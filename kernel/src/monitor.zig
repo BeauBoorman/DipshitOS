@@ -330,6 +330,44 @@ pub fn lookup(name: []const u8) ?*const Command {
 }
 
 // ---------------------------------------------------------------------------
+// ADR 0008 D3 output shapes (milestone eight card U3)
+// ---------------------------------------------------------------------------
+
+/// D3 unknown-verb shape: `unknown command '<x>' — try 'help'` — one line,
+/// deterministic. Also the empty-verb (no command given) shape.
+fn unknown_command(m: *Monitor, name: []const u8) void {
+    m.console.puts("unknown command '");
+    m.console.puts(name);
+    m.console.puts("' — try 'help'\n");
+}
+
+/// D3 misuse shape for a sub-verb usage line: `usage: <sub-usage>` plus the
+/// command's own blurb as the one-line hint (the registry is the single
+/// source — no duplicated hint text to drift).
+fn usage_sub(m: *Monitor, sub: []const u8, verb: []const u8) void {
+    m.console.puts("usage: ");
+    m.console.puts(sub);
+    m.console.puts("\n");
+    if (lookup(verb)) |cmd| {
+        m.console.puts(cmd.help);
+        m.console.puts("\n");
+    }
+}
+
+/// D3 failure shape for a fixed message: `error: <actionable message>`.
+fn error_line(m: *Monitor, text: []const u8) void {
+    m.console.puts("error: ");
+    m.console.print_line(text);
+}
+
+/// D3 failure shape, prefix half: handlers with a runtime subject print
+/// `error: <cmd>: <subject>` via `error_puts` + their own puts calls.
+fn error_puts(m: *Monitor, text: []const u8) void {
+    m.console.puts("error: ");
+    m.console.puts(text);
+}
+
+// ---------------------------------------------------------------------------
 // Tab completion (milestone eight card U2, ADR 0008 D2)
 // ---------------------------------------------------------------------------
 
@@ -472,23 +510,25 @@ fn extension(word: []const u8, matches: usize, match: ?[]const u8) ?[]const u8 {
 /// to the later Console & Shell Core stream.
 pub fn exec(m: *Monitor, argv: []const []const u8) ExecError {
     if (argv.len == 0) {
-        m.console.print_line("no command given; type 'help' for a list of commands");
-        return .usage;
+        // D3: an empty verb is the unknown-verb shape with empty quotes.
+        unknown_command(m, "");
+        return .unknown_command;
     }
     if (argv.len > max_args_limit + 1) {
-        m.console.print_line("too many arguments; type 'help' for a list of commands");
+        error_line(m, "too many arguments (max 17 tokens)");
         return .usage;
     }
     const cmd = lookup(argv[0]) orelse {
-        m.console.puts("unknown command: ");
-        m.console.puts(argv[0]);
-        m.console.puts("\ntype 'help' for a list of commands\n");
+        unknown_command(m, argv[0]);
         return .unknown_command;
     };
     const args = argv[1..];
     if (args.len < cmd.min_args or args.len > cmd.max_args) {
+        // D3 misuse shape: the usage line plus the command's blurb hint.
         m.console.puts("usage: ");
         m.console.puts(cmd.usage);
+        m.console.puts("\n");
+        m.console.puts(cmd.help);
         m.console.puts("\n");
         return .usage;
     }
@@ -579,7 +619,7 @@ fn report_machine(m: *Monitor, verb: []const u8, result: MachineResult) ExecErro
             return .not_implemented;
         },
         .failed => {
-            m.console.puts(verb);
+            error_puts(m, verb);
             m.console.puts(": failed\n");
             return .machine_failed;
         },
@@ -642,7 +682,7 @@ fn cmd_help(m: *Monitor, args: []const []const u8) ExecError {
             m.console.puts(body);
             return .none;
         }
-        m.console.puts("help: no such command: ");
+        error_puts(m, "help: no such command: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
@@ -821,7 +861,7 @@ fn cmd_ls_path(m: *Monitor, path: []const u8) ExecError {
     var list: [esp.entries_max]fat.DirEntry = undefined;
     const n = fat.list_path(path, &list);
     if (n == 0) {
-        m.console.puts("ls: ");
+        error_puts(m, "ls: ");
         m.console.puts(path);
         if (fat.file_size(path) != null) {
             m.console.print_line(": is a file, not a directory");
@@ -860,7 +900,7 @@ fn cmd_mount(m: *Monitor, args: []const []const u8) ExecError {
     const name = args[0];
     const is_data = std.mem.eql(u8, name, "data");
     if (!is_data and !std.mem.eql(u8, name, "esp")) {
-        m.console.puts("mount: unknown volume: ");
+        error_puts(m, "mount: unknown volume: ");
         m.console.puts(name);
         m.console.print_line(" (expected esp or data)");
         return .invalid_argument;
@@ -880,25 +920,25 @@ fn cmd_mount(m: *Monitor, args: []const []const u8) ExecError {
             return .none;
         },
         .no_disk => {
-            m.console.puts("mount: ");
+            error_puts(m, "mount: ");
             m.console.puts(name);
             m.console.print_line(": no disk (FAT volume unavailable)");
             return .not_implemented;
         },
         .bad_gpt => {
-            m.console.puts("mount: ");
+            error_puts(m, "mount: ");
             m.console.puts(name);
             m.console.print_line(": partition not found (bad GPT or no such type GUID)");
             return .machine_failed;
         },
         .bad_bpb => {
-            m.console.puts("mount: ");
+            error_puts(m, "mount: ");
             m.console.puts(name);
             m.console.print_line(": not a FAT32 volume (bad BPB)");
             return .machine_failed;
         },
         .io_failed => {
-            m.console.puts("mount: ");
+            error_puts(m, "mount: ");
             m.console.puts(name);
             m.console.puts(": sector I/O failed (last lba=");
             m.console.print_hex_min(fat.last_fail_lba());
@@ -916,21 +956,21 @@ fn cmd_cat(m: *Monitor, args: []const []const u8) ExecError {
     const name = args[0];
     if (std.mem.indexOfScalar(u8, name, '/') != null) return cmd_cat_path(m, name);
     const e = esp.lookup(name) orelse {
-        m.console.puts("cat: ");
+        error_puts(m, "cat: ");
         m.console.puts(name);
         m.console.print_line(": not found (no such file on the ESP)");
         return .invalid_argument;
     };
     switch (e.kind) {
         .esp_dir => {
-            m.console.puts("cat: ");
+            error_puts(m, "cat: ");
             m.console.puts(name);
             m.console.print_line(": is a directory");
             return .invalid_argument;
         },
         .esp_file => {
             if (e.len == 0 and e.size > 0) {
-                m.console.puts("cat: ");
+                error_puts(m, "cat: ");
                 m.console.puts(name);
                 m.console.puts(": content not loaded (file is ");
                 m.console.print_hex(e.size);
@@ -954,14 +994,14 @@ fn cmd_cat(m: *Monitor, args: []const []const u8) ExecError {
 /// reported honestly (never silently truncated).
 fn cmd_cat_path(m: *Monitor, path: []const u8) ExecError {
     const size = fat.file_size(path) orelse {
-        m.console.puts("cat: ");
+        error_puts(m, "cat: ");
         m.console.puts(path);
         m.console.print_line(": not found (no such file on the FAT volume)");
         return .invalid_argument;
     };
     var buf: [esp.write_content_max]u8 = undefined;
     if (size > @as(u32, @intCast(buf.len))) {
-        m.console.puts("cat: ");
+        error_puts(m, "cat: ");
         m.console.puts(path);
         m.console.puts(": file is ");
         m.console.print_hex(size);
@@ -971,7 +1011,7 @@ fn cmd_cat_path(m: *Monitor, path: []const u8) ExecError {
         return .invalid_argument;
     }
     const got = fat.read_file(path, &buf) orelse {
-        m.console.puts("cat: ");
+        error_puts(m, "cat: ");
         m.console.puts(path);
         m.console.print_line(": not found (no such file on the FAT volume)");
         return .invalid_argument;
@@ -991,7 +1031,7 @@ fn cmd_write(m: *Monitor, args: []const []const u8) ExecError {
     var len: usize = 0;
     for (parts, 0..) |p, i| len += p.len + (if (i > 0) @as(usize, 1) else 0);
     if (len > esp.write_content_max) {
-        m.console.puts("write: content too long (max ");
+        error_puts(m, "write: content too long (max ");
         m.console.print_hex(esp.write_content_max);
         m.console.puts(" bytes, got ");
         m.console.print_hex(@intCast(len));
@@ -1018,13 +1058,13 @@ fn cmd_write(m: *Monitor, args: []const []const u8) ExecError {
             return .none;
         },
         .no_disk => {
-            m.console.puts("write: ");
+            error_puts(m, "write: ");
             m.console.puts(name);
             m.console.print_line(": not persisted - no disk (FAT volume unavailable)");
             return .not_implemented;
         },
         .name_invalid => {
-            m.console.puts("write: invalid file name: ");
+            error_puts(m, "write: invalid file name: ");
             m.console.puts(name);
             m.console.puts(" (max ");
             m.console.print_u64(esp.name_max);
@@ -1032,13 +1072,13 @@ fn cmd_write(m: *Monitor, args: []const []const u8) ExecError {
             return .invalid_argument;
         },
         .name_too_long => {
-            m.console.puts("write: ");
+            error_puts(m, "write: ");
             m.console.puts(name);
             m.console.print_line(": does not fit FAT 8.3 (max 8 chars + 3-char extension)");
             return .invalid_argument;
         },
         .content_too_long => {
-            m.console.puts("write: content too long (max ");
+            error_puts(m, "write: content too long (max ");
             m.console.print_hex(esp.write_content_max);
             m.console.puts(" bytes, got ");
             m.console.print_hex(@intCast(n));
@@ -1046,19 +1086,19 @@ fn cmd_write(m: *Monitor, args: []const []const u8) ExecError {
             return .invalid_argument;
         },
         .bad_path => {
-            m.console.puts("write: ");
+            error_puts(m, "write: ");
             m.console.puts(name);
             m.console.print_line(": parent directory not found");
             return .invalid_argument;
         },
         .disk_full => {
-            m.console.puts("write: ");
+            error_puts(m, "write: ");
             m.console.puts(name);
             m.console.print_line(": not persisted - disk full (no free cluster or root-directory slot)");
             return .invalid_argument;
         },
         .write_failed => {
-            m.console.puts("write: ");
+            error_puts(m, "write: ");
             m.console.puts(name);
             m.console.puts(": FAT write failed (last lba=");
             m.console.print_hex_min(fat.last_fail_lba());
@@ -1080,9 +1120,9 @@ fn cmd_pages(m: *Monitor, args: []const []const u8) ExecError {
     const s = alloc.stats();
     if (!s.armed) {
         if (args.len == 1) {
-            m.console.print_line("pages selftest: allocator not armed");
+            error_line(m, "pages selftest: allocator not armed");
         } else {
-            m.console.print_line("pages: allocator not armed (no poolable memory in span)");
+            error_line(m, "pages: allocator not armed (no poolable memory in span)");
         }
         return .none;
     }
@@ -1190,7 +1230,7 @@ fn cmd_clear(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_hex(m: *Monitor, args: []const []const u8) ExecError {
     for (args) |arg| {
         const value = parseInt(arg) catch {
-            m.console.puts("hex: invalid number: ");
+            error_puts(m, "hex: invalid number: ");
             m.console.puts(arg);
             m.console.puts("\n");
             return .invalid_argument;
@@ -1230,21 +1270,21 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len > 0) {
         if (std.mem.eql(u8, args[0], "focus")) {
             if (args.len != 2) {
-                m.console.print_line("usage: win focus <n>");
+                usage_sub(m, "win focus <n>", "win");
                 return .usage;
             }
             const id = parseInt(args[1]) catch {
-                m.console.puts("win focus: invalid id: ");
+                error_puts(m, "win focus: invalid id: ");
                 m.console.puts(args[1]);
                 m.console.puts("\n");
                 return .invalid_argument;
             };
             if (id > 255) {
-                m.console.print_line("win focus: id out of range");
+                error_line(m, "win focus: id out of range");
                 return .invalid_argument;
             }
             if (!driving_award.focus(@intCast(id))) {
-                m.console.print_line("win focus: no such window");
+                error_line(m, "win focus: no such window");
                 return .invalid_argument;
             }
             // The focus change may alter the clock's focus line — repaint.
@@ -1258,21 +1298,21 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
         }
         if (std.mem.eql(u8, args[0], "raise")) {
             if (args.len != 2) {
-                m.console.print_line("usage: win raise <n>");
+                usage_sub(m, "win raise <n>", "win");
                 return .usage;
             }
             const id = parseInt(args[1]) catch {
-                m.console.puts("win raise: invalid id: ");
+                error_puts(m, "win raise: invalid id: ");
                 m.console.puts(args[1]);
                 m.console.puts("\n");
                 return .invalid_argument;
             };
             if (id > 255) {
-                m.console.print_line("win raise: id out of range");
+                error_line(m, "win raise: id out of range");
                 return .invalid_argument;
             }
             if (!driving_award.raise(@intCast(id))) {
-                m.console.print_line("win raise: no such window");
+                error_line(m, "win raise: no such window");
                 return .invalid_argument;
             }
             _ = driving_award.composite();
@@ -1283,29 +1323,29 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
         }
         if (std.mem.eql(u8, args[0], "move")) {
             if (args.len != 4) {
-                m.console.print_line("usage: win move <n> <x> <y>");
+                usage_sub(m, "win move <n> <x> <y>", "win");
                 return .usage;
             }
             const id = parseInt(args[1]) catch {
-                m.console.puts("win move: invalid id: ");
+                error_puts(m, "win move: invalid id: ");
                 m.console.puts(args[1]);
                 m.console.puts("\n");
                 return .invalid_argument;
             };
             const x = parseInt(args[2]) catch {
-                m.console.print_line("win move: invalid x");
+                error_line(m, "win move: invalid x");
                 return .invalid_argument;
             };
             const y = parseInt(args[3]) catch {
-                m.console.print_line("win move: invalid y");
+                error_line(m, "win move: invalid y");
                 return .invalid_argument;
             };
             if (id > 255 or x > std.math.maxInt(u32) or y > std.math.maxInt(u32)) {
-                m.console.print_line("win move: coordinate out of range");
+                error_line(m, "win move: coordinate out of range");
                 return .invalid_argument;
             }
             if (!driving_award.user_move(@intCast(id), @intCast(x), @intCast(y))) {
-                m.console.print_line("win move: no such user window (the terminal + clock are fixed)");
+                error_line(m, "win move: no such user window (the terminal + clock are fixed)");
                 return .invalid_argument;
             }
             _ = driving_award.composite();
@@ -1320,21 +1360,21 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
         }
         if (std.mem.eql(u8, args[0], "close")) {
             if (args.len != 2) {
-                m.console.print_line("usage: win close <n>");
+                usage_sub(m, "win close <n>", "win");
                 return .usage;
             }
             const id = parseInt(args[1]) catch {
-                m.console.puts("win close: invalid id: ");
+                error_puts(m, "win close: invalid id: ");
                 m.console.puts(args[1]);
                 m.console.puts("\n");
                 return .invalid_argument;
             };
             if (id > 255) {
-                m.console.print_line("win close: id out of range");
+                error_line(m, "win close: id out of range");
                 return .invalid_argument;
             }
             if (!driving_award.user_close(@intCast(id))) {
-                m.console.print_line("win close: no such user window (the terminal + clock are fixed)");
+                error_line(m, "win close: no such user window (the terminal + clock are fixed)");
                 return .invalid_argument;
             }
             // The close marked the fixed windows dirty — composite now to
@@ -1347,11 +1387,11 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
         }
         if (std.mem.eql(u8, args[0], "list")) {
             if (args.len != 2) {
-                m.console.print_line("usage: win list <pid>");
+                usage_sub(m, "win list <pid>", "win");
                 return .usage;
             }
             const pid = parseInt(args[1]) catch {
-                m.console.puts("win list: invalid pid: ");
+                error_puts(m, "win list: invalid pid: ");
                 m.console.puts(args[1]);
                 m.console.puts("\n");
                 return .invalid_argument;
@@ -1377,19 +1417,19 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
         }
         if (std.mem.eql(u8, args[0], "hit")) {
             if (args.len != 3) {
-                m.console.print_line("usage: win hit <x> <y>");
+                usage_sub(m, "win hit <x> <y>", "win");
                 return .usage;
             }
             const x = parseInt(args[1]) catch {
-                m.console.print_line("win hit: invalid x");
+                error_line(m, "win hit: invalid x");
                 return .invalid_argument;
             };
             const y = parseInt(args[2]) catch {
-                m.console.print_line("win hit: invalid y");
+                error_line(m, "win hit: invalid y");
                 return .invalid_argument;
             };
             if (x > std.math.maxInt(u32) or y > std.math.maxInt(u32)) {
-                m.console.print_line("win hit: coordinate out of range");
+                error_line(m, "win hit: coordinate out of range");
                 return .invalid_argument;
             }
             const hit = driving_award.hit_test(@intCast(x), @intCast(y));
@@ -1407,11 +1447,11 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
             m.console.puts("\n");
             return .none;
         }
-        m.console.print_line("win: unknown subcommand (try 'win', 'win focus <n>', 'win raise <n>', 'win move <n> <x> <y>', 'win close <n>', 'win list <pid>', or 'win hit <x> <y>')");
+        error_line(m, "win: unknown subcommand (try 'win', 'win focus <n>', 'win raise <n>', 'win move <n> <x> <y>', 'win close <n>', 'win list <pid>', or 'win hit <x> <y>')");
         return .invalid_argument;
     }
     if (!driving_award.armed()) {
-        m.console.print_line("win: window manager not armed (no gpu device — the default VM)");
+        error_line(m, "win: window manager not armed (no gpu device — the default VM)");
         return .none;
     }
     m.console.puts("win: windows=");
@@ -1588,7 +1628,7 @@ fn cmd_usb(m: *Monitor, args: []const []const u8) ExecError {
 /// interrupt-IN endpoint + the HID boot-protocol negotiation result.
 fn cmd_usb_devices(m: *Monitor) ExecError {
     if (!xhci.xhci_ready) {
-        m.console.puts("usb devices: no XHCI device\n");
+        error_puts(m, "usb devices: no XHCI device\n");
         return .none;
     }
     if (!xhci.enum_done) {
@@ -1638,7 +1678,7 @@ fn cmd_usb_devices(m: *Monitor) ExecError {
 /// to device 0 (the keyboard, if present).
 fn cmd_usb_report(m: *Monitor, args: []const []const u8) ExecError {
     if (!xhci.xhci_ready) {
-        m.console.puts("usb report: no XHCI device\n");
+        error_puts(m, "usb report: no XHCI device\n");
         return .none;
     }
     var dev_idx: usize = 0;
@@ -1705,7 +1745,7 @@ fn cmd_usb_report(m: *Monitor, args: []const []const u8) ExecError {
 
 fn cmd_repeat(m: *Monitor, args: []const []const u8) ExecError {
     const count = parseInt(args[0]) catch {
-        m.console.puts("repeat: invalid count: ");
+        error_puts(m, "repeat: invalid count: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
@@ -1725,7 +1765,7 @@ fn cmd_repeat(m: *Monitor, args: []const []const u8) ExecError {
     if (parts.len > 1) text_len = @min(repeat_max_bytes, text_len + parts.len - 1);
     const per_line = text_len + 1; // + the trailing newline
     if (per_line > repeat_max_bytes or count > @as(u64, repeat_max_bytes / per_line)) {
-        m.console.puts("repeat: output too large (max ");
+        error_puts(m, "repeat: output too large (max ");
         m.console.print_u64(repeat_max_bytes);
         m.console.puts(" bytes)\n");
         return .invalid_argument;
@@ -1949,7 +1989,7 @@ fn cmd_kill(m: *Monitor, args: []const []const u8) ExecError {
         break :blk null;
     };
     const pid_value = pid orelse {
-        m.console.puts("kill: no such process: ");
+        error_puts(m, "kill: no such process: ");
         m.console.puts(arg);
         m.console.puts("\n");
         return .invalid_argument;
@@ -1964,7 +2004,7 @@ fn cmd_kill(m: *Monitor, args: []const []const u8) ExecError {
     // A created-but-unbound process (exec's pre-spawn window) has no
     // executor to terminate; a running process names its executor slot.
     const task_id = info.task_id orelse {
-        m.console.puts("kill: ");
+        error_puts(m, "kill: ");
         m.console.puts(info.name);
         m.console.puts(" not running\n");
         return .invalid_argument;
@@ -1979,7 +2019,7 @@ fn cmd_kill(m: *Monitor, args: []const []const u8) ExecError {
         .not_found => {
             m.console.puts("kill: ");
             m.console.puts(info.name);
-            m.console.puts(" not found\n");
+            error_puts(m, " not found\n");
             return .invalid_argument;
         },
         .already_exited => {
@@ -1989,7 +2029,7 @@ fn cmd_kill(m: *Monitor, args: []const []const u8) ExecError {
             return .invalid_argument;
         },
         .refused => {
-            m.console.print_line("kill: cannot kill the shell or scheduler-owned idle task");
+            error_line(m, "kill: cannot kill the shell or scheduler-owned idle task");
             return .invalid_argument;
         },
     }
@@ -2008,13 +2048,13 @@ fn cmd_kill(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_mbox(m: *Monitor, args: []const []const u8) ExecError {
     const wanted: ?usize = if (args.len > 0) blk: {
         const value = parseInt(args[0]) catch {
-            m.console.puts("mbox: invalid pid: ");
+            error_puts(m, "mbox: invalid pid: ");
             m.console.puts(args[0]);
             m.console.puts("\n");
             return .invalid_argument;
         };
         if (value >= process.max_processes or process.info(@as(usize, @intCast(value))) == null) {
-            m.console.puts("mbox: no such process: ");
+            error_puts(m, "mbox: no such process: ");
             m.console.puts(args[0]);
             m.console.puts("\n");
             return .invalid_argument;
@@ -2076,7 +2116,7 @@ fn cmd_net(m: *Monitor, args: []const []const u8) ExecError {
         if (std.mem.eql(u8, args[0], "udp")) return cmd_net_udp(m, args[1..]);
         if (std.mem.eql(u8, args[0], "dhcp")) return cmd_net_dhcp(m, args[1..]);
         if (std.mem.eql(u8, args[0], "tcp")) return cmd_net_tcp(m, args[1..]);
-        m.console.print_line("net: unknown subcommand (try 'net', 'net recv', 'net ip <a.b.c.d>', 'net arp [<a.b.c.d>]', 'net ping <a.b.c.d>', 'net udp [listen|close|send|recv]', 'net dhcp' or 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]')");
+        error_line(m, "net: unknown subcommand (try 'net', 'net recv', 'net ip <a.b.c.d>', 'net arp [<a.b.c.d>]', 'net ping <a.b.c.d>', 'net udp [listen|close|send|recv]', 'net dhcp' or 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]')");
         return .invalid_argument;
     }
     if (!virtio_net.net_ready) {
@@ -2379,11 +2419,11 @@ fn cmd_net(m: *Monitor, args: []const []const u8) ExecError {
 /// (the `timeout` counter). Deterministic, monitor-driven, no interrupts.
 fn cmd_net_dhcp(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 0) {
-        m.console.print_line("net dhcp: usage: net dhcp");
+        usage_sub(m, "net dhcp", "net");
         return .invalid_argument;
     }
     if (!virtio_net.net_ready) {
-        m.console.puts("net dhcp: no virtio-net device (");
+        error_puts(m, "net dhcp: no virtio-net device (");
         m.console.puts(if (virtio_net.net_fail.len > 0) virtio_net.net_fail else "DID 0x1041 not found on bus 0");
         m.console.puts(")\n");
         return .none;
@@ -2399,7 +2439,7 @@ fn cmd_net_dhcp(m: *Monitor, args: []const []const u8) ExecError {
         .idle => {
             if (virtio_net.dhcp.attempts >= virtio_net.dhcp.max_attempts) {
                 virtio_net.dhcp.timed_out += 1;
-                m.console.puts("net dhcp: refused (no OFFER after ");
+                error_puts(m, "net dhcp: refused (no OFFER after ");
                 m.console.print_u64(@intCast(virtio_net.dhcp.max_attempts));
                 m.console.puts(" DISCOVER attempts)\n");
                 return .none;
@@ -2420,7 +2460,7 @@ fn cmd_net_dhcp(m: *Monitor, args: []const []const u8) ExecError {
                 },
                 else => {
                     virtio_net.dhcp.state = .idle; // the DISCOVER never went out
-                    m.console.print_line("net dhcp: DISCOVER TX failed (transport unready)");
+                    error_line(m, "net dhcp: DISCOVER TX failed (transport unready)");
                 },
             }
             return .none;
@@ -2490,7 +2530,7 @@ fn cmd_net_dhcp(m: *Monitor, args: []const []const u8) ExecError {
                 } else {
                     m.console.puts("net dhcp: ");
                     m.console.puts(if (virtio_net.dhcp.state == .renewing) "RENEWING" else "REBINDING");
-                    m.console.print_line(" TX failed (transport unready)");
+                    error_line(m, " TX failed (transport unready)");
                 }
             } else {
                 m.console.puts("net dhcp: waiting for the renewal ACK (xid=");
@@ -2617,7 +2657,7 @@ fn cmd_net_tcp(m: *Monitor, args: []const []const u8) ExecError {
     if (std.mem.eql(u8, args[0], "recv")) return cmd_net_tcp_recv(m, args[1..]);
     if (std.mem.eql(u8, args[0], "close")) return cmd_net_tcp_close(m, args[1..]);
     if (std.mem.eql(u8, args[0], "reset")) return cmd_net_tcp_reset(m, args[1..]);
-    m.console.print_line("net tcp: unknown subcommand (try 'net tcp', 'net tcp connect <addr> <port>', 'net tcp send <len>', 'net tcp recv', 'net tcp close' or 'net tcp reset')");
+    error_line(m, "net tcp: unknown subcommand (try 'net tcp', 'net tcp connect <addr> <port>', 'net tcp send <len>', 'net tcp recv', 'net tcp close' or 'net tcp reset')");
     return .invalid_argument;
 }
 
@@ -2633,7 +2673,7 @@ fn print_tcp_peer(m: *Monitor) void {
 /// The bare `net tcp` drive (one step per invocation — see cmd_net_tcp).
 fn cmd_net_tcp_drive(m: *Monitor) ExecError {
     if (!virtio_net.net_ready) {
-        m.console.print_line("net tcp: no virtio-net device");
+        error_line(m, "net tcp: no virtio-net device");
         return .none;
     }
     // Card N10: stamp the connect clock BEFORE the drain — a pending
@@ -2651,7 +2691,7 @@ fn cmd_net_tcp_drive(m: *Monitor) ExecError {
         .syn_sent => {
             if (virtio_net.tcp.connect_timed_out()) {
                 virtio_net.tcp.abort_timeout();
-                m.console.puts("net tcp: connect refused (no SYN-ACK after ");
+                error_puts(m, "net tcp: connect refused (no SYN-ACK after ");
                 m.console.print_u64(@intCast(virtio_net.tcp.connect_timeout));
                 m.console.puts("s) — run 'net tcp connect <addr> <port>' to retry\n");
                 return .none;
@@ -2725,23 +2765,23 @@ fn cmd_net_tcp_drive(m: *Monitor) ExecError {
 /// `net tcp connect <addr> <port>` — start the three-way handshake.
 fn cmd_net_tcp_connect(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 2) {
-        m.console.print_line("net tcp: usage: net tcp connect <a.b.c.d> <port>");
+        usage_sub(m, "net tcp connect <a.b.c.d> <port>", "net");
         return .invalid_argument;
     }
     const ip = virtio_net.arp.parse_ip(args[0]) orelse {
-        m.console.puts("net tcp: invalid address: ");
+        error_puts(m, "net tcp: invalid address: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
     };
     const port = parse_port(args[1]) orelse {
-        m.console.puts("net tcp: invalid port: ");
+        error_puts(m, "net tcp: invalid port: ");
         m.console.puts(args[1]);
         m.console.puts("\n");
         return .invalid_argument;
     };
     if (!virtio_net.net_ready) {
-        m.console.print_line("net tcp: no virtio-net device");
+        error_line(m, "net tcp: no virtio-net device");
         return .none;
     }
     if (virtio_net.tcp.state != .idle) {
@@ -2753,7 +2793,7 @@ fn cmd_net_tcp_connect(m: *Monitor, args: []const []const u8) ExecError {
         return .none;
     }
     if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) {
-        m.console.print_line("net tcp: own-IP connect refused (no TCP loopback — the bounded client is outward-only)");
+        error_line(m, "net tcp: own-IP connect refused (no TCP loopback — the bounded client is outward-only)");
         return .none;
     }
     // Drain first (the claim-6076 contract — the ARP reply for `net arp
@@ -2788,7 +2828,7 @@ fn cmd_net_tcp_connect(m: *Monitor, args: []const []const u8) ExecError {
         },
         else => {
             virtio_net.tcp.state = .idle; // the SYN never went out
-            m.console.print_line("net tcp: SYN TX failed (transport unready)");
+            error_line(m, "net tcp: SYN TX failed (transport unready)");
         },
     }
     return .none;
@@ -2798,11 +2838,11 @@ fn cmd_net_tcp_connect(m: *Monitor, args: []const []const u8) ExecError {
 /// of the deterministic pattern 01 02 03…, ack = rcv_nxt).
 fn cmd_net_tcp_send(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 1) {
-        m.console.print_line("net tcp: usage: net tcp send <len>");
+        usage_sub(m, "net tcp send <len>", "net");
         return .invalid_argument;
     }
     const len = parseInt(args[0]) catch {
-        m.console.puts("net tcp: invalid length: ");
+        error_puts(m, "net tcp: invalid length: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
@@ -2814,7 +2854,7 @@ fn cmd_net_tcp_send(m: *Monitor, args: []const []const u8) ExecError {
         return .invalid_argument;
     }
     if (virtio_net.tcp.state != .established) {
-        m.console.print_line("net tcp: not established (net tcp connect <addr> <port> first)");
+        error_line(m, "net tcp: not established (net tcp connect <addr> <port> first)");
         return .none;
     }
     // The deterministic payload — bytes 01 02 03 04… (byte i + 1,
@@ -2846,11 +2886,11 @@ fn cmd_net_tcp_send(m: *Monitor, args: []const []const u8) ExecError {
 /// style) and consume it.
 fn cmd_net_tcp_recv(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 0) {
-        m.console.print_line("net tcp: usage: net tcp recv");
+        usage_sub(m, "net tcp recv", "net");
         return .invalid_argument;
     }
     if (virtio_net.tcp.state != .established) {
-        m.console.print_line("net tcp: not established (net tcp connect <addr> <port> first)");
+        error_line(m, "net tcp: not established (net tcp connect <addr> <port> first)");
         return .none;
     }
     // A segment may have landed while the shell idled — drain first.
@@ -2878,11 +2918,11 @@ fn cmd_net_tcp_recv(m: *Monitor, args: []const []const u8) ExecError {
 /// final ACK by the next `net tcp`).
 fn cmd_net_tcp_close(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 0) {
-        m.console.print_line("net tcp: usage: net tcp close");
+        usage_sub(m, "net tcp close", "net");
         return .invalid_argument;
     }
     if (virtio_net.tcp.state != .established) {
-        m.console.print_line("net tcp: not established (net tcp connect <addr> <port> first)");
+        error_line(m, "net tcp: not established (net tcp connect <addr> <port> first)");
         return .none;
     }
     const seq = virtio_net.tcp.snd_una;
@@ -2909,7 +2949,7 @@ fn cmd_net_tcp_close(m: *Monitor, args: []const []const u8) ExecError {
 /// dies; the next `net tcp` returns to IDLE).
 fn cmd_net_tcp_reset(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 0) {
-        m.console.print_line("net tcp: usage: net tcp reset");
+        usage_sub(m, "net tcp reset", "net");
         return .invalid_argument;
     }
     if (virtio_net.tcp.state == .idle) {
@@ -2946,7 +2986,7 @@ fn cmd_net_tcp_reset(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_net_recv(m: *Monitor, args: []const []const u8) ExecError {
     _ = args;
     if (!virtio_net.net_ready) {
-        m.console.puts("net recv: no virtio-net device (");
+        error_puts(m, "net recv: no virtio-net device (");
         m.console.puts(if (virtio_net.net_fail.len > 0) virtio_net.net_fail else "DID 0x1041 not found on bus 0");
         m.console.puts(")\n");
         return .none;
@@ -2989,11 +3029,11 @@ fn cmd_net_recv(m: *Monitor, args: []const []const u8) ExecError {
 /// runner's `--net-inject-after` marker — deterministic, not a sleep).
 fn cmd_net_ip(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 1) {
-        m.console.print_line("net ip: usage: net ip <a.b.c.d>");
+        usage_sub(m, "net ip <a.b.c.d>", "net");
         return .invalid_argument;
     }
     const ip = virtio_net.arp.parse_ip(args[0]) orelse {
-        m.console.puts("net ip: invalid address: ");
+        error_puts(m, "net ip: invalid address: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
@@ -3017,7 +3057,7 @@ fn cmd_net_ip(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_net_arp(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len == 0) {
         if (!virtio_net.net_ready) {
-            m.console.print_line("net arp: no virtio-net device");
+            error_line(m, "net arp: no virtio-net device");
             return .none;
         }
         virtio_net.net_rx_drain();
@@ -3055,17 +3095,17 @@ fn cmd_net_arp(m: *Monitor, args: []const []const u8) ExecError {
         return .none;
     }
     if (args.len != 1) {
-        m.console.print_line("net arp: usage: net arp [<a.b.c.d>]");
+        usage_sub(m, "net arp [<a.b.c.d>]", "net");
         return .invalid_argument;
     }
     const ip = virtio_net.arp.parse_ip(args[0]) orelse {
-        m.console.puts("net arp: invalid address: ");
+        error_puts(m, "net arp: invalid address: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
     };
     if (!virtio_net.net_ready) {
-        m.console.print_line("net arp: no virtio-net device");
+        error_line(m, "net arp: no virtio-net device");
         return .none;
     }
     virtio_net.net_rx_drain();
@@ -3109,17 +3149,17 @@ fn cmd_net_arp(m: *Monitor, args: []const []const u8) ExecError {
 /// `seq=`).
 fn cmd_net_ping(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 1) {
-        m.console.print_line("net ping: usage: net ping <a.b.c.d>");
+        usage_sub(m, "net ping <a.b.c.d>", "net");
         return .invalid_argument;
     }
     const ip = virtio_net.arp.parse_ip(args[0]) orelse {
-        m.console.puts("net ping: invalid address: ");
+        error_puts(m, "net ping: invalid address: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
     };
     if (!virtio_net.net_ready) {
-        m.console.print_line("net ping: no virtio-net device");
+        error_line(m, "net ping: no virtio-net device");
         return .none;
     }
     virtio_net.net_rx_drain();
@@ -3182,17 +3222,17 @@ fn cmd_net_udp(m: *Monitor, args: []const []const u8) ExecError {
     }
     if (std.mem.eql(u8, args[0], "listen")) {
         if (args.len != 2) {
-            m.console.print_line("net udp: usage: net udp listen <port>");
+            usage_sub(m, "net udp listen <port>", "net");
             return .invalid_argument;
         }
         const port = parse_port(args[1]) orelse {
-            m.console.puts("net udp: invalid port: ");
+            error_puts(m, "net udp: invalid port: ");
             m.console.puts(args[1]);
             m.console.puts("\n");
             return .invalid_argument;
         };
         if (!virtio_net.udp.listen_port(port)) {
-            m.console.print_line("net udp: listen failed (table full or duplicate)");
+            error_line(m, "net udp: listen failed (table full or duplicate)");
             return .none;
         }
         m.console.puts("net udp: listening on ");
@@ -3202,11 +3242,11 @@ fn cmd_net_udp(m: *Monitor, args: []const []const u8) ExecError {
     }
     if (std.mem.eql(u8, args[0], "close")) {
         if (args.len != 2) {
-            m.console.print_line("net udp: usage: net udp close <port>");
+            usage_sub(m, "net udp close <port>", "net");
             return .invalid_argument;
         }
         const port = parse_port(args[1]) orelse {
-            m.console.puts("net udp: invalid port: ");
+            error_puts(m, "net udp: invalid port: ");
             m.console.puts(args[1]);
             m.console.puts("\n");
             return .invalid_argument;
@@ -3224,23 +3264,23 @@ fn cmd_net_udp(m: *Monitor, args: []const []const u8) ExecError {
     }
     if (std.mem.eql(u8, args[0], "send")) {
         if (args.len != 4) {
-            m.console.print_line("net udp: usage: net udp send <a.b.c.d> <port> <len>");
+            usage_sub(m, "net udp send <a.b.c.d> <port> <len>", "net");
             return .invalid_argument;
         }
         const ip = virtio_net.arp.parse_ip(args[1]) orelse {
-            m.console.puts("net udp: invalid address: ");
+            error_puts(m, "net udp: invalid address: ");
             m.console.puts(args[1]);
             m.console.puts("\n");
             return .invalid_argument;
         };
         const port = parse_port(args[2]) orelse {
-            m.console.puts("net udp: invalid port: ");
+            error_puts(m, "net udp: invalid port: ");
             m.console.puts(args[2]);
             m.console.puts("\n");
             return .invalid_argument;
         };
         const len = parseInt(args[3]) catch {
-            m.console.puts("net udp: invalid length: ");
+            error_puts(m, "net udp: invalid length: ");
             m.console.puts(args[3]);
             m.console.puts("\n");
             return .invalid_argument;
@@ -3279,14 +3319,14 @@ fn cmd_net_udp(m: *Monitor, args: []const []const u8) ExecError {
     }
     if (std.mem.eql(u8, args[0], "recv")) {
         if (args.len > 2) {
-            m.console.print_line("net udp: usage: net udp recv [<port>]");
+            usage_sub(m, "net udp recv [<port>]", "net");
             return .invalid_argument;
         }
         // A datagram may have landed while the shell idled — drain first.
         virtio_net.net_rx_drain();
         if (args.len == 2) {
             const port = parse_port(args[1]) orelse {
-                m.console.puts("net udp: invalid port: ");
+                error_puts(m, "net udp: invalid port: ");
                 m.console.puts(args[1]);
                 m.console.puts("\n");
                 return .invalid_argument;
@@ -3304,7 +3344,7 @@ fn cmd_net_udp(m: *Monitor, args: []const []const u8) ExecError {
         m.console.puts("\n");
         return .none;
     }
-    m.console.print_line("net udp: unknown subcommand (try 'net udp', 'net udp listen <port>', 'net udp close <port>', 'net udp send <a.b.c.d> <port> <len>' or 'net udp recv [<port>]')");
+    error_line(m, "net udp: unknown subcommand (try 'net udp', 'net udp listen <port>', 'net udp close <port>', 'net udp send <a.b.c.d> <port> <len>' or 'net udp recv [<port>]')");
     return .invalid_argument;
 }
 
@@ -3361,13 +3401,13 @@ fn parse_port(text: []const u8) ?u16 {
 /// exactly the frame bytes reported here.
 fn cmd_netsend(m: *Monitor, args: []const []const u8) ExecError {
     const requested = parseInt(args[0]) catch {
-        m.console.puts("netsend: invalid byte count: ");
+        error_puts(m, "netsend: invalid byte count: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
     };
     if (!virtio_net.net_ready) {
-        m.console.print_line("netsend: transport not ready (no virtio-net device)");
+        error_line(m, "netsend: transport not ready (no virtio-net device)");
         return .none;
     }
     m.console.puts("netsend: n=");
@@ -3424,7 +3464,7 @@ fn cmd_screen(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len > 0) {
         if (std.mem.eql(u8, args[0], "fill")) return cmd_screen_fill(m, args[1..]);
         if (std.mem.eql(u8, args[0], "peek")) return cmd_screen_peek(m);
-        m.console.print_line("screen: unknown subcommand (try 'screen' or 'screen fill <rrggbb>')");
+        error_line(m, "screen: unknown subcommand (try 'screen' or 'screen fill <rrggbb>')");
         return .invalid_argument;
     }
     if (!virtio_gpu.gpu_ready) {
@@ -3542,21 +3582,21 @@ fn cmd_screen(m: *Monitor, args: []const []const u8) ExecError {
 /// the `--screenshot` pixels then match the fill.
 fn cmd_screen_fill(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len != 1) {
-        m.console.print_line("usage: screen fill <rrggbb>");
+        usage_sub(m, "screen fill <rrggbb>", "screen");
         return .usage;
     }
     const rgb = parseHex(args[0]) catch {
-        m.console.puts("screen fill: invalid color: ");
+        error_puts(m, "screen fill: invalid color: ");
         m.console.puts(args[0]);
         m.console.puts("\n");
         return .invalid_argument;
     };
     if (rgb > 0xffffff) {
-        m.console.print_line("screen fill: color out of range (max 0xffffff)");
+        error_line(m, "screen fill: color out of range (max 0xffffff)");
         return .invalid_argument;
     }
     if (!virtio_gpu.gpu_ready) {
-        m.console.print_line("screen fill: transport not ready (no virtio-gpu device)");
+        error_line(m, "screen fill: transport not ready (no virtio-gpu device)");
         return .none;
     }
     virtio_gpu.fill_framebuffer(@truncate(rgb));
@@ -3577,7 +3617,7 @@ fn cmd_screen_fill(m: *Monitor, args: []const []const u8) ExecError {
 /// prove the GUEST-side fill landed before blaming the host display.
 fn cmd_screen_peek(m: *Monitor) ExecError {
     if (!virtio_gpu.gpu_ready) {
-        m.console.print_line("screen peek: transport not ready (no virtio-gpu device)");
+        error_line(m, "screen peek: transport not ready (no virtio-gpu device)");
         return .none;
     }
     m.console.puts("screen peek: fb=");
@@ -3632,11 +3672,11 @@ fn cmd_text(m: *Monitor, args: []const []const u8) ExecError {
     }
     if (std.mem.eql(u8, args[0], "put")) {
         if (args.len < 2) {
-            m.console.print_line("usage: text put <string...>");
+            usage_sub(m, "text put <string...>", "text");
             return .usage;
         }
         if (!virtio_gpu.gpu_ready) {
-            m.console.print_line("text put: transport not ready (no virtio-gpu device)");
+            error_line(m, "text put: transport not ready (no virtio-gpu device)");
             return .none;
         }
         var i: usize = 1;
@@ -3657,7 +3697,7 @@ fn cmd_text(m: *Monitor, args: []const []const u8) ExecError {
     }
     if (std.mem.eql(u8, args[0], "clear")) {
         if (!virtio_gpu.gpu_ready) {
-            m.console.print_line("text clear: transport not ready (no virtio-gpu device)");
+            error_line(m, "text clear: transport not ready (no virtio-gpu device)");
             return .none;
         }
         fbtext.clear();
@@ -3669,7 +3709,7 @@ fn cmd_text(m: *Monitor, args: []const []const u8) ExecError {
         m.console.puts("\n");
         return .none;
     }
-    m.console.print_line("text: unknown subcommand (try 'text', 'text put <string...>', or 'text clear')");
+    error_line(m, "text: unknown subcommand (try 'text', 'text put <string...>', or 'text clear')");
     return .invalid_argument;
 }
 
@@ -3732,7 +3772,7 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
             return .none;
         },
         .no_disk => {
-            m.console.print_line("exec: no disk (ESP FAT volume unavailable)");
+            error_line(m, "exec: no disk (ESP FAT volume unavailable)");
             return .not_implemented;
         },
         .not_found => {
@@ -3766,11 +3806,11 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
             return .machine_failed;
         },
         .pool_full => {
-            m.console.print_line("exec: no free scheduler pool slot");
+            error_line(m, "exec: no free scheduler pool slot");
             return .machine_failed;
         },
         .table_full => {
-            m.console.print_line("exec: page-table carve-out exhausted (too many user-root rebuilds)");
+            error_line(m, "exec: page-table carve-out exhausted (too many user-root rebuilds)");
             return .machine_failed;
         },
         .process_full => {
@@ -3778,7 +3818,7 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
             return .machine_failed;
         },
         .too_many_args => {
-            m.console.puts("exec: too many arguments (max ");
+            error_puts(m, "exec: too many arguments (max ");
             m.console.print_u64(esp_exec.max_exec_args);
             m.console.print_line(")");
             return .invalid_argument;
@@ -3905,7 +3945,7 @@ fn cmd_random(m: *Monitor, args: []const []const u8) ExecError {
     var count: usize = 16; // fixed-size sample when no argument
     if (args.len == 1) {
         count = @intCast(parseInt(args[0]) catch {
-            m.console.puts("random: invalid count: ");
+            error_puts(m, "random: invalid count: ");
             m.console.puts(args[0]);
             m.console.puts("\n");
             return .invalid_argument;
@@ -4030,7 +4070,7 @@ fn cmd_elephant(m: *Monitor, args: []const []const u8) ExecError {
     if (err == .none) {
         print_plain_field(m, "handoff", "valid");
     } else {
-        m.console.puts("  handoff: invalid (");
+        error_puts(m, "  handoff: invalid (");
         m.console.puts(handoff.error_name(err));
         m.console.puts(")");
     }
@@ -4045,13 +4085,13 @@ fn cmd_beans(m: *Monitor, args: []const []const u8) ExecError {
     var count: u64 = 42;
     if (args.len == 1) {
         count = parseInt(args[0]) catch {
-            m.console.puts("beans: invalid count: ");
+            error_puts(m, "beans: invalid count: ");
             m.console.puts(args[0]);
             m.console.puts("\n");
             return .invalid_argument;
         };
         if (count < 1 or count > beans_max_count) {
-            m.console.puts("beans: count must be between 1 and ");
+            error_puts(m, "beans: count must be between 1 and ");
             m.console.print_u64(beans_max_count);
             m.console.puts("\n");
             return .invalid_argument;
@@ -4220,10 +4260,10 @@ test "monitor: mbox dumps pending messages and drain counters" {
     // Unknown and malformed pids refuse exactly.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "mbox", "7" }));
-    try std.testing.expectEqualStrings("mbox: no such process: 7\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: mbox: no such process: 7\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "mbox", "nope" }));
-    try std.testing.expectEqualStrings("mbox: invalid pid: nope\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: mbox: invalid pid: nope\n", env.mock.contents());
 }
 
 test "monitor: registry is well-formed" {
@@ -4261,7 +4301,7 @@ test "monitor: help for a specific command" {
     try std.testing.expectEqualStrings("echo - repeat your regrettable decisions\nusage: echo <text...>\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "help", "bogus" }));
-    try std.testing.expectEqualStrings("help: no such command: bogus\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: help: no such command: bogus\n", env.mock.contents());
 }
 
 test "monitor: help opens topic pages (and commands win over topics)" {
@@ -4365,27 +4405,27 @@ test "monitor: unknown command is diagnosed" {
     var env = TestEnv.init();
     var mon = env.monitor();
     try std.testing.expectEqual(ExecError.unknown_command, exec(&mon, &.{"frobnicate"}));
-    try std.testing.expectEqualStrings("unknown command: frobnicate\ntype 'help' for a list of commands\n", env.mock.contents());
+    try std.testing.expectEqualStrings("unknown command 'frobnicate' — try 'help'\n", env.mock.contents());
 }
 
 test "monitor: empty and over-long argv" {
     var env = TestEnv.init();
     var mon = env.monitor();
-    try std.testing.expectEqual(ExecError.usage, exec(&mon, &.{}));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "no command given") != null);
+    try std.testing.expectEqual(ExecError.unknown_command, exec(&mon, &.{}));
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "unknown command ''") != null);
 }
 
 test "monitor: argument-count validation" {
     var env = TestEnv.init();
     var mon = env.monitor();
     try std.testing.expectEqual(ExecError.usage, exec(&mon, &.{"hex"}));
-    try std.testing.expectEqualStrings("usage: hex <number>...\n", env.mock.contents());
+    try std.testing.expectEqualStrings("usage: hex <number>...\nformat an integer in hexadecimal\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.usage, exec(&mon, &.{"repeat"}));
-    try std.testing.expectEqualStrings("usage: repeat <count> <text...>\n", env.mock.contents());
+    try std.testing.expectEqualStrings("usage: repeat <count> <text...>\nrepeat text, safely bounded\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.usage, exec(&mon, &.{ "beans", "1", "2" }));
-    try std.testing.expectEqualStrings("usage: beans [count]\n", env.mock.contents());
+    try std.testing.expectEqualStrings("usage: beans [count]\ncount beans, probably\n", env.mock.contents());
 }
 
 // Monitor-test mock transport for the armed netsend path (the virtio_net
@@ -4470,12 +4510,12 @@ test "monitor: screen reports no device honestly when the transport is absent" {
     // `screen fill` is refused honestly with no transport.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "screen", "fill", "0x112233" }));
-    try std.testing.expectEqualStrings("screen fill: transport not ready (no virtio-gpu device)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: screen fill: transport not ready (no virtio-gpu device)\n", env.mock.contents());
     // An out-of-range color is refused honestly even before the transport
     // check.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "screen", "fill", "0x1000000" }));
-    try std.testing.expectEqualStrings("screen fill: color out of range (max 0xffffff)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: screen fill: color out of range (max 0xffffff)\n", env.mock.contents());
     // `screen` is registered (the registry-row shape).
     try std.testing.expect(lookup("screen") != null);
     try std.testing.expectEqualStrings("virtio-gpu transport + framebuffer: device DID, features, scanout, status, re-arm ('screen fill <rrggbb>' fills the framebuffer and flushes it to the scanout)", lookup("screen").?.help);
@@ -4495,10 +4535,10 @@ test "monitor: text reports the region and refuses put/clear without the transpo
     // `text put` / `text clear` are refused honestly with no transport.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "text", "put", "hello" }));
-    try std.testing.expectEqualStrings("text put: transport not ready (no virtio-gpu device)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: text put: transport not ready (no virtio-gpu device)\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "text", "clear" }));
-    try std.testing.expectEqualStrings("text clear: transport not ready (no virtio-gpu device)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: text clear: transport not ready (no virtio-gpu device)\n", env.mock.contents());
     // An unknown subcommand is refused honestly.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "text", "bogus" }));
@@ -4590,10 +4630,10 @@ test "monitor: net ip sets the static address and echoes the marker" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &virtio_net.arp.own_ip);
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "ip", "999.0.0.1" }));
-    try std.testing.expectEqualStrings("net ip: invalid address: 999.0.0.1\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: net ip: invalid address: 999.0.0.1\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "ip" }));
-    try std.testing.expectEqualStrings("net ip: usage: net ip <a.b.c.d>\n", env.mock.contents());
+    try std.testing.expectEqualStrings("usage: net ip <a.b.c.d>\nvirtio-net transport + RX + ARP + ICMP + UDP + DHCP + TCP: device DID, MAC, queues, feature bits, RX counters ('net recv' prints received frames; 'net ip <a.b.c.d>' sets the static IP; 'net arp [<a.b.c.d>]' shows/resolves the ARP table; 'net ping <a.b.c.d>' sends an ICMP echo request; 'net udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]' drives UDP; 'net dhcp' runs the bounded DHCP client one step per invocation; 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]' drives the bounded TCP client)\n", env.mock.contents());
     // The echo line is the live gate's injection trigger marker.
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "ip", "10.0.0.2" }));
     try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "net ip: ip=10.0.0.2\n") != null);
@@ -4649,7 +4689,7 @@ test "monitor: net arp resolve — miss sends the request, no-IP refuses honestl
     // Malformed addresses refuse exactly.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "arp", "nope" }));
-    try std.testing.expectEqualStrings("net arp: invalid address: nope\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: net arp: invalid address: nope\n", env.mock.contents());
     virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
     virtio_net.net_ops = saved_ops;
     virtio_net.net_ready = false;
@@ -4686,7 +4726,7 @@ test "monitor: net ping sends an echo request to a resolved peer" {
     // Malformed addresses refuse exactly.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "ping", "nope" }));
-    try std.testing.expectEqualStrings("net ping: invalid address: nope\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: net ping: invalid address: nope\n", env.mock.contents());
     virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
     virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
     virtio_net.net_ops = saved_ops;
@@ -4717,10 +4757,10 @@ test "monitor: net udp — listen, close, and the report" {
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "udp", "listen", "7000" }));
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "udp", "listen", "7000" }));
-    try std.testing.expectEqualStrings("net udp: listen failed (table full or duplicate)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: net udp: listen failed (table full or duplicate)\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "listen", "nope" }));
-    try std.testing.expectEqualStrings("net udp: invalid port: nope\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: net udp: invalid port: nope\n", env.mock.contents());
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "listen", "70000" }));
 }
 
@@ -4794,10 +4834,10 @@ test "monitor: netsend refuses cleanly without a transport" {
     var mon = env.monitor();
     virtio_net.net_ready = false;
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "netsend", "32" }));
-    try std.testing.expectEqualStrings("netsend: transport not ready (no virtio-net device)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: netsend: transport not ready (no virtio-net device)\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "netsend", "abc" }));
-    try std.testing.expectEqualStrings("netsend: invalid byte count: abc\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: netsend: invalid byte count: abc\n", env.mock.contents());
 }
 
 test "monitor: netsend builds + submits a known frame (armed, mock transport)" {
@@ -4864,7 +4904,7 @@ test "monitor: net recv prints the received frame byte-exact and drains the FIFO
     // Unknown subcommand: documented refusal.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "bogus" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "net: unknown subcommand (try 'net', 'net recv', 'net ip <a.b.c.d>', 'net arp [<a.b.c.d>]', 'net ping <a.b.c.d>', 'net udp [listen|close|send|recv]', 'net dhcp' or 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]')\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: net: unknown subcommand (try 'net', 'net recv', 'net ip <a.b.c.d>', 'net arp [<a.b.c.d>]', 'net ping <a.b.c.d>', 'net udp [listen|close|send|recv]', 'net dhcp' or 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]')\n") != null);
     virtio_net.net_ready = false;
     virtio_net.rx_fifo_head = 0;
     virtio_net.rx_fifo_count = 0;
@@ -4990,13 +5030,13 @@ test "monitor: hex parses and formats with explicit errors" {
     try std.testing.expectEqualStrings("0xff\n0x10\n0x0\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "hex", "zz" }));
-    try std.testing.expectEqualStrings("hex: invalid number: zz\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: hex: invalid number: zz\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "hex", "-1" }));
-    try std.testing.expectEqualStrings("hex: invalid number: -1\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: hex: invalid number: -1\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "hex", "18446744073709551616" }));
-    try std.testing.expectEqualStrings("hex: invalid number: 18446744073709551616\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: hex: invalid number: 18446744073709551616\n", env.mock.contents());
 }
 
 test "monitor: repeat enforces count and byte bounds" {
@@ -5015,7 +5055,7 @@ test "monitor: repeat enforces count and byte bounds" {
     try std.testing.expectEqualStrings("repeat: count must be between 1 and 64\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "repeat", "zz", "x" }));
-    try std.testing.expectEqualStrings("repeat: invalid count: zz\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: repeat: invalid count: zz\n", env.mock.contents());
     env.mock.reset();
     // Count with no text repeats blank lines, deterministically.
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "repeat", "3" }));
@@ -5028,7 +5068,7 @@ test "monitor: repeat enforces count and byte bounds" {
     try std.testing.expectEqual(@as(usize, 57 * 71), env.mock.contents().len);
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "repeat", "58", long }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "repeat: output too large (max 4096 bytes)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: repeat: output too large (max 4096 bytes)") != null);
 }
 
 test "monitor: reboot and shutdown through a mock machine control" {
@@ -5056,7 +5096,7 @@ test "monitor: machine control failures are reported honestly" {
     env.machine.reboot_result = .failed;
     env.mock.reset();
     try std.testing.expectEqual(ExecError.machine_failed, exec(&mon, &.{"reboot"}));
-    try std.testing.expectEqualStrings("reboot: failed\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: reboot: failed\n", env.mock.contents());
 }
 
 test "monitor: disabled machine control is the honest default" {
@@ -5107,10 +5147,10 @@ test "monitor: beans is deterministic and bounded" {
     );
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "beans", "0" }));
-    try std.testing.expectEqualStrings("beans: count must be between 1 and 100\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: beans: count must be between 1 and 100\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "beans", "101" }));
-    try std.testing.expectEqualStrings("beans: count must be between 1 and 100\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: beans: count must be between 1 and 100\n", env.mock.contents());
 }
 
 test "monitor: random prints a deterministic hex line from the seeded CSPRNG and bounds count" {
@@ -5145,7 +5185,7 @@ test "monitor: random prints a deterministic hex line from the seeded CSPRNG and
     try std.testing.expectEqualStrings("random: count must be between 1 and 256\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "random", "zz" }));
-    try std.testing.expect(std.mem.startsWith(u8, env.mock.contents(), "random: invalid count: "));
+    try std.testing.expect(std.mem.startsWith(u8, env.mock.contents(), "error: random: invalid count: "));
 }
 
 test "monitor: fault is registered and honestly reports no vectors in a test process" {
@@ -5277,14 +5317,14 @@ test "monitor: kill refuses unknown, already-exited, and not-running targets exa
     env.mock.reset();
     _ = process.create("ROLLBACK.BIN", .{ .entry_va = 0x400000, .content_len = 1 }, .{}, .{});
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "kill", "ROLLBACK.BIN" }));
-    try std.testing.expectEqualStrings("kill: ROLLBACK.BIN not running\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: kill: ROLLBACK.BIN not running\n", env.mock.contents());
     // Unknown name and unknown numeric id.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "kill", "NOPE.BIN" }));
-    try std.testing.expectEqualStrings("kill: no such process: NOPE.BIN\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: kill: no such process: NOPE.BIN\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "kill", "9" }));
-    try std.testing.expectEqualStrings("kill: no such process: 9\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: kill: no such process: 9\n", env.mock.contents());
 }
 
 test "monitor: spawn is registered and reports the demo spawn or the bound" {
@@ -5437,10 +5477,10 @@ test "monitor: cat prints ESP content with honest errors" {
     try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "content not loaded") != null);
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "cat", "EFI" }));
-    try std.testing.expectEqualStrings("cat: EFI: is a directory\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: cat: EFI: is a directory\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "cat", "NOPE.TXT" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: cat: ") != null);
 }
 
 test "monitor: ls/cat accept /-paths (honest no-volume errors in a test process)" {
@@ -5451,10 +5491,10 @@ test "monitor: ls/cat accept /-paths (honest no-volume errors in a test process)
     // nothing and report it honestly (the success path is exercised live
     // by verify-live-fs.sh — `ls EFI/BOOT` + `cat EFI/BOOT/BOOTAA64.EFI`).
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "ls", "EFI/BOOT" }));
-    try std.testing.expectEqualStrings("ls: EFI/BOOT: not found (no such directory on the FAT volume)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: ls: EFI/BOOT: not found (no such directory on the FAT volume)\n", env.mock.contents());
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "cat", "EFI/BOOT/BOOTAA64.EFI" }));
-    try std.testing.expectEqualStrings("cat: EFI/BOOT/BOOTAA64.EFI: not found (no such file on the FAT volume)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: cat: EFI/BOOT/BOOTAA64.EFI: not found (no such file on the FAT volume)\n", env.mock.contents());
     env.mock.reset();
     // The no-arg ls still lists the (empty) window.
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{"ls"}));
@@ -5469,10 +5509,10 @@ test "monitor: mount is registered and reports honest transport errors in a test
     // sector ops fail, so both volumes report the I/O result honestly (the
     // success path is the live gate).
     try std.testing.expectEqual(ExecError.machine_failed, exec(&mon, &.{ "mount", "data" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "mount: data: sector I/O failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: mount: data: sector I/O failed") != null);
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "mount", "nvme0" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "unknown volume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: mount: unknown volume") != null);
     env.mock.reset();
     // The registry documents the command.
     try std.testing.expectEqualStrings("switch the active FAT volume (esp or data)", lookup("mount").?.help);
@@ -5486,20 +5526,20 @@ test "monitor: write joins arguments and honestly reports no disk in a test proc
     // write must be refused honestly, never faked.
     try std.testing.expectEqual(ExecError.not_implemented, exec(&mon, &.{ "write", "hello.txt", "hello", "world" }));
     try std.testing.expectEqualStrings(
-        "write: hello.txt: not persisted - no disk (FAT volume unavailable)\n",
+        "error: write: hello.txt: not persisted - no disk (FAT volume unavailable)\n",
         env.mock.contents(),
     );
     // Bounds are validated before any persistence attempt.
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "write", "bad/name.txt", "x" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "invalid file name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: write: invalid file name") != null);
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "write", "verylongname.txt", "x" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "does not fit FAT 8.3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), ": does not fit FAT 8.3") != null);
     env.mock.reset();
     // Empty content is allowed (a zero-length file); still refused honestly.
     try std.testing.expectEqual(ExecError.not_implemented, exec(&mon, &.{ "write", "n.txt" }));
-    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "content too long") == null);
+    try std.testing.expect(std.mem.indexOf(u8, env.mock.contents(), "error: content too long") == null);
 }
 
 test "monitor: exec is registered and refuses honestly without a disk" {
@@ -5512,5 +5552,94 @@ test "monitor: exec is registered and refuses honestly without a disk" {
     // (The full load+spawn path is covered by exec.zig's own tests, which
     // mount the in-memory FAT fixture and retire the static user task.)
     try std.testing.expectEqual(ExecError.not_implemented, exec(&mon, &.{"exec"}));
-    try std.testing.expectEqualStrings("exec: no disk (ESP FAT volume unavailable)\n", env.mock.contents());
+    try std.testing.expectEqualStrings("error: exec: no disk (ESP FAT volume unavailable)\n", env.mock.contents());
+}
+
+// ---------------------------------------------------------------------------
+// Card U3 (ADR 0008 D3): the handler fuzz — garbage never panics, and the
+// refusal output keeps the three D3 shapes.
+// ---------------------------------------------------------------------------
+
+test "monitor: card U3 — garbage argv never panics and keeps the D3 shapes" {
+    // Deterministic LCG (a seed change is a new fuzz, never a flaky one).
+    var seed: u32 = 0x0DD5EED;
+    const junk = [_][]const u8{
+        "",                     "x",  "-1",                     "999999999999999999999999",
+        "zz.zz",                "\"", "0x",                     "a b",
+        "..",                   "/",  " ",                      "0",
+        "18446744073709551616", "-0", "N/A",                    "\\",
+        "%",                    "n",  "99999999999999999999.9",
+    };
+    // Side-effect-free commands whose junk arguments must produce ONLY the
+    // D3 refusal shapes (or the usage hint line, which is the registry
+    // blurb). Commands that can legitimately succeed on arbitrary text
+    // (echo, help, ...) are excluded from the shape check but still run
+    // through the no-panic loop below.
+    const shape_checked = [_][]const u8{
+        "hex",  "beans", "repeat", "mount", "cat",     "write",  "ls",
+        "kill", "mbox",  "win",    "net",   "netsend", "screen", "text",
+        "usb",  "exec",
+    };
+    const verbs = ensure_registry();
+    var vi: usize = 0;
+    while (vi < verbs.len) : (vi += 1) {
+        var round: usize = 0;
+        while (round < 8) : (round += 1) {
+            var argv: [5][]const u8 = undefined;
+            argv[0] = verbs[vi].name;
+            const argc = 1 + (seed % 4);
+            var ai: usize = 1;
+            while (ai < argc) : (ai += 1) {
+                seed = seed *% 1664525 +% 1013904223;
+                argv[ai] = junk[seed % junk.len];
+            }
+            var env = TestEnv.init();
+            var mon = env.monitor();
+            _ = exec(&mon, argv[0..argc]);
+            const out = env.mock.contents();
+            // Shape discipline for the curated refusers: every line is one
+            // of the three D3 shapes or the usage hint (the blurb).
+            var checked = false;
+            for (shape_checked) |name| {
+                if (std.mem.eql(u8, name, verbs[vi].name)) checked = true;
+            }
+            if (!checked) continue;
+            // Shape discipline applies to REFUSALS: at least one junk
+            // argument must be present (a bare verb can be a legitimate
+            // no-argument success, e.g. `beans`).
+            if (argc < 2) continue;
+            var it = std.mem.splitScalar(u8, out, '\n');
+            while (it.next()) |line| {
+                if (line.len == 0) continue;
+                const ok_shape = std.mem.startsWith(u8, line, "error: ") or
+                    std.mem.startsWith(u8, line, "usage: ");
+                if (ok_shape) continue;
+                // The usage hint line is the command's own blurb.
+                var blurbed = false;
+                for (verbs) |*c| {
+                    if (std.mem.eql(u8, c.help, line)) blurbed = true;
+                }
+                if (!blurbed) {
+                    std.debug.print("shape violation for '{s}': \"{s}\"\n", .{ verbs[vi].name, line });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
+test "monitor: card U3 — garbage verbs all take the unknown-command shape" {
+    const junk_verbs = [_][]const u8{ "", "Z", "heip", "czt", "0", "?", "net x", "\t", "HELP", "Hex" };
+    for (junk_verbs) |v| {
+        var env = TestEnv.init();
+        var mon = env.monitor();
+        _ = exec(&mon, &.{v});
+        const out = env.mock.contents();
+        try std.testing.expect(std.mem.startsWith(u8, out, "unknown command '"));
+        try std.testing.expect(std.mem.indexOf(u8, out, "— try 'help'") != null);
+        // Case-sensitivity is the contract (D3): HELP/Hex must NOT resolve.
+        if (v.len > 0 and v[0] >= 'A' and v[0] <= 'Z') {
+            try std.testing.expect(std.mem.indexOf(u8, out, "usage:") == null);
+        }
+    }
 }

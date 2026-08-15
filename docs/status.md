@@ -518,7 +518,19 @@ dipshit>
     `tools/verify-live-lineedit.sh` PASS 13/13 on VZ (USB keyboard:
     submit/recall/Home+delete-sweep/Left+delete; serial bytes: Tab
     completion + every chord, atomic output-line assertions);
-    `verify-live-input.sh` re-ran green. U3–U8 are the next cards.
+    `verify-live-input.sh` re-ran green. **Card U3 (claim 5001) DONE
+    2026-08-14** — the ADR 0008 D3 enforcement: the three shapes are now
+    the only refusal output (`usage: <cmd> <args>` + the command's blurb
+    hint on misuse; `error: <actionable message>` on failure; `unknown
+    command '<x>' — try 'help'` on a bad verb, including the empty verb).
+    All 40 handlers' failure prints migrated onto the shared helpers;
+    honest status reports (device reports, kill-armed) intentionally keep
+    their report lines. The canonical transcript was regenerated with a
+    misuse section asserting each shape byte-exactly, and the new
+    deterministic fuzz drives 512 garbage lines through the tokenizer plus
+    every handler with garbage argv — no panic, refusal output
+    shape-checked, garbage verbs all take the unknown shape
+    (case-sensitivity pinned). U4–U8 are the next cards.
 
 The command layer above is portable; `docs/archive/march-m15.md` step 15's filesystem-command **deferral is superseded 2026-08-09** — first by the pre-exit ESP file window (claim 3475) and then, **on the same day, by the real FAT32 storage driver (claim 6420)**: `ls`/`cat`/`write` now read and write the live ESP's FAT volume through a virtio-blk transport, so files persist on the disk itself and **no storage driver remains deferred**. The allocator, interrupts, first tasks, EL0 boundary, syscall ABI, uaccess, per-task address spaces, lifecycle, ESP exec, and blocking syscalls are all complete; **milestone three is closed 2026-08-10 (tag `m3-userspace`, claim 0707)**.
 

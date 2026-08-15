@@ -305,7 +305,7 @@ if [ -f "$SB" ]; then
     # TCP in this run) — the report before the timeout shows it.
     grep -a -qF -- "tcp=syn_sent,peer=10.0.0.2:9999,syn=1,synack=0,ack=0,data_s=0,data_r=0,fin=0,finack=0,rst_s=0,rst_r=0,timedout=0,mal=0" "$SB" && BSYNREPORT=1
     # The 30 s connect timeout refused honestly.
-    grep -a -qF -- "net tcp: connect refused (no SYN-ACK after 30s) — run 'net tcp connect <addr> <port>' to retry" "$SB" && BREFUSED=1
+    grep -a -qF -- "error: net tcp: connect refused (no SYN-ACK after 30s) — run 'net tcp connect <addr> <port>' to retry" "$SB" && BREFUSED=1
     grep -a -qF -- "tcp=idle,peer=0.0.0.0:0,syn=1,synack=0,ack=0,data_s=0,data_r=0,fin=0,finack=0,rst_s=0,rst_r=0,timedout=1,mal=0" "$SB" && BTIMEDOUT=1
     grep -a -qF -- "n10b-done" "$SB" && BDONE=1
 fi

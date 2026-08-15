@@ -98,13 +98,21 @@ dipshit> cat BOOTED.TXT
 DIPSHITOS BOOTLOADER
 firmware has agreed to cooperate
 dipshit> write hello.txt hello world
-write: hello.txt: not persisted - no disk (FAT volume unavailable)
+error: write: hello.txt: not persisted - no disk (FAT volume unavailable)
 dipshit> cat hello.txt
-cat: hello.txt: not found (no such file on the ESP)
+error: cat: hello.txt: not found (no such file on the ESP)
+dipshit> frobnicate
+unknown command 'frobnicate' — try 'help'
+dipshit> hex
+usage: hex <number>...
+format an integer in hexadecimal
+dipshit> mount nowhere
+error: mount: unknown volume: nowhere (expected esp or data)
+dipshit> a b c d e f g h i j k l m n o p q r
+error: too many arguments (max 17 tokens)
 dipshit> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-unknown command: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-type 'help' for a list of commands
+unknown command 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' — try 'help'
 dipshit> ^C
 dipshit> 
-no command given; type 'help' for a list of commands
+unknown command '' — try 'help'
 dipshit> 

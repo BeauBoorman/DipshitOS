@@ -1010,8 +1010,10 @@ record new hardware assumptions in `docs/hardware-contract.md`.
   submit/recall/Home/Delete/Left; the chords + Tab are proven over the
   serial byte path — synthesized USB modifiers never reach VZ's HID
   report, recorded in the hardware contract).
-- **U3 — Error/usage contract.** ⬜ the mechanical enforcement of D3 (misuse
-  transcript + handler fuzz).
+- **U3 — Error/usage contract.** ✅ **done 2026-08-14 (claim 5001)** — the
+  mechanical enforcement of D3: misuse transcript (byte-exact, regenerated)
+  + the tokenizer/handler fuzz; the 40 handlers migrated onto the D3
+  helpers (see [`docs/march-m8.md`](march-m8.md)).
 - **U4 — Pointer focus + cursor.** ⬜ consume the absolute-pointer reports
   into Driving Award hit-test focus + cursor rendering (needs a runner
   pointer-synthesis seam, the I3 keyboard seam's analogue).

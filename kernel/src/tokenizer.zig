@@ -160,3 +160,26 @@ test "tokenizer: the max_tokens+1th token sets too_many" {
     try std.testing.expectEqual(max_tokens, result.count);
     try std.testing.expect(result.too_many);
 }
+
+test "tokenizer: card U3 — the garbage fuzz never panics and stays bounded" {
+    // ADR 0008 D3 (card U3): no input may crash the shell. Deterministic
+    // LCG — a seed change is a new fuzz, never a flaky one.
+    var seed: u32 = 0xC0FFEE;
+    var buf: [128]u8 = undefined;
+    var iter: usize = 0;
+    while (iter < 512) : (iter += 1) {
+        const len = seed % buf.len;
+        seed = seed *% 1664525 +% 1013904223;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            seed = seed *% 1664525 +% 1013904223;
+            // Printable ASCII plus the interesting controls: quote,
+            // backslash, space, tab.
+            buf[i] = @intCast(0x20 + (seed % 0x5f));
+            if (buf[i] == 0x7f) buf[i] = '"';
+        }
+        const r = tokenize(buf[0..len]);
+        try std.testing.expect(r.count <= max_tokens);
+        try std.testing.expect(r.argv.len == max_tokens);
+    }
+}

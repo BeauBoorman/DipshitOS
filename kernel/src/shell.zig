@@ -91,7 +91,8 @@ pub const Shell = struct {
                 self.editor.next_line();
                 self.prompt_shown = false;
                 if (rejected) {
-                    self.mon.console.print_line("input refused: line longer than 256 bytes");
+                    // ADR 0008 D3 failure shape (card U3).
+                    self.mon.console.print_line("error: input refused: line longer than 256 bytes");
                 }
                 handle_line(&self.mon, line);
                 return .processed;
@@ -107,7 +108,8 @@ var shell_state: Shell = undefined;
 fn handle_line(mon: *monitor.Monitor, line: []const u8) void {
     const tokens = tokenizer.tokenize(line);
     if (tokens.too_many) {
-        mon.console.print_line("too many arguments; type 'help' for a list of commands");
+        // ADR 0008 D3 failure shape (card U3).
+        mon.console.print_line("error: too many arguments (max 17 tokens)");
         return;
     }
     if (tokens.unbalanced_quote) {
@@ -382,17 +384,27 @@ test "shell: mock-fed end-to-end session produces the exact transcript" {
         "DIPSHITOS BOOTLOADER\n" ++
         "firmware has agreed to cooperate\n" ++
         "dipshit> write hello.txt hello world\r\n" ++
-        "write: hello.txt: not persisted - no disk (FAT volume unavailable)\n" ++
+        "error: write: hello.txt: not persisted - no disk (FAT volume unavailable)\n" ++
         "dipshit> cat hello.txt\r\n" ++
-        "cat: hello.txt: not found (no such file on the ESP)\n" ++
+        "error: cat: hello.txt: not found (no such file on the ESP)\n" ++
+        // Card U3: the ADR 0008 D3 misuse section — each of the three
+        // shapes asserted byte-exactly.
+        "dipshit> frobnicate\r\n" ++
+        "unknown command 'frobnicate' — try 'help'\n" ++
+        "dipshit> hex\r\n" ++
+        "usage: hex <number>...\n" ++
+        "format an integer in hexadecimal\n" ++
+        "dipshit> mount nowhere\r\n" ++
+        "error: mount: unknown volume: nowhere (expected esp or data)\n" ++
+        "dipshit> a b c d e f g h i j k l m n o p q r\r\n" ++
+        "error: too many arguments (max 17 tokens)\n" ++
         "dipshit> " ++ long ++ "\r\n" ++
-        "unknown command: " ++ long ++ "\n" ++
-        "type 'help' for a list of commands\n" ++
+        "unknown command '" ++ long ++ "' — try 'help'\n" ++
         "dipshit> ^C\r\n" ++
         // Enter pressed after the cancel submits an empty line, which the
         // registry answers with its no-command message (then a new prompt).
         "dipshit> \r\n" ++
-        "no command given; type 'help' for a list of commands\n" ++
+        "unknown command '' — try 'help'\n" ++
         "dipshit> ";
 
     var mock = console.MockConsole(8192){};
@@ -418,6 +430,9 @@ test "shell: mock-fed end-to-end session produces the exact transcript" {
     _ = esp.add_dir_entry("EFI");
     _ = esp.add_esp_entry("BOOTED.TXT", 0x29, "DIPSHITOS BOOTLOADER\nfirmware has agreed to cooperate\n");
     mock.feed("help\nversion\nmem\npages\npages selftest\ntasks\necho \"elephant business\"\nls\ncat BOOTED.TXT\nwrite hello.txt hello world\ncat hello.txt\n");
+    // Card U3: the D3 misuse feed — unknown verb, arity misuse (usage+hint),
+    // a handler refusal (error), and the tokenizer's too-many line.
+    mock.feed("frobnicate\nhex\nmount nowhere\na b c d e f g h i j k l m n o p q r\n");
     mock.feed(long);
     mock.feed("\n\x03\n");
     while (shell.poll() != .idle) {}
@@ -446,8 +461,8 @@ test "shell: over-long line is refused with a bell and an overflow notice" {
     const out = mock.contents();
     // 256 chars echoed, the 257th refused with a bell, then the notice.
     try std.testing.expect(std.mem.indexOf(u8, out, "b" ** 256 ++ "\x07") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "input refused: line longer than 256 bytes\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command: " ++ "b" ** 256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "error: input refused: line longer than 256 bytes\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command '" ++ "b" ** 256 ++ "' — try 'help'") != null);
 }
 
 test "shell: too many arguments refuses execution with the documented message" {
@@ -458,9 +473,9 @@ test "shell: too many arguments refuses execution with the documented message" {
     mock.feed("a b c d e f g h i j k l m n o p q r\n");
     while (shell.poll() != .idle) {}
     const out = mock.contents();
-    try std.testing.expect(std.mem.indexOf(u8, out, "too many arguments; type 'help' for a list of commands\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "error: too many arguments (max 17 tokens)\n") != null);
     // And it must not have executed anything.
-    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command ''") == null);
 }
 
 test "shell: unbalanced quote warns and executes the literal" {
@@ -481,7 +496,7 @@ test "shell: empty line reports no command via the registry" {
     mock.feed("\n");
     while (shell.poll() != .idle) {}
     const out = mock.contents();
-    try std.testing.expect(std.mem.indexOf(u8, out, "no command given; type 'help' for a list of commands\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command '' — try 'help'\n") != null);
 }
 
 test "shell: ctrl-c on an empty line cancels without executing" {
@@ -494,6 +509,6 @@ test "shell: ctrl-c on an empty line cancels without executing" {
     try std.testing.expect(std.mem.indexOf(u8, out, "^C\r\n") != null);
     // Cancelling must not execute anything — and, with no Enter after it,
     // must not submit an empty line either.
-    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command ''") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "no command given") == null);
 }

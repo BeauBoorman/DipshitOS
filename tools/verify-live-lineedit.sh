@@ -40,10 +40,10 @@
 #
 # The assertions (vm-serial.log unless noted):
 #   * "zz" output line            — completion + submit + run (USB)
-#   * "unknown command: xecho zz" — recall + Home + insert at cursor (USB)
+#   * "unknown command 'xecho zz'" — recall + Home + insert at cursor (USB)
 #   * "available commands:" x1    — the Delete sweep emptied the line and
 #                                   the second completion ran the catalog
-#   * "cab" / "def" / "to" / "q"  — Ctrl-A, Ctrl-A+E, Left+Ctrl-K, Ctrl-U
+#   * the D3 unknown-verb shape for 'cab'/'def'/'to'/'q' (Ctrl-A/A+E/K/U)
 #   * exactly one "^C\r\n"        — the scripted cancel, no strays
 #   * the serial marker           — the shell stays responsive on serial
 #   * the runner's input-string flag line + KEY-EVT lines (run log)
@@ -121,7 +121,7 @@ host/vm-runner/.build/release/VMRunner artifacts/disk.img artifacts/vm-serial.lo
     --script artifacts/live-lineedit-script.txt \
     --input-string "$KEYSTRING" --input-string-after "tasks user-el0 reaped" \
     --input-string-interval 3 \
-    --script2 artifacts/live-lineedit-chords.txt --script2-after $'unknown command: z\n' \
+    --script2 artifacts/live-lineedit-chords.txt --script2-after $"unknown command 'z" \
     --script2-delay 80 \
     --timeout 360 \
     > artifacts/live-lineedit-run.txt 2>&1
@@ -136,15 +136,15 @@ SERIAL_BYTES=0 SUBMIT=0 RECALL=0 DELETE=0 COMPLETE=0 CTRLA=0 CTRLE=0 CTRLK=0 CTR
 if [ -f "$SERIAL" ]; then
     SERIAL_BYTES=$(wc -c < "$SERIAL" | tr -d ' ')
     # USB-HID path proofs.
-    grep -a -qE -- 'unknown command: zk\r?$' "$SERIAL" && SUBMIT=1
-    grep -a -qF -- "no command given; type 'help' for a list of commands" "$SERIAL" && RECALL=1
-    grep -a -qE -- 'unknown command: z\r?$' "$SERIAL" && DELETE=1
+    grep -a -qF -- "unknown command 'zk'" "$SERIAL" && SUBMIT=1
+    grep -a -qF -- "unknown command ''" "$SERIAL" && RECALL=1
+    grep -a -qF -- "unknown command 'z'" "$SERIAL" && DELETE=1
     # Serial byte-path proofs (Tab + the Ctrl chords as raw bytes).
     grep -a -qE -- '^zz\r?$' "$SERIAL" && COMPLETE=1
-    grep -a -qE -- 'unknown command: cab\r?$' "$SERIAL" && CTRLA=1
-    grep -a -qE -- 'unknown command: def\r?$' "$SERIAL" && CTRLE=1
-    grep -a -qE -- 'unknown command: to\r?$' "$SERIAL" && CTRLK=1
-    grep -a -qE -- 'unknown command: q\r?$' "$SERIAL" && CTRLU=1
+    grep -a -qF -- "unknown command 'cab'" "$SERIAL" && CTRLA=1
+    grep -a -qF -- "unknown command 'def'" "$SERIAL" && CTRLE=1
+    grep -a -qF -- "unknown command 'to'" "$SERIAL" && CTRLK=1
+    grep -a -qF -- "unknown command 'q'" "$SERIAL" && CTRLU=1
     grep -a -qE -- '\^C\r?$' "$SERIAL" && CANCEL=1
     CANCELS=$( { grep -a -cE -- '\^C\r?$' "$SERIAL" || true; } | tr -d ' ')
     grep -a -qF -- "u2-serial-ok" "$SERIAL" && OBSDONE=1
