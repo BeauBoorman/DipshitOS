@@ -69,12 +69,12 @@ time and recorded in `docs/hardware-contract.md`).
   atomic output-line assertions; evidence `artifacts/live-lineedit-*`).
 - ✅ regression: `bash tools/verify-live-input.sh` PASS (the I3 surface
   after the input.zig changes).
-- ✅ mirror check: the glyph decode of this branch's captures reads
-  FORWARD with the exact tripwire baseline numbers (fwd 0/604, mirrored
-  549/595; clock title+body forward) — no orientation regression from the
-  text.zig change. The SCK-gated `verify-live-glyphs.sh` itself is
-  **blocked in this environment** (Screen Recording permission missing
-  for the terminal — the gate's phase-0 refuses the cacheDisplay
-  fallback captures); the decode above was run manually on those
-  captures (`tools/decode-screen-glyphs.py`).
+- ✅ mirror check: `bash tools/verify-live-glyphs.sh` **PASS** on this
+  branch — the ScreenCaptureKit composited-window capture decodes FORWARD
+  with the exact tripwire baseline numbers (fwd 0/604 ink, mirrored
+  549/595; the Driving Award clock title + body forward, mirrored
+  decisively worse) — no orientation regression from the text.zig change.
+  (First attempt was blocked in this environment — Screen Recording
+  permission missing for the terminal, phase-0 refuses the cacheDisplay
+  fallback — resolved after the permission grant + restart.)
 - ✅ `bash tools/verify-coordination.sh`

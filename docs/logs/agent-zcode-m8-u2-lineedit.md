@@ -73,3 +73,10 @@ Append-only. See [`README.md`](README.md) for the convention.
   Docs updated: status.md, roadmap.md, march-m8.md, gate-inventory.md,
   hardware-contract.md (the editing-key synthesis bounds), justfile
   (verify-vz + the gate target).
+- **2026-08-14** — **Glyphs tripwire resolved (zcode):** after the
+  terminal's Screen Recording permission grant + restart,
+  `bash tools/verify-live-glyphs.sh` **PASS** on this branch — the SCK
+  composited-window capture decodes forward at the exact baseline
+  (fwd 0/604, mirrored 549/595, clock window forward), closing the one
+  blocked step in the U2 close-out. The claim's blocked note is updated
+  to the observed PASS.
