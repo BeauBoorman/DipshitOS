@@ -96,7 +96,8 @@ pub fn armed() bool {
 
 /// Map a HID keyboard boot-protocol usage ID to an ASCII byte, applying
 /// shift when set. Returns null for usages outside the usable subset (the
-/// card's honest bound: no invented bytes).
+/// card's honest bound: no invented bytes). The U2 editing keys (arrows,
+/// Home, End, Delete) and Ctrl chords are NOT ASCII — see `usage_bytes`.
 pub fn hid_to_ascii(usage: u8, shift: bool) ?u8 {
     if (usage >= 0x04 and usage <= 0x1d) {
         // a..z
@@ -127,6 +128,35 @@ pub fn hid_to_ascii(usage: u8, shift: bool) ?u8 {
         0x38 => if (shift) '?' else '/',
         else => null,
     };
+}
+
+/// Milestone eight card U2 (ADR 0008 D2): the editing keys leave ASCII.
+/// Arrows/Home/End/Delete become the classic ANSI sequences a serial
+/// terminal sends (`ESC [ A/B/C/D`, `ESC [ H/F`, `ESC [ 3 ~`), and
+/// Ctrl+letter becomes the raw control byte (0x01..0x1a) — so the line
+/// editor's one parser serves both the USB-HID path and the serial path.
+/// Returns the byte count written into `out` (0 = not an editing key).
+pub fn usage_bytes(usage: u8, mods: u8, out: *[4]u8) usize {
+    const ctrl = (mods & 0x01) != 0 or (mods & 0x10) != 0; // left/right Ctrl
+    if (ctrl and usage >= 0x04 and usage <= 0x1d) {
+        out[0] = usage - 0x04 + 1; // Ctrl-A..Z -> 0x01..0x1a
+        return 1;
+    }
+    return switch (usage) {
+        0x4a => seq(out, "\x1b[H"), // Home
+        0x4c => seq(out, "\x1b[3~"), // Delete (forward)
+        0x4d => seq(out, "\x1b[F"), // End
+        0x4f => seq(out, "\x1b[C"), // Right
+        0x50 => seq(out, "\x1b[D"), // Left
+        0x51 => seq(out, "\x1b[B"), // Down
+        0x52 => seq(out, "\x1b[A"), // Up
+        else => 0,
+    };
+}
+
+fn seq(out: *[4]u8, s: []const u8) usize {
+    for (s, 0..) |b, i| out[i] = b;
+    return s.len;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +195,20 @@ fn decode_keyboard_report(rep: []const u8) void {
     const mods = rep[0];
     const shift = (mods & 0x02) != 0 or (mods & 0x20) != 0;
     kb_mods = mods;
+    // Claim-time diagnostic (card U2): one line per keyboard report —
+    // the raw modifier byte + the six rollover usages, so the exact usages
+    // VZ delivers for the editing keys (arrows/Home/End/Delete/chords)
+    // are observable in the serial log under --input.
+    if (debug != null) {
+        dbg("kb: rep mods=");
+        dbg_hex(mods);
+        dbg(" keys=");
+        for (rep[2..8]) |k| {
+            dbg_hex(k);
+            dbg(",");
+        }
+        dbg("\n");
+    }
     var keys: [6]u8 = [_]u8{0} ** 6;
     for (rep[2..8], 0..) |k, i| keys[i] = k;
     for (keys) |k| {
@@ -178,7 +222,15 @@ fn decode_keyboard_report(rep: []const u8) void {
         }
         if (!held) {
             kb_last_usage = k;
-            if (hid_to_ascii(k, shift)) |b| {
+            // Card U2: editing keys first (Ctrl chords + arrows/Home/End/
+            // Delete -> ANSI sequences), then the printable keymap.
+            var ebytes: [4]u8 = undefined;
+            const n = usage_bytes(k, mods, &ebytes);
+            if (n > 0) {
+                kb_last_byte = ebytes[0];
+                for (ebytes[0..n]) |b| push_byte(b);
+                events += 1;
+            } else if (hid_to_ascii(k, shift)) |b| {
                 kb_last_byte = b;
                 push_byte(b);
                 events += 1;
@@ -268,8 +320,54 @@ test "input: usages outside the usable subset are refused (no invented bytes)" {
     try std.testing.expectEqual(@as(?u8, null), hid_to_ascii(0x00, false));
     try std.testing.expectEqual(@as(?u8, null), hid_to_ascii(0x29, false)); // Escape
     try std.testing.expectEqual(@as(?u8, null), hid_to_ascii(0x39, false)); // Caps Lock
-    try std.testing.expectEqual(@as(?u8, null), hid_to_ascii(0x4c, false)); // Pause
+    try std.testing.expectEqual(@as(?u8, null), hid_to_ascii(0x4c, false)); // Delete (not ASCII)
     try std.testing.expectEqual(@as(?u8, null), hid_to_ascii(0xe0, false)); // Left Ctrl
+}
+
+test "input: card U2 — editing usages map to the ANSI sequences a serial terminal sends" {
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[A", out[0..usage_bytes(0x52, 0, &out)]); // Up
+    try std.testing.expectEqualStrings("\x1b[B", out[0..usage_bytes(0x51, 0, &out)]); // Down
+    try std.testing.expectEqualStrings("\x1b[C", out[0..usage_bytes(0x4f, 0, &out)]); // Right
+    try std.testing.expectEqualStrings("\x1b[D", out[0..usage_bytes(0x50, 0, &out)]); // Left
+    try std.testing.expectEqualStrings("\x1b[H", out[0..usage_bytes(0x4a, 0, &out)]); // Home
+    try std.testing.expectEqualStrings("\x1b[F", out[0..usage_bytes(0x4d, 0, &out)]); // End
+    try std.testing.expectEqualStrings("\x1b[3~", out[0..usage_bytes(0x4c, 0, &out)]); // Delete
+    // Not editing keys: zero bytes (the ASCII keymap handles them, or refuses).
+    try std.testing.expectEqual(@as(usize, 0), usage_bytes(0x04, 0, &out));
+    try std.testing.expectEqual(@as(usize, 0), usage_bytes(0x28, 0, &out));
+    try std.testing.expectEqual(@as(usize, 0), usage_bytes(0x39, 0, &out));
+}
+
+test "input: card U2 — Ctrl+letter maps to the raw control byte (both Ctrl mods)" {
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("\x01", out[0..usage_bytes(0x04, 0x01, &out)]); // Ctrl-A (left)
+    try std.testing.expectEqualStrings("\x05", out[0..usage_bytes(0x08, 0x10, &out)]); // Ctrl-E (right)
+    try std.testing.expectEqualStrings("\x03", out[0..usage_bytes(0x06, 0x01, &out)]); // Ctrl-C
+    try std.testing.expectEqualStrings("\x0b", out[0..usage_bytes(0x0e, 0x01, &out)]); // Ctrl-K ('k' = 0x0e)
+    try std.testing.expectEqualStrings("\x15", out[0..usage_bytes(0x18, 0x01, &out)]); // Ctrl-U ('u' = 0x18)
+    try std.testing.expectEqualStrings("\x0c", out[0..usage_bytes(0x0f, 0x01, &out)]); // Ctrl-L ('l' = 0x0f)
+    // Ctrl without a letter is not a chord (e.g. Ctrl+Enter stays Enter).
+    try std.testing.expectEqual(@as(usize, 0), usage_bytes(0x28, 0x01, &out));
+}
+
+test "input: keyboard report decode pushes arrow sequences and Ctrl chords" {
+    fifo_count = 0;
+    fifo_head = 0;
+    events = 0;
+    dropped = 0;
+    kb_held = [_]u8{0} ** 6;
+    // Up arrow pressed (usage 0x52): ESC [ A lands in the FIFO.
+    decode_keyboard_report(&[_]u8{ 0, 0, 0x52, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(usize, 3), fifo_count);
+    try std.testing.expectEqual(@as(u8, 0x1b), pop_byte().?);
+    try std.testing.expectEqual(@as(u8, '['), pop_byte().?);
+    try std.testing.expectEqual(@as(u8, 'A'), pop_byte().?);
+    // Ctrl+A pressed (left Ctrl 0x01 + usage 0x04): 0x01 lands.
+    decode_keyboard_report(&[_]u8{ 0x01, 0, 0x04, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(usize, 1), fifo_count);
+    try std.testing.expectEqual(@as(u8, 0x01), pop_byte().?);
+    try std.testing.expectEqual(@as(usize, 2), events);
 }
 
 test "input: keyboard report decode pushes key-down bytes with shift" {

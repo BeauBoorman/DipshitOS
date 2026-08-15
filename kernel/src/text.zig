@@ -67,6 +67,13 @@ var cur_col: usize = 0;
 /// Whether the text layer has been initialized (the ring reset).
 var initialized: bool = false;
 
+/// Escape-sequence parser state for the editing bytes the console now
+/// emits (milestone eight card U2): `\b` (cursor left), `\r` (column 0),
+/// and `ESC [ 2 J` / `ESC [ H` (the `clear` command's and Ctrl-L's
+/// erase-in-display — previously rendered as junk glyph cells).
+const EscState = enum { none, esc, csi, csi_two };
+var esc_state: EscState = .none;
+
 /// A B8G8R8X8 canvas the renderer writes into (injectable for tests).
 pub const Canvas = struct {
     base: [*]u8,
@@ -113,15 +120,60 @@ fn cursor_slot() usize {
     return cur_line;
 }
 
-/// Emit one character. `\n` starts a new line; every other byte renders
-/// into the current line (printable chars draw the glyph, control bytes
-/// draw as blank), wrapping to a new line at the region's width.
+/// Emit one character. `\n` starts a new line; the editing bytes move the
+/// cursor instead of drawing (card U2): `\r` returns to column 0, `\b`
+/// steps one cell left, and `ESC [ 2 J` / `ESC [ H` clear the layer (the
+/// clear command + the editor's Ctrl-L). Every other byte renders into
+/// the current line (printable chars draw the glyph, control bytes draw
+/// as blank), wrapping to a new line at the region's width. Unknown
+/// escape sequences are swallowed.
 pub fn putc(c: u8) void {
     if (!initialized) init();
-    if (c == '\n') {
-        _ = new_line();
+    if (esc_state != .none) {
+        putc_esc(c);
         return;
     }
+    switch (c) {
+        0x1b => esc_state = .esc,
+        '\r' => cur_col = 0,
+        0x08 => {
+            if (cur_col > 0) cur_col -= 1;
+        },
+        '\n' => _ = new_line(),
+        else => put_glyph(c),
+    }
+}
+
+/// The escape-sequence half of `putc` (only `ESC [ 2 J` and `ESC [ H`
+/// are produced by the console; anything else is swallowed, never drawn).
+fn putc_esc(c: u8) void {
+    switch (esc_state) {
+        .none => unreachable,
+        .esc => if (c == '[') {
+            esc_state = .csi;
+        } else if (c == 0x1b) {
+            // stay at the start of a sequence
+        } else {
+            esc_state = .none;
+            putc(c); // a lone ESC + a real byte: the byte renders normally
+        },
+        .csi => if (c == '2') {
+            esc_state = .csi_two;
+        } else if (c == 'H') {
+            esc_state = .none;
+            cur_col = 0; // cursor home (after a clear: column 0)
+        } else {
+            esc_state = .none; // unknown sequence: swallowed
+        },
+        .csi_two => {
+            esc_state = .none;
+            if (c == 'J') init(); // ESC [ 2 J: erase in display
+        },
+    }
+}
+
+/// The glyph path (the pre-U2 `putc` body): draw the cell, advance, wrap.
+fn put_glyph(c: u8) void {
     var slot = cursor_slot();
     if (cur_col >= cols) {
         slot = new_line();
@@ -309,6 +361,52 @@ test "text: clear resets the ring and cursor" {
     try std.testing.expectEqual(@as(usize, 0), ring_count);
     try std.testing.expectEqual(@as(usize, 0), cur_col);
     try std.testing.expectEqual(@as(usize, 0), cursor_row());
+}
+
+test "text: card U2 — backspace moves the cursor left and overwrites" {
+    init();
+    clear();
+    puts("ab\x08 \x08"); // the editor's erase pair: back up, blank, back up
+    try std.testing.expectEqual(@as(usize, 1), cur_col);
+    const slot = cur_line;
+    try std.testing.expectEqual(@as(u8, 'a'), ring[slot][0]);
+    // A mid-line edit stream renders the corrected line: "ab", left,
+    // 'c' -> the cell shows "ac" with the cursor at 2.
+    init();
+    clear();
+    puts("ab\x08c");
+    try std.testing.expectEqual(@as(usize, 2), cur_col);
+    try std.testing.expectEqual(@as(u8, 'a'), ring[cur_line][0]);
+    try std.testing.expectEqual(@as(u8, 'c'), ring[cur_line][1]);
+}
+
+test "text: card U2 — carriage return returns to column 0" {
+    init();
+    clear();
+    puts("ab\rc");
+    try std.testing.expectEqual(@as(usize, 1), cur_col);
+    try std.testing.expectEqual(@as(u8, 'c'), ring[cur_line][0]);
+    try std.testing.expectEqual(@as(u8, 'b'), ring[cur_line][1]); // stale tail kept
+}
+
+test "text: card U2 — ESC [ 2 J ESC [ H clears; a lone ESC passes the byte through" {
+    init();
+    clear();
+    puts("junk");
+    try std.testing.expect(ring_count >= 1);
+    puts("\x1b[2J\x1b[H");
+    try std.testing.expectEqual(@as(usize, 0), ring_count);
+    try std.testing.expectEqual(@as(usize, 0), cur_col);
+    // A lone ESC followed by a printable: the printable renders normally.
+    puts("\x1bx");
+    try std.testing.expectEqual(@as(usize, 1), cur_col);
+    try std.testing.expectEqual(@as(u8, 'x'), ring[cursor_slot()][0]);
+    // Unknown sequences are swallowed, never drawn.
+    init();
+    clear();
+    puts("\x1b[Zok");
+    try std.testing.expectEqual(@as(usize, 2), cur_col);
+    try std.testing.expectEqual(@as(u8, 'o'), ring[cur_line][0]);
 }
 
 test "text: render never writes outside the canvas" {

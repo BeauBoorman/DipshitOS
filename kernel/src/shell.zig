@@ -15,7 +15,10 @@
 //! 6684); without RX it prints the prompt and returns so the kernel parks
 //! in WFE. No device register is read by this module.
 //!
-//! No libc, no POSIX, no allocation, no global mutable state.
+//! No libc, no POSIX, no allocation. The single piece of global mutable
+//! state is `shell_state` — the kernel-path Shell parked in BSS so the
+//! editor's history ring (card U2) does not ride the 16 KiB boot stack;
+//! host tests construct their own Shells and never touch it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,7 +55,13 @@ pub const Shell = struct {
     prompt_shown: bool = false,
 
     pub fn init(con: console.Console, state: monitor.SystemState, machine: monitor.MachineControl) Shell {
-        return .{ .mon = monitor.Monitor.init(con, state, machine) };
+        // Card U2 (ADR 0008 D2): the editor gets the monitor's tab
+        // completer (verbs + sub-verbs) and the prompt string, so Ctrl-L
+        // can repaint the full line.
+        return .{
+            .mon = monitor.Monitor.init(con, state, machine),
+            .editor = .{ .completer = monitor.complete_line, .prompt = "dipshit> " },
+        };
     }
 
     /// Print the boot banner once (`monitor.banner`).
@@ -91,6 +100,10 @@ pub const Shell = struct {
     }
 };
 
+/// The kernel-path Shell storage (see boot_and_park). Host tests never
+/// touch it — they build their own Shells against a mock console.
+var shell_state: Shell = undefined;
+
 fn handle_line(mon: *monitor.Monitor, line: []const u8) void {
     const tokens = tokenizer.tokenize(line);
     if (tokens.too_many) {
@@ -113,7 +126,13 @@ pub fn boot_and_park(mon: *monitor.Monitor, rx_wired: bool) void {
         mon.console.puts("dipshit> ");
         return;
     }
-    var shell = Shell.init(mon.console, mon.state, mon.machine);
+    // Card U2: the kernel-path Shell lives in fixed BSS, not on the boot
+    // stack — the editor's history ring (16 x 256 B + draft, ADR 0008 D2)
+    // would eat over half of the 16 KiB stack ADR 0004 D5 allocates.
+    // boot_and_park never returns, so the storage is effectively
+    // single-assignment; host tests construct their own Shells.
+    shell_state = Shell.init(mon.console, mon.state, mon.machine);
+    const shell = &shell_state;
     while (true) {
         if (shell.poll() == .idle) {
             // Claim 9187: the timer is serviced only through the IRQ path.

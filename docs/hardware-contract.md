@@ -163,6 +163,42 @@ assumption comes from documentation or reasoning only.
     and the guest's own `input` report showed `events=6` (i,n,p,u,t,Enter)
     with `dropped=0`, `kb-usage=0x28 kb-byte=0xa` (Enter); evidence under
     `artifacts/live-input-*`.
+  - **Editing-key synthesis (observed 2026-08-14, claim 6233, card U2):**
+    the runner's `--input-string` gains editing-key tokens
+    (`<up>/<down>/<left>/<right>/<home>/<end>/<delete>/<enter>/<tab>`) and
+    `^a`..`^z` Ctrl chords; the seam's honest bounds, each observed in the
+    guest's own per-report debug stream (`kb: rep` lines, printed under
+    `--input`):
+    - **The editing usages ARE delivered when the NSEvents carry AUTHENTIC
+      Cocoa characters** — the function-key unicodes (U+F700-Up … U+F72B,
+      Delete U+F728), `"\t"` for Tab, `"\r"` for Return. Observed usages:
+      Up=0x52, Left=0x50, Home=0x4a, Delete=0x4c, Tab=0x2b, Enter=0x28.
+      Made-up ASCII `characters` strings ("left", "tab") make VZ's event
+      translation misbehave — phantom keystrokes and lost keys.
+    - **Synthesized Ctrl modifiers do NOT reach the HID report.** Three
+      routes observed failing: `modifierFlags` on a synthesized keyDown
+      (arrives as the plain letter), `NSEvent.otherEvent`/`NSEvent(cgEvent:)`
+      for `.flagsChanged` (AppKit rejects the type —
+      NSInternalInconsistencyException), and a `keyEvent`-factory
+      flagsChanged pair (accepted by AppKit, ignored by VZ's report
+      composition). The chords are therefore gate-proven over the SERIAL
+      byte path (raw 0x01..0x1a — byte-identical to the HID decode's
+      output); a real keyboard's flagsChanged events are unaffected.
+    - **VZ re-delivers the session's FIRST usage once as a phantom
+      keystroke mid-session** (5/5 observed runs: first key 'a' ⇒ a stray
+      'a' ~30-60 s in; 'e' ⇒ 'e'). The gate's session starts with a
+      sacrificial `<left>` (on an empty line: a refused bell) so the
+      phantom is harmless; recall (wholesale line replace) wipes any
+      phantom that lands in a draft.
+    - **Reports still coalesce at the present cadence** (the I3 bound): a
+      busy output window can drop a report between drains — the gate
+      types after `tasks user-el0 reaped` (the quiet machine) at 3 s per
+      keystroke (`--input-string-interval`), and its assertions target
+      atomic guest-emitted output lines, never multi-keystroke typed
+      echoes.
+    **[observed]** — `tools/verify-live-lineedit.sh` (PASS 13/13) and the
+    report streams under `artifacts/u2-probe*`; the I3 gate re-ran green
+    after the input.zig changes (`verify-live-input.sh` PASS).
   All **[observed]** — `tools/verify-live-usb.sh` (PASS 11/11) and the saved
   logs under `artifacts/usb-discovery-*` + `artifacts/live-usb-*`.
 - Entropy: virtio entropy device (`VZVirtioEntropyDeviceConfiguration`).

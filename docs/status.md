@@ -498,7 +498,27 @@ dipshit>
     byte-identical transcript (shell.zig e2e + `tests/transcript-console.txt`)
     regenerated to the grouped listing, and the new live gate
     `tools/verify-live-help.sh` PASS 1/1 on VZ (scripted help walk).
-    U2–U8 are the next cards.
+    **Card U2 (claim 6233) DONE 2026-08-14** — the ADR 0008 D2 editing
+    surface: `kernel/src/lineedit.zig` gains the bounded session history
+    ring (16 × 256 B + recall draft), cursor left/right/Home/End, the
+    Ctrl-A/E/K/U/L chords (+ the existing Ctrl-C), forward Delete, and
+    tab completion through `monitor.complete_line` (registry verbs + a
+    bounded sub-verb table; bell on ambiguity — no listing);
+    `kernel/src/input.zig` maps the arrow/Home/End/Delete usages to the
+    ANSI sequences and Ctrl+letter to the raw control bytes (one parser
+    serves the USB-HID and serial paths alike); `kernel/src/text.zig`
+    interprets the editing bytes on screen (cursor motion instead of junk
+    cells). The M1.5 byte seam is preserved (`\b \b`, `\r\n`, `^C\r\n` —
+    the class-A transcript gate stays byte-identical) and the kernel-path
+    Shell moved to BSS so the history ring never rides the 16 KiB boot
+    stack. The runner's `--input-string` seam gains the editing-key tokens
+    and `^a`..`^z` chords (authentic Cocoa characters; the VZ synthesis
+    bounds are recorded in the hardware contract — synthesized Ctrl
+    modifiers never reach the HID report). The new live gate
+    `tools/verify-live-lineedit.sh` PASS 13/13 on VZ (USB keyboard:
+    submit/recall/Home+delete-sweep/Left+delete; serial bytes: Tab
+    completion + every chord, atomic output-line assertions);
+    `verify-live-input.sh` re-ran green. U3–U8 are the next cards.
 
 The command layer above is portable; `docs/archive/march-m15.md` step 15's filesystem-command **deferral is superseded 2026-08-09** — first by the pre-exit ESP file window (claim 3475) and then, **on the same day, by the real FAT32 storage driver (claim 6420)**: `ls`/`cat`/`write` now read and write the live ESP's FAT volume through a virtio-blk transport, so files persist on the disk itself and **no storage driver remains deferred**. The allocator, interrupts, first tasks, EL0 boundary, syscall ABI, uaccess, per-task address spaces, lifecycle, ESP exec, and blocking syscalls are all complete; **milestone three is closed 2026-08-10 (tag `m3-userspace`, claim 0707)**.
 

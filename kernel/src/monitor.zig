@@ -329,6 +329,144 @@ pub fn lookup(name: []const u8) ?*const Command {
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Tab completion (milestone eight card U2, ADR 0008 D2)
+// ---------------------------------------------------------------------------
+
+/// One sub-verb word: `verb sub word` (sub = "" for depth-1 sub-verbs).
+/// Mirrors the usage strings of the multi-verb commands; bounded — a word
+/// missing from this table simply does not complete.
+const SubWord = struct {
+    verb: []const u8,
+    sub: []const u8 = "",
+    word: []const u8,
+};
+
+const sub_words_count: usize = 30;
+
+/// Runtime-built BSS table (the claim-0015 lesson: per-element code
+/// assignments with string literals stay PC-relative at any load base;
+/// a const table of slice pointers would not).
+var sub_words_storage: [sub_words_count]SubWord = undefined;
+var sub_words_ready = false;
+
+fn ensure_sub_words() []const SubWord {
+    if (!sub_words_ready) {
+        sub_words_storage = .{
+            .{ .verb = "mount", .word = "esp" },
+            .{ .verb = "mount", .word = "data" },
+            .{ .verb = "net", .word = "arp" },
+            .{ .verb = "net", .word = "dhcp" },
+            .{ .verb = "net", .word = "ip" },
+            .{ .verb = "net", .word = "ping" },
+            .{ .verb = "net", .word = "recv" },
+            .{ .verb = "net", .word = "tcp" },
+            .{ .verb = "net", .word = "udp" },
+            .{ .verb = "net", .sub = "tcp", .word = "close" },
+            .{ .verb = "net", .sub = "tcp", .word = "connect" },
+            .{ .verb = "net", .sub = "tcp", .word = "reset" },
+            .{ .verb = "net", .sub = "tcp", .word = "send" },
+            .{ .verb = "net", .sub = "udp", .word = "close" },
+            .{ .verb = "net", .sub = "udp", .word = "listen" },
+            .{ .verb = "net", .sub = "udp", .word = "recv" },
+            .{ .verb = "net", .sub = "udp", .word = "send" },
+            .{ .verb = "pages", .word = "selftest" },
+            .{ .verb = "screen", .word = "fill" },
+            .{ .verb = "screen", .word = "peek" },
+            .{ .verb = "text", .word = "clear" },
+            .{ .verb = "text", .word = "put" },
+            .{ .verb = "usb", .word = "devices" },
+            .{ .verb = "usb", .word = "report" },
+            .{ .verb = "win", .word = "close" },
+            .{ .verb = "win", .word = "focus" },
+            .{ .verb = "win", .word = "hit" },
+            .{ .verb = "win", .word = "list" },
+            .{ .verb = "win", .word = "move" },
+            .{ .verb = "win", .word = "raise" },
+        };
+        sub_words_ready = true;
+    }
+    return &sub_words_storage;
+}
+
+/// Scratch for the returned extension (longest command name + trailing
+/// space; bounded, reused per call — the caller inserts before any
+/// reentry).
+var completion_scratch: [24]u8 = undefined;
+
+/// The line editor's tab completer (ADR 0008 D2: bounded completion of
+/// verbs and sub-verbs; no match or ambiguity returns null so the editor
+/// bells — there is no alternative listing). `line` is the buffer up to
+/// the cursor; the completed token is its last (possibly partial) word.
+pub fn complete_line(line: []const u8) ?[]const u8 {
+    // The word being completed: after the last space.
+    var word_start: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == ' ') word_start = i + 1;
+    }
+    const word = line[word_start..];
+
+    if (word_start == 0) {
+        // First token: complete a registry verb.
+        var match: ?[]const u8 = null;
+        var matches: usize = 0;
+        for (ensure_registry()) |*cmd| {
+            if (!std.mem.startsWith(u8, cmd.name, word)) continue;
+            matches += 1;
+            match = cmd.name;
+        }
+        return extension(word, matches, match);
+    }
+
+    // A later token: complete a sub-verb where the table knows one. argv[0]
+    // is the verb; argv[1] (when the word is the third token) selects a
+    // depth-2 list.
+    var argv: [2][]const u8 = undefined;
+    var argv_len: usize = 0;
+    var token_start: usize = 0;
+    var in_token = false;
+    var j: usize = 0;
+    while (j < word_start) : (j += 1) {
+        if (line[j] == ' ') {
+            if (in_token and argv_len < 2) {
+                argv[argv_len] = line[token_start..j];
+                argv_len += 1;
+            }
+            in_token = false;
+        } else {
+            if (!in_token) token_start = j;
+            in_token = true;
+        }
+    }
+    if (argv_len == 0) return null;
+    const sub: []const u8 = if (argv_len == 2) argv[1] else "";
+    var match: ?[]const u8 = null;
+    var matches: usize = 0;
+    for (ensure_sub_words()) |row| {
+        if (!std.mem.eql(u8, row.verb, argv[0])) continue;
+        if (!std.mem.eql(u8, row.sub, sub)) continue;
+        if (!std.mem.startsWith(u8, row.word, word)) continue;
+        matches += 1;
+        match = row.word;
+    }
+    return extension(word, matches, match);
+}
+
+/// Unique-prefix rule: exactly one candidate → its remaining suffix plus a
+/// space (a fully-typed unique word completes to itself + space); anything
+/// else (zero or 2+) → null (bell).
+fn extension(word: []const u8, matches: usize, match: ?[]const u8) ?[]const u8 {
+    if (matches != 1) return null;
+    const name = match.?;
+    if (word.len >= name.len) return " "; // fully typed: just the space
+    const suffix = name[word.len..];
+    if (suffix.len + 1 > completion_scratch.len) return null;
+    @memcpy(completion_scratch[0..suffix.len], suffix);
+    completion_scratch[suffix.len] = ' ';
+    return completion_scratch[0 .. suffix.len + 1];
+}
+
 /// Execute an already-tokenized command line: `argv[0]` is the command
 /// name, the rest are its arguments. Tokenization and line editing belong
 /// to the later Console & Shell Core stream.
@@ -4149,6 +4287,47 @@ test "monitor: help opens topic pages (and commands win over topics)" {
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "help", "input" }));
     try std.testing.expect(std.mem.startsWith(u8, env.mock.contents(), "input - "));
+}
+
+test "monitor: card U2 — complete_line completes verbs by unique prefix" {
+    try std.testing.expectEqualStrings("sion ", complete_line("ver").?);
+    // "he" is genuinely ambiguous (help + hex) — use the longer prefix.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("he"));
+    try std.testing.expectEqualStrings("p ", complete_line("hel").?);
+    try std.testing.expectEqualStrings("ces ", complete_line("addrspa").?);
+    // A fully-typed unique verb completes to just the space.
+    try std.testing.expectEqualStrings(" ", complete_line("echo").?);
+    // Ambiguity: net + netsend (and more) share the "n" prefix.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("n"));
+    // Even "net" is ambiguous (netsend): bell, not a wrong completion.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("net"));
+    try std.testing.expectEqualStrings("nd ", complete_line("netse").?);
+    // No match at all.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("zz"));
+}
+
+test "monitor: card U2 — complete_line completes sub-verbs by table" {
+    try std.testing.expectEqualStrings("dp ", complete_line("net u").?);
+    try std.testing.expectEqualStrings("ing ", complete_line("net p").?);
+    try std.testing.expectEqualStrings(" ", complete_line("net udp").?); // fully typed + space
+    // The word after a completed verb: "net udp " completes nothing at
+    // depth 2 with an empty word unless a row starts with "" — all do,
+    // so an empty word is ambiguous (4 udp words): bell.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("net udp "));
+}
+
+test "monitor: card U2 — complete_line completes depth-2 sub-verbs" {
+    try std.testing.expectEqualStrings("sten ", complete_line("net udp li").?);
+    try std.testing.expectEqualStrings("ect ", complete_line("net tcp conn").?);
+    try std.testing.expectEqualStrings("ocus ", complete_line("win f").?);
+    try std.testing.expectEqualStrings("ata ", complete_line("mount d").?);
+    // Ambiguous sub-verbs: net udp c (close) vs nothing else? close is
+    // unique; but net tcp c is ambiguous (close/connect).
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("net tcp c"));
+    // Unknown verb: no sub-verb completion.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("echo tr"));
+    // A verb with no sub-verbs at depth 2: "mount esp x" has no table rows.
+    try std.testing.expectEqual(@as(?[]const u8, null), complete_line("mount esp x"));
 }
 
 test "monitor: help listing is grouped by category in the ADR 0008 order" {

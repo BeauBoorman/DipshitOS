@@ -1003,8 +1003,13 @@ record new hardware assumptions in `docs/hardware-contract.md`.
   command-named topics (`syscalls`, `input`) resolve to their command detail.
   Gate: the byte-identical transcript (regenerated) + the live `help` walk
   `tools/verify-live-help.sh` PASS 1/1 on VZ.
-- **U2 — Shell editing & history.** ⬜ history ring, cursor movement,
-  Ctrl-A/E/K/U/L, Delete, tab completion over the I3 input path.
+- **U2 — Shell editing & history.** ✅ **done 2026-08-14 (claim 6233)** —
+  history ring (16 entries + draft), cursor movement, Ctrl-A/E/K/U/L,
+  Delete, tab completion over the I3 input path; gate
+  `tools/verify-live-lineedit.sh` PASS 13/13 on VZ (USB keyboard proves
+  submit/recall/Home/Delete/Left; the chords + Tab are proven over the
+  serial byte path — synthesized USB modifiers never reach VZ's HID
+  report, recorded in the hardware contract).
 - **U3 — Error/usage contract.** ⬜ the mechanical enforcement of D3 (misuse
   transcript + handler fuzz).
 - **U4 — Pointer focus + cursor.** ⬜ consume the absolute-pointer reports

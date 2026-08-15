@@ -192,6 +192,12 @@ var inputKeyAfter: String?
 // Road Pops.
 var inputString: String?
 var inputStringAfter: String?
+// Card U2 (claim 6233): seconds between synthesized events. The I3 default
+// 2 s matches VZ's report cadence (~one per Road Pops present); longer
+// intervals trade session time for loss resistance when the boot-time
+// output load makes reports coalesce (single-TRB arming holds one pending
+// report — observed claim-time).
+var inputStringInterval: Double = 2.0
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
 var expectLine = "firmware has agreed to cooperate"
@@ -356,6 +362,12 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--input-string-after", idx + 1 < arguments.count {
         inputStringAfter = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--input-string-interval", idx + 1 < arguments.count {
+        guard let d = Double(arguments[idx + 1]), d > 0 else {
+            fail("--input-string-interval requires a positive number of seconds.")
+        }
+        inputStringInterval = d
         idx += 2
     } else if arg == "--timeout", idx + 1 < arguments.count {
         timeout = TimeInterval(arguments[idx + 1]) ?? 30
@@ -1693,6 +1705,27 @@ func startKeyInject() {
 }
 
 // Milestone seven card I3 (claim 6050): map an ASCII character to its macOS
+// Milestone eight card U2 (ADR 0008 D2): the editing-key tokens --input-string
+// accepts beside literal characters. Each token maps to (macOS keycode,
+// authentic Cocoa characters) — REAL arrow/function keyDown events carry the
+// function-key unicodes (NSUpArrowFunctionKey 0xF700 etc.), Tab carries
+// "\t", Return "\r"; VZ's event translation is unpredictable when handed
+// made-up ASCII strings (observed: phantom keystrokes + dropped keys).
+// `^x` Ctrl chords send a flagsChanged(.control) pair around the letter's
+// keyDown/keyUp — VZ ignores modifierFlags on a synthesized keyDown
+// (observed: Ctrl-A arrived as a plain 'a').
+let editingKeyTokens: [String: (code: UInt16, chars: String)] = [
+    "<up>": (126, String(UnicodeScalar(0xF700)!)), // NSUpArrowFunctionKey
+    "<down>": (125, String(UnicodeScalar(0xF701)!)), // NSDownArrowFunctionKey
+    "<left>": (123, String(UnicodeScalar(0xF702)!)), // NSLeftArrowFunctionKey
+    "<right>": (124, String(UnicodeScalar(0xF703)!)), // NSRightArrowFunctionKey
+    "<delete>": (117, String(UnicodeScalar(0xF728)!)), // NSDeleteFunctionKey (forward)
+    "<home>": (115, String(UnicodeScalar(0xF729)!)), // NSHomeFunctionKey
+    "<end>": (119, String(UnicodeScalar(0xF72B)!)), // NSEndFunctionKey
+    "<enter>": (0x24, "\r"), // Return
+    "<tab>": (0x30, "\t"), // Tab
+]
+
 // virtual keycode + whether shift is required. Only the usable subset the
 // guest keymap accepts is covered; anything else returns nil (the caller
 // fails honestly rather than inventing a keystroke). Enter is `\n`.
@@ -1761,7 +1794,7 @@ func startKeyStringInject() {
                 }
                 let windowNumber = view.window?.windowNumber ?? 0
                 var allOk = true
-                // Resolve every char up front (so a missing keycode aborts
+                // Resolve every key up front (so a missing keycode aborts
                 // before any event fires), then schedule the keyDown/keyUp
                 // pairs on the MAIN queue with strictly increasing delays.
                 // Each event is delivered via the view on the main thread;
@@ -1771,8 +1804,41 @@ func startKeyStringInject() {
                 // spacing is deliberate: VZ's keyboard delivers reports at
                 // roughly one per full-frame Road Pops present, so typing
                 // faster drops reports (observed claim-time).
+                //
+                // Card U2 (milestone eight) editing keys: beside literal
+                // characters, --input-string accepts the tokens <up> <down>
+                // <left> <right> <home> <end> <delete> (macOS keycodes; VZ
+                // surfaces them as the HID usages the guest keymap decodes
+                // to ANSI sequences) and ^a..^z / ^A..^Z Ctrl chords (the
+                // letter's keycode with the control modifier — the guest's
+                // HID decode maps Ctrl+letter to the raw control byte).
                 var events: [(type: NSEvent.EventType, code: UInt16, mods: NSEvent.ModifierFlags, chars: String)] = []
-                for ch in text {
+                var idx = text.startIndex
+                keyLoop: while idx < text.endIndex {
+                    for (tok, key) in editingKeyTokens {
+                        if let r = text.range(of: tok, options: .anchored, range: idx..<text.endIndex) {
+                            events.append((.keyDown, key.code, [], key.chars))
+                            events.append((.keyUp, key.code, [], key.chars))
+                            idx = r.upperBound
+                            continue keyLoop
+                        }
+                    }
+                    let ch = text[idx]
+                    if ch == "^", let next = text.index(idx, offsetBy: 1, limitedBy: text.endIndex), next < text.endIndex {
+                        let letter = text[next].lowercased().first ?? " "
+                        if let (code, _) = macKey(for: letter) {
+                            // A real Ctrl chord is a flagsChanged pair around
+                            // the key: VZ ignores modifierFlags on a plain
+                            // synthesized keyDown (observed claim-time: Ctrl-A
+                            // arrived as a plain 'a'). Left Ctrl = keycode 0x3B.
+                            events.append((.flagsChanged, 0x3B, .control, ""))
+                            events.append((.keyDown, code, .control, String(letter)))
+                            events.append((.keyUp, code, .control, String(letter)))
+                            events.append((.flagsChanged, 0x3B, [], ""))
+                            idx = text.index(after: next)
+                            continue keyLoop
+                        }
+                    }
                     guard let (code, shift) = macKey(for: ch) else {
                         FileHandle.standardError.write(Data("ERROR: --input-string: no macOS keycode for '\(ch)'\n".utf8))
                         allOk = false
@@ -1782,6 +1848,7 @@ func startKeyStringInject() {
                     let chars = String(ch)
                     events.append((.keyDown, code, mods, chars))
                     events.append((.keyUp, code, mods, chars))
+                    idx = text.index(after: idx)
                 }
                 if allOk {
                     var delay: Double = 0.0
@@ -1789,18 +1856,40 @@ func startKeyStringInject() {
                         let evt = ev
                         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                             let t = ProcessInfo.processInfo.systemUptime
-                            // VZ maps keyDown/keyUp by keyCode; keep the
-                            // characters on both so the pair is symmetric.
-                            let chars = evt.chars
-                            if let e = NSEvent.keyEvent(with: evt.type, location: .zero, modifierFlags: evt.mods, timestamp: t, windowNumber: windowNumber, context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: evt.code) {
-                                if evt.type == .keyDown {
-                                    view.keyDown(with: e)
-                                } else {
-                                    view.keyUp(with: e)
+                            if evt.type == .flagsChanged {
+                                // The Ctrl-chord modifier halves. VZ ignores
+                                // modifierFlags on synthesized keyDowns, so the
+                                // modifier travels as its own flagsChanged pair
+                                // (the way a real keyboard delivers it). Built
+                                // via the keyEvent factory: NSEvent.otherEvent
+                                // AND NSEvent(cgEvent:) both reject the
+                                // .flagsChanged type (observed claim-time:
+                                // NSInternalInconsistencyException, the
+                                // "WeirdMask" assertion). Left Ctrl = 0x3B.
+                                if let e = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: evt.mods, timestamp: t, windowNumber: windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: evt.code) {
+                                    view.flagsChanged(with: e)
+                                    FileHandle.standardOutput.write(Data("KEY-EVT flagsChanged code=\(evt.code) mods=\(evt.mods.rawValue)\n".utf8))
+                                }
+                            } else {
+                                // VZ maps keyDown/keyUp by keyCode; keep the
+                                // characters on both so the pair is symmetric.
+                                let chars = evt.chars
+                                if let e = NSEvent.keyEvent(with: evt.type, location: .zero, modifierFlags: evt.mods, timestamp: t, windowNumber: windowNumber, context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: evt.code) {
+                                    if evt.type == .keyDown {
+                                        view.keyDown(with: e)
+                                    } else {
+                                        view.keyUp(with: e)
+                                    }
+                                    var charsdump = ""
+                                    for u in chars.unicodeScalars {
+                                        charsdump += String(format: "U+%04X ", u.value)
+                                    }
+                                    let kind = evt.type == .keyDown ? "keyDown " : "keyUp   "
+                                    FileHandle.standardOutput.write(Data("KEY-EVT \(kind) code=\(evt.code) mods=\(evt.mods.rawValue) chars=\(charsdump)\n".utf8))
                                 }
                             }
                         }
-                        delay += 2.0
+                        delay += inputStringInterval
                     }
                     FileHandle.standardOutput.write(Data("KEY-SEQ: typed \(text.debugDescription) into the VZVirtualMachineView after \"\(marker)\" ok=true\n".utf8))
                 } else {

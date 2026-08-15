@@ -91,6 +91,7 @@ verify-vz:
     bash tools/verify-live-xhci.sh
     bash tools/verify-live-usb.sh
     bash tools/verify-live-input.sh
+    bash tools/verify-live-lineedit.sh
     bash tools/verify-live-win.sh
     bash tools/verify-live-win-syscall.sh
     bash tools/verify-live-win-close.sh
@@ -247,6 +248,10 @@ verify-live-usb:
 # Verify scripted keystrokes drive Road Pops (class B — boots a VZ VM; the runner's --input-string synthesizes one NSEvent per keyDown/keyUp (2 s spacing) into the VZVirtualMachineView, the guest's input FIFO + keycode decode feeds the line editor, and the typed `input` command reports events=6 dropped=0; claim 6050; Apple silicon only)
 verify-live-input:
     bash tools/verify-live-input.sh
+
+# Milestone eight card U2 (claim 6233): live keystrokes drive history recall + line editing on VZ
+verify-live-lineedit:
+    bash tools/verify-live-lineedit.sh
 
 # Verify the Driving Award window manager (class B — boots a VZ VM; Road Pops is window 0, a 1 Hz clock overlay is window 1; `win`/`win focus`/`win hit` exercise the registry + focus + hit-test, a keyboard-typed uname lands in the focused terminal, and the decoded capture shows two overlapping windows with the right z-order; claim 1543; Apple silicon only)
 verify-live-win:
