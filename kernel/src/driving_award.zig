@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const font = @import("font8x8.zig");
+const input = @import("input.zig"); // card U4 (claim 4993): the pointer reports
 const virtio_gpu = @import("virtio_gpu.zig");
 const fbtext = @import("text.zig");
 
@@ -65,6 +66,20 @@ pub const clock_title_fg_rgb: u32 = 0x141414;
 pub const clock_bg_rgb: u32 = 0x0a1a2e; // dark navy body
 pub const clock_fg_rgb: u32 = 0xd8dee9; // light body text
 pub const clock_accent_rgb: u32 = 0xffaa00; // amber accent (mascot line)
+
+/// Card U5 (claim 0935, ADR 0008 D4): the HIG chrome palette. The focus
+/// ring is white (distinct from every window fill); the user title bar
+/// reuses the window-manager's dark blue with white text. The U4 cursor
+/// is magenta — a color nothing else renders, so the pixel gates can find
+/// it unambiguously.
+pub const focus_ring_rgb: u32 = 0xffffff;
+pub const focus_ring_w: usize = 3;
+pub const user_title_h: usize = 16;
+pub const user_title_bg_rgb: u32 = 0x1a2b3c;
+pub const user_title_fg_rgb: u32 = 0xffffff;
+pub const cursor_rgb: u32 = 0xff00ff;
+pub const cursor_w: usize = 8;
+pub const cursor_h: usize = 8;
 
 /// Card G6 (claim 0487): user windows — the draw/window syscall seam.
 /// Bounded: TWO user windows (ids 2 and 3, `user_window_id_base`), each a
@@ -127,6 +142,12 @@ var user_bufs: [user_windows_max][user_buf_w * user_buf_h * 4]u8 = undefined;
 /// The clock's displayed tick (so it only repaints when the second changes).
 var clock_shown_tick: u64 = 0;
 var clock_has_tick: bool = false;
+
+/// Card U4 (claim 4993): the pointer cursor's framebuffer position. Hidden
+/// until the first pointer report arrives (the default VM has no pointer).
+var cursor_x: u32 = 0;
+var cursor_y: u32 = 0;
+var cursor_shown: bool = false;
 
 // ---------------------------------------------------------------------------
 // Arm / query
@@ -224,6 +245,9 @@ pub fn focus(id: u8) bool {
     var i: usize = 0;
     while (i < win_count) : (i += 1) {
         if (windows[i].id == id) {
+            // Card U5 (ADR 0008 D4): focus is ALWAYS VISIBLE — a focus
+            // change must repaint so the ring moves.
+            if (focused_id != id) _ = mark_dirty(0);
             focused_id = id;
             return true;
         }
@@ -545,6 +569,66 @@ fn remove_user_at(idx: usize) void {
     _ = mark_dirty(1);
 }
 
+/// Card U5 (claim 0935, ADR 0008 D4): cycle focus to the next visible
+/// window in z-order (wrapping). Returns the newly focused id, or null
+/// when no window is cyclable. A focus change repaints the whole scene
+/// (mark_dirty(0) — the compositor repaints everything above the lowest
+/// dirty window, so the ring moves correctly under any overlay).
+pub fn cycle_focus() ?u8 {
+    if (win_count == 0) return null;
+    const start = focused_index() orelse 0;
+    var i: usize = 1;
+    while (i <= win_count) : (i += 1) {
+        const idx = (start + i) % win_count;
+        if (!windows[idx].visible) continue;
+        focused_id = windows[idx].id;
+        _ = mark_dirty(0);
+        return focused_id;
+    }
+    return null;
+}
+
+/// Card U4 (claim 4993): the pointer tick — consume the pointer state from
+/// the input path (motion + click edges). Returns the newly focused window
+/// id when a CLICK landed on a window (D4: click = focus + raise), null
+/// otherwise. Called from the shell idle loop; a no-op when the input path
+/// is unarmed (the default VM).
+pub fn pointer_tick(st: input.PointerState, click: ?input.Click) ?u8 {
+    if (!armed_global) return null;
+    if (st.valid) {
+        const nx = map_pointer_axis(st.x, virtio_gpu.fb_width);
+        const ny = map_pointer_axis(st.y, virtio_gpu.fb_height);
+        if (!cursor_shown or nx != cursor_x or ny != cursor_y) {
+            cursor_x = nx;
+            cursor_y = ny;
+            cursor_shown = true;
+            _ = mark_dirty(0); // the cursor moves over a full repaint
+        }
+    }
+    if (click != null) {
+        if (focus_at(cursor_x, cursor_y)) {
+            const id = focused_id;
+            _ = raise(id);
+            _ = mark_dirty(0);
+            return id;
+        }
+    }
+    return null;
+}
+
+/// HID absolute pointers report 0..32767 logical; map onto the framebuffer
+/// axis. Pure — host-testable.
+pub fn map_pointer_axis(v: u16, span: u32) u32 {
+    const scaled = (@as(u32, v) * span + 16384) / 32768;
+    return if (scaled >= span) span - 1 else scaled;
+}
+
+/// Card U4: the cursor's current framebuffer cell (for reports + tests).
+pub fn cursor_pos() ?struct { x: u32, y: u32 } {
+    if (!cursor_shown) return null;
+    return .{ .x = cursor_x, .y = cursor_y };
+}
+
 // ---------------------------------------------------------------------------
 // Pixel helpers (pure — host-testable)
 // ---------------------------------------------------------------------------
@@ -733,10 +817,72 @@ pub fn composite() virtio_gpu.CmdResult {
         paint(w);
         w.dirty = false;
     }
+    draw_chrome();
     if (!virtio_gpu.gpu_ready) return .not_ready;
     presents += 1;
     if (virtio_gpu.gpu_transfer() != .ok) return .timeout;
     return virtio_gpu.gpu_flush();
+}
+
+/// Card U5/U4: the chrome pass, drawn on the framebuffer AFTER the window
+/// paints and BEFORE the transfer — user title bars, the focus ring on the
+/// focused window, and the pointer cursor. Chrome never touches a window's
+/// back-buffer (user buffers stay EL0-owned).
+fn draw_chrome() void {
+    const fb: [*]u8 = @ptrCast(&virtio_gpu.gpu_fb);
+    const stride = virtio_gpu.fb_width * 4;
+    const wspan = virtio_gpu.fb_width;
+    const hspan = virtio_gpu.fb_height;
+    var i: usize = 0;
+    while (i < win_count) : (i += 1) {
+        const w = &windows[i];
+        if (w.kind != .user or !w.visible) continue;
+        // Title bar: "win<id> pid=<pid>" (the owning pid when known).
+        fill_rect(fb, stride, w.x, w.y, w.w, user_title_h, user_title_bg_rgb);
+        var tb: [24]u8 = undefined;
+        var n: usize = 0;
+        const label = "win";
+        @memcpy(tb[0..3], label);
+        n = 3;
+        const idstr = fmt_decimal(tb[n..], w.id);
+        @memcpy(tb[n..][0..idstr.len], idstr);
+        n += idstr.len;
+        if (w.owner) |pid| {
+            const ps = " pid=";
+            @memcpy(tb[n..][0..ps.len], ps);
+            n += ps.len;
+            const pids = fmt_decimal(tb[n..], pid);
+            @memcpy(tb[n..][0..pids.len], pids);
+            n += pids.len;
+        }
+        draw_string(fb, stride, w.x + 4, w.y + 4, tb[0..n], user_title_fg_rgb);
+    }
+    // The focus ring: on the focused window's rect (D4 — focus is always
+    // visible). 0xff = none (no ring).
+    if (focused_id != 0xff) {
+        var idx: usize = 0;
+        while (idx < win_count) : (idx += 1) {
+            if (windows[idx].id != focused_id) continue;
+            const w = &windows[idx];
+            const rx: usize = w.x;
+            const ry: usize = w.y;
+            const rw: usize = if (w.w > wspan) wspan else w.w;
+            const rh: usize = if (w.h > hspan) hspan else w.h;
+            fill_rect(fb, stride, rx, ry, rw, focus_ring_w, focus_ring_rgb);
+            fill_rect(fb, stride, rx, ry + rh - focus_ring_w, rw, focus_ring_w, focus_ring_rgb);
+            fill_rect(fb, stride, rx, ry, focus_ring_w, rh, focus_ring_rgb);
+            fill_rect(fb, stride, rx + rw - focus_ring_w, ry, focus_ring_w, rh, focus_ring_rgb);
+            break;
+        }
+    }
+    // The pointer cursor (card U4) — topmost, only once a report arrived.
+    if (cursor_shown) {
+        const cx: usize = cursor_x;
+        const cy: usize = cursor_y;
+        const cw = if (cx + cursor_w > wspan) wspan - cx else cursor_w;
+        const ch = if (cy + cursor_h > hspan) hspan - cy else cursor_h;
+        fill_rect(fb, stride, cx, cy, cw, ch, cursor_rgb);
+    }
 }
 
 /// Refresh the clock from the 1 Hz generic timer and composite any dirty
@@ -1101,4 +1247,75 @@ test "driving_award: close_owner auto-closes exactly the owning process's window
     // The slots are free again (id 2 re-opens for a different owner).
     try std.testing.expectEqual(UserOpenResult{ .opened = 2 }, user_open(64, 64, 256, 192, 9));
     try std.testing.expectEqual(@as(?usize, 9), user_owner(2));
+}
+
+// ---------------------------------------------------------------------------
+// Card U4/U5 host tests (claims 0935/4993)
+// ---------------------------------------------------------------------------
+
+test "driving_award: card U5 — cycle_focus walks the z-order and wraps" {
+    arm();
+    try std.testing.expectEqual(@as(?u8, 1), cycle_focus()); // 0 -> 1
+    try std.testing.expectEqual(@as(?u8, 0), cycle_focus()); // 1 -> 0 (wrap)
+    try std.testing.expectEqual(@as(?u8, 1), cycle_focus());
+}
+
+test "driving_award: card U4 — map_pointer_axis scales 0..32767 onto the span" {
+    try std.testing.expectEqual(@as(u32, 0), map_pointer_axis(0, 1280));
+    try std.testing.expectEqual(@as(u32, 640), map_pointer_axis(16384, 1280));
+    try std.testing.expectEqual(@as(u32, 1279), map_pointer_axis(32767, 1280));
+    try std.testing.expectEqual(@as(u32, 719), map_pointer_axis(32767, 720));
+}
+
+test "driving_award: card U5 — the chrome draws the focus ring on the focused window" {
+    arm();
+    // Focus the clock; composite (returns not_ready on the host after
+    // drawing — the pixels are inspectable in the BSS framebuffer).
+    try std.testing.expect(focus(1));
+    _ = composite();
+    const stride = virtio_gpu.fb_width * 4;
+    const fb: [*]u8 = @ptrCast(&virtio_gpu.gpu_fb);
+    // The clock's top-left ring pixel is white.
+    const px = struct {
+        fn at(f: [*]u8, st: usize, x: usize, y: usize) u32 {
+            const o = y * st + x * 4;
+            return @as(u32, f[o + 2]) << 16 | @as(u32, f[o + 1]) << 8 | f[o];
+        }
+    };
+    try std.testing.expectEqual(focus_ring_rgb, px.at(fb, stride, clock_x, clock_y));
+    // ...and just inside the ring, the clock's own border (not white).
+    try std.testing.expect(px.at(fb, stride, clock_x + focus_ring_w, clock_y + focus_ring_w) != focus_ring_rgb);
+    // Focus back to the terminal: the ring is at the screen edges now.
+    try std.testing.expect(focus(0));
+    _ = composite();
+    try std.testing.expectEqual(focus_ring_rgb, px.at(fb, stride, 0, 0));
+    // The clock's corner is NOT ringed anymore.
+    try std.testing.expect(px.at(fb, stride, clock_x, clock_y) == clock_border_rgb);
+}
+
+test "driving_award: card U4 — pointer motion moves the cursor; a click focuses + raises" {
+    arm();
+    // Move to the clock's area (mapped coordinates), no click yet.
+    const st_no: input.PointerState = .{ .x = 26000, .y = 8000, .buttons = 0, .valid = true };
+    try std.testing.expectEqual(@as(?u8, null), pointer_tick(st_no, null));
+    const c = cursor_pos().?;
+    try std.testing.expectEqual(hit_test(c.x, c.y).?, 1); // the cursor is over the clock
+    // Click: D4 click = focus + raise on the topmost window under it.
+    try std.testing.expectEqual(@as(?u8, 1), pointer_tick(st_no, .{ .x = st_no.x, .y = st_no.y }));
+    try std.testing.expectEqual(@as(u8, 1), focused_window_id());
+    try std.testing.expectEqual(@as(u8, 1), windows[win_count - 1].id); // raised on top
+    // Move to the terminal area and click: focus returns to window 0.
+    const st_term: input.PointerState = .{ .x = 4000, .y = 30000, .buttons = 0, .valid = true };
+    try std.testing.expectEqual(@as(?u8, 0), pointer_tick(st_term, .{ .x = 4000, .y = 30000 }));
+    // The cursor renders magenta at its cell after a composite.
+    _ = composite();
+    const stride = virtio_gpu.fb_width * 4;
+    const fb: [*]u8 = @ptrCast(&virtio_gpu.gpu_fb);
+    const o = c.y * stride + c.x * 4; // NOTE: st_no's cursor cell (over the clock)
+    _ = o;
+    const cc = cursor_pos().?;
+    const off = cc.y * stride + cc.x * 4;
+    try std.testing.expectEqual(@as(u8, 0xff), fb[off + 2]); // R (0xff00ff)
+    try std.testing.expectEqual(@as(u8, 0x00), fb[off + 1]); // G
+    try std.testing.expectEqual(@as(u8, 0xff), fb[off]); // B
 }

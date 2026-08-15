@@ -380,7 +380,7 @@ const SubWord = struct {
     word: []const u8,
 };
 
-const sub_words_count: usize = 30;
+const sub_words_count: usize = 31;
 
 /// Runtime-built BSS table (the claim-0015 lesson: per-element code
 /// assignments with string literals stay PC-relative at any load base;
@@ -416,6 +416,7 @@ fn ensure_sub_words() []const SubWord {
             .{ .verb = "usb", .word = "devices" },
             .{ .verb = "usb", .word = "report" },
             .{ .verb = "win", .word = "close" },
+            .{ .verb = "win", .word = "cycle" },
             .{ .verb = "win", .word = "focus" },
             .{ .verb = "win", .word = "hit" },
             .{ .verb = "win", .word = "list" },
@@ -1414,6 +1415,20 @@ fn cmd_win(m: *Monitor, args: []const []const u8) ExecError {
                 if (w.owner == want) print_win_row(m, i, w);
             }
             return .none;
+        }
+        if (std.mem.eql(u8, args[0], "cycle")) {
+            if (args.len != 1) {
+                usage_sub(m, "win cycle", "win");
+                return .usage;
+            }
+            if (driving_award.cycle_focus()) |id| {
+                m.console.puts("win: cycle focused=");
+                m.console.print_u64(id);
+                m.console.puts("\n");
+                return .none;
+            }
+            error_line(m, "win: no window to cycle");
+            return .invalid_argument;
         }
         if (std.mem.eql(u8, args[0], "hit")) {
             if (args.len != 3) {

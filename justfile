@@ -92,6 +92,7 @@ verify-vz:
     bash tools/verify-live-usb.sh
     bash tools/verify-live-input.sh
     bash tools/verify-live-lineedit.sh
+    bash tools/verify-live-win-hig.sh
     bash tools/verify-live-win.sh
     bash tools/verify-live-win-syscall.sh
     bash tools/verify-live-win-close.sh
@@ -252,6 +253,10 @@ verify-live-input:
 # Milestone eight card U2 (claim 6233): live keystrokes drive history recall + line editing on VZ
 verify-live-lineedit:
     bash tools/verify-live-lineedit.sh
+
+# Milestone eight card U5 (claim 0935): the focus ring + title bars, live + pixel
+verify-live-win-hig:
+    bash tools/verify-live-win-hig.sh
 
 # Verify the Driving Award window manager (class B — boots a VZ VM; Road Pops is window 0, a 1 Hz clock overlay is window 1; `win`/`win focus`/`win hit` exercise the registry + focus + hit-test, a keyboard-typed uname lands in the focused terminal, and the decoded capture shows two overlapping windows with the right z-order; claim 1543; Apple silicon only)
 verify-live-win:

@@ -530,7 +530,21 @@ dipshit>
     deterministic fuzz drives 512 garbage lines through the tokenizer plus
     every handler with garbage argv — no panic, refusal output
     shape-checked, garbage verbs all take the unknown shape
-    (case-sensitivity pinned). U4–U8 are the next cards.
+    (case-sensitivity pinned). **Card U5 (claim 0935) DONE 2026-08-14**
+    — the ADR 0008 D4 chrome: a white 3-px focus ring on the focused
+    window (focus changes repaint), title bars (name + owning pid) on
+    user windows, `win cycle` + the host-tested Alt+Tab decode for
+    keyboard cycling; the new gate `tools/verify-live-win-hig.sh` PASS
+    8/8 on VZ (scale-aware pixel proof: ring on the focused window,
+    terminal edge not ringed, the title bar). **Card U4 (claim 4993)
+    BLOCKED at the live seam** — the guest side (click = focus + raise,
+    the cursor, the axis mapping) is host-tested and the runner
+    `--pointer` seam landed, but five synthesized pointer delivery
+    routes all produced zero guest pointer reports (hardware contract);
+    the real-mouse observation and the Accessibility-granted CG route
+    are the recorded follow-ups. A latent out-of-bounds write in
+    `text.zig`'s render (the tiny-canvas host test) was found and fixed
+    (render is now canvas-bounded). U6–U8 are the next cards.
 
 The command layer above is portable; `docs/archive/march-m15.md` step 15's filesystem-command **deferral is superseded 2026-08-09** — first by the pre-exit ESP file window (claim 3475) and then, **on the same day, by the real FAT32 storage driver (claim 6420)**: `ls`/`cat`/`write` now read and write the live ESP's FAT volume through a virtio-blk transport, so files persist on the disk itself and **no storage driver remains deferred**. The allocator, interrupts, first tasks, EL0 boundary, syscall ABI, uaccess, per-task address spaces, lifecycle, ESP exec, and blocking syscalls are all complete; **milestone three is closed 2026-08-10 (tag `m3-userspace`, claim 0707)**.
 

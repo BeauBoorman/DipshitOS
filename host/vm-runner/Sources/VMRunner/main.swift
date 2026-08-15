@@ -198,6 +198,23 @@ var inputStringAfter: String?
 // output load makes reports coalesce (single-TRB arming holds one pending
 // report — observed claim-time).
 var inputStringInterval: Double = 2.0
+// Milestone eight cards U4/U5 (claims 4993/0935): the pointer-synthesis
+// seam — "--pointer <x>,<y>[,c][;x2,y2[,c]...]" synthesizes one
+// NSEvent.mouseEvent per step (mouseMoved; + mouseDown/Up when the click
+// flag is set) into the VZVirtualMachineView after --pointer-after's
+// marker, mirroring the I3 keyboard seam (VZ has no programmatic pointer
+// API either). Coordinates are GUEST pixels (y from the top); the view's
+// bottom-left origin is flipped here. 3 s per step (the report-cadence
+// lesson; --input-string-interval does not apply — pointer reports ride
+// the same single-TRB arming).
+var pointerScript: String?
+var pointerAfter: String?
+// The pointer delivery route: "window" (sendEvent into the key window —
+// observed NOT to reach VZ's pointer translation), "app" (NSApp.postEvent
+// into the application queue), or "cg" (real CGEventPost at the HID tap —
+// requires Accessibility permission for the terminal). Probes pick the
+// route; the gate pins the observed-working one.
+var pointerRoute: String = "window"
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
 var expectLine = "firmware has agreed to cooperate"
@@ -368,6 +385,15 @@ while idx < arguments.count {
             fail("--input-string-interval requires a positive number of seconds.")
         }
         inputStringInterval = d
+        idx += 2
+    } else if arg == "--pointer", idx + 1 < arguments.count {
+        pointerScript = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--pointer-after", idx + 1 < arguments.count {
+        pointerAfter = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--pointer-route", idx + 1 < arguments.count {
+        pointerRoute = arguments[idx + 1]
         idx += 2
     } else if arg == "--timeout", idx + 1 < arguments.count {
         timeout = TimeInterval(arguments[idx + 1]) ?? 30
@@ -1074,6 +1100,7 @@ func setupDisplayWindow() {
     window.setContentSize(NSSize(width: 1280, height: 720))
     window.contentView = view
     window.center()
+    window.acceptsMouseMovedEvents = true
     window.orderFrontRegardless()
     window.makeKeyAndOrderFront(nil)
     app.activate(ignoringOtherApps: true)
@@ -1771,6 +1798,132 @@ func macKey(for ch: Character) -> (UInt16, Bool)? {
     case "`": return (0x32, false)
     case "\n": return (0x24, false) // Enter / Return
     default: return nil
+    }
+}
+
+// Milestone eight cards U4/U5 (claims 4993/0935): the pointer-synthesis
+// seam. Once the marker appears, each "<x>,<y>[,c]" step synthesizes one
+// mouseMoved NSEvent (plus a left mouseDown/mouseUp pair when the click
+// flag 'c' is set) and dispatches it to the VZVirtualMachineView — VZ has
+// no programmatic pointer API, exactly like the I3 keyboard seam. 3 s per
+// step; the guest's pointer reports ride the same single-TRB interrupt-IN
+// arming as the keyboard.
+/// Deliver one synthesized pointer NSEvent to the VZ view over the
+/// configured route (see --pointer-route). The "cg" route re-posts a real
+/// CGEvent at the HID tap in GLOBAL screen coordinates — the OS delivers
+/// it to the key window exactly like a physical mouse.
+func deliverPointerEvent(_ view: VZVirtualMachineView, _ e: NSEvent) {
+    switch pointerRoute {
+    case "app":
+        NSApp.postEvent(e, atStart: true)
+    case "cg":
+        if let w = view.window {
+            // Window-local (bottom-left) -> global AppKit -> CG (top-left).
+            let local = e.locationInWindow
+            let glob = w.convertToScreen(NSRect(x: local.x, y: local.y, width: 1, height: 1)).origin
+            guard let screen = NSScreen.main else { return }
+            let cgPt = CGPoint(x: glob.x, y: screen.frame.maxY - glob.y)
+            let src = CGEventSource(stateID: .hidSystemState)
+            let type: CGEventType = e.type == .leftMouseDown ? .leftMouseDown : (e.type == .leftMouseUp ? .leftMouseUp : .mouseMoved)
+            let cg = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: cgPt, mouseButton: .left)
+            cg?.post(tap: .cghidEventTap)
+        }
+    default: // "window"
+        if let w = view.window {
+            w.sendEvent(e)
+        } else {
+            view.mouseMoved(with: e)
+        }
+    }
+}
+
+func startPointerInject() {
+    guard let script = pointerScript else { return }
+    let q = DispatchQueue(label: "dipshitos.ptrseq")
+    q.async {
+        let marker = pointerAfter ?? "tasks user-el0 reaped"
+        let waitDeadline = Date().addingTimeInterval(120)
+        var sent = false
+        while Date() < waitDeadline {
+            if let log = try? String(contentsOf: serialURL, encoding: .utf8), log.contains(marker) {
+                Thread.sleep(forTimeInterval: 0.5)
+                guard let view = machineView else {
+                    FileHandle.standardError.write(Data("ERROR: --pointer needs --display/--screenshot (no VZVirtualMachineView)\n".utf8))
+                    return
+                }
+                let windowNumber = view.window?.windowNumber ?? 0
+                // Resolve every step up front; a malformed step aborts
+                // before any event fires (fail honestly, invent nothing).
+                var steps: [(x: CGFloat, y: CGFloat, click: Bool)] = []
+                for part in script.split(separator: ";") {
+                    let fields = part.split(separator: ",", omittingEmptySubsequences: false).map { String($0).trimmingCharacters(in: .whitespaces) }
+                    guard fields.count >= 2, let gx = Double(fields[0]), let gy = Double(fields[1]), gx >= 0, gy >= 0, gx <= 1280, gy <= 720 else {
+                        FileHandle.standardError.write(Data("ERROR: --pointer step '\(part)' is not <x>,<y>[,c] with 0<=x<=1280, 0<=y<=720\n".utf8))
+                        steps = []
+                        break
+                    }
+                    let click = fields.count >= 3 && (fields[2] == "c" || fields[2] == "1")
+                    steps.append((CGFloat(gx), CGFloat(gy), click))
+                }
+                if !steps.isEmpty {
+                    let vh = view.bounds.height
+                    // A real mouse always ENTERS the window before moving —
+                    // synthesized moves alone were observed not to wake VZ's
+                    // pointer tracking. Lead with a mouseEntered over the
+                    // view (claim-time experiment, card U4).
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        let t = ProcessInfo.processInfo.systemUptime
+                        let loc = NSPoint(x: vh * 0 + 8, y: vh - 8)
+                        if let e = NSEvent.enterExitEvent(with: .mouseEntered, location: loc, modifierFlags: [], timestamp: t, windowNumber: windowNumber, context: nil, eventNumber: 1, trackingNumber: 1, userData: nil) {
+                            if let w = view.window {
+                                w.sendEvent(e)
+                            } else {
+                                view.mouseEntered(with: e)
+                            }
+                            FileHandle.standardOutput.write(Data("PTR-EVT entered\n".utf8))
+                        }
+                    }
+                    var delay: Double = 3.0
+                    for st in steps {
+                        let s = st
+                        // Guest pixels are top-left origin; AppKit view
+                        // coordinates are bottom-left — flip Y.
+                        let loc = NSPoint(x: s.x, y: vh - s.y)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            let t = ProcessInfo.processInfo.systemUptime
+                            if let e = NSEvent.mouseEvent(with: .mouseMoved, location: loc, modifierFlags: [], timestamp: t, windowNumber: windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0) {
+                                deliverPointerEvent(view, e)
+                                FileHandle.standardOutput.write(Data("PTR-EVT move \(Int(s.x)),\(Int(s.y))\n".utf8))
+                            }
+                        }
+                        delay += 3.0
+                        if s.click {
+                            for (type, name) in [(NSEvent.EventType.leftMouseDown, "down"), (NSEvent.EventType.leftMouseUp, "up")] {
+                                let ty = type
+                                let nm = name
+                                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                                    let t = ProcessInfo.processInfo.systemUptime
+                                    if let e = NSEvent.mouseEvent(with: ty, location: loc, modifierFlags: [], timestamp: t, windowNumber: windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: ty == .leftMouseDown ? 1.0 : 0.0) {
+                                        deliverPointerEvent(view, e)
+                                        FileHandle.standardOutput.write(Data("PTR-EVT click \(nm) \(Int(s.x)),\(Int(s.y))\n".utf8))
+                                    }
+                                }
+                                delay += 3.0
+                            }
+                        }
+                    }
+                    FileHandle.standardOutput.write(Data("PTR-SEQ: \(steps.count) pointer steps scheduled after \"\(marker)\" ok=true\n".utf8))
+                } else {
+                    FileHandle.standardOutput.write(Data("PTR-SEQ: aborted (malformed step) ok=false\n".utf8))
+                }
+                sent = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if !sent {
+            FileHandle.standardError.write(Data("ERROR: guest did not emit pointer marker '\(marker)' within 120s; pointer steps not sent\n".utf8))
+        }
     }
 }
 
@@ -2520,6 +2673,7 @@ if consoleMode {
     startNetInject()
     startKeyInject()
     startKeyStringInject()
+    startPointerInject()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { scriptPoll() }
 } else {
     setupDisplayWindow()

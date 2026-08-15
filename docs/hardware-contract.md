@@ -199,6 +199,24 @@ assumption comes from documentation or reasoning only.
     **[observed]** — `tools/verify-live-lineedit.sh` (PASS 13/13) and the
     report streams under `artifacts/u2-probe*`; the I3 gate re-ran green
     after the input.zig changes (`verify-live-input.sh` PASS).
+  - **Synthesized POINTER events do not reach the pointing device
+    (observed 2026-08-14, claim 4993, card U4):** FIVE delivery routes
+    were dispatched with the runner's own PTR-EVT evidence and every one
+    produced `ptr-reports=0` in the guest's `input` report — (1) direct
+    `view.mouseMoved/mouseDown(with:)`, (2) `window.sendEvent(e)`, (3)
+    `NSApp.postEvent` into the application queue, (4) `CGEventPost` at
+    the HID tap (silently dropped without Accessibility trust for the
+    posting process), and (5) a leading synthesized `mouseEntered`
+    (enterExitEvent) preamble. This is unlike the KEYBOARD, where
+    synthesized `view.keyDown(with:)` translates to HID reports
+    immediately (the I2/I3 seam). Open follow-ups: whether a REAL mouse
+    over the `--display` window produces reports (untested knowingly),
+    and whether the CG route works once the terminal holds Accessibility
+    trust. The runner keeps the seam (`--pointer`, `--pointer-after`,
+    `--pointer-route window|app|cg`) for that follow-up.
+    **[observed]** — the probe runs under `artifacts/u45-probe*`; the
+    guest-side consumption (click = focus + raise, cursor render,
+    Alt+Tab decode) is host-tested in `driving_award.zig`/`input.zig`.
   All **[observed]** — `tools/verify-live-usb.sh` (PASS 11/11) and the saved
   logs under `artifacts/usb-discovery-*` + `artifacts/live-usb-*`.
 - Entropy: virtio entropy device (`VZVirtioEntropyDeviceConfiguration`).

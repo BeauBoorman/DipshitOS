@@ -1014,10 +1014,14 @@ record new hardware assumptions in `docs/hardware-contract.md`.
   mechanical enforcement of D3: misuse transcript (byte-exact, regenerated)
   + the tokenizer/handler fuzz; the 40 handlers migrated onto the D3
   helpers (see [`docs/march-m8.md`](march-m8.md)).
-- **U4 — Pointer focus + cursor.** ⬜ consume the absolute-pointer reports
+- **U4 — Pointer focus + cursor.** ⛔ blocked at the live seam (claim
+  4993; kernel + runner landed and host-tested — five pointer synthesis
+  routes produced zero guest reports, hardware contract; the real-mouse
+  + Accessibility follow-ups recorded).
+- ~~consume the absolute-pointer reports
   into Driving Award hit-test focus + cursor rendering (needs a runner
   pointer-synthesis seam, the I3 keyboard seam's analogue).
-- **U5 — Window HIG.** ⬜ title bars, focus ring, click = focus + raise,
+- **U5 — Window HIG.** ✅ **done 2026-08-14 (claim 0935 — gate `tools/verify-live-win-hig.sh` PASS 8/8)** —⬜ title bars, focus ring, click = focus + raise,
   keyboard focus cycling.
 - **U6 — First-boot experience.** ⬜ `welcome`/`about` refresh + boot motd.
 - **U7 — `sysinfo`.** ⬜ the one-command support snapshot.

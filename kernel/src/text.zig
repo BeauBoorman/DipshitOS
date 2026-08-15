@@ -237,7 +237,12 @@ pub fn render(canvas: Canvas) void {
         }
     }
     if (ring_count == 0) return;
-    const visible: usize = @min(ring_count, rows);
+    // Card U4/U5 close-out fix: the render is bounded by the CANVAS, not
+    // just the module geometry — the tiny-canvas host tests (16x16) and
+    // any undersized destination stay in bounds (a latent out-of-bounds
+    // write the 16x16 test exercised into adjacent globals for its whole
+    // life; new BSS neighbors turned it into a bus error).
+    const visible: usize = @min(@min(ring_count, rows), canvas.height / cell_h);
     // The visible window: the last `visible` lines of the ring. The
     // cursor line is the last one; its slot is cur_line.
     var r: usize = 0;
@@ -249,8 +254,9 @@ pub fn render(canvas: Canvas) void {
             0;
         const slot = (first_valid + ring_count - visible + r) % ring_lines;
         const row_pix = r * cell_h;
+        const cols_fit = @min(cols, canvas.width / cell_w);
         var col: usize = 0;
-        while (col < cols) : (col += 1) {
+        while (col < cols_fit) : (col += 1) {
             const c = ring[slot][col];
             if (c < 0x20 or c > 0x7e) continue;
             const glyph = font.glyphs[c - 0x20];

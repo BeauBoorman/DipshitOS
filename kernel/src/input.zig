@@ -66,6 +66,15 @@ var ptr_buttons: u8 = 0;
 var ptr_x: u16 = 0;
 var ptr_y: u16 = 0;
 var ptr_reports: usize = 0;
+/// Card U4 (claim 4993): the pointer became observable (at least one
+/// report) and the click edge (buttons 0 -> nonzero) latches here until
+/// the window manager consumes it via `take_click`.
+var ptr_valid: bool = false;
+var ptr_click_pending: bool = false;
+/// Card U5 (claim 0935): the Alt+Tab chord (modifier 0x04/0x40 + Tab
+/// usage 0x2b) latches here — the shell idle loop consumes it as a
+/// focus-cycle request (ADR 0008 D4's keyboard cycling).
+var alt_tab_pending: bool = false;
 
 /// Diagnostic hooks (kernel/src/main.zig wires these to uart_puts/uart_hex
 /// under `--input`; null in host tests and the default VM).
@@ -211,6 +220,7 @@ fn decode_keyboard_report(rep: []const u8) void {
     }
     var keys: [6]u8 = [_]u8{0} ** 6;
     for (rep[2..8], 0..) |k, i| keys[i] = k;
+    const alt = (mods & 0x04) != 0 or (mods & 0x40) != 0; // left/right Alt
     for (keys) |k| {
         if (k == 0) continue;
         var held = false;
@@ -222,6 +232,12 @@ fn decode_keyboard_report(rep: []const u8) void {
         }
         if (!held) {
             kb_last_usage = k;
+            // Card U5 (ADR 0008 D4): Alt+Tab cycles window focus — the
+            // chord is consumed as a window-manager signal, never a byte.
+            if (alt and k == 0x2b) {
+                alt_tab_pending = true;
+                continue;
+            }
             // Card U2: editing keys first (Ctrl chords + arrows/Home/End/
             // Delete -> ANSI sequences), then the printable keymap.
             var ebytes: [4]u8 = undefined;
@@ -245,12 +261,15 @@ fn decode_keyboard_report(rep: []const u8) void {
 /// exact word order is a claim-time observation, recorded honestly.
 fn record_pointer_report(rep: []const u8) void {
     if (rep.len < 3) return;
+    const prev_buttons = ptr_buttons;
     ptr_buttons = rep[0];
     ptr_x = @as(u16, rep[1]) | (@as(u16, rep[2]) << 8);
     if (rep.len >= 5) {
         ptr_y = @as(u16, rep[3]) | (@as(u16, rep[4]) << 8);
     }
     ptr_reports += 1;
+    ptr_valid = true;
+    if (prev_buttons == 0 and (ptr_buttons & 0x01) != 0) ptr_click_pending = true;
 }
 
 /// The shell-idle-loop drain: poll each enumerated device's interrupt-IN
@@ -294,6 +313,30 @@ pub fn report() Report {
         .ptr_y = ptr_y,
         .ptr_reports = ptr_reports,
     };
+}
+
+/// Card U4 (claim 4993): the pointer snapshot for the window manager.
+pub const PointerState = struct { x: u16, y: u16, buttons: u8, valid: bool };
+pub fn pointer_state() PointerState {
+    return .{ .x = ptr_x, .y = ptr_y, .buttons = ptr_buttons, .valid = ptr_valid };
+}
+
+/// Card U4: a consumed click edge (the pointer cell, HID logical units).
+pub const Click = struct { x: u16, y: u16 };
+
+/// Consume the latched click edge (buttons 0 -> nonzero). Returns the
+/// click's pointer cell or null when no click is pending.
+pub fn take_click() ?Click {
+    if (!ptr_click_pending) return null;
+    ptr_click_pending = false;
+    return .{ .x = ptr_x, .y = ptr_y };
+}
+
+/// Card U5: consume the Alt+Tab chord edge.
+pub fn take_alt_tab() bool {
+    const was = alt_tab_pending;
+    alt_tab_pending = false;
+    return was;
 }
 
 // ---------------------------------------------------------------------------
