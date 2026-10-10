@@ -42,6 +42,7 @@
 
 const std = @import("std");
 pub const arp = @import("arp.zig"); // N3: our static IP (`arp.own_ip` — the ONE copy)
+const csprng = @import("csprng.zig"); // the kernel CSPRNG — the server's ISN draw (M97e-F2 rider)
 
 // ---------------------------------------------------------------------------
 // Wire constants (RFC 793)
@@ -725,7 +726,7 @@ pub fn handle_rx(frame: []const u8) Event {
         dropped_malformed += 1; // no reassembly — the honest bound
         return .none;
     }
-    if (state != .listen and src_port != peer_port) {
+    if (state != .listen and (src_port != peer_port or !std.mem.eql(u8, &src, &peer_ip))) {
         // M84f (#1836): an over-cap SYN (SYN set, ACK clear — a second
         // client knocking while the ONE connection is taken, in any
         // non-listen state) is refused HONESTLY — RST+ACK in the RFC 793
@@ -734,6 +735,10 @@ pub fn handle_rx(frame: []const u8) Event {
         // drop (a server that silently drops looks like a dead host to
         // the caller). Anything else from a port that is not ours to
         // answer is dropped, counted.
+        // M97e-F2 (#2101): the check now binds the peer's SOURCE IP too —
+        // a forged segment from a third host carrying the peer's port
+        // can never move this connection's state (the connection is a
+        // 4-tuple, not a port).
         if ((flags & (flag_syn | flag_ack)) == flag_syn) {
             refuse_overcap_syn(src, src_port, seq, frame[6..12]);
             return .none;
@@ -768,7 +773,7 @@ pub fn handle_rx(frame: []const u8) Event {
                 accept_ticks = now_ticks; // #1105 half-open accept clock
                 srv_isn = seq;
                 rcv_nxt = srv_isn +% 1;
-                isn = 0x54321098; // Server ISN
+                isn = @truncate(csprng.random_u64()); // the server ISN — CSPRNG-drawn like the client's (M97e-F2 rider; deterministic under the unseeded fallback)
                 snd_una = isn;
                 build_msg(isn, rcv_nxt, flag_syn | flag_ack, &.{});
                 ack_pending = true;
@@ -845,6 +850,16 @@ pub fn handle_rx(frame: []const u8) Event {
                 state = .closed; // the connection died — the report shows it
                 return .rst_recv;
             }
+            // M97e-F2 (#2101): the segment must be the NEXT one the
+            // connection expects — `seq == rcv_nxt`. An out-of-sequence
+            // segment (a blind inject, or a reordered/duplicated segment
+            // the no-reassembly bound cannot place) never clears the
+            // retransmission timer on its ACK field, is never FIN-ACKed,
+            // and never lands in the ONE-slot RX buffer.
+            if (seq != rcv_nxt) {
+                dropped_malformed += 1;
+                return .none;
+            }
             // Card N11 (claim 5357): ANY accepted segment whose ACK
             // covers everything the client has sent acknowledges the
             // pending segment — the retransmission timer stops (the
@@ -896,6 +911,10 @@ pub fn handle_rx(frame: []const u8) Event {
             }
             if (payload.len != 0) {
                 dropped_malformed += 1;
+                return .none;
+            }
+            if (seq != rcv_nxt) {
+                dropped_malformed += 1; // M97e-F2: the FIN-ACK is in-sequence too
                 return .none;
             }
             rcv_nxt = seq +% 1; // the FIN consumes one sequence number

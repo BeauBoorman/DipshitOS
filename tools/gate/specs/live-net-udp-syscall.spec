@@ -94,7 +94,8 @@ vgate_assert 01 serial-contains 'procs UDP.BIN exited status=17'
 vgate_assert 01 serial-contains 'tasks user-exec exited status=17'
 vgate_assert 01 serial-contains 'tasks user-exec reaped'
 # Keep the live census in step with the append-only slot-80 family.
-vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=81'
+# Repinned 81 -> 84 on VZ serial after the M97b/M97c/M97d slots landed.
+vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=84'
 vgate_assert 01 serial-contains 'net udp: rx=2,tx=2,loop=1,drop=0'
 vgate_assert 01 serial-contains ' udp=rx=2,tx=2,loop=1,drop=0'
 vgate_assert 01 serial-contains 'net-udp-ok'

@@ -8,15 +8,28 @@ const std = @import("std");
 const timer = @import("timer.zig");
 const builtin = @import("builtin");
 const udp = @import("udp.zig");
+const csprng = @import("csprng.zig");
 pub var sockets: core.Core = .{};
-pub const dns_port: u16 = 7001;
+/// M97e-F5 (#2104): the DNS transaction's client port is a FRESH
+/// ephemeral draw per query (the IANA dynamic range 49152..65535) — a
+/// fixed port let an off-path attacker spray replies at a known
+/// destination; a per-transaction draw means a forged reply must guess
+/// the port as well as the query id. `dns_port` is gone; `Dns.port`
+/// carries the bound port.
+pub const ephemeral_lo: u16 = 49152;
+pub const ephemeral_span: u16 = 16384;
 pub const dns_max = 64;
 pub const Dns = struct {
     owner: u64,
     handle: core.Handle,
     server: [4]u8,
     id: u16,
+    port: u16,
     deadline: u64,
+    /// The outstanding query's question section (bytes 12.. of the
+    /// encoded query) — the reply must echo it byte-exact (M97e-F5).
+    question: [dns_max]u8 = undefined,
+    question_len: usize = 0,
     reply: [dns_max]u8 = undefined,
     len: usize = 0,
     failed: bool = false,
@@ -39,15 +52,27 @@ pub fn poll() void {
 pub fn closeOwner(owner: u64) void {
     sockets.closeOwner(owner);
     if (dns) |d| if (d.owner == owner) {
-        _ = udp.close_port(dns_port);
+        _ = udp.close_port(d.port);
         dns = null;
     };
 }
 pub fn close(owner: u64, handle: core.Handle) core.Error!void {
     if (handle.value & 3 != 3) return sockets.close(owner, handle);
-    _ = try dnsFor(owner, handle);
-    _ = udp.close_port(dns_port);
+    const d = try dnsFor(owner, handle);
+    _ = udp.close_port(d.port);
     dns = null;
+}
+/// M97e-F5 (#2104): draw a fresh ephemeral client port and bind it in
+/// the bounded listen table. `null` after a bounded number of draws
+/// (a table full of listeners, or a run of collisions) — an honest
+/// Capacity, never a silent shared port.
+fn ephemeralPort() ?u16 {
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const port = ephemeral_lo + @as(u16, @truncate(csprng.random_u64())) % ephemeral_span;
+        if (udp.listen_port(port)) return port;
+    }
+    return null;
 }
 pub fn beginDns(owner: u64, server: [4]u8, query: []const u8) core.Error!core.Handle {
     if (server[0] == 0 or server[0] == 127 or server[0] >= 224 or query.len < 17 or query.len > dns_max)
@@ -55,10 +80,13 @@ pub fn beginDns(owner: u64, server: [4]u8, query: []const u8) core.Error!core.Ha
     if (dns != null or sockets.next_generation > std.math.maxInt(i64) >> 2) return error.Capacity;
     // Pin one legacy listen-table seat so nobody can bind it concurrently.
     // A pre-existing bind is a capacity refusal, never silently intercepted.
-    if (!udp.listen_port(dns_port)) return error.Capacity;
+    const port = ephemeralPort() orelse return error.Capacity;
     const handle: core.Handle = .{ .value = sockets.next_generation << 2 | 3 };
     sockets.next_generation += 1;
-    dns = .{ .owner = owner, .handle = handle, .server = server, .id = std.mem.readInt(u16, query[0..2], .big), .deadline = now() +| core.deadline_ns };
+    var d = Dns{ .owner = owner, .handle = handle, .server = server, .id = std.mem.readInt(u16, query[0..2], .big), .port = port, .deadline = now() +| core.deadline_ns };
+    @memcpy(d.question[0 .. query.len - 12], query[12..]); // the question echo the reply must carry
+    d.question_len = query.len - 12;
+    dns = d;
     return handle;
 }
 fn dnsFor(owner: u64, handle: core.Handle) core.Error!*Dns {
@@ -78,18 +106,29 @@ pub fn readDns(owner: u64, handle: core.Handle, output: []u8) core.Error!usize {
 }
 /// Called only after IPv4 checksum/destination/fragment validation.
 pub fn receiveDns(frame: []const u8) bool {
-    if (frame.len < 42 or frame[23] != 17 or std.mem.readInt(u16, frame[36..38], .big) != dns_port) return false;
+    if (frame.len < 42 or frame[23] != 17) return false;
     const d = if (dns) |*d| d else return false;
+    if (std.mem.readInt(u16, frame[36..38], .big) != d.port) return false;
     if (d.timed_out or d.len != 0 or d.failed) return true;
     const total = std.mem.readInt(u16, frame[16..18], .big);
     const length = std.mem.readInt(u16, frame[38..40], .big);
     if (total < 28 or @as(usize, total) + 14 > frame.len or length < 20 or length != total - 20 or
         !std.mem.eql(u8, frame[26..30], &d.server) or std.mem.readInt(u16, frame[34..36], .big) != 53) return true;
     const segment = frame[34 .. 14 + @as(usize, total)];
-    if (std.mem.readInt(u16, segment[6..8], .big) != 0 and
+    // M97e-F5 (#2104): a ZERO UDP checksum is refused — IPv4 tolerates
+    // it, but a resolver must not accept an unchecksummed datagram (the
+    // sum is the only integrity check on the wire shape). A nonzero
+    // field must verify.
+    if (std.mem.readInt(u16, segment[6..8], .big) == 0 or
         udp.checksum_udp(d.server, frame[30..34].*, segment) != 0) return true;
     const reply = segment[8..];
     if (std.mem.readInt(u16, reply[0..2], .big) != d.id or reply[2] & 0x80 == 0) return true;
+    // M97e-F5: the question section must echo the outstanding query's
+    // byte-exact — a forged answer carrying the right id but a
+    // DIFFERENT name is refused (RFC 1035 servers echo the question
+    // verbatim; a case-rewritten echo is the honest bound).
+    if (reply.len < 12 + d.question_len or
+        !std.mem.eql(u8, reply[12 .. 12 + d.question_len], d.question[0..d.question_len])) return true;
     if (reply.len > dns_max) {
         d.failed = true;
     } else {

@@ -879,3 +879,69 @@ test "tcp: M84f — a SYN with no connection (IDLE) is refused RST+ACK to the re
     try std.testing.expectEqualSlices(u8, &host_mac, &tcp.peer_mac);
     try std.testing.expectEqual(@as(u64, 1), tcp.rst_sent);
 }
+test "tcp: M97e-F2 — a forged source IP and out-of-sequence segments cannot move the connection" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    tcp.now_ticks = 100;
+    start(ip_host, 9999, 0x55555555, host_mac);
+    advance_snd(1); // the SYN consumed one
+    const sa = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0000, 0x55555556, flag_syn | flag_ack, &.{});
+    try std.testing.expectEqual(Event.synack_recv, handle_rx(&sa));
+    try std.testing.expectEqual(State.established, tcp.state);
+    tcp.ack_pending = false; // the handshake ACK was transmitted
+    try std.testing.expectEqual(@as(u32, 0xaaaa0001), tcp.rcv_nxt);
+
+    // ONE unACKed data segment in flight — the retransmission timer is
+    // armed (the forged-ACK-must-not-clear-it proof needs it).
+    build_data_msg("frame");
+    advance_snd(5);
+    record_pending();
+    try std.testing.expect(tcp.tx_pending);
+    const dropped0 = tcp.dropped_malformed;
+    const bad_mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x66 };
+    const attacker_ip = [4]u8{ 10, 0, 0, 66 };
+
+    // A forged ACK from a THIRD HOST — the peer's port, a covering ACK
+    // number, valid checksum: it must never reach the connection, so the
+    // retransmission timer keeps running.
+    const forged_ack = craft_frame(attacker_ip, bad_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001, 0x55555560, flag_ack, &.{});
+    try std.testing.expectEqual(Event.none, handle_rx(&forged_ack));
+    try std.testing.expect(tcp.tx_pending); // NOT cleared by a non-peer
+    try std.testing.expectEqual(dropped0 + 1, tcp.dropped_malformed);
+
+    // A forged payload from the third host: never buffered, state intact.
+    const forged_data = craft_frame(attacker_ip, bad_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001, 0x5555555a, flag_ack, "evil");
+    try std.testing.expectEqual(Event.none, handle_rx(&forged_data));
+    try std.testing.expect(!tcp.rx_pending);
+    try std.testing.expectEqual(dropped0 + 2, tcp.dropped_malformed);
+    try std.testing.expectEqual(State.established, tcp.state);
+    try std.testing.expectEqualSlices(u8, &ip_host, &tcp.peer_ip);
+
+    // An out-of-sequence payload from the REAL peer (seq beyond rcv_nxt —
+    // reordered or a blind inject riding the right 4-tuple): dropped, no
+    // buffered bytes, the timer stays armed even though its ACK field
+    // would have covered the pending segment.
+    const oos = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0009, 0x55555560, flag_ack, "late");
+    try std.testing.expectEqual(Event.none, handle_rx(&oos));
+    try std.testing.expect(!tcp.rx_pending);
+    try std.testing.expect(tcp.tx_pending);
+    try std.testing.expectEqual(dropped0 + 3, tcp.dropped_malformed);
+
+    // A stale in-window-less ACK from the peer (an old seq, a covering
+    // ack): refused the same way — the timer keeps running.
+    const stale = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001 -% 4, 0x55555560, flag_ack, &.{});
+    try std.testing.expectEqual(Event.none, handle_rx(&stale));
+    try std.testing.expect(tcp.tx_pending);
+    try std.testing.expectEqual(dropped0 + 4, tcp.dropped_malformed);
+
+    // The real in-sequence segment still lands (the refusal is not a
+    // wedge): the payload is buffered and — its ACK covering the pending
+    // send — the retransmission timer stops HONESTLY.
+    const ok = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, tcp.rcv_nxt, tcp.snd_una, flag_ack, "ok");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&ok));
+    try std.testing.expect(tcp.rx_pending);
+    try std.testing.expect(!tcp.tx_pending); // the peer's own ACK covers it
+    try std.testing.expectEqualSlices(u8, "ok", take_rx());
+}

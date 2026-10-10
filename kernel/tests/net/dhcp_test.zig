@@ -271,6 +271,63 @@ test "dhcp: out-of-sequence + malformed replies are counted, never assumed away"
     try std.testing.expectEqual(State.idle, dhcp.state);
 }
 
+test "dhcp: a reply for ANOTHER transaction is refused — xid + chaddr must match" {
+    reset();
+    defer reset();
+    const chaddr = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    start(&chaddr, 0xabcd1234); // SELECTING with OUR xid
+
+    // A valid OFFER shape (copied from our DISCOVER, op flipped) — the
+    // control: OUR xid + chaddr pass, the state machine moves.
+    var offer: [300]u8 = undefined;
+    @memcpy(offer[0..dhcp.msg_len], dhcp.msg[0..dhcp.msg_len]);
+    offer[0] = 2;
+    @memcpy(offer[16..20], &[_]u8{ 10, 0, 0, 5 }); // yiaddr
+    offer[240] = opt_msg_type;
+    offer[242] = msg_type_offer;
+    const o: usize = 243;
+    offer[o] = opt_lease_time;
+    offer[o + 1] = 4;
+    offer[o + 2] = 0;
+    offer[o + 3] = 0;
+    offer[o + 4] = 0x0e;
+    offer[o + 5] = 0x10;
+    offer[o + 6] = opt_end;
+    const offer_len = o + 7;
+
+    // Mismatched XID: another client's handshake on the shared broadcast
+    // segment — dropped, the state machine stays SELECTING, no offer
+    // recorded.
+    var bad_xid = offer;
+    bad_xid[7] ^= 0xff; // the low xid byte differs
+    var dg: [8 + 300]u8 = undefined;
+    @memset(&dg, 0);
+    @memcpy(dg[8 .. 8 + offer_len], bad_xid[0..offer_len]);
+    try std.testing.expectEqual(Event.none, handle_rx(&dg));
+    try std.testing.expectEqual(@as(u64, 1), dhcp.dropped_malformed);
+    try std.testing.expectEqual(@as(u64, 0), dhcp.offer_recv);
+    try std.testing.expectEqual(State.selecting, dhcp.state);
+    try std.testing.expect(!dhcp.request_transmitted);
+
+    // Mismatched chaddr (the right xid, another client's MAC — broadcast
+    // replies are never MAC-unicast to us): dropped the same way.
+    var bad_chaddr = offer;
+    bad_chaddr[28] ^= 0xff;
+    @memset(&dg, 0);
+    @memcpy(dg[8 .. 8 + offer_len], bad_chaddr[0..offer_len]);
+    try std.testing.expectEqual(Event.none, handle_rx(&dg));
+    try std.testing.expectEqual(@as(u64, 2), dhcp.dropped_malformed);
+    try std.testing.expectEqual(@as(u64, 0), dhcp.offer_recv);
+    try std.testing.expectEqual(State.selecting, dhcp.state);
+
+    // The matching reply still lands (the refusal path is not a wedge).
+    @memset(&dg, 0);
+    @memcpy(dg[8 .. 8 + offer_len], offer[0..offer_len]);
+    try std.testing.expectEqual(Event.request_ready, handle_rx(&dg));
+    try std.testing.expectEqual(State.requesting, dhcp.state);
+    try std.testing.expectEqual(@as(u64, 1), dhcp.offer_recv);
+}
+
 test "dhcp: bounded retry — max_attempts then an honest refuse (the caller's cap)" {
     reset();
     defer reset();

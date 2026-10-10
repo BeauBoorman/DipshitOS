@@ -3434,33 +3434,41 @@ test "B6 DNS service: ownership source ID exclusive UDP seat timeout and release
     var query: [17]u8 = @splat(0);
     query[0] = 1;
     query[1] = 2;
+    query[12] = 0xaa; // a distinctive question blob — the reply must echo it
+    query[16] = 0xbb;
     const h = try ns.beginDns(7, .{ 10, 0, 0, 2 }, &query);
-    try std.testing.expect(!udp.listen_port(ns.dns_port));
+    const dport = ns.dns.?.port;
+    try std.testing.expect(dport >= ns.ephemeral_lo); // M97e-F5: a fresh ephemeral port, not the old fixed 7001
+    try std.testing.expect(!udp.listen_port(dport)); // the seat is already bound
     try std.testing.expectError(error.Capacity, ns.beginDns(8, .{ 10, 0, 0, 2 }, &query));
     var output: [64]u8 = undefined;
     try std.testing.expectError(error.AccessDenied, ns.readDns(8, h, &output));
-    var reply: [12]u8 = @splat(0);
+    var reply: [17]u8 = @splat(0);
     reply[0] = 1;
     reply[1] = 2;
     reply[2] = 0x81;
+    @memcpy(reply[12..17], query[12..17]); // the question echo the reply must carry
     var packet: [128]u8 = undefined;
     reply[1] = 3;
-    const wrong_id_len = udp.build_frame_ex(&packet, .{ 2, 0, 0, 0, 0, 1 }, &.{ 2, 0, 0, 0, 0, 2 }, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 53, ns.dns_port, &reply);
+    const wrong_id_len = udp.build_frame_ex(&packet, .{ 2, 0, 0, 0, 0, 1 }, &.{ 2, 0, 0, 0, 0, 2 }, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 53, dport, &reply);
     try std.testing.expect(ns.receiveDns(packet[0..wrong_id_len]));
     try std.testing.expectError(error.WouldBlock, ns.readDns(7, h, &output));
     reply[1] = 2;
     for ([_][4]u8{ .{ 10, 0, 0, 3 }, .{ 10, 0, 0, 2 } }) |source| {
-        const n = udp.build_frame_ex(&packet, .{ 2, 0, 0, 0, 0, 1 }, &.{ 2, 0, 0, 0, 0, 2 }, source, .{ 10, 0, 0, 1 }, 53, ns.dns_port, &reply);
+        const n = udp.build_frame_ex(&packet, .{ 2, 0, 0, 0, 0, 1 }, &.{ 2, 0, 0, 0, 0, 2 }, source, .{ 10, 0, 0, 1 }, 53, dport, &reply);
         try std.testing.expect(ns.receiveDns(packet[0..n]));
         if (source[3] == 3) try std.testing.expectError(error.WouldBlock, ns.readDns(7, h, &output));
     }
-    try std.testing.expectEqual(@as(usize, 12), try ns.readDns(7, h, &output));
+    try std.testing.expectEqual(@as(usize, 17), try ns.readDns(7, h, &output));
     try ns.close(7, h);
-    try std.testing.expect(!udp.is_listening(ns.dns_port));
-    try std.testing.expect(udp.listen_port(ns.dns_port));
-    try std.testing.expectError(error.Capacity, ns.beginDns(7, .{ 10, 0, 0, 2 }, &query));
-    try std.testing.expect(udp.close_port(ns.dns_port));
+    try std.testing.expect(!udp.is_listening(dport));
+    // M97e-F5: squatting on the released port cannot starve the next
+    // transaction — the ephemeral draw retries and lands elsewhere.
+    try std.testing.expect(udp.listen_port(dport));
     const next = try ns.beginDns(7, .{ 10, 0, 0, 2 }, &query);
+    const next_port = ns.dns.?.port;
+    try std.testing.expect(next_port != dport);
+    try std.testing.expect(udp.close_port(dport));
     try std.testing.expect(next.value != h.value);
     try std.testing.expectError(error.InvalidHandle, ns.close(7, h));
     ns.test_now = ns.core.deadline_ns;
@@ -3468,8 +3476,70 @@ test "B6 DNS service: ownership source ID exclusive UDP seat timeout and release
     try std.testing.expectEqual(@as(u64, 1), try ns.ready(7, next));
     try std.testing.expectError(error.TimedOut, ns.readDns(7, next, &output));
     ns.closeOwner(7);
-    try std.testing.expect(!udp.is_listening(ns.dns_port));
+    try std.testing.expect(!udp.is_listening(next_port));
     try std.testing.expectEqual(@as(u64, 0), ns.ownedCount(7));
+}
+
+test "handle_native_socket_dns: M97e-F5 refusals — wrong question echo, zero checksum, foreign port" {
+    const ns = syscall.native_socket;
+    ns.sockets = .{};
+    ns.dns = null;
+    ns.test_now = 0;
+    udp.reset();
+    defer {
+        ns.sockets = .{};
+        ns.dns = null;
+        ns.test_now = 0;
+        udp.reset();
+    }
+    var query: [17]u8 = @splat(0);
+    query[0] = 1;
+    query[1] = 2;
+    query[12] = 0xaa;
+    query[16] = 0xbb;
+    const h = try ns.beginDns(7, .{ 10, 0, 0, 2 }, &query);
+    const dport = ns.dns.?.port;
+    var output: [64]u8 = undefined;
+    var reply: [17]u8 = @splat(0);
+    reply[0] = 1;
+    reply[1] = 2;
+    reply[2] = 0x81;
+    var packet: [128]u8 = undefined;
+    const src_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 1 };
+    const dst_mac: [6]u8 = .{ 2, 0, 0, 0, 0, 2 };
+
+    // A correct id + server tuple but a DIFFERENT question echo — the
+    // forged answer is consumed but never stored (M97e-F5 QNAME check).
+    reply[12] = 0xcc;
+    const bad_q_len = udp.build_frame_ex(&packet, src_mac, &dst_mac, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 53, dport, &reply);
+    try std.testing.expect(ns.receiveDns(packet[0..bad_q_len]));
+    try std.testing.expectError(error.WouldBlock, ns.readDns(7, h, &output));
+    reply[12] = 0xaa;
+    @memcpy(reply[12..17], query[12..17]);
+
+    // A zero UDP checksum is refused — IPv4 tolerates the field, the
+    // resolver does not (the datagram is consumed, not stored).
+    const csum_len = udp.build_frame_ex(&packet, src_mac, &dst_mac, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 53, dport, &reply);
+    packet[40] = 0;
+    packet[41] = 0;
+    try std.testing.expect(ns.receiveDns(packet[0..csum_len]));
+    try std.testing.expectError(error.WouldBlock, ns.readDns(7, h, &output));
+
+    // A reply addressed to a DIFFERENT destination port is not ours at
+    // all — receiveDns declines it entirely (returns false).
+    const other = udp.build_frame_ex(&packet, src_mac, &dst_mac, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 53, dport + 1, &reply);
+    try std.testing.expect(!ns.receiveDns(packet[0..other]));
+
+    // A reply from port 5353 (not :53) is consumed but refused.
+    const wrong_sport = udp.build_frame_ex(&packet, src_mac, &dst_mac, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 5353, dport, &reply);
+    try std.testing.expect(ns.receiveDns(packet[0..wrong_sport]));
+    try std.testing.expectError(error.WouldBlock, ns.readDns(7, h, &output));
+
+    // The genuine reply (right id, echo, checksum, tuple) still lands.
+    const good = udp.build_frame_ex(&packet, src_mac, &dst_mac, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, 53, dport, &reply);
+    try std.testing.expect(ns.receiveDns(packet[0..good]));
+    try std.testing.expectEqual(@as(usize, 17), try ns.readDns(7, h, &output));
+    try ns.close(7, h);
 }
 
 test "B6 scheduler: real process exit releases listener half-open children and DNS transaction" {
@@ -3521,6 +3591,43 @@ test "syscall: sys_tcp_connect timeout aborts cleanly and increments timed_out" 
     try std.testing.expectEqual(error_result(.einval), rc);
     try std.testing.expectEqual(tcp.State.idle, tcp.state);
     try std.testing.expectEqual(initial_timeouts + 1, tcp.timed_out);
+
+    tcp.reset();
+    virtio_net.net_ready = false;
+    virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
+}
+
+test "syscall: sys_tcp_connect drops the NET domain lock across the wait pacing (M97e-F3 #2094)" {
+    userspace.init();
+    init(test_writer);
+    var frame = fresh_frame();
+
+    const saved_ops = virtio_net.net_ops;
+    virtio_net.net_ops = test_net_ops();
+    defer virtio_net.net_ops = saved_ops;
+
+    virtio_net.net_ready = true;
+    virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
+    virtio_net.arp.upsert(.{ 10, 0, 0, 2 }, .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 });
+    tcp.reset();
+
+    // The order witness records every acquisition with the held mask it
+    // observed. Before #2094 the connect produced exactly ONE net acquire
+    // (dispatch's entry) — the whole spin ran under that hold. Now the
+    // pacing window drops and retakes it every iteration, and each retake
+    // must observe a held mask WITHOUT net set: the drop is real, not a
+    // nested re-acquire. On the wire, that window is where another
+    // process's net syscall (its own RX pump) completes mid-connect.
+    const net_bit = syscall.svclock.dom_bit(.net);
+    syscall.svclock.order_witness.reset();
+    _ = dispatch(sys_tcp_connect, .{ 0x0a000002, 80, 0, 0, 0, 0 }, &frame);
+    const n = syscall.svclock.order_witness.count();
+    try std.testing.expect(n > 1);
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        try std.testing.expectEqual(@as(u5, net_bit), syscall.svclock.order_witness.taken_at(i));
+        try std.testing.expect(syscall.svclock.order_witness.held_at(i) & net_bit == 0);
+    }
 
     tcp.reset();
     virtio_net.net_ready = false;

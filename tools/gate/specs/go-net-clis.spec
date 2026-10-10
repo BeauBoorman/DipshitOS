@@ -275,7 +275,7 @@ typed = re.search(r"(?m)^gosh: line time sync 10\.0\.0\.2", ser)
 line = re.search(r"(?m)^time sync: synced server=10\.0\.0\.2 stratum=2 delay=(\d+)ms "
                  r"correction=([+-]\d+)s epoch=(\d+)$", ser)
 rc = re.search(r"(?m)^rc=(\d+)\s*$", ser)
-dline = re.search(r"(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \(epoch=(\d+)\)$", ser)
+dline = re.search(r"(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?: UTC)? \(epoch=(\d+)\)$", ser)
 for name, mm in (("typed line", typed), ("sync line", line), ("rc line", rc), ("date line", dline)):
     if not mm:
         sys.exit("FAIL: no %s in the serial log" % name)
@@ -343,7 +343,7 @@ if queries != 1:
 typed = re.search(r"(?m)^gosh: line time sync 10\.0\.0\.2", ser)
 fail = re.search(r"(?m)^time sync: no reply from 10\.0\.0\.2 within 5s; clock untouched$", ser)
 rc = re.search(r"(?m)^rc=(\d+)\s*$", ser)
-dline = re.search(r"(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \(epoch=(\d+)\)$", ser)
+dline = re.search(r"(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?: UTC)? \(epoch=(\d+)\)$", ser)
 for name, mm in (("typed line", typed), ("failure line", fail), ("rc line", rc), ("date line", dline)):
     if not mm:
         sys.exit("FAIL: no %s in the serial log" % name)
@@ -386,7 +386,7 @@ end = time.time()
 typed = re.search(r"(?m)^gosh: line time sync$", ser)
 fail = re.search(r"(?m)^time sync: clock untouched$", ser)
 rc = re.search(r"(?m)^rc=(\d+)\s*$", ser)
-dline = re.search(r"(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \(epoch=(\d+)\)$", ser)
+dline = re.search(r"(?m)^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?: UTC)? \(epoch=(\d+)\)$", ser)
 for name, mm in (("typed line", typed), ("failure line", fail), ("rc line", rc), ("date line", dline)):
     if not mm:
         sys.exit("FAIL: no %s in the serial log" % name)
