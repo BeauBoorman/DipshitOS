@@ -11,7 +11,6 @@ const virtio_net = @import("virtio_net.zig");
 const csprng = @import("csprng.zig");
 
 pub const dns_port: u16 = 53;
-pub const default_client_port: u16 = 7000;
 pub const type_a: u16 = 1;
 pub const class_in: u16 = 1;
 
@@ -31,6 +30,7 @@ pub const DnsError = error{
     BufferTooSmall,
     MalformedResponse,
     IdMismatch,
+    QuestionMismatch,
     NonZeroRCode,
     NoAnswer,
     Timeout,
@@ -133,7 +133,14 @@ fn skip_name(packet: []const u8, start_offset: usize) DnsError!usize {
 }
 
 /// Parse a raw DNS response packet and extract the IPv4 address from the first A record.
-pub fn parse_response(packet: []const u8, expected_id: u16) DnsError![4]u8 {
+/// `expected_question` (M97e-F5, #2104): when non-null — the question
+/// section of the outstanding query (bytes 12.. of the encoded query) —
+/// the response's question section must echo it byte-exact. A forged
+/// answer carrying the right id but a DIFFERENT name fails
+/// `QuestionMismatch` before the answer records are trusted. (RFC 1035
+/// servers echo the question verbatim; a case-rewritten or compressed
+/// question is the honest bound — one question, always.)
+pub fn parse_response(packet: []const u8, expected_id: u16, expected_question: ?[]const u8) DnsError![4]u8 {
     if (packet.len < 12) return DnsError.MalformedResponse;
 
     const id = std.mem.readInt(u16, packet[0..2], .big);
@@ -147,6 +154,11 @@ pub fn parse_response(packet: []const u8, expected_id: u16) DnsError![4]u8 {
     const qdcount = std.mem.readInt(u16, packet[4..6], .big);
     const ancount = std.mem.readInt(u16, packet[6..8], .big);
     if (ancount == 0) return DnsError.NoAnswer;
+
+    if (expected_question) |q| {
+        if (qdcount != 1 or packet.len < 12 + q.len or !std.mem.eql(u8, packet[12 .. 12 + q.len], q))
+            return DnsError.QuestionMismatch;
+    }
 
     var off: usize = 12;
 
@@ -184,6 +196,20 @@ pub fn parse_response(packet: []const u8, expected_id: u16) DnsError![4]u8 {
     return DnsError.NoAnswer;
 }
 
+/// M97e-F5 (#2104): draw a fresh ephemeral client port from the IANA
+/// dynamic range and bind it in the bounded listen table — a fixed port
+/// let an off-path attacker spray replies at a known destination; a
+/// forged reply must now guess the port as well as the query id. `null`
+/// after a bounded number of draws (table full / collisions) — honest.
+fn bind_ephemeral() ?u16 {
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const port: u16 = 49152 + @as(u16, @truncate(csprng.random_u64())) % 16384;
+        if (udp.listen_port(port)) return port;
+    }
+    return null;
+}
+
 /// Resolve `hostname` against `server_ip` using the kernel virtio-net transport.
 /// The server is explicit — a resolver on a different subnet rides the
 /// ARP layer's next-hop rule (the datagram's Ethernet dst is the default
@@ -194,9 +220,11 @@ pub fn resolve(hostname: []const u8, server_ip: [4]u8) DnsError![4]u8 {
     if (!virtio_net.net_ready) return DnsError.TransportNotReady;
     if (!virtio_net.arp.ip_set()) return DnsError.TransportNotReady;
 
-    if (!udp.is_listening(default_client_port)) {
-        if (!udp.listen_port(default_client_port)) return DnsError.TransportNotReady;
-    }
+    // M97e-F5: a fresh ephemeral client port per query, released on
+    // every exit — the bounded listen table holds four seats and would
+    // otherwise exhaust after four resolves.
+    const client_port = bind_ephemeral() orelse return DnsError.TransportNotReady;
+    defer _ = udp.close_port(client_port);
 
     const id: u16 = @truncate(csprng.random_u64());
     query_id = id;
@@ -207,7 +235,7 @@ pub fn resolve(hostname: []const u8, server_ip: [4]u8) DnsError![4]u8 {
 
     virtio_net.net_rx_drain();
     var out_len: usize = 0;
-    switch (virtio_net.net_udp_send(server_ip, dns_port, query_buf[0..query_len], &out_len)) {
+    switch (virtio_net.net_udp_send_from(server_ip, client_port, dns_port, query_buf[0..query_len], &out_len)) {
         .ok => {
             queries_sent += 1;
         },
@@ -220,22 +248,26 @@ pub fn resolve(hostname: []const u8, server_ip: [4]u8) DnsError![4]u8 {
     var iterations: usize = 0;
     while (iterations < 1000000) : (iterations += 1) {
         virtio_net.net_rx_drain();
-        if (udp.peek(default_client_port)) |d| {
+        if (udp.peek(client_port)) |d| {
+            // M97e-F5: EVERY datagram on the port is consumed — a
+            // wrong-ID or malformed datagram left on the ring head
+            // permanently shadowed the real reply behind it (the wedge
+            // the audit demonstrated).
+            _ = udp.pop(client_port);
             if (d.len >= udp.udp_hdr_len) {
                 const payload = d.bytes[udp.udp_hdr_len..d.len];
-                if (parse_response(payload, id)) |ip| {
-                    _ = udp.pop(default_client_port);
+                if (parse_response(payload, id, query_buf[12..query_len])) |ip| {
                     resolved_ip = ip;
                     state = .resolved;
                     responses_recv += 1;
                     return ip;
                 } else |err| {
-                    if (err != DnsError.IdMismatch) {
-                        _ = udp.pop(default_client_port);
+                    if (err != DnsError.IdMismatch and err != DnsError.QuestionMismatch) {
                         responses_err += 1;
                         state = .failed;
                         return err;
                     }
+                    // A foreign id/question echo: dropped, keep waiting.
                 }
             }
         }
@@ -286,8 +318,34 @@ test "dns: response parsing with direct question and answer" {
         0x00, 0x01, 0x2C, 0x00, 0x04, 93,   184,  216,  34,
     };
 
-    const ip = try parse_response(&resp, 0x1234);
+    const ip = try parse_response(&resp, 0x1234, null);
     try std.testing.expectEqual([4]u8{ 93, 184, 216, 34 }, ip);
+}
+
+test "dns: M97e-F5 — the question echo must match the outstanding query" {
+    // The same example.com response as the positive test — accepted with
+    // the matching outstanding question, refused (QuestionMismatch)
+    // against any other name before the answer is trusted.
+    const resp = [_]u8{
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x01, 0x00, 0x01, 0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x01, 0x2C, 0x00, 0x04, 93,   184,  216,  34,
+    };
+    // The question section of an encode_query("example.com"): bytes 12...
+    var qbuf: [128]u8 = undefined;
+    const qlen = try encode_query(&qbuf, 0x1234, "example.com");
+    const ip = try parse_response(&resp, 0x1234, qbuf[12..qlen]);
+    try std.testing.expectEqual([4]u8{ 93, 184, 216, 34 }, ip);
+
+    // A different outstanding name: the echo does not match — refused.
+    const qlen2 = try encode_query(&qbuf, 0x1234, "attacker.example");
+    try std.testing.expectError(DnsError.QuestionMismatch, parse_response(&resp, 0x1234, qbuf[12..qlen2]));
+
+    // And a packet that DROPPED the question (qdcount 0) is refused too.
+    var no_q = resp;
+    no_q[5] = 0;
+    try std.testing.expectError(DnsError.QuestionMismatch, parse_response(&no_q, 0x1234, qbuf[12..qlen]));
 }
 
 test "dns: response error conditions" {
@@ -298,19 +356,19 @@ test "dns: response error conditions" {
         0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04, 10,   0,    0,
         1,
     };
-    try std.testing.expectError(DnsError.IdMismatch, parse_response(&resp1, 0x9999));
+    try std.testing.expectError(DnsError.IdMismatch, parse_response(&resp1, 0x9999, null));
 
     // NXDOMAIN (RCODE = 3)
     const resp_nx = [_]u8{
         0x12, 0x34, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x03, 'b',  'a',  'r',  0x00, 0x00, 0x01, 0x00, 0x01,
     };
-    try std.testing.expectError(DnsError.NonZeroRCode, parse_response(&resp_nx, 0x1234));
+    try std.testing.expectError(DnsError.NonZeroRCode, parse_response(&resp_nx, 0x1234, null));
 
     // No answers
     const resp_empty = [_]u8{
         0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x03, 'b',  'a',  'z',  0x00, 0x00, 0x01, 0x00, 0x01,
     };
-    try std.testing.expectError(DnsError.NoAnswer, parse_response(&resp_empty, 0x1234));
+    try std.testing.expectError(DnsError.NoAnswer, parse_response(&resp_empty, 0x1234, null));
 }

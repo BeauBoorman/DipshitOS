@@ -330,9 +330,11 @@ pub fn t1(lease: u32) u64 {
     return lease / 2;
 }
 
-/// The REBINDING threshold T2 = 0.875 × lease (integer seconds).
+/// The REBINDING threshold T2 = 0.875 × lease (integer seconds). The
+/// multiply is done in u64 — a server may offer a lease up to 2^32-1 s
+/// and `lease * 7` overflows u32 above ~613 M (audit M97e-F4 rider).
 pub fn t2(lease: u32) u64 {
-    return (lease * 7) / 8;
+    return (@as(u64, lease) * 7) / 8;
 }
 
 /// Seconds since the last (re)bind, per the caller-stamped clock.
@@ -450,6 +452,19 @@ pub fn handle_rx(datagram: []const u8) Event {
         dropped_malformed += 1;
         return .none;
     };
+    // M97e-F4 (#2103): the reply must belong to OUR transaction before
+    // it can move the state machine — `xid` (bytes 4..8, the DISCOVER's
+    // echo) and `chaddr` (bytes 28..44, our MAC — hlen is 6, checked by
+    // `parse_reply`). Our requests go out broadcast and the replies come
+    // back broadcast, so EVERY port-68 host on the link sees them: a
+    // foreign client's OFFER/ACK (or a forged NACK) would otherwise
+    // claim `offered_ip`, adopt a foreign lease into `arp.own_ip`, or
+    // knock the client back to IDLE.
+    const xid_in: u32 = (@as(u32, msg_in[4]) << 24) | (@as(u32, msg_in[5]) << 16) | (@as(u32, msg_in[6]) << 8) | msg_in[7];
+    if (xid_in != xid or !std.mem.eql(u8, msg_in[28..34], &client_mac)) {
+        dropped_malformed += 1; // another client's handshake — not ours
+        return .none;
+    }
     switch (p.msg_type) {
         msg_type_offer => {
             if (state != .selecting) {

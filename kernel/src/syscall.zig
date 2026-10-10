@@ -3111,8 +3111,21 @@ fn handle_tcp_connect(args: Args, _: *exceptions.VectorFrame) u64 {
         }
 
         if (comptime builtin.cpu.arch == .aarch64) {
+            // M97e-F3 (#2094): pace the wait WITHOUT the domain hold —
+            // the audit's guest-freeze was this handler spinning
+            // IRQ-masked for the caller's whole budget while every other
+            // net-domain syscall spin-blocked on the lock. The loop's
+            // real work stays locked; only the pacing window drops it —
+            // a preempting task's own net syscall (or another core's) is
+            // the second RX pump in this polled stack, and the canonical
+            // release/acquire pair (the handle_exit precedent) keeps
+            // dispatch's defer balanced. Every TCP op is owner-gated, so
+            // a peer can refuse or drain but never mutate this connect.
+            const outer = svclock.held_bits();
+            svclock.release_set(outer);
             var spins: usize = 0;
             while (spins < 1000) : (spins += 1) asm volatile ("nop");
+            svclock.acquire_set(outer);
         }
     }
 

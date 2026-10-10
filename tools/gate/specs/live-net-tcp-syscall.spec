@@ -225,7 +225,18 @@ PY
 vgate_assert native-dns serial-contains 'native-socket: DNS std.Io lookup cleanup ok'
 vgate_assert native-dns serial-contains 'procs ZNET.BIN exited status=0'
 vgate_assert native-dns output-contains "NET-DNS: answered the guest's DNS query for 'myhost.local'"
-vgate_assert native-dns output-contains 'reply to guest src port 7001'
+# M97e-F5 (#2104): the client port is a fresh ephemeral draw per query —
+# assert the RANGE, not the retired fixed 7001.
+vgate_assert native-dns python <<'PY'
+import os, re, sys
+out = open(os.environ["RUN_DIR"] + "/run-native-dns.out", errors="replace").read()
+m = re.search(r"reply to guest src port (\d+)", out)
+if not m:
+    sys.exit("FAIL: no reply-port line")
+if not (49152 <= int(m.group(1)) <= 65535):
+    sys.exit("FAIL: reply port %s outside the ephemeral range" % m.group(1))
+print("native-dns ephemeral reply port %s ok" % m.group(1))
+PY
 vgate_assert native-dns-timeout serial-contains 'native-socket: DNS timeout cleanup ok'
 vgate_assert native-dns-timeout serial-contains 'procs ZNET.BIN exited status=0'
 vgate_assert native-death serial-contains 'native-socket: death listener owned'

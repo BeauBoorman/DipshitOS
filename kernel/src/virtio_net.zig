@@ -1256,6 +1256,30 @@ pub fn net_udp_send(target_ip: [4]u8, dst_port: u16, payload: []const u8, out_le
     return r;
 }
 
+/// M97e-F5 (#2104): `net_udp_send` with an explicit source port — the
+/// DNS client's ephemeral-port send (its listener seat is bound to the
+/// same port). Same checks, same loopback shortcut (a self-addressed
+/// datagram is degenerate — the loopback builder's src port stays the
+/// fixed default; the reply path it feeds is the local ring, not the
+/// wire, so the port draw is unaffected).
+pub fn net_udp_send_from(target_ip: [4]u8, src_port: u16, dst_port: u16, payload: []const u8, out_len: *usize) SendResult {
+    if (!arp.ip_set()) return .not_ready;
+    if (std.mem.eql(u8, &target_ip, &arp.own_ip)) {
+        out_len.* = udp.loopback(arp.own_ip, dst_port, payload);
+        udp.sent += 1;
+        udp.loopbacked += 1;
+        return .ok;
+    }
+    if (!net_ready) return .not_ready;
+    const peer_mac = arp.lookup(target_ip) orelse return .no_peer;
+    @memset(tx_staging[0..tx_hdr_len], 0);
+    const n = udp.build_frame_ex(tx_staging[tx_hdr_len .. tx_hdr_len + udp.frame_max], peer_mac, &net_mac, arp.own_ip, target_ip, src_port, dst_port, payload);
+    out_len.* = n;
+    const r = net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n]);
+    if (r == .ok) udp.sent += 1;
+    return r;
+}
+
 /// Card N8 (claim 0351): transmit the DHCP client's current message (a
 /// DISCOVER or a REQUEST — built by `dhcp` into `dhcp.msg`) on the N1 TX
 /// path. The card's ONE N5-layer seam change: a DHCP frame goes out with
@@ -1345,9 +1369,12 @@ pub fn net_socket_poll() void {
 
 pub fn net_socket_dns_send(server: [4]u8, query: []const u8) SendResult {
     if (!net_ready or !arp.ip_set()) return .not_ready;
+    // M97e-F5 (#2104): the query rides the transaction's ephemeral port
+    // (beginDns bound it — a send with no transaction open is refused).
+    const d = native_socket.dns orelse return .not_ready;
     const mac = arp.lookup(server) orelse return .no_peer;
     @memset(tx_staging[0..tx_hdr_len], 0);
-    const n = udp.build_frame_ex(tx_staging[tx_hdr_len..], mac, &net_mac, arp.own_ip, server, native_socket.dns_port, 53, query);
+    const n = udp.build_frame_ex(tx_staging[tx_hdr_len..], mac, &net_mac, arp.own_ip, server, d.port, 53, query);
     return net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n]);
 }
 
@@ -1836,7 +1863,11 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     arp.replies_learned = 0;
     arp.dropped = 0;
     arp.reply_tx_fail = 0;
-    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    arp.pending_reply = null;
+    defer {
+        arp.own_ip = .{ 0, 0, 0, 0 };
+        arp.pending_reply = null;
+    }
     rx_fifo_head = 0;
     rx_fifo_count = 0;
     rx_frames = 0;
@@ -1849,9 +1880,8 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     mock_used_len = 0;
     mock_kicks = 0;
 
-    // An ARP REPLY addressed TO us (unicast dst = our MAC, sender
-    // 02:00:00:00:00:02 / 10.0.0.2): the MAC filter admits it (own dst),
-    // and the ARP layer learns the sender — no reply is sent.
+    // M97e-F3 (#2102): an UNSOLICITED reply arrives first — dropped, not
+    // learned (before this fix it would have populated the table).
     const host_mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 };
     const host_ip = [4]u8{ 10, 0, 0, 2 };
     var reply: [arp.arp_frame_len]u8 = undefined;
@@ -1865,10 +1895,24 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     net_rx_drain();
 
     try std.testing.expectEqual(@as(u64, 1), rx_frames);
+    try std.testing.expectEqual(@as(u64, 0), arp.replies_learned);
+    try std.testing.expectEqual(@as(u64, 1), arp.dropped); // the unsolicited reply
+    try std.testing.expect(arp.lookup(host_ip) == null);
+
+    // Now WE request the peer (the real resolve path — pending is the
+    // wire target) and its matching reply IS learned — no reply is sent.
+    var out_len: usize = 0;
+    try std.testing.expectEqual(SendResult.ok, net_arp_request(host_ip, &out_len));
+    try std.testing.expectEqualSlices(u8, &host_ip, &arp.pending_reply.?);
+
+    try std.testing.expect(net_rx_arm());
+    net_rx_drain();
+
+    try std.testing.expectEqual(@as(u64, 2), rx_frames);
     try std.testing.expectEqual(@as(u64, 0), arp.replies_sent); // no reply to a reply
     try std.testing.expectEqual(@as(u64, 1), arp.replies_learned);
-    try std.testing.expectEqual(@as(u64, 0), arp.dropped);
-    try std.testing.expectEqual(@as(u64, 0), net_dev.tx_frames);
+    try std.testing.expect(arp.pending_reply == null); // the request was consumed
+    try std.testing.expectEqual(@as(u64, 1), net_dev.tx_frames); // our request only
     try std.testing.expectEqualSlices(u8, &host_mac, &arp.lookup(host_ip).?);
 }
 

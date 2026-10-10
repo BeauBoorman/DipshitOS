@@ -256,6 +256,20 @@ pub fn handle_rx(frame: []const u8, own_mac: *const [6]u8, reply_buf: []u8) ?usi
         dropped_checksum += 1;
         return null;
     }
+    // M97e-F2 (#2101): the destination must name US before a protocol
+    // handler ever sees the packet — `arp.own_ip`, or the limited
+    // broadcast 255.255.255.255 (the DHCP client sets the broadcast
+    // flag; its OFFER/ACKs arrive there, server port 67 -> client 68).
+    // The MAC filter admits broadcast + multicast frames, so unicast
+    // traffic for OTHER addresses on the segment reaches this layer:
+    // without this check a UDP listener or a TCP session would ingest a
+    // datagram never addressed to this host. Directed broadcast and
+    // multicast are NOT admitted (no consumer — the honest bound).
+    const dst = dst_ip(frame);
+    if (!std.mem.eql(u8, &dst, &arp.own_ip) and !std.mem.eql(u8, &dst, &[4]u8{ 255, 255, 255, 255 })) {
+        dropped_other += 1;
+        return null;
+    }
     if (protocol(frame) == udp.protocol_udp) {
         // Card N5 (claim 8552): UDP datagrams are handed to the UDP layer
         // ALREADY VALIDATED (checksum/fragment/dst checks stayed above —
@@ -453,12 +467,18 @@ test "ipv4: handle_rx — answer an echo for us, observe a reply, drop the rest"
     try std.testing.expect(handle_rx(&req_other, &test_mac, &reply_buf) == null);
     try std.testing.expectEqual(@as(u64, 1), dropped_other);
 
-    // An echo REPLY: observed (pong), not re-answered.
+    // An echo REPLY to OUR outbound ping: observed (pong), not
+    // re-answered. (M97e-F2: the reply's dst must be OUR address — the
+    // real shape is our request to the host, the host's reply back.)
+    ping_id = 3;
+    ping_seq = 3;
+    var our_req: [ipv4_frame_min + 4]u8 = undefined;
+    _ = build_echo_request(&our_req, &test_mac, ip_guest, host_mac, ip_host);
     var rep: [ipv4_frame_min + 4]u8 = undefined;
-    _ = build_echo_reply(&rep, &host_mac, ip_host, &req);
+    _ = build_echo_reply(&rep, &host_mac, ip_host, &our_req);
     try std.testing.expect(handle_rx(&rep, &test_mac, &reply_buf) == null);
     try std.testing.expectEqual(@as(u64, 1), pongs_observed);
-    try std.testing.expectEqual(@as(u16, 1), last_seq);
+    try std.testing.expectEqual(@as(u16, 3), last_seq);
 
     // A FRAGMENT: dropped with its own counter, no reply.
     var frag = req;
@@ -547,4 +567,45 @@ test "ipv4: protocol dispatch — UDP (17) is handed to udp, TCP (6) to the tcp 
     try std.testing.expectEqual(@as(u64, 0), dropped_proto); // dispatched, not dropped
     try std.testing.expectEqual(@as(u64, 1), tcp.dropped_malformed); // the client saw it
     udp.reset();
+}
+
+test "ipv4: M97e-F2 dst gate — a foreign unicast address is dropped before UDP, broadcast admitted" {
+    udp.reset();
+    defer udp.reset();
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    dropped_other = 0;
+    var reply_buf: [ipv4_frame_min + 64]u8 = undefined;
+    try std.testing.expect(udp.listen_port(7000));
+
+    // A well-formed UDP datagram to an address we do NOT own (the MAC
+    // filter admitted it — broadcast/multicast frames come through): it
+    // must never reach the UDP layer's listener.
+    var frame: [udp.frame_max]u8 = undefined;
+    var n = udp.build_frame_ex(&frame, test_mac, &host_mac, ip_host, .{ 10, 0, 0, 99 }, 9999, 7000, "hi");
+    try std.testing.expect(handle_rx(frame[0..n], &test_mac, &reply_buf) == null);
+    try std.testing.expectEqual(@as(u64, 1), dropped_other);
+    try std.testing.expectEqual(@as(u64, 0), udp.received); // never delivered
+    try std.testing.expect(udp.pop(7000) == null);
+
+    // The same datagram to OUR address: delivered (the control — the
+    // gate did not wedge the listener).
+    n = udp.build_frame_ex(&frame, test_mac, &host_mac, ip_host, ip_guest, 9999, 7000, "hi");
+    try std.testing.expect(handle_rx(frame[0..n], &test_mac, &reply_buf) == null);
+    try std.testing.expectEqual(@as(u64, 1), udp.received);
+    try std.testing.expect(udp.pop(7000) != null);
+
+    // The limited broadcast address (the DHCP client's reply shape):
+    // admitted through the gate and delivered the same way.
+    n = udp.build_frame_ex(&frame, .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, &host_mac, ip_host, .{ 255, 255, 255, 255 }, 9999, 7000, "bc");
+    try std.testing.expect(handle_rx(frame[0..n], &test_mac, &reply_buf) == null);
+    try std.testing.expectEqual(@as(u64, 2), udp.received);
+    try std.testing.expect(udp.pop(7000) != null);
+
+    // And a directed broadcast / multicast-shaped address is NOT
+    // admitted (no consumer — the honest bound).
+    n = udp.build_frame_ex(&frame, .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, &host_mac, ip_host, .{ 10, 0, 0, 255 }, 9999, 7000, "db");
+    try std.testing.expect(handle_rx(frame[0..n], &test_mac, &reply_buf) == null);
+    try std.testing.expectEqual(@as(u64, 2), dropped_other);
+    try std.testing.expectEqual(@as(u64, 2), udp.received);
 }

@@ -72,6 +72,18 @@ pub var table: [table_slots]ArpEntry = [_]ArpEntry{.{}} ** table_slots;
 /// `pub` for the cross-module wiring tests (virtio_net resets it).
 pub var table_cursor: usize = 0;
 
+/// The protocol address an ARP request is outstanding for — set by
+/// `build_request` (the ONE wire-request funnel: every request we send
+/// asks "who has THIS address", so the built tpa is the pending target,
+/// already the NEXT-HOP resolution for an off-subnet destination) and
+/// cleared when its matching reply is learned. `null` = no request
+/// outstanding. M97e-F3 (#2102): a reply is learned ONLY against this —
+/// an unsolicited reply can never create or overwrite an entry (an
+/// on-link host could otherwise overwrite the gateway mapping and
+/// redirect every off-subnet flow). ONE slot: a second request
+/// supersedes the first, matching the single-request-at-a-time senders.
+pub var pending_reply: ?[4]u8 = null;
+
 /// ARP counters (the `net`/`net arp` reports).
 pub var requests_sent: u64 = 0; // ARP requests we transmitted (a resolve miss)
 pub var replies_sent: u64 = 0; // replies to requests for OUR protocol address
@@ -307,6 +319,7 @@ pub fn is_reply(frame: []const u8) bool {
 pub fn build_request(buf: []u8, own_mac: *const [6]u8, own_ip_addr: [4]u8, target_ip: [4]u8) usize {
     @memset(buf[0..arp_frame_len], 0);
     @memset(buf[0..6], 0xff); // broadcast dst
+    pending_reply = target_ip; // a request for `target_ip` is now outstanding (M97e-F3)
     @memcpy(buf[6..12], own_mac); // src
     buf[12] = 0x08;
     buf[13] = 0x06; // ethertype ARP
@@ -360,8 +373,20 @@ pub fn handle_rx(frame: []const u8, own_mac: *const [6]u8, reply_buf: []u8) ?usi
         return null;
     }
     if (is_reply(frame)) {
-        upsert(sender_ip(frame), sender_mac(frame));
-        replies_learned += 1;
+        // M97e-F3 (#2102): learn ONLY the reply to a request we actually
+        // have outstanding — an unsolicited reply (gratuitous or forged,
+        // e.g. an on-link host racing to overwrite the gateway entry) is
+        // dropped and counted, never upserted.
+        const spa = sender_ip(frame);
+        if (pending_reply) |p| {
+            if (std.mem.eql(u8, &spa, &p)) {
+                upsert(spa, sender_mac(frame));
+                replies_learned += 1;
+                pending_reply = null;
+                return null;
+            }
+        }
+        dropped += 1;
         return null;
     }
     if (!is_request_for_us(frame)) {
@@ -534,13 +559,18 @@ test "arp: handle_rx — answer for us, learn a reply, drop the rest" {
     replies_learned = 0;
     dropped = 0;
     reply_tx_fail = 0;
+    pending_reply = null;
     defer own_ip = .{ 0, 0, 0, 0 };
+    defer pending_reply = null;
 
     var reply_buf: [arp_frame_len]u8 = undefined;
 
-    // A request for OUR address: a byte-exact reply is built.
+    // A request for OUR address: a byte-exact reply is built. (The
+    // fixture build marks a request outstanding as a side effect — clear
+    // it; this frame is the HOST's request, not ours.)
     var req: [arp_frame_len]u8 = undefined;
     _ = build_request(&req, &host_mac, ip_host, ip_guest);
+    pending_reply = null;
     const rn = handle_rx(&req, &test_mac, &reply_buf).?;
     try std.testing.expectEqual(@as(usize, 42), rn);
     try std.testing.expectEqualSlices(u8, &host_mac, reply_buf[0..6]); // dst = requester
@@ -552,31 +582,55 @@ test "arp: handle_rx — answer for us, learn a reply, drop the rest" {
     // A request for a DIFFERENT address: dropped, no reply.
     var req_other: [arp_frame_len]u8 = undefined;
     _ = build_request(&req_other, &host_mac, ip_host, .{ 10, 0, 0, 99 });
+    pending_reply = null;
     try std.testing.expect(handle_rx(&req_other, &test_mac, &reply_buf) == null);
     try std.testing.expectEqual(@as(u64, 1), dropped);
 
-    // An ARP reply: learned into the table, no reply built.
+    // M97e-F3 (#2102): an UNSOLICITED reply is dropped, never learned —
+    // even for the gateway. We then issue OUR request for ip_host and
+    // its matching reply IS learned (the request is consumed).
+    const attacker_mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x66, 0x66 };
+    var rep_forge: [arp_frame_len]u8 = undefined;
+    _ = build_reply(&rep_forge, &attacker_mac, ip_host, test_mac, ip_guest);
+    try std.testing.expect(handle_rx(&rep_forge, &test_mac, &reply_buf) == null);
+    try std.testing.expectEqual(@as(u64, 2), dropped);
+    try std.testing.expectEqual(@as(u64, 0), replies_learned);
+    try std.testing.expect(lookup(ip_host) == null);
+
+    var our_req: [arp_frame_len]u8 = undefined;
+    _ = build_request(&our_req, &test_mac, ip_guest, ip_host);
+    try std.testing.expectEqualSlices(u8, &ip_host, &pending_reply.?);
+
     var rep: [arp_frame_len]u8 = undefined;
     _ = build_reply(&rep, &host_mac, ip_host, test_mac, ip_guest);
     try std.testing.expect(handle_rx(&rep, &test_mac, &reply_buf) == null);
     try std.testing.expectEqual(@as(u64, 1), replies_learned);
+    try std.testing.expect(pending_reply == null); // the outstanding request was consumed
     try std.testing.expectEqualSlices(u8, &host_mac, &lookup(ip_host).?);
+
+    // A reply for an address we did NOT just request is still refused
+    // (a second knock after the pending was consumed).
+    var rep_other: [arp_frame_len]u8 = undefined;
+    _ = build_reply(&rep_other, &.{ 0x02, 0, 0, 0, 0, 7 }, .{ 10, 0, 0, 7 }, test_mac, ip_guest);
+    try std.testing.expect(handle_rx(&rep_other, &test_mac, &reply_buf) == null);
+    try std.testing.expectEqual(@as(u64, 3), dropped);
+    try std.testing.expect(lookup(.{ 10, 0, 0, 7 }) == null);
 
     // A non-ARP frame: untouched, not counted as dropped.
     var ip_frame: [eth_hdr_len + 20]u8 = .{0} ** (eth_hdr_len + 20);
     ip_frame[12] = 0x08;
     ip_frame[13] = 0x00;
     try std.testing.expect(handle_rx(&ip_frame, &test_mac, &reply_buf) == null);
-    try std.testing.expectEqual(@as(u64, 1), dropped);
+    try std.testing.expectEqual(@as(u64, 3), dropped);
 
     // A malformed ARP (short): dropped.
     try std.testing.expect(handle_rx(rep[0..41], &test_mac, &reply_buf) == null);
-    try std.testing.expectEqual(@as(u64, 2), dropped);
+    try std.testing.expectEqual(@as(u64, 4), dropped);
 
     // No IP set: a request is not answered (dropped).
     own_ip = .{ 0, 0, 0, 0 };
     try std.testing.expect(handle_rx(&req, &test_mac, &reply_buf) == null);
-    try std.testing.expectEqual(@as(u64, 3), dropped);
+    try std.testing.expectEqual(@as(u64, 5), dropped);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +643,7 @@ fn reset_route_state() void {
     gateway = .{ 0, 0, 0, 0 };
     table = [_]ArpEntry{.{}} ** table_slots;
     table_cursor = 0;
+    pending_reply = null;
 }
 
 test "arp: on_link — subnet membership under the /24 bound and a wider mask" {
