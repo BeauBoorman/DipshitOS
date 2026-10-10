@@ -281,18 +281,46 @@ pub fn find_peer(peer_pid: u64, peer_va: u64) ?u32 {
     return null;
 }
 
-/// Whether any live region is OWNED by `pid` or peer-mapped by `pid` and
-/// spans `va` — the shared-munmap guard: teardown of a shared surface is
-/// FULL-REGION only; a partial unmap is refused (EINVAL) by the handler.
-pub fn covers(pid: u64, va: u64) bool {
+/// #2113: how the unmap range [va, va+len) stands against every live shared
+/// region `pid` seats. The old `covers` check tested only the range START,
+/// so a range beginning before a surface and overlapping it fell through to
+/// the generic unmap — stripping the owner's shared leaves while the
+/// descriptor and the WM mirror stayed live.
+pub const MunmapMatch = enum {
+    /// No live seat of `pid` intersects the range.
+    none,
+    /// The range intersects a seat but does not equal it exactly — the
+    /// full-region-only teardown rule (ADR 0016) refuses it EINVAL.
+    partial,
+    /// The range IS exactly a region `pid` owns (owner teardown path).
+    owner,
+    /// The range IS exactly a region `pid` peer-maps (peer detach path).
+    peer,
+};
+
+pub fn munmap_match(pid: u64, va: u64, len: u64) MunmapMatch {
+    const va_end = va +% len;
     for (&regions) |*r| {
         if (!r.in_use) continue;
-        const len = @as(u64, r.page_count) * 4096;
-        const owned = r.owner_pid == pid and r.owner_va <= va and va < r.owner_va + len;
-        const peered = r.peer_pid == pid and r.peer_va <= va and va < r.peer_va + len;
-        if (owned or peered) return true;
+        const rlen = @as(u64, r.page_count) * 4096;
+        if (r.owner_pid == pid) {
+            const lo = @max(va, r.owner_va);
+            const hi = @min(va_end, r.owner_va + rlen);
+            if (hi > lo) {
+                if (va == r.owner_va and len == rlen) return .owner;
+                return .partial;
+            }
+        }
+        if (r.peer_pid == pid) {
+            const lo = @max(va, r.peer_va);
+            const hi = @min(va_end, r.peer_va + rlen);
+            if (hi > lo) {
+                if (va == r.peer_va and len == rlen) return .peer;
+                return .partial;
+            }
+        }
     }
-    return false;
+    return .none;
 }
 
 /// Collect the handles of every live region OWNED by `pid` (the owner-exit
@@ -442,8 +470,8 @@ test "shared_region: a reused slot starts clean — no stale SB2 wiring survives
     try std.testing.expect(set_peer(h, wm, 0x2000_0000));
     try std.testing.expect(find_owner(owner, 0x1000_0000) == h);
     try std.testing.expect(find_peer(wm, 0x2000_0000) == h);
-    try std.testing.expect(covers(owner, 0x1000_0000));
-    try std.testing.expect(covers(wm, 0x2000_0000));
+    try std.testing.expect(munmap_match(owner, 0x1000_0000, 8192) == .owner);
+    try std.testing.expect(munmap_match(wm, 0x2000_0000, 8192) == .peer);
     var out: [max_shared_regions]u32 = undefined;
     try std.testing.expectEqual(@as(usize, 1), owned_handles(owner, &out));
     try std.testing.expectEqual(@as(usize, 1), peer_handles(wm, &out));
@@ -452,7 +480,7 @@ test "shared_region: a reused slot starts clean — no stale SB2 wiring survives
     try std.testing.expect(info(h) == null);
     try std.testing.expect(find_owner(owner, 0x1000_0000) == null);
     try std.testing.expect(find_peer(wm, 0x2000_0000) == null);
-    try std.testing.expect(!covers(owner, 0x1000_0000));
+    try std.testing.expect(munmap_match(owner, 0x1000_0000, 8192) == .none);
     // A NEW region reuses the (dropped) slot: no stale owner va, page set,
     // or peer seat survives — a later revoke can never unmap wrong leaves.
     const h2 = create(owner);

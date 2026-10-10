@@ -105,6 +105,7 @@ const sys_win_raise_front = syscall.sys_win_raise_front;
 const sys_win_resize = syscall.sys_win_resize;
 const sys_win_set_title = syscall.sys_win_set_title;
 const sys_win_set_unsaved = syscall.sys_win_set_unsaved;
+const sys_setrlimit = syscall.sys_setrlimit;
 const sys_win_set_visible = syscall.sys_win_set_visible;
 const sys_wmctl = syscall.sys_wmctl;
 const sys_time = syscall.sys_time;
@@ -3857,7 +3858,7 @@ test "syscall: reclaim all four allocation paths unwind record storage exhaustio
     try std.testing.expect(!mmu.leaf_el0_visible(f.root, va));
     try std.testing.expectEqual(@as(u64, 1), alloc.stats().free_pages);
     try std.testing.expect(process.add_mmap_region(f.pid, va, 4096, 3, 0x22));
-    try std.testing.expect(!exceptions.populate_user_page(f.pid, f.root, va));
+    try std.testing.expect(!exceptions.populate_user_page(f.pid, f.root, va, true));
     try std.testing.expect(!mmu.leaf_el0_visible(f.root, va));
     try std.testing.expectEqual(@as(u64, 1), alloc.stats().free_pages);
     // A borrowed COW page is outside the pool (in the refcount span, but
@@ -3927,6 +3928,336 @@ test "syscall: reclaim populated mmap mapping failure unwinds the region" {
     _ = process.on_task_exit(f.task, 0);
     try std.testing.expect(process.release_pages_on_reap(f.task));
     try std.testing.expectEqual(@as(u64, 8), alloc.stats().free_pages);
+}
+
+test "syscall: #2092 — sys_mmap refuses kernel-live and wrapping hints with EINVAL" {
+    const f = try reclaimFixture(8);
+    var frame = fresh_frame();
+
+    // Fabricate a kernel-live EL1-only leaf the way map_low_identity does:
+    // install an EL0 leaf under the fresh root, then strip its AP bits —
+    // the descriptor shape the cloned identity overlay carries over pooled
+    // RAM (Normal attr + AP=0b00 => kernel_live_leaf).
+    const twin_va: u64 = 0x7000_0000;
+    try std.testing.expect(mmu.map_user_page(f.root, twin_va, 0x5000_0000, true, false));
+    mmu.get_user_leaf(f.root, twin_va).?.* &= ~@as(u64, 0b11 << 6);
+    try std.testing.expect(!mmu.user_slot_free(f.root, twin_va));
+
+    // The hinted mmap at the kernel-live VA is refused BEFORE a region row
+    // is registered — the twin leaf survives untouched.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ twin_va, 4096, 3, 0x22, 0, 0 }, &frame));
+    try std.testing.expect(process.find_mmap_region(f.pid, twin_va) == null);
+    try std.testing.expectEqual(@as(u64, 0), (mmu.get_user_leaf(f.root, twin_va).?.* >> 6) & 3);
+    // A range SPANNING INTO the kernel-live page refuses too.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ twin_va - 4096, 8192, 3, 0x22, 0, 0 }, &frame));
+    try std.testing.expect(process.find_mmap_region(f.pid, twin_va - 4096) == null);
+
+    // A hint whose va+len wraps u64 is refused at the collision check —
+    // page-aligned, so it reaches mmap_collides, which must not read the
+    // wrapped end as a tiny range below the apertures.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ std.math.maxInt(u64) - 0xfff, 4096, 3, 0x22, 0, 0 }, &frame));
+    try std.testing.expect(process.mmap_collides(f.pid, std.math.maxInt(u64) - 0xfff, 4096));
+
+    // A clean hint in the mmap band still maps — the check refuses shadows,
+    // not ordinary windows.
+    try std.testing.expectEqual(@as(u64, 0x6000_0000), dispatch(sys_mmap, .{ 0x6000_0000, 4096, 3, 0x22, 0, 0 }, &frame));
+    _ = process.on_task_exit(f.task, 0);
+    try std.testing.expect(process.release_pages_on_reap(f.task));
+}
+
+test "syscall: #2098 — sys_exit refuses the kernel-reserved statuses" {
+    mmu.reset();
+    alloc.reset_refcounts();
+    process.init();
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+    scheduler.start();
+
+    var frame = fresh_frame();
+    try std.testing.expect(scheduler.yield_current()); // shell -> user (2)
+    const task = scheduler.current_id();
+
+    // EL0 may not forge the statuses the kernel reserves for its own
+    // verdicts (OOM-kill 137, fault 139, mem-limit 140, cpu-limit 141).
+    for ([_]u64{ 137, 139, 140, 141 }) |status| {
+        try std.testing.expectEqual(error_result(.einval), dispatch(sys_exit, .{ status, 0, 0, 0, 0, 0 }, &frame));
+        try std.testing.expectEqual(task, scheduler.current_id()); // still alive
+    }
+    // An ordinary status still exits — the guard refuses forgeries, not exit.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_exit, .{ 7, 0, 0, 0, 0, 0 }, &frame));
+}
+
+test "syscall: #2113 — shared-surface munmap is full-region only, whatever the overlap shape" {
+    mmu.reset();
+    alloc.reset_refcounts();
+    shared_region.reset();
+    process.init();
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 256, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+
+    const owner_root = mmu.build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const peer_root = mmu.build_user_root(userspace.text_va, 0x3000, 64, userspace.stack_va, 0x4000, 8192).?;
+    var kstack1: [scheduler.task_stack_size]u8 align(16) = undefined;
+    var kstack2: [scheduler.task_stack_size]u8 align(16) = undefined;
+    const owner_pid = process.create("OWNER.BIN", .{ .entry_va = 0x400000, .content_len = 64 }, .{
+        .root_phys = owner_root,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    const peer_pid = process.create("PEER.BIN", .{ .entry_va = 0x400000, .content_len = 64 }, .{
+        .root_phys = peer_root,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    const owner_task = scheduler.register_exec_user(userspace.text_va, 0x4000_0000, 100, 0x8000_0000, 8192, &kstack1, 0, 0).?;
+    const peer_task = scheduler.register_exec_user(userspace.text_va, 0x5000_0000, 100, 0x9000_0000, 8192, &kstack2, 0, 0).?;
+    _ = process.bind(owner_pid, owner_task);
+    _ = process.bind(peer_pid, peer_task);
+    scheduler.start();
+
+    var frame = fresh_frame();
+    var guard: usize = 0;
+    while (scheduler.current_id() != owner_task and guard < scheduler.max_tasks) : (guard += 1) {
+        try std.testing.expect(scheduler.yield_current());
+    }
+    try std.testing.expectEqual(owner_task, scheduler.current_id());
+
+    // A TWO-page shared surface so partial ranges exist inside it.
+    const owner_va = dispatch(sys_mmap, .{ 0, 8192, 3, 0x20 | 0x10000, 0, 0 }, &frame);
+    try std.testing.expect(owner_va >= 0x1000_0000);
+    const h: u32 = 1;
+    const r = shared_region.info(h).?;
+    try std.testing.expectEqual(@as(u32, 2), r.page_count);
+    const pa_base = r.pa_base;
+
+    // Every partial-overlap shape is EINVAL and strips NOTHING:
+    //  - a suffix inside the region,
+    //  - a prefix inside the region,
+    //  - a range beginning BEFORE the region that overlaps it (the old
+    //    covers() bug — the start was outside, so the check never ran),
+    //  - a range spanning past the region's end.
+    for ([_]struct { va: u64, len: u64 }{
+        .{ .va = owner_va + 4096, .len = 4096 },
+        .{ .va = owner_va, .len = 4096 },
+        .{ .va = owner_va - 4096, .len = 8192 },
+        .{ .va = owner_va + 4096, .len = 8192 },
+    }) |range| {
+        try std.testing.expectEqual(error_result(.einval), dispatch(sys_munmap, .{ range.va, range.len, 0, 0, 0, 0 }, &frame));
+        try std.testing.expectEqual(@as(u32, 2), shared_region.info(h).?.page_count);
+        try std.testing.expect(mmu.leaf_el0_visible(owner_root, owner_va));
+        try std.testing.expect(mmu.leaf_el0_visible(owner_root, owner_va + 4096));
+    }
+    // A wrapping len is refused before it can alias anything.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_munmap, .{ owner_va, std.math.maxInt(u64) - 0xfff, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(shared_region.info(h) != null);
+
+    // The PEER attaches, then the same full-region rule binds its seat.
+    _ = wm_server.register(peer_pid);
+    guard = 0;
+    while (scheduler.current_id() != peer_task and guard < scheduler.max_tasks) : (guard += 1) {
+        try std.testing.expect(scheduler.yield_current());
+    }
+    try std.testing.expectEqual(peer_task, scheduler.current_id());
+    const peer_va = dispatch(sys_mmap, .{ h, 8192, 1, 0x20 | 0x10000, 0, 0 }, &frame);
+    try std.testing.expect(peer_va >= 0x1000_0000);
+    for ([_]struct { va: u64, len: u64 }{
+        .{ .va = peer_va, .len = 4096 },
+        .{ .va = peer_va - 4096, .len = 8192 },
+    }) |range| {
+        try std.testing.expectEqual(error_result(.einval), dispatch(sys_munmap, .{ range.va, range.len, 0, 0, 0, 0 }, &frame));
+        try std.testing.expect(mmu.leaf_el0_visible(peer_root, peer_va));
+        try std.testing.expectEqual(@as(u64, peer_pid), shared_region.info(h).?.peer_pid);
+    }
+    // Exact peer detach succeeds: the peer seat drops, the owner keeps the surface.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_munmap, .{ peer_va, 8192, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(mmu.get_user_leaf(peer_root, peer_va) == null or mmu.get_user_leaf(peer_root, peer_va).?.* == 0);
+    try std.testing.expectEqual(@as(u64, 0), shared_region.info(h).?.peer_pid);
+    try std.testing.expect(mmu.leaf_el0_visible(owner_root, owner_va));
+    _ = wm_server.unregister(peer_pid);
+
+    // Back on the owner, exact teardown still frees the whole surface.
+    guard = 0;
+    while (scheduler.current_id() != owner_task and guard < scheduler.max_tasks) : (guard += 1) {
+        try std.testing.expect(scheduler.yield_current());
+    }
+    try std.testing.expectEqual(owner_task, scheduler.current_id());
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_munmap, .{ owner_va, 8192, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(shared_region.info(h) == null);
+    try std.testing.expect(!alloc.unref_page(pa_base)); // both pages freed, refcount honest
+}
+
+test "syscall: #2114 — a mid-attach auto-mirror failure unwinds peer leaves, refs, and the WM row" {
+    mmu.reset();
+    alloc.reset_refcounts();
+    shared_region.reset();
+    process.init();
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+    driving_award.arm();
+
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 256, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+
+    const owner_root = mmu.build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const wm_root = mmu.build_user_root(userspace.text_va, 0x3000, 64, userspace.stack_va, 0x4000, 8192).?;
+    var kstack1: [scheduler.task_stack_size]u8 align(16) = undefined;
+    var kstack2: [scheduler.task_stack_size]u8 align(16) = undefined;
+    const owner_pid = process.create("APP.BIN", .{ .entry_va = 0x400000, .content_len = 64 }, .{
+        .root_phys = owner_root,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    const wm_pid = process.create("WM.BIN", .{ .entry_va = 0x400000, .content_len = 64 }, .{
+        .root_phys = wm_root,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    const owner_task = scheduler.register_exec_user(userspace.text_va, 0x4000_0000, 100, 0x8000_0000, 8192, &kstack1, 0, 0).?;
+    const wm_task = scheduler.register_exec_user(userspace.text_va, 0x5000_0000, 100, 0x9000_0000, 8192, &kstack2, 0, 0).?;
+    _ = process.bind(owner_pid, owner_task);
+    _ = process.bind(wm_pid, wm_task);
+    scheduler.start();
+
+    var frame = fresh_frame();
+    var guard: usize = 0;
+    while (scheduler.current_id() != owner_task and guard < scheduler.max_tasks) : (guard += 1) {
+        try std.testing.expect(scheduler.yield_current());
+    }
+    try std.testing.expectEqual(owner_task, scheduler.current_id());
+    _ = wm_server.register(wm_pid);
+
+    // Plant a kernel-live EL1-only leaf mid-way through the range the WM's
+    // auto-mirror would take: the WM's first next_mmap_va is
+    // mmap_default_va, and map_peer_leaves installs pages sequentially —
+    // page 0-2 land, page 3 refuses, and the whole attempt must unwind.
+    const fail_va = process.mmap_default_va + 3 * 4096;
+    try std.testing.expect(mmu.map_user_page(wm_root, fail_va, 0x5100_0000, true, false));
+    mmu.get_user_leaf(wm_root, fail_va).?.* &= ~@as(u64, 0b11 << 6); // EL1-only
+    const wm_rows_before = live_mmap_rows(wm_pid);
+    const free_before = alloc.stats().free_pages;
+
+    const wid = dispatch(sys_win_open, .{ 64, 64, 128, 96, 0, 0 }, &frame);
+    try std.testing.expectEqual(@as(u64, 2), wid);
+    const surf_len: u64 = 128 * 96 * 4; // 12 pages
+    const bound = dispatch(sys_mmap, .{ m33_surf_win_tag | wid, surf_len, 3, 0x20 | 0x10000, 0, 0 }, &frame);
+    try std.testing.expectEqual(error_result(.enomem), bound);
+
+    // Zero peer leaves survive and zero elevated refs — the three installed
+    // pages are unmapped AND unref'd (each back to the owner's sole ref).
+    const r = shared_region.info(1).?;
+    for (0..3) |i| {
+        try std.testing.expect(mmu.get_user_leaf(wm_root, process.mmap_default_va + @as(u64, i) * 4096) == null or
+            mmu.get_user_leaf(wm_root, process.mmap_default_va + @as(u64, i) * 4096).?.* == 0);
+        try std.testing.expectEqual(@as(u16, 1), alloc.page_refcount(r.pa_base + @as(u64, i) * 4096));
+    }
+    // The failed page kept its single owner ref — the double-unref would
+    // have freed a page the owner still maps.
+    try std.testing.expectEqual(@as(u16, 1), alloc.page_refcount(r.pa_base + 3 * 4096));
+    // No peer seat, no WM region row, no phantom read grant.
+    try std.testing.expectEqual(@as(u64, 0), r.peer_pid);
+    try std.testing.expectEqual(wm_rows_before, live_mmap_rows(wm_pid));
+    try std.testing.expectEqual(@as(u32, 0), shared_region.read_count(1));
+    // The owner surface itself stays live and bound — the caller's error
+    // was honest, and owner teardown still frees every page exactly once.
+    try std.testing.expect(driving_award.user_is_surface_backed(@intCast(wid)));
+    try std.testing.expect(mmu.leaf_el0_visible(owner_root, r.owner_va));
+    try std.testing.expect(alloc.stats().free_pages < free_before); // only the surface pages are gone
+
+    // Owner exit through the real seam frees every page exactly once —
+    // close_owner ends the bound window, revoke_owner drops the region,
+    // and the reap unrefs the owner's charge (12 surface pages return).
+    try std.testing.expect(scheduler.exit_current(0));
+    try std.testing.expect(process.release_pages_on_reap(owner_task));
+    var pg: u64 = 0;
+    while (pg < r.page_count) : (pg += 1) {
+        // free now — reserve flips it allocated, freeing returns the probe.
+        try std.testing.expect(alloc.reserve(r.pa_base + pg * 4096, 1));
+        try std.testing.expect(alloc.free_pages(r.pa_base + pg * 4096, 1));
+    }
+    try std.testing.expectEqual(free_before, alloc.stats().free_pages);
+
+    _ = wm_server.unregister(wm_pid);
+}
+
+test "syscall: #2115 — the memory rlimit charges demand pages, refuses at the ceiling, and drops on free" {
+    const f = try reclaimFixture(8);
+    var frame = fresh_frame();
+    const pid = f.pid;
+
+    // setrlimit(0, 2) through the syscall gate — process.current() is the
+    // fixture's pid (no later create has moved it yet).
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_setrlimit, .{ 0, 2, 0, 0, 0, 0 }, &frame));
+
+    // Usage starts clean; other processes stay unaffected throughout.
+    const other = process.create("OTHER", .{}, .{}, .{}).?;
+    try std.testing.expectEqual(@as(u64, 0), process.getrusage(pid).?.mem_usage);
+    try std.testing.expectEqual(@as(u64, 0), process.getrusage(other).?.mem_usage);
+
+    // A MAP_POPULATE mmap charges every page it installs: two fit the
+    // ceiling, so the call succeeds and usage reflects the charge.
+    const va: u64 = 0x6000_0000;
+    try std.testing.expectEqual(va, dispatch(sys_mmap, .{ va, 2 * 4096, 3, 0x8022, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 2), process.getrusage(pid).?.mem_usage);
+
+    // The next charged page is refused at the ceiling — the populate
+    // unwinds ALL of it (region row gone, leaves gone, usage unchanged)
+    // and reports ENOMEM, while the refusal is named for the 140 verdict.
+    try std.testing.expectEqual(error_result(.enomem), dispatch(sys_mmap, .{ va + 0x2000, 4096, 3, 0x8022, 0, 0 }, &frame));
+    try std.testing.expect(process.find_mmap_region(pid, va + 0x2000) == null);
+    try std.testing.expect(!mmu.leaf_el0_visible(f.root, va + 0x2000));
+    try std.testing.expectEqual(@as(u64, 2), process.getrusage(pid).?.mem_usage);
+    try std.testing.expect(process.mem_limit_refused(pid));
+    try std.testing.expectEqual(@as(u64, 0), process.getrusage(other).?.mem_usage);
+
+    // Demand populate of a RESERVED region also refuses at the ceiling —
+    // populate, not reservation, is where the charge lands.
+    const va2: u64 = 0x6100_0000;
+    try std.testing.expectEqual(va2, dispatch(sys_mmap, .{ va2, 4096, 3, 0x22, 0, 0 }, &frame));
+    try std.testing.expect(!exceptions.populate_user_page(pid, f.root, va2, true));
+    try std.testing.expect(!mmu.leaf_el0_visible(f.root, va2));
+
+    // Freeing pages drops the charge: munmap of the populated region
+    // returns usage to 0 and re-arms the limit (mem_refused stays latched
+    // until the next setrlimit re-arms it).
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_munmap, .{ va, 2 * 4096, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), process.getrusage(pid).?.mem_usage);
+
+    // Below the ceiling again, charging resumes — and a fresh setrlimit
+    // re-arms the 140 verdict flag.
+    try std.testing.expectEqual(va, dispatch(sys_mmap, .{ va, 4096, 3, 0x8022, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 1), process.getrusage(pid).?.mem_usage);
+    try std.testing.expect(process.setrlimit(pid, 0, 4));
+    try std.testing.expect(!process.mem_limit_refused(pid));
+
+    _ = process.on_task_exit(f.task, 0);
+    try std.testing.expect(process.release_pages_on_reap(f.task));
+    try std.testing.expect(process.reap(other));
 }
 
 test "syscall: sys_mmap and sys_munmap anonymous allocation and teardown" {

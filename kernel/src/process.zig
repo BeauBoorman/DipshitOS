@@ -33,6 +33,7 @@
 const std = @import("std");
 const alloc = @import("alloc.zig"); // claim 0826: the process owns its pages (text/stack/kernel-stack) from the physical allocator
 const memmap = @import("memmap.zig"); // host-test fixture view (page-ownership tests arm the allocator)
+const mmu = @import("mmu.zig"); // #2116: the per-root page-table tree dies with the process
 const svclock = @import("svclock.zig");
 
 /// Bounded process registry size (fixed BSS array). Milestone sixteen C3
@@ -352,11 +353,15 @@ const Process = struct {
     exnotify_handler: u64 = 0,
     /// Arc5 issue #246: per-process resource limits.
     /// mem_limit: max pages (0 = unlimited). cpu_limit: max ticks (0 = unlimited).
-    /// mem_usage: current page count (text + data + stack). cpu_usage: tick counter.
+    /// mem_usage: current page count (charged dynamic pages — #2115).
+    /// cpu_usage: tick counter. mem_refused: a charge was denied by the
+    /// limit since the last setrlimit — the fault path reads it to name the
+    /// kill 140 instead of a generic 139.
     mem_limit: u64 = 0,
     cpu_limit: u64 = 0,
     mem_usage: u64 = 0,
     cpu_usage: u64 = 0,
+    mem_refused: bool = false,
 };
 
 var processes: [max_processes]Process = [_]Process{.{}} ** max_processes;
@@ -496,6 +501,14 @@ fn release_resources(p: *Process) void {
     p.addr_space.dynamic_page_count = 0;
     p.addr_space.mmap_region_count = 0;
     @memset(&p.addr_space.mmap_regions, MmapRegion{});
+    p.mem_usage = 0;
+    // #2116: the process's page-table tree dies with it — every table the
+    // root reaches is a per-root allocation (the identity clone copies, it
+    // never shares), so the whole subtree returns to the carve-out free
+    // list. Zeroed so the registry-level release_resources is a no-op
+    // (same idiom as the page fields above).
+    if (p.addr_space.root_phys != 0) _ = mmu.free_table_tree(p.addr_space.root_phys);
+    p.addr_space.root_phys = 0;
 }
 
 pub fn add_mmap_region(pid: usize, va: u64, len: u64, prot: u64, flags: u64) bool {
@@ -578,7 +591,11 @@ pub fn mmap_collides(pid: usize, va: u64, len: u64) bool {
     if (pid >= max_processes or processes[pid].state == .free) return true;
     const space = &processes[pid].addr_space;
     const start = va;
-    const end = va + len;
+    // #2092: compute the end wrap-safely — a hint near 2^64 wraps `end`
+    // below `start` and every overlap test below then passes trivially,
+    // letting the range alias whatever it wants. Refuse the wrap itself.
+    const end = va +% len;
+    if (len != 0 and end <= start) return true;
     // Protect the data aperture through the packed argv+envp region, not
     // just to the page-rounded image end: on an exactly page-aligned
     // `mem_size` the block starts at the headroom page and the sbrk break
@@ -609,6 +626,16 @@ pub fn record_dynamic_page(pid: usize, pa: u64) bool {
     const taken = svclock.acquire_missing(svclock.dom_bit(.kernel));
     defer svclock.release_set(taken);
     if (pid >= max_processes or processes[pid].state == .free) return false;
+    // #2115: the memory rlimit finally bites — the single charge point
+    // every allocation funnels through (demand populate, COW promotion,
+    // MAP_POPULATE, shared-surface create). A process AT its page ceiling
+    // is refused loudly: mem_refused names the 140 verdict on the fault
+    // path that delivers it.
+    if (processes[pid].mem_limit != 0 and processes[pid].mem_usage >= processes[pid].mem_limit) {
+        processes[pid].mem_refused = true;
+        processes[pid].runtime_usage.record_failures += 1;
+        return false;
+    }
     var space = &processes[pid].addr_space;
     if (space.dynamic_page_count < max_dynamic_pages) {
         space.dynamic_pages[space.dynamic_page_count] = pa;
@@ -630,6 +657,7 @@ pub fn record_dynamic_page(pid: usize, pa: u64) bool {
         tail.count += 1;
     }
     space.dynamic_page_count += 1;
+    update_mem_usage(pid, 1);
     processes[pid].runtime_usage.total_pages += 1;
     processes[pid].runtime_usage.peak_pages = @max(processes[pid].runtime_usage.peak_pages, space.dynamic_page_count);
     return true;
@@ -671,6 +699,7 @@ pub fn forget_dynamic_page(pid: usize, pa: u64) bool {
         space.dynamic_pages[space.dynamic_page_count - 1] = 0;
     }
     space.dynamic_page_count -= 1;
+    update_mem_usage(pid, -1);
     return true;
 }
 
@@ -1254,7 +1283,10 @@ pub fn setrlimit(id: usize, rtype: u64, value: u64) bool {
     if (id >= max_processes or processes[id].state == .free) return false;
     const p = &processes[id];
     switch (rtype) {
-        0 => p.mem_limit = value,
+        0 => {
+            p.mem_limit = value;
+            p.mem_refused = false; // a fresh limit re-arms the 140 verdict
+        },
         1 => p.cpu_limit = value,
         else => return false,
     }
@@ -1274,12 +1306,15 @@ pub fn getrusage(id: usize) ?struct { mem_usage: u64, cpu_usage: u64, mem_limit:
 }
 
 /// Update memory usage for a process (called when pages are mapped/unmapped).
-pub fn update_mem_usage(id: usize, delta: u64) void {
+/// #2115: wired — record_dynamic_page charges +1, forget_dynamic_page -1.
+/// Shared surfaces charge the OWNER (the peer seat holds a page ref, not a
+/// charge — ADR 0016).
+pub fn update_mem_usage(id: usize, delta: i64) void {
     if (id >= max_processes or processes[id].state == .free) return;
     if (delta > 0) {
-        processes[id].mem_usage +%= delta;
+        processes[id].mem_usage +%= @intCast(delta);
     } else {
-        const abs = -delta;
+        const abs: u64 = @intCast(-delta);
         if (abs >= processes[id].mem_usage) {
             processes[id].mem_usage = 0;
         } else {
@@ -1303,6 +1338,15 @@ pub fn check_mem_limit(id: usize) bool {
     const p = &processes[id];
     if (p.mem_limit != 0 and p.mem_usage > p.mem_limit) return true;
     return false;
+}
+
+/// #2115: was a page charge REFUSED by the memory limit since the last
+/// setrlimit? The fault path reads this to name the kill
+/// `reserved_mem_limit_status` (140) — `check_mem_limit`'s `>` alone cannot
+/// see it (a refused charge leaves usage == limit, not over).
+pub fn mem_limit_refused(id: usize) bool {
+    if (id >= max_processes or processes[id].state == .free) return false;
+    return processes[id].mem_refused;
 }
 
 // ---------------------------------------------------------------------------

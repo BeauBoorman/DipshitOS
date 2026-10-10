@@ -2192,3 +2192,32 @@ Go metadata mirror is `user/go/vi/slots_gen.go`; `go generate ./vi` from
 `user/go` regenerates it and the host mirror test refuses drift.
 After M94a merges, **M94b–d do not edit this amendment or any frozen layout**.
 A contract change requires stopping for owner review.
+
+## Amendment (M97b #2092/#2098/#2113/#2115 — refusal-contract tightenings, no slot changes)
+
+No slot is added, renumbered, or reshaped. Four existing slots refuse more
+inputs — every tightening is a named error where the old behavior was a
+silent hazard.
+
+- **Slot 3 `sys_exit(status)`**: statuses 137, 139, 140, and 141 are
+  kernel-produced encodings (kill attribution, fault, memory-limit, and
+  cpu-limit verdicts). An EL0 caller passing one is refused `EINVAL` and
+  stays alive; the kernel's own exits still emit them. `sys_exit` is no
+  longer strictly noreturn — a forged status returns.
+- **Slot 63 `sys_mmap`**: a hint (or an auto-picked range) that wraps
+  `u64` is refused `EINVAL` at the collision check, and a range whose
+  slots hold kernel-live leaves (pooled RAM, an above-blanket device
+  window) is refused `EINVAL` before the region registers. The same
+  bounds apply to shared-surface owner creates and peer attaches through
+  `M33_MAP_SHARED`.
+- **Slot 64 `sys_munmap`**: the full-region-only rule for shared surfaces
+  is now range-aware — ANY range overlapping a live shared seat without
+  equalling it exactly is `EINVAL` (previously only a range whose START
+  landed inside was refused). A `len` that wraps `addr` is `EINVAL`
+  before any overlap test runs.
+- **Slot 54 `sys_setrlimit` type 0**: the memory page limit is now
+  enforced on charged dynamic pages (demand populate, COW promotion,
+  `MAP_POPULATE`, shared-surface create). A charge at the ceiling is
+  refused — `ENOMEM` on the syscall path, and a fault-driven refusal
+  terminates the process with the reserved status 140. Reservations alone
+  (a bare `mmap`) are uncharged; the charge lands on populate.

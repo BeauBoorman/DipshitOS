@@ -269,6 +269,8 @@ pub const sys_win_lower_back: u64 = 50;
 pub const sys_notify: u64 = 51;
 /// Arc4 #242 (ADR 0013 D1): `sys_win_set_unsaved(id, flag)` — slot 53.
 pub const sys_win_set_unsaved: u64 = 53;
+/// Arc5 #246: `sys_setrlimit(type, value)` — slot 54 (self-only, ADR 0024 D10).
+pub const sys_setrlimit: u64 = 54;
 /// M21 W12 (ADR 0013 D1): `sys_win_set_title(id, text_ptr, text_len)` — slot 61.
 pub const sys_win_set_title: u64 = 61;
 /// Arc4 #237 (ADR 0013 D1): `sys_drag_read(buf_ptr, max_len)` — slot 55.
@@ -889,7 +891,16 @@ fn handle_exit(args: Args, _: *exceptions.VectorFrame) u64 {
     // success the scheduler has removed the caller from the runnable set and
     // staged another task's frame, so the SVC exception return never returns
     // to the terminated EL0 task.
-    if (!scheduler.exit_current(args[0])) return error_result(.einval);
+    // #2098: the reserved statuses are kernel-produced encodings, not a
+    // caller's to forge — a user 139 mints a crash receipt, 140/141 mint
+    // rlimit receipts, and 137 poses as a kill attribution. The kernel's own
+    // exits reach exit_current below this seam unchanged.
+    const status = args[0];
+    if (status == scheduler.reserved_kill_status or
+        status == scheduler.reserved_fault_status or
+        status == scheduler.reserved_mem_limit_status or
+        status == scheduler.reserved_cpu_limit_status) return error_result(.einval);
+    if (!scheduler.exit_current(status)) return error_result(.einval);
     return 0;
 }
 
@@ -3276,6 +3287,11 @@ fn handle_mmap(args: Args, _: *exceptions.VectorFrame) u64 {
     if (len == 0 or len > 1024 * 1024 * 1024) return error_result(.einval);
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
     const pinfo = process.info(pid) orelse return error_result(.einval);
+    // #2115: a process already over its memory rlimit gets a named ENOMEM —
+    // the limit verdict is honest at the door, not silently ignored until
+    // the physical pool runs dry. At-limit (not yet over) callers may still
+    // reserve: demand populate refuses per-page at the ceiling.
+    if (process.check_mem_limit(pid)) return error_result(.enomem);
 
     // M33 SB2 (claim 8878): seam-B cross-process shared-anonymous surfaces
     // (ADR 0016, the `M33_MAP_SHARED` flag bit 16 — implemented now). Three
@@ -3299,6 +3315,15 @@ fn handle_mmap(args: Args, _: *exceptions.VectorFrame) u64 {
     // swallowed its own randomized stack aperture here and the runtime's
     // arena trims wiped the live EL0 stack (the go-args boot flake).
     if (process.mmap_collides(pid, va, aligned_len)) return error_result(.einval);
+    // #2092: the range must also be committable EL0 under this root. Every
+    // user root clones the EL1-only identity overlay verbatim, so a hint
+    // whose slot holds a kernel-live leaf (pooled RAM, or a device window
+    // above the blanket) would shadow memory the kernel itself dereferences
+    // under this TTBR0 — or, for a wrapped hint near 2^64, defeat the
+    // collision check above entirely. The mapping layer refuses the same
+    // leaves on demand-populate; this is the early EINVAL at registration.
+    // A zero root (host tests without a built root) has no leaves to check.
+    if (pinfo.root_phys != 0 and !mmu.user_range_free(pinfo.root_phys, va, aligned_len)) return error_result(.einval);
 
     // ADR 0027 review finding 2: uaccess visibility for mappings is
     // PROCESS-scope. The region is registered once on the process and
@@ -3446,8 +3471,12 @@ fn handle_mmap_shared(addr: u64, len: u64, prot: u64, flags: u64, pid: usize, pi
         const peer_va = process.next_mmap_va(pid, aligned_len);
         // Issue #1214: a peer mirror may not alias the peer's own regions.
         if (process.mmap_collides(pid, peer_va, aligned_len)) return error_result(.einval);
+        // #2092: nor may it land on a kernel-live leaf of the peer's root.
+        if (pinfo.root_phys != 0 and !mmu.user_range_free(pinfo.root_phys, peer_va, aligned_len)) return error_result(.einval);
         if (!process.add_mmap_region(pid, peer_va, aligned_len, prot, flags)) return error_result(.enomem);
         if (!shared_mmap.map_peer_leaves(pinfo.root_phys, peer_va, r.page_count, r.pa_base)) {
+            // #2114: map_peer_leaves self-unwinds its installed leaves+refs
+            // — the attach only drops the region row it reserved.
             _ = process.remove_mmap_region(pid, peer_va, aligned_len);
             return error_result(.enomem);
         }
@@ -3470,6 +3499,9 @@ fn handle_mmap_shared(addr: u64, len: u64, prot: u64, flags: u64, pid: usize, pi
     // Issue #1214: the same collision rule as the plain path — a shared
     // surface may not alias the owner's own apertures/regions.
     if (process.mmap_collides(pid, va, aligned_len)) return error_result(.einval);
+    // #2092: and the same kernel-live bound — a hinted shared surface may
+    // not shadow pooled RAM or a device window under the owner's root.
+    if (pinfo.root_phys != 0 and !mmu.user_range_free(pinfo.root_phys, va, aligned_len)) return error_result(.einval);
     const cs = owner_create_shared_surface(pid, pinfo, va, aligned_len, prot, flags);
     return switch (cs) {
         .ok => |o| o.va,
@@ -3617,16 +3649,18 @@ fn bind_window_surface(wid: u8, len: u64, prot: u64, flags: u64, pid: usize, pin
     if (wm_server.registered_pid()) |wm_pid| {
         const wm_len = @as(u64, ok.page_count) * 4096;
         const wm_va = process.next_mmap_va(wm_pid, wm_len);
-        if (process.add_mmap_region(wm_pid, wm_va, wm_len, 1, flags)) {
-            if (process.info(wm_pid)) |wmi| {
-                if (shared_mmap.map_peer_leaves(wmi.root_phys, wm_va, ok.page_count, ok.pa_base)) {
-                    _ = shared_region.grant_read(ok.handle);
-                    _ = shared_region.set_peer(ok.handle, wm_pid, wm_va);
-                } else {
-                    _ = process.remove_mmap_region(wm_pid, wm_va, wm_len);
-                }
-            }
+        const wmi = process.info(wm_pid);
+        // #2114: the auto-mirror is a transaction — a failure reports the
+        // error instead of returning a va whose mirror does not exist.
+        // map_peer_leaves self-unwinds its installed leaves+refs, so the
+        // failure path only drops the WM's region row.
+        if (wmi == null or !process.add_mmap_region(wm_pid, wm_va, wm_len, 1, flags)) return error_result(.enomem);
+        if (!shared_mmap.map_peer_leaves(wmi.?.root_phys, wm_va, ok.page_count, ok.pa_base)) {
+            _ = process.remove_mmap_region(wm_pid, wm_va, wm_len);
+            return error_result(.enomem);
         }
+        _ = shared_region.grant_read(ok.handle);
+        _ = shared_region.set_peer(ok.handle, wm_pid, wm_va);
     }
     // uaccess follows the OWNER only (the WM reads through its peer leaf,
     // never a uaccess aperture — the ADR 0016 D2 owner-side-only rule).
@@ -3652,6 +3686,10 @@ fn handle_munmap(args: Args, _: *exceptions.VectorFrame) u64 {
     const pinfo = process.info(pid) orelse return error_result(.einval);
 
     const aligned_len = (len + 4095) & ~@as(u64, 4095);
+    // #2113: a wrapping range defeats every overlap check below — a len
+    // near 2^64 would wrap aligned_len to a small value and the shared-
+    // surface guard would read the wrong window. Refuse the wrap itself.
+    if (aligned_len == 0 or addr +% aligned_len <= addr) return error_result(.einval);
     const pages = aligned_len / 4096;
 
     // M33 SB5 (claim 7397): the scanout grant is full-frame only; munmapping
@@ -3673,19 +3711,20 @@ fn handle_munmap(args: Args, _: *exceptions.VectorFrame) u64 {
     // owner's own leaves and unrefs 1->0 (free), and since the descriptor is
     // already gone the loop never re-enters this path. A PEER munmap detaches
     // its RO seat (per-root teardown, ADR 0016 D1) and returns directly.
-    if (shared_region.covers(@as(u64, pid), addr)) {
-        if (shared_region.find_owner(pid, addr)) |h| {
-            const r = shared_region.info(h).?;
-            if (aligned_len != @as(u64, r.page_count) * 4096) return error_result(.einval);
-            _ = shared_mmap.revoke_owner_va(pid, addr);
-        } else if (shared_region.find_peer(pid, addr)) |h| {
-            const r = shared_region.info(h).?;
-            if (aligned_len != @as(u64, r.page_count) * 4096) return error_result(.einval);
+    // #2113: the guard is range-aware — `covers` tested only the range
+    // START, so a range beginning before a surface and overlapping it fell
+    // through to the generic unmap and stripped the shared leaves while the
+    // descriptor + WM mirror stayed live.
+    switch (shared_region.munmap_match(@as(u64, pid), addr, aligned_len)) {
+        .none => {},
+        .partial => return error_result(.einval),
+        .owner => _ = shared_mmap.revoke_owner_va(pid, addr),
+        .peer => {
             _ = shared_mmap.detach_peer(pid, addr);
             _ = process.remove_mmap_region(pid, addr, aligned_len);
             uaccess.remove_region(addr, aligned_len);
             return 0;
-        } else return error_result(.einval); // partial unmap of a shared surface
+        },
     }
 
     unmap_dynamic_pages(pid, pinfo.root_phys, addr, pages);

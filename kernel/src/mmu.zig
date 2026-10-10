@@ -63,14 +63,21 @@ const build_options = if (builtin.is_test) struct {
 } else @import("build_options");
 
 // Claim 5804: the user root CLONES the identity tree (per-task overlay),
-// so the carve-out must hold the identity map AND every root built over the
-// boot — table pages are never reclaimed, so this is a TOTAL-roots budget,
-// not a concurrent-roots budget. Milestone sixteen C4 (claim 2714) measured
-// the composition (a 28 KiB segmented app + a hostile app + EIGHT concurrent
-// programs = 282 pages) and grew the carve-out 256 → 512 pages.
+// so the carve-out must hold the identity map AND every LIVE root built over
+// the boot. #2116: reaped roots return their whole subtree to `table_free`
+// (the clone copies tables, it never shares them), so this is now a
+// CONCURRENT-roots budget — exec churn no longer drains the carve-out.
+// Milestone sixteen C4 (claim 2714) measured the composition (a 28 KiB
+// segmented app + a hostile app + EIGHT concurrent programs = 282 pages)
+// and grew the carve-out 256 → 512 pages.
 const table_page_count = 512; // 2 MiB fixed BSS carve-out, no allocator.
 var table_storage: [table_page_count][512]u64 align(4096) = undefined;
 var table_count: usize = 0;
+/// #2116: free list of reclaimed carve-out table pages (indices into
+/// `table_storage`). `new_table` reuses these before bumping `table_count`,
+/// so `table_count - table_free_count` is the live page count.
+var table_free: [table_page_count]u16 = undefined;
+var table_free_count: usize = 0;
 
 /// Physical address of the root translation table (BSS). Exposed for the
 /// claim-0021 firmware-MMU-capture diagnostic (evidence.zig), which prints
@@ -159,18 +166,17 @@ pub fn user_root_phys() u64 {
 /// index zero, and forgets both roots.
 pub fn reset() void {
     table_count = 0;
+    table_free_count = 0;
     user_root_value = 0;
     roots_ready = false;
 }
 
-/// Table pages consumed so far out of the fixed carve-out (`table_page_count`
-/// pages, 2 MiB BSS). The `addrspaces` command prints `tables=<used>/<cap>`
-/// so the per-process-root budget is observable on a live boot: the identity
-/// map uses ~10-15 and each user-root clone ~10-15 + leaf tables, so two
-/// concurrent user roots stay well inside the 512-page carve-out (claim
-/// 0826's budget survey; grown by claim 2714 for the M16 composition).
+/// Live table pages in the fixed carve-out (`table_page_count` pages, 2 MiB
+/// BSS): allocations minus reclaimed ones. The `addrspaces` command prints
+/// `tables=<used>/<cap>` so the concurrent-roots budget is observable on a
+/// live boot — N sequential execs return it to baseline (#2116).
 pub fn tables_used() usize {
-    return table_count;
+    return table_count - table_free_count;
 }
 
 /// Total table pages in the fixed carve-out (2 MiB BSS — see
@@ -460,11 +466,64 @@ fn attr_bits(attr: Attr, page: bool) u64 {
 }
 
 fn new_table() ?*align(4096) [512]u64 {
-    if (table_count >= table_page_count) return null;
-    const table: *align(4096) [512]u64 = @ptrCast(&table_storage[table_count]);
-    table_count += 1;
+    const table: *align(4096) [512]u64 = if (table_free_count > 0) blk: {
+        table_free_count -= 1;
+        break :blk @ptrCast(&table_storage[table_free[table_free_count]]);
+    } else blk: {
+        if (table_count >= table_page_count) return null;
+        const t: *align(4096) [512]u64 = @ptrCast(&table_storage[table_count]);
+        table_count += 1;
+        break :blk t;
+    };
     @memset(table, 0);
     return table;
+}
+
+/// #2116: return `table_phys` to the carve-out free list. Only pages inside
+/// `table_storage` are reclaimable — a malformed or foreign root is ignored
+/// rather than corrupting the free list.
+fn free_table(table_phys: u64) void {
+    const base = @intFromPtr(&table_storage);
+    if (table_phys < base or table_phys - base >= table_page_count * 4096) return;
+    const idx = (table_phys - base) / 4096;
+    if (table_free_count < table_page_count) {
+        table_free[table_free_count] = @intCast(idx);
+        table_free_count += 1;
+    }
+}
+
+/// Recursively return every table page reachable from `table_phys` at
+/// `level` (0 = L0 root) to the free list — children first, then self.
+/// A (e & 3) == 3 entry at levels 0-2 is a table descriptor by the ARM
+/// encoding; at L3 every entry is a leaf and nothing descends.
+fn free_table_level(table_phys: u64, level: u8, freed: *usize) void {
+    const base = @intFromPtr(&table_storage);
+    if (table_phys < base or table_phys - base >= table_page_count * 4096) return;
+    if ((table_phys - base) & 4095 != 0) return;
+    const table: *align(4096) [512]u64 = @ptrFromInt(table_phys);
+    if (level < 3) {
+        for (table) |entry| {
+            if ((entry & 3) == 3) free_table_level(entry & ~@as(u64, 0xfff), level + 1, freed);
+        }
+    }
+    free_table(table_phys);
+    freed.* += 1;
+}
+
+/// #2116: reclaim a DEAD per-process root's whole table subtree. Per-process
+/// roots own every table they reach — `clone_into_user_root_apertures`
+/// copies the identity tables into fresh carve-out pages, it never points
+/// at the shared tree — so the root and all its descendants return to the
+/// free list. Refuses the kernel identity root (kernel_root_phys, whose
+/// tree every user root was cloned FROM but does not share), a null root,
+/// and any root outside the carve-out (host-test fixture addresses). Call
+/// only for a root no task can ever run under again (the lifecycle reap).
+/// Returns the number of table pages reclaimed.
+pub fn free_table_tree(root_phys: u64) usize {
+    if (root_phys == 0 or root_phys == kernel_root_phys()) return 0;
+    var freed: usize = 0;
+    free_table_level(root_phys, 0, &freed);
+    return freed;
 }
 
 fn table_entry(entry: *const u64) ?*align(4096) [512]u64 {
@@ -642,6 +701,9 @@ fn clone_into_user_root_apertures(
     apertures: []const UserAperture,
 ) ?*align(4096) [512]u64 {
     const dst = new_table() orelse return null;
+    // #2116: every failure below discards the partially built subtree —
+    // a null return used to strand every table this build had already
+    // consumed (unreachable from any live root, so reclaimable only here).
     const shift = slot_shift(level);
     const slot_bytes: u64 = @as(u64, 1) << shift;
     var i: usize = 0;
@@ -665,10 +727,19 @@ fn clone_into_user_root_apertures(
             const child_src: *const [512]u64 = if (desc == 0)
                 &empty_table
             else if ((desc & 3) == 3)
-                table_entry(&src[i]) orelse return null
+                table_entry(&src[i]) orelse {
+                    discard_table(dst, level);
+                    return null;
+                }
             else
-                split_block_view(desc) orelse return null;
-            const child = clone_into_user_root_apertures(child_src, level + 1, slot_va, apertures) orelse return null;
+                split_block_view(desc) orelse {
+                    discard_table(dst, level);
+                    return null;
+                };
+            const child = clone_into_user_root_apertures(child_src, level + 1, slot_va, apertures) orelse {
+                discard_table(dst, level);
+                return null;
+            };
             dst[i] = @intFromPtr(child) | 3;
         } else if (hits_user and level == 3) {
             // Page leaf inside a user aperture: the ONLY place EL0
@@ -677,26 +748,57 @@ fn clone_into_user_root_apertures(
             // #2092/#2095: never bind a kernel-live twin (pooled RAM or an
             // above-blanket device window) into an EL0 leaf — a bad
             // aperture stops the whole root build, not just this page.
-            if (kernel_live_leaf(desc, slot_va)) return null;
+            if (kernel_live_leaf(desc, slot_va)) {
+                discard_table(dst, level);
+                return null;
+            }
             // #2096: `aperture_form_ok` guarantees a page-aligned
             // `va_start`, so an intersecting slot never sits below it —
             // keep the check anyway because ReleaseSmall arithmetic wraps
             // silently and `phys + (slot_va - va_start)` underflowing is
             // precisely the page-below-the-allocation bug.
-            if (slot_va < ap.va_start) return null;
-            const pa = std.math.add(u64, ap.phys, slot_va - ap.va_start) catch return null;
+            if (slot_va < ap.va_start) {
+                discard_table(dst, level);
+                return null;
+            }
+            const pa = std.math.add(u64, ap.phys, slot_va - ap.va_start) catch {
+                discard_table(dst, level);
+                return null;
+            };
             const normal = (pa & ~@as(u64, 0xfff)) | attr_bits(.normal, true);
-            dst[i] = user_leaf(normal, ap.writable, ap.executable) orelse return null;
+            dst[i] = user_leaf(normal, ap.writable, ap.executable) orelse {
+                discard_table(dst, level);
+                return null;
+            };
         } else if (desc == 0) {
             continue; // no source entry and no aperture here
         } else if ((desc & 3) == 3 and level < 3) {
-            const child = clone_into_user_root_apertures(table_entry(&src[i]) orelse return null, level + 1, slot_va, apertures) orelse return null;
+            const child = clone_into_user_root_apertures(table_entry(&src[i]) orelse {
+                discard_table(dst, level);
+                return null;
+            }, level + 1, slot_va, apertures) orelse {
+                discard_table(dst, level);
+                return null;
+            };
             dst[i] = @intFromPtr(child) | 3;
         } else {
             dst[i] = desc; // block or page leaf — EL1-only AP=0b00, copy verbatim
         }
     }
     return dst;
+}
+
+/// #2116: discard a partially built clone subtree on a build failure. Every
+/// table reachable from `table` at `level` was allocated by this build
+/// (children are written only as `child | 3` after a successful recursive
+/// clone), so the carve-out gets them all back — children first, then self.
+fn discard_table(table: *align(4096) [512]u64, level: u8) void {
+    if (level < 3) {
+        for (table) |entry| {
+            if ((entry & 3) == 3) discard_table(@ptrFromInt(entry & ~@as(u64, 0xfff)), level + 1);
+        }
+    }
+    free_table(@intFromPtr(table));
 }
 
 /// Build a per-process TTBR0 user root with arbitrary user apertures.
@@ -1119,6 +1221,47 @@ test "mmu: #2092 — user leaves may not shadow kernel-live identity twins" {
     try std.testing.expect(!user_range_free(user_root, std.math.maxInt(u64) - 0xfff, 0x2000)); // wraps
     try std.testing.expect(!user_range_free(user_root, 0x1a40_0000, user_va_limit)); // past the VA space
     try std.testing.expect(!user_range_free(user_root, 0x1a40_0800, 0x1000)); // unaligned hint
+}
+
+test "mmu: #2116 — free_table_tree returns a dead root's whole subtree to the carve-out" {
+    reset();
+    // A kernel root + one user root: the baseline the exec churn must return
+    // to. Kernel-root refusal: a null and the kernel root itself free nothing.
+    const kroot = new_table();
+    kernel_root_value = @intFromPtr(kroot);
+    defer kernel_root_value = 0;
+    _ = build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const baseline = tables_used();
+    try std.testing.expect(baseline > 1);
+
+    try std.testing.expectEqual(@as(usize, 0), free_table_tree(0));
+    try std.testing.expectEqual(@as(usize, 0), free_table_tree(kernel_root_phys()));
+    try std.testing.expectEqual(baseline, tables_used());
+
+    // Sequential exec churn: build a root, free it, repeat — every cycle
+    // returns tables_used() to the baseline, and the allocator reuses the
+    // reclaimed pages instead of marching toward the 512-page bound.
+    const high_water = table_count;
+    var cycle: usize = 0;
+    while (cycle < 8) : (cycle += 1) {
+        const r = build_user_root(userspace.text_va, 0x1000, 64, 0x1a40_0000 + @as(u64, cycle) * 0x10_0000, 0x3000, 8192).?;
+        const grown = tables_used();
+        try std.testing.expect(grown > baseline);
+        const freed = free_table_tree(r);
+        try std.testing.expectEqual(grown - baseline, freed);
+        try std.testing.expectEqual(baseline, tables_used());
+    }
+    try std.testing.expect(table_count < high_water + 8 * 32); // reuse, not unbounded growth
+
+    // A partially-built root strands nothing: drain the carve-out to one
+    // free slot, so the next build consumes it then fails deeper in the
+    // clone — discard_table must return every page the attempt took.
+    while (new_table() != null) {}
+    try std.testing.expectEqual(tables_capacity(), tables_used());
+    free_table(@intFromPtr(&table_storage[table_page_count - 1])); // exactly one slot
+    const drained = tables_used();
+    try std.testing.expect(build_user_root(userspace.text_va, 0x1000, 64, 0x2100_0000, 0x4000, 8192) == null);
+    try std.testing.expectEqual(drained, tables_used()); // nothing stranded
 }
 
 pub fn read_mmfr0() u64 {

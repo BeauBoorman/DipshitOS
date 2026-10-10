@@ -1565,9 +1565,11 @@ pub fn fault_current(esr: u64, far: u64, pc: u64) void {
     fault_reports[idx] = .{ .name = name, .far = far, .ec = ec, .pc = pc, .esr = esr };
     fault_report_count += 1;
     // Arc5 issue #246: if the process has a memory limit and it's exceeded,
-    // use status 140 (mem_limit) instead of 139 (guard page).
+    // use status 140 (mem_limit) instead of 139 (guard page). #2115: a
+    // charge REFUSED at the ceiling names the same verdict — the refusal
+    // leaves usage == limit, which `check_mem_limit`'s `>` cannot see.
     const fault_status = if (process.find_by_task(current[c])) |pid|
-        if (process.check_mem_limit(pid)) reserved_mem_limit_status else reserved_fault_status
+        if (process.check_mem_limit(pid) or process.mem_limit_refused(pid)) reserved_mem_limit_status else reserved_fault_status
     else
         reserved_fault_status;
     _ = exit_current(fault_status);

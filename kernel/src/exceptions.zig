@@ -953,7 +953,7 @@ pub fn try_handle_page_fault(esr: u64, far: u64) bool {
     // page is present-but-AP=0b00 rather than absent). ONE resolution,
     // shared with the kernel -> user copy path (issue #1391), so both agree
     // on what counts as this process's page.
-    if (populate_user_page(pid, root, far)) return true;
+    if (populate_user_page(pid, root, far, is_write)) return true;
 
     return false;
 }
@@ -967,22 +967,40 @@ pub fn try_handle_page_fault(esr: u64, far: u64) bool {
 /// the copy path refuses with EFAULT. Nothing here ever falls back to the
 /// identity overlay — that is the defect this function exists to close.
 /// The caller holds the kernel domain lock (allocator + process registry).
-pub fn populate_user_page(pid: usize, root: u64, va: u64) bool {
+///
+/// #2112: populate only a GENUINE demand fault — a VA the process owns but
+/// has not yet mapped. `for_write` is the fault's WnR bit (the uaccess copy
+/// path passes true): a store to a page the region does not make writable,
+/// a read the region does not make readable, and any access to a page that
+/// already has an EL0 leaf are program faults to deliver — allocating a
+/// fresh page over the leaf would just fault again on the retry, leaking
+/// one page per iteration until the pool drains.
+pub fn populate_user_page(pid: usize, root: u64, va: u64, for_write: bool) bool {
     const page = va & ~@as(u64, 0xfff);
+    var readable = false;
     var writable = false;
     var executable = false;
     var demand = false;
     if (process.find_mmap_region(pid, page)) |mreg| {
+        readable = (mreg.prot & 1) != 0;
         writable = (mreg.prot & 2) != 0;
         executable = (mreg.prot & 4) != 0;
         demand = true;
     } else if (process.info(pid)) |inf| {
         if (inf.stack_len > 0 and page >= inf.stack_va and page < inf.stack_va + inf.stack_len) {
+            readable = true;
             writable = true;
             demand = true;
         }
     }
     if (!demand) return false;
+    // The fault is only serviceable when the region admits the access — an
+    // already-mapped page faults for its own reason (permissions, COW was
+    // tried above) and must be delivered, not re-populated.
+    if (mmu.leaf_el0_visible(root, page)) return false;
+    if (for_write) {
+        if (!writable) return false;
+    } else if (!readable and !writable) return false;
     const pa = alloc.alloc_pages(1) orelse return false;
     zero_phys_page(pa);
     if (!process.record_dynamic_page(pid, pa)) {
@@ -1037,7 +1055,7 @@ pub fn ensure_user_write_pages(address: u64, len: usize) bool {
     var page = address & ~@as(u64, 0xfff);
     while (page < end) : (page += 4096) {
         if (!mmu.leaf_el0_visible(root, page)) {
-            if (!populate_user_page(pid, root, page)) return false;
+            if (!populate_user_page(pid, root, page, true)) return false;
         }
     }
     return true;
@@ -2165,7 +2183,7 @@ test "exceptions: populate_user_page maps the process's own demand regions and r
     // kernel->user path populates it in the process's OWN root, EL0-RW, so
     // the store cannot be swallowed by the identity overlay.
     try std.testing.expect(!mmu.leaf_el0_visible(root, mmap_va));
-    try std.testing.expect(populate_user_page(pid, root, mmap_va + 64));
+    try std.testing.expect(populate_user_page(pid, root, mmap_va + 64, true));
     try std.testing.expect(mmu.leaf_el0_visible(root, mmap_va));
     const leaf = mmu.get_user_leaf(root, mmap_va).?;
     try std.testing.expectEqual(@as(u64, 1), (leaf.* >> 6) & 3); // EL0 RW
@@ -2173,8 +2191,61 @@ test "exceptions: populate_user_page maps the process's own demand regions and r
     // A VA that is neither an mmap region nor the stack is REFUSED, and the
     // refusal leaves the page tables untouched (so no store can land).
     const foreign: u64 = 0x0000_0000_2000_0000;
-    try std.testing.expect(!populate_user_page(pid, root, foreign));
+    try std.testing.expect(!populate_user_page(pid, root, foreign, true));
     try std.testing.expect(!mmu.leaf_el0_visible(root, foreign));
+}
+
+test "exceptions: #2112 — populate refuses already-mapped and permission-denied faults without burning a page" {
+    mmu.reset();
+    alloc.reset_refcounts();
+    process.init();
+
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 20, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+
+    const root = mmu.build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const pid = process.create("TEST_2112", .{}, .{
+        .root_phys = root,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    _ = process.bind(pid, 2);
+
+    const rw_va: u64 = 0x1000_0000;
+    const ro_va: u64 = 0x1100_0000;
+    try std.testing.expect(process.add_mmap_region(pid, rw_va, 4096, 3, 0x22)); // R+W
+    try std.testing.expect(process.add_mmap_region(pid, ro_va, 4096, 1, 0x22)); // R only
+
+    // A genuine demand write populates exactly once; a second fault on the
+    // SAME page (already EL0-visible) allocates nothing — before #2112 the
+    // retry loop leaked a page per fault until the pool drained.
+    try std.testing.expect(populate_user_page(pid, root, rw_va, true));
+    try std.testing.expect(mmu.leaf_el0_visible(root, rw_va));
+    const free_after_first = alloc.stats().free_pages;
+    try std.testing.expect(!populate_user_page(pid, root, rw_va, true));
+    try std.testing.expect(!populate_user_page(pid, root, rw_va, false));
+    try std.testing.expectEqual(free_after_first, alloc.stats().free_pages);
+
+    // A WRITE fault against a read-only region is a program fault to
+    // deliver, not a page to allocate.
+    try std.testing.expect(!populate_user_page(pid, root, ro_va, true));
+    try std.testing.expect(!mmu.leaf_el0_visible(root, ro_va));
+    try std.testing.expectEqual(free_after_first, alloc.stats().free_pages);
+    // The READ fault the region DOES admit still populates.
+    try std.testing.expect(populate_user_page(pid, root, ro_va, false));
+    try std.testing.expect(mmu.leaf_el0_visible(root, ro_va));
+
+    // An exec-only region (prot=4) admits neither read nor write.
+    const x_va: u64 = 0x1200_0000;
+    try std.testing.expect(process.add_mmap_region(pid, x_va, 4096, 4, 0x22));
+    try std.testing.expect(!populate_user_page(pid, root, x_va, false));
+    try std.testing.expect(!populate_user_page(pid, root, x_va, true));
+    try std.testing.expect(!mmu.leaf_el0_visible(root, x_va));
 }
 
 test "exceptions: ensure_user_write_pages is a no-op on host test binaries (issue #1391)" {
