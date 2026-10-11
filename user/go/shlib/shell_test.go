@@ -117,7 +117,7 @@ func (f *fakeHost) Chdir(path string) error {
 	}
 	return nil
 }
-func (f *fakeHost) ListDir() []string  { return []string{"DATA.TXT", "GOSH.ELF", "NOTES"} }
+
 func (f *fakeHost) SleepSeconds(n int) { f.sleeps = append(f.sleeps, n) }
 
 func (f *fakeHost) RunExternal(name string, args []string) (int64, error) {

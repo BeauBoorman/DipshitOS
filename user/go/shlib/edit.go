@@ -171,9 +171,9 @@ type Editor struct {
 	query     []byte
 	draft     []byte
 	draftCur  int
-	// Complete proposes candidates for the word being completed. first
-	// marks the command word (start of the line).
-	Complete func(word string, first bool) []string
+	// Complete proposes candidates for the word being completed, given the
+	// M98g context: the line, the cursor, and the stage head it sits under.
+	Complete func(req CompleteRequest) []string
 }
 
 // NewEditor wires an editor over a history ring.
@@ -790,7 +790,15 @@ func (e *Editor) keyTab() ([]byte, EditEvent) {
 		start--
 	}
 	word := string(e.buf[start:e.cur])
-	cands := e.Complete(word, start == 0)
+	cmd, argIndex := stageCtx(string(e.buf), start)
+	cands := e.Complete(CompleteRequest{
+		Line:      string(e.buf),
+		Cursor:    e.cur,
+		WordStart: start,
+		Word:      word,
+		ArgIndex:  argIndex,
+		Cmd:       cmd,
+	})
 	if len(cands) == 0 {
 		return nil, EditEvent{}
 	}
