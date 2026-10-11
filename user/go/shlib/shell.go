@@ -297,7 +297,8 @@ type Shell struct {
 	capture   *[]byte // non-nil while a `$(...)` is collecting output
 	loopBreak bool
 	loopCont  bool
-	dirstack  []string // M98d pushd/popd stack, canonical paths, top at end
+	dirstack  []string          // M98d pushd/popd stack, canonical paths, top at end
+	aliases   map[string]string // M98b alias table; nil until first define
 }
 
 // NewShell wires a fresh interpreter; hist may be shared with the editor.
@@ -455,9 +456,17 @@ func (s *Shell) runChain(segs []string, ops []chainOp, depth int) (int, Action) 
 	return s.status, ActionContinue
 }
 
-// runSegment executes one chain segment: arithmetic expansion, then the
-// pipeline/redirect/background path, then a deferred `source`.
+// runSegment executes one chain segment: alias expansion on the raw text
+// (M98b — the head word and the head after the single unquoted `|`), then
+// arithmetic expansion, then the pipeline/redirect/background path, then
+// a deferred `source`.
 func (s *Shell) runSegment(line string, depth int) (int, Action) {
+	line, aerr := s.expandAliases(line)
+	if aerr != nil {
+		s.fail(aerr.Error())
+		s.status = 1
+		return 1, ActionContinue
+	}
 	toks, err := tokenize(arithExpand(line))
 	if err != nil {
 		s.fail(err.Error())

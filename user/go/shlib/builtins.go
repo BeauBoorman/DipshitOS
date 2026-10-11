@@ -63,6 +63,8 @@ func init() {
 		// source that runs a file's lines in this shell.
 		"true": bTrue, "false": bFalse, "source": bSource, ".": bSource,
 		"break": bBreak, "continue": bContinue,
+		// M98b (issue #2128): the session alias table.
+		"alias": bAlias, "unalias": bUnalias,
 	}
 }
 
@@ -625,6 +627,8 @@ var helpCatalog = map[string]helpEntry{
 	"date":    {group: "shell", usage: "date", blurb: "show the firmware wall clock, or name the monotonic fallback", notes: "The calendar face carries the timezone setting's fixed offset (UTC by default); without a firmware epoch the command exits 1."},
 	"echo":    {group: "shell", usage: "echo [ARG...]", blurb: "write ARG... separated by single spaces and a newline", notes: "The engine expands $VAR, ${VAR} and $? before echo runs."},
 	"exit":    {group: "shell", usage: "exit [STATUS]", blurb: "leave GOSH with STATUS (the last status when omitted)"},
+	"alias":   {group: "shell", usage: "alias [NAME=VALUE ...]", blurb: "define or list session aliases", notes: "An unquoted head word naming an alias expands before the line runs — `\\name`, 'name' and \"name\" bypass it. Any builtin can be shadowed, including `exit` and `alias` itself."},
+	"unalias": {group: "shell", usage: "unalias NAME...|-a", blurb: "remove aliases (-a clears the table)"},
 	"help":    {group: "shell", usage: "help [CMD|GROUP]", blurb: "the grouped catalog, or one verb's usage and description"},
 	"history": {group: "shell", usage: "history", blurb: "list this session's submitted lines, oldest first"},
 	"log":     {group: "shell", usage: "log [APP]", blurb: "read one app's bounded log ring, or all app rings"},
