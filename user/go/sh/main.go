@@ -739,6 +739,13 @@ func (g *goshHost) ListDir() []string {
 	return out
 }
 
+// ListPath is the M98a glob seam: a path-aware listing of a canonical
+// directory. The shared vi wrapper owns the /host conversion, the
+// slot-79 paging and the USB fallback — the front-end adds no logic.
+func (g *goshHost) ListPath(dir string) ([]vi.DirItem, error) {
+	return vi.ListDirAt(dir)
+}
+
 func (g *goshHost) ReadTTYLine() (string, bool) {
 	if !g.tty {
 		return "", false
