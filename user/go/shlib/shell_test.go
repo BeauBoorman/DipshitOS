@@ -42,6 +42,19 @@ type fakeHost struct {
 	writeErrPaths  map[string]bool   // M98e: WriteFile refuses only these paths
 	externArgs     [][]string        // M98e: argv of every RunExternal call
 	appLogs        map[string][]byte
+
+	// M98f job-control seams. The interrupter is opt-in: default nil keeps
+	// the blocking WaitExternal path (headless shape), so a test that says
+	// nothing about Ctrl-C exercises the code it always exercised.
+	intr      bool             // offer TTYInterrupter (interactive shape)
+	poll      *TTYPoll         // the shared interrupter instance
+	ttyIn     []byte           // scripted tty bytes the interrupter reads
+	kills     []int64          // armed kills, in order
+	killErr   map[int64]string // pid -> errno name the kill arm refuses with
+	waitCalls int              // WaitExternal call counter
+
+	exitedPids   []int64 // ExternalExited pids, in order
+	exitedKilled []bool  // the killed flag each carried
 }
 
 func newFakeHost() *fakeHost {
@@ -116,7 +129,44 @@ func (f *fakeHost) RunExternal(name string, args []string) (int64, error) {
 }
 
 func (f *fakeHost) WaitExternal(pid int64) (int64, error) {
+	f.waitCalls++
 	return f.released, nil
+}
+
+// TTYInterrupter is the M98f Ctrl-C seam, opt-in via f.intr (the default
+// nil is the headless host's answer). readTTY drains the scripted ttyIn.
+func (f *fakeHost) TTYInterrupter() *TTYPoll {
+	if !f.intr {
+		return nil
+	}
+	if f.poll == nil {
+		f.poll = &TTYPoll{Read: f.readTTY}
+	}
+	return f.poll
+}
+
+func (f *fakeHost) readTTY(b []byte) int {
+	if len(f.ttyIn) == 0 {
+		return 0
+	}
+	n := copy(b, f.ttyIn)
+	f.ttyIn = f.ttyIn[n:]
+	return n
+}
+
+func (f *fakeHost) Kill(pid int64) error {
+	f.kills = append(f.kills, pid)
+	if name, ok := f.killErr[pid]; ok {
+		return &OpenError{name: name}
+	}
+	return nil
+}
+
+// ExternalExited records the interruptible wait's exit notification:
+// exitsKilled[i] is the killed flag for exitedPids[i].
+func (f *fakeHost) ExternalExited(pid int64, status int64, killed bool) {
+	f.exitedPids = append(f.exitedPids, pid)
+	f.exitedKilled = append(f.exitedKilled, killed)
 }
 
 func (f *fakeHost) ProbeExternal(pid int64) (int64, int) {

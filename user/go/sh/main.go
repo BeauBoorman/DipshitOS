@@ -308,8 +308,10 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 	// call and holds the remainder of its chunk, so the loop below keeps
 	// feeding until the editor has nothing left: the serial front-end can
 	// deliver several whole lines in a single read, and a burst that stops
-	// after its first line would leave the rest typed but never run.
-	handle := func(out []byte, ev shlib.EditEvent) {
+	// after its first line would leave the rest typed but never run. The
+	// var declaration lets the EvSubmit branch recurse for type-ahead.
+	var handle func([]byte, shlib.EditEvent)
+	handle = func(out []byte, ev shlib.EditEvent) {
 		if len(out) > 0 {
 			writeTTY(fd, out)
 		}
@@ -333,6 +335,14 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 			// this prompt is the one the next in-line repaint uses.
 			editor.SetPrompt(loadPrompt())
 			_, _ = vi.FileWrite(fd, editor.PromptBytes())
+			// M98f: bytes typed while a foreground child ran sit in the
+			// interrupter's stash — feed them now, before the next
+			// FileRead, so a pre-typed line is not lost.
+			if p := hst.TTYInterrupter(); p != nil {
+				if ahead := p.TypeAhead(); len(ahead) > 0 {
+					handle(editor.Feed(ahead))
+				}
+			}
 		case shlib.EvEOF:
 			shutdown(ta, fd, 0)
 		case shlib.EvCancel:
@@ -497,6 +507,7 @@ type goshHost struct {
 	tty      bool
 	lineBuf  []byte
 	children map[int64]string
+	poll     *shlib.TTYPoll
 }
 
 func (g *goshHost) Marker(line string) { vi.ConsoleLine(line) }
@@ -582,7 +593,49 @@ func (g *goshHost) ProbeExternal(pid int64) (int64, int) {
 	return st, state
 }
 
+// ExternalExited keeps the interruptible wait's bookkeeping level with
+// WaitExternal's: the children row always retires, and a nonzero exit
+// still earns its crash receipt — except a kill the shell armed itself,
+// which the card declares is not a crash.
+func (g *goshHost) ExternalExited(pid int64, status int64, killed bool) {
+	name := g.children[pid]
+	delete(g.children, pid)
+	if !killed && status != 0 {
+		g.RecordCrash(name, status)
+	}
+}
+
 func (g *goshHost) SleepTick() { vi.Sleep(1) }
+
+// TTYInterrupter is the M98f Ctrl-C seam: the same fd the session loop
+// reads, handed to the engine as a non-blocking byte source while it
+// waits. Headless (-c) hosts have no fd and answer nil, keeping the
+// blocking WaitExternal path. The instance persists on the host — its
+// type-ahead stash must survive between the engine's waits.
+func (g *goshHost) TTYInterrupter() *shlib.TTYPoll {
+	if !g.tty {
+		return nil
+	}
+	if g.poll == nil {
+		g.poll = &shlib.TTYPoll{Read: func(b []byte) int {
+			n, _ := vi.FileRead(g.fd, b)
+			return n
+		}}
+	}
+	return g.poll
+}
+
+// Kill arms sys_kill (slot 29) for `kill`/Ctrl-C, carrying the kernel's
+// errno name so the engine can report EACCES vs EINVAL honestly.
+func (g *goshHost) Kill(pid int64) error {
+	if r := vi.Kill(uint64(pid)); r < 0 {
+		if name := vi.ErrnoName(r); name != "" {
+			return shlib.NewOpenError(vi.Itoa64(pid), name)
+		}
+		return shlib.ErrNotFound
+	}
+	return nil
+}
 
 func (g *goshHost) PipeWrite(b []byte) error {
 	_, err := vi.PipeWrite(b)

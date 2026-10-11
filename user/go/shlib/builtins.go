@@ -52,6 +52,7 @@ func init() {
 		"pushd": bPushd, "popd": bPopd, "dirs": bDirs,
 		"open": bOpen, "env": bEnv, "printenv": bPrintenv, "set": bSet, "unset": bUnset,
 		"export": bExport, "read": bRead, "jobs": bJobs, "fg": bFg,
+		"kill":    bKill,
 		"history": bHistory, "help": bHelp, "exit": bExit, "monitor": bMonitor,
 		"sleep": bSleep, "clear": bClear, "log": bLog, "date": bDate,
 		"time": bTime,
@@ -423,6 +424,28 @@ func bRead(c *cmdCtx) int {
 		} else {
 			line, ok = string(c.stdin), true
 		}
+	} else if intr := c.sh.ttyPoll(); intr != nil {
+		// M98f: the interruptible tty read — the interrupter's stash IS
+		// the line's input (bytes other than 0x03 accumulate there).
+		var acc []byte
+		for len(acc) < 256 {
+			if intr.Interrupted() {
+				c.sh.host.Out([]byte("^C\r\n"))
+				return statusInterrupted // VAR stays unset
+			}
+			if ahead := intr.TypeAhead(); len(ahead) > 0 {
+				for _, b := range ahead {
+					if b == '\r' || b == '\n' {
+						c.sh.env.Set(c.args[0], string(acc))
+						return 0
+					}
+					acc = append(acc, b)
+				}
+				continue
+			}
+			c.sh.host.SleepTick()
+		}
+		line, ok = string(acc), true
 	} else {
 		line, ok = c.sh.host.ReadTTYLine()
 	}
@@ -433,53 +456,7 @@ func bRead(c *cmdCtx) int {
 	return 0
 }
 
-// bJobs lists the job table; finished jobs are reported once and removed.
-func bJobs(c *cmdCtx) int {
-	c.sh.ReapJobs()
-	for _, j := range append([]*Job{}, c.sh.jobs...) {
-		if j.Done {
-			c.out([]byte("[" + vsys.Itoa64(int64(j.N)) + "] Done: " + j.Display +
-				" (exit=" + vsys.Itoa64(j.Status) + ")\n"))
-			c.sh.removeJob(j)
-		} else {
-			c.out([]byte("[" + vsys.Itoa64(int64(j.N)) + "] running: " + j.Display + "\n"))
-		}
-	}
-	return 0
-}
-
-// bFg waits for one background job and propagates its exit status into $?.
-// There is no `bg` to return to (nothing suspends a guest job) and no
-// `wait` for the table as a whole — fg is the way you wait, the same
-// contract the kernel monitor's job table documents.
-func bFg(c *cmdCtx) int {
-	if len(c.args) != 1 {
-		c.out([]byte("gosh: fg N\n"))
-		return 2
-	}
-	id := strings.TrimPrefix(c.args[0], "%")
-	n, ok := parseInt(id)
-	if !ok {
-		c.out([]byte("gosh: fg N\n"))
-		return 2
-	}
-	j := c.sh.jobByN(n)
-	if j == nil {
-		c.out([]byte("fg: no such job\n"))
-		return 1
-	}
-	for !j.Done {
-		c.sh.ReapJobs()
-		if j.Done {
-			break
-		}
-		c.sh.host.SleepTick()
-	}
-	c.out([]byte("[" + vsys.Itoa64(int64(j.N)) + "] Done: " + j.Display +
-		" (exit=" + vsys.Itoa64(j.Status) + ")\n"))
-	c.sh.removeJob(j)
-	return int(j.Status)
-}
+// The jobs/fg/kill verbs live in jobctl.go (M98f).
 
 func bHistory(c *cmdCtx) int {
 	for i, h := range c.sh.hist.Entries() {
@@ -661,8 +638,9 @@ var helpCatalog = map[string]helpEntry{
 	"continue": {group: "scripts", usage: "continue", blurb: "skip to the innermost loop's next iteration"},
 
 	// jobs
-	"jobs":  {group: "jobs", usage: "jobs", blurb: "list the shell's jobs (done jobs are reaped as they are shown)"},
+	"jobs":  {group: "jobs", usage: "jobs [-l]", blurb: "list the shell's jobs (done jobs are reaped as they are shown)"},
 	"fg":    {group: "jobs", usage: "fg N", blurb: "bring job N to the foreground and wait for it"},
+	"kill":  {group: "jobs", usage: "kill [%N|PID]...", blurb: "terminate a background job or process (Ctrl-C interrupts the foreground)"},
 	"sleep": {group: "jobs", usage: "sleep SECONDS", blurb: "park the shell for SECONDS (0..60)"},
 
 	// identity (ADR 0024)
@@ -835,9 +813,10 @@ func bMonitor(c *cmdCtx) int {
 	return 0
 }
 
-// bSleep parks the shell for about n seconds (the scheduler runs at about
-// 100 Hz; the glue converts seconds to ticks). Bound at 60 so a typo can
-// not wedge the front-end forever.
+// bSleep parks the shell for about n "seconds" — at the glue's 100:1
+// conversion that is 100·n of the kernel's 1 Hz ticks, so `sleep 1` is a
+// ~100 s park today (pre-existing; observed on VZ 2026-10-11). The 60
+// bound still applies; on an interactive host Ctrl-C is now the escape.
 func bSleep(c *cmdCtx) int {
 	if len(c.args) != 1 {
 		c.out([]byte("gosh: sleep SECONDS\n"))
@@ -849,6 +828,18 @@ func bSleep(c *cmdCtx) int {
 		return 2
 	}
 	if n > 0 {
+		if intr := c.sh.ttyPoll(); intr != nil {
+			// M98f: tick-granular so Ctrl-C ends the sleep (the blocking
+			// SleepSeconds would hold the whole duration).
+			for i := 0; i < n*ticksPerSleepSecond; i++ {
+				if intr.Interrupted() {
+					c.sh.host.Out([]byte("^C\r\n"))
+					return statusInterrupted
+				}
+				c.sh.host.SleepTick()
+			}
+			return 0
+		}
 		c.sh.host.SleepSeconds(n)
 	}
 	return 0
