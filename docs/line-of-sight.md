@@ -230,7 +230,7 @@ pins, so behavior is byte-equivalent across the two compilers. This is the
 - Strings as `(addr,len)` pairs (string literals and `[]const u8`
   *returns* — e.g. the z1e/z1f name-mapping fns).
 - Arrays, structs (including `[*]T` pointer fields), enums with
-  `@enumFromInt`/`@intFromEnum`, `@intCast` (identity on words — needed so
+  `@fromBackingInt`/`@backingInt`, `@intCast` (identity on words — needed so
   dual-dialect sources type-check under host Zig's u8 stores).
 - Pointers: `&x`, `x.*`, `[*]u8`/`*T` params, struct-field access through
   pointer params. **Not** slices as *params* (call sites pass one register;

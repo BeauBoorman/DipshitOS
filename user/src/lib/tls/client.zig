@@ -152,7 +152,7 @@ pub fn Client(comptime S: type) type {
             if (!self.read_encrypted and inner == .handshake and self.write_keys_ready == false) {
                 // Plaintext handshake record (ClientHello).
                 var buf: [5 + record.max_plaintext]u8 = undefined;
-                buf[0] = @intFromEnum(hs.ContentType.handshake);
+                buf[0] = @backingInt(hs.ContentType.handshake);
                 buf[1] = 0x03;
                 buf[2] = 0x03;
                 std.mem.writeInt(u16, buf[3..5], @intCast(payload.len), .big);
@@ -160,7 +160,7 @@ pub fn Client(comptime S: type) type {
                 try self.t.writeAll(buf[0 .. 5 + payload.len]);
                 return;
             }
-            const rec_inner: record.ContentType = @enumFromInt(@intFromEnum(inner));
+            const rec_inner: record.ContentType = @fromBackingInt(@intCast(@backingInt(inner)));
             const n = record.sealRecord(&self.rec_buf, payload, rec_inner, &self.write_keys.key, &self.write_keys.iv, self.write_seq);
             self.write_seq += 1;
             try self.t.writeAll(self.rec_buf[0..n]);
@@ -172,7 +172,7 @@ pub fn Client(comptime S: type) type {
         fn readRecord(self: *@This()) !struct { len: usize, inner: hs.ContentType } {
             var hdr: [record.header_len]u8 = undefined;
             try self.t.readAll(&hdr);
-            const ct: hs.ContentType = @enumFromInt(hdr[0]);
+            const ct: hs.ContentType = @fromBackingInt(@intCast(hdr[0]));
             const len = std.mem.readInt(u16, hdr[3..5], .big);
             if (len > record.max_ciphertext) return Error.RecordTooLarge;
 
@@ -206,7 +206,7 @@ pub fn Client(comptime S: type) type {
                 return Error.RecordDecryptFailed; // AEAD failure: fail closed
             };
             self.read_seq += 1;
-            return .{ .len = n, .inner = @enumFromInt(@intFromEnum(inner_rec)) };
+            return .{ .len = n, .inner = @fromBackingInt(@intCast(@backingInt(inner_rec))) };
         }
 
         // -- handshake --------------------------------------------------------
@@ -279,7 +279,7 @@ pub fn Client(comptime S: type) type {
         fn processMessage(self: *@This(), msg: []const u8, server_pub: *[32]u8, got_sh: *bool, priv: [32]u8) !void {
             const hdr = try hs.MessageHeader.decode(msg[0..4]);
             const body = msg[4..];
-            const t: hs.HandshakeType = @enumFromInt(hdr.msg_type);
+            const t: hs.HandshakeType = @fromBackingInt(@intCast(hdr.msg_type));
 
             switch (t) {
                 .server_hello => {
@@ -498,7 +498,7 @@ pub fn Client(comptime S: type) type {
             var expect: [32]u8 = undefined;
             crypto.hmac.hmacSha256(&expect, &self.client_finished_key, &th);
             var fin: [4 + 32]u8 = undefined;
-            fin[0] = @intFromEnum(hs.HandshakeType.finished);
+            fin[0] = @backingInt(hs.HandshakeType.finished);
             std.mem.writeInt(u24, fin[1..4], 32, .big);
             @memcpy(fin[4..][0..32], &expect);
             try self.sendRecord(&fin, .handshake);

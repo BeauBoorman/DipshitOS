@@ -974,7 +974,7 @@ pub fn parse_procs(raw: []const u8, row_count: usize, out: []ProcInfo) usize {
 
         out[i] = .{
             .pid = pid,
-            .state = @enumFromInt(state_raw),
+            .state = @fromBackingInt(@intCast(state_raw)),
             .exit_status = exit_status,
             .name = name,
             .name_len = name_len,

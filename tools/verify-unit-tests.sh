@@ -22,7 +22,7 @@ zig build test --summary all
 
 # App-level test roots (TABWM.BIN / SEXIBURG.BIN) run as direct `zig test`
 # invocations rather than `zig build test` targets: their transitive
-# lib/font_ttf glyph-rasterization tests print to stderr, and the Zig 0.16
+# lib/font_ttf glyph-rasterization tests print to stderr, and the Zig 0.17
 # build runner relays a stale "failed command:" line for a SUCCESSFUL
 # run step whenever the child had stderr output (the Step docs' own note:
 # result_failed_command "may be populated even if the step succeeded").

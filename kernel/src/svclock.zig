@@ -169,7 +169,7 @@ pub const Dom = enum(u3) { file, net, win, ev, kernel };
 
 /// Canonical-order bit index of each domain (kernel is last).
 pub fn dom_bit(d: Dom) u5 {
-    return @as(u5, 1) << @intFromEnum(d);
+    return @as(u5, 1) << @backingInt(d);
 }
 
 pub const all_bits: u5 = dom_bit(.file) | dom_bit(.net) | dom_bit(.win) | dom_bit(.ev) | dom_bit(.kernel);

@@ -918,7 +918,7 @@ fn cached_glyph_rows(cell: Cell, size: FontSize) ?*const [24]u32 {
             (cell >= 0x100 and cell <= 0x17F) or cell == cell_fffd);
     if (!paintable) return null;
 
-    const sz: u2 = @intFromEnum(size);
+    const sz: u2 = @backingInt(size);
     var oldest: usize = 0;
     var oldest_stamp: u32 = 0xFFFFFFFF;
     for (glyph_cache[0..], 0..) |*e, i| {

@@ -1,4 +1,4 @@
-//! Zig 0.16.0 full vtable inventory; review every row on an upgrade.
+//! Zig 0.17.0 full vtable inventory; review every row on an upgrade.
 pub const names = [_][]const u8{
     "crashHandler",
     "async",
@@ -82,12 +82,12 @@ pub const names = [_][]const u8{
     "processSetCurrentDir",
     "processSetCurrentPath",
     "processReplace",
-    "processReplacePath",
     "processSpawn",
-    "processSpawnPath",
     "childWait",
     "childKill",
     "progressParentFile",
+    "inheritParentDir",
+    "inheritParentFile",
     "now",
     "clockResolution",
     "sleep",
@@ -100,9 +100,6 @@ pub const names = [_][]const u8{
     "netListenUnix",
     "netConnectUnix",
     "netSocketCreatePair",
-    "netSend",
-    "netRead",
-    "netWrite",
     "netWriteFile",
     "netClose",
     "netShutdown",

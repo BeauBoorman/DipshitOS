@@ -77,7 +77,7 @@ pub const Metadata = extern struct {
     reserved: u32,
 
     pub fn validate(self: Metadata) Error!void {
-        if (self.version != 1 or @intFromEnum(self.kind) > 6 or self.reserved != 0)
+        if (self.version != 1 or @backingInt(self.kind) > 6 or self.reserved != 0)
             return error.ProtocolViolation;
         try self.identity.validate();
         for ([_]Timestamp{ self.atime, self.mtime, self.ctime }) |time| {
@@ -288,7 +288,7 @@ pub fn Native(comptime Driver: type) type {
         }
         /// One file or one empty directory of exactly `kind`; never recursive.
         pub fn remove(dir: u64, name: []const u8, kind: EntryKind) Error!void {
-            if (try named(remove_op, dir, name, @intFromEnum(kind)) != 0) return error.ProtocolViolation;
+            if (try named(remove_op, dir, name, @backingInt(kind)) != 0) return error.ProtocolViolation;
         }
         /// One backend rename between two pins. No rollback or fallback after
         /// failure, whose outcome may be unknown.

@@ -1195,7 +1195,7 @@ pub fn snapshot(dst: []u8) usize {
         if (processes[id].state == .free) continue;
         const row = dst[rows * snapshot_row_bytes ..][0..snapshot_row_bytes];
         std.mem.writeInt(u64, row[0..8], id, .little);
-        std.mem.writeInt(u64, row[8..16], @intFromEnum(processes[id].state), .little);
+        std.mem.writeInt(u64, row[8..16], @backingInt(processes[id].state), .little);
         std.mem.writeInt(u64, row[16..24], processes[id].exit_status, .little);
         @memset(row[24..snapshot_row_bytes], 0);
         const take = @min(processes[id].name_len, snapshot_name_bytes);
@@ -1682,13 +1682,13 @@ test "process: snapshot marshals non-free rows in id order with the fixed 40-byt
     // Row 0 (pid 0, user-el0, exited): pid at 0, state code at 8, the
     // snapshotted status at 16, the NUL-padded name at 24.
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, scratch[0..8], .little));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(State.exited)), std.mem.readInt(u64, scratch[8..16], .little));
+    try std.testing.expectEqual(@as(u64, @backingInt(State.exited)), std.mem.readInt(u64, scratch[8..16], .little));
     try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, scratch[16..24], .little));
     try std.testing.expectEqualStrings("user-el0", scratch[24 .. 24 + 8]);
     for (scratch[24 + 8 .. 40]) |byte| try std.testing.expectEqual(@as(u8, 0), byte); // NUL-padded
     // Row 1 (pid 1, PEER.BIN, running): a full row is exactly 40 bytes.
     try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, scratch[40..48], .little));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(State.running)), std.mem.readInt(u64, scratch[48..56], .little));
+    try std.testing.expectEqual(@as(u64, @backingInt(State.running)), std.mem.readInt(u64, scratch[48..56], .little));
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, scratch[56..64], .little)); // running: no status
     try std.testing.expectEqualStrings("PEER.BIN", scratch[64 .. 64 + 8]);
 

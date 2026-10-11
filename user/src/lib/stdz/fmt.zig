@@ -1,7 +1,7 @@
 // stdz fmt (issue #759): u64 -> decimal / hex into a caller buffer.
 // Pure — no syscalls, no heap, no comptime. `out` must hold 20 bytes for
 // fmt_dec and 16 for fmt_hex; each returns the byte count written. Written
-// in the zc dialect (dual-valid under host Zig 0.16: byte stores carry
+// in the zc dialect (dual-valid under host Zig 0.17: byte stores carry
 // @intCast, which zc lowers as an identity cast). Plain // comments, not
 // //! — these modules are host-checked CONCATENATED (flat namespace), and
 // a mid-file //! block is not valid Zig.

@@ -45,10 +45,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Setup Zig 0.16.0
+      - name: Setup Zig 0.17.0
         uses: drawmeanelephant/zig-zouave@2d8510d62b517fa786279562cf8b1bdcf0c47b9f
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # --- Class A: the whole portable set, via the recipe devs run -----
       # `just verify-portable` IS the class-A gate set (docs/testing.md):

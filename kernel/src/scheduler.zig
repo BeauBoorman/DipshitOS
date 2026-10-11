@@ -3321,7 +3321,7 @@ pub const audit = struct {
     fn check_task(id: usize, tag: Tag) void {
         const t = &tasks[id];
         const st = enum_raw(&t.state);
-        if (st > @intFromEnum(State.zombie)) record(tag, .state, id, st);
+        if (st > @backingInt(State.zombie)) record(tag, .state, id, st);
         const nptr = @intFromPtr(t.name.ptr);
         if (!valid_ptr(nptr)) record(tag, .name_ptr, id, nptr);
         if (t.name.len > 64) record(tag, .name_len, id, t.name.len);
@@ -3332,7 +3332,7 @@ pub const audit = struct {
 
     fn check_proc(id: usize, tag: Tag) void {
         const c = process.audit_proc(id);
-        if (c.state > @intFromEnum(process.State.exited)) record(tag, .p_state, id, c.state);
+        if (c.state > @backingInt(process.State.exited)) record(tag, .p_state, id, c.state);
         if (c.name_len > process.name_max) record(tag, .p_name_len, id, c.name_len);
         if (c.task_id) |tid| {
             if (tid >= max_tasks) record(tag, .p_task_id, id, tid);
@@ -3401,7 +3401,7 @@ pub const audit = struct {
             have_last = true;
             last_slot = v.slot;
             last_field = v.field;
-            const is_task = @intFromEnum(v.field) < @intFromEnum(Field.p_state);
+            const is_task = @backingInt(v.field) < @backingInt(Field.p_state);
             con.puts("[AUDIT] ");
             con.puts(if (is_task) "tasks slot=" else "procs id=");
             con.print_u64(v.slot);

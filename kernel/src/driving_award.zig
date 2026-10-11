@@ -1400,7 +1400,7 @@ pub fn raise(id: u8) bool {
 pub fn to_geom(w: *const Window) geom.Geom {
     return .{
         .id = w.id,
-        .kind = @enumFromInt(@intFromEnum(w.kind)),
+        .kind = @fromBackingInt(@intCast(@backingInt(w.kind))),
         .x = w.x,
         .y = w.y,
         .w = w.w,
@@ -5756,7 +5756,7 @@ pub fn draw_chrome() void {
         // Info lines.
         draw_string(fb, stride, dlg_x + 10, dlg_y + 42, "AArch64 on Apple Virtualization", 0xd8dee9);
         draw_string(fb, stride, dlg_x + 10, dlg_y + 54, ".framework", 0xd8dee9);
-        draw_string(fb, stride, dlg_x + 10, dlg_y + 70, "Built with Zig 0.16", 0x94a3b8);
+        draw_string(fb, stride, dlg_x + 10, dlg_y + 70, "Built with Zig 0.17", 0x94a3b8);
         draw_string(fb, stride, dlg_x + 10, dlg_y + 86, "Window Manager: Driving Award", 0x94a3b8);
         // Close button.
         fill_rect(fb, stride, dlg_x + dlg_w - 16, dlg_y + 4, 8, 8, 0xef4444);

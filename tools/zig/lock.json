@@ -1,25 +1,25 @@
 {
-  "version": "0.16.0",
+  "version": "0.17.0",
   "target": "aarch64-freestanding-none",
   "cpu": "baseline",
   "optimize": "ReleaseSafe",
   "archives": {
     "aarch64-macos": {
-      "url": "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
-      "sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+      "url": "https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz",
+      "sha256": "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a"
     },
     "aarch64-linux": {
-      "url": "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz",
-      "sha256": "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+      "url": "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz",
+      "sha256": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
     },
     "x86_64-linux": {
-      "url": "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz",
-      "sha256": "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+      "url": "https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz",
+      "sha256": "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
     }
   },
   "dependencies": [],
   "patches": [
     "tools/zig/overlay.json"
   ],
-  "overlay_sha256": "b6d4fadbaae7526b7ece849732391685f9e1ba1b979ef8e231ef0820bd9064b7"
+  "overlay_sha256": "882067f583fc6894b24a1ecf2740ff924421b8f67b94dfd1bf479f4a7ba6a2e2"
 }

@@ -3,7 +3,7 @@
 # build-zc-host.sh -- Z4b (issue #761) host link contract: the target recipe.
 #
 # Builds a corpus fixture (one or more sources, compiled together — the
-# Z3a flat-namespace shape) with HOST zig 0.16 into an ELF64 executable the
+# Z3a flat-namespace shape) with HOST zig 0.17 into an ELF64 executable the
 # VirelaiOS static loader accepts and runs (verified on VZ: the z05 host
 # image exits 72 exactly like the zc-compiled one). This is the "host side"
 # of the Z4b dual-run: the SAME source the in-guest compiler compiles, now

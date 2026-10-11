@@ -164,7 +164,7 @@ test "SDK fs: wire facts are lossless, fresh and filesystem-scoped" {
             2 => Mock.value.identity.filesystem = 0,
             3 => Mock.value.ctime.nanoseconds = 1_000_000_000,
             4 => Mock.value.mtime.reserved = 1,
-            5 => Mock.value.kind = @enumFromInt(99),
+            5 => Mock.value.kind = @fromBackingInt(@intCast(99)),
             6 => Mock.value.host_mode = 0,
             else => unreachable,
         }

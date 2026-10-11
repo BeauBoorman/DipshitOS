@@ -327,7 +327,7 @@ machine. Do not introduce wall-clock time, `sys_getrandom`, or host entropy
 into a gate-run corpus.
 
 **Keep a green run silent.** An unconditional `std.debug.print` in a test
-module makes the Zig 0.16 build runner mark that run step `w` and echo
+module makes the Zig build runner mark that run step `w` and echo
 `failed command: … --listen=-` for a step whose tests all passed and whose
 build exits 0 (observed 2026-09-18 with a five-line probe module). Print only
 when there is a violation to report.

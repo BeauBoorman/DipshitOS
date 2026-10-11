@@ -3,11 +3,11 @@
     // See docs/decisions/0001-arm64-uefi-zig.md.
     .version = "0.1.0",
     .fingerprint = 0x3aede7e1b1ff4f1c,
-    // Package identity. Zig 0.16 derives this value from the package name
+    // Package identity. Zig 0.17 derives this value from the package name
     // for new packages; regenerate (delete and re-run `zig build`) if this
     // project is ever forked.
-    // This project targets Zig 0.16.0 specifically; see .zigversion.
-    .minimum_zig_version = "0.16.0",
+    // This project targets Zig 0.17.0 specifically; see .zigversion.
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

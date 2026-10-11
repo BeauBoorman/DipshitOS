@@ -193,7 +193,7 @@ zig build run        # serial takeover path
 `zig build console` opens an interactive `virelai>` console, and
 `zig build test-console` runs the deterministic transcript test.
 
-**Requirements:** Apple silicon, macOS 27+, Zig 0.16.0, `just`, Swift + Xcode
+**Requirements:** Apple silicon, macOS 27+, Zig 0.17.0, `just`, Swift + Xcode
 command-line tools, Python 3, bash, and the Homebrew `bash`, `gnu-sed`, `jq`,
 and `yq` tools. No root, no `mtools`, no Linux/QEMU path.
 

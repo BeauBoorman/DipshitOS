@@ -154,20 +154,25 @@ test "B6 std.Io: listener stream share four resources and use readiness sleep" {
     Mock.bytes = "hello";
     var output: [5]u8 = undefined;
     var vec = [_][]u8{&output};
-    try t.expectEqual(@as(usize, 5), try io.vtable.netRead(io.userdata, stream.socket.handle, &vec));
+    try t.expectEqual(@as(usize, 5), (try stream.readWithControl(io, &vec, &.{})).data_len);
     try t.expectEqualStrings("hello", &output);
     try t.expectEqual(@as(usize, 1), Mock.slept);
-    try t.expectEqual(@as(usize, 3), try io.vtable.netWrite(io.userdata, stream.socket.handle, "abcde", &.{}, 0));
+    try t.expectEqual(@as(usize, 3), try (try io.operate(.{ .net_write = .{
+        .socket_handle = stream.socket.handle,
+        .header = "abcde",
+        .data = &.{},
+        .splat = 0,
+    } })).net_write);
     Mock.forced = -13;
-    try t.expectError(error.ConnectionResetByPeer, io.vtable.netRead(io.userdata, stream.socket.handle, &vec));
+    try t.expectError(error.ConnectionResetByPeer, stream.readWithControl(io, &vec, &.{}));
     Mock.forced = -12;
-    try t.expectError(error.Timeout, io.vtable.netRead(io.userdata, stream.socket.handle, &vec));
+    try t.expectError(error.ConnectionTimedOut, stream.readWithControl(io, &vec, &.{}));
     Mock.forced = null;
     stream.close(io);
     server.deinit(io);
     try t.expectEqual(@as(usize, 4), backend.liveResources());
     try t.expectEqual(@as(usize, 2), Mock.closed);
-    try t.expectError(error.SocketUnconnected, io.vtable.netRead(io.userdata, stream.socket.handle, &vec));
+    try t.expectError(error.SocketUnconnected, stream.readWithControl(io, &vec, &.{}));
 }
 test "B6 std.Io: capacity and options refuse before creating transport" {
     Mock.reset();

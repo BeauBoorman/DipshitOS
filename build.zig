@@ -1,12 +1,12 @@
 //! VirelaiOS root build system (milestone zero).
 //!
-//! Written against Zig 0.16.0 (pinned in .zigversion). Notable 0.16
+//! Written against Zig 0.17.0 (pinned in .zigversion). Notable 0.17
 //! differences from older tutorials that this file accounts for:
 //!   * `b.addExecutable` takes `.root_module = b.createModule(...)`.
 //!   * `build.zig.zon` uses `.name = .virelaios`, `.fingerprint`,
 //!     `.minimum_zig_version` and a `.paths` allowlist.
 //!   * `Step.Run` exposes settable `has_side_effects` and `stdio` fields
-//!     (verified against the installed 0.16.0 std sources).
+//!     (verified against the installed 0.17.0 std sources).
 //! See docs/decisions/0001-arm64-uefi-zig.md and README.md.
 
 const std = @import("std");
