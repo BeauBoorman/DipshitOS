@@ -39,6 +39,8 @@ type fakeHost struct {
 	chdirErr       map[string]string // path -> errno name for a denied cd
 	chdirPlain     bool              // Chdir fails with a plain (no-errno) error
 	writeErr       bool              // every WriteFile refuses (M69f1 #1537 D3)
+	writeErrPaths  map[string]bool   // M98e: WriteFile refuses only these paths
+	externArgs     [][]string        // M98e: argv of every RunExternal call
 	appLogs        map[string][]byte
 }
 
@@ -109,6 +111,7 @@ func (f *fakeHost) RunExternal(name string, args []string) (int64, error) {
 	if f.missing[name] {
 		return 0, ErrNotFound
 	}
+	f.externArgs = append(f.externArgs, append([]string{name}, args...))
 	return 7, nil // the pid is irrelevant to the engine contract
 }
 
@@ -140,7 +143,7 @@ func (f *fakeHost) ReadFile(path string, max int) ([]byte, error) {
 }
 
 func (f *fakeHost) WriteFile(path string, b []byte, appendMode bool) error {
-	if f.writeErr {
+	if f.writeErr || f.writeErrPaths[path] {
 		return ErrWriteFailed
 	}
 	if appendMode {

@@ -680,6 +680,12 @@ var helpCatalog = map[string]helpEntry{
 	"cut":  {group: "tools", usage: "cut -f LIST [-d C] [FILE...]", blurb: "select fields by LIST ('-d C' sets the delimiter, tab by default)"}, "printf": {group: "tools", usage: "printf FORMAT [ARGS...]", blurb: `write FORMAT with %s/%d/%% substitutions and the escapes \n \t \r \e \xHH \\ \0 (unknown escapes stay literal)`},
 	"test": {group: "tools", usage: "test EXPR", blurb: "evaluate EXPR and set $? (no output)"},
 	"[":    {group: "tools", usage: "[ EXPR ]", blurb: "evaluate EXPR and set $? (the closing ] is required)"},
+	// M98e (issue #2131): the filter-loop composers.
+	"tee":      {group: "tools", usage: "tee [-a] FILE...", blurb: "copy stdin to stdout and each FILE (at most 4)", notes: "Needs piped or redirected input — bare `tee F` refuses rather than truncate F."},
+	"xargs":    {group: "tools", usage: "xargs [-n N] CMD [ARG...]", blurb: "run CMD once per chunk of stdin lines", notes: "One non-empty line is one item — no quoting or splitting, so names may contain spaces (not POSIX). An external CMD under a redirect or $( ) is refused: its output cannot be captured."},
+	"tr":       {group: "tools", usage: "tr [-d] SET1 [SET2]", blurb: "map or delete stdin bytes (a-z ranges; \\n \\t \\\\ escapes)", notes: "[:class:] is refused. Quote bracketed sets — an unquoted [...] word globs."},
+	"basename": {group: "tools", usage: "basename PATH [SUFFIX]", blurb: "the last component of PATH, minus SUFFIX", notes: "Pure string op — no filesystem access."},
+	"dirname":  {group: "tools", usage: "dirname PATH", blurb: "PATH minus its last component", notes: "Pure string op — no filesystem access."},
 
 	// externals: the verb, then the Go net CLIs a daily user reaches from
 	// this prompt by name (M71n #1573 — `exec GOTGIT.ELF` and `exec
