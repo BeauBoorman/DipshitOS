@@ -86,14 +86,27 @@ func TestTimeUsageErrorsNeverTouchTheNetwork(t *testing.T) {
 		t.Fatal("a mistyped `time` must not send a query")
 		return timesync.Result{}
 	}
-	for _, line := range []string{"time", "time now", "time sync a b", "time set 10.0.0.2"} {
+	const usage = "gosh: time: usage: time CMD [ARGS...] | time sync [SERVER]\n"
+	// The misuse forms still refuse with 2; M98h made every other word a
+	// timed run — `time now` runs `now` (127, still no network).
+	for _, line := range []string{"time", "time sync a b"} {
 		h := newFakeHost()
 		run, _ := session(h)
 		if st := run(line); st != 2 {
 			t.Errorf("%q: status = %d, want 2", line, st)
 		}
-		if got := h.outString(); got != "gosh: time: usage: time sync [SERVER]\n" {
+		if got := h.outString(); got != usage {
 			t.Errorf("%q: output = %q", line, got)
 		}
+	}
+	h := newFakeHost()
+	h.missing["now"] = true
+	run, _ := session(h)
+	if st := run("time now"); st != 127 {
+		t.Errorf("time now: status = %d, want 127", st)
+	}
+	out := h.outString()
+	if !strings.Contains(out, "now: not found") || !strings.Contains(out, "real ") {
+		t.Errorf("time now: output = %q, want not-found plus a real line", out)
 	}
 }

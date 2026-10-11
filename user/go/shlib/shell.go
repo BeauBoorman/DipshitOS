@@ -179,6 +179,9 @@ type Host interface {
 	ReadFile(path string, max int) ([]byte, error)
 	// WriteFile writes b to path (truncating, or appending when appendMode).
 	WriteFile(path string, b []byte, appendMode bool) error
+	// DeleteFile removes path; a missing path is not an error (M98h's
+	// edit temp lifecycle).
+	DeleteFile(path string) error
 	// Chdir validates that path is enterable (a directory).
 	Chdir(path string) error
 	// ReadTTYLine reads one line from the terminal (`read VAR` unbound).
@@ -295,6 +298,10 @@ type Shell struct {
 	nextN     int
 	exitReq   bool
 	monitorRq bool
+	// M98h: the last top-level line's wall time feeds the \D prompt escape
+	// and EditLine's temp names get a per-shell counter.
+	lastDurNs int64
+	editSeq   int
 	// M19 scripting (slice 4 of #1450).
 	funcs     funcTable
 	sourceReq string  // set by the `source` builtin; runSegment resolves it
@@ -332,7 +339,19 @@ func (s *Shell) Pwd() string {
 // legitimately hold marks that $(...) splicing inserted (M98a marks
 // captured glob metacharacters literal), and stripping on every entry
 // would silently un-literal them a hop later.
-func (s *Shell) RunLine(line string) (int, Action) { return s.runLine(stripEscMarks(line), 0) }
+// RunLine is the front-end's entry point: one typed line. Depth-0 lines are
+// timed for the \D prompt escape (M98h); an empty line leaves both the last
+// duration and $? untouched, the way a bare Enter leaves $? alone.
+func (s *Shell) RunLine(line string) (int, Action) {
+	stripped := stripEscMarks(line)
+	if trimSpace(stripped) == "" {
+		return s.runLine(stripped, 0)
+	}
+	start := timeMono()
+	st, act := s.runLine(stripped, 0)
+	s.lastDurNs = timeMono() - start
+	return st, act
+}
 
 // stripEscMarks removes the tokenizer's literal-byte sentinel from a raw
 // line. escMark only ever means "this byte was quoted" within one parse, so
