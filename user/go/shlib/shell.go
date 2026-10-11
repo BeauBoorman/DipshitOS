@@ -181,8 +181,6 @@ type Host interface {
 	WriteFile(path string, b []byte, appendMode bool) error
 	// Chdir validates that path is enterable (a directory).
 	Chdir(path string) error
-	// ListDir lists the share root (completion candidates).
-	ListDir() []string
 	// ReadTTYLine reads one line from the terminal (`read VAR` unbound).
 	ReadTTYLine() (string, bool)
 	// SleepSeconds parks the caller for about n seconds.

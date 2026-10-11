@@ -221,8 +221,8 @@ func TestEditorKeys(t *testing.T) {
 func TestEditorCompletion(t *testing.T) {
 	e := NewEditor("gosh> ", &History{})
 	listed := false
-	e.Complete = func(word string, first bool) []string {
-		switch word {
+	e.Complete = func(req CompleteRequest) []string {
+		switch req.Word {
 		case "ec":
 			return []string{"echo "}
 		case "c":
@@ -230,7 +230,7 @@ func TestEditorCompletion(t *testing.T) {
 		case "GO":
 			return []string{"GOSH.ELF", "GONET.ELF"}
 		}
-		if word == "list" {
+		if req.Word == "list" {
 			listed = true
 		}
 		return nil
@@ -338,7 +338,7 @@ func TestEditorLineCap(t *testing.T) {
 	}
 	// A completion that would pass the cap is refused the same way.
 	e2 := NewEditor("gosh> ", &History{})
-	e2.Complete = func(word string, first bool) []string { return []string{word + strings.Repeat("z", 64)} }
+	e2.Complete = func(req CompleteRequest) []string { return []string{req.Word + strings.Repeat("z", 64)} }
 	feedE(e2, strings.Repeat("q", maxLineBytes))
 	out = feedE(e2, "\t")
 	if len(e2.buf) != maxLineBytes {
@@ -454,8 +454,8 @@ func drainFeed(e *Editor, s string) (string, []string) {
 // (submit), and asserts the recall-and-rerun the gate counts.
 func TestSearchGateChoreography(t *testing.T) {
 	e := NewEditor("gosh> ", &History{})
-	e.Complete = func(word string, first bool) []string {
-		if strings.HasPrefix("help", word) {
+	e.Complete = func(req CompleteRequest) []string {
+		if strings.HasPrefix("help", req.Word) {
 			return []string{"help "}
 		}
 		return nil
@@ -1080,8 +1080,8 @@ func TestEditorKillBytesUnchanged(t *testing.T) {
 // menuHook is the completer the menu tests share: "c" is the ambiguous word
 // the card is about, "ec" the single-candidate case, and everything else a
 // miss.
-func menuHook(word string, first bool) []string {
-	switch word {
+func menuHook(req CompleteRequest) []string {
+	switch req.Word {
 	case "ec":
 		return []string{"echo "}
 	case "echo ":
@@ -1135,7 +1135,7 @@ func TestCompletionMenuPages(t *testing.T) {
 	}
 	e := NewEditor("gosh> ", &History{})
 	e.SetCols(15)
-	e.Complete = func(word string, first bool) []string { return cands }
+	e.Complete = func(req CompleteRequest) []string { return cands }
 	feedE(e, "f")
 	out := feedE(e, "\t")
 	page0 := []string{
@@ -1290,7 +1290,7 @@ func TestCompletionMenuRespectsLineCap(t *testing.T) {
 	fits := strings.Repeat("y", maxLineBytes)
 	tooLong := strings.Repeat("z", maxLineBytes+1)
 	e := NewEditor("gosh> ", &History{})
-	e.Complete = func(word string, first bool) []string {
+	e.Complete = func(req CompleteRequest) []string {
 		return []string{fits, tooLong}
 	}
 	feedE(e, "q")

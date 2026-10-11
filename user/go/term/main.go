@@ -153,7 +153,7 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 		}
 
 		editor := shlib.NewEditor(loadPrompt(), hist)
-		editor.Complete = completeFn(hst)
+		editor.Complete = shlib.NewCompleter(sh, hst)
 		// M80n (#1730): the prompt escapes ask the shell where it is, at paint
 		// time. The provider is built once and read once per line, so `\w`
 		// follows a `cd` without SETTINGS.TXT or the directory being walked on
@@ -397,29 +397,9 @@ func startupLinesFrom(body string) []string {
 	return out
 }
 
-// completeFn builds the Tab completer: the command word matches builtins
-// and tools; every word also matches the share listing.
-func completeFn(host *termHost) func(string, bool) []string {
-	return func(word string, first bool) []string {
-		var cands []string
-		if first {
-			for _, n := range append(append([]string{}, shlib.BuiltinNames()...), shlib.ToolNames()...) {
-				if strings.HasPrefix(n, word) {
-					cands = append(cands, n+" ")
-				}
-			}
-		}
-		seen := map[string]bool{}
-		for _, n := range host.ListDir() {
-			if !strings.HasPrefix(n, word) || seen[n] {
-				continue
-			}
-			seen[n] = true
-			cands = append(cands, n)
-		}
-		return cands
-	}
-}
+// Tab completion is shlib.NewCompleter (M98g) — the front-ends used to
+// carry identical copies of a flat word lister; the shared completer is
+// context-aware and this file adds no logic.
 
 // termHost is the Host seam for this windowed front-end: the same vi
 // syscall surface as GOSH's goshHost, always bound to the attached tty
@@ -596,21 +576,6 @@ func (g *termHost) Chdir(path string) error {
 		return shlib.ErrNotFound
 	}
 	return nil
-}
-
-func (g *termHost) ListDir() []string {
-	var entries [vi.MaxDirEntries]vi.DirEntry
-	n, r := vi.DirList("", entries[:])
-	if r < 0 {
-		return nil
-	}
-	out := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		if !entries[i].Dir() {
-			out = append(out, entries[i].NameString())
-		}
-	}
-	return out
 }
 
 // ListPath is the M98a glob seam: a path-aware listing of a canonical
