@@ -731,6 +731,15 @@ beat cannot see this.
 
 ## Verification sequence
 
+Every `zig` command below must resolve to the pinned compiler: the version +
+archive sha256s live in `tools/zig/lock.json` and `tools/zig/sdk.py`
+materializes the pinned SDK into `.build/zig-guest` (offline-by-default,
+checksum-verified, refuses concurrent substitution). Put
+`$(python3 tools/zig/sdk.py prepare)` first on PATH — a shadowing `zig`
+(e.g. Homebrew) must not win: it broke `verify-portable` during the M91
+recheck and `live-web`'s kernel build during M93g. Upstream caveat: ZLS does
+not work with 0.17.0 (maker/configurer split) — known issue, do not file.
+
 1. Print the detected tool versions.
 2. Check Zig formatting: `zig fmt --check boot/src/*.zig kernel/src/*.zig build.zig`.
 3. Run the M1.5 kernel monitor module unit tests:
