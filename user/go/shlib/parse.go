@@ -7,8 +7,6 @@ package shlib
 import (
 	"errors"
 	"strings"
-
-	"virelai/vsys"
 )
 
 // escMark prefixes a character the tokenizer made literal (backslash
@@ -125,6 +123,10 @@ func scanWord(line string, start int) (string, int, error) {
 
 // scanDouble appends a double-quoted segment starting at line[start]=='"'
 // to b. Inside double quotes only \" \\ \$ are escapes; $ still expands.
+// Every quoted byte is escMark-literal — quoted `*`/`?`/`[` never glob —
+// except the bytes of a $ expansion itself ($?, ${NAME}, $NAME), which
+// stay bare so the expander can consume them; the value it emits is
+// already flagged literal.
 func scanDouble(line string, start int, b *strings.Builder) (int, error) {
 	i := start + 1
 	for i < len(line) {
@@ -142,9 +144,38 @@ func scanDouble(line string, start int, b *strings.Builder) (int, error) {
 					continue
 				}
 			}
+			b.WriteByte(escMark)
 			b.WriteByte(c)
 			i++
+		case '$':
+			b.WriteByte(c)
+			i++
+			if i >= len(line) {
+				break
+			}
+			switch {
+			case line[i] == '?':
+				b.WriteByte('?')
+				i++
+			case line[i] == '{':
+				end := strings.IndexByte(line[i:], '}')
+				if end < 0 {
+					b.WriteByte('{')
+					i++
+				} else {
+					for k := i; k <= i+end; k++ {
+						b.WriteByte(line[k])
+					}
+					i += end + 1
+				}
+			default:
+				for i < len(line) && isNameByte(line[i]) {
+					b.WriteByte(line[i])
+					i++
+				}
+			}
 		default:
+			b.WriteByte(escMark)
 			b.WriteByte(c)
 			i++
 		}
@@ -155,55 +186,11 @@ func scanDouble(line string, start int, b *strings.Builder) (int, error) {
 // expand runs $ expansion over one word token: $NAME, ${NAME} and $?
 // (the last status). escMark-marked bytes pass through as literals.
 // Expansion never re-splits words — a variable's value stays one word.
+// The walk itself lives in glob.go's expandMarked, which additionally
+// reports which bytes are glob-active; expand is the flags-free form.
 func expand(t token, env *Env, status int) string {
-	var b strings.Builder
-	s := t.text
-	i := 0
-	for i < len(s) {
-		c := s[i]
-		switch {
-		case c == escMark:
-			if i+1 < len(s) {
-				b.WriteByte(s[i+1])
-				i += 2
-			} else {
-				i++
-			}
-		case c == '$' && i+1 < len(s) && s[i+1] == '?':
-			b.WriteString(vsys.Itoa64(int64(status)))
-			i += 2
-		case c == '$' && i+1 < len(s) && s[i+1] == '{':
-			end := strings.IndexByte(s[i+2:], '}')
-			if end < 0 {
-				b.WriteByte(c)
-				i++
-				continue
-			}
-			name := s[i+2 : i+2+end]
-			if v, ok := env.Get(name); ok {
-				b.WriteString(v)
-			}
-			i = i + 2 + end + 1
-		case c == '$':
-			j := i + 1
-			for j < len(s) && isNameByte(s[j]) {
-				j++
-			}
-			if j == i+1 {
-				b.WriteByte(c)
-				i++
-				continue
-			}
-			if v, ok := env.Get(s[i+1 : j]); ok {
-				b.WriteString(v)
-			}
-			i = j
-		default:
-			b.WriteByte(c)
-			i++
-		}
-	}
-	return b.String()
+	w, _ := expandMarked(t, env, status)
+	return w
 }
 
 func isNameByte(c byte) bool {
@@ -230,7 +217,12 @@ type plan struct {
 // refuses, with honest messages, everything it does not implement: chained
 // pipes, duplicate redirects, `&` anywhere but the end, and `&` combined
 // with pipes or redirects.
-func parsePlan(toks []token, env *Env, status int) (*plan, error) {
+//
+// globFn (M98a) expands one word into zero-or-more argv words; nil keeps
+// every word literal. It applies to argument positions only — never the
+// command word itself, never redirect targets, and never the NAME=VALUE
+// words of set/export/alias.
+func parsePlan(toks []token, env *Env, status int, globFn globFunc) (*plan, error) {
 	var p plan
 	var left, right []string
 	cur := &left
@@ -245,7 +237,16 @@ func parsePlan(toks []token, env *Env, status int) (*plan, error) {
 		t := toks[i]
 		switch t.kind {
 		case tokWord:
-			*cur = append(*cur, expand(t, env, status))
+			w, act := expandMarked(t, env, status)
+			if globFn != nil && len(*cur) > 0 && !globExemptHead((*cur)[0], w) {
+				words, err := globFn(w, act)
+				if err != nil {
+					return nil, err
+				}
+				*cur = append(*cur, words...)
+			} else {
+				*cur = append(*cur, w)
+			}
 			i++
 		case tokPipe:
 			if err := flush(); err != nil {

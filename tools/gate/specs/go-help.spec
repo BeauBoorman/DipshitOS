@@ -59,19 +59,20 @@ print("staged GOHELP.ELF into share (%d bytes), %s (%d bytes), %s (%d bytes)" %
        guide, os.path.getsize(guide), notes, os.path.getsize(notes)))
 PY
 
-# The chord batch, in full (13 strokes at the cv-input transport's fixed
+# The chord batch, in full (14 strokes at the cv-input transport's fixed
 # 0.25 s): `l` hops to the files group head, `h` hops back to shell, then
 # open the docs bundle, read its first page, back out to browse, arm `/`,
 # type `ec` (pinned n=3: echo, secrets, exec), escape to clear, move onto
-# echo with `j,j` (M83a's date sorts between clear and echo), and open
-# the full detail — the LAST stroke, so the screenshot
+# echo with `j,j,j` (M98b's alias leads the shell group, M83a's date sorts
+# between clear and echo), and open the full detail — the LAST stroke, so
+# the screenshot
 # barrier and the dui script both fire against an idle app. Printable h/j/l
 # avoid the currently unreliable multi-byte arrow input path.
 vgate_run 01 -- \
     --screen '$RUN_DIR/help-screen' \
     --input --via-virtio \
     --script '$RUN_DIR/script.txt' \
-    --input-chords 'l,h,d,return,backspace,backspace,/,e,c,escape,j,j,return' \
+    --input-chords 'l,h,d,return,backspace,backspace,/,e,c,escape,j,j,j,return' \
     --input-chords-after 'gohelp: ready' \
     --screenshot-after 'gohelp: detail echo usage=echo [ARG...]' \
     --script2 '$RUN_DIR/script2.txt' \
@@ -90,9 +91,9 @@ vgate_assert 01 serial-contains 'gohelp: ready'
 vgate_assert 01 serial-contains 'gohelp: present'
 
 # The catalog came from shlib.HelpRows — single-sourced from GOSH's
-# helpCatalog (n=48 is the drift tripwire; model_test.go pins the same
+# helpCatalog (n=59 is the drift tripwire; model_test.go pins the same
 # number on the host), and the seeded docs bundle is visible.
-vgate_assert 01 serial-contains 'gohelp: catalog n=48'
+vgate_assert 01 serial-contains 'gohelp: catalog n=59'
 vgate_assert 01 serial-contains 'gohelp: docs n=2'
 
 # The window itself: native rect on the kernel desktop (dui from script2,
@@ -101,9 +102,9 @@ vgate_assert 01 serial-contains 'gohelp: docs n=2'
 vgate_assert 01 serial-contains 'dui[4]: user user rect=32,32,512,384'
 
 # Group navigation: `l` lands on the files head (ASCII sorts `.` before the
-# letters — observed), `h` hops back to the shell head.
+# letters — observed), `h` hops back to the shell head (M98b's alias leads).
 vgate_assert 01 serial-contains 'gohelp: focus . group=files'
-vgate_assert 01 serial-contains 'gohelp: focus clear group=shell'
+vgate_assert 01 serial-contains 'gohelp: focus alias group=shell'
 vgate_assert 01 serial-contains 'gohelp: key l'
 vgate_assert 01 serial-contains 'gohelp: key h'
 
@@ -118,7 +119,7 @@ vgate_assert 01 serial-contains 'gohelp: doc GUIDE.TXT bytes=26'
 vgate_assert 01 serial-contains 'gohelp: browse'
 vgate_assert 01 serial-contains 'gohelp: filter on'
 vgate_assert 01 serial-contains 'gohelp: filter ec n=3'
-vgate_assert 01 serial-contains 'gohelp: filter cleared n=48'
+vgate_assert 01 serial-contains 'gohelp: filter cleared n=59'
 
 # Key labels line up with the chord table verbatim.
 vgate_assert 01 serial-contains 'gohelp: key d'

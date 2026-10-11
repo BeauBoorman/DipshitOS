@@ -181,7 +181,8 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 		// call and holds the remainder of its chunk, so the loop below keeps
 		// feeding until the editor has nothing left: the kernel's input queue
 		// can deliver several whole lines in a single read.
-		handle := func(out []byte, ev shlib.EditEvent) {
+		var handle func([]byte, shlib.EditEvent)
+		handle = func(out []byte, ev shlib.EditEvent) {
 			if len(out) > 0 {
 				writeTTY(fd, out)
 			}
@@ -216,6 +217,14 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 					// this prompt is the one the next in-line repaint uses.
 					editor.SetPrompt(loadPrompt())
 					writeTTY(fd, editor.PromptBytes())
+					// M98f: bytes typed while a foreground child ran sit
+					// in the interrupter's stash — feed them before the
+					// next FileRead.
+					if p := hst.TTYInterrupter(); p != nil {
+						if ahead := p.TypeAhead(); len(ahead) > 0 {
+							handle(editor.Feed(ahead))
+						}
+					}
 				}
 			case shlib.EvEOF:
 				if eofPending {
@@ -418,7 +427,8 @@ func completeFn(host *termHost) func(string, bool) []string {
 // in shlib, because shlib stays host-agnostic; a later card can share one
 // seam between the two front-ends when the Touches allow touching both.
 type termHost struct {
-	fd uint32
+	fd   uint32
+	poll *shlib.TTYPoll
 }
 
 func (g *termHost) Marker(line string) { vi.ConsoleLine(line) }
@@ -465,6 +475,30 @@ func (g *termHost) ProbeExternal(pid int64) (int64, int) {
 }
 
 func (g *termHost) SleepTick() { vi.Sleep(1) }
+
+// TTYInterrupter is the M98f Ctrl-C seam — the same engine hook GOSH
+// exposes, over the attached tty fd. The instance persists on the host:
+// its type-ahead stash must survive between the engine's waits.
+func (g *termHost) TTYInterrupter() *shlib.TTYPoll {
+	if g.poll == nil {
+		g.poll = &shlib.TTYPoll{Read: func(b []byte) int {
+			n, _ := vi.FileRead(g.fd, b)
+			return n
+		}}
+	}
+	return g.poll
+}
+
+// Kill arms sys_kill (slot 29), carrying the kernel's errno name.
+func (g *termHost) Kill(pid int64) error {
+	if r := vi.Kill(uint64(pid)); r < 0 {
+		if name := vi.ErrnoName(r); name != "" {
+			return shlib.NewOpenError(vi.Itoa64(pid), name)
+		}
+		return shlib.ErrNotFound
+	}
+	return nil
+}
 
 func (g *termHost) PipeWrite(b []byte) error {
 	_, err := vi.PipeWrite(b)
@@ -577,6 +611,13 @@ func (g *termHost) ListDir() []string {
 		}
 	}
 	return out
+}
+
+// ListPath is the M98a glob seam: a path-aware listing of a canonical
+// directory. The shared vi wrapper owns the /host conversion, the
+// slot-79 paging and the USB fallback — the front-end adds no logic.
+func (g *termHost) ListPath(dir string) ([]vi.DirItem, error) {
+	return vi.ListDirAt(dir)
 }
 
 func (g *termHost) ReadTTYLine() (string, bool) {

@@ -49,8 +49,10 @@ var builtins map[string]func(*cmdCtx) int
 func init() {
 	builtins = map[string]func(*cmdCtx) int{
 		"echo": bEcho, "cat": bCat, "pwd": bPwd, "cd": bCd,
+		"pushd": bPushd, "popd": bPopd, "dirs": bDirs,
 		"open": bOpen, "env": bEnv, "printenv": bPrintenv, "set": bSet, "unset": bUnset,
 		"export": bExport, "read": bRead, "jobs": bJobs, "fg": bFg,
+		"kill":    bKill,
 		"history": bHistory, "help": bHelp, "exit": bExit, "monitor": bMonitor,
 		"sleep": bSleep, "clear": bClear, "log": bLog, "date": bDate,
 		"time": bTime,
@@ -62,6 +64,8 @@ func init() {
 		// source that runs a file's lines in this shell.
 		"true": bTrue, "false": bFalse, "source": bSource, ".": bSource,
 		"break": bBreak, "continue": bContinue,
+		// M98b (issue #2128): the session alias table.
+		"alias": bAlias, "unalias": bUnalias,
 	}
 }
 
@@ -143,9 +147,14 @@ func bChmod(c *cmdCtx) int {
 		return 1
 	}
 	file := c.args[1]
-	if err := c.sh.host.Chmod(file, mode); err != nil {
+	rp, rerr := c.sh.resolvePath(file)
+	if rerr != nil {
+		c.out([]byte("chmod: " + file + ": " + rerr.Error() + "\n"))
+		return 1
+	}
+	if err := c.sh.host.Chmod(rp.host, mode); err != nil {
 		if oe, denial := deniedAs(err); denial {
-			c.out([]byte("chmod: " + oe.path + ": " + oe.name + "\n"))
+			c.out([]byte("chmod: " + file + ": " + oe.name + "\n"))
 		} else {
 			c.out([]byte("chmod: " + file + ": " + err.Error() + "\n"))
 		}
@@ -239,8 +248,21 @@ func bOpen(c *cmdCtx) int {
 		c.out([]byte("gosh: open: usage: open PATH|URL\n"))
 		return 2
 	}
-	cwd, _ := c.sh.env.Get("PWD")
-	req, err := mime.Open(c.args[0], cwd, c.sh.host.ReadFile)
+	// File paths resolve against PWD here; URL schemes and volume-colon
+	// forms pass through verbatim because mime's own routing owns them
+	// (localVolumePath handles host:/usbN: itself).
+	target := c.args[0]
+	if !hasScheme(target) {
+		rp, rerr := c.sh.resolvePath(target)
+		if rerr != nil {
+			c.sh.host.Marker("gosh: open refused target=" + c.args[0] +
+				" reason=" + rerr.Error())
+			c.out([]byte("gosh: open: " + c.args[0] + ": " + rerr.Error() + "\n"))
+			return 1
+		}
+		target = rp.canon
+	}
+	req, err := mime.Open(target, "/", c.sh.host.ReadFile)
 	if err != nil {
 		c.sh.host.Marker("gosh: open refused target=" + c.args[0] +
 			" reason=" + err.Error())
@@ -303,22 +325,9 @@ func bPwd(c *cmdCtx) int {
 	return 0
 }
 
-func bCd(c *cmdCtx) int {
-	target := "/"
-	if len(c.args) > 0 {
-		target = c.args[0]
-	}
-	if err := c.sh.host.Chdir(target); err != nil {
-		if oe, denial := deniedAs(err); denial {
-			c.out([]byte("gosh: cd: " + oe.path + ": " + oe.name + "\n"))
-		} else {
-			c.out([]byte("gosh: cd: " + target + ": not a directory\n"))
-		}
-		return 1
-	}
-	c.sh.env.Set("PWD", target)
-	return 0
-}
+// bCd lives in dirstack.go with the rest of M98d's navigation state:
+// `cd DIR`/`cd -`, the OLDPWD update shared with pushd/popd, and the
+// bounded directory stack.
 
 func bEnv(c *cmdCtx) int {
 	for _, v := range c.sh.env.List() {
@@ -415,6 +424,28 @@ func bRead(c *cmdCtx) int {
 		} else {
 			line, ok = string(c.stdin), true
 		}
+	} else if intr := c.sh.ttyPoll(); intr != nil {
+		// M98f: the interruptible tty read — the interrupter's stash IS
+		// the line's input (bytes other than 0x03 accumulate there).
+		var acc []byte
+		for len(acc) < 256 {
+			if intr.Interrupted() {
+				c.sh.host.Out([]byte("^C\r\n"))
+				return statusInterrupted // VAR stays unset
+			}
+			if ahead := intr.TypeAhead(); len(ahead) > 0 {
+				for _, b := range ahead {
+					if b == '\r' || b == '\n' {
+						c.sh.env.Set(c.args[0], string(acc))
+						return 0
+					}
+					acc = append(acc, b)
+				}
+				continue
+			}
+			c.sh.host.SleepTick()
+		}
+		line, ok = string(acc), true
 	} else {
 		line, ok = c.sh.host.ReadTTYLine()
 	}
@@ -425,53 +456,7 @@ func bRead(c *cmdCtx) int {
 	return 0
 }
 
-// bJobs lists the job table; finished jobs are reported once and removed.
-func bJobs(c *cmdCtx) int {
-	c.sh.ReapJobs()
-	for _, j := range append([]*Job{}, c.sh.jobs...) {
-		if j.Done {
-			c.out([]byte("[" + vsys.Itoa64(int64(j.N)) + "] Done: " + j.Display +
-				" (exit=" + vsys.Itoa64(j.Status) + ")\n"))
-			c.sh.removeJob(j)
-		} else {
-			c.out([]byte("[" + vsys.Itoa64(int64(j.N)) + "] running: " + j.Display + "\n"))
-		}
-	}
-	return 0
-}
-
-// bFg waits for one background job and propagates its exit status into $?.
-// There is no `bg` to return to (nothing suspends a guest job) and no
-// `wait` for the table as a whole — fg is the way you wait, the same
-// contract the kernel monitor's job table documents.
-func bFg(c *cmdCtx) int {
-	if len(c.args) != 1 {
-		c.out([]byte("gosh: fg N\n"))
-		return 2
-	}
-	id := strings.TrimPrefix(c.args[0], "%")
-	n, ok := parseInt(id)
-	if !ok {
-		c.out([]byte("gosh: fg N\n"))
-		return 2
-	}
-	j := c.sh.jobByN(n)
-	if j == nil {
-		c.out([]byte("fg: no such job\n"))
-		return 1
-	}
-	for !j.Done {
-		c.sh.ReapJobs()
-		if j.Done {
-			break
-		}
-		c.sh.host.SleepTick()
-	}
-	c.out([]byte("[" + vsys.Itoa64(int64(j.N)) + "] Done: " + j.Display +
-		" (exit=" + vsys.Itoa64(j.Status) + ")\n"))
-	c.sh.removeJob(j)
-	return int(j.Status)
-}
+// The jobs/fg/kill verbs live in jobctl.go (M98f).
 
 func bHistory(c *cmdCtx) int {
 	for i, h := range c.sh.hist.Entries() {
@@ -619,6 +604,8 @@ var helpCatalog = map[string]helpEntry{
 	"date":    {group: "shell", usage: "date", blurb: "show the firmware wall clock, or name the monotonic fallback", notes: "The calendar face carries the timezone setting's fixed offset (UTC by default); without a firmware epoch the command exits 1."},
 	"echo":    {group: "shell", usage: "echo [ARG...]", blurb: "write ARG... separated by single spaces and a newline", notes: "The engine expands $VAR, ${VAR} and $? before echo runs."},
 	"exit":    {group: "shell", usage: "exit [STATUS]", blurb: "leave GOSH with STATUS (the last status when omitted)"},
+	"alias":   {group: "shell", usage: "alias [NAME=VALUE ...]", blurb: "define or list session aliases", notes: "An unquoted head word naming an alias expands before the line runs — `\\name`, 'name' and \"name\" bypass it. Any builtin can be shadowed, including `exit` and `alias` itself."},
+	"unalias": {group: "shell", usage: "unalias NAME...|-a", blurb: "remove aliases (-a clears the table)"},
 	"help":    {group: "shell", usage: "help [CMD|GROUP]", blurb: "the grouped catalog, or one verb's usage and description"},
 	"history": {group: "shell", usage: "history", blurb: "list this session's submitted lines, oldest first"},
 	"log":     {group: "shell", usage: "log [APP]", blurb: "read one app's bounded log ring, or all app rings"},
@@ -627,7 +614,10 @@ var helpCatalog = map[string]helpEntry{
 
 	// files
 	"cat":    {group: "files", usage: "cat [FILE...]", blurb: "write FILE... (the bound stdin when none is named)"},
-	"cd":     {group: "files", usage: "cd [DIR]", blurb: "change the working directory (checked against the share)"},
+	"cd":     {group: "files", usage: "cd [DIR|-]", blurb: "change the working directory (checked against the share)", notes: "DIR resolves against PWD and `..` is resolved lexically. `cd -` returns to the previous directory. Arguments to an external app still resolve at the share root — the exec ABI carries no per-process cwd — so use an absolute path, or open PATH."},
+	"pushd":  {group: "files", usage: "pushd [DIR]", blurb: "change to DIR and push the old directory (bare: swap with the stack top)"},
+	"popd":   {group: "files", usage: "popd", blurb: "change to the directory stack's top entry and pop it"},
+	"dirs":   {group: "files", usage: "dirs", blurb: "print the directory stack, current directory first"},
 	"open":   {group: "files", usage: "open PATH|URL", blurb: "open a file with its MIME handler or an HTTPS URL in WEB.ELF", notes: "Supports local paths, file://, and https://. Other URL schemes are refused by name."},
 	"pwd":    {group: "files", usage: "pwd", blurb: "print the working directory"},
 	"read":   {group: "files", usage: "read VAR", blurb: "read one line into VAR, preferring the bound stdin"},
@@ -648,8 +638,9 @@ var helpCatalog = map[string]helpEntry{
 	"continue": {group: "scripts", usage: "continue", blurb: "skip to the innermost loop's next iteration"},
 
 	// jobs
-	"jobs":  {group: "jobs", usage: "jobs", blurb: "list the shell's jobs (done jobs are reaped as they are shown)"},
+	"jobs":  {group: "jobs", usage: "jobs [-l]", blurb: "list the shell's jobs (done jobs are reaped as they are shown)"},
 	"fg":    {group: "jobs", usage: "fg N", blurb: "bring job N to the foreground and wait for it"},
+	"kill":  {group: "jobs", usage: "kill [%N|PID]...", blurb: "terminate a background job or process (Ctrl-C interrupts the foreground)"},
 	"sleep": {group: "jobs", usage: "sleep SECONDS", blurb: "park the shell for SECONDS (0..60)"},
 
 	// identity (ADR 0024)
@@ -667,6 +658,12 @@ var helpCatalog = map[string]helpEntry{
 	"cut":  {group: "tools", usage: "cut -f LIST [-d C] [FILE...]", blurb: "select fields by LIST ('-d C' sets the delimiter, tab by default)"}, "printf": {group: "tools", usage: "printf FORMAT [ARGS...]", blurb: `write FORMAT with %s/%d/%% substitutions and the escapes \n \t \r \e \xHH \\ \0 (unknown escapes stay literal)`},
 	"test": {group: "tools", usage: "test EXPR", blurb: "evaluate EXPR and set $? (no output)"},
 	"[":    {group: "tools", usage: "[ EXPR ]", blurb: "evaluate EXPR and set $? (the closing ] is required)"},
+	// M98e (issue #2131): the filter-loop composers.
+	"tee":      {group: "tools", usage: "tee [-a] FILE...", blurb: "copy stdin to stdout and each FILE (at most 4)", notes: "Needs piped or redirected input — bare `tee F` refuses rather than truncate F."},
+	"xargs":    {group: "tools", usage: "xargs [-n N] CMD [ARG...]", blurb: "run CMD once per chunk of stdin lines", notes: "One non-empty line is one item — no quoting or splitting, so names may contain spaces (not POSIX). An external CMD under a redirect or $( ) is refused: its output cannot be captured."},
+	"tr":       {group: "tools", usage: "tr [-d] SET1 [SET2]", blurb: "map or delete stdin bytes (a-z ranges; \\n \\t \\\\ escapes)", notes: "[:class:] is refused. Quote bracketed sets — an unquoted [...] word globs."},
+	"basename": {group: "tools", usage: "basename PATH [SUFFIX]", blurb: "the last component of PATH, minus SUFFIX", notes: "Pure string op — no filesystem access."},
+	"dirname":  {group: "tools", usage: "dirname PATH", blurb: "PATH minus its last component", notes: "Pure string op — no filesystem access."},
 
 	// externals: the verb, then the Go net CLIs a daily user reaches from
 	// this prompt by name (M71n #1573 — `exec GOTGIT.ELF` and `exec
@@ -816,9 +813,10 @@ func bMonitor(c *cmdCtx) int {
 	return 0
 }
 
-// bSleep parks the shell for about n seconds (the scheduler runs at about
-// 100 Hz; the glue converts seconds to ticks). Bound at 60 so a typo can
-// not wedge the front-end forever.
+// bSleep parks the shell for about n "seconds" — at the glue's 100:1
+// conversion that is 100·n of the kernel's 1 Hz ticks, so `sleep 1` is a
+// ~100 s park today (pre-existing; observed on VZ 2026-10-11). The 60
+// bound still applies; on an interactive host Ctrl-C is now the escape.
 func bSleep(c *cmdCtx) int {
 	if len(c.args) != 1 {
 		c.out([]byte("gosh: sleep SECONDS\n"))
@@ -830,6 +828,18 @@ func bSleep(c *cmdCtx) int {
 		return 2
 	}
 	if n > 0 {
+		if intr := c.sh.ttyPoll(); intr != nil {
+			// M98f: tick-granular so Ctrl-C ends the sleep (the blocking
+			// SleepSeconds would hold the whole duration).
+			for i := 0; i < n*ticksPerSleepSecond; i++ {
+				if intr.Interrupted() {
+					c.sh.host.Out([]byte("^C\r\n"))
+					return statusInterrupted
+				}
+				c.sh.host.SleepTick()
+			}
+			return 0
+		}
 		c.sh.host.SleepSeconds(n)
 	}
 	return 0

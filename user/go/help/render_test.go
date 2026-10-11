@@ -26,7 +26,7 @@ func TestBrowseFrameShape(t *testing.T) {
 	}
 	// The selected row is the slab, and rows carry their group tag.
 	body := strings.Join(lines, "\n")
-	if !strings.Contains(body, "> clear") {
+	if !strings.Contains(body, "> alias") {
 		t.Errorf("first row is not the selection slab")
 	}
 	if !strings.Contains(body, "shell") {
@@ -41,6 +41,7 @@ func TestDetailFrameIsAccentText(t *testing.T) {
 	m := testModel()
 	key(&m, kDown)
 	key(&m, kDown)
+	key(&m, kDown) // M98b's `alias` row sorts one slot ahead of `echo`
 	key(&m, kEnter)
 	lines := m.renderLines()
 	if len(lines) != m.rows {

@@ -55,16 +55,16 @@ func hasLine(lines []string, want string) bool {
 func TestBootMarkers(t *testing.T) {
 	m := newModel(64, 23)
 	got := m.drain()
-	// n=48 is the catalog row count (M83b adds the `time` builtin);
+	// n=59 is the catalog row count (M83b adds the `time` builtin);
 	// a catalog change trips this AND the class-B gate deliberately — both
 	// are the drift tripwire for shlib.HelpRows.
-	if !hasLine(got, "gohelp: catalog n=48") {
+	if !hasLine(got, "gohelp: catalog n=59") {
 		t.Errorf("boot markers missing catalog count: %v", got)
 	}
 	if !hasLine(got, "gohelp: docs n=0") {
 		t.Errorf("boot markers missing docs count (host has no bundle): %v", got)
 	}
-	if !hasLine(got, "gohelp: focus clear group=shell") {
+	if !hasLine(got, "gohelp: focus alias group=shell") {
 		t.Errorf("boot markers missing initial focus: %v", got)
 	}
 }
@@ -74,7 +74,7 @@ func TestGroupJumps(t *testing.T) {
 	if got := key(&m, runeKey('l')); !hasLine(got, "gohelp: focus . group=files") {
 		t.Errorf("l did not jump to the files group head: %v", got)
 	}
-	if got := key(&m, runeKey('h')); !hasLine(got, "gohelp: focus clear group=shell") {
+	if got := key(&m, runeKey('h')); !hasLine(got, "gohelp: focus alias group=shell") {
 		t.Errorf("h did not jump back to the shell group head: %v", got)
 	}
 }
@@ -156,7 +156,7 @@ func TestFilterFlow(t *testing.T) {
 		t.Errorf("filter ec matched %v, want echo,secrets,exec", names)
 	}
 	got = key(&m, kEsc)
-	if !hasLine(got, "gohelp: filter cleared n=48") {
+	if !hasLine(got, "gohelp: filter cleared n=59") {
 		t.Errorf("escape did not clear the filter: %v", got)
 	}
 	if m.filter != "" || m.filtering {
@@ -166,6 +166,7 @@ func TestFilterFlow(t *testing.T) {
 
 func TestDetailFlow(t *testing.T) {
 	m := testModel()
+	key(&m, runeKey('j')) // M98b's `alias` now leads the shell group
 	key(&m, runeKey('j')) // date now sits between clear and echo
 	if got := key(&m, runeKey('j')); !hasLine(got, "gohelp: focus echo group=shell") {
 		t.Fatalf("second j did not focus echo: %v", got)

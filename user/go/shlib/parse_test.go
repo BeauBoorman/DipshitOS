@@ -79,7 +79,7 @@ func TestParsePlanPins(t *testing.T) {
 	build := func(line string) *plan {
 		t.Helper()
 		toks := mustTokens(t, line)
-		p, err := parsePlan(toks, env, 0)
+		p, err := parsePlan(toks, env, 0, nil)
 		if err != nil {
 			t.Fatalf("parsePlan(%q): %v", line, err)
 		}
