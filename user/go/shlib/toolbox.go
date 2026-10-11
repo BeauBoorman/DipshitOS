@@ -5,9 +5,11 @@
 package shlib
 
 import (
+	"errors"
 	"sort"
 	"strings"
 
+	"virelai/vi"
 	"virelai/vsys"
 )
 
@@ -17,6 +19,9 @@ func init() {
 	tools = map[string]func(*cmdCtx) int{
 		"wc": tWc, "head": tHead, "tail": tTail, "grep": tGrep,
 		"sort": tSort, "cut": tCut, "printf": tPrintf, "test": tTest, "[": tTest,
+		// M98e (issue #2131): the filter-loop composers.
+		"tee": tTee, "xargs": tXargs, "tr": tTr,
+		"basename": tBasename, "dirname": tDirname,
 	}
 }
 
@@ -30,12 +35,14 @@ func toolInput(c *cmdCtx, files []string) ([]byte, int) {
 	for _, f := range files {
 		b, err := c.sh.readBounded(f)
 		if err != nil {
+			// c.name is the tool; c.args[0] is its first flag — the old
+			// text printed the flag as the command (M98e fixup).
 			if err == errTooLarge {
-				c.out([]byte("gosh: " + c.args[0] + ": " + f + ": " + errTooLarge.Error() + "\n"))
+				c.out([]byte("gosh: " + c.name + ": " + f + ": " + errTooLarge.Error() + "\n"))
 			} else if msg := resolveDenial(err); msg != "" {
-				c.out([]byte("gosh: " + c.args[0] + ": " + f + ": " + msg + "\n"))
+				c.out([]byte("gosh: " + c.name + ": " + f + ": " + msg + "\n"))
 			} else {
-				c.out([]byte("gosh: " + c.args[0] + ": " + f + ": not found\n"))
+				c.out([]byte("gosh: " + c.name + ": " + f + ": not found\n"))
 			}
 			return nil, 1
 		}
@@ -535,4 +542,341 @@ func tTest(c *cmdCtx) int {
 		return 0
 	}
 	return 1
+}
+
+// --- M98e (issue #2131): tee, xargs, tr, basename, dirname --------------
+//
+// The filter-loop composers. tee fans stdin out to the terminal and the
+// crash-safe publish seam; xargs drives one command per chunk of input
+// lines through the same classify switch runSingle uses; tr rewrites
+// bytes; basename/dirname are pure POSIX string ops with no filesystem
+// access.
+
+const (
+	teeMaxFiles   = 4
+	xargsMaxRuns  = 16
+	xargsDefItems = 64
+)
+
+// tTee copies its bound stdin to c.out and to each FILE — the crash-safe
+// host.WriteFile publish, `-a` for append. Unbound stdin is refused
+// rather than risk truncating a file on a typo.
+func tTee(c *cmdCtx) int {
+	appendMode := false
+	var files []string
+	for _, a := range c.args {
+		if a == "-a" {
+			appendMode = true
+			continue
+		}
+		files = append(files, a)
+	}
+	if len(files) > teeMaxFiles {
+		c.out([]byte("gosh: tee: too many files (at most " + vsys.Itoa64(teeMaxFiles) + ")\n"))
+		return 2
+	}
+	if !c.stdinBound {
+		c.out([]byte("gosh: tee: no input (pipe or redirect into tee)\n"))
+		return 2
+	}
+	c.out(c.stdin)
+	st := 0
+	for _, f := range files {
+		rp, err := c.sh.resolvePath(f)
+		if err != nil {
+			c.out([]byte("gosh: tee: " + f + ": " + err.Error() + "\n"))
+			st = 1
+			continue
+		}
+		if err := c.sh.host.WriteFile(rp.host, c.stdin, appendMode); err != nil {
+			c.out([]byte("gosh: tee: " + f + ": write failed\n"))
+			st = 1
+		}
+	}
+	return st
+}
+
+// tXargs runs `CMD ARG...` once per chunk of stdin items. One non-empty
+// input line is one item — no quote processing and no whitespace
+// splitting, so names can contain spaces (deliberately not POSIX). Items
+// are literal: no globbing, no variable expansion. In-process commands
+// (builtins, tools, functions) run through runSingle's classify switch
+// with stdin: nil — the kernel pipe was already drained into c.stdin —
+// writing to xargs' own c.out so the output stays pipe- and
+// redirect-visible. Externals go through runExternal.
+func tXargs(c *cmdCtx) int {
+	args := c.args
+	n := xargsDefItems
+	if len(args) > 0 && args[0] == "-n" {
+		v, ok := 0, false
+		if len(args) >= 2 {
+			v, ok = parseInt(args[1])
+		}
+		if !ok || v < 1 {
+			c.out([]byte("gosh: xargs: usage: xargs [-n N] CMD [ARG...]\n"))
+			return 2
+		}
+		n = v
+		args = args[2:]
+	}
+	if len(args) == 0 {
+		c.out([]byte("gosh: xargs: usage: xargs [-n N] CMD [ARG...]\n"))
+		return 2
+	}
+	if !c.stdinBound || len(c.stdin) == 0 {
+		return 0
+	}
+	name := args[0]
+	fixed := args[1:]
+	external := classify(name) == 2 && c.sh.funcs.find(name) == nil
+	var items []string
+	for _, ln := range strings.Split(string(c.stdin), "\n") {
+		ln = strings.TrimSuffix(ln, "\r")
+		if ln != "" {
+			items = append(items, ln)
+		}
+	}
+	chunk := n
+	if external {
+		if c.outCaptured {
+			c.out([]byte("gosh: xargs: cannot capture an external app's output\n"))
+			return 1
+		}
+		chunk = vi.ExecMaxArgs - len(fixed)
+		if chunk < 1 {
+			c.out([]byte("gosh: xargs: too many fixed arguments (argv cap is " +
+				vsys.Itoa64(vi.ExecMaxArgs) + ")\n"))
+			return 2
+		}
+		if n < chunk {
+			chunk = n
+		}
+		for _, it := range items {
+			if len(it) > vi.ExecArgMax {
+				c.out([]byte("gosh: xargs: item exceeds the " +
+					vsys.Itoa64(vi.ExecArgMax) + "-byte argv slot\n"))
+				return 2
+			}
+		}
+	}
+	runs := (len(items) + chunk - 1) / chunk
+	if runs > xargsMaxRuns {
+		c.out([]byte("gosh: xargs: more than " + vsys.Itoa64(xargsMaxRuns) + " invocations\n"))
+		return 2
+	}
+	anyFail := false
+	for i := 0; i < len(items); i += chunk {
+		end := i + chunk
+		if end > len(items) {
+			end = len(items)
+		}
+		argv := make([]string, 0, len(fixed)+end-i)
+		argv = append(argv, fixed...)
+		argv = append(argv, items[i:end]...)
+		st, err, act := c.sh.xargsInvoke(name, argv, c.out, c.outCaptured)
+		if act != ActionContinue {
+			rearmAction(c.sh, act)
+			return st
+		}
+		if err != nil {
+			return 127 // the external could not be run at all
+		}
+		if st != 0 {
+			anyFail = true
+		}
+	}
+	if anyFail {
+		return 123
+	}
+	return 0
+}
+
+// xargsInvoke runs one chunk through the same dispatch runSingle uses:
+// builtins and tools in-process, functions through their body, externals
+// through the foreground exec path. stdin stays nil — this process's
+// kernel pipe was already drained — and the chunk writes to xargs' own
+// out so the pipe/redirect/capture sees it.
+func (s *Shell) xargsInvoke(name string, argv []string, out func([]byte), captured bool) (int, error, Action) {
+	switch classify(name) {
+	case 0, 1:
+		st, act := s.runBuiltin(name, &cmdCtx{sh: s, args: argv, out: out,
+			outCaptured: captured})
+		return st, nil, act
+	}
+	if f := s.funcs.find(name); f != nil {
+		s.bindFuncArgs(f, argv)
+		st, act := s.runFuncBody(f, 0)
+		return st, nil, act
+	}
+	st, err := s.runExternal(name, argv)
+	return st, err, ActionContinue
+}
+
+// rearmAction hands an exit/monitor request raised by a nested invocation
+// back to the outer runBuiltin, which maps them into the line's Action.
+func rearmAction(s *Shell, act Action) {
+	switch act {
+	case ActionExit:
+		s.exitReq = true
+	case ActionMonitor:
+		s.monitorRq = true
+	}
+}
+
+// tTr maps or deletes bytes on stdin. SETs take a-z ranges and the \n,
+// \t and \\ escapes; brackets are literal, so [:class:] is refused as
+// unsupported rather than mis-mapped. A short SET2 pads with its last
+// byte, as GNU tr does. tr takes no file arguments — stdin only.
+func tTr(c *cmdCtx) int {
+	args := c.args
+	del := false
+	if len(args) > 0 && args[0] == "-d" {
+		del = true
+		args = args[1:]
+	}
+	if (del && len(args) != 1) || (!del && len(args) != 2) {
+		c.out([]byte("gosh: tr: usage: tr [-d] SET1 [SET2]\n"))
+		return 2
+	}
+	set1, err := trSet(args[0])
+	if err != nil {
+		c.out([]byte("gosh: tr: " + err.Error() + "\n"))
+		return 2
+	}
+	in := c.stdin
+	if del {
+		var drop [256]bool
+		for _, b := range set1 {
+			drop[b] = true
+		}
+		out := make([]byte, 0, len(in))
+		for _, b := range in {
+			if !drop[b] {
+				out = append(out, b)
+			}
+		}
+		c.out(out)
+		return 0
+	}
+	set2, err := trSet(args[1])
+	if err != nil {
+		c.out([]byte("gosh: tr: " + err.Error() + "\n"))
+		return 2
+	}
+	if len(set2) == 0 {
+		c.out([]byte("gosh: tr: SET2 is empty\n"))
+		return 2
+	}
+	for len(set2) < len(set1) {
+		set2 = append(set2, set2[len(set2)-1])
+	}
+	var table [256]byte
+	for i := range table {
+		table[i] = byte(i)
+	}
+	for i, b := range set1 {
+		table[b] = set2[i]
+	}
+	out := make([]byte, len(in))
+	for i, b := range in {
+		out[i] = table[b]
+	}
+	c.out(out)
+	return 0
+}
+
+// trSet expands one tr operand into bytes: a-z ranges (inclusive, with
+// the endpoints in order), and the \n, \t and \\ escapes. `[:` refuses —
+// character classes are unsupported and would silently mis-map.
+func trSet(s string) ([]byte, error) {
+	if strings.Contains(s, "[:") {
+		return nil, errors.New("[:class:] sets are not supported")
+	}
+	var out []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				out = append(out, '\n')
+			case 't':
+				out = append(out, '\t')
+			case '\\':
+				out = append(out, '\\')
+			default:
+				return nil, errors.New("bad escape \\" + s[i+1:i+2])
+			}
+			i++
+			continue
+		}
+		if i+2 < len(s) && s[i+1] == '-' {
+			if s[i+2] < c {
+				return nil, errors.New("range " + s[i:i+3] + " is descending")
+			}
+			for b := c; b <= s[i+2]; b++ {
+				out = append(out, b)
+			}
+			i += 2
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// tBasename and tDirname are POSIX string ops: trailing slashes first,
+// then the last component split. No filesystem access, no PWD.
+func tBasename(c *cmdCtx) int {
+	if len(c.args) < 1 || len(c.args) > 2 {
+		c.out([]byte("gosh: basename: usage: basename PATH [SUFFIX]\n"))
+		return 2
+	}
+	name := posixBase(c.args[0])
+	if len(c.args) == 2 {
+		suf := c.args[1]
+		if suf != name && strings.HasSuffix(name, suf) {
+			name = name[:len(name)-len(suf)]
+		}
+	}
+	c.out([]byte(name + "\n"))
+	return 0
+}
+
+func tDirname(c *cmdCtx) int {
+	if len(c.args) != 1 {
+		c.out([]byte("gosh: dirname: usage: dirname PATH\n"))
+		return 2
+	}
+	c.out([]byte(posixDir(c.args[0]) + "\n"))
+	return 0
+}
+
+func posixBase(p string) string {
+	if p == "" {
+		return "."
+	}
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return "/"
+	}
+	return p[strings.LastIndexByte(p, '/')+1:]
+}
+
+func posixDir(p string) string {
+	if p == "" {
+		return "."
+	}
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return "/"
+	}
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return "."
+	}
+	p = strings.TrimRight(p[:i], "/")
+	if p == "" {
+		return "/"
+	}
+	return p
 }
