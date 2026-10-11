@@ -297,6 +297,7 @@ type Shell struct {
 	capture   *[]byte // non-nil while a `$(...)` is collecting output
 	loopBreak bool
 	loopCont  bool
+	dirstack  []string // M98d pushd/popd stack, canonical paths, top at end
 }
 
 // NewShell wires a fresh interpreter; hist may be shared with the editor.
@@ -319,8 +320,14 @@ func (s *Shell) Pwd() string {
 }
 
 // RunLine interprets one command line and returns (status, Action). An
-// empty or comment-only line is a no-op that leaves $? alone.
-func (s *Shell) RunLine(line string) (int, Action) { return s.runLine(line, 0) }
+// empty or comment-only line is a no-op that leaves $? alone. The
+// escMark strip lives here — at the true entry point — and in runSource,
+// because runLine is also the recursion point for chain segments,
+// construct bodies and if/while conditions: text those paths carry may
+// legitimately hold marks that $(...) splicing inserted (M98a marks
+// captured glob metacharacters literal), and stripping on every entry
+// would silently un-literal them a hop later.
+func (s *Shell) RunLine(line string) (int, Action) { return s.runLine(stripEscMarks(line), 0) }
 
 // stripEscMarks removes the tokenizer's literal-byte sentinel from a raw
 // line. escMark only ever means "this byte was quoted" within one parse, so
@@ -346,7 +353,7 @@ func stripEscMarks(line string) string {
 // substitution, if/for/while/case, `;`/`&&`/`||` chains, then the
 // per-segment pipeline/redirect/simple path.
 func (s *Shell) runLine(raw string, depth int) (int, Action) {
-	line := trimSpace(stripEscMarks(raw))
+	line := trimSpace(raw)
 	if line == "" {
 		return s.status, ActionContinue
 	}
@@ -464,7 +471,7 @@ func (s *Shell) runSegment(line string, depth int) (int, Action) {
 		// check below could catch it.
 		return s.status, ActionContinue
 	}
-	p, err := parsePlan(toks, s.env, s.status)
+	p, err := parsePlan(toks, s.env, s.status, s.globWord)
 	if err != nil {
 		s.fail(err.Error())
 		s.status = 1
@@ -549,7 +556,7 @@ func (s *Shell) commandSubst(line string, depth int) (string, Action) {
 	if act != ActionContinue {
 		return line, act
 	}
-	return c.prefix + out + c.suffix, ActionContinue
+	return c.prefix + markGlobLiteral(out) + c.suffix, ActionContinue
 }
 
 // captureLine runs one line with its output collected, returning that text
@@ -630,9 +637,23 @@ func (s *Shell) runIf(st ifStmt, depth int) (int, Action) {
 }
 
 // runFor runs `for VAR in W...; do BODY; done`, unsetting VAR afterwards
-// exactly as sh.zig did (the loop variable does not leak).
+// exactly as sh.zig did (the loop variable does not leak). The word list
+// gets its own glob pass here (M98a): parseFor keeps raw text, so this is
+// where `for f in *.SH` becomes real names — and where the same refusal
+// fires when the expansion would exceed the 16-word bound.
 func (s *Shell) runFor(st forStmt, depth int) (int, Action) {
-	for _, w := range st.words {
+	words, gerr := s.forWordExpand(st.words)
+	if gerr != nil {
+		s.fail(gerr.Error())
+		s.status = 1
+		return 1, ActionContinue
+	}
+	if len(words) > forWordMax {
+		s.fail("for word list too long (at most " + vsys.Itoa64(forWordMax) + " words)")
+		s.status = 2
+		return 2, ActionContinue
+	}
+	for _, w := range words {
 		s.env.Set(st.varName, w)
 		s.clearLoopFlags()
 		_, brk, act := s.runBody(st.body, depth)
@@ -682,7 +703,8 @@ func (s *Shell) runWhile(st whileStmt, depth int) (int, Action) {
 func (s *Shell) runCase(st caseStmt, depth int) (int, Action) {
 	subject := expand(token{kind: tokWord, text: st.subject}, s.env, s.status)
 	for _, arm := range st.arms {
-		if caseMatch(arm.pattern, subject) {
+		pat, pact := marksToFlags(arm.pattern)
+		if caseMatchFlagged(pat, pact, subject) {
 			_, _, act := s.runBody(arm.body, depth)
 			return s.status, act
 		}
@@ -756,7 +778,7 @@ func (s *Shell) runSource(path string, depth int) (int, Action) {
 		if strings.TrimSpace(ln) == "" {
 			continue
 		}
-		st, act := s.runLine(ln, depth+1)
+		st, act := s.runLine(stripEscMarks(ln), depth+1)
 		if act != ActionContinue {
 			return st, act
 		}

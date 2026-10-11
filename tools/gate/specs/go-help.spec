@@ -90,9 +90,9 @@ vgate_assert 01 serial-contains 'gohelp: ready'
 vgate_assert 01 serial-contains 'gohelp: present'
 
 # The catalog came from shlib.HelpRows — single-sourced from GOSH's
-# helpCatalog (n=48 is the drift tripwire; model_test.go pins the same
+# helpCatalog (n=51 is the drift tripwire; model_test.go pins the same
 # number on the host), and the seeded docs bundle is visible.
-vgate_assert 01 serial-contains 'gohelp: catalog n=48'
+vgate_assert 01 serial-contains 'gohelp: catalog n=51'
 vgate_assert 01 serial-contains 'gohelp: docs n=2'
 
 # The window itself: native rect on the kernel desktop (dui from script2,
@@ -118,7 +118,7 @@ vgate_assert 01 serial-contains 'gohelp: doc GUIDE.TXT bytes=26'
 vgate_assert 01 serial-contains 'gohelp: browse'
 vgate_assert 01 serial-contains 'gohelp: filter on'
 vgate_assert 01 serial-contains 'gohelp: filter ec n=3'
-vgate_assert 01 serial-contains 'gohelp: filter cleared n=48'
+vgate_assert 01 serial-contains 'gohelp: filter cleared n=51'
 
 # Key labels line up with the chord table verbatim.
 vgate_assert 01 serial-contains 'gohelp: key d'
