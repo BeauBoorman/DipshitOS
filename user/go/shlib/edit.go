@@ -107,6 +107,7 @@ const (
 	EvSubmit
 	EvEOF    // Ctrl-D on an empty line
 	EvCancel // Ctrl-C: the line was abandoned
+	EvEdit   // Ctrl-X Ctrl-E: hand the line to GOEDIT.ELF, run what it saves
 )
 
 // EditEvent carries at most one editor outcome per Feed.
@@ -147,7 +148,11 @@ type Editor struct {
 	menuPage  int
 	menuAt    int
 	menuOn    bool
-	cols      int
+	// cx is the one-shot Ctrl-X prefix (M98h): armed by 0x18, spent by the
+	// next byte whatever it is — 0x05 produces EvEdit, anything else is
+	// processed normally as if the prefix never happened.
+	cx   bool
+	cols int
 	// kill ring + consecutive-kill merge (M80l #1728). One entry is the
 	// minimum readline contract: every kill (Ctrl-K/U/W, alt-d,
 	// alt-backspace) parks what it removed, and a kill that continues the
@@ -581,6 +586,13 @@ func (e *Editor) searchExit(accept bool) []byte {
 
 // keyGround handles one non-CSI byte in the ground state.
 func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
+	if e.cx {
+		e.cx = false
+		if b == 0x05 {
+			return e.keyEditLine()
+		}
+		// Any other byte drops the prefix and is processed normally.
+	}
 	switch b {
 	case 0x1b:
 		e.state = edEsc
@@ -634,6 +646,9 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 		return e.keyHome()
 	case 0x05: // Ctrl-E
 		return e.keyEnd()
+	case 0x18: // Ctrl-X: arm the one-shot prefix (Ctrl-X Ctrl-E edits)
+		e.cx = true
+		return nil, EditEvent{}
 	case 0x0b: // Ctrl-K: kill to end
 		return e.killRegion(e.cur, len(e.buf), killForward)
 	case 0x15: // Ctrl-U: kill to start
@@ -823,6 +838,21 @@ func (e *Editor) keyTab() ([]byte, EditEvent) {
 	e.menuPage = 0
 	e.menuOn = true
 	return e.menuPaint(), EditEvent{}
+}
+
+// keyEditLine is Ctrl-X Ctrl-E (M98h): the buffer leaves the editor for
+// GOEDIT.ELF, carried on EvEdit the way EvSubmit carries a line. The buffer
+// clears the way submit's does — if the round trip fails the front-end puts
+// the line back — and the painted row ends with a newline for the editor's
+// own output.
+func (e *Editor) keyEditLine() ([]byte, EditEvent) {
+	e.breakKill()
+	line := string(e.buf)
+	e.buf = e.buf[:0]
+	e.cur = 0
+	e.hview = -1
+	e.lastLen = 0
+	return []byte("\r\n"), EditEvent{Kind: EvEdit, Line: line}
 }
 
 // ins inserts ins at the cursor unless that would pass the line cap, in

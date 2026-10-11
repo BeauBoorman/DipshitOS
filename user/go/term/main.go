@@ -137,6 +137,15 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 	sh := shlib.NewShell(hst, hist)
 	policy := loadRestartPolicy()
 
+	// M98h: the tab title follows the cwd — one tracker for the window's
+	// whole life (a shell restart keeps the seat, and the title it last
+	// sent). Sync after each startup contract and after every submitted
+	// line; the tracker sends only on change.
+	titles := &shlib.TitleSync{}
+	sendTitle := func(s string) bool {
+		return ta != nil && ta.TabAware && ta.SetTabTitle(s)
+	}
+
 	// A terminal owns the window; a shell is one guest in that window. Keep
 	// the same fd, host, and history across restarts so the new shell has
 	// the same terminal contract and recall, but none of the old shell's
@@ -151,6 +160,7 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 				leave(ta, fd, sh, act)
 			}
 		}
+		titles.Sync(shlib.TitleFor("Term", sh.Pwd()), sendTitle)
 
 		editor := shlib.NewEditor(loadPrompt(), hist)
 		editor.Complete = shlib.NewCompleter(sh, hst)
@@ -182,48 +192,71 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 		// feeding until the editor has nothing left: the kernel's input queue
 		// can deliver several whole lines in a single read.
 		var handle func([]byte, shlib.EditEvent)
+		submit := func(line string) {
+			eofPending = false
+			vi.ConsoleLine(markerLine + line)
+			shlib.SaveHistory(hst, hist, line, sink)
+			if closeRequested(line) {
+				vi.ConsoleLine(markerDone + "0")
+				shutdown(ta, fd, 0)
+				return
+			}
+			st, act := sh.RunLine(line)
+			// Only AFTER the engine answered: the gate sequences on this,
+			// so it can never claim an execution that did not happen.
+			vi.ConsoleLine(markerDone + vi.Itoa64(int64(st)))
+			if act == shlib.ActionExit && policy == restartStay {
+				writeTTY(fd, []byte(restartMessage(st)))
+				restart = true
+			} else if act != shlib.ActionContinue {
+				leave(ta, fd, sh, act)
+			}
+			if !restart {
+				// At the cursor, no CR — a CR repaint would overwrite the
+				// truecolour row's cells (the M73h assert scans x64..79 of
+				// grid row 2), where the shell loop's bare prompt lands at
+				// x>=80 as the original gate observed. The template is
+				// re-read (a mid-session goset change still lands) and
+				// re-expanded against the facts NOW — the command may have
+				// been `cd` — and the editor's own bytes are written, so
+				// this prompt is the one the next in-line repaint uses.
+				editor.SetPrompt(loadPrompt())
+				writeTTY(fd, editor.PromptBytes())
+				// M98h: the tab title follows the cwd.
+				titles.Sync(shlib.TitleFor("Term", sh.Pwd()), sendTitle)
+				// M98f: bytes typed while a foreground child ran sit
+				// in the interrupter's stash — feed them before the
+				// next FileRead.
+				if p := hst.TTYInterrupter(); p != nil {
+					if ahead := p.TypeAhead(); len(ahead) > 0 {
+						handle(editor.Feed(ahead))
+					}
+				}
+			}
+		}
 		handle = func(out []byte, ev shlib.EditEvent) {
 			if len(out) > 0 {
 				writeTTY(fd, out)
 			}
 			switch ev.Kind {
 			case shlib.EvSubmit:
+				submit(ev.Line)
+			case shlib.EvEdit:
 				eofPending = false
-				vi.ConsoleLine(markerLine + ev.Line)
-				shlib.SaveHistory(hst, hist, ev.Line, sink)
-				if closeRequested(ev.Line) {
-					vi.ConsoleLine(markerDone + "0")
-					shutdown(ta, fd, 0)
-					return
+				// M98h: Ctrl-X Ctrl-E hands the line to GOEDIT. Each returned
+				// line goes through the same submit path; a failed round trip
+				// says so and puts the original line back.
+				lines, err := sh.EditLine(ev.Line)
+				if err != nil {
+					writeTTY(fd, []byte("gosh: edit: "+err.Error()+"; line not run\r\n"))
+					editor.SetValue(ev.Line)
+					writeTTY(fd, editor.Repaint())
+					break
 				}
-				st, act := sh.RunLine(ev.Line)
-				// Only AFTER the engine answered: the gate sequences on this,
-				// so it can never claim an execution that did not happen.
-				vi.ConsoleLine(markerDone + vi.Itoa64(int64(st)))
-				if act == shlib.ActionExit && policy == restartStay {
-					writeTTY(fd, []byte(restartMessage(st)))
-					restart = true
-				} else if act != shlib.ActionContinue {
-					leave(ta, fd, sh, act)
-				}
-				if !restart {
-					// At the cursor, no CR — a CR repaint would overwrite the
-					// truecolour row's cells (the M73h assert scans x64..79 of
-					// grid row 2), where the shell loop's bare prompt lands at
-					// x>=80 as the original gate observed. The template is
-					// re-read (a mid-session goset change still lands) and
-					// re-expanded against the facts NOW — the command may have
-					// been `cd` — and the editor's own bytes are written, so
-					// this prompt is the one the next in-line repaint uses.
-					editor.SetPrompt(loadPrompt())
-					writeTTY(fd, editor.PromptBytes())
-					// M98f: bytes typed while a foreground child ran sit
-					// in the interrupter's stash — feed them before the
-					// next FileRead.
-					if p := hst.TTYInterrupter(); p != nil {
-						if ahead := p.TypeAhead(); len(ahead) > 0 {
-							handle(editor.Feed(ahead))
-						}
+				for _, ln := range lines {
+					submit(ln)
+					if restart {
+						return
 					}
 				}
 			case shlib.EvEOF:
@@ -558,6 +591,15 @@ func (g *termHost) WriteFile(path string, b []byte, appendMode bool) error {
 		if r == -vi.ErrEACCES || r == -vi.ErrENOENT || r == -vi.ErrENAMETOOLONG {
 			return shlib.ErrNotFound
 		}
+		return shlib.ErrWriteFailed
+	}
+	return nil
+}
+
+// DeleteFile removes path (slot delete) — an absent file is not an error,
+// matching WriteFilePublish's absent-fails-closed readers.
+func (g *termHost) DeleteFile(path string) error {
+	if r := vi.FileDelete(path); r < 0 && r != -vi.ErrENOENT {
 		return shlib.ErrWriteFailed
 	}
 	return nil

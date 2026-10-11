@@ -285,6 +285,13 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 	// every keystroke.
 	editor.SetPromptFacts(shlib.PromptFactsFor(sh, hst.Principal, shlib.PromptHost(settingsBody())))
 
+	// M98h: the tab title follows the cwd. Sync after the startup contract
+	// (a PROFILE.SH `cd` retitles) and after every submitted line.
+	titles := &shlib.TitleSync{}
+	sendTitle := func(s string) bool {
+		return ta != nil && ta.TabAware && ta.SetTabTitle(s)
+	}
+
 	// The startup contract (M49 SD2): STARTUP.SH, then PROFILE.SH, silent
 	// when either is missing, every line through the same engine.
 	for _, ln := range startupLines() {
@@ -294,6 +301,7 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 			leave(ta, fd, sh, act)
 		}
 	}
+	titles.Sync(shlib.TitleFor("Sh", sh.Pwd()), sendTitle)
 
 	// M69f1 (#1537): seed recall from the share AFTER the startup contract
 	// and BEFORE the first prompt, so the startup lines never enter recall
@@ -311,37 +319,56 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 	// after its first line would leave the rest typed but never run. The
 	// var declaration lets the EvSubmit branch recurse for type-ahead.
 	var handle func([]byte, shlib.EditEvent)
+	submit := func(line string) {
+		vi.ConsoleLine(markerLine + line)
+		shlib.SaveHistory(hst, hist, line, sink)
+		_, act := sh.RunLine(line)
+		if act != shlib.ActionContinue {
+			leave(ta, fd, sh, act)
+		}
+		// M73d (#1628): the editor's submit echo is a bare \r\n now;
+		// the front-end paints the fresh prompt AFTER the command's
+		// output — the reference shell loop's order (SH.BIN/TERM.BIN),
+		// and what keeps a screen-clearing command from erasing the
+		// prompt with nothing to repaint it. At the cursor, no CR: a
+		// CR repaint would overwrite output that ended mid-row.
+		// The template is re-read (a mid-session goset change still
+		// lands) and re-expanded against the facts NOW — the command may
+		// have been `cd` — and the editor's own bytes are written, so
+		// this prompt is the one the next in-line repaint uses.
+		editor.SetPrompt(loadPrompt())
+		_, _ = vi.FileWrite(fd, editor.PromptBytes())
+		// M98h: the tab title follows the cwd — send only when it changed.
+		titles.Sync(shlib.TitleFor("Sh", sh.Pwd()), sendTitle)
+		// M98f: bytes typed while a foreground child ran sit in the
+		// interrupter's stash — feed them now, before the next
+		// FileRead, so a pre-typed line is not lost.
+		if p := hst.TTYInterrupter(); p != nil {
+			if ahead := p.TypeAhead(); len(ahead) > 0 {
+				handle(editor.Feed(ahead))
+			}
+		}
+	}
 	handle = func(out []byte, ev shlib.EditEvent) {
 		if len(out) > 0 {
 			writeTTY(fd, out)
 		}
 		switch ev.Kind {
 		case shlib.EvSubmit:
-			vi.ConsoleLine(markerLine + ev.Line)
-			shlib.SaveHistory(hst, hist, ev.Line, sink)
-			_, act := sh.RunLine(ev.Line)
-			if act != shlib.ActionContinue {
-				leave(ta, fd, sh, act)
+			submit(ev.Line)
+		case shlib.EvEdit:
+			// M98h: Ctrl-X Ctrl-E hands the line to GOEDIT. Each returned
+			// line goes through the same submit path; a failed round trip
+			// says so and puts the original line back.
+			lines, err := sh.EditLine(ev.Line)
+			if err != nil {
+				writeTTY(fd, []byte("gosh: edit: "+err.Error()+"; line not run\r\n"))
+				editor.SetValue(ev.Line)
+				writeTTY(fd, editor.Repaint())
+				break
 			}
-			// M73d (#1628): the editor's submit echo is a bare \r\n now;
-			// the front-end paints the fresh prompt AFTER the command's
-			// output — the reference shell loop's order (SH.BIN/TERM.BIN),
-			// and what keeps a screen-clearing command from erasing the
-			// prompt with nothing to repaint it. At the cursor, no CR: a
-			// CR repaint would overwrite output that ended mid-row.
-			// The template is re-read (a mid-session goset change still
-			// lands) and re-expanded against the facts NOW — the command may
-			// have been `cd` — and the editor's own bytes are written, so
-			// this prompt is the one the next in-line repaint uses.
-			editor.SetPrompt(loadPrompt())
-			_, _ = vi.FileWrite(fd, editor.PromptBytes())
-			// M98f: bytes typed while a foreground child ran sit in the
-			// interrupter's stash — feed them now, before the next
-			// FileRead, so a pre-typed line is not lost.
-			if p := hst.TTYInterrupter(); p != nil {
-				if ahead := p.TypeAhead(); len(ahead) > 0 {
-					handle(editor.Feed(ahead))
-				}
+			for _, ln := range lines {
+				submit(ln)
 			}
 		case shlib.EvEOF:
 			shutdown(ta, fd, 0)
@@ -737,6 +764,15 @@ func (g *goshHost) WriteFile(path string, b []byte, appendMode bool) error {
 		if r == -vi.ErrEACCES || r == -vi.ErrENOENT || r == -vi.ErrENAMETOOLONG {
 			return shlib.ErrNotFound
 		}
+		return shlib.ErrWriteFailed
+	}
+	return nil
+}
+
+// DeleteFile removes path — an absent file is not an error, matching
+// WriteFilePublish's absent-fails-closed readers.
+func (g *goshHost) DeleteFile(path string) error {
+	if r := vi.FileDelete(path); r < 0 && r != -vi.ErrENOENT {
 		return shlib.ErrWriteFailed
 	}
 	return nil

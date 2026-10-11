@@ -3,6 +3,8 @@ package shlib
 import (
 	"strings"
 	"unicode/utf8"
+
+	"virelai/vsys"
 )
 
 // Prompt escapes (M80n #1730). The SETTINGS.TXT `prompt=` value is a
@@ -28,6 +30,10 @@ type PromptFacts struct {
 	// Root is the system principal, which `\u` calls "system" and `\$`
 	// answers with "#".
 	Root bool
+	// Status is the last line's exit status, `$?`, for `\?` (M98h).
+	Status int
+	// DurationNs is the last line's wall time in nanoseconds, for `\D`.
+	DurationNs int64
 }
 
 // The glyphs the privilege and home escapes produce. `#` for the system
@@ -46,6 +52,8 @@ const (
 //	\w   the working directory, shortened to ~ against PromptFacts.Home
 //	\W   the last component of \w; the share root stays "/"
 //	\$   the privilege glyph: "#" for the system principal, "$" otherwise
+//	\?   the last line's exit status, decimal
+//	\D   the last line's wall time: 0.4s, 12s, 3m04s, 1h02m
 //	\[   a non-printing span opens: copied through, never expanded, and
 //	\]   measured as zero cells
 //	\\   a literal backslash
@@ -91,6 +99,10 @@ func ExpandPrompt(tmpl string, f PromptFacts) string {
 				out = append(out, baseName(f.Cwd)...)
 			case c == '$':
 				out = append(out, privilegeGlyph(f.Root)...)
+			case c == '?':
+				out = append(out, vsys.Itoa64(int64(f.Status))...)
+			case c == 'D':
+				out = append(out, formatDuration(f.DurationNs)...)
 			case c == '[':
 				marked = true
 			case c == ']':
@@ -133,6 +145,8 @@ func PromptFactsFor(sh *Shell, principal func() (uid uint32, caps uint32, ok boo
 		f := PromptFacts{Host: host, User: PromptUserName(0, false)}
 		if sh != nil {
 			f.Cwd = sh.Pwd()
+			f.Status = sh.status
+			f.DurationNs = sh.lastDurNs
 		}
 		if uid, _, ok := principal(); ok {
 			f.User = PromptUserName(uid, true)
