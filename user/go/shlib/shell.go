@@ -279,6 +279,12 @@ type cmdCtx struct {
 	args  []string // after the command word
 	stdin []byte
 	out   func([]byte)
+	// M98e (issue #2131): where stdin and out were wired, because nil bytes
+	// cannot say it — an empty pipe and an unbound stdin look identical
+	// (stdinBound), and a tool needs to know when its output is collected
+	// rather than printed (outCaptured).
+	stdinBound  bool // stdin came from a pipe or < FILE
+	outCaptured bool // out is a pipe stage, redirect or $(...) capture
 }
 
 // Shell is the interpreter state for one GOSH process.
@@ -297,7 +303,8 @@ type Shell struct {
 	capture   *[]byte // non-nil while a `$(...)` is collecting output
 	loopBreak bool
 	loopCont  bool
-	dirstack  []string // M98d pushd/popd stack, canonical paths, top at end
+	dirstack  []string          // M98d pushd/popd stack, canonical paths, top at end
+	aliases   map[string]string // M98b alias table; nil until first define
 }
 
 // NewShell wires a fresh interpreter; hist may be shared with the editor.
@@ -455,9 +462,17 @@ func (s *Shell) runChain(segs []string, ops []chainOp, depth int) (int, Action) 
 	return s.status, ActionContinue
 }
 
-// runSegment executes one chain segment: arithmetic expansion, then the
-// pipeline/redirect/background path, then a deferred `source`.
+// runSegment executes one chain segment: alias expansion on the raw text
+// (M98b — the head word and the head after the single unquoted `|`), then
+// arithmetic expansion, then the pipeline/redirect/background path, then
+// a deferred `source`.
 func (s *Shell) runSegment(line string, depth int) (int, Action) {
+	line, aerr := s.expandAliases(line)
+	if aerr != nil {
+		s.fail(aerr.Error())
+		s.status = 1
+		return 1, ActionContinue
+	}
 	toks, err := tokenize(arithExpand(line))
 	if err != nil {
 		s.fail(err.Error())
@@ -851,7 +866,8 @@ func (s *Shell) runSingle(p *plan, depth int) (int, Action) {
 	var act Action
 	switch classify(name) {
 	case 0, 1:
-		st, act = s.runBuiltin(name, &cmdCtx{sh: s, args: args, stdin: stdin, out: sink})
+		st, act = s.runBuiltin(name, &cmdCtx{sh: s, args: args, stdin: stdin,
+			out: sink, stdinBound: p.in != nil, outCaptured: p.out != nil || s.capture != nil})
 	default:
 		if f := s.funcs.find(name); f != nil {
 			// A function resolves before the exec seam (sh.zig execute), so a
@@ -956,7 +972,8 @@ func (s *Shell) runPipeline(p *plan) (int, Action) {
 	if fn == nil {
 		fn = tools[lname]
 	}
-	st, act := s.runBuiltin(lname, &cmdCtx{sh: s, args: p.left[1:], stdin: stdin, out: stage.write})
+	st, act := s.runBuiltin(lname, &cmdCtx{sh: s, args: p.left[1:], stdin: stdin,
+		out: stage.write, stdinBound: p.in != nil, outCaptured: true})
 	if act != ActionContinue {
 		return st, act
 	}
@@ -986,7 +1003,8 @@ func (s *Shell) runPipeline(p *plan) (int, Action) {
 	if p.out != nil {
 		rsink = rcap.write
 	}
-	rst, ract := s.runBuiltin(rname, &cmdCtx{sh: s, args: p.right[1:], stdin: rightStdin, out: rsink})
+	rst, ract := s.runBuiltin(rname, &cmdCtx{sh: s, args: p.right[1:], stdin: rightStdin,
+		out: rsink, stdinBound: true, outCaptured: p.out != nil || s.capture != nil})
 	if ract != ActionContinue {
 		return rst, ract
 	}
