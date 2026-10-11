@@ -297,6 +297,7 @@ type Shell struct {
 	capture   *[]byte // non-nil while a `$(...)` is collecting output
 	loopBreak bool
 	loopCont  bool
+	dirstack  []string // M98d pushd/popd stack, canonical paths, top at end
 }
 
 // NewShell wires a fresh interpreter; hist may be shared with the editor.

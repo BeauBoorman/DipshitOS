@@ -49,6 +49,7 @@ var builtins map[string]func(*cmdCtx) int
 func init() {
 	builtins = map[string]func(*cmdCtx) int{
 		"echo": bEcho, "cat": bCat, "pwd": bPwd, "cd": bCd,
+		"pushd": bPushd, "popd": bPopd, "dirs": bDirs,
 		"open": bOpen, "env": bEnv, "printenv": bPrintenv, "set": bSet, "unset": bUnset,
 		"export": bExport, "read": bRead, "jobs": bJobs, "fg": bFg,
 		"history": bHistory, "help": bHelp, "exit": bExit, "monitor": bMonitor,
@@ -321,31 +322,9 @@ func bPwd(c *cmdCtx) int {
 	return 0
 }
 
-// bCd moves the working directory: the target resolves against PWD (a
-// bare `cd` goes to `/` — there is no HOME), the host validates the
-// resolved form, and PWD stores the canonical /-rooted path, never the
-// typed spelling. Messages name the target as typed.
-func bCd(c *cmdCtx) int {
-	target := "/"
-	if len(c.args) > 0 {
-		target = c.args[0]
-	}
-	rp, rerr := c.sh.resolvePath(target)
-	if rerr != nil {
-		c.out([]byte("gosh: cd: " + target + ": " + rerr.Error() + "\n"))
-		return 1
-	}
-	if err := c.sh.host.Chdir(rp.host); err != nil {
-		if oe, denial := deniedAs(err); denial {
-			c.out([]byte("gosh: cd: " + target + ": " + oe.name + "\n"))
-		} else {
-			c.out([]byte("gosh: cd: " + target + ": not a directory\n"))
-		}
-		return 1
-	}
-	c.sh.env.Set("PWD", rp.canon)
-	return 0
-}
+// bCd lives in dirstack.go with the rest of M98d's navigation state:
+// `cd DIR`/`cd -`, the OLDPWD update shared with pushd/popd, and the
+// bounded directory stack.
 
 func bEnv(c *cmdCtx) int {
 	for _, v := range c.sh.env.List() {
@@ -654,7 +633,10 @@ var helpCatalog = map[string]helpEntry{
 
 	// files
 	"cat":    {group: "files", usage: "cat [FILE...]", blurb: "write FILE... (the bound stdin when none is named)"},
-	"cd":     {group: "files", usage: "cd [DIR]", blurb: "change the working directory (checked against the share)", notes: "DIR resolves against PWD and `..` is resolved lexically. Arguments to an external app still resolve at the share root — the exec ABI carries no per-process cwd — so use an absolute path, or open PATH."},
+	"cd":     {group: "files", usage: "cd [DIR|-]", blurb: "change the working directory (checked against the share)", notes: "DIR resolves against PWD and `..` is resolved lexically. `cd -` returns to the previous directory. Arguments to an external app still resolve at the share root — the exec ABI carries no per-process cwd — so use an absolute path, or open PATH."},
+	"pushd":  {group: "files", usage: "pushd [DIR]", blurb: "change to DIR and push the old directory (bare: swap with the stack top)"},
+	"popd":   {group: "files", usage: "popd", blurb: "change to the directory stack's top entry and pop it"},
+	"dirs":   {group: "files", usage: "dirs", blurb: "print the directory stack, current directory first"},
 	"open":   {group: "files", usage: "open PATH|URL", blurb: "open a file with its MIME handler or an HTTPS URL in WEB.ELF", notes: "Supports local paths, file://, and https://. Other URL schemes are refused by name."},
 	"pwd":    {group: "files", usage: "pwd", blurb: "print the working directory"},
 	"read":   {group: "files", usage: "read VAR", blurb: "read one line into VAR, preferring the bound stdin"},
