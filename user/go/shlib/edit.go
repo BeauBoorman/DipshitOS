@@ -588,6 +588,31 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 	case '\r', '\n':
 		e.breakKill()
 		line := string(e.buf)
+		// M98c (#2129): history expansion lives here — inside the Editor,
+		// before Push — so only typed interactive lines expand and both
+		// front-ends inherit it. On a change the expanded line is echoed,
+		// pushed and submitted; on an error nothing submits and the typed
+		// line stays in the buffer for a fix (bash's histreedit).
+		var hist []string
+		if e.hist != nil {
+			hist = e.hist.Entries()
+		}
+		if expanded, changed, herr := expandHistory(line, hist); herr != nil {
+			out := append([]byte("\r\n"), herr.Error()...)
+			out = append(out, '\r', '\n')
+			e.RefreshPrompt()
+			return append(out, e.paint()...), EditEvent{}
+		} else if changed {
+			line = expanded
+			out := append([]byte("\r\n"), expanded...)
+			out = append(out, '\r', '\n')
+			e.buf = e.buf[:0]
+			e.cur = 0
+			e.hview = -1
+			e.lastLen = 0
+			e.hist.Push(line)
+			return out, EditEvent{Kind: EvSubmit, Line: line}
+		}
 		out := []byte("\r\n")
 		e.buf = e.buf[:0]
 		e.cur = 0
