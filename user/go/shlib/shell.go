@@ -89,8 +89,14 @@ func deniedAs(err error) (*OpenError, bool) {
 }
 
 // readBounded reads at most MaxPipeBytes of path, refusing a larger file.
+// The path resolves against PWD first (M98j): every caller names the typed
+// argument in its message, while the host sees the resolved form.
 func (s *Shell) readBounded(path string) ([]byte, error) {
-	b, err := s.host.ReadFile(path, MaxPipeBytes+1)
+	rp, err := s.resolvePath(path)
+	if err != nil {
+		return nil, err
+	}
+	b, err := s.host.ReadFile(rp.host, MaxPipeBytes+1)
 	if err != nil {
 		return nil, err
 	}
@@ -115,11 +121,16 @@ func (s *Shell) readInput(path string) ([]byte, bool) {
 }
 
 // openDenial renders a failed open the way the shell reports one: the
-// kernel's errno name when the seam supplied one, and the plain "not found"
-// fallback otherwise.
+// kernel's errno name when the seam supplied one, a resolution refusal
+// when the path never reached the seam, and the plain "not found"
+// fallback otherwise. The path printed is always the TYPED one — the
+// OpenError's own path field is the resolved form the host saw (M98j).
 func openDenial(path string, err error) string {
 	if oe, ok := deniedAs(err); ok {
-		return "gosh: cannot open " + oe.path + ": " + oe.name + "\n"
+		return "gosh: cannot open " + path + ": " + oe.name + "\n"
+	}
+	if msg := resolveDenial(err); msg != "" {
+		return "gosh: " + path + ": " + msg + "\n"
 	}
 	return "gosh: " + path + ": not found\n"
 }
@@ -721,7 +732,13 @@ func (s *Shell) runSource(path string, depth int) (int, Action) {
 		s.status = 2
 		return 2, ActionContinue
 	}
-	b, err := s.host.ReadFile(path, maxSourceBytes+1)
+	rp, rerr := s.resolvePath(path)
+	if rerr != nil {
+		s.host.Out([]byte("gosh: source: " + path + ": " + rerr.Error() + "\n"))
+		s.status = 1
+		return 1, ActionContinue
+	}
+	b, err := s.host.ReadFile(rp.host, maxSourceBytes+1)
 	if err != nil {
 		s.host.Out([]byte("gosh: source: " + strings.TrimPrefix(openDenial(path, err), "gosh: ")))
 		s.status = 1
@@ -793,6 +810,15 @@ func (s *Shell) runSingle(p *plan, depth int) (int, Action) {
 		}
 		stdin = b
 	}
+	var outPath string
+	if p.out != nil {
+		rp, err := s.resolvePath(p.out.path)
+		if err != nil {
+			s.host.Out([]byte("gosh: " + p.out.path + ": " + err.Error() + "\n"))
+			return 1, ActionContinue
+		}
+		outPath = rp.host
+	}
 	var cap boundedCapture
 	cap.lim = maxRedirectBytes
 	sink := func(b []byte) { s.out(b) }
@@ -834,7 +860,7 @@ func (s *Shell) runSingle(p *plan, depth int) (int, Action) {
 			s.host.Out([]byte("gosh: " + p.out.path + ": output exceeds the " + vsys.Itoa64(maxRedirectBytes) + "-byte redirect buffer\n"))
 			return 1, ActionContinue
 		}
-		if err := s.host.WriteFile(p.out.path, cap.buf, p.out.append); err != nil {
+		if err := s.host.WriteFile(outPath, cap.buf, p.out.append); err != nil {
 			s.host.Out([]byte("gosh: " + p.out.path + ": write failed\n"))
 			return 1, ActionContinue
 		}
@@ -842,10 +868,31 @@ func (s *Shell) runSingle(p *plan, depth int) (int, Action) {
 	return st, act
 }
 
+// execName resolves a program name for the exec seam: a bare name keeps
+// the front-end's share-root lookup (candidateNames is the shell's PATH),
+// while a name containing '/' resolves against PWD like any other path
+// (M98j). The kernel's exec names paths relative to the share root, so the
+// resolved form is what it wants.
+func (s *Shell) execName(name string) (string, error) {
+	if !strings.Contains(name, "/") {
+		return name, nil
+	}
+	rp, err := s.resolvePath(name)
+	if err != nil {
+		return "", err
+	}
+	return rp.host, nil
+}
+
 // runExternal spawns name in the foreground and waits, returning its exit
 // status (127 when nothing loads or the wait fails).
 func (s *Shell) runExternal(name string, args []string) (int, error) {
-	pid, err := s.host.RunExternal(name, args)
+	en, err := s.execName(name)
+	if err != nil {
+		s.host.Out([]byte("gosh: " + name + ": " + err.Error() + "\n"))
+		return 127, err
+	}
+	pid, err := s.host.RunExternal(en, args)
 	if err != nil {
 		s.host.Out([]byte("gosh: " + name + ": not found\n"))
 		return 127, err
@@ -871,6 +918,15 @@ func (s *Shell) runPipeline(p *plan) (int, Action) {
 			return 1, ActionContinue
 		}
 		stdin = b
+	}
+	var outPath string
+	if p.out != nil {
+		rp, err := s.resolvePath(p.out.path)
+		if err != nil {
+			s.host.Out([]byte("gosh: " + p.out.path + ": " + err.Error() + "\n"))
+			return 1, ActionContinue
+		}
+		outPath = rp.host
 	}
 	var stage boundedCapture
 	stage.lim = MaxPipeBytes
@@ -917,7 +973,7 @@ func (s *Shell) runPipeline(p *plan) (int, Action) {
 			s.host.Out([]byte("gosh: " + p.out.path + ": output exceeds the " + vsys.Itoa64(maxRedirectBytes) + "-byte redirect buffer\n"))
 			return 1, ActionContinue
 		}
-		if err := s.host.WriteFile(p.out.path, rcap.buf, p.out.append); err != nil {
+		if err := s.host.WriteFile(outPath, rcap.buf, p.out.append); err != nil {
 			s.host.Out([]byte("gosh: " + p.out.path + ": write failed\n"))
 			return 1, ActionContinue
 		}
@@ -937,7 +993,12 @@ func (s *Shell) runBackground(p *plan, depth int) (int, Action) {
 		s.host.Out([]byte("gosh: too many background jobs\n"))
 		return 1, ActionContinue
 	}
-	pid, err := s.host.RunExternal(name, p.left[1:])
+	en, err := s.execName(name)
+	if err != nil {
+		s.host.Out([]byte("gosh: " + name + ": " + err.Error() + "\n"))
+		return 127, ActionContinue
+	}
+	pid, err := s.host.RunExternal(en, p.left[1:])
 	if err != nil {
 		s.host.Out([]byte("gosh: " + name + ": not found\n"))
 		return 127, ActionContinue

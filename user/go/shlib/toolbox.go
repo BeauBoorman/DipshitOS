@@ -32,6 +32,8 @@ func toolInput(c *cmdCtx, files []string) ([]byte, int) {
 		if err != nil {
 			if err == errTooLarge {
 				c.out([]byte("gosh: " + c.args[0] + ": " + f + ": " + errTooLarge.Error() + "\n"))
+			} else if msg := resolveDenial(err); msg != "" {
+				c.out([]byte("gosh: " + c.args[0] + ": " + f + ": " + msg + "\n"))
 			} else {
 				c.out([]byte("gosh: " + c.args[0] + ": " + f + ": not found\n"))
 			}
@@ -475,7 +477,11 @@ func tTest(c *cmdCtx) int {
 			case "-z":
 				return a[1] == "", 0
 			case "-e":
-				_, err := c.sh.host.ReadFile(a[1], 1)
+				rp, rerr := c.sh.resolvePath(a[1])
+				if rerr != nil {
+					return false, 0
+				}
+				_, err := c.sh.host.ReadFile(rp.host, 1)
 				return err == nil, 0
 			case "!":
 				v, st := eval(a[1:])
@@ -509,7 +515,11 @@ func tTest(c *cmdCtx) int {
 					return x >= y, 0
 				}
 			case "-e":
-				_, err := c.sh.host.ReadFile(a[2], 1)
+				rp, rerr := c.sh.resolvePath(a[2])
+				if rerr != nil {
+					return false, 0
+				}
+				_, err := c.sh.host.ReadFile(rp.host, 1)
 				return err == nil, 0
 			}
 			return false, 2
