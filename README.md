@@ -197,6 +197,17 @@ zig build run        # serial takeover path
 command-line tools, Python 3, bash, and the Homebrew `bash`, `gnu-sed`, `jq`,
 and `yq` tools. No root, no `mtools`, no Linux/QEMU path.
 
+**Zig toolchain:** the compiler is pinned to 0.17.0 — `tools/zig/lock.json`
+carries the archive URLs + sha256s and `tools/zig/sdk.py` fetches and
+materializes the pinned SDK into `.build/zig-guest` (offline-by-default —
+only `sdk.py fetch` touches the network — checksum-verified, and it refuses
+concurrent substitution). Gates put the materialized directory first on PATH
+(e.g. `tools/verify-ttf-fonts.sh`); a shadowing `zig` elsewhere on PATH —
+e.g. Homebrew — must not win. An unpinned Homebrew 0.17 broke
+`verify-portable` during the M91 recheck and broke `live-web`'s kernel build
+during M93g. Known upstream caveat: ZLS does not work with 0.17.0 (the
+maker/configurer split) — not a VirelaiOS bug, do not file it.
+
 ## Verification
 
 The project separates two classes of evidence:
