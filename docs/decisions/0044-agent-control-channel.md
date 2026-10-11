@@ -2,8 +2,8 @@
 
 - Date: 2026-10-11
 - Status: **Proposed** — spec only, no code. Owner review pending.
-- Milestone: **M98**. One mission card, to be filed when claimed. This ADR
-  is the card body: scope, acceptance, gates and `Touches`.
+- Milestone: **M98**. Mission card #2145 (unclaimed). This ADR is the card
+  body: scope, acceptance, gates and `Touches`.
 
 > The first, deliberately small step toward an agent-native OS. A host-side
 > agent connects to a running guest, authenticates, and calls six verbs. It
