@@ -53,9 +53,13 @@ check_face "image/fonts/Inter-Italic.ttf" 417388 "Inter-Italic.ttf"
 check_face "image/fonts/FiraCode-Regular.ttf" 289624 "FiraCode-Regular.ttf"
 
 # B7 (M96c): the zig invocations must resolve to the SDK-pinned compiler —
-# materialize it via sdk.py and put that dir first. A bare /opt/homebrew/bin
-# prepend here let an unpinned Homebrew zig win over the pin and broke this
-# gate during M91 (verify-portable) and M93g (live-web).
+# materialize it via sdk.py and put that dir first, fetching the checksum-
+# verified archive when the cache is absent (CI's setup-zig puts the pinned
+# zig on PATH but never populates .build/zig-guest; fetch is a verified no-op
+# when the archive already exists). A bare /opt/homebrew/bin prepend here let
+# an unpinned Homebrew zig win over the pin and broke this gate during M91
+# (verify-portable) and M93g (live-web).
+python3 tools/zig/sdk.py fetch
 ZIG_PIN_DIR="$(python3 tools/zig/sdk.py prepare)"
 
 # 2. Run unit tests for font_ttf.zig
