@@ -1,7 +1,7 @@
 // Z3a (issue #758): the "module" half of the multi-file pair. Compiled
 // together with z3a-multifile.z into ONE flat cross-file symbol table — no
 // @import between the files (the ladder's module system is scope-out for this
-// step; Z3b's stdz rides this table). Valid Zig 0.16 on its own and when
+// step; Z3b's stdz rides this table). Valid Zig 0.17 on its own and when
 // concatenated with the main half.
 fn lib_triple(x: u64) u64 {
     return x * 3;

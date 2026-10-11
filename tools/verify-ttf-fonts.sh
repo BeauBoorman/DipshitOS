@@ -52,10 +52,16 @@ check_face "image/fonts/Inter-Bold.ttf" 420428 "Inter-Bold.ttf"
 check_face "image/fonts/Inter-Italic.ttf" 417388 "Inter-Italic.ttf"
 check_face "image/fonts/FiraCode-Regular.ttf" 289624 "FiraCode-Regular.ttf"
 
+# B7 (M96c): the zig invocations must resolve to the SDK-pinned compiler —
+# materialize it via sdk.py and put that dir first. A bare /opt/homebrew/bin
+# prepend here let an unpinned Homebrew zig win over the pin and broke this
+# gate during M91 (verify-portable) and M93g (live-web).
+ZIG_PIN_DIR="$(python3 tools/zig/sdk.py prepare)"
+
 # 2. Run unit tests for font_ttf.zig
 echo
 echo "[2/3] Running TrueType parser, rasterizer, composite, cache & blend unit tests"
-PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:/opt/homebrew/bin:$PATH" zig test user/src/lib/font_ttf.zig
+PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$ZIG_PIN_DIR:$PATH" zig test user/src/lib/font_ttf.zig
 
 # 3. Assert userland compilation with font subsystem
 echo
@@ -63,7 +69,7 @@ echo "[3/3] Compiling userland with font engine integrated"
 # M60 / #1297: EDIT.BIN is gone; M66c (#1485): the Zig notepad is gone too.
 # M78c: the last other font-heavy Zig app is retired. DEVCONS.BIN remains the
 # compile-time owner of the Zig TrueType/text stack exercised by this gate.
-PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:/opt/homebrew/bin:$PATH" zig build devcons
+PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$ZIG_PIN_DIR:$PATH" zig build devcons
 
 echo
 echo "=== verify-ttf-fonts: PASS (Inter Regular/Bold/Italic & Fira Code verified) ==="

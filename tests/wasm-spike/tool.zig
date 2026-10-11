@@ -15,8 +15,8 @@
 //!              no env.mmap
 //!   * exit   : env.exit(bytes written), mirroring the wc capstone's discipline
 //!
-//! Build (Zig 0.16 — note `-femit-bin=`, not the contract §7 `-o`, which
-//! 0.16's `zig build-exe` rejects):
+//! Build (Zig 0.17 — note `-femit-bin=`, not the contract §7 `-o`, which
+//! 0.17's `zig build-exe` rejects):
 //!
 //!     zig build-exe -target wasm32-freestanding -O ReleaseSmall -fstrip \
 //!         --dep virelai --dep oliver \

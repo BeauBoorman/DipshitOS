@@ -7694,7 +7694,7 @@ fn cmd_strace(m: *Monitor, args: []const []const u8) ExecError {
         if (res != .ok) {
             err_prefix(m);
             m.console.puts("strace: exec refused (");
-            m.console.print_u64(@intFromEnum(res));
+            m.console.print_u64(@backingInt(res));
             m.console.print_line(")");
             return .invalid_argument;
         }

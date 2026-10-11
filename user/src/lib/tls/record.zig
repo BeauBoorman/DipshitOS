@@ -113,14 +113,14 @@ pub fn sealRecord(
     // TLSInnerPlaintext = content || content_type || zeros(0)
     var inner: [max_plaintext + 1]u8 = undefined;
     @memcpy(inner[0..payload.len], payload);
-    inner[payload.len] = @intFromEnum(inner_type);
+    inner[payload.len] = @backingInt(inner_type);
     const inner_len = payload.len + 1;
 
     const ct_len = inner_len + 16;
     std.debug.assert(out.len >= header_len + ct_len);
 
     // Outer header: the real type is application_data for AEAD records.
-    out[0] = @intFromEnum(ContentType.application_data);
+    out[0] = @backingInt(ContentType.application_data);
     out[1] = 0x03;
     out[2] = 0x03;
     std.mem.writeInt(u16, out[3..5], @intCast(ct_len), .big);
@@ -145,7 +145,7 @@ pub fn openRecord(
     const declared = std.mem.readInt(u16, record[3..5], .big);
     if (declared != record.len - header_len) return Error.TruncatedRecord;
     if (declared > max_ciphertext) return Error.CiphertextTooLarge;
-    if (record[0] != @intFromEnum(ContentType.application_data)) return Error.InnerTypeNotAllowed;
+    if (record[0] != @backingInt(ContentType.application_data)) return Error.InnerTypeNotAllowed;
 
     const ct_len = declared - 16;
     var inner: [max_ciphertext]u8 = undefined;
@@ -160,7 +160,7 @@ pub fn openRecord(
     var end = ct_len;
     while (end > 0 and inner[end - 1] == 0) end -= 1;
     if (end == 0) return Error.InnerTypeMissing;
-    const t: ContentType = @enumFromInt(inner[end - 1]);
+    const t: ContentType = @fromBackingInt(@intCast(inner[end - 1]));
     switch (t) {
         .handshake, .application_data, .alert, .change_cipher_spec => {},
         else => return Error.InnerTypeNotAllowed,

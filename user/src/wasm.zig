@@ -594,7 +594,7 @@ const Reader = struct {
     /// Unsigned LEB128 u32 (max 5 bytes; >32 bits rejected).
     fn uleb(r: *Reader) ParseError!u32 {
         var result: u32 = 0;
-        var shift: u5 = 0; // u32 shift counts must fit 5 bits (zig 0.16)
+        var shift: u5 = 0; // u32 shift counts must fit 5 bits (zig 0.17)
         var count: u8 = 0;
         while (true) : (count += 1) {
             if (count >= 5) return error.MalformedLeb;
@@ -2942,7 +2942,7 @@ const CapId = enum(u8) {
     wait,
     count,
 };
-const cap_count: usize = @intFromEnum(CapId.count);
+const cap_count: usize = @backingInt(CapId.count);
 
 const CapturedCall = struct {
     id: CapId,
@@ -3063,7 +3063,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         const flags: u32 = @bitCast(args[2].i32);
         if (g_capture) |c| {
             c.logCall(.file_open, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_open)]);
+            return importRet(c.returns[@backingInt(CapId.file_open)]);
         }
         // Kernel slot 23: empty or > max_path_len path -> einval.
         if (path_len == 0 or path_len > stage_path_len) return importRet(-1);
@@ -3087,7 +3087,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
                 }
                 return importRet(0); // exhausted: EOF, exactly like the kernel
             }
-            return importRet(c.returns[@intFromEnum(CapId.file_read)]);
+            return importRet(c.returns[@backingInt(CapId.file_read)]);
         }
         // Kernel slot 24: take_count = min(count, 2048); result copied out.
         if (cap == 0) return importRet(0);
@@ -3103,7 +3103,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         const len: u32 = @bitCast(args[2].i32);
         if (g_capture) |c| {
             c.logCall(.file_write, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_write)]);
+            return importRet(c.returns[@backingInt(CapId.file_write)]);
         }
         // Kernel slot 25: count > 2048 -> enospc (no truncation).
         if (len > stage_io_len) return importRet(-5);
@@ -3113,7 +3113,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "file_close")) {
         if (g_capture) |c| {
             c.logCall(.file_close, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_close)]);
+            return importRet(c.returns[@backingInt(CapId.file_close)]);
         }
         const fd: u32 = @bitCast(args[0].i32);
         // Kernel slot 26 result passes through: 0 on success, ebadf (−2)
@@ -3133,7 +3133,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         if (max_entries != 0 and @as(u64, out_ptr) + need > mem_len) return mkTrap(.bounds, mm.module_name, 0);
         if (g_capture) |c| {
             c.logCall(.dir_list, args);
-            const n = c.returns[@intFromEnum(CapId.dir_list)];
+            const n = c.returns[@backingInt(CapId.dir_list)];
             if (n > 0) captureFill(mm, out_ptr, @as(u64, @intCast(n)) * 40, c.out_fill);
             return importRet(n);
         }
@@ -3150,7 +3150,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         const path_len = @as(u32, @bitCast(args[1].i32));
         if (g_capture) |c| {
             c.logCall(.file_delete, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_delete)]);
+            return importRet(c.returns[@backingInt(CapId.file_delete)]);
         }
         // Kernel slot 34: empty or > max_path_len -> einval.
         if (path_len == 0 or path_len > stage_path_len) return importRet(-1);
@@ -3164,7 +3164,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         const new_len = @as(u32, @bitCast(args[3].i32));
         if (g_capture) |c| {
             c.logCall(.file_rename, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_rename)]);
+            return importRet(c.returns[@backingInt(CapId.file_rename)]);
         }
         // Kernel slot 35: any empty or > max_path_len side -> einval.
         if (old_len == 0 or old_len > stage_path_len or new_len == 0 or new_len > stage_path_len) return importRet(-1);
@@ -3175,14 +3175,14 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "file_truncate")) {
         if (g_capture) |c| {
             c.logCall(.file_truncate, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_truncate)]);
+            return importRet(c.returns[@backingInt(CapId.file_truncate)]);
         }
         return importRet(file_truncate(argU64(args, 0), argU64(args, 1)));
     }
     if (std.mem.eql(u8, name, "file_free")) {
         if (g_capture) |c| {
             c.logCall(.file_free, args);
-            return importRet(c.returns[@intFromEnum(CapId.file_free)]);
+            return importRet(c.returns[@backingInt(CapId.file_free)]);
         }
         return importRet(file_free(argU64(args, 0)));
     }
@@ -3191,7 +3191,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "win_open")) {
         if (g_capture) |c| {
             c.logCall(.win_open, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_open)]);
+            return importRet(c.returns[@backingInt(CapId.win_open)]);
         }
         return importRet(win_open(
             argU64(args, 0),
@@ -3203,7 +3203,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "win_fill")) {
         if (g_capture) |c| {
             c.logCall(.win_fill, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_fill)]);
+            return importRet(c.returns[@backingInt(CapId.win_fill)]);
         }
         return importRet(win_fill(
             argU64(args, 0),
@@ -3217,21 +3217,21 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "win_present")) {
         if (g_capture) |c| {
             c.logCall(.win_present, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_present)]);
+            return importRet(c.returns[@backingInt(CapId.win_present)]);
         }
         return importRet(win_present(argU64(args, 0)));
     }
     if (std.mem.eql(u8, name, "win_close")) {
         if (g_capture) |c| {
             c.logCall(.win_close, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_close)]);
+            return importRet(c.returns[@backingInt(CapId.win_close)]);
         }
         return importRet(win_close(argU64(args, 0)));
     }
     if (std.mem.eql(u8, name, "win_move")) {
         if (g_capture) |c| {
             c.logCall(.win_move, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_move)]);
+            return importRet(c.returns[@backingInt(CapId.win_move)]);
         }
         return importRet(win_move(
             argU64(args, 0),
@@ -3242,7 +3242,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "win_raise")) {
         if (g_capture) |c| {
             c.logCall(.win_raise, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_raise)]);
+            return importRet(c.returns[@backingInt(CapId.win_raise)]);
         }
         return importRet(win_raise(argU64(args, 0)));
     }
@@ -3252,7 +3252,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         if (g_capture) |c| {
             c.logCall(.win_get, args);
             @memset(mm.store[out_ptr .. out_ptr + 16], c.out_fill);
-            return importRet(c.returns[@intFromEnum(CapId.win_get)]);
+            return importRet(c.returns[@backingInt(CapId.win_get)]);
         }
         const r = win_get(argU64(args, 0), &g_stage_info);
         if (r == 0) stageOut(mm, out_ptr, g_stage_info[0..16]);
@@ -3264,7 +3264,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         if (g_capture) |c| {
             c.logCall(.win_query, args);
             @memset(mm.store[out_ptr .. out_ptr + 32], c.out_fill);
-            return importRet(c.returns[@intFromEnum(CapId.win_query)]);
+            return importRet(c.returns[@backingInt(CapId.win_query)]);
         }
         const r = win_query(argU64(args, 0), &g_stage_info);
         if (r == 0) stageOut(mm, out_ptr, g_stage_info[0..32]);
@@ -3273,7 +3273,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "win_set_visible")) {
         if (g_capture) |c| {
             c.logCall(.win_set_visible, args);
-            return importRet(c.returns[@intFromEnum(CapId.win_set_visible)]);
+            return importRet(c.returns[@backingInt(CapId.win_set_visible)]);
         }
         return importRet(win_set_visible(argU64(args, 0), argU64(args, 1)));
     }
@@ -3285,7 +3285,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         if (g_capture) |c| {
             c.logCall(.audio_info, args);
             @memset(mm.store[out_ptr .. out_ptr + 16], c.out_fill);
-            return importRet(c.returns[@intFromEnum(CapId.audio_info)]);
+            return importRet(c.returns[@backingInt(CapId.audio_info)]);
         }
         const r = audio_info(&g_stage_info);
         if (r == 0) stageOut(mm, out_ptr, g_stage_info[0..16]);
@@ -3296,7 +3296,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         const raw_len = @as(u32, @bitCast(args[1].i32));
         if (g_capture) |c| {
             c.logCall(.audio_play, args);
-            return importRet(c.returns[@intFromEnum(CapId.audio_play)]);
+            return importRet(c.returns[@backingInt(CapId.audio_play)]);
         }
         // Kernel slot 43: zero -> einval, > audio_max_len -> enametoolong.
         if (raw_len == 0) return importRet(-1);
@@ -3314,14 +3314,14 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "audio_volume")) {
         if (g_capture) |c| {
             c.logCall(.audio_volume, args);
-            return importRet(c.returns[@intFromEnum(CapId.audio_volume)]);
+            return importRet(c.returns[@backingInt(CapId.audio_volume)]);
         }
         return importRet(audio_volume(argU64(args, 0)));
     }
     if (std.mem.eql(u8, name, "audio_mute")) {
         if (g_capture) |c| {
             c.logCall(.audio_mute, args);
-            return importRet(c.returns[@intFromEnum(CapId.audio_mute)]);
+            return importRet(c.returns[@backingInt(CapId.audio_mute)]);
         }
         return importRet(audio_mute(argU64(args, 0)));
     }
@@ -3330,14 +3330,14 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "timer_set")) {
         if (g_capture) |c| {
             c.logCall(.timer_set, args);
-            return importRet(c.returns[@intFromEnum(CapId.timer_set)]);
+            return importRet(c.returns[@backingInt(CapId.timer_set)]);
         }
         return importRet(timer_set(argU64(args, 0)));
     }
     if (std.mem.eql(u8, name, "timer_cancel")) {
         if (g_capture) |c| {
             c.logCall(.timer_cancel, args);
-            return importRet(c.returns[@intFromEnum(CapId.timer_cancel)]);
+            return importRet(c.returns[@backingInt(CapId.timer_cancel)]);
         }
         return importRet(timer_cancel());
     }
@@ -3346,7 +3346,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "mmap")) {
         if (g_capture) |c| {
             c.logCall(.mmap, args);
-            return importRet(c.returns[@intFromEnum(CapId.mmap)]);
+            return importRet(c.returns[@backingInt(CapId.mmap)]);
         }
         return importRet(mmap(
             argU64(args, 0),
@@ -3358,7 +3358,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "munmap")) {
         if (g_capture) |c| {
             c.logCall(.munmap, args);
-            return importRet(c.returns[@intFromEnum(CapId.munmap)]);
+            return importRet(c.returns[@backingInt(CapId.munmap)]);
         }
         return importRet(munmap(argU64(args, 0), argU64(args, 1)));
     }
@@ -3370,7 +3370,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
         if (max != 0 and !checkRange(mm, buf_ptr, max)) return mkTrap(.bounds, mm.module_name, 0);
         if (g_capture) |c| {
             c.logCall(.procs, args);
-            const n = c.returns[@intFromEnum(CapId.procs)];
+            const n = c.returns[@backingInt(CapId.procs)];
             if (n > 0) captureFill(mm, buf_ptr, @as(u64, @intCast(n)) * 40, c.out_fill);
             return importRet(n);
         }
@@ -3384,7 +3384,7 @@ fn dispatchImport(mm: *Machine, m: *const Module, imp_idx: u32, args: []const Va
     if (std.mem.eql(u8, name, "wait")) {
         if (g_capture) |c| {
             c.logCall(.wait, args);
-            return importRet(c.returns[@intFromEnum(CapId.wait)]);
+            return importRet(c.returns[@backingInt(CapId.wait)]);
         }
         return importRet(wait(argU64(args, 0)));
     }
@@ -4118,10 +4118,10 @@ test "w3: all 30 frozen imports dispatch through the capture seam" {
     var cap = HostCapture{ .write_buf = &store };
     g_capture = &cap;
     defer g_capture = null;
-    cap.returns[@intFromEnum(CapId.file_open)] = 3;
-    cap.returns[@intFromEnum(CapId.win_open)] = 4;
-    cap.returns[@intFromEnum(CapId.mmap)] = 0x10000;
-    cap.returns[@intFromEnum(CapId.procs)] = 2;
+    cap.returns[@backingInt(CapId.file_open)] = 3;
+    cap.returns[@backingInt(CapId.win_open)] = 4;
+    cap.returns[@backingInt(CapId.mmap)] = 0x10000;
+    cap.returns[@backingInt(CapId.procs)] = 2;
     const Z: [6]Value = .{ .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 } };
     for (0..m.import_count) |fi| {
         const ft = &m.types[m.imports[fi].type_index];
@@ -4139,7 +4139,7 @@ test "w3: all 30 frozen imports dispatch through the capture seam" {
     try testing.expectEqual(@as(usize, 30), cap.log_count);
     // CapId variants were declared in the same order as the frozen table,
     // so the log ids line up with the import indices.
-    for (0..30) |i| try testing.expectEqual(i, @as(usize, @intFromEnum(cap.log[i].id)));
+    for (0..30) |i| try testing.expectEqual(i, @as(usize, @backingInt(cap.log[i].id)));
     // Canned returns flowed back as the i32 result. The two direct re-calls
     // below log two more entries (30 + 2 = 32).
     const r11 = call(&machine, &m, 11, &.{ .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 } });
@@ -4147,8 +4147,8 @@ test "w3: all 30 frozen imports dispatch through the capture seam" {
     const r26 = call(&machine, &m, 26, &.{ .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 }, .{ .i32 = 0 } });
     try testing.expectEqual(@as(i32, 0x10000), r26.ret.vals[0].i32);
     try testing.expectEqual(@as(usize, 32), cap.log_count);
-    try testing.expectEqual(@as(usize, @intFromEnum(CapId.win_open)), @as(usize, @intFromEnum(cap.log[30].id)));
-    try testing.expectEqual(@as(usize, @intFromEnum(CapId.mmap)), @as(usize, @intFromEnum(cap.log[31].id)));
+    try testing.expectEqual(@as(usize, @backingInt(CapId.win_open)), @as(usize, @backingInt(cap.log[30].id)));
+    try testing.expectEqual(@as(usize, @backingInt(CapId.mmap)), @as(usize, @backingInt(cap.log[31].id)));
 }
 
 test "w3: file imports carry paths and buffers across the store" {
@@ -4161,10 +4161,10 @@ test "w3: file imports carry paths and buffers across the store" {
     var cap = HostCapture{ .write_buf = &store };
     g_capture = &cap;
     defer g_capture = null;
-    cap.returns[@intFromEnum(CapId.file_open)] = 3;
-    cap.returns[@intFromEnum(CapId.file_read)] = 17;
-    cap.returns[@intFromEnum(CapId.file_write)] = 8;
-    cap.returns[@intFromEnum(CapId.dir_list)] = 2;
+    cap.returns[@backingInt(CapId.file_open)] = 3;
+    cap.returns[@backingInt(CapId.file_read)] = 17;
+    cap.returns[@backingInt(CapId.file_write)] = 8;
+    cap.returns[@backingInt(CapId.dir_list)] = 2;
     const args1 = [_]Value{ .{ .i32 = 16 }, .{ .i32 = 13 }, .{ .i32 = 1 } };
     const r0 = call(&machine, &m, 0, &args1);
     try testing.expectEqual(@as(i32, 3), r0.ret.vals[0].i32);
@@ -4190,7 +4190,7 @@ test "w3: window imports dispatch; win_get/win_query fill their out-buffers" {
     var cap = HostCapture{ .write_buf = &store };
     g_capture = &cap;
     defer g_capture = null;
-    cap.returns[@intFromEnum(CapId.win_open)] = 4;
+    cap.returns[@backingInt(CapId.win_open)] = 4;
     const args0 = [_]Value{ .{ .i32 = 100 }, .{ .i32 = 200 }, .{ .i32 = 96 }, .{ .i32 = 48 } };
     const r0 = call(&machine, &m, 0, &args0);
     try testing.expectEqual(@as(i32, 4), r0.ret.vals[0].i32);
@@ -4212,9 +4212,9 @@ test "w3: audio, timer, mmap, procs, wait dispatch" {
     var cap = HostCapture{ .write_buf = &store };
     g_capture = &cap;
     defer g_capture = null;
-    cap.returns[@intFromEnum(CapId.timer_cancel)] = 1;
-    cap.returns[@intFromEnum(CapId.mmap)] = 0x10000;
-    cap.returns[@intFromEnum(CapId.procs)] = 3;
+    cap.returns[@backingInt(CapId.timer_cancel)] = 1;
+    cap.returns[@backingInt(CapId.mmap)] = 0x10000;
+    cap.returns[@backingInt(CapId.procs)] = 3;
     try testing.expect(call(&machine, &m, 0, &.{.{ .i32 = 16 }}) == .ret);
     try testing.expect(std.mem.allEqual(u8, store[16..32], 0xA5));
     try testing.expect(call(&machine, &m, 1, &.{.{ .i32 = 20 }}) == .ret);
@@ -4649,7 +4649,7 @@ test "v2 (§9): the cap table covers every capability, and every frozen import m
     // v2 gate unenforceable for that name, and an unused Cap would mean §9
     // documents a capability nothing needs.
     var reachable: [std.meta.tags(Cap).len]bool = @splat(false);
-    for (frozen_imports) |f| reachable[@intFromEnum(f.cap)] = true;
+    for (frozen_imports) |f| reachable[@backingInt(f.cap)] = true;
     for (reachable) |r| try testing.expect(r);
 }
 

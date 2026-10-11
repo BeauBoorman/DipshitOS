@@ -183,7 +183,7 @@ pub fn generateSource(alloc: std.mem.Allocator, face: *const ttf.TrueTypeFace) !
             \\}};
             \\
         , .{
-            @tagName(@as(SizeName, @enumFromInt(si))),
+            @tagName(@as(SizeName, @fromBackingInt(@intCast(si)))),
             m.px_size,
             m.cell_w,
             m.cell_h,

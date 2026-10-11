@@ -1533,7 +1533,7 @@ pub fn service_snapshot() void {
 }
 
 /// Test-hook recording (module-level BSS — nested functions cannot capture
-/// mutable locals in Zig 0.16).
+/// mutable locals in Zig 0.17).
 var test_hook_calls: usize = 0;
 var test_hook_last_len: usize = 0;
 fn test_input_hook(rep: []const u8) void {
@@ -1818,7 +1818,7 @@ test "virtio_custom: dispatch_input_msg validates the envelope and counts honest
     msg[3] = 0;
     @memcpy(msg[4 .. 4 + input_keyboard_rep_len], &report);
 
-    // The hook records into module-level BSS (a Zig 0.16 nested function
+    // The hook records into module-level BSS (a Zig 0.17 nested function
     // cannot capture mutable locals).
     on_input_report = &test_input_hook;
     defer on_input_report = null;

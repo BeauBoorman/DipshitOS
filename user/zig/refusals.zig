@@ -8,8 +8,8 @@ pub fn result(comptime Driver: type, comptime name: []const u8, comptime R: type
         else => Driver.fatal("Unsupported:" ++ name),
     };
     inline for (.{ "OperationUnsupported", "UnsupportedOperation", "Unexpected" }) |err| {
-        inline for (@typeInfo(E).error_set.?) |candidate| {
-            if (comptime std.mem.eql(u8, candidate.name, err)) return @field(E, err);
+        inline for (@typeInfo(E).error_set.error_names.?) |candidate| {
+            if (comptime std.mem.eql(u8, candidate, err)) return @field(E, err);
         }
     }
     Driver.fatal("Unsupported:" ++ name);
@@ -19,10 +19,10 @@ pub fn function(comptime Driver: type, comptime name: []const u8, comptime P: ty
     const R = F.return_type.?;
     const A = struct {
         fn T(comptime i: usize) type {
-            return F.params[i].type.?;
+            return F.param_types[i].?;
         }
     };
-    return switch (F.params.len) {
+    return switch (F.param_types.len) {
         1 => struct {
             fn call(_: A.T(0)) R {
                 return result(Driver, name, R);

@@ -57,7 +57,7 @@ pub fn get_version() u32 {
 /// Power on a secondary CPU core at the specified physical entry point.
 pub fn cpu_on(target_mpidr: u64, entry_point_pa: u64, context_id: u64) PsciResult {
     const rc = psci_call(CPU_ON_64, target_mpidr, entry_point_pa, context_id);
-    return @enumFromInt(@as(i32, @intCast(rc)));
+    return @fromBackingInt(@intCast(@as(i32, @intCast(rc))));
 }
 
 // ---------------------------------------------------------------------------
@@ -73,8 +73,8 @@ test "psci: constants are standard ARM PSCI v0.2+ function IDs" {
 }
 
 test "psci: result enum conversions" {
-    try std.testing.expectEqual(PsciResult.success, @as(PsciResult, @enumFromInt(0)));
-    try std.testing.expectEqual(PsciResult.not_supported, @as(PsciResult, @enumFromInt(-1)));
-    try std.testing.expectEqual(PsciResult.already_on, @as(PsciResult, @enumFromInt(-4)));
-    try std.testing.expectEqual(PsciResult.on_pending, @as(PsciResult, @enumFromInt(-5)));
+    try std.testing.expectEqual(PsciResult.success, @as(PsciResult, @fromBackingInt(@intCast(0))));
+    try std.testing.expectEqual(PsciResult.not_supported, @as(PsciResult, @fromBackingInt(@intCast(-1))));
+    try std.testing.expectEqual(PsciResult.already_on, @as(PsciResult, @fromBackingInt(@intCast(-4))));
+    try std.testing.expectEqual(PsciResult.on_pending, @as(PsciResult, @fromBackingInt(@intCast(-5))));
 }

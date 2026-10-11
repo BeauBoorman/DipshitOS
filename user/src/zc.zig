@@ -737,7 +737,7 @@ fn parseType(p: *Parser) anyerror!ParsedType {
         if (p.peek() == .keyword_fn) {
             // Z2b: function-pointer type, e.g. *const fn(u64, u64) u64.
             // The params and return type are consumed so the type parses
-            // under host zig 0.16 and in-guest alike; the value itself is a
+            // under host zig 0.17 and in-guest alike; the value itself is a
             // plain 8-byte code address.
             res.is_fnptr = true;
             _ = p.advance(); // 'fn'
@@ -1212,12 +1212,12 @@ fn parsePrimary(p: *Parser) anyerror!void {
             try compileExpr(p);
             _ = try p.expect(.r_paren);
             // Z3b (issue #759): the stdz subset is dual-dialect (valid Zig
-            // 0.16 AND the zc dialect) so the same sources host-parse; host
+            // 0.17 AND the zc dialect) so the same sources host-parse; host
             // Zig type-checks u8 stores, which forces @intCast at byte
             // boundaries. In zc every value is a word, so intCast — like the
             // enum casts — is an identity op.
-            if (!std.mem.eql(u8, builtin_tok.text, "intFromEnum") and
-                !std.mem.eql(u8, builtin_tok.text, "enumFromInt") and
+            if (!std.mem.eql(u8, builtin_tok.text, "backingInt") and
+                !std.mem.eql(u8, builtin_tok.text, "fromBackingInt") and
                 !std.mem.eql(u8, builtin_tok.text, "intCast"))
             {
                 print_err("unknown zc builtin", builtin_tok.line, builtin_tok.text);
@@ -3688,10 +3688,10 @@ test "zc: Z1f int-from-enum and enum-from-int casts" {
         \\const zc = @import("zc");
         \\const Color = enum(u8) { red, green, blue };
         \\fn tag_of(c: Color) u8 {
-        \\    return @intFromEnum(c);
+        \\    return @backingInt(c);
         \\}
         \\pub fn main() void {
-        \\    const c: Color = @enumFromInt(1);
+        \\    const c: Color = @fromBackingInt(1);
         \\    if (tag_of(c) == 1) {
         \\        zc.exit(72);
         \\    }
@@ -3715,7 +3715,7 @@ test "zc: Z1f enum with explicit tag values and statement switch" {
         \\        Mode.done => { v = 3; },
         \\    }
         \\    if (v == 3) {
-        \\        if (@intFromEnum(m) == 5) {
+        \\        if (@backingInt(m) == 5) {
         \\            zc.exit(72);
         \\        }
         \\    }

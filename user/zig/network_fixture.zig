@@ -22,7 +22,7 @@ fn read(stream: std.Io.net.Stream, expected: []const u8) !void {
     var at: usize = 0;
     while (at < expected.len) {
         vectors[0] = data[at..expected.len];
-        const n = try sdk.io.vtable.netRead(sdk.io.userdata, stream.socket.handle, &vectors);
+        const n = (try stream.readWithControl(sdk.io, &vectors, &.{})).data_len;
         try check(n != 0);
         at += n;
     }
@@ -74,13 +74,13 @@ fn run(args: *const sdk.startup.Startup) !void {
     var b: [1]u8 = undefined;
     var vector = [_][]u8{&b};
     // Probe drives an independent FIN or reset; honest terminal read result.
-    try check(try sdk.io.vtable.netRead(sdk.io.userdata, one.socket.handle, &vector) == 0);
+    try check((try one.readWithControl(sdk.io, &vector, &.{})).data_len == 0);
     one.close(sdk.io);
     if (std.mem.eql(u8, mode, "timeout")) {
-        if (sdk.io.vtable.netRead(sdk.io.userdata, two.socket.handle, &vector)) |_| return error.UnexpectedRead else |err| try check(err == error.Timeout);
+        if (two.readWithControl(sdk.io, &vector, &.{})) |_| return error.UnexpectedRead else |err| try check(err == error.ConnectionTimedOut);
         try sdk.print("native-socket: peer timeout reported\n");
     } else {
-        if (sdk.io.vtable.netRead(sdk.io.userdata, two.socket.handle, &vector)) |_| return error.UnexpectedRead else |err| try check(err == error.ConnectionResetByPeer);
+        if (two.readWithControl(sdk.io, &vector, &.{})) |_| return error.UnexpectedRead else |err| try check(err == error.ConnectionResetByPeer);
         try sdk.print("native-socket: peer reset reported\n");
     }
     two.close(sdk.io);

@@ -413,7 +413,7 @@ pub fn dump_mmio_descriptors(map: MemoryMapSlice) void {
         if (count >= 64) break;
         if (desc.number_of_pages == 0 or desc.number_of_pages > std.math.maxInt(u64) / 4096) continue;
         dump_str("MAP T=");
-        dump_hex(@intFromEnum(desc.type));
+        dump_hex(@backingInt(desc.type));
         dump_str(" B=");
         dump_hex(desc.physical_start);
         dump_str(" N=");

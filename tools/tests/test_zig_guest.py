@@ -277,13 +277,13 @@ test "SDK wire matches native B2/B3/B5 without importing kernel into the guest" 
                   "handle_directory", "rename_replace"}) |name| {
         try std.testing.expectEqual(@field(native, name), @field(sdk, name));
     }
-    try std.testing.expectEqual(native.remove_file, @intFromEnum(sdk.EntryKind.file));
-    try std.testing.expectEqual(native.remove_directory, @intFromEnum(sdk.EntryKind.directory));
+    try std.testing.expectEqual(native.remove_file, @backingInt(sdk.EntryKind.file));
+    try std.testing.expectEqual(native.remove_directory, @backingInt(sdk.EntryKind.directory));
     inline for (.{.{sdk.Metadata, native.Wire}, .{sdk.Identity, native.Identity},
                   .{sdk.Entry, native.Entry}, .{sdk.Page, native.Page}}) |pair| {
         try std.testing.expectEqual(@sizeOf(pair[1]), @sizeOf(pair[0]));
-        inline for (@typeInfo(pair[0]).@"struct".fields) |field| {
-            try std.testing.expectEqual(@offsetOf(pair[1], field.name), @offsetOf(pair[0], field.name));
+        inline for (@typeInfo(pair[0]).@"struct".field_names) |name| {
+            try std.testing.expectEqual(@offsetOf(pair[1], name), @offsetOf(pair[0], name));
         }
     }
     const fact = native.Wire.from(.{
@@ -394,7 +394,7 @@ export fn sortSnapshot(snapshot: *metadata.Snapshot) void {
                     False, "single-threaded"),
         "posix-mmap": ('export fn probe() usize { return std.posix.PROT.READ; }\n', False, "VirelaiUnsupportedPosix"),
         "posix-mremap": ('export fn probe() usize { return std.posix.MREMAP.MAYMOVE; }\n', False, "VirelaiUnsupportedPosix"),
-        "posix-errno": ('export fn probe() usize { return @intFromEnum(std.posix.errno(@as(isize,-1))); }\n',
+        "posix-errno": ('export fn probe() usize { return @backingInt(std.posix.errno(@as(isize,-1))); }\n',
                         False, "VirelaiUnsupportedPosix"),
         "posix-getrandom": ('export fn probe() void { var b:[1]u8=undefined; _=std.posix.system.getrandom(&b,1,0); }\n',
                             False, "VirelaiUnsupportedPosix"),

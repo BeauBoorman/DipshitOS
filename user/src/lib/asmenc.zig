@@ -100,7 +100,7 @@ pub const Cond = enum(u4) {
 /// B.cond with a ±1 MiB pc-relative BYTE offset.
 pub fn enc_b_cond(cond: Cond, rel_bytes: i32) u32 {
     const off: u32 = @bitCast(rel_bytes >> 2);
-    return 0x54000000 | ((off & 0x7FFFF) << 5) | @intFromEnum(cond);
+    return 0x54000000 | ((off & 0x7FFFF) << 5) | @backingInt(cond);
 }
 
 pub fn parse_cond(name: []const u8) ?Cond {

@@ -470,7 +470,7 @@ pub const ErrorCode = enum(i64) {
 };
 
 pub fn error_result(code: ErrorCode) u64 {
-    return @bitCast(@intFromEnum(code));
+    return @bitCast(@backingInt(code));
 }
 
 pub const Args = [6]u64;
@@ -1442,7 +1442,7 @@ fn handle_ping_poll(_: Args, _: *exceptions.VectorFrame) u64 {
 
 /// The fixed packed snapshot exposed by `sys_net_stats`. All integers
 /// little-endian; IPs are raw network-order bytes (`[4]u8`); MACs raw
-/// bytes (`[6]u8`). Enums are their `@intFromEnum` naturals, pinned in
+/// bytes (`[6]u8`). Enums are their `@backingInt` naturals, pinned in
 /// the doc comments. The userland mirror lives in
 /// `user/src/lib/netstats.zig` — the host tests on both sides pin
 /// `@sizeOf` and the key `@offsetOf`s so drift fails loudly.
@@ -1498,12 +1498,12 @@ fn handle_net_stats(args: Args, _: *exceptions.VectorFrame) u64 {
     snap.mac = virtio_net.net_mac;
     snap.own_ip = arp.own_ip;
     snap.gateway = dhcp.lease_gw;
-    snap.dhcp_state = @intFromEnum(dhcp.state);
+    snap.dhcp_state = @backingInt(dhcp.state);
     snap.lease_ip = dhcp.lease_ip;
     snap.lease_mask = dhcp.lease_mask;
     snap.lease_server = dhcp.lease_server;
     snap.lease_secs = dhcp.lease_time;
-    snap.tcp_state = @intFromEnum(tcp.state);
+    snap.tcp_state = @backingInt(tcp.state);
     snap.tcp_peer_ip = tcp.peer_ip;
     snap.tcp_peer_port = tcp.peer_port;
     var udp_i: usize = 0;
@@ -2565,7 +2565,7 @@ fn handle_tty_attach(args: Args, _: *exceptions.VectorFrame) u64 {
             if (!virtio_net.net_ready) return error_result(.einval);
             if (!virtio_net.arp.ip_set()) return error_result(.einval);
             const port: u16 = @truncate(args[1]);
-            const scheme: terminal.NetAuthScheme = @enumFromInt(@as(u8, @intCast(args[2])));
+            const scheme: terminal.NetAuthScheme = @fromBackingInt(@intCast(@as(u8, @intCast(args[2]))));
             var allow: ?[4]u8 = null;
             if (args[4] != 0) {
                 allow = .{

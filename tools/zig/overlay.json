@@ -1,6 +1,6 @@
 {
   "lib/std/posix.zig": {
-    "original_sha256": "5b1462b18db6757d984e118e09c532ac8b98cf1cc1ed48f18fcdbb362b75b5e0",
+    "original_sha256": "73e710180ab3c8979a9055386efd0fb94176e84f2e5fd371858335511206a55b",
     "edits": [
       {
         "before": "pub const system = if (use_libc)",
@@ -9,7 +9,7 @@
     ]
   },
   "lib/std/process/Args.zig": {
-    "original_sha256": "109b1e62242bdbaa48fbe05a5284cc823141a98adb9f029f28cd7e7248fc785b",
+    "original_sha256": "46dfd4197ed704ae39f6aa352c0ea8a9f4f663570c0c9ae15c1c59d09da4d049",
     "edits": [
       {
         "before": "pub const Vector = switch (native_os)",
@@ -18,7 +18,7 @@
     ]
   },
   "lib/std/process/Environ.zig": {
-    "original_sha256": "087fdd3cd6a6f5537eb65ad836ec611d81a7933286d0b14358b6ee7b8dfa0464",
+    "original_sha256": "e3eb7f0e6e1ff28914702d3742948c371b005df32d1421c05d0d6b2b1fbd1eb6",
     "edits": [
       {
         "before": "pub const Block = switch (native_os)",
@@ -27,7 +27,7 @@
     ]
   },
   "lib/std/process.zig": {
-    "original_sha256": "32bc77b977b8a25276552b07db9dfc1f96ba1acac8a2478746e4b04ef552ba02",
+    "original_sha256": "26f84fb6f6e0792335ea9e6204893eef57aaa1a6bd2d9e5b26688c4eae603b1e",
     "edits": [
       {
         "before": "pub fn exit(status: u8) noreturn {",
@@ -40,7 +40,7 @@
     ]
   },
   "lib/std/process/Preopens.zig": {
-    "original_sha256": "3b46083ae900b28cef493e3a798f9e7f2fb00100aef77b084a7f673a0c54b1e8",
+    "original_sha256": "797eff2853d340796a90aaa5f64e6dff32bff0c1c57b59286fc5f54f5969ec6e",
     "edits": [
       {
         "before": "    switch (native_os) {",
@@ -49,7 +49,7 @@
     ]
   },
   "lib/std/Io.zig": {
-    "original_sha256": "2d452f28cbeca10280f471b8e1962cdfe2a01000535050af6f6ebcc1a56365d6",
+    "original_sha256": "382a4e343017183eff88e311f983066f88306e7bfcd85a890723b3697f4b2732",
     "edits": [
       {
         "before": "pub const Threaded = @import(\"Io/Threaded.zig\");",

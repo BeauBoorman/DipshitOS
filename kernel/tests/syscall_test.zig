@@ -737,7 +737,7 @@ test "syscall: procs snapshot reflects live registry state and marshals fixed ro
     // The boot payload is process 0, RUNNING, named "user-el0".
     try std.testing.expectEqual(@as(u64, 1), dispatch(sys_procs, .{ @intFromPtr(&buf), buf.len, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, buf[0..8], .little)); // pid 0
-    try std.testing.expectEqual(@as(u64, @intFromEnum(process.State.running)), std.mem.readInt(u64, buf[8..16], .little));
+    try std.testing.expectEqual(@as(u64, @backingInt(process.State.running)), std.mem.readInt(u64, buf[8..16], .little));
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, buf[16..24], .little)); // no status while running
     try std.testing.expectEqualStrings("user-el0", buf[24 .. 24 + 8]);
     // The name field is NUL-padded to the full 16-byte slot.
@@ -747,7 +747,7 @@ test "syscall: procs snapshot reflects live registry state and marshals fixed ro
     try std.testing.expectEqual(@as(usize, 2), scheduler.current_id());
     try std.testing.expect(scheduler.exit_current(7));
     try std.testing.expectEqual(@as(u64, 1), dispatch(sys_procs, .{ @intFromPtr(&buf), buf.len, 0, 0, 0, 0 }, &frame));
-    try std.testing.expectEqual(@as(u64, @intFromEnum(process.State.exited)), std.mem.readInt(u64, buf[8..16], .little));
+    try std.testing.expectEqual(@as(u64, @backingInt(process.State.exited)), std.mem.readInt(u64, buf[8..16], .little));
     try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, buf[16..24], .little)); // the snapshotted status
     // A created (loaded, not yet bound) process joins the snapshot: two
     // rows, in id order, with the free rows skipped.
@@ -756,7 +756,7 @@ test "syscall: procs snapshot reflects live registry state and marshals fixed ro
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, buf[0..8], .little));
     try std.testing.expectEqualStrings("user-el0", buf[24 .. 24 + 8]);
     try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, buf[40..48], .little)); // row 2's pid
-    try std.testing.expectEqual(@as(u64, @intFromEnum(process.State.created)), std.mem.readInt(u64, buf[48..56], .little));
+    try std.testing.expectEqual(@as(u64, @backingInt(process.State.created)), std.mem.readInt(u64, buf[48..56], .little));
     try std.testing.expectEqualStrings("PEER.BIN", buf[64 .. 64 + 8]);
 }
 

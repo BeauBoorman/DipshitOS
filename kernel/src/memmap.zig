@@ -74,7 +74,7 @@ pub const MapView = struct {
         const base = index * self.descriptor_size;
         if (base + @sizeOf(MemoryDescriptor) > self.data.len) return null;
         return .{
-            .type = @enumFromInt(std.mem.readInt(u32, self.data[base..][0..4], .little)),
+            .type = @fromBackingInt(@intCast(std.mem.readInt(u32, self.data[base..][0..4], .little))),
             .physical_start = std.mem.readInt(u64, self.data[base + 8 ..][0..8], .little),
             .virtual_start = std.mem.readInt(u64, self.data[base + 16 ..][0..8], .little),
             .number_of_pages = std.mem.readInt(u64, self.data[base + 24 ..][0..8], .little),

@@ -285,7 +285,7 @@ pub fn buildClientHello(out: []u8, args: ClientHelloArgs) Error![]const u8 {
     var w = Writer.init(out);
 
     // Handshake header, back-patched once the body length is known.
-    try w.putU8(@intFromEnum(HandshakeType.client_hello));
+    try w.putU8(@backingInt(HandshakeType.client_hello));
     const hdr_len_at = w.len;
     try w.putU24(0);
 
@@ -575,7 +575,7 @@ test "handshake: ClientHello has the shape the transcript needs" {
 
     const msg = try buildClientHello(&buf, .{ .host = "example.com", .random = rand, .session_id = sid, .x25519_pub = pk });
     const h = try MessageHeader.decode(msg);
-    try std.testing.expectEqual(@intFromEnum(HandshakeType.client_hello), h.msg_type);
+    try std.testing.expectEqual(@backingInt(HandshakeType.client_hello), h.msg_type);
     try std.testing.expectEqual(msg.len - 4, h.length);
 
     // Body parses far enough to find the version, the suite and the SNI.

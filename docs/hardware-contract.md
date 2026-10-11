@@ -505,7 +505,7 @@ Non-PCI platform facts:
   (`adr` rides the content offset inside the PC; `adrp`+`add` resolves only
   with content at `base+0`). ADR 0002. **[observed]**
 - **PC-relative addressing alone does NOT cover every reference.** The
-  toolchain (Zig 0.16 / lld) still emits **absolute, base-0 pointer tables**
+  toolchain (Zig 0.17 / lld) still emits **absolute, base-0 pointer tables**
   in initialized data for some code shapes — LLVM jump tables and
   outlined-function pointer arrays. Observed on the M43 U1 kernel
   (`--emit-relocs`, 2026-09-10): **70 `R_AARCH64_ABS64` in `.rodata` + 44 in

@@ -6190,7 +6190,7 @@ test "tabwm: go_refresh is bounded well under the live scan budget (TWM/GO9)" {
     go_refresh();
     try std.testing.expect(go_match_count() == go_max_results);
     // The live 5 ms budget is pinned by `tabwm: go-scan-us=` on
-    // live-tabwm-bt (CNTPCT). Host zig 0.16 has no std.time.Timer; the
+    // live-tabwm-bt (CNTPCT). Host zig 0.17 has no std.time.Timer; the
     // conversion itself is what we can unit-test here.
     try std.testing.expectEqual(@as(u64, 1000), ticks_to_us(24_000, 24_000_000));
     try std.testing.expectEqual(@as(u64, 0), ticks_to_us(100, 0));

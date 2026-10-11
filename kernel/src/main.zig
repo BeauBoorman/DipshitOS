@@ -639,13 +639,13 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     uart_puts(" version=");
     uart_hex(@intCast(map_after_exit.info.descriptor_version));
     uart_puts(" key=");
-    uart_hex(@intFromEnum(map_after_exit.info.key));
+    uart_hex(@backingInt(map_after_exit.info.key));
     uart_puts("\n");
 
     var it = map_after_exit.iterator();
     while (it.next()) |desc| {
         uart_puts("map type=");
-        uart_hex(@intFromEnum(desc.type));
+        uart_hex(@backingInt(desc.type));
         uart_puts(" base=");
         uart_hex(desc.physical_start);
         uart_puts(" pages=");

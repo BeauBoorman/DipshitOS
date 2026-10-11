@@ -1054,7 +1054,7 @@ pub const Session = struct {
     /// Attach a front-end (`sys_tty_attach`, slot 67). `detach` is the
     /// explicit selector 0; any other selector is an attach.
     pub fn attach(self: *Session, front_end: FrontEnd) bool {
-        const ok = abi.tty_attach(@intFromEnum(front_end)) == 0;
+        const ok = abi.tty_attach(@backingInt(front_end)) == 0;
         if (ok and front_end != .detach) self.attached = true;
         if (ok and front_end == .detach) self.attached = false;
         return ok;
@@ -1156,10 +1156,10 @@ const Capture = struct {
 
 test "tty: ABI constants mirror the terminal seam (drift guard)" {
     try std.testing.expectEqualStrings("/dev/tty", tty_path);
-    try std.testing.expectEqual(@as(u64, 0), @intFromEnum(FrontEnd.detach));
-    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(FrontEnd.serial));
-    try std.testing.expectEqual(@as(u64, 2), @intFromEnum(FrontEnd.window));
-    try std.testing.expectEqual(@as(u64, 3), @intFromEnum(FrontEnd.net));
+    try std.testing.expectEqual(@as(u64, 0), @backingInt(FrontEnd.detach));
+    try std.testing.expectEqual(@as(u64, 1), @backingInt(FrontEnd.serial));
+    try std.testing.expectEqual(@as(u64, 2), @backingInt(FrontEnd.window));
+    try std.testing.expectEqual(@as(u64, 3), @backingInt(FrontEnd.net));
     try std.testing.expectEqual(@as(u64, 67), abi.sys_tty_attach_num);
 }
 

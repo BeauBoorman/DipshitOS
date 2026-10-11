@@ -43,13 +43,13 @@ pub const SectionId = enum(u8) {
 
     pub fn from_index(idx: usize) ?SectionId {
         if (idx < count) {
-            return @enumFromInt(@as(u8, @intCast(idx)));
+            return @fromBackingInt(@intCast(@as(u8, @intCast(idx))));
         }
         return null;
     }
 
     pub fn index(self: SectionId) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn name(self: SectionId) []const u8 {

@@ -224,7 +224,7 @@ fn discover(root: []const u8, root_id: meta.Identity) void {
                 visited += 1;
                 if (visited > 256 or queued >= pending.len) {
                     var details: [96]u8 = undefined;
-                    say(std.fmt.bufPrint(&details, "b3: Boris visited={d} queued={d} kind={d}\n", .{ visited, queued, @intFromEnum(entry.metadata.kind) }) catch unreachable);
+                    say(std.fmt.bufPrint(&details, "b3: Boris visited={d} queued={d} kind={d}\n", .{ visited, queued, @backingInt(entry.metadata.kind) }) catch unreachable);
                 }
                 check(visited <= 256);
                 if (entry.metadata.kind != .directory) continue;

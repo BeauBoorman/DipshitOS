@@ -49,13 +49,13 @@ pub fn Backend(comptime Driver: type) type {
         pub fn io(self: *Self) Io {
             return .{ .userdata = self, .vtable = &vtable };
         }
-        fn state(ptr: ?*anyopaque) *Self {
+        pub fn state(ptr: ?*anyopaque) *Self {
             return @ptrCast(@alignCast(ptr orelse Driver.instance()));
         }
-        fn reject(comptime name: []const u8, comptime R: type) R {
+        pub fn reject(comptime name: []const u8, comptime R: type) R {
             return refusals.result(Driver, name, R);
         }
-        fn fileRecord(self: *Self, file: File) ?*Record {
+        pub fn fileRecord(self: *Self, file: File) ?*Record {
             for (&self.records) |*entry| {
                 if (entry.*) |*record| {
                     if (record.token == file.handle and record.kind == .file) return record;
@@ -73,12 +73,12 @@ pub fn Backend(comptime Driver: type) type {
         pub fn liveResources(self: *Self) usize {
             return 4 + self.liveFiles();
         }
-        fn reserve(self: *Self) fs.Error!*?Record {
+        pub fn reserve(self: *Self) fs.Error!*?Record {
             if (self.next_token == std.math.maxInt(i64)) return error.ResourceLimit;
             for (&self.records) |*entry| if (entry.* == null) return entry;
             return error.ResourceLimit;
         }
-        fn track(self: *Self, entry: *?Record, fd: u64, kind: @FieldType(Record, "kind"), writable: bool) i64 {
+        pub fn track(self: *Self, entry: *?Record, fd: u64, kind: @FieldType(Record, "kind"), writable: bool) i64 {
             const token = self.next_token;
             self.next_token += 1;
             entry.* = .{ .token = token, .fd = fd, .kind = kind, .writable = writable };
@@ -105,7 +105,7 @@ pub fn Backend(comptime Driver: type) type {
             if (cursor == 0) return error.ProtocolViolation;
             return .{ .token = self.track(entry, cursor, .snapshot, false) };
         }
-        fn snapshotRecord(self: *Self, snapshot: fs.Snapshot) fs.Error!*?Record {
+        pub fn snapshotRecord(self: *Self, snapshot: fs.Snapshot) fs.Error!*?Record {
             for (&self.records) |*entry| if (entry.*) |record| {
                 if (record.token == snapshot.token and record.kind == .snapshot) return entry;
             };
@@ -127,13 +127,13 @@ pub fn Backend(comptime Driver: type) type {
             const record = self.fileRecord(file) orelse return error.InvalidHandle;
             return NativeFs.handleMetadata(record.fd, fs.handle_file);
         }
-        fn directoryRecord(self: *Self, dir: fs.Directory) fs.Error!*?Record {
+        pub fn directoryRecord(self: *Self, dir: fs.Directory) fs.Error!*?Record {
             for (&self.records) |*entry| if (entry.*) |record| {
                 if (record.token == dir.token and record.kind == .directory) return entry;
             };
             return error.InvalidHandle;
         }
-        fn pin(self: *Self, dir: fs.Directory) fs.Error!u64 {
+        pub fn pin(self: *Self, dir: fs.Directory) fs.Error!u64 {
             return (try self.directoryRecord(dir)).*.?.fd;
         }
         /// B5: pins an existing directory. Name operations below act on the
@@ -190,7 +190,7 @@ pub fn Backend(comptime Driver: type) type {
         pub fn publish(_: *Self, from: []const u8, to: []const u8, mode: fs.Publication) fs.Error!void {
             try NativeFs.publish(from, to, mode);
         }
-        fn openError(err: fs.Error) File.OpenError {
+        pub fn openError(err: fs.Error) File.OpenError {
             return switch (err) {
                 error.ResourceLimit, error.OutOfMemory => error.SystemResources,
                 error.FileNotFound => error.FileNotFound,
@@ -226,14 +226,14 @@ pub fn Backend(comptime Driver: type) type {
             return buffer[0 .. 6 + relative.len];
         }
         /// Cwd is lexical SDK state, not proof of no-follow containment.
-        fn nativePath(dir: Dir, name: []const u8, buffer: []u8) File.OpenError![]const u8 {
+        pub fn nativePath(dir: Dir, name: []const u8, buffer: []u8) File.OpenError![]const u8 {
             if (dir.handle != platform.cwd_token) return reject("DirectoryToken", File.OpenError![]const u8);
             return fs.fullPath(name, buffer) catch |err| return switch (err) {
                 error.InvalidArgument => error.BadPathName,
                 else => openError(err),
             };
         }
-        fn open(self: *Self, dir: Dir, name: []const u8, flags: u32) File.OpenError!File {
+        pub fn open(self: *Self, dir: Dir, name: []const u8, flags: u32) File.OpenError!File {
             var buffer: [path_bytes]u8 = undefined;
             const full = try if (wide_paths) nativePath(dir, name, &buffer) else path(dir, name, &buffer);
             const entry = self.reserve() catch return error.ProcessFdQuotaExceeded;
@@ -243,7 +243,7 @@ pub fn Backend(comptime Driver: type) type {
             const token = self.track(entry, fd, .file, flags & 2 != 0);
             return .{ .handle = @intCast(token), .flags = .{ .nonblocking = false } };
         }
-        fn dirOpenFile(ptr: ?*anyopaque, dir: Dir, name: []const u8, options: Dir.OpenFileOptions) File.OpenError!File {
+        pub fn dirOpenFile(ptr: ?*anyopaque, dir: Dir, name: []const u8, options: Dir.OpenFileOptions) File.OpenError!File {
             if (options.mode == .read_write or options.path_only or options.lock != .none or
                 options.lock_nonblocking or options.allow_ctty)
                 return reject("OpenOptions", File.OpenError!File);
@@ -255,13 +255,13 @@ pub fn Backend(comptime Driver: type) type {
             if (options.mode != .read_only) return reject("OpenOptions", File.OpenError!File);
             return state(ptr).open(dir, name, 1);
         }
-        fn dirCreateFile(ptr: ?*anyopaque, dir: Dir, name: []const u8, options: Dir.CreateFileOptions) File.OpenError!File {
+        pub fn dirCreateFile(ptr: ?*anyopaque, dir: Dir, name: []const u8, options: Dir.CreateFileOptions) File.OpenError!File {
             if (options.read or !options.truncate or options.exclusive or options.lock != .none or
                 options.lock_nonblocking or options.resolve_beneath or options.permissions != .default_file)
                 return reject("CreateOptions", File.OpenError!File);
             return state(ptr).open(dir, name, 2 | 4);
         }
-        fn dirCreateDir(ptr: ?*anyopaque, dir: Dir, name: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
+        pub fn dirCreateDir(ptr: ?*anyopaque, dir: Dir, name: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
             if (permissions != .default_dir) return reject("DirectoryPermissions", Dir.CreateDirError!void);
             const self = state(ptr);
             const file = self.open(dir, name, 2 | 4 | 16) catch |err| return switch (err) {
@@ -308,10 +308,10 @@ pub fn Backend(comptime Driver: type) type {
             };
         }
         /// A full std `File.Stat` would need invented fields; use fileMetadata.
-        fn fileStat(_: ?*anyopaque, _: File) File.StatError!File.Stat {
+        pub fn fileStat(_: ?*anyopaque, _: File) File.StatError!File.Stat {
             return reject("FdMetadataUnavailable", File.StatError!File.Stat);
         }
-        fn fileLength(ptr: ?*anyopaque, file: File) File.LengthError!u64 {
+        pub fn fileLength(ptr: ?*anyopaque, file: File) File.LengthError!u64 {
             const value = state(ptr).fileMetadata(file) catch |err| return switch (err) {
                 error.InvalidHandle => reject("UnboundOrClosedFile", File.LengthError!u64),
                 error.Unsupported => reject("FdMetadataUnavailable", File.LengthError!u64),
@@ -326,7 +326,7 @@ pub fn Backend(comptime Driver: type) type {
             };
             return value.size;
         }
-        fn renameError(err: fs.Error) Dir.RenamePreserveError {
+        pub fn renameError(err: fs.Error) Dir.RenamePreserveError {
             return switch (err) {
                 error.InvalidArgument => refused: {
                     Driver.diagnostic("Filesystem:InvalidArgument\n");
@@ -346,7 +346,7 @@ pub fn Backend(comptime Driver: type) type {
                 },
             };
         }
-        fn checkRenamePaths(from_dir: Dir, from: []const u8, to_dir: Dir, to: []const u8) Dir.RenameError!void {
+        pub fn checkRenamePaths(from_dir: Dir, from: []const u8, to_dir: Dir, to: []const u8) Dir.RenameError!void {
             if (from_dir.handle != platform.cwd_token or to_dir.handle != platform.cwd_token)
                 return reject("DirectoryToken", Dir.RenameError!void);
             if (!wide_paths) {
@@ -361,21 +361,21 @@ pub fn Backend(comptime Driver: type) type {
                 }
             }
         }
-        fn dirRenamePreserve(ptr: ?*anyopaque, from_dir: Dir, from: []const u8, to_dir: Dir, to: []const u8) Dir.RenamePreserveError!void {
+        pub fn dirRenamePreserve(ptr: ?*anyopaque, from_dir: Dir, from: []const u8, to_dir: Dir, to: []const u8) Dir.RenamePreserveError!void {
             try checkRenamePaths(from_dir, from, to_dir, to);
             state(ptr).publish(from, to, .preserve_existing) catch |err| return renameError(err);
         }
-        fn dirRename(ptr: ?*anyopaque, from_dir: Dir, from: []const u8, to_dir: Dir, to: []const u8) Dir.RenameError!void {
+        pub fn dirRename(ptr: ?*anyopaque, from_dir: Dir, from: []const u8, to_dir: Dir, to: []const u8) Dir.RenameError!void {
             try checkRenamePaths(from_dir, from, to_dir, to);
             state(ptr).publish(from, to, .replace) catch |err| return switch (renameError(err)) {
                 error.OperationUnsupported, error.PathAlreadyExists => reject("RenameUnavailable", Dir.RenameError!void),
                 else => |mapped| mapped,
             };
         }
-        fn fileClose(ptr: ?*anyopaque, files: []const File) void {
+        pub fn fileClose(ptr: ?*anyopaque, files: []const File) void {
             for (files) |file| state(ptr).closeChecked(file) catch Driver.fatal("CloseFailed");
         }
-        fn fileSync(ptr: ?*anyopaque, file: File) File.SyncError!void {
+        pub fn fileSync(ptr: ?*anyopaque, file: File) File.SyncError!void {
             const record = state(ptr).fileRecord(file) orelse return reject("UnboundOrClosedFile", File.SyncError!void);
             const result = Driver.call(77, .{ record.fd, 0, 0, 0, 0, 0 });
             if (result != 0) return switch (result) {
@@ -384,13 +384,13 @@ pub fn Backend(comptime Driver: type) type {
                 else => error.InputOutput,
             };
         }
-        fn fileSetLength(ptr: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
+        pub fn fileSetLength(ptr: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
             if (length > std.math.maxInt(u32)) return error.FileTooBig;
             const record = state(ptr).fileRecord(file) orelse return reject("UnboundOrClosedFile", File.SetLengthError!void);
             if (!record.writable) return error.AccessDenied;
             if (Driver.call(36, .{ record.fd, length, 0, 0, 0, 0 }) != 0) return error.Unexpected;
         }
-        fn read(self: *Self, op: Io.Operation.FileReadStreaming) Io.Operation.FileReadStreaming.Result {
+        pub fn read(self: *Self, op: Io.Operation.FileReadStreaming) Io.Operation.FileReadStreaming.Result {
             const record = self.fileRecord(op.file) orelse return reject("UnboundOrClosedInput", Io.Operation.FileReadStreaming.Result);
             if (record.writable) return error.NotOpenForReading;
             for (op.data) |buffer| {
@@ -404,7 +404,7 @@ pub fn Backend(comptime Driver: type) type {
             }
             return 0; // A supported, valid handle and an empty request.
         }
-        fn writeChunk(self: *Self, file: File, bytes: []const u8) Io.Operation.FileWriteStreaming.Result {
+        pub fn writeChunk(self: *Self, file: File, bytes: []const u8) Io.Operation.FileWriteStreaming.Result {
             if (file.handle == platform.diagnostic_token) {
                 Driver.diagnostic(bytes);
                 return bytes.len;
@@ -421,7 +421,7 @@ pub fn Backend(comptime Driver: type) type {
             };
             return @intCast(n);
         }
-        fn write(self: *Self, op: Io.Operation.FileWriteStreaming) Io.Operation.FileWriteStreaming.Result {
+        pub fn write(self: *Self, op: Io.Operation.FileWriteStreaming) Io.Operation.FileWriteStreaming.Result {
             // Validate even an empty request; an unbound stream is not a sink.
             if (op.file.handle != platform.diagnostic_token) {
                 const record = self.fileRecord(op.file) orelse
@@ -435,7 +435,7 @@ pub fn Backend(comptime Driver: type) type {
             }
             return 0;
         }
-        fn operate(ptr: ?*anyopaque, op: Io.Operation) Io.Cancelable!Io.Operation.Result {
+        pub fn operate(ptr: ?*anyopaque, op: Io.Operation) Io.Cancelable!Io.Operation.Result {
             try checkCancel(ptr);
             return switch (op) {
                 .file_read_streaming => |request| .{ .file_read_streaming = state(ptr).read(request) },
@@ -444,20 +444,32 @@ pub fn Backend(comptime Driver: type) type {
                     Driver.diagnostic("Unsupported:net_receive\n");
                     break :refused .{ .net_receive = .{ error.Unexpected, 0 } };
                 },
+                .net_send => refused: {
+                    Driver.diagnostic("Unsupported:net_send\n");
+                    break :refused .{ .net_send = .{ error.Unexpected, 0 } };
+                },
+                .net_read => |request| .{
+                    .net_read = socketRead(ptr, request) catch |err| switch (err) {
+                        error.Canceled => return error.Canceled,
+                        else => |e| e,
+                    },
+                },
+                .net_write => |request| .{
+                    .net_write = socketWrite(ptr, request) catch |err| switch (err) {
+                        error.Canceled => return error.Canceled,
+                        else => |e| e,
+                    },
+                },
                 .device_io_control => Driver.fatal("Unsupported:device_io_control"),
             };
         }
-        fn netSend(_: ?*anyopaque, _: Io.net.Socket.Handle, _: []Io.net.OutgoingMessage, _: Io.net.SendFlags) struct { ?Io.net.Socket.SendError, usize } {
-            Driver.diagnostic("Unsupported:netSend\n");
-            return .{ error.Unexpected, 0 };
-        }
-        fn socketRecord(self: *Self, handle: Io.net.Socket.Handle) ?*Record {
+        pub fn socketRecord(self: *Self, handle: Io.net.Socket.Handle) ?*Record {
             for (&self.records) |*entry| if (entry.*) |*r| {
                 if (r.token == handle and (r.kind == .listener or r.kind == .stream)) return r;
             };
             return null;
         }
-        fn netListenIp(ptr: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ListenOptions) Io.net.IpAddress.ListenError!Io.net.Socket {
+        pub fn netListenIp(ptr: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ListenOptions) Io.net.IpAddress.ListenError!Io.net.Socket {
             try checkCancel(ptr);
             if (address.* != .ip4) return error.AddressFamilyUnsupported;
             if (options.mode != .stream) return error.SocketModeUnsupported;
@@ -473,7 +485,7 @@ pub fn Backend(comptime Driver: type) type {
             };
             return .{ .handle = @intCast(self.track(entry, h, .listener, false)), .address = address.* };
         }
-        fn netAccept(ptr: ?*anyopaque, handle: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
+        pub fn netAccept(ptr: ?*anyopaque, handle: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
             const self = state(ptr);
             const listener = self.socketRecord(handle) orelse return error.SocketNotListening;
             if (listener.kind != .listener) return error.SocketNotListening;
@@ -502,29 +514,33 @@ pub fn Backend(comptime Driver: type) type {
                 } } };
             }
         }
-        fn netRead(ptr: ?*anyopaque, handle: Io.net.Socket.Handle, data: [][]u8) Io.net.Stream.Reader.Error!usize {
-            const r = state(ptr).socketRecord(handle) orelse return error.SocketUnconnected;
+        pub fn socketRead(ptr: ?*anyopaque, request: Io.Operation.NetRead) Io.net.Stream.Reader.Error!Io.net.Stream.ReadResult {
+            if (request.control.len != 0) {
+                Driver.diagnostic("Unsupported:net_read:control\n");
+                return error.Unexpected;
+            }
+            const r = state(ptr).socketRecord(request.socket_handle) orelse return error.SocketUnconnected;
             if (r.kind != .stream) return error.SocketUnconnected;
             const deadline = Net.now() +| network.budget_ns;
-            for (data) |bytes| {
+            for (request.data) |bytes| {
                 if (bytes.len == 0) continue;
                 while (true) {
                     try checkCancel(ptr);
-                    return Net.read(r.fd, bytes) catch |err| switch (err) {
+                    return .{ .data_len = Net.read(r.fd, bytes) catch |err| switch (err) {
                         error.WouldBlock => {
                             _ = Net.wait(r.fd, 1, deadline) catch |failure| return readError(failure);
                             continue;
                         },
                         else => return readError(err),
-                    };
+                    } };
                 }
             }
-            return 0;
+            return .{ .data_len = 0 };
         }
-        fn readError(err: network.Error) Io.net.Stream.Reader.Error {
+        pub fn readError(err: network.Error) Io.net.Stream.Reader.Error {
             return switch (err) {
                 error.PeerReset => error.ConnectionResetByPeer,
-                error.TimedOut => error.Timeout,
+                error.TimedOut => error.ConnectionTimedOut,
                 error.AccessDenied => error.AccessDenied,
                 error.Closed, error.InvalidHandle => error.SocketUnconnected,
                 error.NetworkDown => error.NetworkDown,
@@ -536,13 +552,17 @@ pub fn Backend(comptime Driver: type) type {
                 },
             };
         }
-        fn netWrite(ptr: ?*anyopaque, handle: Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) Io.net.Stream.Writer.Error!usize {
-            const r = state(ptr).socketRecord(handle) orelse return error.SocketUnconnected;
+        pub fn socketWrite(ptr: ?*anyopaque, request: Io.Operation.NetWrite) Io.net.Stream.Writer.Error!usize {
+            if (request.control.len != 0) {
+                Driver.diagnostic("Unsupported:net_write:control\n");
+                return error.Unexpected;
+            }
+            const r = state(ptr).socketRecord(request.socket_handle) orelse return error.SocketUnconnected;
             if (r.kind != .stream) return error.SocketUnconnected;
             const deadline = Net.now() +| network.budget_ns;
-            const bytes = if (header.len != 0) header else select: {
-                for (data, 0..) |part, i| {
-                    if (i + 1 == data.len and splat == 0) break;
+            const bytes = if (request.header.len != 0) request.header else select: {
+                for (request.data, 0..) |part, i| {
+                    if (i + 1 == request.data.len and request.splat == 0) break;
                     if (part.len != 0) break :select part;
                 }
                 return 0;
@@ -557,18 +577,15 @@ pub fn Backend(comptime Driver: type) type {
                     error.PeerReset => error.ConnectionResetByPeer,
                     error.Closed, error.InvalidHandle => error.SocketUnconnected,
                     error.NetworkDown => error.NetworkDown,
-                    // std's Writer.Error has no Timeout: name it, never call it EOF.
-                    error.TimedOut => named: {
-                        Driver.diagnostic("Network:TimedOut\n");
-                        break :named error.Unexpected;
-                    },
+                    error.TimedOut => error.ConnectionTimedOut,
                     else => error.Unexpected,
                 };
             }
         }
-        fn netClose(ptr: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {
+        pub fn netClose(ptr: ?*anyopaque, sockets: []const Io.net.Socket) void {
             const self = state(ptr);
-            for (handles) |handle| {
+            for (sockets) |socket| {
+                const handle = socket.handle;
                 const record = self.socketRecord(handle) orelse Driver.fatal("Unsupported:netClose:InvalidSocket");
                 const fd = record.fd;
                 const listener = record.kind == .listener;
@@ -579,7 +596,7 @@ pub fn Backend(comptime Driver: type) type {
                 };
             }
         }
-        fn netLookup(ptr: ?*anyopaque, name: Io.net.HostName, queue: *Io.Queue(Io.net.HostName.LookupResult), options: Io.net.HostName.LookupOptions) Io.net.HostName.LookupError!void {
+        pub fn netLookup(ptr: ?*anyopaque, name: Io.net.HostName, queue: *Io.Queue(Io.net.HostName.LookupResult), options: Io.net.HostName.LookupOptions) Io.net.HostName.LookupError!void {
             const self = state(ptr);
             const io_value = self.io();
             defer queue.close(io_value);
@@ -609,24 +626,24 @@ pub fn Backend(comptime Driver: type) type {
                 queue.putOne(io_value, .{ .canonical_name = .{ .bytes = buffer[0..name.bytes.len] } }) catch return error.Unexpected;
             }
         }
-        fn fileReadPositional(_: ?*anyopaque, _: File, _: []const []u8, _: u64) File.ReadPositionalError!usize {
+        pub fn fileReadPositional(_: ?*anyopaque, _: File, _: []const []u8, _: u64) File.ReadPositionalError!usize {
             return error.Unseekable;
         }
-        fn fileWritePositional(_: ?*anyopaque, _: File, _: []const u8, _: []const []const u8, _: usize, _: u64) File.WritePositionalError!usize {
+        pub fn fileWritePositional(_: ?*anyopaque, _: File, _: []const u8, _: []const []const u8, _: usize, _: u64) File.WritePositionalError!usize {
             return error.Unseekable;
         }
-        fn fileSeekTo(_: ?*anyopaque, _: File, _: u64) File.SeekError!void {
+        pub fn fileSeekTo(_: ?*anyopaque, _: File, _: u64) File.SeekError!void {
             return error.Unseekable;
         }
-        fn fileSeekBy(_: ?*anyopaque, _: File, _: i64) File.SeekError!void {
+        pub fn fileSeekBy(_: ?*anyopaque, _: File, _: i64) File.SeekError!void {
             return error.Unseekable;
         }
-        fn processCurrentPath(_: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
+        pub fn processCurrentPath(_: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
             if (buffer.len < 5) return error.NameTooLong;
             @memcpy(buffer[0..5], "/host");
             return 5;
         }
-        fn randomSecure(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+        pub fn randomSecure(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
             var at: usize = 0;
             while (at < buffer.len) {
                 const chunk = buffer[at..][0..@min(256, buffer.len - at)];
@@ -635,42 +652,42 @@ pub fn Backend(comptime Driver: type) type {
                 at += @intCast(n);
             }
         }
-        fn random(ptr: ?*anyopaque, buffer: []u8) void {
+        pub fn random(ptr: ?*anyopaque, buffer: []u8) void {
             randomSecure(ptr, buffer) catch Driver.fatal("EntropyUnavailable");
         }
-        fn async(_: ?*anyopaque, result: []u8, _: std.mem.Alignment, context: []const u8, _: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) ?*Io.AnyFuture {
+        pub fn async(_: ?*anyopaque, result: []u8, _: std.mem.Alignment, context: []const u8, _: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) ?*Io.AnyFuture {
             start(context.ptr, result.ptr);
             return null; // The result has actually been populated synchronously.
         }
-        fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+        pub fn concurrent(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
             return error.ConcurrencyUnavailable;
         }
-        fn groupAsync(_: ?*anyopaque, _: *Io.Group, context: []const u8, _: std.mem.Alignment, start: *const fn (*const anyopaque) void) void {
+        pub fn groupAsync(_: ?*anyopaque, _: *Io.Group, context: []const u8, _: std.mem.Alignment, start: *const fn (*const anyopaque) void) void {
             start(context.ptr);
         }
-        fn groupConcurrent(_: ?*anyopaque, _: *Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+        pub fn groupConcurrent(_: ?*anyopaque, _: *Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
             return error.ConcurrencyUnavailable;
         }
-        fn batchAwaitConcurrent(_: ?*anyopaque, _: *Io.Batch, _: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+        pub fn batchAwaitConcurrent(_: ?*anyopaque, _: *Io.Batch, _: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
             return error.ConcurrencyUnavailable;
         }
-        fn recancel(ptr: ?*anyopaque) void {
+        pub fn recancel(ptr: ?*anyopaque) void {
             state(ptr).canceled = true;
         }
-        fn swapCancelProtection(ptr: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
+        pub fn swapCancelProtection(ptr: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
             const self = state(ptr);
             const old = self.cancel_protection;
             self.cancel_protection = new;
             return old;
         }
-        fn checkCancel(ptr: ?*anyopaque) Io.Cancelable!void {
+        pub fn checkCancel(ptr: ?*anyopaque) Io.Cancelable!void {
             const self = state(ptr);
             if (self.cancel_protection == .unblocked and self.canceled) {
                 self.canceled = false;
                 return error.Canceled;
             }
         }
-        fn lockStderr(ptr: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+        pub fn lockStderr(ptr: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
             const self = state(ptr);
             if (self.debug_locked) Driver.fatal("Unsupported:ReentrantDebugLock");
             if (mode != null and mode.? != .no_color) Driver.fatal("Unsupported:DebugTerminalMode");
@@ -681,11 +698,11 @@ pub fn Backend(comptime Driver: type) type {
             }, self.io(), &.{});
             return .{ .file_writer = &self.debug_writer, .terminal_mode = .no_color };
         }
-        fn tryLockStderr(ptr: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
+        pub fn tryLockStderr(ptr: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
             if (state(ptr).debug_locked) return null;
             return try lockStderr(ptr, mode);
         }
-        fn unlockStderr(ptr: ?*anyopaque) void {
+        pub fn unlockStderr(ptr: ?*anyopaque) void {
             const self = state(ptr);
             if (!self.debug_locked) Driver.fatal("InvalidDebugUnlock");
             self.debug_writer.interface.flush() catch Driver.fatal("DebugFlushFailed");
@@ -850,7 +867,11 @@ test "native Io: fd metadata, locks, std traversal, network and spawn refuse" {
     try std.testing.expectError(error.Unseekable, io.vtable.fileSeekTo(io.userdata, file, 0));
     try std.testing.expectError(error.Unexpected, platform.cwd().openDir(io, "nested", .{}));
     try std.testing.expectError(error.OperationUnsupported, io.vtable.processSpawn(io.userdata, .{ .argv = &.{"child"} }));
-    try std.testing.expectEqual(error.Unexpected, io.vtable.netSend(io.userdata, 0, &.{}, .{})[0].?);
+    try std.testing.expectEqual(error.Unexpected, (try io.operate(.{ .net_send = .{
+        .socket_handle = 0,
+        .messages = &.{},
+        .flags = .{},
+    } })).net_send[0].?);
     try std.testing.expect(Mock.diagnostics > 0);
     file.close(io);
 }

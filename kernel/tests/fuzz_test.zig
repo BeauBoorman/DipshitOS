@@ -35,7 +35,7 @@
 //!
 //! Quiet on success: this module prints ONLY when it has a violation to
 //! report. (An unconditional `std.debug.print` in a test module makes the Zig
-//! 0.16 build runner mark the run step `w` and echo a `failed command:` line
+//! build runner mark the run step `w` and echo a `failed command:` line
 //! for a step whose tests all passed and whose build exits 0 — observed
 //! 2026-09-18 with a five-line probe module. A green fuzz step must not add
 //! that noise to the fleet log.)

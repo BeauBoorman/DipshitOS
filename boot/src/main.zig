@@ -26,8 +26,8 @@
 //! of our own. It allocates the v2 kernel stack and handoff record but never
 //! calls ExitBootServices itself.
 //!
-//! Zig 0.16.0 adjustment: older Zig examples exported `efi_main` with
-//! `callconv(.win64)`. Zig 0.16's `std.start` for the `uefi` OS target
+//! Zig 0.17.0 adjustment: older Zig examples exported `efi_main` with
+//! `callconv(.win64)`. Zig 0.17's `std.start` for the `uefi` OS target
 //! instead exports `EfiMain` (callconv(.c), which on AArch64 is AAPCS64) and
 //! calls our `pub fn main() void`. It installs the firmware-provided EFI
 //! System Table into `std.os.uefi.system_table` before main runs; that is
@@ -478,7 +478,7 @@ fn wait_a_moment() void {
     var i: u64 = 0;
     while (i < 1_500_000_000) : (i += 1) {
         // The volatile asm prevents the optimizer from eliminating the loop.
-        // (Zig 0.16 clobber syntax: a struct literal of clobber flags.)
+        // (Zig 0.17 clobber syntax: a struct literal of clobber flags.)
         asm volatile ("" ::: .{ .memory = true });
     }
 }

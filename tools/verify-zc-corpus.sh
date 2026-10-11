@@ -5,7 +5,7 @@
 # library modules it compiles with, user/src/lib/stdz/*.zig) must compile on
 # BOTH sides:
 #
-#   host  : built with HOST zig 0.16 by the Z4b target recipe
+#   host  : built with HOST zig 0.17 by the Z4b target recipe
 #           (tools/build-zc-host.sh: `zig build-exe` against the real
 #           user/src/lib/zc.zig shim, -T tools/zc-host-link.ld, full
 #           semantic analysis of every fixture body, loader-contract
@@ -91,7 +91,7 @@
 #
 # Wired into the zc verification path: verify-live-zc.sh delegates its
 # host compile-check phase here (--host), so the corpus case table is the
-# single source of truth for "every fixture is valid Zig 0.16" — now
+# single source of truth for "every fixture is valid Zig 0.17" — now
 # strict-valid, since the Z4b build analyzes every function body.
 
 set -euo pipefail
@@ -186,7 +186,7 @@ cases_selected() {
 # Validate the filter once at startup; SELECTED drives every phase.
 SELECTED="$(cases_selected)"
 [ -n "$SELECTED" ] || { echo "verify-zc-corpus: no cases selected" >&2; exit 1; }    # Host-side phase (Z4a + Z4b): every selected case's sources are built by
-# HOST zig 0.16 with the Z4b target recipe — tools/build-zc-host.sh, which
+# HOST zig 0.17 with the Z4b target recipe — tools/build-zc-host.sh, which
 # concatenates the sources with a `_start` epilogue, runs `zig build-exe`
 # (-fno-entry, custom -T script, 4 KiB pages, ReleaseSmall, stripped), and
 # validates the image against the kernel loader contract
@@ -520,7 +520,7 @@ trap 'gate_end 2>/dev/null || true; sleep 0.5' EXIT
 
 REPORT="$(art zc-corpus-report.txt)"
 
-echo "=== verify-zc-corpus: M20 Z4a/Z4b — corpus dual parity (host zig 0.16 build + run vs in-guest zc), cases: $(echo $SELECTED | tr '\n' ' ') ==="
+echo "=== verify-zc-corpus: M20 Z4a/Z4b — corpus dual parity (host zig 0.17 build + run vs in-guest zc), cases: $(echo $SELECTED | tr '\n' ' ') ==="
 zig version
 swift --version 2>&1 | head -1
 sw_vers
