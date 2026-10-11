@@ -49,6 +49,7 @@ var builtins map[string]func(*cmdCtx) int
 func init() {
 	builtins = map[string]func(*cmdCtx) int{
 		"echo": bEcho, "cat": bCat, "pwd": bPwd, "cd": bCd,
+		"pushd": bPushd, "popd": bPopd, "dirs": bDirs,
 		"open": bOpen, "env": bEnv, "printenv": bPrintenv, "set": bSet, "unset": bUnset,
 		"export": bExport, "read": bRead, "jobs": bJobs, "fg": bFg,
 		"history": bHistory, "help": bHelp, "exit": bExit, "monitor": bMonitor,
@@ -62,6 +63,8 @@ func init() {
 		// source that runs a file's lines in this shell.
 		"true": bTrue, "false": bFalse, "source": bSource, ".": bSource,
 		"break": bBreak, "continue": bContinue,
+		// M98b (issue #2128): the session alias table.
+		"alias": bAlias, "unalias": bUnalias,
 	}
 }
 
@@ -143,9 +146,14 @@ func bChmod(c *cmdCtx) int {
 		return 1
 	}
 	file := c.args[1]
-	if err := c.sh.host.Chmod(file, mode); err != nil {
+	rp, rerr := c.sh.resolvePath(file)
+	if rerr != nil {
+		c.out([]byte("chmod: " + file + ": " + rerr.Error() + "\n"))
+		return 1
+	}
+	if err := c.sh.host.Chmod(rp.host, mode); err != nil {
 		if oe, denial := deniedAs(err); denial {
-			c.out([]byte("chmod: " + oe.path + ": " + oe.name + "\n"))
+			c.out([]byte("chmod: " + file + ": " + oe.name + "\n"))
 		} else {
 			c.out([]byte("chmod: " + file + ": " + err.Error() + "\n"))
 		}
@@ -239,8 +247,21 @@ func bOpen(c *cmdCtx) int {
 		c.out([]byte("gosh: open: usage: open PATH|URL\n"))
 		return 2
 	}
-	cwd, _ := c.sh.env.Get("PWD")
-	req, err := mime.Open(c.args[0], cwd, c.sh.host.ReadFile)
+	// File paths resolve against PWD here; URL schemes and volume-colon
+	// forms pass through verbatim because mime's own routing owns them
+	// (localVolumePath handles host:/usbN: itself).
+	target := c.args[0]
+	if !hasScheme(target) {
+		rp, rerr := c.sh.resolvePath(target)
+		if rerr != nil {
+			c.sh.host.Marker("gosh: open refused target=" + c.args[0] +
+				" reason=" + rerr.Error())
+			c.out([]byte("gosh: open: " + c.args[0] + ": " + rerr.Error() + "\n"))
+			return 1
+		}
+		target = rp.canon
+	}
+	req, err := mime.Open(target, "/", c.sh.host.ReadFile)
 	if err != nil {
 		c.sh.host.Marker("gosh: open refused target=" + c.args[0] +
 			" reason=" + err.Error())
@@ -303,22 +324,9 @@ func bPwd(c *cmdCtx) int {
 	return 0
 }
 
-func bCd(c *cmdCtx) int {
-	target := "/"
-	if len(c.args) > 0 {
-		target = c.args[0]
-	}
-	if err := c.sh.host.Chdir(target); err != nil {
-		if oe, denial := deniedAs(err); denial {
-			c.out([]byte("gosh: cd: " + oe.path + ": " + oe.name + "\n"))
-		} else {
-			c.out([]byte("gosh: cd: " + target + ": not a directory\n"))
-		}
-		return 1
-	}
-	c.sh.env.Set("PWD", target)
-	return 0
-}
+// bCd lives in dirstack.go with the rest of M98d's navigation state:
+// `cd DIR`/`cd -`, the OLDPWD update shared with pushd/popd, and the
+// bounded directory stack.
 
 func bEnv(c *cmdCtx) int {
 	for _, v := range c.sh.env.List() {
@@ -619,6 +627,8 @@ var helpCatalog = map[string]helpEntry{
 	"date":    {group: "shell", usage: "date", blurb: "show the firmware wall clock, or name the monotonic fallback", notes: "The calendar face carries the timezone setting's fixed offset (UTC by default); without a firmware epoch the command exits 1."},
 	"echo":    {group: "shell", usage: "echo [ARG...]", blurb: "write ARG... separated by single spaces and a newline", notes: "The engine expands $VAR, ${VAR} and $? before echo runs."},
 	"exit":    {group: "shell", usage: "exit [STATUS]", blurb: "leave GOSH with STATUS (the last status when omitted)"},
+	"alias":   {group: "shell", usage: "alias [NAME=VALUE ...]", blurb: "define or list session aliases", notes: "An unquoted head word naming an alias expands before the line runs — `\\name`, 'name' and \"name\" bypass it. Any builtin can be shadowed, including `exit` and `alias` itself."},
+	"unalias": {group: "shell", usage: "unalias NAME...|-a", blurb: "remove aliases (-a clears the table)"},
 	"help":    {group: "shell", usage: "help [CMD|GROUP]", blurb: "the grouped catalog, or one verb's usage and description"},
 	"history": {group: "shell", usage: "history", blurb: "list this session's submitted lines, oldest first"},
 	"log":     {group: "shell", usage: "log [APP]", blurb: "read one app's bounded log ring, or all app rings"},
@@ -627,7 +637,10 @@ var helpCatalog = map[string]helpEntry{
 
 	// files
 	"cat":    {group: "files", usage: "cat [FILE...]", blurb: "write FILE... (the bound stdin when none is named)"},
-	"cd":     {group: "files", usage: "cd [DIR]", blurb: "change the working directory (checked against the share)"},
+	"cd":     {group: "files", usage: "cd [DIR|-]", blurb: "change the working directory (checked against the share)", notes: "DIR resolves against PWD and `..` is resolved lexically. `cd -` returns to the previous directory. Arguments to an external app still resolve at the share root — the exec ABI carries no per-process cwd — so use an absolute path, or open PATH."},
+	"pushd":  {group: "files", usage: "pushd [DIR]", blurb: "change to DIR and push the old directory (bare: swap with the stack top)"},
+	"popd":   {group: "files", usage: "popd", blurb: "change to the directory stack's top entry and pop it"},
+	"dirs":   {group: "files", usage: "dirs", blurb: "print the directory stack, current directory first"},
 	"open":   {group: "files", usage: "open PATH|URL", blurb: "open a file with its MIME handler or an HTTPS URL in WEB.ELF", notes: "Supports local paths, file://, and https://. Other URL schemes are refused by name."},
 	"pwd":    {group: "files", usage: "pwd", blurb: "print the working directory"},
 	"read":   {group: "files", usage: "read VAR", blurb: "read one line into VAR, preferring the bound stdin"},
@@ -667,6 +680,12 @@ var helpCatalog = map[string]helpEntry{
 	"cut":  {group: "tools", usage: "cut -f LIST [-d C] [FILE...]", blurb: "select fields by LIST ('-d C' sets the delimiter, tab by default)"}, "printf": {group: "tools", usage: "printf FORMAT [ARGS...]", blurb: `write FORMAT with %s/%d/%% substitutions and the escapes \n \t \r \e \xHH \\ \0 (unknown escapes stay literal)`},
 	"test": {group: "tools", usage: "test EXPR", blurb: "evaluate EXPR and set $? (no output)"},
 	"[":    {group: "tools", usage: "[ EXPR ]", blurb: "evaluate EXPR and set $? (the closing ] is required)"},
+	// M98e (issue #2131): the filter-loop composers.
+	"tee":      {group: "tools", usage: "tee [-a] FILE...", blurb: "copy stdin to stdout and each FILE (at most 4)", notes: "Needs piped or redirected input — bare `tee F` refuses rather than truncate F."},
+	"xargs":    {group: "tools", usage: "xargs [-n N] CMD [ARG...]", blurb: "run CMD once per chunk of stdin lines", notes: "One non-empty line is one item — no quoting or splitting, so names may contain spaces (not POSIX). An external CMD under a redirect or $( ) is refused: its output cannot be captured."},
+	"tr":       {group: "tools", usage: "tr [-d] SET1 [SET2]", blurb: "map or delete stdin bytes (a-z ranges; \\n \\t \\\\ escapes)", notes: "[:class:] is refused. Quote bracketed sets — an unquoted [...] word globs."},
+	"basename": {group: "tools", usage: "basename PATH [SUFFIX]", blurb: "the last component of PATH, minus SUFFIX", notes: "Pure string op — no filesystem access."},
+	"dirname":  {group: "tools", usage: "dirname PATH", blurb: "PATH minus its last component", notes: "Pure string op — no filesystem access."},
 
 	// externals: the verb, then the Go net CLIs a daily user reaches from
 	// this prompt by name (M71n #1573 — `exec GOTGIT.ELF` and `exec

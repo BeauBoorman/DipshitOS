@@ -20,10 +20,10 @@ package vi
 type WatchKind uint8
 
 const (
-	WatchCreated WatchKind = iota + 1 // name appeared since the previous snapshot
-	WatchRemoved                      // name is gone since the previous snapshot
-	WatchChanged                      // same name, different size or kind
-	WatchPathGone                     // the watched directory itself stopped listing
+	WatchCreated  WatchKind = iota + 1 // name appeared since the previous snapshot
+	WatchRemoved                       // name is gone since the previous snapshot
+	WatchChanged                       // same name, different size or kind
+	WatchPathGone                      // the watched directory itself stopped listing
 )
 
 // String names the kind for serial markers ("created", "removed", …).

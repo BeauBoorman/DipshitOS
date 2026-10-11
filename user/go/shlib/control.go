@@ -800,12 +800,31 @@ func parseCase(line string) (caseStmt, bool, bool) {
 // alternatives and each alternative is fnmatch-style. The single pattern `*`
 // matches everything (script.zig caseMatch via pipe.globMatch).
 func caseMatch(pattern, subject string) bool {
+	return caseMatchFlagged(pattern, nil, subject)
+}
+
+// caseMatchFlagged is caseMatch over a pattern whose bytes carry
+// glob-active flags (M98a): a `|` or metacharacter that arrived marked
+// literal — quoted, or spliced in by $(...) — is text, not an alternative
+// separator or a wildcard.
+func caseMatchFlagged(pattern string, act []bool, subject string) bool {
 	for i := 0; i <= len(pattern); {
 		j := i
-		for j < len(pattern) && pattern[j] != '|' {
+		for j < len(pattern) && !(pattern[j] == '|' && active(act, j)) {
 			j++
 		}
-		if alt := trimSpace(pattern[i:j]); alt != "" && globMatch(alt, subject) {
+		lo, hi := i, j
+		for lo < hi && isSpaceByte(pattern[lo]) {
+			lo++
+		}
+		for hi > lo && isSpaceByte(pattern[hi-1]) {
+			hi--
+		}
+		var aflags []bool
+		if act != nil {
+			aflags = act[lo:hi]
+		}
+		if lo < hi && globMatchFlagged(pattern[lo:hi], aflags, subject) {
 			return true
 		}
 		if j >= len(pattern) {
@@ -822,32 +841,48 @@ func caseMatch(pattern, subject string) bool {
 // Iterative with a single backtrack point, so a pattern like `a*a*a*b`
 // against a long subject stays linear rather than exponential.
 func globMatch(pattern, subject string) bool {
+	return globMatchFlagged(pattern, nil, subject)
+}
+
+// globMatchFlagged is globMatch over a pattern whose bytes carry
+// glob-active flags (M98a): a byte with act[i]==false compares literally
+// even when it spells `*`, `?` or `[` — quoting rules live in the flags,
+// so the matcher's semantics stay identical for the all-active case.
+func globMatchFlagged(pattern string, act []bool, subject string) bool {
 	p, n := 0, 0
 	starP, starN := -1, 0
 	for n < len(subject) {
-		if p < len(pattern) {
+		consumed, classMiss := false, false
+		if p < len(pattern) && active(act, p) {
 			switch pattern[p] {
 			case '*':
 				starP, starN = p, n
 				p++
-				continue
+				consumed = true
 			case '?':
 				p++
 				n++
-				continue
+				consumed = true
 			case '[':
-				if np, ok := globClass(pattern, p, subject[n]); ok {
+				if np, ok := globClassFlagged(pattern, act, p, subject[n]); ok {
 					p = np
 					n++
-					continue
-				}
-			default:
-				if pattern[p] == subject[n] {
-					p++
-					n++
-					continue
+					consumed = true
+				} else {
+					// A class that did not match is not a literal `[`
+					// fallback — pipe.zig treats it as a miss and
+					// backtracks only through `*`.
+					classMiss = true
 				}
 			}
+		}
+		if consumed {
+			continue
+		}
+		if !classMiss && p < len(pattern) && pattern[p] == subject[n] {
+			p++
+			n++
+			continue
 		}
 		if starP >= 0 {
 			p = starP + 1
@@ -857,38 +892,41 @@ func globMatch(pattern, subject string) bool {
 		}
 		return false
 	}
-	for p < len(pattern) && pattern[p] == '*' {
+	for p < len(pattern) && pattern[p] == '*' && active(act, p) {
 		p++
 	}
 	return p == len(pattern)
 }
 
-// globClass matches subject byte c against the `[...]` class at pattern[at]
-// and returns the index past the class. ok=false means "no match": a class
-// whose bytes do not contain c, and also a malformed one (`[` with no `]`).
-// That second case is pipe.zig's behaviour and is NOT the same as treating
-// `[` as a literal, so the pattern `[` matches nothing at all.
-func globClass(pattern string, at int, c byte) (int, bool) {
+// globClassFlagged matches subject byte c against the `[...]` class at
+// pattern[at] and returns the index past the class. ok=false means "no
+// match": a class whose bytes do not contain c, and also a malformed one
+// (`[` with no `]`). That second case is pipe.zig's behaviour and is NOT
+// the same as treating `[` as a literal, so the pattern `[` matches
+// nothing at all. Inactive bytes are literal class members: they cannot
+// negate, close, or form a range.
+func globClassFlagged(pattern string, act []bool, at int, c byte) (int, bool) {
 	i := at + 1
 	if i >= len(pattern) {
 		return 0, false
 	}
 	negate := false
-	if pattern[i] == '!' || pattern[i] == '^' {
+	if active(act, i) && (pattern[i] == '!' || pattern[i] == '^') {
 		negate = true
 		i++
 	}
 	matched := false
 	first := true
 	for i < len(pattern) {
-		if pattern[i] == ']' && !first {
+		if pattern[i] == ']' && active(act, i) && !first {
 			if matched != negate {
 				return i + 1, true
 			}
 			return 0, false
 		}
 		first = false
-		if i+2 < len(pattern) && pattern[i+1] == '-' && pattern[i+2] != ']' {
+		if i+2 < len(pattern) && pattern[i+1] == '-' && active(act, i+1) &&
+			(pattern[i+2] != ']' || !active(act, i+2)) {
 			if c >= pattern[i] && c <= pattern[i+2] {
 				matched = true
 			}
