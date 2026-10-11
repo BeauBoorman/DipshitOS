@@ -34,11 +34,11 @@ pub const max_delay_ticks: u64 = 3600;
 
 /// The armed flag, countdown, and counters, indexed by PROCESS id (the
 /// facility is per-process, like the event queue it fires into).
-var armed: [process.max_processes]bool = [_]bool{false} ** process.max_processes;
-var remaining: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
-var set_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
-var fired_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
-var cancel_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
+var armed: [process.max_processes]bool = @as([process.max_processes]bool, @splat(@as(bool, false)));
+var remaining: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
+var set_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
+var fired_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
+var cancel_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
 
 fn in_range(pid: usize) bool {
     return pid < process.max_processes;

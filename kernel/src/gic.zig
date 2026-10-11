@@ -283,7 +283,7 @@ pub fn init_secondary(private_intid: u32, edge_triggered: bool) void {
 /// It never schedules, acquires a service lock, or modifies the physical PPI.
 pub const profile_update_sgi: u32 = 3;
 pub const profile_ppi: u32 = 27;
-var prefetched: [4]?u32 = [_]?u32{null} ** 4;
+var prefetched: [4]?u32 = @as([4]?u32, @splat(@as(?u32, null)));
 
 pub fn configure_local_interrupt(intid: u32, enabled: bool) void {
     if (comptime builtin.is_test or builtin.cpu.arch != .aarch64) return;
@@ -569,12 +569,12 @@ pub fn disarm_spi_window(first: u32, count: u32) void {
 /// gic, so gic cannot import smp for `max_cores` (same idiom as
 /// `exceptions.max_resume_cores`).
 pub const cpu_cores: usize = 4;
-pub var irqs_acked: [cpu_cores]u32 = [_]u32{0} ** cpu_cores;
+pub var irqs_acked: [cpu_cores]u32 = @as([cpu_cores]u32, @splat(@as(u32, 0)));
 /// The first non-spurious INTID acked per core (0xffffffff until one
 /// arrives). The monitor prints slot 0, which is the meaningful boot
 /// diagnostic: SPIs are IROUTER-pinned to PE 0, and a secondary core's
 /// first ack is its own timer PPI or an SGI by construction.
-pub var first_intid: [cpu_cores]u32 = [_]u32{0xffffffff} ** cpu_cores;
+pub var first_intid: [cpu_cores]u32 = @as([cpu_cores]u32, @splat(@as(u32, 0xffffffff)));
 
 /// This core's index into the per-core counters (MPIDR_EL1.Aff0; 0 on
 /// host tests / non-aarch64 — the exceptions.resume_core idiom).

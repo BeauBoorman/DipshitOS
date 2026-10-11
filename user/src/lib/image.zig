@@ -181,7 +181,7 @@ pub fn decode(bytes: []const u8, out_buf: []align(1) u32) DecodeError!Image {
 // ---------------------------------------------------------------------------
 
 test "image: pixel_at bounds checking" {
-    var raw: [16]u32 = [_]u32{0} ** 16;
+    var raw: [16]u32 = @as([16]u32, @splat(@as(u32, 0)));
     const img = Image{ .width = 4, .height = 4, .pixels = &raw };
 
     try std.testing.expect(img.pixel_at(0, 0) != null);
@@ -191,7 +191,7 @@ test "image: pixel_at bounds checking" {
 }
 
 test "image: sub_image view and zero-sized handling" {
-    var raw: [36]u32 = [_]u32{0} ** 36;
+    var raw: [36]u32 = @as([36]u32, @splat(@as(u32, 0)));
     for (&raw, 0..) |*p, i| p.* = @intCast(i);
 
     const img = Image{ .width = 6, .height = 6, .pixels = &raw };
@@ -211,7 +211,7 @@ test "image: sub_image view and zero-sized handling" {
 }
 
 test "image: blit Porter-Duff alpha blending" {
-    var dest_raw: [4]u32 = [_]u32{0xFF000000} ** 4; // Opaque Black: (A=255, R=0, G=0, B=0)
+    var dest_raw: [4]u32 = @as([4]u32, @splat(@as(u32, 0xFF000000))); // Opaque Black: (A=255, R=0, G=0, B=0)
     var src_raw: [4]u32 = [_]u32{
         0x00FFFFFF, // Fully transparent White -> should not alter dest
         0x80FF0000, // 50% Alpha Red (A=128, R=255, G=0, B=0) -> blend with Black

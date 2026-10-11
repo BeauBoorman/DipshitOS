@@ -32,7 +32,7 @@ test "source exact/over, invalid UTF8, handles, diagnostics and repeated reuse" 
     try runtime.checkResources(2, 7);
     try std.testing.expectError(error.HandleLimit, runtime.checkResources(3, 7));
     try std.testing.expectError(error.HandleLimit, runtime.checkResources(2, 8));
-    try std.testing.expectError(error.InvalidFilename, runtime.eval("42", "x" ** 65, harness.sink(), true));
+    try std.testing.expectError(error.InvalidFilename, runtime.eval("42", &@as([65:0]u8, @splat("x"[0])), harness.sink(), true));
     try std.testing.expectError(error.InvalidFilename, runtime.eval("42", "x\x00y", harness.sink(), true));
     for (0..16) |_| {
         try runtime.reset();

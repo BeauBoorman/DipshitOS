@@ -44,7 +44,7 @@ const El0Pipe = struct {
     read_pos: usize = 0,
 };
 var el0_bufs: [max_el0_pipes][pipe_capacity]u8 = undefined;
-var el0: [max_el0_pipes]El0Pipe = [_]El0Pipe{.{}} ** max_el0_pipes;
+var el0: [max_el0_pipes]El0Pipe = @as([max_el0_pipes]El0Pipe, @splat(@as(El0Pipe, .{})));
 
 fn freeable(i: usize) bool {
     const p = &el0[i];
@@ -226,7 +226,7 @@ test "pipe: write/read round-trips through the buffer" {
 
 test "pipe: overflow is dropped, never wraps" {
     reset();
-    const big = "x" ** (pipe_capacity + 100);
+    const big = &@as([(pipe_capacity + 100):0]u8, @splat("x"[0]));
     const n = write(big);
     try std.testing.expectEqual(@as(usize, pipe_capacity), n);
     try std.testing.expectEqual(@as(usize, pipe_capacity), available());

@@ -134,10 +134,10 @@ fn discovery() !void {
 fn boundaries() !void {
     checkpoint = "path and entry bounds";
     const fs = sdk.filesystem();
-    const exact = "a" ** 250 ++ "/" ++ "b" ** 255;
+    const exact = &@as([250:0]u8, @splat("a"[0])) ++ "/" ++ &@as([255:0]u8, @splat("b"[0]));
     _ = try fs.metadata("/host", exact);
     try refused(error.NameTooLong, fs.metadata("/host", exact ++ "c"));
-    try refused(error.NameTooLong, fs.metadata("/host", "a" ** 256));
+    try refused(error.NameTooLong, fs.metadata("/host", &@as([256:0]u8, @splat("a"[0]))));
     _ = try fs.metadata("/host", "d/e/e/e/e/e/e/e");
     try refused(error.ResourceLimit, fs.metadata("/host", "d/e/e/e/e/e/e/e/e"));
     const cursor = try fs.openSnapshot("/host", "LIMIT");
@@ -246,7 +246,7 @@ fn pinned() !void {
     live.close(sdk.io);
     for ([_][]const u8{ "", ".", "..", "a/b", "nul\x00" }) |name|
         try refused(error.InvalidArgument, fs.createExclusive(out, name));
-    try refused(error.NameTooLong, fs.createExclusive(out, "n" ** 256));
+    try refused(error.NameTooLong, fs.createExclusive(out, &@as([256:0]u8, @splat("n"[0]))));
     try refused(error.AccessDenied, fs.openChildDirectory(top, "link"));
     try refused(error.AccessDenied, fs.removeFile(top, "link"));
     try refused(error.AccessDenied, fs.createExclusive(top, "denied"));

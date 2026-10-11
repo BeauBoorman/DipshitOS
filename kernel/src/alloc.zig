@@ -97,7 +97,7 @@ pub const State = struct {
     /// `bitmap_base + i * page_size`. All bits start SET (allocated); init
     /// clears exactly the pooled pages, so any page the map does not
     /// declare poolable (or that an exclusion protects) is unallocatable.
-    bitmap: [bitmap_bytes]u8 = [_]u8{0} ** bitmap_bytes,
+    bitmap: [bitmap_bytes]u8 = @as([bitmap_bytes]u8, @splat(@as(u8, 0))),
     regions: [max_regions]Region = undefined,
     region_count: usize = 0,
     bitmap_base: u64 = 0,
@@ -111,7 +111,7 @@ pub const State = struct {
     /// exclusion ranges. Resets any prior state. Returns true iff at least
     /// one page is pooled.
     pub fn init(self: *State, view: memmap.MapView, exclusions: []const Exclusion) bool {
-        self.bitmap = [_]u8{0} ** bitmap_bytes;
+        self.bitmap = @as([bitmap_bytes]u8, @splat(@as(u8, 0)));
         self.region_count = 0;
         self.bitmap_base = 0;
         self.span_pages = 0;
@@ -403,7 +403,7 @@ pub fn largest_free_run() u64 {
 // the only failure `ref_page` can still report is a PA outside that span,
 // which it now does loudly instead of dropping the ref and letting the
 // caller install an unaccounted leaf.
-var shared_counts: [max_span_pages]u8 = [_]u8{0} ** max_span_pages;
+var shared_counts: [max_span_pages]u8 = @as([max_span_pages]u8, @splat(@as(u8, 0)));
 
 pub fn reset_refcounts() void {
     @memset(&shared_counts, 0);

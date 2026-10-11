@@ -244,12 +244,12 @@ pub var cv_notify_mult: u32 = 0;
 /// Transport BAR base holding the common cfg (the identity-map window).
 pub var cv_bar: u64 = 0;
 /// All six BAR values read during the pre-exit probe (diagnostic).
-pub var cv_bars: [6]u64 = .{0} ** 6;
+pub var cv_bars: [6]u64 = @splat(0);
 /// Capability-pointer value read during the pre-exit probe (diagnostic).
 pub var cv_cap_ptr: u32 = 0;
 /// Per-capability decode: id, next, cfg_type, bar, offset (diagnostic).
 pub const CapDecode = struct { id: u32, next: u32, cfg_type: u32, bar: u32, off: u32, head: u32, base: u32 };
-pub var cv_caps: [8]CapDecode = [_]CapDecode{.{ .id = 0, .next = 0, .cfg_type = 0, .bar = 0, .off = 0, .head = 0, .base = 0 }} ** 8;
+pub var cv_caps: [8]CapDecode = @as([8]CapDecode, @splat(@as(CapDecode, .{ .id = 0, .next = 0, .cfg_type = 0, .bar = 0, .off = 0, .head = 0, .base = 0 })));
 pub var cv_cap_count: usize = 0;
 
 /// PRE-EXIT probe (config-space reads only — the claim-0013 discipline):
@@ -275,7 +275,7 @@ pub fn probe() bool {
     cv_dev = found_dev;
 
     // BAR bases (memory BARs; 64-bit pairs merged).
-    var bar_base: [6]u64 = .{0} ** 6;
+    var bar_base: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < 6) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, found_dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);
@@ -442,9 +442,9 @@ pub fn reply_len() usize {
 /// shared counter would silently lose increments if SPI routing ever
 /// becomes any-core. Core count literal (4), the gic/exceptions idiom.
 pub const cpu_cores: usize = 4;
-pub var irq_count: [cpu_cores]u32 = [_]u32{0} ** cpu_cores;
+pub var irq_count: [cpu_cores]u32 = @as([cpu_cores]u32, @splat(@as(u32, 0)));
 /// First non-timer INTID acked per core (0xffffffff = none yet).
-pub var irq_first: [cpu_cores]u32 = [_]u32{0xffffffff} ** cpu_cores;
+pub var irq_first: [cpu_cores]u32 = @as([cpu_cores]u32, @splat(@as(u32, 0xffffffff)));
 
 /// This core's index into the per-core counters (MPIDR_EL1.Aff0; 0 on
 /// host tests / non-aarch64 — the exceptions.resume_core idiom).
@@ -530,8 +530,8 @@ fn enable_memory_space() void {
 /// Initialize a ring's tables + free list. BSS is not trusted zeroed, so
 /// the used ring's init write is cleaned to RAM (the claim-0016 lesson).
 pub fn ring_init(r: *VirtqRing) void {
-    r.avail = .{ .flags = 0, .idx = 0, .ring = [_]u16{0} ** queue_size, .used_event = 0 };
-    r.used = .{ .flags = 0, .idx = 0, .ring = [_]VirtqUsedElem{.{ .id = 0, .len = 0 }} ** queue_size, .avail_event = 0 };
+    r.avail = .{ .flags = 0, .idx = 0, .ring = @as([queue_size]u16, @splat(@as(u16, 0))), .used_event = 0 };
+    r.used = .{ .flags = 0, .idx = 0, .ring = @as([queue_size]VirtqUsedElem, @splat(@as(VirtqUsedElem, .{ .id = 0, .len = 0 }))), .avail_event = 0 };
     // Free list initialized REVERSED so the LIFO pop hands out LOW indices
     // first (heads 0,2,4,... — the claim-0828-proven pattern). Observed on
     // VZ: the custom device's queue parser reads the head descriptors it
@@ -906,7 +906,7 @@ pub const input_pool_count: usize = 8;
 /// are image-relative in a flat image, the claim-0015 lesson).
 pub var input_rx_bufs: [input_pool_count][input_buf_cap]u8 align(16) = undefined;
 /// Each buffer's chain head (used-ring id -> slot lookup).
-var input_rx_handles: [input_pool_count]u16 = [_]u16{0} ** input_pool_count;
+var input_rx_handles: [input_pool_count]u16 = @as([input_pool_count]u16, @splat(@as(u16, 0)));
 /// True once `arm_input_pool` posted + kicked the whole pool.
 pub var input_armed: bool = false;
 /// Messages consumed and dispatched (valid envelopes, any kind).
@@ -1420,7 +1420,7 @@ fn put32(buf: []u8, off: usize, v: u32) void {
 
 /// Build the 32-byte snapshot header message (pure; unit-tested).
 pub fn build_snap_header(w: u32, h: u32, bpp: u32, total: u32, chunk: u32) [32]u8 {
-    var m = [_]u8{0} ** 32;
+    var m = @as([32]u8, @splat(@as(u8, 0)));
     m[0] = snap_tag_header;
     m[1] = 'S';
     m[2] = 'N';
@@ -1437,7 +1437,7 @@ pub fn build_snap_header(w: u32, h: u32, bpp: u32, total: u32, chunk: u32) [32]u
 
 /// Build one 12-byte chunk header (payload follows as its own descriptor).
 pub fn build_snap_chunk(seq: u16, len: u16, cksum: u16) [12]u8 {
-    var m = [_]u8{0} ** 12;
+    var m = @as([12]u8, @splat(@as(u8, 0)));
     m[0] = snap_tag_chunk;
     put16(&m, 2, seq);
     put16(&m, 4, len);
@@ -1447,7 +1447,7 @@ pub fn build_snap_chunk(seq: u16, len: u16, cksum: u16) [12]u8 {
 
 /// Build the 16-byte done message.
 pub fn build_snap_done(chunks: u16, total: u32, cksum: u16) [16]u8 {
-    var m = [_]u8{0} ** 16;
+    var m = @as([16]u8, @splat(@as(u8, 0)));
     m[0] = snap_tag_done;
     put16(&m, 2, chunks);
     put32(&m, 4, total);
@@ -1917,7 +1917,7 @@ test "virtio_custom: checksum1071 matches RFC 1071 semantics" {
     // (observed live as a host-side Swift arithmetic-overflow trap,
     // claim 0680). Fold: 0x1_FFFE_0000 → 0x1_FFFE → 0xFFFF → complement
     // 0x0000 — a valid checksum of zero, exactly what the wire needs.
-    const big_ff = [_]u8{0xff} ** 262144;
+    const big_ff = @as([262144]u8, @splat(@as(u8, 0xff)));
     try std.testing.expectEqual(@as(u16, 0x0000), checksum1071(&big_ff));
 }
 

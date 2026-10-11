@@ -81,7 +81,7 @@ fn parseIpv4(s: []const u8) ?[16]u8 {
         }
     }
     if (i != s.len) return null;
-    var out = [_]u8{0} ** 16;
+    var out = @as([16]u8, @splat(@as(u8, 0)));
     out[10] = 0xff;
     out[11] = 0xff;
     @memcpy(out[12..16], &parts);
@@ -327,7 +327,7 @@ test "identity: IP literal parsing" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, &parseIpLiteral("127.0.0.1").?);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 255, 255, 255, 255 }, &parseIpLiteral("255.255.255.255").?);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, &parseIpLiteral("2001:db8::1").?);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &parseIpLiteral("::").?);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(@as(u8, 0)))), &parseIpLiteral("::").?);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 0, 1 }, &parseIpLiteral("::ffff:192.168.0.1").?);
 
     // Not literals.

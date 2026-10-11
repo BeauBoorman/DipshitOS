@@ -774,7 +774,7 @@ const testing = std.testing;
 /// Build a minimal ELF32 image: ELF header (52 B) + one phdr (32 B) +
 /// `code`. Returns the image and its total size.
 fn elf32_one(code: []const u8, vaddr: u32, filesz_extra: usize, memsz_extra: usize, flags: u32) [128]u8 {
-    var img = [_]u8{0} ** 128;
+    var img = @as([128]u8, @splat(@as(u8, 0)));
     // e_ident
     @memcpy(img[0..4], &magic);
     img[4] = 1; // ELF32
@@ -811,7 +811,7 @@ test "elf: minimal valid ELF32 parses with correct entry" {
 }
 
 test "elf: rejects bad magic, classes, endianness, and machine" {
-    var img = elf32_one(&[_]u8{0} ** 4, 0x400000, 0, 0, 5);
+    var img = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
 
     // Bad magic.
     var bad_magic = img;
@@ -836,7 +836,7 @@ test "elf: rejects bad magic, classes, endianness, and machine" {
 }
 
 test "elf: rejects truncated headers and tables" {
-    const code = [_]u8{0} ** 4;
+    const code = @as([4]u8, @splat(@as(u8, 0)));
     const img = elf32_one(&code, 0x400000, 0, 0, 5);
     // Header cut short of the ELF32 minimum.
     try testing.expectError(error.truncated, parse(img[0..48]));
@@ -860,13 +860,13 @@ test "elf: rejects out-of-range and oversized segments" {
     // refusal is the truncation one. M70c-K (#1504) split it out of
     // `segment_too_large` because a caller must be able to say "truncated"
     // rather than "bad segment".
-    var oob = elf32_one(&[_]u8{0} ** 4, 0x400000, 0, 0, 5);
+    var oob = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
     std.mem.writeInt(u32, oob[68..72], 9999, .little);
     std.mem.writeInt(u32, oob[72..76], 9999, .little);
     try testing.expectError(error.file_too_short, parse(&oob));
 
     // memsz < filesz (BSS smaller than the initialized part).
-    var neg_bss = elf32_one(&[_]u8{0} ** 4, 0x400000, 0, 0, 5);
+    var neg_bss = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
     std.mem.writeInt(u32, neg_bss[72..76], 2, .little); // memsz < filesz (4)
     try testing.expectError(error.segment_too_large, parse(&neg_bss));
 
@@ -874,7 +874,7 @@ test "elf: rejects out-of-range and oversized segments" {
     // file bytes (`memsz - filesz`), which is why the old rule — which
     // charged the mapped total against a bound named for the file — refused
     // every Go image carrying one:
-    var bss_ok = elf32_one(&[_]u8{0} ** 4, 0x400000, 0, 0, 5);
+    var bss_ok = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
     const forty_mib: u32 = 40 * 1024 * 1024;
     std.mem.writeInt(u32, bss_ok[72..76], forty_mib, .little); // memsz ≫ filesz
     const bss_image = try parse(&bss_ok);
@@ -884,13 +884,13 @@ test "elf: rejects out-of-range and oversized segments" {
     // ...but the mapped total is still bounded, and by its own name: this
     // loader allocates and zeroes every mapped page, so a 1 GiB BSS cannot
     // be a way to dodge the acceptance bound.
-    var too_much = elf32_one(&[_]u8{0} ** 4, 0x400000, 0, 0, 5);
+    var too_much = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
     std.mem.writeInt(u32, too_much[72..76], @intCast(map_max + 1), .little);
     try testing.expectError(error.map_too_large, parse(&too_much));
 }
 
 test "elf: enforces W^X segment flags and placement contract" {
-    const code = [_]u8{0} ** 4;
+    const code = @as([4]u8, @splat(@as(u8, 0)));
     // Writable first segment (RWX) → refused.
     const wtxt = elf32_one(&code, 0x400000, 0, 0, 7);
     try testing.expectError(error.writable_text, parse(&wtxt));
@@ -909,7 +909,7 @@ test "elf: enforces W^X segment flags and placement contract" {
 
     // I2: a LATER gap segment ending at/above the bound → refused, even
     // though its base is below it (ends just past gap_base_max).
-    var img2 = [_]u8{0} ** 512;
+    var img2 = @as([512]u8, @splat(@as(u8, 0)));
     @memcpy(img2[0..4], &magic);
     img2[4] = 1;
     img2[5] = 1;
@@ -960,7 +960,7 @@ test "elf: enforces W^X segment flags and placement contract" {
 }
 
 test "elf: ELF64 parses and reports entry_rel correctly" {
-    var img = [_]u8{0} ** 160;
+    var img = @as([160]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &magic);
     img[4] = 2; // ELF64
     img[5] = 1;
@@ -988,7 +988,7 @@ test "elf: ELF64 parses and reports entry_rel correctly" {
 
 test "elf: two-segment layout validates the data-base contract" {
     // Text: vaddr 0x400000, memsz 0x1000 → data must sit at 0x401000.
-    var img = [_]u8{0} ** 512;
+    var img = @as([512]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &magic);
     img[4] = 1;
     img[5] = 1;
@@ -1034,7 +1034,7 @@ test "elf: three-segment gap layout (Go linker shape) parses with declared vaddr
     // The GOOS=virelai shape (issue #1163): R+X at 0x400000, R-only rodata
     // at a page-aligned gap vaddr, RW data at another — each segment at
     // its DECLARED vaddr, flagged gap_layout.
-    var img = [_]u8{0} ** 512;
+    var img = @as([512]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &magic);
     img[4] = 1; // ELF32
     img[5] = 1;
@@ -1109,7 +1109,7 @@ test "elf: parse_head validates a streamed image against its FILE size, not the 
     // is 3 MiB and lies entirely outside the 148-byte header window, so the
     // STAGED contract cannot validate it — while parse_head can, because it
     // is told the file's real size.
-    var img = [_]u8{0} ** 256;
+    var img = @as([256]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &magic);
     img[4] = 1; // ELF32
     img[5] = 1;
@@ -1215,7 +1215,7 @@ test "elf: parse_head validates a streamed image against its FILE size, not the 
 test "elf: collect_symbols reads a hand-built symtab" {
     // Build an ELF32 with two sections: symtab + strtab, three symbols
     // (global func "crasher", local skipped, global object "msg").
-    var img = [_]u8{0} ** 512;
+    var img = @as([512]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &magic);
     img[4] = 1;
     img[5] = 1;
@@ -1264,13 +1264,13 @@ test "elf: collect_symbols reads a hand-built symtab" {
     try testing.expectEqual(@as(u64, 20), out[0].size);
 
     // Stripped image (no sections) yields zero without error.
-    var bare = elf32_one(&[_]u8{0} ** 4, 0x400000, 0, 0, 5);
+    var bare = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
     _ = &bare;
     try testing.expectEqual(@as(usize, 0), collect_symbols(&bare, &out));
 }
 
 test "elf: PT_INTERP and PT_DYNAMIC program headers are parsed" {
-    var img = [_]u8{0} ** 512;
+    var img = @as([512]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &magic);
     img[4] = 2; // ELF64
     img[5] = 1; // little-endian
@@ -1323,7 +1323,7 @@ test "elf: PT_INTERP and PT_DYNAMIC program headers are parsed" {
 }
 
 test "elf: auxv encoding and decoding" {
-    var buf: [128]u8 = [_]u8{0} ** 128;
+    var buf: [128]u8 = @as([128]u8, @splat(@as(u8, 0)));
     const entries = [_]AuxvEntry{
         .{ .a_type = at_phdr, .a_val = 0x400040 },
         .{ .a_type = at_phent, .a_val = 56 },
@@ -1344,7 +1344,7 @@ test "elf: auxv encoding and decoding" {
 }
 
 test "elf: dynamic tags parsing and relocation resolution" {
-    var dyn_sec: [48]u8 = [_]u8{0} ** 48;
+    var dyn_sec: [48]u8 = @as([48]u8, @splat(@as(u8, 0)));
     // Entry 0: DT_NEEDED = 1
     std.mem.writeInt(u64, dyn_sec[0..8], dt_needed, .little);
     std.mem.writeInt(u64, dyn_sec[8..16], 1, .little); // strtab offset 1 ("LIBUI.SO")

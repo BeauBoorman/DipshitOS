@@ -86,7 +86,7 @@ var dropped: usize = 0;
 var events: usize = 0;
 
 var kb_mods: u8 = 0;
-var kb_held: [6]u8 = [_]u8{0} ** 6;
+var kb_held: [6]u8 = @as([6]u8, @splat(@as(u8, 0)));
 var kb_last_usage: u8 = 0;
 var kb_last_byte: u8 = 0;
 
@@ -590,7 +590,7 @@ pub fn decode_keyboard_report(rep: []const u8) void {
     const ctrl = (flags & app_events.MOD_CTRL) != 0;
     const alt = (flags & app_events.MOD_ALT) != 0;
     kb_mods = mods;
-    var keys: [6]u8 = [_]u8{0} ** 6;
+    var keys: [6]u8 = @as([6]u8, @splat(@as(u8, 0)));
     for (rep[2..8], 0..) |k, i| {
         var duplicate = false;
         for (keys[0..i]) |h| {
@@ -1400,7 +1400,7 @@ test "input: WMS8 Gate 5 — the drained geometry chords fan out but the kernel 
     fifo_count = 0;
     fifo_head = 0;
     events = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     var key_calls: usize = 0;
     var last_usage: u8 = 0;
     var last_flags: u16 = 0;
@@ -1458,7 +1458,7 @@ test "input: keyboard report decode pushes a ctrl chord and an arrow sequence" {
     fifo_count = 0;
     fifo_head = 0;
     events = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     // Left Ctrl (0x01) held + 'a' (usage 0x04) pressed -> 0x01 (Ctrl-A).
     decode_keyboard_report(&[_]u8{ 0x01, 0, 0x04, 0, 0, 0, 0, 0 });
     try std.testing.expectEqual(@as(usize, 1), fifo_count);
@@ -1481,7 +1481,7 @@ test "input: keyboard report decode pushes key-down bytes with shift" {
     fifo_head = 0;
     events = 0;
     dropped = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     // Shift held + 'I' key (usage 0x0c) pressed: byte 0 = 0x02 (left shift),
     // byte 2 = 0x0c.
     decode_keyboard_report(&[_]u8{ 0x02, 0, 0x0c, 0, 0, 0, 0, 0 });
@@ -1499,7 +1499,7 @@ test "input: a held key does not re-fire (no repeat on unchanged report)" {
     fifo_count = 0;
     fifo_head = 0;
     events = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     const pressed = [_]u8{ 0, 0, 0x04, 0, 0, 0, 0, 0 }; // 'a' held
     decode_keyboard_report(&pressed);
     decode_keyboard_report(&pressed); // unchanged → no second push
@@ -1636,7 +1636,7 @@ test "input: M91 each pointer transport has explicit boundaries and button edges
         ptr_press_pending = false;
         for (0..4) |i| {
             const canonical = bytes[i * 5 ..][0..5];
-            var wire = [_]u8{0} ** 10;
+            var wire = @as([10]u8, @splat(@as(u8, 0)));
             wire[0] = 1;
             @memcpy(wire[1..6], canonical);
             if (native) decode_usb_pointer_report(d, &wire) else decode_pointer_report(canonical);
@@ -1705,7 +1705,7 @@ test "input: M91 native drain preserves cross-device and press held release orde
     _ = driving_award.focus(0);
     fifo_head = 0;
     fifo_count = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     ptr_buttons = 0;
     ptr_press_pending = false;
     hw.report(1, &.{ 1, 1, 0x44, 0x24, 0x2f, 0x67, 0, 0, 0, 0 });
@@ -1727,7 +1727,7 @@ test "input: M91 native drain preserves cross-device and press held release orde
     try std.testing.expectEqual(@as(u8, 0), ptr_buttons);
     drain();
     try std.testing.expectEqual(@as(u8, 0), kb_mods);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 6), &kb_held);
+    try std.testing.expectEqualSlices(u8, &(@as([6]u8, @splat(@as(u8, 0)))), &kb_held);
 }
 
 test "input: M91 keyboard release repeat modifiers rollover and malformed policy" {
@@ -1742,7 +1742,7 @@ test "input: M91 keyboard release repeat modifiers rollover and malformed policy
     defer _ = driving_award.user_close(id);
     try std.testing.expect(driving_award.focus(id));
     app_events.reset(9);
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     compose_reset();
     const down = [_]u8{ 0x22, 0, 4, 4, 0, 0, 0, 0 }; // duplicate usage, both shifts
     decode_keyboard_report(&down);
@@ -1801,7 +1801,7 @@ test "input: keyboard routing delivers KEY_DOWN and KEY_UP events to focused use
 
     fifo_count = 0;
     fifo_head = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
 
     // Press 'a' (usage 0x04) with left shift (0x02)
     decode_keyboard_report(&[_]u8{ 0x02, 0, 0x04, 0, 0, 0, 0, 0 });
@@ -1844,7 +1844,7 @@ test "input: a window-bound terminal receives encoded keys, not app events (#108
 
     fifo_count = 0;
     fifo_head = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
     // Space (usage 0x2c) with no modifiers: the bound terminal gets the byte,
     // the console FIFO stays empty, and no KEY_DOWN app event is pushed.
     decode_keyboard_report(&[_]u8{ 0, 0, 0x2c, 0, 0, 0, 0, 0 });
@@ -1903,7 +1903,7 @@ test "input: a hygiene chord is consumed before the tty queue — the app never 
 
     fifo_count = 0;
     fifo_head = 0;
-    kb_held = [_]u8{0} ** 6;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
 
     // Real scrollback first: 160 lines over the 128-row grid pushes rows
     // into the ring, so the clear chord has something to actually drop.

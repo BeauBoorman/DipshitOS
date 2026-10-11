@@ -298,7 +298,7 @@ fn spawn_phase(violations: *usize) void {
 
     const child = "USER.BIN";
     const arg = "alpha";
-    var block: [arg_slot_bytes]u8 = [_]u8{0} ** arg_slot_bytes;
+    var block: [arg_slot_bytes]u8 = @as([arg_slot_bytes]u8, @splat(@as(u8, 0)));
     @memcpy(block[0..arg.len], arg);
     const pid = svc4(sys_exec, @intFromPtr(child.ptr), child.len, @intFromPtr(&block), 1);
     if (pid < 0) {
@@ -399,7 +399,7 @@ fn run() noreturn {
 
     const child = "USER.BIN";
     const arg = "alpha";
-    var block: [arg_slot_bytes]u8 = [_]u8{0} ** arg_slot_bytes;
+    var block: [arg_slot_bytes]u8 = @as([arg_slot_bytes]u8, @splat(@as(u8, 0)));
     @memcpy(block[0..arg.len], arg);
     const pid = svc4(sys_exec, @intFromPtr(child.ptr), child.len, @intFromPtr(&block), 1);
     if (pid < 0) {

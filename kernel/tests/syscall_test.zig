@@ -194,7 +194,7 @@ fn test_writer(bytes: []const u8) void {
     test_write_len += bytes.len;
 }
 
-var test_marshaled_args: Args = [_]u64{0} ** 6;
+var test_marshaled_args: Args = @as([6]u64, @splat(@as(u64, 0)));
 fn capture_marshaled_args(args: Args, _: *exceptions.VectorFrame) u64 {
     test_marshaled_args = args;
     return 0xcafe;
@@ -204,7 +204,7 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
     init(test_writer);
     const table = ensure_table();
     try std.testing.expectEqual(@as(usize, 128), table.len);
-    var seen: [slot_count]bool = [_]bool{false} ** slot_count;
+    var seen: [slot_count]bool = @as([slot_count]bool, @splat(@as(bool, false)));
     var implemented: usize = 0;
     for (table, 0..) |entry, number| {
         if (entry.handler != null) {
@@ -601,7 +601,7 @@ test "syscall: ipc send refuses full, empty, and isolated targets exactly" {
     // A zero-length send is a no-op returning 0.
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_ipc_send, .{ peer_pid, 0, 0, 0, 0, 0 }, &frame));
     // Truncation: a 100-byte send stores the first 64 bytes and returns 64.
-    const long = "x" ** 100;
+    const long = &@as([100:0]u8, @splat("x"[0]));
     set_user_regions(.{ .base = @intFromPtr(long.ptr), .len = long.len }, .{ .base = 0, .len = 0 });
     try std.testing.expectEqual(@as(u64, mailbox.message_max), dispatch(sys_ipc_send, .{ peer_pid, @intFromPtr(long.ptr), long.len, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(usize, 1), mailbox.pending(peer_pid));
@@ -1043,8 +1043,8 @@ test "syscall: udp send — EINVAL mapping, EFAULT, and the honest truncation" {
     defer virtio_net.udp.reset();
     virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
     defer virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
-    defer virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
+    defer virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     var big: [100]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @intCast(i & 0xff);
     set_user_regions(
@@ -2148,7 +2148,7 @@ test "syscall: slot 35 replacement selector preserves legacy register behavior" 
     Probe.calls = 0;
     var frame = fresh_frame();
     const max_length = file_table.max_path_len;
-    var paths = [_]u8{'a'} ** (max_length * 2);
+    var paths = @as([(max_length * 2)]u8, @splat(@as(u8, 'a')));
     for (0..2) |i| {
         var separator = file_table.directory.name_max;
         while (separator + 1 < max_length) : (separator += file_table.directory.name_max)
@@ -2449,7 +2449,7 @@ test "syscall: slot 28 sys_exec success preserves the caller task (issue #1333)"
     scheduler.start();
 
     const content = "user: hello from the ESP\n";
-    var img = [_]u8{0} ** (24 + 25);
+    var img = @as([(24 + 25)]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u32, img[0..4], 0x314b5344, .little);
     std.mem.writeInt(u64, img[8..16], 24, .little);
     std.mem.writeInt(u64, img[16..24], 24 + 25, .little);
@@ -2466,7 +2466,7 @@ test "syscall: slot 28 sys_exec success preserves the caller task (issue #1333)"
 
     // Path (8) plus one argv slot (exec.arg_slot_bytes, 256). The kernel
     // copies the whole slot; a short buffer is EFAULT.
-    var wire: [8 + 256]u8 = [_]u8{0} ** (8 + 256);
+    var wire: [8 + 256]u8 = @as([(8 + 256)]u8, @splat(@as(u8, 0)));
     @memcpy(wire[0..8], "USER.BIN");
     @memcpy(wire[8..13], "alpha");
     const wire_addr = @intFromPtr(&wire);
@@ -3564,7 +3564,7 @@ test "B6 scheduler: real process exit releases listener half-open children and D
     virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
     defer virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
     native_inject(5000, tcp.flag_syn, 10, 0, "");
-    _ = try ns.beginDns(pid, .{ 10, 0, 0, 2 }, "x" ** 17);
+    _ = try ns.beginDns(pid, .{ 10, 0, 0, 2 }, &@as([17:0]u8, @splat("x"[0])));
     try std.testing.expectEqual(@as(u64, 3), ns.ownedCount(pid));
     try std.testing.expect(scheduler.exit_current(0));
     try std.testing.expectEqual(@as(u64, 0), ns.ownedCount(pid));
@@ -5566,7 +5566,7 @@ test "syscall: WMCTL WINDOW_NAME (cmd 14, #1056) resolves a window's display nam
 
     // App-set title: copied OUT and the handler returns its byte count.
     try std.testing.expect(driving_award.set_window_title(2, "Calc"));
-    var out: [16]u8 = [_]u8{0} ** 16;
+    var out: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
     set_user_regions(.{ .base = 0, .len = 0 }, .{ .base = @intFromPtr(&out), .len = out.len });
     try std.testing.expectEqual(@as(u64, 4), dispatch(sys_wmctl, .{ wm_server.wmctl_window_name, 2, @intFromPtr(&out), out.len, 0, 0 }, &frame));
     try std.testing.expectEqualStrings("Calc", out[0..4]);
@@ -6336,7 +6336,7 @@ test "syscall: sys_futex wait re-checks the user word, sleeps, wakes, and times 
     // Host tests deref user VAs as host pointers, so the futex word is a
     // real test-local buffer registered in the task's uaccess regions —
     // the same path the kernel's 4-byte compare reads through on hardware.
-    var futex_word: [8]u8 align(4) = [_]u8{0} ** 8;
+    var futex_word: [8]u8 align(4) = @as([8]u8, @splat(@as(u8, 0)));
     const word_va: u64 = @intFromPtr(&futex_word);
     _ = scheduler.add_task_read_region(2, .{ .base = word_va, .len = 8 });
     _ = scheduler.add_task_write_region(2, .{ .base = word_va, .len = 8 });
@@ -6639,7 +6639,7 @@ test "syscall: sys_futex wait-equals parks while the user word matches (ADR 0027
     try futex_drive_to_user();
     const pid = process.find_by_task(2).?;
 
-    var futex_word: [8]u8 align(4) = [_]u8{0} ** 8;
+    var futex_word: [8]u8 align(4) = @as([8]u8, @splat(@as(u8, 0)));
     const word_va: u64 = @intFromPtr(&futex_word);
     futex_arm_word(2, word_va);
     syscall.arm_task_regions();
@@ -6660,7 +6660,7 @@ test "syscall: sys_futex op 1 wake(n) default 1 unparks a same-process waiter (A
     try futex_drive_to_user();
     const pid = process.find_by_task(2).?;
 
-    var futex_word: [8]u8 align(4) = [_]u8{0} ** 8;
+    var futex_word: [8]u8 align(4) = @as([8]u8, @splat(@as(u8, 0)));
     const word_va: u64 = @intFromPtr(&futex_word);
     futex_arm_word(2, word_va);
     syscall.arm_task_regions();
@@ -6689,7 +6689,7 @@ test "syscall: sys_futex ETIMEDOUT is distinct from a real wake (ADR 0027 D4)" {
     try futex_drive_to_user();
     const pid = process.find_by_task(2).?;
 
-    var futex_word: [8]u8 align(4) = [_]u8{0} ** 8;
+    var futex_word: [8]u8 align(4) = @as([8]u8, @splat(@as(u8, 0)));
     const word_va: u64 = @intFromPtr(&futex_word);
     futex_arm_word(2, word_va);
     syscall.arm_task_regions();
@@ -6727,7 +6727,7 @@ test "syscall: sys_futex death-wakes-peer (ADR 0027 D4 exitThread)" {
     try futex_drive_to_user();
     const pid = process.find_by_task(2).?;
 
-    var futex_word: [8]u8 align(4) = [_]u8{0} ** 8;
+    var futex_word: [8]u8 align(4) = @as([8]u8, @splat(@as(u8, 0)));
     const word_va: u64 = @intFromPtr(&futex_word);
     futex_arm_word(2, word_va);
     syscall.arm_task_regions();
@@ -7047,8 +7047,8 @@ test "pipe: EL0 slots bind per-process — no cross-pid read, write or steal (#2
     scheduler.start();
 
     var frame = fresh_frame();
-    var wbuf: [64]u8 = [_]u8{0} ** 64;
-    var rbuf: [64]u8 = [_]u8{0} ** 64;
+    var wbuf: [64]u8 = @as([64]u8, @splat(@as(u8, 0)));
+    var rbuf: [64]u8 = @as([64]u8, @splat(@as(u8, 0)));
     set_user_regions(.{ .base = @intFromPtr(&wbuf), .len = wbuf.len }, .{ .base = @intFromPtr(&rbuf), .len = rbuf.len });
 
     var hops: usize = 0;
@@ -7119,7 +7119,7 @@ test "syscall: copy_in/load_u32 consult the read resolver — a refused source f
     while (scheduler.current_id() != 2 and hops < 8) : (hops += 1) _ = scheduler.yield_current();
     try std.testing.expectEqual(@as(usize, 2), scheduler.current_id());
 
-    var src: [16]u8 align(4) = [_]u8{0} ** 16;
+    var src: [16]u8 align(4) = @as([16]u8, @splat(@as(u8, 0)));
     set_user_regions(.{ .base = @intFromPtr(&src), .len = src.len }, .{ .base = @intFromPtr(&src), .len = src.len });
 
     // Drain anything an earlier test left in this pid's pipe so the staged

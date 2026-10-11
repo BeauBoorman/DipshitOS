@@ -24,11 +24,11 @@ test "input and exact duration ceiling refuse before rendering" {
     try port.checkSamples(220_500);
     try t.expectError(error.DurationLimit, port.checkSamples(220_501));
     // 16 voiced + four breath syllables, with gaps and penultimate stress.
-    const at = try port.render(t.allocator, .{ .phrase = "bbbbb" ++ "a" ** 16 });
+    const at = try port.render(t.allocator, .{ .phrase = "bbbbb" ++ &@as([16:0]u8, @splat("a"[0])) });
     defer t.allocator.free(at);
     try t.expectEqual(@as(usize, 441_044), at.len);
-    try t.expectError(error.DurationLimit, port.render(t.allocator, .{ .phrase = "a" ** 19 }));
-    const text = "a" ++ " " ** 254;
+    try t.expectError(error.DurationLimit, port.render(t.allocator, .{ .phrase = &@as([19:0]u8, @splat("a"[0])) }));
+    const text = "a" ++ &@as([254:0]u8, @splat(" "[0]));
     const max_input = try port.render(t.allocator, .{ .phrase = text });
     defer t.allocator.free(max_input);
     try t.expectError(error.InputLimit, port.render(t.allocator, .{ .phrase = text ++ " " }));
@@ -57,7 +57,7 @@ test "one arena enforces allocation bound and reuses all engine buffers" {
     const arena = try Arena.init(memory);
     const baseline = arena.used();
     for (0..4) |_| {
-        const wav = try port.render(arena.allocator(), .{ .phrase = "bbbbb" ++ "a" ** 16 });
+        const wav = try port.render(arena.allocator(), .{ .phrase = "bbbbb" ++ &@as([16:0]u8, @splat("a"[0])) });
         arena.allocator().free(wav);
         try t.expectEqual(baseline, arena.used());
     }

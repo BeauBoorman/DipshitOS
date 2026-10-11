@@ -371,7 +371,7 @@ fn histOf(s: *const Screen) ?*HistoryBank {
 /// pool on the terminal's first sixel, not module BSS: KERNEL.BIN carries
 /// BSS as zero fill and has no room for pixels (term_image's header has
 /// the measurement). A bank, once carved, is kept for the kernel's life.
-var image_bank: [max_terminals]?*term_image.Bank = [_]?*term_image.Bank{null} ** max_terminals;
+var image_bank: [max_terminals]?*term_image.Bank = @as([max_terminals]?*term_image.Bank, @splat(@as(?*term_image.Bank, null)));
 /// A Screen outside the registry (a corpus or test value) borrows this
 /// ONE shared bank. It belongs to the last such Screen that began a sixel
 /// decode; a Screen that lost it paints its image cells blank, and scrubs
@@ -411,9 +411,9 @@ fn scrubCell(cell: *Cell, buf: u3) void {
 }
 
 pub const Screen = struct {
-    cells: [grid_lines][grid_cols]Cell = [_][grid_cols]Cell{[_]Cell{empty_cell} ** grid_cols} ** grid_lines,
-    styles: [grid_lines][grid_cols]CellStyle = [_][grid_cols]CellStyle{[_]CellStyle{default_cell_style} ** grid_cols} ** grid_lines,
-    lens: [grid_lines]usize = [_]usize{0} ** grid_lines,
+    cells: [grid_lines][grid_cols]Cell = @as([grid_lines][grid_cols]Cell, @splat(@as([grid_cols]Cell, @as([grid_cols]Cell, @splat(@as(Cell, empty_cell)))))),
+    styles: [grid_lines][grid_cols]CellStyle = @as([grid_lines][grid_cols]CellStyle, @splat(@as([grid_cols]CellStyle, @as([grid_cols]CellStyle, @splat(@as(CellStyle, default_cell_style)))))),
+    lens: [grid_lines]usize = @as([grid_lines]usize, @splat(@as(usize, 0))),
     /// Number of lines in use (>= 1); grows to `grid_lines` then scrolls.
     used: usize = 1,
     /// The cursor's line (0..used-1) and column. `col == cols` is the
@@ -439,9 +439,9 @@ pub const Screen = struct {
     /// The alternate screen is a second bounded grid, not an allocation.
     /// Entering DECSET 47/1049 swaps the primary into this storage and clears
     /// the active grid; DECRST swaps it back unchanged.
-    alt_cells: [grid_lines][grid_cols]Cell = [_][grid_cols]Cell{[_]Cell{empty_cell} ** grid_cols} ** grid_lines,
-    alt_styles: [grid_lines][grid_cols]CellStyle = [_][grid_cols]CellStyle{[_]CellStyle{default_cell_style} ** grid_cols} ** grid_lines,
-    alt_lens: [grid_lines]usize = [_]usize{0} ** grid_lines,
+    alt_cells: [grid_lines][grid_cols]Cell = @as([grid_lines][grid_cols]Cell, @splat(@as([grid_cols]Cell, @as([grid_cols]Cell, @splat(@as(Cell, empty_cell)))))),
+    alt_styles: [grid_lines][grid_cols]CellStyle = @as([grid_lines][grid_cols]CellStyle, @splat(@as([grid_cols]CellStyle, @as([grid_cols]CellStyle, @splat(@as(CellStyle, default_cell_style)))))),
+    alt_lens: [grid_lines]usize = @as([grid_lines]usize, @splat(@as(usize, 0))),
     alt_used: usize = 1,
     alt_cur: usize = 0,
     alt_col: usize = 0,
@@ -486,10 +486,10 @@ pub const Screen = struct {
     /// Written by `putRune` from the current rendition state and read ONLY
     /// for cells whose slot marks `rgb_colour`; swapped and reflowed with
     /// their style arrays.
-    fg_rgb: [grid_lines][grid_cols]Rgb = [_][grid_cols]Rgb{[_]Rgb{empty_rgb} ** grid_cols} ** grid_lines,
-    bg_rgb: [grid_lines][grid_cols]Rgb = [_][grid_cols]Rgb{[_]Rgb{empty_rgb} ** grid_cols} ** grid_lines,
-    alt_fg_rgb: [grid_lines][grid_cols]Rgb = [_][grid_cols]Rgb{[_]Rgb{empty_rgb} ** grid_cols} ** grid_lines,
-    alt_bg_rgb: [grid_lines][grid_cols]Rgb = [_][grid_cols]Rgb{[_]Rgb{empty_rgb} ** grid_cols} ** grid_lines,
+    fg_rgb: [grid_lines][grid_cols]Rgb = @as([grid_lines][grid_cols]Rgb, @splat(@as([grid_cols]Rgb, @as([grid_cols]Rgb, @splat(@as(Rgb, empty_rgb)))))),
+    bg_rgb: [grid_lines][grid_cols]Rgb = @as([grid_lines][grid_cols]Rgb, @splat(@as([grid_cols]Rgb, @as([grid_cols]Rgb, @splat(@as(Rgb, empty_rgb)))))),
+    alt_fg_rgb: [grid_lines][grid_cols]Rgb = @as([grid_lines][grid_cols]Rgb, @splat(@as([grid_cols]Rgb, @as([grid_cols]Rgb, @splat(@as(Rgb, empty_rgb)))))),
+    alt_bg_rgb: [grid_lines][grid_cols]Rgb = @as([grid_lines][grid_cols]Rgb, @splat(@as([grid_cols]Rgb, @as([grid_cols]Rgb, @splat(@as(Rgb, empty_rgb)))))),
     /// The current truecolour state (applies to FUTURE writes), mirrored
     /// across the alternate swap exactly like `style`/`alt_style`.
     fg_rgb_cur: Rgb = empty_rgb,
@@ -508,7 +508,7 @@ pub const Screen = struct {
     /// (DCS/APC/SOS/PM), 7 ESC string after its ESC (ST pending).
     esc_state: u8 = 0,
     esc_charset_slot: u8 = 0,
-    csi_params: [16]u16 = [_]u16{0} ** 16,
+    csi_params: [16]u16 = @as([16]u16, @splat(@as(u16, 0))),
     csi_count: usize = 0,
     csi_private: bool = false,
     csi_intermediate: u8 = 0,
@@ -544,7 +544,7 @@ pub const Screen = struct {
     /// The three DCS Ps values (`P1;P2;P3`); params beyond three are
     /// consumed, never parsed. M85b parses but does not honour them (see
     /// term_image: square pixels, unset pixels transparent).
-    sixel_p: [3]u16 = [_]u16{0} ** 3,
+    sixel_p: [3]u16 = @as([3]u16, @splat(@as(u16, 0))),
     sixel_pcount: usize = 0,
     /// M85b (#1814): the payload is DECODED as it streams (M85a's 4 KiB
     /// capture buffer is gone — it bounded bytes, when the real bound is
@@ -627,7 +627,7 @@ pub const Screen = struct {
     /// never in the byte pipe (D1 holds). Normal screen only. Literal,
     /// row-local, rune-aware, ASCII-case-insensitive (pinned by test).
     search_active: bool = false,
-    search_pat: [32]u21 = [_]u21{0} ** 32,
+    search_pat: [32]u21 = @as([32]u21, @splat(@as(u21, 0))),
     search_len: usize = 0,
     search_count: usize = 0,
     search_row: usize = 0, // unified row of the current match
@@ -640,10 +640,10 @@ pub const Screen = struct {
     /// The row under the prompt bar, saved/restored through ABSOLUTE
     /// identity (survives ring rotation and grid scroll; an evicted row
     /// has nothing left to restore, so the restore skips it).
-    ov_cells: [grid_cols]Cell = [_]Cell{empty_cell} ** grid_cols,
-    ov_styles: [grid_cols]CellStyle = [_]CellStyle{default_cell_style} ** grid_cols,
-    ov_fg: [grid_cols]Rgb = [_]Rgb{empty_rgb} ** grid_cols,
-    ov_bg: [grid_cols]Rgb = [_]Rgb{empty_rgb} ** grid_cols,
+    ov_cells: [grid_cols]Cell = @as([grid_cols]Cell, @splat(@as(Cell, empty_cell))),
+    ov_styles: [grid_cols]CellStyle = @as([grid_cols]CellStyle, @splat(@as(CellStyle, default_cell_style))),
+    ov_fg: [grid_cols]Rgb = @as([grid_cols]Rgb, @splat(@as(Rgb, empty_rgb))),
+    ov_bg: [grid_cols]Rgb = @as([grid_cols]Rgb, @splat(@as(Rgb, empty_rgb))),
     ov_lens: usize = 0,
     ov_abs: u64 = 0,
     ov_valid: bool = false,
@@ -768,7 +768,7 @@ pub const Screen = struct {
         self.esc_state = 6;
         self.dcs_intro = intro;
         self.dcs_phase = 0;
-        self.sixel_p = [_]u16{0} ** 3;
+        self.sixel_p = @as([3]u16, @splat(@as(u16, 0)));
         self.sixel_pcount = 0;
         self.sixel_overflow = false;
         self.sixel_origin_line = self.cur;
@@ -1593,7 +1593,7 @@ pub const Screen = struct {
     }
 
     fn resetCsi(self: *Screen) void {
-        self.csi_params = [_]u16{0} ** self.csi_params.len;
+        self.csi_params = @as([self.csi_params.len]u16, @splat(@as(u16, 0)));
         self.csi_count = 1;
         self.csi_private = false;
         self.csi_intermediate = 0;
@@ -3226,12 +3226,12 @@ pub const FrontEnd = enum(u8) {
 /// A terminal session. All methods are pure; the struct is `extern`-free and
 /// host-testable as a value.
 pub const Terminal = struct {
-    out: [out_capacity]u8 = [_]u8{0} ** out_capacity,
+    out: [out_capacity]u8 = @as([out_capacity]u8, @splat(@as(u8, 0))),
     out_start: usize = 0,
     out_len: usize = 0,
     out_dropped: u64 = 0,
 
-    in: [in_capacity]u8 = [_]u8{0} ** in_capacity,
+    in: [in_capacity]u8 = @as([in_capacity]u8, @splat(@as(u8, 0))),
     in_start: usize = 0,
     in_len: usize = 0,
     /// M73i (#1635): the single newest motion-class report, held out of the
@@ -3263,15 +3263,15 @@ pub const Terminal = struct {
     net_auth_on: bool = false,
     net_auth_scheme: NetAuthScheme = .open,
     net_authed: bool = true, // no auth => open (SH7 behavior)
-    net_challenge: [net_challenge_len]u8 = [_]u8{0} ** net_challenge_len,
+    net_challenge: [net_challenge_len]u8 = @as([net_challenge_len]u8, @splat(@as(u8, 0))),
     net_challenge_sent: bool = false,
     net_auth_ticks: u64 = 0,
-    net_reply: [net_auth_line_max]u8 = [_]u8{0} ** net_auth_line_max,
+    net_reply: [net_auth_line_max]u8 = @as([net_auth_line_max]u8, @splat(@as(u8, 0))),
     net_reply_len: usize = 0,
     net_reply_ready: bool = false,
     /// Bytes pipelined after the reply line (the client's first command):
     /// held until the verdict accepts, then delivered — never before.
-    net_post: [tcp.payload_max]u8 = [_]u8{0} ** tcp.payload_max,
+    net_post: [tcp.payload_max]u8 = @as([tcp.payload_max]u8, @splat(@as(u8, 0))),
     net_post_len: usize = 0,
     net_verdict: ?bool = null,
     net_allow_ip: [4]u8 = .{ 0, 0, 0, 0 },
@@ -3687,12 +3687,12 @@ test "terminal: motion-class reports coalesce, edges keep order (#1635)" {
 // The kernel terminal registry (bounded; no allocation).
 // ---------------------------------------------------------------------------
 
-pub var terminals: [max_terminals]Terminal = [_]Terminal{.{}} ** max_terminals;
+pub var terminals: [max_terminals]Terminal = @as([max_terminals]Terminal, @splat(@as(Terminal, .{})));
 
 /// #1082 (ADR 0020 Amendment A): the per-terminal presentation grid,
 /// parallel to `terminals` and keyed by the same registry handle. Kept out
 /// of `Terminal` so the object stays a pure byte session (D1).
-pub var screens: [max_terminals]Screen = [_]Screen{.{}} ** max_terminals;
+pub var screens: [max_terminals]Screen = @as([max_terminals]Screen, @splat(@as(Screen, .{})));
 
 /// Allocate a free terminal for `owner`, or null when all slots are taken.
 pub fn create(owner: ?usize) ?usize {
@@ -3932,7 +3932,7 @@ fn base64Decode(src: []const u8, dst: []u8) ?usize {
     var g: usize = 0;
     while (g < src.len) : (g += 4) {
         const last = (g + 4) == src.len;
-        var v: [4]u8 = [_]u8{0} ** 4;
+        var v: [4]u8 = @as([4]u8, @splat(@as(u8, 0)));
         var pads: u8 = 0;
         for (0..4) |k| {
             const c = src[g + k];
@@ -5320,7 +5320,7 @@ test "terminal: reflow re-wraps history with the grid, never disagreeing (#1637)
     while (i < 150) : (i += 1) {
         var b: [96]u8 = undefined;
         @memset(&b, 'x');
-        const row = std.fmt.bufPrint(&b, "row{d:0>3}" ++ "x" ** 72, .{i}) catch unreachable;
+        const row = std.fmt.bufPrint(&b, "row{d:0>3}" ++ &@as([72:0]u8, @splat("x"[0])), .{i}) catch unreachable;
         s.feed(row);
         s.feed("\n");
     }
@@ -5692,7 +5692,7 @@ test "terminal: OSC titles queue on the Screen and the pump delivers them once (
     try std.testing.expectEqualStrings("edit", s.title[0..s.title_len]);
     try std.testing.expect(!s.title_dirty);
     // A title past the bound truncates honestly at title_max.
-    const long: [70]u8 = [_]u8{'t'} ** 70;
+    const long: [70]u8 = @as([70]u8, @splat(@as(u8, 't')));
     _ = writeWindow(h, "\x1b]2;");
     _ = writeWindow(h, &long);
     _ = writeWindow(h, "\x07");

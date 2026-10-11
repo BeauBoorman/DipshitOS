@@ -104,7 +104,7 @@ test "B6 DNS: bounded names, exact echoed question, malformed records and NXDOMA
     try t.expectEqual([4]u8{ 10, 0, 0, 2 }, try network.parseReply(b[0..len], request));
     for ([_][]const u8{ "", "-bad", "bad-", "a..b", "bad_name" }) |name|
         try t.expectError(error.InvalidArgument, network.query(name, 1, &q));
-    try t.expectError(error.NameTooLong, network.query("a" ** 47, 1, &q));
+    try t.expectError(error.NameTooLong, network.query(&@as([47:0]u8, @splat("a"[0])), 1, &q));
     for (12..len) |cut| try t.expectError(error.DnsFailed, network.parseReply(b[0..cut], request));
     b[3] = 0x83;
     try t.expectError(error.NameNotFound, network.parseReply(b[0..len], request));
@@ -133,7 +133,7 @@ test "B6 DNS: transaction closes on success timeout and parsing failure" {
     try t.expectEqual(@as(usize, 30), Mock.slept);
     try t.expectEqual(@as(usize, 1), Mock.closed);
     Mock.reset();
-    try t.expectError(error.NameTooLong, Net.resolve("a" ** 47, network.default_dns));
+    try t.expectError(error.NameTooLong, Net.resolve(&@as([47:0]u8, @splat("a"[0])), network.default_dns));
     try t.expectEqual(@as(usize, 0), Mock.closed);
     try t.expectEqual([4]u8{ 10, 0, 0, 2 }, try Net.resolve("10.0.0.2", network.default_dns));
     try t.expectEqual(@as(usize, 0), Mock.closed);

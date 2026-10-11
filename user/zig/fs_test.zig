@@ -50,7 +50,7 @@ const Mock = struct {
         value = facts(42);
         page = std.mem.zeroes(fs.Page);
         page.header = .{ .count = 2, .next = 2, .end = 0 };
-        const names = [_][]const u8{ "p" ** 31 ++ "-one", "p" ** 31 ++ "-two" };
+        const names = [_][]const u8{ &@as([31:0]u8, @splat("p"[0])) ++ "-one", &@as([31:0]u8, @splat("p"[0])) ++ "-two" };
         for (names, 0..) |name, i| {
             page.entries[i].name_len = @intCast(name.len);
             @memcpy(page.entries[i].name[0..name.len], name);
@@ -195,24 +195,24 @@ test "SDK fs: native errors stay distinct, never fabricate metadata or EOF" {
 test "SDK fs: B2 path/name bounds, B3 relative-root depth and opaque names" {
     Mock.reset();
     var backend: Backend = .{};
-    const wide = try platform.cwd().openFile(backend.io(), "x" ** 255 ++ "/" ++ "y" ** 250, .{});
+    const wide = try platform.cwd().openFile(backend.io(), &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([250:0]u8, @splat("y"[0])), .{});
     try equal(@as(u64, 512), Mock.last[1]);
     wide.close(backend.io());
     const calls = Mock.calls;
-    try expectError(error.NameTooLong, platform.cwd().openFile(backend.io(), "x" ** 256, .{}));
+    try expectError(error.NameTooLong, platform.cwd().openFile(backend.io(), &@as([256:0]u8, @splat("x"[0])), .{}));
     try equal(calls, Mock.calls);
     var legacy_buffer: [64]u8 = undefined;
-    const legacy_limit = "x" ** 31 ++ "/" ++ "y" ** 26;
+    const legacy_limit = &@as([31:0]u8, @splat("x"[0])) ++ "/" ++ &@as([26:0]u8, @splat("y"[0]));
     try equal(@as(usize, 64), (try Backend.path(platform.cwd(), legacy_limit, &legacy_buffer)).len);
     @memset(&legacy_buffer, 0xcc);
     try expectError(error.NameTooLong, Backend.path(platform.cwd(), legacy_limit ++ "z", &legacy_buffer));
-    try expectError(error.NameTooLong, Backend.path(platform.cwd(), "x" ** 32, &legacy_buffer));
+    try expectError(error.NameTooLong, Backend.path(platform.cwd(), &@as([32:0]u8, @splat("x"[0])), &legacy_buffer));
     try expect(std.mem.allEqual(u8, &legacy_buffer, 0xcc));
     var native_buffer: [512]u8 = undefined;
-    try equal(@as(usize, 38), (try fs.fullPath("x" ** 32, &native_buffer)).len);
-    try fs.rootedPath("/host", "x" ** 255 ++ "/" ++ "y" ** 250);
-    try expectError(error.NameTooLong, fs.rootedPath("/host", "x" ** 255 ++ "/" ++ "y" ** 251));
-    try expectError(error.NameTooLong, fs.rootedPath("/host", "x" ** 256));
+    try equal(@as(usize, 38), (try fs.fullPath(&@as([32:0]u8, @splat("x"[0])), &native_buffer)).len);
+    try fs.rootedPath("/host", &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([250:0]u8, @splat("y"[0])));
+    try expectError(error.NameTooLong, fs.rootedPath("/host", &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([251:0]u8, @splat("y"[0]))));
+    try expectError(error.NameTooLong, fs.rootedPath("/host", &@as([256:0]u8, @splat("x"[0]))));
     try fs.rootedPath("/host/a/b/c/d/e/f/g/h", "a/b/c/d/e/f/g/h");
     try expectError(error.ResourceLimit, fs.rootedPath("/host", "a/b/c/d/e/f/g/h/i"));
     try expectError(error.ResourceLimit, fs.rootedPath("/host/a/b/c/d/e/f/g/h/i", ""));
@@ -275,8 +275,8 @@ test "SDK fs: rich pages keep names facts explicit EOF and retry state" {
     var page: fs.Page = undefined;
     try backend.snapshotPage(cursor, 0, 7, &page);
     try equal(@as(usize, 2), page.rows().len);
-    try std.testing.expectEqualStrings("p" ** 31 ++ "-one", page.rows()[0].nameBytes());
-    try std.testing.expectEqualStrings("p" ** 31 ++ "-two", page.rows()[1].nameBytes());
+    try std.testing.expectEqualStrings(&@as([31:0]u8, @splat("p"[0])) ++ "-one", page.rows()[0].nameBytes());
+    try std.testing.expectEqualStrings(&@as([31:0]u8, @splat("p"[0])) ++ "-two", page.rows()[1].nameBytes());
     try equal(@as(u64, 0x1_0000_0001), page.rows()[1].metadata.size);
     const saved = page;
     Mock.forced = -3;
@@ -378,12 +378,12 @@ test "SDK fs: std rename preserves both legacy path bounds unless opted into B2"
         pub const diagnostic = Mock.diagnostic;
     });
     const cwd = platform.cwd();
-    const legacy_limit = "x" ** 31 ++ "/" ++ "y" ** 26;
-    const wide_limit = "x" ** 255 ++ "/" ++ "y" ** 250;
+    const legacy_limit = &@as([31:0]u8, @splat("x"[0])) ++ "/" ++ &@as([26:0]u8, @splat("y"[0]));
+    const wide_limit = &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([250:0]u8, @splat("y"[0]));
     inline for (.{ std.Io.Dir.rename, std.Io.Dir.renamePreserve }) |rename| {
         Mock.reset();
         var legacy: Legacy = .{};
-        for ([_][]const u8{ "x" ** 32, legacy_limit ++ "z" }) |over| {
+        for ([_][]const u8{ &@as([32:0]u8, @splat("x"[0])), legacy_limit ++ "z" }) |over| {
             try expectError(error.NameTooLong, rename(cwd, over, cwd, "out", legacy.io()));
             try expectError(error.NameTooLong, rename(cwd, "stage", cwd, over, legacy.io()));
             try equal(@as(usize, 0), Mock.calls);
@@ -403,7 +403,7 @@ test "SDK fs: std rename preserves both legacy path bounds unless opted into B2"
         try equal(@as(usize, 1), Mock.calls);
         try equal(@as(usize, 512), Mock.from_len);
         try equal(@as(usize, 512), Mock.to_len);
-        for ([_][]const u8{ "x" ** 256, wide_limit ++ "z" }) |over| {
+        for ([_][]const u8{ &@as([256:0]u8, @splat("x"[0])), wide_limit ++ "z" }) |over| {
             try expectError(error.NameTooLong, rename(cwd, over, cwd, "out", wide.io()));
             try expectError(error.NameTooLong, rename(cwd, "stage", cwd, over, wide.io()));
             try equal(@as(usize, 1), Mock.calls);
@@ -510,8 +510,8 @@ test "SDK fs: B5 names and token kinds refuse before any native call" {
         try expectError(error.InvalidArgument, backend.rename(dir, bad, dir, "x", .replace));
         try expectError(error.InvalidArgument, backend.rename(dir, "x", dir, bad, .replace));
     }
-    try expectError(error.NameTooLong, backend.createExclusive(dir, "x" ** 256));
-    try expectError(error.NameTooLong, backend.rename(dir, "x" ** 256, dir, "y", .replace));
+    try expectError(error.NameTooLong, backend.createExclusive(dir, &@as([256:0]u8, @splat("x"[0]))));
+    try expectError(error.NameTooLong, backend.rename(dir, &@as([256:0]u8, @splat("x"[0])), dir, "y", .replace));
     const other: fs.Directory = .{ .token = snapshot.token };
     try expectError(error.InvalidHandle, backend.closeDirectory(other));
     try expectError(error.InvalidHandle, backend.directoryMetadata(.{ .token = file.handle }));
@@ -521,7 +521,7 @@ test "SDK fs: B5 names and token kinds refuse before any native call" {
     try expectError(error.CloseFailed, backend.closeChecked(.{ .handle = @intCast(dir.token), .flags = .{ .nonblocking = false } }));
     try equal(calls, Mock.calls);
     // A name accepted by both bounds reaches the kernel byte-for-byte.
-    _ = try backend.openChildDirectory(dir, "x" ** 255);
+    _ = try backend.openChildDirectory(dir, &@as([255:0]u8, @splat("x"[0])));
     try equal(@as(usize, 255), Mock.last_name_len);
     try equal(@as(usize, 8), backend.liveResources());
     try backend.closeAll();

@@ -1,3 +1,7 @@
+fn repeat_lit(comptime lit: []const u8, comptime n: usize) *const [n * lit.len:0]u8 {
+    if (n == 0) return "";
+    return lit ++ repeat_lit(lit, n - 1);
+}
 const std = @import("std");
 const publication = @import("publication.zig");
 const fs = @import("sdk").fs;
@@ -272,7 +276,7 @@ test "occupied stage names never truncate and unknown creation never pretends no
     for ([_]bool{ false, true }) |unknown| {
         var tree = try setup();
         defer tree.deinit();
-        const stage_path = "/host/site/.boris-stage-" ++ "a7" ** 16;
+        const stage_path = "/host/site/.boris-stage-" ++ repeat_lit("a7", 16);
         if (unknown) {
             tree.creation_lost = true;
         } else {
@@ -302,12 +306,12 @@ test "staging full path exact and one over refuse before mutation" {
     var tree = try setup();
     defer tree.deinit();
     var state: publication.State = .{};
-    const exact = [_]Record{.{ .path = "x" ** 255 ++ "/" ++ "y" ** 199, .bytes = "bounded\n" }};
+    const exact = [_]Record{.{ .path = &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([199:0]u8, @splat("y"[0])), .bytes = "bounded\n" }};
     try publication.publish(&tree, t.allocator, "/host/content", "/host/site", &exact, &state);
     try t.expectEqual(@as(usize, 1), state.published);
     tree.mutations = 0;
     const entropy_before = tree.entropy;
-    const over = [_]Record{.{ .path = "x" ** 255 ++ "/" ++ "y" ** 200, .bytes = "bounded\n" }};
+    const over = [_]Record{.{ .path = &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([200:0]u8, @splat("y"[0])), .bytes = "bounded\n" }};
     state = .{};
     try t.expectError(error.NameTooLong, publication.publish(&tree, t.allocator, "/host/content", "/host/site", &over, &state));
     try t.expectEqual(entropy_before, tree.entropy);

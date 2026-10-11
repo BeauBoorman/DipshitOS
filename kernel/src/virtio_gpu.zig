@@ -322,7 +322,7 @@ pub fn gpu_status() u8 {
 /// Resolve the virtio common/notify/device capabilities for `dev` (its
 /// BARs + cap walk). Returns the common-config address, or 0 on failure.
 fn resolve_dev(dev: u32) u64 {
-    var bar_base: [6]u64 = .{0} ** 6;
+    var bar_base: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < 6) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);
@@ -441,8 +441,8 @@ fn setup_queue(queue: u16) bool {
     while (i < queue_size) : (i += 1) {
         desc[i] = .{ .addr = 0, .len = 0, .flags = 0, .next = 0xffff };
     }
-    avail.* = .{ .flags = 0, .idx = 0, .ring = .{0} ** queue_size };
-    used.* = .{ .flags = 0, .idx = 0, .ring = [_]VirtqUsedElem{.{ .id = 0, .len = 0 }} ** queue_size };
+    avail.* = .{ .flags = 0, .idx = 0, .ring = @splat(0) };
+    used.* = .{ .flags = 0, .idx = 0, .ring = @as([queue_size]VirtqUsedElem, @splat(@as(VirtqUsedElem, .{ .id = 0, .len = 0 }))) };
     mmu.clean_dcache_range(@intFromPtr(used), @sizeOf(VirtqUsed));
     if (queue == 0) gpu_last_used = 0;
     // Queue GPA registers are le64; VZ's common-cfg emulation accepts

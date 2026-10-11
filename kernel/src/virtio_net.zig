@@ -277,7 +277,7 @@ pub const FrameSlot = struct {
     data: [rx_buf_len]u8 = undefined,
 };
 
-pub var rx_fifo: [fifo_slots]FrameSlot = [_]FrameSlot{.{}} ** fifo_slots;
+pub var rx_fifo: [fifo_slots]FrameSlot = @as([fifo_slots]FrameSlot, @splat(@as(FrameSlot, .{})));
 pub var rx_fifo_head: usize = 0; // oldest slot (next to pop)
 pub var rx_fifo_count: usize = 0;
 
@@ -290,7 +290,7 @@ pub var rx_bytes: u64 = 0;
 pub var rx_filtered: u64 = 0;
 pub var rx_overflow: u64 = 0;
 pub var rx_last_len: u32 = 0;
-pub var rx_first16: [16]u8 = .{0} ** 16;
+pub var rx_first16: [16]u8 = @splat(0);
 /// Whether the queue-0 buffer is currently supplied (armed + kicked).
 pub var rx_armed: bool = false;
 
@@ -335,7 +335,7 @@ pub var net_fail: []const u8 = "";
 /// host-set MAC is exposed at config offset 0 even when the device does not
 /// offer VIRTIO_NET_F_MAC (the claim-1373 observation; `net` prints it
 /// for the record).
-pub var net_devcfg_mac_obs: [6]u8 = .{0} ** 6;
+pub var net_devcfg_mac_obs: [6]u8 = @splat(0);
 pub var net_devcfg_mac_seen: bool = false;
 /// The device's OFFERED features as observed at init/rearm (low/high), so
 /// a failure can name exactly what the device offered (confirm-at-claim-
@@ -518,7 +518,7 @@ fn real_invalidate(ptr: usize, len: usize) void {
 /// Resolve the virtio common/notify/device capabilities for `dev` (its
 /// BARs + cap walk). Returns the common-config address, or 0 on failure.
 fn resolve_dev(dev: u32) u64 {
-    var bar_base: [6]u64 = .{0} ** 6;
+    var bar_base: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < 6) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);
@@ -723,10 +723,10 @@ fn transport_init(ops: *const Ops, dev: *Device, rearm: bool) bool {
         dev.rx_desc[i] = .{ .addr = 0, .len = 0, .flags = 0, .next = 0 };
         dev.tx_desc[i] = .{ .addr = 0, .len = 0, .flags = 0, .next = 0 };
     }
-    dev.rx_avail = .{ .flags = 0, .idx = 0, .ring = .{0} ** queue_size };
-    dev.rx_used = .{ .flags = 0, .idx = 0, .ring = [_]VirtqUsedElem{.{ .id = 0, .len = 0 }} ** queue_size };
-    dev.tx_avail = .{ .flags = 0, .idx = 0, .ring = .{0} ** queue_size };
-    dev.tx_used = .{ .flags = 0, .idx = 0, .ring = [_]VirtqUsedElem{.{ .id = 0, .len = 0 }} ** queue_size };
+    dev.rx_avail = .{ .flags = 0, .idx = 0, .ring = @splat(0) };
+    dev.rx_used = .{ .flags = 0, .idx = 0, .ring = @as([queue_size]VirtqUsedElem, @splat(@as(VirtqUsedElem, .{ .id = 0, .len = 0 }))) };
+    dev.tx_avail = .{ .flags = 0, .idx = 0, .ring = @splat(0) };
+    dev.tx_used = .{ .flags = 0, .idx = 0, .ring = @as([queue_size]VirtqUsedElem, @splat(@as(VirtqUsedElem, .{ .id = 0, .len = 0 }))) };
     ops.clean(@intFromPtr(&dev.rx_used), @sizeOf(VirtqUsed));
     ops.clean(@intFromPtr(&dev.tx_used), @sizeOf(VirtqUsed));
     dev.tx_last_used = 0;
@@ -1528,7 +1528,7 @@ test "virtio_net: staging bounds — payload truncation is honest" {
     const len = build_known_frame(&frame, &fallback_mac, 5000);
     try std.testing.expectEqual(@as(usize, 1514), len);
     // build_frame (the generic builder) truncates its payload the same way.
-    const payload = [_]u8{0xab} ** 2000;
+    const payload = @as([2000]u8, @splat(@as(u8, 0xab)));
     const len2 = build_frame(&frame, &broadcast_mac, &fallback_mac, eth_type_ipv4, &payload);
     try std.testing.expectEqual(@as(usize, 1514), len2);
     try std.testing.expectEqual(@as(u8, 0xab), frame[1513]);
@@ -1610,7 +1610,7 @@ test "virtio_net: MAC filter — own MAC + broadcast accepted, other dropped" {
     try std.testing.expect(!mac_accept(0, &other, &own));
     // With a 12-byte virtio_net_hdr prefix (the RX-header contract): the
     // dst sits at offset 12.
-    var buf: [rx_hdr_len + 14]u8 = .{0} ** (rx_hdr_len + 14);
+    var buf: [rx_hdr_len + 14]u8 = @splat(0);
     @memcpy(buf[rx_hdr_len .. rx_hdr_len + 6], &own);
     try std.testing.expect(mac_accept(rx_hdr_len, &buf, &own));
     @memcpy(buf[rx_hdr_len .. rx_hdr_len + 6], &other);
@@ -1624,11 +1624,11 @@ test "virtio_net: bounded frame FIFO — push, pop, occupancy, drop-oldest" {
     rx_fifo_head = 0;
     rx_fifo_count = 0;
     rx_overflow = 0;
-    const a = [_]u8{0xaa} ** 10;
-    const b = [_]u8{0xbb} ** 20;
-    const c = [_]u8{0xcc} ** 30;
-    const d = [_]u8{0xdd} ** 40;
-    const e = [_]u8{0xee} ** 50; // the overflow frame (drops `a`)
+    const a = @as([10]u8, @splat(@as(u8, 0xaa)));
+    const b = @as([20]u8, @splat(@as(u8, 0xbb)));
+    const c = @as([30]u8, @splat(@as(u8, 0xcc)));
+    const d = @as([40]u8, @splat(@as(u8, 0xdd)));
+    const e = @as([50]u8, @splat(@as(u8, 0xee))); // the overflow frame (drops `a`)
     try std.testing.expect(fifo_push(&a));
     try std.testing.expect(fifo_push(&b));
     try std.testing.expect(fifo_push(&c));
@@ -1686,7 +1686,7 @@ test "virtio_net: RX supply + used-ring drain + filter + FIFO over a mock" {
     // observation) + a BROADCAST Ethernet frame (dst ff*6, src
     // 02:00:00:00:00:03, ethertype 0x0800, payload bytes 00..1f) — the
     // RX-header + filter contract the class-B gate pins from observation.
-    var delivered: [rx_buf_len]u8 = .{0} ** rx_buf_len;
+    var delivered: [rx_buf_len]u8 = @splat(0);
     delivered[10] = 0x01; // virtio_net_hdr num_buffers = 1 (observed)
     const dst = [6]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     const src = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x03 };
@@ -1759,7 +1759,7 @@ test "virtio_net: RX MAC filter drops a foreign frame (counter, not FIFO)" {
     // filter must drop it — the counter moves, the FIFO stays empty, and
     // the rx-obs record still captures the delivered bytes (so a drop is
     // distinguishable from a failed delivery).
-    var delivered: [rx_buf_len]u8 = .{0} ** rx_buf_len;
+    var delivered: [rx_buf_len]u8 = @splat(0);
     delivered[10] = 0x01; // the OBSERVED virtio_net_hdr num_buffers=1
     const dst = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x04 };
     const src = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x05 };
@@ -1791,7 +1791,7 @@ test "virtio_net: RX ARP request is answered — byte-exact reply on TX over a m
     net_dev = .{};
     net_mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 }; // the host-set guest MAC
     arp.own_ip = .{ 10, 0, 0, 1 };
-    arp.table = [_]arp.ArpEntry{.{}} ** arp.table_slots;
+    arp.table = @as([arp.table_slots]arp.ArpEntry, @splat(@as(arp.ArpEntry, .{})));
     arp.table_cursor = 0;
     arp.replies_sent = 0;
     arp.replies_learned = 0;
@@ -1818,7 +1818,7 @@ test "virtio_net: RX ARP request is answered — byte-exact reply on TX over a m
     const host_mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 };
     const host_ip = [4]u8{ 10, 0, 0, 2 };
     _ = arp.build_request(&request, &host_mac, host_ip, arp.own_ip);
-    var delivered: [rx_buf_len]u8 = .{0} ** rx_buf_len;
+    var delivered: [rx_buf_len]u8 = @splat(0);
     delivered[10] = 0x01; // virtio_net_hdr num_buffers = 1 (observed)
     @memcpy(delivered[rx_hdr_len .. rx_hdr_len + request.len], &request);
     mock_rx_frame = delivered[0 .. rx_hdr_len + request.len];
@@ -1832,7 +1832,7 @@ test "virtio_net: RX ARP request is answered — byte-exact reply on TX over a m
     // The request was accepted (FIFO holds the raw observed frame) AND
     // answered: the reply went out on the TX queue byte-exact, with a
     // ZEROED virtio_net_hdr prefix (the claim-1373 TX contract).
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** tx_hdr_len, tx_staging[0..tx_hdr_len]);
+    try std.testing.expectEqualSlices(u8, &@as([tx_hdr_len]u8, @splat(@as(u8, 0))), tx_staging[0..tx_hdr_len]);
     try std.testing.expectEqual(@as(u64, 1), rx_frames);
     try std.testing.expectEqual(@as(usize, 1), fifo_occupancy());
     try std.testing.expectEqual(@as(u64, 1), arp.replies_sent);
@@ -1857,7 +1857,7 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     net_dev = .{};
     net_mac = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
     arp.own_ip = .{ 10, 0, 0, 1 };
-    arp.table = [_]arp.ArpEntry{.{}} ** arp.table_slots;
+    arp.table = @as([arp.table_slots]arp.ArpEntry, @splat(@as(arp.ArpEntry, .{})));
     arp.table_cursor = 0;
     arp.replies_sent = 0;
     arp.replies_learned = 0;
@@ -1886,7 +1886,7 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     const host_ip = [4]u8{ 10, 0, 0, 2 };
     var reply: [arp.arp_frame_len]u8 = undefined;
     _ = arp.build_reply(&reply, &host_mac, host_ip, net_mac, arp.own_ip);
-    var delivered: [rx_buf_len]u8 = .{0} ** rx_buf_len;
+    var delivered: [rx_buf_len]u8 = @splat(0);
     delivered[10] = 0x01;
     @memcpy(delivered[rx_hdr_len .. rx_hdr_len + reply.len], &reply);
     mock_rx_frame = delivered[0 .. rx_hdr_len + reply.len];
@@ -1986,7 +1986,7 @@ fn fake_dev_read32(off: u32) u32 {
 
 // Module-global mock transport state (the fat.zig mock-ops shape: plain fn
 // pointers close over these; one mock per test binary).
-var mock_cfg: [0x40]u8 = .{0} ** 0x40;
+var mock_cfg: [0x40]u8 = @splat(0);
 var mock_kicks: u16 = 0;
 /// RX used-ring index (the queue-0 completions — the RX side of the mock
 /// is per-queue, like the real device; the ARP reply path transmits on

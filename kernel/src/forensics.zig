@@ -112,10 +112,10 @@ const Record = struct {
     live: bool = false,
 };
 
-var records: [capacity]Record = [_]Record{.{}} ** capacity;
+var records: [capacity]Record = @as([capacity]Record, @splat(@as(Record, .{})));
 /// Per-core next sequence number. Only that core writes its own entry, which is
 /// what makes the ring lock-free (see the header).
-var next: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
+var next: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
 /// Records emitted so far, and how many were dropped as unprintable.
 pub var emitted: u64 = 0;
 pub var truncated: u64 = 0;
@@ -286,8 +286,8 @@ pub fn sample(con: console.Console, counter: u64, freq: u64) void {
 
 /// Reset for a fresh capture (the `forensics reset` command).
 pub fn reset() void {
-    records = [_]Record{.{}} ** capacity;
-    next = [_]u64{0} ** smp.max_cores;
+    records = @as([capacity]Record, @splat(@as(Record, .{})));
+    next = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
     emitted = 0;
     truncated = 0;
     last_sample_secs = null;

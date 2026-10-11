@@ -119,8 +119,8 @@ test "native relative path depth eight and nine, and root-dependent 512 byte lim
     // Direct root rows in a mock still pass through the real B3 path validator.
     try fs.rootedPath("/host/content", node[0].path);
     try t.expectError(error.ResourceLimit, fs.rootedPath("/host/content", "a/b/c/d/e/f/g/h/i"));
-    try fs.rootedPath("/host/content", "x" ** 255 ++ "/" ++ "y" ** 242);
-    try t.expectError(error.NameTooLong, fs.rootedPath("/host/content", "x" ** 255 ++ "/" ++ "y" ** 243));
+    try fs.rootedPath("/host/content", &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([242:0]u8, @splat("y"[0])));
+    try t.expectError(error.NameTooLong, fs.rootedPath("/host/content", &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([243:0]u8, @splat("y"[0]))));
 }
 
 fn allocatingWalk(allocator: std.mem.Allocator) !void {

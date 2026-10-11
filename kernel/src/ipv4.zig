@@ -505,7 +505,7 @@ test "ipv4: handle_rx — answer an echo for us, observe a reply, drop the rest"
     try std.testing.expectEqual(@as(u64, 1), dropped_proto);
 
     // A non-IPv4 frame: untouched, not counted.
-    var arp_frame: [42]u8 = .{0} ** 42;
+    var arp_frame: [42]u8 = @splat(0);
     arp_frame[12] = 0x08;
     arp_frame[13] = 0x06;
     try std.testing.expect(handle_rx(&arp_frame, &test_mac, &reply_buf) == null);
@@ -523,7 +523,7 @@ test "ipv4: protocol dispatch — UDP (17) is handed to udp, TCP (6) to the tcp 
     // A valid UDP datagram 10.0.0.2:9999 -> 10.0.0.1:7000 is delivered to
     // the UDP layer (not counted as dropped_proto) — the IPv4 validation
     // (checksum, fragment, dst) stays in ipv4.
-    var frame: [46]u8 = .{0} ** 46;
+    var frame: [46]u8 = @splat(0);
     frame[12] = 0x08;
     frame[13] = 0x00;
     frame[14] = 0x45;
@@ -550,7 +550,7 @@ test "ipv4: protocol dispatch — UDP (17) is handed to udp, TCP (6) to the tcp 
     // is counted malformed inside tcp, proving the dispatch happened.
     tcp.reset();
     tcp.dropped_malformed = 0;
-    var tcpf: [46]u8 = .{0} ** 46;
+    var tcpf: [46]u8 = @splat(0);
     tcpf[12] = 0x08;
     tcpf[13] = 0x00;
     tcpf[14] = 0x45;

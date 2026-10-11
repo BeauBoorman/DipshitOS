@@ -93,7 +93,7 @@ pub const Atlas = struct {
     /// [95][max_glyph_bytes]u8, row-major: glyph (cp-0x20), row y, byte
     /// y*row_bytes + x/2, high nibble = even x, low nibble = odd x,
     /// level 0..15 = alpha/17. Bytes past `m.glyph_bytes` stay zero.
-    cells: [glyph_count][max_glyph_bytes]u8 = .{.{0} ** max_glyph_bytes} ** glyph_count,
+    cells: [glyph_count][max_glyph_bytes]u8 = @splat(@as([max_glyph_bytes]u8, @splat(0))),
 };
 
 /// Render every printable ASCII glyph through the engine and compose it

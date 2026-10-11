@@ -25,7 +25,7 @@ const std = @import("std");
 
 /// A 24 KiB read-only blob (all 'A') that pushes the image past the old
 /// 16 KiB load bound. Exported so it is never dead-stripped.
-export const big_blob: [24 * 1024]u8 = [_]u8{0x41} ** (24 * 1024);
+export const big_blob: [24 * 1024]u8 = @as([(24 * 1024)]u8, @splat(@as(u8, 0x41)));
 /// An initialized `.data` global — the value the payload verifies on entry.
 export var g_data: u64 = 0x1122334455667788;
 /// A zero-filled `.bss` global (a 4 KiB buffer). `undefined` → NOBITS, so

@@ -158,7 +158,7 @@ pub fn seed(seed_bytes: *const [seed_len]u8) void {
 pub fn seed_fallback() void {
     const daif = stream_lock.lock();
     defer stream_lock.unlock(daif);
-    var fb: [seed_len]u8 = [_]u8{0} ** seed_len;
+    var fb: [seed_len]u8 = @as([seed_len]u8, @splat(@as(u8, 0)));
     const tag = "VIRELAIOS-ENTROPY-FALLBACK";
     @memcpy(fb[0..tag.len], tag);
     init_state(&fb);
@@ -354,7 +354,7 @@ test "csprng: ASLR stack placement stays in band, aligned, clear of text_va" {
         try std.testing.expect(va != 0x0040_0000);
     }
     // Seeded path: a real call also lands in the band.
-    seed(&[_]u8{0x5a} ** seed_len);
+    seed(&@as([seed_len]u8, @splat(@as(u8, 0x5a))));
     const va = random_stack_va();
     try std.testing.expect(va >= 0x1_0000_0000 and va < 0x2_0000_0000);
     try std.testing.expect(va % 0x1_0000 == 0);

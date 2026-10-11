@@ -803,7 +803,7 @@ test "monitor: net arp prints the table + counters" {
     var mon = env.monitor();
     virtio_net.net_ready = true;
     virtio_net.rx_armed = false; // the drain is a no-op without a supplied buffer
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.arp.upsert(.{ 10, 0, 0, 2 }, .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 });
     virtio_net.arp.requests_sent = 1;
     virtio_net.arp.replies_sent = 0;
@@ -820,7 +820,7 @@ test "monitor: net arp prints the table + counters" {
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "arp", "10.0.0.2" }));
     try std.testing.expectEqualStrings("net arp: 10.0.0.2 is at 02:00:00:00:00:02\n", env.mock.contents());
     virtio_net.net_ready = false;
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
 }
 
 test "monitor: net arp resolve — miss sends the request, no-IP refuses honestly" {
@@ -831,7 +831,7 @@ test "monitor: net arp resolve — miss sends the request, no-IP refuses honestl
     virtio_net.net_ready = true;
     virtio_net.net_mac = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
     virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.arp.requests_sent = 0;
     virtio_net.net_dev = .{};
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "arp", "10.0.0.2" }));
@@ -861,7 +861,7 @@ test "monitor: net ping sends an echo request to a resolved peer" {
     virtio_net.net_ready = true;
     virtio_net.net_mac = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
     virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.arp.upsert(.{ 10, 0, 0, 2 }, .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 });
     virtio_net.ipv4.requests_sent = 0;
     virtio_net.ipv4.ping_seq = 1;
@@ -873,7 +873,7 @@ test "monitor: net ping sends an echo request to a resolved peer" {
     // A peer NOT in the ARP table refuses honestly (an echo needs a
     // unicast dst — `net arp <ip>` resolves first).
     env.mock.reset();
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "ping", "10.0.0.3" }));
     try std.testing.expectEqualStrings("error: peer not in ARP table (net arp <a.b.c.d> first)\n", env.mock.contents());
     // Without a static IP the ping is refused honestly.
@@ -886,7 +886,7 @@ test "monitor: net ping sends an echo request to a resolved peer" {
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "ping", "nope" }));
     try std.testing.expectEqualStrings("error: invalid address: nope\n", env.mock.contents());
     virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.net_ops = saved_ops;
     virtio_net.net_ready = false;
 }
@@ -963,7 +963,7 @@ test "monitor: net udp send — to a resolved peer on the mock transport" {
     virtio_net.net_ready = true;
     virtio_net.net_mac = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
     virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.arp.upsert(.{ 10, 0, 0, 2 }, .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x02 });
     virtio_net.udp.reset();
     defer virtio_net.udp.reset();
@@ -974,7 +974,7 @@ test "monitor: net udp send — to a resolved peer on the mock transport" {
     try std.testing.expectEqual(@as(u64, 0), virtio_net.udp.loopbacked);
     // An unresolved peer refuses honestly (an echo/udp needs a unicast dst).
     env.mock.reset();
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "udp", "send", "10.0.0.3", "9999", "4" }));
     try std.testing.expectEqualStrings("error: peer not in ARP table (net arp <a.b.c.d> first)\n", env.mock.contents());
     // Length bounds refuse exactly.
@@ -982,7 +982,7 @@ test "monitor: net udp send — to a resolved peer on the mock transport" {
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "send", "10.0.0.2", "9999", "0" }));
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "send", "10.0.0.2", "9999", "65" }));
     virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
-    virtio_net.arp.table = [_]virtio_net.arp.ArpEntry{.{}} ** virtio_net.arp.table_slots;
+    virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.net_ops = saved_ops;
     virtio_net.net_ready = false;
 }
@@ -1036,7 +1036,7 @@ test "monitor: net recv prints the received frame byte-exact and drains the FIFO
     // broadcast frame (dst ff*6, src 02:00:00:00:00:01, ethertype 0x0800,
     // payload 00..1f) — the exact layout the class-B gate pins from
     // observation (net recv prints the RAW device-written bytes).
-    var frame: [virtio_net.rx_buf_len]u8 = .{0} ** virtio_net.rx_buf_len;
+    var frame: [virtio_net.rx_buf_len]u8 = @splat(0);
     frame[10] = 0x01; // virtio_net_hdr num_buffers = 1 (observed)
     const dst = [6]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     const src = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
@@ -1327,7 +1327,7 @@ test "monitor: repeat enforces count and byte bounds" {
     try std.testing.expectEqualStrings("\n\n\n", env.mock.contents());
 
     // 70-char line: 57 repetitions fit (57*71 = 4047 <= 4096), 58 do not.
-    const long = "a" ** 70;
+    const long = &@as([70:0]u8, @splat("a"[0]));
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "repeat", "57", long }));
     try std.testing.expectEqual(@as(usize, 57 * 71), env.mock.contents().len);
@@ -1443,7 +1443,7 @@ test "monitor: random prints a deterministic hex line from the seeded CSPRNG and
     try std.testing.expect(lookup("random") != null);
     try std.testing.expectEqualStrings("print n random bytes from the seeded CSPRNG (hex)", lookup("random").?.help);
     // Seed with a fixed value so the output is deterministic in the test.
-    csprng.seed(&[_]u8{0x5a} ** csprng.seed_len);
+    csprng.seed(&@as([csprng.seed_len]u8, @splat(@as(u8, 0x5a))));
     env.mock.reset();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "random", "32" }));
     const out = env.mock.contents();
@@ -1939,7 +1939,7 @@ test "monitor: output overflow is bounded and flagged, never fatal" {
         .{ .handoff = make_handoff(), .map = fixture.view, .console_name = "mock" },
         machine.control(),
     );
-    const long = "x" ** 100;
+    const long = &@as([100:0]u8, @splat("x"[0]));
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "echo", long }));
     try std.testing.expect(small.overflowed);
     try std.testing.expectEqual(@as(usize, 16), small.len);
@@ -2010,7 +2010,7 @@ const gap_elf_aarch64: u16 = 0xB7;
 /// in its initialized bytes) — a legal 1-segment gap image when
 /// `vaddr != text_base`.
 fn one_segment_gap_elf(comptime vaddr: u64) [256]u8 {
-    var img = [_]u8{0} ** 256;
+    var img = @as([256]u8, @splat(@as(u8, 0)));
     const magic4 = [4]u8{ 0x7f, 'E', 'L', 'F' };
     @memcpy(img[0..4], &magic4);
     img[4] = 2; // ELF64
@@ -2315,7 +2315,7 @@ test "exec: an oversized CONTIGUOUS ELF keeps its refusal (M70c-K #1504)" {
 /// only ever copies [text][data] — so before the M70c-K guard this image
 /// loaded "successfully" with its rodata and data segments missing.
 fn small_contiguous_three_segment_elf() [0x2100]u8 {
-    var img = [_]u8{0} ** 0x2100;
+    var img = @as([0x2100]u8, @splat(@as(u8, 0)));
     const magic4 = [4]u8{ 0x7f, 'E', 'L', 'F' };
     @memcpy(img[0..4], &magic4);
     img[4] = 1; // ELF32

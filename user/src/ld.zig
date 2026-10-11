@@ -104,7 +104,7 @@ pub const Elf64Phdr = extern struct {
 };
 
 pub const LoadedLib = struct {
-    name: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     base_va: u64 = 0,
     strtab: ?[*]const u8 = null,
@@ -114,7 +114,7 @@ pub const LoadedLib = struct {
 };
 
 pub const max_loaded_libs = 8;
-var loaded_libs: [max_loaded_libs]LoadedLib = [_]LoadedLib{.{}} ** max_loaded_libs;
+var loaded_libs: [max_loaded_libs]LoadedLib = @as([max_loaded_libs]LoadedLib, @splat(@as(LoadedLib, .{})));
 var loaded_lib_count: usize = 0;
 
 // M97c #2099: the shared-library window contract, mirrored from the
@@ -831,7 +831,7 @@ test "ld: symbol lookup across loaded libraries" {
 // the whole staged-load path runs without a kernel.
 // ---------------------------------------------------------------------------
 
-var test_lib_image: [lib_slot_bytes]u8 align(4096) = [_]u8{0} ** lib_slot_bytes;
+var test_lib_image: [lib_slot_bytes]u8 align(4096) = @as([lib_slot_bytes]u8, @splat(@as(u8, 0)));
 
 fn seed_lib_image() void {
     @memset(&test_lib_image, 0);
@@ -970,5 +970,5 @@ test "ld: #2099 — relocations only write inside writable image windows" {
     try std.testing.expectEqual(@as(u64, 0), outside);
 }
 
-var rela_fixture_buf: [2 * @sizeOf(Elf64Rela)]u8 align(8) = [_]u8{0} ** (2 * @sizeOf(Elf64Rela));
-var dyn_fixture_buf: [4 * @sizeOf(Elf64Dyn)]u8 align(8) = [_]u8{0} ** (4 * @sizeOf(Elf64Dyn));
+var rela_fixture_buf: [2 * @sizeOf(Elf64Rela)]u8 align(8) = @as([(2 * @sizeOf(Elf64Rela))]u8, @splat(@as(u8, 0)));
+var dyn_fixture_buf: [4 * @sizeOf(Elf64Dyn)]u8 align(8) = @as([(4 * @sizeOf(Elf64Dyn))]u8, @splat(@as(u8, 0)));

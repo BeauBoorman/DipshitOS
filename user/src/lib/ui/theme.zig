@@ -470,7 +470,7 @@ pub fn sync_theme_from_host() bool {
     if (@import("builtin").os.tag != .freestanding) return false;
     const fd = file_open("/host/SETTINGS.TXT", MODE_READ);
     if (fd < 0) return false;
-    var buf: [256]u8 = [_]u8{0} ** 256;
+    var buf: [256]u8 = @as([256]u8, @splat(@as(u8, 0)));
     const n = file_read(@as(u32, @intCast(fd)), buf[0..]);
     file_close(@as(u32, @intCast(fd)));
     if (n <= 0) return false;

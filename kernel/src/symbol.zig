@@ -18,7 +18,7 @@ pub const max_symbols: usize = 32;
 pub const name_max: usize = 63;
 
 pub const Symbol = struct {
-    name: [name_max + 1]u8 = [_]u8{0} ** (name_max + 1),
+    name: [name_max + 1]u8 = @as([(name_max + 1)]u8, @splat(@as(u8, 0))),
     name_len: u8 = 0,
     /// Link-time virtual address (ELF st_value — images link at the EL0
     /// text aperture, so these are directly comparable with fault PCs).
@@ -36,7 +36,7 @@ pub const Match = struct {
     offset: u64,
 };
 
-var table: [max_symbols]Symbol = [_]Symbol{.{}} ** max_symbols;
+var table: [max_symbols]Symbol = @as([max_symbols]Symbol, @splat(@as(Symbol, .{})));
 var count_val: usize = 0;
 
 /// Clear the table (called at every exec).
@@ -103,7 +103,7 @@ test "symbol: add, count, get, and truncation" {
     try testing.expectEqual(@as(u64, 0x400000), s.addr);
 
     // Truncation to 63 chars.
-    const long = "a" ** 80;
+    const long = &@as([80:0]u8, @splat("a"[0]));
     try testing.expect(add(long, 0x400100, 4));
     try testing.expectEqual(@as(usize, name_max), get(1).?.name_len);
 }

@@ -66,7 +66,7 @@ pub const AppState = struct {
     menu: SexiburgerMenu,
     btn_trigger: Button,
     btn_chord_hint: Button,
-    last_action_text: [64]u8 = [_]u8{0} ** 64,
+    last_action_text: [64]u8 = @as([64]u8, @splat(@as(u8, 0))),
     last_action_len: usize = 0,
     action_counter: u32 = 0,
 

@@ -460,7 +460,7 @@ test "disas: unknown words fall back honestly" {
 // ---------------------------------------------------------------------------
 
 pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
-    var path_buf: [40]u8 = [_]u8{0} ** 40;
+    var path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     // M34 HF6 (issue #740): bare name routes to the host share.
     @memcpy(path_buf[0..7], "OUT.ELF");
     var path_len: usize = 12;

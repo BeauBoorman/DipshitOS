@@ -16,7 +16,7 @@ pub const HmacSha256 = struct {
     opad: [sha256.block_len]u8,
 
     pub fn init(key: []const u8) HmacSha256 {
-        var kblock = [_]u8{0} ** sha256.block_len;
+        var kblock = @as([sha256.block_len]u8, @splat(@as(u8, 0)));
         if (key.len > sha256.block_len) {
             var d: [sha256.digest_len]u8 = undefined;
             sha256.sha256(&d, key);
@@ -54,7 +54,7 @@ pub const HmacSha512 = struct {
     opad: [sha512.block_len]u8,
 
     pub fn init(key: []const u8) HmacSha512 {
-        var kblock = [_]u8{0} ** sha512.block_len;
+        var kblock = @as([sha512.block_len]u8, @splat(@as(u8, 0)));
         if (key.len > sha512.block_len) {
             var d: [sha512.digest_len]u8 = undefined;
             sha512.sha512(&d, key);
@@ -95,7 +95,7 @@ pub const HmacSha384 = struct {
     opad: [sha384.block_len]u8,
 
     pub fn init(key: []const u8) HmacSha384 {
-        var kblock = [_]u8{0} ** sha384.block_len;
+        var kblock = @as([sha384.block_len]u8, @splat(@as(u8, 0)));
         if (key.len > sha384.block_len) {
             var d: [sha384.digest_len]u8 = undefined;
             sha384.sha384(&d, key);
@@ -150,7 +150,7 @@ pub fn hmacSha384(out: *[sha384.digest_len]u8, key: []const u8, msg: []const u8)
 }
 
 test "hmac-sha256: RFC 4231 case 1" {
-    const key = [_]u8{0x0b} ** 20;
+    const key = @as([20]u8, @splat(@as(u8, 0x0b)));
     var out: [32]u8 = undefined;
     hmacSha256(&out, &key, "Hi There");
     const exp = try hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
@@ -165,8 +165,8 @@ test "hmac-sha256: RFC 4231 case 2" {
 }
 
 test "hmac-sha256: RFC 4231 case 3" {
-    const key = [_]u8{0xaa} ** 20;
-    const data = [_]u8{0xdd} ** 50;
+    const key = @as([20]u8, @splat(@as(u8, 0xaa)));
+    const data = @as([50]u8, @splat(@as(u8, 0xdd)));
     var out: [32]u8 = undefined;
     hmacSha256(&out, &key, &data);
     const exp = try hex("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
@@ -176,7 +176,7 @@ test "hmac-sha256: RFC 4231 case 3" {
 test "hmac-sha256: RFC 4231 case 4 (25-byte key, 50-byte data)" {
     var key: [25]u8 = undefined;
     for (0..25) |i| key[i] = @intCast(i + 1);
-    const data = [_]u8{0xcd} ** 50;
+    const data = @as([50]u8, @splat(@as(u8, 0xcd)));
     var out: [32]u8 = undefined;
     hmacSha256(&out, &key, &data);
     const exp = try hex("82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b");
@@ -184,7 +184,7 @@ test "hmac-sha256: RFC 4231 case 4 (25-byte key, 50-byte data)" {
 }
 
 test "hmac-sha256: RFC 4231 case 6 (131-byte key)" {
-    const key = [_]u8{0xaa} ** 131;
+    const key = @as([131]u8, @splat(@as(u8, 0xaa)));
     var out: [32]u8 = undefined;
     hmacSha256(&out, &key, "Test Using Larger Than Block-Size Key - Hash Key First");
     const exp = try hex("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
@@ -192,7 +192,7 @@ test "hmac-sha256: RFC 4231 case 6 (131-byte key)" {
 }
 
 test "hmac-sha256: RFC 4231 case 7 (131-byte key and data)" {
-    const key = [_]u8{0xaa} ** 131;
+    const key = @as([131]u8, @splat(@as(u8, 0xaa)));
     const data = "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
     var out: [32]u8 = undefined;
     hmacSha256(&out, &key, data);
@@ -201,7 +201,7 @@ test "hmac-sha256: RFC 4231 case 7 (131-byte key and data)" {
 }
 
 test "hmac-sha256: streaming in chunks equals one-shot" {
-    const key = [_]u8{0x0b} ** 20;
+    const key = @as([20]u8, @splat(@as(u8, 0x0b)));
     const msg = "Hi There";
     var one: [32]u8 = undefined;
     hmacSha256(&one, &key, msg);
@@ -213,7 +213,7 @@ test "hmac-sha256: streaming in chunks equals one-shot" {
 }
 
 test "hmac-sha512: RFC 4231 case 1" {
-    const key = [_]u8{0x0b} ** 20;
+    const key = @as([20]u8, @splat(@as(u8, 0x0b)));
     var out: [64]u8 = undefined;
     hmacSha512(&out, &key, "Hi There");
     const exp = try hex("87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854");
@@ -228,7 +228,7 @@ test "hmac-sha512: RFC 4231 case 2" {
 }
 
 test "hmac-sha512: RFC 4231 case 6 (131-byte key)" {
-    const key = [_]u8{0xaa} ** 131;
+    const key = @as([131]u8, @splat(@as(u8, 0xaa)));
     var out: [64]u8 = undefined;
     hmacSha512(&out, &key, "Test Using Larger Than Block-Size Key - Hash Key First");
     const exp = try hex("80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598");

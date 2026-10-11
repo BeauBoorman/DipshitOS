@@ -21,7 +21,7 @@ pub fn frame_index(reg: u5) ?usize {
 }
 
 pub fn fresh_frame() VectorFrame {
-    return [_]u64{0} ** vector_frame_slots;
+    return @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
 }
 
 pub fn get_reg(frame: *const VectorFrame, reg: u5) u64 {
@@ -76,7 +76,7 @@ pub const TaskState = enum {
 
 pub const MockTask = struct {
     id: usize,
-    name: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     state: TaskState = .ready,
     frame: VectorFrame = fresh_frame(),
@@ -101,7 +101,7 @@ pub const MockTask = struct {
 pub const MockScheduler = struct {
     const max_tasks = 16;
 
-    tasks: [max_tasks]?MockTask = [_]?MockTask{null} ** max_tasks,
+    tasks: [max_tasks]?MockTask = @as([max_tasks]?MockTask, @splat(@as(?MockTask, null))),
     current_task: ?usize = null,
     total_ticks: u64 = 0,
 

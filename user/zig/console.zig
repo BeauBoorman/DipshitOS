@@ -44,7 +44,7 @@ test "console: chunks, short writes, zero progress and native errors" {
     };
     Mock.seen = 0;
     Mock.result = 17;
-    try writeAll(Mock.write, &([_]u8{'x'} ** 777));
+    try writeAll(Mock.write, &(@as([777]u8, @splat(@as(u8, 'x')))));
     try std.testing.expectEqual(@as(usize, 777), Mock.seen);
     for ([_]i64{ 0, -1, 257 }) |result| {
         Mock.result = result;
@@ -62,7 +62,7 @@ test "diagnostics: reserve exactly one bounded limit message" {
     };
     Mock.bytes = 0;
     var diag: Diagnostics = .{};
-    try diag.emit(Mock.write, &([_]u8{'x'} ** (diagnostic_limit - "DiagnosticLimit\n".len)));
+    try diag.emit(Mock.write, &(@as([(diagnostic_limit - "DiagnosticLimit\n".len)]u8, @splat(@as(u8, 'x')))));
     try std.testing.expectError(error.DiagnosticLimit, diag.emit(Mock.write, "x"));
     try std.testing.expectError(error.DiagnosticLimit, diag.emit(Mock.write, "x"));
     try std.testing.expectEqual(diagnostic_limit, Mock.bytes);

@@ -630,8 +630,8 @@ test "fuzz: request encode and the READ payload builder refuse oversized shapes"
     var dest: [virtio_file.path_max + virtio_file.read_offset_len]u8 = undefined;
     // A payload longer than the u16 length field can express, and a path one
     // byte past the documented bound.
-    const over_long = [_]u8{0x41} ** 0x10000;
-    const long_path = [_]u8{'a'} ** (virtio_file.path_max + 1);
+    const over_long = @as([0x10000]u8, @splat(@as(u8, 0x41)));
+    const long_path = @as([(virtio_file.path_max + 1)]u8, @splat(@as(u8, 'a')));
     var payload: [512]u8 = undefined;
     var violations: usize = 0;
     var checked: usize = 0;

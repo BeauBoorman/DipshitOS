@@ -473,7 +473,7 @@ test "ui: ListView row selection and keyboard navigation" {
 }
 
 test "ui: parse_procs decodes 40-byte snapshot rows" {
-    var raw: [80]u8 = [_]u8{0} ** 80;
+    var raw: [80]u8 = @as([80]u8, @splat(@as(u8, 0)));
     // Row 0: pid=1, state=2 (running), exit=0, name="KERNEL.BIN"
     std.mem.writeInt(u64, raw[0..8], 1, .little);
     std.mem.writeInt(u64, raw[8..16], 2, .little);
@@ -1519,7 +1519,7 @@ test "ui: blend_source_over arithmetic" {
 }
 
 test "ui: direct backing buffer draw_image with alpha blit and clipping" {
-    var buf = [_]u32{0xFF000000} ** (10 * 10);
+    var buf = @as([(10 * 10)]u32, @splat(@as(u32, 0xFF000000)));
     win_set_backing(7, &buf, 10, 10);
     defer win_clear_backing(7);
 
@@ -1550,14 +1550,14 @@ test "ui: direct backing buffer draw_image with alpha blit and clipping" {
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf[4 * 10 + 3]);
 
     // Test clipping: draw clipped to (2, 3, 1, 1) -> only (2, 3) blitted
-    buf = [_]u32{0xFF000000} ** (10 * 10);
+    buf = @as([(10 * 10)]u32, @splat(@as(u32, 0xFF000000)));
     draw_image_clipped(7, 2, 3, src_img, Rect.make(2, 3, 1, 1));
     try std.testing.expect(((buf[3 * 10 + 2] >> 16) & 0xFF) >= 127);
     try std.testing.expectEqual(@as(u32, 0xFF000000), buf[3 * 10 + 3]); // clipped out
 }
 
 test "ui: direct backing buffer draw_image_scaled" {
-    var buf = [_]u32{0xFF000000} ** (8 * 8);
+    var buf = @as([(8 * 8)]u32, @splat(@as(u32, 0xFF000000)));
     win_set_backing(8, &buf, 8, 8);
     defer win_clear_backing(8);
 
@@ -1717,7 +1717,7 @@ test "dq4: set_theme + theme_name round-trip" {
 }
 
 test "m38: direct backing buffer draw_alpha_mask blends anti-aliased font glyphs" {
-    var pixels = [_]u32{0xFF101418} ** 400; // 20x20 buffer
+    var pixels = @as([400]u32, @splat(@as(u32, 0xFF101418))); // 20x20 buffer
     win_set_backing(9, &pixels, 20, 20);
     defer win_clear_backing(9);
 
@@ -1780,7 +1780,7 @@ test "m39 ui2: isqrt integer square root" {
 }
 
 test "m39 ui2: fill_rounded_rect_buf anti-aliased geometry and symmetry" {
-    var pixels = [_]u32{0xFF000000} ** (24 * 24);
+    var pixels = @as([(24 * 24)]u32, @splat(@as(u32, 0xFF000000)));
     fill_rounded_rect_buf(&pixels, 24, 24, Rect.make(0, 0, 24, 24), 8, 0xFFFFFFFF);
 
     // 1. Center must be pure white
@@ -1804,7 +1804,7 @@ test "m39 ui2: fill_rounded_rect_buf anti-aliased geometry and symmetry" {
 }
 
 test "m39 ui2: fill_pill_buf clamps radius to half height" {
-    var pixels = [_]u32{0xFF111111} ** (32 * 16);
+    var pixels = @as([(32 * 16)]u32, @splat(@as(u32, 0xFF111111)));
     fill_pill_buf(&pixels, 32, 16, Rect.make(0, 0, 32, 16), 0xFF3B82F6);
 
     // Outer corner untouched
@@ -1873,20 +1873,20 @@ test "m69d2: strikeUnion is the mask unioned with itself shifted one pixel" {
 test "m69d2: maskSkew16 separates a lean from upright" {
     // 4x6, one ink column per band. A "/" stem (top right, bottom left) leans
     // RIGHT and scores negative; its mirror "\" scores positive.
-    var slash = [_]u8{0} ** 24;
+    var slash = @as([24]u8, @splat(@as(u8, 0)));
     slash[1] = 255; // y=0, x=1  (top, right)
     slash[4 + 1] = 255; // y=1, x=1
     slash[4 * 4] = 255; // y=4, x=0  (bottom, left)
     slash[5 * 4] = 255; // y=5, x=0
     try std.testing.expectEqual(@as(i32, -16), draw.maskSkew16(4, 6, slash[0..]));
-    var backslash = [_]u8{0} ** 24;
+    var backslash = @as([24]u8, @splat(@as(u8, 0)));
     backslash[0] = 255; // y=0, x=0
     backslash[4] = 255; // y=1, x=0
     backslash[4 * 4 + 1] = 255; // y=4, x=1
     backslash[5 * 4 + 1] = 255; // y=5, x=1
     try std.testing.expectEqual(@as(i32, 16), draw.maskSkew16(4, 6, backslash[0..]));
     // The same ink in the same column top and bottom is upright.
-    var upright = [_]u8{0} ** 24;
+    var upright = @as([24]u8, @splat(@as(u8, 0)));
     upright[0] = 255;
     upright[4] = 255;
     upright[4 * 4] = 255;

@@ -264,7 +264,7 @@ pub fn run(arena: memory.Arena) !void {
     }
     harness.clear();
     harness.step = 100_000;
-    result = try runtime.eval(" " ** 5000 ++ "42", "contract.js", harness.sink(), true);
+    result = try runtime.eval(&@as([5000:0]u8, @splat(" "[0])) ++ "42", "contract.js", harness.sink(), true);
     if (!(result.failure != null and result.failure.? == error.EvaluationDeadline and result.context_reset))
         return error.ParserPollContract;
     try success(runtime, harness, "6*7", "42\n");

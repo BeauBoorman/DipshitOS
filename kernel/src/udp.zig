@@ -64,12 +64,12 @@ pub const Datagram = struct {
     bytes: [datagram_max]u8 = undefined,
 };
 
-pub var listen: [listen_slots]ListenEntry = [_]ListenEntry{.{}} ** listen_slots;
+pub var listen: [listen_slots]ListenEntry = @as([listen_slots]ListenEntry, @splat(@as(ListenEntry, .{})));
 /// Per-listener bounded ring (slot index = the listen slot). drop-oldest:
 /// when full, the newest write overwrites the oldest and the head advances.
-pub var buffers: [listen_slots][buffer_slots]Datagram = [_][buffer_slots]Datagram{[_]Datagram{.{}} ** buffer_slots} ** listen_slots;
-pub var buf_head: [listen_slots]usize = .{0} ** listen_slots;
-pub var buf_count: [listen_slots]usize = .{0} ** listen_slots;
+pub var buffers: [listen_slots][buffer_slots]Datagram = @as([listen_slots][buffer_slots]Datagram, @splat(@as([buffer_slots]Datagram, @as([buffer_slots]Datagram, @splat(@as(Datagram, .{}))))));
+pub var buf_head: [listen_slots]usize = @splat(0);
+pub var buf_count: [listen_slots]usize = @splat(0);
 
 // ---------------------------------------------------------------------------
 // RFC 1071 one's-complement checksum (the ipv4.zig machinery, extended for
@@ -181,10 +181,10 @@ fn find_listener(port: u16) ?usize {
 /// Reset the listen table + the datagram buffers + the counters (tests
 /// only — the live kernel never re-initializes protocol state).
 pub fn reset() void {
-    listen = [_]ListenEntry{.{}} ** listen_slots;
-    buffers = [_][buffer_slots]Datagram{[_]Datagram{.{}} ** buffer_slots} ** listen_slots;
-    buf_head = [_]usize{0} ** listen_slots;
-    buf_count = [_]usize{0} ** listen_slots;
+    listen = @as([listen_slots]ListenEntry, @splat(@as(ListenEntry, .{})));
+    buffers = @as([listen_slots][buffer_slots]Datagram, @splat(@as([buffer_slots]Datagram, @as([buffer_slots]Datagram, @splat(@as(Datagram, .{}))))));
+    buf_head = @as([listen_slots]usize, @splat(@as(usize, 0)));
+    buf_count = @as([listen_slots]usize, @splat(@as(usize, 0)));
     received = 0;
     sent = 0;
     loopbacked = 0;
@@ -481,7 +481,7 @@ test "udp: handle_rx — deliver to a listener, drop badsum / closed / short" {
     try std.testing.expect(listen_port(7000));
 
     // A good datagram 10.0.0.2:9999 -> 10.0.0.1:7000 is delivered.
-    var frame: [46]u8 = .{0} ** 46;
+    var frame: [46]u8 = @splat(0);
     frame[12] = 0x08;
     frame[13] = 0x00; // ethertype IPv4
     frame[14] = 0x45;

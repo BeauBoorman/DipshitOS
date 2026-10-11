@@ -96,7 +96,7 @@ fn ghash(h: u128, aad: []const u8, ciphertext: []const u8) u128 {
 
 /// Derive the hash subkey H and the initial counter block J0 from `nonce`.
 fn setup(k: *const aes.Aes, nonce: *const [12]u8, h: *u128, j0: *[16]u8) void {
-    const zero = [_]u8{0} ** 16;
+    const zero = @as([16]u8, @splat(@as(u8, 0)));
     var hb: [16]u8 = undefined;
     k.encryptBlock(&zero, &hb);
     h.* = load(&hb);
@@ -285,8 +285,8 @@ test "gcm: seal matches all 15 generated vectors (incl. NIST GCM tc1/tc2)" {
 test "gcm: NIST GCM test case 1 and 2 tags are exactly the published values" {
     // Belt and braces: the generator asserts these too, but a silent change in
     // the vector file should fail here rather than only in the generator.
-    const k = [_]u8{0} ** 16;
-    const nonce = [_]u8{0} ** 12;
+    const k = @as([16]u8, @splat(@as(u8, 0)));
+    const nonce = @as([12]u8, @splat(@as(u8, 0)));
     var tag: [16]u8 = undefined;
     var out0: [0]u8 = undefined;
     var out16: [16]u8 = undefined;
@@ -294,13 +294,13 @@ test "gcm: NIST GCM test case 1 and 2 tags are exactly the published values" {
     seal128(&out0, &tag, "", "", &nonce, &k);
     try std.testing.expectEqualSlices(u8, &(try hexLit("58e2fccefa7e3061367f1d57a4e7455a")), &tag);
 
-    seal128(&out16, &tag, &([_]u8{0} ** 16), "", &nonce, &k);
+    seal128(&out16, &tag, &(@as([16]u8, @splat(@as(u8, 0)))), "", &nonce, &k);
     try std.testing.expectEqualSlices(u8, &(try hexLit("ab6e47d42cec13bdf53a67b21257bddf")), &tag);
 }
 
 test "gcm: tampering fails closed and never writes plaintext" {
-    const key = [_]u8{0x11} ** 16;
-    const nonce = [_]u8{0x22} ** 12;
+    const key = @as([16]u8, @splat(@as(u8, 0x11)));
+    const nonce = @as([12]u8, @splat(@as(u8, 0x22)));
     const msg = "the quick brown fox jumps over the lazy dog";
     const aad = "record-header";
 
@@ -308,7 +308,7 @@ test "gcm: tampering fails closed and never writes plaintext" {
     var tag: [16]u8 = undefined;
     seal128(&ciphertext, &tag, msg, aad, &nonce, &key);
 
-    var sentinel = [_]u8{0xAA} ** msg.len;
+    var sentinel = @as([msg.len]u8, @splat(@as(u8, 0xAA)));
     var back: [msg.len]u8 = undefined;
     @memset(&back, 0xAA);
 
@@ -341,7 +341,7 @@ test "gcm: tampering fails closed and never writes plaintext" {
     try std.testing.expect(!open128(&back, &ciphertext, &tag, aad, &bad_nonce, &key));
 
     // Wrong key.
-    const bad_key = [_]u8{0x12} ** 16;
+    const bad_key = @as([16]u8, @splat(@as(u8, 0x12)));
     @memset(&back, 0xAA);
     try std.testing.expect(!open128(&back, &ciphertext, &tag, aad, &nonce, &bad_key));
 
@@ -350,8 +350,8 @@ test "gcm: tampering fails closed and never writes plaintext" {
 }
 
 test "gcm: empty plaintext still authenticates the AAD" {
-    const key = [_]u8{0x33} ** 16;
-    const nonce = [_]u8{0x44} ** 12;
+    const key = @as([16]u8, @splat(@as(u8, 0x33)));
+    const nonce = @as([12]u8, @splat(@as(u8, 0x44)));
     var tag: [16]u8 = undefined;
     var empty: [0]u8 = undefined;
     seal128(&empty, &tag, "", "aad-only", &nonce, &key);

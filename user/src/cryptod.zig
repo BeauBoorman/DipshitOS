@@ -80,7 +80,7 @@ fn file_close(fd: u32) void {
 }
 
 pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
-    var path_buf: [40]u8 = [_]u8{0} ** 40;
+    var path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     var path_len: usize = 0;
     if (argc >= 1) {
         if (argv) |slots| copy_arg(&path_buf, &path_len, slots[0]);

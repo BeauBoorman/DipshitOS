@@ -181,7 +181,7 @@ fn vp_write32(off: u32, value: u32) void {
 /// Resolve the virtio common/notify capability addresses for `dev` (its
 /// BARs + cap walk). Returns the common-config address, or 0 on failure.
 fn resolve_dev(dev: u32) u64 {
-    var bar_base: [6]u64 = .{0} ** 6;
+    var bar_base: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < 6) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);

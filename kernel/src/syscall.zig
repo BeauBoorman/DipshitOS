@@ -491,7 +491,7 @@ pub const EntryInfo = struct {
 
 pub var table_storage: [slot_count]Entry = undefined;
 var table_ready = false;
-var call_counts: [svclock.cores][slot_count]u64 = [_][slot_count]u64{[_]u64{0} ** slot_count} ** svclock.cores;
+var call_counts: [svclock.cores][slot_count]u64 = @as([svclock.cores][slot_count]u64, @splat(@as([slot_count]u64, @as([slot_count]u64, @splat(@as(u64, 0))))));
 var write_fn: ?Writer = null;
 /// M22 D5 (issue #328): when set, dispatch() prints one line per syscall
 /// issued by that pid. Armed by the monitor's `strace` command around an
@@ -2877,7 +2877,7 @@ fn handle_exec(args: Args, _: *exceptions.VectorFrame) u64 {
     var path_buf: [virtio_file.path_max]u8 = undefined;
     if (uaccess.copy_in(&path_buf, path_ptr, @intCast(path_len)) != .ok) return error_result(.efault);
 
-    var arg_block: [esp_exec.arg_block_bytes]u8 = [_]u8{0} ** esp_exec.arg_block_bytes;
+    var arg_block: [esp_exec.arg_block_bytes]u8 = @as([esp_exec.arg_block_bytes]u8, @splat(@as(u8, 0)));
     var arg_slices: [esp_exec.max_exec_args][]const u8 = undefined;
     var exec_args: []const []const u8 = &.{};
     if (argc > 0) {

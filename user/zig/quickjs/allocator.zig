@@ -250,12 +250,12 @@ test "resize charges both blocks and cancellation preserves the original" {
     const first = bridge.allocate(3000).?;
     @memset(first[0..3000], 0x5a);
     const next = bridge.resize(first, 6000).?;
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 3000), next[0..3000]);
+    try std.testing.expectEqualSlices(u8, &(@as([3000]u8, @splat(@as(u8, 0x5a)))), next[0..3000]);
     try std.testing.expect(arena.peak() >= base + granule + 16 + 2 * granule + 16);
     poll.cancel_at = poll.calls + 4;
     try std.testing.expect(bridge.resize(next, 7000) == null);
     try std.testing.expectEqual(@as(usize, 1), bridge.blocks);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 3000), next[0..3000]);
+    try std.testing.expectEqualSlices(u8, &(@as([3000]u8, @splat(@as(u8, 0x5a)))), next[0..3000]);
     bridge.releaseAll();
     try std.testing.expectEqual(base, arena.used());
 }

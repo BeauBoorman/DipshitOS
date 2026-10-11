@@ -82,7 +82,7 @@ pub const SlotContext = extern struct {
     dev_info2: u32 = 0,
     tt_info: u32 = 0,
     dev_state: u32 = 0,
-    reserved: [4]u32 = [_]u32{0} ** 4,
+    reserved: [4]u32 = @as([4]u32, @splat(@as(u32, 0))),
 };
 
 /// Endpoint Context (32 bytes). ep_info holds EP state (2:0), Mult (9:8),
@@ -95,7 +95,7 @@ pub const EpContext = extern struct {
     ep_info2: u32 = 0,
     deq: u64 = 0,
     tx_info: u32 = 0,
-    reserved: [3]u32 = [_]u32{0} ** 3,
+    reserved: [3]u32 = @as([3]u32, @splat(@as(u32, 0))),
 };
 
 /// Input Control Context (32 bytes, the front of an Input Context). Bit 0 of
@@ -104,7 +104,7 @@ pub const EpContext = extern struct {
 pub const InputControlContext = extern struct {
     drop_flags: u32 = 0,
     add_flags: u32 = 0,
-    reserved: [6]u32 = [_]u32{0} ** 6,
+    reserved: [6]u32 = @as([6]u32, @splat(@as(u32, 0))),
 };
 
 /// Device Context = Slot Context + the endpoint contexts M7 (HID) and U1
@@ -289,7 +289,7 @@ const tr_usable: usize = tr_ring_len - 1;
 
 /// Device Context Base Address Array: entry 0 = scratchpad array (0 — no
 /// scratchpad buffers), entries 1..max_enumerated = device-context bases.
-var dcbaa: [dcbaa_len]u64 align(64) = [_]u64{0} ** dcbaa_len;
+var dcbaa: [dcbaa_len]u64 align(64) = @as([dcbaa_len]u64, @splat(@as(u64, 0)));
 
 /// The two device contexts (slot 1 = first device, slot 2 = second).
 var dev_ctx: [max_enumerated]DeviceContext align(64) = undefined;
@@ -301,16 +301,16 @@ var input_ctx: InputContext align(64) = undefined;
 /// time — each device's EP0 context tracks its OWN dequeue pointer, so a
 /// shared ring would desynchronize the second device) + enqueue/cycle state.
 var ep0_ring: [max_enumerated][tr_ring_len]Trb align(64) = undefined;
-var ep0_enq: [max_enumerated]usize = [_]usize{0} ** max_enumerated;
-var ep0_cycle: [max_enumerated]u1 = [_]u1{1} ** max_enumerated;
+var ep0_enq: [max_enumerated]usize = @as([max_enumerated]usize, @splat(@as(usize, 0)));
+var ep0_cycle: [max_enumerated]u1 = @as([max_enumerated]u1, @splat(@as(u1, 1)));
 
 /// Per-device interrupt-IN rings (the HID report path) + their enqueue/
 /// dequeue pointers / cycle bits + the report buffers.
 var intr_ring: [max_enumerated][tr_ring_len]Trb align(64) = undefined;
-var intr_enq: [max_enumerated]usize = [_]usize{0} ** max_enumerated;
-var intr_deq: [max_enumerated]usize = [_]usize{0} ** max_enumerated;
-var intr_deq_cycle: [max_enumerated]u1 = [_]u1{1} ** max_enumerated;
-var intr_cycle: [max_enumerated]u1 = [_]u1{1} ** max_enumerated;
+var intr_enq: [max_enumerated]usize = @as([max_enumerated]usize, @splat(@as(usize, 0)));
+var intr_deq: [max_enumerated]usize = @as([max_enumerated]usize, @splat(@as(usize, 0)));
+var intr_deq_cycle: [max_enumerated]u1 = @as([max_enumerated]u1, @splat(@as(u1, 1)));
+var intr_cycle: [max_enumerated]u1 = @as([max_enumerated]u1, @splat(@as(u1, 1)));
 /// The largest interrupt-IN packet any enumerated device reports (the
 /// absolute pointer's maxpkt 10; the keyboard's 8). The report buffers and
 /// the armed TRB length are sized to the DEVICE's maxpkt — issue #118: the
@@ -348,10 +348,10 @@ pub const intr_depth: usize = 8;
 
 /// How many TRBs are currently armed per device (the top-up loop's
 /// accounting; increments on enqueue, decrements on completion).
-var intr_armed: [max_enumerated]usize = [_]usize{0} ** max_enumerated;
+var intr_armed: [max_enumerated]usize = @as([max_enumerated]usize, @splat(@as(usize, 0)));
 
 /// Per-slot interrupt endpoint max packet (the TRB length the arm uses).
-var intr_maxpkt: [max_enumerated]u16 = [_]u16{0} ** max_enumerated;
+var intr_maxpkt: [max_enumerated]u16 = @as([max_enumerated]u16, @splat(@as(u16, 0)));
 
 /// Snapshots own their bytes before a completed DMA slot is rearmed.
 /// One FIFO for both devices preserves event-ring order, including reports
@@ -405,13 +405,13 @@ pub const EnumDevice = struct {
     bulk_out_num: u8 = 0,
     bulk_in_num: u8 = 0,
 };
-pub var enum_devs: [EnumMax]EnumDevice = [_]EnumDevice{.{}} ** EnumMax;
+pub var enum_devs: [EnumMax]EnumDevice = @as([EnumMax]EnumDevice, @splat(@as(EnumDevice, .{})));
 pub var enum_count: usize = 0;
 
 /// The HID report kind for each device (decided from bInterfaceProtocol:
 /// 1 = keyboard, 2 = mouse, else unknown).
 pub const HidKind = enum { unknown, keyboard, mouse };
-pub var hid_kind: [EnumMax]HidKind = [_]HidKind{.unknown} ** EnumMax;
+pub var hid_kind: [EnumMax]HidKind = @as([EnumMax]HidKind, @splat(@as(HidKind, .unknown)));
 
 /// Enumeration result (for the boot log + `usb devices`).
 pub var enum_done: bool = false;
@@ -426,21 +426,21 @@ pub var enum_fail: []const u8 = "";
 const bulk_dirs: usize = 2;
 
 var bulk_ring: [max_enumerated][bulk_dirs][tr_ring_len]Trb align(64) = undefined;
-var bulk_enq: [max_enumerated][bulk_dirs]usize = [_][bulk_dirs]usize{[_]usize{0} ** bulk_dirs} ** max_enumerated;
-var bulk_deq: [max_enumerated][bulk_dirs]usize = [_][bulk_dirs]usize{[_]usize{0} ** bulk_dirs} ** max_enumerated;
-var bulk_cycle: [max_enumerated][bulk_dirs]u1 = [_][bulk_dirs]u1{[_]u1{1} ** bulk_dirs} ** max_enumerated;
+var bulk_enq: [max_enumerated][bulk_dirs]usize = @as([max_enumerated][bulk_dirs]usize, @splat(@as([bulk_dirs]usize, @as([bulk_dirs]usize, @splat(@as(usize, 0))))));
+var bulk_deq: [max_enumerated][bulk_dirs]usize = @as([max_enumerated][bulk_dirs]usize, @splat(@as([bulk_dirs]usize, @as([bulk_dirs]usize, @splat(@as(usize, 0))))));
+var bulk_cycle: [max_enumerated][bulk_dirs]u1 = @as([max_enumerated][bulk_dirs]u1, @splat(@as([bulk_dirs]u1, @as([bulk_dirs]u1, @splat(@as(u1, 1))))));
 /// OUT: queued-but-not-yet-completed TRBs (one send at a time in U1 — the
 /// count is 0 or 1). IN: armed TRBs (the intr rule: keep depth small, one
 /// probe transfer at a time in U1).
-var bulk_armed: [max_enumerated][bulk_dirs]usize = [_][bulk_dirs]usize{[_]usize{0} ** bulk_dirs} ** max_enumerated;
-var bulk_maxpkt: [max_enumerated]u16 = [_]u16{0} ** max_enumerated;
+var bulk_armed: [max_enumerated][bulk_dirs]usize = @as([max_enumerated][bulk_dirs]usize, @splat(@as([bulk_dirs]usize, @as([bulk_dirs]usize, @splat(@as(usize, 0))))));
+var bulk_maxpkt: [max_enumerated]u16 = @as([max_enumerated]u16, @splat(@as(u16, 0)));
 /// U1: the doorbell DCI per direction — EP number + 1 (the xHCI DCI rule:
 /// DCI = 2*EP_NUM + DIR, so EP1 IN = 3, EP2 OUT = 4). Captured at
 /// enumeration; 0 = not configured. [observed, U1 run-01: the VZ MSC is
 /// EP2 OUT → DCI 4, EP1 IN → DCI 3 — NOT the EP1 pair the engine first
 /// assumed; ringing the wrong DCI is a silent no-op.]
-var bulk_out_num_dci: [max_enumerated]u8 = [_]u8{0} ** max_enumerated;
-var bulk_in_num_dci: [max_enumerated]u8 = [_]u8{0} ** max_enumerated;
+var bulk_out_num_dci: [max_enumerated]u8 = @as([max_enumerated]u8, @splat(@as(u8, 0)));
+var bulk_in_num_dci: [max_enumerated]u8 = @as([max_enumerated]u8, @splat(@as(u8, 0)));
 
 /// The bulk data buffers, one per ring slot per direction (the intr_slots
 /// pattern: a completed TRB's payload is read from the slot it occupies).
@@ -451,7 +451,7 @@ var bulk_slots: [max_enumerated][bulk_dirs][tr_usable][bulk_buf_len]u8 align(64)
 
 /// The last completed bulk IN payload (the `usb bulk recv` evidence view).
 var bulk_recv: [max_enumerated][bulk_buf_len]u8 align(64) = undefined;
-pub var bulk_recv_len: [max_enumerated]usize = [_]usize{0} ** max_enumerated;
+pub var bulk_recv_len: [max_enumerated]usize = @as([max_enumerated]usize, @splat(@as(usize, 0)));
 
 /// U1: read access to the last completed bulk IN payload of device index
 /// `dev_idx` (the `usb bulk` report). The buffer stays owned by xhci.
@@ -791,14 +791,14 @@ pub fn xhci_init() bool {
     // scratchpad entry (dcbaa[0]) stays 0 — no scratchpad buffers.
     dbg("xhci: cfg\n");
     mmio.mmio_write32(xhci_op_base + 0x38, max_enumerated); // CONFIG.MaxSlotsEn
-    dcbaa = [_]u64{0} ** dcbaa_len;
+    dcbaa = @as([dcbaa_len]u64, @splat(@as(u64, 0)));
     const dcbaa_pa = ring_phys(&dcbaa);
     mmu.clean_dcache_range(@intFromPtr(&dcbaa), @sizeOf(@TypeOf(dcbaa)));
     mmio.mmio_write32(xhci_op_base + 0x30, @truncate(dcbaa_pa)); // DCBAAP lo
     mmio.mmio_write32(xhci_op_base + 0x34, @truncate(dcbaa_pa >> 32)); // DCBAAP hi
 
     // Command ring: zero it, plant the Link TRB at the last slot.
-    cmd_ring = [_]Trb{.{}} ** cmd_ring_len;
+    cmd_ring = @as([cmd_ring_len]Trb, @splat(@as(Trb, .{})));
     cmd_ring[cmd_usable] = .{
         .param = ring_phys(&cmd_ring),
         .status = 0,
@@ -809,7 +809,7 @@ pub fn xhci_init() bool {
     mmu.clean_dcache_range(@intFromPtr(&cmd_ring), @sizeOf(@TypeOf(cmd_ring)));
 
     // Event ring: zero it (all cycle bits 0), one ERST segment.
-    evt_ring = [_]Trb{.{}} ** evt_ring_len;
+    evt_ring = @as([evt_ring_len]Trb, @splat(@as(Trb, .{})));
     evt_deq = 0;
     evt_cycle = 1;
     erst = .{ .seg_base = ring_phys(&evt_ring), .seg_size = evt_ring_len };
@@ -966,7 +966,7 @@ pub fn xhci_usbsts() u32 {
 /// their Link TRB wrap boundary (called once from xhci_init, post-NO-OP).
 fn xhci_init_transfer_rings() void {
     for (&ep0_ring, 0..) |*ring, i| {
-        ring.* = [_]Trb{.{}} ** tr_ring_len;
+        ring.* = @as([tr_ring_len]Trb, @splat(@as(Trb, .{})));
         ring[tr_usable] = .{
             .param = ring_phys(ring),
             .status = 0,
@@ -977,7 +977,7 @@ fn xhci_init_transfer_rings() void {
         mmu.clean_dcache_range(@intFromPtr(ring), @sizeOf(@TypeOf(ring.*)));
     }
     for (&intr_ring, 0..) |*ring, i| {
-        ring.* = [_]Trb{.{}} ** tr_ring_len;
+        ring.* = @as([tr_ring_len]Trb, @splat(@as(Trb, .{})));
         ring[tr_usable] = .{
             .param = ring_phys(ring),
             .status = 0,
@@ -988,8 +988,8 @@ fn xhci_init_transfer_rings() void {
         intr_deq_cycle[i] = 1;
         intr_cycle[i] = 1;
         intr_armed[i] = 0;
-        intr_report[i] = [_]u8{0} ** max_report_bytes;
-        intr_slots[i] = [_][max_report_bytes]u8{[_]u8{0} ** max_report_bytes} ** tr_usable;
+        intr_report[i] = @as([max_report_bytes]u8, @splat(@as(u8, 0)));
+        intr_slots[i] = @as([tr_usable][max_report_bytes]u8, @splat(@as([max_report_bytes]u8, @as([max_report_bytes]u8, @splat(@as(u8, 0))))));
         mmu.clean_dcache_range(@intFromPtr(ring), @sizeOf(@TypeOf(ring.*)));
     }
     hid_head = 0;
@@ -998,8 +998,8 @@ fn xhci_init_transfer_rings() void {
     // boundary, empty armed/dequeue state).
     xhci_init_bulk_rings();
     enum_count = 0;
-    enum_devs = [_]EnumDevice{.{}} ** EnumMax;
-    hid_kind = [_]HidKind{.unknown} ** EnumMax;
+    enum_devs = @as([EnumMax]EnumDevice, @splat(@as(EnumDevice, .{})));
+    hid_kind = @as([EnumMax]HidKind, @splat(@as(HidKind, .unknown)));
     enum_done = false;
     enum_fail = "";
 }
@@ -1556,8 +1556,8 @@ pub fn xhci_poll_intr(slot_id: u8) bool {
 /// a port that fails is recorded and the next port is still attempted.
 pub fn xhci_enumerate_all() bool {
     enum_count = 0;
-    enum_devs = [_]EnumDevice{.{}} ** EnumMax;
-    hid_kind = [_]HidKind{.unknown} ** EnumMax;
+    enum_devs = @as([EnumMax]EnumDevice, @splat(@as(EnumDevice, .{})));
+    hid_kind = @as([EnumMax]HidKind, @splat(@as(HidKind, .unknown)));
     var all_ok = true;
     const max_ports = hcsparams1_max_ports(xhci_hcsparams1);
     var port: u8 = 1;
@@ -1827,7 +1827,7 @@ fn xhci_enumerate_port(port: u8) bool {
 /// The last raw report bytes + length for a device slot (the `usb report`
 /// decode).
 pub fn xhci_report(slot_id: u8) struct { len: u8, bytes: [max_report_bytes]u8 } {
-    if (slot_id == 0 or slot_id > max_enumerated) return .{ .len = 0, .bytes = [_]u8{0} ** max_report_bytes };
+    if (slot_id == 0 or slot_id > max_enumerated) return .{ .len = 0, .bytes = @as([max_report_bytes]u8, @splat(@as(u8, 0))) };
     const slot_idx = slot_id - 1;
     return .{ .len = enum_devs[slot_idx].last_report_len, .bytes = intr_report[slot_idx] };
 } // -----------------------------------------------------------------------
@@ -1840,7 +1840,7 @@ fn xhci_init_bulk_rings() void {
     for (0..max_enumerated) |i| {
         for (0..bulk_dirs) |dir| {
             const ring = &bulk_ring[i][dir];
-            ring.* = [_]Trb{.{}} ** tr_ring_len;
+            ring.* = @as([tr_ring_len]Trb, @splat(@as(Trb, .{})));
             ring[tr_usable] = .{
                 .param = ring_phys(ring),
                 .status = 0,
@@ -1852,7 +1852,7 @@ fn xhci_init_bulk_rings() void {
             bulk_armed[i][dir] = 0;
             bulk_maxpkt[i] = 0;
         }
-        bulk_recv[i] = [_]u8{0} ** bulk_buf_len;
+        bulk_recv[i] = @as([bulk_buf_len]u8, @splat(@as(u8, 0)));
         bulk_recv_len[i] = 0;
     }
     mmu.clean_dcache_range(@intFromPtr(&bulk_ring), @sizeOf(@TypeOf(bulk_ring)));
@@ -1969,9 +1969,9 @@ test "xhci: nonblocking keyboard and pointer polls preserve each other's complet
         intr_armed = saved_armed;
         intr_deq = saved_deq;
     }
-    enum_devs = [_]EnumDevice{.{}} ** EnumMax;
-    intr_armed = [_]usize{0} ** max_enumerated;
-    intr_deq = [_]usize{0} ** max_enumerated;
+    enum_devs = @as([EnumMax]EnumDevice, @splat(@as(EnumDevice, .{})));
+    intr_armed = @as([max_enumerated]usize, @splat(@as(usize, 0)));
+    intr_deq = @as([max_enumerated]usize, @splat(@as(usize, 0)));
     for (0..2) |i| {
         enum_devs[i] = .{ .present = true, .slot_id = @intCast(i + 1), .ep_in_num = 1 };
         intr_armed[i] = intr_depth;
@@ -2031,7 +2031,7 @@ test "xhci: issue #117 — the multi-TRB top-up keeps the armed depth constant a
     var deq: usize = 0;
     var armed: usize = 0;
     // slot 0..14 -> the ring position a TRB occupies (0 = post-wrap slot 0).
-    var occupied = [_]bool{false} ** tr_usable;
+    var occupied = @as([tr_usable]bool, @splat(@as(bool, false)));
 
     // One arm step mirroring tr_enqueue_intr + xhci_arm_intr exactly: the
     // enqueue pointer wraps at tr_usable (writing the Link TRB, toggling the
@@ -2146,7 +2146,7 @@ test "xhci: U4 detach quiesces the registry so every consumer fails clean" {
         enum_devs = save_devs;
         enum_count = save_count;
     }
-    enum_devs = [_]EnumDevice{.{}} ** EnumMax;
+    enum_devs = @as([EnumMax]EnumDevice, @splat(@as(EnumDevice, .{})));
     enum_devs[0] = .{ .present = true, .slot_id = 1, .port = 1, .bulk_ready = true, .bulk_maxpkt = 1024, .bulk_out_num = 2, .bulk_in_num = 1 };
     enum_count = 1;
     try std.testing.expectEqual(@as(u8, 1), usb_bulk_dev());
@@ -2194,7 +2194,7 @@ test "xhci: M91 polling keyboard must not eat pointer completion" {
     const saved_evt_deq = evt_deq;
     const saved_evt_cycle = evt_cycle;
     const saved_rt_base = xhci_rt_base;
-    var registers: [32]u32 = [_]u32{0} ** 32;
+    var registers: [32]u32 = @as([32]u32, @splat(@as(u32, 0)));
     xhci_rt_base = @intFromPtr(&registers);
     defer {
         enum_devs = saved_devs;
@@ -2212,7 +2212,7 @@ test "xhci: M91 polling keyboard must not eat pointer completion" {
     intr_deq = .{ 0, 0 };
     evt_deq = 0;
     evt_cycle = 1;
-    evt_ring = [_]Trb{.{}} ** evt_ring_len;
+    evt_ring = @as([evt_ring_len]Trb, @splat(@as(Trb, .{})));
     evt_ring[0] = .{
         .param = ring_phys(&intr_ring[1][0]),
         .status = cc_success << 24,
@@ -2226,8 +2226,8 @@ test "xhci: M91 polling keyboard must not eat pointer completion" {
 /// In-memory controller seam, host tests only. The real dispatch, DMA-slot
 /// ownership, queue, Link TRBs, rearm and dequeue cycles all run unchanged.
 pub const HidTest = if (builtin.is_test) struct {
-    registers: [32]u32 = [_]u32{0} ** 32,
-    doorbells: [4]u32 = [_]u32{0} ** 4,
+    registers: [32]u32 = @as([32]u32, @splat(@as(u32, 0))),
+    doorbells: [4]u32 = @as([4]u32, @splat(@as(u32, 0))),
     tail: usize = 0,
     cycle: u1 = 1,
     completed: [EnumMax]usize = .{ 0, 0 },
@@ -2237,7 +2237,7 @@ pub const HidTest = if (builtin.is_test) struct {
         xhci_rt_base = @intFromPtr(&self.registers);
         xhci_doorbell_base = @intFromPtr(&self.doorbells);
         xhci_init_transfer_rings();
-        evt_ring = [_]Trb{.{}} ** evt_ring_len;
+        evt_ring = @as([evt_ring_len]Trb, @splat(@as(Trb, .{})));
         evt_deq = 0;
         evt_cycle = 1;
         enum_devs = .{
@@ -2252,12 +2252,12 @@ pub const HidTest = if (builtin.is_test) struct {
     }
 
     pub fn deinit(_: *@This()) void {
-        enum_devs = [_]EnumDevice{.{}} ** EnumMax;
+        enum_devs = @as([EnumMax]EnumDevice, @splat(@as(EnumDevice, .{})));
         enum_count = 0;
         intr_armed = .{ 0, 0 };
         hid_count = 0;
         hid_head = 0;
-        evt_ring = [_]Trb{.{}} ** evt_ring_len;
+        evt_ring = @as([evt_ring_len]Trb, @splat(@as(Trb, .{})));
         evt_deq = 0;
         evt_cycle = 1;
         xhci_rt_base = 0;
@@ -2277,7 +2277,7 @@ pub const HidTest = if (builtin.is_test) struct {
 
     pub fn report(self: *@This(), i: usize, bytes: []const u8) void {
         const dq = self.completed[i];
-        intr_slots[i][dq] = [_]u8{0} ** max_report_bytes;
+        intr_slots[i][dq] = @as([max_report_bytes]u8, @splat(@as(u8, 0)));
         @memcpy(intr_slots[i][dq][0..bytes.len], bytes);
         self.event(.{
             .param = ring_phys(&intr_ring[i][dq]),
@@ -2293,7 +2293,7 @@ test "xhci: M91 interleaved completions survive command and transfer waits in gl
     hw.init();
     defer hw.deinit();
     const key = [_]u8{ 2, 0, 4, 0, 0, 0, 0, 0 };
-    const release = [_]u8{0} ** 8;
+    const release = @as([8]u8, @splat(@as(u8, 0)));
     const ptr = [_]u8{ 1, 1, 0x44, 0x24, 0x2f, 0x67, 0, 0, 0, 0 };
     hw.report(1, &ptr);
     hw.report(0, &key);
@@ -2306,7 +2306,7 @@ test "xhci: M91 interleaved completions survive command and transfer waits in gl
     hw.event(.{ .param = 0x5678, .status = cc_success << 24, .control = trb_transfer_event << 10 });
     try std.testing.expectEqual(cc_success, wait_transfer(0x5678).cc);
     // Overwrite the DMA buffers: queued payloads must already own snapshots.
-    intr_slots = [_][tr_usable][max_report_bytes]u8{[_][max_report_bytes]u8{[_]u8{0xff} ** max_report_bytes} ** tr_usable} ** EnumMax;
+    intr_slots = @as([EnumMax][tr_usable][max_report_bytes]u8, @splat(@as([tr_usable][max_report_bytes]u8, undefined)));
     for ([_]usize{ 1, 0, 1, 0, 0, 1 }, 0..) |i, n| {
         const rep = xhci_next_hid_report().?;
         try std.testing.expectEqual(@as(u8, @intCast(i + 1)), rep.slot_id);
@@ -2326,7 +2326,7 @@ test "xhci: M91 NO-OP wait preserves HID snapshots too" {
     xhci_op_base = @intFromPtr(&hw.registers);
     cmd_enq = 0;
     cmd_cycle = 1;
-    cmd_ring = [_]Trb{.{}} ** cmd_ring_len;
+    cmd_ring = @as([cmd_ring_len]Trb, @splat(@as(Trb, .{})));
     hw.report(0, &.{ 0, 0, 4, 0, 0, 0, 0, 0 });
     hw.report(1, &.{ 1, 0, 0x44, 0x24, 0x2f, 0x67, 0, 0, 0, 0 });
     hw.event(.{ .param = ring_phys(&cmd_ring[0]), .status = cc_success << 24, .control = trb_command_completion_event << 10 });
@@ -2367,7 +2367,7 @@ test "xhci: M91 shared ring wraps and rearm cycles track each device independent
         // Deliberately uneven device cadence; both orders, both event cycles.
         const i: usize = if (n % 3 == 0) 1 else 0;
         const before = intr_deq[i];
-        var bytes = [_]u8{0} ** max_report_bytes;
+        var bytes = @as([max_report_bytes]u8, @splat(@as(u8, 0)));
         bytes[0] = @truncate(n);
         const len: usize = if (i == 0) 8 else 10;
         hw.report(i, bytes[0..len]);
@@ -2408,7 +2408,7 @@ test "xhci: M91 full snapshot FIFO backpressures without loss then detach preser
     defer hw.deinit();
     for (0..hid_pending_max) |n| {
         const i = n % 2;
-        var wire = [_]u8{0} ** 8;
+        var wire = @as([8]u8, @splat(@as(u8, 0)));
         wire[2] = @intCast(n);
         hw.report(i, &wire);
         try std.testing.expectEqual(IntrDispatch.consumed, intr_complete_from_event(evt_ring[evt_deq]));

@@ -819,14 +819,14 @@ test "lineedit: UTF-8 staging refuses partial input at the byte bound" {
 test "lineedit: 255 and 256 chars fit exactly and submit" {
     var mock = console.MockConsole(1024){};
     var editor = LineEditor{};
-    const line_255 = [_]u8{'a'} ** 255;
+    const line_255 = @as([255]u8, @splat(@as(u8, 'a')));
     for (line_255) |c| try std.testing.expectEqual(LineResult.none, editor.feed(mock.console(), c));
     try std.testing.expectEqual(@as(usize, 255), editor.len);
     try std.testing.expect(!editor.rejected);
     try std.testing.expectEqual(LineResult.submitted, editor.feed(mock.console(), '\n'));
     editor.next_line();
 
-    const line_256 = [_]u8{'b'} ** 256;
+    const line_256 = @as([256]u8, @splat(@as(u8, 'b')));
     for (line_256) |c| try std.testing.expectEqual(LineResult.none, editor.feed(mock.console(), c));
     try std.testing.expectEqual(@as(usize, 256), editor.len);
     try std.testing.expect(!editor.rejected);
@@ -838,12 +838,12 @@ test "lineedit: 255 and 256 chars fit exactly and submit" {
 test "lineedit: the 257th char is refused, never truncated mid-word" {
     var mock = console.MockConsole(1024){};
     var editor = LineEditor{};
-    const line_257 = [_]u8{'c'} ** 257;
+    const line_257 = @as([257]u8, @splat(@as(u8, 'c')));
     for (line_257) |c| try std.testing.expectEqual(LineResult.none, editor.feed(mock.console(), c));
     try std.testing.expectEqual(@as(usize, 256), editor.len); // 257th refused
     try std.testing.expect(editor.rejected);
     // The refusal echoed one bell after the 256 echoed chars.
-    try std.testing.expectEqualStrings("c" ** 256 ++ "\x07", mock.contents());
+    try std.testing.expectEqualStrings(&@as([256:0]u8, @splat("c"[0])) ++ "\x07", mock.contents());
     // The line still submits (with what fit); rejected stays set for the shell.
     try std.testing.expectEqual(LineResult.submitted, editor.feed(mock.console(), '\n'));
     try std.testing.expect(editor.rejected);
@@ -1000,7 +1000,7 @@ test "lineedit: kill chords truncate toward the cursor" {
     _ = editor.feed(mock.console(), 0x0b);
     try std.testing.expectEqual(@as(usize, 0), editor.len);
     try std.testing.expectEqual(@as(usize, 0), editor.cursor);
-    try std.testing.expectEqualStrings("           " ++ "\x08" ** 11, mock.contents());
+    try std.testing.expectEqualStrings("           " ++ &@as([11:0]u8, @splat("\x08"[0])), mock.contents());
     // Ctrl-U kills back to the cursor: "world" -> "rld", cursor 0.
     for ("world") |c| _ = editor.feed(mock.console(), c);
     _ = editor.feed(mock.console(), 0x01); // home

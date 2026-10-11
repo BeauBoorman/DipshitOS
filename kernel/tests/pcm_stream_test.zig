@@ -8,7 +8,7 @@ const rates = [_]u32{ 44100, 48000 };
 const caps = pcm.Capabilities{ .present = true, .output = true, .queue_descriptors = 32, .formats = &formats, .rates_hz = &rates, .channels_min = 1, .channels_max = 2 };
 const params = pcm.Params{ .format = .float32, .rate_hz = 48000, .channels = 2 };
 const limits = pcm.Limits{ .control_ns = 100, .period_ns = 200, .drain_ns = 50 };
-const audio = [_]u8{0x5a} ** pcm.period_bytes;
+const audio = @as([pcm.period_bytes]u8, @splat(@as(u8, 0x5a)));
 
 fn reply(model: *pcm.Model, kind: pcm.Control, ok: bool) !void {
     const ticket = model.control().?;

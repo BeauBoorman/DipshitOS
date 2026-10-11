@@ -314,7 +314,7 @@ pub fn loaded() ?LoadedInfo {
 /// The first 8 bytes of the LOADED CONTENT for a STREAMED image (M70c-K,
 /// issue #1504). That path never touches `program`, so recording them here
 /// is what keeps `head()` from reporting another image's staging bytes.
-var streamed_head: [8]u8 = [_]u8{0} ** 8;
+var streamed_head: [8]u8 = @as([8]u8, @splat(@as(u8, 0)));
 var streamed_head_valid: bool = false;
 
 /// The first 8 bytes of the LOADED CONTENT (the stripped image's first
@@ -923,8 +923,8 @@ fn exec_static_elf_gap(
     // owned by the process and freed at reap. Segment 0 is the text
     // aperture (vaddr == elf.text_base, parser-enforced); middle segments
     // are read-only rodata; the last is the writable data segment.
-    var seg_phys: [elf_mod.max_segments]u64 = .{0} ** elf_mod.max_segments;
-    var seg_pages: [elf_mod.max_segments]u64 = .{0} ** elf_mod.max_segments;
+    var seg_phys: [elf_mod.max_segments]u64 = @splat(0);
+    var seg_pages: [elf_mod.max_segments]u64 = @splat(0);
     var allocated: usize = 0;
     const streaming = switch (src) {
         .streamed => true,
@@ -1710,7 +1710,7 @@ fn host_file_size(name: []const u8) ?u64 {
 /// Build a minimal DSK1 flat image: header (entry at offset 24 = content
 /// start) + `content`.
 fn dsk1(content: []const u8, entry_off: u64, image_size: u64) [dsk1_header_size + 64]u8 {
-    var img = [_]u8{0} ** (dsk1_header_size + 64);
+    var img = @as([(dsk1_header_size + 64)]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u32, img[0..4], dsk1_magic, .little);
     std.mem.writeInt(u32, img[4..8], 0, .little);
     std.mem.writeInt(u64, img[8..16], entry_off, .little);
@@ -1776,7 +1776,7 @@ fn dsk1_exec_pages() u64 {
 
 /// One RX segment, optionally naming LD.SO, for the dynamic-exec tests.
 fn test_dynamic_image(base: u64, interpreter: bool) [512]u8 {
-    var img = [_]u8{0} ** 512;
+    var img = @as([512]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], "\x7fELF");
     img[4] = 2; // ELF64
     img[5] = 1; // little endian
@@ -1886,13 +1886,13 @@ test "exec: #2097 — a shared library past its 64 KiB slot is refused" {
     test_seed("LD.SO", &interpreter);
     // One byte past the slot bound — the stat preflight refuses before a
     // single aperture page is allocated or copied.
-    const fat = [_]u8{0} ** (lib_slot_bytes + 1);
+    const fat = @as([(lib_slot_bytes + 1)]u8, @splat(@as(u8, 0)));
     test_seed("LIBUI.SO", &fat);
     const free_before = alloc.stats().free_pages;
     try std.testing.expectEqual(ExecResult.staging_too_large, exec_file("DYNAMIC.ELF", &.{}));
     try std.testing.expectEqual(free_before, alloc.stats().free_pages);
     // Exactly the bound still stages — the bound is a ceiling, not a fence.
-    const exact = [_]u8{0} ** lib_slot_bytes;
+    const exact = @as([lib_slot_bytes]u8, @splat(@as(u8, 0)));
     test_seed("LIBUI.SO", &exact);
     try std.testing.expectEqual(ExecResult.ok, exec_file("DYNAMIC.ELF", &.{}));
 }
@@ -1928,7 +1928,7 @@ test "exec: no disk is reported honestly" {
 }
 
 test "exec: DSK3 header validation pins the segment bounds (claim 3805)" {
-    var buf: [dsk3_header_size + 4096 + 16]u8 = [_]u8{0} ** (dsk3_header_size + 4096 + 16);
+    var buf: [dsk3_header_size + 4096 + 16]u8 = @as([(dsk3_header_size + 4096 + 16)]u8, @splat(@as(u8, 0)));
     // A valid segmented header: page-aligned 4 KiB text + 8 data + 8 BSS.
     std.mem.writeInt(u32, buf[0..4], dsk3_magic, .little);
     std.mem.writeInt(u64, buf[8..16], dsk3_header_size, .little); // entry at content start
@@ -2275,7 +2275,7 @@ test "exec: COUNTER.BIN loads by name with its own marker and process" {
 /// executable — ELF header (52 B) + one PT_LOAD phdr (32 B) + code. The
 /// single segment is R+X at `elf_mod.text_base` with entry at its start.
 fn elf32_hello() [128]u8 {
-    var img = [_]u8{0} ** 128;
+    var img = @as([128]u8, @splat(@as(u8, 0)));
     @memcpy(img[0..4], &elf_mod.magic);
     img[4] = 1; // ELF32
     img[5] = 1; // little-endian
@@ -2563,13 +2563,13 @@ test "exec: argv packing shape, per-arg refusal, and block VA" {
 
     // A 255-byte arg fills the slot and keeps its NUL. One more byte is
     // refused — the old 31-byte chop is gone.
-    const exact = "y" ** (arg_slot_bytes - 1);
+    const exact = &@as([(arg_slot_bytes - 1):0]u8, @splat("y"[0]));
     const n2 = try pack_args(&.{exact}, &block);
     try std.testing.expectEqual(@as(usize, 1), n2);
     for (block[0 .. arg_slot_bytes - 1]) |b| try std.testing.expectEqual(@as(u8, 'y'), b);
     try std.testing.expectEqual(@as(u8, 0), block[arg_slot_bytes - 1]);
 
-    const too = "x" ** arg_slot_bytes;
+    const too = &@as([arg_slot_bytes:0]u8, @splat("x"[0]));
     try std.testing.expectError(error.ArgTooLong, pack_args(&.{too}, &block));
 
     // The block VA sits right after the content, 8-aligned, inside the
@@ -2590,7 +2590,7 @@ test "exec: envp packing shape, per-entry truncation, and KEY=VALUE slots" {
     try std.testing.expectEqualStrings("HOME=/host", block[env_slot_bytes..][0..10]);
     for (block[env_slot_bytes + 10 .. env_slot_bytes * 2]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 
-    const long = "K=" ++ ("v" ** 200);
+    const long = "K=" ++ (&@as([200:0]u8, @splat("v"[0])));
     const n2 = pack_env(&.{long}, &block);
     try std.testing.expectEqual(@as(usize, 1), n2);
     try std.testing.expectEqual(@as(u8, 'K'), block[0]);
@@ -2611,7 +2611,7 @@ test "exec: more than 8 args is refused honestly (too_many_args)" {
 test "exec: an argument longer than 255 bytes is refused (arg_too_long)" {
     // M71m (#1572): checked before any disk work, same as too_many_args.
     virtio_file.set_test_share(null);
-    const long = "x" ** arg_slot_bytes;
+    const long = &@as([arg_slot_bytes:0]u8, @splat("x"[0]));
     try std.testing.expectEqual(ExecResult.arg_too_long, exec_file("USER.BIN", &.{long}));
 }
 

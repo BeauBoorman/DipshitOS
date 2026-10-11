@@ -31,7 +31,7 @@ fn run(_: *const sdk.startup.Startup) !void {
     try sdk.print("fart-probe: OutOfMemory at arena=4194304, reused\n");
 
     const path = "FARTSYN.BIN";
-    const input = "a" ++ " " ** 254;
+    const input = "a" ++ &@as([254:0]u8, @splat(" "[0]));
     var block: [sdk.startup.block_bytes]u8 = undefined;
     try sdk.startup.pack(&.{ path, "--phrase", input, "--wav", "/host/input.wav" }, &.{}, &block);
     const child = sdk.native.call(28, .{ @intFromPtr(path.ptr), path.len, @intFromPtr(&block) + 256, 4, 0, 0 });

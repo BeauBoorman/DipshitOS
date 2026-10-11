@@ -345,9 +345,9 @@ pub fn Client(comptime S: type) type {
         fn deriveHandshakeKeys(self: *@This(), server_pub: [32]u8, priv: [32]u8) !void {
             var shared: [32]u8 = undefined;
             crypto.x25519.scalarmult(&shared, &priv, &server_pub);
-            if (crypto.ct.ctEq(&shared, &([_]u8{0} ** 32))) return Error.CertificateInvalid;
+            if (crypto.ct.ctEq(&shared, &(@as([32]u8, @splat(@as(u8, 0)))))) return Error.CertificateInvalid;
 
-            var zero: [32]u8 = [_]u8{0} ** 32;
+            var zero: [32]u8 = @as([32]u8, @splat(@as(u8, 0)));
             var early: [32]u8 = undefined;
             crypto.hkdf.Sha256.extract(&early, &zero, &zero);
             var empty_hash: [32]u8 = undefined;
@@ -474,7 +474,7 @@ pub fn Client(comptime S: type) type {
             crypto.sha256.sha256(&empty_hash, "");
             var derived: [32]u8 = undefined;
             ks.Sha256.deriveSecret(&derived, &self.handshake_secret, "derived", &empty_hash);
-            var zero: [32]u8 = [_]u8{0} ** 32;
+            var zero: [32]u8 = @as([32]u8, @splat(@as(u8, 0)));
             var master: [32]u8 = undefined;
             crypto.hkdf.Sha256.extract(&master, &derived, &zero);
 

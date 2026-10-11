@@ -103,16 +103,16 @@ fn run(args: *const sdk.startup.Startup) !void {
 
 fn launchBoundary() !void {
     const path = "ZGUEST.BIN";
-    const long_arg = "x" ** 255;
+    const long_arg = &@as([255:0]u8, @splat("x"[0]));
     const args = [_][]const u8{ path, "boundary", long_arg, "", "alpha", "beta", "six", "seven" };
     var block: [sdk.startup.block_bytes]u8 = undefined;
-    if (sdk.startup.pack(&.{ path, "x" ** 256 }, &.{}, &block)) |_| {
+    if (sdk.startup.pack(&.{ path, &@as([256:0]u8, @splat("x"[0])) }, &.{}, &block)) |_| {
         return error.ArgumentUnexpectedlyAccepted;
     } else |err| {
         if (err != error.ArgumentLimit) return err;
         try sdk.print("zig-guest: ArgumentLimit (256-byte argument)\n");
     }
-    if (sdk.startup.pack(&([_][]const u8{path} ** 9), &.{}, &block)) |_| {
+    if (sdk.startup.pack(&(@as([9][]const u8, @splat(@as([]const u8, path)))), &.{}, &block)) |_| {
         return error.ArgumentCountUnexpectedlyAccepted;
     } else |err| {
         if (err != error.ArgumentLimit) return err;

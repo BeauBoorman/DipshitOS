@@ -25,7 +25,7 @@ pub fn Store(comptime max_roots: usize) type {
             cert: x509.Cert = .{},
         };
 
-        entries: [max_roots]Entry = [_]Entry{.{}} ** max_roots,
+        entries: [max_roots]Entry = @as([max_roots]Entry, @splat(@as(Entry, .{}))),
         len: usize = 0,
         version: []const u8 = "",
 

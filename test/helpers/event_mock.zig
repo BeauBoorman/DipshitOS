@@ -152,8 +152,8 @@ pub const MockMessageDispatcher = struct {
     const max_messages_per_proc = 8;
 
     queues: [max_processes][max_messages_per_proc]MockMessage = undefined,
-    queue_heads: [max_processes]usize = [_]usize{0} ** max_processes,
-    queue_counts: [max_processes]usize = [_]usize{0} ** max_processes,
+    queue_heads: [max_processes]usize = @as([max_processes]usize, @splat(@as(usize, 0))),
+    queue_counts: [max_processes]usize = @as([max_processes]usize, @splat(@as(usize, 0))),
 
     sent_count: usize = 0,
     recv_count: usize = 0,
@@ -179,7 +179,7 @@ pub const MockMessageDispatcher = struct {
             .sender_pid = sender_pid,
             .target_pid = target_pid,
             .len = copy_len,
-            .payload = [_]u8{0} ** 64,
+            .payload = @as([64]u8, @splat(@as(u8, 0))),
         };
         @memcpy(msg.payload[0..copy_len], bytes[0..copy_len]);
 

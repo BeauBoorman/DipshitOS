@@ -2916,10 +2916,10 @@ test "driving_award: WM2 overview move relocates the card and switches" {
 
 test "driving_award: WM2 blit_scaled maps source corners onto the card" {
     // 4x4 source with distinct corners, scaled 2x into an 8x8 target.
-    var src: [4 * 4 * 4]u8 = [_]u8{0} ** (4 * 4 * 4);
+    var src: [4 * 4 * 4]u8 = @as([(4 * 4 * 4)]u8, @splat(@as(u8, 0)));
     src[0] = 0x11; // (0,0) R
     src[(3 * 4 + 3) * 4] = 0x22; // (3,3) R
-    var dst: [8 * 8 * 4]u8 = [_]u8{0} ** (8 * 8 * 4);
+    var dst: [8 * 8 * 4]u8 = @as([(8 * 8 * 4)]u8, @splat(@as(u8, 0)));
     blit_scaled(&dst, 8 * 4, &src, 4, 4, 4 * 4, 0, 0, 8, 8);
     // Top-left 2x2 block comes from source (0,0).
     try std.testing.expectEqual(@as(u8, 0x11), dst[0]);

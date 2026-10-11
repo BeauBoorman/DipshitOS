@@ -901,7 +901,7 @@ const GlyphCacheEntry = struct {
 /// 128 entries × ~104 B ≈ 13 KiB BSS (the halved option from the card,
 /// respecting the kernel budget).
 const glyph_cache_cap = 128;
-const mem_zero: GlyphCacheEntry = .{ .stamp = 0, .cell = 0, .size = 0, .rows = [_]u32{0} ** 24 };
+const mem_zero: GlyphCacheEntry = .{ .stamp = 0, .cell = 0, .size = 0, .rows = @as([24]u32, @splat(@as(u32, 0))) };
 var glyph_cache: [glyph_cache_cap]GlyphCacheEntry = undefined;
 var glyph_cache_stamp: u32 = 0;
 
@@ -1883,7 +1883,7 @@ test "text: cached rows are pixel-identical to the direct path (U13)" {
     clear();
     puts("R");
     // Direct computation for 'R' at small…
-    var want: [24]u32 = [_]u32{0} ** 24;
+    var want: [24]u32 = @as([24]u32, @splat(@as(u32, 0)));
     const g8 = font.glyphs['R' - 0x20];
     for (0..8) |y| {
         var x: usize = 0;

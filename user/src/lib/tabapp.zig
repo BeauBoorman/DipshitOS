@@ -129,7 +129,7 @@ pub const TabApp = struct {
     win: u32 = 0,
     /// This process's own executable name (for WM_RPC ack routing on the
     /// M48/BT5 navigation channel). Copied from Config.name.
-    name: [24]u8 = [_]u8{0} ** 24,
+    name: [24]u8 = @as([24]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     /// CURRENT canvas size — starts at the open rect, follows every
     /// WIN_RESIZE (the WM's SET_WINDOW seam, SX2). Apps lay out against
@@ -224,7 +224,7 @@ pub const TabApp = struct {
             .y = 0,
             .w = 0,
             .h = 0,
-            .title = [_]u8{0} ** ui.wm_rpc_title_max,
+            .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
         };
         const req_bytes = std.mem.asBytes(&req);
         _ = syscall3(ui.sys_ipc_send_num, peers.wm, @intFromPtr(req_bytes.ptr), req_bytes.len);

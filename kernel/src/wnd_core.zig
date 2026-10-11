@@ -597,7 +597,7 @@ pub const TabItem = struct {
     window_id: u8,
     parent_id: u8, // 0 = container/standalone, >0 = parent tab group
     active: bool,
-    title: [24]u8 = [_]u8{0} ** 24,
+    title: [24]u8 = @as([24]u8, @splat(@as(u8, 0))),
     title_len: u8 = 0,
 };
 

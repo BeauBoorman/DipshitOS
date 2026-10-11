@@ -100,7 +100,7 @@ pub const Reader = struct {
             if (raw[0] == 0x00 and (raw[1] & 0x80) == 0) return error.Overflow;
             if (raw[0] == 0xff and (raw[1] & 0x80) != 0) return error.Overflow;
         }
-        const UT = std.meta.Int(.unsigned, info.int.bits);
+        const UT = @Int(.unsigned, info.int.bits);
         var buf: [@sizeOf(T)]u8 = undefined;
         // Sign-extend the (<= sizeof(T)) raw bytes into the full width.
         const fill: u8 = if ((raw[0] & 0x80) != 0) 0xff else 0x00;
@@ -209,7 +209,7 @@ pub const Writer = struct {
         const info = @typeInfo(T);
         if (info != .int or info.int.signedness != .signed) @compileError("writeMpint wants a signed integer");
         if (value == 0) return self.writeString(&.{});
-        const UT = std.meta.Int(.unsigned, info.int.bits);
+        const UT = @Int(.unsigned, info.int.bits);
         var tmp: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(UT, &tmp, @bitCast(value), .big);
         var start: usize = 0;

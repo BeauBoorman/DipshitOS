@@ -71,12 +71,12 @@ pub fn pack(args: []const []const u8, env: []const []const u8, block: *[block_by
 }
 
 test "startup: exact limits, empty user arg, stable views, and empty env value" {
-    const long_arg = [_]u8{'a'} ** 255;
-    const long_env = "X=" ++ ([_]u8{'b'} ** 125);
-    var args = [_][]const u8{&long_arg} ** arg_count;
+    const long_arg = @as([255]u8, @splat(@as(u8, 'a')));
+    const long_env = "X=" ++ (@as([125]u8, @splat(@as(u8, 'b'))));
+    var args = @as([arg_count][]const u8, @splat(@as([]const u8, &long_arg)));
     args[2] = "";
     var block: [block_bytes]u8 = undefined;
-    try pack(&args, &([_][]const u8{long_env} ** env_count), &block);
+    try pack(&args, &(@as([env_count][]const u8, @splat(@as([]const u8, long_env)))), &block);
     const result = try Startup.parse(arg_count, &block);
     try std.testing.expectEqual(arg_count, result.argc);
     try std.testing.expectEqual(env_count, result.envc);
@@ -91,16 +91,16 @@ test "startup: exact limits, empty user arg, stable views, and empty env value" 
 }
 
 test "startup: launch refusal does not modify the destination" {
-    var block = [_]u8{0xa5} ** block_bytes;
+    var block = @as([block_bytes]u8, @splat(@as(u8, 0xa5)));
     try std.testing.expectError(error.ArgumentLimit, pack(&.{}, &.{}, &block));
     try std.testing.expectError(error.ArgumentLimit, pack(&.{""}, &.{}, &block));
-    try std.testing.expectError(error.ArgumentLimit, pack(&([_][]const u8{"x"} ** 9), &.{}, &block));
-    try std.testing.expectError(error.ArgumentLimit, pack(&.{"x" ** 256}, &.{}, &block));
+    try std.testing.expectError(error.ArgumentLimit, pack(&(@as([9][]const u8, @splat(@as([]const u8, "x")))), &.{}, &block));
+    try std.testing.expectError(error.ArgumentLimit, pack(&.{&@as([256:0]u8, @splat("x"[0]))}, &.{}, &block));
     try std.testing.expectError(error.ArgumentLimit, pack(&.{"x\x00y"}, &.{}, &block));
-    try std.testing.expectError(error.EnvironmentLimit, pack(&.{"x"}, &([_][]const u8{"X=1"} ** 17), &block));
-    for ([_][]const u8{ "X=" ++ ("a" ** 126), "", "=bad", "missing", "X=\x00" }) |env|
+    try std.testing.expectError(error.EnvironmentLimit, pack(&.{"x"}, &(@as([17][]const u8, @splat(@as([]const u8, "X=1")))), &block));
+    for ([_][]const u8{ "X=" ++ (&@as([126:0]u8, @splat("a"[0]))), "", "=bad", "missing", "X=\x00" }) |env|
         try std.testing.expectError(error.EnvironmentLimit, pack(&.{"x"}, &.{env}, &block));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** block_bytes), &block);
+    try std.testing.expectEqualSlices(u8, &(@as([block_bytes]u8, @splat(@as(u8, 0xa5)))), &block);
 }
 
 test "startup: malformed received blocks and bounded env termination" {

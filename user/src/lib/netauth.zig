@@ -155,12 +155,12 @@ pub const Auth = struct {
     scheme: Scheme = .open,
     ops: Ops,
     source: Source,
-    challenge: [challenge_len]u8 = [_]u8{0} ** challenge_len,
+    challenge: [challenge_len]u8 = @as([challenge_len]u8, @splat(@as(u8, 0))),
     challenge_read: bool = false,
     done: bool = false,
     /// The key staging buffer (the verifier's only copy) — wiped after each
     /// verdict; a host test asserts it is zero.
-    key: [abi.secret_max_val_len]u8 = [_]u8{0} ** abi.secret_max_val_len,
+    key: [abi.secret_max_val_len]u8 = @as([abi.secret_max_val_len]u8, @splat(@as(u8, 0))),
     key_len: usize = 0,
 
     pub fn init(scheme: Scheme, ops: Ops, source: Source) Auth {
@@ -228,7 +228,7 @@ pub const Auth = struct {
 // ---------------------------------------------------------------------------
 
 const TestOps = struct {
-    var challenge: [challenge_len]u8 = [_]u8{0} ** challenge_len;
+    var challenge: [challenge_len]u8 = @as([challenge_len]u8, @splat(@as(u8, 0)));
     var reply: [line_max]u8 = undefined;
     var reply_len: usize = 0;
     var verdict: ?bool = null;

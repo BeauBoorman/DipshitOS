@@ -171,14 +171,14 @@ pub const BgJob = struct {
     /// null = free slot. Registry pids start at 0, so a plain integer
     /// sentinel would collide with the first real process.
     pid: ?usize = null,
-    name: [bg_name_max]u8 = [_]u8{0} ** bg_name_max,
+    name: [bg_name_max]u8 = @as([bg_name_max]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     /// The `[N] Done:` line has been printed — the slot stays occupied
     /// until then so `jobs`/`fg` never observe a half-registered entry.
     done_reported: bool = false,
 };
 
-pub var bg_jobs: [bg_job_max]BgJob = [_]BgJob{.{}} ** bg_job_max;
+pub var bg_jobs: [bg_job_max]BgJob = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
 
 /// Set by expand_and_dispatch when the line carried a trailing unquoted
 /// `&`; consumed by the registry-dispatch fall-through (or dropped when
@@ -217,7 +217,7 @@ pub var init_boot_pid: ?usize = null;
 var init_boot_owned = false;
 var init_boot_deadline: u64 = 0;
 var init_boot_seat: settings.WmSeat = .none;
-var init_boot_preexisting: [process.max_processes]bool = [_]bool{false} ** process.max_processes;
+var init_boot_preexisting: [process.max_processes]bool = @as([process.max_processes]bool, @splat(@as(bool, false)));
 
 pub const InitBootAction = enum { wait, seated, stop_seat, fallback };
 
@@ -474,9 +474,9 @@ var heredoc_cmd_len: usize = 0;
 const heredoc_max_lines: usize = 64;
 
 const EnvEntry = struct {
-    name: [env_name_max]u8 = [_]u8{0} ** env_name_max,
+    name: [env_name_max]u8 = @as([env_name_max]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
-    val: [env_val_max]u8 = [_]u8{0} ** env_val_max,
+    val: [env_val_max]u8 = @as([env_val_max]u8, @splat(@as(u8, 0))),
     val_len: usize = 0,
     exported: bool = false, // T12: export flag for child processes
 };
@@ -511,13 +511,13 @@ fn arm_exec_envp() void {
 
 /// M19 P4: shell function storage (8 functions × 4 commands × 64 chars).
 const FuncEntry = struct {
-    name: [func_name_max]u8 = [_]u8{0} ** func_name_max,
+    name: [func_name_max]u8 = @as([func_name_max]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
-    arg_names: [func_arg_max][func_arg_name_max]u8 = [_][func_arg_name_max]u8{[_]u8{0} ** func_arg_name_max} ** func_arg_max,
-    arg_name_lens: [func_arg_max]usize = [_]usize{0} ** func_arg_max,
+    arg_names: [func_arg_max][func_arg_name_max]u8 = @as([func_arg_max][func_arg_name_max]u8, @splat(@as([func_arg_name_max]u8, @as([func_arg_name_max]u8, @splat(@as(u8, 0)))))),
+    arg_name_lens: [func_arg_max]usize = @as([func_arg_max]usize, @splat(@as(usize, 0))),
     arg_count: usize = 0,
-    body: [func_cmds_per_func][func_cmd_max]u8 = [_][func_cmd_max]u8{[_]u8{0} ** func_cmd_max} ** func_cmds_per_func,
-    body_lens: [func_cmds_per_func]usize = [_]usize{0} ** func_cmds_per_func,
+    body: [func_cmds_per_func][func_cmd_max]u8 = @as([func_cmds_per_func][func_cmd_max]u8, @splat(@as([func_cmd_max]u8, @as([func_cmd_max]u8, @splat(@as(u8, 0)))))),
+    body_lens: [func_cmds_per_func]usize = @as([func_cmds_per_func]usize, @splat(@as(usize, 0))),
     body_count: usize = 0,
 };
 pub var func_table: [func_max]FuncEntry = undefined;
@@ -2549,7 +2549,7 @@ pub fn func_define(mon: *monitor.Monitor, text: []const u8) void {
     }
     // Parse argument list: (a, b, c)
     var arg_names: [func_arg_max][func_arg_name_max]u8 = undefined;
-    var arg_name_lens: [func_arg_max]usize = [_]usize{0} ** func_arg_max;
+    var arg_name_lens: [func_arg_max]usize = @as([func_arg_max]usize, @splat(@as(usize, 0)));
     var arg_count: usize = 0;
     if (i < text.len and text[i] == '(') {
         i += 1; // skip (
@@ -2586,7 +2586,7 @@ pub fn func_define(mon: *monitor.Monitor, text: []const u8) void {
 
     // Parse body into commands separated by `;`
     var cmds: [func_cmds_per_func][func_cmd_max]u8 = undefined;
-    var cmd_lens: [func_cmds_per_func]usize = [_]usize{0} ** func_cmds_per_func;
+    var cmd_lens: [func_cmds_per_func]usize = @as([func_cmds_per_func]usize, @splat(@as(usize, 0)));
     var cmd_count: usize = 0;
     var bpos: usize = 0;
     while (bpos < body.len and cmd_count < func_cmds_per_func) : (cmd_count += 1) {
@@ -4365,7 +4365,7 @@ pub fn test_reset_share() void {
 }
 
 test "shell: mock-fed end-to-end session produces the exact transcript" {
-    const long = "a" ** 256;
+    const long = &@as([256:0]u8, @splat("a"[0]));
     // 18 tokens: one past the 17-token limit (verb + 16 args), so the
     // tokenizer refuses the line before any handler sees it.
     const too_many_tokens = "echo t t t t t t t t t t t t t t t t t";
@@ -4597,7 +4597,7 @@ test "shell: cmd_subst output is bounded to the line buffer (#1690)" {
     // "clip " (5) + suffix " TAILMARK" (10) reserve 15 bytes of the
     // 256-byte buffer, so the capture truncates to 241 and clip stores
     // 241 + 1 (join space) + 9 = 251 bytes — byte-exact.
-    test_seed_share("SUBSTBIG.TXT", "X" ** 250);
+    test_seed_share("SUBSTBIG.TXT", &@as([250:0]u8, @splat("X"[0])));
     mock.feed("clip $(cat SUBSTBIG.TXT) TAILMARK\n");
     mock.feed("clip\n"); // read the clipboard back
     var rounds: usize = 0;

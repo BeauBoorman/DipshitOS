@@ -1517,7 +1517,7 @@ const cv_push_req = [13]u8{ 'C', 'V', 'C', '-', 'P', 'I', 'N', 'G', '-', '0', 'x
 /// The guest's reply staging (the request echoed verbatim) + its ack buffer
 /// (the host writes "OK:13").
 var cv_push_reply: [virtio_custom.push_buf_len]u8 align(16) = undefined;
-var cv_push_ack_buf: [16]u8 align(16) = [_]u8{0} ** 16;
+var cv_push_ack_buf: [16]u8 align(16) = @as([16]u8, @splat(@as(u8, 0)));
 
 /// Claim 9588: the input channel's decode hook. Kind-1 payloads are raw
 /// 8-byte HID keyboard boot reports; feeding them through the SAME decode

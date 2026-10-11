@@ -31,7 +31,7 @@ pub const SexiburgerMenu = struct {
     registry: ActionRegistry,
 
     // Type-to-filter search buffer
-    search_buf: [64]u8 = [_]u8{0} ** 64,
+    search_buf: [64]u8 = @as([64]u8, @splat(@as(u8, 0))),
     search_len: usize = 0,
 
     // Filter results cache

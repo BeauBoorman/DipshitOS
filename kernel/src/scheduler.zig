@@ -217,9 +217,9 @@ pub const extra_region_capacity: usize = process.max_mmap_regions + 8;
 pub const UserRegions = struct {
     text: userspace.Region = .{ .base = 0, .len = 0 },
     stack: userspace.Region = .{ .base = 0, .len = 0 },
-    extra_reads: [extra_region_capacity]userspace.Region = [_]userspace.Region{.{ .base = 0, .len = 0 }} ** extra_region_capacity,
+    extra_reads: [extra_region_capacity]userspace.Region = @as([extra_region_capacity]userspace.Region, @splat(@as(userspace.Region, .{ .base = 0, .len = 0 }))),
     extra_read_count: usize = 0,
-    extra_writes: [extra_region_capacity]userspace.Region = [_]userspace.Region{.{ .base = 0, .len = 0 }} ** extra_region_capacity,
+    extra_writes: [extra_region_capacity]userspace.Region = @as([extra_region_capacity]userspace.Region, @splat(@as(userspace.Region, .{ .base = 0, .len = 0 }))),
     extra_write_count: usize = 0,
 };
 
@@ -342,7 +342,7 @@ const Task = struct {
     spawned_by: ?usize = null,
     launcher_spawned: bool = false,
 };
-pub var tasks: [max_tasks]Task = [_]Task{.{}} ** max_tasks;
+pub var tasks: [max_tasks]Task = @as([max_tasks]Task, @splat(@as(Task, .{})));
 var exception_owner: [smp.max_cores]?usize = @splat(null);
 var next_join_token: u64 = max_tasks;
 
@@ -438,7 +438,7 @@ const FutexEntry = struct {
     uaddr: u64 = 0,
     task: usize = 0,
 };
-var futex_table: [futex_max]FutexEntry = [_]FutexEntry{.{}} ** futex_max;
+var futex_table: [futex_max]FutexEntry = @as([futex_max]FutexEntry, @splat(@as(FutexEntry, .{})));
 
 fn futex_entry_clear(entry: *FutexEntry) void {
     if (!entry.used) return;
@@ -584,7 +584,7 @@ pub const ReadyRing = struct {
     }
 };
 
-pub var ready_rings: [smp.max_cores]ReadyRing = [_]ReadyRing{.{}} ** smp.max_cores;
+pub var ready_rings: [smp.max_cores]ReadyRing = @as([smp.max_cores]ReadyRing, @splat(@as(ReadyRing, .{})));
 
 /// The ring a task's `ready` membership lives on: its pin core when
 /// pinned, ring 0 for every core-0-only task (`secondary_ok` off — the
@@ -678,7 +678,7 @@ fn ring_remove_anywhere(id: usize) bool {
 /// another lock (the kill conversions release ring locks before their
 /// svclock/sched_lock takes). A rotation holds EVERY ring's lock,
 /// always acquired in ascending index order, so no cycle is possible.
-pub var ring_locks: [smp.max_cores]spinlock.IrqSaveSpinlock = [_]spinlock.IrqSaveSpinlock{.{}} ** smp.max_cores;
+pub var ring_locks: [smp.max_cores]spinlock.IrqSaveSpinlock = @as([smp.max_cores]spinlock.IrqSaveSpinlock, @splat(@as(spinlock.IrqSaveSpinlock, .{})));
 
 pub const RingLockPair = struct { c: usize, saved: [smp.max_cores]u64 };
 
@@ -928,19 +928,19 @@ pub var tick_count: u64 = 0;
 /// (IRQ context) on the SAME core — staging and apply never cross cores,
 /// so indexing both by the running core keeps a switch atomic against that
 /// core's own ticks. Cores 1-3 hold idle staging until they run tasks.
-pub var pending_sp: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
-pub var pending_elr: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
-pub var pending_spsr: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
-pub var pending_sp_el0: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
-pub var pending_tls: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
-var pending_ttbr0: [smp.max_cores]u64 = [_]u64{0} ** smp.max_cores;
+pub var pending_sp: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
+pub var pending_elr: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
+pub var pending_spsr: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
+pub var pending_sp_el0: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
+pub var pending_tls: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
+var pending_ttbr0: [smp.max_cores]u64 = @as([smp.max_cores]u64, @splat(@as(u64, 0)));
 
 /// Task reports (main-context console discipline, claim 9187): a task
 /// marks ITS OWN report slot pending (claim 6729: one slot per pool entry,
 /// so the worker's constant requests cannot starve another task's report);
 /// the shell idle loop prints every pending slot via `maybe_report`.
-var report_pending: [max_tasks]bool = [_]bool{false} ** max_tasks;
-var report_advances: [max_tasks]u64 = [_]u64{0} ** max_tasks;
+var report_pending: [max_tasks]bool = @as([max_tasks]bool, @splat(@as(bool, false)));
+var report_advances: [max_tasks]u64 = @as([max_tasks]u64, @splat(@as(u64, 0)));
 /// Card 3d (claim 1014): the task exit + reap reports are bounded FIFOs,
 /// not single first-wins flags — N exits (or reaps) in one idle-loop
 /// window print N lines IN ORDER instead of collapsing to one. Task names
@@ -953,10 +953,10 @@ var report_advances: [max_tasks]u64 = [_]u64{0} ** max_tasks;
 pub const exit_report_max: usize = 8;
 const ExitEntry = struct { name: []const u8, status: u64 };
 const ReapEntry = struct { name: []const u8 };
-var exit_reports: [exit_report_max]ExitEntry = [_]ExitEntry{.{ .name = "", .status = 0 }} ** exit_report_max;
+var exit_reports: [exit_report_max]ExitEntry = @as([exit_report_max]ExitEntry, @splat(@as(ExitEntry, .{ .name = "", .status = 0 })));
 var exit_report_head: usize = 0;
 var exit_report_count: usize = 0;
-var reap_reports: [exit_report_max]ReapEntry = [_]ReapEntry{.{ .name = "" }} ** exit_report_max;
+var reap_reports: [exit_report_max]ReapEntry = @as([exit_report_max]ReapEntry, @splat(@as(ReapEntry, .{ .name = "" })));
 var reap_report_head: usize = 0;
 var reap_report_count: usize = 0;
 /// Milestone sixteen C2 (claim 8403): the EL0 fault reports are a bounded
@@ -969,7 +969,7 @@ var reap_report_count: usize = 0;
 /// oldest `fault:` line while `live-exceptions` asserts specific ones.
 pub const fault_report_max: usize = 8;
 const FaultEntry = struct { name: []const u8, far: u64, ec: u64, pc: u64 = 0, esr: u64 = 0 };
-var fault_reports: [fault_report_max]FaultEntry = [_]FaultEntry{.{ .name = "", .far = 0, .ec = 0 }} ** fault_report_max;
+var fault_reports: [fault_report_max]FaultEntry = @as([fault_report_max]FaultEntry, @splat(@as(FaultEntry, .{ .name = "", .far = 0, .ec = 0 })));
 var fault_report_head: usize = 0;
 var fault_report_count: usize = 0;
 /// Sleep report (claim 0635): `sys_sleep` marks it (exception context, like
@@ -1037,7 +1037,7 @@ pub var wake_nudges: u64 = 0;
 /// anywhere raised a core-0-only request, because every wake landed on ring 0;
 /// with wake targeting the request belongs to the core whose ring received
 /// the task.
-pub var resched_requested: [smp.max_cores]bool = [_]bool{false} ** smp.max_cores;
+pub var resched_requested: [smp.max_cores]bool = @as([smp.max_cores]bool, @splat(@as(bool, false)));
 /// Requests that owed a rotation (one per wake that found none already owed).
 pub var resched_requests: u64 = 0;
 /// Requests that arrived while one was already owed — the coalesced surplus.
@@ -3258,7 +3258,7 @@ pub const audit = struct {
     var last_field: Field = .state;
     var have_last: bool = false;
 
-    var viol: [max_violations]Violation = [_]Violation{.{}} ** max_violations;
+    var viol: [max_violations]Violation = @as([max_violations]Violation, @splat(@as(Violation, .{})));
     var viol_head: usize = 0;
     var viol_count: usize = 0;
 

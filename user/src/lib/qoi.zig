@@ -68,7 +68,7 @@ pub fn decode(bytes: []const u8, out_pixels: []align(1) u32) DecodeError!QoiHead
     const total_pixels: u64 = @as(u64, header.width) * @as(u64, header.height);
     if (out_pixels.len < total_pixels) return error.BufferTooSmall;
 
-    var index = [_]Color{.{ .r = 0, .g = 0, .b = 0, .a = 0 }} ** 64;
+    var index = @as([64]Color, @splat(@as(Color, .{ .r = 0, .g = 0, .b = 0, .a = 0 })));
     var current = Color{ .r = 0, .g = 0, .b = 0, .a = 255 };
 
     var in_pos: usize = 14;

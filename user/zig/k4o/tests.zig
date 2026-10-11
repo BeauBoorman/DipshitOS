@@ -1,3 +1,7 @@
+fn repeat_lit(comptime lit: []const u8, comptime n: usize) *const [n * lit.len:0]u8 {
+    if (n == 0) return "";
+    return lit ++ repeat_lit(lit, n - 1);
+}
 const std = @import("std");
 const cli = @import("cli.zig");
 const kt = @import("k4o");
@@ -28,10 +32,10 @@ test "CLI defaults, formats, equals and short options, all seven argument slots"
 }
 
 test "CLI capacity and named usage refusals" {
-    _ = try cli.parse(&.{ "render", "x" ** 255 });
-    try t.expectError(error.ArgumentLimit, cli.parse(&.{ "render", "x" ** 256 }));
+    _ = try cli.parse(&.{ "render", &@as([255:0]u8, @splat("x"[0])) });
+    try t.expectError(error.ArgumentLimit, cli.parse(&.{ "render", &@as([256:0]u8, @splat("x"[0])) }));
     try t.expectError(error.ArgumentLimit, cli.parse(&.{ "render", "a\x00b" }));
-    try t.expectError(error.ArgumentLimit, cli.parse(&([_][]const u8{"-h"} ** 8)));
+    try t.expectError(error.ArgumentLimit, cli.parse(&(@as([8][]const u8, @splat(@as([]const u8, "-h"))))));
     try t.expectError(error.MissingCommand, cli.parse(&.{}));
     try t.expectError(error.UnknownCommand, cli.parse(&.{"walk"}));
     try t.expectError(error.MissingTemplate, cli.parse(&.{"render"}));
@@ -66,25 +70,25 @@ test "input byte boundaries and quote-aware JSON depth" {
     try cli.jsonPreflight(input[0..cli.input_limit]);
     try t.expectError(error.InputLimit, cli.templatePreflight(input));
     try t.expectError(error.InputLimit, cli.jsonPreflight(input));
-    try cli.jsonPreflight("[" ** 8 ++ "0" ++ "]" ** 8);
-    try t.expectError(error.JsonDepthLimit, cli.jsonPreflight("[" ** 9 ++ "0" ++ "]" ** 9));
+    try cli.jsonPreflight(&@as([8:0]u8, @splat("["[0])) ++ "0" ++ &@as([8:0]u8, @splat("]"[0])));
+    try t.expectError(error.JsonDepthLimit, cli.jsonPreflight(&@as([9:0]u8, @splat("["[0])) ++ "0" ++ &@as([9:0]u8, @splat("]"[0]))));
     try cli.jsonPreflight("{\"quoted\":\"[[[[[[[[[[[\\\"}\"}");
 }
 
 test "template blocks, comments, quoted delimiters and every condition recursion form" {
-    try cli.templatePreflight("{% if true %}" ** 8 ++ "ok" ++ "{% endif %}" ** 8);
-    try t.expectError(error.TemplateDepthLimit, cli.templatePreflight("{% if true %}" ** 9));
-    try cli.templatePreflight("{%if(true)%}" ** 8 ++ "ok" ++ "{%endif%}" ** 8);
-    try t.expectError(error.TemplateDepthLimit, cli.templatePreflight("{%if(true)%}" ** 9));
-    try t.expectError(error.ConditionLimit, cli.templatePreflight("{%if" ++ "!" ** 9 ++ "true%}"));
-    try cli.templatePreflight("{# {% if true %}" ** 9 ++ "#}");
+    try cli.templatePreflight(repeat_lit("{% if true %}", 8) ++ "ok" ++ repeat_lit("{% endif %}", 8));
+    try t.expectError(error.TemplateDepthLimit, cli.templatePreflight(repeat_lit("{% if true %}", 9)));
+    try cli.templatePreflight(repeat_lit("{%if(true)%}", 8) ++ "ok" ++ repeat_lit("{%endif%}", 8));
+    try t.expectError(error.TemplateDepthLimit, cli.templatePreflight(repeat_lit("{%if(true)%}", 9)));
+    try t.expectError(error.ConditionLimit, cli.templatePreflight("{%if" ++ &@as([9:0]u8, @splat("!"[0])) ++ "true%}"));
+    try cli.templatePreflight(repeat_lit("{# {% if true %}", 9) ++ "#}");
     try cli.templatePreflight("{% if \"{% if not not not not not not not not not %}\" %}ok{% endif %}");
-    try cli.templatePreflight("{% if not " ** 1 ++ "not " ** 7 ++ "true %}ok{% endif %}");
-    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if " ++ "not " ** 9 ++ "true %}"));
-    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if " ++ "!" ** 9 ++ "true %}"));
-    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if " ++ "(" ** 9 ++ "true" ++ ")" ** 9 ++ " %}"));
-    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if true " ++ "or true " ** 9 ++ "%}"));
-    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if true %}{% elseif " ++ "not " ** 9 ++ "true %}"));
+    try cli.templatePreflight(repeat_lit("{% if not ", 1) ++ repeat_lit("not ", 7) ++ "true %}ok{% endif %}");
+    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if " ++ repeat_lit("not ", 9) ++ "true %}"));
+    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if " ++ &@as([9:0]u8, @splat("!"[0])) ++ "true %}"));
+    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if " ++ &@as([9:0]u8, @splat("("[0])) ++ "true" ++ &@as([9:0]u8, @splat(")"[0])) ++ " %}"));
+    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if true " ++ repeat_lit("or true ", 9) ++ "%}"));
+    try t.expectError(error.ConditionLimit, cli.templatePreflight("{% if true %}{% elseif " ++ repeat_lit("not ", 9) ++ "true %}"));
 }
 
 test "unchanged format rendering and optional JSON" {
@@ -128,7 +132,7 @@ test "8 MiB aggregate arena includes input, output, metadata and deterministic O
     defer arena.deinit();
     var d: kt.Diagnostic = .{};
     // An allowed 128 KiB input with many tiny AST nodes exhausts the arena.
-    const template = "{{x}}" ** (cli.input_limit / 5);
+    const template = repeat_lit("{{x}}", (cli.input_limit / 5));
     try t.expectError(error.OutOfMemory, cli.render(arena.allocator(), template, null, .{ .template = "t" }, &d));
     try t.expect(backing.peak() <= cli.arena_bytes);
 }
@@ -136,9 +140,9 @@ test "8 MiB aggregate arena includes input, output, metadata and deterministic O
 test "owned argv packing refuses before mutation at both ABI boundaries" {
     const startup = @import("startup");
     var block: [startup.block_bytes]u8 = @splat(0xcc);
-    try startup.pack(&.{ "K4O.BIN", "x" ** 255 }, &.{}, &block);
+    try startup.pack(&.{ "K4O.BIN", &@as([255:0]u8, @splat("x"[0])) }, &.{}, &block);
     @memset(&block, 0xcc);
-    try t.expectError(error.ArgumentLimit, startup.pack(&.{ "K4O.BIN", "x" ** 256 }, &.{}, &block));
+    try t.expectError(error.ArgumentLimit, startup.pack(&.{ "K4O.BIN", &@as([256:0]u8, @splat("x"[0])) }, &.{}, &block));
     try t.expect(std.mem.allEqual(u8, &block, 0xcc));
-    try t.expectError(error.ArgumentLimit, startup.pack(&([_][]const u8{"x"} ** 9), &.{}, &block));
+    try t.expectError(error.ArgumentLimit, startup.pack(&(@as([9][]const u8, @splat(@as([]const u8, "x")))), &.{}, &block));
 }

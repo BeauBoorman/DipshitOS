@@ -21,7 +21,7 @@ fn padLen(n: usize) usize {
 
 fn mac(tag: *[16]u8, ciphertext: []const u8, aad: []const u8, pkey: *const [32]u8) void {
     var p = poly1305.Poly1305.init(pkey);
-    const zeros = [_]u8{0} ** 16;
+    const zeros = @as([16]u8, @splat(@as(u8, 0)));
     p.update(aad);
     p.update(zeros[0..padLen(aad.len)]);
     p.update(ciphertext);
