@@ -935,6 +935,13 @@ func (s *Shell) runExternal(name string, args []string) (int, error) {
 		s.host.Out([]byte("gosh: " + name + ": not found\n"))
 		return 127, err
 	}
+	if intr := s.ttyPoll(); intr != nil {
+		// M98f: the interactive wait polls + watches for Ctrl-C instead of
+		// blocking in WaitExternal (and writes no crash receipt — a kill
+		// the shell armed is not a crash).
+		st, _ := s.waitForeground(name, pid, intr)
+		return st, nil
+	}
 	st, err := s.host.WaitExternal(pid)
 	if err != nil {
 		s.host.Out([]byte("gosh: " + name + ": wait failed\n"))
@@ -1096,9 +1103,6 @@ func (s *Shell) removeJob(j *Job) {
 		}
 	}
 }
-
-// errNoJob is fg's refusal when the id names nothing.
-var errNoJob = errors.New("fg: no such job")
 
 // names lists builtin and tool names (completion + help).
 func BuiltinNames() []string { return tableNames(builtins) }
