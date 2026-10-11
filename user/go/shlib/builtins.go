@@ -541,25 +541,67 @@ func bDate(c *cmdCtx) int {
 // wire and, on a valid reply, steps the kernel clock.
 var timeSync = timesync.Sync
 
-// bTime is `time sync [SERVER]`: one SNTP query (M83b #1775). `sync` is the
-// only subcommand; the verb is `time` so that a later `time zone` has a home
-// without another top-level name. Exit 0 when the clock is correct afterward
-// (stepped, or already within a tick), 1 for every failure, 2 for misuse.
+// bTime is `time CMD [ARGS...]` — a timed run — plus the M83b (#1775)
+// `time sync [SERVER]` SNTP query, unchanged. Timed output goes through
+// time's own c.out so `time grep x F | sort` and `time echo hi > F` wire
+// like any other command, while the `real` report writes host.Out (the
+// terminal), never c.out — `$(time echo hi)` captures "hi" alone, the way
+// bash's timing lands on stderr. Status is CMD's status, and an `exit` or
+// `monitor` inside the timed command still leaves the shell: runTimed calls
+// the inner verb without consuming exitReq/monitorRq, so the outer
+// runBuiltin translates them. Misuse is 2.
 func bTime(c *cmdCtx) int {
-	if len(c.args) < 1 || len(c.args) > 2 || c.args[0] != "sync" {
-		c.out([]byte("gosh: time: usage: time sync [SERVER]\n"))
+	if len(c.args) == 0 || (c.args[0] == "sync" && len(c.args) > 2) {
+		c.out([]byte("gosh: time: usage: time CMD [ARGS...] | time sync [SERVER]\n"))
 		return 2
 	}
-	server := timesync.DefaultServer
-	if len(c.args) == 2 {
-		server = c.args[1]
+	if c.args[0] == "sync" {
+		server := timesync.DefaultServer
+		if len(c.args) == 2 {
+			server = c.args[1]
+		}
+		res := timeSync(server)
+		c.out([]byte(res.Line()))
+		if !res.OK() {
+			return 1
+		}
+		return 0
 	}
-	res := timeSync(server)
-	c.out([]byte(res.Line()))
-	if !res.OK() {
-		return 1
+	start := timeMono()
+	st := c.sh.runTimed(c, c.args)
+	c.sh.host.Out([]byte("real " + formatReal(timeMono()-start) + "\n"))
+	return st
+}
+
+// runTimed dispatches one already-split command for `time`: the same
+// classification runSingle uses (builtin, tool, function, external) with
+// output wired to time's c.out. It returns the command's status only —
+// exitReq/monitorRq stay armed for the caller's runBuiltin to translate.
+func (s *Shell) runTimed(c *cmdCtx, args []string) int {
+	name := args[0]
+	sub := &cmdCtx{sh: s, name: name, args: args[1:], stdin: c.stdin,
+		out: c.out, stdinBound: c.stdinBound, outCaptured: c.outCaptured}
+	switch classify(name) {
+	case 0, 1:
+		fn := builtins[name]
+		if fn == nil {
+			fn = tools[name]
+		}
+		return fn(sub)
 	}
-	return 0
+	if f := s.funcs.find(name); f != nil {
+		s.bindFuncArgs(f, args[1:])
+		st, act := s.runFuncBody(f, 0)
+		switch act {
+		case ActionExit:
+			s.exitReq = true
+		case ActionMonitor:
+			s.monitorRq = true
+		}
+		return st
+	}
+	st, _ := s.runExternal(name, args[1:])
+	return st
 }
 
 // --- ADR 0008 D1 discovery for the guest verbs (#1538) -------------------
@@ -610,7 +652,7 @@ var helpCatalog = map[string]helpEntry{
 	"history": {group: "shell", usage: "history", blurb: "list this session's submitted lines, oldest first"},
 	"log":     {group: "shell", usage: "log [APP]", blurb: "read one app's bounded log ring, or all app rings"},
 	"monitor": {group: "shell", usage: "monitor", blurb: "hand the console back to the kernel monitor"},
-	"time":    {group: "shell", usage: "time sync [SERVER]", blurb: "set the clock from one SNTP query (default time.apple.com)", notes: "SERVER is a name or a dotted IPv4 address. One query, no retry; on no reply the clock is left untouched and the exit is 1."},
+	"time":    {group: "shell", usage: "time CMD [ARGS...] | time sync [SERVER]", blurb: "time a command, or set the clock from one SNTP query (default time.apple.com)", notes: "With CMD the command runs and `real N.NNs` reports on the terminal. SERVER is a name or a dotted IPv4 address. One query, no retry; on no reply the clock is left untouched and the exit is 1."},
 
 	// files
 	"cat":    {group: "files", usage: "cat [FILE...]", blurb: "write FILE... (the bound stdin when none is named)"},

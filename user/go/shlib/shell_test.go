@@ -118,6 +118,10 @@ func (f *fakeHost) Chdir(path string) error {
 	return nil
 }
 
+func (f *fakeHost) DeleteFile(path string) error {
+	delete(f.files, path)
+	return nil
+}
 func (f *fakeHost) SleepSeconds(n int) { f.sleeps = append(f.sleeps, n) }
 
 func (f *fakeHost) RunExternal(name string, args []string) (int64, error) {

@@ -52,7 +52,9 @@
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-gosh.sh      ->  .build/go/GOSH.ELF
 #   bash tools/go/build-goping.sh    ->  .build/go/GOPING.ELF
-#   bash tools/go/build-web.sh fetch GOFETCH -> .build/go/GOFETCH.ELF
+#   bash tools/go/build-web.sh fetch GOFETCH --gate -> .build/go/GOFETCH-GATE.ELF
+#   (staged under the GOFETCH.ELF guest name; the gate build carries the
+#   AutoClaw test root the boot-02 fixture chains to)
 
 vgate_name go-net-clis "issue #1573 M71n: GOSH execs GOPING.ELF (ICMP) and GOFETCH.ELF (TLS) on a live VZ net"
 vgate_share seed
@@ -76,14 +78,21 @@ import os, shutil, sys
 rd = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
 for name, how in (("GOSH.ELF", "build-gosh.sh"),
-                  ("GOPING.ELF", "build-goping.sh"),
-                  ("GOFETCH.ELF", "build-web.sh fetch GOFETCH")):
+                  ("GOPING.ELF", "build-goping.sh")):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
         sys.exit(name + " missing (expected " + src + ") - build it first: "
                  "bash tools/go/" + how)
     shutil.copy(src, os.path.join(share, name))
     print("staged %s (%d bytes)" % (name, os.path.getsize(src)))
+# Boot 02's TLS fixture chains to the AutoClaw test root, which only the
+# --gate build trusts (same staging live-web.spec uses).
+gofetch = os.path.join(".build", "go", "GOFETCH-GATE.ELF")
+if not os.path.exists(gofetch):
+    sys.exit("GOFETCH.ELF missing (expected " + gofetch + ") - build it first: "
+             "bash tools/go/build-web.sh fetch GOFETCH --gate")
+shutil.copy(gofetch, os.path.join(share, "GOFETCH.ELF"))
+print("staged GOFETCH.ELF (%d bytes)" % os.path.getsize(gofetch))
 # The typed lines are raw console bytes (CR submits a line in GOSH's editor),
 # so they are written here rather than as a heredoc.
 with open(os.path.join(rd, "typed-ping.bin"), "wb") as f:
