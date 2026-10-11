@@ -222,10 +222,10 @@ pub const AddrSpace = struct {
     lib_phys: u64 = 0,
     lib_pages: u64 = 0,
     /// M29 VM Depth: Anonymous mmap regions and dynamic page allocations
-    mmap_regions: [max_mmap_regions]MmapRegion = [_]MmapRegion{.{}} ** max_mmap_regions,
+    mmap_regions: [max_mmap_regions]MmapRegion = @as([max_mmap_regions]MmapRegion, @splat(@as(MmapRegion, .{}))),
     mmap_region_count: usize = 0,
     mmap_next_va: u64 = mmap_default_va,
-    dynamic_pages: [max_dynamic_pages]u64 = [_]u64{0} ** max_dynamic_pages,
+    dynamic_pages: [max_dynamic_pages]u64 = @as([max_dynamic_pages]u64, @splat(@as(u64, 0))),
     dynamic_page_count: usize = 0,
     dynamic_head: ?*DynamicPageBlock = null,
     dynamic_tail: ?*DynamicPageBlock = null,
@@ -300,7 +300,7 @@ const Process = struct {
     /// Owned copy of the program's name (the FAT file name for exec'd
     /// programs, "user-el0" for the boot static payload) — the caller's
     /// slice (e.g. the monitor's token buffer) does not outlive the call.
-    name_buf: [name_max]u8 = [_]u8{0} ** name_max,
+    name_buf: [name_max]u8 = @as([name_max]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     state: State = .free,
     image: Image = .{},
@@ -326,7 +326,7 @@ const Process = struct {
     /// process transitions to exited, at which point it names the LAST
     /// exiting task (the slot whose reap frees the process pages,
     /// `release_pages_on_reap`).
-    thread_tasks: [max_threads]?usize = [_]?usize{null} ** max_threads,
+    thread_tasks: [max_threads]?usize = @as([max_threads]?usize, @splat(@as(?usize, null))),
     /// Live tasks on this process (primary + threads). The process dies
     /// when this reaches 0 — `sys_exit`/fault request the exit and kill the
     /// siblings; thread exit just decrements.
@@ -364,7 +364,7 @@ const Process = struct {
     mem_refused: bool = false,
 };
 
-var processes: [max_processes]Process = [_]Process{.{}} ** max_processes;
+var processes: [max_processes]Process = @as([max_processes]Process, @splat(@as(Process, .{})));
 var registry_count: usize = 0;
 /// The most recently created process (the "current" program — what
 /// `exec.loaded()` reports).
@@ -380,9 +380,9 @@ var current_id: ?usize = null;
 /// was 4, issue #1020): five wasm execs exit inside one drain window and a
 /// full ring drops the oldest (floatapp's 590 was lost).
 pub const exit_report_max: usize = 8;
-var exit_report_names: [exit_report_max][name_max]u8 = [_][name_max]u8{[_]u8{0} ** name_max} ** exit_report_max;
-var exit_report_lens: [exit_report_max]usize = [_]usize{0} ** exit_report_max;
-var exit_report_statuses: [exit_report_max]u64 = [_]u64{0} ** exit_report_max;
+var exit_report_names: [exit_report_max][name_max]u8 = @as([exit_report_max][name_max]u8, @splat(@as([name_max]u8, @as([name_max]u8, @splat(@as(u8, 0))))));
+var exit_report_lens: [exit_report_max]usize = @as([exit_report_max]usize, @splat(@as(usize, 0)));
+var exit_report_statuses: [exit_report_max]u64 = @as([exit_report_max]u64, @splat(@as(u64, 0)));
 var exit_report_head: usize = 0;
 var exit_report_count: usize = 0;
 
@@ -430,7 +430,7 @@ fn reset_process(p: *Process) void {
     p.addr_space.mmap_next_va = mmap_default_va;
     p.uid = uid_user;
     p.task_id = null;
-    p.thread_tasks = [_]?usize{null} ** max_threads;
+    p.thread_tasks = @as([max_threads]?usize, @splat(@as(?usize, null)));
 }
 
 fn apply_spec(space: *AddrSpace, spec: AddrSpaceSpec) void {
@@ -836,7 +836,7 @@ pub fn memory_snapshot(id: usize) ?struct {
     ro_bytes: u64 = 0,
     data_bytes: u64 = 0,
     stack_bytes: u64 = 0,
-    region_sizes: [max_mmap_regions]u64 = [_]u64{0} ** max_mmap_regions,
+    region_sizes: [max_mmap_regions]u64 = @as([max_mmap_regions]u64, @splat(@as(u64, 0))),
 } {
     const taken = svclock.acquire_missing(svclock.dom_bit(.kernel));
     defer svclock.release_set(taken);
@@ -1667,7 +1667,7 @@ test "process: snapshot marshals non-free rows in id order with the fixed 40-byt
     // are skipped, every other row carries pid / state code / exit status
     // / NUL-padded name at the documented offsets.
     init();
-    var scratch: [max_processes * snapshot_row_bytes]u8 = [_]u8{0xaa} ** (max_processes * snapshot_row_bytes);
+    var scratch: [max_processes * snapshot_row_bytes]u8 = @as([(max_processes * snapshot_row_bytes)]u8, @splat(@as(u8, 0xaa)));
     // Empty registry: zero rows.
     try std.testing.expectEqual(@as(usize, 0), snapshot(&scratch));
 
@@ -1821,8 +1821,8 @@ test "process: sys_procs snapshot row is byte-frozen across principals" {
     // gains a uid/caps field. Two processes identical but for their
     // principal must marshal byte-for-byte identical rows.
     init();
-    var a: [max_processes * snapshot_row_bytes]u8 = [_]u8{0xaa} ** (max_processes * snapshot_row_bytes);
-    var b: [max_processes * snapshot_row_bytes]u8 = [_]u8{0xaa} ** (max_processes * snapshot_row_bytes);
+    var a: [max_processes * snapshot_row_bytes]u8 = @as([(max_processes * snapshot_row_bytes)]u8, @splat(@as(u8, 0xaa)));
+    var b: [max_processes * snapshot_row_bytes]u8 = @as([(max_processes * snapshot_row_bytes)]u8, @splat(@as(u8, 0xaa)));
     _ = create("SAME.BIN", .{ .entry_va = 0x400000, .content_len = 8 }, .{}, .{}).?;
     const rows_a = snapshot(&a);
     init();

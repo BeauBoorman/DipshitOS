@@ -58,7 +58,7 @@ pub fn parse(argc: u64, argv_va: u64) ?Args {
 }
 
 test "netargs: parse defaults, port, and the explicit open mode" {
-    var block = [_]u8{0} ** (3 * 256);
+    var block = @as([(3 * 256)]u8, @splat(@as(u8, 0)));
     const write = struct {
         fn f(b: []u8, i: usize, s: []const u8) void {
             @memcpy(b[i * 256 ..][0..s.len], s);

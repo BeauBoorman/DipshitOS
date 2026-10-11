@@ -39,7 +39,7 @@ fn str_flags(length_arg: u8) Arg {
 }
 
 fn arg_list(values: anytype) [6]Arg {
-    var args = [_]Arg{.{}} ** 6;
+    var args = @as([6]Arg, @splat(@as(Arg, .{})));
     inline for (values, 0..) |value, index| {
         args[index] = if (@TypeOf(value) == Arg) value else .{ .kind = value };
     }
@@ -49,7 +49,7 @@ fn arg_list(values: anytype) [6]Arg {
 fn row(number_in: u8, name_in: []const u8, values: anytype) Slot {
     var slot: Slot = .{
         .number = number_in,
-        .name_bytes = [_]u8{0} ** 32,
+        .name_bytes = @as([32]u8, @splat(@as(u8, 0))),
         .name_len = @intCast(name_in.len),
         .arg_count = values.len,
         .args = arg_list(values),

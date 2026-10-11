@@ -84,13 +84,13 @@ pub const file_max: usize = 8 * (max_key_len + 10 + max_val_len + max_apps_len +
 
 pub const Entry = struct {
     uid: u32 = process.uid_user,
-    key: [max_key_len]u8 = [_]u8{0} ** max_key_len,
+    key: [max_key_len]u8 = @as([max_key_len]u8, @splat(@as(u8, 0))),
     key_len: u8 = 0,
-    val: [max_val_len]u8 = [_]u8{0} ** max_val_len,
+    val: [max_val_len]u8 = @as([max_val_len]u8, @splat(@as(u8, 0))),
     val_len: u8 = 0,
     /// M97g (#2083): comma-separated image-name allowlist. Empty = the
     /// legacy uid-scope-only entry.
-    apps: [max_apps_len]u8 = [_]u8{0} ** max_apps_len,
+    apps: [max_apps_len]u8 = @as([max_apps_len]u8, @splat(@as(u8, 0))),
     apps_len: u8 = 0,
 };
 
@@ -113,12 +113,12 @@ pub const SecretRecord = extern struct {
 /// boot paths run without a large stack frame).
 var scratch: [file_max]u8 = undefined;
 
-var entries: [max_secret_entries]Entry = [_]Entry{.{}} ** max_secret_entries;
+var entries: [max_secret_entries]Entry = @as([max_secret_entries]Entry, @splat(@as(Entry, .{})));
 var entry_count: usize = 0;
 var initialized: bool = false;
 
 pub fn init() void {
-    entries = [_]Entry{.{}} ** max_secret_entries;
+    entries = @as([max_secret_entries]Entry, @splat(@as(Entry, .{})));
     entry_count = 0;
     initialized = true;
 }
@@ -379,8 +379,8 @@ test "secret: defaults and the two principals" {
 
 test "secret: set/parse bounds — 32/64 field caps and 8-entry store cap" {
     init();
-    var key: [max_key_len + 1]u8 = [_]u8{'k'} ** (max_key_len + 1);
-    var val: [max_val_len + 1]u8 = [_]u8{'v'} ** (max_val_len + 1);
+    var key: [max_key_len + 1]u8 = @as([(max_key_len + 1)]u8, @splat(@as(u8, 'k')));
+    var val: [max_val_len + 1]u8 = @as([(max_val_len + 1)]u8, @splat(@as(u8, 'v')));
     try std.testing.expectEqual(SetResult.invalid_key, set_internal(process.uid_user, key[0..], "v", ""));
     try std.testing.expectEqual(SetResult.invalid_value, set_internal(process.uid_user, "k", val[0..], ""));
     // A 64-char value (a 32-byte Ed25519 seed in hex exactly) is accepted.

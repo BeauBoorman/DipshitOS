@@ -1,5 +1,9 @@
 //! Native boundary checks use the real guest clock. Policy-only cases are
 //! distinguished from evals; no fake elapsed time or harness kill is a refusal.
+fn repeat_lit(comptime lit: []const u8, comptime n: usize) *const [n * lit.len:0]u8 {
+    if (n == 0) return "";
+    return lit ++ repeat_lit(lit, n - 1);
+}
 const std = @import("std");
 const sdk = @import("sdk").runtime;
 const qjs = @import("qjs");
@@ -124,13 +128,13 @@ fn policyChecks(clock: qjs.Clock) !void {
     state.work_sites = qjs.limits.work - 1;
     try require(state.site());
     try require(!state.site() and state.failure != null and state.failure.? == error.WorkLimit);
-    try product.path("/host/" ++ "a" ** 31 ++ "/" ++ "b" ** 26);
-    if (product.path("/host/" ++ "a" ** 31 ++ "/" ++ "b" ** 27)) |_| return error.PathLimitMissing else |err| try require(err == error.PathLimit);
-    _ = try product.parse(&.{ "QJS.BIN", "/host/F" }, &([_][]const u8{"A=" ++ "x" ** 125} ** 16));
-    if (product.parse(&.{ "QJS.BIN", "x" ** 256 }, &.{})) |_| return error.ArgLimitMissing else |err| try require(err == error.ArgumentLimit);
-    if (product.parse(&([_][]const u8{"QJS.BIN"} ** 9), &.{})) |_| return error.ArgCountMissing else |err| try require(err == error.ArgumentLimit);
-    if (product.parse(&.{ "QJS.BIN", "/host/F" }, &([_][]const u8{"A=B"} ** 17))) |_| return error.EnvCountMissing else |err| try require(err == error.EnvironmentLimit);
-    if (product.parse(&.{ "QJS.BIN", "/host/F" }, &.{"A=" ++ "x" ** 126})) |_| return error.EnvLimitMissing else |err| try require(err == error.EnvironmentLimit);
+    try product.path("/host/" ++ &@as([31:0]u8, @splat("a"[0])) ++ "/" ++ &@as([26:0]u8, @splat("b"[0])));
+    if (product.path("/host/" ++ &@as([31:0]u8, @splat("a"[0])) ++ "/" ++ &@as([27:0]u8, @splat("b"[0])))) |_| return error.PathLimitMissing else |err| try require(err == error.PathLimit);
+    _ = try product.parse(&.{ "QJS.BIN", "/host/F" }, &(@as([16][]const u8, @splat(@as([]const u8, "A=" ++ repeat_lit("x", 125))))));
+    if (product.parse(&.{ "QJS.BIN", &@as([256:0]u8, @splat("x"[0])) }, &.{})) |_| return error.ArgLimitMissing else |err| try require(err == error.ArgumentLimit);
+    if (product.parse(&(@as([9][]const u8, @splat(@as([]const u8, "QJS.BIN")))), &.{})) |_| return error.ArgCountMissing else |err| try require(err == error.ArgumentLimit);
+    if (product.parse(&.{ "QJS.BIN", "/host/F" }, &(@as([17][]const u8, @splat(@as([]const u8, "A=B")))))) |_| return error.EnvCountMissing else |err| try require(err == error.EnvironmentLimit);
+    if (product.parse(&.{ "QJS.BIN", "/host/F" }, &.{"A=" ++ &@as([126:0]u8, @splat("x"[0]))})) |_| return error.EnvLimitMissing else |err| try require(err == error.EnvironmentLimit);
     var bad_clock = clock;
     bad_clock.frequency = 0;
     if (qjs.policy.Control.init(bad_clock)) |_| return error.ClockRefusalMissing else |err| try require(err == error.ClockUnavailable);

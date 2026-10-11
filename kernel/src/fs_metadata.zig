@@ -247,9 +247,9 @@ pub const Wire = extern struct {
 };
 
 pub const Entry = extern struct {
-    name: [256]u8 = .{0} ** 256,
+    name: [256]u8 = @splat(0),
     name_len: u16,
-    reserved: [6]u8 = .{0} ** 6,
+    reserved: [6]u8 = @splat(0),
     metadata: Wire,
 };
 pub const Page = extern struct {
@@ -618,7 +618,7 @@ pub fn rename(backend: Backend, auth: Authorizer, from: Directory, from_name: []
 // Unit fixtures are an explicit in-memory backend. Passing these tests does
 // not opt VirtioFS or the legacy host channel into the containment contract.
 fn testAttr(inode: u64, mode: u32) [fuse_attr_bytes]u8 {
-    var bytes = [_]u8{0} ** fuse_attr_bytes;
+    var bytes = @as([fuse_attr_bytes]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u64, bytes[0..8], inode, .little);
     std.mem.writeInt(u64, bytes[8..16], 0x1_0000_0017, .little);
     std.mem.writeInt(i64, bytes[24..32], -1, .little);
@@ -877,7 +877,7 @@ test "metadata: zero identities invalid kinds and nanoseconds refuse" {
 }
 
 test "metadata: valid epoch zero comes from actual reply bytes" {
-    var attr = [_]u8{0} ** fuse_attr_bytes;
+    var attr = @as([fuse_attr_bytes]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u64, attr[0..8], 1, .little);
     std.mem.writeInt(u32, attr[60..64], 0o040755, .little);
     const value = try decodeFuseAttr(7, &attr);
@@ -886,7 +886,7 @@ test "metadata: valid epoch zero comes from actual reply bytes" {
 }
 
 test "metadata: LOOKUP rejects every cut and a zero node id" {
-    var entry = [_]u8{0} ** fuse_entry_bytes;
+    var entry = @as([fuse_entry_bytes]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u64, entry[0..8], 99, .little);
     std.mem.writeInt(u64, entry[8..16], 17, .little);
     @memcpy(entry[40..], &testAttr(123, 0o040755));
@@ -901,7 +901,7 @@ test "metadata: LOOKUP rejects every cut and a zero node id" {
 }
 
 test "metadata: GETATTR rejects every cut and decodes root attributes" {
-    var reply = [_]u8{0} ** fuse_getattr_bytes;
+    var reply = @as([fuse_getattr_bytes]u8, @splat(@as(u8, 0)));
     @memcpy(reply[16..], &testAttr(77, 0o040700));
     for (0..fuse_getattr_bytes) |cut|
         try std.testing.expectError(error.InvalidMetadata, decodeFuseGetattr(7, reply[0..cut]));
@@ -946,13 +946,13 @@ test "metadata: watch stamp detects independent mtime and size changes" {
 }
 
 test "metadata: approved B2 full-path and component budgets are exact" {
-    try validatePath("x" ** 255);
-    try std.testing.expectError(error.PathLimit, validatePath("x" ** 256));
-    const exact = "x" ** 255 ++ "/" ++ "y" ** 250;
+    try validatePath(&@as([255:0]u8, @splat("x"[0])));
+    try std.testing.expectError(error.PathLimit, validatePath(&@as([256:0]u8, @splat("x"[0]))));
+    const exact = &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([250:0]u8, @splat("y"[0]));
     try std.testing.expectEqual(@as(usize, max_guest_path), exact.len + guest_prefix.len);
     try validatePath(exact);
     try std.testing.expectError(error.PathLimit, validatePath(exact ++ "y"));
-    const at_content_root = "x" ** 255 ++ "/" ++ "y" ** 242;
+    const at_content_root = &@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([242:0]u8, @splat("y"[0]));
     try std.testing.expectEqual(@as(usize, max_guest_path), guest_prefix.len + "content/".len + at_content_root.len);
     try validateRootedPath("content", at_content_root);
     try std.testing.expectError(error.PathLimit, validateRootedPath("content", at_content_root ++ "y"));
@@ -1183,8 +1183,8 @@ test "B3: rich snapshot wire preserves facts padding and exact entry ceiling" {
     try std.testing.expectEqual(@as(u64, 0x1_0000_0017), row.metadata.size);
     try std.testing.expectEqual(value.identity, row.metadata.identity);
     try std.testing.expectEqual(@as(u32, 456), row.metadata.mtime.nanoseconds);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 6), &row.reserved);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 247), row.name[9..]);
+    try std.testing.expectEqualSlices(u8, &(@as([6]u8, @splat(@as(u8, 0)))), &row.reserved);
+    try std.testing.expectEqualSlices(u8, &(@as([247]u8, @splat(@as(u8, 0)))), row.name[9..]);
     try std.testing.expectEqual(@as(u32, 0), row.metadata.mtime.reserved);
     try std.testing.expectError(error.StaleIdentity, snapshot.append("directory", value));
     const link = try decodeFuseAttr(7, &testAttr(124, 0o120777));
@@ -1200,7 +1200,7 @@ test "B3: rich snapshot wire preserves facts padding and exact entry ceiling" {
 test "B3: supplied root and relative depth budgets remain independent" {
     try validateRootedPath("content/one/two/three", "a/b/c/d/e/f/g/h");
     try std.testing.expectError(error.TreeLimit, validateRootedPath("content", "a/b/c/d/e/f/g/h/i"));
-    try std.testing.expectError(error.PathLimit, validateRootedPath("root", "a" ** 255 ++ "/" ++ "b" ** 250));
+    try std.testing.expectError(error.PathLimit, validateRootedPath("root", &@as([255:0]u8, @splat("a"[0])) ++ "/" ++ &@as([250:0]u8, @splat("b"[0]))));
 }
 
 test "B3: in-place snapshot sort preserves every full-capacity row" {
@@ -1239,9 +1239,9 @@ test "B5: names joined paths and depth refuse before backend use" {
     try std.testing.expectEqualStrings("b", try childPath("", "b", &buffer));
     for ([_][]const u8{ "", ".", "..", "a/b", "a\x00" }) |name|
         try std.testing.expectError(error.InvalidPath, childPath("a", name, &buffer));
-    try std.testing.expectError(error.PathLimit, childPath("a", "x" ** 256, &buffer));
-    _ = try childPath("x" ** 255, "y" ** 250, &buffer);
-    try std.testing.expectError(error.PathLimit, childPath("x" ** 255, "y" ** 251, &buffer));
+    try std.testing.expectError(error.PathLimit, childPath("a", &@as([256:0]u8, @splat("x"[0])), &buffer));
+    _ = try childPath(&@as([255:0]u8, @splat("x"[0])), &@as([250:0]u8, @splat("y"[0])), &buffer);
+    try std.testing.expectError(error.PathLimit, childPath(&@as([255:0]u8, @splat("x"[0])), &@as([251:0]u8, @splat("y"[0])), &buffer));
     const deep = "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o";
     _ = try childPath(deep, "p", &buffer);
     try std.testing.expectError(error.TreeLimit, childPath(deep ++ "/p", "q", &buffer));

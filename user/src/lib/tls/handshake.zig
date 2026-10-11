@@ -666,7 +666,7 @@ test "handshake: Certificate and CertificateVerify parse" {
     var cw = Writer.init(&cv);
     try cw.putU16(sig_scheme.ecdsa_secp256r1_sha256);
     const sig_at = try cw.reserveU16();
-    var sig = [_]u8{0xAA} ** 70;
+    var sig = @as([70]u8, @splat(@as(u8, 0xAA)));
     try cw.put(&sig);
     std.mem.writeInt(u16, cw.buf[sig_at..][0..2], @intCast(cw.len - sig_at - 2), .big);
     const parsed = try parseCertificateVerify(cw.bytes());

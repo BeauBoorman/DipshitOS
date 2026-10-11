@@ -20,7 +20,7 @@ pub const max_name_len = 16;
 pub const max_file_size = 1024;
 
 pub const Profile = struct {
-    name: [max_name_len]u8 = [_]u8{0} ** max_name_len,
+    name: [max_name_len]u8 = @as([max_name_len]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     ip: [4]u8 = .{ 0, 0, 0, 0 },
     gw: [4]u8 = .{ 0, 0, 0, 0 },
@@ -32,7 +32,7 @@ pub const Profile = struct {
 };
 
 pub const ProfileTable = struct {
-    profiles: [max_profiles]Profile = [_]Profile{.{}} ** max_profiles,
+    profiles: [max_profiles]Profile = @as([max_profiles]Profile, @splat(@as(Profile, .{}))),
     count: usize = 0,
 
     pub fn find(self: *const ProfileTable, name: []const u8) ?*const Profile {

@@ -38,7 +38,7 @@ pub const glob_max: usize = 64;
 /// so the shell stays allocation-free (fixed BSS in the guest).
 pub fn Buf(comptime N: usize) type {
     return struct {
-        bytes: [N]u8 = [_]u8{0} ** N,
+        bytes: [N]u8 = @as([N]u8, @splat(@as(u8, 0))),
         len: usize = 0,
 
         const Self = @This();
@@ -72,7 +72,7 @@ pub const TokenizeResult = struct {
     argv: [max_args + 1][]const u8 = undefined,
     /// Per-argument wildcard marker (unquoted, unescaped `*`/`?`/`[`) for the
     /// SH4 glob-expansion stage.
-    arg_glob: [max_args + 1]bool = [_]bool{false} ** (max_args + 1),
+    arg_glob: [max_args + 1]bool = @as([(max_args + 1)]bool, @splat(@as(bool, false))),
     count: usize = 0,
     too_many: bool = false,
     unbalanced_quote: bool = false,
@@ -198,7 +198,7 @@ pub const EnvEntry = struct {
 };
 
 pub const Env = struct {
-    entries: [env_max]EnvEntry = [_]EnvEntry{.{}} ** env_max,
+    entries: [env_max]EnvEntry = @as([env_max]EnvEntry, @splat(@as(EnvEntry, .{}))),
     count: usize = 0,
 
     pub fn get(self: *const Env, name: []const u8) ?[]const u8 {
@@ -251,8 +251,8 @@ pub const Env = struct {
 };
 
 pub const AliasTable = struct {
-    names: [alias_max]Name = [_]Name{.{}} ** alias_max,
-    vals: [alias_max]Value = [_]Value{.{}} ** alias_max,
+    names: [alias_max]Name = @as([alias_max]Name, @splat(@as(Name, .{}))),
+    vals: [alias_max]Value = @as([alias_max]Value, @splat(@as(Value, .{}))),
     count: usize = 0,
 
     pub fn get(self: *const AliasTable, name: []const u8) ?[]const u8 {
@@ -359,7 +359,7 @@ pub const ModeView = struct {
 pub const max_secret_names: usize = 8;
 pub const SecretList = struct {
     names: [max_secret_names][secret_max_key_len]u8 = undefined,
-    lens: [max_secret_names]usize = [_]usize{0} ** max_secret_names,
+    lens: [max_secret_names]usize = @as([max_secret_names]usize, @splat(@as(usize, 0))),
     count: usize = 0,
 
     pub fn at(self: *const SecretList, i: usize) []const u8 {
@@ -662,7 +662,7 @@ pub const completion_max: usize = 32;
 /// A sorted, de-duplicated set of completion candidates.
 pub const CompletionSet = struct {
     names: [completion_max][path_max]u8 = undefined,
-    lens: [completion_max]usize = [_]usize{0} ** completion_max,
+    lens: [completion_max]usize = @as([completion_max]usize, @splat(@as(usize, 0))),
     count: usize = 0,
 
     pub fn at(self: *const CompletionSet, i: usize) []const u8 {
@@ -752,7 +752,7 @@ pub fn complete(
 }
 
 pub const RunRequest = struct {
-    candidates: [max_candidates]Program = [_]Program{.{}} ** max_candidates,
+    candidates: [max_candidates]Program = @as([max_candidates]Program, @splat(@as(Program, .{}))),
     count: usize = 0,
 
     pub fn at(self: *const RunRequest, i: usize) []const u8 {
@@ -773,7 +773,7 @@ pub const tool_arg_bytes: usize = line_max * 2;
 
 pub const ToolRequest = struct {
     tool: toolbox.Tool,
-    args: [tool_arg_max]Buf(tool_arg_bytes) = [_]Buf(tool_arg_bytes){.{}} ** tool_arg_max,
+    args: [tool_arg_max]Buf(tool_arg_bytes) = @as([tool_arg_max]Buf(tool_arg_bytes), @splat(@as(Buf(tool_arg_bytes), .{}))),
     count: usize = 0,
 
     pub fn at(self: *const ToolRequest, i: usize) []const u8 {
@@ -1926,7 +1926,7 @@ test "shell: whoami/id render the principal from the view (M50 TS1)" {
 }
 
 const ModeProbe = struct {
-    path: [64]u8 = [_]u8{0} ** 64,
+    path: [64]u8 = @as([64]u8, @splat(@as(u8, 0))),
     len: usize = 0,
     mode: u16 = 0,
     rc: i64 = 0,
@@ -1981,7 +1981,7 @@ test "shell: chmod parses octal and renders the kernel verdict (M50 TS2)" {
 
 const SecretProbe = struct {
     names: [4][32]u8 = undefined,
-    lens: [4]usize = [_]usize{0} ** 4,
+    lens: [4]usize = @as([4]usize, @splat(@as(usize, 0))),
     count: usize = 0,
     ok: bool = true,
 };

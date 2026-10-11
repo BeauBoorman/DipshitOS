@@ -367,7 +367,7 @@ test "tcp: malformed + unexpected segments are counted, never assumed away" {
 
     // A SYN-ACK carrying payload (not permitted), even at the segment
     // bound, is malformed.
-    const big: [payload_max]u8 = .{0x41} ** payload_max;
+    const big: [payload_max]u8 = @splat(0x41);
     const over = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0x22222222, 0x11111112, flag_syn | flag_ack, &big);
     try std.testing.expectEqual(Event.none, handle_rx(&over));
     try std.testing.expectEqual(@as(u64, 4), tcp.dropped_malformed);

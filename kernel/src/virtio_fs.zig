@@ -88,7 +88,7 @@ const Queue = struct {
 };
 
 const Node = struct {
-    path: [cache_path_max]u8 = [_]u8{0} ** cache_path_max,
+    path: [cache_path_max]u8 = @as([cache_path_max]u8, @splat(@as(u8, 0))),
     path_len: usize = 0,
     nodeid: u64 = 0,
     mode: u32 = 0,
@@ -108,7 +108,7 @@ const FileHandle = struct {
 };
 
 pub const DirectoryEntry = struct {
-    name: [31]u8 = [_]u8{0} ** 31,
+    name: [31]u8 = @as([31]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     type: u8 = 0,
     size: u64 = 0,
@@ -157,8 +157,8 @@ const IdentityPin = extern struct { node: u64, pending: u64 };
 var identity_nodes: [identity_pin_max]IdentityPin = undefined;
 pub var identity_pin_count: usize = 0;
 pub var test_exchange: ?*const fn (u32, u64, []const u8) ?[]const u8 = null;
-var nodes: [node_cache_count]Node = [_]Node{.{}} ** node_cache_count;
-var handles: [file_handle_count]FileHandle = [_]FileHandle{.{}} ** file_handle_count;
+var nodes: [node_cache_count]Node = @as([node_cache_count]Node, @splat(@as(Node, .{})));
+var handles: [file_handle_count]FileHandle = @as([file_handle_count]FileHandle, @splat(@as(FileHandle, .{})));
 var fs_lock = spinlock.IrqSaveSpinlock{};
 var request_buf: [max_message]u8 align(64) = undefined;
 var reply_buf: [max_message]u8 align(64) = undefined;
@@ -275,7 +275,7 @@ pub fn decode_fuse_reply(bytes: []const u8, expected_unique: u64) ?FuseReply {
 }
 
 fn resolve_device(dev: u32) bool {
-    var bars: [6]u64 = .{0} ** 6;
+    var bars: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < bars.len) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);
@@ -415,8 +415,8 @@ fn init_ring(q: *Queue, queue_index: u16, wanted: u16) bool {
     q.* = .{};
     q.size = size;
     for (&q.desc) |*d| d.* = .{ .addr = 0, .len = 0, .flags = 0, .next = 0 };
-    q.avail = .{ .flags = 0, .idx = 0, .ring = [_]u16{0} ** descriptor_count, .used_event = 0 };
-    q.used = .{ .flags = 0, .idx = 0, .ring = [_]VirtqUsedElem{.{ .id = 0, .len = 0 }} ** descriptor_count, .avail_event = 0 };
+    q.avail = .{ .flags = 0, .idx = 0, .ring = @as([descriptor_count]u16, @splat(@as(u16, 0))), .used_event = 0 };
+    q.used = .{ .flags = 0, .idx = 0, .ring = @as([descriptor_count]VirtqUsedElem, @splat(@as(VirtqUsedElem, .{ .id = 0, .len = 0 }))), .avail_event = 0 };
     mmu.clean_dcache_range(@intFromPtr(&q.used), @sizeOf(VirtqUsed));
     const desc = mmu.to_phys(@intFromPtr(&q.desc));
     const avail = mmu.to_phys(@intFromPtr(&q.avail));
@@ -485,7 +485,7 @@ pub fn init() bool {
     fs_ready = true;
 
     fs_init_stage = 9; // FUSE_INIT request/reply transport
-    var init_in: [16]u8 = [_]u8{0} ** 16;
+    var init_in: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
     write32(&init_in, 0, 7);
     write32(&init_in, 4, 31);
     write32(&init_in, 8, @intCast(max_io));
@@ -615,14 +615,14 @@ fn metadata_failure() metadata.Error {
 }
 
 fn attr_locked(node: u64) metadata.Error!metadata.Metadata {
-    const input = [_]u8{0} ** 16;
+    const input = @as([16]u8, @splat(@as(u8, 0)));
     const reply = transact(fuse_getattr, node, &input) orelse return metadata_failure();
     return metadata.decodeFuseGetattr(mount_identity, reply);
 }
 
 fn lookup_locked(parent: u64, name: []const u8) metadata.Error!metadata.Object {
     if (!directory.valid_name(name)) return error.InvalidPath;
-    var input: [directory.name_max + 1]u8 = .{0} ** (directory.name_max + 1);
+    var input: [directory.name_max + 1]u8 = @splat(0);
     @memcpy(input[0..name.len], name);
     const reply = transact(fuse_lookup, parent, input[0 .. name.len + 1]) orelse return metadata_failure();
     return adopt_entry_locked(reply);
@@ -767,7 +767,7 @@ fn probe_locked(parent: u64, name: []const u8) metadata.Error!metadata.Metadata 
 }
 
 fn release_fuse_handle_locked(node: u64, fuse_handle: u64) void {
-    var input: [24]u8 = .{0} ** 24;
+    var input: [24]u8 = @splat(0);
     write64(&input, 0, fuse_handle);
     if (transact(fuse_release, node, &input) == null) fs_ready = false;
 }
@@ -807,7 +807,7 @@ fn pin_create(_: *anyopaque, parent: metadata.Object, name: []const u8) metadata
         write32(&input, 4, 0);
         const reply = transact(fuse_mknod, parent.token, request) orelse return metadata_failure();
         created = try adopt_entry_locked(reply);
-        var open_input: [8]u8 = .{0} ** 8;
+        var open_input: [8]u8 = @splat(0);
         write32(&open_input, 0, open_write_only);
         const opened = transact(fuse_open, created.token, &open_input) orelse {
             const err = metadata_failure();
@@ -904,7 +904,7 @@ fn pin_open(_: *anyopaque, object: metadata.Object, access: metadata.Access) met
     defer fs_lock.unlock(saved);
     try live_locked(object);
     const slot = try free_handle_locked();
-    var input: [8]u8 = .{0} ** 8;
+    var input: [8]u8 = @splat(0);
     // FUSE opens this lookup-pinned inode, not its former name. Never
     // create/truncate, never O_RDWR for a read-only request.
     write32(&input, 0, if (access == .read) open_read_only else open_write_only);
@@ -926,7 +926,7 @@ pub fn contained_close(id: u16) metadata.Error!void {
     const saved = fs_lock.lock();
     defer fs_lock.unlock(saved);
     const handle = find_handle(id) orelse return error.StaleIdentity;
-    var input: [24]u8 = .{0} ** 24;
+    var input: [24]u8 = @splat(0);
     write64(&input, 0, handle.fuse_handle);
     _ = transact(fuse_release, handle.nodeid, &input) orelse return metadata_failure();
     handle.* = .{};
@@ -945,7 +945,7 @@ pub fn contained_read(id: u16, offset: u64, out: []u8) metadata.Error!usize {
     if (!handle.contained or handle.access != .read) return error.AccessDenied;
     const take = @min(out.len, max_io);
     if (take == 0) return 0;
-    var input: [40]u8 = .{0} ** 40;
+    var input: [40]u8 = @splat(0);
     write64(&input, 0, handle.fuse_handle);
     write64(&input, 8, offset);
     write32(&input, 16, @intCast(take));
@@ -1005,7 +1005,7 @@ pub const TestMetadataServer = struct {
         name: [32]u8 = undefined,
         name_len: usize = 0,
     };
-    var extras: [8]Extra = [_]Extra{.{}} ** 8;
+    var extras: [8]Extra = @as([8]Extra, @splat(@as(Extra, .{})));
     var next_node: u64 = 50;
     pub var mutations: usize = 0;
     pub var releases: usize = 0;
@@ -1015,7 +1015,7 @@ pub const TestMetadataServer = struct {
     pub fn start() void {
         std.debug.assert(builtin.is_test);
         reset_identity_nodes();
-        extras = [_]Extra{.{}} ** extras.len;
+        extras = @as([extras.len]Extra, @splat(@as(Extra, .{})));
         next_node = 50;
         mutations = 0;
         releases = 0;
@@ -1038,7 +1038,7 @@ pub const TestMetadataServer = struct {
         size = 4;
         mtime = 1_790_897_123;
         bytes = .{ 's', 'a', 'f', 'e' };
-        handles = [_]FileHandle{.{}} ** file_handle_count;
+        handles = @as([file_handle_count]FileHandle, @splat(@as(FileHandle, .{})));
         fs_ready = true;
         fs_initialized = true;
         test_exchange = exchange;
@@ -1053,7 +1053,7 @@ pub const TestMetadataServer = struct {
         fs_ready = false;
         fs_initialized = false;
         fs_minor = 0;
-        handles = [_]FileHandle{.{}} ** file_handle_count;
+        handles = @as([file_handle_count]FileHandle, @splat(@as(FileHandle, .{})));
     }
 
     pub fn transient_pins() usize {
@@ -1528,7 +1528,7 @@ test "B5 backend: full handle table or identity ledger refuses before any mutati
     defer c.release(dir);
     for (&handles) |*h| h.valid = true;
     try std.testing.expectError(error.HandleLimit, metadata.createFile(c.backend(), c.auth(), dir, "x"));
-    handles = [_]FileHandle{.{}} ** file_handle_count;
+    handles = @as([file_handle_count]FileHandle, @splat(@as(FileHandle, .{})));
     for (identity_nodes[identity_pin_count..], 0..) |*entry, i| {
         entry.* = .{ .node = 1000 + i, .pending = 0 };
         S.pins += 1;
@@ -1759,10 +1759,10 @@ pub fn metadata_snapshot(backend: metadata.Backend, auth: metadata.Authorizer, p
     if (before.kind != .directory) return error.NotDirectory;
     const saved = fs_lock.lock();
     defer fs_lock.unlock(saved);
-    var open_input: [8]u8 = .{0} ** 8;
+    var open_input: [8]u8 = @splat(0);
     const opened = transact(fuse_opendir, object.token, &open_input) orelse return metadata_failure();
     if (opened.len < 16) return error.InvalidMetadata;
-    var release: [24]u8 = .{0} ** 24;
+    var release: [24]u8 = @splat(0);
     write64(&release, 0, read64(opened, 0));
     var released = false;
     defer if (!released) {
@@ -1773,7 +1773,7 @@ pub fn metadata_snapshot(backend: metadata.Backend, auth: metadata.Authorizer, p
     while (true) {
         if (pages == directory.entry_max + 2) return error.TreeLimit;
         pages += 1;
-        var input: [40]u8 = .{0} ** 40;
+        var input: [40]u8 = @splat(0);
         write64(&input, 0, read64(&release, 0));
         write64(&input, 8, offset);
         write32(&input, 16, max_io);
@@ -1850,7 +1850,7 @@ fn cache_put(path: []const u8, nodeid: u64, mode: u32, size: u64) void {
     while (slot < nodes.len and nodes[slot].valid) : (slot += 1) {}
     if (slot == nodes.len) slot = 1 + (nodeid % (nodes.len - 1));
     nodes[slot] = .{
-        .path = [_]u8{0} ** cache_path_max,
+        .path = @as([cache_path_max]u8, @splat(@as(u8, 0))),
         .path_len = path.len,
         .nodeid = nodeid,
         .mode = mode,
@@ -1866,7 +1866,7 @@ fn cache_clear() void {
 
 fn lookup(parent: u64, name: []const u8, full_path: []const u8) ?Node {
     if (!directory.valid_name(name)) return null;
-    var payload: [max_path + 1]u8 = [_]u8{0} ** (max_path + 1);
+    var payload: [max_path + 1]u8 = @as([(max_path + 1)]u8, @splat(@as(u8, 0)));
     @memcpy(payload[0..name.len], name);
     const reply = transact(fuse_lookup, parent, payload[0 .. name.len + 1]) orelse return null;
     // fuse_entry_out: nodeid/generation/validity (40 B) + fuse_attr.
@@ -1876,7 +1876,7 @@ fn lookup(parent: u64, name: []const u8, full_path: []const u8) ?Node {
     const size = read64(reply, attr + 8);
     const mode = read32(reply, attr + 60);
     const node = Node{
-        .path = [_]u8{0} ** cache_path_max,
+        .path = @as([cache_path_max]u8, @splat(@as(u8, 0))),
         .path_len = 0, // Only cache_put materializes a bounded cache key.
         .nodeid = nodeid,
         .mode = mode,
@@ -1953,7 +1953,7 @@ fn resolve_parent(raw_path: []const u8) ?struct { parent: u64, name: []const u8 
 }
 
 fn getattr(nodeid: u64) ?Node {
-    var input: [16]u8 = [_]u8{0} ** 16;
+    var input: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
     const reply = transact(fuse_getattr, nodeid, &input) orelse return null;
     if (reply.len < 104) return null;
     const attr = 16;
@@ -1980,7 +1980,7 @@ fn find_handle(id: u16) ?*FileHandle {
 fn ensure_created(path: []const u8) u8 {
     if (resolve_path(path) != null) return st_ok;
     const parent = resolve_parent(path) orelse return status_from_error();
-    var input: [16 + max_path]u8 = [_]u8{0} ** (16 + max_path);
+    var input: [16 + max_path]u8 = @as([(16 + max_path)]u8, @splat(@as(u8, 0)));
     write32(&input, 0, file_type_regular | 0o644);
     write32(&input, 4, 0);
     write32(&input, 8, 0);
@@ -2015,7 +2015,7 @@ pub fn open(raw_path: []const u8, flags: u8, out_handle: *u16) u8 {
     }
     const node = resolve_path(raw_path) orelse return status_from_error();
     if ((node.mode & file_type_mask) == file_type_dir) return st_is_dir;
-    var input: [8]u8 = [_]u8{0} ** 8;
+    var input: [8]u8 = @as([8]u8, @splat(@as(u8, 0)));
     write32(&input, 0, open_read_write);
     if ((flags & 2) != 0) write32(&input, 0, open_read_write | open_append);
     const reply = transact(fuse_open, node.nodeid, &input) orelse return status_from_error();
@@ -2039,7 +2039,7 @@ pub fn close(id: u16) u8 {
     const saved = fs_lock.lock();
     defer fs_lock.unlock(saved);
     const handle = find_handle(id) orelse return st_handle;
-    var input: [24]u8 = [_]u8{0} ** 24;
+    var input: [24]u8 = @as([24]u8, @splat(@as(u8, 0)));
     write64(&input, 0, handle.fuse_handle);
     _ = transact(fuse_release, handle.nodeid, &input) orelse {
         handle.valid = false;
@@ -2054,7 +2054,7 @@ pub fn fsync(id: u16) u8 {
     const saved = fs_lock.lock();
     defer fs_lock.unlock(saved);
     const handle = find_handle(id) orelse return st_handle;
-    var input: [16]u8 = [_]u8{0} ** 16;
+    var input: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
     write64(&input, 0, handle.fuse_handle);
     _ = transact(fuse_fsync, handle.nodeid, &input) orelse return status_from_error();
     return st_ok;
@@ -2067,7 +2067,7 @@ pub fn write(id: u16, data: []const u8, written: *u64) u8 {
     defer fs_lock.unlock(saved);
     const handle = find_handle(id) orelse return st_handle;
     if (handle.contained and handle.access != .write) return st_access;
-    var input: [40 + max_io]u8 = [_]u8{0} ** (40 + max_io);
+    var input: [40 + max_io]u8 = @as([(40 + max_io)]u8, @splat(@as(u8, 0)));
     write64(&input, 0, handle.fuse_handle);
     write64(&input, 8, handle.cursor);
     write32(&input, 16, @intCast(data.len));
@@ -2085,7 +2085,7 @@ pub fn truncate(id: u16, size: u64) u8 {
     const saved = fs_lock.lock();
     defer fs_lock.unlock(saved);
     const handle = find_handle(id) orelse return st_handle;
-    var input: [88]u8 = [_]u8{0} ** 88;
+    var input: [88]u8 = @as([88]u8, @splat(@as(u8, 0)));
     write32(&input, 0, fattr_size | fattr_fh);
     write64(&input, 8, handle.fuse_handle);
     write64(&input, 16, size);
@@ -2101,24 +2101,24 @@ pub fn read_chunk(raw_path: []const u8, offset: u64, out: []u8) ReadChunkResult 
     defer fs_lock.unlock(saved);
     const node = resolve_path(raw_path) orelse return .{ .status = status_from_error() };
     if ((node.mode & file_type_mask) == file_type_dir) return .{ .status = st_is_dir };
-    var open_in: [8]u8 = [_]u8{0} ** 8;
+    var open_in: [8]u8 = @as([8]u8, @splat(@as(u8, 0)));
     const opened = transact(fuse_open, node.nodeid, &open_in) orelse return .{ .status = status_from_error() };
     if (opened.len < 8) return .{ .status = st_host_error };
     const fh = read64(opened, 0);
-    var input: [40]u8 = [_]u8{0} ** 40;
+    var input: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     write64(&input, 0, fh);
     write64(&input, 8, offset);
     write32(&input, 16, @intCast(@min(@min(out.len, fs_max_write), max_io)));
     const reply = transact(fuse_read, node.nodeid, &input) orelse {
         const status = status_from_error();
-        var release: [24]u8 = [_]u8{0} ** 24;
+        var release: [24]u8 = @as([24]u8, @splat(@as(u8, 0)));
         write64(&release, 0, fh);
         _ = transact(fuse_release, node.nodeid, &release);
         return .{ .status = status };
     };
     const take = @min(reply.len, out.len);
     @memcpy(out[0..take], reply[0..take]);
-    var release: [24]u8 = [_]u8{0} ** 24;
+    var release: [24]u8 = @as([24]u8, @splat(@as(u8, 0)));
     write64(&release, 0, fh);
     _ = transact(fuse_release, node.nodeid, &release);
     return .{ .status = st_ok, .bytes = take };
@@ -2146,11 +2146,11 @@ pub fn list(raw_path: []const u8, out: []DirectoryEntry, out_count: *usize) u8 {
     const node = resolve_path(path) orelse return status_from_error();
     if ((node.mode & file_type_mask) != file_type_dir) return st_is_dir;
 
-    var open_in: [8]u8 = [_]u8{0} ** 8;
+    var open_in: [8]u8 = @as([8]u8, @splat(@as(u8, 0)));
     const opened = transact(fuse_opendir, node.nodeid, &open_in) orelse return status_from_error();
     if (opened.len < 8) return st_host_error;
     const fh = read64(opened, 0);
-    var release: [24]u8 = [_]u8{0} ** 24;
+    var release: [24]u8 = @as([24]u8, @splat(@as(u8, 0)));
     write64(&release, 0, fh);
     var released = false;
     defer if (!released) {
@@ -2158,7 +2158,7 @@ pub fn list(raw_path: []const u8, out: []DirectoryEntry, out_count: *usize) u8 {
     };
     var offset: u64 = 0;
     while (out_count.* < out.len) {
-        var input: [40]u8 = [_]u8{0} ** 40;
+        var input: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
         write64(&input, 0, fh);
         write64(&input, 8, offset);
         write32(&input, 16, @intCast(max_io));
@@ -2169,7 +2169,7 @@ pub fn list(raw_path: []const u8, out: []DirectoryEntry, out_count: *usize) u8 {
         // like `snapshot`/`contained_read` do; never memcpy host bytes
         // past this stack buffer.
         if (reply.len > max_io) return st_host_error;
-        var page: [max_io]u8 = [_]u8{0} ** max_io;
+        var page: [max_io]u8 = @as([max_io]u8, @splat(@as(u8, 0)));
         @memcpy(page[0..reply.len], reply);
         const body = page[0..reply.len];
         var at: usize = 0;
@@ -2218,7 +2218,7 @@ pub fn list(raw_path: []const u8, out: []DirectoryEntry, out_count: *usize) u8 {
 }
 
 fn directory_stamp(nodeid: u64) ?[24]u8 {
-    var input: [16]u8 = .{0} ** 16;
+    var input: [16]u8 = @splat(0);
     const reply = transact(fuse_getattr, nodeid, &input) orelse return null;
     if (reply.len < 104) return null;
     var stamp: [24]u8 = undefined;
@@ -2272,10 +2272,10 @@ pub fn snapshot(path: []const u8, out: *directory.Snapshot) u8 {
     const node = resolve_path(path) orelse return status_from_error();
     if ((node.mode & file_type_mask) != file_type_dir) return st_is_dir;
     const before = directory_stamp(node.nodeid) orelse return st_host_error;
-    var open_in: [8]u8 = .{0} ** 8;
+    var open_in: [8]u8 = @splat(0);
     const opened = transact(fuse_opendir, node.nodeid, &open_in) orelse return status_from_error();
     if (opened.len < 8) return st_host_error;
-    var release: [24]u8 = .{0} ** 24;
+    var release: [24]u8 = @splat(0);
     write64(&release, 0, read64(opened, 0));
     var released = false;
     defer if (!released) {
@@ -2287,7 +2287,7 @@ pub fn snapshot(path: []const u8, out: *directory.Snapshot) u8 {
     while (true) {
         if (pages == directory.entry_max + 2) return st_host_error;
         pages += 1;
-        var input: [40]u8 = .{0} ** 40;
+        var input: [40]u8 = @splat(0);
         write64(&input, 0, read64(&release, 0));
         write64(&input, 8, offset);
         write32(&input, 16, max_io);
@@ -2311,14 +2311,14 @@ pub fn snapshot(path: []const u8, out: *directory.Snapshot) u8 {
 test "B2: FUSE pages retain opaque continuation and names without clipping" {
     var snapshot_rows = directory.Snapshot{};
     var offset: u64 = 0;
-    var page: [280]u8 = .{0} ** 280;
+    var page: [280]u8 = @splat(0);
     write64(&page, 8, 0x1234);
     write32(&page, 16, 255);
     @memset(page[24..279], 'x');
     try std.testing.expectEqual(st_ok, snapshot_page(&page, &offset, null, &snapshot_rows));
     try std.testing.expectEqual(@as(u64, 0x1234), offset);
     try std.testing.expectEqual(@as(u16, 255), snapshot_rows.entries[0].name_len);
-    try std.testing.expectEqualStrings(&([_]u8{'x'} ** 255), snapshot_rows.entries[0].name[0..255]);
+    try std.testing.expectEqualStrings(&(@as([255]u8, @splat(@as(u8, 'x')))), snapshot_rows.entries[0].name[0..255]);
     write64(&page, 8, 0x5678);
     write32(&page, 16, 4);
     @memcpy(page[24..28], "next");
@@ -2331,7 +2331,7 @@ test "B2: FUSE pages retain opaque continuation and names without clipping" {
 test "B2: malformed, duplicate, non-progressing and overlong FUSE rows refuse" {
     var snapshot_rows = directory.Snapshot{};
     var offset: u64 = 0;
-    var page: [280]u8 = .{0} ** 280;
+    var page: [280]u8 = @splat(0);
     write64(&page, 8, 1);
     write32(&page, 16, 4);
     @memcpy(page[24..28], "file");
@@ -2352,7 +2352,7 @@ pub fn mkdir(raw_path: []const u8) u8 {
     const saved = fs_lock.lock();
     defer fs_lock.unlock(saved);
     const parent = resolve_parent(raw_path) orelse return status_from_error();
-    var input: [8 + max_path]u8 = [_]u8{0} ** (8 + max_path);
+    var input: [8 + max_path]u8 = @as([(8 + max_path)]u8, @splat(@as(u8, 0)));
     write32(&input, 0, file_type_dir | 0o755);
     write32(&input, 4, 0);
     @memcpy(input[8..][0..parent.name.len], parent.name);
@@ -2368,7 +2368,7 @@ pub fn delete(raw_path: []const u8) u8 {
     defer fs_lock.unlock(saved);
     const parent = resolve_parent(raw_path) orelse return status_from_error();
     const existing = resolve_path(raw_path) orelse return status_from_error();
-    var name: [max_path + 1]u8 = [_]u8{0} ** (max_path + 1);
+    var name: [max_path + 1]u8 = @as([(max_path + 1)]u8, @splat(@as(u8, 0)));
     @memcpy(name[0..parent.name.len], parent.name);
     const opcode = if ((existing.mode & file_type_mask) == file_type_dir) fuse_rmdir else fuse_unlink;
     _ = transact(opcode, parent.parent, name[0 .. parent.name.len + 1]) orelse return status_from_error();
@@ -2386,7 +2386,7 @@ pub fn rename(raw_from: []const u8, raw_to: []const u8, mode: RenameMode) u8 {
     if (mode == .preserve_existing and fs_minor < 23) return st_unsupported;
     const from = resolve_parent(raw_from) orelse return status_from_error();
     const to = resolve_parent(raw_to) orelse return status_from_error();
-    var input: [16 + max_path * 2 + 2]u8 = [_]u8{0} ** (16 + max_path * 2 + 2);
+    var input: [16 + max_path * 2 + 2]u8 = @as([(16 + max_path * 2 + 2)]u8, @splat(@as(u8, 0)));
     const len = encode_rename(to.parent, from.name, to.name, mode, &input) orelse return st_host_error;
     const opcode = if (mode == .replace) fuse_rename else fuse_rename2;
     _ = transact(opcode, from.parent, input[0..len]) orelse return status_from_error();
@@ -2462,7 +2462,7 @@ test "virtio_fs: virtio-fs identity and bounded wire helpers" {
     try std.testing.expectEqual(@as(u32, 0x105a), virtio_fs_did);
     try std.testing.expectEqual(@as(u16, 8), highest_power_of_two_at_most(15));
     try std.testing.expectEqual(@as(u16, 16), highest_power_of_two_at_most(128));
-    var bytes = [_]u8{0} ** 8;
+    var bytes = @as([8]u8, @splat(@as(u8, 0)));
     write64(&bytes, 0, 0x0123456789abcdef);
     try std.testing.expectEqual(@as(u64, 0x0123456789abcdef), read64(&bytes, 0));
 }
@@ -2479,7 +2479,7 @@ test "virtio_fs: FUSE request and reply framing" {
     try std.testing.expectEqualSlices(u8, &payload, request[fuse_in_header_len..]);
     try std.testing.expect(encode_fuse_request(fuse_lookup, 1, 1, &payload, request[0..43]) == null);
 
-    var reply: [fuse_out_header_len + 3]u8 = [_]u8{0} ** (fuse_out_header_len + 3);
+    var reply: [fuse_out_header_len + 3]u8 = @as([(fuse_out_header_len + 3)]u8, @splat(@as(u8, 0)));
     write32(&reply, 0, @intCast(reply.len));
     write64(&reply, 8, 0x1122334455667788);
     @memcpy(reply[fuse_out_header_len..], "ok\n");
@@ -2536,10 +2536,10 @@ test "virtio_fs: paths refuse traversal and keep host-relative names" {
     defer {
         fs_initialized = false;
         fs_ready = false;
-        nodes = [_]Node{.{}} ** node_cache_count;
+        nodes = @as([node_cache_count]Node, @splat(@as(Node, .{})));
     }
     nodes[1] = .{
-        .path = [_]u8{0} ** cache_path_max,
+        .path = @as([cache_path_max]u8, @splat(@as(u8, 0))),
         .path_len = "SELFTEST".len,
         .nodeid = 2,
         .mode = file_type_dir | 0o755,

@@ -114,7 +114,7 @@ test "sha384: 1,000,000 bytes of 'a' (length padding across many blocks)" {
     // Exactly 1,000,000 bytes (one million, as Python's `b"a"*1000000`
     // generated the expected digest) - not 1 MiB.
     var h = Sha384.init();
-    const chunk = [_]u8{'a'} ** 1000;
+    const chunk = @as([1000]u8, @splat(@as(u8, 'a')));
     var i: usize = 0;
     while (i < 1000) : (i += 1) h.update(&chunk);
     var out: [48]u8 = undefined;

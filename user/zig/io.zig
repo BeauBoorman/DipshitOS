@@ -33,15 +33,15 @@ pub fn Backend(comptime Driver: type) type {
         pub const vtable: Io.VTable = table: {
             @setEvalBranchQuota(100000);
             const names = @import("operations.zig").names;
-            const fields = @typeInfo(Io.VTable).@"struct".fields;
+            const fields = std.meta.fieldNames(Io.VTable);
             if (fields.len != names.len) @compileError("UnreviewedIoVTable");
             var table: Io.VTable = undefined;
-            for (fields, names) |field, name| {
-                if (!std.mem.eql(u8, field.name, name)) @compileError("UnreviewedIoVTable:" ++ field.name);
+            for (fields, names) |field_name, name| {
+                if (!std.mem.eql(u8, field_name, name)) @compileError("UnreviewedIoVTable:" ++ field_name);
                 @field(table, name) = if (@hasDecl(Self, name))
                     @field(Self, name)
                 else
-                    refusals.function(Driver, name, field.type);
+                    refusals.function(Driver, name, @FieldType(Io.VTable, name));
             }
             break :table table;
         };
@@ -704,11 +704,11 @@ test "native Io: short writes, splats, empty header, sequential EOF, bounded rea
     Mock.maximum = 17;
     var buffer: [29]u8 = undefined;
     var writer = file.writer(io, &buffer); // default positional path falls back honestly
-    try writer.interface.writeAll("x" ** 5000);
+    try writer.interface.writeAll(&@as([5000:0]u8, @splat("x"[0])));
     try writer.interface.flush();
     try file.writeStreamingAll(io, "end");
     try std.testing.expectEqual(@as(usize, 5003), Mock.output_len);
-    try std.testing.expectEqualStrings("x" ** 5000 ++ "end", Mock.output[0..Mock.output_len]);
+    try std.testing.expectEqualStrings(&@as([5000:0]u8, @splat("x"[0])) ++ "end", Mock.output[0..Mock.output_len]);
     var vectors = [_][]const u8{ "", "ab", "z" };
     try writer.interface.writeSplatAll(&vectors, 3);
     try writer.interface.flush();
@@ -722,13 +722,13 @@ test "native Io: short writes, splats, empty header, sequential EOF, bounded rea
     const input = try platform.cwd().openFile(io, "input", .{});
     const empty_write = try io.operate(.{ .file_write_streaming = .{ .file = input, .data = &.{} } });
     try std.testing.expectError(error.NotOpenForWriting, empty_write.file_write_streaming);
-    Mock.input = "a" ** 5000;
+    Mock.input = &@as([5000:0]u8, @splat("a"[0]));
     const out = try std.testing.allocator.alloc(u8, 5000);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(Mock.input, try readBounded(input, io, out));
     input.close(io);
     const over = try platform.cwd().openFile(io, "input", .{});
-    Mock.input = "a" ** 5001;
+    Mock.input = &@as([5001:0]u8, @splat("a"[0]));
     Mock.input_at = 0;
     try std.testing.expectError(error.InputLimit, readBounded(over, io, out));
     over.close(io);
@@ -807,16 +807,16 @@ test "native Io: path component and full limits reject escapes without clipping"
     var path_buffer: [64]u8 = undefined;
     const cwd = platform.cwd();
     try std.testing.expectEqualStrings("/host/a/b", try TestBackend.path(cwd, "a/b", &path_buffer));
-    try std.testing.expectEqual(@as(usize, 64), (try TestBackend.path(cwd, "x" ** 31 ++ "/" ++ "y" ** 26, &path_buffer)).len);
-    try std.testing.expectError(error.NameTooLong, TestBackend.path(cwd, "x" ** 31 ++ "/" ++ "y" ** 27, &path_buffer));
-    try std.testing.expectError(error.NameTooLong, TestBackend.path(cwd, "x" ** 32, &path_buffer));
+    try std.testing.expectEqual(@as(usize, 64), (try TestBackend.path(cwd, &@as([31:0]u8, @splat("x"[0])) ++ "/" ++ &@as([26:0]u8, @splat("y"[0])), &path_buffer)).len);
+    try std.testing.expectError(error.NameTooLong, TestBackend.path(cwd, &@as([31:0]u8, @splat("x"[0])) ++ "/" ++ &@as([27:0]u8, @splat("y"[0])), &path_buffer));
+    try std.testing.expectError(error.NameTooLong, TestBackend.path(cwd, &@as([32:0]u8, @splat("x"[0])), &path_buffer));
     for ([_][]const u8{ "", "a/../b", "./a", "a//b", "a/", "a\x00b", "host:x", "a\\b" }) |name|
         try std.testing.expectError(error.BadPathName, TestBackend.path(cwd, name, &path_buffer));
     for ([_][]const u8{ "/usb/x", "/dev/tty", "/hostile/x", "//host/x" }) |name|
         try std.testing.expectError(error.AccessDenied, TestBackend.path(cwd, name, &path_buffer));
     Mock.reset();
     var backend: TestBackend = .{};
-    try std.testing.expectError(error.NameTooLong, cwd.openFile(backend.io(), "x" ** 32, .{}));
+    try std.testing.expectError(error.NameTooLong, cwd.openFile(backend.io(), &@as([32:0]u8, @splat("x"[0])), .{}));
     try std.testing.expectEqual(@as(usize, 0), Mock.calls);
 }
 

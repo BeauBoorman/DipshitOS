@@ -121,7 +121,7 @@ pub const FilterResult = struct {
 pub const ActionRegistry = struct {
     commands: [max_total_commands]Command = undefined,
     command_count: usize = 0,
-    active_app_title: [32]u8 = [_]u8{0} ** 32,
+    active_app_title: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     active_app_title_len: usize = 0,
     next_cmd_id: u16 = 1,
 

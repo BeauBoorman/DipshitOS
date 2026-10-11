@@ -40,15 +40,15 @@ pub const max_messages: usize = 8;
 pub const message_max: usize = 64;
 
 var storage: [process.max_processes][max_messages][message_max]u8 =
-    [_][max_messages][message_max]u8{[_][message_max]u8{[_]u8{0} ** message_max} ** max_messages} ** process.max_processes;
+    @as([process.max_processes][max_messages][message_max]u8, @splat(@as([max_messages][message_max]u8, undefined)));
 var lens: [process.max_processes][max_messages]u8 =
-    [_][max_messages]u8{[_]u8{0} ** max_messages} ** process.max_processes;
-var head: [process.max_processes]usize = [_]usize{0} ** process.max_processes;
-var count: [process.max_processes]usize = [_]usize{0} ** process.max_processes;
+    @as([process.max_processes][max_messages]u8, @splat(@as([max_messages]u8, @as([max_messages]u8, @splat(@as(u8, 0))))));
+var head: [process.max_processes]usize = @as([process.max_processes]usize, @splat(@as(usize, 0)));
+var count: [process.max_processes]usize = @as([process.max_processes]usize, @splat(@as(usize, 0)));
 /// Messages enqueued into each process's ring (by any sender targeting it).
-var sent_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
+var sent_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
 /// Messages dequeued from each process's ring (by that process's recv).
-var recv_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
+var recv_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
 
 fn in_range(pid: usize) bool {
     return pid < process.max_processes;
@@ -206,8 +206,8 @@ test "mailbox: send/peek respect the 64-byte slot bound and truncate" {
     // longer is refused by the module's defensive bound (the syscall layer
     // truncates BEFORE calling send — the module never stores a partial
     // oversized message from a caller bug).
-    try std.testing.expectEqual(SendResult.ok, send(0, "x" ** message_max));
-    try std.testing.expectEqual(SendResult.ok, send(0, "y" ** (message_max + 1))); // defensive no-op
+    try std.testing.expectEqual(SendResult.ok, send(0, &@as([message_max:0]u8, @splat("x"[0]))));
+    try std.testing.expectEqual(SendResult.ok, send(0, &@as([(message_max + 1):0]u8, @splat("y"[0])))); // defensive no-op
     try std.testing.expectEqual(@as(usize, 1), pending(0));
     const msg = message(0, 0).?;
     try std.testing.expectEqual(@as(usize, message_max), msg.len);
@@ -241,7 +241,7 @@ test "mailbox: reset clears a ring and its counters (recycled process ids)" {
 test "mailbox: out-of-range pids are defensive no-ops" {
     init();
     try std.testing.expectEqual(SendResult.ok, send(process.max_processes, "x"));
-    var junk: [message_max]u8 = [_]u8{0} ** message_max;
+    var junk: [message_max]u8 = @as([message_max]u8, @splat(@as(u8, 0)));
     try std.testing.expect(peek(process.max_processes, &junk, 1) == null);
     drop(process.max_processes);
     try std.testing.expectEqual(@as(usize, 0), pending(process.max_processes));

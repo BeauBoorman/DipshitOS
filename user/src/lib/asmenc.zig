@@ -241,7 +241,7 @@ pub fn parse_immediate(token: []const u8) ?u64 {
 }
 
 pub const Operands = struct {
-    items: [4][]const u8 = [_][]const u8{""} ** 4,
+    items: [4][]const u8 = @as([4][]const u8, @splat(@as([]const u8, ""))),
     count: usize = 0,
     pub fn get(self: @This(), i: usize) []const u8 {
         return self.items[i];

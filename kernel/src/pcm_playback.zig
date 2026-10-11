@@ -139,7 +139,7 @@ pub const Fixture = struct {
 };
 const caps = pcm.Capabilities{ .present = true, .output = true, .queue_descriptors = 32, .formats = &.{.float32}, .rates_hz = &.{48000}, .channels_min = 1, .channels_max = 2 };
 const params = pcm.Params{ .format = .float32, .rate_hz = 48000, .channels = 2 };
-const samples = [_]u8{0x5a} ** pcm.period_bytes;
+const samples = @as([pcm.period_bytes]u8, @splat(@as(u8, 0x5a)));
 
 test "PCM pump: continuous 128 KiB, eight slots, one START/STOP/RELEASE" {
     var device = Fixture{};

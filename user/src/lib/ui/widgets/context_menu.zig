@@ -74,7 +74,7 @@ pub const MenuSection = struct {
 };
 
 pub const MenuBuilder = struct {
-    items: [16]MenuItemSpec = [_]MenuItemSpec{.{}} ** 16,
+    items: [16]MenuItemSpec = @as([16]MenuItemSpec, @splat(@as(MenuItemSpec, .{}))),
     count: usize = 0,
 
     pub fn init() MenuBuilder {

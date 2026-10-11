@@ -172,7 +172,7 @@ test "hkdf/512: basic, long, empty and a 256-byte output (generated)" {
     try std.testing.expectEqualSlices(u8, &(try hex("f5fa02b18298a72a8c23898a8703472c6eb179dc204c03425c970e3b164bf90fff22d04836d0e2343bac")), &okm2);
 
     // 256 bytes exceeds one hash block: exercises the counter loop end to end.
-    const ikm3 = [_]u8{'a'} ** 64;
+    const ikm3 = @as([64]u8, @splat(@as(u8, 'a')));
     var prk3: [64]u8 = undefined;
     Sha512.extract(&prk3, "salt", &ikm3);
     try std.testing.expectEqualSlices(u8, &(try hex("1e8649236bc71a06f0166c7a1b253473f0d48e8a43244751f8ad37870d4e47c0b67555dc34dccd3168c4f4ee2c59b9434b8340edd0897cc70a8bc969c88a8308")), &prk3);

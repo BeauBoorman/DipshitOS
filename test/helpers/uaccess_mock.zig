@@ -49,7 +49,7 @@ pub const FaultMode = union(enum) {
 pub const MockUserSpace = struct {
     const max_regions = 16;
 
-    regions: [max_regions]Region = [_]Region{.{ .base = 0, .len = 0, .perm = .none }} ** max_regions,
+    regions: [max_regions]Region = @as([max_regions]Region, @splat(@as(Region, .{ .base = 0, .len = 0, .perm = .none }))),
     region_count: usize = 0,
 
     fault_mode: FaultMode = .none,
@@ -181,7 +181,7 @@ test "uaccess_mock: basic read-write regions" {
     var uspace = MockUserSpace.init();
 
     var text_backing = [_]u8{ 'H', 'e', 'l', 'l', 'o' };
-    var stack_backing: [64]u8 = [_]u8{0} ** 64;
+    var stack_backing: [64]u8 = @as([64]u8, @splat(@as(u8, 0)));
 
     try std.testing.expect(uspace.add_const_region(0x400000, &text_backing));
     try std.testing.expect(uspace.add_region(0x800000, &stack_backing, .read_write));
@@ -204,7 +204,7 @@ test "uaccess_mock: basic read-write regions" {
 
 test "uaccess_mock: boundary and fault conditions" {
     var uspace = MockUserSpace.init();
-    var backing: [16]u8 = [_]u8{0} ** 16;
+    var backing: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
     _ = uspace.add_region(0x1000, &backing, .read_write);
 
     var buf: [4]u8 = undefined;

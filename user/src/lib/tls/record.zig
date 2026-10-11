@@ -205,8 +205,8 @@ test "record: RFC 8448 client application_data record decrypts to the published 
 }
 
 test "record: plaintext padding is stripped and the type is the last non-zero byte" {
-    const key = [_]u8{0x0B} ** 16;
-    const iv = [_]u8{0x0C} ** 12;
+    const key = @as([16]u8, @splat(@as(u8, 0x0B)));
+    const iv = @as([12]u8, @splat(@as(u8, 0x0C)));
     var out: [max_plaintext]u8 = undefined;
 
     // A payload that ends in zero bytes must survive: the parser strips
@@ -222,8 +222,8 @@ test "record: plaintext padding is stripped and the type is the last non-zero by
 }
 
 test "record: round-trips every content type and fails closed on tampering" {
-    const key = [_]u8{0x42} ** 16;
-    const iv = [_]u8{0x24} ** 12;
+    const key = @as([16]u8, @splat(@as(u8, 0x42)));
+    const iv = @as([12]u8, @splat(@as(u8, 0x24)));
     var buf: [512]u8 = undefined;
     var back: [512]u8 = undefined;
     const payload = "handshake or application data, either way";
@@ -275,8 +275,8 @@ test "record: nonce is iv XOR seq in the low 8 bytes" {
 }
 
 test "record: the full 2^14 plaintext works and larger is rejected" {
-    const key = [_]u8{0x77} ** 16;
-    const iv = [_]u8{0x88} ** 12;
+    const key = @as([16]u8, @splat(@as(u8, 0x77)));
+    const iv = @as([12]u8, @splat(@as(u8, 0x88)));
     var out: [max_plaintext + 1 + 16 + header_len]u8 = undefined;
     var big: [max_plaintext]u8 = undefined;
     @memset(&big, 0x5A);

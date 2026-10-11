@@ -175,7 +175,7 @@ test "sha256: streaming across every chunk boundary equals one-shot" {
 
 test "sha256: FIPS 180-4 one million 'a' (streaming)" {
     var h = Sha256.init();
-    const block = [_]u8{'a'} ** 1000;
+    const block = @as([1000]u8, @splat(@as(u8, 'a')));
     for (0..1000) |_| h.update(&block);
     var out: [32]u8 = undefined;
     h.final(&out);

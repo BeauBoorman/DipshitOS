@@ -258,7 +258,7 @@ pub const Window = struct {
     /// `title` points here when a dynamic title is set; otherwise it
     /// points to a static string literal. 64 bytes — enough for "NOTEPAD -
     /// filename.txt (*)" plus room.
-    title_buf: [64]u8 = [_]u8{0} ** 64,
+    title_buf: [64]u8 = @as([64]u8, @splat(@as(u8, 0))),
     title_len: u8 = 0,
     /// M37 DQ2 (issue #840): tab-group fact mirrored from the WM's
     /// validated ATTACH_TAB/DETACH_TAB calls (the WM owns grouping and
@@ -682,18 +682,18 @@ pub var tile_master_side: bool = true;
 pub const tile_master_pct: u32 = 667; // per mille (66.7%)
 /// M21 W3: per-window minimized state. When a window is minimized,
 /// its previous rect is saved here for restore.
-pub var minimize_prev_x: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var minimize_prev_y: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var minimize_prev_w: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var minimize_prev_h: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var minimize_prev_valid: [user_windows_max]bool = [_]bool{false} ** user_windows_max;
+pub var minimize_prev_x: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var minimize_prev_y: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var minimize_prev_w: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var minimize_prev_h: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var minimize_prev_valid: [user_windows_max]bool = @as([user_windows_max]bool, @splat(@as(bool, false)));
 
 /// M21 W6: per-window pre-maximize rect storage.
-pub var pre_max_x: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var pre_max_y: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var pre_max_w: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var pre_max_h: [user_windows_max]u32 = [_]u32{0} ** user_windows_max;
-pub var pre_max_valid: [user_windows_max]bool = [_]bool{false} ** user_windows_max;
+pub var pre_max_x: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var pre_max_y: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var pre_max_w: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var pre_max_h: [user_windows_max]u32 = @as([user_windows_max]u32, @splat(@as(u32, 0)));
+pub var pre_max_valid: [user_windows_max]bool = @as([user_windows_max]bool, @splat(@as(bool, false)));
 
 /// M21 W7: fullscreen state — BSS, no heap.
 pub var fullscreen_active: bool = false;
@@ -729,8 +729,8 @@ pub const notify_max: usize = 10;
 pub const notify_text_max: usize = 280;
 pub const notify_dismiss_ticks: u32 = 5;
 pub var notify_texts: [notify_max][notify_text_max]u8 = undefined;
-pub var notify_lens: [notify_max]usize = [_]usize{0} ** notify_max;
-pub var notify_levels: [notify_max]u8 = [_]u8{0} ** notify_max;
+pub var notify_lens: [notify_max]usize = @as([notify_max]usize, @splat(@as(usize, 0)));
+pub var notify_levels: [notify_max]u8 = @as([notify_max]u8, @splat(@as(u8, 0)));
 pub var notify_head: usize = 0;
 pub var notify_count: usize = 0;
 
@@ -739,7 +739,7 @@ pub var notify_count: usize = 0;
 pub var notif_center_open: bool = false;
 pub const notif_center_w: u32 = 300;
 pub const notif_center_h: u32 = 400;
-pub var notify_ticks: [notify_max]u32 = [_]u32{0} ** notify_max;
+pub var notify_ticks: [notify_max]u32 = @as([notify_max]u32, @splat(@as(u32, 0)));
 
 /// M27 G6: tooltip state — BSS, no heap. M32 WMS8 Gate 1 (claim 4270): the
 /// dwell-decision is gone — the WM owns WHEN a tooltip shows via TOOLTIP
@@ -2485,7 +2485,7 @@ pub fn alt_tab_wm_commit(id: u8) bool {
 /// True while the overview grid is on screen.
 pub var overview_open: bool = false;
 /// Snapshot of current-workspace user-window ids taken at enter.
-pub var overview_ids: [user_windows_max]u8 = [_]u8{0} ** user_windows_max;
+pub var overview_ids: [user_windows_max]u8 = @as([user_windows_max]u8, @splat(@as(u8, 0)));
 /// Live entries in `overview_ids`.
 pub var overview_n: usize = 0;
 

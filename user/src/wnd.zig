@@ -561,7 +561,7 @@ const MirrorWin = struct {
 };
 
 /// The mirror table (id 2..9 -> slots 0..7).
-var mirrors: [max_user_windows]MirrorWin = [_]MirrorWin{.{}} ** max_user_windows;
+var mirrors: [max_user_windows]MirrorWin = @as([max_user_windows]MirrorWin, @splat(@as(MirrorWin, .{})));
 // WMS8 Gate 4 (issue #628): the unsaved-changes dialog open state the WM
 // tracks to route dialog-button clicks (the kernel's open state is the
 // applied truth; this is the WM's decision-side mirror).
@@ -748,13 +748,13 @@ pub fn render_wallpaper_root() void {
 pub const AppAction = struct {
     owner_id: u8 = 0,
     section: u8 = 2,
-    label: [32]u8 = [_]u8{0} ** 32,
+    label: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     label_len: usize = 0,
-    verb: [24]u8 = [_]u8{0} ** 24,
+    verb: [24]u8 = @as([24]u8, @splat(@as(u8, 0))),
     verb_len: usize = 0,
 };
 
-var app_actions: [8]AppAction = [_]AppAction{.{}} ** 8;
+var app_actions: [8]AppAction = @as([8]AppAction, @splat(@as(AppAction, .{})));
 var app_actions_count: usize = 0;
 
 pub const god_menu_w: u32 = 488;
@@ -784,12 +784,12 @@ const mascot_qoi_bytes = @embedFile("lib/fixtures/qoi/mascot_24x24.qoi");
 pub const god_menu_manifest_max: usize = sexiburger.manifest_buf_max;
 
 var god_menu_manifest_buf: [god_menu_manifest_max]u8 = undefined;
-var god_menu_app_verbs: [sexiburger.menu_apps_max][24]u8 = [_][24]u8{[_]u8{0} ** 24} ** sexiburger.menu_apps_max;
-var god_menu_app_verb_lens: [sexiburger.menu_apps_max]usize = [_]usize{0} ** sexiburger.menu_apps_max;
-var god_menu_app_bins: [sexiburger.menu_apps_max][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** sexiburger.menu_apps_max;
-var god_menu_app_bin_lens: [sexiburger.menu_apps_max]usize = [_]usize{0} ** sexiburger.menu_apps_max;
-var god_menu_app_labels: [sexiburger.menu_apps_max][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** sexiburger.menu_apps_max;
-var god_menu_app_label_lens: [sexiburger.menu_apps_max]usize = [_]usize{0} ** sexiburger.menu_apps_max;
+var god_menu_app_verbs: [sexiburger.menu_apps_max][24]u8 = @as([sexiburger.menu_apps_max][24]u8, @splat(@as([24]u8, @as([24]u8, @splat(@as(u8, 0))))));
+var god_menu_app_verb_lens: [sexiburger.menu_apps_max]usize = @as([sexiburger.menu_apps_max]usize, @splat(@as(usize, 0)));
+var god_menu_app_bins: [sexiburger.menu_apps_max][16]u8 = @as([sexiburger.menu_apps_max][16]u8, @splat(@as([16]u8, @as([16]u8, @splat(@as(u8, 0))))));
+var god_menu_app_bin_lens: [sexiburger.menu_apps_max]usize = @as([sexiburger.menu_apps_max]usize, @splat(@as(usize, 0)));
+var god_menu_app_labels: [sexiburger.menu_apps_max][32]u8 = @as([sexiburger.menu_apps_max][32]u8, @splat(@as([32]u8, @as([32]u8, @splat(@as(u8, 0))))));
+var god_menu_app_label_lens: [sexiburger.menu_apps_max]usize = @as([sexiburger.menu_apps_max]usize, @splat(@as(usize, 0)));
 var god_menu_app_count: usize = 0;
 
 /// Lowercase stem of `NOTEPAD.BIN` → `notepad`: the verb shape Phase 1
@@ -880,10 +880,10 @@ pub fn select_god_menu_apps(parsed: []const sexiburger.MenuApp) usize {
 
 var god_menu_dark: bool = true;
 
-var god_menu_win_labels: [max_user_windows][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_user_windows;
-var god_menu_win_label_lens: [max_user_windows]usize = [_]usize{0} ** max_user_windows;
-var god_menu_win_verbs: [max_user_windows][8]u8 = [_][8]u8{[_]u8{0} ** 8} ** max_user_windows;
-var god_menu_win_verb_lens: [max_user_windows]usize = [_]usize{0} ** max_user_windows;
+var god_menu_win_labels: [max_user_windows][32]u8 = @as([max_user_windows][32]u8, @splat(@as([32]u8, @as([32]u8, @splat(@as(u8, 0))))));
+var god_menu_win_label_lens: [max_user_windows]usize = @as([max_user_windows]usize, @splat(@as(usize, 0)));
+var god_menu_win_verbs: [max_user_windows][8]u8 = @as([max_user_windows][8]u8, @splat(@as([8]u8, @as([8]u8, @splat(@as(u8, 0))))));
+var god_menu_win_verb_lens: [max_user_windows]usize = @as([max_user_windows]usize, @splat(@as(usize, 0)));
 
 /// Flip the desktop theme; returns the new mode name. The `set_theme` call
 /// + repaint are freestanding-only (host tests assert the flag flip).
@@ -1736,7 +1736,7 @@ var overview_press_id: u8 = 0;
 /// sorts ascending). Pure over the mirrors (host-testable via the real
 /// table — tests set up mirrors directly).
 fn overview_card_list() struct { ids: [max_user_windows]u8, n: usize } {
-    var out: [max_user_windows]u8 = [_]u8{0} ** max_user_windows;
+    var out: [max_user_windows]u8 = @as([max_user_windows]u8, @splat(@as(u8, 0)));
     var n: usize = 0;
     for (&mirrors) |*m| {
         if (!m.valid or m.id < 2) continue;
@@ -2025,7 +2025,7 @@ fn wnd_mail_reply(reply_to: u8, req: *const wnd_core.WmRpc, applied: bool) void 
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** wnd_core.wm_rpc_title_max,
+        .title = @as([wnd_core.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     const rep_bytes = std.mem.asBytes(&rep);
     _ = syscall3(sys_ipc_send, reply_to, @intFromPtr(rep_bytes.ptr), rep_bytes.len);
@@ -2315,7 +2315,7 @@ fn main() noreturn {
     write_marker(registered_marker);
 
     // Ensure mirror table is initialized cleanly.
-    mirrors = [_]MirrorWin{.{}} ** max_user_windows;
+    mirrors = @as([max_user_windows]MirrorWin, @splat(@as(MirrorWin, .{})));
 
     // Issue #825: probe for desktop wallpaper (/host/WALLPAPER.QOI or .PNG)
     init_wallpaper_if_present();
@@ -2951,7 +2951,7 @@ test "wnd: the WMS6 tray policy formats HH:MM and issues TRAY on change only" {
 }
 
 test "wnd: WM3 taskbar enumeration is id-ascending and workspace-filtered" {
-    mirrors = [_]MirrorWin{.{}} ** max_user_windows;
+    mirrors = @as([max_user_windows]MirrorWin, @splat(@as(MirrorWin, .{})));
     current_workspace = 0;
     // Slot order == id order (mirrors[si] is id 2+si): id 2 (ws 0),
     // id 3 (ws 1 — filtered), id 4 (ws 0), id 5 (invalid — filtered).
@@ -2977,7 +2977,7 @@ test "wnd: WM3 taskbar enumeration is id-ascending and workspace-filtered" {
     current_workspace = 1;
     try std.testing.expectEqual(@as(usize, 1), taskbar_entry_ids(&ids));
     try std.testing.expectEqual(@as(u8, 3), ids[0]);
-    mirrors = [_]MirrorWin{.{}} ** max_user_windows;
+    mirrors = @as([max_user_windows]MirrorWin, @splat(@as(MirrorWin, .{})));
     current_workspace = 0;
 }
 
@@ -3012,7 +3012,7 @@ test "wnd: the WMS6 Alt+Tab target rule (drift guard against the shim snapshot)"
     // that made this drift guard flaky standalone (the pure rule iterates the
     // WHOLE table; unset slots must read `valid=false`, as in the zeroed BSS
     // of the real EL0 binary). Pre-existing Gate-A bug, fixed with Gate E.
-    mirrors = [_]MirrorWin{.{}} ** max_user_windows;
+    mirrors = @as([max_user_windows]MirrorWin, @splat(@as(MirrorWin, .{})));
     mirrors[0] = MirrorWin{ .id = 2, .visible = true, .workspace = 0, .valid = true, .focused = true };
     mirrors[1] = MirrorWin{ .id = 3, .visible = true, .workspace = 0, .valid = true, .focused = false };
     // Hidden + off-workspace windows never cycled (M21 W3/W4).
@@ -3327,8 +3327,8 @@ test "wnd: god menu key chord Ctrl+Space toggle and state" {
 }
 
 test "wnd: wallpaper render occlusion and blit logic" {
-    var fake_scan = [_]u32{0xFF000000} ** (fb_w * fb_h);
-    var fake_bg = [_]u32{0xFF123456} ** (fb_w * fb_h);
+    var fake_scan = @as([(fb_w * fb_h)]u32, @splat(@as(u32, 0xFF000000)));
+    var fake_bg = @as([(fb_w * fb_h)]u32, @splat(@as(u32, 0xFF123456)));
 
     scanout_ptr = &fake_scan;
     scanout_mapped = true;

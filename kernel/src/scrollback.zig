@@ -19,7 +19,7 @@ pub const Scrollback = struct {
     /// Ring storage: `max_lines` slots of `line_cap` bytes each.
     lines: [max_lines][line_cap]u8 = undefined,
     /// Actual length of each line in the ring.
-    lens: [max_lines]usize = [_]usize{0} ** max_lines,
+    lens: [max_lines]usize = @as([max_lines]usize, @splat(@as(usize, 0))),
     /// Number of lines ever stored (monotonic counter, used for view math).
     total: usize = 0,
     /// Index of the next slot to write (wraps around `max_lines`).
@@ -187,7 +187,7 @@ test "scrollback: long lines are truncated" {
     var sb = Scrollback{};
     sb.reset();
 
-    const long: [200]u8 = [_]u8{'X'} ** 200;
+    const long: [200]u8 = @as([200]u8, @splat(@as(u8, 'X')));
     sb.append(&long);
     sb.append(&NL);
     sb.flush_partial();

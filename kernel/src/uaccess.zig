@@ -119,13 +119,13 @@ pub const diagnostic_unmapped: u64 = 0x1_2000_0000;
 /// the TCB worst case: 2 base + scheduler.extra_region_capacity. Sized
 /// here so a full TCB re-arms completely — a silent drop here was the
 /// mmap'd-memory-invisible-to-copy_in bug class.
-var read_regions: [cores][26]Region = [_][26]Region{[_]Region{.{ .base = 0, .len = 0 }} ** 26} ** cores;
-var read_region_count: [cores]usize = [_]usize{0} ** cores;
+var read_regions: [cores][26]Region = @as([cores][26]Region, @splat(@as([26]Region, @as([26]Region, @splat(@as(Region, .{ .base = 0, .len = 0 }))))));
+var read_region_count: [cores]usize = @as([cores]usize, @splat(@as(usize, 0)));
 /// EL0-writable regions (copy-out destinations): the user stack only — the
 /// text aperture is read-only at EL0, so copying into it is a permission
 /// fault (rejected at validation).
-var write_regions: [cores][26]Region = [_][26]Region{[_]Region{.{ .base = 0, .len = 0 }} ** 26} ** cores;
-var write_region_count: [cores]usize = [_]usize{0} ** cores;
+var write_regions: [cores][26]Region = @as([cores][26]Region, @splat(@as([26]Region, @as([26]Region, @splat(@as(Region, .{ .base = 0, .len = 0 }))))));
+var write_region_count: [cores]usize = @as([cores]usize, @splat(@as(usize, 0)));
 
 /// The window state is VOLATILE on purpose. `window_active` has no reader
 /// inside the copy loop, so without volatile semantics the optimizer
@@ -140,13 +140,13 @@ var write_region_count: [cores]usize = [_]usize{0} ** cores;
 ///
 /// True while a bounded copy is executing. The claim-9746 synchronous path
 /// checks this before converting a data abort into EFAULT.
-var window_active: [cores]bool = [_]bool{false} ** cores;
+var window_active: [cores]bool = @as([cores]bool, @splat(@as(bool, false)));
 /// Set by `try_recover` when a data abort inside the window was consumed.
 /// The copy loop breaks on it and returns `.fault`.
-var fault_latch: [cores]bool = [_]bool{false} ** cores;
+var fault_latch: [cores]bool = @as([cores]bool, @splat(@as(bool, false)));
 /// DAIF to restore when the window closes (main-context monitor diagnostic;
 /// SVC context already entered with IRQs masked and restores the same value).
-var saved_daif: [cores]u64 = [_]u64{0} ** cores;
+var saved_daif: [cores]u64 = @as([cores]u64, @splat(@as(u64, 0)));
 
 fn window_active_read() bool {
     const c = core_index();
@@ -175,14 +175,14 @@ fn compiler_barrier() void {
     asm volatile ("" ::: .{ .memory = true });
 }
 
-var copies_value: [cores]u64 = [_]u64{0} ** cores;
-var validation_faults_value: [cores]u64 = [_]u64{0} ** cores;
-var recoveries_value: [cores]u64 = [_]u64{0} ** cores;
+var copies_value: [cores]u64 = @as([cores]u64, @splat(@as(u64, 0)));
+var validation_faults_value: [cores]u64 = @as([cores]u64, @splat(@as(u64, 0)));
+var recoveries_value: [cores]u64 = @as([cores]u64, @splat(@as(u64, 0)));
 /// Issue #1391: copy-outs refused because a destination page could not be
 /// resolved in the process's own root. Zero is the healthy value — a
 /// non-zero one means a store would have been swallowed by the identity
 /// overlay (or the caller passed a page it does not own).
-var unbacked_value: [cores]u64 = [_]u64{0} ** cores;
+var unbacked_value: [cores]u64 = @as([cores]u64, @splat(@as(u64, 0)));
 
 pub const Stats = struct {
     copies: u64,
@@ -195,8 +195,8 @@ pub const Stats = struct {
 /// with `set_regions` immediately after.
 pub fn init() void {
     const c = core_index();
-    read_regions[c] = [_]Region{.{ .base = 0, .len = 0 }} ** 26;
-    write_regions[c] = [_]Region{.{ .base = 0, .len = 0 }} ** 26;
+    read_regions[c] = @as([26]Region, @splat(@as(Region, .{ .base = 0, .len = 0 })));
+    write_regions[c] = @as([26]Region, @splat(@as(Region, .{ .base = 0, .len = 0 })));
     read_region_count[c] = 0;
     write_region_count[c] = 0;
     set_window_active(false);
@@ -212,8 +212,8 @@ pub fn init() void {
 /// The syscall layer delegates its `set_user_regions` here.
 pub fn set_regions(text: Region, stack: Region) void {
     const c = core_index();
-    read_regions[c] = [_]Region{.{ .base = 0, .len = 0 }} ** 26;
-    write_regions[c] = [_]Region{.{ .base = 0, .len = 0 }} ** 26;
+    read_regions[c] = @as([26]Region, @splat(@as(Region, .{ .base = 0, .len = 0 })));
+    write_regions[c] = @as([26]Region, @splat(@as(Region, .{ .base = 0, .len = 0 })));
     read_regions[c][0] = text;
     read_regions[c][1] = stack;
     read_region_count[c] = 2;

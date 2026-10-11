@@ -345,7 +345,7 @@ fn parseSan(buf: []const u8, out: *Cert) Error!void {
         } else if (gn.isCtx(7)) { // iPAddress
             if (gn.content.len != 4 and gn.content.len != 16) return Error.BadIpAddress;
             if (out.san_len >= max_general_names) return Error.TooManyExtensions;
-            var ip = [_]u8{0} ** 16;
+            var ip = @as([16]u8, @splat(@as(u8, 0)));
             if (gn.content.len == 4) {
                 ip[10] = 0xff;
                 ip[11] = 0xff;

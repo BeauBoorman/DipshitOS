@@ -175,7 +175,7 @@ pub const Decoder = struct {
     repeat: u32 = 1,
     /// The command collecting parameters (`#`, `!`, `"`), or 0.
     cmd: u8 = 0,
-    params: [5]u16 = [_]u16{0} ** 5,
+    params: [5]u16 = @as([5]u16, @splat(@as(u16, 0))),
     /// `;` separators seen so far (the index of the parameter being read).
     pcount: u8 = 0,
     /// The extent so far: set pixels unioned with any raster declaration.
@@ -219,7 +219,7 @@ pub const Decoder = struct {
             '?'...'~' => self.sixel(img, b - '?'),
             '#', '!', '"' => {
                 self.cmd = b;
-                self.params = [_]u16{0} ** 5;
+                self.params = @as([5]u16, @splat(@as(u16, 0)));
                 self.pcount = 0;
             },
             '$' => self.x = 0, // graphics carriage return

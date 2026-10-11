@@ -240,7 +240,7 @@ test "dhcp: out-of-sequence + malformed replies are counted, never assumed away"
     start(&chaddr, 7);
 
     // A malformed reply (garbage) -> dhcp.dropped_malformed.
-    var junk: [64]u8 = .{0} ** 64;
+    var junk: [64]u8 = @splat(0);
     var dg: [8 + 64]u8 = undefined;
     @memset(&dg, 0);
     @memcpy(dg[8..], &junk);

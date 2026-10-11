@@ -66,7 +66,7 @@ pub var own_mask: [4]u8 = .{ 255, 255, 255, 0 };
 pub var gateway: [4]u8 = .{ 0, 0, 0, 0 };
 
 /// The bounded peer table (protocol address -> hardware address).
-pub var table: [table_slots]ArpEntry = [_]ArpEntry{.{}} ** table_slots;
+pub var table: [table_slots]ArpEntry = @as([table_slots]ArpEntry, @splat(@as(ArpEntry, .{})));
 
 /// Round-robin cursor for drop-oldest eviction (no timestamps, no heap).
 /// `pub` for the cross-module wiring tests (virtio_net resets it).
@@ -494,7 +494,7 @@ test "arp: classify — request-for-us, not-for-us, reply, non-ARP, malformed" {
     try std.testing.expect(!is_request_for_us(&rep));
 
     // Non-ARP: ethertype 0x0800 (the N2 known frame shape).
-    var ip_frame: [eth_hdr_len + 20]u8 = .{0} ** (eth_hdr_len + 20);
+    var ip_frame: [eth_hdr_len + 20]u8 = @splat(0);
     ip_frame[12] = 0x08;
     ip_frame[13] = 0x00;
     try std.testing.expect(!is_valid_arp(&ip_frame));
@@ -517,7 +517,7 @@ test "arp: classify — request-for-us, not-for-us, reply, non-ARP, malformed" {
 
 test "arp: bounded table — lookup, upsert in place, first-free, drop-oldest" {
     // Reset the module table state (BSS is not trusted zeroed).
-    table = [_]ArpEntry{.{}} ** table_slots;
+    table = @as([table_slots]ArpEntry, @splat(@as(ArpEntry, .{})));
     table_cursor = 0;
     try std.testing.expect(lookup(.{ 10, 0, 0, 2 }) == null);
 
@@ -552,7 +552,7 @@ test "arp: bounded table — lookup, upsert in place, first-free, drop-oldest" {
 
 test "arp: handle_rx — answer for us, learn a reply, drop the rest" {
     own_ip = ip_guest;
-    table = [_]ArpEntry{.{}} ** table_slots;
+    table = @as([table_slots]ArpEntry, @splat(@as(ArpEntry, .{})));
     table_cursor = 0;
     requests_sent = 0;
     replies_sent = 0;
@@ -617,7 +617,7 @@ test "arp: handle_rx — answer for us, learn a reply, drop the rest" {
     try std.testing.expect(lookup(.{ 10, 0, 0, 7 }) == null);
 
     // A non-ARP frame: untouched, not counted as dropped.
-    var ip_frame: [eth_hdr_len + 20]u8 = .{0} ** (eth_hdr_len + 20);
+    var ip_frame: [eth_hdr_len + 20]u8 = @splat(0);
     ip_frame[12] = 0x08;
     ip_frame[13] = 0x00;
     try std.testing.expect(handle_rx(&ip_frame, &test_mac, &reply_buf) == null);
@@ -641,7 +641,7 @@ fn reset_route_state() void {
     own_ip = .{ 0, 0, 0, 0 };
     own_mask = .{ 255, 255, 255, 0 };
     gateway = .{ 0, 0, 0, 0 };
-    table = [_]ArpEntry{.{}} ** table_slots;
+    table = @as([table_slots]ArpEntry, @splat(@as(ArpEntry, .{})));
     table_cursor = 0;
     pending_reply = null;
 }

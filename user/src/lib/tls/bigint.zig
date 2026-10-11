@@ -27,7 +27,7 @@ pub const Error = error{
 
 /// Little-endian u64 limbs. `n` is the number of significant limbs.
 pub const Int = struct {
-    limbs: [max_limbs]u64 = [_]u64{0} ** max_limbs,
+    limbs: [max_limbs]u64 = @as([max_limbs]u64, @splat(@as(u64, 0))),
     n: usize = 0,
 
     pub fn fromBytesBE(bytes: []const u8) Error!Int {
@@ -187,11 +187,11 @@ fn modPOW2(out: *[max_limbs]u64, n: usize, m: []const u64, k: usize) void {
 
 /// Montgomery context for one odd modulus.
 pub const Mont = struct {
-    m: [max_limbs]u64 = [_]u64{0} ** max_limbs,
+    m: [max_limbs]u64 = @as([max_limbs]u64, @splat(@as(u64, 0))),
     n: usize = 0,
     m0inv: u64 = 0,
-    one: [max_limbs]u64 = [_]u64{0} ** max_limbs, // R mod m
-    r2: [max_limbs]u64 = [_]u64{0} ** max_limbs, // R^2 mod m
+    one: [max_limbs]u64 = @as([max_limbs]u64, @splat(@as(u64, 0))), // R mod m
+    r2: [max_limbs]u64 = @as([max_limbs]u64, @splat(@as(u64, 0))), // R^2 mod m
 
     pub fn init(modulus: []const u8) Error!Mont {
         const mv = try Int.fromBytesBE(modulus);
@@ -209,7 +209,7 @@ pub const Mont = struct {
     /// Montgomery reduction: returns T * R^-1 mod m for T < m*R.
     fn redc(self: *const Mont, t_in: []const u64) [max_limbs]u64 {
         const n = self.n;
-        var t: [2 * max_limbs + 2]u64 = [_]u64{0} ** (2 * max_limbs + 2);
+        var t: [2 * max_limbs + 2]u64 = @as([(2 * max_limbs + 2)]u64, @splat(@as(u64, 0)));
         @memcpy(t[0 .. 2 * n], t_in[0 .. 2 * n]);
 
         for (0..n) |i| {
@@ -228,7 +228,7 @@ pub const Mont = struct {
             }
         }
 
-        var out: [max_limbs]u64 = [_]u64{0} ** max_limbs;
+        var out: [max_limbs]u64 = @as([max_limbs]u64, @splat(@as(u64, 0)));
         @memcpy(out[0..n], t[n .. 2 * n]);
         var hi = t[2 * n];
 
@@ -263,7 +263,7 @@ pub const Mont = struct {
     /// `x * 1`. Multiplying by `self.one` (which is R mod m, the identity *in*
     /// the Montgomery domain) would leave an extra factor of R behind.
     pub fn fromMont(self: *const Mont, x: []const u64) [max_limbs]u64 {
-        var plain: [max_limbs]u64 = [_]u64{0} ** max_limbs;
+        var plain: [max_limbs]u64 = @as([max_limbs]u64, @splat(@as(u64, 0)));
         plain[0] = 1;
         var t: [2 * max_limbs]u64 = undefined;
         mulFull(&t, x, &plain, self.n);

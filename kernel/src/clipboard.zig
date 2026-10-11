@@ -24,7 +24,7 @@ const std = @import("std");
 /// the syscall layer (the `set` bound here).
 pub const capacity: usize = 512;
 
-var buffer: [capacity]u8 = [_]u8{0} ** capacity;
+var buffer: [capacity]u8 = @as([capacity]u8, @splat(@as(u8, 0)));
 var len: usize = 0;
 var set_count: u64 = 0;
 
@@ -89,7 +89,7 @@ test "clipboard: set/get round-trips bytes without consuming" {
 
 test "clipboard: set truncates at the bound and a shorter set shrinks" {
     init();
-    const long = "x" ** (capacity + 10);
+    const long = &@as([(capacity + 10):0]u8, @splat("x"[0]));
     try std.testing.expectEqual(capacity, set(long));
     try std.testing.expectEqual(capacity, current_len());
 

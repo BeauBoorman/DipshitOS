@@ -135,7 +135,7 @@ test "arena: reusable free, coalescing both neighbors, accounting and fallback r
     try std.testing.expectEqual(@intFromPtr(first.ptr), @intFromPtr(again.ptr));
     @memset(again, 0x5a);
     const grown = try a.realloc(again, 200);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 100), grown[0..100]);
+    try std.testing.expectEqualSlices(u8, &(@as([100]u8, @splat(@as(u8, 0x5a)))), grown[0..100]);
     a.free(grown);
     const largest = try a.alloc(u8, memory.len - base - @sizeOf(Allocation));
     try std.testing.expectEqual(memory.len, arena.used());

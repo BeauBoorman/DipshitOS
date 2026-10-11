@@ -66,10 +66,10 @@ pub const MODE_DIR: u32 = 0x0010;
 
 // Wire DirEntry layout (ADR 0010 D3: exactly 40 bytes)
 pub const DirEntry = extern struct {
-    name: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     size: u32 = 0,
     is_dir: u8 = 0,
-    reserved: [3]u8 = [_]u8{0} ** 3,
+    reserved: [3]u8 = @as([3]u8, @splat(@as(u8, 0))),
 };
 
 /// The file partitions. M34 HF6 (issue #740) deleted the ESP/DATA
@@ -101,7 +101,7 @@ pub const FileHandle = struct {
     flags: u32 = 0,
     cursor: u32 = 0,
     size: u32 = 0,
-    path: [max_path_len]u8 = [_]u8{0} ** max_path_len,
+    path: [max_path_len]u8 = @as([max_path_len]u8, @splat(@as(u8, 0))),
     path_len: u16 = 0,
     dir_token: u64 = 0,
     dir_snapshot: usize = 0,
@@ -156,11 +156,11 @@ const HandleTable = [process.max_processes][max_handles_per_process]FileHandle;
 const handle_pages: u64 = (@sizeOf(HandleTable) + alloc.page_size - 1) / alloc.page_size;
 var handles: [][max_handles_per_process]FileHandle = &.{};
 var test_handles: HandleTable = undefined;
-var snapshots: [directory.cursor_max]?*directory.Snapshot = .{null} ** directory.cursor_max;
-var metadata_snapshots: [directory.cursor_max]?*metadata.Snapshot = .{null} ** directory.cursor_max;
+var snapshots: [directory.cursor_max]?*directory.Snapshot = @splat(null);
+var metadata_snapshots: [directory.cursor_max]?*metadata.Snapshot = @splat(null);
 const metadata_pages: u64 = (@sizeOf(metadata.Snapshot) + alloc.page_size - 1) / alloc.page_size;
 var test_metadata_snapshots: [directory.cursor_max]metadata.Snapshot = undefined;
-var snapshot_used: [directory.cursor_max]bool = .{false} ** directory.cursor_max;
+var snapshot_used: [directory.cursor_max]bool = @splat(false);
 const snapshot_pages: u64 = (@sizeOf(directory.Snapshot) + alloc.page_size - 1) / alloc.page_size;
 var test_snapshots: [directory.cursor_max]directory.Snapshot = undefined;
 var test_snapshot_pool_empty = false;
@@ -215,11 +215,11 @@ pub const stream_console: u64 = stream_inherit - 2;
 pub const StreamRequest = extern struct {
     version: u32 = 1,
     reserved: u32 = 0,
-    sources: [3]u64 = [_]u64{stream_inherit} ** 3,
+    sources: [3]u64 = @as([3]u64, @splat(@as(u64, stream_inherit))),
 };
 const Binding = union(enum) { closed, console, file: usize };
 const default_streams: [3]Binding = .{ .closed, .console, .console };
-var streams: [process.max_processes][3]Binding = [_][3]Binding{default_streams} ** process.max_processes;
+var streams: [process.max_processes][3]Binding = @as([process.max_processes][3]Binding, @splat(@as([3]Binding, default_streams)));
 pub const stream_endpoint_max = process.max_processes * 3;
 const Endpoint = struct { refs: usize = 0, file: FileHandle = .{} };
 const EndpointTable = [stream_endpoint_max]Endpoint;
@@ -427,7 +427,7 @@ pub fn stream_close(pid: u64, fd: u64) i64 {
 /// #1072 (ADR 0020): each process's controlling terminal (a `terminal.zig`
 /// registry index), created on the first `/dev/tty` open and released when
 /// the process is reset. Null = no terminal opened yet.
-var process_terminal: [process.max_processes]?usize = [_]?usize{null} ** process.max_processes;
+var process_terminal: [process.max_processes]?usize = @as([process.max_processes]?usize, @splat(@as(?usize, null)));
 
 /// #1072: the terminal device names. Exact match only (no path traversal).
 pub fn is_tty_path(name: []const u8) bool {
@@ -1135,7 +1135,7 @@ pub fn parse_path(raw: []const u8) ?ParsedPath {
     }
 
     // Clean up multiple consecutive slashes and strip leading/trailing slashes
-    var out: [max_path_len]u8 = [_]u8{0} ** max_path_len;
+    var out: [max_path_len]u8 = @as([max_path_len]u8, @splat(@as(u8, 0)));
     var out_len: usize = 0;
 
     var s_idx: usize = 0;
@@ -1713,7 +1713,7 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
     if (out_entries.len == 0) return 0;
 
     const parsed = if (path_bytes.len == 0)
-        ParsedPath{ .partition = .host, .path = [_]u8{0} ** max_path_len, .path_len = 0 }
+        ParsedPath{ .partition = .host, .path = @as([max_path_len]u8, @splat(@as(u8, 0))), .path_len = 0 }
     else
         parse_path(path_bytes) orelse return -1;
 
@@ -1750,7 +1750,7 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
             if (n >= out_entries.len) break;
             const e = iter.next() orelse break;
             var de = DirEntry{
-                .name = [_]u8{0} ** 32,
+                .name = @as([32]u8, @splat(@as(u8, 0))),
                 .size = e.size,
                 .is_dir = if (e.isDir()) 1 else 0,
                 .reserved = .{ 0, 0, 0 },
@@ -1776,7 +1776,7 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
     while (i < take) : (i += 1) {
         const raw = &lr.entries[i];
         var de = DirEntry{
-            .name = [_]u8{0} ** 32,
+            .name = @as([32]u8, @splat(@as(u8, 0))),
             .size = @intCast(@min(raw.size, std.math.maxInt(u32))),
             .is_dir = if (raw.type == virtio_file.dir_type_dir) 1 else 0,
             .reserved = .{ 0, 0, 0 },
@@ -2178,7 +2178,7 @@ test "B2: complete pages, long names, stable mutation snapshot and EOF" {
     var page: directory.Page = undefined;
     var offset: u64 = 0;
     var seen: usize = 0;
-    var last: [256]u8 = .{0} ** 256;
+    var last: [256]u8 = @splat(0);
     var last_len: usize = 0;
     while (true) {
         const count = dir_page(0, token, offset, 7, &page);
@@ -2380,7 +2380,7 @@ test "B2: exact and over entry, full native path, component and depth bounds" {
     try std.testing.expectEqual(@as(i64, 0), dir_close(0, @intCast(token)));
     virtio_file.set_test_share(&files);
     try std.testing.expectEqual(@as(i64, -5), dir_open(0, ""));
-    const exact = "/host/" ++ ([_]u8{'a'} ** 255) ++ "/" ++ ([_]u8{'b'} ** 250);
+    const exact = "/host/" ++ (@as([255]u8, @splat(@as(u8, 'a')))) ++ "/" ++ (@as([250]u8, @splat(@as(u8, 'b'))));
     try std.testing.expectEqual(@as(usize, 512), exact.len);
     const nested = [_]virtio_file.TestFile{
         .{ .name = exact[6..], .data = "", .is_dir = true },
@@ -2395,15 +2395,15 @@ test "B2: exact and over entry, full native path, component and depth bounds" {
     try std.testing.expect(deep > 0);
     try std.testing.expectEqual(@as(i64, 0), dir_close(0, @intCast(deep)));
     try std.testing.expectEqual(@as(i64, -8), dir_open(0, "/host/a/b/c/d/e/f/g/h/i"));
-    try std.testing.expectEqual(@as(i64, -8), dir_open(0, &([_]u8{'x'} ** 256)));
-    const long = [_]virtio_file.TestFile{.{ .name = &([_]u8{'x'} ** 255), .data = "" }};
+    try std.testing.expectEqual(@as(i64, -8), dir_open(0, &(@as([256]u8, @splat(@as(u8, 'x'))))));
+    const long = [_]virtio_file.TestFile{.{ .name = &(@as([255]u8, @splat(@as(u8, 'x')))), .data = "" }};
     virtio_file.set_test_share(&long);
     const name_token = dir_open(0, "");
     try std.testing.expect(name_token > 0);
     try std.testing.expectEqual(@as(i64, 1), dir_page(0, @intCast(name_token), 0, 16, &page));
     try std.testing.expectEqualStrings(long[0].name, page.entries[0].name[0..page.entries[0].name_len]);
     try std.testing.expectEqual(@as(i64, 0), dir_close(0, @intCast(name_token)));
-    const over = [_]virtio_file.TestFile{.{ .name = &([_]u8{'x'} ** 256), .data = "" }};
+    const over = [_]virtio_file.TestFile{.{ .name = &(@as([256]u8, @splat(@as(u8, 'x')))), .data = "" }};
     virtio_file.set_test_share(&over);
     try std.testing.expectEqual(@as(i64, -8), dir_open(0, ""));
     try std.testing.expectEqual(@as(i64, -4), dir_open(0, "usb1"));
@@ -2424,7 +2424,7 @@ test "B2: access denial at capture and page, including persisted wide keys" {
     var page: directory.Page = undefined;
     try std.testing.expectEqual(@as(i64, -7), dir_page(0, @intCast(token), 0, 16, &page));
     try std.testing.expectEqual(@as(i64, 0), dir_close(0, @intCast(token)));
-    const key = ([_]u8{'a'} ** 200) ++ "/" ++ ([_]u8{'b'} ** 200);
+    const key = (@as([200]u8, @splat(@as(u8, 'a')))) ++ "/" ++ (@as([200]u8, @splat(@as(u8, 'b'))));
     const owners = "#v1\n" ++ key ++ "\t600\t0\t-\n";
     try std.testing.expectEqual(trust.LoadResult.ok, trust.load(owners));
     try std.testing.expectEqual(trust.Verdict.eacces, trust.check(.{ .uid = process.uid_user, .caps = 0 }, .host, key, .list));
@@ -2788,7 +2788,7 @@ test "file_table: window tty reads preserve keyboard CSI bytes (#1794)" {
 
     // Consume WIN_FOCUS and clear any stale held-key state from another test.
     _ = app_events.pop(pid);
-    input.decode_keyboard_report(&[_]u8{0} ** 8);
+    input.decode_keyboard_report(&@as([8]u8, @splat(@as(u8, 0))));
     app_events.init();
     input.decode_keyboard_report(&[_]u8{ 0, 0, 0x52, 0, 0, 0, 0, 0 });
     try std.testing.expectEqual(@as(usize, 0), app_events.pending(pid));
@@ -2799,7 +2799,7 @@ test "file_table: window tty reads preserve keyboard CSI bytes (#1794)" {
     try std.testing.expectEqualSlices(u8, "\x1b[A", got[0..@intCast(n)]);
 
     // Release the test key so it cannot become held state for another test.
-    input.decode_keyboard_report(&[_]u8{0} ** 8);
+    input.decode_keyboard_report(&@as([8]u8, @splat(@as(u8, 0))));
     reset_process(pid);
     for (&terminal.terminals) |*tt| tt.reset();
 }

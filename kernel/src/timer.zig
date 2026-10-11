@@ -248,15 +248,15 @@ pub fn init_secondary() void {
 // The virtual timer is independent of CNTP and scheduler.tick. Only an
 // active profiling session enables it. There is deliberately no poll path.
 var profile_enabled = std.atomic.Value(bool).init(false);
-var profile_deadline: [4]u64 = [_]u64{0} ** 4;
-var profile_window_start: [4]u64 = [_]u64{0} ** 4;
-var profile_window_irqs: [4]u64 = [_]u64{0} ** 4;
-var profile_window_ticks: [4]u64 = [_]u64{0} ** 4;
-pub var profile_irqs: [4]u64 = [_]u64{0} ** 4;
-pub const profile_polls: [4]u64 = [_]u64{0} ** 4;
+var profile_deadline: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+var profile_window_start: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+var profile_window_irqs: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+var profile_window_ticks: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+pub var profile_irqs: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+pub const profile_polls: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
 const ProfileReport = struct { irqs: u64 = 0, elapsed: u64 = 0, ticks: u64 = 0 };
-var profile_reports: [4]ProfileReport = [_]ProfileReport{.{}} ** 4;
-var profile_pending: [4]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** 4;
+var profile_reports: [4]ProfileReport = @as([4]ProfileReport, @splat(@as(ProfileReport, .{})));
+var profile_pending: [4]std.atomic.Value(bool) = @as([4]std.atomic.Value(bool), @splat(@as(std.atomic.Value(bool), std.atomic.Value(bool).init(false))));
 
 fn profile_core() usize {
     if (comptime builtin.is_test or builtin.cpu.arch != .aarch64) return 0;

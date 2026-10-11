@@ -644,7 +644,7 @@ fn split_block_view(desc: u64) ?*align(4096) [512]u64 {
 /// (issue #1214 review): user apertures may sit ABOVE the 4 GiB identity
 /// blanket, where the source has no entry — the clone still has to build
 /// the walk to the page level or the aperture is silently unmapped.
-const empty_table: [512]u64 = [_]u64{0} ** 512;
+const empty_table: [512]u64 = @as([512]u64, @splat(@as(u64, 0)));
 
 /// Bound on a single aperture's page-rounded span (256 MiB — every
 /// production aperture is ≤ 64 MiB: `elf.map_max` for image segments, the

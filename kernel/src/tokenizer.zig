@@ -42,7 +42,7 @@ pub const max_tokens: usize = monitor.max_args_limit + 1;
 pub const TokenizeResult = struct {
     argv: [max_tokens][]const u8 = undefined,
     /// Per-argument wildcard marker for the P6 glob expansion stage.
-    arg_glob: [max_tokens]bool = [_]bool{false} ** max_tokens,
+    arg_glob: [max_tokens]bool = @as([max_tokens]bool, @splat(@as(bool, false))),
     count: usize = 0,
     /// More tokens than fit: the caller must refuse to execute.
     too_many: bool = false,

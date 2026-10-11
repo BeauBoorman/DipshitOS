@@ -60,10 +60,10 @@ test "unsupported product surfaces and parallel options refuse explicitly" {
 }
 
 test "path component full path and nesting exact and over boundaries" {
-    try policy.path("x" ** 255);
-    try t.expectError(error.PathLimit, policy.path("x" ** 256));
-    try policy.path("x" ** 255 ++ "/" ++ "y" ** 250);
-    try t.expectError(error.PathLimit, policy.path("x" ** 255 ++ "/" ++ "y" ** 251));
+    try policy.path(&@as([255:0]u8, @splat("x"[0])));
+    try t.expectError(error.PathLimit, policy.path(&@as([256:0]u8, @splat("x"[0]))));
+    try policy.path(&@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([250:0]u8, @splat("y"[0])));
+    try t.expectError(error.PathLimit, policy.path(&@as([255:0]u8, @splat("x"[0])) ++ "/" ++ &@as([251:0]u8, @splat("y"[0]))));
     try policy.path("a/b/c/d/e/f/g/h/i");
     try t.expectError(error.TreeLimit, policy.path("a/b/c/d/e/f/g/h/i/j"));
     for ([_][]const u8{ "", "/a", "../a", "a/./b", "a//b", "a/", "a\\b", "a\x00b", "a:b" }) |name|

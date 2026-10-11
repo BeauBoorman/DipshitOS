@@ -177,7 +177,7 @@ test "redirect: capture console captures writes" {
 test "redirect: capture console overflow is dropped" {
     reset_capture();
     const cap = capture_console();
-    const big = "x" ** (capture_capacity + 100);
+    const big = &@as([(capture_capacity + 100):0]u8, @splat("x"[0]));
     cap.write(big);
     try std.testing.expectEqual(capture_capacity, captured().len);
 }

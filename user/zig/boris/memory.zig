@@ -38,7 +38,7 @@ test "guarded memory helper contracts include overlapping moves and byte truncat
     _ = memmove(&bytes, bytes[1..].ptr, 5);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 5 }, &bytes);
     _ = memset(&bytes, -1, bytes.len);
-    try std.testing.expectEqualSlices(u8, &(.{255} ** 6), &bytes);
+    try std.testing.expectEqualSlices(u8, &(@splat(255)), &bytes);
     const source = [_]u8{ 6, 5, 4, 3, 2, 1 };
     _ = memcpy(&bytes, &source, source.len);
     try std.testing.expectEqualSlices(u8, &source, &bytes);

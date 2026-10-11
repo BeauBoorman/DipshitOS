@@ -416,7 +416,7 @@ test "stream: an over-cap declared length fails closed before buffering" {
 test "stream: malformed padding fails closed" {
     Harness.reset();
     // total = 16 (aligned), packet_length = 12, but padding_length = 0.
-    var hdr = [_]u8{0} ** 16;
+    var hdr = @as([16]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u32, hdr[0..4], 12, .big);
     hdr[4] = 0;
     Harness.setFeed(&hdr);

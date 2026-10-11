@@ -316,7 +316,7 @@ test "nvram-console: writes persist newline-terminated chunks in order" {
 
 test "nvram-console: a full buffer persists without a newline" {
     _ = make_state();
-    const many = [_]u8{'a'} ** (chunk_cap + 40);
+    const many = @as([(chunk_cap + 40)]u8, @splat(@as(u8, 'a')));
     write(&many);
     // First chunk filled the 256-byte buffer; 40 bytes remain buffered.
     try std.testing.expectEqual(@as(usize, 1), spy_count);
@@ -330,7 +330,7 @@ test "nvram-console: a full buffer persists without a newline" {
 
 test "nvram-console: a single large write splits across chunks" {
     _ = make_state();
-    const big = [_]u8{'b'} ** (chunk_cap * 2 + 10);
+    const big = @as([(chunk_cap * 2 + 10)]u8, @splat(@as(u8, 'b')));
     write(&big);
     // Two full chunks persist inline; the trailing 10 bytes (no newline)
     // stay buffered until the explicit flush.
@@ -357,7 +357,7 @@ test "nvram-console: output past the chunk cap is dropped with a notice" {
     _ = make_state();
     // max_chunks of full chunks, then more bytes: the last allowed chunk is
     // the overflow notice, and everything after is dropped.
-    const flood = [_]u8{'x'} ** (chunk_cap * (max_chunks + 2));
+    const flood = @as([(chunk_cap * (max_chunks + 2))]u8, @splat(@as(u8, 'x')));
     write(&flood);
     try std.testing.expectEqual(@as(usize, max_chunks + 1), spy_count);
     const last = spy_values[spy_count - 1][0..spy_lens[spy_count - 1]];

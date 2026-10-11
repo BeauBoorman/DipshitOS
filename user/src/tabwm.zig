@@ -645,7 +645,7 @@ pub const nav_forward_marker: []const u8 = "tabwm: nav-forward ";
 /// The next navigation target an app should move to, queued by back/forward
 /// and drained by that app's `nav_poll` RPC. Keyed by window id (id 0 = none).
 pub var pending_nav_id: u32 = 0;
-pub var pending_nav_path: [hist_path_max]u8 = [_]u8{0} ** hist_path_max;
+pub var pending_nav_path: [hist_path_max]u8 = @as([hist_path_max]u8, @splat(@as(u8, 0)));
 pub var pending_nav_len: usize = 0;
 
 fn set_pending_nav(id: u32, path: []const u8) void {
@@ -754,9 +754,9 @@ pub fn hover_tick() bool {
 
 /// Tab-search overlay state (independent of the catalog surfaces).
 pub var tab_search_open: bool = false;
-var tab_search_filter: [16]u8 = [_]u8{0} ** 16;
+var tab_search_filter: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
 var tab_search_filter_len: usize = 0;
-var tab_search_results: [max_tabs]usize = [_]usize{0} ** max_tabs;
+var tab_search_results: [max_tabs]usize = @as([max_tabs]usize, @splat(@as(usize, 0)));
 var tab_search_count: usize = 0;
 var tab_search_sel: usize = 0;
 
@@ -931,9 +931,9 @@ pub const GoTarget = struct {
 
 pub var go_open: bool = false;
 pub var hover_go: bool = false;
-var go_query: [go_query_max]u8 = [_]u8{0} ** go_query_max;
+var go_query: [go_query_max]u8 = @as([go_query_max]u8, @splat(@as(u8, 0)));
 var go_query_len: usize = 0;
-var go_results: [go_scan_max]GoTarget = [_]GoTarget{.{}} ** go_scan_max;
+var go_results: [go_scan_max]GoTarget = @as([go_scan_max]GoTarget, @splat(@as(GoTarget, .{})));
 var go_result_count: usize = 0;
 var go_sel: usize = 0;
 
@@ -1391,7 +1391,7 @@ pub const hist_path_max: usize = 24;
 
 /// One recorded navigation target for a tab.
 pub const HistEntry = struct {
-    path: [hist_path_max]u8 = [_]u8{0} ** hist_path_max,
+    path: [hist_path_max]u8 = @as([hist_path_max]u8, @splat(@as(u8, 0))),
     path_len: usize = 0,
 
     pub fn get(self: *const HistEntry) []const u8 {
@@ -1407,7 +1407,7 @@ pub const HistEntry = struct {
 
 pub const Tab = struct {
     id: u32 = 0,
-    title: [32]u8 = [_]u8{0} ** 32,
+    title: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     title_len: usize = 0,
     valid: bool = false,
     visible: bool = false,
@@ -1432,7 +1432,7 @@ pub const Tab = struct {
     /// #1064 (rail-neutral ergonomics): the executable TABWM launched this
     /// tab from, when it knows it (the god-menu launch path records the bin;
     /// windows that opened themselves have none). Reopen-closed re-execs it.
-    bin: [24]u8 = [_]u8{0} ** 24,
+    bin: [24]u8 = @as([24]u8, @splat(@as(u8, 0))),
     bin_len: usize = 0,
 
     /// M48/BT3: the tab is PINNED — it sorts ahead of unpinned tabs and
@@ -1441,7 +1441,7 @@ pub const Tab = struct {
     pinned: bool = false,
     /// M48/BT3: the manifest group label (`group=NAME`), or empty. Rendered
     /// as a small header over the pinned block; never changes tab identity.
-    group: [12]u8 = [_]u8{0} ** 12,
+    group: [12]u8 = @as([12]u8, @splat(@as(u8, 0))),
     group_len: usize = 0,
     /// M48/BT6: the tab is FROZEN — a background tab the user suspended.
     /// Purely presentational state for now (badge + status); pairs with the
@@ -1450,7 +1450,7 @@ pub const Tab = struct {
     /// M48/BT5: the bounded per-tab navigation history (the browser-history
     /// analogue for whole apps). `hist_pos` is the current entry; entries at
     /// (`hist_pos`, `hist_count`) are the forward stack.
-    hist: [hist_max]HistEntry = [_]HistEntry{.{}} ** hist_max,
+    hist: [hist_max]HistEntry = @as([hist_max]HistEntry, @splat(@as(HistEntry, .{}))),
     hist_count: usize = 0,
     hist_pos: usize = 0,
 
@@ -1534,7 +1534,7 @@ pub const Tab = struct {
 };
 
 pub const TabManager = struct {
-    tabs: [max_tabs]Tab = [_]Tab{.{}} ** max_tabs,
+    tabs: [max_tabs]Tab = @as([max_tabs]Tab, @splat(@as(Tab, .{}))),
     tab_count: usize = 0,
     active_idx: ?usize = null,
 
@@ -1739,7 +1739,7 @@ var scanout_mapped: bool = false;
 /// `add_or_update_tab_geom` then becomes a NULL memcpy source and TABWM
 /// takes an EL0 data abort (`live-tabwm-fullscreen` run B). One BSS scratch,
 /// reused serially from the event loop — never live on two call frames.
-var tab_reorder_scratch: [max_tabs]Tab = [_]Tab{.{}} ** max_tabs;
+var tab_reorder_scratch: [max_tabs]Tab = @as([max_tabs]Tab, @splat(@as(Tab, .{})));
 
 fn commit_tab_scratch(self: *TabManager, n: usize) void {
     var i: usize = 0;
@@ -1765,26 +1765,26 @@ pub var prev_buttons: u8 = 0;
 /// A recently-closed tab, enough to reopen it (the executable TABWM launched
 /// it from, plus its title for a fallback label).
 pub const ClosedTab = struct {
-    bin: [24]u8 = [_]u8{0} ** 24,
+    bin: [24]u8 = @as([24]u8, @splat(@as(u8, 0))),
     bin_len: usize = 0,
-    title: [32]u8 = [_]u8{0} ** 32,
+    title: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     title_len: usize = 0,
 };
 
 /// LIFO of recently-closed tabs (bounded to max_tabs); Ctrl+Shift+T reopens
 /// the top. `closed_count` grows monotonically; the ring index is
 /// `closed_count - 1 - k` mod max_tabs.
-pub var closed_tabs: [max_tabs]ClosedTab = [_]ClosedTab{.{}} ** max_tabs;
+pub var closed_tabs: [max_tabs]ClosedTab = @as([max_tabs]ClosedTab, @splat(@as(ClosedTab, .{})));
 pub var closed_count: usize = 0;
 
 /// The bin of an app the god-menu just launched, consumed by the NEXT new
 /// tab (the kernel fans the window mirror after the exec). Empty = none.
-pub var pending_launch_bin: [24]u8 = [_]u8{0} ** 24;
+pub var pending_launch_bin: [24]u8 = @as([24]u8, @splat(@as(u8, 0)));
 pub var pending_launch_bin_len: usize = 0;
 
 /// M48/BT3: the manifest group label of the app just launched, consumed with
 /// the bin by the next new tab (empty = none).
-pub var pending_launch_group: [12]u8 = [_]u8{0} ** 12;
+pub var pending_launch_group: [12]u8 = @as([12]u8, @splat(@as(u8, 0)));
 pub var pending_launch_group_len: usize = 0;
 /// M48/BT3: the launched app declared `dock=true` — the new tab starts pinned.
 pub var pending_launch_pinned: bool = false;
@@ -1969,8 +1969,8 @@ pub const tabs_state_max_bytes: usize = tabs_header_bytes + max_tabs * persist_t
 pub const TabsState = struct {
     active: ?usize = null,
     count: usize = 0,
-    titles: [max_tabs][persist_title_max]u8 = [_][persist_title_max]u8{[_]u8{0} ** persist_title_max} ** max_tabs,
-    title_lens: [max_tabs]usize = [_]usize{0} ** max_tabs,
+    titles: [max_tabs][persist_title_max]u8 = @as([max_tabs][persist_title_max]u8, @splat(@as([persist_title_max]u8, @as([persist_title_max]u8, @splat(@as(u8, 0)))))),
+    title_lens: [max_tabs]usize = @as([max_tabs]usize, @splat(@as(usize, 0))),
 };
 
 /// Encode the live tab list as `[version, active+1, count, titles...]`.
@@ -2100,7 +2100,7 @@ pub noinline fn maybe_apply_persisted_tabs() bool {
     if (persisted_tabs_v2 != null) return maybe_apply_persisted_tabs_v2();
     const st = if (persisted_tabs) |*s| s else return false;
     if (manager.tab_count != st.count) return false;
-    var used = [_]bool{false} ** max_tabs;
+    var used = @as([max_tabs]bool, @splat(@as(bool, false)));
     var n: usize = 0;
     for (0..st.count) |pi| {
         const want = st.titles[pi][0..st.title_lens[pi]];
@@ -2160,8 +2160,8 @@ pub const tablog_code_go: u8 = 10;
 pub const tablog_code_launch: u8 = 11;
 
 pub var tablog_seq: u32 = 0;
-var tablog_lines: [tablog_ring][tablog_line_max]u8 = [_][tablog_line_max]u8{[_]u8{0} ** tablog_line_max} ** tablog_ring;
-pub var tablog_line_lens: [tablog_ring]usize = [_]usize{0} ** tablog_ring;
+var tablog_lines: [tablog_ring][tablog_line_max]u8 = @as([tablog_ring][tablog_line_max]u8, @splat(@as([tablog_line_max]u8, @as([tablog_line_max]u8, @splat(@as(u8, 0))))));
+pub var tablog_line_lens: [tablog_ring]usize = @as([tablog_ring]usize, @splat(@as(usize, 0)));
 var tablog_head: usize = 0;
 var tablog_count: usize = 0;
 var tablog_last_flush_seq: u32 = 0;
@@ -2294,13 +2294,13 @@ pub const TabsStateV2 = struct {
     count: usize = 0,
     seq: u16 = 0,
     prefs: u8 = 0,
-    titles: [max_tabs][persist_title_max]u8 = [_][persist_title_max]u8{[_]u8{0} ** persist_title_max} ** max_tabs,
-    title_lens: [max_tabs]usize = [_]usize{0} ** max_tabs,
-    flags: [max_tabs]u8 = [_]u8{0} ** max_tabs,
-    groups: [max_tabs][persist_group_max]u8 = [_][persist_group_max]u8{[_]u8{0} ** persist_group_max} ** max_tabs,
-    group_lens: [max_tabs]usize = [_]usize{0} ** max_tabs,
-    bins: [max_tabs][persist_bin_max]u8 = [_][persist_bin_max]u8{[_]u8{0} ** persist_bin_max} ** max_tabs,
-    bin_lens: [max_tabs]usize = [_]usize{0} ** max_tabs,
+    titles: [max_tabs][persist_title_max]u8 = @as([max_tabs][persist_title_max]u8, @splat(@as([persist_title_max]u8, @as([persist_title_max]u8, @splat(@as(u8, 0)))))),
+    title_lens: [max_tabs]usize = @as([max_tabs]usize, @splat(@as(usize, 0))),
+    flags: [max_tabs]u8 = @as([max_tabs]u8, @splat(@as(u8, 0))),
+    groups: [max_tabs][persist_group_max]u8 = @as([max_tabs][persist_group_max]u8, @splat(@as([persist_group_max]u8, @as([persist_group_max]u8, @splat(@as(u8, 0)))))),
+    group_lens: [max_tabs]usize = @as([max_tabs]usize, @splat(@as(usize, 0))),
+    bins: [max_tabs][persist_bin_max]u8 = @as([max_tabs][persist_bin_max]u8, @splat(@as([persist_bin_max]u8, @as([persist_bin_max]u8, @splat(@as(u8, 0)))))),
+    bin_lens: [max_tabs]usize = @as([max_tabs]usize, @splat(@as(usize, 0))),
 };
 
 /// The monotonically increasing stamp written into every v2 file, so a
@@ -2412,7 +2412,7 @@ pub noinline fn maybe_apply_persisted_tabs_v2() bool {
             break;
         }
     }
-    var used = [_]bool{false} ** max_tabs;
+    var used = @as([max_tabs]bool, @splat(@as(bool, false)));
     var n: usize = 0;
     for (0..st.count) |pi| {
         const want = st.titles[pi][0..st.title_lens[pi]];
@@ -2890,17 +2890,17 @@ pub const overlay_manifest_max: usize = sexiburger_menu.manifest_buf_max;
 var overlay_open: bool = false;
 var overlay_loaded: bool = false;
 var overlay_manifest_buf: [overlay_manifest_max]u8 = undefined;
-var overlay_bins: [overlay_max_apps][24]u8 = [_][24]u8{[_]u8{0} ** 24} ** overlay_max_apps;
-var overlay_bin_lens: [overlay_max_apps]usize = [_]usize{0} ** overlay_max_apps;
-var overlay_labels: [overlay_max_apps][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** overlay_max_apps;
-var overlay_label_lens: [overlay_max_apps]usize = [_]usize{0} ** overlay_max_apps;
+var overlay_bins: [overlay_max_apps][24]u8 = @as([overlay_max_apps][24]u8, @splat(@as([24]u8, @as([24]u8, @splat(@as(u8, 0))))));
+var overlay_bin_lens: [overlay_max_apps]usize = @as([overlay_max_apps]usize, @splat(@as(usize, 0)));
+var overlay_labels: [overlay_max_apps][32]u8 = @as([overlay_max_apps][32]u8, @splat(@as([32]u8, @as([32]u8, @splat(@as(u8, 0))))));
+var overlay_label_lens: [overlay_max_apps]usize = @as([overlay_max_apps]usize, @splat(@as(usize, 0)));
 /// M48/BT3: the manifest group label (`group=NAME`, optional 5th+ field) and
 /// the `dock=true` pin signal, per catalog entry.
-var overlay_groups: [overlay_max_apps][12]u8 = [_][12]u8{[_]u8{0} ** 12} ** overlay_max_apps;
-var overlay_group_lens: [overlay_max_apps]usize = [_]usize{0} ** overlay_max_apps;
-var overlay_dock: [overlay_max_apps]bool = [_]bool{false} ** overlay_max_apps;
+var overlay_groups: [overlay_max_apps][12]u8 = @as([overlay_max_apps][12]u8, @splat(@as([12]u8, @as([12]u8, @splat(@as(u8, 0))))));
+var overlay_group_lens: [overlay_max_apps]usize = @as([overlay_max_apps]usize, @splat(@as(usize, 0)));
+var overlay_dock: [overlay_max_apps]bool = @as([overlay_max_apps]bool, @splat(@as(bool, false)));
 var overlay_count: usize = 0;
-var overlay_filter: [24]u8 = [_]u8{0} ** 24;
+var overlay_filter: [24]u8 = @as([24]u8, @splat(@as(u8, 0)));
 var overlay_filter_len: usize = 0;
 var overlay_filtered: [overlay_max_apps]usize = undefined;
 var overlay_filtered_count: usize = 0;
@@ -3988,7 +3988,7 @@ pub fn handle_wm_key(usage: u8, flags: u16) void {
 /// M48/BT5: a reply payload set by `wnd_mail_apply` and copied into the ack's
 /// `title` field by `wnd_mail_reply` (the nav-poll channel: the WM hands the
 /// app the target path it must navigate to). Zero length = no payload.
-var rpc_reply_payload: [ui.wm_rpc_title_max]u8 = [_]u8{0} ** ui.wm_rpc_title_max;
+var rpc_reply_payload: [ui.wm_rpc_title_max]u8 = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0)));
 var rpc_reply_payload_len: usize = 0;
 
 fn wnd_mail_reply(reply_to: u8, req: *const ui.WmRpc, applied: bool) void {
@@ -4003,7 +4003,7 @@ fn wnd_mail_reply(reply_to: u8, req: *const ui.WmRpc, applied: bool) void {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     if (rpc_reply_payload_len > 0) {
         @memcpy(rep.title[0..rpc_reply_payload_len], rpc_reply_payload[0..rpc_reply_payload_len]);
@@ -4329,7 +4329,7 @@ pub fn resetForTest() void {
     tablog_head = 0;
     tablog_count = 0;
     tablog_last_flush_seq = 0;
-    tablog_line_lens = [_]usize{0} ** tablog_ring;
+    tablog_line_lens = @as([tablog_ring]usize, @splat(@as(usize, 0)));
 
     overlay_open = false;
     overlay_loaded = false;
@@ -4525,7 +4525,7 @@ test "tabwm: wnd_mail_apply RPC commands" {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     @memcpy(req_config.title[0..9], "New Title");
     try std.testing.expect(wnd_mail_apply(&req_config));
@@ -4543,7 +4543,7 @@ test "tabwm: wnd_mail_apply RPC commands" {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     try std.testing.expect(wnd_mail_apply(&req_raise));
     try std.testing.expectEqual(@as(?usize, 1), manager.active_idx);
@@ -4560,7 +4560,7 @@ test "tabwm: wnd_mail_apply RPC commands" {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     try std.testing.expect(wnd_mail_apply(&req_cycle));
     try std.testing.expectEqual(@as(?usize, 0), manager.active_idx);
@@ -4577,7 +4577,7 @@ test "tabwm: wnd_mail_apply RPC commands" {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     try std.testing.expect(wnd_mail_apply(&req_detach));
     try std.testing.expectEqual(@as(usize, 1), manager.tab_count);
@@ -4768,7 +4768,7 @@ test "tabwm: declare_fullscreen RPC registers and applies the full viewport (M42
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     @memcpy(req.title[0..4], "CALC");
     try std.testing.expect(wnd_mail_apply(&req));
@@ -4806,7 +4806,7 @@ test "tabwm: declare_fullscreen on an inactive tab defers the proposal (M42 SX2)
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     @memcpy(req.title[0..5], "FILES");
     try std.testing.expect(wnd_mail_apply(&req));
@@ -5403,7 +5403,7 @@ test "tabwm: RPC upserts refuse a full manager instead of aliasing tab 0" {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     @memcpy(req.title[0..8], "Overflow");
     try std.testing.expect(!wnd_mail_apply(&req));
@@ -5422,7 +5422,7 @@ test "tabwm: RPC upserts refuse a full manager instead of aliasing tab 0" {
     // A known id still upserts in place at the cap.
     req.id = 2;
     req.kind = ui.wm_rpc_kind_config;
-    req.title = [_]u8{0} ** ui.wm_rpc_title_max;
+    req.title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0)));
     @memcpy(req.title[0..7], "Renamed");
     try std.testing.expect(wnd_mail_apply(&req));
     try std.testing.expectEqualStrings("Renamed", manager.tabs[0].get_title());
@@ -5987,7 +5987,7 @@ test "tabwm: back/forward queue the target for the owning app (M48/BT5)" {
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     @memcpy(req.title[0..6], "/etc/x");
     try std.testing.expect(wnd_mail_apply(&req));
@@ -6273,7 +6273,7 @@ test "tabwm: declare_fullscreen join still applies pending v2 pin/freeze (TWM/ST
         .y = 0,
         .w = 0,
         .h = 0,
-        .title = [_]u8{0} ** ui.wm_rpc_title_max,
+        .title = @as([ui.wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     @memcpy(req.title[0..4], "Calc");
     try std.testing.expect(wnd_mail_apply(&req));

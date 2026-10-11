@@ -114,9 +114,9 @@ pub const max_val_len: usize = 64;
 pub const max_entries: usize = 18;
 
 pub const Entry = struct {
-    key: [max_key_len]u8 = [_]u8{0} ** max_key_len,
+    key: [max_key_len]u8 = @as([max_key_len]u8, @splat(@as(u8, 0))),
     key_len: usize = 0,
-    val: [max_val_len]u8 = [_]u8{0} ** max_val_len,
+    val: [max_val_len]u8 = @as([max_val_len]u8, @splat(@as(u8, 0))),
     val_len: usize = 0,
 };
 

@@ -108,13 +108,13 @@ pub const BitReader = struct {
 };
 
 pub const HuffmanTree = struct {
-    bl_count: [16]u16 = [_]u16{0} ** 16,
-    first_code: [16]u16 = [_]u16{0} ** 16,
-    start_idx: [16]u16 = [_]u16{0} ** 16,
-    symbols: [288]u16 = [_]u16{0} ** 288,
+    bl_count: [16]u16 = @as([16]u16, @splat(@as(u16, 0))),
+    first_code: [16]u16 = @as([16]u16, @splat(@as(u16, 0))),
+    start_idx: [16]u16 = @as([16]u16, @splat(@as(u16, 0))),
+    symbols: [288]u16 = @as([288]u16, @splat(@as(u16, 0))),
 
     pub fn build(self: *HuffmanTree, lengths: []const u8) InflateError!void {
-        self.bl_count = [_]u16{0} ** 16;
+        self.bl_count = @as([16]u16, @splat(@as(u16, 0)));
         for (lengths) |len| {
             if (len > 15) return error.InvalidHuffmanTree;
             if (len > 0) self.bl_count[len] += 1;
@@ -243,7 +243,7 @@ pub fn inflate(in_bytes: []const u8, out_buf: []u8, raw: bool) InflateError!usiz
                 try tree.build(&lit_lens);
                 fixed_lit_tree = tree;
 
-                var dist_lens = [_]u8{5} ** 32;
+                var dist_lens = @as([32]u8, @splat(@as(u8, 5)));
                 var dtree = HuffmanTree{};
                 try dtree.build(&dist_lens);
                 fixed_dist_tree = dtree;
@@ -255,7 +255,7 @@ pub fn inflate(in_bytes: []const u8, out_buf: []u8, raw: bool) InflateError!usiz
             const hdist = (try reader.read_bits(5)) + 1; // 1..32
             const hclen = (try reader.read_bits(4)) + 4; // 4..19
 
-            var code_len_lens = [_]u8{0} ** 19;
+            var code_len_lens = @as([19]u8, @splat(@as(u8, 0)));
             var i: usize = 0;
             while (i < hclen) : (i += 1) {
                 code_len_lens[CODE_LENGTH_ORDER[i]] = @truncate(try reader.read_bits(3));

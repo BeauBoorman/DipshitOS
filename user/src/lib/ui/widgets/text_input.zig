@@ -34,7 +34,7 @@ const measure_text = draw.measure_text;
 
 pub const TextInput = struct {
     rect: Rect,
-    buf: [128]u8 = [_]u8{0} ** 128,
+    buf: [128]u8 = @as([128]u8, @splat(@as(u8, 0))),
     len: usize = 0,
     cursor: usize = 0,
     focused: bool = false,

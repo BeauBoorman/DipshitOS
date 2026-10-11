@@ -2922,10 +2922,10 @@ pub fn compileFiles(sources: []const []const u8) !usize {
 // Backward compatible: `zc a.z` compiles one source to the default output,
 // and no args compiles /host/MAIN.Z -> /host/MAIN.ELF.
 pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
-    var src_path_bufs: [MAX_FILES][40]u8 = [_][40]u8{[_]u8{0} ** 40} ** MAX_FILES;
-    var src_lens: [MAX_FILES]usize = [_]usize{0} ** MAX_FILES;
+    var src_path_bufs: [MAX_FILES][40]u8 = @as([MAX_FILES][40]u8, @splat(@as([40]u8, @as([40]u8, @splat(@as(u8, 0))))));
+    var src_lens: [MAX_FILES]usize = @as([MAX_FILES]usize, @splat(@as(usize, 0)));
     var src_paths: [MAX_FILES][]const u8 = undefined;
-    var out_path_buf: [40]u8 = [_]u8{0} ** 40;
+    var out_path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     // M34 HF6 (issue #740): the host share is the only store — the
     // defaults route to /host/ (the old /esp prefix would resolve to a
     // literal "esp/" subdirectory on the share and fail to write).

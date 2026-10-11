@@ -13,11 +13,11 @@ pub const page_op: u64 = version | 2;
 pub const close_op: u64 = version | 3;
 
 pub const Entry = extern struct {
-    name: [256]u8 = .{0} ** 256,
+    name: [256]u8 = @splat(0),
     size: u64 = 0,
     name_len: u16 = 0,
     is_dir: u8 = 0,
-    reserved: [5]u8 = .{0} ** 5,
+    reserved: [5]u8 = @splat(0),
 };
 
 pub const Header = extern struct {
@@ -88,9 +88,9 @@ test "B2: lossless colliding prefixes, name and entry boundaries" {
     const prefix = "abcdefghijklmnopqrstuvwxyzABCDE";
     try snapshot.append(prefix ++ "-one", 1, false);
     try snapshot.append(prefix ++ "-two", 2, true);
-    const exact = [_]u8{'x'} ** name_max;
+    const exact = @as([name_max]u8, @splat(@as(u8, 'x')));
     try snapshot.append(&exact, 3, false);
-    const over = [_]u8{'x'} ** (name_max + 1);
+    const over = @as([(name_max + 1)]u8, @splat(@as(u8, 'x')));
     try std.testing.expectError(error.NameLimit, snapshot.append(&over, 0, false));
     try std.testing.expectError(error.InvalidEntry, snapshot.append(prefix ++ "-one", 0, false));
     var name: [16]u8 = undefined;
@@ -106,10 +106,10 @@ test "B2: lossless colliding prefixes, name and entry boundaries" {
 test "B2: component, depth, path and traversal boundaries" {
     try std.testing.expect(valid_path("a/b/c/d/e/f/g/h", depth_max));
     try std.testing.expect(!valid_path("a/b/c/d/e/f/g/h/i", depth_max));
-    const name = [_]u8{'a'} ** 255;
+    const name = @as([255]u8, @splat(@as(u8, 'a')));
     try std.testing.expect(valid_path(&name, depth_max));
-    try std.testing.expect(!valid_path(&([_]u8{'a'} ** 256), depth_max));
-    const exact = name ++ "/" ++ ([_]u8{'b'} ** 254) ++ "/c";
+    try std.testing.expect(!valid_path(&(@as([256]u8, @splat(@as(u8, 'a')))), depth_max));
+    const exact = name ++ "/" ++ (@as([254]u8, @splat(@as(u8, 'b')))) ++ "/c";
     try std.testing.expectEqual(@as(usize, 512), exact.len);
     try std.testing.expect(valid_path(exact, depth_max));
     try std.testing.expect(!valid_path(exact ++ "d", depth_max));

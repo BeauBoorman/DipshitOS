@@ -11,7 +11,7 @@ const std = @import("std");
 const f = @import("curve25519.zig");
 const Fe = f.Fe;
 
-pub const basepoint = [_]u8{9} ++ [_]u8{0} ** 31;
+pub const basepoint = [_]u8{9} ++ @as([31]u8, @splat(@as(u8, 0)));
 
 /// X25519 scalar multiplication (RFC 7748 §5). `out = scalar * point`.
 pub fn scalarmult(out: *[32]u8, scalar: *const [32]u8, point: *const [32]u8) void {

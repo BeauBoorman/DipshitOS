@@ -110,7 +110,7 @@ test "ssh_cipher: zero-key Poly1305 key is the RFC 8439 A.1 zero block (76b8e0ad
     // With an all-zero 64-byte key and seq 0, that derivation must produce the
     // RFC 8439 Appendix A.1 test vector #1 block, whose first 256 bits are the
     // pinned `76b8e0ad…` Poly1305 key.
-    const key = [_]u8{0} ** key_len;
+    const key = @as([key_len]u8, @splat(@as(u8, 0)));
     var pkey: [32]u8 = undefined;
     polyKey(&pkey, 0, &key);
     const exp_pkey = try hex("76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7");
@@ -183,7 +183,7 @@ test "ssh_cipher: tag and ciphertext tampering are rejected (ct.ctEq), plaintext
     var tag: [tag_len]u8 = undefined;
     seal(&cipher, &tag, &plain, 3, &key);
 
-    const sentinel = [_]u8{0x5a} ** plain.len;
+    const sentinel = @as([plain.len]u8, @splat(@as(u8, 0x5a)));
     var out: [plain.len]u8 = sentinel;
 
     var bad_tag = tag;
@@ -206,7 +206,7 @@ test "ssh_cipher: tag and ciphertext tampering are rejected (ct.ctEq), plaintext
 }
 
 test "ssh_cipher: sequence-number nonce advances (wrong seq fails)" {
-    const key = [_]u8{0x24} ** key_len;
+    const key = @as([key_len]u8, @splat(@as(u8, 0x24)));
     const plain = try hex("0000000801deadbeef010203");
     var cipher0: [plain.len]u8 = undefined;
     var cipher1: [plain.len]u8 = undefined;

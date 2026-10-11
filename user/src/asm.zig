@@ -194,7 +194,7 @@ pub const AsmResult = union(enum) {
 };
 
 const Label = struct {
-    name: [24]u8 = [_]u8{0} ** 24,
+    name: [24]u8 = @as([24]u8, @splat(@as(u8, 0))),
     name_len: u8 = 0,
     offset: u32 = 0,
 
@@ -561,7 +561,7 @@ const StmtIter = struct {
 /// Assemble `src` into `code` (must be >= code_max bytes). Every failure
 /// names its 1-based statement line (semicolons start new lines).
 pub fn assemble(src: []const u8, code: []u8) AsmResult {
-    var labels: [max_labels]Label = [_]Label{.{}} ** max_labels;
+    var labels: [max_labels]Label = @as([max_labels]Label, @splat(@as(Label, .{})));
     var label_count: usize = 0;
     var entry_off: ?u32 = null;
     var words: usize = 0; // 4-byte units emitted so far
@@ -654,9 +654,9 @@ pub fn error_name(kind: ErrorKind) []const u8 {
 pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
     // M34 HF6 (issue #740): bare names route to the host share (the ESP
     // is gone).
-    var src_path_buf: [40]u8 = [_]u8{0} ** 40;
+    var src_path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     @memcpy(src_path_buf[0..6], "PROG.S");
-    var out_path_buf: [40]u8 = [_]u8{0} ** 40;
+    var out_path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     @memcpy(out_path_buf[0..7], "OUT.ELF");
     var src_len: usize = 6;
     var out_len: usize = 7;

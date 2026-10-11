@@ -742,7 +742,7 @@ pub const WindowBacking = struct {
 };
 
 const max_backing_windows: usize = 16;
-var window_backings: [max_backing_windows]?WindowBacking = [_]?WindowBacking{null} ** max_backing_windows;
+var window_backings: [max_backing_windows]?WindowBacking = @as([max_backing_windows]?WindowBacking, @splat(@as(?WindowBacking, null)));
 
 /// Associate a direct 32-bpp RGBA/RGBX backing buffer with a window ID.
 pub fn win_set_backing(win_id: u32, pixels: [*]u32, width: u32, height: u32) void {
@@ -1198,7 +1198,7 @@ pub fn fill_pill_buf(pixels: []u32, buf_w: u32, buf_h: u32, rect: Rect, color: u
 // ---------------------------------------------------------------------------
 
 test "draw: draw_image_buf source-over into a raw buffer" {
-    var buf: [16]u32 = [_]u32{0xFF202020} ** 16; // opaque dark gray, 4x4
+    var buf: [16]u32 = @as([16]u32, @splat(@as(u32, 0xFF202020))); // opaque dark gray, 4x4
     var src_px: [9]u32 = undefined;
     const src = Image{ .width = 3, .height = 3, .pixels = &src_px };
 
@@ -1230,8 +1230,8 @@ test "draw: draw_image_buf source-over into a raw buffer" {
 }
 
 test "draw: draw_image_buf clips to buffer and stride" {
-    var buf: [9]u32 = [_]u32{0xFF101010} ** 9; // 3x3
-    var src_px: [4]u32 = [_]u32{0xFFFFFFFF} ** 4;
+    var buf: [9]u32 = @as([9]u32, @splat(@as(u32, 0xFF101010))); // 3x3
+    var src_px: [4]u32 = @as([4]u32, @splat(@as(u32, 0xFFFFFFFF)));
     const src = Image{ .width = 2, .height = 2, .pixels = &src_px };
 
     // Blit at the bottom-right corner: only the (2,2) pixel fits

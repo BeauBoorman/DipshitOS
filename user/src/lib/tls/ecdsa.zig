@@ -21,7 +21,7 @@ const L = max_limbs;
 const Fe = [L]u64;
 
 fn zero() Fe {
-    return [_]u64{0} ** L;
+    return @as([L]u64, @splat(@as(u64, 0)));
 }
 
 pub const Error = error{

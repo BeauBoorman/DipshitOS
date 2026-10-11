@@ -15,9 +15,8 @@ pub fn parse(args: []const []const u8) !Command {
             if (std.mem.eql(u8, arg, name)) return error.UnsupportedFeature;
         if (std.mem.startsWith(u8, arg, "--jobs")) return error.UnsupportedParallelism;
     }
-    inline for (std.meta.fields(Command)) |field| {
-        if (std.mem.eql(u8, args[0], field.name)) {
-            const command: Command = @enumFromInt(field.value);
+    inline for (std.meta.tags(Command)) |command| {
+        if (std.mem.eql(u8, args[0], @tagName(command))) {
             const count: usize = switch (command) {
                 .inspect, .compile => 2,
                 .build => 3,

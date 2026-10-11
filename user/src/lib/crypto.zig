@@ -39,11 +39,11 @@ test "crypto: HKDF and SHA-384 are reachable from the umbrella (TLS 1.3 keystone
     hkdf.Sha256.extract(&prk, "salt", "ikm");
     var okm: [32]u8 = undefined;
     hkdf.Sha256.expand(&okm, &prk, "info");
-    try std.testing.expect(!ct.ctEq(&okm, &([_]u8{0} ** 32)));
+    try std.testing.expect(!ct.ctEq(&okm, &(@as([32]u8, @splat(@as(u8, 0))))));
 
     var d: [sha384.digest_len]u8 = undefined;
     sha384.sha384(&d, "abc");
-    try std.testing.expect(!ct.ctEq(&d, &([_]u8{0} ** sha384.digest_len)));
+    try std.testing.expect(!ct.ctEq(&d, &(@as([sha384.digest_len]u8, @splat(@as(u8, 0))))));
 
     // The SHA-384 HMAC must be distinct from the SHA-512 HMAC when both are
     // truncated to 48 bytes (different IV), i.e. HMAC-SHA384 is not
@@ -56,18 +56,18 @@ test "crypto: HKDF and SHA-384 are reachable from the umbrella (TLS 1.3 keystone
 
     // AES-GCM is reachable too (TLS_AES_128_GCM_SHA256 is mandatory to
     // implement, so this is the suite that makes SSH-only interop general).
-    const n12 = [_]u8{0} ** 12;
-    const k16 = [_]u8{0} ** 16;
+    const n12 = @as([12]u8, @splat(@as(u8, 0)));
+    const k16 = @as([16]u8, @splat(@as(u8, 0)));
     var zero_out: [0]u8 = undefined;
     var gt: [gcm.tag_len]u8 = undefined;
     gcm.seal128(&zero_out, &gt, "", "", &n12, &k16);
-    try std.testing.expect(!ct.ctEq(&gt, &([_]u8{0} ** gcm.tag_len)));
+    try std.testing.expect(!ct.ctEq(&gt, &(@as([gcm.tag_len]u8, @splat(@as(u8, 0))))));
 }
 
 test "crypto: HMAC-SHA256 and Ed25519 compose (a signed, authenticated transcript)" {
     // A tiny end-to-end composition: an Ed25519 key signs a transcript whose
     // integrity is also MAC'd. This is an integration smoke, not a protocol.
-    const seed = [_]u8{0x42} ** 32;
+    const seed = @as([32]u8, @splat(@as(u8, 0x42)));
     var pk: [32]u8 = undefined;
     ed25519.derivePublicKey(&pk, &seed);
 
@@ -78,13 +78,13 @@ test "crypto: HMAC-SHA256 and Ed25519 compose (a signed, authenticated transcrip
 
     var mac: [32]u8 = undefined;
     hmac.hmacSha256(&mac, &pk, transcript);
-    try std.testing.expect(!ct.ctEq(&mac, &([_]u8{0} ** 32)));
+    try std.testing.expect(!ct.ctEq(&mac, &(@as([32]u8, @splat(@as(u8, 0))))));
 }
 
 test "crypto: AEAD then X25519 shared-secret consistency" {
     // Derive a shared secret each way and use it as an AEAD key.
-    const a_sk = [_]u8{0x11} ** 32;
-    const b_sk = [_]u8{0x22} ** 32;
+    const a_sk = @as([32]u8, @splat(@as(u8, 0x11)));
+    const b_sk = @as([32]u8, @splat(@as(u8, 0x22)));
     var a_pk: [32]u8 = undefined;
     var b_pk: [32]u8 = undefined;
     x25519.scalarmultBase(&a_pk, &a_sk);
@@ -95,7 +95,7 @@ test "crypto: AEAD then X25519 shared-secret consistency" {
     x25519.scalarmult(&s2, &b_sk, &a_pk);
     try std.testing.expect(ct.ctEq(&s1, &s2));
 
-    const nonce = [_]u8{0} ** 12;
+    const nonce = @as([12]u8, @splat(@as(u8, 0)));
     var ctbuf: [5]u8 = undefined;
     var tag: [16]u8 = undefined;
     aead.seal(&ctbuf, &tag, "hello", "aad", &nonce, &s1);
@@ -122,7 +122,7 @@ test "crypto: OpenSSH cipher is not the RFC 8439 AEAD (distinct constructions)" 
     try std.testing.expect(ssh_cipher.open(&back, &ssh_ct, &ssh_tag, seq, &key));
     try std.testing.expectEqualSlices(u8, packet, &back);
 
-    const rfc_nonce = [_]u8{0} ** 12;
+    const rfc_nonce = @as([12]u8, @splat(@as(u8, 0)));
     var rfc_ct: [packet.len]u8 = undefined;
     var rfc_tag: [16]u8 = undefined;
     aead.seal(&rfc_ct, &rfc_tag, packet, "", &rfc_nonce, key[0..32]);

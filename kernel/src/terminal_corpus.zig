@@ -72,6 +72,10 @@
 //! the corpus drives it from outside through the pub feed/grid surface
 //! (`feed`, `line`, `cellAt`, `styleAt`, `cursorLine`/`cursorCol`).
 
+fn repeat_lit(comptime lit: []const u8, comptime n: usize) *const [n * lit.len:0]u8 {
+    if (n == 0) return "";
+    return lit ++ repeat_lit(lit, n - 1);
+}
 const std = @import("std");
 const t = @import("terminal.zig");
 
@@ -257,18 +261,18 @@ fn runAll(cases: []const Case) !void {
 }
 
 // Repeated inputs (comptime) so the tables stay readable.
-const a80: [80]u8 = [_]u8{'a'} ** 80;
-const a79: [79]u8 = [_]u8{'a'} ** 79;
+const a80: [80]u8 = @as([80]u8, @splat(@as(u8, 'a')));
+const a79: [79]u8 = @as([79]u8, @splat(@as(u8, 'a')));
 /// M80b: three spaces + 77 `a`s — an ICH that shoves 3 cells off the
 /// right margin of a full row.
-const spaces3_a77: [80]u8 = [_]u8{' '} ** 3 ++ [_]u8{'a'} ** 77;
+const spaces3_a77: [80]u8 = @as([3]u8, @splat(@as(u8, ' '))) ++ @as([77]u8, @splat(@as(u8, 'a')));
 /// M80g: an over-bound OSC payload (780 > osc_max) and a 70-byte title
 /// (past title_max 64) — the overflow and truncation probes.
-const x780: [780]u8 = [_]u8{'x'} ** 780;
-const t70: [70]u8 = [_]u8{'t'} ** 70;
+const x780: [780]u8 = @as([780]u8, @splat(@as(u8, 'x')));
+const t70: [70]u8 = @as([70]u8, @splat(@as(u8, 't')));
 /// M85a: 4097 sixels — once one byte past the 4 KiB capture bound; since
 /// M85b (#1814) an image 4097 pixels wide, far past `term_image.max_w`.
-const s4097: [4097]u8 = [_]u8{'s'} ** 4097;
+const s4097: [4097]u8 = @as([4097]u8, @splat(@as(u8, 's')));
 /// M85b: wrap a sixel payload in its DCS `q` … ST envelope.
 fn sx(comptime payload: []const u8) *const [payload.len + 5]u8 {
     return "\x1bPq" ++ payload ++ "\x1b\\";
@@ -305,7 +309,7 @@ const control_cases = [_]Case{
         // 127 LFs walk the cursor to the last row; the 128th scrolls the
         // grid up and drops the oldest row ("TOP") off the top.
         .name = "scroll at the bottom drops the oldest row",
-        .input = "TOP" ++ ("\n" ** 128) ++ "Z",
+        .input = "TOP" ++ (&@as([128:0]u8, @splat("\n"[0]))) ++ "Z",
         .lines = &.{""},
         .cursor = .{ 127, 1 },
         .used = 128,
@@ -619,7 +623,7 @@ const csi_cases = [_]Case{
     .{
         .name = "TBC 3 clears every stop and TAB clamps at the right margin",
         .input = "\x1b[H\x1b[3g\tZ",
-        .lines = &.{(" " ** 79) ++ "Z"},
+        .lines = &.{(&@as([79:0]u8, @splat(" "[0]))) ++ "Z"},
         .cursor = .{ 0, 80 },
         .used = 1,
     },
@@ -1039,14 +1043,14 @@ const m80c_cases = [_]Case{
     .{
         .name = "DECAWM disabled makes the next write overwrite the last column",
         .input = &a80 ++ "\x1b[?7lX",
-        .lines = &.{(("a") ** 79) ++ "X"},
+        .lines = &.{(repeat_lit("a", 79)) ++ "X"},
         .cursor = .{ 0, 79 },
         .used = 1,
     },
     .{
         .name = "SGR resolves a pending wrap before the next write",
         .input = &a80 ++ "\x1b[31mX",
-        .lines = &.{(("a") ** 79) ++ "X"},
+        .lines = &.{(repeat_lit("a", 79)) ++ "X"},
         .cursor = .{ 0, 80 },
         .used = 1,
         .rendition = .{ .fg = 1 },
@@ -1055,7 +1059,7 @@ const m80c_cases = [_]Case{
     .{
         .name = "soft reset also resolves a pending wrap",
         .input = &a80 ++ "\x1b[!pX",
-        .lines = &.{(("a") ** 79) ++ "X"},
+        .lines = &.{(repeat_lit("a", 79)) ++ "X"},
         .cursor = .{ 0, 80 },
         .used = 1,
     },
@@ -1673,7 +1677,7 @@ const image_cases = [_]Case{
     },
     .{
         .name = "the payload has no byte bound: 4.8 KiB of register definitions still places",
-        .input = sx("#1;2;100;0;0" ** 400 ++ "~"),
+        .input = sx(repeat_lit("#1;2;100;0;0", 400) ++ "~"),
         .images = .{ 1, 0, 0 },
         .pixels = &.{.{ .row = 0, .col = 0, .rgb = 0xff0000 }},
     },

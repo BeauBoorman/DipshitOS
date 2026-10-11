@@ -431,7 +431,7 @@ fn kick(qoff: u16, q: u16) void {
 /// failure. Mirrors the net/entropy resolve_dev shape; additionally records
 /// the device-config region (cfg_type 3) for the jacks/streams/chmaps read.
 fn resolve_dev(dev: u32) u64 {
-    var bar_base: [6]u64 = .{0} ** 6;
+    var bar_base: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < 6) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);

@@ -98,9 +98,9 @@ const FakeFiles = struct {
     /// 0 = absent, 1 = startup, 2 = profile.
     var startup_present: bool = true;
     var profile_present: bool = true;
-    var reads: [4]u8 = [_]u8{0} ** 4;
+    var reads: [4]u8 = @as([4]u8, @splat(@as(u8, 0)));
     var read_count: usize = 0;
-    var open_order: [2]u8 = [_]u8{0} ** 2;
+    var open_order: [2]u8 = @as([2]u8, @splat(@as(u8, 0)));
     var open_count: usize = 0;
 
     fn reset() void {

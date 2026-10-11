@@ -178,7 +178,7 @@ pub const Volume = struct {
     /// Usable data clusters; valid cluster numbers are 2..cluster_count+1.
     cluster_count: u32 = 0,
     root_cluster: u32 = 0,
-    label: [11]u8 = [_]u8{' '} ** 11,
+    label: [11]u8 = @as([11]u8, @splat(@as(u8, ' '))),
     has_label: bool = false,
 
     pub fn maxCluster(self: Volume) u32 {
@@ -327,11 +327,11 @@ pub const entry_len: usize = 32;
 pub const entries_per_sector: usize = sector_len / entry_len;
 
 pub const Entry = struct {
-    name: [max_name]u8 = [_]u8{0} ** max_name,
+    name: [max_name]u8 = @as([max_name]u8, @splat(@as(u8, 0))),
     name_len: u8 = 0,
     /// The 8.3 alias, always populated — FAT names an entry twice when it has
     /// an LFN, and both names are valid open() targets on a real volume.
-    short: [12]u8 = [_]u8{0} ** 12,
+    short: [12]u8 = @as([12]u8, @splat(@as(u8, 0))),
     short_len: u8 = 0,
     attr: u8 = 0,
     first_cluster: u32 = 0,
@@ -430,7 +430,7 @@ pub const DirIter = struct {
     /// the monitor's `usb ls` loop is on the single-threaded shell path.
     clusters_walked: u32 = 0,
     /// LFN assembly state.
-    lfn: [max_name]u8 = [_]u8{0} ** max_name,
+    lfn: [max_name]u8 = @as([max_name]u8, @splat(@as(u8, 0))),
     lfn_len: u8 = 0,
     lfn_checksum: u8 = 0,
     lfn_expect: u8 = 0, // sequence number the next part must carry
@@ -494,7 +494,7 @@ pub const DirIter = struct {
         const seq: u8 = ord & 0x1f;
         if (ord & 0x40 != 0) {
             // The first (highest-sequence) part starts a new run.
-            self.lfn = [_]u8{0} ** max_name;
+            self.lfn = @as([max_name]u8, @splat(@as(u8, 0)));
             self.lfn_len = 0;
             self.lfn_checksum = raw[13];
             self.lfn_expect = seq;
@@ -968,7 +968,7 @@ test "fat32_ro: MBR parse accepts a signed table and marks empty slots" {
     try std.testing.expect(table[3] == null);
 
     // An unsigned LBA 0 is not a partition table at all.
-    var bare: [sector_len]u8 = [_]u8{0} ** sector_len;
+    var bare: [sector_len]u8 = @as([sector_len]u8, @splat(@as(u8, 0)));
     try std.testing.expect(!parseMbr(&bare, &table));
 
     // The classifier picks the FAT32-typed slot, and refuses out-of-range indices.

@@ -157,6 +157,6 @@ test "C1 depth is refused before recursive rendering or TOML conversion" {
     try doc.appendChild(node, child);
     try std.testing.expectError(error.DepthLimit, checkTree(std.testing.allocator, doc.root));
     const cfg = try config(&.{ "render", "--from", "markdown", "--frontmatter", "toml" });
-    try preflight("." ** depth_limit, cfg);
-    try std.testing.expectError(error.DepthLimit, preflight("." ** (depth_limit + 1), cfg));
+    try preflight(&@as([depth_limit:0]u8, @splat("."[0])), cfg);
+    try std.testing.expectError(error.DepthLimit, preflight(&@as([(depth_limit + 1):0]u8, @splat("."[0])), cfg));
 }

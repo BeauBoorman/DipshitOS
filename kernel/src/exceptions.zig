@@ -100,8 +100,8 @@ pub fn frame_write(frame: *VectorFrame, reg: u5, value: u64) bool {
     return true;
 }
 
-var sample_read_active: [4]bool = [_]bool{false} ** 4;
-var sample_read_fault: [4]bool = [_]bool{false} ** 4;
+var sample_read_active: [4]bool = @as([4]bool, @splat(@as(bool, false)));
+var sample_read_fault: [4]bool = @as([4]bool, @splat(@as(bool, false)));
 
 /// IRQ-only, fault-safe user read with EL0 permissions. LDTR refuses the
 /// identity overlay even if another thread unmaps a page after validation.
@@ -324,13 +324,13 @@ fn resume_core() usize {
 /// x23=0x1e/x26=0x10040080 crash family); (b) on SMP, core 1's exception
 /// entry unconditionally overwrote core 0's staged frame mid-handler.
 /// Meaningful only in IRQ context, on the local core.
-pub var resume_frame: [max_resume_cores]u64 = [_]u64{0} ** max_resume_cores;
+pub var resume_frame: [max_resume_cores]u64 = @as([max_resume_cores]u64, @splat(@as(u64, 0)));
 
 /// SP_EL0 to install before the vector stub restores registers and `eret`s.
 /// EL1h tasks do not consume it, but an EL0t task must regain its separate
 /// userspace stack when scheduled after an EL1 task. Per-core like
 /// `resume_frame`.
-pub var resume_sp_el0: [max_resume_cores]u64 = [_]u64{0} ** max_resume_cores;
+pub var resume_sp_el0: [max_resume_cores]u64 = @as([max_resume_cores]u64, @splat(@as(u64, 0)));
 /// Source-frame guard released only after the vector has changed SP. The
 /// pointer array is per-core; restore scratch registers are still saved.
 pub export var exc_scheduler_handoff: [max_resume_cores]?*u64 = @splat(null);
@@ -381,7 +381,7 @@ pub fn installed() bool {
 /// a shared counter was a plain RMW race that lost increments. Indexed by
 /// `resume_core()`; `handled_count()` sums the slots. Same literal-4
 /// rationale as `max_resume_cores` above (smp imports this module).
-var handled_count_value: [max_resume_cores]u64 = [_]u64{0} ** max_resume_cores;
+var handled_count_value: [max_resume_cores]u64 = @as([max_resume_cores]u64, @splat(@as(u64, 0)));
 var resume_count_value: u64 = 0;
 
 /// Total exceptions taken since boot.
@@ -1840,7 +1840,7 @@ test "exceptions: mode_name decodes SPSR M field" {
 }
 
 test "exceptions: vector-frame helpers match the reverse stp layout" {
-    var frame: VectorFrame = [_]u64{0} ** vector_frame_slots;
+    var frame: VectorFrame = @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
     try std.testing.expect(frame_write(&frame, 0, 0x10));
     try std.testing.expect(frame_write(&frame, 1, 0x11));
     try std.testing.expect(frame_write(&frame, 8, 0x18));
@@ -1881,8 +1881,8 @@ test "exceptions: is_from_el0 matches SPSR M field 0x0 only" {
 }
 
 test "exceptions: an EL0 sync fault reaches the fault dispatcher and resumes its frame" {
-    var frame: VectorFrame = [_]u64{0} ** vector_frame_slots;
-    var selected: VectorFrame = [_]u64{0} ** vector_frame_slots;
+    var frame: VectorFrame = @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
+    var selected: VectorFrame = @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
     test_fault_esr = 0;
     test_fault_far = 0;
     test_fault_resume_frame = &selected;
@@ -1897,7 +1897,7 @@ test "exceptions: an EL0 sync fault reaches the fault dispatcher and resumes its
 }
 
 test "exceptions: SVC dispatcher mutates x0 and resumes the same EL0 frame" {
-    var frame: VectorFrame = [_]u64{0} ** vector_frame_slots;
+    var frame: VectorFrame = @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
     try std.testing.expect(frame_write(&frame, 0, 41));
     test_svc_immediate = 0;
     test_svc_resume_frame = null;
@@ -1911,8 +1911,8 @@ test "exceptions: SVC dispatcher mutates x0 and resumes the same EL0 frame" {
 }
 
 test "exceptions: handled SVC may select another existing scheduler frame" {
-    var frame: VectorFrame = [_]u64{0} ** vector_frame_slots;
-    var selected: VectorFrame = [_]u64{0} ** vector_frame_slots;
+    var frame: VectorFrame = @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
+    var selected: VectorFrame = @as([vector_frame_slots]u64, @splat(@as(u64, 0)));
     test_svc_resume_frame = &selected;
     set_svc_dispatcher(test_svc_handler);
     const result = exc_dispatch(&frame, 0x15 << 26, 0, 0x4000, 0, kind_sync);

@@ -3662,7 +3662,7 @@ fn canonicalVolumePath(buf: *[file_table.max_path_len]u8, arg: []const u8) ?[]co
 
 const UsbVolume = struct {
     src: fat32_ro.SectorSource = .{ .ctx = null, .readFn = unusableSource },
-    parsed: file_table.ParsedPath = .{ .partition = .usb_fat, .path = [_]u8{0} ** file_table.max_path_len, .path_len = 0 },
+    parsed: file_table.ParsedPath = .{ .partition = .usb_fat, .path = @as([file_table.max_path_len]u8, @splat(@as(u8, 0))), .path_len = 0 },
     vol: fat32_ro.Volume = .{},
 
     fn unusableSource(_: ?*anyopaque, _: u32, _: *[fat32_ro.sector_len]u8) bool {

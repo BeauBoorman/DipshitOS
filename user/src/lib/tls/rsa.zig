@@ -396,7 +396,7 @@ test "rsa: wrong hash size, short modulus and over-long signature are refused" {
     // A truncated modulus is not acceptable by policy.
     try std.testing.expect(!modulusAcceptable(n[nn - 128 .. nn]));
     // An all-zero signature is 0^e = 0, which has no valid padding.
-    var zero: [256]u8 = [_]u8{0} ** 256;
+    var zero: [256]u8 = @as([256]u8, @splat(@as(u8, 0)));
     try std.testing.expect(!verifyPkcs1(n[0..nn], e[0..en], .sha256, v.msg, &zero));
     try std.testing.expect(!verifyPss(n[0..nn], e[0..en], .sha256, v.msg, &zero));
     // A representative equal to the modulus is out of range.

@@ -13,7 +13,7 @@ const std = @import("std");
 /// Maximum bytes captured in the ring buffer.
 pub const capacity: usize = 512;
 
-var buf: [capacity]u8 = [_]u8{0} ** capacity;
+var buf: [capacity]u8 = @as([capacity]u8, @splat(@as(u8, 0)));
 var head: usize = 0; // next write position
 var count: usize = 0; // bytes written (capped at capacity)
 

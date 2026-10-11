@@ -33,18 +33,18 @@ pub const tombstone_max_bytes: usize = 1024;
 /// A single tombstone record.
 pub const Tombstone = struct {
     pid: u64,
-    name: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     exit_status: u64,
     fault_addr: u64 = 0,
     /// Faulting PC (ELR) — the code address used for symbol resolution.
     pc: u64 = 0,
     tick: u64,
-    serial_snapshot: [512]u8 = [_]u8{0} ** 512,
+    serial_snapshot: [512]u8 = @as([512]u8, @splat(@as(u8, 0))),
     serial_len: usize = 0,
     /// "(in name+0xoffset)" note resolved via the kernel symbol table
     /// (M22 D3, issue #326). Empty when nothing matched.
-    sym_note: [96]u8 = [_]u8{0} ** 96,
+    sym_note: [96]u8 = @as([96]u8, @splat(@as(u8, 0))),
     sym_note_len: usize = 0,
 };
 
@@ -69,7 +69,7 @@ const FaultEvidence = struct {
 };
 
 var evidence: [max_fault_evidence]FaultEvidence = undefined;
-var evidence_used: [max_fault_evidence]bool = [_]bool{false} ** max_fault_evidence;
+var evidence_used: [max_fault_evidence]bool = @as([max_fault_evidence]bool, @splat(@as(bool, false)));
 var evidence_cursor: usize = 0;
 
 /// Exception-context note: task `pid` just took an EL0 fault at far/pc.
@@ -111,7 +111,7 @@ fn take_evidence(pid: u64) ?FaultEvidence {
 pub fn init() void {
     tombstone_head = 0;
     tombstone_count = 0;
-    evidence_used = [_]bool{false} ** max_fault_evidence;
+    evidence_used = @as([max_fault_evidence]bool, @splat(@as(bool, false)));
     evidence_cursor = 0;
 }
 

@@ -220,7 +220,7 @@ pub fn virtio_pci_init(st: *const SystemTable) bool {
     evidence.write_marker_var(st, marker_vpscan);
 
     // BAR bases (memory BARs; 64-bit pairs merged).
-    var bar_base: [6]u64 = .{0} ** 6;
+    var bar_base: [6]u64 = @splat(0);
     var bi: usize = 0;
     while (bi < 6) : (bi += 1) {
         const low = pci.pci_read32(pci.pci_ecam, 0, console_dev, 0, 0x10 + @as(u32, @intCast(bi)) * 4);

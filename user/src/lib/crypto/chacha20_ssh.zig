@@ -88,8 +88,8 @@ pub fn xorStream(out: []u8, in: []const u8, key: *const [key_len]u8, counter: u6
 // ---------------------------------------------------------------------------
 
 test "chacha20_ssh: RFC 8439 A.1 TV#1 zero block (counter 0)" {
-    const key = [_]u8{0} ** key_len;
-    const nonce = [_]u8{0} ** nonce_len;
+    const key = @as([key_len]u8, @splat(@as(u8, 0)));
+    const nonce = @as([nonce_len]u8, @splat(@as(u8, 0)));
     var out: [block_len]u8 = undefined;
     block(&key, 0, &nonce, &out);
     const expected = try hex(
@@ -102,8 +102,8 @@ test "chacha20_ssh: RFC 8439 A.1 TV#1 zero block (counter 0)" {
 }
 
 test "chacha20_ssh: 64-bit counter advances through RFC 8439 A.1 TV#2/TV#3" {
-    const key = [_]u8{0} ** key_len;
-    const nonce = [_]u8{0} ** nonce_len;
+    const key = @as([key_len]u8, @splat(@as(u8, 0)));
+    const nonce = @as([nonce_len]u8, @splat(@as(u8, 0)));
     var out: [block_len]u8 = undefined;
     const exp2 = try hex(
         "9f07e7be5551387a98ba977c732d080d" ++
@@ -127,8 +127,8 @@ test "chacha20_ssh: counter high word and nonce occupy djb state words 13-15" {
     // djb {counter=2^32, nonce=0} puts 1 in state[13]; the RFC layout puts
     // its 96-bit nonce there, so this is the same block as RFC counter 0 with
     // nonce = {01,00,00,00, 00*8}.
-    const key = [_]u8{0} ** 32;
-    const nonce0 = [_]u8{0} ** nonce_len;
+    const key = @as([32]u8, @splat(@as(u8, 0)));
+    const nonce0 = @as([nonce_len]u8, @splat(@as(u8, 0)));
     var djb_out: [block_len]u8 = undefined;
     var rfc_out: [block_len]u8 = undefined;
     block(&key, 1 << 32, &nonce0, &djb_out);

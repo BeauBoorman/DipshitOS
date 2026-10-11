@@ -119,14 +119,14 @@ const Entry = struct {
     deny: bool = false,
     secret: bool = false,
     partition: file_table.Partition = .host,
-    path: [max_path_len]u8 = [_]u8{0} ** max_path_len,
+    path: [max_path_len]u8 = @as([max_path_len]u8, @splat(@as(u8, 0))),
     path_len: u16 = 0,
     mode: u16 = default_file_mode,
     uid: u32 = process.uid_user,
 };
 
 /// Metadata table (pure BSS). Entries are never evicted to make room.
-var entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries;
+var entries: [max_entries]Entry = @as([max_entries]Entry, @splat(@as(Entry, .{})));
 var entry_count: usize = 0;
 
 /// Clear the table (boot + host tests; `load` also starts from empty).

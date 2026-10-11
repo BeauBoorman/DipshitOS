@@ -125,13 +125,13 @@ pub const event_bytes: usize = @sizeOf(Event);
 // ---------------------------------------------------------------------------
 
 var storage: [process.max_processes][max_events]Event =
-    [_][max_events]Event{[_]Event{.{ .kind = 0, .flags = 0, .seq = 0, .arg0 = 0, .arg1 = 0 }} ** max_events} ** process.max_processes;
-var head: [process.max_processes]usize = [_]usize{0} ** process.max_processes;
-var count: [process.max_processes]usize = [_]usize{0} ** process.max_processes;
-var next_seq: [process.max_processes]u32 = [_]u32{1} ** process.max_processes;
-var pushed_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
-var popped_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
-var dropped_counts: [process.max_processes]u64 = [_]u64{0} ** process.max_processes;
+    @as([process.max_processes][max_events]Event, @splat(@as([max_events]Event, @as([max_events]Event, @splat(@as(Event, .{ .kind = 0, .flags = 0, .seq = 0, .arg0 = 0, .arg1 = 0 }))))));
+var head: [process.max_processes]usize = @as([process.max_processes]usize, @splat(@as(usize, 0)));
+var count: [process.max_processes]usize = @as([process.max_processes]usize, @splat(@as(usize, 0)));
+var next_seq: [process.max_processes]u32 = @as([process.max_processes]u32, @splat(@as(u32, 1)));
+var pushed_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
+var popped_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
+var dropped_counts: [process.max_processes]u64 = @as([process.max_processes]u64, @splat(@as(u64, 0)));
 
 /// Hook for scheduler wakeup (notified whenever an event is pushed).
 pub var on_event_pushed: ?*const fn (usize) void = null;

@@ -543,13 +543,13 @@ pub fn parseFuncDef(text: []const u8) ?FuncDef {
 }
 
 pub const Func = struct {
-    name: [func_name_max]u8 = [_]u8{0} ** func_name_max,
+    name: [func_name_max]u8 = @as([func_name_max]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
-    arg_names: [func_arg_max][func_arg_name_max]u8 = [_][func_arg_name_max]u8{[_]u8{0} ** func_arg_name_max} ** func_arg_max,
-    arg_name_lens: [func_arg_max]usize = [_]usize{0} ** func_arg_max,
+    arg_names: [func_arg_max][func_arg_name_max]u8 = @as([func_arg_max][func_arg_name_max]u8, @splat(@as([func_arg_name_max]u8, @as([func_arg_name_max]u8, @splat(@as(u8, 0)))))),
+    arg_name_lens: [func_arg_max]usize = @as([func_arg_max]usize, @splat(@as(usize, 0))),
     arg_count: usize = 0,
-    body: [func_cmds_max][func_cmd_max]u8 = [_][func_cmd_max]u8{[_]u8{0} ** func_cmd_max} ** func_cmds_max,
-    body_lens: [func_cmds_max]usize = [_]usize{0} ** func_cmds_max,
+    body: [func_cmds_max][func_cmd_max]u8 = @as([func_cmds_max][func_cmd_max]u8, @splat(@as([func_cmd_max]u8, @as([func_cmd_max]u8, @splat(@as(u8, 0)))))),
+    body_lens: [func_cmds_max]usize = @as([func_cmds_max]usize, @splat(@as(usize, 0))),
     body_count: usize = 0,
 
     pub fn argName(self: *const Func, i: usize) []const u8 {
@@ -562,7 +562,7 @@ pub const Func = struct {
 };
 
 pub const FuncTable = struct {
-    funcs: [func_max]Func = [_]Func{.{}} ** func_max,
+    funcs: [func_max]Func = @as([func_max]Func, @splat(@as(Func, .{}))),
     count: usize = 0,
 
     pub fn find(self: *const FuncTable, name: []const u8) ?usize {

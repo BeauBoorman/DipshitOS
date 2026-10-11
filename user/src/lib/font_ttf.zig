@@ -906,7 +906,7 @@ pub const TrueTypeFace = struct {
 
     pub const GlyphCache = struct {
         // Fast direct cache for ASCII 0x20..0x7E
-        ascii_entries: [95]CachedGlyph = [_]CachedGlyph{.{
+        ascii_entries: [95]CachedGlyph = @splat(@as(CachedGlyph, .{
             .valid = false,
             .width = 0,
             .height = 0,
@@ -914,8 +914,8 @@ pub const TrueTypeFace = struct {
             .bearing_y = 0,
             .advance_width = 0,
             .alpha_offset = 0,
-        }} ** 95,
-        alpha_storage: [32768]u8 = [_]u8{0} ** 32768,
+        })),
+        alpha_storage: [32768]u8 = @as([32768]u8, @splat(@as(u8, 0))),
         storage_used: usize = 0,
 
         pub fn get_or_render(
@@ -1261,7 +1261,7 @@ test "GlyphCache and blend_glyph_bgra render text into 32-bpp BGRA buffer" {
     // Allocate a 120x30 32-bpp BGRA destination surface filled with dark slate (0x101418)
     const buf_w: usize = 120;
     const buf_h: usize = 30;
-    var screen_buf = [_]u32{0xFF101418} ** (buf_w * buf_h);
+    var screen_buf = @as([(buf_w * buf_h)]u32, @splat(@as(u32, 0xFF101418)));
 
     const text = "Virelai";
     var cur_x: i32 = 8;

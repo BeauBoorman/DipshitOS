@@ -94,9 +94,9 @@ pub fn cdbWrite10(lba: u32, blocks: u16) [10]u8 {
 // --- SCSI response parsers -------------------------------------------------
 
 pub const Inquiry = struct {
-    vendor: [8]u8 = [_]u8{' '} ** 8,
-    product: [16]u8 = [_]u8{' '} ** 16,
-    rev: [4]u8 = [_]u8{' '} ** 4,
+    vendor: [8]u8 = @as([8]u8, @splat(@as(u8, ' '))),
+    product: [16]u8 = @as([16]u8, @splat(@as(u8, ' '))),
+    rev: [4]u8 = @as([4]u8, @splat(@as(u8, ' '))),
 };
 
 /// INQUIRY response: vendor at bytes 8..15, product at 16..31, revision at
@@ -229,7 +229,7 @@ pub fn probe(lba: u32) Info {
     const tur = cdbTestUnitReady();
     info.tur = transfer(slot, &tur, false, &no_data, 0);
 
-    var ibuf: [36]u8 = [_]u8{0} ** 36;
+    var ibuf: [36]u8 = @as([36]u8, @splat(@as(u8, 0)));
     const inq = cdbInquiry(36);
     const ir = transfer(slot, &inq, true, ibuf[0..36], 36);
     if (ir.ok) {
@@ -238,7 +238,7 @@ pub fn probe(lba: u32) Info {
         info.inquiry_ok = got >= 36;
     }
 
-    var cbuf: [8]u8 = [_]u8{0} ** 8;
+    var cbuf: [8]u8 = @as([8]u8, @splat(@as(u8, 0)));
     const cap = cdbReadCapacity10();
     const cr = transfer(slot, &cap, true, cbuf[0..8], 8);
     if (cr.ok) {
@@ -284,7 +284,7 @@ pub fn present() bool {
 pub fn capacity() ?Capacity {
     const slot = xhci.usb_bulk_dev();
     if (slot == 0) return null;
-    var cbuf: [8]u8 = [_]u8{0} ** 8;
+    var cbuf: [8]u8 = @as([8]u8, @splat(@as(u8, 0)));
     const cap = cdbReadCapacity10();
     const cr = transfer(slot, &cap, true, cbuf[0..8], 8);
     if (!cr.ok) return null;
@@ -341,7 +341,7 @@ test "usb_msc: CBW encodes signature/tag/len/dir/lun/cdb" {
 }
 
 test "usb_msc: CSW parses signature/tag/residue/status" {
-    var buf: [csw_len]u8 = [_]u8{0} ** csw_len;
+    var buf: [csw_len]u8 = @as([csw_len]u8, @splat(@as(u8, 0)));
     std.mem.writeInt(u32, buf[0..4], csw_signature, .little);
     std.mem.writeInt(u32, buf[4..8], 0x0badf00d, .little);
     std.mem.writeInt(u32, buf[8..12], 7, .little);
@@ -365,7 +365,7 @@ test "usb_msc: SCSI CDB shapes (opcodes + big-endian LBA/length)" {
 }
 
 test "usb_msc: INQUIRY/CAPACITY parsers" {
-    var inq: [36]u8 = [_]u8{0} ** 36;
+    var inq: [36]u8 = @as([36]u8, @splat(@as(u8, 0)));
     @memcpy(inq[8..16], "ACME    ");
     @memcpy(inq[16..32], "USB DISK 2.0    ");
     @memcpy(inq[32..36], "1.00");

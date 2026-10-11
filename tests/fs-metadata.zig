@@ -7,7 +7,7 @@ var bytes: [64]u8 = undefined;
 var checkpoint: []const u8 = "start";
 var checks: usize = 0;
 var pending: [8][meta.max_relative_path]u8 = undefined;
-var lengths: [8]usize = .{0} ** 8;
+var lengths: [8]usize = @splat(0);
 var identities: [8]meta.Identity = undefined;
 
 fn svc(number: u64, args: [6]u64) i64 {
@@ -174,7 +174,7 @@ fn pinned() void {
     checkpoint = "B5 names registers faults and policy";
     for ([_][]const u8{ ".", "..", "a/b", "nul\x00" }) |name| check(named(meta.create_op, top, name, 0) == -1);
     check(named(meta.create_op, top, "", 0) == -1);
-    check(named(meta.create_op, top, "n" ** 256, 0) == -8);
+    check(named(meta.create_op, top, &@as([256:0]u8, @splat("n"[0])), 0) == -8);
     check(svc(79, .{ meta.create_op, @bitCast(top), 0x1_2000_0000, 4, 0, 0 }) == -3);
     check(svc(79, .{ meta.create_op, @bitCast(top), @intFromPtr("x"), 1, 1, 0 }) == -1);
     check(svc(79, .{ meta.pin_close_op, @bitCast(top), 1, 0, 0, 0 }) == -1);
@@ -204,7 +204,7 @@ fn pinned() void {
 fn discover(root: []const u8, root_id: meta.Identity) void {
     // Boris's cycle rule: remember the root, refuse a repeated directory
     // identity, and walk returned names, not a host-supplied file list.
-    lengths = .{0} ** 8;
+    lengths = @splat(0);
     identities[0] = root_id;
     var queued: usize = 1;
     var current: usize = 0;

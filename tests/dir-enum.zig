@@ -140,7 +140,7 @@ export fn b2_main() noreturn {
     checkpoint = "depth 9 refusal";
     check(open("d/e/e/e/e/e/e/e/e") == -8);
     checkpoint = "component 256 refusal";
-    check(open(&([_]u8{'x'} ** 256)) == -8);
+    check(open(&(@as([256]u8, @splat(@as(u8, 'x'))))) == -8);
     checkpoint = "ACL refusal";
     check(open("B2DENIED") == -7);
     checkpoint = "traversal refusal";

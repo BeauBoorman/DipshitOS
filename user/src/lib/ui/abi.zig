@@ -485,7 +485,7 @@ pub fn wm_mail_request(kind: u8, id: u32, x: u16, y: u16, w: u16, h: u16, title:
         .y = y,
         .w = w,
         .h = h,
-        .title = [_]u8{0} ** wm_rpc_title_max,
+        .title = @as([wm_rpc_title_max]u8, @splat(@as(u8, 0))),
     };
     const take = @min(title.len, wm_rpc_title_max);
     @memcpy(req.title[0..take], title[0..take]);
@@ -923,7 +923,7 @@ pub fn exec_program_args(name: []const u8, args: []const []const u8) i64 {
     for (args) |a| {
         if (a.len >= exec_arg_slot_bytes) return -1;
     }
-    var block: [exec_max_args * exec_arg_slot_bytes]u8 = [_]u8{0} ** (exec_max_args * exec_arg_slot_bytes);
+    var block: [exec_max_args * exec_arg_slot_bytes]u8 = @as([(exec_max_args * exec_arg_slot_bytes)]u8, @splat(@as(u8, 0)));
     for (args, 0..) |a, i| {
         @memcpy(block[i * exec_arg_slot_bytes ..][0..a.len], a);
     }
@@ -966,7 +966,7 @@ pub fn parse_procs(raw: []const u8, row_count: usize, out: []ProcInfo) usize {
         const pid = std.mem.readInt(u64, raw[off .. off + 8][0..8], .little);
         const state_raw = std.mem.readInt(u64, raw[off + 8 .. off + 16][0..8], .little);
         const exit_status = std.mem.readInt(u64, raw[off + 16 .. off + 24][0..8], .little);
-        var name: [16]u8 = [_]u8{0} ** 16;
+        var name: [16]u8 = @as([16]u8, @splat(@as(u8, 0)));
         @memcpy(&name, raw[off + 24 .. off + 40]);
 
         var name_len: usize = 0;

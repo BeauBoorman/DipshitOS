@@ -194,7 +194,7 @@ pub const dir_type_file: u8 = 0;
 pub const dir_type_dir: u8 = 1;
 
 pub const DirEntry = struct {
-    name: [31]u8 = [_]u8{0} ** 31,
+    name: [31]u8 = @as([31]u8, @splat(@as(u8, 0))),
     name_len: usize = 0,
     type: u8 = dir_type_file,
     size: u64 = 0,
@@ -672,7 +672,7 @@ pub fn snapshot(raw_path: []const u8, out: *directory.Snapshot) u8 {
     const opened = snapshot_exchange(op_dir_open, path) orelse return st_host_error;
     if (opened.status != st_ok) return opened.status;
     if (opened.data.len != 8) return st_host_error;
-    var request: [12]u8 = .{0} ** 12;
+    var request: [12]u8 = @splat(0);
     @memcpy(request[0..8], opened.data);
     var closed = false;
     defer if (!closed) {
@@ -699,7 +699,7 @@ test "B2: legacy backend v2 rows and EOF decode losslessly and fail closed" {
     var page = directory.Page{
         .header = .{ .next = 1, .count = 1, .end = 1 },
     };
-    const name = [_]u8{'n'} ** 255;
+    const name = @as([255]u8, @splat(@as(u8, 'n')));
     page.entries[0] = .{ .name_len = 255, .size = 0x0123456789abcdef };
     @memcpy(page.entries[0].name[0..255], &name);
     const raw: [*]const u8 = @ptrCast(&page);
@@ -1351,23 +1351,23 @@ test "virtio_file: G3 — probe request shape + the raw 32 KiB pattern reply" {
 
 test "virtio_file: G4 — hostile envelopes (bad status, truncated rows) are honest" {
     // Status 4 (host error) passes through with no data.
-    var buf: [64]u8 = [_]u8{0} ** 64;
+    var buf: [64]u8 = @as([64]u8, @splat(@as(u8, 0)));
     buf[0] = st_host_error;
     std.mem.writeInt(u16, buf[1..3], 0, .little);
     const rep = decode_reply(&buf);
     try testing.expectEqual(st_host_error, rep.status);
     try testing.expectEqual(@as(usize, 0), rep.data.len);
     // A short LIST row decodes as an empty entry (no OOB).
-    const row = decode_entry_row(&[_]u8{0x41} ** 10);
+    const row = decode_entry_row(&@as([10]u8, @splat(@as(u8, 0x41))));
     try testing.expectEqual(@as(usize, 0), row.name_len);
     // An exact-length zeroed row is an empty (NUL) name.
-    const zero_row = decode_entry_row(&[_]u8{0} ** entry_row_len);
+    const zero_row = decode_entry_row(&@as([entry_row_len]u8, @splat(@as(u8, 0))));
     try testing.expectEqual(@as(usize, 0), zero_row.name_len);
     try testing.expectEqual(dir_type_file, zero_row.type);
 }
 
 test "virtio_file: G5 — entry row round trip + read payload + streaming cksum" {
-    var row: [entry_row_len]u8 = [_]u8{0} ** entry_row_len;
+    var row: [entry_row_len]u8 = @as([entry_row_len]u8, @splat(@as(u8, 0)));
     const name = "HELLO.TXT";
     @memcpy(row[0..name.len], name);
     row[31] = dir_type_file;
@@ -1383,7 +1383,7 @@ test "virtio_file: G5 — entry row round trip + read payload + streaming cksum"
     try testing.expectEqualStrings("/dir/file.bin", payload[0..13]);
     try testing.expectEqual(@as(u64, 0x1234), std.mem.readInt(u64, payload[13..21], .little));
     // Over-long path is refused honestly.
-    const long = [_]u8{0x41} ** (path_max + 1);
+    const long = @as([(path_max + 1)]u8, @splat(@as(u8, 0x41)));
     try testing.expectEqual(@as(?usize, null), build_read_payload(&long, 0, &payload));
     // The streaming checksum equals the one-shot checksum over the same
     // bytes, across an odd-length chunk split.
@@ -1396,7 +1396,7 @@ test "virtio_file: G5 — entry row round trip + read payload + streaming cksum"
 
 test "virtio_file: G6 — request encode bounds (over-long payload, small out)" {
     var out: [16]u8 = undefined;
-    const long = [_]u8{0x41} ** 0x10000;
+    const long = @as([0x10000]u8, @splat(@as(u8, 0x41)));
     try testing.expectEqual(@as(?usize, null), encode_request(op_list, 0, &long, &out));
     try testing.expectEqual(@as(?usize, null), encode_request(op_list, 0, "abc", out[0..2]));
     const n = encode_request(op_list, 0, "abc", &out) orelse return error.TestUnexpectedResult;
@@ -1495,7 +1495,7 @@ test "virtio_file: G11 — rename NUL-framed payload + bounds" {
     try testing.expectEqual(@as(u8, 0), payload[from.len]);
     try testing.expectEqualStrings(to, payload[from.len + 1 .. plen]);
     // Over-long rename is refused before any exchange.
-    const long = [_]u8{0x41} ** (path_max + 1);
+    const long = @as([(path_max + 1)]u8, @splat(@as(u8, 0x41)));
     try testing.expectEqual(@as(u8, st_host_error), rename(&long, "x"));
     try testing.expectEqual(@as(u8, st_host_error), rename("x", &long));
 }
@@ -1528,7 +1528,7 @@ test "virtio_file: replacement is additive and malformed paths never dispatch" {
     try testing.expectEqual(RenameMode.replace, Probe.mode);
     try testing.expectEqual(st_host_error, replace("stage\x00escape", "out"));
     try testing.expectEqual(st_host_error, replace("stage", ""));
-    const long = [_]u8{'x'} ** (path_max + 1);
+    const long = @as([(path_max + 1)]u8, @splat(@as(u8, 'x')));
     try testing.expectEqual(st_host_error, replace(&long, "out"));
     try testing.expectEqual(@as(usize, 2), Probe.calls);
 }
@@ -1591,7 +1591,7 @@ test "virtio_file: G13 — HF7 clone op: 0x0c, NUL frame, bounds, honest refusal
     try testing.expectEqual(@as(u8, 0), payload[from.len]);
     try testing.expectEqualStrings(to, payload[from.len + 1 .. plen]);
     // Bounds + NUL-safety are refused BEFORE any exchange.
-    const long = [_]u8{0x41} ** (path_max + 1);
+    const long = @as([(path_max + 1)]u8, @splat(@as(u8, 0x41)));
     try testing.expectEqual(@as(u8, st_host_error), clone(&long, "x"));
     try testing.expectEqual(@as(u8, st_host_error), clone("x", &long));
     try testing.expectEqual(@as(u8, st_host_error), clone("", "x"));
@@ -1640,7 +1640,7 @@ test "virtio_file: read_at_into streams a region larger than one reply" {
     // duplicated, or offset-shifted exchange moves one of them, and the
     // whole-region compare below catches anything softer.
     const fixture_bytes = comptime blk: {
-        var b = [_]u8{0xA5} ** total;
+        var b = @as([total]u8, @splat(@as(u8, 0xA5)));
         b[0] = 0x11;
         b[read_chunk_max - 1] = 0x22; // last byte of reply 1
         b[read_chunk_max] = 0x33; // first byte of reply 2

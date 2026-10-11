@@ -27,7 +27,7 @@ pub const SGI_IPI_RESCHEDULE: u8 = 0;
 pub const SGI_IPI_TLB_SHOOTDOWN: u8 = 1;
 pub const SGI_IPI_PING: u8 = 2;
 
-pub var ipi_counts: [max_cores][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** max_cores;
+pub var ipi_counts: [max_cores][4]u64 = @as([max_cores][4]u64, @splat(@as([4]u64, @as([4]u64, @splat(@as(u64, 0))))));
 
 // Stacks for secondary cores
 pub var secondary_stacks: [max_cores][core_stack_size]u8 align(16) = undefined;

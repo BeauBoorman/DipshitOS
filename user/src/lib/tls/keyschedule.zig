@@ -163,7 +163,7 @@ test "rfc8448: X25519 shared secret from the published key pair" {
 }
 
 test "rfc8448: early/handshake/master secrets and the derived steps" {
-    var zero: [32]u8 = [_]u8{0} ** 32;
+    var zero: [32]u8 = @as([32]u8, @splat(@as(u8, 0)));
     var empty_hash: [32]u8 = undefined;
     crypto.sha256.sha256(&empty_hash, "");
 
@@ -267,7 +267,7 @@ test "rfc8448: application traffic secrets need the transcript up to server Fini
     transcriptAfterServerFlight(&th_sf);
 
     decode(&hs, vectors.handshake_secret);
-    var zero = [_]u8{0} ** 32;
+    var zero = @as([32]u8, @splat(@as(u8, 0)));
     var empty_hash: [32]u8 = undefined;
     crypto.sha256.sha256(&empty_hash, "");
     var derived: [32]u8 = undefined;
@@ -342,7 +342,7 @@ test "rfc8448: the server's Finished verify_data is HMAC(finished_key, transcrip
 }
 
 test "keyschedule: traffic key update advances the secret" {
-    var s = [_]u8{0x5A} ** 32;
+    var s = @as([32]u8, @splat(@as(u8, 0x5A)));
     const before = s;
     Sha256.updateTrafficSecret(&s);
     try std.testing.expect(!std.mem.eql(u8, &before, &s));

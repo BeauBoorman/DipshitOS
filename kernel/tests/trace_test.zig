@@ -53,7 +53,7 @@ test "trace: each metadata kind preserves all six arguments without copying bina
 }
 
 test "trace: bounded entry strings, escaped bytes, hostile pointer and rename length flag" {
-    var text = [_]u8{'x'} ** 160;
+    var text = @as([160]u8, @splat(@as(u8, 'x')));
     text[1] = '\n';
     syscall.uaccess.init();
     syscall.uaccess.set_regions(.{ .base = @intFromPtr(&text), .len = text.len }, .{ .base = 0, .len = 0 });
@@ -65,7 +65,7 @@ test "trace: bounded entry strings, escaped bytes, hostile pointer and rename le
     const hostile = trace.capture(23, .{ std.math.maxInt(u64), 128, 1, 0, 0, 0 }, 0, 2, 99);
     try std.testing.expectEqual(@as(u32, 1), hostile.fault_mask);
     try std.testing.expectEqual(@as(u16, 0), hostile.string_lengths[0]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 128), &hostile.strings[0]);
+    try std.testing.expectEqualSlices(u8, &(@as([128]u8, @splat(@as(u8, 0)))), &hostile.strings[0]);
     const rename = trace.capture(35, .{ @intFromPtr(&text), (@as(u64, 1) << 63) | 3, @intFromPtr(&text), 4, 0, 0 }, 0, 2, 99);
     try std.testing.expectEqual(@as(u16, 3), rename.string_lengths[0]);
     try std.testing.expectEqual(@as(u16, 4), rename.string_lengths[2]);
@@ -82,7 +82,7 @@ test "trace: never-logged slots copy nothing and zero all sensitive fields" {
         var record = trace.capture(slot, .{ std.math.maxInt(u64), 128, 3, 4, 5, 6 }, 7, 8, 9);
         trace.complete(&record, @bitCast(@as(i64, -7)));
         try std.testing.expectEqual(@as(u32, trace.flag_redacted), record.flags);
-        try std.testing.expectEqual([_]u64{0} ** 6, record.args);
+        try std.testing.expectEqual(@as([6]u64, @splat(@as(u64, 0))), record.args);
         try std.testing.expectEqual(@as(i64, 0), record.result);
         const bytes = std.mem.asBytes(&record);
         for (bytes[96..]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
@@ -169,7 +169,7 @@ test "trace: atomic configuration, token replacement, whole reads and copy-out r
     config.pid_count = 1;
     config.pids[0] = 0;
     config.slots[0] = 1;
-    var output_bytes: [24 + 2 * 896 + 17]u8 align(8) = [_]u8{0xaa} ** (24 + 2 * 896 + 17);
+    var output_bytes: [24 + 2 * 896 + 17]u8 align(8) = @as([(24 + 2 * 896 + 17)]u8, @splat(@as(u8, 0xaa)));
     // M97g (#2086): the session token is a CSPRNG mint — the arm fails
     // closed while unseeded, so tests key the stream explicitly.
     var seed_bytes: [syscall.csprng.seed_len]u8 = undefined;

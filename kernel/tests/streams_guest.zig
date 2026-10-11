@@ -64,7 +64,7 @@ fn open(path: []const u8, flags: u64) u64 {
 
 fn spawn(mode: []const u8, request: ?*const Request) u64 {
     const name = "STREAMS.BIN";
-    var argv: [256]u8 = [_]u8{0} ** 256;
+    var argv: [256]u8 = @as([256]u8, @splat(@as(u8, 0)));
     @memcpy(argv[0..mode.len], mode);
     const pid = call(28, .{
         @intFromPtr(name.ptr),                               name.len,                               @intFromPtr(&argv),

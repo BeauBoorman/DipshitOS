@@ -112,7 +112,7 @@ pub const SvcLock = struct {
     /// The core currently inside this lock (`cores` = nobody).
     holder: usize = cores,
     /// The pre-acquire DAIF per core, restored by the matching release.
-    saved_daif: [cores]u64 = [_]u64{0} ** cores,
+    saved_daif: [cores]u64 = @as([cores]u64, @splat(@as(u64, 0))),
     /// This lock's canonical-order bit, so the host-test order witness
     /// can record which domain each acquisition took (0 = untagged).
     tag: u5 = 0,

@@ -154,8 +154,8 @@ pub const Cap = enum(u8) {
     }
 
     pub fn parse(s: []const u8) ?Cap {
-        inline for (@typeInfo(Cap).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        inline for (std.meta.tags(Cap)) |cap| {
+            if (std.mem.eql(u8, s, @tagName(cap))) return cap;
         }
         return null;
     }
@@ -397,8 +397,7 @@ pub fn admit(row: ?ManifestRow, size: u64, digest: [32]u8, abi: u8, used: Caps) 
     if (r.bytes != size) return .size;
     if (!std.mem.eql(u8, &r.digest, &digest)) return .digest;
     if (r.abi != abi) return .revision;
-    inline for (@typeInfo(Cap).@"enum".fields) |f| {
-        const cap: Cap = @enumFromInt(f.value);
+    inline for (std.meta.tags(Cap)) |cap| {
         if (used.has(cap) and !r.caps.has(cap)) return .capability;
     }
     return .ok;
@@ -657,7 +656,7 @@ pub fn parseInto(m: *Module, bytes: []const u8) ParseError!void {
     const ver = try r.take(4);
     if (!std.mem.eql(u8, ver, "\x01\x00\x00\x00")) return error.BadVersion;
 
-    var seen = [_]bool{false} ** 13; // ids 0..12 (DataCount is legal, id 12)
+    var seen = @as([13]bool, @splat(@as(bool, false))); // ids 0..12 (DataCount is legal, id 12)
     var prev_id: u8 = 0;
     while (r.pos < r.bytes.len) {
         const id = try r.u8_();
@@ -1571,7 +1570,7 @@ pub fn resetMachine(mm: *Machine) void {
     mm.store = &.{};
     mm.mem_pages = 0;
     mm.mem_max = 0;
-    mm.data_dropped = [_]bool{false} ** max_datas;
+    mm.data_dropped = @as([max_datas]bool, @splat(@as(bool, false)));
     mm.module_name = "module";
     mm.last_trap = null;
 }
@@ -2958,7 +2957,7 @@ const HostCapture = struct {
     exited: bool = false,
     log: [96]CapturedCall = undefined,
     log_count: usize = 0,
-    returns: [cap_count]i64 = [_]i64{0} ** cap_count,
+    returns: [cap_count]i64 = @as([cap_count]i64, @splat(@as(i64, 0))),
     out_fill: u8 = 0xA5,
     // W5 (wc): when set, captured file_read serves bytes from file_data
     // (0 at EOF, cap-clamped — contract §5 semantics) so a host test can
@@ -4649,7 +4648,7 @@ test "v2 (§9): the cap table covers every capability, and every frozen import m
     // A drift guard: a frozen import added without a capability would make the
     // v2 gate unenforceable for that name, and an unused Cap would mean §9
     // documents a capability nothing needs.
-    var reachable: [@typeInfo(Cap).@"enum".fields.len]bool = @splat(false);
+    var reachable: [std.meta.tags(Cap).len]bool = @splat(false);
     for (frozen_imports) |f| reachable[@intFromEnum(f.cap)] = true;
     for (reachable) |r| try testing.expect(r);
 }
@@ -4728,8 +4727,7 @@ test "v2 (§9): the author-proof corpus apps declare exactly what they use" {
     try testing.expect(!used_trio.has(.audio));
     // The declaration must cover what the imports need, or the app would
     // refuse itself at validation.
-    inline for (@typeInfo(Cap).@"enum".fields) |f| {
-        const cap: Cap = @enumFromInt(f.value);
+    inline for (std.meta.tags(Cap)) |cap| {
         try testing.expect(!used_trio.has(cap) or mt.caps.has(cap));
     }
 

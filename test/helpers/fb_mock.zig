@@ -85,7 +85,7 @@ pub fn MockScanoutSurface(comptime W: u32, comptime H: u32) type {
         pub const height: u32 = H;
         pub const stride: usize = W * 4;
 
-        buffer: [W * H * 4]u8 = [_]u8{0} ** (W * H * 4),
+        buffer: [W * H * 4]u8 = @as([(W * H * 4)]u8, @splat(@as(u8, 0))),
 
         pub fn init() Self {
             return .{};

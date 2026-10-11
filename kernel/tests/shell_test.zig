@@ -284,14 +284,14 @@ test "shell: over-long line is refused with a bell and an overflow notice" {
     var mock = console.MockConsole(2048){};
     var shell = make_shell(&mock, make_view());
     shell.boot();
-    mock.feed("b" ** 257);
+    mock.feed(&@as([257:0]u8, @splat("b"[0])));
     mock.feed("\n");
     while (shell.poll() != .idle) {}
     const out = mock.contents();
     // 256 chars echoed, the 257th refused with a bell, then the notice.
-    try std.testing.expect(std.mem.indexOf(u8, out, "b" ** 256 ++ "\x07") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, &@as([256:0]u8, @splat("b"[0])) ++ "\x07") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "input refused: line longer than 256 bytes\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command '" ++ "b" ** 256 ++ "' -- try 'help'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unknown command '" ++ &@as([256:0]u8, @splat("b"[0])) ++ "' -- try 'help'") != null);
 }
 
 test "shell: too many arguments refuses execution with the documented message" {
@@ -1417,7 +1417,7 @@ test "shell: T16 script: line longer than 256 bytes is refused and skipped" {
     shell.boot();
     test_reset_share();
     defer virtio_file.set_test_share(null);
-    const content = "echo before-long\n" ++ ("x" ** 300) ++ "\necho after-long\n";
+    const content = "echo before-long\n" ++ (&@as([300:0]u8, @splat("x"[0]))) ++ "\necho after-long\n";
     test_seed_share("LONG.TXT", content);
     mock.feed("sh LONG.TXT\n");
     while (shell.poll() != .idle) {}
@@ -1426,7 +1426,7 @@ test "shell: T16 script: line longer than 256 bytes is refused and skipped" {
     try std.testing.expect(std.mem.indexOf(u8, out, "before-long\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "after-long\n") != null);
     // The over-long line never reached the executor (no 300-char echo).
-    try std.testing.expect(std.mem.indexOf(u8, out, "x" ** 300) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, &@as([300:0]u8, @splat("x"[0]))) == null);
 }
 
 test "shell: T4 history: load_history restores newest-first" {
@@ -2682,7 +2682,7 @@ test "shell: M19 P7 trailing_bg_amp: trailing only, quote/escape aware" {
 test "shell: M19 P7 background of a non-spawning command records no job" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     var mock = console.MockConsole(4096){};
     var shell = make_shell(&mock, make_view());
     shell.boot();
@@ -2697,7 +2697,7 @@ test "shell: M19 P7 background of a non-spawning command records no job" {
 test "shell: M19 P7 jobs and fg report an empty table" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     var mock = console.MockConsole(4096){};
     var shell = make_shell(&mock, make_view());
     shell.boot();
@@ -2711,7 +2711,7 @@ test "shell: M19 P7 jobs and fg report an empty table" {
 test "shell: M19 P7 reaper reports a vanished child once and frees the slot" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     var mock = console.MockConsole(4096){};
     var shell = make_shell(&mock, make_view());
     shell.boot();
@@ -2731,7 +2731,7 @@ test "shell: M19 P7 reaper reports a vanished child once and frees the slot" {
 test "shell: M19 P7 fg refuses bad numbers and freed slots" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     var mock = console.MockConsole(4096){};
     var shell = make_shell(&mock, make_view());
     shell.boot();
@@ -2751,7 +2751,7 @@ test "shell: M19 P7 fg refuses bad numbers and freed slots" {
 test "shell: M19 P7 bare & is a harmless no-op" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     var mock = console.MockConsole(4096){};
     var shell = make_shell(&mock, make_view());
     shell.boot();
@@ -2763,7 +2763,7 @@ test "shell: M19 P7 bare & is a harmless no-op" {
 test "shell: M19 P7 fg propagates the child's real exit status into $?" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     process.init();
     // A REAL registry entry — created, bound to a task, exited with 43 —
     // exactly the lifecycle an `exec STATUS43.BIN &` produces on hardware.
@@ -2786,7 +2786,7 @@ test "shell: M19 P7 fg propagates the child's real exit status into $?" {
 test "shell: M19 P7 fg on a live child honestly times out and keeps tracking" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     process.init();
     // Created + bound but never exits: the eternal-COUNTER shape.
     const pid = process.create("COUNTER.BIN", .{ .entry_va = 0x400000, .content_len = 1 }, .{}, .{}).?;
@@ -2807,7 +2807,7 @@ test "shell: M19 P7 fg on a live child honestly times out and keeps tracking" {
 test "shell: M19 P7 reaper announces a real exited child with its status" {
     shell_mod.env_count = 0;
     shell_mod.trace_enabled = false;
-    shell_mod.bg_jobs = [_]BgJob{.{}} ** bg_job_max;
+    shell_mod.bg_jobs = @as([bg_job_max]BgJob, @splat(@as(BgJob, .{})));
     process.init();
     const pid = process.create("QUICK.BIN", .{ .entry_va = 0x400000, .content_len = 1 }, .{}, .{}).?;
     _ = process.bind(pid, 5);
