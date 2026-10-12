@@ -51,13 +51,40 @@
 //     of staying open for the next search.
 //   - a miss keeps the caret where it was and prints `miss`; it does not
 //     re-anchor or wrap.
-//   - replace, match highlighting and the status-line "Line X of Y" are absent.
-//     The Zig side had them; the live gate (`live-text-search`) never asserted
-//     them, so no live coverage moved -- but they did not come across.
+//   - match highlighting stays absent: the Zig side had it, the live gate
+//     (`live-text-search`) never asserted it, and this card is no exception.
 //
-// What this is NOT: EDIT.BIN's feature list. The buffer is a byte slice with a
-// caret, find is a forward substring search, and there is no selection, undo,
-// replace or syntax highlighting.
+// The second pass (#2199) lands the rest of the daily-driver core, all of it
+// as pure buffer-layer rules in buffer.go with the live seat proving each:
+//
+//   - bounded undo/redo. Ctrl-Z reverts the newest op and Ctrl-Shift-Z /
+//     Ctrl-Y reapplies it; typing and delete bursts merge into one open run
+//     op each (breaking at a newline), paste/cut/replace are one composite
+//     op per action, and the ring caps at histCap ops — a full ring forgets
+//     the oldest op rather than growing without bound.
+//   - selection. Shift+arrows (or a Ctrl-Shift-M mark, the gate-drivable
+//     spelling of the same anchor+caret rule) extend a selection from the
+//     caret, Ctrl-A selects all, and the region paints under the text. A
+//     find's match lands selected — the found region is the next edit's
+//     target without a second gesture.
+//   - the system clipboard. Ctrl-C copies, Ctrl-X cuts, Ctrl-V pastes
+//     through sys_clipboard_set/get (slots 38/39) — the machine-global
+//     buffer the monitor's `clip` command reads. M97g-F4 (#2082) gates
+//     those slots on CAP_CLIPBOARD, so an unprivileged GOEDIT gets -EACCES
+//     and reports it on the marker instead of keeping a shadow clipboard:
+//     the policy is the boundary.
+//   - replace, as the Zig app's Ctrl-R bar: `pattern`, Tab, `replacement`,
+//     Return replaces the match find would land on (`hit=N/M` — same scan,
+//     same ordinal), Ctrl-A replaces all matches in one op whose count
+//     equals the find total (`n=N`).
+//   - the status line. The chrome row right-aligns `line=L/T col=C`, adds
+//     `sel=N` while a selection is live and `*` while dirty, and every
+//     change republishes `goedit: status ...` on the serial console — the
+//     marker the gate greps and the row the seat paints are one string.
+//
+// What this is NOT: EDIT.BIN's feature list. No syntax highlighting, no
+// multi-file buffers or tabs, no LSP, no auto-indent — follow-on cards own
+// all of those.
 //
 // The palette stays local (colChromeBg/colPageBg) rather than importing
 // webrender's theme: the full webrender package drags in layout + HTML parsing,
@@ -77,6 +104,7 @@ import (
 	"virelai/settings"
 	"virelai/tabapp"
 	"virelai/vi"
+	"virelai/vsys"
 	"virelai/webrender/font"
 )
 
@@ -116,6 +144,21 @@ const (
 	// M42 UX r2 / WMS8 Gate 4 rehomed (#1485): the unsaved-changes dialog.
 	markerUnsaved = "goedit: win_unsaved"
 
+	// #2199 second pass: the new features' receipts. Undo/redo report the
+	// stack depth they left and the caret's landing offset; the mark and the
+	// clipboard ops report their outcome (n= bytes moved, or the negative
+	// kernel code the M97g-F4 policy returned — rc=-7 is the receipt, not
+	// an error swallowed); the status line republishes its chrome text.
+	markerStatus  = "goedit: status "
+	markerUndo    = "goedit: undo "
+	markerRedo    = "goedit: redo "
+	markerMark    = "goedit: mark "
+	markerCopy    = "goedit: copy "
+	markerCut     = "goedit: cut "
+	markerPaste   = "goedit: paste "
+	markerRepl    = "goedit: replace '"
+	markerReplAll = "goedit: replace-all '"
+
 	// M81d (#1764): the advisory write lease's console receipts. The open
 	// marker names the holder pid the record now carries (the takeover's
 	// receipt); the save-error line carries the -ErrEAGAIN refusal when
@@ -138,6 +181,10 @@ const (
 	keyCtrlF = 0x06
 	keyG     = 0x67
 	keyCtrlG = 0x07
+	// #2199: the replace bar's chord and the second field's focus key. Ctrl-R
+	// is unbound in both seats (checked against tabwm and gotabwm).
+	keyR     = 0x72
+	keyCtrlR = 0x12
 	// backspace/delete/return/escape codepoints (the kernel sends the
 	// codepoint in arg1).
 	codeBackspace = 0x08
@@ -145,6 +192,20 @@ const (
 	codeReturn    = 0x0d
 	codeNewline   = 0x0a
 	codeEscape    = 0x1b
+	// #2199: HID usages the new input paths test on arg0 — the usage column
+	// is the encoding-proof one (a ctrl chord's arg1 spelling varies, the
+	// usage never does). The letter chords derive theirs from the letter
+	// itself (usage = letter-'a'+0x04, see chord); the nav keys and Tab sit
+	// at their documented usages.
+	usageEsc    = 0x29
+	usageTab    = 0x2b
+	usageHome   = 0x4a
+	usageFwdDel = 0x4c
+	usageEnd    = 0x4d
+	usageRight  = 0x4f
+	usageLeft   = 0x50
+	usageDown   = 0x51
+	usageUp     = 0x52
 
 	// barMax bounds the find pattern and the goto digits; gotoDigitsMax is the
 	// Zig app's 5-digit bound on a goto line number.
@@ -170,18 +231,34 @@ const (
 	colInk      = uint32(0xe6edf3)
 	colText     = uint32(0xe6edf3)
 	// colCaret is the caret block and colDim the find/goto bar's label.
+	// colSel is the selection's under-text tint (#2199) — a cool tone over
+	// the page, one step darker than colPageBg so the text stays readable.
 	colCaret = uint32(0xffd75f)
 	colDim   = uint32(0x8b98a8)
+	colSel   = uint32(0x2c4459)
 )
 
-// inputMode is which surface owns the keyboard: the document, the find bar, or
-// the goto-line bar (M20 U3).
+// inputMode is which surface owns the keyboard: the document, the find bar,
+// the goto-line bar (M20 U3), or the replace bar (#2199).
 type inputMode uint8
 
 const (
 	modeEdit inputMode = iota
 	modeFind
 	modeGoto
+	modeReplace
+)
+
+// clipWrite/clipRead are the machine-global clipboard (sys_clipboard_set/get,
+// slots 38/39 — the same buffer the monitor's `clip` command and the
+// terminal chrome chords use). M97g-F4 (#2082) gates the slots on
+// CAP_CLIPBOARD: an unprivileged GOEDIT gets -EACCES, which lands on the op's
+// marker as rc= — the policy is the boundary, so there is no app-local shadow
+// clipboard. The indirection is the host-test seam: vsys's syscallFn is
+// package-internal, so tests swap these two instead.
+var (
+	clipWrite = func(p []byte) (int, int64) { return vsys.ClipboardSet(p) }
+	clipRead  = func() ([]byte, int64) { return vsys.ClipboardGet(vsys.ClipboardMax) }
 )
 
 // fill is one clamped background rectangle through the kernel fill batcher.
@@ -240,10 +317,24 @@ type editor struct {
 
 	// M20 U3: cur is the caret as a byte offset into buf, clamped on every use
 	// so a buffer that shrank under it cannot index out of range; mode says
-	// which bar owns the keyboard; bar holds that bar's typed text.
-	cur  int
-	mode inputMode
-	bar  []byte
+	// which bar owns the keyboard; bar holds that bar's typed text; bar2 is
+	// the replace bar's second field (the replacement) with bar2At its focus.
+	cur    int
+	mode   inputMode
+	bar    []byte
+	bar2   []byte
+	bar2At bool
+
+	// #2199: the selection and the bounded history. sel is the selection's
+	// anchor byte offset, live only while selSet; markOn is the ctrl-shift-m
+	// mark — plain nav extends while it is set, which is how the gate drives
+	// a selection the runner's chord table cannot spell (shift+arrow is not
+	// a token). hist is the bounded op ring; status dedupes emitStatus.
+	sel    int
+	selSet bool
+	markOn bool
+	hist   history
+	status string
 
 	// M83e (#1778): the dead-key stage. It sits in front of whichever surface
 	// owns the keyboard (the document or a bar) and hands it the text a
@@ -351,6 +442,7 @@ func main() {
 	// The first frame is on the scanout: the gate releases the injected
 	// keystrokes on this marker, so the editor is already in its event loop.
 	vi.ConsoleLine(markerPresent)
+	e.emitStatus()
 
 	for {
 		ev, r, ok := vi.PollEventRaw()
@@ -376,11 +468,13 @@ func main() {
 		case tabapp.ActionResized:
 			e.draw()
 			ta.Present()
+			e.emitStatus()
 		case tabapp.ActionNone:
 			if e.handle(ev) {
 				e.draw()
 				ta.Present()
 				e.markStage()
+				e.emitStatus()
 			}
 		}
 	}
@@ -507,11 +601,47 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if isChord(ev, keyG, keyCtrlG) {
 		return e.openBar(modeGoto)
 	}
+	if isChord(ev, keyR, keyCtrlR) {
+		return e.openBar(modeReplace)
+	}
 	switch e.mode {
 	case modeFind:
 		return e.barKey(ev, e.runFind)
 	case modeGoto:
 		return e.barKey(ev, e.runGoto)
+	case modeReplace:
+		return e.replaceBarKey(ev)
+	}
+	// #2199 chords, all on the usage column via chord() so the shifted
+	// spellings stay distinct: ctrl-z undoes, ctrl-shift-z and ctrl-y redo,
+	// ctrl-x/c/v are the clipboard, ctrl-a selects all, and ctrl-shift-m is
+	// the mark — the gate-drivable selection gesture.
+	if chord(ev, 'z', false) {
+		e.undo()
+		return true
+	}
+	if chord(ev, 'z', true) || chord(ev, 'y', false) {
+		e.redo()
+		return true
+	}
+	if chord(ev, 'm', true) {
+		return e.toggleMark()
+	}
+	if chord(ev, 'a', false) {
+		e.selectAll()
+		return true
+	}
+	if chord(ev, 'x', false) {
+		e.cut()
+		return true
+	}
+	if chord(ev, 'c', false) {
+		e.copy()
+		return true
+	}
+	if chord(ev, 'v', false) {
+		e.paste()
+		return true
 	}
 	if isSave(ev) {
 		// A failed Ctrl-S leaves the app alive and the buffer dirty: the
@@ -526,11 +656,60 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if ev.Flags&modCtrl != 0 {
 		return false
 	}
+	// Nav keys move the caret; Shift extends the selection from it, as does
+	// a set mark. Alt-nav belongs to the seat, not the document.
+	if ev.Flags&vi.ModAlt == 0 {
+		extend := ev.Flags&vi.ModShift != 0 || e.markOn
+		switch ev.Arg0 {
+		case usageLeft:
+			e.moveCaret(moveLeft(e.buf, e.cur), extend)
+			return true
+		case usageRight:
+			e.moveCaret(moveRight(e.buf, e.cur), extend)
+			return true
+		case usageUp:
+			e.moveCaret(moveLine(e.buf, e.cur, -1), extend)
+			return true
+		case usageDown:
+			e.moveCaret(moveLine(e.buf, e.cur, 1), extend)
+			return true
+		case usageHome:
+			e.moveCaret(moveHome(e.buf, e.cur), extend)
+			return true
+		case usageEnd:
+			e.moveCaret(moveEnd(e.buf, e.cur), extend)
+			return true
+		case usageFwdDel:
+			return e.deleteForward()
+		}
+	}
 	if ev.Arg1 == codeBackspace || ev.Arg1 == codeDelete {
 		return e.backspace()
 	}
 	if ch, ok := insertionFor(ev); ok {
 		return e.insert(ch)
+	}
+	return false
+}
+
+// chord reports a ctrl+<letter> chord on the letter's HID usage, with the
+// arg1 spellings as fallbacks (the letter — either case, since a shifted
+// chord capitalizes it — and the ASCII control code). shift pins the Shift
+// flag: false refuses the shifted spelling so ctrl-shift-z never re-fires
+// undo, true requires it.
+func chord(ev vi.Event, letter uint32, shift bool) bool {
+	if ev.Kind != vi.EvKeyDown || ev.Flags&modCtrl == 0 {
+		return false
+	}
+	if (ev.Flags&vi.ModShift != 0) != shift {
+		return false
+	}
+	if letter >= 'a' && letter <= 'z' {
+		if ev.Arg0 == letter-'a'+0x04 {
+			return true
+		}
+		return ev.Arg1 == letter || ev.Arg1 == letter-'a'+'A' ||
+			ev.Arg1 == letter-'a'+1
 	}
 	return false
 }
@@ -542,28 +721,45 @@ func isChord(ev vi.Event, key, ctrlCode uint32) bool {
 	if ev.Kind != vi.EvKeyDown || ev.Flags&modCtrl == 0 {
 		return false
 	}
-	return ev.Arg1 == key || ev.Arg1 == ctrlCode
+	if ev.Arg1 == key || ev.Arg1 == ctrlCode {
+		return true
+	}
+	// The arg0 usage is the spelling that survives every arg1 encoding.
+	return key >= 'a' && key <= 'z' && ev.Arg0 == key-'a'+0x04
 }
 
 // isSave reports whether the event is the Ctrl-S save chord.
 func isSave(ev vi.Event) bool { return isChord(ev, keyS, keyCtrlS) }
 
-// openBar focuses a bar with an empty entry.
+// openBar focuses a bar with an empty entry — and, for replace, an empty
+// second field with the focus back on the pattern. Opening a bar is a mode
+// change, so it also closes an open typing run.
 func (e *editor) openBar(m inputMode) bool {
 	e.mode = m
 	e.bar = e.bar[:0]
+	e.bar2 = e.bar2[:0]
+	e.bar2At = false
+	e.hist.breakRun()
 	return true
 }
 
-// barKey handles one key while a bar owns the keyboard: Return runs the bar's
-// action and closes it, Escape closes it without one, backspace trims it, and
-// printable codepoints append (bounded by barMax).
+// closeBar hands the keyboard back to the document.
+func (e *editor) closeBar() {
+	e.mode = modeEdit
+	e.bar = e.bar[:0]
+	e.bar2 = e.bar2[:0]
+	e.bar2At = false
+}
+
+// barKey handles one key while a find/goto bar owns the keyboard: Return runs
+// the bar's action and closes it, Escape closes it without one, backspace
+// trims it, and printable codepoints append (bounded by barMax).
 func (e *editor) barKey(ev vi.Event, run func()) bool {
 	if ev.Flags&modCtrl != 0 {
 		return false
 	}
-	if ev.Arg1 == codeEscape {
-		e.mode, e.bar = modeEdit, e.bar[:0]
+	if ev.Arg1 == codeEscape || ev.Arg0 == usageEsc {
+		e.closeBar()
 		return true
 	}
 	if ev.Arg1 == codeReturn || ev.Arg1 == codeNewline {
@@ -584,17 +780,65 @@ func (e *editor) barKey(ev vi.Event, run func()) bool {
 	return false
 }
 
-// barAppend adds one scalar to the focused bar's entry, bounded by barMax.
-func (e *editor) barAppend(ch rune) bool {
-	if len(e.bar)+utf8.RuneLen(ch) > barMax {
+// replaceBarKey is the replace bar's two-field variant (#2199): Tab moves the
+// focus between pattern and replacement, Return replaces the current match,
+// Ctrl-A replaces all, and the rest follows barKey's rules.
+func (e *editor) replaceBarKey(ev vi.Event) bool {
+	if ev.Arg1 == codeEscape || ev.Arg0 == usageEsc {
+		e.closeBar()
+		return true
+	}
+	if ev.Arg0 == usageTab && ev.Flags&modCtrl == 0 {
+		e.bar2At = !e.bar2At
+		return true
+	}
+	if chord(ev, 'a', false) {
+		e.runReplaceAll()
+		return true
+	}
+	if ev.Flags&modCtrl != 0 {
 		return false
 	}
-	e.bar = append(e.bar, []byte(string(ch))...)
+	if ev.Arg1 == codeReturn || ev.Arg1 == codeNewline {
+		e.runReplace()
+		return true
+	}
+	if ev.Arg1 == codeBackspace || ev.Arg1 == codeDelete {
+		dst := &e.bar
+		if e.bar2At {
+			dst = &e.bar2
+		}
+		if len(*dst) == 0 {
+			return false
+		}
+		_, size := utf8.DecodeLastRune(*dst)
+		*dst = (*dst)[:len(*dst)-size]
+		return true
+	}
+	if ch, ok := insertionFor(ev); ok {
+		return e.barAppend(ch)
+	}
+	return false
+}
+
+// barAppend adds one scalar to the focused bar field — replace's Tab picks
+// between them — bounded by barMax.
+func (e *editor) barAppend(ch rune) bool {
+	dst := &e.bar
+	if e.mode == modeReplace && e.bar2At {
+		dst = &e.bar2
+	}
+	if len(*dst)+utf8.RuneLen(ch) > barMax {
+		return false
+	}
+	*dst = append(*dst, []byte(string(ch))...)
 	return true
 }
 
 // runFind runs the find bar's Return: search from the caret, move it to the
-// match, and report the result. An empty pattern is a no-op with no marker.
+// match — landed SELECTED, so the found region is the next op's target
+// without a second gesture — and report the result. An empty pattern is a
+// no-op with no marker.
 func (e *editor) runFind() {
 	pat := e.bar
 	e.mode, e.bar = modeEdit, e.bar[:0]
@@ -606,6 +850,8 @@ func (e *editor) runFind() {
 		vi.ConsoleLine(findMissMarker(pat))
 		return
 	}
+	e.hist.breakRun()
+	e.sel, e.selSet, e.markOn = off+len(pat), true, false
 	e.cur = off
 	vi.ConsoleLine(findMarker(pat, ordinal, total))
 }
@@ -625,6 +871,8 @@ func (e *editor) runGoto() {
 		vi.ConsoleLine(gotoMissMarker(n, countLines(e.buf)))
 		return
 	}
+	e.hist.breakRun()
+	e.selSet, e.markOn = false, false
 	e.cur = off
 	vi.ConsoleLine(gotoMarker(n, off))
 }
@@ -671,34 +919,340 @@ func insertionFor(ev vi.Event) (rune, bool) {
 	return 0, false
 }
 
-// insert splices one UTF-8 encoded scalar at the byte caret and marks the
-// buffer dirty (the dirty marker prints once, on the first edit).
-func (e *editor) insert(ch rune) bool {
-	encoded := []byte(string(ch))
-	if len(e.buf)+len(encoded) > maxBuffer {
-		return false
-	}
+// --- selection -----------------------------------------------------------
+// #2199: the selection is an anchor (sel) plus the caret — nothing else.
+// selRange is the only reader; every editor state it draws from or splices
+// goes through it, so "what is selected" has exactly one definition.
+
+// selRange returns [lo,hi) when a selection is pinned and non-empty.
+func (e *editor) selRange() (lo, hi int, ok bool) {
 	e.clampCaret()
-	oldLen := len(e.buf)
-	e.buf = append(e.buf, make([]byte, len(encoded))...)
-	copy(e.buf[e.cur+len(encoded):], e.buf[e.cur:oldLen])
-	copy(e.buf[e.cur:], encoded)
-	e.cur += len(encoded)
-	e.markDirty()
+	if !e.selSet || e.sel == e.cur {
+		return 0, 0, false
+	}
+	lo, hi = e.sel, e.cur
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > len(e.buf) {
+		hi = len(e.buf)
+	}
+	return lo, hi, lo < hi
+}
+
+// selBytes returns a COPY of the selected bytes — the clipboard stores
+// bytes, not aliases, and a cut splices the buffer out from under them.
+func (e *editor) selBytes() ([]byte, bool) {
+	lo, hi, ok := e.selRange()
+	if !ok {
+		return nil, false
+	}
+	return append([]byte{}, e.buf[lo:hi]...), true
+}
+
+// moveCaret lands the caret at to. With extend (a Shift modifier or the
+// ctrl-shift-m mark) the selection grows from its anchor; without it the
+// selection collapses. Either way a caret move closes an open run.
+func (e *editor) moveCaret(to int, extend bool) {
+	e.clampCaret()
+	if to < 0 {
+		to = 0
+	}
+	if to > len(e.buf) {
+		to = len(e.buf)
+	}
+	e.hist.breakRun()
+	if extend {
+		if !e.selSet {
+			e.sel, e.selSet = e.cur, true
+		}
+	} else {
+		e.selSet, e.markOn = false, false
+	}
+	e.cur = to
+}
+
+// selectAll is Ctrl-A in the document: anchor at 0, caret at the end.
+func (e *editor) selectAll() {
+	e.hist.breakRun()
+	e.sel, e.selSet, e.markOn = 0, true, false
+	e.cur = len(e.buf)
+}
+
+// toggleMark is Ctrl-Shift-M: with the mark set, plain arrows extend the
+// selection — the runner's chord table cannot spell shift+arrow, so this is
+// the live seat's selection gesture; clearing the mark drops the selection.
+func (e *editor) toggleMark() bool {
+	e.markOn = !e.markOn
+	if !e.markOn {
+		e.selSet = false
+		vi.ConsoleLine(markerMark + "clear")
+	} else {
+		vi.ConsoleLine(markerMark + "set")
+	}
 	return true
 }
 
-// backspace removes the Unicode scalar before the byte caret.
+// --- bounded undo/redo ----------------------------------------------------
+// applyOp is the ONE path a document edit takes: splice, caret, record. Runs
+// merge inside push(); every other caller-facing path (moves, mode changes,
+// clipboard ops, undo/redo) calls hist.breakRun() first so a run only ever
+// joins truly consecutive keystrokes.
+func (e *editor) applyOp(o editOp, cur int) {
+	e.buf = applySplices(e.buf, o.sp, false)
+	e.cur = cur
+	e.hist.push(o)
+	e.selSet, e.markOn = false, false
+	e.markDirty()
+}
+
+// undo reverts the newest op and parks the caret at the END of the reverted
+// region's old text — the position a fresh find-from-caret scans past. An
+// empty stack prints the `none` variant the gates count separately.
+func (e *editor) undo() {
+	o, ok := e.hist.popUndo()
+	if !ok {
+		vi.ConsoleLine(markerUndo + "none")
+		return
+	}
+	e.buf = applySplices(e.buf, o.sp, true)
+	e.cur = o.sp[0].pos + len(o.sp[0].old)
+	e.selSet, e.markOn = false, false
+	e.markDirty()
+	vi.ConsoleLine(markerUndo + "n=" + vi.Itoa64(int64(len(e.hist.undo))) +
+		" cur=" + vi.Itoa64(int64(e.cur)))
+}
+
+// redo reapplies the newest undone op, caret after its inserted text.
+func (e *editor) redo() {
+	o, ok := e.hist.popRedo()
+	if !ok {
+		vi.ConsoleLine(markerRedo + "none")
+		return
+	}
+	e.buf = applySplices(e.buf, o.sp, false)
+	// Caret after the last splice's inserted text — in APPLIED-buffer
+	// coordinates, so shift the original pos by the earlier splices' delta.
+	shift := 0
+	for _, s := range o.sp[:len(o.sp)-1] {
+		shift += len(s.ins) - len(s.old)
+	}
+	last := o.sp[len(o.sp)-1]
+	e.cur = last.pos + shift + len(last.ins)
+	e.selSet, e.markOn = false, false
+	e.markDirty()
+	vi.ConsoleLine(markerRedo + "n=" + vi.Itoa64(int64(len(e.hist.redo))) +
+		" cur=" + vi.Itoa64(int64(e.cur)))
+}
+
+// --- clipboard ------------------------------------------------------------
+// #2199: copy, cut and paste go through slots 38/39 unconditionally — the
+// kernel decides who may touch the shared buffer, and a refusal prints the
+// negative code on the op's marker so the M97g-F4 boundary is observable.
+
+// copy stages the selection; it never touches the buffer.
+func (e *editor) copy() {
+	b, ok := e.selBytes()
+	if !ok {
+		vi.ConsoleLine(markerCopy + "none")
+		return
+	}
+	n, r := clipWrite(b)
+	if r < 0 {
+		vi.ConsoleLine(markerCopy + "rc=" + vi.Itoa64(r))
+		return
+	}
+	vi.ConsoleLine(markerCopy + "n=" + vi.Itoa64(int64(n)))
+}
+
+// cut is copy plus the delete splice; a refused write leaves the buffer
+// alone (the bytes stay where they were, selection included).
+func (e *editor) cut() {
+	lo, hi, ok := e.selRange()
+	if !ok {
+		vi.ConsoleLine(markerCut + "none")
+		return
+	}
+	n, r := clipWrite(e.buf[lo:hi])
+	if r < 0 {
+		vi.ConsoleLine(markerCut + "rc=" + vi.Itoa64(r))
+		return
+	}
+	old := append([]byte{}, e.buf[lo:hi]...)
+	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: lo, old: old}}}, lo)
+	vi.ConsoleLine(markerCut + "n=" + vi.Itoa64(int64(n)))
+}
+
+// paste splices the clipboard at the caret — over the selection when one is
+// pinned, so paste-over-selection is one undoable op too.
+func (e *editor) paste() {
+	b, r := clipRead()
+	if r < 0 {
+		vi.ConsoleLine(markerPaste + "rc=" + vi.Itoa64(r))
+		return
+	}
+	if len(b) == 0 {
+		vi.ConsoleLine(markerPaste + "empty")
+		return
+	}
+	e.clampCaret()
+	pos := e.cur
+	var old []byte
+	if lo, hi, ok := e.selRange(); ok {
+		pos = lo
+		old = append([]byte{}, e.buf[lo:hi]...)
+	}
+	if splicedLen(len(e.buf), []splice{{pos: pos, old: old, ins: b}}, false) > maxBuffer {
+		vi.ConsoleLine(markerPaste + "rc=" + vi.Itoa64(-vsys.ErrENOMEM))
+		return
+	}
+	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: pos, old: old, ins: b}}}, pos+len(b))
+	vi.ConsoleLine(markerPaste + "n=" + vi.Itoa64(int64(len(b))))
+}
+
+// --- status line ----------------------------------------------------------
+
+// statusText is the chrome row's right-aligned status AND the serial
+// marker's body: `line=L/T col=C [sel=N] [*]` — one rule, two readers.
+func (e *editor) statusText() string {
+	line, col := caretLineCol(e.buf, e.cur)
+	s := "line=" + vi.Itoa64(int64(line)) + "/" + vi.Itoa64(int64(countLines(e.buf))) +
+		" col=" + vi.Itoa64(int64(col))
+	if lo, hi, ok := e.selRange(); ok {
+		s += " sel=" + vi.Itoa64(int64(hi-lo))
+	}
+	if e.dirty {
+		s += " *"
+	}
+	return s
+}
+
+// emitStatus publishes the status line on its edges: the serial marker fires
+// only when the text changed, so a caret walk prints once per landing, not
+// once per key.
+func (e *editor) emitStatus() {
+	s := e.statusText()
+	if s == e.status {
+		return
+	}
+	e.status = s
+	vi.ConsoleLine(markerStatus + s)
+}
+
+// --- replace ---------------------------------------------------------------
+
+// runReplace replaces the match find would land on — same scan, same ordinal
+// — then parks the caret after the replacement.
+func (e *editor) runReplace() {
+	pat := append([]byte{}, e.bar...)
+	repl := append([]byte{}, e.bar2...)
+	e.closeBar()
+	if len(pat) == 0 {
+		vi.ConsoleLine(markerRepl + "' -> '" + string(repl) + "' no-pattern")
+		return
+	}
+	total, ordinal, off := findFrom(e.buf, pat, e.cur)
+	if off < 0 {
+		vi.ConsoleLine(markerRepl + string(pat) + "' -> '" + string(repl) + "' no-match")
+		return
+	}
+	old := append([]byte{}, e.buf[off:off+len(pat)]...)
+	if len(e.buf)-len(old)+len(repl) > maxBuffer {
+		vi.ConsoleLine(markerRepl + string(pat) + "' -> '" + string(repl) +
+			"' rc=" + vi.Itoa64(-vsys.ErrENOMEM))
+		return
+	}
+	e.hist.breakRun()
+	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: off, old: old, ins: repl}}}, off+len(repl))
+	vi.ConsoleLine(markerRepl + string(pat) + "' -> '" + string(repl) + "' hit=" +
+		vi.Itoa64(int64(ordinal)) + "/" + vi.Itoa64(int64(total)))
+}
+
+// runReplaceAll splices every match in one op — a single Ctrl-Z reverts the
+// whole pass. n equals find's total for the same pattern: both walk the same
+// non-overlapping scan, and the splices are computed against the ORIGINAL
+// buffer so a replacement containing the pattern cannot re-match itself.
+func (e *editor) runReplaceAll() {
+	pat := append([]byte{}, e.bar...)
+	repl := append([]byte{}, e.bar2...)
+	e.closeBar()
+	if len(pat) == 0 {
+		vi.ConsoleLine(markerReplAll + "' -> '" + string(repl) + "' no-pattern")
+		return
+	}
+	sp := replaceAllSplices(e.buf, pat, repl)
+	if len(sp) == 0 {
+		vi.ConsoleLine(markerReplAll + string(pat) + "' -> '" + string(repl) + "' n=0")
+		return
+	}
+	if splicedLen(len(e.buf), sp, false) > maxBuffer {
+		vi.ConsoleLine(markerReplAll + string(pat) + "' -> '" + string(repl) +
+			"' rc=" + vi.Itoa64(-vsys.ErrENOMEM))
+		return
+	}
+	e.hist.breakRun()
+	e.applyOp(editOp{kind: opEdit, sp: sp}, sp[0].pos+len(repl))
+	vi.ConsoleLine(markerReplAll + string(pat) + "' -> '" + string(repl) +
+		"' n=" + vi.Itoa64(int64(len(sp))))
+}
+
+// insert splices one UTF-8 encoded scalar at the byte caret and marks the
+// buffer dirty (the dirty marker prints once, on the first edit). Over a
+// selection the delete+insert is one composite op, so one Ctrl-Z restores
+// the selected text AND removes the typed rune.
+func (e *editor) insert(ch rune) bool {
+	encoded := []byte(string(ch))
+	e.clampCaret()
+	if lo, hi, ok := e.selRange(); ok {
+		if len(e.buf)-(hi-lo)+len(encoded) > maxBuffer {
+			return false
+		}
+		old := append([]byte{}, e.buf[lo:hi]...)
+		e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: lo, old: old, ins: encoded}}}, lo+len(encoded))
+		return true
+	}
+	if len(e.buf)+len(encoded) > maxBuffer {
+		return false
+	}
+	e.applyOp(editOp{kind: opInsRun, sp: []splice{{pos: e.cur, ins: encoded}}}, e.cur+len(encoded))
+	return true
+}
+
+// backspace removes the Unicode scalar before the byte caret — or the whole
+// selection, as one op.
 func (e *editor) backspace() bool {
 	e.clampCaret()
+	if lo, hi, ok := e.selRange(); ok {
+		old := append([]byte{}, e.buf[lo:hi]...)
+		e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: lo, old: old}}}, lo)
+		return true
+	}
 	if e.cur == 0 {
 		return false
 	}
-	_, size := utf8.DecodeLastRune(e.buf[:e.cur])
-	copy(e.buf[e.cur-size:], e.buf[e.cur:])
-	e.buf = e.buf[:len(e.buf)-size]
-	e.cur -= size
-	e.markDirty()
+	prev := moveLeft(e.buf, e.cur)
+	old := append([]byte{}, e.buf[prev:e.cur]...)
+	e.applyOp(editOp{kind: opDelRun, sp: []splice{{pos: prev, old: old}}}, prev)
+	return true
+}
+
+// deleteForward is the Del key — the same run merge, forward direction.
+func (e *editor) deleteForward() bool {
+	e.clampCaret()
+	if lo, hi, ok := e.selRange(); ok {
+		old := append([]byte{}, e.buf[lo:hi]...)
+		e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: lo, old: old}}}, lo)
+		return true
+	}
+	if e.cur >= len(e.buf) {
+		return false
+	}
+	next := moveRight(e.buf, e.cur)
+	old := append([]byte{}, e.buf[e.cur:next]...)
+	e.applyOp(editOp{kind: opDelRun, sp: []splice{{pos: e.cur, old: old}}}, e.cur)
 	return true
 }
 
@@ -943,11 +1497,18 @@ func (e *editor) draw() {
 	e.drawText(textOrigin, 8, "Edit  "+e.path, colInk)
 
 	adv := font.Advance(1)
+	// #2199: the status line shares the chrome row, right-aligned — the same
+	// string emitStatus publishes on the serial console.
+	status := e.statusText()
+	if sw := utf8.RuneCountInString(status) * adv; sw < w-textOrigin {
+		e.drawText(w-textOrigin-sw, 8, status, colDim)
+	}
 	// M83e: a staged accent belongs to the surface that owns the keyboard, so
 	// the document shows it only in edit mode; a bar shows it below.
 	pre := e.stage.Preedit()
 	inDoc := pre != "" && e.mode == modeEdit
 
+	slo, shi, selOn := e.selRange()
 	y := chromeH + 4
 	line, start := 0, 0
 	caretRow, caretCol := -1, 0
@@ -957,6 +1518,32 @@ func (e *editor) draw() {
 		}
 		if line >= maxLines {
 			break
+		}
+		// The selection paints UNDER this row's text: the cells of the
+		// [start,i) byte range the [slo,shi) selection covers, plus one cell
+		// for a covered newline so a selection trailing a line still reads.
+		if selOn {
+			loB, hiB := slo, shi
+			if loB < start {
+				loB = start
+			}
+			if hiB > i {
+				hiB = i
+			}
+			c0, c1 := -1, -1
+			if loB < hiB {
+				c0 = utf8.RuneCount(e.buf[start:loB])
+				c1 = utf8.RuneCount(e.buf[start:hiB])
+				if shi > i && i < len(e.buf) && hiB == i {
+					c1++ // the covered newline's cell
+				}
+			} else if loB == i && shi > i && i < len(e.buf) {
+				c0 = utf8.RuneCount(e.buf[start:i])
+				c1 = c0 + 1 // a selection starting exactly on the newline
+			}
+			if c0 >= 0 {
+				e.fill(textOrigin+c0*adv, y, (c1-c0)*adv, 8, colSel)
+			}
 		}
 		onCaret := e.cur >= start && e.cur <= i
 		if inDoc && onCaret {
@@ -987,9 +1574,25 @@ func (e *editor) draw() {
 		label := "Find: "
 		if e.mode == modeGoto {
 			label = "Goto: "
+		} else if e.mode == modeReplace {
+			label = "Repl: "
 		}
 		barY := h - lineH - 2
 		e.drawText(textOrigin, barY, label+string(e.bar), colDim)
+		if e.mode == modeReplace {
+			// The second field follows `->`; a small block under it marks
+			// which field Tab has focused.
+			fx := textOrigin + (utf8.RuneCountInString(label)+utf8.RuneCount(e.bar))*adv
+			e.drawText(fx, barY, " -> ", colDim)
+			fx += 4 * adv
+			e.drawText(fx, barY, string(e.bar2), colDim)
+			fx += utf8.RuneCount(e.bar2) * adv
+			if e.bar2At {
+				e.fill(fx, barY+8, adv, 1, colCaret)
+			} else {
+				e.fill(textOrigin+(utf8.RuneCountInString(label)+utf8.RuneCount(e.bar))*adv, barY+8, adv, 1, colCaret)
+			}
+		}
 		if pre != "" {
 			col := utf8.RuneCountInString(label) + utf8.RuneCount(e.bar)
 			e.drawPreedit(textOrigin+col*adv, barY, pre)
