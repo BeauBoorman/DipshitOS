@@ -8,12 +8,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"virelai/gpu3d"
 	"virelai/vi"
 )
+
+// The seat's declare handler (kind-8) resizes declared windows to the full
+// viewport; the kernel then refuses a smaller surface bind (issue #2225).
+const seatViewportW, seatViewportH = 1280, 720
 
 // fakeTransport is the injected kind-17 transport. It records the opcode
 // order exactly as the client drives it, answers with genuine bound-token
@@ -84,7 +89,12 @@ func (f *fakeTransport) Exchange(_ context.Context, windowID uint32, op uint8, p
 	return gpu3d.Trip{Req: req, Ack: ack, Token: f.token}, nil
 }
 
-// fakeHost is the injected window/file/mailbox seam.
+// fakeHost is the injected window/file/mailbox seam. It enforces two real
+// kernel/share rules so the ordering bugs stay unrepresentable: a declared
+// window is seat-resized to the full viewport, after which a smaller bind
+// fails the capacity check (issue #2225), and the /host share has no
+// implicit mkdir — a write into a dir the app never created fails
+// (issue #2226).
 type fakeHost struct {
 	tr       *fakeTransport
 	nextWin  int
@@ -92,6 +102,8 @@ type fakeHost struct {
 	surfW    uint32
 	files    map[string][]byte
 	dirs     map[string]bool
+	declared map[int]bool
+	order    []string
 	lines    []string
 	ipc      [][]byte
 	closed   []int
@@ -106,10 +118,11 @@ type fakeHost struct {
 func newFakeHost() (*fakeHost, *fakeTransport) {
 	tr := &fakeTransport{token: 0x5150aa}
 	return &fakeHost{
-		tr:      tr,
-		files:   map[string][]byte{},
-		dirs:    map[string]bool{},
-		peersOK: true,
+		tr:       tr,
+		files:    map[string][]byte{},
+		dirs:     map[string]bool{},
+		declared: map[int]bool{},
+		peersOK:  true,
 	}, tr
 }
 
@@ -121,11 +134,19 @@ func (f *fakeHost) OpenWindow(x, y, w, h uint32) (int, error) {
 	return f.nextWin, nil
 }
 
-func (f *fakeHost) DeclareTab(win int, title string) bool { return true }
+func (f *fakeHost) DeclareTab(win int, title string) bool {
+	f.declared[win] = true
+	f.order = append(f.order, "declare")
+	return true
+}
 
 func (f *fakeHost) BindSurface(win int, w, h uint32) ([]byte, error) {
+	f.order = append(f.order, "bind")
 	if f.bindErr != nil {
 		return nil, f.bindErr
+	}
+	if f.declared[win] && (w < seatViewportW || h < seatViewportH) {
+		return nil, errors.New("bind under the declared viewport")
 	}
 	f.surf = make([]byte, int(w*h)*4)
 	f.surfW = w
@@ -149,6 +170,9 @@ func (f *fakeHost) MkdirShare(path string) error {
 func (f *fakeHost) WriteShareFile(path string, b []byte) error {
 	if f.writeErr != nil {
 		return f.writeErr
+	}
+	if strings.HasPrefix(path, receiptDir+"/") && !f.dirs[receiptDir] {
+		return errors.New("write: no such directory")
 	}
 	f.files[path] = append([]byte(nil), b...)
 	return nil
@@ -483,5 +507,55 @@ func TestLostContextIsNamed(t *testing.T) {
 	}
 	if len(rowsWith(h, "published")) != 0 {
 		t.Fatal("published row on a lost context")
+	}
+}
+
+// --- the M102 live-path fixes (#2224, #2225, #2226) -----------------------------
+
+// Issue #2224: the surface bind must issue the mmap syscall, not die
+// client-side. The old MmapHint(winTag|win, …) call failed its own
+// page-alignment check — EINVAL with zero kernel contact — while
+// MmapWindowSurface passes the tag|win hint through to slot-63. On the
+// host every issued syscall degrades to -ENOSYS, so ENOSYS (not EINVAL)
+// IS the proof the bind reached the kernel.
+func TestBindSurfaceIssuesTheMmapSyscall(t *testing.T) {
+	_, err := (guestHost{}).BindSurface(7, extentW, extentH)
+	if err == nil {
+		t.Fatal("the host stub must surface an error")
+	}
+	if err.Error() != "ENOSYS" {
+		t.Fatalf("bind error %q — EINVAL means the syscall never issued", err)
+	}
+}
+
+// Issue #2225: bind must precede declare. The fake enforces the kernel's
+// capacity rule — a declared window is seat-resized to the full viewport,
+// so a smaller post-declare bind is EINVAL — which makes every journey an
+// ordering check; this test names the contract directly.
+func TestBindPrecedesDeclare(t *testing.T) {
+	h, tr := newFakeHost()
+	tr.onStaged = func() { publishInto(h, extentW, extentH) }
+	if err := runJ(t, h, "triangle"); err != nil {
+		t.Fatalf("triangle: %v", err)
+	}
+	if len(h.order) < 2 || h.order[0] != "bind" || h.order[1] != "declare" {
+		t.Fatalf("window setup order: %v", h.order)
+	}
+}
+
+// Issue #2226: the first export must not depend on writeReceipts' mkdir —
+// it runs first, so exportSurface creates the receipt dir itself. The
+// fake share refuses writes into a dir that was never created.
+func TestExportCreatesReceiptDirFirst(t *testing.T) {
+	h, tr := newFakeHost()
+	tr.onStaged = func() { publishInto(h, extentW, extentH) }
+	if err := runJ(t, h, "triangle"); err != nil {
+		t.Fatalf("triangle: %v", err)
+	}
+	if !h.dirs[receiptDir] {
+		t.Fatalf("receipt dir never created: %v", h.dirs)
+	}
+	if _, ok := h.files[receiptDir+"/EXPO_1_1.BGRA"]; !ok {
+		t.Fatal("first export missing")
 	}
 }
