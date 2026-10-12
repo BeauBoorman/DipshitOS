@@ -190,6 +190,19 @@
 //   spike proves discovery + queue transport (audit step 4) and the
 //   used-ring IRQ via returnToQueue (audit step 5, claim 0828).
 //
+// * --gpu3d-metal (M102d3, issue #2168): attaches ONE additional custom-
+//   virtio device — the experimental private render device (virtio deviceID
+//   0x43, PCI DID 0x1083, class 0x03/0x00, 2 queues) served by b2's VIR1
+//   envelope core with c2's real Metal backend. APPENDED to the
+//   custom-virtio list: the 0x42 channel and the native 2D GPU are
+//   untouched, and without the flag the VM configuration is byte-identical
+//   to before. A Metal device that cannot initialize is a named failure,
+//   never a fallback. Requires the SPIKE build (macOS 27 custom-virtio SDK
+//   types); an ordinary build rejects the flag by name.
+//   [--gpu3d-test-mode <delay|wrong-fence|stall>] selects one of c2's
+//   deterministic completion-fault knobs; SPIKE-only, requires
+//   --gpu3d-metal, and OFF by default — no fault mode exists without it.
+//
 // * --virtio-fs <host-dir> (M83g): attach Apple's standard VirtioFS device,
 //   independently of the custom-virtio spike. The directory is shared
 //   writable under the guest's fixed `virelaios` tag. Unlike custom virtio,
@@ -270,6 +283,7 @@ import ScreenCaptureKit
 import Virtualization
 import VFWire
 import VMAppKit
+import VMGPU3D
 import VMPostmortem
 import VSNTP
 import VSSH
@@ -556,6 +570,11 @@ var snapshotOutBase: String?
 // this long (bounded) while a stream is in flight. 0 = stop immediately.
 var snapshotDrainTimeout: Double = 20
 var snapshotTriggers: [SnapshotTrigger] = []
+// M102d3 (issue #2168): the opt-in private 3D render device. Zero-value
+// options mean the VM configuration is byte-identical to before; the
+// VMGPU3D leaf owns the parsing vocabulary, the named rejections and the
+// device/backend assembly.
+var gpu3dOptions = GPU3DRunnerConfiguration.Options()
 // Milestone five card N1 (claim 1373): `--net <capture-file>` attaches the
 // virtio-net device; the guest's TX frames are captured byte-exactly to the
 // file. nil = default (no network device attached, config.networkDevices
@@ -1115,6 +1134,24 @@ while idx < arguments.count {
         snapshotDrainTimeout = Double(arguments[idx + 1]) ?? 20
         if snapshotDrainTimeout < 0 { snapshotDrainTimeout = 0 }
         idx += 2
+    } else if arg == "--gpu3d-metal" {
+        // M102d3 (#2168): opt-in private 3D render device (custom-virtio
+        // 0x43 / PCI 1af4:1083, VIR1) beside native 2D — appended, never
+        // replacing. Needs the SPIKE build; checked below with a named
+        // failure on an ordinary binary.
+        gpu3dOptions.metal = true
+        idx += 1
+    } else if arg == "--gpu3d-test-mode", idx + 1 < arguments.count {
+        // M102d3 (#2168): completion-fault selection for c2's
+        // deterministic knobs. SPIKE-only — the pre-attachment check
+        // rejects it by name on an ordinary binary.
+        guard let mode = GPU3DRunnerConfiguration.TestMode(rawValue: arguments[idx + 1]) else {
+            fail("--gpu3d-test-mode: unknown mode '\(arguments[idx + 1])' (want \(GPU3DRunnerConfiguration.TestMode.allCases.map(\.rawValue).joined(separator: "|")))")
+        }
+        gpu3dOptions.testMode = mode
+        idx += 2
+    } else if arg == "--gpu3d-test-mode" {
+        fail("--gpu3d-test-mode requires a mode (want \(GPU3DRunnerConfiguration.TestMode.allCases.map(\.rawValue).joined(separator: "|")))")
     } else if arg == "--net", idx + 1 < arguments.count {
         netCapturePath = arguments[idx + 1]
         idx += 2
@@ -1899,6 +1936,13 @@ if !snapshotAfterMarkers.isEmpty, screenshotPath == nil {
 if cvcConsoleFilePath != nil, !customVirtioEnabled {
     fail("--cvc-console-file requires the custom virtio device (queue 1 carries the structured console).")
 }
+// M102d3 (#2168): the opt-in render device and its SPIKE-only fault knob
+// are validated BEFORE any device is configured — every refusal is named,
+// never a silent fallback (the leaf also covers the ordinary-build case:
+// the flag parses, then attachment refuses by name).
+if let rejection = GPU3DRunnerConfiguration.rejection(for: gpu3dOptions) {
+    fail("\(rejection)")
+}
 if let sharePath = virtioFSShareDir {
     let shareURL = URL(fileURLWithPath: sharePath, isDirectory: true)
     var isDirectory: ObjCBool = false
@@ -2496,6 +2540,37 @@ if customVirtioEnabled {
     fail("--custom-virtio/--cvc-echo/--via-virtio/--cvc-snap/--cvc-console-file/--snapshot-after require a SPIKE build (macOS 27 SDK types); rebuild with `swift build --package-path host/vm-runner --configuration release -Xswiftc -DSPIKE` (`zig build spike-virtio` drives it). This binary cannot attach the requested device.")
 }
 #endif
+// M102d3 (#2168): the opt-in private render device, attached AFTER the
+// existing custom-virtio attach — the leaf's attach() APPENDS to
+// config.customVirtioDevices, so the 0x42 channel, the native 2D GPU and
+// every other device array stay untouched. Assemble builds c2's real
+// Metal backend first: a Metal init failure is a named stop here, never
+// a fallback. If VZ later refuses the configuration, config.validate()
+// below reports its exact error — do not substitute another device.
+// gpu3dCountersReport stays nil without the flag (and on every non-SPIKE
+// binary), so teardown reporting is compiled in everywhere but fires
+// only when the device was actually attached.
+var gpu3dCountersReport: (() -> String)?
+#if SPIKE
+// Held for the VM's lifetime: VZ holds the provider's delegates weakly,
+// so dropping the attachment would make the device go deaf (the same
+// retention discipline as CustomVirtioSpike's static delegates).
+@available(macOS 27.0, *)
+enum GPU3DRunnerRetain {
+    static var attachment: GPU3DRunnerAttachment?
+}
+if gpu3dOptions.metal, #available(macOS 27.0, *) {
+    switch GPU3DRunnerAttachment.assemble(options: gpu3dOptions) {
+    case .failure(let why):
+        fail("\(why)")
+    case .success(let attachment):
+        GPU3DRunnerRetain.attachment = attachment
+        attachment.attach(to: config)
+        gpu3dCountersReport = { attachment.counters() }
+        print("  \(attachment.banner())")
+    }
+}
+#endif
 do { try config.validate() } catch { fail("Invalid VM configuration: \(error)") }
 if vzRestore {
 #if arch(arm64)
@@ -2506,6 +2581,7 @@ if vzRestore {
     if inputMode { vzRestoreExtras.append("usb-hid(xhci)") }
     if usbMsdPath != nil { vzRestoreExtras.append("usb-msd(xhci)") }
     if customVirtioEnabled { vzRestoreExtras.append("custom-virtio") }
+    if gpu3dOptions.metal { vzRestoreExtras.append("gpu3d-metal") }
     if virtioFSShareDir != nil { vzRestoreExtras.append("virtio-fs") }
     let vzRestoreDevices = vzRestoreExtras.isEmpty ? "headless-base" : vzRestoreExtras.joined(separator: ",")
     print("VZ-RESTORE: devices=\(vzRestoreDevices) mode=\(vzRestoreLoadDir != nil ? "load" : vzRestoreSaveDir != nil ? "save" : "same-process")")
@@ -3078,6 +3154,12 @@ func stopDeviceAndExit(success: Bool, wantDump: Bool, wantNvram: Bool) {
             }
             if let probe = netTcpStreamProcess, probe.isRunning {
                 probe.terminate() // VM stopped; do not leave a blocked test peer behind
+            }
+            // M102d3 (#2168): the opt-in render device's lifecycle
+            // counters (resets, refusals, draws, completions) — numbers
+            // only, never token contents or guest bytes.
+            if let gpu3dCountersReport {
+                print("  \(gpu3dCountersReport())")
             }
             // Claim #1278: report the stop verdict on EVERY run, not only the
             // failing ones. The live gate asserts this line, so dropping the
