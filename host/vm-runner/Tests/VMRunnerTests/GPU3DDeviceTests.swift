@@ -17,6 +17,9 @@ final class GPU3DDeviceTests: XCTestCase {
         let writeCapacity: Int
         private(set) var written: [UInt8] = []
         private(set) var returned = false
+        /// Fires inside gpu3dReturn — the pump test observes retirement
+        /// from whatever queue completed the fence.
+        var onReturn: (() -> Void)?
 
         init(_ request: [UInt8], writeCapacity: Int = 4096) {
             self.request = request
@@ -31,7 +34,7 @@ final class GPU3DDeviceTests: XCTestCase {
             written.append(contentsOf: bytes)
             return true
         }
-        func gpu3dReturn() { returned = true }
+        func gpu3dReturn() { returned = true; onReturn?() }
     }
 
     final class FakeQueue: GPU3DQueue {
@@ -193,6 +196,23 @@ final class GPU3DDeviceTests: XCTestCase {
         return req
     }
 
+    /// RESOURCE_UNREF (0x0102) / RESOURCE_DETACH_BACKING (0x0107): the
+    /// frozen VIR1 res-op envelope — 24-byte header + u32 resource_id,
+    /// 28 bytes total with NO trailing pad word.
+    private func resOpReq(_ type: UInt32, ctxID: UInt32 = 7,
+                          resourceID: UInt32 = 5) -> [UInt8] {
+        var req: [UInt8] = [
+            UInt8(type & 0xff), UInt8((type >> 8) & 0xff), 0x00, 0x00, // type
+            0x00, 0x00, 0x00, 0x00, // flags
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fence_id
+            0x00, 0x00, 0x00, 0x00, // ctx_id (filled below)
+            0x00, 0x00, 0x00, 0x00, // ring_idx + padding
+        ]
+        for i in 0..<4 { req[16 + i] = UInt8((ctxID >> (8 * i)) & 0xff) }
+        for i in 0..<4 { req.append(UInt8((resourceID >> (8 * i)) & 0xff)) }
+        return req
+    }
+
     // MARK: - Helpers
 
     private func drive(_ device: GPU3DDevice, _ elements: [FakeElement]) {
@@ -296,6 +316,92 @@ final class GPU3DDeviceTests: XCTestCase {
         XCTAssertEqual(d.written, okNoDataCtx7)
         XCTAssertEqual(device.liveContextIDs, [])
         XCTAssertNil(device.lastRefusal)
+    }
+
+    // MARK: - Frozen 28B res-op decode (#2222)
+
+    /// The frozen res-op is 28 bytes: 24-byte header + u32 resource_id
+    /// and NO trailing pad — the pad check that used to sit over bytes
+    /// 24-27 made every nonzero resource_id die `.reservedBits`, so
+    /// unref/detach could never succeed. Both commands now decode and
+    /// dispatch against a live resource.
+    func testResOpsAccepted28B() {
+        switch GPU3DWire.decode(resOpReq(GPU3DWire.cmdResourceUnref)) {
+        case .success(let req):
+            XCTAssertEqual(req.command, .resourceUnref(resourceID: 5))
+            XCTAssertEqual(req.header.ctxID, 7)
+        case .failure(let r):
+            XCTFail("28B unref refused: \(r)")
+        }
+        switch GPU3DWire.decode(resOpReq(GPU3DWire.cmdResourceDetachBacking)) {
+        case .success(let req):
+            XCTAssertEqual(req.command, .resourceDetachBacking(resourceID: 5))
+        case .failure(let r):
+            XCTFail("28B detach-backing refused: \(r)")
+        }
+
+        let backend = GPU3DTestBackend()
+        backend.deferWork = false
+        let device = GPU3DDevice(backend: backend)
+        create(device, 7)
+        XCTAssertEqual(responseType({ let e = FakeElement(resourceCreateReq(resourceID: 5)); drive(device, [e]); return e }()),
+                       GPU3DWire.respOkNoData)
+        XCTAssertEqual(responseType({ let e = FakeElement(resourceCreateReq(resourceID: 6)); drive(device, [e]); return e }()),
+                       GPU3DWire.respOkNoData)
+
+        let detach = FakeElement(resOpReq(GPU3DWire.cmdResourceDetachBacking, resourceID: 5))
+        drive(device, [detach])
+        XCTAssertEqual(backend.calls.last, "detachBacking:7:5")
+        XCTAssertEqual(responseType(detach), GPU3DWire.respOkNoData)
+
+        let unref = FakeElement(resOpReq(GPU3DWire.cmdResourceUnref, resourceID: 6))
+        drive(device, [unref])
+        XCTAssertEqual(backend.calls.last, "unref:7:6")
+        XCTAssertEqual(responseType(unref), GPU3DWire.respOkNoData)
+
+        // The unref dropped resource 6 — a second unref names the
+        // dead id, and the envelope refusal still decodes.
+        let again = FakeElement(resOpReq(GPU3DWire.cmdResourceUnref, resourceID: 6))
+        drive(device, [again])
+        XCTAssertEqual(device.lastRefusal, .invalidResource)
+        XCTAssertEqual(responseType(again), GPU3DWire.respErrInvalidResourceID)
+    }
+
+    /// The 28B freeze is the whole envelope: a stock-virtio 32-byte
+    /// res-op (trailing pad word) is trailing garbage, a header pad
+    /// byte is still a named reserved-bits violation, and resource_id
+    /// 0 is still invalid — none of the hygiene checks went away with
+    /// the overlapping padWord.
+    func testResOpEnvelopeViolationsRefused() {
+        let device = GPU3DDevice(backend: GPU3DTestBackend())
+
+        var stockShape = resOpReq(GPU3DWire.cmdResourceUnref)
+        stockShape += [0, 0, 0, 0] // the stock-virtio pad word
+        let e32 = FakeElement(stockShape)
+        drive(device, [e32])
+        XCTAssertEqual(device.lastRefusal, .trailingBytes)
+        XCTAssertEqual(responseType(e32), GPU3DWire.respErrInvalidParameter)
+
+        var hdrPad = resOpReq(GPU3DWire.cmdResourceUnref)
+        hdrPad[21] = 0xff
+        let ePad = FakeElement(hdrPad)
+        drive(device, [ePad])
+        XCTAssertEqual(device.lastRefusal, .reservedBits)
+
+        var badFlag = resOpReq(GPU3DWire.cmdResourceDetachBacking)
+        badFlag[4] = 0x02 // INFO_RING_IDX — refused header-wide
+        let eFlag = FakeElement(badFlag)
+        drive(device, [eFlag])
+        XCTAssertEqual(device.lastRefusal, .reservedBits)
+
+        let eZero = FakeElement(resOpReq(GPU3DWire.cmdResourceUnref, resourceID: 0))
+        drive(device, [eZero])
+        XCTAssertEqual(device.lastRefusal, .invalidResource)
+        XCTAssertEqual(responseType(eZero), GPU3DWire.respErrInvalidResourceID)
+
+        let short = FakeElement(Array(resOpReq(GPU3DWire.cmdResourceUnref).prefix(27)))
+        drive(device, [short])
+        XCTAssertEqual(device.lastRefusal, .truncatedRequest)
     }
 
     // MARK: - Lifecycle
@@ -588,6 +694,87 @@ final class GPU3DDeviceTests: XCTestCase {
         drive(device, [])
         XCTAssertTrue(el.returned)
         XCTAssertEqual(responseType(el), GPU3DWire.respOkNoData)
+    }
+
+    /// pumpFences() is the drain the serial-queue pump invokes between
+    /// doorbells: an unfinished fence keeps the element held, a finished
+    /// one retires it with the matched OK — no queue notification needed.
+    func testPumpFencesRetiresPending() {
+        let backend = GPU3DTestBackend()
+        let device = GPU3DDevice(backend: backend)
+        create(device, 7)
+        let el = FakeElement(submitReq(ctxID: 7, fence: 0x42))
+        drive(device, [el])
+        XCTAssertFalse(el.returned)
+
+        device.pumpFences() // Metal has not completed — still held.
+        XCTAssertFalse(el.returned)
+        XCTAssertEqual(device.pendingFenceID, 0x42)
+
+        backend.polledFences = [0x42]
+        device.pumpFences()
+        XCTAssertTrue(el.returned)
+        XCTAssertEqual(responseType(el), GPU3DWire.respOkNoData)
+        XCTAssertNil(device.pendingFenceID)
+    }
+
+    /// #2223: while a deferred element holds its fence the device
+    /// re-polls the backend on completionQueue — the guest's next
+    /// doorbell is NOT required for the fence to retire. The Metal
+    /// completion is armed from inside the poll itself (on the pump's
+    /// serial queue) so the test races nothing.
+    func testFencePumpCompletesWithoutDoorbell() {
+        let backend = GPU3DTestBackend()
+        let device = GPU3DDevice(backend: backend)
+        device.completionQueue = DispatchQueue(label: "test.gpu3d.fencepump")
+        // The completion lands between guest notifications: arm it
+        // inside the poll, which every pump tick runs on the serial
+        // queue — the first notification-time poll sees no pending
+        // fence and stays empty.
+        backend.onPoll = {
+            if device.pendingFenceID == 0x42 { backend.polledFences = [0x42] }
+        }
+        create(device, 7)
+
+        let returned = expectation(description: "held element returned")
+        let el = FakeElement(submitReq(ctxID: 7, fence: 0x42))
+        el.onReturn = { returned.fulfill() }
+        drive(device, [el])
+        XCTAssertEqual(device.pendingFenceID, 0x42)
+        XCTAssertFalse(el.returned)
+
+        wait(for: [returned], timeout: 2)
+        XCTAssertEqual(responseType(el), GPU3DWire.respOkNoData)
+        XCTAssertNil(device.pendingFenceID)
+        XCTAssertEqual(device.staleCompletions, 0)
+    }
+
+    /// The pump stops itself: once the fence retires, `pending` clears
+    /// and no further poll is armed — a late backend report lands as
+    /// stale, never as a second retirement of the same element.
+    func testFencePumpStopsAfterRetirement() {
+        let backend = GPU3DTestBackend()
+        let device = GPU3DDevice(backend: backend)
+        device.completionQueue = DispatchQueue(label: "test.gpu3d.fencepump.stop")
+        create(device, 7)
+
+        let returned = expectation(description: "held element returned")
+        let el = FakeElement(submitReq(ctxID: 7, fence: 0x42))
+        el.onReturn = { returned.fulfill() }
+        drive(device, [el])
+
+        backend.polledFences = [0x42]
+        device.pumpFences() // retire synchronously before any pump tick
+        wait(for: [returned], timeout: 2)
+        XCTAssertNil(device.pendingFenceID)
+
+        // Let any stray tick fire, then a late fence report is stale.
+        backend.polledFences = [0x42]
+        let drained = expectation(description: "pump drained")
+        device.completionQueue?.asyncAfter(deadline: .now() + 0.02) { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+        device.pumpFences()
+        XCTAssertEqual(device.staleCompletions, 1)
     }
 
     // MARK: - Null backend

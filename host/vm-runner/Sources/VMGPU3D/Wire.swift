@@ -33,7 +33,7 @@
 //   RESOURCE_ATTACH_BACKING u32 resource_id, u32 nr_entries,
 //                        entries[n]{u64 addr, u32 len, u32 pad}
 //   RESOURCE_DETACH_BACKING / RESOURCE_UNREF
-//                        u32 resource_id, u32 padding            (28 total)
+//                        u32 resource_id                          (28 total)
 
 import Foundation
 
@@ -508,8 +508,10 @@ public enum GPU3DWire {
 
         case cmdResourceUnref, cmdResourceDetachBacking:
             if case .failure(let f) = fixed(unrefLen) { return .failure(f) }
+            // The frozen 28B res-op is header + u32 resource_id — there
+            // is no trailing pad word to check (bytes 24-27 ARE the id;
+            // a pad check there would reject every nonzero resource).
             guard let resourceID = r.u32() else { return .failure(.truncatedRequest) }
-            guard padWord(24) else { return .failure(.reservedBits) }
             guard resourceID != 0 else { return .failure(.invalidResource) }
             cmd = hdr.type == cmdResourceUnref
                 ? .resourceUnref(resourceID: resourceID)
