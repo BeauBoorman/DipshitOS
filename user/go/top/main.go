@@ -10,13 +10,14 @@
 // reason `gofiles:` kept FILE.BIN's shape. Every marker below is printed only
 // AFTER its syscall returned, so no assert can pass on a program that never ran.
 //
+// The filter is BACK (issue #2197): TOP's C8 text filter rode on Zig's
+// ui.TextInput, and the kit now has widgets.TextInput, so the retired
+// semantics return unchanged — `/` (or `f`) focuses the field, typed text
+// live-narrows the table by case-insensitive name substring, Enter commits
+// (the filter stays applied, the field unfocuses), Escape clears and the full
+// list comes back. Header sorting is untouched (click / press 1-4).
+//
 // What GOTOP deliberately does NOT port, and why (measured, not assumed):
-//   - TOP's text FILTER and its per-column header sorting both rode on Zig's
-//     ui.TextInput widget. The Go widget kit is exactly Text/Button/List
-//     (widgets.go), so there is no text-entry control to port the filter onto.
-//     Sorting stays (click the header / press 1-4) because it needs no input
-//     widget; the filter is retired with the widget, and C8's live coverage was
-//     never a gate assertion (it was top.zig's host tests).
 //   - The CPU/memory bar. `sys_procs` carries no CPU or memory figure and no
 //     cheap Go seam exposes one, so the summary line reports what the snapshot
 //     actually knows: row, running and exited counts.
@@ -61,6 +62,14 @@ const (
 	markerExit       = "top: exiting 43"
 	markerRefreshErr = "top: procs err="
 
+	// Filter markers (issue #2197): open/commit/cleared are the field's
+	// lifecycle; `top: filter=<text> n=<rows>` is printed after every edit
+	// rebuild, followed by a row dump of the narrowed view.
+	markerFilterOpen    = "top: filter open"
+	markerFilter        = "top: filter="
+	markerFilterCommit  = "top: filter commit"
+	markerFilterCleared = "top: filter cleared"
+
 	// rowMarkerMax bounds the per-row serial lines one refresh prints. The
 	// snapshot itself is capped at maxProcs (16), so this is belt-and-braces
 	// against a refresh storm flooding the serial log.
@@ -92,11 +101,16 @@ var (
 	natAuto    = widgets.Rect{X: 106, Y: 6, W: 42, H: 20}
 	natProcs   = widgets.Rect{X: 152, Y: 6, W: 44, H: 20}
 	natNetwork = widgets.Rect{X: 200, Y: 6, W: 38, H: 20}
-	natSummary = widgets.Rect{X: 296, Y: 6, W: 210, H: 20}
-	natHeader  = widgets.Rect{X: 6, Y: 52, W: 500, H: 16}
-	natList    = widgets.Rect{X: 6, Y: 70, W: 500, H: 256}
-	natFoot    = widgets.Rect{X: 6, Y: 330, W: 500, H: 18}
-	natRowH    = 16
+	// The filter field sits where Zig TOP.BIN's native_filter_input sat —
+	// (296,6,80,20) with its "Filter:" label to the left — and the summary
+	// line shifts right of it.
+	natFilterLabel = widgets.Rect{X: 238, Y: 6, W: 56, H: 20}
+	natFilter      = widgets.Rect{X: 296, Y: 6, W: 80, H: 20}
+	natSummary     = widgets.Rect{X: 384, Y: 6, W: 122, H: 20}
+	natHeader      = widgets.Rect{X: 6, Y: 52, W: 500, H: 16}
+	natList        = widgets.Rect{X: 6, Y: 70, W: 500, H: 256}
+	natFoot        = widgets.Rect{X: 6, Y: 330, W: 500, H: 18}
+	natRowH        = 16
 )
 
 type app struct {
@@ -118,6 +132,11 @@ type app struct {
 	header     widgets.Text
 	foot       widgets.Text
 	list       widgets.List
+
+	// filter is persistent state (text, caret, focus): layout() only moves
+	// its rect, never rebuilds it — a relayout must not lose the typed text.
+	filter      widgets.TextInput
+	filterLabel widgets.Text
 }
 
 func loadGuestTheme() {
@@ -151,6 +170,7 @@ func main() {
 		net: NewNetView(),
 		pg:  pageProcs,
 	}
+	a.bindFilter()
 	a.refreshAll(true, false)
 
 	a.layout()
@@ -278,6 +298,8 @@ func (a *app) layout() {
 	a.summary = widgets.Text{R: scaleR(natSummary), Label: a.status, Fg: t.Muted, Bg: t.Bg}
 	a.header = widgets.Text{R: scaleR(natHeader), Label: a.tab.Header(), Fg: t.Accent, Bg: t.Surface}
 	a.foot = widgets.Text{R: scaleR(natFoot), Label: a.footLine(), Fg: t.Muted, Bg: t.Bg}
+	a.filterLabel = widgets.Text{R: scaleR(natFilterLabel), Label: "Filter:", Fg: t.Muted, Bg: t.Bg}
+	a.filter.R = scaleR(natFilter)
 
 	items := a.items
 	if a.pg == pageNetwork {
@@ -304,7 +326,7 @@ func (a *app) footLine() string {
 		return "n procs   r refresh   a auto   rx/s " + vi.Itoa64(int64(a.net.RXRate)) +
 			" B   tx/s " + vi.Itoa64(int64(a.net.TXRate)) + " B"
 	}
-	return "k kill   r refresh   a auto   n net   1-4 sort"
+	return "k kill   r refresh   a auto   n net   / filter   1-4 sort"
 }
 
 func (a *app) draw() {
@@ -319,6 +341,8 @@ func (a *app) draw() {
 	a.killBtn.Draw(cv)
 	a.autoBtn.Draw(cv)
 	if a.pg == pageProcs {
+		a.filterLabel.Draw(cv)
+		a.filter.Draw(cv)
 		a.header.Draw(cv)
 	}
 	a.list.Draw(cv)
@@ -349,6 +373,58 @@ func (a *app) toggleAuto() {
 	} else {
 		vsys.TimerCancel()
 	}
+}
+
+// --- The filter (issue #2197) -------------------------------------------------
+//
+// TOP.BIN's retired C8 filter, restored on widgets.TextInput: `/` (or `f`)
+// focuses the field, every edit narrows the table live by name substring,
+// Enter commits (the field unfocuses, the filter stays applied, and its text
+// survives for the next `/`), Escape clears it — the full list returns.
+
+// bindFilter installs the field's submit/cancel callbacks once. The widget is
+// a pure state machine; the app owns what Enter and Escape mean.
+func (a *app) bindFilter() {
+	a.filter.OnSubmit = func(string) { a.commitFilter() }
+	a.filter.OnCancel = func() { a.cancelFilter() }
+}
+
+// openFilter focuses the field (`/`, `f`, or a click on the plate). It reports
+// whether focus actually moved, so a repeat `/` while focused costs nothing.
+func (a *app) openFilter() bool {
+	if a.filter.Focused {
+		return false
+	}
+	a.filter.Focused = true
+	vi.ConsoleLine(markerFilterOpen)
+	return true
+}
+
+// filterEdited rebuilds the view after the text changed mid-edit: the table
+// narrows live, the marker reports the needle and the row count it left, and
+// the row dump names exactly what the list now shows.
+func (a *app) filterEdited() {
+	a.tab.SetFilter(a.filter.Value())
+	a.rebuildItems()
+	vi.ConsoleLine(markerFilter + a.filter.Value() + " n=" + vi.Itoa64(int64(a.tab.Len())))
+	a.printRows()
+}
+
+// commitFilter is Enter: the filter stays applied, the field unfocuses.
+func (a *app) commitFilter() {
+	a.filter.Focused = false
+	vi.ConsoleLine(markerFilterCommit)
+}
+
+// cancelFilter is Escape: the text and the filter both clear, so the full
+// table comes back — TOP.BIN's "Esc restores the list".
+func (a *app) cancelFilter() {
+	a.filter.Focused = false
+	a.filter.Clear()
+	a.tab.SetFilter("")
+	a.rebuildItems()
+	vi.ConsoleLine(markerFilterCleared)
+	a.printRows()
 }
 
 // killSelected arms the highlighted process through slot 29. The marker is
@@ -391,6 +467,18 @@ func (a *app) handle(ev vi.Event) bool {
 }
 
 func (a *app) handleKey(ev vi.Event) bool {
+	// A focused filter field eats every key on the procs page (TOP.BIN's
+	// rule): the field interprets them, app chords stay inert until Enter or
+	// Escape hands the keys back.
+	if a.pg == pageProcs && a.filter.Focused {
+		before := a.filter.Value()
+		handled := a.filter.HandleKey(ev.Arg0, byte(ev.Arg1))
+		if a.filter.Focused && a.filter.Value() != before {
+			a.filterEdited()
+			return true
+		}
+		return handled || !a.filter.Focused
+	}
 	switch ev.Arg0 {
 	case keyUpArrow:
 		return a.tab.MoveBy(-1)
@@ -410,6 +498,11 @@ func (a *app) handleKey(ev vi.Event) bool {
 		return a.setPage(pageNetwork)
 	case 'p', 'P':
 		return a.setPage(pageProcs)
+	case '/', 'f', 'F':
+		if a.pg == pageProcs {
+			return a.openFilter()
+		}
+		return false
 	case keyOne:
 		a.tab.SortBy(ColPID)
 		return true
@@ -427,6 +520,18 @@ func (a *app) handleKey(ev vi.Event) bool {
 }
 
 func (a *app) handleClick(x, y int) bool {
+	if a.pg == pageProcs {
+		// The filter plate takes focus on click; a click anywhere else while
+		// it is focused just hands focus back (TOP.BIN's outside-click rule)
+		// rather than firing the control under the pointer.
+		if a.filter.HitTest(x, y) || a.filterLabel.HitTest(x, y) {
+			return a.openFilter()
+		}
+		if a.filter.Focused {
+			a.filter.Focused = false
+			return true
+		}
+	}
 	if a.procsBtn.HitTest(x, y) {
 		return a.setPage(pageProcs)
 	}

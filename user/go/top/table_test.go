@@ -311,6 +311,199 @@ func TestComparatorIgnoresNameCase(t *testing.T) {
 	}
 }
 
+// --- The filter (issue #2197) --------------------------------------------------
+
+// TestNameContainsTable mirrors top.zig's name_contains host test verbatim:
+// case-insensitive substring, empty needle matches all, needle longer than
+// the name never matches.
+func TestNameContainsTable(t *testing.T) {
+	cases := []struct {
+		haystack, needle string
+		want             bool
+	}{
+		{"HELLO.BIN", "", true},
+		{"HELLO.BIN", "hello", true},
+		{"HELLO.BIN", "llo", true},
+		{"HELLO.BIN", "world", false},
+		{"Calc.BIN", "calc", true},
+		{"A", "AB", false},
+	}
+	for _, c := range cases {
+		if got := nameContains(c.haystack, c.needle); got != c.want {
+			t.Fatalf("nameContains(%q, %q) = %v, want %v", c.haystack, c.needle, got, c.want)
+		}
+	}
+}
+
+// TestSetFilterNarrowsDisplayByNameSubstring is the Go port of Zig's "AppState
+// text filter and sort+filter" test: the display view narrows live to the
+// matching names, and an empty needle restores the whole table.
+func TestSetFilterNarrowsDisplayByNameSubstring(t *testing.T) {
+	fakeProcs(t, []vi.ProcRow{
+		namedRow(0, vi.ProcRunning, 0, "VIEW.BIN"),
+		namedRow(1, vi.ProcRunning, 0, "NOTEPAD.BIN"),
+		namedRow(2, vi.ProcRunning, 0, "TOP.BIN"),
+		namedRow(3, vi.ProcRunning, 0, "FILE.BIN"),
+	})
+	tab := NewTable()
+	tab.Refresh()
+	tab.SetFilter("top")
+	if tab.Len() != 1 {
+		t.Fatalf("filter 'top' left %d rows, want 1", tab.Len())
+	}
+	if p, _ := tab.Row(0); p.Name != "TOP.BIN" {
+		t.Fatalf("filtered row = %+v, want TOP.BIN", p)
+	}
+	// Sort composes with the filter (TOP.BIN's C8 pair).
+	tab.SetFilter("bin")
+	tab.SortBy(ColName)
+	if got := orderPIDs(tab); got != "3,1,2,0" {
+		t.Fatalf("filtered name-sort order = %s, want 3,1,2,0", got)
+	}
+	// Clearing the filter restores the full list.
+	tab.SetFilter("")
+	if tab.Len() != 4 {
+		t.Fatalf("cleared filter left %d rows, want 4", tab.Len())
+	}
+}
+
+// TestFilterPreservesSelectionByPID: a row that still matches keeps the aim.
+func TestFilterPreservesSelectionByPID(t *testing.T) {
+	fakeProcs(t, []vi.ProcRow{
+		namedRow(1, vi.ProcRunning, 0, "ALPHA.BIN"),
+		namedRow(2, vi.ProcRunning, 0, "BETA.BIN"),
+		namedRow(3, vi.ProcRunning, 0, "GAMMA.BIN"),
+	})
+	tab := NewTable()
+	tab.Refresh()
+	tab.SelectRow(1) // aim at BETA.BIN
+	tab.SetFilter("ta.bin")
+	if p, ok := tab.Selected(); !ok || p.PID != 2 {
+		t.Fatalf("filtered aim = %+v ok=%v, want pid 2 (BETA.BIN)", p, ok)
+	}
+}
+
+// TestFilteredOutSelectionFallsBackToDefaultAim: when the aimed row no longer
+// matches, the fallback picks the first running aimable row in the NARROWED
+// view — not a hidden row, not nothing.
+func TestFilteredOutSelectionFallsBackToDefaultAim(t *testing.T) {
+	fakeProcs(t, []vi.ProcRow{
+		namedRow(1, vi.ProcRunning, 0, "ALPHA.BIN"),
+		namedRow(2, vi.ProcRunning, 0, "BETA.BIN"),
+		namedRow(3, vi.ProcRunning, 0, "GAMMA.BIN"),
+	})
+	tab := NewTable()
+	tab.Refresh()
+	tab.SelectRow(0) // aim at ALPHA.BIN
+	tab.SetFilter("gamma")
+	p, ok := tab.Selected()
+	if !ok || p.PID != 3 {
+		t.Fatalf("fallback = %+v ok=%v, want the surviving pid 3", p, ok)
+	}
+}
+
+// TestFilterSurvivesRefresh: the needle is a view property — a new snapshot
+// re-applies it, exactly like Zig's rebuild_display on timer refresh.
+func TestFilterSurvivesRefresh(t *testing.T) {
+	rows := fakeProcs(t, []vi.ProcRow{
+		namedRow(1, vi.ProcRunning, 0, "ALPHA.BIN"),
+		namedRow(2, vi.ProcRunning, 0, "BETA.BIN"),
+	})
+	tab := NewTable()
+	tab.Refresh()
+	tab.SetFilter("alpha")
+	*rows = append(*rows, namedRow(3, vi.ProcRunning, 0, "ALPHA2.BIN"),
+		namedRow(4, vi.ProcRunning, 0, "DELTA.BIN"))
+	tab.Refresh()
+	if tab.Len() != 2 {
+		t.Fatalf("post-refresh filtered view = %d rows, want 2", tab.Len())
+	}
+	if got := orderNames(tab); got != "ALPHA.BIN,ALPHA2.BIN" {
+		t.Fatalf("filtered rows = %s", got)
+	}
+	if tab.Filter() != "alpha" {
+		t.Fatalf("filter = %q", tab.Filter())
+	}
+}
+
+// TestFilterMatchesNothingYieldsEmptyView: a needle no row matches empties
+// the list and disarms selection — it does not panic and does not lie.
+func TestFilterMatchesNothingYieldsEmptyView(t *testing.T) {
+	fakeProcs(t, []vi.ProcRow{
+		namedRow(1, vi.ProcRunning, 0, "ALPHA.BIN"),
+	})
+	tab := NewTable()
+	tab.Refresh()
+	tab.SetFilter("zzz")
+	if tab.Len() != 0 {
+		t.Fatalf("unmatched filter left %d rows", tab.Len())
+	}
+	if _, ok := tab.Selected(); ok {
+		t.Fatal("an empty filtered view must report no selection")
+	}
+	if tab.MoveBy(1) {
+		t.Fatal("MoveBy on an empty filtered view must not move")
+	}
+}
+
+// TestFilterRouteThroughHandleKey pins the app's wiring end to end at the key
+// boundary: `/` opens, typed chars narrow, Enter commits (filter stays),
+// Escape clears (full list back) — and while the field is focused the app
+// chords (`k`, digits) are inert text, not commands.
+func TestFilterRouteThroughHandleKey(t *testing.T) {
+	fakeProcs(t, []vi.ProcRow{
+		namedRow(0, vi.ProcExited, 7, "user-el0"),
+		namedRow(1, vi.ProcRunning, 0, "TABWM.BIN"),
+		namedRow(2, vi.ProcRunning, 0, "COUNTER.BIN"),
+		namedRow(3, vi.ProcRunning, 0, "GOTOP.ELF"),
+	})
+	a := &app{tab: NewTable(), net: NewNetView(), pg: pageProcs}
+	a.bindFilter()
+	a.tab.Refresh()
+	a.rebuildItems()
+
+	key := func(arg0 uint32, arg1 byte) bool {
+		return a.handleKey(vi.Event{Kind: vi.EvKeyDown, Arg0: arg0, Arg1: uint32(arg1)})
+	}
+	if !key(0, '/') || !a.filter.Focused {
+		t.Fatal("/ must open the filter field")
+	}
+	for _, ch := range "counter" {
+		key(0, byte(ch))
+	}
+	if a.filter.Value() != "counter" || a.tab.Len() != 1 {
+		t.Fatalf("filter=%q rows=%d, want counter/1", a.filter.Value(), a.tab.Len())
+	}
+	if len(a.items) != 1 {
+		t.Fatalf("list shows %d items, want the one matching row", len(a.items))
+	}
+	// Enter commits: the filter stays applied, focus leaves the field.
+	if !key(0x28, 0) || a.filter.Focused {
+		t.Fatal("Enter must commit and unfocus")
+	}
+	if a.tab.Len() != 1 || a.tab.Filter() != "counter" {
+		t.Fatal("commit must keep the filter applied")
+	}
+	// Reopen: the committed text survives; Escape clears field and filter.
+	key(0, '/')
+	if a.filter.Value() != "counter" {
+		t.Fatalf("reopened field = %q, want the committed text", a.filter.Value())
+	}
+	if !key(0x29, 0) || a.filter.Focused {
+		t.Fatal("Escape must close the field")
+	}
+	if a.tab.Len() != 4 || a.tab.Filter() != "" || a.filter.Value() != "" {
+		t.Fatalf("clear: rows=%d filter=%q value=%q", a.tab.Len(), a.tab.Filter(), a.filter.Value())
+	}
+	// While focused, `k` is a typed character, not a kill.
+	key(0, '/')
+	key(0, 'k')
+	if a.filter.Value() != "k" {
+		t.Fatalf("focused field ate 'k' as text? value=%q", a.filter.Value())
+	}
+	key(0x29, 0)
+}
+
 // TestCounts pins the summary line's inputs.
 func TestCounts(t *testing.T) {
 	fakeProcs(t, []vi.ProcRow{
