@@ -52,13 +52,13 @@ pub const hdr_len: usize = 24;
 /// Command types on the control queue (the subset this channel uses).
 pub const cmd_get_capset_info: u32 = 0x0108;
 pub const cmd_get_capset: u32 = 0x0109;
-pub const cmd_ctx_create: u32 = 0x0206;
-pub const cmd_ctx_destroy: u32 = 0x0207;
+pub const cmd_ctx_create: u32 = 0x0200;
+pub const cmd_ctx_destroy: u32 = 0x0201;
 
 /// Response types. 0x1100–0x11ff are OK responses; 0x1200+ are errors.
 pub const resp_ok_nodata: u32 = 0x1100;
-pub const resp_ok_capset_info: u32 = 0x1106;
-pub const resp_ok_capset: u32 = 0x1107;
+pub const resp_ok_capset_info: u32 = 0x1102;
+pub const resp_ok_capset: u32 = 0x1103;
 pub const resp_err_unspec: u32 = 0x1200;
 
 /// virtio_gpu_ctrl_hdr.flags: the request carries a fence the device must
@@ -152,7 +152,7 @@ pub fn encode_get_capset(out: []u8, capset_id: u32, capset_version: u32, fence_i
     return get_capset_req_len;
 }
 
-/// CTX_CREATE (0x0206): hdr + nlen + context_init + rname[64] = 96 bytes.
+/// CTX_CREATE (0x0200): hdr + nlen + context_init + rname[64] = 96 bytes.
 /// The context id travels in the header; `name` is the bounded debug name
 /// (≤ 64 bytes, NUL-free zone is zero-filled). `context_init` stays 0 —
 /// the private profile negotiates no context-init feature bits.
@@ -167,7 +167,7 @@ pub fn encode_ctx_create(out: []u8, ctx_id: u32, context_init: u32, name: []cons
     return ctx_create_req_len;
 }
 
-/// CTX_DESTROY (0x0207): the header alone names the context = 24 bytes.
+/// CTX_DESTROY (0x0201): the header alone names the context = 24 bytes.
 pub fn encode_ctx_destroy(out: []u8, ctx_id: u32, fence_id: u64) usize {
     std.debug.assert(out.len >= ctx_destroy_req_len);
     put_hdr(out, cmd_ctx_destroy, ctx_id, fence_id);
@@ -277,7 +277,7 @@ pub const golden_get_capset: [get_capset_req_len]u8 = .{
 
 /// CTX_CREATE ctx_id 1, context_init 0, rname "vir1c1", fence 3.
 pub const golden_ctx_create: [ctx_create_req_len]u8 = .{
-    0x06, 0x02, 0x00, 0x00, // type 0x0206
+    0x00, 0x02, 0x00, 0x00, // type 0x0200
     0x01, 0x00, 0x00, 0x00, // flags = FENCE
     0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fence_id = 3
     0x01, 0x00, 0x00, 0x00, // ctx_id = 1
@@ -296,7 +296,7 @@ pub const golden_ctx_create: [ctx_create_req_len]u8 = .{
 
 /// CTX_DESTROY ctx_id 1, fence 4.
 pub const golden_ctx_destroy: [ctx_destroy_req_len]u8 = .{
-    0x07, 0x02, 0x00, 0x00, // type 0x0207
+    0x01, 0x02, 0x00, 0x00, // type 0x0201
     0x01, 0x00, 0x00, 0x00, // flags = FENCE
     0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fence_id = 4
     0x01, 0x00, 0x00, 0x00, // ctx_id = 1
@@ -324,11 +324,11 @@ pub fn encode_vir1_caps(out: []u8, ready: u32) void {
 test "gpu3d_wire: command/response constants are the spec values" {
     try std.testing.expectEqual(@as(u32, 0x0108), cmd_get_capset_info);
     try std.testing.expectEqual(@as(u32, 0x0109), cmd_get_capset);
-    try std.testing.expectEqual(@as(u32, 0x0206), cmd_ctx_create);
-    try std.testing.expectEqual(@as(u32, 0x0207), cmd_ctx_destroy);
+    try std.testing.expectEqual(@as(u32, 0x0200), cmd_ctx_create);
+    try std.testing.expectEqual(@as(u32, 0x0201), cmd_ctx_destroy);
     try std.testing.expectEqual(@as(u32, 0x1100), resp_ok_nodata);
-    try std.testing.expectEqual(@as(u32, 0x1106), resp_ok_capset_info);
-    try std.testing.expectEqual(@as(u32, 0x1107), resp_ok_capset);
+    try std.testing.expectEqual(@as(u32, 0x1102), resp_ok_capset_info);
+    try std.testing.expectEqual(@as(u32, 0x1103), resp_ok_capset);
     try std.testing.expectEqual(@as(u32, 0x56495231), capset_vir1);
     try std.testing.expectEqual(@as(u32, 1), vir1_version);
     try std.testing.expectEqual(@as(u32, 32), vir1_payload_len);
