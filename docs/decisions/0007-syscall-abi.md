@@ -2312,3 +2312,123 @@ stay distinct all the way up: a timed-out session answers `ENOENT`, never
 `EIO` names a device-level protocol/submission fault. No fabricated live
 3D success exists while the host/seat integration is pending — an absent
 or unarmed device always answers `ENXIO`.
+
+## Amendment (2026-10-12, M99f #2184 — one bounded TCP socket table; legacy slots become a shim)
+
+No slot is added, renumbered, or reshaped. The change is **which state
+machine** answers the existing EL0 TCP surface: `socket_core.Core` is
+promoted to be the ONE connection table, and legacy slots 30–33/76 become
+a thin per-process view over it. The B6 slot-80 handle family is
+unchanged at the ABI level.
+
+### Decision: promote `socket_core`, do not table `tcp.zig`'s globals
+
+Two engines existed: `tcp.zig`'s system-wide singleton behind slots
+30–33/76 (every Go `vi.Dial`/`vi.Listen` competes for it) and the
+handle-based, owner-keyed `socket_core` behind slot 80 (passive-only,
+one listener, two children). The card's recommended option wins:
+
+- **`tcp.zig` cannot become the table without touching files outside the
+  card.** Its globals are read and written directly by `monitor.zig`,
+  `terminal.zig`, `shell.zig`, `scheduler.zig` and `ipv4.zig` — the
+  kernel-internal monitor/`net tcp` front-end and the `tty` net
+  front-end attach ride the singleton and stay on it. Turning it into a
+  table would change five files the card does not touch, or fork the
+  semantics those consumers see.
+- **`socket_core` already is the disciplined shape**: generation-tagged
+  handles, per-owner AccessDenied, bounded receive/poll/flush, the
+  ENOSPC/`capacity_refused` contract, byte-exact tested TX/RX. Growing
+  it reuses one tested engine instead of writing a second one inside
+  `tcp.zig` that would drift from it.
+- The singleton stays for its existing kernel-internal consumers
+  (monitor `net tcp`, the net front-end). Those flows are byte-identical
+  by construction: their code is untouched.
+
+### The table (kernel, bounded, compile-time priced)
+
+`socket_core.Core` becomes the system socket table:
+
+| Object | Bound | Priced against |
+|---|---:|---|
+| Connections (`children`) | 4 system-wide | `Connection` ≈ 3.1 KiB (RX `payload_max` + TX `segment_max` + control + metadata); 4 × ≈12.3 KiB |
+| Listeners | 4 system-wide, ≤1 per owner | `listener` keeps the slot-0 field `ipv4.zig` reads; slots 1–3 are `extra_listeners` |
+| Children per listener | 2 (`child_limit`) | the B6 "two clients, third refused" contract is preserved end-to-end |
+| Sockets per owner | 4 (listeners + conns + DNS seat) | `ownedCount` accounting |
+| Refusal slot | 1 (unchanged) | over-cap SYNs answered RST+ACK, counted `capacity_refused`/`refusal_dropped` |
+
+`@sizeOf(Core) + wire.frame_max` stays ≤ `core_limit` (16 KiB) — the
+existing comptime check enforces it: 4 conns + 4 listeners + refusal +
+counters ≈ 12.6 KiB + 1514 B ≈ 14.1 KiB. A fifth connection would price
+≈17.1 KiB — the 16 KiB budget, not a policy, sets the system bound. The
+card's "16 system-wide" is therefore dominated honestly: the real bound
+is 8 live TCP handles (4 conns + 4 listeners) + the unchanged DNS seat.
+
+Handles widen from `generation << 2 | slot2` to `generation << 4 |
+slot4`: slots 0–3 listeners, 4–7 connections, 15 the DNS seat (socket
+space is not a file descriptor — the encoding is internal). Each
+`Connection` gains a `parent` byte naming its spawning listener slot
+(0xFF = active-open), so `accept`/`ready`/`close` scope children to
+their own listener and `close(listener)` reclaims only its children.
+
+### Active open and routing
+
+- `Core.open(owner, local, remote, now, fresh_isn)` allocates an
+  outbound connection (`parent` = none), queues the SYN in the
+  connection's bounded TX, and stays `half_open` until a SYN+ACK whose
+  ack covers `snd_nxt` establishes it — the same 30 s phase deadline and
+  3 s/10-retry RTO every other connection carries. The slot-80 `connect`
+  operation stays `Unsupported` (the B6 ABI is unchanged — passive
+  only); active open is reachable through legacy slot 30.
+- RX: `ipv4.zig` keeps its slot-0 fast path. Every other TCP frame
+  enters `tcp.handle_rx`, which first offers the frame to a registered
+  claim delegate (`tcp.table_rx`, registered by `socket_native` — the
+  same callback seam as `Transmit`; no import cycle). `receive` demuxes
+  by full 4-tuple across all connections, then by listener-local match
+  for SYN admission; unclaimed frames fall through to the singleton
+  exactly as today.
+- TX: unchanged `Outbound` per-connection addressing (local/remote
+  endpoint + learned remote MAC) through `socket_transmit` — the fix for
+  the singleton's one-peer-MAC problem already existed.
+- Outbound local port: `tcp.default_src_port` (8000) when unclaimed,
+  else an IANA-ephemeral draw (49152+) that skips every claimed TCP port
+  (table listeners, table connections, the singleton's listener and
+  client port).
+
+### The legacy shim (slots 30–33/76 — same surface, new engine)
+
+The handle-less ABI keeps its per-process law: one outbound connection
+and/or one listener per process through slots 30–33 (the Go `slotHeld`
+contract is unchanged). `legacyConn(owner)` resolves the caller's
+outbound connection, else the first established child of the caller's
+listener — an implicit accept that mirrors the singleton's serialized
+listen→established→release cycle.
+
+- Slot 30 outbound: identical argument/peer validation; identical
+  in-kernel wait (RX drain + socket flush + RTO poll + the svclock
+  pacing release) until established, terminal, or the packed
+  ConnectDeadline — `EINVAL`/`ETIMEDOUT` exactly as today. A full table
+  is `ENOSPC`, counted `capacity_refused`.
+- Slot 30 passive: re-binds the caller's own listener (today's replace
+  semantics); a port held by another owner or by the singleton is
+  `ENOSPC`.
+- Slots 31/32/33/76 map onto `legacyConn` with today's errno rows
+  (`EACCES` not-owner, `EINVAL` wrong-state, `EFAULT` uaccess, `EAGAIN`
+  no socket). Recv returns 0 for not-ready/EOF exactly as today.
+- Owner death: the existing `socket_native.closeOwner(pid)` teardown
+  call already reclaims every table object the dead process owned; the
+  singleton's `tcp.close_owner` is unchanged.
+- `tcp.*` event counters are mirrored at shim-observable points (SYN
+  sent, SYN-ACK, data, FIN, RST, timeout, retransmit) so `net` and
+  `sys_net_stats` keep reporting the guest's TCP traffic — the gates
+  pin `timedout=1` on this path.
+
+### Observable contract
+
+`live-net-tcp`, `live-net-tcp-syscall`, `live-net-tcp-rto`, `go-net`,
+`live-ssh-server` and `go-agentd` stay byte-identical and green; the
+slot-80 native fixture (`ZNET.BIN`) keeps its two-children/third-refused
+shape; the injected `SOCKCORE.BIN` fixture keeps its budget and refusal
+pins. Multiplicity that never existed before is the only new behavior:
+two processes hold live connections, one process holds a listener plus
+an outbound connection, and listeners coexist across processes —
+over-cap is `ENOSPC`, counted.

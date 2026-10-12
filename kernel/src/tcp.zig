@@ -383,6 +383,16 @@ fn be32(b: []const u8) u32 {
 
 pub var owner_pid: ?u64 = null;
 
+/// M99f (#2184, ADR 0007): the promoted socket table's RX claim —
+/// registered by `socket_native` before any table socket exists.
+/// `handle_rx` offers EVERY TCP frame to it first; true means the frame
+/// named a table-owned local port and the table consumed it (its own
+/// parse and counters — never re-counted here). Frames it declines fall
+/// through to this singleton unchanged. The seam keeps the import-free
+/// delegate shape (the `Transmit` callback precedent): tcp.zig never
+/// imports socket_native.
+pub var table_rx: ?*const fn ([]const u8) bool = null;
+
 /// Close connection if owned by `pid` (called during process exit).
 pub fn close_owner(pid: u64) void {
     if (owner_pid) |p| {
@@ -683,6 +693,12 @@ pub fn take_rx() []const u8 {
 /// `ack_pending` — the transmission is MONITOR-driven on the next `net
 /// tcp` (deterministic, never a transmit from the drain context).
 pub fn handle_rx(frame: []const u8) Event {
+    // M99f (#2184): the ONE socket table claims its ports first — listeners
+    // beyond slot 0 and every connection reach the singleton only through
+    // this seam (ipv4's fast path keeps feeding slot 0 directly).
+    if (table_rx) |claim| {
+        if (claim(frame)) return .none;
+    }
     if (frame.len < frame_min) {
         dropped_malformed += 1;
         return .none;

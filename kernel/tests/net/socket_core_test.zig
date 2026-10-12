@@ -13,10 +13,16 @@ pub const Frame = struct {
     bytes: [wire.frame_max]u8 = undefined,
     len: usize,
     fn init(src: core.Endpoint, seq: u32, ack: u32, flags: u8, body: []const u8) Frame {
+        return initTo(local, src, seq, ack, flags, body);
+    }
+    /// M99f (#2184): a frame addressed to any table endpoint — extra
+    /// listeners and active-open connections sit on ports `init` cannot
+    /// name.
+    fn initTo(dst: core.Endpoint, src: core.Endpoint, seq: u32, ack: u32, flags: u8, body: []const u8) Frame {
         var segment: [wire.segment_max]u8 = undefined;
-        const slen = wire.build_segment(&segment, src.ip, local.ip, src.port, local.port, seq, ack, flags, body);
+        const slen = wire.build_segment(&segment, src.ip, dst.ip, src.port, dst.port, seq, ack, flags, body);
         var frame: Frame = .{ .len = 0 };
-        frame.len = wire.build_frame(&frame.bytes, &peer_mac, src.ip, guest_mac, local.ip, segment[0..slen]);
+        frame.len = wire.build_frame(&frame.bytes, &peer_mac, src.ip, guest_mac, dst.ip, segment[0..slen]);
         return frame;
     }
     fn inject(self: *const Frame, c: *core.Core, now: u64) !void {
@@ -85,7 +91,7 @@ test "socket core: listener admission, ownership, typed and stale tokens" {
     const newer = try c.listen(7, local, 0);
     try t.expect(newer.value != listener.value);
     try t.expectError(error.InvalidHandle, c.ready(7, listener));
-    c.next_generation = (std.math.maxInt(u64) >> 2) + 1;
+    c.next_generation = (std.math.maxInt(u64) >> core.slot_bits) + 1;
     try c.close(7, newer);
     try t.expectError(error.Capacity, c.listen(7, local, 0));
 }
@@ -520,4 +526,130 @@ test "socket core: checksum-valid fragments and reserved IPv4 flags are refused"
     std.mem.writeInt(u16, frame.bytes[24..26], wire.fold(wire.sum_words(frame.bytes[14..34])), .big);
     try frame.inject(&c, 0);
     try t.expect((try c.ready(7, h)).read);
+}
+
+// --- M99f (#2184): the real per-process socket table -------------------------
+
+test "socket core: four listeners on distinct ports, fifth is Capacity, ports never shared" {
+    var c: core.Core = .{};
+    const first = try c.listen(7, local, 0);
+    const second = try c.listen(8, .{ .ip = local.ip, .port = 8091 }, 0);
+    _ = try c.listen(9, .{ .ip = local.ip, .port = 8092 }, 0);
+    _ = try c.listen(10, .{ .ip = local.ip, .port = 8093 }, 0);
+    // The system listener bound, the one-listener-per-owner bound and the
+    // shared-port refusal are all honest Capacity, not silent sharing.
+    try t.expectError(error.Capacity, c.listen(11, .{ .ip = local.ip, .port = 8094 }, 0));
+    try t.expectError(error.Capacity, c.listen(8, .{ .ip = local.ip, .port = 8099 }, 0));
+    try t.expectError(error.Capacity, c.listen(11, local, 0));
+    try t.expect((first.value & core.slot_mask) != (second.value & core.slot_mask));
+    // Closing a mid-table listener frees its slot; the stale token is dead
+    // even after a new listener lands in it (the generation turns).
+    try c.close(8, second);
+    const newer = try c.listen(11, .{ .ip = local.ip, .port = 8094 }, 0);
+    try t.expectError(error.InvalidHandle, c.ready(8, second));
+    try t.expect((newer.value & core.slot_mask) == (second.value & core.slot_mask));
+    try t.expect(newer.value != second.value);
+    try c.close(7, first);
+    try t.expectEqual(@as(usize, 3), c.ownedSockets(9) + c.ownedSockets(10) + c.ownedSockets(11));
+}
+
+test "socket core: children across two listeners demux by tuple and close reclaims only siblings" {
+    var c: core.Core = .{};
+    const first = try c.listen(7, local, 0);
+    const second_l: core.Endpoint = .{ .ip = local.ip, .port = 8091 };
+    const second = try c.listen(8, second_l, 0);
+    var cap: Capture = .{};
+    var f = Frame.init(remote, 10, 0, wire.flag_syn, "");
+    try f.inject(&c, 0);
+    var g = Frame.initTo(second_l, other, 20, 0, wire.flag_syn, "");
+    try g.inject(&c, 0);
+    try t.expectEqual(@as(usize, 2), c.liveChildren());
+    cap.drain(&c);
+    f = Frame.init(remote, 11, 101, wire.flag_ack, "");
+    try f.inject(&c, 0);
+    const child0 = try c.accept(7, first);
+    g = Frame.initTo(second_l, other, 21, 101, wire.flag_ack, "");
+    try g.inject(&c, 0);
+    const child1 = try c.accept(8, second);
+    try t.expect((child0.value & core.slot_mask) != (child1.value & core.slot_mask));
+    // Payload to listener-1's tuple never reaches listener-0's child.
+    g = Frame.initTo(second_l, other, 21, 101, wire.flag_ack, "hi");
+    try g.inject(&c, 0);
+    var buf: [8]u8 = undefined;
+    try t.expectError(error.WouldBlock, c.read(7, child0, &buf, 0));
+    try t.expectEqual(@as(usize, 2), try c.read(8, child1, &buf, 0));
+    try t.expectEqualStrings("hi", buf[0..2]);
+    // Closing one listener reclaims only ITS children — the other
+    // listener's connection is untouched.
+    try c.close(7, first);
+    try t.expectError(error.InvalidHandle, c.status(7, child0));
+    try t.expectEqual(core.Outcome.none, try c.status(8, child1));
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    try c.close(8, second);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+}
+
+test "socket core: active open SYN-ACK establishes, stale conn token dies on reuse" {
+    var c: core.Core = .{};
+    var cap: Capture = .{};
+    const isn: u32 = 0x11111111;
+    const server: core.Endpoint = .{ .ip = .{ 10, 0, 0, 2 }, .port = 80 };
+    const h = try c.open(7, .{ .ip = local.ip, .port = 8000 }, server, peer_mac, 0, isn);
+    cap.drain(&c); // the queued SYN goes out to the server tuple
+    try t.expectEqualDeep(server, cap.endpoint);
+    try t.expectEqual(@as(u8, wire.flag_syn), cap.bytes[13]);
+    try t.expectEqual(isn, std.mem.readInt(u32, cap.bytes[4..8], .big));
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    try t.expectEqual(core.no_parent, c.children[0].?.parent);
+    // A SYN-ACK covering our SYN completes the handshake and queues the ACK.
+    var frame = Frame.initTo(.{ .ip = local.ip, .port = 8000 }, server, 77, isn +% 1, wire.flag_syn | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(core.State.established, c.children[0].?.state);
+    cap.drain(&c);
+    try t.expectEqual(@as(u8, wire.flag_ack), cap.bytes[13]);
+    try t.expect((try c.ready(7, h)).write);
+    // Data flows both ways on the one table engine.
+    try t.expectEqual(@as(usize, 2), try c.send(7, h, "hi", 0));
+    cap.drain(&c);
+    frame = Frame.initTo(.{ .ip = local.ip, .port = 8000 }, server, 78, isn +% 3, wire.flag_ack, "yo");
+    try frame.inject(&c, 0);
+    var buf: [8]u8 = undefined;
+    try t.expectEqual(@as(usize, 2), try c.read(7, h, &buf, 0));
+    try t.expectEqualStrings("yo", buf[0..2]);
+    // Close + re-open into the same slot: the old handle is dead.
+    try c.close(7, h);
+    const again = try c.open(7, .{ .ip = local.ip, .port = 8000 }, server, peer_mac, 0, isn);
+    try t.expectError(error.InvalidHandle, c.send(7, h, "x", 0));
+    try t.expect((again.value & core.slot_mask) == (h.value & core.slot_mask));
+    try c.close(7, again);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+}
+
+test "socket core: owner and system bounds are honest Capacity, owner death reclaims" {
+    var c: core.Core = .{};
+    var cap: Capture = .{};
+    const server: core.Endpoint = .{ .ip = .{ 10, 0, 0, 2 }, .port = 80 };
+    _ = try c.listen(7, local, 0);
+    // Owner 7: listener + two children = 3 sockets; a fourth fits.
+    _ = try establish(&c, &cap, remote, 0);
+    _ = try establish(&c, &cap, other, 0);
+    _ = try c.open(7, .{ .ip = local.ip, .port = 8000 }, server, peer_mac, 0, 5);
+    // The fifth socket for the same owner is refused at the door.
+    try t.expectError(error.Capacity, c.open(7, .{ .ip = local.ip, .port = 8001 }, server, peer_mac, 0, 5));
+    // No silent port sharing: another owner cannot claim a live local port.
+    try t.expectError(error.Capacity, c.open(8, local, server, peer_mac, 0, 5));
+    // The system connection bound: one more open fills the table; a SYN to
+    // the listener then gets the counted RST, never a silent drop.
+    _ = try c.open(8, .{ .ip = local.ip, .port = 8002 }, server, peer_mac, 0, 5);
+    try t.expectError(error.Capacity, c.open(9, .{ .ip = local.ip, .port = 8003 }, server, peer_mac, 0, 5));
+    var frame = Frame.init(.{ .ip = .{ 10, 0, 0, 9 }, .port = 6000 }, 30, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.capacity_refused);
+    cap.drain(&c);
+    try t.expectEqual(@as(u8, wire.flag_rst | wire.flag_ack), cap.bytes[13]);
+    // Owner death reclaims all of one owner's sockets and nothing else's.
+    c.closeOwner(7);
+    try t.expectEqual(@as(usize, 0), c.ownedSockets(7));
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    try t.expectEqual(@as(usize, 1), c.ownedSockets(8));
 }

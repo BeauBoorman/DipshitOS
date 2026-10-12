@@ -2309,7 +2309,6 @@ fn handle_sock_ready(args: Args, _: *exceptions.VectorFrame) u64 {
     const caller = scheduler.current_id();
     const pid = process.find_by_task(caller) orelse return error_result(.einval);
     if (want == 0 or (want & ~@as(u64, 3)) != 0) return error_result(.einval);
-    if (!tcp.owned_by_pid(pid)) return error_result(.eagain);
     // op 0 and op 1 are BOTH a probe. The level-triggered mask IS the
     // readiness signal; the bounded wait belongs to the CALLER (the Go
     // runtime's netpoll re-probes on its own scheduler-aware sleep), not to a
@@ -2318,7 +2317,20 @@ fn handle_sock_ready(args: Args, _: *exceptions.VectorFrame) u64 {
     // (observed: `[EXC] sync from EL1h ... unknown-reason`, `no recovery
     // path`) — a syscall handler must not re-enter the scheduler.
     _ = op;
-    return @intCast(tcp.ready_mask());
+    // M99f (#2184): this probe drains NOTHING and advances nothing — the
+    // drain-driven transport contract (agentd's netio, the singleton's own
+    // law) reads "readable-but-empty after a 0-recv" as peer-gone. A probe
+    // that pulled a fresh segment into rx would falsify exactly that.
+    if (native_socket.legacyConn(pid) == null and native_socket.legacyListenerSlot(pid) == null) {
+        // No table socket of the caller's: the kernel singleton's law —
+        // its owner's ready_mask, EAGAIN for anyone else.
+        if (!tcp.owned_by_pid(pid)) return error_result(.eagain);
+        return @intCast(tcp.ready_mask());
+    }
+    return native_socket.legacyReady(pid) catch |err| return switch (err) {
+        error.WouldBlock => error_result(.eagain),
+        else => socket_error(err),
+    };
 }
 
 fn socket_error(err: native_socket.core.Error) u64 {
@@ -2349,7 +2361,7 @@ fn handle_socket(args: Args, _: *exceptions.VectorFrame) u64 {
         0 => {
             if (!virtio_net.net_ready or !virtio_net.arp.ip_set()) return error_result(.enxio);
             if (args[1] > 0xffffffff or args[2] == 0 or args[2] > 65535) return error_result(.einval);
-            if (native_socket.sockets.next_generation > std.math.maxInt(i64) >> 2) return error_result(.enospc);
+            if (native_socket.sockets.next_generation > std.math.maxInt(i64) >> native_socket.core.slot_bits) return error_result(.enospc);
             const ip = if (args[1] == 0) virtio_net.arp.own_ip else native_socket.ipBytes(args[1]);
             if (!std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
             if (tcp.state != .idle and tcp.state != .closed and
@@ -2591,6 +2603,7 @@ fn handle_tty_attach(args: Args, _: *exceptions.VectorFrame) u64 {
             }
             if (tcp.state == .closed) tcp.reset();
             if (tcp.state != .idle and tcp.state != .listen) return error_result(.eacces);
+            if (native_socket.tcpPortClaimed(port)) return error_result(.enospc);
             tcp.reset();
             tcp.listen(port);
             tcp.allow_ip = if (allow) |ip| ip else .{ 0, 0, 0, 0 };
@@ -2972,22 +2985,323 @@ fn handle_kill(args: Args, _: *exceptions.VectorFrame) u64 {
     };
 }
 
-/// True when the process currently making the syscall owns the single
-/// global TCP connection (`tcp.owner_pid` matches the caller's pid). False
-/// for a non-process caller or when another process owns it. The connection
-/// is process-owned once established — a second process is refused EACCES
-/// (the M14 S4 ownership audit; the connection auto-closes on owner exit
-/// via `tcp.close_owner`).
+/// The caller key for the handle-less legacy view — a pid-less caller
+/// (kernel/test dispatch) sees only `unowned` sockets, matching "nobody
+/// owns it". M99f (#2184): every legacy op is per-process over the ONE
+/// socket table; a process's sockets auto-close on owner exit via
+/// `native_socket.closeOwner`, and the "another process owns it" case no
+/// longer exists — each process holds its own.
+fn legacy_owner() u64 {
+    return process.find_by_task(scheduler.current_id()) orelse native_socket.unowned;
+}
+
+/// The singleton's ownership test — kept for the `*_single` fallbacks: a
+/// caller with no table socket of its own still meets today's kernel
+/// engine (a front-end's own conn byte-identically, another owner's live
+/// conn = EACCES, idle = the old EINVAL/0 rows).
 fn tcp_owned_by_caller() bool {
-    const owner = process.find_by_task(scheduler.current_id()) orelse return false;
-    const current = tcp.owner_pid orelse return false;
-    return owner == current;
+    const pid = process.find_by_task(scheduler.current_id()) orelse return false;
+    return tcp.owned_by_pid(pid);
 }
 
 /// Slot 30: outbound x1 = port | timeout_ms<<16 (bits 48..63 reserved).
 /// Zero timeout keeps the legacy 30 s/EINVAL refusal. Passive open (ip==0)
 /// keeps its plain port word and rejects timeout bits.
-fn handle_tcp_connect(args: Args, _: *exceptions.VectorFrame) u64 {
+///
+/// M99f (#2184): the engine is the ONE socket table, not the tcp.zig
+/// singleton — each process carries its own outbound connection and/or
+/// legacy listener; the singleton still serves the monitor/front-end.
+/// Same validation, same in-handler handshake wait, same errno rows.
+fn handle_tcp_connect(args: Args, frame: *exceptions.VectorFrame) u64 {
+    const ip_raw = args[0];
+    const port_word = args[1];
+    const dst_port: u16 = @truncate(port_word);
+    const timeout_ms: u32 = @truncate(port_word >> 16);
+    if (dst_port == 0 or port_word >> 48 != 0) return error_result(.einval);
+    if (ip_raw == 0 and timeout_ms != 0) return error_result(.einval);
+    if (!virtio_net.net_ready) return error_result(.einval);
+    if (!virtio_net.arp.ip_set()) return error_result(.einval);
+    const owner = legacy_owner();
+
+    // Passive open (Listen mode) when ip == 0 — the caller's legacy
+    // listener: re-binding replaces it; a port claimed by any other
+    // socket (or the singleton) is ENOSPC, counted in the table. A live
+    // connection of the caller's is today's non-listen-state EINVAL; a
+    // drained terminal conn is reclaimed first (the `tcp.reset` mirror).
+    if (ip_raw == 0) {
+        if (native_socket.legacyConn(owner)) |c| {
+            if (c.state != .terminal) return error_result(.einval);
+            native_socket.releaseConn(c);
+        }
+        if (native_socket.legacyListenerSlot(owner) == null and tcp.state != .idle) {
+            // No table socket of the caller's and a live singleton — the
+            // kernel engine's own listen path answers byte-identically.
+            return handle_tcp_connect_single(args, frame);
+        }
+        native_socket.legacyListen(owner, virtio_net.arp.own_ip, dst_port) catch |err| return socket_error(err);
+        return 0;
+    }
+
+    const ip: [4]u8 = .{
+        @truncate(ip_raw >> 24),
+        @truncate(ip_raw >> 16),
+        @truncate(ip_raw >> 8),
+        @truncate(ip_raw),
+    };
+    if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
+
+    // The caller's own conn: an idempotent re-connect to the same peer is
+    // a no-op; any other live socket state is EINVAL (today's rows) — but
+    // another PROCESS's sockets no longer block this connect at all.
+    if (native_socket.legacyConn(owner)) |c| {
+        if (c.state == .terminal) {
+            native_socket.releaseConn(c);
+        } else {
+            if (c.state == .established and std.mem.eql(u8, &ip, &c.remote.ip) and dst_port == c.remote.port) return 0;
+            return error_result(.einval);
+        }
+    }
+    // No table socket of the caller's and a live singleton: the kernel
+    // engine still answers byte-identically — the front-end's own conn
+    // (idempotent-0 for its owner) or today's EACCES for anyone else's.
+    if (tcp.state != .idle) return handle_tcp_connect_single(args, frame);
+
+    virtio_net.net_rx_drain();
+    const peer_mac = virtio_net.arp.lookup(ip) orelse return error_result(.einval);
+    const start_pct = timer.cntpct();
+    const deadline = tcp.ConnectDeadline.init(start_pct, timer.freq, timeout_ms);
+    if (!builtin.is_test and deadline == null) return error_result(.einval);
+    const timeout_result = error_result(if (timeout_ms == 0) .einval else .etimedout);
+    const isn: u32 = @truncate(csprng.random_u64());
+    _ = native_socket.legacyOpen(owner, virtio_net.arp.own_ip, ip, dst_port, peer_mac, isn) catch |err| return socket_error(err);
+    tcp.syn_sent += 1; // `net`/`sys_net_stats` mirror — the guest's traffic stays honest
+
+    var test_iterations: usize = 0;
+
+    while (true) {
+        const c = native_socket.legacyConn(owner) orelse return error_result(.einval);
+        if (c.state == .established) {
+            tcp.synack_recv += 1;
+            tcp.ack_sent += 1;
+            return 0;
+        }
+        if (c.state == .terminal) {
+            const outcome = c.outcome;
+            native_socket.releaseConn(c);
+            switch (outcome) {
+                .timeout => {
+                    tcp.timed_out += 1;
+                    return timeout_result;
+                },
+                else => {
+                    tcp.rst_recv += 1;
+                    return error_result(.einval);
+                },
+            }
+        }
+        if (deadline) |d| {
+            if (d.expired(timer.cntpct())) {
+                native_socket.releaseConn(c);
+                tcp.timed_out += 1;
+                return timeout_result;
+            }
+        }
+        virtio_net.net_rx_drain();
+        // A SYN-ACK drained after the deadline must not turn expiry into
+        // success (the same check the singleton ran, in the same order).
+        if (deadline) |d| {
+            if (d.expired(timer.cntpct())) {
+                native_socket.releaseConn(c);
+                tcp.timed_out += 1;
+                return timeout_result;
+            }
+        }
+        virtio_net.net_socket_poll(); // table deadlines/RTO + the SYN (re)transmits here
+        tcp_flush_rst(); // M84f: an over-cap SYN during our connect is refused too
+
+        if (timer.freq == 0 or comptime builtin.is_test) {
+            test_iterations += 1;
+            if (test_iterations > 1000) {
+                native_socket.releaseConn(c);
+                tcp.timed_out += 1;
+                return timeout_result;
+            }
+        }
+
+        if (comptime builtin.cpu.arch == .aarch64) {
+            // M97e-F3 (#2094): pace the wait WITHOUT the domain hold —
+            // the audit's guest-freeze was this handler spinning
+            // IRQ-masked for the caller's whole budget while every other
+            // net-domain syscall spin-blocked on the lock. The loop's
+            // real work stays locked; only the pacing window drops it —
+            // a preempting task's own net syscall (or another core's) is
+            // the second RX pump in this polled stack, and the canonical
+            // release/acquire pair (the handle_exit precedent) keeps
+            // dispatch's defer balanced.
+            const outer = svclock.held_bits();
+            svclock.release_set(outer);
+            var spins: usize = 0;
+            while (spins < 1000) : (spins += 1) asm volatile ("nop");
+            svclock.acquire_set(outer);
+        }
+    }
+}
+
+/// M84f (#1836): flush the over-cap refusal's OWN bounded slot
+/// (`tcp.rst_msg` — never `tcp.msg`, so the connection's pending segment
+/// and retransmit state are undisturbed). Best-effort: a transport
+/// refusal keeps the refusal queued for the next TX site (and the shell
+/// idle loop). Called at every syscall TCP TX site — the refusal goes
+/// out before the connection's own queued segments.
+fn tcp_flush_rst() void {
+    if (!tcp.rst_pending) return;
+    var out_len: usize = 0;
+    if (virtio_net.net_tcp_send(tcp.rst_msg[0..tcp.rst_len], &out_len) == .ok) tcp.rst_pending = false;
+}
+
+/// Slot 31: `sys_tcp_send(buf, len)`: Send up to payload_max (64) bytes.
+/// M99f (#2184): the caller's own table connection — its bounded TX slot
+/// queues the segment and the core flush delivers it (the one-in-flight
+/// law: a still-unacked segment is EAGAIN, not silent overwrite).
+fn handle_tcp_send(args: Args, frame: *exceptions.VectorFrame) u64 {
+    const address = args[0];
+    var len = args[1];
+    if (len == 0) return 0;
+    if (len > tcp.payload_max) len = tcp.payload_max;
+    const owner = legacy_owner();
+    const c = native_socket.legacyConn(owner) orelse {
+        // A listener-only caller meets today's listen-state EINVAL; a
+        // caller with no table socket still meets the kernel singleton —
+        // its own conn byte-identically, another owner's EACCES.
+        if (native_socket.legacyListenerSlot(owner) != null) return error_result(.einval);
+        return handle_tcp_send_single(args, frame);
+    };
+    if (c.state != .established) return error_result(.einval);
+
+    if (uaccess.copy_in(&tcp_send_staging, address, @intCast(len)) != .ok) return error_result(.efault);
+
+    tcp_flush_rst(); // M84f: the singleton's refusal slot still goes first
+    const n = native_socket.sockets.send(owner, c.handle, tcp_send_staging[0..@intCast(len)], native_socket.now()) catch |err| return switch (err) {
+        error.WouldBlock => error_result(.eagain),
+        else => socket_error(err),
+    };
+    virtio_net.net_socket_poll();
+    tcp.data_sent += 1;
+    return n;
+}
+
+/// Slot 32: `sys_tcp_recv(buf, max)`: Receive up to max bytes into user buffer.
+/// M99f (#2184): reads the caller's own table connection's bounded RX —
+/// drained-EOF returns 0 exactly like the singleton's closed state.
+fn handle_tcp_recv(args: Args, frame: *exceptions.VectorFrame) u64 {
+    const address = args[0];
+    var max = args[1];
+    if (max == 0) return 0;
+    if (max > tcp.payload_max) max = tcp.payload_max;
+    const owner = legacy_owner();
+    const c = native_socket.legacyConn(owner) orelse {
+        // The caller's listener (or its still-handshaking child) reports
+        // 0 exactly like the singleton's listen/syn_received states; no
+        // table socket at all falls through to the singleton's rows.
+        if (native_socket.legacyListenerSlot(owner) != null) return 0;
+        return handle_tcp_recv_single(args, frame);
+    };
+    // A still-handshaking child (syn_received) reports 0 like the
+    // singleton did; a mid-open outbound conn is today's syn_sent EINVAL.
+    if (c.state == .half_open) {
+        if (c.parent == native_socket.core.no_parent) return error_result(.einval);
+        return 0;
+    }
+
+    virtio_net.net_rx_drain();
+    tcp_flush_rst();
+    virtio_net.net_socket_poll();
+
+    const take: usize = @intCast(@min(max, socket_scratch.len));
+    if (!uaccess.write_region_covers(address, take)) return error_result(.efault);
+    if (take != 0) if (uaccess.resolve_write_pages) |resolve| {
+        if (!resolve(address, take)) return error_result(.efault);
+    };
+    const n = native_socket.sockets.read(owner, c.handle, socket_scratch[0..take], native_socket.now()) catch |err| return switch (err) {
+        error.WouldBlock => 0,
+        error.PeerReset => blk: {
+            tcp.rst_recv += 1;
+            break :blk 0;
+        },
+        else => socket_error(err),
+    };
+    if (n == 0) return 0;
+    if (uaccess.copy_out(address, socket_scratch[0..n], n) != .ok) return error_result(.efault);
+    tcp.data_recv += 1;
+    return n;
+}
+
+/// Slot 33: `sys_tcp_close()`: Initiate client FIN teardown.
+/// M99f (#2184): the caller's own connection gets the bounded FIN dance;
+/// its listener (with any children) is reclaimed on the spot. Idle is 0.
+fn handle_tcp_close(args: Args, frame: *exceptions.VectorFrame) u64 {
+    const owner = legacy_owner();
+    const c = native_socket.legacyConn(owner) orelse {
+        if (native_socket.legacyListenerSlot(owner)) |slot| {
+            native_socket.sockets.releaseAt(slot);
+            return 0;
+        }
+        // No table socket of the caller's: the singleton's rows — idle
+        // is 0, another owner's live conn is EACCES, its own takes the
+        // kernel engine's FIN dance byte-identically.
+        return handle_tcp_close_single(args, frame);
+    };
+
+    tcp_flush_rst();
+    switch (c.state) {
+        .established => {
+            var tries: usize = 0;
+            while (tries < 100000) : (tries += 1) {
+                virtio_net.net_rx_drain();
+                virtio_net.net_socket_poll();
+                if (c.state != .established) break;
+                native_socket.sockets.shutdown(owner, c.handle, native_socket.now()) catch |err| switch (err) {
+                    error.WouldBlock => continue,
+                    else => {
+                        native_socket.releaseConn(c);
+                        return 0;
+                    },
+                };
+                tcp.fin_sent += 1;
+                break;
+            }
+            if (c.state != .closing) return 0;
+        },
+        .closing => {},
+        else => {
+            native_socket.releaseConn(c);
+            return 0;
+        },
+    }
+
+    // The FIN-ACK drain — today's bounded loop; the table's control ACK
+    // rides the same flush.
+    var iterations: usize = 0;
+    while (c.state == .closing and iterations < 100000) : (iterations += 1) {
+        virtio_net.net_rx_drain();
+        virtio_net.net_socket_poll();
+    }
+    if (c.state == .terminal) {
+        if (c.outcome == .eof) tcp.finack_recv += 1;
+        native_socket.releaseConn(c);
+    }
+    return 0;
+}
+
+// --- Singleton fallbacks -----------------------------------------------------
+// The kernel's one-connection engine still owns the monitor/front-end TCP
+// session. A legacy-slot caller with NO table socket of its own meets these
+// handlers verbatim: its own singleton conn (a tty net front-end attach)
+// keeps every byte of today's behavior, and "one socket exists that isn't
+// yours" stays EACCES. Idle falls to the same EINVAL/0 rows the table
+// would produce, so the dispatch is invisible when nothing is live.
+
+fn handle_tcp_connect_single(args: Args, _: *exceptions.VectorFrame) u64 {
     const ip_raw = args[0];
     const port_word = args[1];
     const dst_port: u16 = @truncate(port_word);
@@ -3139,20 +3453,7 @@ fn handle_tcp_connect(args: Args, _: *exceptions.VectorFrame) u64 {
     return error_result(.einval);
 }
 
-/// M84f (#1836): flush the over-cap refusal's OWN bounded slot
-/// (`tcp.rst_msg` — never `tcp.msg`, so the connection's pending segment
-/// and retransmit state are undisturbed). Best-effort: a transport
-/// refusal keeps the refusal queued for the next TX site (and the shell
-/// idle loop). Called at every syscall TCP TX site — the refusal goes
-/// out before the connection's own queued segments.
-fn tcp_flush_rst() void {
-    if (!tcp.rst_pending) return;
-    var out_len: usize = 0;
-    if (virtio_net.net_tcp_send(tcp.rst_msg[0..tcp.rst_len], &out_len) == .ok) tcp.rst_pending = false;
-}
-
-/// Slot 31: `sys_tcp_send(buf, len)`: Send up to payload_max (64) bytes.
-fn handle_tcp_send(args: Args, _: *exceptions.VectorFrame) u64 {
+fn handle_tcp_send_single(args: Args, _: *exceptions.VectorFrame) u64 {
     const address = args[0];
     var len = args[1];
     if (len == 0) return 0;
@@ -3188,8 +3489,7 @@ fn handle_tcp_send(args: Args, _: *exceptions.VectorFrame) u64 {
     }
 }
 
-/// Slot 32: `sys_tcp_recv(buf, max)`: Receive up to max bytes into user buffer.
-fn handle_tcp_recv(args: Args, _: *exceptions.VectorFrame) u64 {
+fn handle_tcp_recv_single(args: Args, _: *exceptions.VectorFrame) u64 {
     const address = args[0];
     var max = args[1];
     if (max == 0) return 0;
@@ -3228,8 +3528,7 @@ fn handle_tcp_recv(args: Args, _: *exceptions.VectorFrame) u64 {
     return @intCast(take);
 }
 
-/// Slot 33: `sys_tcp_close()`: Initiate client FIN teardown.
-fn handle_tcp_close(_: Args, _: *exceptions.VectorFrame) u64 {
+fn handle_tcp_close_single(_: Args, _: *exceptions.VectorFrame) u64 {
     if (tcp.state == .idle) return 0;
     if (!tcp_owned_by_caller()) return error_result(.eacces);
     if (tcp.state == .listen) {

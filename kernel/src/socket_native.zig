@@ -1,6 +1,8 @@
-//! B6 native service. NET-domain callers serialize this singleton.
-//! One passive listener, two children (including half-open/terminal), one
-//! separately owned DNS transaction. Legacy slots 30–33/76 stay independent.
+//! B6 native service — now the ONE TCP socket table (M99f #2184, ADR 0007).
+//! Up to four listeners (one per owner) and four connections in the bounded
+//! core, plus one separately owned DNS transaction. The legacy slot 30–33/76
+//! surface is a thin per-process view over this table (`legacy*` below); the
+//! kernel-internal `tcp.zig` singleton stays for the monitor/front-end.
 //! Handles are generation-tagged, process-owned, never file descriptors.
 //! All operations probe; EL0 sleeps between probes. No scheduler entry here.
 pub const core = @import("socket_core.zig");
@@ -43,7 +45,24 @@ pub fn now() u64 {
     if (timer.freq == 0) return timer.ticks *| timer.period_ns;
     return @intCast(@min(std.math.maxInt(u64), @as(u128, timer.cntpct()) * timer.period_ns / timer.freq));
 }
+/// M99f (#2184): the RX claim `tcp.zig`'s `handle_rx` offers every TCP
+/// frame to FIRST. True = the frame named a table-owned port and the
+/// table consumed it (its own parse/counts — the singleton never sees it).
+/// Registered the first time the table is polled; the kernel-internal
+/// singleton is untouched until then.
+fn claimTcpFrame(frame: []const u8) bool {
+    if (frame.len < core.wire.frame_min or frame[12] != 8 or frame[13] != 0 or
+        frame[14] != 0x45 or frame[23] != core.wire.protocol_tcp) return false;
+    const port = std.mem.readInt(u16, frame[36..38], .big);
+    if (!sockets.tableOwns(port)) return false;
+    sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
+    return true;
+}
+pub fn registerTableRx() void {
+    if (core.wire.table_rx == null) core.wire.table_rx = claimTcpFrame;
+}
 pub fn poll() void {
+    registerTableRx();
     sockets.poll(now()) catch unreachable;
     if (dns) |*d| {
         if (d.len == 0 and !d.failed and now() >= d.deadline) d.timed_out = true;
@@ -57,7 +76,7 @@ pub fn closeOwner(owner: u64) void {
     };
 }
 pub fn close(owner: u64, handle: core.Handle) core.Error!void {
-    if (handle.value & 3 != 3) return sockets.close(owner, handle);
+    if ((handle.value & core.slot_mask) != core.dns_slot) return sockets.close(owner, handle);
     const d = try dnsFor(owner, handle);
     _ = udp.close_port(d.port);
     dns = null;
@@ -77,11 +96,11 @@ fn ephemeralPort() ?u16 {
 pub fn beginDns(owner: u64, server: [4]u8, query: []const u8) core.Error!core.Handle {
     if (server[0] == 0 or server[0] == 127 or server[0] >= 224 or query.len < 17 or query.len > dns_max)
         return error.InvalidArgument;
-    if (dns != null or sockets.next_generation > std.math.maxInt(i64) >> 2) return error.Capacity;
+    if (dns != null or sockets.next_generation > std.math.maxInt(i64) >> core.slot_bits) return error.Capacity;
     // Pin one legacy listen-table seat so nobody can bind it concurrently.
     // A pre-existing bind is a capacity refusal, never silently intercepted.
     const port = ephemeralPort() orelse return error.Capacity;
-    const handle: core.Handle = .{ .value = sockets.next_generation << 2 | 3 };
+    const handle: core.Handle = .{ .value = sockets.next_generation << core.slot_bits | core.dns_slot };
     sockets.next_generation += 1;
     var d = Dns{ .owner = owner, .handle = handle, .server = server, .id = std.mem.readInt(u16, query[0..2], .big), .port = port, .deadline = now() +| core.deadline_ns };
     @memcpy(d.question[0 .. query.len - 12], query[12..]); // the question echo the reply must carry
@@ -138,27 +157,25 @@ pub fn receiveDns(frame: []const u8) bool {
     return true;
 }
 pub fn ready(owner: u64, handle: core.Handle) core.Error!u64 {
-    if (handle.value & 3 == 3) {
+    if ((handle.value & core.slot_mask) == core.dns_slot) {
         const d = try dnsFor(owner, handle);
         return if (d.len != 0 or d.failed or d.timed_out) 1 else 0;
     }
     const r = try sockets.ready(owner, handle);
+    // A readiness probe is the owner's liveness touch: callers that wait by
+    // polling ready must not hit the abandonment deadline while watching.
+    if ((handle.value & core.slot_mask) >= core.conn_slot_base)
+        sockets.children[(handle.value & core.slot_mask) - core.conn_slot_base].?.read_deadline = now() +| core.deadline_ns;
     return @as(u64, @intFromBool(r.read)) | (@as(u64, @intFromBool(r.write)) << 1) |
         (@as(u64, @intFromBool(r.accept)) << 2) | (@as(u64, @intFromBool(r.terminal)) << 3);
 }
 pub fn peer(owner: u64, handle: core.Handle) core.Error!u64 {
     _ = try sockets.status(owner, handle);
-    const c = sockets.children[(handle.value & 3) - 1].?;
+    const c = sockets.children[(handle.value & core.slot_mask) - core.conn_slot_base].?;
     return ipWord(c.remote.ip) << 16 | c.remote.port;
 }
 pub fn ownedCount(owner: u64) u64 {
-    var n: u64 = 0;
-    if (sockets.listener) |l| if (l.owner == owner) {
-        n += 1;
-    };
-    for (sockets.children) |c| if (c) |child| if (child.owner == owner) {
-        n += 1;
-    };
+    var n: u64 = sockets.ownedSockets(owner);
     if (dns) |d| if (d.owner == owner) {
         n += 1;
     };
@@ -169,4 +186,137 @@ pub fn ipWord(ip: [4]u8) u64 {
 }
 pub fn ipBytes(value: u64) [4]u8 {
     return .{ @truncate(value >> 24), @truncate(value >> 16), @truncate(value >> 8), @truncate(value) };
+}
+
+// ---------------------------------------------------------------------------
+// M99f (#2184): the legacy slot 30–33/76 shim — a handle-less per-process
+// view over the ONE table. The handle ABI (slot 80) is unchanged; the
+// kernel-internal tcp.zig singleton still serves the monitor/front-end.
+// ---------------------------------------------------------------------------
+
+/// Owner key for a pid-less caller (kernel/test dispatch) — unreachable by
+/// any real process, matching "nobody owns it" for legacy purposes.
+pub const unowned: u64 = std.math.maxInt(u64);
+
+/// Every TCP local port that is taken system-wide: the table's listeners
+/// and connections plus the kernel-internal singleton's listen/client port.
+pub fn tcpPortClaimed(port: u16) bool {
+    if (sockets.portClaimed(port)) return true;
+    const t = core.wire;
+    if (t.state != .idle and t.state != .closed) {
+        if (t.is_server) return t.listen_port == port;
+        return port == t.default_src_port;
+    }
+    return false;
+}
+
+/// The caller's legacy listener slot, if it holds one.
+pub fn legacyListenerSlot(owner: u64) ?u64 {
+    for (0..core.listener_limit) |slot| if (sockets.listenerAt(slot)) |l| {
+        if (l.owner == owner and l.legacy) return slot;
+    };
+    return null;
+}
+
+/// The handle-less "current connection" slots 31–33/76 operate on: the
+/// caller's active-open socket wins; else its legacy listener's children —
+/// the serving (already-claimed) child first, then a terminal child whose
+/// verdict the transport still needs, and only then an unaccepted one.
+/// Order matters now that multiplicity admits a second child: the session
+/// being served keeps the shim (a later connection WAITS), and a terminal
+/// child's .closed verdict outranks a queued accept so waitPeerGone still
+/// exits on the mask it watched the singleton produce. Implicit accept
+/// marks the child (a shim listener's handle never escapes the kernel, so
+/// slot-80 accept cannot double-serve). Explicit close/release frees it.
+pub fn legacyConn(owner: u64) ?*core.Connection {
+    for (&sockets.children) |*entry| if (entry.*) |*c| {
+        if (c.owner == owner and c.parent == core.no_parent) return c;
+    };
+    const slot = legacyListenerSlot(owner) orelse return null;
+    var serving: ?*core.Connection = null;
+    var draining: ?*core.Connection = null;
+    var pending: ?*core.Connection = null;
+    for (&sockets.children) |*entry| if (entry.*) |*c| {
+        if (c.parent != slot or c.state == .half_open) continue;
+        if (c.state == .terminal) {
+            if (draining == null) draining = c;
+        } else if (c.accepted) {
+            if (serving == null) serving = c;
+        } else if (pending == null) {
+            pending = c;
+        }
+    };
+    if (serving) |c| return c;
+    if (draining) |c| return c;
+    if (pending) |c| {
+        c.accepted = true;
+        return c;
+    }
+    return null;
+}
+
+/// The connection's own table slot — callers pass the pointer `legacyConn`
+/// returned, then close/release by handle-free slot id.
+pub fn connSlot(c: *core.Connection) u64 {
+    for (&sockets.children, 0..) |*entry, i| {
+        if (entry.*) |*e| if (e == c) return core.conn_slot_base + i;
+    }
+    unreachable; // a live conn's slot always exists
+}
+/// Free a connection slot the shim owns (post-outcome or explicit close).
+pub fn releaseConn(c: *core.Connection) void {
+    sockets.releaseAt(connSlot(c));
+}
+
+/// Passive open for legacy slot 30: re-bind replaces the caller's own
+/// legacy listener (today's `tcp.listen` semantics); any other claim on
+/// the port — a table listener/connection, another owner's legacy
+/// listener, or the kernel-internal singleton — is ENOSPC.
+pub fn legacyListen(owner: u64, local_ip: [4]u8, port: u16) core.Error!void {
+    registerTableRx(); // an extra-slot listener's SYNs arrive before any poll
+    if (legacyListenerSlot(owner)) |slot| sockets.releaseAt(slot);
+    if (tcpPortClaimed(port)) return error.Capacity;
+    const handle = try sockets.listen(owner, .{ .ip = local_ip, .port = port }, now());
+    try sockets.markLegacy(owner, handle);
+}
+
+/// Active open for legacy slot 30: allocate the caller's outbound
+/// connection with the SYN already queued in its bounded TX slot — the
+/// same engine, deadline and RTO every child carries. Local port is the
+/// deterministic 8000 when free, else an honest ephemeral draw that
+/// skips every claimed TCP port.
+pub fn legacyOpen(owner: u64, local_ip: [4]u8, remote_ip: [4]u8, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
+    registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
+    const port = allocLocalPort() orelse return error.Capacity;
+    return sockets.open(owner, .{ .ip = local_ip, .port = port }, .{ .ip = remote_ip, .port = remote_port }, remote_mac, now(), isn);
+}
+fn allocLocalPort() ?u16 {
+    if (!tcpPortClaimed(core.wire.default_src_port)) return core.wire.default_src_port;
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const port = ephemeral_lo + @as(u16, @truncate(csprng.random_u64())) % ephemeral_span;
+        if (!tcpPortClaimed(port)) return port;
+    }
+    return null;
+}
+
+/// slot 76's readiness over the shim view — the singleton's ready_mask
+/// shape: bit0 = a read outcome is pending (queued bytes, EOF, close, a
+/// peer FIN/RST), bit1 = established with nothing unacked in flight.
+/// WouldBlock when the caller holds no socket (the handler maps EAGAIN).
+pub fn legacyReady(owner: u64) core.Error!u64 {
+    const c = legacyConn(owner) orelse {
+        if (legacyListenerSlot(owner) != null) return 0;
+        return error.WouldBlock;
+    };
+    // The probe is a read-only query on the wire, but it is still the
+    // owner's liveness touch — the drain-driven transport and vi.Conn.Recv
+    // both keep a conn alive by polling ready alone. Without this slide a
+    // silently-waited conn would hit the 30 s abandonment deadline while
+    // its owner watches it (the singleton had no such deadline).
+    c.read_deadline = now() +| core.deadline_ns;
+    var mask: u64 = 0;
+    if (c.rx_len != 0 or c.peer_fin or c.state == .terminal or c.state == .closing) mask |= 1;
+    if (c.state == .established and c.tx_len == 0) mask |= 2;
+    return mask;
 }

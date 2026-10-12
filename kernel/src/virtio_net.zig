@@ -1362,7 +1362,7 @@ fn socket_transmit(_: ?*anyopaque, outbound: native_socket.core.Outbound) bool {
 /// NET lock held. Bounded maintenance even with no application traffic.
 pub fn net_socket_poll() void {
     native_socket.poll();
-    for (0..native_socket.core.child_limit * 2 + 1) |_| {
+    for (0..native_socket.core.conn_limit * 2 + 1) |_| {
         if (native_socket.sockets.flush(null, socket_transmit) != .sent) break;
     }
 }
