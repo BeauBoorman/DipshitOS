@@ -46,6 +46,7 @@ const mmu = @import("mmu.zig");
 const driving_award = @import("driving_award.zig"); // M32 WMS4: the renderer owns the chrome state the seam's teardown clears
 const scheduler = @import("scheduler.zig"); // M97g (#2079): the spawn provenance behind the seat gate
 const settings = @import("settings.zig"); // M97g (#2079): the configured seat program for the launcher class
+const gpu3d_broker = @import("gpu3d_broker.zig"); // M102d1 (#2166): the seat's GPU3D contexts die with it
 
 /// Slot-65 subcommand encoding — frozen by WMS1 (claim 1484) in the ADR 0007
 /// amendment. Do NOT renumber these; WMS4+ implement `SET_WINDOW` against
@@ -159,6 +160,17 @@ pub const wmctl_content_ptr: u64 = 15;
 /// read-only: the seat pid was always observable; the fix is that the
 /// answer can no longer be impersonated.
 pub const wmctl_seat_pid: u64 = 16;
+/// M102d1 (issue #2166): GPU3D (cmd 22) — the bounded experimental 3D
+/// bridge on the existing seat-exclusive slot. a0..a2 are reserved-zero;
+/// ptr/len carry exactly one frozen 64-byte typed descriptor (op /
+/// generation-bearing handle / window id / bounded geometry + vertices /
+/// reserved-zero — ADR 0007). The seat relays an authenticated app's
+/// bounded ops; apps never call it directly. The kernel side verifies
+/// seat, window, owner, bounds and context generation on EVERY operation
+/// and revokes contexts on window close, owner exit and unregister —
+/// gpu3d_broker.zig owns the state machine, this file only names the op
+/// and counts accepted submissions.
+pub const wmctl_gpu3d: u64 = 22;
 /// OVERVIEW actions (a0).
 pub const overview_enter_action: u64 = 0;
 pub const overview_exit_action: u64 = 1;
@@ -306,6 +318,9 @@ var tab_activate_count: u64 = 0;
 /// WM2 mission-control overview (issue #707 card 2): OVERVIEW (cmd 21)
 /// submissions accepted — the WM's grid-policy decisions applied.
 var overview_count: u64 = 0;
+/// M102d1 (issue #2166): GPU3D (cmd 22) submissions accepted — the
+/// bounded render decisions the seat relayed. Refusals never count.
+var gpu3d_count: u64 = 0;
 /// Set when the registered WM exits (teardown) — the shell idle loop drains
 /// this into the `wm: unregistered, shim resumed` report (the exit path is
 /// IRQ context and console-free, so the report is drained like the process
@@ -381,6 +396,10 @@ pub fn init() void {
     tab_detach_count = 0;
     tab_activate_count = 0;
     overview_count = 0;
+    gpu3d_count = 0;
+    // M102d1 (#2166): a seam reset strands no GPU3D context (records bind
+    // to windows/seat — pure BSS wipe, no device I/O).
+    gpu3d_broker.reset_state();
     pointer_fan_count = 0;
     window_mirror_count = 0;
     key_fan_count = 0;
@@ -552,6 +571,11 @@ pub fn unregister(pid: usize) bool {
     // M33 SB5: the WM's scanout grant dies with it — unmap the leaves (no
     // unref; kernel pages) and give the user layer back to the shim.
     scanout_teardown();
+    // M102d1 (#2166): the seat's GPU3D contexts die with it — handles are
+    // invalidated before the bounded drain, so nothing can ever publish
+    // for a dead compositor; a device that cannot drain leaves each
+    // session quarantined (backing pinned for late DMA).
+    gpu3d_broker.revoke_all();
     // M32 WMS4: the WM's chrome decisions die with it — the shim fallback
     // must restore its own chrome rules (a dead WM's look must not stay
     // painted). driving_award imports only wnd_core, so this import is
@@ -693,6 +717,8 @@ pub const WmInfo = struct {
     taskbar_count: u64,
     win_close_count: u64,
     overview_count: u64,
+    /// M102d1 (#2166): accepted GPU3D (cmd 22) submissions.
+    gpu3d_count: u64,
     pointer_fan_count: u64,
     window_mirror_count: u64,
     key_fan_count: u64,
@@ -730,6 +756,7 @@ pub fn info() WmInfo {
         .taskbar_count = taskbar_count,
         .win_close_count = win_close_count,
         .overview_count = overview_count,
+        .gpu3d_count = gpu3d_count,
         .pointer_fan_count = pointer_fan_count,
         .window_mirror_count = window_mirror_count,
         .key_fan_count = key_fan_count,
@@ -749,6 +776,13 @@ pub fn info() WmInfo {
 /// calls this AFTER the descriptor was validated and stored).
 pub fn note_set_window() void {
     set_window_count +%= 1;
+}
+
+/// M102d1 (#2166): count one accepted GPU3D submission — called by the
+/// syscall layer AFTER the broker accepted the descriptor. Refusals are
+/// never counted.
+pub fn note_gpu3d() void {
+    gpu3d_count +%= 1;
 }
 
 // ---------------------------------------------------------------------------

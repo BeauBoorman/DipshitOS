@@ -2221,3 +2221,94 @@ silent hazard.
   refused — `ENOMEM` on the syscall path, and a fault-driven refusal
   terminates the process with the reserved status 140. Reservations alone
   (a bare `mmap`) are uncharged; the charge lands on populate.
+
+## Amendment (2026-10-12, M102d1 #2166 — slot-65 cmd 22 `GPU3D`, the bounded experimental 3D bridge)
+
+Milestone M102 (index #2160, owner decisions: custom device 0x43 /
+1af4:1083, the private VIR1 capability profile) adds ONE subcommand to the
+existing slot-65 surface — **no new syscall slot**, the dispatch table and
+unknown-slot behavior are unchanged, and every existing slot-65 refusal
+(`ENOSYS` no seat, `EACCES` foreign caller, `EINVAL` unknown cmd) is
+preserved verbatim. The WM-facing app IPC that rides it (`WM_RPC` kind 17)
+is a separate card's contract; this amendment freezes only the kernel
+bridge.
+
+| GPU3D | `WMCTL_GPU3D` | 22 | a0..a2 reserved (0); `ptr` → GPU3D descriptor, `len` = 64 exactly | op result (see below) | `ENOSYS` no WM; `EACCES` foreign caller; `EFAULT` unreadable descriptor; `EINVAL` malformed; `EBADF` bad/stale handle; `ENOSPC` pool exhausted; `ENXIO` unsupported device; `EAGAIN` pending; `ETIMEDOUT` device deadline; `ENOENT` lost context; `EIO` device fault |
+
+### Call contract
+
+`a0`, `a1`, `a2` are reserved and must be zero. `len` must equal **64**
+exactly — a caller may never pass a different descriptor size. The handler
+copies the descriptor through checked uaccess **before any action**: an
+unreadable `ptr` answers `EFAULT` with zero device activity, and the
+broker sees only the kernel-owned copy — no user buffer is dereferenced
+after return, and no field of the descriptor carries or is ever treated
+as a physical address. Each successful operation increments the seat's
+`gpu3d` counter in the `wm` monitor report.
+
+### The frozen 64-byte descriptor (little-endian)
+
+| Offset | Size | Field | Rules |
+|-------:|-----:|-------|-------|
+| 0 | 4 | `op` | operation 1–7 below; 0 and ≥8 fail closed |
+| 4 | 4 | `flags` | always 0 |
+| 8 | 8 | `handle` | `generation:48 << 16 \| ctx_id:16`; CREATE requires 0, all other ops require the CREATE result verbatim |
+| 16 | 4 | `window_id` | the bound user window (1–255); required on every op |
+| 20 | 4 | `width` | CREATE: render extent (1–256); PUBLISH: the seat's captured client width; else 0 |
+| 24 | 4 | `height` | same rule as `width` (1–192 on CREATE) |
+| 28 | 4 | `rgb` | CLEAR: `0x00RRGGBB` frame clear color; else 0 |
+| 32 | 24 | `verts` | TRIANGLE: exactly three 8-byte wire vertices `{ i16 x, i16 y, u16 z, u16 rgb565 }`; else every byte 0 |
+| 56 | 8 | `reserved` | always 0 |
+
+Every field not listed for an operation must be zero — a nonzero
+reserved/foreign field, an over-bounds extent, or a malformed pointer is
+`EINVAL`/`EFAULT` **before** any device submission, and rejection never
+moves the context-pool counters.
+
+### Operations
+
+| op | Name | Fields used | Returns | Semantics |
+|---:|------|-------------|---------|-----------|
+| 1 | CREATE | `window_id`, `width`, `height` | generation-bearing `handle` | binds a bounded VIR1 render context to a live, owner-verified user window; same extent on the same window is idempotent (same handle), an extent change revokes the old generation and re-opens |
+| 2 | CLEAR | `handle`, `window_id`, `rgb` | 0 | stages the pending frame's clear color (rides the next PRESENT; doubles as the PUBLISH clear-rest fill) |
+| 3 | TRIANGLE | `handle`, `window_id`, `verts` | 0 | stages the one bounded triangle — replaces, never accumulates |
+| 4 | PRESENT | `handle`, `window_id` | 0 | uploads + `SUBMIT_3D`; returns only after the fence-matched completion (bounded device wait, never a sleep) |
+| 5 | POLL | `handle`, `window_id` | 1 = completed-frame pixels staged, 0 = pending | stages the kernel-owned bounce readback for the newest completed frame; idempotent |
+| 6 | PUBLISH | `handle`, `window_id`, `width`, `height` | 0 | copies ONLY the staged readback into the window's ordinary pixels (bound surface or kernel back-buffer) at the client origin with the destination row stride, clipped to the client rect; the rest is cleared through ordinary 2D drawing |
+| 7 | CLOSE | `handle`, `window_id` | 0 | invalidates the handle first, then runs the bounded drain |
+
+The broker re-verifies on **every** operation: registered seat, live
+window, unchanged window owner, descriptor bounds, context ownership and
+handle generation — the pid is never trusted as an identity input beyond
+the seat match.
+
+### PUBLISH lifetime rules
+
+PUBLISH draws nothing and submits nothing: the completed frame's pixels
+must already be staged by POLL (a kernel-owned bounce buffer — the device
+writes it via `TRANSFER_FROM_HOST_3D`, the CPU copies it onward; no DMA
+into application pages ever occurs). Immediately before the copy it
+re-validates the live window, the unchanged owner, the captured geometry
+against this moment's client rect (a resize since capture → `EINVAL`),
+and the destination surface's capacity (absent/revoked/undersized →
+`EINVAL`). A refused PUBLISH paints nothing.
+
+### Revocation
+
+Window close, owner exit and WM unregister revoke contexts **immediately
+and non-blockingly**: the handle's generation is bumped first (every
+later op on it answers `EBADF`), then the bounded drain runs. A device
+that cannot drain leaves the session quarantined — its pinned backing
+pages are preserved for late DMA — and the next CREATE retries the drain
+before answering `ENOSPC`. Window-id or pid reuse can never publish old
+pixels.
+
+### Named errors
+
+Pending (`EAGAIN`), unsupported (`ENXIO`), invalid (`EINVAL`),
+exhausted (`ENOSPC`), timeout (`ETIMEDOUT`) and lost context (`ENOENT`)
+stay distinct all the way up: a timed-out session answers `ENOENT`, never
+`EAGAIN`, on every later op. `EBADF` names only handle failures;
+`EIO` names a device-level protocol/submission fault. No fabricated live
+3D success exists while the host/seat integration is pending — an absent
+or unarmed device always answers `ENXIO`.

@@ -2702,6 +2702,173 @@ test "syscall: sys_wmctl (slot 65) enforces the render-server register contract"
     try std.testing.expect(!driving_award.wm_owns_input);
 }
 
+// ---------------------------------------------------------------------------
+// M102d1 (#2166): slot-65 cmd 22 GPU3D — the typed descriptor boundary.
+// A minimal fake render device over the same injectable transport seam
+// b1/c1's suites drive: it echoes the request header into the posted reply
+// and produces the response the request type implies (VIR1 caps on the
+// profile queries, nodata otherwise). No real rendering is proven here —
+// only the syscall-side contract.
+// ---------------------------------------------------------------------------
+
+const gpu3d_device = syscall.gpu3d_device;
+const gpu3d_wire = syscall.gpu3d_wire;
+const gpu3d_broker = syscall.gpu3d_broker;
+
+var g3d_req_count: usize = 0;
+var g3d_stash: []u8 = &.{};
+var g3d_req_buf: [4096]u8 = undefined;
+var g3d_req_len: usize = 0;
+
+fn g3d_submit(req: []const u8, resp: []u8) ?u32 {
+    g3d_req_count += 1;
+    const take = @min(req.len, g3d_req_buf.len);
+    @memcpy(g3d_req_buf[0..take], req[0..take]);
+    g3d_req_len = take;
+    const n = @min(resp.len, req.len);
+    @memcpy(resp[0..n], req[0..n]);
+    g3d_stash = resp;
+    return 0;
+}
+
+fn g3d_wait(handle: u32, budget: usize) ?u32 {
+    _ = handle;
+    _ = budget;
+    const resp = g3d_stash;
+    const cmd = std.mem.readInt(u32, resp[0..4], .little);
+    const want: u32 = switch (cmd) {
+        gpu3d_wire.cmd_get_capset_info => gpu3d_wire.resp_ok_capset_info,
+        gpu3d_wire.cmd_get_capset => gpu3d_wire.resp_ok_capset,
+        else => gpu3d_wire.resp_ok_nodata,
+    };
+    var used: usize = gpu3d_wire.nodata_resp_len;
+    if (want == gpu3d_wire.resp_ok_capset_info) used = gpu3d_wire.get_capset_info_resp_len;
+    if (want == gpu3d_wire.resp_ok_capset) used = gpu3d_wire.capset_resp_hdr_len + gpu3d_wire.vir1_payload_len;
+    const u: u32 = @intCast(used);
+    if (resp.len < u) return null;
+    std.mem.writeInt(u32, resp[0..4], want, .little);
+    if (want == gpu3d_wire.resp_ok_capset_info) {
+        std.mem.writeInt(u32, resp[24..28], gpu3d_wire.capset_vir1, .little);
+        std.mem.writeInt(u32, resp[28..32], gpu3d_wire.vir1_version, .little);
+        std.mem.writeInt(u32, resp[32..36], gpu3d_wire.vir1_payload_len, .little);
+    } else if (want == gpu3d_wire.resp_ok_capset) {
+        gpu3d_wire.encode_vir1_caps(resp[24..], 1); // ready=1
+    }
+    return u;
+}
+
+fn g3d_release(handle: u32, completed: bool) void {
+    _ = handle;
+    _ = completed;
+}
+
+fn g3d_arm() void {
+    gpu3d_device.reset_state();
+    gpu3d_device.transport = .{ .submit = g3d_submit, .wait = g3d_wait, .release = g3d_release };
+    gpu3d_device.g3_ready = true;
+    g3d_req_count = 0;
+    g3d_req_len = 0;
+}
+
+test "syscall: slot-65 cmd 22 GPU3D — typed descriptor boundary on the existing seat surface" {
+    userspace.init();
+    init(test_writer);
+    wm_server.init();
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = process 0
+    scheduler.start();
+    driving_award.arm();
+    var frame = fresh_frame();
+    try std.testing.expect(scheduler.yield_current()); // caller = pid 0
+    defer wm_server.init();
+
+    const cmd = wm_server.wmctl_gpu3d;
+    var desc: gpu3d_broker.Desc = .{ .op = gpu3d_broker.op_create, .window_id = 2, .width = 16, .height = 16 };
+    const desc_ptr = @intFromPtr(&desc);
+    set_user_regions(.{ .base = desc_ptr, .len = gpu3d_broker.desc_len }, .{ .base = 0, .len = 0 });
+
+    // The command rides the EXISTING slot: no new table entry, and cmd 22
+    // is the only new kernel entry behind it.
+    try std.testing.expectEqual(@as(u64, 22), cmd);
+
+    // No WM registered -> ENOSYS (the existing slot-65 semantic, before
+    // the descriptor is even touched).
+    try std.testing.expectEqual(error_result(.enosys), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    // Seat held by pid 1, caller is pid 0 -> EACCES.
+    try std.testing.expect(wm_server.register(1));
+    try std.testing.expectEqual(error_result(.eacces), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    // The caller becomes the seat.
+    try std.testing.expect(wm_server.unregister(1));
+    try std.testing.expect(wm_server.register(0));
+
+    // Reserved a0..a2 must be zero; len must be the frozen 64.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 1, 0, 0, desc_ptr, 64 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 63 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 65 }, &frame));
+    // An unreadable descriptor pointer -> EFAULT, before any device touch.
+    set_user_regions(.{ .base = 0, .len = 0 }, .{ .base = 0, .len = 0 });
+    try std.testing.expectEqual(error_result(.efault), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, 0x4000, 64 }, &frame));
+    set_user_regions(.{ .base = desc_ptr, .len = 64 }, .{ .base = 0, .len = 0 });
+
+    // Unknown ops fail closed; reserved bytes and op-foreign fields refuse.
+    desc.op = 0;
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    desc.op = 8;
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    desc.op = gpu3d_broker.op_create;
+    desc.reserved = 1;
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    desc.reserved = 0;
+
+    // No live user window 2 yet -> EINVAL (foreign window), still no device.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+
+    // Window exists but no render device -> ENXIO (unsupported), the named
+    // no-device refusal — never EINVAL or a crash.
+    const opened = driving_award.user_open(64, 64, 64, 48, 7);
+    try std.testing.expectEqual(driving_award.UserOpenResult{ .opened = 2 }, opened);
+    try std.testing.expectEqual(error_result(.enxio), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    try std.testing.expectEqual(@as(usize, 0), g3d_req_count);
+
+    // Arm the fake device: CREATE returns the generation-bearing handle,
+    // CLOSE drains it; the accepted-submission counter moves only on
+    // success.
+    g3d_arm();
+    const reqs0 = g3d_req_count;
+    const h = dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame);
+    try std.testing.expect(h != error_result(.einval));
+    try std.testing.expect(h > 0xffff); // generation bits set
+    try std.testing.expect(g3d_req_count > reqs0); // probe + bring-up ran
+    try std.testing.expectEqual(@as(u64, 1), wm_server.info().gpu3d_count);
+
+    // A stale generation on the same slot -> EBADF (the named
+    // lost-handle refusal, distinct from EINVAL).
+    desc = .{ .op = gpu3d_broker.op_close, .window_id = 2, .handle = h + (1 << 16) };
+    try std.testing.expectEqual(error_result(.ebadf), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    desc.handle = h;
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    try std.testing.expectEqual(@as(u64, 2), wm_server.info().gpu3d_count);
+
+    // The window's death revokes the context path: a descriptor naming a
+    // closed window is EINVAL, and a handle whose context was revoked is
+    // EBADF — both before the device (request count frozen).
+    gpu3d_device.reset_state();
+    g3d_arm();
+    desc = .{ .op = gpu3d_broker.op_create, .window_id = 2, .width = 16, .height = 16 };
+    const h2 = dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame);
+    const reqs1 = g3d_req_count;
+    _ = driving_award.user_close(2);
+    desc = .{ .op = gpu3d_broker.op_present, .window_id = 2, .handle = h2 };
+    try std.testing.expectEqual(error_result(.ebadf), dispatch(sys_wmctl, .{ cmd, 0, 0, 0, desc_ptr, 64 }, &frame));
+    try std.testing.expectEqual(reqs1 + 7, g3d_req_count); // the close drain ran; no new submits
+
+    // Slot count/table unchanged: cmd 22 is the only new kernel entry,
+    // and it rides slot 65 — the dispatch table itself did not grow.
+    try std.testing.expectEqual(@as(usize, 84), syscall.abi.slots.len);
+    gpu3d_device.reset_state();
+}
+
 test "syscall: #2079 wmctl REGISTER is provenance-gated; SEAT_PID answers the kernel register" {
     userspace.init();
     init(test_writer);

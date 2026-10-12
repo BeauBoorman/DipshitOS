@@ -57,6 +57,7 @@ pub const klog = @import("klog.zig"); // issue #990 (claim #997): the serial-log
 pub const geom = @import("wnd_core.zig"); // M32 WMS3 (issue #623): the shared pure rules (hit-test / workspace / clamps / title-layout) — compiled by the kernel AND the WM server so they cannot drift
 pub const process = @import("process.zig"); // #1056 item 2: resolve a window's owning process name (the non-tabapp tab-title fallback)
 pub const terminal = @import("terminal.zig"); // #1082 (ADR 0020 A4/A6): window-bound terminal grid + close auto-detach
+pub const gpu3d_broker = @import("gpu3d_broker.zig"); // M102d1 (#2166): window death revokes its GPU3D context (remove_user_at)
 
 /// M27 G13: Focus-follows-mouse configuration and dialog previous-focus tracking
 pub var focus_follows_mouse: bool = false;
@@ -1157,6 +1158,11 @@ pub fn arm() void {
         _ = alloc.init(view, &.{});
     }
     win_count = 0;
+    // M102d1 (#2166): a registry reset strands no GPU3D context — the
+    // broker's records bind to window ids, so a fresh window registry
+    // means a fresh context pool too (pure BSS wipe, mirrors c1's
+    // reset_state contract; nothing is live at boot).
+    gpu3d_broker.reset_state();
     windows[win_count] = .{
         .id = 0,
         .title = "roadpops",
@@ -1831,6 +1837,31 @@ pub fn user_is_surface_backed(id: u8) bool {
     return win.surface_handle != 0;
 }
 
+/// M102d1 (#2166): the CPU-visible pixel destination for one user window —
+/// the bound surface's own pages when migrated (identity-mapped into the
+/// kernel root, exactly where `composite()`/`user_fill` already address it),
+/// else the pool back-buffer. Surface capacity is re-validated HERE, at
+/// copy time, against the CURRENT win.w×win.h — an undersized surface
+/// refuses rather than painting past its pages (the #2111 invariant). Null
+/// for an unknown/non-user window or an undersized surface; the returned
+/// extent/stride are this moment's geometry so the caller clips and clears
+/// against the live rect, never a captured one.
+pub const PaintDest = struct {
+    base: [*]u8,
+    stride: usize,
+    w: u32,
+    h: u32,
+};
+
+pub fn user_paint_dest(id: u8) ?PaintDest {
+    const win = find_user_window(id) orelse return null;
+    if (win.surface_handle != 0) {
+        if (!surface_covers(win.surface_pages, win.w, win.h)) return null;
+        return .{ .base = @as([*]u8, @ptrFromInt(win.surface_pa)), .stride = @as(usize, win.w) * 4, .w = win.w, .h = win.h };
+    }
+    return .{ .base = kbuf_ptr(win), .stride = @as(usize, win.w) * 4, .w = win.w, .h = win.h };
+}
+
 /// Move a user window's top-left corner to (x, y), CLAMPED so the whole
 /// window stays inside the scanout (a window is never allowed off-screen —
 /// the honest bound). Marks the moved window dirty and the terminal dirty
@@ -2222,6 +2253,13 @@ pub fn surface_revoked(handle: u32) usize {
 pub fn remove_user_at(idx: usize) void {
     const removed_win = windows[idx];
     const removed_id = removed_win.id;
+    // M102d1 (#2166): a dying window revokes its GPU3D context FIRST — the
+    // handle is invalidated before c1's bounded drain runs, so a late
+    // publish can never reach this window's pixels. Non-blocking: a device
+    // that cannot drain leaves the session quarantined (backing pinned for
+    // late DMA). Runs in the exit path via close_owner — the same
+    // bounded-exchange contract as the kbuf free below.
+    gpu3d_broker.revoke_window(removed_id);
     // #1082 (ADR 0020 Amendment A, A6): closing the bound window auto-detaches
     // its terminal. The terminal survives, buffered, unattached, and the
     // serial console is NOT reclaimed (boot default unchanged). Pure BSS
