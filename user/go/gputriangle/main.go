@@ -61,21 +61,17 @@ const (
 
 	// Window + default render extent. The extent rides the private VIR1
 	// bound (1..256 x 1..192); the window is a fixed modest rect.
-	winX, winY                = 40, 32
-	winW, winH                = 320, 240
-	mixedWinW, mixedH         = 384, 288
-	mixedExW, mixedExH        = 96, 72 // mixed export rect: extent + margin ring
-	extentW, extentH          = 64, 48
-	resizeW, resizeH          = 96, 64
-	clearRGB                  = 0x102030
-	marginRGB                 = 0x4a3020
-	forgedToken               = 0xdeadbeef
-	maxPublishPolls           = 240
-	maxIdleTicks              = 120
-	surfWinTag         uint64 = 0x8000_0000_0000_0000 // M33 win-tag (kernel m33_surf_win_tag)
-	protRW             uint64 = 3
-	mapAnon            uint64 = 0x20
-	mapShared          uint64 = 0x10000
+	winX, winY         = 40, 32
+	winW, winH         = 320, 240
+	mixedWinW, mixedH  = 384, 288
+	mixedExW, mixedExH = 96, 72 // mixed export rect: extent + margin ring
+	extentW, extentH   = 64, 48
+	resizeW, resizeH   = 96, 64
+	clearRGB           = 0x102030
+	marginRGB          = 0x4a3020
+	forgedToken        = 0xdeadbeef
+	maxPublishPolls    = 240
+	maxIdleTicks       = 120
 )
 
 // The deterministic scene: a red right-ish triangle, asymmetric so a flipped
@@ -314,11 +310,16 @@ func (a *app) fillMargin(ew, eh uint32) {
 // app's own surface mapping into a packed BGRA receipt (alpha forced opaque)
 // and publishes it through the file seam. Called only after the seat has
 // staged the completed frame — this is the published-pixel evidence, read
-// back through the window mapping, never a GPU read.
+// back through the window mapping, never a GPU read. The receipt dir is
+// created here (issue #2226): the first export runs before writeReceipts'
+// own mkdir, so it cannot rely on it existing.
 func (a *app) exportSurface(name string, ew, eh uint32) error {
 	if a.surf == nil || ew == 0 || eh == 0 || ew > a.surfW ||
 		uint64(eh)*uint64(a.surfW)*4 > uint64(len(a.surf)) {
 		return errors.New("export geometry")
+	}
+	if err := a.h.MkdirShare(receiptDir); err != nil {
+		return err
 	}
 	out := make([]byte, 0, int(ew*eh)*4)
 	for y := uint32(0); y < eh; y++ {
@@ -399,22 +400,25 @@ func (a *app) frame(ew, eh, xw, xh uint32) error {
 	return nil
 }
 
-// openWindow opens the app window, declares the ordinary tab, binds its
-// shared back-buffer and records the window generation.
+// openWindow opens the app window, binds its shared back-buffer, declares
+// the ordinary tab and records the window generation. The bind must come
+// FIRST (issue #2225): the seat's declare handler resizes the window to the
+// full viewport, and a later smaller bind would fail the capacity check —
+// bound first, the kernel honestly keeps the window at its opened size.
 func (a *app) openWindow(w, h uint32) error {
 	win, err := a.h.OpenWindow(winX, winY, w, h)
 	if err != nil {
 		return err
 	}
 	a.win, a.wgen = win, a.wgen+1
-	if a.h.DeclareTab(win, appTitle) {
-		a.h.ConsoleLine("gputri: declare accepted")
-	}
 	surf, err := a.h.BindSurface(win, w, h)
 	if err != nil {
 		return err
 	}
 	a.surf, a.surfW = surf, w
+	if a.h.DeclareTab(win, appTitle) {
+		a.h.ConsoleLine("gputri: declare accepted")
+	}
 	a.rec.row("window", is(a.wgen), is(win), u32s(w)+"x"+u32s(h))
 	a.h.ConsoleLine("gputri: open id=" + is(win) + " surface")
 	return nil
@@ -693,7 +697,9 @@ func (guestHost) DeclareTab(win int, title string) bool {
 
 func (guestHost) BindSurface(win int, w, h uint32) ([]byte, error) {
 	n := int(w*h) * 4
-	surf, err := vi.MmapHint(uintptr(surfWinTag)|uintptr(win), n, protRW, mapAnon|mapShared)
+	// Issue #2224: MmapWindowSurface carries the tag|win hint that MmapHint
+	// would reject as unaligned — the bind must reach the kernel.
+	surf, err := vi.MmapWindowSurface(win, n)
 	if err != nil {
 		return nil, err
 	}
