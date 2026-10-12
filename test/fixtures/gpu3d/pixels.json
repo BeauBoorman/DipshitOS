@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "comment": "M102f1 (#2170) independent pixel oracle for the GPU3D triangle demo. Original fixture: the expected image is described as geometry, never stored as pixels — the comparator rasterizes the expectation itself. Coordinates are image space: origin top-left, y down, units are pixels. channel_order names the in-memory byte order of raw receipts and the channel semantics after PNG decode; alpha is pinned opaque.",
+  "channel_order": "BGRA",
+  "alpha": 255,
+  "edge_band_px": 2,
+  "scenes": {
+    "triangle": {
+      "width": 64,
+      "height": 48,
+      "stride": 64,
+      "clear": [16, 32, 48],
+      "triangle": {
+        "color": [255, 0, 0],
+        "vertices": [[8, 8], [56, 20], [20, 40]]
+      },
+      "min_interior": 200,
+      "guards": [
+        {"rect": [0, 0, 3, 3], "color": [16, 32, 48], "why": "far corner stays clear"},
+        {"rect": [61, 45, 3, 3], "color": [16, 32, 48], "why": "opposite corner stays clear"}
+      ]
+    },
+    "mixed": {
+      "width": 96,
+      "height": 72,
+      "stride": 96,
+      "render": [0, 0, 64, 48],
+      "clear": [16, 32, 48],
+      "margin": [74, 48, 32],
+      "triangle": {
+        "color": [255, 0, 0],
+        "vertices": [[8, 8], [56, 20], [20, 40]]
+      },
+      "min_interior": 200,
+      "guards": [
+        {"rect": [80, 8, 8, 8], "color": [74, 48, 32], "why": "right margin outside render destination"},
+        {"rect": [8, 60, 8, 8], "color": [74, 48, 32], "why": "bottom margin outside render destination"}
+      ]
+    },
+    "resized": {
+      "width": 96,
+      "height": 64,
+      "stride": 96,
+      "clear": [16, 32, 48],
+      "triangle": {
+        "color": [255, 0, 0],
+        "vertices": [[12, 11], [84, 27], [30, 53]]
+      },
+      "min_interior": 400,
+      "guards": [
+        {"rect": [0, 0, 3, 3], "color": [16, 32, 48], "why": "far corner stays clear"},
+        {"rect": [93, 61, 3, 3], "color": [16, 32, 48], "why": "opposite corner stays clear"}
+      ]
+    }
+  }
+}
