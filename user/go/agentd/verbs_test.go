@@ -40,7 +40,10 @@ func seamScope(t *testing.T) {
 		func() { killFn = killSave },
 		func() { probeFn = probeSave },
 		func() { seatPidFn = seatSave },
+		func() { winOpenFn = winSave },
+		func() { winHideFn = winHideSave },
 		func() { wmWindowsFn = wmSave },
+		func() { agentWindow = -1 },
 		func() { secretGetFn = secretSave },
 		func() { principalFn = principalSave },
 		func() { randomFn = randomSave },
@@ -67,6 +70,8 @@ var (
 	killSave      = killFn
 	probeSave     = probeFn
 	seatSave      = seatPidFn
+	winSave       = winOpenFn
+	winHideSave   = winHideFn
 	wmSave        = wmWindowsFn
 	secretSave    = secretGetFn
 	principalSave = principalFn
@@ -90,6 +95,11 @@ type fakeKernel struct {
 	waitErr  error
 	waitSt   int64
 	seatPid  int64
+	winID    int
+	winErr   int64
+	winW     uint32
+	winH     uint32
+	hidden   bool
 	wmRows   []vi.WmWindowRow
 	wmErr    error
 	outBody  []byte // what the spawned GOSH "wrote" to AGENTD.OUT
@@ -177,7 +187,26 @@ func (k *fakeKernel) install() {
 		return 0, vi.ProbeAbsent
 	}
 	seatPidFn = func() int64 { return k.seatPid }
-	wmWindowsFn = func(self string) ([]vi.WmWindowRow, error) {
+	winOpenFn = func(x, y, w, h uint32) (int, int64) {
+		if k.winErr != 0 {
+			return -1, k.winErr
+		}
+		k.winW, k.winH = w, h
+		if k.winID == 0 {
+			k.winID = 7
+		}
+		return k.winID, int64(k.winID)
+	}
+	winHideFn = func(id int, visible bool) int64 {
+		if id == k.winID && !visible {
+			k.hidden = true
+		}
+		return 0
+	}
+	wmWindowsFn = func(winID uint32, self string) ([]vi.WmWindowRow, error) {
+		if self != appName || int(winID) != k.winID {
+			return nil, vi.ErrSeatSilent
+		}
 		return k.wmRows, k.wmErr
 	}
 }
@@ -392,6 +421,11 @@ func TestUIWindows(t *testing.T) {
 	}
 
 	k.seatPid = 3
+	k.winErr = -vi.ErrENOSPC
+	if _, code = verbUIWindows(); code != "seat_unsupported" {
+		t.Fatalf("winopen fail code = %q", code)
+	}
+	k.winErr = 0
 	k.wmErr = vi.ErrSeatUnsupported
 	if _, code = verbUIWindows(); code != "seat_unsupported" {
 		t.Fatalf("zig seat code = %q", code)
@@ -408,6 +442,11 @@ func TestUIWindows(t *testing.T) {
 	res, code = verbUIWindows()
 	if code != "" {
 		t.Fatal(code)
+	}
+	// The bind window opens at the kernel's resize floor and hides at
+	// once (D5: never on the strip it reads, never painted).
+	if k.winW != 128 || k.winH != 64 || !k.hidden {
+		t.Fatalf("bind window = %dx%d hidden=%v", k.winW, k.winH, k.hidden)
 	}
 	want := `{"seat":"gotabwm","focused":0,"windows":[` +
 		`{"index":0,"id":100,"title":"Calc","focused":true,"pinned":false,"frozen":false},` +

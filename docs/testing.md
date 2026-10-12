@@ -739,7 +739,7 @@ host->guest, `AGENTCTL:` evidence rides stderr into the run log).
 
 | run | proves |
 |-----|--------|
-| 01 | seat + `--allow-exec` + Calc (Calc execs on the first `ui.windows` request — the 16-slot task pool cannot hold four Go runtimes at once, so it is staged after the journey's `gosh.run` calls): the handshake, all six verbs green, the whole in-session D4 refusal matrix, the `gosh.run` kill path, a second peer's SYN refused while the session stays up, and `line_too_long` ending it |
+| 01 | seat + `--allow-exec` + Calc (Calc execs on the first `ui.windows` request — the 16-slot task pool cannot hold four Go runtimes at once, so it is staged after the journey's `gosh.run` calls): the handshake, all six verbs green, the whole in-session D4 refusal matrix, the `gosh.run` kill path, a second peer's SYN refused while the session stays up, and `line_too_long` ending it. `ui.windows` rides the M97g-F2 bind: agentd opens its own undeclared window on the first call, walks the ownership challenge, and its bound kind-16 page requests quote the session token (`gotabwm: rpc bind id=` is the serial proof) |
 | 02 | wrong MAC -> `auth_failed`, the 1 s damping, and an honest relisten |
 | 03 | a `verb` line before auth -> `auth_required`, no request runs |
 | 04 | a silent client -> `auth_timeout` inside 15 s |
@@ -768,7 +768,10 @@ for the guest side and `python3 -m unittest
 tools/agentctl/test_agentctl.py` for the client: the pinned HMAC vector,
 the flat-grammar reader differential against `encoding/json`, the D4 code
 table, and the journeys run end-to-end against a wire-level daemon
-simulation.
+simulation. The `gosh.run` capture contract is pinned as observed
+(`shlib/agentline_observed_test.go`): the redirect captures builtin
+stdout; an external app's fd-1 output bypasses it and `AGENTD.OUT` is
+written empty; a pipeline naming an external refuses before any write.
 
 ## Verification sequence
 

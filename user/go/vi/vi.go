@@ -391,6 +391,17 @@ func WinResize(id int, w, h uint32) int64 {
 // WinClose closes the caller's window.
 func WinClose(id int) int64 { return syscall1(SlotWinClose, uintptr(id)) }
 
+// WinSetVisible hides or shows the caller's window (sys_win_set_visible,
+// slot 20 — the slots_gen row). A hidden window is inert to the compositor:
+// agentd's kind-16 bind window uses it so the WM_RPC plumbing never paints.
+func WinSetVisible(id int, visible bool) int64 {
+	var v uintptr
+	if visible {
+		v = 1
+	}
+	return syscall2(SlotWinSetVisible, uintptr(id), v)
+}
+
 // WinRaise raises the caller's window without changing keyboard focus.
 func WinRaise(id int) int64 { return svc1(SlotWinRaise, uintptr(id)) }
 

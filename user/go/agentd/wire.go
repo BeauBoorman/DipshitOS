@@ -29,11 +29,11 @@ type connIO interface {
 
 // Read outcomes for readLine: the caller maps them onto session results.
 const (
-	readOK = iota
-	readPeerGone   // FIN/RST consumed
-	readTimeout    // the recv deadline expired
-	readTooLong    // a line exceeded its byte limit (fatal)
-	readIOErr      // any other transport error
+	readOK       = iota
+	readPeerGone // FIN/RST consumed
+	readTimeout  // the recv deadline expired
+	readTooLong  // a line exceeded its byte limit (fatal)
+	readIOErr    // any other transport error
 )
 
 // lineReader owns the pipelined-input buffer. Lines are answered strictly
