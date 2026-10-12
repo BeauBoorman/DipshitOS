@@ -24,12 +24,29 @@
 # never on their paths; `--lease-fixture=` is the app's named fixture verb
 # (the GOSELF --panic-receipt-fixture precedent).
 #
+# #2199 (second pass) adds runs 05-08, one leg per landed feature:
+#   05 undo/redo + status line -- a typed run, a newline, another run and a
+#      backspace are undone three deep and redone once; `goedit: undo n=` /
+#      `redo n=` count the stacks, `goedit: status line=L/T col=C [*]` tracks
+#      each landing, and the saved bytes are the post-undo buffer exactly.
+#   06 selection + clipboard, CAP_CLIPBOARD path -- `exec -u0`, the monitor's
+#      `clip` preloads the shared buffer, paste splices it, ctrl-a selects
+#      all (sel=8 in the status line), ctrl-shift-m + arrows extend a mark
+#      selection (the runner cannot spell shift+arrow -- mark mode is the
+#      same anchor+caret rule), ctrl-x cuts it and a second `clip` reads the
+#      cut text back through the kernel buffer an app cannot fake.
+#   07 the M97g-F4 (#2082) refusal leg -- a plain `exec` GOEDIT gets -EACCES
+#      from slots 38/39; the markers carry rc=-7 and the share stays clean.
+#   08 replace -- Ctrl-R's two-field bar: Return replaces the match find
+#      lands on (hit=N/M), a find after it reports the remaining total, and
+#      Ctrl-A replaces all in one op whose n= equals that total.
+#
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goedit.sh   ->  .build/go/GOEDIT.ELF
 #
-# exec-order: assert-proven -- the run ends on `rx-goedit-ok`, which only the
-# script prints, and the stage gate that forwards the close waits on the app's
-# own `goedit: saved `; a program that never ran cannot pass.
+# exec-order: assert-proven -- the runs end on `rx-goedit-*`, which only the
+# scripts print, and the stage gates that forward the close wait on the app's
+# own markers; a program that never ran cannot pass.
 
 vgate_name go-edit "issue #1306 M58b: a Go editor opens, edits and saves a share file in Zig TABWM on VZ"
 vgate_share seed
@@ -70,6 +87,13 @@ with open(seed, "wb") as f:
 lease_seed = os.path.join(ed, "LEASE.TXT")
 with open(lease_seed, "wb") as f:
     f.write(b"lease-seed\n")
+# #2199: the second-pass runs' own targets — an undo/redo drill, a clipboard
+# drill, and a three-match replace document, each seeded so the saved-bytes
+# assert is an exact host-side compare.
+for name, body in [("UNDO.TXT", b"ab\n"), ("CLIP.TXT", b"clipthis"),
+                   ("REPL.TXT", b"one two one\ntwo one\n")]:
+    with open(os.path.join(ed, name), "wb") as f:
+        f.write(body)
 print("staged GOEDIT.ELF into share (%d bytes) and %s (%d bytes)" %
       (os.path.getsize(os.path.join(share, "GOEDIT.ELF")),
        seed, os.path.getsize(seed)))
@@ -341,4 +365,220 @@ source = os.path.join(os.environ["VG_SHARE"], "HEAP", "GOEDIT.ELF.TXT")
 rows = open(source).read().splitlines()
 assert 5 <= len(rows) <= 32 and all(len(row) <= 256 for row in rows)
 shutil.copy(source, os.path.join("artifacts", "m94d-goedit-series-" + os.environ["VG_TAG"] + ".txt"))
+PY
+
+# --- #2199 run 05: bounded undo/redo + the status line --------------------
+# On "ab\n" (caret at end): a leading ctrl-z proves the empty-stack marker,
+# then X, Return, Y build three ops (the newline breaks the typing run) and
+# backspace a fourth. Three undos pop the delete, the Y and the newline in
+# newest-first order; one ctrl-shift-z re-applies the newline. The saved
+# file is exactly the post-redo buffer "ab\nX\n" — the ops, the markers and
+# the bytes must all agree.
+vgate_file script2-05.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/UNDO.TXT
+EOF
+
+vgate_file script3-05.txt <<'EOF'
+dui close 2
+echo rx-goedit-undo-ok
+EOF
+
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-05.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-z,X,return,Y,backspace,ctrl-z,ctrl-z,ctrl-z,ctrl-shift-z,ctrl-s' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-05.txt' \
+    --script3-after 'goedit: saved ' \
+    --script-expect 'rx-goedit-undo-ok' --timeout 240
+
+vgate_assert 05 serial-contains 'goedit: read /host/EDIT/UNDO.TXT n=3'
+# Empty stack, then three reverted ops newest-first, then one redo.
+vgate_assert 05 serial-contains 'goedit: undo none'
+vgate_assert 05 serial-count 'goedit: undo n=' 3
+vgate_assert 05 serial-contains 'goedit: redo n='
+# The status line tracks the caret on every landing: the open frame, the
+# typed X, the newline's line 3, and the post-save clean flag (no *).
+vgate_assert 05 serial-contains 'goedit: status line=2/2 col=1'
+vgate_assert 05 serial-contains 'goedit: status line=2/2 col=2 *'
+vgate_assert 05 serial-contains 'goedit: status line=3/3 col=1 *'
+# The post-redo buffer is "ab\nX\n" — five bytes.
+vgate_assert 05 serial-contains 'goedit: saved /host/EDIT/UNDO.TXT n=5'
+vgate_assert 05 serial-contains 'rx-goedit-undo-ok'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'exited status=139'
+
+vgate_assert 05 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+path = os.path.join(share, "EDIT", "UNDO.TXT")
+want = b"ab\nX\n"
+got = open(path, "rb").read()
+if got != want:
+    print("UNDO/REDO SAVE MISMATCH: got %r want %r" % (got, want))
+    raise SystemExit(1)
+print("post-undo buffer verified on the host: %r (%d bytes)" % (got, len(got)))
+PY
+
+# --- #2199 run 06: selection + the shared clipboard (CAP_CLIPBOARD) -------
+# `exec -u0` is the M97g-F4 capable path (the live-m14-composition
+# precedent); the monitor's `clip` preloads "gateext" so the paste reads
+# bytes an app cannot fake. The drill: paste it, undo back to the seed,
+# ctrl-a selects all (sel=8) and copies, then a ctrl-shift-m mark plus three
+# rights selects "cli" — shift+arrow is not a runner token, so the mark is
+# the same anchor+caret rule driven by a chord the gate can spell — ctrl-x
+# cuts it, ctrl-v puts it back, and the harness-side `clip` prints the cut
+# text from the KERNEL buffer after the save.
+vgate_file script2-06.txt <<'EOF'
+clip gateext
+exec -u0 GOEDIT.ELF /host/EDIT/CLIP.TXT
+EOF
+
+vgate_file script3-06.txt <<'EOF'
+clip
+dui close 2
+echo rx-goedit-clip-ok
+EOF
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-06.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-v,ctrl-z,ctrl-a,ctrl-c,home,ctrl-shift-m,right,right,right,ctrl-x,ctrl-v,ctrl-s' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-06.txt' \
+    --script3-after 'goedit: saved ' \
+    --script-expect 'rx-goedit-clip-ok' --timeout 240
+
+vgate_assert 06 serial-contains 'goedit: read /host/EDIT/CLIP.TXT n=8'
+# The kernel buffer held the preloaded bytes before the app ever ran.
+vgate_assert 06 serial-contains 'clip: stored 7 bytes'
+vgate_assert 06 serial-contains 'goedit: paste n=7'
+# The paste is one op — one undo restores the seed (n=0 ops left, caret 8).
+vgate_assert 06 serial-contains 'goedit: undo n=0 cur=8'
+vgate_assert 06 serial-contains 'goedit: copy n=8'
+vgate_assert 06 serial-contains 'goedit: mark set'
+vgate_assert 06 serial-contains 'goedit: cut n=3'
+vgate_assert 06 serial-contains 'goedit: paste n=3'
+# sel=N is in the status line while the mark selection is live.
+vgate_assert 06 serial-contains 'goedit: status line=1/1 col=9 sel=8 *'
+vgate_assert 06 serial-contains 'goedit: status line=1/1 col=4 sel=3 *'
+vgate_assert 06 serial-contains 'goedit: saved /host/EDIT/CLIP.TXT n=8'
+# The external read: the kernel clipboard holds exactly the cut text. Line-
+# anchored because 'clip: cli' is a substring of 'clip: clipthis' — a serial-
+# contains could be satisfied by the copy that ran earlier in the drill.
+vgate_assert 06 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+assert re.search(r"(?m)^clip: cli\n", ser), "kernel clipboard must read back exactly 'cli'"
+print("clipboard read-back verified: 'clip: cli'")
+PY
+vgate_assert 06 serial-contains 'rx-goedit-clip-ok'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'exited status=139'
+
+vgate_assert 06 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+path = os.path.join(share, "EDIT", "CLIP.TXT")
+want = b"clipthis"
+got = open(path, "rb").read()
+if got != want:
+    print("CLIP DRILL SAVE MISMATCH: got %r want %r" % (got, want))
+    raise SystemExit(1)
+print("cut/paste round-trip verified on the host: %r (%d bytes)" % (got, len(got)))
+PY
+
+# --- #2199 run 07: the M97g-F4 refusal leg ---------------------------------
+# A plain `exec` GOEDIT has no CAP_CLIPBOARD: slots 38/39 answer -EACCES and
+# the markers carry rc=-7 — the policy boundary is the receipt, and the cut
+# must NOT have removed the bytes (serial-absent n=, file untouched: the run
+# closes a clean buffer, no save marker anywhere). `clip sentinel` preloads
+# the shared buffer so a refused paste cannot be mistaken for an empty one.
+vgate_file script2-07.txt <<'EOF'
+clip sentinel
+exec GOEDIT.ELF /host/EDIT/CLIP.TXT
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+dui close 2
+echo rx-goedit-refuse-ok
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-a,ctrl-x,ctrl-v' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'goedit: paste rc=' \
+    --script-expect 'rx-goedit-refuse-ok' --timeout 240
+
+vgate_assert 07 serial-contains 'clip: stored 8 bytes'
+vgate_assert 07 serial-contains 'goedit: cut rc=-7'
+vgate_assert 07 serial-contains 'goedit: paste rc=-7'
+# No clipboard op may have reported a byte count or a save.
+vgate_assert 07 serial-absent 'goedit: cut n='
+vgate_assert 07 serial-absent 'goedit: paste n='
+vgate_assert 07 serial-absent 'goedit: saved '
+vgate_assert 07 serial-contains 'goedit: close'
+vgate_assert 07 serial-contains 'rx-goedit-refuse-ok'
+vgate_assert 07 serial-absent '[EXC] parking:'
+
+# --- #2199 run 08: replace-current and replace-all ------------------------
+# On "one two one\ntwo one\n" ('one' x3): Ctrl-R opens the two-field bar,
+# `one`, Tab, `X`, Return replaces the match find would land on — hit=1/3 —
+# a find then reports the remaining total (1/2), and a second bar's Ctrl-A
+# replaces every match in one op whose n= equals that total. The saved file
+# is the host-side proof: "X two X\ntwo X\n" (14 bytes).
+vgate_file script2-08.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/REPL.TXT
+EOF
+
+vgate_file script3-08.txt <<'EOF'
+dui close 2
+echo rx-goedit-repl-ok
+EOF
+
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-08.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-r,o,n,e,tab,X,return,ctrl-f,o,n,e,return,ctrl-r,o,n,e,tab,X,ctrl-a,ctrl-s' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-08.txt' \
+    --script3-after 'goedit: saved ' \
+    --script-expect 'rx-goedit-repl-ok' --timeout 240
+
+vgate_assert 08 serial-contains 'goedit: read /host/EDIT/REPL.TXT n=20'
+vgate_assert 08 serial-contains "goedit: replace 'one' -> 'X' hit=1/3"
+# find's remaining total after the first replacement is 2 — the number
+# replace-all then reports, so N and M are the same scan.
+vgate_assert 08 serial-contains "goedit: find 'one' hit=1/2"
+vgate_assert 08 serial-contains "goedit: replace-all 'one' -> 'X' n=2"
+vgate_assert 08 serial-contains 'goedit: saved /host/EDIT/REPL.TXT n=14'
+vgate_assert 08 serial-contains 'rx-goedit-repl-ok'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 serial-absent 'exited status=139'
+
+vgate_assert 08 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+path = os.path.join(share, "EDIT", "REPL.TXT")
+want = b"X two X\ntwo X\n"
+got = open(path, "rb").read()
+if got != want:
+    print("REPLACE SAVE MISMATCH: got %r want %r" % (got, want))
+    raise SystemExit(1)
+print("replace-all result verified on the host: %r (%d bytes)" % (got, len(got)))
 PY
