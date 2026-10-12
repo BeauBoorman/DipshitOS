@@ -95,3 +95,111 @@ if out.count("NET-TCP-CONNECT-SSH: sent ") < 3:
     sys.exit("FAIL: pacing produced fewer than 3 segments")
 print("ssh server runner log ok")
 PY
+
+# --- M99g (#2185): two concurrent sessions -------------------------------
+# The pre-M99g daemon served exactly one session on the singleton socket.
+# On the slot-80 handle listener every accepted child is its own Conn on
+# its own goroutine, so the kernel's child_limit=2 becomes two
+# concurrent SSH sessions — each running GOSH -c independently — while a
+# DIFFERENT process (AGENTD.ELF, legacy slot-30 listener) holds its own
+# socket: listener + two children + a second process's listener coexist
+# inside the one socket table.
+
+vgate_file script-2.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec AGENTD.ELF
+exec GOSSHD.ELF
+EOF
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+for name, cmd in (("GOSSHD.ELF", "bash tools/go/build-sshd.sh"),
+                  ("GOSH.ELF", "bash tools/go/build-gosh.sh"),
+                  ("AGENTD.ELF", "bash tools/go/build-agentd.sh")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit(name + " missing (expected " + src + ") - build it first: " + cmd)
+    shutil.copy(src, os.path.join(share, name))
+os.makedirs(os.path.join(share, "SSH"), exist_ok=True)
+os.makedirs(os.path.join(share, "AGENT"), exist_ok=True)
+# sshd's host key + agentd's hmac credential, each app-bound (M97g).
+open(os.path.join(share, "SECRETS.TXT"), "w").write(
+    "#v1\n"
+    "ssh-host-ed25519\t1000\t9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\tGOSSHD.ELF\n"
+    "agent-hmac\t1000\t" + "a5" * 32 + "\tAGENTD.ELF\n"
+)
+open(os.path.join(share, "OWNERS.TXT"), "w").write(
+    "#v1\n"
+    "GOSSHD.ELF\t644\t0\t-\n"
+    "GOSH.ELF\t644\t0\t-\n"
+    "AGENTD.ELF\t644\t0\t-\n"
+)
+open(os.path.join(share, "SSH", "AUTHORIZED_KEYS"), "w").write(
+    "#v1\n"
+    "alice\tssh-ed25519\t3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c\n"
+)
+print("staged two-session share")
+PY
+
+# Two :ssh clients on ports 12345/12346 dial once 'sshd: listen' lands;
+# both must complete KEX+auth+exec. The daemon keeps its listener for the
+# next SYN; the bounded idle accept then closes the loop and 'sshd: bye'
+# is the run's own end marker.
+vgate_run 02 -- --net '$RUN_DIR/cap2.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:2222:ssh --net-tcp-connect 10.0.0.1:2222:ssh \
+    --net-tcp-connect-after 'sshd: listen' \
+    --script '$RUN_DIR/script-2.txt' \
+    --script-expect 'sshd: bye' --timeout 150
+
+vgate_assert 02 serial-contains 'agentd: listen 4747'
+vgate_assert 02 serial-contains 'sshd: listen 2222'
+vgate_assert 02 serial-contains 'sshd: bye'
+vgate_assert 02 serial-absent 'sshd: error'
+vgate_assert 02 serial-absent '[EXC] parking:'
+vgate_assert 02 python <<'PY'
+import os, re, struct, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Every marker twice: two sessions each ran the full KEX+auth+GOSH exec.
+for marker in ("sshd: accepted", "sshd: kex-ok",
+               "sshd: auth-ok user=alice key=ssh-ed25519",
+               "sshd: exec echo VIRELAI-SSH-SERVER-OK-ARGV2",
+               "sshd: gosh rc=0"):
+    n = ser.count(marker)
+    if n != 2:
+        sys.exit("FAIL: %r appeared %d times, want 2" % (marker, n))
+out = open(os.path.join(os.environ["RUN_DIR"], "run-02.out"), errors="replace").read()
+assert out.count("SSH-CLI: exit-status=0") == 2, "both clients must finish exec"
+assert out.count("SSH-CLI: stdout VIRELAI-SSH-SERVER-OK-ARGV2") == 2
+# The wire walk: guest frames from listener 2222 to the two client
+# source ports — distinct 5-tuples whose windows overlap (a one-session
+# daemon could not emit on the second while the first still streams).
+data = open(os.environ["RUN_DIR"] + "/cap2.bin", "rb").read()
+frames = []
+i = 0
+while i < len(data):
+    if data[i+12:i+14] == b"\x08\x06":
+        i += 42
+        continue
+    assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
+    size = 14 + struct.unpack_from("!H", data, i + 16)[0]
+    frames.append(data[i:i+size])
+    i += size
+conns = {}
+for idx, f in enumerate(frames):
+    if f[23] != 6 or f[26:30] != bytes([10, 0, 0, 1]):
+        continue
+    sp = (f[34] << 8) | f[35]
+    dp = (f[36] << 8) | f[37]
+    if sp != 2222:
+        continue
+    conns.setdefault(dp, []).append((idx, len(f) - 54))
+assert set(conns) == {12345, 12346}, list(conns)
+for dp, segs in conns.items():
+    assert any(n > 0 for _, n in segs), "client port %d got no guest data" % dp
+assert conns[12345][0][0] < conns[12346][-1][0] and conns[12346][0][0] < conns[12345][-1][0], (
+    "session windows did not overlap")
+print("ssh2 ok: agentd listener + 2 concurrent SSH sessions, 2 GOSH execs, overlapping 5-tuples")
+PY
