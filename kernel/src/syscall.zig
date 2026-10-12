@@ -81,6 +81,9 @@ pub const wnd_core = @import("wnd_core.zig");
 const klog = @import("klog.zig"); // #990: serial-log seam (hook armed by main.zig) // M32 WMS4 (issue #624): the SET_WINDOW chrome-descriptor ABI (single source with the WM server)
 pub const virtio_gpu = @import("virtio_gpu.zig"); // M32 WMS2 (issue #622): the G1 gpu-armed signal for the REGISTER ENXIO check
 pub const wm_server = @import("wm_server.zig"); // M32 WMS2 (issue #622): the render-server register backing slot 65
+pub const gpu3d_broker = @import("gpu3d_broker.zig"); // M102d1 (issue #2166): the typed GPU3D bridge behind slot-65 cmd 22
+pub const gpu3d_device = @import("gpu3d_device.zig"); // M102d1: host tests arm the fake render-device transport on this seam
+pub const gpu3d_wire = @import("gpu3d_wire.zig"); // M102d1: wire constants for the same fake device
 pub const events = @import("events.zig"); // Milestone 9 (claim 1016): application event queues
 pub const file_table = @import("file_table.zig"); // Milestone 10 (claim 3570): userland storage ABI
 pub const esp_exec = @import("exec.zig"); // Claim 6359 (ADR 0007 slot 28): the EL0 exec seam — reuse the EL1h loader
@@ -467,6 +470,8 @@ pub const ErrorCode = enum(i64) {
     // ADR 0007 amendment (2026-09-12, issue #1214 round 2 — slots 73/74):
     eagain = -11, // futex wait: the user word no longer holds the expected value
     etimedout = -12, // futex wait or explicit outbound connect deadline expired
+    // ADR 0007 amendment (2026-10-13, issue #2166 — slot 65 cmd 22):
+    eio = -13, // device-level protocol/submission fault (GPU3D render device)
 };
 
 pub fn error_result(code: ErrorCode) u64 {
@@ -4270,6 +4275,38 @@ fn handle_wmctl(args: Args, _: *exceptions.VectorFrame) u64 {
                 wm_server.note_overview();
                 return id;
             } else return error_result(.einval);
+        },
+        wm_server.wmctl_gpu3d => {
+            // M102d1 (issue #2166): GPU3D — the bounded experimental 3D
+            // bridge (ADR 0007). a0..a2 are reserved-zero; ptr/len carry
+            // exactly one frozen 64-byte descriptor. The copy runs through
+            // checked uaccess BEFORE any broker/device action — a bad
+            // pointer can never reach the device — and the descriptor the
+            // broker sees is this kernel-owned copy, so no user buffer is
+            // ever dereferenced after return.
+            if (!wm_server.registered()) return error_result(.enosys);
+            if (wm_server.registered_pid() != pid) return error_result(.eacces);
+            if (args[1] != 0 or args[2] != 0 or args[3] != 0) return error_result(.einval); // a0..a2 reserved
+            if (args[5] != gpu3d_broker.desc_len) return error_result(.einval); // the frozen size
+            var desc: gpu3d_broker.Desc = undefined;
+            const desc_bytes: *[gpu3d_broker.desc_len]u8 = @ptrCast(&desc);
+            if (uaccess.copy_in(desc_bytes, args[4], gpu3d_broker.desc_len) != .ok) {
+                return error_result(.efault); // bad descriptor pointer
+            }
+            const result = gpu3d_broker.dispatch(&desc, pid) catch |e| return switch (e) {
+                error.Invalid, error.BadWindow => error_result(.einval),
+                error.BadHandle => error_result(.ebadf),
+                error.NoSeat => error_result(.enosys),
+                error.ForeignSeat => error_result(.eacces),
+                error.Exhausted => error_result(.enospc),
+                error.Unsupported => error_result(.enxio),
+                error.Pending => error_result(.eagain),
+                error.TimedOut => error_result(.etimedout),
+                error.LostContext => error_result(.enoent),
+                error.DeviceFault => error_result(.eio),
+            };
+            wm_server.note_gpu3d();
+            return result;
         },
         else => return error_result(.einval), // unknown / zero cmd
     }
