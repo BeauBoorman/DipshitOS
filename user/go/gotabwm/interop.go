@@ -161,6 +161,11 @@ func dropRpcBinding(id uint32) {
 	}
 	rpcBindings[id] = rpcBinding{}
 	rpcChallenges[id] = 0
+	// M102e (#2169): the window's GPU3D context dies with the session that
+	// opened it — same rule as the token. The kernel revokes it too (its
+	// own window-release path is the final authority); this is the seat's
+	// bookkeeping of the same fact.
+	gpu3dDropWindow(id)
 }
 
 func dropAllRpcBindings() {
@@ -312,6 +317,16 @@ func serviceRPC() int {
 			// binds like every other request, then bypasses replyRPC.
 			if req.Kind == wmKindWindowsQuery {
 				serveWindowsQuery(req, auth)
+				served++
+				continue
+			}
+			// Kind 17 (GPU3D, M102e) binds like every other request —
+			// no exemption: unbound windows draw the challenge and
+			// bad credentials draw the bare refusal below, so a forged
+			// frame never reaches the broker. serveGpu3d answers with
+			// the frozen status/staged/frame payload itself.
+			if req.Kind == vi.WmRpcKindGpu3d {
+				serveGpu3d(req, auth)
 				served++
 				continue
 			}

@@ -450,6 +450,10 @@ func main() {
 	// the choreography or countdown already emptied is a no-op.
 	dismissLauncher()
 	sweepHosted(closeHosted)
+	// M102e (#2169): WM shutdown closes every GPU3D context — the kernel's
+	// unregister-time revoke_all is the final authority; these are the
+	// seat's own CLOSEs for records still marked live.
+	gpu3dCloseAll()
 	// M82d2 (#1785): the tail of the center's history (whatever landed since
 	// the last tick) is published before the seat says it is done.
 	flushNotifyHistory()
@@ -565,6 +569,9 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 		vi.ConsoleLine(line)
 	}
 	idlePresentedFrame(presented)
+	// M102e (#2169): a published GPU frame earns its `presented` marker only
+	// now — after the ordinary present actually flushed it to the scanout.
+	gpu3dPresented(presented)
 	// M82d2 (#1785): AFTER the present, so the fsync'd publish never delays a
 	// frame, and BEFORE the live-mode early return below.
 	flushNotifyHistory()
@@ -666,6 +673,11 @@ func drainSeatEvents(first vi.Event, poll func() (vi.Event, bool), consume func(
 // EvCompositeTick returns true.
 func consumeSeatEvent(e vi.Event) bool {
 	launcherWindowEvent(e)
+	// M102e (#2169): the kind-20 registry mirror also feeds the GPU3D
+	// publish geometry table — the seat's only legible live-rect source
+	// (WinQuery is owner-only). The released-bit context drop rides
+	// dropRpcBinding inside launcherWindowEvent.
+	gpu3dNoteMirror(e)
 	if e.Kind == vi.EvWmPointer {
 		vi.ConsoleLine(MarkerPtr)
 		if idleInput(seatTick) {
