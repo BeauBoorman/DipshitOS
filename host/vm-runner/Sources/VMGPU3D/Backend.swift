@@ -99,6 +99,11 @@ public final class GPU3DTestBackend: GPU3DBackend {
     public var deferWork = true
     /// Fence IDs reported complete by the next gpu3dPoll() call.
     public var polledFences: [UInt64] = []
+    /// Called at the top of every gpu3dPoll() — lets a test arm a
+    /// completion from inside the poll itself, on whatever queue the
+    /// caller ran it on (the fence pump's serial queue), instead of
+    /// racing the pump from the test thread.
+    public var onPoll: (() -> Void)?
     /// When set, the next fallible call returns this failure once.
     public var nextFailure: GPU3DBackendFailure?
     /// Every call the device made, in order ("createContext:1", ...).
@@ -144,6 +149,11 @@ public final class GPU3DTestBackend: GPU3DBackend {
         return fail()
     }
 
+    public func gpu3dDetachBacking(context ctxID: UInt32, resourceID: UInt32) -> GPU3DBackendFailure? {
+        calls.append("detachBacking:\(ctxID):\(resourceID)")
+        return fail()
+    }
+
     public func gpu3dAttachResource(context ctxID: UInt32, resourceID: UInt32) -> GPU3DBackendFailure? {
         calls.append("attachResource:\(ctxID):\(resourceID)")
         return fail()
@@ -167,6 +177,7 @@ public final class GPU3DTestBackend: GPU3DBackend {
     }
 
     public func gpu3dPoll() -> [UInt64] {
+        onPoll?()
         let out = polledFences
         polledFences = []
         if !out.isEmpty { calls.append("poll:\(out.count)") }

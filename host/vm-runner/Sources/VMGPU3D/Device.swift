@@ -91,6 +91,43 @@ public final class GPU3DDevice {
     public var liveContextIDs: [UInt32] { contexts.keys.sorted() }
     public func generation(of ctxID: UInt32) -> UInt64? { contexts[ctxID]?.generation }
 
+    /// The serial queue the device runs on — set by the host shell to
+    /// the queue the virtio provider was created with. While a deferred
+    /// element holds its fence the device re-polls the backend here on
+    /// a timer: a Metal completion lands between guest notifications,
+    /// and the guest may not ring the doorbell again until its fence
+    /// wait times out (#2223). MUST be the same serial queue that
+    /// drives every other entry point — the pump takes no lock.
+    public var completionQueue: DispatchQueue?
+
+    /// Re-poll cadence while a deferred element's fence is in flight.
+    static let fencePumpInterval: DispatchTimeInterval = .milliseconds(5)
+
+    private var pumpArmed = false
+
+    /// Drain any completed backend fences without a queue notification —
+    /// a deferred element's completion lands between guest posts.
+    public func pumpFences() {
+        for fence in backend?.gpu3dPoll() ?? [] {
+            noteFenceCompleted(fence)
+        }
+    }
+
+    /// Arm the fence pump: while `pending` is set, poll the backend on
+    /// `completionQueue` every `fencePumpInterval`. At most one tick is
+    /// ever scheduled; each tick re-arms only if a fence is still held,
+    /// so the pump stops itself on completion, retirement or reset.
+    private func armFencePump() {
+        guard !pumpArmed, pending != nil, let queue = completionQueue else { return }
+        pumpArmed = true
+        queue.asyncAfter(deadline: .now() + Self.fencePumpInterval) { [weak self] in
+            guard let self else { return }
+            self.pumpArmed = false
+            self.pumpFences()
+            self.armFencePump()
+        }
+    }
+
     // MARK: - Queue drain
 
     /// Service every element on the queue until it is empty — the same
@@ -98,9 +135,7 @@ public final class GPU3DDevice {
     public func handleQueueNotification(_ queue: GPU3DQueue) {
         // Poll the backend first: a fence that finished since the last
         // batch retires the held element before new work is examined.
-        for fence in backend?.gpu3dPoll() ?? [] {
-            noteFenceCompleted(fence)
-        }
+        pumpFences()
         while let element = queue.gpu3dNextElement() {
             serve(element)
         }
@@ -130,6 +165,7 @@ public final class GPU3DDevice {
             pending = Pending(header: request.header, ctxID: request.header.ctxID,
                               generation: contexts[request.header.ctxID]?.generation ?? 0,
                               element: element)
+            armFencePump()
         }
     }
 
@@ -493,6 +529,9 @@ public final class GPU3DHostDevice: NSObject {
     public init(backend: GPU3DBackend? = nil) {
         core = GPU3DDevice(backend: backend)
         super.init()
+        // The pump rides the same serial queue VZ delivers delegate
+        // callbacks on — fence polling never leaves it.
+        core.completionQueue = deviceQueue
         configDelegate.owner = self
         deviceDelegate.owner = self
     }
