@@ -121,6 +121,7 @@ const userspace = @import("userspace.zig"); // claim 8215: first EL0t task + SVC
 const syscall = @import("syscall.zig"); // claim 3594: fixed syscall ABI + runtime dispatch table
 const exec = @import("exec.zig"); // milestone-three card 6: ESP exec — owns the shared rebuild_user_root (claims 2665/3693)
 const virtio_custom = @import("virtio_custom.zig"); // claim 0828: custom-virtio spike driver (DID 0x1082)
+const gpu3d_device = @import("gpu3d_device.zig"); // M102b1 (issue #2162): experimental GPU3D channel (DID 0x1083)
 const virtio_file = @import("virtio_file.zig"); // M34 HF1+HF2 (issues #735/#736): host file channel client (queue 5)
 const virtio_fs = @import("virtio_fs.zig"); // M83g: standard VirtioFS/FUSE backend for /host
 // M34 HF5 (issue #739): one-time /data → /host migration at boot.
@@ -401,6 +402,16 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // ExitBootServices; configure queues and FUSE after the MMU switch.
     const fs_probed = virtio_fs.probe();
 
+    // M102 card b1 (issue #2162): the experimental GPU3D render channel —
+    // the owner-approved second custom-virtio device (DID 0x1083, the
+    // sibling of the 0x1082 host channel). PRE-EXIT discovery only
+    // (config-space reads, the claim-0013 discipline); its transport BAR
+    // is handed to the identity map below and the queue is armed post-MMU.
+    // Absent means UNSUPPORTED, not a boot failure — the default runner
+    // attaches no such device, so `g3_probed` is false on every existing
+    // gate and the boot output stays byte-identical.
+    const g3_probed = gpu3d_device.probe();
+
     var exited = false;
     var attempt: usize = 0;
     while (attempt < 8) : (attempt += 1) {
@@ -446,7 +457,7 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // (discovered pre-exit) are handed to mmu.build_identity_map as the
     // extra Device windows above the blanket; mmu.zig stays
     // transport-agnostic.
-    var extra_windows: [9]mmu.DeviceWindow = undefined;
+    var extra_windows: [10]mmu.DeviceWindow = undefined;
     var extra_count: usize = 0;
     if (virtio_console.vp_ready and virtio_console.vp_bar0 != 0) {
         extra_windows[extra_count] = .{ .base = virtio_console.vp_bar0, .len = 0x10000 };
@@ -459,6 +470,13 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // already covers the BAR, so the entry is a harmless no-op there.
     if (cv_probed and virtio_custom.cv_bar != 0) {
         extra_windows[extra_count] = virtio_custom.device_window();
+        extra_count += 1;
+    }
+    // M102b1 (issue #2162): the GPU3D transport BAR — the same Device-
+    // window treatment so post-MMU common-config reads + control-queue
+    // notify reach the device. Absent device: no window, no change.
+    if (g3_probed and gpu3d_device.g3_bar != 0) {
+        extra_windows[extra_count] = gpu3d_device.device_window();
         extra_count += 1;
     }
     if (fs_probed) extra_count += virtio_fs.add_device_windows(extra_windows[extra_count..]);
@@ -729,6 +747,21 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // shell runs without interrupt noise; the claim-9187 timer PPI stays
     // armed and the polled console paths are untouched.
     custom_virtio_spike();
+
+    // M102 card b1 (issue #2162): arm the GPU3D render channel post-MMU
+    // (the claim-6420 discipline — the whole device state machine is
+    // re-programmed on the pre-exit-resolved addresses). Absent device:
+    // `g3_probed` is false, nothing is printed, and the boot output stays
+    // byte-identical. A malformed device is unsupported, not fatal.
+    if (g3_probed) {
+        if (gpu3d_device.init()) {
+            uart_puts("gpu3d: armed did=0x1083\n");
+        } else {
+            uart_puts("gpu3d: unsupported (");
+            uart_puts(gpu3d_device.g3_fail);
+            uart_puts(")\n");
+        }
+    }
 
     // ------------------------------------------------------------------
     // M1.5 console & shell core seam (agent B). The takeover path above

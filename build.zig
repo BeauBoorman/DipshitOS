@@ -2025,6 +2025,11 @@ pub fn build(b: *std.Build) void {
         "kernel/src/fat32_ro.zig",
         "kernel/src/font8x8.zig",
         "kernel/src/gic.zig",
+        // M102b1 (issue #2162): the GPU3D render channel — the pinned
+        // wire contract plus the transport/context lifecycle against a
+        // fake-device transcript (class A; the VZ render is a later card).
+        "kernel/src/gpu3d_device.zig",
+        "kernel/src/gpu3d_wire.zig",
         "kernel/src/handoff.zig",
         "kernel/src/input.zig",
         "kernel/src/ipv4.zig",
