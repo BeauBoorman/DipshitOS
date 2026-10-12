@@ -24,6 +24,11 @@
 # first 'verb=ui.windows' marker prints -- the harness then polls
 # ui.windows until the Calc row registers.
 #
+# ui.windows rides the M97g-F2 bind (owner ruling 2026-10-13): agentd
+# opens its own undeclared window on the first call, walks the ownership
+# challenge, and its bound kind-16 page requests quote the session
+# token. The 'gotabwm: rpc bind id=' marker is the serial proof.
+#
 # HOST PREREQ:
 #   bash tools/go/build-agentd.sh  -> .build/go/AGENTD.ELF
 #   bash tools/go/build-gosh.sh    -> .build/go/GOSH.ELF
@@ -148,6 +153,7 @@ vgate_assert 01 serial-contains 'code=unknown_verb'
 vgate_assert 01 serial-contains 'code=timed_out'
 vgate_assert 01 serial-contains 'agentd: session end reason=line_too_long'
 vgate_assert 01 serial-contains 'gotabwm: wq start='
+vgate_assert 01 serial-contains 'gotabwm: rpc bind id='
 vgate_assert 01 output-contains 'NET-TCP-STREAM: ENABLED'
 vgate_assert 01 output-contains 'NET-TCP-INTRUDER: sent a second SYN from port'
 vgate_assert 01 output-contains 'AGENTCTL: PASS full'

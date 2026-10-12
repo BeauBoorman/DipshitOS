@@ -25,6 +25,8 @@ var (
 	killFn       = vi.Kill
 	probeFn      = vi.Probe
 	seatPidFn    = vi.WmctlSeatPid
+	winOpenFn    = vi.WinOpen
+	winHideFn    = vi.WinSetVisible
 	wmWindowsFn  = vi.WmWindows
 	secretGetFn  = shlib.StoreGet
 	principalFn  = vi.Principal
@@ -62,7 +64,7 @@ const (
 	cmdMax         = 192  // gosh.run cmd byte ceiling
 	timeoutMaxMs   = 30000
 	timeoutDefMs   = 10000
-	maxProcRows    = 64   // D3: at most 64 rows, kernel order
+	maxProcRows    = 64 // D3: at most 64 rows, kernel order
 	authBudgetNs   = int64(10) * 1e9
 	idleBudgetNs   = int64(60) * 1e9
 	dampingTicks   = 1 // 1 s brute-force damping after an auth failure (D2)
@@ -330,11 +332,30 @@ func verbFSWrite(req *request) (string, string) {
 
 // --- ui.windows -----------------------------------------------------------------
 
+// agentWindow is the daemon's own kernel window, opened lazily on the
+// first ui.windows call. M97g-F2 binds kind-16 requests by window id, so
+// an authenticated query requires a window the daemon provably owns —
+// the ownership challenge echoes through its title. The window is never
+// declared to the seat, so it stays off the strip it reads (D5); it is
+// opened at the kernel's resize floor and hidden at once — an undersized
+// window is outside the compositor's tested geometry (observed: a 1x1
+// open faulted the kernel's paint path), and the daemon's plumbing has
+// no pixels to show.
+var agentWindow = -1
+
 func verbUIWindows() (string, string) {
 	if seatPidFn() <= 0 {
 		return `{"seat":"none","focused":null,"windows":[]}`, ""
 	}
-	rows, err := wmWindowsFn(appName)
+	if agentWindow < 0 {
+		id, raw := winOpenFn(0, 0, 128, 64)
+		if id < 0 || raw < 0 {
+			return "", "seat_unsupported"
+		}
+		_ = winHideFn(id, false)
+		agentWindow = id
+	}
+	rows, err := wmWindowsFn(uint32(agentWindow), appName)
 	if err != nil {
 		if err == vi.ErrSeatUnsupported {
 			return "", "seat_unsupported"

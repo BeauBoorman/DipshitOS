@@ -2,8 +2,9 @@ package main
 
 // ADR 0044 D5 / AC2: the kind-16 seat paging table — 0, 1, 4, 5 and 16
 // tabs, a start past the end, and an ENOSPC that ends a page mid-way —
-// plus the routing proof that the query is answered ahead of gateRPC and
-// never draws a challenge.
+// plus the routing proof that the query now rides the M97g-F2 bind: an
+// unbound kind-16 frame is challenged, bad credentials are refused, and
+// only a bound window's page requests carry the session token.
 
 import (
 	"testing"
@@ -13,8 +14,8 @@ import (
 
 // wqTab is one scripted strip entry for the paging table.
 type wqTab struct {
-	id            uint32
-	title         string
+	id             uint32
+	title          string
 	pinned, frozen bool
 }
 
@@ -65,63 +66,78 @@ func wqTabs(n int) []wqTab {
 	return rows
 }
 
+// wqQueryReq builds a kind-16 request as the bound client sends it: id is
+// the caller's window, the page start rides title[0].
+func wqQueryReq(winID uint8, start int) vi.WmRpc {
+	req := vi.WmRpc{Kind: wmKindWindowsQuery, ID: winID, Seq: 7, ReplyTo: 9}
+	req.Title[0] = byte(start)
+	return req
+}
+
 func TestServeWindowsQueryPages(t *testing.T) {
+	const auth = 0xbeef
 	for _, tc := range []struct {
 		name      string
 		tabs      int
-		start     uint8
-		wantRows  int // reply frames
-		wantFirst int // index of first row frame, or -1 for the applied=0 path
+		start     int
+		wantRows  int // applied row frames (the end frame always adds one)
+		wantFirst int // index of first row frame, or -1 for an empty page
 	}{
-		{"empty strip", 0, 0, 1, -1},
+		{"empty strip", 0, 0, 0, -1},
 		{"one tab", 1, 0, 1, 0},
 		{"full page", 4, 0, 4, 0},
 		{"second page short", 5, 4, 1, 4},
 		{"full strip first page", 16, 0, 4, 0},
 		{"full strip last page", 16, 12, 4, 12},
-		{"start past end", 5, 5, 1, -1},
+		{"start past end", 5, 5, 0, -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stageTabs(t, wqTabs(tc.tabs))
 			frames := captureWqSend(t, -1)
-			req := vi.WmRpc{Kind: wmKindWindowsQuery, ID: tc.start, Seq: 7, ReplyTo: 9}
-			serveWindowsQuery(req)
-			if len(*frames) != tc.wantRows {
-				t.Fatalf("reply frames = %d want %d", len(*frames), tc.wantRows)
+			req := wqQueryReq(5, tc.start)
+			serveWindowsQuery(req, auth)
+			if len(*frames) != tc.wantRows+1 {
+				t.Fatalf("reply frames = %d want %d rows + end", len(*frames), tc.wantRows)
 			}
 			for i, m := range *frames {
 				if m.Kind != wmKindWindowsQuery|vi.WmRpcReplyFlag ||
 					m.Seq != req.Seq || m.ReplyTo != req.ReplyTo ||
-					m.Pad != vi.WmRpcPadPlain {
+					m.Pad != vi.WmRpcPadBound || vi.WmAuth(m) != auth {
 					t.Fatalf("frame %d shape = %+v", i, m)
 				}
-				if int(m.W) != tc.tabs {
-					t.Fatalf("frame %d count W = %d want %d", i, m.W, tc.tabs)
-				}
 			}
-			if tc.wantFirst < 0 {
-				if (*frames)[0].Applied != 0 {
-					t.Fatalf("empty-page frame Applied = %d want 0", (*frames)[0].Applied)
-				}
-				return
+			// The last frame is the end-of-page marker: applied=0 with
+			// the strip count in title[0].
+			term := (*frames)[len(*frames)-1]
+			if term.Applied != 0 || int(term.Title[0]) != tc.tabs {
+				t.Fatalf("end frame = %+v want applied=0 count=%d", term, tc.tabs)
 			}
-			for i, m := range *frames {
+			for i, m := range (*frames)[:tc.wantRows] {
 				if m.Applied != 1 {
 					t.Fatalf("row frame %d Applied = %d", i, m.Applied)
 				}
 				if int(m.ID) != tc.wantFirst+i {
 					t.Fatalf("row frame %d index = %d want %d", i, m.ID, tc.wantFirst+i)
 				}
-				if uint32(m.X) != uint32(100+tc.wantFirst+i) {
-					t.Fatalf("row frame %d window id = %d", i, m.X)
+				winID := uint32(m.Title[0]) | uint32(m.Title[1])<<8
+				if winID != uint32(100+tc.wantFirst+i) {
+					t.Fatalf("row frame %d window id = %d", i, winID)
 				}
 			}
 		})
 	}
 }
 
-// The focused/pinned/frozen flag bits land in Y (D5), with the title in the
-// 24-byte field.
+// The flag bits land in title[2] and the tab title starts at title[3]
+// (x/y/w/h quote the token). Rows decode through this helper.
+func wqRowTail(m vi.WmRpc) string {
+	n := 3
+	for n < len(m.Title) && m.Title[n] != 0 {
+		n++
+	}
+	return string(m.Title[3:n])
+}
+
 func TestServeWindowsQueryFlagsAndTitle(t *testing.T) {
 	stageTabs(t, []wqTab{
 		{id: 10, title: "Calc"},
@@ -130,35 +146,25 @@ func TestServeWindowsQueryFlagsAndTitle(t *testing.T) {
 	})
 	// OpenTab focuses the first entry when the strip was empty.
 	frames := captureWqSend(t, -1)
-	req := vi.WmRpc{Kind: wmKindWindowsQuery, ID: 0, Seq: 1, ReplyTo: 3}
-	serveWindowsQuery(req)
-	if len(*frames) != 3 {
-		t.Fatalf("frames = %d want 3", len(*frames))
+	serveWindowsQuery(wqQueryReq(5, 0), 0xbeef)
+	if len(*frames) != 4 {
+		t.Fatalf("frames = %d want 3 rows + end", len(*frames))
 	}
 	// Pinned normalizes to the left of the rail, so order is
 	// PinnedTab, Calc, FrozenTab; Calc stays focused.
-	want := []struct {
-		title string
-		flags uint16
-	}{
-		{"PinnedTab", 0x2},
-		{"Calc", 0x1},
-		{"FrozenTab", 0x4},
+	got := (*frames)[:3]
+	if wqRowTail(got[0]) != "PinnedTab" || got[0].Title[2] != 0x2 {
+		t.Fatalf("frame 0 = %q flags %#x", wqRowTail(got[0]), got[0].Title[2])
 	}
-	_ = want
-	got := *frames
-	if got[0].TitleString() != "PinnedTab" || got[0].Y != 0x2 {
-		t.Fatalf("frame 0 = %q flags %#x", got[0].TitleString(), got[0].Y)
+	if wqRowTail(got[1]) != "Calc" || got[1].Title[2]&0x1 == 0 {
+		t.Fatalf("frame 1 = %q flags %#x want focused", wqRowTail(got[1]), got[1].Title[2])
 	}
-	if got[1].TitleString() != "Calc" || got[1].Y&0x1 == 0 {
-		t.Fatalf("frame 1 = %q flags %#x want focused", got[1].TitleString(), got[1].Y)
-	}
-	if got[2].TitleString() != "FrozenTab" || got[2].Y != 0x4 {
-		t.Fatalf("frame 2 = %q flags %#x", got[2].TitleString(), got[2].Y)
+	if wqRowTail(got[2]) != "FrozenTab" || got[2].Title[2] != 0x4 {
+		t.Fatalf("frame 2 = %q flags %#x", wqRowTail(got[2]), got[2].Title[2])
 	}
 	focused := 0
 	for _, m := range got {
-		if m.Y&0x1 != 0 {
+		if m.Title[2]&0x1 != 0 {
 			focused++
 		}
 	}
@@ -172,8 +178,7 @@ func TestServeWindowsQueryFlagsAndTitle(t *testing.T) {
 func TestServeWindowsQuerySendFailureEndsPage(t *testing.T) {
 	stageTabs(t, wqTabs(8))
 	frames := captureWqSend(t, 2) // the third send fails
-	req := vi.WmRpc{Kind: wmKindWindowsQuery, ID: 0, Seq: 1, ReplyTo: 3}
-	serveWindowsQuery(req)
+	serveWindowsQuery(wqQueryReq(5, 0), 0xbeef)
 	if len(*frames) != 2 {
 		t.Fatalf("frames after ENOSPC = %d want 2", len(*frames))
 	}
@@ -183,35 +188,95 @@ func TestServeWindowsQuerySendFailureEndsPage(t *testing.T) {
 func TestServeWindowsQueryNoReplyTo(t *testing.T) {
 	stageTabs(t, wqTabs(2))
 	frames := captureWqSend(t, -1)
-	serveWindowsQuery(vi.WmRpc{Kind: wmKindWindowsQuery, ID: 0, Seq: 1, ReplyTo: 0})
+	serveWindowsQuery(vi.WmRpc{Kind: wmKindWindowsQuery, ID: 5, Seq: 1, ReplyTo: 0}, 0xbeef)
 	if len(*frames) != 0 {
 		t.Fatalf("reply_to=0 sent %d frames", len(*frames))
 	}
 }
 
-// serviceRPC serves kind 16 BEFORE gateRPC: no challenge ack, no binding
-// state touched, and the strip answers plainly — even with live bindings
-// for other windows.
-func TestServiceRPCRoutesWindowsQueryBeforeGate(t *testing.T) {
+// serviceRPC routes kind 16 THROUGH gateRPC: an unbound request draws the
+// ownership challenge and no row frames; a bound request with the wrong
+// pid or token is refused plainly; only the bound owner's frames carry
+// rows — each quoting Pad=Bound + the session token.
+func TestServiceRPCGatesWindowsQuery(t *testing.T) {
 	stageTabs(t, wqTabs(2))
-	dropAllRpcBindings()
-	t.Cleanup(dropAllRpcBindings)
-	rpcBindings[5] = rpcBinding{pid: 1, token: 0xdead}
+	ownerTitle := ""
+	stubAuthSeams(t, func(id uint8) (string, bool) {
+		if id != 5 || ownerTitle == "" {
+			return "", false
+		}
+		return ownerTitle, true
+	})
 
-	req := vi.WmRpc{Kind: wmKindWindowsQuery, ID: 0, Seq: 9, ReplyTo: 42}
+	// 1. Unbound: a bare kind-16 frame is challenged — never served.
+	req := wqQueryReq(5, 0)
 	acks := decodeAcks(t, serveOneWmRpc(t, req.Encode()))
-	if len(acks) != 2 {
-		t.Fatalf("kind-16 acks = %d want 2 row frames", len(acks))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadChallenge || acks[0].Applied != 0 {
+		t.Fatalf("unbound kind-16 acks = %+v want one challenge", acks)
 	}
-	for i, a := range acks {
-		if a.Kind != wmKindWindowsQuery|vi.WmRpcReplyFlag || a.Applied != 1 ||
-			a.Pad != vi.WmRpcPadPlain {
-			t.Fatalf("ack %d = %+v want plain applied row", i, a)
+	challenge := vi.WmAuth(acks[0])
+	if challenge == 0 || rpcChallenges[5] != challenge {
+		t.Fatalf("challenge = %#x table = %#x", challenge, rpcChallenges[5])
+	}
+
+	// 2. The owner proves the title and echoes: the echo itself is a page
+	//    request, and its bound row frames both mint the token and answer.
+	ownerTitle = vi.WmBindChallengeTitle(challenge)
+	req.Pad = vi.WmRpcPadBound
+	req.Seq = 8
+	vi.SetWmAuth(&req, challenge)
+	acks = decodeAcks(t, serveOneWmRpc(t, req.Encode()))
+	if len(acks) != 3 {
+		t.Fatalf("bound echo acks = %d want 2 rows + end", len(acks))
+	}
+	token := vi.WmAuth(acks[0])
+	if token == 0 || token == challenge {
+		t.Fatalf("row token = %#x", token)
+	}
+	for i, a := range acks[:2] {
+		if a.Pad != vi.WmRpcPadBound || vi.WmAuth(a) != token || a.Applied != 1 {
+			t.Fatalf("row %d = %+v want bound applied", i, a)
 		}
 	}
-	// The query drew no challenge and minted no binding.
-	if rpcChallenges[0] != 0 {
-		t.Fatal("windows query minted a challenge")
+	if acks[2].Applied != 0 || acks[2].Pad != vi.WmRpcPadBound || vi.WmAuth(acks[2]) != token {
+		t.Fatalf("end frame = %+v want bound end-of-page", acks[2])
+	}
+	if rpcBindings[5].pid != 9 || rpcBindings[5].token != token {
+		t.Fatalf("binding = %+v want pid 9 token %#x", rpcBindings[5], token)
+	}
+
+	// 3. Bound but forged: wrong token, right pid → bare refusal, no rows.
+	forged := wqQueryReq(5, 0)
+	forged.Pad = vi.WmRpcPadBound
+	vi.SetWmAuth(&forged, token^0xff)
+	acks = decodeAcks(t, serveOneWmRpc(t, forged.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadPlain || acks[0].Applied != 0 {
+		t.Fatalf("forged-token acks = %+v want bare refusal", acks)
+	}
+
+	// 4. Bound but forged: right token, wrong pid → bare refusal, no rows.
+	wrongPid := wqQueryReq(5, 0)
+	wrongPid.ReplyTo = 3
+	wrongPid.Pad = vi.WmRpcPadBound
+	vi.SetWmAuth(&wrongPid, token)
+	acks = decodeAcks(t, serveOneWmRpc(t, wrongPid.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadPlain || acks[0].Applied != 0 {
+		t.Fatalf("wrong-pid acks = %+v want bare refusal", acks)
+	}
+
+	// 5. The bound owner's next page request answers without a rebind.
+	page := wqQueryReq(5, 0)
+	page.Pad = vi.WmRpcPadBound
+	page.Seq = 12
+	vi.SetWmAuth(&page, token)
+	acks = decodeAcks(t, serveOneWmRpc(t, page.Encode()))
+	if len(acks) != 3 {
+		t.Fatalf("bound page acks = %d want 2 rows + end", len(acks))
+	}
+	for i, a := range acks {
+		if a.Pad != vi.WmRpcPadBound || vi.WmAuth(a) != token {
+			t.Fatalf("page frame %d = %+v", i, a)
+		}
 	}
 }
 

@@ -214,9 +214,10 @@ on peer FIN/RST, or on `line_too_long`.
 - TCP for anything else in the guest while `AGENTD.ELF` holds the socket.
   That includes `gosh.run` commands that use the network: fetch, DNS, SSH
   and RFB fail as busy.
-- Guaranteed `ui.windows` rows. A co-resident EL0 process can forge a reply
-  frame, because the mailbox carries no sender identity (ADR 0007 slots
-  5/6).
+- Guaranteed `ui.windows` rows. The seat query rides the M97g-F2 bind, so
+  a co-resident EL0 process cannot forge a reply that satisfies the
+  caller's wait without quoting the session token (D5). The rows are
+  still only as honest as the seat's own strip state.
 
 ## D3. Command surface (complete)
 
@@ -247,8 +248,11 @@ Verb semantics that are binding:
 - **`ui.windows`** uses the seat query from D5. `seat:"none"` with an empty
   list is a success when no seat is registered (`vi.WmctlSeatPid() <= 0`).
   A Zig seat, or a Go seat that answers `applied=0`, is `seat_unsupported`.
-  No complete answer within 10 s is `seat_timeout`. `focused` and the
-  per-row flag reflect the seat strip's focus.
+  No complete answer within 10 s — including a bind that never completes —
+  is `seat_timeout`. `focused` and the per-row flag reflect the seat
+  strip's focus. The first call against a registered seat opens the
+  daemon's bind window and walks the ownership challenge, so it costs two
+  extra round trips once per daemon lifetime.
 - **`gosh.run`**:
   1. `cmd` must be 1–192 bytes of printable ASCII (0x20–0x7e), or the
      request fails with `too_large` (length) or `cmd_rejected` (bytes).
@@ -268,9 +272,18 @@ Verb semantics that are binding:
   5. It reads up to 4096 + 1 bytes, sets `truncated` when the output is
      over 4096, and deletes the file.
   6. A non-zero `exit_status` is still `ok:true`: the command ran.
-  - Only stdout from the GOSH pipeline is captured. Whatever GOSH or a child
-    writes to the console goes to serial, not into the response. The
-    working directory is GOSH's default `/host`, **not** `/host/AGENT`.
+  - **Observed capture contract (pinned):** a builtin's stdout — success
+    or failure text — goes through the shell's output sink, so the
+    redirect captures it. An external app writes fd 1 itself: under `>`
+    its bytes bypass the capture, the file is still written (empty), the
+    external's status is the line's status, and nothing diagnoses the
+    loss. A pipeline that names an external refuses before any write with
+    the shell's own diagnostic (`cannot capture an external app's output
+    yet` / `a piped command must be a builtin or tool`). The agent reports
+    what the shell did — `stdout_b64` is whatever `AGENTD.OUT` holds, and
+    an external's empty capture is reported honestly as empty. Pinned in
+    `shlib/agentline_observed_test.go`.
+  - The working directory is GOSH's default `/host`, **not** `/host/AGENT`.
   - `AGENTD.OUT` lives outside the sandbox on purpose.
 
 ## D4. Out-of-bounds requests and the error model
@@ -300,29 +313,46 @@ Only codes marked *fatal* close it.
 | `line_too_long` | a line exceeds its limit (bytes discarded unparsed) | **yes** |
 | `idle_timeout` | 60 s without a request | **yes** |
 
-## D5. Seat query: WM_RPC kind 16 `WINDOWS_QUERY` (additive)
+## D5. Seat query: WM_RPC kind 16 `WINDOWS_QUERY` (additive, bound)
 
-- **Request:** `kind=16`, `id=start` (row index 0..15), `seq` and
-  `reply_to` as usual, everything else zero.
-- **Seat handling:** `serviceRPC` handles kind 16 **before** `gateRPC`. The
-  query reads seat-wide state, binds no window, and mutates nothing, so it
-  draws no challenge.
-- **Reply:** for each row `i` in `[start, min(start+4, count))` the seat
-  sends one frame with `kind=16|0x80`, the request's seq, `ID=i`,
-  `Applied=1` and `Pad=Plain`. `X` is the kernel window id, and `Y` is the
-  flags (bit 0 focused, bit 1 pinned, bit 2 frozen). `W` is the total
-  count. `title` is the tab title, NUL-padded and truncated to 24 bytes.
-  When `start >= count` (including an empty strip) the seat sends one frame
-  with `Applied=0` and `W=count`. A frame that fails `IpcSend` ends the page
-  without a retry, and the client's budget expires instead.
-- **Bounds:** at most 4 frames per request, which fits the 8-slot ring
-  (ENOSPC is defined behavior). At most 4 requests cover `MaxTabs = 16`.
-- **Client:** `vi.WmWindows(selfName) ([]WmWindowRow, error)` in a new
-  `user/go/vi/wmquery.go`, reusing the package's ack wait. It is the only
-  caller.
+The query rides the M97g-F2 sender-authentication bind like every other
+kind (owner ruling 2026-10-13: **auth wins** — the pre-auth exemption the
+landed squash used is dropped; `ui.windows` requires an authenticated bind
+first, and that is the contract).
+
+- **Request:** `kind=16`, `id` = a window the caller owns, `seq` and
+  `reply_to` as usual, `title[0]` = `start` (page index 0..15). `id` is
+  the bound window and `x/y/w/h` are the auth union, so the page index
+  rides the first title byte — the only payload field the bind leaves.
+- **Seat handling:** `serviceRPC` routes kind 16 through `gateRPC` like
+  everything else. An unbound `id` draws the ownership challenge; a bound
+  `id` with the wrong `reply_to` or token draws a bare refusal and no
+  rows; a proven or credentialed request applies and is served by
+  `serveWindowsQuery`. The ownership echo is itself a page request — its
+  bound answer both mints the session token and opens the page.
+- **Reply:** every frame is `kind=16|0x80` with the request's seq,
+  `Pad=Bound`, and `x/y/w/h` quoting the session token — which the row
+  payload therefore cannot share. A row frame carries `ID` = strip index,
+  `Applied=1`, and packs `title[0:2]` = kernel window id LE, `title[2]` =
+  flags (bit 0 focused, bit 1 pinned, bit 2 frozen), `title[3:]` = tab
+  title, NUL-padded and truncated to 21 bytes. Every request ends with
+  ONE `Applied=0` end-of-page frame whose `title[0]` is the strip count —
+  without a `W` to quote, that frame is how the client learns the page is
+  done and whether another `start` remains. A send that fails ends the
+  page without a retry, and the client's budget expires instead.
+- **Bounds:** at most 5 frames per request (4 rows + end), which fits the
+  8-slot ring (ENOSPC is defined behavior). At most 4 requests cover
+  `MaxTabs = 16`.
+- **Client:** `vi.WmWindows(winID, selfName)` in `user/go/vi/wmquery.go`,
+  reusing the package's bind/ack machinery (`wmToken`, `bindSetTitle`,
+  `wmBindMaxRounds`). Agentd is the only caller; it opens one kernel
+  window lazily on the first `ui.windows` call and never declares it, so
+  the daemon's bind window stays off the strip it reads. A forged bound
+  frame quoting a different value is consumed and dropped; a token the
+  seat forgot is re-challenged and re-bound.
 - **Not changed:** the Zig seats and the kernel. Zig TABWM answers unknown
   kinds `applied=0`, which becomes `seat_unsupported`. The 38-byte frame
-  layout is untouched.
+  layout and the bind invariants are untouched.
 
 ## D6. Markers and the never-logged contract
 
@@ -452,6 +482,30 @@ host; guest class A `go test ./agentd ./shlib ./vi ./gotabwm` green; host
 class A `python3 -m unittest tools/agentctl/test_agentctl.py` 21 tests
 green.
 
+#### Amendment (post-merge owner rulings, 2026-10-13)
+
+The merge's `Closes` auto-closed the card before close-out; the owner
+reopened it and ruled on two points, both implemented here:
+
+1. **Kind 16 rides the bind.** The landed pre-auth exemption conflicted
+   with M97g-F2 (binding is keyed by `id`, which the exemption had reused
+   as the page index). D5 is rewritten: `id` is a caller-owned window,
+   `title[0]` is the page index, and bound replies quote the session
+   token in `x/y/w/h`. Because the row payload can no longer share those
+   fields, rows pack window id + flags + a 21-byte title into the title
+   field, and every page ends with an `Applied=0` frame carrying the
+   strip count. Agentd opens one undeclared kernel window to bind with;
+   it never joins the strip it reads. Observed on the gate: the open
+   must be at or above the kernel's resize floor — a 1x1 window faulted
+   the compositor's paint path — so the bind window opens 128x64 and
+   hides via `sys_win_set_visible` immediately (plumbing, not pixels).
+2. **GOSH redirect pinned as observed.** `CheckAgentLine` untouched. The
+   `>` redirect captures builtin stdout (success and failure text); an
+   external app's fd-1 output bypasses capture and the file is written
+   empty; an external in a pipeline refuses before any write. That is
+   the spec now, pinned in `shlib/agentline_observed_test.go` and in the
+   D3 capture bullet.
+
 ### Per-verb red/green matrix (run 01 unless noted)
 
 | Verb | Green | Red |
@@ -473,7 +527,8 @@ The harness prints one `AGENTCTL: ok <step>` or `AGENTCTL: FAIL <step>
 **Touches:** `docs/decisions/0044-agent-control-channel.md`,
 `docs/status.md`, `docs/testing.md`, `user/go/agentd/**`,
 `user/go/shlib/agentline.go`, `user/go/shlib/agentline_test.go`,
-`user/go/vi/wmquery.go`, `user/go/vi/wmquery_test.go`,
+`user/go/shlib/agentline_observed_test.go`,
+`user/go/vi/vi.go`, `user/go/vi/wmquery.go`, `user/go/vi/wmquery_test.go`,
 `user/go/gotabwm/interop.go`, `user/go/gotabwm/windows_query.go`,
 `user/go/gotabwm/windows_query_test.go`, `tools/go/build-agentd.sh`,
 `tools/agentctl/**`, `tools/gate/specs/go-agentd.spec`
@@ -483,8 +538,9 @@ The harness prints one `AGENTCTL: ok <step>` or `AGENTCTL: FAIL <step>
 - `shlib/agentline.go`: `CheckAgentLine` and an exported
   `HMACSHA256(key, msg) [32]byte` wrapper over the existing `hmac.go`
   (no copy of SHA-256).
-- `gotabwm/interop.go`: at most 15 lines, routing kind 16 ahead of
-  `gateRPC`.
+- `gotabwm/interop.go`: kind 16 routes through `gateRPC` like every other
+  kind; on `apply` it is served by `serveWindowsQuery` instead of
+  `applyRPC`/`replyRPC`.
 - `tools/agentctl/`: `agentctl.py` (client `Session` class + `harness`
   journeys) and `test_agentctl.py`. Python stdlib only (`hmac`, `hashlib`,
   `base64`, `json`), PSF license, no new dependency.
@@ -521,12 +577,16 @@ The harness prints one `AGENTCTL: ok <step>` or `AGENTCTL: FAIL <step>
 - **Tick latency.** Budgets assume up to about 1 s per poll. If run 01 cannot
   finish within a 240 s `--timeout`, record the measured per-verb latency
   here and stop. Do not add a kernel tick change or a runner flag.
-- **Seat behaviour.** If the kind-16 exemption ahead of `gateRPC` conflicts
-  with the M97g-F2 auth invariants (`interop_auth_test.go`), stop and ask
-  the owner. Do not weaken the bind protocol.
-- **Unexpected GOSH behaviour.** If `GOSH.ELF -c` redirect capture differs
-  from D3 (for example, a builtin's output escapes the redirect), pin the
-  observed behaviour in class A and here. Do not widen `CheckAgentLine`.
+- **Seat behaviour — resolved.** The landed squash served kind 16 ahead of
+  `gateRPC` (a pre-auth exemption justified by read-only semantics). The
+  owner ruled the exemption conflicts with the M97g-F2 bind invariants:
+  kind 16 now rides the normal bind (D5 rewrite above), the protocol was
+  not weakened, and `ui.windows` requires an authenticated bind first.
+- **Unexpected GOSH behaviour — resolved.** Observed and pinned in class A
+  (`agentline_observed_test.go`) and in the D3 capture bullet above: the
+  redirect captures builtin output only; an external app's fd-1 output
+  bypasses it and the file is still written empty. `CheckAgentLine` was
+  not widened or otherwise touched.
 
 ## Rejected alternatives
 
