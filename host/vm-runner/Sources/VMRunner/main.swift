@@ -696,7 +696,6 @@ var netTcpRespondHandshakeOnly = false
 var netTcpRespondPacketMode = false
 var netTcpRespondPacketPayload: [UInt8] = []
 var netTcpRespondPacketChunk: Int = 192
-var netTcpRespondPacketIndex = 0
 // M51 SSH5 (#1172): the optional `:ssh` responder mode — a runner-hosted
 // minimal SSH-2 server (VSSH) behind the same deterministic TCP responder:
 // curve25519-sha256 KEX with a pinned ssh-ed25519 host key, pinned
@@ -712,9 +711,6 @@ var netTcpRespondSSHUserKey: [UInt8] = SSHFixtures.hex(SSHFixtures.userPublicKey
 var netTcpRespondSSHTamperMAC = false
 var netTcpRespondSSHMarker = SSHFixtures.defaultMarker
 var netTcpRespondSSHExitStatus: UInt32 = 0
-var netTcpRespondSSHServer: SSHServer?
-var netTcpRespondSSHTx: [UInt8] = []
-var netTcpRespondSSHTxOffset = 0
 // M51 real-OpenSSH interop (#1209, goal #1066, ADR 0025 D8): the optional
 // `:relay` responder mode — the same deterministic TCP endpoint, but the
 // byte stream is proxied byte-for-byte to a REAL upstream TCP server
@@ -726,18 +722,54 @@ var netTcpRespondSSHTxOffset = 0
 var netTcpRespondRelayMode = false
 var netTcpRespondRelayHost = "127.0.0.1"
 var netTcpRespondRelayPort: UInt16?
-var netTcpRespondRelayFd: Int32 = -1
-var netTcpRespondRelayGen = 0
-var netTcpRespondRelayClosed = false
-var netTcpRespondRelayTx: [UInt8] = []
-var netTcpRespondRelayTxOffset = 0
-let netTcpRespondRelayLock = NSLock()
-// The responder's per-connection state: the server's next sequence
-// number. The FIXED server ISN (gate-assertable); a new SYN resets the
-// state — ONE connection at a time (the guest's ONE client state
-// machine).
+// The responder's per-connection state, keyed by the guest's 4-tuple
+// (src IP:src port — M99f #2184). The FIXED server ISN (gate-assertable);
+// a new SYN on an existing key resets that connection's state. Each
+// connection carries its own server sequence, packet-mode index, SSH
+// server instance + paced TX, and relay upstream — one guest's socket
+// table can hold several live connections and every one is answered.
 let netTcpSrvIsn: UInt32 = 0x12345678
-var netTcpSrvNxt: UInt32 = 0x12345679 // after the SYN
+final class NetTcpSrvConn {
+    var srvNxt: UInt32 = netTcpSrvIsn &+ 1 // after the SYN
+    var packetIndex = 0
+    var sshServer: SSHServer?
+    var sshTx: [UInt8] = []
+    var sshTxOffset = 0
+    var relayFd: Int32 = -1
+    var relayGen = 0
+    var relayClosed = false
+    var relayTx: [UInt8] = []
+    var relayTxOffset = 0
+    var relayTemplate: [UInt8] = []
+    var relayGuestNext: UInt32 = 0
+    var relayGuestAck: UInt32 = 0
+    var closed = false
+    let lock = NSLock()
+}
+var netTcpSrvConns: [String: NetTcpSrvConn] = [:]
+/// Bounded table: 16 live server-side connections; a SYN over the cap is
+/// refused with an RST (the same honesty the guest's table applies).
+let netTcpSrvConnLimit = 16
+func netTcpConnKey(_ guestIP: [UInt8], _ guestPort: UInt16) -> String {
+    "\(guestIP[0]).\(guestIP[1]).\(guestIP[2]).\(guestIP[3]):\(guestPort)"
+}
+/// The connection a guest segment belongs to — lazily created so every
+/// segment reaches the per-connection state machine (byte-identical with
+/// today's always-on scalar for the single-connection case).
+func netTcpSrvConn(for buf: [UInt8]) -> NetTcpSrvConn {
+    let key = netTcpConnKey([UInt8](buf[26..<30]), (UInt16(buf[34]) << 8) | UInt16(buf[35]))
+    if let conn = netTcpSrvConns[key] { return conn }
+    let conn = NetTcpSrvConn()
+    netTcpSrvConns[key] = conn
+    return conn
+}
+/// Bounded admission for a fresh SYN: drop closed entries first, then
+/// refuse when the live table is full (the RST is the caller's to build).
+func netTcpSrvAdmit(_ key: String) -> Bool {
+    netTcpSrvConns = netTcpSrvConns.filter { !$0.value.closed }
+    if netTcpSrvConns[key] == nil, netTcpSrvConns.count >= netTcpSrvConnLimit { return false }
+    return true
+}
 // SH7 (#1083, ADR 0020 Amendment B): `--net-tcp-connect
 // <guest-ip>:<port>[:<payload-file>]` — the host initiates an INBOUND TCP
 // connection TO a guest listener (the reverse of the N10 responder): SYN,
@@ -745,6 +777,12 @@ var netTcpSrvNxt: UInt32 = 0x12345679 // after the SYN
 // the same `--net` attachment socketpair. The guest server's ISN is the
 // fixed `kernel/src/tcp.zig` constant 0x54321098; the client ISN/source
 // port are fixed for gate assertability.
+// M99f (#2184): each `--net-tcp-connect` flag is ONE host client with its
+// own state machine, keyed by the guest listener port; its source port is
+// `netTcpCliPort` + index so two clients to the same guest port still
+// have distinct 5-tuples. `netTcpConnectGuestIP`/`netTcpConnectPort`/
+// `netTcpConnectPayload` remain the FIRST target's mirrors for the
+// validation/print paths — a single flag behaves byte-identically.
 var netTcpConnectGuestIP: [UInt8]?
 var netTcpConnectPort: UInt16?
 var netTcpConnectPayload: [UInt8] = []
@@ -766,50 +804,81 @@ var netTcpConnectSSHUserSeed: [UInt8] = SSHFixtures.hex(SSHFixtures.userKeySeedH
 var netTcpConnectSSHHostPin: [UInt8] = SSHFixtures.hex(SSHFixtures.hostPublicKeyHex) ?? []
 var netTcpConnectSSHUser = "alice"
 var netTcpConnectSSHExec = "echo VIRELAI-SSH-SERVER-OK-ARGV2"
-var netTcpConnectSSHClient: SSHClient?
-var netTcpConnectSSHTx: [UInt8] = []
-var netTcpConnectSSHTxOffset = 0
-// False until the guest Recv's the first SSH chunk and emits bytes. The
-// kernel ACKs a segment as soon as it lands in the one-slot RX buffer
-// (tcp.zig syn_received / established), so a bare ACK or SYN-ACK
-// retransmit must NOT release the next ≤192-byte chunk — that overflow
-// is dropped and never ACKed. Guest data is the Recv-happened signal.
-var netTcpConnectSSHGuestDataSeen = false
 // The hermetic RFB gate's byte-stream adapter. Unlike the payload-file
 // client this pipes a local probe's stdin/stdout through the existing
 // host->guest TCP emulation. It never binds a host port or uses --net-nat.
+// M99f: it attaches to the FIRST connect target's client.
 var netTcpConnectStreamExec: String?
 var netTcpConnectStreamArgs: [String] = []
-var netTcpStreamProcess: Process?
-var netTcpStreamInput: FileHandle?
-var netTcpStreamTx: [UInt8] = []
-var netTcpStreamInFlight = false
-var netTcpStreamDone = false
-var netTcpStreamEOF = false // the probe exited 0: FIN once its bytes are ACKed
 // A second viewer's SYN, sent from the next source port while the first
 // holds the guest's one connection. The guest's answer (or silence) is the
 // over-cap receipt.
 var netTcpConnectIntruder = false
 var nativeSocketProbeMode: String?
 var nativeSocketProbe: NativeSocketProbe?
-var netTcpIntruderSent = false
-var netTcpIntruderAnswered = false
 let netTcpIntruderIsn: UInt32 = 0x0badf00d
 let netTcpStreamLock = NSLock()
 let netTcpStreamMaxTx = 16 * 1024
 // Lifetime byte bound, not a queue: one raw 1280x720x4 RFB frame plus
 // handshake fits; the old 64 KiB cut off even a compressed first frame.
 let netTcpStreamMaxRx = 4 * 1024 * 1024
-var netTcpStreamRxBytes = 0
-var netTcpConnectState: UInt8 = 0 // 0 idle, 1 synSent, 2 established, 3 closed, 4 finSent, 5 awaitingChallenge
-var netTcpConnRecvText: String = ""
 let netTcpCliIsn: UInt32 = 0x10203040
 let netTcpCliPort: UInt16 = 12345
 let netTcpCliSrcIP: [UInt8] = [10, 0, 0, 2]
 let netTcpGuestMAC: [UInt8] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
 let netTcpGuestSrvIsn: UInt32 = 0x54321098
-var netTcpCliSeq: UInt32 = 0
-var netTcpCliAck: UInt32 = 0
+/// One host-initiated connection's state machine (0 idle, 1 synSent,
+/// 2 established, 3 closed, 4 finSent, 5 awaitingChallenge) plus the
+/// SSH/stream/intruder per-connection state — M99f (#2184).
+final class NetTcpClient {
+    let guestIP: [UInt8]
+    let guestPort: UInt16
+    let cliPort: UInt16
+    var payload: [UInt8]
+    var sshMode: Bool
+    var state: UInt8 = 0
+    var seq: UInt32 = 0
+    var ack: UInt32 = 0
+    var recvText = ""
+    var sshClient: SSHClient?
+    var sshTx: [UInt8] = []
+    var sshTxOffset = 0
+    // M99f (#2184): the guest's advertised window, refreshed on every
+    // inbound segment. The guest kernel reports 0 while its one-slot RX
+    // buffer holds an unconsumed segment, and the guest emits a
+    // window-update ACK when its read drains the slot — so holding a
+    // chunk back while peerWindow == 0 loses nothing.
+    var peerWindow: UInt32 = 0
+    // False until the guest Recv's the first SSH chunk and emits bytes.
+    // The kernel ACKs a segment as soon as it lands in the one-slot RX
+    // buffer (tcp.zig syn_received / established), so a bare ACK or
+    // SYN-ACK retransmit must NOT release the next ≤192-byte chunk — that
+    // overflow is dropped and never ACKed. Guest data is the signal.
+    var sshGuestDataSeen = false
+    var streamProcess: Process?
+    var streamInput: FileHandle?
+    var streamTx: [UInt8] = []
+    var streamInFlight = false
+    var streamDone = false
+    var streamEOF = false // the probe exited 0: FIN once its bytes are ACKed
+    var streamRxBytes = 0
+    var intruderSent = false
+    var intruderAnswered = false
+    /// `--net-tcp-connect-stream` attaches the probe to the FIRST declared
+    /// client only (M99f: later clients never take the stream branch).
+    var isStreamClient: Bool {
+        netTcpConnectStreamExec != nil && netTcpClients.first === self
+    }
+
+    init(guestIP: [UInt8], guestPort: UInt16, cliPort: UInt16, payload: [UInt8], sshMode: Bool) {
+        self.guestIP = guestIP
+        self.guestPort = guestPort
+        self.cliPort = cliPort
+        self.payload = payload
+        self.sshMode = sshMode
+    }
+}
+var netTcpClients: [NetTcpClient] = []
 // Milestone five card N7 (claim 4678): `--net-nat` attaches one
 // VZVirtioNetworkDeviceConfiguration with a VZNATNetworkDeviceAttachment
 // instead of the file-handle attachment — the host is the guest's router
@@ -1368,20 +1437,35 @@ while idx < arguments.count {
         guard parts.count == 4 else {
             fail("--net-tcp-connect requires a dotted-quad guest IPv4 address, got '\(token)'.")
         }
-        netTcpConnectGuestIP = parts
-        netTcpConnectPort = port
+        var payload: [UInt8] = []
+        var sshMode = false
         if halves.count == 3, !halves[2].isEmpty {
             if halves[2] == "ssh" {
                 // M70g G1 (#1491): host SSH-2 client against GOSSHD.ELF.
+                sshMode = true
                 netTcpConnectSSHMode = true
             } else {
                 let payloadPath = String(halves[2])
                 do {
-                    netTcpConnectPayload = [UInt8](try Data(contentsOf: URL(fileURLWithPath: payloadPath)))
+                    payload = [UInt8](try Data(contentsOf: URL(fileURLWithPath: payloadPath)))
                 } catch {
                     fail("--net-tcp-connect could not read payload file '\(payloadPath)': \(error).")
                 }
             }
+        }
+        // M99f (#2184): one NetTcpClient per flag — several host-initiated
+        // connections run concurrently, each on its own source port.
+        netTcpClients.append(NetTcpClient(
+            guestIP: parts,
+            guestPort: port,
+            cliPort: netTcpCliPort &+ UInt16(netTcpClients.count),
+            payload: payload,
+            sshMode: sshMode
+        ))
+        if netTcpClients.count == 1 {
+            netTcpConnectGuestIP = parts
+            netTcpConnectPort = port
+            netTcpConnectPayload = payload
         }
         idx += 2
     } else if arg == "--net-tcp-connect-ssh-exec", idx + 1 < arguments.count {
@@ -1875,7 +1959,7 @@ if netTcpConnectGuestIP != nil, netCapturePath == nil {
 if nativeSocketProbeMode != nil && (netCapturePath == nil || netNatEnabled || netTcpConnectGuestIP != nil) {
     fail("--net-native-preview requires hermetic --net, no NAT or other connecting peer")
 }
-if netTcpConnectStreamExec != nil && (netTcpConnectGuestIP == nil || netTcpConnectSSHMode || !netTcpConnectPayload.isEmpty || netNatEnabled) {
+if netTcpConnectStreamExec != nil && (netTcpClients.isEmpty || netTcpClients.first!.sshMode || !netTcpClients.first!.payload.isEmpty || netNatEnabled) {
     fail("--net-tcp-connect-stream requires --net-tcp-connect <ip>:<port> with --net; no SSH, payload, or NAT")
 }
 if netTcpConnectStreamExec == nil && (!netTcpConnectStreamArgs.isEmpty || netTcpConnectIntruder) {
@@ -2002,7 +2086,7 @@ if let netCapturePath {
             if let hostIP = netArpRespondHostIP, isArpRequest(buf, n) {
                 var reply = [UInt8](repeating: 0, count: 42)
                 buildArpReply(&reply, buf, n, arpHostMAC, hostIP)
-                try? netCaptureReadSocket!.write(contentsOf: Data(reply))
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 print("NET-ARP: answered the guest's ARP request for \(buf[28]).\(buf[29]).\(buf[30]).\(buf[31]) with host MAC 02:00:00:00:00:02")
             }
             // Card N4: if the guest pinged our address, echo it back from
@@ -2011,7 +2095,7 @@ if let netCapturePath {
             if let hostIP = netIcmpRespondHostIP, isIcmpEchoRequest(buf, n, hostIP) {
                 var reply = [UInt8](repeating: 0, count: n)
                 buildIcmpEchoReply(&reply, buf, n, arpHostMAC, hostIP)
-                try? netCaptureReadSocket!.write(contentsOf: Data(reply))
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 print("NET-ICMP: answered the guest's echo request for \(hostIP[0]).\(hostIP[1]).\(hostIP[2]).\(hostIP[3]) (id \(reply[38] << 8 | reply[39]), seq \(reply[40] << 8 | reply[41]))")
             }
             // Card N5: if the guest sent a UDP datagram to our ip:port,
@@ -2022,7 +2106,7 @@ if let netCapturePath {
                isUdpDatagram(buf, n, hostIP, hostPort) {
                 var reply = [UInt8](repeating: 0, count: n)
                 buildUdpReply(&reply, buf, n, arpHostMAC, hostIP, hostPort)
-                try? netCaptureReadSocket!.write(contentsOf: Data(reply))
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 let srcPort = (UInt16(buf[34]) << 8) | UInt16(buf[35])
                 print("NET-UDP: answered the guest's datagram for \(hostIP[0]).\(hostIP[1]).\(hostIP[2]).\(hostIP[3]):\(hostPort) (reply to guest src port \(srcPort), \(n - 42) payload bytes)")
             }
@@ -2031,7 +2115,7 @@ if let netCapturePath {
                 var reply = [UInt8](repeating: 0, count: 512)
                 let replyLen = buildDnsReply(&reply, buf, n, arpHostMAC, hostIP, netDnsRespondHostPort)
                 if replyLen > 0 {
-                    try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                     let qname = extractDnsQName(buf, n)
                     let srcPort = (UInt16(buf[34]) << 8) | UInt16(buf[35])
                     print("NET-DNS: answered the guest's DNS query for '\(qname)' (reply to guest src port \(srcPort), resolved to 93.184.216.34)")
@@ -2039,7 +2123,7 @@ if let netCapturePath {
             }
             // M83b (#1775): SNTP responder
             if let sntp = netSntpResponder, let answer = sntp.answer(buf, n) {
-                try? netCaptureReadSocket!.write(contentsOf: Data(answer.frame))
+                try? netCaptureReadSocket?.write(contentsOf: Data(answer.frame))
                 let originate = answer.originate.map { String(format: "%02x", $0) }.joined()
                 print("NET-SNTP: answered \(answer.guestIP.map(String.init).joined(separator: ".")):\(answer.guestPort) served_unix=\(answer.servedUnix) skew=\(sntp.skew) originate=\(originate)")
             }
@@ -2073,7 +2157,7 @@ if let netCapturePath {
                 } else {
                 var reply = [UInt8](repeating: 0, count: 4096)
                 let replyLen = buildDhcpReply(&reply, buf, n, arpHostMAC, leaseIP, netDhcpRespondLeaseSecs, mtype)
-                try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                 // The xid hex built manually (Swift's String(format:) vararg
                 // bridge mismatches %x with UInt8/UInt32 — the same reason
                 // the N5 responder prints ports as arithmetic).
@@ -2104,10 +2188,17 @@ if let netCapturePath {
                 let isSyn = (flags & 0x02) != 0 && (flags & 0x10) == 0
                 let isFin = (flags & 0x01) != 0
                 let isRst = (flags & 0x04) != 0
+                // M99f (#2184): the per-connection peer, keyed by the
+                // guest's src IP:port — several guest connections are
+                // answered concurrently; a SYN on a live key restarts
+                // only that connection.
+                let connKey = netTcpConnKey([UInt8](buf[26..<30]), (UInt16(buf[34]) << 8) | UInt16(buf[35]))
                 if isRst {
                     // The guest aborted — the connection is dead; observe.
+                    let conn = netTcpSrvConn(for: buf)
+                    conn.closed = true
                     if netTcpRespondRelayMode {
-                        netTcpRespondRelayShutdown()
+                        conn.relayShutdown()
                         print("NET-TCP-RELAY: observed the guest's RST (seq 0x\(hex32(seq))); upstream closed")
                     } else if netTcpRespondSSHMode {
                         print("NET-TCP-SSH: observed the guest's RST (seq 0x\(hex32(seq)))")
@@ -2115,25 +2206,26 @@ if let netCapturePath {
                         print("NET-TCP: observed the guest's RST (seq 0x\(hex32(seq)))")
                     }
                 } else if isSyn {
-                    netTcpSrvNxt = netTcpSrvIsn &+ 1
-                    netTcpRespondPacketIndex = 0
+                    if !netTcpSrvAdmit(connKey) {
+                        // The bounded server table is full — the honest
+                        // refusal, the same one the guest's table sends.
+                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, 0, seq &+ 1, 0x14, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                        print("NET-TCP: refused the guest's SYN (seq 0x\(hex32(seq))); \(netTcpSrvConnLimit) connections already live")
+                    } else {
+                    let conn = NetTcpSrvConn()
+                    if let old = netTcpSrvConns[connKey] { old.relayShutdown() }
+                    netTcpSrvConns[connKey] = conn
                     if netTcpRespondRelayMode, netTcpRespondRelayPort != nil {
                         // M51 interop (#1209): a fresh connection dials the
                         // real upstream NOW — real sshd sends its banner
                         // before the guest's version line, so the first
                         // paced chunk is already buffered.
-                        netTcpRespondRelayLock.lock()
-                        netTcpRespondRelayTemplate = []
-                        netTcpRespondRelayGuestNext = 0
-                        netTcpRespondRelayGuestAck = 0
-                        netTcpRespondRelayLock.unlock()
                         print("NET-TCP-RELAY: connection accepted (guest SYN seq 0x\(hex32(seq))); dialing upstream \(netTcpRespondRelayHost):\(netTcpRespondRelayPort!)")
-                        netTcpRespondRelayStart(netTcpRespondRelayHost, netTcpRespondRelayPort!)
+                        conn.relayStart(netTcpRespondRelayHost, netTcpRespondRelayPort!)
                     } else if netTcpRespondSSHMode {
                         // M51 SSH5 (#1172): a fresh connection gets a fresh
                         // server state machine and an empty paced TX stream.
-                        netTcpRespondSSHTx = []
-                        netTcpRespondSSHTxOffset = 0
                         let cfg = SSHServer.Config(
                             hostKeySeed: netTcpRespondSSHHostKey,
                             acceptedUserKey: netTcpRespondSSHUserKey,
@@ -2143,13 +2235,15 @@ if let netCapturePath {
                         )
                         let server = SSHServer(config: cfg)
                         server.logSink = { line in print("SSH-SRV: \(line)") }
-                        netTcpRespondSSHServer = server
+                        conn.sshServer = server
                         print("NET-TCP-SSH: connection accepted (guest SYN seq 0x\(hex32(seq))); awaiting the version exchange")
                     }
                     let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvIsn, seq &+ 1, 0x12, payload)
-                    try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                     print("NET-TCP: answered the guest's SYN (seq 0x\(hex32(seq))) with a SYN-ACK (seq 0x\(hex32(netTcpSrvIsn)), ack 0x\(hex32(seq &+ 1)))")
+                    }
                 } else if isFin {
+                    let conn = netTcpSrvConn(for: buf)
                     if netTcpRespondHandshakeOnly {
                         // Card N11 (claim 5357): the handshake-only mode
                         // goes SILENT on data/FIN — the deterministic
@@ -2157,18 +2251,20 @@ if let netCapturePath {
                         // retransmission machinery to fire.
                         print("NET-TCP: handshake-only — ignoring the guest's FIN (black hole)")
                     } else {
-                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvNxt, seq &+ 1, 0x11, payload)
-                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ 1, 0x11, payload)
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                        conn.closed = true
                         if netTcpRespondRelayMode {
-                            netTcpRespondRelayShutdown()
+                            conn.relayShutdown()
                             print("NET-TCP-RELAY: the guest sent FIN; FIN-ACK and upstream close")
                         } else if netTcpRespondSSHMode {
                             print("NET-TCP-SSH: the guest sent FIN; FIN-ACK and close (SSH session done)")
                         } else {
-                            print("NET-TCP: answered the guest's FIN (seq 0x\(hex32(seq))) with a FIN-ACK (seq 0x\(hex32(netTcpSrvNxt)), ack 0x\(hex32(seq &+ 1)))")
+                            print("NET-TCP: answered the guest's FIN (seq 0x\(hex32(seq))) with a FIN-ACK (seq 0x\(hex32(conn.srvNxt)), ack 0x\(hex32(seq &+ 1)))")
                         }
                     }
                 } else if !payload.isEmpty {
+                    let conn = netTcpSrvConn(for: buf)
                     // A data segment: the SSH responder's byte stream, the
                     // paced packet stream, or the HTTP/echo response.
                     if netTcpRespondRelayMode {
@@ -2177,10 +2273,10 @@ if let netCapturePath {
                         // and pump at most one real-server chunk back. No
                         // blocking wait: the guest waits on a bounded read
                         // and the upstream reader pumps asynchronously.
-                        netTcpRespondRelaySaveTemplate(buf, n)
-                        netTcpRespondRelayLock.lock()
-                        let upfd = netTcpRespondRelayFd
-                        netTcpRespondRelayLock.unlock()
+                        conn.relaySaveTemplate(buf, n)
+                        conn.lock.lock()
+                        let upfd = conn.relayFd
+                        conn.lock.unlock()
                         if upfd >= 0 {
                             let wr = payload.withUnsafeBufferPointer { p in
                                 write(upfd, p.baseAddress, p.count)
@@ -2189,31 +2285,31 @@ if let netCapturePath {
                                 print("NET-TCP-RELAY: upstream write failed (errno \(errno))")
                             }
                         }
-                        if !netTcpRespondRelayPump() {
+                        if !conn.relayPump() {
                             // Not established upstream bytes yet (or a chunk
                             // is still in flight): ACK the guest's data bare.
-                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvNxt, seq &+ UInt32(payload.count), 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, [])
+                            try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         }
                     } else if netTcpRespondSSHMode {
                         // M51 SSH5 (#1172): feed the SSH server with the
                         // guest's bytes and pace the next ≤192-byte chunk of
                         // its output with this ACK; when nothing is pending
                         // the ACK goes out bare.
-                        if let server = netTcpRespondSSHServer {
-                            netTcpRespondSSHTx.append(contentsOf: server.feed(payload))
+                        if let server = conn.sshServer {
+                            conn.sshTx.append(contentsOf: server.feed(payload))
                         }
-                        if !netTcpRespondSSHSendChunk(&reply, buf, n, arpHostMAC, hostPort, seq, payload.count) {
-                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvNxt, seq &+ UInt32(payload.count), 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                        if !netTcpRespondSSHSendChunk(conn, &reply, buf, n, arpHostMAC, hostPort, seq, payload.count) {
+                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, [])
+                            try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         }
                     } else if netTcpRespondPacketMode {
                         // M51 SSH1 (#1168): a trigger/keepalive — ACK it bare
                         // and pace the next chunk; never echo (the payload is
                         // the SSH packet stream, not an echo surface).
-                        if !netTcpSendPacketChunk(&reply, buf, n, arpHostMAC, hostPort, seq, payload.count) {
-                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvNxt, seq &+ UInt32(payload.count), 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                        if !netTcpSendPacketChunk(conn, &reply, buf, n, arpHostMAC, hostPort, seq, payload.count) {
+                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, [])
+                            try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         }
                     } else if netTcpRespondHandshakeOnly {
                         print("NET-TCP: handshake-only — ignoring the guest's \(payload.count)-byte data (black hole)")
@@ -2225,253 +2321,54 @@ if let netCapturePath {
                             let httpBody = "HTTP/1.0 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
                             responsePayload = Array(httpBody.utf8)
                         }
-                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvNxt, seq &+ UInt32(payload.count), 0x10, responsePayload)
-                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
+                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, responsePayload)
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         if isGet || hostPort == 80 {
                             print("NET-TCP: answered the guest's HTTP request with 200 OK (\(responsePayload.count) bytes)")
                         } else {
                             print("NET-TCP: echoed the guest's \(payload.count)-byte data (ack 0x\(hex32(seq &+ UInt32(payload.count))), \(payload.count) payload bytes)")
                         }
-                        netTcpSrvNxt = netTcpSrvNxt &+ UInt32(responsePayload.count)
+                        conn.srvNxt = conn.srvNxt &+ UInt32(responsePayload.count)
                     }
                 } else {
+                    let conn = netTcpSrvConn(for: buf)
                     // A pure ACK (the handshake / the echo / the final ACK).
                     // M51 SSH1 (#1168): in packet mode the handshake ACK (and
                     // every later ACK for a delivered chunk) paces out the
                     // next chunk; M51 SSH5 (#1172): the same pacing feeds the
                     // encrypted SSH byte stream. Otherwise it is observed.
                     if netTcpRespondRelayMode {
-                        netTcpRespondRelaySaveTemplate(buf, n)
-                        if !netTcpRespondRelayPump() {
+                        conn.relaySaveTemplate(buf, n)
+                        if !conn.relayPump() {
                             print("NET-TCP-RELAY: observed the guest's ACK (ack 0x\(hex32(ack)))")
                         }
                     } else if netTcpRespondSSHMode {
-                        if !netTcpRespondSSHSendChunk(&reply, buf, n, arpHostMAC, hostPort, seq, 0) {
+                        if !netTcpRespondSSHSendChunk(conn, &reply, buf, n, arpHostMAC, hostPort, seq, 0) {
                             print("NET-TCP-SSH: observed the guest's ACK (ack 0x\(hex32(ack)))")
                         }
-                    } else if !netTcpSendPacketChunk(&reply, buf, n, arpHostMAC, hostPort, seq, 0) {
+                    } else if !netTcpSendPacketChunk(conn, &reply, buf, n, arpHostMAC, hostPort, seq, 0) {
                         print("NET-TCP: observed the guest's ACK (ack 0x\(hex32(ack)))")
                     }
                 }
             }
             nativeSocketProbe?.receive(buf, n)
-            if netTcpIntruderSent, !netTcpIntruderAnswered,
-               let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort,
-               isTcpSegmentFromGuest(buf, n, guestIP, guestPort, netTcpCliPort &+ 1) {
-                netTcpIntruderAnswered = true
-                let flags = tcpFlags(buf)
-                let verdict = (flags & 0x04) != 0 ? "refused (RST)" : ((flags & 0x12) == 0x12 ? "ADMITTED (SYN-ACK)" : "answered")
-                print("NET-TCP-INTRUDER: the guest \(verdict) flags=0x\(String(flags, radix: 16))")
-            }
-            // SH7 (#1083, ADR 0020 Amendment B): the host-initiated inbound
-            // TCP client. Match the guest server's segments (src = the
-            // guest listener) and drive the handshake / data / close.
-            if let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort,
-               isTcpSegmentFromGuest(buf, n, guestIP, guestPort, netTcpCliPort) {
-                let flags = tcpFlags(buf)
-                let seq = tcpSeq(buf)
-                var payload = [UInt8]()
-                if n > 54 { payload = [UInt8](buf[54..<n]) }
-                let isSynAck = (flags & 0x02) != 0 && (flags & 0x10) != 0
-                let isFin = (flags & 0x01) != 0
-                let isRst = (flags & 0x04) != 0
-                var reply = [UInt8](repeating: 0, count: 4096)
-                switch netTcpConnectState {
-                case 1:
-                    // SYN sent — expect the guest's SYN-ACK.
-                    if isSynAck {
-                        netTcpCliAck = seq &+ 1
-                        netTcpCliSeq = netTcpCliIsn &+ 1
-                        if netTcpConnectStreamExec != nil {
-                            let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                            netTcpConnectState = 2
-                            startNetTcpStream(guestIP, guestPort)
-                            print("NET-TCP-STREAM: handshake complete; probe launched")
-                        } else if netTcpConnectSSHMode {
-                            let cfg = SSHClient.Config(
-                                userKeySeed: netTcpConnectSSHUserSeed,
-                                hostPublicKey: netTcpConnectSSHHostPin,
-                                user: netTcpConnectSSHUser,
-                                execCommand: netTcpConnectSSHExec
-                            )
-                            let client = SSHClient(config: cfg)
-                            client.logSink = { line in print("SSH-CLI: \(line)") }
-                            netTcpConnectSSHClient = client
-                            netTcpConnectSSHTx = client.start()
-                            netTcpConnectSSHTxOffset = 0
-                            netTcpConnectSSHGuestDataSeen = false
-                            netTcpConnectState = 2
-                            if !netTcpConnectSSHSendChunk(guestIP, guestPort) {
-                                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                                try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                            }
-                            print("NET-TCP-CONNECT: handshake complete (server ISN 0x\(hex32(seq)), ack 0x\(hex32(netTcpCliAck))); SSH client started")
-                        } else {
-                        // M50 TS4 (#1138, ADR 0024 D6): in auth mode the
-                        // guest mints + sends its challenge once the
-                        // connection is ESTABLISHED, so the handshake ACK
-                        // must be bare; the payload follows the MAC.
-                        let authPending = netTcpConnectSecret != nil || netTcpConnectMac != nil
-                        let firstPayload = authPending ? [UInt8]() : netTcpConnectPayload
-                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, firstPayload)
-                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                        netTcpCliSeq = netTcpCliSeq &+ UInt32(firstPayload.count)
-                        netTcpConnectState = authPending ? 5 : 2
-                        if authPending {
-                            print("NET-TCP-CONNECT: handshake complete (server ISN 0x\(hex32(seq)), ack 0x\(hex32(netTcpCliAck))); awaiting the VIRELAIOS-AUTH/1 challenge")
-                        } else {
-                            print("NET-TCP-CONNECT: handshake complete (server ISN 0x\(hex32(seq)), ack 0x\(hex32(netTcpCliAck))); sent \(netTcpConnectPayload.count)-byte payload")
-                        }
-                        }
-                    } else if isRst {
-                        netTcpConnectState = 3
-                        print("NET-TCP-CONNECT: the guest refused the connection (RST)")
-                    }
-                case 5:
-                    // M50 TS4: awaiting the guest's `VIRELAIOS-AUTH/1` line.
-                    if isRst {
-                        netTcpConnectState = 3
-                        print("NET-TCP-CONNECT: the guest reset the connection (RST)")
-                    } else if isFin {
-                        netTcpCliAck = seq &+ 1
-                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                        netTcpConnectState = 3
-                        print("NET-TCP-CONNECT: the guest sent FIN; ACKed and closed")
-                    } else if !payload.isEmpty {
-                        var text = ""
-                        for b in payload { text.append((b >= 0x20 && b < 0x7f) ? Character(UnicodeScalar(b)) : ".") }
-                        netTcpConnRecvText.append(text)
-                        print("NET-TCP-CONNECT: received \(payload.count) byte(s): \(text)")
-                        netTcpCliAck = seq &+ UInt32(payload.count)
-                        if let answer = netTcpAuthAnswer(challenge: payload) {
-                            let combined = answer + netTcpConnectPayload
-                            let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, combined)
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                            netTcpCliSeq = netTcpCliSeq &+ UInt32(combined.count)
-                            netTcpConnectState = 2
-                            print("NET-TCP-CONNECT: answered the challenge (\(answer.count) bytes) with the \(netTcpConnectMac != nil ? "recorded replay MAC" : "computed HMAC"); sent \(netTcpConnectPayload.count)-byte payload")
-                        } else {
-                            let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                            netTcpConnectState = 3
-                            print("NET-TCP-CONNECT: could not answer the challenge (malformed / no HMAC support); closing")
-                        }
-                    }
-                case 2:
-                    // ESTABLISHED — the guest shell's data / a FIN.
-                    if isRst {
-                        if netTcpConnectStreamExec != nil { try? netTcpStreamInput?.close() }
-                        netTcpConnectState = 3
-                        print("NET-TCP-CONNECT: the guest reset the connection (RST)")
-                    } else if isFin {
-                        if netTcpConnectStreamExec != nil { try? netTcpStreamInput?.close() }
-                        netTcpCliAck = seq &+ 1
-                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                        netTcpConnectState = 3
-                        print("NET-TCP-CONNECT: the guest sent FIN; ACKed and closed")
-                    } else if netTcpConnectStreamExec != nil {
-                        netTcpStreamLock.lock()
-                        if !payload.isEmpty {
-                            if netTcpConnectIntruder && !netTcpIntruderSent {
-                                // The guest is ESTABLISHED and serving: now a
-                                // second viewer knocks from the next port.
-                                netTcpIntruderSent = true
-                                let synLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort &+ 1, guestPort, netTcpIntruderIsn, 0, 0x02, [])
-                                try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<synLen]))
-                                print("NET-TCP-INTRUDER: sent a second SYN from port \(netTcpCliPort &+ 1) while the first viewer is connected")
-                            }
-                            let fresh = netTcpConnectStreamAccept(seq, payload)
-                            if !fresh.isEmpty {
-                                netTcpStreamRxBytes += fresh.count
-                                if netTcpStreamRxBytes <= netTcpStreamMaxRx {
-                                    // nil once the probe exited: a dead viewer reads nothing.
-                                    try? netTcpStreamInput?.write(contentsOf: Data(fresh))
-                                } else {
-                                    netTcpStreamDone = true
-                                    print("NET-TCP-STREAM: inbound byte bound exceeded")
-                                }
-                            }
-                        }
-                        if (flags & 0x10) != 0 && tcpAck(buf) == netTcpCliSeq {
-                            netTcpStreamInFlight = false
-                        }
-                        if !payload.isEmpty || isSynAck {
-                            let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                        }
-                        netTcpStreamPump(guestIP, guestPort)
-                        netTcpStreamLock.unlock()
-                    } else if netTcpConnectSSHMode {
-                        if (flags & 0x02) != 0 {
-                            // SYN-ACK retransmit after ESTABLISHED. Re-ACK
-                            // only — another SSH chunk would overflow RX.
-                            let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                            print("NET-TCP-CONNECT-SSH: re-ACK SYN-ACK retransmit")
-                        } else {
-                            var fresh: [UInt8] = []
-                            if !payload.isEmpty {
-                                fresh = netTcpConnectSSHAccept(seq, payload)
-                                if !fresh.isEmpty {
-                                    netTcpConnectSSHGuestDataSeen = true
-                                    if let client = netTcpConnectSSHClient {
-                                        netTcpConnectSSHTx.append(contentsOf: client.feed(fresh))
-                                    }
-                                }
-                            }
-                            // Pace further chunks only after the guest has
-                            // Recv'd (it then emits SSH bytes). Bare ACKs
-                            // of the handshake chunk land while RX is full.
-                            if netTcpConnectSSHGuestDataSeen {
-                                if !netTcpConnectSSHSendChunk(guestIP, guestPort) {
-                                    if !payload.isEmpty {
-                                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                                    }
-                                }
-                            } else if !payload.isEmpty {
-                                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                                try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                            }
-                            if let client = netTcpConnectSSHClient, client.isClosed, netTcpConnectSSHTx.isEmpty {
-                                let finLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x11, [])
-                                try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<finLen]))
-                                netTcpCliSeq = netTcpCliSeq &+ 1
-                                netTcpConnectState = 4
-                                print("NET-TCP-CONNECT-SSH: session done; sent FIN")
-                            }
-                        }
-                    } else if !payload.isEmpty {
-                        netTcpCliAck = seq &+ UInt32(payload.count)
-                        var text = ""
-                        for b in payload { text.append((b >= 0x20 && b < 0x7f) ? Character(UnicodeScalar(b)) : ".") }
-                        netTcpConnRecvText.append(text)
-                        print("NET-TCP-CONNECT: received \(payload.count) byte(s): \(text)")
-                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, [])
-                        try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-                        // Close once the reply shows the command ran (the
-                        // configure marker) or, absent one, after the first
-                        // data segment.
-                        let shouldClose = netTcpConnectCloseAfter.map { netTcpConnRecvText.contains($0) } ?? true
-                        if shouldClose {
-                            let finLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x11, [])
-                            try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<finLen]))
-                            netTcpCliSeq = netTcpCliSeq &+ 1
-                            netTcpConnectState = 4
-                            print("NET-TCP-CONNECT: sent FIN (closing the session)")
-                        }
-                    }
-                case 4:
-                    // FIN sent — expect the guest's ACK.
-                    if (flags & 0x10) != 0 {
-                        netTcpConnectState = 3
-                        print("NET-TCP-CONNECT: close acknowledged (session done)")
-                    }
-                default:
-                    break
+            // M99f (#2184): every host-initiated client is an independent
+            // state machine — the intruder receipt and the main dispatch
+            // are keyed by each client's own 5-tuple.
+            for client in netTcpClients {
+                if client.intruderSent, !client.intruderAnswered,
+                   isTcpSegmentFromGuest(buf, n, client.guestIP, client.guestPort, client.cliPort &+ 1) {
+                    client.intruderAnswered = true
+                    let flags = tcpFlags(buf)
+                    let verdict = (flags & 0x04) != 0 ? "refused (RST)" : ((flags & 0x12) == 0x12 ? "ADMITTED (SYN-ACK)" : "answered")
+                    print("NET-TCP-INTRUDER: the guest \(verdict) flags=0x\(String(flags, radix: 16))")
+                }
+                // SH7 (#1083, ADR 0020 Amendment B): the host-initiated
+                // inbound TCP client. Match the guest server's segments
+                // (src = the guest listener) and drive the handshake /
+                // data / close for THIS client only.
+                if isTcpSegmentFromGuest(buf, n, client.guestIP, client.guestPort, client.cliPort) {
+                    client.drive(buf, n)
                 }
             }
         }
@@ -2814,6 +2711,11 @@ if let hostIP = netTcpRespondHostIP, let hostPort = netTcpRespondHostPort {
 if let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort {
     let ipText = guestIP.map(String.init).joined(separator: ".")
     print("  net-tcp-connect: ENABLED (M45 SH7, issue #1083, ADR 0020 Amendment B) — the host initiates an INBOUND TCP connection to the guest listener \(ipText):\(guestPort) (client port \(netTcpCliPort), ISN 0x\(hex32(netTcpCliIsn)), guest server ISN 0x\(hex32(netTcpGuestSrvIsn))) after \"\(netTcpConnectAfter ?? "sh: remote")\"\(netTcpConnectPayload.isEmpty ? "" : ", \(netTcpConnectPayload.count)-byte payload")")
+    // M99f (#2184): each further --net-tcp-connect flag is its own client.
+    for client in netTcpClients.dropFirst() {
+        let extraIP = client.guestIP.map(String.init).joined(separator: ".")
+        print("  net-tcp-connect: ENABLED additional client to \(extraIP):\(client.guestPort) (client port \(client.cliPort))")
+    }
     if netTcpConnectSSHMode {
         print("NET-TCP-CONNECT-SSH: ENABLED (M70g G1, #1491) user=\(netTcpConnectSSHUser) exec=\(netTcpConnectSSHExec.debugDescription) hostpin=\(SSHFixtures.hexString(netTcpConnectSSHHostPin))")
     }
@@ -3152,8 +3054,10 @@ func stopDeviceAndExit(success: Bool, wantDump: Bool, wantNvram: Bool) {
                 _ = netCaptureDone.wait(timeout: .now() + 2)
                 try? netCaptureHandle?.close()
             }
-            if let probe = netTcpStreamProcess, probe.isRunning {
-                probe.terminate() // VM stopped; do not leave a blocked test peer behind
+            for client in netTcpClients {
+                if let probe = client.streamProcess, probe.isRunning {
+                    probe.terminate() // VM stopped; do not leave a blocked test peer behind
+                }
             }
             // M102d3 (#2168): the opt-in render device's lifecycle
             // counters (resets, refusals, draws, completions) — numbers
@@ -5035,36 +4939,40 @@ func startNetInject() {
 // into the attachment socketpair. The capture thread drives the rest
 // (SYN-ACK -> ACK+payload -> data -> FIN). Deterministic — a serial
 // trigger, not a sleep. Requires --net (validated at parse time).
+// M99f (#2184): one SYN-watcher per declared client — several
+// `--net-tcp-connect` flags each wait for the marker and fire their own
+// SYN on their own source port.
 func startNetTcpConnect() {
-    guard let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort,
-          let socket = netCaptureReadSocket else { return }
-    let q = DispatchQueue(label: "virelaios.nettcpconnect")
-    q.async {
-        let marker = netTcpConnectAfter ?? "sh: remote"
-        let waitDeadline = Date().addingTimeInterval(60)
-        var sent = false
-        while Date() < waitDeadline {
-            if let text = try? String(contentsOf: serialURL, encoding: .utf8), text.contains(marker) {
-                netTcpCliSeq = netTcpCliIsn
-                netTcpCliAck = 0
-                netTcpConnectSSHGuestDataSeen = false
-                netTcpConnectState = 1
-                var syn = [UInt8](repeating: 0, count: 4096)
-                let len = buildTcpFrameExplicit(&syn, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliIsn, 0, 0x02, [])
-                do {
-                    try socket.write(contentsOf: Data(syn[0..<len]))
-                    let ipText = guestIP.map(String.init).joined(separator: ".")
-                    FileHandle.standardOutput.write(Data("NET-TCP-CONNECT: sent SYN to \(ipText):\(guestPort) (seq 0x\(hex32(netTcpCliIsn))) after \"\(marker)\"\n".utf8))
-                } catch {
-                    FileHandle.standardError.write(Data("ERROR: net-tcp-connect SYN write failed: \(error)\n".utf8))
+    guard let socket = netCaptureReadSocket else { return }
+    for client in netTcpClients {
+        let q = DispatchQueue(label: "virelaios.nettcpconnect.\(client.cliPort)")
+        q.async {
+            let marker = netTcpConnectAfter ?? "sh: remote"
+            let waitDeadline = Date().addingTimeInterval(60)
+            var sent = false
+            while Date() < waitDeadline {
+                if let text = try? String(contentsOf: serialURL, encoding: .utf8), text.contains(marker) {
+                    client.seq = netTcpCliIsn
+                    client.ack = 0
+                    client.sshGuestDataSeen = false
+                    client.state = 1
+                    var syn = [UInt8](repeating: 0, count: 4096)
+                    let len = buildTcpFrameExplicit(&syn, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, client.guestIP, client.cliPort, client.guestPort, netTcpCliIsn, 0, 0x02, [])
+                    do {
+                        try socket.write(contentsOf: Data(syn[0..<len]))
+                        let ipText = client.guestIP.map(String.init).joined(separator: ".")
+                        FileHandle.standardOutput.write(Data("NET-TCP-CONNECT: sent SYN to \(ipText):\(client.guestPort) (seq 0x\(hex32(netTcpCliIsn))) after \"\(marker)\"\n".utf8))
+                    } catch {
+                        FileHandle.standardError.write(Data("ERROR: net-tcp-connect SYN write failed: \(error)\n".utf8))
+                    }
+                    sent = true
+                    break
                 }
-                sent = true
-                break
+                Thread.sleep(forTimeInterval: 0.02)
             }
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if !sent {
-            FileHandle.standardError.write(Data("ERROR: guest did not emit net-tcp-connect marker '\(marker)' within 60s; connection not attempted\n".utf8))
+            if !sent {
+                FileHandle.standardError.write(Data("ERROR: guest did not emit net-tcp-connect marker '\(marker)' within 60s; connection not attempted\n".utf8))
+            }
         }
     }
 }
@@ -5501,6 +5409,14 @@ func tcpAck(_ buf: [UInt8]) -> UInt32 {
     return (UInt32(buf[42]) << 24) | (UInt32(buf[43]) << 16) | (UInt32(buf[44]) << 8) | UInt32(buf[45])
 }
 
+// M99f (#2184): the advertised receive window (big-endian u16 at frame
+// 48..50). The guest reports 0 while its single RX slot is occupied —
+// a data chunk sent into a zero window is dropped as rx_full and, with
+// no retransmit here, starves the session.
+func tcpWindow(_ buf: [UInt8]) -> UInt16 {
+    return (UInt16(buf[48]) << 8) | UInt16(buf[49])
+}
+
 // Card N10: a 32-bit value as zero-padded 8-hex-digit text, built by
 // hand (Swift's String(format:) vararg bridge mismatches %x with UInt32
 // — the same reason the N5/N8 responders print values as arithmetic).
@@ -5606,19 +5522,19 @@ func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
 // at most one ≤chunk segment per call — the guest's one-slot RX cannot take
 // two back-to-back, and the host has no retransmission. Returns true when a
 // chunk was sent.
-func netTcpSendPacketChunk(_ reply: inout [UInt8], _ buf: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ guestSeq: UInt32, _ guestPayload: Int) -> Bool {
+func netTcpSendPacketChunk(_ conn: NetTcpSrvConn, _ reply: inout [UInt8], _ buf: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ guestSeq: UInt32, _ guestPayload: Int) -> Bool {
     guard netTcpRespondPacketMode else { return false }
     let total = netTcpRespondPacketPayload.count
-    let off = netTcpRespondPacketIndex * netTcpRespondPacketChunk
+    let off = conn.packetIndex * netTcpRespondPacketChunk
     guard off < total else { return false }
     let end = min(off + netTcpRespondPacketChunk, total)
     let chunk = Array(netTcpRespondPacketPayload[off..<end])
     let chunkCount = (total + netTcpRespondPacketChunk - 1) / netTcpRespondPacketChunk
-    let replyLen = buildTcpReply(&reply, buf, n, hostMAC, hostPort, netTcpSrvNxt, guestSeq &+ UInt32(guestPayload), 0x10, chunk)
-    try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-    netTcpSrvNxt = netTcpSrvNxt &+ UInt32(chunk.count)
-    netTcpRespondPacketIndex += 1
-    print("NET-TCP: packet mode sent chunk \(netTcpRespondPacketIndex)/\(chunkCount) (\(chunk.count) bytes, seq 0x\(hex32(netTcpSrvNxt &- UInt32(chunk.count))))")
+    let replyLen = buildTcpReply(&reply, buf, n, hostMAC, hostPort, conn.srvNxt, guestSeq &+ UInt32(guestPayload), 0x10, chunk)
+    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+    conn.srvNxt = conn.srvNxt &+ UInt32(chunk.count)
+    conn.packetIndex += 1
+    print("NET-TCP: packet mode sent chunk \(conn.packetIndex)/\(chunkCount) (\(chunk.count) bytes, seq 0x\(hex32(conn.srvNxt &- UInt32(chunk.count))))")
     return true
 }
 
@@ -5629,330 +5545,564 @@ func netTcpSendPacketChunk(_ reply: inout [UInt8], _ buf: [UInt8], _ n: Int, _ h
 // `netTcpSendPacketChunk`: the guest kernel RX is a single bounded slot
 // with no reassembly and the host has no retransmission, so at most one
 // segment goes out per guest ACK. Returns true when a chunk was sent.
-func netTcpRespondSSHSendChunk(_ reply: inout [UInt8], _ buf: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ guestSeq: UInt32, _ guestPayload: Int) -> Bool {
+func netTcpRespondSSHSendChunk(_ conn: NetTcpSrvConn, _ reply: inout [UInt8], _ buf: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ guestSeq: UInt32, _ guestPayload: Int) -> Bool {
     guard netTcpRespondSSHMode else { return false }
-    let total = netTcpRespondSSHTx.count
-    let off = netTcpRespondSSHTxOffset
+    let total = conn.sshTx.count
+    let off = conn.sshTxOffset
     guard off < total else { return false }
     let end = min(off + netTcpRespondPacketChunk, total)
-    let chunk = Array(netTcpRespondSSHTx[off..<end])
-    let replyLen = buildTcpReply(&reply, buf, n, hostMAC, hostPort, netTcpSrvNxt, guestSeq &+ UInt32(guestPayload), 0x10, chunk)
-    try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-    netTcpSrvNxt = netTcpSrvNxt &+ UInt32(chunk.count)
-    netTcpRespondSSHTxOffset = end
-    print("NET-TCP-SSH: sent \(chunk.count) bytes (\(end)/\(total), seq 0x\(hex32(netTcpSrvNxt &- UInt32(chunk.count))))")
+    let chunk = Array(conn.sshTx[off..<end])
+    let replyLen = buildTcpReply(&reply, buf, n, hostMAC, hostPort, conn.srvNxt, guestSeq &+ UInt32(guestPayload), 0x10, chunk)
+    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+    conn.srvNxt = conn.srvNxt &+ UInt32(chunk.count)
+    conn.sshTxOffset = end
+    print("NET-TCP-SSH: sent \(chunk.count) bytes (\(end)/\(total), seq 0x\(hex32(conn.srvNxt &- UInt32(chunk.count))))")
     if end >= total {
-        netTcpRespondSSHTx.removeAll(keepingCapacity: true)
-        netTcpRespondSSHTxOffset = 0
+        conn.sshTx.removeAll(keepingCapacity: true)
+        conn.sshTxOffset = 0
     }
     return true
 }
 
-// Advance netTcpCliAck over in-order guest payload and return the new
-// bytes. Retransmits and out-of-order segments are dropped: feeding them
-// into SSHClient concatenates a second copy of the identification line
-// onto a partial KEXINIT and the client fails closed (observed on the
-// first live-ssh-server run as "malformed KEXINIT").
-func netTcpConnectSSHAccept(_ seq: UInt32, _ payload: [UInt8]) -> [UInt8] {
-    if payload.isEmpty { return [] }
-    let delta = Int32(bitPattern: seq &- netTcpCliAck)
-    if delta > 0 {
-        print("NET-TCP-CONNECT-SSH: dropped out-of-order seq 0x\(hex32(seq)) want 0x\(hex32(netTcpCliAck))")
-        return []
-    }
-    let skip = Int(netTcpCliAck &- seq)
-    if skip >= payload.count {
-        print("NET-TCP-CONNECT-SSH: ignored retransmit seq 0x\(hex32(seq)) (acked through 0x\(hex32(netTcpCliAck)))")
-        return []
-    }
-    let fresh = skip == 0 ? payload : Array(payload[skip...])
-    netTcpCliAck = netTcpCliAck &+ UInt32(fresh.count)
-    print("NET-TCP-CONNECT-SSH: received \(fresh.count) byte(s)")
-    return fresh
-}
-
-// M70g G1 (#1491): pace one ≤192-byte segment of the SSH client's output
-// toward the guest. Same contract as netTcpRespondSSHSendChunk: the guest
-// kernel RX is a single bounded slot with no reassembly.
-func netTcpConnectSSHSendChunk(_ guestIP: [UInt8], _ guestPort: UInt16) -> Bool {
-    guard netTcpConnectSSHMode else { return false }
-    let total = netTcpConnectSSHTx.count
-    let off = netTcpConnectSSHTxOffset
-    guard off < total else { return false }
-    let end = min(off + netTcpRespondPacketChunk, total)
-    let chunk = Array(netTcpConnectSSHTx[off..<end])
-    var reply = [UInt8](repeating: 0, count: 4096)
-    let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, chunk)
-    try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-    netTcpCliSeq = netTcpCliSeq &+ UInt32(chunk.count)
-    netTcpConnectSSHTxOffset = end
-    print("NET-TCP-CONNECT-SSH: sent \(chunk.count) bytes (\(end)/\(total), seq 0x\(hex32(netTcpCliSeq &- UInt32(chunk.count))))")
-    if end >= total {
-        netTcpConnectSSHTx.removeAll(keepingCapacity: true)
-        netTcpConnectSSHTxOffset = 0
-    }
-    return true
-}
-
-// Runs only after a guest SYN-ACK, on the hermetic test path. Child stdout
-// is binary RFB, never printed as text; stderr is diagnostic only. One
-// reader drains stdout, and the network capture thread writes stdin.
-func startNetTcpStream(_ guestIP: [UInt8], _ guestPort: UInt16) {
-    guard let path = netTcpConnectStreamExec else { return }
-    let proc = Process()
-    let stdin = Pipe(), stdout = Pipe()
-    proc.executableURL = URL(fileURLWithPath: path)
-    proc.arguments = netTcpConnectStreamArgs
-    proc.standardInput = stdin
-    proc.standardOutput = stdout
-    proc.standardError = FileHandle.standardError
-    // A viewer that dies mid-update leaves guest bytes in flight; writing
-    // them to its closed pipe must be an error, not a SIGPIPE to the runner.
-    _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
-    do {
-        try proc.run()
-    } catch {
-        netTcpStreamDone = true
-        print("NET-TCP-STREAM: probe launch failed: \(error)")
-        return
-    }
-    netTcpStreamProcess = proc
-    netTcpStreamInput = stdin.fileHandleForWriting
-    DispatchQueue.global().async {
-        var buf = [UInt8](repeating: 0, count: 192)
-        while true {
-            // FileHandle.readData(ofLength:) waits for the FULL requested
-            // length on a pipe. RFB's 12-byte banner reply would not reach
-            // the guest until EOF. POSIX read returns each available chunk.
-            let n = Darwin.read(stdout.fileHandleForReading.fileDescriptor, &buf, buf.count)
-            if n < 0 && errno == EINTR { continue }
-            if n <= 0 { break }
-            let bytes = Array(buf[..<n])
-            netTcpStreamLock.lock()
-            if netTcpStreamTx.count + bytes.count > netTcpStreamMaxTx {
-                netTcpStreamDone = true
-                netTcpStreamLock.unlock()
-                print("NET-TCP-STREAM: outbound byte bound exceeded")
-                break
-            }
-            netTcpStreamTx.append(contentsOf: bytes)
-            netTcpStreamPump(guestIP, guestPort)
-            netTcpStreamLock.unlock()
-        }
-        proc.waitUntilExit()
-        let status = proc.terminationStatus
-        print("NET-TCP-STREAM: probe exited status=\(status)")
-        if netTcpIntruderSent && !netTcpIntruderAnswered {
-            print("NET-TCP-INTRUDER: no answer to the second SYN (dropped without RST)")
-        }
-        // The viewer's exit is its close: a clean exit is a FIN after its
-        // last byte is ACKed, any other exit is a peer that vanished (RST).
-        netTcpStreamLock.lock()
-        try? netTcpStreamInput?.close()
-        netTcpStreamInput = nil
-        if status == 0 && !netTcpStreamDone {
-            netTcpStreamEOF = true
-            netTcpStreamPump(guestIP, guestPort)
-        } else {
-            netTcpStreamDone = true
-            netTcpStreamReset(guestIP, guestPort)
-        }
-        netTcpStreamLock.unlock()
-    }
-}
-
-// Called under streamLock. Only an ESTABLISHED stream is reset: once the
-// guest has closed first there is nothing left to tear down.
-func netTcpStreamReset(_ guestIP: [UInt8], _ guestPort: UInt16) {
-    guard netTcpConnectState == 2 else { return }
-    var rst: [UInt8] = []
-    let len = buildTcpFrameExplicit(&rst, netTcpGuestMAC, [0x02, 0, 0, 0, 0, 0x02],
-        netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x14, [])
-    try? netCaptureReadSocket?.write(contentsOf: Data(rst[0..<len]))
-    netTcpConnectState = 3
-    print("NET-TCP-STREAM: the viewer died; sent RST")
-}
-
-// In-order, retransmit-safe byte delivery to the probe. The kernel only has
-// one RX segment slot, so the reverse path likewise sends one <=192-byte
-// chunk and waits for its ACK before advancing. Called under streamLock.
-func netTcpConnectStreamAccept(_ seq: UInt32, _ payload: [UInt8]) -> [UInt8] {
-    let delta = Int32(bitPattern: seq &- netTcpCliAck)
-    if delta > 0 { return [] }
-    let skip = Int(netTcpCliAck &- seq)
-    if skip >= payload.count { return [] }
-    let fresh = Array(payload[skip...])
-    netTcpCliAck = netTcpCliAck &+ UInt32(fresh.count)
-    return fresh
-}
-
-func netTcpStreamPump(_ guestIP: [UInt8], _ guestPort: UInt16) {
-    if netTcpStreamEOF && netTcpStreamTx.isEmpty && !netTcpStreamInFlight && !netTcpStreamDone {
-        netTcpStreamDone = true
-        guard netTcpConnectState == 2 else { return }
-        var fin: [UInt8] = []
-        let len = buildTcpFrameExplicit(&fin, netTcpGuestMAC, [0x02, 0, 0, 0, 0, 0x02],
-            netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x11, [])
-        try? netCaptureReadSocket?.write(contentsOf: Data(fin[0..<len]))
-        netTcpCliSeq = netTcpCliSeq &+ 1
-        netTcpConnectState = 4
-        print("NET-TCP-STREAM: the viewer closed; sent FIN")
-        return
-    }
-    guard !netTcpStreamInFlight && !netTcpStreamTx.isEmpty && !netTcpStreamDone else { return }
-    let count = min(192, netTcpStreamTx.count)
-    let chunk = Array(netTcpStreamTx.prefix(count))
-    netTcpStreamTx.removeFirst(count)
-    var reply: [UInt8] = []
-    let len = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0, 0, 0, 0, 0x02],
-        netTcpCliSrcIP, guestIP, netTcpCliPort, guestPort, netTcpCliSeq, netTcpCliAck, 0x10, chunk)
-    do {
-        try netCaptureReadSocket?.write(contentsOf: Data(reply[0..<len]))
-        netTcpCliSeq = netTcpCliSeq &+ UInt32(count)
-        netTcpStreamInFlight = true
-    } catch {
-        netTcpStreamDone = true
-        print("NET-TCP-STREAM: transmit failed: \(error)")
-    }
-}
-
-// M51 real-OpenSSH interop (#1209, goal #1066): the `:relay` upstream
-// plumbing. The rendezvous is the guest's SYN: connect the real server
-// (localhost sshd), then start the reader that appends real bytes to the
-// paced TX buffer. The capture thread writes guest bytes to the upstream
-// fd. Only the reader closes its own fd (a generation counter retires a
-// previous reader without an fd-reuse race).
-func netTcpRespondRelayShutdown() {
-    netTcpRespondRelayLock.lock()
-    let fd = netTcpRespondRelayFd
-    netTcpRespondRelayFd = -1
-    netTcpRespondRelayLock.unlock()
-    if fd >= 0 { shutdown(fd, SHUT_RDWR) }
-}
-
-func netTcpRespondRelayStart(_ host: String, _ port: UInt16) {
-    netTcpRespondRelayShutdown()
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else {
-        print("NET-TCP-RELAY: upstream socket() failed (errno \(errno)); the relay is dead for this connection")
-        return
-    }
-    var addr = sockaddr_in()
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    var a4 = in_addr()
-    guard inet_pton(AF_INET, host, &a4) == 1 else {
-        print("NET-TCP-RELAY: upstream '\(host)' is not a dotted-quad IPv4 address")
-        close(fd)
-        return
-    }
-    addr.sin_addr = a4
-    let rc = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-            connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
-    guard rc == 0 else {
-        print("NET-TCP-RELAY: upstream connect \(host):\(port) failed (errno \(errno)); the relay is dead for this connection")
-        close(fd)
-        return
-    }
-    netTcpRespondRelayLock.lock()
-    netTcpRespondRelayGen += 1
-    let gen = netTcpRespondRelayGen
-    netTcpRespondRelayFd = fd
-    netTcpRespondRelayTx = []
-    netTcpRespondRelayTxOffset = 0
-    netTcpRespondRelayClosed = false
-    netTcpRespondRelayLock.unlock()
-    print("NET-TCP-RELAY: upstream \(host):\(port) connected (real server; bytes proxied, no crypto here)")
-    let reader = Thread {
-        var buf = [UInt8](repeating: 0, count: 4096)
-        while true {
-            let n = read(fd, &buf, buf.count)
-            if n < 0 && errno == EINTR { continue }
-            if n <= 0 {
-                netTcpRespondRelayLock.lock()
-                if gen == netTcpRespondRelayGen {
-                    netTcpRespondRelayClosed = true
-                    if netTcpRespondRelayFd == fd { netTcpRespondRelayFd = -1 }
+// M99f (#2184): the host-initiated client state machine, one instance per
+// `--net-tcp-connect` flag. Everything that was a scalar global is a field
+// on the client, so two live clients never share sequence/ACK/stream
+// state — a segment's 5-tuple picks its client before `drive` runs.
+extension NetTcpClient {
+    /// One guest segment for THIS client: the handshake / payload / SSH /
+    /// stream / close transitions that used to live in the capture loop's
+    /// scalar switch.
+    func drive(_ buf: [UInt8], _ n: Int) {
+        let flags = tcpFlags(buf)
+        let seq = tcpSeq(buf)
+        if n > 49 { peerWindow = UInt32(tcpWindow(buf)) }
+        var payload = [UInt8]()
+        if n > 54 { payload = [UInt8](buf[54..<n]) }
+        let isSynAck = (flags & 0x02) != 0 && (flags & 0x10) != 0
+        let isFin = (flags & 0x01) != 0
+        let isRst = (flags & 0x04) != 0
+        var reply = [UInt8](repeating: 0, count: 4096)
+        let guestIP = self.guestIP
+        let guestPort = self.guestPort
+        let cliPort = self.cliPort
+        switch state {
+        case 1:
+            // SYN sent — expect the guest's SYN-ACK.
+            if isSynAck {
+                ack = seq &+ 1
+                self.seq = netTcpCliIsn &+ 1
+                if isStreamClient {
+                    let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    state = 2
+                    startStream()
+                    print("NET-TCP-STREAM: handshake complete; probe launched")
+                } else if sshMode {
+                    let cfg = SSHClient.Config(
+                        userKeySeed: netTcpConnectSSHUserSeed,
+                        hostPublicKey: netTcpConnectSSHHostPin,
+                        user: netTcpConnectSSHUser,
+                        execCommand: netTcpConnectSSHExec
+                    )
+                    let client = SSHClient(config: cfg)
+                    client.logSink = { line in print("SSH-CLI: \(line)") }
+                    sshClient = client
+                    sshTx = client.start()
+                    sshTxOffset = 0
+                    sshGuestDataSeen = false
+                    state = 2
+                    if !sshSendChunk() {
+                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    }
+                    print("NET-TCP-CONNECT: handshake complete (server ISN 0x\(hex32(seq)), ack 0x\(hex32(ack))); SSH client started")
+                } else {
+                // M50 TS4 (#1138, ADR 0024 D6): in auth mode the
+                // guest mints + sends its challenge once the
+                // connection is ESTABLISHED, so the handshake ACK
+                // must be bare; the payload follows the MAC.
+                let authPending = netTcpConnectSecret != nil || netTcpConnectMac != nil
+                let firstPayload = authPending ? [UInt8]() : self.payload
+                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, firstPayload)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                self.seq = self.seq &+ UInt32(firstPayload.count)
+                state = authPending ? 5 : 2
+                if authPending {
+                    print("NET-TCP-CONNECT: handshake complete (server ISN 0x\(hex32(seq)), ack 0x\(hex32(ack))); awaiting the VIRELAIOS-AUTH/1 challenge")
+                } else {
+                    print("NET-TCP-CONNECT: handshake complete (server ISN 0x\(hex32(seq)), ack 0x\(hex32(ack))); sent \(self.payload.count)-byte payload")
                 }
-                netTcpRespondRelayLock.unlock()
-                close(fd)
-                print("NET-TCP-RELAY: upstream \(host):\(port) closed (\(n == 0 ? "EOF" : "errno \(errno)"))")
-                return
+                }
+            } else if isRst {
+                state = 3
+                print("NET-TCP-CONNECT: the guest refused the connection (RST)")
             }
-            netTcpRespondRelayLock.lock()
-            let current = gen == netTcpRespondRelayGen
-            if current { netTcpRespondRelayTx.append(contentsOf: buf[0..<n]) }
-            netTcpRespondRelayLock.unlock()
-            if !current {
-                close(fd)
-                return
+        case 5:
+            // M50 TS4: awaiting the guest's `VIRELAIOS-AUTH/1` line.
+            if isRst {
+                state = 3
+                print("NET-TCP-CONNECT: the guest reset the connection (RST)")
+            } else if isFin {
+                ack = seq &+ 1
+                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                state = 3
+                print("NET-TCP-CONNECT: the guest sent FIN; ACKed and closed")
+            } else if !payload.isEmpty {
+                var text = ""
+                for b in payload { text.append((b >= 0x20 && b < 0x7f) ? Character(UnicodeScalar(b)) : ".") }
+                recvText.append(text)
+                print("NET-TCP-CONNECT: received \(payload.count) byte(s): \(text)")
+                ack = seq &+ UInt32(payload.count)
+                if let answer = netTcpAuthAnswer(challenge: payload) {
+                    let combined = answer + self.payload
+                    let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, combined)
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    self.seq = self.seq &+ UInt32(combined.count)
+                    state = 2
+                    print("NET-TCP-CONNECT: answered the challenge (\(answer.count) bytes) with the \(netTcpConnectMac != nil ? "recorded replay MAC" : "computed HMAC"); sent \(self.payload.count)-byte payload")
+                } else {
+                    let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    state = 3
+                    print("NET-TCP-CONNECT: could not answer the challenge (malformed / no HMAC support); closing")
+                }
             }
-            print("NET-TCP-RELAY: upstream -> guest \(n) bytes buffered")
-            // M51 interop (#1209): real-server bytes arriving with no
-            // guest segment to trigger the next chunk are pumped right
-            // here — the guest's bounded KEX/auth reads cannot wait for
-            // the next guest ACK alone.
-            netTcpRespondRelayPump()
+        case 2:
+            // ESTABLISHED — the guest shell's data / a FIN.
+            if isRst {
+                if isStreamClient { try? streamInput?.close() }
+                state = 3
+                print("NET-TCP-CONNECT: the guest reset the connection (RST)")
+            } else if isFin {
+                if isStreamClient { try? streamInput?.close() }
+                ack = seq &+ 1
+                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                state = 3
+                print("NET-TCP-CONNECT: the guest sent FIN; ACKed and closed")
+            } else if isStreamClient {
+                netTcpStreamLock.lock()
+                if !payload.isEmpty {
+                    if netTcpConnectIntruder && !intruderSent {
+                        // The guest is ESTABLISHED and serving: now a
+                        // second viewer knocks from the next port.
+                        intruderSent = true
+                        let synLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort &+ 1, guestPort, netTcpIntruderIsn, 0, 0x02, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<synLen]))
+                        print("NET-TCP-INTRUDER: sent a second SYN from port \(cliPort &+ 1) while the first viewer is connected")
+                    }
+                    let fresh = streamAccept(seq, payload)
+                    if !fresh.isEmpty {
+                        streamRxBytes += fresh.count
+                        if streamRxBytes <= netTcpStreamMaxRx {
+                            // nil once the probe exited: a dead viewer reads nothing.
+                            try? streamInput?.write(contentsOf: Data(fresh))
+                        } else {
+                            streamDone = true
+                            print("NET-TCP-STREAM: inbound byte bound exceeded")
+                        }
+                    }
+                }
+                if (flags & 0x10) != 0 && tcpAck(buf) == self.seq {
+                    streamInFlight = false
+                }
+                if !payload.isEmpty || isSynAck {
+                    let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                }
+                streamPump()
+                netTcpStreamLock.unlock()
+            } else if sshMode {
+                if (flags & 0x02) != 0 {
+                    // SYN-ACK retransmit after ESTABLISHED. Re-ACK
+                    // only — another SSH chunk would overflow RX.
+                    let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    print("NET-TCP-CONNECT-SSH: re-ACK SYN-ACK retransmit")
+                } else {
+                    var fresh: [UInt8] = []
+                    if !payload.isEmpty {
+                        fresh = sshAccept(seq, payload)
+                        if !fresh.isEmpty {
+                            sshGuestDataSeen = true
+                            if let client = sshClient {
+                                sshTx.append(contentsOf: client.feed(fresh))
+                            }
+                        }
+                    }
+                    // Pace further chunks only after the guest has
+                    // Recv'd (it then emits SSH bytes). Bare ACKs
+                    // of the handshake chunk land while RX is full.
+                    if sshGuestDataSeen {
+                        if !sshSendChunk() {
+                            if !payload.isEmpty {
+                                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                                try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                            }
+                        }
+                    } else if !payload.isEmpty {
+                        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    }
+                    if let client = sshClient, client.isClosed, sshTx.isEmpty {
+                        let finLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x11, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<finLen]))
+                        self.seq = self.seq &+ 1
+                        state = 4
+                        print("NET-TCP-CONNECT-SSH: session done; sent FIN")
+                    }
+                }
+            } else if !payload.isEmpty {
+                ack = seq &+ UInt32(payload.count)
+                var text = ""
+                for b in payload { text.append((b >= 0x20 && b < 0x7f) ? Character(UnicodeScalar(b)) : ".") }
+                recvText.append(text)
+                print("NET-TCP-CONNECT: received \(payload.count) byte(s): \(text)")
+                let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x10, [])
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                // Close once the reply shows the command ran (the
+                // configure marker) or, absent one, after the first
+                // data segment.
+                let shouldClose = netTcpConnectCloseAfter.map { recvText.contains($0) } ?? true
+                if shouldClose {
+                    let finLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, self.seq, ack, 0x11, [])
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<finLen]))
+                    self.seq = self.seq &+ 1
+                    state = 4
+                    print("NET-TCP-CONNECT: sent FIN (closing the session)")
+                }
+            }
+        case 4:
+            // FIN sent — expect the guest's ACK.
+            if (flags & 0x10) != 0 {
+                state = 3
+                print("NET-TCP-CONNECT: close acknowledged (session done)")
+            }
+        default:
+            break
         }
     }
-    reader.name = "net-tcp-relay-upstream"
-    reader.start()
-}
 
-// M51 interop (#1209): the reply template — the most recent guest segment,
-// saved so the upstream reader can pump the next real-server chunk the
-// moment it arrives, with no guest segment needed as a trigger (the guest
-// waits on a BOUNDED read; a blocking capture thread would time it out).
-// `GuestNext` is the ACK value our next segment must carry.
-var netTcpRespondRelayTemplate: [UInt8] = []
-var netTcpRespondRelayGuestNext: UInt32 = 0
-var netTcpRespondRelayGuestAck: UInt32 = 0
-
-/// Save the reply template from one guest segment (under the lock).
-func netTcpRespondRelaySaveTemplate(_ buf: [UInt8], _ n: Int) {
-    let payload = n > 54 ? n - 54 : 0
-    netTcpRespondRelayLock.lock()
-    netTcpRespondRelayTemplate = Array(buf[0..<n])
-    netTcpRespondRelayGuestNext = tcpSeq(buf) &+ UInt32(payload)
-    netTcpRespondRelayGuestAck = tcpAck(buf)
-    netTcpRespondRelayLock.unlock()
-}
-
-/// Pump at most ONE ≤192-byte upstream chunk to the guest, and only when
-/// the previously sent chunk has been ACKed (`netTcpSrvNxt == GuestAck` —
-/// the guest kernel RX is a single bounded slot with no reassembly and
-/// the host has no retransmission). Called from the capture thread (guest
-/// traffic) AND the upstream reader (real-server bytes); the lock
-/// serializes, so exactly one segment is in flight. Returns true when a
-/// chunk went out.
-@discardableResult
-func netTcpRespondRelayPump() -> Bool {
-    guard netTcpRespondRelayMode else { return false }
-    netTcpRespondRelayLock.lock()
-    defer { netTcpRespondRelayLock.unlock() }
-    let total = netTcpRespondRelayTx.count
-    let off = netTcpRespondRelayTxOffset
-    guard off < total else { return false }
-    guard netTcpSrvNxt == netTcpRespondRelayGuestAck else { return false }
-    let tmpl = netTcpRespondRelayTemplate
-    guard tmpl.count >= 54 else { return false }
-    let end = min(off + netTcpRespondPacketChunk, total)
-    let chunk = Array(netTcpRespondRelayTx[off..<end])
-    netTcpRespondRelayTxOffset = end
-    if end >= total {
-        netTcpRespondRelayTx.removeAll(keepingCapacity: true)
-        netTcpRespondRelayTxOffset = 0
+    // Advance ack over in-order guest payload and return the new bytes.
+    // Retransmits and out-of-order segments are dropped: feeding them
+    // into SSHClient concatenates a second copy of the identification
+    // line onto a partial KEXINIT and the client fails closed (observed
+    // on the first live-ssh-server run as "malformed KEXINIT").
+    func sshAccept(_ seq: UInt32, _ payload: [UInt8]) -> [UInt8] {
+        if payload.isEmpty { return [] }
+        let delta = Int32(bitPattern: seq &- ack)
+        if delta > 0 {
+            print("NET-TCP-CONNECT-SSH: dropped out-of-order seq 0x\(hex32(seq)) want 0x\(hex32(ack))")
+            return []
+        }
+        let skip = Int(ack &- seq)
+        if skip >= payload.count {
+            print("NET-TCP-CONNECT-SSH: ignored retransmit seq 0x\(hex32(seq)) (acked through 0x\(hex32(ack)))")
+            return []
+        }
+        let fresh = skip == 0 ? payload : Array(payload[skip...])
+        ack = ack &+ UInt32(fresh.count)
+        print("NET-TCP-CONNECT-SSH: received \(fresh.count) byte(s)")
+        return fresh
     }
-    var reply = [UInt8](repeating: 0, count: 4096)
-    let replyLen = buildTcpReply(&reply, tmpl, tmpl.count, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpRespondHostPort ?? 0, netTcpSrvNxt, netTcpRespondRelayGuestNext, 0x10, chunk)
-    try? netCaptureReadSocket!.write(contentsOf: Data(reply[0..<replyLen]))
-    netTcpSrvNxt = netTcpSrvNxt &+ UInt32(chunk.count)
-    print("NET-TCP-RELAY: sent \(chunk.count) bytes to the guest (seq 0x\(hex32(netTcpSrvNxt &- UInt32(chunk.count))))")
-    return true
+
+    // M70g G1 (#1491): pace one ≤192-byte segment of the SSH client's
+    // output toward the guest. Same contract as
+    // netTcpRespondSSHSendChunk: the guest kernel RX is a single bounded
+    // slot with no reassembly.
+    func sshSendChunk() -> Bool {
+        guard sshMode, peerWindow != 0 else { return false }
+        let total = sshTx.count
+        let off = sshTxOffset
+        guard off < total else { return false }
+        let end = min(off + netTcpRespondPacketChunk, total)
+        let chunk = Array(sshTx[off..<end])
+        var reply = [UInt8](repeating: 0, count: 4096)
+        let replyLen = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpCliSrcIP, guestIP, cliPort, guestPort, seq, ack, 0x10, chunk)
+        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+        seq = seq &+ UInt32(chunk.count)
+        sshTxOffset = end
+        print("NET-TCP-CONNECT-SSH: sent \(chunk.count) bytes (\(end)/\(total), seq 0x\(hex32(seq &- UInt32(chunk.count))))")
+        if end >= total {
+            sshTx.removeAll(keepingCapacity: true)
+            sshTxOffset = 0
+        }
+        return true
+    }
+
+    // Runs only after a guest SYN-ACK, on the hermetic test path. Child
+    // stdout is binary RFB, never printed as text; stderr is diagnostic
+    // only. One reader drains stdout, and the network capture thread
+    // writes stdin.
+    func startStream() {
+        guard let path = netTcpConnectStreamExec else { return }
+        let proc = Process()
+        let stdin = Pipe(), stdout = Pipe()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = netTcpConnectStreamArgs
+        proc.standardInput = stdin
+        proc.standardOutput = stdout
+        proc.standardError = FileHandle.standardError
+        // A viewer that dies mid-update leaves guest bytes in flight;
+        // writing them to its closed pipe must be an error, not a SIGPIPE
+        // to the runner.
+        _ = fcntl(stdin.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        do {
+            try proc.run()
+        } catch {
+            streamDone = true
+            print("NET-TCP-STREAM: probe launch failed: \(error)")
+            return
+        }
+        streamProcess = proc
+        streamInput = stdin.fileHandleForWriting
+        DispatchQueue.global().async { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 192)
+            while true {
+                // FileHandle.readData(ofLength:) waits for the FULL
+                // requested length on a pipe. RFB's 12-byte banner reply
+                // would not reach the guest until EOF. POSIX read returns
+                // each available chunk.
+                let n = Darwin.read(stdout.fileHandleForReading.fileDescriptor, &buf, buf.count)
+                if n < 0 && errno == EINTR { continue }
+                if n <= 0 { break }
+                guard let self else { break }
+                let bytes = Array(buf[..<n])
+                netTcpStreamLock.lock()
+                if self.streamTx.count + bytes.count > netTcpStreamMaxTx {
+                    self.streamDone = true
+                    netTcpStreamLock.unlock()
+                    print("NET-TCP-STREAM: outbound byte bound exceeded")
+                    break
+                }
+                self.streamTx.append(contentsOf: bytes)
+                self.streamPump()
+                netTcpStreamLock.unlock()
+            }
+            proc.waitUntilExit()
+            let status = proc.terminationStatus
+            print("NET-TCP-STREAM: probe exited status=\(status)")
+            if let self {
+                if self.intruderSent && !self.intruderAnswered {
+                    print("NET-TCP-INTRUDER: no answer to the second SYN (dropped without RST)")
+                }
+                // The viewer's exit is its close: a clean exit is a FIN
+                // after its last byte is ACKed, any other exit is a peer
+                // that vanished (RST).
+                netTcpStreamLock.lock()
+                try? self.streamInput?.close()
+                self.streamInput = nil
+                if status == 0 && !self.streamDone {
+                    self.streamEOF = true
+                    self.streamPump()
+                } else {
+                    self.streamDone = true
+                    self.streamReset()
+                }
+                netTcpStreamLock.unlock()
+            }
+        }
+    }
+
+    // Called under streamLock. Only an ESTABLISHED stream is reset: once
+    // the guest has closed first there is nothing left to tear down.
+    func streamReset() {
+        guard state == 2 else { return }
+        var rst: [UInt8] = []
+        let len = buildTcpFrameExplicit(&rst, netTcpGuestMAC, [0x02, 0, 0, 0, 0, 0x02],
+            netTcpCliSrcIP, guestIP, cliPort, guestPort, seq, ack, 0x14, [])
+        try? netCaptureReadSocket?.write(contentsOf: Data(rst[0..<len]))
+        state = 3
+        print("NET-TCP-STREAM: the viewer died; sent RST")
+    }
+
+    // In-order, retransmit-safe byte delivery to the probe. The kernel
+    // only has one RX segment slot, so the reverse path likewise sends
+    // one <=192-byte chunk and waits for its ACK before advancing.
+    // Called under streamLock.
+    func streamAccept(_ seq: UInt32, _ payload: [UInt8]) -> [UInt8] {
+        let delta = Int32(bitPattern: seq &- ack)
+        if delta > 0 { return [] }
+        let skip = Int(ack &- seq)
+        if skip >= payload.count { return [] }
+        let fresh = Array(payload[skip...])
+        ack = ack &+ UInt32(fresh.count)
+        return fresh
+    }
+
+    func streamPump() {
+        if streamEOF && streamTx.isEmpty && !streamInFlight && !streamDone {
+            streamDone = true
+            guard state == 2 else { return }
+            var fin: [UInt8] = []
+            let len = buildTcpFrameExplicit(&fin, netTcpGuestMAC, [0x02, 0, 0, 0, 0, 0x02],
+                netTcpCliSrcIP, guestIP, cliPort, guestPort, seq, ack, 0x11, [])
+            try? netCaptureReadSocket?.write(contentsOf: Data(fin[0..<len]))
+            seq = seq &+ 1
+            state = 4
+            print("NET-TCP-STREAM: the viewer closed; sent FIN")
+            return
+        }
+        guard !streamInFlight && !streamTx.isEmpty && !streamDone && peerWindow != 0 else { return }
+        let count = min(192, streamTx.count)
+        let chunk = Array(streamTx.prefix(count))
+        streamTx.removeFirst(count)
+        var reply: [UInt8] = []
+        let len = buildTcpFrameExplicit(&reply, netTcpGuestMAC, [0x02, 0, 0, 0, 0, 0x02],
+            netTcpCliSrcIP, guestIP, cliPort, guestPort, seq, ack, 0x10, chunk)
+        do {
+            try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<len]))
+            seq = seq &+ UInt32(count)
+            streamInFlight = true
+        } catch {
+            streamDone = true
+            print("NET-TCP-STREAM: transmit failed: \(error)")
+        }
+    }
+}
+
+// M51 real-OpenSSH interop (#1209, goal #1066) + M99f (#2184): the
+// `:relay` upstream plumbing, per guest connection. The rendezvous is the
+// guest's SYN: connect the real server (localhost sshd), then start the
+// reader that appends real bytes to the connection's paced TX buffer. The
+// capture thread writes guest bytes to the upstream fd. Only the reader
+// closes its own fd (a generation counter retires a previous reader
+// without an fd-reuse race).
+extension NetTcpSrvConn {
+    func relayShutdown() {
+        lock.lock()
+        let fd = relayFd
+        relayFd = -1
+        lock.unlock()
+        if fd >= 0 { shutdown(fd, SHUT_RDWR) }
+    }
+
+    func relayStart(_ host: String, _ port: UInt16) {
+        relayShutdown()
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            print("NET-TCP-RELAY: upstream socket() failed (errno \(errno)); the relay is dead for this connection")
+            return
+        }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        var a4 = in_addr()
+        guard inet_pton(AF_INET, host, &a4) == 1 else {
+            print("NET-TCP-RELAY: upstream '\(host)' is not a dotted-quad IPv4 address")
+            close(fd)
+            return
+        }
+        addr.sin_addr = a4
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard rc == 0 else {
+            print("NET-TCP-RELAY: upstream connect \(host):\(port) failed (errno \(errno)); the relay is dead for this connection")
+            close(fd)
+            return
+        }
+        lock.lock()
+        relayGen += 1
+        let gen = relayGen
+        relayFd = fd
+        relayTx = []
+        relayTxOffset = 0
+        relayClosed = false
+        relayTemplate = []
+        relayGuestNext = 0
+        relayGuestAck = 0
+        lock.unlock()
+        print("NET-TCP-RELAY: upstream \(host):\(port) connected (real server; bytes proxied, no crypto here)")
+        let reader = Thread { [weak self] in
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let n = read(fd, &buf, buf.count)
+                if n < 0 && errno == EINTR { continue }
+                guard let self else { close(fd); return }
+                if n <= 0 {
+                    self.lock.lock()
+                    if gen == self.relayGen {
+                        self.relayClosed = true
+                        if self.relayFd == fd { self.relayFd = -1 }
+                    }
+                    self.lock.unlock()
+                    close(fd)
+                    print("NET-TCP-RELAY: upstream \(host):\(port) closed (\(n == 0 ? "EOF" : "errno \(errno)"))")
+                    return
+                }
+                self.lock.lock()
+                let current = gen == self.relayGen
+                if current { self.relayTx.append(contentsOf: buf[0..<n]) }
+                self.lock.unlock()
+                if !current {
+                    close(fd)
+                    return
+                }
+                print("NET-TCP-RELAY: upstream -> guest \(n) bytes buffered")
+                // M51 interop (#1209): real-server bytes arriving with no
+                // guest segment to trigger the next chunk are pumped right
+                // here — the guest's bounded KEX/auth reads cannot wait
+                // for the next guest ACK alone.
+                self.relayPump()
+            }
+        }
+        reader.name = "net-tcp-relay-upstream"
+        reader.start()
+    }
+
+    // M51 interop (#1209): the reply template — the most recent guest
+    // segment, saved so the upstream reader can pump the next real-server
+    // chunk the moment it arrives, with no guest segment needed as a
+    // trigger (the guest waits on a BOUNDED read; a blocking capture
+    // thread would time it out). `GuestNext` is the ACK value our next
+    // segment must carry. Saved under the connection's lock.
+    func relaySaveTemplate(_ buf: [UInt8], _ n: Int) {
+        let payload = n > 54 ? n - 54 : 0
+        lock.lock()
+        relayTemplate = Array(buf[0..<n])
+        relayGuestNext = tcpSeq(buf) &+ UInt32(payload)
+        relayGuestAck = tcpAck(buf)
+        lock.unlock()
+    }
+
+    /// Pump at most ONE ≤192-byte upstream chunk to the guest, and only
+    /// when the previously sent chunk has been ACKed (`srvNxt ==
+    /// GuestAck` — the guest kernel RX is a single bounded slot with no
+    /// reassembly and the host has no retransmission). Called from the
+    /// capture thread (guest traffic) AND the upstream reader
+    /// (real-server bytes); the connection lock serializes, so exactly
+    /// one segment is in flight per connection. Returns true when a
+    /// chunk went out.
+    @discardableResult
+    func relayPump() -> Bool {
+        guard netTcpRespondRelayMode else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        let total = relayTx.count
+        let off = relayTxOffset
+        guard off < total else { return false }
+        guard srvNxt == relayGuestAck else { return false }
+        let tmpl = relayTemplate
+        guard tmpl.count >= 54 else { return false }
+        let end = min(off + netTcpRespondPacketChunk, total)
+        let chunk = Array(relayTx[off..<end])
+        relayTxOffset = end
+        if end >= total {
+            relayTx.removeAll(keepingCapacity: true)
+            relayTxOffset = 0
+        }
+        var reply = [UInt8](repeating: 0, count: 4096)
+        let replyLen = buildTcpReply(&reply, tmpl, tmpl.count, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpRespondHostPort ?? 0, srvNxt, relayGuestNext, 0x10, chunk)
+        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+        srvNxt = srvNxt &+ UInt32(chunk.count)
+        print("NET-TCP-RELAY: sent \(chunk.count) bytes to the guest (seq 0x\(hex32(srvNxt &- UInt32(chunk.count))))")
+        return true
+    }
 }
 
 // SH7 (#1083, ADR 0020 Amendment B): match a guest-originated TCP segment

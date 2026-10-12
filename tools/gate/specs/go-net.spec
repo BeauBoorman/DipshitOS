@@ -371,6 +371,146 @@ assert len(syns) == 10 and all(s == syns[0] for s in syns), "legacy SYN/retransm
 print("legacy connect: guest counters %.6f s; unchanged EINVAL; reconnect/GET/close" % (elapsed / 1e9))
 PY
 
+# --- M99f (#2184): socket multiplicity ------------------------------------
+# The sshd+agentd+rfb shape: three processes each hold a vi.Listen slot-30
+# listener — three coexisting table listeners, distinct owners — while the
+# host dials two of them at once: two live connections, distinct 5-tuples,
+# in one capture. The listener-only 6003 proves the table holds more than
+# the two sockets a connection pair needs. Each accepted process exits
+# after the peer's FIN, so owner death also reclaims the sockets.
+
+vgate_file listener.go <<'EOF'
+package main
+
+import (
+    "strconv"
+    "virelai/vi"
+    "virelai/vsys"
+)
+
+func fail(s string) {
+    vsys.Println("listener: FAIL " + s)
+    vsys.Exit(1)
+}
+
+func main() {
+    args := vi.Args()
+    if len(args) < 2 {
+        fail("no port")
+    }
+    p, err := strconv.ParseUint(args[1], 10, 16)
+    if err != nil {
+        fail("bad port " + args[1])
+    }
+    tag := strconv.Itoa(int(p))
+    ln, err := vi.Listen(uint16(p))
+    if err != nil {
+        fail("listen " + tag + " " + err.Error())
+    }
+    vsys.Println("listener: listen " + tag)
+    if err := ln.Accept(); err != nil {
+        fail("accept " + tag + " " + err.Error())
+    }
+    vsys.Println("listener: accepted " + tag)
+    if _, err := ln.Send([]byte("hello from " + tag)); err != nil {
+        fail("send " + tag + " " + err.Error())
+    }
+    buf := make([]byte, vi.TCPPayloadMax)
+    _, _ = ln.Recv(buf) // drains the peer's FIN (readable-but-empty = gone)
+    vsys.Println("listener: done " + tag)
+    vsys.Exit(0)
+}
+EOF
+
+vgate_file script-multi.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOLISTEN.ELF 6001
+exec GOLISTEN.ELF 6002
+exec GOLISTEN.ELF 6003
+EOF
+
+vgate_file script-multi-end.txt <<'EOF'
+echo multi-finished
+EOF
+
+vgate_setup_python <<'PY'
+import os, pathlib, subprocess
+rd = pathlib.Path(os.environ["RUN_DIR"])
+share = pathlib.Path(os.environ.get("VG_SHARE") or rd / "share")
+tmp = rd / "connect-build"
+tmp.mkdir(exist_ok=True)
+env = dict(os.environ, TMPDIR=str(tmp), GO_BUILD_OUT=str(share),
+           GO_BUILD_NAME="GOLISTEN", GO_LDFLAGS_VALUE="-s -w")
+subprocess.run(["bash", "tools/go/build-go.sh", str(rd / "listener.go")], env=env, check=True)
+PY
+
+# The two 'done' markers are unordered across the two connections, so the
+# run ends on a script2 echo fired by a bounded delay after the SECOND
+# connection's listener reports — the same script2-delay mechanism the
+# live-net-tcp black-hole run uses.
+vgate_run multi -- --net '$RUN_DIR/multi.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:6001 --net-tcp-connect 10.0.0.1:6002 \
+    --net-tcp-connect-after 'listener: listen 6003' \
+    --script '$RUN_DIR/script-multi.txt' \
+    --script2 '$RUN_DIR/script-multi-end.txt' --script2-after 'listener: done 6002' --script2-delay 8 \
+    --script-expect 'multi-finished' --timeout 120
+
+vgate_assert multi serial-contains 'listener: listen 6001'
+vgate_assert multi serial-contains 'listener: listen 6002'
+vgate_assert multi serial-contains 'listener: listen 6003'
+vgate_assert multi serial-contains 'listener: accepted 6001'
+vgate_assert multi serial-contains 'listener: accepted 6002'
+vgate_assert multi serial-contains 'listener: done 6001'
+vgate_assert multi serial-contains 'listener: done 6002'
+vgate_assert multi serial-absent 'listener: FAIL'
+vgate_assert multi serial-absent '[EXC] parking:'
+vgate_assert multi output-contains 'NET-TCP-CONNECT: sent SYN to 10.0.0.1:6001'
+vgate_assert multi output-contains 'NET-TCP-CONNECT: sent SYN to 10.0.0.1:6002'
+vgate_assert multi output-contains 'NET-TCP-CONNECT: handshake complete'
+vgate_assert multi python <<'PY'
+import os, struct
+# The wire walk. The capture carries the GUEST's frames only (the runner
+# writes its own replies into the socketpair, not the file — the same
+# one-direction shape the live-net-tcp 9-frame walk relies on). Two guest
+# listeners (6001/6002) answer two host client source ports
+# (12345/12346) — distinct 5-tuples whose lifecycles interleave in ONE
+# capture: a singleton guest TCP could not send the second listener's
+# SYN-ACK while the first connection was still emitting.
+data = open(os.environ["RUN_DIR"] + "/multi.bin", "rb").read()
+frames = []
+i = 0
+while i < len(data):
+    if data[i+12:i+14] == b"\x08\x06":
+        i += 42
+        continue
+    assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
+    size = 14 + struct.unpack_from("!H", data, i + 16)[0]
+    frames.append(data[i:i+size])
+    i += size
+conns = {6001: [], 6002: []}
+dst_ports = {}
+for idx, f in enumerate(frames):
+    if f[23] != 6:
+        continue
+    sp = (f[34] << 8) | f[35]
+    dp = (f[36] << 8) | f[37]
+    if sp not in conns or f[26:30] != bytes([10, 0, 0, 1]):
+        continue
+    conns[sp].append((idx, f[47], len(f) - 54))
+    dst_ports.setdefault(sp, set()).add(dp)
+for port, segs in conns.items():
+    assert segs, "listener %d emitted nothing" % port
+    assert any(fl == 0x12 for _, fl, _ in segs), "no SYN-ACK from %d" % port
+    assert any(n > 0 for _, _, n in segs), "no data segment from %d" % port
+    assert dst_ports[port] == {12345 + (port - 6001)}, (port, dst_ports[port])
+# Concurrency: each connection's first frame precedes the other's LAST —
+# both were live at once on the wire.
+assert conns[6001][0][0] < conns[6002][-1][0] and conns[6002][0][0] < conns[6001][-1][0], (
+    "connection windows did not overlap: %r vs %r" % (conns[6001], conns[6002]))
+print("multi ok: 3 listeners, 2 concurrent connections, distinct 5-tuples")
+PY
+
 # --- M95 prerequisite #2029: stdlib `net` on GOOS=virelai ---------------
 # The package compiles for in-process IPC only: net.Pipe is a real Conn
 # pair (channel plumbing, no netFD), while every path that would need a

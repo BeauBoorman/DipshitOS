@@ -164,10 +164,12 @@ test "syscall: slot 30 packed timeout validation and failure release the network
     arp.own_ip = ip_guest;
     arp.upsert(ip_host, host_mac);
     reset();
+    net.native_socket.sockets = .{};
     defer {
         net.net_ops = saved_ops;
         net.net_ready = false;
         arp.own_ip = .{ 0, 0, 0, 0 };
+        net.native_socket.sockets = .{};
         reset();
     }
     for ([_]u64{ 0, 0x10000, @as(u64, 1) << 48 | 8081, @as(u64, 1) << 63 | 8081 }) |word| {
@@ -178,12 +180,15 @@ test "syscall: slot 30 packed timeout validation and failure release the network
     // Host transport only acknowledges TX completion, never supplies SYN-ACK.
     // Deadline arithmetic is tested above; the host iteration guard tests
     // this handler's error/cleanup/lock return path, not elapsed wall time.
+    // M99f (#2184): slots 30-33 ride the socket TABLE — the singleton below
+    // stays idle and only the mirrored counters move.
     connect_saw_net_lock = false;
     try std.testing.expectEqual(syscall.error_result(.etimedout), syscall.dispatch(30, .{ 0x0a000002, @as(u64, 5000) << 16 | 8081, 0, 0, 0, 0 }, &frame));
     try std.testing.expect(connect_saw_net_lock);
     try std.testing.expectEqual(State.idle, tcp.state);
     try std.testing.expectEqual(@as(u64, 1), tcp.timed_out);
     try std.testing.expect(tcp.owner_pid == null and !tcp.tx_pending);
+    try std.testing.expectEqual(@as(usize, 0), net.native_socket.sockets.liveChildren());
     try std.testing.expect(!syscall.svclock.net.held());
     try std.testing.expect(syscall.svclock.net.try_acquire());
     syscall.svclock.net.release();
@@ -191,7 +196,11 @@ test "syscall: slot 30 packed timeout validation and failure release the network
     try std.testing.expectEqual(syscall.error_result(.einval), syscall.dispatch(30, .{ 0x0a000002, 8081, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 2), tcp.timed_out);
     try std.testing.expectEqual(@as(u64, 0), syscall.dispatch(30, .{ 0, 8080, 0, 0, 0, 0 }, &frame));
-    try std.testing.expectEqual(State.listen, tcp.state);
+    try std.testing.expectEqual(State.idle, tcp.state);
+    // The passive open landed in the table as a legacy listener instead.
+    try std.testing.expect(net.native_socket.sockets.listener != null);
+    try std.testing.expectEqual(@as(u16, 8080), net.native_socket.sockets.listener.?.local.port);
+    try std.testing.expect(net.native_socket.legacyListenerSlot(net.native_socket.unowned) != null);
 }
 
 /// Craft a full TCP frame the way the host responder does (the guest's

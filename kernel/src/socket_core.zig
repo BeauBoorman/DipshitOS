@@ -1,7 +1,10 @@
-//! B6's owner-approved injected core, NOT the live TCP/syscall implementation.
-//! One listener and two charged children; numeric IPv4, passive open only.
-//! A caller serializes access and supplies monotonic nanoseconds and fresh ISNs.
-//! No locks, allocation, scheduler calls, DNS, threading or SDK resource grants.
+//! The ONE owner-approved TCP socket table — B6's injected core promoted to
+//! the live implementation (M99f #2184, ADR 0007 amendment). Up to
+//! `listener_limit` listeners (one per owner), `conn_limit` connections
+//! including active-open (`parent == no_parent`) children of no listener;
+//! numeric IPv4. A caller serializes access and supplies monotonic
+//! nanoseconds and fresh ISNs. No locks, allocation, scheduler calls, DNS,
+//! threading or SDK resource grants.
 //!
 //! receive/poll/flush perform bounded work. Call poll(now) before flushing and
 //! periodically even without RX/app traffic. flush calls a bounded, non-reentrant
@@ -16,7 +19,28 @@
 const std = @import("std");
 pub const wire = @import("tcp.zig");
 
+/// Accepted children one listener may charge at once (the B6 two-client bound,
+/// preserved end-to-end by the native socket fixture).
 pub const child_limit = 2;
+/// System listener slots: slot 0 stays the named `listener` field the ipv4
+/// fast path reads; slots 1..3 live in `extra_listeners`.
+pub const listener_limit = 4;
+/// System connection slots, priced against `core_limit`: a Connection is
+/// ~3.1 KiB (RX + TX + control + metadata), so 4 fit the 16 KiB core budget
+/// with the listeners, refusal and counters (~14.1 KiB incl. one owned frame)
+/// where 5 do not (~17.1 KiB).
+pub const conn_limit = 4;
+/// Sockets (listeners + connections) one owner may hold at once.
+pub const owner_limit = 4;
+/// Handle encoding: `generation << slot_bits | slot`. Slots 0..listener_limit-1
+/// are listeners, conn_slot_base..conn_slot_base+conn_limit-1 connections;
+/// socket_native mints the DNS seat at `dns_slot`.
+pub const slot_bits = 4;
+pub const slot_mask: u64 = (1 << slot_bits) - 1;
+pub const conn_slot_base = listener_limit;
+pub const dns_slot: u64 = 15;
+/// A connection spawned by `open`, not by a listener's SYN.
+pub const no_parent: u8 = 0xff;
 pub const core_limit = 16 * 1024;
 pub const deadline_ns: u64 = 30_000_000_000;
 pub const rto_ns: u64 = 3_000_000_000;
@@ -51,7 +75,14 @@ pub const Outbound = struct {
 };
 pub const Transmit = *const fn (?*anyopaque, Outbound) bool;
 pub const Flush = enum { empty, sent, refused };
-const Listener = struct { handle: Handle, owner: u64, local: Endpoint };
+const Listener = struct {
+    handle: Handle,
+    owner: u64,
+    local: Endpoint,
+    /// True when created through the legacy slot-30 listen path: the shim
+    /// serves its children through slots 31–33/76, never through accept.
+    legacy: bool = false,
+};
 pub const Connection = struct {
     handle: Handle,
     owner: u64,
@@ -60,6 +91,9 @@ pub const Connection = struct {
     remote_mac: [6]u8,
     state: State = .half_open,
     outcome: Outcome = .none,
+    /// Listener slot that spawned this connection, or `no_parent` when it
+    /// was created by `open` (active open, a child of no listener).
+    parent: u8 = no_parent,
     accepted: bool = false,
     peer_fin: bool = false,
     peer_window: u16,
@@ -99,8 +133,10 @@ pub const Counters = struct {
 };
 
 pub const Core = struct {
+    /// Slot 0 keeps the named field `ipv4.zig`'s fast path reads.
     listener: ?Listener = null,
-    children: [child_limit]?Connection = @splat(null),
+    extra_listeners: [listener_limit - 1]?Listener = @splat(null),
+    children: [conn_limit]?Connection = @splat(null),
     refusal: ?Refusal = null,
     next_generation: u64 = 1,
     now: u64 = 0,
@@ -112,48 +148,143 @@ pub const Core = struct {
         self.now = now;
     }
     fn token(self: *Core, slot: u64) Error!Handle {
-        if (self.next_generation > std.math.maxInt(u64) >> 2) return error.Capacity;
-        const handle: Handle = .{ .value = (self.next_generation << 2) | slot };
+        if (self.next_generation > std.math.maxInt(u64) >> slot_bits) return error.Capacity;
+        const handle: Handle = .{ .value = (self.next_generation << slot_bits) | slot };
         self.next_generation += 1;
         return handle;
     }
-    fn listenerFor(self: *Core, owner: u64, handle: Handle) Error!*Listener {
-        const listener = if (self.listener) |*l| l else return error.InvalidHandle;
+    pub fn listenerAt(self: *Core, slot: u64) ?*Listener {
+        if (slot == 0) {
+            return if (self.listener) |*l| l else null;
+        }
+        return if (self.extra_listeners[slot - 1]) |*l| l else null;
+    }
+    fn listenerSlot(self: *Core, handle: Handle) Error!u8 {
+        const slot = handle.value & slot_mask;
+        if (slot >= listener_limit) return error.InvalidHandle;
+        const listener = self.listenerAt(slot) orelse return error.InvalidHandle;
         if (listener.handle.value != handle.value) return error.InvalidHandle;
+        return @intCast(slot);
+    }
+    fn listenerFor(self: *Core, owner: u64, handle: Handle) Error!*Listener {
+        const slot = try self.listenerSlot(handle);
+        const listener = self.listenerAt(slot).?;
         if (listener.owner != owner) return error.AccessDenied;
         return listener;
     }
     fn childFor(self: *Core, owner: u64, handle: Handle) Error!*Connection {
-        const slot = handle.value & 3;
-        if (slot == 0 or slot > child_limit) return error.InvalidHandle;
-        const child = if (self.children[slot - 1]) |*c| c else return error.InvalidHandle;
+        const slot = handle.value & slot_mask;
+        if (slot < conn_slot_base or slot >= conn_slot_base + conn_limit) return error.InvalidHandle;
+        const child = if (self.children[slot - conn_slot_base]) |*c| c else return error.InvalidHandle;
         if (child.handle.value != handle.value) return error.InvalidHandle;
         if (child.owner != owner) return error.AccessDenied;
         return child;
     }
+    /// How many listeners + connections an owner currently charges.
+    pub fn ownedSockets(self: *Core, owner: u64) usize {
+        var count: usize = 0;
+        for (0..listener_limit) |slot| if (self.listenerAt(slot)) |l| {
+            if (l.owner == owner) count += 1;
+        };
+        for (self.children) |entry| if (entry) |c| {
+            if (c.owner == owner) count += 1;
+        };
+        return count;
+    }
+    /// True when a listener or connection already charges this local port.
+    pub fn portClaimed(self: *Core, port: u16) bool {
+        for (0..listener_limit) |slot| if (self.listenerAt(slot)) |l| {
+            if (l.local.port == port) return true;
+        };
+        for (self.children) |entry| if (entry) |c| {
+            if (c.local.port == port) return true;
+        };
+        return false;
+    }
+    /// True when a listener or connection would process TCP for `port`.
+    pub fn tableOwns(self: *Core, port: u16) bool {
+        return self.portClaimed(port);
+    }
     pub fn listen(self: *Core, owner: u64, local: Endpoint, now: u64) Error!Handle {
         if (!validIp(local.ip) or local.port == 0) return error.InvalidArgument;
-        if (self.listener != null) return error.Capacity;
+        // One listener per owner — B6's same-owner second-listen ENOSPC — and
+        // no shared local port across listeners or connections.
+        for (0..listener_limit) |slot| if (self.listenerAt(slot)) |l| {
+            if (l.owner == owner) return error.Capacity;
+        };
+        if (self.portClaimed(local.port)) return error.Capacity;
+        if (self.ownedSockets(owner) >= owner_limit) return error.Capacity;
         try self.clock(now);
-        const handle = try self.token(0);
-        self.listener = .{ .handle = handle, .owner = owner, .local = local };
+        const slot = self.freeListenerSlot() orelse return error.Capacity;
+        const handle = try self.token(slot);
+        const fresh: Listener = .{ .handle = handle, .owner = owner, .local = local };
+        if (slot == 0) {
+            self.listener = fresh;
+        } else {
+            self.extra_listeners[slot - 1] = fresh;
+        }
         return handle;
     }
+    fn freeListenerSlot(self: *Core) ?u64 {
+        for (0..listener_limit) |slot| {
+            if (self.listenerAt(slot) == null) return slot;
+        }
+        return null;
+    }
+    /// Mark a just-minted listener as belonging to the legacy slot-30 shim so
+    /// its children are never served through `accept`.
+    pub fn markLegacy(self: *Core, owner: u64, handle: Handle) Error!void {
+        (try self.listenerFor(owner, handle)).legacy = true;
+    }
     pub fn accept(self: *Core, owner: u64, handle: Handle) Error!Handle {
-        _ = try self.listenerFor(owner, handle);
+        const parent = try self.listenerSlot(handle);
+        const listener = self.listenerAt(parent).?;
+        if (listener.owner != owner) return error.AccessDenied;
         for (&self.children) |*entry| if (entry.*) |*c| {
-            if (!c.accepted and c.state != .half_open) {
+            if (c.parent == parent and !c.accepted and c.state != .half_open) {
                 c.accepted = true;
                 return c.handle;
             }
         };
         return error.WouldBlock;
     }
+    /// Active open: mint an outbound connection with its SYN queued in the
+    /// bounded TX slot. The `connect` operation stays `Unsupported` — the
+    /// handle ABI (slot 80) is passive-only; only the legacy slot-30 shim
+    /// calls `open`.
+    pub fn open(self: *Core, owner: u64, local: Endpoint, remote: Endpoint, remote_mac: [6]u8, now: u64, fresh_isn: u32) Error!Handle {
+        if (!validIp(remote.ip) or remote.port == 0 or local.port == 0) return error.InvalidArgument;
+        if (self.ownedSockets(owner) >= owner_limit) return error.Capacity;
+        if (self.portClaimed(local.port)) return error.Capacity;
+        try self.clock(now);
+        for (&self.children, 0..) |*entry, index| {
+            if (entry.* != null) continue;
+            const handle = try self.token(conn_slot_base + index);
+            entry.* = .{
+                .handle = handle,
+                .owner = owner,
+                .local = local,
+                .remote = remote,
+                .remote_mac = remote_mac,
+                .peer_window = 0, // unknown until the peer's SYN-ACK arrives
+                .snd_una = fresh_isn,
+                .snd_nxt = fresh_isn,
+                .rcv_nxt = 0,
+                .phase_deadline = deadline(now),
+                .parent = no_parent,
+            };
+            queue(&entry.*.?, wire.flag_syn, &.{}, now);
+            return handle;
+        }
+        return error.Capacity;
+    }
     pub fn ready(self: *Core, owner: u64, handle: Handle) Error!Ready {
-        if ((handle.value & 3) == 0) {
-            _ = try self.listenerFor(owner, handle);
+        if ((handle.value & slot_mask) < conn_slot_base) {
+            const parent = try self.listenerSlot(handle);
+            const listener = self.listenerAt(parent).?;
+            if (listener.owner != owner) return error.AccessDenied;
             for (self.children) |entry| if (entry) |c| {
-                if (!c.accepted and c.state != .half_open) return .{ .accept = true };
+                if (c.parent == parent and !c.accepted and c.state != .half_open) return .{ .accept = true };
             };
             return .{};
         }
@@ -178,6 +309,10 @@ pub const Core = struct {
         const c = try self.childFor(owner, handle);
         try self.poll(now);
         try usable(c);
+        // A live sender is servicing the socket — same abandonment-slide as
+        // the empty-read path (the singleton never timed a conn out while
+        // its owner kept calling).
+        c.read_deadline = deadline(now);
         if (bytes.len == 0) return 0;
         if (c.state != .established or c.tx_len != 0 or c.peer_window == 0) return error.WouldBlock;
         const count = @min(bytes.len, @min(wire.payload_max, c.peer_window));
@@ -201,6 +336,11 @@ pub const Core = struct {
         }
         if (c.peer_fin or c.outcome == .eof) return 0;
         try usable(c);
+        // An empty read is still a read: the caller is alive and servicing
+        // the socket, so the abandonment deadline slides. The legacy
+        // transport polls recv on every wait tick — without this refresh a
+        // live, silent-but-established conn would die at 30 s.
+        c.read_deadline = deadline(now);
         return error.WouldBlock;
     }
     /// Graceful close is an operation, not an in-handler wait. close releases.
@@ -213,24 +353,40 @@ pub const Core = struct {
         c.state = .closing;
         c.phase_deadline = deadline(now);
     }
+    /// Reclaim a slot without the ownership walk — caller already validated.
+    /// Closing a listener reclaims only ITS children (other listeners' and
+    /// active-open connections survive) plus a refusal bound to its port.
+    pub fn releaseAt(self: *Core, slot: u64) void {
+        if (slot < listener_limit) {
+            const local = self.listenerAt(slot).?.local;
+            if (slot == 0) {
+                self.listener = null;
+            } else {
+                self.extra_listeners[slot - 1] = null;
+            }
+            if (self.refusal) |r| {
+                if (same(r.local, local)) self.refusal = null;
+            }
+            for (&self.children) |*entry| if (entry.*) |c| {
+                if (c.parent == slot) entry.* = null;
+            };
+            return;
+        }
+        self.children[slot - conn_slot_base] = null;
+    }
     pub fn close(self: *Core, owner: u64, handle: Handle) Error!void {
-        if ((handle.value & 3) == 0) {
+        const slot = handle.value & slot_mask;
+        if (slot < conn_slot_base) {
             _ = try self.listenerFor(owner, handle);
-            self.children = @splat(null);
-            self.listener = null;
-            self.refusal = null;
         } else {
             _ = try self.childFor(owner, handle);
-            self.children[(handle.value & 3) - 1] = null;
         }
+        self.releaseAt(slot);
     }
     pub fn closeOwner(self: *Core, owner: u64) void {
-        if (self.listener) |l| {
-            if (l.owner == owner) {
-                self.listener = null;
-                self.refusal = null;
-            }
-        }
+        for (0..listener_limit) |slot| if (self.listenerAt(slot)) |l| {
+            if (l.owner == owner) self.releaseAt(slot);
+        };
         for (&self.children) |*entry| if (entry.*) |c| {
             if (c.owner == owner) entry.* = null;
         };
@@ -243,29 +399,42 @@ pub const Core = struct {
     }
 
     /// Complete Ethernet/IPv4 frames, not the old singleton's RX globals.
+    /// Demux: an established connection's full 4-tuple match wins; then a
+    /// listener-local match admits a new SYN under that listener's own
+    /// two-child bound; anything else is foreign. A table with no matching
+    /// endpoint leaves the frame alone (the caller decides).
     pub fn receive(self: *Core, frame: []const u8, now: u64, fresh_isn: u32) Error!void {
         try self.poll(now);
-        const l = self.listener orelse return;
         const p = parse(frame) orelse {
             self.counters.malformed +%= 1;
             return;
         };
-        if (!same(p.local, l.local)) {
-            self.counters.foreign +%= 1;
-            return;
-        }
         for (&self.children) |*entry| if (entry.*) |*c| {
             if (same(c.local, p.local) and same(c.remote, p.remote)) {
                 self.received(c, p);
                 return;
             }
         };
+        const parent = self.listenerForLocal(p.local) orelse {
+            self.counters.foreign +%= 1;
+            return;
+        };
+        const l = self.listenerAt(parent).?;
         if (p.flags != wire.flag_syn or p.payload.len != 0) {
             self.counters.foreign +%= 1;
             return;
         }
+        // Per-listener child bound — B6's two-client cap, per listener now.
+        var siblings: usize = 0;
+        for (self.children) |entry| if (entry) |c| {
+            if (c.parent == parent) siblings += 1;
+        };
+        if (siblings >= child_limit) {
+            self.refuse(p);
+            return;
+        }
         for (&self.children, 0..) |*entry, i| if (entry.* == null) {
-            const handle = self.token(i + 1) catch {
+            const handle = self.token(conn_slot_base + i) catch {
                 self.refuse(p);
                 return;
             };
@@ -280,11 +449,19 @@ pub const Core = struct {
                 .snd_nxt = fresh_isn,
                 .rcv_nxt = p.seq +% 1,
                 .phase_deadline = deadline(now),
+                .parent = @intCast(parent),
             };
             queue(&entry.*.?, wire.flag_syn | wire.flag_ack, &.{}, now);
             return;
         };
         self.refuse(p);
+    }
+    /// The listener slot whose local endpoint matches, if any.
+    fn listenerForLocal(self: *Core, local: Endpoint) ?u64 {
+        for (0..listener_limit) |slot| if (self.listenerAt(slot)) |l| {
+            if (same(l.local, local)) return slot;
+        };
+        return null;
     }
     fn refuse(self: *Core, p: Parsed) void {
         self.counters.capacity_refused +%= 1;
@@ -299,6 +476,25 @@ pub const Core = struct {
     fn received(self: *Core, c: *Connection, p: Parsed) void {
         if (c.state == .terminal) {
             if (p.flags == wire.flag_syn and p.payload.len == 0) self.refuse(p);
+            return;
+        }
+        if (c.parent == no_parent and c.state == .half_open) {
+            // Active-open handshake: a SYN+ACK covering our SYN establishes.
+            if ((p.flags & wire.flag_rst) != 0) {
+                finish(c, .reset);
+                return;
+            }
+            if (p.flags == (wire.flag_syn | wire.flag_ack) and p.ack == c.snd_nxt and p.payload.len == 0) {
+                c.rcv_nxt = p.seq +% 1;
+                c.snd_una = p.ack;
+                c.peer_window = p.window;
+                clearTx(c);
+                c.state = .established;
+                c.read_deadline = deadline(self.now);
+                ack(c);
+                return;
+            }
+            self.counters.malformed +%= 1;
             return;
         }
         if (p.flags == wire.flag_syn and c.state == .half_open and p.seq +% 1 == c.rcv_nxt and p.payload.len == 0) {
@@ -398,12 +594,13 @@ pub const Core = struct {
             }
         };
     }
-    /// Fair round-robin across two children and refusal, one callback per call.
+    /// Fair round-robin across all connections and the refusal slot,
+    /// one callback per call.
     pub fn flush(self: *Core, context: ?*anyopaque, transmit: Transmit) Flush {
-        for (0..child_limit + 1) |_| {
+        for (0..conn_limit + 1) |_| {
             const slot = self.tx_cursor;
-            self.tx_cursor = (slot + 1) % (child_limit + 1);
-            if (slot == child_limit) {
+            self.tx_cursor = (slot + 1) % (conn_limit + 1);
+            if (slot == conn_limit) {
                 if (self.refusal) |r| {
                     if (!transmit(context, .{ .local = r.local, .remote = r.remote, .remote_mac = r.remote_mac, .bytes = &r.bytes })) {
                         self.counters.tx_refused +%= 1;
