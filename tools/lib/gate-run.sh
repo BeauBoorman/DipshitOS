@@ -147,6 +147,11 @@ gate_seed_share_contents() {
     if [ -f image/WALLPAPER.QOI ]; then
         cp image/WALLPAPER.QOI "$SHARE/WALLPAPER.QOI"
     fi
+    # 4b. The launcher emblem (#2054): the same mascot QOI the Zig
+    # fixtures carry, read by the Go seat at /host/SEXIBURGER.QOI.
+    if [ -f user/src/lib/fixtures/qoi/mascot_64x64.qoi ]; then
+        cp user/src/lib/fixtures/qoi/mascot_64x64.qoi "$SHARE/SEXIBURGER.QOI"
+    fi
     # 5. TrueType fonts (Inter Regular/Bold/Italic for UI, Fira Code for mono).
     # Share names frozen by M69d #1531 D1: INTER.TTF, INTERB.TTF, INTERI.TTF,
     # FIRACODE.TTF. Zig ui.init_fonts (#1536) consumes the same names.

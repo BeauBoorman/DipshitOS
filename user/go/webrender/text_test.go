@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"virelai/ttf"
+	"virelai/webrender/qoi"
 	"virelai/webstyle"
 )
 
@@ -46,8 +47,8 @@ func TestCSSShortLineHeightDoesNotCullGlyphInk(t *testing.T) {
 func TestQOIHashStaysInTheIndexTable(t *testing.T) {
 	for _, px := range []uint32{0xff117f33, 0xffd03399, 0xff2266dd, 0xffeecc00,
 		0xffffffff, 0xff000000, 0xff7f7f7f, 0xff010203} {
-		if h := qoiHash(px); h >= 64 {
-			t.Errorf("qoiHash(%#08x) = %d, outside the 64-entry index table", px, h)
+		if h := qoi.Hash(px); h >= 64 {
+			t.Errorf("qoi.Hash(%#08x) = %d, outside the 64-entry index table", px, h)
 		}
 	}
 }

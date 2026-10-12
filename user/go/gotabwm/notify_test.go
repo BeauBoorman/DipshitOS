@@ -534,11 +534,16 @@ func TestToastSurvivesTheRestOfTheTick(t *testing.T) {
 		t.Fatalf("the toast's accent rule is #%06x after the tick, want #%06x — the strip was not painted last",
 			rule, theme.Current.Accent)
 	}
-	// Replay everything the tick paints AFTER the toast would be, in the
-	// order compositeTick uses. A toast painted BELOW any of these would
-	// be erased wherever the rects meet.
+	// compositeTick paints the launcher BEFORE the toast and the chrome
+	// before both — and with the #2054 left-edge strip the launcher's rect
+	// genuinely overlaps the toast column now, so the order is what keeps
+	// the toast visible. The honest replay is the real order compressed:
+	// strip, then toast again — the strip must lose, and the center
+	// dialog (the only paint after it) must not erase it either.
 	_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	chromeTick(scan, 4)
+	_ = paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, 4)
+	_ = paintNotifyCenter(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	pix = asUint32(scan)
 	if got := pix[(y+ph/2)*vi.ScanoutWidth+x+1] & 0xffffff; got != theme.Current.Accent {
 		t.Fatalf("a later paint in the same tick changed the toast's rule to #%06x: it is not the last write", got)
