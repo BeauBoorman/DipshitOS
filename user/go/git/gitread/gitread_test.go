@@ -144,6 +144,88 @@ func TestPackOfsDelta(t *testing.T) {
 	}
 }
 
+// TestParsePackThinExternalBase is the fetch case (#2203): a ref-delta
+// whose base the pack does not carry. ParsePack must refuse it honestly
+// and ParsePackThin must resolve it through the object-store lookup.
+func TestParsePackThinExternalBase(t *testing.T) {
+	base := GitObj{Type: ObjBlob, Data: []byte("hello, git\n")}
+	base.ID = HashObject(ObjBlob, base.Data)
+	target := []byte("hello, git!\n")
+	d := encodeDelta(base.Data, target)
+	z := zlibStore(d)
+	var body []byte
+	body = append(body, encodePackHdr(ObjRefDelta, len(d))...)
+	body = append(body, base.ID[:]...)
+	body = append(body, z...)
+	hdr := make([]byte, 12)
+	copy(hdr, "PACK")
+	putBE32(hdr[4:], 2)
+	putBE32(hdr[8:], 1)
+	all := append(hdr, body...)
+	sum := sha1Sum(all)
+	pack := append(all, sum[:]...)
+
+	if _, _, err := ParsePack(pack); err != errPackDelta {
+		t.Fatalf("ParsePack on thin pack = %v want errPackDelta", err)
+	}
+	if _, _, err := ParsePackThin(pack, func(id [20]byte) (GitObj, bool) {
+		return GitObj{}, false
+	}); err != errPackDelta {
+		t.Fatalf("ParsePackThin missing base = %v want errPackDelta", err)
+	}
+	got, nDelta, err := ParsePackThin(pack, func(id [20]byte) (GitObj, bool) {
+		if id == base.ID {
+			return base, true
+		}
+		return GitObj{}, false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nDelta != 1 || len(got) != 1 {
+		t.Fatalf("nDelta=%d len=%d", nDelta, len(got))
+	}
+	if got[0].Type != ObjBlob || !bytes.Equal(got[0].Data, target) {
+		t.Fatalf("thin delta data = %q", got[0].Data)
+	}
+	if got[0].ID != HashObject(ObjBlob, target) {
+		t.Fatalf("thin delta id = %x", got[0].ID)
+	}
+}
+
+// TestParsePackThinInPackBase — a base that arrives in the SAME pack but
+// unresolved must not be snatched from the store; the in-pack copy wins.
+func TestParsePackThinInPackBase(t *testing.T) {
+	base := GitObj{Type: ObjBlob, Data: []byte("hello, git\n")}
+	base.ID = HashObject(ObjBlob, base.Data)
+	target := []byte("hello, git!\n")
+	d := encodeDelta(base.Data, target)
+	z := zlibStore(d)
+	var body []byte
+	// delta first, base second — forces the pass-ordering path.
+	body = append(body, encodePackHdr(ObjRefDelta, len(d))...)
+	body = append(body, base.ID[:]...)
+	body = append(body, z...)
+	body = append(body, encodePackHdr(ObjBlob, len(base.Data))...)
+	body = append(body, zlibStore(base.Data)...)
+	hdr := make([]byte, 12)
+	copy(hdr, "PACK")
+	putBE32(hdr[4:], 2)
+	putBE32(hdr[8:], 2)
+	all := append(hdr, body...)
+	sum := sha1Sum(all)
+	pack := append(all, sum[:]...)
+	got, _, err := ParsePackThin(pack, func(id [20]byte) (GitObj, bool) {
+		return GitObj{}, false // store has nothing: in-pack must resolve
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !bytes.Equal(got[0].Data, target) || !bytes.Equal(got[1].Data, base.Data) {
+		t.Fatalf("got = %+v", got)
+	}
+}
+
 func TestOfsRoundTrip(t *testing.T) {
 	for _, v := range []int{1, 2, 127, 128, 129, 1000, 20000} {
 		enc := encodeOfs(v)

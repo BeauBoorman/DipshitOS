@@ -91,6 +91,20 @@ type rawObj struct {
 }
 
 func ParsePack(buf []byte) ([]GitObj, int, error) {
+	return parsePack(buf, nil)
+}
+
+// ParsePackThin is ParsePack for a FETCH pack (#2203): negotiated with the
+// thin-pack capability, it may carry ref-deltas whose base the sender
+// omitted because the client already holds it. lookup resolves those bases
+// against the local object store; a miss fails the parse honestly (a delta
+// never floats on a guessed base). A self-contained pack parses identically
+// under either entry point.
+func ParsePackThin(buf []byte, lookup func(id [20]byte) (GitObj, bool)) ([]GitObj, int, error) {
+	return parsePack(buf, lookup)
+}
+
+func parsePack(buf []byte, lookup func(id [20]byte) (GitObj, bool)) ([]GitObj, int, error) {
 	if len(buf) < 32 {
 		return nil, 0, errPackTrunc
 	}
@@ -128,7 +142,7 @@ func ParsePack(buf []byte) ([]GitObj, int, error) {
 	if pos != len(body) {
 		return nil, 0, errPackCount
 	}
-	if err := resolveDeltas(raw); err != nil {
+	if err := resolveDeltas(raw, lookup); err != nil {
 		return nil, 0, err
 	}
 	out := make([]GitObj, len(raw))
@@ -230,7 +244,7 @@ func readOfsDelta(b []byte) (off, n int, err error) {
 	return off, n, nil
 }
 
-func resolveDeltas(raw []rawObj) error {
+func resolveDeltas(raw []rawObj, lookup func(id [20]byte) (GitObj, bool)) error {
 	byOff := make(map[int]int, len(raw))
 	for i := range raw {
 		byOff[raw[i].off] = i
@@ -249,19 +263,35 @@ func resolveDeltas(raw []rawObj) error {
 				continue
 			}
 			base, ok := findBase(raw, byOff, &raw[i])
-			if !ok || !base.done {
+			if ok && base.done {
+				out, err := applyDelta(base.data, raw[i].data)
+				if err != nil {
+					return err
+				}
+				raw[i].typ = base.typ
+				raw[i].data = out
+				raw[i].id = HashObject(raw[i].typ, out)
+				raw[i].delta = false
+				raw[i].done = true
+				progress = true
 				continue
 			}
-			out, err := applyDelta(base.data, raw[i].data)
-			if err != nil {
-				return err
+			// Thin pack: a ref-delta base the sender left out lives in
+			// the object store the client already holds.
+			if !ok && lookup != nil && raw[i].typ == ObjRefDelta {
+				if ext, eok := lookup(raw[i].baseSHA); eok {
+					out, err := applyDelta(ext.Data, raw[i].data)
+					if err != nil {
+						return err
+					}
+					raw[i].typ = ext.Type
+					raw[i].data = out
+					raw[i].id = HashObject(raw[i].typ, out)
+					raw[i].delta = false
+					raw[i].done = true
+					progress = true
+				}
 			}
-			raw[i].typ = base.typ
-			raw[i].data = out
-			raw[i].id = HashObject(raw[i].typ, out)
-			raw[i].delta = false
-			raw[i].done = true
-			progress = true
 		}
 	}
 	for i := range raw {

@@ -307,6 +307,56 @@ func TestStatusIndexlessCloneDegradation(t *testing.T) {
 	_ = o
 }
 
+// TestHeadRefResolveTreeFilesParents covers the #2203 fetch/pull surface:
+// the ref name HEAD carries, arbitrary ref resolution, a tree map at a
+// commit that is NOT HEAD, and commit parent links.
+func TestHeadRefResolveTreeFilesParents(t *testing.T) {
+	root, o := fxBuild(t, false, true)
+	r, err := Open(osFS{}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, ok := r.HeadRef()
+	if !ok || name != "refs/heads/main" {
+		t.Fatalf("HeadRef = %q ok=%v", name, ok)
+	}
+	id, err := r.ResolveRef("refs/heads/main")
+	if err != nil || id != o.c2.ID {
+		t.Fatalf("ResolveRef = %x err=%v", id, err)
+	}
+	if _, err := r.ResolveRef("refs/heads/nonexistent"); err == nil {
+		t.Fatal("missing ref resolved")
+	}
+	// TreeFiles at c1 (NOT head): the c1 map predates the notes.txt change.
+	f1, err := r.TreeFiles(o.c1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f1) != 2 || f1["notes.txt"] != o.notes1.ID || f1["hello.txt"] != o.hello.ID {
+		t.Fatalf("c1 files = %+v", f1)
+	}
+	f2, err := r.TreeFiles(o.c2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f2["notes.txt"] != o.notes2.ID {
+		t.Fatalf("c2 files = %+v", f2)
+	}
+	parents, ok := CommitParents(o.c2.Data)
+	if !ok || len(parents) != 1 || parents[0] != o.c1.ID {
+		t.Fatalf("c2 parents = %v ok=%v", parents, ok)
+	}
+	parents, ok = CommitParents(o.c1.Data)
+	if !ok || len(parents) != 0 {
+		t.Fatalf("c1 parents = %v ok=%v", parents, ok)
+	}
+	// A detached HEAD has no ref name — pull must refuse it.
+	fxWrite(t, filepath.Join(root, ".git", "HEAD"), HexEncode(o.c2.ID[:])+"\n")
+	if _, ok := r.HeadRef(); ok {
+		t.Fatal("detached HEAD reported a ref name")
+	}
+}
+
 func TestParseIndexLayout(t *testing.T) {
 	id := HashObject(ObjBlob, []byte("x"))
 	ents := fxIndex([]IndexEntry{{Path: "hello.txt", Sha: id}, {Path: "sub/a", Sha: id}})

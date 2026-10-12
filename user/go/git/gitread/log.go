@@ -40,6 +40,13 @@ func parseCommit(data []byte) (tree [20]byte, parents [][20]byte, subject string
 	return tree, parents, "", true
 }
 
+// CommitParents returns the parent ids recorded in a raw commit body —
+// the ancestry links a pull's fast-forward check walks (#2203).
+func CommitParents(data []byte) ([][20]byte, bool) {
+	_, parents, _, ok := parseCommit(data)
+	return parents, ok
+}
+
 func indexByteByte(b []byte, c byte) int {
 	for i, v := range b {
 		if v == c {

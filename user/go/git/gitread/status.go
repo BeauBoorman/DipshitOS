@@ -30,9 +30,17 @@ func (r *Repo) headFiles() (map[string][20]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	c, ok := r.Get(head)
+	return r.TreeFiles(head)
+}
+
+// TreeFiles walks one commit's tree into rel-path -> blob sha. Gitlinks
+// (160000) are skipped; symlinks (120000) count as files. Pull needs the
+// map at BOTH endpoints — the checkout plan diffs HEAD's files against the
+// fetched commit's (#2203).
+func (r *Repo) TreeFiles(commit [20]byte) (map[string][20]byte, error) {
+	c, ok := r.Get(commit)
 	if !ok || c.Type != ObjCommit {
-		return nil, fsErr("head commit unreadable")
+		return nil, fsErr("commit unreadable")
 	}
 	tid, ok := CommitTree(c.Data)
 	if !ok {
