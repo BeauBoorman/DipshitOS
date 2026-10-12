@@ -268,6 +268,7 @@ func TestStartSurfaceRectAndHit(t *testing.T) {
 }
 
 func TestPaintStartSurfaceUsesTokens(t *testing.T) {
+	defer saveSeatState()() // the start surface lazily decodes the emblem now
 	const w, h = 1280, 720
 	scan := make([]byte, w*h*4)
 	tok := theme.Current

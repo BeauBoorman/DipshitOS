@@ -467,6 +467,7 @@ vgate_assert 03 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 03 serial-contains 'gotabwm: registered'
 vgate_assert 03 serial-contains 'gotabwm: tokens theme=dark bg=0x182026 surface=0x222d35 border=0x334155 accent=0x3b82f6'
 vgate_assert 03 serial-contains 'gotabwm: present'
+vgate_assert 03 serial-contains 'gotabwm: launcher emblem qoi 64x64'
 vgate_assert 03 serial-contains 'gotabwm: launcher open n='
 vgate_assert 03 serial-contains 'gotabwm: launcher filter q=calc n='
 vgate_assert 03 serial-contains 'gotabwm: launcher exec GOCALC.ELF'
@@ -1172,8 +1173,11 @@ echo rx-gotabwm-menu-ok
 EOF
 
 # Raw kind-4 pixels are the presented GUEST scanout, not the host VM view.
-# Three pinned glyph masks distinguish real title/named-row text from fills.
-# Save a PNG of those exact guest pixels as small local review evidence.
+# Three pinned glyph masks distinguish real prompt/row text from fills, and
+# a colour-count probe names the emblem raster (the #2054 strip's header:
+# 'W' of "Where do you want to go today?", row0 '6' of "64-bit Calc", row4
+# 'T' of "Terminal" — all docked at the strip's left edge). Save a PNG of
+# those exact guest pixels as small local review evidence.
 vgate_file menu-glyphs.py <<'PY'
 import os, pathlib, struct, sys, zlib
 raw = open(sys.argv[1], "rb").read()
@@ -1181,9 +1185,9 @@ W, H = 1280, 720
 if len(raw) != W * H * 4:
     sys.exit("missing full guest scanout")
 glyphs = [
-    ("Apps title A", 248, 86, [0x0c, 0x1e, 0x33, 0x33, 0x3f, 0x33, 0x33, 0]),
-    ("64-bit Calc C", 310, 122, [0x3c, 0x66, 3, 3, 3, 0x66, 0x3c, 0]),
-    ("Terminal T", 254, 218, [0x3f, 0x2d, 0x0c, 0x0c, 0x0c, 0x0c, 0x1e, 0]),
+    ("prompt W", 8, 88, [0x63, 0x63, 0x63, 0x6b, 0x7f, 0x77, 0x63, 0]),
+    ("64-bit Calc 6", 14, 146, [0x1c, 0x06, 3, 0x1f, 0x33, 0x33, 0x1e, 0]),
+    ("Terminal T", 14, 242, [0x3f, 0x2d, 0x0c, 0x0c, 0x0c, 0x0c, 0x1e, 0]),
 ]
 for name, x, y, rows in glyphs:
     def pixel(dx, dy):
@@ -1203,6 +1207,16 @@ for name, x, y, rows in glyphs:
             want = ink if bits & (1 << dx) else background
             if pixel(dx, dy) != want:
                 sys.exit("%s glyph mismatch at %d,%d" % (name, dx, dy))
+# The emblem slot (centred in the strip's header) must hold the mascot
+# raster, not the bordered "SB" fallback: a flat box has a handful of
+# colours, the real raster has dozens. Fade-in dimming shifts every colour
+# together, so distinctness survives it.
+seen = set()
+for dy in range(16, 80):
+    for dx in range(99, 163):
+        seen.add(raw[(dy * W + dx) * 4: (dy * W + dx) * 4 + 3])
+if len(seen) < 12:
+    sys.exit("emblem slot holds %d colours, not the mascot raster" % len(seen))
 def chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 rows = bytearray()
@@ -1217,11 +1231,13 @@ png += chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 out = "artifacts/go-wm-hid-menu-%s%s.png" % (
     pathlib.Path(sys.argv[1]).name.split("-")[1], os.environ.get("VIRELAI_GATE_SUFFIX", ""))
 open(out, "wb").write(png)
-print("guest menu glyph masks match; saved " + out)
+print("guest strip glyph masks + emblem raster match; saved " + out)
 PY
 
-# Existing editor -> Apps button -> header (no exec) -> named Calculator.
-# Held motion/release crosses the rail/content after exec and stays chrome.
+# Existing editor -> Apps button -> emblem press (no exec) -> row0 named
+# Calculator. Held motion/release crosses the rail/content after exec and
+# stays chrome. (#2054 strip coords: button at 272,702; the emblem is
+# (99..163,16..80); row0 sits at y=140.)
 vgate_run 11 -- \
     --screen '$RUN_DIR/screen-11' --via-virtio --cvc-snap \
     --snapshot-after 'gotabwm: launcher presented' \
@@ -1229,7 +1245,7 @@ vgate_run 11 -- \
     --script '$RUN_DIR/script-m87.txt' \
     --script2 '$RUN_DIR/script2-m87-edit.txt' \
     --script2-after 'gotabwm: win focus' \
-    --pointer-virtio '272,702,d;272,702,u;270,115,d;800,650;800,650,u;270,126,d;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;132,50,d;800,650;800,650,u;20,150,d;960,10;800,400,u' \
     --pointer-virtio-after 'goedit: present' \
     --script3 '$RUN_DIR/script3-m87.txt' \
     --script3-after 'gocalc: declare accepted' --script3-delay 8 \
@@ -1275,7 +1291,7 @@ vgate_run 12 -- \
     --script '$RUN_DIR/script-m87.txt' \
     --script2 '$RUN_DIR/script2-m87-shell.txt' \
     --script2-after 'gotabwm: win focus' \
-    --pointer-virtio '272,702,d;272,702,u;270,222,d;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;20,246,d;960,10;800,400,u' \
     --pointer-virtio-after 'gosh: declare accepted' \
     --input-string $'echo m87-terminal\n' \
     --input-string-after 'goterm: prompt' \
@@ -1322,7 +1338,7 @@ vgate_run 13 -- \
     --script '$RUN_DIR/script-m87.txt' \
     --script2 '$RUN_DIR/script2-m87-edit.txt' \
     --script2-after 'gotabwm: win focus' \
-    --pointer-virtio '272,702,d;272,702,u;270,115,d;270,115,u;800,650,d;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;132,50,d;132,50,u;800,650,d;960,10;800,400,u' \
     --pointer-virtio-after 'goedit: present' \
     --input-string 'calc' --input-string-after 'gotabwm: launcher open n=' \
     --input-chords 'ctrl-s' --input-chords-after 'gotabwm: launcher restore id=' \
@@ -1356,6 +1372,8 @@ print("real-focus dual-path negative: filtered while editor unfocused, restored,
 PY
 
 # M91: Escape is independently exercised on the real dual-path input seam.
+# #2054 AC-C4 makes it two-step on the live path: the first Escape clears
+# the typed query (the `q= ` filter marker), the second dismisses.
 vgate_run 14 -- \
     --screen '$RUN_DIR/screen-14' --via-virtio \
     --script '$RUN_DIR/script-m87.txt' \
@@ -1364,9 +1382,10 @@ vgate_run 14 -- \
     --pointer-virtio '272,702,d;272,702,u' \
     --pointer-virtio-after 'goedit: present' \
     --input-string 'calc' --input-string-after 'gotabwm: launcher open n=' \
-    --input-chords 'escape' \
+    --input-chords 'escape,escape' \
     --input-chords-after 'gotabwm: launcher filter q=calc n=1' \
     --script-expect 'gotabwm: launcher restore id=' --script-expect-tail 4 --timeout 120
+vgate_assert 14 serial-contains 'gotabwm: launcher filter q= n='
 vgate_assert 14 serial-contains 'gotabwm: launcher restore id='
 vgate_assert 14 serial-contains 'gotabwm: launcher dismiss'
 vgate_assert 14 share-equals EDIT/M87.TXT $'seed-line\n'
@@ -1400,7 +1419,7 @@ vgate_run 15 -- \
     --script '$RUN_DIR/script-m87.txt' \
     --script2 '$RUN_DIR/script2-m87-edit.txt' \
     --script2-after 'gotabwm: win focus' \
-    --pointer-virtio '272,702,d;272,702,u;241,150,d;241,150,u;270,150,d;270,150,u;270,438,d;270,438,u;800,650,d;800,650,u' \
+    --pointer-virtio '272,702,d;272,702,u;2,150,d;2,150,u;20,175,d;20,175,u;20,460,d;20,460,u;800,650,d;800,650,u' \
     --pointer-virtio-after 'goedit: present' \
     --script3 '$RUN_DIR/script-m91-unavailable.txt' \
     --script3-after 'gotabwm: launcher restore id=' \
@@ -1415,9 +1434,10 @@ vgate_assert 15 serial-absent 'exited status=139'
 vgate_assert 15 snapshot 'menu-15-*.raw' <<'PY'
 import pathlib, sys
 exec((pathlib.Path(sys.argv[1]).parent / "menu-glyphs.py").read_text())
-# Exact unavailable text, not just a gray rectangle: B in Binary not staged.
+# Exact unavailable text, not just a gray rectangle: B in Binary not staged,
+# under the dimmed NOTE label on strip row 1 (y=164; the reason sits at +13).
 rows = [0x3f, 0x66, 0x66, 0x3e, 0x66, 0x66, 0x3f, 0]
-x, y = 648, 146
+x, y = 14, 177
 def px(dx, dy):
     p = ((y + dy) * W + x + dx) * 4
     return raw[p:p+3]

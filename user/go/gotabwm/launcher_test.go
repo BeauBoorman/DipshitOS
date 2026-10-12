@@ -2,10 +2,12 @@ package main
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/webrender/qoi"
 )
 
 // Ordinary window/focus/close seams, not a mocked "key consumed" claim.
@@ -84,29 +86,197 @@ func TestLauncherPaintsLabelsQueryAndUnavailableState(t *testing.T) {
 	if paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight) == 0 {
 		t.Fatal("no panel paint")
 	}
+	// #2054: a left-edge strip, not the centred panel. Header top-down is
+	// emblem, prompt, filter field, error line, then the ranked column.
 	for _, r := range []struct {
 		name       string
 		x, y, w, h int
 		ink        uint32
 	}{
-		{"title", launchX + theme.Current.PadMD, launchY + 6, 32, 8, theme.Current.Ink},
-		{"query", launchX + theme.Current.PadMD + 64, launchY + 20, 32, 8, theme.Current.InkMuted},
-		{"label", launchX + theme.Current.PadMD + 6, launchY + launchHdr + 6, 64, 8, theme.Current.InkMuted},
-		{"unavailable", launchX + theme.Current.PadMD + 400, launchY + launchHdr + 6, 136, 8, theme.Current.InkMuted},
-		{"error", launchX + 160, launchY + 6, 184, 8, theme.Current.Danger},
+		{"strip", 0, 0, 8, 8, theme.Current.Surface},
+		{"emblem fallback", 99, 16, 64, 1, theme.Current.Border},
+		{"prompt", 8, 88, 32, 8, theme.Current.Ink},
+		{"field", 8, 104, 246, 1, theme.Current.Border},
+		{"query", 14, 110, 32, 8, theme.Current.Ink},
+		{"error", 8, 128, 200, 8, theme.Current.Danger},
 	} {
 		if countLaunchInk(scan, r.x, r.y, r.w, r.h, r.ink) < 10 {
 			t.Fatalf("%s has no glyph pixels", r.name)
 		}
 	}
-	x, y, _, _, _ := launch.rowRect(0, vi.ScanoutWidth, vi.ScanoutHeight)
+	if countLaunchInk(scan, 262, 0, 2, 400, theme.Current.Accent) != 800 {
+		t.Fatal("the strip's right-edge accent rule is missing")
+	}
+	for py := 100; py < 110; py++ {
+		for px := 264; px < vi.ScanoutWidth; px++ {
+			i := (py*vi.ScanoutWidth + px) * 4
+			if scan[i] != 0 || scan[i+1] != 0 || scan[i+2] != 0 || scan[i+3] != 0 {
+				t.Fatalf("launcher pixels leaked past the strip into the desktop at (%d,%d)", px, py)
+			}
+		}
+	}
+	x, y, _, _, ok := launch.rowRect(0, vi.ScanoutWidth, vi.ScanoutHeight)
+	if !ok || x != 8 || y != 140 {
+		t.Fatal("the ranked column does not start under the header")
+	}
 	if countLaunchInk(scan, x, y, 4, 4, theme.Current.Selection) != 16 {
 		t.Fatal("selected row not painted")
 	}
+	if countLaunchInk(scan, x+6, y+3, 32, 8, theme.Current.InkMuted) < 10 {
+		t.Fatal("dimmed label ink missing")
+	}
+	if countLaunchInk(scan, x+6, y+13, 32, 8, theme.Current.Muted) < 10 {
+		t.Fatal("unavailable reason missing")
+	}
 	launch.filtered, launch.err = nil, ""
 	paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	if countLaunchInk(scan, launchX+theme.Current.PadMD, launchY+launchHdr+6, 120, 8, theme.Current.InkMuted) < 10 {
+	if countLaunchInk(scan, 8, 146, 120, 8, theme.Current.InkMuted) < 10 {
 		t.Fatal("no-match glyphs missing")
+	}
+}
+
+// TestLauncherStripIsDockedToTheLeftEdge is the AC-B2 geometry contract: the
+// strip owns the scanout's left edge for its full height. The centred panel
+// it replaces (x=240, content-height) fails every clause.
+func TestLauncherStripIsDockedToTheLeftEdge(t *testing.T) {
+	defer saveSeatState()()
+	if launchX != 0 || launchY != 0 {
+		t.Fatal("the strip must dock the scanout's top-left corner")
+	}
+	launch = launcherState{open: true}
+	if launch.panelH() != vi.ScanoutHeight {
+		t.Fatal("a docked edge strip is full height, not content-sized")
+	}
+}
+
+// TestLauncherHeaderCarriesTheEmblemRaster stages the repo's mascot fixture
+// at the emblem's share path through the same read seam APPS.TXT uses, then
+// checks the strip's emblem slot pixel-for-pixel: opaque source pixels
+// composite exactly, transparent corners leave the Surface showing — the
+// real raster, not a rect-drawn stand-in (AC-B1).
+func TestLauncherHeaderCarriesTheEmblemRaster(t *testing.T) {
+	defer saveSeatState()()
+	// Other suites paint the chrome first and may have already spent the
+	// one-shot decode on the real (absent) share; the fresh launcherState
+	// below carries a zeroed emblem, so the decode tries again against the
+	// fixture.
+	body, err := os.ReadFile("../../src/lib/fixtures/qoi/mascot_64x64.qoi")
+	if err != nil {
+		t.Fatalf("mascot fixture: %v", err)
+	}
+	old := readAppsFile
+	readAppsFile = func(path string, max int) ([]byte, int64) {
+		if path == "/host/SEXIBURGER.QOI" {
+			return body, int64(len(body))
+		}
+		return []byte("GOCALC.ELF | Calculator | c\n"), 0
+	}
+	defer func() { readAppsFile = old }()
+	w, h, src, derr := qoi.Decode(body, 256, 256*256)
+	if derr != nil {
+		t.Fatalf("fixture does not decode: %v", derr)
+	}
+	launch = launcherState{
+		open:     true,
+		catalog:  []AppEntry{{Bin: "GOCALC.ELF", Label: "Calculator"}},
+		filtered: []int{0},
+	}
+	scan := launcherScan()
+	paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	x0, y0 := launchX+(264-2-w)/2, 16
+	opaque, transparent := 0, 0
+	for r := 0; r < h; r++ {
+		for c := 0; c < w; c++ {
+			s := src[r*w+c]
+			i := ((y0+r)*vi.ScanoutWidth + x0 + c) * 4
+			got := uint32(scan[i]) | uint32(scan[i+1])<<8 | uint32(scan[i+2])<<16
+			switch s >> 24 {
+			case 255:
+				opaque++
+				if got != s&0xffffff {
+					t.Fatalf("emblem pixel (%d,%d) painted %06x, want %06x", c, r, got, s&0xffffff)
+				}
+			case 0:
+				transparent++
+				if got != theme.Current.Surface {
+					t.Fatalf("transparent emblem pixel (%d,%d) painted %06x over the Surface", c, r, got)
+				}
+			}
+		}
+	}
+	if opaque < 1000 || transparent == 0 {
+		t.Fatalf("emblem slot does not hold the real raster: opaque=%d transparent=%d", opaque, transparent)
+	}
+}
+
+// TestLauncherRanksPrefixSubstringThenFuzzy is AC-C1/C2: a prefix hit
+// outranks a substring hit, a substring outranks a fuzzy reach, and the same
+// (catalog, query) refreshes to the identical order every time. The old
+// manifest-order filter leaves row 0 first — this fails on it.
+func TestLauncherRanksPrefixSubstringThenFuzzy(t *testing.T) {
+	defer saveSeatState()()
+	launch = launcherState{open: true}
+	launch.catalog = parseAppsTXT(
+		"EDITCAL.ELF | Editor Calc | e\n" + // substring only
+			"GOCALC.ELF | Calc | c\n" + // prefix — manifest row 1, must rank first
+			"CARNIVAL.ELF | Carnival Clock | k\n" + // fuzzy: c-a-l-c subsequence
+			"RUNNER.ELF | Runner | r | dock=false | argv=--calc-mode\n" + // fuzzy via argv=
+			"GOFILES.ELF | Files | f\n")
+	launch.filter = "calc"
+	want := []int{1, 0, 2, 3}
+	for i := 0; i < 100; i++ {
+		launch.refresh()
+		if len(launch.filtered) != len(want) {
+			t.Fatalf("refresh %d ranked %v, want %v", i, launch.filtered, want)
+		}
+		for j, v := range want {
+			if launch.filtered[j] != v {
+				t.Fatalf("refresh %d ranked %v, want %v", i, launch.filtered, want)
+			}
+		}
+	}
+}
+
+// TestLauncherEscapeClearsTheFilterFirst is AC-C4: with a non-empty filter
+// Esc edits the query, not the panel. Only an already-clear Esc dismisses.
+func TestLauncherEscapeClearsTheFilterFirst(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	tabs = TabStrip{}
+	tabs.OpenTab(3, "Edit")
+	launch = launcherState{}
+	openLauncher()
+	for _, usage := range []uint32{0x06, 0x04} {
+		handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: usage})
+	}
+	if launch.filter != "ca" {
+		t.Fatalf("filter = %q", launch.filter)
+	}
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
+	if !launch.open || launch.filter != "" {
+		t.Fatal("the first Esc must clear the filter and keep the strip open")
+	}
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
+	if launch.open {
+		t.Fatal("the second Esc must dismiss")
+	}
+}
+
+// TestLauncherChordDismissesAnOpenStrip is AC-A2: the same chord that
+// summons the strip dismisses it — one front door, both directions.
+func TestLauncherChordDismissesAnOpenStrip(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	tabs = TabStrip{}
+	tabs.OpenTab(3, "Edit")
+	launch = launcherState{}
+	openLauncher()
+	if !launch.open {
+		t.Fatal("summon failed")
+	}
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageSpace), Flags: vi.ModCtrl})
+	if launch.open {
+		t.Fatal("Ctrl+Space while open must dismiss")
 	}
 }
 
@@ -254,7 +424,7 @@ func TestLauncherPointerExecOnce(t *testing.T) {
 	}
 	scan := launcherScan()
 	paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	if countLaunchInk(scan, launchX+160, launchY+6, 200, 8, theme.Current.Danger) < 10 {
+	if countLaunchInk(scan, 8, 128, 200, 8, theme.Current.Danger) < 10 {
 		t.Fatal("failure has no visible glyphs")
 	}
 }
@@ -371,6 +541,12 @@ func TestLauncherEscapeRestoresFocusWithoutInterpretingSinkCopies(t *testing.T) 
 	}
 	if launch.filter != "calc" {
 		t.Fatal("modal filter interpreted the app-side copy")
+	}
+	// #2054 AC-C4: the first Esc clears "calc", the second dismisses and
+	// restores focus to the tab that owned it before the summon.
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
+	if !launch.open || launch.filter != "" {
+		t.Fatal("the first Escape must clear the filter, not dismiss")
 	}
 	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
 	if launch.open || launch.sink != 0 || len(*closes) != 1 || (*raises)[len(*raises)-1] != 3 {

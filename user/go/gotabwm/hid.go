@@ -541,11 +541,11 @@ func handleWmPointer(e vi.Event) {
 	// finds. The launcher's block returns early for every button, so a
 	// press on a toast that fired while the launcher was open used to be
 	// swallowed there — it neither clicked the toast nor reached content,
-	// it just closed the launcher under a toast the user could see. The
-	// two rects are disjoint at 1280x720 anyway (the launcher panel starts
-	// at launchX=240, the toast column ends at 216), so hoisting changes
-	// no press outside a toast; TestToastHitPrecedesTheLauncher pins the
-	// order rather than the coincidence.
+	// it just closed the launcher under a toast the user could see. With
+	// the #2054 left-edge strip the two rects DO overlap (the strip is
+	// x<launchW, the toast column x<216), which makes the order load-
+	// bearing rather than a coincidence: the toast is painted last, so
+	// the press finds it first. TestToastHitPrecedesTheLauncher pins it.
 	if down {
 		if notifyCenterClick(px, py) {
 			return

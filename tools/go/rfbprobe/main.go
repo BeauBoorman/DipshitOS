@@ -29,6 +29,12 @@ const (
 	contentX = 88
 	contentY = 158
 
+	// Plain desktop past the launcher strip's right edge (#2054: the strip
+	// owns x<264, so the old x=100 point is INSIDE it now): a press here
+	// dismisses the open launcher.
+	dismissX = 800
+	dismissY = 600
+
 	// Exit status of a viewer that dies without closing its socket. The
 	// runner answers a non-zero exit with a TCP RST toward the guest.
 	diedStatus = 3
@@ -197,11 +203,11 @@ func probe(r io.Reader, w io.Writer) error {
 	}
 	fmt.Fprintln(os.Stderr, "RFBPROBE: Calc BtnIdle 16x16 pixels = #2d3748")
 
-	// Ctrl+Space opens the seat launcher. A left press OUTSIDE its panel
+	// Ctrl+Space opens the seat launcher. A left press OUTSIDE its strip
 	// dismisses it. They traverse the same kind-21/19 path as local input.
 	return write(w, concat(
 		key(true, 0xffe3), key(true, ' '), key(false, ' '), key(false, 0xffe3),
-		pointer(1, 100, 600), pointer(0, 100, 600),
+		pointer(1, dismissX, dismissY), pointer(0, dismissX, dismissY),
 	))
 }
 

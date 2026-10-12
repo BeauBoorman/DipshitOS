@@ -18,7 +18,7 @@ func TestInputWireShapes(t *testing.T) {
 	if got := key(true, 0xffe3); !bytes.Equal(got, []byte{4, 1, 0, 0, 0, 0, 0xff, 0xe3}) {
 		t.Fatalf("Ctrl_L: %x", got)
 	}
-	if got := pointer(1, 100, 600); !bytes.Equal(got, []byte{5, 1, 0, 100, 2, 88}) {
+	if got := pointer(1, dismissX, dismissY); !bytes.Equal(got, []byte{5, 1, 3, 32, 2, 88}) {
 		t.Fatalf("pointer: %x", got)
 	}
 }
@@ -42,7 +42,7 @@ func TestProbeNegotiatesAndRequestsRealPixels(t *testing.T) {
 	b := out.Bytes()
 	if !bytes.HasPrefix(b, []byte("RFB 003.008\n")) ||
 		!bytes.Contains(b, []byte{3, 0, 0, patchX, 0, patchY, 0, patchW, 0, patchH}) ||
-		!bytes.HasSuffix(b, pointer(0, 100, 600)) {
+		!bytes.HasSuffix(b, pointer(0, dismissX, dismissY)) {
 		t.Fatalf("client did not request pixels and send input: %x", b)
 	}
 }

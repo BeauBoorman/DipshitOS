@@ -761,6 +761,11 @@ func TestLauncherCtrlSpaceToggleAndFilter(t *testing.T) {
 	if len(launch.filtered) != 1 || launch.catalog[launch.filtered[0]].Bin != "GOCALC.ELF" {
 		t.Fatalf("filtered = %v", launch.filtered)
 	}
+	// #2054 AC-C4: Esc is two-step — clear the typed query, then dismiss.
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
+	if !launch.open || launch.filter != "" {
+		t.Fatal("the first escape must clear the filter, not dismiss")
+	}
 	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
 	if launch.open {
 		t.Fatal("escape must dismiss")
@@ -1168,11 +1173,10 @@ func TestHandleWmPointerPressOnToastIsChrome(t *testing.T) {
 // strip is painted LAST, so a press on a toast has to be found FIRST. The
 // launcher's own block returns early for every button, which meant a press on
 // a toast that fired while the launcher was open never reached the toast at
-// all — it closed the launcher under a toast the user could plainly see. The
-// two rects happen to be disjoint at 1280x720 (the launcher panel starts at
-// launchX, the toast column ends at 216), so what this pins is the ORDER and
-// not that coincidence: widen the strip or move the launcher and the order is
-// still right.
+// all — it closed the launcher under a toast the user could plainly see. With
+// the #2054 left-edge strip the rects genuinely overlap (toast x<216 is inside
+// the strip's x<launchW), so the press below is not just order-pinned, it is a
+// real overlapping rect the order decides.
 func TestToastHitPrecedesTheLauncher(t *testing.T) {
 	defer saveSeatState()()
 	resetNotify(t)
@@ -1208,13 +1212,15 @@ func TestToastHitPrecedesTheLauncher(t *testing.T) {
 	}
 
 	// A press that is NOT on a toast still belongs to the launcher, exactly
-	// as before: on the empty desktop beside the strip it dismisses it.
+	// as before: on the empty desktop past the strip's right edge it
+	// dismisses it. The point is past launchW — inside the strip it would
+	// be panel chrome, not an outside click.
 	handleWmPointer(vi.Event{Kind: vi.EvWmPointer, Arg0: uint32(x+pw/2) | uint32(y+ph/2)<<16, Flags: 0})
 	handleWmPointer(vi.Event{Kind: vi.EvWmPointer,
-		Arg0:  uint32(x+pw/2) | uint32(y+ph+2)<<16,
+		Arg0:  uint32(launchW+136) | uint32(y+ph+2)<<16,
 		Flags: uint16(hidBtnLeft)})
 	if launch.open {
-		t.Fatal("a press on the desktop beside the toast no longer reaches the launcher")
+		t.Fatal("a press on the desktop past the strip no longer reaches the launcher")
 	}
 }
 

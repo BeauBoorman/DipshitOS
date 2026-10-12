@@ -125,11 +125,21 @@ func paintGodMenuButton(scan []byte, width, height int) int {
 	tok := theme.Current
 	n := fillRect(pix, width, height, x, y, w, h, tok.ChromeBg)
 	n += fillRect(pix, width, height, x, y, 2, h, tok.Accent)
-	label, ink := "Apps", tok.Ink
-	if launch.err != "" && !launch.open {
-		label, ink = "Apps error", tok.Danger
+	// #2054: the button's icon is the sexiburger itself — the same raster
+	// the launcher strip carries, so the click target and the chord name
+	// the same front door. 16px = the 64px decode at factor 4.
+	tx := x + chromePad
+	if icon := emblemScaled(4); icon != nil {
+		n += blitImage(pix, width, height, icon, 16, 16, x+4, y+2)
+		tx = x + 24
 	}
-	n += drawText8(pix, width, height, x+chromePad, y+chromePad, label, ink)
+	// A failed open shows the same label in Danger — the icon leaves no
+	// room for the old "Apps error" tail.
+	ink := tok.Ink
+	if launch.err != "" && !launch.open {
+		ink = tok.Danger
+	}
+	n += drawText8(pix, width, height, tx, y+chromePad, "Apps", ink)
 	return n
 }
 
@@ -397,6 +407,12 @@ func paintStartSurface(scan []byte, width, height int) int {
 	// The same 2px accent rule the clock panel carries: one seat identity.
 	written += fillRect(pix, width, maxH, x, y, 2, h, tok.Accent)
 	tx, ty := x+startPad, y+startPad
+	// #2054: the avatar is the front door here too — the start surface is
+	// the launcher's pointer affordance, so it carries the same emblem.
+	if icon := emblemScaled(2); icon != nil {
+		written += blitImage(pix, width, maxH, icon, 32, 32, tx, ty+4)
+		tx += 40
+	}
 	written += drawText8(pix, width, maxH, tx, ty, statusText, tok.Ink)
 	written += drawText8(pix, width, maxH, tx, ty+startLineGap, startHint, tok.InkMuted)
 	return written

@@ -91,7 +91,7 @@ vgate_assert 01 output-contains 'NET-TCP-STREAM: probe exited status=0'
 vgate_assert 01 output-contains 'NET-TCP-STREAM: the viewer closed; sent FIN'
 vgate_assert 01 serial-contains 'gotabwm: launcher open n='
 vgate_assert 01 serial-contains 'gotabwm: rfb key usage=44'
-vgate_assert 01 serial-contains 'gotabwm: rfb pointer x=100 y=600 buttons=1'
+vgate_assert 01 serial-contains 'gotabwm: rfb pointer x=800 y=600 buttons=1'
 vgate_assert 01 serial-contains 'gotabwm: launcher dismiss'
 vgate_assert 01 serial-contains 'gotabwm: rfb drop peer'
 # Over the cap: the kernel has one connection and refuses a second peer's
@@ -108,7 +108,7 @@ from rfborder import texts, ordered, probe_ok
 ser, out = texts()
 ordered(ser, ("gocalc: present", "gotabwm: rfb ready", "gotabwm: rfb frame",
               "gotabwm: launcher open n=", "gotabwm: rfb key usage=44",
-              "gotabwm: launcher dismiss", "gotabwm: rfb pointer x=100 y=600 buttons=1"))
+              "gotabwm: launcher dismiss", "gotabwm: rfb pointer x=800 y=600 buttons=1"))
 ordered(ser, ("gotabwm: rfb ready", "gotabwm: rfb drop peer", "gotabwm: rfb done"))
 probe_ok(out)
 if "NET-TCP-INTRUDER: the guest refused (RST)" not in out:
@@ -168,7 +168,7 @@ vgate_run 03 -- \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
     --input-chords 'ctrl-space' --input-chords-after 'gotabwm: rfb release x=' \
-    --pointer-virtio '100,600,d;100,600,u' --pointer-virtio-after 'gotabwm: launcher open n=' \
+    --pointer-virtio '800,600,d;800,600,u' --pointer-virtio-after 'gotabwm: launcher open n=' \
     --script-expect 'gotabwm: launcher dismiss' --script-expect-tail 3 --timeout 160
 
 vgate_assert 03 serial-contains 'gotabwm: rfb ready'
@@ -205,7 +205,7 @@ vgate_run 04 -- \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
     --input-chords 'ctrl-space' --input-chords-after 'gotabwm: rfb ready' \
-    --pointer-virtio '100,600,d;100,600,u' --pointer-virtio-after 'gotabwm: launcher open n=' \
+    --pointer-virtio '800,600,d;800,600,u' --pointer-virtio-after 'gotabwm: launcher open n=' \
     --script-expect 'gotabwm: rfb done' --script-expect-tail 4 --timeout 160
 
 vgate_assert 04 serial-contains 'gotabwm: rfb ready'
@@ -237,7 +237,7 @@ vgate_run 05 -- \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
     --input-chords 'ctrl-space' --input-chords-after 'gotabwm: rfb release x=' \
-    --pointer-virtio '100,600,d;100,600,u' --pointer-virtio-after 'gotabwm: launcher open n=' \
+    --pointer-virtio '800,600,d;800,600,u' --pointer-virtio-after 'gotabwm: launcher open n=' \
     --script-expect 'gotabwm: launcher dismiss' --script-expect-tail 3 --timeout 160
 
 vgate_assert 05 serial-contains 'gotabwm: rfb pointer x=88 y=158 buttons=1'
@@ -273,7 +273,7 @@ vgate_run 06 -- \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
-    --pointer-virtio '100,600,d;100,600,u' --pointer-virtio-after 'gotabwm: rfb done' \
+    --pointer-virtio '800,600,d;800,600,u' --pointer-virtio-after 'gotabwm: rfb done' \
     --script-expect 'gotabwm: launcher dismiss' --script-expect-tail 3 --timeout 160
 
 vgate_assert 06 serial-contains 'gotabwm: launcher open n='
