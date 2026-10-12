@@ -235,6 +235,200 @@ func TestGlyphRunPaintsLettersNotBars(t *testing.T) {
 	}
 }
 
+// --- TextInput (issue #2197) -------------------------------------------------
+
+// An unfocused field eats nothing — the app owns focus.
+func TestTextInputIgnoresKeysUntilFocused(t *testing.T) {
+	in := &TextInput{R: Rect{0, 0, 80, 20}}
+	if in.HandleKey(0, 'a') || in.HandleKey(keyLeft, 0) || in.HandleKey(keyBackspace, 0) {
+		t.Fatal("an unfocused field must ignore every key")
+	}
+	in.Focused = true
+	if !in.HandleKey(0, 'a') {
+		t.Fatal("a focused field must accept printable input")
+	}
+	if in.Value() != "a" || in.Caret() != 1 {
+		t.Fatalf("value=%q caret=%d, want a/1", in.Value(), in.Caret())
+	}
+}
+
+// Insert lands at the caret, not the end — the state machine's core move.
+func TestTextInputInsertsAtCaret(t *testing.T) {
+	in := &TextInput{Focused: true}
+	in.HandleKey(0, 'a')
+	in.HandleKey(0, 'c')
+	in.HandleKey(keyLeft, 0)
+	if !in.HandleKey(0, 'b') {
+		t.Fatal("insert at caret refused")
+	}
+	if in.Value() != "abc" || in.Caret() != 2 {
+		t.Fatalf("value=%q caret=%d, want abc/2", in.Value(), in.Caret())
+	}
+}
+
+// Backspace removes before the caret, Delete removes under it, and both clamp
+// at the ends without lying about a change.
+func TestTextInputBackspaceAndDelete(t *testing.T) {
+	in := &TextInput{Focused: true}
+	in.SetValue("abc")
+	in.HandleKey(keyLeft, 0) // caret 2
+	if !in.HandleKey(keyBackspace, 0) {
+		t.Fatal("backspace refused")
+	}
+	if in.Value() != "ac" || in.Caret() != 1 {
+		t.Fatalf("after backspace value=%q caret=%d", in.Value(), in.Caret())
+	}
+	in.HandleKey(keyHome, 0)
+	if !in.HandleKey(keyDelete, 0) {
+		t.Fatal("forward delete refused")
+	}
+	if in.Value() != "c" || in.Caret() != 0 {
+		t.Fatalf("after delete value=%q caret=%d", in.Value(), in.Caret())
+	}
+	if in.HandleKey(keyBackspace, 0) {
+		t.Fatal("backspace at offset 0 must report no change")
+	}
+	if in.HandleKey(keyEnd, 0) && in.Value() != "c" {
+		t.Fatal("end must not edit")
+	}
+	if in.HandleKey(keyDelete, 0) {
+		t.Fatal("delete at end of buffer must report no change")
+	}
+	// The 0x08 character fallback behaves like the backspace usage.
+	in.HandleKey(0, 'x')
+	if !in.HandleKey(0, 0x08) {
+		t.Fatal("0x08 must backspace")
+	}
+	if in.Value() != "c" {
+		t.Fatalf("value=%q after char backspace, want c", in.Value())
+	}
+}
+
+// Navigation clamps at both ends and reports no-change honestly.
+func TestTextInputNavigationClamps(t *testing.T) {
+	in := &TextInput{Focused: true}
+	in.SetValue("ab")
+	if !in.HandleKey(keyHome, 0) || in.Caret() != 0 {
+		t.Fatal("home must move to 0")
+	}
+	if in.HandleKey(keyLeft, 0) || in.HandleKey(keyHome, 0) {
+		t.Fatal("left/home at 0 must report no change")
+	}
+	if !in.HandleKey(keyEnd, 0) || in.Caret() != 2 {
+		t.Fatal("end must move past the last byte")
+	}
+	if in.HandleKey(keyRight, 0) || in.HandleKey(keyEnd, 0) {
+		t.Fatal("right/end at len must report no change")
+	}
+}
+
+// The buffer is bounded: inserts past Max are refused, and SetValue clamps.
+func TestTextInputBoundsBuffer(t *testing.T) {
+	in := &TextInput{Focused: true, Max: 3}
+	in.HandleKey(0, 'a')
+	in.HandleKey(0, 'b')
+	in.HandleKey(0, 'c')
+	if in.HandleKey(0, 'd') {
+		t.Fatal("a full buffer must refuse the insert")
+	}
+	if in.Value() != "abc" {
+		t.Fatalf("value=%q, want abc", in.Value())
+	}
+	in.SetValue("012345")
+	if in.Value() != "012" || in.Caret() != 3 {
+		t.Fatalf("SetValue clamp = %q caret=%d", in.Value(), in.Caret())
+	}
+}
+
+// Printable ASCII only: control codes and high bytes are not text.
+func TestTextInputPrintableASCIIOnly(t *testing.T) {
+	in := &TextInput{Focused: true}
+	for _, ch := range []byte{0x00, 0x01, 0x1f, '\t', 0x7f, 0x80, 0xff} {
+		if in.HandleKey(0, ch) {
+			t.Fatalf("byte %#x must be rejected", ch)
+		}
+	}
+	if in.Value() != "" {
+		t.Fatalf("non-printables leaked into the buffer: %q", in.Value())
+	}
+	if !in.HandleKey(0, ' ') || !in.HandleKey(0, '~') {
+		t.Fatal("space and tilde are printable and must insert")
+	}
+	if in.Value() != " ~" {
+		t.Fatalf("value=%q, want \" ~\"", in.Value())
+	}
+}
+
+// Enter fires OnSubmit with the text; Escape fires OnCancel. Both usages and
+// both byte encodings work, and a nil callback makes the key inert.
+func TestTextInputSubmitAndCancel(t *testing.T) {
+	var got string
+	submitted, cancelled := false, false
+	in := &TextInput{Focused: true}
+	in.SetValue("needle")
+	in.OnSubmit = func(s string) { submitted, got = true, s }
+	in.OnCancel = func() { cancelled = true }
+	if !in.HandleKey(keyEnter, 0) || !submitted || got != "needle" {
+		t.Fatalf("submit=%v got=%q", submitted, got)
+	}
+	if !in.HandleKey(keyEscape, 0) || !cancelled {
+		t.Fatal("escape must fire OnCancel")
+	}
+	// '\n' and 0x1b encodings fire the same callbacks.
+	submitted, cancelled = false, false
+	in.HandleKey(0, '\n')
+	in.HandleKey(0, 0x1b)
+	if !submitted || !cancelled {
+		t.Fatal("byte encodings of Enter/Escape must fire the callbacks")
+	}
+	// Nil callbacks: the key is inert, not a fake state change.
+	bare := &TextInput{Focused: true}
+	if bare.HandleKey(keyEnter, 0) || bare.HandleKey(keyEscape, 0) {
+		t.Fatal("Enter/Escape with no callback must report no change")
+	}
+}
+
+func TestTextInputHitTestAgreement(t *testing.T) {
+	in := &TextInput{R: Rect{10, 10, 80, 20}}
+	gridAgreement(t, in, 5, 5, 95, 35)
+}
+
+// Draw paints the plate and, when focused, a caret bar inside it at the
+// caret's glyph cell — the same inset drawGlyphRun uses.
+func TestTextInputDrawPaintsPlateAndCaret(t *testing.T) {
+	in := &TextInput{R: Rect{0, 0, 80, 20}, Focused: true}
+	in.SetValue("ab")
+	c := &recordingCanvas{}
+	in.Draw(c)
+	if len(c.fills) == 0 || c.fills[0].r != in.R {
+		t.Fatalf("first fill must be the border plate %+v", c.fills)
+	}
+	var caret *Rect
+	for i := range c.fills {
+		if c.fills[i].rgb == theme.Current.Caret {
+			rr := c.fills[i].r
+			caret = &rr
+		}
+	}
+	if caret == nil {
+		t.Fatal("a focused field must paint a caret")
+	}
+	// caret = inner.X + 2 + 2 glyphs * 8px; inner is the plate inset BorderW.
+	wantX := in.R.X + theme.Current.BorderW + 2 + 2*8
+	if caret.X != wantX || caret.W != 2 {
+		t.Fatalf("caret rect = %+v, want x=%d w=2", caret, wantX)
+	}
+	// Unfocused: no caret ink.
+	in.Focused = false
+	c = &recordingCanvas{}
+	in.Draw(c)
+	for _, f := range c.fills {
+		if f.rgb == theme.Current.Caret {
+			t.Fatal("an unfocused field must not paint a caret")
+		}
+	}
+}
+
 func TestRectHelpers(t *testing.T) {
 	r := Rect{10, 10, 20, 20}
 	if !r.Contains(10, 10) || r.Contains(30, 10) || r.Contains(10, 30) {

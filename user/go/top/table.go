@@ -63,10 +63,14 @@ type Proc struct {
 type Table struct {
 	raw   []vi.ProcRow // snapshot scratch (never reallocated)
 	rows  []Proc       // decoded, in snapshot (id) order
-	order []int        // display order: indices into rows, sorted by the column
+	order []int        // display order: indices into rows, filtered + sorted
 	sel   int          // index into order; -1 = nothing selected
 	col   Column
 	asc   bool
+
+	// filter is the live name substring (TOP.BIN's C8 filter, restored by
+	// issue #2197). "" shows every row.
+	filter string
 
 	// self and seats are what the DEFAULT aim skips — see defaultAim.
 	self  string
@@ -128,6 +132,9 @@ func (t *Table) Rebuild() {
 func (t *Table) rebuildWith(prevPID uint64, hadPrev bool) {
 	t.order = t.order[:0]
 	for i := range t.rows {
+		if !nameContains(t.rows[i].Name, t.filter) {
+			continue
+		}
 		t.order = append(t.order, i)
 	}
 	for j := 1; j < len(t.order); j++ {
@@ -316,6 +323,46 @@ func (t *Table) MoveBy(delta int) bool {
 	}
 	t.sel = next
 	return true
+}
+
+// SetFilter is TOP's C8 text filter restored (issue #2197): the display view
+// narrows to rows whose name contains the text, case-insensitively, and an
+// empty string shows the whole table again. It applies live — the same
+// rebuild a sort uses — so the selection keeps its pid while the row still
+// matches and falls back to the usual default aim when it does not.
+func (t *Table) SetFilter(s string) {
+	if s == t.filter {
+		return
+	}
+	t.filter = s
+	t.Rebuild()
+}
+
+// Filter is the active substring ("" = unfiltered).
+func (t *Table) Filter() string { return t.filter }
+
+// nameContains is top.zig's name_contains: a case-insensitive substring test
+// where the empty needle matches everything.
+func nameContains(haystack, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	if len(needle) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		ok := true
+		for j := 0; j < len(needle); j++ {
+			if asciiLower(haystack[i+j]) != asciiLower(needle[j]) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 // SortBy activates a column: the same column flips direction, a new one starts

@@ -18,10 +18,17 @@
 # kernel's own `tasks user-exec exited status=137` (the kill's consequence),
 # so a boot in which the kill never landed cannot reach the echo.
 #
+# Run 02 (issue #2197) is the filter leg: TOP.BIN's retired text filter is
+# back on the Go kit's widgets.TextInput. `/` opens the field, typed text
+# live-narrows the table (the row dump then shows only matching names), Enter
+# commits it, `/` reopens the committed text and Escape clears it -- the full
+# list returns. The leg fails before the widget exists: none of its `top:
+# filter*` markers are ever printed.
+#
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-gotop.sh   ->  .build/go/GOTOP.ELF
 
-vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ"
+vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -44,6 +51,13 @@ vgate_file script3.txt <<'EOF'
 procs
 dui close 2
 echo rx-gotop-ok
+EOF
+
+# Run 02's close rides on the filter's own last marker: the clear is on the
+# serial log before the window goes away.
+vgate_file script3f.txt <<'EOF'
+dui close 2
+echo rx-gotop-filter-ok
 EOF
 
 vgate_setup_python <<'PY'
@@ -104,10 +118,87 @@ if killed is None:
              % (pid, "; ".join(cands) or "nothing"))
 if killed < listed:
     sys.exit("FAIL: the kill preceded the listing it names")
-after = sum(1 for l in lines[killed + 1:] if "counter: alive" in l)
+# SMP caveat (observed 2026-10-12): sys_kill only ARMS the task — the
+# kill_pending flag converts to status 137 at the counter's next resume — so
+# a counter mid-quantum on another core can land ONE more `counter: alive`
+# between the arm marker and its exit report. The hard invariant is zero
+# markers after the kernel's own `exited status=137`: a dead task cannot
+# print.
+exit_line = next((i for i, l in enumerate(lines)
+                  if i > killed and "exited status=137" in l), None)
+if exit_line is None:
+    sys.exit("FAIL: no exit report follows the kill marker")
+after = sum(1 for l in lines[exit_line + 1:] if "counter: alive" in l)
 if after != 0:
-    sys.exit("FAIL: the killed process produced %d markers after the kill" % after)
+    sys.exit("FAIL: the killed process produced %d markers after its exit report" % after)
+inflight = sum(1 for l in lines[killed + 1:exit_line] if "counter: alive" in l)
+if inflight > 1:
+    sys.exit("FAIL: %d markers between arm and exit — at most one in-flight "
+             "tick is explainable" % inflight)
 if not re.search(r"procs: id=%s name=COUNTER\.BIN .*state=exited .*exit=137" % pid, ser):
     sys.exit("FAIL: no exited/137 row for the killed pid %s" % pid)
 print("gotop kill ok: listed+armed pid=%s, status 137, no markers after" % pid)
+PY
+
+# Run 02 -- the `/` filter leg (issue #2197). One cv-input chord sequence does
+# the whole dance: `/` opens the field, `counter` narrows the table to the one
+# matching row, `return` commits it, `/` reopens the committed text and
+# `escape` clears it -- the unfiltered list comes back. Each edit dumps the
+# filtered rows (`top: row pid=`), so the serial holds the row names the list
+# showed, not just a count.
+vgate_run 02 -- \
+    --screen '$RUN_DIR/screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords '/,c,o,u,n,t,e,r,return,/,escape' \
+    --input-chords-after 'top: ready' \
+    --script3 '$RUN_DIR/script3f.txt' \
+    --script3-after 'top: filter cleared' \
+    --script-expect 'rx-gotop-filter-ok' --timeout 150
+
+vgate_assert 02 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 02 serial-contains 'tabwm: sidebar-rendered'
+vgate_assert 02 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 02 serial-contains 'top: ready'
+vgate_assert 02 serial-contains 'top: filter open'
+vgate_assert 02 serial-contains 'top: filter=counter n=1'
+vgate_assert 02 serial-contains 'top: filter commit'
+vgate_assert 02 serial-contains 'top: filter cleared'
+vgate_assert 02 serial-contains 'top: win_close'
+vgate_assert 02 serial-contains 'top: exiting 43'
+vgate_assert 02 serial-contains 'rx-gotop-filter-ok'
+vgate_assert 02 serial-absent '[EXC] parking:'
+
+# The filter really narrowed the LIVE table: between `top: filter open` and
+# `top: filter cleared` every row line the app dumped names COUNTER.BIN and
+# nothing else (non-match rows hidden), and after the clear the dumped list
+# names the seat and GOTOP again -- the full table restored, not a reprint of
+# the narrowed one.
+vgate_assert 02 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = ser.splitlines()
+try:
+    op = next(i for i, l in enumerate(lines) if l.strip() == "top: filter open")
+    cl = next(i for i, l in enumerate(lines) if l.strip() == "top: filter cleared")
+except StopIteration:
+    sys.exit("FAIL: filter open/cleared markers missing")
+if cl <= op:
+    sys.exit("FAIL: filter cleared precedes filter open")
+narrowed = [l for l in lines[op:cl] if l.startswith("top: row pid=")]
+if not narrowed:
+    sys.exit("FAIL: no filtered row dump between open and cleared")
+bad = [l for l in narrowed if "name=COUNTER.BIN" not in l]
+if bad:
+    sys.exit("FAIL: non-match rows visible while filtered: %s" % bad)
+restored = [l for l in lines[cl:] if l.startswith("top: row pid=")]
+names = {l.split("name=")[1].split(" ")[0] for l in restored if "name=" in l}
+missing = {"COUNTER.BIN", "TABWM.BIN", "GOTOP.ELF"} - names
+if missing:
+    sys.exit("FAIL: full list not restored after clear; missing %s (saw %s)"
+             % (sorted(missing), sorted(names)))
+print("gotop filter ok: %d narrowed row(s) all COUNTER.BIN; restored names %s"
+      % (len(narrowed), sorted(names)))
 PY

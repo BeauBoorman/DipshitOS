@@ -1,7 +1,7 @@
-// Package widgets is the M56e (issue #1319) Go widget kit: exactly three
-// widgets — Text, Button, List — plus integer layout helpers. It is NOT a
-// LIBUI clone; anything beyond these three is a new card with its own
-// justification.
+// Package widgets is the M56e (issue #1319) Go widget kit: Text, Button,
+// List, and — since issue #2197 — the single-line TextInput field, plus
+// integer layout helpers. It is NOT a LIBUI clone; anything beyond these is a
+// new card with its own justification.
 //
 // The load-bearing rule (the CALC-drift lesson): a widget's Draw and its
 // HitTest must read the SAME rectangle. Every widget exposes Bounds() and both
@@ -318,6 +318,226 @@ func (l *List) Draw(c RectCanvas) {
 		c.FillRect(Rect{X: l.R.X, Y: l.R.Y, W: fw, H: l.R.H}, theme.Current.Accent)
 		c.FillRect(Rect{X: l.R.Right() - fw, Y: l.R.Y, W: fw, H: l.R.H}, theme.Current.Accent)
 	}
+}
+
+// --- TextInput ----------------------------------------------------------------
+//
+// HID usage codes (ADR 0009 Arg0) the field understands. The kit keeps the
+// numbers local — a widget must not need vi to be a state machine. The same
+// constants already live per-app (goset controls.go, note main.go).
+const (
+	keyEnter     = 0x28
+	keyEscape    = 0x29
+	keyBackspace = 0x2a
+	keyHome      = 0x4a
+	keyDelete    = 0x4c
+	keyEnd       = 0x4d
+	keyRight     = 0x4f
+	keyLeft      = 0x50
+)
+
+// textInputMaxLen is the default buffer bound when Max is left at 0 — the
+// same 128 bytes the retired Zig ui.TextInput held.
+const textInputMaxLen = 128
+
+// TextInput is a bounded single-line editable field — the kit's text-entry
+// control (issue #2197), first consumed by GOTOP's restored filter. It is a
+// pure state machine plus a paint, exactly like Text/Button/List: HandleKey
+// consumes one key-down event and reports whether the field changed enough to
+// repaint; the app owns Focused and what Submit/Cancel mean via the
+// callbacks.
+//
+// Deliberately single-line: no selection, no clipboard, no multi-line —
+// GOEDIT owns its buffer. Bytes only, printable ASCII only.
+type TextInput struct {
+	R        Rect
+	Fg       uint32 // 0 → theme text
+	Bg       uint32 // 0 → theme surface
+	Focused  bool
+	Max      int          // byte bound on the buffer; <=0 → textInputMaxLen
+	OnSubmit func(string) // Enter commits the value (nil → Enter inert)
+	OnCancel func()       // Escape cancels the edit (nil → Escape inert)
+	value    string
+	caret    int
+}
+
+// Bounds is the plate — the ONE rect Draw and HitTest both read.
+func (t *TextInput) Bounds() Rect { return t.R }
+
+// HitTest agrees with Bounds by construction.
+func (t *TextInput) HitTest(x, y int) bool { return t.R.Contains(x, y) }
+
+// Value is the current text.
+func (t *TextInput) Value() string { return t.value }
+
+// Caret is the byte offset the next insert lands at.
+func (t *TextInput) Caret() int { return t.caret }
+
+// SetValue replaces the text (clamped to the bound) and parks the caret at
+// the end — the Zig TextInput's set_text.
+func (t *TextInput) SetValue(s string) {
+	if len(s) > t.cap() {
+		s = s[:t.cap()]
+	}
+	t.value, t.caret = s, len(s)
+}
+
+// Clear empties the field and homes the caret.
+func (t *TextInput) Clear() { t.value, t.caret = "", 0 }
+
+// cap is the active buffer bound.
+func (t *TextInput) cap() int {
+	if t.Max > 0 {
+		return t.Max
+	}
+	return textInputMaxLen
+}
+
+// HandleKey consumes one key-down event: usage is the event's Arg0 (a HID
+// usage code, 0 when the feed only carries characters) and ch is Arg1
+// truncated to a byte. The usage code wins over the character for named keys,
+// so a feed may deliver both. It reports whether the field changed — text,
+// caret, or a callback fired — i.e. whether the frame needs a repaint. An
+// unfocused field eats nothing.
+func (t *TextInput) HandleKey(usage uint32, ch byte) bool {
+	if !t.Focused {
+		return false
+	}
+	switch usage {
+	case keyLeft:
+		if t.caret > 0 {
+			t.caret--
+			return true
+		}
+		return false
+	case keyRight:
+		if t.caret < len(t.value) {
+			t.caret++
+			return true
+		}
+		return false
+	case keyHome:
+		if t.caret != 0 {
+			t.caret = 0
+			return true
+		}
+		return false
+	case keyEnd:
+		if t.caret != len(t.value) {
+			t.caret = len(t.value)
+			return true
+		}
+		return false
+	case keyBackspace:
+		return t.backspace()
+	case keyDelete:
+		return t.deleteForward()
+	case keyEnter:
+		if t.OnSubmit != nil {
+			t.OnSubmit(t.value)
+			return true
+		}
+		return false
+	case keyEscape:
+		if t.OnCancel != nil {
+			t.OnCancel()
+			return true
+		}
+		return false
+	}
+	// Character fallbacks for feeds that deliver control codes in Arg1 with a
+	// zero usage (0x7f is left alone: the fleet reads it as forward-Delete,
+	// and it is not printable anyway).
+	switch ch {
+	case 0x08:
+		return t.backspace()
+	case '\r', '\n':
+		if t.OnSubmit != nil {
+			t.OnSubmit(t.value)
+			return true
+		}
+		return false
+	case 0x1b:
+		if t.OnCancel != nil {
+			t.OnCancel()
+			return true
+		}
+		return false
+	}
+	if ch >= 0x20 && ch <= 0x7e {
+		return t.insert(ch)
+	}
+	return false
+}
+
+// insert splices ch in at the caret, refusing a full buffer.
+func (t *TextInput) insert(ch byte) bool {
+	if len(t.value) >= t.cap() {
+		return false
+	}
+	t.value = t.value[:t.caret] + string([]byte{ch}) + t.value[t.caret:]
+	t.caret++
+	return true
+}
+
+// backspace removes the byte before the caret.
+func (t *TextInput) backspace() bool {
+	if t.caret == 0 {
+		return false
+	}
+	t.value = t.value[:t.caret-1] + t.value[t.caret:]
+	t.caret--
+	return true
+}
+
+// deleteForward removes the byte under the caret (the caret stays).
+func (t *TextInput) deleteForward() bool {
+	if t.caret >= len(t.value) {
+		return false
+	}
+	t.value = t.value[:t.caret] + t.value[t.caret+1:]
+	return true
+}
+
+// Draw paints the border (accent when focused), the face, the clipped glyph
+// run, and the caret bar — geometry identical to drawGlyphRun's inset so the
+// caret sits exactly where the next glyph would land.
+func (t *TextInput) Draw(c RectCanvas) {
+	if t.R.Empty() {
+		return
+	}
+	th := theme.Current
+	border := th.Border
+	if t.Focused {
+		border = th.Accent
+	}
+	c.FillRect(t.R, border)
+	inner := t.R.Inset(th.BorderW)
+	if inner.Empty() {
+		return
+	}
+	bg := t.Bg
+	if bg == 0 {
+		bg = th.Surface
+	}
+	c.FillRect(inner, bg)
+	fg := t.Fg
+	if fg == 0 {
+		fg = th.Text
+	}
+	drawGlyphRun(c, inner, t.value, fg)
+	if !t.Focused {
+		return
+	}
+	cw := font.Advance(1)
+	caretX := inner.X + 2 + t.caret*cw
+	if maxX := inner.Right() - 2; caretX > maxX {
+		caretX = maxX
+	}
+	if caretX < inner.X {
+		caretX = inner.X
+	}
+	c.FillRect(Rect{X: caretX, Y: inner.Y + 2, W: 2, H: inner.H - 4}, th.Caret)
 }
 
 // DrawText paints a clipped glyph run using the shared widget face. It is
