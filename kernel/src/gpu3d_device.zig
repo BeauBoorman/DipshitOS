@@ -4,7 +4,8 @@
 //!
 //! The device is the owner-approved second custom-virtio channel:
 //! virtio device ID 0x43 (PCI VID 0x1af4, DID 0x1083 = 0x1040 + 0x43 —
-//! the sibling of the 0x42 host channel), PCI class 0x00/0x00, found
+//! the sibling of the 0x42 host channel), PCI class 0x00/0x00 or
+//! 0x03/0x00 (the display class the VIR1 render device advertises), found
 //! through the MCFG ECAM base exactly like the console/blk/custom
 //! devices. It speaks virtio-gpu CONTROL-queue envelopes carrying the
 //! private VIR1 capability profile (gpu3d_wire.zig) — it is NOT a second
@@ -54,6 +55,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const klog = @import("klog.zig");
 const mmio = @import("mmio.zig");
 const mmu = @import("mmu.zig");
 const pci = @import("pci.zig");
@@ -108,8 +110,8 @@ pub var g3_notify_mult: u32 = 0;
 pub var g3_bar: u64 = 0;
 /// Transport armed (DRIVER_OK set, queue 0 live).
 pub var g3_ready: bool = false;
-/// The OBSERVED PCI class (recorded, not assumed — the custom family's
-/// 0x00/0x00 is the expected value).
+/// The OBSERVED PCI class (recorded, not assumed — either the custom
+/// family's 0x00/0x00 or the display class 0x03/0x00 is expected).
 pub var g3_class: u32 = 0;
 /// The OBSERVED device-features word (offered) and the accepted mask.
 pub var g3_dev_feats: u64 = 0;
@@ -146,10 +148,11 @@ pub fn probe() bool {
         if ((id & 0xffff) == 0xffff) continue;
         const did = id >> 16;
         if (did != g3_did) continue;
-        // The custom-virtio family identity (the 0x42 channel's class).
+        // Accept the custom-virtio family class (0x00, the 0x42 channel)
+        // and the display class (0x03) the VIR1 render device advertises.
         const cls = pci.pci_read32(pci.pci_ecam, 0, dev, 0, 8) >> 8;
         g3_class = cls;
-        if (cls != 0x000000) continue;
+        if (cls != 0x000000 and cls != 0x030000) continue;
         found_dev = dev;
         break;
     }
@@ -651,6 +654,15 @@ pub const Error = error{
     StaleHandle,
 };
 
+/// One bounded serial line per exchange failure — the request type names
+/// WHICH step of the VIR1 sequence a device refused, which counters alone
+/// cannot say. No-op pre-boot and in host tests (the klog hook is unset).
+fn log_err(comptime what: []const u8, req_type: u32) void {
+    var buf: [48]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "gpu3d: " ++ what ++ " req=0x{x}\n", .{req_type}) catch return;
+    klog.line(s);
+}
+
 /// Post one control-queue element and validate its completion end to
 /// end: used descriptor id + length, response type, echoed ctx_id, full
 /// fence id. `req` is copied into pinned staging before submit; `resp_cap`
@@ -668,12 +680,16 @@ pub fn exchange(req: []const u8, want_type: u32, resp_cap: usize) Error!Completi
 
     @memcpy(g3_req_staging[0..req.len], req);
     const resp = g3_resp_buf[0..resp_cap];
-    const handle = transport.submit(g3_req_staging[0..req.len], resp) orelse return error.SubmitFailed;
+    const handle = transport.submit(g3_req_staging[0..req.len], resp) orelse {
+        log_err("submit", req_hdr.type);
+        return error.SubmitFailed;
+    };
     pending = .{ .handle = handle, .fence_id = req_hdr.fence_id, .ctx_id = req_hdr.ctx_id };
     const used_len = transport.wait(handle, exchange_budget) orelse {
         transport.release(handle, false); // park — the head is never reused
         pending = null;
         g3_timeouts += 1;
+        log_err("timeout", req_hdr.type);
         return error.Timeout;
     };
     transport.release(handle, true);
@@ -681,18 +697,24 @@ pub fn exchange(req: []const u8, want_type: u32, resp_cap: usize) Error!Completi
     g3_cmds += 1;
     if (used_len > resp_cap) {
         g3_errors += 1;
+        log_err("oversized", req_hdr.type);
         return error.ResponseOversized;
     }
     if (used_len < wire.hdr_len) {
         g3_errors += 1;
+        log_err("truncated", req_hdr.type);
         return error.ResponseTruncated;
     }
     const resp_hdr = wire.parse_hdr(resp[0..used_len]) orelse {
         g3_errors += 1;
+        log_err("parse", req_hdr.type);
         return error.ResponseTruncated;
     };
     if (resp_hdr.type != want_type or resp_hdr.ctx_id != req_hdr.ctx_id or resp_hdr.fence_id != req_hdr.fence_id) {
         g3_errors += 1;
+        var buf: [128]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "gpu3d: badresp req=0x{x} want=0x{x} got=0x{x} ctx {d}>{d} fence {d}>{d}\n", .{ req_hdr.type, want_type, resp_hdr.type, req_hdr.ctx_id, resp_hdr.ctx_id, req_hdr.fence_id, resp_hdr.fence_id }) catch return error.BadResponse;
+        klog.line(s);
         return error.BadResponse;
     }
     return .{ .used_len = used_len, .resp_type = resp_hdr.type, .ctx_id = resp_hdr.ctx_id, .fence_id = resp_hdr.fence_id };

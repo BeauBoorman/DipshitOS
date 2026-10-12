@@ -45,28 +45,28 @@ const stream = @import("gpu3d_stream.zig");
 pub const cmd_resource_unref: u32 = 0x0102;
 pub const cmd_resource_attach_backing: u32 = 0x0106;
 pub const cmd_resource_detach_backing: u32 = 0x0107;
-pub const cmd_resource_create_3d: u32 = 0x0202;
-pub const cmd_transfer_to_host_3d: u32 = 0x0203;
-pub const cmd_transfer_from_host_3d: u32 = 0x0204;
-pub const cmd_submit_3d: u32 = 0x0205;
-pub const cmd_ctx_attach_resource: u32 = 0x0208;
-pub const cmd_ctx_detach_resource: u32 = 0x0209;
+pub const cmd_ctx_attach_resource: u32 = 0x0202;
+pub const cmd_ctx_detach_resource: u32 = 0x0203;
+pub const cmd_resource_create_3d: u32 = 0x0204;
+pub const cmd_transfer_to_host_3d: u32 = 0x0205;
+pub const cmd_transfer_from_host_3d: u32 = 0x0206;
+pub const cmd_submit_3d: u32 = 0x0207;
 
 /// virtio_gpu_resource_create_3d: hdr + 12 payload words = 72 bytes.
 pub const create3d_req_len: usize = 72;
 /// virtio_gpu_resource_attach_backing with ONE virtio_gpu_mem_entry:
 /// hdr + resource_id + nr_entries + (addr + length + padding) = 48 bytes.
 pub const attach_backing_req_len: usize = 48;
-/// hdr + resource_id + padding = 32 bytes.
-pub const detach_backing_req_len: usize = 32;
-/// hdr + resource_id + padding = 32 bytes (attach and detach share it).
-pub const ctx_res_req_len: usize = 32;
+/// hdr + resource_id = 28 bytes (the VIR1 res-op shape the device decodes).
+pub const detach_backing_req_len: usize = 28;
+/// hdr + resource_id = 28 bytes (attach and detach share it).
+pub const ctx_res_req_len: usize = 28;
 /// virtio_gpu_transfer_host_3d: hdr + box(24) + offset(8) + four words.
 pub const transfer_req_len: usize = 72;
 /// virtio_gpu_cmd_submit header (hdr + size + padding); data follows.
 pub const submit_env_len: usize = 32;
-/// hdr + resource_id + padding = 32 bytes.
-pub const unref_req_len: usize = 32;
+/// hdr + resource_id = 28 bytes.
+pub const unref_req_len: usize = 28;
 
 /// The largest color backing the profile allows (256x192 x BGRA8).
 pub const max_color_bytes: usize = 256 * 192 * 4;
@@ -135,13 +135,13 @@ fn put_hdr(out: []u8, cmd_type: u32, ctx_id: u32, fence_id: u64) void {
     put32(out, 20, 0);
 }
 
-/// RESOURCE_CREATE_3D (0x0202): hdr + resource_id + target + format +
+/// RESOURCE_CREATE_3D (0x0204): hdr + resource_id + target + format +
 /// bind + width + height + depth + array_size + last_level + nr_samples +
-/// flags + padding = 72 bytes. Resource commands carry ctx_id 0 — the
-/// resource namespace is global; CTX_ATTACH_RESOURCE binds it.
-pub fn encode_create3d(out: []u8, res_id: u32, target: u32, format: u32, bind: u32, width: u32, height: u32, fence_id: u64) usize {
+/// flags + padding = 72 bytes. The VIR1 device scopes resources to the
+/// creating context — every resource command carries its live ctx_id.
+pub fn encode_create3d(out: []u8, res_id: u32, target: u32, format: u32, bind: u32, width: u32, height: u32, ctx_id: u32, fence_id: u64) usize {
     std.debug.assert(out.len >= create3d_req_len);
-    put_hdr(out, cmd_resource_create_3d, 0, fence_id);
+    put_hdr(out, cmd_resource_create_3d, ctx_id, fence_id);
     put32(out, 24, res_id);
     put32(out, 28, target);
     put32(out, 32, format);
@@ -159,9 +159,9 @@ pub fn encode_create3d(out: []u8, res_id: u32, target: u32, format: u32, bind: u
 
 /// RESOURCE_ATTACH_BACKING (0x0106) with a single mem entry:
 /// hdr + resource_id + nr_entries + {addr, length, padding} = 48 bytes.
-pub fn encode_attach_backing(out: []u8, res_id: u32, addr: u64, len: u32, fence_id: u64) usize {
+pub fn encode_attach_backing(out: []u8, res_id: u32, addr: u64, len: u32, ctx_id: u32, fence_id: u64) usize {
     std.debug.assert(out.len >= attach_backing_req_len);
-    put_hdr(out, cmd_resource_attach_backing, 0, fence_id);
+    put_hdr(out, cmd_resource_attach_backing, ctx_id, fence_id);
     put32(out, 24, res_id);
     put32(out, 28, 1); // nr_entries
     put64(out, 32, addr);
@@ -170,21 +170,22 @@ pub fn encode_attach_backing(out: []u8, res_id: u32, addr: u64, len: u32, fence_
     return attach_backing_req_len;
 }
 
-/// RESOURCE_DETACH_BACKING (0x0107) / CTX_ATTACH_RESOURCE (0x0208) /
-/// CTX_DETACH_RESOURCE (0x0209) / RESOURCE_UNREF (0x0102): the same
-/// 32-byte shape, ctx_id per the command family.
+/// RESOURCE_DETACH_BACKING (0x0107) / CTX_ATTACH_RESOURCE (0x0202) /
+/// CTX_DETACH_RESOURCE (0x0203) / RESOURCE_UNREF (0x0102): the same
+/// 28-byte shape, ctx_id per the command family. The VIR1 device
+/// decodes hdr + resource_id only — a stock padding word would land
+/// as trailing bytes.
 pub fn encode_res_op(out: []u8, cmd_type: u32, res_id: u32, ctx_id: u32, fence_id: u64) usize {
-    std.debug.assert(out.len >= 32);
+    std.debug.assert(out.len >= 28);
     put_hdr(out, cmd_type, ctx_id, fence_id);
     put32(out, 24, res_id);
-    put32(out, 28, 0);
-    return 32;
+    return 28;
 }
 
 /// A 3D transfer box (x, y, z, w, h, d).
 pub const Box = struct { x: u32, y: u32, z: u32, w: u32, h: u32, d: u32 };
 
-/// TRANSFER_TO_HOST_3D (0x0203) / TRANSFER_FROM_HOST_3D (0x0204):
+/// TRANSFER_TO_HOST_3D (0x0205) / TRANSFER_FROM_HOST_3D (0x0206):
 /// hdr + box + offset + resource_id + level + stride + layer_stride =
 /// 72 bytes. `stride` is the guest backing's row stride in bytes;
 /// `offset` is the byte offset into the backing.
@@ -205,7 +206,7 @@ pub fn encode_transfer(out: []u8, cmd_type: u32, res_id: u32, box: Box, offset: 
     return transfer_req_len;
 }
 
-/// SUBMIT_3D (0x0205): hdr + size + padding + stream bytes. The stream
+/// SUBMIT_3D (0x0207): hdr + size + padding + stream bytes. The stream
 /// must be nonempty, word-aligned, count-consistent and within the
 /// 4096-byte profile bound — 32 + 4096 = 4128 = the staging bound.
 pub fn encode_submit3d(out: []u8, stream_bytes: []const u8, ctx_id: u32, fence_id: u64) Error!usize {
@@ -335,20 +336,20 @@ pub fn open(ctx_id: u32, width: u32, height: u32) Error!Session {
     const steps = struct {
         fn run(ss: *Sess, clen: u32) Error!void {
             // color target: 2D, BGRA8, RENDER_TARGET
-            var n = encode_create3d(env[0..], ss.res_color, stream.target_2d, stream.fmt_bgra8_unorm, stream.bind_render_target, ss.width, ss.height, try take_fence());
+            var n = encode_create3d(env[0..], ss.res_color, stream.target_2d, stream.fmt_bgra8_unorm, stream.bind_render_target, ss.width, ss.height, ss.ctx.ctx_id, try take_fence());
             _ = try guarded(ss, env[0..n], wire.resp_ok_nodata, wire.nodata_resp_len);
             ss.res_state |= res_color_created;
-            n = encode_attach_backing(env[0..], ss.res_color, mmu.to_phys(@intFromPtr(&ss.color)), clen, try take_fence());
+            n = encode_attach_backing(env[0..], ss.res_color, mmu.to_phys(@intFromPtr(&ss.color)), clen, ss.ctx.ctx_id, try take_fence());
             _ = try guarded(ss, env[0..n], wire.resp_ok_nodata, wire.nodata_resp_len);
             ss.res_state |= res_color_backed;
             n = encode_res_op(env[0..], cmd_ctx_attach_resource, ss.res_color, ss.ctx.ctx_id, try take_fence());
             _ = try guarded(ss, env[0..n], wire.resp_ok_nodata, wire.nodata_resp_len);
             ss.res_state |= res_color_attached;
             // vertex buffer: PIPE_BUFFER, VERTEX_BUFFER, 96 bytes wide
-            n = encode_create3d(env[0..], ss.res_vbo, stream.target_buffer, 0, stream.bind_vertex_buffer, vbo_bytes, 1, try take_fence());
+            n = encode_create3d(env[0..], ss.res_vbo, stream.target_buffer, 0, stream.bind_vertex_buffer, vbo_bytes, 1, ss.ctx.ctx_id, try take_fence());
             _ = try guarded(ss, env[0..n], wire.resp_ok_nodata, wire.nodata_resp_len);
             ss.res_state |= res_vbo_created;
-            n = encode_attach_backing(env[0..], ss.res_vbo, mmu.to_phys(@intFromPtr(&ss.vbo)), vbo_bytes, try take_fence());
+            n = encode_attach_backing(env[0..], ss.res_vbo, mmu.to_phys(@intFromPtr(&ss.vbo)), vbo_bytes, ss.ctx.ctx_id, try take_fence());
             _ = try guarded(ss, env[0..n], wire.resp_ok_nodata, wire.nodata_resp_len);
             ss.res_state |= res_vbo_backed;
             n = encode_res_op(env[0..], cmd_ctx_attach_resource, ss.res_vbo, ss.ctx.ctx_id, try take_fence());
@@ -387,7 +388,9 @@ fn drain(s: *Sess, best_effort: bool) Error!void {
     for (order) |st| {
         if ((s.res_state & st.bit) == 0) continue;
         const res = if (st.bit == res_vbo_attached or st.bit == res_vbo_backed or st.bit == res_vbo_created) s.res_vbo else s.res_color;
-        const ctx: u32 = if (st.cmd == cmd_ctx_detach_resource) s.ctx.ctx_id else 0;
+        // The device scopes resources per context — every owed op
+        // carries the session's live ctx_id (ctx 0 is refused).
+        const ctx: u32 = s.ctx.ctx_id;
         const f = take_fence() catch |e| {
             if (first == null) first = e;
             if (best_effort) continue else return e;
@@ -772,12 +775,12 @@ fn open_session(ctx: u32) !Session {
 
 test "gpu3d_submit: envelope encoders produce the spec byte shapes" {
     var buf: [128]u8 = @splat(0xee);
-    var n = encode_create3d(&buf, 9, stream.target_2d, stream.fmt_bgra8_unorm, stream.bind_render_target, 256, 192, 0x1122334455667788);
+    var n = encode_create3d(&buf, 9, stream.target_2d, stream.fmt_bgra8_unorm, stream.bind_render_target, 256, 192, 7, 0x1122334455667788);
     try testing.expectEqual(@as(usize, 72), n);
     try testing.expectEqual(cmd_resource_create_3d, std.mem.readInt(u32, buf[0..4], .little));
     try testing.expectEqual(wire.flag_fence, std.mem.readInt(u32, buf[4..8], .little));
     try testing.expectEqual(@as(u64, 0x1122334455667788), std.mem.readInt(u64, buf[8..16], .little));
-    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[16..20], .little)); // global resource
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, buf[16..20], .little)); // creating ctx
     try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, buf[24..28], .little));
     try testing.expectEqual(@as(u32, stream.target_2d), std.mem.readInt(u32, buf[28..32], .little));
     try testing.expectEqual(@as(u32, stream.fmt_bgra8_unorm), std.mem.readInt(u32, buf[32..36], .little));
@@ -790,20 +793,26 @@ test "gpu3d_submit: envelope encoders produce the spec byte shapes" {
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[60..64], .little)); // nr_samples
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[64..68], .little)); // flags
 
-    n = encode_attach_backing(&buf, 9, 0xdeadbeef, 0x3000, 7);
+    n = encode_attach_backing(&buf, 9, 0xdeadbeef, 0x3000, 4, 7);
     try testing.expectEqual(@as(usize, 48), n);
     try testing.expectEqual(cmd_resource_attach_backing, std.mem.readInt(u32, buf[0..4], .little));
+    try testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, buf[16..20], .little)); // owning ctx
     try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, buf[24..28], .little));
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[28..32], .little));
     try testing.expectEqual(@as(u64, 0xdeadbeef), std.mem.readInt(u64, buf[32..40], .little));
     try testing.expectEqual(@as(u32, 0x3000), std.mem.readInt(u32, buf[40..44], .little));
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[44..48], .little));
 
-    n = encode_res_op(&buf, cmd_ctx_attach_resource, 3, 5, 9);
-    try testing.expectEqual(@as(usize, 32), n);
-    try testing.expectEqual(cmd_ctx_attach_resource, std.mem.readInt(u32, buf[0..4], .little));
-    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, buf[16..20], .little));
-    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, buf[24..28], .little));
+    // The VIR1 res-op shape is hdr + resource_id = 28 bytes; byte 28
+    // onward must stay untouched (a pad word lands as trailing bytes
+    // and the device refuses the request).
+    var op: [32]u8 = @splat(0xee);
+    n = encode_res_op(&op, cmd_ctx_attach_resource, 3, 5, 9);
+    try testing.expectEqual(@as(usize, 28), n);
+    try testing.expectEqual(cmd_ctx_attach_resource, std.mem.readInt(u32, op[0..4], .little));
+    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, op[16..20], .little));
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, op[24..28], .little));
+    try testing.expectEqual(@as(u32, 0xeeeeeeee), std.mem.readInt(u32, op[28..32], .little));
 
     n = encode_transfer(&buf, cmd_transfer_from_host_3d, 4, .{ .x = 1, .y = 2, .z = 3, .w = 64, .h = 48, .d = 1 }, 0x80, 256, 0, 2, 11);
     try testing.expectEqual(@as(usize, 72), n);
