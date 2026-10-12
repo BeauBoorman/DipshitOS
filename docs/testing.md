@@ -729,6 +729,47 @@ repaint (measured 1789 console-green pixels). The default-seat probe is
 `go-wm-console-ink` (#1561) and asserts console-green = 0. A serial-marker
 beat cannot see this.
 
+## Agent control channel (M98, issue #2145)
+
+`go-agentd` is the ADR 0044 class-B gate: eight boots of `AGENTD.ELF` on
+guest TCP 4747 behind an HMAC-SHA256 challenge, driven by the stdlib-only
+harness `tools/agentctl/agentctl.py` over the runner's hermetic
+`--net-tcp-connect-stream` adapter (stdin is guest->host, stdout is
+host->guest, `AGENTCTL:` evidence rides stderr into the run log).
+
+| run | proves |
+|-----|--------|
+| 01 | seat + `--allow-exec` + Calc (Calc execs on the first `ui.windows` request — the 16-slot task pool cannot hold four Go runtimes at once, so it is staged after the journey's `gosh.run` calls): the handshake, all six verbs green, the whole in-session D4 refusal matrix, the `gosh.run` kill path, a second peer's SYN refused while the session stays up, and `line_too_long` ending it |
+| 02 | wrong MAC -> `auth_failed`, the 1 s damping, and an honest relisten |
+| 03 | a `verb` line before auth -> `auth_required`, no request runs |
+| 04 | a silent client -> `auth_timeout` inside 15 s |
+| 05 | no `--allow-exec` and no seat: `gosh.run` absent from `verbs` -> `verb_disabled`, `ui.windows` -> `seat:"none"` |
+| 06–08 | startup posture: `exec -u0` -> `refuse privileged`, a store with no `agent-hmac` row -> `refuse no-credential`, no `AGENT/` directory -> `refuse no-root` — each before any `listen` |
+
+Two runs stage a different share through a run-local `--cvc-file` (the
+runner takes the last assignment): `nocred-share` carries a `#v1` secrets
+file with no `agent-hmac` row, `noroot-share` has the row but no `AGENT/`
+directory. Every run asserts the key text, the `fs.write` payload
+sentinel and the `gosh.run` stdout sentinel never reach serial.
+
+Host prerequisites — build the four guest ELFs first; the spec refuses a
+missing one by name:
+
+```bash
+bash tools/go/build-agentd.sh   # AGENTD.ELF (enforces the 2 MiB ceiling)
+bash tools/go/build-gosh.sh     # GOSH.ELF (also hash-checked by fleet.sh)
+bash tools/go/build-gotabwm.sh  # GOTABWM.ELF (run 01 seat)
+bash tools/go/build-gocalc.sh   # GOCALC.ELF (run 01 window)
+just gate go-agentd
+```
+
+Class-A coverage is `cd user/go && go test ./agentd ./shlib ./vi ./gotabwm`
+for the guest side and `python3 -m unittest
+tools/agentctl/test_agentctl.py` for the client: the pinned HMAC vector,
+the flat-grammar reader differential against `encoding/json`, the D4 code
+table, and the journeys run end-to-end against a wire-level daemon
+simulation.
+
 ## Verification sequence
 
 Every `zig` command below must resolve to the pinned compiler: the version +

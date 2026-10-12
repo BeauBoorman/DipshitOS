@@ -1,8 +1,9 @@
 # ADR 0044: Agent control channel v1 — an outside agent drives a running VirelaiOS
 
 - Date: 2026-10-11
-- Status: **Proposed** — spec only, no code. Owner review pending.
-- Milestone: **M98**. Mission card #2145 (unclaimed). This ADR is the card
+- Status: **Accepted** — landed on `t3/complete-issue-2145`; `go-agentd`
+  is 8/8 green on the reference host (observed 2026-10-12).
+- Milestone: **M98**. Mission card #2145. This ADR is the card
   body: scope, acceptance, gates and `Touches`.
 
 > The first, deliberately small step toward an agent-native OS. A host-side
@@ -414,7 +415,7 @@ logged.
 
 | Run | Setup | Journey | Must hold |
 |---|---|---|---|
-| 01 | seat + Calc + `AGENTD.ELF --allow-exec`, `--net-tcp-connect-intruder` | `full` | AC4 greens. Every in-session red in the matrix below. Final 8193-byte line → `line_too_long`, `session end reason=line_too_long`. Intruder SYN refused, session intact. `AGENTCTL: PASS full`, probe status 0 |
+| 01 | seat + `AGENTD.ELF --allow-exec` + Calc, `--net-tcp-connect-intruder` | `full` | AC4 greens. Every in-session red in the matrix below. Final 8193-byte line → `line_too_long`, `session end reason=line_too_long`. Intruder SYN refused, session intact. `AGENTCTL: PASS full`, probe status 0 |
 | 02 | `AGENTD.ELF` | `badmac` | `auth_failed`. `auth fail reason=mac`. `agentd: listen 4747` ≥ 2 (relistened). `auth ok` and `req` absent |
 | 03 | `AGENTD.ELF` | `preauth` (sends `proc.list` first) | `auth_required`, `reason=preauth`, `req` absent |
 | 04 | `AGENTD.ELF` | `mute` | `auth_timeout` within 15 s, `reason=timeout` |
@@ -427,6 +428,29 @@ Every run also asserts that the serial log omits the key, the payload
 sentinel and the stdout sentinel. Run 01's python assert compares the share
 root listing with the staged set plus `AGENT/HELLO.TXT` and
 `AGENTD.OUT`-absent, and checks that `SECRETS.TXT` is byte-unchanged.
+
+#### Amendment (landed, observed 2026-10-12)
+
+**Run 01 stages GOCALC last.** `scheduler.max_tasks` is 16 and a live Go
+runtime holds ~4 task slots (main + sysmon + startup Ms — measured via the
+`tasks` monitor dump: kernel 3 + 4 per Go process). Seat + Calc + agentd +
+a `gosh.run` child would need 19 slots, so the four cannot coexist. Run 01
+therefore execs `GOCALC.ELF` on the first `verb=ui.windows` marker — after
+every `gosh.run` call in the journey — and the harness polls `ui.windows`
+until the Calc row registers (`UI_WAIT`, 60 s). AC4's assertions are
+unchanged; only the staging order moved.
+
+Two `gosh.run` robustness fixes ride the same bound: a spawn that lands
+`ENOSPC` retries for ≤ 2 s on yields (a just-exited child's slots stay
+zombie until the idle task reaps them), and after `WaitBudget` the daemon
+yield-polls `Probe` for `ProbeAbsent` before answering so a back-to-back
+`gosh.run` sees a clean pool.
+
+**Observed figures:** `AGENTD.ELF` 1,769,632 bytes (ceiling 2,097,152);
+`go-agentd` 8/8 PASS, ~3 min wall for all eight runs on the reference
+host; guest class A `go test ./agentd ./shlib ./vi ./gotabwm` green; host
+class A `python3 -m unittest tools/agentctl/test_agentctl.py` 21 tests
+green.
 
 ### Per-verb red/green matrix (run 01 unless noted)
 

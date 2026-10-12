@@ -35,6 +35,7 @@ core
 
 # --- Local environment (never commit) ---
 .env
+__pycache__/
 
 # --- Editors & OS noise ---
 .DS_Store
