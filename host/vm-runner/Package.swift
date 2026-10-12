@@ -58,14 +58,25 @@ let package = Package(
             name: "VMAppKit",
             path: "Sources/VMAppKit"
         ),
+        // M102b2 (#2163): the host envelope for the experimental
+        // custom-Virtio 3D render device (ID 0x43 / PCI 1af4:1083) — the
+        // frozen VIR1 wire codec, the two-context generation-safe device
+        // core, and the injected GPU3DBackend seam c2's Metal renderer
+        // will fill. The Virtualization glue is behind -DSPIKE (macOS 27
+        // SDK); the core is pure Swift, so `swift test` exercises it on
+        // any host. Nothing attaches it to the runner until d3.
+        .target(
+            name: "VMGPU3D",
+            path: "Sources/VMGPU3D"
+        ),
         .executableTarget(
             name: "VMRunner",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit"],
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D"],
             path: "Sources/VMRunner"
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D"]
         )
     ],
     swiftLanguageModes: [.v5]
