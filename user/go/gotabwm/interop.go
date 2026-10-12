@@ -305,6 +305,14 @@ func serviceRPC() int {
 		if req.Kind&vi.WmRpcReplyFlag != 0 {
 			continue
 		}
+		// Kind 16 (WINDOWS_QUERY, ADR 0044 D5) reads seat-wide strip
+		// state, binds no window and mutates nothing — it is served
+		// ahead of the authentication gate.
+		if req.Kind == wmKindWindowsQuery {
+			serveWindowsQuery(req)
+			served++
+			continue
+		}
 		pad, auth, apply := gateRPC(req)
 		applied := false
 		if apply {

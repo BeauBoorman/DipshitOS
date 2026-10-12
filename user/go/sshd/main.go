@@ -30,7 +30,7 @@ const (
 
 // argvEnvpGuard keeps the writable segment's bss end far enough from the
 // page boundary for the kernel's packed argv+envp (see GOSH.ELF).
-var argvEnvpGuard [0x11b0]byte
+var argvEnvpGuard [0x1b00]byte
 
 func init() {
 	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
