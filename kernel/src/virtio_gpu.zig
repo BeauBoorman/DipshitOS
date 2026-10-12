@@ -390,15 +390,19 @@ fn resolve_dev(dev: u32) u64 {
 /// progressively larger masks a quirky VZ device might demand (the
 /// claim-1373 net lesson: it cleared FEATURES_OK even for VER1-only).
 /// Claim-time observation (the VZ gpu offers VIRGL|RESOURCE_UUID|
-/// ACCESS_PLATFORM|VERSION_1): the VIRGL-capable device may demand the
-/// gpu feature bits too, so the ladder prefers the largest mask whose
-/// bits are ALL offered — ending at the minimal VERSION_1-only mask (the
-/// claim-1373 shape). VIRTIO_F_ACCESS_PLATFORM is deliberately NOT part
-/// of any accepted mask: accepting it would put every ring address
-/// through the platform DMA translation, and every other VZ virtio
-/// device works with plain physical addresses (the blk/entropy/net/
-/// console precedent). Only masks whose bits are ALL offered are
-/// returned (0 when even the minimum is impossible).
+/// ACCESS_PLATFORM|VERSION_1): the device may demand the offered gpu
+/// feature bits too, so the ladder prefers the largest mask whose bits
+/// are ALL offered — ending at the minimal VERSION_1-only mask (the
+/// claim-1373 shape). Accepting the VIRGL bit here is ONLY a FEATURES_OK
+/// negotiation artifact: this driver implements no VIRGL commands, and
+/// M102 research (issue #2161) observed that the native VZ device
+/// provides no usable VIRGL path — the experimental 3D channel is the
+/// private DID 0x1083 device (gpu3d_device.zig). VIRTIO_F_ACCESS_PLATFORM
+/// is deliberately NOT part of any accepted mask: accepting it would put
+/// every ring address through the platform DMA translation, and every
+/// other VZ virtio device works with plain physical addresses (the
+/// blk/entropy/net/console precedent). Only masks whose bits are ALL
+/// offered are returned (0 when even the minimum is impossible).
 pub fn select_features(device_feats: u64) u64 {
     if ((device_feats & vf_version_1) == 0) return 0;
     const fixed = [_]u64{
@@ -926,7 +930,9 @@ test "virtio_gpu: spec constants, wire shapes, and the fill are the spec shapes"
     try std.testing.expectEqual(@as(usize, 720), fb_height);
     // Feature selection: the largest mask whose bits are ALL offered,
     // ending at VER1-only. VZ's gpu offers VIRGL|RESOURCE_UUID|VERSION_1
-    // (claim-time observation) — the pick there is bits 0|2|32.
+    // (claim-time observation) — the pick there is bits 0|2|32. Accepted
+    // VIRGL here is negotiation-only; no VIRGL command exists in this
+    // driver (M102: the native device has no usable VIRGL path).
     try std.testing.expectEqual(@as(u64, 0x1 << 32), select_features(0x1 << 32));
     try std.testing.expectEqual(@as(u64, 0x1 << 32 | 0x1 << 0 | 0x1 << 2), select_features(0x1 << 32 | 0x1 << 0 | 0x1 << 2));
     // A mask with an unoffered RESOURCE_UUID (bit 2) falls back to the
