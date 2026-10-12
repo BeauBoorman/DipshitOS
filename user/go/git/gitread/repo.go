@@ -192,6 +192,31 @@ func (r *Repo) Head() ([20]byte, error) {
 	return r.head, nil
 }
 
+// HeadRef returns the ref name HEAD points at ("ref: <name>"), or false
+// when HEAD is detached (a direct 40-hex) — a pull needs the name to know
+// which branch ref to advance.
+func (r *Repo) HeadRef() (string, bool) {
+	b, err := r.FS.ReadFile(r.GitDir + "/HEAD")
+	if err != nil {
+		return "", false
+	}
+	line := strings.TrimRight(string(b), "\r\n")
+	if !strings.HasPrefix(line, "ref: ") {
+		return "", false
+	}
+	name := strings.TrimPrefix(line, "ref: ")
+	if name == "" || name == "ref:" {
+		return "", false
+	}
+	return name, true
+}
+
+// ResolveRef resolves any ref name (loose file first, then packed-refs) —
+// the public half of resolveRef for fetch's remote-tracking refs.
+func (r *Repo) ResolveRef(name string) ([20]byte, error) {
+	return r.resolveRef(name)
+}
+
 // resolveRef reads refs/<name> loose-first, then packed-refs.
 func (r *Repo) resolveRef(name string) ([20]byte, error) {
 	b, err := r.FS.ReadFile(r.GitDir + "/" + name)

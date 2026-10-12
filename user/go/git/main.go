@@ -5,9 +5,9 @@ import (
 	"virelai/vi"
 )
 
-// GOTGIT.ELF — git-over-https clone (issue #1337 / M67b #1447 / ADR 0029).
-// HTTPS is in-process tls.Dial over vi.Dial. FETCHS.BIN is not referenced.
-// Never a cleartext GET. No push.
+// GOTGIT.ELF — git-over-https clone (issue #1337 / M67b #1447 / ADR 0029),
+// fetch/pull second pass (#2203). HTTPS is in-process tls.Dial over vi.Dial.
+// FETCHS.BIN is not referenced. Never a cleartext GET. No push.
 
 const (
 	appName = "GOTGIT.ELF"
@@ -42,7 +42,7 @@ func main() {
 	argvPad[0] = 1
 	vi.ConsoleLine(markerStart)
 
-	url, dest := startArgs()
+	cmd, url, dest := startArgs()
 	vi.ConsoleLine(markerURL + url)
 	tgt := classify(url)
 	if wouldSendCleartext(tgt) {
@@ -54,42 +54,60 @@ func main() {
 		return
 	}
 
-	if !mkdirAll(dest) {
-		fail("mkdir dest")
-		return
-	}
 	gitDir, ok := gitread.JoinPath(dest, ".git")
-	if !ok || !mkdirAll(gitDir) {
-		fail("mkdir git")
+	if !ok {
+		fail("git dir")
 		return
 	}
-	if !clone(tgt, dest, gitDir) {
-		return
+	switch cmd {
+	case "fetch":
+		if !doFetch(tgt, dest, gitDir) {
+			return
+		}
+	case "pull":
+		if !doPull(tgt, dest, gitDir) {
+			return
+		}
+	default: // clone
+		if !mkdirAll(dest) {
+			fail("mkdir dest")
+			return
+		}
+		if !mkdirAll(gitDir) {
+			fail("mkdir git")
+			return
+		}
+		if !clone(tgt, dest, gitDir) {
+			return
+		}
 	}
 	vi.ConsoleLine(markerOK)
 	vi.Exit(0)
 }
 
-func startArgs() (url, dest string) {
+func startArgs() (cmd, url, dest string) {
 	args := vi.Args()
+	cmd = "clone"
 	url = "https://10.0.0.2:24541/g.git"
 	dest = "/host/G"
-	if len(args) > 1 && args[1] == "clone" {
+	if len(args) > 1 && (args[1] == "clone" || args[1] == "fetch" || args[1] == "pull") {
+		cmd = args[1]
 		if len(args) > 2 && args[2] != "" {
 			url = args[2]
 		}
 		if len(args) > 3 && args[3] != "" {
 			dest = args[3]
 		}
-		return url, dest
+		return cmd, url, dest
 	}
+	// The pre-#2203 shape "GOTGIT <url> <dest>" stays a clone.
 	if len(args) > 1 && args[1] != "" {
 		url = args[1]
 	}
 	if len(args) > 2 && args[2] != "" {
 		dest = args[2]
 	}
-	return url, dest
+	return cmd, url, dest
 }
 
 func clone(tgt target, dest, gitDir string) bool {
