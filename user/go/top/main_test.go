@@ -99,7 +99,9 @@ func TestKillWithNoSelectionIsInert(t *testing.T) {
 			}
 			return -vi.ErrEACCES
 		case vi.SlotProcs:
-			buf := unsafe.Slice((*byte)(unsafe.Pointer(a0)), a1)
+			// Old-kernel answer: ignore ADR 0047's version tag, serve the
+			// frozen 40-byte row at the masked byte limit.
+			buf := unsafe.Slice((*byte)(unsafe.Pointer(a0)), a1&procsMaxMask)
 			row := namedRow(1, vi.ProcRunning, 0, "COUNTER.BIN")
 			putU64(buf[0:], row.PID)
 			putU64(buf[8:], row.State)

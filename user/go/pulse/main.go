@@ -91,6 +91,12 @@ func main() {
 	vi.ConsoleLine(markerTimerArm)
 	vi.ConsoleLine(markerReady)
 	vi.ConsoleLine("pulse: procs " + vi.Itoa64(int64(len(m.snap.procs))))
+	if m.usage.ok {
+		// ADR 0047 evidence: the negotiated v2 rows actually arrived.
+		vi.ConsoleLine("pulse: usage cpux10=" + vi.Itoa64(int64(m.usage.cpuX10)) +
+			" memused=" + vi.Itoa64(int64(m.usage.memUsed)) +
+			" memtotal=" + vi.Itoa64(int64(m.usage.memTotal)))
+	}
 
 	var in [64]byte
 	for {

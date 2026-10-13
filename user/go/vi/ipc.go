@@ -35,6 +35,11 @@ const (
 	ProcRowSize = 40
 	// ProcNameBytes is the NUL-padded name field width inside a row.
 	ProcNameBytes = 16
+	// ProcRowVersion2 is the wire row_version written by kernels that
+	// implement ADR 0047's negotiated v2 snapshot.
+	ProcRowVersion2 = 2
+	// ProcRowBytesV2 is the stride of the version-2 wire row (ADR 0047).
+	ProcRowBytesV2 = 80
 )
 
 // Process state codes as marshalled by the kernel snapshot (process.zig
@@ -46,12 +51,32 @@ const (
 )
 
 // ProcRow is one decoded `sys_procs` row: u64 pid@0, u64 state@8, u64
-// exit_status@16, name[16] NUL-padded@24 (all little-endian).
+// exit_status@16, name[16] NUL-padded@24 (all little-endian). The frozen
+// wire shape ends at NameBuf; the fields after it are Go-side decode
+// targets for the negotiated v2 row (procs.go, ADR 0047) — zero on a v1
+// stream or over any truncated/unknown field range, never garbage.
 type ProcRow struct {
 	PID        uint64
 	State      uint64
 	ExitStatus uint64
 	NameBuf    [ProcNameBytes]byte
+	// RowVer is the wire row_version the snapshot carried (0/1 = v1).
+	RowVer uint32
+	// NCores is the online-core count at snapshot time (v2@72).
+	NCores uint32
+	// TotalPages is the allocator pool page count (v2@76); ×4096 = the
+	// machine memory denominator in bytes.
+	TotalPages uint64
+	// CpuTicks is the cumulative scheduler ticks attributed to this pid
+	// (v2@48). It is a counter, not a percentage — pair consecutive
+	// snapshots' deltas against TotalTicks and NCores for a utilization.
+	CpuTicks uint64
+	// MemBytes is the owned resident footprint in bytes (v2@56): static
+	// spans + dynamic pages + kernel stack.
+	MemBytes uint64
+	// TotalTicks is Σ per-core scheduler ticks (v2@64) — the CPU-share
+	// denominator, identical on every row of one snapshot.
+	TotalTicks uint64
 }
 
 // Name returns the row's process name with the NUL padding trimmed.

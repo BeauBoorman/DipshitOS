@@ -7,7 +7,12 @@ import (
 	"virelai/vi"
 )
 
-// fakeProcs installs a slot-7 hook serving rows, and returns a pointer to the
+// procsMaxMask strips ADR 0047's version tag off `sys_procs`'s `max`
+// argument — what a v1 kernel does implicitly when it ignores the top byte.
+const procsMaxMask = uintptr(1)<<56 - 1
+
+// fakeProcs installs a slot-7 hook serving frozen 40-byte rows (an OLD
+// kernel's answer even to a tagged request), and returns a pointer to the
 // served table so a test can mutate it between refreshes.
 func fakeProcs(t *testing.T, rows []vi.ProcRow) *[]vi.ProcRow {
 	t.Helper()
@@ -16,7 +21,7 @@ func fakeProcs(t *testing.T, rows []vi.ProcRow) *[]vi.ProcRow {
 		if num != vi.SlotProcs {
 			t.Fatalf("unexpected slot %d", num)
 		}
-		buf := unsafe.Slice((*byte)(unsafe.Pointer(a0)), a1)
+		buf := unsafe.Slice((*byte)(unsafe.Pointer(a0)), a1&procsMaxMask)
 		n := 0
 		for _, r := range *table {
 			off := n * vi.ProcRowSize
@@ -24,6 +29,45 @@ func fakeProcs(t *testing.T, rows []vi.ProcRow) *[]vi.ProcRow {
 			putU64(buf[off+8:], r.State)
 			putU64(buf[off+16:], r.ExitStatus)
 			copy(buf[off+24:off+40], r.NameBuf[:])
+			n++
+		}
+		return int64(n)
+	})
+	t.Cleanup(func() { vi.SetSyscallHookForTest(prev) })
+	return table
+}
+
+// fakeProcsV2 installs a slot-7 hook that honours ADR 0047's version tag:
+// rows carry their own u32 version@0 / u32 row_bytes@4 header, the identity
+// fields shifted +8, and the usage tail after them.
+func fakeProcsV2(t *testing.T, rows []vi.ProcRow) *[]vi.ProcRow {
+	t.Helper()
+	table := &rows
+	prev := vi.SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		if num != vi.SlotProcs {
+			t.Fatalf("unexpected slot %d", num)
+		}
+		ver, max := a1>>56, a1&procsMaxMask
+		if ver < vi.ProcRowVersion2 {
+			t.Fatalf("v2 kernel got an untagged request (a1=%#x)", a1)
+		}
+		buf := unsafe.Slice((*byte)(unsafe.Pointer(a0)), max)
+		n := 0
+		for _, r := range *table {
+			off := n * vi.ProcRowBytesV2
+			if off+vi.ProcRowBytesV2 > len(buf) {
+				break
+			}
+			buf[off+0] = byte(vi.ProcRowVersion2)
+			buf[off+4] = byte(vi.ProcRowBytesV2)
+			putU64(buf[off+8:], r.PID)
+			putU64(buf[off+16:], r.State)
+			putU64(buf[off+24:], r.ExitStatus)
+			copy(buf[off+32:off+48], r.NameBuf[:])
+			putU64(buf[off+48:], r.CpuTicks)
+			putU64(buf[off+56:], r.MemBytes)
+			putU64(buf[off+64:], r.TotalTicks)
+			putU64(buf[off+72:], uint64(r.NCores)|uint64(r.TotalPages)<<32)
 			n++
 		}
 		return int64(n)
@@ -519,5 +563,103 @@ func TestCounts(t *testing.T) {
 	}
 	if len(tab.Labels()) != 3 {
 		t.Fatalf("labels = %d, want 3", len(tab.Labels()))
+	}
+}
+
+// --- Real utilization columns (issue #2198, ADR 0047) -------------------------
+
+// v2Row stages a version-2 wire row for fakeProcsV2.
+func v2Row(pid, cpu, mem uint64, name string) vi.ProcRow {
+	r := vi.ProcRow{PID: pid, State: vi.ProcRunning, RowVer: vi.ProcRowVersion2,
+		CpuTicks: cpu, MemBytes: mem, TotalTicks: 1000, NCores: 4, TotalPages: 16384}
+	copy(r.NameBuf[:], name)
+	return r
+}
+
+// TestUsageColumnsAppearOnV2Only: a v2 snapshot grows the header/rows; the
+// same table on a v1 kernel renders the frozen four columns again.
+func TestUsageColumnsAppearOnV2Only(t *testing.T) {
+	fakeProcsV2(t, []vi.ProcRow{v2Row(1, 500, 28*4096, "BUSY.BIN")})
+	tab := NewTable()
+	tab.Refresh()
+	if got := tab.Header(); got != "PID  Name           State   Exit  CPU%  MEM      ^pid" {
+		t.Fatalf("v2 header = %q", got)
+	}
+	p, ok := tab.Row(0)
+	if !ok || !p.HasUsage || p.CpuTicks != 500 || p.MemBytes != 28*4096 {
+		t.Fatalf("row = %+v", p)
+	}
+	// First snapshot has no window: CpuX10 is the share since boot.
+	// 500 of 1000 machine ticks over 4 cores = 200% of one core = 2000 x10.
+	if p.CpuX10 != 2000 {
+		t.Fatalf("CpuX10 = %d, want 2000", p.CpuX10)
+	}
+	cpuX10, memUsed, memTotal, ok := tab.Usage()
+	if !ok || cpuX10 != 500 || memUsed != 28*4096 || memTotal != 16384*4096 {
+		t.Fatalf("usage = %d/%d/%d ok=%v", cpuX10, memUsed, memTotal, ok)
+	}
+	label := tab.Labels()[0]
+	if label != "  1  BUSY.BIN       running -     200.0 112K" {
+		t.Fatalf("v2 label = %q", label)
+	}
+}
+
+// TestUsageWindowedDelta: a second snapshot reports the delta over the
+// window, not the lifetime counter.
+func TestUsageWindowedDelta(t *testing.T) {
+	rows := fakeProcsV2(t, []vi.ProcRow{v2Row(1, 500, 4096, "BUSY.BIN")})
+	tab := NewTable()
+	tab.Refresh()
+	// +50 ticks on the row, machine advanced 200 total across 4 cores ->
+	// 50 ticks elapsed per core -> the row saturated one core (100%).
+	*rows = []vi.ProcRow{func() vi.ProcRow {
+		r := v2Row(1, 550, 8192, "BUSY.BIN")
+		r.TotalTicks = 1200
+		return r
+	}()}
+	tab.Refresh()
+	p, _ := tab.Row(0)
+	if p.CpuX10 != 1000 {
+		t.Fatalf("windowed CpuX10 = %d, want 1000", p.CpuX10)
+	}
+	// Machine share over the same window: 50 proc ticks of 200 machine
+	// ticks = 25% busy.
+	if cpuX10, _, _, _ := tab.Usage(); cpuX10 != 250 {
+		t.Fatalf("windowed machine share = %d, want 250", cpuX10)
+	}
+}
+
+// TestUsageGoneOnV1: after a v2 snapshot, a v1 answer must retract the
+// columns — stale figures are worse than none.
+func TestUsageGoneOnV1(t *testing.T) {
+	fakeProcsV2(t, []vi.ProcRow{v2Row(1, 500, 4096, "BUSY.BIN")})
+	tab := NewTable()
+	tab.Refresh()
+	if _, _, _, ok := tab.Usage(); !ok {
+		t.Fatal("v2 snapshot must report usage")
+	}
+	fakeProcs(t, []vi.ProcRow{namedRow(1, vi.ProcRunning, 0, "BUSY.BIN")})
+	tab.Refresh()
+	if _, _, _, ok := tab.Usage(); ok {
+		t.Fatal("v1 snapshot must retract usage")
+	}
+	if tab.Labels()[0] != "  1  BUSY.BIN       running -" {
+		t.Fatalf("v1 label = %q", tab.Labels()[0])
+	}
+}
+
+// TestSortByCPU pins the new sort axis: highest CpuX10 ascends last.
+func TestSortByCPU(t *testing.T) {
+	fakeProcsV2(t, []vi.ProcRow{
+		v2Row(1, 900, 4096, "HOT.BIN"),
+		v2Row(2, 50, 4096, "IDLE.BIN"),
+	})
+	tab := NewTable()
+	tab.Refresh()
+	tab.SortBy(ColCPU)
+	tab.SortBy(ColCPU) // descending
+	p, _ := tab.Row(0)
+	if p.Name != "HOT.BIN" {
+		t.Fatalf("cpu-desc top row = %q", p.Name)
 	}
 }

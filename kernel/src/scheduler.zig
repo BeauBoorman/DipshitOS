@@ -2585,11 +2585,32 @@ fn diagnose_exit_requests_locked() void {
 /// the D4 contract: a timed-out wait is distinct from a real wake.
 pub const futex_timed_out_result: u64 = @bitCast(@as(i64, -12));
 
+/// ADR 0047 (#2198): the machine tick denominator the sys_procs v2 rows
+/// export — Σ `smp.core_ticks` over online cores. Each core ticks
+/// independently, so the per-pid `cpu_ticks` / `total_ticks` quotient is a
+/// share of the machine's tick-capacity over the diff window.
+pub fn machine_ticks() u64 {
+    var total: u64 = 0;
+    for (0..smp.max_cores) |c| {
+        if (smp.core_online[c]) total +%= smp.core_ticks[c];
+    }
+    return total;
+}
+
+/// Online core count at call time (the row's `ncores` field — readers
+/// rescale share-of-machine into share-of-one-core).
+pub fn online_cores() u32 {
+    var n: u32 = 0;
+    for (0..smp.max_cores) |c| {
+        if (smp.core_online[c]) n += 1;
+    }
+    return n;
+}
+
 /// Host-testable tick seam (mirrors `timer.on_tick`): advance the tick
 /// counter and run the timer-driven wakeups. Called by the real `tick`
 /// before preemption; host tests call it directly to drive sleepers.
 pub fn on_tick() void {
-    const c = smp.core_id(); // per-core current
     tick_count +%= 1;
     diagnose_exit_requests_locked();
     wake_expired();
@@ -2602,23 +2623,11 @@ pub fn on_tick() void {
     // composite pacing moves OFF the shell idle to this tick path. A no-op
     // when no WM is registered (zero-regression: shim mode unchanged).
     wm_server.on_tick();
-    // Arc5 issue #246: per-process CPU limit enforcement. Increment the
-    // current process's tick counter; if the limit is exceeded, arm the
-    // ring's kill conversion with status 141 (distinct from guard-page
-    // 139). Claim 9498 follow-on: on_tick holds only the EV + kernel
-    // subset, while the exit teardown needs the FULL domain set — exiting
-    // synchronously here would require acquiring file/net/win out of
-    // canonical order (a deadlock risk against a teardown holding them),
-    // so the task converts at its next ring selection instead, one
-    // quantum later.
-    if (current[c] != idle_id and tasks[current[c]].state == .running) {
-        if (process.find_by_task(current[c])) |pid| {
-            if (process.inc_cpu_ticks(pid)) {
-                tasks[current[c]].kill_pending = true;
-                tasks[current[c]].kill_pending_status = reserved_cpu_limit_status;
-            }
-        }
-    }
+    // Arc5 issue #246's CPU-limit check rode here once — moved into tick()
+    // per core (ADR 0047, #2198): this beat only ever runs on core 0, so a
+    // charge here left cores 1-3 forever uncharged. The kill arm still
+    // converts at the task's next ring selection — the teardown needs the
+    // full domain set and never runs synchronously in tick context.
 }
 
 /// Remove the calling task from the runnable ring and stage its successor.
@@ -3100,6 +3109,24 @@ pub fn tick() void {
     // no tick can ever preempt a same-core hold.
     const evk = svclock.dom_bit(.ev) | svclock.dom_bit(.kernel);
     const evk_taken = svclock.try_take(evk);
+    if (evk_taken != null) {
+        // Arc5 issue #246 / ADR 0047 (#2198): per-process CPU attribution,
+        // charged per core — this tick preempted THIS core's current task,
+        // so this core's sample names it. (Was on_tick, which only ever
+        // runs inside the c==0 beat below and so never charged work on
+        // cores 1-3.) A skipped try_take drops the sample like any other
+        // housekeeping cadence loss; the kill arm converts at the task's
+        // next ring selection, status 141.
+        const cur = current[c];
+        if (cur != idle_id and tasks[cur].state == .running) {
+            if (process.find_by_task(cur)) |pid| {
+                if (process.inc_cpu_ticks(pid)) {
+                    tasks[cur].kill_pending = true;
+                    tasks[cur].kill_pending_status = reserved_cpu_limit_status;
+                }
+            }
+        }
+    }
     // Core-0 timekeeping authority (tick_count, wake_expired, app timers,
     // WM pacing, CPU limits) under a brief sched_lock TRY: the idle
     // reaper / monitor may hold sched_lock from main context with IRQs
