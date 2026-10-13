@@ -2449,3 +2449,53 @@ pins. Multiplicity that never existed before is the only new behavior:
 two processes hold live connections, one process holds a listener plus
 an outbound connection, and listeners coexist across processes —
 over-cap is `ENOSPC`, counted.
+
+## Amendment (2026-10-14, M99i #2187 — owned UDP ports, the source-aware seam)
+
+M99i's DNS-depth card makes the UDP listen table **per-process owned**
+and freezes slots 84–86 in the dispatch table (every existing number
+stays frozen; `implemented_count` is now 87):
+
+- `udp.payload_max` rises 64 → **512** (`datagram_max` 520, the full
+  8-byte header + payload). The slot-10/11 handlers now honor the
+  kernel bound; the Go `vi` package keeps its own 64/72 wrapper
+  refusal for the legacy clients written against it (timesync), and
+  the owned seam uses the real bound.
+- `udp.Datagram` now carries `src_ip: [4]u8` — `deliver` records the
+  sender's IPv4 (from the frame's IP header on the device path, the
+  interface's own IP on loopback) so slot 85 can report it.
+- `udp.listen_port_owned(port, owner)` binds a port to a pid;
+  `owner_of`, `release_owned`, and `release_owner` enforce it.
+  Rebinding a released port clears any queued datagrams; a stale seat
+  left by an exited process is reclaimed at the next bind
+  (`stale_reclaimed` counts the recoveries).
+
+| 84 | `sys_udp_send_from` | `udp_send_from(ip, dst_port, src_port, buf, len) -> i64` | Send ONE UDP datagram to `ip:dst_port` from the EXPLICIT source port `src_port`, which must be bound in the listen table by the CALLING process (`EINVAL` unbound or port 0, `EACCES` another owner's). `len` ≤ 512 through uaccess into the same fixed BSS staging as slot 10; `EFAULT` for a bad `buf`; 0 for a zero-length no-op. The N5 send contract is unchanged — the seam does NOT resolve ARP (`EINVAL` on `.no_peer`/`.not_ready`); resolve-then-retry is the caller's contract. Returns the payload length sent. |
+| 85 | `sys_udp_recv_from` | `udp_recv_from(port, buf, max) -> i64` | Copy the oldest datagram for the listener on `port` OUT through uaccess, prefixed with the sender's IPv4: `[4-byte source IP][8-byte UDP header][payload]` — `max` clamps to `udp.recv_from_max` 524, shorter truncates and CONSUMES. Returns the copied length; 0 when the ring is empty; `EINVAL` when not listening; `EACCES` when another process owns the port. Same peek-copy-pop contract and same drain-first pull as slot 11. |
+| 86 | `sys_udp_close` | `udp_close(port) -> i64` | Release a listen-table port owned by the calling process: `EINVAL` when unbound, `EACCES` when another process owns it, 0 on release. Queued datagrams die with the seat. A process that exits without closing is reclaimed by the stale-owner scan at the next `sys_udp_listen`. |
+
+Slot 9 (`sys_udp_listen`) now records the calling process as the port's
+owner — `EINVAL` still means port 0/out-of-range/already bound, but a
+full table is now `ENOSPC` (the caller retries a collision, not a
+full table). Slot 11 (`sys_udp_recv`) gains the owner check: a port
+bound by another process is `EACCES`, not a silent steal. Ownership
+is the spoof fix's other half: two processes' DNS transactions bind
+distinct ephemeral ports, and neither can read the other's reply.
+
+The EL0 consumer is `vi.Resolve` (user/go/vi/dns.go): one transaction =
+bind a CSPRNG-drawn ephemeral port (49152–65535, `EINVAL` collisions
+retried ≤ 8, `ENOSPC` fails fast), send from it (slot 84), poll the
+source-prefixed ring (slot 85) — dropping datagrams whose source IP
+is not the queried server, whose source port is not 53, whose ID is
+not the CSPRNG-drawn query ID, or whose echoed question does not match
+byte-for-byte — then close (slot 86) on every path. `timesync` and the
+legacy one-shot clients ride the unchanged slot-10 fixed port.
+
+### Observable contract
+
+`live-net-udp-syscall` stays byte-identical and green (legacy slots
+9–11 keep their wire shape; ownership is invisible to a single
+process). `live-n5-dns` gains the depth legs: AAAA, multi-answer,
+TTL cache hit + expiry, concurrent transactions on distinct source
+ports, spoof/wrong-question rejection, and the explicit `TC=1`
+refusal with no TCP fallback.

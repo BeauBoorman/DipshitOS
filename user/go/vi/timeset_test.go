@@ -46,8 +46,15 @@ func TestTimeSetRefusesANonPositiveEpochWithoutASyscall(t *testing.T) {
 	}
 }
 
-func TestUDPSeamBoundsAreTheDNSOnes(t *testing.T) {
+// The exported seam bounds pin the LEGACY fixed-port contract timesync
+// was written against (M99i raised the KERNEL bound to 512, but the
+// slot-10/11 wrapper keeps its 64/72 refusal for its existing clients;
+// the owned DNS seam uses the real 512/524).
+func TestUDPSeamBoundsAreTheLegacyOnes(t *testing.T) {
 	if UDPSourcePort != 7000 || UDPPayloadMax != 64 || UDPDatagramMax != 72 {
 		t.Fatalf("seam bounds drifted: port=%d payload=%d datagram=%d", UDPSourcePort, UDPPayloadMax, UDPDatagramMax)
+	}
+	if udpFromPayloadMax != 512 || udpRecvFromMax != 524 {
+		t.Fatalf("owned seam bounds drifted: payload=%d recv=%d", udpFromPayloadMax, udpRecvFromMax)
 	}
 }

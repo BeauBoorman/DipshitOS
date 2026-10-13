@@ -628,6 +628,24 @@ var netUdpRespondHostPort: UInt16?
 // DNS resolver inside the capture thread.
 var netDnsRespondHostIP: [UInt8]?
 var netDnsRespondHostPort: UInt16 = 53
+// M99i (issue #2187): the responder's depth knobs, all gated on
+// --net-dns-respond. `--net-dns-answer <ipv4>` (repeatable) pins the A
+// records every A reply carries (empty = the legacy qname table, one
+// answer). `--net-dns-answer6 <32 hex digits>` (repeatable) pins the
+// AAAA records every AAAA reply carries (empty = one fixed 2001:db8::53).
+// `--net-dns-ttl <sec>` is the TTL written into every record (default
+// 300). The hostile knobs inject noise BEFORE the real reply so the
+// guest's rejection path is exercised, not just asserted:
+// `--net-dns-spoof` sends the same reply forged from source IP 10.0.0.9,
+// `--net-dns-wrong-question` sends a reply whose echoed question section
+// is corrupted, and `--net-dns-truncate` answers every query with TC=1
+// and ANCOUNT=0 (the guest must refuse — no TCP fallback exists).
+var netDnsAnswers: [[UInt8]] = []
+var netDnsAnswers6: [[UInt8]] = []
+var netDnsTTL: UInt32 = 300
+var netDnsSpoof = false
+var netDnsWrongQuestion = false
+var netDnsTruncate = false
 // M83b (#1775): `--net-sntp-respond <host-ip>[:<port>]` answers the guest's
 // SNTP queries with host wall-clock time + `--net-sntp-skew` seconds.
 var netSntpRespondHostIP: [UInt8]?
@@ -1287,6 +1305,38 @@ while idx < arguments.count {
             fail("--net-dns-respond port must be 1..65535, got '\(halves[1])'.")
         }
         idx += 2
+    } else if arg == "--net-dns-answer", idx + 1 < arguments.count {
+        // M99i (issue #2187): pin an A record into every A reply.
+        let parts = arguments[idx + 1].split(separator: ".").compactMap { UInt8($0) }
+        guard parts.count == 4 else {
+            fail("--net-dns-answer requires a dotted-quad IPv4 address, got '\(arguments[idx + 1])'.")
+        }
+        netDnsAnswers.append(parts)
+        idx += 2
+    } else if arg == "--net-dns-answer6", idx + 1 < arguments.count {
+        // M99i: pin an AAAA record into every AAAA reply — 32 hex
+        // digits (colons tolerated, stripped).
+        let hex = arguments[idx + 1].replacingOccurrences(of: ":", with: "")
+        guard hex.count == 32, let rdata = parseHexBytes(hex), rdata.count == 16 else {
+            fail("--net-dns-answer6 requires 32 hex digits (colons optional), got '\(arguments[idx + 1])'.")
+        }
+        netDnsAnswers6.append(rdata)
+        idx += 2
+    } else if arg == "--net-dns-ttl", idx + 1 < arguments.count {
+        guard let ttl = UInt32(arguments[idx + 1]) else {
+            fail("--net-dns-ttl requires a non-negative integer, got '\(arguments[idx + 1])'.")
+        }
+        netDnsTTL = ttl
+        idx += 2
+    } else if arg == "--net-dns-spoof" {
+        netDnsSpoof = true
+        idx += 1
+    } else if arg == "--net-dns-wrong-question" {
+        netDnsWrongQuestion = true
+        idx += 1
+    } else if arg == "--net-dns-truncate" {
+        netDnsTruncate = true
+        idx += 1
     } else if arg == "--net-sntp-respond", idx + 1 < arguments.count {
         let token = arguments[idx + 1]
         let halves = token.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
@@ -1937,6 +1987,13 @@ if netUdpRespondHostIP != nil, netCapturePath == nil {
 if netDnsRespondHostIP != nil, netCapturePath == nil {
     fail("--net-dns-respond requires --net (the DNS reply is written into the SAME attachment's socket).")
 }
+// M99i (issue #2187): the depth knobs are meaningless without the
+// responder they configure.
+if netDnsRespondHostIP == nil,
+   !netDnsAnswers.isEmpty || !netDnsAnswers6.isEmpty || netDnsTTL != 300 ||
+   netDnsSpoof || netDnsWrongQuestion || netDnsTruncate {
+    fail("--net-dns-answer/--net-dns-answer6/--net-dns-ttl/--net-dns-spoof/--net-dns-wrong-question/--net-dns-truncate require --net-dns-respond.")
+}
 if netSntpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-sntp-respond requires --net (the SNTP reply is written into the SAME attachment's socket).")
 }
@@ -2127,15 +2184,45 @@ if let netCapturePath {
                 let srcPort = (UInt16(buf[34]) << 8) | UInt16(buf[35])
                 print("NET-UDP: answered the guest's datagram for \(hostIP[0]).\(hostIP[1]).\(hostIP[2]).\(hostIP[3]):\(hostPort) (reply to guest src port \(srcPort), \(n - 42) payload bytes)")
             }
-            // Card N2 (claim 7566): DNS responder
+            // Card N2 (claim 7566): DNS responder; M99i (#2187) added the
+            // answer-set/depth knobs and the hostile injects. The noise
+            // datagrams go out BEFORE the real reply so the guest's
+            // rejection path is what lets the good answer through.
             if let hostIP = netDnsRespondHostIP, isDnsQuery(buf, n, hostIP, netDnsRespondHostPort) {
-                var reply = [UInt8](repeating: 0, count: 512)
-                let replyLen = buildDnsReply(&reply, buf, n, arpHostMAC, hostIP, netDnsRespondHostPort)
+                let qname = extractDnsQName(buf, n)
+                let qtype = dnsQueryType(buf, n)
+                let answers = dnsAnswersFor(qtype, qname)
+                let srcPort = (UInt16(buf[34]) << 8) | UInt16(buf[35])
+                if netDnsSpoof {
+                    var forged = [UInt8](repeating: 0, count: 1518)
+                    let flen = buildDnsReply(&forged, buf, n, arpHostMAC, hostIP, netDnsRespondHostPort,
+                                             answers: answers, ttl: netDnsTTL, truncate: false,
+                                             forgeSrcIP: [10, 0, 0, 9])
+                    if flen > 0 {
+                        try? netCaptureReadSocket?.write(contentsOf: Data(forged[0..<flen]))
+                        print("NET-DNS: injected a reply forged from 10.0.0.9 for '\(qname)' (the guest must drop it)")
+                    }
+                }
+                if netDnsWrongQuestion {
+                    var wq = [UInt8](repeating: 0, count: 1518)
+                    let wlen = buildDnsReply(&wq, buf, n, arpHostMAC, hostIP, netDnsRespondHostPort,
+                                             answers: answers, ttl: netDnsTTL, truncate: false,
+                                             corruptQuestion: true)
+                    if wlen > 0 {
+                        try? netCaptureReadSocket?.write(contentsOf: Data(wq[0..<wlen]))
+                        print("NET-DNS: injected a corrupted-question reply for '\(qname)' (the guest must drop it)")
+                    }
+                }
+                var reply = [UInt8](repeating: 0, count: 1518)
+                let replyLen = buildDnsReply(&reply, buf, n, arpHostMAC, hostIP, netDnsRespondHostPort,
+                                             answers: answers, ttl: netDnsTTL, truncate: netDnsTruncate)
                 if replyLen > 0 {
                     try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
-                    let qname = extractDnsQName(buf, n)
-                    let srcPort = (UInt16(buf[34]) << 8) | UInt16(buf[35])
-                    print("NET-DNS: answered the guest's DNS query for '\(qname)' (reply to guest src port \(srcPort), resolved to 93.184.216.34)")
+                    if netDnsTruncate {
+                        print("NET-DNS: answered the guest's DNS query for '\(qname)' qtype=\(qtype) with TC=1 ANCOUNT=0 (reply to guest src port \(srcPort); the guest must refuse truncation)")
+                    } else {
+                        print("NET-DNS: answered the guest's DNS query for '\(qname)' qtype=\(qtype) ancount=\(answers.count) ttl=\(netDnsTTL) (reply to guest src port \(srcPort))")
+                    }
                 }
             }
             // M83b (#1775): SNTP responder
@@ -2698,7 +2785,11 @@ if let hostIP = netUdpRespondHostIP, let hostPort = netUdpRespondHostPort {
 }
 if let hostIP = netDnsRespondHostIP {
     let ipText = hostIP.map(String.init).joined(separator: ".")
-    print("  net-dns-respond: ENABLED (milestone twelve card N2, claim 7566) — the host answers the guest's DNS queries for \(ipText):\(netDnsRespondHostPort) via the capture thread (deterministic, request-driven)")
+    var knobs = "a=\(netDnsAnswers.count) aaaa=\(netDnsAnswers6.count) ttl=\(netDnsTTL)"
+    if netDnsSpoof { knobs += " spoof" }
+    if netDnsWrongQuestion { knobs += " wrong-question" }
+    if netDnsTruncate { knobs += " truncate" }
+    print("  net-dns-respond: ENABLED (milestone twelve card N2, claim 7566; depth M99i #2187) — the host answers the guest's DNS queries for \(ipText):\(netDnsRespondHostPort) via the capture thread (deterministic, request-driven; \(knobs))")
 }
 if let hostIP = netSntpRespondHostIP {
     let ipText = hostIP.map(String.init).joined(separator: ".")
@@ -5170,6 +5261,21 @@ func buildUdpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[41] = UInt8(udpChk & 0xff)
 }
 
+// M99i (issue #2187): hex helper for --net-dns-answer6.
+func parseHexBytes(_ hex: String) -> [UInt8]? {
+    guard hex.count % 2 == 0 else { return nil }
+    var out: [UInt8] = []
+    out.reserveCapacity(hex.count / 2)
+    var i = hex.startIndex
+    while i < hex.endIndex {
+        let j = hex.index(i, offsetBy: 2)
+        guard let b = UInt8(hex[i..<j], radix: 16) else { return nil }
+        out.append(b)
+        i = j
+    }
+    return out
+}
+
 // Milestone twelve card N2 (claim 7566): DNS packet matching & response synthesis
 func isDnsQuery(_ buf: [UInt8], _ n: Int, _ hostIP: [UInt8], _ hostPort: UInt16) -> Bool {
     guard n >= 42 + 12 + 5 else { return false }
@@ -5200,15 +5306,49 @@ func extractDnsQName(_ buf: [UInt8], _ n: Int) -> String {
     return labels.joined(separator: ".")
 }
 
-func buildDnsReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostIP: [UInt8], _ hostPort: UInt16) -> Int {
-    let qname = extractDnsQName(req, n)
+// M99i (issue #2187): the QTYPE the request's question section asks for
+// (offset 42+12 qname, then QTYPE/QCLASS).
+func dnsQueryType(_ req: [UInt8], _ n: Int) -> UInt16 {
+    var off = 42 + 12
+    while off < n {
+        let len = Int(req[off])
+        if len == 0 { off += 1; break }
+        if (len & 0xC0) != 0 { off += 2; break }
+        off += 1 + len
+    }
+    guard off + 2 <= n else { return 1 }
+    return (UInt16(req[off]) << 8) | UInt16(req[off + 1])
+}
+
+// M99i: the answer set for one query. A queries take the configured A
+// records (or the legacy qname table, one answer — the pre-M99i
+// behavior); AAAA queries take the configured AAAA records (or one fixed
+// 2001:db8::53).
+func dnsAnswersFor(_ qtype: UInt16, _ qname: String) -> [(rtype: UInt16, rdata: [UInt8])] {
+    if qtype == 28 {
+        if !netDnsAnswers6.isEmpty {
+            return netDnsAnswers6.map { (28, $0) }
+        }
+        return [(28, [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53])]
+    }
+    if !netDnsAnswers.isEmpty {
+        return netDnsAnswers.map { (1, $0) }
+    }
     var resolvedIP: [UInt8] = [93, 184, 216, 34]
     if qname == "myhost.local" || qname == "gateway.local" {
         resolvedIP = [10, 0, 0, 2]
     } else if qname == "virelai.local" {
         resolvedIP = [10, 0, 0, 1]
     }
+    return [(1, resolvedIP)]
+}
 
+// M99i: builds the full Ethernet reply. `answers` is the record set,
+// `ttl` is written into each, `truncate` answers TC=1/ANCOUNT=0,
+// `forgeSrcIP` replaces the packet's source IPv4 (the spoof knob), and
+// `corruptQuestion` flips the echoed question's first label byte so the
+// guest's byte-exact question check rejects it.
+func buildDnsReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostIP: [UInt8], _ hostPort: UInt16, answers: [(rtype: UInt16, rdata: [UInt8])], ttl: UInt32, truncate: Bool, forgeSrcIP: [UInt8]? = nil, corruptQuestion: Bool = false) -> Int {
     var off = 42 + 12
     while off < n {
         let len = Int(req[off])
@@ -5220,40 +5360,53 @@ func buildDnsReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     if off > n { return 0 }
     let questionLen = off - (42 + 12)
 
-    var dnsPayload = [UInt8](repeating: 0, count: 12 + questionLen + 16)
+    let ancount = truncate ? 0 : answers.count
+    var answersLen = 0
+    for a in answers { answersLen += 12 + a.rdata.count }
+
+    var dnsPayload = [UInt8](repeating: 0, count: 12 + questionLen + answersLen)
     dnsPayload[0] = req[42]
     dnsPayload[1] = req[43]
-    dnsPayload[2] = 0x81
+    dnsPayload[2] = truncate ? 0x83 : 0x81
     dnsPayload[3] = 0x80
     dnsPayload[4] = 0x00
     dnsPayload[5] = 0x01
-    dnsPayload[6] = 0x00
-    dnsPayload[7] = 0x01
+    dnsPayload[6] = UInt8(ancount >> 8)
+    dnsPayload[7] = UInt8(ancount & 0xff)
     dnsPayload[8] = 0x00
     dnsPayload[9] = 0x00
     dnsPayload[10] = 0x00
     dnsPayload[11] = 0x00
 
     dnsPayload[12..<(12 + questionLen)] = req[(42 + 12)..<off]
+    if corruptQuestion, questionLen > 2 {
+        // Flip the case of the first label's first byte — DNS name
+        // comparison is case-insensitive on paper, but the guest's
+        // byte-exact echo check must refuse it.
+        dnsPayload[13] ^= 0x20
+    }
 
-    let aoff = 12 + questionLen
-    dnsPayload[aoff + 0] = 0xC0
-    dnsPayload[aoff + 1] = 0x0C
-    dnsPayload[aoff + 2] = 0x00
-    dnsPayload[aoff + 3] = 0x01
-    dnsPayload[aoff + 4] = 0x00
-    dnsPayload[aoff + 5] = 0x01
-    dnsPayload[aoff + 6] = 0x00
-    dnsPayload[aoff + 7] = 0x00
-    dnsPayload[aoff + 8] = 0x01
-    dnsPayload[aoff + 9] = 0x2C
-    dnsPayload[aoff + 10] = 0x00
-    dnsPayload[aoff + 11] = 0x04
-    dnsPayload[aoff + 12] = resolvedIP[0]
-    dnsPayload[aoff + 13] = resolvedIP[1]
-    dnsPayload[aoff + 14] = resolvedIP[2]
-    dnsPayload[aoff + 15] = resolvedIP[3]
+    var aoff = 12 + questionLen
+    for a in answers {
+        dnsPayload[aoff + 0] = 0xC0
+        dnsPayload[aoff + 1] = 0x0C
+        dnsPayload[aoff + 2] = UInt8(a.rtype >> 8)
+        dnsPayload[aoff + 3] = UInt8(a.rtype & 0xff)
+        dnsPayload[aoff + 4] = 0x00
+        dnsPayload[aoff + 5] = 0x01
+        dnsPayload[aoff + 6] = UInt8(ttl >> 24)
+        dnsPayload[aoff + 7] = UInt8((ttl >> 16) & 0xff)
+        dnsPayload[aoff + 8] = UInt8((ttl >> 8) & 0xff)
+        dnsPayload[aoff + 9] = UInt8(ttl & 0xff)
+        dnsPayload[aoff + 10] = UInt8(a.rdata.count >> 8)
+        dnsPayload[aoff + 11] = UInt8(a.rdata.count & 0xff)
+        for (i, b) in a.rdata.enumerated() {
+            dnsPayload[aoff + 12 + i] = b
+        }
+        aoff += 12 + a.rdata.count
+    }
 
+    let srcIP = forgeSrcIP ?? hostIP
     let totalLen = 42 + dnsPayload.count
     reply = [UInt8](repeating: 0, count: totalLen)
     reply[0...5] = req[6...11]
@@ -5267,7 +5420,7 @@ func buildDnsReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[18...19] = req[18...19]
     reply[22] = 64
     reply[23] = 17
-    reply[26...29] = hostIP[0...3]
+    reply[26...29] = srcIP[0...3]
     reply[30...33] = req[26...29]
     let hdrChk = ipChecksum(reply, 14, 34)
     reply[24] = UInt8(hdrChk >> 8)
@@ -5286,7 +5439,7 @@ func buildDnsReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     var datagram = [UInt8](reply[34..<totalLen])
     datagram[6] = 0
     datagram[7] = 0
-    let udpChk = udpChecksum(hostIP, senderIP, datagram, udpLen)
+    let udpChk = udpChecksum(srcIP, senderIP, datagram, udpLen)
     reply[40] = UInt8(udpChk >> 8)
     reply[41] = UInt8(udpChk & 0xff)
 

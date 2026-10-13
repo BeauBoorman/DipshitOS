@@ -162,6 +162,12 @@ pub const sys_wait: u64 = 8;
 pub const sys_udp_listen: u64 = 9;
 pub const sys_udp_send: u64 = 10;
 pub const sys_udp_recv: u64 = 11;
+/// M99i (#2187, ADR 0007): the owned/ephemeral UDP seam — send_from an
+/// owned bound port, recv_from with the sender's IPv4 prepended, and
+/// close releasing an owned bind.
+pub const sys_udp_send_from: u64 = 84;
+pub const sys_udp_recv_from: u64 = 85;
+pub const sys_udp_close: u64 = 86;
 /// Card G6 (claim 0487): the draw/window syscall seam — slots 12/13/14, the
 /// card's ONE ABI change (the ipc slots-5/6, slots-7/8, and udp slots-9/10/11
 /// precedents; every existing syscall number 0–11 stays frozen).
@@ -524,6 +530,8 @@ var getrandom_scratch: [getrandom_max]u8 = undefined;
 /// call, no allocation (the ipc staging pattern).
 var udp_send_staging: [udp.payload_max]u8 = undefined;
 var udp_recv_scratch: [udp.datagram_max]u8 = undefined;
+/// M99i (#2187): the slot-85 copy-out staging — src-IP prefix + datagram.
+var udp_recv_from_scratch: [udp.recv_from_max]u8 = undefined;
 /// Milestone 12 (claim 7483): fixed BSS scratch for TCP send payload.
 var tcp_send_staging: [tcp.payload_max]u8 = undefined;
 /// Milestone 14 (claim 0169): fixed BSS scratch for the clipboard (set
@@ -589,6 +597,9 @@ fn handler_for(comptime number: u64) Handler {
         sys_udp_listen => handle_udp_listen,
         sys_udp_send => handle_udp_send,
         sys_udp_recv => handle_udp_recv,
+        sys_udp_send_from => handle_udp_send_from,
+        sys_udp_recv_from => handle_udp_recv_from,
+        sys_udp_close => handle_udp_close,
         sys_win_open => handle_win_open,
         sys_win_fill => handle_win_fill,
         sys_win_present => handle_win_present,
@@ -696,7 +707,7 @@ fn doms_of(number: u64) u5 {
     const e: u5 = svclock.dom_bit(.ev);
     const k: u5 = svclock.dom_bit(.kernel);
     return switch (number) {
-        sys_udp_listen, sys_udp_send, sys_udp_recv, sys_tcp_connect, sys_tcp_send, sys_tcp_recv, sys_tcp_close, sys_sock_ready, sys_socket, sys_ping_send, sys_ping_poll, sys_net_stats => n,
+        sys_udp_listen, sys_udp_send, sys_udp_recv, sys_udp_send_from, sys_udp_recv_from, sys_udp_close, sys_tcp_connect, sys_tcp_send, sys_tcp_recv, sys_tcp_close, sys_sock_ready, sys_socket, sys_ping_send, sys_ping_poll, sys_net_stats => n,
         sys_file_open, sys_file_read, sys_file_write, sys_file_close, sys_dir_list, sys_file_delete, sys_file_rename, sys_file_truncate, sys_file_free, sys_file_sync, sys_fs_metadata => f,
         sys_exec => f | k,
         sys_trace => f | k, // M94b's atomic arm-and-exec needs both domains.
@@ -1065,8 +1076,41 @@ fn handle_wait(args: Args, frame: *exceptions.VectorFrame) u64 {
 fn handle_udp_listen(args: Args, _: *exceptions.VectorFrame) u64 {
     const port = args[0];
     if (port == 0 or port > 0xffff) return error_result(.einval);
-    if (!udp.listen_port(@truncate(port))) return error_result(.einval);
+    // M99i (#2187): the bind records its owner — a caller without a
+    // process (kernel/test dispatch) binds `unowned`, matching the
+    // monitor's `net udp listen`. Stale seats left by exited processes
+    // are reclaimed before the table-full refusal.
+    const owner: u64 = process.find_by_task(scheduler.current_id()) orelse udp.unowned;
+    reclaimStaleUdpPorts();
+    // A claimed port is EINVAL; the bound being exhausted is ENOSPC —
+    // two distinct refusals so an ephemeral-port allocator can retry a
+    // collision but must not spin on a full table.
+    if (udp.owner_of(@truncate(port)) != null) return error_result(.einval);
+    if (!udp.listen_port_owned(@truncate(port), owner)) return error_result(.enospc);
     return 0;
+}
+
+/// M99i (#2187): free listen-table seats whose owner pid no longer names
+/// a live process (a program that exits without `sys_udp_close` would
+/// otherwise leak its four global slots). udp.zig cannot see process
+/// state (import direction), so the scan runs here.
+fn reclaimStaleUdpPorts() void {
+    var reclaimed: usize = 0;
+    defer {
+        if (reclaimed != 0) udp.stale_reclaimed +%= @intCast(reclaimed);
+    }
+    for (udp.listen) |e| {
+        if (!e.valid or e.owner == udp.unowned) continue;
+        const info = process.info(@intCast(e.owner)) orelse {
+            _ = udp.release_owner(e.owner);
+            reclaimed += 1;
+            continue;
+        };
+        if (info.state == .exited) {
+            _ = udp.release_owner(e.owner);
+            reclaimed += 1;
+        }
+    }
 }
 
 /// `sys_udp_send(ip, port, buf, len)`: send ONE UDP datagram to
@@ -1128,12 +1172,93 @@ fn handle_udp_recv(args: Args, _: *exceptions.VectorFrame) u64 {
     if (max > udp.datagram_max) max = udp.datagram_max; // documented clamp
     if (port == 0 or port > 0xffff) return error_result(.einval);
     virtio_net.net_rx_drain(); // the polled-drain contract (no-op unarmed)
-    if (!udp.is_listening(@truncate(port))) return error_result(.einval);
+    // M99i (#2187): the port's owner reads it — a task can no longer
+    // drain another task's reply (the spoofing gap this card closes).
+    // A no-process caller owns `unowned` ports, matching the bind side.
+    const owner: u64 = process.find_by_task(scheduler.current_id()) orelse udp.unowned;
+    const bound = udp.owner_of(@truncate(port)) orelse return error_result(.einval);
+    if (bound != owner) return error_result(.eacces);
     const d = udp.peek(@truncate(port)) orelse return 0; // empty ring
     const take = @min(@as(usize, @intCast(max)), d.len);
     if (uaccess.copy_out(address, d.bytes[0..take], take) != .ok) return error_result(.efault);
     _ = udp.pop(@truncate(port)); // consume (the EFAULT path preserved it)
     return @intCast(take);
+}
+
+/// `sys_udp_send_from(ip, dst_port, src_port, buf, len)` — slot 84
+/// (M99i #2187, ADR 0007): `sys_udp_send` with an EXPLICIT source port
+/// that must be a listen-table port bound by the CALLER — the model is
+/// "send from the port your transaction bound", so the reply lands on a
+/// port only this process can read. `src_port` unbound → EINVAL; bound
+/// by another owner → EACCES. All other checks mirror slot 10 (payload
+/// ≤ `udp.payload_max` truncates honestly, no ARP resolution, own-IP
+/// loopback). Returns the payload length sent.
+fn handle_udp_send_from(args: Args, _: *exceptions.VectorFrame) u64 {
+    const ip_raw = args[0];
+    const dst_port = args[1];
+    const src_port = args[2];
+    const address = args[3];
+    var len = args[4];
+    if (dst_port == 0 or dst_port > 0xffff or src_port == 0 or src_port > 0xffff) return error_result(.einval);
+    const owner: u64 = process.find_by_task(scheduler.current_id()) orelse udp.unowned;
+    const bound = udp.owner_of(@truncate(src_port)) orelse return error_result(.einval);
+    if (bound != owner) return error_result(.eacces);
+    if (len == 0) return 0;
+    if (len > udp.payload_max) len = udp.payload_max; // documented truncation
+    const ip: [4]u8 = .{
+        @truncate(ip_raw >> 24),
+        @truncate(ip_raw >> 16),
+        @truncate(ip_raw >> 8),
+        @truncate(ip_raw),
+    };
+    if (uaccess.copy_in(&udp_send_staging, address, @intCast(len)) != .ok) return error_result(.efault);
+    var out_len: usize = 0;
+    switch (virtio_net.net_udp_send_from(ip, @truncate(src_port), @truncate(dst_port), udp_send_staging[0..@intCast(len)], &out_len)) {
+        .ok => return len,
+        .not_ready, .no_peer, .timeout => return error_result(.einval),
+    }
+}
+
+/// `sys_udp_recv_from(port, buf, max)` — slot 85 (M99i #2187, ADR 0007):
+/// `sys_udp_recv` with the sender's IPv4 address prepended — the copied
+/// shape is `[4-byte src ip][8-byte UDP header][payload]`, clamped to
+/// `udp.recv_from_max` (524). The resolver needs the source IP for the
+/// reply-spoof check (M97e-F5 posture on the Go path). Same ownership
+/// rule, same peek→copy_out→pop contract, same drain as slot 11.
+fn handle_udp_recv_from(args: Args, _: *exceptions.VectorFrame) u64 {
+    const port = args[0];
+    const address = args[1];
+    var max = args[2];
+    if (max == 0) return 0;
+    if (max > udp.recv_from_max) max = udp.recv_from_max; // documented clamp
+    if (port == 0 or port > 0xffff) return error_result(.einval);
+    virtio_net.net_rx_drain(); // the polled-drain contract (no-op unarmed)
+    const owner: u64 = process.find_by_task(scheduler.current_id()) orelse udp.unowned;
+    const bound = udp.owner_of(@truncate(port)) orelse return error_result(.einval);
+    if (bound != owner) return error_result(.eacces);
+    const d = udp.peek(@truncate(port)) orelse return 0; // empty ring
+    // Stage the prefixed shape: src ip, then the stored datagram.
+    udp_recv_from_scratch[0..4].* = d.src_ip;
+    const take = @min(@as(usize, @intCast(max)) -| 4, d.len);
+    const total = take + 4;
+    @memcpy(udp_recv_from_scratch[4 .. 4 + take], d.bytes[0..take]);
+    if (uaccess.copy_out(address, udp_recv_from_scratch[0..total], total) != .ok) return error_result(.efault);
+    _ = udp.pop(@truncate(port)); // consume (the EFAULT path preserved it)
+    return @intCast(total);
+}
+
+/// `sys_udp_close(port)` — slot 86 (M99i #2187, ADR 0007): release a
+/// listen-table port the CALLER owns (per-transaction binds require
+/// release or the bounded table fills). Unbound → EINVAL; another
+/// owner's → EACCES. Returns 0.
+fn handle_udp_close(args: Args, _: *exceptions.VectorFrame) u64 {
+    const port = args[0];
+    if (port == 0 or port > 0xffff) return error_result(.einval);
+    const owner: u64 = process.find_by_task(scheduler.current_id()) orelse udp.unowned;
+    const bound = udp.owner_of(@truncate(port)) orelse return error_result(.einval);
+    if (bound != owner) return error_result(.eacces);
+    if (!udp.release_owned(owner, @truncate(port))) return error_result(.einval);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

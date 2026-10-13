@@ -27,13 +27,18 @@ pub const protocol_udp: u8 = 17;
 pub const default_src_port: u16 = 7000;
 /// Bounded payload for `net udp send` (the honest bound — the byte-index
 /// pattern, gate-assertable). Over-length sends truncate honestly.
-pub const payload_max: usize = 64;
+/// M99i (#2187): raised 64 -> 512 — a multi-answer DNS reply cannot fit a
+/// 64-byte datagram; 512 is the classic RFC 1035 UDP bound (no EDNS0).
+pub const payload_max: usize = 512;
 /// Datagram storage: 8-byte header + the bounded payload.
-pub const datagram_max: usize = udp_hdr_len + payload_max; // 72
+pub const datagram_max: usize = udp_hdr_len + payload_max; // 520
+/// M99i (#2187): the slot-85 `sys_udp_recv_from` shape prepends the
+/// sender's IPv4 address to the datagram — 4 + datagram_max.
+pub const recv_from_max: usize = 4 + datagram_max; // 524
 /// The smallest full frame: Ethernet + IPv4 + the 8-byte UDP header.
 pub const frame_min: usize = eth_hdr_len + ipv4_hdr_len + udp_hdr_len; // 42
 /// The largest full frame: Ethernet + IPv4 + header + the bounded payload.
-pub const frame_max: usize = eth_hdr_len + ipv4_hdr_len + udp_hdr_len + payload_max; // 106
+pub const frame_max: usize = eth_hdr_len + ipv4_hdr_len + udp_hdr_len + payload_max; // 554
 /// Bounded listen table (the ARP-table pattern: 4 slots, pure BSS).
 pub const listen_slots: usize = 4;
 /// Bounded datagram buffer PER listener (drop-oldest, the N2 FIFO pattern).
@@ -49,18 +54,33 @@ pub var loopbacked: u64 = 0; // sends that took the local loopback path (no devi
 pub var dropped_badsum: u64 = 0; // UDP checksum mismatch (pseudo-header + datagram)
 pub var dropped_closed: u64 = 0; // datagram for a port with NO listener
 pub var dropped_len: u64 = 0; // length < 8 or exceeding the frame's remaining bytes
+/// M99i (#2187): listen-table seats reclaimed from exited owners by the
+/// syscall layer (a program that exits without sys_udp_close).
+pub var stale_reclaimed: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // State (pure BSS, the fat.zig pattern)
 // ---------------------------------------------------------------------------
 
+/// M99i (#2187): the owner a `sys_udp_listen` bind records — the pid that
+/// bound the port. Kernel-internal binds (`net udp listen`, the slot-80
+/// DNS transaction's ephemeral port) carry `unowned` and are not
+/// receivable or releasable from EL0.
+pub const unowned: u64 = 0;
+
 pub const ListenEntry = struct {
     port: u16 = 0,
+    /// M99i: owner pid of the binding process (`unowned` for kernel binds).
+    owner: u64 = unowned,
     valid: bool = false,
 };
 
 pub const Datagram = struct {
     len: usize = 0,
+    /// M99i: the sender's IPv4 address, kept from the IP header — the
+    /// slot-85 recv-from shape prepends it so a resolver can check the
+    /// reply came from the server it asked.
+    src_ip: [4]u8 = .{ 0, 0, 0, 0 },
     bytes: [datagram_max]u8 = undefined,
 };
 
@@ -148,16 +168,63 @@ pub fn build_datagram(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, ds
 // ---------------------------------------------------------------------------
 
 pub fn listen_port(port: u16) bool {
+    return listen_port_owned(port, unowned);
+}
+
+/// M99i (#2187): bind `port` recording `owner` (the caller's pid, or
+/// `unowned` for kernel callers). Duplicate port or full table → false,
+/// the same honest bool `listen_port` always returned.
+pub fn listen_port_owned(port: u16, owner: u64) bool {
     for (&listen) |*e| {
         if (e.valid and e.port == port) return false; // duplicate
     }
     for (&listen) |*e| {
         if (!e.valid) {
-            e.* = .{ .port = port, .valid = true };
+            e.* = .{ .port = port, .owner = owner, .valid = true };
             return true;
         }
     }
     return false; // table full
+}
+
+/// M99i (#2187): release `port` only when `owner` bound it. True on
+/// release — the EL0 `sys_udp_close` maps the false cases onto honest
+/// errnos (not bound → EINVAL, another owner's → EACCES).
+pub fn release_owned(owner: u64, port: u16) bool {
+    for (&listen, 0..) |*e, i| {
+        if (e.valid and e.port == port and e.owner == owner) {
+            e.valid = false;
+            buf_head[i] = 0;
+            buf_count[i] = 0; // the listener's ring is drained with it
+            return true;
+        }
+    }
+    return false;
+}
+
+/// M99i (#2187): the owner recorded for `port` — null when the port is
+/// not bound (the syscall layer distinguishes EINVAL from EACCES).
+pub fn owner_of(port: u16) ?u64 {
+    for (listen) |e| {
+        if (e.valid and e.port == port) return e.owner;
+    }
+    return null;
+}
+
+/// M99i (#2187): release EVERY port `owner` bound (a dead process's
+/// seats are reclaimed by the syscall layer — udp itself cannot see
+/// process state without an import cycle). Returns the count freed.
+pub fn release_owner(owner: u64) usize {
+    var freed: usize = 0;
+    for (&listen, 0..) |*e, i| {
+        if (e.valid and e.owner == owner) {
+            e.valid = false;
+            buf_head[i] = 0;
+            buf_count[i] = 0;
+            freed += 1;
+        }
+    }
+    return freed;
 }
 
 pub fn close_port(port: u16) bool {
@@ -165,6 +232,7 @@ pub fn close_port(port: u16) bool {
         if (e.valid and e.port == port) {
             e.valid = false;
             buf_head[i] = 0; // the listener's ring is drained with it
+            buf_count[i] = 0;
             return true;
         }
     }
@@ -193,10 +261,12 @@ pub fn reset() void {
     dropped_len = 0;
 }
 
-/// Deliver `datagram` (header + payload) to the listener for `dst_port`:
-/// stored in the listener's bounded ring (drop-oldest) and counted. A port
-/// with no listener is dropped (`dropped_closed`) — never assumed away.
-pub fn deliver(dst_port: u16, datagram: []const u8) void {
+/// Deliver `datagram` (header + payload) from `src_ip` to the listener
+/// for `dst_port`: stored in the listener's bounded ring (drop-oldest)
+/// and counted. A port with no listener is dropped (`dropped_closed`) —
+/// never assumed away. M99i keeps the sender's address so the recv-from
+/// shape can hand it to EL0.
+pub fn deliver(dst_port: u16, src_ip: [4]u8, datagram: []const u8) void {
     const slot = find_listener(dst_port) orelse {
         dropped_closed += 1;
         return;
@@ -206,6 +276,7 @@ pub fn deliver(dst_port: u16, datagram: []const u8) void {
     const idx = (head + count) % buffer_slots;
     const d = &buffers[slot][idx];
     d.len = @min(datagram.len, datagram_max);
+    d.src_ip = src_ip;
     @memcpy(d.bytes[0..d.len], datagram[0..d.len]);
     if (count < buffer_slots) {
         buf_count[slot] = count + 1;
@@ -292,7 +363,7 @@ pub fn handle_rx(frame: []const u8) void {
         _ = dhcp.handle_rx(datagram);
         return;
     }
-    deliver(dst_port, datagram);
+    deliver(dst_port, src, datagram);
 }
 
 /// Build a FULL Ethernet + IPv4 + UDP frame with EXPLICIT dst/src
@@ -362,7 +433,7 @@ pub fn build_frame(buf: []u8, own_mac: *const [6]u8, own_ip: [4]u8, peer_mac: [6
 pub fn loopback(own_ip: [4]u8, dst_port: u16, payload: []const u8) usize {
     var datagram: [datagram_max]u8 = undefined;
     const n = build_datagram(&datagram, own_ip, own_ip, default_src_port, dst_port, payload);
-    deliver(dst_port, datagram[0..n]);
+    deliver(dst_port, own_ip, datagram[0..n]);
     return n;
 }
 
@@ -544,7 +615,7 @@ test "udp: bounded per-listener buffer — drop-oldest at 4" {
         var dg: [9]u8 = undefined;
         const n = build_datagram(&dg, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 1 }, 7000, 7000, &.{@intCast(i)});
         try std.testing.expectEqual(@as(usize, 9), n);
-        deliver(7000, &dg);
+        deliver(7000, .{ 10, 0, 0, 1 }, &dg);
     }
     try std.testing.expectEqual(@as(u64, 5), received); // all accepted
     // The oldest (payload 0) was dropped; the newest 4 remain.
@@ -581,4 +652,62 @@ test "udp: loopback — send to our own IP delivers locally, no TX" {
     try std.testing.expectEqual(@as(usize, 9), m);
     try std.testing.expectEqual(@as(u64, 1), dropped_closed);
     try std.testing.expectEqual(@as(u64, 1), received); // only the 7000 one
+}
+
+test "udp: owned binds — owner_of, release_owned, release_owner, duplicate" {
+    reset();
+    defer reset();
+    // An EL0 process (pid 7) binds an ephemeral port; a kernel caller
+    // binds another with no owner.
+    try std.testing.expect(listen_port_owned(49152, 7));
+    try std.testing.expect(listen_port(7000));
+    try std.testing.expectEqual(@as(?u64, 7), owner_of(49152));
+    try std.testing.expectEqual(@as(?u64, unowned), owner_of(7000));
+    try std.testing.expect(owner_of(9998) == null);
+    // The port is claimed whoever asks: a second bind is a duplicate.
+    try std.testing.expect(!listen_port_owned(49152, 8));
+    try std.testing.expect(!listen_port(49152));
+    // Only the owner may release it.
+    try std.testing.expect(!release_owned(8, 49152));
+    try std.testing.expect(!release_owned(unowned, 49152));
+    try std.testing.expect(release_owned(7, 49152));
+    try std.testing.expect(owner_of(49152) == null);
+    // release_owner frees every seat the pid held, not the kernel's.
+    try std.testing.expect(listen_port_owned(49152, 7));
+    try std.testing.expect(listen_port_owned(49153, 7));
+    try std.testing.expectEqual(@as(usize, 2), release_owner(7));
+    try std.testing.expectEqual(@as(usize, 0), release_owner(7));
+    try std.testing.expect(is_listening(7000));
+    // A freed seat leaves its ring drained: after release + rebind the
+    // stale datagram is not replayed.
+    try std.testing.expect(listen_port_owned(49154, 9));
+    deliver(49154, .{ 10, 0, 0, 2 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 });
+    try std.testing.expect(release_owned(9, 49154));
+    try std.testing.expect(listen_port_owned(49154, 9));
+    try std.testing.expect(pop(49154) == null);
+}
+
+test "udp: deliver keeps the sender's IPv4 address for the recv-from shape" {
+    reset();
+    defer reset();
+    try std.testing.expect(listen_port_owned(49200, 3));
+    deliver(49200, .{ 10, 0, 0, 2 }, &.{ 0, 53, 0, 1, 0, 9, 0xaa, 0xbb, 0x42 });
+    const d = pop(49200).?;
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &d.src_ip);
+    try std.testing.expectEqual(@as(usize, 9), d.len);
+    // A large datagram (over the old 64-byte bound) lands whole.
+    var big: [300]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @intCast(i & 0xff);
+    deliver(49200, .{ 93, 184, 216, 34 }, &big);
+    const d2 = pop(49200).?;
+    try std.testing.expectEqual(@as(usize, 300), d2.len);
+    try std.testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, &d2.src_ip);
+    try std.testing.expectEqualSlices(u8, &big, d2.bytes[0..d2.len]);
+    // And the 512-byte bound itself is honest: a datagram one byte over
+    // datagram_max (udp header + payload) is truncated, not refused.
+    var over: [datagram_max + 1]u8 = undefined;
+    for (&over, 0..) |*b, i| b.* = @intCast(i & 0xff);
+    deliver(49200, .{ 10, 0, 0, 9 }, &over);
+    const d3 = pop(49200).?;
+    try std.testing.expectEqual(datagram_max, d3.len);
 }
