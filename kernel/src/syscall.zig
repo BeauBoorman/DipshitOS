@@ -511,6 +511,9 @@ pub var strace_pid: ?usize = null;
 /// Card 4a (claim 5799): fixed BSS scratch for the process snapshot —
 /// `max_processes` rows × 40 bytes, marshaled per call, no allocation.
 var procs_scratch: [process.max_processes * process.snapshot_row_bytes]u8 = undefined;
+/// ADR 0047 (#2198): BSS scratch for the size-tagged v2 rows — a second
+/// buffer, because the v1 scratch's frozen geometry must not change.
+var procs_scratch_v2: [process.max_processes * process.snapshot_row_bytes_v2]u8 = undefined;
 /// M50 TS1 (#1135): fixed BSS scratch for the `sys_principal` reply — two
 /// u32 LE words (uid, caps), marshaled per call, no allocation.
 var principal_scratch: [principal_bytes]u8 = undefined;
@@ -991,11 +994,33 @@ fn handle_ipc_recv(args: Args, _: *exceptions.VectorFrame) u64 {
 /// claim-6120 contract — the copy is validated before any state is
 /// touched). The snapshot is marshaled into a fixed BSS scratch, so no
 /// allocation and no caller-identity requirement (any EL0 task may read
-/// the table).
+/// the table). ADR 0047 (#2198) adds the negotiated v2 row described
+/// below: `max`'s top byte selects the row format; the 40-byte v1 shape
+/// is untouched for untagged requests.
+///
+/// ADR 0047 (#2198): `max`'s top byte is the requested row version —
+/// `sys_procs(buf, max | ver<<56)`. Every legacy caller passes a real
+/// buffer length (< 2^56), so the tag can never appear by accident, and an
+/// old kernel's `@min` simply saturates on the tagged length. 0 and 1 are
+/// the frozen v1 path; >= 2 asks for the newest row format the kernel
+/// knows (v2 today — the rows self-describe, so the reader reconciles
+/// what actually arrived rather than trusting the request it made).
+const procs_ver_tag_shift: u6 = 56;
+
 fn handle_procs(args: Args, _: *exceptions.VectorFrame) u64 {
     const address = args[0];
-    const max = args[1];
+    const ver_req = args[1] >> procs_ver_tag_shift;
+    const max = args[1] & ((@as(u64, 1) << procs_ver_tag_shift) - 1);
     if (max == 0) return 0;
+    if (ver_req >= 2) {
+        const rows = process.snapshot_v2(&procs_scratch_v2, scheduler.machine_ticks(), scheduler.online_cores(), @intCast(@min(alloc.stats().total_pages, std.math.maxInt(u32))));
+        if (rows == 0) return 0;
+        const full_bytes = rows * process.snapshot_row_bytes_v2;
+        const take_bytes = @min(full_bytes, @as(usize, @intCast(max))) / process.snapshot_row_bytes_v2 * process.snapshot_row_bytes_v2;
+        if (take_bytes == 0) return 0;
+        if (uaccess.copy_out(address, procs_scratch_v2[0..take_bytes], take_bytes) != .ok) return error_result(.efault);
+        return take_bytes / process.snapshot_row_bytes_v2;
+    }
     const rows = process.snapshot(&procs_scratch);
     if (rows == 0) return 0;
     const full_bytes = rows * process.snapshot_row_bytes;

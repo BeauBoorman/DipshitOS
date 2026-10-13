@@ -23,6 +23,8 @@ const (
 	ColName
 	ColState
 	ColExit
+	ColCPU
+	ColMem
 )
 
 // Label is the column's header text.
@@ -34,6 +36,10 @@ func (c Column) Label() string {
 		return "State"
 	case ColExit:
 		return "Exit"
+	case ColCPU:
+		return "CPU%"
+	case ColMem:
+		return "MEM"
 	}
 	return "PID"
 }
@@ -51,12 +57,19 @@ func StateName(state uint64) string {
 	return "unknown"
 }
 
-// Proc is one decoded snapshot row.
+// Proc is one decoded snapshot row. CpuTicks/MemBytes/HasUsage are the ADR
+// 0047 v2 fields; CpuX10 is the derived share of one core in tenths of a
+// percent (windowed against the previous snapshot, else the share since
+// boot — both come straight from kernel tick accounting).
 type Proc struct {
-	PID   uint64
-	State uint64
-	Exit  uint64
-	Name  string
+	PID      uint64
+	State    uint64
+	Exit     uint64
+	Name     string
+	CpuTicks uint64
+	CpuX10   uint64
+	MemBytes uint64
+	HasUsage bool
 }
 
 // Table is the live process view.
@@ -72,6 +85,17 @@ type Table struct {
 	// issue #2197). "" shows every row.
 	filter string
 
+	// Usage state (ADR 0047): set when the snapshot carried v2 rows. cpuX10
+	// is the machine-wide busy share in tenths of a percent, memUsed the
+	// summed footprint, memTotal the pool size in bytes.
+	usage     bool
+	cpuX10    uint64
+	memUsed   uint64
+	memTotal  uint64
+	ncores    uint64
+	prevCpu   map[uint64]uint64
+	prevTotal uint64
+
 	// self and seats are what the DEFAULT aim skips — see defaultAim.
 	self  string
 	seats []string
@@ -81,22 +105,28 @@ type Table struct {
 // and this app's own name as the self row the default aim avoids.
 func NewTable() *Table {
 	return &Table{
-		raw:   make([]vi.ProcRow, maxProcs),
-		rows:  make([]Proc, 0, maxProcs),
-		order: make([]int, 0, maxProcs),
-		sel:   -1,
-		col:   ColPID,
-		asc:   true,
-		self:  appName,
-		seats: vi.WMProcNames[:],
+		raw:     make([]vi.ProcRow, maxProcs),
+		rows:    make([]Proc, 0, maxProcs),
+		order:   make([]int, 0, maxProcs),
+		sel:     -1,
+		col:     ColPID,
+		asc:     true,
+		self:    appName,
+		seats:   vi.WMProcNames[:],
+		prevCpu: make(map[uint64]uint64),
 	}
 }
 
 // Refresh takes one snapshot (slot 7) and rebuilds the view. rc < 0 means the
 // kernel refused (EINVAL/EFAULT, or -ENOSYS off the guest) and the previous
 // view is kept — the caller prints the error instead of inventing a table.
+//
+// The read negotiates the versioned row (ADR 0047): on a v2 kernel every row
+// reports real tick and footprint figures; on a v1 kernel (or any stream the
+// decoder cannot trust) the usage fields stay zero and the table renders
+// exactly the frozen four-column view it always did.
 func (t *Table) Refresh() (int, int64) {
-	n, rc := vi.Procs(t.raw)
+	n, rc := vi.ProcsV2(t.raw)
 	if rc < 0 {
 		return 0, rc
 	}
@@ -107,12 +137,76 @@ func (t *Table) Refresh() (int, int64) {
 		n = len(t.raw)
 	}
 	t.rows = t.rows[:0]
+	t.usage = false
 	for i := 0; i < n; i++ {
 		r := t.raw[i]
-		t.rows = append(t.rows, Proc{PID: r.PID, State: r.State, Exit: r.ExitStatus, Name: r.Name()})
+		p := Proc{PID: r.PID, State: r.State, Exit: r.ExitStatus, Name: r.Name()}
+		if r.RowVer >= vi.ProcRowVersion2 {
+			p.CpuTicks, p.MemBytes, p.HasUsage = r.CpuTicks, r.MemBytes, true
+			t.usage = true
+			t.ncores = uint64(r.NCores)
+			t.memTotal = r.TotalPages * 4096
+		}
+		t.rows = append(t.rows, p)
 	}
+	t.deriveUsage(n)
 	t.rebuildWith(prevPID, hadPrev)
 	return n, rc
+}
+
+// deriveUsage turns the raw tick counters into shares. Per-row CpuX10 is
+// tenths of a percent of ONE core: delta_ticks * ncores * 1000 / delta_total
+// over the window between snapshots; on the first usable snapshot there is
+// no window, so the share is the same formula over the counters' whole life
+// (cpu_ticks / total_ticks since boot). Both are pure scheduler accounting —
+// never wall-clock inference. cpuX10 is the machine-wide busy share: sum of
+// all process deltas over the same window, i.e. ΣΔcpu * 1000 / Δtotal.
+func (t *Table) deriveUsage(n int) {
+	if !t.usage {
+		t.cpuX10, t.memUsed = 0, 0
+		return
+	}
+	t.memUsed = 0
+	var total uint64
+	// TotalTicks is identical on every v2 row; grab it from the first.
+	for i := 0; i < n && i < len(t.raw); i++ {
+		if t.raw[i].RowVer >= vi.ProcRowVersion2 {
+			total = t.raw[i].TotalTicks
+			break
+		}
+	}
+	var sumDelta uint64
+	windowed := t.prevTotal > 0 && total > t.prevTotal
+	for i := range t.rows {
+		p := &t.rows[i]
+		t.memUsed += p.MemBytes
+		prev, had := t.prevCpu[p.PID]
+		dCpu := p.CpuTicks
+		dTot := total
+		if had && windowed && p.CpuTicks >= prev {
+			dCpu = p.CpuTicks - prev
+			dTot = total - t.prevTotal
+		}
+		sumDelta += dCpu
+		if dTot > 0 && t.ncores > 0 {
+			p.CpuX10 = dCpu * 1000 * t.ncores / dTot
+		} else {
+			p.CpuX10 = 0
+		}
+		t.prevCpu[p.PID] = p.CpuTicks
+	}
+	// The machine share uses the same denominator family as the rows: the
+	// window's total when a window exists, else the counters' whole life.
+	dTotMachine := total
+	if windowed {
+		dTotMachine = total - t.prevTotal
+	}
+	if dTotMachine > 0 {
+		t.cpuX10 = sumDelta * 1000 / dTotMachine
+	} else {
+		t.cpuX10 = 0
+	}
+	t.prevTotal = total
 }
 
 // Rebuild re-sorts the display order and restores the selection. Callers that
@@ -218,6 +312,10 @@ func compareProcs(a, b Proc, col Column) int {
 		return compareU64(a.State, b.State)
 	case ColExit:
 		return compareU64(a.Exit, b.Exit)
+	case ColCPU:
+		return compareU64(a.CpuX10, b.CpuX10)
+	case ColMem:
+		return compareU64(a.MemBytes, b.MemBytes)
 	}
 	return compareU64(a.PID, b.PID)
 }
@@ -404,7 +502,17 @@ func (t *Table) Labels() []string {
 	return out
 }
 
-// rowLabel is one process row: "  1  COUNTER.BIN    running  -".
+// Usage reports the snapshot's machine totals: aggregate busy share in
+// tenths of a percent, summed footprint bytes, the memory pool bytes, and
+// whether the last snapshot carried v2 figures at all (false on a v1
+// kernel — the summary must say nothing it cannot prove).
+func (t *Table) Usage() (cpuX10, memUsed, memTotal uint64, ok bool) {
+	return t.cpuX10, t.memUsed, t.memTotal, t.usage
+}
+
+// rowLabel is one process row: "  1  COUNTER.BIN    running  -", extended
+// with "  CPU%   MEM" columns only when the row carries v2 figures — a v1
+// snapshot renders byte-identically to before ADR 0047.
 func rowLabel(p Proc) string {
 	name := p.Name
 	if len(name) > 14 {
@@ -414,8 +522,32 @@ func rowLabel(p Proc) string {
 	if p.State == vi.ProcExited {
 		exit = vi.Itoa64(int64(p.Exit))
 	}
-	return padLeft(vi.Itoa64(int64(p.PID)), 3) + "  " + padRight(name, 14) +
+	base := padLeft(vi.Itoa64(int64(p.PID)), 3) + "  " + padRight(name, 14) +
 		" " + padRight(StateName(p.State), 7) + " " + exit
+	if !p.HasUsage {
+		return base
+	}
+	return base + spaces(4-len(exit)) + "  " + padRight(pctX10Text(p.CpuX10), 5) +
+		" " + memText(p.MemBytes)
+}
+
+// pctX10Text renders tenths of a percent ("250" -> "25.0", guest-safe).
+func pctX10Text(x10 uint64) string {
+	if x10 > 9999 {
+		x10 = 9999
+	}
+	return vi.Itoa64(int64(x10/10)) + "." + vi.Itoa64(int64(x10%10))
+}
+
+// memText renders a byte footprint in binary units, integer-only.
+func memText(b uint64) string {
+	if b < 1024 {
+		return vi.Itoa64(int64(b)) + "B"
+	}
+	if b < 10*1024*1024 {
+		return vi.Itoa64(int64(b/1024)) + "K"
+	}
+	return vi.Itoa64(int64(b/(1024*1024))) + "M"
 }
 
 // Header is the column header line, with the active sort marked.
@@ -424,17 +556,24 @@ func (t *Table) Header() string {
 	if !t.asc {
 		mark = "v"
 	}
-	h := padLeft("PID", 3) + "  " + padRight("Name", 14) + " " + padRight("State", 7) + " Exit"
-	if t.col == ColPID {
-		return h + " " + mark + "pid"
+	h := padLeft("PID", 3) + "  " + padRight("Name", 14) + " " + padRight("State", 7) + " " + padRight("Exit", 4)
+	if t.usage {
+		h += "  " + padRight("CPU%", 5) + " " + padRight("MEM", 8)
 	}
-	if t.col == ColName {
-		return h + " " + mark + "name"
+	tag := "exit"
+	switch t.col {
+	case ColPID:
+		tag = "pid"
+	case ColName:
+		tag = "name"
+	case ColState:
+		tag = "state"
+	case ColCPU:
+		tag = "cpu"
+	case ColMem:
+		tag = "mem"
 	}
-	if t.col == ColState {
-		return h + " " + mark + "state"
-	}
-	return h + " " + mark + "exit"
+	return h + " " + mark + tag
 }
 
 // padRight pads s to width w with spaces (never truncates).

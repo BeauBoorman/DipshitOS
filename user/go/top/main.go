@@ -17,10 +17,12 @@
 // (the filter stays applied, the field unfocuses), Escape clears and the full
 // list comes back. Header sorting is untouched (click / press 1-4).
 //
-// What GOTOP deliberately does NOT port, and why (measured, not assumed):
-//   - The CPU/memory bar. `sys_procs` carries no CPU or memory figure and no
-//     cheap Go seam exposes one, so the summary line reports what the snapshot
-//     actually knows: row, running and exited counts.
+// CPU/MEM are real since issue #2198 (ADR 0047): the snapshot negotiates the
+// versioned `sys_procs` row, per-row CPU% is scheduler tick share (windowed
+// against the previous refresh, else the share since boot), and MEM is the
+// process's owned resident footprint — the summary line reports the machine
+// aggregate. On a pre-v2 kernel the columns and summary figures disappear
+// entirely; nothing is approximated.
 //
 // Kill IS the live proof (the card's D2): `k`, or the Kill button, arms the
 // selected pid through slot 29, and the kernel converts it into the reserved
@@ -61,6 +63,7 @@ const (
 	markerClose      = "top: win_close"
 	markerExit       = "top: exiting 43"
 	markerRefreshErr = "top: procs err="
+	markerUsage      = "top: usage"
 
 	// Filter markers (issue #2197): open/commit/cleared are the field's
 	// lifecycle; `top: filter=<text> n=<rows>` is printed after every edit
@@ -84,6 +87,8 @@ const (
 	keyTwo       = '2'
 	keyThree     = '3'
 	keyFour      = '4'
+	keyFive      = '5'
+	keySix       = '6'
 )
 
 // page is the active tab.
@@ -234,6 +239,12 @@ func (a *app) refreshAll(rows, announce bool) {
 		a.printRows()
 	}
 	a.status = "n=" + vi.Itoa64(int64(n)) + " run=" + vi.Itoa64(int64(running))
+	if cpuX10, memUsed, memTotal, ok := a.tab.Usage(); ok {
+		vi.ConsoleLine(markerUsage + " cpux10=" + vi.Itoa64(int64(cpuX10)) +
+			" memused=" + vi.Itoa64(int64(memUsed)) +
+			" memtotal=" + vi.Itoa64(int64(memTotal)))
+		a.status += " cpu=" + pctX10Text(cpuX10) + "% mem=" + memText(memUsed)
+	}
 	if announce {
 		vi.ConsoleLine(markerRefreshed)
 	}
@@ -256,6 +267,11 @@ func (a *app) printRows() {
 		line := markerRow + vi.Itoa64(int64(p.PID)) + " name=" + p.Name + " state=" + StateName(p.State)
 		if p.State == vi.ProcExited {
 			line += " exit=" + vi.Itoa64(int64(p.Exit))
+		}
+		if p.HasUsage {
+			line += " cpu=" + vi.Itoa64(int64(p.CpuTicks)) +
+				" cpux10=" + vi.Itoa64(int64(p.CpuX10)) +
+				" mem=" + vi.Itoa64(int64(p.MemBytes))
 		}
 		vi.ConsoleLine(line)
 	}
@@ -326,7 +342,7 @@ func (a *app) footLine() string {
 		return "n procs   r refresh   a auto   rx/s " + vi.Itoa64(int64(a.net.RXRate)) +
 			" B   tx/s " + vi.Itoa64(int64(a.net.TXRate)) + " B"
 	}
-	return "k kill   r refresh   a auto   n net   / filter   1-4 sort"
+	return "k kill   r refresh   a auto   n net   / filter   1-6 sort"
 }
 
 func (a *app) draw() {
@@ -515,6 +531,12 @@ func (a *app) handleKey(ev vi.Event) bool {
 	case keyFour:
 		a.tab.SortBy(ColExit)
 		return true
+	case keyFive:
+		a.tab.SortBy(ColCPU)
+		return true
+	case keySix:
+		a.tab.SortBy(ColMem)
+		return true
 	}
 	return false
 }
@@ -563,16 +585,20 @@ func (a *app) handleClick(x, y int) bool {
 	return false
 }
 
-// columnAt maps an x inside the header to a column: PID | Name | State | Exit,
-// using the same widths the row label pads to, so the header and the rows
-// cannot disagree about where a column starts.
+// columnAt maps an x inside the header to a column:
+// PID | Name | State | Exit | CPU% | MEM, using the same widths the row
+// label pads to, so the header and the rows cannot disagree about where a
+// column starts. On a v1 snapshot the CPU/MEM columns are not drawn; a
+// click that far right simply sorts an all-zero column.
 func (a *app) columnAt(x int, header widgets.Rect) Column {
 	rel := x - header.X
-	// cell = 6 px per glyph; "PID"(3) + 2 + Name(14) + 1 + State(7) + 1
+	// cell = 6 px per glyph; see rowLabel/Header for the same grid.
 	const cell = 6
 	pidEnd := 3 * cell
 	nameEnd := (3 + 2 + 14) * cell
 	stateEnd := (3 + 2 + 14 + 1 + 7) * cell
+	exitEnd := (3 + 2 + 14 + 1 + 7 + 1 + 4) * cell
+	cpuEnd := (3 + 2 + 14 + 1 + 7 + 1 + 4 + 2 + 5) * cell
 	switch {
 	case rel < pidEnd:
 		return ColPID
@@ -580,6 +606,10 @@ func (a *app) columnAt(x int, header widgets.Rect) Column {
 		return ColName
 	case rel < stateEnd:
 		return ColState
+	case rel < exitEnd:
+		return ColExit
+	case rel < cpuEnd:
+		return ColCPU
 	}
-	return ColExit
+	return ColMem
 }

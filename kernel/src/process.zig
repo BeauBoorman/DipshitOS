@@ -1207,6 +1207,77 @@ pub fn snapshot(dst: []u8) usize {
     return rows;
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0047 (issue #2198): the size-tagged v2 row — real CPU/mem figures
+// ---------------------------------------------------------------------------
+
+/// The version number written into every v2 row's @0 u32. The v1 stream
+/// carries no version word at all: its row-0 u32 is a pid (< max_processes)
+/// and its row-0 u32@4 is `pid >> 32`, i.e. 0 — so a reader that sees
+/// version >= 2 with a sane row_bytes can never be looking at a v1 stream.
+pub const snapshot_row_version_v2: u32 = 2;
+
+/// Fixed width of one v2 row (80 bytes), self-describing:
+///   u32 row_version @0, u32 row_bytes @4,
+///   u64 pid @8, u64 state @16, u64 exit_status @24, name[16] @32,
+///   u64 cpu_ticks @48, u64 mem_bytes @56,
+///   u64 total_ticks @64, u32 ncores @72, u32 total_pages @76.
+/// The leading tag lets a reader stride a stream whose width it does not
+/// know; a field decodes only while its end offset fits row_bytes (zeroed
+/// beyond — never garbage).
+pub const snapshot_row_bytes_v2: usize = 80;
+
+/// One process's honest resident footprint in PAGES: every owned segment
+/// page (text/data/stack/ro/interp/lib), the owned kernel stack, and the
+/// demand-paged/mmap-resident dynamic set. A segment whose owned count is
+/// 0 but whose declared span is nonzero is STATIC boot backing (the
+/// payload's .usertext/.userbss) — charged as its rounded VA span, because
+/// those pages are resident too. The `mem_usage` rusage field is NOT this:
+/// it counts only the charged dynamic subset (#2115) and would understate
+/// every exec'd image.
+pub fn footprint_pages(id: usize) u64 {
+    if (id >= max_processes or processes[id].state == .free) return 0;
+    const p = &processes[id];
+    const s = &p.addr_space;
+    var pages: u64 = s.text_pages + s.data_pages + s.stack_pages +
+        s.ro_pages + s.interp_pages + s.lib_pages +
+        @as(u64, @intCast(s.dynamic_page_count)) + p.kernel_stack.pages;
+    if (s.text_pages == 0) pages += segment_pages(s.text_len);
+    if (s.data_pages == 0) pages += segment_pages(s.data_len);
+    if (s.stack_pages == 0) pages += segment_pages(s.stack_len);
+    return pages;
+}
+
+/// The v2 marshal: every NON-FREE descriptor as one 80-byte self-describing
+/// row, in id order. `total_ticks`/`ncores`/`total_pages` are machine-wide
+/// and arrive as parameters (process.zig deliberately has no scheduler
+/// import — the syscall layer resolves them), repeated identically on every
+/// row so one snapshot carries a complete utilization picture. Returns the
+/// row count; dst must hold `max_processes * snapshot_row_bytes_v2` bytes.
+pub fn snapshot_v2(dst: []u8, total_ticks: u64, ncores: u32, total_pages: u32) usize {
+    var rows: usize = 0;
+    var id: usize = 0;
+    while (id < max_processes) : (id += 1) {
+        if (processes[id].state == .free) continue;
+        const row = dst[rows * snapshot_row_bytes_v2 ..][0..snapshot_row_bytes_v2];
+        @memset(row, 0);
+        std.mem.writeInt(u32, row[0..4], snapshot_row_version_v2, .little);
+        std.mem.writeInt(u32, row[4..8], snapshot_row_bytes_v2, .little);
+        std.mem.writeInt(u64, row[8..16], id, .little);
+        std.mem.writeInt(u64, row[16..24], @backingInt(processes[id].state), .little);
+        std.mem.writeInt(u64, row[24..32], processes[id].exit_status, .little);
+        const take: usize = @min(processes[id].name_len, snapshot_name_bytes);
+        @memcpy(row[32 .. 32 + take], processes[id].name_buf[0..take]);
+        std.mem.writeInt(u64, row[48..56], processes[id].cpu_usage, .little);
+        std.mem.writeInt(u64, row[56..64], footprint_pages(id) * 4096, .little);
+        std.mem.writeInt(u64, row[64..72], total_ticks, .little);
+        std.mem.writeInt(u32, row[72..76], ncores, .little);
+        std.mem.writeInt(u32, row[76..80], total_pages, .little);
+        rows += 1;
+    }
+    return rows;
+}
+
 pub fn info(id: usize) ?ProcessInfo {
     if (id >= max_processes or processes[id].state == .free) return null;
     const p = &processes[id];
@@ -1836,6 +1907,62 @@ test "process: sys_procs snapshot row is byte-frozen across principals" {
     );
     // And the row width itself is unchanged.
     try std.testing.expectEqual(@as(usize, 40), snapshot_row_bytes);
+}
+
+test "process: sys_procs v2 row is self-describing and carries real figures" {
+    // ADR 0047 (#2198): the v2 row leads with (version, row_bytes), keeps
+    // the v1 field semantics at shifted offsets, and reports the real
+    // cpu_usage counter plus the owned-page footprint — not the
+    // charged-dynamic subset.
+    init();
+    const pid = create_as("V2.BIN", .{}, .{
+        .text_pages = 3,
+        .data_pages = 1,
+        .stack_pages = 2,
+    }, .{ .phys = 0x800000, .pages = 1 }, .{}).?;
+    processes[pid].cpu_usage = 41;
+
+    var buf: [max_processes * snapshot_row_bytes_v2]u8 = @splat(0);
+    const rows = snapshot_v2(&buf, 1000, 4, 65536);
+    try std.testing.expectEqual(@as(usize, 1), rows);
+    const row = buf[0..snapshot_row_bytes_v2];
+    try std.testing.expectEqual(snapshot_row_version_v2, std.mem.readInt(u32, row[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 80), std.mem.readInt(u32, row[4..8], .little));
+    try std.testing.expectEqual(@as(u64, pid), std.mem.readInt(u64, row[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, row[16..24], .little)); // created
+    try std.testing.expectEqual(@as(u64, 41), std.mem.readInt(u64, row[48..56], .little));
+    // footprint = (3 + 1 + 2 + 1 owned) * 4096 — mem_usage is NOT this.
+    try std.testing.expectEqual(@as(u64, 7 * 4096), std.mem.readInt(u64, row[56..64], .little));
+    try std.testing.expectEqual(@as(u64, 1000), std.mem.readInt(u64, row[64..72], .little));
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, row[72..76], .little));
+    try std.testing.expectEqual(@as(u32, 65536), std.mem.readInt(u32, row[76..80], .little));
+    try std.testing.expectEqualSlices(u8, "V2.BIN", row[32 .. 32 + 6]);
+    try std.testing.expectEqual(@as(u8, 0), row[39]); // name is NUL-padded
+
+    // The discriminator contract: a v1 stream's row-0 u32@0 is a pid (<16)
+    // and u32@4 is 0 — it can never pass the version+row_bytes sanity.
+    var v1buf: [snapshot_row_bytes]u8 = @splat(0);
+    _ = snapshot(&v1buf);
+    try std.testing.expect(std.mem.readInt(u32, v1buf[0..4], .little) < snapshot_row_version_v2 or
+        std.mem.readInt(u32, v1buf[4..8], .little) < 48);
+}
+
+test "process: footprint counts static spans and dynamic pages, not mem_usage" {
+    // ADR 0047 (#2198) D5: the honest resident figure. A static-backing
+    // segment (pages==0, len>0 — the boot payload's layout) charges its
+    // rounded span; demand-faulted pages ride dynamic_page_count; the
+    // rusage `mem_usage` field is neither.
+    init();
+    const pid = create_as("FP.BIN", .{}, .{
+        .text_len = 0x2100, // 0-owned static span -> 3 pages (2 full + tail)
+        .stack_pages = 3,
+    }, .{ .phys = 0x900000, .pages = 1 }, .{}).?;
+    try std.testing.expectEqual(@as(u64, 7), footprint_pages(pid));
+    try std.testing.expectEqual(@as(u64, 0), processes[pid].mem_usage);
+    try std.testing.expect(record_dynamic_page(pid, 0x100000));
+    try std.testing.expect(record_dynamic_page(pid, 0x101000));
+    try std.testing.expectEqual(@as(u64, 9), footprint_pages(pid));
+    try std.testing.expectEqual(@as(u64, 9 * 4096), footprint_pages(pid) * 4096);
 }
 
 test "process: AddrSpaceSpec fits the EL0 kstack; AddrSpace does not (issue #1333)" {

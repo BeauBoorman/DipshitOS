@@ -25,8 +25,28 @@
 # list returns. The leg fails before the widget exists: none of its `top:
 # filter*` markers are ever printed.
 #
-# HOST PREREQUISITE (fails the gate honestly when missing):
-#   bash tools/go/build-gotop.sh   ->  .build/go/GOTOP.ELF
+# Run 03 (issue #2198) is the real-figures leg: GOSCALE.ELF's four spinning
+# workers saturate the cores for a ~6 s window, so a GOTOP snapshot taken
+# after `goscale: released` MUST show that pid's cpu_ticks > 0 — under the
+# pre-0047 kernel the `top: usage` marker and the cpu=/mem= row fields do not
+# exist at all, so every assert below fails before this card. GOSCALE is the
+# honest fixture: it holds real runnable Ms instead of parking between
+# yields, which is exactly what tick-attributed accounting measures.
+#
+# Run 04 is the PULSE half: PULSE.ELF's negotiated read prints
+# `pulse: usage cpux10= memused= memtotal=` right after `pulse: ready` when
+# the v2 rows arrived — absent on a v1 kernel — and a `2` chord repaints the
+# Processes tab with real CPU%/MEM columns over the same busy guest.
+#
+# The old-row decode leg is pinned on the host, not here: a v2 kernel always
+# answers a tagged request with v2 rows, so "v1 stream decodes correctly"
+# is `go test ./vi ./top` (TestProcsV2OldKernel, TestUsageGoneOnV1) plus the
+# kernel-side byte-frozen snapshot test.
+#
+# HOST PREREQUISITES (fail the gate honestly when missing):
+#   bash tools/go/build-gotop.sh                    -> .build/go/GOTOP.ELF
+#   bash tools/go/build-go.sh tools/go/smpscale.go  -> .build/go/GOSCALE.ELF
+#   bash tools/go/build-pulse.sh                    -> .build/go/PULSE.ELF
 
 vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg"
 vgate_share seed
@@ -60,6 +80,17 @@ dui close 2
 echo rx-gotop-filter-ok
 EOF
 
+# Run 03's busy fixture + GOTOP launch: the exec waits on `goscale: busy m=4`
+# so both snapshots land inside the ~6 s spin window — the workers' pids have
+# real per-core tick charges by then, while the process row is still live.
+vgate_file script2u.txt <<'EOF'
+exec GOSCALE.ELF
+EOF
+
+vgate_file script3u.txt <<'EOF'
+exec GOTOP.ELF
+EOF
+
 vgate_setup_python <<'PY'
 import os, shutil, sys
 rd = os.environ["RUN_DIR"]
@@ -70,6 +101,18 @@ if not os.path.exists(src):
              "bash tools/go/build-gotop.sh")
 shutil.copy(src, os.path.join(share, "GOTOP.ELF"))
 print("staged GOTOP.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GOTOP.ELF")))
+gsrc = os.path.join(".build", "go", "GOSCALE.ELF")
+if not os.path.exists(gsrc):
+    sys.exit("GOSCALE.ELF missing (expected " + gsrc + ") - build it first: "
+             "bash tools/go/build-go.sh tools/go/smpscale.go")
+shutil.copy(gsrc, os.path.join(share, "GOSCALE.ELF"))
+print("staged GOSCALE.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GOSCALE.ELF")))
+psrc = os.path.join(".build", "go", "PULSE.ELF")
+if not os.path.exists(psrc):
+    sys.exit("PULSE.ELF missing (expected " + psrc + ") - build it first: "
+             "bash tools/go/build-pulse.sh")
+shutil.copy(psrc, os.path.join(share, "PULSE.ELF"))
+print("staged PULSE.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "PULSE.ELF")))
 PY
 
 vgate_run 01 -- \
@@ -201,4 +244,115 @@ if missing:
              % (sorted(missing), sorted(names)))
 print("gotop filter ok: %d narrowed row(s) all COUNTER.BIN; restored names %s"
       % (len(narrowed), sorted(names)))
+PY
+
+# --- Run 03 (issue #2198): real CPU/MEM figures against a busy fixture ---------
+#
+# script2 execs GOSCALE.ELF once the seat is up; script3 execs GOTOP.ELF only
+# after `goscale: released m=4` — by then the four spinning workers have held
+# the cores for the whole ~6 s window, so the busy pid has real tick charges
+# on whichever cores ran them (the per-core attribution is the point: a
+# core-0-only charge would read 0 here). The run ends on `top: refreshed ok`
+# from the post-'r' dump, which is program output — assert-proven, and the
+# pre-0047 kernel cannot emit `top: usage` or cpu=/mem= row fields at all.
+vgate_run 03 -- \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2u.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --script3 '$RUN_DIR/script3u.txt' \
+    --script3-after 'goscale: busy m=4' \
+    --input-string 'r' \
+    --input-string-after 'top: ready' \
+    --script-expect 'top: refreshed ok' --timeout 240
+
+vgate_assert 03 serial-contains 'tabwm: sidebar-rendered'
+vgate_assert 03 serial-contains 'exec: loaded GOSCALE.ELF'
+vgate_assert 03 serial-contains 'goscale: busy m=4'
+vgate_assert 03 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 03 serial-contains 'top: ready'
+vgate_assert 03 serial-contains 'top: usage cpux10='
+vgate_assert 03 serial-contains 'top: refreshed ok'
+vgate_assert 03 serial-absent '[EXC] parking:'
+
+vgate_assert 03 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = ser.splitlines()
+# The busy fixture's row must carry a nonzero tick count — real scheduler
+# attribution, not wall-clock math.
+busy = [l for l in lines if l.startswith("top: row pid=") and "name=GOSCALE.ELF" in l]
+if not busy:
+    sys.exit("FAIL: GOTOP never listed GOSCALE.ELF")
+cpus = [int(m.group(1)) for l in busy
+        for m in [re.search(r" cpu=(\d+)", l)] if m]
+if not cpus or max(cpus) == 0:
+    sys.exit("FAIL: GOSCALE.ELF rows have no nonzero cpu= tick count: %s" % busy)
+# Memory: a live process (GOTOP itself) must report a real footprint.
+gotop = [l for l in lines if "name=GOTOP.ELF" in l and "state=running" in l]
+mems = [int(m.group(1)) for l in gotop
+        for m in [re.search(r" mem=(\d+)", l)] if m]
+if not mems or max(mems) == 0:
+    sys.exit("FAIL: GOTOP.ELF rows have no nonzero mem= footprint: %s" % gotop)
+# The machine summary: nonzero busy share and a real pool denominator.
+us = [l for l in lines if l.startswith("top: usage cpux10=")]
+if not us:
+    sys.exit("FAIL: no `top: usage` marker — v2 rows never arrived")
+m = re.search(r"cpux10=(\d+) memused=(\d+) memtotal=(\d+)", us[-1])
+if not m or int(m.group(1)) == 0 or int(m.group(3)) == 0:
+    sys.exit("FAIL: usage marker carries no real figures: %r" % us[-1])
+print("gotop usage ok: busy cpu_ticks=%d, gotop mem=%dB, machine cpux10=%s"
+      % (max(cpus), max(mems), m.group(1)))
+PY
+
+
+# --- Run 04 (issue #2198): PULSE renders the same real figures -----------------
+#
+# PULSE.ELF on the default seat: its usage seam negotiates the v2 row, so
+# `pulse: usage` is the proof the bars have real numerators — it is absent
+# on a pre-0047 kernel. The `2` chord repaints the Processes tab (CPU%/MEM
+# columns) before the close; `pulse: repainted` gates it.
+vgate_file script4p.txt <<'EOS'
+exec GOSCALE.ELF
+EOS
+
+vgate_file script4q.txt <<'EOS'
+exec PULSE.ELF
+EOS
+
+vgate_file script4r.txt <<'EOS'
+dui close 2
+EOS
+
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script4p.txt' \
+    --script2 '$RUN_DIR/script4q.txt' \
+    --script2-after 'goscale: released m=4' \
+    --input-chords '2' \
+    --input-chords-after 'pulse: ready' \
+    --script3 '$RUN_DIR/script4r.txt' \
+    --script3-after 'pulse: repainted' \
+    --script-expect 'pulse: close' --timeout 240
+
+vgate_assert 04 serial-contains 'exec: loaded GOSCALE.ELF'
+vgate_assert 04 serial-contains 'exec: loaded PULSE.ELF'
+vgate_assert 04 serial-contains 'pulse: ready'
+vgate_assert 04 serial-contains 'pulse: procs '
+vgate_assert 04 serial-contains 'pulse: usage cpux10='
+vgate_assert 04 serial-contains 'pulse: key 2'
+vgate_assert 04 serial-contains 'pulse: repainted'
+vgate_assert 04 serial-contains 'pulse: close'
+vgate_assert 04 serial-absent '[EXC] parking:'
+
+vgate_assert 04 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"pulse: usage cpux10=(\d+) memused=(\d+) memtotal=(\d+)", ser)
+if not m:
+    sys.exit("FAIL: no `pulse: usage` marker - the v2 rows never arrived")
+if int(m.group(2)) == 0 or int(m.group(3)) == 0:
+    sys.exit("FAIL: pulse usage has no real memory figures: %r" % m.group(0))
+print("pulse usage ok: cpux10=%s memused=%sB memtotal=%sB" % m.groups())
 PY

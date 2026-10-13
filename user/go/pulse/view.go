@@ -117,7 +117,7 @@ func (m model) bodyLines() []string {
 
 func (m model) overviewLines() []string {
 	running, created, exited := countStates(m.snap)
-	return []string{
+	lines := []string{
 		"",
 		"  uptime      " + styleHead.Render(formatUptime(m.snap.uptimeNs)),
 		"  processes   " + styleRun.Render(itoa64(uint64(running))+" running") +
@@ -125,9 +125,43 @@ func (m model) overviewLines() []string {
 			styleDim.Render(" · ") + styleExited.Render(itoa64(uint64(exited))+" exited"),
 		"  ticks       " + itoa64(m.ticks),
 		"",
+	}
+	if m.usage.ok {
+		// Real figures (ADR 0047): the machine busy share is Σ per-process
+		// tick deltas over Σ core ticks; the memory bar is summed owned
+		// footprint over the allocator pool.
+		var memX10 uint64
+		if m.usage.memTotal > 0 {
+			memX10 = m.usage.memUsed * 1000 / m.usage.memTotal
+		}
+		lines = append(lines,
+			"  cpu         "+usageBar(m.usage.cpuX10, 20)+" "+pctX10(m.usage.cpuX10),
+			"  mem         "+usageBar(memX10, 20)+" "+formatBytes(int64(m.usage.memUsed))+
+				styleDim.Render("/"+formatBytes(int64(m.usage.memTotal))),
+		)
+		return lines
+	}
+	return append(lines,
 		styleDim.Render("  per-process memory and CPU% are not exposed by sys_procs (slot 7):"),
 		styleDim.Render("  its rows carry pid, state and name only (ADR 0007)."),
+	)
+}
+
+// usageBar renders a width-w share bar from a tenths-of-a-percent figure.
+func usageBar(x10, w uint64) string {
+	fill := x10 * w / 1000
+	if fill > w {
+		fill = w
 	}
+	return "[" + strings.Repeat("#", int(fill)) + strings.Repeat("-", int(w-fill)) + "]"
+}
+
+// pctX10 renders tenths of a percent ("250" -> "25.0%").
+func pctX10(x10 uint64) string {
+	if x10 > 9999 {
+		x10 = 9999
+	}
+	return itoa64(x10/10) + "." + itoa64(x10%10) + "%"
 }
 
 func stateStyle(s uint64) lipgloss.Style {
@@ -145,7 +179,12 @@ func stateStyle(s uint64) lipgloss.Style {
 func (m model) procsLines() []string {
 	rows := visibleProcs(m.snap, m.sortCol, m.filter)
 	var lines []string
-	head := "  " + padRight("PID", 8) + padRight("NAME", 18) + "STATE"
+	head := "  " + padRight("PID", 8) + padRight("NAME", 18) + padRight("STATE", 8)
+	if m.usage.ok {
+		head += padRight("CPU%", 8) + "MEM"
+	} else {
+		head = "  " + padRight("PID", 8) + padRight("NAME", 18) + "STATE"
+	}
 	head = markSortCol(head, m.sortCol)
 	lines = append(lines, styleHead.Render(head))
 	maxRows := 14
@@ -157,7 +196,16 @@ func (m model) procsLines() []string {
 		if i == m.sel {
 			marker = "> "
 		}
-		line := marker + padRight(itoa64(p.pid), 8) + padRight(p.name, 18) + stateName(p.state)
+		line := marker + padRight(itoa64(p.pid), 8) + padRight(p.name, 18)
+		if m.usage.ok {
+			cpu, mem := "-", "-"
+			if u, found := m.usage.perProc[p.pid]; found {
+				cpu, mem = pctX10(u.cpuX10), formatBytes(int64(u.memBytes))
+			}
+			line += padRight(stateName(p.state), 8) + padRight(cpu, 8) + mem
+		} else {
+			line += stateName(p.state)
+		}
 		if i == m.sel {
 			line = styleSel.Render(line)
 		} else {
