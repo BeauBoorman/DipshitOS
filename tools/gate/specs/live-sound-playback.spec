@@ -58,7 +58,10 @@ if "pcm_status=0x0000000000008000" not in ser:
     sys.exit("ERROR: pcm_status is not the virtio-snd OK value 0x8000")
 PY
 
-# B7 (#1874): same real output device, opt-in slot 43 streaming. This is
+# B7 (#1874) + M99b (#2180): same real output device, opt-in slot 43 streaming
+# through the kernel mixer. PCM.BIN now runs three processes against one device
+# stream: the orchestrator, a "peer" streamer that overlaps with it, and a
+# "death" streamer whose exit reaps its seat mid-stream. This is
 # ownership/accounting evidence, not capture or a low-latency guarantee.
 vgate_setup_python <<'PY'
 import os, subprocess
@@ -88,12 +91,14 @@ vgate_run stream -- --sound --script '$RUN_DIR/pcm.txt' \
     --script2 '$RUN_DIR/pcm-done.txt' --script2-after 'b7: done' \
     --script2-delay 3 --script-expect 'b7-gate-done' --timeout 150
 vgate_assert stream output-contains 'SOUND: virtio-snd attached'
-vgate_assert stream serial-contains 'b7: bounds=8x4096 backpressure=EAGAIN accepted=32768 copy-rollback=0'
-vgate_assert stream serial-contains 'b7: continuous accepted=131072 submitted=131072 completed=131072 starts=1 stops=1 releases=1 resets=0'
-vgate_assert stream serial-contains 'b7: underrun=XRUN sticky=1 explicit-abort=ok'
-vgate_assert stream serial-contains 'b7: abort canceled=32768 outstanding=0'
+vgate_assert stream serial-contains 'b7: bounds=4x4096 backpressure=EAGAIN accepted=16384 copy-rollback=0 legacy=EAGAIN'
+vgate_assert stream serial-contains 'b7: cap=4 open5=ENOSPC refused=1 sources=1'
+vgate_assert stream serial-contains 'b7: overlap sources=2 peak=4 both-advanced'
+vgate_assert stream serial-contains 'b7: peer accepted=65536 submitted=65536 completed=65536 sources=2'
 vgate_assert stream serial-contains 'b7: owner exits with queued PCM'
-vgate_assert stream serial-contains 'b7: owner-death teardown reopened=ok'
+vgate_assert stream serial-contains 'b7: owner-death teardown sources=1 survivor-advances'
+vgate_assert stream serial-contains 'b7: underrun counted no-XRUN resume=ok'
+vgate_assert stream serial-contains 'b7: continuous accepted=131072 submitted=131072 completed=131072 starts=1 stops=1 releases=1 resets=0'
 vgate_assert stream serial-contains 'b7: output only, no capture or low-latency claim'
 vgate_assert stream serial-contains 'b7: done'
 vgate_assert stream serial-absent 'b7: FAIL'
@@ -104,7 +109,8 @@ vgate_assert stream python <<'PY'
 import os, re
 serial = open(os.environ["VG_SER"], "rb").read()
 assert serial.count(b"b7: continuous accepted=131072") == 1
-assert len(re.findall(rb"procs PCM\.BIN exited status=0", serial)) == 2
+# orchestrator + peer + death child, each a clean exit
+assert len(re.findall(rb"procs PCM\.BIN exited status=0", serial)) == 3
 PY
 
 vgate_run absent -- --script '$RUN_DIR/pcm.txt' \

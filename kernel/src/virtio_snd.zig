@@ -849,8 +849,8 @@ pub const audio_max_len: u32 = 64 * 1024;
 /// state. Returns `.ready = 1` only when the transport AND the
 /// negotiation succeeded.
 pub fn snd_audio_info() AudioInfo {
-    if (stream) |current| {
-        if (current.model.state == .quarantined) {
+    if (mixer) |m| {
+        if (m.playback.model.state == .quarantined) {
             return .{ .ready = 0, .format = 0xff, .rate = 0xff, .channels = 0, .padding = 0, .period_bytes = beep_period_bytes, .max_len = audio_max_len };
         }
     }
@@ -1165,16 +1165,27 @@ pub const StreamParams = extern struct {
     reserved: u8 = 0,
     version: u32 = 1,
 };
+/// M99b (ADR 0046): status is per-source now. accepted/submitted/completed/
+/// canceled/underruns count this source's bytes through the mix; `slots` is
+/// the per-source queue bound; sources/peak_sources/refused are mixer-wide
+/// occupancy and over-cap (ENOSPC) counters; clipped is mixer-wide samples
+/// clamped at the post-sum saturation; starts..resets count the shared
+/// device stream's lifecycle.
 pub const StreamStatus = extern struct {
     generation: u64,
     accepted: u64,
     submitted: u64,
     completed: u64,
     canceled: u64,
+    underruns: u64,
+    clipped: u64,
     state: u32,
     reason: u32,
     outstanding: u32,
     slots: u32,
+    sources: u32,
+    peak_sources: u32,
+    refused: u32,
     starts: u32,
     stops: u32,
     releases: u32,
@@ -1182,10 +1193,10 @@ pub const StreamStatus = extern struct {
 };
 pub var audio_lock = spinlock.IrqSaveSpinlock{};
 // One fixed pool charge on first open, retained for reuse/quarantine. Keeping
-// 32 KiB of PCM out of the flat kernel preserves its 16 MiB loader ceiling.
-pub const stream_pages = (@sizeOf(playback.Playback) + 4095) / 4096;
-pub var stream: ?*playback.Playback = null;
-var stream_last_owner: ?u64 = null;
+// the mixer's ~100 KiB of source+ring storage out of the flat kernel
+// preserves its 16 MiB loader ceiling.
+pub const stream_pages = (@sizeOf(playback.Mixer) + 4095) / 4096;
+pub var mixer: ?*playback.Mixer = null;
 const HeaderLine = extern struct { stream_id: u32 = 0, padding: [60]u8 = @splat(0) };
 var stream_headers: [pcm.slot_count]HeaderLine align(64) = @splat(.{});
 var stream_statuses: [pcm.slot_count]StatusLine align(64) = @splat(.{});
@@ -1278,12 +1289,18 @@ fn stream_completion(_: *anyopaque) ?playback.RawCompletion {
     return .{ .head = used.id, .written = used.len, .ok = stream_statuses[slot].status == S_OK };
 }
 
-/// Callers hold audio_lock, including reserve/copy/commit as one transaction.
-pub fn snd_stream_open(owner: u64, request: StreamParams) pcm.Error!pcm.StreamToken {
-    if (stream) |current| {
-        if (current.model.state == .quarantined) return error.Quarantined;
+/// M99b: slots 44/45 are the post-mix choke point now — applied to each
+/// composed output period after the f32 sum + clamp, not per submit.
+fn stream_post_gain(_: *anyopaque, samples: []u8) void {
+    snd_apply_gain(samples, beep_format, beep_channels);
+}
+
+/// Callers hold audio_lock, including seat alloc/copy/commit as one
+/// transaction. M99b: each open is a mixer source seat, not the device.
+pub fn snd_stream_open(owner: u64, request: StreamParams) playback.MixerError!pcm.StreamToken {
+    if (mixer) |m| {
+        if (m.playback.model.state == .quarantined) return error.Quarantined;
     }
-    if (!snd_legacy_available()) return error.Busy;
     if (!snd_ready or !ctrl_armed or !tx_armed) {
         beep_fail = "NO AUDIO DEVICE: continuous PCM refused";
         return error.NoDevice;
@@ -1296,78 +1313,113 @@ pub fn snd_stream_open(owner: u64, request: StreamParams) pcm.Error!pcm.StreamTo
         else => return error.UnsupportedFormat,
     };
     const params = pcm.Params{ .format = format, .rate_hz = snd_rate_hz(request.rate), .channels = request.channels };
-    var formats: [3]pcm.Format = undefined;
-    var rates: [6]u32 = undefined;
-    var nf: usize = 0;
-    var nr: usize = 0;
-    var caps: pcm.Capabilities = undefined;
-    if (@import("builtin").is_test and test_stream_caps != null) {
-        caps = test_stream_caps.?;
-    } else {
-        if (snd_pcm_probe() != S_OK) return error.DeviceFailed;
-        for ([_]u8{ FMT_S16, FMT_S32, FMT_FLOAT }, [_]pcm.Format{ .s16, .s32, .float32 }) |bit, fmt| {
-            if (beep_obs_formats & (@as(u64, 1) << @intCast(bit)) != 0) {
-                formats[nf] = fmt;
-                nf += 1;
+    // The probe/negotiation only runs when this open prepares a fresh
+    // device stream; sources joining a live stream just match its tuple.
+    const fresh = mixer == null or mixer.?.playback.model.state == .closed;
+    var caps: ?pcm.Capabilities = null;
+    if (fresh) {
+        var formats: [3]pcm.Format = undefined;
+        var rates: [6]u32 = undefined;
+        var nf: usize = 0;
+        var nr: usize = 0;
+        var c: pcm.Capabilities = undefined;
+        if (@import("builtin").is_test and test_stream_caps != null) {
+            c = test_stream_caps.?;
+        } else {
+            if (snd_pcm_probe() != S_OK) return error.DeviceFailed;
+            for ([_]u8{ FMT_S16, FMT_S32, FMT_FLOAT }, [_]pcm.Format{ .s16, .s32, .float32 }) |bit, fmt| {
+                if (beep_obs_formats & (@as(u64, 1) << @intCast(bit)) != 0) {
+                    formats[nf] = fmt;
+                    nf += 1;
+                }
             }
-        }
-        for ([_]u8{ RATE_48000, RATE_44100, RATE_32000, RATE_22050, RATE_16000, RATE_8000 }) |bit| {
-            if (beep_obs_rates & (@as(u64, 1) << @intCast(bit)) != 0) {
-                rates[nr] = snd_rate_hz(bit);
-                nr += 1;
+            for ([_]u8{ RATE_48000, RATE_44100, RATE_32000, RATE_22050, RATE_16000, RATE_8000 }) |bit| {
+                if (beep_obs_rates & (@as(u64, 1) << @intCast(bit)) != 0) {
+                    rates[nr] = snd_rate_hz(bit);
+                    nr += 1;
+                }
             }
+            c = .{ .present = true, .output = beep_obs_dir == D_OUTPUT, .queue_descriptors = tx_queue_size, .formats = formats[0..nf], .rates_hz = rates[0..nr], .channels_min = beep_obs_ch_min, .channels_max = @min(beep_obs_ch_max, 2) };
         }
-        caps = .{ .present = true, .output = beep_obs_dir == D_OUTPUT, .queue_descriptors = tx_queue_size, .formats = formats[0..nf], .rates_hz = rates[0..nr], .channels_min = beep_obs_ch_min, .channels_max = @min(beep_obs_ch_max, 2) };
+        caps = c;
     }
-    if (stream == null) {
+    if (mixer == null) {
         if (@import("builtin").is_test) return error.InsufficientCapacity;
         const physical = alloc.alloc_pages(stream_pages) orelse return error.InsufficientCapacity;
-        stream = @ptrFromInt(mmu.to_kva(physical));
-        stream.?.* = std.mem.zeroes(playback.Playback);
+        mixer = @ptrFromInt(mmu.to_kva(physical));
+        mixer.?.* = .{};
     }
-    const token = try stream.?.open(owner, caps, params, snd_stream_now(), stream_io());
-    stream_last_owner = owner;
-    return token;
+    mixer.?.post_mix = stream_post_gain;
+    mixer.?.post_mix_ctx = &io_context;
+    return mixer.?.open(owner, caps, params, snd_stream_now(), stream_io());
 }
 
 pub fn snd_stream_drive() void {
-    const current = stream orelse return;
-    if (current.model.state != .closed) current.drive(snd_stream_now(), stream_io());
+    const m = mixer orelse return;
+    m.drive(snd_stream_now(), stream_io());
 }
 
 pub fn snd_stream_status(owner: u64, generation: u64) pcm.Error!StreamStatus {
-    const current = stream orelse return error.InvalidToken;
-    if (stream_last_owner != owner or generation != current.model.generation) return error.InvalidToken;
-    const m = &current.model;
+    const m = mixer orelse return error.InvalidToken;
+    const token = pcm.StreamToken{ .owner = owner, .generation = generation };
+    var counts: pcm.Counts = .{};
+    var underruns: u64 = 0;
+    var state: pcm.State = .closed;
+    var reason: pcm.Reason = .none;
+    if (m.source_of(token)) |s| {
+        counts = s.counts;
+        underruns = s.underruns;
+        state = switch (s.state) {
+            .idle => .prepared,
+            .live => m.playback.model.state,
+            .draining => .draining,
+            .free => unreachable,
+        };
+        reason = m.playback.model.reason;
+    } else {
+        const last = m.last_of(token) orelse return error.InvalidToken;
+        counts = last.counts;
+        underruns = last.underruns;
+        state = last.state;
+        reason = last.reason;
+    }
     return .{
-        .generation = m.generation,
-        .accepted = m.counts.accepted,
-        .submitted = m.counts.submitted,
-        .completed = m.counts.completed,
-        .canceled = m.counts.canceled,
-        .state = @backingInt(m.state),
-        .reason = @backingInt(m.reason),
-        .outstanding = @intCast(m.counts.outstanding),
-        .slots = pcm.slot_count,
-        .starts = @intCast(current.starts),
-        .stops = @intCast(current.stops),
-        .releases = @intCast(current.releases),
-        .resets = @intCast(current.resets),
+        .generation = generation,
+        .accepted = counts.accepted,
+        .submitted = counts.submitted,
+        .completed = counts.completed,
+        .canceled = counts.canceled,
+        .underruns = underruns,
+        .clipped = m.clipped,
+        .state = @backingInt(state),
+        .reason = @backingInt(reason),
+        .outstanding = @intCast(@min(counts.outstanding, std.math.maxInt(u32))),
+        .slots = playback.source_periods,
+        .sources = m.open_count,
+        .peak_sources = m.peak_sources,
+        .refused = @intCast(@min(m.refused, std.math.maxInt(u32))),
+        .starts = @intCast(m.playback.starts),
+        .stops = @intCast(m.playback.stops),
+        .releases = @intCast(m.playback.releases),
+        .resets = @intCast(m.playback.resets),
     };
 }
 
+/// Legacy slot-43 playback stays excluded while the mixer holds any open
+/// source or a live device stream (ADR 0046 D5).
 pub fn snd_legacy_available() bool {
-    return if (stream) |current| current.model.state == .closed else true;
+    return if (mixer) |m| m.open_count == 0 and m.playback.model.state == .closed else true;
 }
 
 /// Exit context only changes ownership. STOP/RELEASE/reset run in the next
 /// main-context pump; kernel-owned DMA storage outlives process mappings.
+/// M99b: only the dead owner's source seats are torn down — other
+/// processes' sources keep streaming.
 pub fn snd_stream_owner_death(owner: u64) void {
     const saved = audio_lock.lock();
     defer audio_lock.unlock(saved);
-    const current = stream orelse return;
-    if (stream_last_owner == owner) stream_last_owner = null;
-    current.model.owner_death(owner, snd_stream_now()) catch {};
+    const m = mixer orelse return;
+    m.owner_death(owner, snd_stream_now());
 }
 
 pub fn snd_stream_poll() void {
@@ -1384,9 +1436,9 @@ test "virtio_snd: continuous DMA layout and ABI are bounded and cache isolated" 
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(StatusLine));
     try std.testing.expectEqual(@as(usize, 1984), @sizeOf(@TypeOf(tx_desc)) + @sizeOf(VirtqAvail) + @sizeOf(VirtqUsed) + @sizeOf(@TypeOf(stream_headers)) + @sizeOf(@TypeOf(stream_statuses)));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(StreamParams));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(StreamStatus));
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(StreamStatus));
     try std.testing.expectEqual(@as(u16, 32), tx_queue_size);
-    try std.testing.expectEqual(@as(usize, 9), stream_pages);
+    try std.testing.expectEqual(@as(usize, (@sizeOf(playback.Mixer) + 4095) / 4096), stream_pages);
 }
 
 test "virtio_snd: S32 gain handles both signed endpoints exactly" {
@@ -1404,11 +1456,11 @@ test "virtio_snd: S32 gain handles both signed endpoints exactly" {
 }
 
 test "virtio_snd: quarantined storage refuses open and reports not ready" {
-    var current = playback.Playback{};
-    current.model.state = .quarantined;
-    stream = &current;
+    var current = playback.Mixer{};
+    current.playback.model.state = .quarantined;
+    mixer = &current;
     defer {
-        stream = null;
+        mixer = null;
     }
     try std.testing.expectError(error.Quarantined, snd_stream_open(42, .{ .format = FMT_FLOAT, .rate = RATE_48000, .channels = 2 }));
     try std.testing.expectEqual(@as(u32, 0), snd_audio_info().ready);

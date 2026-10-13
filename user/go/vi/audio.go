@@ -185,6 +185,182 @@ func AudioMute(muted bool) error {
 	return nil
 }
 
+// M99b (#2180, ADR 0046): slot 43 also carries an opt-in mixer stream ABI —
+// the same syscall number, distinguished by the high bit of the length
+// argument. Each OPEN takes a bounded source seat on the kernel mixer (up to
+// AudioStreamMaxSources at once); all live sources share the one negotiated
+// format/rate/channels and are summed in f32 into the single device stream,
+// with slots 44/45 applied once to the composed output. AudioPlay (the
+// legacy form, no high bit) refuses EAGAIN while any seat is open, and vice
+// versa: one ABI, one physical stream, two mutually exclusive clients.
+//
+// AudioStream is the Go half of that ABI — what PCM.BIN's helpers do raw.
+// A stream is a source token (owner = the calling process, generation =
+// the kernel's seat generation): process death reaps the seat kernel-side,
+// so there is no Close — End drains and frees, Abort frees without
+// draining, and doing nothing is the owner-death path.
+
+// AudioStreamParams is the 8-byte open argument (kernel StreamParams): the
+// tuple the caller wants, which for a seat on an already-running stream
+// must equal what AudioQuery reported — the mixer does not resample.
+// Version is the ABI rev (1); Reserved must be 0.
+type AudioStreamParams struct {
+	Format   uint8
+	Rate     uint8
+	Channels uint8
+	Reserved uint8
+	Version  uint32
+}
+
+// AudioStreamStatus is the 104-byte per-source status (kernel StreamStatus).
+// Accepted/Submitted/Completed/Canceled/Underruns count THIS source's bytes
+// through the mix; Slots is its queue bound; Sources/PeakSources/Refused and
+// Clipped are mixer-wide; Starts/Stops/Releases/Resets count the shared
+// device stream's lifecycle. State is pcm.Model's numbering for the shared
+// stream while the seat is open, the seat's post-close snapshot after.
+type AudioStreamStatus struct {
+	Generation  uint64
+	Accepted    uint64
+	Submitted   uint64
+	Completed   uint64
+	Canceled    uint64
+	Underruns   uint64
+	Clipped     uint64
+	State       uint32
+	Reason      uint32
+	Outstanding uint32
+	Slots       uint32
+	Sources     uint32
+	PeakSources uint32
+	Refused     uint32
+	Starts      uint32
+	Stops       uint32
+	Releases    uint32
+	Resets      uint32
+}
+
+// The mixer ABI's bounds, exported for the same reason AudioPeriodBytes is:
+// the guest gate and this binding state the kernel's numbers once.
+const (
+	AudioStreamMaxSources               = 4 // mixer source seats; the (N+1)th open is ENOSPC
+	AudioStreamPeriodsPerSource         = 4 // queued periods per seat; full is EAGAIN
+	audioStreamFlag             uintptr = 1 << 63
+)
+
+const (
+	audioStreamOpen   uintptr = 1
+	audioStreamSubmit uintptr = 2
+	audioStreamStart  uintptr = 3
+	audioStreamEnd    uintptr = 4
+	audioStreamAbort  uintptr = 5
+	audioStreamStatus uintptr = 6
+)
+
+// ErrAudioStreamFull is the kernel's ENOSPC from open: all
+// AudioStreamMaxSources seats are occupied. Compare with == or errors.Is.
+var ErrAudioStreamFull = errno(ErrENOSPC)
+
+// ErrAudioBusy is the kernel's EAGAIN: a submit found the source's queue
+// full, or a lifecycle op found the shared stream between phases (the
+// documented backpressure answer — retry, don't tear down).
+var ErrAudioBusy = errno(ErrEAGAIN)
+
+// AudioStream is one mixer source seat: the kernel's (owner, generation)
+// token for this process's stream. It is not safe for concurrent use.
+type AudioStream struct {
+	generation uint64
+}
+
+// AudioStreamOpen takes a mixer seat for this process (slot 43, op open).
+// The first seat negotiates the physical stream's tuple with the device;
+// later seats must match it exactly (EINVAL otherwise). All seats occupied
+// is ErrAudioStreamFull; a stream mid-teardown retry window is ErrAudioBusy;
+// no device is ErrNoAudioDevice. The returned generation identifies the seat
+// in every later call.
+func AudioStreamOpen(params AudioStreamParams) (*AudioStream, error) {
+	r := svc4(SlotAudioPlay,
+		uintptr(unsafe.Pointer(&params)),
+		audioStreamFlag|uintptr(unsafe.Sizeof(params)),
+		audioStreamOpen, 0)
+	if r < 0 {
+		return nil, errno(-r)
+	}
+	return &AudioStream{generation: uint64(r)}, nil
+}
+
+// Generation is the kernel's seat generation — the identity Status exposes
+// too, here so a caller can correlate without a syscall.
+func (s *AudioStream) Generation() uint64 {
+	return s.generation
+}
+
+// Submit copies one period (≤ AudioPeriodBytes, frame-aligned) into the
+// source's bounded queue and returns the bytes accepted. A full queue is
+// ErrAudioBusy — backpressure, not an error the caller should act on beyond
+// retrying. A kernel answer of fewer bytes than submitted would be a
+// device-level refusal, reported as ErrNoAudioDevice like AudioPlay's.
+func (s *AudioStream) Submit(period []byte) (int, error) {
+	if len(period) == 0 {
+		return 0, errno(ErrEINVAL)
+	}
+	if len(period) > AudioPeriodBytes {
+		return 0, errno(ErrENAMETOOLONG)
+	}
+	r := svc4(SlotAudioPlay,
+		uintptr(unsafe.Pointer(&period[0])),
+		audioStreamFlag|uintptr(len(period)),
+		audioStreamSubmit, uintptr(s.generation))
+	if r < 0 {
+		return 0, errno(-r)
+	}
+	if int(r) != len(period) {
+		return int(r), ErrNoAudioDevice
+	}
+	return int(r), nil
+}
+
+// Start moves the seat from idle to live: its queue joins the mix (and the
+// shared stream starts if this is the first source). A seat with an empty
+// queue is EINVAL — submit before starting.
+func (s *AudioStream) Start() error {
+	return s.lifecycle(audioStreamStart)
+}
+
+// End frees the seat after its queued periods drain through the mix. When
+// it is the last source, the shared stream drains, stops and releases.
+func (s *AudioStream) End() error {
+	return s.lifecycle(audioStreamEnd)
+}
+
+// Abort frees the seat immediately; queued-and-uncomposed bytes are
+// canceled and counted, never played.
+func (s *AudioStream) Abort() error {
+	return s.lifecycle(audioStreamAbort)
+}
+
+func (s *AudioStream) lifecycle(op uintptr) error {
+	r := svc4(SlotAudioPlay, 0, audioStreamFlag, op, uintptr(s.generation))
+	if r < 0 {
+		return errno(-r)
+	}
+	return nil
+}
+
+// Status reads the seat's counters (slot 43, op status). After End or Abort
+// the seat is gone and the kernel answers with the post-close snapshot, so
+// Status still works — the accounting survives the seat.
+func (s *AudioStream) Status() (AudioStreamStatus, error) {
+	var out AudioStreamStatus
+	r := svc4(SlotAudioPlay,
+		uintptr(unsafe.Pointer(&out)),
+		audioStreamFlag|uintptr(unsafe.Sizeof(out)),
+		audioStreamStatus, uintptr(s.generation))
+	if r < 0 {
+		return AudioStreamStatus{}, errno(-r)
+	}
+	return out, nil
+}
+
 // audioChunks splits n bytes into AudioPeriodBytes-sized [off,end) ranges and
 // calls f for each. It is the AudioPlay loop as a pure function — no syscall,
 // no allocation — so the host suite can pin the arithmetic the live gate's

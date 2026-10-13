@@ -350,6 +350,327 @@ func TestAudioMuteMapping(t *testing.T) {
 	}
 }
 
+// M99b: the mixer ABI's wire structs mirror kernel/src/virtio_snd.zig's
+// StreamParams (8 bytes) and StreamStatus (104 bytes). Same pin argument as
+// AudioInfo: the kernel copies exactly @sizeOf bytes through uaccess, so a
+// drifted Go struct silently reads/writes past the contract.
+func TestAudioStreamParamsWireSize(t *testing.T) {
+	if got := unsafe.Sizeof(AudioStreamParams{}); got != 8 {
+		t.Fatalf("AudioStreamParams size = %d want 8", got)
+	}
+	offsets := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"Format", unsafe.Offsetof(AudioStreamParams{}.Format), 0},
+		{"Rate", unsafe.Offsetof(AudioStreamParams{}.Rate), 1},
+		{"Channels", unsafe.Offsetof(AudioStreamParams{}.Channels), 2},
+		{"Reserved", unsafe.Offsetof(AudioStreamParams{}.Reserved), 3},
+		{"Version", unsafe.Offsetof(AudioStreamParams{}.Version), 4},
+	}
+	for _, o := range offsets {
+		if o.got != o.want {
+			t.Fatalf("AudioStreamParams.%s offset = %d want %d", o.name, o.got, o.want)
+		}
+	}
+}
+
+func TestAudioStreamStatusWireSize(t *testing.T) {
+	if got := unsafe.Sizeof(AudioStreamStatus{}); got != 104 {
+		t.Fatalf("AudioStreamStatus size = %d want 104", got)
+	}
+	offsets := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"Generation", unsafe.Offsetof(AudioStreamStatus{}.Generation), 0},
+		{"Accepted", unsafe.Offsetof(AudioStreamStatus{}.Accepted), 8},
+		{"Submitted", unsafe.Offsetof(AudioStreamStatus{}.Submitted), 16},
+		{"Completed", unsafe.Offsetof(AudioStreamStatus{}.Completed), 24},
+		{"Canceled", unsafe.Offsetof(AudioStreamStatus{}.Canceled), 32},
+		{"Underruns", unsafe.Offsetof(AudioStreamStatus{}.Underruns), 40},
+		{"Clipped", unsafe.Offsetof(AudioStreamStatus{}.Clipped), 48},
+		{"State", unsafe.Offsetof(AudioStreamStatus{}.State), 56},
+		{"Reason", unsafe.Offsetof(AudioStreamStatus{}.Reason), 60},
+		{"Outstanding", unsafe.Offsetof(AudioStreamStatus{}.Outstanding), 64},
+		{"Slots", unsafe.Offsetof(AudioStreamStatus{}.Slots), 68},
+		{"Sources", unsafe.Offsetof(AudioStreamStatus{}.Sources), 72},
+		{"PeakSources", unsafe.Offsetof(AudioStreamStatus{}.PeakSources), 76},
+		{"Refused", unsafe.Offsetof(AudioStreamStatus{}.Refused), 80},
+		{"Starts", unsafe.Offsetof(AudioStreamStatus{}.Starts), 84},
+		{"Stops", unsafe.Offsetof(AudioStreamStatus{}.Stops), 88},
+		{"Releases", unsafe.Offsetof(AudioStreamStatus{}.Releases), 92},
+		{"Resets", unsafe.Offsetof(AudioStreamStatus{}.Resets), 96},
+	}
+	for _, o := range offsets {
+		if o.got != o.want {
+			t.Fatalf("AudioStreamStatus.%s offset = %d want %d", o.name, o.got, o.want)
+		}
+	}
+}
+
+// The mixer op numbers are the kernel's StreamOp enum (slot 43's a2). Same
+// argument as TestAudioSlotNumbers: a wrong op looks identical on the host.
+func TestAudioStreamOpNumbers(t *testing.T) {
+	ops := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"open", audioStreamOpen, 1},
+		{"submit", audioStreamSubmit, 2},
+		{"start", audioStreamStart, 3},
+		{"end", audioStreamEnd, 4},
+		{"abort", audioStreamAbort, 5},
+		{"status", audioStreamStatus, 6},
+	}
+	for _, o := range ops {
+		if o.got != o.want {
+			t.Fatalf("%s op = %d want %d", o.name, o.got, o.want)
+		}
+	}
+	if AudioStreamMaxSources != 4 || AudioStreamPeriodsPerSource != 4 {
+		t.Fatalf("mixer bounds drifted: sources=%d periods=%d want 4,4",
+			AudioStreamMaxSources, AudioStreamPeriodsPerSource)
+	}
+	if ErrAudioStreamFull != errno(ErrENOSPC) || ErrAudioBusy != errno(ErrEAGAIN) {
+		t.Fatalf("typed errors drifted: full=%v busy=%v", ErrAudioStreamFull, ErrAudioBusy)
+	}
+}
+
+// Open sends exactly one slot-43 call with the params pointer, flag|8 length,
+// op 1 and a zero generation; the kernel's positive answer is the generation
+// the stream carries into every later call.
+func TestAudioStreamOpenWire(t *testing.T) {
+	var gotNum, gotLen, gotOp, gotGen uintptr
+	var params AudioStreamParams
+	gotParams := params
+	gotParams.Format, gotParams.Rate, gotParams.Channels, gotParams.Version = AudioFmtFloat, 7, 2, 1
+	var gotParamBytes [8]byte
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		gotNum, gotLen, gotOp, gotGen = num, a1, a2, a3
+		copy(gotParamBytes[:], unsafe.Slice((*byte)(unsafe.Pointer(a0)), 8))
+		return 41 // the kernel's seat generation
+	})
+	defer SetSyscallHookForTest(prev)
+
+	s, err := AudioStreamOpen(gotParams)
+	if err != nil {
+		t.Fatalf("AudioStreamOpen err = %v want nil", err)
+	}
+	if gotNum != SlotAudioPlay || gotOp != audioStreamOpen || gotGen != 0 {
+		t.Fatalf("open call = slot %d op %d gen %d want 43/1/0", gotNum, gotOp, gotGen)
+	}
+	if gotLen != audioStreamFlag|8 {
+		t.Fatalf("open len arg = %#x want flag|8", gotLen)
+	}
+	var sent AudioStreamParams
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(&sent)), 8), gotParamBytes[:])
+	if sent != gotParams {
+		t.Fatalf("params on the wire = %+v want %+v", sent, gotParams)
+	}
+	if s.Generation() != 41 {
+		t.Fatalf("stream generation = %d want 41", s.Generation())
+	}
+}
+
+// Every seat occupied is the kernel's ENOSPC — the binding surfaces it as the
+// typed ErrAudioStreamFull, and a mid-teardown window as ErrAudioBusy.
+func TestAudioStreamOpenRefusals(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		kern int64
+		want error
+	}{
+		{"seats full", -ErrENOSPC, ErrAudioStreamFull},
+		{"teardown busy", -ErrEAGAIN, ErrAudioBusy},
+		{"no device", -ErrENXIO, ErrNoAudioDevice},
+		{"tuple mismatch", -ErrEINVAL, errno(ErrEINVAL)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+				return c.kern
+			})
+			defer SetSyscallHookForTest(prev)
+			s, err := AudioStreamOpen(AudioStreamParams{Version: 1})
+			if s != nil || err != c.want {
+				t.Fatalf("AudioStreamOpen = %v, %v want nil, %v", s, err, c.want)
+			}
+		})
+	}
+}
+
+// Submit is one call per period: the buffer pointer, flag|len, op 2, and the
+// seat's generation in a3. A full queue is EAGAIN → ErrAudioBusy.
+func TestAudioStreamSubmitWire(t *testing.T) {
+	s := &AudioStream{generation: 9}
+	period := make([]byte, AudioPeriodBytes)
+	var gotOp, gotGen uintptr
+	var gotLen uintptr
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		if num != SlotAudioPlay || a0 != uintptr(unsafe.Pointer(&period[0])) {
+			t.Fatalf("submit call = slot %d ptr %#x want 43/%#x", num, a0, &period[0])
+		}
+		gotLen, gotOp, gotGen = a1, a2, a3
+		return int64(len(period))
+	})
+	defer SetSyscallHookForTest(prev)
+
+	n, err := s.Submit(period)
+	if n != AudioPeriodBytes || err != nil {
+		t.Fatalf("Submit = %d, %v want %d, nil", n, err, AudioPeriodBytes)
+	}
+	if gotLen != audioStreamFlag|AudioPeriodBytes || gotOp != audioStreamSubmit || gotGen != 9 {
+		t.Fatalf("submit args = len %#x op %d gen %d", gotLen, gotOp, gotGen)
+	}
+}
+
+func TestAudioStreamSubmitRefusals(t *testing.T) {
+	s := &AudioStream{generation: 9}
+	period := make([]byte, AudioPeriodBytes)
+	for _, c := range []struct {
+		name string
+		kern int64
+		want error
+	}{
+		{"queue full", -ErrEAGAIN, ErrAudioBusy},
+		{"bad pointer", -ErrEFAULT, errno(ErrEFAULT)},
+		{"seat gone", -ErrEINVAL, errno(ErrEINVAL)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+				return c.kern
+			})
+			defer SetSyscallHookForTest(prev)
+			n, err := s.Submit(period)
+			if n != 0 || err != c.want {
+				t.Fatalf("Submit = %d, %v want 0, %v", n, err, c.want)
+			}
+		})
+	}
+}
+
+// Bounds checked without a syscall at all: an empty period is EINVAL, an
+// over-period submit is ENAMETOOLONG — both decided here, matching the
+// kernel's answers (it would refuse the same way, so no behavior is hidden).
+func TestAudioStreamSubmitBounds(t *testing.T) {
+	calls := 0
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		calls++
+		return 0
+	})
+	defer SetSyscallHookForTest(prev)
+	s := &AudioStream{generation: 9}
+	if n, err := s.Submit(nil); n != 0 || err != errno(ErrEINVAL) {
+		t.Fatalf("Submit(empty) = %d, %v want 0, EINVAL", n, err)
+	}
+	if n, err := s.Submit(make([]byte, AudioPeriodBytes+1)); n != 0 || err != errno(ErrENAMETOOLONG) {
+		t.Fatalf("Submit(over) = %d, %v want 0, ENAMETOOLONG", n, err)
+	}
+	if calls != 0 {
+		t.Fatalf("bounds sent %d syscalls want 0", calls)
+	}
+}
+
+// Start/End/Abort are one shape: no pointer, no payload length — op and the
+// generation only. Any payload bytes are the kernel's EINVAL.
+func TestAudioStreamLifecycleWire(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		call func(*AudioStream) error
+		op   uintptr
+	}{
+		{"start", (*AudioStream).Start, audioStreamStart},
+		{"end", (*AudioStream).End, audioStreamEnd},
+		{"abort", (*AudioStream).Abort, audioStreamAbort},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := &AudioStream{generation: 33}
+			var gotA0, gotLen, gotOp, gotGen uintptr
+			prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+				gotA0, gotLen, gotOp, gotGen = a0, a1, a2, a3
+				if num != SlotAudioPlay {
+					t.Fatalf("%s called slot %d want %d", c.name, num, SlotAudioPlay)
+				}
+				return 0
+			})
+			defer SetSyscallHookForTest(prev)
+			if err := c.call(s); err != nil {
+				t.Fatalf("%s err = %v want nil", c.name, err)
+			}
+			if gotA0 != 0 || gotLen != audioStreamFlag || gotOp != c.op || gotGen != 33 {
+				t.Fatalf("%s args = ptr %#x len %#x op %d gen %d", c.name, gotA0, gotLen, gotOp, gotGen)
+			}
+		})
+	}
+}
+
+// Status sends op 6 with the out pointer and flag|104, and returns the
+// kernel's struct verbatim — including after the seat is gone, which is what
+// makes the post-close snapshot observable from Go.
+func TestAudioStreamStatusWire(t *testing.T) {
+	s := &AudioStream{generation: 7}
+	want := AudioStreamStatus{Generation: 7, Accepted: 8192, Completed: 8192, Slots: 4, Sources: 2}
+	var gotLen, gotOp, gotGen uintptr
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		gotLen, gotOp, gotGen = a1, a2, a3
+		dst := (*AudioStreamStatus)(unsafe.Pointer(a0))
+		*dst = want
+		return 0
+	})
+	defer SetSyscallHookForTest(prev)
+	got, err := s.Status()
+	if err != nil {
+		t.Fatalf("Status err = %v want nil", err)
+	}
+	if gotLen != audioStreamFlag|104 || gotOp != audioStreamStatus || gotGen != 7 {
+		t.Fatalf("status args = len %#x op %d gen %d", gotLen, gotOp, gotGen)
+	}
+	if got != want {
+		t.Fatalf("Status = %+v want %+v", got, want)
+	}
+}
+
+// A kernel answer short of the submitted length is a device-level refusal,
+// same convention as AudioPlay's — never a silent partial accept.
+func TestAudioStreamSubmitShortCount(t *testing.T) {
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		return 2048 // half a period
+	})
+	defer SetSyscallHookForTest(prev)
+	s := &AudioStream{generation: 9}
+	n, err := s.Submit(make([]byte, AudioPeriodBytes))
+	if n != 2048 || err != ErrNoAudioDevice {
+		t.Fatalf("Submit short = %d, %v want 2048, ENXIO", n, err)
+	}
+}
+
+// Host: every raw call is -ENOSYS; the stream API must degrade like the rest
+// of the seam — no panic, no fabricated seat.
+func TestAudioStreamHostFails(t *testing.T) {
+	if s, err := AudioStreamOpen(AudioStreamParams{Version: 1}); s != nil || err != errno(ErrENOSYS) {
+		t.Fatalf("host AudioStreamOpen = %v, %v want nil, ENOSYS", s, err)
+	}
+	s := &AudioStream{generation: 1}
+	if n, err := s.Submit(make([]byte, AudioPeriodBytes)); n != 0 || err != errno(ErrENOSYS) {
+		t.Fatalf("host Submit = %d, %v want 0, ENOSYS", n, err)
+	}
+	if err := s.Start(); err != errno(ErrENOSYS) {
+		t.Fatalf("host Start err = %v want ENOSYS", err)
+	}
+	if err := s.End(); err != errno(ErrENOSYS) {
+		t.Fatalf("host End err = %v want ENOSYS", err)
+	}
+	if err := s.Abort(); err != errno(ErrENOSYS) {
+		t.Fatalf("host Abort err = %v want ENOSYS", err)
+	}
+	if _, err := s.Status(); err != errno(ErrENOSYS) {
+		t.Fatalf("host Status err = %v want ENOSYS", err)
+	}
+}
+
 // Host: the two new rows degrade exactly like the rest of the seam (no hook,
 // so the raw gateway answers -ENOSYS) — an app that runs the host suite must
 // not see a panic or a fabricated success.

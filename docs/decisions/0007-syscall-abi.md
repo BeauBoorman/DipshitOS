@@ -2023,6 +2023,60 @@ tests, and `live-sound-playback`'s real-device 128 KiB / single START,
 backpressure, copy rollback, sticky XRUN, abort, owner-death/reopen and
 soundless-refusal runs. Legacy audio specs remain regression gates.
 
+## Amendment (M99b / #2180, stacked on ADR 0046): kernel mixer on slot 43
+
+The bit-63 stream ABI is unchanged in shape — same slot, same six
+operations, same open-request tuple — but **open is a mixer source seat,
+not the device**: up to four sources from different processes mix into the
+one physical stream. The mixer sums sources in f32 (each source carries a
+gain field in the composition, wired at unity — no setter op is part of
+this ABI), clamps to [-1, 1], encodes to the negotiated format, and
+applies the slots 44/45 volume/mute ONCE to each composed output period
+(they are no longer applied per submit).
+
+- **Open** takes a seat: the first negotiates the physical stream's tuple;
+  later opens must request the identical format/rate/channels (`EINVAL`
+  otherwise — the mixer does not resample). All four seats occupied is
+  `ENOSPC` (-5) and counted in `refused`; a device stream mid-teardown is
+  `EAGAIN`. A live source set still excludes legacy playback (`EAGAIN`),
+  and legacy playback excludes opens.
+- **Submit** reserves one slot in the source's bounded queue — **four**
+  4096-byte periods per source (was eight shared device slots) — copies
+  user bytes straight into source storage, and commits only on a clean
+  copy (`EFAULT` rolls back, zero acceptance). A full source queue is
+  `EAGAIN`, accepting zero bytes.
+- **Start** makes the seat live; an empty queue is still `EINVAL`. The
+  shared stream STARTs when the first live source is fed.
+- **End** drains this source's queue through the mix, then frees the seat;
+  the device stream STOPs/RELEASEs when the last source leaves. **Abort**
+  frees immediately — queued-but-uncomposed bytes are `canceled`, never
+  played.
+- **Status** is per-source and grew to **104 bytes**: seven u64 fields
+  `generation, accepted, submitted, completed, canceled, underruns,
+  clipped`, then eleven u32 fields `state, reason, outstanding, slots,
+  sources, peak_sources, refused, starts, stops, releases, resets`.
+  `slots` reports the per-source bound (4); `sources`/`peak_sources`/
+  `refused`/`clipped` are mixer-wide; `starts`..`resets` still count the
+  shared stream's lifecycle. A closed seat answers from its post-close
+  snapshot.
+- **Starvation is per-source data, not stream death.** A live source with
+  an empty queue contributes silence and increments its `underruns`; the
+  shared stream keeps running for the others. The sticky-XRUN transition
+  is retired — `state=9` remains in the enum numbering for ABI stability
+  but is never entered; `aborted` remains an explicit reason on abort,
+  and `owner_died` on reaping. Process death revokes only that process's
+  seat; survivors are uninterrupted.
+- Device-side failure still quarantines; transport recovery is the
+  acknowledged-reset path unchanged. This remains not a low-latency
+  scheduling guarantee.
+
+Verification: host mixer unit vectors (exact mix sums, clipping, source
+silence, post-mix ordering), the syscall suite's seat/backpressure/ENOSPC
+rows, and `live-sound-playback`'s extended real-device run: two processes
+streaming simultaneously, per-source accounting identity, owner-death of
+one while the other continues, the four-seat cap, per-source underruns
+without XRUN, and the soundless refusal.
+
 ## B5 amendment — explicit TLS threads and strict coarse waits (#1872)
 
 Slots 73/74 gain additive operations; no new slot or task budget.

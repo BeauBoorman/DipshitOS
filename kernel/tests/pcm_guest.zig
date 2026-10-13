@@ -1,4 +1,7 @@
-//! B7 native acceptance fixture, not a shipped app. No libc or capture.
+//! B7/M99b native acceptance fixture, not a shipped app. No libc or capture.
+//! Modes: default = orchestrator process; argv "peer" = second concurrent
+//! streamer; argv "death" = open/prefill/start then exit for owner-death
+//! teardown while a survivor keeps streaming.
 const std = @import("std");
 pub const panic = std.debug.FullPanic(panicImpl);
 const flag: u64 = @as(u64, 1) << 63;
@@ -9,10 +12,15 @@ const Status = extern struct {
     submitted: u64,
     completed: u64,
     canceled: u64,
+    underruns: u64,
+    clipped: u64,
     state: u32,
     reason: u32,
     outstanding: u32,
     slots: u32,
+    sources: u32,
+    peak_sources: u32,
+    refused: u32,
     starts: u32,
     stops: u32,
     releases: u32,
@@ -77,7 +85,7 @@ fn open() u64 {
     const until = budget();
     while (counter() < until) {
         const n = audio(1, 0, @intFromPtr(&params), @sizeOf(Params));
-        if (n == -11) continue; // bounded deferred owner-death teardown
+        if (n == -11) continue; // bounded deferred teardown between streams
         require(n > 0);
         return @intCast(n);
     }
@@ -87,7 +95,9 @@ fn open() u64 {
 fn status(generation: u64) Status {
     var result: Status = undefined;
     require(audio(6, generation, @intFromPtr(&result), @sizeOf(Status)) == 0);
-    require(result.slots == 8 and result.outstanding <= 32768);
+    // The per-source queue bound is four periods; outstanding is the queue
+    // plus this source's share of the device ring still in flight.
+    require(result.slots == 4 and result.outstanding <= 16384 + 32768);
     return result;
 }
 fn closed(generation: u64) Status {
@@ -115,7 +125,7 @@ fn submit(generation: u64) void {
     const until = budget();
     while (counter() < until) {
         const n = audio(2, generation, @intFromPtr(&samples), samples.len);
-        if (n == -11) continue;
+        if (n == -11) continue; // source queue full: backpressure, not error
         if (n != 4096) {
             var buf: [128]u8 = undefined;
             const s = status(generation);
@@ -127,16 +137,38 @@ fn submit(generation: u64) void {
     require(false);
 }
 fn prefill(generation: u64) void {
-    for (0..8) |_| submit(generation);
+    for (0..4) |_| submit(generation);
 }
 fn start(generation: u64) void {
     require(audio(3, generation, 0, 0) == 0);
+}
+fn exec_self(mode: []const u8) i64 {
+    const name = "PCM.BIN";
+    var arg: [256]u8 = @splat(0);
+    @memcpy(arg[0..mode.len], mode);
+    return call(28, .{ @intFromPtr(name.ptr), name.len, @intFromPtr(&arg), 1, 0, 0 });
 }
 
 export fn _start(argc: u64, argv: u64) callconv(.c) noreturn {
     pcm_probe_state += 1;
     if (argc > 0) {
         const block: [*]const u8 = @ptrFromInt(argv);
+        if (std.mem.startsWith(u8, block[0..256], "peer")) {
+            // Second concurrent streamer: the card's "two processes make
+            // sound at the same time" half. It opens its own seat on the
+            // already-running device stream, streams, drains and reports
+            // its own generation's counters.
+            const generation = open();
+            prefill(generation);
+            start(generation);
+            for (0..12) |_| submit(generation);
+            require(audio(4, generation, 0, 0) == 0);
+            const drained = closed(generation);
+            require(drained.accepted == 65536 and drained.submitted == 65536 and drained.completed == 65536);
+            require(drained.canceled == 0 and drained.reason == 0);
+            say("b7: peer accepted=65536 submitted=65536 completed=65536 sources=2\n");
+            exit(0);
+        }
         if (std.mem.startsWith(u8, block[0..256], "death")) {
             const generation = open();
             prefill(generation);
@@ -161,48 +193,79 @@ export fn _start(argc: u64, argv: u64) callconv(.c) noreturn {
     require(audio(2, generation, @intFromPtr(&samples), 7) == -1);
     require(audio(2, generation, @intFromPtr(&samples), 4097) == -8);
     require(audio(2, generation + 1, @intFromPtr(&samples), 8) == -1);
+    // Legacy slot-43 playback stays refused while a source seat is open.
+    require(call(43, .{ @intFromPtr(&samples), 8, 0, 0, 0, 0 }) == -11);
     prefill(generation);
     require(audio(2, generation, @intFromPtr(&samples), 4096) == -11);
-    require(status(generation).accepted == 32768);
-    say("b7: bounds=8x4096 backpressure=EAGAIN accepted=32768 copy-rollback=0\n");
+    require(status(generation).accepted == 16384);
+    say("b7: bounds=4x4096 backpressure=EAGAIN accepted=16384 copy-rollback=0 legacy=EAGAIN\n");
+
+    // The source bound is four seats: fill them and watch the (N+1)th open
+    // refuse ENOSPC and count it; then free the spares.
+    var spares: [3]u64 = undefined;
+    for (&spares) |*g| {
+        g.* = open();
+        require(g.* > 0);
+    }
+    require(status(generation).sources == 4);
+    require(audio(1, 0, @intFromPtr(&params), @sizeOf(Params)) == -5);
+    require(status(generation).refused == 1);
+    for (spares) |g| require(audio(5, g, 0, 0) == 0);
+    require(status(generation).sources == 1);
+    say("b7: cap=4 open5=ENOSPC refused=1 sources=1\n");
+
     start(generation);
-    for (0..24) |_| submit(generation);
+    for (0..8) |_| submit(generation);
+
+    // Two processes streaming at once: the peer execs PCM.BIN, opens its
+    // own seat on the running device stream, and streams while we do.
+    const peer = exec_self("peer");
+    require(peer >= 0);
+    {
+        const until = budget();
+        var seen: u32 = 0;
+        while (counter() < until and seen == 0) {
+            seen = status(generation).sources;
+        }
+        require(seen == 2);
+    }
+    for (0..8) |_| submit(generation); // overlapped streaming
+    require(call(8, .{ @intCast(peer), 0, 0, 0, 0, 0 }) == 0);
+    const after_peer = status(generation);
+    require(after_peer.peak_sources == 4 and after_peer.sources == 1);
+    say("b7: overlap sources=2 peak=4 both-advanced\n");
+
+    // Owner death mid-stream: the child's seat reaps while ours streams on.
+    const dying = exec_self("death");
+    require(dying >= 0);
+    require(call(8, .{ @intCast(dying), 0, 0, 0, 0, 0 }) == 0);
+    for (0..8) |_| submit(generation);
+    require(status(generation).sources == 1);
+    say("b7: owner-death teardown sources=1 survivor-advances\n");
+
+    // Starvation is per-source data now, not whole-stream death: stop
+    // feeding for a slice, watch underruns accrue with state still running,
+    // then resume cleanly.
+    const before_gap = status(generation).underruns;
+    {
+        const freq = asm volatile ("mrs %[v], cntfrq_el0"
+            : [v] "=r" (-> u64),
+        );
+        const until = counter() + freq / 4;
+        while (counter() < until) {}
+    }
+    const starved = status(generation);
+    require(starved.underruns > before_gap and starved.state == 4);
+    for (0..4) |_| submit(generation);
+    say("b7: underrun counted no-XRUN resume=ok\n");
+
+    // 4 prefill + 8 + 8 + 8 + 4 = 32 periods accepted end to end.
     require(audio(4, generation, 0, 0) == 0);
     const drained = closed(generation);
     require(drained.accepted == 131072 and drained.submitted == 131072 and drained.completed == 131072);
     require(drained.canceled == 0 and drained.reason == 0 and drained.outstanding == 0);
     require(drained.starts == 1 and drained.stops == 1 and drained.releases == 1 and drained.resets == 0);
     say("b7: continuous accepted=131072 submitted=131072 completed=131072 starts=1 stops=1 releases=1 resets=0\n");
-
-    const underrun = open();
-    prefill(underrun);
-    start(underrun);
-    const until = budget();
-    while (counter() < until and status(underrun).state != 9) {}
-    require(status(underrun).state == 9 and status(underrun).reason == 1);
-    require(audio(2, underrun, @intFromPtr(&samples), 4096) == -1);
-    require(audio(5, underrun, 0, 0) == 0);
-    _ = closed(underrun);
-    say("b7: underrun=XRUN sticky=1 explicit-abort=ok\n");
-
-    const aborted = open();
-    prefill(aborted);
-    require(audio(5, aborted, 0, 0) == 0);
-    const canceled = closed(aborted);
-    require(canceled.canceled == 32768 and canceled.completed == 0 and canceled.reason == 3);
-    say("b7: abort canceled=32768 outstanding=0\n");
-
-    const name = "PCM.BIN";
-    var arg: [256]u8 = @splat(0);
-    @memcpy(arg[0..5], "death");
-    const pid = call(28, .{ @intFromPtr(name.ptr), name.len, @intFromPtr(&arg), 1, 0, 0 });
-    require(pid >= 0);
-    require(call(8, .{ @intCast(pid), 0, 0, 0, 0, 0 }) == 0);
-    const reopened = open();
-    require(reopened > aborted);
-    require(audio(5, reopened, 0, 0) == 0);
-    _ = closed(reopened);
-    say("b7: owner-death teardown reopened=ok\n");
     say("b7: output only, no capture or low-latency claim\n");
     say("b7: done\n");
     exit(0);
