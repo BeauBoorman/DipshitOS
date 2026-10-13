@@ -174,6 +174,110 @@ func TestMeasureIsSumOfAdvances(t *testing.T) {
 	}
 }
 
+// TestZigEngineParity is the M99n frozen-fallback contract (ADR 0034
+// amendment A). user/src/lib/font_ttf.zig is frozen as the fallback and
+// build-time engine, and user/src/lib/font_atlas_gen.zig emits that
+// engine's own advance table as testdata/zig-engine-advances.tsv. On the
+// faces both engines share, the Go engine must produce the same glyph ids
+// and the same advances at the kernel atlas's 11/13/17 px ladder — a diff
+// here is engine drift, and the fix is a deliberate, reviewed fixture
+// regeneration (`zig run user/src/lib/font_atlas_gen.zig`), never a silent
+// divergence.
+func TestZigEngineParity(t *testing.T) {
+	faces := map[string]*Face{
+		"inter-regular":    loadFace(t, interPath),
+		"firacode-regular": loadFace(t, firaPath),
+	}
+	data, err := os.ReadFile("testdata/zig-engine-advances.tsv")
+	if err != nil {
+		t.Fatalf("parity fixture is required (regenerate: zig run user/src/lib/font_atlas_gen.zig): %v", err)
+	}
+	rows := 0
+	for ln, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 6 {
+			t.Fatalf("fixture line %d has %d fields, want 6: %q", ln+1, len(fields), line)
+		}
+		f, ok := faces[fields[0]]
+		if !ok {
+			t.Fatalf("fixture line %d names unknown face %q", ln+1, fields[0])
+		}
+		cp, err := strconv.ParseUint(fields[1], 16, 32)
+		if err != nil {
+			t.Fatalf("fixture line %d codepoint: %v", ln+1, err)
+		}
+		wantGID, err := strconv.Atoi(fields[2])
+		if err != nil {
+			t.Fatalf("fixture line %d gid: %v", ln+1, err)
+		}
+		r := rune(cp)
+		if got := f.GlyphIndex(r); got != uint16(wantGID) {
+			t.Errorf("%s: GlyphIndex(U+%04X) = %d, Zig engine says %d", fields[0], cp, got, wantGID)
+		}
+		for i, px := range []int{11, 13, 17} {
+			want, err := strconv.Atoi(fields[3+i])
+			if err != nil {
+				t.Fatalf("fixture line %d advance: %v", ln+1, err)
+			}
+			if got := f.AdvancePx(r, px); got != want {
+				t.Errorf("%s: AdvancePx(U+%04X, %d) = %d, Zig engine says %d", fields[0], cp, px, got, want)
+			}
+		}
+		rows++
+	}
+	// 95 printable-ASCII codepoints per face; a truncated fixture must not
+	// silently pass.
+	if rows != 190 {
+		t.Fatalf("fixture has %d data rows, want 190", rows)
+	}
+}
+
+// TestFrozenZigDivergencesAreReal pins the Go half of the divergence
+// contract: the capabilities the frozen Zig engine is pinned *without*
+// genuinely exist in the faces it ships — so the Zig-side pins (gid 0
+// above U+FFFF, un-kerned measures) are measuring a real gap, not nothing.
+func TestFrozenZigDivergencesAreReal(t *testing.T) {
+	inter := loadFace(t, interPath)
+	fira := loadFace(t, firaPath)
+
+	// Plane-1 coverage the faces carry through their format-12 cmaps,
+	// which the frozen engine's format-4 selection never sees. These are
+	// the same codepoints font_ttf.zig's pin expects as gid 0.
+	if gid := inter.GlyphIndex(0x1F130); gid != 1964 {
+		t.Errorf("Inter GlyphIndex(U+1F130) = %d, want 1964 (the glyph Zig cannot reach)", gid)
+	}
+	if gid := fira.GlyphIndex(0x1D539); gid != 997 {
+		t.Errorf("Fira GlyphIndex(U+1D539) = %d, want 997 (the glyph Zig cannot reach)", gid)
+	}
+
+	// Inter's GPOS kern is real and worth a pixel at the atlas sizes:
+	// pair ('A','V') adjusts -140 design units — the number the Zig test
+	// subtracts to prove its measure is un-kerned.
+	a, v := inter.GlyphIndex('A'), inter.GlyphIndex('V')
+	if got := inter.PairAdvance(a, v); got != -140 {
+		t.Errorf("Inter PairAdvance('A','V') = %d, want -140", got)
+	}
+	shaped := inter.ShapeLatin("AV")
+	if len(shaped) != 2 || shaped[0].XAdvance != inter.GlyphAdvanceUPEM(a)-140 {
+		t.Errorf("ShapeLatin(AV)[0].XAdvance = %+v, want adv-140", shaped)
+	}
+	// Kerning only ever applies through shaping. Measure — the path the
+	// parity fixture records — stays a plain advance sum, which is why
+	// the two engines can hold parity at all.
+	upem := inter.UnitsPerEm()
+	unKerned := scaleUPEM(inter.GlyphAdvanceUPEM(a)+inter.GlyphAdvanceUPEM(v), 13, upem)
+	kerned := scaleUPEM(inter.GlyphAdvanceUPEM(a)+inter.GlyphAdvanceUPEM(v)-140, 13, upem)
+	if kerned >= unKerned {
+		t.Fatalf("kern %d upem should be visible at 13px: kerned=%d unkerned=%d", -140, kerned, unKerned)
+	}
+	if got := inter.Measure("AV", 13); got != unKerned {
+		t.Errorf("Measure(AV,13) = %d, want un-kerned %d (kerned would be %d)", got, unKerned, kerned)
+	}
+}
+
 // TestUnmappedRuneStillAdvances: a rune the font has no glyph for resolves to
 // .notdef, and .notdef still has a width. Text made of unknown characters stays
 // visible and keeps its spacing instead of collapsing to nothing.
