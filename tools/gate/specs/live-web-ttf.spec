@@ -9,6 +9,9 @@
 # coverage faces, so runs enter the M99l manifest path. Runs 03/04 are the
 # coverage boots — they must precede 05, whose `vf rm` deletions persist on
 # the share for the rest of the gate.
+# M99o (#2192): INTERBI.TTF stages beside the other faces, the manifest pins
+# faces=9, and run 03's COVER.HTML carries a font-weight:700;font-style:italic
+# line so the gate watches it resolve to the dedicated face (bi-resolve).
 
 vgate_name live-web-ttf "WEB: native font metrics and exact M93 typography/table/image/fallback presentation"
 vgate_share seed
@@ -33,6 +36,7 @@ vgate_file script-nofont.txt <<'EOF'
 vf rm INTER.TTF
 vf rm INTERB.TTF
 vf rm INTERI.TTF
+vf rm INTERBI.TTF
 vf rm FIRACODE.TTF
 vf rm CHROME.TTF
 vf rm FONTS.TXT
@@ -54,7 +58,7 @@ if not os.path.exists(src):
     sys.exit("build first: bash tools/go/build-web.sh browser WEB --gate")
 shutil.copy(src, os.path.join(share, "WEB.ELF"))
 shutil.copy(os.path.join("tests", "oliver-spike", "expect.html"), os.path.join(share, "OLIVER.HTML"))
-for face in ("INTER.TTF", "INTERB.TTF", "INTERI.TTF", "FIRACODE.TTF"):
+for face in ("INTER.TTF", "INTERB.TTF", "INTERI.TTF", "INTERBI.TTF", "FIRACODE.TTF"):
     if not os.path.exists(os.path.join(share, face)):
         sys.exit("missing seeded face: " + face)
 # M99m (#2190): the seeder still drops only the four original faces, so the
@@ -99,11 +103,14 @@ open(os.path.join(share, "PNG.HTML"), "wb").write(
     b'<img src="SWATCH.PNG" width="32" height="32" alt="guest PNG">')
 # M99m coverage page: kyōiku kanji + kana only NOTOCJK covers, then ℔ and the
 # ﬁ ligature — runes only NOTOSERF covers — inside a font-family:serif block.
-# A miss anywhere counts on `fonts: notdef`; real glyphs paint real ink.
+# M99o adds a font-weight:700;font-style:italic line, the CSS that must
+# resolve to INTERBI.TTF. A miss anywhere counts on `fonts: notdef`; real
+# glyphs paint real ink.
 open(os.path.join(share, "COVER.HTML"), "wb").write(
     b"<h4>coverage</h4>"
     b"<p>cjk &#x65e5;&#x672c;&#x8a9e; &#x3042;&#x3044; &#x30ab;&#x30ad;</p>"
-    b'<p style="font-family:serif">serif &#x2114;&#xfb01;</p>')
+    b'<p style="font-family:serif">serif &#x2114;&#xfb01;</p>'
+    b'<p style="font-weight:700;font-style:italic">bold italic ink</p>')
 print("M93f staged separately tagged WEB and original QOI/PNG/HTML fixtures")
 PY
 
@@ -141,6 +148,8 @@ vgate_assert 01 serial-contains ' adv-space=4'
 vgate_assert 01 serial-contains ' bold-face=yes'
 vgate_assert 01 serial-contains ' bold-heavier=yes'
 vgate_assert 01 serial-contains ' italic-face=yes'
+vgate_assert 01 serial-contains ' bi-face=yes'
+vgate_assert 01 serial-contains ' bi-resolve=bolditalic'
 vgate_assert 01 serial-absent 'proportional=no'
 vgate_assert 01 serial-absent 'adv-i=8'
 vgate_assert 01 snapshot 'snap-01-*.raw' <<'PY'
@@ -172,9 +181,11 @@ import subprocess, sys
 subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'depth'])
 PY
 
-# 03: M99m coverage faces. The manifest is honored (faces=8), the CJK line
-# reaches NOTOCJK and the serif-only runes in the font-family:serif block
-# reach NOTOSERF through the ui cascade — no rune exhausts its chain, so
+# 03: M99m coverage faces, and M99o's bold-italic. The manifest is honored
+# (faces=9), the CJK line reaches NOTOCJK, the serif-only runes in the
+# font-family:serif block reach NOTOSERF through the ui cascade, and the
+# font-weight:700;font-style:italic line resolves the dedicated face — the
+# engine's own bi-resolve marker says so. No rune exhausts its chain, so
 # `fonts: notdef` never speaks, and the page paints real ink (the probe
 # counts non-background pixels in the page viewport; .notdef cannot satisfy
 # the no-notdef marker).
@@ -191,8 +202,10 @@ vgate_assert 03 serial-contains 'web: layout blocks='
 vgate_assert 03 serial-contains 'web: settled'
 vgate_assert 03 serial-contains 'web: repaint items='
 vgate_assert 03 serial-contains 'web: ready'
-vgate_assert 03 serial-contains 'fonts: manifest=ok faces=8'
+vgate_assert 03 serial-contains 'fonts: manifest=ok faces=9'
 vgate_assert 03 serial-contains 'web: fonts truetype(inter+firacode) ui=truetype mono=truetype'
+vgate_assert 03 serial-contains ' bi-face=yes'
+vgate_assert 03 serial-contains ' bi-resolve=bolditalic'
 vgate_assert 03 serial-absent 'fonts: notdef='
 vgate_assert 03 serial-absent 'web: error'
 vgate_assert 03 serial-absent '[EXC] parking:'
@@ -240,7 +253,7 @@ vgate_run 04 -- \
 
 vgate_assert 04 serial-absent 'web: budget over'
 vgate_assert 04 serial-contains 'web: url /host/COVER.HTML'
-vgate_assert 04 serial-contains 'fonts: manifest=ok faces=8'
+vgate_assert 04 serial-contains 'fonts: manifest=ok faces=9'
 vgate_assert 04 serial-contains 'fonts: notdef='
 vgate_assert 04 serial-contains 'web: ready'
 vgate_assert 04 serial-absent 'web: error'
@@ -285,6 +298,8 @@ vgate_assert 05 serial-contains 'web: fonts bitmap8x8 ui=missing mono=missing'
 vgate_assert 05 serial-contains 'web: text face=bitmap8x8 proportional=no'
 vgate_assert 05 serial-contains ' bold-face=no'
 vgate_assert 05 serial-contains ' italic-face=no'
+vgate_assert 05 serial-contains ' bi-face=no'
+vgate_assert 05 serial-contains ' bi-resolve=none'
 vgate_assert 05 serial-contains ' adv-i=8'
 vgate_assert 05 serial-contains ' adv-W=8'
 vgate_assert 05 serial-contains ' h1-lineh=18'

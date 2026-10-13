@@ -3,25 +3,26 @@
   "Fonts": {
     "FiraCode-Regular.ttf": "5992ab9640e2df491b2f609467b1de60e8bc39b2c28db184342a0592d98f6117",
     "Inter-Bold.ttf": "288316099b1e0a47a4716d159098005eef7c0066921f34e3200393dbdb01947f",
+    "Inter-BoldItalic.ttf": "948405a16cdc62701da5f4005ed068ca5f4d27061d98f7974ccfc37831d9581d",
     "Inter-Italic.ttf": "bbc051dd204b5019a1aa0bc0ae2aa8a05ab13e7a3f979fa357631dc7feb6833a",
     "Inter-Regular.ttf": "40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82"
   },
   "Images": {
-    "borders": {"Native":"427db58453459d97a9a189d6d0ab467ef7cf8ef3fdf4177a4fd549476ffdc1bf","Presentation":"ed1acd9e4078ed74f1b1d2f19a7525bae39ded7b7785f82c35006bda6deea145","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "box-model": {"Native":"1a238826172d6d139eee4182f3ea050e0b79d2d3fec8058e3a143a4447789416","Presentation":"ff959817f1e4152a3c19bd5fa79b00394235de5b92e5323c18664de8c73d722e","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "borders": {"Native":"2b563ddc3397b117813d33aa5aef3efee0f63b25f0d4f3c433532db6afdf1ced","Presentation":"8d30863aaa483945eebfc3338b0aacb3fe3c9549e1ac710450d97c4b175c620a","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "box-model": {"Native":"ba4f83393f289020b4207ebd28ec16004f126ead43339e5b03ba79c84eda5b3f","Presentation":"024489b41c32442a4d37af39be6d7d4724359bec7b7bbdeb2eb293c04b0bbafc","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "boxes-block": {"Native":"4aba7392fe79185b09e3188aa88755df764c08dd25bc626c1e8ac1d3fb27b892","Presentation":"a16a92ae4b0d7417fc7d14c9b2f35ee188ece0db2d54f0176f4e3373d50d33ba","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "boxes-collapse": {"Native":"830a61ec3e25d064f20841ac6a80123be7122181800456876f86178e69b147d8","Presentation":"02dffb6f688b7d9e3f7aaf008c79fe90fb33799f7aeed286857ce4e86f0aa5c2","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "boxes-flex": {"Native":"830a61ec3e25d064f20841ac6a80123be7122181800456876f86178e69b147d8","Presentation":"02dffb6f688b7d9e3f7aaf008c79fe90fb33799f7aeed286857ce4e86f0aa5c2","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "colors": {"Native":"6255d6265deace9074d7d108ceffddca5aacb56513bd548e33a97084bc529130","Presentation":"1ba558517359ee20ea8f6bd9f4181c528043d47c975c971e8ca0e155ee91ad89","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "degradation": {"Native":"2e63f804971ac2cec370c06263a785f1c7e9724922db3e8ddeefe49dfacdfc0e","Presentation":"584dcd2fc670e33d4b03412eafdea9fe32895a0b9030196dcbedd625e63a52b4","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "display-tables": {"Native":"5bca9ee56e68031653a17b65f57751b89af143a0d83c70b79f70fe7b1661ff4c","Presentation":"1e6dd314022cd181efaaf9e55f145e809dd435c1f85b1cf93f09d294c4bb8689","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "flex": {"Native":"4f006843adcf33aa48039f05eaf9d3bac1beb7d570723c427e920c0066195224","Presentation":"0c11501e5d89f0bc4d0a98f096a54e540fd549f53af759c6ce0d461902b496f5","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "fonts": {"Native":"4306efaf31043f6030558fd33e0c297d27e57f16648e371866c6ef288948958d","Presentation":"9469953f248891801ea73eb4e82c341841310bad66d559f771c6d436893f490e","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "forms": {"Native":"2e321213eb9953fa1fff1d11def05a6d8c3deee3a1e621240e46522e94ec5e06","Presentation":"e0d01d0b1dce2682097a7c04340ca4083e6835178b0557dbf6249b0dc8a75b62","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "github": {"Native":"22879e132bb8599509b79ab1e568cde07b5ffab68648d096956420037186aee2","Presentation":"7cee56b106ab381d92b2c4c6912fcf2a5f3d87f48bdf0d8d3015b0f825fce526","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "mdn": {"Native":"49df6e29235d0030ef3872d47eb21ea0ac91e1494f616beb3a169dc8dcac64fb","Presentation":"11445bf68f72f612f48a819248b42a586702dbc8c09d91501a59ebdfc5f10d36","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "selectors": {"Native":"15eec1a57a9d8ef86005f8806dc61874859914b7ba28c92b05f011bfa16a0567","Presentation":"5e8a476548079959b79ffa979f8484c9bd18cf88c453bc0044e7d2d0c4f7fbdc","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "wikipedia": {"Native":"3c9c9e68d0680fcbd4730e956d405cde2e0388aff3bda67e367cbabffc309836","Presentation":"9daea03f715f5f680c4508ab3d003dbcdb92d024ad20e90baf971adffb6c7850","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0}
+    "colors": {"Native":"c0fd0fe861e53b76489dc5ada349e186b47137d9dc373f14a0dcdb16e0c888a2","Presentation":"7768bae301fa3c78683847511cda2e93ad361b49206573f5c547960f1a7b1117","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "degradation": {"Native":"e9af381857c63c55869390ec0c81774a5c2b462d30f7bc908f9a1b229f4c32fb","Presentation":"f887b8ec2ccc455378887ebef81aab85060ffde35fc996e2735cf7f805623880","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "display-tables": {"Native":"e3c9229457ea4b35dbc4543f38fe750bc7bd2d8c26414f1a5ac7cb5c94e75e10","Presentation":"cc55fdc51fa4aad041dba96acc77c1b5dea049dc33f05c01ee4dcb4aef8d49fc","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "flex": {"Native":"7939c44170f2d03d77da70099e6f56c05b1e88cba7a0b416a4fbc1c257614e55","Presentation":"f80b8ad26d8b2853c3b55a0153ea65e533d5810c34cd56450dca40c10b82eef5","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "fonts": {"Native":"983ba11fe069fe39c6104335ce078610f88f3496997fcd9fd259465974d5cc30","Presentation":"71820536604b165c7b16fcd8338d1939b423a757c6b2ec888a3e7e7749759a47","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "forms": {"Native":"432eff0332d758bb5c7472bbaf0edce73a5397d680109755540539cdcbc9e165","Presentation":"303152c58ca7299f6f1010228d022f05386688427a1817088d2b2b534f0ec097","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "github": {"Native":"abcd39837487a98a80c5f7d8ae3f0bcf2fbe13762a341176c03032da4d8f2444","Presentation":"7ed0b8fa02cbe1c5066d3dbfecab73046abb49947f05074d18e34c6e89db3574","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "mdn": {"Native":"b46be5fa34e78e34d9ae0757ad6610cc63861cae8b8b084f76ce42c706404689","Presentation":"9bfdab494cfffb680e5c6151180010babafd07937f4ac9c7ca199905d7f6bfd6","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "selectors": {"Native":"6cb9568a762f23432978e00726db69ff828dfc568f69545252326424d11f8a9d","Presentation":"bdbd08342d78944d6e70f8db6514534233c2aa4777ca79d6bf2e895984d882bb","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "wikipedia": {"Native":"923b395a83db9dc077c5afe5f609f2be6fc6acfcf0a42658214b45a32eaba632","Presentation":"445b5771fe033db5a840d968e5b6d5b7267f4405a3cc4127b4917d7f189e04c4","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0}
   },
   "Verdicts": {
     "borders": "Approve all 15 pairs",

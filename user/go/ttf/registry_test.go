@@ -15,8 +15,10 @@ func regFaces(t *testing.T) map[string]*Face {
 		"INTER.TTF":    loadFace(t, interPath),
 		"INTERB.TTF":   loadFace(t, "../../../image/fonts/Inter-Bold.ttf"),
 		"INTERI.TTF":   loadFace(t, "../../../image/fonts/Inter-Italic.ttf"),
+		"INTERBI.TTF":  loadFace(t, "../../../image/fonts/Inter-BoldItalic.ttf"),
 		"FIRACODE.TTF": loadFace(t, firaPath),
 		"CHROME.TTF":   loadFace(t, chromePath),
+		"NOTOSERF.TTF": loadFace(t, "../../../image/fonts/NotoSerif-Regular.ttf"),
 	}
 }
 
@@ -54,14 +56,17 @@ func TestManifestParsesShippedShape(t *testing.T) {
 		t.Fatalf("the shipped manifest must parse: %v", err)
 	}
 	// The four faces the hard-coded path reads must resolve to the same
-	// selections the manifest assigns them, plus the M99m coverage faces:
-	// NOTOSERF is both the serif role's primary and the ui cascade's tail,
-	// and NOTOCJK trails the symbol faces so every chain reaches it last.
+	// selections the manifest assigns them, plus the M99m coverage faces and
+	// the M99o bold-italic: NOTOSERF is both the serif role's primary and the
+	// ui cascade's tail, NOTOCJK trails the symbol faces so every chain
+	// reaches it last, and INTERBI is the one row carrying weight=700 AND
+	// style=italic, sorted last so no other cascade moves.
 	want := []FaceSpec{
 		{File: "INTER.TTF", Role: "ui", Order: 1, Weight: 400},
 		{File: "INTERB.TTF", Role: "ui", Order: 2, Weight: 700},
 		{File: "INTERI.TTF", Role: "ui", Order: 3, Weight: 400, Italic: true},
 		{File: "NOTOSERF.TTF", Role: "ui", Order: 4, Weight: 400},
+		{File: "INTERBI.TTF", Role: "ui", Order: 5, Weight: 700, Italic: true},
 		{File: "FIRACODE.TTF", Role: "mono", Order: 1, Weight: 400},
 		{File: "NOTOSERF.TTF", Role: "serif", Order: 1, Weight: 400},
 		{File: "CHROME.TTF", Role: "symbol", Order: 1, Weight: 400},
@@ -421,5 +426,95 @@ func TestGoldenChainFallbackRune(t *testing.T) {
 	}
 	if reg.Notdef() != 0 {
 		t.Error("a covered rune was counted as notdef")
+	}
+}
+
+// TestChainBoldItalicResolvesTheDedicatedFace: a {bold,italic} query must
+// pick the one row carrying weight=700 AND style=italic — and only that
+// query may pick it, so the BI face never shadows a plain bold or italic.
+func TestChainBoldItalicResolvesTheDedicatedFace(t *testing.T) {
+	faces := regFaces(t)
+	load, _ := fixtureLoader(t, faces)
+	specs := parseOK(t,
+		"INTER.TTF | role=ui | order=1\n"+
+			"INTERB.TTF | role=ui | order=2 | weight=700\n"+
+			"INTERI.TTF | role=ui | order=3 | style=italic\n"+
+			"INTERBI.TTF | role=ui | order=4 | weight=700 | style=italic\n")
+	reg := NewRegistry(specs, load)
+	bi := Query{Role: "ui", Bold: true, Italic: true}
+	if got := reg.Primary(bi); got != faces["INTERBI.TTF"] {
+		t.Fatal("a bold-italic primary is not the weight=700+italic face")
+	}
+	if ch := reg.Chain(bi); ch == nil || ch.Primary() != faces["INTERBI.TTF"] {
+		t.Fatal("the bold-italic chain did not resolve the dedicated face")
+	}
+	// The dedicated face must not leak into sibling queries.
+	if got := reg.Primary(Query{Role: "ui", Bold: true}); got != faces["INTERB.TTF"] {
+		t.Error("a bold query reached for the BI face")
+	}
+	if got := reg.Primary(Query{Role: "ui", Italic: true}); got != faces["INTERI.TTF"] {
+		t.Error("an italic query reached for the BI face")
+	}
+	if got := reg.Primary(Query{Role: "ui"}); got != faces["INTER.TTF"] {
+		t.Error("a plain query reached for a styled face")
+	}
+}
+
+// TestChainBoldItalicDegradesThroughStyledFaces is the card's degrade rule:
+// {B,I} falls back {B} then {I} then the role's normal face, so a manifest
+// without a BI row still paints a styled face, never Regular first.
+func TestChainBoldItalicDegradesThroughStyledFaces(t *testing.T) {
+	faces := regFaces(t)
+	load, _ := fixtureLoader(t, faces)
+	cases := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{"no BI row degrades to bold",
+			"INTER.TTF | role=ui | order=1\n" +
+				"INTERB.TTF | role=ui | order=2 | weight=700\n" +
+				"INTERI.TTF | role=ui | order=3 | style=italic\n", "INTERB.TTF"},
+		{"no bold-weight row degrades to italic",
+			"INTER.TTF | role=ui | order=1\n" +
+				"INTERI.TTF | role=ui | order=3 | style=italic\n", "INTERI.TTF"},
+		{"no styled row degrades to normal",
+			"INTER.TTF | role=ui | order=1\n", "INTER.TTF"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := NewRegistry(parseOK(t, tc.manifest), load)
+			ch := reg.Chain(Query{Role: "ui", Bold: true, Italic: true})
+			if ch == nil || ch.Primary() != faces[tc.want] {
+				t.Fatalf("degraded primary = %v, want %s", ch.Primary(), tc.want)
+			}
+		})
+	}
+}
+
+// TestSerifStyledQueriesRefuseByName is the card's declared serif policy:
+// NOTOSERF has no styled rows, so serif bold, italic and bold-italic all
+// degrade to the regular serif face — real coverage, no synthetic shear or
+// embolden. The query must not borrow an Inter styled face either: styled
+// rows in another role are not a serif answer.
+func TestSerifStyledQueriesRefuseByName(t *testing.T) {
+	faces := regFaces(t)
+	load, _ := fixtureLoader(t, faces)
+	specs := parseOK(t,
+		"INTER.TTF | role=ui | order=1\n"+
+			"INTERB.TTF | role=ui | order=2 | weight=700\n"+
+			"INTERI.TTF | role=ui | order=3 | style=italic\n"+
+			"INTERBI.TTF | role=ui | order=4 | weight=700 | style=italic\n"+
+			"NOTOSERF.TTF | role=serif | order=1\n")
+	reg := NewRegistry(specs, load)
+	for _, q := range []Query{
+		{Role: "serif", Bold: true},
+		{Role: "serif", Italic: true},
+		{Role: "serif", Bold: true, Italic: true},
+	} {
+		ch := reg.Chain(q)
+		if ch == nil || ch.Primary() != faces["NOTOSERF.TTF"] {
+			t.Fatalf("%+v resolved %v, want the regular serif face", q, ch.Primary())
+		}
 	}
 }

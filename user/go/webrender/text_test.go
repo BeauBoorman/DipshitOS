@@ -54,22 +54,9 @@ func TestQOIHashStaysInTheIndexTable(t *testing.T) {
 }
 
 func (f *maskFB) BlitMask(x, y int, m *ttf.Mask, rgb uint32) {
-	for row := 0; row < m.Height; row++ {
-		for col := 0; col < m.Width; col++ {
-			px, py := x+col, y+row
-			if px < 0 || py < 0 || px >= f.w || py >= f.h {
-				continue
-			}
-			a := uint32(m.Alpha[row*m.Width+col])
-			old := f.at(px, py)
-			var blended uint32
-			for _, shift := range []uint{0, 8, 16} {
-				n := ((rgb>>shift&255)*a + (old>>shift&255)*(255-a) + 127) / 255
-				blended |= n << shift
-			}
-			f.px[py*f.w+px] = blended
-		}
-	}
+	// The shared linear-light helper (M99o): every Go coverage blend routes
+	// through ttf.Blend, test surfaces included.
+	ttf.Blend(f.px, f.w, f.w, f.h, x, y, m, rgb)
 }
 
 func TestCSSFontSizes(t *testing.T) {
@@ -95,8 +82,14 @@ func TestCSSFontSizes(t *testing.T) {
 		}
 		t.Logf("CSS metrics verified at %d px for Inter, Bold, Italic, Bold+Italic and Fira Code", px)
 	}
-	if f.face(Style{Bold: true, Italic: true}) != f.Bold {
-		t.Fatal("Bold must win without a Bold-Italic face")
+	if f.face(Style{Bold: true, Italic: true}) != f.BoldItalic {
+		t.Fatal("the dedicated Bold-Italic face must win when it is loaded")
+	}
+	// And the card's degrade: a Fonts built without BI resolves {B,I} to
+	// Bold, not to Regular.
+	noBI := Fonts{UI: f.UI, Mono: f.Mono, Bold: f.Bold, Italic: f.Italic}
+	if noBI.face(Style{Bold: true, Italic: true}) != noBI.Bold {
+		t.Fatal("without a Bold-Italic face a {bold,italic} style must degrade to Bold")
 	}
 	// These are the existing guest metric markers, not CSS normal line height.
 	if f.LineHeight(Style{Size: 1}) != 18 || f.LineHeight(Style{Size: 2}) != 33 ||
@@ -161,12 +154,13 @@ func TestCSSLayoutAndPaintUseSameSize(t *testing.T) {
 	}
 }
 
-// The two faces the desktop loads. Both are committed fixtures; a missing one
+// The faces the desktop loads. All are committed fixtures; a missing one
 // fails the test rather than skipping it.
 const (
 	interFixture       = "../../../image/fonts/Inter-Regular.ttf"
 	interBoldFixture   = "../../../image/fonts/Inter-Bold.ttf"
 	interItalicFixture = "../../../image/fonts/Inter-Italic.ttf"
+	interBIFixture     = "../../../image/fonts/Inter-BoldItalic.ttf"
 	firaFixture        = "../../../image/fonts/FiraCode-Regular.ttf"
 )
 
@@ -184,11 +178,15 @@ func loadFonts(t *testing.T) Fonts {
 	if err != nil {
 		t.Fatalf("Inter Italic fixture is required by these tests: %v", err)
 	}
+	boldItalic, err := os.ReadFile(interBIFixture)
+	if err != nil {
+		t.Fatalf("Inter Bold Italic fixture is required by these tests: %v", err)
+	}
 	mono, err := os.ReadFile(firaFixture)
 	if err != nil {
 		t.Fatalf("Fira Code fixture is required by these tests: %v", err)
 	}
-	f := LoadFonts(FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic})
+	f := LoadFonts(FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic, BoldItalic: boldItalic})
 	if f.UI == nil {
 		t.Fatal("LoadFonts dropped the Inter face")
 	}
@@ -200,6 +198,9 @@ func loadFonts(t *testing.T) Fonts {
 	}
 	if f.Italic == nil {
 		t.Fatal("LoadFonts dropped the Inter Italic face")
+	}
+	if f.BoldItalic == nil {
+		t.Fatal("LoadFonts dropped the Inter Bold Italic face")
 	}
 	return f
 }
@@ -787,6 +788,7 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 		"INTER.TTF":    interFixture,
 		"INTERB.TTF":   interBoldFixture,
 		"INTERI.TTF":   interItalicFixture,
+		"INTERBI.TTF":  interBIFixture,
 		"FIRACODE.TTF": firaFixture,
 		"CHROME.TTF":   chromeFixture,
 	}
@@ -794,6 +796,7 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 		"INTER.TTF | role=ui | order=1\n" +
 			"INTERB.TTF | role=ui | order=2 | weight=700\n" +
 			"INTERI.TTF | role=ui | order=3 | style=italic\n" +
+			"INTERBI.TTF | role=ui | order=4 | weight=700 | style=italic\n" +
 			"FIRACODE.TTF | role=mono | order=1\n" +
 			"CHROME.TTF | role=symbol | order=1\n"))
 	if err != nil {
@@ -809,8 +812,8 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 		return ttf.Parse(data)
 	})
 	f := RegistryFonts(reg)
-	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil {
-		t.Fatalf("the manifest engine must resolve all four primaries: %+v", f)
+	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil || f.BoldItalic == nil {
+		t.Fatalf("the manifest engine must resolve all five primaries: %+v", f)
 	}
 	return f, &reads
 }
@@ -821,7 +824,7 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 // is still a ui miss.
 func symbolOnlyRune(t *testing.T, f Fonts) rune {
 	t.Helper()
-	excl := []*ttf.Face{f.UI, f.Bold, f.Italic}
+	excl := []*ttf.Face{f.UI, f.Bold, f.Italic, f.BoldItalic}
 	for cp := rune(0x20); cp <= 0x2FFFF; cp++ {
 		if glyphOf(f.Reg, cp) == 0 {
 			continue

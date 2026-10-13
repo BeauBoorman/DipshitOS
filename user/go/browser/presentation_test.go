@@ -57,7 +57,9 @@ func TestVirenderMaskBlendsInsteadOfThresholding(t *testing.T) {
 	pix := []uint32{0, 0, 0}
 	v := virender{pix: pix, w: 3, h: 1}
 	v.BlitMask(0, 0, &ttf.Mask{Width: 3, Height: 1, Alpha: []byte{0, 127, 255}}, 0xffffff)
-	if pix[0]&0xffffff != 0 || pix[1]&0xffffff != 0x7f7f7f || pix[2]&0xffffff != 0xffffff {
+	// a=127 is half coverage: in linear light that is ~0xBC, far above the
+	// 0x7F an sRGB-space lerp produced — the M99o difference, pinned.
+	if pix[0]&0xffffff != 0 || pix[1]&0xffffff != 0xbbbbbb || pix[2]&0xffffff != 0xffffff {
 		t.Fatalf("coverage=%x", pix)
 	}
 }

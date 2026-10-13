@@ -293,16 +293,19 @@ func (r *Registry) noteNotdef() {
 	}
 }
 
-// attrMatch reports whether spec is the face q asks for: Bold wants
-// weight >= 600, Italic wants style=italic, and a plain query wants both
-// absent. The exact rule RegistryFonts uses, so a manifested-only-in-name
-// bold face cannot silently take regular's slot — or vice versa.
+// attrMatch reports whether spec is the face q asks for. Bold wants
+// weight >= 600, Italic wants style=italic, Bold+Italic wants both on one
+// face, and a plain query wants both absent. The exact rule RegistryFonts
+// uses, so a manifested-only-in-name bold face cannot silently take
+// regular's slot — or vice versa.
 func attrMatch(s FaceSpec, q Query) bool {
 	switch {
+	case q.Bold && q.Italic:
+		return s.Weight >= 600 && s.Italic
 	case q.Bold:
 		return s.Weight >= 600 && !s.Italic
 	case q.Italic:
-		return s.Italic
+		return s.Italic && s.Weight < 600
 	default:
 		return s.Weight < 600 && !s.Italic
 	}
@@ -351,7 +354,8 @@ type Chain struct {
 }
 
 // Chain resolves q to its cascade. The primary is the strictly matching face
-// when one exists, then the role's normal face, then the role's first face —
+// when one exists; a Bold+Italic query next tries {Bold} then {Italic}, then
+// every query falls to the role's normal face, then the role's first face —
 // the same degraded selection the callers' own fallbacks encode. A role the
 // manifest does not list at all — or whose faces all fail to load — yields
 // nil, and the caller falls back to its own no-face path (the renderer's
@@ -367,10 +371,22 @@ func (r *Registry) Chain(q Query) *Chain {
 	if len(role) == 0 {
 		return nil
 	}
+	// A Bold+Italic request degrades through Bold, then Italic, before the
+	// role's normal face — a manifest without a BI row paints a styled face,
+	// never Regular, while a manifest without any styled faces still answers.
+	wants := []Query{q}
+	if q.Bold && q.Italic {
+		wants = append(wants, Query{Role: q.Role, Bold: true}, Query{Role: q.Role, Italic: true})
+	}
 	primary := -1
-	for _, i := range role {
-		if attrMatch(r.specs[i], q) && r.face(i) != nil {
-			primary = i
+	for _, want := range wants {
+		for _, i := range role {
+			if attrMatch(r.specs[i], want) && r.face(i) != nil {
+				primary = i
+				break
+			}
+		}
+		if primary >= 0 {
 			break
 		}
 	}

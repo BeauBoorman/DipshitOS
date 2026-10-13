@@ -170,6 +170,13 @@ func blitMask(c widgets.Canvas, mask *ttf.Mask, clip widgets.Rect, x, y int, rgb
 	if x0 >= x1 || y0 >= y1 {
 		return
 	}
+	// A real buffer paints the mask through the shared linear-light helper
+	// (M99o, #2192) with no intermediate surface. Every other Canvas keeps
+	// the tinted-mask path — each degrades coverage its own way.
+	if bc, ok := c.(*BufferCanvas); ok {
+		blitCoverage(bc, mask, x0, y0, x1, y1, x, y, rgb)
+		return
+	}
 	w, h := x1-x0, y1-y0
 	pix := make([]uint32, w*h)
 	for row := 0; row < h; row++ {
@@ -178,4 +185,32 @@ func blitMask(c widgets.Canvas, mask *ttf.Mask, clip widgets.Rect, x, y int, rgb
 		}
 	}
 	c.BlitTinted(pix, w, h, x0, y0, rgb)
+}
+
+// blitCoverage paints a glyph mask into a BufferCanvas through
+// ttf.CoverageBlend — the one shared linear-light helper. The tint's own
+// alpha folds into the coverage, so a translucent tint blends the same
+// coverage a BlitTinted round would; a translucent destination pixel keeps
+// the pinned straight-alpha compositor, because linear light is only
+// defined over an opaque surface.
+func blitCoverage(c *BufferCanvas, mask *ttf.Mask, x0, y0, x1, y1, x, y int, rgb uint32) {
+	if !valid(c) || rgb>>24 == 0 {
+		return
+	}
+	for dy := y0; dy < y1; dy++ {
+		for dx := x0; dx < x1; dx++ {
+			a := int(mask.Alpha[(dy-y)*mask.Width+dx-x])
+			if a == 0 {
+				continue
+			}
+			i := dy*c.W + dx
+			d := c.Pix[i]
+			if d>>24 != 255 {
+				tint := rgb&0xffffff | uint32((int(rgb>>24)*a+127)/255)<<24
+				c.Pix[i] = blend(d, tint, samples)
+				continue
+			}
+			c.Pix[i] = ttf.CoverageBlend(d, rgb, uint8((a*int(rgb>>24)+127)/255))
+		}
+	}
 }

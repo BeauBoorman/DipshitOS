@@ -57,14 +57,18 @@ const (
 // Fonts is the TrueType-backed engine. The zero value has no faces and behaves
 // exactly like Bitmap, so a renderer that failed to load anything still paints.
 //
-// Bold and Italic are optional. When they are present, Style.Bold / Style.Italic
-// select them; when they are absent, Bold falls back to a 1-px second strike
-// and Italic falls back to the UI face (ADR 0028 D4, amended M69d #1531).
+// Bold, Italic and BoldItalic are optional. When they are present,
+// Style.Bold / Style.Italic select them — Bold+Italic selects the dedicated
+// face when one is loaded, degrading through Bold then Italic, matching the
+// registry chain's own degrade. When they are absent, Bold falls back to a
+// 1-px second strike and Italic falls back to the UI face (ADR 0028 D4,
+// amended M69d #1531).
 type Fonts struct {
-	UI     *ttf.Face // Inter Regular (proportional)
-	Mono   *ttf.Face // Fira Code (monospace)
-	Bold   *ttf.Face // Inter Bold; optional
-	Italic *ttf.Face // Inter Italic; optional
+	UI         *ttf.Face // Inter Regular (proportional)
+	Mono       *ttf.Face // Fira Code (monospace)
+	Bold       *ttf.Face // Inter Bold; optional
+	Italic     *ttf.Face // Inter Italic; optional
+	BoldItalic *ttf.Face // Inter Bold Italic; optional
 
 	// Reg, when set, is the manifest's registry (M99l): each rune resolves
 	// through a chain — the style's primary, then the role's other faces in
@@ -78,7 +82,7 @@ type Fonts struct {
 // FontFiles is the byte source for LoadFonts. Any field may be empty or
 // unparseable; the corresponding face is then simply absent.
 type FontFiles struct {
-	UI, Mono, Bold, Italic []byte
+	UI, Mono, Bold, Italic, BoldItalic []byte
 }
 
 func parseOptionalFace(b []byte) *ttf.Face {
@@ -102,10 +106,11 @@ func NewFonts(ui, mono []byte) Fonts {
 // absent — the caller reports it, the renderer falls back, and nothing panics.
 func LoadFonts(files FontFiles) Fonts {
 	return Fonts{
-		UI:     parseOptionalFace(files.UI),
-		Mono:   parseOptionalFace(files.Mono),
-		Bold:   parseOptionalFace(files.Bold),
-		Italic: parseOptionalFace(files.Italic),
+		UI:         parseOptionalFace(files.UI),
+		Mono:       parseOptionalFace(files.Mono),
+		Bold:       parseOptionalFace(files.Bold),
+		Italic:     parseOptionalFace(files.Italic),
+		BoldItalic: parseOptionalFace(files.BoldItalic),
 	}
 }
 
@@ -119,17 +124,18 @@ func RegistryFonts(reg *ttf.Registry) Fonts {
 		return Fonts{}
 	}
 	return Fonts{
-		UI:     reg.Primary(ttf.Query{Role: "ui"}),
-		Mono:   reg.Primary(ttf.Query{Role: "mono"}),
-		Bold:   reg.Primary(ttf.Query{Role: "ui", Bold: true}),
-		Italic: reg.Primary(ttf.Query{Role: "ui", Italic: true}),
-		Reg:    reg,
+		UI:         reg.Primary(ttf.Query{Role: "ui"}),
+		Mono:       reg.Primary(ttf.Query{Role: "mono"}),
+		Bold:       reg.Primary(ttf.Query{Role: "ui", Bold: true}),
+		Italic:     reg.Primary(ttf.Query{Role: "ui", Italic: true}),
+		BoldItalic: reg.Primary(ttf.Query{Role: "ui", Bold: true, Italic: true}),
+		Reg:        reg,
 	}
 }
 
 // Loaded reports whether any TrueType face is available.
 func (f Fonts) Loaded() bool {
-	return f.UI != nil || f.Mono != nil || f.Bold != nil || f.Italic != nil
+	return f.UI != nil || f.Mono != nil || f.Bold != nil || f.Italic != nil || f.BoldItalic != nil
 }
 
 func glyphCover(face *ttf.Face, r rune, px int) int {
@@ -175,12 +181,26 @@ func (f Fonts) Name() string {
 }
 
 // face is the face a style renders with: the monospace face for a mono style
-// that has one, otherwise Bold/Italic when requested and loaded, otherwise the
-// UI face. nil means "no TrueType face for this style" and the caller falls
-// back to the bitmap. There is no Bold-Italic face; Bold wins if both are set.
+// that has one, otherwise BoldItalic/Bold/Italic when requested and loaded,
+// otherwise the UI face. nil means "no TrueType face for this style" and the
+// caller falls back to the bitmap. Bold+Italic prefers the dedicated face and
+// degrades through Bold then Italic — the registry chain's own order, so the
+// two selection paths can never disagree.
 func (f Fonts) face(st Style) *ttf.Face {
 	if st.Mono && f.Mono != nil {
 		return f.Mono
+	}
+	if st.Bold && st.Italic {
+		if f.BoldItalic != nil {
+			return f.BoldItalic
+		}
+		if f.Bold != nil {
+			return f.Bold
+		}
+		if f.Italic != nil {
+			return f.Italic
+		}
+		return f.UI
 	}
 	if st.Bold && f.Bold != nil {
 		return f.Bold
@@ -191,12 +211,57 @@ func (f Fonts) face(st Style) *ttf.Face {
 	return f.UI
 }
 
+// noRealBold reports whether a bold-styled run has no real bold-weight face
+// to paint it — the synthetic-strike condition. A BoldItalic face IS a real
+// bold for a {bold,italic} style, so its presence retires the strike too.
+func (f Fonts) noRealBold(st Style) bool {
+	if !st.Bold {
+		return false
+	}
+	if f.Bold != nil {
+		return false
+	}
+	return !(st.Italic && f.BoldItalic != nil)
+}
+
+// faceName is the marker name for one of the engine's resolved faces — the
+// "what did a style actually resolve to" fact the serial line reports.
+func (f Fonts) faceName(face *ttf.Face) string {
+	switch {
+	case face == nil:
+		return "none"
+	case face == f.Mono:
+		return "mono"
+	case face == f.BoldItalic:
+		return "bolditalic"
+	case face == f.Bold:
+		return "bold"
+	case face == f.Italic:
+		return "italic"
+	case face == f.UI:
+		return "ui"
+	}
+	return "cascade" // a fallback face the style does not name
+}
+
+// ResolvedName reports which face a style resolves to — the marker's honest
+// answer for `font-weight:700;font-style:italic`, which is "bolditalic" when
+// the dedicated face is loaded and the degrade name (bold, italic, ui) when
+// it is not. A registry engine answers through the chain's primary so the
+// name is the face the paint walk will actually open.
+func (f Fonts) ResolvedName(st Style) string {
+	if ch := f.chain(st); ch != nil {
+		return f.faceName(ch.Primary())
+	}
+	return f.faceName(f.face(st))
+}
+
 // chain resolves the cascade for a style when the engine was built from a
 // manifest. The query mirrors face()'s precedence — mono only when a mono
-// primary loaded, bold ahead of italic — so the chain picks the same primary
-// the face table would, then falls back per rune. nil means no registry, a
-// role the manifest does not list, or a primary that would not load: the
-// caller then uses today's single-face/bitmap path.
+// primary loaded, both attributes when both are styled — so the chain picks
+// the same primary the face table would, then falls back per rune. nil means
+// no registry, a role the manifest does not list, or a primary that would not
+// load: the caller then uses today's single-face/bitmap path.
 func (f Fonts) chain(st Style) *ttf.Chain {
 	if f.Reg == nil {
 		return nil
@@ -205,9 +270,10 @@ func (f Fonts) chain(st Style) *ttf.Chain {
 	if st.Mono && f.Mono != nil {
 		q.Role = "mono"
 	}
-	if st.Bold && f.Bold != nil {
+	if st.Bold {
 		q.Bold = true
-	} else if st.Italic && f.Italic != nil {
+	}
+	if st.Italic {
 		q.Italic = true
 	}
 	return f.Reg.Chain(q)
@@ -298,7 +364,7 @@ func (f Fonts) Paint(s Surface, x, top int, text string, st Style, rgb uint32, c
 		}
 		if !m.Empty() {
 			blitMask(s, c, pen+m.BearingX, baseline-m.BearingY, m, rgb)
-			if st.Bold && f.Bold == nil {
+			if f.noRealBold(st) {
 				// No bold face loaded: keep the 1-px second strike. Dead
 				// when INTERB.TTF parsed (M69d #1531).
 				blitMask(s, c, pen+m.BearingX+1, baseline-m.BearingY, m, rgb)
@@ -341,7 +407,7 @@ func (f Fonts) paintChain(s Surface, x, top int, text string, st Style, rgb uint
 			}
 			if !m.Empty() {
 				blitMask(s, c, pen+m.BearingX, baseline-m.BearingY, m, rgb)
-				if st.Bold && f.Bold == nil {
+				if f.noRealBold(st) {
 					blitMask(s, c, pen+m.BearingX+1, baseline-m.BearingY, m, rgb)
 				}
 			}

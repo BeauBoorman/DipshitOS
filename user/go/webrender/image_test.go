@@ -146,17 +146,9 @@ func (f *referenceFrame) Fill(x, y, w, h int, rgb uint32) {
 }
 
 func (f *referenceFrame) BlitMask(x, y int, m *ttf.Mask, rgb uint32) {
-	for yy := max(0, y); yy < min(f.h, y+m.Height); yy++ {
-		for xx := max(0, x); xx < min(f.w, x+m.Width); xx++ {
-			a := uint32(m.Alpha[(yy-y)*m.Width+xx-x])
-			p := f.pix[yy*f.w+xx]
-			var dst uint32
-			for _, shift := range []uint{0, 8, 16} {
-				dst |= (((rgb>>shift&255)*a + (p>>shift&255)*(255-a) + 127) / 255) << shift
-			}
-			f.pix[yy*f.w+xx] = dst
-		}
-	}
+	// The shared linear-light helper (M99o): the reference renderer blends
+	// exactly what the guest blends.
+	ttf.Blend(f.pix, f.w, f.w, f.h, x, y, m, rgb)
 }
 
 func (f *referenceFrame) rgbHash() string {
@@ -199,8 +191,8 @@ func sampleFrame(src *referenceFrame, w, h int) *referenceFrame {
 
 func referenceFonts(t *testing.T) (wr.Fonts, map[string]string) {
 	t.Helper()
-	names := []string{"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "FiraCode-Regular.ttf"}
-	data, hashes := make([][]byte, 4), make(map[string]string)
+	names := []string{"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf", "FiraCode-Regular.ttf"}
+	data, hashes := make([][]byte, 5), make(map[string]string)
 	for i, name := range names {
 		b, err := os.ReadFile(filepath.Join("../../../image/fonts", name))
 		if err != nil {
@@ -210,8 +202,8 @@ func referenceFonts(t *testing.T) (wr.Fonts, map[string]string) {
 		sum := sha256.Sum256(b)
 		hashes[name] = hex.EncodeToString(sum[:])
 	}
-	fonts := wr.LoadFonts(wr.FontFiles{UI: data[0], Bold: data[1], Italic: data[2], Mono: data[3]})
-	if fonts.UI == nil || fonts.Bold == nil || fonts.Italic == nil || fonts.Mono == nil {
+	fonts := wr.LoadFonts(wr.FontFiles{UI: data[0], Bold: data[1], Italic: data[2], BoldItalic: data[3], Mono: data[4]})
+	if fonts.UI == nil || fonts.Bold == nil || fonts.Italic == nil || fonts.BoldItalic == nil || fonts.Mono == nil {
 		t.Fatal("reference font did not load")
 	}
 	return fonts, hashes
@@ -480,7 +472,11 @@ func checkReferencePNG(t *testing.T, name string, actual *referenceFrame) {
 	for y := 0; y < actual.h; y++ {
 		for x := 0; x < actual.w; x++ {
 			i := y*actual.w + x
-			if x >= want.w || y >= want.h || actual.pix[i] != want.pix[y*want.w+x] {
+			// Mask the alpha byte: the shared blend writes opaque 0xFF
+			// words while PNG-decoded goldens decode as 0x00RRGGBB — the
+			// comparison (like rgbHash) is on RGB alone.
+			if x >= want.w || y >= want.h ||
+				actual.pix[i]&0xffffff != want.pix[y*want.w+x]&0xffffff {
 				diff.pix[i] = 0xff0000
 				mismatched++
 			}
