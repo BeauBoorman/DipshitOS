@@ -38,8 +38,12 @@ const (
 	// panel writes it too, through the same crash-safe publish.
 	Path = "/host/SETTINGS.TXT"
 	// Caps mirror the kernel's table (max_entries / max_key_len / max_val_len)
-	// and its bounded load buffer.
-	MaxKeys = 18
+	// and its bounded load buffer. M99d (#2182) raised the cap 18 -> 20: the
+	// Go-side union (nine seeded + palette 3 + font_size + keyboard_layout +
+	// idle_minutes + notify_dnd + timezone + notify_sound + audio_volume) is
+	// 19 rows, and the table must hold a file that carries all of them with
+	// one slot to spare rather than silently dropping the last row at load.
+	MaxKeys = 20
 	MaxKey  = 32
 	MaxVal  = 64
 	MaxBody = 2048
@@ -194,6 +198,69 @@ func NotifyDND(value string) (on, ok bool) {
 // IsNotifyDNDKey reports whether key is the do-not-disturb row.
 func IsNotifyDNDKey(key string) bool { return key == NotifyDNDKey }
 
+// NotifySoundKeys is the M99d (#2182) notification-chime row: like font_size
+// it is accepted-but-unseeded AND not a default panel row — the kernel's
+// table stays unchanged, an absent row means the chime is on (the default),
+// and the row materializes in GOSET once it is set, after which it cycles
+// on|off like every vocabulary row. The seat alone interprets it: `off`
+// keeps an accepted toast silent.
+var NotifySoundKeys = []Key{
+	{Name: "notify_sound", Default: "on", Vocab: []string{"on", "off"}},
+}
+
+// NotifySoundKey is the notification-chime key's name.
+const NotifySoundKey = "notify_sound"
+
+// NotifySound parses a stored notify_sound value, the same on|off grammar
+// as notify_dnd. ok is false for anything else, and the caller treats that
+// as the default (on) so a mistyped value can never silence the user's
+// notification sound by accident.
+func NotifySound(value string) (on, ok bool) {
+	switch value {
+	case "on":
+		return true, true
+	case "off":
+		return false, true
+	}
+	return false, false
+}
+
+// IsNotifySoundKey reports whether key is the notification-chime row.
+func IsNotifySoundKey(key string) bool { return key == NotifySoundKey }
+
+// VolumeKeys is the M99d (#2182) audio-volume row: the stream gain behind
+// slot 44 (0..100, kernel state that resets to 100 at boot). Accepted-
+// but-unseeded and not a default panel row, like font_size: the row is
+// typed input (`audio_volume=40`), persists once set, and cycles its
+// vocabulary afterwards. The kernel never interprets the row — slot 44 is
+// applied by the row's consumers (GOSET's edit, the seat's boot read).
+var VolumeKeys = []Key{
+	{Name: "audio_volume", Default: "100", Vocab: []string{"0", "10", "20", "30", "40", "50", "60", "70", "80", "90", "100"}},
+}
+
+// AudioVolumeKey is the stream-gain key's name.
+const AudioVolumeKey = "audio_volume"
+
+// AudioVolume parses a stored volume value: whole numbers 0..100, the same
+// bound slot 44 enforces. ok is false for anything else — out-of-range is
+// the kernel's refusal, never a silent clamp.
+func AudioVolume(value string) (int, bool) {
+	if value == "" || len(value) > 3 {
+		return 0, false
+	}
+	v := 0
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+		v = v*10 + int(value[i]-'0')
+	}
+	return v, v <= 100
+}
+
+// IsVolumeKey reports whether key is the audio-volume row.
+func IsVolumeKey(key string) bool { return key == AudioVolumeKey }
+
 // TimezoneKeys is the M83c (#1776) timezone row: accepted-but-unseeded like
 // the idle row — the kernel's eight-row table stays exactly as it was, an
 // absent row means UTC, and GOSET still surfaces the effective default so
@@ -276,12 +343,14 @@ func IsPaletteKey(key string) bool {
 
 // Editable is the panel's write gate: a kernel-table key, one of the
 // custom-palette keys, font_size (M80i), keyboard_layout (M83d2),
-// idle_minutes (M83f), notify_dnd (M82d2), or timezone (M83c).
+// idle_minutes (M83f), notify_dnd (M82d2), notify_sound or audio_volume
+// (M99d), or timezone (M83c).
 // Anything else is named and dropped, never written.
 func Editable(key string) bool {
 	_, known := Known(key)
 	return known || IsPaletteKey(key) || IsFontKey(key) || IsKeyboardLayoutKey(key) ||
-		IsIdleMinutesKey(key) || IsNotifyDNDKey(key) || IsTimezoneKey(key)
+		IsIdleMinutesKey(key) || IsNotifyDNDKey(key) || IsNotifySoundKey(key) ||
+		IsVolumeKey(key) || IsTimezoneKey(key)
 }
 
 // ValidColour is the palette value grammar, mirrored from the kernel's
@@ -351,7 +420,7 @@ func Default(key string) (string, bool) {
 			return k.Default, true
 		}
 	}
-	for _, group := range [][]Key{NotifyKeys, TimezoneKeys} {
+	for _, group := range [][]Key{NotifyKeys, NotifySoundKeys, VolumeKeys, TimezoneKeys} {
 		for _, k := range group {
 			if k.Name == key {
 				return k.Default, true
@@ -375,6 +444,12 @@ func Vocab(key string) ([]string, bool) {
 	}
 	if !ok {
 		k, ok = findKey(NotifyKeys, key)
+	}
+	if !ok {
+		k, ok = findKey(NotifySoundKeys, key)
+	}
+	if !ok {
+		k, ok = findKey(VolumeKeys, key)
 	}
 	if !ok {
 		k, ok = findKey(TimezoneKeys, key)
@@ -492,15 +567,39 @@ func Get(ss []Setting, key string) (string, bool) {
 // Set updates the last row for key in place, or appends one when the file
 // carries no such row. The kernel's own set is the same shape: a later row
 // wins, and a new key lands at the end of the table.
+//
+// M99d (#2182): the kernel's set also runs per-key apply hooks (theme,
+// font_size, focus_follows_mouse — kernel/src/settings.zig). The Go mirror
+// carries exactly one: writing audio_volume applies it to slot 44 at the
+// moment the row is written, so a GOSET `audio_volume=40` moves the stream
+// gain before the save even publishes. The kernel validates the same
+// 0..100 bound; an unparsable value writes the row but applies nothing
+// (the row's consumers refuse it the same way at read time).
 func Set(ss []Setting, key, val string) []Setting {
+	found := false
 	for i := len(ss) - 1; i >= 0; i-- {
 		if ss[i].Key == key {
 			ss[i].Val = val
-			return ss
+			found = true
+			break
 		}
 	}
-	return append(ss, Setting{Key: key, Val: val})
+	if !found {
+		ss = append(ss, Setting{Key: key, Val: val})
+	}
+	if key == AudioVolumeKey {
+		if v, ok := AudioVolume(val); ok {
+			_, _ = AudioVolumeApply(v)
+		}
+	}
+	return ss
 }
+
+// AudioVolumeApply is the slot-44 seam behind Set's audio_volume hook —
+// exported and a var so a host test outside this package can pin the call
+// the way the seat pins its own seams; the real syscall degrades to ENOSYS
+// off the guest, and a refusal is honest (the caller's row still lands).
+var AudioVolumeApply = vi.AudioVolume
 
 // Effective returns the value the seat will honor for key: the file's value
 // when the file carries one, else the kernel's compiled default. found=false

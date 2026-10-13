@@ -37,8 +37,9 @@
 // accepted notice. Toasts expire; center entries remain until dismissed or
 // cleared. M82d2 (#1785) adds the policy half in notify_policy.go: while
 // do-not-disturb is on a notice goes to the center only, and the center's
-// history survives a seat restart. Sounds and per-app permission gating are
-// out of scope.
+// history survives a seat restart. M99d (#2182) makes an accepted toast
+// audible too — the chime and its policy live in notify_policy.go. Per-app
+// permission gating is out of scope.
 package main
 
 import (
@@ -171,6 +172,11 @@ func notifyPush(tabID uint32, text string, ticks uint64) (string, bool, bool) {
 		expires:  ticks + NotifyTicks,
 		centerID: centerID,
 	})
+	// M99d (#2182): an accepted toast is audible too — one bounded stream
+	// play (open, prefill, start, end; the drain is confirmed on the next
+	// composite tick). DND returned above, so a held notice never chimes;
+	// notify_sound=off and no-device are no-ops inside the call.
+	notifyPlayChime()
 	return text, true, dropped
 }
 
@@ -443,12 +449,15 @@ func notifyDismissByIndex(i int) (uint32, bool) {
 
 // notifyTick is the per-composite-tick half: expire first (so a toast that
 // has run out is not painted for one more frame), then print the dismiss
-// markers for whatever left. Expiry is the ONLY thing this half can drop —
-// a click goes through notifyClicked from the pointer path.
+// markers for whatever left, then retire the chime — the play call did its
+// bounded part in notifyPush; the drain's confirmation belongs here so the
+// seat never sleeps on audio (M99d). Expiry is the ONLY thing this half
+// can drop — a click goes through notifyClicked from the pointer path.
 func notifyTick(ticks uint64) {
 	for _, id := range notifyExpire(ticks) {
 		vi.ConsoleLine(MarkerNotifyDismiss + vi.Itoa64(int64(id)))
 	}
+	notifySoundTick()
 }
 
 // notifyClicked is the click-to-focus action: the toast under the pointer
