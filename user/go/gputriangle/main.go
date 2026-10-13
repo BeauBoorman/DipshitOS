@@ -76,11 +76,13 @@ const (
 
 // The deterministic scene: a red right-ish triangle, asymmetric so a flipped
 // or channel-swapped image is visible to the comparator. i16 normalized X/Y
-// with Y up, u16 normalized Z, u16 RGB565 — the wire vertex, nothing else.
+// in the VIR1 NDC convention (the contract pins +Y to INCREASING rows —
+// NDC (-1,-1) is the top-left readback pixel), u16 normalized Z, u16
+// RGB565 — the wire vertex, nothing else.
 var sceneVerts = [3]gpu3d.Vertex{
-	{X: -24576, Y: 21626, Z: 0, RGB: 0xf800},
-	{X: 24576, Y: 5243, Z: 0, RGB: 0xf800},
-	{X: -12288, Y: -21626, Z: 0, RGB: 0xf800},
+	{X: -24576, Y: -21626, Z: 0, RGB: 0xf800},
+	{X: 24576, Y: -5243, Z: 0, RGB: 0xf800},
+	{X: -12288, Y: 21626, Z: 0, RGB: 0xf800},
 }
 
 const (
@@ -97,6 +99,12 @@ type host interface {
 	// BindSurface creates+binds the window's M33 shared back-buffer and
 	// returns the app's own writable view (stride = window width, BGRX).
 	BindSurface(win int, w, h uint32) ([]byte, error)
+	// ShareSurface hands the bound surface to the Go seat (kind 18): the
+	// seat attaches its RO mirror and composites the window — under a
+	// registered seat the kernel skips migrated windows entirely (#2236
+	// defect #13), so without this handoff the pixels never reach the
+	// scanout.
+	ShareSurface(win int, surf []byte, stride, rows int) bool
 	PresentWindow(win int) error
 	PollEvent() (vi.Event, int64, bool)
 	CloseWindow(win int)
@@ -416,6 +424,11 @@ func (a *app) openWindow(w, h uint32) error {
 		return err
 	}
 	a.surf, a.surfW = surf, w
+	if a.h.ShareSurface(win, surf, int(w), int(h)) {
+		a.h.ConsoleLine("gputri: surface shared")
+	} else {
+		a.h.ConsoleLine("gputri: surface share refused")
+	}
 	if a.h.DeclareTab(win, appTitle) {
 		a.h.ConsoleLine("gputri: declare accepted")
 	}
@@ -487,14 +500,22 @@ func (a *app) jTriangle() error {
 
 // jMixed renders the same extent into a larger window and 2D-fills the
 // margins — the mixed-layout leg: GPU pixels at the client origin, ordinary
-// margin pixels around them.
+// margin pixels around them. The margin fill must land AFTER the publish:
+// the broker's publish_op clears every destination pixel outside the render
+// extent, so a pre-publish fill is overwritten and the receipt would show
+// clear-colour margins (#2236 leg 02). The export is re-taken after the
+// fill so the receipt records the final surface.
 func (a *app) jMixed() error {
 	if err := a.openWindow(mixedWinW, mixedH); err != nil {
 		return err
 	}
 	defer a.h.CloseWindow(a.win)
-	a.fillMargin(extentW, extentH)
 	if err := a.frame(extentW, extentH, mixedExW, mixedExH); err != nil {
+		return err
+	}
+	a.fillMargin(extentW, extentH)
+	if err := a.exportSurface(a.exportName(), mixedExW, mixedExH); err != nil {
+		a.rec.row("error", is(a.wgen), is(a.rgen), "margin-export", "write")
 		return err
 	}
 	if err := a.writeReceipts(); err != nil {
@@ -707,6 +728,10 @@ func (guestHost) BindSurface(win int, w, h uint32) ([]byte, error) {
 		return nil, errors.New("short surface")
 	}
 	return surf[:n], nil
+}
+
+func (guestHost) ShareSurface(win int, surf []byte, stride, rows int) bool {
+	return vi.WmSurfaceShare(uint32(win), surf, stride, rows, appTitle, appName)
 }
 
 func (guestHost) PresentWindow(win int) error {

@@ -241,7 +241,16 @@ func gpu3dRequestGo(id uint8, op uint8, payload [WmRpcTitleMax]byte, peers WmSea
 		if tok != 0 {
 			req.Pad = WmRpcPadBound
 			SetWmAuth(&req, tok)
-			accept = func(m WmRpc) bool { return m.Pad == WmRpcPadBound && WmAuth(m) == tok }
+			// A bound request accepts the token-quoting ack — and a
+			// re-challenge, which is how the seat answers a token it no
+			// longer holds (a reused window's binding died with the old
+			// window). The challenge tail below re-proves and rebinds in
+			// the SAME round, exactly as wqPage does; anything else is
+			// the forgery shape and is dropped by the wait.
+			accept = func(m WmRpc) bool {
+				return m.Pad == WmRpcPadChallenge ||
+					(m.Pad == WmRpcPadBound && WmAuth(m) == tok)
+			}
 		} else {
 			accept = func(m WmRpc) bool { return m.Pad == WmRpcPadChallenge }
 		}

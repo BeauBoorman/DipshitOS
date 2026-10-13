@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -107,6 +108,8 @@ type fakeHost struct {
 	lines    []string
 	ipc      [][]byte
 	closed   []int
+	shared   []int
+	shareOK  bool
 	presents int
 	events   []vi.Event
 	openErr  error
@@ -123,6 +126,7 @@ func newFakeHost() (*fakeHost, *fakeTransport) {
 		dirs:     map[string]bool{},
 		declared: map[int]bool{},
 		peersOK:  true,
+		shareOK:  true,
 	}, tr
 }
 
@@ -153,6 +157,11 @@ func (f *fakeHost) BindSurface(win int, w, h uint32) ([]byte, error) {
 	return f.surf, nil
 }
 
+func (f *fakeHost) ShareSurface(win int, surf []byte, stride, rows int) bool {
+	f.order = append(f.order, "share")
+	f.shared = append(f.shared, win)
+	return f.shareOK
+}
 func (f *fakeHost) PresentWindow(win int) error { f.presents++; return nil }
 func (f *fakeHost) PollEvent() (vi.Event, int64, bool) {
 	if len(f.events) == 0 {
@@ -538,7 +547,7 @@ func TestBindPrecedesDeclare(t *testing.T) {
 	if err := runJ(t, h, "triangle"); err != nil {
 		t.Fatalf("triangle: %v", err)
 	}
-	if len(h.order) < 2 || h.order[0] != "bind" || h.order[1] != "declare" {
+	if len(h.order) < 3 || h.order[0] != "bind" || h.order[1] != "share" || h.order[2] != "declare" {
 		t.Fatalf("window setup order: %v", h.order)
 	}
 }
@@ -557,5 +566,34 @@ func TestExportCreatesReceiptDirFirst(t *testing.T) {
 	}
 	if _, ok := h.files[receiptDir+"/EXPO_1_1.BGRA"]; !ok {
 		t.Fatal("first export missing")
+	}
+}
+
+// Issue #2236 defect #11: the independent pixel oracle
+// (test/fixtures/gpu3d/pixels.json) rasterizes its expectation in the
+// VIR1 convention — NDC y grows toward LARGER pixel rows, so (-1,-1) is
+// the top-left readback pixel. The fixture triangle sits at pixels
+// (8,8) (56,20) (20,40) in the 64×48 frame; mapping the scene's wire
+// verts through that convention must land on those pixels. The GL-style
+// y-up encoding this replaces produced the exact vertical mirror — a
+// red pixel where the oracle wants clear — so this pin fails on the
+// sign bug even before the live comparator runs.
+func TestSceneVertsMapToFixturePixels(t *testing.T) {
+	const (
+		ndcHalf = 32768 // i16 wire magnitude of NDC ±1
+		w       = 64
+		h       = 48
+	)
+	want := [3][2]int{{8, 8}, {56, 20}, {20, 40}}
+	for i, v := range sceneVerts {
+		px := int(math.Round(float64(int64(v.X)+ndcHalf) / (2 * ndcHalf) * w))
+		py := int(math.Round(float64(int64(v.Y)+ndcHalf) / (2 * ndcHalf) * h))
+		if px != want[i][0] || py != want[i][1] {
+			t.Fatalf("sceneVerts[%d] NDC (%d,%d) -> pixel (%d,%d), want %v",
+				i, v.X, v.Y, px, py, want[i])
+		}
+		if v.RGB != 0xf800 {
+			t.Fatalf("sceneVerts[%d] rgb %#x want red 0xf800", i, v.RGB)
+		}
 	}
 }

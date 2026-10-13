@@ -306,6 +306,70 @@ func TestGpu3dExchangeForgedAckCannotSucceed(t *testing.T) {
 	}
 }
 
+// M102 defect #12 (#2236): the live closereuse leg showed the second
+// window-lifetime open timing out ~250s — the seat answered the
+// stale-token request with a challenge the wait was dropping, so the
+// queued bind surfaced only at teardown. A bound kind-17 request that
+// draws Pad=Challenge must re-prove and rebind inside the same call.
+func TestGpu3dExchangeBoundRechallengeRebinds(t *testing.T) {
+	f := startWmMailFake(t)
+	f.wmName = "GOTABWM.ELF"
+	const stale = uint64(0x5a1e5a1e5a1e5a1e)
+	const challenge = uint64(0x00deadbeef00cafe)
+	const token = uint64(0x0123456789abcdef)
+	setWmToken(4, stale)
+	f.replyFn = func(req WmRpc) []byte {
+		rep := WmRpc{Kind: req.Kind | WmRpcReplyFlag, ID: req.ID, Seq: req.Seq, ReplyTo: req.ReplyTo}
+		switch WmAuth(req) {
+		case stale:
+			rep.Pad = WmRpcPadChallenge
+			SetWmAuth(&rep, challenge)
+		case challenge, token:
+			rep.Pad = WmRpcPadBound
+			SetWmAuth(&rep, token)
+			rep.Applied = 1
+		default:
+			return nil
+		}
+		return rep.Encode()
+	}
+	var titles []string
+	prevBind := bindSetTitle
+	bindSetTitle = func(id int, s string) int64 {
+		titles = append(titles, s)
+		return 0
+	}
+	t.Cleanup(func() { bindSetTitle = prevBind })
+
+	payload := payload24(64, 48)
+	sent, ack, tok, outcome := Gpu3dExchange(4, 1, payload, "NOTE.ELF")
+	if outcome != Gpu3dOutcomeOK {
+		t.Fatalf("re-challenged exchange outcome = %d want OK", outcome)
+	}
+	if len(f.sent) != 2 {
+		t.Fatalf("sent %d frames want stale+echo", len(f.sent))
+	}
+	if f.sent[0].Pad != WmRpcPadBound || WmAuth(f.sent[0]) != stale {
+		t.Fatalf("first frame pad=%d union=%#x want stale-bound", f.sent[0].Pad, WmAuth(f.sent[0]))
+	}
+	if f.sent[1].Pad != WmRpcPadBound || WmAuth(f.sent[1]) != challenge {
+		t.Fatalf("echo frame pad=%d union=%#x want challenge %#x",
+			f.sent[1].Pad, WmAuth(f.sent[1]), challenge)
+	}
+	if sent.Seq != f.sent[1].Seq || ack.Pad != WmRpcPadBound || tok != token {
+		t.Fatalf("returned (%+v, %+v, %#x) want echo + bound ack + new token", sent, ack, tok)
+	}
+	if wmToken(4) != token {
+		t.Fatalf("session token = %#x want rebound %#x", wmToken(4), token)
+	}
+	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge) || titles[1] != "" {
+		t.Fatalf("title sets = %v want [challenge, empty]", titles)
+	}
+	if f.sleepCalls != 0 {
+		t.Fatalf("rebind parked %d times — the challenge must answer inline", f.sleepCalls)
+	}
+}
+
 func TestGpu3dExchangeSilentSeatTimesOut(t *testing.T) {
 	f := startWmMailFake(t)
 	f.wmName = "GOTABWM.ELF"

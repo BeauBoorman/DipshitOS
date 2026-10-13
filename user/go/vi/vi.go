@@ -363,13 +363,20 @@ func TtyNetAuth(op uint64, buf []byte) int64 {
 	return syscall3(SlotTtyNetAuth, uintptr(op), p, uintptr(len(buf)))
 }
 
-// WinOpen opens a user window and returns (id, rawResult).
+// WinOpen opens a user window and returns (id, rawResult). The id can be
+// one the kernel just recycled: any WM_RPC session token the table still
+// holds for it belongs to the dead window (the seat drops its half of the
+// binding on the release mirror), so a fresh id always starts unbound.
 func WinOpen(x, y, w, h uint32) (int, int64) {
-	r := syscall4(SlotWinOpen, uintptr(x), uintptr(y), uintptr(w), uintptr(h))
+	r := svc4(SlotWinOpen, uintptr(x), uintptr(y), uintptr(w), uintptr(h))
 	if r < 0 {
 		return -1, r
 	}
-	return int(r), r
+	id := int(r)
+	if fitsWire8(uint32(id)) {
+		setWmToken(uint8(id), 0)
+	}
+	return id, r
 }
 
 // WinFill is a single (unbatched) fill — prefer Filler.
@@ -388,8 +395,17 @@ func WinResize(id int, w, h uint32) int64 {
 	return syscall3(SlotWinResize, uintptr(id), uintptr(w), uintptr(h))
 }
 
-// WinClose closes the caller's window.
-func WinClose(id int) int64 { return syscall1(SlotWinClose, uintptr(id)) }
+// WinClose closes the caller's window. A successful close releases the
+// window — its WM_RPC binding dies with it (the seat drops the token on
+// the release mirror), so the table forgets it here too rather than
+// letting a later reused id inherit a token the seat already forgot.
+func WinClose(id int) int64 {
+	r := svc1(SlotWinClose, uintptr(id))
+	if r == 0 && id >= 0 && fitsWire8(uint32(id)) {
+		setWmToken(uint8(id), 0)
+	}
+	return r
+}
 
 // WinSetVisible hides or shows the caller's window (sys_win_set_visible,
 // slot 20 — the slots_gen row). A hidden window is inert to the compositor:
