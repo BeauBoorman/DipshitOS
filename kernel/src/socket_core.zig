@@ -15,7 +15,14 @@
 //! stay charged until close/death. close is immediate local reclamation, not a
 //! promise that FIN/RST reached a peer; shutdown initiates bounded graceful FIN.
 //! The single independently addressed refusal slot drops/counts overflow.
-//! Unsupported option-bearing TCP and fragmented IPv4 are counted and dropped.
+//! TCP options are parsed and skipped — MSS is honored, malformed option
+//! lists are dropped in their own counter; window scaling, SACK blocks,
+//! timestamps, congestion control and keepalive are NOT implemented.
+//! Received data reassembles inside each connection's bounded window
+//! (1460 bytes, bitmap-marked); the advertised window is the real free
+//! space. Retransmission uses RFC 6298 adaptive RTO in nanoseconds
+//! (200 ms floor, 60 s ceiling, Karn's rule, backoff). Fragmented IPv4
+//! is still counted and dropped.
 const std = @import("std");
 pub const wire = @import("tcp.zig");
 
@@ -41,10 +48,29 @@ pub const conn_slot_base = listener_limit;
 pub const dns_slot: u64 = 15;
 /// A connection spawned by `open`, not by a listener's SYN.
 pub const no_parent: u8 = 0xff;
-pub const core_limit = 16 * 1024;
+/// The whole table's byte budget. M99f priced 16 KiB for 4 connections
+/// at ~3.1 KiB each; M99h (#2186) adds each connection's bounded
+/// reassembly window (1460 bytes + a 184-byte validity bitmap + spans),
+/// the RFC 6298 estimator triple and the peer MSS — ~4.8 KiB per
+/// connection — so the honest bound is 24 KiB.
+pub const core_limit = 24 * 1024;
 pub const deadline_ns: u64 = 30_000_000_000;
+/// The INITIAL retransmission timeout before any RTT sample exists
+/// (RFC 6298 §2.1 allows an initial RTO >= 1 s). Once a clean sample
+/// lands, `Connection.rto_ns_cur` tracks SRTT + 4 x RTTVAR instead.
 pub const rto_ns: u64 = 3_000_000_000;
+/// M99h (#2186, card h3): the RFC 6298 RTO bounds in nanoseconds —
+/// the suggested 1 s floor tightened to 200 ms per the card, the 60 s
+/// ceiling.
+pub const rto_floor_ns: u64 = 200_000_000;
+pub const rto_ceiling_ns: u64 = 60_000_000_000;
 pub const retry_limit: u8 = 10;
+/// M99h (#2186, card h2): the receive window every connection
+/// advertises — one `wire.payload_max` span. Held bytes (the in-order
+/// prefix plus the bitmap-marked out-of-order bytes) always fit inside
+/// it, so the advertised free space is exactly the honest bound.
+pub const recv_window: usize = wire.payload_max;
+const ooo_map_words = (recv_window + 63) / 64;
 pub const Endpoint = struct { ip: [4]u8, port: u16 };
 pub const Handle = struct { value: u64 };
 pub const Error = error{
@@ -103,14 +129,42 @@ pub const Connection = struct {
     phase_deadline: u64,
     read_deadline: u64 = 0,
     write_deadline: u64 = 0,
+    /// M99h (#2186): the peer's advertised MSS (0 = none — outbound
+    /// payloads keep the `payload_max` bound; otherwise `send` clamps).
+    peer_mss: u16 = 0,
     rx: [wire.payload_max]u8 = undefined,
     rx_len: usize = 0,
+    /// M99h (#2186, card h2): the bounded out-of-order window.
+    /// `ooo_buf[i]` holds sequence `ooo_base + i`; `ooo_map` marks which
+    /// bytes are valid. `ooo_base` always equals `rcv_nxt` while bytes
+    /// are held (rebased on every advance), so index 0 is never valid
+    /// outside a drain — a held byte is strictly ahead of the stream.
+    /// The window bound itself caps held bytes; there is no segment
+    /// limit beyond it.
+    ooo_buf: [recv_window]u8 = undefined,
+    ooo_map: [ooo_map_words]u64 = @splat(0),
+    ooo_base: u32 = 0,
+    ooo_bytes: u16 = 0,
+    /// A FIN received ahead of the stream — the sequence number it
+    /// consumes, applied when contiguous.
+    fin_ooo: u32 = 0,
+    fin_ooo_set: bool = false,
     tx: [wire.segment_max]u8 = undefined,
     tx_len: usize = 0,
     tx_due: bool = false,
     tx_started: bool = false,
     last_tx: u64 = 0,
     retries: u8 = 0,
+    /// M99h (#2186, card h3): the RFC 6298 RTT estimators in
+    /// nanoseconds. `rtt_valid` is false until the first clean sample —
+    /// an ACK covering a segment that was never retransmitted (Karn's
+    /// algorithm, §5.2). `rto_ns_cur` is the live timeout: the estimator
+    /// value after a sample, doubled per retransmission (§5.5 backoff),
+    /// clamped [rto_floor_ns, rto_ceiling_ns].
+    srtt_ns: u64 = 0,
+    rttvar_ns: u64 = 0,
+    rtt_valid: bool = false,
+    rto_ns_cur: u64 = rto_ns,
     control: [wire.tcp_hdr_len]u8 = undefined,
     control_pending: bool = false,
 };
@@ -130,6 +184,11 @@ pub const Counters = struct {
     tx_refused: u64 = 0,
     retransmitted: u64 = 0,
     timed_out: u64 = 0,
+    /// M99h (#2186): a segment dropped for a malformed option list —
+    /// distinct from `malformed` (header shape) and `duplicates`.
+    dropped_options: u64 = 0,
+    /// M99h (#2186): segments the reassembly window has held, ever.
+    ooo_held: u64 = 0,
 };
 
 pub const Core = struct {
@@ -273,7 +332,10 @@ pub const Core = struct {
                 .phase_deadline = deadline(now),
                 .parent = no_parent,
             };
-            queue(&entry.*.?, wire.flag_syn, &.{}, now);
+            // M99h (#2186, card h1): the active-open SYN advertises our
+            // MSS 1460 — the table path's originated SYN, where the
+            // legacy singleton's bare SYN stays pinned by the fleet.
+            queueOpts(&entry.*.?, wire.flag_syn, &wire.mss_option, &.{}, now);
             return handle;
         }
         return error.Capacity;
@@ -315,7 +377,10 @@ pub const Core = struct {
         c.read_deadline = deadline(now);
         if (bytes.len == 0) return 0;
         if (c.state != .established or c.tx_len != 0 or c.peer_window == 0) return error.WouldBlock;
-        const count = @min(bytes.len, @min(wire.payload_max, c.peer_window));
+        // M99h: the peer's advertised MSS bounds the segment too (a peer
+        // that sent none keeps the payload_max bound).
+        const mss: usize = if (c.peer_mss == 0) wire.payload_max else c.peer_mss;
+        const count = @min(bytes.len, @min(@min(wire.payload_max, c.peer_window), mss));
         queue(c, wire.flag_ack, bytes[0..count], now);
         c.write_deadline = deadline(now);
         return count;
@@ -405,8 +470,13 @@ pub const Core = struct {
     /// endpoint leaves the frame alone (the caller decides).
     pub fn receive(self: *Core, frame: []const u8, now: u64, fresh_isn: u32) Error!void {
         try self.poll(now);
-        const p = parse(frame) orelse {
-            self.counters.malformed +%= 1;
+        var bad_options = false;
+        const p = parse(frame, &bad_options) orelse {
+            if (bad_options) {
+                self.counters.dropped_options +%= 1;
+            } else {
+                self.counters.malformed +%= 1;
+            }
             return;
         };
         for (&self.children) |*entry| if (entry.*) |*c| {
@@ -445,13 +515,15 @@ pub const Core = struct {
                 .remote = p.remote,
                 .remote_mac = p.mac,
                 .peer_window = p.window,
+                .peer_mss = p.mss, // M99h: the requester's MSS, if it sent one
                 .snd_una = fresh_isn,
                 .snd_nxt = fresh_isn,
                 .rcv_nxt = p.seq +% 1,
                 .phase_deadline = deadline(now),
                 .parent = @intCast(parent),
             };
-            queue(&entry.*.?, wire.flag_syn | wire.flag_ack, &.{}, now);
+            // M99h: the SYN-ACK advertises our MSS — a SYN is a SYN.
+            queueOpts(&entry.*.?, wire.flag_syn | wire.flag_ack, &wire.mss_option, &.{}, now);
             return;
         };
         self.refuse(p);
@@ -488,6 +560,8 @@ pub const Core = struct {
                 c.rcv_nxt = p.seq +% 1;
                 c.snd_una = p.ack;
                 c.peer_window = p.window;
+                c.peer_mss = p.mss; // M99h: the peer's advertised MSS
+                noteSample(c, self.now); // the SYN-ACK is the first RTT sample
                 clearTx(c);
                 c.state = .established;
                 c.read_deadline = deadline(self.now);
@@ -502,19 +576,58 @@ pub const Core = struct {
             c.tx_due = true;
             return;
         }
-        if (p.seq != c.rcv_nxt) {
+        if ((p.flags & wire.flag_rst) != 0) {
+            // An RST still only bites exactly at rcv_nxt — the pinned bound.
+            if (p.seq == c.rcv_nxt) {
+                finish(c, .reset);
+                return;
+            }
             self.counters.duplicates +%= 1;
             if (c.state != .half_open) ack(c);
-            return;
-        }
-        if ((p.flags & wire.flag_rst) != 0) {
-            finish(c, .reset);
             return;
         }
         if ((p.flags & wire.flag_syn) != 0 or
             (c.state == .half_open and (p.flags & wire.flag_fin) != 0))
         {
             self.counters.malformed +%= 1;
+            return;
+        }
+        // M99h (#2186, card h2): the in-sequence bound became the bounded
+        // receive window — a data segment must overlap
+        // [rcv_nxt, rcv_nxt + free); fully-old bytes are duplicates
+        // (re-ACKed); bytes beyond the window are refused; the rest is
+        // head/tail-trimmed honestly. A bare segment still sits exactly
+        // at rcv_nxt; a FIN may sit ahead (it queues until contiguous).
+        const fwin: u32 = @intCast(rxFree(c));
+        const plen: u32 = @intCast(p.payload.len);
+        const has_fin = (p.flags & wire.flag_fin) != 0;
+        var d_seq = p.seq;
+        var d_len: usize = p.payload.len;
+        var off: usize = 0;
+        if (plen != 0) {
+            if (wire.seq_ge(c.rcv_nxt, p.seq)) {
+                const skip = c.rcv_nxt -% p.seq;
+                if (skip >= plen) {
+                    self.counters.duplicates +%= 1;
+                    if (c.state != .half_open) ack(c);
+                    return;
+                }
+                off = @intCast(skip);
+                d_seq = c.rcv_nxt;
+                d_len = p.payload.len - off;
+            } else if (p.seq != c.rcv_nxt and (p.seq -% c.rcv_nxt) >= fwin) {
+                self.counters.malformed +%= 1;
+                return;
+            }
+        } else if (p.seq != c.rcv_nxt) {
+            if (has_fin and !wire.seq_ge(c.rcv_nxt, p.seq) and (p.seq -% c.rcv_nxt) <= fwin) {
+                c.fin_ooo = p.seq; // a FIN ahead of the stream — queue it
+                c.fin_ooo_set = true;
+                if (c.state != .half_open) ack(c);
+                return;
+            }
+            self.counters.duplicates +%= 1;
+            if (c.state != .half_open) ack(c);
             return;
         }
         const sent_limit = if (c.tx_started) c.snd_nxt else c.snd_una;
@@ -525,11 +638,13 @@ pub const Core = struct {
         c.peer_window = p.window;
         if (c.state == .half_open) {
             if (!c.tx_started or p.ack != c.snd_nxt) return;
+            noteSample(c, self.now); // the handshake ACK covers our SYN-ACK
             clearTx(c);
             c.snd_una = p.ack;
             c.state = .established;
             c.read_deadline = deadline(self.now);
         } else if (c.tx_started and p.ack == c.snd_nxt) {
+            noteSample(c, self.now); // Karn's rule keeps retried segments out
             clearTx(c);
             c.snd_una = p.ack;
             if (c.state == .closing and c.peer_fin) {
@@ -539,22 +654,47 @@ pub const Core = struct {
                 return;
             }
         }
-        if (p.payload.len != 0) {
-            if (c.peer_fin or c.rx_len != 0 or c.state == .closing) {
+        if (d_len != 0) {
+            if (c.peer_fin or c.state == .closing) {
                 self.counters.rx_full +%= 1;
                 ack(c);
                 return;
             }
-            @memcpy(c.rx[0..p.payload.len], p.payload);
-            c.rx_len = p.payload.len;
-            c.rcv_nxt +%= @intCast(p.payload.len);
+            // The tail cannot exceed the window past the segment's own
+            // offset — `d_seq - rcv_nxt` bytes of the free space are
+            // upstream of it (0 for an in-order segment).
+            const room: usize = @intCast(fwin -% (d_seq -% c.rcv_nxt));
+            if (d_len > room) {
+                self.counters.rx_full +%= 1;
+                d_len = room;
+            }
+            if (d_len != 0) {
+                if (d_seq == c.rcv_nxt) {
+                    @memcpy(c.rx[c.rx_len .. c.rx_len + d_len], p.payload[off .. off + d_len]);
+                    c.rx_len += d_len;
+                    c.rcv_nxt +%= @intCast(d_len);
+                    oooAdvance(c, @intCast(d_len));
+                } else {
+                    if (oooInsert(c, d_seq, p.payload[off .. off + d_len])) {
+                        self.counters.ooo_held +%= 1;
+                    } else {
+                        self.counters.rx_full +%= 1; // held bound hit — dropped, never misordered
+                    }
+                }
+            }
             ack(c);
         }
-        if ((p.flags & wire.flag_fin) != 0) {
-            c.rcv_nxt +%= 1;
-            c.peer_fin = true;
+        if (has_fin) {
+            const fin_seq = p.seq +% plen;
+            if (fin_seq == c.rcv_nxt) {
+                c.rcv_nxt +%= 1;
+                c.peer_fin = true;
+            } else {
+                c.fin_ooo = fin_seq; // ahead of the stream — applies when contiguous
+                c.fin_ooo_set = true;
+            }
             ack(c);
-            if (c.tx_len == 0) {
+            if (c.peer_fin and c.tx_len == 0) {
                 if (c.state == .closing) {
                     finish(c, .eof);
                     ack(c);
@@ -564,6 +704,12 @@ pub const Core = struct {
                     c.phase_deadline = deadline(self.now);
                 }
             }
+        } else if (c.peer_fin and c.tx_len == 0 and c.state == .established) {
+            // A queued FIN just applied inside `oooAdvance` — the same
+            // close-out as a FIN that arrived contiguous.
+            queue(c, wire.flag_fin | wire.flag_ack, &.{}, self.now);
+            c.state = .closing;
+            c.phase_deadline = deadline(self.now);
         }
     }
     /// Deadlines win at equality, before a same-time retransmission.
@@ -580,11 +726,19 @@ pub const Core = struct {
                 self.counters.timed_out +%= 1;
                 continue;
             }
-            if (c.tx_len != 0 and c.tx_started and !c.tx_due and now - c.last_tx >= rto_ns) {
+            // M99h (#2186, card h3): the adaptive RTO — `rto_ns_cur` is
+            // the estimator value (or the initial bound), doubled toward
+            // the 60 s ceiling per retransmission (RFC 6298 §5.5). The
+            // 30 s phase/read deadlines still abort a black hole
+            // independently of the retry schedule.
+            if (c.tx_len != 0 and c.tx_started and !c.tx_due and now - c.last_tx >= c.rto_ns_cur) {
                 if (c.retries >= retry_limit) {
                     finish(c, .timeout);
                     self.counters.timed_out +%= 1;
-                } else c.tx_due = true;
+                } else {
+                    c.tx_due = true;
+                    c.rto_ns_cur = @min(rto_ceiling_ns, c.rto_ns_cur *| 2);
+                }
             }
             // A peer FIN while our data was pending: queue FIN after its ACK.
             if (c.peer_fin and c.state == .established and c.tx_len == 0) {
@@ -685,22 +839,147 @@ fn finish(c: *Connection, outcome: Outcome) void {
         c.rx_len = 0;
         c.peer_fin = false;
     }
+    // M99h: a dead connection releases its reassembly window and any
+    // queued FIN — the .eof path keeps the in-order prefix readable
+    // exactly like before.
+    c.ooo_map = @splat(0);
+    c.ooo_bytes = 0;
+    c.fin_ooo_set = false;
+}
+/// M99h (#2186, card h2): the honest advertised window — the receive
+/// window's real free space: `recv_window` minus every buffered byte
+/// (the in-order prefix plus the bitmap-held out-of-order bytes).
+fn rxFree(c: *const Connection) usize {
+    const used = c.rx_len + c.ooo_bytes;
+    return if (used >= recv_window) 0 else recv_window - used;
 }
 fn build(c: *const Connection, buf: []u8, seq: u32, flags: u8, payload: []const u8) usize {
-    const len = wire.build_segment(buf, c.local.ip, c.remote.ip, c.local.port, c.remote.port, seq, c.rcv_nxt, flags, payload);
-    // One segment, not 4096 bytes of reassembly space. A partial read stays shut.
-    std.mem.writeInt(u16, buf[14..16], if (c.rx_len == 0) wire.payload_max else 0, .big);
+    return buildOpts(c, buf, seq, flags, &.{}, payload);
+}
+fn buildOpts(c: *const Connection, buf: []u8, seq: u32, flags: u8, opts: []const u8, payload: []const u8) usize {
+    const len = wire.build_segment_opts(buf, c.local.ip, c.remote.ip, c.local.port, c.remote.port, seq, c.rcv_nxt, flags, opts, payload);
+    // M99h: the advertised window is the queue's real free space — an
+    // empty queue advertises the whole span, a partial read a slice.
+    std.mem.writeInt(u16, buf[14..16], @intCast(rxFree(c)), .big);
     @memset(buf[16..18], 0);
     std.mem.writeInt(u16, buf[16..18], wire.checksum_tcp(c.local.ip, c.remote.ip, buf[0..len]), .big);
     return len;
 }
 fn queue(c: *Connection, flags: u8, payload: []const u8, now: u64) void {
-    c.tx_len = build(c, &c.tx, c.snd_nxt, flags, payload);
+    queueOpts(c, flags, &.{}, payload, now);
+}
+fn queueOpts(c: *Connection, flags: u8, opts: []const u8, payload: []const u8, now: u64) void {
+    c.tx_len = buildOpts(c, &c.tx, c.snd_nxt, flags, opts, payload);
     c.snd_nxt +%= @intCast(payload.len + @as(usize, if ((flags & (wire.flag_syn | wire.flag_fin)) != 0) 1 else 0));
     c.tx_due = true;
     c.tx_started = false;
     c.retries = 0;
     c.last_tx = now;
+    // A new segment loses the backoff: the live RTO returns to the
+    // estimator value (or the initial bound before the first sample).
+    c.rto_ns_cur = if (c.rtt_valid)
+        @min(rto_ceiling_ns, @max(rto_floor_ns, c.srtt_ns +| 4 *| c.rttvar_ns))
+    else
+        rto_ns;
+}
+/// M99h (#2186, card h2): the reassembly bitmap — bit i marks
+/// `ooo_buf[i]` valid (sequence `ooo_base + i`).
+fn oooBit(c: *const Connection, i: usize) bool {
+    return (c.ooo_map[i / 64] >> @intCast(i % 64)) & 1 != 0;
+}
+fn oooSet(c: *Connection, i: usize, v: bool) void {
+    if (v) {
+        c.ooo_map[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+    } else {
+        c.ooo_map[i / 64] &= ~(@as(u64, 1) << @intCast(i % 64));
+    }
+}
+/// Hold `data` (sequence `seq`, strictly ahead of `rcv_nxt`, already
+/// trimmed to the free window) in the reassembly window. `ooo_base` is
+/// `rcv_nxt` whenever bytes are held, so the offset is always positive;
+/// the first held byte also re-bases. Overlapping a held byte is free —
+/// the bitmap is idempotent and `ooo_bytes` counts only the new bits.
+fn oooInsert(c: *Connection, seq: u32, data: []const u8) bool {
+    if (c.ooo_bytes == 0) c.ooo_base = c.rcv_nxt;
+    const off: usize = seq -% c.ooo_base;
+    if (off + data.len > recv_window) return false;
+    var added: u16 = 0;
+    for (0..data.len) |i| {
+        if (!oooBit(c, off + i)) {
+            oooSet(c, off + i, true);
+            added += 1;
+        }
+    }
+    @memcpy(c.ooo_buf[off .. off + data.len], data);
+    c.ooo_bytes += added;
+    return true;
+}
+/// `rcv_nxt` just advanced by `n` in-order bytes: re-base the held
+/// window (bytes the new prefix covered are dropped, the rest slide
+/// down), then splice every now-contiguous held run into `rx` — the
+/// stream cannot go backwards. A queued FIN applies the moment its
+/// sequence number becomes contiguous. The window invariant
+/// (`rx_len + ooo_bytes <= recv_window`) guarantees each splice fits.
+fn oooAdvance(c: *Connection, n: u32) void {
+    if (c.ooo_bytes != 0) {
+        oooSlide(c, n);
+        while (c.ooo_bytes != 0 and oooBit(c, 0)) {
+            var k: usize = 0;
+            while (k < recv_window and oooBit(c, k)) k += 1;
+            @memcpy(c.rx[c.rx_len .. c.rx_len + k], c.ooo_buf[0..k]);
+            c.rx_len += k;
+            c.rcv_nxt +%= @intCast(k);
+            oooSlide(c, @intCast(k));
+        }
+    }
+    if (c.fin_ooo_set and c.fin_ooo == c.rcv_nxt) {
+        c.fin_ooo_set = false;
+        c.rcv_nxt +%= 1; // the FIN consumes one sequence number
+        c.peer_fin = true;
+    }
+}
+/// Drop the lowest `n` held positions, sliding the rest down and
+/// advancing `ooo_base` to match — the shared re-base step for
+/// `oooAdvance` (n = the rcv_nxt advance) and its inner splice
+/// (n = the run length, so `ooo_base` tracks `rcv_nxt` exactly).
+fn oooSlide(c: *Connection, n: usize) void {
+    if (n >= recv_window) {
+        c.ooo_map = @splat(0);
+        c.ooo_bytes = 0;
+        c.ooo_base +%= @intCast(n);
+        return;
+    }
+    var kept: u16 = 0;
+    var i: usize = 0;
+    while (i + n < recv_window) : (i += 1) {
+        const b = oooBit(c, i + n);
+        oooSet(c, i, b);
+        if (b) kept += 1;
+    }
+    while (i < recv_window) : (i += 1) oooSet(c, i, false);
+    std.mem.copyForwards(u8, c.ooo_buf[0 .. recv_window - n], c.ooo_buf[n..recv_window]);
+    c.ooo_bytes = kept;
+    c.ooo_base +%= @intCast(n);
+}
+/// M99h (#2186, card h3): the RFC 6298 RTT update — called at every
+/// ACK-accept site BEFORE `clearTx`. A sample exists only when the
+/// pending segment was never retransmitted (Karn's algorithm, §5.2):
+/// `tx_started` and zero retries. First sample: SRTT = R, RTTVAR = R/2;
+/// later samples: the §2.3 alpha = 1/8 / beta = 1/4 filters. The live
+/// RTO is SRTT + 4 x RTTVAR clamped [rto_floor_ns, rto_ceiling_ns].
+fn noteSample(c: *Connection, now: u64) void {
+    if (!c.tx_started or c.retries != 0) return;
+    const r = now -| c.last_tx;
+    if (!c.rtt_valid) {
+        c.srtt_ns = r;
+        c.rttvar_ns = r / 2;
+        c.rtt_valid = true;
+    } else {
+        const d = if (r > c.srtt_ns) r - c.srtt_ns else c.srtt_ns - r;
+        c.rttvar_ns = (3 * c.rttvar_ns + d) / 4;
+        c.srtt_ns = (7 * c.srtt_ns + r) / 8;
+    }
+    c.rto_ns_cur = @min(rto_ceiling_ns, @max(rto_floor_ns, c.srtt_ns +| 4 *| c.rttvar_ns));
 }
 fn ack(c: *Connection) void {
     _ = build(c, &c.control, if (c.tx_started) c.snd_nxt else c.snd_una, wire.flag_ack, &.{});
@@ -714,17 +993,32 @@ const Parsed = struct {
     ack: u32,
     flags: u8,
     window: u16,
+    /// M99h (#2186): the peer's advertised MSS from a SYN-flagged
+    /// segment (0 = none).
+    mss: u16,
     payload: []const u8,
 };
-fn parse(frame: []const u8) ?Parsed {
+fn parse(frame: []const u8, bad_options: *bool) ?Parsed {
+    bad_options.* = false;
     if (frame.len < wire.frame_min or frame[12] != 8 or frame[13] != 0 or frame[14] != 0x45 or frame[23] != 6) return null;
     const ip = frame[14..34];
     if (wire.fold(wire.sum_words(ip)) != 0 or std.mem.readInt(u16, ip[6..8], .big) & 0xbfff != 0) return null;
     const length = std.mem.readInt(u16, ip[2..4], .big);
     if (length < 40 or length > 1500 or length + @as(usize, 14) > frame.len) return null;
     const seg = frame[34 .. 14 + @as(usize, length)];
-    if (seg[12] != 0x50 or seg[13] & ~@as(u8, 0x1f) != 0 or (seg[13] & (wire.flag_syn | wire.flag_fin)) == (wire.flag_syn | wire.flag_fin)) return null;
-    if (seg[13] & wire.flag_rst != 0 and (seg.len != wire.tcp_hdr_len or seg[13] & (wire.flag_syn | wire.flag_fin) != 0)) return null;
+    if (seg[13] & ~@as(u8, 0x1f) != 0 or (seg[13] & (wire.flag_syn | wire.flag_fin)) == (wire.flag_syn | wire.flag_fin)) return null;
+    // M99h (#2186, card h1): the data offset declares the option area.
+    // Offset < 5 or one beyond the segment is malformed; a valid area is
+    // scanned (NOPs and unknown kinds skipped, MSS recorded) — a
+    // malformed option list drops the segment in its own counter.
+    const doff: usize = seg[12] >> 4;
+    if (doff < 5 or doff * 4 > seg.len) return null;
+    var mss: u16 = 0;
+    wire.scanOptions(seg, wire.tcp_hdr_len, doff * 4 - wire.tcp_hdr_len, &mss) catch {
+        bad_options.* = true;
+        return null;
+    };
+    if (seg[13] & wire.flag_rst != 0 and (doff != 5 or seg.len != wire.tcp_hdr_len or seg[13] & (wire.flag_syn | wire.flag_fin) != 0)) return null;
     const remote: [4]u8 = ip[12..16].*;
     const local: [4]u8 = ip[16..20].*;
     if (!validIp(remote) or wire.checksum_tcp(remote, local, seg) != 0) return null;
@@ -739,6 +1033,7 @@ fn parse(frame: []const u8) ?Parsed {
         .ack = std.mem.readInt(u32, seg[8..12], .big),
         .flags = seg[13],
         .window = std.mem.readInt(u16, seg[14..16], .big),
-        .payload = seg[20..],
+        .mss = if (seg[13] & wire.flag_syn != 0) mss else 0,
+        .payload = seg[doff * 4 ..],
     };
 }

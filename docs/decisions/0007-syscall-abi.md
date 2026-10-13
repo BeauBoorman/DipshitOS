@@ -2103,15 +2103,28 @@ active connect and unsupported socket options continue to refuse.
 | 7 peer | child handle | unused | unused | `(IPv4_word << 16) \| port` |
 | 8 DNS begin | resolver IPv4 word | query bytes | 17–64 bytes | DNS handle |
 | 9 DNS reply | DNS handle | writable buffer | byte capacity | complete DNS message, or error |
+| 10 connect | IPv4 network-order word | remote port \| timeout_ms<<16 | unused, must be 0 | connection handle |
 | 11 owned-count | unused | unused | unused | caller's charged native handles |
+| 12 table | writable row buffer | max rows, ≤64 | unused, must be 0 | rows written |
 
-Op 10 and unknown operations refuse `EINVAL`. x4/x5 must be zero.
+Ops above 12 refuse `EINVAL`. x4/x5 must be zero.
 Ready bits: 1 readable (including EOF/error), 2 writable, 4 accept,
 8 terminal; DNS uses bit 1. All calls probe, perform bounded RX/TX work
-under the NET lock, and return without entering the scheduler. The idle
+under the NET lock, and return without entering the scheduler — except
+op 10, which spins the caller inside the handler until ESTABLISHED or
+the connect budget expires, exactly as slot 30 does (it drops the
+domain hold through the same pacing window, so concurrent in-kernel
+connects interleave). The idle
 network pump also advances the core, so deadlines/retries do not depend
 on application polling. Kernel deadlines are 30 s; RTO is 3 s with ten
 retries. Deadline equality wins before RX or retransmission.
+
+Op 12 writes one fixed 24-byte little-endian row per live table socket:
+u64 owner pid, 4-byte local IPv4, u16 local port, u16 remote port,
+4-byte remote IPv4, u8 kind (0 listener / 1 connection), u8 state,
+2 bytes reserved. Listeners come first; connection rows carry the
+core lifecycle state. It is observability only — a snapshot, never a
+wait.
 
 Errors: `-1` invalid argument, `-2` stale/wrong-kind handle, `-3` bad
 user buffer, `-4` unsupported, `-5` capacity, `-7` wrong owner, `-9`
@@ -2376,9 +2389,13 @@ their own listener and `close(listener)` reclaims only its children.
   outbound connection (`parent` = none), queues the SYN in the
   connection's bounded TX, and stays `half_open` until a SYN+ACK whose
   ack covers `snd_nxt` establishes it — the same 30 s phase deadline and
-  3 s/10-retry RTO every other connection carries. The slot-80 `connect`
-  operation stays `Unsupported` (the B6 ABI is unchanged — passive
-  only); active open is reachable through legacy slot 30.
+  3 s/10-retry RTO every other connection carries. M99g (#2185) added
+  slot-80 op 10 `connect` — the same argument packing and in-handler
+  bounded wait as slot 30, answered with the table handle, so the
+  handle ABI is no longer passive-only and one process can hold several
+  outbound connections priced against the same kernel bounds
+  (`owner_limit`/`conn_limit`; Capacity → `-5`). Slot 30 remains the
+  legacy caller's path and keeps its one-outbound-per-owner law.
 - RX: `ipv4.zig` keeps its slot-0 fast path. Every other TCP frame
   enters `tcp.handle_rx`, which first offers the frame to a registered
   claim delegate (`tcp.table_rx`, registered by `socket_native` — the

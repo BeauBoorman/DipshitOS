@@ -687,6 +687,19 @@ var netTcpRespondHostPort: UInt16?
 // deterministic data black hole for the gate's retransmission-bound
 // run). Default (no suffix) = the full N10 responder.
 var netTcpRespondHandshakeOnly = false
+// M99h (#2186): the optional `:options` responder mode — the same
+// deterministic endpoint, but its SYN-ACK carries a real peer's option
+// list (MSS 1460 + SACK-permitted + WS + NOP + a pinned TS, data offset
+// 10) and its data/FIN segments carry NOP+NOP+TS (data offset 8). The
+// guest must parse-and-skip the options and honor the advertised MSS —
+// the shape a real NAT peer puts on the wire.
+var netTcpRespondOptionsMode = false
+// The pinned option lists (pre-padded to the 4-byte bound). SYN-ACK:
+// MSS(4) + SACK-perm(2) + WS=0(3) + NOP(1) + TS(10) = 20 bytes.
+// Data/FIN: NOP + NOP + TS(10) = 12 bytes.
+let netTcpOptionsSynAck: [UInt8] = [0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x03, 0x03, 0x00, 0x01,
+                                  0x08, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]
+let netTcpOptionsData: [UInt8] = [0x01, 0x01, 0x08, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]
 // M51 SSH1 (#1168): the optional `:packet` responder mode — after the
 // handshake, page a caller-supplied byte payload out as ≤chunk-byte TCP
 // segments, one per guest ACK. This is the deterministic peer the
@@ -1338,7 +1351,7 @@ while idx < arguments.count {
         let token = arguments[idx + 1]
         let halves = token.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
         guard halves.count >= 2, let port = UInt16(halves[1]) else {
-            fail("--net-tcp-respond requires <host-ip>:<host-port>[:handshake|packet|ssh|relay], got '\(token)'.")
+            fail("--net-tcp-respond requires <host-ip>:<host-port>[:handshake|packet|ssh|relay|options], got '\(token)'.")
         }
         if halves.count == 3 {
             if halves[2] == "handshake" {
@@ -1352,8 +1365,12 @@ while idx < arguments.count {
                 // M51 interop (#1209): byte-forward to a real upstream
                 // (`--net-tcp-respond-relay`).
                 netTcpRespondRelayMode = true
+            } else if halves[2] == "options" {
+                // M99h (#2186): the option-carrying peer (a real peer's
+                // wire shape — the guest must parse-and-skip).
+                netTcpRespondOptionsMode = true
             } else {
-                fail("--net-tcp-respond mode must be 'handshake', 'packet', 'ssh' or 'relay', got '\(halves[2])'.")
+                fail("--net-tcp-respond mode must be 'handshake', 'packet', 'ssh', 'relay' or 'options', got '\(halves[2])'.")
             }
         }
         let parts = halves[0].split(separator: ".").compactMap { UInt8($0) }
@@ -2184,7 +2201,11 @@ if let netCapturePath {
                 let ack = tcpAck(buf)
                 var reply = [UInt8](repeating: 0, count: 4096)
                 var payload = [UInt8]()
-                if n > 54 { payload = [UInt8](buf[54..<n]) }
+                // M99h (#2186): the payload starts at the segment's data
+                // offset, not byte 54 — a guest SYN carrying its MSS
+                // option must not be echoed as "payload" in the SYN-ACK.
+                let dataOff = 34 + max(5, Int(buf[46] >> 4)) * 4
+                if n > dataOff { payload = [UInt8](buf[dataOff..<n]) }
                 let isSyn = (flags & 0x02) != 0 && (flags & 0x10) == 0
                 let isFin = (flags & 0x01) != 0
                 let isRst = (flags & 0x04) != 0
@@ -2238,9 +2259,10 @@ if let netCapturePath {
                         conn.sshServer = server
                         print("NET-TCP-SSH: connection accepted (guest SYN seq 0x\(hex32(seq))); awaiting the version exchange")
                     }
-                    let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvIsn, seq &+ 1, 0x12, payload)
+                    let synAckOpts: [UInt8] = netTcpRespondOptionsMode ? netTcpOptionsSynAck : []
+                    let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, netTcpSrvIsn, seq &+ 1, 0x12, payload, options: synAckOpts)
                     try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
-                    print("NET-TCP: answered the guest's SYN (seq 0x\(hex32(seq))) with a SYN-ACK (seq 0x\(hex32(netTcpSrvIsn)), ack 0x\(hex32(seq &+ 1)))")
+                    print("NET-TCP: answered the guest's SYN (seq 0x\(hex32(seq))) with a SYN-ACK (seq 0x\(hex32(netTcpSrvIsn)), ack 0x\(hex32(seq &+ 1))\(netTcpRespondOptionsMode ? ", options mss/sackp/ws/ts" : ""))")
                     }
                 } else if isFin {
                     let conn = netTcpSrvConn(for: buf)
@@ -2251,7 +2273,8 @@ if let netCapturePath {
                         // retransmission machinery to fire.
                         print("NET-TCP: handshake-only — ignoring the guest's FIN (black hole)")
                     } else {
-                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ 1, 0x11, payload)
+                        let finOpts: [UInt8] = netTcpRespondOptionsMode ? netTcpOptionsData : []
+                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ 1, 0x11, payload, options: finOpts)
                         try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         conn.closed = true
                         if netTcpRespondRelayMode {
@@ -2321,7 +2344,8 @@ if let netCapturePath {
                             let httpBody = "HTTP/1.0 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
                             responsePayload = Array(httpBody.utf8)
                         }
-                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, responsePayload)
+                        let dataOpts: [UInt8] = netTcpRespondOptionsMode ? netTcpOptionsData : []
+                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, responsePayload, options: dataOpts)
                         try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         if isGet || hostPort == 80 {
                             print("NET-TCP: answered the guest's HTTP request with 200 OK (\(responsePayload.count) bytes)")
@@ -2703,6 +2727,9 @@ if let hostIP = netTcpRespondHostIP, let hostPort = netTcpRespondHostPort {
     if netTcpRespondPacketMode {
         let chunkCount = (netTcpRespondPacketPayload.count + netTcpRespondPacketChunk - 1) / netTcpRespondPacketChunk
         print("  net-tcp-respond mode: packet (M51 SSH1, #1168) — after the handshake, page \(netTcpRespondPacketPayload.count) bytes out as \(chunkCount) chunks of ≤\(netTcpRespondPacketChunk) bytes, one per guest ACK")
+    }
+    if netTcpRespondOptionsMode {
+        print("  net-tcp-respond mode: options (M99h, #2186) — the SYN-ACK carries MSS 1460 + SACK-permitted + WS + TS (data offset 10) and every data/FIN segment carries NOP+NOP+TS (data offset 8) — a real peer's wire shape")
     }
     if netTcpRespondSSHMode {
         print("NET-TCP-SSH: ENABLED (M51 SSH5, #1172) hostkey=\(SSHFixtures.hexString(netTcpRespondSSHHostKey)) userkey=\(SSHFixtures.hexString(netTcpRespondSSHUserKey)) marker=\(netTcpRespondSSHMarker.debugDescription) exit=\(netTcpRespondSSHExitStatus) tamper-mac=\(netTcpRespondSSHTamperMAC)")
@@ -5461,9 +5488,14 @@ func hex32(_ v: UInt32) -> String {
 // given ack, the given flags, the FIXED window 4096, no options — the
 // guest's honest bound), the echoed payload when present; both checksums
 // recomputed (RFC 1071). Returns the frame length (54 + the payload).
-func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ srvSeq: UInt32, _ ack: UInt32, _ flags: UInt8, _ payload: [UInt8]) -> Int {
+func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ srvSeq: UInt32, _ ack: UInt32, _ flags: UInt8, _ payload: [UInt8], options: [UInt8] = []) -> Int {
     _ = n
-    let frameLen = 54 + payload.count
+    // M99h (#2186): `options` is the pre-padded option area (0..40 bytes,
+    // a multiple of 4) — the `:options` mode's pinned lists; every other
+    // caller passes nothing and gets the byte-identical legacy frame.
+    let optsPad = (options.count + 3) & ~3
+    let hdrBytes = 20 + optsPad
+    let frameLen = 54 + optsPad + payload.count
     reply = [UInt8](repeating: 0, count: frameLen)
     // Ethernet: dst = the guest's MAC, src = the host MAC.
     reply[0...5] = req[6...11]
@@ -5472,8 +5504,8 @@ func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[13] = 0x00 // ethertype IPv4
     // IPv4: src = the guest's dst IP, dst = the guest's src IP, proto 6.
     reply[14] = 0x45 // version 4, IHL 5
-    reply[16] = UInt8((20 + 20 + payload.count) >> 8)
-    reply[17] = UInt8((20 + 20 + payload.count) & 0xff) // total length
+    reply[16] = UInt8((20 + hdrBytes + payload.count) >> 8)
+    reply[17] = UInt8((20 + hdrBytes + payload.count) & 0xff) // total length
     reply[22] = 64 // TTL
     reply[23] = 6 // protocol TCP
     reply[26...29] = req[30...33] // src
@@ -5482,7 +5514,8 @@ func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[24] = UInt8(hdrChk >> 8)
     reply[25] = UInt8(hdrChk & 0xff)
     // TCP: src = the host port, dst = the guest's src port, seq/ack,
-    // data offset 5, the flags, window 4096, urgent 0.
+    // the data offset covering the option area, the flags, window 4096,
+    // urgent 0.
     reply[34] = UInt8(hostPort >> 8)
     reply[35] = UInt8(hostPort & 0xff)
     reply[36] = req[34]
@@ -5495,13 +5528,16 @@ func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[43] = UInt8((ack >> 16) & 0xff)
     reply[44] = UInt8((ack >> 8) & 0xff)
     reply[45] = UInt8(ack & 0xff)
-    reply[46] = 0x50 // data offset 5 (no options)
+    reply[46] = UInt8((5 + optsPad / 4) << 4) // data offset (5 = no options)
     reply[47] = flags
     reply[48] = 0x10 // window 4096
     reply[49] = 0x00
     // Checksum field at 50..52 (zeroed by the memset), urgent 52..54 (0).
+    if !options.isEmpty {
+        reply[54...54 + options.count - 1] = options[0...options.count - 1]
+    }
     if !payload.isEmpty {
-        reply[54...54 + payload.count - 1] = payload[0...payload.count - 1]
+        reply[54 + optsPad...54 + optsPad + payload.count - 1] = payload[0...payload.count - 1]
     }
     // The TCP checksum over the pseudo-header (the guest's src IP -> the
     // guest's dst IP), the checksum field zeroed during the computation.
@@ -5510,7 +5546,7 @@ func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     var seg = [UInt8](reply[34..<frameLen])
     seg[16] = 0
     seg[17] = 0
-    let tcpChk = tcpChecksum(srcIP, dstIP, seg, UInt16(20 + payload.count))
+    let tcpChk = tcpChecksum(srcIP, dstIP, seg, UInt16(hdrBytes + payload.count))
     reply[50] = UInt8(tcpChk >> 8)
     reply[51] = UInt8(tcpChk & 0xff)
     return frameLen

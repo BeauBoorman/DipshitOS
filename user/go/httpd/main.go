@@ -1,18 +1,19 @@
 // Command httpd is GOHTTPD.ELF — the M71l (#1571) Go replacement for the Zig
-// HTTPD.BIN: an in-guest HTTP/1.1 publisher that passively opens one port so a
-// host on the NAT bridge can fetch this share.
+// HTTPD.BIN, second pass (#2200): an in-guest persistent HTTP/1.1 publisher
+// that passively opens one port so a host on the NAT bridge can fetch this
+// share.
 //
-// It listens on one TCP port (default 8080) via slot 30 ip-0, accepts ONE
-// connection (the kernel TCP machine), answers it, closes, and exits. The
-// class-B probe is the passive open itself -- the monitor shows `tcp=listen`
-// while the server lives -- which is exactly what the Zig gate proved.
+// It listens on one TCP port (default 8080) on the slot-80 handle listener
+// (vi.SocketListen) — the same surface GOSSHD.ELF uses — and serves
+// connections serially: every ESTABLISHED child is its own per-handle Conn,
+// answered, closed, and the listener takes the next one. One connection can
+// carry several requests (keep-alive); the session ends on the peer's FIN,
+// a Connection: close answer, or the bounded recv budget lapsing.
 //
 // Not on the boot path.
 package main
 
 import (
-	"errors"
-
 	"virelai/vi"
 )
 
@@ -24,14 +25,15 @@ const (
 const (
 	markerStarting  = "httpd: starting"
 	markerListening = "httpd: listening on port "
+	markerAccepted  = "httpd: accepted"
 	markerRequest   = "httpd: request "
 	markerServed    = "httpd: served"
+	markerClosed    = "httpd: closed"
 	markerBye       = "httpd: bye"
 	markerFailed    = "httpd: listen failed"
-	markerErr       = "httpd: error "
 )
 
-// maxPinnedBytes caps the published file. The share is the host's, so the
+// maxPinnedBytes caps one published file. The share is the host's, so the
 // server does not trust it to be small.
 const maxPinnedBytes = 256 * 1024
 
@@ -40,83 +42,100 @@ const maxPinnedBytes = 256 * 1024
 // size is chosen so this binary's writable segment leaves well over the 0x908
 // bytes of page slack the kernel's first mmap needs; the build script verifies
 // it and says so by name if a future edit moves the segment end.
-var argvEnvpGuard [0x1ae0]byte
+var argvEnvpGuard [0x4000]byte
 
 func init() {
 	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
 }
 
-var errRequestTooLong = errors.New("httpd: request exceeds maxRequestBytes")
-
 func main() {
 	port := listenPort(vi.Args())
 	vi.ConsoleLine(markerStarting)
 
-	ln, err := vi.Listen(port)
+	ln, err := vi.SocketListen(port)
 	if err != nil {
 		vi.ConsoleLine(markerFailed)
 		vi.Exit(1)
 	}
 	vi.ConsoleLine(markerListening + vi.Itoa64(int64(port)))
 
-	// One connection at a time (the kernel TCP machine), as GOSSHD does.
-	if err := ln.Accept(); err != nil {
-		_ = ln.Close()
-		vi.ConsoleLine(markerErr + "accept")
-		vi.Exit(1)
-	}
-
-	raw, err := readRequest(ln)
-	if err != nil {
-		_ = ln.Close()
-		vi.ConsoleLine(markerErr + "recv")
-		vi.Exit(1)
-	}
-	req, ok := parseRequest(raw)
-	if !ok {
-		_ = ln.Close()
-		vi.ConsoleLine(markerErr + "parse")
-		vi.Exit(1)
-	}
-	vi.ConsoleLine(markerRequest + req.Target)
-
-	pinned := readWholeFile(sharePath, maxPinnedBytes)
-	resp := route(req, pinned, pinned != nil)
-
-	if _, err := ln.Send(formatResponse(resp, req.Method == "HEAD")); err != nil {
-		_ = ln.Close()
-		vi.ConsoleLine(markerErr + "send")
-		vi.Exit(1)
+	// The accept loop hands every ESTABLISHED child its own Conn; the
+	// listener itself stays live, so session close IS the relisten. The
+	// kernel's child_limit=2 bounds pending children — a third
+	// simultaneous SYN is honestly refused, not queued. An idle listener
+	// lets the bounded AcceptConn expire and the daemon exits cleanly;
+	// a kernel kill interrupts the same wait the same way.
+	for {
+		child, err := ln.AcceptConn()
+		if err != nil {
+			break
+		}
+		vi.ConsoleLine(markerAccepted)
+		serveConn(child)
+		_ = child.Close()
+		vi.ConsoleLine(markerClosed)
 	}
 	_ = ln.Close()
-	vi.ConsoleLine(markerServed)
 	vi.ConsoleLine(markerBye)
 	vi.Exit(0)
 }
 
-// readRequest buffers until the headers are complete, the bound is reached, or
-// the peer stops sending.
-func readRequest(ln *vi.Conn) ([]byte, error) {
+// serveConn runs one connection's request loop: split each complete request
+// head off the buffered stream (pipelined bytes stay for the next turn),
+// answer, and continue while the resolved Connection semantics say
+// keep-alive. A parse failure is answered 400 and closed; a 405 likewise
+// closes (the request's body extent is unknowable, so the stream cannot be
+// trusted to resync). Read failures end the session, never the daemon.
+func serveConn(c *vi.Conn) {
 	buf := make([]byte, 0, maxRequestBytes)
 	chunk := make([]byte, vi.TCPPayloadMax)
-	for len(buf) < maxRequestBytes {
-		n, err := ln.Recv(chunk)
-		if err != nil {
-			return nil, err
-		}
-		if n <= 0 {
+	for {
+		req, resp, rest, ok := serveTurn(buf, func(rel string) []byte { return readWholeFile(rel, maxPinnedBytes) })
+		if !ok {
+			if len(buf) >= maxRequestBytes {
+				answerAndClose(c, badRequest())
+				return
+			}
+			n, err := c.Recv(chunk)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				buf = append(buf, chunk[:n]...)
+			}
 			continue
 		}
-		buf = append(buf, chunk[:n]...)
-		if hasHeaderEnd(buf) {
-			return buf, nil
+		buf = rest
+		if resp.Status == 400 {
+			// A bad head cannot resync the stream; serveTurn already
+			// answered it — close after the response goes out.
+			answerAndClose(c, resp)
+			return
+		}
+		vi.ConsoleLine(markerRequest + req.RawTarget)
+
+		// Error statuses the stream cannot resync after (a malformed head,
+		// a method whose body we never read) close regardless of the
+		// client's keep-alive ask; a 404 keeps the connection.
+		keepAlive := !req.wantClose() && resp.Status != 405
+		if _, err := c.Send(formatResponse(resp, req.Method == "HEAD", keepAlive)); err != nil {
+			return
+		}
+		vi.ConsoleLine(markerServed)
+		if !keepAlive {
+			return
 		}
 	}
-	return nil, errRequestTooLong
 }
 
-// readWholeFile reads up to max bytes of a share file, or nil if it cannot be
-// opened. Same shape as the browser's reader (see user/go/browser/text.go).
+// answerAndClose emits one terminal response with Connection: close.
+func answerAndClose(c *vi.Conn, resp response) {
+	_, _ = c.Send(formatResponse(resp, false, false))
+	vi.ConsoleLine(markerServed)
+}
+
+// readWholeFile reads up to max bytes of a share file, or nil if it cannot
+// be opened. Same shape as the browser's reader (see user/go/browser/text.go).
 func readWholeFile(path string, max int) []byte {
 	h, rc := vi.FileOpen(path, vi.ModeRead)
 	if rc < 0 || h < 0 {
