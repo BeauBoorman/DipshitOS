@@ -33,6 +33,7 @@ const RtoEvent = tcp.RtoEvent;
 
 const checksum_tcp = tcp.checksum_tcp;
 const build_segment = tcp.build_segment;
+const build_segment_opts = tcp.build_segment_opts;
 const build_frame = tcp.build_frame;
 const handle_rx = tcp.handle_rx;
 const reset = tcp.reset;
@@ -360,9 +361,9 @@ test "tcp: malformed + unexpected segments are counted, never assumed away" {
     try std.testing.expectEqual(Event.none, handle_rx(&wrong_port));
     try std.testing.expectEqual(@as(u64, 2), tcp.dropped_malformed);
 
-    // A segment with options (data offset 6) -> tcp.dropped_malformed.
+    // A data offset that outruns the segment -> tcp.dropped_malformed.
     var opts = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0x22222222, 0x11111112, flag_syn | flag_ack, &.{});
-    opts[46] = 0x60; // data offset 6 — must also fix the checksum to land in malformed
+    opts[46] = 0x60; // data offset 6 in a 20-byte segment — must also fix the checksum to land in malformed
     opts[50] = 0;
     opts[51] = 0; // zero the checksum field during the recompute (RFC 1071)
     {
@@ -373,6 +374,16 @@ test "tcp: malformed + unexpected segments are counted, never assumed away" {
     }
     try std.testing.expectEqual(Event.none, handle_rx(&opts));
     try std.testing.expectEqual(@as(u64, 3), tcp.dropped_malformed);
+
+    // A SYN-ACK with a malformed option list (an MSS kind whose length
+    // byte is 0) -> tcp.dropped_options, a class distinct from malformed.
+    var seg_buf: [segment_max]u8 = undefined;
+    const olen = build_segment_opts(&seg_buf, ip_host, ip_guest, 9999, default_src_port, 0x22222222, 0x11111112, flag_syn | flag_ack, &.{ 2, 0 }, &.{});
+    var oframe: [frame_max]u8 = undefined;
+    const oflen = build_frame(&oframe, &host_mac, ip_host, test_mac, ip_guest, seg_buf[0..olen]);
+    try std.testing.expectEqual(Event.none, handle_rx(oframe[0..oflen]));
+    try std.testing.expectEqual(@as(u64, 1), tcp.dropped_options);
+    try std.testing.expectEqual(@as(u64, 3), tcp.dropped_malformed); // unchanged — the classes stay distinct
 
     // A SYN-ACK carrying payload (not permitted), even at the segment
     // bound, is malformed.
@@ -389,7 +400,7 @@ test "tcp: malformed + unexpected segments are counted, never assumed away" {
     try std.testing.expectEqual(State.closed, tcp.state);
 }
 
-test "tcp: the RX buffer holds ONE segment — a second unread segment is dropped" {
+test "tcp: the RX buffer is a contiguous prefix — a second in-order segment appends" {
     arp.own_ip = ip_guest;
     defer arp.own_ip = .{ 0, 0, 0, 0 };
     reset();
@@ -402,11 +413,16 @@ test "tcp: the RX buffer holds ONE segment — a second unread segment is droppe
     const d1 = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001, 3, flag_ack, "one");
     try std.testing.expectEqual(Event.data_recv, handle_rx(&d1));
     try std.testing.expectEqual(@as(u64, 1), tcp.data_recv);
-    // The second segment arrives BEFORE `net tcp recv` — dropped (counted).
-    const d2 = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0005, 3, flag_ack, "two");
-    try std.testing.expectEqual(Event.none, handle_rx(&d2));
-    try std.testing.expectEqual(@as(u64, 1), tcp.dropped_malformed);
-    try std.testing.expectEqualSlices(u8, "one", tcp.rx_payload[0..tcp.rx_len]); // unchanged
+    // M99h (#2186, h2): the second in-order segment arrives BEFORE `net
+    // tcp recv` — it appends to the contiguous prefix (the ACK still
+    // carries the real free window), never drops.
+    const d2 = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0004, 3, flag_ack, "two");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&d2));
+    try std.testing.expectEqual(@as(u64, 2), tcp.data_recv);
+    try std.testing.expectEqual(@as(u64, 0), tcp.dropped_malformed);
+    try std.testing.expectEqualSlices(u8, "onetwo", tcp.rx_payload[0..tcp.rx_len]);
+    // The ACK for the appended bytes advertises the shrunken free space.
+    try std.testing.expectEqual(@as(u16, window - 6), (@as(u16, tcp.msg[14]) << 8) | tcp.msg[15]);
 }
 
 test "tcp: ready_mask reports a peer FIN in ESTABLISHED as readable" {
@@ -928,29 +944,237 @@ test "tcp: M97e-F2 — a forged source IP and out-of-sequence segments cannot mo
     try std.testing.expectEqual(State.established, tcp.state);
     try std.testing.expectEqualSlices(u8, &ip_host, &tcp.peer_ip);
 
-    // An out-of-sequence payload from the REAL peer (seq beyond rcv_nxt —
-    // reordered or a blind inject riding the right 4-tuple): dropped, no
-    // buffered bytes, the timer stays armed even though its ACK field
-    // would have covered the pending segment.
-    const oos = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0009, 0x55555560, flag_ack, "late");
-    try std.testing.expectEqual(Event.none, handle_rx(&oos));
-    try std.testing.expect(!tcp.rx_pending);
-    try std.testing.expect(tcp.tx_pending);
-    try std.testing.expectEqual(dropped0 + 3, tcp.dropped_malformed);
-
-    // A stale in-window-less ACK from the peer (an old seq, a covering
-    // ack): refused the same way — the timer keeps running.
+    // A stale bare ACK from the peer (an old seq, a covering ack field):
+    // not an acceptable segment — refused, the timer keeps running.
     const stale = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001 -% 4, 0x55555560, flag_ack, &.{});
     try std.testing.expectEqual(Event.none, handle_rx(&stale));
     try std.testing.expect(tcp.tx_pending);
-    try std.testing.expectEqual(dropped0 + 4, tcp.dropped_malformed);
+    try std.testing.expectEqual(dropped0 + 3, tcp.dropped_malformed);
 
-    // The real in-sequence segment still lands (the refusal is not a
-    // wedge): the payload is buffered and — its ACK covering the pending
-    // send — the retransmission timer stops HONESTLY.
+    // M99h (#2186, h2): an out-of-sequence payload from the REAL peer
+    // inside the receive window is an ACCEPTABLE segment — it is held in
+    // the bounded OOO queue (not delivered early), ACKed honestly, and
+    // its covering ACK field stops the retransmission timer. The M97e-F2
+    // property survives unchanged: only acceptable segments from the
+    // connected peer reach the ACK check — the forged frames above did
+    // not move the connection.
+    const oos = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0009, 0x55555560, flag_ack, "late");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&oos));
+    try std.testing.expect(!tcp.rx_pending); // held, never delivered out of order
+    try std.testing.expect(!tcp.tx_pending); // the peer's own ACK covers it
+    try std.testing.expectEqual(@as(u64, 1), tcp.ooo_held);
+    try std.testing.expectEqual(@as(u32, 0xaaaa0001), tcp.rcv_nxt); // unmoved
+
+    // The real in-sequence segment lands; the queued bytes stay held
+    // until the gap closes (still not a wedge).
     const ok = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, tcp.rcv_nxt, tcp.snd_una, flag_ack, "ok");
     try std.testing.expectEqual(Event.data_recv, handle_rx(&ok));
     try std.testing.expect(tcp.rx_pending);
-    try std.testing.expect(!tcp.tx_pending); // the peer's own ACK covers it
-    try std.testing.expectEqualSlices(u8, "ok", take_rx());
+    try std.testing.expectEqualSlices(u8, "ok", tcp.rx_payload[0..tcp.rx_len]);
+
+    // The gap fills: the held slot splices into the contiguous prefix in
+    // wire order — the app sees "ok" + the middle + "late", never "late"
+    // early.
+    const mid = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0003, tcp.snd_una, flag_ack, "MIDDLE");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&mid));
+    try std.testing.expectEqualSlices(u8, "okMIDDLElate", take_rx());
+    try std.testing.expectEqual(@as(u32, 0xaaaa000d), tcp.rcv_nxt);
+}
+
+// ---------------------------------------------------------------------------
+// M99h (#2186): wire depth — options, the bounded OOO queue, adaptive RTO
+// ---------------------------------------------------------------------------
+
+/// Craft a frame carrying an explicit option area (the h1 peer shape —
+/// a real host's SYN-ACK has NOPs, an MSS, and kinds we do not know).
+fn craft_opts(src: [4]u8, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, opts: []const u8, payload: []const u8) [frame_max]u8 {
+    var seg: [segment_max]u8 = undefined;
+    const slen = build_segment_opts(&seg, src, ip_guest, src_port, dst_port, seq, ack, flags, opts, payload);
+    var frame: [frame_max]u8 = undefined;
+    _ = build_frame(&frame, &host_mac, src, test_mac, ip_guest, seg[0..slen]);
+    return frame;
+}
+
+test "tcp: h1 — a real-peer SYN-ACK (NOPs, MSS, unknown kinds) establishes and records the MSS" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    start(ip_host, 9999, 0x12345678, host_mac);
+    advance_snd(1);
+
+    // NOP NOP | MSS 1200 | kind 30 len 4 (unknown — skipped) | EOL pad.
+    const sa = craft_opts(ip_host, 9999, default_src_port, 0xabcdef01, 0x12345679, flag_syn | flag_ack, &.{ 1, 1, 2, 4, 0x04, 0xb0, 30, 4, 0, 0, 0, 0 }, &.{});
+    try std.testing.expectEqual(Event.synack_recv, handle_rx(&sa));
+    try std.testing.expectEqual(State.established, tcp.state);
+    try std.testing.expectEqual(@as(u16, 1200), tcp.peer_mss);
+    try std.testing.expectEqual(@as(u64, 0), tcp.dropped_options);
+    // The peer's MSS clamps the outbound write — a payload_max write is
+    // truncated to 1200, honestly.
+    try std.testing.expectEqual(@as(usize, 1200), tcp.send_limit());
+    const big: [payload_max]u8 = @splat(0x42);
+    build_data_msg(&big);
+    try std.testing.expectEqual(@as(usize, tcp_hdr_len + 1200), tcp.msg_len);
+    try std.testing.expectEqualSlices(u8, big[0..1200], tcp.msg[tcp_hdr_len..tcp.msg_len]);
+}
+
+test "tcp: h1 — a SYN-ACK without MSS keeps the payload_max send bound" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    start(ip_host, 9999, 0x12345678, host_mac);
+    advance_snd(1);
+    // Options present but no MSS kind (NOPs + an unknown kind only).
+    const sa = craft_opts(ip_host, 9999, default_src_port, 0xabcdef01, 0x12345679, flag_syn | flag_ack, &.{ 1, 30, 4, 0, 0, 0, 0, 0 }, &.{});
+    try std.testing.expectEqual(Event.synack_recv, handle_rx(&sa));
+    try std.testing.expectEqual(@as(u16, 0), tcp.peer_mss);
+    try std.testing.expectEqual(payload_max, tcp.send_limit());
+}
+
+test "tcp: h1 — every malformed option shape drops the segment in its own counter" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    start(ip_host, 9999, 0x12345678, host_mac);
+    advance_snd(1);
+    for ([_][]const u8{
+        &.{ 2, 0, 0, 0 }, // a length byte of 0
+        &.{ 30, 1, 0, 0 }, // a length byte of 1
+        &.{ 30, 8, 0, 0 }, // a length that overruns the option area
+        &.{ 2, 8, 1, 2 }, // an MSS kind with the wrong length
+    }, 0..) |bad_opts, i| {
+        const sa = craft_opts(ip_host, 9999, default_src_port, 0xabcdef01, 0x12345679, flag_syn | flag_ack, bad_opts, &.{});
+        try std.testing.expectEqual(Event.none, handle_rx(&sa));
+        try std.testing.expectEqual(@as(u64, i + 1), tcp.dropped_options);
+        try std.testing.expectEqual(@as(u64, 0), tcp.dropped_malformed);
+        try std.testing.expectEqual(State.syn_sent, tcp.state); // never moves
+    }
+    // A kind byte stranded at the option area's end (no room for its
+    // length byte) — scanOptions' own bound, tested directly.
+    var mss: u16 = 0;
+    var seg: [21]u8 = undefined;
+    seg[20] = 30;
+    try std.testing.expectError(error.MalformedOptions, tcp.scanOptions(&seg, 20, 1, &mss));
+}
+
+test "tcp: h2 — the bounded OOO queue holds 8 slots, duplicates and overflow are counted" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    start(ip_host, 9999, 1, host_mac);
+    const sa = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0000, 2, flag_syn | flag_ack, &.{});
+    try std.testing.expectEqual(Event.synack_recv, handle_rx(&sa));
+
+    // Eight distinct out-of-order slots fill the queue (window 4096).
+    for (0..tcp.rx_ooo_max) |i| {
+        const s = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001 +% @as(u32, @intCast(8 + i * 4)), 2, flag_ack, "held");
+        try std.testing.expectEqual(Event.data_recv, handle_rx(&s));
+    }
+    try std.testing.expectEqual(@as(u64, 8), tcp.ooo_held);
+    try std.testing.expect(!tcp.rx_pending); // nothing delivered early
+    // A same-seq retransmit of a held segment is a duplicate, not a
+    // second slot.
+    const dup = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0009, 2, flag_ack, "held");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&dup));
+    try std.testing.expectEqual(@as(u64, 1), tcp.rx_dup);
+    try std.testing.expectEqual(@as(u64, 8), tcp.ooo_held);
+    // The ninth distinct OOO segment has no slot — dropped, counted
+    // overflow, ACKed honestly.
+    const ninth = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001 +% 200, 2, flag_ack, "nope");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&ninth));
+    try std.testing.expectEqual(@as(u64, 4), tcp.rx_overflow);
+    // A segment wholly beyond the receive window is refused malformed —
+    // never held.
+    const far = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001 +% 4096, 2, flag_ack, "far");
+    try std.testing.expectEqual(Event.none, handle_rx(&far));
+    try std.testing.expectEqual(@as(u64, 1), tcp.dropped_malformed);
+}
+
+test "tcp: h2 — overlap head-trims, the window tail trims, and a queued FIN applies contiguous" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    start(ip_host, 9999, 1, host_mac);
+    const sa = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0000, 2, flag_syn | flag_ack, &.{});
+    try std.testing.expectEqual(Event.synack_recv, handle_rx(&sa));
+
+    // A FIN riding ahead of the stream queues — it does not close yet.
+    const early_fin = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0006, 2, flag_ack | flag_fin, &.{});
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&early_fin));
+    try std.testing.expect(!tcp.peer_fin);
+
+    // A segment straddling rcv_nxt: the old head bytes are trimmed, the
+    // new tail lands — the queued FIN is still one byte ahead.
+    const straddle = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0000, 2, flag_ack, "12345");
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&straddle));
+    try std.testing.expectEqualSlices(u8, "2345", tcp.rx_payload[0..tcp.rx_len]);
+    try std.testing.expectEqual(@as(u32, 0xaaaa0005), tcp.rcv_nxt);
+    try std.testing.expect(!tcp.peer_fin);
+
+    // A segment whose tail runs past the free window is trimmed, the
+    // excess counted overflow: free window = 4096 - 4 = 4092, the
+    // segment's own offset is 2996, so room = 1096 of its 1460 bytes.
+    var huge: [payload_max]u8 = @splat(0x58);
+    const tail = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001 +% 3000, 2, flag_ack, &huge);
+    try std.testing.expectEqual(Event.data_recv, handle_rx(&tail));
+    try std.testing.expectEqual(@as(u64, 1460 - 1096), tcp.rx_overflow);
+
+    // Close the one-byte gap — the queued FIN now applies.
+    const gap = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0005, 2, flag_ack, "!");
+    try std.testing.expectEqual(Event.finack_recv, handle_rx(&gap));
+    try std.testing.expect(tcp.peer_fin);
+    try std.testing.expectEqual(@as(u32, 0xaaaa0007), tcp.rcv_nxt); // data + FIN consumed
+}
+
+test "tcp: h3 — the RTT sample feeds the estimator; retransmission backs off; Karn's rule holds" {
+    arp.own_ip = ip_guest;
+    defer arp.own_ip = .{ 0, 0, 0, 0 };
+    reset();
+    defer reset();
+    tcp.now_ticks = 100;
+    start(ip_host, 9999, 0x55555555, host_mac);
+    advance_snd(1);
+    record_pending(); // the SYN is the pending segment
+    // A SYN-ACK one tick later: the first sample (r = 1) initializes
+    // SRTT = 1, RTTVAR = 0 — RTO = 1 + max(1, 0) = 2 ticks.
+    tcp.now_ticks = 101;
+    const sa = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0000, 0x55555556, flag_syn | flag_ack, &.{});
+    try std.testing.expectEqual(Event.synack_recv, handle_rx(&sa));
+    try std.testing.expect(tcp.rtt_valid);
+    try std.testing.expectEqual(@as(u64, 1), tcp.srtt_ticks);
+    try std.testing.expectEqual(@as(u64, 2), tcp.rto_current);
+
+    // Pending data retransmits on the adaptive clock, not the fixed 3.
+    build_data_msg("ping");
+    advance_snd(4);
+    record_pending(); // tx_ticks = 101
+    tcp.now_ticks = 102; // 1 tick < RTO 2 — nothing yet
+    try std.testing.expectEqual(RtoEvent.none, poll_rto());
+    tcp.now_ticks = 103; // 2 ticks — the adaptive RTO fires
+    try std.testing.expectEqual(RtoEvent.retransmit, poll_rto());
+    try std.testing.expectEqual(@as(u64, 3), tcp.rto_current); // §5.5 backoff, clamped at the 3-tick ceiling
+
+    // Karn: the ACK of a retransmitted segment feeds NO sample.
+    const late_ack = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001, 0x5555555a, flag_ack, &.{});
+    try std.testing.expectEqual(Event.none, handle_rx(&late_ack));
+    try std.testing.expect(!tcp.tx_pending);
+    try std.testing.expectEqual(@as(u64, 1), tcp.srtt_ticks); // unchanged
+    try std.testing.expectEqual(@as(u64, 3), tcp.rto_current); // the backoff persists
+
+    // The next clean sample re-enters the estimator: a fresh send ACKed
+    // 2 ticks later updates SRTT/RTTVAR (alpha 1/8, beta 1/4).
+    build_data_msg("pong");
+    advance_snd(4);
+    record_pending(); // tx_ticks = 103
+    tcp.now_ticks = 105;
+    const clean_ack = craft_frame(ip_host, host_mac, ip_guest, test_mac, 9999, default_src_port, 0xaaaa0001, 0x5555555e, flag_ack, &.{});
+    try std.testing.expectEqual(Event.none, handle_rx(&clean_ack));
+    // r = 2: rttvar = (3x0 + |2-1|)/4 = 0; srtt = (7x1 + 2)/8 = 1.
+    try std.testing.expectEqual(@as(u64, 1), tcp.srtt_ticks);
+    try std.testing.expectEqual(@as(u64, 0), tcp.rttvar_ticks);
+    try std.testing.expectEqual(@as(u64, 2), tcp.rto_current);
 }
