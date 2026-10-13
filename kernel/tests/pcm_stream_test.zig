@@ -305,7 +305,7 @@ test "PCM model: malformed completion heads/lengths and failed status preserve d
     try invariant(&corrupt_length);
 }
 
-test "PCM model: XRUN is sticky, never inserts silence and requires explicit recovery" {
+test "PCM model: running with an empty queue is survivable (M99b: no whole-stream XRUN)" {
     var model = pcm.Model{};
     const token = try prepared(&model);
     _ = try model.submit(token, audio[0..8]);
@@ -313,18 +313,17 @@ test "PCM model: XRUN is sticky, never inserts silence and requires explicit rec
     try running(&model, token);
     const uncommitted = try model.reserve(token, 8);
     try model.complete(.{ .transfer = transfer }, 0);
-    try t.expectEqual(pcm.State.xrun, model.state);
-    try t.expectEqual(pcm.Reason.underrun, model.reason);
-    try t.expect(model.control() == null);
-    try t.expectError(error.InvalidState, model.submit(token, &audio));
-    try t.expectError(error.InvalidState, model.commit(uncommitted, audio[0..8]));
-    try t.expectError(error.InvalidState, model.start(token, 0));
-    try model.tick(20);
-    try t.expectEqual(@as(u64, 8), model.counts.accepted);
-    try model.recover(token, 20);
+    // ADR 0046 D2: starvation is per-source data under the mixer, so the
+    // model keeps running and accepts more periods — no sticky .xrun.
+    try t.expectEqual(pcm.State.running, model.state);
+    try t.expectEqual(pcm.Reason.none, model.reason);
+    _ = try model.commit(uncommitted, audio[0..8]);
+    _ = try model.submit(token, &audio);
+    try t.expectEqual(@as(u64, 8 + pcm.period_bytes + 8), model.counts.accepted);
+    try model.abort(token, 0);
     try reply(&model, .stop, true);
     try reply(&model, .release, true);
-    try t.expectEqual(pcm.Reason.underrun, model.reason);
+    try t.expectEqual(pcm.Reason.aborted, model.reason);
     const next = try prepared(&model);
     try t.expect(next.generation != token.generation);
     try t.expectEqual(pcm.Reason.none, model.reason);
@@ -541,15 +540,15 @@ test "PCM model: death in PREPARE/START and failed control transitions require r
     }
 }
 
-test "PCM model: owner death in prepared, draining, XRUN, STOP and RELEASE" {
-    for ([_]pcm.State{ .prepared, .draining, .xrun, .stopping, .releasing }) |state| {
+test "PCM model: owner death in prepared, draining, STOP and RELEASE" {
+    for ([_]pcm.State{ .prepared, .draining, .stopping, .releasing }) |state| {
         var model = pcm.Model{};
         const token = try prepared(&model);
         if (state != .prepared) {
             _ = try model.submit(token, audio[0..8]);
             const transfer = try model.publish(0);
             try running(&model, token);
-            if (state != .xrun) try model.end(token, 0);
+            try model.end(token, 0);
             if (state != .draining) try model.complete(.{ .transfer = transfer }, 0);
             if (state == .releasing) try reply(&model, .stop, true);
         }

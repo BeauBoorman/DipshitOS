@@ -37,7 +37,10 @@ pub const Limits = struct {
     period_ns: u64,
     drain_ns: u64,
 };
-// Values are exported by slot 43's B7 status ABI.
+// Values are exported by slot 43's B7 status ABI. `xrun` (9) is RETIRED:
+// M99b's mixer (ADR 0046 D2) makes starvation per-source data — the device
+// stream composes silence for an empty source instead of dying whole — so
+// the model never enters it. The value stays in the ABI numbering.
 pub const State = enum(u32) { closed = 0, preparing = 1, prepared = 2, starting = 3, running = 4, draining = 5, stopping = 6, releasing = 7, resetting = 8, xrun = 9, quarantined = 10 };
 pub const Reason = enum(u32) { none = 0, underrun = 1, owner_died = 2, aborted = 3, control_failed = 4, device_failed = 5, malformed_completion = 6, timeout = 7 };
 pub const Control = enum { prepare, start, stop, release, reset };
@@ -165,10 +168,7 @@ pub const Model = struct {
         }
         switch (ticket.kind) {
             .prepare => self.state = .prepared,
-            .start => {
-                self.state = .running;
-                self.check_empty();
-            },
+            .start => self.state = .running,
             .stop => {
                 // STOP alone does not return any DMA-owned buffers.
                 self.state = .releasing;
@@ -236,6 +236,18 @@ pub const Model = struct {
 
     pub fn submit(self: *Model, token: StreamToken, bytes: []const u8) Error!usize {
         return self.commit(try self.reserve(token, bytes.len), bytes);
+    }
+
+    /// The reservation's storage was filled in place — the M99b mixer
+    /// composes each output period directly into the slot so mixed sources
+    /// never take a bounce copy.
+    pub fn commit_in_place(self: *Model, reservation: Reservation) Error!void {
+        const slot = try self.reserved(reservation);
+        slot.state = .queued;
+        self.queue[(self.queue_head + self.queue_len) % slot_count] = reservation.slot;
+        self.queue_len += 1;
+        self.counts.accepted += slot.length;
+        self.counts.outstanding += slot.length;
     }
 
     pub fn start(self: *Model, token: StreamToken, now: u64) Error!void {
@@ -311,7 +323,7 @@ pub const Model = struct {
         self.used_idx +%= 1;
         if (self.state == .draining and self.queue_len == 0 and self.owned == 0) {
             self.stop(now);
-        } else self.check_empty();
+        }
     }
 
     pub fn end(self: *Model, token: StreamToken, now: u64) Error!void {
@@ -338,16 +350,6 @@ pub const Model = struct {
         if (self.owner == null or self.owner.? != owner) return error.InvalidToken;
         try self.time(now);
         self.note(.owner_died);
-        self.owner = null;
-        self.cancel_queued();
-        self.stop(now);
-    }
-
-    /// Explicit XRUN recovery closes the old generation before another open.
-    pub fn recover(self: *Model, token: StreamToken, now: u64) Error!void {
-        try self.authenticate(token);
-        try self.time(now);
-        if (self.state != .xrun) return error.InvalidState;
         self.owner = null;
         self.cancel_queued();
         self.stop(now);
@@ -420,14 +422,6 @@ pub const Model = struct {
         }
         self.queue_head = 0;
         self.queue_len = 0;
-    }
-
-    fn check_empty(self: *Model) void {
-        if (self.state == .running and self.queue_len == 0 and self.owned == 0) {
-            self.note(.underrun);
-            self.cancel_reservations();
-            self.state = .xrun;
-        }
     }
 
     fn finish(self: *Model) void {

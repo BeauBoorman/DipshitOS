@@ -4067,7 +4067,7 @@ test "syscall: slots 44/45 — sys_audio_volume/sys_audio_mute are bounded and p
     virtio_snd.stream_muted = false;
 }
 
-test "syscall: B7 device binding, atomic copy rollback, bounds, tokens and exit cleanup" {
+test "syscall: B7 mixer source seats, atomic copy rollback, bounds, tokens and exit cleanup" {
     const pcm = virtio_snd.playback.pcm;
     userspace.init();
     init(test_writer);
@@ -4077,15 +4077,15 @@ test "syscall: B7 device binding, atomic copy rollback, bounds, tokens and exit 
     scheduler.start();
     try std.testing.expect(scheduler.yield_current());
     var device = virtio_snd.playback.Fixture{};
-    var current = virtio_snd.playback.Playback{};
-    virtio_snd.stream = &current;
+    var current = virtio_snd.playback.Mixer{};
+    virtio_snd.mixer = &current;
     virtio_snd.snd_ready = false;
     virtio_snd.ctrl_armed = true;
     virtio_snd.tx_armed = true;
     virtio_snd.test_stream_io = device.io();
     virtio_snd.test_stream_caps = .{ .present = true, .output = true, .queue_descriptors = 32, .formats = &.{.float32}, .rates_hz = &.{48000}, .channels_min = 1, .channels_max = 2 };
     defer {
-        virtio_snd.stream = null;
+        virtio_snd.mixer = null;
         virtio_snd.test_stream_io = null;
         virtio_snd.test_stream_caps = null;
         virtio_snd.snd_ready = false;
@@ -4104,7 +4104,7 @@ test "syscall: B7 device binding, atomic copy rollback, bounds, tokens and exit 
     const request = @intFromPtr(&memory.params);
     const source = @intFromPtr(&memory.samples);
     try std.testing.expectEqual(error_result(.enxio), dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame));
-    try std.testing.expectEqual(pcm.State.closed, current.model.state);
+    try std.testing.expectEqual(pcm.State.closed, current.playback.model.state);
     virtio_snd.snd_ready = true;
     memory.params.channels = 3;
     try std.testing.expectEqual(error_result(.einval), dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame));
@@ -4112,30 +4112,58 @@ test "syscall: B7 device binding, atomic copy rollback, bounds, tokens and exit 
     try std.testing.expectEqual(error_result(.efault), dispatch(43, .{ uaccess.diagnostic_unmapped, flag | 8, 1, 0, 0, 0 }, &frame));
     const generation = dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame);
     try std.testing.expectEqual(@as(u64, 1), generation);
-    try std.testing.expectEqual(error_result(.eagain), dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame));
+    // M99b: a second open is another source seat on the same device stream,
+    // not contention — the old single-owner EAGAIN is gone.
+    const second = dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame);
+    try std.testing.expectEqual(@as(u64, 2), second);
+    try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ 0, flag, 5, second, 0, 0 }, &frame));
+    // Over-cap: the bound is four source seats; the next open is ENOSPC
+    // and counted, while teardown-in-flight still reads EAGAIN.
+    var extra: [virtio_snd.playback.source_count - 1]u64 = undefined;
+    for (&extra) |*g| {
+        g.* = dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame);
+        try std.testing.expect(g.* > 0);
+    }
+    try std.testing.expectEqual(error_result(.enospc), dispatch(43, .{ request, flag | 8, 1, 0, 0, 0 }, &frame));
+    for (extra) |g| try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ 0, flag, 5, g, 0, 0 }, &frame));
+    // Legacy playback stays excluded while a source seat is open (D5).
     try std.testing.expectEqual(error_result(.eagain), dispatch(43, .{ source, 8, 999, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(error_result(.einval), dispatch(43, .{ 0, flag, 3, generation, 0, 0 }, &frame));
     try std.testing.expectEqual(error_result(.einval), dispatch(43, .{ source, flag | 7, 2, generation, 0, 0 }, &frame));
     try std.testing.expectEqual(error_result(.enametoolong), dispatch(43, .{ source, flag | 4097, 2, generation, 0, 0 }, &frame));
     try std.testing.expectEqual(error_result(.einval), dispatch(43, .{ source, flag | 8, 2, generation + 1, 0, 0 }, &frame));
     try std.testing.expectEqual(error_result(.efault), dispatch(43, .{ uaccess.diagnostic_unmapped, flag | 4096, 2, generation, 0, 0 }, &frame));
-    try std.testing.expectEqual(@as(u64, 0), current.model.counts.accepted);
-    for (0..8) |_| try std.testing.expectEqual(@as(u64, 4096), dispatch(43, .{ source, flag | 4096, 2, generation, 0, 0 }, &frame));
-    const before = current.model.counts;
+    try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ @intFromPtr(&memory.status), flag | @sizeOf(virtio_snd.StreamStatus), 6, generation, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), memory.status.accepted);
+    try std.testing.expectEqual(@as(u32, 1), memory.status.refused);
+    try std.testing.expectEqual(@as(u32, 1), memory.status.sources);
+    try std.testing.expectEqual(@as(u32, virtio_snd.playback.source_periods), memory.status.slots);
+    // The per-source queue bound is four periods; the fifth is EAGAIN and
+    // accepts nothing.
+    for (0..virtio_snd.playback.source_periods) |_| try std.testing.expectEqual(@as(u64, 4096), dispatch(43, .{ source, flag | 4096, 2, generation, 0, 0 }, &frame));
     try std.testing.expectEqual(error_result(.eagain), dispatch(43, .{ source, flag | 4096, 2, generation, 0, 0 }, &frame));
-    try std.testing.expectEqual(before, current.model.counts);
+    try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ @intFromPtr(&memory.status), flag | @sizeOf(virtio_snd.StreamStatus), 6, generation, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 16384), memory.status.accepted);
     try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ 0, flag, 3, generation, 0, 0 }, &frame));
-    try std.testing.expectEqual(@as(usize, 8), current.model.owned);
-    try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ @intFromPtr(&memory.status), flag | 72, 6, generation, 0, 0 }, &frame));
-    try std.testing.expectEqual(@as(u64, 32768), memory.status.accepted);
-    // Real process exit, not just the model's injected death.
+    try std.testing.expectEqual(@as(usize, 8), current.playback.model.owned);
+    try std.testing.expectEqual(@as(u64, 0), dispatch(43, .{ @intFromPtr(&memory.status), flag | @sizeOf(virtio_snd.StreamStatus), 6, generation, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 16384), memory.status.accepted);
+    // Real process exit, not just the model's injected death: only this
+    // owner's seat is reaped; the shared stream drains what it already
+    // mixed and the source's snapshot keeps the owner_died reason.
+    const dead_pid = process.find_by_task(scheduler.current_id()).?;
     try std.testing.expect(scheduler.exit_current(0));
-    try std.testing.expect(current.model.owner == null);
     virtio_snd.snd_stream_poll();
-    try std.testing.expectEqual(pcm.State.closed, current.model.state);
-    try std.testing.expectEqual(pcm.Reason.owner_died, current.model.reason);
-    try std.testing.expectEqual(@as(u64, 32768), current.model.counts.canceled);
-    try std.testing.expectEqual(@as(u64, 1), current.resets);
+    for (0..pcm.slot_count) |i| device.complete(i);
+    virtio_snd.snd_stream_poll();
+    try std.testing.expectEqual(pcm.State.closed, current.playback.model.state);
+    try std.testing.expectEqual(@as(u8, 0), current.open_count);
+    const last = try virtio_snd.snd_stream_status(dead_pid, generation);
+    try std.testing.expectEqual(@as(u32, 0), last.state);
+    try std.testing.expectEqual(@as(u32, @backingInt(pcm.Reason.owner_died)), last.reason);
+    try std.testing.expectEqual(@as(u64, 16384), last.completed);
+    try std.testing.expectEqual(@as(u64, 0), last.canceled);
+    try std.testing.expectEqual(@as(u64, 0), current.playback.resets);
 }
 
 var reclaim_pool: [4100 * 4096]u8 align(4096) = undefined;
