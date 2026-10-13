@@ -66,6 +66,7 @@ const (
 type Fonts struct {
 	UI         *ttf.Face // Inter Regular (proportional)
 	Mono       *ttf.Face // Fira Code (monospace)
+	Serif      *ttf.Face // Noto Serif or the registry's serif primary; optional
 	Bold       *ttf.Face // Inter Bold; optional
 	Italic     *ttf.Face // Inter Italic; optional
 	BoldItalic *ttf.Face // Inter Bold Italic; optional
@@ -82,7 +83,7 @@ type Fonts struct {
 // FontFiles is the byte source for LoadFonts. Any field may be empty or
 // unparseable; the corresponding face is then simply absent.
 type FontFiles struct {
-	UI, Mono, Bold, Italic, BoldItalic []byte
+	UI, Mono, Serif, Bold, Italic, BoldItalic []byte
 }
 
 func parseOptionalFace(b []byte) *ttf.Face {
@@ -108,6 +109,7 @@ func LoadFonts(files FontFiles) Fonts {
 	return Fonts{
 		UI:         parseOptionalFace(files.UI),
 		Mono:       parseOptionalFace(files.Mono),
+		Serif:      parseOptionalFace(files.Serif),
 		Bold:       parseOptionalFace(files.Bold),
 		Italic:     parseOptionalFace(files.Italic),
 		BoldItalic: parseOptionalFace(files.BoldItalic),
@@ -126,6 +128,7 @@ func RegistryFonts(reg *ttf.Registry) Fonts {
 	return Fonts{
 		UI:         reg.Primary(ttf.Query{Role: "ui"}),
 		Mono:       reg.Primary(ttf.Query{Role: "mono"}),
+		Serif:      reg.Primary(ttf.Query{Role: "serif"}),
 		Bold:       reg.Primary(ttf.Query{Role: "ui", Bold: true}),
 		Italic:     reg.Primary(ttf.Query{Role: "ui", Italic: true}),
 		BoldItalic: reg.Primary(ttf.Query{Role: "ui", Bold: true, Italic: true}),
@@ -135,7 +138,8 @@ func RegistryFonts(reg *ttf.Registry) Fonts {
 
 // Loaded reports whether any TrueType face is available.
 func (f Fonts) Loaded() bool {
-	return f.UI != nil || f.Mono != nil || f.Bold != nil || f.Italic != nil || f.BoldItalic != nil
+	return f.UI != nil || f.Mono != nil || f.Serif != nil ||
+		f.Bold != nil || f.Italic != nil || f.BoldItalic != nil
 }
 
 func glyphCover(face *ttf.Face, r rune, px int) int {
@@ -190,6 +194,13 @@ func (f Fonts) face(st Style) *ttf.Face {
 	if st.Mono && f.Mono != nil {
 		return f.Mono
 	}
+	// Family wins over weight/style: the manifest ships a regular serif
+	// only, so a styled serif run keeps the serif face and the weight or
+	// style is refused by name (fonts.txt) — never a silently different
+	// family, never a synthetic embolden or shear.
+	if st.Serif && f.Serif != nil {
+		return f.Serif
+	}
 	if st.Bold && st.Italic {
 		if f.BoldItalic != nil {
 			return f.BoldItalic
@@ -214,8 +225,14 @@ func (f Fonts) face(st Style) *ttf.Face {
 // noRealBold reports whether a bold-styled run has no real bold-weight face
 // to paint it — the synthetic-strike condition. A BoldItalic face IS a real
 // bold for a {bold,italic} style, so its presence retires the strike too.
+// Serif never earns the strike: the manifest documents refusal-by-name for
+// styled serif (fonts.txt), so a serif bold keeps the regular serif face
+// unmarked rather than faking a weight that face does not have.
 func (f Fonts) noRealBold(st Style) bool {
 	if !st.Bold {
+		return false
+	}
+	if st.Serif && f.Serif != nil {
 		return false
 	}
 	if f.Bold != nil {
@@ -232,6 +249,8 @@ func (f Fonts) faceName(face *ttf.Face) string {
 		return "none"
 	case face == f.Mono:
 		return "mono"
+	case face == f.Serif:
+		return "serif"
 	case face == f.BoldItalic:
 		return "bolditalic"
 	case face == f.Bold:
@@ -269,6 +288,8 @@ func (f Fonts) chain(st Style) *ttf.Chain {
 	q := ttf.Query{Role: "ui"}
 	if st.Mono && f.Mono != nil {
 		q.Role = "mono"
+	} else if st.Serif && f.Serif != nil {
+		q.Role = "serif"
 	}
 	if st.Bold {
 		q.Bold = true

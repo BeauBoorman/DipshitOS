@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- Authored for VirelaiOS, 2026-10-08; repository LICENSE; no copied site bytes. -->
+<html><head><title>Font family resolution</title><style>
+body { font-family:Inter,sans-serif; font-size:13px; line-height:18px; }
+.serif { font-family:serif; }
+.named { font-family:"Noto Serif",serif; }
+.unknown { font-family:VirelaiMissing; }
+.serifbold { font-family:serif; font-weight:700; }
+.mono { font-family:"Fira Code",monospace; }
+.inner { font-family:serif; }
+</style></head><body>
+<p>Sans baseline (Inter).</p>
+<p class="serif">The generic serif keyword selects the serif role.</p>
+<p class="named">A shipped family name resolves to the same face.</p>
+<p class="unknown">A list of only unshipped names inherits the parent family.</p>
+<p class="serifbold">Serif with a bold request keeps the serif face.</p>
+<p class="mono">Monospace still selects the mono role.</p>
+<p class="mono">A <span class="inner">serif span</span> inside monospace resolves serif.</p>
+</body></html>

@@ -13,18 +13,39 @@
     "Inter-Bold.ttf": "288316099b1e0a47a4716d159098005eef7c0066921f34e3200393dbdb01947f",
     "Inter-BoldItalic.ttf": "948405a16cdc62701da5f4005ed068ca5f4d27061d98f7974ccfc37831d9581d",
     "Inter-Italic.ttf": "bbc051dd204b5019a1aa0bc0ae2aa8a05ab13e7a3f979fa357631dc7feb6833a",
-    "Inter-Regular.ttf": "40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82"
+    "Inter-Regular.ttf": "40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82",
+    "NotoSerif-Regular.ttf": "7f5399a928da58075d578960e9ea89afa0a4588574894b4f20f11ae4a63c5f84"
   },
   "Fixtures": {
-    "corpus": {"Hash": "3ce283b94f0cf5beb6a6486861a55c7fcf9654d9820c184fdb3ab2aa7e1aaec2"},
-    "depth": {"Hash": "dc0c1ee8809bf947d8ad620a43d5946d0733b8d87f65a56d446509d9197963ca"},
-    "fetch": {"Hash": "58b5d68199ff4ec65c3611c39e3479eed0f99e8327c004a8db686f29dbf33f87"},
-    "hostile": {"Hash": "8d1f4745edf04dd8a6a3ea346fbc16de6bf8e6472d342b015991d724fe73c688"},
-    "lists-grid": {"Hash": "d86ffc0cd335e140697f5df3f3fb42715becc1344ff8f9ae5dbec9e3632997a6"},
-    "next": {"Hash": "b5604073446ef3f74cf63fcddf842e68c102f4e748869ac9a30fcbeae92b1da3"},
-    "oliver": {"Hash": "6e5f3c185a1aa6378c91741535ae640f6530657844aa6b5e21421d253a157e6c"},
-    "oliver-grid": {"Hash": "2094f1b39731eeefbfde6859bf6b23dd99bcb8fc2830b9c0d080906a149a5890"},
-    "page": {"Hash": "f127aaa6666c19bd23d83a69359231993e9b58b1736472eba41a6d5b00245f53"},
-    "png-grid": {"Hash": "779b38765dda260a59f4504c0e4ed61287658dc22c3d8838d3676675c2b81d99"}
+    "corpus": {
+      "Hash": "3ce283b94f0cf5beb6a6486861a55c7fcf9654d9820c184fdb3ab2aa7e1aaec2"
+    },
+    "depth": {
+      "Hash": "dc0c1ee8809bf947d8ad620a43d5946d0733b8d87f65a56d446509d9197963ca"
+    },
+    "fetch": {
+      "Hash": "58b5d68199ff4ec65c3611c39e3479eed0f99e8327c004a8db686f29dbf33f87"
+    },
+    "hostile": {
+      "Hash": "8d1f4745edf04dd8a6a3ea346fbc16de6bf8e6472d342b015991d724fe73c688"
+    },
+    "lists-grid": {
+      "Hash": "d86ffc0cd335e140697f5df3f3fb42715becc1344ff8f9ae5dbec9e3632997a6"
+    },
+    "next": {
+      "Hash": "b5604073446ef3f74cf63fcddf842e68c102f4e748869ac9a30fcbeae92b1da3"
+    },
+    "oliver": {
+      "Hash": "6e5f3c185a1aa6378c91741535ae640f6530657844aa6b5e21421d253a157e6c"
+    },
+    "oliver-grid": {
+      "Hash": "2094f1b39731eeefbfde6859bf6b23dd99bcb8fc2830b9c0d080906a149a5890"
+    },
+    "page": {
+      "Hash": "f127aaa6666c19bd23d83a69359231993e9b58b1736472eba41a6d5b00245f53"
+    },
+    "png-grid": {
+      "Hash": "779b38765dda260a59f4504c0e4ed61287658dc22c3d8838d3676675c2b81d99"
+    }
   }
 }

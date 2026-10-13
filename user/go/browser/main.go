@@ -337,9 +337,9 @@ func main() {
 	}
 	a := &app{win: id, hist: newHistory(), tStart: t0}
 	a.bindCanvas(winW, winH)
-	engine, uiState, monoState := loadTextEngine()
+	engine, uiState, monoState, serifState := loadTextEngine()
 	a.text = engine
-	vi.ConsoleLine(markerFonts + engine.Name() + " ui=" + uiState + " mono=" + monoState)
+	vi.ConsoleLine(markerFonts + engine.Name() + " ui=" + uiState + " mono=" + monoState + " serif=" + serifState)
 	vi.ConsoleLine(markerText + textProbeString(engine))
 	vi.ConsoleLine(markerOpen + itoa(id))
 	// Fullscreen eligibility uses the existing seat RPC. With no responding

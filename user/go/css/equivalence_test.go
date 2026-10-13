@@ -58,9 +58,11 @@ func excludedOracle(src string) (string, int) {
 		count += len(excluded.FindAllStringIndex(src, -1))
 		src = next
 	}
-	// Exact excluded values in degradation.html, independently pinned to the
-	// authored reference, not inferred by calling the product's value parser.
-	values := regexp.MustCompile(`(?im)(^|[;{])(\s*)(width\s*:\s*calc\([^;{}]*\)|border\s*:\s*dashed[^;{}]*|display\s*:\s*grid|font-size\s*:\s*2em)\s*;?`)
+	// Exact excluded values in degradation.html and fonts-family.html,
+	// independently pinned to the authored references, not inferred by
+	// calling the product's value parser. (M99p removed font-size:2em here:
+	// it is supported now, so the oracle must keep it.)
+	values := regexp.MustCompile(`(?im)(^|[;{])(\s*)(width\s*:\s*calc\([^;{}]*\)|border\s*:\s*dashed[^;{}]*|display\s*:\s*grid|font-family\s*:\s*VirelaiMissing)\s*;?`)
 	for {
 		next := values.ReplaceAllString(src, "$1$2")
 		if next == src {
@@ -106,7 +108,7 @@ func TestUnsupportedEquivalence(t *testing.T) {
 
 func TestReferenceUnsupportedEquivalence(t *testing.T) {
 	files, err := filepath.Glob("../../../tests/fixtures/web/reference/*.html")
-	if err != nil || len(files) != 15 {
+	if err != nil || len(files) != 17 {
 		t.Fatalf("reference inventory: %d, %v", len(files), err)
 	}
 	styleRE := regexp.MustCompile(`(?s)<style>(.*?)</style>`)

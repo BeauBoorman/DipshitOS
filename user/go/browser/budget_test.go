@@ -11,7 +11,7 @@ import (
 
 func TestRequiredReferencesFitPreflightLedger(t *testing.T) {
 	files, err := filepath.Glob("../../../tests/fixtures/web/reference/*.html")
-	if err != nil || len(files) != 15 {
+	if err != nil || len(files) != 17 {
 		t.Fatal("reference inventory", err)
 	}
 	for _, path := range files {

@@ -71,7 +71,7 @@ func Paint(l *Layout, s Surface, ox, oy, vw, vh, scroll int) {
 			}
 			engine.Paint(s, ox+it.X, y, it.Text,
 				Style{Size: it.Size, FontPx: it.FontPx, LineHeightPx: it.LineHeightPx,
-					Mono: it.Mono, Bold: it.Bold, Italic: it.Italic}, it.Color, clip)
+					Mono: it.Mono, Serif: it.Serif, Bold: it.Bold, Italic: it.Italic}, it.Color, clip)
 		case ItemImage:
 			if it.Img != nil {
 				drawImage(s, clip, ox+it.X, y, it)

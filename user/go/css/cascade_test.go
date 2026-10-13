@@ -226,3 +226,53 @@ func TestUnsupportedDiagnosticsOncePerConstruct(t *testing.T) {
 		}
 	}
 }
+
+// TestRelativeFontSizesResolveInTheCascade pins M99p (#2193): em resolves
+// against the parent's computed size, rem against the root's computed size,
+// smaller/larger step the absolute-size ladder, and a computed size outside
+// 8..48 clamps with a diagnostic rather than refusing at parse — the value is
+// unknowable until computed. The renderer only ever sees resolved px.
+func TestRelativeFontSizesResolveInTheCascade(t *testing.T) {
+	doc, s, ds := compute(t, `<main id="m"><p id="em">e</p><div id="nest"><p id="inner">i</p></div>`+
+		`<p id="rem">r</p><p id="larger">l</p><p id="smaller">s</p><p id="clamp">c</p></main>`, `
+	main { font-size:20px; }
+	#em { font-size:2em; }
+	#nest { font-size:1.5em; }
+	#inner { font-size:2em; }
+	#rem { font-size:1.5rem; }
+	#larger { font-size:larger; }
+	#smaller { font-size:smaller; }
+	#clamp { font-size:10em; }
+	`)
+	sizes := map[string]int32{}
+	for _, id := range []string{"m", "em", "nest", "inner", "rem", "larger", "smaller", "clamp"} {
+		st := s.ForNode(find(doc, id))
+		if st.FontSize.Kind != webstyle.LengthPx {
+			t.Fatalf("%s font-size never resolved: %+v", id, st.FontSize)
+		}
+		sizes[id] = st.FontSize.Value
+	}
+	want := map[string]int32{
+		"m": 20, "em": 40, "nest": 30, "inner": 48, // 60 clamps to the 48px ceiling
+		"rem": 20, "larger": 26, "smaller": 16, "clamp": 48, // rem off the 13px root
+	}
+	for id, w := range want {
+		if sizes[id] != w {
+			t.Errorf("%s font-size=%d, want %d", id, sizes[id], w)
+		}
+	}
+	// Exactly the two clamps report; every other resolution is silent.
+	clamped := 0
+	for _, d := range ds {
+		if d.Text == "font-size-clamped" {
+			clamped++
+		}
+	}
+	if clamped != 2 || len(ds) != 2 {
+		t.Fatalf("want exactly the two clamp diagnostics, got %+v", ds)
+	}
+	// Normal line height recomputes off the resolved size, not the literal.
+	if got := s.ForNode(find(doc, "em")).LineHeight; got != px((40*18+12)/13) {
+		t.Fatalf("em line height=%+v", got)
+	}
+}

@@ -311,7 +311,7 @@ func (a *app) updateControlPaint() {
 					it.Text = c.labels[c.selected]
 				}
 			}
-			st := webrender.Style{Size: it.Size, Mono: it.Mono, Bold: it.Bold, Italic: it.Italic,
+			st := webrender.Style{Size: it.Size, Mono: it.Mono, Serif: it.Serif, Bold: it.Bold, Italic: it.Italic,
 				Color: it.Color, FontPx: it.FontPx, LineHeightPx: it.LineHeightPx}
 			engine := a.lay.Text
 			if engine == nil {

@@ -98,10 +98,11 @@ func TestGatePresentationExpectations(t *testing.T) {
 	qoi, pngData := swatchSources()
 	fonts := browserFonts(t)
 	if stage == "" {
-		// Five faces of provenance: the four the engine always loaded plus
-		// Inter Bold Italic (M99o), which browserFonts resolves for a {B,I}
-		// style even though none of the ten fixtures carries one.
-		if pinned.Verdict != "Approve all ten presentation expectations" || len(pinned.Fonts) != 5 {
+		// Six faces of provenance: the four the engine always loaded plus
+		// Inter Bold Italic (M99o) and Noto Serif (M99p), which browserFonts
+		// resolves for a serif style even though none of the ten fixtures
+		// carries one.
+		if pinned.Verdict != "Approve all ten presentation expectations" || len(pinned.Fonts) != 6 {
 			t.Fatal("missing owner verdict or font provenance")
 		}
 		for name, want := range pinned.Fonts {

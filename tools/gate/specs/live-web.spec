@@ -111,7 +111,7 @@ vgate_file script-m93-receipt.txt <<'EOF'
 procs receipt WEB.ELF
 EOF
 
-# M93g #1999: one boot per frozen reference page (boots 22-36). The script
+# M93g #1999: one boot per frozen reference page (boots 22-38). The script
 # bodies differ only in the share name, kept literal so the exec-order guard
 # can read every one of them.
 vgate_file script-ref-borders.txt <<'EOF'
@@ -144,6 +144,15 @@ EOF
 vgate_file script-ref-fonts.txt <<'EOF'
 exec WEB.ELF /host/FONTS.HTML
 EOF
+
+vgate_file script-ref-fonts-family.txt <<'EOF'
+exec WEB.ELF /host/FONTS-FAMILY.HTML
+EOF
+
+vgate_file script-ref-fonts-size.txt <<'EOF'
+exec WEB.ELF /host/FONTS-SIZE.HTML
+EOF
+
 vgate_file script-ref-forms.txt <<'EOF'
 exec WEB.ELF /host/FORMS.HTML
 EOF
@@ -322,7 +331,7 @@ PY
 
 vgate_setup_python <<'PY'
 # M93g #1999: stage every frozen reference page under its uppercased share
-# name for boots 22-36, and run the comparator's own self-test before a single
+# name for boots 22-38, and run the comparator's own self-test before a single
 # guest pixel is graded -- a comparator that cannot fail is not evidence.
 import json, os, shutil, subprocess, sys
 share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
@@ -341,6 +350,13 @@ if missing:
 for page in pages:
     shutil.copy(os.path.join(ref, page),
                 os.path.join(share, os.path.splitext(page)[0].upper() + ".HTML"))
+# M99p (#2193): fonts-family.html exercises font-family:serif, which needs the
+# serif face on the manifest-less path these boots run. One extra share file;
+# nothing else reads it.
+serif_src = os.path.join("image", "fonts", "NotoSerif-Regular.ttf")
+if not os.path.exists(serif_src):
+    sys.exit("serif face missing at " + serif_src)
+shutil.copy(serif_src, os.path.join(share, "NOTOSERF.TTF"))
 subprocess.check_call([sys.executable, "test_compare.py"], cwd="tools/web-proof")
 print("M93g: staged %d reference pages; comparator self-test green" % len(pages))
 PY
@@ -1368,8 +1384,11 @@ PY
 # golden predates M93f's intentional `[x]` checkbox overlay
 # (TestInitialCheckedStateIsPaintedBeforeEditing), so no guest render can equal
 # it. The comparator still enforces manifest, fonts, geometry and exact crop
-# pixels -- but against the deterministic guest hash observed on 2026-10-08,
-# identical across runs. Any drift in EITHER direction goes red.
+# pixels -- but against the deterministic guest hash re-observed on 2026-11-15
+# after M99m's coverage faces and M99o's linear-light blending moved glyph edge
+# pixels (the guest's delta vs the approved golden is still exactly the 15-px
+# checkbox-overlay region; original pin 3ba79ded... was observed 2026-10-08).
+# Any drift in EITHER direction goes red.
 vgate_run 32 -- \
     --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
     --snapshot-out '$RUN_DIR/snap-32' \
@@ -1393,7 +1412,7 @@ vgate_assert 32 snapshot 'snap-32-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'forms',
                        '--expect-actual',
-                       '3ba79dedb074e3d43ef95eaaa47ef84823dad4844082cac5203b6bca3335c440'])
+                       '7e6d860f4ffd705f541bb5c99499f6ce44e41e20d25406f226e795490230d18c'])
 PY
 
 # --- boot 33: M93g reference 'github' -- in-guest render vs approved golden --
@@ -1506,4 +1525,61 @@ vgate_assert 36 serial-absent '[EXC] parking:'
 vgate_assert 36 snapshot 'snap-36-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'wikipedia'])
+PY
+
+# --- boot 37: M99p reference 'fonts-family' -- serif role end to end ------
+# One page, one boot, one exec. font-family:serif must reach the registry's
+# serif role (Noto Serif) in the guest, not alias to Inter: the probe's
+# serif-face/serif-resolve markers prove the role loaded and the comparator
+# grades the pixels against the approved golden.
+vgate_run 37 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-37' \
+    --script '$RUN_DIR/script-ref-fonts-family.txt' \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'web: ready' --timeout 120
+
+vgate_assert 37 serial-contains 'web: url /host/FONTS-FAMILY.HTML'
+vgate_assert 37 serial-contains 'web: fonts truetype(inter+firacode) ui=truetype mono=truetype serif=truetype'
+vgate_assert 37 serial-contains 'serif-face=yes'
+vgate_assert 37 serial-contains 'serif-resolve=serif'
+vgate_assert 37 serial-contains 'web: paint items='
+vgate_assert 37 serial-contains 'web: viewport css=1280x720 x=0 y=64 w=512 h=288 s=0'
+vgate_assert 37 serial-contains 'web: settled'
+vgate_assert 37 serial-contains 'web: repaint items='
+vgate_assert 37 serial-contains 'web: ready'
+vgate_assert 37 serial-absent 'web: error'
+vgate_assert 37 serial-absent 'web: budget over'
+vgate_assert 37 serial-absent '[EXC] parking:'
+vgate_assert 37 snapshot 'snap-37-*.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'fonts-family'])
+PY
+
+# --- boot 38: M99p reference 'fonts-size' -- relative sizes + weights ------
+# One page, one boot, one exec. em/rem/smaller/larger and the absolute-size
+# keywords resolve to px in the cascade; numeric weights 100-900 map to the
+# two-weight engine (>=600 -> the real bold face). The comparator grades the
+# rendered result against the approved golden, so a wrong resolved size is a
+# wrong pixel, not a silent pass.
+vgate_run 38 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-38' \
+    --script '$RUN_DIR/script-ref-fonts-size.txt' \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'web: ready' --timeout 120
+
+vgate_assert 38 serial-contains 'web: url /host/FONTS-SIZE.HTML'
+vgate_assert 38 serial-contains 'web: fonts truetype(inter+firacode) ui=truetype mono=truetype serif=truetype'
+vgate_assert 38 serial-contains 'web: paint items='
+vgate_assert 38 serial-contains 'web: viewport css=1280x720 x=0 y=64 w=512 h=288 s=0'
+vgate_assert 38 serial-contains 'web: settled'
+vgate_assert 38 serial-contains 'web: repaint items='
+vgate_assert 38 serial-contains 'web: ready'
+vgate_assert 38 serial-absent 'web: error'
+vgate_assert 38 serial-absent 'web: budget over'
+vgate_assert 38 serial-absent '[EXC] parking:'
+vgate_assert 38 snapshot 'snap-38-*.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'fonts-size'])
 PY
