@@ -381,13 +381,23 @@ func wmRequest(kind uint8, id uint32, x, y, w, h uint16, title, selfName string)
 	}
 	if !peers.Go {
 		// Legacy seat: the single bare exchange, exactly as before the bind
-		// protocol. The Zig seats never emit an auth Pad.
+		// protocol. The Zig seats never emit an auth Pad, and x/y/w/h are
+		// real geometry on their wire.
 		req := WmRpc{Kind: kind, ID: uint8(id), Seq: nextWmSeq(), ReplyTo: uint8(peers.Self), X: x, Y: y, W: w, H: h}
 		req.SetTitle(title)
 		if IpcSend(peers.WM, req.Encode()) < 0 {
 			return WmRpc{}, false
 		}
 		return waitWmRpcAck(req.Seq, req.ReplyTo, func(WmRpc) bool { return true })
+	}
+	// #2157: under the Go seat the frame's only x/y/w/h fields ARE the auth
+	// union — a bound request carries the session token and an unbound one
+	// draws a challenge whose echo overwrites them, so nonzero geometry can
+	// never reach the wire. Refuse honestly rather than land the request
+	// with its geometry silently zeroed; carrying both needs a wire
+	// (ABI) decision the client cannot make alone.
+	if x != 0 || y != 0 || w != 0 || h != 0 {
+		return WmRpc{}, false
 	}
 	return wmRequestGo(kind, uint8(id), title, peers)
 }
@@ -480,9 +490,10 @@ func wmRequestGoTitle(kind uint8, id uint8, title [WmRpcTitleMax]byte, restoreTi
 // WmMailRequest sends one WM_RPC request to the registered WM and polls the
 // CALLER's own inbox for the matching ack. It returns whether the WM applied
 // it. A missing WM seat, an id or requester pid that does not fit the frozen
-// 8-bit wire fields, or a bounded-poll timeout returns false (honest — the
-// caller then falls back to the frozen syscall); recv reads the caller's own
-// ring, while the seat uses reply_to to route the ack.
+// 8-bit wire fields, nonzero geometry under the Go seat (the auth union owns
+// the wire's only x/y/w/h fields — #2157), or a bounded-poll timeout returns
+// false (honest — the caller then falls back to the frozen syscall); recv
+// reads the caller's own ring, while the seat uses reply_to to route the ack.
 func WmMailRequest(kind uint8, id uint32, x, y, w, h uint16, title, selfName string) bool {
 	rep, ok := wmRequest(kind, id, x, y, w, h, title, selfName)
 	return ok && rep.Applied != 0

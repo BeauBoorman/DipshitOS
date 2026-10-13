@@ -403,6 +403,70 @@ func TestPollNavRefusesWideValuesBeforeSend(t *testing.T) {
 	}
 }
 
+func TestWmMailRequestRefusesGeometryUnderGoSeat(t *testing.T) {
+	// #2157: under the Go seat the frame's only x/y/w/h fields are the
+	// M97g-F2 auth union — a bound or challenged request can never carry
+	// geometry, so a nonzero request must refuse at the call boundary
+	// instead of landing on the wire with its geometry silently zeroed.
+	f := startWmMailFake(t)
+	f.wmName = "GOTABWM.ELF"
+	const challenge = uint64(0x00deadbeef00cafe)
+	const token = uint64(0x0123456789abcdef)
+	f.replyFn = func(req WmRpc) []byte {
+		rep := WmRpc{Kind: req.Kind | WmRpcReplyFlag, ID: req.ID, Seq: req.Seq, ReplyTo: req.ReplyTo}
+		switch WmAuth(req) {
+		case 0:
+			rep.Pad = WmRpcPadChallenge
+			SetWmAuth(&rep, challenge)
+		case challenge, token:
+			rep.Pad = WmRpcPadBound
+			SetWmAuth(&rep, token)
+			rep.Applied = 1
+		default:
+			return nil
+		}
+		return rep.Encode()
+	}
+	prev := bindSetTitle
+	bindSetTitle = func(id int, s string) int64 { return 0 }
+	t.Cleanup(func() { bindSetTitle = prev })
+
+	if WmMailRequest(WmRpcKindConfig, 4, 11, 22, 330, 440, "t", "NOTE.ELF") {
+		t.Fatal("nonzero geometry under the Go seat must refuse, not silently drop")
+	}
+	if len(f.sent) != 0 {
+		t.Fatalf("refused request touched the wire: sent = %d frames", len(f.sent))
+	}
+
+	// Zero geometry keeps the challenge→bind exchange byte-identical: the
+	// union carries zero, the echoed challenge, then the session token.
+	if !WmMailRequest(WmRpcKindConfig, 4, 0, 0, 0, 0, "t", "NOTE.ELF") {
+		t.Fatal("zero-geometry config should complete the bind handshake")
+	}
+	if WmAuth(f.sent[0]) != 0 || WmAuth(f.sent[1]) != challenge {
+		t.Fatalf("unbound/echo unions = %#x/%#x want 0/%#x",
+			WmAuth(f.sent[0]), WmAuth(f.sent[1]), challenge)
+	}
+	if !WmMailRequest(WmRpcKindConfig, 4, 0, 0, 0, 0, "t", "NOTE.ELF") {
+		t.Fatal("bound zero-geometry config should still apply")
+	}
+	if WmAuth(f.sent[len(f.sent)-1]) != token {
+		t.Fatal("bound frame does not carry the session token")
+	}
+
+	// Contrast: under a legacy (Zig) seat the same call still carries
+	// geometry — those fields are real geometry there, not an auth union.
+	g := startWmMailFake(t)
+	g.autoReply = true
+	if !WmMailRequest(WmRpcKindConfig, 4, 11, 22, 330, 440, "t", "NOTE.ELF") {
+		t.Fatal("legacy-seat config request refused")
+	}
+	if g.sent[0].X != 11 || g.sent[0].Y != 22 || g.sent[0].W != 330 || g.sent[0].H != 440 {
+		t.Fatalf("legacy frame geometry = (%d,%d,%d,%d) want (11,22,330,440)",
+			g.sent[0].X, g.sent[0].Y, g.sent[0].W, g.sent[0].H)
+	}
+}
+
 func TestWmMailRequestAllocatesMonotonicSequences(t *testing.T) {
 	f := startWmMailFake(t)
 	f.autoReply = true
