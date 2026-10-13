@@ -60,9 +60,11 @@ fn panicImpl(_: []const u8, _: ?usize) noreturn {
     say("b7: PANIC\n");
     exit(71);
 }
+var phase: u8 = '0';
 fn require(ok: bool) void {
     if (!ok) {
-        say("b7: FAIL\n");
+        var buf: [24]u8 = undefined;
+        say(std.fmt.bufPrint(&buf, "b7: FAIL @{c}\n", .{phase}) catch "b7: FAIL\n");
         exit(70);
     }
 }
@@ -101,14 +103,23 @@ fn status(generation: u64) Status {
     return result;
 }
 fn closed(generation: u64) Status {
+    // A freed seat still has bytes owned by the device (composed but not yet
+    // completed): they credit the post-close snapshot asynchronously, so the
+    // identity only settles when outstanding reaches zero.
     const until = budget();
     while (counter() < until) {
         const result = status(generation);
-        if (result.state == 0) return result;
-        require(result.state != 10); // quarantined
+        if (result.state == 0 and result.outstanding == 0) return result;
+        if (result.state == 10 or result.state == 8) { // quarantined/resetting
+            var buf: [80]u8 = undefined;
+            say(std.fmt.bufPrint(&buf, "b7: terminal state={d} reason={d} @{c}\n", .{ result.state, result.reason, phase }) catch unreachable);
+            exit(70);
+        }
     }
-    require(false);
-    unreachable;
+    const last = status(generation);
+    var buf: [80]u8 = undefined;
+    say(std.fmt.bufPrint(&buf, "b7: close-timeout state={d} outstanding={d} @{c}\n", .{ last.state, last.outstanding, phase }) catch unreachable);
+    exit(70);
 }
 fn synth() void {
     for (0..512) |i| {
@@ -158,12 +169,23 @@ export fn _start(argc: u64, argv: u64) callconv(.c) noreturn {
             // sound at the same time" half. It opens its own seat on the
             // already-running device stream, streams, drains and reports
             // its own generation's counters.
+            phase = 'p';
             const generation = open();
             prefill(generation);
+            phase = 'q';
             start(generation);
             for (0..12) |_| submit(generation);
-            require(audio(4, generation, 0, 0) == 0);
+            phase = 'r';
+            {
+                const e = audio(4, generation, 0, 0);
+                if (e != 0) {
+                    var buf: [48]u8 = undefined;
+                    say(std.fmt.bufPrint(&buf, "b7: peer-end refused={d}\n", .{e}) catch unreachable);
+                    exit(70);
+                }
+            }
             const drained = closed(generation);
+            phase = 's';
             require(drained.accepted == 65536 and drained.submitted == 65536 and drained.completed == 65536);
             require(drained.canceled == 0 and drained.reason == 0);
             say("b7: peer accepted=65536 submitted=65536 completed=65536 sources=2\n");
@@ -214,17 +236,19 @@ export fn _start(argc: u64, argv: u64) callconv(.c) noreturn {
     require(status(generation).sources == 1);
     say("b7: cap=4 open5=ENOSPC refused=1 sources=1\n");
 
+    phase = 'a';
     start(generation);
     for (0..8) |_| submit(generation);
 
     // Two processes streaming at once: the peer execs PCM.BIN, opens its
     // own seat on the running device stream, and streams while we do.
+    phase = 'b';
     const peer = exec_self("peer");
     require(peer >= 0);
     {
         const until = budget();
         var seen: u32 = 0;
-        while (counter() < until and seen == 0) {
+        while (counter() < until and seen != 2) {
             seen = status(generation).sources;
         }
         require(seen == 2);
