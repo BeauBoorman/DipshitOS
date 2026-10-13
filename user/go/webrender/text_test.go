@@ -773,3 +773,251 @@ func TestH1BandWithBoldFace(t *testing.T) {
 		t.Errorf("h1 band height %d is too short", bandH)
 	}
 }
+
+// ——— M99l registry/fallback-chain tests (#2189) ———
+
+const chromeFixture = "../../../image/fonts/VirelaiChrome-Regular.ttf"
+
+// manifestFonts builds the engine over the shipped manifest shape: the four
+// UI/mono primaries plus the chrome face as the symbol tail. reads records
+// every file the registry asked for — the lazy-load witness.
+func manifestFonts(t *testing.T) (Fonts, *[]string) {
+	t.Helper()
+	paths := map[string]string{
+		"INTER.TTF":    interFixture,
+		"INTERB.TTF":   interBoldFixture,
+		"INTERI.TTF":   interItalicFixture,
+		"FIRACODE.TTF": firaFixture,
+		"CHROME.TTF":   chromeFixture,
+	}
+	specs, err := ttf.ParseManifest([]byte(
+		"INTER.TTF | role=ui | order=1\n" +
+			"INTERB.TTF | role=ui | order=2 | weight=700\n" +
+			"INTERI.TTF | role=ui | order=3 | style=italic\n" +
+			"FIRACODE.TTF | role=mono | order=1\n" +
+			"CHROME.TTF | role=symbol | order=1\n"))
+	if err != nil {
+		t.Fatalf("manifest refused: %v", err)
+	}
+	var reads []string
+	reg := ttf.NewRegistry(specs, func(file string) (*ttf.Face, error) {
+		reads = append(reads, file)
+		data, err := os.ReadFile(paths[file])
+		if err != nil {
+			return nil, err
+		}
+		return ttf.Parse(data)
+	})
+	f := RegistryFonts(reg)
+	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil {
+		t.Fatalf("the manifest engine must resolve all four primaries: %+v", f)
+	}
+	return f, &reads
+}
+
+// symbolOnlyRune finds a rune the symbol face covers that the UI-role faces
+// lack — diffed from the cmaps, never hard-coded. Mono faces are NOT
+// excluded: the ui cascade never consults them, so a rune Fira Code covers
+// is still a ui miss.
+func symbolOnlyRune(t *testing.T, f Fonts) rune {
+	t.Helper()
+	excl := []*ttf.Face{f.UI, f.Bold, f.Italic}
+	for cp := rune(0x20); cp <= 0x2FFFF; cp++ {
+		if glyphOf(f.Reg, cp) == 0 {
+			continue
+		}
+		only := true
+		for _, face := range excl {
+			if face != nil && face.GlyphIndex(cp) != 0 {
+				only = false
+				break
+			}
+		}
+		if only {
+			return cp
+		}
+	}
+	t.Fatal("no rune covered only by the symbol face within the ui cascade")
+	return 0
+}
+
+// glyphOf reports the symbol face's gid for a rune (0 = uncovered).
+func glyphOf(reg *ttf.Registry, cp rune) uint16 {
+	for _, s := range reg.Specs() {
+		if s.Role != "symbol" {
+			continue
+		}
+		if face := reg.Primary(ttf.Query{Role: "symbol"}); face != nil {
+			return face.GlyphIndex(cp)
+		}
+	}
+	return 0
+}
+
+// TestRegistryCascadePaintsTheSecondFace is the card's core assertion at the
+// engine level: a rune only the symbol face covers must paint THAT face's
+// glyph — pixel-identical to blitting the symbol face's own mask — not the
+// primary's .notdef.
+func TestRegistryCascadePaintsTheSecondFace(t *testing.T) {
+	f, reads := manifestFonts(t)
+	st := Style{Size: 1}
+	// Primaries load eagerly (ui, bold, italic, mono — the same four files
+	// the hard-coded path always read); the symbol face must NOT have been
+	// touched yet.
+	for _, r := range *reads {
+		if r == "CHROME.TTF" {
+			t.Fatalf("the symbol face loaded before any miss: %v", *reads)
+		}
+	}
+	r := symbolOnlyRune(t, f)
+	symbol := f.Reg.Primary(ttf.Query{Role: "symbol"})
+	if symbol == nil {
+		t.Fatal("no symbol face resolved")
+	}
+	text := "A" + string(r) + "A"
+	// Measure must be the per-face sum — agreement the comparator pins.
+	want := f.UI.Measure("A", ttfBodyPx)*2 + symbol.AdvancePx(r, ttfBodyPx)
+	if got := f.Measure(text, st); got != want {
+		t.Fatalf("chain measure=%d, per-face sum=%d", got, want)
+	}
+	// Paint it, then reproduce the expected pixels by hand: same baseline,
+	// the symbol face's own mask in the middle.
+	const bg = 0x000000
+	surf := newFB(120, 60, bg)
+	Paint(&Layout{Text: f}, surf, 0, 0, 120, 60, 0) // no items; sanity
+	got := newFB(120, 60, bg)
+	f.Paint(got, 4, 20, text, st, ColorText, Clip{W: 120, H: 60})
+	wantFB := newFB(120, 60, bg)
+	asc, _, _ := f.UI.LineMetrics(ttfBodyPx)
+	baseline := 20 + asc
+	pen := 4
+	for _, rr := range text {
+		face := f.UI
+		if rr == r {
+			face = symbol
+		}
+		m, adv, err := face.Glyph(face.GlyphIndex(rr), ttfBodyPx)
+		if err != nil {
+			t.Fatalf("glyph %U: %v", rr, err)
+		}
+		blitMask(wantFB, Clip{W: 120, H: 60}, pen+m.BearingX, baseline-m.BearingY, m, ColorText)
+		pen += adv
+	}
+	for i := range got.px {
+		if got.px[i] != wantFB.px[i] {
+			t.Fatalf("fallback paint diverged at pixel %d", i)
+		}
+	}
+	// And the lazy load fired exactly once, for the covering face.
+	seenChrome := 0
+	for _, rd := range *reads {
+		if rd == "CHROME.TTF" {
+			seenChrome++
+		}
+	}
+	if seenChrome != 1 {
+		t.Fatalf("the miss must lazily read the symbol face once: %v", *reads)
+	}
+	if f.Reg.Notdef() != 0 {
+		t.Error("a covered rune was counted as notdef")
+	}
+}
+
+// TestRegistryCoveredRunsMatchTheHardCodedEngine pins the comparator rule:
+// when the manifest lists only today's faces, text they cover must measure
+// and paint byte-identically through either engine — the M93 corpus cannot
+// move.
+func TestRegistryCoveredRunsMatchTheHardCodedEngine(t *testing.T) {
+	hard := loadFonts(t)
+	reg, _ := manifestFonts(t)
+	texts := []string{
+		"The quick brown fox jumps over the lazy dog 0123456789",
+		"inter, national: punctuation & marks!?!",
+		"Mi W .il",
+	}
+	styles := []Style{
+		{Size: 1}, {Size: 2},
+		{Size: 1, Bold: true}, {Size: 1, Italic: true},
+		{Size: 1, Mono: true}, {Size: 1, Bold: true, Italic: true},
+	}
+	for _, st := range styles {
+		for _, text := range texts {
+			if a, b := hard.Measure(text, st), reg.Measure(text, st); a != b {
+				t.Errorf("%+v %q: hard=%d registry=%d", st, text, a, b)
+			}
+			if a, b := hard.LineHeight(st), reg.LineHeight(st); a != b {
+				t.Errorf("%+v lineheight: hard=%d registry=%d", st, a, b)
+			}
+			fa, fb2 := newFB(400, 60, 0), newFB(400, 60, 0)
+			hard.Paint(fa, 4, 20, text, st, ColorText, Clip{W: 400, H: 60})
+			reg.Paint(fb2, 4, 20, text, st, ColorText, Clip{W: 400, H: 60})
+			for i := range fa.px {
+				if fa.px[i] != fb2.px[i] {
+					t.Fatalf("%+v %q: paint diverged at pixel %d", st, text, i)
+				}
+			}
+		}
+	}
+	if reg.Reg.Notdef() != 0 {
+		t.Error("covered text counted notdefs")
+	}
+}
+
+// TestRegistryNotdefCountsAndKeepsThePrimary: a rune NO face covers lands on
+// the primary's .notdef — it measures as the primary's own advance for that
+// rune and increments the counter the browser publishes.
+func TestRegistryNotdefCountsAndKeepsThePrimary(t *testing.T) {
+	f, _ := manifestFonts(t)
+	st := Style{Size: 1}
+	// Find a rune absent from every listed face — primaries and the symbol
+	// tail are the whole cascade for a ui run.
+	symbol := f.Reg.Primary(ttf.Query{Role: "symbol"})
+	var miss rune = -1
+	for cp := rune(0x20); cp <= 0x2FFFF; cp++ {
+		if f.UI.GlyphIndex(cp) == 0 && f.Mono.GlyphIndex(cp) == 0 &&
+			f.Bold.GlyphIndex(cp) == 0 && f.Italic.GlyphIndex(cp) == 0 &&
+			(symbol == nil || symbol.GlyphIndex(cp) == 0) {
+			miss = cp
+			break
+		}
+	}
+	if miss < 0 {
+		t.Fatal("no uncovered rune found in the scan range")
+	}
+	text := "A" + string(miss)
+	if got, want := f.Measure(text, st), f.UI.Measure(text, ttfBodyPx); got != want {
+		t.Fatalf("a missed rune must measure on the primary: got=%d primary=%d", got, want)
+	}
+	if f.Reg.Notdef() != 1 {
+		t.Fatalf("Notdef=%d, want exactly one counted miss", f.Reg.Notdef())
+	}
+	// The painted pixels are the primary's .notdef glyph — identical to
+	// painting the rune on the primary directly.
+	a := newFB(120, 60, 0)
+	f.Paint(a, 4, 20, text, st, ColorText, Clip{W: 120, H: 60})
+	b := newFB(120, 60, 0)
+	asc, _, _ := f.UI.LineMetrics(ttfBodyPx)
+	pen := 4
+	for _, rr := range text {
+		m, adv, _ := f.UI.Glyph(f.UI.GlyphIndex(rr), ttfBodyPx)
+		blitMask(b, Clip{W: 120, H: 60}, pen+m.BearingX, 20+asc-m.BearingY, m, ColorText)
+		pen += adv
+	}
+	for i := range a.px {
+		if a.px[i] != b.px[i] {
+			t.Fatalf("the missed rune did not paint the primary's .notdef (pixel %d)", i)
+		}
+	}
+}
+
+// TestRegistryZeroValueIsBitmapHonest: a nil registry degrades exactly like a
+// failed hard-coded load — bitmap metrics, honest name.
+func TestRegistryZeroValueIsBitmapHonest(t *testing.T) {
+	f := RegistryFonts(nil)
+	if f.Loaded() || f.Name() != "bitmap8x8" {
+		t.Fatalf("a nil registry must be the fontless engine, got %q", f.Name())
+	}
+	if f.Measure("W", Style{Size: 1}) != (Bitmap{}).Measure("W", Style{Size: 1}) {
+		t.Error("nil-registry measure must be the bitmap metric")
+	}
+}

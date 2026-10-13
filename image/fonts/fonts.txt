@@ -1,0 +1,30 @@
+# VirelaiOS font registry manifest (M99l, #2189), staged as /host/FONTS.TXT.
+#
+# Wire format follows the APPS.TXT v2 shape: pipe-separated fields, '#' is a
+# comment, blank lines are skipped. Field 1 is the share file name (the 8.3
+# names frozen by M69d #1531 D1); the rest are order-insensitive `key=value`
+# fields, and unknown keys are ignored so a newer manifest still decodes.
+#
+#   FILE.TTF | role=ui|mono|serif|symbol | order=N | weight=N | style=normal|italic
+#
+#   role    the slot a consumer asks for. symbol is the role nothing asks for
+#           directly: symbol faces are the tail of EVERY role's cascade.
+#   order   cascade rank inside a role (default 0); the lowest order is the
+#           role's default face. Rows are order-insensitive on the wire.
+#   weight  400 normal, 700 bold — a numeric weight, not a name. Absent = 400.
+#   style   normal | italic. Absent = normal.
+#
+# Coverage is never declared here: the registry reads each face's cmap at
+# load, so the file cannot lie about what a face covers. A rune the primary
+# lacks falls through the role's other faces in order, then the symbol faces;
+# one nothing covers paints the primary's .notdef and is counted
+# (`fonts: notdef=N`), never dropped.
+#
+# Only the Go engine reads this manifest (ADR 0034 amendment A): the frozen
+# Zig paths keep their hard-coded face list, and a missing or refused manifest
+# falls back to that same set.
+INTER.TTF    | role=ui     | order=1 | weight=400 | style=normal
+INTERB.TTF   | role=ui     | order=2 | weight=700 | style=normal
+INTERI.TTF   | role=ui     | order=3 | weight=400 | style=italic
+FIRACODE.TTF | role=mono   | order=1 | weight=400 | style=normal
+CHROME.TTF   | role=symbol | order=1 | weight=400 | style=normal
