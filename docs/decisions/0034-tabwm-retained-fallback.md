@@ -1,6 +1,7 @@
 # ADR 0034: TABWM.BIN is retained as the Zig fallback seat
 
-- Status: ACCEPTED
+- Status: ACCEPTED · amended M99n #2191 (2026-10-13): the engine behind the
+  Zig seat is frozen too — Amendment A
 - Date: 2026-09-19
 - Issue: #1451 (this document) · milestone #1436 (M68) · card M68c · closes the
   `TABWM.BIN` row of M60's ledger (#1297)
@@ -133,3 +134,86 @@ the fail-closed-plus-heal path (M66b/#1444).
 Spec: `tools/gate/specs/go-wm-default.spec`. The settings contract is
 `kernel/src/settings.zig` (header lines 13–14, the `wm` row at 52, `wm_default`
 at 77, `WmSeat` at 182–191).
+
+## Amendment A — M99n #2191: the engine behind the Zig seat is frozen too
+
+- Date: 2026-10-13 · card: #2191 (M99 depth-pass index #2178)
+
+**Decision: the two TrueType engines converge by freezing, not by parity.**
+`user/src/lib/font_ttf.zig` is the fallback and build-time engine, frozen at
+its current surface; `virelai/ttf` (Go) is the only engine that gains new
+typography. M99l's registry, M99m's coverage faces and M99o's quality work
+are all Go-only.
+
+### What the frozen engine is
+
+The pinned divergences — each enforced by a test, so growing the engine
+lands as a deliberate, reviewed diff rather than silent drift:
+
+- **No GPOS kerning.** `measure_string` is the design-unit sum scaled once.
+  The Go engine reads GPOS `kern` but applies it only inside `ShapeLatin`
+  (Inter pair 'A','V' is -140 design units — visible as a pixel at the
+  atlas sizes), so Go's own `Measure` stays un-kerned and the engines can
+  hold parity on the shared path.
+- **No GSUB ligatures.** Every codepoint is an independent cmap lookup.
+- **BMP only.** The subtable selector prefers cmap format 4, so codepoints
+  above U+FFFF resolve to `.notdef` even though both shipped faces carry
+  real format-12 coverage there (Inter maps U+1F130, Fira Code U+1D539 —
+  both Go-reachable).
+
+Simple and composite glyf outlines, anti-aliased rasterizing, and the
+metrics the atlas generator needs are all already inside the frozen
+surface — freezing costs nothing a dependent uses.
+
+### The four dependents stay put
+
+1. **`font_atlas_gen.zig` → `kernel/src/font_atlas_data.zig`.** Stays on
+   the Zig engine permanently: it is a host-run codegen whose output is a
+   checked-in byte fixture, so a Go port would buy nothing. It now also
+   emits the parity fixture (below).
+2. **`TABWM.BIN`** — this ADR's seat — through `ui.init_fonts`. The frozen
+   seat keeps the frozen engine; D3's bug-fix-only posture extends to it.
+3. **`LIBFONT.SO`** in the dynamic-linking fixture. It exists to prove
+   freestanding `.so` linking, not typography; the frozen engine is all it
+   needs.
+4. **The ADR 0038 Zig app portfolio** through `user/src/lib/ui`. Zig apps
+   get the frozen engine; an app that needs kerning, ligatures or plane-1
+   coverage is a Go app.
+
+### Cross-engine parity is pinned, not assumed
+
+`zig run user/src/lib/font_atlas_gen.zig` emits
+`user/go/ttf/testdata/zig-engine-advances.tsv`: the frozen engine's glyph
+ids and advances for printable ASCII at the kernel atlas's 11/13/17 px
+ladder on Inter and Fira Code. `zig test user/src/lib/font_atlas_gen.zig`
+tripwires the fixture against a fresh dump, and `go test ./ttf`'s
+`TestZigEngineParity` asserts the Go engine reproduces every row. The two
+engines agreeing on a shared face is what lets the fallback seat and the
+Go seat measure the same text to the same width.
+
+### Does the Zig engine read M99l's manifest?
+
+**No.** `image/fonts/fonts.txt` is the Go registry's input; the Zig
+engine's consumers keep their hard-coded face paths (`ui.init_fonts`, the
+generator's `ttf_path`). The fallback chain, lazy loading and run
+splitting M99l builds are Go-side machinery the frozen paths never grow.
+
+### Why not parity (the rejected option)
+
+Bringing the Zig engine to Go parity means porting GPOS `kern`, a real
+format-12 preference and ideally GSUB `liga`, then maintaining both
+implementations forever — every M99o change written twice, every shaping
+subtlety debugged in two languages. The beneficiaries would be the frozen
+seat, a linking fixture, a build-time generator and the Zig app portfolio;
+none of them ships text that needs it. The cost is permanent and the
+capability gain on the paths that pay it is zero — the same asymmetry D4
+used to keep the seat. Revisit only if a Zig-seated consumer gains a real
+kerning or plane-1 requirement.
+
+### Consequences for ADR 0030
+
+"Go is EL0" stays the direction of travel — no new Zig typography work.
+ADR 0038 already carved out the Zig app portfolio, so this amendment is
+the explicit record that two text engines exist at EL0 with different
+postures: Go's grows, Zig's is frozen at bug-fix level — the same posture
+this ADR set for the seat that hosts it.
