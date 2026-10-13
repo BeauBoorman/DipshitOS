@@ -773,6 +773,63 @@ simulation. The `gosh.run` capture contract is pinned as observed
 stdout; an external app's fd-1 output bypasses it and `AGENTD.OUT` is
 written empty; a pipeline naming an external refuses before any write.
 
+## Virtio GPU 3D (M102, issue #2160)
+
+`live-gpu3d` is the M102f2 class-B acceptance gate: eight independent
+boots, each driving a guest Go app (`GPUTRIANGLE.ELF`) through the real
+path — Go seat -> kernel GPU3D broker -> the opt-in custom-Virtio render
+device (`--gpu3d-metal`, PCI DID `0x1083`, private VIR1 capset) -> a
+Metal backend on the host — with the rendered surface CPU-composited
+into the ordinary 2D scanout by the guest seat itself. This is a custom
+VZ/Metal device implementing the project's own bounded VirGL-shaped
+subset: native VZ exposes no 3D support at all, and nothing here is
+QEMU, Venus or OpenGL.
+
+| run | proves |
+|-----|--------|
+| 01 | triangle: declare/open/clear/triangle/present markers, the receipt TSV's submitted/completed/published rows, a real host Metal draw (`draws=1 gpu-completions=1`), the raw BGRA readback export against the pinned oracle, and the final scanout's red interior over the non-red clear field |
+| 02 | mixed: the 64x48 render inside the larger surface — every margin pixel is the app's own 2D fill (guard rects) |
+| 03 | resize: a second context generation at 96x64; both extent exports verified (the new frame cannot be the old one republished) |
+| 04 | close/reuse: a second window generation publishes fresh pixels after a full close; counters back to baseline |
+| 05 | native-only: no `--gpu3d-metal` -> named `unsupported`, the 2D seat still presents, zero 3D receipts on the share |
+| 06 | malformed/auth: the invalid battery's named `invalid`/`closed` refusals, then a forged kind-17 frame refused at the seat's rpc seam — zero broker submissions for it |
+| 07 | wrong/stale fence: the injected bad fence is caught (`stale-fences=1 retired-pending=1`), the frame is never published, 2D keeps ticking |
+| 08 | stall/retirement: the suppressed fence hits the 2 s deadline -> named timeout + quarantine; a second exec drains and opens a fresh context |
+
+Host prerequisites — build the guest ELFs first; the spec refuses a
+missing one by name:
+
+```bash
+bash tools/go/build-gotabwm.sh
+bash tools/go/build-gputriangle.sh
+just gate live-gpu3d
+```
+
+Pixel evidence is the independent comparator
+(`tools/gpu3d-proof/compare.py`, scene oracles in
+`test/fixtures/gpu3d/pixels.json`): the raw BGRA export is rasterized
+against pinned geometry — interior colour, clear field, guard bands,
+opaque alpha — sharing no code with the renderer. Its self-test suite
+(`python3 -m unittest tools.gpu3d-proof.test_compare`, 18 cases)
+rejects blank, clear-only, channel-swapped, vertically flipped,
+wrong-stride, stale and occlusion-wrong images and accepts the good
+fixtures.
+
+Named limits, so a green run is not read as more than it is:
+
+- **CPU composition.** The 3D surface reaches the screen through the
+  guest's surface mapping and the ordinary 2D present path — a real
+  Metal draw read back and composited in software, not a hardware
+  scanout plane and not shared-texture zero-copy.
+- **Private profile only.** VIR1 is the project's own bounded subset —
+  no Venus/VirGL conformance and no OpenGL claims are made, and none are
+  tested.
+- **Opt-in only.** Without `--gpu3d-metal` the boot is byte-identical to
+  a native-only boot (run 05 pins `unsupported` with the 2D seat green);
+  the render device never changes the default VM's device list.
+- These are class-B gates (VZ + Metal on Apple silicon): they run where
+  the class-B fleet runs, not on every push.
+
 ## Verification sequence
 
 Every `zig` command below must resolve to the pinned compiler: the version +
