@@ -41,7 +41,7 @@ func TestEveryLonghandValidInvalidAndEdge(t *testing.T) {
 				wantEdge.length = px(-32768)
 			case pFontFamily:
 				valid, edge, invalid = `"Fira Code"`, "serif", `"missing"`
-				want.enum, wantEdge.enum = uint8(webstyle.FontMono), uint8(webstyle.FontSans)
+				want.enum, wantEdge.enum = uint8(webstyle.FontMono), uint8(webstyle.FontSerif)
 			case pFontSize:
 				edge, invalid = "48px", "49px"
 				wantEdge.length = px(48)
@@ -179,7 +179,8 @@ func TestAdditionalValueEdges(t *testing.T) {
 		"width:auto", "height:auto", "max-width:none", "max-height:none",
 		"margin:auto", "margin:100%", "width:32768px", "font-size:8px",
 		"line-height:normal", "line-height:1px", "flex-basis:auto", "color:currentColor",
-		"color:#ABCDEF", "font-weight:600", "font-weight:500",
+		"color:#ABCDEF", "font-weight:600", "font-weight:500", "font-weight:550",
+		"font-size:large", "font-size:2em", "font-size:0.85rem", "font-size:larger",
 		`font-family:Remote, "Fira Code", Inter`,
 		`font-family:Fira /*comment*/ Code`,
 	} {
@@ -192,7 +193,7 @@ func TestAdditionalValueEdges(t *testing.T) {
 		"width:32769px", "width:1.5px", "width:1", "height:1%", "min-height:100%",
 		"font-size:7px", "line-height:0", "line-height:1", "margin:-1%",
 		"gap:32769px", "border-width:-1px", "color:#12", "color:rgb(256,0,0)",
-		"color:rgb(10%,0,0)", "color:rgb (0,0,0)", "font-size:large", "font-weight:550",
+		"color:rgb(10%,0,0)", "color:rgb (0,0,0)", "font-size:1.234em", "font-weight:50",
 		`font-family:"Inter" Remote`, "font-family:monospace,", "width:calc(1px + 2px)",
 	} {
 		p := newParser(source)
@@ -224,6 +225,42 @@ func TestFontFallbackPreservesWinnerAndWarnsOnce(t *testing.T) {
 		`span{font-family:monospace;font-family:In/**/ter}`)
 	if len(ds) != 1 || s.ForNode(find(doc, "target")).FontFamily != webstyle.FontMono {
 		t.Fatal("comment-separated identifiers joined into a known font", ds)
+	}
+}
+
+// TestFontFamilyListMapping pins M99p (#2193): generic and shipped names map
+// to the family's registry role, an unshipped name warns and yields to the
+// next list entry, and an unshipped generic degrades to sans with its own
+// diagnostic.
+func TestFontFamilyListMapping(t *testing.T) {
+	for _, tc := range []struct {
+		list string
+		want webstyle.FontFamily
+	}{
+		{"serif", webstyle.FontSerif},
+		{`"Noto Serif", serif`, webstyle.FontSerif},
+		{"VirelaiMissing, serif", webstyle.FontSerif},
+		{"VirelaiMissing, Inter", webstyle.FontSans},
+		{"ui-monospace", webstyle.FontMono},
+		{"system-ui", webstyle.FontSans},
+		{"cursive", webstyle.FontSans},
+		{"fantasy", webstyle.FontSans},
+	} {
+		doc, s, _ := compute(t, `<span id="target">text</span>`,
+			`span{font-family:`+tc.list+`}`)
+		if got := s.ForNode(find(doc, "target")).FontFamily; got != tc.want {
+			t.Errorf("font-family:%s = %d, want %d", tc.list, got, tc.want)
+		}
+	}
+	_, _, ds := compute(t, `<span id="target">text</span>`,
+		`span{font-family:VirelaiMissing, serif}`)
+	if len(ds) != 1 || ds[0].Text != "font-family-fallback VirelaiMissing" {
+		t.Fatal("unshipped name must warn once and yield", ds)
+	}
+	_, _, ds = compute(t, `<span id="target">text</span>`, `span{font-family:cursive}`)
+	if len(ds) != 1 || ds[0].Text != "font-family-generic cursive" ||
+		ds[0].Kind != webstyle.DiagnosticUnsupported {
+		t.Fatal("unshipped generic must warn as unsupported, not as missing", ds)
 	}
 }
 

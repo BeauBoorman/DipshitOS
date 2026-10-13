@@ -29,6 +29,7 @@ type Style struct {
 	FontPx       int    // positive CSS px; zero retains logical-size compatibility
 	LineHeightPx int    // positive used CSS line height; zero selects engine metrics
 	Mono         bool   // fixed-width face
+	Serif        bool   // serif face (registry role "serif"; e.g. Noto Serif)
 	Bold         bool   // Inter Bold when loaded; else a 1-px synthetic strike
 	Italic       bool   // Inter Italic when loaded; else the UI face
 	Align        int    // 0 left, 1 center

@@ -19,6 +19,7 @@ const (
 	fontItalicPath     = "/host/INTERI.TTF"
 	fontBoldItalicPath = "/host/INTERBI.TTF"
 	fontMonoPath       = "/host/FIRACODE.TTF"
+	fontSerifPath      = "/host/NOTOSERF.TTF"
 
 	// fontManifestPath is the M99l registry manifest, staged from
 	// image/fonts/fonts.txt. It is Go-registry input only — the frozen Zig
@@ -108,19 +109,20 @@ func loadRegistryEngine() (webrender.Fonts, string, bool) {
 // keeps today's four hard-coded faces. Either way the serial line says which
 // path was taken, so a gate can assert the manifest was honored rather than
 // silently ignored.
-func loadTextEngine() (webrender.Fonts, string, string) {
+func loadTextEngine() (webrender.Fonts, string, string, string) {
 	f, marker, ok := loadRegistryEngine()
 	vi.ConsoleLine("fonts: " + marker)
 	if ok {
-		return f, faceState(f.UI), faceState(f.Mono)
+		return f, faceState(f.UI), faceState(f.Mono), faceState(f.Serif)
 	}
 	ui := readWholeFile(fontUIPath, maxFontBytes)
 	mono := readWholeFile(fontMonoPath, maxFontBytes)
+	serif := readWholeFile(fontSerifPath, maxFontBytes)
 	bold := readWholeFile(fontBoldPath, maxFontBytes)
 	italic := readWholeFile(fontItalicPath, maxFontBytes)
 	boldItalic := readWholeFile(fontBoldItalicPath, maxFontBytes)
-	f = webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic, BoldItalic: boldItalic})
-	return f, faceState(f.UI), faceState(f.Mono)
+	f = webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Serif: serif, Bold: bold, Italic: italic, BoldItalic: boldItalic})
+	return f, faceState(f.UI), faceState(f.Mono), faceState(f.Serif)
 }
 
 // textProbeString is the Inter-or-grid probe, published on the serial line.
@@ -139,8 +141,14 @@ func textProbeString(t webrender.TextEngine) string {
 	body := webrender.Style{Size: 1, Color: webrender.ColorText}
 	h1 := webrender.Style{Size: 2, Color: webrender.ColorText}
 	mono := webrender.Style{Size: 1, Mono: true}
+	serif := webrender.Style{Size: 1, Serif: true}
 	boldFace, boldHeavier, italicFace, biFace, biResolve := "no", "no", "no", "no", "none"
+	serifFace, serifResolve := "no", "none"
 	if f, ok := t.(webrender.Fonts); ok {
+		if f.Serif != nil {
+			serifFace = "yes"
+		}
+		serifResolve = f.ResolvedName(serif)
 		if f.Bold != nil {
 			boldFace = "yes"
 			if f.BoldHeavier() {
@@ -170,7 +178,9 @@ func textProbeString(t webrender.TextEngine) string {
 		" bold-heavier=" + boldHeavier +
 		" italic-face=" + italicFace +
 		" bi-face=" + biFace +
-		" bi-resolve=" + biResolve
+		" bi-resolve=" + biResolve +
+		" serif-face=" + serifFace +
+		" serif-resolve=" + serifResolve
 }
 
 // resolveImage returns only preflighted sources during layout. Resource reads

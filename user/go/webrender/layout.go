@@ -30,6 +30,7 @@ type Item struct {
 	Size                 int // font scale (logical; the engine maps it to a pixel size)
 	FontPx, LineHeightPx int // positive CSS used sizes; zero is the legacy path
 	Mono                 bool
+	Serif                bool
 	Bold                 bool
 	Italic               bool
 	Color                uint32
@@ -282,7 +283,12 @@ func (b *builder) block(box *Box, st Style, indent int) {
 
 func mergeInline(parent, child Style) Style {
 	out := child
-	out.Mono = child.Mono || parent.Mono
+	// Family is exclusive, so it cannot OR-merge like weight: the cascade
+	// resolves each node's FontFamily, and a styled child always carries its
+	// own. A child carrying neither flag inherits the parent's family.
+	if !child.Mono && !child.Serif {
+		out.Mono, out.Serif = parent.Mono, parent.Serif
+	}
 	out.Bold = child.Bold || parent.Bold
 	out.Italic = child.Italic || parent.Italic
 	if out.Color == 0 {
@@ -457,7 +463,7 @@ func (b *builder) flushInline() {
 		}
 		b.items = append(b.items, Item{
 			Kind: ItemText, X: x, Y: y, W: sg.w, H: lh,
-			Text: sg.text, Size: sg.st.Size, Mono: sg.st.Mono, Bold: sg.st.Bold, Italic: sg.st.Italic,
+			Text: sg.text, Size: sg.st.Size, Mono: sg.st.Mono, Serif: sg.st.Serif, Bold: sg.st.Bold, Italic: sg.st.Italic,
 			Color: color, Target: sg.target,
 		})
 		if sg.target != "" && len(b.links) < MaxItems {

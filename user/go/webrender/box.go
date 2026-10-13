@@ -404,6 +404,7 @@ func textStyle(s webstyle.ComputedStyle) Style {
 		color = s.Color.RGBA & 0xffffff
 	}
 	return Style{Size: 1, FontPx: px, LineHeightPx: lh, Mono: s.FontFamily == webstyle.FontMono,
+		Serif: s.FontFamily == webstyle.FontSerif,
 		Bold: s.FontWeight == webstyle.WeightBold, Italic: s.FontStyle == webstyle.StyleItalic, Color: color}
 }
 
@@ -780,7 +781,7 @@ func (b *boxLayout) inline(parent *Box) int {
 		}
 		it := Item{Box: source, Kind: ItemText, X: parent.Content.X + x, Y: parent.Content.Y + y, W: token.w, H: token.st.LineHeightPx,
 			Text: token.text, Size: 1, FontPx: token.st.FontPx, LineHeightPx: token.st.LineHeightPx, Mono: token.st.Mono,
-			Bold: token.st.Bold, Italic: token.st.Italic, Color: token.st.Color, Target: token.target}
+			Serif: token.st.Serif, Bold: token.st.Bold, Italic: token.st.Italic, Color: token.st.Color, Target: token.target}
 		b.emit(it)
 		if token.target != "" && !b.stopped {
 			b.out.Links = append(b.out.Links, Link{X: it.X, Y: it.Y, W: it.W, H: it.H, Target: token.target})

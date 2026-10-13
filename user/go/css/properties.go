@@ -260,6 +260,38 @@ func integer(t token) (int32, bool) {
 	return int32(n), err == nil
 }
 
+// centis parses a non-negative decimal ("1.5", "0.75", "2") into hundredths —
+// the stored unit for em/rem font-size values. Empty, signed, over-precise
+// (more than two fraction digits) or overflowing inputs fail.
+func centis(s string) (int32, bool) {
+	n, frac, fracDigits, seenDot := int64(0), int64(0), 0, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' && !seenDot {
+			seenDot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		if seenDot {
+			frac, fracDigits = frac*10+int64(c-'0'), fracDigits+1
+		} else {
+			n = n*10 + int64(c-'0')
+		}
+		if n > 10000 || fracDigits > 2 {
+			return 0, false
+		}
+	}
+	if len(s) == 0 || seenDot && fracDigits == 0 || !seenDot && len(s) == 0 {
+		return 0, false
+	}
+	if fracDigits == 1 {
+		frac *= 10
+	}
+	return int32(n*100 + frac), true
+}
+
 func length(t token, percent, auto, negative bool) (webstyle.Length, string) {
 	s := lower(t.text)
 	if t.kind == tIdent && s == "auto" && auto {
@@ -325,13 +357,61 @@ func (p *parser) single(id propertyID, ts []token, start token) (value, string) 
 			"table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell", "table-caption")
 	case pFontStyle:
 		return enumValue(ts, "normal", "italic")
+	case pFontSize:
+		// Absolute keywords use the CSS absolute-size ladder scaled so
+		// medium = the frozen 13px initial: factors {0.6,0.75,0.89,1,1.2,
+		// 1.5,2} land on {8,10,12,13,16,20,26}. em/rem keep hundredths and
+		// resolve in the cascade against parent/root computed size;
+		// smaller/larger step the same ladder off the parent's size.
+		if len(ts) == 1 {
+			t := ts[0]
+			if t.kind == tIdent {
+				switch lower(t.text) {
+				case "xx-small":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 8}}, ""
+				case "x-small":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 10}}, ""
+				case "small":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 12}}, ""
+				case "medium":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 13}}, ""
+				case "large":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 16}}, ""
+				case "x-large":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 20}}, ""
+				case "xx-large":
+					return value{length: webstyle.Length{Kind: webstyle.LengthPx, Value: 26}}, ""
+				case "smaller":
+					return value{length: webstyle.Length{Kind: webstyle.LengthFontSmaller}}, ""
+				case "larger":
+					return value{length: webstyle.Length{Kind: webstyle.LengthFontLarger}}, ""
+				}
+			}
+			if t.kind == tDimension {
+				s := lower(t.text)
+				for _, u := range []struct {
+					suffix string
+					kind   webstyle.LengthKind
+				}{{"rem", webstyle.LengthRem}, {"em", webstyle.LengthEm}} {
+					if strings.HasSuffix(s, u.suffix) {
+						if c, ok := centis(s[:len(s)-len(u.suffix)]); ok && c > 0 {
+							return value{length: webstyle.Length{Kind: u.kind, Value: c}}, ""
+						}
+						return value{}, "invalid-value"
+					}
+				}
+			}
+		}
 	case pFontWeight:
 		if len(ts) == 1 {
 			s := lower(ts[0].text)
 			if ts[0].kind == tIdent && (s == "normal" || s == "bold") {
 				return enumValue(ts, "normal", "bold")
 			}
-			if n, ok := integer(ts[0]); ok && n >= 100 && n <= 900 && n%100 == 0 {
+			// Any integer weight 100-900 (M99p #2193): 600 and up resolve to
+			// the real bold face, below is normal — the two-weight engine's
+			// honest answer, not a clamped lie.
+			if n, ok := integer(ts[0]); ok && n >= 100 && n <= 900 {
 				if n >= 600 {
 					return value{enum: uint8(webstyle.WeightBold)}, ""
 				}
@@ -430,14 +510,29 @@ func (p *parser) family(ts []token, start token) (value, string) {
 		if !valid {
 			return value{}, "invalid-value"
 		}
+		// Generic families map per M99p (#2193): system-ui/ui-sans-serif are
+		// the sans face, ui-monospace the mono face, cursive/fantasy degrade
+		// to sans with a diagnostic. Named families select the registry role
+		// for that shipped family: Inter->sans, Fira Code->mono,
+		// Noto Serif->serif. A name nobody shipped warns and yields to the
+		// next list entry; a list with no known name drops the declaration.
 		switch lower(name) {
-		case "inter", "sans-serif", "serif":
+		case "inter", "sans-serif", "system-ui", "ui-sans-serif":
 			if !known {
 				chosen, known = value{enum: uint8(webstyle.FontSans)}, true
 			}
-		case "fira code", "monospace":
+		case "fira code", "firacode", "monospace", "ui-monospace":
 			if !known {
 				chosen, known = value{enum: uint8(webstyle.FontMono)}, true
+			}
+		case "serif", "noto serif":
+			if !known {
+				chosen, known = value{enum: uint8(webstyle.FontSerif)}, true
+			}
+		case "cursive", "fantasy":
+			p.warn(webstyle.DiagnosticUnsupported, start, "font-family-generic "+name)
+			if !known {
+				chosen, known = value{enum: uint8(webstyle.FontSans)}, true
 			}
 		default:
 			p.warn(webstyle.DiagnosticUnsupported, start, "font-family-fallback "+name)

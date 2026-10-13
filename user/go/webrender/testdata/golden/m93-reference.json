@@ -5,7 +5,8 @@
     "Inter-Bold.ttf": "288316099b1e0a47a4716d159098005eef7c0066921f34e3200393dbdb01947f",
     "Inter-BoldItalic.ttf": "948405a16cdc62701da5f4005ed068ca5f4d27061d98f7974ccfc37831d9581d",
     "Inter-Italic.ttf": "bbc051dd204b5019a1aa0bc0ae2aa8a05ab13e7a3f979fa357631dc7feb6833a",
-    "Inter-Regular.ttf": "40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82"
+    "Inter-Regular.ttf": "40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82",
+    "NotoSerif-Regular.ttf": "7f5399a928da58075d578960e9ea89afa0a4588574894b4f20f11ae4a63c5f84"
   },
   "Images": {
     "borders": {"Native":"2b563ddc3397b117813d33aa5aef3efee0f63b25f0d4f3c433532db6afdf1ced","Presentation":"8d30863aaa483945eebfc3338b0aacb3fe3c9549e1ac710450d97c4b175c620a","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
@@ -14,10 +15,12 @@
     "boxes-collapse": {"Native":"830a61ec3e25d064f20841ac6a80123be7122181800456876f86178e69b147d8","Presentation":"02dffb6f688b7d9e3f7aaf008c79fe90fb33799f7aeed286857ce4e86f0aa5c2","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "boxes-flex": {"Native":"830a61ec3e25d064f20841ac6a80123be7122181800456876f86178e69b147d8","Presentation":"02dffb6f688b7d9e3f7aaf008c79fe90fb33799f7aeed286857ce4e86f0aa5c2","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "colors": {"Native":"c0fd0fe861e53b76489dc5ada349e186b47137d9dc373f14a0dcdb16e0c888a2","Presentation":"7768bae301fa3c78683847511cda2e93ad361b49206573f5c547960f1a7b1117","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
-    "degradation": {"Native":"e9af381857c63c55869390ec0c81774a5c2b462d30f7bc908f9a1b229f4c32fb","Presentation":"f887b8ec2ccc455378887ebef81aab85060ffde35fc996e2735cf7f805623880","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "degradation": {"Native":"16d18f4a6d91eafb2de62cf8a7501b59ba89776cb37e41c0242f9221631103d9","Presentation":"d560dfdee48c82a969de4da839a6c6b1a5914022063e2a706d84b9e4af9b36e7","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "display-tables": {"Native":"e3c9229457ea4b35dbc4543f38fe750bc7bd2d8c26414f1a5ac7cb5c94e75e10","Presentation":"cc55fdc51fa4aad041dba96acc77c1b5dea049dc33f05c01ee4dcb4aef8d49fc","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "flex": {"Native":"7939c44170f2d03d77da70099e6f56c05b1e88cba7a0b416a4fbc1c257614e55","Presentation":"f80b8ad26d8b2853c3b55a0153ea65e533d5810c34cd56450dca40c10b82eef5","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "fonts": {"Native":"983ba11fe069fe39c6104335ce078610f88f3496997fcd9fd259465974d5cc30","Presentation":"71820536604b165c7b16fcd8338d1939b423a757c6b2ec888a3e7e7749759a47","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "fonts-family": {"Native":"d00f586864afc1d1fbb12241bd47234282bd0d5e270ad6450adfe24c78223b02","Presentation":"43843f7f442da7309fd31d8a4a3e2b3b614a083b2223dd6cdddfefc91c57e7b5","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
+    "fonts-size": {"Native":"363899d244c986a733bf7ad5d1885bf9df159fbc7f3532a755ff08b9ff012fd5","Presentation":"b4b10eba526947c71c8b36bc79ff4b1dd5b2ddbada2c23c9b22773136c927a03","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "forms": {"Native":"432eff0332d758bb5c7472bbaf0edce73a5397d680109755540539cdcbc9e165","Presentation":"303152c58ca7299f6f1010228d022f05386688427a1817088d2b2b534f0ec097","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "github": {"Native":"abcd39837487a98a80c5f7d8ae3f0bcf2fbe13762a341176c03032da4d8f2444","Presentation":"7ed0b8fa02cbe1c5066d3dbfecab73046abb49947f05074d18e34c6e89db3574","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
     "mdn": {"Native":"b46be5fa34e78e34d9ae0757ad6610cc63861cae8b8b084f76ce42c706404689","Presentation":"9bfdab494cfffb680e5c6151180010babafd07937f4ac9c7ca199905d7f6bfd6","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0},
@@ -25,20 +28,22 @@
     "wikipedia": {"Native":"923b395a83db9dc077c5afe5f609f2be6fc6acfcf0a42658214b45a32eaba632","Presentation":"445b5771fe033db5a840d968e5b6d5b7267f4405a3cc4127b4917d7f189e04c4","NativeWidth":1280,"NativeHeight":720,"Width":512,"Height":288,"Scroll":0}
   },
   "Verdicts": {
-    "borders": "Approve all 15 pairs",
-    "box-model": "Approve all 15 pairs",
-    "boxes-block": "Approve all 15 pairs",
-    "boxes-collapse": "Approve all 15 pairs",
-    "boxes-flex": "Approve all 15 pairs",
-    "colors": "Approve all 15 pairs",
-    "degradation": "Approve all 15 pairs",
-    "display-tables": "Approve all 15 pairs",
-    "flex": "Approve all 15 pairs",
-    "fonts": "Approve all 15 pairs",
-    "forms": "Approve all 15 pairs",
-    "github": "Approve all 15 pairs",
-    "mdn": "Approve all 15 pairs",
-    "selectors": "Approve all 15 pairs",
-    "wikipedia": "Approve all 15 pairs"
+    "borders": "Approve all 17 pairs",
+    "box-model": "Approve all 17 pairs",
+    "boxes-block": "Approve all 17 pairs",
+    "boxes-collapse": "Approve all 17 pairs",
+    "boxes-flex": "Approve all 17 pairs",
+    "colors": "Approve all 17 pairs",
+    "degradation": "Approve all 17 pairs",
+    "display-tables": "Approve all 17 pairs",
+    "flex": "Approve all 17 pairs",
+    "fonts": "Approve all 17 pairs",
+    "fonts-family": "Approve all 17 pairs",
+    "fonts-size": "Approve all 17 pairs",
+    "forms": "Approve all 17 pairs",
+    "github": "Approve all 17 pairs",
+    "mdn": "Approve all 17 pairs",
+    "selectors": "Approve all 17 pairs",
+    "wikipedia": "Approve all 17 pairs"
   }
 }

@@ -102,7 +102,7 @@ func TestReferenceSetBounds(t *testing.T) {
 			}
 		}
 	}
-	if pages != 15 {
-		t.Fatalf("reference page inventory changed: got %d, want 15", pages)
+	if pages != 17 {
+		t.Fatalf("reference page inventory changed: got %d, want 17", pages)
 	}
 }

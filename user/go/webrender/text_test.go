@@ -162,6 +162,7 @@ const (
 	interItalicFixture = "../../../image/fonts/Inter-Italic.ttf"
 	interBIFixture     = "../../../image/fonts/Inter-BoldItalic.ttf"
 	firaFixture        = "../../../image/fonts/FiraCode-Regular.ttf"
+	serifFixture       = "../../../image/fonts/NotoSerif-Regular.ttf"
 )
 
 func loadFonts(t *testing.T) Fonts {
@@ -186,7 +187,11 @@ func loadFonts(t *testing.T) Fonts {
 	if err != nil {
 		t.Fatalf("Fira Code fixture is required by these tests: %v", err)
 	}
-	f := LoadFonts(FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic, BoldItalic: boldItalic})
+	serif, err := os.ReadFile(serifFixture)
+	if err != nil {
+		t.Fatalf("Noto Serif fixture is required by these tests: %v", err)
+	}
+	f := LoadFonts(FontFiles{UI: ui, Mono: mono, Serif: serif, Bold: bold, Italic: italic, BoldItalic: boldItalic})
 	if f.UI == nil {
 		t.Fatal("LoadFonts dropped the Inter face")
 	}
@@ -201,6 +206,9 @@ func loadFonts(t *testing.T) Fonts {
 	}
 	if f.BoldItalic == nil {
 		t.Fatal("LoadFonts dropped the Inter Bold Italic face")
+	}
+	if f.Serif == nil {
+		t.Fatal("LoadFonts dropped the Noto Serif face")
 	}
 	return f
 }
@@ -409,6 +417,37 @@ func TestMonoStylePrefersTheMonoFace(t *testing.T) {
 	prose := fonts.Measure("iiii", Style{Size: 1})
 	if prose == fonts.Measure("WWWW", Style{Size: 1}) {
 		t.Error("a proportional style must not report a fixed advance")
+	}
+}
+
+// TestSerifStyleResolvesTheSerifFace pins M99p (#2193): a serif style selects
+// the serif family — through both the file list and the manifest registry —
+// and a styled serif run keeps that face (refusal by name): a bold serif run
+// resolves to "serif" with NO synthetic strike — the manifest's documented
+// policy is real glyphs at real coverage, never a fake embolden.
+func TestSerifStyleResolvesTheSerifFace(t *testing.T) {
+	serifSt := Style{Size: 1, Serif: true}
+	boldSerif := Style{Size: 1, Serif: true, Bold: true}
+	for name, f := range map[string]Fonts{"files": loadFonts(t)} {
+		if got := f.ResolvedName(serifSt); got != "serif" {
+			t.Fatalf("%s: serif style resolved to %q", name, got)
+		}
+		if got := f.ResolvedName(boldSerif); got != "serif" {
+			t.Fatalf("%s: bold serif must keep the serif face, got %q", name, got)
+		}
+		if f.noRealBold(boldSerif) {
+			t.Fatalf("%s: refusal-by-name means no strike on serif", name)
+		}
+	}
+	f, _ := manifestFonts(t)
+	if got := f.ResolvedName(serifSt); got != "serif" {
+		t.Fatalf("registry: serif style resolved to %q", got)
+	}
+	if got := f.ResolvedName(boldSerif); got != "serif" {
+		t.Fatalf("registry: bold serif must degrade to the serif primary, got %q", got)
+	}
+	if f.face(serifSt) != f.Serif {
+		t.Fatal("registry: face() and Serif disagree")
 	}
 }
 
@@ -790,6 +829,7 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 		"INTERI.TTF":   interItalicFixture,
 		"INTERBI.TTF":  interBIFixture,
 		"FIRACODE.TTF": firaFixture,
+		"NOTOSERF.TTF": serifFixture,
 		"CHROME.TTF":   chromeFixture,
 	}
 	specs, err := ttf.ParseManifest([]byte(
@@ -798,6 +838,7 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 			"INTERI.TTF | role=ui | order=3 | style=italic\n" +
 			"INTERBI.TTF | role=ui | order=4 | weight=700 | style=italic\n" +
 			"FIRACODE.TTF | role=mono | order=1\n" +
+			"NOTOSERF.TTF | role=serif | order=1\n" +
 			"CHROME.TTF | role=symbol | order=1\n"))
 	if err != nil {
 		t.Fatalf("manifest refused: %v", err)
@@ -812,8 +853,8 @@ func manifestFonts(t *testing.T) (Fonts, *[]string) {
 		return ttf.Parse(data)
 	})
 	f := RegistryFonts(reg)
-	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil || f.BoldItalic == nil {
-		t.Fatalf("the manifest engine must resolve all five primaries: %+v", f)
+	if f.UI == nil || f.Mono == nil || f.Serif == nil || f.Bold == nil || f.Italic == nil || f.BoldItalic == nil {
+		t.Fatalf("the manifest engine must resolve all six primaries: %+v", f)
 	}
 	return f, &reads
 }

@@ -137,6 +137,10 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 	authorStopped, inlineStopped, nodeStopped := false, false, false
 	visited := make(map[*webrender.Node]bool)
 	var path []*webrender.Node
+	// The root element's computed font-size, once it resolves — the rem base.
+	// Initial until then, which is the correct base for a rem on the root
+	// itself (its "parent" is the initial style).
+	rootFontPx := int32(webstyle.InitialFontSize)
 	var walk func(*webrender.Node, webstyle.ComputedStyle, bool)
 	walk = func(n *webrender.Node, parent webstyle.ComputedStyle, parentNormal bool) {
 		if nodeStopped {
@@ -213,6 +217,41 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 				}
 			}
 			assign(&style, id, v)
+		}
+		// Font-relative sizes resolve to px here (M99p #2193): em against
+		// the parent's computed size, rem against the root's, smaller/larger
+		// one step off the absolute-size ladder. Parent styles are already
+		// resolved before children recurse, so parent's FontSize is always
+		// px. A computed result outside 8-48 clamps and reports — the value
+		// is only known at this point, unlike a literal px which refuses at
+		// parse.
+		if style.FontSize.Kind != webstyle.LengthPx &&
+			style.FontSize.Kind != webstyle.LengthInitial && style.FontSize.Kind != webstyle.LengthAuto {
+			parentPx := parent.FontSize.Value
+			if parentPx <= 0 {
+				// The root's "parent" is the zero style; CSS resolves a root
+				// em/smaller against the initial medium.
+				parentPx = webstyle.InitialFontSize
+			}
+			var px int64
+			switch style.FontSize.Kind {
+			case webstyle.LengthEm:
+				px = (int64(parentPx)*int64(style.FontSize.Value) + 50) / 100
+			case webstyle.LengthRem:
+				px = (int64(rootFontPx)*int64(style.FontSize.Value) + 50) / 100
+			case webstyle.LengthFontSmaller:
+				px = int64(fontSizeStep(parentPx, -1))
+			case webstyle.LengthFontLarger:
+				px = int64(fontSizeStep(parentPx, 1))
+			}
+			if px < 8 || px > 48 {
+				px = min(48, max(8, px))
+				diags.add(webstyle.DiagnosticUnsupported, 0, 0, "font-size-clamped")
+			}
+			style.FontSize = webstyle.Length{Kind: webstyle.LengthPx, Value: int32(px)}
+		}
+		if len(path) == 1 {
+			rootFontPx = style.FontSize.Value
 		}
 		if style.Color.Kind == webstyle.ColorCurrent {
 			style.Color = parent.Color
@@ -395,4 +434,25 @@ func assign(s *webstyle.ComputedStyle, id propertyID, v value) {
 	case pFlexShrink:
 		s.FlexShrink = webstyle.FlexFactor{Value: v.enum, Set: v.set}
 	}
+}
+
+// fontSizeStep is the CSS smaller/larger keyword: one step off the
+// absolute-size ladder from the parent's computed px. Off the ladder ends the
+// step is the ladder's own ratio (6/5), matching how the table is built.
+func fontSizeStep(parentPx int32, dir int) int32 {
+	ladder := [...]int32{8, 10, 12, 13, 16, 20, 26}
+	if dir > 0 {
+		for _, v := range ladder {
+			if v > parentPx {
+				return v
+			}
+		}
+		return (parentPx*6 + 2) / 5
+	}
+	for i := len(ladder) - 1; i >= 0; i-- {
+		if ladder[i] < parentPx {
+			return ladder[i]
+		}
+	}
+	return (parentPx*5 + 3) / 6
 }

@@ -30,8 +30,12 @@ func browserFonts(t *testing.T) webrender.Fonts {
 	if err != nil {
 		t.Fatalf("Inter Bold Italic fixture: %v", err)
 	}
-	f := webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic, BoldItalic: boldItalic})
-	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil || f.BoldItalic == nil {
+	serif, err := os.ReadFile("../../../image/fonts/NotoSerif-Regular.ttf")
+	if err != nil {
+		t.Fatalf("Noto Serif fixture: %v", err)
+	}
+	f := webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Serif: serif, Bold: bold, Italic: italic, BoldItalic: boldItalic})
+	if f.UI == nil || f.Mono == nil || f.Serif == nil || f.Bold == nil || f.Italic == nil || f.BoldItalic == nil {
 		t.Fatal("LoadFonts dropped a face")
 	}
 	return f
@@ -57,6 +61,8 @@ func TestTextProbeOnTrueType(t *testing.T) {
 		"italic-face=yes",
 		"bi-face=yes",
 		"bi-resolve=bolditalic",
+		"serif-face=yes",
+		"serif-resolve=serif",
 	} {
 		if !strings.Contains(probe, want) {
 			t.Errorf("probe is missing %q\n  got: %s", want, probe)
@@ -83,6 +89,8 @@ func TestTextProbeOnBitmap(t *testing.T) {
 		"italic-face=no",
 		"bi-face=no",
 		"bi-resolve=none",
+		"serif-face=no",
+		"serif-resolve=none",
 	} {
 		if !strings.Contains(probe, want) {
 			t.Errorf("bitmap probe is missing %q\n  got: %s", want, probe)
@@ -118,7 +126,7 @@ func fieldOf(line, prefix string) string {
 // -ENOSYS, so the engine is the bitmap one and says so. This is the same path a
 // missing font takes in the guest, and it must not panic or blank the app.
 func TestLoadTextEngineOnHostFallsBack(t *testing.T) {
-	engine, uiState, monoState := loadTextEngine()
+	engine, uiState, monoState, serifState := loadTextEngine()
 	if engine.Name() != "bitmap8x8" {
 		t.Logf("host file channel returned fonts; engine=%s", engine.Name())
 	}
@@ -128,10 +136,13 @@ func TestLoadTextEngineOnHostFallsBack(t *testing.T) {
 	if monoState == "truetype" && engine.Mono == nil {
 		t.Error("monoState says truetype but no mono face is loaded")
 	}
+	if serifState == "truetype" && engine.Serif == nil {
+		t.Error("serifState says truetype but no serif face is loaded")
+	}
 	if probe := textProbeString(engine); !strings.Contains(probe, "face=") {
 		t.Errorf("probe must always describe the engine: %q", probe)
 	}
-	t.Logf("host engine=%s ui=%s mono=%s", engine.Name(), uiState, monoState)
+	t.Logf("host engine=%s ui=%s mono=%s serif=%s", engine.Name(), uiState, monoState, serifState)
 }
 
 // TestReadWholeFileIsBoundedAndSafe: a bounded reader that never panics.
@@ -154,6 +165,7 @@ func TestMaxFontBytesHoldsBothShippedFaces(t *testing.T) {
 		"../../../image/fonts/Inter-Regular.ttf",
 		"../../../image/fonts/Inter-Bold.ttf",
 		"../../../image/fonts/Inter-Italic.ttf",
+		"../../../image/fonts/NotoSerif-Regular.ttf",
 		"../../../image/fonts/FiraCode-Regular.ttf",
 	} {
 		st, err := os.Stat(p)
@@ -180,7 +192,7 @@ func TestResolveImageRefusesNetworkAndMissingSources(t *testing.T) {
 // TestTextProbeIsLanguageStable guards the field names the gate greps.
 func TestTextProbeIsLanguageStable(t *testing.T) {
 	probe := textProbeString(browserFonts(t))
-	for _, f := range []string{"face=", "proportional=", "body-lineh=", "h1-lineh=", "mono-lineh=", "adv-i=", "adv-W=", "adv-space=", "bold-face=", "bold-heavier=", "italic-face=", "bi-face=", "bi-resolve="} {
+	for _, f := range []string{"face=", "proportional=", "body-lineh=", "h1-lineh=", "mono-lineh=", "adv-i=", "adv-W=", "adv-space=", "bold-face=", "bold-heavier=", "italic-face=", "bi-face=", "bi-resolve=", "serif-face=", "serif-resolve="} {
 		if !strings.Contains(probe, f) {
 			t.Errorf("probe lost field %q: %s", f, probe)
 		}

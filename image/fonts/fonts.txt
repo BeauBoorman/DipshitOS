@@ -33,7 +33,7 @@
 # card ships a JP build, and Hangul syllables need a Noto Sans KR face.
 #
 # NOTOSERF appears twice on purpose. The role=serif row is the face
-# font-family:serif resolves to once M99p (#2193) wires that query. The
+# font-family:serif resolves to (M99p #2193 wired the query). The
 # role=ui row puts the same face in today's ui cascade so runes only it
 # covers paint serif instead of .notdef; the faces map caches by file, so
 # the two rows still cost one lazy load.

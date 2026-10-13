@@ -191,8 +191,8 @@ func sampleFrame(src *referenceFrame, w, h int) *referenceFrame {
 
 func referenceFonts(t *testing.T) (wr.Fonts, map[string]string) {
 	t.Helper()
-	names := []string{"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf", "FiraCode-Regular.ttf"}
-	data, hashes := make([][]byte, 5), make(map[string]string)
+	names := []string{"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf", "FiraCode-Regular.ttf", "NotoSerif-Regular.ttf"}
+	data, hashes := make([][]byte, 6), make(map[string]string)
 	for i, name := range names {
 		b, err := os.ReadFile(filepath.Join("../../../image/fonts", name))
 		if err != nil {
@@ -202,8 +202,8 @@ func referenceFonts(t *testing.T) (wr.Fonts, map[string]string) {
 		sum := sha256.Sum256(b)
 		hashes[name] = hex.EncodeToString(sum[:])
 	}
-	fonts := wr.LoadFonts(wr.FontFiles{UI: data[0], Bold: data[1], Italic: data[2], BoldItalic: data[3], Mono: data[4]})
-	if fonts.UI == nil || fonts.Bold == nil || fonts.Italic == nil || fonts.BoldItalic == nil || fonts.Mono == nil {
+	fonts := wr.LoadFonts(wr.FontFiles{UI: data[0], Bold: data[1], Italic: data[2], BoldItalic: data[3], Mono: data[4], Serif: data[5]})
+	if fonts.UI == nil || fonts.Bold == nil || fonts.Italic == nil || fonts.BoldItalic == nil || fonts.Mono == nil || fonts.Serif == nil {
 		t.Fatal("reference font did not load")
 	}
 	return fonts, hashes
@@ -353,10 +353,10 @@ func TestM93ReferenceRenders(t *testing.T) {
 	fonts, hashes := referenceFonts(t)
 	candidate := referenceManifest{Version: 1, Fonts: hashes, Images: make(map[string]referenceHash), Verdicts: make(map[string]string)}
 	paths, err := filepath.Glob("../../../tests/fixtures/web/reference/*.html")
-	if err != nil || len(paths) != 15 {
+	if err != nil || len(paths) != 17 {
 		t.Fatalf("reference inventory: %d, error=%v", len(paths), err)
 	}
-	contact := frame(512*3, (288+24)*5, 0xffffff)
+	contact := frame(512*3, (288+24)*((len(paths)+2)/3), 0xffffff)
 	for index, path := range paths {
 		name := strings.TrimSuffix(filepath.Base(path), ".html")
 		data, err := os.ReadFile(path)

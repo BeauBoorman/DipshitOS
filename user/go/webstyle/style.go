@@ -18,6 +18,16 @@ const (
 	LengthAuto
 	LengthPx
 	LengthPercent
+	// Font-relative lengths (M99p #2193), declared on font-size only and
+	// resolved to LengthPx by the cascade against the parent's (em) or the
+	// root's (rem) computed size. Value is hundredths of the unit:
+	// LengthEm{Value:150} is 1.5em.
+	LengthEm
+	LengthRem
+	// The relative keywords smaller/larger: one step off the CSS
+	// absolute-size ladder from the parent's computed size. Value is unused.
+	LengthFontSmaller
+	LengthFontLarger
 )
 
 // Edges are physical, not logical, sides in top/right/bottom/left order.
@@ -78,8 +88,9 @@ type Borders struct {
 type FontFamily uint8
 
 const (
-	FontSans FontFamily = iota // Inter; serif/sans-serif aliases also select it
+	FontSans FontFamily = iota // Inter; sans-serif aliases also select it
 	FontMono                   // Fira Code
+	FontSerif                  // Noto Serif via the registry's serif role (M99p)
 )
 
 type FontWeight uint8
