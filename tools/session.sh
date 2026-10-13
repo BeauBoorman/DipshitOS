@@ -104,6 +104,9 @@ fi
 # M99l (#2189): the font registry manifest. Go consumers read /host/FONTS.TXT;
 # the frozen Zig engine ignores it (ADR 0034).
 [ -f "$ROOT/image/fonts/fonts.txt" ] && cp "$ROOT/image/fonts/fonts.txt" "$SHARE/FONTS.TXT"
+# M99m (#2190) coverage faces: the serif role primary and the CJK cascade tail.
+[ -f "$ROOT/image/fonts/NotoSerif-Regular.ttf" ] && cp "$ROOT/image/fonts/NotoSerif-Regular.ttf" "$SHARE/NOTOSERF.TTF"
+[ -f "$ROOT/image/fonts/NotoSansJP-Regular.ttf" ] && cp "$ROOT/image/fonts/NotoSansJP-Regular.ttf" "$SHARE/NOTOCJK.TTF"
 
 # The GO seat (M59, issue #1298): the compiled `wm` default is `gotabwm`, so
 # a default boot looks for GOTABWM.ELF ON THE SHARE. Build it with the
