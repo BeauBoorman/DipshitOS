@@ -155,7 +155,7 @@ test "syscall: M94 trace and profile control and remaining observability stub ar
 
 test "syscall: ABI metadata covers every registered row without pointers" {
     const abi = syscall.abi;
-    try std.testing.expectEqual(@as(usize, 84), abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 87), abi.slots.len);
     for (&abi.slots, 0..) |slot, index| {
         try std.testing.expectEqual(index, slot.number);
         try std.testing.expectEqualStrings(slot.name(), entry_info(index).?.name);
@@ -177,7 +177,7 @@ test "syscall: ABI metadata covers every registered row without pointers" {
             try std.testing.expect(earlier.number != item.number or earlier.selector != item.selector or earlier.op != item.op);
         }
     }
-    try std.testing.expect(abi.lookup(84) == null);
+    try std.testing.expect(abi.lookup(87) == null); // first free slot after M99i #2187's 84–86
     try std.testing.expectEqual(abi.ArgKind.string, abi.shape(79, .{ 0, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.fd, abi.shape(80, .{ 2, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.int, abi.shape(27, .{ 0, 0, 0, 0x8000000000000002, 0, 0 }).?.args[0].kind);
@@ -213,7 +213,7 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
             implemented += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 84), implemented);
+    try std.testing.expectEqual(@as(usize, 87), implemented);
     try std.testing.expectEqualStrings("sys_socket", entry_info(80).?.name);
     try std.testing.expectEqualStrings("sys_fs_metadata", entry_info(79).?.name);
     try std.testing.expectEqualStrings("sys_pipe_read", entry_info(sys_pipe_read).?.name);
@@ -300,13 +300,14 @@ test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
     try std.testing.expectEqual(@as(u64, 41), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(u64, 1), call_count(sys_ping));
 
-    // Unregistered in-range slots still return ENOSYS. M94 reserves 81–83.
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 84));
+    // Unregistered in-range slots still return ENOSYS. M94 reserves
+    // 81–83; M99i (#2187) takes 84–86 for the owned UDP seam.
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 87));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
-    try std.testing.expectEqual(@as(u64, 1), call_count(84));
+    try std.testing.expectEqual(@as(u64, 1), call_count(87));
 
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 85));
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 88));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
 }
@@ -990,11 +991,12 @@ test "syscall: udp listen — ok, duplicate, full, and port-zero refusal" {
     try std.testing.expect(virtio_net.udp.is_listening(7000));
     // Duplicate: EINVAL (the N5 layer's honest bool, mapped).
     try std.testing.expectEqual(error_result(.einval), dispatch(sys_udp_listen, .{ 7000, 0, 0, 0, 0, 0 }, &frame));
-    // Fill the 4-slot table: the fifth bind is EINVAL.
+    // Fill the 4-slot table: the fifth bind is ENOSPC (M99i #2187 split
+    // the refusal — a taken port is EINVAL, an exhausted table ENOSPC).
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_udp_listen, .{ 7001, 0, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_udp_listen, .{ 7002, 0, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_udp_listen, .{ 7003, 0, 0, 0, 0, 0 }, &frame));
-    try std.testing.expectEqual(error_result(.einval), dispatch(sys_udp_listen, .{ 7004, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.enospc), dispatch(sys_udp_listen, .{ 7004, 0, 0, 0, 0, 0 }, &frame));
 }
 
 test "syscall: udp send/recv — loopback round trip through the handlers" {
@@ -1045,7 +1047,9 @@ test "syscall: udp send — EINVAL mapping, EFAULT, and the honest truncation" {
     defer virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
     virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     defer virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
-    var big: [100]u8 = undefined;
+    // M99i (#2187): over the 512-byte payload bound so the truncation
+    // half of this test still exercises the clamp.
+    var big: [udp.payload_max + 88]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @intCast(i & 0xff);
     set_user_regions(
         .{ .base = @intFromPtr(&big), .len = big.len },
@@ -1068,9 +1072,10 @@ test "syscall: udp send — EINVAL mapping, EFAULT, and the honest truncation" {
     virtio_net.net_ready = true;
     try std.testing.expectEqual(error_result(.einval), dispatch(sys_udp_send, .{ 0x0a000002, 9999, @intFromPtr(&big), 4, 0, 0 }, &frame));
     virtio_net.net_ready = false;
-    // len > 64 truncates honestly at payload_max (the ipc send shape) and
-    // the send returns the WRITTEN length: 64. The loopbacked datagram is
-    // 72 bytes with the first 64 payload bytes.
+    // len > 512 truncates honestly at payload_max (the ipc send shape)
+    // and the send returns the WRITTEN length: 512. The loopbacked
+    // datagram is 520 bytes: the 8-byte header + the first 512 payload
+    // bytes.
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_udp_listen, .{ 7000, 0, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, udp.payload_max), dispatch(sys_udp_send, .{ 0x0a000001, 7000, @intFromPtr(&big), big.len, 0, 0 }, &frame));
     var recv_buf: [udp.datagram_max]u8 = undefined;
@@ -1078,8 +1083,8 @@ test "syscall: udp send — EINVAL mapping, EFAULT, and the honest truncation" {
         .{ .base = @intFromPtr(&big), .len = big.len },
         .{ .base = @intFromPtr(&recv_buf), .len = recv_buf.len },
     );
-    try std.testing.expectEqual(@as(u64, udp.datagram_max), dispatch(sys_udp_recv, .{ 7000, @intFromPtr(&recv_buf), 100, 0, 0, 0 }, &frame));
-    try std.testing.expectEqualSlices(u8, big[0..udp.payload_max], recv_buf[8..72]);
+    try std.testing.expectEqual(@as(u64, udp.datagram_max), dispatch(sys_udp_recv, .{ 7000, @intFromPtr(&recv_buf), udp.datagram_max, 0, 0, 0 }, &frame));
+    try std.testing.expectEqualSlices(u8, big[0..udp.payload_max], recv_buf[8..udp.datagram_max]);
 }
 
 test "syscall: handle_svc decodes and dispatches slots 9/10/11 via the frame" {
@@ -1390,7 +1395,7 @@ test "syscall: counters are monotonic and report is deterministic" {
     var con = mock.console();
     report(&con);
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=84\n" ++
+        "syscalls: slots=64 implemented=87\n" ++
             "  0 sys_ping calls=2\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1474,7 +1479,10 @@ test "syscall: counters are monotonic and report is deterministic" {
             "  80 sys_socket calls=0\n" ++
             "  81 sys_trace calls=0\n" ++
             "  82 sys_profile calls=0\n" ++
-            "  83 sys_memstat calls=0\n",
+            "  83 sys_memstat calls=0\n" ++
+            "  84 sys_udp_send_from calls=0\n" ++
+            "  85 sys_udp_recv_from calls=0\n" ++
+            "  86 sys_udp_close calls=0\n",
         mock.contents(),
     );
 }
@@ -2865,7 +2873,7 @@ test "syscall: slot-65 cmd 22 GPU3D — typed descriptor boundary on the existin
 
     // Slot count/table unchanged: cmd 22 is the only new kernel entry,
     // and it rides slot 65 — the dispatch table itself did not grow.
-    try std.testing.expectEqual(@as(usize, 84), syscall.abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 87), syscall.abi.slots.len);
     gpu3d_device.reset_state();
 }
 
@@ -5757,7 +5765,7 @@ test "syscall: SYS_TIME (slot 66, #1058) returns the firmware wall-clock epoch" 
     // TS5 slot 70 (sys_secret_get), TS4 slot 71 (sys_tty_net_auth);
     // M51 SSH-P1 (#1166) slot 72 (sys_getrandom); issue #1228 slot 75;
     // issue #1163 phase 2 slot 76 (sys_sock_ready).
-    try std.testing.expectEqual(@as(usize, 84), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 87), syscall.implemented_count);
 
     const saved_epoch = timer.boot_epoch_secs;
     const saved_ticks = timer.ticks;
@@ -5915,7 +5923,7 @@ test "syscall: M50 TS3 gate table is explicit, bounded, and exactly the ADR 0024
         try std.testing.expect(gate.number < syscall.implemented_count);
         try std.testing.expect(entry_info(gate.number) != null);
     }
-    try std.testing.expectEqual(@as(usize, 84), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 87), syscall.implemented_count);
 }
 
 test "syscall: no slot can raise uid/caps (TS3 consumes caps, adds no setter)" {

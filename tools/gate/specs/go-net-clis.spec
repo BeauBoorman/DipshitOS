@@ -24,6 +24,9 @@
 #   boot 05   M83b: bare `time sync` (the default NAME) with no network at all
 #             -> the live-net-offline sentence, `clock untouched`, exit 1, and
 #             no DNS query attempted
+#   boot 06   M99i (#2187): GOSH types `exec GODNS.ELF example.com 10.0.0.2`
+#             against the runner's DNS responder -> the deep resolver's
+#             Answer, `dns: status=ok`, one ephemeral-port wire query
 #
 # WHY THE CONSOLE SHELL AND NOT THE WINDOW: a windowed GOSH would need
 # GOTABWM.ELF staged and a third live Go runtime (seat + shell + CLI), and
@@ -52,6 +55,7 @@
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-gosh.sh      ->  .build/go/GOSH.ELF
 #   bash tools/go/build-goping.sh    ->  .build/go/GOPING.ELF
+#   bash tools/go/build-netdiag.sh   ->  .build/go/GODNS.ELF
 #   bash tools/go/build-web.sh fetch GOFETCH --gate -> .build/go/GOFETCH-GATE.ELF
 #   (staged under the GOFETCH.ELF guest name; the gate build carries the
 #   AutoClaw test root the boot-02 fixture chains to)
@@ -78,7 +82,8 @@ import os, shutil, sys
 rd = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
 for name, how in (("GOSH.ELF", "build-gosh.sh"),
-                  ("GOPING.ELF", "build-goping.sh")):
+                  ("GOPING.ELF", "build-goping.sh"),
+                  ("GODNS.ELF", "build-netdiag.sh")):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
         sys.exit(name + " missing (expected " + src + ") - build it first: "
@@ -99,6 +104,8 @@ with open(os.path.join(rd, "typed-ping.bin"), "wb") as f:
     f.write(b"exec GOPING.ELF -c 3 10.0.0.2\r")
 with open(os.path.join(rd, "typed-fetch.bin"), "wb") as f:
     f.write(b"exec GOFETCH.ELF https://10.0.0.2:24533/\r")
+with open(os.path.join(rd, "typed-dns.bin"), "wb") as f:
+    f.write(b"exec GODNS.ELF example.com 10.0.0.2\recho rc=$?\r")
 PY
 
 # M83b (#1775): boots 03 and 04 type three lines in one burst. `time sync` is a
@@ -407,4 +414,49 @@ epoch = int(dline.group(2))
 if not start - 60 <= epoch <= end + 60:
     sys.exit("FAIL: date epoch %d outside host interval [%d, %d] with 60 s slack" % (epoch, start, end))
 print("go-net-clis 05 ok: offline, exit 1, clock untouched (date epoch %d)" % epoch)
+PY
+
+# --- boot 06: GOSH execs GODNS.ELF through the DNS responder -----------------
+# M99i (#2187): the deep resolver holds up when the exec comes from GOSH's
+# own parser — a third-process proof that the owned-port seam is per-process,
+# not per-runtime. Same proof shape as boots 01/02: the monitor's load line
+# is absent, GOSH's submit record is present, the child's Answer follows.
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' \
+    --net '$RUN_DIR/cap-06.bin' --net-arp-respond 10.0.0.2 --net-dns-respond 10.0.0.2 \
+    --script '$RUN_DIR/net.txt' \
+    --script2 '$RUN_DIR/sh.txt' --script2-after 'net arp: ' \
+    --script3 '$RUN_DIR/typed-dns.bin' --script3-after 'gosh: attached' \
+    --script-expect 'rc=0' --timeout 180
+
+vgate_assert 06 serial-contains 'gosh: attached'
+vgate_assert 06 serial-absent 'exec: loaded GODNS.ELF'
+vgate_assert 06 serial-contains 'DNS query for example.com (A) via 10.0.0.2:53'
+vgate_assert 06 serial-contains 'Answer: example.com -> 93.184.216.34 (ttl=300s answers=1 ignored=0)'
+vgate_assert 06 serial-contains 'dns: status=ok'
+vgate_assert 06 serial-contains 'rc=0'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'fatal error: runtime:'
+vgate_assert 06 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+if not re.search(r"(?m)^gosh: line exec GODNS\.ELF example\.com 10\.0\.0\.2", ser):
+    sys.exit("FAIL: GOSH never recorded the typed `exec GODNS.ELF ...` line")
+rd = os.environ["RUN_DIR"]
+d = open(os.path.join(rd, "cap-06.bin"), "rb").read()
+off, ports = 0, []
+while off < len(d):
+    if d[off+12:off+14] == b"\x08\x00":
+        flen = 14 + ((d[off+16] << 8) | d[off+17])
+        f = d[off:off+flen]
+        off += flen
+        if len(f) >= 42 and f[23] == 17 and f[30:34] == bytes([10,0,0,2]) and f[36:38] == b"\x00\x35":
+            ports.append((f[34] << 8) | f[35])
+    else:
+        off += 42
+if len(ports) != 1:
+    sys.exit("FAIL: want exactly 1 DNS query on the wire, saw %d" % len(ports))
+if not 49152 <= ports[0] <= 65535:
+    sys.exit("FAIL: query source port %d outside the ephemeral range" % ports[0])
+print("go-net-clis 06 ok: GOSH exec'd GODNS.ELF, ephemeral src port %d" % ports[0])
 PY

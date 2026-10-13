@@ -347,19 +347,21 @@ func TestDial_ZeroGuards(t *testing.T) {
 func TestDial_NameResolvesThenConnects(t *testing.T) {
 	// A name dials the RESOLVED address: the DNS seam runs first (the fake
 	// answers myhost.local -> 10.0.0.2), then op 10 carries the octets.
-	dns := &dnsFake{}
-	dns.recvScript = func(int) []byte {
-		return udpDgram(DNSPort, dnsReplyFor(dns.sentQuery, [4]byte{10, 0, 0, 2}))
+	dns := &dnsFake{bound: map[uint16]bool{}, recvPer: map[uint16]int{}}
+	dns.recvScript = func(port uint16, call int) []byte {
+		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{10, 0, 0, 2}))
 	}
 	f := &connFake{}
 	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
-		if num == SlotUDPListen || num == SlotUDPSend || num == SlotUDPRecv {
-			return dns.hook(num, a0, a1, a2, a3)
+		if num == SlotSocket {
+			return f.hook(num, a0, a1, a2, a3)
 		}
-		return f.hook(num, a0, a1, a2, a3)
+		return dns.hook(num, a0, a1, a2, a3)
 	})
+	prev6 := SetSyscallHook6ForTest(dns.hook6)
 	defer SetSyscallHookForTest(prev)
-	t.Cleanup(func() { dnsPortBound = false })
+	defer SetSyscallHook6ForTest(prev6)
+	t.Cleanup(resetDNSCacheForTest)
 
 	c, err := Dial("myhost.local", 8080)
 	if err != nil {
@@ -371,19 +373,21 @@ func TestDial_NameResolvesThenConnects(t *testing.T) {
 }
 
 func TestDial_DNSResolvingToZeroRefused(t *testing.T) {
-	dns := &dnsFake{}
-	dns.recvScript = func(int) []byte {
-		return udpDgram(DNSPort, dnsReplyFor(dns.sentQuery, [4]byte{0, 0, 0, 0}))
+	dns := &dnsFake{bound: map[uint16]bool{}, recvPer: map[uint16]int{}}
+	dns.recvScript = func(port uint16, call int) []byte {
+		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{0, 0, 0, 0}))
 	}
 	f := &connFake{}
 	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
-		if num == SlotUDPListen || num == SlotUDPSend || num == SlotUDPRecv {
-			return dns.hook(num, a0, a1, a2, a3)
+		if num == SlotSocket {
+			return f.hook(num, a0, a1, a2, a3)
 		}
-		return f.hook(num, a0, a1, a2, a3)
+		return dns.hook(num, a0, a1, a2, a3)
 	})
+	prev6 := SetSyscallHook6ForTest(dns.hook6)
 	defer SetSyscallHookForTest(prev)
-	t.Cleanup(func() { dnsPortBound = false })
+	defer SetSyscallHook6ForTest(prev6)
+	t.Cleanup(resetDNSCacheForTest)
 
 	if _, err := Dial("zero.host", 8080); !errors.Is(err, ErrServerDial) {
 		t.Fatalf("Dial of a name resolving to 0.0.0.0 = %v, want ErrServerDial", err)

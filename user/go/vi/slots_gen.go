@@ -30,6 +30,9 @@ const (
 	SlotTrace              uintptr = 81
 	SlotProfile            uintptr = 82
 	SlotMemstat            uintptr = 83
+	SlotUDPSendFrom        uintptr = 84
+	SlotUDPRecvFrom        uintptr = 85
+	SlotUDPClose           uintptr = 86
 )
 
 type SyscallArgKind uint8
@@ -148,6 +151,9 @@ var SyscallSlots = [...]SyscallSlot{
 	{SlotTrace, "sys_trace", 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotProfile, "sys_profile", 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotMemstat, "sys_memstat", 3, [6]SyscallArg{{Kind: ArgPID}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotUDPSendFrom, "sys_udp_send_from", 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotUDPRecvFrom, "sys_udp_recv_from", 3, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotUDPClose, "sys_udp_close", 1, [6]SyscallArg{{Kind: ArgInt}}},
 }
 
 var SyscallVariants = [...]SyscallVariant{

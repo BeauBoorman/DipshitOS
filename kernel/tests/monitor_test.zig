@@ -977,10 +977,11 @@ test "monitor: net udp send — to a resolved peer on the mock transport" {
     virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{ "net", "udp", "send", "10.0.0.3", "9999", "4" }));
     try std.testing.expectEqualStrings("error: peer not in ARP table (net arp <a.b.c.d> first)\n", env.mock.contents());
-    // Length bounds refuse exactly.
+    // Length bounds refuse exactly (M99i #2187 raised payload_max to 512,
+    // so 65 is a legal length now and 513 is the first refusal).
     env.mock.reset();
     try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "send", "10.0.0.2", "9999", "0" }));
-    try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "send", "10.0.0.2", "9999", "65" }));
+    try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "net", "udp", "send", "10.0.0.2", "9999", "513" }));
     virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
     virtio_net.arp.table = @as([virtio_net.arp.table_slots]virtio_net.arp.ArpEntry, @splat(@as(virtio_net.arp.ArpEntry, .{})));
     virtio_net.net_ops = saved_ops;
@@ -1794,7 +1795,7 @@ test "monitor: syscalls is registered and reports deterministic rows" {
     try std.testing.expectEqualStrings("numbered syscall table and counters", lookup("syscalls").?.help);
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{"syscalls"}));
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=84\n" ++
+        "syscalls: slots=64 implemented=87\n" ++
             "  0 sys_ping calls=0\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1878,7 +1879,10 @@ test "monitor: syscalls is registered and reports deterministic rows" {
             "  80 sys_socket calls=0\n" ++
             "  81 sys_trace calls=0\n" ++
             "  82 sys_profile calls=0\n" ++
-            "  83 sys_memstat calls=0\n",
+            "  83 sys_memstat calls=0\n" ++
+            "  84 sys_udp_send_from calls=0\n" ++
+            "  85 sys_udp_recv_from calls=0\n" ++
+            "  86 sys_udp_close calls=0\n",
         env.mock.contents(),
     );
 }
