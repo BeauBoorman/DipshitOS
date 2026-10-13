@@ -179,6 +179,81 @@ func scanHook(t *testing.T, seat int64, tables ...[]ProcRow) *int {
 	return scans
 }
 
+// scanHookGetpid is scanHook plus a kernel self-pid register (slot 87,
+// ADR 0048): `selfpid <= 0` models a kernel without the slot (-ENOSYS),
+// which is exactly what the legacy callers of scanHook see.
+func scanHookGetpid(t *testing.T, selfpid int64, seat int64, tables ...[]ProcRow) *int {
+	t.Helper()
+	if len(tables) == 0 {
+		t.Fatal("scanHookGetpid needs at least one table")
+	}
+	scans := new(int)
+	call := 0
+	installHook(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		switch num {
+		case SlotGetpid:
+			if selfpid > 0 {
+				return selfpid
+			}
+			return -ErrENOSYS
+		case SlotProcs:
+			tbl := tables[len(tables)-1]
+			if call < len(tables) {
+				tbl = tables[call]
+			}
+			call++
+			*scans++
+			return int64(emitNamed(a0, a1, tbl))
+		case SlotWmctl:
+			if a0 == uintptr(WmctlSeatPidCmd) {
+				return seat
+			}
+			return -ErrENOSYS
+		}
+		return -ErrENOSYS
+	})
+	return scans
+}
+
+// TestWmPeersSelfPidIsTheKernelRegister is the #2158 fix: the proc table
+// carries TWO RUNNING rows named NOTE.ELF — the first name match (pid 4)
+// is the OTHER instance; the caller is the second (pid 8, the duplicate-
+// tab chord's spawn). The sys_getpid register must win over the scan or
+// every WM_RPC this instance sends stamps reply_to=4 and its acks —
+// including the Go seat's bind challenge — misroute to the sibling's
+// mailbox.
+func TestWmPeersSelfPidIsTheKernelRegister(t *testing.T) {
+	scans := scanHookGetpid(t, 8, 5, []ProcRow{
+		namedRow(1, "GOSH.ELF"),
+		namedRow(4, "NOTE.ELF"),
+		namedRow(5, "GOTABWM.ELF"),
+		namedRow(8, "NOTE.ELF"),
+	})
+	p := WmPeers("NOTE.ELF")
+	if p.Self != 8 || p.WM != 5 || !p.Go {
+		t.Fatalf("WmPeers = %+v want self=8 (kernel register) wm=5 go", p)
+	}
+	// The register answers self before the scan, so one scan still
+	// suffices for the seat's protocol row — no retry discipline changes.
+	if *scans != 1 {
+		t.Fatalf("scan read the table %d time(s), want 1", *scans)
+	}
+}
+
+// TestWmPeersSelfPidScanFallsBackWithoutRegister keeps the scan as the
+// fallback where no kernel answers (host, -ENOSYS): the name match still
+// resolves self exactly as before.
+func TestWmPeersSelfPidScanFallsBackWithoutRegister(t *testing.T) {
+	scanHookGetpid(t, 0, 5, []ProcRow{
+		namedRow(1, "WEB.ELF"),
+		namedRow(5, "GOTABWM.ELF"),
+	})
+	p := WmPeers("WEB.ELF")
+	if p.Self != 1 || p.WM != 5 || !p.Go {
+		t.Fatalf("WmPeers = %+v want self=1 (scan fallback) wm=5 go", p)
+	}
+}
+
 // TestWmPeersNoSeatAnswersImmediately is the #1586 fix. The shim boot's table
 // was measured live: this app plus one other task, no WM-named row, readable on
 // every attempt. The honest answer "no seat" is available on the first scan, so

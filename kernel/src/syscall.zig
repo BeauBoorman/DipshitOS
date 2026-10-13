@@ -168,6 +168,11 @@ pub const sys_udp_recv: u64 = 11;
 pub const sys_udp_send_from: u64 = 84;
 pub const sys_udp_recv_from: u64 = 85;
 pub const sys_udp_close: u64 = 86;
+/// #2158 (ADR 0048): the unforgeable self-pid answer — the kernel resolves
+/// the CALLING process from the task registry, so a same-named sibling can
+/// never be mistaken for the caller (the sys_procs first-name-match that
+/// misrouted a second instance's WM_RPC acks).
+pub const sys_getpid: u64 = 87;
 /// Card G6 (claim 0487): the draw/window syscall seam — slots 12/13/14, the
 /// card's ONE ABI change (the ipc slots-5/6, slots-7/8, and udp slots-9/10/11
 /// precedents; every existing syscall number 0–11 stays frozen).
@@ -603,6 +608,7 @@ fn handler_for(comptime number: u64) Handler {
         sys_udp_send_from => handle_udp_send_from,
         sys_udp_recv_from => handle_udp_recv_from,
         sys_udp_close => handle_udp_close,
+        sys_getpid => handle_getpid,
         sys_win_open => handle_win_open,
         sys_win_fill => handle_win_fill,
         sys_win_present => handle_win_present,
@@ -717,7 +723,7 @@ fn doms_of(number: u64) u5 {
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
         sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
-        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat => k,
+        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid => k,
         sys_exit => svclock.all_bits,
         else => 0,
     };
@@ -1029,6 +1035,19 @@ fn handle_procs(args: Args, _: *exceptions.VectorFrame) u64 {
     if (take_bytes == 0) return 0;
     if (uaccess.copy_out(address, procs_scratch[0..take_bytes], take_bytes) != .ok) return error_result(.efault);
     return take_bytes / process.snapshot_row_bytes;
+}
+
+// ---------------------------------------------------------------------------
+// #2158 (ADR 0048): sys_getpid — slot 87
+// ---------------------------------------------------------------------------
+
+/// `sys_getpid()`: the CALLING process's pid, resolved from the task
+/// registry — the only self-pid answer a same-named sibling cannot spoof
+/// (the `sys_procs` name scan resolves the FIRST matching row, so a second
+/// instance of any app would misroute every reply-addressed message). A
+/// non-process caller (an EL1h task) is EINVAL, matching sys_principal.
+fn handle_getpid(_: Args, _: *exceptions.VectorFrame) u64 {
+    return process.find_by_task(scheduler.current_id()) orelse error_result(.einval);
 }
 
 // ---------------------------------------------------------------------------
