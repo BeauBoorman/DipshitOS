@@ -47,6 +47,9 @@ pub const sys_yield_num: u64 = 2;
 pub const sys_exit_num: u64 = 3;
 pub const sys_sleep_num: u64 = 4;
 pub const sys_procs_num: u64 = 7;
+/// #2158 (ADR 0048): the kernel's self-pid register — the caller's pid
+/// resolved from the task table, unspoofable by a same-named sibling.
+pub const sys_getpid_num: u64 = 87;
 pub const sys_win_open_num: u64 = 12;
 pub const sys_win_fill_num: u64 = 13;
 pub const sys_win_present_num: u64 = 14;
@@ -431,15 +434,23 @@ pub fn is_wm_name(nm: []const u8) bool {
     return false;
 }
 
-/// Resolve the WM's pid and the caller-specified self pid in ONE sys_procs
-/// scan — the WM acks to `reply_to`, so the requester must supply its own
-/// pid (resolved by its own process name, the WMRPC pattern). Returns
+/// Resolve the WM's pid and the caller's own pid — the WM acks to
+/// `reply_to`, so the requester must stamp ITS OWN pid. Returns
 /// (wm_pid, self_pid); a zero wm_pid means shim mode / no WM.
+/// #2158 (ADR 0048): self comes from `sys_getpid` — the kernel's task
+/// registry, which a same-named sibling can never be mistaken for. The
+/// `sys_procs` name scan survives only as the no-kernel fallback for self
+/// and for the WM row itself (matching WND/TABWM/GOTABWM by name is the
+/// pre-#2079 shape; the seat register is a separate follow-up).
 pub fn wm_peers(self_name: []const u8) struct { wm: u64, self: u64 } {
     var rows: [wm_procs_buf]u8 align(8) = undefined;
     const row_count = get_procs(&rows);
     var wm: u64 = 0;
     var self_pid: u64 = 0;
+    {
+        const gp = syscall0(sys_getpid_num);
+        if (gp > 0) self_pid = @intCast(gp);
+    }
     if (row_count > 0) {
         var infos: [16]ProcInfo = undefined;
         const n = parse_procs(&rows, @intCast(row_count), &infos);
@@ -448,7 +459,7 @@ pub fn wm_peers(self_name: []const u8) struct { wm: u64, self: u64 } {
             const nm = p.name[0..p.name_len];
             // M42 SX3: either WM server seat resolves (WND.BIN or TABWM.BIN).
             if (is_wm_name(nm)) wm = p.pid;
-            if (self_name.len != 0 and std.mem.eql(u8, nm, self_name)) self_pid = p.pid;
+            if (self_pid == 0 and self_name.len != 0 and std.mem.eql(u8, nm, self_name)) self_pid = p.pid;
         }
     }
     return .{ .wm = wm, .self = self_pid };

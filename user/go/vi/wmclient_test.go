@@ -239,6 +239,14 @@ type wmMailFake struct {
 	// the legacy Zig seat: bare applied acks are honest there. Go-seat tests
 	// set it to GOTABWM.ELF, where the authenticated protocol applies.
 	wmName string
+	// kernPID, when > 0, is the fake kernel's slot-87 (sys_getpid) answer —
+	// the register WmPeers prefers over the name scan (#2158). A zero
+	// value models a kernel without the slot (-ENOSYS → scan fallback).
+	kernPID int64
+	// extraProcs are appended to the fake's two built-in proc rows — the
+	// duplicate-instance shape needs a second RUNNING row with the same
+	// name as the caller's binary.
+	extraProcs []ProcRow
 }
 
 func namedProc(pid uint64, name string) ProcRow {
@@ -264,6 +272,7 @@ func (f *wmMailFake) hook(num uintptr, a0, a1, a2, a3 uintptr) int64 {
 			namedProc(3, wmName),
 			namedProc(selfPID, "NOTE.ELF"),
 		}
+		rows = append(rows, f.extraProcs...)
 		n := 0
 		for _, r := range rows {
 			off := n * ProcRowSize
@@ -283,6 +292,13 @@ func (f *wmMailFake) hook(num uintptr, a0, a1, a2, a3 uintptr) int64 {
 		// assigns to GOTABWM.ELF.
 		if a0 == uintptr(WmctlSeatPidCmd) {
 			return 3
+		}
+		return -ErrENOSYS
+	case SlotGetpid:
+		// #2158: the self-pid register — a zero kernPID models a kernel
+		// without the slot, exercising the name-scan fallback.
+		if f.kernPID > 0 {
+			return f.kernPID
 		}
 		return -ErrENOSYS
 	case SlotIPCSend:
@@ -464,6 +480,52 @@ func TestWmMailRequestRefusesGeometryUnderGoSeat(t *testing.T) {
 	if g.sent[0].X != 11 || g.sent[0].Y != 22 || g.sent[0].W != 330 || g.sent[0].H != 440 {
 		t.Fatalf("legacy frame geometry = (%d,%d,%d,%d) want (11,22,330,440)",
 			g.sent[0].X, g.sent[0].Y, g.sent[0].W, g.sent[0].H)
+	}
+}
+
+func TestWmMailRequestRoutesAcksToCallersOwnPid(t *testing.T) {
+	// #2158: the caller is the SECOND NOTE.ELF instance (kernel pid 8 —
+	// the duplicate-tab chord's spawn); the first instance's row (pid 4)
+	// is what a name scan resolves. The kernel register must stamp
+	// reply_to=8 so the seat's bind challenge and every later ack lands
+	// in THIS mailbox — the audit repro showed reply_to=4 and a bounded
+	// 8-tick honest false under the authenticated protocol.
+	f := startWmMailFake(t)
+	f.wmName = "GOTABWM.ELF"
+	f.selfPID = 4 // the FIRST instance's row — the name-scan answer
+	f.kernPID = 8
+	f.extraProcs = []ProcRow{namedProc(8, "NOTE.ELF")}
+	const challenge = uint64(0x00deadbeef00cafe)
+	const token = uint64(0x0123456789abcdef)
+	f.replyFn = func(req WmRpc) []byte {
+		if req.ReplyTo != 8 {
+			// The seat routed this ack to the FIRST instance's ring —
+			// this mailbox hears nothing.
+			return nil
+		}
+		rep := WmRpc{Kind: req.Kind | WmRpcReplyFlag, ID: req.ID, Seq: req.Seq, ReplyTo: req.ReplyTo}
+		switch WmAuth(req) {
+		case 0:
+			rep.Pad = WmRpcPadChallenge
+			SetWmAuth(&rep, challenge)
+		case challenge, token:
+			rep.Pad = WmRpcPadBound
+			SetWmAuth(&rep, token)
+			rep.Applied = 1
+		default:
+			return nil
+		}
+		return rep.Encode()
+	}
+	prev := bindSetTitle
+	bindSetTitle = func(id int, s string) int64 { return 0 }
+	t.Cleanup(func() { bindSetTitle = prev })
+
+	if !WmMailRequest(WmRpcKindRaise, 4, 0, 0, 0, 0, "", "NOTE.ELF") {
+		t.Fatal("the second instance's request must route its acks to pid 8, not the first instance's 4")
+	}
+	if f.sent[0].ReplyTo != 8 {
+		t.Fatalf("reply_to = %d want 8 (the caller's own kernel pid)", f.sent[0].ReplyTo)
 	}
 }
 

@@ -116,6 +116,7 @@ const sys_principal = syscall.sys_principal;
 const sys_file_mode = syscall.sys_file_mode;
 const sys_secret_get = syscall.sys_secret_get;
 const sys_getrandom = syscall.sys_getrandom;
+const sys_getpid = syscall.sys_getpid;
 const getrandom_max = syscall.getrandom_max;
 const secret = syscall.secret;
 const trust = syscall.trust;
@@ -155,7 +156,7 @@ test "syscall: M94 trace and profile control and remaining observability stub ar
 
 test "syscall: ABI metadata covers every registered row without pointers" {
     const abi = syscall.abi;
-    try std.testing.expectEqual(@as(usize, 87), abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 88), abi.slots.len);
     for (&abi.slots, 0..) |slot, index| {
         try std.testing.expectEqual(index, slot.number);
         try std.testing.expectEqualStrings(slot.name(), entry_info(index).?.name);
@@ -177,7 +178,7 @@ test "syscall: ABI metadata covers every registered row without pointers" {
             try std.testing.expect(earlier.number != item.number or earlier.selector != item.selector or earlier.op != item.op);
         }
     }
-    try std.testing.expect(abi.lookup(87) == null); // first free slot after M99i #2187's 84–86
+    try std.testing.expect(abi.lookup(88) == null); // first free slot after #2158's sys_getpid (87)
     try std.testing.expectEqual(abi.ArgKind.string, abi.shape(79, .{ 0, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.fd, abi.shape(80, .{ 2, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.int, abi.shape(27, .{ 0, 0, 0, 0x8000000000000002, 0, 0 }).?.args[0].kind);
@@ -213,7 +214,7 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
             implemented += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 87), implemented);
+    try std.testing.expectEqual(@as(usize, 88), implemented);
     try std.testing.expectEqualStrings("sys_socket", entry_info(80).?.name);
     try std.testing.expectEqualStrings("sys_fs_metadata", entry_info(79).?.name);
     try std.testing.expectEqualStrings("sys_pipe_read", entry_info(sys_pipe_read).?.name);
@@ -301,13 +302,14 @@ test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
     try std.testing.expectEqual(@as(u64, 1), call_count(sys_ping));
 
     // Unregistered in-range slots still return ENOSYS. M94 reserves
-    // 81–83; M99i (#2187) takes 84–86 for the owned UDP seam.
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 87));
+    // 81–83; M99i (#2187) takes 84–86 for the owned UDP seam; #2158
+    // takes 87 for sys_getpid.
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 88));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
-    try std.testing.expectEqual(@as(u64, 1), call_count(87));
+    try std.testing.expectEqual(@as(u64, 1), call_count(88));
 
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 88));
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 89));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
 }
@@ -1395,7 +1397,7 @@ test "syscall: counters are monotonic and report is deterministic" {
     var con = mock.console();
     report(&con);
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=87\n" ++
+        "syscalls: slots=64 implemented=88\n" ++
             "  0 sys_ping calls=2\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1482,7 +1484,8 @@ test "syscall: counters are monotonic and report is deterministic" {
             "  83 sys_memstat calls=0\n" ++
             "  84 sys_udp_send_from calls=0\n" ++
             "  85 sys_udp_recv_from calls=0\n" ++
-            "  86 sys_udp_close calls=0\n",
+            "  86 sys_udp_close calls=0\n" ++
+            "  87 sys_getpid calls=0\n",
         mock.contents(),
     );
 }
@@ -2873,7 +2876,7 @@ test "syscall: slot-65 cmd 22 GPU3D — typed descriptor boundary on the existin
 
     // Slot count/table unchanged: cmd 22 is the only new kernel entry,
     // and it rides slot 65 — the dispatch table itself did not grow.
-    try std.testing.expectEqual(@as(usize, 87), syscall.abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 88), syscall.abi.slots.len);
     gpu3d_device.reset_state();
 }
 
@@ -5876,8 +5879,8 @@ test "syscall: SYS_TIME (slot 66, #1058) returns the firmware wall-clock epoch" 
     // M50 TS1 added slot 68 (sys_principal), TS2 slot 69 (sys_file_mode),
     // TS5 slot 70 (sys_secret_get), TS4 slot 71 (sys_tty_net_auth);
     // M51 SSH-P1 (#1166) slot 72 (sys_getrandom); issue #1228 slot 75;
-    // issue #1163 phase 2 slot 76 (sys_sock_ready).
-    try std.testing.expectEqual(@as(usize, 87), syscall.implemented_count);
+    // issue #1163 phase 2 slot 76 (sys_sock_ready); #2158 slot 87.
+    try std.testing.expectEqual(@as(usize, 88), syscall.implemented_count);
 
     const saved_epoch = timer.boot_epoch_secs;
     const saved_ticks = timer.ticks;
@@ -5986,6 +5989,25 @@ test "syscall: SYS_PRINCIPAL reports an explicit uid_system principal" {
     try std.testing.expectEqual(process.kernel_caps, std.mem.readInt(u32, buf[4..8], .little));
 }
 
+test "syscall: sys_getpid (slot 87, #2158) returns the caller's pid — EINVAL for a non-process task" {
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = a user process
+    scheduler.start();
+    var frame = fresh_frame();
+    // An EL1h caller (the shell) is not a process: EINVAL, same as
+    // sys_principal — there is no pid to fabricate.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_getpid, .{ 0, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(scheduler.yield_current());
+    const task = scheduler.current_id();
+    try std.testing.expectEqual(@as(usize, 2), task);
+    // The kernel's registry answer, not a name scan: pid is exactly what
+    // find_by_task resolves for the running task.
+    try std.testing.expectEqual(@as(u64, process.find_by_task(task).?), dispatch(sys_getpid, .{ 0, 0, 0, 0, 0, 0 }, &frame));
+}
+
 // ---------------------------------------------------------------------------
 // M50 TS3 (issue #1137, ADR 0024 D5/D10): the capability gate table + kill gate
 // ---------------------------------------------------------------------------
@@ -6035,7 +6057,7 @@ test "syscall: M50 TS3 gate table is explicit, bounded, and exactly the ADR 0024
         try std.testing.expect(gate.number < syscall.implemented_count);
         try std.testing.expect(entry_info(gate.number) != null);
     }
-    try std.testing.expectEqual(@as(usize, 87), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 88), syscall.implemented_count);
 }
 
 test "syscall: no slot can raise uid/caps (TS3 consumes caps, adds no setter)" {

@@ -33,6 +33,7 @@ const (
 	SlotUDPSendFrom        uintptr = 84
 	SlotUDPRecvFrom        uintptr = 85
 	SlotUDPClose           uintptr = 86
+	SlotGetpid             uintptr = 87
 )
 
 type SyscallArgKind uint8
@@ -154,6 +155,7 @@ var SyscallSlots = [...]SyscallSlot{
 	{SlotUDPSendFrom, "sys_udp_send_from", 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotUDPRecvFrom, "sys_udp_recv_from", 3, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotUDPClose, "sys_udp_close", 1, [6]SyscallArg{{Kind: ArgInt}}},
+	{SlotGetpid, "sys_getpid", 0, [6]SyscallArg{}},
 }
 
 var SyscallVariants = [...]SyscallVariant{
