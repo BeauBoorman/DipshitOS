@@ -203,7 +203,15 @@ vgate_assert 03 serial-contains 'web: settled'
 vgate_assert 03 serial-contains 'web: repaint items='
 vgate_assert 03 serial-contains 'web: ready'
 vgate_assert 03 serial-contains 'fonts: manifest=ok faces=9'
-vgate_assert 03 serial-contains 'web: fonts truetype(inter+firacode) ui=truetype mono=truetype'
+# M99z (#2194): the probe's serif fields pin the M99p end-to-end — the serif
+# role is loaded (serif=truetype), the face resolved (serif-face=yes), and a
+# {serif} style resolves by name to the serif face, not Inter
+# (serif-resolve=serif). COVER.HTML's `font-family:serif` block and its CJK
+# line are the in-page half of that evidence; `fonts: notdef` staying silent
+# is what proves neither rune set painted tofu.
+vgate_assert 03 serial-contains 'web: fonts truetype(inter+firacode) ui=truetype mono=truetype serif=truetype'
+vgate_assert 03 serial-contains ' serif-face=yes'
+vgate_assert 03 serial-contains ' serif-resolve=serif'
 vgate_assert 03 serial-contains ' bi-face=yes'
 vgate_assert 03 serial-contains ' bi-resolve=bolditalic'
 vgate_assert 03 serial-absent 'fonts: notdef='
@@ -239,6 +247,12 @@ for yy in range(y, y + h):
 print("coverage viewport ink pixels:", ink, "bg:", bg.hex())
 if ink < 500:
     sys.exit("coverage page painted too little ink for 12 real glyphs")
+# M99z (#2194): the card's per-family pixel evidence rides on the serial
+# markers, not on pixel regions — `fonts: notdef` absent proves every rune
+# (the CJK codepoints AND the serif-only ℔/ﬁ in the font-family:serif
+# block) resolved to real coverage instead of tofu, `serif-resolve=serif`
+# proves the serif run took the serif face, and the ink floor above proves
+# the page painted them.
 PY
 
 # 04: fail-first mirror. The coverage faces are deleted through the real host
@@ -294,12 +308,14 @@ vgate_run 05 -- \
     --script-expect 'web: ready' --timeout 120
 
 vgate_assert 05 serial-absent 'web: budget over'
-vgate_assert 05 serial-contains 'web: fonts bitmap8x8 ui=missing mono=missing'
+vgate_assert 05 serial-contains 'web: fonts bitmap8x8 ui=missing mono=missing serif=missing'
 vgate_assert 05 serial-contains 'web: text face=bitmap8x8 proportional=no'
 vgate_assert 05 serial-contains ' bold-face=no'
 vgate_assert 05 serial-contains ' italic-face=no'
 vgate_assert 05 serial-contains ' bi-face=no'
 vgate_assert 05 serial-contains ' bi-resolve=none'
+vgate_assert 05 serial-contains ' serif-face=no'
+vgate_assert 05 serial-contains ' serif-resolve=none'
 vgate_assert 05 serial-contains ' adv-i=8'
 vgate_assert 05 serial-contains ' adv-W=8'
 vgate_assert 05 serial-contains ' h1-lineh=18'

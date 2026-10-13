@@ -262,3 +262,213 @@ vgate_assert wav-nodev serial-contains 'procs GOSOUND.ELF exited status=0'
 vgate_assert wav-nodev serial-absent 'gosound: streaming'
 vgate_assert wav-nodev serial-absent 'gosound: refused'
 vgate_assert wav-nodev serial-absent '[EXC] parking'
+
+# ----------------------------------------------------------------------
+# M99z (#2194) run wav-toast: the audio end-to-end. A real WAV streams from
+# GOFILES's open-by-extension dispatch through GOSOUND while a kind-12
+# notify toast — the M99d path, GOFILES's own copy completion — fires MID-
+# STREAM and its chime mixes on a second source seat. The card's bar is
+# that both streams' `completed` counters advance while they overlap: the
+# chime's `played` line carries the kernel's own completed count, and
+# GOSOUND's `done` line reports the mixer's PeakSources, which only reaches
+# 2 if the chime was in the mix alongside it.
+#
+# The choreography is the go-wm-seat run 06 pattern: the seat is staged on
+# the share but SETTINGS.TXT pins wm=none so nothing autostarts — the
+# earlier runs in this spec then keep their seatless shim environment —
+# and this run execs GOTABWM.ELF itself. `vf rm GOTABWM.DEMO` keeps the
+# seat live (demo mode's single-tab countdown would close apps).
+#
+# SND2/LONG.WAV is a 40 s 44.1 kHz stereo sine — same resample path as
+# TONE.WAV, four times the stream length — because the toast takes real
+# wall time to arrive: the mid-stream chord batch is alt-tab plus the five
+# printable-byte strokes (j c k return p, the keys.Decode-safe dance from
+# go-wm-seat run 06) and each stroke was observed costing ~1 s while the
+# seat composited under load (first attempts, 2026-10-12). The script-
+# expect is `gosound: done`, so the toast has to land well inside the
+# stream. Measured under load (2026-10-12): the seat forwards input on a
+# starved cadence while it composites — the first app-directed keystroke
+# after the alt-tab sat ~10 s before the batch drained; the whole
+# alt-tab+j c k return p batch spanned ~15 s. 40 s still failed: the
+# kind-12 post landed but the starved seat did not drain its mailbox —
+# and the played chime — before teardown (observed 2026-10-13). 60 s
+# leaves a ~35 s drain window after the ~25 s batch.
+vgate_setup_python <<'PY'
+import math, os, shutil, struct, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+# The seat: staged for run wav-toast only; SETTINGS.TXT below pins wm=none
+# so the kernel never autostarts it and the earlier runs keep the shim.
+src = os.path.join(".build", "go", "GOTABWM.ELF")
+if not os.path.exists(src):
+    sys.exit("GOTABWM.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-gotabwm.sh")
+shutil.copy(src, os.path.join(share, "GOTABWM.ELF"))
+with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
+    f.write("#v2\nwm=none\n")
+# The toast source: a GOFILES copy completion posts the kind-12 notice.
+# TWO paste cycles below give the post two independent chances — under a
+# starved seat the WM_RPC ack races the 8-tick budget and a single post
+# was observed refused with no delivery (2026-10-13). NOTIFY lists
+# dirs-first as [SUB, SOURCE.XYZ] and SUB holds only the empty D1; the
+# .XYZ extension has no mime handler, so a stray `return` on the source
+# degrades to an "open refused" status, never an exec'd app mid-stream.
+# The dance is DOWNWARD-ONLY on purpose: no goUp means no /host wander
+# (observed 2026-10-13 when doubled 'h' left the batch in the share root
+# and the second paste refused "exists" on a root file).
+d = os.path.join(share, "NOTIFY")
+os.makedirs(os.path.join(d, "SUB", "D1"), exist_ok=True)
+with open(os.path.join(d, "SOURCE.XYZ"), "w") as f:
+    f.write("copy me\n")
+# The long stream: 60 s of 44.1 kHz stereo s16 sine, 2646000 frames.
+d2 = os.path.join(share, "SND2")
+os.makedirs(d2, exist_ok=True)
+rate, frames = 44100, 2646000
+data = bytearray()
+for i in range(frames):
+    v = int(0.2 * 32767 * math.sin(2 * math.pi * 440 * i / rate))
+    data += struct.pack("<hh", v, v)
+hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" +
+       b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, rate, rate * 4, 4, 16) +
+       b"data" + struct.pack("<I", len(data)))
+with open(os.path.join(d2, "LONG.WAV"), "wb") as f:
+    f.write(hdr + data)
+print("staged GOTABWM + NOTIFY + SND2/LONG.WAV (%d bytes, %d frames)" %
+      (len(hdr) + len(data), frames))
+PY
+
+vgate_file script-seat.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+
+# GOFILES on NOTIFY execs FIRST so its seat handshake (declare/nav-declare)
+# completes while the seat is idle — a second GOFILES exec'd mid-stream was
+# observed to sit unbound until the stream ended, dropping the key batch on
+# the floor (first attempt, 2026-10-12). Its tab is then index 0.
+vgate_file script-notify.txt <<'EOF'
+dui focus 0
+set GOMAXPROCS=1
+exec GOFILES.ELF /host/NOTIFY
+EOF
+
+# GOMAXPROCS=1 is pinned in every script: four runtimes (seat, two
+# GOFILES, GOSOUND) at 3 tasks each stay inside the 13 EL0 slots — at the
+# default of 2 the GOSOUND exec was observed to hit newosproc EAGAIN and
+# die status=2 (2026-10-13).
+vgate_file script-snd2.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOFILES.ELF /host/SND2
+EOF
+
+# script2 opens the NOTIFY GOFILES once the seat's chime is armed; script3
+# opens the SND2 one once the first is fully declared (a unique per-path
+# marker — 'gofiles: ready' prints once per instance). The SND2 instance is
+# focused on open, so a lone '\n' opens LONG.WAV -> GOSOUND (tab index 2).
+# Mid-stream one alt-tab wraps focus index 2 -> 0 (positional cycle) back to
+# the NOTIFY GOFILES, whose input path is long since live, then TWO
+# copy+paste cycles post the kind-12 twice — one post was observed refused
+# with no delivery under seat starvation (2026-10-13), so the evidence
+# rides on either toast landing. Motion strokes are absolute + idempotent
+# (end/home clamp); single-return drops are absorbed by cycle B's extra
+# depth, and every wrong landing degrades to a refused paste or a refused
+# .XYZ open, never an exec'd app:
+#   cycle A: end,end -> SOURCE.XYZ; c,c copy; home,home -> SUB;
+#            return cd in; p,p paste SOURCE.XYZ into SUB -> post 1
+#   cycle B: home,home -> D1 (cwd is now SUB=[D1, SOURCE.XYZ]);
+#            return,return cd D1 (empty, second no-ops); p,p paste
+#            SOURCE.XYZ into D1 -> post 2
+# If cycle A's lone return drops, the first p refuses "exists" in NOTIFY
+# and cycle B cds SUB then D1 before pasting — still one clean post. A
+# dropped alt-tab fails honestly: the keys land on the GOSOUND tab.
+vgate_run wav-toast -- \
+    --sound --screen '$RUN_DIR/toast-screen' --input --via-virtio --cvc-snap \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-notify.txt' \
+    --script2-after 'gotabwm: notify-sound ready' \
+    --script3 '$RUN_DIR/script-snd2.txt' \
+    --script3-after 'gofiles: nav declare /host/NOTIFY' \
+    --input-string $'\n' --input-string-after 'gofiles: list /host/SND2' \
+    --input-chords 'alt-tab,end,end,c,c,home,home,return,p,p,home,home,return,return,p,p' \
+    --input-chords-after 'gosound: streaming gen=' \
+    --script-expect 'gosound: done ' --timeout 240
+
+# The seat came up with its chime path armed (a device exists under
+# --sound), and the dispatch chain ran: list -> open -> GOSOUND streaming.
+vgate_assert wav-toast serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert wav-toast serial-contains 'gotabwm: holding seat'
+vgate_assert wav-toast serial-contains 'gotabwm: notify-sound ready bytes='
+vgate_assert wav-toast serial-contains 'gofiles: list /host/SND2'
+vgate_assert wav-toast serial-contains 'gofiles: open launched LONG.WAV handler=GOSOUND.ELF'
+vgate_assert wav-toast serial-contains 'gosound: open id='
+vgate_assert wav-toast serial-contains 'gosound: loaded LONG.WAV fmt=pcm16 ch=2 rate=44100 frames=2646000'
+vgate_assert wav-toast serial-contains 'gosound: streaming gen='
+
+# The toast's half: the mid-stream GOFILES copied, the seat accepted the
+# kind-12, painted it, and drained the chime — the kernel's completed count
+# is on the played line. NOTE the app-side `gofiles: notify sent|refused`
+# marker is NOT asserted either way: vi.Notify's bool is a post-time
+# verdict, not a delivered verdict — observed 2026-10-13 it printed
+# `refused` while the seat still painted id=3 and played the chime. The
+# seat-side lines below are the authoritative toast evidence.
+vgate_assert wav-toast serial-contains 'gofiles: list /host/NOTIFY'
+vgate_assert wav-toast serial-contains 'gofiles: pasted SOURCE'
+vgate_assert wav-toast serial-contains 'gotabwm: notify id='
+vgate_assert wav-toast serial-contains 'gotabwm: notify paint id='
+vgate_assert wav-toast serial-contains 'gotabwm: notify-sound played bytes='
+vgate_assert wav-toast serial-contains 'gosound: done '
+# 'gofiles: open refused' and 'gofiles: open launch refused' are
+# deliberately NOT absent-asserted: the doubled-stroke design tolerates
+# drops AND doubles — a stray return on a .XYZ source prints `open
+# refused`, and a doubly-landed 'h' can wander the batch to a share-root
+# file whose handler is not staged (`open launch refused ... ENOENT`),
+# both observed safe (2026-10-13: toast+chime still landed via the other
+# cycle).
+vgate_assert wav-toast serial-absent 'gotabwm: notify-sound skipped'
+vgate_assert wav-toast serial-absent 'gosound: refused'
+vgate_assert wav-toast serial-absent 'gosound: drain failed'
+vgate_assert wav-toast serial-absent '[EXC] parking'
+vgate_assert wav-toast serial-absent 'exited status=139'
+
+# The card's counter evidence, all recomputed: the chime's played bytes
+# equal its kernel-completed count, it landed while the stream was live
+# (the played marker precedes gosound's done), the wav stream drained
+# every resampled byte (accepted == submitted == completed == 1764000
+# frames resampled to 1920000 * 8 B FLOAT stereo), and the mixer's
+# PeakSources reached 2 — the two streams really were concurrent.
+vgate_assert wav-toast python <<'PY'
+import os, re, sys
+
+ser = open(os.environ["VG_SER"], "rb").read().decode("latin1", errors="replace")
+pm = re.search(r"gotabwm: notify-sound played bytes=(\d+) completed=(\d+)", ser)
+if not pm:
+    sys.exit("ERROR: no notify-sound played marker")
+played_bytes, played_done = int(pm.group(1)), int(pm.group(2))
+if played_bytes <= 0 or played_done < played_bytes:
+    sys.exit(f"ERROR: chime counters bytes={played_bytes} "
+             f"completed={played_done}")
+dm = re.search(
+    r"gosound: done accepted=(\d+) submitted=(\d+) completed=(\d+) "
+    r"underruns=(\d+) peak=(\d+) clipped=(\d+)", ser)
+if not dm:
+    sys.exit("ERROR: no gosound done marker")
+accepted, submitted, completed, underruns, peak, clipped = (
+    int(g) for g in dm.groups())
+in_frames = 2646000
+want_frames = -(-in_frames * 48000 // 44100)
+want_bytes = want_frames * 8
+if want_frames != 2880000:
+    sys.exit(f"ERROR: fixture math changed: want_frames={want_frames}")
+if not (accepted == submitted == completed == want_bytes):
+    sys.exit(f"ERROR: counters accepted={accepted} submitted={submitted} "
+             f"completed={completed}, want {want_bytes}")
+if peak != 2:
+    sys.exit(f"ERROR: peak={peak}, want 2 (the chime overlap)")
+if not (0 <= pm.start() < dm.start()):
+    sys.exit("ERROR: chime played marker did not precede gosound done")
+print(f"toast-overlap ok: chime {played_done} B completed, "
+      f"stream {completed} B completed, peak={peak}")
+PY
