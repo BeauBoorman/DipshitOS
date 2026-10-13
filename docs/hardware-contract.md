@@ -38,6 +38,23 @@ Without `--sound`, open and legacy playback refuse ENXIO loudly.
 Ownership/completion accounting is not captured audio, an audible
 continuity measurement, capture support, or a low-latency guarantee.
 
+**B7 pump cadence [observed]** (M99a, #2179, `m99a-probe` ×3 spec
+passes on macOS 27.2 build 26B5101f, instrumented scratch kernel):
+the stream pump (`snd_stream_drive`, entered from stream syscalls and
+the scheduler main-context poll, never IRQ) ran 174k–502k drive
+entries per 12–19 s run at a mean drive-to-drive gap of 24–72 µs with
+≥ 99.97 % of gaps < 1 ms across baseline, GOTOP+WEB-corpus+GOSTRESS,
+and saturating-spin loads; the largest gap on a zero-XRUN boot was
+19 ms. Every gap ≥ 500 ms coincided with an owner-starvation / sticky
+XRUN window (0–8 XRUNs per run under load) — the user-side owner, not
+the kernel pump, is what starves the ring. A busy-polling userland
+doorbell consumer measured publish→submit p50 7–9 µs but p99 64–68 ms
+over the mailbox IPC path — multi-10 ms and ≥ 64 ms timeslice stalls
+are routine for a user process even near idle — which is why ADR 0046
+puts the mixer in the kernel rather than in an `AUDIOD.ELF` daemon.
+All figures are buffer/accounting evidence; the no-capture-path limit
+above still stands.
+
 Custom-virtio identity rationale (claim 3141): the device keeps the
 virtio-pci transitional scheme — vendor `0x1af4` is REQUIRED so the
 transport is discoverable as virtio (a private vendor ID would make it a
