@@ -84,6 +84,16 @@
 //!                                   rung (8x16), so `small` SHRINKS the
 //!                                   grid below the boot cell and `medium`
 //!                                   is the no-op rung at the classic rect.
+//!   notify_sound string (none)      "on"|"off" — the seat's notification
+//!                                   chime (M99d #2182). Accepted, not
+//!                                   seeded: absent = on. The kernel
+//!                                   stores it; the seat interprets it.
+//!   audio_volume string  (none)     "0".."100" — slot-44 stream gain
+//!                                   (M99d #2182). Accepted, not seeded:
+//!                                   the gain is kernel state that resets
+//!                                   to 100 at boot; the row only carries
+//!                                   the choice for its consumers to
+//!                                   re-apply.
 
 const std = @import("std");
 // M34 HF5 (issue #739): the host-share persistence path; HF6 (issue
@@ -109,9 +119,12 @@ pub const wm_default: []const u8 = "gotabwm";
 
 pub const max_key_len: usize = 32;
 pub const max_val_len: usize = 64;
-// Nine seeded rows, eight optional/extension rows, and the optional
-// keyboard_layout selector can coexist in a persisted table.
-pub const max_entries: usize = 18;
+// M99d (#2182): nine seeded rows plus the Go codec's ten optional/accepted
+// rows (palette_fg/bg/accent, font_size, keyboard_layout, idle_minutes,
+// notify_dnd, notify_sound, audio_volume, timezone) can all persist, with
+// one slot to spare — a file carrying the full union is 19 rows and must
+// load without dropping the tail.
+pub const max_entries: usize = 20;
 
 pub const Entry = struct {
     key: [max_key_len]u8 = @as([max_key_len]u8, @splat(@as(u8, 0))),
@@ -928,7 +941,7 @@ test "settings: a full legacy table can gain the persisted layout" {
     init();
     defer init();
     try std.testing.expectEqual(@as(usize, 9), count());
-    for (0..8) |i| {
+    for (0..10) |i| {
         var key: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&key, "extension{d}", .{i});
         try std.testing.expectEqual(SetResult.ok, set(name, "v"));

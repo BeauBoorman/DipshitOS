@@ -36,10 +36,29 @@
 # (exact-RGB, straight out of the guest), and a `--pointer-virtio` click on
 # the toast that dismisses it and focuses the sender.
 #
+# M99d (#2182) adds runs 08-11: the audible half of the same seam, played
+# through the M99b vi.AudioStream mixer path (never the blocking slot-43
+# drain), plus the GOSET volume row on kernel slot 44. Run 08 is the full
+# sound-on chain — the seat boots with --sound, re-applies the persisted
+# audio_volume row at startup, probes and synthesizes once, then a GOFILES
+# toast plays the chime and the NEXT composite tick prints `notify-sound
+# played` with the kernel's own completed counter. The same run drives
+# GOSET.ELF's typed `audio_volume=40` row and reads the kernel's `sound`
+# report for `sound: vol=40`. Runs 09-11 are the silence contracts: a
+# DND-held notice, a `notify_sound=off` boot, and a soundless VM each keep
+# the toast working while `43 sys_audio_play calls=0` (the kernel's own
+# counter — stream opens and legacy plays share it) proves nothing ever
+# reached the audio path. HOST PREREQUISITE for run 08:
+#   bash tools/go/build-goset.sh -> .build/go/GOSET.ELF
+#
 # exec-order: assert-proven -- each run ends on a marker only its script prints
 # (`rx-gotabwm-ok`, `rx-gotabwm-np-ok`, `rx-gotabwm-chrome-ok`), and every stage
 # gate waits on guest output the program, the kernel and the hosted app produce
 # (`gotabwm: win focus`, `gotabwm: present`, `wm: unregistered, shim resumed`).
+# The M99d runs are graded the strong way: 08 ends on `gotabwm: notify-sound
+# played` (a marker only the seat's completed-drain check can print) and
+# 09-11 end on their own `rx-*` echoes, gated behind guest markers
+# (`gofiles: notify sent` / `gotabwm: notify dismiss id=`).
 #
 # M71c (#1562) adds run 03: the seat's OWN clock/status chrome, on an EMPTY
 # strip. Run 01/02 host a full-viewport client that the kernel repaints every
@@ -169,6 +188,21 @@ with open(os.path.join(notify, "SOURCE.TXT"), "w") as f:
     f.write("notify-adopter-payload\n")
 print("staged GOFILES.ELF (%d bytes) + NOTIFY/SOURCE.TXT + NOTIFY/SUB"
       % os.path.getsize(os.path.join(share, "GOFILES.ELF")))
+PY
+
+# M99d (#2182): run 08 hosts GOSET.ELF to drive the volume row — the typed
+# `audio_volume=40` line lands on kernel slot 44 through the panel's normal
+# set+save path. HOST PREREQUISITE: bash tools/go/build-goset.sh
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOSET.ELF")
+if not os.path.exists(src):
+    sys.exit("GOSET.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-goset.sh")
+shutil.copy(src, os.path.join(share, "GOSET.ELF"))
+print("staged GOSET.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GOSET.ELF")))
 PY
 
 # M71h (#1567): run 04 hosts the image viewer, so stage it and the QOI fixture
@@ -942,3 +976,323 @@ if ink < 20:
     sys.exit("curtain's honesty text did not paint (%d ink pixels)" % ink)
 print("curtain covers full frame; panel accent and honesty text painted (ink=%d)" % ink)
 PY
+
+# --- M99d (#2182) run 08: an audible toast + the GOSET volume row ----------
+#
+# The chain this run proves has four links, each independently checkable:
+#
+#   gotabwm: notify-sound volume=25     the seat re-applied the persisted
+#                                        audio_volume row to slot 44 at boot
+#                                        (the kernel's gain boots at 100 and
+#                                        never reads the file, so the seat is
+#                                        the consumer)
+#   gotabwm: notify-sound ready         the one-time AudioQuery succeeded and
+#     bytes=N fmt=.. rate=.. ch=..       the chime was synthesized for the
+#                                        negotiated tuple — never probed again
+#   sound: vol=40                        the KERNEL's own report after GOSET's
+#                                        typed `audio_volume=40` line landed
+#                                        on slot 44 through the normal
+#                                        set+save path
+#   gotabwm: notify-sound played        the toast's chime drained through the
+#     bytes=N completed=N                mix; `completed` is the kernel's own
+#                                        counter, printed on the composite
+#                                        tick AFTER the bounded play call
+#
+# The chime is an M99b vi.AudioStream client (open, prefill inside the
+# per-source queue, start, end) — never the blocking slot-43 drain, which the
+# kernel's own `43 sys_audio_play` counter would expose because stream ops
+# and legacy plays share the slot.
+#
+# The inputs use the two proven transports deliberately: GOSET's typed line
+# rides --input-chords (the go-wm-default keyboard_layout pattern) after
+# `goset: ready `, and GOFILES's copy+notify batch rides --input-string (the
+# run 06 pattern — printable runes, no CSI expansion) after `gofiles: ready`.
+# The `sound` report is forwarded the moment GOSET's `saved` marker lands, so
+# `sound: vol=40` is read after the apply but before GOFILES ever execs.
+vgate_file script-08.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm NOTIFY/SUB/SOURCE.TXT
+set GOMAXPROCS=1
+settings set notify_dnd off
+settings set notify_sound on
+settings set audio_volume 25
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-08.txt <<'EOF'
+dui focus 0
+exec GOSET.ELF
+EOF
+
+vgate_file script3-08.txt <<'EOF'
+sound
+exec GOFILES.ELF /host/NOTIFY
+EOF
+
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
+    --via-virtio \
+    --sound \
+    --script '$RUN_DIR/script-08.txt' \
+    --script2 '$RUN_DIR/script2-08.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'a,u,d,i,o,_,v,o,l,u,m,e,=,4,0,return' \
+    --input-chords-after 'goset: ready ' \
+    --script3 '$RUN_DIR/script3-08.txt' \
+    --script3-after 'goset: saved ' \
+    --input-string $'jck\np' \
+    --input-string-after 'gofiles: ready' \
+    --script-expect 'gotabwm: notify-sound played' --timeout 300
+
+vgate_assert 08 serial-contains 'settings: notify_dnd=off (persisted)'
+vgate_assert 08 serial-contains 'settings: notify_sound=on (persisted)'
+vgate_assert 08 serial-contains 'settings: audio_volume=25 (persisted)'
+vgate_assert 08 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 08 serial-contains 'gotabwm: mode live'
+# The seat's startup sound contract: the persisted row re-applied to slot 44,
+# then the one probe and the one synthesis — in that order, once each.
+vgate_assert 08 serial-contains 'gotabwm: notify-sound volume=25'
+vgate_assert 08 serial-contains 'gotabwm: notify-sound ready bytes='
+vgate_assert 08 serial-absent 'gotabwm: notify-sound off'
+vgate_assert 08 serial-absent 'gotabwm: notify-sound unavailable'
+# The panel's half of the volume control: the typed row set, saved, and the
+# kernel's OWN report shows the gain the slot-44 call left behind.
+vgate_assert 08 serial-contains 'exec: loaded GOSET.ELF'
+vgate_assert 08 serial-contains 'goset: ready keys='
+vgate_assert 08 serial-contains 'goset: set audio_volume=40'
+vgate_assert 08 serial-contains 'goset: saved keys='
+vgate_assert 08 serial-contains 'sound: vol=40'
+# And the toast is still a toast: the same notify/paint chain run 06 proved,
+# now with its chime confirmed drained by the kernel's own counter.
+vgate_assert 08 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 08 serial-contains 'gofiles: pasted SOURCE.TXT'
+vgate_assert 08 serial-contains 'gofiles: notify sent copied SOURCE.TXT'
+vgate_assert 08 serial-contains 'gotabwm: notify id='
+vgate_assert 08 serial-contains 'gotabwm: notify paint id='
+vgate_assert 08 serial-contains 'gotabwm: notify-sound played bytes='
+vgate_assert 08 serial-absent 'gotabwm: notify-sound skipped'
+vgate_assert 08 serial-absent 'gofiles: notify refused'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 serial-absent 'exited status=139'
+
+# The chain as an arithmetic + ordering check. `played bytes` must equal both
+# the synthesized length from `ready` and the kernel's `completed` counter —
+# a partial drain or a marker printed ahead of the truth fails here, and the
+# causal order (row applied, chime built, toast queued, drain confirmed) is
+# pinned because every one of these markers can appear without the others.
+vgate_assert 08 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+def at(pat, what):
+    m = re.search(pat, ser)
+    if not m:
+        sys.exit("no %s in the serial log" % what)
+    return m
+
+volume = at(r"(?m)^gotabwm: notify-sound volume=(\d+)$", "the boot volume re-apply")
+ready = at(r"(?m)^gotabwm: notify-sound ready bytes=(\d+) fmt=(\d+) rate=(\d+) ch=(\d+)$",
+           "the synthesized chime")
+queued = at(r"(?m)^gotabwm: notify id=(\d+) copied SOURCE\.TXT$", "the toast's queue line")
+vol40 = at(r"(?m)^sound: vol=40", "the kernel's own volume report")
+played = at(r"(?m)^gotabwm: notify-sound played bytes=(\d+) completed=(\d+)$",
+            "the drain confirmation")
+
+if not (volume.start() < ready.start() < queued.start() < played.start()):
+    sys.exit("sound chain out of order: volume=%d ready=%d queued=%d played=%d"
+             % (volume.start(), ready.start(), queued.start(), played.start()))
+# GOSET's apply landed before the `sound` report was forwarded (script3 waits
+# on `goset: saved`, which prints after the set), and the toast's chime came
+# after both — the volume the chime drained at was GOSET's, not the boot row's.
+if not (at(r"goset: set audio_volume=40", "the panel's set").start()
+        < vol40.start() < queued.start()):
+    sys.exit("volume chain out of order: the kernel report must sit between "
+             "the panel's set and the toast")
+
+# The kernel's counters are the honest arithmetic: the chime the seat built
+# is the chime the device confirmed, byte for byte.
+chime = int(ready.group(1))
+if chime <= 0 or chime > 4 * 4096:
+    sys.exit("chime length %d outside the stream prefill bound (4 x 4096)" % chime)
+if int(played.group(1)) != chime:
+    sys.exit("played bytes=%s, want the synthesized %d" % (played.group(1), chime))
+if int(played.group(2)) != chime:
+    sys.exit("the kernel confirmed %s of %d chime bytes" % (played.group(2), chime))
+print("M99d sound chain OK: volume -> ready (%dB fmt=%s rate=%s ch=%s) -> "
+      "set vol=40 -> toast -> played completed=%s"
+      % (chime, ready.group(2), ready.group(3), ready.group(4), played.group(2)))
+PY
+
+# --- M99d (#2182) run 09: DND holds the notice, so nothing ever plays ------
+#
+# `settings set notify_dnd on` is persisted before the exec, so the seat's
+# boot applies it (`notify dnd=on via=boot`) and the notice lands in the
+# center history with `notify held id=` — accepted, never toasted, never
+# chimed. The kernel's `43 sys_audio_play calls=0` is the load-bearing
+# absent: every audio call — a stream open AND a legacy play — shares slot
+# 43, so a seat that secretly probed a chime for the held notice cannot hide
+# behind a missing marker. The `ready` line still prints: DND gates the
+# PLAY, not the one-time device configuration.
+vgate_file script-09.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm NOTIFY/SUB/SOURCE.TXT
+set GOMAXPROCS=1
+settings set notify_dnd on
+settings set notify_sound on
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-09.txt <<'EOF'
+dui focus 0
+exec GOFILES.ELF /host/NOTIFY
+EOF
+
+vgate_file script3-09.txt <<'EOF'
+syscalls
+echo rx-gotabwm-snd-dnd-ok
+EOF
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio \
+    --sound \
+    --script '$RUN_DIR/script-09.txt' \
+    --script2 '$RUN_DIR/script2-09.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-string $'jck\np' \
+    --input-string-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-09.txt' \
+    --script3-after 'gofiles: notify sent copied SOURCE.TXT' \
+    --script-expect 'rx-gotabwm-snd-dnd-ok' --script-expect-tail 4 --timeout 300
+
+vgate_assert 09 serial-contains 'settings: notify_dnd=on (persisted)'
+vgate_assert 09 serial-contains 'gotabwm: notify dnd=on via=boot'
+vgate_assert 09 serial-contains 'gotabwm: notify-sound ready bytes='
+vgate_assert 09 serial-contains 'gofiles: notify sent copied SOURCE.TXT'
+vgate_assert 09 serial-absent 'gofiles: notify refused'
+# Held is the whole point: the notice is in the center, the toast was never
+# queued, and the chime was never touched.
+vgate_assert 09 serial-contains 'gotabwm: notify held id='
+vgate_assert 09 serial-absent 'gotabwm: notify id='
+vgate_assert 09 serial-absent 'gotabwm: notify paint id='
+vgate_assert 09 serial-absent 'gotabwm: notify-sound played'
+vgate_assert 09 serial-absent 'gotabwm: notify-sound skipped'
+# The kernel's own counters, forwarded AFTER the held notice: one probe at
+# boot, zero audio-path calls for the whole run.
+vgate_assert 09 serial-contains '42 sys_audio_info calls=1'
+vgate_assert 09 serial-contains '43 sys_audio_play calls=0'
+vgate_assert 09 serial-contains 'rx-gotabwm-snd-dnd-ok'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
+
+# --- M99d (#2182) run 10: notify_sound=off — the toast without the chime ---
+#
+# The policy row is persisted `off` before the exec, so the boot prints
+# `notify-sound off` and never probes at all — `42 sys_audio_info calls=0`
+# is that fact observed in the kernel's counter, not inferred from a missing
+# marker. The toast itself is unchanged: queued, painted, and dismissed by
+# the NotifyTicks expiry, which is also why script3 waits for the dismiss —
+# the run ends only after the toast's FULL lifetime passed silently.
+vgate_file script-10.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm NOTIFY/SUB/SOURCE.TXT
+set GOMAXPROCS=1
+settings set notify_dnd off
+settings set notify_sound off
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-10.txt <<'EOF'
+dui focus 0
+exec GOFILES.ELF /host/NOTIFY
+EOF
+
+vgate_file script3-10.txt <<'EOF'
+syscalls
+echo rx-gotabwm-snd-off-ok
+EOF
+
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --via-virtio \
+    --sound \
+    --script '$RUN_DIR/script-10.txt' \
+    --script2 '$RUN_DIR/script2-10.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-string $'jck\np' \
+    --input-string-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-10.txt' \
+    --script3-after 'gotabwm: notify dismiss id=' \
+    --script-expect 'rx-gotabwm-snd-off-ok' --timeout 300
+
+vgate_assert 10 serial-contains 'settings: notify_sound=off (persisted)'
+vgate_assert 10 serial-exact 'gotabwm: notify-sound off' 1
+vgate_assert 10 serial-contains 'gofiles: notify sent copied SOURCE.TXT'
+vgate_assert 10 serial-contains 'gotabwm: notify id='
+vgate_assert 10 serial-contains 'gotabwm: notify paint id='
+vgate_assert 10 serial-contains 'gotabwm: notify dismiss id='
+vgate_assert 10 serial-absent 'gotabwm: notify-sound ready'
+vgate_assert 10 serial-absent 'gotabwm: notify-sound played'
+vgate_assert 10 serial-absent 'gotabwm: notify-sound skipped'
+vgate_assert 10 serial-absent 'gotabwm: notify-sound unavailable'
+# Off means never probed: zero info calls, zero audio-path calls.
+vgate_assert 10 serial-contains '42 sys_audio_info calls=0'
+vgate_assert 10 serial-contains '43 sys_audio_play calls=0'
+vgate_assert 10 serial-contains 'rx-gotabwm-snd-off-ok'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 serial-absent 'exited status=139'
+
+# --- M99d (#2182) run 11: no sound device — the toast without the VM flag --
+#
+# Same run as 10 minus --sound: AudioQuery reports no usable device once at
+# boot, the seat prints `unavailable` exactly once (serial-exact pins the
+# one-probe contract — no per-toast ENXIO probing), and the toast lifecycle
+# is byte-for-byte the armed case. `42 sys_audio_info calls=1` +
+# `43 sys_audio_play calls=0` is the kernel's own accounting of it.
+vgate_file script-11.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm NOTIFY/SUB/SOURCE.TXT
+set GOMAXPROCS=1
+settings set notify_dnd off
+settings set notify_sound on
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-11.txt <<'EOF'
+dui focus 0
+exec GOFILES.ELF /host/NOTIFY
+EOF
+
+vgate_file script3-11.txt <<'EOF'
+syscalls
+echo rx-gotabwm-snd-nodev-ok
+EOF
+
+vgate_run 11 -- \
+    --screen '$RUN_DIR/screen-11' \
+    --via-virtio \
+    --script '$RUN_DIR/script-11.txt' \
+    --script2 '$RUN_DIR/script2-11.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-string $'jck\np' \
+    --input-string-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-11.txt' \
+    --script3-after 'gotabwm: notify dismiss id=' \
+    --script-expect 'rx-gotabwm-snd-nodev-ok' --timeout 300
+
+vgate_assert 11 serial-exact 'gotabwm: notify-sound unavailable' 1
+vgate_assert 11 serial-contains 'gofiles: notify sent copied SOURCE.TXT'
+vgate_assert 11 serial-contains 'gotabwm: notify id='
+vgate_assert 11 serial-contains 'gotabwm: notify paint id='
+vgate_assert 11 serial-contains 'gotabwm: notify dismiss id='
+vgate_assert 11 serial-absent 'gotabwm: notify-sound ready'
+vgate_assert 11 serial-absent 'gotabwm: notify-sound played'
+vgate_assert 11 serial-absent 'gotabwm: notify-sound skipped'
+# One probe, no play attempts, and no ENXIO line anywhere — the seat's own
+# output stays clean of the error the card forbids it to leak.
+vgate_assert 11 serial-contains '42 sys_audio_info calls=1'
+vgate_assert 11 serial-contains '43 sys_audio_play calls=0'
+vgate_assert 11 serial-absent 'ENXIO'
+vgate_assert 11 serial-contains 'rx-gotabwm-snd-nodev-ok'
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 serial-absent 'exited status=139'

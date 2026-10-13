@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"virelai/settings"
 	"virelai/theme"
@@ -829,5 +830,302 @@ func TestNotifyHistoryDefaultSeamsDegradeOffGuest(t *testing.T) {
 	flushNotifyHistory()
 	if !notifyHistDirty {
 		t.Fatal("a failed host publish forgot it owed a write")
+	}
+}
+
+// --- M99d (#2182): the notification chime -------------------------------------
+//
+// Host coverage splits at the syscalls, like the history half: the synthesis,
+// the switch, the DND order and the seat seams are plain Go; the device probe,
+// the stream play and the kernel echo are the go-wm-seat gate's job (a host
+// svc returns ENOSYS, which is itself the no-device path).
+
+// chimePush counts notifyPlayChime calls: the seam sits between "an accepted
+// toast happened" and the stream work, so it is how the host sees every
+// policy the push path applies.
+func chimePush(t *testing.T) *int {
+	t.Helper()
+	n := new(int)
+	notifyPlayChime = func() { *n++ }
+	return n
+}
+
+// An accepted toast is audible: one play call per queued toast, none for a
+// refused push and none for a held one — the policy's DND ordering is what
+// makes "held" silent without the chime path knowing why.
+func TestNotifyPushCallsTheChimeForAcceptedToasts(t *testing.T) {
+	resetNotify(t)
+	plays := chimePush(t)
+	if _, ok, _ := notifyPush(4, "ding", 0); !ok || *plays != 1 {
+		t.Fatalf("accepted toast: ok=%v plays=%d", ok, *plays)
+	}
+	notifyPush(4, "ding again", 0)
+	if *plays != 2 {
+		t.Fatalf("two toasts played %d times", *plays)
+	}
+	if _, ok, _ := notifyPush(4, "", 0); ok || *plays != 2 {
+		t.Fatalf("an empty notice played: ok=%v plays=%d", ok, *plays)
+	}
+	notifyDND = true
+	if _, ok, _ := notifyPush(4, "held", 0); !ok || *plays != 2 {
+		t.Fatalf("a DND-held notice played: ok=%v plays=%d", ok, *plays)
+	}
+	// The queue-bound eviction is still an accepted toast — it chimes like
+	// any other; the drop is about pixels, not policy.
+	notifyDND = false
+	for i := 0; i < NotifyMax+1; i++ {
+		notifyPush(4, "flood", 0)
+	}
+	if *plays != 2+NotifyMax+1 {
+		t.Fatalf("a full queue played %d times", *plays)
+	}
+}
+
+// The boot configure wires the whole sound path off one settings.File:
+// notify_sound seeds the bus value the live read uses, and on the host the
+// device probe honestly reports itself unavailable rather than pretending.
+func TestConfigureNotifySoundSeedsTheSwitchAndStaysHonest(t *testing.T) {
+	resetNotify(t)
+	configureNotifyDND(settings.File{State: settings.StateOK,
+		Rows: []settings.Setting{{Key: settings.NotifySoundKey, Val: "off"}}})
+	if notifySoundOn() {
+		t.Fatal("notify_sound=off left the chime switch on")
+	}
+	if notifySoundChime != nil {
+		t.Fatal("notify_sound=off still synthesized a chime")
+	}
+	// A second configure is idempotent: the bus slot is found by name.
+	configureNotifyDND(settings.File{State: settings.StateOK,
+		Rows: []settings.Setting{{Key: settings.NotifySoundKey, Val: "on"}}})
+	n := 0
+	for i := range settingsBusValues {
+		if settingsBusValues[i].key == settings.NotifySoundKey {
+			n++
+		}
+	}
+	if n != 1 || !notifySoundOn() {
+		t.Fatalf("reconfigure: %d notify_sound slots, on=%v", n, notifySoundOn())
+	}
+	// No device on the host: the probe fails, the path stays off and the
+	// seat never chimes — exactly the soundless-VM contract.
+	if notifySoundChime != nil {
+		t.Fatal("a failed device probe still synthesized a chime")
+	}
+	plays := chimePush(t)
+	notifyPush(4, "silent", 0)
+	if *plays != 1 || notifySoundPending != nil || notifySoundSkipped != 0 {
+		t.Fatalf("soundless push: plays=%d pending=%v skipped=%d", *plays, notifySoundPending != nil, notifySoundSkipped)
+	}
+}
+
+// A corrupt file is the defaults: notify_sound absent means on, the bus seed
+// still lands, and the (host-absent) device is named unavailable — never a
+// boot failure.
+func TestConfigureNotifySoundOnACorruptFileDefaultsOn(t *testing.T) {
+	resetNotify(t)
+	configureNotifyDND(settings.File{State: settings.StateCorrupt})
+	if !notifySoundOn() {
+		t.Fatal("a corrupt file switched the chime off")
+	}
+}
+
+// The bus seed is what makes GOSET's publish reach the seat live: a
+// notify_sound row that is not in the value table is a publish refused, so
+// the seed exists for the update path, not for the boot read alone.
+func TestNotifySoundBusValueTakesThePublishPath(t *testing.T) {
+	resetNotify(t)
+	seedNotifySoundBusValue("on")
+	if !notifySoundOn() {
+		t.Fatal("a seeded on read off")
+	}
+	if !updateSettingsBusValue(settings.NotifySoundKey, "off") || notifySoundOn() {
+		t.Fatal("a published notify_sound=off did not reach the switch")
+	}
+	if !updateSettingsBusValue(settings.NotifySoundKey, "on") || !notifySoundOn() {
+		t.Fatal("a published notify_sound=on did not restore the switch")
+	}
+	// A value that is not exactly on/off is the default, like the boot read:
+	// a typo can never silence the chime.
+	seedNotifySoundBusValue("loud")
+	if !notifySoundOn() {
+		t.Fatal("a bogus bus value switched the chime off")
+	}
+}
+
+// playNotifyChime counts a refused open and keeps the seat's tick: the guest
+// gate sees the skip marker; the host sees the counter and the early exits.
+func TestPlayNotifyChimeCountsRefusalsAndHonoursTheSwitch(t *testing.T) {
+	resetNotify(t)
+	notifySoundChime = make([]byte, 8)
+	// The host's open is ENOSYS: a refusal, counted — the toast stands
+	// either way.
+	playNotifyChime()
+	if notifySoundSkipped != 1 || notifySoundPending != nil {
+		t.Fatalf("a refused open: skipped=%d pending=%v", notifySoundSkipped, notifySoundPending != nil)
+	}
+	// notify_sound=off and an absent chime are silent no-ops, not skips —
+	// the counter is for attempts that failed, never for policy.
+	seedNotifySoundBusValue("off")
+	playNotifyChime()
+	notifySoundChime = nil
+	seedNotifySoundBusValue("on")
+	playNotifyChime()
+	if notifySoundSkipped != 1 {
+		t.Fatalf("policy exits counted as skips: %d", notifySoundSkipped)
+	}
+}
+
+// notifySoundTick retires the in-flight stream honestly: on the host a
+// Status call fails, which is the unconfirmed-drain path — the seat clears
+// the seat and counts it rather than claiming a play it cannot prove.
+func TestNotifySoundTickClearsAnUnconfirmableDrain(t *testing.T) {
+	resetNotify(t)
+	notifySoundPending = &vi.AudioStream{}
+	notifySoundBytes = 8
+	notifySoundTick()
+	if notifySoundPending != nil || notifySoundSkipped != 1 {
+		t.Fatalf("a lost stream: pending=%v skipped=%d", notifySoundPending != nil, notifySoundSkipped)
+	}
+}
+
+// --- the chime's synthesis -----------------------------------------------------
+
+// f32le reads one little-endian f32 sample back — the putF32 inverse, kept
+// guest-safe the same way (no math/bits package).
+func f32le(b []byte) float32 {
+	u := uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+	return *(*float32)(unsafe.Pointer(&u))
+}
+func s16le(b []byte) int16 { return int16(uint16(b[0]) | uint16(b[1])<<8) }
+func s32le(b []byte) int32 {
+	return int32(uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24)
+}
+
+// The chime's hard bound is the source queue's whole prefill: the seat
+// submits it all before start and never feeds the stream twice, so a chime
+// that cannot fit is a chime that must not exist. The worst tuple (FLOAT
+// stereo 48 kHz) is the bound's own witness.
+func TestSynthNotifyChimeFitsThePrefillEverywhere(t *testing.T) {
+	worst := synthNotifyChime(vi.AudioInfo{Ready: 1, Format: vi.AudioFmtFloat, Rate: 7, Channels: 2})
+	if len(worst) == 0 || len(worst) > notifyChimeMaxBytes {
+		t.Fatalf("FLOAT stereo 48 kHz chime = %d bytes, bound %d", len(worst), notifyChimeMaxBytes)
+	}
+	for _, info := range []vi.AudioInfo{
+		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 6, Channels: 1},
+		{Ready: 1, Format: vi.AudioFmtS16, Rate: 7, Channels: 2},
+		{Ready: 1, Format: vi.AudioFmtS32, Rate: 5, Channels: 1},
+		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 1, Channels: 2},
+	} {
+		pcm := synthNotifyChime(info)
+		if len(pcm) == 0 || len(pcm) > notifyChimeMaxBytes {
+			t.Fatalf("%+v: %d bytes, bound %d", info, len(pcm), notifyChimeMaxBytes)
+		}
+		if fb, ok := notifyFrameBytes(info.Format, info.Channels); !ok || len(pcm)%int(fb) != 0 {
+			t.Fatalf("%+v: %d bytes is not frame-aligned", info, len(pcm))
+		}
+	}
+	// Deterministic, like fart's sines: a guest and a host build the same
+	// bytes, so the gate's serial marker and this byte count name one sound.
+	again := synthNotifyChime(vi.AudioInfo{Ready: 1, Format: vi.AudioFmtFloat, Rate: 7, Channels: 2})
+	if !bytes.Equal(worst, again) {
+		t.Fatal("the chime is not deterministic")
+	}
+}
+
+// A tuple the synth cannot encode returns nothing — the caller reports the
+// path unavailable rather than opening the stream on a buffer of zeros.
+func TestSynthNotifyChimeRefusesTuplesItCannotEncode(t *testing.T) {
+	for _, info := range []vi.AudioInfo{
+		{Ready: 1, Format: vi.AudioFmtNone, Rate: 7, Channels: 2}, // no negotiated format
+		{Ready: 1, Format: 1, Rate: 7, Channels: 2},              // U8: not a stream format
+		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 0, Channels: 2},
+		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 2, Channels: 2}, // off the rate ladder
+		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 7, Channels: 0},
+		{Ready: 1, Format: vi.AudioFmtS16, Rate: 7, Channels: 0},
+	} {
+		if pcm := synthNotifyChime(info); len(pcm) != 0 {
+			t.Fatalf("%+v: synthesized %d bytes on an unencodable tuple", info, len(pcm))
+		}
+	}
+}
+
+// The shape the card asks for: an attack that ramps in (a leading click is
+// worse than a soft start), a body that is loud, a decay that lands near
+// silence, and mono duplicated across every channel — the f32 readback is
+// the same bytes the device would get.
+func TestSynthNotifyChimeEnvelopeAndChannels(t *testing.T) {
+	pcm := synthNotifyChime(vi.AudioInfo{Ready: 1, Format: vi.AudioFmtFloat, Rate: 7, Channels: 2})
+	frames := len(pcm) / 8
+	first := f32le(pcm[0:4])
+	if first != 0 {
+		t.Fatalf("the attack does not start at silence: first sample %v", first)
+	}
+	// Any one instant can sit on a node where the two partials cancel, and
+	// the envelope is already decaying through the middle — so the body's
+	// claim is a PEAK across the first half, not a sample.
+	peak := float32(0)
+	for i := 0; i < frames/2; i++ {
+		v := f32le(pcm[i*8 : i*8+4])
+		if v > peak {
+			peak = v
+		} else if -v > peak {
+			peak = -v
+		}
+	}
+	if peak < 0.05 {
+		t.Fatalf("the body is silent: first-half peak %v", peak)
+	}
+	last := f32le(pcm[len(pcm)-8 : len(pcm)-4])
+	if last > 0.02 || last < -0.02 {
+		t.Fatalf("the decay does not land near silence: last sample %v", last)
+	}
+	// Stereo is the same wave twice.
+	for i := 0; i < 8; i++ {
+		l, r := f32le(pcm[i*8:i*8+4]), f32le(pcm[i*8+4:i*8+8])
+		if l != r {
+			t.Fatalf("frame %d: channels differ (%v vs %v)", i, l, r)
+		}
+	}
+	// The other formats carry the same envelope in their own encoding.
+	p16 := synthNotifyChime(vi.AudioInfo{Ready: 1, Format: vi.AudioFmtS16, Rate: 7, Channels: 2})
+	if s16le(p16[len(p16)/4*2:]) == 0 && s16le(p16[len(p16)/2:]) == 0 {
+		t.Fatal("the S16 body is silent")
+	}
+	p32 := synthNotifyChime(vi.AudioInfo{Ready: 1, Format: vi.AudioFmtS32, Rate: 7, Channels: 1})
+	if s32le(p32[len(p32)/2:]) == 0 {
+		t.Fatal("the S32 body is silent")
+	}
+}
+
+// The synth's two approximations: the sine's known anchors, and the decay's
+// endpoints (e^-x lands at 1 for x<=0 and at silence past the tail).
+func TestChimeApproximationsHitTheirAnchors(t *testing.T) {
+	for _, p := range []struct {
+		x, want float64
+	}{
+		{0, 0},
+		{pi / 2, 1},
+		{-pi / 2, -1},
+		{pi, 0},
+		{2 * pi, 0},
+		{7 * pi / 2, -1},
+	} {
+		if got := sinApprox(p.x); got-p.want > 0.001 || p.want-got > 0.001 {
+			t.Fatalf("sinApprox(%v) = %v, want %v", p.x, got, p.want)
+		}
+	}
+	if expDecay(0) != 1 || expDecay(-1) != 1 {
+		t.Fatal("the decay does not start at 1")
+	}
+	if expDecay(16) != 0 || expDecay(100) != 0 {
+		t.Fatal("the decay does not reach silence")
+	}
+	prev := 1.0
+	for i := 1; i < 15; i++ {
+		v := expDecay(float64(i))
+		if v >= prev || v < 0 {
+			t.Fatalf("the decay is not monotone: e^-%d = %v after %v", i, v, prev)
+		}
+		prev = v
 	}
 }

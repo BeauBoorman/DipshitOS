@@ -32,15 +32,33 @@ func resetNotify(t *testing.T) {
 	savedHistDirty := notifyHistDirty
 	savedHistFailLogged := notifyHistFailLogged
 	savedSaveDND, savedRead, savedWrite := saveNotifyDND, readNotifyFile, writeNotifyFile
+	savedSoundChime := notifySoundChime
+	savedSoundParams := notifySoundParams
+	savedSoundPending := notifySoundPending
+	savedSoundBytes := notifySoundBytes
+	savedSoundSkipped := notifySoundSkipped
+	savedPlayChime := notifyPlayChime
+	savedBusValues := settingsBusValues
 	// M82d2 (#1785): the policy's three file seams degrade to ENOSYS on the
 	// host, so every case starts with inert ones (a test that cares swaps in
-	// a fake through fakeNotifyShare).
+	// a fake through fakeNotifyShare). M99d: the sound state resets beside
+	// them — the chime buffer, the in-flight stream, the skip counter, the
+	// play seam and the bus value the chime switch reads.
 	notifyDND = false
 	notifyHistDirty = false
 	notifyHistFailLogged = false
 	saveNotifyDND = func(bool) bool { return true }
 	readNotifyFile = func(string, int) ([]byte, int64) { return nil, -1 }
 	writeNotifyFile = func(string, []byte) bool { return true }
+	notifySoundChime = nil
+	notifySoundParams = vi.AudioStreamParams{}
+	notifySoundPending = nil
+	notifySoundBytes = 0
+	notifySoundSkipped = 0
+	notifyPlayChime = playNotifyChime
+	for i := range settingsBusValues {
+		settingsBusValues[i] = settingValue{}
+	}
 	notifyQueue = nil
 	notifyDropped = 0
 	notifyPainted = false
@@ -64,6 +82,13 @@ func resetNotify(t *testing.T) {
 		notifyHistDirty = savedHistDirty
 		notifyHistFailLogged = savedHistFailLogged
 		saveNotifyDND, readNotifyFile, writeNotifyFile = savedSaveDND, savedRead, savedWrite
+		notifySoundChime = savedSoundChime
+		notifySoundParams = savedSoundParams
+		notifySoundPending = savedSoundPending
+		notifySoundBytes = savedSoundBytes
+		notifySoundSkipped = savedSoundSkipped
+		notifyPlayChime = savedPlayChime
+		settingsBusValues = savedBusValues
 	})
 }
 

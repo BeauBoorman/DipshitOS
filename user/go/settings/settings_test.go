@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"errors"
 	"os"
 	"regexp"
 	"strings"
@@ -551,7 +552,7 @@ func TestOptionalRowsRespectFullTable(t *testing.T) {
 	for _, k := range KnownKeys {
 		rows = append(rows, Setting{Key: k.Name, Val: k.Default})
 	}
-	for i := 0; i < 7; i++ {
+	for i := 0; i < 9; i++ {
 		rows = append(rows, Setting{Key: "extension" + string(rune('a'+i)), Val: "v"})
 	}
 	display := (File{Rows: rows, State: StateOK}).Display()
@@ -577,7 +578,7 @@ func TestOptionalRowsRespectFullTable(t *testing.T) {
 	// A table with one free slot can still be saved from GOSET after
 	// materializing keyboard_layout. Keep that contract:
 	// the idle default is implicit when there is no free kernel slot.
-	legacy := append(append([]Setting(nil), rows...), Setting{Key: "extensionh", Val: "v"})
+	legacy := append(append([]Setting(nil), rows...), Setting{Key: "extensionj", Val: "v"})
 	full := (File{Rows: legacy, State: StateOK}).Display()
 	if len(legacy) != MaxKeys-1 || len(full) != MaxKeys {
 		t.Fatalf("legacy table rows = %d, display = %d, want %d and %d", len(legacy), len(full), MaxKeys-1, MaxKeys)
@@ -599,6 +600,16 @@ func TestOptionalRowsRespectFullTable(t *testing.T) {
 	}
 	if _, found := Get(display, "timezone"); found {
 		t.Fatal("a table full after layout+idle materialized timezone beyond the kernel cap")
+	}
+	// M99d: the chime and gain rows are accepted, never display-materialized —
+	// a default panel table carries neither, whatever the cap.
+	for _, key := range []string{NotifySoundKey, AudioVolumeKey} {
+		if _, found := Get(full, key); found {
+			t.Fatalf("full table materialized %s beyond the kernel cap", key)
+		}
+		if _, found := Get(display, key); found {
+			t.Fatalf("%s materialized into a default display table", key)
+		}
 	}
 }
 
@@ -721,5 +732,141 @@ func TestTimezoneAcceptedUnseededCyclableAndFallsBackToUTC(t *testing.T) {
 	}
 	if v, found := Get(rows, TimezoneKey); !found || v != "UTC+05:30" {
 		t.Fatalf("round-trip timezone = %q found=%v", v, found)
+	}
+}
+
+// M99d (#2182): the notification-chime row is accepted-but-unseeded like
+// notify_dnd and strict like it — a typo falls back to the default (on), so
+// a bad value can never silence the chime by accident.
+func TestNotifySoundAcceptedUnseededCyclableAndStrict(t *testing.T) {
+	if _, known := Known(NotifySoundKey); known {
+		t.Fatal("the kernel does not seed notify_sound")
+	}
+	if !Editable(NotifySoundKey) || !IsNotifySoundKey(NotifySoundKey) || IsNotifySoundKey("notify") {
+		t.Fatal("GOSET must be able to edit exactly notify_sound")
+	}
+	if got, ok := Default(NotifySoundKey); !ok || got != "on" {
+		t.Fatalf("Default(notify_sound) = (%q,%v), want (on,true)", got, ok)
+	}
+	vocab, ok := Vocab(NotifySoundKey)
+	if !ok || len(vocab) != 2 || vocab[0] != "on" || vocab[1] != "off" {
+		t.Fatalf("notify_sound vocab = %v ok=%v, want [on off]", vocab, ok)
+	}
+	if got := Next(vocab, "off"); got != "on" {
+		t.Fatalf("cycle off -> %q, want on", got)
+	}
+	for val, want := range map[string]bool{"on": true, "off": false} {
+		if on, ok := NotifySound(val); !ok || on != want {
+			t.Errorf("NotifySound(%q) = (%v, %v), want (%v, true)", val, on, ok, want)
+		}
+	}
+	for _, val := range []string{"", "ON", "true", "1", "yes", "on ", "loud"} {
+		if on, ok := NotifySound(val); ok || on {
+			t.Errorf("NotifySound(%q) = (%v, %v), want (false, false)", val, on, ok)
+		}
+	}
+	// Absent means on: the value in force for a default table is the chime.
+	if v, ok := (File{State: StateMissing}).Effective(NotifySoundKey); !ok || v != "on" {
+		t.Fatalf("absent notify_sound = %q ok=%v, want on", v, ok)
+	}
+	f := File{Rows: []Setting{{Key: NotifySoundKey, Val: "off"}}, State: StateOK}
+	if v, ok := f.Effective(NotifySoundKey); !ok || v != "off" {
+		t.Fatalf("persisted notify_sound = %q ok=%v", v, ok)
+	}
+	if rows, ok := Parse(Render(f.Rows)); !ok {
+		t.Fatal("a persisted notify_sound row cannot round-trip")
+	} else if v, found := Get(rows, NotifySoundKey); !found || v != "off" {
+		t.Fatalf("round-trip notify_sound = %q found=%v", v, found)
+	}
+}
+
+// M99d (#2182): the stream-gain row is accepted-but-unseeded, carries the
+// 0..100 bound slot 44 enforces, and is the one row Set applies live — the
+// same shape as the kernel set()'s own per-key hooks.
+func TestAudioVolumeAcceptedUnseededBoundedAndLiveApplied(t *testing.T) {
+	if _, known := Known(AudioVolumeKey); known {
+		t.Fatal("the kernel does not seed audio_volume")
+	}
+	if !Editable(AudioVolumeKey) || !IsVolumeKey(AudioVolumeKey) || IsVolumeKey("volume") {
+		t.Fatal("GOSET must be able to edit exactly audio_volume")
+	}
+	if got, ok := Default(AudioVolumeKey); !ok || got != "100" {
+		t.Fatalf("Default(audio_volume) = (%q,%v), want (100,true)", got, ok)
+	}
+	for _, val := range []string{"0", "1", "40", "100", "007"} {
+		if _, ok := AudioVolume(val); !ok {
+			t.Errorf("AudioVolume(%q) refused a value slot 44 takes", val)
+		}
+	}
+	for _, val := range []string{"", "101", "255", "-1", "1.5", "loud", "1000", "0x28"} {
+		if _, ok := AudioVolume(val); ok {
+			t.Errorf("AudioVolume(%q) accepted a value slot 44 refuses", val)
+		}
+	}
+	vocab, ok := Vocab(AudioVolumeKey)
+	if !ok || len(vocab) != 11 || vocab[0] != "0" || vocab[10] != "100" {
+		t.Fatalf("audio_volume vocab = %v ok=%v, want the 0..100 decade ladder", vocab, ok)
+	}
+	if got := Next(vocab, "40"); got != "50" {
+		t.Fatalf("cycle 40 -> %q, want 50", got)
+	}
+	// Out-of-vocabulary current value cycles to the top, matching every row.
+	if got := Next(vocab, "abc"); got != "0" {
+		t.Fatalf("cycle off-ladder -> %q, want 0", got)
+	}
+	f := File{Rows: []Setting{{Key: AudioVolumeKey, Val: "40"}}, State: StateOK}
+	if v, ok := f.Effective(AudioVolumeKey); !ok || v != "40" {
+		t.Fatalf("persisted audio_volume = %q ok=%v", v, ok)
+	}
+	if rows, ok := Parse(Render(f.Rows)); !ok {
+		t.Fatal("a persisted audio_volume row cannot round-trip")
+	} else if v, found := Get(rows, AudioVolumeKey); !found || v != "40" {
+		t.Fatalf("round-trip audio_volume = %q found=%v", v, found)
+	}
+}
+
+// The live-apply hook: writing audio_volume through Set — GOSET's typed
+// input AND its row cycle both funnel here — pushes the value to slot 44 in
+// the same call, and only a parseable in-range value applies. Other keys,
+// and values the bound refuses, never reach the kernel.
+func TestSetAppliesAudioVolumeToSlot44(t *testing.T) {
+	saved := AudioVolumeApply
+	defer func() { AudioVolumeApply = saved }()
+	var got []int
+	fail := false
+	AudioVolumeApply = func(vol int) (int, error) {
+		got = append(got, vol)
+		if fail {
+			return 0, errors.New("kernel refused")
+		}
+		return vol, nil
+	}
+	rows := Set(nil, AudioVolumeKey, "40")
+	if len(got) != 1 || got[0] != 40 {
+		t.Fatalf("set applied %v, want [40]", got)
+	}
+	if v, _ := Get(rows, AudioVolumeKey); v != "40" {
+		t.Fatalf("row = %q, want 40", v)
+	}
+	// The row lands even when the kernel refuses — the write is the store,
+	// the apply is best-effort like the kernel's own hooks.
+	fail = true
+	rows = Set(rows, AudioVolumeKey, "60")
+	if v, _ := Get(rows, AudioVolumeKey); v != "60" || len(got) != 2 {
+		t.Fatalf("refused apply lost the row or retried: %q applied=%v", v, got)
+	}
+	// Unparsable and out-of-range values write the row but apply nothing —
+	// the row's readers refuse them the same way.
+	for _, val := range []string{"101", "loud", ""} {
+		rows = Set(rows, AudioVolumeKey, val)
+	}
+	if len(got) != 2 {
+		t.Fatalf("out-of-range values applied: %v", got)
+	}
+	// Other keys never touch the seam.
+	Set(rows, "theme", "light")
+	Set(rows, NotifySoundKey, "off")
+	if len(got) != 2 {
+		t.Fatalf("a non-volume key applied: %v", got)
 	}
 }
