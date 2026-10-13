@@ -1,7 +1,11 @@
 # live-net-tcp.spec -- the bounded RFC 793 client: Run A the full
 # lifecycle + reset against the host responder (9-frame byte-exact
 # capture walk); Run B the black-hole connect timeout; Run C the
-# real-NAT observation (gateway RSTs the SYN on this host).
+# real-NAT observation (gateway RSTs the SYN on this host); Run D
+# (M99h, #2186) the same lifecycle against the :options responder --
+# SYN-ACK at data offset 10 (MSS 1460 + SACK-permitted + WS + TS) and
+# data/FIN at data offset 8 (NOP+NOP+TS), the real-peer wire shape the
+# option parser must walk.
 # Mirrors tools/verify-live-net-tcp.sh (claim 7026, card N10). The
 # VIRELAI_NET_TCP_RUNS skip knob is not ported (default A,B,C always
 # runs -- document if a host's NAT drops instead of RSTing).
@@ -53,9 +57,28 @@ net
 echo n10c-done
 EOF
 
+vgate_file d1.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+net arp
+net tcp connect 10.0.0.2 9999
+net tcp
+net tcp send 5
+net tcp
+net tcp recv
+net tcp close
+net tcp
+net tcp connect 10.0.0.2 9999
+net tcp
+net tcp reset
+echo n10d-done
+net
+EOF
+
 vgate_run A -- --net '$RUN_DIR/a-cap.bin' --net-tcp-respond 10.0.0.2:9999 --net-arp-respond 10.0.0.2 --script '$RUN_DIR/a1.txt' --script-expect 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4' --timeout 120
 vgate_run B -- --net '$RUN_DIR/b-cap.bin' --net-arp-respond 10.0.0.2 --script '$RUN_DIR/b1.txt' --script2 '$RUN_DIR/b2.txt' --script2-after 'n10b-phase1-ready' --script2-delay 31 --script-expect 'tcp=idle,peer=0.0.0.0:0,syn=1,synack=0' --timeout 140
 vgate_run C -- --net-nat --script '$RUN_DIR/c1.txt' --script-expect 'peer=192.168.64.1:9999,syn=1,synack=0' --timeout 120
+vgate_run D -- --net '$RUN_DIR/d-cap.bin' --net-tcp-respond 10.0.0.2:9999:options --net-arp-respond 10.0.0.2 --script '$RUN_DIR/d1.txt' --script-expect 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4' --timeout 120
 
 vgate_assert A serial-contains 'net tcp: ack sent (ack=0x12345679, 54 bytes)'
 vgate_assert A serial-contains 'net tcp: established (peer=10.0.0.2:9999)'
@@ -169,4 +192,54 @@ if not re.search(r"net arp: 192\.168\.64\.1 -> ", ser):
 if not re.search(r"net tcp: syn sent \(peer=192\.168\.64\.1:9999, seq=0x[0-9a-f]+, 54 bytes\)", ser):
     sys.exit("FAIL: no SYN line")
 print("tcp C NAT observation ok")
+PY
+
+# Run D (M99h, #2186): the :options responder. Every inbound segment
+# carries an option area the pre-M99h stack would have dropped as
+# malformed — an established echo + a clean close prove the parser
+# walks the data offset, skips NOP/unknown kinds, and locates the
+# payload. The guest's own wire bytes are unchanged, so the capture
+# walk is Run A's nine frames exactly.
+vgate_assert D serial-contains 'net tcp: established (peer=10.0.0.2:9999)'
+vgate_assert D serial-contains 'net tcp recv: 01 02 03 04 05'
+vgate_assert D serial-contains 'net tcp: connection closed'
+vgate_assert D serial-contains 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4,data_s=1,data_r=1,fin=1,finack=1,rst_s=1,rst_r=0,timedout=0,mal=0'
+vgate_assert D serial-contains 'n10d-done'
+vgate_assert D output-contains 'options mss/sackp/ws/ts'
+vgate_assert D output-contains 'net-tcp-respond mode: options (M99h, #2186)'
+vgate_assert D python <<'PY'
+import os, re, struct, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+for p in (r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 54 bytes\)",
+          r"net tcp: data sent \(seq=0x[0-9a-f]+, 5 bytes\)",
+          r"net tcp: fin sent \(seq=0x[0-9a-f]+, 54 bytes\)",
+          r"net tcp: reset sent \(seq=0x[0-9a-f]+, 54 bytes\)"):
+    if not re.search(p, ser):
+        sys.exit("FAIL: ERE absent: %s" % p)
+d = open(os.environ["RUN_DIR"] + "/d-cap.bin", "rb").read()
+assert len(d) == 533, len(d)
+off = 0
+tcpf = []
+while off < len(d):
+    if d[off+12:off+14] == b'\x08\x00':
+        total = (d[off+16] << 8) | d[off+17]
+        flen = 14 + total
+        tcpf.append(d[off:off+flen])
+        off += flen
+    else:
+        off += 42
+# Nine guest frames, all bare — the option area lives on the peer's
+# side of the wire only (the guest's pinned SYN stays option-free).
+assert [len(f) for f in tcpf] == [54, 54, 59, 54, 54, 54, 54, 54, 54], [len(f) for f in tcpf]
+def chk(data):
+    if len(data) % 2: data += b'\x00'
+    s = sum(struct.unpack('>%dH' % (len(data) // 2), data))
+    while s >> 16: s = (s & 0xffff) + (s >> 16)
+    return (~s) & 0xffff
+for i, f in enumerate(tcpf):
+    seg = f[34:]
+    ps = bytes([10, 0, 0, 1, 10, 0, 0, 2, 0, 6]) + struct.pack('>H', len(seg))
+    assert chk(ps + seg) == 0, ("tcp checksum", i)
+assert tcpf[2][47] == 0x10 and tcpf[2][54:59] == bytes([1, 2, 3, 4, 5]), "data"
+print("tcp D options-mode lifecycle + guest-side walk ok")
 PY

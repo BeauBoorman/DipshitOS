@@ -134,7 +134,7 @@ test "socket core: two children, third refusal uses its own address and counts o
     try c.close(7, listener);
     try t.expectEqual(@as(usize, 0), c.liveChildren());
 }
-test "socket core: partial reads, zero window and exact sequence prevent duplicate delivery" {
+test "socket core: partial reads, the honest window and exact sequence prevent duplicate delivery" {
     var c: core.Core = .{};
     _ = try init(&c);
     var cap: Capture = .{};
@@ -142,24 +142,30 @@ test "socket core: partial reads, zero window and exact sequence prevent duplica
     var frame = Frame.init(remote, 11, 101, wire.flag_ack, "abcdef");
     try frame.inject(&c, 1);
     cap.drain(&c);
-    try t.expectEqual(@as(u16, 0), std.mem.readInt(u16, cap.bytes[14..16], .big));
+    // M99h (#2186, h2): the advertised window is the queue's real free
+    // space — six buffered bytes shrink it, never zero it.
+    try t.expectEqual(@as(u16, wire.payload_max - 6), std.mem.readInt(u16, cap.bytes[14..16], .big));
     var buf: [8]u8 = undefined;
     try t.expectEqual(@as(usize, 2), try c.read(7, h, buf[0..2], 1));
     try t.expectEqualStrings("ab", buf[0..2]);
     try t.expect((try c.ready(7, h)).read);
-    try frame.inject(&c, 1);
-    frame = Frame.init(remote, 17, 101, wire.flag_ack, "next");
+    // A retransmitted duplicate re-ACKs and counts — the stream is not
+    // delivered twice.
     try frame.inject(&c, 1);
     try t.expectEqual(@as(u64, 1), c.counters.duplicates);
-    try t.expectEqual(@as(u64, 1), c.counters.rx_full);
-    try t.expectEqual(@as(usize, 4), try c.read(7, h, &buf, 1));
+    // The next in-order segment appends to the contiguous prefix (a
+    // partial read leaves the tail queued — "cdefnext" is one buffer).
+    frame = Frame.init(remote, 17, 101, wire.flag_ack, "next");
+    try frame.inject(&c, 1);
+    try t.expectEqual(@as(usize, 4), try c.read(7, h, buf[0..4], 1));
     try t.expectEqualStrings("cdef", buf[0..4]);
     cap.drain(&c);
-    try t.expectEqual(@as(u16, wire.payload_max), std.mem.readInt(u16, cap.bytes[14..16], .big));
-    try t.expectError(error.WouldBlock, c.read(7, h, &buf, 1));
-    try frame.inject(&c, 1);
+    // The drained ACK is the read-triggered window update — four bytes
+    // were still queued when it was built.
+    try t.expectEqual(@as(u16, wire.payload_max - 4), std.mem.readInt(u16, cap.bytes[14..16], .big));
     try t.expectEqual(@as(usize, 4), try c.read(7, h, &buf, 1));
     try t.expectEqualStrings("next", buf[0..4]);
+    try t.expectError(error.WouldBlock, c.read(7, h, &buf, 1));
 }
 test "socket core: full IPv4 tuple and malformed packets cannot mutate a child" {
     var c: core.Core = .{};
@@ -227,9 +233,12 @@ test "socket core: byte-identical retransmission and ACK stop, failed TX retries
     cap.drain(&c);
     const original = cap.bytes;
     const len = cap.len;
-    try c.poll(core.rto_ns - 1);
+    // M99h (#2186, h3): the handshake ACK sampled r = 0, so the adaptive
+    // RTO sits at the 200 ms floor — the retransmission clock is the
+    // estimator's, not the fixed 3 s.
+    try c.poll(core.rto_floor_ns - 1);
     try t.expectEqual(core.Flush.empty, c.flush(&cap, Capture.transmit));
-    try c.poll(core.rto_ns);
+    try c.poll(core.rto_floor_ns);
     cap.fail = true;
     try t.expectEqual(core.Flush.refused, c.flush(&cap, Capture.transmit));
     try t.expectEqual(@as(u8, 0), c.children[0].?.retries);
@@ -237,8 +246,9 @@ test "socket core: byte-identical retransmission and ACK stop, failed TX retries
     cap.drain(&c);
     try t.expectEqualSlices(u8, original[0..len], cap.bytes[0..cap.len]);
     try t.expectEqual(@as(u64, 1), c.counters.retransmitted);
+    try t.expectEqual(core.rto_floor_ns * 2, c.children[0].?.rto_ns_cur); // §5.5 backoff
     var frame = Frame.init(remote, 11, 106, wire.flag_ack, "");
-    try frame.inject(&c, core.rto_ns);
+    try frame.inject(&c, core.rto_floor_ns);
     try c.poll(core.rto_ns * 2);
     try t.expectEqual(core.Flush.empty, c.flush(&cap, Capture.transmit));
 }
@@ -378,19 +388,25 @@ test "socket core: expired receive and application operations cannot bypass poll
         }
     }
 }
-test "socket core: ten retry ceiling is subordinate to the thirty-second outer deadline" {
+test "socket core: the retry ceiling is subordinate to the thirty-second outer deadline" {
     var c: core.Core = .{};
     _ = try init(&c);
     var cap: Capture = .{};
     const h = try establish(&c, &cap, remote, 0);
     _ = try c.send(7, h, "dark", 0);
     cap.drain(&c);
-    for (1..10) |n| {
-        try c.poll(core.rto_ns * n);
+    // M99h (#2186, h3): the estimator sampled r = 0, so the RTO walks
+    // the §5.5 backoff ladder 0.2 + 0.4 + ... — the next due time is
+    // each connection's own `rto_ns_cur`. The 30 s deadline still wins:
+    // 25.4 s of backoff admits exactly seven retransmissions before the
+    // eighth (due at 51 s) loses to the deadline.
+    var now: u64 = 0;
+    for (0..core.retry_limit) |_| {
+        now += c.children[0].?.rto_ns_cur;
+        try c.poll(now);
         cap.drain(&c);
     }
-    try t.expectEqual(@as(u64, 9), c.counters.retransmitted);
-    try c.poll(core.deadline_ns);
+    try t.expectEqual(@as(u64, 7), c.counters.retransmitted);
     try t.expectEqual(core.Flush.empty, c.flush(&cap, Capture.transmit));
     try t.expectEqual(core.Outcome.timeout, try c.status(7, h));
     try t.expect(c.counters.retransmitted <= core.retry_limit);
@@ -651,5 +667,176 @@ test "socket core: owner and system bounds are honest Capacity, owner death recl
     c.closeOwner(7);
     try t.expectEqual(@as(usize, 0), c.ownedSockets(7));
     try t.expectEqual(@as(usize, 1), c.liveChildren());
-    try t.expectEqual(@as(usize, 1), c.ownedSockets(8));
+}
+
+// --- M99h (#2186): options, the bounded reassembly window, adaptive RTO -
+
+test "socket core: the active-open SYN advertises MSS 1460; the passive SYN-ACK does too" {
+    var c: core.Core = .{};
+    var cap: Capture = .{};
+    const server: core.Endpoint = .{ .ip = .{ 10, 0, 0, 2 }, .port = 80 };
+    const h = try c.open(7, .{ .ip = local.ip, .port = 8000 }, server, peer_mac, 0, 0x11111111);
+    cap.drain(&c);
+    // The SYN carries the data-offset-6 option area: kind 2, len 4, 1460.
+    try t.expectEqual(@as(u8, 0x60), cap.bytes[12]);
+    try t.expectEqualSlices(u8, &wire.mss_option, cap.bytes[20..24]);
+    try c.close(7, h);
+
+    _ = try init(&c);
+    var frame = Frame.init(remote, 10, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    cap.drain(&c);
+    try t.expectEqual(@as(u8, wire.flag_syn | wire.flag_ack), cap.bytes[13]);
+    try t.expectEqual(@as(u8, 0x60), cap.bytes[12]);
+    try t.expectEqualSlices(u8, &wire.mss_option, cap.bytes[20..24]);
+}
+
+test "socket core: a peer SYN-ACK with options records the MSS and clamps the send" {
+    var c: core.Core = .{};
+    var cap: Capture = .{};
+    const server: core.Endpoint = .{ .ip = .{ 10, 0, 0, 2 }, .port = 80 };
+    const h = try c.open(7, .{ .ip = local.ip, .port = 8000 }, server, peer_mac, 0, 0x11111111);
+    cap.drain(&c);
+    // SYN-ACK with NOP NOP MSS 1200 + EOL padding — parsed, never dropped.
+    var segment: [wire.segment_max]u8 = undefined;
+    const slen = wire.build_segment_opts(&segment, server.ip, local.ip, server.port, 8000, 77, 0x11111112, wire.flag_syn | wire.flag_ack, &.{ 1, 1, 2, 4, 0x04, 0xb0, 0, 0 }, "");
+    var frame: Frame = .{ .len = 0 };
+    frame.len = wire.build_frame(&frame.bytes, &peer_mac, server.ip, guest_mac, local.ip, segment[0..slen]);
+    try frame.inject(&c, 0);
+    try t.expectEqual(core.State.established, c.children[0].?.state);
+    try t.expectEqual(@as(u16, 1200), c.children[0].?.peer_mss);
+    // The send path honors it — a payload_max write truncates to 1200.
+    const body: [wire.payload_max]u8 = @splat('m');
+    try t.expectEqual(@as(usize, 1200), try c.send(7, h, &body, 0));
+}
+
+test "socket core: malformed option lists drop the segment in their own counter" {
+    var c: core.Core = .{};
+    _ = try init(&c);
+    var cap: Capture = .{};
+    const h = try establish(&c, &cap, remote, 0);
+    for ([_][]const u8{
+        &.{ 2, 0, 0, 0 }, // a length byte of 0
+        &.{ 30, 8, 0, 0 }, // a length that overruns the option area
+        &.{ 2, 3, 1, 2 }, // an MSS kind with the wrong length
+    }, 0..) |bad_opts, i| {
+        var segment: [wire.segment_max]u8 = undefined;
+        const slen = wire.build_segment_opts(&segment, remote.ip, local.ip, remote.port, local.port, 11, 101, wire.flag_ack, bad_opts, "x");
+        var frame: Frame = .{ .len = 0 };
+        frame.len = wire.build_frame(&frame.bytes, &peer_mac, remote.ip, guest_mac, local.ip, segment[0..slen]);
+        try frame.inject(&c, 0);
+        try t.expectEqual(@as(u64, i + 1), c.counters.dropped_options);
+        try t.expectEqual(@as(u64, 0), c.counters.malformed);
+        try t.expect(!(try c.ready(7, h)).read);
+    }
+}
+
+test "socket core: the reassembly window holds out-of-order bytes and splices them contiguous" {
+    var c: core.Core = .{};
+    _ = try init(&c);
+    var cap: Capture = .{};
+    const h = try establish(&c, &cap, remote, 0);
+    var buf: [16]u8 = undefined;
+    // Two future segments arrive first — held, ACKed, never delivered.
+    var frame = Frame.init(remote, 15, 101, wire.flag_ack, "EFGH");
+    try frame.inject(&c, 0);
+    frame = Frame.init(remote, 19, 101, wire.flag_ack, "IJ");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 2), c.counters.ooo_held);
+    try t.expectError(error.WouldBlock, c.read(7, h, &buf, 0));
+    // The window field counts held bytes as occupied space.
+    cap.drain(&c);
+    try t.expectEqual(@as(u16, wire.payload_max - 6), std.mem.readInt(u16, cap.bytes[14..16], .big));
+    // The gap fills — the held bytes splice in wire order.
+    frame = Frame.init(remote, 11, 101, wire.flag_ack, "ABCD");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 10), try c.read(7, h, &buf, 0));
+    try t.expectEqualStrings("ABCDEFGHIJ", buf[0..10]);
+    // A byte-level overlapping retransmit is idempotent — the bitmap
+    // never double-counts or double-delivers.
+    frame = Frame.init(remote, 13, 101, wire.flag_ack, "CDEF");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.duplicates);
+    try t.expectError(error.WouldBlock, c.read(7, h, &buf, 0));
+}
+
+test "socket core: the reassembly window is bounded — edge trims and beyond-window refusals" {
+    var c: core.Core = .{};
+    _ = try init(&c);
+    var cap: Capture = .{};
+    const h = try establish(&c, &cap, remote, 0);
+    // One byte ahead keeps rcv_nxt put; the segment's tail runs past the
+    // window edge — 1459 of its 1460 bytes are held, the last refused.
+    const body: [wire.payload_max]u8 = @splat('x');
+    var segment: [wire.segment_max]u8 = undefined;
+    const slen = wire.build_segment(&segment, remote.ip, local.ip, remote.port, local.port, 12, 101, wire.flag_ack, &body);
+    var frame: Frame = .{ .len = 0 };
+    frame.len = wire.build_frame(&frame.bytes, &peer_mac, remote.ip, guest_mac, local.ip, segment[0..slen]);
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.ooo_held);
+    try t.expectEqual(@as(u64, 1), c.counters.rx_full); // the trimmed tail byte
+    // The window is now exactly full — a byte wholly past the edge is
+    // malformed, never held.
+    frame = Frame.init(remote, 11 + wire.payload_max, 101, wire.flag_ack, "y");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.malformed);
+    // Delivering the gap byte splices the whole held window in order.
+    frame = Frame.init(remote, 11, 101, wire.flag_ack, "G");
+    try frame.inject(&c, 0);
+    var buf: [wire.payload_max]u8 = undefined;
+    try t.expectEqual(@as(usize, wire.payload_max), try c.read(7, h, &buf, 0));
+    try t.expectEqual(@as(u8, 'G'), buf[0]);
+    try t.expectEqual(@as(u8, 'x'), buf[wire.payload_max - 1]);
+}
+
+test "socket core: a FIN ahead of the stream applies only when contiguous" {
+    var c: core.Core = .{};
+    _ = try init(&c);
+    var cap: Capture = .{};
+    const h = try establish(&c, &cap, remote, 0);
+    var frame = Frame.init(remote, 13, 101, wire.flag_ack | wire.flag_fin, "");
+    try frame.inject(&c, 0);
+    try t.expect(!c.children[0].?.peer_fin);
+    frame = Frame.init(remote, 11, 101, wire.flag_ack, "ab");
+    try frame.inject(&c, 0);
+    try t.expect(c.children[0].?.peer_fin);
+    try t.expectEqual(core.State.closing, c.children[0].?.state);
+    var buf: [8]u8 = undefined;
+    try t.expectEqual(@as(usize, 2), try c.read(7, h, &buf, 0));
+    try t.expectEqualStrings("ab", buf[0..2]);
+}
+
+test "socket core: RTT samples feed the estimator; Karn's rule keeps retries out" {
+    var c: core.Core = .{};
+    _ = try init(&c);
+    var cap: Capture = .{};
+    // The handshake ACK 100 ms after the SYN-ACK: first sample r = 100ms
+    // -> SRTT 100ms, RTTVAR 50ms, RTO = 300ms.
+    var frame = Frame.init(remote, 10, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    cap.drain(&c);
+    frame = Frame.init(remote, 11, 101, wire.flag_ack, "");
+    try frame.inject(&c, 100_000_000);
+    const h = try c.accept(7, c.listener.?.handle);
+    try t.expectEqual(@as(u64, 300_000_000), c.children[0].?.rto_ns_cur);
+    try t.expect(c.children[0].?.rtt_valid);
+    // A clean data sample updates the filters (alpha 1/8, beta 1/4):
+    // r = 300ms -> rttvar = (3x50 + 200)/4 = 87.5ms; srtt = 125ms.
+    _ = try c.send(7, h, "ping", 400_000_000);
+    cap.drain(&c);
+    frame = Frame.init(remote, 11, 105, wire.flag_ack, "");
+    try frame.inject(&c, 700_000_000);
+    try t.expectEqual(@as(u64, 125_000_000), c.children[0].?.srtt_ns);
+    try t.expectEqual(@as(u64, 87_500_000), c.children[0].?.rttvar_ns);
+    // Retransmission + ACK: Karn's rule — no sample, backoff persists.
+    _ = try c.send(7, h, "pong", 700_000_000);
+    cap.drain(&c);
+    const rto = c.children[0].?.rto_ns_cur;
+    try c.poll(700_000_000 + rto);
+    cap.drain(&c);
+    try t.expectEqual(@as(u64, 1), c.counters.retransmitted);
+    frame = Frame.init(remote, 11, 109, wire.flag_ack, "");
+    try frame.inject(&c, 1_300_000_000);
+    try t.expectEqual(@as(u64, 125_000_000), c.children[0].?.srtt_ns); // unchanged
+    try t.expectEqual(@min(core.rto_ceiling_ns, rto * 2), c.children[0].?.rto_ns_cur);
 }

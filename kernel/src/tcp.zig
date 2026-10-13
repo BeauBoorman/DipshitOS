@@ -10,29 +10,37 @@
 //! one-request-at-a-time TX path).
 //!
 //! Honest bounds (documented, never assumed away): BOUNDED
-//! retransmission (card N11, claim 5357 — a SYN/data/FIN with no ACK
-//! is retransmitted on a FIXED 3 s RTO of guest ticks, at most
-//! `retx_max` = 10 times, then the connection ABORTS honestly —
-//! counted `retx_aborted`; bare ACKs are NEVER retransmitted; the 30 s
-//! connect timeout remains the SYN's outer bound — the retransmission
-//! abort at 33 s never beats it, so the N10 refusal is byte-exact;
-//! every retransmission is byte-identical — the pending segment copy —
-//! and counted `retransmitted`; an ACK covering everything the client
-//! sent clears the pending state, so an acknowledged segment is never
-//! retransmitted); ONE bounded connect timeout (30 s of guest ticks —
-//! the card-N9 timer pattern — a SYN with no SYN-ACK refuses honestly,
-//! counted `timed_out`); NO TCP options (a bare 20-byte header — no
-//! MSS, no window scaling, no SACK, no timestamps — a segment with a
-//! data offset != 5 is DROPPED, counted); a FIXED window (4096); no
-//! segmentation (payload <= `payload_max`, truncated honestly on TX);
-//! no reassembly (ONE bounded RX segment — a second unread segment is
-//! DROPPED, counted, never overwritten silently); NO TCP loopback (the
-//! client connects OUTWARD only — an own-IP connect is refused
-//! `.no_peer` like an unresolved peer); no server surface, no port
-//! listening, no urgent data, no congestion control, no adaptive RTO
-//! (a fixed timer — no Karn's algorithm, no exponential backoff). The
-//! close is client-driven (FIN -> FIN-ACK -> final ACK); a clean
-//! server FIN+ACK in ESTABLISHED is ACKed and counted
+//! retransmission (card N11, claim 5357; M99h #2186 adaptive RTO per
+//! RFC 6298 — a SYN/data/FIN with no ACK is retransmitted when the
+//! per-connection `rto_current` expires, at most `retx_max` = 10 times,
+//! then the connection ABORTS honestly — counted `retx_aborted`; bare
+//! ACKs are NEVER retransmitted; the 30 s connect timeout is enforced
+//! INDEPENDENTLY of the adaptive RTO — its worst case stays inside
+//! (retx_max + 1) x `rto_ceiling_ticks` = 33 s > 30 s, so the N10
+//! refusal remains byte-exact; every retransmission is byte-identical —
+//! the pending segment copy — and counted `retransmitted`; an ACK
+//! covering everything the client sent clears the pending state, so an
+//! acknowledged segment is never retransmitted); ONE bounded connect
+//! timeout (30 s of guest ticks — the card-N9 timer pattern — a SYN
+//! with no SYN-ACK refuses honestly, counted `timed_out`); TCP options
+//! are PARSED and SKIPPED (M99h #2186 — NOPs and unknown kinds are
+//! walked, a malformed option length fails closed counted
+//! `dropped_options`, the peer's MSS option is honored as an outbound
+//! clamp; we send no window-scale/SACK/timestamp options, so per RFC
+//! 7323 a peer may not use them back — no renegotiation needed); a
+//! BOUNDED out-of-order RX queue (M99h — the in-order stream head is
+//! `rx_payload[0..rx_len]`, segments ahead of `rcv_nxt` but inside the
+//! advertised window are held in `rx_ooo` slots and spliced in order;
+//! overflow is counted `rx_overflow`, never corrupt); the window field
+//! advertises the queue's REAL free space (the SYN keeps the pinned
+//! 4096, which is the honest free space of an empty queue); no
+//! segmentation beyond `payload_max`/peer-MSS (truncated honestly on
+//! TX); NO TCP loopback (the client connects OUTWARD only — an own-IP
+//! connect is refused `.no_peer` like an unresolved peer); no server
+//! surface, no port listening, no urgent data, no congestion control
+//! (the OS does not generate the bulk traffic that would need it), no
+//! keepalive. The close is client-driven (FIN -> FIN-ACK -> final ACK);
+//! a clean server FIN+ACK in ESTABLISHED is ACKed and counted
 //! (`finack_recv`), and the caller's `net tcp close` then completes
 //! the close; an over-cap SYN (a second peer knocking while the ONE
 //! connection is taken, in any non-listen state) is refused HONESTLY
@@ -72,8 +80,30 @@ pub const segment_max: usize = tcp_hdr_len + payload_max; // 1480
 pub const frame_max: usize = eth_hdr_len + ipv4_hdr_len + segment_max; // 1514
 /// The smallest full frame: Ethernet + IPv4 + the 20-byte header.
 pub const frame_min: usize = eth_hdr_len + ipv4_hdr_len + tcp_hdr_len; // 54
-/// The fixed advertised window (no window scaling — honest bound).
+/// The receive window bound in bytes (M99h #2186): the singleton's RX
+/// capacity AND the SYN's advertised bound — 4096 free bytes is honest
+/// only while the queue is empty, so data-bearing segments overwrite
+/// the field with `free_window()`. No window-scale option is sent, so
+/// the peer may not scale its window back (RFC 7323 §2.2).
 pub const window: u16 = 4096;
+/// The largest legal TCP option area (data offset 15 x 4 - 20).
+pub const options_max: usize = 40;
+/// Our advertised maximum segment size — the Ethernet MTU's TCP payload
+/// bound, sent as a kind-2 option in SYN segments we originate (M99h).
+pub const our_mss: u16 = 1460;
+/// The pre-formatted MSS option: kind 2, length 4, value `our_mss`.
+pub const mss_option: [4]u8 = .{ 2, 4, our_mss >> 8, our_mss & 0xff };
+// Option kinds the parser acts on (RFC 793 §3.1 / RFC 9293 §3.2). Every
+// other kind is skipped by its declared length — never interpreted.
+pub const opt_eol: u8 = 0;
+pub const opt_nop: u8 = 1;
+pub const opt_mss: u8 = 2;
+pub const mss_len: u8 = 4;
+/// The peer's advertised MSS (0 = none — the synthetic fleet's shape;
+/// outbound payloads keep the `payload_max` bound, the fleet's
+/// established contract. A real peer's advertised MSS clamps outbound
+/// payloads per RFC 9293 §3.7.1 — see `send_limit`).
+pub var peer_mss: u16 = 0;
 /// The connect timeout in guest seconds (the 1 Hz generic timer — the
 /// card-N9 lease-clock pattern). A SYN with no SYN-ACK after this long
 /// refuses honestly (`timed_out`), releasing the connection state. Card
@@ -100,16 +130,31 @@ pub const ConnectDeadline = struct {
         return counter -% self.start >= self.duration;
     }
 };
-/// The fixed retransmission timeout in guest seconds (card N11, claim
-/// 5357). A SYN/data/FIN with no ACK is retransmitted when its RTO
-/// expires — a fixed timer (no adaptive estimation, no Karn's
-/// algorithm, no exponential backoff — the honest bound).
+/// The INITIAL retransmission timeout in guest ticks before any RTT
+/// sample exists (card N11's 3 s value, kept — RFC 6298 §2.1 allows
+/// the initial RTO as long as it is >= 1 s). M99h (#2186): once a clean
+/// RTT sample lands, `rto_current` tracks SRTT + 4 x RTTVAR instead.
 pub const rto_ticks: u64 = 3;
+/// M99h (#2186): the adaptive-RTO floor in ticks — the 1 Hz guest
+/// clock's honest minimum (sub-second floors like RFC 6298's suggested
+/// 200 ms are not representable; the socket table's nanosecond clock
+/// enforces `rto_floor_ns` instead).
+pub const rto_floor_ticks: u64 = 1;
+/// M99h (#2186): the adaptive-RTO ceiling in ticks — deliberately small,
+/// not RFC 6298's 60 s. The guest's bounded black-hole budget requires
+/// `retx_max` retransmissions to abort inside a tight, testable window:
+/// (retx_max + 1) x 3 = 33 s > the 30 s connect timeout keeps the N10
+/// refusal byte-exact, and a black-holed established connection dies in
+/// ~33 s instead of minutes. Exponential backoff (RTO x 2 per
+/// retransmission) saturates here quickly — that is the point.
+pub const rto_ceiling_ticks: u64 = 3;
 /// The retransmission bound (card N11): a segment is retransmitted at
 /// most `retx_max` times (11 transmissions total), then the connection
-/// ABORTS honestly (`retx_aborted`), releasing the state. The abort
-/// fires at (retx_max + 1) * rto = 33 s of guest ticks — after the 30 s
-/// connect timeout, so the SYN's outer bound is unchanged.
+/// ABORTS honestly (`retx_aborted`), releasing the state. M99h restates
+/// the invariant: with an adaptive RTO the abort is no longer a
+/// constant — its WORST case is (retx_max + 1) x rto_ceiling_ticks =
+/// 33 s > 30 s, and the connect timeout is enforced on its own clock,
+/// so the SYN's outer bound is unchanged.
 pub const retx_max: u64 = 10;
 
 // Flags (RFC 793 §3.1 — the 9-bit flag field; only the ones we use).
@@ -136,6 +181,18 @@ pub var retransmitted: u64 = 0; // segment retransmissions (card N11 — the `re
 pub var retx_aborted: u64 = 0; // the retransmission bound aborted the connection (the `abort=` counter)
 pub var dropped_badsum: u64 = 0; // the TCP checksum mismatch (pseudo-header + segment)
 pub var dropped_malformed: u64 = 0; // an unparseable / unexpected / out-of-bounds segment
+/// M99h (#2186, card h1): a segment whose data offset was parseable but
+/// whose option list was malformed (a length of 0, 1, or past the end
+/// of the option area) — refused closed, counted separately from
+/// `dropped_malformed`.
+pub var dropped_options: u64 = 0;
+/// M99h (#2186, card h2): the bounded out-of-order queue's counters —
+/// a segment held for reassembly (`ooo_held`), bytes/segments that
+/// could not be stored inside the window or the slot bound
+/// (`rx_overflow`), and fully-duplicate segments re-ACKed (`rx_dup`).
+pub var ooo_held: u64 = 0;
+pub var rx_overflow: u64 = 0;
+pub var rx_dup: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // State (pure BSS — ONE client connection)
@@ -191,10 +248,32 @@ pub var ack_pending: bool = false;
 pub var rst_msg: [segment_max]u8 = undefined;
 pub var rst_len: usize = 0;
 pub var rst_pending: bool = false;
-/// The bounded RX buffer (ONE segment — no reassembly, honest bound).
-pub var rx_payload: [payload_max]u8 = undefined;
+/// The bounded in-order RX buffer (M99h #2186, card h2): it holds the
+/// undelivered stream PREFIX only — `rx_payload[0..rx_len]` is always
+/// the contiguous bytes [rcv_nxt - rx_len, rcv_nxt) — never out-of-order
+/// data (those live in `rx_ooo` slots). Capacity == `window`, the SYN's
+/// advertised bound. `rx_len`/`rx_pending`/`take_rx` keep their exact
+/// M84-era meaning for the seam's direct readers (syscall partial
+/// reads, the monitor's `net tcp recv`, terminal test fixtures).
+pub var rx_payload: [@as(usize, window)]u8 = undefined;
 pub var rx_len: usize = 0;
 pub var rx_pending: bool = false;
+/// M99h (#2186): the bounded out-of-order queue — `rx_ooo_max` slots,
+/// each one bounded segment. A slot holds bytes ahead of `rcv_nxt`
+/// inside the advertised window until the gap before them fills; the
+/// stream then splices them into `rx_payload` in order. `len == 0`
+/// marks a free slot (a held segment always carries bytes).
+pub const rx_ooo_max: usize = 8;
+pub const OooSlot = struct {
+    seq: u32 = 0,
+    len: u16 = 0,
+    data: [payload_max]u8 = undefined,
+};
+pub var rx_ooo: [rx_ooo_max]OooSlot = @splat(.{});
+/// M99h (#2186): a FIN received ahead of the stream — the sequence
+/// number it consumes — held until the bytes before it arrive.
+pub var fin_ooo: u32 = 0;
+pub var fin_ooo_set: bool = false;
 /// SH7 (#1083): a clean peer FIN+ACK was received in ESTABLISHED. The
 /// connection stays ESTABLISHED (the kernel TCP seam's close discipline),
 /// but the net terminal front-end uses this to auto-detach on disconnect
@@ -241,6 +320,17 @@ pub var retx_len: usize = 0;
 /// retransmit itself.
 pub var tx_ticks: u64 = 0;
 pub var retx_count: u64 = 0; // retransmissions of the CURRENT pending segment
+/// M99h (#2186, card h3): the RFC 6298 RTT estimators on the 1 Hz guest
+/// tick clock. `rtt_valid` is false until the first clean sample (a
+/// sample is an ACK that covers a pending segment which was NEVER
+/// retransmitted — Karn's algorithm, RFC 6298 §5.2). `rto_current` is
+/// the live timeout: the estimator value after a sample, doubled per
+/// retransmission (§5.5 backoff), clamped [rto_floor_ticks,
+/// rto_ceiling_ticks].
+pub var srtt_ticks: u64 = 0;
+pub var rttvar_ticks: u64 = 0;
+pub var rtt_valid: bool = false;
+pub var rto_current: u64 = rto_ticks;
 
 /// The RX dispatch's outcome — the caller (the monitor) observes it via
 /// `state`; the enum is the honest event for the host tests.
@@ -343,6 +433,71 @@ pub fn build_segment(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst
     return total;
 }
 
+/// M99h (#2186, card h1): `build_segment` with a bounded option area —
+/// `opts` is the pre-formed option list (0..40 bytes, padded to a
+/// 4-byte boundary with EOLs by the caller; the data offset records the
+/// padded length). Used by `socket_core` to put MSS 1460 on the
+/// active-open SYN; the legacy connection's SYN stays bare (its wire
+/// bytes are pinned by the live fleet gates).
+pub fn build_segment_opts(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, opts: []const u8, payload: []const u8) usize {
+    const plen = @min(payload.len, payload_max);
+    const opad = (opts.len + 3) & ~@as(usize, 3);
+    const total = tcp_hdr_len + opad + plen;
+    @memset(buf[0..total], 0);
+    buf[0] = @truncate(src_port >> 8);
+    buf[1] = @truncate(src_port);
+    buf[2] = @truncate(dst_port >> 8);
+    buf[3] = @truncate(dst_port);
+    buf[4] = @truncate(seq >> 24);
+    buf[5] = @truncate(seq >> 16);
+    buf[6] = @truncate(seq >> 8);
+    buf[7] = @truncate(seq);
+    buf[8] = @truncate(ack >> 24);
+    buf[9] = @truncate(ack >> 16);
+    buf[10] = @truncate(ack >> 8);
+    buf[11] = @truncate(ack);
+    buf[12] = @truncate(@as(u8, @intCast(5 + opad / 4)) << 4); // data offset covers the options
+    buf[13] = flags;
+    buf[14] = @truncate(window >> 8);
+    buf[15] = @truncate(window);
+    @memcpy(buf[20 .. 20 + opts.len], opts);
+    @memcpy(buf[20 + opad .. total], payload[0..plen]);
+    const c = checksum_tcp(src_ip, dst_ip, buf[0..total]);
+    buf[16] = @truncate(c >> 8);
+    buf[17] = @truncate(c);
+    return total;
+}
+
+/// M99h (#2186, card h1): the bounded option-list scan. Walks the
+/// declared option area (segment offset `off`, `opt_len` bytes —
+/// already bounds-checked against the segment) skipping EOL and NOPs,
+/// refusing a malformed length byte (0, 1, or one that overruns the
+/// area) with `error.MalformedOptions`; unknown kinds are skipped by
+/// their declared length; an MSS option (`mss_len` bytes — anything
+/// else is malformed) records the peer's MSS. Kind/length bytes are
+/// only ever read inside the area — a short option can never walk the
+/// walk past the segment end.
+pub fn scanOptions(seg: []const u8, off: usize, opt_len: usize, mss_out: *u16) error{MalformedOptions}!void {
+    var i: usize = off;
+    const end = off + opt_len;
+    while (i < end) {
+        const kind = seg[i];
+        if (kind == opt_eol) return; // padding — the rest is zeroed
+        if (kind == opt_nop) {
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= end) return error.MalformedOptions;
+        const olen: usize = seg[i + 1];
+        if (olen < 2 or i + olen > end) return error.MalformedOptions;
+        if (kind == opt_mss) {
+            if (olen != mss_len) return error.MalformedOptions;
+            mss_out.* = (@as(u16, seg[i + 2]) << 8) | seg[i + 3];
+        }
+        i += olen;
+    }
+}
+
 /// Build the FULL Ethernet + IPv4 + TCP frame into `buf` (must hold >=
 /// `eth_hdr_len + ipv4_hdr_len + segment.len`): dst MAC (the peer — the
 /// caller resolved it), src MAC, ethertype 0x0800, a 20-byte IPv4 header
@@ -424,6 +579,10 @@ pub fn reset_connection() void {
     rst_pending = false;
     rx_len = 0;
     rx_pending = false;
+    rx_ooo = @splat(.{});
+    fin_ooo = 0;
+    fin_ooo_set = false;
+    peer_mss = 0;
     peer_fin = false;
     allow_ip = .{ 0, 0, 0, 0 };
     allow_ip_set = false;
@@ -433,6 +592,10 @@ pub fn reset_connection() void {
     retx_len = 0;
     tx_ticks = 0;
     retx_count = 0;
+    srtt_ticks = 0;
+    rttvar_ticks = 0;
+    rtt_valid = false;
+    rto_current = rto_ticks;
     now_ticks = 0;
     syn_ticks = 0;
 }
@@ -455,6 +618,10 @@ pub fn reset() void {
     retx_aborted = 0;
     dropped_badsum = 0;
     dropped_malformed = 0;
+    dropped_options = 0;
+    ooo_held = 0;
+    rx_overflow = 0;
+    rx_dup = 0;
 }
 
 /// Enter LISTEN state on a local port (passive open).
@@ -473,15 +640,41 @@ pub fn listen(port: u16) void {
     ack_pending = false;
     rx_len = 0;
     rx_pending = false;
+    rx_ooo = @splat(.{});
+    fin_ooo = 0;
+    fin_ooo_set = false;
+    peer_mss = 0;
     peer_fin = false;
+    srtt_ticks = 0;
+    rttvar_ticks = 0;
+    rtt_valid = false;
+    rto_current = rto_ticks;
     clear_pending();
 }
 
+/// M99h (#2186, card h2): the honest advertised window — the receive
+/// queue's real free space: `window` minus every buffered byte (the
+/// in-order prefix plus the held out-of-order slots). An empty queue
+/// advertises the full 4096 — the SYN's pinned value — so the pin and
+/// the honesty agree.
+fn free_window() u16 {
+    var held: usize = rx_len;
+    for (rx_ooo) |s| held += s.len;
+    return @intCast(if (held >= window) 0 else window - held);
+}
+
 /// Build the next outbound segment into `msg` for THE connection (the
-/// fixed src port + the stored peer).
+/// fixed src port + the stored peer). M99h: the window field carries
+/// the queue's real free space — rewritten after the fixed-window build
+/// and re-checksummed.
 fn build_msg(seq: u32, ack: u32, flags: u8, payload: []const u8) void {
     const local_port = if (is_server) listen_port else default_src_port;
     msg_len = build_segment(&msg, arp.own_ip, peer_ip, local_port, peer_port, seq, ack, flags, payload);
+    std.mem.writeInt(u16, msg[14..16], free_window(), .big);
+    msg[16] = 0;
+    msg[17] = 0;
+    const c = checksum_tcp(arp.own_ip, peer_ip, msg[0..msg_len]);
+    std.mem.writeInt(u16, msg[16..18], c, .big);
 }
 
 /// IDLE -> SYN_SENT: record the peer (the caller resolved the MAC), draw
@@ -500,6 +693,14 @@ pub fn start(peer_ip_in: [4]u8, dst_port: u16, isn_in: u32, peer_mac_in: [6]u8) 
     srv_isn = 0;
     ack_pending = false;
     rx_pending = false;
+    rx_ooo = @splat(.{});
+    fin_ooo = 0;
+    fin_ooo_set = false;
+    peer_mss = 0;
+    srtt_ticks = 0;
+    rttvar_ticks = 0;
+    rtt_valid = false;
+    rto_current = rto_ticks;
     syn_ticks = now_ticks; // the connect clock starts now
     build_msg(isn, 0, flag_syn, &.{});
     state = .syn_sent;
@@ -558,6 +759,10 @@ pub fn release_conn() void {
     peer_mac = .{ 0, 0, 0, 0, 0, 0 };
     ack_pending = false;
     rx_pending = false;
+    rx_ooo = @splat(.{});
+    fin_ooo = 0;
+    fin_ooo_set = false;
+    peer_mss = 0;
     peer_fin = false;
     clear_pending();
 }
@@ -587,26 +792,51 @@ pub fn clear_pending() void {
 /// RFC 1982-style sequence comparison: `a` is at or past `b` (treating
 /// the u32 wrap). Used for the ACK-clears-pending check — the peer's
 /// ACK covers everything the client has sent when it reaches `snd_una`.
-fn seq_ge(a: u32, b: u32) bool {
+pub fn seq_ge(a: u32, b: u32) bool {
     return (a -% b) < 0x8000_0000;
+}
+
+/// M99h (#2186, card h3): the RFC 6298 RTT update on the guest's tick
+/// clock. Called at every ACK-accept site BEFORE `clear_pending` — a
+/// sample exists only when the pending segment was never retransmitted
+/// (Karn's algorithm, §5.2). First sample: SRTT = R, RTTVAR = R/2;
+/// later samples: the §2.3 alpha = 1/8 / beta = 1/4 filters in integer
+/// ticks. `rto_current` = SRTT + max(G, 4 x RTTVAR) with G = 1 tick,
+/// clamped [rto_floor_ticks, rto_ceiling_ticks]. A retransmitted
+/// segment's ACK contributes nothing and keeps the backed-off RTO.
+fn note_rtt_sample() void {
+    if (!tx_pending or retx_count != 0) return;
+    const r = now_ticks -| tx_ticks;
+    if (!rtt_valid) {
+        srtt_ticks = r;
+        rttvar_ticks = r / 2;
+        rtt_valid = true;
+    } else {
+        const d = if (r > srtt_ticks) r - srtt_ticks else srtt_ticks - r;
+        rttvar_ticks = (3 * rttvar_ticks + d) / 4;
+        srtt_ticks = (7 * srtt_ticks + r) / 8;
+    }
+    rto_current = @min(rto_ceiling_ticks, @max(rto_floor_ticks, srtt_ticks + @max(rto_floor_ticks, 4 * rttvar_ticks)));
 }
 
 /// Card N11 (claim 5357): the bounded retransmission poll — the shell
 /// idle loop calls it after the RX drain (an ACK processed by the drain
 /// cleared the pending state — a retransmission NEVER follows an
 /// acknowledged segment). One step per poll: if the pending segment's
-/// RTO (3 s of guest ticks) has expired and the bound is not exhausted,
-/// rebuild `msg` from the pending copy (byte-identical — the same seq,
-/// flags, payload, checksum) and count it; if the bound IS exhausted
-/// (10 retransmissions), release the connection honestly (`release_conn`
-/// — no RST, no TX) and count the abort. Bare ACKs are never pending.
+/// RTO (the adaptive `rto_current`, M99h) has expired and the bound is
+/// not exhausted, rebuild `msg` from the pending copy (byte-identical —
+/// the same seq, flags, payload, checksum), count it, and double the
+/// RTO toward the ceiling (RFC 6298 §5.5 backoff); if the bound IS
+/// exhausted (10 retransmissions), release the connection honestly
+/// (`release_conn` — no RST, no TX) and count the abort. Bare ACKs are
+/// never pending.
 pub fn poll_rto() RtoEvent {
     if (!tx_pending) return .none;
     if (state == .idle or state == .closed) {
         clear_pending(); // the connection died another way — stop the timer
         return .none;
     }
-    if (now_ticks -| tx_ticks < rto_ticks) return .none;
+    if (now_ticks -| tx_ticks < rto_current) return .none;
     if (retx_count >= retx_max) {
         retx_aborted += 1;
         // #1105: a server SYN-ACK that exhausted its retransmissions is a
@@ -620,6 +850,7 @@ pub fn poll_rto() RtoEvent {
     retx_count += 1;
     retransmitted += 1;
     tx_ticks = now_ticks; // the RTO clock restarts at each transmission
+    rto_current = @min(rto_ceiling_ticks, rto_current *| 2); // §5.5 backoff
     return .retransmit;
 }
 
@@ -633,9 +864,18 @@ pub fn advance_snd(consumed: usize) void {
 /// ESTABLISHED: build the data segment for `payload` (seq = snd_una, ack
 /// = rcv_nxt — every outbound segment after the handshake carries the
 /// client's receive state, RFC 793 §3.5). The payload is truncated
-/// honestly at `payload_max`.
+/// honestly at `send_limit`.
+/// M99h (#2186, card h1): the honest send bound — the smaller of the
+/// local buffer and the peer's advertised MSS. A peer that sent no MSS
+/// (the synthetic fleet's option-free shape) keeps the `payload_max`
+/// bound — the fleet's established contract — rather than the RFC 793
+/// 536-byte default, which would silently truncate existing consumers.
+pub fn send_limit() usize {
+    return @min(payload_max, if (peer_mss == 0) payload_max else @as(usize, peer_mss));
+}
+
 pub fn build_data_msg(payload: []const u8) void {
-    build_msg(snd_una, rcv_nxt, flag_ack, payload);
+    build_msg(snd_una, rcv_nxt, flag_ack, payload[0..@min(payload.len, send_limit())]);
 }
 
 /// ESTABLISHED: build the FIN (seq = snd_una, ack = rcv_nxt, FIN+ACK —
@@ -687,6 +927,183 @@ pub fn take_rx() []const u8 {
     return p;
 }
 
+/// M99h (#2186, card h2): hold one out-of-order segment in a bounded
+/// slot. The caller has already trimmed the bytes to the window, so the
+/// only bounds left are the slot count (`rx_ooo_max`) and a same-seq
+/// duplicate (counted, not double-stored). Returns false when the queue
+/// is full.
+fn ooo_insert(seq: u32, data: []const u8) bool {
+    for (rx_ooo) |s| {
+        if (s.len != 0 and s.seq == seq) {
+            rx_dup += 1;
+            return true; // held already — the stream is unchanged
+        }
+    }
+    for (&rx_ooo) |*s| {
+        if (s.len == 0) {
+            s.seq = seq;
+            s.len = @intCast(data.len);
+            @memcpy(s.data[0..data.len], data);
+            ooo_held += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// M99h (#2186, card h2): splice every queued slot now adjacent to
+/// `rcv_nxt` into the in-order prefix, oldest-first. A slot's held
+/// bytes were already counted against the window at insert, so the
+/// splice always fits — `rx_len + sum(slot.len) <= window` is the
+/// queue's invariant. Slots entirely below `rcv_nxt` (covered by a
+/// later segment) are freed, never copied — the stream cannot go
+/// backwards. A queued FIN (`fin_ooo_set`) applies the moment its
+/// sequence number becomes contiguous. Returns true when a FIN applied.
+fn drain_ooo() bool {
+    var fin_applied = false;
+    var progress = true;
+    while (progress) {
+        progress = false;
+        for (&rx_ooo) |*s| {
+            if (s.len == 0) continue;
+            const skip = rcv_nxt -% s.seq;
+            if (skip >= s.len) {
+                if (!seq_ge(rcv_nxt, s.seq +% s.len)) continue; // entirely ahead — a gap remains
+                s.len = 0; // fully covered — freed, never delivered
+                progress = true;
+                continue;
+            }
+            const rem: usize = s.len - skip;
+            @memcpy(rx_payload[rx_len .. rx_len + rem], s.data[skip..s.len]);
+            rx_len += rem;
+            rx_pending = true;
+            rcv_nxt +%= @intCast(rem);
+            s.len = 0;
+            progress = true;
+        }
+    }
+    if (fin_ooo_set and fin_ooo == rcv_nxt) {
+        fin_ooo_set = false;
+        rcv_nxt +%= 1; // the FIN consumes one sequence number
+        finack_recv += 1;
+        peer_fin = true;
+        fin_applied = true;
+    }
+    return fin_applied;
+}
+
+/// M99h (#2186, card h2): the established-state receive path — shared
+/// by `.established` and the `.syn_received` handshake ACK that carries
+/// payload. RFC 793's acceptability check on the bounded window: a pure
+/// ACK must sit exactly at `rcv_nxt`; a data segment must overlap
+/// `[rcv_nxt, rcv_nxt + free_window())`; a FIN may sit at or ahead of
+/// `rcv_nxt` inside the window (it queues until contiguous). Fully-old
+/// bytes are duplicates (`rx_dup`, re-ACKed — the peer resyncs); bytes
+/// beyond the window are refused (`dropped_malformed`); bytes that fit
+/// only partially are trimmed honestly (`rx_overflow`). An acceptable
+/// segment's ACK field is the ONLY thing that clears the retransmission
+/// timer — forged and out-of-window segments still never reach it
+/// (M97e-F2's property, kept).
+fn established_rx(seq: u32, ack: u32, flags: u8, payload: []const u8) Event {
+    const fwin: u32 = free_window();
+    const plen: u32 = @intCast(payload.len);
+    const has_fin = (flags & flag_fin) != 0;
+    var d_seq = seq;
+    var d_len: usize = payload.len;
+    var off: usize = 0;
+
+    if (plen == 0) {
+        if (seq != rcv_nxt) {
+            if (has_fin and (seq -% rcv_nxt) <= fwin and !seq_ge(rcv_nxt, seq)) {
+                fin_ooo = seq; // a FIN ahead of the stream — queue it
+                fin_ooo_set = true;
+                build_msg(snd_una, rcv_nxt, flag_ack, &.{});
+                ack_pending = true;
+                return .data_recv;
+            }
+            dropped_malformed += 1; // a bare segment not at rcv_nxt
+            return .none;
+        }
+    } else {
+        if (seq_ge(rcv_nxt, seq)) {
+            const skip = rcv_nxt -% seq;
+            if (skip >= plen) {
+                // Every byte is old news — a retransmit of consumed data.
+                rx_dup += 1;
+                build_msg(snd_una, rcv_nxt, flag_ack, &.{});
+                ack_pending = true;
+                return .data_recv;
+            }
+            off = @intCast(skip); // trim the consumed head
+            d_seq = rcv_nxt;
+            d_len = payload.len - off;
+        } else if (seq != rcv_nxt and (seq -% rcv_nxt) >= fwin) {
+            dropped_malformed += 1; // beyond the advertised window — never held
+            return .none;
+        }
+    }
+
+    // The ACK field of an acceptable segment — Karn's rule keeps a
+    // retransmitted segment's ACK out of the estimator.
+    if (tx_pending and seq_ge(ack, snd_una)) {
+        note_rtt_sample();
+        clear_pending();
+    }
+
+    var result: Event = .none;
+    var need_ack = false;
+    if (d_len != 0) {
+        // The tail cannot exceed the window past the segment's own
+        // offset — `d_seq - rcv_nxt` bytes of the free space are
+        // upstream of it (0 for an in-order segment).
+        const room: usize = @intCast(fwin -% (d_seq -% rcv_nxt));
+        if (d_len > room) {
+            rx_overflow += d_len - room;
+            d_len = room;
+        }
+        if (d_len != 0) {
+            if (d_seq == rcv_nxt) {
+                @memcpy(rx_payload[rx_len .. rx_len + d_len], payload[off .. off + d_len]);
+                rx_len += d_len;
+                rx_pending = true;
+                rcv_nxt +%= @intCast(d_len);
+                data_recv += 1;
+                result = .data_recv;
+                if (drain_ooo()) result = .finack_recv;
+            } else {
+                if (!ooo_insert(d_seq, payload[off .. off + d_len])) {
+                    rx_overflow += d_len; // the bounded queue is full — dropped, never misordered
+                }
+                result = .data_recv; // the ACK still goes out — it resyncs the peer
+            }
+        }
+        need_ack = true;
+    }
+    if (has_fin) {
+        const fin_seq = seq +% plen;
+        if (fin_seq == rcv_nxt) {
+            if ((flags & flag_ack) == 0) {
+                dropped_malformed += 1; // a clean FIN+ACK close only (honest bound)
+                return .none;
+            }
+            rcv_nxt +%= 1; // the FIN consumes one sequence number
+            finack_recv += 1;
+            peer_fin = true;
+            result = .finack_recv;
+        } else {
+            fin_ooo = fin_seq; // ahead of the stream — applies when contiguous
+            fin_ooo_set = true;
+            if (result == .none) result = .data_recv;
+        }
+        need_ack = true;
+    }
+    if (need_ack) {
+        build_msg(snd_una, rcv_nxt, flag_ack, &.{});
+        ack_pending = true;
+    }
+    return result;
+}
+
 /// Process one received TCP segment (the frame's IPv4 header was ALREADY
 /// validated by ipv4.zig — checksum, fragment, dst address). Runs in the
 /// RX drain context; builds the client's answer into `msg` and sets
@@ -730,14 +1147,26 @@ pub fn handle_rx(frame: []const u8) Event {
         dropped_malformed += 1; // a segment for a port we do not own
         return .none;
     }
-    if (segment[12] >> 4 != 5) {
-        dropped_malformed += 1; // options — the honest bound (offset != 5)
+    // M99h (#2186, card h1): the data offset declares the option area —
+    // [tcp_hdr_len, doff x 4) inside the segment. Offset < 5 is
+    // malformed; an offset beyond the segment is malformed; a valid
+    // offset's option list is scanned (NOPs skipped, unknown kinds
+    // skipped by length, MSS recorded) — a malformed option list drops
+    // the segment in its OWN counter, distinct from a malformed header.
+    const doff: usize = segment[12] >> 4;
+    if (doff < 5 or doff * 4 > segment.len) {
+        dropped_malformed += 1;
         return .none;
     }
+    var seg_mss: u16 = 0;
+    scanOptions(segment, tcp_hdr_len, doff * 4 - tcp_hdr_len, &seg_mss) catch {
+        dropped_options += 1;
+        return .none;
+    };
     const seq = be32(segment[4..8]);
     const ack = be32(segment[8..12]);
     const flags = segment[13];
-    const payload = segment[tcp_hdr_len..];
+    const payload = segment[doff * 4 ..];
     if (payload.len > payload_max) {
         dropped_malformed += 1; // no reassembly — the honest bound
         return .none;
@@ -789,6 +1218,7 @@ pub fn handle_rx(frame: []const u8) Event {
                 accept_ticks = now_ticks; // #1105 half-open accept clock
                 srv_isn = seq;
                 rcv_nxt = srv_isn +% 1;
+                peer_mss = seg_mss; // M99h: the requester's MSS, if it sent one
                 isn = @truncate(csprng.random_u64()); // the server ISN — CSPRNG-drawn like the client's (M97e-F2 rider; deterministic under the unseeded fallback)
                 snd_una = isn;
                 build_msg(isn, rcv_nxt, flag_syn | flag_ack, &.{});
@@ -811,17 +1241,11 @@ pub fn handle_rx(frame: []const u8) Event {
             }
             if ((flags & flag_ack) != 0) {
                 if (ack == snd_una) {
+                    note_rtt_sample(); // the ACK covers our SYN-ACK
                     clear_pending();
                     state = .established;
-                    if (payload.len != 0) {
-                        @memcpy(rx_payload[0..payload.len], payload);
-                        rx_len = payload.len;
-                        rx_pending = true;
-                        rcv_nxt = seq +% @as(u32, @intCast(payload.len));
-                        data_recv += 1;
-                        build_msg(snd_una, rcv_nxt, flag_ack, &.{});
-                        ack_pending = true;
-                        return .data_recv;
+                    if (payload.len != 0 or (flags & flag_fin) != 0) {
+                        return established_rx(seq, ack, flags, payload);
                     }
                     return .none;
                 }
@@ -850,7 +1274,9 @@ pub fn handle_rx(frame: []const u8) Event {
             }
             srv_isn = seq;
             rcv_nxt = srv_isn +% 1;
+            peer_mss = seg_mss; // M99h: the peer's advertised MSS, if it sent one
             state = .established;
+            note_rtt_sample(); // the SYN-ACK covers our SYN — the first RTT sample
             clear_pending(); // the SYN-ACK acknowledges our SYN — the timer stops
             // The handshake ACK (seq = our ISN+1, ack = the server's
             // ISN+1 — the SND/RCV state after the SYN).
@@ -866,53 +1292,17 @@ pub fn handle_rx(frame: []const u8) Event {
                 state = .closed; // the connection died — the report shows it
                 return .rst_recv;
             }
-            // M97e-F2 (#2101): the segment must be the NEXT one the
-            // connection expects — `seq == rcv_nxt`. An out-of-sequence
-            // segment (a blind inject, or a reordered/duplicated segment
-            // the no-reassembly bound cannot place) never clears the
-            // retransmission timer on its ACK field, is never FIN-ACKed,
-            // and never lands in the ONE-slot RX buffer.
-            if (seq != rcv_nxt) {
-                dropped_malformed += 1;
-                return .none;
-            }
-            // Card N11 (claim 5357): ANY accepted segment whose ACK
-            // covers everything the client has sent acknowledges the
-            // pending segment — the retransmission timer stops (the
-            // honest check: an acknowledged segment is never
-            // retransmitted).
-            if (tx_pending and seq_ge(ack, snd_una)) clear_pending();
-            if ((flags & flag_fin) != 0) {
-                if ((flags & flag_ack) == 0 or payload.len != 0) {
-                    dropped_malformed += 1; // a clean FIN+ACK close only (honest bound)
-                    return .none;
-                }
-                // A server FIN+ACK (the close answer, or the server
-                // closing first): count it, ACK it, and stay ESTABLISHED
-                // — the caller's `net tcp close` completes the close.
-                rcv_nxt = seq +% 1; // the FIN consumes one sequence number
-                finack_recv += 1;
-                peer_fin = true; // SH7: the peer asked to disconnect
-                build_msg(snd_una, rcv_nxt, flag_ack, &.{});
-                ack_pending = true;
-                return .finack_recv;
-            }
-            if (payload.len != 0) {
-                if (rx_pending) {
-                    dropped_malformed += 1; // the ONE-slot RX buffer is full (net tcp recv first)
-                    return .none;
-                }
-                @memcpy(rx_payload[0..payload.len], payload);
-                rx_len = payload.len;
-                rx_pending = true;
-                rcv_nxt = seq +% @as(u32, @intCast(payload.len));
-                data_recv += 1;
-                build_msg(snd_una, rcv_nxt, flag_ack, &.{});
-                ack_pending = true;
-                return .data_recv;
-            }
-            // A pure ACK: accepted, ignored (no retransmission machinery).
-            return .none;
+            // M99h (#2186, card h2): the in-sequence bound became the
+            // bounded receive window — `established_rx` accepts segments
+            // overlapping [rcv_nxt, rcv_nxt + free_window()), appends
+            // in-order bytes to the contiguous prefix, queues future
+            // bytes in the bounded `rx_ooo` slots, counts duplicates and
+            // overflow, and applies a queued FIN once its sequence
+            // number is contiguous. M97e-F2's property is kept: only an
+            // acceptable segment's ACK field may clear the
+            // retransmission timer — forged and out-of-window segments
+            // never reach it.
+            return established_rx(seq, ack, flags, payload);
         },
         .fin_sent => {
             if ((flags & flag_rst) != 0) {
@@ -935,6 +1325,7 @@ pub fn handle_rx(frame: []const u8) Event {
             }
             rcv_nxt = seq +% 1; // the FIN consumes one sequence number
             finack_recv += 1;
+            note_rtt_sample(); // the FIN-ACK covers our FIN — the last sample
             clear_pending(); // the FIN-ACK acknowledges our FIN — the timer stops
             state = .closed;
             // The final ACK (seq = snd_una — after our FIN — ack =
