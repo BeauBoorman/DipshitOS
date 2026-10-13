@@ -114,6 +114,9 @@ cp image/fonts/FiraCode-Regular.ttf "$OUT/share/FIRACODE.TTF"
 # the manifest that wires it — the Go registry only.
 cp image/fonts/VirelaiChrome-Regular.ttf "$OUT/share/CHROME.TTF"
 cp image/fonts/fonts.txt "$OUT/share/FONTS.TXT"
+# M99m (#2190): the serif role primary and the CJK cascade tail.
+cp image/fonts/NotoSerif-Regular.ttf "$OUT/share/NOTOSERF.TTF"
+cp image/fonts/NotoSansJP-Regular.ttf "$OUT/share/NOTOCJK.TTF"
 printf '#v2\nwm=none\n' >"$OUT/share/SETTINGS.TXT"
 cat >"$OUT/boot.txt" <<'EOF'
 net ip 10.0.0.1

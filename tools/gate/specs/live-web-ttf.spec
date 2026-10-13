@@ -4,6 +4,11 @@
 # Native font metrics, font-removal falsification and every behavior boot remain.
 # No guest capture is a golden. Gate-only root artifacts retain guest WEB.ELF identity.
 # Prerequisite: bash tools/go/build-web.sh browser WEB --gate
+#
+# M99m (#2190): the share now also stages FONTS.TXT, CHROME.TTF and the two
+# coverage faces, so runs enter the M99l manifest path. Runs 03/04 are the
+# coverage boots — they must precede 05, whose `vf rm` deletions persist on
+# the share for the rest of the gate.
 
 vgate_name live-web-ttf "WEB: native font metrics and exact M93 typography/table/image/fallback presentation"
 vgate_share seed
@@ -15,11 +20,22 @@ EOF
 vgate_file script-depth.txt <<'EOF'
 exec WEB.ELF /host/DEPTH.HTML
 EOF
+vgate_file script-cover.txt <<'EOF'
+exec WEB.ELF /host/COVER.HTML
+EOF
+vgate_file script-cover-noface.txt <<'EOF'
+vf rm NOTOSERF.TTF
+vf rm NOTOCJK.TTF
+vf ls
+exec WEB.ELF /host/COVER.HTML
+EOF
 vgate_file script-nofont.txt <<'EOF'
 vf rm INTER.TTF
 vf rm INTERB.TTF
 vf rm INTERI.TTF
 vf rm FIRACODE.TTF
+vf rm CHROME.TTF
+vf rm FONTS.TXT
 vf ls
 exec WEB.ELF /host/OLIVER.HTML
 EOF
@@ -41,6 +57,16 @@ shutil.copy(os.path.join("tests", "oliver-spike", "expect.html"), os.path.join(s
 for face in ("INTER.TTF", "INTERB.TTF", "INTERI.TTF", "FIRACODE.TTF"):
     if not os.path.exists(os.path.join(share, face)):
         sys.exit("missing seeded face: " + face)
+# M99m (#2190): the seeder still drops only the four original faces, so the
+# manifest, the chrome face and the two coverage faces stage here — same
+# names session.sh uses.
+for src, dst in (("image/fonts/fonts.txt", "FONTS.TXT"),
+                 ("image/fonts/VirelaiChrome-Regular.ttf", "CHROME.TTF"),
+                 ("image/fonts/NotoSerif-Regular.ttf", "NOTOSERF.TTF"),
+                 ("image/fonts/NotoSansJP-Regular.ttf", "NOTOCJK.TTF")):
+    if not os.path.exists(src):
+        sys.exit("missing font payload: " + src)
+    shutil.copy(src, os.path.join(share, dst))
 colors = [(0x11, 0x7f, 0x33), (0xd0, 0x33, 0x99),
           (0x22, 0x66, 0xdd), (0xee, 0xcc, 0x00)]
 qoi = bytearray(b"qoif") + struct.pack(">II", 32, 32) + bytes([4, 0])
@@ -71,6 +97,13 @@ open(os.path.join(share, "DEPTH.HTML"), "wb").write(depth)
 open(os.path.join(share, "LISTS.HTML"), "wb").write(lists)
 open(os.path.join(share, "PNG.HTML"), "wb").write(
     b'<img src="SWATCH.PNG" width="32" height="32" alt="guest PNG">')
+# M99m coverage page: kyōiku kanji + kana only NOTOCJK covers, then ℔ and the
+# ﬁ ligature — runes only NOTOSERF covers — inside a font-family:serif block.
+# A miss anywhere counts on `fonts: notdef`; real glyphs paint real ink.
+open(os.path.join(share, "COVER.HTML"), "wb").write(
+    b"<h4>coverage</h4>"
+    b"<p>cjk &#x65e5;&#x672c;&#x8a9e; &#x3042;&#x3044; &#x30ab;&#x30ad;</p>"
+    b'<p style="font-family:serif">serif &#x2114;&#xfb01;</p>')
 print("M93f staged separately tagged WEB and original QOI/PNG/HTML fixtures")
 PY
 
@@ -139,71 +172,171 @@ import subprocess, sys
 subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'depth'])
 PY
 
-# 03: remove every face through the actual host file channel. Distinct grid
-# hash is the falsification: a grid cannot pass the real-face expectation.
+# 03: M99m coverage faces. The manifest is honored (faces=8), the CJK line
+# reaches NOTOCJK and the serif-only runes in the font-family:serif block
+# reach NOTOSERF through the ui cascade — no rune exhausts its chain, so
+# `fonts: notdef` never speaks, and the page paints real ink (the probe
+# counts non-background pixels in the page viewport; .notdef cannot satisfy
+# the no-notdef marker).
 vgate_run 03 -- \
     --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
-    --snapshot-out '$RUN_DIR/snap-03' --script '$RUN_DIR/script-nofont.txt' \
+    --snapshot-out '$RUN_DIR/snap-03' --script '$RUN_DIR/script-cover.txt' \
     --snapshot-after 'web: settled' --snapshot-after 'web: repaint' \
     --script-expect 'web: ready' --timeout 120
 
 vgate_assert 03 serial-absent 'web: budget over'
-vgate_assert 03 serial-contains 'web: fonts bitmap8x8 ui=missing mono=missing'
-vgate_assert 03 serial-contains 'web: text face=bitmap8x8 proportional=no'
-vgate_assert 03 serial-contains ' bold-face=no'
-vgate_assert 03 serial-contains ' italic-face=no'
-vgate_assert 03 serial-contains ' adv-i=8'
-vgate_assert 03 serial-contains ' adv-W=8'
-vgate_assert 03 serial-contains ' h1-lineh=18'
-vgate_assert 03 serial-absent 'proportional=yes'
+vgate_assert 03 serial-contains 'web: url /host/COVER.HTML'
 vgate_assert 03 serial-contains 'web: parse nodes='
+vgate_assert 03 serial-contains 'web: layout blocks='
 vgate_assert 03 serial-contains 'web: settled'
 vgate_assert 03 serial-contains 'web: repaint items='
 vgate_assert 03 serial-contains 'web: ready'
+vgate_assert 03 serial-contains 'fonts: manifest=ok faces=8'
+vgate_assert 03 serial-contains 'web: fonts truetype(inter+firacode) ui=truetype mono=truetype'
+vgate_assert 03 serial-absent 'fonts: notdef='
 vgate_assert 03 serial-absent 'web: error'
 vgate_assert 03 serial-absent '[EXC] parking:'
-vgate_assert 03 snapshot 'snap-03-*.raw' <<'PY'
+vgate_assert 03 python <<'PY'
+import os, re, sys
+from pathlib import Path
+run = Path(os.environ["RUN_DIR"])
+ser = Path(os.environ["VG_SER"]).read_text(errors="replace")
+m = re.findall(r"^web: viewport css=1280x720 x=(\d+) y=(\d+) w=(\d+) h=(\d+) s=(\d+)$",
+               ser, re.MULTILINE)
+if not m:
+    sys.exit("missing intact viewport marker")
+x, y, w, h, _ = map(int, m[-1])
+if (x, y, w, h) != (0, 64, 512, 288):
+    sys.exit("wrong presentation geometry")
+x, y = x + 40, y + 28
+snaps = sorted(run.glob("snap-03-*.raw"))
+if not snaps:
+    sys.exit("no scanout snapshot")
+raw = snaps[-1].read_bytes()
+if len(raw) != 1280 * 720 * 4:
+    sys.exit("scanout size mismatch")
+bg_at = ((y + h - 4) * 1280 + x + w - 4) * 4
+bg = raw[bg_at:bg_at + 3]
+ink = 0
+for yy in range(y, y + h):
+    row = yy * 1280 * 4
+    for xx in range(x, x + w):
+        if raw[row + xx * 4:row + xx * 4 + 3] != bg:
+            ink += 1
+print("coverage viewport ink pixels:", ink, "bg:", bg.hex())
+if ink < 500:
+    sys.exit("coverage page painted too little ink for 12 real glyphs")
+PY
+
+# 04: fail-first mirror. The coverage faces are deleted through the real host
+# file channel and the same page re-run: every CJK and serif-only rune
+# exhausts its chain, so `fonts: notdef` counts them and the painted band
+# differs from run 03's (tofu is not the real glyphs).
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-04' --script '$RUN_DIR/script-cover-noface.txt' \
+    --snapshot-after 'web: settled' --snapshot-after 'web: repaint' \
+    --script-expect 'web: ready' --timeout 120
+
+vgate_assert 04 serial-absent 'web: budget over'
+vgate_assert 04 serial-contains 'web: url /host/COVER.HTML'
+vgate_assert 04 serial-contains 'fonts: manifest=ok faces=8'
+vgate_assert 04 serial-contains 'fonts: notdef='
+vgate_assert 04 serial-contains 'web: ready'
+vgate_assert 04 serial-absent 'web: error'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 python <<'PY'
+import os, re, sys
+from pathlib import Path
+run = Path(os.environ["RUN_DIR"])
+ser = Path(os.environ["VG_SER"]).read_text(errors="replace")
+m = re.findall(r"^web: viewport css=1280x720 x=(\d+) y=(\d+) w=(\d+) h=(\d+) s=(\d+)$",
+               ser, re.MULTILINE)
+if not m:
+    sys.exit("missing intact viewport marker")
+x, y, w, h, _ = map(int, m[-1])
+x, y = x + 40, y + 28
+def crop(p):
+    raw = Path(p).read_bytes()
+    if len(raw) != 1280 * 720 * 4:
+        sys.exit("scanout size mismatch: " + str(p))
+    return b"".join(raw[(yy * 1280 + x) * 4:(yy * 1280 + x + w) * 4]
+                    for yy in range(y, y + h))
+with_faces = sorted(run.glob("snap-03-*.raw"))
+no_faces = sorted(run.glob("snap-04-*.raw"))
+if not with_faces or not no_faces:
+    sys.exit("missing a scanout to compare")
+a, b = crop(with_faces[-1]), crop(no_faces[-1])
+print("with-faces crop bytes:", len(a), "identical to no-faces:", a == b)
+if a == b:
+    sys.exit("deleting the coverage faces changed no pixels")
+PY
+
+# 05: remove every face through the actual host file channel. Distinct grid
+# hash is the falsification: a grid cannot pass the real-face expectation.
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-05' --script '$RUN_DIR/script-nofont.txt' \
+    --snapshot-after 'web: settled' --snapshot-after 'web: repaint' \
+    --script-expect 'web: ready' --timeout 120
+
+vgate_assert 05 serial-absent 'web: budget over'
+vgate_assert 05 serial-contains 'web: fonts bitmap8x8 ui=missing mono=missing'
+vgate_assert 05 serial-contains 'web: text face=bitmap8x8 proportional=no'
+vgate_assert 05 serial-contains ' bold-face=no'
+vgate_assert 05 serial-contains ' italic-face=no'
+vgate_assert 05 serial-contains ' adv-i=8'
+vgate_assert 05 serial-contains ' adv-W=8'
+vgate_assert 05 serial-contains ' h1-lineh=18'
+vgate_assert 05 serial-absent 'proportional=yes'
+vgate_assert 05 serial-contains 'web: parse nodes='
+vgate_assert 05 serial-contains 'web: settled'
+vgate_assert 05 serial-contains 'web: repaint items='
+vgate_assert 05 serial-contains 'web: ready'
+vgate_assert 05 serial-absent 'web: error'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 snapshot 'snap-05-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'oliver-grid'])
 PY
 
-# 04: definition-list indentation and visible missing-image alt box.
-vgate_run 04 -- \
+# 06: definition-list indentation and visible missing-image alt box.
+vgate_run 06 -- \
     --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
-    --snapshot-out '$RUN_DIR/snap-04' --script '$RUN_DIR/script-lists.txt' \
+    --snapshot-out '$RUN_DIR/snap-06' --script '$RUN_DIR/script-lists.txt' \
     --snapshot-after 'web: repaint' \
     --script-expect 'web: ready' --timeout 120
 
-vgate_assert 04 serial-absent 'web: budget over'
-vgate_assert 04 serial-contains 'web: url /host/LISTS.HTML'
-vgate_assert 04 serial-contains 'web: parse nodes='
-vgate_assert 04 serial-contains 'web: layout blocks='
-vgate_assert 04 serial-contains 'web: settled'
-vgate_assert 04 serial-absent 'web: error'
-vgate_assert 04 serial-absent '[EXC] parking:'
-vgate_assert 04 snapshot 'snap-04-0.raw' <<'PY'
+vgate_assert 06 serial-absent 'web: budget over'
+vgate_assert 06 serial-contains 'web: url /host/LISTS.HTML'
+vgate_assert 06 serial-contains 'web: parse nodes='
+vgate_assert 06 serial-contains 'web: layout blocks='
+vgate_assert 06 serial-contains 'web: settled'
+vgate_assert 06 serial-absent 'web: error'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 snapshot 'snap-06-0.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'lists-grid'])
 PY
 
-# 05: real guest PNG decode; no face is needed. A placeholder cannot satisfy
+# 07: real guest PNG decode; no face is needed. A placeholder cannot satisfy
 # the exact host swatch hash or its four unique decoded colors.
-vgate_run 05 -- \
+vgate_run 07 -- \
     --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
-    --snapshot-out '$RUN_DIR/snap-05' --script '$RUN_DIR/script-png.txt' \
+    --snapshot-out '$RUN_DIR/snap-07' --script '$RUN_DIR/script-png.txt' \
     --snapshot-after 'web: repaint' \
     --script-expect 'web: ready' --timeout 120
 
-vgate_assert 05 serial-contains 'web: url /host/PNG.HTML'
-vgate_assert 05 serial-contains 'web: parse nodes='
-vgate_assert 05 serial-contains 'web: layout blocks='
-vgate_assert 05 serial-contains 'web: paint items='
-vgate_assert 05 serial-contains 'web: repaint items='
-vgate_assert 05 serial-contains 'web: ready'
-vgate_assert 05 serial-absent 'web: error'
-vgate_assert 05 serial-absent 'web: budget over'
-vgate_assert 05 serial-absent '[EXC] parking:'
-vgate_assert 05 snapshot 'snap-05-*.raw' <<'PY'
+vgate_assert 07 serial-contains 'web: url /host/PNG.HTML'
+vgate_assert 07 serial-contains 'web: parse nodes='
+vgate_assert 07 serial-contains 'web: layout blocks='
+vgate_assert 07 serial-contains 'web: paint items='
+vgate_assert 07 serial-contains 'web: repaint items='
+vgate_assert 07 serial-contains 'web: ready'
+vgate_assert 07 serial-absent 'web: error'
+vgate_assert 07 serial-absent 'web: budget over'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 snapshot 'snap-07-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'png-grid'])
 PY

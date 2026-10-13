@@ -23,8 +23,30 @@
 # Only the Go engine reads this manifest (ADR 0034 amendment A): the frozen
 # Zig paths keep their hard-coded face list, and a missing or refused manifest
 # falls back to that same set.
+#
+# M99m (#2190) coverage faces — both OFL 1.1, both static glyf TTFs instanced
+# from Google Fonts variable fonts and rebuilt by tools/fonts/build-faces.py
+# (pinned source URL + SHA-256 inside; fontTools is MIT). Neither engine
+# parses CFF, so the canonical CFF Noto CJK releases are unusable; these are
+# glyf builds. Excluded by name — they need complex shaping or bidi, both
+# named mountains: Arabic, Hebrew, Indic and Thai. Hangul is deferred: this
+# card ships a JP build, and Hangul syllables need a Noto Sans KR face.
+#
+# NOTOSERF appears twice on purpose. The role=serif row is the face
+# font-family:serif resolves to once M99p (#2193) wires that query. The
+# role=ui row puts the same face in today's ui cascade so runes only it
+# covers paint serif instead of .notdef; the faces map caches by file, so
+# the two rows still cost one lazy load.
+#
+#   face           source                          bytes   sha256
+#   NOTOSERF.TTF   Noto Serif 2.015 (var->Regular)  359680  7f5399a928da58075d578960e9ea89afa0a4588574894b4f20f11ae4a63c5f84
+#   NOTOCJK.TTF    Noto Sans JP 2.004 (var->Regular, 399592  e437322c312e04b580d8ce56539390148b529398932fca3f129321e5bcbe38a2
+#                  kana + kyōiku kanji + symbols)
 INTER.TTF    | role=ui     | order=1 | weight=400 | style=normal
 INTERB.TTF   | role=ui     | order=2 | weight=700 | style=normal
 INTERI.TTF   | role=ui     | order=3 | weight=400 | style=italic
+NOTOSERF.TTF | role=ui     | order=4 | weight=400 | style=normal
 FIRACODE.TTF | role=mono   | order=1 | weight=400 | style=normal
+NOTOSERF.TTF | role=serif  | order=1 | weight=400 | style=normal
 CHROME.TTF   | role=symbol | order=1 | weight=400 | style=normal
+NOTOCJK.TTF  | role=symbol | order=2 | weight=400 | style=normal

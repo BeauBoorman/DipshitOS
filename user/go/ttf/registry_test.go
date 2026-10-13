@@ -53,25 +53,26 @@ func TestManifestParsesShippedShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the shipped manifest must parse: %v", err)
 	}
-	if len(specs) != 5 {
-		t.Fatalf("shipped manifest decoded %d rows, want 5", len(specs))
-	}
 	// The four faces the hard-coded path reads must resolve to the same
-	// selections the manifest assigns them.
-	want := map[string]FaceSpec{
-		"INTER.TTF":    {Role: "ui", Order: 1, Weight: 400},
-		"INTERB.TTF":   {Role: "ui", Order: 2, Weight: 700},
-		"INTERI.TTF":   {Role: "ui", Order: 3, Weight: 400, Italic: true},
-		"FIRACODE.TTF": {Role: "mono", Order: 1, Weight: 400},
-		"CHROME.TTF":   {Role: "symbol", Order: 1, Weight: 400},
+	// selections the manifest assigns them, plus the M99m coverage faces:
+	// NOTOSERF is both the serif role's primary and the ui cascade's tail,
+	// and NOTOCJK trails the symbol faces so every chain reaches it last.
+	want := []FaceSpec{
+		{File: "INTER.TTF", Role: "ui", Order: 1, Weight: 400},
+		{File: "INTERB.TTF", Role: "ui", Order: 2, Weight: 700},
+		{File: "INTERI.TTF", Role: "ui", Order: 3, Weight: 400, Italic: true},
+		{File: "NOTOSERF.TTF", Role: "ui", Order: 4, Weight: 400},
+		{File: "FIRACODE.TTF", Role: "mono", Order: 1, Weight: 400},
+		{File: "NOTOSERF.TTF", Role: "serif", Order: 1, Weight: 400},
+		{File: "CHROME.TTF", Role: "symbol", Order: 1, Weight: 400},
+		{File: "NOTOCJK.TTF", Role: "symbol", Order: 2, Weight: 400},
 	}
-	for _, s := range specs {
-		w, ok := want[s.File]
-		if !ok {
-			t.Fatalf("unexpected row %+v", s)
-		}
-		if s.Role != w.Role || s.Order != w.Order || s.Weight != w.Weight || s.Italic != w.Italic {
-			t.Errorf("%s decoded %+v, want %+v", s.File, s, w)
+	if len(specs) != len(want) {
+		t.Fatalf("shipped manifest decoded %d rows, want %d", len(specs), len(want))
+	}
+	for i, s := range specs {
+		if w := want[i]; s != w {
+			t.Errorf("row %d decoded %+v, want %+v", i, s, w)
 		}
 	}
 }
