@@ -3506,12 +3506,37 @@ fn test_net_ops() virtio_net.Ops {
 }
 
 fn native_inject(port: u16, flags: u8, seq: u32, ack: u32, payload: []const u8) void {
+    native_inject_to(8090, port, flags, seq, ack, payload);
+}
+
+fn native_inject_to(dst_port: u16, src_port: u16, flags: u8, seq: u32, ack: u32, payload: []const u8) void {
     var segment: [tcp.segment_max]u8 = undefined;
-    const len = tcp.build_segment(&segment, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, port, 8090, seq, ack, flags, payload);
+    const len = tcp.build_segment(&segment, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, src_port, dst_port, seq, ack, flags, payload);
     var frame: [tcp.frame_max]u8 = undefined;
     const n = tcp.build_frame(&frame, &.{ 2, 0, 0, 0, 0, 2 }, .{ 10, 0, 0, 2 }, .{ 2, 0, 0, 0, 0, 1 }, .{ 10, 0, 0, 1 }, segment[0..len]);
     var scratch: [128]u8 = undefined;
     _ = virtio_net.ipv4.handle_rx(frame[0..n], &.{ 2, 0, 0, 0, 0, 1 }, &scratch);
+}
+
+/// Stage the device-completion the NEXT net_rx_drain picks up: the frame
+/// (built exactly like native_inject's, broadcast-dst so the MAC filter
+/// admits it) lands in rx_buf behind the observed 12-byte virtio_net_hdr
+/// and the used ring advances one element. This is how a mid-handler
+/// drain — handle_tcp_send's WouldBlock retry loop (#2233) — can admit
+/// the peer ACK that frees a conn's bounded TX slot.
+fn native_prime_rx(dst_port: u16, src_port: u16, flags: u8, seq: u32, ack: u32, payload: []const u8) void {
+    var segment: [tcp.segment_max]u8 = undefined;
+    const len = tcp.build_segment(&segment, .{ 10, 0, 0, 2 }, .{ 10, 0, 0, 1 }, src_port, dst_port, seq, ack, flags, payload);
+    const bcast = [6]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    var frame: [tcp.frame_max]u8 = undefined;
+    const n = tcp.build_frame(&frame, &.{ 2, 0, 0, 0, 0, 2 }, .{ 10, 0, 0, 2 }, bcast, .{ 10, 0, 0, 1 }, segment[0..len]);
+    @memset(virtio_net.rx_buf[0..virtio_net.rx_hdr_len], 0);
+    virtio_net.rx_buf[10] = 0x01; // virtio_net_hdr num_buffers (observed)
+    @memcpy(virtio_net.rx_buf[virtio_net.rx_hdr_len .. virtio_net.rx_hdr_len + n], frame[0..n]);
+    const dev = &virtio_net.net_dev;
+    dev.rx_used.ring[dev.rx_used.idx % virtio_net.queue_size] = .{ .id = 0, .len = @intCast(virtio_net.rx_hdr_len + n) };
+    dev.rx_used.idx +%= 1;
+    virtio_net.rx_armed = true;
 }
 
 test "B6 syscall: native routing two handles ownership EFAULT partial reads reset timeout cleanup" {
@@ -3592,6 +3617,65 @@ test "B6 syscall: native routing two handles ownership EFAULT partial reads rese
     try std.testing.expectEqual(error_result(.ebadf), dispatch(80, .{ 5, b, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 0), dispatch(80, .{ 4, listen, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 0), ns.ownedCount(pid));
+}
+
+test "syscall: sys_tcp_send waits a bounded drain for the TX slot's ACK — no EAGAIN leak (#2233)" {
+    const ns = syscall.native_socket;
+    ns.sockets = .{};
+    ns.dns = null;
+    ns.test_now = 0;
+    defer {
+        ns.sockets = .{};
+        ns.dns = null;
+        ns.test_now = 0;
+    }
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+    scheduler.start();
+    try std.testing.expect(scheduler.yield_current());
+    const pid = process.find_by_task(scheduler.current_id()).?;
+    const saved = virtio_net.net_ops;
+    virtio_net.net_ops = test_net_ops();
+    defer virtio_net.net_ops = saved;
+    virtio_net.net_ready = true;
+    virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
+    virtio_net.rx_armed = false;
+    tcp.reset();
+    defer {
+        virtio_net.net_ready = false;
+        virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
+        virtio_net.rx_armed = false;
+        tcp.reset();
+    }
+    var sendbuf = "abcdef".*;
+    set_user_regions(.{ .base = @intFromPtr(&sendbuf), .len = sendbuf.len }, .{ .base = 0, .len = 0 });
+    var frame = fresh_frame();
+
+    // The caller's established active-open conn — the legacy-shim shape a
+    // raw slot-31 caller (the TLS viTransport) drives after vi.Dial.
+    _ = try ns.legacyOpen(pid, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, 9999, .{ 2, 0, 0, 0, 0, 2 }, 100);
+    const c = ns.legacyConn(pid).?;
+    native_inject_to(c.local.port, 9999, tcp.flag_syn | tcp.flag_ack, 77, c.snd_nxt, "");
+    try std.testing.expect(c.state == .established);
+
+    // The first send commits and holds the bounded TX slot in flight —
+    // exactly the occupant that used to make the next send return -11.
+    try std.testing.expectEqual(@as(u64, 6), dispatch(sys_tcp_send, .{ @intFromPtr(&sendbuf), 6, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(c.tx_len != 0);
+    try std.testing.expect(c.tx_started);
+
+    // The peer's ACK arrives while the slot is occupied: the handler's
+    // drain admits it mid-call and the send commits instead of EAGAIN.
+    native_prime_rx(c.local.port, 9999, tcp.flag_ack, c.rcv_nxt, c.snd_nxt, "");
+    try std.testing.expectEqual(@as(u64, 6), dispatch(sys_tcp_send, .{ @intFromPtr(&sendbuf), 6, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(c.tx_len != 0); // the new segment is the occupant now
+
+    // Nothing inbound ever frees the slot: the wait is bounded and the
+    // seam's honest EAGAIN row survives only at the bound.
+    try std.testing.expectEqual(error_result(.eagain), dispatch(sys_tcp_send, .{ @intFromPtr(&sendbuf), 6, 0, 0, 0, 0 }, &frame));
 }
 
 test "B6 DNS service: ownership source ID exclusive UDP seat timeout and release" {

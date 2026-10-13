@@ -1315,3 +1315,80 @@ test "GlyphCache and blend_glyph_bgra render text into 32-bpp BGRA buffer" {
     try std.testing.expect(num_modified > 50);
     try std.testing.expect(num_blended > 20);
 }
+
+// M99n (#2191, ADR 0034 amendment A) froze this engine as the fallback and
+// build-time engine. The next two tests pin the frozen divergences — they
+// are the contract, not bugs: a change that greens them by growing the
+// engine has landed an unreviewed parity port.
+
+test "frozen engine is BMP-only: cmap format 4 shadows the faces' format 12" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init_single_threaded;
+    const io = io_impl.io();
+
+    // Both shipped faces carry format-12 subtables with real plane-1
+    // glyphs — Inter maps U+1F130 and Fira maps U+1D539 there (the Go
+    // engine reads them: gids 1964 and 997). The selector's format-4
+    // preference makes this engine BMP-only anyway: glyph_index returns
+    // 0 (.notdef) for every codepoint above U+FFFF, so astral text keeps
+    // advancing on .notdef rather than reaching those glyphs.
+    const inter_data = try load_test_font(io, "inter", allocator);
+    defer allocator.free(inter_data);
+    const inter = try TrueTypeFace.init(inter_data);
+    try std.testing.expectEqual(@as(u16, 4), inter.cmap_format);
+    try std.testing.expectEqual(@as(u16, 0), inter.glyph_index(0x1F130));
+    try std.testing.expectEqual(@as(u16, 0), inter.glyph_index(0x1F600));
+    try std.testing.expectEqual(@as(u16, 0), inter.glyph_index(0x10000));
+
+    const fira_data = try load_test_font(io, "fira", allocator);
+    defer allocator.free(fira_data);
+    const fira = try TrueTypeFace.init(fira_data);
+    try std.testing.expectEqual(@as(u16, 4), fira.cmap_format);
+    try std.testing.expectEqual(@as(u16, 0), fira.glyph_index(0x1D539));
+
+    // BMP coverage is unaffected — the divergence starts exactly at
+    // U+FFFF + 1.
+    try std.testing.expect(inter.glyph_index('A') > 0);
+    try std.testing.expect(fira.glyph_index('A') > 0);
+}
+
+test "frozen engine never kerns or ligates: measure is cmap+hmtx only" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init_single_threaded;
+    const io = io_impl.io();
+
+    const inter_data = try load_test_font(io, "inter", allocator);
+    defer allocator.free(inter_data);
+    const inter = try TrueTypeFace.init(inter_data);
+
+    // Inter carries GPOS kern and the Go engine applies it inside
+    // ShapeLatin: pair ('A','V') is worth -140 design units. This engine
+    // has no GPOS/GSUB pass at all — measure_string is exactly the
+    // design-unit sum scaled once. Pin both halves: the measured width
+    // equals the un-kerned sum AND differs from the kerned answer a
+    // shaping engine gives for the same pair.
+    const px: u32 = 13;
+    const upem: u64 = inter.units_per_em;
+    const adv_a = inter.glyph_metrics(inter.glyph_index('A')).advance_width;
+    const adv_v = inter.glyph_metrics(inter.glyph_index('V')).advance_width;
+    const un_kerned: u32 = @intCast(((@as(u64, adv_a) + adv_v) * px + upem / 2) / upem);
+    const kerned: u32 = @intCast(((@as(u64, adv_a) + adv_v - 140) * px + upem / 2) / upem);
+    try std.testing.expect(kerned < un_kerned); // -140 upem is visible at 13px
+    try std.testing.expectEqual(un_kerned, inter.measure_string(px, "AV"));
+
+    // No ligature shaping either: 'ffi' is three cmap lookups and three
+    // hmtx advances; a GSUB liga pass would substitute one glyph.
+    const adv_f = inter.glyph_metrics(inter.glyph_index('f')).advance_width;
+    const adv_i = inter.glyph_metrics(inter.glyph_index('i')).advance_width;
+    const ffi_unshaped: u32 = @intCast(((2 * @as(u64, adv_f) + adv_i) * px + upem / 2) / upem);
+    try std.testing.expectEqual(ffi_unshaped, inter.measure_string(px, "ffi"));
+
+    const fira_data = try load_test_font(io, "fira", allocator);
+    defer allocator.free(fira_data);
+    const fira = try TrueTypeFace.init(fira_data);
+    const fupem: u64 = fira.units_per_em;
+    const adv_ff = fira.glyph_metrics(fira.glyph_index('f')).advance_width;
+    const adv_fi = fira.glyph_metrics(fira.glyph_index('i')).advance_width;
+    const fi_unshaped: u32 = @intCast(((@as(u64, adv_ff) + adv_fi) * px + fupem / 2) / fupem);
+    try std.testing.expectEqual(fi_unshaped, fira.measure_string(px, "fi"));
+}
