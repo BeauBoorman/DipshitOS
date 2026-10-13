@@ -1,13 +1,17 @@
 // Command sshd is GOSSHD.ELF — the M70g G1 (#1491) in-guest SSH-2 server.
 //
-// Listens on one TCP port (default 2222) via slot 30 ip-0, speaks the ADR
-// 0025 D2 profile as a server, authenticates publickey against
-// SSH/AUTHORIZED_KEYS, and pipes one session exec to GOSH.ELF -c. One
-// connection at a time (the kernel TCP machine). Not on the boot path.
+// Listens on one TCP port (default 2222) on the slot-80 handle listener
+// (vi.SocketListen), speaks the ADR 0025 D2 profile as a server,
+// authenticates publickey against SSH/AUTHORIZED_KEYS, and pipes each
+// session exec to GOSH.ELF -c. M99g (#2185): every accepted child is its
+// own per-handle Conn served on its own goroutine, so the kernel's
+// two-children-per-listener bound translates directly into two
+// concurrent SSH sessions. Not on the boot path.
 package main
 
 import (
 	"strings"
+	"sync"
 
 	"virelai/vi"
 )
@@ -17,7 +21,6 @@ const (
 	defaultPort    = 2222
 	hostSecretName = "ssh-host-ed25519"
 	authKeysPath   = "SSH/AUTHORIZED_KEYS"
-	execOutPath    = "SSH/EXEC.OUT"
 	markerListen   = "sshd: listen "
 	markerAccepted = "sshd: accepted"
 	markerKex      = "sshd: kex-ok"
@@ -49,30 +52,64 @@ func main() {
 		vi.ConsoleLine(markerErr + "missing SSH/AUTHORIZED_KEYS")
 		vi.Exit(1)
 	}
-	ln, err := vi.Listen(port)
+	ln, err := vi.SocketListen(port)
 	if err != nil {
 		wipe(seed[:])
 		vi.ConsoleLine(markerErr + "listen")
 		vi.Exit(1)
 	}
 	vi.ConsoleLine(markerListen + vi.Itoa64(int64(port)))
-	if err := ln.Accept(); err != nil {
-		wipe(seed[:])
-		_ = ln.Close()
-		vi.ConsoleLine(markerErr + "accept")
+
+	// The accept loop hands every ESTABLISHED child its own Conn and its
+	// own goroutine; the kernel's child_limit=2 is what bounds live
+	// sessions. A third simultaneous SYN waits in the table until a
+	// session slot frees; an idle listener lets the bounded AcceptConn
+	// expire and the daemon exits cleanly.
+	var wg sync.WaitGroup
+	var failedMu sync.Mutex
+	failed := false
+	sessionN := 0
+	for {
+		child, err := ln.AcceptConn()
+		if err != nil {
+			break
+		}
+		vi.ConsoleLine(markerAccepted)
+		idx := sessionN
+		sessionN++
+		wg.Add(1)
+		go func(c *vi.Conn, i int) {
+			defer wg.Done()
+			defer c.Close()
+			if rc := serveSession(c, i, seed, keys); rc != 0 {
+				failedMu.Lock()
+				failed = true
+				failedMu.Unlock()
+			}
+		}(child, idx)
+	}
+	wg.Wait()
+	_ = ln.Close()
+	wipe(seed[:])
+	if failed {
 		vi.Exit(1)
 	}
-	vi.ConsoleLine(markerAccepted)
+	vi.ConsoleLine(markerBye)
+	vi.Exit(0)
+}
 
+// serveSession runs one SSH-2 session on its own per-handle Conn — the
+// pre-M99g session body, unchanged except the peer is the accepted child
+// rather than the singleton socket. Returns nonzero when the transport
+// or the SSH machine failed.
+func serveSession(c *vi.Conn, idx int, seed [32]byte, keys []AuthKey) int {
 	srv := newServer(serverConfig{
 		HostSeed: seed,
 		Keys:     keys,
-		Run:      runGosh,
+		Run:      func(cmd string) ([]byte, uint32, error) { return runGosh(cmd, execOutPath(idx)) },
 		Log:      logLine,
 		Entropy:  fillRandom,
 	})
-	wipe(seed[:])
-
 	var leftover []byte
 	rc := 0
 	for !srv.Closed() {
@@ -82,7 +119,7 @@ func main() {
 			leftover = nil
 		} else {
 			var chunk [vi.TCPPayloadMax]byte
-			n, err := ln.Recv(chunk[:])
+			n, err := c.Recv(chunk[:])
 			if err != nil {
 				vi.ConsoleLine(markerErr + "recv")
 				rc = 1
@@ -96,18 +133,22 @@ func main() {
 			continue
 		}
 		out := srv.Feed(in)
-		if err := pacedSend(ln, out, &leftover); err != nil {
+		if err := pacedSend(c, out, &leftover); err != nil {
 			vi.ConsoleLine(markerErr + "send")
 			rc = 1
 			break
 		}
 	}
-	_ = ln.Close()
-	if rc != 0 || srv.Failed() {
-		vi.Exit(1)
+	if srv.Failed() {
+		rc = 1
 	}
-	vi.ConsoleLine(markerBye)
-	vi.Exit(0)
+	return rc
+}
+
+// execOutPath gives each session its own GOSH stdout redirect — two
+// concurrent execs must not share SSH/EXEC.OUT.
+func execOutPath(idx int) string {
+	return "SSH/EX" + vi.Itoa64(int64(idx%16)) + ".OUT"
 }
 
 func listenPort(args []string) uint16 {
@@ -264,17 +305,17 @@ func splitLines(s string) []string {
 	return out
 }
 
-func runGosh(cmd string) ([]byte, uint32, error) {
+func runGosh(cmd string, outPath string) ([]byte, uint32, error) {
 	if cmd == "" || strings.ContainsAny(cmd, "\n\r") {
 		return nil, 1, errString("bad exec")
 	}
 	// The redirect is how this process reads the child's stdout back onto
 	// the SSH channel. The whole line is one argv slot; over-long is refused.
-	line := cmd + " > " + execOutPath
+	line := cmd + " > " + outPath
 	if len(line) > vi.ExecArgMax {
 		return nil, 1, errString("exec line")
 	}
-	_ = vi.FileDelete(execOutPath)
+	_ = vi.FileDelete(outPath)
 	pid, err := vi.Exec("GOSH.ELF", "-c", line)
 	if err != nil {
 		return nil, 127, err
@@ -284,7 +325,7 @@ func runGosh(cmd string) ([]byte, uint32, error) {
 		return nil, 1, err
 	}
 	vi.ConsoleLine(markerGosh + vi.Itoa64(st))
-	out, r := vi.ReadFileAll(execOutPath, 4096)
+	out, r := vi.ReadFileAll(outPath, 4096)
 	if r < 0 {
 		return nil, uint32(st), nil
 	}
@@ -310,8 +351,8 @@ func pacedSend(c *vi.Conn, p []byte, leftover *[]byte) error {
 		}
 		deadline := vi.Nanos() + vi.DefaultRecvBudgetNs
 		for {
-			mask, rc := vi.TCPReady()
-			if rc < 0 {
+			mask, err := c.ReadyMask()
+			if err != nil {
 				return errString("ready")
 			}
 			if mask&1 != 0 {

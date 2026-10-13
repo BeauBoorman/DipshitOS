@@ -2411,7 +2411,150 @@ fn handle_socket(args: Args, _: *exceptions.VectorFrame) u64 {
             }
             return h.value;
         },
+        10 => {
+            // M99g (#2185): active open — the per-handle connect the Go
+            // net surface's `vi.Dial` rides. The handle ABI stops being
+            // passive-only here: same argument packing as slot 30
+            // (args[1]=ip, args[2]=port|timeout_ms<<16), the same ARP +
+            // in-handler bounded wait, but the answer is the table handle
+            // every other op addresses, so one process can hold several
+            // outbound connections. The bound is the table's own
+            // (owner_limit/conn_limit): Capacity -> ENOSPC, never a
+            // userland copy.
+            if (!virtio_net.net_ready or !virtio_net.arp.ip_set()) return error_result(.einval);
+            const ip_raw = args[1];
+            const port_word = args[2];
+            const dst_port: u16 = @truncate(port_word);
+            const timeout_ms: u32 = @truncate(port_word >> 16);
+            if (ip_raw == 0 or ip_raw > 0xffffffff or dst_port == 0 or
+                port_word >> 48 != 0 or args[3] != 0) return error_result(.einval);
+            const ip = native_socket.ipBytes(ip_raw);
+            if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
+            const peer_mac = virtio_net.arp.lookup(ip) orelse return error_result(.einval);
+            const start_pct = timer.cntpct();
+            const deadline = tcp.ConnectDeadline.init(start_pct, timer.freq, timeout_ms);
+            if (!builtin.is_test and deadline == null) return error_result(.einval);
+            const timeout_result = error_result(if (timeout_ms == 0) .einval else .etimedout);
+            const isn: u32 = @truncate(csprng.random_u64());
+            const h = native_socket.legacyOpen(pid, virtio_net.arp.own_ip, ip, dst_port, peer_mac, isn) catch |err| return socket_error(err);
+            tcp.syn_sent += 1; // `net`/`sys_net_stats` mirror — same row slot 30 writes
+            const cslot: usize = @intCast((h.value & native_socket.core.slot_mask) - native_socket.core.conn_slot_base);
+            var test_iterations: usize = 0;
+            while (true) {
+                const c: *native_socket.core.Connection = blk: {
+                    if (native_socket.sockets.children[cslot]) |*cc| {
+                        if (cc.handle.value == h.value) break :blk cc;
+                    }
+                    return error_result(.einval);
+                };
+                if (c.state == .established) {
+                    tcp.synack_recv += 1;
+                    tcp.ack_sent += 1;
+                    return h.value;
+                }
+                if (c.state == .terminal) {
+                    const outcome = c.outcome;
+                    native_socket.sockets.releaseAt(native_socket.core.conn_slot_base + cslot);
+                    switch (outcome) {
+                        .timeout => {
+                            tcp.timed_out += 1;
+                            return timeout_result;
+                        },
+                        else => {
+                            tcp.rst_recv += 1;
+                            return error_result(.einval);
+                        },
+                    }
+                }
+                if (deadline) |d| {
+                    if (d.expired(timer.cntpct())) {
+                        native_socket.sockets.releaseAt(native_socket.core.conn_slot_base + cslot);
+                        tcp.timed_out += 1;
+                        return timeout_result;
+                    }
+                }
+                virtio_net.net_rx_drain();
+                // A SYN-ACK drained after the deadline must not turn
+                // expiry into success — the slot-30 ordering, mirrored.
+                if (deadline) |d| {
+                    if (d.expired(timer.cntpct())) {
+                        native_socket.sockets.releaseAt(native_socket.core.conn_slot_base + cslot);
+                        tcp.timed_out += 1;
+                        return timeout_result;
+                    }
+                }
+                virtio_net.net_socket_poll();
+                tcp_flush_rst();
+
+                if (timer.freq == 0 or comptime builtin.is_test) {
+                    test_iterations += 1;
+                    if (test_iterations > 1000) {
+                        native_socket.sockets.releaseAt(native_socket.core.conn_slot_base + cslot);
+                        tcp.timed_out += 1;
+                        return timeout_result;
+                    }
+                }
+
+                if (comptime builtin.cpu.arch == .aarch64) {
+                    // Same pacing window as handle_tcp_connect: the domain
+                    // hold is dropped so a second process's net syscall
+                    // (or a second Dial's) interleaves — that is what makes
+                    // two concurrent in-kernel connects possible at all.
+                    const outer = svclock.held_bits();
+                    svclock.release_set(outer);
+                    var spins: usize = 0;
+                    while (spins < 1000) : (spins += 1) asm volatile ("nop");
+                    svclock.acquire_set(outer);
+                }
+            }
+        },
         11 => return native_socket.ownedCount(pid),
+        12 => {
+            // M99g (#2185): the live table snapshot netstat paints — one
+            // fixed 24-byte row per listener and per connection, carrying
+            // the owner pid so the reader can name the holding process.
+            // Row layout (little-endian):
+            //   [0]  owner pid        u64
+            //   [8]  local ip         [4]u8
+            //   [12] local port       u16
+            //   [14] remote port      u16 (0 for listeners)
+            //   [16] remote ip        [4]u8 (0.0.0.0 for listeners)
+            //   [20] kind             u8  (0 = listener, 1 = connection)
+            //   [21] state            u8  (core State; listeners always 0)
+            //   [22] pad              u16
+            // args[1]=out ptr, args[2]=max rows (bounded 64), args[3]=0.
+            const max_rows: usize = @intCast(@min(args[2], 64));
+            if (args[3] != 0) return error_result(.einval);
+            const row_len: usize = 24;
+            if (!uaccess.write_region_covers(args[1], max_rows * row_len)) return error_result(.efault);
+            var row: [row_len]u8 = undefined;
+            var written: u64 = 0;
+            for (0..native_socket.core.listener_limit) |slot| {
+                if (written >= max_rows) return written;
+                const l = native_socket.sockets.listenerAt(slot) orelse continue;
+                @memset(&row, 0);
+                std.mem.writeInt(u64, row[0..8], l.owner, .little);
+                row[8..12].* = l.local.ip;
+                std.mem.writeInt(u16, row[12..14], l.local.port, .little);
+                written += 1;
+                if (uaccess.copy_out(args[1] + (written - 1) * row_len, &row, row_len) != .ok) return error_result(.efault);
+            }
+            for (&native_socket.sockets.children) |*entry| {
+                if (written >= max_rows) return written;
+                const c = if (entry.*) |*cc| cc else continue;
+                @memset(&row, 0);
+                std.mem.writeInt(u64, row[0..8], c.owner, .little);
+                row[8..12].* = c.local.ip;
+                std.mem.writeInt(u16, row[12..14], c.local.port, .little);
+                std.mem.writeInt(u16, row[14..16], c.remote.port, .little);
+                row[16..20].* = c.remote.ip;
+                row[20] = 1;
+                row[21] = @backingInt(c.state);
+                written += 1;
+                if (uaccess.copy_out(args[1] + (written - 1) * row_len, &row, row_len) != .ok) return error_result(.efault);
+            }
+            return written;
+        },
         else => return error_result(.einval),
     }
 }

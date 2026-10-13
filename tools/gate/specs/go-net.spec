@@ -321,7 +321,11 @@ assert m, "missing guest counter samples or wrong timeout error"
 elapsed = int(m[2]) - int(m[1])
 assert 5_000_000_000 <= elapsed < 6_000_000_000, elapsed
 assert re.search(r"tcp=idle,[^\n]*,timedout=1,", ser), "timeout singleton/counter not observed"
-assert "  30 sys_tcp_connect calls=2" in ser and "  33 sys_tcp_close calls=2" in ser
+# M99g: vi.Dial rides slot-80 op-10 now, so slot 30 sees no connects and
+# slot 33 only the fixture's explicit cleanup call; the handle ops ride 80.
+assert "  30 sys_tcp_connect calls=0" in ser and "  33 sys_tcp_close calls=1" in ser
+m2 = re.search(r"  80 sys_socket calls=(\d+)", ser)
+assert m2 and int(m2.group(1)) >= 5, "slot-80 ops missing (connects+send+read+close)"
 data = (rd / "connect.bin").read_bytes()
 suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")
 pathlib.Path("artifacts", "go-net-connect-wire" + suffix + ".bin").write_bytes(data)
@@ -353,7 +357,9 @@ assert m, "missing guest counter samples or changed legacy timeout error"
 elapsed = int(m[2]) - int(m[1])
 assert 30_000_000_000 <= elapsed < 31_000_000_000, elapsed
 assert re.search(r"tcp=idle,[^\n]*,timedout=1,", ser), "legacy timeout singleton/counter not observed"
-assert "  30 sys_tcp_connect calls=2" in ser and "  33 sys_tcp_close calls=2" in ser
+# M99g: same slot-80 reroute — the 'legacy' mode's 30 s EINVAL now comes
+# from op-10's default connect window, not the retired slot-30 path.
+assert "  30 sys_tcp_connect calls=0" in ser and "  33 sys_tcp_close calls=1" in ser
 data = (rd / "connect-legacy.bin").read_bytes()
 suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")
 pathlib.Path("artifacts", "go-net-connect-legacy-wire" + suffix + ".bin").write_bytes(data)
@@ -509,6 +515,199 @@ for port, segs in conns.items():
 assert conns[6001][0][0] < conns[6002][-1][0] and conns[6002][0][0] < conns[6001][-1][0], (
     "connection windows did not overlap: %r vs %r" % (conns[6001], conns[6002]))
 print("multi ok: 3 listeners, 2 concurrent connections, distinct 5-tuples")
+PY
+
+# --- M99g (#2185): per-handle outbound conns -----------------------------
+# One process now holds several outbound vi.Dial connections: op-10 of
+# the slot-80 socket ABI mints a table handle per Dial, priced against
+# the kernel's own owner_limit (4 per process). The fifth Dial is the
+# bound's own ENOSPC, surfaced as ErrConnBusy BY NAME — there is no
+# userland copy of the bound. Two of the held conns carry data so the
+# capture shows two distinct guest source ports with interleaved
+# lifecycles; GONETSTAT.ELF runs alongside and its `netstat: sock`
+# diff-log must list the live conns with the owner's pid.
+
+vgate_file dialpair.go <<'EOF'
+package main
+
+import (
+	"errors"
+	"time"
+
+	"virelai/vi"
+	"virelai/vsys"
+)
+
+func fail(s string) {
+	vsys.Println("dialpair: FAIL " + s)
+	vsys.Exit(1)
+}
+
+func main() {
+	// Four concurrent outbound connections from ONE process. The kernel
+	// table's per-owner bound is 4, so these must all succeed — and each
+	// answer is a distinct per-connection handle. (Channels, not the sync
+	// package: the fixture must stay inside the kernel's text gap.)
+	conns := make([]*vi.Conn, 4)
+	errs := make([]error, 4)
+	done := make(chan int, len(conns))
+	for i := range conns {
+		go func(i int) {
+			conns[i], errs[i] = vi.DialTimeout("10.0.0.2", 8080, 15*time.Second)
+			done <- i
+		}(i)
+	}
+	for range conns {
+		<-done
+	}
+	seen := make(map[uint64]bool)
+	for i, c := range conns {
+		if errs[i] != nil {
+			fail("dial refused " + errs[i].Error())
+		}
+		if c == nil {
+			fail("dial returned no conn")
+		}
+		if seen[c.Handle()] {
+			fail("two dials share a handle")
+		}
+		seen[c.Handle()] = true
+		vsys.Println("dialpair: open h=" + vsys.Itoa64(int64(c.Handle())))
+	}
+
+	// The fifth Dial meets the kernel's ENOSPC — named ErrConnBusy, not
+	// a userland singleton guard (there is none any more).
+	c5, err := vi.DialTimeout("10.0.0.2", 8080, 5*time.Second)
+	if c5 != nil || err == nil {
+		fail("fifth dial succeeded")
+	}
+	if !errors.Is(err, vi.ErrConnBusy) {
+		fail("fifth dial = " + err.Error())
+	}
+	vsys.Println("dialpair: fifth refused busy")
+
+	// Hold the pair long enough for GONETSTAT's ~1 Hz refresh to log the
+	// live rows, then carry data on both — two live connections, two
+	// distinct source ports on the wire.
+	holdUntil := vi.Nanos() + 3_000_000_000
+	for vi.Nanos() < holdUntil {
+		vi.Yield()
+	}
+	_ = conns[2].Close()
+	_ = conns[3].Close()
+	dataDone := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func(i int, c *vi.Conn) {
+			tag := "one"
+			if i == 1 {
+				tag = "two"
+			}
+			if _, err := c.Send([]byte("GET /" + tag + " HTTP/1.0\r\n\r\n")); err != nil {
+				fail("send " + tag + " " + err.Error())
+			}
+			c.SetRecvDeadline(15_000_000_000)
+			buf := make([]byte, vi.TCPPayloadMax)
+			n, err := c.Recv(buf)
+			if err != nil || n < 15 || string(buf[:15]) != "HTTP/1.0 200 OK" {
+				fail("recv " + tag)
+			}
+			vsys.Println("dialpair: data " + tag)
+			dataDone <- i
+		}(i, conns[i])
+	}
+	<-dataDone
+	<-dataDone
+	_ = conns[0].Close()
+	_ = conns[1].Close()
+	vsys.Println("dialpair: done")
+	vsys.Exit(0)
+}
+EOF
+
+vgate_file script-dialpair.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GONETSTAT.ELF
+exec GO2DIAL.ELF
+EOF
+
+vgate_file script-dialpair-end.txt <<'EOF'
+echo dialpair-finished
+EOF
+
+vgate_setup_python <<'PY'
+import os, pathlib, subprocess, shutil, sys
+rd = pathlib.Path(os.environ["RUN_DIR"])
+share = pathlib.Path(os.environ.get("VG_SHARE") or rd / "share")
+tmp = rd / "connect-build"
+tmp.mkdir(exist_ok=True)
+env = dict(os.environ, TMPDIR=str(tmp), GO_BUILD_OUT=str(share),
+           GO_BUILD_NAME="GO2DIAL", GO_LDFLAGS_VALUE="-s -w")
+subprocess.run(["bash", "tools/go/build-go.sh", str(rd / "dialpair.go")], env=env, check=True)
+src = os.path.join(".build", "go", "GONETSTAT.ELF")
+if not os.path.exists(src):
+    sys.exit("GONETSTAT.ELF missing (expected " + src + ") - build it first: bash tools/go/build-netdiag.sh")
+shutil.copy(src, os.path.join(share, "GONETSTAT.ELF"))
+PY
+
+# script2 ends the run a beat after the pair finishes: the markers are all
+# emitted by then, and netstat's diff-log has already printed the rows.
+vgate_run dialpair -- --net '$RUN_DIR/dialpair.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:8080 \
+    --script '$RUN_DIR/script-dialpair.txt' \
+    --script2 '$RUN_DIR/script-dialpair-end.txt' --script2-after 'dialpair: done' --script2-delay 8 \
+    --script-expect 'dialpair-finished' --timeout 120
+
+vgate_assert dialpair serial-contains 'netstat: ready'
+vgate_assert dialpair serial-contains 'dialpair: fifth refused busy'
+vgate_assert dialpair serial-contains 'dialpair: data one'
+vgate_assert dialpair serial-contains 'dialpair: data two'
+vgate_assert dialpair serial-contains 'dialpair: done'
+vgate_assert dialpair serial-absent 'dialpair: FAIL'
+vgate_assert dialpair serial-absent '[EXC] parking:'
+vgate_assert dialpair python <<'PY'
+import os, re, struct, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Four opens, four DISTINCT table handles — the per-handle proof.
+handles = re.findall(r"dialpair: open h=(\d+)", ser)
+assert len(handles) == 4 and len(set(handles)) == 4, handles
+# netstat's diff-log named the owning pid for every live conn: at least
+# two sock rows for the SAME pid carrying the 8080 remote endpoint.
+sock = re.findall(r"netstat: sock pid=(\d+) tcp .* -> 10\.0\.0\.2:8080", ser)
+assert len(sock) >= 2 and len(set(sock)) == 1, sock
+# The wire walk: guest-initiated frames to 10.0.0.2:8080 — four SYNs from
+# four distinct source ports, at least two carrying data, lifecycles
+# overlapping in ONE capture (a singleton dial path cannot emit the
+# second SYN while the first connection still sends).
+data = open(os.environ["RUN_DIR"] + "/dialpair.bin", "rb").read()
+frames = []
+i = 0
+while i < len(data):
+    if data[i+12:i+14] == b"\x08\x06":
+        i += 42
+        continue
+    assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
+    size = 14 + struct.unpack_from("!H", data, i + 16)[0]
+    frames.append(data[i:i+size])
+    i += size
+conns = {}
+for idx, f in enumerate(frames):
+    if f[23] != 6 or f[26:30] != bytes([10, 0, 0, 1]):
+        continue
+    sp = (f[34] << 8) | f[35]
+    dp = (f[36] << 8) | f[37]
+    if dp != 8080:
+        continue
+    conns.setdefault(sp, []).append((idx, f[47], len(f) - 54))
+syns = {sp: segs for sp, segs in conns.items() if any(fl == 0x02 for _, fl, _ in segs)}
+assert len(syns) == 4, "expected 4 distinct guest source ports, got %r" % list(syns)
+data_ports = [sp for sp, segs in conns.items() if any(n > 0 for _, _, n in segs)]
+assert len(data_ports) >= 2, "fewer than two conns carried data: %r" % data_ports
+a, b = data_ports[0], data_ports[1]
+assert conns[a][0][0] < conns[b][-1][0] and conns[b][0][0] < conns[a][-1][0], (
+    "connection windows did not overlap")
+print("dialpair ok: 4 concurrent dials (%s), 5th ErrConnBusy, netstat pid=%s, data on %s"
+      % (sorted(syns), sock[0], sorted(data_ports)))
 PY
 
 # --- M95 prerequisite #2029: stdlib `net` on GOOS=virelai ---------------

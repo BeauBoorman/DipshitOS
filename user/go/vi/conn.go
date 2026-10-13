@@ -1,32 +1,37 @@
 package vi
 
 import (
-	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"virelai/vsys"
 )
 
-// The M67a/M70g socket surface (#1446, #1491): dial/send/recv over the
-// kernel's TCP slots 30-33, with DNS name resolution in front of the dial
-// (dns.go), plus Listen over the same slot-30 passive-open (ip==0) that
-// httpd.zig already uses. Every call lands on an existing ADR 0007 row;
-// DialTimeout opts into slot 30's packed budget. The kernel keeps its
-// ONE-TCP-socket-per-process
-// law (kernel/src/tcp.zig is a process-wide singleton keyed by
-// tcp.owner_pid) and this type mirrors it so a second live Dial or Listen
-// fails in userland before the kernel has to.
+// The M99g (#2185) per-handle socket surface: `vi.Dial` and the native
+// `SocketListen`/`AcceptConn` pair ride the kernel's slot-80 socket ABI
+// (kernel/src/syscall.zig handle_socket), where every Conn carries the
+// generation-tagged table handle M99f (#2184) mints. The process's bound
+// is the kernel table's own (owner_limit=4, conn_limit=4): a refused
+// open comes back ENOSPC and maps to ErrConnBusy — there is no userland
+// copy of the bound.
 //
-// Blocking semantics: Dial's connect waits IN the kernel (slot 30 spins the
-// caller until ESTABLISHED or the kernel's 30 s connect timeout); Recv is
-// blocking-with-poll — probe the readiness mask (slot 76), take the bytes
-// when readable, otherwise check the deadline and PARK one scheduler tick
-// (slot 4) before re-probing. A parked Recv therefore never starves its
-// peers: the M65 runtime's other goroutines keep running while this task is
-// parked, which is the pacing the go-net gate pins with its heartbeat.
-// Every wait is bounded (the deadline or DefaultRecvBudgetNs): a peer that
-// goes dark fails closed instead of parking forever.
+// Legacy compat: `vi.Listen` still takes the slot-30 passive open, so
+// the singleton-era callers (agentd, rfbserver, httpd) that drive the
+// accepted session over raw slots 31–33/76 keep their kernel contract.
+// Raw-slot callers after a `vi.Dial` also keep working: the kernel's
+// legacy view binds the process's first active-open conn, which an
+// op-10 conn still is.
+//
+// Blocking semantics: Dial's connect waits IN the kernel (op 10 spins
+// the caller until ESTABLISHED or the connect budget expires — the
+// kernel drops the net domain lock through its pacing window, so two
+// goroutines really can each hold a live connect); Recv is
+// blocking-with-poll — probe the HANDLE's readiness mask (op 5), take
+// the bytes when readable, otherwise check the deadline and PARK one
+// scheduler tick (slot 4) before re-probing. A parked Recv therefore
+// never starves its peers. Every wait is bounded (the deadline or
+// DefaultRecvBudgetNs): a peer that goes dark fails closed instead of
+// parking forever.
 
 const (
 	// TCPPayloadMax is tcp.payload_max (kernel/src/tcp.zig): the largest
@@ -40,12 +45,43 @@ const (
 	maxRecvPolls = 3600
 )
 
+// Slot-80 socket ops (kernel/src/syscall.zig handle_socket dispatch).
+const (
+	sockOpListen   = 0
+	sockOpAccept   = 1
+	sockOpRead     = 2
+	sockOpSend     = 3
+	sockOpClose    = 4
+	sockOpReady    = 5
+	sockOpShutdown = 6
+	sockOpPeer     = 7
+	sockOpConnect  = 10
+	sockOpTable    = 12
+)
+
+// Slot-80's socket_error rows beyond the ADR 0007 generic table's 12:
+// PeerReset and Closed are conn-terminal signals, not argument faults.
+const (
+	errSockPeerReset int64 = 13
+	errSockClosed    int64 = 14
+)
+
+// Per-handle readiness mask bits (native_socket.ready).
+const (
+	readyRead     = 1 // data queued, peer FIN, or terminal
+	readyWrite    = 2 // established and the bounded TX slot is free
+	readyAccept   = 4 // listener: an established child awaits accept
+	readyTerminal = 8 // conn reached its terminal state
+)
+
 // Connection-domain failures (the errno rows carry the kernel's codes; the
 // sentinels carry this type's own contract).
 var (
-	// ErrConnBusy: a second live Dial. One TCP socket per process — Close
-	// the current Conn before dialing again.
-	ErrConnBusy = errString("vi: one TCP socket per process — Close before Dial")
+	// ErrConnBusy: the kernel's socket table refused the open — every
+	// listener and connection the process holds charges the table's
+	// per-owner bound, and the global conn limit is shared. Close a
+	// socket before opening another.
+	ErrConnBusy = errString("vi: TCP socket table full — Close a socket before opening another")
 	// ErrConnClosed: the Conn was closed (or is nil) and cannot carry traffic.
 	ErrConnClosed = errString("vi: connection closed")
 	// ErrPeerGone: the peer's FIN/RST was observed. Fail closed, never spin.
@@ -66,25 +102,17 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
-// slotHeld is the one-socket bound's enforcement point. The claim is a
-// CAS on an atomic bool, NOT a sync.Mutex: a racing Dial must never slip
-// a second socket past the check (programs run heartbeat goroutines, so
-// Dial-vs-Dial is a live race), and the sync package costs ~3 KiB of text
-// — enough to push the gate fixtures out of the kernel's fixed text gap.
-// Dial claims before touching the seam (a racing Dial's CAS fails and it
-// sees the busy bound) and releases on every failure path; Close releases
-// only after the kernel confirms (a refusal leaves the socket live
-// in-kernel, so the slot must stay claimed). Identity needs no second
-// variable: only the successful Close of the OWNING Conn sets its open
-// flag false before releasing, and a released Conn cannot re-release.
-var slotHeld atomic.Bool
-
-// Conn is one outbound TCP connection. Create it with Dial; it is the
-// process's only live socket until Close. Concurrent Dial and Close calls
-// are safe (the slotHeld CAS arbitrates); a single Conn's Recv/Send/Close
-// are not — one goroutine owns the traffic, the same contract vsys.Conn
-// states.
+// Conn is one TCP connection or listener on the kernel's socket table.
+// Create an outbound one with Dial/DialTimeout (it holds the op-10
+// handle), a handle listener with SocketListen, or an accepted child
+// with a handle listener's AcceptConn. `vi.Listen` still mints the
+// legacy slot-30 listener for the singleton-era callers that drive the
+// session over raw slots. A Conn's Recv/Send/Close are owned by one
+// goroutine — the same contract vsys.Conn states — but separate Conns
+// are independent: two goroutines can each run one.
 type Conn struct {
+	handle    uint64 // the table handle; 0 for the legacy slot-30 view
+	serve     uint64 // a handle listener's bound serving child (Accept)
 	ip        [4]byte
 	port      uint16
 	open      bool
@@ -97,13 +125,35 @@ type Conn struct {
 	deadlineAt int64
 }
 
+// sock is the slot-80 gateway: args[0]=op, args[1]=handle-or-ip,
+// args[2]=ptr-or-port, args[3]=len. Negative returns are the kernel's
+// socket errnos. Slot 80's ABI takes SIX argument words — the kernel
+// refuses nonzero args[4]/args[5], and svc4 would leave those registers
+// holding whatever the caller last had there (a systematic EINVAL on
+// target; the fake never sees it because the test hook is 4-arg). The
+// hook path keeps the four meaningful words; the guest path zero-pads
+// to six.
+func sock(op uintptr, a1, a2, a3 uintptr) int64 {
+	if syscallHook != nil {
+		return syscallHook(SlotSocket, op, a1, a2, a3)
+	}
+	return syscall6(SlotSocket, op, a1, a2, a3, 0, 0)
+}
+
+// sockErr maps a refused slot-80 open to the named bound — Capacity is
+// the kernel's honest "the table is full" and travels as ENOSPC (-5).
+func sockErr(rc int64) error {
+	if rc < 0 && -rc == ErrENOSPC {
+		return ErrConnBusy
+	}
+	return errno(-rc)
+}
+
 // Dial connects to host:port. host may be a dotted-quad IPv4 literal
 // (dialed directly) or a name (resolved via ResolveDNS against
-// DefaultDNSServer first). The kernel's connect blocks until the handshake
-// lands or its 30 s timeout expires; a refusal maps to the kernel's errno.
-// The argument checks and the resolution are pure userland work and run
-// before the claim; the CAS guards only the seam, so a racing Dial can
-// never slip a second connect past it.
+// DefaultDNSServer first). The kernel's connect blocks until the
+// handshake lands or its 30 s timeout expires; a refusal maps to the
+// kernel's errno (ENOSPC -> ErrConnBusy by name).
 func Dial(host string, port uint16) (*Conn, error) {
 	return dial(host, port, 0)
 }
@@ -111,7 +161,7 @@ func Dial(host string, port uint16) (*Conn, error) {
 // DialTimeout connects like Dial, but bounds the outbound handshake in the
 // kernel by d. DNS resolution keeps its separate DefaultDNSBudgetNs budget.
 // d must be positive and fit in uint32 milliseconds, rounded up to the next
-// millisecond. Expiry returns Errno(ErrETIMEDOUT) and releases the socket.
+// millisecond. Expiry returns Errno(ErrETIMEDOUT).
 func DialTimeout(host string, port uint16, d time.Duration) (*Conn, error) {
 	if d <= 0 {
 		return nil, errno(ErrEINVAL)
@@ -141,40 +191,64 @@ func dial(host string, port uint16, timeoutMs uint32) (*Conn, error) {
 	if ip == ([4]byte{}) {
 		return nil, ErrServerDial
 	}
-	if !slotHeld.CompareAndSwap(false, true) {
-		return nil, ErrConnBusy
-	}
-	rc := svc2(SlotTCPConnect, ipv4Word(ip), uintptr(port)|uintptr(timeoutMs)<<16)
+	rc := sock(sockOpConnect, ipv4Word(ip), uintptr(port)|uintptr(timeoutMs)<<16, 0)
 	if rc < 0 {
-		slotHeld.Store(false)
-		return nil, errno(-rc)
+		return nil, sockErr(rc)
 	}
-	return &Conn{ip: ip, port: port, open: true}, nil
+	return &Conn{handle: uint64(rc), ip: ip, port: port, open: true}, nil
 }
 
-// Listen passively opens port (slot 30, ip==0). The kernel's TCP is a
-// single-connection machine: one listen_port, one handshake, one RX
-// slot. Accept waits until that handshake reaches ESTABLISHED. Close
-// releases the process-wide socket so the next Listen or Dial can run.
+// Listen passively opens port on the LEGACY slot-30 view (ip==0): the
+// shim's accepted children ride raw slots 31–33/76, which is what
+// agentd, rfbserver and httpd's session loops still drive. New
+// handle-mode servers take SocketListen instead. Accept waits until
+// that handshake reaches ESTABLISHED. Close releases the process's
+// legacy socket so the next Listen or Dial can run.
 func Listen(port uint16) (*Conn, error) {
 	if port == 0 {
 		return nil, errno(ErrEINVAL)
 	}
-	if !slotHeld.CompareAndSwap(false, true) {
-		return nil, ErrConnBusy
-	}
 	rc := svc2(SlotTCPConnect, 0, uintptr(port))
 	if rc < 0 {
-		slotHeld.Store(false)
-		return nil, errno(-rc)
+		return nil, sockErr(rc)
 	}
 	return &Conn{port: port, open: true, listening: true}, nil
 }
 
-// Accept waits until the listened socket is ESTABLISHED. Bit 1 of the
-// readiness mask is writable-when-established; bit 0 is readable (the
-// peer's first segment may land before we observe writable). A bounded
-// wait fails closed rather than parking forever.
+// SocketListen passively opens port on the slot-80 handle ABI (op 0):
+// the returned listener is a real table socket with its own handle, so
+// one process may hold it alongside Dial'd connections and accepted
+// children — that is the server shape the singleton kernel could not
+// express. Its children are claimed per-handle with AcceptConn (each a
+// fully independent Conn), or bound to the listener itself with Accept
+// for the legacy single-session callers.
+func SocketListen(port uint16) (*Conn, error) {
+	if port == 0 {
+		return nil, errno(ErrEINVAL)
+	}
+	rc := sock(sockOpListen, 0, uintptr(port), 0)
+	if rc < 0 {
+		return nil, sockErr(rc)
+	}
+	return &Conn{handle: uint64(rc), port: port, open: true, listening: true}, nil
+}
+
+// Handle returns the kernel's generation-tagged table handle (0 for the
+// legacy view). Exposed for observability — the netstat table dump
+// prints the same handles.
+func (c *Conn) Handle() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.handle
+}
+
+// Accept waits until the listened socket has an ESTABLISHED session to
+// serve. On the legacy listener it parks on slot-76 readiness exactly as
+// before (the raw slots then serve the child). On a handle listener it
+// claims the pending child itself (op 1) and binds it as the Conn's
+// serving socket — Send/Recv/ReadyMask then run per-handle on that
+// child. A bounded wait fails closed rather than parking forever.
 func (c *Conn) Accept() error {
 	if c == nil || !c.open {
 		return ErrConnClosed
@@ -182,25 +256,91 @@ func (c *Conn) Accept() error {
 	if !c.listening {
 		return nil
 	}
+	if c.handle == 0 {
+		deadline := Nanos() + DefaultRecvBudgetNs
+		for polls := 0; ; polls++ {
+			mask, rc := TCPReady()
+			if rc < 0 {
+				if -rc == ErrEAGAIN {
+					return ErrConnClosed
+				}
+				return errno(-rc)
+			}
+			// Established (writable) or the peer already sent bytes/FIN.
+			if mask&3 != 0 {
+				c.listening = false
+				return nil
+			}
+			if Nanos() >= deadline || polls >= maxRecvPolls {
+				return errno(ErrETIMEDOUT)
+			}
+			svc1(SlotSleep, 1)
+		}
+	}
+	if c.serve != 0 {
+		return nil // a serving child is already bound
+	}
+	child, err := c.AcceptConn()
+	if err != nil {
+		return err
+	}
+	c.serve = child.handle
+	return nil
+}
+
+// AcceptConn claims the listener's next ESTABLISHED child as its own
+// Conn — the multi-session accept: every call hands back an independent
+// per-handle connection while the listener stays live for the next SYN.
+// Only a SocketListen listener can hand out handles; on the legacy
+// listener the children already belong to the raw slots (EINVAL).
+func (c *Conn) AcceptConn() (*Conn, error) {
+	if c == nil || !c.open {
+		return nil, ErrConnClosed
+	}
+	if c.handle == 0 || !c.listening {
+		return nil, errno(ErrEINVAL)
+	}
 	deadline := Nanos() + DefaultRecvBudgetNs
 	for polls := 0; ; polls++ {
-		mask, rc := TCPReady()
-		if rc < 0 {
-			if -rc == ErrEAGAIN {
-				return ErrConnClosed
+		// The probe is the LISTENER's own readiness (readyAccept), never a
+		// bound serving child's — AcceptConn must keep claiming while
+		// another session is already being served.
+		mask, rc := func() (int64, int64) {
+			r := sock(sockOpReady, uintptr(c.handle), 0, 0)
+			if r < 0 {
+				return 0, r
 			}
-			return errno(-rc)
+			return r, 0
+		}()
+		if rc < 0 {
+			return nil, errno(-rc)
 		}
-		// Established (writable) or the peer already sent bytes/FIN.
-		if mask&3 != 0 {
-			c.listening = false
-			return nil
+		if mask&readyAccept != 0 {
+			h := sock(sockOpAccept, uintptr(c.handle), 0, 0)
+			if h < 0 {
+				return nil, sockErr(h)
+			}
+			child := &Conn{handle: uint64(h), open: true}
+			child.fillPeer()
+			return child, nil
 		}
 		if Nanos() >= deadline || polls >= maxRecvPolls {
-			return errno(ErrETIMEDOUT)
+			return nil, errno(ErrETIMEDOUT)
 		}
 		svc1(SlotSleep, 1)
 	}
+}
+
+// fillPeer snapshots the remote endpoint through op 7 so IP/Port answer
+// without another syscall.
+func (c *Conn) fillPeer() {
+	r := sock(sockOpPeer, uintptr(c.handle), 0, 0)
+	if r < 0 {
+		return
+	}
+	w := uint64(r)
+	c.ip = [4]byte{byte(w >> 40), byte(w >> 32), byte(w >> 24), byte(w >> 16)}
+	c.port = uint16(w & 0xffff)
 }
 
 // IP returns the peer's address (the resolved one when Dial was given a
@@ -235,10 +375,45 @@ func (c *Conn) SetRecvDeadline(ns int64) {
 	c.deadlineAt = Nanos() + ns
 }
 
+// readyProbe is the per-handle readiness poll: op 5 on the Conn's own
+// handle (or its bound serving child), slot 76 on the legacy view.
+// Returns (mask, negative-rc): one of the pair is always zero.
+func (c *Conn) readyProbe() (int64, int64) {
+	h := c.trafficHandle()
+	if h == 0 {
+		return TCPReady()
+	}
+	if r := sock(sockOpReady, uintptr(h), 0, 0); r < 0 {
+		return 0, r
+	} else {
+		return r, 0
+	}
+}
+
+// ReadyMask reports the Conn's current readiness bits (readyRead/
+// readyWrite/readyAccept/readyTerminal) — per handle, so one Conn's
+// probe never answers for another.
+func (c *Conn) ReadyMask() (int64, error) {
+	if c == nil || !c.open {
+		return 0, ErrConnClosed
+	}
+	mask, rc := c.readyProbe()
+	if rc < 0 {
+		if -rc == ErrEAGAIN {
+			return 0, ErrConnClosed
+		}
+		return 0, errno(-rc)
+	}
+	return mask, nil
+}
+
 // Send writes ALL of p, chunked to TCPPayloadMax (the kernel's one-segment
-// bound) and advancing ONLY by the confirmed count each slot-31 call
+// bound) and advancing ONLY by the confirmed count each op-3/slot-31 call
 // reports — the FileWriteAll contract applied to the socket, so a longer
 // body is a run of honest syscalls that can never silently truncate.
+// On a handle conn a WouldBlock answer means the bounded TX slot or the
+// peer's window is full: park one tick and retry, bounded by the recv
+// deadline's budget so a dead peer cannot wedge the sender.
 // Returns the confirmed total (== len(p) on success, the confirmed prefix
 // after a mid-stream failure).
 func (c *Conn) Send(p []byte) (int, error) {
@@ -249,13 +424,29 @@ func (c *Conn) Send(p []byte) (int, error) {
 		return 0, ErrPeerGone
 	}
 	sent := 0
+	deadline := Nanos() + DefaultRecvBudgetNs
 	for sent < len(p) {
 		take := len(p) - sent
 		if take > TCPPayloadMax {
 			take = TCPPayloadMax
 		}
-		r := svc2(SlotTCPSend, bytePtr(p[sent:sent+take]), uintptr(take))
+		var r int64
+		if h := c.trafficHandle(); h != 0 {
+			r = sock(sockOpSend, uintptr(h), bytePtr(p[sent:sent+take]), uintptr(take))
+		} else {
+			r = svc2(SlotTCPSend, bytePtr(p[sent:sent+take]), uintptr(take))
+		}
 		if r < 0 {
+			if -r == ErrEAGAIN {
+				if Nanos() >= deadline {
+					return sent, errno(ErrETIMEDOUT)
+				}
+				svc1(SlotSleep, 1)
+				continue
+			}
+			if e := c.deadErr(r); e != nil {
+				return sent, e
+			}
 			return sent, errno(-r)
 		}
 		if r == 0 {
@@ -269,13 +460,35 @@ func (c *Conn) Send(p []byte) (int, error) {
 	return sent, nil
 }
 
-// Recv reads up to len(p) bytes, blocking-with-poll: probe readiness (slot
-// 76), take the segment when readable, otherwise check the deadline and
-// park one scheduler tick (slot 4) before re-probing. A readable socket
-// whose recv then drains 0 bytes means the peer's FIN/RST was consumed —
-// fail closed with ErrPeerGone (the kernel reports a received FIN as
-// readable and returns 0 for both "no segment yet" and EOF; readiness is
-// the only way to tell them apart, and readable-but-empty IS the EOF).
+// deadErr translates the kernel's dead-conn rows to the named sentinels:
+// PeerReset and Closed mean the socket cannot carry bytes, not a
+// caller-side argument fault.
+func (c *Conn) deadErr(rc int64) error {
+	switch -rc {
+	case errSockPeerReset:
+		c.peerGone = true
+		return ErrPeerGone
+	case errSockClosed, ErrEBADF:
+		return ErrConnClosed
+	}
+	return nil
+}
+
+// trafficHandle is the handle the send/recv ops address: the bound
+// serving child on an Accept'd handle listener, else the Conn's own.
+func (c *Conn) trafficHandle() uint64 {
+	if c.serve != 0 {
+		return c.serve
+	}
+	return c.handle
+}
+
+// Recv reads up to len(p) bytes, blocking-with-poll: probe THIS
+// connection's readiness (op 5 — a per-handle probe, so sibling
+// connections never answer for it), take the segment when readable,
+// otherwise check the deadline and park one scheduler tick (slot 4)
+// before re-probing. A readable socket whose recv then drains 0 bytes
+// means the peer's FIN/RST was consumed — fail closed with ErrPeerGone.
 func (c *Conn) Recv(p []byte) (int, error) {
 	if c == nil || !c.open {
 		return 0, ErrConnClosed
@@ -295,18 +508,32 @@ func (c *Conn) Recv(p []byte) (int, error) {
 		deadline = Nanos() + DefaultRecvBudgetNs
 	}
 	for polls := 0; ; polls++ {
-		mask, rc := TCPReady()
+		mask, rc := c.readyProbe()
 		if rc < 0 {
 			// EAGAIN = the process owns no socket any more (released or
 			// never connected): the Conn is dead, not merely empty.
 			if -rc == ErrEAGAIN {
 				return 0, ErrConnClosed
 			}
+			if e := c.deadErr(rc); e != nil {
+				return 0, e
+			}
 			return 0, errno(-rc)
 		}
-		if mask&1 != 0 {
-			r := svc2(SlotTCPRecv, bytePtr(p[:max]), uintptr(max))
+		if mask&readyRead != 0 {
+			var r int64
+			if h := c.trafficHandle(); h != 0 {
+				r = sock(sockOpRead, uintptr(h), bytePtr(p[:max]), uintptr(max))
+			} else {
+				r = svc2(SlotTCPRecv, bytePtr(p[:max]), uintptr(max))
+			}
 			if r < 0 {
+				if -r == ErrEAGAIN {
+					continue // readiness raced a drain: re-probe
+				}
+				if e := c.deadErr(r); e != nil {
+					return 0, e
+				}
 				return 0, errno(-r)
 			}
 			if r == 0 {
@@ -326,25 +553,96 @@ func (c *Conn) Recv(p []byte) (int, error) {
 	}
 }
 
-// Close tears the connection down (FIN, slot 33). The userland slot is
-// released ONLY when the kernel confirms: on a refusal (the kernel keeps
-// the socket — its only close error is EACCES, not-owner) the slot stays
-// claimed so the next Dial fails with the honest busy bound instead of a
-// confusing EINVAL from the seam. The kernel returns 0 for "nothing
-// owned" (idle), which releases too. Close on an already-closed (or nil)
+// Close tears the connection down. On a handle conn it first queues the
+// graceful FIN (op 6, bounded retries while the TX slot is busy) and
+// then releases the table slot (op 4). On a SocketListen listener the
+// release also reclaims every child the listener spawned. On the legacy
+// view it is slot 33 as before. Close on an already-closed (or nil)
 // Conn is a no-op.
 func (c *Conn) Close() error {
 	if c == nil || !c.open {
 		return nil
 	}
-	rc := svc0(SlotTCPClose)
-	if rc < 0 {
-		return errno(-rc)
+	if c.handle == 0 && c.serve == 0 {
+		rc := svc0(SlotTCPClose)
+		if rc < 0 {
+			return errno(-rc)
+		}
+		c.open = false
+		return nil
+	}
+	if c.serve != 0 {
+		finRelease(c.serve, true) // the bound serving child: FIN, then free
+		c.serve = 0
+	}
+	if c.handle != 0 {
+		finRelease(c.handle, !c.listening)
 	}
 	c.open = false
-	slotHeld.Store(false) // identity needs no check: c.open was still true,
-	// and only the owner's conn can be open (Dial cannot succeed while held)
 	return nil
+}
+
+// finRelease queues FIN on h when graceful (bounded while the TX slot
+// stays busy or the conn has nothing established to close) and frees the
+// handle. Release is unconditional: a FIN that could not queue still
+// leaves an honestly-closed table slot.
+func finRelease(h uint64, graceful bool) {
+	if graceful {
+		for polls := 0; polls < 300; polls++ {
+			if r := sock(sockOpShutdown, uintptr(h), 0, 0); r != -ErrEAGAIN {
+				break
+			}
+			svc1(SlotSleep, 1)
+		}
+	}
+	_ = sock(sockOpClose, uintptr(h), 0, 0)
+}
+
+// SocketRow is one live socket-table row (the op-12 snapshot): a
+// listener or a connection with its owner pid, so a reader can name the
+// holding process.
+type SocketRow struct {
+	Owner      uint64
+	LocalIP    [4]byte
+	LocalPort  uint16
+	RemotePort uint16
+	RemoteIP   [4]byte
+	Kind       uint8 // 0 = listener, 1 = connection
+	State      uint8 // core State for connections (0 half-open, 1 established, 2 closing, 3 terminal)
+}
+
+// SocketTableMax bounds one snapshot (the kernel's own bound is far
+// smaller; this only sizes the EL0 scratch buffer).
+const SocketTableMax = 64
+const socketRowLen = 24
+
+// SocketTable snapshots the kernel's live socket table (op 12): every
+// listener and every connection with its owner pid. Returns nil when
+// the table is empty or the probe fails — observability, never a
+// caller-blocking path.
+func SocketTable() []SocketRow {
+	buf := make([]byte, SocketTableMax*socketRowLen)
+	n := sock(sockOpTable, bytePtr(buf), uintptr(SocketTableMax), 0)
+	if n <= 0 {
+		return nil
+	}
+	if n > SocketTableMax {
+		n = SocketTableMax
+	}
+	rows := make([]SocketRow, 0, n)
+	for i := int64(0); i < n; i++ {
+		b := buf[i*socketRowLen:]
+		rows = append(rows, SocketRow{
+			Owner:      uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 | uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56,
+			LocalIP:    [4]byte{b[8], b[9], b[10], b[11]},
+			LocalPort:  uint16(b[12]) | uint16(b[13])<<8,
+			RemotePort: uint16(b[14]) | uint16(b[15])<<8,
+			RemoteIP:   [4]byte{b[16], b[17], b[18], b[19]},
+			Kind:       b[20],
+			State:      b[21],
+		})
+	}
+	return rows
 }
 
 // ipv4Word packs an IPv4 address into the slot-30/10 argument word

@@ -16,18 +16,19 @@ const (
 	winX         = 40
 	winY         = 40
 	winW         = 512
-	winH         = 384
+	winH         = 512
 	exitStatus   = 44
 	refreshTicks = 4 // ~1 Hz at the Zig app's 250 ms scheduler quantum
 )
 
 // argvEnvpGuard keeps space for the kernel's fixed argv/envp block in the
 // writable segment, as required by the GOOS=virelai loader/runtime contract.
-var argvEnvpGuard [0x1000]byte
+var argvEnvpGuard [0x1800]byte
 
 type canvas struct {
 	draw.FillerCanvas
-	filler vi.Filler
+	filler   vi.Filler
+	lastSock []vi.SocketRow // last table paint, for the serial diff log
 }
 
 func ipString(ip [4]byte) string { return vi.FormatIPv4(ip) }
@@ -75,6 +76,61 @@ func tcpName(state byte) string {
 	default:
 		return "IDLE"
 	}
+}
+
+// sockStateName names a socket-table row's core state (M99g #2185): the
+// op-12 snapshot's connection lifecycle, not the singleton TCP machine's.
+func sockStateName(state byte) string {
+	switch state {
+	case 0:
+		return "syn-sent"
+	case 1:
+		return "established"
+	case 2:
+		return "closing"
+	case 3:
+		return "terminal"
+	default:
+		return "?"
+	}
+}
+
+// socketRowLine renders one live table socket: "pid=7 listen 10.0.0.1:2222"
+// or "pid=7 tcp 10.0.0.1:2222 -> 10.0.0.2:12345 established".
+func socketRowLine(r vi.SocketRow) string {
+	owner := "pid=" + vi.Itoa64(int64(r.Owner))
+	if r.Kind == 0 {
+		return owner + " listen " + ipString(r.LocalIP) + ":" + vi.Itoa64(int64(r.LocalPort))
+	}
+	return owner + " tcp " + ipString(r.LocalIP) + ":" + vi.Itoa64(int64(r.LocalPort)) +
+		" -> " + ipString(r.RemoteIP) + ":" + vi.Itoa64(int64(r.RemotePort)) +
+		" " + sockStateName(r.State)
+}
+
+func socketRowsEqual(a, b []vi.SocketRow) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sockDiff console-logs the socket-table rows whenever the snapshot
+// changes — the same rows the window paints, so headless runs can assert
+// the table view. Returns the current rows for the painter.
+func sockDiff(last *[]vi.SocketRow) []vi.SocketRow {
+	rows := vi.SocketTable()
+	if !socketRowsEqual(*last, rows) {
+		for _, r := range rows {
+			vi.ConsoleLine("netstat: sock " + socketRowLine(r))
+		}
+		*last = append((*last)[:0], rows...)
+	}
+	return rows
 }
 
 func drawLine(c *canvas, y int, label, value string, color uint32) {
@@ -135,6 +191,25 @@ func drawSnapshot(c *canvas, s vi.NetStats) {
 	drawLine(c, y, "Peer", ipString(s.TCPPeerIP)+":"+vi.Itoa64(int64(s.TCPPeerPort))+" ("+tcpName(s.TCPState)+")", t.Text)
 	y += 17
 
+	// M99g (#2185): the live socket table — every listener and connection
+	// with its owner pid, from the slot-80 op-12 snapshot. Console-log the
+	// diff so headless runs can assert the same rows the window paints.
+	y = drawSection(c, y, "Sockets")
+	rows := sockDiff(&c.lastSock)
+	if len(rows) == 0 {
+		drawLine(c, y, "Table", "(empty)", t.Text)
+		y += 14
+	} else {
+		for _, r := range rows {
+			if y > winH-32 {
+				break
+			}
+			drawLine(c, y, "sock", socketRowLine(r), t.Text)
+			y += 14
+		}
+	}
+	y += 3
+
 	y = drawSection(c, y, "UDP listeners")
 	ports := "none"
 	if s.UDPCount > 0 {
@@ -181,8 +256,8 @@ func main() {
 	argvEnvpGuard[0] = 1
 	win, rc := vi.WinOpen(winX, winY, winW, winH)
 	if rc < 0 {
-		vi.ConsoleLine("netstat: failed to open window")
-		vi.Exit(1)
+		headlessMain()
+		return
 	}
 	vi.ConsoleLine("netstat: open id=" + vi.Itoa64(int64(win)))
 
@@ -190,7 +265,7 @@ func main() {
 	if !ok {
 		snap = vi.NetStats{}
 	}
-	for _, section := range []string{"iface", "dhcp", "tcp", "udp", "arp", "counters"} {
+	for _, section := range []string{"iface", "dhcp", "tcp", "sockets", "udp", "arp", "counters"} {
 		vi.ConsoleLine("netstat: section " + section)
 	}
 	c := &canvas{}
@@ -236,4 +311,24 @@ func main() {
 	vsys.TimerCancel()
 	vi.WinClose(win)
 	vi.Exit(exitStatus)
+}
+
+// headlessMain is the no-compositor path: a class-B run booted without
+// the window server still gets the dashboard's report — the section
+// markers, the ready marker, and the same refresh loop's sock diff-log —
+// just no window. The kernel table is as readable here as it is painted.
+func headlessMain() {
+	vi.ConsoleLine("netstat: headless")
+	for _, section := range []string{"iface", "dhcp", "tcp", "sockets", "udp", "arp", "counters"} {
+		vi.ConsoleLine("netstat: section " + section)
+	}
+	var last []vi.SocketRow
+	_ = sockDiff(&last)
+	vi.ConsoleLine("netstat: ready")
+	// Sleep-tick the same ~1 Hz cadence — no window event loop exists to
+	// carry timer events here.
+	for {
+		vi.Sleep(refreshTicks)
+		_ = sockDiff(&last)
+	}
 }
