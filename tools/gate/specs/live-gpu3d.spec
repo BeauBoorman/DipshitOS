@@ -7,7 +7,9 @@
 # device), 06 malformed/auth (invalid battery + forged kind-17), 07
 # wrong/stale fence, 08 stall/timeout + next-open drain. `wm=none` is
 # seeded so the seat is the spec's own scripted exec; every leg ends on a
-# marker only its script can print.
+# marker only its script can print. Leg 05 RUNS FIRST: the seed share is
+# spec-scoped, so its no-receipt assert is only honest before any 3D leg
+# has written GPUTRI/ files to it.
 # exec-order: assert-proven -- each run's expect marker is printed by the
 # script AFTER the guest markers its stage gates wait on; a leg whose
 # device/app never ran cannot pass. HOST PREREQUISITE (fails honestly):
@@ -73,6 +75,38 @@ with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
 print("staged Go seat + GPUTRIANGLE.ELF, wm=none")
 PY
 
+# --- leg 05 (run first): native-only --------------------------------------
+# No --gpu3d-metal: the device is absent, the app reports unsupported, the
+# ordinary 2D seat and scanout keep working, and NO 3D receipt lands. It
+# runs ahead of the 3D legs because their receipt files persist on the
+# spec-scoped seed share — asserting "no GPUTRI dir" after them could never
+# pass. Tag 05 keeps the report's logical numbering.
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-tri.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-rx.txt' \
+    --script3-after 'gputri: unsupported' \
+    --script-expect 'rx-g3-ok' --timeout 180
+
+vgate_assert 05 serial-absent 'gpu3d: armed'
+vgate_assert 05 serial-contains 'gpu: setup ok scanout='
+vgate_assert 05 serial-contains 'gotabwm: holding seat'
+vgate_assert 05 serial-contains 'gputri: declare accepted'
+vgate_assert 05 serial-contains 'gputri: unsupported'
+vgate_assert 05 serial-absent 'gputri: published'
+vgate_assert 05 serial-count 'gotabwm: present' 1
+vgate_assert 05 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+p = os.path.join(share, "GPUTRI")
+if os.path.exists(p):
+    sys.exit("GPUTRI receipt dir exists on a native-only boot: %r" %
+             os.listdir(p))
+print("no 3D receipts on native-only boot")
+PY
+
 # --- leg 01: triangle ----------------------------------------------------
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen-01' \
@@ -129,7 +163,12 @@ vgate_assert 01 output-contains 'draws=1 gpu-completions=1'
 vgate_assert 01 output-contains 'submit-rejections=0'
 vgate_assert 01 output-contains 'refusals=0'
 # The final scanout contains the triangle's red interior AND the non-red
-# clear field — one capture, fired on the successful present marker.
+# clear field — one capture, fired on the successful present marker. The
+# PNG is a ScreenCaptureKit capture of the composited macOS window, so the
+# framebuffer's exact values arrive colour-managed: on this host fb
+# 255,0,0 reads as (234,51,35) and fb 16,32,48 as (20,32,47) — stable
+# across runs. The check pins those observed anchors with a small
+# tolerance; the pixel-EXACT proof stays on the raw EXPO comparator.
 vgate_assert 01 snapshot 'screen-01-after' <<'PY'
 import sys, zlib, struct
 path = sys.argv[1]
@@ -166,8 +205,8 @@ for y in range(h):
     prev = px
     for x in range(w):
         p = px[x*bpp:x*bpp+3]
-        if p[0] == 255 and p[1] == 0 and p[2] == 0: red += 1
-        if p[0] == 16 and p[1] == 32 and p[2] == 48: clear += 1
+        if 218 <= p[0] <= 246 and 38 <= p[1] <= 64 and 22 <= p[2] <= 48: red += 1
+        if 16 <= p[0] <= 24 and 28 <= p[1] <= 36 and 42 <= p[2] <= 52: clear += 1
 if red < 200:
     sys.exit("scanout has only %d interior red pixels (want >=200)" % red)
 if clear < 200:
@@ -175,11 +214,16 @@ if clear < 200:
 print("scanout: %d red + %d clear pixels" % (red, clear))
 PY
 
+# Every leg passes --screen: without a VZ graphics device the kernel
+# compositor never arms and the seat's wmctl register fails ENXIO — the
+# flag is how the seat exists at all, not only how leg 01's PNG lands.
+
 # --- leg 02: mixed margins ------------------------------------------------
 # The same 64x48 render exported into the larger 96x72 surface; the margin
 # pixels around it are the app's own 2D fill, proven by the mixed scene's
 # guard rects (every pixel outside the render rect is the margin colour).
 vgate_run 02 -- \
+    --screen '$RUN_DIR/screen-02' \
     --gpu3d-metal \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-mixed.txt' \
@@ -211,6 +255,7 @@ PY
 # EXPO_1_2 at 96x64 (resized scene) — rgen 2 proves the new generation is
 # not the old frame republished.
 vgate_run 03 -- \
+    --screen '$RUN_DIR/screen-03' \
     --gpu3d-metal \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-resize.txt' \
@@ -243,6 +288,7 @@ PY
 # Two full window lifetimes: wgen 1 publishes, closes, then wgen 2 renders
 # fresh pixels — the second export cannot contain the old frame.
 vgate_run 04 -- \
+    --screen '$RUN_DIR/screen-04' \
     --gpu3d-metal \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-closereuse.txt' \
@@ -254,8 +300,8 @@ vgate_run 04 -- \
 vgate_assert 04 serial-contains 'gpu3d: armed did=0x1083'
 vgate_assert 04 serial-contains 'gputri: gpu open 64x48 gen=1.1'
 vgate_assert 04 serial-contains 'gotabwm: gpu3d close id='
-vgate_assert 04 serial-contains 'gputri: gpu open 64x48 gen=2.1'
-vgate_assert 04 serial-contains 'gputri: published frame=1 EXPO_2_1.BGRA'
+vgate_assert 04 serial-contains 'gputri: gpu open 64x48 gen=2.2'
+vgate_assert 04 serial-contains 'gputri: published frame=1 EXPO_2_2.BGRA'
 vgate_assert 04 serial-contains 'gputri OK'
 vgate_assert 04 serial-absent 'gpu3d: timeout'
 vgate_assert 04 output-contains 'draws=2 gpu-completions=2'
@@ -264,41 +310,12 @@ vgate_assert 04 output-contains 'retired-pending=0'
 vgate_assert 04 python <<'PY'
 import os, subprocess, sys
 share = os.environ["VG_SHARE"]
-img = os.path.join(share, "GPUTRI", "EXPO_2_1.BGRA")
+img = os.path.join(share, "GPUTRI", "EXPO_2_2.BGRA")
 r = subprocess.run(["python3", "tools/gpu3d-proof/compare.py", img, "triangle"],
                    capture_output=True, text=True)
 if r.returncode != 0:
     sys.exit("compare failed:\n" + r.stdout + r.stderr)
 print(r.stdout.strip())
-PY
-
-# --- leg 05: native-only --------------------------------------------------
-# No --gpu3d-metal: the device is absent, the app reports unsupported, the
-# ordinary 2D seat and scanout keep working, and NO 3D receipt lands.
-vgate_run 05 -- \
-    --screen '$RUN_DIR/screen-05' \
-    --script '$RUN_DIR/script-seat.txt' \
-    --script2 '$RUN_DIR/script-tri.txt' \
-    --script2-after 'gotabwm: holding seat' \
-    --script3 '$RUN_DIR/script-rx.txt' \
-    --script3-after 'gputri: unsupported' \
-    --script-expect 'rx-g3-ok' --timeout 180
-
-vgate_assert 05 serial-absent 'gpu3d: armed'
-vgate_assert 05 serial-contains 'gpu: setup ok scanout='
-vgate_assert 05 serial-contains 'gotabwm: holding seat'
-vgate_assert 05 serial-contains 'gputri: declare accepted'
-vgate_assert 05 serial-contains 'gputri: unsupported'
-vgate_assert 05 serial-absent 'gputri: published'
-vgate_assert 05 serial-count 'gotabwm: present' 1
-vgate_assert 05 python <<'PY'
-import os, sys
-share = os.environ["VG_SHARE"]
-p = os.path.join(share, "GPUTRI")
-if os.path.exists(p):
-    sys.exit("GPUTRI receipt dir exists on a native-only boot: %r" %
-             os.listdir(p))
-print("no 3D receipts on native-only boot")
 PY
 
 # --- leg 06: malformed + forged -------------------------------------------
@@ -307,6 +324,7 @@ PY
 # kind-17 frame for its own bound surface with an invalid token — the seat
 # refuses it at the rpc seam and the device sees ZERO submissions for it.
 vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' \
     --gpu3d-metal \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-invalid.txt' \
@@ -334,6 +352,7 @@ vgate_assert 06 output-contains 'refusals=0'
 # never completes the exchange, the frame is never published, the stale
 # fence is pinned host-side and the seat's 2D keeps presenting.
 vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
     --gpu3d-metal --gpu3d-test-mode wrong-fence \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-tri.txt' \
@@ -361,6 +380,7 @@ vgate_assert 07 output-contains 'submit-rejections=0'
 # journey's full open + named refusals — while the parked chain is never
 # recycled into the new context.
 vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
     --gpu3d-metal --gpu3d-test-mode stall \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-tri.txt' \

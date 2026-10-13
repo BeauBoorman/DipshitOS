@@ -704,3 +704,112 @@ func TestGoSeatBoundAckNeedsTheToken(t *testing.T) {
 		t.Fatal("an ack quoting a wrong token satisfied a bound request")
 	}
 }
+
+// M102 defect #12 (#2236): a bound request that draws a re-challenge —
+// the seat's answer to a token it no longer holds, e.g. a reused window
+// id — re-proves and rebinds in the SAME call, the wqPage shape. Before
+// this the wait dropped the challenge as a non-answer, burned every
+// round's timeout, and the seat's queued bind surfaced only at teardown.
+func TestGoSeatBoundRechallengeRebinds(t *testing.T) {
+	f := startWmMailFake(t)
+	f.wmName = "GOTABWM.ELF"
+	const stale = uint64(0x5a1e5a1e5a1e5a1e)
+	const challenge = uint64(0x00deadbeef00cafe)
+	const token = uint64(0x0123456789abcdef)
+	setWmToken(4, stale)
+	f.replyFn = func(req WmRpc) []byte {
+		rep := WmRpc{Kind: req.Kind | WmRpcReplyFlag, ID: req.ID, Seq: req.Seq, ReplyTo: req.ReplyTo}
+		switch WmAuth(req) {
+		case stale:
+			rep.Pad = WmRpcPadChallenge
+			SetWmAuth(&rep, challenge)
+		case challenge, token:
+			rep.Pad = WmRpcPadBound
+			SetWmAuth(&rep, token)
+			rep.Applied = 1
+		default:
+			return nil
+		}
+		return rep.Encode()
+	}
+	var titles []string
+	prev := bindSetTitle
+	bindSetTitle = func(id int, s string) int64 {
+		titles = append(titles, s)
+		return 0
+	}
+	t.Cleanup(func() { bindSetTitle = prev })
+
+	if !WmMailRequest(WmRpcKindSetTitle, 4, 0, 0, 0, 0, "Mine", "NOTE.ELF") {
+		t.Fatal("a re-challenged bound request must rebind, not refuse")
+	}
+	if len(f.sent) != 2 {
+		t.Fatalf("sent %d frames want stale+echo", len(f.sent))
+	}
+	if f.sent[0].Pad != WmRpcPadBound || WmAuth(f.sent[0]) != stale {
+		t.Fatalf("first frame pad=%d union=%#x want stale-bound", f.sent[0].Pad, WmAuth(f.sent[0]))
+	}
+	if f.sent[1].Pad != WmRpcPadBound || WmAuth(f.sent[1]) != challenge {
+		t.Fatalf("echo frame pad=%d union=%#x want challenge %#x",
+			f.sent[1].Pad, WmAuth(f.sent[1]), challenge)
+	}
+	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge) || titles[1] != "Mine" {
+		t.Fatalf("title sets = %v want [challenge, %q]", titles, "Mine")
+	}
+	if wmToken(4) != token {
+		t.Fatalf("session token = %#x want rebound %#x", wmToken(4), token)
+	}
+	// The challenge answered the first send inline and the bound ack did
+	// the same for the echo — the rebind never parked once.
+	if f.sleepCalls != 0 {
+		t.Fatalf("rebind parked %d times — the challenge must answer inline", f.sleepCalls)
+	}
+}
+
+// M102 defect #12 (#2236), the table side: a session token belongs to its
+// window's lifetime. WinOpen can hand back an id the kernel just recycled
+// — the seat dropped its half of the binding on the release mirror — and
+// a successful WinClose ends the binding. Neither may leave the dead
+// window's token in the table for a reused id to quote.
+func TestWindowLifecycleClearsWmToken(t *testing.T) {
+	resetWmAuth()
+	t.Cleanup(resetWmAuth)
+	closeRC := int64(0)
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		switch num {
+		case SlotWinOpen:
+			return 7 // the kernel hands back a recycled id
+		case SlotWinClose:
+			return closeRC
+		}
+		return -ErrENOSYS
+	})
+	t.Cleanup(func() { SetSyscallHookForTest(prev) })
+
+	setWmToken(7, 0xdeadbeef)
+	id, rc := WinOpen(0, 0, 8, 8)
+	if id != 7 || rc < 0 {
+		t.Fatalf("WinOpen = (%d, %d) want (7, >=0)", id, rc)
+	}
+	if got := wmToken(7); got != 0 {
+		t.Fatalf("recycled id kept the dead window's token %#x", got)
+	}
+
+	setWmToken(7, 0xfeedface)
+	if rc := WinClose(7); rc != 0 {
+		t.Fatalf("WinClose = %d want 0", rc)
+	}
+	if got := wmToken(7); got != 0 {
+		t.Fatalf("closed window kept its token %#x", got)
+	}
+
+	// A refused close leaves the window — and its binding — alive.
+	setWmToken(7, 0xf00d)
+	closeRC = -ErrEINVAL
+	if rc := WinClose(7); rc != -ErrEINVAL {
+		t.Fatalf("refused WinClose = %d want -EINVAL", rc)
+	}
+	if got := wmToken(7); got != 0xf00d {
+		t.Fatalf("refused close dropped the live binding's token %#x", got)
+	}
+}

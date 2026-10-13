@@ -528,6 +528,10 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover)
 		markRail()
 	}
+	// #2236 defect #13: migrated (surface-backed) client windows are the
+	// seat's compositing job — the kernel skipped their blit at tick time.
+	// Compose them under the seat's chrome like the kernel layer expects.
+	composeSurfaces(scan)
 	chromeTick(scan, ticks)
 	if launch.open {
 		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
@@ -678,6 +682,9 @@ func consumeSeatEvent(e vi.Event) bool {
 	// (WinQuery is owner-only). The released-bit context drop rides
 	// dropRpcBinding inside launcherWindowEvent.
 	gpu3dNoteMirror(e)
+	// #2236 defect #13: the same mirror's x|y arg feeds the compose-N
+	// blit for handoff surfaces.
+	surfaceNoteMirror(e)
 	if e.Kind == vi.EvWmPointer {
 		vi.ConsoleLine(MarkerPtr)
 		if idleInput(seatTick) {

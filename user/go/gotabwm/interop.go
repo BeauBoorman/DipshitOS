@@ -166,11 +166,17 @@ func dropRpcBinding(id uint32) {
 	// own window-release path is the final authority); this is the seat's
 	// bookkeeping of the same fact.
 	gpu3dDropWindow(id)
+	// A shared-surface handoff dies the same way: the kernel revokes the
+	// peer mirror at owner teardown, so a reused id must never blit a dead
+	// window's pages (#2236 defect #13).
+	surfaceDropWindow(id)
 }
 
 func dropAllRpcBindings() {
 	rpcBindings = [256]rpcBinding{}
 	rpcChallenges = [256]uint64{}
+	surfaceRecs = [surfaceMaxRecs]surfaceRec{}
+	surfaceXY = [256]uint32{}
 }
 
 // gateRPC is the sender-authentication check ahead of applyRPC. It returns
@@ -505,6 +511,8 @@ func applyRPC(req vi.WmRpc) bool {
 		// the queue does not hold. The next composite tick paints it.
 		vi.ConsoleLine(MarkerNotify + vi.Itoa64(int64(id)) + " " + text)
 		return true
+	case vi.WmRpcKindShareSurface: // 18, client -> seat: hand off its bound surface
+		return serveSurfaceShare(req)
 	case vi.WmRpcKindSettingsSubscribe: // 13, client -> seat: subscribe to one key
 		return applySettingsSubscribe(req)
 	case vi.WmRpcKindSettingsPublish: // 14, writer -> seat: a persisted key changed

@@ -398,20 +398,36 @@ func wmRequest(kind uint8, id uint32, x, y, w, h uint16, title, selfName string)
 // in that shape matching seq+reply_to is a forgery and is dropped inside
 // waitWmRpcAck rather than satisfying it.
 func wmRequestGo(kind uint8, id uint8, title string, peers WmSeat) (WmRpc, bool) {
+	var tb [WmRpcTitleMax]byte
+	copy(tb[:], title)
+	return wmRequestGoTitle(kind, id, tb, title, peers)
+}
+
+// wmRequestGoTitle is the raw-title form of wmRequestGo for kinds whose
+// payload is binary (kind 17 gpu3d, kind 18 surface handoff): title is the
+// verbatim frame field, restoreTitle is the window's intended kernel title
+// the challenge tail puts back after the bind proof.
+func wmRequestGoTitle(kind uint8, id uint8, title [WmRpcTitleMax]byte, restoreTitle string, peers WmSeat) (WmRpc, bool) {
 	for round := 0; round < wmBindMaxRounds; round++ {
 		token := wmToken(id)
-		req := WmRpc{Kind: kind, ID: id, Seq: nextWmSeq(), ReplyTo: uint8(peers.Self)}
-		req.SetTitle(title)
+		req := WmRpc{Kind: kind, ID: id, Seq: nextWmSeq(), ReplyTo: uint8(peers.Self), Title: title}
 		// The accept predicate is strict per send shape: a bound request
-		// accepts only an ack quoting the same token, an unbound request
+		// accepts an ack quoting the same token, an unbound request
 		// accepts only a challenge — a plain ack is the forgery shape, and
 		// a Bound ack for a request that carried no credentials could only
-		// install an attacker-chosen token.
+		// install an attacker-chosen token. A bound request ALSO accepts
+		// a re-challenge: that is how the seat answers a token it no
+		// longer holds (a reused window's binding died with the old
+		// window), and the challenge tail below re-proves and rebinds in
+		// the SAME round, exactly as wqPage does.
 		var accept func(WmRpc) bool
 		if token != 0 {
 			req.Pad = WmRpcPadBound
 			SetWmAuth(&req, token)
-			accept = func(m WmRpc) bool { return m.Pad == WmRpcPadBound && WmAuth(m) == token }
+			accept = func(m WmRpc) bool {
+				return m.Pad == WmRpcPadChallenge ||
+					(m.Pad == WmRpcPadBound && WmAuth(m) == token)
+			}
 		} else {
 			accept = func(m WmRpc) bool { return m.Pad == WmRpcPadChallenge }
 		}
@@ -455,7 +471,7 @@ func wmRequestGo(kind uint8, id uint8, title string, peers WmSeat) (WmRpc, bool)
 		setWmToken(id, newToken)
 		// The challenge string is the window's kernel title right now;
 		// restore the title the request meant it to wear.
-		_ = bindSetTitle(int(id), title)
+		_ = bindSetTitle(int(id), restoreTitle)
 		return rep, true
 	}
 	return WmRpc{}, false
