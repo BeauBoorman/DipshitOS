@@ -1797,6 +1797,17 @@ pub fn build(b: *std.Build) void {
     // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
+    // M99c (#2181): GOSOUND.ELF (user/go/sound, built by
+    // tools/go/build-gosound.sh) is the WAV player for the `audio` mime
+    // type — another host-share ELF, so there is no Zig build step here
+    // either. It parses RIFF/WAVE and streams through M99b's mixer client
+    // (vi.AudioStream, slot 43); virelai/mime's init names it the Audio
+    // handler so GOFILES' open path reaches it. The live-sound-playback
+    // gate stages GOSOUND.ELF beside PCM.BIN and asserts its post-resample
+    // stream counters against the fixture's declared frame count.
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
     // M71i (#1568): DOC.BIN (the M-web in-guest HTML viewer, issues
     // #1202–#1207, ADR 0028) is RETIRED with user/src/doc.zig. The EL0 HTML
     // consumer is WEB.ELF (`user/go/browser`, built by

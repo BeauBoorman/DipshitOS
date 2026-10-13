@@ -124,3 +124,141 @@ vgate_assert absent serial-absent 'b7: continuous'
 vgate_assert absent serial-absent 'b7: FAIL'
 vgate_assert absent serial-absent 'b7: PANIC'
 vgate_assert absent serial-absent '[EXC] parking'
+
+# ----------------------------------------------------------------------
+# M99c (#2181): the WAV player on the same real device. GOFILES opens a
+# >256 KiB 44.1 kHz stereo s16 file (TONE.WAV), GOSOUND parses it,
+# resamples 44100 -> 48000 linearly, and streams through the M99b mixer
+# seat while PCM.BIN's peer mode proves a second source mixes alongside.
+# The accounting asserts are the card's: the seat's counters must equal
+# the file's expected post-resample byte count exactly.
+vgate_setup_python <<'PY'
+import math, os, shutil, struct, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+for elf, script in (("GOSOUND.ELF", "gosound"), ("GOFILES.ELF", "files")):
+    src = os.path.join(".build", "go", elf)
+    if not os.path.exists(src):
+        sys.exit(elf + " missing (expected " + src + ") - build it first: "
+                 "bash tools/go/build-" + script + ".sh")
+    shutil.copy(src, os.path.join(share, elf))
+d = os.path.join(share, "SND")
+os.makedirs(d, exist_ok=True)
+# 3 s of 44.1 kHz stereo s16 sine: 132300 frames, 529200 B of PCM — past the
+# card's 256 KiB floor, and a rate the negotiated 48 kHz tuple must resample.
+rate, frames = 44100, 132300
+data = bytearray()
+for i in range(frames):
+    v = int(0.2 * 32767 * math.sin(2 * math.pi * 440 * i / rate))
+    data += struct.pack("<hh", v, v)
+hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" +
+       b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, rate, rate * 4, 4, 16) +
+       b"data" + struct.pack("<I", len(data)))
+with open(os.path.join(d, "TONE.WAV"), "wb") as f:
+    f.write(hdr + data)
+print("staged GOSOUND/GOFILES + TONE.WAV (%d bytes, %d frames)" %
+      (len(hdr) + len(data), frames))
+PY
+
+vgate_file gosound-open.txt <<'EOF'
+exec GOFILES.ELF /host/SND
+EOF
+vgate_file gosound-peer.txt <<'EOF'
+exec PCM.BIN peer
+EOF
+vgate_file gosound-done.txt <<'EOF'
+echo m99c-gate-done
+EOF
+vgate_file gosound-exec.txt <<'EOF'
+exec GOSOUND.ELF /host/SND/TONE.WAV
+EOF
+
+# The dispatch chain is the card's acceptance: GOFILES' default open picks
+# GOSOUND for type=audio, vi.Exec launches it, the seat streams the whole
+# file, and the peer overlaps mid-playback. `gosound:` markers print only
+# after the syscall they report.
+vgate_run wav -- --sound \
+    --screen '$RUN_DIR/gosound-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/gosound-open.txt' \
+    --input-chords 'return' \
+    --input-chords-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/gosound-peer.txt' \
+    --script2-after 'gosound: streaming gen=' \
+    --script3 '$RUN_DIR/gosound-done.txt' \
+    --script3-after 'gosound: done ' \
+    --script-expect 'm99c-gate-done' --timeout 240
+
+vgate_assert wav output-contains 'SOUND: virtio-snd attached'
+vgate_assert wav serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert wav serial-contains 'gofiles: list /host/SND n=1'
+vgate_assert wav serial-contains 'gofiles: open file TONE.WAV type=audio handler=GOSOUND.ELF'
+vgate_assert wav serial-contains 'gofiles: open launched TONE.WAV handler=GOSOUND.ELF pid='
+
+# The second reporter: GOSOUND's own markers prove the launched app parsed
+# and streamed the file the manager named.
+vgate_assert wav serial-contains 'gosound: open id='
+vgate_assert wav serial-contains 'gosound: loaded TONE.WAV fmt=pcm16 ch=2 rate=44100 frames=132300'
+vgate_assert wav serial-contains 'gosound: out f32 rate=48000 ch=2 frames=144000'
+vgate_assert wav serial-contains 'gosound: streaming gen='
+
+# The overlap: the peer's own close-out asserts it saw exactly two live
+# sources — its seat plus GOSOUND's.
+vgate_assert wav serial-contains 'b7: peer accepted=65536 submitted=65536 completed=65536 sources=2'
+vgate_assert wav serial-contains 'procs PCM.BIN exited status=0'
+
+# No refusal of any kind may appear on the happy path.
+vgate_assert wav serial-absent 'gosound: refused'
+vgate_assert wav serial-absent 'gosound: no decoder'
+vgate_assert wav serial-absent 'gosound: drain failed'
+vgate_assert wav serial-absent 'gosound: stream err'
+vgate_assert wav serial-absent 'gofiles: open refused'
+vgate_assert wav serial-absent 'gofiles: open launch refused'
+vgate_assert wav serial-absent 'b7: FAIL'
+vgate_assert wav serial-absent '[EXC] parking'
+vgate_assert wav serial-absent 'exited status=139'
+vgate_assert wav serial-contains 'm99c-gate-done'
+
+# The counter identity, recomputed from the fixture rather than pinned: the
+# resampler's output frame count is ceil(in*48000/44100), the seat must
+# report accepted == submitted == completed == frames * 8 B (FLOAT stereo),
+# and the overlap must have raised the mixer's concurrent-source peak to 2.
+vgate_assert wav python <<'PY'
+import os, re, sys
+
+ser = open(os.environ["VG_SER"], "rb").read().decode("latin1", errors="replace")
+m = re.search(
+    r"gosound: done accepted=(\d+) submitted=(\d+) completed=(\d+) "
+    r"underruns=(\d+) peak=(\d+) clipped=(\d+)", ser)
+if not m:
+    sys.exit("ERROR: no gosound done marker in serial")
+accepted, submitted, completed, underruns, peak, clipped = (
+    int(g) for g in m.groups())
+
+in_frames = 132300                      # 44.1 kHz stereo, 4 B frames
+want_frames = -(-in_frames * 48000 // 44100)   # ceil — pipe.go OutFrames
+want_bytes = want_frames * 8            # FLOAT/stereo
+if want_frames != 144000:
+    sys.exit(f"ERROR: fixture math changed: want_frames={want_frames}")
+if not (accepted == submitted == completed == want_bytes):
+    sys.exit(f"ERROR: counters accepted={accepted} submitted={submitted} "
+             f"completed={completed}, want {want_bytes}")
+if peak != 2:
+    sys.exit(f"ERROR: peak={peak}, want 2 (the peer overlap)")
+PY
+
+# Soundless boot: same desktop (screen + input) but no --sound device. The
+# file still parses, the window opens and says 'no audio device', and the
+# process exits cleanly — documented, not a failure.
+vgate_run wav-nodev -- \
+    --screen '$RUN_DIR/gosound-screen-nodev' \
+    --input --via-virtio \
+    --script '$RUN_DIR/gosound-exec.txt' \
+    --script-expect 'procs GOSOUND.ELF exited status=0' --timeout 120
+vgate_assert wav-nodev serial-contains 'gosound: open id='
+vgate_assert wav-nodev serial-contains 'gosound: loaded TONE.WAV fmt=pcm16 ch=2 rate=44100 frames=132300'
+vgate_assert wav-nodev serial-contains 'gosound: no audio device'
+vgate_assert wav-nodev serial-contains 'procs GOSOUND.ELF exited status=0'
+vgate_assert wav-nodev serial-absent 'gosound: streaming'
+vgate_assert wav-nodev serial-absent 'gosound: refused'
+vgate_assert wav-nodev serial-absent '[EXC] parking'

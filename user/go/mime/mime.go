@@ -573,15 +573,16 @@ func baseName(path string) string {
 	return path
 }
 
-// init registers the two live adopters (the card's day-one requirement):
-// GOVIEW.ELF opens images and takes a path in argv[1]; GOEDIT.ELF opens text
-// and takes a path in argv[1] as well. GOEDIT is ALSO an image handler,
-// second, because GOVIEW refuses images it has no decoder for ("this format
-// has no guest decoder") and reading the raw bytes is the honest fallback
-// then. A type with no registration is Audio (nothing in the tree plays
-// sound yet), Archive and Binary — those refuse by name.
+// init registers the live adopters: GOVIEW.ELF opens images and takes a
+// path in argv[1]; GOEDIT.ELF opens text and takes a path in argv[1] as
+// well. GOEDIT is ALSO an image handler, second, because GOVIEW refuses
+// images it has no decoder for ("this format has no guest decoder") and
+// reading the raw bytes is the honest fallback then. GOSOUND.ELF (M99c)
+// opens audio and takes the path in argv[1]. Types with no registration —
+// Archive, Binary — refuse by name.
 func init() {
 	Register(Image, "GOVIEW.ELF", "Image Viewer")
 	Register(Text, "GOEDIT.ELF", "Code Editor")
 	Register(Image, "GOEDIT.ELF", "Code Editor (raw bytes)")
+	Register(Audio, "GOSOUND.ELF", "Sound Player")
 }

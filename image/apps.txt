@@ -40,6 +40,7 @@ GOHELP.ELF | Help | h
 GOTOP.ELF | Top | p | dock=true
 GOSET.ELF | Settings | g | dock=false | v=2 | caps=file
 GOVIEW.ELF | Image Viewer | v | dock=false | v=2 | opens=image
+GOSOUND.ELF | Sound | a | dock=false | v=2 | caps=file,window,audio | opens=audio
 ZC.BIN | Zig Compiler | z | dock=false | v=2 | caps=file,memory,process
 TABWM.BIN | Tabbed Desktop | m
 GOSTALGIA.ELF | Gostalgia | o | dock=false | v=2 | argv=shell --root /host/GS | caps=file,window,term,process

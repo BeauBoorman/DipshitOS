@@ -38,12 +38,12 @@ func TestOpenUsesMagicAndNamesMissingHandlers(t *testing.T) {
 		t.Fatalf("PNG named .TXT resolved to %+v", req)
 	}
 
-	_, err = Open("/host/SONG.OGG", "/", func(string, int) ([]byte, error) {
-		return []byte("OggS\x00\x02"), nil
+	_, err = Open("/host/BUNDLE.ZIP", "/", func(string, int) ([]byte, error) {
+		return []byte("PK\x03\x04"), nil
 	})
 	var openErr *OpenError
-	if !errors.As(err, &openErr) || openErr.Kind != OpenNoHandler || openErr.Type != Audio {
-		t.Fatalf("audio refusal = %#v, want named no-handler error", err)
+	if !errors.As(err, &openErr) || openErr.Kind != OpenNoHandler || openErr.Type != Archive {
+		t.Fatalf("archive refusal = %#v, want named no-handler error", err)
 	}
 }
 

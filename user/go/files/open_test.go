@@ -70,12 +70,13 @@ func TestOpenFileMagicBeatsTheName(t *testing.T) {
 }
 
 func TestOpenFileRefusesATypeNothingOpens(t *testing.T) {
-	withHead(t, []byte("OggS\x00\x02\x00\x00"))
-	m := testModel(entry("SONG.OGG", false))
+	// Audio has a handler since M99c (GOSOUND.ELF); archive does not.
+	withHead(t, []byte("PK\x03\x04\x00\x00"))
+	m := testModel(entry("BUNDLE.ZIP", false))
 	m.handleKey(keys.Event{Key: keys.KeyEnter})
 	got := pendingJoined(&m)
-	if !strings.Contains(got, markerOpenNo+"SONG.OGG type=audio") {
-		t.Fatalf("audio must refuse by name: %q", got)
+	if !strings.Contains(got, markerOpenNo+"BUNDLE.ZIP type=archive") {
+		t.Fatalf("archive must refuse by name: %q", got)
 	}
 	if strings.Contains(got, markerOpenFile) {
 		t.Fatalf("a refused open must not also claim a dispatch: %q", got)
@@ -83,7 +84,7 @@ func TestOpenFileRefusesATypeNothingOpens(t *testing.T) {
 	if _, ok := m.takeLaunch(); ok {
 		t.Fatal("a refused open must not queue an exec")
 	}
-	if m.status != "no handler for audio" {
+	if m.status != "no handler for archive" {
 		t.Fatalf("status = %q, want the named refusal", m.status)
 	}
 }
@@ -168,13 +169,14 @@ func TestOpenWithEscapeLaunchesNothing(t *testing.T) {
 }
 
 func TestOpenWithRefusesATypeWithNoCandidates(t *testing.T) {
-	withHead(t, []byte("fLaC\x00\x00\x00\x22"))
-	m := testModel(entry("TUNE.FLAC", false))
+	// Binary is a type nothing opens: the modal must not arm empty.
+	withHead(t, []byte("\x7fELF\x02\x01\x01\x00"))
+	m := testModel(entry("TOOL.ELF", false))
 	m.handleKey(runeKey('o'))
 	if m.mode == modeOpenWith {
 		t.Fatal("no candidates must not arm an empty modal")
 	}
-	if got := pendingJoined(&m); !strings.Contains(got, markerOpenNo+"TUNE.FLAC type=audio") {
+	if got := pendingJoined(&m); !strings.Contains(got, markerOpenNo+"TOOL.ELF type=binary") {
 		t.Fatalf("the refusal must name the type: %q", got)
 	}
 }

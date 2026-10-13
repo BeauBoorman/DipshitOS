@@ -205,8 +205,11 @@ func TestHandlersAreTheRegisteredOnes(t *testing.T) {
 		if h, ok := Default(Text); !ok || h.Bin != "GOEDIT.ELF" {
 			t.Errorf("Default(Text) = %+v, %v; want GOEDIT.ELF", h, ok)
 		}
+		if h, ok := Default(Audio); !ok || h.Bin != "GOSOUND.ELF" {
+			t.Errorf("Default(Audio) = %+v, %v; want GOSOUND.ELF", h, ok)
+		}
 		// The refusal half: a type nothing opens is a fact the caller needs.
-		for _, id := range []ID{Audio, Archive, Binary, Unknown} {
+		for _, id := range []ID{Archive, Binary, Unknown} {
 			if h, ok := Default(id); ok {
 				t.Errorf("Default(%s) = %+v; want no handler (a named refusal)", id, h)
 			}
