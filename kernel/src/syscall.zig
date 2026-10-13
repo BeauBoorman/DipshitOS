@@ -3449,10 +3449,29 @@ fn handle_tcp_send(args: Args, frame: *exceptions.VectorFrame) u64 {
     if (uaccess.copy_in(&tcp_send_staging, address, @intCast(len)) != .ok) return error_result(.efault);
 
     tcp_flush_rst(); // M84f: the singleton's refusal slot still goes first
-    const n = native_socket.sockets.send(owner, c.handle, tcp_send_staging[0..@intCast(len)], native_socket.now()) catch |err| return switch (err) {
-        error.WouldBlock => error_result(.eagain),
-        else => socket_error(err),
-    };
+    // #2233: the singleton committed a slot-31 send to the wire
+    // synchronously and never surfaced EAGAIN; the table's one-in-flight
+    // law is honest, so a still-unACKed segment occupying the bounded TX
+    // slot is a bounded WAIT, not an error row — the recv-then-send
+    // rhythm every raw-slot caller runs (the TLS stream's chunk pacing is
+    // the observed one) would otherwise eat a fatal -11 on the peer's
+    // ACK latency. Same shape as the close handler's shutdown retry: the
+    // drain admits the ACK that frees the slot, the poll drives queued
+    // TX/deadlines, and the bound keeps a black-hole peer or a wedged
+    // transport honest at the seam's errno row.
+    var send_tries: usize = 0;
+    var n: usize = 0;
+    while (true) {
+        virtio_net.net_rx_drain();
+        virtio_net.net_socket_poll();
+        n = native_socket.sockets.send(owner, c.handle, tcp_send_staging[0..@intCast(len)], native_socket.now()) catch |err| {
+            if (err != error.WouldBlock) return socket_error(err);
+            send_tries += 1;
+            if (send_tries >= 100000) return error_result(.eagain);
+            continue;
+        };
+        break;
+    }
     virtio_net.net_socket_poll();
     tcp.data_sent += 1;
     return n;
