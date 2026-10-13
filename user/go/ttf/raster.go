@@ -226,6 +226,60 @@ func addSpan(acc []int32, rowOff, w int, ax, bx float64) {
 	}
 }
 
+// Linear-light coverage blending (M99o, #2192). Interpolating encoded sRGB
+// channels weights dark destination text far too strongly — a half-covered
+// stem edge over a light background comes out visibly darker than the ink the
+// outline actually covers — so coverage is applied in linear light instead.
+// The conversion is table-driven: a 256-entry sRGB->linear table at 12-bit
+// precision, and a 4096-entry linear->sRGB table to encode the blend. The
+// two tables cost ~4.6 KiB; the alternative (one gamma curve on coverage) is
+// a contrast hack, not a blend, so the tables are the implementation.
+var covS2L [256]uint16 // sRGB byte -> linear light, 0..4095
+var covL2S [4096]uint8 // linear light 0..4095 -> sRGB byte
+
+func init() {
+	for i := range covS2L {
+		v := float64(i) / 255
+		l := v / 12.92
+		if v > 0.04045 {
+			l = math.Pow((v+0.055)/1.055, 2.4)
+		}
+		covS2L[i] = uint16(l*4095 + 0.5)
+	}
+	for i := range covL2S {
+		l := float64(i) / 4095
+		v := l * 12.92
+		if l > 0.0031308 {
+			v = 1.055*math.Pow(l, 1.0/2.4) - 0.055
+		}
+		covL2S[i] = uint8(v*255 + 0.5)
+	}
+}
+
+// CoverageBlend composites src over dst weighted by 8-bit coverage a, in
+// linear light, and is THE shared helper: every Go glyph-mask blend routes
+// here (ttf.Blend, the draw BufferCanvas coverage path, and MaskSink
+// implementations). dst is treated as opaque — the surfaces that call this
+// are window back-buffers, and the result keeps the 0xff alpha byte the
+// window format expects. a == 0 leaves dst untouched and a == 255 paints src
+// exactly, so full-coverage pixels and untouched pixels never quantize.
+func CoverageBlend(dst, src uint32, a uint8) uint32 {
+	if a == 0 {
+		return dst
+	}
+	rgb := src & 0xffffff
+	if a == 255 {
+		return 0xff000000 | rgb
+	}
+	ia := int32(255 - int32(a))
+	sa := int32(a)
+	blend := func(shift uint) uint32 {
+		l := (int32(covS2L[(src>>shift)&0xff])*sa + int32(covS2L[(dst>>shift)&0xff])*ia + 127) / 255
+		return uint32(covL2S[l]) << shift
+	}
+	return 0xff000000 | blend(16) | blend(8) | blend(0)
+}
+
 // Blend composites an 8-bit coverage mask into a 32-bpp surface.
 //
 // dst is the surface as 0xAARRGGBB words (in memory on the guest that is the
@@ -236,14 +290,11 @@ func addSpan(acc []int32, rowOff, w int, ax, bx float64) {
 //
 // Coverage comes from the mask, so a partial pixel becomes a partial blend —
 // this is the anti-aliasing, and it is why the glyph edge is smooth rather
-// than stair-stepped.
+// than stair-stepped. The blend itself is linear-light via CoverageBlend.
 func Blend(dst []uint32, stride, w, h, x, y int, m *Mask, rgb uint32) {
 	if m.Empty() || len(dst) == 0 || stride <= 0 || w <= 0 || h <= 0 || len(dst) < stride*h {
 		return
 	}
-	sr := int32((rgb >> 16) & 0xff)
-	sg := int32((rgb >> 8) & 0xff)
-	sb := int32(rgb & 0xff)
 	for row := 0; row < m.Height; row++ {
 		dy := y + row
 		if dy < 0 || dy >= h {
@@ -264,19 +315,7 @@ func Blend(dst []uint32, stride, w, h, x, y int, m *Mask, rgb uint32) {
 			if i >= len(dst) {
 				continue
 			}
-			if a == 255 {
-				dst[i] = 0xff000000 | uint32(sr)<<16 | uint32(sg)<<8 | uint32(sb)
-				continue
-			}
-			ia := int32(255 - int32(a))
-			d := dst[i]
-			dr := int32((d >> 16) & 0xff)
-			dg := int32((d >> 8) & 0xff)
-			db := int32(d & 0xff)
-			r := (sr*int32(a) + dr*ia + 127) / 255
-			g := (sg*int32(a) + dg*ia + 127) / 255
-			b := (sb*int32(a) + db*ia + 127) / 255
-			dst[i] = 0xff000000 | uint32(r)<<16 | uint32(g)<<8 | uint32(b)
+			dst[i] = CoverageBlend(dst[i], rgb, a)
 		}
 	}
 }

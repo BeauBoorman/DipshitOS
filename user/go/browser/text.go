@@ -14,10 +14,11 @@ import (
 // Share names frozen by M69d #1531 D1. Zig ui.init_fonts (#1536) consumes the
 // same paths; this card only reads them.
 const (
-	fontUIPath     = "/host/INTER.TTF"
-	fontBoldPath   = "/host/INTERB.TTF"
-	fontItalicPath = "/host/INTERI.TTF"
-	fontMonoPath   = "/host/FIRACODE.TTF"
+	fontUIPath         = "/host/INTER.TTF"
+	fontBoldPath       = "/host/INTERB.TTF"
+	fontItalicPath     = "/host/INTERI.TTF"
+	fontBoldItalicPath = "/host/INTERBI.TTF"
+	fontMonoPath       = "/host/FIRACODE.TTF"
 
 	// fontManifestPath is the M99l registry manifest, staged from
 	// image/fonts/fonts.txt. It is Go-registry input only — the frozen Zig
@@ -117,7 +118,8 @@ func loadTextEngine() (webrender.Fonts, string, string) {
 	mono := readWholeFile(fontMonoPath, maxFontBytes)
 	bold := readWholeFile(fontBoldPath, maxFontBytes)
 	italic := readWholeFile(fontItalicPath, maxFontBytes)
-	f = webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic})
+	boldItalic := readWholeFile(fontBoldItalicPath, maxFontBytes)
+	f = webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic, BoldItalic: boldItalic})
 	return f, faceState(f.UI), faceState(f.Mono)
 }
 
@@ -137,7 +139,7 @@ func textProbeString(t webrender.TextEngine) string {
 	body := webrender.Style{Size: 1, Color: webrender.ColorText}
 	h1 := webrender.Style{Size: 2, Color: webrender.ColorText}
 	mono := webrender.Style{Size: 1, Mono: true}
-	boldFace, boldHeavier, italicFace := "no", "no", "no"
+	boldFace, boldHeavier, italicFace, biFace, biResolve := "no", "no", "no", "no", "none"
 	if f, ok := t.(webrender.Fonts); ok {
 		if f.Bold != nil {
 			boldFace = "yes"
@@ -148,6 +150,13 @@ func textProbeString(t webrender.TextEngine) string {
 		if f.Italic != nil {
 			italicFace = "yes"
 		}
+		if f.BoldItalic != nil {
+			biFace = "yes"
+		}
+		// What does a CSS bold+italic style actually resolve to? The named
+		// face, not an adjective: bolditalic when INTERBI.TTF is loaded,
+		// the degrade name (bold, italic, ui) when it is not.
+		biResolve = f.ResolvedName(webrender.Style{Size: 1, Bold: true, Italic: true})
 	}
 	return "face=" + t.Name() +
 		" proportional=" + boolStr(t.Proportional()) +
@@ -159,7 +168,9 @@ func textProbeString(t webrender.TextEngine) string {
 		" adv-space=" + itoa(t.Measure(" ", body)) +
 		" bold-face=" + boldFace +
 		" bold-heavier=" + boldHeavier +
-		" italic-face=" + italicFace
+		" italic-face=" + italicFace +
+		" bi-face=" + biFace +
+		" bi-resolve=" + biResolve
 }
 
 // resolveImage returns only preflighted sources during layout. Resource reads

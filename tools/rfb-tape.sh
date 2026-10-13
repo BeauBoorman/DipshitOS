@@ -109,6 +109,7 @@ cp image/WALLPAPER.QOI "$OUT/share/"
 cp image/fonts/Inter-Regular.ttf "$OUT/share/INTER.TTF"
 cp image/fonts/Inter-Bold.ttf "$OUT/share/INTERB.TTF"
 cp image/fonts/Inter-Italic.ttf "$OUT/share/INTERI.TTF"
+cp image/fonts/Inter-BoldItalic.ttf "$OUT/share/INTERBI.TTF"
 cp image/fonts/FiraCode-Regular.ttf "$OUT/share/FIRACODE.TTF"
 # M99l (#2189): the chrome face is the cascade's symbol tail, and FONTS.TXT is
 # the manifest that wires it — the Go registry only.

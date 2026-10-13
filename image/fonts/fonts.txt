@@ -42,10 +42,22 @@
 #   NOTOSERF.TTF   Noto Serif 2.015 (var->Regular)  359680  7f5399a928da58075d578960e9ea89afa0a4588574894b4f20f11ae4a63c5f84
 #   NOTOCJK.TTF    Noto Sans JP 2.004 (var->Regular, 399592  e437322c312e04b580d8ce56539390148b529398932fca3f129321e5bcbe38a2
 #                  kana + kyōiku kanji + symbols)
+#   INTERBI.TTF    Inter Bold Italic (4.001, the    425296  948405a16cdc62701da5f4005ed068ca5f4d27061d98f7974ccfc37831d9581d
+#                  same rsms/inter v4.1 extras/ttf
+#                  build as the pinned faces)
+#
+# M99o (#2192): INTERBI is the bold-italic face — one row carries weight=700
+# AND style=italic, so only a {bold,italic} query selects it; it sorts after
+# the existing ui rows so every other chain's cascade order is unchanged.
+# Serif bold/italic policy is refusal-by-name: NOTOSERF has no styled rows,
+# so a serif {bold} / {italic} / {bold,italic} query degrades to the regular
+# serif face — real glyphs at real coverage, never a synthetic shear or
+# embolden.
 INTER.TTF    | role=ui     | order=1 | weight=400 | style=normal
 INTERB.TTF   | role=ui     | order=2 | weight=700 | style=normal
 INTERI.TTF   | role=ui     | order=3 | weight=400 | style=italic
 NOTOSERF.TTF | role=ui     | order=4 | weight=400 | style=normal
+INTERBI.TTF  | role=ui     | order=5 | weight=700 | style=italic
 FIRACODE.TTF | role=mono   | order=1 | weight=400 | style=normal
 NOTOSERF.TTF | role=serif  | order=1 | weight=400 | style=normal
 CHROME.TTF   | role=symbol | order=1 | weight=400 | style=normal

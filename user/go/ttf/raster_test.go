@@ -1,6 +1,10 @@
 package ttf
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 // TestAntiAliasingProducesIntermediateCoverage is the anti-aliasing contract:
 // a curved or oblique glyph must produce pixels that are PARTLY covered. A
@@ -200,6 +204,98 @@ func TestBlendWritesOnlyCoveredPixels(t *testing.T) {
 	t.Logf("H@32px: %d px painted, %d fully ink", touched, exact)
 	if touched == 0 || exact == 0 {
 		t.Fatalf("blend painted %d px (%d fully ink); expected real ink", touched, exact)
+	}
+}
+
+// --- coverage blending (M99o #2192) ----------------------------------------
+//
+// Glyph coverage is a fraction of a pixel. Weighting the sRGB-encoded
+// channels by it puts the perceptual midpoint at ~25% linear light — text on
+// dark chrome looks thinner and text on a light page looks fatter. The shared
+// helper weights the LINEAR-light channels instead, and every Go glyph-mask
+// blend site routes through it so the whole tree renders one thing.
+
+// TestCoverageBlendIsLinearLight pins the helper's space: half coverage must
+// produce the linear-light midpoint (~0xBB), not the sRGB-space midpoint
+// 0x80. The ~23% difference in the middle of the curve is the entire card.
+func TestCoverageBlendIsLinearLight(t *testing.T) {
+	const black, white = 0xff000000, 0xffffff
+	if got := CoverageBlend(black, white, 0); got != black {
+		t.Fatalf("a=0 wrote %#08x, want the destination untouched", got)
+	}
+	if got := CoverageBlend(black, white, 255); got&0xffffff != white {
+		t.Fatalf("a=255 wrote %#08x, want exact ink", got)
+	}
+	half := CoverageBlend(black, white, 128) & 0xffffff
+	const srgbMid = uint32(0x808080)
+	t.Logf("white@128 over black -> %#06x (an sRGB-space blend writes %#06x)", half, srgbMid)
+	if half <= srgbMid {
+		t.Fatalf("half coverage produced %#06x, not brighter than the sRGB midpoint %#06x: the blend is not in linear light", half, srgbMid)
+	}
+	// The blend is symmetric: half-covered black ink over white lands at the
+	// same ~0xBC (half of linear light), NOT the sRGB midpoint 0x80 that the
+	// old formula produced on the light page too.
+	inv := CoverageBlend(0xffffffff, 0x000000, 128) & 0xffffff
+	t.Logf("black@128 over white -> %#06x", inv)
+	if inv <= srgbMid {
+		t.Fatalf("half coverage produced %#06x, not brighter than the sRGB midpoint", inv)
+	}
+	// Complementary coverage is the same blend run backwards: a coverage of
+	// white over black and 255-a of black over white sum to the white page.
+	for _, a := range []uint8{1, 63, 128, 191, 254} {
+		l := CoverageBlend(black, white, a) & 0xffffff
+		d := CoverageBlend(white, black, 255-a) & 0xffffff
+		if l != d {
+			t.Errorf("a=%d: white-over-black %#06x != complement %#06x", a, l, d)
+		}
+	}
+	// Endpoints are exact for every channel value — no LUT quantization
+	// error at a=0 or a=255.
+	for _, v := range []uint32{0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff} {
+		px := v<<16 | v<<8 | v
+		if got := CoverageBlend(black, px, 255) & 0xffffff; got != px {
+			t.Errorf("a=255 with channel %#02x wrote %#06x", v, got)
+		}
+		if got := CoverageBlend(px, black, 0); got != px {
+			t.Errorf("a=0 on destination %#06x wrote %#08x", px, got)
+		}
+	}
+	// The result is always an opaque word — glyph ink never punches
+	// transparency into the surface.
+	if got := CoverageBlend(0x00000000, white, 100); got>>24 != 0xff {
+		t.Errorf("blend wrote a translucent word %#08x", got)
+	}
+}
+
+// TestEveryCoverageBlendSiteUsesTheHelper is the grep pin the card asks for:
+// every file that composites a glyph mask must route through the shared
+// helper (directly or via Blend), and none may keep a hand-rolled sRGB
+// coverage lerp. Add a site here when the tree gains one.
+func TestEveryCoverageBlendSiteUsesTheHelper(t *testing.T) {
+	sites := []struct {
+		path string // relative to this package dir (user/go/ttf)
+		want string // substring that proves the site routes through the helper
+	}{
+		{"raster.go", "CoverageBlend("},                  // Blend's partial-coverage branch
+		{"../draw/text.go", "ttf.CoverageBlend("},        // BufferCanvas mask fast path
+		{"../browser/presentation.go", "ttf.Blend("},     // virender MaskSink
+		{"../webrender/text_test.go", "ttf.Blend("},      // maskFB test sink
+		{"../webrender/image_test.go", "ttf.Blend("},     // m93 reference comparator sink
+	}
+	for _, s := range sites {
+		data, err := os.ReadFile(s.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", s.path, err)
+		}
+		src := string(data)
+		if !strings.Contains(src, s.want) {
+			t.Errorf("%s does not call %s — the site bypasses the shared coverage blend", s.path, s.want)
+		}
+		// The retired formula multiplied each sRGB channel by `a` and the
+		// complement by (255-a); both fragments mark a hand-rolled lerp.
+		if strings.Contains(src, "*(255-a)") || strings.Contains(src, "(255-a)*") {
+			t.Errorf("%s still carries an inline sRGB coverage lerp", s.path)
+		}
 	}
 }
 

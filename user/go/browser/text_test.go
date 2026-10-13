@@ -26,8 +26,12 @@ func browserFonts(t *testing.T) webrender.Fonts {
 	if err != nil {
 		t.Fatalf("Inter Italic fixture: %v", err)
 	}
-	f := webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic})
-	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil {
+	boldItalic, err := os.ReadFile("../../../image/fonts/Inter-BoldItalic.ttf")
+	if err != nil {
+		t.Fatalf("Inter Bold Italic fixture: %v", err)
+	}
+	f := webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic, BoldItalic: boldItalic})
+	if f.UI == nil || f.Mono == nil || f.Bold == nil || f.Italic == nil || f.BoldItalic == nil {
 		t.Fatal("LoadFonts dropped a face")
 	}
 	return f
@@ -51,6 +55,8 @@ func TestTextProbeOnTrueType(t *testing.T) {
 		"bold-face=yes",
 		"bold-heavier=yes",
 		"italic-face=yes",
+		"bi-face=yes",
+		"bi-resolve=bolditalic",
 	} {
 		if !strings.Contains(probe, want) {
 			t.Errorf("probe is missing %q\n  got: %s", want, probe)
@@ -75,6 +81,8 @@ func TestTextProbeOnBitmap(t *testing.T) {
 		"adv-space=8",
 		"bold-face=no",
 		"italic-face=no",
+		"bi-face=no",
+		"bi-resolve=none",
 	} {
 		if !strings.Contains(probe, want) {
 			t.Errorf("bitmap probe is missing %q\n  got: %s", want, probe)
@@ -172,7 +180,7 @@ func TestResolveImageRefusesNetworkAndMissingSources(t *testing.T) {
 // TestTextProbeIsLanguageStable guards the field names the gate greps.
 func TestTextProbeIsLanguageStable(t *testing.T) {
 	probe := textProbeString(browserFonts(t))
-	for _, f := range []string{"face=", "proportional=", "body-lineh=", "h1-lineh=", "mono-lineh=", "adv-i=", "adv-W=", "adv-space=", "bold-face=", "bold-heavier=", "italic-face="} {
+	for _, f := range []string{"face=", "proportional=", "body-lineh=", "h1-lineh=", "mono-lineh=", "adv-i=", "adv-W=", "adv-space=", "bold-face=", "bold-heavier=", "italic-face=", "bi-face=", "bi-resolve="} {
 		if !strings.Contains(probe, f) {
 			t.Errorf("probe lost field %q: %s", f, probe)
 		}

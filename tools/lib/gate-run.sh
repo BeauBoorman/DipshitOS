@@ -152,8 +152,9 @@ gate_seed_share_contents() {
     if [ -f user/src/lib/fixtures/qoi/mascot_64x64.qoi ]; then
         cp user/src/lib/fixtures/qoi/mascot_64x64.qoi "$SHARE/SEXIBURGER.QOI"
     fi
-    # 5. TrueType fonts (Inter Regular/Bold/Italic for UI, Fira Code for mono).
-    # Share names frozen by M69d #1531 D1: INTER.TTF, INTERB.TTF, INTERI.TTF,
+    # 5. TrueType fonts (Inter Regular/Bold/Italic/BoldItalic for UI,
+    # Fira Code for mono). Share names frozen by M69d #1531 D1 (+ INTERBI.TTF
+    # from M99o #2192): INTER.TTF, INTERB.TTF, INTERI.TTF, INTERBI.TTF,
     # FIRACODE.TTF. Zig ui.init_fonts (#1536) consumes the same names.
     if [ -f image/fonts/Inter-Regular.ttf ]; then
         cp image/fonts/Inter-Regular.ttf "$SHARE/INTER.TTF"
@@ -169,6 +170,11 @@ gate_seed_share_contents() {
         cp image/fonts/Inter-Italic.ttf "$SHARE/INTERI.TTF"
     elif [ -f FONTS-CHOOSE/Inter-4.1/extras/ttf/Inter-Italic.ttf ]; then
         cp FONTS-CHOOSE/Inter-4.1/extras/ttf/Inter-Italic.ttf "$SHARE/INTERI.TTF"
+    fi
+    if [ -f image/fonts/Inter-BoldItalic.ttf ]; then
+        cp image/fonts/Inter-BoldItalic.ttf "$SHARE/INTERBI.TTF"
+    elif [ -f FONTS-CHOOSE/Inter-4.1/extras/ttf/Inter-BoldItalic.ttf ]; then
+        cp FONTS-CHOOSE/Inter-4.1/extras/ttf/Inter-BoldItalic.ttf "$SHARE/INTERBI.TTF"
     fi
     if [ -f image/fonts/FiraCode-Regular.ttf ]; then
         cp image/fonts/FiraCode-Regular.ttf "$SHARE/FIRACODE.TTF"
