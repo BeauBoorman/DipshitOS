@@ -39,14 +39,12 @@ net ip 10.0.0.1
 net arp 10.0.0.2
 exec GODNS.ELF -6 example.com 10.0.0.2
 exec GODNS.ELF multi.example 10.0.0.2
-echo dns-aaaa-done
 EOF
 
 vgate_file script-cache.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec GODNS.ELF --twice example.com 10.0.0.2
-echo dns-cache-done
 EOF
 
 vgate_file script-expire.txt <<'EOF'
@@ -58,7 +56,6 @@ exec GODNS.ELF shared.example 10.0.0.2 &
 exec GODNS.ELF shared.example 10.0.0.2 &
 fg 1
 fg 2
-echo dns-armed
 EOF
 
 vgate_setup_python <<'PY'
@@ -117,7 +114,7 @@ vgate_run 02 -- --net '$RUN_DIR/cap-02.bin' --net-arp-respond 10.0.0.2 \
     --net-dns-respond 10.0.0.2 \
     --net-dns-answer 93.184.216.34 --net-dns-answer 93.184.216.35 --net-dns-answer 93.184.216.36 \
     --net-dns-ttl 120 \
-    --script '$RUN_DIR/script-aaaa.txt' --script-expect 'dns-aaaa-done' --timeout 90
+    --script '$RUN_DIR/script-aaaa.txt' --script-expect 'dns: status=ok' --script-expect-tail 8 --timeout 90
 
 vgate_assert 02 serial-contains 'DNS query for example.com (AAAA) via 10.0.0.2:53'
 vgate_assert 02 serial-contains 'Answer: example.com -> 2001:0db8:0000:0000:0000:0000:0000:0053 (ttl=120s answers=1 ignored=0)'
@@ -158,7 +155,7 @@ vgate_assert 04 output-contains "NET-DNS: answered the guest's DNS query for 'ex
 # query leaves the guest, not two.
 vgate_run 05 -- --net '$RUN_DIR/cap-05.bin' --net-arp-respond 10.0.0.2 \
     --net-dns-respond 10.0.0.2 \
-    --script '$RUN_DIR/script-cache.txt' --script-expect 'dns-cache-done' --timeout 60
+    --script '$RUN_DIR/script-cache.txt' --script-expect 'dns: status=ok' --timeout 60
 
 vgate_assert 05 serial-contains 'Answer: example.com -> 93.184.216.34 (ttl=300s answers=1 ignored=0)'
 vgate_assert 05 serial-contains 'cached'
@@ -198,12 +195,13 @@ PY
 # the script races to its end, so the request's reply must be drained
 # into the table synchronously before any child can send (the monitor's
 # own `net arp` drains first, then lookups — 'is at' proves the entry).
-# The run ends when the fg'd jobs are done plus a 16 s tail: the expire
-# process needs its ~12 s transaction (resolve + 8-tick gap + resolve) to
-# finish inside the tail so all four queries and all Answer lines exist.
+# The run ends on `fg`'s job-done line — guest-produced output, not a
+# script echo — plus a 16 s tail: the expire process needs its ~12 s
+# transaction (resolve + 8-tick gap + resolve) to finish inside the tail
+# so all four queries and all Answer lines exist.
 vgate_run 06 -- --net '$RUN_DIR/cap-06.bin' --net-arp-respond 10.0.0.2 \
     --net-dns-respond 10.0.0.2 --net-dns-ttl 1 \
-    --script '$RUN_DIR/script-expire.txt' --script-expect 'dns-armed' --script-expect-tail 16 --timeout 120
+    --script '$RUN_DIR/script-expire.txt' --script-expect 'Done: GODNS.ELF' --script-expect-tail 16 --timeout 120
 
 vgate_assert 06 serial-contains 'DNS query for expire.example (A) via 10.0.0.2:53'
 vgate_assert 06 serial-contains 'dns: status=ok'
