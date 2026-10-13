@@ -110,6 +110,10 @@ cp image/fonts/Inter-Regular.ttf "$OUT/share/INTER.TTF"
 cp image/fonts/Inter-Bold.ttf "$OUT/share/INTERB.TTF"
 cp image/fonts/Inter-Italic.ttf "$OUT/share/INTERI.TTF"
 cp image/fonts/FiraCode-Regular.ttf "$OUT/share/FIRACODE.TTF"
+# M99l (#2189): the chrome face is the cascade's symbol tail, and FONTS.TXT is
+# the manifest that wires it — the Go registry only.
+cp image/fonts/VirelaiChrome-Regular.ttf "$OUT/share/CHROME.TTF"
+cp image/fonts/fonts.txt "$OUT/share/FONTS.TXT"
 printf '#v2\nwm=none\n' >"$OUT/share/SETTINGS.TXT"
 cat >"$OUT/boot.txt" <<'EOF'
 net ip 10.0.0.1

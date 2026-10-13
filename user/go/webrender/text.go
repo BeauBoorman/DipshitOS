@@ -65,6 +65,14 @@ type Fonts struct {
 	Mono   *ttf.Face // Fira Code (monospace)
 	Bold   *ttf.Face // Inter Bold; optional
 	Italic *ttf.Face // Inter Italic; optional
+
+	// Reg, when set, is the manifest's registry (M99l): each rune resolves
+	// through a chain — the style's primary, then the role's other faces in
+	// order, then the symbol faces — so a rune the primary lacks paints the
+	// covering face's glyph instead of .notdef. The named faces above are
+	// the primaries the registry resolved, and stay the truth the markers
+	// report.
+	Reg *ttf.Registry
 }
 
 // FontFiles is the byte source for LoadFonts. Any field may be empty or
@@ -98,6 +106,24 @@ func LoadFonts(files FontFiles) Fonts {
 		Mono:   parseOptionalFace(files.Mono),
 		Bold:   parseOptionalFace(files.Bold),
 		Italic: parseOptionalFace(files.Italic),
+	}
+}
+
+// RegistryFonts builds the engine over a manifest registry: the named faces
+// are the registry's resolved primaries (loaded eagerly, as the hard-coded
+// path always did), and Reg carries the cascade so a rune a primary lacks
+// falls through to a covering face. A nil registry yields the zero engine —
+// the caller's bitmap fallback, same as a manifest-less boot.
+func RegistryFonts(reg *ttf.Registry) Fonts {
+	if reg == nil {
+		return Fonts{}
+	}
+	return Fonts{
+		UI:     reg.Primary(ttf.Query{Role: "ui"}),
+		Mono:   reg.Primary(ttf.Query{Role: "mono"}),
+		Bold:   reg.Primary(ttf.Query{Role: "ui", Bold: true}),
+		Italic: reg.Primary(ttf.Query{Role: "ui", Italic: true}),
+		Reg:    reg,
 	}
 }
 
@@ -165,6 +191,28 @@ func (f Fonts) face(st Style) *ttf.Face {
 	return f.UI
 }
 
+// chain resolves the cascade for a style when the engine was built from a
+// manifest. The query mirrors face()'s precedence — mono only when a mono
+// primary loaded, bold ahead of italic — so the chain picks the same primary
+// the face table would, then falls back per rune. nil means no registry, a
+// role the manifest does not list, or a primary that would not load: the
+// caller then uses today's single-face/bitmap path.
+func (f Fonts) chain(st Style) *ttf.Chain {
+	if f.Reg == nil {
+		return nil
+	}
+	q := ttf.Query{Role: "ui"}
+	if st.Mono && f.Mono != nil {
+		q.Role = "mono"
+	}
+	if st.Bold && f.Bold != nil {
+		q.Bold = true
+	} else if st.Italic && f.Italic != nil {
+		q.Italic = true
+	}
+	return f.Reg.Chain(q)
+}
+
 // px is the pixel size for a style. Style.Size is a logical scale (1 = body).
 func (f Fonts) px(st Style) int {
 	if st.FontPx > 0 {
@@ -182,6 +230,9 @@ func (f Fonts) px(st Style) int {
 
 // Measure implements TextEngine.
 func (f Fonts) Measure(text string, st Style) int {
+	if ch := f.chain(st); ch != nil {
+		return ch.Measure(text, f.px(st))
+	}
 	face := f.face(st)
 	if face == nil {
 		return Bitmap{}.Measure(text, st)
@@ -200,7 +251,9 @@ func (f Fonts) Advance(st Style) int {
 }
 
 // LineHeight implements TextEngine: the face's own ascent+descent+gap, plus a
-// pixel of leading so adjacent lines do not touch.
+// pixel of leading so adjacent lines do not touch. For a manifested engine
+// this is the PRIMARY face's metrics — the card's rule is that fallback
+// glyphs sit on the primary baseline and never move the line box.
 func (f Fonts) LineHeight(st Style) int {
 	if st.LineHeightPx > 0 {
 		return st.LineHeightPx
@@ -219,6 +272,9 @@ func (f Fonts) LineHeight(st Style) int {
 // Paint implements TextEngine. Text is anchored on the LINE BOX TOP the layout
 // produced; the engine converts that to the baseline it needs.
 func (f Fonts) Paint(s Surface, x, top int, text string, st Style, rgb uint32, c Clip) int {
+	if ch := f.chain(st); ch != nil {
+		return f.paintChain(s, x, top, text, st, rgb, c, ch)
+	}
 	face := f.face(st)
 	if face == nil {
 		return Bitmap{}.Paint(s, x, top, text, st, rgb, c)
@@ -249,6 +305,48 @@ func (f Fonts) Paint(s Surface, x, top int, text string, st Style, rgb uint32, c
 			}
 		}
 		pen += adv
+	}
+	return pen - x
+}
+
+// paintChain is Paint for a manifested engine: the chain splits the run at
+// face boundaries and each piece paints with its own face on the PRIMARY
+// face's baseline, so a fallback glyph sits in the line the primary set.
+// Measure walks the same Split, so the two can never disagree about a
+// rune's width — the rule the comparator gates on.
+func (f Fonts) paintChain(s Surface, x, top int, text string, st Style, rgb uint32, c Clip, ch *ttf.Chain) int {
+	px := f.px(st)
+	primary := ch.Primary()
+	if primary == nil {
+		return Bitmap{}.Paint(s, x, top, text, st, rgb, c)
+	}
+	asc, _, _ := primary.LineMetrics(px)
+	baseline := top + asc
+	pen := x
+	tabStep := primary.AdvancePx('M', px) * 4
+	for _, piece := range ch.Split(text) {
+		face := piece.Face
+		if face == nil {
+			continue
+		}
+		for _, r := range piece.Text {
+			if r == '\t' {
+				pen += tabStep
+				continue
+			}
+			m, adv, err := face.Glyph(face.GlyphIndex(r), px)
+			if err != nil {
+				pen += face.AdvancePx(r, px)
+				continue
+			}
+			if !m.Empty() {
+				blitMask(s, c, pen+m.BearingX, baseline-m.BearingY, m, rgb)
+				if st.Bold && f.Bold == nil {
+					blitMask(s, c, pen+m.BearingX+1, baseline-m.BearingY, m, rgb)
+				}
+			}
+			pen += adv
+		}
 	}
 	return pen - x
 }

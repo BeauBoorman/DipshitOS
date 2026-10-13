@@ -1,6 +1,7 @@
 package main
 
 import (
+	"virelai/ttf"
 	"virelai/vi"
 	"virelai/webrender"
 	"virelai/webstyle"
@@ -17,7 +18,16 @@ const (
 	fontBoldPath   = "/host/INTERB.TTF"
 	fontItalicPath = "/host/INTERI.TTF"
 	fontMonoPath   = "/host/FIRACODE.TTF"
+
+	// fontManifestPath is the M99l registry manifest, staged from
+	// image/fonts/fonts.txt. It is Go-registry input only — the frozen Zig
+	// engine never reads it (ADR 0034).
+	fontManifestPath = "/host/FONTS.TXT"
 )
+
+// maxManifestBytes bounds the manifest read; apps.txt's readers use the same
+// 4096-byte buffer for the same line format.
+const maxManifestBytes = 4096
 
 // maxFontBytes bounds one face read. Inter Regular is 411,640 bytes, Bold
 // 420,428, Italic 417,388, Fira Code 289,624 — 512 KiB holds each with room
@@ -59,24 +69,56 @@ func readWholeFile(path string, max int) []byte {
 	return out
 }
 
+// faceState is the per-role half of the `web: fonts` marker pair.
+func faceState(f *ttf.Face) string {
+	if f == nil {
+		return "missing"
+	}
+	return "truetype"
+}
+
+// loadRegistryEngine reads the staged manifest and builds the M99l cascade
+// engine over it. The second return is the marker payload —
+// "manifest=ok faces=N" or "manifest=malformed <why>" — and false means the
+// caller takes the no-manifest path (missing manifest, or a refused one per
+// the card's malformed-then-hard-coded rule).
+func loadRegistryEngine() (webrender.Fonts, string, bool) {
+	data := readWholeFile(fontManifestPath, maxManifestBytes)
+	if data == nil {
+		return webrender.Fonts{}, "manifest=missing", false
+	}
+	specs, err := ttf.ParseManifest(data)
+	if err != nil {
+		return webrender.Fonts{}, "manifest=malformed " + err.Error(), false
+	}
+	reg := ttf.NewRegistry(specs, func(file string) (*ttf.Face, error) {
+		return ttf.Parse(readWholeFile("/host/"+file, maxFontBytes))
+	})
+	// The card's `fonts: notdef=N` marker: every rune that exhausted its
+	// chain increments the count on the serial line.
+	reg.OnNotdef = func(n int) {
+		vi.ConsoleLine("fonts: notdef=" + itoa(n))
+	}
+	return webrender.RegistryFonts(reg), "manifest=ok faces=" + itoa(len(specs)), true
+}
+
 // loadTextEngine loads the staged faces and returns the engine to render with.
-// Any failure (a missing face, a short read, a rejected font) simply leaves
-// that face out, which is how the renderer reaches its documented fallback.
+// A valid manifest selects the registry engine; a missing or refused manifest
+// keeps today's four hard-coded faces. Either way the serial line says which
+// path was taken, so a gate can assert the manifest was honored rather than
+// silently ignored.
 func loadTextEngine() (webrender.Fonts, string, string) {
+	f, marker, ok := loadRegistryEngine()
+	vi.ConsoleLine("fonts: " + marker)
+	if ok {
+		return f, faceState(f.UI), faceState(f.Mono)
+	}
 	ui := readWholeFile(fontUIPath, maxFontBytes)
 	mono := readWholeFile(fontMonoPath, maxFontBytes)
 	bold := readWholeFile(fontBoldPath, maxFontBytes)
 	italic := readWholeFile(fontItalicPath, maxFontBytes)
-	f := webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic})
-	uiState := "truetype"
-	if f.UI == nil {
-		uiState = "missing"
-	}
-	monoState := "truetype"
-	if f.Mono == nil {
-		monoState = "missing"
-	}
-	return f, uiState, monoState
+	f = webrender.LoadFonts(webrender.FontFiles{UI: ui, Mono: mono, Bold: bold, Italic: italic})
+	return f, faceState(f.UI), faceState(f.Mono)
 }
 
 // textProbeString is the Inter-or-grid probe, published on the serial line.
