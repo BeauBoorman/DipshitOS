@@ -840,6 +840,8 @@ not `vgate_repeat`-safe.
 |-----|--------|
 | 01 | M103a (#2253): `FLINT.ELF parse-corpus /host/FLINTC` runs `go/parser` (`parser.SkipObjectResolution`) and FLINT's Go-native Zig declaration scanner in-guest over the 100-file corpus (50 `.go` + 50 `.zig`), prints `flint: parse files=100 atoms=245 parse_errors=0`, and writes `/host/FLINTC.OUT` byte-equal to the host's independent rendering of `MANIFEST.json` (`share-equals`) |
 | 02 | M103b (#2251): `GOSH.ELF -c "source /host/FLINTJ/02.SH"` runs `FLINT.ELF init --name=w --src=/host/FLINTW`, adds the 245-Atom corpus, verifies idempotent re-add (`new=0 modified=0 deleted=0 unchanged=245`), applies `sample-body.go` (body edit + `const Answer` removal) and `sample-ws.zig` (whitespace/comments only), re-adds (`modified=1 deleted=1 unchanged=243`), and verifies `status` (`atoms=244 staged=244 add=244 modify=0 delete=0 duplicates=0`), `WORKSPACE.json`, and 244 unique UUIDv7 rows in `ATOMS.jsonl` |
+| 03 | M103c (#2252): `GOSH.ELF -c "source /host/FLINTJ/03.SH"` continues workspace `w`, signs and commits the 244 staged adds via the app-bound `agent-sign` secret (`flint: commit ok id=<uuid> ops=244 parent=none`), prints `flint log` (`author=d75a9801 msg=initial corpus`), verifies the store (`verify --all` -> `sig: verified`) and the pinned RFC 8032 §7.1 TEST 1 vectors (`verify --file=/host/FLINTV/good.jsonl` -> `sig: verified`, `verify --file=/host/FLINTV/bad.jsonl` -> `sig_invalid`), and checks that `FLINT/streams/*.jsonl` has one line, the stream record `head` matches its id, and `STAGE.jsonl` is removed |
+| 04 | M103c (#2252): on `--cvc-file $RUN_DIR/nosign-share` (whose `SECRETS.TXT` is `#v1\n` only), `GOSH.ELF -c "source /host/FLINTJ/04.SH"` runs `init` -> `add` -> `commit` and proves `flint: refuse secret_not_found` with no `streams/*.jsonl` written and `STAGE.jsonl` left intact; every run asserts the signing seed hex is absent from serial and runner output |
 
 Host prerequisites:
 
@@ -854,10 +856,14 @@ Class-A coverage is `cd user/go && go test ./flint/... && go vet ./flint/...`:
 body edit, whitespace/comment, parameter edit, field reorder),
 `TestRefusals` (`anon_ret.zig` -> `parse_unsupported`, `bad.go` -> `syntax`),
 `TestCanon` (`testdata/canon/*.txt`), `TestZigOracle` (`zig run
-tools/flint/zigdecls.zig` over all 50 `.zig` files), plus the `memFS` store
+tools/flint/zigdecls.zig` over all 50 `.zig` files), the `memFS` store
 suite (`TestInitLayoutAndRefusals`, `TestUUIDv7MonotonicAndClockUnset`,
 `TestAddIdempotentAndEdits`, `TestStageFoldRulesAndStatus`,
-`TestParseErrorAndDuplicateDeclAllOrNothing`, `TestTornLineAndStoreBounds`).
+`TestParseErrorAndDuplicateDeclAllOrNothing`, `TestTornLineAndStoreBounds`),
+and the M103c signature/commit suite (`TestPinnedSigVectorsAndStdlibOracle`
+with `crypto/ed25519` independent oracle against `testdata/sig/`,
+`TestFlipAnySingleFieldFailsVerify`, `TestJSONKeyOrderAndWhitespaceInvariance`,
+`TestCommitLogVerifyAndRollForward`, `TestCommitAndVerifyRefusals`).
 
 ## Verification sequence
 

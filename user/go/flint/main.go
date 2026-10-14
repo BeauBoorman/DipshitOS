@@ -53,6 +53,12 @@ func run(args []string) int {
 		return runErr(cmdAdd(activeFS, storeRoot, defaultUUIDGen, args[1:]))
 	case "status":
 		return runErr(cmdStatus(activeFS, storeRoot, args[1:]))
+	case "commit":
+		return runErr(cmdCommit(activeFS, storeRoot, defaultUUIDGen, args[1:]))
+	case "log":
+		return runErr(cmdLog(activeFS, storeRoot, args[1:]))
+	case "verify":
+		return cmdVerify(activeFS, storeRoot, args[1:])
 	default:
 		consoleFn("flint: usage")
 		return 2
