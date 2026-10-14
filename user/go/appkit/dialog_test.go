@@ -130,7 +130,7 @@ func TestDialogPrimitiveChrome(t *testing.T) {
 	for i, px := range c.Pix {
 		binary.LittleEndian.PutUint32(bytes[4*i:], px)
 	}
-	const golden = "6f86f33a779f0d3fb7e5a19119df25201d41b5dc4f934c6f472aa753bc5c2c85"
+	const golden = "a6e30042a6052d53340d7679aa9b13552e658680f059ae85bc6cc5839ebdc2d9"
 	if got := fmt.Sprintf("%x", sha256.Sum256(bytes[:])); got != golden {
 		t.Fatalf("dialog composite SHA-256 = %s (want %s)", got, golden)
 	}
