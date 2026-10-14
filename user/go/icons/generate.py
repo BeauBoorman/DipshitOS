@@ -7,7 +7,7 @@ Host-only tool. It never modifies the external pipeline. Example:
     --out image/fonts/VirelaiChrome-Regular.ttf
 
 The base Virelai Sans cannot carry this inventory: its U+E001 is the
-sexiburger mark. This font contains only the twenty contract glyphs.
+sexiburger mark. This font contains only the thirty contract glyphs.
 """
 import argparse
 import math
@@ -23,7 +23,7 @@ def polygon(points, OutContour):
 
 
 def draw(p, geom, design):
-    """The twenty silhouettes, all on the pipeline's 1000 UPM grid."""
+    """The thirty silhouettes, all on the pipeline's 1000 UPM grid."""
     pt, Arc, OutContour = geom.pt, geom.Arc, geom.OutContour
 
     def line(a, b):
@@ -92,7 +92,46 @@ def draw(p, geom, design):
         p.arc(pt(500, 360), 230, 0, 180)
         + [box(190, 0, 810, 385)]
     )
-    assert len(shapes) == 20 and sorted(shapes) == list(range(0xE000, 0xE014))
+    # Batch 2 (contract v2, M104g): the controls/seat shapes, same pen.
+    shapes[0xE014] = (
+        line((250, 520), (750, 520))
+        + line((250, 330), (750, 330))
+        + line((250, 140), (750, 140))
+    )
+    shapes[0xE015] = [disk(500, 120, 75), disk(500, 330, 75), disk(500, 540, 75)]
+    shapes[0xE016] = [polygon([pt(310, 100), pt(310, 560), pt(700, 330)],
+                             OutContour)]
+    shapes[0xE017] = line((380, 90), (380, 570)) + line((620, 90), (620, 570))
+    shapes[0xE018] = [box(260, 90, 740, 570)]
+    # Dome, flared sides, rim and clapper; the dnd variant adds a slash.
+    bell = (
+        p.arc(pt(500, 390), 195, 0, 180)
+        + line((305, 390), (250, 170))
+        + line((695, 390), (750, 170))
+        + line((225, 170), (775, 170))
+        + [disk(500, 50, 62)]
+    )
+    shapes[0xE019] = bell
+    shapes[0xE01A] = bell + line((250, 610), (750, 50))
+    # Speaker box and cone; volume adds two waves, mute a slash instead.
+    speaker = [polygon([
+        pt(180, 250), pt(180, 410), pt(340, 410),
+        pt(560, 580), pt(560, 80), pt(340, 250),
+    ], OutContour)]
+    shapes[0xE01B] = (
+        speaker
+        + p.arc(pt(550, 330), 135, -50, 100, cap=("round",))
+        + p.arc(pt(550, 330), 295, -50, 100, cap=("round",))
+    )
+    shapes[0xE01C] = speaker + line((240, 580), (720, 60))
+    # Grip stripes nest toward the bottom-right corner; the innermost is
+    # a short mark, matching the long/medium/nub silhouette of a SE grip.
+    shapes[0xE01D] = (
+        line((330, 70), (790, 530))
+        + line((560, 70), (790, 300))
+        + line((780, 70), (800, 90))
+    )
+    assert len(shapes) == 30 and sorted(shapes) == list(range(0xE000, 0xE01E))
     return shapes
 
 
@@ -146,10 +185,10 @@ def main():
     font.close()
     check = TTFont(str(args.out))
     cmap = check.getBestCmap()
-    assert set(cmap) == set(range(0xE000, 0xE014)), sorted(cmap)
+    assert set(cmap) == set(range(0xE000, 0xE01E)), sorted(cmap)
     assert check["head"].unitsPerEm == 1000
     check.close()
-    print(f"wrote {args.out}: twenty chrome glyphs at 1000 UPM")
+    print(f"wrote {args.out}: thirty chrome glyphs at 1000 UPM")
 
 
 if __name__ == "__main__":
