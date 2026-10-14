@@ -3,8 +3,11 @@ package appkit
 import (
 	"unicode/utf8"
 
+	"virelai/draw"
 	"virelai/layout"
 	"virelai/shlib"
+	"virelai/theme"
+	"virelai/ttf"
 	"virelai/widgets"
 )
 
@@ -132,6 +135,10 @@ func (c *ListController) ensureVisible() {
 // A field created without SetLayout has no dead keys and behaves as a plain
 // editor. With a layout, a dead key stages an accent that shows in the field
 // (see Preedit) until the next key resolves it.
+//
+// Face is the §3.4 optional TrueType label face — nil keeps the 8x8 bitmap
+// face. Disabled drops text to the Muted role and blends the plate 50%
+// toward Surface (§2.3).
 type TextField struct {
 	R           widgets.Rect
 	Buffer      shlib.LineBuffer
@@ -139,6 +146,8 @@ type TextField struct {
 	Bg          uint32
 	Caret       uint32
 	Focused     bool
+	Disabled    bool
+	Face        *ttf.Face
 	Max         int
 	Prefix      string
 	Placeholder string
@@ -330,6 +339,9 @@ func (f *TextField) OnClick(x, y int) bool {
 // glyphW is the 8x8 face's advance, and so the width of one text cell.
 const glyphW = 8
 
+// labelPx is the §2.2 chrome label size for the TrueType path.
+const labelPx = 13
+
 func (f *TextField) Draw(c widgets.RectCanvas) {
 	if f.R.Empty() {
 		return
@@ -343,6 +355,13 @@ func (f *TextField) Draw(c widgets.RectCanvas) {
 	}
 	if f.Caret == 0 {
 		f.Caret = 0x3b82f6
+	}
+	if fc, ok := c.(widgets.Canvas); ok {
+		f.drawCanvas(fc, fg, bg)
+		return
+	}
+	if f.Disabled {
+		fg = theme.Current.Muted
 	}
 	c.FillRect(f.R, bg)
 	// The existing widget text painter is intentionally reused. The caret is a
@@ -384,6 +403,101 @@ func (f *TextField) Draw(c widgets.RectCanvas) {
 		}
 		c.FillRect(widgets.Rect{X: x, Y: f.R.Y + 2, W: 2, H: f.R.H - 4}, f.Caret)
 	}
+}
+
+// drawCanvas is the full-Canvas form of Draw: the §2.2 rounded recessed plate
+// with a border and an inside focus ring, and text through Canvas.Text — the
+// face's own advances when Face is set, the bitmap degrade (which never
+// blanks the label) when it is not.
+func (f *TextField) drawCanvas(c widgets.Canvas, fg, bg uint32) {
+	th := theme.Current
+	if f.Disabled {
+		fg = th.Muted
+		bg = blendHalf(bg, th.Surface)
+	}
+	c.FillRoundedRect(f.R, 4, draw.Opaque(bg))
+	c.StrokeRoundedRect(f.R, 4, th.BorderW, draw.Opaque(th.Border))
+	if f.Focused && !f.Disabled {
+		c.StrokeRoundedRect(f.R, 4, th.FocusW, draw.Opaque(th.Accent))
+	}
+	inner := f.R.Inset(th.BorderW)
+	if inner.Empty() {
+		return
+	}
+	x0 := inner.X + th.PadXS
+	// advance measures a run in Face pixels, or in 8px cells when the bitmap
+	// fallback is painting — the preedit splits the run either way.
+	advance := func(s string) int {
+		if f.Face == nil {
+			return utf8.RuneCountInString(s) * glyphW
+		}
+		w := 0
+		for _, r := range s {
+			w += f.Face.AdvancePx(r, labelPx)
+		}
+		return w
+	}
+	v, caret := f.Value(), f.Buffer.Caret()
+	before, after := f.Prefix+v[:caret], v[caret:]
+	caretX := x0 + advance(before)
+	if pre := f.stage.Preedit(); pre != "" {
+		f.paintRun(c, inner, x0, before, fg)
+		f.paintRun(c, inner, x0+advance(before), pre, f.Caret)
+		f.paintRun(c, inner, x0+advance(before)+advance(pre), after, fg)
+		// The underline sits just under the staged accent — the face's
+		// descender line, or one row under the bitmap glyph like Draw does.
+		uy := inner.Y + 2 + (inner.H-4-8)/2 + 8
+		if uy < inner.Y+2 {
+			uy = inner.Y + 2
+		}
+		if f.Face != nil {
+			asc, desc, _ := f.Face.LineMetrics(labelPx)
+			uy = inner.Y + (inner.H-asc-desc)/2 + asc + desc
+		}
+		if uy >= inner.Bottom() {
+			uy = inner.Bottom() - 1
+		}
+		c.FillRect(widgets.Rect{X: x0 + advance(before), Y: uy, W: advance(pre), H: 1}, draw.Opaque(f.Caret))
+		caretX += advance(pre)
+	} else {
+		text := f.Prefix + v
+		if text == "" && f.Placeholder != "" {
+			text = f.Placeholder
+		}
+		f.paintRun(c, inner, x0, text, fg)
+	}
+	if f.Focused {
+		if caretX >= inner.Right()-2 {
+			caretX = inner.Right() - 3
+		}
+		if caretX < x0 {
+			caretX = x0
+		}
+		c.FillRect(widgets.Rect{X: caretX, Y: inner.Y + 2, W: 2, H: inner.H - 4}, draw.Opaque(f.Caret))
+	}
+}
+
+// paintRun paints s with the pen at x through Canvas.Text. A nil face keeps
+// §3.4's bitmap degrade — which anchors at the plate's own inset, so the clip
+// is shifted to land the run at x.
+func (f *TextField) paintRun(c widgets.Canvas, clip widgets.Rect, x int, s string, rgb uint32) {
+	if s == "" {
+		return
+	}
+	y := 0
+	if f.Face != nil {
+		asc, desc, _ := f.Face.LineMetrics(labelPx)
+		y = clip.Y + (clip.H-asc-desc)/2 + asc
+	} else {
+		clip = widgets.Rect{X: x - 2, Y: clip.Y, W: clip.Right() - x + 2, H: clip.H}
+	}
+	c.Text(f.Face, clip, x, y, labelPx, s, draw.Opaque(rgb))
+}
+
+// blendHalf is the §2.3 disabled blend: 50% per-channel toward b. Kept local
+// so appkit needs no new export from widgets for one formula.
+func blendHalf(a, b uint32) uint32 {
+	return (a & b) + (((a ^ b) >> 1) & 0x7f7f7f)
 }
 
 // cellPlate is the field's plate shifted right by col text cells, so a run
