@@ -14,6 +14,11 @@ func TestContractInventory(t *testing.T) {
 		{0xE00E, "folder"}, {0xE00F, "file"},
 		{0xE010, "warning-triangle"}, {0xE011, "error-circle"},
 		{0xE012, "info-circle"}, {0xE013, "lock"},
+		{0xE014, "menu"}, {0xE015, "kebab"},
+		{0xE016, "media-play"}, {0xE017, "media-pause"},
+		{0xE018, "media-stop"}, {0xE019, "bell"},
+		{0xE01A, "bell-dnd"}, {0xE01B, "volume"},
+		{0xE01C, "volume-mute"}, {0xE01D, "resize-grip"},
 	}
 	if Inventory != want {
 		t.Fatalf("chrome inventory drifted from docs/ui-primitives.md §4:\ngot  %v\nwant %v", Inventory, want)
@@ -29,7 +34,7 @@ func TestContractInventory(t *testing.T) {
 			t.Errorf("Codepoint(%q) = %U, %v", glyph.Name, cp, ok)
 		}
 	}
-	for _, cp := range []rune{0, 0xDFFF, 0xE014, 0xF000} {
+	for _, cp := range []rune{0, 0xDFFF, 0xE01E, 0xF000} {
 		if _, ok := Name(cp); ok {
 			t.Errorf("Name(%U) unexpectedly exists", cp)
 		}

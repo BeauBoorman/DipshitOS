@@ -1,4 +1,4 @@
-// Package icons names the twenty M86a chrome glyphs in Virelai Chrome.
+// Package icons names the thirty M86a/M104g chrome glyphs in Virelai Chrome.
 // The companion font keeps this PUA range separate from Virelai Sans, whose
 // U+E001 is already the sexiburger mark. See docs/ui-primitives.md §4.
 package icons
@@ -38,10 +38,20 @@ var Inventory = [...]Glyph{
 	{0xE011, "error-circle"},
 	{0xE012, "info-circle"},
 	{0xE013, "lock"},
+	{0xE014, "menu"},
+	{0xE015, "kebab"},
+	{0xE016, "media-play"},
+	{0xE017, "media-pause"},
+	{0xE018, "media-stop"},
+	{0xE019, "bell"},
+	{0xE01A, "bell-dnd"},
+	{0xE01B, "volume"},
+	{0xE01C, "volume-mute"},
+	{0xE01D, "resize-grip"},
 }
 
 func Name(codepoint rune) (string, bool) {
-	if codepoint < 0xE000 || codepoint > 0xE013 {
+	if codepoint < 0xE000 || codepoint > 0xE01D {
 		return "", false
 	}
 	return Inventory[codepoint-0xE000].Name, true

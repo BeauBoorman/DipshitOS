@@ -12,8 +12,8 @@ import (
 const chromePath = "../../../image/fonts/" + icons.FontFile
 
 // The exact shipped binary is pinned, not just the Python drawing recipe.
-// A regenerated font needs a new digest and a review of all twenty goldens.
-const chromeSHA256 = "07c510860f101847f3a43db40cd7dca403011583727ecc2de5e5fe05a894d773"
+// A regenerated font needs a new digest and a review of all thirty goldens.
+const chromeSHA256 = "1c9f7aea8fbec2dbd76715fd4f89312089610abc24fb570fb5da9580634e937a"
 const chromeLicenseSHA256 = "ea2392e36ae4638e52c695fef75a6012d784aa536667e787077ac5ca1a262ea9"
 
 func chromeFace(t *testing.T) *Face {
@@ -32,8 +32,8 @@ func chromeFace(t *testing.T) *Face {
 	}
 	f := loadFace(t, chromePath)
 	if f.UnitsPerEm() != 1000 || f.NumGlyphs() != len(icons.Inventory)+3 {
-		t.Fatalf("chrome font has %d UPM, %d glyphs; want 1000, 23",
-			f.UnitsPerEm(), f.NumGlyphs())
+		t.Fatalf("chrome font has %d UPM, %d glyphs; want 1000, %d",
+			f.UnitsPerEm(), f.NumGlyphs(), len(icons.Inventory)+3)
 	}
 	for i, glyph := range icons.Inventory {
 		gid := f.GlyphIndex(glyph.Codepoint)
@@ -50,7 +50,7 @@ func chromeFace(t *testing.T) *Face {
 			}
 		}
 	}
-	for cp := rune(0xE014); cp <= 0xE0FF; cp++ {
+	for cp := rune(0xE01E); cp <= 0xE0FF; cp++ {
 		if f.GlyphIndex(cp) != 0 {
 			t.Fatalf("off-contract PUA slot %U has a glyph", cp)
 		}
