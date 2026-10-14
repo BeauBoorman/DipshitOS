@@ -21,72 +21,88 @@ type Tokens struct {
 	InkMuted                   uint32
 	PadXS, PadSM, PadMD, PadLG int
 	BorderW, FocusW            int
+	// M104a (contract v2, #2268): the depth roles. Shadow is the
+	// drop-shadow ink — the caller supplies the falloff alpha (the
+	// contract pins 0x40 peak at dy=4/blur=16). WallpaperTop/WallpaperBot
+	// are the seat desktop gradient endpoints, matching the kernel's
+	// wallpaper_top/wallpaper_bot (driving_award.zig) so a Go-seat
+	// desktop and the kernel's fixed layer read identically. Go-only:
+	// no Zig table carries these, so the byte-parity tests pin nothing
+	// here.
+	Shadow                     uint32
+	WallpaperTop, WallpaperBot uint32
 }
 
 // Dark is the boot-default palette. Hexes are byte-identical to Zig
 // THEME_DARK / CHROME_DARK for bg, surface, border, text, muted, accent,
 // buttons, danger, caret, on-accent.
 var Dark = Tokens{
-	Bg:         0x182026,
-	Surface:    0x222d35,
-	Border:     0x334155,
-	Text:       0xffffff,
-	Muted:      0x94a3b8,
-	Accent:     0x3b82f6,
-	BtnIdle:    0x2d3748,
-	BtnHover:   0x4a5568,
-	BtnPressed: 0x1a202c,
-	Success:    0x22c55e,
-	Danger:     0xef4444,
-	Warning:    0xf59e0b,
-	OnAccent:   0xffffff,
-	Caret:      0x3b82f6,
-	Selection:  0x2a4460,
-	Gutter:     0x0b0e11,
-	Ink:        0xe6edf3,
-	InkMuted:   0x8b98a5,
-	ChromeBg:   0x11171c,
-	Rule:       0x2e3a44,
-	Ok:         0x3fb950,
-	PadXS:      2,
-	PadSM:      4,
-	PadMD:      8,
-	PadLG:      16,
-	BorderW:    1,
-	FocusW:     2,
+	Bg:           0x182026,
+	Surface:      0x222d35,
+	Border:       0x334155,
+	Text:         0xffffff,
+	Muted:        0x94a3b8,
+	Accent:       0x3b82f6,
+	BtnIdle:      0x2d3748,
+	BtnHover:     0x4a5568,
+	BtnPressed:   0x1a202c,
+	Success:      0x22c55e,
+	Danger:       0xef4444,
+	Warning:      0xf59e0b,
+	OnAccent:     0xffffff,
+	Caret:        0x3b82f6,
+	Selection:    0x2a4460,
+	Gutter:       0x0b0e11,
+	Ink:          0xe6edf3,
+	InkMuted:     0x8b98a5,
+	ChromeBg:     0x11171c,
+	Rule:         0x2e3a44,
+	Ok:           0x3fb950,
+	PadXS:        2,
+	PadSM:        4,
+	PadMD:        8,
+	PadLG:        16,
+	BorderW:      1,
+	FocusW:       2,
+	Shadow:       0x000000,
+	WallpaperTop: 0x1a1a2e,
+	WallpaperBot: 0x0a0a14,
 }
 
 // Light matches Zig THEME_LIGHT / CHROME_LIGHT. Applied when a Go client
 // reads schema-v2 `theme=light` from SETTINGS.TXT. No amber: no Go reader
 // of `theme=amber` exists yet (#1530 D3-adjacent).
 var Light = Tokens{
-	Bg:         0xf1f5f9,
-	Surface:    0xffffff,
-	Border:     0xcbd5e1,
-	Text:       0x0f172a,
-	Muted:      0x64748b,
-	Accent:     0x2563eb,
-	BtnIdle:    0xe2e8f0,
-	BtnHover:   0xcbd5e1,
-	BtnPressed: 0x94a3b8,
-	Success:    0x16a34a,
-	Danger:     0xdc2626,
-	Warning:    0xd97706,
-	OnAccent:   0xffffff,
-	Caret:      0x2563eb,
-	Selection:  0xbfdbfe,
-	Gutter:     0xe5e7eb,
-	Ink:        0x0f172a,
-	InkMuted:   0x64748b,
-	ChromeBg:   0xe2e8f0,
-	Rule:       0xcbd5e1,
-	Ok:         0x16a34a,
-	PadXS:      2,
-	PadSM:      4,
-	PadMD:      8,
-	PadLG:      16,
-	BorderW:    1,
-	FocusW:     2,
+	Bg:           0xf1f5f9,
+	Surface:      0xffffff,
+	Border:       0xcbd5e1,
+	Text:         0x0f172a,
+	Muted:        0x64748b,
+	Accent:       0x2563eb,
+	BtnIdle:      0xe2e8f0,
+	BtnHover:     0xcbd5e1,
+	BtnPressed:   0x94a3b8,
+	Success:      0x16a34a,
+	Danger:       0xdc2626,
+	Warning:      0xd97706,
+	OnAccent:     0xffffff,
+	Caret:        0x2563eb,
+	Selection:    0xbfdbfe,
+	Gutter:       0xe5e7eb,
+	Ink:          0x0f172a,
+	InkMuted:     0x64748b,
+	ChromeBg:     0xe2e8f0,
+	Rule:         0xcbd5e1,
+	Ok:           0x16a34a,
+	PadXS:        2,
+	PadSM:        4,
+	PadMD:        8,
+	PadLG:        16,
+	BorderW:      1,
+	FocusW:       2,
+	Shadow:       0x0f172a,
+	WallpaperTop: 0xf1f5f9,
+	WallpaperBot: 0xe2e8f0,
 }
 
 // Current is the active table. Boot default is Dark.

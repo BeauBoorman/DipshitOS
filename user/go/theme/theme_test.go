@@ -78,3 +78,20 @@ func TestBootDefaultIsDark(t *testing.T) {
 		t.Fatal("package default must be dark")
 	}
 }
+
+func TestDepthTokensV2(t *testing.T) {
+	// M104a (#2268): Go-only roles — no Zig table carries them, so these
+	// pin the contract's chosen values, not a Zig byte-parity.
+	if Dark.Shadow != 0x000000 || Light.Shadow != 0x0f172a {
+		t.Fatalf("shadow ink %#x/%#x", Dark.Shadow, Light.Shadow)
+	}
+	// The seat desktop gradient endpoints match the kernel's
+	// wallpaper_top/bot for dark and light (driving_award.zig), so the
+	// Go-seat desktop reads identically to the kernel's fixed layer.
+	if Dark.WallpaperTop != 0x1a1a2e || Dark.WallpaperBot != 0x0a0a14 {
+		t.Fatalf("dark wallpaper %#x -> %#x", Dark.WallpaperTop, Dark.WallpaperBot)
+	}
+	if Light.WallpaperTop != 0xf1f5f9 || Light.WallpaperBot != 0xe2e8f0 {
+		t.Fatalf("light wallpaper %#x -> %#x", Light.WallpaperTop, Light.WallpaperBot)
+	}
+}
