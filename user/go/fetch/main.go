@@ -231,9 +231,8 @@ func (a *app) handle(ev vi.Event) bool {
 }
 
 func (a *app) draw() {
-	var f vi.Filler
-	f.Rect(a.ta.Win, 0, 0, a.ta.W, a.ta.H, 0x101418)
-	cv := &draw.FillerCanvas{Filler: &f, WindowID: a.ta.Win}
+	cv := a.ta.Canvas()
+	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(0x101418))
 	a.title = widgets.Text{
 		R:     scaleR(a.ta, widgets.Rect{X: 8, Y: 8, W: int(natW) - 16, H: 20}),
 		Label: appTitle,
@@ -255,7 +254,6 @@ func (a *app) draw() {
 	a.title.Draw(cv)
 	a.body.Draw(cv)
 	a.stat.Draw(cv)
-	f.Flush()
 }
 
 func scaleR(ta *tabapp.TabApp, r widgets.Rect) widgets.Rect {

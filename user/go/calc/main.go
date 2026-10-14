@@ -529,15 +529,13 @@ func (a *app) layout() {
 
 func (a *app) draw() {
 	a.layout()
-	var f vi.Filler
-	f.Rect(a.ta.Win, 0, 0, a.ta.W, a.ta.H, tabapp.FillRGB())
-	cv := &draw.FillerCanvas{Filler: &f, WindowID: a.ta.Win}
+	cv := a.ta.Canvas()
+	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(tabapp.FillRGB()))
 	a.hist.Draw(cv)
 	a.disp.Draw(cv)
 	for i := range a.keys {
 		a.keys[i].Draw(cv)
 	}
-	f.Flush()
 }
 
 func scaleR(ta *tabapp.TabApp, r widgets.Rect) widgets.Rect {

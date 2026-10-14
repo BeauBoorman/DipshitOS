@@ -3,6 +3,8 @@ package main
 import (
 	"unicode/utf8"
 
+	"virelai/draw"
+	"virelai/theme"
 	"virelai/vi"
 	"virelai/widgets"
 )
@@ -253,15 +255,73 @@ func (f *textField) Draw(c widgets.RectCanvas) {
 	if f.R.Empty() {
 		return
 	}
-	c.FillRect(f.R, f.Bg)
+	// Opaque at the canvas boundary: the raster path honours alpha where the
+	// kernel fill batcher always forced X=ff.
+	c.FillRect(f.R, draw.Opaque(f.Bg))
 	text := f.Prefix + f.value
 	if text == "" {
 		text = f.Placeholder
 	}
-	widgets.DrawText(c, f.R, text, f.Fg)
+	widgets.DrawText(c, f.R, text, draw.Opaque(f.Fg))
 	if f.Focused {
 		col := utf8.RuneCountInString(f.Prefix + f.value[:f.caret])
 		x := max(f.R.X+2, min(f.R.X+2+col*8, f.R.Right()-3))
-		c.FillRect(widgets.Rect{X: x, Y: f.R.Y + 2, W: 2, H: f.R.H - 4}, f.Caret)
+		c.FillRect(widgets.Rect{X: x, Y: f.R.Y + 2, W: 2, H: f.R.H - 4}, draw.Opaque(f.Caret))
+	}
+}
+
+// dropdownCtl is GOSET's vocabulary popover — the dropdown adoption (M104d's
+// control) without appkit.Dropdown, which would drag shlib's builtin table
+// past the image budget (the same reason the bounded textField lives here).
+// The anchor row's own vocabulary is the option list; the kernel reader
+// stays the authority on what a saved value means.
+type dropdownCtl struct {
+	open  bool
+	key   string
+	r     widgets.Rect // the popover plate
+	rowH  int
+	vocab []string
+}
+
+// openAt parks the popover under the anchor row, flipping above it when the
+// options would run off the window's bottom edge.
+func (d *dropdownCtl) openAt(key string, vocab []string, anchor widgets.Rect, winH int) {
+	d.key, d.vocab, d.rowH = key, vocab, 18
+	d.r = widgets.Rect{X: anchor.Right() - 148, Y: anchor.Y + anchor.H,
+		W: 140, H: len(vocab) * d.rowH}
+	if d.r.Bottom() > winH {
+		d.r.Y = anchor.Y - d.r.H
+	}
+	d.open = true
+}
+
+// optionAt is the popover row under (x,y), or -1 outside it.
+func (d *dropdownCtl) optionAt(x, y int) int {
+	if !d.r.Contains(x, y) || d.rowH <= 0 {
+		return -1
+	}
+	i := (y - d.r.Y) / d.rowH
+	if i < 0 || i >= len(d.vocab) {
+		return -1
+	}
+	return i
+}
+
+// Draw paints the plate: a surface plate with the border, then one option
+// row per vocabulary entry with the current value highlighted.
+func (d *dropdownCtl) Draw(c widgets.RectCanvas, cur string) {
+	if d.r.Empty() {
+		return
+	}
+	th := theme.Current
+	c.FillRect(d.r, draw.Opaque(th.Border))
+	c.FillRect(d.r.Inset(1), draw.Opaque(th.Surface))
+	for i, v := range d.vocab {
+		rr := widgets.Rect{X: d.r.X + 1, Y: d.r.Y + i*d.rowH, W: d.r.W - 2, H: d.rowH}
+		fg := th.Text
+		if v == cur {
+			c.FillRect(rr, draw.Opaque(th.Selection))
+		}
+		widgets.DrawText(c, rr.Inset(4), v, draw.Opaque(fg))
 	}
 }

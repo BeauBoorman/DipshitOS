@@ -13,11 +13,13 @@ package main
 import (
 	"errors"
 
+	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/webrender"
 	"virelai/webrender/font"
+	"virelai/widgets"
 )
 
 const (
@@ -439,27 +441,28 @@ func (a *app) dragPan(curX, curY int) bool {
 // Painting
 // ---------------------------------------------------------------------------
 
-// fillerSurface is the webrender.Surface the fill batcher implements: one
-// rect per span. Text goes through webrender.DrawText so the viewer shares the
-// seat's 8x8 face instead of carrying a second glyph table.
-type fillerSurface struct {
-	f   *vi.Filler
-	win int
+// canvasSurface is the webrender.Surface the bound window canvas implements:
+// one rect per span, Opaque at the boundary so the raster path writes the
+// same bytes the kernel's fill batcher forced (it always made pixels X=ff).
+// Text goes through webrender.DrawText so the viewer shares the seat's 8x8
+// face instead of carrying a second glyph table.
+type canvasSurface struct {
+	cv widgets.Canvas
 }
 
-func (s *fillerSurface) Fill(x, y, w, h int, rgb uint32) {
+func (s *canvasSurface) Fill(x, y, w, h int, rgb uint32) {
 	if w <= 0 || h <= 0 || x < 0 || y < 0 {
 		return
 	}
-	s.f.Rect(s.win, uint32(x), uint32(y), uint32(w), uint32(h), rgb)
+	s.cv.FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
 }
 
 func (a *app) draw() {
 	vp := a.viewport()
-	var f vi.Filler
-	surf := &fillerSurface{f: &f, win: a.ta.Win}
+	cv := a.ta.Canvas()
+	surf := &canvasSurface{cv: cv}
 	// Window ground: the token table's Bg, so a resize never shows garbage.
-	f.Rect(a.ta.Win, 0, 0, a.ta.W, a.ta.H, theme.Current.Bg)
+	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(theme.Current.Bg))
 	a.drawBackdrop(surf, vp)
 	switch a.st {
 	case loadOkay:
@@ -471,12 +474,11 @@ func (a *app) draw() {
 	}
 	a.drawTitleBand(surf, vp)
 	a.drawStatus(surf, vp)
-	f.Flush()
 }
 
 // drawBackdrop is VIEW.BIN's checkerboard: transparent image pixels show it
 // through, so "the file painted nothing here" is visible rather than black.
-func (a *app) drawBackdrop(s *fillerSurface, vp viewport) {
+func (a *app) drawBackdrop(s *canvasSurface, vp viewport) {
 	const cell uint32 = 8
 	for cy := uint32(0); cy < vp.H; cy += cell {
 		for cx := uint32(0); cx < vp.W; cx += cell {
@@ -494,7 +496,7 @@ func (a *app) drawBackdrop(s *fillerSurface, vp viewport) {
 // blit is a straight port of view.zig's blit_view: nearest-neighbour
 // crop+scale from the pan origin, one span per same-colour run, transparent
 // pixels skipped so the backdrop shows.
-func (a *app) blit(s *fillerSurface, vp viewport) {
+func (a *app) blit(s *canvasSurface, vp viewport) {
 	if a.img == nil || a.iw == 0 || a.ih == 0 {
 		return
 	}
@@ -559,14 +561,14 @@ func (a *app) titleText() string {
 	return a.name
 }
 
-func (a *app) drawTitleBand(s *fillerSurface, vp viewport) {
+func (a *app) drawTitleBand(s *canvasSurface, vp viewport) {
 	s.Fill(0, 0, int(a.ta.W), titleBandH, theme.Current.Surface)
 	s.Fill(0, titleBandH, int(a.ta.W), 1, theme.Current.Border)
 	clip := webrender.Clip{X: 0, Y: 0, W: int(a.ta.W), H: titleBandH}
 	webrender.DrawText(s, 4, 4, webrender.UpperASCII(a.titleText()), 1, false, theme.Current.Text, clip)
 }
 
-func (a *app) drawStatus(s *fillerSurface, vp viewport) {
+func (a *app) drawStatus(s *canvasSurface, vp viewport) {
 	barY := int(vp.Y + vp.H)
 	s.Fill(0, barY, int(a.ta.W), statusH, theme.Current.Surface)
 	text := u32s(a.zoom()) + "%  +/- zoom  0 reset  arrows/drag pan"
@@ -577,13 +579,13 @@ func (a *app) drawStatus(s *fillerSurface, vp viewport) {
 	webrender.DrawText(s, 4, barY+2, webrender.UpperASCII(text), 1, false, theme.Current.Muted, clip)
 }
 
-func (a *app) drawEmpty(s *fillerSurface, vp viewport) {
+func (a *app) drawEmpty(s *canvasSurface, vp viewport) {
 	centred(s, vp, 1, appName, theme.Current.Text)
 	centred(s, vp, 2, "no image loaded", theme.Current.Muted)
 	centred(s, vp, 3, "exec GOVIEW.ELF /host/FILE.QOI", theme.Current.Muted)
 }
 
-func (a *app) drawError(s *fillerSurface, vp viewport) {
+func (a *app) drawError(s *canvasSurface, vp viewport) {
 	centred(s, vp, 1, "cannot open", theme.Current.Danger)
 	centred(s, vp, 2, loadSummary(a.st, a.name), theme.Current.Muted)
 	centred(s, vp, 3, "stay open - q quits", theme.Current.Muted)
@@ -591,7 +593,7 @@ func (a *app) drawError(s *fillerSurface, vp viewport) {
 
 // centred paints one line of the empty/error state. line 1 is the headline and
 // is drawn in the accent-adjacent slot, the rest are body text.
-func centred(s *fillerSurface, vp viewport, line int, text string, rgb uint32) {
+func centred(s *canvasSurface, vp viewport, line int, text string, rgb uint32) {
 	shown := webrender.UpperASCII(text)
 	advance := font.Advance(1)
 	if advance < 1 {

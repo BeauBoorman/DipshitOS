@@ -9,9 +9,11 @@
 package main
 
 import (
+	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/vi"
 	"virelai/webrender/font"
+	"virelai/widgets"
 )
 
 const (
@@ -41,11 +43,10 @@ const (
 	colFail = uint32(0xf85149)
 )
 
-// app is the shell state: the tab surface, the verdicts, and the fill batcher.
+// app is the shell state: the tab surface and the verdicts.
 type app struct {
 	ta *tabapp.TabApp
 	rs []result
-	f  vi.Filler
 }
 
 func main() {
@@ -163,13 +164,14 @@ func main() {
 
 // draw paints the whole frame: title, one row per case, and the summary line.
 func (a *app) draw() {
+	cv := a.ta.Canvas()
 	w, h := int(a.ta.W), int(a.ta.H)
 	if w <= 0 || h <= 0 {
 		w, h = natW, natH
 	}
-	a.fill(0, 0, w, h, colBg)
-	a.text(16, 16, "GOSELF self-test", colInk)
-	a.text(16, 32, "the guest writes the report; the host reads it", colDim)
+	a.fill(cv, 0, 0, w, h, colBg)
+	a.text(cv, 16, 16, "GOSELF self-test", colInk)
+	a.text(cv, 16, 32, "the guest writes the report; the host reads it", colDim)
 
 	y := 60
 	for _, r := range a.rs {
@@ -181,21 +183,20 @@ func (a *app) draw() {
 		if !r.ok && r.detail != "" {
 			line += "  " + r.detail
 		}
-		a.text(16, y, line, rgb)
+		a.text(cv, 16, y, line, rgb)
 		y += 12
 	}
 
-	a.text(16, y+12, summaryLine(a.rs), colInk)
+	a.text(cv, 16, y+12, summaryLine(a.rs), colInk)
 	if len(a.rs) > 0 && failed(a.rs) == 0 {
-		a.text(16, y+28, "selftest OK", colPass)
+		a.text(cv, 16, y+28, "selftest OK", colPass)
 	}
-	_ = a.f.Flush()
 }
 
 // text paints ASCII with the 8x8 face, coalescing each row's lit run into ONE
 // fill (the go-edit text path: the full webrender package drags in layout +
 // HTML and the Go runtime's init then exceeds the kernel's sbrk budget).
-func (a *app) text(x, y int, s string, rgb uint32) {
+func (a *app) text(cv widgets.Canvas, x, y int, s string, rgb uint32) {
 	cx := x
 	for i := 0; i < len(s); i++ {
 		g := font.Glyph8(rune(s[i]))
@@ -211,7 +212,7 @@ func (a *app) text(x, y int, s string, rgb uint32) {
 				for col+run < 8 && bits&(1<<uint(col+run)) != 0 {
 					run++
 				}
-				a.fill(cx+col, y+row, run, 1, rgb)
+				a.fill(cv, cx+col, y+row, run, 1, rgb)
 				col += run
 			}
 		}
@@ -219,10 +220,11 @@ func (a *app) text(x, y int, s string, rgb uint32) {
 	}
 }
 
-// fill clamps one rectangle into the frame and queues it.
-func (a *app) fill(x, y, w, h int, rgb uint32) {
+// fill clamps one rectangle into the frame and paints it. Opaque mirrors the
+// kernel fill's byte contract (it always wrote X=ff) on the raster path.
+func (a *app) fill(cv widgets.Canvas, x, y, w, h int, rgb uint32) {
 	if w <= 0 || h <= 0 || x < 0 || y < 0 {
 		return
 	}
-	a.f.Rect(a.ta.Win, uint32(x), uint32(y), uint32(w), uint32(h), rgb)
+	cv.FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
 }

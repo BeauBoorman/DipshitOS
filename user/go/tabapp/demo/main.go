@@ -66,13 +66,10 @@ func main() {
 // draw paints a full-viewport frame using the three widgets, mapping a fixed
 // native layout (natW x natH) into the app's CURRENT canvas via tabapp.Scale.
 func draw(ta *tabapp.TabApp) {
-	var f vi.Filler
-	w, h := uint32(ta.W), uint32(ta.H)
+	cv := ta.Canvas()
 	// Clear the whole canvas.
 	tok := theme.Current
-	f.Rect(ta.Win, 0, 0, w, h, tabapp.FillRGB())
-
-	cv := &uidraw.FillerCanvas{Filler: &f, WindowID: ta.Win}
+	cv.FillRect(widgets.Rect{W: int(ta.W), H: int(ta.H)}, uidraw.Opaque(tabapp.FillRGB()))
 	title := &widgets.Text{
 		R:     scaleR(ta, widgets.Rect{X: tok.PadMD, Y: tok.PadMD, W: int(natW) - 2*tok.PadMD, H: 20}),
 		Label: appTitle,
@@ -97,8 +94,6 @@ func draw(ta *tabapp.TabApp) {
 		SelBg: tok.Selection,
 	}
 	list.Draw(cv)
-
-	f.Flush()
 }
 
 // scaleR maps a native-canvas widget rect into the app's current canvas.

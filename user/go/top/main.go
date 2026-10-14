@@ -137,6 +137,9 @@ type app struct {
 	header     widgets.Text
 	foot       widgets.Text
 	list       widgets.List
+	scroll     widgets.Scrollbar // proc-list chrome (§5.2); absent while rows fit
+	scrollDrag bool              // the thumb is being dragged
+	scrollTop  int               // persistent: layout() rebuilds list wholesale
 
 	// filter is persistent state (text, caret, focus): layout() only moves
 	// its rect, never rebuilds it — a relayout must not lose the typed text.
@@ -334,6 +337,45 @@ func (a *app) layout() {
 		Bg:    t.Bg,
 		SelBg: t.Selection,
 	}
+	// §5.2: the scrollbar claims its track only while the content overflows;
+	// the list keeps the full width when it is absent.
+	vr := a.list.VisibleRows()
+	maxTop := len(items) - vr
+	if a.scrollTop > maxTop {
+		a.scrollTop = maxTop
+	}
+	if a.scrollTop < 0 {
+		a.scrollTop = 0
+	}
+	a.list.ScrollTop = a.scrollTop
+	if len(items) > vr && vr > 0 {
+		a.scroll = widgets.Scrollbar{
+			R: widgets.Rect{
+				X: a.list.R.Right() - widgets.ScrollbarW,
+				Y: a.list.R.Y, W: widgets.ScrollbarW, H: a.list.R.H,
+			},
+			Total:    len(items),
+			Viewport: vr,
+			Offset:   a.scrollTop,
+			Pressed:  a.scrollDrag,
+		}
+		a.list.R.W -= widgets.ScrollbarW + t.PadXS
+	} else {
+		a.scroll = widgets.Scrollbar{}
+	}
+}
+
+// ensureVisible scrolls the proc list until the table's selection is inside
+// the viewport — the keyboard path of the scrollbar's two-way binding.
+func (a *app) ensureVisible() {
+	vr := a.list.VisibleRows()
+	sel := a.tab.SelIndex()
+	if sel < a.scrollTop {
+		a.scrollTop = sel
+	}
+	if sel >= a.scrollTop+vr {
+		a.scrollTop = sel - vr + 1
+	}
 }
 
 // footLine is the keyboard hint / status line.
@@ -346,9 +388,8 @@ func (a *app) footLine() string {
 }
 
 func (a *app) draw() {
-	var f vi.Filler
-	f.Rect(a.ta.Win, 0, 0, a.ta.W, a.ta.H, theme.Current.Bg)
-	cv := &draw.FillerCanvas{Filler: &f, WindowID: a.ta.Win}
+	cv := a.ta.Canvas()
+	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(theme.Current.Bg))
 
 	a.summary.Draw(cv)
 	a.procsBtn.Draw(cv)
@@ -362,8 +403,8 @@ func (a *app) draw() {
 		a.header.Draw(cv)
 	}
 	a.list.Draw(cv)
+	a.scroll.Draw(cv)
 	a.foot.Draw(cv)
-	f.Flush()
 }
 
 // setPage switches tabs and reports it.
@@ -473,6 +514,18 @@ func (a *app) handle(ev vi.Event) bool {
 		return true
 	case vi.EvKeyDown:
 		return a.handleKey(ev)
+	case vi.EvMouseMove:
+		if a.scrollDrag {
+			a.scrollTop = a.scroll.OffsetAt(int(ev.Arg1))
+			return true
+		}
+		return false
+	case vi.EvMouseUp:
+		if a.scrollDrag {
+			a.scrollDrag = false
+			return true
+		}
+		return false
 	case vi.EvMouseDown:
 		if ev.Flags&vi.BtnLeft == 0 {
 			return false
@@ -497,9 +550,17 @@ func (a *app) handleKey(ev vi.Event) bool {
 	}
 	switch ev.Arg0 {
 	case keyUpArrow:
-		return a.tab.MoveBy(-1)
+		if a.tab.MoveBy(-1) {
+			a.ensureVisible()
+			return true
+		}
+		return false
 	case keyDownArrow:
-		return a.tab.MoveBy(1)
+		if a.tab.MoveBy(1) {
+			a.ensureVisible()
+			return true
+		}
+		return false
 	}
 	switch ev.Arg1 {
 	case 'k', 'K':
@@ -542,6 +603,19 @@ func (a *app) handleKey(ev vi.Event) bool {
 }
 
 func (a *app) handleClick(x, y int) bool {
+	// The scrollbar owns its track strip: on the thumb the drag begins, off
+	// it the click pages by a viewport (§5.2's track-click rule).
+	if a.scroll.HitTest(x, y) {
+		switch a.scroll.PageAt(x, y) {
+		case 0:
+			a.scrollDrag = true
+		case -1:
+			a.scrollTop -= a.list.VisibleRows()
+		case 1:
+			a.scrollTop += a.list.VisibleRows()
+		}
+		return true
+	}
 	if a.pg == pageProcs {
 		// The filter plate takes focus on click; a click anywhere else while
 		// it is focused just hands focus back (TOP.BIN's outside-click rule)

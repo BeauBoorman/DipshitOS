@@ -19,8 +19,10 @@
 package tabapp
 
 import (
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/widgets"
 )
 
 // Config opens/starts a tab app. Name is THIS process's own executable name
@@ -54,7 +56,22 @@ type TabApp struct {
 	Name     string
 	TabAware bool
 	OpenOK   bool
+
+	// surf is the bound M33 window surface — the shared pages the depth
+	// engine paints and the compositor reads — nil when the bind refused
+	// and this app is on the degrade path. buf is surf viewed at the
+	// current W x H stride; fill/fc are the FillerCanvas fallback's batcher
+	// and adapter (the contract's keep-forever §1 path).
+	surf []byte
+	buf  *draw.BufferCanvas
+	fill vi.Filler
+	fc   draw.FillerCanvas
 }
+
+// mmapWindowSurface is the host-test seam over the surface bind — the same
+// call draw.WindowCanvas makes. Tests substitute a page-sized slice and
+// verify bind + review without a kernel.
+var mmapWindowSurface = vi.MmapWindowSurface
 
 // Init opens the window and declares tab-awareness. It returns nil when
 // win_open fails (the caller prints and exits).
@@ -70,10 +87,100 @@ func Init(cfg Config) *TabApp {
 		Name:   cfg.Name,
 		OpenOK: true,
 	}
+	ta.bindSurface()
 	// Best-effort declaration: one blocking RPC at startup. TABWM accepts it;
 	// the shim/WND refuse and the app keeps its native presentation.
 	ta.TabAware = vi.DeclareFullscreen(uint32(win), cfg.Title, cfg.Name)
 	return ta
+}
+
+// Attach binds the canvas to a window the app opened with a raw vi.WinOpen —
+// the netstat shape: no tab declaration (TabAware stays false because none
+// was made), but the same surface binding and rebind-on-resize discipline.
+// The bind is best-effort exactly as in Init: a refused mmap leaves the
+// FillerCanvas degrade live, never a failed open.
+func Attach(win int, name string, w, h uint32) *TabApp {
+	t := &TabApp{Win: win, W: w, H: h, Name: name, OpenOK: true}
+	t.bindSurface()
+	return t
+}
+
+// bindSurface maps this window's shared M33 surface ONCE, sized to the whole
+// scanout — the largest rect a seat can ever propose, since wm_apply_rect
+// clamps every proposal on-scanout.
+//
+// The size is forced by the kernel's surface contract, not convenience:
+// bind_window_surface accepts only the first bind for a window (a second
+// answers EINVAL — "one surface per window", unbind before rebind), and
+// owner-munmapping a bound region revokes the surface, which tears the
+// window down (driving_award.zig surface_revoked). Meanwhile reflow refuses
+// any resize the bound pages would not cover (surface_covers). The only
+// bind that can never refuse a legal resize is therefore one that covers
+// the scanout; WIN_RESIZE then re-VIEWS these same pages (review) instead
+// of remapping. The bind only requires len >= win.w*win.h*4, so the
+// scanout-sized map is legal at the window's native size.
+func (t *TabApp) bindSurface() {
+	b, err := mmapWindowSurface(t.Win, vi.ScanoutFbBytes)
+	if err != nil {
+		return
+	}
+	t.surf = b
+	t.review()
+}
+
+// review re-views the bound surface at the current W x H — the only "rebind"
+// a resize can legally perform. The kernel strides the surface by the live
+// win.w*4 (user_paint_dest), so the canvas is always the tight w x h view.
+//
+// The overlap copy is the app's half of reflow's contract ("a resize
+// reframes bytes rather than discarding them"): reflow performs that copy
+// only for its own pool buffer — for a shared surface the relocation of
+// each surviving row to its new stride is this process's job. A grown
+// stride copies bottom-up (each destination row sits past every source row
+// still unread); a shrunken one top-down.
+func (t *TabApp) review() {
+	w, h := int(t.W), int(t.H)
+	if len(t.surf) == 0 || w <= 0 || h <= 0 {
+		return
+	}
+	if t.buf != nil && (t.buf.W != w || t.buf.H != h) {
+		ow := t.buf.W
+		copyW := min(ow, w) * 4
+		rows := min(t.buf.H, h)
+		if w > ow {
+			for y := rows - 1; y >= 0; y-- {
+				copy(t.surf[y*w*4:][:copyW], t.surf[y*ow*4:][:copyW])
+			}
+		} else {
+			for y := 0; y < rows; y++ {
+				copy(t.surf[y*w*4:][:copyW], t.surf[y*ow*4:][:copyW])
+			}
+		}
+	}
+	c, err := draw.BytesCanvas(t.surf, w, h)
+	if err != nil {
+		t.buf = nil
+		return
+	}
+	t.buf = c
+}
+
+// Canvas is the frame's paint surface — the M104f contract every migrated
+// app paints through instead of opening its own vi.Filler. When the surface
+// bound this is a *draw.BufferCanvas over the shared pages (the depth
+// engine's AA path; type-assert it for PushClip/PopClip/FillShadow). When
+// the bind refused — an old kernel, no surface seat, or a hand-built TabApp
+// in a host test — it is the documented degrade: a draw.FillerCanvas
+// batching the same rects through the legacy fill syscall, where the kernel
+// ignores the alpha byte and paints the identical pixels flat (§1's
+// keep-forever policy).
+func (t *TabApp) Canvas() widgets.Canvas {
+	if t.buf != nil {
+		return t.buf
+	}
+	t.fc.Filler = &t.fill
+	t.fc.WindowID = t.Win
+	return &t.fc
 }
 
 // Dispatch classifies one event and tracks the canvas size. Everything that is
@@ -85,13 +192,22 @@ func (t *TabApp) Dispatch(ev vi.Event) Action {
 	case vi.EvWinResize:
 		t.W = ev.Arg0
 		t.H = ev.Arg1
+		// The rebind is part of the tracking, not the app's job: the canvas
+		// must be the new stride before the ActionResized repaint runs.
+		t.review()
 		return ActionResized
 	}
 	return ActionNone
 }
 
-// Present flushes the current frame (the app draws first).
-func (t *TabApp) Present() { vi.WinPresent(t.Win) }
+// Present flushes the frame: the degrade path's pending fill batch first
+// (a no-op while a surface is bound), then the compositor's dirty mark.
+func (t *TabApp) Present() {
+	if t.buf == nil {
+		_ = t.fill.Flush()
+	}
+	vi.WinPresent(t.Win)
+}
 
 // Close closes the window without exiting.
 func (t *TabApp) Close() { vi.WinClose(t.Win) }
