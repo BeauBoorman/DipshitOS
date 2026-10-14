@@ -134,3 +134,97 @@ func TestShapeGoldens(t *testing.T) {
 		})
 	}
 }
+
+// The v2 depth block, pinned the same way: shadow at two radii x two blur
+// distances plus the hard plate, the vertical gradient in both aspect
+// directions plus clipped cases, scaled blits at up/down/non-integer
+// ratios, nested and intersecting clips, and arcs at partial sweeps.
+func TestDepthGoldens(t *testing.T) {
+	const bg, ink, accent, shadow = 0xff101b2b, 0xffe7f0ff, 0xff51adf6, 0x40000000
+	sprite := func() *BufferCanvas {
+		s := canvas(12, 8, 0)
+		FillRect(s, rect(0, 0, 6, 4), 0xffe05050)
+		FillRect(s, rect(6, 0, 6, 4), 0xff50e050)
+		FillRect(s, rect(0, 4, 6, 4), 0x805050e0)
+		FillRect(s, rect(6, 4, 6, 4), 0xffffe050)
+		FillEllipse(s, rect(3, 2, 6, 4), 0xccffffff)
+		return s
+	}
+	cases := []struct {
+		name string
+		w, h int
+		draw func(*BufferCanvas)
+	}{
+		{"shadow", 108, 88, func(c *BufferCanvas) {
+			FillShadow(c, rect(8, 6, 22, 16), 2, 6, 4, shadow)
+			FillShadow(c, rect(44, 6, 22, 16), 10, 6, 4, shadow)
+			FillShadow(c, rect(80, 6, 22, 16), 2, 14, 4, shadow)
+			FillShadow(c, rect(8, 42, 22, 16), 10, 14, 4, shadow)
+			FillShadow(c, rect(44, 42, 22, 16), 6, 0, 6, 0x80ffc040)
+			FillShadow(c, rect(84, 56, 30, 20), 8, 10, 8, shadow)
+		}},
+		{"gradient", 108, 84, func(c *BufferCanvas) {
+			FillLinearGradient(c, rect(4, 4, 20, 60), 0xffff8840, 0xff2050c0)
+			FillLinearGradient(c, rect(30, 4, 48, 12), 0xff1a1a2e, 0xffe8e8f0)
+			FillLinearGradient(c, rect(30, 22, 48, 40), 0xff51adf6, 0x4051adf6)
+			FillLinearGradient(c, rect(84, -10, 20, 60), 0xffe7f0ff, 0xff101b2b)
+			c.PushClip(rect(34, 66, 40, 12))
+			FillLinearGradient(c, rect(20, 60, 60, 24), 0xff30ff90, 0xff9040e0)
+			c.PopClip()
+		}},
+		{"scaled", 108, 84, func(c *BufferCanvas) {
+			s := sprite()
+			BlitScaled(c, s, rect(4, 4, 30, 20))
+			BlitScaled(c, s, rect(44, 4, 24, 16))
+			BlitScaled(c, s, rect(76, 6, 12, 8))
+			BlitScaled(c, s, rect(4, 40, 7, 5))
+			BlitScaled(c, s, rect(18, 38, 40, 26))
+			BlitScaled(c, s, rect(64, 40, 26, 26))
+			BlitScaled(c, s, rect(96, 60, 22, 22))
+		}},
+		{"clip", 108, 84, func(c *BufferCanvas) {
+			c.PushClip(rect(6, 6, 40, 30))
+			FillRect(c, rect(0, 0, 108, 84), 0x80204060)
+			c.PushClip(rect(26, 16, 40, 30))
+			FillRoundedRect(c, rect(0, 0, 108, 84), 8, accent)
+			c.PopClip()
+			StrokeLine(c, 0, 0, 108, 84, 2, 0xc0ffcc40)
+			FillEllipse(c, rect(30, 24, 24, 24), ink)
+			c.PopClip()
+			FillRect(c, rect(60, 50, 40, 30), 0x80f06eec)
+			c.PushClip(rect(70, 44, 30, 24))
+			FillPolygon(c, []Point{{64, 40}, {104, 40}, {84, 76}}, 0xc051adf6)
+			c.PushClip(rect(80, 8, 20, 16))
+			FillRect(c, rect(0, 0, 108, 84), 0x60ffffff)
+			c.PopClip()
+			c.PopClip()
+		}},
+		{"arc", 110, 84, func(c *BufferCanvas) {
+			FillArc(c, rect(4, 4, 24, 24), 0, 90, ink)
+			FillArc(c, rect(36, 4, 24, 24), 90, 180, accent)
+			FillArc(c, rect(68, 4, 24, 24), 300, 300, 0xc0f06eec)
+			FillArc(c, rect(4, 40, 24, 24), 0, 360, 0x8051adf6)
+			StrokeArc(c, rect(36, 40, 24, 24), 2, 0, 270, ink)
+			StrokeArc(c, rect(68, 40, 24, 24), 6, 45, 160, accent)
+			StrokeArc(c, rect(96, -8, 24, 24), 3, 180, 120, 0xc0ffcc40)
+			FillArc(c, rect(96, 52, 28, 28), 210, 100, 0x80ffe050)
+		}},
+		{"depthComposite", 108, 84, func(c *BufferCanvas) {
+			FillLinearGradient(c, widgets.Rect{W: 108, H: 84}, 0xff1a1a2e, 0xff0a0a14)
+			c.PushClip(rect(4, 4, 100, 76))
+			FillShadow(c, rect(18, 14, 72, 52), 8, 12, 4, shadow)
+			FillRoundedRect(c, rect(18, 14, 72, 52), 8, 0xff204060)
+			BlitScaled(c, sprite(), rect(24, 20, 24, 16))
+			StrokeArc(c, rect(58, 20, 26, 26), 4, 270, 220, accent)
+			FillArc(c, rect(58, 48, 26, 20), 90, 140, 0xa0ff8840)
+			c.PopClip()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := canvas(tc.w, tc.h, bg)
+			tc.draw(c)
+			checkGolden(t, tc.name, c)
+		})
+	}
+}

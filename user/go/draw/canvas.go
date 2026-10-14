@@ -4,6 +4,7 @@ import (
 	"errors"
 	"unsafe"
 
+	"virelai/ttf"
 	"virelai/vi"
 	"virelai/widgets"
 )
@@ -26,6 +27,17 @@ func (c *BufferCanvas) StrokeRoundedRect(r widgets.Rect, radius, weight int, rgb
 
 func (c *BufferCanvas) BlitTinted(src []uint32, srcW, srcH, x, y int, rgb uint32) {
 	BlitTinted(c, &BufferCanvas{Pix: src, W: srcW, H: srcH}, x, y, rgb)
+}
+
+// Text is the §3.2 widget label path: a real face paints through
+// draw.Text's linear-light mask composite, and a nil face degrades to the
+// 8x8 bitmap face — §3.4's "no face → bitmap" rule, never a blank label.
+func (c *BufferCanvas) Text(face *ttf.Face, clip widgets.Rect, x, y, size int, s string, rgb uint32) {
+	if face == nil {
+		widgets.DrawText(c, clip, s, rgb)
+		return
+	}
+	Text(c, face, clip, x, y, size, s, rgb)
 }
 
 // Opaque converts a theme token's 0x00RRGGBB to the raster engine's opaque
@@ -90,6 +102,13 @@ func (c *FillerCanvas) BlitTinted(src []uint32, srcW, srcH, x, y int, rgb uint32
 	if maxX >= minX {
 		c.FillRect(widgets.Rect{X: x + minX, Y: y + minY, W: maxX - minX + 1, H: maxY - minY + 1}, rgb)
 	}
+}
+
+// Text degrades per §3.2: the run repaints through widgets.DrawText with
+// clip as the plate — the 8x8 bitmap face — so a filler surface keeps
+// legible labels instead of glyph bounding boxes.
+func (c *FillerCanvas) Text(_ *ttf.Face, clip widgets.Rect, _, _, _ int, s string, rgb uint32) {
+	widgets.DrawText(c, clip, s, rgb)
 }
 
 var errBuffer = errors.New("draw: invalid buffer geometry")

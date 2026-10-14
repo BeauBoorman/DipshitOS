@@ -8,9 +8,14 @@ import "virelai/widgets"
 type Point struct{ X, Y int }
 
 // BufferCanvas is a row-major, W-stride surface owned by the caller.
+// The clip stack is a fixed array (depth.go): the zero value clips to the
+// whole canvas.
 type BufferCanvas struct {
 	Pix  []uint32
 	W, H int
+
+	clips [ClipDepth]widgets.Rect
+	depth int
 }
 
 const samples = 16
@@ -21,31 +26,27 @@ func valid(c *BufferCanvas) bool {
 	return c != nil && c.W > 0 && c.H > 0 && c.W <= len(c.Pix)/c.H
 }
 
-// clipSpan intersects [origin, origin+size) with [0, limit) without
+// clipRange intersects [origin, origin+size) with [lo, hi) without
 // overflowing on an off-screen origin or a very large requested size.
-func clipSpan(origin, size, limit int) (int, int) {
-	if size <= 0 || origin >= limit {
+// An empty intersection returns (0, 0).
+func clipRange(origin, size, lo, hi int) (int, int) {
+	if size <= 0 || lo >= hi || origin >= hi {
 		return 0, 0
 	}
-	if origin < 0 {
-		end := origin + size // adding a positive size to a negative origin is safe
-		if end <= 0 {
-			return 0, 0
-		}
-		if end > limit {
-			end = limit
-		}
-		return 0, end
+	start := max(origin, lo)
+	end := min(saturatingAdd(origin, size), hi)
+	if end <= start {
+		return 0, 0
 	}
-	if size >= limit-origin {
-		return origin, limit
-	}
-	return origin, origin + size
+	return start, end
 }
 
+// clipRect intersects r with the §3.3.4 paint region — the active clip
+// stack intersected with canvas bounds.
 func clipRect(c *BufferCanvas, r widgets.Rect) (x0, y0, x1, y1 int) {
-	x0, x1 = clipSpan(r.X, r.W, c.W)
-	y0, y1 = clipSpan(r.Y, r.H, c.H)
+	cl := activeClip(c)
+	x0, x1 = clipRange(r.X, r.W, cl.X, cl.Right())
+	y0, y1 = clipRange(r.Y, r.H, cl.Y, cl.Bottom())
 	return
 }
 
@@ -76,7 +77,11 @@ func blend(dst, rgb uint32, coverage int) uint32 {
 // BlendPixel composites one pixel with the color's alpha. Alpha zero is a
 // no-op, including over a transparent destination.
 func BlendPixel(c *BufferCanvas, x, y int, rgb uint32) {
-	if !valid(c) || x < 0 || y < 0 || x >= c.W || y >= c.H {
+	if !valid(c) {
+		return
+	}
+	cl := activeClip(c)
+	if x < cl.X || y < cl.Y || x >= cl.Right() || y >= cl.Bottom() {
 		return
 	}
 	i := y*c.W + x
@@ -89,8 +94,9 @@ func BlitTinted(c *BufferCanvas, src *BufferCanvas, x, y int, rgb uint32) {
 	if !valid(c) || !valid(src) || rgb>>24 == 0 {
 		return
 	}
-	x0, x1 := clipSpan(x, src.W, c.W)
-	y0, y1 := clipSpan(y, src.H, c.H)
+	cl := activeClip(c)
+	x0, x1 := clipRange(x, src.W, cl.X, cl.Right())
+	y0, y1 := clipRange(y, src.H, cl.Y, cl.Bottom())
 	for dy := y0; dy < y1; dy++ {
 		for dx := x0; dx < x1; dx++ {
 			alpha := int(src.Pix[(dy-y)*src.W+dx-x] >> 24)
@@ -319,8 +325,9 @@ func FillPolygon(c *BufferCanvas, pts []Point, rgb uint32) {
 		minX, maxX = min(minX, p.X), max(maxX, p.X)
 		minY, maxY = min(minY, p.Y), max(maxY, p.Y)
 	}
-	x0, x1 := max(0, minX), min(c.W, maxX)
-	y0, y1 := max(0, minY), min(c.H, maxY)
+	cl := activeClip(c)
+	x0, x1 := max(cl.X, minX), min(cl.Right(), maxX)
+	y0, y1 := max(cl.Y, minY), min(cl.Bottom(), maxY)
 	for y := y0; y < y1; y++ {
 		for x := x0; x < x1; x++ {
 			coverage := 0
@@ -375,8 +382,9 @@ func strokeSegments(c *BufferCanvas, pts []Point, weight int, rgb uint32) {
 		minY, maxY = min(minY, p.Y), max(maxY, p.Y)
 	}
 	pad := weight/2 + 1
-	x0, x1 := max(0, saturatingAdd(minX, -pad)), min(c.W, saturatingAdd(maxX, pad+1))
-	y0, y1 := max(0, saturatingAdd(minY, -pad)), min(c.H, saturatingAdd(maxY, pad+1))
+	cl := activeClip(c)
+	x0, x1 := max(cl.X, saturatingAdd(minX, -pad)), min(cl.Right(), saturatingAdd(maxX, pad+1))
+	y0, y1 := max(cl.Y, saturatingAdd(minY, -pad)), min(cl.Bottom(), saturatingAdd(maxY, pad+1))
 	for y := y0; y < y1; y++ {
 		for x := x0; x < x1; x++ {
 			coverage := 0
