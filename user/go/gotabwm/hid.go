@@ -142,6 +142,13 @@ var (
 	// the pointer rests off the rail. Paint state; updateRailHover owns it
 	// and the entry marker.
 	railHover = -1
+	// railCloseHover is the rail cell whose close zone holds the pointer,
+	// or -1 — the §2.4 Danger tint paintRail gives the close glyph under
+	// it. updateRailHover tracks it on the same samples as railHover.
+	railCloseHover = -1
+	// godButtonHover rides the same samples for the god-menu button's
+	// §2.3 hover face.
+	godButtonHover bool
 	// sashDragging is the M79c (#1706) sash latch: a pointer-down on the
 	// split divider arms it, the matching release commits the drag at the
 	// release x/y, and motion while armed is swallowed (chrome, never
@@ -734,6 +741,14 @@ func railCloseZoneAt(px, py uint32, width, n, stripH int) (int, bool) {
 // `rail-hover` names a hover, never a click.
 func updateRailHover(px, py uint32, motion bool) {
 	prev := railHover
+	// The button's §2.3 hover face and the rail close glyph's §2.4 Danger
+	// tint ride the same pointer samples the cell hover already takes.
+	godButtonHover = godMenuHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight)
+	if j, ok := railCloseZoneAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight); ok {
+		railCloseHover = j
+	} else {
+		railCloseHover = -1
+	}
 	i, ok := railCellAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight)
 	if !ok {
 		railHover = -1

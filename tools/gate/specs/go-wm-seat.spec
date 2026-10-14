@@ -434,6 +434,31 @@ PY
 # The face and its source: the marker is one-shot and comes after the seat
 # registered, so a gate never has to guess which of VZ's three cases (kernel
 # EFI epoch / host `.clock` / uptime) this boot is in.
+# M104e (#2272): the seat's one-shot font report, printed at the first
+# paint. No FONTS.TXT is staged on this share, so BOTH roles must name the
+# documented degrade — ui=bitmap chrome=bitmap — and the seat still paints
+# everything this run asserts (the never-blank contract). The marker is
+# well-formed, one-shot, and lands after the seat registered.
+vgate_assert 03 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+hits = re.findall(r"(?m)^gotabwm: fonts (.*?) ui=(\w+) chrome=(\w+)$", ser)
+if not hits:
+    sys.exit("no `gotabwm: fonts` marker — the seat never resolved a font")
+if len(hits) != 1:
+    sys.exit("the fonts marker is one-shot, saw %d" % len(hits))
+payload, ui, chrome = hits[0]
+if not payload.startswith("manifest="):
+    sys.exit("malformed fonts payload: %r" % payload)
+if ui != "bitmap" or chrome != "bitmap":
+    sys.exit("ui=%s chrome=%s — this share stages no FONTS.TXT, so both "
+             "roles must degrade to the bitmap face" % (ui, chrome))
+if ser.find("gotabwm: registered") > ser.find("gotabwm: fonts "):
+    sys.exit("the fonts marker printed before the seat registered")
+print("fonts marker: %s ui=%s chrome=%s — the degrade path, observed"
+      % (payload, ui, chrome))
+PY
+
 vgate_assert 03 serial-contains 'gotabwm: clock-source '
 vgate_assert 03 python <<'PY'
 import os, re, sys
@@ -547,6 +572,20 @@ assert ink >= 20, ("only %d ink-white pixels in the panel rect - the clock face 
                    "did not paint" % ink)
 assert green == 0, ("%d console-green pixels inside the panel rect - the kernel's "
                     "terminal is compositing over the seat's scanout" % green)
+
+# M104e: the accent rule still rides the panel's left edge, now through the
+# shared plate's rounded silhouette — column x0+1 (the outermost column is
+# the 1px Rule stroke). Blue dominance, not a token match: the capture's
+# shift is large on saturated blue (measured in M71e: Accent 0x3b82f6 reads
+# back ~(78,128,238)), and nothing else on this frame is blue-dominant.
+arule = 0
+for y in range(int((y0 + 2) * scale), int((y0 + ph - 2) * scale)):
+    r, g, b = px(int((x0 + 1) * scale), y)
+    if b > 150 and b > r + 40 and b > g + 40:
+        arule += 1
+assert arule > 0, ("no accent rule on the clock panel's left edge - the "
+                   "seat's identity mark did not paint")
+print("clock panel accent rule: %d blue-dominant rows" % arule)
 PY
 
 # --- M79a (#1704) run 05: LIVE mode persistence --------------------------
@@ -708,6 +747,10 @@ vgate_run 06 -- \
 vgate_assert 06 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 06 serial-contains 'gotabwm: mode live'
 vgate_assert 06 serial-absent 'gotabwm: mode demo'
+# M104e (#2272): live mode resolves the fonts too — the degrade marker is
+# the never-blank contract's evidence (the toast pixels below are the proof
+# it still painted).
+vgate_assert 06 serial-contains 'gotabwm: fonts '
 vgate_assert 06 serial-contains 'exec: loaded GOFILES.ELF'
 vgate_assert 06 serial-contains 'gofiles: declare accepted'
 # The adopter's half: the copy completed and the notify was ACCEPTED. The
@@ -843,28 +886,41 @@ SURFACE = (0x22, 0x2d, 0x35)
 INK = (0xe6, 0xed, 0xf3)
 CHROME_BG = (0x11, 0x17, 0x1c)
 
+BORDER = (0x33, 0x41, 0x55)
+
 modal = Counter()
-rule = ink = surface = 0
+ink = surface = 0
 for y in range(TY, TY + TH):
     for x in range(TX, TX + TW):
         c = px(x, y)
         modal[c] += 1
-        if x < TX + 2:
-            if c == ACCENT:
-                rule += 1
-        elif c == INK:
+        if c == INK:
             ink += 1
         elif c == SURFACE:
             surface += 1
 
 best, n = modal.most_common(1)[0]
 print("toast rect (%d,%d %dx%d): modal=#%02x%02x%02x n=%d distinct=%d "
-      "rule=%d ink=%d surface=%d"
-      % (TX, TY, TW, TH, best[0], best[1], best[2], n, len(modal), rule, ink, surface))
+      "ink=%d surface=%d"
+      % (TX, TY, TW, TH, best[0], best[1], best[2], n, len(modal), ink, surface))
 
-# The accent rule: the panel's full-height 2px left edge, 2 x TH pixels.
-assert rule == 2 * TH, ("only %d/%d accent-rule pixels at the toast's left edge - "
-                        "the seat did not paint the toast" % (rule, 2 * TH))
+# M104e: the accent rule rides the plate's ROUNDED left edge — the §2.2
+# radius is the visible claim, the exact-token probes the raw scanout
+# permits. On the straight section the outermost column is the 1px Border
+# stroke and column TX+1 is the accent rule; the corner pixels are outside
+# the silhouette (the §2.5 shadow / the client beneath), so they can never
+# read accent — a square plate painted accent at every row of both columns.
+assert px(TX + 1, TY + TH // 2) == ACCENT, \
+    "no accent rule at the toast's left edge mid-height"
+assert px(TX, TY + TH // 2) == BORDER, \
+    "the plate's 1px Border stroke is missing at the left edge"
+assert px(TX + 2, TY + TH // 2) == SURFACE, \
+    "the toast's interior is not Surface past the rule"
+for cx, cy in ((TX, TY), (TX, TY + TH - 1), (TX + TW - 1, TY), (TX + TW - 1, TY + TH - 1)):
+    assert px(cx, cy) != ACCENT, \
+        "corner %d,%d reads accent - the toast plate is not rounded" % (cx, cy)
+assert px(TX + 1, TY) != ACCENT and px(TX + 1, TY + TH - 1) != ACCENT, \
+    "the accent rule reaches the corner rows - the left edge is not rounded"
 # The face painted, in ink, inside the panel and clear of the rule.
 assert ink >= 20, ("only %d ink pixels in the toast rect - the message text did not paint" % ink)
 # And the panel is Surface, NOT the blank desktop Bg (0x182026): a toast that
@@ -887,8 +943,8 @@ assert cbest == CHROME_BG, ("the clock panel reads #%02x%02x%02x, want the Chrom
 # top of this hook already proves is the real claim: the toast rect starts
 # below the 22px rail and ends before the clock panel, so nothing it paints
 # can land on either.
-print("toast: rule=%d ink=%d surface=%d; clock panel intact at #%02x%02x%02x (n=%d)"
-      % (rule, ink, surface, cbest[0], cbest[1], cbest[2], cn))
+print("toast: ink=%d surface=%d; clock panel intact at #%02x%02x%02x (n=%d)"
+      % (ink, surface, cbest[0], cbest[1], cbest[2], cn))
 PY
 
 # --- M83f (#1779) run 07: seat-owned presence, never a waited-out minute ---
@@ -951,6 +1007,9 @@ PY
 # Full-frame cover, centred Surface panel, accent rule, and actual text ink.
 # The top-left is ChromeBg, not the bright underlying desktop; the panel
 # text is the seat's explicit NOT AUTHENTICATION notice (unit-pinned).
+# M104e: the plate is rounded — its corner pixel is the curtain's own
+# ChromeBg cover (outside the silhouette), the 2px accent rule rides the
+# straight left edge, and Surface fills the interior from column x+2.
 vgate_assert 07 snapshot 'snap-idle-0.raw' <<'PY'
 import sys
 from collections import Counter
@@ -967,8 +1026,12 @@ accent = (0x3b, 0x82, 0xf6)
 x, y = (W-256)//2, (H-64)//2
 if px(40, 40) != bg or px(W-40, H-40) != bg:
     sys.exit("curtain does not cover the full scanout")
-if px(x, y+8) != accent or px(x+3, y+3) != surface:
-    sys.exit("curtain panel or accent rule absent")
+if px(x, y) != bg:
+    sys.exit("the curtain plate's top-left corner is painted - not rounded")
+if px(x, y+32) != accent or px(x+1, y+32) != accent:
+    sys.exit("no accent rule on the curtain plate's left edge")
+if px(x+2, y+32) != surface or px(x+128, y+32) != surface:
+    sys.exit("the curtain plate's interior is not Surface")
 colours = Counter(px(col, row) for row in range(y+8, y+40)
                   for col in range(x+10, x+240))
 ink = sum(n for c, n in colours.items() if min(c) >= 150)

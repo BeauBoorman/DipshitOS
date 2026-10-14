@@ -449,8 +449,12 @@ func TestPaintNotifyStaysInsideTheRectAndUsesTokens(t *testing.T) {
 			v := pix[row*w+col]
 			inRect := col >= x && col < x+pw && row >= y && row < y+ph
 			if !inRect {
-				if v != theme.Light.Success {
-					t.Fatalf("paintNotify wrote outside its rect at %d,%d", col, row)
+				// The §2.5 drop shadow darkens a falloff band around the
+				// toast plate (blur 16, dy 4) — bound it, then hold the
+				// rest of the scanout to the sentinel.
+				inShadow := col >= x-16 && col < x+pw+16 && row >= y-16 && row < y+ph+20
+				if !inShadow && v != theme.Light.Success {
+					t.Fatalf("paintNotify wrote outside its rect and shadow at %d,%d", col, row)
 				}
 				continue
 			}

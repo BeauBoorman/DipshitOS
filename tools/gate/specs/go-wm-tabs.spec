@@ -1,5 +1,5 @@
-# go-wm-tabs.spec -- M62b–h + #1426 + M66b + M79d + M79g
-# (issues #1400–#1406/#1426/#1444/#1707/#1718)
+# go-wm-tabs.spec -- M62b–h + #1426 + M66b + M79d + M79g + M104e
+# (issues #1400–#1406/#1426/#1444/#1707/#1718/#2272)
 # class-B gate: GOTABWM tab strip, split, pin, session, LAYOUT.txt, then two
 # shipping Go ELFs as tabs. Boot 01 hosts GOCALC.ELF + NOTE.ELF
 # (Zig CALC.BIN is gone, M62h / #1406; Zig NOTEPAD.BIN is gone, M66c / #1485). Boot 03 hosts GOEDIT.ELF + GOTERM.ELF:
@@ -45,6 +45,9 @@
 #       seat restores the file run 09 wrote and must report the ORDER, the
 #       pin bit and the frozen badge the user actually left — `session load
 #       n=2 mode=restore` plus the order/titles lines that carry them.
+#       M104e (#2272): the restored rail is also asserted as PIXELS — the
+#       §2.3.6 Selection + 3px Accent marker on the focused cell, the
+#       close glyph's zone, and the frozen badge.
 #   11  M97g-F2 (#2080): NOTE.ELF as the bound victim, WMRPCPROBE.ELF as the
 #       in-guest attacker. The probe binds its own window honestly, then
 #       sprays forged SetTitle frames (bare and guessed-token) at every other
@@ -276,6 +279,9 @@ vgate_assert 01 serial-contains 'gotabwm: registered'
 vgate_assert 01 serial-contains 'gotabwm: settings wm=none'
 vgate_assert 01 serial-contains 'exec: loaded GOCALC.ELF'
 vgate_assert 01 serial-contains 'exec: loaded NOTE.ELF'
+# M104e (#2272): the seat's one-shot font report — this share stages no
+# FONTS.TXT, so it names the bitmap degrade the rail's chrome glyphs ride.
+vgate_assert 01 serial-contains 'gotabwm: fonts '
 # Two clients on the strip, rail painted, one focused.
 vgate_assert 01 serial-count 'gotabwm: tab open id=' 2
 vgate_assert 01 serial-contains 'gotabwm: tab focus id='
@@ -885,15 +891,40 @@ if not near(dmodal, bg):
 # rule at scale 2 lands on fractional pixels and blends with its neighbours).
 # Nothing else on this frame is blue-dominant: Bg and Surface are dark grey
 # and the text is near-white.
+#
+# M104e (#2272): the sample column moved one pixel right. The plate now
+# carries the §2.2 1px Border stroke on its silhouette, so the outermost
+# column is the border and the accent rule is column x0+1 — the same rule,
+# one column in, through the shared rounded plate.
 n = 0
 for y in range(int((y0 + 2) * scale), int((y0 + ph - 2) * scale)):
-    r, g, b = px(int((x0 + 0.5) * scale), y)
+    r, g, b = px(int((x0 + 1) * scale), y)
     if b > 150 and b > r + 40 and b > g + 40:
         n += 1
 if n == 0:
     sys.exit("no accent rule on the start surface's left edge")
-print("start surface: panel modal %r (%d px), desktop %r, accent rule %d rows" % (
-    modal, mn, dmodal, n))
+
+# M104e (#2272): the panel is a §2.5 floating plate — it casts the shared
+# drop shadow onto the uniform Bg desktop, and its §2.2 radius cuts the
+# corners. The shadow band below the silhouette (dy=4, blur 16) darkens
+# Bg by ~25% on every channel; the corner pixel sits outside the
+# silhouette, so it cannot read Surface.
+band = Counter()
+for y in range(int((y0 + ph + 6) * scale), int((y0 + ph + 18) * scale)):
+    for x in range(int((x0 + 40) * scale), int((x0 + pw - 40) * scale)):
+        band[px(x, y)] += 1
+if not band:
+    sys.exit("empty shadow band below the start surface")
+bmodal, bn = band.most_common(1)[0]
+if not all(m <= c - 3 for m, c in zip(bmodal, bg)):
+    sys.exit("no shadow under the start surface: band modal %r is not "
+             "darker than the desktop %r" % (bmodal, bg))
+corner = px(int((x0 + 1) * scale), int((y0 + 1) * scale))
+if near(corner, surface, 4):
+    sys.exit("the start surface's top-left corner reads Surface %r - "
+             "the plate is not rounded" % (corner,))
+print("start surface: panel modal %r (%d px), desktop %r, accent rule %d rows, "
+      "shadow band %r (%d px), corner %r" % (modal, mn, dmodal, n, bmodal, bn, corner))
 PY
 
 # ---------------------------------------------------------------------------
@@ -1516,6 +1547,9 @@ EOF
 
 vgate_run 10 -- \
     --screen '$RUN_DIR/screen-10' \
+    --via-virtio --cvc-snap \
+    --snapshot-after 'gotabwm: present' \
+    --snapshot-out '$RUN_DIR/snap-10' \
     --script '$RUN_DIR/script-10.txt' \
     --script2 '$RUN_DIR/script2-10.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -1591,6 +1625,101 @@ if bins != want_bins:
 if any(row[8] != "none" for row in parsed):
     sys.exit("restore dump must be unsplit")
 print("LAYOUT.txt restore n=2 ids=256,257 bins=%s in the restored order" % bins)
+PY
+
+# M104e (#2272): the rail on the restored strip, as PIXELS. Two cells of
+# 640px under the 22px strip; the file's active=2 focuses cell 1. The card's
+# §2.3.6 pinned geometry is the claim: the focused cell is a Selection fill
+# carrying the 3px Accent left-edge marker, the idle cell keeps BtnIdle
+# with NO marker, and every cell carries the close glyph (VirelaiChrome
+# window-close on a fonted seat — the bitmap 'x' here, since this share
+# stages no FONTS.TXT: the run 01 `gotabwm: fonts` assert names that
+# degrade). Cell 1's frozen badge is run 09's pin+freeze left behind.
+#
+# The snapshot rides the kind-4 channel (`--snapshot-after 'gotabwm:
+# present'`): the marker is once-guarded behind the seat's first presented
+# frame, so the scanout it streams already carries the rail. BGRX raw, so
+# the probes are exact token matches — no capture shift, no scale.
+vgate_assert 10 snapshot 'snap-10-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    b, g, r = raw[off], raw[off + 1], raw[off + 2]
+    return (r, g, b)
+
+ACCENT = (0x3b, 0x82, 0xf6)
+SELECTION = (0x2a, 0x44, 0x60)
+BTN_IDLE = (0x2d, 0x37, 0x48)
+WARNING = (0xf5, 0x9e, 0x0b)
+BG = (0x18, 0x20, 0x26)
+MUTED = (0x94, 0xa3, 0xb8)
+
+# Cell 1 (x 640..1279) is focused: the 3px Accent marker rides its left
+# edge at x 641..643 for the full strip height (paintRail: marker at
+# x+1, w=3 over the cell's Selection fill).
+marker = 0
+for y in range(22):
+    for x in (641, 642, 643):
+        if px(x, y) == ACCENT:
+            marker += 1
+if marker < 3 * 20:
+    sys.exit("only %d accent-marker px on the focused rail cell - the "
+             "3px selection marker did not paint" % marker)
+assert px(900, 11) == SELECTION, \
+    "focused rail cell interior %r is not Selection %r" \
+    % (px(900, 11), SELECTION)
+
+# Cell 0 (x 0..639) is idle: BtnIdle face, a Bg trough at its left edge,
+# and NO accent marker — the marker is focus visibility, not decoration.
+assert px(300, 11) == BTN_IDLE, \
+    "idle rail cell interior %r is not BtnIdle %r" % (px(300, 11), BTN_IDLE)
+assert px(1, 11) == BTN_IDLE, \
+    "the idle cell's left edge %r is not its face - a marker leaked" % (px(1, 11),)
+assert px(0, 11) == BG and px(640, 11) == BG, \
+    "the 1px trough between cells is not Bg: %r %r" % (px(0, 11), px(640, 11))
+
+# Every cell carries the close glyph in its close zone — Muted ink on the
+# cell face (Danger only while the pointer hovers the zone, and no pointer
+# ran in this boot). Cell 0's bitmap 'x' lands at 626..633 x 7..14; the
+# PUA glyph lands in the same zone on a fonted seat, so the probe counts
+# non-face pixels, not a bitmap mask.
+def glyph_strokes(x0, y0, face):
+    n = 0
+    for y in range(y0, y0 + 8):
+        for x in range(x0, x0 + 8):
+            c = px(x, y)
+            if c != face:
+                if c != MUTED:
+                    sys.exit("close-zone pixel (%d,%d) is %r, want %r or the "
+                             "cell face %r" % (x, y, c, MUTED, face))
+                n += 1
+    return n
+g0 = glyph_strokes(626, 7, BTN_IDLE)
+if g0 < 4:
+    sys.exit("only %d close-glyph px in cell 0's close zone - the "
+             "window-close control did not paint" % g0)
+g1 = glyph_strokes(1266, 7, SELECTION)
+if g1 < 4:
+    sys.exit("only %d close-glyph px in cell 1's close zone" % g1)
+
+# Cell 1's frozen badge survived the restore: the 4px Warning strip inset
+# 4px at the cell's right edge (x 1275..1278, rows 4..17) — the pin+freeze
+# run 09 persisted.
+badge = sum(1 for y in range(4, 18) for x in range(1275, 1279)
+            if px(x, y) == WARNING)
+if badge < 40:
+    sys.exit("only %d frozen-badge px on the restored cell - the badge "
+             "did not repaint" % badge)
+print("rail: %d marker px, Selection/BtnIdle faces, close glyphs %d+%d, "
+      "frozen badge %d px" % (marker, g0, g1, badge))
 PY
 
 # --- M97g-F2 (#2080): WM_RPC sender authentication --------------------------

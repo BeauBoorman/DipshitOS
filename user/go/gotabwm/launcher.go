@@ -17,11 +17,11 @@
 package main
 
 import (
-	"unsafe"
-
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/webrender/qoi"
+	"virelai/widgets"
 )
 
 const (
@@ -92,18 +92,16 @@ type launcherState struct {
 	// god-menu button paints it every tick, long before the first
 	// summon). tried gates the one-shot marker and the retry: a share
 	// that lacks the file is named once per boot, not once per paint.
-	// icon16/icon32 memoize the two scaled variants chrome paints per
-	// tick. It lives on launcherState so the seat-state snapshot tests
-	// already take carries it.
+	// It lives on launcherState so the seat-state snapshot tests already
+	// take carries it. The scaled variants the old box filter memoized
+	// are gone: BlitScaled resamples from this one decode per paint.
 	emblem emblemState
 }
 
 type emblemState struct {
-	tried  bool
-	w, h   int
-	pix    []uint32
-	icon16 []uint32
-	icon32 []uint32
+	tried bool
+	w, h  int
+	pix   []uint32
 }
 
 var launch launcherState
@@ -132,104 +130,6 @@ func launcherEmblem() []uint32 {
 		}
 	}
 	return em.pix
-}
-
-// emblemScaled box-filters the mascot by an integer factor, premultiplied,
-// so its alpha edges shrink honestly instead of fringing — the 16px chrome
-// icon and the 32px start-surface mark both come from the one decode, and
-// each factor is computed once per boot.
-func emblemScaled(factor int) []uint32 {
-	em := &launch.emblem
-	switch factor {
-	case 2:
-		if em.icon32 != nil {
-			return em.icon32
-		}
-	case 4:
-		if em.icon16 != nil {
-			return em.icon16
-		}
-	}
-	src := launcherEmblem()
-	if src == nil || factor < 1 || em.w%factor != 0 || em.h%factor != 0 {
-		return nil
-	}
-	out := emblemBoxScale(src, factor)
-	switch factor {
-	case 2:
-		em.icon32 = out
-	case 4:
-		em.icon16 = out
-	}
-	return out
-}
-
-func emblemBoxScale(src []uint32, factor int) []uint32 {
-	em := &launch.emblem
-	dw, dh := em.w/factor, em.h/factor
-	out := make([]uint32, dw*dh)
-	n := factor * factor
-	for ry := 0; ry < dh; ry++ {
-		for rx := 0; rx < dw; rx++ {
-			var sa, sr, sg, sb int
-			for dy := 0; dy < factor; dy++ {
-				for dx := 0; dx < factor; dx++ {
-					p := src[(ry*factor+dy)*em.w+rx*factor+dx]
-					a := int(p >> 24)
-					sa += a
-					sr += a * int(p>>16&0xff)
-					sg += a * int(p>>8&0xff)
-					sb += a * int(p&0xff)
-				}
-			}
-			a := sa / n
-			if a == 0 {
-				continue
-			}
-			out[ry*dw+rx] = uint32(a)<<24 | uint32(sr/sa)<<16 | uint32(sg/sa)<<8 | uint32(sb/sa)
-		}
-	}
-	return out
-}
-
-// blitImage composites an 0xAARRGGBB raster source-over onto the scanout
-// words — the same byte order fillRect writes, so opaque source pixels keep
-// the X byte opaque like every other seat store.
-func blitImage(pix []uint32, stride, maxH int, src []uint32, sw, sh, x, y int) int {
-	if src == nil || stride <= 0 {
-		return 0
-	}
-	written := 0
-	for row := 0; row < sh; row++ {
-		dy := y + row
-		if dy < 0 || dy >= maxH {
-			continue
-		}
-		for col := 0; col < sw; col++ {
-			dx := x + col
-			if dx < 0 || dx >= stride {
-				continue
-			}
-			s := src[row*sw+col]
-			a := int(s >> 24)
-			if a == 0 {
-				continue
-			}
-			di := dy*stride + dx
-			if a == 255 {
-				pix[di] = s | 0xff000000
-				written++
-				continue
-			}
-			d := pix[di]
-			r := (int(s>>16&0xff)*a + int(d>>16&0xff)*(255-a) + 127) / 255
-			g := (int(s>>8&0xff)*a + int(d>>8&0xff)*(255-a) + 127) / 255
-			b := (int(s&0xff)*a + int(d&0xff)*(255-a) + 127) / 255
-			pix[di] = 0xff000000 | uint32(r)<<16 | uint32(g)<<8 | uint32(b)
-			written++
-		}
-	}
-	return written
 }
 
 func appUnavailable(e AppEntry) string {
@@ -625,51 +525,53 @@ func paintLauncher(scan []byte, width, height int) int {
 	if !launch.open || width <= 0 || height <= 0 || len(scan) < 4 {
 		return 0
 	}
-	pixN := len(scan) / 4
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), pixN)
-	maxH := pixN / width
-	if maxH > height {
-		maxH = height
-	}
-	if maxH <= 0 {
+	c := seatCanvas(scan, width, height)
+	if c == nil {
 		return 0
 	}
+	maxH := c.H
 	tok := theme.Current
 	launch.painted, launch.width, launch.height = true, width, maxH
-	written := fillRect(pix, width, maxH, launchX, launchY, launchW, maxH, tok.Surface)
-	written += fillRect(pix, width, maxH, launchX+launchW-launchRule, launchY, launchRule, maxH, tok.Accent)
+	// The strip is DOCKED chrome — flat plate, no shadow — with the seat's
+	// accent rule on the edge facing the desktop.
+	written := seatFill(c, widgets.Rect{X: launchX, Y: launchY, W: launchW, H: maxH}, tok.Surface)
+	written += seatFill(c, widgets.Rect{X: launchX + launchW - launchRule, Y: launchY, W: launchRule, H: maxH}, tok.Accent)
+	strip := widgets.Rect{X: launchX, Y: launchY, W: launchW - launchRule, H: maxH}
 	// The emblem is the seat's front door: the real sexiburger raster,
-	// centred in the strip. A share without it gets a bordered box and
-	// the marker's `unavailable`, never a fabricated mascot.
-	if src := launcherEmblem(); src != nil {
-		written += blitImage(pix, width, maxH, src, launch.emblem.w, launch.emblem.h,
-			launchX+(launchW-launchRule-launch.emblem.w)/2, launchY+launchAvatarY)
+	// centred in the strip and resampled by the engine's BlitScaled. A
+	// share without it gets a bordered box and the marker's
+	// `unavailable`, never a fabricated mascot.
+	if icon := emblemCanvas(); icon != nil {
+		dst := widgets.Rect{X: launchX + (launchW-launchRule-icon.W)/2,
+			Y: launchY + launchAvatarY, W: icon.W, H: icon.H}
+		draw.BlitScaled(c, icon, dst)
+		written += seatArea(c, dst)
 	} else {
 		ex, ey := launchX+(launchW-launchRule-launchEmblem)/2, launchY+launchAvatarY
-		written += fillRect(pix, width, maxH, ex, ey, launchEmblem, launchEmblem, tok.Surface)
-		written += fillRect(pix, width, maxH, ex, ey, launchEmblem, tok.BorderW, tok.Border)
-		written += fillRect(pix, width, maxH, ex, ey+launchEmblem-tok.BorderW, launchEmblem, tok.BorderW, tok.Border)
-		written += fillRect(pix, width, maxH, ex, ey, tok.BorderW, launchEmblem, tok.Border)
-		written += fillRect(pix, width, maxH, ex+launchEmblem-tok.BorderW, ey, tok.BorderW, launchEmblem, tok.Border)
-		written += drawText8(pix, width, maxH, ex+24, ey+28, "SB", tok.InkMuted)
+		written += seatFill(c, widgets.Rect{X: ex, Y: ey, W: launchEmblem, H: launchEmblem}, tok.Surface)
+		written += seatFill(c, widgets.Rect{X: ex, Y: ey, W: launchEmblem, H: tok.BorderW}, tok.Border)
+		written += seatFill(c, widgets.Rect{X: ex, Y: ey + launchEmblem - tok.BorderW, W: launchEmblem, H: tok.BorderW}, tok.Border)
+		written += seatFill(c, widgets.Rect{X: ex, Y: ey, W: tok.BorderW, H: launchEmblem}, tok.Border)
+		written += seatFill(c, widgets.Rect{X: ex + launchEmblem - tok.BorderW, Y: ey, W: tok.BorderW, H: launchEmblem}, tok.Border)
+		seatText(c, strip, ex+24, ey+28, seatTextPx, "SB", tok.InkMuted)
 	}
-	written += drawText8(pix, width, maxH, launchX+tok.PadMD, launchY+launchPromptY, launchPrompt, tok.Ink)
-	// The filter field: an inset box, the query, then the caret — the
-	// keystroke sink made visible.
+	seatText(c, strip, launchX+tok.PadMD, launchY+launchPromptY, seatTextPx, launchPrompt, tok.Ink)
+	// The filter field: an inset control with the §2.3.5 Accent focus
+	// ring (the field IS the focus while the strip is open), the query,
+	// then the caret — the keystroke sink made visible.
 	fx, fy, fw := launchX+tok.PadMD, launchY+launchFieldY, launchW-2*tok.PadMD-launchRule
-	written += fillRect(pix, width, maxH, fx, fy, fw, launchFieldH, tok.Bg)
-	written += fillRect(pix, width, maxH, fx, fy, fw, tok.BorderW, tok.Border)
-	written += fillRect(pix, width, maxH, fx, fy+launchFieldH-tok.BorderW, fw, tok.BorderW, tok.Border)
-	written += fillRect(pix, width, maxH, fx, fy, tok.BorderW, launchFieldH, tok.Border)
-	written += fillRect(pix, width, maxH, fx+fw-tok.BorderW, fy, tok.BorderW, launchFieldH, tok.Border)
+	field := widgets.Rect{X: fx, Y: fy, W: fw, H: launchFieldH}
+	draw.StrokeRoundedRect(c, field, radiusControl, tok.FocusW, draw.Opaque(tok.Accent))
+	draw.FillRoundedRect(c, field.Inset(tok.FocusW), radiusControl, draw.Opaque(tok.Bg))
+	written += seatArea(c, field)
 	q := launchText(launch.filter, (fw-14)/8)
-	written += drawText8(pix, width, maxH, fx+6, fy+6, q, tok.Ink)
-	written += fillRect(pix, width, maxH, fx+8+len(q)*8, fy+6, 1, 8, tok.Caret)
+	seatText(c, field, fx+6, fy+6, seatTextPx, q, tok.Ink)
+	written += seatFill(c, widgets.Rect{X: fx + 8 + seatTextWidth(q, seatTextPx), Y: fy + 6, W: 1, H: 8}, tok.Caret)
 	if launch.err != "" {
-		written += drawText8(pix, width, maxH, launchX+tok.PadMD, launchY+launchErrY, launchText(launch.err, 30), tok.Danger)
+		seatText(c, strip, launchX+tok.PadMD, launchY+launchErrY, seatSmallPx, launchText(launch.err, 30), tok.Danger)
 	}
 	if len(launch.filtered) == 0 {
-		written += drawText8(pix, width, maxH, launchX+tok.PadMD, launchY+launchHdr+6, "No matching apps", tok.InkMuted)
+		seatText(c, strip, launchX+tok.PadMD, launchY+launchHdr+6, seatTextPx, "No matching apps", tok.InkMuted)
 	}
 	for i := launch.first; i < len(launch.filtered); i++ {
 		x, y, w, rh, ok := launch.rowRect(i, width, maxH)
@@ -680,11 +582,19 @@ func paintLauncher(scan []byte, width, height int) int {
 		if ci < 0 || ci >= len(launch.catalog) {
 			continue
 		}
-		bg := tok.Surface
+		row := widgets.Rect{X: x, Y: y, W: w, H: rh}
 		if i == launch.sel {
-			bg = tok.Selection
+			// §2.3.6: the selected row is a Selection fill carrying the
+			// 3px Accent left-edge marker — the Zig chrome's bar.
+			draw.FillRoundedRect(c, row, radiusControl, draw.Opaque(tok.Accent))
+			inner := row
+			inner.X += seatMarkerW
+			inner.W -= seatMarkerW
+			draw.FillRoundedRect(c, inner, radiusControl, draw.Opaque(tok.Selection))
+		} else {
+			draw.FillRoundedRect(c, row, radiusControl, draw.Opaque(tok.Surface))
 		}
-		written += fillRect(pix, width, maxH, x, y, w, rh, bg)
+		written += seatArea(c, row)
 		ink := tok.Ink
 		reason := ""
 		if ci < len(launch.reasons) {
@@ -694,11 +604,11 @@ func paintLauncher(scan []byte, width, height int) int {
 			// A dimmed row names its own refusal: label and reason on
 			// two lines inside the one row, never a launchable facade.
 			ink = tok.InkMuted
-			written += drawText8(pix, width, maxH, x+6, y+3, launchText(launch.catalog[ci].Label, 28), ink)
-			written += drawText8(pix, width, maxH, x+6, y+13, launchText(reason, 28), tok.Muted)
+			seatText(c, row, x+6, y+3, seatTextPx, launchText(launch.catalog[ci].Label, 28), ink)
+			seatText(c, row, x+6, y+13, seatSmallPx, launchText(reason, 28), tok.Muted)
 			continue
 		}
-		written += drawText8(pix, width, maxH, x+6, y+6, launchText(launch.catalog[ci].Label, 29), ink)
+		seatText(c, row, x+6, y+6, seatTextPx, launchText(launch.catalog[ci].Label, 29), ink)
 	}
 	return written
 }

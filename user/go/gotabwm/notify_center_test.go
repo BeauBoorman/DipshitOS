@@ -93,8 +93,12 @@ func TestNotifyCenterPaintIsBoundedAndPaintMarkerFollowsPresentation(t *testing.
 	for py := 0; py < h; py++ {
 		for px := 0; px < w; px++ {
 			in := px >= x && px < x+rw && py >= y && py < y+rh
-			if !in && pix[py*w+px] != theme.Light.Success {
-				t.Fatalf("center painted outside its panel at (%d,%d)", px, py)
+			// The §2.5 drop shadow darkens a falloff band around the
+			// panel (blur 16, dy 4) — bound it, then hold the rest of the
+			// scanout to the sentinel.
+			inShadow := px >= x-16 && px < x+rw+16 && py >= y-16 && py < y+rh+20
+			if !in && !inShadow && pix[py*w+px] != theme.Light.Success {
+				t.Fatalf("center painted outside its panel and shadow at (%d,%d)", px, py)
 			}
 		}
 	}

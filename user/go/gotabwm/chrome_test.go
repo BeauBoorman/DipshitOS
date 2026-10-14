@@ -1,19 +1,22 @@
 // chrome_test.go — M71c (#1562): host tests for the seat chrome's pure half.
 //
 // These run on the host (`go test ./gotabwm`), so they may not call any `vi`
-// guest syscall: parseClockEpoch, clockHMS, formatClock, chromeRect,
-// drawText8 and paintChrome all operate on plain Go values and a caller's
-// scanout slice, which is the whole point of keeping them out of the seat
-// loop.
+// guest syscall: parseClockEpoch, clockHMS, formatClock, chromeRect and
+// paintChrome all operate on plain Go values and a caller's scanout slice,
+// which is the whole point of keeping them out of the seat loop. M104e
+// (#2272): the painters now run through draw.BytesCanvas, and the tests pin
+// the engine's bitmap degrade on a font-less host.
 package main
 
 import (
 	"testing"
 	"unsafe"
 
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/webrender/font"
+	"virelai/widgets"
 )
 
 func TestGodMenuButtonPaintAndHitAgree(t *testing.T) {
@@ -150,23 +153,46 @@ func TestChromeRect(t *testing.T) {
 	}
 }
 
-func TestDrawText8SizesWithTheFace(t *testing.T) {
+// M104e (#2272): with no ui face resolved — the host has no staged
+// /host/FONTS.TXT — seatText repaints the run through the engine's bitmap
+// degrade, byte-identical to the drawText8 it replaced: same 8x8 face,
+// same origin, same advance. This is the never-blank rule pinned locally.
+func TestSeatTextDegradeRepaintsTheBitmapFace(t *testing.T) {
 	const w, h = 1280, 720
 	scan := make([]byte, w*h*4)
+	c, err := draw.BytesCanvas(scan, w, h)
+	if err != nil {
+		t.Fatalf("BytesCanvas: %v", err)
+	}
+	if f := seatFaceUI(); f != nil {
+		t.Skip("a ui face resolved on this host — the degrade path is unpinned")
+	}
+	seatText(c, widgets.Rect{X: 0, Y: 0, W: w, H: h}, 4, 4, seatTextPx, "ABC", theme.Dark.Ink)
 	pix := asUint32(scan)
-	n := drawText8(pix, w, h, 4, 4, "ABC", theme.Dark.Ink)
-	if n == 0 {
-		t.Fatal("drawText8 painted nothing")
+	// Every lit bit of the 8x8 face lands at (4+i*8+col, 4+row), and no
+	// pixel outside the run's own mask is ink — the run-coalesced degrade
+	// paints exactly what drawText8 did.
+	for i, ch := range "ABC" {
+		g := font.Glyph8(ch)
+		for row := 0; row < 8; row++ {
+			for col := 0; col < 8; col++ {
+				lit := g[row]&(1<<uint(col)) != 0
+				v := pix[(4+row)*w+4+i*8+col]
+				if lit && v&0xffffff != theme.Dark.Ink {
+					t.Fatalf("glyph %d bit %d,%d not painted (%#x)", i, col, row, v)
+				}
+				if !lit && v != 0 {
+					t.Fatalf("glyph %d wrote a dark cell at %d,%d", i, col, row)
+				}
+			}
+		}
 	}
-	if got, want := font.Measure("ABC", chromeScale), 24; got != want {
-		t.Fatalf("Measure(\"ABC\") = %d want %d", got, want)
-	}
-	// The third glyph's columns live at 16..23, so a run of 24-wide advance
-	// means nothing is painted past x 4+24.
-	for row := 0; row < 8; row++ {
+	// The third glyph's columns live at 16..23, so a run of 24-wide
+	// advance means nothing is painted past x 4+24.
+	for row := 0; row < 12; row++ {
 		for col := 4 + 24; col < w; col++ {
 			if pix[row*w+col] != 0 {
-				t.Fatalf("drawText8 wrote past its advance at %d,%d", col, row)
+				t.Fatalf("the degrade path wrote past its advance at %d,%d", col, row)
 			}
 		}
 	}
@@ -199,8 +225,9 @@ func TestPaintChromeStaysInsideTheRectAndUsesTokens(t *testing.T) {
 				}
 				continue
 			}
-			// fillRect forces the scanout's X byte opaque (M71c #1562), so the
-			// stored word is the token with 0xff in the top byte.
+			// The engine's Opaque fill forces the scanout's X byte 0xff
+			// (M71c #1562), so the stored word is the token with 0xff in
+			// the top byte.
 			switch v & 0xffffff {
 			case tok.ChromeBg:
 				panel++
@@ -216,8 +243,18 @@ func TestPaintChromeStaysInsideTheRectAndUsesTokens(t *testing.T) {
 	if panel == 0 {
 		t.Fatal("panel is not ChromeBg")
 	}
-	if accent != 2*ph {
-		t.Fatalf("accent rule = %d pixels want %d (2px x panel height)", accent, 2*ph)
+	// The plate is rounded now (§2.2): the accent rule follows the curved
+	// corner, so it paints fewer than the square plate's 2xH — and the
+	// 1px Rule stroke takes the silhouette's outermost column, so the
+	// rule's mid-height exact band is the second column in.
+	if accent == 0 || accent >= 2*ph {
+		t.Fatalf("rounded accent rule = %d pixels, want between 0 and %d", accent, 2*ph)
+	}
+	if pix[(y+ph/2)*w+x+1]&0xffffff != tok.Accent {
+		t.Fatal("the accent rule's mid-height band is missing")
+	}
+	if pix[(y+ph/2)*w+x]&0xffffff != tok.Rule {
+		t.Fatal("the plate's left-edge border stroke is missing")
 	}
 	if ink == 0 {
 		t.Fatal("clock face has no Ink pixels")
@@ -286,8 +323,12 @@ func TestPaintStartSurfaceUsesTokens(t *testing.T) {
 			v := pix[row*w+col]
 			inRect := col >= x && col < x+pw && row >= y && row < y+ph
 			if !inRect {
-				if v != theme.Light.Success {
-					t.Fatalf("paintStartSurface wrote outside the panel at %d,%d", col, row)
+				// The §2.5 shadow legitimately darkens a falloff band
+				// around the plate (blur 16, dy 4) — bound it, then hold
+				// the rest of the scanout to the sentinel.
+				inShadow := col >= x-16 && col < x+pw+16 && row >= y-16 && row < y+ph+20
+				if !inShadow && v != theme.Light.Success {
+					t.Fatalf("paintStartSurface wrote outside the panel and its shadow at %d,%d", col, row)
 				}
 				continue
 			}
@@ -306,8 +347,8 @@ func TestPaintStartSurfaceUsesTokens(t *testing.T) {
 	if panel == 0 {
 		t.Fatal("start panel is not Surface")
 	}
-	if accent != 2*ph {
-		t.Fatalf("start accent rule = %d pixels want %d", accent, 2*ph)
+	if accent == 0 || accent >= 2*ph {
+		t.Fatalf("rounded accent rule = %d pixels, want between 0 and %d", accent, 2*ph)
 	}
 	if ink == 0 {
 		t.Fatal("start surface title has no Ink pixels")
@@ -352,7 +393,12 @@ func TestIdleCurtainCoversScanoutAndNamesNoAuthentication(t *testing.T) {
 		t.Fatal("curtain did not cover both corners")
 	}
 	x, y := (w-curtainW)/2, (h-curtainH)/2
-	if pix[y*w+x] != 0xff000000|tok.Accent || pix[(y+2)*w+x+3] != 0xff000000|tok.Surface {
+	// The plate is rounded (§2.2): probe the mid-height band — the accent
+	// rule's straight section and the surface deep inside the plate —
+	// where no anti-aliased corner blends the tokens.
+	if pix[(y+curtainH/2)*w+x] != 0xff000000|tok.Accent ||
+		pix[(y+curtainH/2)*w+x+1] != 0xff000000|tok.Accent ||
+		pix[(y+curtainH/2)*w+x+curtainW/2] != 0xff000000|tok.Surface {
 		t.Fatal("curtain panel lacks its accent rule or surface")
 	}
 	var ink, muted int
@@ -381,9 +427,9 @@ func TestPaintChromeRefusesDegenerateScanouts(t *testing.T) {
 	}
 }
 
-// asUint32 views a scanout byte slice as the words fillRect writes. It must
-// ALIAS the caller's buffer, not copy it: fillRect's writes have to land in
-// the slice the test then reads.
+// asUint32 views a scanout byte slice as the words the draw engine writes.
+// It must ALIAS the caller's buffer, not copy it: BytesCanvas borrows the
+// same bytes, so its writes have to land in the slice the test then reads.
 func asUint32(scan []byte) []uint32 {
 	return unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), len(scan)/4)
 }
