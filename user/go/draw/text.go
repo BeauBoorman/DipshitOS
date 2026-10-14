@@ -197,6 +197,14 @@ func blitCoverage(c *BufferCanvas, mask *ttf.Mask, x0, y0, x1, y1, x, y int, rgb
 	if !valid(c) || rgb>>24 == 0 {
 		return
 	}
+	// The caller's clip still binds, and the §3.3.4 stack binds every
+	// primitive — a glyph run is no exception.
+	cl := activeClip(c)
+	x0, x1 = max(x0, cl.X), min(x1, cl.Right())
+	y0, y1 = max(y0, cl.Y), min(y1, cl.Bottom())
+	if x0 >= x1 || y0 >= y1 {
+		return
+	}
 	for dy := y0; dy < y1; dy++ {
 		for dx := x0; dx < x1; dx++ {
 			a := int(mask.Alpha[(dy-y)*mask.Width+dx-x])
