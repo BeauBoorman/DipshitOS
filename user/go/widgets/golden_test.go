@@ -146,6 +146,21 @@ func TestWidgetFaceGoldens(t *testing.T) {
 			(&widgets.List{R: rect(104, 108, 92, 24), Items: []string{"bitmap row"}, RowH: 24,
 				Fg: fg, Bg: th.ChromeBg}).Draw(c)
 		}},
+		{"controls", 220, 124, func(c *draw.BufferCanvas) {
+			// The M104d kit controls on their own §2.3 ramps — no labels, so
+			// no face involvement: the pill track/thumb, the toggle states,
+			// and the slider's band/fill/knob.
+			(&widgets.Scrollbar{R: rect(4, 4, 12, 100), Total: 40, Viewport: 10, Offset: 8}).Draw(c)
+			(&widgets.Scrollbar{R: rect(20, 4, 12, 100), Total: 40, Viewport: 10, Offset: 15, Pressed: true}).Draw(c)
+			(&widgets.Toggle{R: rect(40, 8, 32, 18)}).Draw(c)
+			(&widgets.Toggle{R: rect(40, 34, 32, 18), On: true}).Draw(c)
+			(&widgets.Toggle{R: rect(40, 60, 32, 18), On: true, Focused: true}).Draw(c)
+			(&widgets.Toggle{R: rect(40, 86, 32, 18), Disabled: true}).Draw(c)
+			(&widgets.Slider{R: rect(84, 10, 130, 20), Max: 100, Value: 40}).Draw(c)
+			(&widgets.Slider{R: rect(84, 40, 130, 20), Max: 100, Value: 65, Pressed: true}).Draw(c)
+			(&widgets.Slider{R: rect(84, 70, 130, 20), Max: 100, Value: 20, Focused: true}).Draw(c)
+			(&widgets.Slider{R: rect(84, 100, 130, 20), Max: 100, Value: 60, Disabled: true}).Draw(c)
+		}},
 		{"textinput", 200, 104, func(c *draw.BufferCanvas) {
 			idle := &widgets.TextInput{R: rect(4, 4, 192, 28), Face: face}
 			idle.SetValue("notes.txt")

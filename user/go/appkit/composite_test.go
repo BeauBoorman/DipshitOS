@@ -134,3 +134,66 @@ func TestControlsCompositeGolden(t *testing.T) {
 
 	checkCompositeGolden(t, "appkit-controls", c)
 }
+
+// The M104d (#2271) dropdown: the §2.3 button ramp, and the open popover —
+// the contract's FillShadow + PushClip surface — with its selected marker,
+// hovered row, and the kit's scrollbar inside the plate. The nil-face
+// degrade keeps legible bitmap labels (§3.4).
+func TestDropdownCompositeGolden(t *testing.T) {
+	th := theme.Current
+	ui, err := os.ReadFile("../../../image/fonts/Inter-Regular.ttf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	face, err := ttf.Parse(ui)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chrome, err := os.ReadFile("../../../image/fonts/VirelaiChrome-Regular.ttf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	icon, err := ttf.Parse(chrome)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const w, h = 240, 232
+	c := &draw.BufferCanvas{Pix: make([]uint32, w*h), W: w, H: h}
+	draw.FillRect(c, widgets.Rect{W: w, H: h}, draw.Opaque(th.Bg))
+
+	// The closed button's §2.3 ramp: idle, hover, disabled, focused.
+	for _, dd := range []*Dropdown{
+		{R: widgets.Rect{X: 4, Y: 4, W: 110, H: 24}, Items: []string{"dark", "light"}, Sel: 0},
+		{R: widgets.Rect{X: 122, Y: 4, W: 110, H: 24}, Items: []string{"dark", "light"}, Sel: 0, Hovered: true},
+		{R: widgets.Rect{X: 4, Y: 36, W: 110, H: 24}, Items: []string{"dark", "light"}, Sel: 1, Disabled: true},
+		{R: widgets.Rect{X: 122, Y: 36, W: 110, H: 24}, Items: []string{"dark", "light"}, Sel: 1, Focused: true},
+	} {
+		dd.UIFace, dd.IconFace = face, icon
+		dd.Draw(c)
+	}
+
+	// Open, goset-vocab-flavoured rows: selected marker on row 1, the
+	// hovered row 3, five items under MaxRows 4 so the popover carries the
+	// kit's scrollbar — all under the §2.5 shadow and the clip stack.
+	open := &Dropdown{
+		R:        widgets.Rect{X: 4, Y: 68, W: 160, H: 24},
+		Items:    []string{"tabbed", "floating", "grid", "stack", "monocle"},
+		Sel:      1,
+		Open:     true,
+		MaxRows:  4,
+		HoverRow: 3,
+		UIFace:   face, IconFace: icon,
+	}
+	open.Draw(c)
+
+	// The nil-face degrade: a closed control labels itself through the
+	// bitmap face and a text "v" affordance.
+	bare := &Dropdown{
+		R:     widgets.Rect{X: 4, Y: 204, W: 120, H: 24},
+		Items: []string{"one", "two"}, Sel: 0,
+	}
+	bare.Draw(c)
+
+	checkCompositeGolden(t, "appkit-dropdown", c)
+}
