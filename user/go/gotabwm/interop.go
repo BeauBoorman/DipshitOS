@@ -190,6 +190,24 @@ func gateRPC(req vi.WmRpc) (pad uint8, auth uint64, apply bool) {
 		if req.ReplyTo == b.pid && vi.WmAuth(req) == b.token {
 			return vi.WmRpcPadBound, b.token, true
 		}
+		// #2260 heal: a bound id presenting NO credentials is a client
+		// that lost its session token (ack timeout / full-mailbox send
+		// refusal under load) while the seat still holds its half of the
+		// binding. Bare-refusing wedges that client forever — it can only
+		// send unauthed frames and each is refused — so offer a fresh
+		// challenge instead. The echo still has to produce the
+		// owner-restricted title proof, the same bar as the first bind.
+		if vi.WmAuth(req) == 0 {
+			return vi.WmRpcPadChallenge, challengeFor(req.ID), false
+		}
+		// A bound id quoting the pending challenge is that client's echo:
+		// completeBind re-checks it against the kernel title and installs
+		// a fresh token, retiring the stale binding the same way a first
+		// bind does. Wrong-token frames (a forged credential guess) still
+		// fall through to the bare refusal.
+		if completeBind(req) {
+			return vi.WmRpcPadBound, rpcBindings[req.ID].token, true
+		}
 		return vi.WmRpcPadPlain, 0, false
 	}
 	if vi.WmAuth(req) == 0 {
@@ -341,7 +359,19 @@ func serviceRPC() int {
 		if apply {
 			applied = applyRPC(req)
 		} else if pad == vi.WmRpcPadPlain {
-			vi.ConsoleLine(MarkerRpcRefuse + vi.Itoa64(int64(req.ID)))
+			// #2260: name why the bound id refused — which pid asked,
+			// which kind, and whether any credentials rode the frame.
+			// Never print the auth value itself (it is the session
+			// credential); the 0/1 flag is enough to split "sender had
+			// no token" from "sender held a stale token".
+			authed := int64(0)
+			if vi.WmAuth(req) != 0 {
+				authed = 1
+			}
+			vi.ConsoleLine(MarkerRpcRefuse + vi.Itoa64(int64(req.ID)) +
+				" pid=" + vi.Itoa64(int64(req.ReplyTo)) +
+				" kind=" + vi.Itoa64(int64(req.Kind&0x7f)) +
+				" authed=" + vi.Itoa64(authed))
 		}
 		replyRPC(req, applied, pad, auth)
 		served++

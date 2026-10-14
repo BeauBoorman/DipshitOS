@@ -243,6 +243,9 @@ type wmMailFake struct {
 	// the register WmPeers prefers over the name scan (#2158). A zero
 	// value models a kernel without the slot (-ENOSYS → scan fallback).
 	kernPID int64
+	// sendENOSPC fails the next N sends with -ENOSPC — the seat's ring
+	// momentarily full, the transient #2260 made retriable.
+	sendENOSPC int
 	// extraProcs are appended to the fake's two built-in proc rows — the
 	// duplicate-instance shape needs a second RUNNING row with the same
 	// name as the caller's binary.
@@ -304,6 +307,10 @@ func (f *wmMailFake) hook(num uintptr, a0, a1, a2, a3 uintptr) int64 {
 	case SlotIPCSend:
 		f.sendCalls++
 		f.sendTarget = uint32(a0)
+		if f.sendENOSPC > 0 {
+			f.sendENOSPC--
+			return -ErrENOSPC
+		}
 		if frame, ok := DecodeWmRpc(hookBytes(a1, a2)); ok {
 			f.sent = append(f.sent, frame)
 		}
@@ -937,5 +944,65 @@ func TestWindowLifecycleClearsWmToken(t *testing.T) {
 	}
 	if got := wmToken(7); got != 0xf00d {
 		t.Fatalf("refused close dropped the live binding's token %#x", got)
+	}
+}
+
+// #2260: a momentarily-full seat mailbox (ENOSPC from slot 5) is transient —
+// the ring drains once per composite pass — so the send retries a few ticks
+// instead of refusing a servable request outright.
+func TestWmSendRetriesFullMailbox(t *testing.T) {
+	f := startWmMailFake(t)
+	f.wmName = "GOTABWM.ELF"
+	const challenge = uint64(0x00deadbeef00cafe)
+	const token = uint64(0x0123456789abcdef)
+	f.replyFn = func(req WmRpc) []byte {
+		rep := WmRpc{Kind: req.Kind | WmRpcReplyFlag, ID: req.ID, Seq: req.Seq, ReplyTo: req.ReplyTo}
+		switch WmAuth(req) {
+		case 0:
+			rep.Pad = WmRpcPadChallenge
+			SetWmAuth(&rep, challenge)
+		case challenge, token:
+			rep.Pad = WmRpcPadBound
+			SetWmAuth(&rep, token)
+			rep.Applied = 1
+		default:
+			return nil
+		}
+		return rep.Encode()
+	}
+	prev := bindSetTitle
+	bindSetTitle = func(id int, s string) int64 { return 0 }
+	t.Cleanup(func() { bindSetTitle = prev })
+
+	f.sendENOSPC = 2 // the first two sends hit a full ring
+	if !Notify(4, "copied KNOWN.TXT", "NOTE.ELF") {
+		t.Fatal("a transiently full seat mailbox must retry, not refuse")
+	}
+	if f.sendCalls != 4 {
+		t.Fatalf("send calls = %d want 4 (2 ENOSPC + unbound + echo)", f.sendCalls)
+	}
+	if len(f.sent) != 2 {
+		t.Fatalf("delivered frames = %d want 2 (refused sends did not land)", len(f.sent))
+	}
+	if f.sleepCalls != 2 {
+		t.Fatalf("ENOSPC retries parked %d ticks, want 2 (one per resend)", f.sleepCalls)
+	}
+}
+
+// A ring that stays full still refuses — the retry is a bounded courtesy,
+// not an unbounded block.
+func TestWmSendGivesUpAfterBound(t *testing.T) {
+	f := startWmMailFake(t)
+	f.wmName = "GOTABWM.ELF"
+	f.sendENOSPC = 99
+	if Notify(4, "copied KNOWN.TXT", "NOTE.ELF") {
+		t.Fatal("a permanently full mailbox must still refuse")
+	}
+	if f.sendCalls != wmSendRetries+1 {
+		t.Fatalf("send calls = %d want %d (bounded retry then give up)",
+			f.sendCalls, wmSendRetries+1)
+	}
+	if len(f.sent) != 0 {
+		t.Fatalf("refused sends reached the wire: %d frames", len(f.sent))
 	}
 }

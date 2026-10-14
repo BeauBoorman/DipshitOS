@@ -143,7 +143,10 @@ Milestone 9 allocates slots 21 and 22 in the frozen ADR 0007 syscall table:
 
 ### D6. Queue geometry and lifecycle discipline
 
-- **Queue Capacity:** Exactly 16 events per process slot (`events_per_process = 16`).
+- **Queue Capacity:** 64 events per process slot (`events.max_events = 64`;
+  raised from 16 by #2260 — the cv input pump can dispatch a full
+  32-completion used-ring pass in one idle turn, and a 16-deep target queue
+  dropped the head of every burst that out-grew it under scheduling load).
 - **Memory Discipline:** Statically allocated in kernel BSS (`[process.max_processes]EventQueue`). No heap allocation.
 - **Overflow Policy:** Drop-oldest FIFO. When full, pushing an event drops the oldest unconsumed event and increments `dropped_count`.
 - **Lifecycle Reset:** `events.reset(pid)` is called during process creation (`process.allocate`) and process termination (`process.free`).
@@ -185,7 +188,7 @@ runtime's netpoll drain the queue — is **rejected**, for three reasons:
    window stream the GUI loop consumes (`sys_poll_event` / `sys_wait_event`).
    A runtime poller draining readiness from the same FIFO would consume the
    application's keyboard and window events.
-2. **Drop-oldest would lose readiness.** The queue is a bounded 16-event FIFO
+2. **Drop-oldest would lose readiness.** The queue is a bounded 64-event FIFO
    with a drop-oldest overflow policy. Readiness is not a notification that
    tolerates loss; dropping it wedges a reader until an unrelated event
    happens to arrive.
