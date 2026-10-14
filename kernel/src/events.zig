@@ -1,7 +1,11 @@
 //! VirelaiOS bounded per-process event queue (Milestone 9, card E1 — claim 7670).
 //!
 //! Provides fixed-capacity in-memory event FIFOs for EL0 processes (ADR 0009):
-//! - 16 events per process slot (`max_events = 16`).
+//! - 64 events per process slot (`max_events = 64`; raised 16 -> 64 for
+//!   #2260 — the cv input pump can dispatch a whole 32-completion used-ring
+//!   pass in one idle turn, and a 16-deep target queue dropped the head of
+//!   every such burst (alt-tab / paste-confirm) while the seat was off the
+//!   ring).
 //! - Statically allocated in kernel BSS (pure BSS, no heap, no allocation).
 //! - Drop-oldest discipline when full (tracks monotonic dropped count).
 //! - Monotonic sequence numbering per process slot.
@@ -117,7 +121,7 @@ pub const Event = extern struct {
     arg1: u32,
 };
 
-pub const max_events: usize = 16;
+pub const max_events: usize = 64;
 pub const event_bytes: usize = @sizeOf(Event);
 
 // ---------------------------------------------------------------------------

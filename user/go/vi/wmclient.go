@@ -364,6 +364,26 @@ func waitWmRpcAck(seq, replyTo uint8, accept func(WmRpc) bool) (WmRpc, bool) {
 // round-trip.
 const wmBindMaxRounds = 3
 
+// wmSendRetries bounds the full-mailbox resend: the seat's ring is 8 deep
+// and drains once per composite pass, so a frame that hits ENOSPC under a
+// burst fits one tick later (#2260 — a one-shot send turned a momentarily
+// full seat mailbox into an instant `refused` while the request was
+// otherwise servable).
+const wmSendRetries = 4
+
+// wmSend posts one request frame to the seat, retrying only the transient
+// ENOSPC (ring full) for a few scheduler ticks. Every other error —
+// EINVAL for a dead seat, EFAULT — fails at once.
+func wmSend(target uint32, b []byte) int64 {
+	for i := 0; i < wmSendRetries; i++ {
+		if r := IpcSend(target, b); r != -ErrENOSPC {
+			return r
+		}
+		_ = svc1(SlotSleep, 1)
+	}
+	return IpcSend(target, b)
+}
+
 // wmRequest sends one WM_RPC request to the resolved seat and returns its
 // genuine ack (or ok=false on refusal/timeout/no seat). The Zig seats keep
 // the bare legacy exchange; the Go seat adds the ownership handshake: an
@@ -441,7 +461,7 @@ func wmRequestGoTitle(kind uint8, id uint8, title [WmRpcTitleMax]byte, restoreTi
 		} else {
 			accept = func(m WmRpc) bool { return m.Pad == WmRpcPadChallenge }
 		}
-		if IpcSend(peers.WM, req.Encode()) < 0 {
+		if wmSend(peers.WM, req.Encode()) < 0 {
 			return WmRpc{}, false
 		}
 		rep, ok := waitWmRpcAck(req.Seq, req.ReplyTo, accept)
@@ -466,7 +486,7 @@ func wmRequestGoTitle(kind uint8, id uint8, title [WmRpcTitleMax]byte, restoreTi
 		req.Seq = nextWmSeq()
 		req.Pad = WmRpcPadBound
 		SetWmAuth(&req, challenge)
-		if IpcSend(peers.WM, req.Encode()) < 0 {
+		if wmSend(peers.WM, req.Encode()) < 0 {
 			return WmRpc{}, false
 		}
 		rep, ok = waitWmRpcAck(req.Seq, req.ReplyTo,

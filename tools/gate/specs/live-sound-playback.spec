@@ -279,20 +279,33 @@ vgate_assert wav-nodev serial-absent '[EXC] parking'
 # and this run execs GOTABWM.ELF itself. `vf rm GOTABWM.DEMO` keeps the
 # seat live (demo mode's single-tab countdown would close apps).
 #
-# SND2/LONG.WAV is a 40 s 44.1 kHz stereo sine — same resample path as
-# TONE.WAV, four times the stream length — because the toast takes real
-# wall time to arrive: the mid-stream chord batch is alt-tab plus the five
-# printable-byte strokes (j c k return p, the keys.Decode-safe dance from
-# go-wm-seat run 06) and each stroke was observed costing ~1 s while the
-# seat composited under load (first attempts, 2026-10-12). The script-
-# expect is `gosound: done`, so the toast has to land well inside the
-# stream. Measured under load (2026-10-12): the seat forwards input on a
-# starved cadence while it composites — the first app-directed keystroke
-# after the alt-tab sat ~10 s before the batch drained; the whole
-# alt-tab+j c k return p batch spanned ~15 s. 40 s still failed: the
-# kind-12 post landed but the starved seat did not drain its mailbox —
-# and the played chime — before teardown (observed 2026-10-13). 60 s
-# leaves a ~35 s drain window after the ~25 s batch.
+# SND2/LONG.WAV is a 60 s 44.1 kHz stereo sine — same resample path as
+# TONE.WAV — so the toast has a wide drain window inside the stream.
+#
+# #2260 root cause (this leg used to flap), three coupled defects:
+#  1. The seat's poll loop parked a full 1 Hz scheduler tick on every empty
+#     poll AND after every consumed WM_KEY, so injected strokes (0.25 s/
+#     stroke host-side) piled up — first in the cv input ring, then as
+#     drop-oldest losses in the 16-deep process event queue when one
+#     idle-turn pump burst overflowed it (the batch head — the alt-tab
+#     focus move — is exactly what drop-oldest eats). The seat now blocks
+#     on sys_wait_event (the kernel wakes event waiters on every push, so
+#     keys drain at arrival rate) and yields after each key instead of
+#     parking a tick; the event queue grew 16 -> 64, twice the pump's
+#     per-pass bound.
+#  2. RPC latency slips under the same load push the client's 8-tick ack
+#     budget over: its token drops and retries go out unauthenticated —
+#     but the seat bare-refused unauthed frames on a BOUND id forever
+#     (observed: 'rpc refuse ... authed=0' repeating until teardown), so
+#     the client's documented re-challenge recovery could never trigger.
+#     gateRPC now re-challenges credential-less frames on a bound id and
+#     lets a title-proven echo rebind (same proof bar as a first bind).
+#  3. A client send that hit the momentarily-full 8-deep seat mailbox
+#     returned ENOSPC -> instant `notify refused`; vi.wmSend now retries
+#     ENOSPC a bounded 4 ticks.
+# The toast chain below is the regression surface: every chord edge must
+# reach the seat (the key-marker count assert), and the kind-12 post must
+# paint + play inside the stream.
 vgate_setup_python <<'PY'
 import math, os, shutil, struct, sys
 rd = os.environ["RUN_DIR"]
@@ -420,6 +433,17 @@ vgate_assert wav-toast serial-contains 'gotabwm: notify id='
 vgate_assert wav-toast serial-contains 'gotabwm: notify paint id='
 vgate_assert wav-toast serial-contains 'gotabwm: notify-sound played bytes='
 vgate_assert wav-toast serial-contains 'gosound: done '
+# #2260 drop detector: the 16 injected chords each produce exactly one
+# WM_KEY edge, and the seat prints 'gotabwm: key' for every edge it
+# consumes. A seat-queue overflow drops the head of the batch — the count
+# falls below 16 and this fails even when a toast still lands via cycle B.
+vgate_assert wav-toast python <<'PY'
+import os, sys
+n = open(os.environ["VG_SER"]).read().count("gotabwm: key")
+if n < 16:
+    sys.exit(f"ERROR: seat consumed {n} key edges, want >= 16 — "
+             f"event-queue drop under PCM load")
+PY
 # 'gofiles: open refused' and 'gofiles: open launch refused' are
 # deliberately NOT absent-asserted: the doubled-stroke design tolerates
 # drops AND doubles — a stray return on a .XYZ source prints `open

@@ -1505,7 +1505,7 @@ transient here — a probe before `sys_tcp_connect` is a race, not a
 permission error.
 
 Why a slot and not an ADR 0009 event kind. ADR 0009's queue is the
-application's input/window stream, bounded at 16 events and drop-oldest. A
+application's input/window stream, bounded at 64 events and drop-oldest. A
 poller that consumed readiness from that FIFO would steal the app's keyboard
 and window events, and the drop-oldest policy would silently discard
 readiness. Slot 76 keeps readiness out of that stream entirely: it is a

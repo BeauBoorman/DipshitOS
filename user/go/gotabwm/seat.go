@@ -401,8 +401,21 @@ func main() {
 		}
 		e, ok := vi.PollEvent()
 		if !ok {
-			vi.Sleep(1)
-			continue
+			// #2260: block on the event queue instead of parking a whole
+			// scheduler tick (~1 s at the 1 Hz tick) per empty poll. The
+			// kernel wakes event waiters on every push, so input drains at
+			// arrival rate instead of ~1 Hz — a key/pointer burst can no
+			// longer pile past the 64-deep queue and drop-oldest while the
+			// seat slept. COMPOSITE_TICK still lands each second, so the
+			// serviceRPC/mailbox pass keeps at least its old cadence.
+			w, r := vi.WaitEvent()
+			if r <= 0 {
+				if r < 0 {
+					vi.Sleep(1) // never spin on a refused wait
+				}
+				continue
+			}
+			e = w
 		}
 		// Drain the complete event queue before yielding to another empty
 		// poll. A virtio chord can enqueue several WM_KEY/POINTER events while
@@ -700,11 +713,15 @@ func consumeSeatEvent(e vi.Event) bool {
 		}
 		handleWmKey(e)
 		// Yield only when the launcher is closed: a hosted client (GOEDIT
-		// ctrl-s) needs a tick to drain KEY_DOWN before the next virtio
-		// chord. While the launcher is open, Sleep would drop the next
-		// type-to-filter report (observed: first `c` of `calc` vanished).
+		// ctrl-s) needs a scheduling slice to drain KEY_DOWN before the
+		// next virtio chord. #2260: this used to park a whole scheduler
+		// tick (~1 s) per key — at 4 strokes/s of injected input the
+		// seat's 16-deep queue overflowed and drop-oldest ate the batch
+		// head (the alt-tab focus change or the paste-confirm return),
+		// which is exactly how the wav-toast chain went silent. A yield
+		// hands the client its slice without taking the seat off the wire.
 		if !launch.open {
-			vi.Sleep(1)
+			vi.Yield()
 		}
 		return false
 	}

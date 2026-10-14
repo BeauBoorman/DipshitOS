@@ -234,3 +234,95 @@ func TestServiceRPCBindingDiesWithWindow(t *testing.T) {
 		t.Fatalf("dead-token frame ack = %+v want re-challenge", acks)
 	}
 }
+
+// #2260: a client that loses its session token (ack timeout / full-mailbox
+// send refusal under load) while the seat still holds the binding used to
+// wedge permanently — every unauthed retry drew a bare refusal and no
+// challenge, so the client could never rebind and its requests (the notify
+// post included) starved forever. The seat now answers an unauthed frame
+// on a bound id with a fresh challenge; the title-proven echo rebinds.
+func TestServiceRPCReChallengesBoundIdWithNoCredentials(t *testing.T) {
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+	if !tabs.OpenTab(4, "x") {
+		t.Fatal("OpenTab")
+	}
+	ownerTitle := ""
+	stubAuthSeams(t, func(id uint8) (string, bool) {
+		if id != 4 || ownerTitle == "" {
+			return "", false
+		}
+		return ownerTitle, true
+	})
+	// The seat's half of the original session: pid 7 bound window 4.
+	rpcBindings[4] = rpcBinding{pid: 7, token: 0xbeef}
+
+	// 1. An unauthed frame (client's token is gone) draws a challenge,
+	//    not a bare refusal — the client's documented recovery expects it.
+	req := vi.WmRpc{Kind: vi.WmRpcKindNotify, ID: 4, Seq: 1, ReplyTo: 7}
+	req.SetTitle("copied X")
+	acks := decodeAcks(t, serveOneWmRpc(t, req.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadChallenge || acks[0].Applied != 0 {
+		t.Fatalf("lost-token frame ack = %+v want a fresh challenge", acks)
+	}
+	challenge := vi.WmAuth(acks[0])
+	if challenge == 0 {
+		t.Fatal("zero challenge")
+	}
+
+	// 2. The echo with the owner-only title proof rebinds under a FRESH
+	//    token — the stale binding retires — and the request applies.
+	ownerTitle = vi.WmBindChallengeTitle(challenge)
+	echo := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 2, ReplyTo: 7,
+		Pad: vi.WmRpcPadBound}
+	echo.SetTitle("real")
+	vi.SetWmAuth(&echo, challenge)
+	acks = decodeAcks(t, serveOneWmRpc(t, echo.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadBound || acks[0].Applied != 1 {
+		t.Fatalf("heal echo ack = %+v want bound applied", acks)
+	}
+	token := vi.WmAuth(acks[0])
+	if token == 0 || token == 0xbeef || token == challenge {
+		t.Fatalf("rebind token = %#x want a fresh value", token)
+	}
+	if rpcBindings[4].token != token || rpcBindings[4].pid != 7 {
+		t.Fatalf("binding after heal = %+v", rpcBindings[4])
+	}
+
+	// 3. The wedge is healed: the rebound client's frames apply again.
+	bound := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 3, ReplyTo: 7,
+		Pad: vi.WmRpcPadBound}
+	bound.SetTitle("legit")
+	vi.SetWmAuth(&bound, token)
+	acks = decodeAcks(t, serveOneWmRpc(t, bound.Encode()))
+	if len(acks) != 1 || acks[0].Applied != 1 {
+		t.Fatalf("post-heal bound ack = %+v", acks)
+	}
+}
+
+// The heal must not soften the credential check: a nonzero auth value that
+// is neither the session token nor the pending challenge still draws the
+// bare refusal — no challenge oracle for credential guessing.
+func TestServiceRPCStillRefusesWrongTokenOnBoundId(t *testing.T) {
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+	if !tabs.OpenTab(4, "x") {
+		t.Fatal("OpenTab")
+	}
+	stubAuthSeams(t, func(uint8) (string, bool) { return "", false })
+	rpcBindings[4] = rpcBinding{pid: 7, token: 0xbeef}
+
+	forged := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 1, ReplyTo: 7,
+		Pad: vi.WmRpcPadBound}
+	forged.SetTitle("pwned")
+	vi.SetWmAuth(&forged, 0xdead) // wrong nonzero token
+	acks := decodeAcks(t, serveOneWmRpc(t, forged.Encode()))
+	if len(acks) != 1 || acks[0].Applied != 0 || acks[0].Pad != vi.WmRpcPadPlain {
+		t.Fatalf("wrong-token ack = %+v want bare refusal", acks)
+	}
+	if tabs.At(0).Title != "x" {
+		t.Fatalf("wrong-token frame applied: title = %q", tabs.At(0).Title)
+	}
+}
