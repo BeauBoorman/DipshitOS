@@ -830,6 +830,30 @@ Named limits, so a green run is not read as more than it is:
 - These are class-B gates (VZ + Metal on Apple silicon): they run where
   the class-B fleet runs, not on every push.
 
+## FLINT source control (M103, ADR 0049)
+
+`go-flint` is the ADR 0049 class-B gate for `FLINT.ELF`, grown across
+M103a–d. Because later runs share `/host` state across boots, the spec is
+not `vgate_repeat`-safe.
+
+| run | proves |
+|-----|--------|
+| 01 | M103a (#2253): `FLINT.ELF parse-corpus /host/FLINTC` runs `go/parser` (`parser.SkipObjectResolution`) and FLINT's Go-native Zig declaration scanner in-guest over the 100-file corpus (50 `.go` + 50 `.zig`), prints `flint: parse files=100 atoms=245 parse_errors=0`, and writes `/host/FLINTC.OUT` byte-equal to the host's independent rendering of `MANIFEST.json` (`share-equals`) |
+
+Host prerequisites:
+
+```bash
+bash tools/go/build-flint.sh   # FLINT.ELF (8 MiB budget; bans crypto/*)
+just gate go-flint
+```
+
+Class-A coverage is `cd user/go && go test ./flint/... && go vet ./flint/...`:
+`TestCorpus` (100 corpus files vs `MANIFEST.json`), `TestPairs` (rename,
+body edit, whitespace/comment, parameter edit, field reorder),
+`TestRefusals` (`anon_ret.zig` -> `parse_unsupported`, `bad.go` -> `syntax`),
+`TestCanon` (`testdata/canon/*.txt`), and `TestZigOracle` (`zig run
+tools/flint/zigdecls.zig` over all 50 `.zig` files).
+
 ## Verification sequence
 
 Every `zig` command below must resolve to the pinned compiler: the version +
