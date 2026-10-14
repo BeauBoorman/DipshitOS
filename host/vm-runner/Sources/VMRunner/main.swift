@@ -940,9 +940,9 @@ while idx < arguments.count {
                       "--vz-restore-save", "--vz-restore-load", "--vz-restore-witness",
                       "--vz-restore-verify-command", "--vz-restore-verify-output",
                       "--usb-msd", "--virtio-fs"]
-        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio"]
+        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal"]
         guard valued.contains(arg) || bare.contains(arg) else {
-            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio.")
+            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal.")
         }
         if valued.contains(arg) {
             guard idx + 1 < arguments.count, !arguments[idx + 1].hasPrefix("--") else {
@@ -2583,22 +2583,28 @@ do { try config.validate() } catch { fail("Invalid VM configuration: \(error)") 
 if vzRestore {
 #if arch(arm64)
     // M70g G3 (#1459): name the attached extras so a verdict line is
-    // self-describing when it lands in docs/hardware-contract.md.
-    var vzRestoreExtras: [String] = []
-    if displayMode { vzRestoreExtras.append("virtio-gpu") }
-    if inputMode { vzRestoreExtras.append("usb-hid(xhci)") }
-    if usbMsdPath != nil { vzRestoreExtras.append("usb-msd(xhci)") }
-    if customVirtioEnabled { vzRestoreExtras.append("custom-virtio") }
-    if gpu3dOptions.metal { vzRestoreExtras.append("gpu3d-metal") }
-    if virtioFSShareDir != nil { vzRestoreExtras.append("virtio-fs") }
-    let vzRestoreDevices = vzRestoreExtras.isEmpty ? "headless-base" : vzRestoreExtras.joined(separator: ",")
+    // self-describing when it lands in docs/hardware-contract.md. #2261:
+    // each entry carries whether it is a VZ custom-virtio device — those
+    // are the observed-unsaveable ones, and the refusal names them.
+    var vzRestoreExtras: [(name: String, customVirtio: Bool)] = []
+    if displayMode { vzRestoreExtras.append(("virtio-gpu", customVirtio: false)) }
+    if inputMode { vzRestoreExtras.append(("usb-hid(xhci)", customVirtio: false)) }
+    if usbMsdPath != nil { vzRestoreExtras.append(("usb-msd(xhci)", customVirtio: false)) }
+    if customVirtioEnabled { vzRestoreExtras.append(("custom-virtio", customVirtio: true)) }
+    if gpu3dOptions.metal { vzRestoreExtras.append(("gpu3d-metal", customVirtio: true)) }
+    if virtioFSShareDir != nil { vzRestoreExtras.append(("virtio-fs", customVirtio: false)) }
+    let vzRestoreDevices = vzRestoreExtras.isEmpty ? "headless-base" : vzRestoreExtras.map(\.name).joined(separator: ",")
     print("VZ-RESTORE: devices=\(vzRestoreDevices) mode=\(vzRestoreLoadDir != nil ? "load" : vzRestoreSaveDir != nil ? "save" : "same-process")")
     do {
         try config.validateSaveRestoreSupport()
         print("VZ-RESTORE: validateSaveRestoreSupport passed; \(ProcessInfo.processInfo.operatingSystemVersionString), arm64")
     } catch {
         print("VZ-RESTORE: validateSaveRestoreSupport REFUSED devices=\(vzRestoreDevices) error=\(error as NSError)")
-        fail("--vz-restore validateSaveRestoreSupport failed: \(error as NSError). No snapshot or reboot fallback.")
+        // VZ cannot serialize custom-virtio device state and offers no
+        // detach/quiesce API, so a configuration carrying one is refused
+        // wholesale: name the blocking attachment(s), not just the list.
+        let blocking = vzRestoreExtras.filter(\.customVirtio).map(\.name)
+        fail("--vz-restore validateSaveRestoreSupport failed: \(error as NSError). No snapshot or reboot fallback. Blocking device(s): \(blocking.isEmpty ? vzRestoreDevices : blocking.joined(separator: ",")).")
     }
 #else
     fail("--vz-restore requires arm64 save/restore APIs.")
