@@ -16,6 +16,7 @@ package widgets
 
 import (
 	"virelai/theme"
+	"virelai/ttf"
 	"virelai/webrender/font"
 )
 
@@ -50,17 +51,22 @@ func (r Rect) Inset(n int) Rect {
 
 // Canvas is the M86 chrome set. FillRect keeps its original signature and
 // behavior; the other operations let controls and appkit use the same
-// geometry on a shared window buffer or the legacy fill-batch path.
+// geometry on a shared window buffer or the legacy fill-batch path. Text is
+// the contract v2 (§3.2) label path: a nil face must degrade to the bitmap
+// face, never blank the label.
 type Canvas interface {
 	FillRect(r Rect, rgb uint32)
 	FillRoundedRect(r Rect, radius int, rgb uint32)
 	StrokeRoundedRect(r Rect, radius, weight int, rgb uint32)
 	BlitTinted(src []uint32, srcW, srcH, x, y int, rgb uint32)
+	Text(face *ttf.Face, clip Rect, x, y, size int, s string, rgb uint32)
 }
 
-// RectCanvas is the pre-M86 fill-only subset. Existing widgets still draw
-// through it unchanged, including clients that cannot bind a window buffer.
-// New chrome (appkit.Dialog) asks for the full Canvas above.
+// RectCanvas is the pre-M86 fill-only subset. Every widget's Draw still takes
+// it: inside, the widget type-asserts to Canvas and paints the rounded,
+// TrueType-labelled form when the assertion holds, and the flat v1 form when
+// it does not — so a fill-only recorder sees the byte-identical FillRect
+// stream it always has (the zero-regression fixed point, §3.4).
 type RectCanvas interface {
 	FillRect(r Rect, rgb uint32)
 }
@@ -121,15 +127,75 @@ func Column(x, y, w, h, gap, n int) []Rect {
 	return out
 }
 
+// labelPx is the chrome label size — §2.2 fixes UI text at the terminal's
+// 13px face.
+const labelPx = 13
+
+// radiusControl is the §2.2 corner radius for control and list plates.
+const radiusControl = 4
+
+// opaque lifts a 24-bit theme token or app RGB field into the engine's
+// 0xAARRGGBB. The full-canvas path shares its methods with draw, where alpha
+// 0 is a no-op, so every colour leaving a widget through Canvas is opaque.
+// (widgets cannot take draw.Opaque — the import direction is fixed, §3.1.)
+func opaque(rgb uint32) uint32 { return rgb | 0xff000000 }
+
+// blendHalf is the §2.3 disabled face: a 50% integer blend of a toward b as
+// a per-channel average — deterministic, never brighter than default.
+func blendHalf(a, b uint32) uint32 {
+	return (a & b) + (((a ^ b) >> 1) & 0x7f7f7f)
+}
+
+// labelBaseline is the §3.4 baseline for a label vertically centred in plate:
+// y = plate.Y + (plate.H-asc-desc)/2 + asc, the formula appkit's dialogText
+// established.
+func labelBaseline(face *ttf.Face, plate Rect) int {
+	asc, desc, _ := face.LineMetrics(labelPx)
+	return plate.Y + (plate.H-asc-desc)/2 + asc
+}
+
+// drawLabel paints one label run. On a full Canvas it goes through
+// Canvas.Text — a nil face is legal and degrades inside the implementation
+// to the 8x8 bitmap face (§3.2/§3.4: a failed font load never blanks a
+// label). A RectCanvas-only surface takes drawGlyphRun directly: no face, or
+// no full canvas, is the bitmap fallback either way. The bitmap path keeps
+// its 24-bit colours and its left-anchored geometry unchanged.
+func drawLabel(c RectCanvas, face *ttf.Face, plate Rect, s string, rgb uint32, centered bool) {
+	fc, ok := c.(Canvas)
+	if !ok {
+		drawGlyphRun(c, plate, s, rgb)
+		return
+	}
+	x, y := plate.X+theme.Current.PadXS, 0
+	if face != nil {
+		y = labelBaseline(face, plate)
+		if centered {
+			w := 0
+			for _, ch := range s {
+				w += face.AdvancePx(ch, labelPx)
+			}
+			if w < plate.W-2*theme.Current.PadXS {
+				x = plate.X + (plate.W-w)/2
+			}
+		}
+	}
+	fc.Text(face, plate, x, y, labelPx, s, opaque(rgb))
+}
+
 // --- Text -------------------------------------------------------------------
 
 // Text is a single line of label text in a bounded plate. Draw paints the
 // plate (and clipped glyph cells); HitTest tests the same plate.
+//
+// Face is the §3.4 optional TrueType label face — nil keeps the 8x8 bitmap
+// face. Disabled drops the label to the Muted role (§2.3).
 type Text struct {
-	R     Rect
-	Label string
-	Fg    uint32
-	Bg    uint32
+	R        Rect
+	Label    string
+	Fg       uint32
+	Bg       uint32
+	Face     *ttf.Face
+	Disabled bool
 }
 
 // Bounds is the plate — the ONE rect Draw and HitTest both read.
@@ -138,13 +204,23 @@ func (t *Text) Bounds() Rect { return t.R }
 // HitTest agrees with Bounds by construction.
 func (t *Text) HitTest(x, y int) bool { return t.R.Contains(x, y) }
 
-// Draw paints the plate then a run of fixed glyph cells clipped inside it.
+// Draw paints the plate then the label run. A full Canvas gets the rounded
+// plate; a RectCanvas-only surface keeps the flat fill.
 func (t *Text) Draw(c RectCanvas) {
 	if t.R.Empty() {
 		return
 	}
+	fg := t.Fg
+	if t.Disabled {
+		fg = theme.Current.Muted
+	}
+	if fc, ok := c.(Canvas); ok {
+		fc.FillRoundedRect(t.R, radiusControl, opaque(t.Bg))
+		drawLabel(fc, t.Face, t.R, t.Label, fg, false)
+		return
+	}
 	c.FillRect(t.R, t.Bg)
-	drawGlyphRun(c, t.R, t.Label, t.Fg)
+	drawGlyphRun(c, t.R, t.Label, fg)
 }
 
 // --- Button -----------------------------------------------------------------
@@ -155,15 +231,22 @@ func (t *Text) Draw(c RectCanvas) {
 // Face/Border/LabelRGB of 0 mean "use the theme table". Hover/press/focus
 // colours always come from the table (M69c #1530). Apps that already have
 // pointer events set Hovered/Pressed; this package does not add an event ABI.
+// Disabled resolves the §2.3 disabled state — the idle face blended 50%
+// toward Surface, a Muted label — and suppresses the focus ring.
+//
+// LabelFace is the §3.4 optional TrueType label face; it is not Face because
+// Face is the kit's pre-existing 24-bit face-colour override.
 type Button struct {
-	R        Rect
-	Label    string
-	Face     uint32
-	Border   uint32
-	LabelRGB uint32
-	Hovered  bool
-	Pressed  bool
-	Focused  bool
+	R         Rect
+	Label     string
+	Face      uint32
+	Border    uint32
+	LabelRGB  uint32
+	Hovered   bool
+	Pressed   bool
+	Focused   bool
+	Disabled  bool
+	LabelFace *ttf.Face
 }
 
 // Bounds is the outer frame.
@@ -172,23 +255,43 @@ func (b *Button) Bounds() Rect { return b.R }
 // HitTest agrees with Bounds by construction.
 func (b *Button) HitTest(x, y int) bool { return b.R.Contains(x, y) }
 
-// Draw paints the border, the inset face, then the centred label run.
+// Draw paints the border, the inset face, then the label run. A full Canvas
+// gets the §2.2 rounded plate, an inside FocusW focus ring, and the label
+// through Canvas.Text; a RectCanvas-only surface keeps the flat v1 form —
+// border fill, inset face fill, bitmap run.
 func (b *Button) Draw(c RectCanvas) {
 	if b.R.Empty() {
 		return
 	}
 	face, border, label := b.colors()
+	t := theme.Current
+	inner := b.R.Inset(t.BorderW)
+	if fc, ok := c.(Canvas); ok {
+		fc.FillRoundedRect(b.R, radiusControl, opaque(face))
+		fc.StrokeRoundedRect(b.R, radiusControl, t.BorderW, opaque(border))
+		if b.Focused && !b.Disabled {
+			fw := t.FocusW
+			if fw < 1 {
+				fw = 1
+			}
+			fc.StrokeRoundedRect(b.R, radiusControl, fw, opaque(t.Accent))
+		}
+		if !inner.Empty() {
+			drawLabel(fc, b.LabelFace, inner, b.Label, label, true)
+		}
+		return
+	}
 	c.FillRect(b.R, border)
-	inner := b.R.Inset(theme.Current.BorderW)
 	if !inner.Empty() {
 		c.FillRect(inner, face)
 		drawGlyphRun(c, inner, b.Label, label)
 	}
 }
 
-// colors resolves idle/hover/press/focus from the token table. A non-zero
-// Face/Border/LabelRGB is an idle override (existing callers keep their hex
-// until they migrate); hover/press/focus still take contrast from the table.
+// colors resolves idle/hover/press/focus/disabled from the token table. A
+// non-zero Face/Border/LabelRGB is an idle override (existing callers keep
+// their hex until they migrate); the state ramp still takes its colours from
+// the table.
 func (b *Button) colors() (face, border, label uint32) {
 	t := theme.Current
 	face, border, label = t.BtnIdle, t.Border, t.Text
@@ -202,6 +305,9 @@ func (b *Button) colors() (face, border, label uint32) {
 		label = b.LabelRGB
 	}
 	switch {
+	case b.Disabled:
+		face = blendHalf(face, t.Surface)
+		label = t.Muted
 	case b.Pressed:
 		face = t.BtnPressed
 		border = t.Accent
@@ -218,6 +324,9 @@ func (b *Button) colors() (face, border, label uint32) {
 
 // List is a fixed-row-height list of items with an optional selection. Row i
 // occupies RowRect(i); Draw and ItemAt derive from the SAME RowRect.
+//
+// Face is the §3.4 optional TrueType label face — nil keeps the 8x8 bitmap
+// face. Disabled drops item text to the Muted role (§2.3).
 type List struct {
 	R         Rect
 	Items     []string
@@ -225,6 +334,8 @@ type List struct {
 	Sel       int
 	ScrollTop int
 	Focused   bool
+	Disabled  bool
+	Face      *ttf.Face
 	Fg        uint32
 	Bg        uint32
 	SelBg     uint32
@@ -275,12 +386,26 @@ func (l *List) ItemAt(x, y int) int {
 	return i
 }
 
-// Draw paints the list background, the selected row, then each row's label.
+// Draw paints the list plate, the selected row, then each row's label. A full
+// Canvas gets the §2.2 rounded plate and border, the §2.3 selected row's
+// Selection fill plus 3px Accent left-edge marker, and an inside focus ring;
+// a RectCanvas-only surface keeps the flat v1 form unchanged.
 func (l *List) Draw(c RectCanvas) {
 	if l.R.Empty() {
 		return
 	}
-	c.FillRect(l.R, l.Bg)
+	th := theme.Current
+	fc, full := c.(Canvas)
+	fg := l.Fg
+	if l.Disabled {
+		fg = th.Muted
+	}
+	if full {
+		fc.FillRoundedRect(l.R, radiusControl, opaque(l.Bg))
+		fc.StrokeRoundedRect(l.R, radiusControl, th.BorderW, opaque(th.Border))
+	} else {
+		c.FillRect(l.R, l.Bg)
+	}
 	start := l.ScrollTop
 	if start < 0 {
 		start = 0
@@ -297,13 +422,37 @@ func (l *List) Draw(c RectCanvas) {
 		if clip.Bottom() > l.R.Bottom() {
 			clip.H = l.R.Bottom() - clip.Y
 		}
+		label := clip
 		if i == l.Sel {
-			c.FillRect(clip, l.SelBg)
+			if !full {
+				c.FillRect(clip, l.SelBg)
+			} else {
+				sel := l.SelBg
+				if sel == 0 {
+					sel = th.Selection
+				}
+				fc.FillRect(clip, opaque(sel))
+				// §2.3 selected: the 3px Accent left-edge marker, inset a
+				// pixel off the row edges like the Zig tab chrome's 3x22 bar.
+				mark := clip
+				mark.W = 3
+				if mark.H > 2 {
+					mark.Y++
+					mark.H -= 2
+				}
+				fc.FillRect(mark, opaque(th.Accent))
+				label.X += mark.W + th.PadXS
+				label.W -= mark.W + th.PadXS
+			}
 		}
-		drawGlyphRun(c, clip, l.Items[i], l.Fg)
+		if full {
+			drawLabel(fc, l.Face, label, l.Items[i], fg, false)
+		} else {
+			drawGlyphRun(c, clip, l.Items[i], fg)
+		}
 	}
 	if l.Focused {
-		fw := theme.Current.FocusW
+		fw := th.FocusW
 		if fw < 1 {
 			fw = 1
 		}
@@ -313,10 +462,14 @@ func (l *List) Draw(c RectCanvas) {
 		if fw > l.R.H {
 			fw = l.R.H
 		}
-		c.FillRect(Rect{X: l.R.X, Y: l.R.Y, W: l.R.W, H: fw}, theme.Current.Accent)
-		c.FillRect(Rect{X: l.R.X, Y: l.R.Bottom() - fw, W: l.R.W, H: fw}, theme.Current.Accent)
-		c.FillRect(Rect{X: l.R.X, Y: l.R.Y, W: fw, H: l.R.H}, theme.Current.Accent)
-		c.FillRect(Rect{X: l.R.Right() - fw, Y: l.R.Y, W: fw, H: l.R.H}, theme.Current.Accent)
+		if full {
+			fc.StrokeRoundedRect(l.R, radiusControl, fw, opaque(th.Accent))
+		} else {
+			c.FillRect(Rect{X: l.R.X, Y: l.R.Y, W: l.R.W, H: fw}, th.Accent)
+			c.FillRect(Rect{X: l.R.X, Y: l.R.Bottom() - fw, W: l.R.W, H: fw}, th.Accent)
+			c.FillRect(Rect{X: l.R.X, Y: l.R.Y, W: fw, H: l.R.H}, th.Accent)
+			c.FillRect(Rect{X: l.R.Right() - fw, Y: l.R.Y, W: fw, H: l.R.H}, th.Accent)
+		}
 	}
 }
 
@@ -354,6 +507,8 @@ type TextInput struct {
 	Fg       uint32 // 0 → theme text
 	Bg       uint32 // 0 → theme surface
 	Focused  bool
+	Disabled bool // §2.3: Muted text, face blended 50% toward Surface
+	Face     *ttf.Face
 	Max      int          // byte bound on the buffer; <=0 → textInputMaxLen
 	OnSubmit func(string) // Enter commits the value (nil → Enter inert)
 	OnCancel func()       // Escape cancels the edit (nil → Escape inert)
@@ -501,12 +656,19 @@ func (t *TextInput) deleteForward() bool {
 
 // Draw paints the border (accent when focused), the face, the clipped glyph
 // run, and the caret bar — geometry identical to drawGlyphRun's inset so the
-// caret sits exactly where the next glyph would land.
+// caret sits exactly where the next glyph would land. A full Canvas paints
+// the §2.2 rounded plate with an inside FocusW focus ring and routes the
+// label through Canvas.Text (the caret then advances by the face's own
+// metrics); a RectCanvas-only surface keeps the flat v1 form.
 func (t *TextInput) Draw(c RectCanvas) {
 	if t.R.Empty() {
 		return
 	}
 	th := theme.Current
+	if fc, ok := c.(Canvas); ok {
+		t.drawCanvas(fc)
+		return
+	}
 	border := th.Border
 	if t.Focused {
 		border = th.Accent
@@ -525,6 +687,9 @@ func (t *TextInput) Draw(c RectCanvas) {
 	if fg == 0 {
 		fg = th.Text
 	}
+	if t.Disabled {
+		fg = th.Muted
+	}
 	drawGlyphRun(c, inner, t.value, fg)
 	if !t.Focused {
 		return
@@ -538,6 +703,59 @@ func (t *TextInput) Draw(c RectCanvas) {
 		caretX = inner.X
 	}
 	c.FillRect(Rect{X: caretX, Y: inner.Y + 2, W: 2, H: inner.H - 4}, th.Caret)
+}
+
+// drawCanvas is the full-Canvas form of Draw: rounded plate, border, inside
+// focus ring, label through Canvas.Text, and a caret measured in the face's
+// own advances (or in 8px cells when the bitmap fallback is painting).
+func (t *TextInput) drawCanvas(fc Canvas) {
+	th := theme.Current
+	bg := t.Bg
+	if bg == 0 {
+		bg = th.Surface
+	}
+	fg := t.Fg
+	if fg == 0 {
+		fg = th.Text
+	}
+	if t.Disabled {
+		bg = blendHalf(bg, th.Surface)
+		fg = th.Muted
+	}
+	fc.FillRoundedRect(t.R, radiusControl, opaque(bg))
+	fc.StrokeRoundedRect(t.R, radiusControl, th.BorderW, opaque(th.Border))
+	if t.Focused && !t.Disabled {
+		fc.StrokeRoundedRect(t.R, radiusControl, th.FocusW, opaque(th.Accent))
+	}
+	inner := t.R.Inset(th.BorderW)
+	if inner.Empty() {
+		return
+	}
+	x := inner.X + th.PadXS
+	y := 0
+	if t.Face != nil {
+		y = labelBaseline(t.Face, inner)
+	}
+	fc.Text(t.Face, inner, x, y, labelPx, t.value, opaque(fg))
+	if !t.Focused {
+		return
+	}
+	cw := font.Advance(1)
+	caretX := x
+	for _, ch := range t.value[:t.caret] {
+		if t.Face != nil {
+			caretX += t.Face.AdvancePx(ch, labelPx)
+		} else {
+			caretX += cw
+		}
+	}
+	if maxX := inner.Right() - 2; caretX > maxX {
+		caretX = maxX
+	}
+	if caretX < inner.X {
+		caretX = inner.X
+	}
+	fc.FillRect(Rect{X: caretX, Y: inner.Y + 2, W: 2, H: inner.H - 4}, opaque(th.Caret))
 }
 
 // DrawText paints a clipped glyph run using the shared widget face. It is
