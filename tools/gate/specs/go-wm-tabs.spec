@@ -641,12 +641,17 @@ PY
 # Two clients as in run 01. `ctrl-shift-f` is Zig's BT6 binding; GOTABWM has
 # no conflicting ctrl-shift chord other than ctrl-shift-p.
 #
-# M79g (#1718): the chord is anchored on NOTE's declare (NOT GOCALC's, as it
-# was) on purpose. The choreography closes the PINNED tab first and pin-stay
-# pins Calc, so the tab whose badge can still be on disk when the strip
-# empties is the OTHER one — the text client. Freezing the focused tab at
-# `note: tab-aware` is that tab, well inside the choreography's hidChordHold
-# (32 ticks), so the flag is set long before the closes.
+# M79g (#1718): the chords are anchored on pin-stay's own marker — NOT on a
+# client-side marker like `note: tab-aware`. The two execs are unordered
+# (SPEC.md: `exec` returns at spawn), so whichever client the seat adopts
+# last holds focus at client-anchor time, and an injected chord can beat
+# the seat's focus transition. applyPinStay pins the title-"Calc" tab
+# wherever it sits, toggles focus away, then RESTORES focus to the pinned
+# tab — so after `gotabwm: pin id=` the focused tab is deterministically
+# the pinned Calc regardless of declare order. `alt-tab` then toggles
+# focus to the unpinned text client (two tabs, wrap toggle), and
+# `ctrl-shift-f` freezes NOTE deterministically, well inside the
+# choreography's hidChordHold (32 ticks), long before the closes.
 #
 # This is a BADGE, not a lock: the run also asserts the frozen tab is still
 # closed by the ordinary choreography (the `tab close` count below), because
@@ -675,14 +680,15 @@ vgate_run 04 -- \
     --script '$RUN_DIR/script-04.txt' \
     --script2 '$RUN_DIR/script2-04.txt' \
     --script2-after 'gotabwm: win focus' \
-    --input-chords 'ctrl-shift-f' \
-    --input-chords-after 'note: tab-aware (full-viewport)' \
+    --input-chords 'alt-tab,ctrl-shift-f' \
+    --input-chords-after 'gotabwm: pin id=' \
     --script3 '$RUN_DIR/script3-04.txt' \
     --script3-after 'wm: unregistered, shim resumed' \
     --script-expect 'rx-gotabwm-freeze-ok' --timeout 300
 
 vgate_assert 04 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 04 serial-contains 'gotabwm: registered'
+vgate_assert 04 serial-contains 'gotabwm: alt-tab id='
 vgate_assert 04 serial-contains 'gotabwm: freeze id='
 vgate_assert 04 serial-absent 'gotabwm: thaw id='
 vgate_assert 04 serial-contains 'gotabwm: session write n=2'
@@ -1412,8 +1418,31 @@ vgate_assert 09 serial-absent 'exited status=139'
 # The file itself: the ORDER, the pin bit, the frozen badge and the live
 # title, byte-level on the share (offsets per tabsv2.go: header 6, record
 # 69 = title 32 | flags 1 | group 12 | bin 24).
+#
+# The strip order is resolved from the seat's own markers, not assumed:
+# script2's two execs are unordered (SPEC.md — `exec` returns at spawn), so
+# whichever client binds first owns slot 0 and the rail drag moves THAT tab
+# right. The chord/pin/freeze choreography is positional (ctrl-1 focuses
+# slot 0), so either declare order is a legal run; the file must equal the
+# strip the seat reported in its last `order ids=` line either way.
 vgate_assert 09 python <<'PY'
-import os, sys
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+orders = re.findall(r"gotabwm: order ids=(\d+),(\d+) pin=", ser)
+if not orders:
+    sys.exit("no order ids= line in serial")
+slot0, slot1 = int(orders[-1][0]), int(orders[-1][1])
+calc_m = re.search(r"gocalc: open id=(\d+)", ser)
+note_m = re.search(r"note: open id=(\d+)", ser)
+if not calc_m or not note_m:
+    sys.exit("missing app open markers in serial")
+app = {int(calc_m.group(1)): ("Calc", "GOCALC.ELF"),
+       int(note_m.group(1)): ("notes.txt", "NOTE.ELF")}
+if slot0 not in app or slot1 not in app:
+    sys.exit("order ids %d,%d not the two clients %s" % (slot0, slot1, sorted(app)))
+want_titles = [app[slot0][0], app[slot1][0]]
+want_bins = [app[slot0][1], app[slot1][1]]
+
 p = os.path.join(os.environ["VG_SHARE"], "SESSION.TABS")
 try:
     b = open(p, "rb").read()
@@ -1426,7 +1455,7 @@ if b[0] != 2:
 if b[2] != 2:
     sys.exit("count %d want 2" % b[2])
 if b[1] != 2:
-    sys.exit("active+1 = %d want 2 (Calc, moved right and still focused)" % b[1])
+    sys.exit("active+1 = %d want 2 (the dragged tab stays focused)" % b[1])
 recs = []
 for i in (0, 1):
     off = 6 + i * 69
@@ -1434,16 +1463,17 @@ for i in (0, 1):
                  b[off + 32],
                  b[off + 45:off + 69].split(b"\x00", 1)[0].decode()))
 titles, flags, bins = ([r[0] for r in recs], [r[1] for r in recs], [r[2] for r in recs])
-if titles != ["notes.txt", "Calc"]:
-    sys.exit("titles %s want notes.txt,Calc (the drag moved Calc right)" % titles)
+if titles != want_titles:
+    sys.exit("titles %s want %s (file must match the seat's order)" % (titles, want_titles))
 if flags[0] != 0:
     sys.exit("record 0 flags %#x want 0 (unpinned, thawed)" % flags[0])
 if flags[1] != 0x03:
     sys.exit("record 1 flags %#x want 0x03 (pinned|frozen)" % flags[1])
-if bins != ["NOTE.ELF", "GOCALC.ELF"]:
-    sys.exit("bins %s want NOTE.ELF,GOCALC.ELF (identity follows the tab)" % bins)
-print("SESSION.TABS: notes.txt(0x00,NOTE.ELF) then Calc(0x03,GOCALC.ELF), "
-      "active=Calc — the user's order, pin and badge")
+if bins != want_bins:
+    sys.exit("bins %s want %s (identity follows the tab)" % (bins, want_bins))
+print("SESSION.TABS: %s(0x00,%s) then %s(0x03,%s), "
+      "active=%s — the user's order, pin and badge" % (
+          titles[0], bins[0], titles[1], bins[1], titles[1]))
 PY
 
 # Ordering: the last publish came after the last mutation, so the file is
@@ -1497,8 +1527,25 @@ vgate_assert 10 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 10 serial-contains 'gotabwm: registered'
 vgate_assert 10 serial-contains 'gotabwm: mode live'
 vgate_assert 10 serial-contains 'gotabwm: session load n=2 mode=restore'
-# The order line the seat restored: notes.txt first, Calc pinned and frozen.
-vgate_assert 10 serial-contains 'gotabwm: session titles=notes.txt,Calc pin=0,1 active=1'
+# The order line the seat restored. Which tab sits in slot 0 is decided by
+# run 09's unsequenced execs (SPEC.md: `exec` returns at spawn), so the
+# expected line is derived from the SESSION.TABS run 09 left on the share —
+# the seat's restore report must faithfully echo the file it loaded.
+vgate_assert 10 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+titles, pins = [], []
+for i in range(b[2]):
+    off = 6 + i * 69
+    titles.append(b[off:off + 32].split(b"\x00", 1)[0].decode())
+    pins.append("1" if b[off + 32] & 1 else "0")
+line = "gotabwm: session titles=%s pin=%s active=%d" % (
+    ",".join(titles), ",".join(pins), b[1] - 1)
+ser = open(os.environ["VG_SER"], errors="replace").read()
+if line not in ser:
+    sys.exit("restored titles line %r (from the file) missing from serial" % line)
+print("restore echo matches SESSION.TABS: %s" % line)
+PY
 vgate_assert 10 serial-contains 'gotabwm: session freeze n=1'
 vgate_assert 10 serial-contains 'gotabwm: order ids='
 vgate_assert 10 serial-contains 'pin=0,1'
@@ -1533,12 +1580,17 @@ if not all(parsed):
 ids = [parsed[0].group(1), parsed[1].group(1)]
 if ids != ["256", "257"]:
     sys.exit("restored ids %s want 256,257 (sessionIDBase=0x100)" % ids)
+# Row order follows run 09's file — which tab led is whichever client won
+# the unsequenced exec/bind race, so compare against SESSION.TABS itself.
+sb = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+want_bins = [sb[6 + i * 69 + 45:6 + i * 69 + 69].split(b"\x00", 1)[0].decode()
+             for i in range(sb[2])]
 bins = [parsed[0].group(2), parsed[1].group(2)]
-if bins != ["NOTE.ELF", "GOCALC.ELF"]:
-    sys.exit("bins %s want NOTE.ELF,GOCALC.ELF in that order" % bins)
+if bins != want_bins:
+    sys.exit("bins %s want %s (the order run 09 persisted)" % (bins, want_bins))
 if any(row[8] != "none" for row in parsed):
     sys.exit("restore dump must be unsplit")
-print("LAYOUT.txt restore n=2 ids=256,257 bins=NOTE.ELF,GOCALC.ELF in the restored order")
+print("LAYOUT.txt restore n=2 ids=256,257 bins=%s in the restored order" % bins)
 PY
 
 # --- M97g-F2 (#2080): WM_RPC sender authentication --------------------------
