@@ -96,7 +96,9 @@ func TestLauncherPaintsLabelsQueryAndUnavailableState(t *testing.T) {
 		{"strip", 0, 0, 8, 8, theme.Current.Surface},
 		{"emblem fallback", 99, 16, 64, 1, theme.Current.Border},
 		{"prompt", 8, 88, 32, 8, theme.Current.Ink},
-		{"field", 8, 104, 246, 1, theme.Current.Border},
+		// M104e: the field's ring is the §2.3.5 focus ring — Accent while
+		// the strip owns the focus, not the old Border.
+		{"field", 8, 104, 246, 1, theme.Current.Accent},
 		{"query", 14, 110, 32, 8, theme.Current.Ink},
 		{"error", 8, 128, 200, 8, theme.Current.Danger},
 	} {
@@ -119,8 +121,14 @@ func TestLauncherPaintsLabelsQueryAndUnavailableState(t *testing.T) {
 	if !ok || x != 8 || y != 140 {
 		t.Fatal("the ranked column does not start under the header")
 	}
-	if countLaunchInk(scan, x, y, 4, 4, theme.Current.Selection) != 16 {
+	// §2.3.6: the selected row is a Selection fill with a 3px Accent
+	// marker at its left edge — probe inside both, clear of the rounded
+	// corner falloff.
+	if countLaunchInk(scan, x+8, y+6, 24, 8, theme.Current.Selection) == 0 {
 		t.Fatal("selected row not painted")
+	}
+	if countLaunchInk(scan, x, y+6, 3, 8, theme.Current.Accent) != 24 {
+		t.Fatal("selected row's accent marker missing")
 	}
 	if countLaunchInk(scan, x+6, y+3, 32, 8, theme.Current.InkMuted) < 10 {
 		t.Fatal("dimmed label ink missing")

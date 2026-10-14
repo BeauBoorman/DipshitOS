@@ -1,10 +1,11 @@
 package main
 
 import (
-	"unsafe"
-
+	"virelai/draw"
+	"virelai/icons"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/widgets"
 )
 
 // The center is the history of recently accepted kind-12 notices.
@@ -278,18 +279,23 @@ func paintNotifyCenter(scan []byte, width, height int) int {
 	if w <= 0 || h <= 0 {
 		return 0
 	}
-	pixels := len(scan) / 4
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), pixels)
-	maxH := pixels / width
-	if maxH <= 0 {
+	c := seatCanvas(scan, width, height)
+	if c == nil {
 		return 0
 	}
 	tok := theme.Current
-	written := fillRect(pix, width, maxH, x, y, w, h, tok.Surface)
-	written += fillRect(pix, width, maxH, x, y, w, tok.BorderW, tok.Rule)
-	written += fillRect(pix, width, maxH, x, y, 2, h, tok.Accent)
-	written += drawText8(pix, width, maxH, x+notifyCenterPad, y+10, "Notifications", tok.Ink)
-	written += drawText8(pix, width, maxH, x+w-28, y+10, "X", tok.Muted)
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	// A floating plate: the §2.5 shadow, the §2.2 radius, the Rule border.
+	seatShadow(c, plate, radiusWindow)
+	written := seatPlate(c, plate, radiusWindow, tok.Accent, tok.Surface)
+	draw.StrokeRoundedRect(c, plate, radiusWindow, tok.BorderW, draw.Opaque(tok.Rule))
+	clip := plate.Inset(tok.BorderW)
+	closeIcon, _ := icons.Codepoint("window-close")
+	seatText(c, clip, x+notifyCenterPad, y+10, seatTextPx, "Notifications", tok.Ink)
+	// The header's close glyph is centred on its hit zone — the trailing
+	// 42px of the header — not on the old 'X' cell.
+	seatGlyph(c, widgets.Rect{X: x + w - 42, Y: y, W: 42, H: notifyHeaderH},
+		closeIcon, tok.Muted, "X", x+w-28, y+10)
 	if dx, _, dw, _ := notifyCenterDNDRect(width, height); dw > 0 {
 		// Accent when on: the mode has to be readable at a glance, because
 		// a silenced center is a state the user must not forget they set.
@@ -297,10 +303,10 @@ func paintNotifyCenter(scan []byte, width, height int) int {
 		if notifyDND {
 			fg = tok.Accent
 		}
-		written += drawText8(pix, width, maxH, dx, y+10, notifyCenterDNDLabel(), fg)
+		seatText(c, clip, dx, y+10, seatTextPx, notifyCenterDNDLabel(), fg)
 	}
-	written += fillRect(pix, width, maxH, x+notifyCenterPad, y+notifyHeaderH-1,
-		w-2*notifyCenterPad, 1, tok.Border)
+	written += seatFill(c, widgets.Rect{X: x + notifyCenterPad, Y: y + notifyHeaderH - 1,
+		W: w - 2*notifyCenterPad, H: 1}, tok.Border)
 
 	rows := notifyCenterVisibleRows(h)
 	for i := 0; i < rows && i < len(notifyCenter); i++ {
@@ -312,21 +318,22 @@ func paintNotifyCenter(scan []byte, width, height int) int {
 			source += " [closed]"
 			fg = tok.Muted
 		}
-		written += drawText8(pix, width, maxH, x+notifyCenterPad, rowY+2,
+		seatText(c, clip, x+notifyCenterPad, rowY+2, seatTextPx,
 			centerText(source, 48), fg)
-		written += drawText8(pix, width, maxH, x+notifyCenterPad, rowY+16,
+		seatText(c, clip, x+notifyCenterPad, rowY+16, seatTextPx,
 			centerText(entry.text, 48), tok.InkMuted)
-		written += drawText8(pix, width, maxH, x+w-28, rowY+10, "X", tok.Muted)
+		// The row's dismiss glyph, centred on its trailing-34px hit zone.
+		seatGlyph(c, widgets.Rect{X: x + w - 34, Y: rowY, W: 34, H: notifyRowH},
+			closeIcon, tok.Muted, "X", x+w-28, rowY+10)
 		if i+1 < rows && i+1 < len(notifyCenter) {
-			written += fillRect(pix, width, maxH, x+notifyCenterPad, rowY+notifyRowH-1,
-				w-2*notifyCenterPad, 1, tok.Border)
+			written += seatFill(c, widgets.Rect{X: x + notifyCenterPad, Y: rowY + notifyRowH - 1,
+				W: w - 2*notifyCenterPad, H: 1}, tok.Border)
 		}
 	}
 	footerY := y + h - notifyFooterH
-	written += fillRect(pix, width, maxH, x+notifyCenterPad, footerY,
-		w-2*notifyCenterPad, tok.BorderW, tok.Border)
-	written += drawText8(pix, width, maxH, x+notifyCenterPad, footerY+10,
-		"Clear all", tok.Ink)
+	written += seatFill(c, widgets.Rect{X: x + notifyCenterPad, Y: footerY,
+		W: w - 2*notifyCenterPad, H: tok.BorderW}, tok.Border)
+	seatText(c, clip, x+notifyCenterPad, footerY+10, seatTextPx, "Clear all", tok.Ink)
 	return written
 }
 

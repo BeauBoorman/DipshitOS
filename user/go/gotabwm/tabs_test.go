@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"virelai/theme"
 	"virelai/vi"
 )
 
@@ -398,7 +399,7 @@ func TestPaintRailFrozenBadge(t *testing.T) {
 	if !s.OpenTab(3, "Calc") {
 		t.Fatal("OpenTab")
 	}
-	thawed := paintRail(scan, w, h, RailHeight, &s, -1)
+	thawed := paintRail(scan, w, h, RailHeight, &s, -1, -1)
 	if n := countRGB(pix, w, RailHeight, railFrozenRGB()); n != 0 {
 		t.Fatalf("a thawed rail painted %d badge pixels", n)
 	}
@@ -409,7 +410,7 @@ func TestPaintRailFrozenBadge(t *testing.T) {
 	if !s.Freeze(3) {
 		t.Fatal("Freeze")
 	}
-	frozen := paintRail(scan, w, h, RailHeight, &s, -1)
+	frozen := paintRail(scan, w, h, RailHeight, &s, -1, -1)
 	badge := countRGB(pix, w, RailHeight, railFrozenRGB())
 	if badge == 0 {
 		t.Fatal("a frozen rail painted no Warning badge pixels")
@@ -458,7 +459,7 @@ func TestPaintRailHoverTintAndCloseGlyph(t *testing.T) {
 	}
 	_ = s.FocusTab(4) // cell 1 focused
 	// Hover the IDLE cell: it tints and no idle pixels remain there.
-	paintRail(buf, w, h, RailHeight, &s, 0)
+	paintRail(buf, w, h, RailHeight, &s, 0, -1)
 	if n := countRGB(pix, w, RailHeight, railHoverRGB()); n == 0 {
 		t.Fatal("hovering an idle cell painted no hover tint")
 	}
@@ -469,19 +470,24 @@ func TestPaintRailHoverTintAndCloseGlyph(t *testing.T) {
 	for i := range pix {
 		pix[i] = 0
 	}
-	paintRail(buf, w, h, RailHeight, &s, 1)
+	paintRail(buf, w, h, RailHeight, &s, 1, -1)
 	if n := countRGB(pix, w, RailHeight, railHoverRGB()); n != 0 {
 		t.Fatalf("hover painted %d tint pixels over the focused cell", n)
 	}
-	if n := countRGB(pix, w, RailHeight, railFocusRGB()); n == 0 {
-		t.Fatal("the focused cell lost its focus fill")
+	// The focused cell is the §2.3.6 treatment: Selection fill plus the
+	// 3px Accent marker (railFocusRGB is the token's Accent).
+	if n := countRGB(pix, w, RailHeight, theme.Current.Selection); n == 0 {
+		t.Fatal("the focused cell lost its Selection fill")
 	}
-	// No hover: the close-x glyph (muted ink) sits in each cell's zone.
+	if n := countRGB(pix, w, RailHeight, railFocusRGB()); n == 0 {
+		t.Fatal("the focused cell lost its Accent marker")
+	}
+	// No hover: the close glyph (muted ink) sits in each cell's zone.
 	// Cell 0's zone at w=256 n=2 (cellW=128) is [112,128).
 	for i := range pix {
 		pix[i] = 0
 	}
-	paintRail(buf, w, h, RailHeight, &s, -1)
+	paintRail(buf, w, h, RailHeight, &s, -1, -1)
 	if n := countRGB(pix, w, RailHeight, railCloseRGB()); n == 0 {
 		t.Fatal("no close-x glyph pixels on the rail")
 	}
@@ -495,6 +501,22 @@ func TestPaintRailHoverTintAndCloseGlyph(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("cell 0's close zone holds no glyph pixels")
+	}
+	// §2.4: the close zone under the pointer tints its glyph Danger —
+	// cell 0's zone only, and nowhere else on the rail.
+	for i := range pix {
+		pix[i] = 0
+	}
+	paintRail(buf, w, h, RailHeight, &s, -1, 0)
+	if n := countRGB(pix, w, RailHeight, theme.Current.Danger); n == 0 {
+		t.Fatal("the hovered close zone painted no Danger glyph")
+	}
+	for row := 0; row < RailHeight; row++ {
+		for col := 128; col < w; col++ {
+			if pix[row*w+col]&0xffffff == theme.Current.Danger {
+				t.Fatalf("Danger close glyph outside cell 0's zone at %d,%d", col, row)
+			}
+		}
 	}
 }
 
@@ -528,13 +550,13 @@ func TestPaintRailFillsStripOnly(t *testing.T) {
 	const w, h, strip = 256, 32, 8
 	buf := make([]byte, w*h*4)
 	var s TabStrip
-	if n := paintRail(buf, w, h, strip, &s, -1); n != 0 {
+	if n := paintRail(buf, w, h, strip, &s, -1, -1); n != 0 {
 		t.Fatalf("empty strip wrote %d pixels", n)
 	}
 	s.OpenTab(1, "a")
 	s.OpenTab(2, "b")
 	s.FocusTab(2)
-	if n := paintRail(buf, w, h, strip, &s, -1); n == 0 {
+	if n := paintRail(buf, w, h, strip, &s, -1, -1); n == 0 {
 		t.Fatal("paintRail wrote nothing")
 	}
 	pix := func(x, y int) uint32 {
@@ -549,19 +571,23 @@ func TestPaintRailFillsStripOnly(t *testing.T) {
 			}
 		}
 	}
-	// The two cells differ: left is idle, right is focused.
+	// The two cells differ: left is idle, right is the §2.3.6 focused
+	// cell — a 3px Accent marker at its left edge, Selection fill after.
 	left := pix(2, 1)
-	right := pix(w/2+2, 1)
+	right := pix(w/2+8, 1)
 	if left == 0 || right == 0 {
 		t.Fatalf("strip cells were not painted left=%#x right=%#x", left, right)
 	}
 	if left == right {
 		t.Fatalf("focused and idle cells are the same colour %#x", left)
 	}
-	// fillRect forces the scanout's X byte opaque (M71c #1562), so compare
-	// the colour with that byte masked off.
-	if right&0xffffff != railFocusRGB() {
-		t.Fatalf("focused cell %#x want %#x", right, railFocusRGB())
+	// The engine's Opaque fill forces the scanout's X byte 0xff (M71c
+	// #1562), so compare the colour with that byte masked off.
+	if marker := pix(w/2+1, 1) & 0xffffff; marker != railFocusRGB() {
+		t.Fatalf("focused cell's marker %#x want %#x", marker, railFocusRGB())
+	}
+	if right&0xffffff != theme.Current.Selection {
+		t.Fatalf("focused cell %#x want %#x", right, theme.Current.Selection)
 	}
 	if left&0xffffff != railIdleRGB() {
 		t.Fatalf("idle cell %#x want %#x", left, railIdleRGB())

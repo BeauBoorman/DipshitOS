@@ -41,11 +41,11 @@
 package main
 
 import (
-	"unsafe"
-
+	"virelai/draw"
 	"virelai/settings"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/widgets"
 )
 
 // The marker lines the class-B gate greps. Exported constants so seat_test.go
@@ -538,7 +538,7 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 		_ = paintBlank(scan, blankRGB())
 		startSurfaceTick(scan)
 	} else {
-		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover)
+		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
 		markRail()
 	}
 	// #2236 defect #13: migrated (surface-backed) client windows are the
@@ -751,14 +751,17 @@ func paintBlank(scan []byte, rgb uint32) int {
 	if n == 0 {
 		return 0
 	}
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), n)
-	// B,G,R,X scanout: the X byte must be opaque (the kernel writes 0xff
-	// there too). A 6-hex token leaves it 0x00, which the host display
-	// honours as alpha — that is why a seated scanout used to show the
-	// kernel's opaque layer and none of the seat's. M71c (#1562).
-	for i := range pix {
-		pix[i] = rgb | 0xff000000
+	// One canvas row the whole buffer long: the opaque fill is the same
+	// engine write every other seat painter makes. B,G,R,X scanout: the
+	// X byte must be opaque (the kernel writes 0xff there too) — a 6-hex
+	// token leaves it 0x00, which the host display honours as alpha. That
+	// is why a seated scanout used to show the kernel's opaque layer and
+	// none of the seat's. M71c (#1562); draw.Opaque carries it now.
+	c, err := draw.BytesCanvas(scan, n, 1)
+	if err != nil {
+		return 0
 	}
+	draw.FillRect(c, widgets.Rect{X: 0, Y: 0, W: n, H: 1}, draw.Opaque(rgb))
 	return n
 }
 

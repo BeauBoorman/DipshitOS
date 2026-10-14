@@ -24,17 +24,18 @@
 // The one-shot `gotabwm: clock-source <name>` line says which source won, so
 // a gate never has to guess, and `gotabwm: clock HH:MM:SS` carries the face.
 //
-// Text uses the same 8x8 VirelaiOS face NOTE/GOEDIT paint with
-// (virelai/webrender/font) — that leaf package, not webrender's layout half,
-// which GOEDIT's header records as too heavy for a guest ELF.
+// M104e (#2272): every painter in this file now runs through
+// draw.BytesCanvas over the scanout — the shared FillRect/
+// FillRoundedRect/FillShadow/Text/Glyph primitives in seatpaint.go —
+// with registry fonts when the share stages them and the engine's bitmap
+// degrade when it does not.
 package main
 
 import (
-	"unsafe"
-
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
-	"virelai/webrender/font"
+	"virelai/widgets"
 )
 
 // The chrome marker lines the class-B gate greps. Exported constants so
@@ -64,7 +65,6 @@ const (
 	ChromeW     = 148
 	chromeInset = 8
 	chromePad   = 6
-	chromeScale = 1 // the 8x8 face at 1x: an 8px advance, no scaling
 )
 
 // statusText is the seat's one-line identity in the panel (D1: the seat names
@@ -121,16 +121,27 @@ func paintGodMenuButton(scan []byte, width, height int) int {
 	if w == 0 || width <= 0 || len(scan)/4/width < y+h {
 		return 0
 	}
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), len(scan)/4)
+	c := seatCanvas(scan, width, height)
+	if c == nil {
+		return 0
+	}
 	tok := theme.Current
-	n := fillRect(pix, width, height, x, y, w, h, tok.ChromeBg)
-	n += fillRect(pix, width, height, x, y, 2, h, tok.Accent)
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	// §2.3: the button's face rides the hover ramp; the plate carries the
+	// seat's left accent rule.
+	face := tok.ChromeBg
+	if godButtonHover {
+		face = tok.BtnHover
+	}
+	n := seatPlate(c, plate, radiusControl, tok.Accent, face)
 	// #2054: the button's icon is the sexiburger itself — the same raster
 	// the launcher strip carries, so the click target and the chord name
-	// the same front door. 16px = the 64px decode at factor 4.
+	// the same front door. 16px on the 20px plate, through BlitScaled.
 	tx := x + chromePad
-	if icon := emblemScaled(4); icon != nil {
-		n += blitImage(pix, width, height, icon, 16, 16, x+4, y+2)
+	if icon := emblemCanvas(); icon != nil {
+		dst := widgets.Rect{X: x + 4, Y: y + 2, W: 16, H: 16}
+		draw.BlitScaled(c, icon, dst)
+		n += seatArea(c, dst)
 		tx = x + 24
 	}
 	// A failed open shows the same label in Danger — the icon leaves no
@@ -139,7 +150,7 @@ func paintGodMenuButton(scan []byte, width, height int) int {
 	if launch.err != "" && !launch.open {
 		ink = tok.Danger
 	}
-	n += drawText8(pix, width, height, tx, y+chromePad, "Apps", ink)
+	seatText(c, plate.Inset(1), tx, y+chromePad, seatTextPx, "Apps", ink)
 	return n
 }
 
@@ -272,62 +283,31 @@ func chromeRect(width, height int) (x, y, w, h int) {
 // past the 2px accent rule and its gap.
 func chromeTextOrigin(x, y int) (int, int) { return x + 6, y + chromePad }
 
-// drawText8 paints text with the VirelaiOS 8x8 face, coalescing each row's
-// lit run into one fill — the NOTE/GOEDIT idiom, and the reason a whole clock
-// costs a bounded number of rects instead of one per lit pixel.
-func drawText8(pix []uint32, width, maxH, x, y int, text string, rgb uint32) int {
-	written, cx := 0, x
-	for i := 0; i < len(text); i++ {
-		g := font.Glyph8(rune(text[i]))
-		for row := 0; row < 8; row++ {
-			bits := g[row]
-			for col := 0; col < 8; {
-				if bits&(1<<uint(col)) == 0 {
-					col++
-					continue
-				}
-				run := 1
-				for col+run < 8 && bits&(1<<uint(col+run)) != 0 {
-					run++
-				}
-				written += fillRect(pix, width, maxH, cx+col, y+row, run, 1, rgb)
-				col += run
-			}
-		}
-		cx += font.Advance(chromeScale)
-	}
-	return written
-}
-
 // paintChrome paints the seat's clock/status panel and returns the pixel
 // count written. Tokens only (M69c) — no hex lives here. Pure: it edits the
 // caller's scanout slice and touches nothing else, which is what the host
 // test pins.
 func paintChrome(scan []byte, width, height int, clock string) int {
-	if width <= 0 || height <= 0 || len(scan) < 4 {
-		return 0
-	}
 	x, y, w, h := chromeRect(width, height)
 	if w <= 0 || h <= 0 {
 		return 0
 	}
-	pixN := len(scan) / 4
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), pixN)
-	maxH := pixN / width
-	if maxH <= 0 {
+	c := seatCanvas(scan, width, height)
+	if c == nil {
 		return 0
 	}
 	tok := theme.Current
-	written := fillRect(pix, width, maxH, x, y, w, h, tok.ChromeBg)
-	written += fillRect(pix, width, maxH, x, y, w, tok.BorderW, tok.Rule)
-	// A 2px accent rule on the panel's left edge is the seat's identity
-	// mark, painted after the border so it spans the full panel height. It
-	// is also the pixel probe's blue anchor: the desktop fill and the
-	// terminal's green text are neither accent-blue nor ink-white.
-	written += fillRect(pix, width, maxH, x, y, 2, h, tok.Accent)
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	// The 2px accent rule on the panel's left edge is the seat's identity
+	// mark; it is also the pixel probe's blue anchor: the desktop fill and
+	// the terminal's green text are neither accent-blue nor ink-white. The
+	// 1px Rule stroke is the §2.2 plate border.
+	written := seatPlate(c, plate, radiusWindow, tok.Accent, tok.ChromeBg)
+	draw.StrokeRoundedRect(c, plate, radiusWindow, tok.BorderW, draw.Opaque(tok.Rule))
 	tx, ty := chromeTextOrigin(x, y)
-	written += drawText8(pix, width, maxH, tx, ty, clock, tok.Ink)
-	written += drawText8(pix, width, maxH, tx+font.Measure(clock, chromeScale)+8, ty, chromeStatusText(), tok.Muted)
+	clip := plate.Inset(tok.BorderW)
+	seatText(c, clip, tx, ty, seatTextPx, clock, tok.Ink)
+	seatText(c, clip, tx+seatTextWidth(clock, seatTextPx)+8, ty, seatSmallPx, chromeStatusText(), tok.Muted)
 	return written
 }
 
@@ -388,33 +368,33 @@ func startSurfaceRect(width, height int) (x, y, w, h int) {
 // Tokens only (M69c) — no hex lives here. Pure: it edits the caller's
 // scanout slice and touches nothing else, which is what the host test pins.
 func paintStartSurface(scan []byte, width, height int) int {
-	if width <= 0 || height <= 0 || len(scan) < 4 {
-		return 0
-	}
 	x, y, w, h := startSurfaceRect(width, height)
 	if w <= 0 || h <= 0 {
 		return 0
 	}
-	pixN := len(scan) / 4
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), pixN)
-	maxH := pixN / width
-	if maxH <= 0 {
+	c := seatCanvas(scan, width, height)
+	if c == nil {
 		return 0
 	}
 	tok := theme.Current
-	written := fillRect(pix, width, maxH, x, y, w, h, tok.Surface)
-	written += fillRect(pix, width, maxH, x, y, w, tok.BorderW, tok.Border)
-	// The same 2px accent rule the clock panel carries: one seat identity.
-	written += fillRect(pix, width, maxH, x, y, 2, h, tok.Accent)
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	// The panel is a floating plate: the §2.5 shadow, the §2.2 radius,
+	// and the same 2px accent rule the clock panel carries — one seat.
+	seatShadow(c, plate, radiusWindow)
+	written := seatPlate(c, plate, radiusWindow, tok.Accent, tok.Surface)
+	draw.StrokeRoundedRect(c, plate, radiusWindow, tok.BorderW, draw.Opaque(tok.Border))
 	tx, ty := x+startPad, y+startPad
 	// #2054: the avatar is the front door here too — the start surface is
 	// the launcher's pointer affordance, so it carries the same emblem.
-	if icon := emblemScaled(2); icon != nil {
-		written += blitImage(pix, width, maxH, icon, 32, 32, tx, ty+4)
+	if icon := emblemCanvas(); icon != nil {
+		dst := widgets.Rect{X: tx, Y: ty + 4, W: 32, H: 32}
+		draw.BlitScaled(c, icon, dst)
+		written += seatArea(c, dst)
 		tx += 40
 	}
-	written += drawText8(pix, width, maxH, tx, ty, statusText, tok.Ink)
-	written += drawText8(pix, width, maxH, tx, ty+startLineGap, startHint, tok.InkMuted)
+	clip := plate.Inset(tok.BorderW)
+	seatText(c, clip, tx, ty, seatTextPx, statusText, tok.Ink)
+	seatText(c, clip, tx, ty+startLineGap, seatSmallPx, startHint, tok.InkMuted)
 	return written
 }
 
@@ -445,18 +425,20 @@ func startSurfaceHit(px, py uint32) bool {
 // M83f (#1779): virtio-gpu has no observed backlight control. "Dim" is a
 // software-blended, opaque BGRX frame: half of each colour channel remains
 // visible, but the scanout's X byte stays 0xff so VZ displays the pixels.
+// One FillRect of straight-alpha 0x80000000 is that same 50% blend.
 func paintIdleDim(scan []byte, width, height int) int {
 	if width <= 0 || height <= 0 || len(scan) < 4 {
 		return 0
 	}
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), len(scan)/4)
-	n := width * height
-	if n > len(pix) {
-		n = len(pix)
+	c := seatCanvas(scan, width, height)
+	if c == nil {
+		return 0
 	}
-	for i := 0; i < n; i++ {
-		pix[i] = 0xff000000 | ((pix[i] >> 1) & 0x007f7f7f)
+	n := len(scan) / 4
+	if width*height < n {
+		n = width * height
 	}
+	draw.FillRect(c, widgets.Rect{X: 0, Y: 0, W: width, H: c.H}, 0x80000000)
 	return n
 }
 
@@ -471,13 +453,12 @@ func paintIdleCurtain(scan []byte, width, height int) int {
 	if width <= 0 || height <= 0 || len(scan) < 4 {
 		return 0
 	}
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), len(scan)/4)
-	maxH := len(pix) / width
-	if maxH <= 0 {
+	c := seatCanvas(scan, width, height)
+	if c == nil {
 		return 0
 	}
 	tok := theme.Current
-	written := fillRect(pix, width, maxH, 0, 0, width, height, tok.ChromeBg)
+	written := seatFill(c, widgets.Rect{X: 0, Y: 0, W: width, H: height}, tok.ChromeBg)
 	w, h := curtainW, curtainH
 	if w > width-2*chromeInset {
 		w = width - 2*chromeInset
@@ -489,10 +470,11 @@ func paintIdleCurtain(scan []byte, width, height int) int {
 		return written
 	}
 	x, y := (width-w)/2, (height-h)/2
-	written += fillRect(pix, width, maxH, x, y, w, h, tok.Surface)
-	written += fillRect(pix, width, maxH, x, y, 2, h, tok.Accent)
-	written += drawText8(pix, width, maxH, x+10, y+8, "VISUAL CURTAIN", tok.Ink)
-	written += drawText8(pix, width, maxH, x+10, y+25, "NOT AUTHENTICATION", tok.Ink)
-	written += drawText8(pix, width, maxH, x+10, y+42, "ANY INPUT WAKES", tok.InkMuted)
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	written += seatPlate(c, plate, radiusWindow, tok.Accent, tok.Surface)
+	clip := plate.Inset(seatRuleW)
+	seatText(c, clip, x+10, y+8, seatTextPx, "VISUAL CURTAIN", tok.Ink)
+	seatText(c, clip, x+10, y+25, seatTextPx, "NOT AUTHENTICATION", tok.Ink)
+	seatText(c, clip, x+10, y+42, seatTextPx, "ANY INPUT WAKES", tok.InkMuted)
 	return written
 }

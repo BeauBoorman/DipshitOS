@@ -530,12 +530,15 @@ func TestNotifyCenterHeaderShowsTheModeAtAGlance(t *testing.T) {
 	if !strings.Contains(notifyCenterDNDLabel(), "[off]") {
 		t.Fatalf("label = %q", notifyCenterDNDLabel())
 	}
-	// The control is inside the panel; nothing paints outside it.
+	// The control is inside the panel; nothing paints outside the panel
+	// and the §2.5 shadow's bounded falloff band (blur 16, dy 4).
 	px, py, pw, ph := notifyCenterRect(w, h)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
-			if (x < px || x >= px+pw || y < py || y >= py+ph) && on[y*w+x] != 0 {
-				t.Fatalf("center painted outside its panel at (%d,%d)", x, y)
+			in := x >= px && x < px+pw && y >= py && y < py+ph
+			inShadow := x >= px-16 && x < px+pw+16 && y >= py-16 && y < py+ph+20
+			if !in && !inShadow && on[y*w+x] != 0 {
+				t.Fatalf("center painted outside its panel and shadow at (%d,%d)", x, y)
 			}
 		}
 	}
@@ -1037,7 +1040,7 @@ func TestSynthNotifyChimeFitsThePrefillEverywhere(t *testing.T) {
 func TestSynthNotifyChimeRefusesTuplesItCannotEncode(t *testing.T) {
 	for _, info := range []vi.AudioInfo{
 		{Ready: 1, Format: vi.AudioFmtNone, Rate: 7, Channels: 2}, // no negotiated format
-		{Ready: 1, Format: 1, Rate: 7, Channels: 2},              // U8: not a stream format
+		{Ready: 1, Format: 1, Rate: 7, Channels: 2},               // U8: not a stream format
 		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 0, Channels: 2},
 		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 2, Channels: 2}, // off the rate ladder
 		{Ready: 1, Format: vi.AudioFmtFloat, Rate: 7, Channels: 0},

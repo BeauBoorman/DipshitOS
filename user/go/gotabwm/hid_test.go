@@ -877,13 +877,17 @@ func rectRecorder() (*[]rectCall, func()) {
 func saveSeatState() func() {
 	ts, pl := tabs, launch
 	pb, cd, rd, rh, sd := prevPtrButtons, contentDown, railDragFrom, railHover, sashDragging
+	rc, gh := railCloseHover, godButtonHover
 	mg := menuGesture
 	bp, mp := buttonPixels, menuPixels
+	sf := seatFonts
 	return func() {
 		tabs, launch = ts, pl
 		prevPtrButtons, contentDown, railDragFrom, railHover, sashDragging = pb, cd, rd, rh, sd
+		railCloseHover, godButtonHover = rc, gh
 		menuGesture = mg
 		buttonPixels, menuPixels = bp, mp
+		seatFonts = sf
 	}
 }
 

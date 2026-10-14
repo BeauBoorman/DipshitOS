@@ -15,9 +15,9 @@
 package main
 
 import (
-	"unsafe"
-
+	"virelai/icons"
 	"virelai/theme"
+	"virelai/widgets"
 )
 
 // MaxTabs is the `.tabs` v2 / ADR 0033 cap.
@@ -974,12 +974,15 @@ func dec(v uint32) string {
 }
 
 // paintRail fills the top stripH rows of a width x height scanout with
-// one cell per tab. The focused cell uses railFocusRGB; the hovered cell
-// (M79b #1705, `hover` is the cell index or -1) uses railHoverRGB; the rest
-// use railIdleRGB. Every cell carries the close-x glyph in its close zone.
-// Returns how many pixels in the strip were written. No syscalls — the seat
-// paints, then presents, then prints the rail marker.
-func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover int) int {
+// one cell per tab. The focused cell carries the §2.3.6 selection
+// treatment — Selection fill plus the 3px Accent left-edge marker — the
+// hovered cell (M79b #1705, `hover` is the cell index or -1) uses
+// railHoverRGB, and the rest railIdleRGB. Every cell carries the close
+// glyph (VirelaiChrome window-close, the bitmap 'x' when the symbol face
+// is absent) in its close zone, tinted Danger while `closeHover` points
+// at it. Returns how many pixels in the strip were written. No syscalls —
+// the seat paints, then presents, then prints the rail marker.
+func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover, closeHover int) int {
 	n := ts.Count()
 	if n == 0 || width <= 0 || height <= 0 || stripH <= 0 || len(scan) < 4 {
 		return 0
@@ -987,25 +990,22 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover int) 
 	if stripH > height {
 		stripH = height
 	}
-	pixN := len(scan) / 4
-	if pixN < width {
+	if pixN := len(scan) / 4; pixN < width {
 		return 0
 	}
-	maxH := pixN / width
-	if maxH < stripH {
-		stripH = maxH
-	}
-	if stripH <= 0 {
+	c := seatCanvas(scan, width, stripH)
+	if c == nil {
 		return 0
 	}
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), pixN)
+	stripH = c.H
 	// Trough behind the cells (matches the blank desktop so a gap is a gap).
-	written := fillRect(pix, width, maxH, 0, 0, width, stripH, railGapRGB())
+	written := seatFill(c, widgets.Rect{X: 0, Y: 0, W: width, H: stripH}, railGapRGB())
 	cellW := width / n
 	if cellW < 48 {
 		cellW = 48
 	}
 	focus, _ := ts.Focused()
+	tok := theme.Current
 	for i := 0; i < n; i++ {
 		x := i * cellW
 		w := cellW
@@ -1018,16 +1018,22 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover int) 
 		if w <= 1 {
 			continue
 		}
-		rgb := railIdleRGB()
+		cell := widgets.Rect{X: x + 1, Y: 0, W: w - 1, H: stripH}
 		if ts.At(i).ID == focus {
-			rgb = railFocusRGB()
-		} else if i == hover {
-			// M79b (#1705): the hover tint. Focus wins on the focused
-			// cell so the pointer never masks the keyboard's target.
-			rgb = railHoverRGB()
+			// §2.3.6: the selected cell is a Selection fill carrying the
+			// 3px Accent marker the Zig tab chrome drew as a 3x22 bar.
+			written += seatFill(c, cell, tok.Selection)
+			written += seatFill(c, widgets.Rect{X: x + 1, Y: 0, W: seatMarkerW, H: stripH}, tok.Accent)
+		} else {
+			rgb := railIdleRGB()
+			if i == hover {
+				// M79b (#1705): the hover tint. Focus wins on the focused
+				// cell so the pointer never masks the keyboard's target.
+				rgb = railHoverRGB()
+			}
+			// 1px trough on the left, like kernel paint_tab_strip.
+			written += seatFill(c, cell, rgb)
 		}
-		// 1px trough on the left, like kernel paint_tab_strip.
-		written += fillRect(pix, width, maxH, x+1, 0, w-1, stripH, rgb)
 		// M71e (#1564): the frozen badge, inset at the cell's right edge and
 		// painted after the cell fill so it reads on both idle and focused
 		// cells. A badge only — nothing about the tab's behaviour changes.
@@ -1037,50 +1043,28 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover int) 
 				bw = w - 2
 			}
 			if bw > 0 && stripH > 2*railBadgeInset {
-				written += fillRect(pix, width, maxH, x+w-1-bw, railBadgeInset, bw, stripH-2*railBadgeInset, railFrozenRGB())
+				written += seatFill(c, widgets.Rect{X: x + w - 1 - bw, Y: railBadgeInset, W: bw, H: stripH - 2*railBadgeInset}, railFrozenRGB())
 			}
 		}
-		// M79b (#1705): the close-x glyph — the 8x8 face's 'x', inside the
+		// M79b (#1705): the close glyph — VirelaiChrome's window-close,
+		// the bitmap 'x' when the symbol face is absent — inside the
 		// cell's close zone and left of the frozen badge's edge strip.
 		// Painted on every cell (idle, hovered, focused): a user must be
-		// able to FIND the button before they can hover it. Cells too narrow
-		// for the zone get no glyph and no hit target (railCloseZoneAt).
+		// able to FIND the button before they can hover it. Cells too
+		// narrow for the zone get no glyph and no hit target
+		// (railCloseZoneAt). Under the pointer the glyph tints Danger —
+		// the §2.4 destructive-hover state.
 		if w >= railCloseW && stripH >= 8 {
-			written += drawText8(pix, width, maxH, x+w-railCloseW+railCloseInset, (stripH-8)/2, "x", railCloseRGB())
+			ink := railCloseRGB()
+			if i == closeHover {
+				ink = tok.Danger
+			}
+			zone := widgets.Rect{X: x + w - railCloseW, Y: 0, W: railCloseW, H: stripH}
+			closeIcon, _ := icons.Codepoint("window-close")
+			seatGlyph(c, zone, closeIcon, ink, "x",
+				x+w-railCloseW+railCloseInset, (stripH-8)/2)
+			written++
 		}
 	}
 	return written
-}
-
-func fillRect(pix []uint32, width, height, x, y, w, h int, rgb uint32) int {
-	if w <= 0 || h <= 0 || width <= 0 {
-		return 0
-	}
-	if x < 0 {
-		w += x
-		x = 0
-	}
-	if y < 0 {
-		h += y
-		y = 0
-	}
-	n := 0
-	for row := y; row < y+h && row < height; row++ {
-		off := row * width
-		for col := x; col < x+w && col < width; col++ {
-			idx := off + col
-			if idx < 0 || idx >= len(pix) {
-				continue
-			}
-			// The scanout is B,G,R,X and the X byte must be opaque: the
-			// kernel's own stores write 0xff there (virtio_gpu.gpu_fb), and
-			// a 6-hex token leaves it 0x00 — which the host display honours
-			// as alpha, hiding every seat pixel. M71c (#1562), measured:
-			// with X=0 the seated frame showed only the kernel's opaque
-			// splash, the seat's fill and chrome invisible.
-			pix[idx] = rgb | 0xff000000
-			n++
-		}
-	}
-	return n
 }

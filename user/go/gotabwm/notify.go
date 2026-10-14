@@ -43,10 +43,10 @@
 package main
 
 import (
-	"unsafe"
-
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/widgets"
 )
 
 // The notify markers the class-B gate greps. Exported so notify_test.go pins
@@ -382,10 +382,8 @@ func paintNotify(scan []byte, width, height int, ticks uint64) int {
 	if width <= 0 || height <= 0 || len(scan) < 4 || len(notifyQueue) == 0 {
 		return 0
 	}
-	pixN := len(scan) / 4
-	pix := unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), pixN)
-	maxH := pixN / width
-	if maxH <= 0 {
+	c := seatCanvas(scan, width, height)
+	if c == nil {
 		return 0
 	}
 	tok := theme.Current
@@ -401,12 +399,16 @@ func paintNotify(scan []byte, width, height int, ticks uint64) int {
 			continue
 		}
 		remaining := e.expires - ticks
-		written += fillRect(pix, width, maxH, x, y, w, h, notifyFill(tok, remaining))
+		plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+		// §2.5: each toast is a floating plate — the shared shadow under
+		// it, the §2.2 radius on it, the faded rule on its left edge.
+		seatShadow(c, plate, radiusWindow)
 		step := notifyRamp(remaining)
-		written += fillRect(pix, width, maxH, x, y, w, tok.BorderW,
-			mixRGB(tok.Border, tok.Bg, step, uint32(notifyFadeTicks)))
-		written += fillRect(pix, width, maxH, x, y, notifyRuleW, h, notifyRule(tok, remaining))
-		written += drawText8(pix, width, maxH, x+notifyTextPad, y+chromePad,
+		written += seatPlate(c, plate, radiusWindow,
+			notifyRule(tok, remaining), notifyFill(tok, remaining))
+		draw.StrokeRoundedRect(c, plate, radiusWindow, tok.BorderW,
+			draw.Opaque(mixRGB(tok.Border, tok.Bg, step, uint32(notifyFadeTicks))))
+		seatText(c, plate, x+notifyTextPad, y+chromePad, seatTextPx,
 			e.text, notifyText(tok, remaining))
 	}
 	return written
