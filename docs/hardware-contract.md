@@ -430,13 +430,33 @@ Non-PCI platform facts:
     measurement-session observation whose per-cycle logs are not retained; the
     refusal is not deliberately reproducible, so `live-vz-restore` run `msd`
     pins the deterministic half hard and accepts exactly those two cycle
-    outcomes.
+    outcomes. **[observed]** #2261, macOS 27.2 (26B5101f): the same
+    `VZErrorDomain Code=12` "permission denied" restore refusal hit every
+    `restoreMachineStateFrom` leg (headless-base, cross-process load,
+    virtio-gpu, usb-hid, fs-load — 5 of 5 restores) of a `live-vz-restore`
+    run executed while a second VZ gate held a running VM; the identical
+    spec passed 18/18 when rerun with no concurrent VZ VM. The refusal is
+    therefore not msd-specific and is aggravated by concurrent VZ load.
   - **custom-virtio attached: VZ REFUSES** at `validateSaveRestoreSupport`:
     `VZErrorDomain Code=2 "Unsupported custom virtio device in configuration."`
     Every configuration carrying the custom-virtio device (input queue, host
     file channel, snapshot channel, structured console) is therefore
     unsaveable on macOS 27.2; the gate run `cvc` pins the refusal verbatim so
     a release that lifts it fails loudly.
+  - **gpu3d-metal attached (`--gpu3d-metal`, the M102 VIR1 render device):
+    VZ REFUSES the same way** — it is a `VZCustomVirtioDevice`, so the same
+    `VZErrorDomain Code=2` refusal applies. **[observed]** #2261, macOS 27.2
+    (26B5101f), arm64, Xcode 27.1 (27A9275), `live-vz-restore` runs `gpu3d`
+    and `cvboth` (`--custom-virtio --gpu3d-metal` together). `--gpu3d-metal`
+    is admitted under `--vz-restore` as a device knob so the verdict is
+    measured rather than refused at parse time.
+  - **Refusal contract (#2261):** a configuration carrying any custom-virtio
+    attachment is unsaveable, and VZ offers no device-detach, quiesce, or
+    partial-state API — `customVirtioDevices` are part of the immutable
+    configuration, so a graceful detach/save/reattach path does not exist on
+    this platform. The runner's refusal names the blocking attachment(s)
+    (`Blocking device(s): custom-virtio[,gpu3d-metal]`) instead of only the
+    full device list; the gate runs `cvc`/`gpu3d`/`cvboth` pin that naming.
   - **Standard VirtioFS configuration: [observed, host-side validation only]**
     an entitlement-signed host probe with
     `VZVirtioFileSystemDeviceConfiguration` passes

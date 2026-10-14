@@ -18,8 +18,13 @@
 #   cvc        custom-virtio attached: VZ REFUSES at validateSaveRestoreSupport
 #              (VZErrorDomain 2 "Unsupported custom virtio device in
 #              configuration.") — the negative result, pinned verbatim.
-# The SPIKE runner variant is needed for the `cvc` run (custom-virtio types);
-# every other run is byte-identical on it.
+#   gpu3d      gpu3d-metal attached: the M102 VIR1 render device is itself a
+#              VZCustomVirtioDevice; VZ REFUSES the same way (#2261). VZ has
+#              no detach/quiesce API for live devices, so the contract is a
+#              documented refusal and the runner error names the blocking
+#              device(s) — asserted verbatim for both negative runs.
+# The SPIKE runner variant is needed for the `cvc`/`gpu3d` runs (custom-virtio
+# types); every other run is byte-identical on it.
 vgate_name live-vz-restore "Real VZ pause/save/stop/restore/resume preserves a RAM-only clipboard marker; M70g G3 cross-process + device verdicts"
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_share none
@@ -169,13 +174,33 @@ PY
 
 # The negative result: VZ refuses the custom-virtio device at validation, before
 # any boot. Pinned verbatim so a future macOS that accepts it fails this run
-# loudly (and gets a new hardware-contract row).
+# loudly (and gets a new hardware-contract row). #2261: the runner error must
+# also name the blocking device(s), not only list the attached set.
 vgate_run cvc -- --vz-restore --custom-virtio --timeout 90
 vgate_allow_rc cvc 1
 vgate_assert cvc output-contains 'VZ-RESTORE: devices=custom-virtio mode=same-process'
 vgate_assert cvc output-contains 'VZ-RESTORE: validateSaveRestoreSupport REFUSED devices=custom-virtio'
 vgate_assert cvc output-contains 'Unsupported custom virtio device in configuration.'
 vgate_assert cvc output-contains 'ERROR: --vz-restore validateSaveRestoreSupport failed'
+vgate_assert cvc output-contains 'Blocking device(s): custom-virtio'
+
+# The M102 VIR1 render device is a VZCustomVirtioDevice too; #2261 admits
+# --gpu3d-metal under --vz-restore so its verdict is measured like the other
+# device knobs. The observed refusal is pinned verbatim.
+vgate_run gpu3d -- --vz-restore --gpu3d-metal --timeout 90
+vgate_allow_rc gpu3d 1
+vgate_assert gpu3d output-contains 'VZ-RESTORE: devices=gpu3d-metal mode=same-process'
+vgate_assert gpu3d output-contains 'VZ-RESTORE: validateSaveRestoreSupport REFUSED devices=gpu3d-metal'
+vgate_assert gpu3d output-contains 'Unsupported custom virtio device in configuration.'
+vgate_assert gpu3d output-contains 'Blocking device(s): gpu3d-metal'
+
+# Both custom-virtio attachments at once: the refusal names both blockers.
+vgate_run cvboth -- --vz-restore --custom-virtio --gpu3d-metal --timeout 90
+vgate_allow_rc cvboth 1
+vgate_assert cvboth output-contains 'VZ-RESTORE: devices=custom-virtio,gpu3d-metal mode=same-process'
+vgate_assert cvboth output-contains 'VZ-RESTORE: validateSaveRestoreSupport REFUSED devices=custom-virtio,gpu3d-metal'
+vgate_assert cvboth output-contains 'Unsupported custom virtio device in configuration.'
+vgate_assert cvboth output-contains 'Blocking device(s): custom-virtio,gpu3d-metal'
 
 # --- M83g #1780: cross-process restore with a live VirtioFS-backed Go seat --
 # A real session/settings fixture is read by the guest before save. The Go
