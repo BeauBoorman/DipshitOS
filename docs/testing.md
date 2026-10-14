@@ -839,11 +839,13 @@ not `vgate_repeat`-safe.
 | run | proves |
 |-----|--------|
 | 01 | M103a (#2253): `FLINT.ELF parse-corpus /host/FLINTC` runs `go/parser` (`parser.SkipObjectResolution`) and FLINT's Go-native Zig declaration scanner in-guest over the 100-file corpus (50 `.go` + 50 `.zig`), prints `flint: parse files=100 atoms=245 parse_errors=0`, and writes `/host/FLINTC.OUT` byte-equal to the host's independent rendering of `MANIFEST.json` (`share-equals`) |
+| 02 | M103b (#2251): `GOSH.ELF -c "source /host/FLINTJ/02.SH"` runs `FLINT.ELF init --name=w --src=/host/FLINTW`, adds the 245-Atom corpus, verifies idempotent re-add (`new=0 modified=0 deleted=0 unchanged=245`), applies `sample-body.go` (body edit + `const Answer` removal) and `sample-ws.zig` (whitespace/comments only), re-adds (`modified=1 deleted=1 unchanged=243`), and verifies `status` (`atoms=244 staged=244 add=244 modify=0 delete=0 duplicates=0`), `WORKSPACE.json`, and 244 unique UUIDv7 rows in `ATOMS.jsonl` |
 
 Host prerequisites:
 
 ```bash
 bash tools/go/build-flint.sh   # FLINT.ELF (8 MiB budget; bans crypto/*)
+bash tools/go/build-gosh.sh    # GOSH.ELF (journey runner for runs 02+)
 just gate go-flint
 ```
 
@@ -851,8 +853,11 @@ Class-A coverage is `cd user/go && go test ./flint/... && go vet ./flint/...`:
 `TestCorpus` (100 corpus files vs `MANIFEST.json`), `TestPairs` (rename,
 body edit, whitespace/comment, parameter edit, field reorder),
 `TestRefusals` (`anon_ret.zig` -> `parse_unsupported`, `bad.go` -> `syntax`),
-`TestCanon` (`testdata/canon/*.txt`), and `TestZigOracle` (`zig run
-tools/flint/zigdecls.zig` over all 50 `.zig` files).
+`TestCanon` (`testdata/canon/*.txt`), `TestZigOracle` (`zig run
+tools/flint/zigdecls.zig` over all 50 `.zig` files), plus the `memFS` store
+suite (`TestInitLayoutAndRefusals`, `TestUUIDv7MonotonicAndClockUnset`,
+`TestAddIdempotentAndEdits`, `TestStageFoldRulesAndStatus`,
+`TestParseErrorAndDuplicateDeclAllOrNothing`, `TestTornLineAndStoreBounds`).
 
 ## Verification sequence
 

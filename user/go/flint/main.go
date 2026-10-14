@@ -12,7 +12,7 @@ import (
 
 // argvEnvpGuard keeps the writable segment's bss end far enough from the
 // page boundary for the kernel's packed argv+envp (see GOSH.ELF / AGENTD.ELF).
-var argvEnvpGuard [0x1600]byte
+var argvEnvpGuard [0x1000]byte
 
 func init() {
 	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
@@ -47,8 +47,29 @@ func run(args []string) int {
 			return 2
 		}
 		return parseCorpus(args[1])
+	case "init":
+		return runErr(cmdInit(activeFS, storeRoot, defaultUUIDGen, args[1:]))
+	case "add":
+		return runErr(cmdAdd(activeFS, storeRoot, defaultUUIDGen, args[1:]))
+	case "status":
+		return runErr(cmdStatus(activeFS, storeRoot, args[1:]))
 	default:
 		consoleFn("flint: usage")
 		return 2
 	}
+}
+
+func runErr(err error) int {
+	if err == nil {
+		return 0
+	}
+	if re, ok := err.(*RefuseError); ok {
+		consoleFn(re.Error())
+		if re.Code == "usage" {
+			return 2
+		}
+		return 1
+	}
+	consoleFn("flint: error " + err.Error())
+	return 1
 }
