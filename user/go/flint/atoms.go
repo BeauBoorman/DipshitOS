@@ -138,6 +138,37 @@ func cmdAdd(fs FS, root string, uuidGen *UUIDGen, args []string) error {
 	}
 	sort.Strings(affectedFiles)
 
+	// Step 1b: Enforce the M103d `src_behind` guard before staging anything:
+	// if any Atom marked `origin: merge` in an affected file is missing on disk
+	// or has a different hash, refuse `src_behind <file>` and stage nothing.
+	for _, rel := range affectedFiles {
+		oldList := atomsByFile[rel]
+		hasMergeOrigin := false
+		for _, old := range oldList {
+			if old.Origin == "merge" {
+				hasMergeOrigin = true
+				break
+			}
+		}
+		if !hasMergeOrigin {
+			continue
+		}
+		decls := parsedByFile[rel]
+		declHashByKey := make(map[AtomKey]string, len(decls))
+		for _, d := range decls {
+			declHashByKey[AtomKey{File: rel, Kind: d.Kind, Name: d.Name}] = hex.EncodeToString(d.Hash[:])
+		}
+		for _, old := range oldList {
+			if old.Origin != "merge" {
+				continue
+			}
+			key := AtomKey{File: rel, Kind: old.Kind, Name: old.Name}
+			if diskHash, ok := declHashByKey[key]; !ok || diskHash != old.Hash {
+				return refuse("src_behind", rel)
+			}
+		}
+	}
+
 	// Step 2: Diff per file against ATOMS.jsonl (ADR 0049 §1).
 	var newAtoms []StoredAtom
 	for _, a := range existingAtoms {

@@ -23,18 +23,30 @@
 # `flint: refuse secret_not_found` with no `streams/*.jsonl` written and
 # `STAGE.jsonl` left intact.
 #
-# This spec is grown across M103a-d and is NOT vgate_repeat-safe (runs 01-03
-# share the primary /host store across boots).
+# Runs 05-07 (M103d #2254): on `--cvc-file $RUN_DIR/clean-share`, proves two-VM
+# fork + attach/replay (`init --stream=feature`) + disjoint edits on X and Y +
+# semantic merge on Ops (`flint: merge ok conflicts=0`, `src not materialized
+# files=1`, re-merge `flint: merge up to date`, `verify --all` 4x `sig: verified`).
+#
+# Runs 08-10 (M103d #2254): on `--cvc-file $RUN_DIR/conflict-share`, proves two
+# machines editing X differently produce `flint: merge conflict atom=calc.X
+# type=concurrent_modify` and `flint: merge conflicts=1` with `MERGE.json`
+# written and main's stream log and head unchanged.
+#
+# This spec is grown across M103a-d and is NOT vgate_repeat-safe (runs 01-03,
+# 05-07, and 08-10 share /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
 #   bash tools/go/build-gosh.sh  -> .build/go/GOSH.ELF
 #
 # exec-order: assert-proven -- run 01 ends on `flint: parse files=`, run 02
-# ends on `flint: status `, run 03 ends on `sig_invalid`, and run 04 ends on
-# `flint: refuse secret_not_found`.
+# ends on `flint: status `, run 03 ends on `sig_invalid`, run 04 ends on
+# `flint: refuse secret_not_found`, runs 05/08 end on `flint: fork ok`, runs
+# 06/09 end on `flint: commit ok`, run 07 ends on `flint: status ws=a`, and
+# run 10 ends on `flint: merge conflicts=1`.
 
-vgate_name go-flint "M103 #2253/#2251/#2252 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, log, verify"
+vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -52,6 +64,30 @@ EOF
 
 vgate_file script-04.txt <<'EOF'
 exec GOSH.ELF -c "source /host/FLINTJ/04.SH"
+EOF
+
+vgate_file script-05.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/05.SH"
+EOF
+
+vgate_file script-06.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/06.SH"
+EOF
+
+vgate_file script-07.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/07.SH"
+EOF
+
+vgate_file script-08.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/08.SH"
+EOF
+
+vgate_file script-09.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/09.SH"
+EOF
+
+vgate_file script-10.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/10.SH"
 EOF
 
 vgate_setup_python <<'PY'
@@ -182,7 +218,93 @@ open(os.path.join(nosign, "FLINTJ", "04.SH"), "w", encoding="utf-8").write(
     "FLINT.ELF commit -m \"no key\"\n"
 )
 
-print("staged FLINT.ELF, GOSH.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, and nosign-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
+# Runs 05-07 (clean-share) and 08-10 (conflict-share): two-VM merge journeys.
+base_calc = (
+    "package calc\n\n"
+    "func X() int {\n"
+    "\treturn 1\n"
+    "}\n\n"
+    "func Y() int {\n"
+    "\treturn 2\n"
+    "}\n"
+)
+edit_x_feat = (
+    "package calc\n\n"
+    "func X() int {\n"
+    "\treturn 10\n"
+    "}\n\n"
+    "func Y() int {\n"
+    "\treturn 2\n"
+    "}\n"
+)
+edit_y_main = (
+    "package calc\n\n"
+    "func X() int {\n"
+    "\treturn 1\n"
+    "}\n\n"
+    "func Y() int {\n"
+    "\treturn 20\n"
+    "}\n"
+)
+edit_x_conflict = (
+    "package calc\n\n"
+    "func X() int {\n"
+    "\treturn 99\n"
+    "}\n\n"
+    "func Y() int {\n"
+    "\treturn 2\n"
+    "}\n"
+)
+
+def stage_merge_share(share_dir, s_init, s_feat, s_merge, main_edit_src):
+    for sub in ("SRCA", "SRCB", "FLINTJ"):
+        os.makedirs(os.path.join(share_dir, sub), exist_ok=True)
+    for name in ("FLINT.ELF", "GOSH.ELF"):
+        shutil.copy(os.path.join(".build", "go", name), os.path.join(share_dir, name))
+    open(os.path.join(share_dir, "SECRETS.TXT"), "w", encoding="utf-8").write(
+        "#v1\nagent-sign\t1000\t" + SEED_HEX + "\tFLINT.ELF\n"
+    )
+    open(os.path.join(share_dir, "OWNERS.TXT"), "w", encoding="utf-8").write(
+        "#v1\nFLINT.ELF\t644\t0\t-\n"
+    )
+    open(os.path.join(share_dir, "SRCA", "calc.go"), "w", encoding="utf-8").write(base_calc)
+    open(os.path.join(share_dir, "SRCB", "calc.go"), "w", encoding="utf-8").write(base_calc)
+    open(os.path.join(share_dir, "FLINTJ", "edit-b.go"), "w", encoding="utf-8").write(edit_x_feat)
+    open(os.path.join(share_dir, "FLINTJ", "edit-a.go"), "w", encoding="utf-8").write(main_edit_src)
+
+    open(os.path.join(share_dir, "FLINTJ", s_init), "w", encoding="utf-8").write(
+        "FLINT.ELF init --name=a --src=/host/SRCA\n"
+        "FLINT.ELF add /host/SRCA\n"
+        "FLINT.ELF commit -m base\n"
+        "FLINT.ELF fork main feature\n"
+    )
+    open(os.path.join(share_dir, "FLINTJ", s_feat), "w", encoding="utf-8").write(
+        "FLINT.ELF init --name=b --src=/host/SRCB --stream=feature\n"
+        "cat /host/FLINTJ/edit-b.go > /host/SRCB/calc.go\n"
+        "FLINT.ELF add /host/SRCB\n"
+        "FLINT.ELF commit -m feat\n"
+    )
+
+stage_merge_share(os.path.join(run, "clean-share"), "05.SH", "06.SH", "07.SH", edit_y_main)
+open(os.path.join(run, "clean-share", "FLINTJ", "07.SH"), "w", encoding="utf-8").write(
+    "cat /host/FLINTJ/edit-a.go > /host/SRCA/calc.go\n"
+    "FLINT.ELF add /host/SRCA\n"
+    "FLINT.ELF commit -m main\n"
+    "FLINT.ELF merge feature\n"
+    "FLINT.ELF merge feature\n"
+    "FLINT.ELF verify --all\n"
+    "FLINT.ELF status --ws=a\n"
+)
+
+stage_merge_share(os.path.join(run, "conflict-share"), "08.SH", "09.SH", "10.SH", edit_x_conflict)
+open(os.path.join(run, "conflict-share", "FLINTJ", "10.SH"), "w", encoding="utf-8").write(
+    "cat /host/FLINTJ/edit-a.go > /host/SRCA/calc.go\n"
+    "FLINT.ELF add /host/SRCA\n"
+    "FLINT.ELF commit -m main\n"
+    "FLINT.ELF merge feature\n"
+)
+
+print("staged FLINT.ELF, GOSH.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, and conflict-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
 PY
 
 # ---- 01: M103a in-guest parse-corpus over /host/FLINTC -----------------------
@@ -329,4 +451,189 @@ stage_path = os.path.join(nosign, "FLINT", "ws", "w", "STAGE.jsonl")
 if not os.path.isfile(stage_path) or os.path.getsize(stage_path) == 0:
     sys.exit("expected STAGE.jsonl to remain intact on secret_not_found")
 print("run-04 nosign-share hygiene ok (no stream log, STAGE.jsonl intact)")
+PY
+
+# ---- 05: M103d clean-share machine A base commit + fork main -> feature ------
+vgate_run 05 -- \
+    --cvc-file '$RUN_DIR/clean-share' \
+    --virtio-fs '$RUN_DIR/clean-share' \
+    --script '$RUN_DIR/script-05.txt' \
+    --script-expect 'flint: fork ok stream=feature head=' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 05 serial-contains 'flint: init ok ws=a stream=main'
+vgate_assert 05 serial-contains 'flint: add files=1 new=2 modified=0 deleted=0 unchanged=0'
+vgate_assert 05 serial-contains 'flint: commit ok id='
+vgate_assert 05 serial-contains 'flint: fork ok stream=feature head='
+vgate_assert 05 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-05.out"), errors="replace").read()
+if "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" in out:
+    sys.exit("FAIL: signing seed hex reached run-05.out")
+print("run-05 secret-absence ok")
+PY
+
+# ---- 06: M103d clean-share machine B init --stream=feature, edit X, commit ---
+vgate_run 06 -- \
+    --cvc-file '$RUN_DIR/clean-share' \
+    --virtio-fs '$RUN_DIR/clean-share' \
+    --script '$RUN_DIR/script-06.txt' \
+    --script-expect 'flint: commit ok id=' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 06 serial-contains 'flint: init ok ws=b stream=feature atoms=2 replayed=1'
+vgate_assert 06 serial-contains 'flint: add files=1 new=0 modified=1 deleted=0 unchanged=1'
+vgate_assert 06 serial-contains 'flint: commit ok id='
+vgate_assert 06 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-06.out"), errors="replace").read()
+if "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" in out:
+    sys.exit("FAIL: signing seed hex reached run-06.out")
+print("run-06 secret-absence ok")
+PY
+
+# ---- 07: M103d clean-share machine A edit Y, commit, merge, re-merge, verify -
+vgate_run 07 -- \
+    --cvc-file '$RUN_DIR/clean-share' \
+    --virtio-fs '$RUN_DIR/clean-share' \
+    --script '$RUN_DIR/script-07.txt' \
+    --script-expect 'flint: status ws=a' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 07 serial-contains 'flint: merge ok conflicts=0 ops=1 id='
+vgate_assert 07 serial-contains 'flint: merge src not materialized files=1'
+vgate_assert 07 serial-contains 'flint: merge up to date'
+vgate_assert 07 serial-count 'sig: verified' 4
+vgate_assert 07 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 python <<'PY'
+import glob, json, os, sys
+
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-07.out"), errors="replace").read()
+if "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" in out:
+    sys.exit("FAIL: signing seed hex reached run-07.out")
+
+clean = os.path.join(run, "clean-share")
+streams_dir = os.path.join(clean, "FLINT", "streams")
+by_name = {}
+for p in glob.glob(os.path.join(streams_dir, "*.json")):
+    rec = json.load(open(p, "r", encoding="utf-8"))
+    by_name[rec["name"]] = rec
+
+if "main" not in by_name or "feature" not in by_name:
+    sys.exit("missing main or feature stream record: %r" % list(by_name.keys()))
+
+main_rec = by_name["main"]
+feat_rec = by_name["feature"]
+main_log = os.path.join(streams_dir, main_rec["id"] + ".jsonl")
+lines = [json.loads(l) for l in open(main_log, "r", encoding="utf-8").read().splitlines() if l.strip()]
+if len(lines) != 3:
+    sys.exit("expected 3 changes in main log, got %d" % len(lines))
+
+prev_change = lines[-2]
+last_change = lines[-1]
+if last_change.get("merged") != feat_rec.get("head"):
+    sys.exit("last main change merged=%r != feature head=%r" % (last_change.get("merged"), feat_rec.get("head")))
+if last_change.get("parent") != prev_change.get("id"):
+    sys.exit("last main change parent=%r != previous main head=%r" % (last_change.get("parent"), prev_change.get("id")))
+if main_rec.get("head") != last_change.get("id"):
+    sys.exit("main record head=%r != last main change id=%r" % (main_rec.get("head"), last_change.get("id")))
+print("run-07 clean merge log + head verified (merged=%s parent=%s)" % (last_change.get("merged"), last_change.get("parent")))
+PY
+
+# ---- 08: M103d conflict-share machine A base commit + fork main -> feature ---
+vgate_run 08 -- \
+    --cvc-file '$RUN_DIR/conflict-share' \
+    --virtio-fs '$RUN_DIR/conflict-share' \
+    --script '$RUN_DIR/script-08.txt' \
+    --script-expect 'flint: fork ok stream=feature head=' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 08 serial-contains 'flint: init ok ws=a stream=main'
+vgate_assert 08 serial-contains 'flint: add files=1 new=2 modified=0 deleted=0 unchanged=0'
+vgate_assert 08 serial-contains 'flint: commit ok id='
+vgate_assert 08 serial-contains 'flint: fork ok stream=feature head='
+vgate_assert 08 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-08.out"), errors="replace").read()
+if "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" in out:
+    sys.exit("FAIL: signing seed hex reached run-08.out")
+print("run-08 secret-absence ok")
+PY
+
+# ---- 09: M103d conflict-share machine B init --stream=feature, edit X --------
+vgate_run 09 -- \
+    --cvc-file '$RUN_DIR/conflict-share' \
+    --virtio-fs '$RUN_DIR/conflict-share' \
+    --script '$RUN_DIR/script-09.txt' \
+    --script-expect 'flint: commit ok id=' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 09 serial-contains 'flint: init ok ws=b stream=feature atoms=2 replayed=1'
+vgate_assert 09 serial-contains 'flint: add files=1 new=0 modified=1 deleted=0 unchanged=1'
+vgate_assert 09 serial-contains 'flint: commit ok id='
+vgate_assert 09 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-09.out"), errors="replace").read()
+if "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" in out:
+    sys.exit("FAIL: signing seed hex reached run-09.out")
+print("run-09 secret-absence ok")
+PY
+
+# ---- 10: M103d conflict-share machine A edit X differently, merge -> conflict
+vgate_run 10 -- \
+    --cvc-file '$RUN_DIR/conflict-share' \
+    --virtio-fs '$RUN_DIR/conflict-share' \
+    --script '$RUN_DIR/script-10.txt' \
+    --script-expect 'flint: merge conflicts=1' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 10 serial-contains 'flint: merge conflict atom=calc.X type=concurrent_modify'
+vgate_assert 10 serial-contains 'flint: merge conflicts=1'
+vgate_assert 10 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 python <<'PY'
+import glob, json, os, sys
+
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-10.out"), errors="replace").read()
+if "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60" in out:
+    sys.exit("FAIL: signing seed hex reached run-10.out")
+
+conflict_share = os.path.join(run, "conflict-share")
+streams_dir = os.path.join(conflict_share, "FLINT", "streams")
+by_name = {}
+for p in glob.glob(os.path.join(streams_dir, "*.json")):
+    rec = json.load(open(p, "r", encoding="utf-8"))
+    by_name[rec["name"]] = rec
+
+main_rec = by_name["main"]
+main_log = os.path.join(streams_dir, main_rec["id"] + ".jsonl")
+lines = [json.loads(l) for l in open(main_log, "r", encoding="utf-8").read().splitlines() if l.strip()]
+if len(lines) != 2:
+    sys.exit("expected 2 changes in main log (nothing appended on conflict), got %d" % len(lines))
+if main_rec.get("head") != lines[-1].get("id"):
+    sys.exit("main record head=%r != last log line id=%r" % (main_rec.get("head"), lines[-1].get("id")))
+
+merge_path = os.path.join(conflict_share, "FLINT", "ws", "a", "MERGE.json")
+if not os.path.isfile(merge_path):
+    sys.exit("missing " + merge_path)
+report = json.load(open(merge_path, "r", encoding="utf-8"))
+conflicts = report.get("conflicts", [])
+if len(conflicts) != 1 or conflicts[0].get("name") != "calc.X" or conflicts[0].get("type") != "concurrent_modify":
+    sys.exit("unexpected MERGE.json conflicts: %r" % (conflicts,))
+print("run-10 conflict MERGE.json and unchanged main log/head verified")
 PY

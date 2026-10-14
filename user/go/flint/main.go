@@ -21,7 +21,12 @@ func init() {
 var consoleFn = vi.ConsoleLine
 
 func main() {
-	vi.Exit(run(cliArgs(vi.Args())))
+	rc := run(cliArgs(vi.Args()))
+	// Yield one tick before exiting so a parent shell polling `vi.Wait` blocks
+	// for a tick alongside us, letting the core-0 idle reaper free the prior
+	// child's 4 Go task slots before the next sequential `FLINT.ELF` exec.
+	vi.Sleep(1)
+	vi.Exit(rc)
 }
 
 func cliArgs(raw []string) []string {
@@ -59,6 +64,10 @@ func run(args []string) int {
 		return runErr(cmdLog(activeFS, storeRoot, args[1:]))
 	case "verify":
 		return cmdVerify(activeFS, storeRoot, args[1:])
+	case "fork":
+		return runErr(cmdFork(activeFS, storeRoot, defaultUUIDGen, args[1:]))
+	case "merge":
+		return cmdMerge(activeFS, storeRoot, defaultUUIDGen, args[1:])
 	default:
 		consoleFn("flint: usage")
 		return 2

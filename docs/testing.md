@@ -842,6 +842,12 @@ not `vgate_repeat`-safe.
 | 02 | M103b (#2251): `GOSH.ELF -c "source /host/FLINTJ/02.SH"` runs `FLINT.ELF init --name=w --src=/host/FLINTW`, adds the 245-Atom corpus, verifies idempotent re-add (`new=0 modified=0 deleted=0 unchanged=245`), applies `sample-body.go` (body edit + `const Answer` removal) and `sample-ws.zig` (whitespace/comments only), re-adds (`modified=1 deleted=1 unchanged=243`), and verifies `status` (`atoms=244 staged=244 add=244 modify=0 delete=0 duplicates=0`), `WORKSPACE.json`, and 244 unique UUIDv7 rows in `ATOMS.jsonl` |
 | 03 | M103c (#2252): `GOSH.ELF -c "source /host/FLINTJ/03.SH"` continues workspace `w`, signs and commits the 244 staged adds via the app-bound `agent-sign` secret (`flint: commit ok id=<uuid> ops=244 parent=none`), prints `flint log` (`author=d75a9801 msg=initial corpus`), verifies the store (`verify --all` -> `sig: verified`) and the pinned RFC 8032 §7.1 TEST 1 vectors (`verify --file=/host/FLINTV/good.jsonl` -> `sig: verified`, `verify --file=/host/FLINTV/bad.jsonl` -> `sig_invalid`), and checks that `FLINT/streams/*.jsonl` has one line, the stream record `head` matches its id, and `STAGE.jsonl` is removed |
 | 04 | M103c (#2252): on `--cvc-file $RUN_DIR/nosign-share` (whose `SECRETS.TXT` is `#v1\n` only), `GOSH.ELF -c "source /host/FLINTJ/04.SH"` runs `init` -> `add` -> `commit` and proves `flint: refuse secret_not_found` with no `streams/*.jsonl` written and `STAGE.jsonl` left intact; every run asserts the signing seed hex is absent from serial and runner output |
+| 05 | M103d (#2254): on `--cvc-file $RUN_DIR/clean-share` (machine A), `GOSH.ELF -c "source /host/FLINTJ/05.SH"` runs `init --name=a --src=/host/SRCA`, `add`, `commit -m base`, and `fork main feature` (`flint: fork ok stream=feature head=<id>`) |
+| 06 | M103d (#2254): on `--cvc-file $RUN_DIR/clean-share` (machine B), `GOSH.ELF -c "source /host/FLINTJ/06.SH"` attaches workspace `b` to `feature` via `init --name=b --src=/host/SRCB --stream=feature` (`atoms=2 replayed=1`), edits `calc.X`, stages (`modified=1 unchanged=1`), and commits `-m feat` |
+| 07 | M103d (#2254): on `--cvc-file $RUN_DIR/clean-share` (machine A), `GOSH.ELF -c "source /host/FLINTJ/07.SH"` edits disjoint `calc.Y`, commits `-m main`, runs `merge feature` (`flint: merge ok conflicts=0 ops=1 id=<uuid>` and `flint: merge src not materialized files=1`), re-merges `feature` (`flint: merge up to date`), and runs `verify --all` (4x `sig: verified`), with Python verifying that the last line of `main`'s log has `merged == feature.head` and `parent == previous main head` |
+| 08 | M103d (#2254): on `--cvc-file $RUN_DIR/conflict-share` (machine A), `GOSH.ELF -c "source /host/FLINTJ/08.SH"` runs `init --name=a --src=/host/SRCA`, `add`, `commit -m base`, and `fork main feature` |
+| 09 | M103d (#2254): on `--cvc-file $RUN_DIR/conflict-share` (machine B), `GOSH.ELF -c "source /host/FLINTJ/09.SH"` runs `init --name=b --src=/host/SRCB --stream=feature`, edits `calc.X`, adds, and commits `-m feat` |
+| 10 | M103d (#2254): on `--cvc-file $RUN_DIR/conflict-share` (machine A), `GOSH.ELF -c "source /host/FLINTJ/10.SH"` edits `calc.X` differently, commits `-m main`, and runs `merge feature`, proving `flint: merge conflict atom=calc.X type=concurrent_modify` and `flint: merge conflicts=1` with `main`'s record `head` and log unchanged and `MERGE.json` holding the single conflict |
 
 Host prerequisites:
 
@@ -860,10 +866,14 @@ tools/flint/zigdecls.zig` over all 50 `.zig` files), the `memFS` store
 suite (`TestInitLayoutAndRefusals`, `TestUUIDv7MonotonicAndClockUnset`,
 `TestAddIdempotentAndEdits`, `TestStageFoldRulesAndStatus`,
 `TestParseErrorAndDuplicateDeclAllOrNothing`, `TestTornLineAndStoreBounds`),
-and the M103c signature/commit suite (`TestPinnedSigVectorsAndStdlibOracle`
+the M103c signature/commit suite (`TestPinnedSigVectorsAndStdlibOracle`
 with `crypto/ed25519` independent oracle against `testdata/sig/`,
 `TestFlipAnySingleFieldFailsVerify`, `TestJSONKeyOrderAndWhitespaceInvariance`,
-`TestCommitLogVerifyAndRollForward`, `TestCommitAndVerifyRefusals`).
+`TestCommitLogVerifyAndRollForward`, `TestCommitAndVerifyRefusals`), and
+the M103d fork/merge suite (`TestMergeScenariosAndSymmetry` across 20
+`testdata/merge/*.json` scenarios + `into`/`from` symmetry,
+`TestForkInitStreamReplayMergeAndSrcBehind`,
+`TestConflictingMergeLeavesHistoryByteIdentical`).
 
 ## Verification sequence
 

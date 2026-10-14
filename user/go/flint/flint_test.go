@@ -1015,3 +1015,461 @@ func TestCommitAndVerifyRefusals(t *testing.T) {
 		t.Fatalf("expected change_malformed on verify --file, got rc=%d logs=%v", rc, logs)
 	}
 }
+
+type mergeScenarioWantConflict struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type mergeScenarioWant struct {
+	Clean     bool                        `json:"clean"`
+	Ops       []Op                        `json:"ops"`
+	Conflicts []mergeScenarioWantConflict `json:"conflicts"`
+}
+
+type mergeScenario struct {
+	Name      string            `json:"name"`
+	BaseAtoms []StoredAtom      `json:"base_atoms"`
+	Into      [][]Op            `json:"into"`
+	From      [][]Op            `json:"from"`
+	Want      mergeScenarioWant `json:"want"`
+}
+
+func opsSliceEqual(a, b []Op) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Type != b[i].Type ||
+			a[i].AtomID != b[i].AtomID ||
+			a[i].Kind != b[i].Kind ||
+			a[i].NewName != b[i].NewName ||
+			!spansEqual(a[i].NewSpan, b[i].NewSpan) ||
+			a[i].NewHash != b[i].NewHash ||
+			a[i].NewSigHash != b[i].NewSigHash ||
+			a[i].OldHash != b[i].OldHash {
+			return false
+		}
+	}
+	return true
+}
+
+func TestMergeScenariosAndSymmetry(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("testdata", "merge"))
+	if err != nil {
+		t.Fatalf("read testdata/merge: %v", err)
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			files = append(files, e.Name())
+		}
+	}
+	if len(files) < 18 {
+		t.Fatalf("expected at least 18 merge scenario files, got %d", len(files))
+	}
+
+	for _, fname := range files {
+		raw, err := os.ReadFile(filepath.Join("testdata", "merge", fname))
+		if err != nil {
+			t.Fatalf("read %s: %v", fname, err)
+		}
+		var sc mergeScenario
+		if err := json.Unmarshal(raw, &sc); err != nil {
+			t.Fatalf("unmarshal %s: %v", fname, err)
+		}
+
+		res := MergeOps(sc.BaseAtoms, sc.Into, sc.From)
+		if res.Clean != sc.Want.Clean {
+			t.Fatalf("%s (%s): Clean = %v, want %v (conflicts=%v)", fname, sc.Name, res.Clean, sc.Want.Clean, res.Conflicts)
+		}
+
+		wantOps := make([]Op, len(sc.Want.Ops))
+		copy(wantOps, sc.Want.Ops)
+		sortOps(wantOps)
+		if !opsSliceEqual(res.Ops, wantOps) {
+			t.Fatalf("%s (%s): Ops mismatch:\ngot:  %+v\nwant: %+v", fname, sc.Name, res.Ops, wantOps)
+		}
+
+		if len(res.Conflicts) != len(sc.Want.Conflicts) {
+			t.Fatalf("%s (%s): len(Conflicts) = %d (%+v), want %d (%+v)",
+				fname, sc.Name, len(res.Conflicts), res.Conflicts, len(sc.Want.Conflicts), sc.Want.Conflicts)
+		}
+		for i, c := range res.Conflicts {
+			wc := sc.Want.Conflicts[i]
+			if c.Name != wc.Name || c.Type != wc.Type {
+				t.Fatalf("%s (%s): conflict[%d] = (%s, %s), want (%s, %s)",
+					fname, sc.Name, i, c.Name, c.Type, wc.Name, wc.Type)
+			}
+		}
+
+		// Equal add: verify `into`'s Atom ID is kept when `into`'s changes + merge ops are applied.
+		if sc.Name == "equal_add" {
+			atomsByID := make(map[string]StoredAtom)
+			for _, ops := range sc.Into {
+				ApplyOpsToAtomMap(atomsByID, ops, false)
+			}
+			ApplyOpsToAtomMap(atomsByID, res.Ops, true)
+			if len(atomsByID) != 1 {
+				t.Fatalf("equal_add: expected 1 atom in table, got %d", len(atomsByID))
+			}
+			intoAddID := sc.Into[0][0].AtomID
+			if _, ok := atomsByID[intoAddID]; !ok {
+				t.Fatalf("equal_add: expected into's id %s to be kept, got %+v", intoAddID, atomsByID)
+			}
+		}
+
+		// Symmetry: swapping `into` and `from` must give the exact same set of conflict (name, type) pairs.
+		rev := MergeOps(sc.BaseAtoms, sc.From, sc.Into)
+		if rev.Clean != res.Clean {
+			t.Fatalf("%s (%s): symmetry failed on Clean: forward=%v reverse=%v", fname, sc.Name, res.Clean, rev.Clean)
+		}
+		if len(rev.Conflicts) != len(res.Conflicts) {
+			t.Fatalf("%s (%s): symmetry failed on conflict count: forward=%+v reverse=%+v",
+				fname, sc.Name, res.Conflicts, rev.Conflicts)
+		}
+		for i := range res.Conflicts {
+			if rev.Conflicts[i].Name != res.Conflicts[i].Name || rev.Conflicts[i].Type != res.Conflicts[i].Type {
+				t.Fatalf("%s (%s): symmetry conflict[%d] mismatch: forward=(%s,%s) reverse=(%s,%s)",
+					fname, sc.Name, i, res.Conflicts[i].Name, res.Conflicts[i].Type, rev.Conflicts[i].Name, rev.Conflicts[i].Type)
+			}
+		}
+	}
+}
+
+func TestForkInitStreamReplayMergeAndSrcBehind(t *testing.T) {
+	h := newTestHarness(t)
+	baseSrc := []byte("package calc\n\nfunc X() int {\n\treturn 1\n}\n\nfunc Y() int {\n\treturn 2\n}\n")
+	if err := h.fs.WriteFileSafe("/host/SRCA/calc.go", baseSrc); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.fs.WriteFileSafe("/host/SRCB/calc.go", baseSrc); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Init workspace `a` on stream `main`.
+	if rc, logs := h.runCmd("init", "--name=a", "--src=/host/SRCA"); rc != 0 {
+		t.Fatalf("init a: %v", logs)
+	}
+
+	// Refusal: `fork_empty` when `main` has no head yet.
+	rc, logs := h.runCmd("fork", "main", "feature")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse fork_empty" {
+		t.Fatalf("expected fork_empty, got rc=%d logs=%v", rc, logs)
+	}
+
+	// Refusal: `stream_missing` on fork.
+	rc, logs = h.runCmd("fork", "nope", "feature")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse stream_missing nope" {
+		t.Fatalf("expected stream_missing nope, got rc=%d logs=%v", rc, logs)
+	}
+
+	// Stage and commit base on `a` (`main`).
+	if rc, logs := h.runCmd("add", "/host/SRCA"); rc != 0 {
+		t.Fatalf("add a: %v", logs)
+	}
+	if rc, logs := h.runCmd("commit", "-m", "base"); rc != 0 {
+		t.Fatalf("commit base: %v", logs)
+	}
+
+	idx, err := LoadStoreIndex(h.fs, h.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainSt := idx.StreamsByName["main"]
+	if mainSt == nil || mainSt.Head == nil {
+		t.Fatalf("expected main head after base commit, got %+v", mainSt)
+	}
+	baseHead := *mainSt.Head
+
+	// 2. Fork `main` -> `feature`.
+	h.now += 5
+	rc, logs = h.runCmd("fork", "main", "feature")
+	if rc != 0 || len(logs) != 1 || logs[0] != "flint: fork ok stream=feature head="+baseHead {
+		t.Fatalf("fork main feature: rc=%d logs=%v", rc, logs)
+	}
+
+	// Refusal: `stream_exists` when forking to an existing stream name.
+	rc, logs = h.runCmd("fork", "main", "feature")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse stream_exists feature" {
+		t.Fatalf("expected stream_exists feature, got rc=%d logs=%v", rc, logs)
+	}
+
+	// Verify forked_from in `feature`'s stream record.
+	idx, err = LoadStoreIndex(h.fs, h.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	featSt := idx.StreamsByName["feature"]
+	if featSt == nil || featSt.Head == nil || *featSt.Head != baseHead ||
+		featSt.ForkedFrom == nil || featSt.ForkedFrom.Stream != mainSt.ID || featSt.ForkedFrom.Change != baseHead {
+		t.Fatalf("unexpected feature stream record: %+v", featSt)
+	}
+
+	// 3. `init --name=b --src=/host/SRCB --stream=feature` replays Ops and matches `a`'s Atom table.
+	h.now += 5
+	rc, logs = h.runCmd("init", "--name=b", "--src=/host/SRCB", "--stream=feature")
+	if rc != 0 || len(logs) != 1 || logs[0] != "flint: init ok ws=b stream=feature atoms=2 replayed=1" {
+		t.Fatalf("init b --stream=feature: rc=%d logs=%v", rc, logs)
+	}
+
+	atomsA, err := LoadWorkspaceAtoms(h.fs, h.root, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	atomsB, err := LoadWorkspaceAtoms(h.fs, h.root, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atomsA) != 2 || len(atomsB) != 2 {
+		t.Fatalf("expected 2 atoms in a and b, got %d and %d", len(atomsA), len(atomsB))
+	}
+	for i := range atomsA {
+		if atomsA[i].ID != atomsB[i].ID ||
+			atomsA[i].Kind != atomsB[i].Kind ||
+			atomsA[i].Name != atomsB[i].Name ||
+			atomsA[i].Hash != atomsB[i].Hash ||
+			atomsA[i].SigHash != atomsB[i].SigHash ||
+			atomsA[i].Span != atomsB[i].Span {
+			t.Fatalf("replayed atom[%d] mismatch:\na: %+v\nb: %+v", i, atomsA[i], atomsB[i])
+		}
+	}
+
+	// 4. Machine B edits `X` and commits on `feature`.
+	featSrc := []byte("package calc\n\nfunc X() int {\n\treturn 10\n}\n\nfunc Y() int {\n\treturn 2\n}\n")
+	if err := h.fs.WriteFileSafe("/host/SRCB/calc.go", featSrc); err != nil {
+		t.Fatal(err)
+	}
+	h.now += 5
+	if rc, logs := h.runCmd("add", "/host/SRCB"); rc != 0 {
+		t.Fatalf("add b: %v", logs)
+	}
+	if rc, logs := h.runCmd("commit", "-m", "feat"); rc != 0 {
+		t.Fatalf("commit feat: %v", logs)
+	}
+
+	// 5. Machine A edits `Y`. Before committing, test `stage_dirty` refusal on `merge`.
+	mainSrc := []byte("package calc\n\nfunc X() int {\n\treturn 1\n}\n\nfunc Y() int {\n\treturn 20\n}\n")
+	if err := h.fs.WriteFileSafe("/host/SRCA/calc.go", mainSrc); err != nil {
+		t.Fatal(err)
+	}
+	h.now += 5
+	if rc, logs := h.runCmd("add", "/host/SRCA"); rc != 0 {
+		t.Fatalf("add a: %v", logs)
+	}
+	rc, logs = h.runCmd("merge", "feature")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse stage_dirty" {
+		t.Fatalf("expected stage_dirty, got rc=%d logs=%v", rc, logs)
+	}
+
+	if rc, logs := h.runCmd("commit", "-m", "main"); rc != 0 {
+		t.Fatalf("commit main: %v", logs)
+	}
+
+	// Refusal: `stream_missing` on merge.
+	rc, logs = h.runCmd("merge", "no-such-stream")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse stream_missing no-such-stream" {
+		t.Fatalf("expected stream_missing, got rc=%d logs=%v", rc, logs)
+	}
+
+	idx, _ = LoadStoreIndex(h.fs, h.root)
+	preMergeMainHead := *idx.StreamsByName["main"].Head
+	featHead := *idx.StreamsByName["feature"].Head
+
+	// 6. Clean merge of `feature` into `main` (workspace `a`).
+	h.now += 5
+	rc, logs = h.runCmd("merge", "feature")
+	if rc != 0 || len(logs) != 2 {
+		t.Fatalf("clean merge: rc=%d logs=%v", rc, logs)
+	}
+	if !strings.HasPrefix(logs[0], "flint: merge ok conflicts=0 ops=1 id=") {
+		t.Fatalf("unexpected merge line 0: %s", logs[0])
+	}
+	if logs[1] != "flint: merge src not materialized files=1" {
+		t.Fatalf("unexpected merge line 1: %s", logs[1])
+	}
+
+	// Verify the signed merge Change on `main` (`parent == preMergeMainHead`, `merged == featHead`).
+	mainStAfter, mainChanges, err := LoadStream(h.fs, h.root, mainSt.ID)
+	if err != nil || len(mainChanges) != 3 {
+		t.Fatalf("expected 3 changes on main after merge, got %d err=%v", len(mainChanges), err)
+	}
+	mergeChange := mainChanges[2]
+	if mainStAfter.Head == nil || *mainStAfter.Head != mergeChange.ID {
+		t.Fatalf("main head %v != mergeChange.ID %s", mainStAfter.Head, mergeChange.ID)
+	}
+	if mergeChange.Parent == nil || *mergeChange.Parent != preMergeMainHead {
+		t.Fatalf("mergeChange.Parent = %v, want %s", mergeChange.Parent, preMergeMainHead)
+	}
+	if mergeChange.Merged == nil || *mergeChange.Merged != featHead {
+		t.Fatalf("mergeChange.Merged = %v, want %s", mergeChange.Merged, featHead)
+	}
+	if ok, err := VerifyChange(&mergeChange); err != nil || !ok {
+		t.Fatalf("VerifyChange(mergeChange) = %v, %v", ok, err)
+	}
+
+	// Re-merge `feature` -> `flint: merge up to date`, nothing written.
+	mainLogBefore, _ := h.fs.ReadFile(streamLogPath(h.root, mainSt.ID), MaxFileReadBytes)
+	rc, logs = h.runCmd("merge", "feature")
+	if rc != 0 || len(logs) != 1 || logs[0] != "flint: merge up to date" {
+		t.Fatalf("expected up to date on re-merge, got rc=%d logs=%v", rc, logs)
+	}
+	mainLogAfter, _ := h.fs.ReadFile(streamLogPath(h.root, mainSt.ID), MaxFileReadBytes)
+	if !bytes.Equal(mainLogBefore, mainLogAfter) {
+		t.Fatal("stream log modified on up-to-date merge")
+	}
+
+	// `verify --all` verifies all 4 Changes across `main` and `feature`.
+	rc, logs = h.runCmd("verify", "--all")
+	if rc != 0 || len(logs) != 4 {
+		t.Fatalf("verify --all: rc=%d logs=%v", rc, logs)
+	}
+	for _, l := range logs {
+		if !strings.HasSuffix(l, " sig: verified") {
+			t.Fatalf("expected sig: verified, got %s", l)
+		}
+	}
+
+	// 7. `src_behind` guard: `calc.X` in workspace `a` is marked `origin: merge`,
+	// while `/host/SRCA/calc.go` still has the old `X() { return 1 }` on disk.
+	atomsAfterMerge, err := LoadWorkspaceAtoms(h.fs, h.root, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundMergeOrigin := false
+	for _, a := range atomsAfterMerge {
+		if a.Name == "calc.X" && a.Origin == "merge" {
+			foundMergeOrigin = true
+		}
+	}
+	if !foundMergeOrigin {
+		t.Fatalf("expected calc.X to have origin=merge, got %+v", atomsAfterMerge)
+	}
+
+	rc, logs = h.runCmd("add", "/host/SRCA")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse src_behind calc.go" {
+		t.Fatalf("expected src_behind calc.go, got rc=%d logs=%v", rc, logs)
+	}
+	if h.fs.Exists(workspaceStagePath(h.root, "a")) {
+		t.Fatal("STAGE.jsonl must not exist after src_behind refusal")
+	}
+
+	// Once `/host/SRCA/calc.go` is updated on disk so `X` matches the merged hash,
+	// `add` succeeds and clears `origin: merge`!
+	mergedSrc := []byte("package calc\n\nfunc X() int {\n\treturn 10\n}\n\nfunc Y() int {\n\treturn 20\n}\n")
+	if err := h.fs.WriteFileSafe("/host/SRCA/calc.go", mergedSrc); err != nil {
+		t.Fatal(err)
+	}
+	rc, logs = h.runCmd("add", "/host/SRCA")
+	if rc != 0 || len(logs) != 1 || logs[0] != "flint: add files=1 new=0 modified=0 deleted=0 unchanged=2" {
+		t.Fatalf("expected clean add once disk matches merged state, got rc=%d logs=%v", rc, logs)
+	}
+	atomsCleared, err := LoadWorkspaceAtoms(h.fs, h.root, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range atomsCleared {
+		if a.Origin != "" {
+			t.Fatalf("expected origin: merge to clear after matching add, got %+v", a)
+		}
+	}
+}
+
+func TestConflictingMergeLeavesHistoryByteIdentical(t *testing.T) {
+	h := newTestHarness(t)
+	baseSrc := []byte("package calc\n\nfunc X() int {\n\treturn 1\n}\n\nfunc Y() int {\n\treturn 2\n}\n")
+	if err := h.fs.WriteFileSafe("/host/SRCA/calc.go", baseSrc); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.fs.WriteFileSafe("/host/SRCB/calc.go", baseSrc); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc, _ := h.runCmd("init", "--name=a", "--src=/host/SRCA"); rc != 0 {
+		t.Fatal("init a failed")
+	}
+	if rc, _ := h.runCmd("add", "/host/SRCA"); rc != 0 {
+		t.Fatal("add a failed")
+	}
+	if rc, _ := h.runCmd("commit", "-m", "base"); rc != 0 {
+		t.Fatal("commit base failed")
+	}
+	if rc, _ := h.runCmd("fork", "main", "feature"); rc != 0 {
+		t.Fatal("fork failed")
+	}
+	if rc, _ := h.runCmd("init", "--name=b", "--src=/host/SRCB", "--stream=feature"); rc != 0 {
+		t.Fatal("init b failed")
+	}
+
+	// Machine B edits `X` to return 10.
+	if err := h.fs.WriteFileSafe("/host/SRCB/calc.go", []byte("package calc\n\nfunc X() int {\n\treturn 10\n}\n\nfunc Y() int {\n\treturn 2\n}\n")); err != nil {
+		t.Fatal(err)
+	}
+	h.now += 5
+	if rc, _ := h.runCmd("add", "/host/SRCB"); rc != 0 {
+		t.Fatal("add b failed")
+	}
+	if rc, _ := h.runCmd("commit", "-m", "feat"); rc != 0 {
+		t.Fatal("commit feat failed")
+	}
+
+	// Machine A edits `X` to return 99.
+	if err := h.fs.WriteFileSafe("/host/SRCA/calc.go", []byte("package calc\n\nfunc X() int {\n\treturn 99\n}\n\nfunc Y() int {\n\treturn 2\n}\n")); err != nil {
+		t.Fatal(err)
+	}
+	h.now += 5
+	if rc, _ := h.runCmd("add", "/host/SRCA"); rc != 0 {
+		t.Fatal("add a failed")
+	}
+	if rc, _ := h.runCmd("commit", "-m", "main"); rc != 0 {
+		t.Fatal("commit main failed")
+	}
+
+	idx, _ := LoadStoreIndex(h.fs, h.root)
+	mainID := idx.StreamsByName["main"].ID
+	recBefore, err := h.fs.ReadFile(streamRecordPath(h.root, mainID), MaxFileReadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logBefore, err := h.fs.ReadFile(streamLogPath(h.root, mainID), MaxFileReadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	atomsBefore, err := h.fs.ReadFile(workspaceAtomsPath(h.root, "a"), MaxFileReadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rc, logs := h.runCmd("merge", "feature")
+	if rc != 2 || len(logs) != 2 ||
+		logs[0] != "flint: merge conflict atom=calc.X type=concurrent_modify" ||
+		logs[1] != "flint: merge conflicts=1" {
+		t.Fatalf("expected conflict rc=2, got rc=%d logs=%v", rc, logs)
+	}
+
+	recAfter, _ := h.fs.ReadFile(streamRecordPath(h.root, mainID), MaxFileReadBytes)
+	logAfter, _ := h.fs.ReadFile(streamLogPath(h.root, mainID), MaxFileReadBytes)
+	atomsAfter, _ := h.fs.ReadFile(workspaceAtomsPath(h.root, "a"), MaxFileReadBytes)
+	if !bytes.Equal(recBefore, recAfter) {
+		t.Fatal("stream record changed on conflicting merge")
+	}
+	if !bytes.Equal(logBefore, logAfter) {
+		t.Fatal("stream log changed on conflicting merge")
+	}
+	if !bytes.Equal(atomsBefore, atomsAfter) {
+		t.Fatal("ATOMS.jsonl changed on conflicting merge")
+	}
+
+	mergeBytes, err := h.fs.ReadFile(workspaceMergePath(h.root, "a"), MaxFileReadBytes)
+	if err != nil {
+		t.Fatalf("read MERGE.json: %v", err)
+	}
+	var report MergeReport
+	if err := json.Unmarshal(mergeBytes, &report); err != nil {
+		t.Fatalf("unmarshal MERGE.json: %v", err)
+	}
+	if len(report.Conflicts) != 1 || report.Conflicts[0].Name != "calc.X" || report.Conflicts[0].Type != "concurrent_modify" {
+		t.Fatalf("unexpected MERGE.json conflicts: %+v", report)
+	}
+}
+
