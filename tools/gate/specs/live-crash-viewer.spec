@@ -99,20 +99,24 @@ import os
 exec(open(os.path.join(os.environ["RUN_DIR"], "reset-crash.py")).read())
 PY
 
+# M97g (#2085): the APPLOG/CRASH label overlay binds receipt files to the
+# producing image or its spawner — a VIEWER needs the monitor's `-u0`
+# admin spawn (uid_system + CAP_FS_ANY), the same channel go-selftest's
+# LOGVIEW legs use.
 vgate_file go.txt <<'EOF'
-exec CRASHVIEW.ELF -text -exercise go
+exec -u0 CRASHVIEW.ELF -text -exercise go
 EOF
 vgate_file kernel.txt <<'EOF'
-exec CRASHVIEW.ELF -text -exercise kernel
+exec -u0 CRASHVIEW.ELF -text -exercise kernel
 EOF
 vgate_file twice.txt <<'EOF'
-exec CRASHVIEW.ELF -text -exercise twice
+exec -u0 CRASHVIEW.ELF -text -exercise twice
 EOF
 vgate_file reopen.txt <<'EOF'
-exec CRASHVIEW.ELF -text -exercise reopen
+exec -u0 CRASHVIEW.ELF -text -exercise reopen
 EOF
 vgate_file window.txt <<'EOF'
-exec CRASHVIEW.ELF -exercise go
+exec -u0 CRASHVIEW.ELF -exercise go
 EOF
 
 vgate_run 02 -- --script '$RUN_DIR/go.txt' --script-after 'tasks user-el0 exited status=7' --script-expect 'crashview: done shown=1' --timeout 60

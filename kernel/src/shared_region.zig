@@ -267,7 +267,7 @@ pub fn clear_peer(handle: u32) void {
 /// `owner_va` (the owner's sys_munmap / owner re-map lookup), or null.
 pub fn find_owner(owner_pid: u64, owner_va: u64) ?u32 {
     for (&regions) |*r| {
-        if (r.in_use and r.owner_pid == owner_pid and r.owner_va == owner_va) return r.handle;
+        if (r.in_use and r.owner_pid != 0 and r.owner_pid == owner_pid and r.owner_va == owner_va) return r.handle;
     }
     return null;
 }
@@ -276,7 +276,7 @@ pub fn find_owner(owner_pid: u64, owner_va: u64) ?u32 {
 /// `peer_va` (the peer's per-root sys_munmap lookup), or null.
 pub fn find_peer(peer_pid: u64, peer_va: u64) ?u32 {
     for (&regions) |*r| {
-        if (r.in_use and r.peer_pid == peer_pid and r.peer_va == peer_va) return r.handle;
+        if (r.in_use and r.peer_pid != 0 and r.peer_pid == peer_pid and r.peer_va == peer_va) return r.handle;
     }
     return null;
 }
@@ -303,7 +303,7 @@ pub fn munmap_match(pid: u64, va: u64, len: u64) MunmapMatch {
     for (&regions) |*r| {
         if (!r.in_use) continue;
         const rlen = @as(u64, r.page_count) * 4096;
-        if (r.owner_pid == pid) {
+        if (r.owner_pid != 0 and r.owner_pid == pid) {
             const lo = @max(va, r.owner_va);
             const hi = @min(va_end, r.owner_va + rlen);
             if (hi > lo) {
@@ -311,7 +311,7 @@ pub fn munmap_match(pid: u64, va: u64, len: u64) MunmapMatch {
                 return .partial;
             }
         }
-        if (r.peer_pid == pid) {
+        if (r.peer_pid != 0 and r.peer_pid == pid) {
             const lo = @max(va, r.peer_va);
             const hi = @min(va_end, r.peer_va + rlen);
             if (hi > lo) {
@@ -328,7 +328,7 @@ pub fn munmap_match(pid: u64, va: u64, len: u64) MunmapMatch {
 pub fn owned_handles(owner_pid: u64, out: []u32) usize {
     var n: usize = 0;
     for (&regions) |*r| {
-        if (r.in_use and r.owner_pid == owner_pid) {
+        if (r.in_use and r.owner_pid != 0 and r.owner_pid == owner_pid) {
             if (n < out.len) out[n] = r.handle;
             n += 1;
         }
@@ -341,7 +341,10 @@ pub fn owned_handles(owner_pid: u64, out: []u32) usize {
 pub fn peer_handles(peer_pid: u64, out: []u32) usize {
     var n: usize = 0;
     for (&regions) |*r| {
-        if (r.in_use and r.peer_pid == peer_pid) {
+        // peer_pid == 0 is the empty-seat sentinel, not a principal — a
+        // caller carrying pid 0 (a task with no process mapping) must not
+        // match every peer-less region and unmap the owner's live leaves.
+        if (r.in_use and r.peer_pid != 0 and r.peer_pid == peer_pid) {
             if (n < out.len) out[n] = r.handle;
             n += 1;
         }
@@ -491,4 +494,27 @@ test "shared_region: a reused slot starts clean — no stale SB2 wiring survives
     try std.testing.expectEqual(@as(u64, 0), r.pa_base);
     try std.testing.expectEqual(@as(u64, 0), r.peer_pid);
     try std.testing.expectEqual(@as(u64, 0), r.peer_va);
+}
+
+test "shared_region: pid 0 never matches the empty peer seat" {
+    reset();
+    const owner: u64 = 42;
+    const h = create(owner);
+    try std.testing.expect(h != 0);
+    try std.testing.expect(set_mapping(h, 0x1000_0000, 2, 0x200000));
+    // The seat is empty (peer_pid == 0): a pid-0 caller — a task with no
+    // process mapping, as the exit sweep sees for EL1h/kernel tasks — must
+    // match NOTHING, or its peer-detach sweep would unmap+unref the owner's
+    // live pages (M104f go-calc pad-leg corruption).
+    var out: [max_shared_regions]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), peer_handles(0, &out));
+    try std.testing.expectEqual(@as(usize, 0), owned_handles(0, &out));
+    try std.testing.expect(munmap_match(0, 0x1000, 8192) == .none);
+    try std.testing.expect(find_peer(0, 0) == null);
+    // A real peer seat still matches its own pid.
+    const wm: u64 = 7;
+    try std.testing.expect(set_peer(h, wm, 0x2000_0000));
+    try std.testing.expectEqual(@as(usize, 1), peer_handles(wm, &out));
+    try std.testing.expectEqual(@as(usize, 0), peer_handles(0, &out));
+    _ = drop_owner(h);
 }

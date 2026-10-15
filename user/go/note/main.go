@@ -474,7 +474,8 @@ func insertionFor(ev vi.Event) (rune, bool) {
 // fill is one clamped rectangle through the bound window canvas (or the
 // FillerCanvas degradation path — tabapp.Canvas picks). draw.Opaque mirrors
 // the kernel fill's byte contract on the raster path: the compositor reads
-// RGB, so tok.Bg's client fill is still 0x101418 byte-for-byte.
+// B8G8R8X8, so the client fill the specs pixel-pin keeps tok.Bg's exact
+// bytes (0x182026 since M69c moved NOTE onto the token table).
 func (a *app) fill(x, y, w, h int, rgb uint32) {
 	if w <= 0 || h <= 0 || x < 0 || y < 0 || a.ta == nil {
 		return
