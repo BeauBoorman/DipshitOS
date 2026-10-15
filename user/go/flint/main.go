@@ -68,6 +68,14 @@ func run(args []string) int {
 		return runErr(cmdFork(activeFS, storeRoot, defaultUUIDGen, args[1:]))
 	case "merge":
 		return cmdMerge(activeFS, storeRoot, defaultUUIDGen, args[1:])
+	case "clone":
+		return runErr(cmdClone(activeFS, storeRoot, args[1:]))
+	case "pull":
+		return runErr(cmdPull(activeFS, storeRoot, args[1:]))
+	case "push":
+		return runErr(cmdPush(activeFS, storeRoot, args[1:]))
+	case "ls-remote":
+		return runErr(cmdLsRemote(activeFS, storeRoot, args[1:]))
 	default:
 		consoleFn("flint: usage")
 		return 2
