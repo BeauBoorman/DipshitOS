@@ -537,14 +537,18 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	if tabs.Count() == 0 {
 		_ = paintBlank(scan, blankRGB())
 		startSurfaceTick(scan)
-	} else {
-		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
-		markRail()
 	}
 	// #2236 defect #13: migrated (surface-backed) client windows are the
 	// seat's compositing job — the kernel skipped their blit at tick time.
-	// Compose them under the seat's chrome like the kernel layer expects.
+	// Compose them UNDER the seat's chrome like the kernel layer expects:
+	// a full-viewport tab rect covers the rail band, and a record that
+	// painted on top of it would hide the strip entirely. Runs on both
+	// branches — a non-tab Attach surface is live with an empty strip.
 	composeSurfaces(scan)
+	if tabs.Count() != 0 {
+		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
+		markRail()
+	}
 	chromeTick(scan, ticks)
 	if launch.open {
 		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)

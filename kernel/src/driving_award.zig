@@ -1862,6 +1862,20 @@ pub fn user_paint_dest(id: u8) ?PaintDest {
     return .{ .base = kbuf_ptr(win), .stride = @as(usize, win.w) * 4, .w = win.w, .h = win.h };
 }
 
+/// M104f: render a window's KERNEL front-end (attached terminal grid) into
+/// its bound surface — the half of paint() a migrated window still needs
+/// while the seat owns the scanout blit (wm_owns_user_layer). No-op for
+/// self-painting apps (no terminal screen) and for a rect that outgrew the
+/// bound pages (the #2111 invariant — the seat clips to the last honest
+/// extent until the owner re-shares).
+fn render_frontend_to_surface(w: *const Window) void {
+    if (w.kind != .user or w.surface_handle == 0) return;
+    const scr = terminal.screenOf(w.id) orelse return;
+    if (!surface_covers(w.surface_pages, w.w, w.h)) return;
+    terminal.syncWindowCols(w.id, w.w);
+    render_terminal_screen(@as([*]u8, @ptrFromInt(w.surface_pa)), w, scr);
+}
+
 /// Move a user window's top-left corner to (x, y), CLAMPED so the whole
 /// window stays inside the scanout (a window is never allowed off-screen —
 /// the honest bound). Marks the moved window dirty and the terminal dirty
@@ -2145,8 +2159,10 @@ pub fn wm_apply_rect(id: u8, x: u32, y: u32, w: u32, h: u32) bool {
         win.fade_phase = 0;
         win.fade_tick = 0;
         win.damaged = false;
-        // Migrated clients are composed by the WM, not by this legacy blit.
-        if (win.surface_handle == 0) paint(win);
+        // Migrated clients are composed by the WM, not by this legacy blit —
+        // but a kernel-rendered front-end (attached tty) still needs its grid
+        // re-rendered into the resized surface, or the seat reads stale rows.
+        if (win.surface_handle == 0) paint(win) else render_frontend_to_surface(win);
     }
     win.dirty = true;
     _ = mark_dirty(0);
@@ -4884,6 +4900,12 @@ pub fn paint_scene() virtio_gpu.CmdResult {
         // before the final present). Skip the kernel blit entirely; the
         // damage is consumed (the WM composites from the same tick mask).
         if (w.kind == .user and wm_owns_user_layer and user_surface(w.id) != null) {
+            // M104f: only the SCANOUT BLIT is the seat's job — a window with
+            // a kernel-rendered front-end (attached tty) still needs its grid
+            // painted into the surface pages, or the seat's compose-N reads
+            // zeros. Apps that paint their own surface have no terminal
+            // screen and take the pure skip.
+            render_frontend_to_surface(w);
             w.dirty = false;
             w.damaged = false;
             // M33 SB6 (claim 6864): the seam-B composite-cost saving — the

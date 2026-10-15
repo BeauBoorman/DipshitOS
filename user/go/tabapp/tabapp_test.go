@@ -1,10 +1,13 @@
 package tabapp
 
 import (
+	"errors"
 	"testing"
 
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/widgets"
 )
 
 // On the host every vi call degrades, so Init reports the honest failure
@@ -87,5 +90,95 @@ func TestLayoutTracksCanvas(t *testing.T) {
 	got := ta.Layout(Rect{8, 104, 56, 20}, 512, 340)
 	if got.X+got.W > 1100 || got.Y+got.H > 720 {
 		t.Fatalf("layout spills: %+v", got)
+	}
+}
+
+// stubSurface replaces the kernel bind for one test and returns the shared
+// page slice every call records against.
+func stubSurface(t *testing.T, fail bool) (*[][2]int, []byte) {
+	t.Helper()
+	calls := new([][2]int)
+	surf := make([]byte, vi.ScanoutFbBytes)
+	orig := mmapWindowSurface
+	mmapWindowSurface = func(win, size int) ([]byte, error) {
+		*calls = append(*calls, [2]int{win, size})
+		if fail {
+			return nil, errors.New("ENOSYS")
+		}
+		return surf, nil
+	}
+	t.Cleanup(func() { mmapWindowSurface = orig })
+	return calls, surf
+}
+
+// Attach performs the same one-time bind Init does — observable on the host
+// because Attach does not gate on WinOpen.
+func TestAttachBindsScanoutSurfaceOnce(t *testing.T) {
+	calls, _ := stubSurface(t, false)
+	ta := Attach(7, "T.ELF", 320, 200)
+	if len(*calls) != 1 || (*calls)[0] != [2]int{7, vi.ScanoutFbBytes} {
+		t.Fatalf("bind calls = %v want one scanout bind on win 7", *calls)
+	}
+	bc, ok := ta.Canvas().(*draw.BufferCanvas)
+	if !ok || bc.W != 320 || bc.H != 200 {
+		t.Fatalf("canvas = %#v want *draw.BufferCanvas 320x200", ta.Canvas())
+	}
+	// One bind is the lifetime contract: WIN_RESIZE re-views, never re-mmaps.
+	if a := ta.Dispatch(vi.Event{Kind: vi.EvWinResize, Arg0: 640, Arg1: 400}); a != ActionResized {
+		t.Fatalf("resize action = %v", a)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("resize re-mmapped the surface: %v calls", *calls)
+	}
+	bc, ok = ta.Canvas().(*draw.BufferCanvas)
+	if !ok || bc.W != 640 || bc.H != 400 {
+		t.Fatalf("post-resize canvas = %#v want 640x400 BufferCanvas", ta.Canvas())
+	}
+}
+
+// The review half of reflow's reframe contract: a resize keeps each
+// surviving row's bytes at the new stride. Grow relocates bottom-up, shrink
+// top-down — either way the top-left overlap is identical before repaint.
+func TestReviewPreservesOverlap(t *testing.T) {
+	_, _ = stubSurface(t, false)
+	ta := Attach(7, "T.ELF", 2, 2)
+	for i := 0; i < 2*2*4; i++ {
+		ta.surf[i] = byte(i + 1)
+	}
+	// Grow 2x2 -> 4x2: each row moves to the 16-byte stride.
+	ta.Dispatch(vi.Event{Kind: vi.EvWinResize, Arg0: 4, Arg1: 2})
+	for i := 0; i < 8; i++ {
+		if ta.surf[i] != byte(i+1) || ta.surf[16+i] != byte(i+9) {
+			t.Fatalf("grow clobbered overlap: %v", ta.surf[:24])
+		}
+	}
+	// Rebind determinism: repeat the pattern under the wider view, then
+	// shrink 4x2 -> 2x2 — the left half of each row survives.
+	for i := 0; i < 4*2*4; i++ {
+		ta.surf[i] = byte(i + 1)
+	}
+	ta.Dispatch(vi.Event{Kind: vi.EvWinResize, Arg0: 2, Arg1: 2})
+	for i := 0; i < 8; i++ {
+		if ta.surf[i] != byte(i+1) || ta.surf[8+i] != byte(i+17) {
+			t.Fatalf("shrink clobbered overlap: %v", ta.surf[:16])
+		}
+	}
+}
+
+// The degrade contract: a refused bind (and a hand-built TabApp, what the
+// app host tests construct) paints through FillerCanvas, never panics.
+func TestCanvasDegradesWhenBindRefused(t *testing.T) {
+	_, _ = stubSurface(t, true)
+	ta := Attach(7, "T.ELF", 320, 200)
+	fc, ok := ta.Canvas().(*draw.FillerCanvas)
+	if !ok || fc.WindowID != 7 {
+		t.Fatalf("degrade canvas = %#v want *draw.FillerCanvas win 7", ta.Canvas())
+	}
+	ta.Canvas().FillRect(widgets.Rect{W: 10, H: 10}, 0xFF112233)
+	ta.Present()
+
+	manual := &TabApp{Win: 4, W: 512, H: 340}
+	if _, ok := manual.Canvas().(*draw.FillerCanvas); !ok {
+		t.Fatalf("manual TabApp canvas = %#v want FillerCanvas degrade", manual.Canvas())
 	}
 }

@@ -46,6 +46,7 @@ import (
 	"strings"
 
 	"virelai/chords"
+	"virelai/draw"
 	"virelai/settings"
 	"virelai/svcmanifest"
 	"virelai/tabapp"
@@ -109,6 +110,11 @@ type panel struct {
 	saveBtn     widgets.Button
 	quitBtn     widgets.Button
 	paletteSwat [3]widgets.Rect
+	// M104f: the dropdown popover over a vocabulary row, and the audio
+	// slider's drag state. Both ride the shared canvas; neither is a
+	// focus-ring member (Tab order is unchanged — they are row affordances).
+	dropdown dropdownCtl
+	volDrag  bool
 }
 
 func main() {
@@ -456,6 +462,15 @@ func (a *panel) handle(ev vi.Event) bool {
 			return false
 		}
 		x, y := int(ev.Arg0), int(ev.Arg1)
+		// An open popover is modal: it eats the click (choosing an option
+		// or just closing), so a click-away never reaches the rows under it.
+		if a.dropdown.open {
+			a.dropdownClick(x, y)
+			return true
+		}
+		if a.rowControlClick(x, y) {
+			return true
+		}
 		if a.focus.HandleClick(x, y) {
 			if current, _ := a.focus.Current(); current == a.listCtl {
 				a.sel = a.list.Sel
@@ -465,6 +480,19 @@ func (a *panel) handle(ev vi.Event) bool {
 		if i := a.list.ItemAt(x, y); i >= 0 {
 			a.sel = i
 			a.list.Sel = i
+			return true
+		}
+	case vi.EvMouseMove:
+		if a.volDrag {
+			if r, ok := a.volumeSliderRect(); ok {
+				s := widgets.Slider{R: r, Min: 0, Max: 100}
+				a.set(settings.AudioVolumeKey, decade(s.ValueAt(int(ev.Arg0))))
+			}
+			return true
+		}
+	case vi.EvMouseUp:
+		if a.volDrag {
+			a.volDrag = false
 			return true
 		}
 	}
@@ -479,6 +507,12 @@ func (a *panel) key(ev vi.Event) bool {
 	// chord checks.
 	if isShortcutsChord(ev) {
 		return a.toggleShortcuts()
+	}
+	// An open popover closes on any key — Left/Right cycling is the
+	// keyboard path for the same vocabulary, so the popover is mouse-only.
+	if a.dropdown.open {
+		a.dropdown.open = false
+		return true
 	}
 	k, ok := normalizeKey(ev)
 	if !ok {
@@ -700,39 +734,212 @@ func paletteHex(v uint32) string {
 	return string(b[:])
 }
 
+// --- row controls -----------------------------------------------------------
+//
+// M104f (#2273): the M104d controls ride the settings list as per-row
+// affordances. {on,off} vocab rows get a Toggle, the audio_volume row gets
+// the Slider (the §5.2 secondary consumer — its writes still flow through
+// a.set → settings.Set → the slot-44 apply hook), and every other
+// multi-valued row gets a dropdown affordance whose popover picks the value.
+// Non-editable "(kept)" rows get none. All of it is geometry over the same
+// canvas; the kernel's vocabulary, not the control, stays authoritative.
+
+// rowRect is row i's slice of the list viewport (i is the absolute index).
+func (a *panel) rowRect(i int) (widgets.Rect, bool) {
+	lr, top := a.list.R, a.list.ScrollTop
+	if i < top || i >= top+a.list.VisibleRows() || i >= len(a.disp) {
+		return widgets.Rect{}, false
+	}
+	ry := lr.Y + (i-top)*a.list.RowH
+	if ry+a.list.RowH > lr.Bottom() {
+		return widgets.Rect{}, false
+	}
+	return widgets.Rect{X: lr.X, Y: ry, W: lr.W, H: a.list.RowH}, true
+}
+
+// controlFor returns the affordance kind a row carries at its right edge.
+func rowControl(row settings.Setting) int {
+	if !settings.Editable(row.Key) {
+		return ctlNone
+	}
+	vocab, ok := settings.Vocab(row.Key)
+	if !ok || len(vocab) < 2 {
+		return ctlNone
+	}
+	if row.Key == settings.AudioVolumeKey {
+		return ctlSlider
+	}
+	if len(vocab) == 2 &&
+		(vocab[0] == "on" && vocab[1] == "off" || vocab[0] == "off" && vocab[1] == "on") {
+		return ctlToggle
+	}
+	return ctlDropdown
+}
+
+const (
+	ctlNone = iota
+	ctlToggle
+	ctlSlider
+	ctlDropdown
+)
+
+// toggleRect/sliderRect/dropdownRect carve the affordance out of the row's
+// right edge. They must agree between draw and click — one geometry source
+// per control, same pattern as the widget Bounds() methods.
+func toggleRect(rr widgets.Rect) widgets.Rect {
+	return widgets.Rect{X: rr.Right() - 38, Y: rr.Y + (rr.H-16)/2, W: 32, H: 16}
+}
+
+func sliderRect(rr widgets.Rect) widgets.Rect {
+	return widgets.Rect{X: rr.Right() - 100, Y: rr.Y + (rr.H-widgets.SliderKnobD)/2,
+		W: 92, H: widgets.SliderKnobD}
+}
+
+func dropdownRect(rr widgets.Rect) widgets.Rect {
+	return widgets.Rect{X: rr.Right() - 22, Y: rr.Y + (rr.H-14)/2, W: 18, H: 14}
+}
+
+// volumeSliderRect is the live audio row's slider geometry for drag updates.
+func (a *panel) volumeSliderRect() (widgets.Rect, bool) {
+	for i, row := range a.disp {
+		if row.Key == settings.AudioVolumeKey {
+			if rr, ok := a.rowRect(i); ok {
+				return sliderRect(rr), true
+			}
+		}
+	}
+	return widgets.Rect{}, false
+}
+
+// decade snaps a slider position to the audio_volume vocabulary's step-10
+// ladder (the row's stored string, not a raw gain number).
+func decade(v int) string {
+	v = (v + 5) / 10 * 10
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	return vi.Itoa64(int64(v))
+}
+
+// drawRowControls paints each visible settings row's affordance after the
+// list rows — Toggles, the volume Slider, and the dropdown buttons.
+func (a *panel) drawRowControls(cv widgets.RectCanvas) {
+	if a.showServices || a.showChords {
+		return
+	}
+	for i, row := range a.disp {
+		rr, ok := a.rowRect(i)
+		if !ok {
+			continue
+		}
+		switch rowControl(row) {
+		case ctlToggle:
+			(&widgets.Toggle{R: toggleRect(rr), On: row.Val == "on", Focused: a.sel == i}).Draw(cv)
+		case ctlSlider:
+			v, _ := settings.AudioVolume(row.Val)
+			(&widgets.Slider{R: sliderRect(rr), Min: 0, Max: 100,
+				Value: v, Pressed: a.volDrag}).Draw(cv)
+		case ctlDropdown:
+			br := dropdownRect(rr)
+			cv.FillRect(br, draw.Opaque(theme.Current.BtnIdle))
+			cv.FillRect(br.Inset(1), draw.Opaque(theme.Current.Surface))
+			// The affordance glyph is a 3-row triangle — font.Glyph8 has no
+			// chevron, and a hand-placed wedge reads identically at 8px.
+			tx, ty := br.X+5, br.Y+5
+			for w := 7; w > 0; w -= 2 {
+				cv.FillRect(widgets.Rect{X: tx + (7-w)/2, Y: ty, W: w, H: 1},
+					draw.Opaque(theme.Current.Text))
+				ty++
+			}
+		}
+	}
+}
+
+// rowControlClick gives a left-click inside the list first shot at a row
+// affordance; a miss falls through to the existing focus/list handling.
+func (a *panel) rowControlClick(x, y int) bool {
+	if a.showServices || a.showChords {
+		return false
+	}
+	for i, row := range a.disp {
+		rr, ok := a.rowRect(i)
+		if !ok {
+			continue
+		}
+		switch rowControl(row) {
+		case ctlToggle:
+			if !toggleRect(rr).Contains(x, y) {
+				continue
+			}
+			a.sel, a.list.Sel = i, i
+			v := "on"
+			if row.Val == "on" {
+				v = "off"
+			}
+			return a.set(row.Key, v)
+		case ctlSlider:
+			sr := sliderRect(rr)
+			if !sr.Contains(x, y) {
+				continue
+			}
+			a.sel, a.list.Sel = i, i
+			a.volDrag = true
+			s := widgets.Slider{R: sr, Min: 0, Max: 100}
+			return a.set(row.Key, decade(s.ValueAt(x)))
+		case ctlDropdown:
+			if !dropdownRect(rr).Contains(x, y) {
+				continue
+			}
+			a.sel, a.list.Sel = i, i
+			vocab, _ := settings.Vocab(row.Key)
+			a.dropdown.openAt(row.Key, vocab, rr, int(a.ta.H))
+			return true
+		}
+	}
+	return false
+}
+
+// dropdownClick resolves a click while the popover is open: inside → choose
+// (or just close on the padding), outside → close without choosing.
+func (a *panel) dropdownClick(x, y int) {
+	d := &a.dropdown
+	if i := d.optionAt(x, y); i >= 0 {
+		key, v := d.key, d.vocab[i]
+		d.open = false
+		a.set(key, v)
+		return
+	}
+	d.open = false
+}
+
 func (a *panel) draw() {
 	a.layout()
-	var f vi.Filler
-	f.Rect(a.ta.Win, 0, 0, a.ta.W, a.ta.H, theme.Current.Bg)
-	cv := &widgetCanvas{f: &f, win: a.ta.Win}
+	cv := a.ta.Canvas()
+	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(theme.Current.Bg))
 	a.headTxt.Draw(cv)
 	a.list.Draw(cv)
+	a.drawRowControls(cv)
 	// M73m: swatch plates — border first, colour inset, so a near-black bg
 	// or a near-white fg is still visible against the panel.
 	fg, bg, accent := a.paletteColours()
 	for i, c := range [3]uint32{fg, bg, accent} {
 		r := a.paletteSwat[i]
-		cv.FillRect(r, theme.Current.Border)
-		cv.FillRect(r.Inset(1), c)
+		cv.FillRect(r, draw.Opaque(theme.Current.Border))
+		cv.FillRect(r.Inset(1), draw.Opaque(c))
 	}
 	a.paletteTxt.Draw(cv)
 	a.input.Draw(cv)
 	a.statusT.Draw(cv)
 	a.saveBtn.Draw(cv)
 	a.quitBtn.Draw(cv)
-	f.Flush()
-}
-
-type widgetCanvas struct {
-	f   *vi.Filler
-	win int
-}
-
-func (c *widgetCanvas) FillRect(r widgets.Rect, rgb uint32) {
-	if r.W <= 0 || r.H <= 0 {
-		return
+	// The dropdown popover is last: it floats over the rows below it.
+	if a.dropdown.open {
+		cur, _ := settings.Get(a.disp, a.dropdown.key)
+		a.dropdown.Draw(cv, cur)
 	}
-	c.f.Rect(c.win, uint32(r.X), uint32(r.Y), uint32(r.W), uint32(r.H), rgb)
 }
 
 func scaleR(ta *tabapp.TabApp, r widgets.Rect) widgets.Rect {

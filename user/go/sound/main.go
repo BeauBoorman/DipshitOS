@@ -16,10 +16,13 @@ import (
 	"errors"
 	"strings"
 
+	"virelai/draw"
+	"virelai/settings"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/webrender"
+	"virelai/widgets"
 )
 
 const (
@@ -108,12 +111,19 @@ type app struct {
 	outSecs  uint64 // resampled duration
 	position uint64 // output seconds submitted (playing position)
 
-	stream *vi.AudioStream // nil when no seat is held
-	quit   bool            // the event service saw quit/close
-	stop   bool            // the event service saw stop
-	started bool           // the seat went live (first period submitted)
+	stream  *vi.AudioStream // nil when no seat is held
+	quit    bool            // the event service saw quit/close
+	stop    bool            // the event service saw stop
+	started bool            // the seat went live (first period submitted)
 
 	submitted uint64 // output bytes accepted this playback (position readout)
+
+	// vol is the §5.2 volume slider (slot-44 stream gain) and volDrag its
+	// pressed state; volReady is false until the settings row seeded it.
+	vol      widgets.Slider
+	volVal   int
+	volDrag  bool
+	volReady bool
 }
 
 func main() {
@@ -498,6 +508,10 @@ func (a *app) service() bool {
 			a.ta.Present()
 		case tabapp.ActionNone:
 			a.key(ev)
+			if a.pointer(ev) {
+				a.draw()
+				a.ta.Present()
+			}
 		}
 	}
 	pos := a.submitted / uint64(a.out.FrameBytes()) / uint64(a.out.Rate)
@@ -518,6 +532,8 @@ const (
 	keyEnter  = 0x28
 	keyEscape = 0x29
 	keySpace  = 0x2c
+	keyRight  = 0x4f
+	keyLeft   = 0x50
 )
 
 // key handles raw keys the tab harness does not own. space/enter/p toggles
@@ -541,7 +557,42 @@ func (a *app) key(ev vi.Event) {
 		if a.st == stStopped || a.st == stDone {
 			a.st = stLoaded
 		}
+	case keyLeft:
+		if a.st != stEmpty && a.st != stNoDevice && a.st != stRefused {
+			a.setVolume(a.volume() - 5)
+		}
+	case keyRight:
+		if a.st != stEmpty && a.st != stNoDevice && a.st != stRefused {
+			a.setVolume(a.volume() + 5)
+		}
 	}
+}
+
+// pointer drives the volume slider: press grabs the knob, drag maps x to the
+// 0..100 gain, release ends it. Returns whether the frame changed.
+func (a *app) pointer(ev vi.Event) bool {
+	switch ev.Kind {
+	case vi.EvMouseDown:
+		if ev.Flags&vi.BtnLeft == 0 || !a.vol.HitTest(int(ev.Arg0), int(ev.Arg1)) {
+			return false
+		}
+		a.volDrag = true
+		a.setVolume(a.vol.ValueAt(int(ev.Arg0)))
+		return true
+	case vi.EvMouseMove:
+		if !a.volDrag {
+			return false
+		}
+		a.setVolume(a.vol.ValueAt(int(ev.Arg0)))
+		return true
+	case vi.EvMouseUp:
+		if !a.volDrag {
+			return false
+		}
+		a.volDrag = false
+		return true
+	}
+	return false
 }
 
 // eventLoop is the parked loop (no live seat). Returns true only when a
@@ -566,6 +617,10 @@ func (a *app) eventLoop() bool {
 			a.present()
 		case tabapp.ActionNone:
 			a.key(ev)
+			if a.pointer(ev) {
+				a.draw()
+				a.present()
+			}
 			if a.quit {
 				a.quitApp()
 			}
@@ -729,16 +784,41 @@ func clock(s uint64) string {
 // Painting. The same shape as GOVIEW: a filler-backed webrender.Surface, the
 // shared 8x8 face, one present per redraw.
 
-type fillSurf struct {
-	f   *vi.Filler
-	win int
+// canvasSurface is the webrender.Surface over the bound window canvas —
+// the same one-rect-per-span shape the fill batcher carried, with Opaque at
+// the boundary because the raster path honours alpha where the kernel's
+// fill always wrote X=ff.
+type canvasSurface struct {
+	cv widgets.Canvas
 }
 
-func (s *fillSurf) Fill(x, y, w, h int, rgb uint32) {
+func (s *canvasSurface) Fill(x, y, w, h int, rgb uint32) {
 	if w <= 0 || h <= 0 || x < 0 || y < 0 {
 		return
 	}
-	s.f.Rect(s.win, uint32(x), uint32(y), uint32(w), uint32(h), rgb)
+	s.cv.FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
+}
+
+// volume seeds the slider from the audio_volume settings row (the value the
+// mixer is already applying), and applies a slider move to slot 44 — the
+// same stream-gain knob GOSET's row writes.
+func (a *app) volume() int {
+	if !a.volReady {
+		a.volVal = 100
+		if v, ok := settings.Load().Effective(settings.AudioVolumeKey); ok {
+			if parsed, ok := settings.AudioVolume(v); ok {
+				a.volVal = parsed
+			}
+		}
+		a.volReady = true
+	}
+	return a.volVal
+}
+
+func (a *app) setVolume(v int) {
+	if echo, err := vi.AudioVolume(v); err == nil {
+		a.volVal = echo
+	}
 }
 
 func (a *app) draw() {
@@ -746,9 +826,9 @@ func (a *app) draw() {
 		return
 	}
 	W, H := int(a.ta.W), int(a.ta.H)
-	var f vi.Filler
-	s := &fillSurf{f: &f, win: a.ta.Win}
-	f.Rect(a.ta.Win, 0, 0, a.ta.W, a.ta.H, theme.Current.Bg)
+	cv := a.ta.Canvas()
+	s := &canvasSurface{cv: cv}
+	cv.FillRect(widgets.Rect{W: W, H: H}, draw.Opaque(theme.Current.Bg))
 
 	// Title band, then the body text below it.
 	s.Fill(0, 0, W, titleBandH, theme.Current.Surface)
@@ -789,19 +869,28 @@ func (a *app) draw() {
 		}
 		line(2, clock(a.position)+" / "+clock(a.outSecs)+"  "+state,
 			theme.Current.Text)
-		// Progress bar: position over the expected output duration.
+		// §5.2: the position readout is the Slider's non-interactive form —
+		// same track/fill/knob anatomy as the volume control below it.
 		barY := titleBandH + 10 + 3*14 + 6
 		barW := W - 16
-		s.Fill(8, barY, barW, 8, theme.Current.Border)
-		if a.outSecs > 0 {
-			w := int(a.position * uint64(barW) / a.outSecs)
-			if w > barW {
-				w = barW
-			}
-			s.Fill(8, barY, w, 8, theme.Current.Accent)
-		}
+		(&widgets.Slider{
+			R:     widgets.Rect{X: 8, Y: barY - 3, W: barW, H: widgets.SliderKnobD},
+			Min:   0,
+			Max:   int(a.outSecs),
+			Value: int(a.position),
+		}).Draw(cv)
 		line(5, "p/space play  s stop  q quit", theme.Current.Muted)
 		line(6, "resample: linear interp", theme.Current.Muted)
+		// The volume row: the slot-44 stream gain as the interactive slider.
+		volY := titleBandH + 10 + 7*14
+		webrender.DrawText(s, 8, volY, "VOL", 1, false, theme.Current.Muted, body)
+		a.vol = widgets.Slider{
+			R:       widgets.Rect{X: 48, Y: volY - 3, W: W - 56, H: widgets.SliderKnobD},
+			Min:     0,
+			Max:     100,
+			Value:   a.volume(),
+			Pressed: a.volDrag,
+		}
+		a.vol.Draw(cv)
 	}
-	f.Flush()
 }

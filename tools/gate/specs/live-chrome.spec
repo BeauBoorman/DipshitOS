@@ -104,10 +104,13 @@ def px(x, y):
     return (data[k + 2], data[k + 1], data[k])
 BORDER = (0x47, 0x55, 0x69)
 TITLE  = (0x1a, 0x2b, 0x3c)
-# The client's own page fill (NOTE.ELF paints 0x101418 below its chrome row).
-# rest-alpha 240 blends it a shade toward the desktop, which the ±6 tolerance
-# below already absorbs.
-CLIENT = (0x10, 0x14, 0x18)
+# The client's own page fill: NOTE.ELF paints theme.Current.Bg below its
+# chrome row — 0x182026 since M69c moved it onto the token table (the
+# 0x101418 pin below predated that move; the kernel's boot fill still
+# carries 0x101418, not this client). Bare-shim boots set no rest-alpha
+# policy, so the unfocused window composites pure — exactly what
+# live-wm4-paint re-pinned by measurement in M71g.
+CLIENT = (0x18, 0x20, 0x26)
 X, Y, W, H = 56, 56, 512, 384
 fails = []
 def near(c, want, tol=6):

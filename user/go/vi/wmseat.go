@@ -120,17 +120,91 @@ func MmapScanout() ([]byte, error) {
 // The kernel validates the window owner and size and selects the actual VA.
 // Unlike MmapHint this tag has a window id in its low bits, so it must not
 // pass the ordinary page-alignment check.
+//
+// The VA the kernel selects is NOT a safe default: bind_window_surface is
+// the one shared-surface path that takes process.next_mmap_va verbatim —
+// no mmap_collides, no user_range_free (sibling paths all run both). The
+// bump base starts at 0x1000_0000 and hinted reservations never advance it,
+// so under a Go runtime — whose sbrk heap is one contiguous hinted region
+// already spanning that VA — the bind could land INSIDE the heap and
+// map_owner_leaves would silently alias its pages: pixel stores would then
+// corrupt heap objects and vice versa.
+// advanceWindowSurfaceVA walks the bump to a verified-free span before the
+// bind is made; when no free span turns up the call degrades to ENOMEM and
+// the caller's documented fallback (FillerCanvas) takes over instead of a
+// corrupted heap.
 func MmapWindowSurface(id, size int) ([]byte, error) {
 	if id <= 0 || id > 255 || size <= 0 || size > int(^uint(0)>>1)-(PageSize-1) {
 		return nil, errno(ErrEINVAL)
 	}
 	n := (size + PageSize - 1) &^ (PageSize - 1)
+	ok, err := advanceWindowSurfaceVA(n)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errno(ErrENOMEM)
+	}
 	r := syscall4(SlotMmap, M33WindowTag|uintptr(id), uintptr(n),
 		uintptr(ProtRead|ProtWrite), uintptr(MapAnonymous|M33MapShared))
 	if r < 0 {
 		return nil, errno(-r)
 	}
 	return mmapSlice(uintptr(r), n), nil
+}
+
+// windowSurfaceProbeSpan is the throwaway reservation that pushes the bump
+// allocator's next bind point a full span past the verified hole — 256 MiB
+// of headroom between the heap's top region and the surface, so the
+// contiguous sbrk heap must grow that far before it could ever meet the
+// bound pages. Demand-backed: the probe costs a region-table slot and its
+// release walk, not physical pages. Slot-63 refuses a len over 1 GiB.
+const windowSurfaceProbeSpan = 256 << 20
+
+// windowSurfaceProbeMax bounds the walk. Each iteration either verifies a
+// free span or advances the bump past one probed span of claimed VA, so
+// termination is bounded by the VA the process can plausibly have
+// registered — not by luck.
+const windowSurfaceProbeMax = 64
+
+// advanceWindowSurfaceVA walks the process's mmap bump allocator to a span
+// proven free of every registered region and live leaf, so the window-tag
+// bind lands there instead of inside the heap reservation.
+//
+// An addr=0 sys_mmap reports the bump's position AND advances it — the bump
+// happens before the collision verdict, so a refused probe still skips one
+// full span of claimed VA. The first successful probe verifies
+// [base, base+probeSpan) cleared every region and leaf; the bind target is
+// the bump's new position one span higher, and a hinted map at exactly that
+// address verifies those bytes too before the tag bind claims them (hinted
+// maps are collision-checked but never move the bump).
+//
+// Host callers get ENOSYS from the first probe and pass it through
+// unchanged — the off-guest contract callers and tests already pin.
+func advanceWindowSurfaceVA(n int) (bool, error) {
+	prot := uintptr(ProtRead | ProtWrite)
+	anon := uintptr(MapAnonymous)
+	for range windowSurfaceProbeMax {
+		base := syscall4(SlotMmap, 0, windowSurfaceProbeSpan, prot, anon)
+		if base == -ErrENOSYS {
+			return false, errno(ErrENOSYS)
+		}
+		if base < 0 {
+			continue // collided or refused; the bump advanced regardless
+		}
+		target := uintptr(base) + windowSurfaceProbeSpan
+		v := syscall4(SlotMmap, target, uintptr(n), prot, anon)
+		_ = syscall2(SlotMunmap, uintptr(base), windowSurfaceProbeSpan)
+		if v < 0 {
+			continue // the span past the hole is claimed; walk on
+		}
+		_ = syscall2(SlotMunmap, uintptr(v), uintptr(n))
+		if uintptr(v) != target {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // ErrnoOf maps a negative syscall result to the kernel's own error magnitude

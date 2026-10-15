@@ -85,10 +85,21 @@ pub fn unmap_peer_leaves(peer_root: u64, peer_va: u64, page_count: u32, pa_base:
             process.forget_dynamic_page_in_root(peer_root, mapped_pa);
             _ = alloc.unref_page(mapped_pa);
         } else {
-            // Leaf already gone (defensive): unref the ref we hold anyway so
-            // the count stays honest.
-            _ = alloc.unref_page(pa_base + @as(u64, i) * 4096);
+            // Leaf already gone (defensive): drop the peer ref we hold anyway
+            // so the count stays honest.
+            drop_peer_ref(pa_base + @as(u64, i) * 4096);
         }
+    }
+}
+
+/// Drop one peer ref on `pa` — but only when one is actually recorded. The
+/// shared count reads 0 for a sole-owner page and 1 once the last peer seat
+/// detached; unref'ing then FREES a page the owner still maps (M104f: a
+/// peer_va that names no installed leaf — e.g. a stale seat walked by a
+/// pid-0 exit sweep — used to free every owner page it touched).
+fn drop_peer_ref(pa: u64) void {
+    if ((alloc.page_refcount_recorded(pa) orelse 0) >= 2) {
+        _ = alloc.unref_page(pa);
     }
 }
 
@@ -212,6 +223,6 @@ fn revoke_peer(handle: u32) void {
 fn unref_peer_pages(page_count: u32, pa_base: u64) void {
     var j: u32 = 0;
     while (j < page_count) : (j += 1) {
-        _ = alloc.unref_page(pa_base + @as(u64, j) * 4096);
+        drop_peer_ref(pa_base + @as(u64, j) * 4096);
     }
 }

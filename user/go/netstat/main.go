@@ -6,6 +6,7 @@ package main
 
 import (
 	"virelai/draw"
+	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/vsys"
@@ -23,11 +24,13 @@ const (
 
 // argvEnvpGuard keeps space for the kernel's fixed argv/envp block in the
 // writable segment, as required by the GOOS=virelai loader/runtime contract.
-var argvEnvpGuard [0x1800]byte
+var argvEnvpGuard [0x2000]byte
 
+// canvas carries the frame surface (the window's bound pages through
+// tabapp.Attach, or the FillerCanvas degrade) plus the socket-table diff
+// state — the serial log of table changes headless runs assert.
 type canvas struct {
-	draw.FillerCanvas
-	filler   vi.Filler
+	cv       widgets.Canvas
 	lastSock []vi.SocketRow // last table paint, for the serial diff log
 }
 
@@ -141,14 +144,14 @@ func drawLine(c *canvas, y int, label, value string, color uint32) {
 		Fg:    t.Muted,
 		Bg:    t.Bg,
 	}
-	left.Draw(c)
+	left.Draw(c.cv)
 	right := widgets.Text{
 		R:     widgets.Rect{X: 128, Y: y, W: 372, H: 14},
 		Label: value,
 		Fg:    color,
 		Bg:    t.Bg,
 	}
-	right.Draw(c)
+	right.Draw(c.cv)
 }
 
 func drawSection(c *canvas, y int, name string) int {
@@ -158,20 +161,20 @@ func drawSection(c *canvas, y int, name string) int {
 		Fg:    theme.Current.Accent,
 		Bg:    theme.Current.Bg,
 	}
-	section.Draw(c)
+	section.Draw(c.cv)
 	return y + 15
 }
 
 func drawSnapshot(c *canvas, s vi.NetStats) {
 	t := theme.Current
-	c.filler.Rect(c.WindowID, 0, 0, winW, winH, t.Bg)
+	c.cv.FillRect(widgets.Rect{W: winW, H: winH}, draw.Opaque(t.Bg))
 	title := widgets.Text{
 		R:     widgets.Rect{X: 12, Y: 8, W: 488, H: 20},
 		Label: "GONETSTAT.ELF - network dashboard",
 		Fg:    t.Accent,
 		Bg:    t.Bg,
 	}
-	title.Draw(c)
+	title.Draw(c.cv)
 
 	y := drawSection(c, 30, "Interface")
 	drawLine(c, y, "MAC", macString(s.MAC), t.Text)
@@ -249,7 +252,6 @@ func drawSnapshot(c *canvas, s vi.NetStats) {
 	drawLine(c, y, "TX", vi.Itoa64(int64(s.TXFrames))+" frames / "+vi.Itoa64(int64(s.TXBytes))+" B", t.Text)
 	y += 14
 	drawLine(c, y, "RX", vi.Itoa64(int64(s.RXFrames))+" frames / "+vi.Itoa64(int64(s.RXBytes))+" B ("+vi.Itoa64(int64(s.RXOverflow))+" dropped)", t.Text)
-	c.filler.Flush()
 }
 
 func main() {
@@ -260,6 +262,9 @@ func main() {
 		return
 	}
 	vi.ConsoleLine("netstat: open id=" + vi.Itoa64(int64(win)))
+	// No tab declaration — the M78a shape stands — but the paint path is the
+	// same bound-surface canvas every migrated app uses.
+	ta := tabapp.Attach(win, "GONETSTAT.ELF", winW, winH)
 
 	snap, ok := vi.NetStatsSnapshot()
 	if !ok {
@@ -268,48 +273,53 @@ func main() {
 	for _, section := range []string{"iface", "dhcp", "tcp", "sockets", "udp", "arp", "counters"} {
 		vi.ConsoleLine("netstat: section " + section)
 	}
-	c := &canvas{}
-	c.Filler, c.WindowID = &c.filler, win
+	c := &canvas{cv: ta.Canvas()}
 	drawSnapshot(c, snap)
-	if vi.WinPresent(win) < 0 {
-		vi.WinClose(win)
-		vi.Exit(1)
-	}
+	ta.Present()
 	vi.ConsoleLine("netstat: ready")
 	if vsys.TimerSet(refreshTicks) < 0 {
-		vi.WinClose(win)
+		ta.Close()
 		vi.Exit(1)
 	}
 
-	for {
+	closed := false
+	for !closed {
 		ev, result, ok := vi.PollEventRaw()
 		if !ok {
 			if result < 0 {
 				vsys.TimerCancel()
-				vi.WinClose(win)
+				ta.Close()
 				vi.Exit(1)
 			}
 			vi.Sleep(1)
 			continue
 		}
-		if ev.Kind == vi.EvWinClose {
-			break
-		}
-		if ev.Kind == vi.EvTimer {
-			if next, valid := vi.NetStatsSnapshot(); valid {
-				snap = next
-			}
+		switch ta.Dispatch(ev) {
+		case tabapp.ActionClosed:
+			closed = true
+		case tabapp.ActionResized:
+			// The canvas view re-strides inside Dispatch; repaint the native
+			// layout onto it.
+			c.cv = ta.Canvas()
 			drawSnapshot(c, snap)
-			vi.WinPresent(win)
-			if vsys.TimerSet(refreshTicks) < 0 {
-				vsys.TimerCancel()
-				vi.WinClose(win)
-				vi.Exit(1)
+			ta.Present()
+		case tabapp.ActionNone:
+			if ev.Kind == vi.EvTimer {
+				if next, valid := vi.NetStatsSnapshot(); valid {
+					snap = next
+				}
+				drawSnapshot(c, snap)
+				ta.Present()
+				if vsys.TimerSet(refreshTicks) < 0 {
+					vsys.TimerCancel()
+					ta.Close()
+					vi.Exit(1)
+				}
 			}
 		}
 	}
 	vsys.TimerCancel()
-	vi.WinClose(win)
+	ta.Close()
 	vi.Exit(exitStatus)
 }
 

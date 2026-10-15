@@ -43,10 +43,12 @@ package main
 import (
 	"unicode/utf8"
 
+	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/webrender/font"
+	"virelai/widgets"
 )
 
 const (
@@ -158,7 +160,6 @@ type app struct {
 	path  string
 	top   int
 	dirty bool
-	f     vi.Filler
 
 	// presents counts the frames this app has put on the scanout. Draw and
 	// present are separate calls, so the only way a gate can tell a filled frame
@@ -470,12 +471,16 @@ func insertionFor(ev vi.Event) (rune, bool) {
 	return 0, false
 }
 
-// fill is one clamped background rectangle through the kernel fill batcher.
+// fill is one clamped rectangle through the bound window canvas (or the
+// FillerCanvas degradation path — tabapp.Canvas picks). draw.Opaque mirrors
+// the kernel fill's byte contract on the raster path: the compositor reads
+// B8G8R8X8, so the client fill the specs pixel-pin keeps tok.Bg's exact
+// bytes (0x182026 since M69c moved NOTE onto the token table).
 func (a *app) fill(x, y, w, h int, rgb uint32) {
 	if w <= 0 || h <= 0 || x < 0 || y < 0 || a.ta == nil {
 		return
 	}
-	a.f.Rect(a.ta.Win, uint32(x), uint32(y), uint32(w), uint32(h), rgb)
+	a.ta.Canvas().FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
 }
 
 // drawText paints text with the VirelaiOS 8x8 face (virelai/webrender/font),
@@ -550,8 +555,8 @@ func (a *app) draw() {
 	status := "line " + vi.Itoa64(int64(a.buf.Line())) + ":" + vi.Itoa64(int64(a.buf.Col())) +
 		"  bytes " + vi.Itoa64(int64(a.buf.Len())) + "/" + vi.Itoa64(int64(MaxBytes))
 	a.drawText(textOrigin, h-statusH, status, tok.Muted)
-	_ = a.f.Flush()
-	// Present puts the batch on the scanout. Without it the app fills its own
+	// Present puts the frame on the scanout — and flushes the degradation
+	// path's pending fills first, so the batcher semantics are unchanged. Without it the app fills its own
 	// back-buffer and NOTHING reaches the compositor -- and the serial looks
 	// identical, which is why the count below exists. GOEDIT presents after
 	// every draw for the same reason. Every draw path ends here, so each frame

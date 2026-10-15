@@ -121,15 +121,20 @@ func runWindow(v *viewer, o options) {
 	if ta.TabAware {
 		vi.ConsoleLine("logview: declare accepted")
 	}
-	status := "Live app logs | E: export | Esc: close"
+	status := "Live app logs | E: export | arrows scroll | Esc: close"
 	polls := 0
 	exported := false
 	next := int64(0)
 	quit := false
+	// top is the first painted row; -1 is follow-tail (the pre-scrollbar
+	// behaviour — the newest rows stay visible as the rings grow). Any
+	// explicit scroll drops follow; End re-arms it.
+	top := -1
+	drag := false
+	var bar widgets.Scrollbar // the §5.2 log-list chrome, rebuilt per frame
 	loop := appkit.NewLoop(ta, func() {
-		var filler vi.Filler
-		filler.Rect(ta.Win, 0, 0, ta.W, ta.H, theme.Current.Bg)
-		c := &draw.FillerCanvas{Filler: &filler, WindowID: ta.Win}
+		c := ta.Canvas()
+		c.FillRect(widgets.Rect{W: int(ta.W), H: int(ta.H)}, draw.Opaque(theme.Current.Bg))
 		header := widgets.Text{R: widgets.Rect{X: 12, Y: 12, W: int(ta.W) - 24, H: 24},
 			Label: status, Fg: theme.Current.Text, Bg: theme.Current.Bg}
 		header.Draw(c)
@@ -138,20 +143,107 @@ func runWindow(v *viewer, o options) {
 		if n < 1 {
 			n = 1
 		}
-		start := len(rows) - n
-		if start < 0 {
-			start = 0
+		maxTop := len(rows) - n
+		if maxTop < 0 {
+			maxTop = 0
 		}
-		for i, e := range rows[start:] {
-			row := widgets.Text{R: widgets.Rect{X: 12, Y: 44 + i*16, W: int(ta.W) - 24, H: 16},
+		start := top
+		if start < 0 || start > maxTop {
+			start = maxTop
+		}
+		rowW := int(ta.W) - 24
+		if maxTop > 0 {
+			bar = widgets.Scrollbar{
+				R:        widgets.Rect{X: int(ta.W) - 12 - widgets.ScrollbarW, Y: 44, W: widgets.ScrollbarW, H: n * 16},
+				Total:    len(rows),
+				Viewport: n,
+				Offset:   start,
+				Pressed:  drag,
+			}
+			rowW = bar.R.X - theme.Current.PadXS - 12
+		} else {
+			bar = widgets.Scrollbar{}
+		}
+		if bc, ok := c.(*draw.BufferCanvas); ok {
+			bc.PushClip(widgets.Rect{X: 12, Y: 44, W: rowW, H: n * 16})
+		}
+		end := start + n
+		if end > len(rows) {
+			end = len(rows)
+		}
+		for i, e := range rows[start:end] {
+			row := widgets.Text{R: widgets.Rect{X: 12, Y: 44 + i*16, W: rowW, H: 16},
 				Label: strings.ReplaceAll(e.text(), "\t", " "), Fg: theme.Current.Text,
 				Bg: theme.Current.Bg}
 			row.Draw(c)
 		}
-		filler.Flush()
+		if bc, ok := c.(*draw.BufferCanvas); ok {
+			bc.PopClip()
+		}
+		bar.Draw(c)
 	}, func(ev vi.Event) bool {
+		rows := len(v.visible())
+		n := (int(ta.H) - 48) / 16
+		if n < 1 {
+			n = 1
+		}
+		maxTop := rows - n
+		if maxTop < 0 {
+			maxTop = 0
+		}
+		switch ev.Kind {
+		case vi.EvMouseDown:
+			if ev.Flags&vi.BtnLeft == 0 || !bar.HitTest(int(ev.Arg0), int(ev.Arg1)) {
+				return false
+			}
+			switch bar.PageAt(int(ev.Arg0), int(ev.Arg1)) {
+			case 0:
+				drag = true
+			case -1:
+				if top < 0 {
+					top = maxTop
+				}
+				top -= n
+				if top < 0 {
+					top = 0
+				}
+			case 1:
+				if top < 0 {
+					top = maxTop
+				}
+				top += n
+				if top > maxTop {
+					top = maxTop
+				}
+			}
+			return true
+		case vi.EvMouseMove:
+			if !drag {
+				return false
+			}
+			top = bar.OffsetAt(int(ev.Arg1))
+			return true
+		case vi.EvMouseUp:
+			if !drag {
+				return false
+			}
+			drag = false
+			return true
+		}
 		if ev.Kind != vi.EvKeyDown {
 			return false
+		}
+		step := func(d int) {
+			if top < 0 {
+				top = maxTop
+			}
+			top += d
+			if top < 0 {
+				top = 0
+			}
+			if top > maxTop {
+				top = maxTop
+			}
 		}
 		switch ev.Arg0 {
 		case 0x29: // Escape
@@ -163,6 +255,24 @@ func runWindow(v *viewer, o options) {
 			} else {
 				status = "Exported filtered view to /host/LOGEXPORT"
 			}
+			return true
+		case 0x52: // Up
+			step(-1)
+			return true
+		case 0x51: // Down
+			step(1)
+			return true
+		case 0x4b: // Page Up
+			step(-n)
+			return true
+		case 0x4e: // Page Down
+			step(n)
+			return true
+		case 0x4a: // Home
+			top = 0
+			return true
+		case 0x4d: // End — re-arm follow-tail
+			top = -1
 			return true
 		}
 		return false

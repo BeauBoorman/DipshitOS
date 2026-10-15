@@ -99,6 +99,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"virelai/draw"
 	"virelai/heap"
 	"virelai/layout"
 	"virelai/settings"
@@ -106,6 +107,7 @@ import (
 	"virelai/vi"
 	"virelai/vsys"
 	"virelai/webrender/font"
+	"virelai/widgets"
 )
 
 const (
@@ -261,7 +263,9 @@ var (
 	clipRead  = func() ([]byte, int64) { return vsys.ClipboardGet(vsys.ClipboardMax) }
 )
 
-// fill is one clamped background rectangle through the kernel fill batcher.
+// fill is one clamped background rectangle through the bound window canvas
+// (or the FillerCanvas degradation path — tabapp.Canvas() picks). Opaque
+// mirrors the kernel fill's byte contract on the raster path.
 func (e *editor) fill(x, y, w, h int, rgb uint32) {
 	if w <= 0 || h <= 0 || x < 0 || y < 0 {
 		return
@@ -270,7 +274,7 @@ func (e *editor) fill(x, y, w, h int, rgb uint32) {
 		e.rec(x, y, w, h, rgb)
 		return
 	}
-	e.f.Rect(e.ta.Win, uint32(x), uint32(y), uint32(w), uint32(h), rgb)
+	e.ta.Canvas().FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
 }
 
 // drawText paints text with the VirelaiOS 8x8 face (virelai/webrender/font),
@@ -309,10 +313,8 @@ type editor struct {
 	path  string
 	buf   []byte
 	dirty bool
-	f     vi.Filler
-	// rec, when set, receives every fill instead of the kernel batcher. It is
-	// nil in the guest; host tests set it because vi.Filler.Flush does not go
-	// through the syscall-hook seam.
+	// rec, when set, receives every fill instead of the window canvas. It is
+	// nil in the guest; host tests set it to observe the frame geometry.
 	rec func(x, y, w, h int, rgb uint32)
 
 	// M20 U3: cur is the caret as a byte offset into buf, clamped on every use
@@ -1486,7 +1488,6 @@ const (
 
 // draw repaints the frame: a chrome bar with the path, the buffer line by
 // line through the M56e text surface, the caret, and the focused bar's label.
-// The fill batcher is flushed once.
 func (e *editor) draw() {
 	w, h := int(e.ta.W), int(e.ta.H)
 	if w <= 0 || h <= 0 {
@@ -1598,7 +1599,6 @@ func (e *editor) draw() {
 			e.drawPreedit(textOrigin+col*adv, barY, pre)
 		}
 	}
-	_ = e.f.Flush()
 }
 
 // drawPreedit paints a pending dead-key accent in the caret colour with an

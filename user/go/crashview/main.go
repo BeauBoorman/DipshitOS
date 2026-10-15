@@ -394,10 +394,11 @@ func (a *application) runWindow() {
 	vi.ConsoleLine("crashview: open id=" + vi.Itoa64(int64(ta.Win)))
 	quit := false
 	scroll := 0
+	drag := false
+	var bar widgets.Scrollbar // the receipt-list chrome, rebuilt every frame
 	loop := appkit.NewLoop(ta, func() {
-		var filler vi.Filler
-		filler.Rect(ta.Win, 0, 0, ta.W, ta.H, theme.Current.Bg)
-		c := &draw.FillerCanvas{Filler: &filler, WindowID: ta.Win}
+		c := ta.Canvas()
+		c.FillRect(widgets.Rect{W: int(ta.W), H: int(ta.H)}, draw.Opaque(theme.Current.Bg))
 		rows := []string{a.status}
 		for i, r := range a.view.records {
 			prefix := "  "
@@ -417,19 +418,77 @@ func (a *application) runWindow() {
 		rows = append(rows, "Tracer (last 64 records):")
 		rows = append(rows, a.traceRows...)
 		lines := strings.Split(strings.Join(rows, "\n"), "\n")
-		if scroll >= len(lines) {
+		vp := (int(ta.H)-28)/16 + 1
+		if vp < 1 {
+			vp = 1
+		}
+		maxTop := len(lines) - vp
+		if maxTop < 0 {
+			maxTop = 0
+		}
+		if scroll < 0 {
 			scroll = 0
 		}
-		for i, line := range lines[scroll:] {
-			if 12+i*16+16 > int(ta.H) {
-				break
+		if scroll > maxTop {
+			scroll = maxTop
+		}
+		rowW := int(ta.W) - 24
+		if len(lines) > vp {
+			bar = widgets.Scrollbar{
+				R:        widgets.Rect{X: int(ta.W) - 12 - widgets.ScrollbarW, Y: 12, W: widgets.ScrollbarW, H: vp * 16},
+				Total:    len(lines),
+				Viewport: vp,
+				Offset:   scroll,
+				Pressed:  drag,
 			}
-			row := widgets.Text{R: widgets.Rect{X: 12, Y: 12 + i*16, W: int(ta.W) - 24, H: 16},
+			rowW = bar.R.X - theme.Current.PadXS - 12
+		} else {
+			bar = widgets.Scrollbar{}
+		}
+		if bc, ok := c.(*draw.BufferCanvas); ok {
+			bc.PushClip(widgets.Rect{X: 12, Y: 0, W: rowW, H: int(ta.H)})
+		}
+		end := scroll + vp
+		if end > len(lines) {
+			end = len(lines)
+		}
+		for i, line := range lines[scroll:end] {
+			row := widgets.Text{R: widgets.Rect{X: 12, Y: 12 + i*16, W: rowW, H: 16},
 				Label: strings.ReplaceAll(line, "\t", " "), Fg: theme.Current.Text, Bg: theme.Current.Bg}
 			row.Draw(c)
 		}
-		filler.Flush()
+		if bc, ok := c.(*draw.BufferCanvas); ok {
+			bc.PopClip()
+		}
+		bar.Draw(c)
 	}, func(ev vi.Event) bool {
+		switch ev.Kind {
+		case vi.EvMouseDown:
+			if ev.Flags&vi.BtnLeft == 0 || !bar.HitTest(int(ev.Arg0), int(ev.Arg1)) {
+				return false
+			}
+			switch bar.PageAt(int(ev.Arg0), int(ev.Arg1)) {
+			case 0:
+				drag = true
+			case -1:
+				scroll -= bar.Viewport
+			case 1:
+				scroll += bar.Viewport
+			}
+			return true
+		case vi.EvMouseMove:
+			if !drag {
+				return false
+			}
+			scroll = bar.OffsetAt(int(ev.Arg1))
+			return true
+		case vi.EvMouseUp:
+			if !drag {
+				return false
+			}
+			drag = false
+			return true
+		}
 		if ev.Kind != vi.EvKeyDown {
 			return false
 		}
