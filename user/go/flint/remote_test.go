@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"virelai/sshlib"
 )
 
 // ---------------------------------------------------------------------------
@@ -672,6 +674,14 @@ func newRemoteHarness(t *testing.T, srv *fakeServer) *remoteHarness {
 		remoteHex:    strings.Repeat("ab", 32),
 		hasRemoteKey: false,
 	}
+	// M101b: clone/pull verify fetched Changes against the pinned keyring —
+	// the default TRUSTED.TXT trusts the RFC 8032 key every signed fixture
+	// uses. Refusal legs overwrite or remove it.
+	if err := h.fs.WriteFileSafe(keyringPath(h.root), []byte(
+		keyringHeader+"\nkey="+testRFC8032PubHex+" name=rfc8032\n",
+	)); err != nil {
+		t.Fatal(err)
+	}
 	return h
 }
 
@@ -741,7 +751,14 @@ func (h *remoteHarness) runCmd(args ...string) (int, []string) {
 // the sig vectors use) so fakeServer's signature gate passes.
 func signServerChange(t *testing.T, c *Change) {
 	t.Helper()
-	seed, err := hex.DecodeString(testRFC8032SeedHex)
+	signChangeHexSeed(t, c, testRFC8032SeedHex)
+}
+
+// signChangeHexSeed signs c with the 64-hex seed — the M101b wrong-key leg
+// uses a second pinned key the keyring does not trust.
+func signChangeHexSeed(t *testing.T, c *Change, seedHex string) {
+	t.Helper()
+	seed, err := hex.DecodeString(seedHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,9 +767,28 @@ func signServerChange(t *testing.T, c *Change) {
 	}
 }
 
+// pubHexForSeed derives the Ed25519 public key hex for a 64-hex seed, for
+// building keyring rows in tests.
+func pubHexForSeed(t *testing.T, seedHex string) string {
+	t.Helper()
+	seed, err := hex.DecodeString(seedHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var arr [32]byte
+	copy(arr[:], seed)
+	pub := sshlib.EdDerivePublic(arr)
+	return sshlib.EncodeHex(pub[:])
+}
+
 // mkSignedStream builds a stream record + n signed Changes (ops can be
 // empty) chained parent→child, returns the record and the raw lines.
 func mkSignedStream(t *testing.T, h *remoteHarness, name string, n int) (*Stream, [][]byte) {
+	t.Helper()
+	return mkSignedStreamSeed(t, h, name, n, testRFC8032SeedHex)
+}
+
+func mkSignedStreamSeed(t *testing.T, h *remoteHarness, name string, n int, seedHex string) (*Stream, [][]byte) {
 	t.Helper()
 	sid, err := h.uuid.New()
 	if err != nil {
@@ -771,7 +807,7 @@ func mkSignedStream(t *testing.T, h *remoteHarness, name string, n int) (*Stream
 			TS: 1760000000000 + int64(i+1)*1000, Message: "srv change",
 			Ops: []Op{}, Merged: nil,
 		}
-		signServerChange(t, &c)
+		signChangeHexSeed(t, &c, seedHex)
 		line, err := MarshalChangeLine(c)
 		if err != nil {
 			t.Fatal(err)

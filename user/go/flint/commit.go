@@ -200,8 +200,16 @@ func cmdLog(fs FS, root string, args []string) error {
 	return nil
 }
 
-// cmdVerify implements `flint verify <id> | --all | --file=<log>`.
+// cmdVerify implements `flint verify <id> | --all | --file=<log>` locally,
+// or `--remote` (with optional --remote=<url>/--stream=<s>) against the
+// publisher keyring — the M101b verify-before-materialize gate.
 func cmdVerify(fs FS, root string, args []string) int {
+	for _, a := range args {
+		if a == "--remote" || strings.HasPrefix(a, "--remote=") ||
+			strings.HasPrefix(a, "--stream=") {
+			return cmdVerifyRemote(fs, root, args)
+		}
+	}
 	if len(args) != 1 || args[0] == "" {
 		return runErr(refuse("usage", ""))
 	}
