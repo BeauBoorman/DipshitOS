@@ -148,10 +148,10 @@ func TestOpenBuiltinNamesUnsupportedSchemeAndMissingHandler(t *testing.T) {
 	}
 
 	h.out = nil
-	h.files["/host/SONG.OGG"] = []byte("OggS\x00\x02")
-	status, _ = runOpenLine(t, h, "open SONG.OGG")
+	h.files["/host/SAVE.ZIP"] = []byte("PK\x03\x04\x00\x02")
+	status, _ = runOpenLine(t, h, "open SAVE.ZIP")
 	if status != 1 || len(h.launches) != 0 ||
-		!strings.Contains(h.outString(), "no handler for audio") {
+		!strings.Contains(h.outString(), "no handler for archive") {
 		t.Fatalf("missing MIME handler: status=%d launches=%v output=%q",
 			status, h.launches, h.outString())
 	}
