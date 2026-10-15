@@ -308,6 +308,13 @@ func paintChrome(scan []byte, width, height int, clock string) int {
 	clip := plate.Inset(tok.BorderW)
 	seatText(c, clip, tx, ty, seatTextPx, clock, tok.Ink)
 	seatText(c, clip, tx+seatTextWidth(clock, seatTextPx)+8, ty, seatSmallPx, chromeStatusText(), tok.Muted)
+	// M108b (#2325, ADR 0051 D3): the clipboard state badge — M97g's
+	// seat-visibility rule carried across the glass. While the last buffer
+	// write was host-sourced it shows the distinct host-marked state.
+	if tag, rgb, ok := hostClipBadge(); ok {
+		tw := seatTextWidth(tag, seatSmallPx)
+		seatText(c, clip, x+w-chromePad-tw, ty, seatSmallPx, tag, rgb)
+	}
 	return written
 }
 

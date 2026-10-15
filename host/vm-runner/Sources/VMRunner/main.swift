@@ -56,6 +56,20 @@
 //          FileManager calls rooted at <host-dir> (wire format in
 //          Sources/VFWire/VFWire.swift). The deepest flag implies the full
 //          five-queue shape below it.)
+//         [--host-clipboard] (M108b #2325, ADR 0051: the bidirectional
+//          clipboard lane — signed VHI1 record files in <share>/HOSTINT/.
+//          Guest→host: seat-emitted CLIP_OUT is mirrored to the
+//          pasteboard; host→guest: changeCount polls emit CLIP_IN the
+//          seat applies. Requires --cvc-file and a `host-int` row in the
+//          share's SECRETS.TXT; OFF by default — no directory, no
+//          records, no pasteboard read.)
+//         [--host-pasteboard <name>] (retarget the clipboard lane to
+//          NSPasteboard(name:) — mandatory for gates so a run never
+//          clobbers .general; modifier on --host-clipboard)
+//         [--host-clip-in <text>] [--host-clip-in-after <marker>]
+//          (test hook: write <text> to the lane pasteboard once <marker>
+//          appears — a real changeCount bump the ordinary path then
+//          carries in. Default trigger: `gotabwm: hostint armed`.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -556,6 +570,26 @@ var cvcSnapEnabled = false
 // the full five-queue shape below it (unchanged rule).
 var cvcFileShareDir: String?
 var cvcFileEnabled: Bool { cvcFileShareDir != nil }
+// M108b (#2325, ADR 0051): the host-integration lanes are signed VHI1
+// record files under <share>/HOSTINT/ — modifiers on --cvc-file, so the
+// share is the transport. `--host-clipboard` arms the clipboard lane both
+// directions (seat-emitted CLIP_OUT records are mirrored to the
+// pasteboard; pasteboard changeCount bumps become CLIP_IN records the
+// seat applies). OFF by default: no lane flag means no HOSTINT/ is ever
+// created and no pasteboard is ever read (D7 byte-silence).
+var hostClipboardFlag = false
+// `--host-pasteboard <name>` retargets the lane to NSPasteboard(name:) —
+// the gate/test hook so a run never clobbers the operator's .general
+// pasteboard (ADR 0051 D3's pasteboard-identity rule).
+var hostPasteboardName: String?
+// `--host-clip-in <text>` + `--host-clip-in-after <marker>`: the
+// marker-timed test hook that performs a real pasteboard write once the
+// marker appears — the changeCount path then carries it in like any host
+// copy (the --host-write-after precedent).
+var hostClipInText: String?
+var hostClipInAfter: String?
+var hostClipInFired = false
+var hostClipboard: HostClipboard?
 // HF3 (issue #737): the mutation verbs ride an 8-slot host handle table
 // (parity with the kernel's file_table.zig — cursors live HERE, not in
 // the guest). VZ-free class lives in the VFWire module.
@@ -1221,6 +1255,21 @@ while idx < arguments.count {
         viaVirtioEnabled = true
         customVirtioEnabled = true
         cvcEchoEnabled = true
+        idx += 2
+    } else if arg == "--host-clipboard" {
+        // M108b (#2325, ADR 0051): the bidirectional clipboard lane —
+        // signed lane files under the share's HOSTINT/. It does NOT touch
+        // the queue shape: the share (queue 5) is already the transport.
+        hostClipboardFlag = true
+        idx += 1
+    } else if arg == "--host-pasteboard", idx + 1 < arguments.count {
+        hostPasteboardName = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--host-clip-in", idx + 1 < arguments.count {
+        hostClipInText = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--host-clip-in-after", idx + 1 < arguments.count {
+        hostClipInAfter = arguments[idx + 1]
         idx += 2
     } else if arg == "--cvc-console-file", idx + 1 < arguments.count {
         // Claim 0680: structured console — capture every queue-1 guest log
@@ -2129,6 +2178,25 @@ if hostWriteAfter != nil || hostWritePath != nil || hostWriteContent != nil {
         fail("--host-write-after requires --cvc-file <share-dir> (the mutation must land in the share the guest reads).")
     }
 }
+// M108b (#2325, ADR 0051 D6): the lane flags are modifiers on --cvc-file —
+// the share IS the transport, so a lane flag without it is a fatal argument
+// error (loud, never a silent ignore — the --via-virtio rule).
+if hostClipboardFlag || hostPasteboardName != nil || hostClipInText != nil || hostClipInAfter != nil {
+    guard hostClipboardFlag else {
+        fail("--host-pasteboard/--host-clip-in/--host-clip-in-after are modifiers on --host-clipboard (no lane to redirect or inject into).")
+    }
+    guard cvcFileEnabled else {
+        fail("--host-clipboard requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
+    }
+    if hostClipInAfter != nil, hostClipInText == nil {
+        fail("--host-clip-in-after requires --host-clip-in <text> (there is no pasteboard write to schedule).")
+    }
+    if hostClipInText != nil, hostClipInAfter == nil {
+        // Default trigger: fire as soon as the seat announces the lane is
+        // armed — the deterministic point where a CLIP_IN can be consumed.
+        hostClipInAfter = "gotabwm: hostint armed"
+    }
+}
 // Claim 9367: --pointer-virtio rides the four-queue device; the after-marker
 // only makes sense with a sequence to schedule.
 if pointerVirtioScript == nil, pointerVirtioAfter != nil {
@@ -2902,6 +2970,24 @@ if netNatEnabled {
     print("  net-nat: ENABLED (milestone five card N7, claim 4678) — VZNATNetworkDeviceAttachment attached (host router + NAT; no capture file — guest-observed counters are the gate's evidence)")
 }
 
+// M108b (#2325, ADR 0051): arm the clipboard lane BEFORE the VM starts —
+// the ARMED record lands in the share now, so the seat's first poll after
+// boot already verifies it. No flag → no HOSTINT/, no records, no
+// pasteboard read (D7's byte-silence: a flags-off boot is identical to
+// today). A refused arm (no credential, broken share) is a dead lane, not
+// a failed boot.
+if hostClipboardFlag {
+    let shareURL = URL(fileURLWithPath: cvcFileShareDir!, isDirectory: true)
+    hostClipboard = HostClipboard(shareDir: shareURL, pasteboardName: hostPasteboardName)
+    if let lane = hostClipboard {
+        if lane.arm(shareDir: shareURL) {
+            DispatchQueue.main.async { hostIntTick() }
+        }
+    } else {
+        HostInt.logRefuse(lane: "clip", reason: .ioError)
+    }
+}
+
 runner.queue.async {
     if vzRestore, let load = vzRestoreLoadDir {
         // M70g G3 (#1459): the load process never boots — it restores the
@@ -3608,6 +3694,29 @@ func captureScreenshotIfMarker(_ text: String) {
         screenshotAfterCaptured = true
         captureScreenshotMarker("after")
     }
+}
+
+// M108b (#2325, ADR 0051): the clipboard lane's 250 ms poll — drains
+// CLIP_OUT records to the pasteboard and carries changeCount bumps out as
+// CLIP_IN records. Runs on the main queue like every other runner poll,
+// for the life of the process.
+func hostIntTick() {
+    hostClipboard?.tick()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { hostIntTick() }
+}
+
+// Marker-driven pasteboard write (`--host-clip-in` + `--host-clip-in-after`):
+// when the marker appears in the serial stream the text is written to the
+// lane's pasteboard — a REAL host change the ordinary changeCount poll then
+// carries in, not a seam that skips it. Fires once; the marker line carries
+// the byte count, never the text (never-logged contract).
+func fireHostClipInIfMarker(_ text: String) {
+    guard let marker = hostClipInAfter, !hostClipInFired, let body = hostClipInText,
+          text.contains(marker) else { return }
+    hostClipInFired = true
+    guard let lane = hostClipboard else { return }
+    let cc = lane.inject(body)
+    FileHandle.standardOutput.write(Data("host-clip: inject len=\(body.utf8.count) changeCount=\(cc) after \"\(marker)\"\n".utf8))
 }
 
 // M81f (#1766): marker-driven host-side share mutation. When the
@@ -6522,6 +6631,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     captureScreenshotIfMarker(lastText)
     fireSnapshotsIfMarker(lastText)
     fireHostWriteIfMarker(lastText)
+    fireHostClipInIfMarker(lastText)
     // Fix 3: the liveness heartbeat — unbuffered stderr every 30 s.
     if Date().timeIntervalSince(scriptPollLastBeat) >= 30 {
         scriptPollLastBeat = Date()
