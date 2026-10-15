@@ -222,6 +222,10 @@ fn secretDenies(want: Want) bool {
 fn defaultMode(partition: file_table.Partition, want: Want) u16 {
     return switch (partition) {
         .usb, .usb_fat => usb_mode, // M70f F1: a USB volume is read-only too
+        // M100c (issue #2308, ADR 0050 D6): every .disk object is
+        // world-readable/writable in v1 — the mode is a statement, and the
+        // fs never consults the trust table for it anyway.
+        .disk => 0o777,
         .tty => 0o666, // unreachable: tty returns allow early
         .host => if (want == .list) default_dir_mode else default_file_mode,
     };

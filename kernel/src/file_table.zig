@@ -50,6 +50,11 @@ const driving_award = @import("driving_award.zig");
 const trust = @import("trust.zig");
 pub const directory = @import("directory.zig");
 pub const metadata = @import("fs_metadata.zig");
+// M100c (issue #2308, ADR 0050): the VLFS reader and its mounted-volume
+// state — `vlfs_disk.attach` is the seam the M100b virtio-blk driver calls
+// after its `virelai-vlfs` GET_ID match.
+const vlfs = @import("vlfs/vlfs.zig");
+const vlfs_disk = @import("vlfs/disk.zig");
 
 pub const max_handles_per_process: usize = 8;
 pub const max_path_len: usize = directory.path_max;
@@ -89,6 +94,14 @@ pub const Partition = enum {
     /// volume root, a directory). No write, create, rename, delete or chmod
     /// path exists — the reader cannot mutate a volume.
     usb_fat,
+    /// M100c (issue #2308, ADR 0050): the VLFS data disk (`disk`, `/disk`,
+    /// `disk:`) — the guest's own journaled volume on the dedicated
+    /// virtio-blk device. Mounted per boot only when the `virelai-vlfs`
+    /// device is present and its superblock validates; absent or refused,
+    /// paths here answer ENOENT and the boot proceeds share-only. v1 is
+    /// read-only: every object is world-readable inside the guest and no
+    /// mutation path exists (M100d owns writes).
+    disk,
     /// #1072 (ADR 0020): the virtual terminal device (`/dev/tty`) — a
     /// process's controlling terminal, backed by `terminal.zig`. Not a
     /// path on any filesystem; `open` special-cases the name.
@@ -133,6 +146,13 @@ pub const FileHandle = struct {
     /// the volume's FAT chain (geometry + position + bytes remaining). Only
     /// meaningful when `partition == .usb_fat`.
     usb_file: fat32_ro.FileReader = .{},
+    /// M100c (issue #2308): a `.disk` file's VLFS inode number and the mount
+    /// epoch it was opened under — a remount invalidates the handle (EBADF)
+    /// rather than letting it read a silently different volume. For a
+    /// slot-79 contained open, `disk_handle` is the vlfs_disk backend token.
+    disk_ino: u32 = 0,
+    disk_epoch: u64 = 0,
+    disk_handle: u32 = 0,
 };
 
 pub const ParsedPath = struct {
@@ -457,6 +477,13 @@ var usb_sector: [usb_msc.block_len]u8 align(64) = undefined;
 /// direction in any case.
 var usb_fat_sector: [fat32_ro.sector_len]u8 align(64) = undefined;
 
+/// M100c (issue #2308): the readdir staging for `.disk` listings — the
+/// name-sorted smallest `entry_max` live dirents of the target directory
+/// (vlfs.listDir selects over the FULL directory scan, so a truncated
+/// answer is still the true first N names). ~66 KiB BSS, inside the VLFS
+/// 256 KiB budget row of ADR 0050 D7.
+var disk_dir_scratch: [directory.entry_max]vlfs.Dirent = undefined;
+
 pub fn init() void {
     for (0..process.max_processes) |pid| reset_process(pid);
     for (0..snapshots.len) |slot| release_snapshot(slot);
@@ -650,6 +677,35 @@ fn metadata_root(raw: []const u8) metadata.Error![]const u8 {
     return path;
 }
 
+/// M100c (issue #2308, ADR 0050 D6): the `/disk` root of a slot-79 call —
+/// the /disk-relative directory the operation pins, or null for a non-disk
+/// root. VLFS supplies a real `ContainedOps` backend (inode-number pins are
+/// stable by construction), so disk paths do NOT answer
+/// ContainmentUnavailable here.
+fn disk_metadata_root(raw: []const u8) metadata.Error!?[]const u8 {
+    const path = if (std.mem.eql(u8, raw, "/disk") or std.mem.eql(u8, raw, "/disk/"))
+        ""
+    else if (std.mem.startsWith(u8, raw, "/disk/"))
+        raw[6..]
+    else
+        return null;
+    try metadata.validatePath(path);
+    return path;
+}
+
+/// Fill a rich metadata snapshot for a `.disk` directory: the sorted VLFS
+/// readdir with each name's live inode attributes.
+fn disk_metadata_snapshot(droot: []const u8, relative: []const u8, snapshot: *metadata.Snapshot) metadata.Error!void {
+    const backend = vlfs_disk.backend(droot);
+    const object = try metadata.openDirectory(backend, vlfs_disk.authorizer, relative);
+    defer backend.ops.?.release(backend.context, object);
+    const n = vlfs_disk.listDir(@intCast(object.token), &disk_dir_scratch) catch |err| return vlfs_disk.vlfsToMetaError(err);
+    for (disk_dir_scratch[0..n]) |*d| {
+        try snapshot.append(d.nameSlice(), try vlfs_disk.inodeMeta(d.inode));
+    }
+    snapshot.sort();
+}
+
 fn join_metadata(root: []const u8, relative: []const u8, out: []u8) metadata.Error![]const u8 {
     if (!directory.valid_path(root, metadata.max_depth * 2) or
         !directory.valid_path(relative, metadata.max_depth * 2)) return error.InvalidPath;
@@ -664,6 +720,11 @@ fn join_metadata(root: []const u8, relative: []const u8, out: []u8) metadata.Err
 
 pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, out: *metadata.Wire) i64 {
     if (pid >= process.max_processes) return -1;
+    if (disk_metadata_root(root_bytes) catch |err| return metadata_errno(err)) |droot| {
+        const value = metadata.stat(vlfs_disk.backend(droot), vlfs_disk.authorizer, relative) catch |err| return metadata_errno(err);
+        out.* = metadata.Wire.from(value);
+        return 0;
+    }
     const path = metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var root = virtio_file.MetadataRoot{ .path = path };
     var auth = MetadataAuth{ .pid = pid, .root = path };
@@ -676,7 +737,8 @@ pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, out: 
 /// The returned native fd uses slots 24/25/26, never reopens a pathname.
 pub fn contained_open(pid: u64, root_bytes: []const u8, relative: []const u8, writing: bool) i64 {
     if (pid >= process.max_processes) return -1;
-    const root_path = metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const disk_root = disk_metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var full: [max_path_len]u8 = undefined;
     const path = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
     if (!ensure_handles()) return -10;
@@ -685,6 +747,24 @@ pub fn contained_open(pid: u64, root_bytes: []const u8, relative: []const u8, wr
     var slot: usize = 0;
     while (slot < max_handles_per_process and handles[pid][slot].in_use) : (slot += 1) {}
     if (slot == max_handles_per_process) return -5;
+    if (disk_root != null) {
+        // VLFS contained open (ADR 0050 D6): the pinned lookup resolves
+        // through the vlfs backend; a write access is the v1 read-only
+        // refusal (AccessDenied → EACCES).
+        const token = metadata.openToken(vlfs_disk.backend(disk_root.?), vlfs_disk.authorizer, relative, if (writing) .write else .read) catch |err| return metadata_errno(err);
+        var h = FileHandle{
+            .in_use = true,
+            .partition = .disk,
+            .flags = MODE_READ,
+            .path_len = @intCast(path.len),
+            .contained = true,
+            .disk_handle = @intCast(token),
+            .disk_epoch = vlfs_disk.mountEpoch(),
+        };
+        @memcpy(h.path[0..path.len], path);
+        handles[pid][slot] = h;
+        return @intCast(slot);
+    }
     var root = virtio_file.MetadataRoot{ .path = root_path };
     var auth = MetadataAuth{ .pid = pid, .root = root_path };
     const token = metadata.openToken(virtio_file.metadata_backend(&root), auth.authorizer(), relative, if (writing) .write else .read) catch |err| return metadata_errno(err);
@@ -703,7 +783,8 @@ pub fn contained_open(pid: u64, root_bytes: []const u8, relative: []const u8, wr
 
 pub fn metadata_dir_open(pid: u64, root_bytes: []const u8, relative: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
-    const root_path = metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const disk_root = disk_metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var full: [max_path_len]u8 = undefined;
     const path = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
     if (!ensure_handles()) return -10;
@@ -719,16 +800,24 @@ pub fn metadata_dir_open(pid: u64, root_bytes: []const u8, relative: []const u8)
     else
         @ptrFromInt(alloc.alloc_pages(metadata_pages) orelse return -10);
     metadata_snapshots[slot] = snapshot;
-    var root = virtio_file.MetadataRoot{ .path = root_path };
-    var auth = MetadataAuth{ .pid = pid, .root = root_path };
-    virtio_file.metadata_snapshot(virtio_file.metadata_backend(&root), auth.authorizer(), relative, snapshot) catch |err| {
-        release_snapshot(slot);
-        return metadata_errno(err);
-    };
+    if (disk_root) |droot| {
+        disk_metadata_snapshot(droot, relative, snapshot) catch |err| {
+            release_snapshot(slot);
+            return metadata_errno(err);
+        };
+    } else {
+        var root = virtio_file.MetadataRoot{ .path = root_path };
+        var auth = MetadataAuth{ .pid = pid, .root = root_path };
+        virtio_file.metadata_snapshot(virtio_file.metadata_backend(&root), auth.authorizer(), relative, snapshot) catch |err| {
+            release_snapshot(slot);
+            return metadata_errno(err);
+        };
+    }
     const token = next_dir_token;
     next_dir_token += 1;
     var h = FileHandle{
         .in_use = true,
+        .partition = if (disk_root != null) .disk else .host,
         .is_dir = true,
         .rich_directory = true,
         .dir_token = token,
@@ -780,6 +869,13 @@ fn pin_directory(h: *const FileHandle) metadata.Directory {
 }
 
 fn release_pin(h: *FileHandle) void {
+    // `.disk` pins release through the VLFS backend (a no-op in v1 — an
+    // inode-number pin on a read-only volume cannot dangle).
+    if (h.partition == .disk) {
+        const backend = vlfs_disk.backend("");
+        if (backend.ops) |ops| ops.release(backend.context, pin_object(h));
+        return;
+    }
     var root = virtio_file.MetadataRoot{ .path = "" };
     const backend = virtio_file.metadata_backend(&root);
     // Without a live backend the mount lifetime (and its reference) ended.
@@ -799,11 +895,12 @@ fn free_resource_slot(pid: u64) ?usize {
     return null;
 }
 
-fn install_pin(pid: u64, slot: usize, path: []const u8, object: metadata.Object) i64 {
+fn install_pin(pid: u64, slot: usize, partition: Partition, path: []const u8, object: metadata.Object) i64 {
     const token = next_dir_token;
     next_dir_token += 1;
     var h = FileHandle{
         .in_use = true,
+        .partition = partition,
         .is_dir = true,
         .dir_token = token,
         .pin = true,
@@ -835,17 +932,22 @@ fn invalidate_pins(path: []const u8) void {
 /// Op 7: pins an existing directory by the B3 no-follow walk.
 pub fn pin_open(pid: u64, root_bytes: []const u8, relative: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
-    const root_path = metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const disk_root = disk_metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var full: [max_path_len]u8 = undefined;
     const path = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
     if (!ensure_handles()) return -10;
     defer release_empty_handles();
     const slot = free_resource_slot(pid) orelse return -5;
     if (next_dir_token > std.math.maxInt(i64)) return -5;
+    if (disk_metadata_root(root_bytes) catch |err| return metadata_errno(err)) |droot| {
+        const object = metadata.openDirectory(vlfs_disk.backend(droot), vlfs_disk.authorizer, relative) catch |err| return metadata_errno(err);
+        return install_pin(pid, slot, .disk, path, object);
+    }
     var root = virtio_file.MetadataRoot{ .path = root_path };
     var auth = MetadataAuth{ .pid = pid, .root = root_path };
     const object = metadata.openDirectory(virtio_file.metadata_backend(&root), auth.authorizer(), relative) catch |err| return metadata_errno(err);
-    return install_pin(pid, slot, path, object);
+    return install_pin(pid, slot, .host, path, object);
 }
 
 /// Op 8: one no-follow LOOKUP of a child directory from a live pin.
@@ -856,10 +958,14 @@ pub fn pin_child(pid: u64, token: u64, name: []const u8) i64 {
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
     const slot = free_resource_slot(pid) orelse return -5;
     if (next_dir_token > std.math.maxInt(i64)) return -5;
-    var root = virtio_file.MetadataRoot{ .path = "" };
-    var auth = MetadataAuth{ .pid = pid, .root = "" };
-    const object = metadata.childDirectory(virtio_file.metadata_backend(&root), auth.authorizer(), pin_directory(parent), name) catch |err| return metadata_errno(err);
-    return install_pin(pid, slot, path, object);
+    const object = if (parent.partition == .disk)
+        metadata.childDirectory(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err)
+    else blk: {
+        var root = virtio_file.MetadataRoot{ .path = "" };
+        var auth = MetadataAuth{ .pid = pid, .root = "" };
+        break :blk metadata.childDirectory(virtio_file.metadata_backend(&root), auth.authorizer(), pin_directory(parent), name) catch |err| return metadata_errno(err);
+    };
+    return install_pin(pid, slot, parent.partition, path, object);
 }
 
 /// Op 9. Allowed after revocation or invalidation; releases the reference.
@@ -883,13 +989,22 @@ pub fn handle_metadata(pid: u64, handle: u64, kind: u64, out: *metadata.Wire) i6
     var value: metadata.Metadata = undefined;
     if (kind == metadata.handle_directory) {
         const h = live_pin(pid, handle) orelse return -2;
-        value = metadata.directoryMetadata(backend, auth.authorizer(), pin_directory(h)) catch |err| return metadata_errno(err);
+        if (h.partition == .disk) {
+            value = metadata.directoryMetadata(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(h)) catch |err| return metadata_errno(err);
+        } else {
+            value = metadata.directoryMetadata(backend, auth.authorizer(), pin_directory(h)) catch |err| return metadata_errno(err);
+        }
     } else {
         if (handle >= max_handles_per_process or handles.len == 0) return -2;
         const h = &handles[pid][handle];
         if (!h.in_use or h.dir_token != 0 or h.is_dir) return -2;
-        if (!h.contained or !h.host_handle_valid) return -4;
-        value = metadata.handleMetadata(backend, auth.authorizer(), h.host_handle, h.path[0..h.path_len]) catch |err| return metadata_errno(err);
+        if (h.partition == .disk) {
+            if (!h.contained or h.disk_handle == 0) return -4;
+            value = metadata.handleMetadata(vlfs_disk.backend(""), vlfs_disk.authorizer, h.disk_handle, h.path[0..h.path_len]) catch |err| return metadata_errno(err);
+        } else {
+            if (!h.contained or !h.host_handle_valid) return -4;
+            value = metadata.handleMetadata(backend, auth.authorizer(), h.host_handle, h.path[0..h.path_len]) catch |err| return metadata_errno(err);
+        }
     }
     out.* = metadata.Wire.from(value);
     return 0;
@@ -902,6 +1017,10 @@ pub fn pin_create(pid: u64, token: u64, name: []const u8) i64 {
     var child: [max_path_len]u8 = undefined;
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
     const slot = free_resource_slot(pid) orelse return -5;
+    if (parent.partition == .disk) {
+        _ = metadata.createFile(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
+        return -7; // unreachable: the v1 backend denies every mutation
+    }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
     const created = metadata.createFile(virtio_file.metadata_backend(&root), auth.authorizer(), pin_directory(parent), name) catch |err| return metadata_errno(err);
@@ -926,10 +1045,14 @@ pub fn pin_mkdir(pid: u64, token: u64, name: []const u8) i64 {
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
     const slot = free_resource_slot(pid) orelse return -5;
     if (next_dir_token > std.math.maxInt(i64)) return -5;
+    if (parent.partition == .disk) {
+        _ = metadata.makeDirectory(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
+        return -7; // unreachable: the v1 backend denies every mutation
+    }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
     const object = metadata.makeDirectory(virtio_file.metadata_backend(&root), auth.authorizer(), pin_directory(parent), name) catch |err| return metadata_errno(err);
-    return install_pin(pid, slot, path, object);
+    return install_pin(pid, slot, .host, path, object);
 }
 
 /// Op 13: removes one file (kind 0) or empty directory (kind 1) by name.
@@ -940,6 +1063,10 @@ pub fn pin_remove(pid: u64, token: u64, name: []const u8, kind: u64) i64 {
     var child: [max_path_len]u8 = undefined;
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
     const want: metadata.Kind = if (kind == metadata.remove_directory) .directory else .file;
+    if (parent.partition == .disk) {
+        metadata.remove(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name, want) catch |err| return metadata_errno(err);
+        return -7; // unreachable: the v1 backend denies every mutation
+    }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
     metadata.remove(virtio_file.metadata_backend(&root), auth.authorizer(), pin_directory(parent), name, want) catch |err| return metadata_errno(err);
@@ -957,6 +1084,13 @@ pub fn pin_rename(pid: u64, from_token: u64, from_name: []const u8, to_token: u6
     var target: [max_path_len]u8 = undefined;
     const from_path = metadata.childPath(from.path[0..from.path_len], from_name, &source) catch |err| return metadata_errno(err);
     const to_path = metadata.childPath(to.path[0..to.path_len], to_name, &target) catch |err| return metadata_errno(err);
+    if (from.partition == .disk or to.partition == .disk) {
+        // Same-volume only by ABI; either side on the read-only disk refuses.
+        if (from.partition == .disk and to.partition == .disk) {
+            metadata.rename(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(from), from_name, pin_directory(to), to_name, replace) catch |err| return metadata_errno(err);
+        }
+        return -7; // cross-partition rename, or the v1 backend's denial
+    }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
     metadata.rename(virtio_file.metadata_backend(&root), auth.authorizer(), pin_directory(from), from_name, pin_directory(to), to_name, replace) catch |err| return metadata_errno(err);
@@ -1024,8 +1158,9 @@ pub fn set_mode(pid: u64, path_bytes: []const u8, mode: u16) i64 {
     if (path_bytes.len == 0 or path_bytes.len > max_path_len) return -1;
     const parsed = parse_path(path_bytes) orelse return -1;
     if (parsed.partition == .tty) return -1; // device semantics
-    // `.usb` and `.usb_fat` are fixed read-only 0444 for every actor.
-    if (parsed.partition == .usb or parsed.partition == .usb_fat) return -7;
+    // `.usb` and `.usb_fat` are fixed read-only 0444 for every actor;
+    // `.disk` has no per-file trust table in v1 — chmod is refused by name.
+    if (parsed.partition == .usb or parsed.partition == .usb_fat or parsed.partition == .disk) return -7;
     if (!virtio_file.available()) return -6;
     const subpath = parsed.path[0..parsed.parsed_len()];
     // M97d-F5 (#2090): the policy file is kernel-writable only — chmod on
@@ -1132,6 +1267,17 @@ pub fn parse_path(raw: []const u8) ?ParsedPath {
     } else if (subpath.len == 3 and std.ascii.eqlIgnoreCase(subpath[0..3], "usb")) {
         partition = .usb;
         subpath = "";
+    } else if (subpath.len >= 5 and std.ascii.eqlIgnoreCase(subpath[0..5], "disk/")) {
+        // M100c (issue #2308, ADR 0050 D6): the VLFS data volume. The same
+        // boundary rule as `host`/`usb` keeps `diskette.txt` on the share.
+        partition = .disk;
+        subpath = subpath[5..];
+    } else if (subpath.len >= 5 and std.ascii.eqlIgnoreCase(subpath[0..5], "disk:")) {
+        partition = .disk;
+        subpath = subpath[5..];
+    } else if (subpath.len == 4 and std.ascii.eqlIgnoreCase(subpath[0..4], "disk")) {
+        partition = .disk;
+        subpath = "";
     }
 
     // Clean up multiple consecutive slashes and strip leading/trailing slashes
@@ -1211,6 +1357,16 @@ pub fn hf_handle_errno(st: u8) i64 {
 // ---------------------------------------------------------------------------
 // File Handle Operations (Card F1)
 // ---------------------------------------------------------------------------
+
+/// M100c (issue #2308): VLFS refusals → the frozen ABI errno rows, mirroring
+/// the `.usb_fat` split — an absent volume/path or a dead device is ENOENT,
+/// everything structural is EINVAL.
+fn disk_errno(err: vlfs.Error) i64 {
+    return switch (err) {
+        error.NotMounted, error.NotFound, error.Io => -6,
+        else => -1,
+    };
+}
 
 /// Open a file for `pid` with given `flags`.
 /// Returns fd (0..7) on success, or negative error code:
@@ -1333,6 +1489,31 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
         return @intCast(slot);
     }
 
+    // M100c (issue #2308, ADR 0050 D6): a file on the VLFS data disk. The
+    // error split mirrors `.usb_fat`: not-mounted and not-found are ENOENT
+    // (the share-only boot continues — a disk is an enhancement, never a
+    // requirement); a directory has no byte stream; anything structural is
+    // EINVAL. v1 is read-only: every mutating flag is refused up front.
+    if (parsed.partition == .disk) {
+        if ((flags & (MODE_WRITE | MODE_CREATE | MODE_APPEND | MODE_DIR)) != 0) return -1;
+        const subpath = parsed.path[0..parsed.parsed_len()];
+        const found = vlfs_disk.lookup(subpath) catch |err| return disk_errno(err);
+        if (found.kind == vlfs.kind_dir) return -1; // the volume root and dirs: no byte stream
+        const st = vlfs_disk.statInode(found.inode) catch |err| return disk_errno(err);
+        handles[pid][slot] = .{
+            .in_use = true,
+            .partition = .disk,
+            .flags = flags,
+            .cursor = 0,
+            .size = st.size,
+            .path = parsed.path,
+            .path_len = parsed.path_len,
+            .disk_ino = found.inode,
+            .disk_epoch = vlfs_disk.mountEpoch(),
+        };
+        return @intCast(slot);
+    }
+
     // M50 TS2 (ADR 0024 D4): the ownership/mode gate, after parse_path and
     // before any virtio_file access. `.usb`/`.usb_fat` were handled above and
     // `.tty` before parse_path; every path here is `.host`.
@@ -1445,6 +1626,23 @@ fn read_handle(pid: u64, h: *FileHandle, out_buf: []u8, strict: bool) i64 {
         // SH7 (#1083): a net-bound terminal's input comes from the TCP seam.
         _ = terminal.pumpNetInput();
         return @intCast(t.readInput(out_buf));
+    }
+
+    // M100c (issue #2308): `.disk` reads go to the VLFS extent walk at the
+    // handle cursor; a remounted volume invalidates the handle (EBADF) and
+    // a mid-read structural failure stops at the last byte the disk held.
+    // The contained-open variant carries the backend handle, whose cursor
+    // lives in vlfs_disk's table.
+    if (h.partition == .disk) {
+        if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        if (h.disk_handle != 0) {
+            const n = vlfs_disk.containedRead(h.disk_handle, out_buf) catch |err| return disk_errno(err);
+            h.cursor += @intCast(n);
+            return @intCast(n);
+        }
+        const n = vlfs_disk.read(h.disk_ino, h.cursor, out_buf) catch |err| return disk_errno(err);
+        h.cursor += @intCast(n);
+        return @intCast(n);
     }
 
     // M50 TS2 (ADR 0024 D4): the host-share ownership/mode gate for reads.
@@ -1603,6 +1801,7 @@ pub fn close(pid: u64, fd: u64) i64 {
     if (handles[pid][fd].pin) return -2; // a pin token is not an fd (op 9)
     if (handles[pid][fd].dir_token != 0) release_snapshot(handles[pid][fd].dir_snapshot);
 
+    if (handles[pid][fd].disk_handle != 0) vlfs_disk.containedClose(handles[pid][fd].disk_handle);
     if (handles[pid][fd].host_handle_valid) {
         if (handles[pid][fd].contained) {
             virtio_file.contained_close(handles[pid][fd].host_handle) catch |err| return metadata_errno(err);
@@ -1628,14 +1827,18 @@ fn resource_count(pid: u64) usize {
 
 /// Slot 27 v2: capture a complete immutable directory, reserving one of
 /// the process's eight native resources. USB is explicitly unsupported.
+/// M100c (issue #2308): `.disk` captures a sorted VLFS readdir — each row
+/// carries the inode's live size/kind, so the snapshot is the same shape
+/// the share's snapshot takes.
 pub fn dir_open(pid: u64, path_bytes: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
     if (path_bytes.len > max_path_len) return -8;
     const parsed = parse_path(if (path_bytes.len == 0) "/host" else path_bytes) orelse return -8;
-    if (parsed.partition != .host) return -4;
+    if (parsed.partition != .host and parsed.partition != .disk) return -4;
     const path = parsed.path[0..parsed.path_len];
     if (!directory.valid_path(path, directory.depth_max)) return -8;
-    if (!hostAllowed(pid, path, .list)) return -7;
+    if (parsed.partition == .host and !hostAllowed(pid, path, .list)) return -7;
+    if (parsed.partition == .disk and !vlfs_disk.mounted()) return -6;
     if (!ensure_handles()) return -10;
     defer release_empty_handles();
     if (resource_count(pid) >= max_handles_per_process) return -5;
@@ -1647,19 +1850,48 @@ pub fn dir_open(pid: u64, path_bytes: []const u8) i64 {
     if (slot == snapshot_used.len or next_dir_token > std.math.maxInt(i64)) return -5;
     const snapshot = allocate_snapshot(slot) orelse return -10; // ENOMEM, not cursor exhaustion
     snapshots[slot] = snapshot;
-    const status = virtio_file.snapshot(path, snapshot);
-    if (status != virtio_file.st_ok) {
-        release_snapshot(slot);
-        return switch (status) {
-            virtio_file.st_limit, virtio_file.st_handle => -5,
-            virtio_file.st_path_limit => -8,
-            else => hf_open_errno(status),
+    if (parsed.partition == .disk) {
+        const dir = vlfs_disk.lookup(path) catch |err| {
+            release_snapshot(slot);
+            return disk_errno(err);
         };
+        if (dir.kind != vlfs.kind_dir) {
+            release_snapshot(slot);
+            return -1;
+        }
+        const n = vlfs_disk.listDir(dir.inode, &disk_dir_scratch) catch |err| {
+            release_snapshot(slot);
+            return disk_errno(err);
+        };
+        // entry_max rows is the snapshot's bound; a directory with more live
+        // dirents reports the sorted first-256, the same ceiling the share's
+        // own snapshot has.
+        for (0..n) |i| {
+            const d = &disk_dir_scratch[i];
+            const st = vlfs_disk.statInode(d.inode) catch |err| {
+                release_snapshot(slot);
+                return disk_errno(err);
+            };
+            snapshot.entries[i] = .{ .size = st.size, .name_len = @intCast(d.name_len), .is_dir = @intFromBool(d.kind == vlfs.kind_dir) };
+            @memcpy(snapshot.entries[i].name[0..d.name_len], d.name[0..d.name_len]);
+        }
+        snapshot.count = n;
+    } else {
+        const status = virtio_file.snapshot(path, snapshot);
+        if (status != virtio_file.st_ok) {
+            release_snapshot(slot);
+            return switch (status) {
+                virtio_file.st_limit, virtio_file.st_handle => -5,
+                virtio_file.st_path_limit => -8,
+                else => hf_open_errno(status),
+            };
+        }
     }
     const token = next_dir_token;
     next_dir_token += 1;
     handles[pid][fd] = .{
         .in_use = true,
+        .partition = parsed.partition,
         .is_dir = true,
         .dir_token = token,
         .dir_snapshot = slot,
@@ -1683,7 +1915,8 @@ fn dir_handle(pid: u64, token: u64) ?*FileHandle {
 pub fn dir_page(pid: u64, token: u64, offset: u64, limit: u64, page: *directory.Page) i64 {
     const h = dir_handle(pid, token) orelse return -2;
     if (h.rich_directory or h.pin) return -2;
-    if (!hostAllowed(pid, h.path[0..h.path_len], .list)) return -7;
+    // `.disk` carries no trust table (ADR 0050 D6): listing is world-granted.
+    if (h.partition == .host and !hostAllowed(pid, h.path[0..h.path_len], .list)) return -7;
     if (limit == 0 or limit > directory.page_max) return -1;
     const snapshot = snapshots[h.dir_snapshot].?;
     if (offset > snapshot.count) return -1;
@@ -1759,6 +1992,31 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
             @memcpy(de.name[0..nlen], e.name[0..nlen]);
             out_entries[n] = de;
             n += 1;
+        }
+        return @intCast(n);
+    }
+
+    // M100c (issue #2308): listing a `.disk` path is the name-sorted VLFS
+    // readdir (ADR D3 — entries come back name-sorted, matching
+    // directory.Snapshot.sort). Names over the 31-byte row truncate, the
+    // same accommodation the `.usb_fat` listing makes.
+    if (parsed.partition == .disk) {
+        const subpath = parsed.path[0..parsed.parsed_len()];
+        const dir = vlfs_disk.lookup(subpath) catch |err| return disk_errno(err);
+        if (dir.kind != vlfs.kind_dir) return -1;
+        const n = vlfs_disk.listDir(dir.inode, disk_dir_scratch[0..out_entries.len]) catch |err| return disk_errno(err);
+        for (0..n) |i| {
+            const d = &disk_dir_scratch[i];
+            const st = vlfs_disk.statInode(d.inode) catch |err| return disk_errno(err);
+            var de = DirEntry{
+                .name = @as([32]u8, @splat(@as(u8, 0))),
+                .size = st.size,
+                .is_dir = if (d.kind == vlfs.kind_dir) 1 else 0,
+                .reserved = .{ 0, 0, 0 },
+            };
+            const nlen = @min(d.name_len, 31);
+            @memcpy(de.name[0..nlen], d.name[0..nlen]);
+            out_entries[i] = de;
         }
         return @intCast(n);
     }
@@ -2771,6 +3029,11 @@ test "file_table: /dev/tty routes to the process's terminal device (#1072)" {
 test "file_table: window tty reads preserve keyboard CSI bytes (#1794)" {
     init();
     app_events.init();
+    // arming sets armed_global for the rest of this test binary; leaving it
+    // armed lets an unrelated later test's render_splash reach real device
+    // ops (the `dc ivac` landmine documented in virtio_file.zig), so restore.
+    const saved_armed = driving_award.armed_global;
+    defer driving_award.armed_global = saved_armed;
     driving_award.arm();
     for (&terminal.terminals) |*tt| tt.reset();
 
@@ -2836,4 +3099,219 @@ test "file_table: window tty write larger than the ring cannot drop (M73f-1)" {
     try std.testing.expectEqual(@as(u21, 'L'), scr.cellAt(last_line, last_col + 3).base);
 
     reset_process(pid);
+}
+
+// ---------------------------------------------------------------------------
+// M100c (issue #2308, ADR 0050): `.disk` / VLFS routing tests over the
+// committed .regions fixtures — the same images tools/go/vlfs asserts.
+// ---------------------------------------------------------------------------
+
+const vlfs_empty_regions = @embedFile("vlfs/testdata/empty-16m.regions");
+const vlfs_populated_regions = @embedFile("vlfs/testdata/populated-16m.regions");
+
+const vlfs_test_bytes: usize = 16 << 20;
+var vlfs_test_img: [vlfs_test_bytes]u8 = undefined;
+
+/// A minimal in-memory sector device driving `vlfs_disk.attach` — the exact
+/// seam the M100b virtio-blk driver will call after its GET_ID match.
+const VlfsTestDisk = struct {
+    fn readFn(ctx: ?*anyopaque, lba: u64, out: *[vlfs.sector_len]u8) bool {
+        const img: *[vlfs_test_bytes]u8 = @ptrCast(@alignCast(ctx.?));
+        const off = lba * vlfs.sector_len;
+        if (off + vlfs.sector_len > img.len) return false;
+        @memcpy(out, img[off..][0..vlfs.sector_len]);
+        return true;
+    }
+    fn source(img: *[vlfs_test_bytes]u8) vlfs.SectorSource {
+        return .{
+            .ctx = img,
+            .total_sectors = @intCast(img.len / vlfs.sector_len),
+            .readFn = readFn,
+        };
+    }
+};
+
+fn vlfs_build(regions: []const u8, img: []u8) !void {
+    @memset(img, 0);
+    var it = std.mem.splitScalar(u8, regions, '\n');
+    var lines: usize = 0;
+    while (it.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        if (lines == 0) {
+            if (!std.mem.eql(u8, line, "vlfs-regions 1")) return error.BadFixture;
+            lines += 1;
+            continue;
+        }
+        if (lines == 1) {
+            const n = try std.fmt.parseInt(usize, line[6..], 10);
+            if (n != img.len) return error.BadFixture;
+            lines += 1;
+            continue;
+        }
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadFixture;
+        const off = try std.fmt.parseInt(usize, line[0..sp], 10);
+        const hexs = line[sp + 1 ..];
+        _ = try std.fmt.hexToBytes(img[off..][0 .. hexs.len / 2], hexs);
+        lines += 1;
+    }
+}
+
+test "file_table: /disk parses like the other volume prefixes" {
+    init();
+    const p1 = parse_path("/disk/DOCS/NESTED.TXT").?;
+    try std.testing.expectEqual(Partition.disk, p1.partition);
+    try std.testing.expectEqualStrings("DOCS/NESTED.TXT", p1.path[0..p1.parsed_len()]);
+    try std.testing.expectEqual(Partition.disk, parse_path("/disk").?.partition);
+    try std.testing.expectEqual(Partition.disk, parse_path("disk/").?.partition);
+    try std.testing.expectEqual(Partition.disk, parse_path("DISK:x.txt").?.partition);
+    // A leading-substring file is NOT the volume: `diskette.txt` is a share
+    // file, as is `mydisk/x`.
+    try std.testing.expectEqual(Partition.host, parse_path("diskette.txt").?.partition);
+    try std.testing.expectEqual(Partition.host, parse_path("mydisk/x").?.partition);
+    try std.testing.expectEqual(Partition.host, parse_path("/diskx/y").?.partition);
+    // Traversal still refuses.
+    try std.testing.expect(parse_path("/disk/../x") == null);
+}
+
+test "file_table: absent VLFS volume refuses /disk by name, share-only" {
+    init();
+    vlfs_disk.detach();
+    defer vlfs_disk.detach();
+    // Every /disk surface is an honest ENOENT/ENOSYS — nothing else suffers.
+    try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/APPLE.TXT", MODE_READ));
+    var rows: [4]DirEntry = undefined;
+    try std.testing.expectEqual(@as(i64, -6), dir_list(0, "/disk", rows[0..]));
+    try std.testing.expectEqual(@as(i64, -6), dir_open(0, "/disk"));
+    var wire: metadata.Wire = undefined;
+    // The slot-79 surface mirrors the host channel's own dead-backend answer.
+    try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", &wire));
+    try std.testing.expectEqual(@as(i64, -4), pin_open(0, "/disk", ""));
+    // The share still works (host-availability governs its own refusal).
+    try std.testing.expectEqual(@as(i64, -6), open(0, "test.txt", MODE_READ)); // no host channel in tests
+    try std.testing.expectEqual(Partition.host, parse_path("diskette.txt").?.partition);
+}
+
+test "file_table: mounted VLFS serves open/read/stat/readdir on /disk" {
+    init();
+    defer vlfs_disk.detach();
+    try vlfs_build(vlfs_populated_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
+
+    // open + read through the extent walk, including the second block.
+    const fd = open(0, "/disk/APPLE.TXT", MODE_READ);
+    try std.testing.expect(fd >= 0);
+    var buf: [4113]u8 = undefined;
+    try std.testing.expectEqual(@as(i64, 4113), read(0, @intCast(fd), &buf));
+    try std.testing.expectEqualSlices(u8, "apple\n", buf[0..6]);
+    try std.testing.expectEqualSlices(u8, "le\napp", buf[4107..4113]);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fd)));
+
+    // A directory and a missing name refuse distinctly; every mutating flag
+    // is refused before a single sector is read.
+    try std.testing.expectEqual(@as(i64, -1), open(0, "/disk/DOCS", MODE_READ));
+    try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/NOPE.TXT", MODE_READ));
+    try std.testing.expectEqual(@as(i64, -1), open(0, "/disk/APPLE.TXT", MODE_WRITE));
+    try std.testing.expectEqual(@as(i64, -1), open(0, "/disk/APPLE.TXT", MODE_READ | MODE_CREATE));
+    try std.testing.expectEqual(@as(i64, -1), delete(0, "/disk/APPLE.TXT"));
+    try std.testing.expectEqual(@as(i64, -1), rename(0, "/disk/A", "/disk/B"));
+    try std.testing.expectEqual(@as(i64, -7), set_mode(0, "/disk/APPLE.TXT", 0o600));
+
+    // Nested-path lookup through two directories (uppercase + lowercase).
+    const fdn = open(0, "disk:DOCS/NESTED.TXT", MODE_READ);
+    try std.testing.expect(fdn >= 0);
+    var nbuf: [64]u8 = undefined;
+    const nn = read(0, @intCast(fdn), &nbuf);
+    try std.testing.expectEqualSlices(u8, "nested file contents\n", nbuf[0..@intCast(nn)]);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fdn)));
+
+    // Flat readdir comes back name-sorted (the tombstoned GONE.TXT is gone).
+    var rows: [8]DirEntry = undefined;
+    const dn = dir_list(0, "/disk", rows[0..]);
+    try std.testing.expectEqual(@as(i64, 5), dn);
+    const names = [_][]const u8{ "APPLE.TXT", "CHAINED.BIN", "DOCS", "EMPTY.BIN", "ZEBRA.TXT" };
+    for (names, 0..) |name, i| {
+        const row = rows[i];
+        const nl = std.mem.indexOfScalar(u8, &row.name, 0) orelse row.name.len;
+        try std.testing.expectEqualStrings(name, row.name[0..nl]);
+    }
+    try std.testing.expectEqual(@as(u8, 1), rows[2].is_dir);
+    try std.testing.expectEqual(@as(u64, 4113), rows[0].size);
+
+    // The paginated v2 capture serves the same sorted order.
+    const tok = dir_open(0, "/disk/DOCS");
+    try std.testing.expect(tok > 0);
+    var page: directory.Page = undefined;
+    try std.testing.expectEqual(@as(i64, 2), dir_page(0, @intCast(tok), 0, directory.page_max, &page));
+    try std.testing.expectEqual(@as(u32, 2), page.header.count);
+    try std.testing.expectEqual(@as(u32, 1), page.header.end);
+    try std.testing.expectEqualStrings("DEEP", page.entries[0].name[0..page.entries[0].name_len]);
+    try std.testing.expectEqualStrings("NESTED.TXT", page.entries[1].name[0..page.entries[1].name_len]);
+    try std.testing.expectEqual(@as(i64, 0), dir_close(0, @intCast(tok)));
+
+    // Slot 79: stat/identity through the real ContainedOps backend.
+    var wire: metadata.Wire = undefined;
+    try std.testing.expectEqual(@as(i64, 0), metadata_at(0, "/disk", "APPLE.TXT", &wire));
+    try std.testing.expectEqual(metadata.Kind.file, wire.kind);
+    try std.testing.expectEqual(@as(u64, 4113), wire.size);
+    try std.testing.expectEqual(@as(i64, 0), metadata_at(0, "/disk/DOCS", "DEEP", &wire));
+    try std.testing.expectEqual(metadata.Kind.directory, wire.kind);
+    try std.testing.expectEqual(@as(i64, -6), metadata_at(0, "/disk", "NOPE.TXT", &wire));
+
+    // Contained open: read streams through the backend handle; write denies.
+    const cfd = contained_open(0, "/disk", "CHAINED.BIN", false);
+    try std.testing.expect(cfd >= 0);
+    var cbuf: [64]u8 = undefined;
+    const cn = read(0, @intCast(cfd), &cbuf);
+    try std.testing.expect(cn > 0);
+    try std.testing.expectEqualStrings("chain-block-0", cbuf[0..13]);
+    var cmeta: metadata.Wire = undefined;
+    try std.testing.expectEqual(@as(i64, 0), handle_metadata(0, @intCast(cfd), metadata.handle_file, &cmeta));
+    try std.testing.expectEqual(metadata.Kind.file, cmeta.kind);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(cfd)));
+    try std.testing.expectEqual(@as(i64, -7), contained_open(0, "/disk", "APPLE.TXT", true));
+
+    // Pins resolve through the same backend; mutations are denied by it.
+    const pin = pin_open(0, "/disk", "DOCS");
+    try std.testing.expect(pin > 0);
+    const child = pin_child(0, @intCast(pin), "DEEP");
+    try std.testing.expect(child > 0);
+    var pm: metadata.Wire = undefined;
+    try std.testing.expectEqual(@as(i64, 0), handle_metadata(0, @intCast(pin), metadata.handle_directory, &pm));
+    try std.testing.expectEqual(metadata.Kind.directory, pm.kind);
+    try std.testing.expectEqual(@as(i64, -7), pin_create(0, @intCast(pin), "NEW.TXT"));
+    try std.testing.expectEqual(@as(i64, -7), pin_mkdir(0, @intCast(child), "X"));
+    try std.testing.expectEqual(@as(i64, -7), pin_remove(0, @intCast(pin), "NESTED.TXT", metadata.remove_file));
+    try std.testing.expectEqual(@as(i64, -7), pin_rename(0, @intCast(pin), "NESTED.TXT", @intCast(child), "Y.TXT", false));
+    try std.testing.expectEqual(@as(i64, 0), pin_close(0, @intCast(child)));
+    try std.testing.expectEqual(@as(i64, 0), pin_close(0, @intCast(pin)));
+
+    // The rich dir_open surface (slot-79 op 4) pages metadata rows.
+    const mtok = metadata_dir_open(0, "/disk", "DOCS");
+    try std.testing.expect(mtok > 0);
+    var mpage: metadata.Page = undefined;
+    try std.testing.expectEqual(@as(i64, 2), metadata_dir_page(0, @intCast(mtok), 0, directory.page_max, &mpage));
+    try std.testing.expectEqual(@as(u32, 2), mpage.header.count);
+    try std.testing.expectEqual(@as(u32, 1), mpage.header.end);
+    try std.testing.expectEqual(metadata.Kind.directory, mpage.entries[0].metadata.kind);
+    try std.testing.expectEqual(@as(i64, 0), dir_close(0, @intCast(mtok)));
+
+    // A reattach (fresh mount epoch) invalidates open .disk handles.
+    const fd2 = open(0, "/disk/EMPTY.BIN", MODE_READ);
+    try std.testing.expect(fd2 >= 0);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
+    try std.testing.expectEqual(@as(i64, -2), read(0, @intCast(fd2), &nbuf));
+    reset_process(0);
+}
+
+test "file_table: /disk refusals are names, not crashes" {
+    init();
+    defer vlfs_disk.detach();
+    // A zeroed device attaches as a refusal: mount fails by name and every
+    // path still answers ENOENT rather than serving phantom bytes.
+    @memset(&vlfs_test_img, 0);
+    try std.testing.expect(!vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
+    try std.testing.expectEqualStrings("not_vlfs", vlfs_disk.last_refusal.?);
+    try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/APPLE.TXT", MODE_READ));
+    var wire: metadata.Wire = undefined;
+    try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", &wire));
 }
