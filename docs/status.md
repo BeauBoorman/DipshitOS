@@ -162,7 +162,7 @@ Threads and their current state (the tracker is authoritative):
 | **M103 — FLINT M0: agent-native SCM** | **Landed** (all four cards M103a–d): `FLINT.ELF` parses Zig/Go into Atoms (#2253), stages Ops into a flat-file store with UUIDv7 (#2251), signs and verifies Ed25519 Changes on Streams (#2252), and forks/replays/merges Streams with a semantic three-way merge on Ops, `MERGE.json` conflicts, and the `src_behind` guard (#2254); class-B `go-flint` 10/10 green. | #2253, #2251, #2252, #2254; [ADR 0049](decisions/0049-flint-scm.md) |
 | **M104 — UI depth: primitives v2, widget faces, seat chrome, adoption sweep** | Open (index #2267); M104a contract v2 in review (PR #2276); cards b–h unclaimed. | #2267; cards #2268–#2275 |
 | **M105 — FLINT host client (cross-platform Zig port)** | Open (index #2283); client spec in review (PR #2282); cards a–f unclaimed. | #2283; cards #2284–#2289 |
-| **M106 — FLINT host server (cross-platform Zig port)** | Open (index #2291); sync-server spec in review (PR #2290); cards a–f unclaimed. | #2291; cards #2292–#2297 |
+| **M106 — FLINT host server (cross-platform Zig port)** | **Landed** — all six cards closed in [flint-server](https://github.com/drawmeanelephant/flint-server) (index flint-server#1). flint-server#7 shipped the Zig 0.17 skeleton + wire model (Go field order/escaping, Ed25519 verify, torn-append JSONL, `flintd init`), `streams/` store IO with crash-safe append order, the `FLINT-SYNC/1` NDJSON server over TCP + `--stdio`, `--auth-key` HMAC challenge + `--allow-author` gating, and the `testdata/sync/` golden-transcript conformance suite; flint-client#16 landed M106e remote verbs (`push`/`pull`/`clone`, `REMOTE.json`). | flint-server#1; cards flint-server#2–#6, flint-client#9 |
 
 
 ## Gate status
