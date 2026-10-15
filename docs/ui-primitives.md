@@ -1,6 +1,7 @@
 # `user/go/draw` — UI primitives contract (chrome design language + API)
 
 Status: **contract v2** · Date: 2026-10-14 · Owner: M104a (issue #2268) ·
+implemented: M104b–h (#2269–#2275) ·
 v1: 2026-09-27, M86a (#1817) — v1's frozen names are unchanged ·
 Source of truth for: M86b (#1818, glyph batch 1), M86c (#1819, shape
 renderer), M86d (#1820, published API + adoption), and the M104 depth +
@@ -69,10 +70,10 @@ Everything here is Go-side: the kernel and the Zig seat are untouched.
     view a caller-owned BGRA buffer or mmap a Seam-B window surface. The
     v1 "where an app gets `[]u32`" gap is **closed**; `appkit/demo` binds
     `WindowCanvas` today.
-- **Named gap (v2):** `WindowCanvas` mmaps once at bind;
-  `tabapp.Dispatch` treats `WIN_RESIZE` as relayout only. Rebinding the
-  surface on resize is M104f's problem (`tabapp` grows the binding
-  helper), named here so no card discovers it mid-flight.
+- **Named gap (v2) — resolved (M104f, #2273):** `WindowCanvas` mmaps
+  once at bind — at scanout size — and `tabapp.Dispatch`'s `WIN_RESIZE`
+  arm re-views the same pages at the new tight stride (reflow-style
+  overlap copy), never remaps. The resize path is shipped.
 - **`FillerCanvas` sunset policy (v2 decision):** **kept** — it is the
   documented degrade path, the zero-regression adapter for surfaces that
   cannot mmap, and ~40 lines. It is *not* deprecated: removal would be a

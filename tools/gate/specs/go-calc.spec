@@ -24,6 +24,14 @@
 #           only feeds terminal selection/mouse-reports, not app events.
 #           Under the shim the kernel's own hit path pushes MOUSE_DOWN/UP
 #           to the hit user window, so FE,AND,0F,= really clicks the pad.
+#   run 05  M104h (#2275): the migrated surface, as PIXELS. Bare shim like
+#           run 04 so the window keeps its declared 512x384 at (32,32); a
+#           kind-4 snapshot on a settled rx echo probes the §2.2 rounded
+#           pad plates (outer corner pixels stay window-Bg, never Border),
+#           the Border stroke + BtnIdle faces, the bitmap '7' label ink,
+#           and the Ink digits a typed '12+3' leaves in the display — the
+#           draw-engine composite end-to-end, discriminated from the v1
+#           flat-rect path by the corner probe.
 #
 # The load-bearing evidence is NOT only the app's own markers: each run's
 # last assert reads the share file back ON THE HOST and requires it to
@@ -273,4 +281,121 @@ if got != want:
     print("RESULT CONTENT MISMATCH: got %r want %r" % (got, want))
     raise SystemExit(1)
 print("result verified on the host: %r (%d bytes)" % (got, len(got)))
+PY
+# --- run 05 (M104h / #2275): the migrated chrome, as PIXELS ---------------
+# Same bare-shim boot as run 04: `declare` refused, native 512x384 window
+# at (32,32), so the app's bound surface is blitted 1:1 at the declared
+# rect and the kernel's 16px title band covers canvas rows 0..15. '1,2,+,3'
+# lands after the first present; script3's echo at +20 s is the snapshot
+# trigger, so the kind-4 stream reads a fully settled frame — the same
+# marker-settle idiom as the seat specs. No '=': the run ends with the
+# app still open (RESULT.TXT is run 01-04's evidence, not this leg's).
+vgate_file script3-pixels.txt <<'S3EOF'
+echo rx-gocalc-pixels
+S3EOF
+
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-05' \
+    --script '$RUN_DIR/script-pad.txt' \
+    --input-chords '1,2,+,3' \
+    --input-chords-after 'gocalc: present' \
+    --script3 '$RUN_DIR/script3-pixels.txt' \
+    --script3-after 'gocalc: present' \
+    --script3-delay 20 \
+    --snapshot-after 'rx-gocalc-pixels' \
+    --script-expect 'rx-gocalc-pixels' --timeout 300
+
+vgate_assert 05 serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert 05 serial-contains 'gocalc: open id='
+vgate_assert 05 serial-contains 'gocalc: declare refused'
+vgate_assert 05 serial-contains 'gocalc: present'
+vgate_assert 05 serial-contains 'rx-gocalc-pixels'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'exited status=139'
+
+# The M104 composite, probed on the raw BGRX scanout. Window-local coords
+# are canvas coords: the app surface is blitted 1:1 at (32,32). Decimal pad
+# is 5x4, btn 118x52, PadMD=8, pad top y0=84:
+#   "C" plate canvas (8,84,118,52) -> scanout x 40..157, y 116..167
+#   "7" plate canvas (8,144,118,52) -> scanout x 40..157, y 176..227
+#   display canvas (8,32,496,44) -> scanout x 40..535, y 64..107
+# The discriminating probe is the corner: the v2 full-canvas path paints
+# FillRoundedRect + StrokeRoundedRect, so each plate's OUTER corner pixel
+# keeps the window Bg the app filled first; the v1 RectCanvas path filled
+# the whole outer rect with Border, and would read 0x334155 there.
+vgate_assert 05 snapshot 'snap-05-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    b, g, r = raw[off], raw[off + 1], raw[off + 2]
+    return (r, g, b)
+
+BG       = (0x18, 0x20, 0x26)  # theme.Dark.Bg - the window fill (tabapp.FillRGB)
+SURFACE  = (0x22, 0x2d, 0x35)  # display/history plate
+BORDER   = (0x33, 0x41, 0x55)  # §2.2 plate stroke
+BTNIDLE  = (0x2d, 0x37, 0x48)  # §2.3 idle face
+TEXT     = (0xff, 0xff, 0xff)  # button label ink
+INK      = (0xe6, 0xed, 0xf3)  # display text ink
+TITLE    = (0x1a, 0x2b, 0x3c)  # kernel title band (user_title_bg dark)
+
+# Kernel chrome band over canvas rows 0..15 -> scanout rows 32..47: the
+# window's own chrome frame is present and the surface sits below it.
+band = [px(x, y) for y in range(34, 46) for x in range(60, 530, 10)]
+if sum(1 for c in band if c == TITLE) * 2 < len(band):
+    sys.exit("title band rows are not the kernel chrome colour")
+
+# The "C" plate's OUTER corner is the v2/v1 discriminator: rounded plates
+# leave it at the window Bg the app's FillRect painted first.
+c = px(40, 116)
+if c == BORDER:
+    sys.exit("plate outer corner is Border - the flat RectCanvas v1 path "
+             "painted, not the rounded §2.2 plate")
+if c != BG:
+    sys.exit("plate outer corner is %r, want window Bg %r" % (c, BG))
+# The stroke rides the plate edge, the face fills inside it.
+assert px(99, 116) == BORDER, \
+    "plate top edge %r is not the Border stroke" % (px(99, 116),)
+assert px(40, 141) == BORDER, \
+    "plate left edge %r is not the Border stroke" % (px(40, 141),)
+assert px(70, 130) == BTNIDLE and px(99, 160) == BTNIDLE, \
+    "plate interior is not BtnIdle: %r %r" % (px(70, 130), px(99, 160))
+
+# The gap between the display's bottom (canvas 76) and the pad top (84)
+# is the window fill - proof the app, not the kernel, painted this field.
+assert px(300, 112) == BG, "pad/display gap %r is not window Bg" % (px(300, 112),)
+
+# The '7' label: the kit's 8x8 bitmap face in Text ink. Nil-face labels
+# are LEFT-anchored (drawGlyphRun: plate inset 2, vertically centred), so
+# the glyph box is canvas x 11..18, y 166..173 -> scanout x 43..50,
+# y 198..205 - a live counterpart to the composite golden's degrade-path
+# labels.
+glyph = sum(1 for y in range(198, 206) for x in range(43, 51)
+            if px(x, y) == TEXT)
+if glyph < 4:
+    sys.exit("only %d Text px in the '7' label zone - the bitmap label "
+             "did not paint" % glyph)
+
+# '12+3' in the display: Ink digits over the Surface plate.
+digits = sum(1 for y in range(64, 108) for x in range(40, 536)
+             if px(x, y) == INK)
+if digits < 12:
+    sys.exit("only %d Ink px in the display band - '12+3' did not repaint" % digits)
+
+# Outside the window is NOT the app: the wallpaper gradient, which shares
+# no token with the pad field.
+out = px(700, 300)
+if out in (BG, SURFACE, BORDER, BTNIDLE, TEXT, INK, TITLE):
+    sys.exit("outside-window pixel %r collides with an app token - the "
+             "window may not be where the probes assume" % (out,))
+print("calc chrome: corner=Bg, border+BtnIdle plates, '7' label %d px, "
+      "display %d Ink px, title band ok" % (glyph, digits))
 PY
