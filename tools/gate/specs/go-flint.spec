@@ -33,18 +33,38 @@
 # type=concurrent_modify` and `flint: merge conflicts=1` with `MERGE.json`
 # written and main's stream log and head unchanged.
 #
-# This spec is grown across M103a-d and is NOT vgate_repeat-safe (runs 01-03,
-# 05-07, and 08-10 share /host state across boots).
+# Runs 11-13 (M101a #2313): FLINT-SYNC/1 remote verbs over hermetic --net.
+# The setup hook locates a sibling ../flint-server checkout (FLINT_SERVER_DIR
+# override, Zig 0.17 — same recovery pattern as GO_FORK_DIR), `zig build`s
+# flintd, seeds its store with the pinned sync-seed stream, and serves it on
+# 127.0.0.1:4748 with --auth-key. The runner relays guest dials of
+# 10.0.0.2:4748 to it (--net-tcp-respond/-relay). Run 11 proves `flint
+# ls-remote` + `clone <addr> <stream>` writing raw-JSONL verbatim into
+# sync-share; run 12 re-boots on the SAME share (the conflict-share pattern)
+# for `verify --all` + a REMOTE.json-bound bare `pull`; run 13 proves a wrong
+# `flint-remote` secret refuses `auth_failed` and writes nothing. Splitting
+# clone and verify/pull across boots also keeps the sequential-exec path off
+# the task-slot/file-channel reclamation race the M103 gate relies on
+# vi.Sleep(1) to absorb (observed: `gosh: FLINT.ELF: not found` +
+# stream_missing on the immediately-next invocation after a socket session).
+#
+# This spec is grown across M103a-d/M101a and is NOT vgate_repeat-safe (runs
+# 01-03, 05-07, and 08-10 share /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
 #   bash tools/go/build-gosh.sh  -> .build/go/GOSH.ELF
+#   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-12 only;
+#   the hook zig-builds flintd. flint-server is drawmeanelephant's repo under
+#   the VirelaiOS proprietary source-available license (not GPL-family).
 #
 # exec-order: assert-proven -- run 01 ends on `flint: parse files=`, run 02
 # ends on `flint: status `, run 03 ends on `sig_invalid`, run 04 ends on
 # `flint: refuse secret_not_found`, runs 05/08 end on `flint: fork ok`, runs
-# 06/09 end on `flint: commit ok`, run 07 ends on `flint: status ws=a`, and
-# run 10 ends on `flint: merge conflicts=1`.
+# 06/09 end on `flint: commit ok`, run 07 ends on `flint: status ws=a`, run
+# 10 ends on `flint: merge conflicts=1`, run 11 ends on `flint: clone ok`,
+# run 12 ends on `flint: pull up to date`, and run 13 ends on `flint: refuse
+# auth_failed`.
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -90,8 +110,26 @@ vgate_file script-10.txt <<'EOF'
 exec GOSH.ELF -c "source /host/FLINTJ/10.SH"
 EOF
 
+vgate_file script-11.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/11.SH"
+EOF
+
+vgate_file script-12.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/12.SH"
+EOF
+
+vgate_file script-13.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/13.SH"
+EOF
+
 vgate_setup_python <<'PY'
-import json, os, shutil, sys
+import json, os, shutil, socket, subprocess, sys, time
 
 run = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
@@ -304,7 +342,119 @@ open(os.path.join(run, "conflict-share", "FLINTJ", "10.SH"), "w", encoding="utf-
     "FLINT.ELF merge feature\n"
 )
 
-print("staged FLINT.ELF, GOSH.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, and conflict-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
+# ---- M101a (#2313): host flintd for the hermetic --net sync runs ------------
+# flintd is not built in this repo: locate a sibling checkout
+# (FLINT_SERVER_DIR env override, then ../flint-server — the GO_FORK_DIR
+# recovery pattern), zig-build it, seed a store with the pinned sig-vector
+# stream, and serve it with --auth-key for runs 11-12.
+repo = os.getcwd()
+flint_server_dir = os.environ.get("FLINT_SERVER_DIR") or os.path.join(repo, "..", "flint-server")
+flint_server_dir = os.path.abspath(flint_server_dir)
+if not os.path.isfile(os.path.join(flint_server_dir, "build.zig")):
+    sys.exit(
+        "flint-server checkout missing at %s - clone it once (outside the repo): "
+        "git clone https://github.com/drawmeanelephant/flint-server %s"
+        % (flint_server_dir, flint_server_dir)
+    )
+flintd_rev = subprocess.run(
+    ["git", "-C", flint_server_dir, "rev-parse", "HEAD"],
+    capture_output=True, text=True,
+).stdout.strip()
+subprocess.check_call(["zig", "build"], cwd=flint_server_dir)
+flintd = os.path.join(flint_server_dir, "zig-out", "bin", "flintd")
+if not os.path.isfile(flintd):
+    sys.exit("flintd missing after zig build (expected " + flintd + ")")
+
+# Seed the served store with the pinned sync-seed stream (testdata/sync/
+# seed-stream.jsonl — one signed empty-ops Change on `main`). streams/<id>.json
+# + .jsonl are the byte-portable contract, so a store written here loads in
+# flintd and in FLINT.ELF identically. The seed stays under the ~1.4 KiB wire
+# cliff observed in the go-flint run-11 capture: the runner's TCP relay
+# re-delivers retransmitted guest segments to flintd without dedup AND drops
+# inbound data past the first ~1460-byte segment, so a >MTU `read` response
+# starves the guest of its '\n' terminator (flint-server @ 3e18fc0 observed).
+good_raw = open(os.path.join("user", "go", "flint", "testdata", "sync", "seed-stream.jsonl"), "rb").read()
+good_changes = [json.loads(l) for l in good_raw.decode("utf-8").splitlines() if l.strip()]
+stream_id = good_changes[-1]["stream"]
+flintd_store = os.path.join(run, "flintd-store")
+os.makedirs(os.path.join(flintd_store, "streams"), exist_ok=True)
+with open(os.path.join(flintd_store, "streams", stream_id + ".jsonl"), "wb") as f:
+    f.write(good_raw)
+rec = {
+    "id": stream_id, "name": "main", "head": good_changes[-1]["id"],
+    "created": good_changes[0]["ts"], "forked_from": None,
+}
+with open(os.path.join(flintd_store, "streams", stream_id + ".json"), "w") as f:
+    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+# The shared --auth-key secret: 64 lowercase hex + newline, outside the store
+# and outside the share (the guest reads its copy from the slot-70 secret
+# lane, never from /host).
+AUTH_KEY_HEX = "ab" * 32
+auth_key_file = os.path.join(run, "flint-auth.key")
+open(auth_key_file, "w", encoding="utf-8").write(AUTH_KEY_HEX + "\n")
+
+subprocess.run(
+    ["sh", "-c", "lsof -ti tcp:4748 | xargs kill -9"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+time.sleep(0.2)
+flintd_log = open(os.path.join(run, "flintd.log"), "wb")
+flintd_proc = subprocess.Popen(
+    [flintd, "serve", "--store=" + flintd_store,
+     "--listen=127.0.0.1:4748", "--auth-key=" + auth_key_file],
+    stdout=flintd_log, stderr=subprocess.STDOUT, start_new_session=True,
+)
+flintd_up = False
+for _ in range(100):
+    try:
+        s = socket.create_connection(("127.0.0.1", 4748), 0.2)
+        s.close()
+        flintd_up = True
+        break
+    except OSError:
+        if flintd_proc.poll() is not None:
+            break
+        time.sleep(0.1)
+if not flintd_up:
+    sys.exit("flintd did not come up on 127.0.0.1:4748 (see flintd.log)")
+print("flintd: serving %s on 127.0.0.1:4748 pid=%d rev=%s" % (flintd_store, flintd_proc.pid, flintd_rev))
+
+
+def stage_sync_share(share_dir, auth_hex, script_name, script_body):
+    os.makedirs(os.path.join(share_dir, "FLINTJ"), exist_ok=True)
+    for name in ("FLINT.ELF", "GOSH.ELF"):
+        shutil.copy(os.path.join(".build", "go", name), os.path.join(share_dir, name))
+    open(os.path.join(share_dir, "OWNERS.TXT"), "w", encoding="utf-8").write(
+        "#v1\nFLINT.ELF\t644\t0\t-\n"
+    )
+    open(os.path.join(share_dir, "SECRETS.TXT"), "w", encoding="utf-8").write(
+        "#v1\nagent-sign\t1000\t" + SEED_HEX + "\tFLINT.ELF\n"
+        "flint-remote\t1000\t" + auth_hex + "\tFLINT.ELF\n"
+    )
+    open(os.path.join(share_dir, "FLINTJ", script_name), "w", encoding="utf-8").write(script_body)
+
+
+stage_sync_share(
+    os.path.join(run, "sync-share"),
+    AUTH_KEY_HEX,
+    "11.SH",
+    "FLINT.ELF ls-remote 10.0.0.2:4748\n"
+    "FLINT.ELF clone 10.0.0.2:4748 main\n",
+)
+open(os.path.join(run, "sync-share", "FLINTJ", "12.SH"), "w", encoding="utf-8").write(
+    "FLINT.ELF verify --all\n"
+    "sleep 1\n"
+    "FLINT.ELF pull\n",
+)
+stage_sync_share(
+    os.path.join(run, "badauth-share"),
+    "cd" * 32,
+    "13.SH",
+    "FLINT.ELF clone 10.0.0.2:4748 main\n",
+)
+
+print("staged FLINT.ELF, GOSH.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, and badauth-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
 PY
 
 # ---- 01: M103a in-guest parse-corpus over /host/FLINTC -----------------------
@@ -636,4 +786,111 @@ conflicts = report.get("conflicts", [])
 if len(conflicts) != 1 or conflicts[0].get("name") != "calc.X" or conflicts[0].get("type") != "concurrent_modify":
     sys.exit("unexpected MERGE.json conflicts: %r" % (conflicts,))
 print("run-10 conflict MERGE.json and unchanged main log/head verified")
+PY
+
+# ---- 11: M101a hermetic sync — ls-remote + clone land the stream ------------
+vgate_run 11 -- \
+    --cvc-file '$RUN_DIR/sync-share' \
+    --virtio-fs '$RUN_DIR/sync-share' \
+    --net '$RUN_DIR/cap11.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
+    --script '$RUN_DIR/script-11.txt' \
+    --script-expect 'flint: clone ok stream=main changes=1' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 11 serial-contains 'flint: stream main id=0199de2d-dc00-7000-8000-00000000a010 head=0199de2d-dc00-7000-8000-00000000a001'
+vgate_assert 11 serial-contains 'flint: clone ok stream=main changes=1'
+vgate_assert 11 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 11 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 python <<'PY'
+import json, os, sys
+
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-11.out"), errors="replace").read()
+for leaked in (
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "ab" * 32,
+):
+    if leaked in out:
+        sys.exit("FAIL: secret hex reached run-11.out")
+
+share = os.path.join(run, "sync-share")
+log_path = os.path.join(
+    share, "FLINT", "streams", "0199de2d-dc00-7000-8000-00000000a010.jsonl"
+)
+if not os.path.isfile(log_path):
+    sys.exit("missing " + log_path)
+got = open(log_path, "rb").read()
+want = open(
+    os.path.join("user", "go", "flint", "testdata", "sync", "seed-stream.jsonl"), "rb"
+).read()
+if got != want:
+    sys.exit("cloned streams/<id>.jsonl is not byte-verbatim")
+rec = json.load(
+    open(
+        os.path.join(
+            share, "FLINT", "streams",
+            "0199de2d-dc00-7000-8000-00000000a010.json",
+        ),
+        "r",
+        encoding="utf-8",
+    )
+)
+if rec.get("head") != "0199de2d-dc00-7000-8000-00000000a001":
+    sys.exit("stream record head %r != pinned change id" % rec.get("head"))
+remote = open(os.path.join(share, "FLINT", "REMOTE.json"), "r", encoding="utf-8").read()
+if '"remote":"tcp://10.0.0.2:4748"' not in remote or '"stream":"0199de2d-dc00-7000-8000-00000000a010"' not in remote:
+    sys.exit("REMOTE.json does not bind the clone: %r" % remote)
+print("run-11 clone landed verbatim raw JSONL, rolled the record head, and wrote REMOTE.json")
+PY
+
+# ---- 12: M101a — same share, fresh boot: verify --all + REMOTE.json pull -----
+vgate_run 12 -- \
+    --cvc-file '$RUN_DIR/sync-share' \
+    --virtio-fs '$RUN_DIR/sync-share' \
+    --net '$RUN_DIR/cap12.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
+    --script '$RUN_DIR/script-12.txt' \
+    --script-expect 'flint: pull up to date' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 12 serial-contains 'sig: verified'
+vgate_assert 12 serial-contains 'flint: pull up to date'
+vgate_assert 12 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 12 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 12 serial-absent '[EXC] parking:'
+
+# ---- 13: M101a refusal leg — wrong flint-remote secret → auth_failed ---------
+vgate_run 13 -- \
+    --cvc-file '$RUN_DIR/badauth-share' \
+    --virtio-fs '$RUN_DIR/badauth-share' \
+    --net '$RUN_DIR/cap13.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
+    --script '$RUN_DIR/script-13.txt' \
+    --script-expect 'flint: refuse auth_failed' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 13 serial-contains 'flint: refuse auth_failed'
+vgate_assert 13 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 13 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 13 serial-absent 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 python <<'PY'
+import os, sys
+
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-13.out"), errors="replace").read()
+for leaked in (
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "ab" * 32,
+    "cd" * 32,
+):
+    if leaked in out:
+        sys.exit("FAIL: secret hex reached run-13.out")
+
+share = os.path.join(run, "badauth-share")
+if os.path.exists(os.path.join(share, "FLINT")):
+    sys.exit("auth_failed clone wrote a store under badauth-share/FLINT")
+print("run-13 auth_failed leg wrote nothing")
 PY
