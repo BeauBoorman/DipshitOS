@@ -86,3 +86,42 @@ func ClipboardGet(max int) ([]byte, int64) {
 	copy(out, virConsoleStaging[:r])
 	return out, r
 }
+
+// ClipboardSetAll is ClipboardSet for a caller that already holds its body
+// in uaccess-valid memory (any live Go heap/stack slice is — the scheduler
+// registers the runtime's mmap'd regions as EL0 apertures, issue #1163 A1).
+// It skips the staging copy, so the kernel's own 512-byte bound — not the
+// 256-byte staging pool — is the transfer cap. The seat's host-integration
+// lane (ADR 0051, M108b) is the caller this exists for: the lane bound IS
+// the kernel bound, and halving it would be a silent fidelity loss.
+func ClipboardSetAll(p []byte) (int, int64) {
+	if len(p) == 0 {
+		// len 0 clears the clipboard; the slot still runs (with a nil
+		// pointer it never touches).
+		r := syscallFn(SlotClipboardSet, 0, 0, 0, 0)
+		if r < 0 {
+			return 0, r
+		}
+		return int(r), r
+	}
+	r := syscallFn(SlotClipboardSet, strPtr(p), uintptr(len(p)), 0, 0)
+	if r < 0 {
+		return 0, r
+	}
+	return int(r), r
+}
+
+// ClipboardGetInto is ClipboardGet for the same caller: the kernel copies
+// the current contents into buf (truncated to len(buf); the kernel clamps
+// to its own 512 too) without consuming them. Returns (copied, raw result);
+// an empty clipboard is (0, 0).
+func ClipboardGetInto(buf []byte) (int, int64) {
+	if len(buf) == 0 {
+		return 0, 0
+	}
+	r := syscallFn(SlotClipboardGet, strPtr(buf), uintptr(len(buf)), 0, 0)
+	if r < 0 {
+		return 0, r
+	}
+	return int(r), r
+}

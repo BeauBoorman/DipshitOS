@@ -343,6 +343,10 @@ func main() {
 	// count and the first notice already obeys DND.
 	configureNotifyDND(seatSettings)
 	loadNotifyHistory()
+	// M108b (#2325, ADR 0051): the host-integration lane engine. The probe
+	// reads the host-int credential once; absent is byte-silent (D7). The
+	// lane runs in BOTH seat modes — it is not demo choreography.
+	hostintSeatInit()
 	if demoMode {
 		vi.ConsoleLine(MarkerModeDemo)
 	} else {
@@ -549,6 +553,10 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
 		markRail()
 	}
+	// M108b (#2325): the lane pass runs before the chrome paint so a
+	// host-sourced clipboard write this tick is already badged on the same
+	// presented frame.
+	hostintSeatTick()
 	chromeTick(scan, ticks)
 	if launch.open {
 		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)

@@ -122,6 +122,14 @@ func rotr32(x uint32, n uint) uint32 {
 	return x>>n | x<<(32-n)
 }
 
+// SHA256Sum exports the in-tree SHA-256 (the HMAC's compression function)
+// for callers that need the bare digest — the host-integration lane's
+// never-logged markers carry sha256[:8] of a payload (ADR 0051 D2), so the
+// seat needs the same primitive HMACSHA256 already exports.
+func SHA256Sum(p []byte) [32]byte {
+	return sha256Sum(p)
+}
+
 func hmacSha256(key, msg []byte) [32]byte {
 	var k [64]byte
 	if len(key) > 64 {
