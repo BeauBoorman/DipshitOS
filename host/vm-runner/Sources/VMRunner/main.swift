@@ -10,6 +10,10 @@
 //          a fresh post-restore serial query must recover a RAM-only clipboard
 //          marker. Supports only --overlay-base/--vars/--serial/--cpus/--timeout;
 //          needs --timeout in (0,600]. See docs/hardware-contract.md.)
+//         [--data-disk <img>] (M100b, #2307, ADR 0050: a second virtio-blk
+//          function — the guest's VLFS data disk; raw RW image created if
+//          absent, blockDeviceIdentifier "virelai-vlfs", sync .full.
+//          Coexists with --overlay-base, which covers the boot disk only.)
 //          [--vz-restore-save <dir>] [--vz-restore-load <dir>] (M70g G3, #1459:
 //          restore beyond same-process — one process boots, stores the marker,
 //          saves state + the ASIF overlay + the marker into <dir> and exits;
@@ -283,6 +287,7 @@ import ScreenCaptureKit
 import Virtualization
 import VFWire
 import VMAppKit
+import VMDiskImage
 import VMGPU3D
 import VMPostmortem
 import VSNTP
@@ -361,6 +366,15 @@ var noEntropy = false
 // bulk probe is the first consumer: the guest enumerates the MSD as a third
 // XHCI device (bulk EP1 OUT/IN pair) and `usb bulk` reads the engine state.
 var usbMsdPath: String? = nil
+// M100b (issue #2307, ADR 0050 D1/D2): `--data-disk <img>` attaches a SECOND
+// virtio-blk function as the guest's VLFS data disk — a plain read-write
+// VZDiskImageStorageDeviceAttachment (never stacked; the throwaway overlay
+// covers the boot disk only) named "virelai-vlfs" via blockDeviceIdentifier,
+// synchronizationMode .full so a guest VIRTIO_BLK_T_FLUSH is a host-side
+// full sync. A missing file is created as a zero-filled 64 MiB raw image —
+// formatting is mkfs.vlfs's job, never the runner's. Off by default: without
+// the flag config.storageDevices keeps its single boot element.
+var dataDiskPath: String? = nil
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
 // VZVirtualMachineView after `--input-key-after <marker>` (default: the
@@ -998,6 +1012,9 @@ while idx < arguments.count {
         idx += 1
     } else if arg == "--usb-msd", idx + 1 < arguments.count {
         usbMsdPath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--data-disk", idx + 1 < arguments.count {
+        dataDiskPath = arguments[idx + 1]
         idx += 2
     } else if arg == "--input-key", idx + 1 < arguments.count {
         guard let kc = UInt16(arguments[idx + 1]) else {
@@ -1846,6 +1863,37 @@ do {
     }
 } catch {
     fail("Could not attach disk image '\(diskImagePath)': \(error)")
+}
+
+// M100b (issue #2307, ADR 0050 D1/D2): --data-disk appends a SECOND
+// VZVirtioBlockDeviceConfiguration in every attach mode (plain and
+// --overlay-base — the overlay covers the boot disk only; the data disk
+// itself is never stacked). It is named "virelai-vlfs" so the guest's
+// VIRTIO_BLK_T_GET_ID can tell it from the boot image, and its attachment
+// runs synchronizationMode .full so a guest FLUSH is a host-side full
+// sync. A missing file becomes a zero-filled raw image (default 64 MiB);
+// the guest then refuses mount with not_vlfs until mkfs.vlfs (M100c)
+// formats it — never the runner's or kernel's job.
+if let dataDiskPath {
+    do {
+        let prepared = try DataDisk.prepare(path: dataDiskPath)
+        try VZVirtioBlockDeviceConfiguration.validateBlockDeviceIdentifier(DataDisk.vlfsIdentifier)
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: prepared.url,
+            readOnly: false,
+            cachingMode: .automatic,
+            synchronizationMode: .full)
+        let dataDisk = VZVirtioBlockDeviceConfiguration(attachment: attachment)
+        dataDisk.blockDeviceIdentifier = DataDisk.vlfsIdentifier
+        config.storageDevices.append(dataDisk)
+        if prepared.created {
+            print("  data-disk: created zero-filled raw image \(dataDiskPath) (\(prepared.sectors) sectors)")
+        } else {
+            print("  data-disk: \(dataDiskPath) (\(prepared.sectors) sectors)")
+        }
+    } catch {
+        fail("Could not attach --data-disk image '\(dataDiskPath)': \(error)")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2741,6 +2789,9 @@ if inputMode {
 }
 if let usbMsdPath {
     print("  usb-msd: ENABLED (M43 card U6, issue #1037) — USB mass storage attached on an explicit VZXHCIControllerConfiguration (\(usbMsdPath)); the guest enumerates it as a bulk device behind the XHCI controller (the U1 bulk probe consumes it)")
+}
+if let dataDiskPath {
+    print("  data-disk: ENABLED (M100b, issue #2307, ADR 0050) — second virtio-blk function id 'virelai-vlfs', raw read-write, sync .full (\(dataDiskPath)); the guest's GET_ID probe names it")
 }
 if let kc = inputKeyCode {
     if viaVirtioEnabled {

@@ -54,6 +54,13 @@ let package = Package(
             name: "VMPostmortem",
             path: "Sources/VMPostmortem"
         ),
+        // M100b (#2307, ADR 0050): the `--data-disk` raw-image preparation
+        // (create/validate) + the `virelai-vlfs` identifier. Pure
+        // Swift/Foundation so `swift test` covers it without a VM.
+        .target(
+            name: "VMDiskImage",
+            path: "Sources/VMDiskImage"
+        ),
         .target(
             name: "VMAppKit",
             path: "Sources/VMAppKit"
@@ -71,12 +78,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "VMRunner",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D"],
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage"],
             path: "Sources/VMRunner"
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage"]
         )
     ],
     swiftLanguageModes: [.v5]

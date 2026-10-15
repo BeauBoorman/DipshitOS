@@ -41,5 +41,11 @@ zig test user/src/sexiburger.zig
 zig test kernel/src/tombstone.zig
 zig test user/src/ld.zig
 
+# M100b (#2307): same pattern for the virtio-blk data-disk transport — a
+# kernel module reached through main.zig whose test blocks (request-chain
+# shapes, GET_ID identity match, named refusals) run on the host. A direct
+# run keeps the coverage without claiming build.zig (held by M100c #2308).
+zig test kernel/src/virtio_blk.zig
+
 echo "verify-unit-tests: all unit tests passed"
 exit 0
