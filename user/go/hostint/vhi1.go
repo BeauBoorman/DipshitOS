@@ -46,12 +46,10 @@ const (
 	// HMAC key verbatim (no decoding — the agentd `a5`x32 precedent).
 	SecretName = "host-int"
 
-	// CanonDir is the lane directory in shell-canonical form (what
-	// vi.ListDirAt takes); HostDir is the same directory in kernel path
-	// form (what the file ops take). The runner serves it as
+	// HostDir is the lane directory in kernel path form — what the slot-27
+	// dir_list window and the file ops take. The runner serves it as
 	// <share>/HOSTINT/.
-	CanonDir = "/HOSTINT"
-	HostDir  = "/host/HOSTINT"
+	HostDir = "/host/HOSTINT"
 )
 
 // Record tags (direction is in the tag; each tag's consumer is fixed).

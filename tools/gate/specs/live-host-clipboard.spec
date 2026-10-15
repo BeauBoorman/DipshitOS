@@ -3,16 +3,25 @@
 #
 # Run 01 is the full journey: the seat adopts the runner's ARMED, a
 # marker-timed host pasteboard write lands in the guest clipboard (seat
-# applies CLIP_IN through slot 38, the tray badge flips host-marked), a
-# monitor `clip` write crosses the other way (seat emits CLIP_OUT, runner
-# mirrors to the NAMED pasteboard -- never .general), and two planted
-# records prove the MAC/epoch refusals live. Run 02 is the flags-off
-# posture: the same credentialed share, no --host-clipboard -- byte-silent
-# both directions, no HOSTINT/ created.
+# applies CLIP_IN through slot 38, the badge flips host-marked, a `clip`
+# read proves the bytes), THEN a monitor `clip` write crosses the other
+# way (seat emits CLIP_OUT, runner mirrors to the NAMED pasteboard --
+# never .general), and two planted records prove the MAC/epoch refusals
+# live. The ordering is load-bearing: the guest write rides the seat's
+# post-apply diff so `clip-ind host` and `clip-ind local` are BOTH
+# observed transitions, not a race — and NO -after/expect marker carries
+# payload bytes (the runner echoes its marker flags verbatim, so a marker
+# containing the text would self-trip the never-logged check).
+#
+# Run 02 is the flags-off posture: the same credentialed share shape on a
+# clean dir, no --host-clipboard -- byte-silent both directions, no
+# HOSTINT/ created.
 #
 # The credential rides the share's SECRETS.TXT, bound to GOTABWM.ELF (the
 # ADR 0024 D8 app binding: uid_system-owned in OWNERS.TXT, 644). The seat
-# is exec'd explicitly (wm=none) so the choreography times off its markers.
+# is exec'd explicitly (wm=none) so the choreography times off its
+# markers, and --screen arms the virtio-gpu the seat's WmctlRegister
+# requires (headless boots get ENXIO — the go-wm-seat shape).
 #
 # HOST PREREQ:
 #   bash tools/go/build-gotabwm.sh  -> .build/go/GOTABWM.ELF
@@ -26,11 +35,18 @@ vgate_file script-seat.txt <<'EOF'
 exec GOTABWM.ELF
 EOF
 
+# The read-back AND the guest write ride ONE burst gated on the seat's
+# apply marker: `clip` prints the host text (h->g proven), then `clip
+# gate-guest-copy-77` stores the local write the next seat diff carries
+# out as CLIP_OUT (g->h, with clip-ind flipping host->local).
 vgate_file script-clip.txt <<'EOF'
+clip
 clip gate-guest-copy-77
 EOF
 
-vgate_file script-paste.txt <<'EOF'
+# The post-emit read: proves the buffer holds the guest text when the
+# CLIP_OUT is in flight (the runner's echo guard must NOT bounce it back).
+vgate_file script-read.txt <<'EOF'
 clip
 EOF
 
@@ -68,17 +84,40 @@ open(os.path.join(share, "HOSTINT", "CLIPIN-00000077"), "wb").write(
 open(os.path.join(share, "HOSTINT", "CLIPIN-00000088"), "wb").write(
     rec(2, 0, 0x88, 1, b"forged-plant", "wrongkey" * 8))
 open(os.path.join(run, "key-sentinel.txt"), "w").write(KEY + "\n")
-print("staged hostint share (GOTABWM + host-int credential + 2 refusal plants)")
+# Run 02's flags-off posture needs a share the lane flag never touched:
+# the runner owns HOSTINT/ creation, so a boot on THIS directory with no
+# flag proves byte-silence while still holding the same credential, seat
+# binary and wm=none posture the armed run uses. The main share cannot
+# prove it — the refusal plants above live in its HOSTINT/ already.
+# (go-agentd.spec runs 07/08 are the same alternate-share pattern.)
+off = os.path.join(run, "off-share")
+os.makedirs(off, exist_ok=True)
+shutil.copy(src, os.path.join(off, "GOTABWM.ELF"))
+open(os.path.join(off, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
+open(os.path.join(off, "SECRETS.TXT"), "w").write(
+    "#v1\n" + "host-int\t1000\t" + KEY + "\tGOTABWM.ELF\n")
+open(os.path.join(off, "OWNERS.TXT"), "w").write(
+    "#v1\nGOTABWM.ELF\t644\t0\t-\n")
+print("staged hostint share (GOTABWM + host-int credential + 2 refusal plants)"
+      " + flags-off share")
 PY
 
 # ---- 01: both directions + refusal proofs, one boot -----------------------------
+# --screen arms the virtio-gpu: without it WmctlRegister answers ENXIO and
+# the seat dies before the lane exists (every gotabwm spec boots this way).
+# The chain is strictly marker-ordered: inject on the armed marker; one
+# burst after `clip-in seq=1` reads the applied host text THEN stores the
+# guest write; a last read after `clip-out seq=1` ends the run on the
+# guest text — the 6 s tail covers the runner's 250 ms drain to the named
+# pasteboard.
 vgate_run 01 -- \
+    --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script-seat.txt' \
-    --script2 '$RUN_DIR/script-clip.txt' --script2-after 'gotabwm: hostint armed' \
-    --script3 '$RUN_DIR/script-paste.txt' --script3-after 'gotabwm: hostint clip-in seq=1' \
+    --script2 '$RUN_DIR/script-clip.txt' --script2-after 'gotabwm: hostint clip-in seq=1' \
+    --script3 '$RUN_DIR/script-read.txt' --script3-after 'gotabwm: hostint clip-out seq=1' \
     --host-clipboard --host-pasteboard 'virelai-gate-clip' \
     --host-clip-in 'gate-host-copy-88' --host-clip-in-after 'gotabwm: hostint armed' \
-    --script-expect 'clip: gate-host-copy-88' --script-expect-tail 6 --timeout 240
+    --script-expect 'clip: gate-guest-copy-77' --script-expect-tail 6 --timeout 240
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 01 serial-contains 'exec: loaded GOTABWM.ELF'
@@ -94,19 +133,22 @@ vgate_assert 01 serial-absent 'stale-epoch-plant'
 vgate_assert 01 serial-absent 'forged-plant'
 # h->g: the inject fired on the armed marker, the seat applied CLIP_IN
 # through slot 38, and the badge flipped host-marked. `clip` reads it back.
+# The sha256[:8] digests are pinned — the payload is a fixed string, so the
+# digest IS the content proof (the text itself is asserted on serial only,
+# where the guest's own read-back legitimately prints it).
 vgate_assert 01 output-contains 'host-clip: inject len=17'
-vgate_assert 01 output-contains 'host-clip: in seq=1 sha256='
-vgate_assert 01 output-contains 'truncated=0'
-vgate_assert 01 serial-contains 'gotabwm: hostint clip-in seq=1 len=17 truncated=0'
+vgate_assert 01 output-contains 'host-clip: in seq=1 sha256=107ea696 len=17 truncated=0'
+vgate_assert 01 serial-contains 'gotabwm: hostint clip-in seq=1 len=17 sha=107ea696 truncated=0'
 vgate_assert 01 serial-contains 'gotabwm: hostint clip-ind host'
 vgate_assert 01 serial-contains 'clip: gate-host-copy-88'
 # g->h: the monitor `clip` write was observed on the seat's slot-39 poll,
-# emitted as CLIP_OUT, and mirrored to the named pasteboard.
+# emitted as CLIP_OUT, and mirrored to the named pasteboard; the post-emit
+# read shows the buffer holding the guest text (no echo bounce).
 vgate_assert 01 serial-contains 'clip: stored 18 bytes'
-vgate_assert 01 serial-contains 'gotabwm: hostint clip-out seq=1 len=18'
+vgate_assert 01 serial-contains 'gotabwm: hostint clip-out seq=1 len=18 sha=09a691a7'
 vgate_assert 01 serial-contains 'gotabwm: hostint clip-ind local'
-vgate_assert 01 output-contains 'host-clip: out seq=1 sha256='
-vgate_assert 01 output-contains 'len=18'
+vgate_assert 01 output-contains 'host-clip: out seq=1 sha256=09a691a7 len=18'
+vgate_assert 01 serial-contains 'clip: gate-guest-copy-77'
 vgate_assert 01 serial-absent '[EXC] parking:'
 # The credential never reaches serial or runner stdout.
 vgate_assert 01 serial-absent 'clipkey0clipkey0'
@@ -128,15 +170,15 @@ print("run-01 lane hygiene ok")
 PY
 
 # ---- 02: flags-off is byte-silent ------------------------------------------------
-# Same credential+share posture, no lane flag: the runner never creates
-# HOSTINT/, never writes a record, never reads a pasteboard; the seat's
-# once-per-tick listing sees a directory that never exists -- one cheap
-# ENOENT per tick, zero lane markers either end. (The planted CLIPIN files
-# from run 01's setup are staged into THIS share too by vgate_setup_python
-# -- they sit unread in a runner-side dir the share never has, since the
-# runner owns HOSTINT creation; the seat's ListDirAt of /HOSTINT answers
-# ENOENT because the host folder itself was never created here.)
+# Same credential+seat posture on a CLEAN share (setup seeds off-share
+# with GOTABWM.ELF + wm=none + the host-int row), no lane flag: the
+# runner never creates HOSTINT/, never writes a record, never reads a
+# pasteboard; the seat's once-per-tick listing sees a directory that
+# never exists -- one cheap ENOENT per tick, zero lane markers either
+# end. The seat still registers and reports live (the lane is not a seat
+# precondition), so --screen arms the gpu exactly as run 01.
 vgate_run 02 -- \
+    --screen '$RUN_DIR/screen-02' \
     --cvc-file '$RUN_DIR/off-share' \
     --script '$RUN_DIR/script-seat.txt' \
     --script-expect 'gotabwm: mode live' --script-expect-tail 10 --timeout 180

@@ -30,15 +30,28 @@ var hostintEngine *hostint.Engine
 // production values wire the engine to the real file channel and console.
 var (
 	hostintSecretGet = shlib.StoreGet
-	hostintListDir   = func() ([]vi.DirItem, bool) {
-		items, err := vi.ListDirAt(hostint.CanonDir)
-		if err == nil {
-			return items, false
+	// The lane dir rides the --cvc-file channel (queue 5), so the listing
+	// is slot-27 sys_dir_list — vi.ListDirAt's slot-79 snapshot needs the
+	// virtio_fs backend, which is ContainmentUnavailable on this share.
+	// The 16-row window is within the lane's own bound (≤ MaxOutstanding
+	// per tag + the handshake, and consumers delete on sight, so a fuller
+	// directory still drains a page per tick). ENOENT — a missing dir or a
+	// channel that is not there — is the flags-off steady state: silent.
+	hostintListDir = func() ([]vi.DirItem, bool) {
+		var rows [vi.MaxDirEntries]vi.DirEntry
+		n, rc := vi.DirList(hostint.HostDir, rows[:])
+		if rc < 0 {
+			return nil, rc == -vi.ErrENOENT
 		}
-		if err.Error() == "ENOENT" {
-			return nil, true // the flags-off steady state — silent
+		items := make([]vi.DirItem, 0, n)
+		for i := 0; i < n; i++ {
+			items = append(items, vi.DirItem{
+				Name:  rows[i].NameString(),
+				IsDir: rows[i].Dir(),
+				Size:  uint64(rows[i].Size),
+			})
 		}
-		return nil, false
+		return items, false
 	}
 	hostintReadFile = func(name string) ([]byte, int64) {
 		// RecordMax+1 so an oversize lane file is visibly oversize to

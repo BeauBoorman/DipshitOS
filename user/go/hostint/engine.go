@@ -24,7 +24,7 @@ import "virelai/vi"
 // (the engine joins it to the directory for the caller's benefit — the
 // seat's real seams glue it to /host/HOSTINT/ there).
 type EngineIO struct {
-	// List returns the lane directory's entries (vi.ListDirAt on CanonDir).
+	// List returns the lane directory's entries (vi.DirList on HostDir).
 	// (items, false) is a listing, (nil, true) is "the directory does not
 	// exist" — the flags-off steady state, silent — and (nil, false) is a
 	// real channel failure, which is an io_error refusal.
