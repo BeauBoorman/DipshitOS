@@ -1,10 +1,11 @@
 # live-gobuild.spec -- M107a (issue #2318) class-B gate: the in-guest build
-# driver. GOBUILD.ELF (user/go/gobuild) walks a multi-package program's import
-# graph in the guest, writes each package a -importcfg, and drives the guest's
-# own GOCMDCOMPILE.ELF once per package plus GOCMDLINK.ELF once — children
-# sequenced by spawn-and-wait with the B1 stream request binding each child's
-# fd-1 stream to a capture file, so compiler diagnostics land in
-# WSP/.BUILD/*.diag and aggregate into WSP/.BUILD/ERRORS.TXT.
+# driver, plus the M107b (#2319) refusal surface. GOBUILD.ELF (user/go/gobuild)
+# walks a multi-package program's import graph in the guest, writes each
+# package a -importcfg, and drives the guest's own GOCMDCOMPILE.ELF once per
+# package plus GOCMDLINK.ELF once — children sequenced by spawn-and-wait with
+# the B1 stream request binding each child's fd-1 stream to a capture file, so
+# compiler diagnostics land in WSP/.BUILD/*.diag and aggregate into
+# WSP/.BUILD/ERRORS.TXT.
 #
 # The fixture proves the card's acceptance and the card's three prerequisite
 # measurements at once: main + FIVE local packages (six sequential compiles
@@ -13,17 +14,27 @@
 # strings) resolved to staged GPKG_*.a archives, all under NESTED share paths
 # (/host/WSP/<pkg>/*.go) — the nested-share proof the review notes asked for.
 #
-# TWO boots, same reason as live-selfhost-go: the product's run is a separate
-# monitor exec so a build boot never has to host the loop's children AND the
-# product at once.
+# M107b adds runs 04-05: the named refusals. The staged artifacts are now the
+# REAL ones — .build/go/selfhost/{GOIMPORT.CFG,GOPKGS.TXT,GPKG_*.a} written by
+# tools/go/stage-selfhost.sh from tools/go/pkg-table.txt — so a denied package
+# refuses dep_unsupported against the shipped table (run 04) and an over-cap
+# local closure refuses closure_too_large before a single child spawns
+# (run 05). Both refuse in the graph phase, so no compile line may appear.
+#
+# TWO boots for the build+run, same reason as live-selfhost-go: the product's
+# run is a separate monitor exec so a build boot never has to host the loop's
+# children AND the product at once. The refusal runs need no product boot.
 #
 # HOST PREREQUISITE (fails the gate honestly when missing):
-#   bash tools/go/build-gobuild.sh  -> .build/go/GOBUILD.ELF
-#   bash tools/go/build-gotool.sh   -> .build/go/GOCMD*.ELF
+#   bash tools/go/build-gobuild.sh   -> .build/go/GOBUILD.ELF
+#   bash tools/go/build-gotool.sh    -> .build/go/GOCMD*.ELF
+#   bash tools/go/stage-selfhost.sh  -> .build/go/selfhost/{GOIMPORT.CFG,
+#                                       GOPKGS.TXT,GPKG_*.a}
 # exec-order: assert-proven -- run 01 ends on a marker only the driver prints
 # after its last child exits, and its asserts read the driver's own step
-# lines; run 02 ends on the product's pinned output. A driver that never ran
-# cannot go green. See tools/gate/SPEC.md.
+# lines; run 02 ends on the product's pinned output; runs 03-05 end on the
+# driver's own FAIL marker with asserts that read driver-produced text only.
+# A driver that never ran cannot go green. See tools/gate/SPEC.md.
 
 vgate_name live-gobuild "issue #2318 M107a: the guest builds a 6-package program with its own toolchain and the product runs"
 vgate_share seed
@@ -42,8 +53,16 @@ vgate_file script3.txt <<'EOF'
 exec GOBUILD.ELF /host/BAD
 EOF
 
+vgate_file script4.txt <<'EOF'
+exec GOBUILD.ELF /host/DENIED
+EOF
+
+vgate_file script5.txt <<'EOF'
+exec GOBUILD.ELF /host/OVERCAP
+EOF
+
 vgate_setup_python <<'PY'
-import os, re, shutil, subprocess, sys
+import os, shutil, sys
 share = os.path.join(os.environ["RUN_DIR"], "share")
 repo = os.getcwd()
 fixtures = [".build/go/GOBUILD.ELF", ".build/go/GOCMDCOMPILE.ELF", ".build/go/GOCMDLINK.ELF"]
@@ -53,6 +72,28 @@ for src in fixtures:
                  "bash tools/go/build-gobuild.sh, bash tools/go/build-gotool.sh" % src)
     shutil.copy(src, os.path.join(share, os.path.basename(src)))
     print("staged %s (%d bytes)" % (os.path.basename(src), os.path.getsize(src)))
+
+# --- the REAL staged surface (M107b): the manifest, the package table and ---
+# the GPKG_*.a archives exactly as tools/go/stage-selfhost.sh wrote them from
+# tools/go/pkg-table.txt. The WSP fixture's std imports (strconv, strings) are
+# inside the allowlist closure; the driver's resolution order and the refusal
+# oracle are what a real in-guest build sees, not a spec-local mirror.
+selfhost = os.path.join(repo, ".build", "go", "selfhost")
+for need in ("GOIMPORT.CFG", "GOPKGS.TXT"):
+    if not os.path.exists(os.path.join(selfhost, need)):
+        sys.exit(".build/go/selfhost/%s missing — stage it first "
+                 "(see this spec's header): bash tools/go/stage-selfhost.sh" % need)
+n_arch = total = 0
+for name in sorted(os.listdir(selfhost)):
+    if name.startswith("GPKG_") and name.endswith(".a") or \
+       name in ("GOIMPORT.CFG", "GOPKGS.TXT"):
+        src = os.path.join(selfhost, name)
+        shutil.copy(src, os.path.join(share, name))
+        total += os.path.getsize(src)
+        if name.endswith(".a"):
+            n_arch += 1
+print("staged %d archives + GOIMPORT.CFG + GOPKGS.TXT from "
+      ".build/go/selfhost (%.2f MiB)" % (n_arch, total / 1048576.0))
 
 # --- the workspace: main + five local packages + two std imports -----------
 # Nested share paths under /host/WSP/<pkg>/ — itself the nested-path evidence
@@ -120,62 +161,44 @@ for rel, body in BAD.items():
     with open(path, "w") as f:
         f.write(body)
 
-# --- the staged archive manifest --------------------------------------------
-# The driver's resolution order needs /host/GOIMPORT.CFG + GPKG_*.a archives
-# naming the fixture's WHOLE std closure (the linker walks transitively), the
-# same layout tools/go/stage-selfhost.sh writes for the pinned hello. The
-# closure comes from the fork toolchain's `go list -export -deps` over a
-# GOPATH mirror of the fixture (import paths identical: "helper", "join", ...).
-gopath = os.path.join(os.environ["RUN_DIR"], "gopath")
-for rel, body in WSP.items():
-    # GOPATH src layout: local packages live at src/<name>; the main package
-    # gets its own dir as import path "wsp" (a command). Same sources, so the
-    # closure `go list` computes is the closure the guest's link walks.
-    dst = os.path.join(gopath, "src", "wsp", "main.go") if rel == "main.go" \
-        else os.path.join(gopath, "src", rel)
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with open(dst, "w") as f:
+# The DENIED workspace for run 04: a program importing crypto/x509 — a real
+# std package the GOOS=virelai port cannot build (no system cert-root store)
+# and GOPKGS.TXT therefore carries as `denied`. The refusal must be the
+# driver's named dep_unsupported — the package and the table's reason on the
+# console and in ERRORS.TXT — not a toolchain panic, and no compile child may
+# spawn at all.
+DENIED = {
+  "main.go": """package main
+import "crypto/x509"
+func main() { _ = x509.ErrUnsupportedAlgorithm }
+""",
+}
+for rel, body in DENIED.items():
+    path = os.path.join(share, "DENIED", rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         f.write(body)
 
-fork = os.environ.get("GO_FORK_DIR") or os.path.join(os.path.dirname(repo), "go-virelai")
-go = os.path.join(fork, "bin", "go")
-if not os.path.exists(go):
-    sys.exit("missing fork toolchain at %s — provision once with: "
-             "bash tools/go/apply.sh && just go-toolchain" % go)
-env = dict(os.environ, GOROOT=fork, GOTOOLCHAIN="local", GO111MODULE="off",
-           CGO_ENABLED="0", GOOS="virelai", GOARCH="arm64", GOPATH=gopath)
-out = subprocess.run(
-    [go, "list", "-export", "-deps", "-f", "{{.ImportPath}}|{{.Export}}", "wsp"],
-    env=env, capture_output=True, text=True)
-if out.returncode != 0:
-    sys.exit("go list -export -deps wsp failed:\n" + out.stderr)
-lines = [l for l in out.stdout.splitlines() if l.strip()]
-prefix = "GPKG_"
-cfg = ["# staged by live-gobuild.spec setup — the stage-selfhost.sh layout"]
-total = 0
-indexed = 0
-for line in lines:
-    path, _, export = line.partition("|")
-    if path in ("wsp", "helper", "join", "punct", "shout", "twice"):
-        continue  # local packages are built in-guest, never staged
-    if not export:
-        if path != "unsafe":
-            sys.exit("%s has no export data (run `go install std`)" % path)
-        continue
-    name = prefix + re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_") + ".a"
-    if len(name) > 31:  # file_table.zig's share-name bound (stage-selfhost rule)
-        name = "%s%02d.a" % (prefix, indexed)
-        indexed += 1
-    shutil.copyfile(export, os.path.join(share, name))
-    cfg.append("packagefile %s=/host/%s" % (path, name))
-    total += os.path.getsize(export)
-with open(os.path.join(share, "GOIMPORT.CFG"), "w") as f:
-    f.write("\n".join(cfg) + "\n")
-print("staged %d std archives (%.2f MiB) + GOIMPORT.CFG" % (len(cfg) - 1, total / 1048576.0))
+# The OVERCAP workspace for run 05: main plus 64 local packages — 65 locals,
+# one past the driver's 64-package cap. The graph phase must refuse
+# closure_too_large BEFORE any compile child spawns; the cap exists so a
+# pathological closure cannot spend the boot budget on sequential
+# GOCMDCOMPILE.ELF children.
+imports = "\n".join('\t_ "p%02d"' % i for i in range(64))
+os.makedirs(os.path.join(share, "OVERCAP"), exist_ok=True)
+with open(os.path.join(share, "OVERCAP", "main.go"), "w") as f:
+    f.write("package main\nimport (\n%s\n)\nfunc main() {}\n" % imports)
+for i in range(64):
+    d = os.path.join(share, "OVERCAP", "p%02d" % i)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "p.go"), "w") as f:
+        f.write("package p%02d\nvar V int\n" % i)
+print("wrote DENIED + OVERCAP fixtures (1 and 65 files)")
 
 # Stale products must not let a broken driver go green (same rule as
 # live-selfhost-go's HELLO.o/HELLO2.ELF sweep).
-for stale in ("WSPPROG.ELF", "WSP/.BUILD", "BAD/.BUILD"):
+for stale in ("WSPPROG.ELF", "WSP/.BUILD", "BAD/.BUILD",
+              "DENIED/.BUILD", "OVERCAP/.BUILD"):
     p = os.path.join(share, stale)
     if os.path.isdir(p):
         shutil.rmtree(p)
@@ -268,3 +291,39 @@ vgate_assert 03 serial-contains 'gobuild: FAIL'
 vgate_assert 03 serial-absent '[EXC] parking:'
 vgate_assert 03 serial-absent 'cannot allocate memory'
 vgate_assert 03 share-contains 'BAD/.BUILD/ERRORS.TXT' 'bad.go'
+
+# Run 04 (M107b): the named refusal for a denied package. DENIED imports
+# crypto/x509, which GOPKGS.TXT carries as `denied` — the driver must print
+# dep_unsupported naming the package and the table's reason, land the same
+# in ERRORS.TXT, and never spawn a compile child. `serial-absent` on the
+# compile line is the proof the refusal happened in the graph phase.
+vgate_run 04 -- --script '$RUN_DIR/script4.txt' --script-expect 'gobuild: FAIL' --timeout 120
+
+vgate_assert 04 serial-contains 'exec: loaded GOBUILD.ELF'
+vgate_assert 04 serial-contains 'dep_unsupported'
+vgate_assert 04 serial-contains 'crypto/x509'
+vgate_assert 04 serial-contains 'cert-root'
+vgate_assert 04 serial-contains 'gobuild: FAIL'
+vgate_assert 04 serial-absent 'gobuild: compile '
+vgate_assert 04 serial-absent 'gobuild: link '
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent 'cannot allocate memory'
+vgate_assert 04 serial-absent 'panic:'
+vgate_assert 04 share-contains 'DENIED/.BUILD/ERRORS.TXT' 'dep_unsupported'
+vgate_assert 04 share-contains 'DENIED/.BUILD/ERRORS.TXT' 'crypto/x509'
+
+# Run 05 (M107b): the package cap. OVERCAP is main + 64 local packages = 65
+# locals > the driver's 64 cap; the refusal is closure_too_large before a
+# single GOCMDCOMPILE.ELF spawn — a pathological closure must not get to
+# spend the boot budget on sequential compiles.
+vgate_run 05 -- --script '$RUN_DIR/script5.txt' --script-expect 'gobuild: FAIL' --timeout 120
+
+vgate_assert 05 serial-contains 'exec: loaded GOBUILD.ELF'
+vgate_assert 05 serial-contains 'closure_too_large'
+vgate_assert 05 serial-contains 'cap 64'
+vgate_assert 05 serial-contains 'gobuild: FAIL'
+vgate_assert 05 serial-absent 'gobuild: compile '
+vgate_assert 05 serial-absent 'gobuild: link '
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'cannot allocate memory'
+vgate_assert 05 share-contains 'OVERCAP/.BUILD/ERRORS.TXT' 'closure_too_large'

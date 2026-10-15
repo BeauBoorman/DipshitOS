@@ -22,8 +22,10 @@ func init() {
 // rather than a shlib builtin keeps the driver's blast radius out of the
 // shell — the card's review-note recommendation).
 //
-//	gobuild [build] <dir> [-o OUT.ELF] [-importcfg CFG]...  compile + link
-//	gobuild graph <dir> [-importcfg CFG]...                 resolve + print order
+//	gobuild [build] <dir> [-o OUT.ELF] [-importcfg CFG]... [-pkgdb TBL]...
+//	                                                        compile + link
+//	gobuild graph <dir> [-importcfg CFG]... [-pkgdb TBL]...  resolve + print
+//	                                                        order
 func main() {
 	rc := run(vi.Args())
 	// Yield a tick before exiting so a parent shell polling vi.Wait blocks
@@ -58,6 +60,12 @@ func run(argv []string) int {
 			}
 			i++
 			cfg.Importcfg = append(cfg.Importcfg, args[i])
+		case "-pkgdb":
+			if i+1 >= len(args) {
+				return usage("-pkgdb needs a path")
+			}
+			i++
+			cfg.PkgDB = append(cfg.PkgDB, args[i])
 		default:
 			if strings.HasPrefix(args[i], "-") {
 				return usage("unknown flag " + args[i])
@@ -72,6 +80,9 @@ func run(argv []string) int {
 	if len(cfg.Importcfg) == 0 {
 		cfg.Importcfg = []string{"/host/GOIMPORT.CFG"}
 	}
+	if len(cfg.PkgDB) == 0 {
+		cfg.PkgDB = []string{"/host/GOPKGS.TXT"}
+	}
 
 	if verb == "graph" {
 		return runGraph(cfg)
@@ -81,8 +92,8 @@ func run(argv []string) int {
 
 func usage(why string) int {
 	vsys.Println("gobuild: " + why)
-	vsys.Println("gobuild: usage: gobuild [build] <dir> [-o OUT.ELF] [-importcfg CFG]")
-	vsys.Println("gobuild:        gobuild graph <dir> [-importcfg CFG]")
+	vsys.Println("gobuild: usage: gobuild [build] <dir> [-o OUT.ELF] [-importcfg CFG] [-pkgdb TBL]")
+	vsys.Println("gobuild:        gobuild graph <dir> [-importcfg CFG] [-pkgdb TBL]")
 	return 2
 }
 
@@ -90,7 +101,9 @@ func usage(why string) int {
 // No toolchain children — it is the cheap half of the driver's story.
 func runGraph(cfg Config) int {
 	archives, diags := loadArchives(cfg.Importcfg)
-	g := ImportGraph(cfg.Dir, archives)
+	table, tdiags := loadPkgTable(cfg.PkgDB)
+	diags = append(diags, tdiags...)
+	g := ImportGraph(cfg.Dir, archives, table)
 	diags = append(diags, g.Diags...)
 	for _, p := range g.Order {
 		vsys.Println("gobuild: order " + p.Path + " (" + pkgKind(p) +

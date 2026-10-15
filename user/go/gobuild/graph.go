@@ -45,12 +45,26 @@ type Graph struct {
 	Diags    []Diag
 }
 
+// maxLocalPackages bounds the sequential compiles ONE build can spawn. Every
+// local package is a GOCMDCOMPILE.ELF child (~2 s measured for the pinned
+// hello) run spawn-and-wait, so the cap is about total work inside the class-B
+// boot budget and about a pathological closure outrunning the idle reaper
+// that frees task slots between children (max_tasks = 16; exec refuses
+// ENOSPC when the pool is full) — not about concurrency, which never exceeds
+// one child in flight. 64 is ~10x the largest proven in-guest build
+// (live-gobuild's six local packages) and bounds the sortLocal recursion and
+// the .BUILD sprawl at the same time; the driver's DFS depth stays trivial
+// inside its heap-grown goroutine stacks regardless (task_stack_size 192 KiB
+// is the kernel's per-task stack, untouched by EL0 code).
+const maxLocalPackages = 64
+
 // Resolution contract, pinned by the card: an import resolves against the
-// program directory first (a local package to compile), then the staged
-// archive manifest (a prebuilt .a to link). The staged-std-source tier the
-// card names between them is M107b's staging-layout decision; the resolver
-// is ordered so that tier slots in here when it exists.
-func (g *Graph) resolve(imp Import, archives map[string]string) {
+// program directory first (a local package to compile), then the package
+// table's denylist (a policy refusal beats a stale archive — fail closed),
+// then the staged archive manifest (a prebuilt .a to link). M107b ruled out
+// a std-from-source tier, so a KNOWN package with no archive is refused as
+// dep_unsupported and a path in no table at all is no_package.
+func (g *Graph) resolve(imp Import, archives map[string]string, table map[string]pkgRow) {
 	switch {
 	case imp.Path == "unsafe":
 		return // the compiler knows it intrinsically; never an archive
@@ -66,8 +80,31 @@ func (g *Graph) resolve(imp Import, archives map[string]string) {
 		}
 		return
 	}
+	if row, ok := table[imp.Path]; ok && row.denied {
+		// The refusal's name goes in the message: ERRORS.TXT renders
+		// file:line:col: msg, so the named refusal must live in the text
+		// for the console and the file to carry it identically.
+		msg := "dep_unsupported: package " + strconv.Quote(imp.Path) +
+			" is not supported on GOOS=virelai"
+		if row.reason != "" {
+			msg += ": " + row.reason
+		}
+		g.Diags = append(g.Diags, Diag{Code: "dep_unsupported", File: imp.File,
+			Line: imp.Line, Col: imp.Col, Msg: msg})
+		return
+	}
 	if a, ok := archives[imp.Path]; ok {
 		g.Packages[imp.Path] = &Package{Path: imp.Path, Archive: a}
+		return
+	}
+	if _, ok := table[imp.Path]; ok {
+		// A real package — in the universe — that simply has no archive
+		// staged for it. This is the refusal M107b names: the fix is an
+		// `allow` line in pkg-table.txt, not overlay work.
+		g.Diags = append(g.Diags, Diag{Code: "dep_unsupported", File: imp.File,
+			Line: imp.Line, Col: imp.Col,
+			Msg: "dep_unsupported: package " + strconv.Quote(imp.Path) +
+				" is not supported on GOOS=virelai: no staged archive"})
 		return
 	}
 	g.Diags = append(g.Diags, Diag{Code: "no_package", File: imp.File,
@@ -79,8 +116,11 @@ func (g *Graph) resolve(imp Import, archives map[string]string) {
 // ImportGraph scans dir's package (which must be `package main`), walks the
 // import graph under it, and returns the closure in build order. Failures
 // arrive as Diags — never as a thrown error — so `gobuild graph` and the
-// ERRORS.TXT writer see the same structured facts.
-func ImportGraph(dir string, archives map[string]string) *Graph {
+// ERRORS.TXT writer see the same structured facts. The walk stops cold at
+// maxLocalPackages local packages: the cap exists to refuse a pathological
+// closure BEFORE it spends the boot budget on hundreds of sequential
+// compile children.
+func ImportGraph(dir string, archives map[string]string, table map[string]pkgRow) *Graph {
 	g := &Graph{Dir: dir, Packages: map[string]*Package{}}
 	main := &Package{Path: "main", Dir: dir, Local: true}
 	g.Packages["main"] = main
@@ -93,16 +133,27 @@ func ImportGraph(dir string, archives map[string]string) *Graph {
 
 	// Resolve + recurse breadth-first: a local import discovered while
 	// loading P enqueues P's resolution AFTER its files are parsed, which
-	// keeps diagnostics ordered by discovery.
+	// keeps diagnostics ordered by discovery. locals counts every local
+	// package including main — each is one compile child the build will run.
+	locals := 1
 	queue := []*Package{main}
 	for len(queue) > 0 {
 		p := queue[0]
 		queue = queue[1:]
 		for _, imp := range p.Imports {
 			before := len(g.Packages)
-			g.resolve(imp, archives)
+			g.resolve(imp, archives, table)
 			if len(g.Packages) > before {
 				if np := g.Packages[imp.Path]; np.Local {
+					locals++
+					if locals > maxLocalPackages {
+						g.Diags = append(g.Diags, Diag{Code: "closure_too_large",
+							File: imp.File, Line: imp.Line, Col: imp.Col,
+							Msg: "closure_too_large: local package closure " +
+								strconv.Itoa(locals) + " > cap " +
+								strconv.Itoa(maxLocalPackages)})
+						return g // refuse before a single child is spawned
+					}
 					g.load(np)
 					queue = append(queue, np)
 				}

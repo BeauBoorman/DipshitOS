@@ -7,12 +7,14 @@
 // an in-process library call (ADR 0035 amendment 6).
 //
 // Package resolution order is pinned by the card: the program's own directory
-// first (import "x" -> <dir>/x/*.go), then the staged package archives an
-// importcfg manifest names (the /host/GOIMPORT.CFG + GPKG_*.a layout
-// tools/go/stage-selfhost.sh already establishes). There is deliberately no
-// in-guest std-from-source stage in v1 — dep-closure policy and staging
-// layout are M107b's (#2319); an import that resolves under neither rule is
-// refused with a no_package diagnostic naming it, which is the seam.
+// first (import "x" -> <dir>/x/*.go), then the package table's denylist
+// (a policy refusal beats a stale archive), then the staged package archives
+// an importcfg manifest names (the /host/GOIMPORT.CFG + GPKG_*.a layout
+// tools/go/stage-selfhost.sh establishes from tools/go/pkg-table.txt). There
+// is no in-guest std-from-source tier — M107b (#2319) ruled it out. The named
+// refusals are M107b's half of the surface: dep_unsupported for a known
+// package with no staged archive (or a denied one), no_package for a path in
+// no table, closure_too_large past the 64-local-package cap, import_cycle.
 //
 // Diagnostics are the card's other half. A child's stderr reaches the parent
 // through the B1 exec stream request (kernel/src/file_table.zig
