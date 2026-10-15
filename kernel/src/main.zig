@@ -39,6 +39,12 @@ const csprng = @import("csprng.zig");
 // Pre-exit discovery, post-MMU re-arm, MAC via VIRTIO_NET_F_MAC, TX on
 // queue 1 with a polled used-ring drain; RX is card N2.
 const virtio_net = @import("virtio_net.zig");
+// M100b (issue #2307, ADR 0050): the virtio-blk transport returns as the
+// VLFS data-disk path — clean-slate, not the deleted FAT-era driver. The
+// runner's `--data-disk` attach adds a second DID-0x1042 function named
+// `virelai-vlfs` via blockDeviceIdentifier; VIRTIO_BLK_T_GET_ID is the
+// identity wire. Pre-exit scan/cap-resolution, post-MMU re-arm + GET_ID.
+const virtio_blk = @import("virtio_blk.zig");
 // Milestone six card G1 (claim 6053): virtio-gpu transport + framebuffer
 // (the runner's VZVirtioGraphicsDeviceConfiguration under `--display` /
 // `--screenshot`) — the graphics keystone. Pre-exit discovery, post-MMU
@@ -329,9 +335,18 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // instead means the kernel died in that window.
     evidence.write_marker_var(st, marker_prex);
 
-    // M34 HF6 (issue #740): the virtio-blk transport and the ESP/DATA
-    // FAT partitions are GONE — zero guest code speaks FAT after boot.
-    // (The boot volume is parsed by Apple's firmware pre-exit only.)
+    // M34 HF6 (issue #740): the ESP/DATA FAT partitions are GONE — zero
+    // guest code speaks FAT after boot. (The boot volume is parsed by
+    // Apple's firmware pre-exit only.) M100b (issue #2307, ADR 0050)
+    // restores a virtio-blk transport for the VLFS data disk alone:
+    // the bus-0 scan collects EVERY DID-0x1042 function (the boot image
+    // is always one; the runner's `--data-disk` adds a second named
+    // `virelai-vlfs`), resolves each one's common/notify/device-config
+    // capability addresses + BAR windows PRE-EXIT (config-space reads
+    // hang post-exit, claim 0013), and arms each queue. Post-MMU the
+    // functions are re-armed and GET_ID names the disk — identity is
+    // wired, never positional.
+    _ = virtio_blk.virtio_blk_init();
 
     // Milestone four (claim 2665): the virtio-pci entropy transport
     // (DID 0x1044 — the runner's VZVirtioEntropyDeviceConfiguration, seen
@@ -457,15 +472,20 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // (discovered pre-exit) are handed to mmu.build_identity_map as the
     // extra Device windows above the blanket; mmu.zig stays
     // transport-agnostic.
-    var extra_windows: [10]mmu.DeviceWindow = undefined;
+    var extra_windows: [14]mmu.DeviceWindow = undefined;
     var extra_count: usize = 0;
     if (virtio_console.vp_ready and virtio_console.vp_bar0 != 0) {
         extra_windows[extra_count] = .{ .base = virtio_console.vp_bar0, .len = 0x10000 };
         extra_count += 1;
     }
     // M34 HF6 (issue #740): the virtio-blk BAR window is gone with the
-    // transport. Claim 0828: the custom-virtio transport BAR (pre-exit
-    // resolved).
+    // transport; M100b (issue #2307, ADR 0050) restores it — every
+    // discovered blk function's BAR base(s) get a Device window so the
+    // post-MMU common-config reads + queue notify reach the devices.
+    if (virtio_blk.function_count > 0) {
+        extra_count += virtio_blk.add_device_windows(extra_windows[extra_count..]);
+    }
+    // Claim 0828: the custom-virtio transport BAR (pre-exit resolved).
     // mmu.zig maps windows above the blanket; below it the 4 GiB blanket
     // already covers the BAR, so the entry is a harmless no-op there.
     if (cv_probed and virtio_custom.cv_bar != 0) {
@@ -810,6 +830,50 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     } else {
         csprng.seed_fallback();
         uart_puts("entropy: seed failed n=0 (deterministic fallback)\n");
+    }
+    // M100b (issue #2307, ADR 0050): the virtio-blk data-disk path. One
+    // DID-0x1042 function is the firmware's boot ESP — the kernel issues
+    // it no requests at all, and the default boot stays byte-identical.
+    // A SECOND function means the runner attached `--data-disk`: every
+    // candidate is re-armed (claim 6420 — VZ resets virtio devices at
+    // ExitBootServices), named with VIRTIO_BLK_T_GET_ID, and the one
+    // answering `virelai-vlfs` is the data disk. A failed/absent match is
+    // `no_disk` — the boot continues share-only, never wedged.
+    if (virtio_blk.function_count > 1) {
+        const armed = virtio_blk.blk_rearm();
+        virtio_blk.blk_identify();
+        var bi: usize = 0;
+        while (bi < virtio_blk.function_count) : (bi += 1) {
+            const f = &virtio_blk.functions[bi];
+            uart_puts("blk: dev=");
+            uart_hex(f.dev);
+            uart_puts(" armed=");
+            uart_puts(if (f.armed) "1" else "0");
+            uart_puts(" flush=");
+            uart_puts(if (f.flush_ok) "1" else "0");
+            uart_puts(" id='");
+            uart_puts(virtio_blk.function_id(bi));
+            uart_puts("'");
+            if (virtio_blk.vlfs_disk != null and virtio_blk.vlfs_disk.? == bi) {
+                uart_puts(" vlfs");
+            } else {
+                uart_puts(" not_vlfs_disk");
+            }
+            uart_puts("\n");
+        }
+        if (virtio_blk.vlfs_disk) |_| {
+            const sectors = virtio_blk.capacity_sectors() catch 0;
+            uart_puts("disk: ");
+            uart_hex(sectors);
+            uart_puts(" sectors id=");
+            uart_puts(virtio_blk.vlfs_disk_id);
+            uart_puts("\n");
+            blk_boot_probe(sectors);
+        } else {
+            uart_puts("blk: ");
+            uart_hex(armed);
+            uart_puts(" armed, no_disk (no 'virelai-vlfs' GET_ID match)\n");
+        }
     }
     // Milestone five card N1 (claim 1373): re-arm the virtio-net transport
     // post-MMU (the claim-6420/2665 lesson — VZ resets virtio devices at
@@ -1383,6 +1447,74 @@ fn uart_putc(byte: u8) void {
         },
         .none => {},
     }
+}
+
+/// M100b (issue #2307, ADR 0050): the smallest honest proof of the RW
+/// data-disk path — save the VLFS disk's last sector, write the marker
+/// pattern, FLUSH (a real barrier: submitted only after the write's
+/// completion and waited out itself), read it back and verify, then
+/// restore the original contents + FLUSH so the probe leaves the image
+/// untouched. A crash inside the window could lose the one sector — the
+/// serial line records every step's named refusal instead of hiding it.
+fn blk_boot_probe(capacity: u64) void {
+    if (capacity == 0) {
+        uart_puts("vlfs-probe: refused no_capacity\n");
+        return;
+    }
+    const lba = capacity - 1;
+    var saved: [virtio_blk.sector_len]u8 = undefined;
+    var probe: [virtio_blk.sector_len]u8 = undefined;
+    var back: [virtio_blk.sector_len]u8 = undefined;
+    virtio_blk.read_sector(lba, &saved) catch |e| {
+        blk_probe_fail("read", e);
+        return;
+    };
+    const sig = "VIRELAI-VLFS-PROBE";
+    @memcpy(probe[0..sig.len], sig);
+    var i: usize = sig.len;
+    while (i < probe.len) : (i += 1) probe[i] = @truncate(i *% 31 +% 7);
+    virtio_blk.write_sector(lba, &probe) catch |e| {
+        blk_probe_fail("write", e);
+        return;
+    };
+    const flushed = blk: {
+        virtio_blk.flush() catch |e| {
+            // no_flush = the feature was never negotiated: recorded
+            // honestly as flush=0, not dressed up as a barrier.
+            if (e == error.no_flush) break :blk false;
+            blk_probe_fail("flush", e);
+            return;
+        };
+        break :blk true;
+    };
+    virtio_blk.read_sector(lba, &back) catch |e| {
+        blk_probe_fail("readback", e);
+        return;
+    };
+    const ok = std.mem.eql(u8, &back, &probe);
+    virtio_blk.write_sector(lba, &saved) catch |e| {
+        blk_probe_fail("restore", e);
+        return;
+    };
+    if (flushed) virtio_blk.flush() catch |e| {
+        blk_probe_fail("restore-flush", e);
+        return;
+    };
+    uart_puts("vlfs-probe: write+readback ");
+    uart_puts(if (ok) "ok" else "MISMATCH");
+    uart_puts(" lba=");
+    uart_hex(lba);
+    uart_puts(" flush=");
+    uart_puts(if (flushed) "1" else "0");
+    uart_puts(" restored\n");
+}
+
+fn blk_probe_fail(stage: []const u8, e: virtio_blk.BlkError) void {
+    uart_puts("vlfs-probe: ");
+    uart_puts(stage);
+    uart_puts(" ");
+    uart_puts(@errorName(e));
+    uart_puts("\n");
 }
 
 pub fn uart_puts(text: []const u8) void {
