@@ -528,8 +528,18 @@ func (a *app) layout() {
 }
 
 func (a *app) draw() {
+	a.paintCanvas(a.ta.Canvas())
+}
+
+// paintCanvas renders the laid-out widgets onto cv — split from draw so the
+// host-side composite golden (M104h #2275) can pin the full-canvas surface
+// without a bound window surface: on the host Canvas() is the FillerCanvas
+// degrade, which is not the chrome this app paints in the guest.
+func (a *app) paintCanvas(cv widgets.Canvas) {
+	if cv == nil {
+		return
+	}
 	a.layout()
-	cv := a.ta.Canvas()
 	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(tabapp.FillRGB()))
 	a.hist.Draw(cv)
 	a.disp.Draw(cv)
