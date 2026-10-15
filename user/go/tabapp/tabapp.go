@@ -54,6 +54,7 @@ type TabApp struct {
 	Win      int
 	W, H     uint32
 	Name     string
+	Title    string
 	TabAware bool
 	OpenOK   bool
 
@@ -85,12 +86,16 @@ func Init(cfg Config) *TabApp {
 		W:      cfg.W,
 		H:      cfg.H,
 		Name:   cfg.Name,
+		Title:  cfg.Title,
 		OpenOK: true,
 	}
-	ta.bindSurface()
 	// Best-effort declaration: one blocking RPC at startup. TABWM accepts it;
 	// the shim/WND refuse and the app keeps its native presentation.
+	// Declare BEFORE the surface bind: tab rails order cells by adoption,
+	// so the bind's probe+map latency must not sit in the declare path and
+	// reorder a peer's tab ahead of this one.
 	ta.TabAware = vi.DeclareFullscreen(uint32(win), cfg.Title, cfg.Name)
+	ta.bindSurface()
 	return ta
 }
 
@@ -100,7 +105,7 @@ func Init(cfg Config) *TabApp {
 // The bind is best-effort exactly as in Init: a refused mmap leaves the
 // FillerCanvas degrade live, never a failed open.
 func Attach(win int, name string, w, h uint32) *TabApp {
-	t := &TabApp{Win: win, W: w, H: h, Name: name, OpenOK: true}
+	t := &TabApp{Win: win, W: w, H: h, Name: name, Title: name, OpenOK: true}
 	t.bindSurface()
 	return t
 }
@@ -126,6 +131,21 @@ func (t *TabApp) bindSurface() {
 	}
 	t.surf = b
 	t.review()
+	t.shareSurface()
+}
+
+// shareSurface hands the bound surface to the Go seat over the kind-18
+// SHARE_SURFACE RPC. Under a registered seat the kernel skips blitting
+// surface-backed windows (wm_owns_user_layer), so the seat's composeSurfaces
+// is the only path the painted bytes take to the scanout — a bound surface
+// that was never shared composites black. Best-effort like the bind itself:
+// no Go seat, a refused challenge, or the legacy path all return false and
+// the kernel's own blit stays in charge.
+func (t *TabApp) shareSurface() {
+	if len(t.surf) == 0 || t.W == 0 || t.H == 0 {
+		return
+	}
+	vi.WmSurfaceShare(uint32(t.Win), t.surf, int(t.W), int(t.H), t.Title, t.Name)
 }
 
 // review re-views the bound surface at the current W x H — the only "rebind"
@@ -195,6 +215,9 @@ func (t *TabApp) Dispatch(ev vi.Event) Action {
 		// The rebind is part of the tracking, not the app's job: the canvas
 		// must be the new stride before the ActionResized repaint runs.
 		t.review()
+		// The seat's handoff record carries the reported stride/rows — a
+		// resize leaves it reading the old geometry until re-shared.
+		t.shareSurface()
 		return ActionResized
 	}
 	return ActionNone
@@ -210,7 +233,12 @@ func (t *TabApp) Present() {
 }
 
 // Close closes the window without exiting.
-func (t *TabApp) Close() { vi.WinClose(t.Win) }
+func (t *TabApp) Close() {
+	if len(t.surf) != 0 {
+		vi.WmSurfaceShareDrop(uint32(t.Win), t.Name)
+	}
+	vi.WinClose(t.Win)
+}
 
 // CloseAndExit is the common exit path: close the window, then exit.
 func (t *TabApp) CloseAndExit(status int) {

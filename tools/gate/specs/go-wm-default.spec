@@ -363,8 +363,8 @@ import os, sys
 share = os.environ["VG_SHARE"]
 text = open(os.path.join(share, "APPS.TXT"), encoding="utf-8").read()
 rows = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
-if len(rows) != 15:
-    sys.exit("manifest has %d rows, want 15" % len(rows))
+if len(rows) != 16:
+    sys.exit("manifest has %d rows, want 16 (M99c's GOSOUND row grew it)" % len(rows))
 dock = 0
 v2 = 0
 for ln in rows:

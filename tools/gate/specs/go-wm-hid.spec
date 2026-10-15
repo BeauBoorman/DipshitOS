@@ -113,7 +113,13 @@ vgate_file script2.txt <<'EOF'
 dui focus 0
 echo m87-seat-flush-before
 dui
-exec GOEDIT.ELF
+# The rail orders cells by tab-open (declare) order and the clicks below
+# hit cell 0, so GOEDIT must declare before GOTERM execs. `fg` after a
+# backgrounded exec is the bounded-wait idiom (live-jobs.spec): it parks
+# ~5 timer ticks while GOEDIT boots and declares, then reports the job
+# still running — serializing the two execs without a sleep builtin.
+exec GOEDIT.ELF &
+fg
 exec GOTERM.ELF
 echo m87-seat-flush-after
 dui
