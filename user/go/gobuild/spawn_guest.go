@@ -62,7 +62,7 @@ func execAndWaitGuest(image string, args []string, capturePath string) (status i
 	// Open the capture file first: the handle index is what the stream
 	// request binds as the child's fd-1 source. MODE_WRITE is required —
 	// prepare_streams refuses a source opened read-only.
-	h, rc := vi.FileOpen(capturePath, vi.ModeWrite|vi.ModeCreate)
+	h, rc := vi.FileOpen(capturePath+"~", vi.ModeWrite|vi.ModeCreate)
 	if rc < 0 {
 		return -1, 0, nil, errors.New("capture open failed rc=" + itoa64(rc))
 	}
@@ -94,7 +94,7 @@ func execAndWaitGuest(image string, args []string, capturePath string) (status i
 	// h moved into the child's stream table — never close it here.
 	status, werr := vi.WaitBudget(pid, stepBudgetNs)
 	ms = (vi.Nanos() - start) / 1000000
-	captured, _ = readFile(capturePath)
+	captured, _ = readFile(capturePath + "~")
 	if werr != nil {
 		return -1, ms, captured, werr
 	}
