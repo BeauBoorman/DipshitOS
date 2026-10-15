@@ -161,6 +161,8 @@ Threads and their current state (the tracker is authoritative):
 | **M102 — Custom-Virtio GPU 3D** | **Closed** (index #2160); all lanes landed, f2 acceptance #2171 met (`live-gpu3d` eight-leg class-B + defect fixes). Opt-in custom-Virtio Metal render device (DID `1af4:1083`, private VIR1 capset) beside native 2D: guest `GPUTRIANGLE.ELF` -> Go seat -> kernel broker -> Metal, CPU-composited into the ordinary scanout. | #2160; cards #2161–#2171 |
 | **M103 — FLINT M0: agent-native SCM** | **Landed** (all four cards M103a–d): `FLINT.ELF` parses Zig/Go into Atoms (#2253), stages Ops into a flat-file store with UUIDv7 (#2251), signs and verifies Ed25519 Changes on Streams (#2252), and forks/replays/merges Streams with a semantic three-way merge on Ops, `MERGE.json` conflicts, and the `src_behind` guard (#2254); class-B `go-flint` 10/10 green. | #2253, #2251, #2252, #2254; [ADR 0049](decisions/0049-flint-scm.md) |
 | **M104 — UI depth: primitives v2, widget faces, seat chrome, adoption sweep** | Open (index #2267); M104a contract v2 in review (PR #2276); cards b–h unclaimed. | #2267; cards #2268–#2275 |
+| **M105 — FLINT host client (cross-platform Zig port)** | Open (index #2283); client spec in review (PR #2282); cards a–f unclaimed. | #2283; cards #2284–#2289 |
+| **M106 — FLINT host server (cross-platform Zig port)** | Open (index #2291); sync-server spec in review (PR #2290); cards a–f unclaimed. | #2291; cards #2292–#2297 |
 
 
 ## Gate status
