@@ -27,11 +27,13 @@ type Result struct {
 }
 
 // Config is one build's wiring. The zero images are the staged toolchain
-// names; Importcfg nil means the stage-selfhost manifest path.
+// names; Importcfg nil means the stage-selfhost manifest path and PkgDB nil
+// the staged package table beside it.
 type Config struct {
 	Dir          string   // program dir (share path, e.g. /host/WSP)
 	Out          string   // default: <Dir>/<basename>.ELF
 	Importcfg    []string // staged-archive manifests; default {"/host/GOIMPORT.CFG"}
+	PkgDB        []string // package tables; default {"/host/GOPKGS.TXT"}
 	WorkDir      string   // default: <Dir>/.BUILD
 	CompileImage string   // default GOCMDCOMPILE.ELF
 	LinkImage    string   // default GOCMDLINK.ELF
@@ -82,6 +84,9 @@ func Build(cfg Config) Result {
 	if len(cfg.Importcfg) == 0 {
 		cfg.Importcfg = []string{"/host/GOIMPORT.CFG"}
 	}
+	if len(cfg.PkgDB) == 0 {
+		cfg.PkgDB = []string{"/host/GOPKGS.TXT"}
+	}
 	res := Result{}
 
 	fail := func(d Diag) Result {
@@ -95,8 +100,10 @@ func Build(cfg Config) Result {
 	}
 	archives, mdiags := loadArchives(cfg.Importcfg)
 	res.Diags = append(res.Diags, mdiags...)
+	table, tdiags := loadPkgTable(cfg.PkgDB)
+	res.Diags = append(res.Diags, tdiags...)
 
-	g := ImportGraph(cfg.Dir, archives)
+	g := ImportGraph(cfg.Dir, archives, table)
 	res.Diags = append(res.Diags, g.Diags...)
 	res.Diags = append(res.Diags, checkMangles(g)...)
 	for _, p := range g.Order {

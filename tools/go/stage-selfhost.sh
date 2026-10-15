@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # stage-selfhost.sh -- stage everything the GUEST needs to build a Go program
-# with its own cmd/compile + cmd/link (M70c-S1T, issue #1543, D4).
+# with its own cmd/compile + cmd/link (M70c-S1T, issue #1543, D4; the package
+# surface is M107b, issue #2319).
 #
 # The pinned program is tools/go/hello.go (issue #1163's phase-0a hello:
 # "runtime" only, zero standard-library OS imports, prints "hello from
@@ -14,11 +15,20 @@
 #      executable is not one object file: main.o references runtime.*, and the
 #      linker needs runtime.a's object + every package in its closure.
 #
+# What gets staged is POLICY, not a fixture's closure: tools/go/pkg-table.txt
+# is the reviewable table — `allow` roots are the measured fleet surface plus
+# the virelai/vi + virelai/vsys SDK pair, `deny` lines carry the named
+# refusals. There is deliberately no /host/GOSRC/ std-from-source tier: the
+# guest reads files 2048 B per syscall into 256 MiB, so a package is
+# buildable in-guest iff its archive is staged here.
+#
 # So this stages, into .build/go/selfhost/ (flat — the guest opens share-root
 # paths; nested share paths are not proven on this GOOS):
 #
 #   GOIMPORT.CFG   `packagefile <import path>=/host/GPKG_<name>.a` per package
-#   GPKG_*.a       the 28 archives of GOOS=virelai GOARCH=arm64's closure
+#   GPKG_*.a       the archives of the allow roots' GOOS=virelai closure
+#   GOPKGS.TXT     every importable path marked staged / denied / unstaged —
+#                  the driver's dep_unsupported oracle (default /host/GOPKGS.TXT)
 #   HELLO.GO       the pinned source, byte-identical to tools/go/hello.go
 #
 # and the share-copy step is the spec's own setup hook (see
@@ -60,11 +70,34 @@ export GOARCH=arm64
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
+# --- 0. the policy table ------------------------------------------------------
+# The allow roots + deny rules come from the checked-in table. An empty table
+# here would silently stage nothing and every std import would refuse
+# in-guest — fail instead.
+TABLE="$REPO/tools/go/pkg-table.txt"
+[ -f "$TABLE" ] || { log "missing policy table $TABLE"; exit 1; }
+awk '$1 == "allow" { print $2 }' "$TABLE" > "$OUT_DIR/.allow-roots"
+[ -s "$OUT_DIR/.allow-roots" ] || {
+    log "$TABLE names no allow roots"
+    exit 1
+}
+
+# virelai/* roots resolve in GOPATH mode through a src/ symlink — the same
+# trick build-gobuild.sh uses (`virelai/...` wildcard expansion ignores
+# symlinks, so the universe listing below enumerates package dirs instead).
+GOPATH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/virelai-gopath.XXXXXX")"
+trap 'rm -rf "$GOPATH_DIR"' EXIT
+mkdir -p "$GOPATH_DIR/src"
+ln -sfn "$REPO/user/go" "$GOPATH_DIR/src/virelai"
+export GOPATH="$GOPATH_DIR"
+
 # --- 1. the closure -----------------------------------------------------------
 # -export makes the go command build (and cache) what is missing, so this
 # works on a fork whose std was only ever compiled, never installed to pkg/.
 cd "$REPO/tools/go"
-go list -export -deps -f '{{.ImportPath}}|{{.Export}}' hello.go > "$OUT_DIR/.closure"
+# shellcheck disable=SC2046  # allow roots are package paths, word-split on purpose
+go list -export -deps -f '{{.ImportPath}}|{{.Export}}' \
+    $(cat "$OUT_DIR/.allow-roots") > "$OUT_DIR/.closure"
 
 python3 - "$OUT_DIR" "$PREFIX" "$OUT_DIR/.closure" <<'PY'
 import os, re, shutil, sys
@@ -112,6 +145,118 @@ print("stage-selfhost: import config %d lines" % len(pkgs))
 PY
 
 cp "$REPO/$SRC_REL" "$OUT_DIR/HELLO.GO"
+
+# --- 1b. GOPKGS.TXT: the per-package disposition table -------------------------
+# The driver's dep_unsupported oracle. The universe is every importable path
+# under GOOS=virelai: `std` plus the user/go packages an in-guest program
+# could name (dirs enumerated on the filesystem — `virelai/...` wildcard
+# expansion ignores the symlink above). For each package the table records
+# its own name, whether the LIST/BUILD itself failed, and its dep list — the
+# generator below turns that into one `staged|denied|unstaged` row per path.
+VI_PKGS="$(cd "$REPO/user/go" && find . -name '*.go' ! -name '*_test.go' -print \
+    | sed 's|^\./||; s|/[^/]*$||' | grep -v '^\.$' | grep -v '/testdata/' \
+    | sort -u | sed 's|^|virelai/|')"
+# shellcheck disable=SC2086  # package list, word-split on purpose
+go list -export -e \
+    -f '{{.ImportPath}}|{{.Name}}|{{if .Error}}ERR{{end}}|{{join .Deps " "}}' \
+    std $VI_PKGS > "$OUT_DIR/.universe"
+
+python3 - "$OUT_DIR" "$TABLE" <<'PY'
+import sys
+out_dir, table_path = sys.argv[1], sys.argv[2]
+
+# --- read the policy table ---------------------------------------------------
+# Grammar: `allow <pkg>` | `deny <pattern> <reason...>` | `#` comment. A deny
+# pattern ending in '/' is a subtree rule: it matches a package whose import
+# path CONTAINS that element (`deny internal/` covers internal/abi and
+# crypto/internal/cryptotest alike). Deny rules are policy — they refuse by
+# name but do NOT propagate to dependents (fmt is not broken because
+# internal/abi is std-private); only a real build failure propagates.
+allow, rules = set(), []
+for n, raw in enumerate(open(table_path), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split(None, 2)
+    if parts[0] == "allow" and len(parts) == 2:
+        allow.add(parts[1])
+    elif parts[0] == "deny" and len(parts) >= 3:
+        pat, reason = parts[1], parts[2]
+        rules.append((pat[:-1] if pat.endswith("/") else pat,
+                      pat.endswith("/"), reason))
+    else:
+        sys.exit("%s:%d: not an allow/deny line: %r" % (table_path, n, line))
+
+def deny_reason(path):
+    for pat, subtree, reason in rules:
+        if (subtree and pat in path.split("/")) or (not subtree and pat == path):
+            return reason
+    return None
+
+for p in sorted(allow):
+    if deny_reason(p):
+        sys.exit("%s: %s is both allowed and denied" % (table_path, p))
+
+# --- read what got staged ----------------------------------------------------
+staged = set()
+for line in open(out_dir + "/GOIMPORT.CFG"):
+    if line.startswith("packagefile "):
+        staged.add(line.split()[1].split("=", 1)[0])
+staged.add("unsafe")  # intrinsic — the compiler knows it, no archive exists
+
+# --- the universe ------------------------------------------------------------
+own_err, names, deps = set(), {}, {}
+for line in open(out_dir + "/.universe"):
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    p, name, err, ds = (line.split("|") + ["", "", "", ""])[:4]
+    names[p] = name
+    deps[p] = set(ds.split()) if ds else set()
+    if err == "ERR":
+        own_err.add(p)
+
+# Build-failure fixpoint: a package whose own build fails, or that depends on
+# a broken package, is denied (needs <dep>). Policy-denied deps do not
+# break the importer — they are refused for the importer's own line, not this
+# one.
+broken = set(own_err)
+changed = True
+while changed:
+    changed = False
+    for p, ds in deps.items():
+        if p not in broken and (ds & broken):
+            broken.add(p)
+            changed = True
+
+rows = []
+for p in sorted(deps):
+    reason = deny_reason(p)
+    if reason is not None:
+        rows.append(("denied", p, reason))
+    elif p in own_err:
+        rows.append(("denied", p, "cannot be built on GOOS=virelai"))
+    elif names[p] == "main":
+        rows.append(("denied", p, "command package, not importable"))
+    elif p in broken:
+        needs = sorted(d for d in deps[p] if d in broken)
+        rows.append(("denied", p, "needs " + needs[0]))
+    elif p in staged:
+        rows.append(("staged", p, ""))
+    else:
+        rows.append(("unstaged", p, ""))
+
+counts = {"staged": 0, "denied": 0, "unstaged": 0}
+with open(out_dir + "/GOPKGS.TXT", "w") as f:
+    f.write("# generated by tools/go/stage-selfhost.sh from "
+            "tools/go/pkg-table.txt -- do not edit\n")
+    f.write("# <state> <import-path> [reason]\n")
+    for state, p, reason in rows:
+        counts[state] += 1
+        f.write("%s %s%s\n" % (state, p, " " + reason if reason else ""))
+print("stage-selfhost: GOPKGS.TXT %d staged / %d denied / %d unstaged"
+      % (counts["staged"], counts["denied"], counts["unstaged"]))
+PY
 
 # --- 2. the guest's argv, checked against the kernel's budget -----------------
 # The kernel's exec copies argv into a fixed 8-slot x 256-byte block, and the

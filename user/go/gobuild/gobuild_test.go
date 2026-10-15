@@ -49,7 +49,7 @@ import "strings"
 var V = strings.ToUpper("v")
 `)
 	archives := map[string]string{"fmt": "/host/GPKG_FMT.a", "strings": "/host/GPKG_STRINGS.a"}
-	g := ImportGraph(dir, archives)
+	g := ImportGraph(dir, archives, nil)
 	if len(g.Diags) != 0 {
 		t.Fatalf("unexpected diags: %v", g.Diags)
 	}
@@ -86,7 +86,7 @@ func main() {}
 	writeSrc(t, dir, "helper/h.go", `package helper
 var V = 1
 `)
-	g := ImportGraph(dir, map[string]string{"helper": "/host/GPKG_HELPER.a"})
+	g := ImportGraph(dir, map[string]string{"helper": "/host/GPKG_HELPER.a"}, nil)
 	if len(g.Diags) != 0 {
 		t.Fatalf("unexpected diags: %v", g.Diags)
 	}
@@ -101,7 +101,7 @@ func TestNoPackageRefusedByName(t *testing.T) {
 import "missing"
 func main() {}
 `)
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if !hasCode(g.Diags, "no_package") {
 		t.Fatalf("want no_package, got %v", g.Diags)
 	}
@@ -128,7 +128,7 @@ func F() { b.G() }
 import "a"
 func G() {}
 `)
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if !hasCode(g.Diags, "import_cycle") {
 		t.Fatalf("want import_cycle, got %v", g.Diags)
 	}
@@ -147,7 +147,7 @@ import "unsafe"
 var _ = unsafe.Sizeof(0)
 func main() {}
 `)
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if len(g.Diags) != 0 {
 		t.Fatalf("unsafe is intrinsic, got %v", g.Diags)
 	}
@@ -162,7 +162,7 @@ func TestCgoRefused(t *testing.T) {
 import "C"
 func main() {}
 `)
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if !hasCode(g.Diags, "import_cgo") {
 		t.Fatalf("want import_cgo, got %v", g.Diags)
 	}
@@ -173,7 +173,7 @@ func TestNonMainDirRefused(t *testing.T) {
 	writeSrc(t, dir, "lib.go", `package lib
 func F() {}
 `)
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if !hasCode(g.Diags, "no_main") {
 		t.Fatalf("want no_main, got %v", g.Diags)
 	}
@@ -186,7 +186,7 @@ func TestFileSelection(t *testing.T) {
 	writeSrc(t, dir, "main_test.go", "package main\nimport \"testing\"\n")
 	writeSrc(t, dir, "other.go", "//go:build linux\npackage main\n")
 	writeSrc(t, dir, "guest.go", "//go:build virelai\npackage main\nvar guestOnly = 1\n")
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if len(g.Diags) != 0 {
 		t.Fatalf("unexpected diags: %v", g.Diags)
 	}
@@ -202,7 +202,7 @@ func TestFileSelection(t *testing.T) {
 func TestSyntaxErrorCarriesPosition(t *testing.T) {
 	dir := t.TempDir()
 	writeSrc(t, dir, "main.go", "package main\nfunc main( {}\n")
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	if !hasCode(g.Diags, "syntax") {
 		t.Fatalf("want syntax, got %v", g.Diags)
 	}

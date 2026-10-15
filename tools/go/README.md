@@ -127,8 +127,10 @@ Both runs assert that receipt absent from the guest's serial, which is how D1
 **What is still not the loop**: a guest-driven `go build`. M70c S1/S2 landed
 (#1543/#1544): the guest's own `cmd/compile` and `cmd/link` build and link
 `tools/go/hello.go` (`go-hello` runs 06-08, `live-selfhost-go`), but their
-inputs — the import config and the 29 package archives — are staged by the host
-into the share (`tools/go/stage-selfhost.sh`), and a `go` command driving that
+inputs — the import config, the package archives and the staged/denied
+package table — are staged by the host into the share
+(`tools/go/stage-selfhost.sh` driven by the `tools/go/pkg-table.txt` policy,
+M107b #2319), and a `go` command driving that
 from inside the guest is a later card (ADR 0035 amendment 9).
 
 ## Phase map (issue #1163 / #1194)

@@ -1,0 +1,98 @@
+# pkg-table.txt -- M107b (issue #2319): the bounded in-guest package surface.
+#
+# This is the reviewable policy the guest's build driver enforces. There is
+# NO std-from-source tier on virelai (the guest reads files 2048 B per syscall
+# and owns 256 MiB; ADR 0035 D4 already makes the toolchain payload
+# host-provided): a package is buildable in-guest iff its archive is staged.
+# tools/go/stage-selfhost.sh reads this file and produces two artifacts:
+#
+#   .build/go/selfhost/GOIMPORT.CFG + GPKG_*.a  -- archives for every allow
+#                                                root's dependency closure
+#   .build/go/selfhost/GOPKGS.TXT              -- every importable path in the
+#                                                 GOOS=virelai universe marked
+#                                                 staged / denied / unstaged,
+#                                                 the file the driver reads
+#                                                 (default /host/GOPKGS.TXT)
+#
+# Grammar (one directive per line, `#` comments):
+#
+#   allow <pkg>             stage a prebuilt GPKG_<name>.a for this package and
+#                           its transitive closure
+#   deny  <pkg> <reason>    refuse `dep_unsupported` naming the reason. A path
+#                           ending in '/' denies every package with that path
+#                           ELEMENT (e.g. `internal/` matches internal/abi AND
+#                           crypto/internal/cryptotest); a path ending in '/*'
+#                           denies only that subtree's children.
+#
+# The allow list is the MEASURED fleet surface, not a guess: every public
+# standard package some user/go app transitively imports under GOOS=virelai,
+# plus the virelai/vi + virelai/vsys SDK pair an in-guest program links
+# against (measured 2026-10-15; the closing comment on #2319 has the full
+# inventory). Growing it is one line here and a re-stage.
+
+# --- the allowlist: measured fleet closure + the SDK ------------------------
+
+allow bufio
+allow bytes
+allow cmp
+allow context
+allow encoding
+allow encoding/base32
+allow encoding/base64
+allow encoding/binary
+allow encoding/hex
+allow encoding/json
+allow encoding/json/jsontext
+allow encoding/json/v2
+allow encoding/xml
+allow errors
+allow fmt
+allow go/ast
+allow go/build/constraint
+allow go/parser
+allow go/scanner
+allow go/token
+allow hash
+allow hash/fnv
+allow io
+allow io/fs
+allow iter
+allow math
+allow math/bits
+allow os
+allow path
+allow path/filepath
+allow reflect
+allow runtime
+allow slices
+allow sort
+allow strconv
+allow strings
+allow sync
+allow sync/atomic
+allow syscall
+allow time
+allow unicode
+allow unicode/utf16
+allow unicode/utf8
+allow virelai/vi
+allow virelai/vsys
+
+# --- the denylist -----------------------------------------------------------
+#
+# Measured roots (every package below was compile-probed under GOOS=virelai
+# on 2026-10-15). Packages whose OWN build fails get their reason here;
+# packages that only fail through a denied dependency are marked
+# `denied <pkg> needs <dep>` by the generator — the chain is reproducible,
+# so it is not repeated here.
+
+deny crypto/x509 no system cert-root store on GOOS=virelai (undefined certFiles/certDirectories/systemVerify)
+deny internal/testenv test-only helper; undefined Sigquit/syscallIsNotSupported
+
+# Structural refusals: these are not "missing archives", they are paths the
+# import model itself reserves or that were never packages.
+deny internal/ std-internal: the internal import rule reserves this element for the std tree
+deny vendor/ vendored std dependencies are not importable paths
+deny charm overlay source drop under $GOROOT/src, not a package (mixed package names)
+deny gostalgia/ overlay application sources, not importable packages
+deny gostalgia-mods/ module-path overlay sources, not GOPATH-importable

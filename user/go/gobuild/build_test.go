@@ -236,7 +236,7 @@ func TestNameMangleCollisionRefused(t *testing.T) {
 	writeSrc(t, dir, "main.go", "package main\nimport (\"a/b\"; \"a_b\")\nfunc main() {}\n")
 	writeSrc(t, dir, "a/b/x.go", "package b\n")
 	writeSrc(t, dir, "a_b/x.go", "package a_b\n")
-	g := ImportGraph(dir, nil)
+	g := ImportGraph(dir, nil, nil)
 	diags := checkMangles(g)
 	if !hasCode(diags, "name_collision") {
 		t.Fatalf("want name_collision, got %v", diags)
