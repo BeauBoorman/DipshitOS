@@ -18,7 +18,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FORK_DIR="${GO_FORK_DIR:-$(dirname "$REPO")/go-virelai}"
 DIR="gotabwm"
 NAME="${GO_BUILD_NAME:-GOTABWM}"
-MAX_BYTES=2097152 # kernel/src/exec.zig exec_program_max
+MAX_BYTES=33554432 # kernel/src/exec.zig exec_image_max — GOOS=virelai
+# ELFs are gap-layout and stream past the 2 MiB staging bound (M70c-K
+# #1504); the loader's real acceptance bound is the image one.
 
 log() { printf 'build-gotabwm: %s\n' "$*"; }
 
@@ -50,7 +52,7 @@ log "building virelai/$DIR -> $OUT"
 SIZE="$(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT")"
 log "wrote $OUT ($SIZE bytes)"
 if [ "$SIZE" -gt "$MAX_BYTES" ]; then
-    log "FAIL: $SIZE bytes exceeds exec_program_max ($MAX_BYTES); the kernel loader will refuse it"
+    log "FAIL: $SIZE bytes exceeds exec_image_max ($MAX_BYTES); the kernel loader will refuse it"
     exit 1
 fi
 log "size ok (< $MAX_BYTES bytes)"
