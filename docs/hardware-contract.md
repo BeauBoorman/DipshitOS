@@ -333,6 +333,31 @@ above the fullscreen terminal before clicking it — session setup via
 documented monitor commands, with the focus proof still driven purely by
 the injected messages.
 
+### Host-integration lanes over the share (M108a, ADR 0051 — proposed)
+
+The three M108 lanes (clipboard both ways, host→guest file drop,
+guest→host notify) ride the `--cvc-file` share as signed `VHI1` records
+under `HOSTINT/` plus dropped payloads under `INBOX/` — **no new
+virtqueue, no queue-count change** (ADR 0051 D1). All three flags are
+modifiers on `--cvc-file` (a lane flag without it is a fatal runner
+argument error) and require a `SECRETS.TXT` `host-int` row app-bound to
+`GOTABWM.ELF`, which the runner also reads as a host file; a missing row
+refuses the lane `no_credential` without failing the boot. Flags off =
+byte-silent: no directories created, no records, no pasteboard polling.
+
+| Runner flag | Effect |
+|-------------|--------|
+| `--host-clipboard` | clipboard sync both ways via `CLIP_IN`/`CLIP_OUT` records; targets `.general` |
+| `--host-drop` | `.fileURL` drop target on the display view → `INBOX/` files (temp+rename, ≤ 64 MiB, ≤ 16 per gesture) + signed `DROP` notices |
+| `--host-notify` | `NOTIFY_OUT` records → `UNUserNotificationCenter` banners under the `just session` bundle only; the bare runner logs `no_bundle` refusals |
+| `--host-pasteboard <name>` | test hook — redirect the clipboard lane to `NSPasteboard(name:)`; gates MUST use it so a class-B run never touches the reference host's real clipboard |
+| `--host-drop-file <path>` / `--host-drop-after <marker>` | test hook — feed a host file through the real drop handler after a serial marker (the `--input-string` precedent) |
+
+Runner polls `changeCount` and the lane directories at 250 ms; the seat
+is the only guest-side consumer (one `ListDirAt` per ~1 Hz composite
+tick). Record bounds, seq/epoch rules, and the refusal vocabulary are
+normative in `docs/decisions/0051-host-integration.md`.
+
 ## Structured console + framebuffer snapshots over the custom virtio device
 
 Claim 0680 (issue #523 item 3 capstone): the two remaining observation
