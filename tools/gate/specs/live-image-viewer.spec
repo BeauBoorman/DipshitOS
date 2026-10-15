@@ -15,15 +15,14 @@
 #            the window is the same 328x264, so the burst had to grow, not the
 #            assertions shrink), reset to 100%, one step down to 66%, then `q`
 #            exits 43.
-#   PNG   -- the GAP, asserted as a gap. `webrender.DecodeImage` under the
-#            guest build tag has no PNG decoder: user/go/webrender/image_png_guest.go
-#            returns ErrImageUnsupported because the fork's stdlib image/png
-#            drags in compress/zlib -> fmt -> os. GOVIEW must say so and stay
-#            open (`gview: unsupported PNG`), never panic, and never claim to
-#            have loaded it. The window still opens at 328x264: the size comes
-#            from the PNG IHDR header (16/20), which the app reads without
-#            decoding -- so this boot also proves the header sniff is
-#            format-independent.
+#   PNG   -- decode, formerly a gap. This leg originally asserted
+#            `gview: unsupported PNG` + `loaded` ABSENT because the guest
+#            build had no PNG decoder (stdlib image/png drags in
+#            compress/zlib -> fmt -> os). M93e landed the bounded in-tree
+#            decoder (image_png_guest.go -> DecodePNG), so the app now
+#            loads the fixture; the assertions below pin that success and
+#            still prove the IHDR sniff sizes the window BEFORE the decode
+#            (the `open` marker precedes `loaded` in the serial).
 #   NOPE  -- the other error surface, and the default window when there is no
 #            header at all: `gview: open err`, 320x240, still exits cleanly on
 #            `q`.
@@ -119,8 +118,8 @@ vgate_run PNG -- \
     --script-expect "user-exec exited status=43" --timeout 150
 
 vgate_assert PNG serial-contains "exec: loaded GOVIEW.ELF"
-vgate_assert PNG serial-contains "gview: unsupported PNG"
-vgate_assert PNG serial-absent "gview: loaded TEST.PNG"
+vgate_assert PNG serial-contains "gview: loaded TEST.PNG 160x120 PNG bytes=420"
+vgate_assert PNG serial-absent "gview: unsupported"
 vgate_assert PNG serial-contains "gview: ready"
 vgate_assert PNG serial-contains "gview: quit"
 vgate_assert PNG serial-contains "user-exec exited status=43"
