@@ -58,6 +58,10 @@ pub const forensics = @import("forensics.zig"); // #1278: the last-words recorde
 pub const dns = @import("dns.zig"); // milestone twelve card N2 (claim 7566): DNS resolver
 pub const events = @import("events.zig"); // milestone sixteen C3 (claim 0339): per-process event queue bound behind `resources`
 pub const file_table = @import("file_table.zig"); // milestone sixteen C3 (claim 0339): per-process handle bound behind `resources`
+// M100c (issue #2308, ADR 0050): `vf ls|cat`/`stat` on /disk read the VLFS
+// volume through the same mount the file ABI routes `.disk` paths to.
+const vlfs = @import("vlfs/vlfs.zig");
+const vlfs_disk = @import("vlfs/disk.zig");
 pub const serial_ring = @import("serial_ring.zig"); // Arc5 issue #243: serial output ring buffer behind `dmesg`
 pub const smp = @import("smp.zig");
 pub const trust = @import("trust.zig"); // M50 TS2 (#1136, ADR 0024 D4): the kernel-actor file policy for direct consumers
@@ -1548,6 +1552,9 @@ fn cmd_vf_clone(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_vf_ls(m: *Monitor, args: []const []const u8) ExecError {
     const path: []const u8 = if (args.len > 0) args[0] else "";
     if (!kernel_vf_allowed(path, .list)) return trust_denied(m, "vf ls", path);
+    if (file_table.parse_path(path)) |parsed| {
+        if (parsed.partition == .disk) return cmd_disk_ls(m, parsed.path[0..parsed.parsed_len()]);
+    }
     var res: virtio_file.ListResult = .{};
     const st = virtio_file.list(path, &res);
     if (st != virtio_file.st_ok) {
@@ -1573,6 +1580,9 @@ fn cmd_vf_cat(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len == 0) return cmd_vf_usage(m);
     const path = args[0];
     if (!kernel_vf_allowed(path, .read)) return trust_denied(m, "vf cat", path);
+    if (file_table.parse_path(path)) |parsed| {
+        if (parsed.partition == .disk) return cmd_disk_cat(m, parsed.path[0..parsed.parsed_len()]);
+    }
     var st_res: virtio_file.StatResult = .{};
     const st = virtio_file.stat(path, &st_res);
     if (st != virtio_file.st_ok) {
@@ -1624,6 +1634,98 @@ fn cmd_vf_cat(m: *Monitor, args: []const []const u8) ExecError {
     m.console.puts(" cksum=0x");
     m.console.puts(&vf_hex16(acc.finish()));
     m.console.puts("\n");
+    return .none;
+}
+
+// ---------------------------------------------------------------------------
+// M100c (issue #2308, ADR 0050): `vf ls`, `vf cat` and `stat` on /disk go to
+// the mounted VLFS volume — the same reader the EL0 file ABI uses. A missing
+// or refused disk prints the ADR refusal name (not_vlfs, io_error, ...)
+// rather than leaking the path into the host share.
+// ---------------------------------------------------------------------------
+
+/// Readdir staging for `vf ls /disk...` — the sorted smallest-256 live
+/// dirents, the same bound file_table's own listing uses.
+var disk_ls_entries: [file_table.directory.entry_max]vlfs.Dirent = undefined;
+/// `vf cat /disk/...` stream window (the kernel stack cannot hold one).
+var disk_cat_buf: [vlfs.block_len]u8 = undefined;
+
+fn disk_verb_err(m: *Monitor, verb: []const u8, path: []const u8, err: vlfs.Error) ExecError {
+    err_prefix(m);
+    m.console.puts(verb);
+    m.console.puts(": disk:");
+    m.console.puts(if (path.len == 0) "/" else path);
+    m.console.puts(": ");
+    m.console.print_line(vlfs.refusalName(err));
+    return .invalid_argument;
+}
+
+fn cmd_disk_ls(m: *Monitor, subpath: []const u8) ExecError {
+    const dir = vlfs_disk.lookup(subpath) catch |err| return disk_verb_err(m, "vf ls", subpath, err);
+    if (dir.kind != vlfs.kind_dir) return disk_verb_err(m, "vf ls", subpath, error.NotDir);
+    const n = vlfs_disk.listDir(dir.inode, &disk_ls_entries) catch |err| return disk_verb_err(m, "vf ls", subpath, err);
+    for (disk_ls_entries[0..n]) |*d| {
+        const st = vlfs_disk.statInode(d.inode) catch |err| return disk_verb_err(m, "vf ls", subpath, err);
+        m.console.puts(d.nameSlice());
+        m.console.puts(if (d.kind == vlfs.kind_dir) "/ " else "  ");
+        m.console.print_u64(st.size);
+        m.console.puts("\n");
+    }
+    return .none;
+}
+
+fn cmd_disk_cat(m: *Monitor, subpath: []const u8) ExecError {
+    const found = vlfs_disk.lookup(subpath) catch |err| return disk_verb_err(m, "vf cat", subpath, err);
+    if (found.kind == vlfs.kind_dir) {
+        err_prefix(m);
+        m.console.puts("vf cat: disk:");
+        m.console.puts(subpath);
+        m.console.print_line(": is a directory");
+        return .invalid_argument;
+    }
+    const st = vlfs_disk.statInode(found.inode) catch |err| return disk_verb_err(m, "vf cat", subpath, err);
+    m.console.puts("vf: cat disk:");
+    m.console.puts(subpath);
+    m.console.puts(" size=");
+    m.console.print_u64(st.size);
+    m.console.puts("\n");
+    var acc = virtio_file.StreamCksum{};
+    var off: u64 = 0;
+    var rts: usize = 0;
+    var total: u64 = 0;
+    while (off < st.size) {
+        const n = vlfs_disk.read(found.inode, off, &disk_cat_buf) catch |err| return disk_verb_err(m, "vf cat", subpath, err);
+        if (n == 0) break; // defensive EOF
+        rts += 1;
+        total += n;
+        acc.add(disk_cat_buf[0..n]);
+        off += n;
+    }
+    m.console.puts("vf: cat ok bytes=");
+    m.console.print_u64(total);
+    m.console.puts(" rts=");
+    m.console.print_u64(rts);
+    m.console.puts(" cksum=0x");
+    m.console.puts(&vf_hex16(acc.finish()));
+    m.console.puts("\n");
+    return .none;
+}
+
+fn cmd_disk_stat(m: *Monitor, name: []const u8, subpath: []const u8) ExecError {
+    const found = vlfs_disk.lookup(subpath) catch |err| return disk_verb_err(m, "stat", subpath, err);
+    const st = vlfs_disk.statInode(found.inode) catch |err| return disk_verb_err(m, "stat", subpath, err);
+    m.console.puts("  File:    ");
+    m.console.print_line(name);
+    m.console.puts("  Size:    ");
+    m.console.print_u64(st.size);
+    m.console.print_line(" bytes");
+    m.console.puts("  Type:    ");
+    m.console.print_line(if (st.kind == vlfs.kind_dir) "directory" else "regular file");
+    m.console.puts("  Inode:   ");
+    m.console.print_u64(st.ino);
+    m.console.puts("\n");
+    m.console.puts("  Volume:  ");
+    m.console.print_line("vlfs");
     return .none;
 }
 
@@ -1745,6 +1847,9 @@ fn cmd_mktemp(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_stat(m: *Monitor, args: []const []const u8) ExecError {
     const name = args[0];
     if (!kernel_vf_allowed(name, .read)) return trust_denied(m, "stat", name);
+    if (file_table.parse_path(name)) |parsed| {
+        if (parsed.partition == .disk) return cmd_disk_stat(m, name, parsed.path[0..parsed.parsed_len()]);
+    }
     var st = virtio_file.StatResult{};
     const sst = virtio_file.stat(name, &st);
     if (sst != virtio_file.st_ok or st.is_dir) {
