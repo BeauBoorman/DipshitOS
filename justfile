@@ -210,8 +210,10 @@ verify-coordination:
 # gate fleet inventory (M40 GF1, issue #934 — docs/gate-fleet-inventory.md).
 # The check is the registration guard: every added/removed/renamed script
 # under tools/ must ship with a regenerated report.
+[positional-arguments]
 inventory-gates *ARGS:
-    bash tools/inventory-gates.sh {{ARGS}}
+    #!/usr/bin/env bash
+    bash tools/inventory-gates.sh "$@"
 
 # Lint the GitHub Actions workflows (class A — actionlint, pinned; self-bootstraps into .build/ when not on PATH)
 lint-workflows:
@@ -224,8 +226,10 @@ test-coordination:
 # One issue per card, and the card IS the claim: claim an EXISTING card (issue)
 # in place, adding the `claim` label + machine-read Owner/Scope/Touches fields.
 # Prefer this over filing a new issue.
+[positional-arguments]
 claim-card ISSUE *ARGS:
-    bash tools/status/claim-card.sh {{ISSUE}} {{ARGS}}
+    #!/usr/bin/env bash
+    bash tools/status/claim-card.sh "$@"
 
 # Rehearse the real-time claim:stale removal path end to end (live: creates + closes a throwaway claim issue; REHEARSAL_MODE=local forces the in-process guard run)
 rehearse-unlabel:
@@ -238,8 +242,10 @@ sweep-stale-claims:
 # For an existing card, prefer `just claim-card <issue>`.
 # Otherwise file an ad-hoc claim (tools/status/new-claim.sh, label `claim`),
 # bare title or full flags: `just claim "Fix the flake"` / `just claim --touches ...`.
+[positional-arguments]
 claim *ARGS:
-    bash tools/status/new-claim.sh {{ARGS}}
+    #!/usr/bin/env bash
+    bash tools/status/new-claim.sh "$@"
 
 # Create an isolated per-agent checkout (issue #523 item 1; claim 4928):
 #   just new-agent buffy m18-t16-scripting
