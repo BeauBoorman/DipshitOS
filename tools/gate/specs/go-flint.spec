@@ -41,8 +41,11 @@
 # 10.0.0.2:4748 to it (--net-tcp-respond/-relay). Run 11 proves `flint
 # ls-remote` + `clone <addr> <stream>` writing raw-JSONL verbatim into
 # sync-share; run 12 re-boots on the SAME share (the conflict-share pattern)
-# for `verify --all` + a REMOTE.json-bound bare `pull`; run 13 proves a wrong
-# `flint-remote` secret refuses `auth_failed` and writes nothing. Splitting
+# for `verify --all` + M101b `verify --remote` + a REMOTE.json-bound bare
+# `pull`; run 13 proves a wrong `flint-remote` secret refuses `auth_failed`
+# and writes nothing. M101b (#2314): sync-share carries a TRUSTED.TXT
+# keyring pinning the seed stream's author — without it clone/pull refuse
+# keyring_missing. Splitting
 # clone and verify/pull across boots also keeps the sequential-exec path off
 # the task-slot/file-channel reclamation race the M103 gate relies on
 # vi.Sleep(1) to absorb (observed: `gosh: FLINT.ELF: not found` +
@@ -442,8 +445,18 @@ stage_sync_share(
     "FLINT.ELF ls-remote 10.0.0.2:4748\n"
     "FLINT.ELF clone 10.0.0.2:4748 main\n",
 )
+# M101b (#2314): the publisher keyring at /host/FLINT/TRUSTED.TXT pins the
+# seed stream's author key, so clone/pull/verify --remote trust the seeded
+# stream. badauth-share carries none on purpose: auth_failed refuses at
+# hello before the keyring is ever read (and its FLINT/ dir must stay
+# absent for the run-13 no-writes assert).
+os.makedirs(os.path.join(run, "sync-share", "FLINT"), exist_ok=True)
+open(os.path.join(run, "sync-share", "FLINT", "TRUSTED.TXT"), "w", encoding="utf-8").write(
+    "#v1\nkey=" + good_changes[-1]["author"] + " name=sync-seed\n"
+)
 open(os.path.join(run, "sync-share", "FLINTJ", "12.SH"), "w", encoding="utf-8").write(
     "FLINT.ELF verify --all\n"
+    "FLINT.ELF verify --remote\n"
     "sleep 1\n"
     "FLINT.ELF pull\n",
 )
@@ -855,7 +868,7 @@ vgate_run 12 -- \
     --script-expect 'flint: pull up to date' \
     --script-expect-tail 3 --timeout 180
 
-vgate_assert 12 serial-contains 'sig: verified'
+vgate_assert 12 serial-count 'sig: verified' 2
 vgate_assert 12 serial-contains 'flint: pull up to date'
 vgate_assert 12 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
 vgate_assert 12 serial-absent 'abababababababababababababababababababababababababababababababab'

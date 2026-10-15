@@ -630,8 +630,11 @@ func (c *syncClient) append(stream string, expectedHead *string, rawLines [][]by
 // fetchAndVerifyStreamChanges pages `read` from `after` to the remote head
 // and verifies every returned Change before the caller writes anything:
 // parse, stream id, message bound, parent chain from expectedFirstParent,
-// and the Ed25519 signature — integrity must not depend on the transport.
-func fetchAndVerifyStreamChanges(client *syncClient, st *Stream, after, expectedFirstParent *string) ([][]byte, error) {
+// the publisher keyring (M101b: key_unknown/key_revoked), and the Ed25519
+// signature — integrity must not depend on the transport. The keyring is
+// loaded lazily only when new Changes arrived, so an up-to-date pull never
+// demands TRUSTED.TXT.
+func fetchAndVerifyStreamChanges(client *syncClient, fs FS, root string, st *Stream, after, expectedFirstParent *string) ([][]byte, error) {
 	var all [][]byte
 	cursor := after
 	for {
@@ -650,6 +653,14 @@ func fetchAndVerifyStreamChanges(client *syncClient, st *Stream, after, expected
 		cursor = &last.ID
 	}
 
+	var kr *Keyring
+	if len(all) > 0 {
+		var err error
+		kr, err = LoadKeyring(fs, root)
+		if err != nil {
+			return nil, err
+		}
+	}
 	prev := expectedFirstParent
 	for _, line := range all {
 		if len(line)+1 > maxChangeBytes {
@@ -671,6 +682,9 @@ func fetchAndVerifyStreamChanges(client *syncClient, st *Stream, after, expected
 			}
 		} else if c.Parent != nil {
 			return nil, refuse("change_malformed", "non-null root parent")
+		}
+		if err := kr.CheckAuthor(c.Author); err != nil {
+			return nil, err
 		}
 		ok, err := VerifyChange(&c)
 		if err != nil {
@@ -824,6 +838,83 @@ func sortStreamsByName(streams []Stream) {
 	}
 }
 
+// cmdVerifyRemote implements `flint verify --remote [--remote=<url>]
+// [--stream=<s>]` (M101b): fetch the remote stream's whole Change chain and
+// run the same verify-before-materialize gate clone/pull apply — every
+// Change's publisher key against TRUSTED.TXT, then its Ed25519 signature —
+// printing the per-change `sig: verified` lines `verify` uses. Read-only:
+// nothing is written to the store. The stream selector is --stream (name or
+// id) or the REMOTE.json binding; the remote is --remote=<url> or the
+// binding's remote.
+func cmdVerifyRemote(fs FS, root string, args []string) int {
+	var remoteFlag, streamFlag string
+	for _, a := range args {
+		switch {
+		case a == "--remote":
+		case strings.HasPrefix(a, "--remote="):
+			remoteFlag = a[len("--remote="):]
+		case strings.HasPrefix(a, "--stream="):
+			streamFlag = a[len("--stream="):]
+		default:
+			return runErr(refuse("usage", ""))
+		}
+	}
+
+	client, _, err := dialSync(fs, root, remoteFlag)
+	if err != nil {
+		return runErr(err)
+	}
+	defer client.close()
+
+	sel := streamFlag
+	if sel == "" {
+		rc, err := loadRemoteConfig(fs, root)
+		if err != nil {
+			return runErr(err)
+		}
+		if rc == nil || rc.Stream == "" {
+			return runErr(refuse("stream_missing", ""))
+		}
+		sel = rc.Stream
+	}
+	st, err := client.open(sel)
+	if err != nil {
+		return runErr(err)
+	}
+
+	var firstParent *string
+	if st.ForkedFrom != nil {
+		firstParent = &st.ForkedFrom.Change
+	}
+	lines, err := fetchAndVerifyStreamChanges(client, fs, root, st, nil, firstParent)
+	if err != nil {
+		return runErr(err)
+	}
+	if len(lines) == 0 {
+		// An empty log is only honest on a fork record whose head is the
+		// pinned fork origin.
+		if st.Head != nil && (st.ForkedFrom == nil || *st.Head != st.ForkedFrom.Change) {
+			return runErr(refuse("stream_malformed", "non-null head on empty stream"))
+		}
+		return 0
+	}
+	last, err := ParseChange(lines[len(lines)-1])
+	if err != nil {
+		return runErr(err)
+	}
+	if st.Head == nil || last.ID != *st.Head {
+		return runErr(refuse("stream_malformed", "head mismatch"))
+	}
+	for _, line := range lines {
+		c, err := ParseChange(line)
+		if err != nil {
+			return runErr(err)
+		}
+		consoleFn("flint: verify " + c.ID + " sig: verified")
+	}
+	return 0
+}
+
 // cmdClone implements `flint clone <remote> <stream>`: fetch the target
 // stream plus its forked_from ancestors, verify every Change, and write
 // the raw JSONL bytes into streams/<id>.jsonl verbatim. No workspace, no
@@ -906,7 +997,7 @@ func cmdClone(fs FS, root string, args []string) error {
 		if st.ForkedFrom != nil {
 			firstParent = &st.ForkedFrom.Change
 		}
-		lines, err := fetchAndVerifyStreamChanges(client, st, nil, firstParent)
+		lines, err := fetchAndVerifyStreamChanges(client, fs, root, st, nil, firstParent)
 		if err != nil {
 			return err
 		}
@@ -1109,7 +1200,7 @@ func cmdPull(fs FS, root string, args []string) error {
 	if expectedFirst == nil && localSt.ForkedFrom != nil {
 		expectedFirst = &localSt.ForkedFrom.Change
 	}
-	fetched, err := fetchAndVerifyStreamChanges(client, localSt, afterArg, expectedFirst)
+	fetched, err := fetchAndVerifyStreamChanges(client, fs, root, localSt, afterArg, expectedFirst)
 	if err != nil {
 		if re, ok := err.(*RefuseError); ok && re.Code == "change_missing" {
 			return refuse("fork_needed", "")
