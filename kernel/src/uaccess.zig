@@ -337,6 +337,14 @@ pub fn write_region_covers(address: u64, len: usize) bool {
     return range_ok(write_regions[c][0..write_region_count[c]], address, @intCast(len));
 }
 
+/// Diagnostic (#2354): the armed write region at `i` on this core;
+/// {0,0} past the armed count. Never called on the hot path.
+pub fn debug_write_region(i: usize) Region {
+    const c = core_index();
+    if (i >= write_region_count[c]) return .{ .base = 0, .len = 0 };
+    return write_regions[c][i];
+}
+
 pub fn copy_in(dst: []u8, address: u64, len: usize) Outcome {
     if (len == 0) return .ok;
     if (len > dst.len) return .fault; // caller bug: bounded by the buffer
