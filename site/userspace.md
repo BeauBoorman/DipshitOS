@@ -14,8 +14,8 @@ and scheduled as processes. The syscall boundary is a frozen, numbered ABI.
 
 The syscall ABI is frozen in `docs/decisions/0007-syscall-abi.md`: the syscall
 number goes in x8, arguments in x0–x5, the result in x0, dispatched through a
-runtime-built **128-slot** table. **Eighty slots are implemented**
-(0–79); the remaining slots return `ENOSYS`.
+runtime-built **128-slot** table. **Eighty-eight slots are implemented**
+(0–87); the remaining slots return `ENOSYS`.
 
 | Slot | Name | What it does |
 |-----:|------|--------------|
@@ -68,7 +68,11 @@ runtime-built **128-slot** table. **Eighty slots are implemented**
 | 76 | `sock_ready` | socket readiness for the Go netpoll (#1163) |
 | 77 | `file_sync` | `fsync` for EL0 — push `/host` writes to the live fd (M66a, ADR 0007 amendment) |
 | 78 | `time_set` | set the guest wall clock within the documented epoch range (M83b, ADR 0007 amendment) |
-| 79 | `fs_metadata` | bounded filesystem metadata and contained operations (B3) |
+| 79 | `fs_metadata` | bounded filesystem metadata and contained operations (B3); also the `/disk` VLFS surface since M100c |
+| 80 | `socket` | op-dispatched native socket handles (B6 #1873, ADR 0007 amendment) |
+| 81/82/83 | `trace` / `profile` / `memstat` | the M94 observability seam: tracer, 100 Hz sampler, heap/memory stats (ADR 0043) |
+| 84–86 | `udp_send_from` / `udp_recv_from` / `udp_close` | bound-source-port UDP send, sender-prefixed receive, and listen-port release (ADR 0007 amendment) |
+| 87 | `getpid` | an unforgeable self-pid answer (ADR 0048) |
 
 ## Fault-safe uaccess
 

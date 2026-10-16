@@ -28,7 +28,7 @@ Boot Services and drives the hardware itself.
 
 - **Apple silicon** Mac (any Apple-silicon generation the macOS floor supports).
 - **macOS 27 or newer** — the launcher enforces this floor at runtime.
-- **Zig 0.16.0** — pinned in the repo's `.zigversion`.
+- **Zig 0.17.0** — pinned in the repo's `.zigversion`.
 - **Swift + Xcode command line tools** — for the Virtualization.framework launcher.
 - **Python 3** and **bash** — for the disk-image tooling and gate scripts.
 

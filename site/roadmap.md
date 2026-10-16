@@ -46,20 +46,37 @@ is the canonical, always-current source; this is the readable summary.
 | 30 | Dynamic linking: freestanding `LD.SO`, `LIBUI.SO`/`LIBFONT.SO`, W^X multi-aperture isolation |
 | 31 | Dynamic linking ecosystem: `CALC.ELF`/`NOTEPAD.ELF`/`FILE.ELF`/`DESKTOP.ELF`, `dlopen`/`dlsym` |
 
-Milestones through **M86** have landed. **M87**, First impressions + remote
-terminal, is still open on the tracker; `docs/status.md` is the ledger. For a
+Milestones through **M104** have landed (M96's index awaits its owner
+acceptance run); `docs/status.md` is the ledger. For a
 curated account of merged work from 2026-09-01 through 2026-10-02, see the
 [[chronicle|weekly merged-PR chronicle]].
 
 ## Current
 
-**M87, First impressions + remote terminal**, remains open
-([#1856](https://github.com/drawmeanelephant/VirelaiOS/issues/1856)). The
-default-desktop launcher and authenticated serial client landed, but remote
-class-C acceptance needs a distinct connecting machine and an authorized SSH
-target. That resource was not supplied for the current verification; see
-[#1860](https://github.com/drawmeanelephant/VirelaiOS/issues/1860). The M84
-remote-framebuffer arc closed on 2026-09-30.
+Five arcs are open on the tracker, each with its first cards already on main:
+
+- **M100, a disk of our own** ([#2302](https://github.com/drawmeanelephant/VirelaiOS/issues/2302))
+  — ADR 0050's journaled guest filesystem (VLFS) on a dedicated virtio-blk
+  image. Landed: the RW block driver + the runner's `--data-disk` attach
+  (M100b) and `mkfs.vlfs` + the kernel's read-only `/disk` mount (M100c).
+  Ahead: the journaled write path, fsck + the kill-mid-write gate, adoption.
+- **M101, software arrives signed** ([#2303](https://github.com/drawmeanelephant/VirelaiOS/issues/2303))
+  — `FLINT.ELF` speaks FLINT-SYNC/1 (`clone`/`pull`/`push`/`ls-remote`) and
+  verifies a pinned publisher keyring before materializing (M101a/b). Ahead:
+  the `STORE.ELF` install seam (the release-manifest convention is decided)
+  and update/rollback.
+- **M105, FLINT host client** ([#2283](https://github.com/drawmeanelephant/VirelaiOS/issues/2283))
+  — the cross-platform Zig client spec is landed; the `flintd` server already
+  shipped in [flint-server](https://github.com/drawmeanelephant/flint-server)
+  (M106).
+- **M107, the guest builds the guest** ([#2304](https://github.com/drawmeanelephant/VirelaiOS/issues/2304))
+  — `GOBUILD.ELF` walks an import graph and drives the in-guest
+  `cmd/compile`/`cmd/link` through a multi-package build with named refusals
+  (M107a/b); GOEDIT diagnostics navigation is in review (M107c).
+- **M108, through the glass** ([#2305](https://github.com/drawmeanelephant/VirelaiOS/issues/2305))
+  — ADR 0051's consented host lanes: the bidirectional clipboard over signed
+  VHI1 share files is landed and gated (M108b); host→guest file drop-in and
+  guest→host notify-out remain.
 
 Honest-bound edges that remain planned regardless of milestone:
 
@@ -67,10 +84,13 @@ Honest-bound edges that remain planned regardless of milestone:
   memory reclaim.
 - **Routing beyond the NAT gateway** and any IPv6 stack; TCP RTO stays fixed
   (no adaptive estimation), and the TCP client is single-connection.
-- **Deeper filesystem semantics** — M13's B1 shipped delete/rename/
-  truncate/free and no app has produced new pressure.
-- **Multi-display and accelerated/3D graphics** — the guest stays
-  single-display, 2D-blit-only.
+- **Deeper filesystem semantics on the share** — M13's B1 shipped
+  delete/rename/truncate/free and no app has produced new pressure; the
+  journaled VLFS volume currently mounts read-only (M100c), with the write
+  path and fsck still open cards.
+- **Multi-display** — the guest stays single-display. Accelerated 3D exists
+  only as the opt-in M102 custom-virtio Metal device; the default desktop is
+  2D.
 
 Both former "open thread" caveats are resolved and shipped: the M8 U4
 pointer-focus proof is now class-B-headless via custom-virtio pointer
