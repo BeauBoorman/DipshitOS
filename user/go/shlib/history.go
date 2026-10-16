@@ -10,18 +10,58 @@
 // clobber the other.
 package shlib
 
-import "virelai/vi"
+import (
+	"virelai/settings"
+	"virelai/vi"
+)
 
 const (
 	// M69f1 (#1537): the shell's own persistent history. NOT the monitor's
 	// HISTORY.TXT -- mixing the kernel actor's `virelai>` verbs into GOSH's
 	// Up-arrow recall would be worse than no persistence at all.
-	histPath = "/host/GOSH-HISTORY.TXT"
+	histName = "GOSH-HISTORY.TXT"
 	// M69f1 (#1537) D3: persistence is best-effort. ONE line, once, and the
 	// session continues -- a share that refuses the write must not end a
 	// shell.
 	markerHistFail = "gosh: history not persisted"
+	// M100f (#2311): the data-root lines — printed once per process at the
+	// latched resolution, and only when the row opted in. `not_mounted` is
+	// the kernel's named refusal for an absent VLFS mount (ADR 0050 D6).
+	markerHistRoot         = "gosh: data_root=/disk"
+	markerHistRootFallback = "gosh: data_root=disk but /disk not_mounted; using /host"
 )
+
+// histPath is where the history file lives this boot: the share path unless
+// the data_root row opted in AND a VLFS data disk mounted (M100f, ADR 0050
+// D6). Resolved lazily on first use and latched — the mount table is fixed
+// for a boot, and a mid-session `data_root` flip must not split one shell's
+// history across two volumes.
+var histPath = settings.DataRootHost + "/" + histName
+
+// histResolved latches the boot's resolution; histResolve is the seam itself
+// (a var so host tests pin the disk and fallback legs).
+var histResolved bool
+var histResolve = func() (string, bool) {
+	return settings.Load().ResolveDataRoot()
+}
+
+func resolveHistPath() {
+	if histResolved {
+		return
+	}
+	histResolved = true
+	root, fellBack := histResolve()
+	if root == "" {
+		root = settings.DataRootHost
+	}
+	histPath = root + "/" + histName
+	switch {
+	case fellBack:
+		vi.ConsoleLine(markerHistRootFallback)
+	case root == settings.DataRootDisk:
+		vi.ConsoleLine(markerHistRoot)
+	}
+}
 
 // maxHistoryBytes bounds the load. The writer keeps the file inside the ring
 // bound, so a larger file is not ours: refuse it whole instead of parsing a
@@ -50,6 +90,7 @@ type HistorySink struct {
 // ring, not an error; a read failure is treated the same way (D3: the file
 // is a convenience, and a share that cannot answer must not stop the boot).
 func LoadHistory(st histStore, h *History, s *HistorySink) {
+	resolveHistPath()
 	b, err := st.ReadFile(histPath, maxHistoryBytes)
 	if err != nil || len(b) == 0 {
 		return
@@ -66,6 +107,7 @@ func LoadHistory(st histStore, h *History, s *HistorySink) {
 // the file past the bound, it is rewritten whole from the ring, which has
 // already dropped the oldest lines.
 func SaveHistory(st histStore, h *History, line string, s *HistorySink) {
+	resolveHistPath()
 	// Idempotent: the editor already pushed this line when it submitted, so
 	// this is a no-op in the shell and the reason the function is honest on
 	// its own in a test.

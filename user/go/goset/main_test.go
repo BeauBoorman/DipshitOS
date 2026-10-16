@@ -557,3 +557,31 @@ func TestTimezoneRowCyclesAndValidatesBeforeSave(t *testing.T) {
 		t.Fatalf("change notification keys = %v, want timezone", got)
 	}
 }
+
+// M100f (#2311): the data-root row is accepted-but-unseeded and never a
+// default display row (a default GOSET save stays byte-identical). Typed
+// input validates host|disk before the row materializes, and a materialized
+// row cycles like every vocabulary row.
+func TestDataRootRowValidatesAndMaterializes(t *testing.T) {
+	a := newPanel(nil)
+	if _, ok := settings.Get(a.disp, "data_root"); ok {
+		t.Fatal("a default panel materialized data_root")
+	}
+	for _, val := range []string{"", "usb", "DISK", "/disk", "on"} {
+		a.input.SetValue("data_root=" + val)
+		a.applyInput()
+		if _, ok := settings.Get(a.disp, "data_root"); ok {
+			t.Fatalf("invalid %q materialized data_root", val)
+		}
+	}
+	a.input.SetValue("data_root=disk")
+	a.applyInput()
+	if v, ok := settings.Get(a.disp, "data_root"); !ok || v != "disk" {
+		t.Fatalf("typed data_root = %q ok=%v, want disk", v, ok)
+	}
+	a.sel = rowOf(t, a, "data_root")
+	a.cycle(1)
+	if got, _ := settings.Get(a.disp, "data_root"); got != "host" {
+		t.Fatalf("cycling disk gave %q, want host", got)
+	}
+}

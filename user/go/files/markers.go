@@ -71,6 +71,14 @@ const (
 	markerOpenLaunched = "gofiles: open launched "
 	markerOpenLaunchNo = "gofiles: open launch refused "
 
+	// M100f (#2311): the volumes root. The listing reuses markerList /
+	// markerEntry on the synthetic path "/", and the disk row's mount state
+	// is named every list (`not_mounted` is the kernel's own refusal name,
+	// ADR 0050 D6). `volume refused` is the enter attempt on an absent /disk.
+	markerVolDiskMounted = "gofiles: volume disk mounted"
+	markerVolDiskAbsent  = "gofiles: volume disk not_mounted"
+	markerVolRefused     = "gofiles: volume refused "
+
 	// M81f (#1766): the change feed. `watch armed` says the subscription is
 	// live (the baseline listing is taken); the event markers name what the
 	// feed observed since the previous poll, followed by the refreshed

@@ -557,7 +557,7 @@ func TestLoadNotifyHistoryRestoresBeforeTheFirstPaint(t *testing.T) {
 		t.Fatal("precondition: an empty center already shows the hint")
 	}
 
-	if state := loadNotifyHistory(); state != notifyHistRestored {
+	if state := loadNotifyHistory(settings.File{}); state != notifyHistRestored {
 		t.Fatalf("state = %v, want restored", state)
 	}
 	if len(notifyCenter) != 3 {
@@ -603,7 +603,7 @@ func TestLoadNotifyHistoryRestoresBeforeTheFirstPaint(t *testing.T) {
 func TestLoadNotifyHistoryMissingFileIsSilentAndUntouched(t *testing.T) {
 	resetNotify(t)
 	share := fakeNotifyFiles(t)
-	if state := loadNotifyHistory(); state != notifyHistMissing {
+	if state := loadNotifyHistory(settings.File{}); state != notifyHistMissing {
 		t.Fatalf("state = %v, want missing", state)
 	}
 	if len(notifyCenter) != 0 || notifyHistDirty || len(share.writes) != 0 {
@@ -633,7 +633,7 @@ func TestLoadNotifyHistoryCorruptIsRefusedWholeAndHeals(t *testing.T) {
 		// Whatever the center held is not a survivor of a refused file.
 		notifyCenter = []centerNotification{{text: "stale"}}
 
-		if state := loadNotifyHistory(); state != notifyHistCorrupt {
+		if state := loadNotifyHistory(settings.File{}); state != notifyHistCorrupt {
 			t.Fatalf("%s: state = %v, want corrupt", name, state)
 		}
 		if len(notifyCenter) != 0 {
@@ -653,7 +653,7 @@ func TestLoadNotifyHistoryCorruptIsRefusedWholeAndHeals(t *testing.T) {
 		resetNotify(t)
 		fakeAgain := fakeNotifyFiles(t)
 		fakeAgain.data, fakeAgain.present = share.data, true
-		if state := loadNotifyHistory(); state != notifyHistRestored || len(fakeAgain.writes) != 0 {
+		if state := loadNotifyHistory(settings.File{}); state != notifyHistRestored || len(fakeAgain.writes) != 0 {
 			t.Fatalf("%s: second boot state=%v writes=%d, want a clean restore", name, state, len(fakeAgain.writes))
 		}
 	}
@@ -663,7 +663,7 @@ func TestLoadNotifyHistoryCorruptWithAFailingShareStaysDirtyAndRetries(t *testin
 	resetNotify(t)
 	share := fakeNotifyFiles(t)
 	share.data, share.present, share.failing = []byte("junk"), true, true
-	if state := loadNotifyHistory(); state != notifyHistCorrupt {
+	if state := loadNotifyHistory(settings.File{}); state != notifyHistCorrupt {
 		t.Fatalf("state = %v", state)
 	}
 	if !notifyHistDirty || !notifyHistFailLogged {
@@ -778,7 +778,7 @@ func TestHeldNoticeSurvivesARestart(t *testing.T) {
 
 	// "Restart": a fresh center, the same share.
 	notifyCenter, notifyCenterNextID, notifyHistDirty = nil, 0, false
-	if state := loadNotifyHistory(); state != notifyHistRestored {
+	if state := loadNotifyHistory(settings.File{}); state != notifyHistRestored {
 		t.Fatalf("state = %v", state)
 	}
 	if len(notifyCenter) != 1 || notifyCenter[0].text != "held while away" || notifyCenter[0].source != "files" {
@@ -826,7 +826,7 @@ func TestNotifyHistoryDefaultSeamsDegradeOffGuest(t *testing.T) {
 	readNotifyFile, writeNotifyFile = vi.ReadFileAll, func(path string, data []byte) bool {
 		return vi.WriteFileSafe(path, data) == 0
 	}
-	if state := loadNotifyHistory(); state != notifyHistMissing {
+	if state := loadNotifyHistory(settings.File{}); state != notifyHistMissing {
 		t.Fatalf("host read state = %v, want missing", state)
 	}
 	notifyPush(4, "n", 0)
@@ -1130,5 +1130,51 @@ func TestChimeApproximationsHitTheirAnchors(t *testing.T) {
 			t.Fatalf("the decay is not monotone: e^-%d = %v after %v", i, v, prev)
 		}
 		prev = v
+	}
+}
+
+// M100f (#2311): the notify history is part of the movable set — an opted-in
+// boot with a mounted VLFS volume reads and publishes /disk/NOTIFY.HIST, and
+// a set-but-absent disk keeps the share path. The resolver seam is stubbed;
+// the file seams still see whatever path the resolution chose.
+func TestNotifyHistoryFollowsTheDataRoot(t *testing.T) {
+	resetNotify(t)
+	notifyDataRoot = func(f settings.File) (string, bool) { return "/disk", false }
+	var reads, writes []string
+	readNotifyFile = func(path string, max int) ([]byte, int64) {
+		reads = append(reads, path)
+		return nil, -2
+	}
+	writeNotifyFile = func(path string, b []byte) bool {
+		writes = append(writes, path)
+		return true
+	}
+	if state := loadNotifyHistory(settings.File{Rows: []settings.Setting{{Key: settings.DataRootKey, Val: "disk"}}, State: settings.StateOK}); state != notifyHistMissing {
+		t.Fatalf("state = %v, want missing (an empty new volume)", state)
+	}
+	if notifyHistoryPath != "/disk/NOTIFY.HIST" {
+		t.Fatalf("history path = %q, want the disk path", notifyHistoryPath)
+	}
+	if len(reads) != 1 || reads[0] != "/disk/NOTIFY.HIST" {
+		t.Fatalf("load read %v, want /disk/NOTIFY.HIST", reads)
+	}
+	notifyPush(4, "n", 0)
+	flushNotifyHistory()
+	if len(writes) != 1 || writes[0] != "/disk/NOTIFY.HIST" {
+		t.Fatalf("publish wrote %v, want /disk/NOTIFY.HIST", writes)
+	}
+}
+
+func TestNotifyHistoryDataRootFallback(t *testing.T) {
+	resetNotify(t)
+	notifyDataRoot = func(f settings.File) (string, bool) { return "/host", true }
+	var readPath string
+	readNotifyFile = func(path string, max int) ([]byte, int64) {
+		readPath = path
+		return nil, -2
+	}
+	loadNotifyHistory(settings.File{Rows: []settings.Setting{{Key: settings.DataRootKey, Val: "disk"}}, State: settings.StateOK})
+	if notifyHistoryPath != "/host/NOTIFY.HIST" || readPath != "/host/NOTIFY.HIST" {
+		t.Fatalf("fallback path = %q read %q, want the share path", notifyHistoryPath, readPath)
 	}
 }

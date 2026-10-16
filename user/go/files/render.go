@@ -86,7 +86,7 @@ func (m model) renderLines() []string {
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · o open with · backspace up · r rename · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("j/k move · enter open · o open with · v volumes · backspace up · r rename · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }

@@ -43,6 +43,9 @@ const (
 	// idle_minutes + notify_dnd + timezone + notify_sound + audio_volume) is
 	// 19 rows, and the table must hold a file that carries all of them with
 	// one slot to spare rather than silently dropping the last row at load.
+	// M100f (#2311) adds data_root, so the union is exactly at the cap: a
+	// file carrying every known row still loads intact; the row past it is
+	// the one that drops.
 	MaxKeys = 20
 	MaxKey  = 32
 	MaxVal  = 64
@@ -276,6 +279,36 @@ const TimezoneKey = "timezone"
 // IsTimezoneKey reports whether key is the M83c timezone row.
 func IsTimezoneKey(key string) bool { return key == TimezoneKey }
 
+// DataRootKeys is the M100f (#2311) data-root row: accepted-but-unseeded AND
+// not a default panel row, like notify_sound — the kernel's table stays
+// unchanged, an absent row means the host share, and the row materializes
+// in GOSET once it is set, after which it cycles host|disk like every
+// vocabulary row. (Display-materializing it would write data_root=host into
+// every GOSET save — a byte change to default SETTINGS.TXT the opt-in does
+// not need.) The kernel never interprets the row: the movable data set
+// (GOSH history, the notify history, the fetch download default) resolves
+// through File.ResolveDataRoot, and SETTINGS.TXT itself always stays on
+// /host — it is the pointer, not the payload.
+var DataRootKeys = []Key{
+	{Name: "data_root", Default: "host", Vocab: []string{"host", "disk"}},
+}
+
+// DataRootKey is the data-root key's name, for the movable set's readers.
+const DataRootKey = "data_root"
+
+// IsDataRootKey reports whether key is the M100f data-root row.
+func IsDataRootKey(key string) bool {
+	return key == DataRootKey
+}
+
+// ValidDataRoot reports whether the value names a real data root. The
+// resolver treats anything but an exact `disk` as the host default anyway,
+// so a refused value here is one a save would write and a boot would read
+// as `host` — the panel names it instead of persisting a silent lie.
+func ValidDataRoot(value string) bool {
+	return value == "host" || value == "disk"
+}
+
 // ValidTimezone reports whether the value names a fixed offset clockfmt
 // parses.
 func ValidTimezone(value string) bool {
@@ -344,13 +377,13 @@ func IsPaletteKey(key string) bool {
 // Editable is the panel's write gate: a kernel-table key, one of the
 // custom-palette keys, font_size (M80i), keyboard_layout (M83d2),
 // idle_minutes (M83f), notify_dnd (M82d2), notify_sound or audio_volume
-// (M99d), or timezone (M83c).
+// (M99d), timezone (M83c), or data_root (M100f).
 // Anything else is named and dropped, never written.
 func Editable(key string) bool {
 	_, known := Known(key)
 	return known || IsPaletteKey(key) || IsFontKey(key) || IsKeyboardLayoutKey(key) ||
 		IsIdleMinutesKey(key) || IsNotifyDNDKey(key) || IsNotifySoundKey(key) ||
-		IsVolumeKey(key) || IsTimezoneKey(key)
+		IsVolumeKey(key) || IsTimezoneKey(key) || IsDataRootKey(key)
 }
 
 // ValidColour is the palette value grammar, mirrored from the kernel's
@@ -420,7 +453,7 @@ func Default(key string) (string, bool) {
 			return k.Default, true
 		}
 	}
-	for _, group := range [][]Key{NotifyKeys, NotifySoundKeys, VolumeKeys, TimezoneKeys} {
+	for _, group := range [][]Key{NotifyKeys, NotifySoundKeys, VolumeKeys, TimezoneKeys, DataRootKeys} {
 		for _, k := range group {
 			if k.Name == key {
 				return k.Default, true
@@ -453,6 +486,9 @@ func Vocab(key string) ([]string, bool) {
 	}
 	if !ok {
 		k, ok = findKey(TimezoneKeys, key)
+	}
+	if !ok {
+		k, ok = findKey(DataRootKeys, key)
 	}
 	if !ok {
 		return nil, false

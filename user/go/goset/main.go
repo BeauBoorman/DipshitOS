@@ -329,6 +329,14 @@ func (a *panel) applyInput() bool {
 		vi.ConsoleLine(markerDiscard + line)
 		return true
 	}
+	// M100f (#2311): the data-root row is host|disk — anything else reads
+	// as the host default at resolve time, which would silently lie about
+	// what the boot will do; refuse it before it reaches the file.
+	if settings.IsDataRootKey(key) && !settings.ValidDataRoot(val) {
+		a.status = "data_root: host or disk"
+		vi.ConsoleLine(markerDiscard + line)
+		return true
+	}
 	a.set(key, val)
 	return true
 }

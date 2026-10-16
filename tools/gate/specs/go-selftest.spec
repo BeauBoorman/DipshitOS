@@ -180,6 +180,12 @@
 #             `clock=yes` in the receipt is the boot's EFI epoch present;
 #             the same drill would prove the pid rules in a no-epoch boot.
 #
+#   * disk — the M100f (#2311) VLFS leg. This run attaches no --data-disk,
+#             so the case records `mounted=no` on /host and passes (a data
+#             disk is an enhancement, never a requirement — ADR 0050 D6).
+#             The mounted write/fsync/readback drill and its receipts are
+#             pinned by live-vlfs-dataroot.spec.
+#
 # The report fixture below is byte-exact on purpose — the report is
 # deterministic (ADR 0031). Adding a case updates the fixture, the
 # share-contains case count, and want_summary in the python block.
@@ -233,9 +239,10 @@ case file-snapshot pass
 case app-logs pass
 case file-lease pass
 case window pass
+case disk pass
 case clock-epoch pass
 case clock-set pass
-summary cases=23 failed=0
+summary cases=24 failed=0
 EOF
 vgate_file clock-set.expected <<'EOF'
 case clock-set refused=4 stepped=+100 restored=yes
@@ -704,7 +711,7 @@ vgate_assert 01 share-equals SELFTEST/OUT/clock-set.ok clock-set.expected
 vgate_assert 01 share-contains SELFTEST/OUT/file-lease.copy 'token=0123456789abcdef'
 vgate_assert 01 share-contains SELFTEST/OUT/file-lease.copy 'path=/host/SELFTEST/LEASE/TARGET.TXT'
 vgate_assert 01 share-equals CRASH/GOSELF.ELF.TXT app-log-receipt.expected
-vgate_assert 01 share-contains SELFTEST/OUT/summary.txt 'summary cases=23 failed=0'
+vgate_assert 01 share-contains SELFTEST/OUT/summary.txt 'summary cases=24 failed=0'
 
 # The load-bearing assert: the copies and the receipts on the host's own
 # filesystem must be byte-exact, the share's directory state must agree with
@@ -781,7 +788,7 @@ win_open_rect = (32, 32, 640, 400)
 win_viewport_w = 1100
 win_viewport_h = 720
 
-want_summary = b"summary cases=23 failed=0\n"
+want_summary = b"summary cases=24 failed=0\n"
 want_hello = b"goself smoke\n"
 want_intake_receipt = b"case intake path=IN/fixture.txt bytes=25 match=yes\n"
 want_altered_receipt = b"case intake-altered path=IN/altered.txt bytes=25 differs=yes\n"
@@ -893,6 +900,12 @@ require(os.path.join(out, "file-bigwrite.ok"), want_bigwrite_receipt, "BIGWRITE 
 require(os.path.join(out, "file-clamp.ok"), want_clamp_receipt, "CLAMP RECEIPT")
 require(os.path.join(out, "file-fsync.ok"), want_fsync_receipt, "FSYNC RECEIPT")
 require(os.path.join(out, "file-errors.ok"), want_errors_receipt, "ERRORS RECEIPT")
+# M100f (#2311): the disk leg's receipt lands on /host like every other
+# case's. This boot attaches no --data-disk, so the case must record the
+# mounted=no skip honestly — the mounted drill is the opt-in leg, pinned by
+# live-vlfs-dataroot.spec.
+require(os.path.join(out, "file-disk.ok"), b"case disk mounted=no skipped\n",
+        "DISK RECEIPT (no data disk attached)")
 require(os.path.join(out, "append.copy"), append_body, "APPEND COPY")
 require(os.path.join(out, "bigwrite.copy"), bigwrite_body, "BIGWRITE COPY")
 require(os.path.join(out, "clamp.copy"), clamp_body, "CLAMP COPY")

@@ -342,7 +342,7 @@ func main() {
 	// first composite paint, so the first frame already shows the restored
 	// count and the first notice already obeys DND.
 	configureNotifyDND(seatSettings)
-	loadNotifyHistory()
+	loadNotifyHistory(seatSettings)
 	// M108b (#2325, ADR 0051): the host-integration lane engine. The probe
 	// reads the host-int credential once; absent is byte-silent (D7). The
 	// lane runs in BOTH seat modes — it is not demo choreography.

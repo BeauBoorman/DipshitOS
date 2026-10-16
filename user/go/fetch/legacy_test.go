@@ -515,3 +515,27 @@ func TestParseResponseHeadRefusesUnsupportedFraming(t *testing.T) {
 		t.Fatalf("identity encoding refused: %v", err)
 	}
 }
+
+// M100f (#2311): the no-DEST download default follows the data_root row —
+// /disk on a mounted opt-in, the share path on the set-but-absent fallback,
+// and an explicit DEST always wins either way.
+func TestDownloadDestFollowsDataRoot(t *testing.T) {
+	saved := fetchDataRoot
+	defer func() { fetchDataRoot = saved }()
+
+	fetchDataRoot = func() (string, bool) { return "/disk", false }
+	a, legacy := parseLegacyArgs([]string{"GOFETCH.ELF", "--download"})
+	if !legacy || a.dest != "/disk/DOWNLOAD.OUT" {
+		t.Fatalf("mounted opt-in dest = %q legacy=%v", a.dest, legacy)
+	}
+	a, _ = parseLegacyArgs([]string{"GOFETCH.ELF", "--download", "http://10.0.0.2/f.bin", "OUT.BIN"})
+	if a.dest != "OUT.BIN" {
+		t.Fatalf("explicit DEST overridden: %q", a.dest)
+	}
+
+	fetchDataRoot = func() (string, bool) { return "/host", true }
+	a, _ = parseLegacyArgs([]string{"GOFETCH.ELF", "--download"})
+	if a.dest != legacyDefaultDest {
+		t.Fatalf("fallback dest = %q, want %q", a.dest, legacyDefaultDest)
+	}
+}

@@ -147,6 +147,15 @@ const (
 	// the present verdict.
 	windowReceipt = outDir + "/window.txt"
 
+	// M100f (#2311, ADR 0050): the disk leg's paths. Everything the case
+	// mutates lives under /disk/SELFTEST; the receipts stay on /host like
+	// every other case — the host byte-compares them even though the bytes
+	// under test never touch the share.
+	diskDir  = "/disk/SELFTEST"
+	diskPath = diskDir + "/DISK.TXT"
+	diskOk   = outDir + "/file-disk.ok"
+	diskCopy = outDir + "/disk.copy"
+
 	// M81e2 (#1787): the publish seam the shell hook stands on. The file
 	// is named for what it models — GOSH's history save — because that IS
 	// the caller: the ring-replace save and the one-line append.
@@ -212,6 +221,7 @@ const (
 	clampKeptUnits  = 5
 	clampExtraUnits = 3
 	fsyncUnits      = 7
+	diskUnits       = 21 // M100f: the disk leg's body, same one-expression rule
 
 	// fileWriteMax mirrors the kernel's sys_file_write stage cap
 	// (handle_file_write refuses count > 2048 with -ENOSPC).
@@ -257,6 +267,7 @@ func clampFull() []byte         { return []byte(strings.Repeat(fileUnit, clampUn
 func clampKept() []byte         { return []byte(strings.Repeat(fileUnit, clampKeptUnits)) }
 func clampExtra() []byte        { return []byte(strings.Repeat(fileUnit, clampExtraUnits)) }
 func fsyncPayload() []byte      { return []byte(strings.Repeat(fileUnit, fsyncUnits)) }
+func diskPayload() []byte       { return []byte(strings.Repeat(fileUnit, diskUnits)) }
 
 // The M81e publish bodies: a long body replaced by a short one, so the case
 // can prove the publish is whole-file. An in-place writer would leave the
@@ -471,6 +482,11 @@ func cases() []testCase {
 		{id: "file-lease", run: caseFileLease},
 		// M61e (#1385): the window receipt.
 		{id: "window", run: caseWindow},
+		// M100f (#2311): the VLFS data-disk leg — write, fsync, readback on
+		// /disk with the receipts on /host; mounted=no skip on the default
+		// no-disk fleet. Before the clock cases so their wall-time reads
+		// stay the tail.
+		{id: "disk", run: caseDisk},
 		// M83a (#1774): add the epoch receipt at the tail so existing
 		// report rows keep their order and their host-test indexes.
 		{id: "clock-epoch", run: caseClockEpoch},
@@ -1424,6 +1440,68 @@ func caseWindow(s *syscalls) error {
 		// what the two writes could not.
 		return errors.New("query reports an empty window: " +
 			strconv.FormatUint(uint64(gotW), 10) + "x" + strconv.FormatUint(uint64(gotH), 10))
+	}
+	return nil
+}
+
+// caseDisk is the M100f (#2311, ADR 0050) VLFS leg: write → fsync → close →
+// reopen → read-back on the guest's own journaled volume, with the receipts
+// on /host so the host byte-compares the evidence even while the disk is the
+// thing under test (the fsync is a real VIRTIO_BLK_T_FLUSH barrier — D4's
+// commit ordering means the write was already durable; the call is still the
+// ABI's own verb, exercised end to end).
+//
+// The probe is one dirlist of the volume root: no data disk attached (or a
+// refused mount) is the kernel's named `not_mounted`, surfaced through the
+// file ABI as ENOENT — the case records `mounted=no` and PASSES, because the
+// default fleet boots no disk and ADR 0050 makes a disk an enhancement,
+// never a requirement. A mounted volume that cannot complete the drill is a
+// FAIL, not a skip — the opt-in run is where this case earns its keep.
+func caseDisk(s *syscalls) error {
+	s.mkdir(outDir)
+	var probe [1]vi.DirEntry
+	if _, rc := s.list("/disk", probe[:]); rc < 0 {
+		return writeReceipt(s, diskOk, "case disk mounted=no skipped")
+	}
+	if rc := s.mkdir(diskDir); rc < 0 && rc != -9 { // -9 EEXIST: re-run is fine
+		return errors.New("mkdir disk rc=" + strconv.FormatInt(rc, 10))
+	}
+	want := diskPayload()
+	h, rc := s.open(diskPath, vi.ModeWrite|vi.ModeCreate)
+	if rc < 0 {
+		return errors.New("open rc=" + strconv.FormatInt(rc, 10))
+	}
+	werr := writeAll(s, uint32(h), want)
+	frc := int64(0)
+	if werr == nil {
+		frc = s.sync(uint32(h))
+	}
+	s.close(uint32(h))
+	if werr != nil {
+		return werr
+	}
+	if frc < 0 {
+		return errors.New("fsync rc=" + strconv.FormatInt(frc, 10))
+	}
+	got, err := readFile(s, diskPath, len(want)+1)
+	if err != nil {
+		return err
+	}
+	match := bytes.Equal(got, want)
+	// The receipts are written BEFORE the verdict (the files are the
+	// evidence): disk.copy carries the bytes READ BACK off the volume, not
+	// the intended body — a lying disk fails the host's byte-compare.
+	if cerr := copyBytes(s, diskCopy, got); cerr != nil {
+		return cerr
+	}
+	line := "case disk mounted=yes path=SELFTEST/DISK.TXT wrote=" +
+		strconv.Itoa(len(want)) + " fsync=" + strconv.FormatInt(frc, 10) +
+		" read=" + strconv.Itoa(len(got)) + " match=" + yesNo(match)
+	if rerr := writeReceipt(s, diskOk, line); rerr != nil {
+		return rerr
+	}
+	if !match || len(got) != len(want) {
+		return errors.New("read-back is not the written body")
 	}
 	return nil
 }

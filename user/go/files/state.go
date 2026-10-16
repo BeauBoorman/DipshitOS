@@ -148,10 +148,19 @@ func (m *model) clampSel() {
 // itself just took is what "unchanged" means, so its own cd/rename/paste
 // never comes back as a watch event.
 func (m *model) refresh() {
+	if m.path == volsPath {
+		m.refreshVolumes()
+		return
+	}
 	n, rc := vi.DirList(m.path, m.entries[:])
 	if rc < 0 {
 		m.n, m.sel = 0, 0
 		m.status = "list err"
+		// An ENOENT under /disk is the kernel's `not_mounted` (ADR 0050
+		// D6) — name it so an absent data disk never reads as corruption.
+		if volumeOf(m.path) == volDisk && !diskMounted() {
+			m.status = "disk: not mounted"
+		}
 		m.emit(markerListErr + vi.Itoa64(rc))
 		m.watcher.Adopt(vi.DirSnapshot{OK: false})
 		m.loadPreview()
@@ -177,6 +186,32 @@ func (m *model) refresh() {
 	m.loadPreview()
 }
 
+// refreshVolumes lists the synthetic volumes root (M100f #2311): the two
+// mount names in the same wire-entry shape a real listing carries, so the
+// whole render/selection machinery applies unchanged. The disk row's mount
+// state is named every list — the kernel's refusal for an absent mount is
+// `not_mounted` (ADR 0050 D6), and the marker carries it verbatim.
+func (m *model) refreshVolumes() {
+	m.entries[0] = volEntry(volHost)
+	m.entries[1] = volEntry(volDisk)
+	m.n = 2
+	m.clampSel()
+	// The feed never watches the synthetic root; adopt an empty baseline so
+	// the next real listing's first poll is primed, not diffed against this.
+	m.watcher.Adopt(vi.DirSnapshot{OK: false})
+	m.emit(markerList + m.path + " n=" + vi.Itoa64(2))
+	for i := 0; i < m.n; i++ {
+		m.emit(markerEntry + m.entries[i].NameString() + " dir size=0")
+	}
+	if diskMounted() {
+		m.emit(markerVolDiskMounted)
+	} else {
+		m.emit(markerVolDiskAbsent)
+	}
+	m.status = "listed"
+	m.loadPreview()
+}
+
 // loadPreview fills the preview pane for the selection: directories get a
 // note, files get their bytes (sanitized, capped), and every successful file
 // load emits the M58a `gofiles: view …` marker.
@@ -190,6 +225,14 @@ func (m *model) loadPreview() {
 	name := e.NameString()
 	if e.Dir() {
 		m.previewOf = name
+		if m.path == volsPath {
+			if name == volDisk && !diskMounted() {
+				m.preview = "volume — not mounted\n(boot with --data-disk to attach it)"
+			} else {
+				m.preview = "volume — enter to browse"
+			}
+			return
+		}
 		m.preview = "(directory — enter to open)"
 		return
 	}
@@ -227,6 +270,9 @@ func (m *model) loadPreview() {
 // adopts it), so a second change landing inside that window is reported on
 // the NEXT poll — the feed is advisory, never a lossless log.
 func (m *model) watchStep() int {
+	if m.path == volsPath {
+		return -1 // the synthetic root has no feed — the mount set is boot-fixed
+	}
 	first := !m.watchArmed
 	m.watchArmed = true
 	evs := m.watcher.ObserveDir(m.path)
@@ -297,6 +343,10 @@ func (m *model) openSel() {
 	if !ok {
 		return
 	}
+	if m.path == volsPath {
+		m.enterVolume(e.NameString())
+		return
+	}
 	if e.Dir() {
 		child, ok := joinPath(m.path, e.NameString())
 		if !ok {
@@ -312,8 +362,38 @@ func (m *model) openSel() {
 	m.openFile()
 }
 
+// enterVolume descends from the volumes root into a mount name. /host is
+// always there; /disk refuses by name when the boot attached no data disk —
+// the refusal is the kernel's `not_mounted` (ADR 0050 D6), carried into the
+// marker and the status line.
+func (m *model) enterVolume(name string) {
+	target := "/" + name
+	if name == volDisk && !diskMounted() {
+		m.emit(markerVolRefused + name + " not_mounted")
+		m.status = "disk: not mounted"
+		return
+	}
+	m.path = target
+	m.sel = 0
+	m.emit(markerCd + m.path)
+	m.refresh()
+}
+
 // goUp walks to the parent directory.
 func (m *model) goUp() {
+	if m.path == volsPath {
+		m.status = "at volumes root"
+		return
+	}
+	if m.path == rootPath || m.path == diskRoot {
+		// Above a mount root is the volumes list, not the other volume —
+		// parentPath cannot know that (it owns share paths only).
+		m.path = volsPath
+		m.sel = 0
+		m.emit(markerCd + m.path)
+		m.refresh()
+		return
+	}
 	parent := parentPath(m.path)
 	if parent == m.path {
 		m.status = "at share root"
@@ -439,6 +519,8 @@ func (m *model) handleKey(ev keys.Event) {
 			m.moveTo(m.n - 1)
 		case 'q':
 			m.quit = true
+		case 'v':
+			m.showVolumes()
 		case 'r':
 			m.startRename()
 		case 'd':
@@ -457,9 +539,35 @@ func (m *model) handleKey(ev keys.Event) {
 	}
 }
 
+// showVolumes is the `v` chord: jump straight to the synthetic volumes root
+// (M100f #2311) — the same view Backspace/`h` reaches from a mount root.
+func (m *model) showVolumes() {
+	if m.path == volsPath {
+		return
+	}
+	m.path = volsPath
+	m.sel = 0
+	m.emit(markerCd + m.path)
+	m.refresh()
+}
+
+// atVolumes guards the mutating ops: the volumes root is a synthetic list,
+// so there is nothing to rename, trash, hold or write into — each op names
+// that rather than sending the kernel a path it could never honor.
+func (m *model) atVolumes() bool {
+	if m.path == volsPath {
+		m.status = "volumes: browse only"
+		return true
+	}
+	return false
+}
+
 // startRename opens the prompt with an EMPTY buffer: the typeable name is
 // the new name (the gate types `newname.txt` one chord at a time).
 func (m *model) startRename() {
+	if m.atVolumes() {
+		return
+	}
 	if _, ok := m.selEntry(); !ok {
 		m.status = "rename: nothing selected"
 		return
@@ -512,6 +620,9 @@ func (m *model) commitRename() {
 // startDelete arms the confirm step for a file; directories are refused
 // honestly (ADR 0007 has no rmdir slot, so EASY delete would fail anyway).
 func (m *model) startDelete() {
+	if m.atVolumes() {
+		return
+	}
 	e, ok := m.selEntry()
 	if !ok {
 		m.status = "delete: nothing selected"
@@ -568,6 +679,9 @@ func (m *model) restoreLatest() {
 
 // yankClip holds the selected file for a later paste (c = copy, x = move).
 func (m *model) yankClip(cut bool) {
+	if m.atVolumes() {
+		return
+	}
 	e, ok := m.selEntry()
 	if !ok {
 		m.status = "clip: nothing selected"
@@ -602,7 +716,18 @@ func (m *model) pasteClip() {
 		m.status = "paste: nothing held"
 		return
 	}
+	if m.atVolumes() {
+		return
+	}
 	name := baseName(m.clip)
+	if m.clipCut && volumeOf(m.clip) != volumeOf(m.path) {
+		// A rename is same-volume only by ABI (ADR 0050 D6: pin_rename
+		// refuses a cross-partition pair), so a held move cannot land off
+		// its own volume — copy (c) crosses volumes; move (x) does not.
+		m.emit(markerPasteNo + name + " cross-volume")
+		m.status = "paste: a move stays on one volume"
+		return
+	}
 	if containsName(m.entries[:], m.n, name) {
 		m.emit(markerPasteNo + name + " exists")
 		m.status = "paste: name exists"

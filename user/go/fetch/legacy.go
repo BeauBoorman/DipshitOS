@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"strings"
 
+	"virelai/settings"
 	"virelai/vi"
 )
 
@@ -35,6 +36,12 @@ const (
 	legacyDefaultPort = 80
 	legacyDefaultPath = "/"
 	legacyDefaultDest = "/host/DOWNLOAD.OUT"
+
+	// M100f (#2311): the default download target follows the data_root row —
+	// /disk only when it opted in AND the volume mounted. `not_mounted` is
+	// the kernel's named refusal for an absent VLFS mount (ADR 0050 D6).
+	markerDataRoot         = "gofetch: data_root=/disk"
+	markerDataRootFallback = "gofetch: data_root=disk but /disk not_mounted; using /host"
 
 	// headerLimit is the old Zig fetch's header_scratch_max: once the head
 	// reaches this without a terminator, refuse instead of growing a buffer.
@@ -302,9 +309,33 @@ func parseLegacyArgs(args []string) (legacyArgs, bool) {
 		a.url = "http://" + legacyDefaultHost + "/"
 	}
 	if a.download && a.dest == "" {
-		a.dest = legacyDefaultDest
+		a.dest = legacyDownloadDest()
 	}
 	return a, true
+}
+
+// fetchDataRoot is the M100f (#2311) resolver seam — a var so a host test
+// pins the disk and fallback legs without a settings file.
+var fetchDataRoot = func() (string, bool) {
+	return settings.Load().ResolveDataRoot()
+}
+
+// legacyDownloadDest resolves the no-DEST download target for this boot:
+// the resolved data root plus the file name. It names the resolution on the
+// console exactly when the row opted in — silent on the default boot, which
+// is the whole point of opt-in.
+func legacyDownloadDest() string {
+	root, fellBack := fetchDataRoot()
+	if root == "" {
+		root = settings.DataRootHost
+	}
+	switch {
+	case fellBack:
+		vi.ConsoleLine(markerDataRootFallback)
+	case root == settings.DataRootDisk:
+		vi.ConsoleLine(markerDataRoot)
+	}
+	return root + "/DOWNLOAD.OUT"
 }
 
 func isCleartextURL(raw string) bool {

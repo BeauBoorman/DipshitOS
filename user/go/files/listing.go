@@ -8,13 +8,56 @@
 // handle_dir_list).
 package main
 
-import "virelai/vi"
+import (
+	"strings"
+
+	"virelai/vi"
+)
 
 const (
 	maxPath   = 64
 	rootPath  = "/host"
 	knownName = "KNOWN.TXT"
+
+	// M100f (#2311, ADR 0050 D6): the synthetic volumes root sits above the
+	// two mount names — the kernel never sees "/" as a path here because the
+	// model lists the volume rows itself. `/disk` exists on a boot only when
+	// a named data disk attached and its superblock validated.
+	volsPath = "/"
+	diskRoot = "/disk"
+	volHost  = "host"
+	volDisk  = "disk"
 )
+
+// diskMounted is the /disk mount probe: one dirlist of the VLFS root answers
+// the kernel's not_mounted ENOENT when the boot attached no named data disk
+// (ADR 0050 D6). A var so host tests pin both legs; on a host build the
+// syscall is -ENOSYS, which reads as unmounted — the honest default.
+var diskMounted = func() bool {
+	var scratch [1]vi.DirEntry
+	_, rc := vi.DirList(diskRoot, scratch[:])
+	return rc >= 0
+}
+
+// volEntry fabricates one volumes-root row (both volumes are directories).
+func volEntry(name string) vi.DirEntry {
+	var e vi.DirEntry
+	copy(e.Name[:], name)
+	e.IsDir = 1
+	return e
+}
+
+// volumeOf names the volume a path lives under ("" when neither — never the
+// case for a path this app navigates to).
+func volumeOf(path string) string {
+	switch {
+	case path == diskRoot || strings.HasPrefix(path, diskRoot+"/"):
+		return volDisk
+	case path == rootPath || strings.HasPrefix(path, rootPath+"/"):
+		return volHost
+	}
+	return ""
+}
 
 // joinPath appends name under dir. It refuses ".." and a result longer
 // than the kernel path cap, so a hostile name cannot walk off the share
