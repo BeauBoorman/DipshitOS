@@ -6,7 +6,9 @@
 // the schema-v2 APPS.TXT row through WriteFileSafe. The launcher re-reads
 // APPS.TXT at each summon, so an install is live on the next call.
 //
-// Verbs: `store ls`, `store install <stream>`, `store remove <name>`.
+// Verbs: `store ls`, `store install <stream>`, `store update <name>`,
+// `store rollback <name>`, `store remove <name>` (M101d #2316 adds the
+// last two plus the STORE.TXT prev-head state file).
 // Every failure is a named refusal — `store: refuse <code>` — and a
 // failed install leaves zero partial state: no ELF, no row, no
 // half-copied file.
@@ -67,7 +69,7 @@ func cliArgs(raw []string) []string {
 	return raw
 }
 
-const usageLine = "store: usage: store ls [--remote=<r>] | store install <stream> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store remove <name>"
+const usageLine = "store: usage: store ls [--remote=<r>] | store install <stream> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store update <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store rollback <name> | store remove <name>"
 
 func run(args []string) int {
 	if len(args) == 0 {
@@ -102,6 +104,18 @@ func run(args []string) int {
 			return 2
 		}
 		return cmdInstall(activeFS, DefaultStoreRoot, positional[0], remoteFlag, channelArg)
+	case "update":
+		if len(positional) != 1 {
+			consoleFn(usageLine)
+			return 2
+		}
+		return cmdUpdate(activeFS, DefaultStoreRoot, positional[0], remoteFlag, channelArg)
+	case "rollback":
+		if len(positional) != 1 || remoteFlag != "" || channelArg != "" {
+			consoleFn(usageLine)
+			return 2
+		}
+		return cmdRollback(activeFS, positional[0])
 	case "remove":
 		if len(positional) != 1 || remoteFlag != "" || channelArg != "" {
 			consoleFn(usageLine)

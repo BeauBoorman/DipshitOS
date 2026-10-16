@@ -78,6 +78,42 @@ func manifestWithRow(lines []string, row string) ([]byte, error) {
 	return out, nil
 }
 
+// manifestRowFor returns the verbatim row line naming bin.
+func manifestRowFor(lines []string, bin string) (string, bool) {
+	for _, l := range lines {
+		if rowBin(l) == bin {
+			return strings.TrimSpace(l), true
+		}
+	}
+	return "", false
+}
+
+// manifestWithBinRow replaces bin's row in place (row order is a user-
+// visible launcher ordering — an update must not reshuffle it), or
+// appends when absent, enforcing the shared reader budget.
+func manifestWithBinRow(lines []string, bin, row string) ([]byte, error) {
+	out := make([]string, 0, len(lines)+1)
+	done := false
+	for _, l := range lines {
+		if rowBin(l) == bin {
+			if !done {
+				out = append(out, row)
+				done = true
+			}
+			continue
+		}
+		out = append(out, l)
+	}
+	if !done {
+		out = append(out, row)
+	}
+	b := renderManifest(out)
+	if len(b) > appsMaxBytes {
+		return nil, refuse("manifest_full", "")
+	}
+	return b, nil
+}
+
 // manifestWithoutBin returns the manifest lines minus every row naming
 // bin; found reports whether anything was removed.
 func manifestWithoutBin(lines []string, bin string) ([]string, bool) {

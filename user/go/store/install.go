@@ -237,6 +237,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	st := byID[id]
 	// M101b's gate, local edition: `verify --all` runs the publisher
 	// keyring + Ed25519 check over the replica pull just confirmed
 	// current. `verify --remote` would re-fetch the same Changes off the
@@ -309,14 +310,30 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 		return runErr(err)
 	}
 
-	// 6. Publish: ELF first (orphan = harmless), then the row; a failed
-	// row write reverts the ELF so no partial state survives.
+	// 6. Publish: ELF first (orphan = harmless), then the row, then the
+	// STORE.TXT entry — a failed later write reverts the earlier ones so
+	// no partial state survives. The entry records the resolved stream
+	// NAME (not the selector: `update` pulls it by name) and head id;
+	// prev_* stay empty until the first update retains a rollback target.
 	if err := fs.WriteFileSafe(elfPath, elf); err != nil {
 		return runErr(err)
 	}
 	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
 		_ = fs.Remove(elfPath)
 		return runErr(err)
+	}
+	// st.Head is non-nil in practice — a headless stream has no changes,
+	// so release_missing refused earlier — but never write a state line
+	// the parser would refuse back (an empty head self-corrupts
+	// STORE.TXT): an untracked install beats a malformed state file.
+	if st.Head != nil {
+		if err := writeStateEntry(fs, &storeEntry{
+			Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+		}); err != nil {
+			_ = fs.WriteFileSafe(appsPath, renderManifest(lines))
+			_ = fs.Remove(elfPath)
+			return runErr(err)
+		}
 	}
 	consoleFn("store: install ok " + bin + " version=" + rel.Version)
 	return 0
@@ -330,6 +347,19 @@ func cmdRemove(fs FS, arg string) int {
 	bin, ok := normalizeBin(arg)
 	if !ok {
 		return runErr(refuse("name_invalid", arg))
+	}
+	// The state row goes first: a torn remove leaves an untracked-but-
+	// present app rather than a phantom STORE.TXT entry pointing at an
+	// ELF that is gone.
+	state, err := loadState(fs)
+	if err != nil {
+		return runErr(err)
+	}
+	if _, ok := state[bin]; ok {
+		delete(state, bin)
+		if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
+			return runErr(err)
+		}
 	}
 	lines, err := loadManifest(fs)
 	if err != nil {
@@ -348,6 +378,23 @@ func cmdRemove(fs FS, arg string) int {
 			return runErr(err)
 		}
 	}
+	if fs.Exists(prevPath(bin)) {
+		if err := fs.Remove(prevPath(bin)); err != nil {
+			return runErr(err)
+		}
+	}
 	consoleFn("store: remove ok " + bin)
 	return 0
+}
+
+// writeStateEntry upserts e in STORE.TXT through WriteFileSafe. The
+// load-write pair is one WriteFileSafe — the atomic point is the file
+// itself, so a crash can only lose the newest entry, never tear a line.
+func writeStateEntry(fs FS, e *storeEntry) error {
+	state, err := loadState(fs)
+	if err != nil {
+		return err
+	}
+	state[e.Name] = e
+	return fs.WriteFileSafe(statePath, renderState(state))
 }
