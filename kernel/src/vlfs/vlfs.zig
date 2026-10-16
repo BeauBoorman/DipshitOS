@@ -343,7 +343,7 @@ fn geometryError(s: Superblock, sector: *const [sector_len]u8) ?Error {
     if (s.bbitmap_first != s.ibitmap_first + 1 or s.bbitmap_blocks != bbitmap_blocks)
         return error.GeometryMismatch;
     if (s.itable_first != s.bbitmap_first + s.bbitmap_blocks or
-        s.itable_blocks != s.inode_count / inodes_per_block)
+        s.itable_blocks != (s.inode_count + inodes_per_block - 1) / inodes_per_block)
         return error.GeometryMismatch;
     if (s.data_first != s.itable_first + s.itable_blocks or
         @as(u64, s.data_first) + s.data_blocks != s.volume_blocks)
@@ -664,6 +664,10 @@ pub const Inode = struct {
 pub fn readInode(src: SectorSource, vol: Volume, ino: u32, scratch: *[block_len]u8) Error!Inode {
     if (ino == 0 or ino >= vol.inode_count) return error.BadInode;
     const blk = vol.itable_first + ino / inodes_per_block;
+    // Bound against the declared itable: a foreign volume whose inode_count
+    // overruns itable_blocks must not read inode records out of the data
+    // region (geometryError now requires the ceil count).
+    if (blk >= vol.itable_first + vol.itable_blocks) return error.BadInode;
     if (!src.readBlock(blk, scratch)) return error.Io;
     const rec = scratch[(ino % inodes_per_block) * inode_len ..][0..inode_len];
     return parseInode(rec);
@@ -1250,4 +1254,67 @@ test "vlfs: torn journal tail is discarded, mount still succeeds" {
     var check: [block_len]u8 = undefined;
     try std.testing.expect(ro2.ro().readBlock(vol.data_first + 7, &check));
     try std.testing.expect(check[0] != 't'); // payload never reached home
+}
+
+// #2365: the D3 itable size is ⌈inode_count/32⌉. A 17 MiB image written
+// by the pre-amendment truncating formula (inode_count 272, itable_blocks
+// 8) leaves its tail inode slots inside the data region, so mount now
+// refuses it — and readInode bounds the slot against the declared itable
+// for a Volume that never passed geometryError.
+var image17_buf: [17 << 20]u8 = undefined;
+
+test "vlfs: truncated itable_blocks geometry refuses mount; readInode bounds the itable" {
+    @memset(&image17_buf, 0);
+    var disk = MemDisk{ .img = &image17_buf };
+    const vol_blocks: u32 = 4352;
+    const prefix = Superblock{
+        .seq = 2,
+        .volume_id = 0x1234,
+        .volume_bytes = 17 << 20,
+        .volume_blocks = vol_blocks,
+        .journal_first = 2,
+        .journal_blocks = 512,
+        .ibitmap_first = 514,
+        .ibitmap_blocks = 1,
+        .bbitmap_first = 515,
+        .bbitmap_blocks = 1,
+        .itable_first = 516,
+        .itable_blocks = 8, // truncating 272/32 — the pre-fix shape
+        .data_first = 524,
+        .data_blocks = vol_blocks - 524,
+        .inode_count = 272,
+        .journal_applied = 0,
+        .next_txn_seq = 1,
+        .slot = 0,
+    };
+    var blk: [block_len]u8 = @splat(0);
+    writeSuperblockSector(blk[0..sector_len], prefix);
+    try std.testing.expect(disk.rw().writeBlock(0, &blk));
+    try std.testing.expect(disk.rw().writeBlock(1, &blk));
+    try std.testing.expectError(error.GeometryMismatch, mount(disk.ro(), &test_scratch));
+
+    // The same volume under the ceil rule (itable_blocks 9) mounts, and
+    // every inode slot — including the partial tail block — sits inside
+    // the itable.
+    var fixed = prefix;
+    fixed.itable_blocks = 9;
+    fixed.data_first = 525;
+    fixed.data_blocks = vol_blocks - 525;
+    writeSuperblockSector(blk[0..sector_len], fixed);
+    try std.testing.expect(disk.rw().writeBlock(0, &blk));
+    try std.testing.expect(disk.rw().writeBlock(1, &blk));
+    const vol = try mount(disk.ro(), &test_scratch);
+    try std.testing.expectEqual(@as(u32, 9), vol.itable_blocks);
+    try std.testing.expectEqual(@as(u32, 272), vol.inode_count);
+    try std.testing.expectEqual(@as(u32, 525), vol.data_first);
+    try std.testing.expect(vol.itable_first + (vol.inode_count - 1) / inodes_per_block < vol.data_first);
+
+    // Defense in depth: a Volume whose inode_count overruns its declared
+    // itable must not read records out of the data region — ino 256 maps
+    // to itable_first + 8, one block past a truncated 8-block table.
+    var wild = vol;
+    wild.itable_blocks = 8;
+    try std.testing.expectError(error.BadInode, readInode(disk.ro(), wild, 256, &test_scratch));
+    try std.testing.expectError(error.BadInode, readInode(disk.ro(), wild, 271, &test_scratch));
+    try std.testing.expectError(error.BadInode, readInode(disk.ro(), vol, 272, &test_scratch));
 }

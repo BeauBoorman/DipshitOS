@@ -354,6 +354,38 @@ func TestCheckGoldenClean(t *testing.T) {
 	}
 }
 
+// TestCheckMultiBlockBbitmap: a volume over 128 MiB has a multi-block
+// bbitmap. The scan must read every map block — it once read only the
+// first and panicked index-out-of-range past bit 32767.
+func TestCheckMultiBlockBbitmap(t *testing.T) {
+	const size = 256 << 20 // 256 MiB -> 2 bbitmap blocks
+	img := make([]byte, size)
+	if err := formatImage(img, goldenID, goldenTime); err != nil {
+		t.Fatal(err)
+	}
+	g, err := geometryFor(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.BbitmapBlocks != 2 {
+		t.Fatalf("256 MiB bbitmap %d blocks, want 2", g.BbitmapBlocks)
+	}
+	for _, f := range checkImage(img) {
+		if !f.info {
+			t.Fatalf("256 MiB image fails check: %v", f)
+		}
+	}
+	// The 1 GiB ceiling spans all 8 map blocks; assert the geometry
+	// arithmetically rather than formatting a gigabyte.
+	g, err = geometryFor(MaxVolumeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.BbitmapBlocks != 8 {
+		t.Fatalf("1 GiB bbitmap %d blocks, want 8", g.BbitmapBlocks)
+	}
+}
+
 // TestGeometry pins the ADR D3 region arithmetic for the floor volume.
 func TestGeometry(t *testing.T) {
 	g, err := geometryFor(MinVolumeBytes)
@@ -393,6 +425,41 @@ func TestGeometry(t *testing.T) {
 	}
 	if g.JournalBlocks != 2048 || g.InodeCount != 16384 || g.DataFirst+g.DataBlocks != g.VolumeBlocks {
 		t.Fatalf("ceiling geometry %+v", g)
+	}
+}
+
+// TestGeometryCeilItable: an odd-MiB volume has an inode_count that is not
+// a multiple of 32, so the itable must round up (ADR 0050 D3). Truncating
+// once wrote the tail inode records into the root directory's data block.
+func TestGeometryCeilItable(t *testing.T) {
+	const size = 17 << 20
+	img := make([]byte, size)
+	if err := formatImage(img, goldenID, goldenTime); err != nil {
+		t.Fatal(err)
+	}
+	g, err := geometryFor(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.InodeCount != 272 || g.InodeCount%InodesPerBlock == 0 {
+		t.Fatalf("inode_count %d: want a non-multiple of %d", g.InodeCount, InodesPerBlock)
+	}
+	if g.ItableBlocks != (g.InodeCount+InodesPerBlock-1)/InodesPerBlock {
+		t.Fatalf("itable_blocks %d != ceil(inode_count/32)", g.ItableBlocks)
+	}
+	// Block data_first is the root directory's block: mkfs leaves it zero.
+	if !isZero(block(img, g.DataFirst)) {
+		t.Fatal("data_first block nonzero — itable aliases the data region")
+	}
+	// The last inode's slot must land inside the itable.
+	if last := g.InodeCount - 1; g.ItableFirst+last/InodesPerBlock >= g.DataFirst {
+		t.Fatalf("inode %d maps to block %d >= data_first %d", last,
+			g.ItableFirst+last/InodesPerBlock, g.DataFirst)
+	}
+	for _, f := range checkImage(img) {
+		if !f.info {
+			t.Fatalf("17 MiB image fails check: %v", f)
+		}
 	}
 }
 

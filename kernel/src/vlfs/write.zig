@@ -277,6 +277,7 @@ fn freeInode(t: *Txn, ino: u32) Error!void {
     t.walk[ino / 8] &= ~(@as(u8, 1) << @intCast(ino % 8));
     try t.append(t.vol.ibitmap_first, t.walk);
     const blk = t.vol.itable_first + ino / vlfs.inodes_per_block;
+    if (blk >= t.vol.itable_first + t.vol.itable_blocks) return error.BadInode;
     try t.readCurrent(blk, t.walk);
     const rec = t.walk[(ino % vlfs.inodes_per_block) * vlfs.inode_len ..][0..vlfs.inode_len];
     @memset(rec, 0);
@@ -303,6 +304,7 @@ fn writeInodeRec(out: *[vlfs.inode_len]u8, rec: vlfs.Inode) void {
 /// Stage the itable block holding `ino` with `rec` written into its slot.
 fn stageInode(t: *Txn, ino: u32, rec: vlfs.Inode) Error!void {
     const blk = t.vol.itable_first + ino / vlfs.inodes_per_block;
+    if (blk >= t.vol.itable_first + t.vol.itable_blocks) return error.BadInode;
     try t.readCurrent(blk, t.walk);
     const slot = t.walk[(ino % vlfs.inodes_per_block) * vlfs.inode_len ..][0..vlfs.inode_len];
     writeInodeRec(slot, rec);
@@ -793,7 +795,9 @@ pub fn removeAt(src: vlfs.SectorSource, vol: *vlfs.Volume, dir_ino: u32, name: [
 /// target refuses `exists` unless `replace`; a replaced file's blocks free
 /// in the same transaction, a replaced directory must be empty
 /// (`not_empty`), and kind mismatches are `is_directory`/`not_directory`.
-/// The caller checks the directory-cycle guard (renamePath does).
+/// Moving a directory into its own subtree refuses `not_directory` — the
+/// cycle guard lives here, not in the caller, because the .disk ABI entry
+/// (slot-79 pin_rename) reaches renameAt without renamePath's checks.
 pub fn renameAt(src: vlfs.SectorSource, vol: *vlfs.Volume, from_dir: u32, from_name: []const u8, to_dir: u32, to_name: []const u8, replace: bool, now: u64, walk: *Block, compose: *Block) Error!void {
     if (!src.writable()) return error.ReadOnly;
     if (!validName(to_name)) return error.NameTooLong;
@@ -803,6 +807,13 @@ pub fn renameAt(src: vlfs.SectorSource, vol: *vlfs.Volume, from_dir: u32, from_n
     if (dst_parent.kind != vlfs.kind_dir) return error.NotDir;
     const from_scan = try dirScan(null, src, vol, src_parent, from_name, walk);
     const from_abs = from_scan.hit orelse return error.NotFound;
+    // Cycle guard: a directory may not move beneath itself. If the
+    // destination directory is inside the moving subtree — or is the
+    // moving inode itself — the rename would orphan the subtree; refuse
+    // before any mutation.
+    if (from_scan.hit_kind == vlfs.kind_dir and
+        try dirContains(src, vol, from_scan.hit_inode, to_dir, 0, walk))
+        return error.NotDir;
     var victim: ?vlfs.Inode = null;
     var victim_ino: u32 = 0;
     const to_scan = try dirScan(null, src, vol, dst_parent, to_name, walk);
@@ -886,13 +897,6 @@ pub fn renamePath(src: vlfs.SectorSource, vol: *vlfs.Volume, old: []const u8, ne
     if (src_parent.kind != vlfs.kind_dir) return error.NotDir;
     const dst_parent = try vlfs.lookup(src, vol.*, np.parent, walk);
     if (dst_parent.kind != vlfs.kind_dir) return error.NotDir;
-    // Cycle guard: a directory may not move beneath itself. Resolve the
-    // new parent's ancestor chain; if the moving inode appears in it, the
-    // rename would orphan the subtree — refuse before any mutation.
-    const moving = try dirScan(null, src, vol, try vlfs.readInode(src, vol.*, src_parent.inode, walk), op.leaf, walk);
-    if (moving.hit != null and moving.hit_kind == vlfs.kind_dir) {
-        if (try dirContains(src, vol, moving.hit_inode, dst_parent.inode, 0, walk)) return error.NotDir;
-    }
     return renameAt(src, vol, src_parent.inode, op.leaf, dst_parent.inode, np.leaf, replace, now, walk, compose);
 }
 
@@ -1125,6 +1129,38 @@ test "vlfs write: create + write + truncate + rename + delete round-trips throug
     // consult the journal): the root is empty again.
     const h = try mountDigest(&img_a, &t_walk);
     try std.testing.expectEqual(@as(u64, 1469598103934665603), h);
+}
+
+// #2376: slot-79 pin_rename reaches renameAt without renamePath's checks,
+// so the directory-cycle guard lives in renameAt itself.
+test "vlfs write: renameAt refuses a directory into its own subtree" {
+    try buildImage(empty_regions, &img_a);
+    var disk = RecDisk{ .img = &img_a, .record = false };
+    const src = disk.source();
+    var vol = try vlfs.mount(src, &t_walk);
+
+    const docs = try create(src, &vol, vlfs.root_inode, "DOCS", vlfs.kind_dir, test_now, &t_walk, &t_compose);
+    const old = try create(src, &vol, docs, "OLD", vlfs.kind_dir, test_now, &t_walk, &t_compose);
+    const deep = try create(src, &vol, old, "DEEP", vlfs.kind_dir, test_now, &t_walk, &t_compose);
+
+    // DOCS into its child, its grandchild, and itself — all refuse.
+    try std.testing.expectError(error.NotDir, renameAt(src, &vol, vlfs.root_inode, "DOCS", old, "ARCH", false, test_now, &t_walk, &t_compose));
+    try std.testing.expectError(error.NotDir, renameAt(src, &vol, vlfs.root_inode, "DOCS", deep, "ARCH", false, test_now, &t_walk, &t_compose));
+    try std.testing.expectError(error.NotDir, renameAt(src, &vol, vlfs.root_inode, "DOCS", docs, "ARCH", false, test_now, &t_walk, &t_compose));
+    // The path entry gets the same refusal now that renameAt owns the guard.
+    try std.testing.expectError(error.NotDir, renamePath(src, &vol, "DOCS", "DOCS/OLD/ARCH", false, test_now, &t_walk, &t_compose));
+
+    // The refusals committed nothing: the tree is untouched.
+    const untouched = try vlfs.lookup(src, vol, "DOCS/OLD/DEEP", &t_walk);
+    try std.testing.expectEqual(deep, untouched.inode);
+
+    // Legal moves still work: a file into a subdir, a directory renamed
+    // at the same level.
+    _ = try create(src, &vol, docs, "F.TXT", vlfs.kind_file, test_now, &t_walk, &t_compose);
+    try renameAt(src, &vol, docs, "F.TXT", old, "G.TXT", false, test_now, &t_walk, &t_compose);
+    try renameAt(src, &vol, vlfs.root_inode, "DOCS", vlfs.root_inode, "DOC2", false, test_now, &t_walk, &t_compose);
+    const moved = try vlfs.lookup(src, vol, "DOC2/OLD/G.TXT", &t_walk);
+    try std.testing.expectEqual(vlfs.kind_file, moved.kind);
 }
 
 test "vlfs write: named refusals — exists, not_empty, name_too_long, no_inodes" {
