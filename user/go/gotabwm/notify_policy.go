@@ -43,9 +43,31 @@ import (
 )
 
 const (
-	// notifyHistoryPath is the persisted center history on the share.
+	// MarkerDataRoot names the seat's M100f (#2311) data-root resolution:
+	// printed once at seat start, and only when the row opted in —
+	// `gotabwm: data_root=/disk` on a mounted opt-in, the not_mounted
+	// fallback (the kernel's named refusal, ADR 0050 D6) when the row is
+	// set but no data disk attached.
+	MarkerDataRoot         = "gotabwm: data_root=/disk"
+	MarkerDataRootFallback = "gotabwm: data_root=disk but /disk not_mounted; using /host"
+)
+
+var (
+	// notifyHistoryPath is where the persisted center history lives this
+	// boot: /host/NOTIFY.HIST unless the data_root row opted in AND the
+	// mount probe found the volume (M100f #2311). Resolved once at seat
+	// start inside loadNotifyHistory — never mid-boot, so a session cannot
+	// split its history across two volumes.
 	notifyHistoryPath = "/host/NOTIFY.HIST"
 
+	// notifyDataRoot is the resolver seam (a var so a host test pins both
+	// legs without touching settings' own probe).
+	notifyDataRoot = func(f settings.File) (string, bool) {
+		return f.ResolveDataRoot()
+	}
+)
+
+const (
 	// MarkerNotifyDND names a do-not-disturb transition and who asked for
 	// it: `via=boot` (the persisted key, read at start — printed only when
 	// it is ON, so a default boot's log is unchanged), `via=seat` (the
@@ -747,7 +769,22 @@ func restoreNotifyHistoryBytes(b []byte, readResult int64) ([]centerNotification
 // composite loop, so the history is in place before the first frame is
 // painted (the clock panel's hint reads it) and before the user can open the
 // panel: there is no flash of an empty center that then fills in.
-func loadNotifyHistory() notifyHistState {
+//
+// M100f (#2311): this call also resolves WHERE the history file lives — the
+// movable set follows `data_root=disk` only when the volume actually mounted,
+// and the seat names the resolution when the row opted in.
+func loadNotifyHistory(f settings.File) notifyHistState {
+	root, fellBack := notifyDataRoot(f)
+	if root == "" {
+		root = settings.DataRootHost
+	}
+	notifyHistoryPath = root + "/NOTIFY.HIST"
+	switch {
+	case fellBack:
+		vi.ConsoleLine(MarkerDataRootFallback)
+	case root == settings.DataRootDisk:
+		vi.ConsoleLine(MarkerDataRoot)
+	}
 	b, r := readNotifyFile(notifyHistoryPath, notifyHistMaxBytes+1)
 	h, state := restoreNotifyHistoryBytes(b, r)
 	switch state {

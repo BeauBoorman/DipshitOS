@@ -55,6 +55,7 @@ pub const metadata = @import("fs_metadata.zig");
 // after its `virelai-vlfs` GET_ID match.
 const vlfs = @import("vlfs/vlfs.zig");
 const vlfs_disk = @import("vlfs/disk.zig");
+const klog = @import("klog.zig");
 
 pub const max_handles_per_process: usize = 8;
 pub const max_path_len: usize = directory.path_max;
@@ -1395,7 +1396,7 @@ pub fn hf_handle_errno(st: u8) i64 {
 /// the `.usb_fat` split — an absent volume/path or a dead device is ENOENT,
 /// everything structural is EINVAL.
 fn disk_errno(err: vlfs.Error) i64 {
-    return switch (err) {
+    const rc: i64 = switch (err) {
         error.NotMounted, error.NotFound, error.Io => -6,
         error.ReadOnly => -7,
         error.NameTooLong => -8,
@@ -1405,6 +1406,17 @@ fn disk_errno(err: vlfs.Error) i64 {
         error.NoSpace, error.NoInodes, error.DirFull, error.TxnTooLarge, error.FileTooLarge, error.ExtentOverflow => -5,
         else => -1,
     };
+    // Named refusals are the ADR 0050 contract: a structural -1 on /disk is
+    // otherwise indistinguishable from the host channel's residual EINVAL,
+    // so the serial log carries the name for diagnosis. The expected rows
+    // (not_mounted/not_found/exists/read_only/name_too_long, io, space)
+    // are legitimate app outcomes and stay quiet.
+    if (rc == -1) {
+        klog.line("vlfs: op refused ");
+        klog.line(vlfs.refusalName(err));
+        klog.line("\n");
+    }
+    return rc;
 }
 
 /// Open a file for `pid` with given `flags`.
@@ -3466,4 +3478,60 @@ test "file_table: /disk refusals are names, not crashes" {
     try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/APPLE.TXT", MODE_READ));
     var wire: metadata.Wire = undefined;
     try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", &wire));
+}
+
+// TEMP REPRO — writable mount + selftest's exact mkdir/open sequence.
+const VlfsTestDiskRw = struct {
+    fn readFn(ctx: ?*anyopaque, lba: u64, out: *[vlfs.sector_len]u8) bool {
+        const img: *[vlfs_test_bytes]u8 = @ptrCast(@alignCast(ctx.?));
+        const off = lba * vlfs.sector_len;
+        if (off + vlfs.sector_len > img.len) return false;
+        @memcpy(out, img[off..][0..vlfs.sector_len]);
+        return true;
+    }
+    fn writeFn(ctx: ?*anyopaque, lba: u64, data: *const [vlfs.sector_len]u8) bool {
+        const img: *[vlfs_test_bytes]u8 = @ptrCast(@alignCast(ctx.?));
+        const off = lba * vlfs.sector_len;
+        if (off + vlfs.sector_len > img.len) return false;
+        @memcpy(img[off..][0..vlfs.sector_len], data);
+        return true;
+    }
+    fn flushFn(_: ?*anyopaque) bool {
+        return true;
+    }
+    fn source(img: *[vlfs_test_bytes]u8) vlfs.SectorSource {
+        return .{
+            .ctx = img,
+            .total_sectors = @intCast(img.len / vlfs.sector_len),
+            .readFn = readFn,
+            .writeFn = writeFn,
+            .flushFn = flushFn,
+        };
+    }
+};
+
+test "file_table: writable /disk mkdir-then-create inside fresh dir (M100f)" {
+    init();
+    defer vlfs_disk.detach();
+    try vlfs_build(vlfs_empty_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDiskRw.source(&vlfs_test_img)));
+
+    // GOSELF's disk leg on a writable mount: mkdir the receipt dir, then
+    // create+write+fsync+read a file inside it — the live-failure shape.
+    const dm = open(0, "/disk/SELFTEST", MODE_WRITE | MODE_CREATE | MODE_DIR);
+    try std.testing.expect(dm >= 0);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(dm)));
+
+    const fd = open(0, "/disk/SELFTEST/DISK.TXT", MODE_WRITE | MODE_CREATE);
+    try std.testing.expect(fd >= 0);
+    const body = "disk receipt body\n";
+    try std.testing.expectEqual(@as(i64, body.len), write(0, @intCast(fd), body));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fd)));
+
+    const fr = open(0, "/disk/SELFTEST/DISK.TXT", MODE_READ);
+    try std.testing.expect(fr >= 0);
+    var buf: [64]u8 = undefined;
+    const n = read(0, @intCast(fr), &buf);
+    try std.testing.expectEqualStrings(body, buf[0..@intCast(n)]);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fr)));
 }

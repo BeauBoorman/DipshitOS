@@ -870,3 +870,84 @@ func TestSetAppliesAudioVolumeToSlot44(t *testing.T) {
 		t.Fatalf("a non-volume key applied: %v", got)
 	}
 }
+
+// M100f (#2311): data_root is an accepted-but-unseeded row that is NOT
+// display-materialized (the M99d chime/gain shape — a default GOSET save
+// must stay byte-identical), cycles host|disk once it exists, and is strict
+// about its vocabulary.
+func TestDataRootAcceptedUnseededCyclableAndStrict(t *testing.T) {
+	if _, known := Known(DataRootKey); known {
+		t.Fatal("the kernel does not seed data_root")
+	}
+	if !Editable(DataRootKey) || !IsDataRootKey(DataRootKey) || IsDataRootKey("data") {
+		t.Fatal("GOSET must be able to edit exactly data_root")
+	}
+	if got, ok := Default(DataRootKey); !ok || got != "host" {
+		t.Fatalf("Default(data_root) = (%q,%v), want (host,true)", got, ok)
+	}
+	vocab, ok := Vocab(DataRootKey)
+	if !ok || len(vocab) != 2 || vocab[0] != "host" || vocab[1] != "disk" {
+		t.Fatalf("data_root vocab = %v ok=%v, want [host disk]", vocab, ok)
+	}
+	if got := Next(vocab, "host"); got != "disk" {
+		t.Fatalf("cycle host -> %q, want disk", got)
+	}
+	if got := Next(vocab, "disk"); got != "host" {
+		t.Fatalf("cycle disk -> %q, want host", got)
+	}
+	for _, val := range []string{"host", "disk"} {
+		if !ValidDataRoot(val) {
+			t.Errorf("ValidDataRoot(%q) = false", val)
+		}
+	}
+	for _, val := range []string{"", "DISK", "usb", "/disk", "on", " disk"} {
+		if ValidDataRoot(val) {
+			t.Errorf("ValidDataRoot(%q) = true", val)
+		}
+	}
+	// Never a default panel row: an absent file's display carries no
+	// data_root, and a file that carries one round-trips it.
+	if _, found := Get((File{State: StateMissing}).Display(), DataRootKey); found {
+		t.Fatal("a default display materialized data_root")
+	}
+	f := File{Rows: []Setting{{Key: DataRootKey, Val: "disk"}}, State: StateOK}
+	if v, ok := f.Effective(DataRootKey); !ok || v != "disk" {
+		t.Fatalf("persisted data_root = %q ok=%v", v, ok)
+	}
+	if rows, ok := Parse(Render(f.Display())); !ok {
+		t.Fatal("a set data_root row cannot round-trip")
+	} else if v, found := Get(rows, DataRootKey); !found || v != "disk" {
+		t.Fatalf("round-trip data_root = %q found=%v", v, found)
+	}
+}
+
+// M100f (#2311): the resolver's three legs — the default boot reads /host
+// untouched, an opted-in row with a mounted volume reads /disk, and the
+// set-but-absent shape is a NAMED fallback (fellBack) that still answers
+// /host rather than failing.
+func TestResolveDataRootLegs(t *testing.T) {
+	saved := DiskMounted
+	defer func() { DiskMounted = saved }()
+
+	diskFile := File{Rows: []Setting{{Key: DataRootKey, Val: "disk"}}, State: StateOK}
+
+	DiskMounted = func() bool { return true }
+	for _, f := range []File{
+		{State: StateMissing},
+		{State: StateCorrupt},
+		{Rows: []Setting{{Key: DataRootKey, Val: "host"}}, State: StateOK},
+		{Rows: []Setting{{Key: DataRootKey, Val: "florp"}}, State: StateOK},
+	} {
+		if root, fb := f.ResolveDataRoot(); root != DataRootHost || fb {
+			t.Fatalf("state=%d root=%q fellBack=%v, want /host without a fallback note", f.State, root, fb)
+		}
+	}
+	if root, fb := diskFile.ResolveDataRoot(); root != DataRootDisk || fb {
+		t.Fatalf("mounted opt-in root=%q fellBack=%v, want /disk", root, fb)
+	}
+
+	DiskMounted = func() bool { return false }
+	if root, fb := diskFile.ResolveDataRoot(); root != DataRootHost || !fb {
+		t.Fatalf("unmounted opt-in root=%q fellBack=%v, want /host + the named fallback", root, fb)
+	}
+}

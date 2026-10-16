@@ -1235,3 +1235,57 @@ func TestHistoryDoesNotTouchTheMonitorFile(t *testing.T) {
 		t.Fatal("SaveHistory did not write " + histPath)
 	}
 }
+
+// TestHistoryFollowsTheDataRoot pins the M100f (#2311) movable-set leg: an
+// opted-in row with a mounted /disk puts GOSH-HISTORY.TXT on the volume and
+// latches it there; a set-but-absent disk falls back to the share path and
+// the resolution runs once — a mid-session flip cannot split one shell's
+// history across two volumes.
+func TestHistoryFollowsTheDataRoot(t *testing.T) {
+	savedResolve, savedPath, savedLatched := histResolve, histPath, histResolved
+	defer func() { histResolve, histPath, histResolved = savedResolve, savedPath, savedLatched }()
+
+	// The mounted opt-in leg: the file lives on /disk for the whole session.
+	histResolve = func() (string, bool) { return "/disk", false }
+	histPath, histResolved = "", false
+	h := newFakeHost()
+	hist := &History{}
+	sink := &HistorySink{}
+	LoadHistory(h, hist, sink)
+	hist.Push("echo disk")
+	SaveHistory(h, hist, "echo disk", sink)
+	if _, ok := h.files["/disk/GOSH-HISTORY.TXT"]; !ok {
+		t.Fatalf("no write to /disk/GOSH-HISTORY.TXT: files = %v", h.files)
+	}
+	if _, ok := h.files["/host/GOSH-HISTORY.TXT"]; ok {
+		t.Fatal("an opted-in boot wrote history to the share")
+	}
+
+	// Latched: a resolver that changes its answer mid-session is ignored.
+	histResolve = func() (string, bool) { return "/host", false }
+	hist.Push("echo disk2")
+	SaveHistory(h, hist, "echo disk2", sink)
+	if _, ok := h.files["/host/GOSH-HISTORY.TXT"]; ok {
+		t.Fatal("a mid-session resolver flip moved the history file")
+	}
+	if got := string(h.files["/disk/GOSH-HISTORY.TXT"]); got != "echo disk\necho disk2\n" {
+		t.Fatalf("disk history = %q", got)
+	}
+}
+
+// TestHistoryDataRootFallback pins the set-but-absent leg: the row opted in,
+// the mount probe refused, and the file still lands on the share.
+func TestHistoryDataRootFallback(t *testing.T) {
+	savedResolve, savedPath, savedLatched := histResolve, histPath, histResolved
+	defer func() { histResolve, histPath, histResolved = savedResolve, savedPath, savedLatched }()
+	histResolve = func() (string, bool) { return "/host", true }
+	histPath, histResolved = "", false
+	h := newFakeHost()
+	hist := &History{}
+	sink := &HistorySink{}
+	hist.Push("echo host")
+	SaveHistory(h, hist, "echo host", sink)
+	if got := string(h.files["/host/GOSH-HISTORY.TXT"]); got != "echo host\n" {
+		t.Fatalf("fallback history = %q", got)
+	}
+}

@@ -11,6 +11,7 @@ package main
 import (
 	"testing"
 
+	"virelai/settings"
 	"virelai/theme"
 	"virelai/vi"
 )
@@ -32,6 +33,7 @@ func resetNotify(t *testing.T) {
 	savedHistDirty := notifyHistDirty
 	savedHistFailLogged := notifyHistFailLogged
 	savedSaveDND, savedRead, savedWrite := saveNotifyDND, readNotifyFile, writeNotifyFile
+	savedHistPath, savedDataRoot := notifyHistoryPath, notifyDataRoot
 	savedSoundChime := notifySoundChime
 	savedSoundParams := notifySoundParams
 	savedSoundPending := notifySoundPending
@@ -50,6 +52,10 @@ func resetNotify(t *testing.T) {
 	saveNotifyDND = func(bool) bool { return true }
 	readNotifyFile = func(string, int) ([]byte, int64) { return nil, -1 }
 	writeNotifyFile = func(string, []byte) bool { return true }
+	// M100f (#2311): the history path and its resolver reset beside the file
+	// seams — a test's /disk answer must never leak into the next case.
+	notifyHistoryPath = "/host/NOTIFY.HIST"
+	notifyDataRoot = func(f settings.File) (string, bool) { return f.ResolveDataRoot() }
 	notifySoundChime = nil
 	notifySoundParams = vi.AudioStreamParams{}
 	notifySoundPending = nil
@@ -82,6 +88,7 @@ func resetNotify(t *testing.T) {
 		notifyHistDirty = savedHistDirty
 		notifyHistFailLogged = savedHistFailLogged
 		saveNotifyDND, readNotifyFile, writeNotifyFile = savedSaveDND, savedRead, savedWrite
+		notifyHistoryPath, notifyDataRoot = savedHistPath, savedDataRoot
 		notifySoundChime = savedSoundChime
 		notifySoundParams = savedSoundParams
 		notifySoundPending = savedSoundPending

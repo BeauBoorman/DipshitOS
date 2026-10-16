@@ -51,7 +51,8 @@ type fakeFS struct {
 	listStale    bool // deleted paths: removed from the table, still listed
 	ghosts       []string
 
-	failSync bool // fsync reports the residual host error (M66a)
+	failSync bool     // fsync reports the residual host error (M66a)
+	syncs    []string // M100f (#2311): the paths fsync landed on, in order
 
 	// M81e2 (#1787): override the publish seam with a DELIBERATELY WRONG
 	// implementation, so a test can prove the file-write-publish case
@@ -471,6 +472,7 @@ func (f *fakeFS) syncHandle(h uint32) int64 {
 	if f.failSync {
 		return -1
 	}
+	f.syncs = append(f.syncs, f.handles[int64(h)])
 	return 0
 }
 
@@ -586,8 +588,8 @@ const wantReport = "case intake pass\ncase intake-altered pass\n" +
 	"case file-fsync pass\ncase file-errors pass\n" +
 	"case file-write-safe pass\ncase trash pass\ncase file-write-publish pass\n" +
 	"case mime pass\ncase file-snapshot pass\ncase app-logs pass\n" +
-	"case file-lease pass\ncase window pass\ncase clock-epoch pass\n" +
-	"case clock-set pass\nsummary cases=23 failed=0\n"
+	"case file-lease pass\ncase window pass\ncase disk pass\n" +
+	"case clock-epoch pass\ncase clock-set pass\nsummary cases=24 failed=0\n"
 
 // seedFixtures is the host's half of the intake contract: IN/fixture.txt holds
 // the canonical body, IN/altered.txt the altered one (ADR 0031 D2), and the
@@ -608,8 +610,8 @@ func TestRunCasesAllPassAndReportBytes(t *testing.T) {
 	seedFixtures(fs)
 	rs := runCases(fs.syscalls())
 
-	if len(rs) != 23 {
-		t.Fatalf("cases = %d, want 23", len(rs))
+	if len(rs) != 24 {
+		t.Fatalf("cases = %d, want 24", len(rs))
 	}
 	for _, r := range rs {
 		if !r.ok {
@@ -619,7 +621,7 @@ func TestRunCasesAllPassAndReportBytes(t *testing.T) {
 	if got := string(renderReport(rs)); got != wantReport {
 		t.Fatalf("report bytes:\n got %q\nwant %q", got, wantReport)
 	}
-	if got := string(renderSummary(rs)); got != "summary cases=23 failed=0\n" {
+	if got := string(renderSummary(rs)); got != "summary cases=24 failed=0\n" {
 		t.Fatalf("summary = %q", got)
 	}
 	if got := fs.files[helloPath]; !bytes.Equal(got, []byte(helloPayload)) {
@@ -705,7 +707,7 @@ func TestIntakeFailsOnAMutatedSeed(t *testing.T) {
 	if !strings.Contains(report, "case intake fail fixture mismatch") {
 		t.Fatalf("report lacks the intake failure: %q", report)
 	}
-	if !strings.Contains(report, "summary cases=23 failed=2") {
+	if !strings.Contains(report, "summary cases=24 failed=2") {
 		t.Fatalf("report summary wrong: %q", report)
 	}
 	if got := fs.files[intakeCopy]; !bytes.Equal(got, []byte(intakeAltered)) {
@@ -738,10 +740,10 @@ func TestIntakeFailsWhenTheFixtureIsMissing(t *testing.T) {
 	if got := string(fs.files[alteredReceipt]); !strings.Contains(got, "bytes=0 err=open rc=-6") {
 		t.Fatalf("altered receipt = %q", got)
 	}
-	// The report is still complete: 23 cases, the 2 intake ones failed (the
+	// The report is still complete: 24 cases, the 2 intake ones failed (the
 	// clock, file and window cases do not read IN/).
 	report := string(renderReport(rs))
-	if !strings.Contains(report, "summary cases=23 failed=2") {
+	if !strings.Contains(report, "summary cases=24 failed=2") {
 		t.Fatalf("report summary wrong: %q", report)
 	}
 	if lines := strings.Count(report, "\n"); lines != len(rs)+1 {
@@ -939,7 +941,7 @@ func TestFileWriteCaseFailsWhenTheWriteIsRefused(t *testing.T) {
 	if !strings.Contains(report, "case file-write fail ") {
 		t.Fatalf("report lacks the fail detail: %q", report)
 	}
-	if !strings.Contains(report, "summary cases=23 failed=1") {
+	if !strings.Contains(report, "summary cases=24 failed=1") {
 		t.Fatalf("report summary wrong: %q", report)
 	}
 }
@@ -1997,5 +1999,71 @@ func TestNoTruncatedPrefixOfABundleParses(t *testing.T) {
 	// And one byte PAST the end is a refusal too, not a silent accept.
 	if _, ok, _ := snapshot.Parse(append(append([]byte(nil), full...), 'x')); ok {
 		t.Fatal("a bundle with a trailing byte parsed clean")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M100f (#2311): the VLFS disk leg — write, fsync, readback on /disk with
+// the receipts on /host.
+// ---------------------------------------------------------------------------
+
+// The absent leg is the default boot's shape: the mount probe answers
+// not_mounted (-6), the case records mounted=no on the share and passes —
+// a data disk is an enhancement, never a boot requirement (ADR 0050 D6).
+func TestDiskCaseSkipsCleanlyWithoutADataDisk(t *testing.T) {
+	fs := newFakeFS()
+	if err := caseDisk(fs.syscalls()); err != nil {
+		t.Fatalf("absent-disk leg failed: %v", err)
+	}
+	if got := string(fs.files[diskOk]); got != "case disk mounted=no skipped\n" {
+		t.Fatalf("absent receipt = %q", got)
+	}
+	if _, ok := fs.files[diskPath]; ok {
+		t.Fatal("the absent leg touched /disk")
+	}
+}
+
+// The mounted leg: /disk exists, the payload is written, fsynced and read
+// back, the copy of the bytes READ BACK lands on the share, and the receipt
+// carries the deterministic numbers.
+func TestDiskCaseMountedDrill(t *testing.T) {
+	fs := newFakeFS()
+	fs.dirs["/disk"] = true
+	if err := caseDisk(fs.syscalls()); err != nil {
+		t.Fatalf("mounted leg failed: %v", err)
+	}
+	want := diskPayload()
+	if got := fs.files[diskPath]; !bytes.Equal(got, want) {
+		t.Fatalf("disk body = %d bytes, want the %d-byte payload", len(got), len(want))
+	}
+	if got := fs.files[diskCopy]; !bytes.Equal(got, want) {
+		t.Fatalf("disk.copy is not the read-back body (len %d, want %d)", len(got), len(want))
+	}
+	wantReceipt := "case disk mounted=yes path=SELFTEST/DISK.TXT wrote=" +
+		strconv.Itoa(len(want)) + " fsync=0 read=" + strconv.Itoa(len(want)) + " match=yes\n"
+	if got := string(fs.files[diskOk]); got != wantReceipt {
+		t.Fatalf("mounted receipt = %q want %q", got, wantReceipt)
+	}
+	if !fs.dirs[diskDir] {
+		t.Fatal("the case did not create /disk/SELFTEST")
+	}
+	// The fsync must have landed on the payload's handle — the fake records
+	// the path each sync closed over.
+	if len(fs.syncs) != 1 || fs.syncs[0] != diskPath {
+		t.Fatalf("syncs = %v, want exactly [%s]", fs.syncs, diskPath)
+	}
+}
+
+// A lying volume fails the case, not the receipt pipeline: the read-back
+// mismatch is the verdict.
+func TestDiskCaseFailsOnAReadbackMismatch(t *testing.T) {
+	fs := newFakeFS()
+	fs.dirs["/disk"] = true
+	fs.corruptRead = true
+	if err := caseDisk(fs.syscalls()); err == nil {
+		t.Fatal("a corrupted read-back passed")
+	}
+	if got := string(fs.files[diskOk]); !strings.Contains(got, "match=no") {
+		t.Fatalf("receipt = %q, want the honest mismatch", got)
 	}
 }
