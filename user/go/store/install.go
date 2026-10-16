@@ -1,0 +1,353 @@
+package main
+
+import (
+	"virelai/sshlib"
+	"virelai/vi"
+)
+
+// execFn is the exec+wait seam; tests replace it. It spawns name with
+// args and returns the child's exit status. STORE calls FLINT.ELF
+// DIRECTLY — never through `GOSH.ELF -c ... > file`: outer-GOSH + STORE +
+// inner-GOSH + FLINT is four Go runtimes at once, and four runtimes blow
+// the kernel's 13-user-slot task pool (observed `newosproc: sys_thread
+// create failed` when a 3-deep chain spawned a fourth). Direct exec is
+// three runtimes at worst, and the child's `flint:` lines still reach the
+// console for evidence — the named refusal prints, STORE just cannot
+// re-read it, so a nonzero exit maps to sync_failed.
+// execWaitNs bounds one child wait. The default Wait budget is 120 s —
+// far longer than a foreground FLINT verb ever runs — and a spawned pid
+// that the reclamation race loses ("wait failed" — the pid never enters
+// the registry) would burn the entire budget into ErrWaitGone; two of
+// those outrun a 180 s gate run before a refusal can print. Fifteen
+// seconds is generous for the verbs store spawns.
+const execWaitNs = int64(15) * int64(1e9)
+
+var execFn = func(name string, args ...string) (int64, error) {
+	pid, err := vi.Exec(name, args...)
+	if err != nil {
+		return -1, err
+	}
+	return vi.WaitBudget(pid, execWaitNs)
+}
+
+var sleepFn = vi.Sleep
+
+// execPaceTicks is the yield before and after each nested socket-exec.
+// Scheduler ticks are 1 Hz — values here are SECONDS, so keep them small.
+// The kernel's file channel races the task reaper for several commands
+// after a socket session — a `sleep 1` in run 14's script (a full
+// second) still lost `FLINT.ELF commit` to `not found` — so STORE paces
+// every transition in and out of a flint exec instead of trusting one
+// gap. A second per side is cheap inside a 180 s run budget.
+const execPaceTicks = 2
+
+// flint runs one FLINT.ELF verb and reports success. The child's console
+// output (including `flint: refuse <name>` on failure) flows to the
+// serial log directly. A nonzero exit is sync_failed — the named refusal
+// already printed. Any failure gets ONE retry after a re-arm: the
+// task-slot/file-channel reclamation race can refuse the spawn itself
+// right after a socket session (observed `gosh: FLINT.ELF: not found`),
+// and a `newosproc` abort surfaces only as a nonzero status — both are
+// transient and every verb used here is idempotent, so a real refusal
+// just refuses twice.
+// flintRetryTicks re-arms the task pool before a retry (seconds-scale —
+// ticks are 1 Hz): a child that
+// died inside its own runtime (`newosproc`) leaves slots the reaper
+// reclaims on a timeslice, so the second attempt waits longer than the
+// normal pace.
+const flintRetryTicks = 3
+
+// flintAttempts bounds retries. The post-socket task/file-channel
+// reclamation race can lose an exec spawn OR its registry entry several
+// seconds running (`gosh: wait failed` + silent child, observed twice
+// on run 15); the window is longer than one pace, so the seam retries
+// twice — every verb used here is idempotent and a real refusal just
+// refuses again.
+const flintAttempts = 3
+
+func flint(args ...string) error {
+	var status int64
+	var err error
+	for i := 0; i < flintAttempts; i++ {
+		sleepFn(execPaceTicks)
+		status, err = execFn("FLINT.ELF", args...)
+		if err == nil && status == 0 {
+			sleepFn(execPaceTicks)
+			return nil
+		}
+		if i+1 < flintAttempts {
+			sleepFn(flintRetryTicks)
+		}
+	}
+	if err != nil {
+		return refuse("sync_failed", "exec")
+	}
+	return refuse("sync_failed", "")
+}
+
+// resolveRemote picks the flintd address: --remote wins, then the
+// REMOTE.json binding clone/pull/push left.
+func resolveRemote(fs FS, root, remoteFlag string) (string, error) {
+	if remoteFlag != "" {
+		return remoteFlag, nil
+	}
+	rc, err := loadRemoteConfig(fs, root)
+	if err != nil {
+		return "", err
+	}
+	if rc != nil && rc.Remote != "" {
+		return rc.Remote, nil
+	}
+	return "", refuse("remote_missing", "")
+}
+
+// syncStream ensures the named stream's local replica is current: clone
+// when absent, pull when present. Either way every Change that lands has
+// already passed the M101b keyring gate inside FLINT.ELF.
+func syncStream(fs FS, remote, stream string, byName map[string]*Stream) error {
+	if _, ok := byName[stream]; ok {
+		return flint("pull", "--remote="+remote, "--stream="+stream)
+	}
+	return flint("clone", remote, stream)
+}
+
+// streamID resolves a stream selector (name preferred, then id) in the
+// local index after a sync.
+func streamID(byName, byID map[string]*Stream, sel string) (string, error) {
+	if st, ok := byName[sel]; ok {
+		return st.ID, nil
+	}
+	if st, ok := byID[sel]; ok {
+		return st.ID, nil
+	}
+	return "", refuse("stream_missing", sel)
+}
+
+// headReleaseOps loads the stream's local log and returns the folded
+// signed release.go atom set.
+func headReleaseOps(fs FS, root, id string) (map[atomKey]string, error) {
+	changes, err := readStreamChanges(fs, root, id)
+	if err != nil {
+		return nil, err
+	}
+	return foldReleaseOps(changes), nil
+}
+
+// remoteStreamsFn is the wire-enumeration seam; tests substitute a fake.
+// The pacing wrapper matters as much as the exec one: a just-closed
+// guest socket returns its task/channel slots on the reaper's schedule,
+// not Close()s — a fresh dial inside that window parks the caller with
+// no error and no output (the run-15 silent stall, observed), so the
+// seam sleeps around the whole session.
+var remoteStreamsFn = func(remote string) ([]Stream, error) {
+	sleepFn(execPaceTicks)
+	streams, err := remoteStreams(remote)
+	sleepFn(execPaceTicks)
+	return streams, err
+}
+
+// cmdLs implements `store ls [--remote=<r>]`: enumerate the remote's
+// streams over the wire, refresh the local replica when the remote head
+// moved, and report whether each stream's head ops carry a release
+// manifest. A current replica needs no pull at all — the wire `read`
+// behind clone/pull cannot carry a release-sized Change anyway (the
+// relay drop is documented on remoteStreams), so ls is expected to see
+// replicas the share already materialized, exactly like install.
+func cmdLs(fs FS, root string, remoteFlag string) int {
+	consoleFn("store: ls")
+	remote, err := resolveRemote(fs, root, remoteFlag)
+	if err != nil {
+		return runErr(err)
+	}
+	consoleFn("store: remote " + remote)
+	streams, err := remoteStreamsFn(remote)
+	if err != nil {
+		return runErr(err)
+	}
+	for _, st := range streams {
+		byName, byID, err := listStreamRecords(fs, root)
+		if err != nil {
+			return runErr(err)
+		}
+		rec, found := byName[st.Name]
+		localHead := (*string)(nil)
+		if found {
+			localHead = rec.Head
+		}
+		if !found || (st.Head != nil && (localHead == nil || *localHead != *st.Head)) {
+			if err := syncStream(fs, remote, st.Name, byName); err != nil {
+				consoleFn("store: stream " + st.Name + " sync-failed")
+				continue
+			}
+		}
+		byName, byID, err = listStreamRecords(fs, root)
+		if err != nil {
+			return runErr(err)
+		}
+		id, err := streamID(byName, byID, st.Name)
+		if err != nil {
+			return runErr(err)
+		}
+		signed, err := headReleaseOps(fs, root, id)
+		if err != nil {
+			return runErr(err)
+		}
+		if len(signed) > 0 {
+			consoleFn("store: stream " + st.Name + " release")
+		} else {
+			consoleFn("store: stream " + st.Name + " no-release")
+		}
+	}
+	consoleFn("store: ls ok")
+	return 0
+}
+
+// cmdInstall implements `store install <stream> [--remote=<r>]
+// [--channel=<c>]` — the full verify-then-install pipeline.
+func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
+	consoleFn("store: install " + stream)
+	remote, err := resolveRemote(fs, root, remoteFlag)
+	if err != nil {
+		return runErr(err)
+	}
+	consoleFn("store: remote " + remote)
+	ch, err := openChannel(fs, channelArg)
+	if err != nil {
+		return runErr(err)
+	}
+
+	// 1. Sync + verify: `pull` inside the FLINT.ELF child does its own
+	// remote heads-check (`pull up to date` costs one `heads` round —
+	// the wire session lives INSIDE the child, whose socket+exec coexist
+	// under its own task slots; a store-side session raced the kernel's
+	// reclamation for ~2 min observed). Then the local keyring + Ed25519
+	// gate over the replica.
+	byName, _, err := listStreamRecords(fs, root)
+	if err != nil {
+		return runErr(err)
+	}
+	if err := syncStream(fs, remote, stream, byName); err != nil {
+		return runErr(err)
+	}
+	byName, byID, err := listStreamRecords(fs, root)
+	if err != nil {
+		return runErr(err)
+	}
+	id, err := streamID(byName, byID, stream)
+	if err != nil {
+		return runErr(err)
+	}
+	// M101b's gate, local edition: `verify --all` runs the publisher
+	// keyring + Ed25519 check over the replica pull just confirmed
+	// current. `verify --remote` would re-fetch the same Changes off the
+	// wire — and a release-sized Change is exactly what the relay cannot
+	// carry back (remoteStreams documents the ~1460 B fill boundary), so
+	// the remote read stalls where the local fold does not.
+	consoleFn("store: verify " + stream)
+	if err := flint("verify", "--all"); err != nil {
+		return runErr(err)
+	}
+	consoleFn("store: verified " + stream)
+
+	// 2. Signed release manifest atoms at head.
+	signed, err := headReleaseOps(fs, root, id)
+	if err != nil {
+		return runErr(err)
+	}
+	if len(signed) == 0 {
+		return runErr(refuse("release_missing", stream))
+	}
+
+	// 3. Fetch + verify release.go over the untrusted channel.
+	src, err := ch.fetch(stream+"/"+releaseFile, MaxReleaseBytes)
+	if err != nil {
+		return runErr(err)
+	}
+	if err := verifyRelease(src, signed); err != nil {
+		return runErr(err)
+	}
+	rel, err := parseRelease(src)
+	if err != nil {
+		return runErr(err)
+	}
+	bin := rel.Name + ".ELF"
+
+	// 4. Fetch + hash the ELF.
+	elf, err := ch.fetch(stream+"/"+bin, MaxELFBytes)
+	if err != nil {
+		return runErr(err)
+	}
+	sum := sshlib.SHA256Sum(elf)
+	if sshlib.EncodeHex(sum[:]) != rel.ELFSHA256 {
+		return runErr(refuse("elf_mismatch", bin))
+	}
+
+	// 5. Install checks against current state.
+	lines, err := loadManifest(fs)
+	if err != nil {
+		return runErr(err)
+	}
+	if manifestHasBin(lines, bin) {
+		// Idempotent re-install: the signed manifest covers the same ELF,
+		// and a gate/shell retry after a raced exec must not read as a
+		// refusal. Verify the on-disk bytes still match the signed hash —
+		// a tampered install is not skipped silently.
+		have, rerr := fs.ReadFile("/host/"+bin, MaxELFBytes)
+		haveSum := sshlib.SHA256Sum(have)
+		if rerr == nil && sshlib.EncodeHex(haveSum[:]) == rel.ELFSHA256 {
+			consoleFn("store: already installed " + bin + " version=" + rel.Version)
+			return 0
+		}
+		return runErr(refuse("already_installed", bin))
+	}
+	elfPath := "/host/" + bin
+	if fs.Exists(elfPath) {
+		return runErr(refuse("elf_exists", bin))
+	}
+	manifest, err := manifestWithRow(lines, rel.ManifestRow)
+	if err != nil {
+		return runErr(err)
+	}
+
+	// 6. Publish: ELF first (orphan = harmless), then the row; a failed
+	// row write reverts the ELF so no partial state survives.
+	if err := fs.WriteFileSafe(elfPath, elf); err != nil {
+		return runErr(err)
+	}
+	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
+		_ = fs.Remove(elfPath)
+		return runErr(err)
+	}
+	consoleFn("store: install ok " + bin + " version=" + rel.Version)
+	return 0
+}
+
+// cmdRemove implements `store remove <name>` — the symmetric case: the
+// manifest row goes first (a crash leaves an orphan file, never a
+// dangling row), then the ELF.
+func cmdRemove(fs FS, arg string) int {
+	consoleFn("store: remove " + arg)
+	bin, ok := normalizeBin(arg)
+	if !ok {
+		return runErr(refuse("name_invalid", arg))
+	}
+	lines, err := loadManifest(fs)
+	if err != nil {
+		return runErr(err)
+	}
+	kept, found := manifestWithoutBin(lines, bin)
+	if !found {
+		return runErr(refuse("not_installed", bin))
+	}
+	if err := fs.WriteFileSafe(appsPath, renderManifest(kept)); err != nil {
+		return runErr(err)
+	}
+	elfPath := "/host/" + bin
+	if fs.Exists(elfPath) {
+		if err := fs.Remove(elfPath); err != nil {
+			return runErr(err)
+		}
+	}
+	consoleFn("store: remove ok " + bin)
+	return 0
+}
