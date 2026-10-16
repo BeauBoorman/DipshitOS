@@ -940,6 +940,20 @@ fn invalidate_disk_pin(ino: u32) void {
     };
 }
 
+/// Issue #2374: a committed `.disk` removal also stales every PLAIN file
+/// handle holding the freed inode — without it the handle stayed live and
+/// `allocInode` (lowest-first) recycled the inode into the next created
+/// file, which the stale fd then silently aliased. `disk_ino` zeroed is
+/// the stale marker (inode 0 is never allocated, contained handles carry
+/// their backend token in `disk_handle` instead), so read/write/truncate
+/// answer EBADF — the same refusal a stale pin gives.
+fn invalidate_disk_plain(ino: u32) void {
+    if (handles.len == 0) return;
+    for (handles) |*row| for (row) |*h| {
+        if (h.in_use and h.partition == .disk and !h.pin and h.disk_handle == 0 and h.disk_ino == ino) h.disk_ino = 0;
+    };
+}
+
 /// Op 7: pins an existing directory by the B3 no-follow walk.
 pub fn pin_open(pid: u64, root_bytes: []const u8, relative: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
@@ -1097,7 +1111,10 @@ pub fn pin_remove(pid: u64, token: u64, name: []const u8, kind: u64) i64 {
             } else |_| {}
         }
         metadata.remove(backend, vlfs_disk.authorizer, pin_directory(parent), name, want) catch |err| return metadata_errno(err);
-        if (doomed_ino != 0) invalidate_disk_pin(@intCast(doomed_ino));
+        if (doomed_ino != 0) {
+            invalidate_disk_pin(@intCast(doomed_ino));
+            invalidate_disk_plain(@intCast(doomed_ino));
+        }
         return 0;
     }
     var root = virtio_file.MetadataRoot{ .path = "" };
@@ -1744,6 +1761,9 @@ fn read_handle(pid: u64, h: *FileHandle, out_buf: []u8, strict: bool) i64 {
     // lives in vlfs_disk's table.
     if (h.partition == .disk) {
         if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        // A committed removal zeroed `disk_ino` (issue #2374): refuse
+        // rather than let the fd alias the recycled inode.
+        if (h.disk_handle == 0 and h.disk_ino == 0) return -2;
         if (h.disk_handle != 0) {
             const n = vlfs_disk.containedRead(h.disk_handle, out_buf) catch |err| return disk_errno(err);
             h.cursor += @intCast(n);
@@ -1865,6 +1885,9 @@ fn write_handle(pid: u64, h: *FileHandle, in_buf: []const u8) i64 {
     // contained-open variant writes through the backend handle's cursor.
     if (h.partition == .disk) {
         if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        // A committed removal zeroed `disk_ino` (issue #2374): refuse
+        // rather than let the fd alias the recycled inode.
+        if (h.disk_handle == 0 and h.disk_ino == 0) return -2;
         const n = if (h.disk_handle != 0)
             vlfs_disk.containedWrite(h.disk_handle, in_buf) catch |err| return disk_errno(err)
         else
@@ -2189,6 +2212,7 @@ pub fn delete(pid: u64, path_bytes: []const u8) i64 {
         const subpath = parsed.path[0..parsed.parsed_len()];
         const ino = vlfs_disk.remove(subpath) catch |err| return disk_errno(err);
         invalidate_disk_pin(ino);
+        invalidate_disk_plain(ino);
         return 0;
     }
     if (parsed.partition != .host) return -1;
@@ -2281,6 +2305,9 @@ pub fn truncate(pid: u64, fd: u64, new_size: u32) i64 {
     // the 64-block payload span → `txn_too_large` on a huge grow).
     if (h.partition == .disk) {
         if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        // A committed removal zeroed `disk_ino` (issue #2374): refuse
+        // rather than let the fd alias the recycled inode.
+        if (h.disk_handle == 0 and h.disk_ino == 0) return -2;
         const ino = blk: {
             if (h.disk_handle != 0) {
                 // Contained handles resolve their own inode.
@@ -3574,4 +3601,62 @@ test "file_table: contained write-open on writable /disk mints a write handle (i
     const n = read(0, @intCast(fr), &buf);
     try std.testing.expectEqualStrings("ZZZ", buf[0..@intCast(n)]);
     try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fr)));
+}
+
+test "file_table: deleting a /disk file stales its plain handles (issue #2374)" {
+    init();
+    defer vlfs_disk.detach();
+    try vlfs_build(vlfs_empty_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDiskRw.source(&vlfs_test_img)));
+
+    // A write fd and a read fd on A, then the path goes away — both plain
+    // handles still reference the freed inode.
+    const faw = open(0, "/disk/A.TXT", MODE_WRITE | MODE_CREATE);
+    try std.testing.expect(faw >= 0);
+    try std.testing.expectEqual(@as(i64, 5), write(0, @intCast(faw), "AAAA\n"));
+    const far = open(0, "/disk/A.TXT", MODE_READ);
+    try std.testing.expect(far >= 0);
+    try std.testing.expectEqual(@as(i64, 0), delete(0, "/disk/A.TXT"));
+
+    // B recycles A's inode (allocInode is lowest-first). Before #2374 the
+    // stale fds silently aliased B: reads served B's bytes, writes and
+    // truncate mutated B.
+    const fb = open(0, "/disk/B.TXT", MODE_WRITE | MODE_CREATE);
+    try std.testing.expect(fb >= 0);
+    try std.testing.expectEqual(@as(i64, 5), write(0, @intCast(fb), "BBBB\n"));
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(i64, -2), read(0, @intCast(far), &buf));
+    try std.testing.expectEqual(@as(i64, -2), write(0, @intCast(faw), "X"));
+    try std.testing.expectEqual(@as(i64, -2), truncate(0, @intCast(faw), 0));
+    var wire: metadata.Wire = undefined;
+    try std.testing.expect(handle_metadata(0, @intCast(far), metadata.handle_file, &wire) < 0);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(far)));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(faw)));
+
+    // B is untouched: it reads back exactly what was written to it.
+    const fr = open(0, "/disk/B.TXT", MODE_READ);
+    try std.testing.expect(fr >= 0);
+    const n = read(0, @intCast(fr), &buf);
+    try std.testing.expectEqualStrings("BBBB\n", buf[0..@intCast(n)]);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fr)));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fb)));
+
+    // pin_remove stales the same way.
+    const pd = open(0, "/disk/D", MODE_WRITE | MODE_CREATE | MODE_DIR);
+    try std.testing.expect(pd >= 0);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(pd)));
+    const fc = open(0, "/disk/D/C.TXT", MODE_WRITE | MODE_CREATE);
+    try std.testing.expect(fc >= 0);
+    try std.testing.expectEqual(@as(i64, 4), write(0, @intCast(fc), "CCC\n"));
+    const fcr = open(0, "/disk/D/C.TXT", MODE_READ);
+    try std.testing.expect(fcr >= 0);
+    const pin = pin_open(0, "/disk", "D");
+    try std.testing.expect(pin > 0);
+    try std.testing.expectEqual(@as(i64, 0), pin_remove(0, @intCast(pin), "C.TXT", metadata.remove_file));
+    try std.testing.expectEqual(@as(i64, -2), read(0, @intCast(fcr), &buf));
+    try std.testing.expectEqual(@as(i64, -2), write(0, @intCast(fc), "Y"));
+    try std.testing.expectEqual(@as(i64, 0), pin_close(0, @intCast(pin)));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fcr)));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fc)));
 }
