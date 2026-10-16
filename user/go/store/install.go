@@ -125,13 +125,31 @@ func streamID(byName, byID map[string]*Stream, sel string) (string, error) {
 
 // headReleaseOps folds the signed release.go atom set from verified log
 // bytes — at install/update these are the same bytes the --expect bind
-// pinned, so nothing swapped after the gate ran can reach the fold.
-func headReleaseOps(logBytes []byte) (map[atomKey]string, error) {
+// pinned, so nothing swapped after the gate ran can reach the fold —
+// but only through the record head: a pull torn between its log append
+// and its record roll leaves the log ahead of the record, and the
+// un-committed tail must not materialize ahead of the head STORE
+// records. A nil head folds nothing (nothing is committed); a head
+// absent from the log is stream_malformed — record and log disagree.
+func headReleaseOps(logBytes []byte, head *string) (map[atomKey]string, error) {
 	changes, err := parseStreamChanges(logBytes)
 	if err != nil {
 		return nil, err
 	}
-	return foldReleaseOps(changes), nil
+	if head == nil {
+		return foldReleaseOps(nil), nil
+	}
+	end := -1
+	for i, c := range changes {
+		if c.ID == *head {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return nil, refuse("stream_malformed", "head not in log")
+	}
+	return foldReleaseOps(changes[:end+1]), nil
 }
 
 // verifyStore runs the materialization gate inside FLINT.ELF: the
@@ -209,7 +227,7 @@ func cmdLs(fs FS, root string, remoteFlag string) int {
 		if err != nil {
 			return runErr(err)
 		}
-		signed, err := headReleaseOps(logBytes)
+		signed, err := headReleaseOps(logBytes, byID[id].Head)
 		if err != nil {
 			return runErr(err)
 		}
@@ -280,8 +298,8 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	consoleFn("store: verified " + stream)
 
 	// 2. Signed release manifest atoms at head — folded from the bound
-	// bytes.
-	signed, err := headReleaseOps(logBytes)
+	// bytes, up to the record head.
+	signed, err := headReleaseOps(logBytes, st.Head)
 	if err != nil {
 		return runErr(err)
 	}
@@ -325,15 +343,47 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 		// a tampered install is not skipped silently.
 		have, rerr := fs.ReadFile("/host/"+bin, MaxELFBytes)
 		haveSum := sshlib.SHA256Sum(have)
-		if rerr == nil && sshlib.EncodeHex(haveSum[:]) == rel.ELFSHA256 {
-			consoleFn("store: already installed " + bin + " version=" + rel.Version)
-			return 0
+		if rerr != nil || sshlib.EncodeHex(haveSum[:]) != rel.ELFSHA256 {
+			return runErr(refuse("already_installed", bin))
 		}
-		return runErr(refuse("already_installed", bin))
+		// Converge to a tracked install: a crash between the APPS.TXT
+		// write and the state write left a live app STORE.TXT does not
+		// know (update/rollback then refuse not_installed), so the
+		// already-installed path reconciles the row to the signed one
+		// and writes the state entry.
+		if cur, _ := manifestRowFor(lines, bin); cur != rel.ManifestRow {
+			manifest, merr := manifestWithBinRow(lines, bin, rel.ManifestRow)
+			if merr != nil {
+				return runErr(merr)
+			}
+			if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
+				return runErr(err)
+			}
+		}
+		if st.Head != nil {
+			if err := writeStateEntry(fs, &storeEntry{
+				Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+			}); err != nil {
+				return runErr(err)
+			}
+		}
+		consoleFn("store: already installed " + bin + " version=" + rel.Version)
+		return 0
 	}
 	elfPath := "/host/" + bin
+	elfOrphan := false
 	if fs.Exists(elfPath) {
-		return runErr(refuse("elf_exists", bin))
+		// An orphan ELF — a manifest-row write that never landed, or a
+		// manual drop — must not block the name forever: adopt it when
+		// its bytes are exactly what the signed release pins (writing
+		// them again is a no-op), and keep refusing elf_exists on
+		// anything else, which is a file STORE cannot account for.
+		have, rerr := fs.ReadFile(elfPath, MaxELFBytes)
+		sum := sshlib.SHA256Sum(have)
+		if rerr != nil || sshlib.EncodeHex(sum[:]) != rel.ELFSHA256 {
+			return runErr(refuse("elf_exists", bin))
+		}
+		elfOrphan = true
 	}
 	manifest, err := manifestWithRow(lines, rel.ManifestRow)
 	if err != nil {
@@ -345,11 +395,15 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	// no partial state survives. The entry records the resolved stream
 	// NAME (not the selector: `update` pulls it by name) and head id;
 	// prev_* stay empty until the first update retains a rollback target.
-	if err := fs.WriteFileSafe(elfPath, elf); err != nil {
-		return runErr(err)
+	if !elfOrphan {
+		if err := fs.WriteFileSafe(elfPath, elf); err != nil {
+			return runErr(err)
+		}
 	}
 	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
-		_ = fs.Remove(elfPath)
+		if !elfOrphan {
+			_ = fs.Remove(elfPath)
+		}
 		return runErr(err)
 	}
 	// st.Head is non-nil in practice — a headless stream has no changes,
@@ -361,7 +415,9 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 			Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
 		}); err != nil {
 			_ = fs.WriteFileSafe(appsPath, renderManifest(lines))
-			_ = fs.Remove(elfPath)
+			if !elfOrphan {
+				_ = fs.Remove(elfPath)
+			}
 			return runErr(err)
 		}
 	}
@@ -396,13 +452,20 @@ func cmdRemove(fs FS, arg string) int {
 		return runErr(err)
 	}
 	kept, found := manifestWithoutBin(lines, bin)
-	if !found {
+	elfPath := "/host/" + bin
+	// An ELF (or retained bytes) present without a manifest row is the
+	// orphan a torn install left — the name is only BLOCKED, not
+	// tracked, so remove cleans it up rather than refusing
+	// not_installed until someone deletes the file by hand.
+	orphan := fs.Exists(elfPath) || fs.Exists(prevPath(bin)) || fs.Exists(prevStagePath(bin))
+	if !found && !orphan {
 		return runErr(refuse("not_installed", bin))
 	}
-	if err := fs.WriteFileSafe(appsPath, renderManifest(kept)); err != nil {
-		return runErr(err)
+	if found {
+		if err := fs.WriteFileSafe(appsPath, renderManifest(kept)); err != nil {
+			return runErr(err)
+		}
 	}
-	elfPath := "/host/" + bin
 	if fs.Exists(elfPath) {
 		if err := fs.Remove(elfPath); err != nil {
 			return runErr(err)
@@ -410,6 +473,11 @@ func cmdRemove(fs FS, arg string) int {
 	}
 	if fs.Exists(prevPath(bin)) {
 		if err := fs.Remove(prevPath(bin)); err != nil {
+			return runErr(err)
+		}
+	}
+	if fs.Exists(prevStagePath(bin)) {
+		if err := fs.Remove(prevStagePath(bin)); err != nil {
 			return runErr(err)
 		}
 	}

@@ -14,9 +14,12 @@ const (
 	appsMaxBytes = 4096 // sexiburger.manifest_buf_max — every reader's bound
 )
 
-// loadManifest returns APPS.TXT's raw lines. An absent file is an empty
-// manifest (the launcher's own posture); a corrupt one is refused whole —
-// STORE never writes on top of bytes it could not read.
+// loadManifest returns APPS.TXT's raw lines, blank lines included. An
+// absent file is an empty manifest (the launcher's own posture); a
+// corrupt one is refused whole — STORE never writes on top of bytes it
+// could not read. The final empty element the trailing newline leaves
+// under strings.Split is a split artifact, not a line, and is dropped —
+// interior blanks survive so a rewrite never loses them.
 func loadManifest(fs FS) ([]string, error) {
 	if !fs.Exists(appsPath) {
 		return nil, nil
@@ -26,7 +29,11 @@ func loadManifest(fs FS) ([]string, error) {
 		return nil, refuse("manifest_malformed", "")
 	}
 	text := strings.ReplaceAll(string(b), "\r\n", "\n")
-	return strings.Split(text, "\n"), nil
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines, nil
 }
 
 // rowBin returns the first field of a manifest line (the binary name), or
@@ -53,13 +60,12 @@ func manifestHasBin(lines []string, bin string) bool {
 	return false
 }
 
-// renderManifest joins lines back to file bytes with a trailing newline.
+// renderManifest joins lines back to file bytes with a trailing
+// newline. Blank lines are written verbatim — dropping them would make
+// every APPS.TXT rewrite silently eat the file's spacing.
 func renderManifest(lines []string) []byte {
 	var b strings.Builder
 	for _, l := range lines {
-		if l == "" {
-			continue
-		}
 		b.WriteString(l)
 		b.WriteByte('\n')
 	}

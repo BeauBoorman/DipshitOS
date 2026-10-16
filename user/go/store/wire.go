@@ -449,9 +449,12 @@ func remoteStreams(remote string) ([]Stream, error) {
 	// Bound the whole session, not each Recv: hello+auth+list each carry
 	// a 30 s default budget and a wedged remote makes them expire
 	// serially — past a gate run's window, with no output to show for it.
-	// 20 s covers a healthy session many times over.
+	// 20 s covers a healthy session many times over. SetRecvDeadline
+	// takes a RELATIVE budget (it adds Nanos() itself — vi/conn.go), so
+	// passing an absolute timestamp would bound the session at
+	// uptime + 20 s.
 	if d, ok := conn.(interface{ SetRecvDeadline(int64) }); ok {
-		d.SetRecvDeadline(vi.Nanos() + 20_000_000_000)
+		d.SetRecvDeadline(20_000_000_000)
 	}
 	client := &syncClient{conn: conn}
 	defer client.close()
