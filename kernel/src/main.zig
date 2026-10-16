@@ -45,6 +45,7 @@ const virtio_net = @import("virtio_net.zig");
 // `virelai-vlfs` via blockDeviceIdentifier; VIRTIO_BLK_T_GET_ID is the
 // identity wire. Pre-exit scan/cap-resolution, post-MMU re-arm + GET_ID.
 const virtio_blk = @import("virtio_blk.zig");
+const vlfs_disk = @import("vlfs/disk.zig"); // M100d (#2309): mount the data disk
 // Milestone six card G1 (claim 6053): virtio-gpu transport + framebuffer
 // (the runner's VZVirtioGraphicsDeviceConfiguration under `--display` /
 // `--screenshot`) — the graphics keystone. Pre-exit discovery, post-MMU
@@ -869,6 +870,17 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
             uart_puts(virtio_blk.vlfs_disk_id);
             uart_puts("\n");
             blk_boot_probe(sectors);
+            // M100d (issue #2309, ADR 0050 D1/D6): mount the data disk at
+            // /disk. A refusal is named on the serial line and the boot
+            // continues share-only — the mount is an enhancement, never a
+            // requirement.
+            if (vlfs_disk.attachBlk()) {
+                uart_puts("vlfs: mounted /disk\n");
+            } else {
+                uart_puts("vlfs: mount refused ");
+                uart_puts(vlfs_disk.last_refusal orelse "io_error");
+                uart_puts("\n");
+            }
         } else {
             uart_puts("blk: ");
             uart_hex(armed);

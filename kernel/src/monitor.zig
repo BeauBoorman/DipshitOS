@@ -1353,11 +1353,15 @@ fn trust_denied(m: *Monitor, verb: []const u8, path: []const u8) ExecError {
 }
 
 fn cmd_vf(m: *Monitor, args: []const []const u8) ExecError {
-    if (!virtio_file.available()) {
+    if (args.len == 0) return cmd_vf_usage(m);
+    // M100d (issue #2309): a /disk path routes to the VLFS volume whether
+    // or not the host channel is attached — the mount stands alone, so
+    // the availability check fires only for verbs with no disk operand.
+    const disk_target = args.len > 1 and arg_is_disk(args[1]);
+    if (!virtio_file.available() and !disk_target) {
         m.console.print_line("vf: no host file channel (boot the runner with --cvc-file <host-dir>)");
         return .none;
     }
-    if (args.len == 0) return cmd_vf_usage(m);
     if (std.mem.eql(u8, args[0], "ls")) return cmd_vf_ls(m, args[1..]);
     if (std.mem.eql(u8, args[0], "cat")) return cmd_vf_cat(m, args[1..]);
     if (std.mem.eql(u8, args[0], "open")) return cmd_vf_open(m, args[1..]);
@@ -1370,6 +1374,12 @@ fn cmd_vf(m: *Monitor, args: []const []const u8) ExecError {
     if (std.mem.eql(u8, args[0], "mv")) return cmd_vf_mv(m, args[1..]);
     if (std.mem.eql(u8, args[0], "clone")) return cmd_vf_clone(m, args[1..]);
     return cmd_vf_usage(m);
+}
+
+/// Does this argument name a /disk path? (nil/parse failures are host-side.)
+fn arg_is_disk(arg: []const u8) bool {
+    const parsed = file_table.parse_path(arg) orelse return false;
+    return parsed.partition == .disk;
 }
 
 fn cmd_vf_usage(m: *Monitor) ExecError {
@@ -1404,6 +1414,15 @@ fn vf_err(m: *Monitor, verb: []const u8, path: []const u8, st: u8) ExecError {
 fn cmd_vf_open(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len == 0) return cmd_vf_usage(m);
     const path = args[0];
+    if (arg_is_disk(path)) {
+        // The disk has no monitor handle table — writes go through the
+        // whole-file verbs (`write`, `vf write <path> <n>`) or the file ABI.
+        err_prefix(m);
+        m.console.puts("vf open: ");
+        m.console.puts(path);
+        m.console.print_line(": no handle form on /disk — use 'vf write <path> <n>'");
+        return .invalid_argument;
+    }
     if (!kernel_vf_allowed(path, .create)) return trust_denied(m, "vf open", path);
     var flags: u8 = virtio_file.open_flag_create;
     if (args.len > 1 and std.mem.eql(u8, args[1], "append")) flags |= virtio_file.open_flag_append;
@@ -1435,9 +1454,16 @@ fn cmd_vf_close(m: *Monitor, args: []const []const u8) ExecError {
     return .none;
 }
 
-/// `vf write <h> <n>` — stream n probe-pattern bytes through the cursor.
+/// `vf write <h> <n>` — stream n probe-pattern bytes through the cursor;
+/// `vf write /disk/<path> <n>` — the same fill on the VLFS volume.
 fn cmd_vf_write(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len < 2) return cmd_vf_usage(m);
+    if (arg_is_disk(args[0])) {
+        const n = parseInt(args[1]) catch return cmd_vf_usage(m);
+        if (n == 0) return cmd_vf_usage(m);
+        const parsed = file_table.parse_path(args[0]).?;
+        return cmd_disk_write(m, parsed.path[0..parsed.parsed_len()], n);
+    }
     const handle = parseInt(args[0]) catch return cmd_vf_usage(m);
     const n = parseInt(args[1]) catch return cmd_vf_usage(m);
     if (n == 0) return cmd_vf_usage(m);
@@ -1456,9 +1482,24 @@ fn cmd_vf_write(m: *Monitor, args: []const []const u8) ExecError {
     return .none;
 }
 
-/// `vf truncate <h> <n>` — set the file size through the handle.
+/// `vf truncate <h> <n>` — set the file size through the handle;
+/// `vf truncate /disk/<path> <n>` — the journaled resize on VLFS.
 fn cmd_vf_truncate(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len < 2) return cmd_vf_usage(m);
+    if (arg_is_disk(args[0])) {
+        const size = parseInt(args[1]) catch return cmd_vf_usage(m);
+        const parsed = file_table.parse_path(args[0]).?;
+        const subpath = parsed.path[0..parsed.parsed_len()];
+        const found = vlfs_disk.lookup(subpath) catch |err| return disk_verb_err(m, "vf truncate", subpath, err);
+        if (found.kind == vlfs.kind_dir) return disk_verb_err(m, "vf truncate", subpath, error.IsDir);
+        vlfs_disk.truncate(found.inode, @intCast(@min(size, std.math.maxInt(u32)))) catch |err| return disk_verb_err(m, "vf truncate", subpath, err);
+        m.console.puts("vf: truncate disk:");
+        m.console.puts(subpath);
+        m.console.puts(" size=");
+        m.console.print_u64(size);
+        m.console.print_line(" ok");
+        return .none;
+    }
     const handle = parseInt(args[0]) catch return cmd_vf_usage(m);
     const size = parseInt(args[1]) catch return cmd_vf_usage(m);
     if (handle > std.math.maxInt(u16)) return cmd_vf_usage(m); // #2089
@@ -1472,9 +1513,17 @@ fn cmd_vf_truncate(m: *Monitor, args: []const []const u8) ExecError {
     return .none;
 }
 
-/// `vf fsync <h>` — real durability on the host fd.
+/// `vf fsync <h>` — real durability on the host fd; `vf fsync /disk[...]` —
+/// the virtio-blk FLUSH barrier on the mounted VLFS volume.
 fn cmd_vf_fsync(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len == 0) return cmd_vf_usage(m);
+    if (arg_is_disk(args[0])) {
+        vlfs_disk.sync() catch |err| return disk_verb_err(m, "vf fsync", args[0], err);
+        m.console.puts("vf: fsync ");
+        m.console.puts(args[0]);
+        m.console.print_line(" ok (FLUSH completed)");
+        return .none;
+    }
     const handle = parseInt(args[0]) catch return cmd_vf_usage(m);
     if (handle > std.math.maxInt(u16)) return cmd_vf_usage(m); // #2089
     const st = virtio_file.fsync(@intCast(handle));
@@ -1489,6 +1538,16 @@ fn cmd_vf_fsync(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_vf_mkdir(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len == 0) return cmd_vf_usage(m);
     const path = args[0];
+    if (file_table.parse_path(path)) |parsed| {
+        if (parsed.partition == .disk) {
+            const subpath = parsed.path[0..parsed.parsed_len()];
+            _ = vlfs_disk.create(subpath, vlfs.kind_dir) catch |err| return disk_verb_err(m, "vf mkdir", subpath, err);
+            m.console.puts("vf: mkdir disk:");
+            m.console.puts(subpath);
+            m.console.print_line(" ok");
+            return .none;
+        }
+    }
     if (!kernel_vf_allowed(path, .create)) return trust_denied(m, "vf mkdir", path);
     const st = virtio_file.mkdir(path);
     if (st != virtio_file.st_ok) return vf_err(m, "mkdir", path, st);
@@ -1502,6 +1561,16 @@ fn cmd_vf_mkdir(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_vf_rm(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len == 0) return cmd_vf_usage(m);
     const path = args[0];
+    if (file_table.parse_path(path)) |parsed| {
+        if (parsed.partition == .disk) {
+            const subpath = parsed.path[0..parsed.parsed_len()];
+            _ = vlfs_disk.remove(subpath) catch |err| return disk_verb_err(m, "vf rm", subpath, err);
+            m.console.puts("vf: rm disk:");
+            m.console.puts(subpath);
+            m.console.print_line(" ok");
+            return .none;
+        }
+    }
     if (!kernel_vf_allowed(path, .delete)) return trust_denied(m, "vf rm", path);
     const st = virtio_file.delete(path);
     if (st != virtio_file.st_ok) return vf_err(m, "rm", path, st);
@@ -1516,6 +1585,31 @@ fn cmd_vf_mv(m: *Monitor, args: []const []const u8) ExecError {
     if (args.len < 2) return cmd_vf_usage(m);
     const from = args[0];
     const to = args[1];
+    const from_disk = arg_is_disk(from);
+    const to_disk = arg_is_disk(to);
+    if (from_disk or to_disk) {
+        // Same-volume only — a cross-partition move has no rename op.
+        if (!(from_disk and to_disk)) {
+            err_prefix(m);
+            m.console.puts("vf mv: ");
+            m.console.puts(from);
+            m.console.puts(" -> ");
+            m.console.puts(to);
+            m.console.print_line(": cross-partition rename refused");
+            return .invalid_argument;
+        }
+        const fp = file_table.parse_path(from).?;
+        const tp = file_table.parse_path(to).?;
+        const fs = fp.path[0..fp.parsed_len()];
+        const ts = tp.path[0..tp.parsed_len()];
+        vlfs_disk.rename(fs, ts, false) catch |err| return disk_verb_err(m, "vf mv", fs, err);
+        m.console.puts("vf: mv disk:");
+        m.console.puts(fs);
+        m.console.puts(" -> ");
+        m.console.puts(ts);
+        m.console.print_line(" ok");
+        return .none;
+    }
     if (!kernel_vf_allowed(from, .delete)) return trust_denied(m, "vf mv", from);
     if (!kernel_vf_allowed(to, .create)) return trust_denied(m, "vf mv", to);
     const st = virtio_file.rename(from, to);
@@ -1711,6 +1805,45 @@ fn cmd_disk_cat(m: *Monitor, subpath: []const u8) ExecError {
     return .none;
 }
 
+/// `vf write /disk/<path> <n>` — write n bytes of a deterministic fill
+/// pattern through the journaled write path in reply_cap-sized chunks
+/// (each chunk is one committed transaction). A mid-fill refusal reports
+/// the named reason AND the confirmed byte count — an honest short write.
+fn cmd_disk_write(m: *Monitor, subpath: []const u8, n: u64) ExecError {
+    var written: u64 = 0;
+    var chunks: u64 = 0;
+    while (written < n) {
+        const take: usize = @intCast(@min(n - written, cmd_write_buf.len));
+        for (cmd_write_buf[0..take], 0..) |*b, i| {
+            b.* = @intCast((written + i) % 251);
+        }
+        vlfs_disk.writeAppend(subpath, cmd_write_buf[0..take]) catch |err| {
+            err_prefix(m);
+            m.console.puts("vf write: disk:");
+            m.console.puts(subpath);
+            m.console.puts(": ");
+            m.console.puts(vlfs.refusalName(err));
+            m.console.puts(" after ");
+            m.console.print_u64(written);
+            m.console.print_line(" bytes");
+            return .invalid_argument;
+        };
+        written += take;
+        chunks += 1;
+    }
+    vlfs_disk.sync() catch |err| return disk_verb_err(m, "vf write", subpath, err);
+    m.console.puts("vf: write disk:");
+    m.console.puts(subpath);
+    m.console.puts(" n=");
+    m.console.print_u64(n);
+    m.console.puts(" wrote=");
+    m.console.print_u64(written);
+    m.console.puts(" chunks=");
+    m.console.print_u64(chunks);
+    m.console.puts("\n");
+    return .none;
+}
+
 fn cmd_disk_stat(m: *Monitor, name: []const u8, subpath: []const u8) ExecError {
     const found = vlfs_disk.lookup(subpath) catch |err| return disk_verb_err(m, "stat", subpath, err);
     const st = vlfs_disk.statInode(found.inode) catch |err| return disk_verb_err(m, "stat", subpath, err);
@@ -1774,6 +1907,19 @@ fn cmd_write(m: *Monitor, args: []const []const u8) ExecError {
         }
         @memcpy(buf[n..][0..p.len], p);
         n += p.len;
+    }
+    // M100d (issue #2309): `write /disk/<path> <text>` is a journaled
+    // whole-file replace + FLUSH on the mounted volume.
+    if (arg_is_disk(name)) {
+        const parsed = file_table.parse_path(name).?;
+        const subpath = parsed.path[0..parsed.parsed_len()];
+        vlfs_disk.writeWhole(subpath, buf[0..n]) catch |err| return disk_verb_err(m, "write", subpath, err);
+        m.console.puts("write: ok (journaled ");
+        m.console.print_u64(n);
+        m.console.puts(" bytes to disk:");
+        m.console.puts(subpath);
+        m.console.puts(")\n");
+        return .none;
     }
     if (!kernel_vf_allowed(name, .write)) return trust_denied(m, "write", name);
     const st = virtio_file.write_whole(name, buf[0..n]);
