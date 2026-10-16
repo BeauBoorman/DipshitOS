@@ -2,5 +2,5 @@ package release
 
 const ReleaseName = "GOHELLO"
 const ReleaseVersion = "1.0.0"
-const ReleaseELFSHA256 = "117c3b2575e6a8de32036aca8ea0eda6c5c6dc2f737ddf0edeec5c4b89264a25"
+const ReleaseELFSHA256 = "f628079e401fb2c9e03afb7c556941a6db21e63e9ad1c260f342aaa9d7a1ebc6"
 const ReleaseManifestRow = "GOHELLO.ELF | Go Hello | g | dock=false"
