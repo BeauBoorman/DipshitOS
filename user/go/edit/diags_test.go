@@ -63,6 +63,10 @@ func TestParseDiag(t *testing.T) {
 		{"gobuild:0:0: compile main: spawn GOCMDCOMPILE.ELF", "gobuild", 0, 0, 0, true},
 		{"panic: index out of range", "", 0, 0, 0, false},
 		{":3:8: no file", "", 0, 0, 0, false},
+		// The writer's grammar terminates the column with ':' — a bare
+		// `file:line:col` or junk right after the digits is not a position.
+		{"a.go:1:2", "", 0, 0, 0, false},
+		{"a.go:1:2xyz: trailing junk is not a column", "", 0, 0, 0, false},
 	}
 	for _, c := range cases {
 		r, ok := parseDiag(c.line)

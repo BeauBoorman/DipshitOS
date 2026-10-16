@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strconv"
 	"strings"
 )
@@ -183,7 +184,12 @@ func (s stepOut) failed() bool { return s.err != nil || s.step.Status != 0 }
 // diags. A nonzero status records the tombstone as a diag naming the child
 // — the card's no-papering-over rule.
 func runStep(cfg Config, label, image string, args []string, diagFile string) stepOut {
-	status, ms, captured, err := execAndWait(image, args, diagFile)
+	// The capture temp rides the `~` publish-temp convention beside the
+	// diag stem and is removed once the step's bytes came back — .BUILD
+	// must not accumulate one temp per step per build.
+	capture := diagFile + "~"
+	status, ms, captured, err := execAndWait(image, args, capture)
+	_ = os.Remove(capture)
 	out := stepOut{step: Step{Label: label, Image: image, Status: status, Ms: ms}}
 	if err != nil {
 		out.err = err

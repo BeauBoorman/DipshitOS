@@ -55,7 +55,8 @@ var (
 )
 
 // parseDiag splits `path:line:col: msg` — the grammar cmd/compile prints
-// and M107a's writer keeps. Share paths carry no ':', so the first colon
+// and M107a's writer keeps (gobuild's parseDiagLine requires the same
+// terminating ':' this does). Share paths carry no ':', so the first colon
 // ends the path and digits follow; the message may hold colons, which is
 // why this walks left-to-right. A line without the shape is not a
 // diagnostic position (false) — the caller still displays it raw.
@@ -84,7 +85,7 @@ func parseDiag(line string) (diagRow, bool) {
 	if r.line, rest, ok = num(rest); !ok || !strings.HasPrefix(rest, ":") {
 		return diagRow{raw: line}, false
 	}
-	if r.col, _, ok = num(rest[1:]); !ok {
+	if r.col, rest, ok = num(rest[1:]); !ok || !strings.HasPrefix(rest, ":") {
 		return diagRow{raw: line}, false
 	}
 	return r, true
