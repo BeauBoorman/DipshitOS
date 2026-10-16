@@ -377,4 +377,101 @@ final class NetTcpRelayTests: XCTestCase {
         XCTAssertTrue(logged(matching: "cannot retransmit"))
         XCTAssertEqual(tcpFlags(frame(at: frameCount - 1)) & 0x14, 0x14)
     }
+
+    // #2369 — death is a teardown, not a leak: the stall-RST path shuts
+    // the upstream fd down in the same call, so the accepted server
+    // side reads EOF instead of holding a live connection that only an
+    // unrelated SYN purge would ever reap.
+    func testDeadRelayClosesTheUpstream() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(), 58)
+        let up = try upstream(relay)
+        defer { close(up); relay.shutdown() }
+        writeUpstream(up, [UInt8](repeating: 0x63, count: 100))
+        _ = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: serverIsn + 1, wnd: 1460), 54)
+        _ = relay.pump()
+        XCTAssertTrue(waitFor { self.frameCount == 1 })
+
+        var killed = false
+        for _ in 0..<NetTcpRelay.stallLimit {
+            killed = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: serverIsn + 1, wnd: 0), 54)
+        }
+        XCTAssertTrue(killed)
+        XCTAssertTrue(relay.isDead)
+
+        // The fd was shut the moment the RST went out — the server side
+        // (which the relay never wrote to, so POLLIN can only be the
+        // close) reads EOF within the bound.
+        XCTAssertTrue(waitFor {
+            var pfd = pollfd(fd: up, events: Int16(POLLIN), revents: 0)
+            guard poll(&pfd, 1, 50) > 0 else { return false }
+            var one: [UInt8] = [0]
+            return read(up, &one, 1) == 0
+        })
+    }
+
+    // #2368 — the tx buffer is bounded: with the guest's window shut,
+    // the reader parks at the high-water mark and the backpressure
+    // lands on the upstream socket's own TCP window instead of host
+    // RAM. Opening the guest's window drains below the low-water mark
+    // and reads (and upstream writes) resume.
+    func testTxHighWaterBackpressuresUpstream() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(mss: 1460, wnd: 0), 58)
+        let up = try upstream(relay)
+        defer { close(up); relay.shutdown() }
+        // Handshake ACK, window still shut: nothing may drain.
+        _ = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: serverIsn + 1, wnd: 0), 54)
+        _ = relay.pump()
+        XCTAssertEqual(frameCount, 0)
+
+        // Non-blocking upstream writes run until the reader parks and
+        // the kernel's send buffer fills — the observable end of the
+        // backpressure reaching the socket. A transient EAGAIN while
+        // the reader is still running is retried; the cap is proven
+        // when the buffer sits at high-water AND the socket refuses.
+        let fl = fcntl(up, F_GETFL, 0)
+        XCTAssertEqual(fcntl(up, F_SETFL, fl | O_NONBLOCK), 0)
+        let chunk = [UInt8](repeating: 0x41, count: 8192)
+        var total = 0
+        var heldAtCap = false
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            let n = chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) }
+            if n > 0 { total += n; continue }
+            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if logged(matching: "high-water") { heldAtCap = true; break }
+                Thread.sleep(forTimeInterval: 0.005)
+                continue
+            }
+            if n < 0 && errno == EINTR { continue }
+            XCTFail("upstream write failed with errno \(errno)")
+            break
+        }
+        XCTAssertTrue(heldAtCap)
+        XCTAssertGreaterThanOrEqual(total, NetTcpRelay.txHighWater)
+
+        // The cap holds: a beat later nothing more is accepted.
+        Thread.sleep(forTimeInterval: 0.3)
+        for _ in 0..<8 {
+            let n = chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) }
+            XCTAssertLessThanOrEqual(n, 0)
+        }
+
+        // The window opens: each ACK'd window drains a chunk of the
+        // buffer; once pending drops below the low-water mark the
+        // reader un-parks and upstream writes are accepted again. The
+        // guest ACKs exactly send-next each leg (currentSeqAck's seq).
+        var resumed = false
+        for _ in 0..<12 {
+            _ = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: relay.currentSeqAck().seq, wnd: 0xFFFF), 54)
+            _ = relay.pump()
+            if waitFor(2, { chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) } > 0 }) {
+                resumed = true
+                break
+            }
+        }
+        XCTAssertTrue(resumed)
+        XCTAssertGreaterThan(frameCount, 0)
+    }
 }

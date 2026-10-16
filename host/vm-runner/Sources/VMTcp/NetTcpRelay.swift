@@ -64,6 +64,13 @@ public final class NetTcpRelay {
     /// the guest dropped a segment it can never signal for — the relay
     /// has no retransmission, so the stream is dead: RST, not a stall.
     public static let stallLimit = 8
+    /// The bound on `tx`, the upstream->guest staging buffer (#2368).
+    /// Above it the reader parks, so TCP's own window — not host RAM —
+    /// carries the backpressure to the upstream server. Large enough
+    /// that release-sized pulls (go-flint) never see the cap.
+    public static let txHighWater = 262144
+    /// The drain level that un-parks a reader stopped at `txHighWater`.
+    private static let txLowWater = txHighWater / 4
 
     public var hostMAC: [UInt8] = [0x02, 0x00, 0x00, 0x00, 0x02]
     public var hostPort: UInt16 = 0
@@ -185,9 +192,34 @@ public final class NetTcpRelay {
         let reader = Thread { [weak self] in
             var buf = [UInt8](repeating: 0, count: 4096)
             while true {
+                guard let self else { close(newFd); return }
+                self.lock.lock()
+                var alive = myGen == self.gen && !self.dead && self.fd == newFd
+                let full = self.tx.count - self.txOffset >= Self.txHighWater
+                self.lock.unlock()
+                if !alive { close(newFd); return }
+                if full {
+                    // #2368: a full tx buffer parks the reader — TCP's own
+                    // window then pushes the backpressure onto the
+                    // upstream socket instead of host RAM growing
+                    // without bound. It stays parked until the pending
+                    // bytes drop below the low-water mark, so a drain
+                    // just past the cap does not wake a read that
+                    // immediately refills it. #2369: a dead or retired
+                    // relay stops reading at once.
+                    self.onLog("NET-TCP-RELAY: tx at high-water (\(Self.txHighWater) bytes); upstream reads paused")
+                    while true {
+                        Thread.sleep(forTimeInterval: 0.005)
+                        self.lock.lock()
+                        alive = myGen == self.gen && !self.dead && self.fd == newFd
+                        let drained = self.tx.count - self.txOffset < Self.txLowWater
+                        self.lock.unlock()
+                        if !alive { close(newFd); return }
+                        if drained { break }
+                    }
+                }
                 let n = read(newFd, &buf, buf.count)
                 if n < 0 && errno == EINTR { continue }
-                guard let self else { close(newFd); return }
                 if n <= 0 {
                     self.lock.lock()
                     if myGen == self.gen {
@@ -203,7 +235,7 @@ public final class NetTcpRelay {
                     return
                 }
                 self.lock.lock()
-                let current = myGen == self.gen
+                let current = myGen == self.gen && !self.dead
                 if current { self.tx.append(contentsOf: buf[0..<n]) }
                 self.lock.unlock()
                 if !current {
@@ -345,14 +377,17 @@ public final class NetTcpRelay {
             emitLocked(flags: 0x10, payload: Array(tx[txOffset..<txOffset + count]), seq: srvNxt, ack: rcvNxt)
             srvNxt = srvNxt &+ UInt32(count)
             txOffset += count
-            if txOffset >= tx.count {
-                tx.removeAll(keepingCapacity: true)
-                txOffset = 0
-            }
             sent = true
             onLog("NET-TCP-RELAY: sent \(count) bytes to the guest (seq 0x\(hex32(srvNxt &- UInt32(count))))")
         }
-        if !finSent, !noFin, upstreamClosed, txOffset >= tx.count {
+        // Compact the drained head so `tx.count` tracks bytes still owed
+        // to the guest — a partial drain must also relax the reader's
+        // high-water pressure toward the low-water mark (#2368).
+        if txOffset > 0 {
+            tx.removeFirst(txOffset)
+            txOffset = 0
+        }
+        if !finSent, !noFin, upstreamClosed, tx.count == 0 {
             emitLocked(flags: 0x11, payload: [], seq: srvNxt, ack: rcvNxt)
             srvNxt = srvNxt &+ 1
             finSent = true
@@ -415,7 +450,14 @@ public final class NetTcpRelay {
         guard !rstSent, template.count >= 54 else { return }
         rstSent = true
         dead = true
+        // Every death path tears the upstream down (#2369): hand the fd
+        // back and half-close it so the reader's EOF/exit checks can
+        // finish the job — a live socket held past the RST is a
+        // per-connection fd + thread + tx buffer leak.
+        let old = fd
+        fd = -1
         emitLocked(flags: 0x14, payload: [], seq: srvNxt, ack: rcvNxt)
+        if old >= 0 { Darwin.shutdown(old, SHUT_RDWR) }
     }
 
     /// The MSS option (kind 2, length 4) in a segment's option area —
