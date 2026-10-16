@@ -282,7 +282,7 @@ func TestPreflightOfflineExitsThree(t *testing.T) {
 				buf[i] = 0
 			}
 			return int64(len(buf)), true // own_ip 0.0.0.0, arp_count 0
-		case vi.SlotTCPConnect, vi.SlotTCPSend, vi.SlotTCPRecv, vi.SlotTCPClose, vi.SlotSockReady:
+		case vi.SlotTCPConnect, vi.SlotTCPSend, vi.SlotTCPRecv, vi.SlotTCPClose, vi.SlotSockReady, vi.SlotSocket:
 			tcpTouched = true
 			return -vi.ErrENOSYS, true
 		}
@@ -316,7 +316,7 @@ func TestPreflightNoRouteExitsFour(t *testing.T) {
 			}
 			copy(buf[6:10], []byte{10, 0, 0, 1}) // own_ip, arp_count stays 0
 			return int64(len(buf)), true
-		case vi.SlotTCPConnect, vi.SlotTCPSend, vi.SlotTCPRecv, vi.SlotTCPClose, vi.SlotSockReady:
+		case vi.SlotTCPConnect, vi.SlotTCPSend, vi.SlotTCPRecv, vi.SlotTCPClose, vi.SlotSockReady, vi.SlotSocket:
 			tcpTouched = true
 			return -vi.ErrENOSYS, true
 		}
@@ -348,26 +348,32 @@ func TestOnlineFetchExitsFortyTwo(t *testing.T) {
 				t.Fatalf("net-stats buffer = %d bytes, want %d", len(buf), vi.NetStatsBytes)
 			}
 			return netStatsReady(buf), true
-		case vi.SlotTCPConnect:
-			if a0 != 0x0a000002 || a1 != 80 {
-				t.Errorf("connect = %#x:%d want 0a000002:80", a0, a1)
+		case vi.SlotSocket:
+			// vi.Dial rides the slot-80 handle ABI: a0 is the op, so a
+			// connect arrives as (SockOpConnect, ip, port|ms<<16, _); the
+			// per-handle I/O ops then carry (op, handle, ptr, len).
+			switch a0 {
+			case vi.SockOpConnect:
+				if a1 != 0x0a000002 || a2 != 80 {
+					t.Errorf("connect = %#x:%#x want 0a000002:80", a1, a2)
+				}
+				return 0x11, true // a table handle
+			case vi.SockOpSend:
+				sent = append(sent, hookBytesAt(a2, a3)...)
+				return int64(a3), true
+			case vi.SockOpReady:
+				return 1, true // readyRead
+			case vi.SockOpRead:
+				if recvCount == 0 {
+					recvCount++
+					dst := hookBytesAt(a2, a3)
+					return int64(copy(dst, response)), true
+				}
+				return 0, true // readable + 0 bytes == FIN
+			case vi.SockOpShutdown, vi.SockOpClose:
+				return 0, true
 			}
-			return 0, true
-		case vi.SlotTCPSend:
-			sent = append(sent, hookBytesAt(a0, a1)...)
-			return int64(a1), true
-		case vi.SlotSockReady:
-			return 1, true // readable
-		case vi.SlotTCPRecv:
-			// svc2 routes (ptr, len) as (a0, a1) to the hook.
-			if recvCount == 0 {
-				recvCount++
-				dst := hookBytesAt(a0, a1)
-				return int64(copy(dst, response)), true
-			}
-			return 0, true // readable + 0 bytes == FIN
-		case vi.SlotTCPClose:
-			return 0, true
+			return -vi.ErrENOSYS, true
 		}
 		return 0, false
 	})
@@ -401,21 +407,27 @@ func TestOnlineDownloadPublishesBodyAndExitsZero(t *testing.T) {
 	var ops []string
 	captureExit(t, probe, func(num uintptr, a0, a1, a2, a3 uintptr) (int64, bool) {
 		switch num {
-		case vi.SlotTCPConnect:
-			return 0, true
-		case vi.SlotTCPSend:
-			sent = append(sent, hookBytesAt(a0, a1)...)
-			return int64(a1), true
-		case vi.SlotSockReady:
-			return 1, true
-		case vi.SlotTCPRecv:
-			if recvCount == 0 {
-				recvCount++
-				return int64(copy(hookBytesAt(a0, a1), response)), true
+		case vi.SlotSocket:
+			// Slot-80 handle ABI: a0 is the op; connect carries the ip in
+			// a1 and port|ms<<16 in a2, I/O ops carry (op, handle, ptr, len).
+			switch a0 {
+			case vi.SockOpConnect:
+				return 0x11, true // a table handle
+			case vi.SockOpSend:
+				sent = append(sent, hookBytesAt(a2, a3)...)
+				return int64(a3), true
+			case vi.SockOpReady:
+				return 1, true // readyRead
+			case vi.SockOpRead:
+				if recvCount == 0 {
+					recvCount++
+					return int64(copy(hookBytesAt(a2, a3), response)), true
+				}
+				return 0, true
+			case vi.SockOpShutdown, vi.SockOpClose:
+				return 0, true
 			}
-			return 0, true
-		case vi.SlotTCPClose:
-			return 0, true
+			return -vi.ErrENOSYS, true
 		case vi.SlotFileOpen:
 			path := cstringAt(a0, a1)
 			files[path] = nil

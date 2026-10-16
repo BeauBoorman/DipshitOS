@@ -46,17 +46,19 @@ const (
 )
 
 // Slot-80 socket ops (kernel/src/syscall.zig handle_socket dispatch).
+// Exported so host-side test fakes in other packages (fetch, browser)
+// key on the same numbers instead of mirroring them.
 const (
-	sockOpListen   = 0
-	sockOpAccept   = 1
-	sockOpRead     = 2
-	sockOpSend     = 3
-	sockOpClose    = 4
-	sockOpReady    = 5
-	sockOpShutdown = 6
-	sockOpPeer     = 7
-	sockOpConnect  = 10
-	sockOpTable    = 12
+	SockOpListen   = 0
+	SockOpAccept   = 1
+	SockOpRead     = 2
+	SockOpSend     = 3
+	SockOpClose    = 4
+	SockOpReady    = 5
+	SockOpShutdown = 6
+	SockOpPeer     = 7
+	SockOpConnect  = 10
+	SockOpTable    = 12
 )
 
 // Slot-80's socket_error rows beyond the ADR 0007 generic table's 12:
@@ -191,7 +193,7 @@ func dial(host string, port uint16, timeoutMs uint32) (*Conn, error) {
 	if ip == ([4]byte{}) {
 		return nil, ErrServerDial
 	}
-	rc := sock(sockOpConnect, ipv4Word(ip), uintptr(port)|uintptr(timeoutMs)<<16, 0)
+	rc := sock(SockOpConnect, ipv4Word(ip), uintptr(port)|uintptr(timeoutMs)<<16, 0)
 	if rc < 0 {
 		return nil, sockErr(rc)
 	}
@@ -226,7 +228,7 @@ func SocketListen(port uint16) (*Conn, error) {
 	if port == 0 {
 		return nil, errno(ErrEINVAL)
 	}
-	rc := sock(sockOpListen, 0, uintptr(port), 0)
+	rc := sock(SockOpListen, 0, uintptr(port), 0)
 	if rc < 0 {
 		return nil, sockErr(rc)
 	}
@@ -306,7 +308,7 @@ func (c *Conn) AcceptConn() (*Conn, error) {
 		// bound serving child's — AcceptConn must keep claiming while
 		// another session is already being served.
 		mask, rc := func() (int64, int64) {
-			r := sock(sockOpReady, uintptr(c.handle), 0, 0)
+			r := sock(SockOpReady, uintptr(c.handle), 0, 0)
 			if r < 0 {
 				return 0, r
 			}
@@ -316,7 +318,7 @@ func (c *Conn) AcceptConn() (*Conn, error) {
 			return nil, errno(-rc)
 		}
 		if mask&readyAccept != 0 {
-			h := sock(sockOpAccept, uintptr(c.handle), 0, 0)
+			h := sock(SockOpAccept, uintptr(c.handle), 0, 0)
 			if h < 0 {
 				return nil, sockErr(h)
 			}
@@ -334,7 +336,7 @@ func (c *Conn) AcceptConn() (*Conn, error) {
 // fillPeer snapshots the remote endpoint through op 7 so IP/Port answer
 // without another syscall.
 func (c *Conn) fillPeer() {
-	r := sock(sockOpPeer, uintptr(c.handle), 0, 0)
+	r := sock(SockOpPeer, uintptr(c.handle), 0, 0)
 	if r < 0 {
 		return
 	}
@@ -383,7 +385,7 @@ func (c *Conn) readyProbe() (int64, int64) {
 	if h == 0 {
 		return TCPReady()
 	}
-	if r := sock(sockOpReady, uintptr(h), 0, 0); r < 0 {
+	if r := sock(SockOpReady, uintptr(h), 0, 0); r < 0 {
 		return 0, r
 	} else {
 		return r, 0
@@ -432,7 +434,7 @@ func (c *Conn) Send(p []byte) (int, error) {
 		}
 		var r int64
 		if h := c.trafficHandle(); h != 0 {
-			r = sock(sockOpSend, uintptr(h), bytePtr(p[sent:sent+take]), uintptr(take))
+			r = sock(SockOpSend, uintptr(h), bytePtr(p[sent:sent+take]), uintptr(take))
 		} else {
 			r = svc2(SlotTCPSend, bytePtr(p[sent:sent+take]), uintptr(take))
 		}
@@ -523,7 +525,7 @@ func (c *Conn) Recv(p []byte) (int, error) {
 		if mask&readyRead != 0 {
 			var r int64
 			if h := c.trafficHandle(); h != 0 {
-				r = sock(sockOpRead, uintptr(h), bytePtr(p[:max]), uintptr(max))
+				r = sock(SockOpRead, uintptr(h), bytePtr(p[:max]), uintptr(max))
 			} else {
 				r = svc2(SlotTCPRecv, bytePtr(p[:max]), uintptr(max))
 			}
@@ -589,13 +591,13 @@ func (c *Conn) Close() error {
 func finRelease(h uint64, graceful bool) {
 	if graceful {
 		for polls := 0; polls < 300; polls++ {
-			if r := sock(sockOpShutdown, uintptr(h), 0, 0); r != -ErrEAGAIN {
+			if r := sock(SockOpShutdown, uintptr(h), 0, 0); r != -ErrEAGAIN {
 				break
 			}
 			svc1(SlotSleep, 1)
 		}
 	}
-	_ = sock(sockOpClose, uintptr(h), 0, 0)
+	_ = sock(SockOpClose, uintptr(h), 0, 0)
 }
 
 // SocketRow is one live socket-table row (the op-12 snapshot): a
@@ -622,7 +624,7 @@ const socketRowLen = 24
 // caller-blocking path.
 func SocketTable() []SocketRow {
 	buf := make([]byte, SocketTableMax*socketRowLen)
-	n := sock(sockOpTable, bytePtr(buf), uintptr(SocketTableMax), 0)
+	n := sock(SockOpTable, bytePtr(buf), uintptr(SocketTableMax), 0)
 	if n <= 0 {
 		return nil
 	}

@@ -26,6 +26,9 @@ verify-portable:
     zig build image
     zig build inspect
     swift build --package-path host/vm-runner
+    swift test --package-path host/vm-runner
+    go -C user/go test ./...
+    go -C tools/go/vlfs test ./...
     zig build context
     bash tools/status/verify-issue-coordination.sh
     bash tools/status/test-coordination.sh
