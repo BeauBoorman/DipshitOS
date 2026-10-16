@@ -81,6 +81,14 @@
 //          (test hook: feed <path> through the real drop handler once
 //          <marker> appears — repeatable for multi-file gestures.
 //          Default trigger: `gotabwm: hostint armed`.)
+//         [--host-notify] (M108d #2328, ADR 0051 D5: seat toasts cross the
+//          glass — each kind-12 toast becomes a signed NOTIFY_OUT record
+//          the runner posts as a UNUserNotificationCenter banner. Banners
+//          exist only under the `just session` bundle; the bare runner
+//          consumes records and logs `host-notify: dropped
+//          reason=no_bundle` per record instead. Requires --cvc-file and
+//          the `host-int` SECRETS.TXT row; OFF by default — no records
+//          polled, no center touched.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -612,6 +620,11 @@ var hostDropFiles: [String] = []
 var hostDropAfter: String?
 var hostDropFired = false
 var hostDrop: HostDrop?
+// M108d (#2328, ADR 0051 D5): `--host-notify` arms the notify-out lane —
+// seat toasts arrive as signed NOTIFY_OUT records and post as macOS
+// banners under the session bundle (bare runner: `no_bundle` drops).
+var hostNotifyFlag = false
+var hostNotify: HostNotify?
 // The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
 // ARMED record naming every live lane — the seat adopts (epoch, mask), so
 // per-lane epochs would refuse each other stale_epoch forever.
@@ -1309,6 +1322,13 @@ while idx < arguments.count {
     } else if arg == "--host-drop-after", idx + 1 < arguments.count {
         hostDropAfter = arguments[idx + 1]
         idx += 2
+    } else if arg == "--host-notify" {
+        // M108d (#2328, ADR 0051 D5): the notify-out lane — seat toasts
+        // become signed NOTIFY_OUT records the runner maps to banners
+        // (bundled) or no_bundle drops (bare). Modifier on --cvc-file;
+        // never touches the queue shape.
+        hostNotifyFlag = true
+        idx += 1
     } else if arg == "--cvc-console-file", idx + 1 < arguments.count {
         // Claim 0680: structured console — capture every queue-1 guest log
         // line to this file and arm the guest's console tee (kind-3) when
@@ -2253,6 +2273,13 @@ if hostDropFlag || !hostDropFiles.isEmpty || hostDropAfter != nil {
         hostDropAfter = "gotabwm: hostint armed"
     }
 }
+// M108d (#2328, ADR 0051 D6): notify-out is the same modifier shape — no
+// display prerequisite (banners do not need the VM window).
+if hostNotifyFlag {
+    guard cvcFileEnabled else {
+        fail("--host-notify requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
+    }
+}
 // Claim 9367: --pointer-virtio rides the four-queue device; the after-marker
 // only makes sense with a sequence to schedule.
 if pointerVirtioScript == nil, pointerVirtioAfter != nil {
@@ -3036,7 +3063,7 @@ if netNatEnabled {
 // The drop lane's display precondition (D4): the drop target is the
 // display view, so a headless runner refuses lane_disabled at arm and the
 // drop bit never enters the mask.
-if hostClipboardFlag || hostDropFlag {
+if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
     let shareURL = URL(fileURLWithPath: cvcFileShareDir!, isDirectory: true)
     var mask: UInt8 = 0
     var requested: [String] = []
@@ -3054,6 +3081,10 @@ if hostClipboardFlag || hostDropFlag {
             HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
         }
     }
+    if hostNotifyFlag {
+        mask |= HostInt.laneNotify
+        requested.append("notify")
+    }
     if mask != 0 {
         hostIntSession = HostIntSession.arm(shareDir: shareURL, mask: mask, requested: requested)
     }
@@ -3061,11 +3092,19 @@ if hostClipboardFlag || hostDropFlag {
         if hostClipboardFlag {
             hostClipboard = HostClipboard(session: session, pasteboardName: hostPasteboardName)
             hostClipboard?.start()
-            DispatchQueue.main.async { hostIntTick() }
         }
         if dropWanted {
             hostDrop = HostDrop(session: session)
             hostDrop?.start()
+        }
+        if hostNotifyFlag {
+            hostNotify = HostNotify(session: session)
+            hostNotify?.start()
+        }
+        // One shared 250 ms drain for every consuming lane — the notify
+        // lane rides the same poll as the clipboard drain (ADR 0051 D5).
+        if hostClipboard != nil || hostNotify != nil {
+            DispatchQueue.main.async { hostIntTick() }
         }
     }
 }
@@ -3785,12 +3824,14 @@ func captureScreenshotIfMarker(_ text: String) {
     }
 }
 
-// M108b (#2325, ADR 0051): the clipboard lane's 250 ms poll — drains
-// CLIP_OUT records to the pasteboard and carries changeCount bumps out as
-// CLIP_IN records. Runs on the main queue like every other runner poll,
-// for the life of the process.
+// M108b (#2325, ADR 0051): the lane session's 250 ms poll — drains
+// CLIP_OUT records to the pasteboard, NOTIFY_OUT records to banners
+// (M108d), and carries changeCount bumps out as CLIP_IN records. Runs on
+// the main queue like every other runner poll, for the life of the
+// process.
 func hostIntTick() {
     hostClipboard?.tick()
+    hostNotify?.tick()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { hostIntTick() }
 }
 

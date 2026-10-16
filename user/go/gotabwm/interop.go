@@ -179,6 +179,12 @@ func dropAllRpcBindings() {
 	surfaceXY = [256]uint32{}
 }
 
+// serviceRPCBuf is the mailbox drain's receive buffer. Package-level, not a
+// stack local: the host-test syscall seam hands &buf[0] to the fake kernel as
+// a uintptr, and a goroutine stack move mid-hook would leave the write in a
+// stale segment — the buffer must not live on a movable stack.
+var serviceRPCBuf [vi.WmRpcMax]byte
+
 // gateRPC is the sender-authentication check ahead of applyRPC. It returns
 // the Pad and auth union the ack must carry plus whether the request may
 // apply. A frame that fails authentication never reaches the WM state, and
@@ -319,7 +325,7 @@ var (
 // holds the scanout cadence. Bounded per call so a flood cannot starve the tick
 // loop. Returns how many requests were served.
 func serviceRPC() int {
-	var buf [vi.WmRpcMax]byte
+	buf := serviceRPCBuf[:]
 	served := 0
 	for i := 0; i < 8; i++ {
 		n, r := vi.IpcRecv(buf[:])

@@ -54,7 +54,9 @@ func newHostintFixture(t *testing.T, key string) *hostintFixture {
 		return copy(out, f.key)
 	}
 	hostintListDir = func() ([]vi.DirItem, bool) {
-		var items []vi.DirItem
+		// Non-nil even when empty: a drained lane dir is a real listing,
+		// not an io_error — same shape as the production DirList seam.
+		items := make([]vi.DirItem, 0, len(f.files))
 		for name := range f.files {
 			items = append(items, vi.DirItem{Name: name})
 		}
