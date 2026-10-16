@@ -546,14 +546,14 @@ const DirScan = struct {
     /// First tombstone slot (reusable), or null.
     free: ?u32 = null,
     live: u32 = 0,
-    /// Total slots = dir.size / 272.
+    /// Total slots = vlfs.dirSlotCount(dir.size).
     slots: u32,
 };
 
 /// Scan a directory's slots, txn-aware: the name match, first tombstone,
 /// and live count in one pass. `name` may be empty (count-only scan).
 fn dirScan(t: ?*Txn, src: vlfs.SectorSource, vol: *const vlfs.Volume, dir: vlfs.Inode, name: []const u8, walk: *Block) Error!DirScan {
-    var scan = DirScan{ .slots = @intCast(dir.size / vlfs.dirent_len) };
+    var scan = DirScan{ .slots = vlfs.dirSlotCount(dir.size) };
     var cur_blk: u32 = std.math.maxInt(u32);
     var abs: u32 = 0;
     while (abs < scan.slots) : (abs += 1) {
@@ -579,7 +579,7 @@ fn dirScan(t: ?*Txn, src: vlfs.SectorSource, vol: *const vlfs.Volume, dir: vlfs.
         const row_kind = row[vlfs.de_kind];
         if (row_kind != vlfs.kind_file and row_kind != vlfs.kind_dir) return error.BadDirent;
         if (row[vlfs.de_flags] != 0 or rd64(row, vlfs.de_reserved) != 0) return error.BadDirent;
-        const row_name = row[vlfs.de_name ..][0..nl];
+        const row_name = row[vlfs.de_name..][0..nl];
         if (std.mem.indexOfScalar(u8, row_name, 0) != null or
             std.mem.indexOfScalar(u8, row_name, '/') != null) return error.BadDirent;
         scan.live += 1;
@@ -605,7 +605,7 @@ fn dirWriteRow(t: *Txn, src: vlfs.SectorSource, vol: *const vlfs.Volume, dir: vl
     wr32(row, vlfs.de_inode, ino);
     wr16(row, vlfs.de_name_len, @intCast(name.len));
     row[vlfs.de_kind] = kind;
-    @memcpy(row[vlfs.de_name ..][0..name.len], name);
+    @memcpy(row[vlfs.de_name..][0..name.len], name);
     try t.append(blk, t.compose);
 }
 
@@ -642,7 +642,9 @@ fn dirInsert(t: *Txn, src: vlfs.SectorSource, vol: *vlfs.Volume, dir: *vlfs.Inod
     } else {
         abs = scan.slots;
         // A fresh slot at a 15-row boundary needs a new dirent block.
-        while (abs * vlfs.dirent_len >= dir.size) try dirGrow(t, src, vol, dir);
+        // (Slot s lives in block s/15 — the byte test abs*272 >= size
+        // forgets the per-block pad and stops one growth short.)
+        while (abs >= vlfs.dirSlotCount(dir.size)) try dirGrow(t, src, vol, dir);
     }
     try dirWriteRow(t, src, vol, dir.*, abs, ino, kind, name);
     dir.mtime = now;
@@ -1008,7 +1010,7 @@ fn buildImage(regions: []const u8, img: []u8) !void {
         }
         const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadFixture;
         const off = try std.fmt.parseInt(usize, line[0..sp], 10);
-        _ = try std.fmt.hexToBytes(img[off..][0 .. hexs_len(line, sp)], line[sp + 1 ..]);
+        _ = try std.fmt.hexToBytes(img[off..][0..hexs_len(line, sp)], line[sp + 1 ..]);
         lines += 1;
     }
 }
@@ -1089,12 +1091,13 @@ test "vlfs write: create + write + truncate + rename + delete round-trips throug
     try std.testing.expectEqual(@as(usize, 6000), try vlfs.read(src, vol, ino, 0, &out, &t_walk));
     try std.testing.expectEqualSlices(u8, &payload, &out);
 
-    // Extending write past EOF leaves a zeroed gap.
+    // Extending write past EOF leaves a zeroed gap; the 4 tail bytes land
+    // at file offsets 9000..9003, i.e. just past the gap window's end.
     _ = try writeFile(src, &vol, ino, 9000, "tail", test_now, &t_walk, &t_compose);
-    var gap: [3000]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 3000), try vlfs.read(src, vol, ino, 6000, &gap, &t_walk));
-    try std.testing.expect(std.mem.allEqual(u8, gap[0..2996], 0));
-    try std.testing.expectEqualSlices(u8, "tail", gap[2996..3000]);
+    var gap: [3004]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3004), try vlfs.read(src, vol, ino, 6000, &gap, &t_walk));
+    try std.testing.expect(std.mem.allEqual(u8, gap[0..3000], 0));
+    try std.testing.expectEqualSlices(u8, "tail", gap[3000..3004]);
 
     // Truncate shrink keeps the prefix; grow zero-fills.
     try truncateFile(src, &vol, ino, 3, test_now, &t_walk, &t_compose);
@@ -1139,10 +1142,11 @@ test "vlfs write: named refusals — exists, not_empty, name_too_long, no_inodes
     var long_name: [256]u8 = @splat('x');
     try std.testing.expectError(error.NameTooLong, create(src, &vol, vlfs.root_inode, &long_name, vlfs.kind_file, test_now, &t_walk, &t_compose));
 
-    // Exhaust the inode table: 16 MiB has 256 inodes, one is root.
+    // Exhaust the inode table: 16 MiB has 256 inodes — 0 is reserved, 1 is
+    // root, A.TXT took one, so 253 more creates fill it exactly.
     var i: u32 = 0;
     var name_buf: [16]u8 = undefined;
-    while (i < 254) : (i += 1) {
+    while (i < 253) : (i += 1) {
         const name = std.fmt.bufPrint(&name_buf, "f{x}", .{i}) catch unreachable;
         _ = try create(src, &vol, vlfs.root_inode, name, vlfs.kind_file, test_now, &t_walk, &t_compose);
     }
@@ -1337,9 +1341,13 @@ test "vlfs write: every legal crash state replays to pre- or post-txn, never a t
         }
         try std.testing.expect(window <= 63);
         const full: u64 = (@as(u64, 1) << @intCast(window)) - 1;
-        // masks: 0, full, each singleton, each leave-one-out — the legal
-        // "any subset of the post-flush window" family, bounded.
-        var masks: [130]u64 = undefined;
+        // The legal family is every subset of the post-flush window; 2^w is
+        // unreachable, so the bounded sample covers its structurally
+        // distinct edges: empty and full, every singleton (each write alone
+        // is insufficient to forge a commit), every leave-one-out (each
+        // write's loss), and every in-order prefix and suffix (the shapes
+        // real devices actually retire writes in).
+        var masks: [256]u64 = undefined;
         var nm: usize = 0;
         masks[nm] = 0;
         nm += 1;
@@ -1349,6 +1357,14 @@ test "vlfs write: every legal crash state replays to pre- or post-txn, never a t
             masks[nm] = @as(u64, 1) << @intCast(b);
             nm += 1;
             masks[nm] = full & ~(@as(u64, 1) << @intCast(b));
+            nm += 1;
+        }
+        var keep: usize = 1;
+        while (keep < window) : (keep += 1) {
+            const prefix = (@as(u64, 1) << @intCast(keep)) - 1;
+            masks[nm] = prefix;
+            nm += 1;
+            masks[nm] = full & ~prefix;
             nm += 1;
         }
         for (masks[0..nm]) |mask| {

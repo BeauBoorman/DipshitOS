@@ -1402,8 +1402,7 @@ fn disk_errno(err: vlfs.Error) i64 {
         error.Exists => -9,
         // The space/refusal family: full device, full inode table, full
         // directory, and the bounded-shape refusals (txn/file/extent).
-        error.NoSpace, error.NoInodes, error.DirFull, error.TxnTooLarge,
-        error.FileTooLarge, error.ExtentOverflow => -5,
+        error.NoSpace, error.NoInodes, error.DirFull, error.TxnTooLarge, error.FileTooLarge, error.ExtentOverflow => -5,
         else => -1,
     };
 }

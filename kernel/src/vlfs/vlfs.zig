@@ -771,6 +771,17 @@ pub const Dirent = struct {
     }
 };
 
+/// Live-slot capacity of a directory payload of `size` bytes. Dirents pack
+/// 15 per 4 KiB block and the trailing 16 B of each block are pad, so a
+/// block-aligned size of k blocks holds exactly 15k slots — `size / 272`
+/// overcounts from k = 18 up (271 "slots" in 18 blocks, the last of which
+/// maps past the final extent). The ceil term keeps a partial tail block's
+/// complete rows addressable on a non-aligned foreign image.
+pub fn dirSlotCount(size: u32) u32 {
+    const blocks = (size + block_len - 1) / block_len;
+    return @min(size / @as(u32, dirent_len), blocks * dirents_per_block);
+}
+
 /// Sequential reader over a directory's live dirents. The state is a single
 /// absolute slot index — `next()` maps it to (block, slot) and re-reads the
 /// block through `scratch` every call, so callers may reuse the same scratch
@@ -780,7 +791,7 @@ pub const DirIter = struct {
     vol: Volume,
     dir: Inode,
     scratch: *[block_len]u8,
-    /// Absolute dirent index into the payload: floor(size / 272) slots.
+    /// Absolute dirent index into the payload: dirSlotCount(size) slots.
     abs_slot: u32 = 0,
     slots_total: u32,
 
@@ -790,7 +801,7 @@ pub const DirIter = struct {
             .vol = vol,
             .dir = dir,
             .scratch = scratch,
-            .slots_total = dir.size / @as(u32, dirent_len),
+            .slots_total = dirSlotCount(dir.size),
         };
     }
 
