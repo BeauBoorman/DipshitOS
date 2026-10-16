@@ -354,6 +354,38 @@ func TestCheckGoldenClean(t *testing.T) {
 	}
 }
 
+// TestCheckMultiBlockBbitmap: a volume over 128 MiB has a multi-block
+// bbitmap. The scan must read every map block — it once read only the
+// first and panicked index-out-of-range past bit 32767.
+func TestCheckMultiBlockBbitmap(t *testing.T) {
+	const size = 256 << 20 // 256 MiB -> 2 bbitmap blocks
+	img := make([]byte, size)
+	if err := formatImage(img, goldenID, goldenTime); err != nil {
+		t.Fatal(err)
+	}
+	g, err := geometryFor(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.BbitmapBlocks != 2 {
+		t.Fatalf("256 MiB bbitmap %d blocks, want 2", g.BbitmapBlocks)
+	}
+	for _, f := range checkImage(img) {
+		if !f.info {
+			t.Fatalf("256 MiB image fails check: %v", f)
+		}
+	}
+	// The 1 GiB ceiling spans all 8 map blocks; assert the geometry
+	// arithmetically rather than formatting a gigabyte.
+	g, err = geometryFor(MaxVolumeBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.BbitmapBlocks != 8 {
+		t.Fatalf("1 GiB bbitmap %d blocks, want 8", g.BbitmapBlocks)
+	}
+}
+
 // TestGeometry pins the ADR D3 region arithmetic for the floor volume.
 func TestGeometry(t *testing.T) {
 	g, err := geometryFor(MinVolumeBytes)
