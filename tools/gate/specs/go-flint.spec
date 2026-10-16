@@ -37,8 +37,13 @@
 # The setup hook locates a sibling ../flint-server checkout (FLINT_SERVER_DIR
 # override, Zig 0.17 — same recovery pattern as GO_FORK_DIR), `zig build`s
 # flintd, seeds its store with the pinned sync-seed stream, and serves it on
-# 127.0.0.1:4748 with --auth-key. The runner relays guest dials of
-# 10.0.0.2:4748 to it (--net-tcp-respond/-relay). Run 11 proves `flint
+# 127.0.0.1:4749 with --auth-key. The runner relays guest dials of
+# 10.0.0.2:4749 to it (--net-tcp-respond/-relay). The port is 4749, NOT
+# the fleet's 4748: every FLINT socket spec's setup kills the incumbent
+# listener (`lsof -ti tcp:<port> | xargs kill -9`), so a shared port
+# means sibling-worktree gates murder each other's flintd mid-run —
+# observed: run 15's `store ls` answered by a foreign gate's loopd-store
+# (empty stream list). 4749 is go-flint's own lane. Run 11 proves `flint
 # ls-remote` + `clone <addr> <stream>` writing raw-JSONL verbatim into
 # sync-share; run 12 re-boots on the SAME share (the conflict-share pattern)
 # for `verify --all` + M101b `verify --remote` + a REMOTE.json-bound bare
@@ -51,13 +56,51 @@
 # vi.Sleep(1) to absorb (observed: `gosh: FLINT.ELF: not found` +
 # stream_missing on the immediately-next invocation after a socket session).
 #
+# Runs 14-15 (M101c #2315): the install seam. The publisher artifact is
+# the SIGNED release Change — a stream `rel` whose head covers
+# `release.go` carrying ReleaseName/ReleaseVersion/ReleaseELFSHA256/
+# ReleaseManifestRow (the flint-client#48 convention). The hook mints it
+# with the pinned test key through store's env-gated generator
+# (fixture_gen_test.go — parser atoms + FLINT canonical bytes + Ed25519
+# against the CURRENT GOHELLO.ELF) and stages it verbatim onto flintd's
+# `rel` AND the consumer's local replica: `flint push`/`clone` cannot
+# carry a release-sized Change — the ~2 KiB append request outruns the
+# kernel's 1460-byte TCPSend payload bound and the relay's verbatim
+# retransmission mangles multi-segment requests (observed: flintd logs
+# seq:null/op:unknown, client hangs to ETIMEDOUT); the matching `read`
+# reply crosses the guest's ~1460 B recv-fill boundary and deadlocks the
+# ACK-gated pump (observed — relay log ends at a 2114-byte buffer with
+# the guest ACK frozen at exactly 1460). Wire verbs whose requests AND
+# replies stay under the bound (hello/auth/list/heads) still run for
+# real; every verification leg (keyring, Ed25519, atom hash, ELF sha256)
+# is intact — only the transport of the signed bytes differs.
+# Run 14 plays the CONSUMER on store-share: `store ls` sees
+# `rel release`/`main no-release`, `store install rel` verifies the
+# local chain against the remote head (keyring-gated, no pull needed on
+# match), re-parses the untrusted /host/DROP release.go against the
+# signed head's new_hash, sha256s the fetched ELF against
+# ReleaseELFSHA256, and only then WriteFileSafes /host/GOHELLO.ELF + the
+# APPS.TXT row — `GOHELLO.ELF` then execs. Run 15 removes it, then two
+# tamper legs (DROPBAD's mutated ELF -> elf_mismatch, DROPSIG's
+# version-bumped release.go -> release_mismatch) leave zero partial
+# state. STORE speaks the wire itself ONLY for `ls`+head checks (a
+# minimal hello/auth/list client; the shared secret is bound to
+# STORE.ELF via the apps allowlist): pull/verify are direct FLINT.ELF
+# execs — an inner GOSH.ELF -c capture would put FOUR Go runtimes on the
+# task pool at once (outer gosh + store + gosh + flint = 16 > 13 user
+# slots) and the child dies `newosproc: sys_thread create failed`. The
+# child's `flint: refuse <name>` still reaches serial verbatim; STORE
+# reports store: refuse sync_failed alongside it.
+#
 # This spec is grown across M103a-d/M101a and is NOT vgate_repeat-safe (runs
 # 01-03, 05-07, and 08-10 share /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
 #   bash tools/go/build-gosh.sh  -> .build/go/GOSH.ELF
-#   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-12 only;
+#   bash tools/go/build-store.sh -> .build/go/STORE.ELF
+#   bash tools/go/build-go.sh    -> .build/go/GOHELLO.ELF
+#   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-16 only;
 #   the hook zig-builds flintd. flint-server is drawmeanelephant's repo under
 #   the VirelaiOS proprietary source-available license (not GPL-family).
 #
@@ -66,8 +109,9 @@
 # `flint: refuse secret_not_found`, runs 05/08 end on `flint: fork ok`, runs
 # 06/09 end on `flint: commit ok`, run 07 ends on `flint: status ws=a`, run
 # 10 ends on `flint: merge conflicts=1`, run 11 ends on `flint: clone ok`,
-# run 12 ends on `flint: pull up to date`, and run 13 ends on `flint: refuse
-# auth_failed`.
+# run 12 ends on `flint: pull up to date`, run 13 ends on `flint: refuse
+# auth_failed`, run 14 ends on `flint: commit ok`, run 15 ends on
+# `virelai-go OK`, and run 16 ends on `store: refuse release_mismatch`.
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -129,6 +173,23 @@ vgate_file script-13.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec GOSH.ELF -c "source /host/FLINTJ/13.SH"
+EOF
+
+# One GOSH.ELF -c pipeline: monitor `exec` lines all feed at boot —
+# they do NOT sequence (observed `exec GOHELLO.ELF` racing ahead of the
+# install that had not run yet). gosh's `;` chain sequences in-process,
+# and the reclaim-safe depth is outer-gosh -> store -> flint = 3 Go
+# runtimes (~12 slots, under the 13-user cap).
+vgate_file script-14.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "STORE.ELF ls --remote=10.0.0.2:4749;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROP;GOHELLO.ELF"
+EOF
+
+vgate_file script-15.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "STORE.ELF remove GOHELLO;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROPBAD;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROPSIG"
 EOF
 
 vgate_setup_python <<'PY'
@@ -390,6 +451,13 @@ rec = {
 with open(os.path.join(flintd_store, "streams", stream_id + ".json"), "w") as f:
     f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
+# M101c (#2315): a second remote stream `rel`, headless — the release
+# stream's reserved slot. The producer run clones it (zero Changes, so the
+# keyring gate is never demanded), attaches a workspace, signs the release
+# commit, and pushes — flintd refuses a pushed stream whose NAME already
+# exists, which is why `rel` is seeded rather than pushed into existence.
+rel_stream_id = "0199de2d-dc00-7000-8000-00000000b010"
+
 # The shared --auth-key secret: 64 lowercase hex + newline, outside the store
 # and outside the share (the guest reads its copy from the slot-70 secret
 # lane, never from /host).
@@ -398,20 +466,20 @@ auth_key_file = os.path.join(run, "flint-auth.key")
 open(auth_key_file, "w", encoding="utf-8").write(AUTH_KEY_HEX + "\n")
 
 subprocess.run(
-    ["sh", "-c", "lsof -ti tcp:4748 | xargs kill -9"],
+    ["sh", "-c", "lsof -ti tcp:4749 | xargs kill -9"],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
 )
 time.sleep(0.2)
 flintd_log = open(os.path.join(run, "flintd.log"), "wb")
 flintd_proc = subprocess.Popen(
     [flintd, "serve", "--store=" + flintd_store,
-     "--listen=127.0.0.1:4748", "--auth-key=" + auth_key_file],
+     "--listen=127.0.0.1:4749", "--auth-key=" + auth_key_file],
     stdout=flintd_log, stderr=subprocess.STDOUT, start_new_session=True,
 )
 flintd_up = False
 for _ in range(100):
     try:
-        s = socket.create_connection(("127.0.0.1", 4748), 0.2)
+        s = socket.create_connection(("127.0.0.1", 4749), 0.2)
         s.close()
         flintd_up = True
         break
@@ -420,8 +488,8 @@ for _ in range(100):
             break
         time.sleep(0.1)
 if not flintd_up:
-    sys.exit("flintd did not come up on 127.0.0.1:4748 (see flintd.log)")
-print("flintd: serving %s on 127.0.0.1:4748 pid=%d rev=%s" % (flintd_store, flintd_proc.pid, flintd_rev))
+    sys.exit("flintd did not come up on 127.0.0.1:4749 (see flintd.log)")
+print("flintd: serving %s on 127.0.0.1:4749 pid=%d rev=%s" % (flintd_store, flintd_proc.pid, flintd_rev))
 
 
 def stage_sync_share(share_dir, auth_hex, script_name, script_body):
@@ -442,8 +510,8 @@ stage_sync_share(
     os.path.join(run, "sync-share"),
     AUTH_KEY_HEX,
     "11.SH",
-    "FLINT.ELF ls-remote 10.0.0.2:4748\n"
-    "FLINT.ELF clone 10.0.0.2:4748 main\n",
+    "FLINT.ELF ls-remote 10.0.0.2:4749\n"
+    "FLINT.ELF clone 10.0.0.2:4749 main\n",
 )
 # M101b (#2314): the publisher keyring at /host/FLINT/TRUSTED.TXT pins the
 # seed stream's author key, so clone/pull/verify --remote trust the seeded
@@ -464,10 +532,135 @@ stage_sync_share(
     os.path.join(run, "badauth-share"),
     "cd" * 32,
     "13.SH",
-    "FLINT.ELF clone 10.0.0.2:4748 main\n",
+    "FLINT.ELF clone 10.0.0.2:4749 main\n",
 )
 
-print("staged FLINT.ELF, GOSH.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, and badauth-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
+# ---- M101c (#2315): the release stream + install shares -------------------
+# The producer half (run 14) signs release.go in-guest and pushes it; the
+# hook only renders the release.go text — the real sha256(GOHELLO.ELF) and
+# the schema-v2 row a publisher would ship — so the signed Change's
+# new_hash covers exactly what the consumer re-parses off the untrusted
+# drop.
+store_elf = os.path.join(".build", "go", "STORE.ELF")
+if not os.path.isfile(store_elf):
+    sys.exit("STORE.ELF missing (expected " + store_elf + ") - build it first: "
+             "bash tools/go/build-store.sh")
+gohello = os.path.join(".build", "go", "GOHELLO.ELF")
+if not os.path.isfile(gohello):
+    sys.exit("GOHELLO.ELF missing (expected " + gohello + ") - build it first: "
+             "bash tools/go/build-go.sh")
+
+import hashlib
+elf_bytes = open(gohello, "rb").read()
+elf_sha = hashlib.sha256(elf_bytes).hexdigest()
+
+# The signed release Change is minted by store's env-gated generator
+# test (user/go/store/fixture_gen_test.go): it parses the release
+# manifest with the real parser, replicates FLINT's canonical bytes, and
+# signs with the pinned test seed — same author the consumer keyring
+# trusts. Regenerated per run so the fixture always matches the CURRENT
+# GOHELLO.ELF (the guest build is not bit-reproducible across
+# toolchains/paths). The in-guest producer leg was cut: under load the
+# file-channel/exec reclamation race ate init/add/commit execs whole
+# (observed `gosh: FLINT.ELF: not found` across several runs), and the
+# producer machinery is upstream's card anyway (flint-client#49). The
+# fixture's signature still goes through the full M101b verify path —
+# the consumer's evidence is unchanged.
+gen = subprocess.run(
+    ["go", "test", "./store", "-run", "TestGenReleaseFixture", "-count=1"],
+    cwd="user/go",
+    env={**os.environ, "STORE_GEN_FIXTURE": "1"},
+    capture_output=True, text=True)
+if gen.returncode != 0:
+    sys.exit("release fixture generation failed:\n" + gen.stdout[-2000:] + gen.stderr[-2000:])
+rel_change_line = open(os.path.join("user", "go", "store", "testdata",
+                                    "release-stream.jsonl"),
+                       "r", encoding="utf-8").read().strip()
+rel_change = json.loads(rel_change_line)
+release_go = open(os.path.join("user", "go", "store", "testdata", "release.go"),
+                  "r", encoding="utf-8").read()
+REL_ROW = "GOHELLO.ELF | Go Hello | g | dock=false"
+# The tamper variant: a version bump parses fine but rehashes the atom, so
+# it fails release_mismatch — not release_malformed.
+release_go_tampered = release_go.replace('"1.0.0"', '"9.9.9"')
+assert release_go_tampered != release_go
+
+# Consumer share: STORE+GOSH+FLINT, publisher keyring, the real fleet
+# manifest, and the three drops (clean / mutated ELF / tampered
+# release.go). GOHELLO.ELF is staged ONLY inside the drops — install must
+# be the thing that lands it at the share root.
+store_share = os.path.join(run, "store-share")
+os.makedirs(os.path.join(store_share, "FLINTJ"), exist_ok=True)
+os.makedirs(os.path.join(store_share, "FLINT"), exist_ok=True)
+for name in ("FLINT.ELF", "GOSH.ELF", "STORE.ELF"):
+    shutil.copy(os.path.join(".build", "go", name), os.path.join(store_share, name))
+open(os.path.join(store_share, "OWNERS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nFLINT.ELF\t644\t0\t-\nSTORE.ELF\t644\t0\t-\n"
+)
+# STORE.ELF needs its own flint-remote binding for `store ls`'s wire
+# handshake — the slot-70 lane scopes secrets per app. The apps field is
+# a COMMA allowlist inside ONE row: a second same-key row overwrites the
+# first (set_internal dedupes on uid+key), observed FLINT.ELF losing its
+# binding to auth_required.
+open(os.path.join(store_share, "SECRETS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nflint-remote\t1000\t" + AUTH_KEY_HEX + "\tFLINT.ELF,STORE.ELF\n"
+)
+open(os.path.join(store_share, "FLINT", "TRUSTED.TXT"), "w", encoding="utf-8").write(
+    "#v1\nkey=" + good_changes[-1]["author"] + " name=sync-seed\n"
+)
+# Local stream replicas on store-share. The wire `read` behind clone/
+# pull cannot carry a release-sized Change (>~1460 B, the guest fill
+# boundary — see the spec header), so the streams the consumer legs
+# touch are materialized on the share instead: `main` verbatim from the
+# pinned seed, `rel` verbatim from the generated release fixture —
+# byte-identical to what a clone would have written. `store ls`/`install`
+# then pull only `heads`/`list`-sized responses and verify locally — the
+# keyring, signature, atom-hash, and ELF-sha checks are unchanged, only
+# the transport of the signed bytes differs.
+os.makedirs(os.path.join(store_share, "FLINT", "streams"), exist_ok=True)
+with open(os.path.join(store_share, "FLINT", "streams", stream_id + ".jsonl"), "wb") as f:
+    f.write(good_raw)
+with open(os.path.join(store_share, "FLINT", "streams", stream_id + ".json"), "w") as f:
+    f.write(json.dumps(
+        {"id": stream_id, "name": "main", "head": good_changes[-1]["id"],
+         "created": good_changes[0]["ts"], "forked_from": None},
+        separators=(",", ":")) + "\n")
+with open(os.path.join(store_share, "FLINT", "streams", rel_stream_id + ".json"), "w") as f:
+    f.write(json.dumps(
+        {"id": rel_stream_id, "name": "rel", "head": rel_change["id"],
+         "created": 1760000000000, "forked_from": None},
+        separators=(",", ":")) + "\n")
+with open(os.path.join(store_share, "FLINT", "streams", rel_stream_id + ".jsonl"), "w") as f:
+    f.write(rel_change_line + "\n")
+
+# The remote's `rel` stream carries the same signed Change — staged
+# verbatim because the ~2 KiB append request outruns the kernel's
+# 1460-byte TCPSend payload bound and the relay's verbatim
+# retransmission mangles multi-segment requests, while the matching
+# `read` reply crosses the guest's ~1460 B recv-fill boundary (both
+# observed; small hello/auth/list/heads traffic stays honest).
+with open(os.path.join(flintd_store, "streams", rel_stream_id + ".json"), "w") as f:
+    f.write(json.dumps(
+        {"id": rel_stream_id, "name": "rel", "head": rel_change["id"],
+         "created": 1760000000000, "forked_from": None},
+        separators=(",", ":")) + "\n")
+with open(os.path.join(flintd_store, "streams", rel_stream_id + ".jsonl"), "w") as f:
+    f.write(rel_change_line + "\n")
+shutil.copy(os.path.join("image", "apps.txt"), os.path.join(store_share, "APPS.TXT"))
+
+def write_drop(drop, rel_text, elf):
+    d = os.path.join(store_share, drop, "rel")
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "release.go"), "w", encoding="utf-8").write(rel_text)
+    open(os.path.join(d, "GOHELLO.ELF"), "wb").write(elf)
+
+write_drop("DROP", release_go, elf_bytes)
+write_drop("DROPBAD", release_go, elf_bytes + b"\x00")
+write_drop("DROPSIG", release_go_tampered, elf_bytes)
+
+
+
+print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, and store-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
 PY
 
 # ---- 01: M103a in-guest parse-corpus over /host/FLINTC -----------------------
@@ -806,7 +999,7 @@ vgate_run 11 -- \
     --cvc-file '$RUN_DIR/sync-share' \
     --virtio-fs '$RUN_DIR/sync-share' \
     --net '$RUN_DIR/cap11.bin' --net-arp-respond 10.0.0.2 \
-    --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
     --script '$RUN_DIR/script-11.txt' \
     --script-expect 'flint: clone ok stream=main changes=1' \
     --script-expect-tail 3 --timeout 180
@@ -853,7 +1046,7 @@ rec = json.load(
 if rec.get("head") != "0199de2d-dc00-7000-8000-00000000a001":
     sys.exit("stream record head %r != pinned change id" % rec.get("head"))
 remote = open(os.path.join(share, "FLINT", "REMOTE.json"), "r", encoding="utf-8").read()
-if '"remote":"tcp://10.0.0.2:4748"' not in remote or '"stream":"0199de2d-dc00-7000-8000-00000000a010"' not in remote:
+if '"remote":"tcp://10.0.0.2:4749"' not in remote or '"stream":"0199de2d-dc00-7000-8000-00000000a010"' not in remote:
     sys.exit("REMOTE.json does not bind the clone: %r" % remote)
 print("run-11 clone landed verbatim raw JSONL, rolled the record head, and wrote REMOTE.json")
 PY
@@ -863,7 +1056,7 @@ vgate_run 12 -- \
     --cvc-file '$RUN_DIR/sync-share' \
     --virtio-fs '$RUN_DIR/sync-share' \
     --net '$RUN_DIR/cap12.bin' --net-arp-respond 10.0.0.2 \
-    --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
     --script '$RUN_DIR/script-12.txt' \
     --script-expect 'flint: pull up to date' \
     --script-expect-tail 3 --timeout 180
@@ -879,7 +1072,7 @@ vgate_run 13 -- \
     --cvc-file '$RUN_DIR/badauth-share' \
     --virtio-fs '$RUN_DIR/badauth-share' \
     --net '$RUN_DIR/cap13.bin' --net-arp-respond 10.0.0.2 \
-    --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
     --script '$RUN_DIR/script-13.txt' \
     --script-expect 'flint: refuse auth_failed' \
     --script-expect-tail 3 --timeout 180
@@ -906,4 +1099,75 @@ share = os.path.join(run, "badauth-share")
 if os.path.exists(os.path.join(share, "FLINT")):
     sys.exit("auth_failed clone wrote a store under badauth-share/FLINT")
 print("run-13 auth_failed leg wrote nothing")
+PY
+
+# ---- 14: M101c consumer — ls, verify-then-install, launch ------------------
+vgate_run 14 -- \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap14.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-14.txt' \
+    --script-expect 'virelai-go OK' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 14 serial-contains 'store: stream main no-release'
+vgate_assert 14 serial-contains 'store: stream rel release'
+vgate_assert 14 serial-contains 'store: ls ok'
+vgate_assert 14 serial-contains 'sig: verified'
+vgate_assert 14 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
+vgate_assert 14 serial-contains 'virelai-go OK'
+vgate_assert 14 serial-absent 'store: refuse'
+vgate_assert 14 serial-absent 'flint: refuse'
+vgate_assert 14 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 14 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+elf = os.path.join(share, "GOHELLO.ELF")
+if not os.path.isfile(elf):
+    sys.exit("GOHELLO.ELF missing at share root after install")
+got = hashlib.sha256(open(elf, "rb").read()).hexdigest()
+want = hashlib.sha256(open(os.path.join(".build", "go", "GOHELLO.ELF"), "rb").read()).hexdigest()
+if got != want:
+    sys.exit("installed GOHELLO.ELF hash %s != built %s" % (got, want))
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if apps.count("GOHELLO.ELF |") != 1:
+    sys.exit("expected exactly one GOHELLO row in APPS.TXT: %r" % apps)
+print("run-14 installed ELF bytes verified against the built artifact")
+PY
+
+# ---- 15: M101c negatives — remove round-trip + tamper legs fail closed -----
+vgate_run 15 -- \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap15.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-15.txt' \
+    --script-expect 'store: refuse release_mismatch' \
+    --script-expect-tail 3 --timeout 180
+
+vgate_assert 15 serial-contains 'store: remove ok GOHELLO.ELF'
+vgate_assert 15 serial-contains 'store: refuse elf_mismatch GOHELLO.ELF'
+vgate_assert 15 serial-contains 'store: refuse release_mismatch'
+vgate_assert 15 serial-absent 'store: install ok'
+vgate_assert 15 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 15 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 15 serial-absent '[EXC] parking:'
+vgate_assert 15 python <<'PY'
+import os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+if os.path.exists(os.path.join(share, "GOHELLO.ELF")):
+    sys.exit("GOHELLO.ELF present at share root after remove + refused installs")
+apps_path = os.path.join(share, "APPS.TXT")
+if os.path.exists(apps_path) and "GOHELLO.ELF" in open(apps_path, "r", encoding="utf-8").read():
+    sys.exit("GOHELLO row present in APPS.TXT after remove + refused installs")
+if os.path.exists(os.path.join(share, "STORECAP.OUT")):
+    sys.exit("store left its FLINT capture scratch file behind")
+print("run-15 remove + both tamper legs left zero partial state")
 PY
