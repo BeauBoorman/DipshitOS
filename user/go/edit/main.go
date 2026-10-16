@@ -292,7 +292,15 @@ const (
 // package-internal, so tests swap these two instead.
 var (
 	clipWrite = func(p []byte) (int, int64) { return vsys.ClipboardSet(p) }
-	clipRead  = func() ([]byte, int64) { return vsys.ClipboardGet(vsys.ClipboardMax) }
+	// M107e (#2322): ClipboardGetInto reads into a 512 B caller buffer, not
+	// the 256 B vsys staging pool — the kernel clipboard holds 512 and the
+	// M108b host lane fills all of it, so a 257..512 B host paste used to
+	// splice into the buffer silently truncated.
+	clipRead = func() ([]byte, int64) {
+		var buf [512]byte
+		n, r := vsys.ClipboardGetInto(buf[:])
+		return buf[:n], r
+	}
 )
 
 // fill is one clamped background rectangle through the bound window canvas
