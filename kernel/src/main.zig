@@ -45,6 +45,7 @@ const virtio_net = @import("virtio_net.zig");
 // `virelai-vlfs` via blockDeviceIdentifier; VIRTIO_BLK_T_GET_ID is the
 // identity wire. Pre-exit scan/cap-resolution, post-MMU re-arm + GET_ID.
 const virtio_blk = @import("virtio_blk.zig");
+const vlfs = @import("vlfs/vlfs.zig"); // issue #2381: the boot probe reads the superblock's journal geometry
 const vlfs_disk = @import("vlfs/disk.zig"); // M100d (#2309): mount the data disk
 // Milestone six card G1 (claim 6053): virtio-gpu transport + framebuffer
 // (the runner's VZVirtioGraphicsDeviceConfiguration under `--display` /
@@ -1470,18 +1471,17 @@ fn uart_putc(byte: u8) void {
 }
 
 /// M100b (issue #2307, ADR 0050): the smallest honest proof of the RW
-/// data-disk path — save the VLFS disk's last sector, write the marker
-/// pattern, FLUSH (a real barrier: submitted only after the write's
-/// completion and waited out itself), read it back and verify, then
-/// restore the original contents + FLUSH so the probe leaves the image
-/// untouched. A crash inside the window could lose the one sector — the
-/// serial line records every step's named refusal instead of hiding it.
+/// data-disk path — save the scratch sector, write the marker pattern,
+/// FLUSH (a real barrier: submitted only after the write's completion and
+/// waited out itself), read it back and verify, then restore the original
+/// contents + FLUSH so the probe leaves the image untouched. The serial
+/// line records every step's named refusal instead of hiding it.
 fn blk_boot_probe(capacity: u64) void {
     if (capacity == 0) {
         uart_puts("vlfs-probe: refused no_capacity\n");
         return;
     }
-    const lba = capacity - 1;
+    const lba = blk_probe_lba(capacity);
     var saved: [virtio_blk.sector_len]u8 = undefined;
     var probe: [virtio_blk.sector_len]u8 = undefined;
     var back: [virtio_blk.sector_len]u8 = undefined;
@@ -1527,6 +1527,44 @@ fn blk_boot_probe(capacity: u64) void {
     uart_puts(" flush=");
     uart_puts(if (flushed) "1" else "0");
     uart_puts(" restored\n");
+}
+
+/// Issue #2381: the probe's target sector. A disk carrying a valid VLFS
+/// superblock (magic + version + checksum — the field offsets pinned here
+/// are ADR 0050's frozen v1 layout; vlfs.zig's own copies stay private to
+/// the format reader) probes the LAST sector of the journal region's tail
+/// block. The journal's live records span at most max_payload+2 blocks
+/// from journal_first — one outstanding transaction, checkpointed at every
+/// commit boundary — so the tail block is never replay-read and never
+/// transaction-written: a crash mid-probe strands the marker where nothing
+/// reads it, instead of in the volume's last data block (the old
+/// capacity-1 target — live data when the volume spans the disk). A disk
+/// without a valid superblock is a raw scratch disk and keeps the
+/// last-sector probe; nothing lives there either.
+fn blk_probe_lba(capacity: u64) u64 {
+    const sb_magic: usize = 0;
+    const sb_version: usize = 4;
+    const sb_journal_first: usize = 40;
+    const sb_journal_blocks: usize = 44;
+    const sb_cksum: usize = 508;
+    var sector: [virtio_blk.sector_len]u8 = undefined;
+    var slot: u64 = 0;
+    while (slot < 2) : (slot += 1) {
+        const valid = blk: {
+            virtio_blk.read_sector(slot * @as(u64, vlfs.sectors_per_block), &sector) catch break :blk false;
+            if (vlfs.rd32(&sector, sb_magic) != vlfs.magic_super) break :blk false;
+            if (vlfs.rd32(&sector, sb_version) != vlfs.format_version) break :blk false;
+            if (vlfs.rd32(&sector, sb_cksum) != vlfs.fnv32(sector[0..sb_cksum])) break :blk false;
+            break :blk true;
+        };
+        if (!valid) continue;
+        const journal_first = vlfs.rd32(&sector, sb_journal_first);
+        const journal_blocks = vlfs.rd32(&sector, sb_journal_blocks);
+        if (journal_first < 2 or journal_blocks == 0) continue;
+        const tail = (@as(u64, journal_first) + journal_blocks) * vlfs.sectors_per_block - 1;
+        if (tail < capacity) return tail;
+    }
+    return capacity - 1;
 }
 
 fn blk_probe_fail(stage: []const u8, e: virtio_blk.BlkError) void {
