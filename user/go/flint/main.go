@@ -58,6 +58,8 @@ func run(args []string) int {
 		return runErr(cmdAdd(activeFS, storeRoot, defaultUUIDGen, args[1:]))
 	case "status":
 		return runErr(cmdStatus(activeFS, storeRoot, args[1:]))
+	case "diff":
+		return runErr(cmdDiff(activeFS, storeRoot, args[1:]))
 	case "commit":
 		return runErr(cmdCommit(activeFS, storeRoot, defaultUUIDGen, args[1:]))
 	case "log":

@@ -384,6 +384,73 @@ receipt the host reads), [`go-selftest`](../tools/gate/specs/go-selftest.spec)
 (the ring-buffer receipt, host-compared) and
 [`go-sh`](../tools/gate/specs/go-sh.spec) (the `log` builtin).
 
+## 12. The versioned dev loop: FLINT in the guest (M107d, #2321)
+
+The guest edits, builds, and runs its own programs, and FLINT
+(`FLINT.ELF`, [`user/go/flint`](../user/go/flint/), ADR 0049) versions
+that work without leaving the guest. One workspace per program: the
+store lives at `/host/FLINT`, each workspace is a name under
+`/host/FLINT/ws/` bound to a `/host` source dir, and `src` on disk stays
+the source of truth — streams carry Atom hashes and Ops, not source
+text.
+
+A fresh guest needs two entries in `SECRETS.TXT` (the staged shape is in
+[`go-flint`](../tools/gate/specs/go-flint.spec)):
+
+- `agent-sign`, app-bound to `FLINT.ELF` — the Ed25519 seed `commit`
+  signs every Change with. Missing → `flint: refuse secret_not_found`
+  and nothing is written.
+- `flint-remote` — the FLINT-SYNC/1 `--auth-key` shared with `flintd`
+  for `push`/`pull`/`clone`/`ls-remote`. Wrong → `flint: refuse
+  auth_failed`.
+
+The loop, from GOSH:
+
+```sh
+FLINT.ELF init --name=myapp --src=/host/MYAPP   # once; ws_exists, src_missing
+GOEDIT.ELF /host/MYAPP/main.go                  # edit (M107c)
+GOBUILD.ELF /host/MYAPP -o /host/MYAPP.ELF      # build (M107a)
+MYAPP.ELF                                       # run
+FLINT.ELF add /host/MYAPP                       # stage; syntax, parse_unsupported,
+                                              # duplicate_decl refuse atomically
+FLINT.ELF status                                # staged Op counts + names
+FLINT.ELF diff                                  # staged Ops by file (below)
+FLINT.ELF commit -m "describe the change"       # nothing_to_commit,
+                                              # message_invalid, secret_not_found
+FLINT.ELF push --remote=<host>:4748 --stream=main
+                                              # auth_failed, stale_head,
+                                              # stream_missing (no --stream and
+                                              # no REMOTE.json binding yet)
+```
+
+`push` creates the stream on the remote when needed and sends the unsent
+suffix of the raw Change log; it writes `REMOTE.json` so later rounds
+are a bare `flint push`. On the host, against the served store:
+
+```sh
+flint verify --all --store <store-dir>
+```
+
+Each pushed line lands verbatim, so a byte-compare of the last line of
+the guest's `FLINT/streams/<id>.jsonl` against the server's
+`streams/<id>.jsonl` plus `flint verify` proves the signature chain end
+to end.
+
+`flint diff` is a status-depth diff, not a content diff — FLINT tracks
+hashes, not source lines. It prints
+`flint: diff ws=<n> stream=<s> files=<f> staged=<n> add=<a> modify=<m> delete=<d>`
+then one `flint: diff <type> <file> <qualified-name>` per staged Op
+(capped at 64, `flint: diff … +<n>` overflow). Deletes carry only an
+AtomID, so their file and name resolve by replaying the workspace's
+stream chain for the introducing add Op; an Atom that resolves nowhere
+prints `-` and its AtomID.
+
+The build leg is pinned by
+[`live-gobuild`](../tools/gate/specs/live-gobuild.spec); the FLINT verbs
+by [`go-flint`](../tools/gate/specs/go-flint.spec); the whole
+init→edit→add→diff→commit→push→host-verify round-trip by
+[`live-flint-loop`](../tools/gate/specs/live-flint-loop.spec).
+
 Before opening a PR, run the focused host tests, the app's class-B gate,
 `bash tools/status/verify-issue-coordination.sh`, and the relevant portable
 checks. The canonical gate policy is in [`docs/testing.md`](testing.md); the
