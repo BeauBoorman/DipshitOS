@@ -23,6 +23,15 @@ const (
 	authDomain       = "FLINT-SYNC-AUTH/1\x00"
 	defaultReadLimit = 256
 	maxBatchChanges  = 256
+	// maxBatchBytes caps the escaped change payload one `append` request
+	// carries. A request spanning two guest TCP segments can reach flintd
+	// with its first segment duplicated — the runner relay re-delivers
+	// retransmitted guest segments without dedup (see helloDrainNs) — and
+	// flintd then waits on a line that never terminates, so the push hangs
+	// (observed as ETIMEDOUT on a ~1.9 KiB two-Change append, M107d).
+	// ~1 KiB of escaped payload keeps the whole request inside one
+	// ~1460-byte segment; a single Change larger than the cap ships alone.
+	maxBatchBytes    = 1024
 	maxWireLineBytes = 4 * 1024 * 1024
 	maxChangeBytes   = 1024 * 1024
 	// helloDrainNs bounds the extra-response drain after `hello`. The guest
@@ -1349,10 +1358,7 @@ func pushSingleStream(fs FS, root string, client *syncClient, serverHeads map[st
 	curExpected := copyStrPtr(expectedHead)
 	sent := 0
 	for batchStart := startIdx; batchStart < len(rawLines); {
-		batchEnd := batchStart + maxBatchChanges
-		if batchEnd > len(rawLines) {
-			batchEnd = len(rawLines)
-		}
+		batchEnd := appendBatchEnd(rawLines, batchStart)
 		newHead, err := client.append(streamID, curExpected, rawLines[batchStart:batchEnd])
 		if err != nil {
 			return sent, wasCreated, err
@@ -1363,6 +1369,24 @@ func pushSingleStream(fs FS, root string, client *syncClient, serverHeads map[st
 	}
 	serverHeads[streamID] = copyStrPtr(curExpected)
 	return sent, wasCreated, nil
+}
+
+// appendBatchEnd returns the exclusive end of the next append batch: at
+// most maxBatchChanges lines whose escaped payload stays under
+// maxBatchBytes (a single line always batches, even over the cap). The
+// escaped length matches what client.append writes, q(line) per change.
+func appendBatchEnd(rawLines [][]byte, start int) int {
+	end := start
+	payload := 0
+	for end < len(rawLines) && end-start < maxBatchChanges {
+		n := len(q(string(bytes.TrimRight(rawLines[end], "\r\n"))))
+		if end > start && payload+n > maxBatchBytes {
+			break
+		}
+		payload += n
+		end++
+	}
+	return end
 }
 
 // cmdPush implements `flint push [--remote=<url>] [--stream=<s>]`:

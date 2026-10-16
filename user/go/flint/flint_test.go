@@ -463,6 +463,100 @@ func Mul(a, b int) int {
 	}
 }
 
+func TestDiffGroupsStagedOpsByFile(t *testing.T) {
+	h := newTestHarness(t)
+	if err := h.fs.WriteFileSafe("/host/src/go/sample.go", readCorpusFile(t, "go/sample.go")); err != nil {
+		t.Fatal(err)
+	}
+	if rc, _ := h.runCmd("init", "--name=w", "--src=/host/src"); rc != 0 {
+		t.Fatal("init failed")
+	}
+	if rc, _ := h.runCmd("add", "/host/src"); rc != 0 {
+		t.Fatal("add failed")
+	}
+
+	// Four staged adds in one file: header + per-op lines sorted by name.
+	rc, logs := h.runCmd("diff")
+	want := []string{
+		"flint: diff ws=w stream=main files=1 staged=4 add=4 modify=0 delete=0",
+		"flint: diff add go/sample.go sample.Add",
+		"flint: diff add go/sample.go sample.Answer",
+		"flint: diff add go/sample.go sample.Mul",
+		"flint: diff add go/sample.go sample.Point",
+	}
+	if rc != 0 || strings.Join(logs, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("unexpected diff output: rc=%d logs=%v", rc, logs)
+	}
+
+	// Commit clears the stage: diff reports a clean workspace.
+	if rc, _ := h.runCmd("commit", "-m", "base"); rc != 0 {
+		t.Fatal("commit failed")
+	}
+	rc, logs = h.runCmd("diff")
+	if rc != 0 || len(logs) != 1 || logs[0] != "flint: diff ws=w stream=main files=0 staged=0 add=0 modify=0 delete=0" {
+		t.Fatalf("unexpected clean diff: rc=%d logs=%v", rc, logs)
+	}
+
+	// A body edit stages a modify. A deleted file stages deletes whose
+	// file/name resolve from stream history (the delete Op carries only
+	// the AtomID and the Atom is gone from ATOMS.jsonl).
+	if err := h.fs.WriteFileSafe("/host/src/zig/gone.zig", readCorpusFile(t, "zig/sample.zig")); err != nil {
+		t.Fatal(err)
+	}
+	if rc, _ := h.runCmd("add", "/host/src"); rc != 0 {
+		t.Fatal("add zig failed")
+	}
+	if rc, _ := h.runCmd("commit", "-m", "zig"); rc != 0 {
+		t.Fatal("commit zig failed")
+	}
+	edited := []byte(`package sample
+
+const Answer = 42
+
+type Point struct {
+	X, Y int
+}
+
+func Add(a, b int) int {
+	return a + b + 1
+}
+
+func Mul(a, b int) int {
+	return a * b
+}
+`)
+	if err := h.fs.WriteFileSafe("/host/src/go/sample.go", edited); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.fs.Remove("/host/src/zig/gone.zig"); err != nil {
+		t.Fatal(err)
+	}
+	if rc, _ := h.runCmd("add", "/host/src"); rc != 0 {
+		t.Fatal("add delete failed")
+	}
+
+	rc, logs = h.runCmd("diff")
+	want = []string{
+		"flint: diff ws=w stream=main files=2 staged=7 add=0 modify=1 delete=6",
+		"flint: diff modify go/sample.go sample.Add",
+		"flint: diff delete zig/gone.zig gone.Point",
+		"flint: diff delete zig/gone.zig gone.add",
+		"flint: diff delete zig/gone.zig gone.entry",
+		"flint: diff delete zig/gone.zig gone.helper",
+		"flint: diff delete zig/gone.zig gone.limit",
+		"flint: diff delete zig/gone.zig gone.test:add works",
+	}
+	if rc != 0 || strings.Join(logs, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("unexpected mixed diff: rc=%d logs=%v", rc, logs)
+	}
+
+	// Usage refusal on an unknown flag.
+	rc, _ = h.runCmd("diff", "--bogus")
+	if rc != 2 {
+		t.Fatalf("expected usage rc=2, got %d", rc)
+	}
+}
+
 func TestParseErrorAndDuplicateDeclAllOrNothing(t *testing.T) {
 	h := newTestHarness(t)
 	if err := h.fs.WriteFileSafe("/host/src/go/a.go", readCorpusFile(t, "go/sample.go")); err != nil {
@@ -1472,4 +1566,3 @@ func TestConflictingMergeLeavesHistoryByteIdentical(t *testing.T) {
 		t.Fatalf("unexpected MERGE.json conflicts: %+v", report)
 	}
 }
-

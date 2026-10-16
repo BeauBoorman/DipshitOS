@@ -342,11 +342,12 @@ type fakeStream struct {
 }
 
 type fakeServer struct {
-	streams  map[string]*fakeStream
-	authKey  *[32]byte
-	authed   bool
-	nonce    string
-	nonceSeq uint64
+	streams       map[string]*fakeStream
+	authKey       *[32]byte
+	authed        bool
+	nonce         string
+	nonceSeq      uint64
+	appendBatches []int
 }
 
 func newFakeServer() *fakeServer {
@@ -538,6 +539,7 @@ func (s *fakeServer) handle(reqLine []byte) []byte {
 		if len(rawLines) == 0 {
 			return refuseResp(seq, "change_malformed", "empty batch")
 		}
+		s.appendBatches = append(s.appendBatches, len(rawLines))
 		prev := expected
 		var parsed []Change
 		for _, rl := range rawLines {
@@ -990,6 +992,81 @@ func TestRemotePushAndLsRemote(t *testing.T) {
 	want := "flint: stream main id=" + srvSt.rec.ID + " head=" + *srvSt.rec.Head
 	if logs[0] != want {
 		t.Fatalf("ls-remote line=%q want %q", logs[0], want)
+	}
+}
+
+func TestAppendBatchEndCapsPayload(t *testing.T) {
+	mk := func(n int) []byte { return bytes.Repeat([]byte{'x'}, n) }
+	// q() adds 2 bytes of quoting for opaque lines: 600-byte lines batch
+	// one per request (602 + 602 > maxBatchBytes).
+	lines := [][]byte{mk(600), mk(600), mk(600)}
+	if got := appendBatchEnd(lines, 0); got != 1 {
+		t.Fatalf("batch end=%d want 1", got)
+	}
+	if got := appendBatchEnd(lines, 1); got != 2 {
+		t.Fatalf("batch end=%d want 2", got)
+	}
+	// 300-byte lines fit three per request (3*302 <= 1024, 4*302 > 1024).
+	lines = [][]byte{mk(300), mk(300), mk(300), mk(300)}
+	if got := appendBatchEnd(lines, 0); got != 3 {
+		t.Fatalf("batch end=%d want 3", got)
+	}
+	// A single line over the cap still batches alone.
+	lines = [][]byte{mk(2000), mk(10)}
+	if got := appendBatchEnd(lines, 0); got != 1 {
+		t.Fatalf("oversize batch end=%d want 1", got)
+	}
+	if got := appendBatchEnd(lines, 1); got != 2 {
+		t.Fatalf("tail batch end=%d want 2", got)
+	}
+}
+
+func TestRemotePushBatchesByBytes(t *testing.T) {
+	// Two commits on the sample corpus each serialize to most of the
+	// segment cap, so the suffix ships as two single-Change appends
+	// rather than one ~1.9 KiB request the relay corrupts (M107d).
+	srv := newFakeServer()
+	h := newRemoteHarness(t, srv)
+	if err := h.fs.WriteFileSafe("/host/src/go/sample.go", readCorpusFile(t, "go/sample.go")); err != nil {
+		t.Fatal(err)
+	}
+	if rc, logs := h.runCmd("init", "--name=w", "--src=/host/src"); rc != 0 {
+		t.Fatalf("init: %v", logs)
+	}
+	if rc, logs := h.runCmd("add", "/host/src"); rc != 0 {
+		t.Fatalf("add: %v", logs)
+	}
+	if rc, logs := h.runCmd("commit", "-m", "first"); rc != 0 {
+		t.Fatalf("commit1: %v", logs)
+	}
+	edited := []byte("package sample\n\nconst Answer = 43\n\ntype Point struct {\n\tX, Y int\n}\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\nfunc Mul(a, b int) int {\n\treturn a * b\n}\n")
+	if err := h.fs.WriteFileSafe("/host/src/go/sample.go", edited); err != nil {
+		t.Fatal(err)
+	}
+	if rc, logs := h.runCmd("add", "/host/src"); rc != 0 {
+		t.Fatalf("add2: %v", logs)
+	}
+	if rc, logs := h.runCmd("commit", "-m", "second"); rc != 0 {
+		t.Fatalf("commit2: %v", logs)
+	}
+
+	rc, logs := h.runCmd("push", "--remote=10.0.0.2:4748", "--stream=main")
+	if rc != 0 {
+		t.Fatalf("push rc=%d logs=%v", rc, logs)
+	}
+	mustOneLog(t, logs, "flint: push ok stream=main changes=2")
+
+	// Both commits were larger than half the cap, so each shipped in its
+	// own append request with the expected_head chain intact.
+	var srvSt *fakeStream
+	for _, fs := range srv.streams {
+		srvSt = fs
+	}
+	if srvSt == nil || len(srvSt.lines) != 2 {
+		t.Fatalf("server stream lines=%v", srvSt)
+	}
+	if len(srv.appendBatches) != 2 || srv.appendBatches[0] != 1 || srv.appendBatches[1] != 1 {
+		t.Fatalf("append batches=%v want [1 1]", srv.appendBatches)
 	}
 }
 
