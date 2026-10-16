@@ -929,6 +929,16 @@ fn invalidate_pins(path: []const u8) void {
     };
 }
 
+/// M100d (issue #2309): a `.disk` pin's node IS the VLFS inode — a
+/// committed removal stales every pin that referenced it (bare /disk paths
+/// are not unique keys against host pins, so this keys on the inode).
+fn invalidate_disk_pin(ino: u32) void {
+    if (handles.len == 0) return;
+    for (handles) |*row| for (row) |*h| {
+        if (h.in_use and h.pin and h.partition == .disk and h.pin_node == ino) h.pin_stale = true;
+    };
+}
+
 /// Op 7: pins an existing directory by the B3 no-follow walk.
 pub fn pin_open(pid: u64, root_bytes: []const u8, relative: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
@@ -1018,8 +1028,19 @@ pub fn pin_create(pid: u64, token: u64, name: []const u8) i64 {
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
     const slot = free_resource_slot(pid) orelse return -5;
     if (parent.partition == .disk) {
-        _ = metadata.createFile(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
-        return -7; // unreachable: the v1 backend denies every mutation
+        const created = metadata.createFile(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
+        var h = FileHandle{
+            .in_use = true,
+            .flags = MODE_WRITE,
+            .path_len = @intCast(path.len),
+            .partition = .disk,
+            .contained = true,
+            .disk_handle = @intCast(created.handle),
+            .disk_epoch = vlfs_disk.mountEpoch(),
+        };
+        @memcpy(h.path[0..path.len], path);
+        handles[pid][slot] = h;
+        return @intCast(slot);
     }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
@@ -1046,8 +1067,8 @@ pub fn pin_mkdir(pid: u64, token: u64, name: []const u8) i64 {
     const slot = free_resource_slot(pid) orelse return -5;
     if (next_dir_token > std.math.maxInt(i64)) return -5;
     if (parent.partition == .disk) {
-        _ = metadata.makeDirectory(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
-        return -7; // unreachable: the v1 backend denies every mutation
+        const object = metadata.makeDirectory(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
+        return install_pin(pid, slot, .disk, path, object);
     }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
@@ -1064,8 +1085,19 @@ pub fn pin_remove(pid: u64, token: u64, name: []const u8, kind: u64) i64 {
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
     const want: metadata.Kind = if (kind == metadata.remove_directory) .directory else .file;
     if (parent.partition == .disk) {
-        metadata.remove(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name, want) catch |err| return metadata_errno(err);
-        return -7; // unreachable: the v1 backend denies every mutation
+        const backend = vlfs_disk.backend("");
+        // Resolve the child's inode first so a committed removal can stale
+        // every pin still holding it.
+        var doomed_ino: u64 = 0;
+        if (backend.ops) |ops| {
+            if (ops.lookup(backend.context, pin_object(parent), name)) |doomed| {
+                doomed_ino = doomed.metadata.identity.inode;
+                ops.release(backend.context, doomed);
+            } else |_| {}
+        }
+        metadata.remove(backend, vlfs_disk.authorizer, pin_directory(parent), name, want) catch |err| return metadata_errno(err);
+        if (doomed_ino != 0) invalidate_disk_pin(@intCast(doomed_ino));
+        return 0;
     }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
@@ -1085,11 +1117,12 @@ pub fn pin_rename(pid: u64, from_token: u64, from_name: []const u8, to_token: u6
     const from_path = metadata.childPath(from.path[0..from.path_len], from_name, &source) catch |err| return metadata_errno(err);
     const to_path = metadata.childPath(to.path[0..to.path_len], to_name, &target) catch |err| return metadata_errno(err);
     if (from.partition == .disk or to.partition == .disk) {
-        // Same-volume only by ABI; either side on the read-only disk refuses.
-        if (from.partition == .disk and to.partition == .disk) {
-            metadata.rename(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(from), from_name, pin_directory(to), to_name, replace) catch |err| return metadata_errno(err);
-        }
-        return -7; // cross-partition rename, or the v1 backend's denial
+        // Same-volume only by ABI; a cross-partition rename refuses.
+        if (from.partition != .disk or to.partition != .disk) return -1;
+        metadata.rename(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(from), from_name, pin_directory(to), to_name, replace) catch |err| return metadata_errno(err);
+        // On VLFS a pin's identity IS the inode — it follows the object
+        // across a rename (the contained contract), so nothing goes stale.
+        return 0;
     }
     var root = virtio_file.MetadataRoot{ .path = "" };
     var auth = MetadataAuth{ .pid = pid, .root = "" };
@@ -1364,6 +1397,13 @@ pub fn hf_handle_errno(st: u8) i64 {
 fn disk_errno(err: vlfs.Error) i64 {
     return switch (err) {
         error.NotMounted, error.NotFound, error.Io => -6,
+        error.ReadOnly => -7,
+        error.NameTooLong => -8,
+        error.Exists => -9,
+        // The space/refusal family: full device, full inode table, full
+        // directory, and the bounded-shape refusals (txn/file/extent).
+        error.NoSpace, error.NoInodes, error.DirFull, error.TxnTooLarge,
+        error.FileTooLarge, error.ExtentOverflow => -5,
         else => -1,
     };
 }
@@ -1489,14 +1529,72 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
         return @intCast(slot);
     }
 
-    // M100c (issue #2308, ADR 0050 D6): a file on the VLFS data disk. The
-    // error split mirrors `.usb_fat`: not-mounted and not-found are ENOENT
-    // (the share-only boot continues — a disk is an enhancement, never a
-    // requirement); a directory has no byte stream; anything structural is
-    // EINVAL. v1 is read-only: every mutating flag is refused up front.
+    // M100c (issue #2308, ADR 0050 D6) + M100d (issue #2309): a file on the
+    // VLFS data disk. The error split mirrors `.usb_fat`: not-mounted and
+    // not-found are ENOENT; a directory has no byte stream; anything
+    // structural is EINVAL; the write path's named refusals map onto the
+    // frozen errno rows (exists → EEXIST, the space family → ENOSPC,
+    // read_only_partition → EACCES). Every mutation is a committed journal
+    // transaction before open returns.
     if (parsed.partition == .disk) {
-        if ((flags & (MODE_WRITE | MODE_CREATE | MODE_APPEND | MODE_DIR)) != 0) return -1;
         const subpath = parsed.path[0..parsed.parsed_len()];
+        if ((flags & MODE_DIR) != 0) {
+            // Parity with the host branch: DIR needs CREATE or WRITE;
+            // a bare DIR open of a directory is not this table's shape.
+            if ((flags & (MODE_CREATE | MODE_WRITE)) == 0) return -1;
+            if (subpath.len == 0) return -9; // the volume root exists
+            _ = vlfs_disk.create(subpath, vlfs.kind_dir) catch |err| return disk_errno(err);
+            handles[pid][slot] = .{
+                .in_use = true,
+                .partition = .disk,
+                .flags = flags,
+                .path = parsed.path,
+                .path_len = parsed.path_len,
+                .is_dir = true,
+                .disk_epoch = vlfs_disk.mountEpoch(),
+            };
+            return @intCast(slot);
+        }
+        if ((flags & MODE_WRITE) != 0) {
+            var ino: u32 = 0;
+            var size: u32 = 0;
+            var created = false;
+            if (vlfs_disk.lookup(subpath)) |found| {
+                if (found.kind == vlfs.kind_dir) return -1; // no byte stream
+                ino = found.inode;
+                const st = vlfs_disk.statInode(ino) catch |err| return disk_errno(err);
+                size = st.size;
+            } else |err| {
+                if (err != error.NotFound) return disk_errno(err);
+                if ((flags & MODE_CREATE) == 0) return -6;
+                ino = vlfs_disk.create(subpath, vlfs.kind_file) catch |cerr| return disk_errno(cerr);
+                created = true;
+            }
+            if (!created and (flags & MODE_APPEND) == 0) {
+                // Replace semantics (host parity): a fresh write-open
+                // truncates — as a journaled transaction, so a crash
+                // mid-open leaves the old file whole or the new size,
+                // never a torn extent list.
+                vlfs_disk.truncate(ino, 0) catch |err| return disk_errno(err);
+                size = 0;
+            }
+            const cursor: u32 = if ((flags & MODE_APPEND) != 0) size else 0;
+            handles[pid][slot] = .{
+                .in_use = true,
+                .partition = .disk,
+                .flags = flags,
+                .cursor = cursor,
+                .size = size,
+                .path = parsed.path,
+                .path_len = parsed.path_len,
+                .disk_ino = ino,
+                .disk_epoch = vlfs_disk.mountEpoch(),
+            };
+            return @intCast(slot);
+        }
+        // Read opens. CREATE without WRITE mirrors the host branch: an
+        // existing file opens, a missing one is ENOENT (the host never
+        // creates on a read-only open either).
         const found = vlfs_disk.lookup(subpath) catch |err| return disk_errno(err);
         if (found.kind == vlfs.kind_dir) return -1; // the volume root and dirs: no byte stream
         const st = vlfs_disk.statInode(found.inode) catch |err| return disk_errno(err);
@@ -1748,6 +1846,21 @@ fn write_handle(pid: u64, h: *FileHandle, in_buf: []const u8) i64 {
             _ = terminal.pumpRuntimeOutput();
             return @intCast(n);
         }
+    }
+
+    // M100d (issue #2309): `.disk` writes are one journal transaction per
+    // call (DESC+PAYLOAD+COMMIT+FLUSH inside vlfs_disk.write) at the
+    // handle's cursor; a remount still invalidates the handle. The
+    // contained-open variant writes through the backend handle's cursor.
+    if (h.partition == .disk) {
+        if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        const n = if (h.disk_handle != 0)
+            vlfs_disk.containedWrite(h.disk_handle, in_buf) catch |err| return disk_errno(err)
+        else
+            vlfs_disk.write(h.disk_ino, h.cursor, in_buf) catch |err| return disk_errno(err);
+        h.cursor += @intCast(n);
+        h.size = @max(h.size, h.cursor);
+        return @intCast(n);
     }
 
     // M50 TS2 (ADR 0024 D4): the host-share ownership/mode gate for writes.
@@ -2056,10 +2169,17 @@ pub fn delete(pid: u64, path_bytes: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
     if (path_bytes.len == 0 or path_bytes.len > max_path_len) return -1;
     const parsed = parse_path(path_bytes) orelse return -1;
-    // M70f F1 (issue #1458): only the host share is mutable through this
-    // table. A device path (`.usb`, `.usb_fat`, `.tty`) is refused by name —
-    // without this guard the subpath would be handed to the host channel,
-    // i.e. `rm usb1/x` would have acted on the share's `x`.
+    // M100d (issue #2309): `.disk` deletes are a journaled removal (the
+    // dirent tombstones, the blocks and inode free, in one transaction).
+    // `.usb`/`.usb_fat`/`.tty` stay refused by name — without this guard
+    // the subpath would be handed to the host channel, i.e. `rm usb1/x`
+    // would have acted on the share's `x`.
+    if (parsed.partition == .disk) {
+        const subpath = parsed.path[0..parsed.parsed_len()];
+        const ino = vlfs_disk.remove(subpath) catch |err| return disk_errno(err);
+        invalidate_disk_pin(ino);
+        return 0;
+    }
     if (parsed.partition != .host) return -1;
     // M50 TS2 (ADR 0024 D4/D8): the ownership/mode gate — a secret-class
     // path is denied delete through the file ABI for every actor. Only the
@@ -2099,9 +2219,16 @@ pub fn rename_mode(pid: u64, old_bytes: []const u8, new_bytes: []const u8, mode:
     const old = parse_path(old_bytes) orelse return -1;
     const new = parse_path(new_bytes) orelse return -1;
     if (old.partition != new.partition) return -1; // cross-partition unsupported
-    if (old.partition != .host) return -1; // M70f F1: devices are read-only
     const oldp = old.path[0..old.parsed_len()];
     const newp = new.path[0..new.parsed_len()];
+    // M100d (issue #2309): a same-volume `.disk` rename is one journaled
+    // transaction (tombstone + insert + inode updates); `exists` and the
+    // other named refusals map onto the errno rows.
+    if (old.partition == .disk) {
+        vlfs_disk.rename(oldp, newp, mode == .replace) catch |err| return disk_errno(err);
+        return 0;
+    }
+    if (old.partition != .host) return -1; // M70f F1: devices are read-only
     // M50 TS2 (ADR 0024 D4/D8): the ownership/mode gate on BOTH ends — a
     // secret-class path is denied rename for every actor, so the class can
     // never be stripped by a guest rename.
@@ -2138,6 +2265,23 @@ pub fn truncate(pid: u64, fd: u64, new_size: u32) i64 {
     if ((h.flags & MODE_WRITE) == 0) return -7; // EACCES
     if (h.dir_token != 0) return -2;
     if (h.is_dir) return -7; // M25 Lane B: never truncate through a dir handle
+    // M100d (issue #2309): a `.disk` truncate is one journaled transaction —
+    // shrink frees the dropped extents, grow zero-fills (both bounded by
+    // the 64-block payload span → `txn_too_large` on a huge grow).
+    if (h.partition == .disk) {
+        if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        const ino = blk: {
+            if (h.disk_handle != 0) {
+                // Contained handles resolve their own inode.
+                break :blk vlfs_disk.containedIno(h.disk_handle) orelse return -2;
+            }
+            break :blk h.disk_ino;
+        };
+        vlfs_disk.truncate(ino, new_size) catch |err| return disk_errno(err);
+        h.size = new_size;
+        if (h.cursor > new_size) h.cursor = new_size;
+        return 0;
+    }
     // M50 TS2 (ADR 0024 D4): the host-share ownership/mode gate for resize.
     if (h.partition == .host and !hostAllowed(pid, h.path[0..h.path_len], .write)) return -7; // EACCES
     // M34 HF5 (issue #739): host truncate rides the host handle. M66a: the
@@ -2165,6 +2309,14 @@ pub fn sync(pid: u64, fd: u64) i64 {
     const h = &handles[pid][fd];
     if (!h.in_use) return -2; // EBADF
     if (h.dir_token != 0) return -2;
+    // M100d (issue #2309, ADR 0050 D4): fsync on a `.disk` handle is a real
+    // virtio-blk FLUSH — every committed mutation is already durable, and
+    // the barrier is waited out so the caller's line is honest.
+    if (h.partition == .disk) {
+        if (!vlfs_disk.epochLive(h.disk_epoch)) return -2;
+        vlfs_disk.sync() catch |err| return disk_errno(err);
+        return 0;
+    }
     if (h.partition != .host) return 0; // no host-side state to push
     if (!h.host_handle_valid) return 0; // stateless read handle: nothing to sync
     if (h.contained) {
@@ -3206,14 +3358,15 @@ test "file_table: mounted VLFS serves open/read/stat/readdir on /disk" {
     try std.testing.expectEqualSlices(u8, "le\napp", buf[4107..4113]);
     try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fd)));
 
-    // A directory and a missing name refuse distinctly; every mutating flag
-    // is refused before a single sector is read.
+    // A directory and a missing name refuse distinctly. The fixture disk
+    // is a read-only SectorSource (no writeFn), so every mutation refuses
+    // `read_only_partition` — EACCES — by name.
     try std.testing.expectEqual(@as(i64, -1), open(0, "/disk/DOCS", MODE_READ));
     try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/NOPE.TXT", MODE_READ));
-    try std.testing.expectEqual(@as(i64, -1), open(0, "/disk/APPLE.TXT", MODE_WRITE));
-    try std.testing.expectEqual(@as(i64, -1), open(0, "/disk/APPLE.TXT", MODE_READ | MODE_CREATE));
-    try std.testing.expectEqual(@as(i64, -1), delete(0, "/disk/APPLE.TXT"));
-    try std.testing.expectEqual(@as(i64, -1), rename(0, "/disk/A", "/disk/B"));
+    try std.testing.expectEqual(@as(i64, -7), open(0, "/disk/APPLE.TXT", MODE_WRITE));
+    try std.testing.expect(open(0, "/disk/APPLE.TXT", MODE_READ | MODE_CREATE) >= 0);
+    try std.testing.expectEqual(@as(i64, -7), delete(0, "/disk/APPLE.TXT"));
+    try std.testing.expectEqual(@as(i64, -7), rename(0, "/disk/A", "/disk/B"));
     try std.testing.expectEqual(@as(i64, -7), set_mode(0, "/disk/APPLE.TXT", 0o600));
 
     // Nested-path lookup through two directories (uppercase + lowercase).

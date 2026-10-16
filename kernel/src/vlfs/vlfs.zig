@@ -91,6 +91,33 @@ pub const Error = error{
     BadExtent,
     /// extent_chain_corrupt — an extent block's magic/count/checksum fails.
     ExtentChainCorrupt,
+    /// bad_journal — a journal record or a txn dest violates the D3/D4
+    /// shape (runtime corruption or a writer invariant breach).
+    BadJournal,
+    /// read_only_partition — the sector source cannot write/flush.
+    ReadOnly,
+    /// exists — a create/rename target name is already live.
+    Exists,
+    /// no_space — the block bitmap has no free data block (device full).
+    NoSpace,
+    /// no_inodes — the inode bitmap has no free inode.
+    NoInodes,
+    /// dir_full — the directory already holds 1024 live dirents.
+    DirFull,
+    /// txn_too_large — the operation's payload set exceeds 64 blocks (the
+    /// ADR D7 span bound); under eager checkpointing this is also the
+    /// journal-full answer (the journal holds one transaction).
+    TxnTooLarge,
+    /// extent_overflow — the file's extent list would exceed 8 inline +
+    /// 4 chained extent blocks.
+    ExtentOverflow,
+    /// file_too_large — the byte size would exceed 4 GiB − 1 (u32 size).
+    FileTooLarge,
+    /// name_too_long — a dirent name outside 1..255 bytes or containing a
+    /// forbidden character.
+    NameTooLong,
+    /// not_empty — a remove target is a directory with live dirents.
+    NotEmpty,
 };
 
 /// The ADR D7 refusal spelling, for logs and gate evidence.
@@ -112,6 +139,17 @@ pub fn refusalName(err: Error) []const u8 {
         error.BadDirent => "bad_dirent",
         error.BadExtent => "bad_extent",
         error.ExtentChainCorrupt => "extent_chain_corrupt",
+        error.BadJournal => "bad_journal",
+        error.ReadOnly => "read_only_partition",
+        error.Exists => "exists",
+        error.NoSpace => "no_space",
+        error.NoInodes => "no_inodes",
+        error.DirFull => "dir_full",
+        error.TxnTooLarge => "txn_too_large",
+        error.ExtentOverflow => "extent_overflow",
+        error.FileTooLarge => "file_too_large",
+        error.NameTooLong => "name_too_long",
+        error.NotEmpty => "not_empty",
     };
 }
 
@@ -174,7 +212,8 @@ pub const SectorSource = struct {
         return true;
     }
 
-    fn writeBlock(self: SectorSource, blk: u32, data: *const [block_len]u8) bool {
+    /// One 4 KiB VLFS block is 8 sector writes; a sector failure fails it.
+    pub fn writeBlock(self: SectorSource, blk: u32, data: *const [block_len]u8) bool {
         for (0..sectors_per_block) |i| {
             const lba = @as(u64, blk) * sectors_per_block + i;
             if (!self.writeSector(lba, @ptrCast(data[i * sector_len ..][0..sector_len]))) return false;
@@ -234,15 +273,15 @@ pub const Superblock = struct {
     slot: u8,
 };
 
-fn rd16(b: []const u8, off: usize) u16 {
+pub fn rd16(b: []const u8, off: usize) u16 {
     return std.mem.readInt(u16, b[off..][0..2], .little);
 }
 
-fn rd32(b: []const u8, off: usize) u32 {
+pub fn rd32(b: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, b[off..][0..4], .little);
 }
 
-fn rd64(b: []const u8, off: usize) u64 {
+pub fn rd64(b: []const u8, off: usize) u64 {
     return std.mem.readInt(u64, b[off..][0..8], .little);
 }
 
@@ -314,19 +353,20 @@ fn geometryError(s: Superblock, sector: *const [sector_len]u8) ?Error {
 }
 
 // ---------------------------------------------------------------------------
-// Journal record field offsets (ADR 0050 D3)
+// Journal record field offsets (ADR 0050 D3) — pub for the M100d write path
+// (write.zig emits the same records this reader validates).
 // ---------------------------------------------------------------------------
 
-const jd_magic: usize = 0;
-const jd_seq: usize = 4;
-const jd_count: usize = 12;
-const jd_flags: usize = 14;
-const jd_entries: usize = 16;
-const jd_cksum: usize = block_len - 4;
-const jc_magic: usize = 0;
-const jc_seq: usize = 4;
-const jc_txn: usize = 12;
-const jc_cksum: usize = block_len - 4;
+pub const jd_magic: usize = 0;
+pub const jd_seq: usize = 4;
+pub const jd_count: usize = 12;
+pub const jd_flags: usize = 14;
+pub const jd_entries: usize = 16;
+pub const jd_cksum: usize = block_len - 4;
+pub const jc_magic: usize = 0;
+pub const jc_seq: usize = 4;
+pub const jc_txn: usize = 12;
+pub const jc_cksum: usize = block_len - 4;
 
 /// A mounted, validated volume — the chosen superblock's geometry.
 pub const Volume = struct {
@@ -347,7 +387,35 @@ pub const Volume = struct {
     next_txn_seq: u64,
     /// The physical superblock slot the volume was read from (0/1).
     sb_slot: u8,
+    /// M100d: the write path's forward-only bbitmap scan cursor (in-memory
+    /// only, never on disk) — the next data block to probe for a free bit.
+    alloc_hint: u32,
 };
+
+/// The live volume state re-expressed as a Superblock record — the shape the
+/// ping-pong update writes (M100d's commit path and D5's replay share it).
+pub fn volumeSuperblock(vol: Volume, slot: u8) Superblock {
+    return .{
+        .seq = vol.seq,
+        .volume_id = vol.volume_id,
+        .volume_bytes = @as(u64, vol.volume_blocks) * block_len,
+        .volume_blocks = vol.volume_blocks,
+        .journal_first = vol.journal_first,
+        .journal_blocks = vol.journal_blocks,
+        .ibitmap_first = vol.ibitmap_first,
+        .ibitmap_blocks = 1,
+        .bbitmap_first = vol.bbitmap_first,
+        .bbitmap_blocks = vol.bbitmap_blocks,
+        .itable_first = vol.itable_first,
+        .itable_blocks = vol.itable_blocks,
+        .data_first = vol.data_first,
+        .data_blocks = vol.data_blocks,
+        .inode_count = vol.inode_count,
+        .journal_applied = vol.journal_applied,
+        .next_txn_seq = vol.next_txn_seq,
+        .slot = slot,
+    };
+}
 
 /// One DESC record's verdict: `torn` stops the scan; the journal tail is
 /// whatever follows — discarded either way.
@@ -393,7 +461,7 @@ fn checkJournalRecord(src: SectorSource, sb: Superblock, pos: u32, scratch: *[bl
 
 /// FNV-1a continued over another block (for the COMMIT txn_cksum over
 /// DESC[+0..+16+8n] + all payload blocks).
-fn fnv32Continue(h: u32, bytes: []const u8) u32 {
+pub fn fnv32Continue(h: u32, bytes: []const u8) u32 {
     var hash = h;
     for (bytes) |c| {
         hash ^= c;
@@ -466,7 +534,9 @@ fn replayJournal(src: SectorSource, sb: *Superblock, count: u32, scratch: *[bloc
     sb.slot = @intCast(target_slot);
 }
 
-fn writeSuperblockSector(sector: *[sector_len]u8, s: Superblock) void {
+/// Serialize one superblock sector (512 B; the caller zero-pads the rest of
+/// the block). Shared by D5 replay and the M100d commit's ping-pong update.
+pub fn writeSuperblockSector(sector: *[sector_len]u8, s: Superblock) void {
     @memset(sector, 0);
     std.mem.writeInt(u32, sector[sb_magic..][0..4], magic_super, .little);
     std.mem.writeInt(u32, sector[sb_version..][0..4], format_version, .little);
@@ -542,6 +612,7 @@ pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
         .journal_applied = sb.journal_applied,
         .next_txn_seq = sb.next_txn_seq,
         .sb_slot = sb.slot,
+        .alloc_hint = sb.data_first,
     };
 }
 
@@ -549,20 +620,21 @@ pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
 // Inodes (128-B records in the itable; slot i = inode i)
 // ---------------------------------------------------------------------------
 
-const in_kind: usize = 0;
-const in_nextents: usize = 2;
-const in_size: usize = 4;
-const in_mtime: usize = 8;
-const in_ctime: usize = 16;
-const in_extents: usize = 24;
-const in_next_ext: usize = 88;
-const in_cksum: usize = 124;
+pub const in_kind: usize = 0;
+pub const in_flags: usize = 1;
+pub const in_nextents: usize = 2;
+pub const in_size: usize = 4;
+pub const in_mtime: usize = 8;
+pub const in_ctime: usize = 16;
+pub const in_extents: usize = 24;
+pub const in_next_ext: usize = 88;
+pub const in_cksum: usize = 124;
 
-const xb_magic: usize = 0;
-const xb_next: usize = 4;
-const xb_count: usize = 8;
-const xb_extents: usize = 12;
-const xb_cksum: usize = block_len - 4;
+pub const xb_magic: usize = 0;
+pub const xb_next: usize = 4;
+pub const xb_count: usize = 8;
+pub const xb_extents: usize = 12;
+pub const xb_cksum: usize = block_len - 4;
 
 pub const Extent = struct { first: u32, count: u32 };
 
@@ -681,12 +753,12 @@ fn readExtentBytes(src: SectorSource, vol: Volume, rec: Inode, offset: u64, out:
 // Directory entries (272-B records packed inside a directory's payload)
 // ---------------------------------------------------------------------------
 
-const de_inode: usize = 0;
-const de_name_len: usize = 4;
-const de_kind: usize = 6;
-const de_flags: usize = 7;
-const de_reserved: usize = 8;
-const de_name: usize = 16;
+pub const de_inode: usize = 0;
+pub const de_name_len: usize = 4;
+pub const de_kind: usize = 6;
+pub const de_flags: usize = 7;
+pub const de_reserved: usize = 8;
+pub const de_name: usize = 16;
 
 pub const Dirent = struct {
     inode: u32,
