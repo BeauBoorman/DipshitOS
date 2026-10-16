@@ -975,16 +975,6 @@ pub fn try_handle_page_fault(esr: u64, far: u64) bool {
 /// already has an EL0 leaf are program faults to deliver — allocating a
 /// fresh page over the leaf would just fault again on the retry, leaking
 /// one page per iteration until the pool drains.
-/// Diagnostic (#2354): which populate refusal the last failing call took.
-/// Written on every failure return; read by the syscall EFAULT diagnostic.
-/// 1 = no demand region, 2 = leaf already EL0-visible, 3 = prot mismatch,
-/// 4 = page pool empty, 5 = record_dynamic_page failed, 6 = map_user_page.
-pub var populate_fail_reason: u8 = 0;
-/// VA whose populate refused (pairs with populate_fail_reason).
-pub var populate_fail_va: u64 = 0;
-/// pid whose populate refused (pairs with populate_fail_reason).
-pub var populate_fail_pid: usize = 0;
-
 pub fn populate_user_page(pid: usize, root: u64, va: u64, for_write: bool) bool {
     const page = va & ~@as(u64, 0xfff);
     var readable = false;
@@ -1003,54 +993,23 @@ pub fn populate_user_page(pid: usize, root: u64, va: u64, for_write: bool) bool 
             demand = true;
         }
     }
-    if (!demand) {
-        populate_fail_reason = 1;
-        populate_fail_va = va;
-        populate_fail_pid = pid;
-        return false;
-    }
+    if (!demand) return false;
     // The fault is only serviceable when the region admits the access — an
     // already-mapped page faults for its own reason (permissions, COW was
     // tried above) and must be delivered, not re-populated.
-    if (mmu.leaf_el0_visible(root, page)) {
-        populate_fail_reason = 2;
-        populate_fail_va = va;
-        populate_fail_pid = pid;
-        return false;
-    }
+    if (mmu.leaf_el0_visible(root, page)) return false;
     if (for_write) {
-        if (!writable) {
-            populate_fail_reason = 3;
-            populate_fail_va = va;
-            populate_fail_pid = pid;
-            return false;
-        }
-    } else if (!readable and !writable) {
-        populate_fail_reason = 3;
-        populate_fail_va = va;
-        populate_fail_pid = pid;
-        return false;
-    }
-    const pa = alloc.alloc_pages(1) orelse {
-        populate_fail_reason = 4;
-        populate_fail_va = va;
-        populate_fail_pid = pid;
-        return false;
-    };
+        if (!writable) return false;
+    } else if (!readable and !writable) return false;
+    const pa = alloc.alloc_pages(1) orelse return false;
     zero_phys_page(pa);
     if (!process.record_dynamic_page(pid, pa)) {
         _ = alloc.free_pages(pa, 1);
-        populate_fail_reason = 5;
-        populate_fail_va = va;
-        populate_fail_pid = pid;
         return false;
     }
     if (!mmu.map_user_page(root, page, pa, writable, executable)) {
         _ = process.forget_dynamic_page(pid, pa);
         _ = alloc.free_pages(pa, 1);
-        populate_fail_reason = 6;
-        populate_fail_va = va;
-        populate_fail_pid = pid;
         return false;
     }
     demand_fault_count += 1;

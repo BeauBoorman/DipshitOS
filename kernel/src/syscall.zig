@@ -2033,37 +2033,7 @@ fn handle_file_read(args: Args, _: *exceptions.VectorFrame) u64 {
     }
     const bytes_read: usize = @intCast(res);
     if (bytes_read > 0) {
-        if (uaccess.copy_out(buf_ptr, read_staging[0..bytes_read], bytes_read) != .ok) {
-            // #2354 diagnostic: which side of the copy_out contract refused —
-            // region validation (covers=false) or the demand-page resolver
-            // (covers=true, populate_fail_reason names the refusal).
-            const covers = uaccess.write_region_covers(buf_ptr, bytes_read);
-            var kbuf: [160]u8 = undefined;
-            const s = std.fmt.bufPrint(&kbuf, "fileread: EFAULT pid={d} fd={d} buf=0x{x} len={d} covers={} populate_why={d} populate_va=0x{x} populate_pid={d}\n", .{ pid, fd, buf_ptr, bytes_read, covers, exceptions.populate_fail_reason, exceptions.populate_fail_va, exceptions.populate_fail_pid }) catch "fileread: EFAULT\n";
-            klog.line(s);
-            // Dump the task's armed write regions + the process's registered
-            // mmap regions so the missing range is visible, not inferred.
-            {
-                const cur_task = scheduler.current_id();
-                const bytask = process.find_by_task(cur_task);
-                const s9 = std.fmt.bufPrint(&kbuf, "fileread:   task={d} find_by_task={?d}\n", .{ cur_task, bytask }) catch null;
-                if (s9) |ss| klog.line(ss);
-                var li: usize = 0;
-                while (li < 26) : (li += 1) {
-                    const r = uaccess.debug_write_region(li);
-                    if (r.len == 0) break;
-                    const s2 = std.fmt.bufPrint(&kbuf, "fileread:   wr[{d}] 0x{x}..0x{x}\n", .{ li, r.base, r.base + r.len }) catch break;
-                    klog.line(s2);
-                }
-                var mi: usize = 0;
-                while (process.mmap_region_at(pid, mi)) |mr| : (mi += 1) {
-                    if (mr.len == 0) continue;
-                    const s3 = std.fmt.bufPrint(&kbuf, "fileread:   mmap[{d}] 0x{x}..0x{x} prot={d}\n", .{ mi, mr.base_va, mr.base_va + mr.len, mr.prot }) catch break;
-                    klog.line(s3);
-                }
-            }
-            return error_result(.efault);
-        }
+        if (uaccess.copy_out(buf_ptr, read_staging[0..bytes_read], bytes_read) != .ok) return error_result(.efault);
         if (file_table.is_stream(fd)) file_table.stream_advance(pid, fd, bytes_read);
         if (file_table.is_contained(pid, fd)) file_table.contained_advance(pid, fd, bytes_read);
     }

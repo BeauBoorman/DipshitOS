@@ -75,12 +75,14 @@ gate-list:
 # machine — plus GOBIG.ELF (M70c-K #1504: the 9.5 MiB image go-hello run 02
 # streams, which the old 2 MiB staging bound refused), GOREAD.ELF (M70c
 # #1455: the share-read measurement, go-hello run 04), GOSYSCALL.ELF
-# (M70c-S1L #1540: the os/fmt fixture, go-hello run 05) and GOSELFHOST.ELF
+# (M70c-S1L #1540: the os/fmt fixture, go-hello run 05), GOBIGREAD.ELF
+# (#2354: the region-straddle large-read fixture, go-hello run 13) and
+# GOSELFHOST.ELF
 # (M70c-S2 #1544: the in-guest build-loop driver, live-selfhost-go). First run takes
 # several minutes (one Go make.bash pass; the second cross-std pass is
 # phase-2 opt-in via GOVIRELAI_STD=1).
 go-toolchain:
-    bash tools/go/build-go.sh tools/go/hello.go tools/go/goargs.go tools/go/goroutines.go tools/go/gostress.go tools/go/gopanic.go tools/go/gowin.go tools/go/gonet.go tools/go/govinet.go tools/go/govidns.go tools/go/smpscale.go tools/go/gobig.go tools/go/goloadbss.go tools/go/goread.go tools/go/gosyscall.go tools/go/selfhost.go
+    bash tools/go/build-go.sh tools/go/hello.go tools/go/goargs.go tools/go/goroutines.go tools/go/gostress.go tools/go/gopanic.go tools/go/gowin.go tools/go/gonet.go tools/go/govinet.go tools/go/govidns.go tools/go/smpscale.go tools/go/gobig.go tools/go/goloadbss.go tools/go/goread.go tools/go/gosyscall.go tools/go/gobigread.go tools/go/selfhost.go
 
 # Build the phase-2 netpoll + os.File/net.Conn fixture (issue #1163):
 # .build/go/GONET.ELF. HOST PREREQUISITE for the go-net class-B gate.
