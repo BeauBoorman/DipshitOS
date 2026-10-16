@@ -46,12 +46,12 @@ func run(args []string) int {
 	}
 	a, ra := vi.ReadFileAll(paths[0], vi.MaxFileBytes)
 	if ra < 0 {
-		vi.ConsoleLine("godiff: cannot read " + paths[0])
+		vi.ConsoleLine("godiff: read " + paths[0] + " refused rc=" + strconv.Itoa(int(ra)))
 		return 3
 	}
 	b, rb := vi.ReadFileAll(paths[1], vi.MaxFileBytes)
 	if rb < 0 {
-		vi.ConsoleLine("godiff: cannot read " + paths[1])
+		vi.ConsoleLine("godiff: read " + paths[1] + " refused rc=" + strconv.Itoa(int(rb)))
 		return 3
 	}
 	text, differ, tooBig := Diff(string(a), string(b), ctx)
@@ -60,7 +60,7 @@ func run(args []string) int {
 		return 4
 	}
 	if !differ {
-		vi.ConsoleLine("godiff: files identical")
+		vi.ConsoleLine("godiff: " + paths[0] + " and " + paths[1] + " are identical")
 		return 0
 	}
 	vi.ConsoleLine("--- " + paths[0])

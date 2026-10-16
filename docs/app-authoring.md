@@ -449,7 +449,19 @@ The build leg is pinned by
 [`live-gobuild`](../tools/gate/specs/live-gobuild.spec); the FLINT verbs
 by [`go-flint`](../tools/gate/specs/go-flint.spec); the whole
 init→edit→add→diff→commit→push→host-verify round-trip by
-[`live-flint-loop`](../tools/gate/specs/live-flint-loop.spec).
+[`live-flint-loop`](../tools/gate/specs/live-flint-loop.spec). The
+capstone — a real app (GODIFF, a unified context diff) authored through
+GOEDIT, built by in-guest GOBUILD, run, committed and pushed by FLINT,
+verified byte-for-byte and cryptographically on the host — is pinned by
+[`live-godiff-loop`](../tools/gate/specs/live-godiff-loop.spec).
+
+Two share-transport facts matter for `flint push` specifically: FLINT's
+store index resolves `--stream=<name>` by listing `FLINT/streams/`, and
+the legacy cv channel's frozen directory rows truncate names at 31
+bytes — a `<uuid>.json` record is 41, so on a cv-only share the push
+refuses `stream_missing`. Mount the share with `--virtio-fs` (the paged
+listing backend) for push legs. The `vf ls` monitor command shows what
+the guest's readdir actually sees; a truncated tail is the tell.
 
 Before opening a PR, run the focused host tests, the app's class-B gate,
 `bash tools/status/verify-issue-coordination.sh`, and the relevant portable

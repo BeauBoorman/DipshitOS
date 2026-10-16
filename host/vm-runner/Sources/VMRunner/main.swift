@@ -848,6 +848,14 @@ final class NetTcpSrvConn {
     var relayTemplate: [UInt8] = []
     var relayGuestNext: UInt32 = 0
     var relayGuestAck: UInt32 = 0
+    // M107e (#2322): the byte count of guest->upstream stream space already
+    // forwarded (cumulative expected sequence). The guest's bounded TCP
+    // stack retransmits a data segment when the paced reply path lags its
+    // RTO; the old relay wrote every segment's payload unconditionally, so
+    // each retransmission duplicated bytes into the real server — a dup
+    // inside a multi-segment request corrupts the NDJSON frame (observed:
+    // live-godiff-loop's push mangled `append` into flintd's "unknown").
+    var relayGuestDataNext: UInt32 = 0
     var closed = false
     let lock = NSLock()
 }
@@ -2496,6 +2504,7 @@ if let netCapturePath {
                     let conn = NetTcpSrvConn()
                     if let old = netTcpSrvConns[connKey] { old.relayShutdown() }
                     netTcpSrvConns[connKey] = conn
+                    conn.relayGuestDataNext = seq &+ 1 // SYN consumes one sequence number
                     if netTcpRespondRelayMode, netTcpRespondRelayPort != nil {
                         // M51 interop (#1209): a fresh connection dials the
                         // real upstream NOW — real sshd sends its banner
@@ -2558,9 +2567,30 @@ if let netCapturePath {
                         conn.relaySaveTemplate(buf, n)
                         conn.lock.lock()
                         let upfd = conn.relayFd
+                        // M107e (#2322): forward only bytes past the
+                        // connection's contiguous guest sequence — the
+                        // guest's bounded TCP stack retransmits a data
+                        // segment when the paced reply lags its RTO, and
+                        // writing every segment's payload unconditionally
+                        // duplicated bytes into the real server.
+                        var fwd = payload
+                        let segEnd = seq &+ UInt32(payload.count)
+                        if conn.relayGuestDataNext == 0 {
+                            conn.relayGuestDataNext = segEnd
+                        } else {
+                            let overlap = conn.relayGuestDataNext &- seq
+                            if overlap >= UInt32(payload.count) {
+                                fwd = []
+                            } else {
+                                if overlap > 0 { fwd = Array(payload[Int(overlap)...]) }
+                                if conn.relayGuestDataNext &- segEnd > 0x8000_0000 {
+                                    conn.relayGuestDataNext = segEnd
+                                }
+                            }
+                        }
                         conn.lock.unlock()
-                        if upfd >= 0 {
-                            let wr = payload.withUnsafeBufferPointer { p in
+                        if upfd >= 0 && !fwd.isEmpty {
+                            let wr = fwd.withUnsafeBufferPointer { p in
                                 write(upfd, p.baseAddress, p.count)
                             }
                             if wr < 0 {
@@ -6546,11 +6576,18 @@ extension NetTcpSrvConn {
     // thread would time it out). `GuestNext` is the ACK value our next
     // segment must carry. Saved under the connection's lock.
     func relaySaveTemplate(_ buf: [UInt8], _ n: Int) {
-        let payload = n > 54 ? n - 54 : 0
+        // Same data-offset rule the caller uses (M99h): TCP options push
+        // the payload past the fixed 54-byte header.
+        let dataOff = n >= 54 ? 34 + max(5, Int(buf[46] >> 4)) * 4 : n
+        let payload = n > dataOff ? n - dataOff : 0
         lock.lock()
         relayTemplate = Array(buf[0..<n])
-        relayGuestNext = tcpSeq(buf) &+ UInt32(payload)
-        relayGuestAck = tcpAck(buf)
+        // A retransmitted segment carries the seq/ack of its ORIGINAL send:
+        // both cursors stay monotonic or the paced pump reads a stale ack
+        // (`srvNxt == relayGuestAck` never true again) and the connection
+        // stalls into the guest's read timeout — the run-08 ETIMEDOUT.
+        relayGuestNext = max(relayGuestNext, tcpSeq(buf) &+ UInt32(payload))
+        relayGuestAck = max(relayGuestAck, tcpAck(buf))
         lock.unlock()
     }
 

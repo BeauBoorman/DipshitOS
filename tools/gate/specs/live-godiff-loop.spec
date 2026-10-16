@@ -102,6 +102,9 @@ EOF
 vgate_file script-push.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
+vf ls
+vf ls FLINT
+vf ls FLINT/streams
 exec GOSH.ELF -c "source /host/PUSH.SH"
 EOF
 
@@ -205,10 +208,17 @@ open(os.path.join(share, "COMMIT2.SH"), "w").write(
     "echo COMMIT2-DONE\n")
 open(os.path.join(share, "BUILD.SH"), "w").write(
     "GOBUILD.ELF /host/GODIFF -o /host/GODIFF.ELF\n"
+    # go-flint's sequential-exec spacing: a just-built image exec'd on the
+    # very next line can lose the reclamation/FUSE-lookup race (observed:
+    # `gosh: GODIFF.ELF: not found` right after `build OK`).
+    "sleep 1\n"
     "GODIFF.ELF /host/DA.TXT /host/DB.TXT\n"
     "echo BUILD-RUN-DONE\n")
 open(os.path.join(share, "PUSH.SH"), "w").write(
+    "FLINT.ELF status\n"
+    "FLINT.ELF log\n"
     "FLINT.ELF push --remote=10.0.0.2:4748 --stream=main\n"
+    "sleep 1\n"
     "FLINT.ELF push\n"
     "echo PUSH-DONE\n")
 
@@ -370,20 +380,20 @@ if got != want:
 print("run-01: diff.go authored byte-identical through GOEDIT pastes")
 PY
 
-# ---- 02: GOEDIT authors main.go (4 chunks) -----------------------------------
+# ---- 02: GOEDIT authors main.go (5 chunks) -----------------------------------
 vgate_run 02 -- \
     --screen '$RUN_DIR/screen-02' \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-open-main.txt' --script2-after 'gotabwm: hostint armed' \
     --host-clipboard --host-pasteboard 'virelai-gate-godiff' \
     --via-virtio \
-    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
+    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
     --input-chords-after 'gotabwm: hostint clip-in seq=1' \
     --script-expect 'goedit: saved /host/GODIFF/main.go' --script-expect-tail 4 \
     --timeout 240
 
-vgate_assert 02 serial-count 'gotabwm: hostint clip-in seq=' 4
-vgate_assert 02 serial-count 'goedit: paste n=' 4
+vgate_assert 02 serial-count 'gotabwm: hostint clip-in seq=' 5
+vgate_assert 02 serial-count 'goedit: paste n=' 5
 vgate_assert 02 serial-contains 'goedit: saved /host/GODIFF/main.go'
 vgate_assert 02 serial-absent '[EXC] parking:'
 vgate_assert 02 python <<'PY'
@@ -414,6 +424,23 @@ vgate_assert 03 serial-count 'gotabwm: hostint clip-in seq=' 5
 vgate_assert 03 serial-count 'goedit: paste n=' 5
 vgate_assert 03 serial-contains 'goedit: saved /host/GODIFF/diff_test.go'
 vgate_assert 03 serial-absent '[EXC] parking:'
+vgate_assert 03 python <<'PY'
+import os, shutil, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+# Gate hygiene: every boot in this spec is killed mid-session, so the
+# advisory write leases (M81d) GOEDIT takes at open are never released —
+# and the next boot's pid space restarts from scratch while the guest
+# epoch barely advances between boots, so a previous run's record reads
+# live forever (observed: run 05's `goedit: save error ... -11` from a
+# lease run 03's killed VM left on /host/GODIFF/diff_test.go). A real
+# user's crashed-editor record expires in 30 s; here the lease root is
+# cleared between boots, which is exactly that expiry.
+leases = os.path.join(share, "LEASES")
+if os.path.isdir(leases):
+    shutil.rmtree(leases)
+print("run-03: cleared leftover LEASES state for the next boot")
+PY
 
 # ---- 04: in-guest add + commit (Change 1) ------------------------------------
 # Seat-less: GOSH sources the two-step journey so add finishes before
@@ -455,8 +482,13 @@ print("run-05: diff_test.go now byte-identical after the append edit")
 PY
 
 # ---- 06: GOBUILD.ELF builds the authored tree; the product diffs ------------
+# --virtio-fs for the link: the in-guest GOCMDLINK reads ~12 MiB of GPKG
+# archives; a mid-stream read fault (`read /host/GPKG_runtime.a: bad
+# address`, ~4.4 MiB in) was observed on the pure cv channel, while the
+# same link under virtio-fs links clean. live-gobuild covers cvc builds.
 vgate_run 06 -- \
     --script '$RUN_DIR/script-buildrun.txt' \
+    --virtio-fs '$RUN_DIR/share' \
     --script-expect 'BUILD-RUN-DONE' --script-expect-tail 5 --timeout 600
 
 vgate_assert 06 serial-contains 'gobuild: build OK'
@@ -488,13 +520,22 @@ vgate_assert 07 serial-contains 'flint: commit ok id='
 vgate_assert 07 serial-absent '[EXC] parking:'
 
 # ---- 08: push to flintd; host verifies the all-guest history -----------------
+# This leg mounts --virtio-fs on the armed share because FLINT's store index
+# lists streams/ for name->record resolution: the slot-79 paged listing is
+# virtiofs-only (virtio_file.metadata_backend refuses the cv channel), and
+# the v1 DirList fallback truncates names at 31 bytes, which hides
+# `streams/<uuid>.json` (41 chars) -> `flint: refuse stream_missing`. Earlier
+# legs stay pure cv like every seat spec (the FUSE-session/exec-lookup race
+# documented in go-shell-polish.spec); only push needs name-faithful listing.
 vgate_run 08 -- \
     --net '$RUN_DIR/cap08.bin' --net-arp-respond 10.0.0.2 \
     --net-tcp-respond 10.0.0.2:4748:relay --net-tcp-respond-relay 127.0.0.1:4748 \
     --script '$RUN_DIR/script-push.txt' \
+    --virtio-fs '$RUN_DIR/share' \
     --script-expect 'PUSH-DONE' --script-expect-tail 4 --timeout 300
 
 vgate_assert 08 serial-contains 'flint: push ok stream=main changes=2'
+vgate_assert 08 serial-contains 'flint: push up to date'
 vgate_assert 08 serial-absent '[EXC] parking:'
 vgate_assert 08 python <<'PY'
 import glob, json, os, subprocess, sys
