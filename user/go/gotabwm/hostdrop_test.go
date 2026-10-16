@@ -1,0 +1,111 @@
+package main
+
+import (
+	"strings"
+	"testing"
+
+	"virelai/hostint"
+)
+
+// plantDrop stages a valid runner DROP record: payload [name_len u8]
+// [name][size u64le], signed under the fixture key.
+func (f *hostintFixture) plantDrop(epoch, seq uint32, name string, size uint64) {
+	p := make([]byte, 0, 1+len(name)+8)
+	p = append(p, byte(len(name)))
+	p = append(p, name...)
+	for i := 0; i < 8; i++ {
+		p = append(p, byte(size>>(8*i)))
+	}
+	f.files[hostint.RecordName(hostint.TagDrop, seq)] =
+		hostint.EncodeRecord(f.key, hostint.TagDrop, 0, seq, epoch, p)
+}
+
+func TestHostdropConsumeToasts(t *testing.T) {
+	resetNotify(t)
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(0xBEEF, hostint.LaneDrop)
+	hostintSeatTick()
+	if !f.hasLog(hostintMarkerPrefix+" armed epoch=48879 lanes=drop") {
+		t.Fatalf("missing armed marker: %v", f.logs)
+	}
+
+	f.plantDrop(0xBEEF, 1, "PHOTO.QOI", 4100)
+	hostintSeatTick()
+	if !f.hasLog(MarkerHostintDrop+"seq=1 name=PHOTO.QOI size=4100") {
+		t.Fatalf("missing drop marker: %v", f.logs)
+	}
+	if !f.hasLog("gotabwm: notify id=0 host drop: PHOTO.QOI") {
+		t.Fatalf("missing notify marker: %v", f.logs)
+	}
+	if len(notifyQueue) != 1 || notifyQueue[0].text != "host drop: PHOTO.QOI" {
+		t.Fatalf("toast queue = %+v", notifyQueue)
+	}
+	if notifyQueue[0].tabID != 0 {
+		t.Fatal("drop toast carries a sender id — click must dismiss, not focus")
+	}
+	// A stale DROP on the next tick is a named refusal, never a toast.
+	f.plantDrop(0xBEEF, 1, "PHOTO.QOI", 4100)
+	hostintSeatTick()
+	if !f.hasLog("lane=drop reason="+hostint.RefuseStaleSeq) {
+		t.Fatalf("missing stale_seq refusal: %v", f.logs)
+	}
+	if len(notifyQueue) != 1 {
+		t.Fatalf("stale record produced a toast: %+v", notifyQueue)
+	}
+}
+
+func TestHostdropBadPayloadRefused(t *testing.T) {
+	resetNotify(t)
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(9, hostint.LaneDrop)
+	hostintSeatTick()
+	// A signed record whose payload does not decode: name_len overruns.
+	p := append([]byte{200}, []byte("short")...)
+	f.files[hostint.RecordName(hostint.TagDrop, 1)] =
+		hostint.EncodeRecord(f.key, hostint.TagDrop, 0, 1, 9, p)
+	hostintSeatTick()
+	if !f.hasLog("lane=drop reason="+hostint.RefuseBadRecord) {
+		t.Fatalf("missing bad_record refusal: %v", f.logs)
+	}
+	if len(notifyQueue) != 0 {
+		t.Fatalf("malformed record produced a toast: %+v", notifyQueue)
+	}
+}
+
+func TestHostdropConsentDeniedWithoutLaneBit(t *testing.T) {
+	resetNotify(t)
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	// A clip-only ARMED: a signed DROP against an unarmed lane is the
+	// ADR's consent_denied, never a toast.
+	f.plantArmed(7, hostint.LaneClip)
+	hostintSeatTick()
+	f.plantDrop(7, 1, "SNEAK.QOI", 12)
+	hostintSeatTick()
+	if !f.hasLog("lane=drop reason="+hostint.RefuseConsent) {
+		t.Fatalf("missing consent_denied refusal: %v", f.logs)
+	}
+	if len(notifyQueue) != 0 {
+		t.Fatalf("unarmed lane produced a toast: %+v", notifyQueue)
+	}
+}
+
+func TestDropPayloadDecode(t *testing.T) {
+	name, size, ok := dropPayload([]byte("\x03ABC\x01\x00\x00\x00\x00\x00\x00\x00"))
+	if !ok || name != "ABC" || size != 1 {
+		t.Fatalf("dropPayload = %q %d %v", name, size, ok)
+	}
+	for _, p := range [][]byte{
+		{},                       // empty
+		{0},                      // zero name_len alone
+		{2, 'A'},                 // truncated name
+		{1, 'A', 1, 2, 3},        // short size field
+		{1, 'A', 1, 2, 3, 4, 5, 6, 7, 8, 9}, // trailing byte
+	} {
+		if _, _, ok := dropPayload(p); ok {
+			t.Fatalf("dropPayload(%x) decoded a malformed payload", p)
+		}
+	}
+}

@@ -109,12 +109,10 @@ func hostclipPoll() {
 		" len=" + vi.Itoa64(int64(n)) + " sha=" + hostint.HexDigest8(sum[:]))
 }
 
-// hostclipApply is the engine's Consume hook for seat-inbound records —
-// M108b implements CLIP_IN; later cards' tags are refused by name.
-func hostclipApply(tag uint8, rec hostint.Record) string {
-	if tag != hostint.TagClipIn {
-		return hostint.RefuseLaneDisabled
-	}
+// hostclipApply is the CLIP_IN tenant of hostintConsume — the engine's
+// per-tag dispatch (hostint.go) routes here; other tags live in their own
+// lane files.
+func hostclipApply(rec hostint.Record) string {
 	if !utf8.Valid(rec.Payload) {
 		return hostint.RefuseNotText
 	}

@@ -21,10 +21,11 @@ import Foundation
 // lane dead (fail closed per lane, never a boot failure).
 
 final class HostClipboard {
-    private let laneDir: URL
+    private let session: HostIntSession
+    private var laneDir: URL { session.laneDir }
+    private var key: Data { session.key }
+    private var epoch: UInt32 { session.epoch }
     private let board: NSPasteboard
-    private var key: Data?
-    private var epoch: UInt32 = 0
     private var armed = false
 
     private var clipInSeq: UInt32 = 0       // next outbound CLIP_IN seq
@@ -33,8 +34,8 @@ final class HostClipboard {
     private var echoGuard: String?          // the last string this lane wrote
     private var ioLogged = Set<String>()    // one io_error per filename
 
-    init(shareDir: URL, pasteboardName: String?) {
-        laneDir = HostInt.laneDir(shareDir: shareDir)
+    init(session: HostIntSession, pasteboardName: String?) {
+        self.session = session
         if let name = pasteboardName {
             board = NSPasteboard(name: NSPasteboard.Name(name))
         } else {
@@ -42,43 +43,19 @@ final class HostClipboard {
         }
     }
 
-    /// Arm the lane: create HOSTINT/, load the credential, mint the epoch,
-    /// publish the one ARMED record. A missing/malformed credential refuses
-    /// `no_credential` and the lane stays dead — the boot continues.
-    /// Returns true when the lane is live.
-    @discardableResult
-    func arm(shareDir: URL) -> Bool {
-        guard let key = HostInt.loadKey(shareDir: shareDir) else {
-            HostInt.logRefuse(lane: "clip", reason: .noCredential)
-            return false
-        }
-        do {
-            try FileManager.default.createDirectory(at: laneDir, withIntermediateDirectories: true)
-        } catch {
-            HostInt.logRefuse(lane: "clip", reason: .ioError)
-            return false
-        }
-        self.key = key
-        epoch = UInt32.random(in: 1...UInt32.max)
-        guard let rec = HostInt.encode(tag: .armed, flags: 0, seq: 1, epoch: epoch,
-                                       payload: Data([HostInt.laneClip]), key: key),
-              HostInt.publish(laneDir: laneDir, name: HostInt.recordName(tag: .armed, seq: 1), body: rec)
-        else {
-            HostInt.logRefuse(lane: "clip", reason: .ioError)
-            return false
-        }
-        HostInt.logArmed(mask: HostInt.laneClip, epoch: epoch)
-        // The changeCount baseline is sampled at arm: only bumps from here
-        // are lane events (a gate stages the named board AFTER arming).
+    /// Begin the lane on an already-armed session: the ARMED record naming
+    /// the clip bit is published, so all that remains is the pasteboard
+    /// baseline — only changeCount bumps from here are lane events (a gate
+    /// stages the named board AFTER arming).
+    func start() {
         lastChangeCount = board.changeCount
         armed = true
-        return true
     }
 
     /// The 250 ms poll step: drain CLIP_OUT (guest→host), then check the
     /// pasteboard (host→guest). Both halves run every tick while armed.
     func tick() {
-        guard armed, let key else { return }
+        guard armed else { return }
         drainClipOut(key: key)
         pollPasteboard(key: key)
     }

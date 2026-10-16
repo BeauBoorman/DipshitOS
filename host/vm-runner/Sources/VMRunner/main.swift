@@ -70,6 +70,17 @@
 //          (test hook: write <text> to the lane pasteboard once <marker>
 //          appears — a real changeCount bump the ordinary path then
 //          carries in. Default trigger: `gotabwm: hostint armed`.)
+//         [--host-drop] (M108c #2326, ADR 0051 D4: the host→guest file-drop
+//          lane — the display view registers .fileURL; dropped files land
+//          in <share>/INBOX/ via temp+rename (≤64 MiB/file, ≤16/gesture)
+//          and a signed DROP record announces each for the seat's toast.
+//          Requires --cvc-file, the `host-int` SECRETS.TXT row, and a
+//          display path; OFF by default — no INBOX/, no drag target, no
+//          records.)
+//         [--host-drop-file <path>] [--host-drop-after <marker>]
+//          (test hook: feed <path> through the real drop handler once
+//          <marker> appears — repeatable for multi-file gestures.
+//          Default trigger: `gotabwm: hostint armed`.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -590,6 +601,21 @@ var hostClipInText: String?
 var hostClipInAfter: String?
 var hostClipInFired = false
 var hostClipboard: HostClipboard?
+// M108c (#2326, ADR 0051 D4): `--host-drop` arms the file-drop lane — the
+// display view registers .fileURL, dropped files land in <share>/INBOX/
+// (≤64 MiB/file, ≤16/gesture) and each gets a signed DROP notice the seat
+// toasts. `--host-drop-file`/`--host-drop-after` are the marker-timed test
+// hook: feed a host path through the SAME handler the NSView drop calls
+// (repeatable — a multi-file gesture is one call).
+var hostDropFlag = false
+var hostDropFiles: [String] = []
+var hostDropAfter: String?
+var hostDropFired = false
+var hostDrop: HostDrop?
+// The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
+// ARMED record naming every live lane — the seat adopts (epoch, mask), so
+// per-lane epochs would refuse each other stale_epoch forever.
+var hostIntSession: HostIntSession?
 // HF3 (issue #737): the mutation verbs ride an 8-slot host handle table
 // (parity with the kernel's file_table.zig — cursors live HERE, not in
 // the guest). VZ-free class lives in the VFWire module.
@@ -1270,6 +1296,18 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--host-clip-in-after", idx + 1 < arguments.count {
         hostClipInAfter = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--host-drop" {
+        // M108c (#2326, ADR 0051 D4): the host→guest file-drop lane —
+        // INBOX/ writes + signed DROP notices over the same share. Does
+        // NOT touch the queue shape either.
+        hostDropFlag = true
+        idx += 1
+    } else if arg == "--host-drop-file", idx + 1 < arguments.count {
+        hostDropFiles.append(arguments[idx + 1])
+        idx += 2
+    } else if arg == "--host-drop-after", idx + 1 < arguments.count {
+        hostDropAfter = arguments[idx + 1]
         idx += 2
     } else if arg == "--cvc-console-file", idx + 1 < arguments.count {
         // Claim 0680: structured console — capture every queue-1 guest log
@@ -2197,6 +2235,24 @@ if hostClipboardFlag || hostPasteboardName != nil || hostClipInText != nil || ho
         hostClipInAfter = "gotabwm: hostint armed"
     }
 }
+// M108c (#2326, ADR 0051 D6): the drop lane is the same shape — a modifier
+// on --cvc-file, its hooks modifiers on the lane.
+if hostDropFlag || !hostDropFiles.isEmpty || hostDropAfter != nil {
+    guard hostDropFlag else {
+        fail("--host-drop-file/--host-drop-after are modifiers on --host-drop (no lane to inject into).")
+    }
+    guard cvcFileEnabled else {
+        fail("--host-drop requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
+    }
+    if hostDropAfter != nil, hostDropFiles.isEmpty {
+        fail("--host-drop-after requires --host-drop-file <path> (there is no drop to schedule).")
+    }
+    if !hostDropFiles.isEmpty, hostDropAfter == nil {
+        // Default trigger, same shape as --host-clip-in: fire once the
+        // seat has adopted the lane's epoch.
+        hostDropAfter = "gotabwm: hostint armed"
+    }
+}
 // Claim 9367: --pointer-virtio rides the four-queue device; the after-marker
 // only makes sense with a sequence to schedule.
 if pointerVirtioScript == nil, pointerVirtioAfter != nil {
@@ -2970,21 +3026,47 @@ if netNatEnabled {
     print("  net-nat: ENABLED (milestone five card N7, claim 4678) — VZNATNetworkDeviceAttachment attached (host router + NAT; no capture file — guest-observed counters are the gate's evidence)")
 }
 
-// M108b (#2325, ADR 0051): arm the clipboard lane BEFORE the VM starts —
+// M108 (#2325/#2326, ADR 0051): arm the live lanes BEFORE the VM starts —
 // the ARMED record lands in the share now, so the seat's first poll after
-// boot already verifies it. No flag → no HOSTINT/, no records, no
-// pasteboard read (D7's byte-silence: a flags-off boot is identical to
-// today). A refused arm (no credential, broken share) is a dead lane, not
-// a failed boot.
-if hostClipboardFlag {
+// boot already verifies it. The session is SHARED: one credential, one
+// epoch, one ARMED record naming every live lane in its mask. No flag →
+// no HOSTINT/, no INBOX/, no records, no pasteboard read (D7's
+// byte-silence: a flags-off boot is identical to today). A refused arm
+// (no credential, broken share) is dead lanes, not a failed boot.
+// The drop lane's display precondition (D4): the drop target is the
+// display view, so a headless runner refuses lane_disabled at arm and the
+// drop bit never enters the mask.
+if hostClipboardFlag || hostDropFlag {
     let shareURL = URL(fileURLWithPath: cvcFileShareDir!, isDirectory: true)
-    hostClipboard = HostClipboard(shareDir: shareURL, pasteboardName: hostPasteboardName)
-    if let lane = hostClipboard {
-        if lane.arm(shareDir: shareURL) {
+    var mask: UInt8 = 0
+    var requested: [String] = []
+    if hostClipboardFlag {
+        mask |= HostInt.laneClip
+        requested.append("clip")
+    }
+    var dropWanted = false
+    if hostDropFlag {
+        requested.append("drop")
+        if screenshotPath != nil || displayMode || hostSessionMode {
+            mask |= HostInt.laneDrop
+            dropWanted = true
+        } else {
+            HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
+        }
+    }
+    if mask != 0 {
+        hostIntSession = HostIntSession.arm(shareDir: shareURL, mask: mask, requested: requested)
+    }
+    if let session = hostIntSession {
+        if hostClipboardFlag {
+            hostClipboard = HostClipboard(session: session, pasteboardName: hostPasteboardName)
+            hostClipboard?.start()
             DispatchQueue.main.async { hostIntTick() }
         }
-    } else {
-        HostInt.logRefuse(lane: "clip", reason: .ioError)
+        if dropWanted {
+            hostDrop = HostDrop(session: session)
+            hostDrop?.start()
+        }
     }
 }
 
@@ -3084,6 +3166,13 @@ func setupDisplayWindow() {
         options: [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .activeAlways],
         owner: view, userInfo: nil)
     view.addTrackingArea(tracking)
+    // M108c (#2326, ADR 0051 D4): the drop target lives here, on the display
+    // view itself — registered only while the lane is armed, so a flags-off
+    // boot shows no affordance.
+    if hostDrop != nil {
+        view.registerForDraggedTypes([.fileURL])
+        view.dropHandler = { urls in hostDrop?.drop(urls: urls) }
+    }
     window.orderFrontRegardless()
     window.makeKeyAndOrderFront(nil)
     if hostSessionMode {
@@ -3717,6 +3806,24 @@ func fireHostClipInIfMarker(_ text: String) {
     guard let lane = hostClipboard else { return }
     let cc = lane.inject(body)
     FileHandle.standardOutput.write(Data("host-clip: inject len=\(body.utf8.count) changeCount=\(cc) after \"\(marker)\"\n".utf8))
+}
+
+// M108c (#2326, ADR 0051 D6): marker-driven file drop (`--host-drop-file` +
+// `--host-drop-after`). When the marker appears in the serial stream the
+// listed paths go through HostDrop.drop — the SAME function the NSView's
+// performDragOperation calls — so a class-B run exercises the real handler:
+// sanitize, caps, temp+rename into INBOX/, then the signed DROP notices.
+// Fires once; the marker names a file COUNT, never contents (never-logged).
+func fireHostDropIfMarker(_ text: String) {
+    guard let marker = hostDropAfter, !hostDropFired, !hostDropFiles.isEmpty,
+          text.contains(marker) else { return }
+    hostDropFired = true
+    guard let lane = hostDrop else {
+        HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
+        return
+    }
+    FileHandle.standardOutput.write(Data("host-drop: inject files=\(hostDropFiles.count) after \"\(marker)\"\n".utf8))
+    lane.drop(urls: hostDropFiles.map { URL(fileURLWithPath: $0) })
 }
 
 // M81f (#1766): marker-driven host-side share mutation. When the
@@ -4613,6 +4720,10 @@ func startChordInject() {
 final class TraceView: VZVirtualMachineView {
     var trace = false
     var nativeInput = false
+    /// M108c (#2326, ADR 0051 D4): the file-drop surface. Set only when
+    /// --host-drop armed the lane AND this view registered .fileURL — a
+    /// flags-off view never advertises a drop affordance.
+    var dropHandler: (([URL]) -> Void)?
     private var nativeKeyLogged = false
     private var nativeClickLogged = false
 
@@ -4660,6 +4771,24 @@ final class TraceView: VZVirtualMachineView {
     override func mouseEntered(with event: NSEvent) {
         if trace { pmo("TRACE mouseEntered") }
         super.mouseEntered(with: event)
+    }
+
+    // NSDraggingDestination: the drop lands ONLY while the lane armed this
+    // surface — the copy cursor is the affordance, and the URLs go through
+    // the one handler --host-drop-file also calls (ADR 0051 D4's "same
+    // function" rule).
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard dropHandler != nil else { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let handler = dropHandler else { return false }
+        let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        handler(urls)
+        return true
     }
 }
 
@@ -6632,6 +6761,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     fireSnapshotsIfMarker(lastText)
     fireHostWriteIfMarker(lastText)
     fireHostClipInIfMarker(lastText)
+    fireHostDropIfMarker(lastText)
     // Fix 3: the liveness heartbeat — unbuffered stderr every 30 s.
     if Date().timeIntervalSince(scriptPollLastBeat) >= 30 {
         scriptPollLastBeat = Date()
