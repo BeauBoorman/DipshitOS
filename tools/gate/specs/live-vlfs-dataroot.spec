@@ -96,7 +96,7 @@ echo rx-dataroot-absent-ok
 EOF
 
 vgate_file disk-receipt.expected <<'EOF'
-case disk mounted=yes path=SELFTEST/DISK.TXT wrote=420 fsync=0 read=420 match=yes
+case disk mounted=yes path=SELFTEST/DISK.TXT wrote=441 fsync=0 read=441 match=yes
 EOF
 
 vgate_file host-history.expected <<'EOF'
@@ -121,6 +121,29 @@ fm = os.path.join(share, "FM")
 os.makedirs(fm, exist_ok=True)
 with open(os.path.join(fm, "KNOWN.TXT"), "w") as f:
     f.write("hello-from-gofiles\npreview-line-alpha\npreview-line-beta\n")
+# GOSELF runs its FULL battery in run B — the same SELFTEST tree
+# go-selftest.spec seeds, or every receipt write under OUT/ dies at the
+# host's missing-parent refusal (a silent stHostError, -1 guest-side) and
+# the intake cases' IN/ fixtures read ENOENT.
+st = os.path.join(share, "SELFTEST")
+for d in ("IN", "OUT"):
+    os.makedirs(os.path.join(st, d), exist_ok=True)
+for name, body in (("fixture.txt", b"goself intake fixture v1\n"),
+                   ("altered.txt", b"goself intake fixture v2\n")):
+    with open(os.path.join(st, "IN", name), "wb") as fh:
+        fh.write(body)
+snap_docs = os.path.join(st, "IN", "snapshot-docs")
+os.makedirs(snap_docs, exist_ok=True)
+for name, body in (
+        ("snapshot-settings.txt", b"#v2\ntheme=amber\nwm=gotabwm\n"),
+        ("snapshot-session.tabs",
+         bytes([0x54, 0x41, 0x42, 0x53, 0x00, 0x02, 0x00, 0x0a,
+                0xff, 0xfe, 0x10, 0x20])),
+        (os.path.join("snapshot-docs", "NOTE.TXT"), b"goself snapshot note\n"),
+        (os.path.join("snapshot-docs", "SECOND.TXT"),
+         b"goself snapshot second document\n")):
+    with open(os.path.join(st, "IN", name), "wb") as fh:
+        fh.write(body)
 # Rebuild the golden empty 16 MiB VLFS image from its .regions description —
 # the same fixture live-vlfs-write.spec formats nothing from.
 img = None
