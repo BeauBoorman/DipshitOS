@@ -52,6 +52,7 @@ public final class NetTcpRelay {
         case gap                    // ahead of the in-order bound — dropped
         case closed                 // upstream EOF'd — dropped; buffered bytes + FIN still deliver
         case dead                   // no usable upstream — RST was emitted
+        case dialing                // upstream connect in flight — dropped; the guest retransmits
     }
 
     /// The Ethernet MTU's TCP payload bound — the largest single segment
@@ -70,7 +71,7 @@ public final class NetTcpRelay {
     /// that release-sized pulls (go-flint) never see the cap.
     public static let txHighWater = 262144
     /// The drain level that un-parks a reader stopped at `txHighWater`.
-    private static let txLowWater = txHighWater / 4
+    static let txLowWater = txHighWater / 4
 
     public var hostMAC: [UInt8] = [0x02, 0x00, 0x00, 0x00, 0x02]
     public var hostPort: UInt16 = 0
@@ -107,6 +108,10 @@ public final class NetTcpRelay {
     private var rstSent = false
     private var stallCount = 0
     private var dead = false
+    /// True while the reader thread's blocking connect is in flight —
+    /// guest payload is dropped (the guest retransmits) rather than
+    /// written to a half-dialed socket (#2377).
+    private var connecting = false
     /// False until `begin` ran (a lazy conn created by a stray segment
     /// answers RST — there is no handshake to continue).
     private var began = false
@@ -145,8 +150,12 @@ public final class NetTcpRelay {
     }
 
     /// Dial the real upstream and spawn the reader that appends real
-    /// bytes to the paced TX buffer. Only the reader closes its own fd
-    /// (a generation counter retires a previous reader without an
+    /// bytes to the paced TX buffer. The blocking connect() runs on the
+    /// reader thread, never the capture thread (#2377): a blackholed
+    /// upstream cannot stall ARP/DNS/DHCP/every other guest lane for
+    /// the OS connect timeout, and a failure is an immediate named RST
+    /// rather than a silent dead relay. Only the reader closes its own
+    /// fd (a generation counter retires a previous reader without an
     /// fd-reuse race).
     public func start(_ host: String, _ port: UInt16) {
         shutdown()
@@ -170,29 +179,51 @@ public final class NetTcpRelay {
             return
         }
         addr.sin_addr = a4
-        let rc = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(newFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard rc == 0 else {
-            onLog("NET-TCP-RELAY: upstream connect \(host):\(port) failed (errno \(errno)); the relay is dead for this connection")
-            close(newFd)
-            return
-        }
         lock.lock()
         gen += 1
         let myGen = gen
         fd = newFd
+        connecting = true
         upstreamClosed = false
         tx = []
         txOffset = 0
         lock.unlock()
-        onLog("NET-TCP-RELAY: upstream \(host):\(port) connected (real server; bytes proxied, no crypto here)")
         let reader = Thread { [weak self] in
+            // The dial lives here so the capture thread never parks on
+            // a blackholed upstream (#2377).
+            var wire = addr
+            let rc = withUnsafePointer(to: &wire) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    connect(newFd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard let self else { close(newFd); return }
+            self.lock.lock()
+            // A shutdown or a newer start() retired this dial while
+            // connect() was in flight — close it and go quietly.
+            guard myGen == self.gen, self.fd == newFd, !self.dead else {
+                self.lock.unlock()
+                close(newFd)
+                return
+            }
+            guard rc == 0 else {
+                let e = errno
+                self.connecting = false
+                self.upstreamClosed = true
+                // A dead upstream is an immediate named RST, not a
+                // silent sink the guest discovers on its next data
+                // segment (#2377).
+                self.emitResetLocked()
+                self.lock.unlock()
+                close(newFd)
+                self.onLog("NET-TCP-RELAY: upstream connect \(host):\(port) failed (errno \(e)); sent RST — the relay is dead for this connection")
+                return
+            }
+            self.connecting = false
+            self.lock.unlock()
+            self.onLog("NET-TCP-RELAY: upstream \(host):\(port) connected (real server; bytes proxied, no crypto here)")
             var buf = [UInt8](repeating: 0, count: 4096)
             while true {
-                guard let self else { close(newFd); return }
                 self.lock.lock()
                 var alive = myGen == self.gen && !self.dead && self.fd == newFd
                 let full = self.tx.count - self.txOffset >= Self.txHighWater
@@ -319,6 +350,13 @@ public final class NetTcpRelay {
             onLog("NET-TCP-RELAY: deduplicated a retransmitted guest segment (seq 0x\(hex32(seq)), \(payloadLen) bytes already delivered upstream)")
             return .duplicate
         }
+        if connecting {
+            // The dial runs on the reader thread; until it lands these
+            // bytes are dropped — the honest ack holds rcvNxt and the
+            // guest retransmits once the upstream is live (#2377).
+            onLog("NET-TCP-RELAY: dropped \(fresh) guest bytes — still dialing the upstream; the guest's retransmit lands once connected")
+            return .dialing
+        }
         guard fd >= 0, !dead else {
             if upstreamClosed {
                 // A graceful EOF: the buffered reply + FIN still deliver,
@@ -397,6 +435,15 @@ public final class NetTcpRelay {
         return sent
     }
 
+    /// Bytes buffered upstream->guest, still owed to the guest — the
+    /// high-water check's input. Internal for the test suite; the
+    /// runner watches the logs.
+    var pendingUpstreamBytes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return tx.count - txOffset
+    }
+
     /// Whether the connection was torn down (stall RST or dead-upstream
     /// RST); a bare ACK to a dead relay would only invite another.
     public var isDead: Bool {
@@ -421,7 +468,16 @@ public final class NetTcpRelay {
         let wnd = tcpWindow(buf)
         let adv = Int32(bitPattern: ack &- peerAck)
         if adv > 0 {
-            peerAck = ack
+            if Int32(bitPattern: ack &- srvNxt) > 0 {
+                // #2377: an ACK for bytes never sent earns no credit
+                // past send-next — RFC 793's "ACK of unsent data" is
+                // adopted as the window update it also is, never as the
+                // altitude it claims.
+                onLog("NET-TCP-RELAY: guest ack 0x\(hex32(ack)) ran \(Int32(bitPattern: ack &- srvNxt)) bytes past send-next 0x\(hex32(srvNxt)); clamped to the advertised window")
+                peerAck = srvNxt
+            } else {
+                peerAck = ack
+            }
             peerWnd = wnd
             stallCount = 0
         } else if adv == 0 {

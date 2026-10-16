@@ -425,53 +425,133 @@ final class NetTcpRelayTests: XCTestCase {
         _ = relay.pump()
         XCTAssertEqual(frameCount, 0)
 
-        // Non-blocking upstream writes run until the reader parks and
-        // the kernel's send buffer fills — the observable end of the
-        // backpressure reaching the socket. A transient EAGAIN while
-        // the reader is still running is retried; the cap is proven
-        // when the buffer sits at high-water AND the socket refuses.
+        // Non-blocking upstream writes feed the staging buffer until
+        // it sits at the cap. The buffer bound is asserted on
+        // pendingUpstreamBytes itself — the kernel's send-buffer size
+        // is autotuned and proves nothing on its own.
         let fl = fcntl(up, F_GETFL, 0)
         XCTAssertEqual(fcntl(up, F_SETFL, fl | O_NONBLOCK), 0)
         let chunk = [UInt8](repeating: 0x41, count: 8192)
         var total = 0
-        var heldAtCap = false
-        let deadline = Date().addingTimeInterval(15)
-        while Date() < deadline {
+        XCTAssertTrue(waitFor(15) {
             let n = chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) }
-            if n > 0 { total += n; continue }
-            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if logged(matching: "high-water") { heldAtCap = true; break }
-                Thread.sleep(forTimeInterval: 0.005)
-                continue
-            }
-            if n < 0 && errno == EINTR { continue }
-            XCTFail("upstream write failed with errno \(errno)")
-            break
-        }
-        XCTAssertTrue(heldAtCap)
+            if n > 0 { total += n }
+            return relay.pendingUpstreamBytes >= NetTcpRelay.txHighWater
+        })
         XCTAssertGreaterThanOrEqual(total, NetTcpRelay.txHighWater)
+        // Bounded: the cap plus at most one in-flight read — never the
+        // unbounded growth of #2368. The reader names it on the log.
+        XCTAssertLessThan(relay.pendingUpstreamBytes, NetTcpRelay.txHighWater + 8192)
+        XCTAssertTrue(waitFor { self.logged(matching: "high-water") })
 
-        // The cap holds: a beat later nothing more is accepted.
+        // And it stays there: nothing drains with the window shut, so
+        // a parked reader takes no more bytes from the socket.
+        let parked = relay.pendingUpstreamBytes
         Thread.sleep(forTimeInterval: 0.3)
-        for _ in 0..<8 {
-            let n = chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) }
-            XCTAssertLessThanOrEqual(n, 0)
-        }
+        XCTAssertEqual(relay.pendingUpstreamBytes, parked)
 
         // The window opens: each ACK'd window drains a chunk of the
         // buffer; once pending drops below the low-water mark the
-        // reader un-parks and upstream writes are accepted again. The
-        // guest ACKs exactly send-next each leg (currentSeqAck's seq).
+        // reader un-parks and upstream bytes flow again. The guest
+        // ACKs exactly send-next each leg (currentSeqAck's seq).
         var resumed = false
         for _ in 0..<12 {
             _ = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: relay.currentSeqAck().seq, wnd: 0xFFFF), 54)
             _ = relay.pump()
-            if waitFor(2, { chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) } > 0 }) {
-                resumed = true
+            if relay.pendingUpstreamBytes < NetTcpRelay.txLowWater {
+                let drained = relay.pendingUpstreamBytes
+                _ = chunk.withUnsafeBufferPointer { Darwin.write(up, $0.baseAddress, $0.count) }
+                resumed = waitFor(2, { relay.pendingUpstreamBytes > drained })
                 break
             }
         }
         XCTAssertTrue(resumed)
         XCTAssertGreaterThan(frameCount, 0)
+    }
+
+    // #2377 — an ACK for bytes never sent earns no credit: send credit
+    // stays bounded by the advertised window, not the ack's altitude.
+    // Unclamped, ~2^30 ahead would have released the whole buffered
+    // response in one go.
+    func testAckBeyondSendNextEarnsNoCredit() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(), 58)
+        let up = try upstream(relay)
+        defer { close(up); relay.shutdown() }
+        let response = (0..<4000).map { UInt8($0 % 251) }
+        writeUpstream(up, response)
+
+        // The handshake ACK claims ~2^30 bytes past send-next. Clamped,
+        // the advertised window still bounds: one 1460-byte segment.
+        _ = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: serverIsn &+ 1 &+ 0x4000_0000, wnd: 1460), 54)
+        _ = relay.pump()
+        XCTAssertTrue(waitFor { self.frameCount == 1 })
+        XCTAssertEqual(payload(of: frame(at: 0)), Array(response[0..<1460]))
+        _ = relay.pump()
+        Thread.sleep(forTimeInterval: 0.1)
+        XCTAssertEqual(frameCount, 1)
+        XCTAssertTrue(logged(matching: "past send-next"))
+    }
+
+    // #2377 — connect failure is an immediate named RST, not a dead
+    // relay the guest only discovers on its next data segment (and
+    // server-speaks-first protocols would never get that far).
+    func testConnectFailureEmitsReset() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(), 58)
+        defer { relay.shutdown() }
+        // A port with nothing listening: bind, learn it, let it go.
+        let listener = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(listener, 0)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr = in_addr(s_addr: INADDR_LOOPBACK.bigEndian)
+        let bound = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.bind(listener, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        XCTAssertEqual(bound, 0)
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        var actual = sockaddr_in()
+        withUnsafeMutablePointer(to: &actual) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                _ = getsockname(listener, sa, &len)
+            }
+        }
+        close(listener)
+
+        relay.start("127.0.0.1", UInt16(bigEndian: actual.sin_port))
+        // ECONNREFUSED lands on the reader thread → RST to the guest.
+        XCTAssertTrue(waitFor { self.frameCount == 1 })
+        XCTAssertEqual(tcpFlags(frame(at: 0)) & 0x14, 0x14)
+        XCTAssertTrue(relay.isDead)
+        XCTAssertTrue(logged(matching: "connect"))
+    }
+
+    // #2377 — start() must not run the blocking connect() on the
+    // capture thread: it returns at once and the dial happens on the
+    // reader. Guest payload mid-dial is dropped — never written to a
+    // half-dialed socket and never RST.
+    func testStartDoesNotDialOnTheCallingThread() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(), 58)
+        defer { relay.shutdown() }
+        // A blackholed upstream — a blocking connect would park the
+        // caller for the OS timeout (~75 s); async it returns at once.
+        let t0 = Date()
+        relay.start("10.255.255.1", 65000)
+        XCTAssertLessThan(Date().timeIntervalSince(t0), 5.0)
+
+        let data = seg(seq: guestIsn + 1, ack: serverIsn + 1, payload: [UInt8](repeating: 0x64, count: 8))
+        let delivery = relay.guestDataSegment(data, data.count)
+        // The dial is usually still in flight here (.dialing); on a
+        // host with no route the connect may already have failed
+        // (.dead). Both prove nothing was written to a half-dialed
+        // socket.
+        XCTAssertTrue(delivery == .dialing || delivery == .dead)
+        if delivery == .dialing { XCTAssertEqual(frameCount, 0) }
     }
 }
