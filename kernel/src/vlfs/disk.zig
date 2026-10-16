@@ -39,6 +39,9 @@ var epoch_ctr: u64 = 0;
 /// The ADR refusal name of the last failed attach (static text), for the
 /// boot log. null when the last attach succeeded or none ran.
 pub var last_refusal: ?[]const u8 = null;
+/// Transactions the last successful mount replayed out of the journal
+/// (ADR D5) — the boot log reports it as recovery evidence.
+pub var last_replayed: u32 = 0;
 
 /// One shared 4 KiB block scratch for every `/disk` path op, and the write
 /// path's compose buffer. The file ABI runs under the `.file` service-domain
@@ -73,6 +76,7 @@ fn now() u64 {
 pub fn attach(src: vlfs.SectorSource) bool {
     active = null;
     for (&contained_files) |*f| f.* = .{};
+    last_replayed = 0;
     const vol = vlfs.mount(src, &block_scratch) catch |err| {
         last_refusal = vlfs.refusalName(err);
         return false;
@@ -80,6 +84,7 @@ pub fn attach(src: vlfs.SectorSource) bool {
     epoch_ctr += 1;
     active = .{ .src = src, .vol = vol, .epoch = epoch_ctr };
     last_refusal = null;
+    last_replayed = vol.replayed;
     return true;
 }
 
@@ -87,6 +92,7 @@ pub fn attach(src: vlfs.SectorSource) bool {
 pub fn detach() void {
     active = null;
     for (&contained_files) |*f| f.* = .{};
+    last_replayed = 0;
 }
 
 pub fn mounted() bool {

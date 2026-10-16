@@ -876,6 +876,14 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
             // requirement.
             if (vlfs_disk.attachBlk()) {
                 uart_puts("vlfs: mounted /disk\n");
+                // M100e (#2310): D5 replay evidence — a killed boot left
+                // committed transactions in the journal and mount landed
+                // them. 0 replays prints nothing (the common case).
+                if (vlfs_disk.last_replayed > 0) {
+                    uart_puts("vlfs: replayed ");
+                    uart_hex(vlfs_disk.last_replayed);
+                    uart_puts(" txn(s) from the journal\n");
+                }
             } else {
                 uart_puts("vlfs: mount refused ");
                 uart_puts(vlfs_disk.last_refusal orelse "io_error");

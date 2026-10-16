@@ -390,6 +390,10 @@ pub const Volume = struct {
     /// M100d: the write path's forward-only bbitmap scan cursor (in-memory
     /// only, never on disk) — the next data block to probe for a free bit.
     alloc_hint: u32,
+    /// M100e: transactions this mount replayed out of the journal (0 when
+    /// the journal was clean or held only a torn tail). In-memory evidence
+    /// for the boot log — never on disk.
+    replayed: u32,
 };
 
 /// The live volume state re-expressed as a Superblock record — the shape the
@@ -613,6 +617,7 @@ pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
         .next_txn_seq = sb.next_txn_seq,
         .sb_slot = sb.slot,
         .alloc_hint = sb.data_first,
+        .replayed = live,
     };
 }
 
@@ -1199,6 +1204,7 @@ test "vlfs: mount replays a committed transaction; read-only refuses" {
     // superblock (the older copy, slot 1, now carries seq 3).
     var rw_disk = MemDisk{ .img = &image_buf };
     const vol2 = try mount(rw_disk.rw(), &test_scratch);
+    try std.testing.expectEqual(@as(u32, 1), vol2.replayed);
     try std.testing.expectEqual(@as(u64, 1), vol2.journal_applied);
     try std.testing.expectEqual(@as(u64, 2), vol2.next_txn_seq);
     try std.testing.expect(rw_disk.writes > 0 and rw_disk.flushes >= 2);
@@ -1240,6 +1246,7 @@ test "vlfs: torn journal tail is discarded, mount still succeeds" {
     var ro2 = MemDisk{ .img = &image_buf };
     const vol2 = try mount(ro2.ro(), &test_scratch); // torn tail: mounts fine
     try std.testing.expectEqual(@as(u64, 0), vol2.journal_applied);
+    try std.testing.expectEqual(@as(u32, 0), vol2.replayed);
     var check: [block_len]u8 = undefined;
     try std.testing.expect(ro2.ro().readBlock(vol.data_first + 7, &check));
     try std.testing.expect(check[0] != 't'); // payload never reached home

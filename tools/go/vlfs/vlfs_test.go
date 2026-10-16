@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -450,6 +452,17 @@ func TestCheckDetects(t *testing.T) {
 			bb := block(img, g.BbitmapFirst)
 			bitmapSet(bb, g.DataFirst+10)
 		}, "bitmap_inconsistent", false},
+		{"used data block unmarked", func(img []byte) {
+			g, _ := geometryFor(goldenSize)
+			bb := block(img, g.BbitmapFirst)
+			bb[g.DataFirst/8] &^= 1 << (g.DataFirst % 8) // root's dirent block
+		}, "bitmap_inconsistent", false},
+		{"bad inode kind", func(img []byte) {
+			g, _ := geometryFor(goldenSize)
+			rec := img[uint64(g.ItableFirst)*BlockLen+RootInode*InodeBytes:]
+			rec[inKind] = 7
+			binary.LittleEndian.PutUint32(rec[inCksum:], fnv1a(rec[:inCksum]))
+		}, "bad_inode", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -469,6 +482,135 @@ func TestCheckDetects(t *testing.T) {
 			}
 			for _, f := range got {
 				if f.code == tc.code {
+					return
+				}
+			}
+			t.Fatalf("expected %s in %v", tc.code, got)
+		})
+	}
+}
+
+// journalAppend encodes one committed transaction (DESC + payloads +
+// COMMIT) into the journal region at block pos — the bytes the kernel's
+// write path emits, hand-built so tests can place committed-but-
+// uncheckpointed state.
+func journalAppend(img []byte, pos, seq uint64, payloads map[uint32][]byte) {
+	dests := make([]uint32, 0, len(payloads))
+	for d := range payloads {
+		dests = append(dests, d)
+	}
+	sort.Slice(dests, func(a, b int) bool { return dests[a] < dests[b] })
+	desc := block(img, uint32(pos))
+	for i := range desc {
+		desc[i] = 0
+	}
+	binary.LittleEndian.PutUint32(desc[jdMagic:], MagicDesc)
+	binary.LittleEndian.PutUint64(desc[jdSeq:], seq)
+	binary.LittleEndian.PutUint16(desc[jdCount:], uint16(len(dests)))
+	for i, d := range dests {
+		binary.LittleEndian.PutUint32(desc[jdEntries+i*8:], d)
+		binary.LittleEndian.PutUint32(desc[jdEntries+i*8+4:], fnv1a(payloads[d]))
+		copy(block(img, uint32(pos)+uint32(1+i)), payloads[d])
+	}
+	binary.LittleEndian.PutUint32(desc[jdCksum:], fnv1a(desc[:jdCksum]))
+	commit := block(img, uint32(pos)+uint32(1+len(dests)))
+	for i := range commit {
+		commit[i] = 0
+	}
+	var txn []byte
+	txn = append(txn, desc[:jdEntries+8*len(dests)]...)
+	for _, d := range dests {
+		txn = append(txn, payloads[d]...)
+	}
+	binary.LittleEndian.PutUint32(commit[jcMagic:], MagicCommit)
+	binary.LittleEndian.PutUint64(commit[jcSeq:], seq)
+	binary.LittleEndian.PutUint32(commit[jcTxn:], fnv1a(txn))
+	binary.LittleEndian.PutUint32(commit[jcCksum:], fnv1a(commit[:jcCksum]))
+}
+
+// TestCheckDetectsStructural covers the refusal names that need a
+// populated writer-built image: overlap, chains, orphans, dirents, depth.
+func TestCheckDetectsStructural(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(w *imageWriter)
+		code   string
+	}{
+		{"extent overlap — two files share a block", func(w *imageWriter) {
+			a := w.writeFile(RootInode, "A.TXT", "a")
+			b := w.writeFile(RootInode, "B.TXT", "b")
+			recA := w.inodeRec(a)
+			first := binary.LittleEndian.Uint32(recA[inExtents:])
+			recB := w.inodeRec(b)
+			binary.LittleEndian.PutUint32(recB[inExtents:], first) // B now claims A's block
+			w.sealInode(b)
+		}, "extent_overlap"},
+		{"extent chain corrupt — bad VXEB checksum", func(w *imageWriter) {
+			blocks := make([]string, 10)
+			for i := range blocks {
+				blocks[i] = "x"
+			}
+			ino := w.writeChainedFile(RootInode, "CH.BIN", blocks)
+			chain := binary.LittleEndian.Uint32(w.inodeRec(ino)[inNextExt:])
+			block(w.img, chain)[100] ^= 0x01
+		}, "extent_chain_corrupt"},
+		{"extent overflow — chain deeper than 4", func(w *imageWriter) {
+			ino := w.writeFile(RootInode, "DEEP.BIN", "d")
+			var prev uint32
+			for i := 0; i < 5; i++ {
+				xb := w.allocBlocks(1)
+				blk := block(w.img, xb)
+				binary.LittleEndian.PutUint32(blk[xbMagic:], MagicExtent)
+				if prev != 0 {
+					pb := block(w.img, prev)
+					binary.LittleEndian.PutUint32(pb[xbNext:], xb)
+					binary.LittleEndian.PutUint32(pb[xbCksum:], fnv1a(pb[:xbCksum]))
+				} else {
+					binary.LittleEndian.PutUint32(w.inodeRec(ino)[inNextExt:], xb)
+				}
+				binary.LittleEndian.PutUint32(blk[xbCksum:], fnv1a(blk[:xbCksum]))
+				prev = xb
+			}
+			w.sealInode(ino)
+		}, "extent_overflow"},
+		{"inode orphan — allocated, unreachable", func(w *imageWriter) {
+			w.writeFile(RootInode, "KEPT.TXT", "k")
+			ino := w.allocInode(kindFile) // no dirent names it
+			w.setExtents(ino, w.allocBlocks(1), 1)
+		}, "inode_orphan"},
+		{"dirent bad — kind byte out of range", func(w *imageWriter) {
+			w.writeFile(RootInode, "F.TXT", "f")
+			rec := w.inodeRec(RootInode)
+			first := binary.LittleEndian.Uint32(rec[inExtents:])
+			de := block(w.img, first) // slot 0 = F.TXT
+			de[deKind] = 9
+		}, "dirent_bad"},
+		{"dirent bad — points at a free inode", func(w *imageWriter) {
+			ino := w.writeFile(RootInode, "F.TXT", "f")
+			rec := w.inodeRec(RootInode)
+			first := binary.LittleEndian.Uint32(rec[inExtents:])
+			de := block(w.img, first)
+			binary.LittleEndian.PutUint32(de[deInode:], ino+1) // next slot is free
+		}, "dirent_bad"},
+		{"depth overflow — nine nested directories", func(w *imageWriter) {
+			var dir uint32 = RootInode
+			for i := 0; i < 9; i++ {
+				dir = w.mkdir(dir, fmt.Sprintf("D%d", i))
+			}
+		}, "depth_overflow"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newImage(t)
+			tc.mutate(w)
+			var got []string
+			for _, f := range checkImage(w.img) {
+				if !f.info {
+					got = append(got, f.code)
+				}
+			}
+			for _, code := range got {
+				if code == tc.code {
 					return
 				}
 			}
@@ -526,5 +668,86 @@ func TestCheckJournal(t *testing.T) {
 	}
 	if found["journal_unreplayed"] {
 		t.Fatal("torn txn must not count as unreplayed")
+	}
+}
+
+// TestCheckReplayOverlay is the D5 as-replayed contract: check evaluates
+// the state the journal yields after replay, not the raw home blocks. An
+// image whose home state is inconsistent (a dirent naming a free inode)
+// but whose committed transaction installs the matching inode, bitmaps,
+// dirent, and data must check clean apart from the informational
+// journal_unreplayed — and the same image without the covering txn must
+// fail dirent_bad, proving the overlay is what was evaluated.
+func TestCheckReplayOverlay(t *testing.T) {
+	w := newImage(t)
+	g := w.g
+	const ino = 2
+	dataBlk := g.DataFirst + 1 // root's dirent block is DataFirst
+
+	// The committed transaction's payloads: ibitmap with ino's bit, the
+	// itable block holding inode 2 as a live file, bbitmap marking dataBlk,
+	// the root dirent block naming it, and the file's data block.
+	ibitmap := append([]byte(nil), block(w.img, g.IbitmapFirst)...)
+	bitmapSet(ibitmap, ino)
+	itable := append([]byte(nil), block(w.img, g.ItableFirst)...)
+	rec := itable[ino*InodeBytes:]
+	rec[inKind] = kindFile
+	binary.LittleEndian.PutUint16(rec[inNextents:], 1)
+	content := "delivered only by replay\n"
+	binary.LittleEndian.PutUint32(rec[inSize:], uint32(len(content)))
+	binary.LittleEndian.PutUint32(rec[inExtents:], dataBlk)
+	binary.LittleEndian.PutUint32(rec[inExtents+4:], 1)
+	binary.LittleEndian.PutUint64(rec[inMtime:], goldenTime)
+	binary.LittleEndian.PutUint64(rec[inCtime:], goldenTime)
+	binary.LittleEndian.PutUint32(rec[inCksum:], fnv1a(rec[:inCksum]))
+	bbitmap := append([]byte(nil), block(w.img, g.BbitmapFirst)...)
+	bitmapSet(bbitmap, dataBlk)
+	rootBlk := binary.LittleEndian.Uint32(w.inodeRec(RootInode)[inExtents:])
+	root := append([]byte(nil), block(w.img, rootBlk)...)
+	de := root[:DirentBytes]
+	binary.LittleEndian.PutUint32(de[deInode:], ino)
+	binary.LittleEndian.PutUint16(de[deNameLen:], uint16(len("GHOST.TXT")))
+	de[deKind] = kindFile
+	copy(de[deName:], "GHOST.TXT")
+	data := make([]byte, BlockLen)
+	copy(data, content)
+
+	// First, the same image minus the covering transaction: the home dirent
+	// names a free inode and must fail.
+	copy(block(w.img, rootBlk), root)
+	hard := map[string]bool{}
+	for _, f := range checkImage(w.img) {
+		if !f.info {
+			hard[f.code] = true
+		}
+	}
+	if !hard["dirent_bad"] {
+		t.Fatalf("as-written state should fail dirent_bad, got %v", hard)
+	}
+
+	// Now the committed txn lands in the journal: check evaluates the
+	// as-replayed overlay, which is a consistent populated volume.
+	journalAppend(w.img, uint64(g.JournalFirst), 1, map[uint32][]byte{
+		g.IbitmapFirst: ibitmap,
+		g.ItableFirst:  itable,
+		g.BbitmapFirst: bbitmap,
+		rootBlk:        root,
+		dataBlk:        data,
+	})
+	hard = map[string]bool{}
+	var sawUnreplayed bool
+	for _, f := range checkImage(w.img) {
+		if !f.info {
+			hard[f.code] = true
+		}
+		if f.code == "journal_unreplayed" {
+			sawUnreplayed = true
+		}
+	}
+	if len(hard) != 0 {
+		t.Fatalf("as-replayed state must check clean, got %v", hard)
+	}
+	if !sawUnreplayed {
+		t.Fatal("expected informational journal_unreplayed")
 	}
 }
