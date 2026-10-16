@@ -786,13 +786,16 @@ func TestWireHandshakeRefusals(t *testing.T) {
 const (
 	testChangeV1 = "0199de2d-dc00-7000-8000-00000000c001"
 	testChangeV2 = "0199de2d-dc00-7000-8000-00000000c002"
+	testChangeV3 = "0199de2d-dc00-7000-8000-00000000c003"
 )
 
 var testELFv2 = []byte("fake guest elf bytes v2 payload, deliberately different")
+var testELFv3 = []byte("fake guest elf bytes v3 payload, different again")
 
 const (
 	rowV1 = "GOHELLO.ELF | Go Hello | g | dock=false"
 	rowV2 = "GOHELLO.ELF | Go Hello 2 | g | dock=true | v=2"
+	rowV3 = "GOHELLO.ELF | Go Hello 3 | g | dock=true | v=3"
 )
 
 func shaHex(b []byte) string {
@@ -1004,8 +1007,9 @@ func TestUpdateUpToDate(t *testing.T) {
 }
 
 // TestUpdateInterrupted is the card's second acceptance leg: a kill
-// between staging and the WriteFileSafe publish leaves the old install
-// live — the ELF, APPS.TXT, and STORE.TXT stay byte-identical.
+// between staging and the state commit leaves the old install live —
+// the ELF, APPS.TXT, and STORE.TXT stay byte-identical — and a kill
+// after the commit can never destroy the rollback target.
 func TestUpdateInterrupted(t *testing.T) {
 	fs, _, _, restore := seedConsumer(t)
 	defer restore()
@@ -1026,22 +1030,24 @@ func TestUpdateInterrupted(t *testing.T) {
 		}
 	}
 
-	// Kill at the .prev write (the first publish step): nothing moved.
-	failOn(prevPath("GOHELLO.ELF"))
+	// Kill at the staged .prev.new write (the first publish step):
+	// nothing moved.
+	failOn(prevStagePath("GOHELLO.ELF"))
 	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
 		t.Fatalf("rc=%d", rc)
 	}
 	if string(fs.files["/host/GOHELLO.ELF"]) != string(elfV1) ||
 		string(fs.files[appsPath]) != string(appsV1) ||
 		string(fs.files[statePath]) != string(stateV1) {
-		t.Fatal("kill at .prev write disturbed live state")
+		t.Fatal("kill at stage write disturbed live state")
 	}
-	if fs.Exists(prevPath("GOHELLO.ELF")) {
-		t.Fatal(".prev exists despite its write being refused")
+	if fs.Exists(prevStagePath("GOHELLO.ELF")) {
+		t.Fatal(".prev.new exists despite its write being refused")
 	}
 
-	// Kill at the ELF publish itself: .prev staged, but the old row and
-	// ELF are byte-identical — the old install is live.
+	// Kill at the ELF publish itself: .prev.new staged (a harmless
+	// orphan the next update overwrites), but the old install is
+	// byte-identical — and .prev was never touched.
 	failOn("/host/GOHELLO.ELF")
 	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
 		t.Fatalf("rc=%d", rc)
@@ -1051,11 +1057,14 @@ func TestUpdateInterrupted(t *testing.T) {
 		string(fs.files[statePath]) != string(stateV1) {
 		t.Fatal("kill at ELF publish disturbed live state")
 	}
-	if got := fs.files[prevPath("GOHELLO.ELF")]; string(got) != string(elfV1) {
-		t.Fatal("staged .prev missing the old ELF bytes")
+	if got := fs.files[prevStagePath("GOHELLO.ELF")]; string(got) != string(elfV1) {
+		t.Fatal("staged .prev.new missing the old ELF bytes")
+	}
+	if fs.Exists(prevPath("GOHELLO.ELF")) {
+		t.Fatal(".prev written before the commit")
 	}
 
-	// Kill at the state write (last step): ELF+row moved but the head
+	// Kill at the state write (the commit): ELF+row moved but the head
 	// pair did not — the next command detects the torn publish via the
 	// state sha256 instead of rolling forward on a lie.
 	failOn(statePath)
@@ -1081,6 +1090,88 @@ func TestUpdateInterrupted(t *testing.T) {
 	}
 	if string(fs.files["/host/GOHELLO.ELF"]) != string(testELFv2) {
 		t.Fatal("post-interrupt update did not land v2")
+	}
+	if got := fs.files[prevPath("GOHELLO.ELF")]; string(got) != string(elfV1) {
+		t.Fatal(".prev did not rotate to the old ELF")
+	}
+	if fs.Exists(prevStagePath("GOHELLO.ELF")) {
+		t.Fatal("staged .prev.new survived a completed publish")
+	}
+}
+
+// TestUpdatePrevSurvivesKilledPublish is the #2372 acceptance: a publish
+// killed after the STORE.TXT commit — before the .prev rotation — must
+// not destroy the rollback target. The state file names sha(v2) while
+// .prev still holds v1; the staged .prev.new carries the bytes PrevSHA
+// points at, and rollback works.
+func TestUpdatePrevSurvivesKilledPublish(t *testing.T) {
+	fs, _, _, restore := seedConsumer(t)
+	defer restore()
+	if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	seedConsumerV2(t, fs)
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("update v2 rc=%d", rc)
+	}
+
+	// A second update killed at the live-ELF write (the state commit
+	// never happens): the recorded rollback target stays whole.
+	srcV3 := releaseGo("GOHELLO", "3.0.0", testELFv3, rowV3)
+	streamAdvanceRelease(t, fs, srcV3, testChangeV2, testChangeV3)
+	fs.files["/host/DROP/rel/release.go"] = srcV3
+	fs.files["/host/DROP/rel/GOHELLO.ELF"] = testELFv3
+	fs.beforeWrite = func(op, p string) error {
+		if p == "/host/GOHELLO.ELF" {
+			return newFSErr("write", p, -5)
+		}
+		return nil
+	}
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	fs.beforeWrite = nil
+	if string(fs.files[prevPath("GOHELLO.ELF")]) != string(testELF) {
+		t.Fatal("pre-commit kill touched .prev")
+	}
+	if rc := cmdRollback(fs, "gohello"); rc != 0 {
+		t.Fatalf("rollback after pre-commit kill rc=%d", rc)
+	}
+	if string(fs.files["/host/GOHELLO.ELF"]) != string(testELF) {
+		t.Fatal("rollback did not restore v1")
+	}
+
+	// Now the dangerous kill — the replica's head is still v3, so the
+	// next update runs v1 -> v3: the STORE.TXT commit lands, then every
+	// later write (the .prev rotation) dies.
+	fs.beforeWrite = func(op, p string) error {
+		if p == prevPath("GOHELLO.ELF") {
+			return newFSErr("write", p, -5)
+		}
+		return nil
+	}
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	fs.beforeWrite = nil
+
+	// The commit landed — live is v3 and state names sha(v1) as the
+	// rollback target — but .prev still holds the v2 bytes the phase-1
+	// rollback rotated in.
+	e := stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV3 || e.PrevSHA != shaHex(testELF) {
+		t.Fatalf("post-commit state %+v", e)
+	}
+	if string(fs.files[prevPath("GOHELLO.ELF")]) != string(testELFv2) {
+		t.Fatal(".prev rotated despite the refused write")
+	}
+
+	// Rollback still works: .prev.new carries the bytes PrevSHA names.
+	if rc := cmdRollback(fs, "gohello"); rc != 0 {
+		t.Fatalf("rollback after post-commit kill rc=%d", rc)
+	}
+	if string(fs.files["/host/GOHELLO.ELF"]) != string(testELF) {
+		t.Fatal("rollback did not restore v1 from the staged target")
 	}
 }
 

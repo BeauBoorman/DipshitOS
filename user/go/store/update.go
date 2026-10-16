@@ -11,18 +11,24 @@ import (
 // replica forward (the staged half), the M101b keyring + Ed25519 gate
 // re-runs, the fetched release.go is re-authenticated atom-for-atom
 // against the new head's signed ops, and the ELF is sha-checked — all
-// BEFORE any live path is touched. Publish is four WriteFileSafes:
-// <BIN>.prev (the retained prior ELF — a FLINT head is only hashes, so
-// rollback needs the bytes, never a re-fetch), <BIN>, APPS.TXT's row
-// (replaced in place), STORE.TXT's {head, sha256, prev_*} line last —
-// the state write is what commits the update; a kill anywhere earlier
-// leaves the old install byte-identical.
+// BEFORE any live path is touched. Publish is five WriteFileSafes and a
+// remove: <BIN>.prev.new (the new rollback bytes STAGED under a second
+// name — <BIN>.prev itself is never touched before the commit, so a
+// killed publish cannot destroy the target the still-live PrevSHA
+// names), <BIN>, APPS.TXT's row (replaced in place), STORE.TXT's
+// {head, sha256, prev_*} line — the state write is what commits the
+// update — and finally <BIN>.prev rotating to the same bytes. A kill
+// before the commit leaves the old install live and the old PrevSHA's
+// bytes intact at <BIN>.prev; a kill after it leaves the staged file
+// matching the NEW PrevSHA.
 //
-// `store rollback <name>` re-materializes the retained head: the .prev
-// bytes are sha-checked against STORE.TXT's prev_sha256, published over
-// <BIN>, the prior manifest row is restored verbatim, .prev rotates to
-// the ELF just replaced, and the state pair swaps — a second rollback
-// walks back forward.
+// `store rollback <name>` re-materializes the retained head: the
+// rollback bytes come from whichever of <BIN>.prev (the published
+// name) or <BIN>.prev.new (the staged survivor of a killed publish)
+// hashes to STORE.TXT's prev_sha256, are published over <BIN>, the
+// prior manifest row is restored verbatim, the replaced ELF rotates
+// through the same staged->commit->publish order, and the state pair
+// swaps — a second rollback walks back forward.
 //
 // Torn publishes (kill after the ELF write, before the state write)
 // diverge the live ELF from state sha256; update and rollback detect
@@ -160,11 +166,16 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 		return runErr(err)
 	}
 
-	// Publish. Order is the crash contract: .prev FIRST (the retained
-	// bytes must exist before the live ELF moves), the ELF itself is
-	// the atomic point (old install live until it lands), the row
-	// follows the bytes it launches, the STORE.TXT swap commits last.
-	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
+	// Publish. Order is the crash contract: the new rollback bytes are
+	// STAGED at <bin>.prev.new first — .prev is never written before
+	// the commit, so a kill anywhere in the publish cannot destroy the
+	// target the still-live PrevSHA names — the ELF itself is the
+	// atomic point (old install live until it lands), the row follows
+	// the bytes it launches, the STORE.TXT swap commits, and only then
+	// does .prev rotate to the staged bytes. A kill between the commit
+	// and the rotation leaves PrevSHA naming <bin>.prev.new instead of
+	// <bin>.prev; rollback reads whichever matches.
+	if err := fs.WriteFileSafe(prevStagePath(bin), curELF); err != nil {
 		return runErr(err)
 	}
 	if err := fs.WriteFileSafe("/host/"+bin, elf); err != nil {
@@ -184,13 +195,54 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
 		return runErr(err)
 	}
+	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
+		// Committed already: the staged file still hashes to the new
+		// PrevSHA, so rollback is not lost — but the rotation did not
+		// land, so report the publish incomplete.
+		return runErr(err)
+	}
+	_ = fs.Remove(prevStagePath(bin))
 	consoleFn("store: update ok " + bin + " version=" + rel.Version)
 	return 0
 }
 
+// prevStagePath is the staging name an update or rollback writes the new
+// rollback bytes to BEFORE the state commit — never <bin>.prev~, which
+// is WriteFileSafe's own sacrificial temp for <bin>.prev.
+func prevStagePath(bin string) string { return "/host/" + bin + ".prev.new" }
+
+// readRollbackBytes returns the retained prior ELF: whichever of
+// <bin>.prev (the published name) or <bin>.prev.new (the staged survivor
+// of a publish killed between the state commit and the .prev rotation)
+// hashes to PrevSHA wins. Neither file existing is prev_missing; bytes
+// matching on neither is prev_mismatch.
+func readRollbackBytes(fs FS, bin string, ent *storeEntry) ([]byte, error) {
+	exists := false
+	for _, p := range []string{prevPath(bin), prevStagePath(bin)} {
+		if !fs.Exists(p) {
+			continue
+		}
+		exists = true
+		b, err := fs.ReadFile(p, MaxELFBytes)
+		if err != nil {
+			continue
+		}
+		sum := sshlib.SHA256Sum(b)
+		if sshlib.EncodeHex(sum[:]) == ent.PrevSHA {
+			return b, nil
+		}
+	}
+	if !exists {
+		return nil, refuse("prev_missing", bin)
+	}
+	return nil, refuse("prev_mismatch", bin)
+}
+
 // cmdRollback implements `store rollback <name>`: publish the retained
-// .prev bytes (sha-checked against STORE.TXT), restore the prior row,
-// rotate .prev to the ELF being replaced, and swap the state pair.
+// bytes (sha-checked against STORE.TXT over both candidate names),
+// restore the prior row, rotate .prev to the ELF being replaced through
+// the same staged->commit->publish order update uses, and swap the
+// state pair.
 func cmdRollback(fs FS, arg string) int {
 	consoleFn("store: rollback " + arg)
 	bin, ent, lines, curELF, curRow, err := loadTrackedApp(fs, arg)
@@ -200,25 +252,21 @@ func cmdRollback(fs FS, arg string) int {
 	if ent.PrevHead == "" {
 		return runErr(refuse("no_rollback", bin))
 	}
-	prevELF, err := fs.ReadFile(prevPath(bin), MaxELFBytes)
+	prevELF, err := readRollbackBytes(fs, bin, ent)
 	if err != nil {
-		return runErr(refuse("prev_missing", bin))
-	}
-	prevSum := sshlib.SHA256Sum(prevELF)
-	if sshlib.EncodeHex(prevSum[:]) != ent.PrevSHA {
-		return runErr(refuse("prev_mismatch", bin))
+		return runErr(err)
 	}
 	manifest, err := manifestWithBinRow(lines, bin, ent.PrevRow)
 	if err != nil {
+		return runErr(err)
+	}
+	if err := fs.WriteFileSafe(prevStagePath(bin), curELF); err != nil {
 		return runErr(err)
 	}
 	if err := fs.WriteFileSafe("/host/"+bin, prevELF); err != nil {
 		return runErr(err)
 	}
 	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
-		return runErr(err)
-	}
-	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
 		return runErr(err)
 	}
 	state, err := loadState(fs)
@@ -232,6 +280,10 @@ func cmdRollback(fs FS, arg string) int {
 	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
 		return runErr(err)
 	}
+	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
+		return runErr(err)
+	}
+	_ = fs.Remove(prevStagePath(bin))
 	consoleFn("store: rollback ok " + bin + " head=" + ent.PrevHead)
 	return 0
 }
