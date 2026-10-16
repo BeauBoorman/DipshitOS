@@ -387,6 +387,52 @@ func TestHTTPChannel(t *testing.T) {
 	}
 }
 
+// streamAdvanceRelease simulates what `flint pull` lands when the remote
+// head moved: a second signed Change modifying every release.go atom to
+// the NEW src's hashes (same atom ids — modify keeps the folded key),
+// then the stream record's head rolled to it.
+func streamAdvanceRelease(t *testing.T, fs *memFS, src []byte, parent, id string) {
+	t.Helper()
+	p, ok := parser.ForPath("release.go")
+	if !ok {
+		t.Fatal("no parser for release.go")
+	}
+	atoms, err := p.Parse("release.go", src)
+	if err != nil {
+		t.Fatalf("parse release.go: %v", err)
+	}
+	change := Change{
+		ID:     id,
+		Parent: &parent,
+		Stream: testStreamID,
+		TS:     1760000001000,
+		Author: strings.Repeat("ab", 32),
+		Ops:    []Op{},
+		Sig:    strings.Repeat("cd", 64),
+	}
+	for i, a := range atoms {
+		span := Span{File: a.File, Start: a.Start, End: a.End}
+		change.Ops = append(change.Ops, Op{
+			Type:    "modify",
+			AtomID:  fmt.Sprintf("0199de2d-dc00-7000-8000-00000000d%03d", i),
+			Kind:    a.Kind,
+			NewName: a.Name,
+			NewSpan: &span,
+			NewHash: hex.EncodeToString(a.Hash[:]),
+		})
+	}
+	lb, _ := json.Marshal(change)
+	fs.files[streamLogPath(DefaultStoreRoot, testStreamID)] =
+		append(fs.files[streamLogPath(DefaultStoreRoot, testStreamID)], append(lb, '\n')...)
+	var rec Stream
+	if err := json.Unmarshal(fs.files[streamRecordPath(DefaultStoreRoot, testStreamID)], &rec); err != nil {
+		t.Fatalf("stream record: %v", err)
+	}
+	rec.Head = &id
+	rb, _ := json.Marshal(rec)
+	fs.files[streamRecordPath(DefaultStoreRoot, testStreamID)] = append(rb, '\n')
+}
+
 // ---- install / remove end to end ------------------------------------------
 
 func seedConsumer(t *testing.T) (*memFS, *fakeExec, *[]string, func()) {
@@ -710,4 +756,479 @@ func TestWireHandshakeRefusals(t *testing.T) {
 	}
 	_, err = c2.list()
 	refuseCode(t, err, "stream_missing")
+}
+
+// ---- M101d: state file, update, rollback -----------------------------------
+
+const (
+	testChangeV1 = "0199de2d-dc00-7000-8000-00000000c001"
+	testChangeV2 = "0199de2d-dc00-7000-8000-00000000c002"
+)
+
+var testELFv2 = []byte("fake guest elf bytes v2 payload, deliberately different")
+
+const (
+	rowV1 = "GOHELLO.ELF | Go Hello | g | dock=false"
+	rowV2 = "GOHELLO.ELF | Go Hello 2 | g | dock=true | v=2"
+)
+
+func shaHex(b []byte) string {
+	s := sshlib.SHA256Sum(b)
+	return sshlib.EncodeHex(s[:])
+}
+
+func stateEntry(t *testing.T, fs *memFS, bin string) *storeEntry {
+	t.Helper()
+	state, err := loadState(fs)
+	if err != nil {
+		t.Fatalf("loadState: %v", err)
+	}
+	e, ok := state[bin]
+	if !ok {
+		t.Fatalf("no STORE.TXT entry for %s: %q", bin, fs.files[statePath])
+	}
+	return e
+}
+
+// seedConsumerV2 is seedConsumer plus the staged v2: the local replica
+// carries the second signed change (what a pull would land) and the drop
+// dir serves the v2 release.go + ELF.
+func seedConsumerV2(t *testing.T, fs *memFS) {
+	t.Helper()
+	srcV2 := releaseGo("GOHELLO", "2.0.0", testELFv2, rowV2)
+	streamAdvanceRelease(t, fs, srcV2, testChangeV1, testChangeV2)
+	fs.files["/host/DROP/rel/release.go"] = srcV2
+	fs.files["/host/DROP/rel/GOHELLO.ELF"] = testELFv2
+}
+
+// TestStateFile covers the STORE.TXT grammar: round-trip, all-or-none
+// prev_*, and refuse-whole on any corrupt line.
+func TestStateFile(t *testing.T) {
+	fs := newMemFS()
+	if !fs.Exists(statePath) {
+		state, err := loadState(fs)
+		if err != nil || len(state) != 0 {
+			t.Fatalf("absent state: %v %v", state, err)
+		}
+	}
+	row := "GOHELLO.ELF | Go Hello | g | dock=false"
+	want := map[string]*storeEntry{
+		"GOHELLO.ELF": {Name: "GOHELLO.ELF", Stream: "rel", Head: "h1",
+			SHA256:   shaHex(testELF),
+			PrevHead: "h0", PrevSHA: shaHex(testELFv2), PrevRow: row},
+		"GOCALC.ELF": {Name: "GOCALC.ELF", Stream: "calc", Head: "h9",
+			SHA256: shaHex(testELFv2)},
+	}
+	if err := fs.WriteFileSafe(statePath, renderState(want)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadState(fs)
+	if err != nil {
+		t.Fatalf("loadState: %v", err)
+	}
+	if len(got) != 2 || got["GOHELLO.ELF"].PrevRow != row ||
+		got["GOHELLO.ELF"].PrevHead != "h0" ||
+		got["GOCALC.ELF"].PrevHead != "" || got["GOCALC.ELF"].PrevSHA != "" ||
+		got["GOCALC.ELF"].PrevRow != "" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	// Render is deterministic: a no-change rewrite is byte-identical.
+	before := string(fs.files[statePath])
+	if err := fs.WriteFileSafe(statePath, renderState(got)); err != nil {
+		t.Fatal(err)
+	}
+	if string(fs.files[statePath]) != before {
+		t.Fatal("renderState not deterministic")
+	}
+	for _, bad := range []string{
+		"name=GOHELLO.ELF stream=rel head=h1 sha256=" + shaHex(testELF) + " prev_head=- prev_sha256=- prev_row=- trailing_garbage\n",
+		"name=GOHELLO.ELF stream=rel head=h1 sha256=" + shaHex(testELF) + " prev_head=h0 prev_sha256=- prev_row=-\n",
+		"name=go hello.ELF stream=rel head=h1 sha256=" + shaHex(testELF) + " prev_head=- prev_sha256=- prev_row=-\n",
+		"name=GOHELLO.ELF stream=rel head=h1 sha256=zz prev_head=- prev_sha256=- prev_row=-\n",
+		"name=GOHELLO.ELF head=h1 sha256=" + shaHex(testELF) + " prev_head=- prev_sha256=- prev_row=-\n",
+	} {
+		fs.files[statePath] = []byte(bad)
+		if _, err := loadState(fs); err == nil {
+			t.Fatalf("accepted corrupt state: %q", bad)
+		} else {
+			re := err.(*RefuseError)
+			if re.Code != "state_malformed" {
+				t.Fatalf("wrong refusal %q for %q", re.Code, bad)
+			}
+		}
+	}
+}
+
+// TestUpdateRollbackRoundTrip is the card's acceptance: install v1 ->
+// update v2 -> rollback v1, asserted byte-for-byte on the ELF and the
+// manifest row.
+func TestUpdateRollbackRoundTrip(t *testing.T) {
+	fs, fx, lines, restore := seedConsumer(t)
+	defer restore()
+
+	if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d lines=%v", rc, *lines)
+	}
+	manifestV1 := string(fs.files[appsPath])
+	e := stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV1 || e.SHA256 != shaHex(testELF) ||
+		e.Stream != "rel" || e.PrevHead != "" {
+		t.Fatalf("post-install state %+v", e)
+	}
+
+	seedConsumerV2(t, fs)
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("update rc=%d lines=%v", rc, *lines)
+	}
+	joined := strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "store: update ok GOHELLO.ELF version=2.0.0") {
+		t.Fatalf("missing update ok: %v", *lines)
+	}
+	if got := fs.files["/host/GOHELLO.ELF"]; string(got) != string(testELFv2) {
+		t.Fatal("update did not land v2 ELF bytes")
+	}
+	man := string(fs.files[appsPath])
+	if !strings.Contains(man, rowV2+"\n") || strings.Contains(man, rowV1) {
+		t.Fatalf("row not replaced in place: %q", man)
+	}
+	if got := fs.files[prevPath("GOHELLO.ELF")]; string(got) != string(testELF) {
+		t.Fatal("prev ELF not retained")
+	}
+	e = stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV2 || e.PrevHead != testChangeV1 ||
+		e.PrevSHA != shaHex(testELF) || e.PrevRow != rowV1 {
+		t.Fatalf("post-update state %+v", e)
+	}
+	if !strings.Contains(strings.Join(fx.log, "|"), "pull") ||
+		!strings.Contains(strings.Join(fx.log, "|"), "verify --all") {
+		t.Fatalf("update skipped pull/verify: %v", fx.log)
+	}
+
+	if rc := cmdRollback(fs, "gohello"); rc != 0 {
+		t.Fatalf("rollback rc=%d lines=%v", rc, *lines)
+	}
+	if got := fs.files["/host/GOHELLO.ELF"]; string(got) != string(testELF) {
+		t.Fatal("rollback ELF is not byte-for-byte v1")
+	}
+	if string(fs.files[appsPath]) != manifestV1 {
+		t.Fatalf("manifest row not byte-for-byte restored: %q want %q",
+			fs.files[appsPath], manifestV1)
+	}
+	e = stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV1 || e.PrevHead != testChangeV2 ||
+		e.PrevSHA != shaHex(testELFv2) || e.PrevRow != rowV2 {
+		t.Fatalf("post-rollback state %+v", e)
+	}
+	if got := fs.files[prevPath("GOHELLO.ELF")]; string(got) != string(testELFv2) {
+		t.Fatal(".prev did not rotate to the rolled-back-from ELF")
+	}
+
+	// The swapped pair toggles: a second rollback returns to v2.
+	if rc := cmdRollback(fs, "GOHELLO"); rc != 0 {
+		t.Fatalf("second rollback rc=%d", rc)
+	}
+	if got := fs.files["/host/GOHELLO.ELF"]; string(got) != string(testELFv2) {
+		t.Fatal("second rollback did not restore v2")
+	}
+	if !strings.Contains(string(fs.files[appsPath]), rowV2+"\n") {
+		t.Fatal("second rollback did not restore the v2 row")
+	}
+}
+
+// TestUpdateUpToDate: a pull that lands no head movement is a no-op
+// success — nothing is re-verified or republished.
+func TestUpdateUpToDate(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("update rc=%d lines=%v", rc, *lines)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "store: update GOHELLO.ELF up to date") {
+		t.Fatalf("missing up-to-date line: %v", *lines)
+	}
+	if _, ok := fs.files[prevPath("GOHELLO.ELF")]; ok {
+		t.Fatal("up-to-date update wrote .prev")
+	}
+}
+
+// TestUpdateInterrupted is the card's second acceptance leg: a kill
+// between staging and the WriteFileSafe publish leaves the old install
+// live — the ELF, APPS.TXT, and STORE.TXT stay byte-identical.
+func TestUpdateInterrupted(t *testing.T) {
+	fs, _, _, restore := seedConsumer(t)
+	defer restore()
+	if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	seedConsumerV2(t, fs)
+	elfV1 := fs.files["/host/GOHELLO.ELF"]
+	appsV1 := fs.files[appsPath]
+	stateV1 := fs.files[statePath]
+
+	failOn := func(path string) {
+		fs.beforeWrite = func(op, p string) error {
+			if p == path {
+				return newFSErr("write", p, -5)
+			}
+			return nil
+		}
+	}
+
+	// Kill at the .prev write (the first publish step): nothing moved.
+	failOn(prevPath("GOHELLO.ELF"))
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if string(fs.files["/host/GOHELLO.ELF"]) != string(elfV1) ||
+		string(fs.files[appsPath]) != string(appsV1) ||
+		string(fs.files[statePath]) != string(stateV1) {
+		t.Fatal("kill at .prev write disturbed live state")
+	}
+	if fs.Exists(prevPath("GOHELLO.ELF")) {
+		t.Fatal(".prev exists despite its write being refused")
+	}
+
+	// Kill at the ELF publish itself: .prev staged, but the old row and
+	// ELF are byte-identical — the old install is live.
+	failOn("/host/GOHELLO.ELF")
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if string(fs.files["/host/GOHELLO.ELF"]) != string(elfV1) ||
+		string(fs.files[appsPath]) != string(appsV1) ||
+		string(fs.files[statePath]) != string(stateV1) {
+		t.Fatal("kill at ELF publish disturbed live state")
+	}
+	if got := fs.files[prevPath("GOHELLO.ELF")]; string(got) != string(elfV1) {
+		t.Fatal("staged .prev missing the old ELF bytes")
+	}
+
+	// Kill at the state write (last step): ELF+row moved but the head
+	// pair did not — the next command detects the torn publish via the
+	// state sha256 instead of rolling forward on a lie.
+	failOn(statePath)
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	e := stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV1 || e.PrevHead != "" {
+		t.Fatalf("torn publish still rolled state head: %+v", e)
+	}
+	fs.beforeWrite = nil
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("torn publish should refuse state_mismatch, rc=%d", rc)
+	}
+
+	// And a clean update after the interrupted ones still converges.
+	// Repair the torn publish fully (ELF AND row back to v1) so the
+	// converging update records a truthful prev_row.
+	fs.files["/host/GOHELLO.ELF"] = elfV1
+	fs.files[appsPath] = appsV1
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("post-interrupt update rc=%d", rc)
+	}
+	if string(fs.files["/host/GOHELLO.ELF"]) != string(testELFv2) {
+		t.Fatal("post-interrupt update did not land v2")
+	}
+}
+
+// TestUpdateRefusals: every named refusal leaves installed state
+// byte-identical.
+func TestUpdateRefusals(t *testing.T) {
+	mk := func(t *testing.T, mutate func(fs *memFS)) (*memFS, *[]string, func()) {
+		fs, _, lines, restore := seedConsumer(t)
+		if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+			t.Fatalf("install rc=%d", rc)
+		}
+		mutate(fs)
+		return fs, lines, restore
+	}
+	snapshot := func(fs *memFS) (elf, apps, state string) {
+		return string(fs.files["/host/GOHELLO.ELF"]),
+			string(fs.files[appsPath]), string(fs.files[statePath])
+	}
+	unchanged := func(t *testing.T, fs *memFS, elf, apps, state string) {
+		t.Helper()
+		e, a, s := snapshot(fs)
+		if e != elf || a != apps || s != state {
+			t.Fatal("refusal mutated installed state")
+		}
+	}
+
+	t.Run("not_installed", func(t *testing.T) {
+		fs, _, lines, restore := seedConsumer(t)
+		defer restore()
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse not_installed") {
+			t.Fatalf("%v", *lines)
+		}
+	})
+
+	t.Run("name_mismatch on a renamed release", func(t *testing.T) {
+		fs, lines, restore := mk(t, func(fs *memFS) {
+			src := releaseGo("GOTWO", "2.0.0", testELFv2, "GOTWO.ELF | Two | t | dock=false")
+			streamAdvanceRelease(t, fs, src, testChangeV1, testChangeV2)
+			fs.files["/host/DROP/rel/release.go"] = src
+		})
+		defer restore()
+		elf, apps, state := snapshot(fs)
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse name_mismatch") {
+			t.Fatalf("%v", *lines)
+		}
+		unchanged(t, fs, elf, apps, state)
+	})
+
+	t.Run("state_mismatch on tampered live ELF", func(t *testing.T) {
+		fs, lines, restore := mk(t, func(fs *memFS) {
+			fs.files["/host/GOHELLO.ELF"] = []byte("replaced behind store's back")
+		})
+		defer restore()
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse state_mismatch") {
+			t.Fatalf("%v", *lines)
+		}
+	})
+
+	t.Run("state_malformed refuses whole", func(t *testing.T) {
+		fs, lines, restore := mk(t, func(fs *memFS) {
+			fs.files[statePath] = []byte("not a state line\n")
+		})
+		defer restore()
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+			t.Fatalf("update rc=%d", rc)
+		}
+		if rc := cmdRollback(fs, "gohello"); rc != 1 {
+			t.Fatalf("rollback rc=%d", rc)
+		}
+		joined := strings.Join(*lines, "\n")
+		if strings.Count(joined, "store: refuse state_malformed") != 2 {
+			t.Fatalf("%v", *lines)
+		}
+	})
+
+	t.Run("elf_mismatch on tampered v2 drop", func(t *testing.T) {
+		fs, lines, restore := mk(t, func(fs *memFS) {
+			seedConsumerV2(t, fs)
+			fs.files["/host/DROP/rel/GOHELLO.ELF"] = append(testELFv2, 0)
+		})
+		defer restore()
+		elf, apps, state := snapshot(fs)
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse elf_mismatch") {
+			t.Fatalf("%v", *lines)
+		}
+		unchanged(t, fs, elf, apps, state)
+	})
+}
+
+// TestRollbackRefusals: the three retained-bytes failure modes plus
+// rollback-with-no-prev.
+func TestRollbackRefusals(t *testing.T) {
+	t.Run("no_rollback", func(t *testing.T) {
+		fs, _, lines, restore := seedConsumer(t)
+		defer restore()
+		if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+			t.Fatalf("install rc=%d", rc)
+		}
+		if rc := cmdRollback(fs, "gohello"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse no_rollback") {
+			t.Fatalf("%v", *lines)
+		}
+	})
+
+	t.Run("prev_missing", func(t *testing.T) {
+		fs, _, lines, restore := seedConsumer(t)
+		defer restore()
+		if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+			t.Fatalf("install rc=%d", rc)
+		}
+		seedConsumerV2(t, fs)
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+			t.Fatalf("update rc=%d", rc)
+		}
+		if err := fs.Remove(prevPath("GOHELLO.ELF")); err != nil {
+			t.Fatal(err)
+		}
+		if rc := cmdRollback(fs, "gohello"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse prev_missing") {
+			t.Fatalf("%v", *lines)
+		}
+		// The v2 install stays live.
+		if string(fs.files["/host/GOHELLO.ELF"]) != string(testELFv2) {
+			t.Fatal("prev_missing rollback disturbed the live ELF")
+		}
+	})
+
+	t.Run("prev_mismatch", func(t *testing.T) {
+		fs, _, lines, restore := seedConsumer(t)
+		defer restore()
+		if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+			t.Fatalf("install rc=%d", rc)
+		}
+		seedConsumerV2(t, fs)
+		if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+			t.Fatalf("update rc=%d", rc)
+		}
+		fs.files[prevPath("GOHELLO.ELF")] = []byte("tampered retained bytes")
+		if rc := cmdRollback(fs, "gohello"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse prev_mismatch") {
+			t.Fatalf("%v", *lines)
+		}
+		if string(fs.files["/host/GOHELLO.ELF"]) != string(testELFv2) {
+			t.Fatal("prev_mismatch rollback published tampered bytes")
+		}
+	})
+
+	t.Run("not_installed", func(t *testing.T) {
+		fs, _, lines, restore := seedConsumer(t)
+		defer restore()
+		if rc := cmdRollback(fs, "gohello"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse not_installed") {
+			t.Fatalf("%v", *lines)
+		}
+	})
+}
+
+// TestRemoveCleansState: remove drops the STORE.TXT row and the
+// retained .prev alongside the ELF and manifest row.
+func TestRemoveCleansState(t *testing.T) {
+	fs, _, _, restore := seedConsumer(t)
+	defer restore()
+	if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	seedConsumerV2(t, fs)
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("update rc=%d", rc)
+	}
+	if rc := cmdRemove(fs, "gohello"); rc != 0 {
+		t.Fatalf("remove rc=%d", rc)
+	}
+	if fs.Exists("/host/GOHELLO.ELF") || fs.Exists(prevPath("GOHELLO.ELF")) {
+		t.Fatal("remove left ELF artifacts")
+	}
+	state, err := loadState(fs)
+	if err != nil || len(state) != 0 {
+		t.Fatalf("remove left state: %v %v", state, err)
+	}
 }
