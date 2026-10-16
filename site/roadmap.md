@@ -45,38 +45,133 @@ is the canonical, always-current source; this is the readable summary.
 | 29 | VM depth: demand paging, copy-on-write, anonymous `sys_mmap`/`sys_munmap` (slots 63/64) |
 | 30 | Dynamic linking: freestanding `LD.SO`, `LIBUI.SO`/`LIBFONT.SO`, W^X multi-aperture isolation |
 | 31 | Dynamic linking ecosystem: `CALC.ELF`/`NOTEPAD.ELF`/`FILE.ELF`/`DESKTOP.ELF`, `dlopen`/`dlsym` |
+| 32 | Window-manager server migration (Seam A): desktop policy moved to a userland WM server (slot 65), the kernel slimmed WMS1–WMS9 |
+| 33 | Seam B full pixel ownership: shared-anon mmap, apps own their buffers, the WM composes one present |
+| 34 | FAT-free storage: the host file channel HF1–HF7 over custom-virtio; FAT removed; CLONE dedup |
+| 35 | WASM core interpreter: `WASM.BIN`, a frozen `env.*` surface, the `wc` capstone |
+| 36 | Skipped — the raster/wallpaper/viewer scope re-landed under later arcs (M78, M85, M89, M90) |
+| 37 | Desktop quality pass: God Menu overlay, tab strip render + mouse, design tokens, snap guides |
+| 38 | Vector typography: TrueType Inter/Fira Code, anti-aliased BGRA blending, proportional metrics |
+| 39 | Tabbed desktop & modular UI: modular `ui.zig`, `TABWM.BIN`, tab lifecycle, viewports |
+| 40 | Gate-fleet consolidation (#934) — a tooling workstream, not a product milestone |
+| 41 | Test separation: parallel `zig build test`, shared mocks, de-monolithized sources |
+| 42 | The Sexiburger desktop: mascot raster, the WM→app resize seam, `lib/tabapp.zig`, UX hardening round 2 |
+| 43 | Device depth: the XHCI bulk engine, USB mass storage (BOT+SCSI), the `.usb` block seam |
+| 44 | The terminal (vt) seam: `/dev/tty`, `sys_tty_attach` (slot 67); ADR 0020 |
+| 45 | Userland shell & front-ends: the `tty.zig` editor, the original `SH.BIN`/`TERM.BIN` (both since retired to Go), the default-shell flip; ADR 0021 |
+| 46 | Remote access Stage 0/1: `--console-tcp`, guest net auth (RC0–RC4); ADR 0022 |
+| 47 | Crypto primitives: SHA-256/512, HMAC, ChaCha20, Ed25519; ADR 0023 |
+| 48 | Browser-style tab depth: reopen/duplicate, reorder, pin/group, start surface, per-tab history, preview |
+| 49 | A shell I'd use daily: `monitor` detach, the startup contract, the `toolbox.zig` multicall |
+| 50 | Trust & isolation: uid/caps, permissions, secrets, authenticated remote, privilege gating; ADR 0024 |
+| 51 | SSH: a userland SSH-2 client with real-OpenSSH interop (the Zig client was later retired); ADR 0025 |
+| 52 | Client-death hardening: exit/revoke teardown pinned end to end — no zombie windows, stale mappings, or stuck captures |
+| 53 | TLS 1.3 client + trust store: HKDF/SHA-384/AES-GCM, X.509 chain validation, real interop against four peer implementations; git-over-https followed; ADR 0029 |
+| 54 | Go carries its first app: `GOWIN.ELF` owns a raw window, `WEB.ELF` renders in-guest; kernel untouched |
+| 55 | The language split (ADR 0030): Zig keeps the kernel and the seats; new userland is Go |
+| 56 | Finish the Go SDK: `vi` IPC + discovery, the WM_RPC wire, `widgets`, `tabapp` (gate `go-tabapp`) |
+| 57 | `GOTABWM.ELF` as a second seat: it registers the slot-65 seat, manages its own windows, and hosts unmodified Zig apps over WM_RPC |
+| 58 | Move the apps you touch: files, GOEDIT, GOTERM, fetch, FART re-land as Go ELFs |
+| 59 | Default flip: a boot autostarts `GOTABWM.ELF`; `settings set wm tabwm` keeps the Zig fallback reachable |
+| 60 | Starve Zig EL0: no new `user/src/*.zig` apps; the deleted Zig clients (`EDIT.BIN`, `FILE.BIN`, `CALC.BIN`, `NOTEPAD.BIN`, `SH.BIN`, and friends) went as their Go successors landed |
+| 61 | Guest self-test: `GOSELF.ELF` runs in-OS cases; the host only byte-compares receipts |
+| 62 | GOTABWM depth: in-process tab strip, constrained pane split, `.tabs` v2 session persist, pin/reorder, GOEDIT and GOCALC as hosted clients |
+| 63 | GOTABWM HID: the seat drains kind 19/21 input — pin, Alt+Tab, real typing into GOEDIT |
+| 64 | Signal: a green fleet plus EL0 exec caller survival |
+| 65 | Go threads (ADR 0027): slots 73/74, a 16-task ceiling |
+| 66 | Go owns files: honest HF error names, fsync at EL0 (slot 77), crash-safe settings, `NOTE.ELF` becomes the fleet editor |
+| 67 | Go owns net: `vi` Dial/Send/Recv + DNS, in-process HTTPS for GOFETCH/GOTGIT/WEB |
+| 68 | Go owns the shell: `GOSH.ELF` is the serial/login seat; `SH.BIN` was deleted; `TABWM.BIN` was retained by decision (ADR 0034) |
+| 69 | Daily-driver floor: Go-seat dogfood, chrome cohesion, the edit→build→run loop |
+| 70 | Moonshots: the web fidelity corpus, hardened `--console-tcp`, measured cross-process VZ save/restore, the `GOOS=virelai` port reaching in-guest `cmd/compile`+`cmd/link` |
+| 71 | Seat honesty: the Go seat stops lying — hosted GOSH paints, M48 tab depth lands on GOTABWM, the Zig client catalog deletions finish |
+| 72 | Charm TUI: window-tty VT (SGR/CUP/EL/ED/alt screen), a Bubble Tea hello, the `load_max`/`map_max` loader bound split |
+| 73 | Terminal depth: fourteen cards — palette theming, resize, the acceptance chain (index #1624) |
+| 74 | TUI apps: `GOFILES.ELF` becomes a Bubble Tea file manager (index #1639) |
+| 75 | Docs & site truth-up: the watermark guard and this page's own honesty rules (index #1669) |
+| 76 | Boot past the wall (index #1673) |
+| 77 | TUIOS exploration (index #1678) |
+| 78 | Final Zig user-source inventory: ten superseded apps retired, 62 survivors classified (index #1685) |
+| 79 | Go seat depth + appkit: the persistent live seat, rail chrome, session honesty, appkit dialogs, notify (index #1703) |
+| 80 | Terminal you can live in: DSR/CPR, the terminal outlives its shell, line-editor depth, prompt escapes (index #1716) |
+| 81 | Files as a platform: one mime table + handler registry, snapshots, trash + recent, file watching (index #1781) |
+| 82 | The app platform: a versioned `apps.txt` schema, the chord registry, the notifications center, per-app logs + crash receipts (index #1782) |
+| 83 | Time, keys, and idle: wall time at EL0, SNTP clock set (slot 78), timezone, keyboard layouts, dead keys, idle dim (index #1783) |
+| 84 | Remote framebuffer: opt-in in-seat RFB 3.8, every drop reason named, a VNC-auth bridge so macOS Screen Sharing connects (index #1807) |
+| 85 | Terminal graphics: streaming sixel decode + `IMGCAT.ELF` (index #1808) |
+| 86 | Window chrome & UI primitives: contract v1, twenty chrome glyphs, the AA shape renderer (index #1816) |
+| 87 | First impressions + remote terminal: launcher, staging, the remote console (index #1856) |
+| 88 | JavaScript via embedded QuickJS (`live-quickjs`; index #1915) |
+| 89 | PDF support, scoped subset: the bounded v1 Go PDF engine; ADR 0040 (index #1916) |
+| 90 | SVG rendering: the bounded vector subset; ADR 0041 (index #1917) |
+| 91 | Local desktop readiness: virtio-console TX, an owner human session 7/7 (index #1914) |
+| 92 | Init and service supervision: `INIT.ELF` declarative manifests, restart policies, a mid-boot-kill acceptance; ADR 0042 (index #1985) |
+| 93 | Dillo-tier browser subset: the exact-RGB8/SHA-256 live-web comparator, K = 3 (index #1992) |
+| 94 | Debugger and observability: tracer, 100 Hz sampler, heap analyzer, crash receipts; ADR 0043 (index #2000) |
+| 95 | Gostalgia as a guest: the static `GOSTALGIA.ELF` ships and launches (index #2008) |
+| 96 | Zig 0.17.0 toolchain port: the flag-day port of build/kernel/user/zc landed; the owner acceptance run is the remaining step (index #2060) |
+| 97 | Security audit of the trust boundaries: ~40 deduplicated findings, every Sev-A/B owned and fixed (index #2069) |
+| 98 | GOSH polish + the agent control channel: a pure-Go `shlib` engine behind GOSH/GOTERM, and `AGENTD.ELF` serving six verbs behind an HMAC challenge; ADR 0044 (indexes #2126, #2145) |
+| 99 | Go desktop/tooling depth: sound, networking, and web typography end to end (index #2178) |
+| 102 | Custom-virtio GPU 3D: an opt-in Metal render device beside the native 2D scanout (index #2160) |
+| 103 | FLINT M0, agent-native SCM: atoms, ops, signed changes, a semantic three-way merge; ADR 0049 |
+| 104 | UI depth: primitives v2, widget faces, seat chrome, composite goldens (index #2267) |
+| 106 | FLINT host server: `flintd`, the Zig FLINT-SYNC/1 server, shipped in [flint-server](https://github.com/drawmeanelephant/flint-server) |
 
-Milestones through **M104** have landed (M96's index awaits its owner
-acceptance run); `docs/status.md` is the ledger. For a
-curated account of merged work from 2026-09-01 through 2026-10-02, see the
+Every milestone through **M104** is landed or closed — plus **M106**, which
+shipped in its own repository; M105 is the open exception between them.
+`docs/status.md` is the ledger. For a curated account of merged work from
+2026-09-01 through 2026-10-02, see the
 [[chronicle|weekly merged-PR chronicle]].
 
 ## Current
 
-Five arcs are open on the tracker, each with its first cards already on main:
+Six arcs are open on the tracker — five active lanes, plus M96 awaiting its
+owner acceptance run:
 
 - **M100, a disk of our own** ([#2302](https://github.com/drawmeanelephant/VirelaiOS/issues/2302))
   — ADR 0050's journaled guest filesystem (VLFS) on a dedicated virtio-blk
   image. Landed: the RW block driver + the runner's `--data-disk` attach
-  (M100b) and `mkfs.vlfs` + the kernel's read-only `/disk` mount (M100c).
-  Ahead: the journaled write path, fsck + the kill-mid-write gate, adoption.
+  (M100b), `mkfs.vlfs` + the kernel's `/disk` mount (M100c), and the
+  journaled write path — commits, allocation, and a real fsync barrier,
+  gated by `live-vlfs-write` (M100d, PR #2351). In flight: `fsck.vlfs` +
+  journal replay + the kill-mid-write gate (M100e, claimed) and the opt-in
+  `/disk` data root (M100f, claimed). Ahead: acceptance (M100g).
 - **M101, software arrives signed** ([#2303](https://github.com/drawmeanelephant/VirelaiOS/issues/2303))
   — `FLINT.ELF` speaks FLINT-SYNC/1 (`clone`/`pull`/`push`/`ls-remote`) and
-  verifies a pinned publisher keyring before materializing (M101a/b). Ahead:
-  the `STORE.ELF` install seam (the release-manifest convention is decided)
-  and update/rollback.
+  verifies a pinned publisher keyring before materializing (M101a/b); the
+  `STORE.ELF` install seam — `store ls`/`install`/`remove` over the
+  release-stream convention — is on main (M101c, PR #2355). In review:
+  update/rollback with a staged pull + crash-safe publish (M101d, PR
+  #2356). Ahead: acceptance (M101e).
 - **M105, FLINT host client** ([#2283](https://github.com/drawmeanelephant/VirelaiOS/issues/2283))
   — the cross-platform Zig client spec is landed; the `flintd` server already
   shipped in [flint-server](https://github.com/drawmeanelephant/flint-server)
   (M106).
 - **M107, the guest builds the guest** ([#2304](https://github.com/drawmeanelephant/VirelaiOS/issues/2304))
-  — `GOBUILD.ELF` walks an import graph and drives the in-guest
-  `cmd/compile`/`cmd/link` through a multi-package build with named refusals
-  (M107a/b); GOEDIT diagnostics navigation is in review (M107c).
+  — complete through M107e: `GOBUILD.ELF` drives the in-guest
+  `cmd/compile`/`cmd/link` through a bounded import graph (M107a/b), GOEDIT
+  navigates build diagnostics (M107c), `flint
+  status`/`diff`/`commit`/`push` versions the session (M107d, gate
+  `live-flint-loop`), and the capstone `GODIFF.ELF` — a unified context
+  diff — was authored, compiled, run, and pushed entirely in-guest (M107e,
+  PR #2353, gates `live-godiff-loop` + `go-godiff`). Ahead: acceptance
+  (M107f, claimed).
 - **M108, through the glass** ([#2305](https://github.com/drawmeanelephant/VirelaiOS/issues/2305))
-  — ADR 0051's consented host lanes: the bidirectional clipboard over signed
-  VHI1 share files is landed and gated (M108b); host→guest file drop-in and
-  guest→host notify-out remain.
+  — ADR 0051's consented host lanes are landed and gated end to end: the
+  bidirectional clipboard over signed VHI1 share files (M108b), host→guest
+  file drop into `/host/INBOX` with a seat toast + mime dispatch (M108c,
+  PR #2347, gate `live-host-drop`), and seat toasts crossing out to macOS
+  banners (M108d, PR #2350, gate `live-host-notify`). Ahead: acceptance
+  (M108e).
+
+Underneath the dev-loop lanes, the runner's TCP relay now dedups
+retransmits and paces by the guest's advertised MSS/window (PR #2352,
+issue #2349) — the lane in-guest `flint push` rides on.
+
+M96 stays technically open on the ledger: all five cards of the Zig 0.17.0
+toolchain port are landed and the arc awaits its owner acceptance run
+(index #2060).
 
 Honest-bound edges that remain planned regardless of milestone:
 
@@ -86,8 +181,9 @@ Honest-bound edges that remain planned regardless of milestone:
   (no adaptive estimation), and the TCP client is single-connection.
 - **Deeper filesystem semantics on the share** — M13's B1 shipped
   delete/rename/truncate/free and no app has produced new pressure; the
-  journaled VLFS volume currently mounts read-only (M100c), with the write
-  path and fsck still open cards.
+  journaled VLFS volume now writes through real commits + an fsync barrier
+  (M100d, `live-vlfs-write`), with fsck/journal replay and the opt-in
+  `/disk` data root still open cards.
 - **Multi-display** — the guest stays single-display. Accelerated 3D exists
   only as the opt-in M102 custom-virtio Metal device; the default desktop is
   2D.

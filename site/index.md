@@ -22,18 +22,23 @@ see [[evidence]].
 
 ## Current status
 
-Milestones through **M104** have landed. Five arcs are open on the ledger —
-**M100** (a journaled guest filesystem on virtio-blk: the RW driver, the
-runner's `--data-disk` attach, the `mkfs.vlfs` formatter, and the kernel's
-`/disk` read path are on main), **M101** (signed software distribution:
-`FLINT.ELF`'s FLINT-SYNC/1 remote verbs and publisher keyring are on main),
-**M105** (the Zig FLINT host client — the `flintd` server already shipped),
-**M107** (the in-guest dev loop: `GOBUILD.ELF` drives the guest's own Go
-toolchain through a multi-package build), and **M108** (host integration: the
-bidirectional host clipboard over signed share files is on main). The table
-below is the first 31 milestones; the current tracker is
-[`docs/status.md`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/docs/status.md)
-and [[roadmap]].
+Milestones through **M104** are landed or closed — plus **M106** (the
+`flintd` host server, shipped in its own repo). Six arcs are open on the
+ledger — **M96** (the Zig 0.17.0 port's cards are all landed; its owner
+acceptance run is the last step), **M100** (a journaled guest filesystem on
+virtio-blk: the RW driver, the runner's `--data-disk` attach, `mkfs.vlfs`,
+the `/disk` mount, and the journaled write path are on main; fsck and the
+data-root cards are in flight), **M101** (signed software distribution:
+`FLINT.ELF`'s FLINT-SYNC/1 remote verbs, the publisher keyring, and the
+`STORE.ELF` install seam are on main; update/rollback is in review),
+**M105** (the Zig FLINT host client — `flintd` already shipped), **M107**
+(the in-guest dev loop, complete through M107e: `GODIFF.ELF` was authored,
+built, and pushed entirely in-guest; acceptance is in flight), and **M108**
+(host integration: the bidirectional clipboard, host→guest file drop, and
+seat→macOS notify-out are all on main; acceptance is open). The table
+below is the first 31 milestones; the full table through M106 is on
+[[roadmap]] and the canonical tracker is
+[`docs/status.md`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/docs/status.md).
 
 | Milestone | What it is | Status |
 |-----------|-----------|--------|
@@ -132,12 +137,15 @@ A single boot of VirelaiOS gets you, in order:
 - Sound: a virtio-snd device, PCM playback from EL0, a boot chime, and a
   melody app that plays Twinkle Twinkle Little Star.
 - A disk of its own (opt-in): `--data-disk <img>` attaches a second virtio-blk
-  function and the kernel mounts a `mkfs.vlfs`-formatted VLFS volume
-  read-only at `/disk` — the journaled write path is M100d's card, not yet
-  landed.
+  function and the kernel mounts a `mkfs.vlfs`-formatted VLFS volume at
+  `/disk` — journaled writes commit through a real fsync barrier (M100d,
+  gate `live-vlfs-write`); `fsck.vlfs` and opt-in data-root adoption are
+  still in flight.
 - A bridge to the Mac (opt-in): `--host-clipboard` syncs the guest clipboard
   with a named pasteboard through HMAC-signed share files, seat-mediated and
-  byte-silent when off; `FLINT.ELF` clones/pulls/pushes signed source against
+  byte-silent when off; `--host-drop` lands host files in `/host/INBOX` with
+  a seat toast and mime dispatch; `--host-notify` carries seat toasts out to
+  macOS banners; `FLINT.ELF` clones/pulls/pushes signed source against
   a host `flintd` over FLINT-SYNC/1.
 
 ![A live VirelaiOS boot: the Go seat GOTABWM with its tab strip across the top and the Go editor NOTE.ELF hosting a document in the tab below](index.assets/screenshot.png "A live VirelaiOS boot")
