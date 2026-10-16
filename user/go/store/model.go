@@ -185,18 +185,21 @@ func listStreamRecords(fs FS, root string) (map[string]*Stream, map[string]*Stre
 	return byName, byID, nil
 }
 
-// readStreamChanges parses streams/<id>.jsonl into Changes (JSON only —
-// the signature and publisher-key gate already ran in FLINT.ELF before
-// these bytes were allowed to land).
-func readStreamChanges(fs FS, root, streamID string) ([]Change, error) {
+// streamLogBytes returns the raw streams/<id>.jsonl payload — nil when
+// the log does not exist.
+func streamLogBytes(fs FS, root, streamID string) ([]byte, error) {
 	p := streamLogPath(root, streamID)
 	if !fs.Exists(p) {
 		return nil, nil
 	}
-	b, err := fs.ReadFile(p, MaxStreamLogBytes)
-	if err != nil {
-		return nil, err
-	}
+	return fs.ReadFile(p, MaxStreamLogBytes)
+}
+
+// parseStreamChanges parses a raw JSONL payload into Changes (JSON only
+// — the caller binds these bytes into `verify --all --trusted
+// --expect`, whose publisher-keyring + Ed25519 gate runs in FLINT.ELF
+// before they are folded).
+func parseStreamChanges(b []byte) ([]Change, error) {
 	lines, err := readJSONLLines(b)
 	if err != nil {
 		return nil, err

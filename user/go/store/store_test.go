@@ -488,8 +488,12 @@ func TestInstallHappy(t *testing.T) {
 	if !strings.Contains(man, "GOHELLO.ELF | Go Hello | g | dock=false\n") {
 		t.Fatalf("row missing: %q", man)
 	}
-	if !strings.Contains(strings.Join(fx.log, "|"), "verify --all") {
-		t.Fatalf("no local verify: %v", fx.log)
+	// The materialization gate runs the keyring (--trusted) bound to the
+	// exact log bytes folded (--expect=<id>:<sha256>).
+	logSHA := shaHex(fs.files[streamLogPath(DefaultStoreRoot, testStreamID)])
+	if !strings.Contains(strings.Join(fx.log, "|"),
+		"verify --all --trusted --expect="+testStreamID+":"+logSHA) {
+		t.Fatalf("verify not trusted+bound: %v", fx.log)
 	}
 }
 
@@ -595,6 +599,25 @@ func TestInstallRefusals(t *testing.T) {
 		rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP")
 		if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse already_installed") {
 			t.Fatalf("rc=%d %v", rc, *lines)
+		}
+	})
+
+	t.Run("verify refusal fails install closed", func(t *testing.T) {
+		// The child's `flint: refuse key_unknown`/`key_revoked` (the
+		// --trusted gate) prints on its own; STORE maps the nonzero exit
+		// to sync_failed and publishes nothing.
+		fs, lines, restore := mk(t, func(fs *memFS, fx *fakeExec) {
+			fx.steps = []execStep{{match: "verify", status: 1}}
+		})
+		defer restore()
+		if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+			t.Fatalf("rc=%d", rc)
+		}
+		if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse sync_failed") {
+			t.Fatalf("refusal not mapped: %v", *lines)
+		}
+		if _, ok := fs.files["/host/GOHELLO.ELF"]; ok {
+			t.Fatal("partial ELF landed on verify refusal")
 		}
 	})
 
@@ -900,7 +923,7 @@ func TestUpdateRollbackRoundTrip(t *testing.T) {
 		t.Fatalf("post-update state %+v", e)
 	}
 	if !strings.Contains(strings.Join(fx.log, "|"), "pull") ||
-		!strings.Contains(strings.Join(fx.log, "|"), "verify --all") {
+		!strings.Contains(strings.Join(fx.log, "|"), "verify --all --trusted") {
 		t.Fatalf("update skipped pull/verify: %v", fx.log)
 	}
 
@@ -932,6 +955,32 @@ func TestUpdateRollbackRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(string(fs.files[appsPath]), rowV2+"\n") {
 		t.Fatal("second rollback did not restore the v2 row")
+	}
+}
+
+// TestUpdateVerifyRefusal: the materialization gate refusing inside the
+// child (the --trusted keyring leg or the log bind) leaves the installed
+// v1 byte-identical — nothing is re-fetched or republished.
+func TestUpdateVerifyRefusal(t *testing.T) {
+	fs, fx, lines, restore := seedConsumer(t)
+	defer restore()
+	if rc := cmdInstall(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	seedConsumerV2(t, fs)
+	fx.steps = []execStep{{match: "verify", status: 1}}
+	elf, apps, state := string(fs.files["/host/GOHELLO.ELF"]),
+		string(fs.files[appsPath]), string(fs.files[statePath])
+	if rc := cmdUpdate(fs, DefaultStoreRoot, "gohello", "10.0.0.2:4748", "/host/DROP"); rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse sync_failed") {
+		t.Fatalf("%v", *lines)
+	}
+	if string(fs.files["/host/GOHELLO.ELF"]) != elf ||
+		string(fs.files[appsPath]) != apps ||
+		string(fs.files[statePath]) != state {
+		t.Fatal("verify refusal mutated installed state")
 	}
 }
 

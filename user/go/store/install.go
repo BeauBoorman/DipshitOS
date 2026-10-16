@@ -123,14 +123,31 @@ func streamID(byName, byID map[string]*Stream, sel string) (string, error) {
 	return "", refuse("stream_missing", sel)
 }
 
-// headReleaseOps loads the stream's local log and returns the folded
-// signed release.go atom set.
-func headReleaseOps(fs FS, root, id string) (map[atomKey]string, error) {
-	changes, err := readStreamChanges(fs, root, id)
+// headReleaseOps folds the signed release.go atom set from verified log
+// bytes — at install/update these are the same bytes the --expect bind
+// pinned, so nothing swapped after the gate ran can reach the fold.
+func headReleaseOps(logBytes []byte) (map[atomKey]string, error) {
+	changes, err := parseStreamChanges(logBytes)
 	if err != nil {
 		return nil, err
 	}
 	return foldReleaseOps(changes), nil
+}
+
+// verifyStore runs the materialization gate inside FLINT.ELF: the
+// publisher keyring + Ed25519 check (`verify --all --trusted`) over
+// every stream log in the local replica — including anything a share
+// writer appended after the pull — plus a hash bind on the one log
+// STORE is about to fold. A nil logBytes (a headless replica) carries
+// no bind: the fold yields no release atoms and release_missing refuses
+// downstream.
+func verifyStore(logID string, logBytes []byte) error {
+	args := []string{"verify", "--all", "--trusted"}
+	if logBytes != nil {
+		sum := sshlib.SHA256Sum(logBytes)
+		args = append(args, "--expect="+logID+":"+sshlib.EncodeHex(sum[:]))
+	}
+	return flint(args...)
 }
 
 // remoteStreamsFn is the wire-enumeration seam; tests substitute a fake.
@@ -188,7 +205,11 @@ func cmdLs(fs FS, root string, remoteFlag string) int {
 		if err != nil {
 			return runErr(err)
 		}
-		signed, err := headReleaseOps(fs, root, id)
+		logBytes, err := streamLogBytes(fs, root, id)
+		if err != nil {
+			return runErr(err)
+		}
+		signed, err := headReleaseOps(logBytes)
 		if err != nil {
 			return runErr(err)
 		}
@@ -238,20 +259,29 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 		return runErr(err)
 	}
 	st := byID[id]
-	// M101b's gate, local edition: `verify --all` runs the publisher
-	// keyring + Ed25519 check over the replica pull just confirmed
-	// current. `verify --remote` would re-fetch the same Changes off the
-	// wire — and a release-sized Change is exactly what the relay cannot
-	// carry back (remoteStreams documents the ~1460 B fill boundary), so
-	// the remote read stalls where the local fold does not.
+	// M101b's gate, local edition: `verify --all --trusted` runs the
+	// publisher keyring + Ed25519 check over the whole replica — a share
+	// writer's appended Change is refused key_unknown/key_revoked, not
+	// folded — and --expect binds the exact log bytes STORE folds, so a
+	// write landing between this read and the child's trips log_changed
+	// rather than sneaking unverified ops through. `verify --remote`
+	// would re-fetch the same Changes off the wire — and a release-sized
+	// Change is exactly what the relay cannot carry back (remoteStreams
+	// documents the ~1460 B fill boundary), so the remote read stalls
+	// where the local fold does not.
 	consoleFn("store: verify " + stream)
-	if err := flint("verify", "--all"); err != nil {
+	logBytes, err := streamLogBytes(fs, root, id)
+	if err != nil {
+		return runErr(err)
+	}
+	if err := verifyStore(id, logBytes); err != nil {
 		return runErr(err)
 	}
 	consoleFn("store: verified " + stream)
 
-	// 2. Signed release manifest atoms at head.
-	signed, err := headReleaseOps(fs, root, id)
+	// 2. Signed release manifest atoms at head — folded from the bound
+	// bytes.
+	signed, err := headReleaseOps(logBytes)
 	if err != nil {
 		return runErr(err)
 	}

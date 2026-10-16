@@ -114,14 +114,19 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	}
 
 	// The head moved: re-run the whole M101b/c gate over the new head —
-	// keyring + Ed25519 (in the FLINT.ELF child), signed release.go atom
-	// match, ELF sha256.
+	// keyring + Ed25519 (in the FLINT.ELF child, `verify --all --trusted`
+	// bound to the exact log bytes below), signed release.go atom match,
+	// ELF sha256.
 	consoleFn("store: verify " + ent.Stream)
-	if err := flint("verify", "--all"); err != nil {
+	logBytes, err := streamLogBytes(fs, root, rec.ID)
+	if err != nil {
+		return runErr(err)
+	}
+	if err := verifyStore(rec.ID, logBytes); err != nil {
 		return runErr(err)
 	}
 	consoleFn("store: verified " + ent.Stream)
-	signed, err := headReleaseOps(fs, root, rec.ID)
+	signed, err := headReleaseOps(logBytes)
 	if err != nil {
 		return runErr(err)
 	}

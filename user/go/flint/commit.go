@@ -200,9 +200,22 @@ func cmdLog(fs FS, root string, args []string) error {
 	return nil
 }
 
-// cmdVerify implements `flint verify <id> | --all | --file=<log>` locally,
-// or `--remote` (with optional --remote=<url>/--stream=<s>) against the
-// publisher keyring — the M101b verify-before-materialize gate.
+// cmdVerify implements `flint verify <id> | --all [--trusted]
+// [--expect=<stream>:<sha256>] | --file=<log>` locally, or `--remote`
+// (with optional --remote=<url>/--stream=<s>) against the publisher
+// keyring — the M101b verify-before-materialize gate.
+//
+// --trusted adds the publisher-keyring leg to the local gate: every
+// verified Change's author key must be pinned in TRUSTED.TXT and not
+// revoked — the same CheckAuthor clone/pull/`verify --remote` run on
+// fetched bytes. STORE uses `verify --all --trusted` before
+// materialization so a Change a share writer appended to the local
+// replica (self-signed by an arbitrary key) is refused instead of
+// folded. --expect=<stream>:<sha256> binds one stream's log bytes:
+// streams/<id>.jsonl is re-read after the verify pass, its sha256
+// printed for evidence, and a difference from the caller-hashed bytes
+// refuses log_changed — closing the window between the log the gate
+// verified and the log the caller folds.
 func cmdVerify(fs FS, root string, args []string) int {
 	for _, a := range args {
 		if a == "--remote" || strings.HasPrefix(a, "--remote=") ||
@@ -210,13 +223,46 @@ func cmdVerify(fs FS, root string, args []string) int {
 			return cmdVerifyRemote(fs, root, args)
 		}
 	}
-	if len(args) != 1 || args[0] == "" {
+	var sel, expect string
+	trusted := false
+	for _, a := range args {
+		switch {
+		case a == "--all" || strings.HasPrefix(a, "--file="):
+			if sel != "" {
+				return runErr(refuse("usage", ""))
+			}
+			sel = a
+		case a == "--trusted":
+			trusted = true
+		case strings.HasPrefix(a, "--expect="):
+			if expect != "" {
+				return runErr(refuse("usage", ""))
+			}
+			expect = a[len("--expect="):]
+		case strings.HasPrefix(a, "-"):
+			return runErr(refuse("usage", ""))
+		default:
+			if sel != "" {
+				return runErr(refuse("usage", ""))
+			}
+			sel = a
+		}
+	}
+	if sel == "" || (expect != "" && sel != "--all") {
 		return runErr(refuse("usage", ""))
 	}
-	arg := args[0]
 
-	if strings.HasPrefix(arg, "--file=") {
-		logPath := cleanMemPath(arg[len("--file="):])
+	var kr *Keyring
+	if trusted {
+		var err error
+		kr, err = LoadKeyring(fs, root)
+		if err != nil {
+			return runErr(err)
+		}
+	}
+
+	if strings.HasPrefix(sel, "--file=") {
+		logPath := cleanMemPath(sel[len("--file="):])
 		if logPath == "" {
 			return runErr(refuse("usage", ""))
 		}
@@ -239,10 +285,10 @@ func cmdVerify(fs FS, root string, args []string) int {
 			}
 			changes = append(changes, c)
 		}
-		return verifyChangeList(changes)
+		return verifyChangeList(changes, kr)
 	}
 
-	if arg == "--all" {
+	if sel == "--all" {
 		idx, err := LoadStoreIndex(fs, root)
 		if err != nil {
 			return runErr(err)
@@ -251,11 +297,13 @@ func cmdVerify(fs FS, root string, args []string) int {
 		if err != nil {
 			return runErr(err)
 		}
-		return verifyChangeList(changes)
-	}
-
-	if strings.HasPrefix(arg, "-") {
-		return runErr(refuse("usage", ""))
+		if rc := verifyChangeList(changes, kr); rc != 0 {
+			return rc
+		}
+		if expect != "" {
+			return checkExpectedLog(fs, root, expect)
+		}
+		return 0
 	}
 
 	idx, err := LoadStoreIndex(fs, root)
@@ -267,16 +315,47 @@ func cmdVerify(fs FS, root string, args []string) int {
 		return runErr(err)
 	}
 	for _, c := range changes {
-		if c.ID == arg {
-			return verifyChangeList([]Change{c})
+		if c.ID == sel {
+			return verifyChangeList([]Change{c}, kr)
 		}
 	}
-	return runErr(refuse("change_missing", arg))
+	return runErr(refuse("change_missing", sel))
 }
 
-func verifyChangeList(changes []Change) int {
+// checkExpectedLog re-reads streams/<id>.jsonl and binds it to the
+// caller's hash: the printed sha256 is evidence of the log this gate
+// verified, and a mismatch refuses log_changed so the caller's fold
+// provably covers the same bytes.
+func checkExpectedLog(fs FS, root, expect string) int {
+	sid, wantHex, ok := strings.Cut(expect, ":")
+	if !ok || sid == "" || !isLowerHexN(wantHex, 64) {
+		return runErr(refuse("usage", ""))
+	}
+	p := streamLogPath(root, sid)
+	if !fs.Exists(p) {
+		return runErr(refuse("log_changed", sid))
+	}
+	b, err := fs.ReadFile(p, MaxFileReadBytes)
+	if err != nil {
+		return runErr(err)
+	}
+	sum := sshlib.SHA256Sum(b)
+	got := sshlib.EncodeHex(sum[:])
+	consoleFn("flint: log " + sid + " sha256=" + got)
+	if got != wantHex {
+		return runErr(refuse("log_changed", sid))
+	}
+	return 0
+}
+
+func verifyChangeList(changes []Change, kr *Keyring) int {
 	rc := 0
 	for i := range changes {
+		if kr != nil {
+			if err := kr.CheckAuthor(changes[i].Author); err != nil {
+				return runErr(err)
+			}
+		}
 		ok, err := VerifyChange(&changes[i])
 		if err != nil {
 			return runErr(err)
