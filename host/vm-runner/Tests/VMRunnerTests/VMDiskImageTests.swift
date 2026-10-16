@@ -75,6 +75,35 @@ final class VMDiskImageTests: XCTestCase {
         }
     }
 
+    /// A create whose truncate leg fails removes the just-made file — it
+    /// must not leave a 0-byte poison the next launch would refuse as
+    /// badImageSize(0). The failure is forced with RLIMIT_FSIZE: the
+    /// ftruncate to 64 MiB crosses the 1 KiB cap and fails EFBIG, with
+    /// SIGXFSZ ignored so the probe cannot kill the test host. The limit
+    /// is process-wide, so it is restored before the retry assertion.
+    func testFailedCreateLeavesNoFile() throws {
+        signal(SIGXFSZ, SIG_IGN)
+        var old = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_FSIZE, &old), 0)
+        var cap = old
+        cap.rlim_cur = 1024
+        XCTAssertEqual(setrlimit(RLIMIT_FSIZE, &cap), 0)
+        let p = path("poisoned.img")
+        XCTAssertThrowsError(try DataDisk.prepare(path: p)) { error in
+            guard case .couldNotSize = error as? DataDisk.PrepareError else {
+                return XCTFail("expected couldNotSize, got \(error)")
+            }
+        }
+        XCTAssertEqual(setrlimit(RLIMIT_FSIZE, &old), 0)
+        signal(SIGXFSZ, SIG_DFL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: p),
+                       "a failed create must not leave a poisoned file")
+        // The retry the fix exists for: the same path creates cleanly.
+        let prepared = try DataDisk.prepare(path: p)
+        XCTAssertTrue(prepared.created)
+        XCTAssertEqual(prepared.sectors, DataDisk.defaultBytes / 512)
+    }
+
     /// A directory is never an image and is never recreated.
     func testRefusesDirectory() throws {
         XCTAssertThrowsError(try DataDisk.prepare(path: tmpDir.path)) { error in

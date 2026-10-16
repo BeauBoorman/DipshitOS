@@ -193,9 +193,16 @@ enum HostInt {
         return rec
     }
 
-    /// The forgery check: the record's MAC must match under key.
+    /// The forgery check: the record's MAC must match under key. The
+    /// compare is constant-time — an XOR-accumulate over the fixed 32-byte
+    /// tag, matching the guest side's Verify so neither end leaks a
+    /// timing channel on the refusal.
     static func verify(_ rec: Record, key: Data) -> Bool {
-        hmacSHA256(key: key, msg: rec.signed) == rec.mac
+        let mac = hmacSHA256(key: key, msg: rec.signed)
+        guard mac.count == rec.mac.count else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<mac.count { diff |= mac[i] ^ rec.mac[i] }
+        return diff == 0
     }
 
     // MARK: Lane-directory IO
