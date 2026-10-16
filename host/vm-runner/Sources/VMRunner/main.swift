@@ -323,6 +323,7 @@ import VMAppKit
 import VMDiskImage
 import VMGPU3D
 import VMPostmortem
+import VMTcp
 import VSNTP
 import VSSH
 
@@ -853,24 +854,10 @@ final class NetTcpSrvConn {
     var sshServer: SSHServer?
     var sshTx: [UInt8] = []
     var sshTxOffset = 0
-    var relayFd: Int32 = -1
-    var relayGen = 0
-    var relayClosed = false
-    var relayTx: [UInt8] = []
-    var relayTxOffset = 0
-    var relayTemplate: [UInt8] = []
-    var relayGuestNext: UInt32 = 0
-    var relayGuestAck: UInt32 = 0
-    // M107e (#2322): the byte count of guest->upstream stream space already
-    // forwarded (cumulative expected sequence). The guest's bounded TCP
-    // stack retransmits a data segment when the paced reply path lags its
-    // RTO; the old relay wrote every segment's payload unconditionally, so
-    // each retransmission duplicated bytes into the real server — a dup
-    // inside a multi-segment request corrupts the NDJSON frame (observed:
-    // live-godiff-loop's push mangled `append` into flintd's "unknown").
-    var relayGuestDataNext: UInt32 = 0
+    // #2349: the `:relay` upstream state machine (dedup + window/MSS
+    // pacing) lives in VMTcp so `swift test` drives it without a VM.
+    let relay = NetTcpRelay()
     var closed = false
-    let lock = NSLock()
 }
 var netTcpSrvConns: [String: NetTcpSrvConn] = [:]
 /// Bounded table: 16 live server-side connections; a SYN over the cap is
@@ -2513,7 +2500,7 @@ if let netCapturePath {
                     let conn = netTcpSrvConn(for: buf)
                     conn.closed = true
                     if netTcpRespondRelayMode {
-                        conn.relayShutdown()
+                        conn.relay.shutdown(suppressFin: true)
                         print("NET-TCP-RELAY: observed the guest's RST (seq 0x\(hex32(seq))); upstream closed")
                     } else if netTcpRespondSSHMode {
                         print("NET-TCP-SSH: observed the guest's RST (seq 0x\(hex32(seq)))")
@@ -2529,16 +2516,22 @@ if let netCapturePath {
                         print("NET-TCP: refused the guest's SYN (seq 0x\(hex32(seq))); \(netTcpSrvConnLimit) connections already live")
                     } else {
                     let conn = NetTcpSrvConn()
-                    if let old = netTcpSrvConns[connKey] { old.relayShutdown() }
+                    if let old = netTcpSrvConns[connKey] { old.relay.shutdown(suppressFin: true) }
                     netTcpSrvConns[connKey] = conn
-                    conn.relayGuestDataNext = seq &+ 1 // SYN consumes one sequence number
                     if netTcpRespondRelayMode, netTcpRespondRelayPort != nil {
                         // M51 interop (#1209): a fresh connection dials the
                         // real upstream NOW — real sshd sends its banner
                         // before the guest's version line, so the first
                         // paced chunk is already buffered.
                         print("NET-TCP-RELAY: connection accepted (guest SYN seq 0x\(hex32(seq))); dialing upstream \(netTcpRespondRelayHost):\(netTcpRespondRelayPort!)")
-                        conn.relayStart(netTcpRespondRelayHost, netTcpRespondRelayPort!)
+                        conn.relay.hostMAC = arpHostMAC
+                        conn.relay.hostPort = hostPort
+                        conn.relay.serverIsn = netTcpSrvIsn
+                        conn.relay.onFrame = { frame in
+                            try? netCaptureReadSocket?.write(contentsOf: Data(frame))
+                        }
+                        conn.relay.begin(synFrame: buf, n)
+                        conn.relay.start(netTcpRespondRelayHost, netTcpRespondRelayPort!)
                     } else if netTcpRespondSSHMode {
                         // M51 SSH5 (#1172): a fresh connection gets a fresh
                         // server state machine and an empty paced TX stream.
@@ -2569,16 +2562,20 @@ if let netCapturePath {
                         print("NET-TCP: handshake-only — ignoring the guest's FIN (black hole)")
                     } else {
                         let finOpts: [UInt8] = netTcpRespondOptionsMode ? netTcpOptionsData : []
-                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ 1, 0x11, payload, options: finOpts)
+                        // #2349: in relay mode the connection's send-next
+                        // lives on the relay (it advances as chunks pump);
+                        // the conn's own srvNxt never moved.
+                        let finSeq = netTcpRespondRelayMode ? conn.relay.currentSeqAck().seq : conn.srvNxt
+                        let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, finSeq, seq &+ 1, 0x11, payload, options: finOpts)
                         try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         conn.closed = true
                         if netTcpRespondRelayMode {
-                            conn.relayShutdown()
+                            conn.relay.shutdown(suppressFin: true)
                             print("NET-TCP-RELAY: the guest sent FIN; FIN-ACK and upstream close")
                         } else if netTcpRespondSSHMode {
                             print("NET-TCP-SSH: the guest sent FIN; FIN-ACK and close (SSH session done)")
                         } else {
-                            print("NET-TCP: answered the guest's FIN (seq 0x\(hex32(seq))) with a FIN-ACK (seq 0x\(hex32(conn.srvNxt)), ack 0x\(hex32(seq &+ 1)))")
+                            print("NET-TCP: answered the guest's FIN (seq 0x\(hex32(seq))) with a FIN-ACK (seq 0x\(hex32(finSeq)), ack 0x\(hex32(seq &+ 1)))")
                         }
                     }
                 } else if !payload.isEmpty {
@@ -2586,48 +2583,24 @@ if let netCapturePath {
                     // A data segment: the SSH responder's byte stream, the
                     // paced packet stream, or the HTTP/echo response.
                     if netTcpRespondRelayMode {
-                        // M51 interop (#1209): save the reply template,
-                        // forward the guest's bytes to the REAL upstream,
-                        // and pump at most one real-server chunk back. No
-                        // blocking wait: the guest waits on a bounded read
-                        // and the upstream reader pumps asynchronously.
-                        conn.relaySaveTemplate(buf, n)
-                        conn.lock.lock()
-                        let upfd = conn.relayFd
-                        // M107e (#2322): forward only bytes past the
-                        // connection's contiguous guest sequence — the
-                        // guest's bounded TCP stack retransmits a data
-                        // segment when the paced reply lags its RTO, and
-                        // writing every segment's payload unconditionally
-                        // duplicated bytes into the real server.
-                        var fwd = payload
-                        let segEnd = seq &+ UInt32(payload.count)
-                        if conn.relayGuestDataNext == 0 {
-                            conn.relayGuestDataNext = segEnd
-                        } else {
-                            let overlap = conn.relayGuestDataNext &- seq
-                            if overlap >= UInt32(payload.count) {
-                                fwd = []
-                            } else {
-                                if overlap > 0 { fwd = Array(payload[Int(overlap)...]) }
-                                if conn.relayGuestDataNext &- segEnd > 0x8000_0000 {
-                                    conn.relayGuestDataNext = segEnd
-                                }
-                            }
+                        // M51 interop (#1209) + #2349: dedup the segment's
+                        // payload against the in-order bound (retransmits
+                        // write nothing upstream a second time), then pump
+                        // as much real-server data as the guest's window
+                        // holds — not one chunk per ACK. A dead relay is an
+                        // RST, not a silent sink. No blocking wait: the
+                        // guest waits on a bounded read and the upstream
+                        // reader pumps asynchronously.
+                        if conn.relay.guestDataSegment(buf, n) == .dead {
+                            conn.closed = true
                         }
-                        conn.lock.unlock()
-                        if upfd >= 0 && !fwd.isEmpty {
-                            let wr = fwd.withUnsafeBufferPointer { p in
-                                write(upfd, p.baseAddress, p.count)
-                            }
-                            if wr < 0 {
-                                print("NET-TCP-RELAY: upstream write failed (errno \(errno))")
-                            }
-                        }
-                        if !conn.relayPump() {
-                            // Not established upstream bytes yet (or a chunk
-                            // is still in flight): ACK the guest's data bare.
-                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, [])
+                        if !conn.closed && !conn.relay.pump() {
+                            // Not established upstream bytes yet (or the
+                            // guest's window is full): ACK the guest's
+                            // data bare — at the in-order bound, so a
+                            // dropped/ahead segment is NOT covered.
+                            let sa = conn.relay.currentSeqAck()
+                            let replyLen = buildTcpReply(&reply, buf, n, arpHostMAC, hostPort, sa.seq, sa.ack, 0x10, [])
                             try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
                         }
                     } else if netTcpRespondSSHMode {
@@ -2678,8 +2651,12 @@ if let netCapturePath {
                     // next chunk; M51 SSH5 (#1172): the same pacing feeds the
                     // encrypted SSH byte stream. Otherwise it is observed.
                     if netTcpRespondRelayMode {
-                        conn.relaySaveTemplate(buf, n)
-                        if !conn.relayPump() {
+                        // #2349: the ack/window pair is adopted only when
+                        // it does not retreat — a retransmitted segment's
+                        // stale snapshot can no longer stall the pump.
+                        if conn.relay.guestAckSegment(buf, n) {
+                            conn.closed = true // stalled past the bound; RST sent
+                        } else if !conn.relay.pump() {
                             print("NET-TCP-RELAY: observed the guest's ACK (ack 0x\(hex32(ack)))")
                         }
                     } else if netTcpRespondSSHMode {
@@ -5514,21 +5491,6 @@ func buildArpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[38...41] = req[28...31] // tpa = the requester's IP
 }
 
-// Card N4 (claim 0148): RFC 1071 one's-complement checksum over
-// `bytes[start..<end]` (big-endian 16-bit words, folded; the checksummed
-// field must be zero by the caller).
-@Sendable func ipChecksum(_ bytes: [UInt8], _ start: Int, _ end: Int) -> UInt16 {
-    var sum: UInt32 = 0
-    var i = start
-    while i + 1 < end {
-        sum += (UInt32(bytes[i]) << 8) | UInt32(bytes[i + 1])
-        i += 2
-    }
-    if i < end { sum += UInt32(bytes[i]) << 8 } // trailing odd byte
-    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
-    return UInt16(~sum & 0xffff)
-}
-
 // Card N4 (claim 0148): is the datagram an ICMP ECHO REQUEST for our
 // address? Ethernet II ethertype 0x0800, version 4 / IHL 5 (0x45),
 // protocol ICMP (1), dst IP == `hostIP`, ICMP type 8. The guest's
@@ -5920,154 +5882,6 @@ func buildDhcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC:
     let udpChk = udpChecksum(leaseIP, [UInt8](repeating: 0xff, count: 4), datagram, UInt16(8 + msgLen))
     reply[40] = UInt8(udpChk >> 8)
     reply[41] = UInt8(udpChk & 0xff)
-    return frameLen
-}
-
-// Card N10 (claim 7026): is the captured frame a TCP segment for our
-// ip:port from the guest's bounded client (Ethernet II ethertype 0x0800,
-// version 4 / IHL 5, NOT a fragment, protocol TCP, dst IP = the host IP,
-// dst port = the host port)? The guest's segments are raw Ethernet —
-// header at 14..34, the TCP header at 34.
-func isTcpSegment(_ buf: [UInt8], _ n: Int, _ hostIP: [UInt8], _ hostPort: UInt16) -> Bool {
-    guard n >= 54 else { return false }
-    guard buf[12] == 0x08 && buf[13] == 0x00 else { return false } // ethertype IPv4
-    guard buf[14] == 0x45 else { return false } // version 4, IHL 5
-    guard (buf[20] & 0x1f) == 0 && buf[21] == 0 else { return false } // NOT a fragment
-    guard buf[23] == 6 else { return false } // protocol TCP
-    guard buf[30] == hostIP[0] && buf[31] == hostIP[1] && buf[32] == hostIP[2] && buf[33] == hostIP[3] else { return false }
-    let dstPort = (UInt16(buf[36]) << 8) | UInt16(buf[37])
-    return dstPort == hostPort
-}
-
-// Card N10: the TCP flags byte (frame offset 34 + 13 = 47).
-func tcpFlags(_ buf: [UInt8]) -> UInt8 {
-    return buf[47]
-}
-
-// Card N10: the TCP sequence number (big-endian u32 at frame 38..42).
-func tcpSeq(_ buf: [UInt8]) -> UInt32 {
-    return (UInt32(buf[38]) << 24) | (UInt32(buf[39]) << 16) | (UInt32(buf[40]) << 8) | UInt32(buf[41])
-}
-
-// Card N10: the TCP acknowledgment number (big-endian u32 at frame
-// 42..46).
-func tcpAck(_ buf: [UInt8]) -> UInt32 {
-    return (UInt32(buf[42]) << 24) | (UInt32(buf[43]) << 16) | (UInt32(buf[44]) << 8) | UInt32(buf[45])
-}
-
-// M99f (#2184): the advertised receive window (big-endian u16 at frame
-// 48..50). The guest reports 0 while its single RX slot is occupied —
-// a data chunk sent into a zero window is dropped as rx_full and, with
-// no retransmit here, starves the session.
-func tcpWindow(_ buf: [UInt8]) -> UInt16 {
-    return (UInt16(buf[48]) << 8) | UInt16(buf[49])
-}
-
-// Card N10: a 32-bit value as zero-padded 8-hex-digit text, built by
-// hand (Swift's String(format:) vararg bridge mismatches %x with UInt32
-// — the same reason the N5/N8 responders print values as arithmetic).
-func hex32(_ v: UInt32) -> String {
-    let hexT = Array("0123456789abcdef")
-    var out = ""
-    var shift: UInt32 = 28
-    while true {
-        let nib = Int((v >> shift) & 0xf)
-        out.append(hexT[nib])
-        if shift == 0 { break }
-        shift &-= 4
-    }
-    return out
-}
-
-// Card N10: the TCP checksum over the IPv4 pseudo-header (src IP, dst
-// IP, zero, protocol 6, TCP length) + the segment (RFC 793 §3.1 — the
-// checksum field must be zeroed by the caller during the computation).
-@Sendable func tcpChecksum(_ src: [UInt8], _ dst: [UInt8], _ segment: [UInt8], _ tcpLen: UInt16) -> UInt16 {
-    var sum: UInt32 = 0
-    sum += (UInt32(src[0]) << 8) | UInt32(src[1])
-    sum += (UInt32(src[2]) << 8) | UInt32(src[3])
-    sum += (UInt32(dst[0]) << 8) | UInt32(dst[1])
-    sum += (UInt32(dst[2]) << 8) | UInt32(dst[3])
-    sum += 6 // protocol TCP
-    sum += UInt32(tcpLen)
-    var i = 0
-    while i + 1 < segment.count {
-        sum += (UInt32(segment[i]) << 8) | UInt32(segment[i + 1])
-        i += 2
-    }
-    if i < segment.count { sum += UInt32(segment[i]) << 8 } // trailing odd byte
-    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
-    return UInt16((~sum) & 0xffff)
-}
-
-// Card N10 (claim 7026): synthesize a TCP reply to the guest's segment
-// in `req` into `reply`: Ethernet dst/src swapped, ethertype 0x0800,
-// IPv4 src/dst swapped, protocol 6, the TCP header (src = the host port,
-// dst = the guest's src port, seq = the given server seq, ack = the
-// given ack, the given flags, the FIXED window 4096, no options — the
-// guest's honest bound), the echoed payload when present; both checksums
-// recomputed (RFC 1071). Returns the frame length (54 + the payload).
-func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ srvSeq: UInt32, _ ack: UInt32, _ flags: UInt8, _ payload: [UInt8], options: [UInt8] = []) -> Int {
-    _ = n
-    // M99h (#2186): `options` is the pre-padded option area (0..40 bytes,
-    // a multiple of 4) — the `:options` mode's pinned lists; every other
-    // caller passes nothing and gets the byte-identical legacy frame.
-    let optsPad = (options.count + 3) & ~3
-    let hdrBytes = 20 + optsPad
-    let frameLen = 54 + optsPad + payload.count
-    reply = [UInt8](repeating: 0, count: frameLen)
-    // Ethernet: dst = the guest's MAC, src = the host MAC.
-    reply[0...5] = req[6...11]
-    reply[6...11] = hostMAC[0...5]
-    reply[12] = 0x08
-    reply[13] = 0x00 // ethertype IPv4
-    // IPv4: src = the guest's dst IP, dst = the guest's src IP, proto 6.
-    reply[14] = 0x45 // version 4, IHL 5
-    reply[16] = UInt8((20 + hdrBytes + payload.count) >> 8)
-    reply[17] = UInt8((20 + hdrBytes + payload.count) & 0xff) // total length
-    reply[22] = 64 // TTL
-    reply[23] = 6 // protocol TCP
-    reply[26...29] = req[30...33] // src
-    reply[30...33] = req[26...29] // dst
-    let hdrChk = ipChecksum(reply, 14, 34)
-    reply[24] = UInt8(hdrChk >> 8)
-    reply[25] = UInt8(hdrChk & 0xff)
-    // TCP: src = the host port, dst = the guest's src port, seq/ack,
-    // the data offset covering the option area, the flags, window 4096,
-    // urgent 0.
-    reply[34] = UInt8(hostPort >> 8)
-    reply[35] = UInt8(hostPort & 0xff)
-    reply[36] = req[34]
-    reply[37] = req[35]
-    reply[38] = UInt8(srvSeq >> 24)
-    reply[39] = UInt8((srvSeq >> 16) & 0xff)
-    reply[40] = UInt8((srvSeq >> 8) & 0xff)
-    reply[41] = UInt8(srvSeq & 0xff)
-    reply[42] = UInt8(ack >> 24)
-    reply[43] = UInt8((ack >> 16) & 0xff)
-    reply[44] = UInt8((ack >> 8) & 0xff)
-    reply[45] = UInt8(ack & 0xff)
-    reply[46] = UInt8((5 + optsPad / 4) << 4) // data offset (5 = no options)
-    reply[47] = flags
-    reply[48] = 0x10 // window 4096
-    reply[49] = 0x00
-    // Checksum field at 50..52 (zeroed by the memset), urgent 52..54 (0).
-    if !options.isEmpty {
-        reply[54...54 + options.count - 1] = options[0...options.count - 1]
-    }
-    if !payload.isEmpty {
-        reply[54 + optsPad...54 + optsPad + payload.count - 1] = payload[0...payload.count - 1]
-    }
-    // The TCP checksum over the pseudo-header (the guest's src IP -> the
-    // guest's dst IP), the checksum field zeroed during the computation.
-    let srcIP = [UInt8](req[26...29])
-    let dstIP = [UInt8](req[30...33])
-    var seg = [UInt8](reply[34..<frameLen])
-    seg[16] = 0
-    seg[17] = 0
-    let tcpChk = tcpChecksum(srcIP, dstIP, seg, UInt16(hdrBytes + payload.count))
-    reply[50] = UInt8(tcpChk >> 8)
-    reply[51] = UInt8(tcpChk & 0xff)
     return frameLen
 }
 
@@ -6515,219 +6329,6 @@ extension NetTcpClient {
             print("NET-TCP-STREAM: transmit failed: \(error)")
         }
     }
-}
-
-// M51 real-OpenSSH interop (#1209, goal #1066) + M99f (#2184): the
-// `:relay` upstream plumbing, per guest connection. The rendezvous is the
-// guest's SYN: connect the real server (localhost sshd), then start the
-// reader that appends real bytes to the connection's paced TX buffer. The
-// capture thread writes guest bytes to the upstream fd. Only the reader
-// closes its own fd (a generation counter retires a previous reader
-// without an fd-reuse race).
-extension NetTcpSrvConn {
-    func relayShutdown() {
-        lock.lock()
-        let fd = relayFd
-        relayFd = -1
-        lock.unlock()
-        if fd >= 0 { shutdown(fd, SHUT_RDWR) }
-    }
-
-    func relayStart(_ host: String, _ port: UInt16) {
-        relayShutdown()
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else {
-            print("NET-TCP-RELAY: upstream socket() failed (errno \(errno)); the relay is dead for this connection")
-            return
-        }
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        var a4 = in_addr()
-        guard inet_pton(AF_INET, host, &a4) == 1 else {
-            print("NET-TCP-RELAY: upstream '\(host)' is not a dotted-quad IPv4 address")
-            close(fd)
-            return
-        }
-        addr.sin_addr = a4
-        let rc = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard rc == 0 else {
-            print("NET-TCP-RELAY: upstream connect \(host):\(port) failed (errno \(errno)); the relay is dead for this connection")
-            close(fd)
-            return
-        }
-        lock.lock()
-        relayGen += 1
-        let gen = relayGen
-        relayFd = fd
-        relayTx = []
-        relayTxOffset = 0
-        relayClosed = false
-        relayTemplate = []
-        relayGuestNext = 0
-        relayGuestAck = 0
-        lock.unlock()
-        print("NET-TCP-RELAY: upstream \(host):\(port) connected (real server; bytes proxied, no crypto here)")
-        let reader = Thread { [weak self] in
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while true {
-                let n = read(fd, &buf, buf.count)
-                if n < 0 && errno == EINTR { continue }
-                guard let self else { close(fd); return }
-                if n <= 0 {
-                    self.lock.lock()
-                    if gen == self.relayGen {
-                        self.relayClosed = true
-                        if self.relayFd == fd { self.relayFd = -1 }
-                    }
-                    self.lock.unlock()
-                    close(fd)
-                    print("NET-TCP-RELAY: upstream \(host):\(port) closed (\(n == 0 ? "EOF" : "errno \(errno)"))")
-                    return
-                }
-                self.lock.lock()
-                let current = gen == self.relayGen
-                if current { self.relayTx.append(contentsOf: buf[0..<n]) }
-                self.lock.unlock()
-                if !current {
-                    close(fd)
-                    return
-                }
-                print("NET-TCP-RELAY: upstream -> guest \(n) bytes buffered")
-                // M51 interop (#1209): real-server bytes arriving with no
-                // guest segment to trigger the next chunk are pumped right
-                // here — the guest's bounded KEX/auth reads cannot wait
-                // for the next guest ACK alone.
-                self.relayPump()
-            }
-        }
-        reader.name = "net-tcp-relay-upstream"
-        reader.start()
-    }
-
-    // M51 interop (#1209): the reply template — the most recent guest
-    // segment, saved so the upstream reader can pump the next real-server
-    // chunk the moment it arrives, with no guest segment needed as a
-    // trigger (the guest waits on a BOUNDED read; a blocking capture
-    // thread would time it out). `GuestNext` is the ACK value our next
-    // segment must carry. Saved under the connection's lock.
-    func relaySaveTemplate(_ buf: [UInt8], _ n: Int) {
-        // Same data-offset rule the caller uses (M99h): TCP options push
-        // the payload past the fixed 54-byte header.
-        let dataOff = n >= 54 ? 34 + max(5, Int(buf[46] >> 4)) * 4 : n
-        let payload = n > dataOff ? n - dataOff : 0
-        lock.lock()
-        relayTemplate = Array(buf[0..<n])
-        // A retransmitted segment carries the seq/ack of its ORIGINAL send:
-        // both cursors stay monotonic or the paced pump reads a stale ack
-        // (`srvNxt == relayGuestAck` never true again) and the connection
-        // stalls into the guest's read timeout — the run-08 ETIMEDOUT.
-        relayGuestNext = max(relayGuestNext, tcpSeq(buf) &+ UInt32(payload))
-        relayGuestAck = max(relayGuestAck, tcpAck(buf))
-        lock.unlock()
-    }
-
-    /// Pump at most ONE ≤192-byte upstream chunk to the guest, and only
-    /// when the previously sent chunk has been ACKed (`srvNxt ==
-    /// GuestAck` — the guest kernel RX is a single bounded slot with no
-    /// reassembly and the host has no retransmission). Called from the
-    /// capture thread (guest traffic) AND the upstream reader
-    /// (real-server bytes); the connection lock serializes, so exactly
-    /// one segment is in flight per connection. Returns true when a
-    /// chunk went out.
-    @discardableResult
-    func relayPump() -> Bool {
-        guard netTcpRespondRelayMode else { return false }
-        lock.lock()
-        defer { lock.unlock() }
-        let total = relayTx.count
-        let off = relayTxOffset
-        guard off < total else { return false }
-        guard srvNxt == relayGuestAck else { return false }
-        let tmpl = relayTemplate
-        guard tmpl.count >= 54 else { return false }
-        let end = min(off + netTcpRespondPacketChunk, total)
-        let chunk = Array(relayTx[off..<end])
-        relayTxOffset = end
-        if end >= total {
-            relayTx.removeAll(keepingCapacity: true)
-            relayTxOffset = 0
-        }
-        var reply = [UInt8](repeating: 0, count: 4096)
-        let replyLen = buildTcpReply(&reply, tmpl, tmpl.count, [0x02, 0x00, 0x00, 0x00, 0x00, 0x02], netTcpRespondHostPort ?? 0, srvNxt, relayGuestNext, 0x10, chunk)
-        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
-        srvNxt = srvNxt &+ UInt32(chunk.count)
-        print("NET-TCP-RELAY: sent \(chunk.count) bytes to the guest (seq 0x\(hex32(srvNxt &- UInt32(chunk.count))))")
-        return true
-    }
-}
-
-// SH7 (#1083, ADR 0020 Amendment B): match a guest-originated TCP segment
-// in the HOST-CLIENT direction — src IP/port = the guest listener, dst port
-// = the host client's fixed source port (the reverse of `isTcpSegment`).
-func isTcpSegmentFromGuest(_ buf: [UInt8], _ n: Int, _ guestIP: [UInt8], _ guestPort: UInt16, _ clientPort: UInt16) -> Bool {
-    guard n >= 54 else { return false }
-    guard buf[12] == 0x08 && buf[13] == 0x00 else { return false } // ethertype IPv4
-    guard buf[14] == 0x45 else { return false } // version 4, IHL 5
-    guard (buf[20] & 0x1f) == 0 && buf[21] == 0 else { return false } // NOT a fragment
-    guard buf[23] == 6 else { return false } // protocol TCP
-    guard buf[26] == guestIP[0] && buf[27] == guestIP[1] && buf[28] == guestIP[2] && buf[29] == guestIP[3] else { return false }
-    let srcPort = (UInt16(buf[34]) << 8) | UInt16(buf[35])
-    let dstPort = (UInt16(buf[36]) << 8) | UInt16(buf[37])
-    return srcPort == guestPort && dstPort == clientPort
-}
-
-// SH7: synthesize a frame from EXPLICIT Ethernet/IPv4/TCP fields (the N10
-// `buildTcpReply` copies those from a request frame; a host-initiated
-// client has no request to copy from). Both checksums are recomputed.
-func buildTcpFrameExplicit(_ frame: inout [UInt8], _ dstMAC: [UInt8], _ srcMAC: [UInt8], _ srcIP: [UInt8], _ dstIP: [UInt8], _ srcPort: UInt16, _ dstPort: UInt16, _ seq: UInt32, _ ack: UInt32, _ flags: UInt8, _ payload: [UInt8]) -> Int {
-    let frameLen = 54 + payload.count
-    frame = [UInt8](repeating: 0, count: frameLen)
-    frame[0...5] = dstMAC[0...5]
-    frame[6...11] = srcMAC[0...5]
-    frame[12] = 0x08
-    frame[13] = 0x00 // ethertype IPv4
-    frame[14] = 0x45 // version 4, IHL 5
-    frame[16] = UInt8((20 + 20 + payload.count) >> 8)
-    frame[17] = UInt8((20 + 20 + payload.count) & 0xff) // total length
-    frame[22] = 64 // TTL
-    frame[23] = 6 // protocol TCP
-    frame[26...29] = srcIP[0...3]
-    frame[30...33] = dstIP[0...3]
-    let hdrChk = ipChecksum(frame, 14, 34)
-    frame[24] = UInt8(hdrChk >> 8)
-    frame[25] = UInt8(hdrChk & 0xff)
-    frame[34] = UInt8(srcPort >> 8)
-    frame[35] = UInt8(srcPort & 0xff)
-    frame[36] = UInt8(dstPort >> 8)
-    frame[37] = UInt8(dstPort & 0xff)
-    frame[38] = UInt8(seq >> 24)
-    frame[39] = UInt8((seq >> 16) & 0xff)
-    frame[40] = UInt8((seq >> 8) & 0xff)
-    frame[41] = UInt8(seq & 0xff)
-    frame[42] = UInt8(ack >> 24)
-    frame[43] = UInt8((ack >> 16) & 0xff)
-    frame[44] = UInt8((ack >> 8) & 0xff)
-    frame[45] = UInt8(ack & 0xff)
-    frame[46] = 0x50 // data offset 5 (no options)
-    frame[47] = flags
-    frame[48] = 0x10 // window 4096
-    frame[49] = 0x00
-    if !payload.isEmpty {
-        frame[54...54 + payload.count - 1] = payload[0...payload.count - 1]
-    }
-    var seg = [UInt8](frame[34..<frameLen])
-    seg[16] = 0
-    seg[17] = 0
-    let tcpChk = tcpChecksum(srcIP, dstIP, seg, UInt16(20 + payload.count))
-    frame[50] = UInt8(tcpChk >> 8)
-    frame[51] = UInt8(tcpChk & 0xff)
-    return frameLen
 }
 
 // Card N4 (claim 0148): synthesize the ICMP ECHO REPLY to the echo

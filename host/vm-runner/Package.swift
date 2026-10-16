@@ -76,14 +76,22 @@ let package = Package(
             name: "VMGPU3D",
             path: "Sources/VMGPU3D"
         ),
+        // #2349: the runner's TCP wire helpers + the :relay upstream
+        // state machine (NetTcpRelay) — pure Swift/Foundation, zero
+        // Virtualization imports, so `swift test` proves the >1460-byte
+        // inbound payload and retransmit-dedup behavior without a VM.
+        .target(
+            name: "VMTcp",
+            path: "Sources/VMTcp"
+        ),
         .executableTarget(
             name: "VMRunner",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage"],
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"],
             path: "Sources/VMRunner"
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"]
         )
     ],
     swiftLanguageModes: [.v5]
