@@ -79,6 +79,8 @@ for prog in "${@:-$REPO/tools/go/hello.go}"; do
         goloadbss)  base="GOLOADBSS" ;;
         goread)     base="GOREAD" ;;
         gosyscall)  base="GOSYSCALL" ;;
+        # #2354: the region-straddle large-read fixture (go-hello run 13).
+        gobigread)  base="GOBIGREAD" ;;
         # M70c-S2 (#1544): the in-guest build-loop driver.
         selfhost)   base="GOSELFHOST" ;;
     esac
@@ -100,6 +102,8 @@ for prog in "${@:-$REPO/tools/go/hello.go}"; do
         # M70c-S1P (#1525): the syscall-layer fixture — the std `syscall`
         # package for GOOS=virelai, which is smaller than `vi` but not small.
         GOSYSCALL) strip="-s -w" ;;
+        # #2354: os/fmt surface like GOSYSCALL's — same class.
+        GOBIGREAD) strip="-s -w" ;;
         # M70c-S2 (#1544): the driver links `vi` (Exec/Wait/Probe) and `vsys`,
         # the same order of surface GOREAD links.
         GOSELFHOST) strip="-s -w" ;;

@@ -38,9 +38,18 @@
 # after the edit and before the run); run 10 executes the image the Mac built
 # from the guest's own bytes. The guest never sees a compiler - both runs
 # assert the host's own receipt line absent from their serial.
-# HOST PREREQUISITE: `.build/go/{GOHELLO,GOBIG,GOREAD,GOSYSCALL}.ELF` must exist
-# first via `bash tools/go/build-go.sh tools/go/hello.go tools/go/gobig.go
-# tools/go/goread.go tools/go/gosyscall.go` (fork prerequisites in
+# Run 13 (#2354): GOBIGREAD.ELF reads GOBIG.ELF through os.ReadFile — the
+# growing-buffer shape that lands a 2048-byte read chunk ACROSS the armed
+# region boundary where the Go runtime's sbrk chain grows the heap
+# (observed live: `read /host/GPKG_runtime.a: bad address` ~4.4 MiB into a
+# 12 MiB archive on the pure cv channel, live-godiff-loop run 06). Every
+# other big-read fixture uses a fixed 2-4 KiB buffer that never straddles.
+# The bytes are held to the file on macOS (FNV-1a-64), and a deep+mid
+# ReadAt pair proves the port's shadow pull after the sequential pass.
+# HOST PREREQUISITE: `.build/go/{GOHELLO,GOBIG,GOREAD,GOSYSCALL,GOBIGREAD}.ELF`
+# must exist first via `bash tools/go/build-go.sh tools/go/hello.go
+# tools/go/gobig.go tools/go/goread.go tools/go/gosyscall.go
+# tools/go/gobigread.go` (fork prerequisites in
 # tools/go/README.md); runs 06-08 additionally need `bash tools/go/build-gotool.sh`
 # (the GOOS=virelai toolchain images) and `bash tools/go/stage-selfhost.sh`
 # (the import config + package archives the guest's linker resolves against).
@@ -87,16 +96,24 @@ vgate_file script5.txt <<'EOF'
 exec GOSYSCALL.ELF
 EOF
 
+# #2354 run 13: the straddle reproducer — os.ReadFile's growing destination
+# plus a deep ReadAt pull, against the same 9.5 MiB image run 04 hashes.
+vgate_file script17.txt <<'EOF'
+exec GOBIGREAD.ELF /host/GOBIG.ELF
+EOF
+
 vgate_setup_python <<'PY'
 import os, shutil, sys
 share = os.path.join(os.environ["RUN_DIR"], "share")
 srcs = [".build/go/GOHELLO.ELF", ".build/go/GOBIG.ELF", ".build/go/GOREAD.ELF",
-        ".build/go/GOSYSCALL.ELF", ".build/go/GOLOADBSS.ELF"]
+        ".build/go/GOSYSCALL.ELF", ".build/go/GOLOADBSS.ELF",
+        ".build/go/GOBIGREAD.ELF"]
 missing = [p for p in srcs if not os.path.exists(p)]
 if missing:
     sys.exit("%s missing — build the fork binaries first: "
              "bash tools/go/build-go.sh tools/go/hello.go tools/go/gobig.go "
              "tools/go/goloadbss.go tools/go/goread.go tools/go/gosyscall.go "
+             "tools/go/gobigread.go "
              "(or `just go-toolchain`; fork prerequisites in tools/go/README.md)"
              % ", ".join(missing))
 for src in srcs:
@@ -867,4 +884,48 @@ if not free:
     sys.exit("FAIL: no allocator line in the serial")
 print("the 1 GiB twin was refused by the map bound, and the monitor kept reading "
       "(free=0x%s pages after the refusal)" % free[-1])
+PY
+
+# #2354 run 13: the large-read straddle regression leg, on the pure cv
+# channel (the spec's `seed` share). GOREAD/GOSYSCALL hash their file
+# through a fixed 2-4 KiB buffer that lands inside ONE armed region every
+# call; os.ReadFile's destination grows across the whole file, so its
+# 2048-byte chunks eventually straddle the boundary between two of the Go
+# heap's adjacent sbrk regions — the exact copy_out range that used to
+# EFAULT. The assert holds the guest's own byte count + FNV-1a-64 to the
+# file on macOS, and the ReadAt pair proves the port's post-read shadow
+# serves backward offsets too.
+vgate_run 13 -- --script '$RUN_DIR/script17.txt' --script-expect 'gobigread: BIGREAD OK' --timeout 300
+
+vgate_assert 13 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 13 serial-contains 'exec: loaded GOBIGREAD.ELF'
+vgate_assert 13 serial-contains 'gobigread: readat deep+mid ok'
+vgate_assert 13 serial-contains 'gobigread: BIGREAD OK'
+vgate_assert 13 serial-absent 'gobigread: FAIL'
+vgate_assert 13 serial-absent 'bad address'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 serial-absent 'exited status=139'
+vgate_assert 13 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+src = os.path.join(share, "GOBIG.ELF")  # what the fixture os.ReadFile'd
+if not os.path.exists(src):
+    sys.exit("FAIL: the fixture's input is missing: " + src)
+n = os.path.getsize(src)
+if n <= 4 * 1024 * 1024 + 400 * 1024:
+    sys.exit("FAIL: GOBIG.ELF is %d B — under the ~4.4 MiB cliff, the "
+             "straddle is untested" % n)
+# FNV-1a-64, the same fold the fixture prints.
+h = 0xcbf29ce484222325
+with open(src, "rb") as fh:
+    blob = fh.read()
+for byte in blob:
+    h = ((h ^ byte) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+ser = open(os.environ["VG_SER"], errors="replace").read()
+want = "gobigread: readfile bytes %d fnv 0x%016x" % (n, h)
+if want not in ser:
+    sys.exit("FAIL: the guest's os.ReadFile hash does not match the file on "
+             "macOS (want %r)" % want)
+print("os.ReadFile over cv: %d B, fnv 0x%016x — byte-exact past the "
+      "4.4 MiB straddle cliff" % (n, h))
 PY

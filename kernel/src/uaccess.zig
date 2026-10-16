@@ -281,20 +281,38 @@ pub fn stats() Stats {
     };
 }
 
-/// Range check: `[address, address+len)` must be non-wrapping and fully
-/// contained in one of `regions`. Zero length is always ok (nothing to
-/// access). This is the first line of defense; the fault window is the second.
+/// Range check: `[address, address+len)` must be non-wrapping and covered
+/// by the armed regions with no gap — every byte inside SOME region. Zero
+/// length is always ok (nothing to access). This is the first line of
+/// defense; the fault window is the second.
+///
+/// Issue #2354: coverage, not single-region containment. The armed list is
+/// a SET of adjacent apertures — the Go runtime's heap is a chain of
+/// separately-registered sbrk mmap regions, so a valid EL0 buffer can
+/// straddle a boundary (observed: a 2048-byte read buffer at 0x4bfffec4
+/// crossing 0x4c000000, the seam between two armed heap regions, EFAULT'd
+/// ~4.4 MiB into a 12 MiB archive read). Each step takes the region that
+/// covers `cur` and reaches furthest; a byte no armed region covers ends
+/// the walk as a fault. The read/write split is unchanged: copy_out still
+/// walks the WRITE list only, so a straddle through a read-only aperture
+/// remains a permission fault.
 fn range_ok(regions: []const Region, address: u64, len: u64) bool {
     if (len == 0) return true;
     const end = address +% len;
     if (end < address) return false; // overflow: bad pointer
-    for (regions) |region| {
-        if (region.len == 0) continue;
-        const region_end = region.base +% region.len;
-        if (region_end < region.base) continue;
-        if (address >= region.base and end <= region_end) return true;
+    var cur = address;
+    while (cur < end) {
+        var next = cur;
+        for (regions) |region| {
+            if (region.len == 0) continue;
+            const region_end = region.base +% region.len;
+            if (region_end < region.base) continue;
+            if (cur >= region.base and cur < region_end and region_end > next) next = region_end;
+        }
+        if (next == cur) return false; // no armed region covers this byte
+        cur = next;
     }
-    return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +612,67 @@ test "uaccess: boundary — range ending exactly at the region end is ok, one pa
     const s = stats();
     try std.testing.expectEqual(@as(u64, 1), s.copies);
     try std.testing.expectEqual(@as(u64, 3), s.validation_faults);
+}
+
+test "uaccess: a range straddling ADJACENT armed regions is covered (issue #2354)" {
+    init();
+    var buf: [64]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast(i);
+    var dst: [64]u8 = undefined;
+    const base = @intFromPtr(&buf);
+    // The Go-heap shape behind the ~4.4 MiB EFAULT: two separately armed
+    // regions sharing one boundary; no single region holds the range.
+    set_regions(.{ .base = 0, .len = 0 }, .{ .base = 0, .len = 0 });
+    try std.testing.expect(add_read_region(.{ .base = base, .len = 32 }));
+    try std.testing.expect(add_read_region(.{ .base = base + 32, .len = 32 }));
+    try std.testing.expect(add_write_region(.{ .base = base, .len = 32 }));
+    try std.testing.expect(add_write_region(.{ .base = base + 32, .len = 32 }));
+    // Reads and writes crossing the seam are covered byte-for-byte.
+    try std.testing.expectEqual(Outcome.ok, copy_in(dst[0..48], base + 8, 48));
+    try std.testing.expectEqualSlices(u8, buf[8..56], dst[0..48]);
+    try std.testing.expectEqual(Outcome.ok, copy_out(base + 8, "0123456789abcdef", 16));
+    try std.testing.expectEqualStrings("0123456789abcdef", buf[8..24]);
+    const s = stats();
+    try std.testing.expectEqual(@as(u64, 2), s.copies);
+    try std.testing.expectEqual(@as(u64, 0), s.validation_faults);
+}
+
+test "uaccess: straddling a GAP between armed regions still faults (issue #2354)" {
+    init();
+    var buf: [64]u8 = undefined;
+    @memset(buf[0..], 0);
+    var dst: [64]u8 = undefined;
+    const base = @intFromPtr(&buf);
+    set_regions(.{ .base = 0, .len = 0 }, .{ .base = 0, .len = 0 });
+    // [base, base+32) and [base+40, base+64): bytes 32..40 are armed NOWHERE.
+    try std.testing.expect(add_read_region(.{ .base = base, .len = 32 }));
+    try std.testing.expect(add_read_region(.{ .base = base + 40, .len = 24 }));
+    try std.testing.expect(add_write_region(.{ .base = base, .len = 32 }));
+    try std.testing.expect(add_write_region(.{ .base = base + 40, .len = 24 }));
+    // A range reaching into the gap faults — the walk cannot widen to cover it.
+    try std.testing.expectEqual(Outcome.fault, copy_in(dst[0..48], base + 8, 48));
+    try std.testing.expectEqual(Outcome.fault, copy_out(base + 24, "0123456789abcdef", 16));
+    // A range wholly inside the gap faults too.
+    try std.testing.expectEqual(Outcome.fault, copy_in(dst[0..4], base + 34, 4));
+    // The covered parts still work on both sides of the gap.
+    try std.testing.expectEqual(Outcome.ok, copy_in(dst[0..8], base + 8, 8));
+    try std.testing.expectEqual(Outcome.ok, copy_in(dst[0..8], base + 48, 8));
+    const s = stats();
+    try std.testing.expectEqual(@as(u64, 3), s.validation_faults);
+}
+
+test "uaccess: a straddle through a read-ONLY aperture stays a write fault (issue #2354)" {
+    init();
+    var buf: [64]u8 = undefined;
+    @memset(buf[0..], 0);
+    const base = @intFromPtr(&buf);
+    // Read list covers both halves; the WRITE list only the second — the
+    // read/write split the coverage walk must not blur.
+    set_regions(.{ .base = base, .len = 32 }, .{ .base = base + 32, .len = 32 });
+    var dst: [8]u8 = undefined;
+    try std.testing.expectEqual(Outcome.ok, copy_in(dst[0..8], base + 28, 8));
+    try std.testing.expectEqual(Outcome.fault, copy_out(base + 28, "12345678", 8));
+    try std.testing.expectEqual(Outcome.ok, copy_out(base + 32, "12345678", 8));
 }
 
 test "uaccess: overflow and zero length" {
