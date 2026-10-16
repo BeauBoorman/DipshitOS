@@ -24,6 +24,19 @@ import UserNotifications
 // name. Never-logged holds: toast text never reaches stdout — seq plus the
 // cumulative dropped count is the whole marker story.
 final class HostNotify: NSObject {
+    /// Consume bound per 250 ms tick: ONE verified record — the seat's own
+    /// emit rate (D5). The lane dir is guest-writable and the guest holds
+    /// the lane key, so a hostile guest can drop thousands of validly-MAC'd
+    /// records at once; the cap means that buys at most one banner (or
+    /// named drop) per poll. Verified records past the cap stay on disk
+    /// for the next tick rather than being deleted.
+    static let perTickMax = 1
+    /// The seat's own toast-text budget in bytes (D5; the kind-12 strip's
+    /// 24). A verified record can carry up to payloadMax — the body is
+    /// clamped to the budget on a UTF-8 boundary before it can reach a
+    /// banner.
+    static let bodyMax = 24
+
     private let session: HostIntSession
     private var laneDir: URL { session.laneDir }
     private var lastSeq: UInt32 = 0      // last consumed NOTIFY_OUT seq
@@ -58,11 +71,12 @@ final class HostNotify: NSObject {
     }
 
     /// The 250 ms poll step (hostIntTick): drain NOTIFY_OUT records in seq
-    /// order. Every verified record is consumed — the runner side has no
-    /// rate bound of its own; the seat's 1/tick + 4-outstanding is the
-    /// whole flood story.
+    /// order. Refused records are still deleted as met, but only
+    /// `perTickMax` verified records are consumed per tick — anything
+    /// beyond stays on disk and drains at the lane's own rate.
     func tick() {
         guard let files = HostInt.records(laneDir: laneDir, tag: .notifyOut) else { return }
+        var consumed = 0
         for (name, seq) in files {
             let url = laneDir.appendingPathComponent(name)
             guard let raw = try? Data(contentsOf: url) else {
@@ -97,9 +111,14 @@ final class HostNotify: NSObject {
                 remove(url)
                 continue
             }
+            // The per-tick bound: a verified record past it is left for
+            // the next tick — consume is the expensive act (banner or
+            // named drop), not the refusal sweeps above.
+            guard consumed < Self.perTickMax else { break }
             lastSeq = seq
             remove(url)
             post(text, seq: seq)
+            consumed += 1
         }
     }
 
@@ -119,12 +138,21 @@ final class HostNotify: NSObject {
         }
         let content = UNMutableNotificationContent()
         content.title = "VirelaiOS"
-        content.body = text
+        content.body = Self.clamped(text)
         let req = UNNotificationRequest(
             identifier: "vhi1-notify-\(session.epoch)-\(seq)",
             content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req) { _ in }
         FileHandle.standardOutput.write(Data("host-notify: post seq=\(seq)\n".utf8))
+    }
+
+    /// The bodyMax clamp: whole Characters drop off the tail until the
+    /// text fits the seat's 24-byte budget — the cut can never split a
+    /// UTF-8 scalar.
+    static func clamped(_ text: String) -> String {
+        var out = text
+        while out.utf8.count > bodyMax { out = String(out.dropLast()) }
+        return out
     }
 
     private func remove(_ url: URL) {
