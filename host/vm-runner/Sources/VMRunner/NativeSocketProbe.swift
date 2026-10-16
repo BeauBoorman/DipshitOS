@@ -1,4 +1,5 @@
 import Foundation
+import VMTcp
 
 // B6's hermetic Ethernet peers. No host listening socket or public exposure.
 // The capture thread observes the real guest packets, not an injected core.
