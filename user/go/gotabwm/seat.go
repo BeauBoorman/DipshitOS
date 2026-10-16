@@ -724,6 +724,12 @@ func consumeSeatEvent(e vi.Event) bool {
 			return false
 		}
 		handleWmKey(e)
+		// M107e (#2322): poll the host-integration lane on the input path,
+		// not only at the ~1 Hz composite tick — a host clipboard item the
+		// user pastes with ctrl-v would otherwise sit unapplied for up to a
+		// full tick after their gesture. Per-key polling makes the lane
+		// land within the keystroke that asked for it.
+		hostintSeatTick()
 		// Yield only when the launcher is closed: a hosted client (GOEDIT
 		// ctrl-s) needs a scheduling slice to drain KEY_DOWN before the
 		// next virtio chord. #2260: this used to park a whole scheduler
