@@ -80,27 +80,54 @@
 # match), re-parses the untrusted /host/DROP release.go against the
 # signed head's new_hash, sha256s the fetched ELF against
 # ReleaseELFSHA256, and only then WriteFileSafes /host/GOHELLO.ELF + the
-# APPS.TXT row — `GOHELLO.ELF` then execs. Run 15 removes it, then two
-# tamper legs (DROPBAD's mutated ELF -> elf_mismatch, DROPSIG's
-# version-bumped release.go -> release_mismatch) leave zero partial
-# state. STORE speaks the wire itself ONLY for `ls`+head checks (a
-# minimal hello/auth/list client; the shared secret is bound to
-# STORE.ELF via the apps allowlist): pull/verify are direct FLINT.ELF
-# execs — an inner GOSH.ELF -c capture would put FOUR Go runtimes on the
-# task pool at once (outer gosh + store + gosh + flint = 16 > 13 user
-# slots) and the child dies `newosproc: sys_thread create failed`. The
-# child's `flint: refuse <name>` still reaches serial verbatim; STORE
-# reports store: refuse sync_failed alongside it.
+# APPS.TXT row — `GOHELLO.ELF` then execs. STORE speaks the wire itself
+# ONLY for `ls`+head checks (a minimal hello/auth/list client; the
+# shared secret is bound to STORE.ELF via the apps allowlist):
+# pull/verify are direct FLINT.ELF execs — an inner GOSH.ELF -c capture
+# would put FOUR Go runtimes on the task pool at once (outer gosh +
+# store + gosh + flint = 16 > 13 user slots) and the child dies
+# `newosproc: sys_thread create failed`. The child's `flint: refuse
+# <name>` still reaches serial verbatim; STORE reports store: refuse
+# sync_failed alongside it.
 #
-# This spec is grown across M103a-d/M101a and is NOT vgate_repeat-safe (runs
-# 01-03, 05-07, and 08-10 share /host state across boots).
+# Runs 15-17 (M101e #2317): the acceptance legs — update, rollback, and
+# the standing negatives, all on store-share (state carries boot to
+# boot). The v2 fixture is GOHELLO.ELF with its marker literal patched
+# ("virelai-go OK" -> "virelai-go V2"): distinct bytes, distinct sha256,
+# a distinct serial marker — no second build. Its release Change is
+# parented on v1's with modify ops for the two moved atoms
+# (ReleaseVersion + ReleaseELFSHA256), minted by the same env-gated
+# generator. The wire still cannot carry a release-sized Change, so run
+# 15's script advances the local `rel` replica to v2 by file copy (the
+# same seam M101c staged v1 with) — `flint pull` then answers "up to
+# date" because the remote head is already inside local history — and
+# `store update` runs the full verify + fetch + WriteFileSafe publish
+# for real. `store rollback` re-materializes the retained .prev bytes.
+# Run 16 is the update negatives: a bad v2 ELF drop refuses elf_mismatch
+# BEFORE any publish (old state untouched), then `echo >>` appends stage
+# the torn-publish shapes — a diverged .prev refuses rollback with
+# prev_mismatch, a diverged live ELF (STORE.TXT still records v1) makes
+# update AND rollback refuse state_mismatch — and the post-run python
+# pins every tracked file byte-exact. (`cat >` cannot move a >4 KiB file
+# in-guest — readBounded — so the tears are appends.) Run 17 removes the app
+# (remove needs no hash match — the recovery path), then refuses
+# installs on the tampered drops plus the two publisher negatives:
+# badkey/revkey are ~400 B empty-ops Changes served ONLY by flintd —
+# small enough to clone over the wire for real, so the keyring gate
+# fires: badkey's author is simply absent (key_unknown) and revkey's is
+# a revoked= row in TRUSTED.TXT (key_revoked). Both also refuse inside
+# run 14's `store ls` — the honest negatives print in the same boot as
+# the happy path.
+#
+# This spec is grown across M103a-d/M101a-e and is NOT vgate_repeat-safe
+# (runs 01-03, 05-07, 08-10, and 14-17 share /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
 #   bash tools/go/build-gosh.sh  -> .build/go/GOSH.ELF
 #   bash tools/go/build-store.sh -> .build/go/STORE.ELF
 #   bash tools/go/build-go.sh    -> .build/go/GOHELLO.ELF
-#   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-16 only;
+#   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-17 only;
 #   the hook zig-builds flintd. flint-server is drawmeanelephant's repo under
 #   the VirelaiOS proprietary source-available license (not GPL-family).
 #
@@ -110,8 +137,9 @@
 # 06/09 end on `flint: commit ok`, run 07 ends on `flint: status ws=a`, run
 # 10 ends on `flint: merge conflicts=1`, run 11 ends on `flint: clone ok`,
 # run 12 ends on `flint: pull up to date`, run 13 ends on `flint: refuse
-# auth_failed`, run 14 ends on `flint: commit ok`, run 15 ends on
-# `virelai-go OK`, and run 16 ends on `store: refuse release_mismatch`.
+# auth_failed`, runs 14/15 end on `virelai-go OK` (the v1 install, then the
+# rollback restoring it), run 16 ends on `m101e: torn-state legs done`, and
+# run 17 ends on `m101e: negatives done`.
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -186,10 +214,25 @@ net arp 10.0.0.2
 exec GOSH.ELF -c "STORE.ELF ls --remote=10.0.0.2:4749;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROP;GOHELLO.ELF"
 EOF
 
+# Runs 15-17 drive the multi-line install legs through staged .SH files —
+# the replica advance and the torn-publish leg need `cat >` redirection,
+# and a sourced script keeps the sequencing in-guest like runs 02-13.
 vgate_file script-15.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec GOSH.ELF -c "STORE.ELF remove GOHELLO;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROPBAD;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROPSIG"
+exec GOSH.ELF -c "source /host/FLINTJ/15.SH"
+EOF
+
+vgate_file script-16.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/16.SH"
+EOF
+
+vgate_file script-17.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/17.SH"
 EOF
 
 vgate_setup_python <<'PY'
@@ -580,15 +623,11 @@ rel_change = json.loads(rel_change_line)
 release_go = open(os.path.join("user", "go", "store", "testdata", "release.go"),
                   "r", encoding="utf-8").read()
 REL_ROW = "GOHELLO.ELF | Go Hello | g | dock=false"
-# The tamper variant: a version bump parses fine but rehashes the atom, so
-# it fails release_mismatch — not release_malformed.
-release_go_tampered = release_go.replace('"1.0.0"', '"9.9.9"')
-assert release_go_tampered != release_go
 
 # Consumer share: STORE+GOSH+FLINT, publisher keyring, the real fleet
-# manifest, and the three drops (clean / mutated ELF / tampered
-# release.go). GOHELLO.ELF is staged ONLY inside the drops — install must
-# be the thing that lands it at the share root.
+# manifest, and the drops (clean v1 / clean v2 / mutated v2 ELF /
+# tampered v2 release.go). GOHELLO.ELF is staged ONLY inside the drops —
+# install must be the thing that lands it at the share root.
 store_share = os.path.join(run, "store-share")
 os.makedirs(os.path.join(store_share, "FLINTJ"), exist_ok=True)
 os.makedirs(os.path.join(store_share, "FLINT"), exist_ok=True)
@@ -655,9 +694,171 @@ def write_drop(drop, rel_text, elf):
     open(os.path.join(d, "GOHELLO.ELF"), "wb").write(elf)
 
 write_drop("DROP", release_go, elf_bytes)
-write_drop("DROPBAD", release_go, elf_bytes + b"\x00")
-write_drop("DROPSIG", release_go_tampered, elf_bytes)
 
+# ---- M101e (#2317): update/rollback + the standing negatives -----------
+# v2 is GOHELLO.ELF with its marker literal patched: same program,
+# distinct bytes, distinct sha256, a distinct serial marker — the update
+# swap is visible without a second build. The v2 release Change is
+# parented on v1's and carries modify ops for the two moved atoms; the
+# same env-gated generator (user/go/store/fixture_gen_test.go) mints it
+# plus two ~400 B empty-ops Changes signed by untrusted keys for the
+# publisher negatives — small enough to clone over the wire for real, so
+# the M101b keyring gate is what refuses them (a locally-staged replica
+# would short-circuit pull at "up to date" and never consult
+# TRUSTED.TXT).
+mark_v1 = b"virelai-go OK"
+mark_v2 = b"virelai-go V2"
+if elf_bytes.count(mark_v1) != 1:
+    sys.exit("GOHELLO.ELF marker %r occurs %d times (need exactly 1)"
+             % (mark_v1, elf_bytes.count(mark_v1)))
+elf_v2 = elf_bytes.replace(mark_v1, mark_v2)
+
+fixture_dir = os.path.join(run, "fixtures")
+os.makedirs(fixture_dir, exist_ok=True)
+open(os.path.join(fixture_dir, "gohello-v2.elf"), "wb").write(elf_v2)
+
+
+def gen_release_fixture(env):
+    g = subprocess.run(
+        ["go", "test", "./store", "-run", "TestGenReleaseFixture", "-count=1"],
+        cwd="user/go",
+        env={**os.environ, "STORE_GEN_FIXTURE": "1", **env},
+        capture_output=True, text=True)
+    if g.returncode != 0:
+        sys.exit("fixture generation failed (tag=%s):\n%s%s"
+                 % (env.get("STORE_FIXTURE_TAG", "?"),
+                    g.stdout[-2000:], g.stderr[-2000:]))
+
+
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-v2.elf"),
+    "STORE_FIXTURE_VERSION": "2.0.0",
+    "STORE_FIXTURE_PARENT": rel_change["id"],
+    "STORE_FIXTURE_PREV_ELF": os.path.abspath(gohello),
+    "STORE_FIXTURE_PREV_VERSION": "1.0.0",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c002",
+    "STORE_FIXTURE_TS": "1760000100000",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "v2",
+})
+gen_release_fixture({
+    "STORE_FIXTURE_EMPTY": "1",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000e010",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000e001",
+    "STORE_FIXTURE_TS": "1760000200000",
+    "STORE_FIXTURE_MSG": "untrusted publisher",
+    "STORE_FIXTURE_SEED_HEX": "b1" * 32,
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "badkey",
+})
+gen_release_fixture({
+    "STORE_FIXTURE_EMPTY": "1",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000e011",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000e002",
+    "STORE_FIXTURE_TS": "1760000300000",
+    "STORE_FIXTURE_MSG": "revoked publisher",
+    "STORE_FIXTURE_SEED_HEX": "b2" * 32,
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "revkey",
+})
+
+rel_v2_line = open(os.path.join(fixture_dir, "release-v2-stream.jsonl"),
+                   "r", encoding="utf-8").read().strip()
+rel_v2 = json.loads(rel_v2_line)
+release_v2_go = open(os.path.join(fixture_dir, "release-v2.go"),
+                     "r", encoding="utf-8").read()
+release_v2_tampered = release_v2_go.replace('"2.0.0"', '"9.9.9"')
+assert release_v2_tampered != release_v2_go
+
+
+def load_gen_change(tag):
+    line = open(os.path.join(fixture_dir, "release-%s-stream.jsonl" % tag),
+                "r", encoding="utf-8").read().strip()
+    return json.loads(line), line
+
+
+badkey_ch, badkey_line = load_gen_change("badkey")
+revkey_ch, revkey_line = load_gen_change("revkey")
+
+# flintd serves the two negative-key streams — remote-only, so `store ls`
+# and `store install` must clone them over the wire and the keyring gate
+# fires inside FLINT.ELF. `store ls` tolerates the per-stream refusal and
+# reports `sync-failed` for each.
+for ch, line, sname in ((badkey_ch, badkey_line, "badkey"),
+                        (revkey_ch, revkey_line, "revkey")):
+    with open(os.path.join(flintd_store, "streams", ch["stream"] + ".jsonl"), "w") as f:
+        f.write(line + "\n")
+    with open(os.path.join(flintd_store, "streams", ch["stream"] + ".json"), "w") as f:
+        f.write(json.dumps(
+            {"id": ch["stream"], "name": sname, "head": ch["id"],
+             "created": ch["ts"], "forked_from": None},
+            separators=(",", ":")) + "\n")
+
+# The consumer keyring keeps the release author pinned and gains a
+# revoked= row for revkey's author; badkey's author stays absent
+# (key_unknown).
+with open(os.path.join(store_share, "FLINT", "TRUSTED.TXT"),
+          "a", encoding="utf-8") as f:
+    f.write("revoked=" + revkey_ch["author"] + "\n")
+
+# The v2 replica advance — run 15's script lands it by file copy (the
+# staged-bytes seam again), after which the local `rel` log is the v1+v2
+# chain and its record head is the v2 change.
+with open(os.path.join(store_share, "FLINTJ", "rel-v2.jsonl"),
+          "w", encoding="utf-8") as f:
+    f.write(rel_change_line + "\n" + rel_v2_line + "\n")
+with open(os.path.join(store_share, "FLINTJ", "rel-v2.json"),
+          "w", encoding="utf-8") as f:
+    f.write(json.dumps(
+        {"id": rel_stream_id, "name": "rel", "head": rel_v2["id"],
+         "created": 1760000000000, "forked_from": None},
+        separators=(",", ":")) + "\n")
+
+write_drop("DROPV2", release_v2_go, elf_v2)
+write_drop("DROPV2BAD", release_v2_go, elf_v2 + b"\x00")
+write_drop("DROPV2SIG", release_v2_tampered, elf_v2)
+
+flintj_m101e = {
+    # 15: advance the replica to v2, update, exec the new bytes, roll back,
+    # exec the restored v1.
+    "15.SH": (
+        "cat /host/FLINTJ/rel-v2.jsonl > /host/FLINT/streams/" + rel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/rel-v2.json > /host/FLINT/streams/" + rel_stream_id + ".json\n"
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV2\n"
+        "GOHELLO.ELF\n"
+        "STORE.ELF rollback GOHELLO\n"
+        "GOHELLO.ELF\n"
+    ),
+    # 16: a mutated v2 drop refuses elf_mismatch before any publish; then
+    # byte-appends stage the two torn-publish shapes the state file fences
+    # on — a diverged .prev refuses rollback with prev_mismatch, and a
+    # diverged live ELF (state still records v1) makes update AND rollback
+    # refuse state_mismatch. `cat` cannot move a >4 KiB file in-guest
+    # (readBounded), so the tears are `echo >>` appends — byte-exact for
+    # the post-run python.
+    "16.SH": (
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV2BAD\n"
+        "echo x >> /host/GOHELLO.ELF.prev\n"
+        "STORE.ELF rollback GOHELLO\n"
+        "echo y >> /host/GOHELLO.ELF\n"
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV2\n"
+        "STORE.ELF rollback GOHELLO\n"
+        "echo m101e: torn-state legs done\n"
+    ),
+    # 17: remove the (torn-state) app, then install refusals: tampered ELF,
+    # tampered release manifest, unknown publisher key, revoked key.
+    "17.SH": (
+        "STORE.ELF remove GOHELLO\n"
+        "STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROPV2BAD\n"
+        "STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROPV2SIG\n"
+        "STORE.ELF install badkey --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+        "STORE.ELF install revkey --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+        "echo m101e: negatives done\n"
+    ),
+}
+for sname, sbody in flintj_m101e.items():
+    open(os.path.join(store_share, "FLINTJ", sname),
+         "w", encoding="utf-8").write(sbody)
 
 
 print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, and store-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
@@ -1109,21 +1310,27 @@ vgate_run 14 -- \
     --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
     --script '$RUN_DIR/script-14.txt' \
     --script-expect 'virelai-go OK' \
-    --script-expect-tail 3 --timeout 180
+    --script-expect-tail 3 --timeout 300
 
 vgate_assert 14 serial-contains 'store: stream main no-release'
 vgate_assert 14 serial-contains 'store: stream rel release'
+vgate_assert 14 serial-contains 'store: stream badkey sync-failed'
+vgate_assert 14 serial-contains 'store: stream revkey sync-failed'
 vgate_assert 14 serial-contains 'store: ls ok'
 vgate_assert 14 serial-contains 'sig: verified'
 vgate_assert 14 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
 vgate_assert 14 serial-contains 'virelai-go OK'
+# M101e: the untrusted-publisher streams are refused by the keyring inside
+# the same boot as the happy path — `store ls` tolerates them per-stream.
+vgate_assert 14 serial-count 'flint: refuse key_unknown' 1
+vgate_assert 14 serial-count 'flint: refuse key_revoked' 1
 vgate_assert 14 serial-absent 'store: refuse'
-vgate_assert 14 serial-absent 'flint: refuse'
+vgate_assert 14 serial-absent 'sig_invalid'
 vgate_assert 14 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
 vgate_assert 14 serial-absent 'abababababababababababababababababababababababababababababababab'
 vgate_assert 14 serial-absent '[EXC] parking:'
 vgate_assert 14 python <<'PY'
-import hashlib, os, sys
+import hashlib, os, re, sys
 
 run = os.environ["RUN_DIR"]
 share = os.path.join(run, "store-share")
@@ -1137,37 +1344,180 @@ if got != want:
 apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
 if apps.count("GOHELLO.ELF |") != 1:
     sys.exit("expected exactly one GOHELLO row in APPS.TXT: %r" % apps)
-print("run-14 installed ELF bytes verified against the built artifact")
+
+ser = open(os.environ["VG_SER"], errors="replace").read()
+for m in re.finditer(r"flint: refuse (\S+)", ser):
+    if m.group(1) not in ("key_unknown", "key_revoked"):
+        sys.exit("unexpected flint refusal on the happy-path run: %s" % m.group(1))
+for sid in ("0199de2d-dc00-7000-8000-00000000e010",
+            "0199de2d-dc00-7000-8000-00000000e011"):
+    if os.path.exists(os.path.join(share, "FLINT", "streams", sid + ".jsonl")):
+        sys.exit("key-refused clone wrote a local replica for " + sid)
+print("run-14 installed ELF bytes verified; key_unknown/key_revoked refused with zero local state")
 PY
 
-# ---- 15: M101c negatives — remove round-trip + tamper legs fail closed -----
+# ---- 15: M101e update — advance the replica, publish v2, roll back to v1 -
 vgate_run 15 -- \
     --cvc-file '$RUN_DIR/store-share' \
     --virtio-fs '$RUN_DIR/store-share' \
     --net '$RUN_DIR/cap15.bin' --net-arp-respond 10.0.0.2 \
     --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
     --script '$RUN_DIR/script-15.txt' \
-    --script-expect 'store: refuse release_mismatch' \
-    --script-expect-tail 3 --timeout 180
+    --script-expect 'virelai-go OK' \
+    --script-expect-tail 3 --timeout 300
 
-vgate_assert 15 serial-contains 'store: remove ok GOHELLO.ELF'
-vgate_assert 15 serial-contains 'store: refuse elf_mismatch GOHELLO.ELF'
-vgate_assert 15 serial-contains 'store: refuse release_mismatch'
-vgate_assert 15 serial-absent 'store: install ok'
+vgate_assert 15 serial-contains 'flint: pull up to date'
+vgate_assert 15 serial-count 'sig: verified' 3
+vgate_assert 15 serial-contains 'store: update ok GOHELLO.ELF version=2.0.0'
+vgate_assert 15 serial-contains 'virelai-go V2'
+vgate_assert 15 serial-contains 'store: rollback ok GOHELLO.ELF head=0199de2d-dc00-7000-8000-00000000c001'
+vgate_assert 15 serial-absent 'store: refuse'
+vgate_assert 15 serial-absent 'flint: refuse'
 vgate_assert 15 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
 vgate_assert 15 serial-absent 'abababababababababababababababababababababababababababababababab'
 vgate_assert 15 serial-absent '[EXC] parking:'
 vgate_assert 15 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+marks = ["store: update ok GOHELLO.ELF version=2.0.0",
+         "virelai-go V2",
+         "store: rollback ok GOHELLO.ELF",
+         "virelai-go OK"]
+pos = -1
+for m in marks:
+    i = ser.find(m, pos + 1)
+    if i < 0:
+        sys.exit("missing or out-of-order marker: " + m)
+    pos = i
+
+v1 = open(os.path.join(".build", "go", "GOHELLO.ELF"), "rb").read()
+v1sha = hashlib.sha256(v1).hexdigest()
+v2 = open(os.path.join(run, "fixtures", "gohello-v2.elf"), "rb").read()
+v2sha = hashlib.sha256(v2).hexdigest()
+
+live = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+if live != v1:
+    sys.exit("post-rollback GOHELLO.ELF is not the v1 bytes")
+prev = open(os.path.join(share, "GOHELLO.ELF.prev"), "rb").read()
+if prev != v2:
+    sys.exit("post-rollback .prev is not the replaced v2 bytes")
+
+want_state = ("#v1\n"
+              "name=GOHELLO.ELF stream=rel "
+              "head=0199de2d-dc00-7000-8000-00000000c001 "
+              "sha256=" + v1sha + " "
+              "prev_head=0199de2d-dc00-7000-8000-00000000c002 "
+              "prev_sha256=" + v2sha + " "
+              "prev_row=GOHELLO.ELF | Go Hello | g | dock=false\n")
+got_state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if got_state != want_state:
+    sys.exit("STORE.TXT after update+rollback:\n" + got_state + "\nwant:\n" + want_state)
+print("run-15 update published v2, ran it, rollback restored v1 bytes")
+PY
+
+# ---- 16: M101e update negatives — refused update touches nothing, torn ---
+# ---- publish makes update AND rollback refuse state_mismatch ------------
+vgate_run 16 -- \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap16.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-16.txt' \
+    --script-expect 'm101e: torn-state legs done' \
+    --script-expect-tail 3 --timeout 300
+
+vgate_assert 16 serial-contains 'store: refuse elf_mismatch GOHELLO.ELF'
+vgate_assert 16 serial-contains 'store: refuse prev_mismatch GOHELLO.ELF'
+vgate_assert 16 serial-exact 'store: refuse state_mismatch GOHELLO.ELF' 2
+vgate_assert 16 serial-absent 'store: update ok'
+vgate_assert 16 serial-absent 'store: rollback ok'
+vgate_assert 16 serial-absent 'flint: refuse'
+vgate_assert 16 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 16 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 16 serial-absent '[EXC] parking:'
+vgate_assert 16 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+
+v1 = open(os.path.join(".build", "go", "GOHELLO.ELF"), "rb").read()
+v1sha = hashlib.sha256(v1).hexdigest()
+v2 = open(os.path.join(run, "fixtures", "gohello-v2.elf"), "rb").read()
+v2sha = hashlib.sha256(v2).hexdigest()
+
+# The tears staged by the script's `echo >>` appends: the retained .prev
+# diverged from prev_sha256 (the prev_mismatch leg) and the live ELF
+# diverged from the recorded v1 sha256 — exactly the divergent-but-
+# detected shape a kill between the ELF write and the state write leaves.
+live = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+if live != v1 + b"y\n":
+    sys.exit("torn leg: GOHELLO.ELF is not the v1 bytes plus the appended line")
+prev = open(os.path.join(share, "GOHELLO.ELF.prev"), "rb").read()
+if prev != v2 + b"x\n":
+    sys.exit("torn leg: .prev is not the v2 bytes plus the appended line")
+want_state = ("#v1\n"
+              "name=GOHELLO.ELF stream=rel "
+              "head=0199de2d-dc00-7000-8000-00000000c001 "
+              "sha256=" + v1sha + " "
+              "prev_head=0199de2d-dc00-7000-8000-00000000c002 "
+              "prev_sha256=" + v2sha + " "
+              "prev_row=GOHELLO.ELF | Go Hello | g | dock=false\n")
+got_state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if got_state != want_state:
+    sys.exit("tracked state moved under refused updates/rollback:\n" + got_state)
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if apps.count("GOHELLO.ELF |") != 1:
+    sys.exit("manifest moved under refused updates/rollback: %r" % apps)
+print("run-16 elf_mismatch + torn-state legs left tracked bytes untouched")
+PY
+
+# ---- 17: M101e remove + install negatives — tampered ELF/release, --------
+# ---- unknown + revoked publisher keys, zero partial state ---------------
+vgate_run 17 -- \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap17.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-17.txt' \
+    --script-expect 'm101e: negatives done' \
+    --script-expect-tail 3 --timeout 300
+
+vgate_assert 17 serial-contains 'store: remove ok GOHELLO.ELF'
+vgate_assert 17 serial-contains 'store: refuse elf_mismatch GOHELLO.ELF'
+vgate_assert 17 serial-contains 'store: refuse release_mismatch'
+vgate_assert 17 serial-count 'flint: refuse key_unknown' 1
+vgate_assert 17 serial-count 'flint: refuse key_revoked' 1
+vgate_assert 17 serial-count 'store: refuse sync_failed' 2
+vgate_assert 17 serial-absent 'store: install ok'
+vgate_assert 17 serial-absent 'store: update ok'
+vgate_assert 17 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 17 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 17 serial-absent '[EXC] parking:'
+vgate_assert 17 python <<'PY'
 import os, sys
 
 run = os.environ["RUN_DIR"]
 share = os.path.join(run, "store-share")
 if os.path.exists(os.path.join(share, "GOHELLO.ELF")):
     sys.exit("GOHELLO.ELF present at share root after remove + refused installs")
+if os.path.exists(os.path.join(share, "GOHELLO.ELF.prev")):
+    sys.exit("GOHELLO.ELF.prev left behind after remove")
 apps_path = os.path.join(share, "APPS.TXT")
 if os.path.exists(apps_path) and "GOHELLO.ELF" in open(apps_path, "r", encoding="utf-8").read():
     sys.exit("GOHELLO row present in APPS.TXT after remove + refused installs")
+state_path = os.path.join(share, "STORE.TXT")
+if os.path.exists(state_path) and "GOHELLO" in open(state_path, "r", encoding="utf-8").read():
+    sys.exit("GOHELLO entry present in STORE.TXT after remove")
+for sid in ("0199de2d-dc00-7000-8000-00000000e010",
+            "0199de2d-dc00-7000-8000-00000000e011"):
+    if os.path.exists(os.path.join(share, "FLINT", "streams", sid + ".jsonl")):
+        sys.exit("key-refused clone wrote a local replica for " + sid)
 if os.path.exists(os.path.join(share, "STORECAP.OUT")):
     sys.exit("store left its FLINT capture scratch file behind")
-print("run-15 remove + both tamper legs left zero partial state")
+print("run-17 remove + all four refused installs left zero partial state")
 PY
