@@ -82,6 +82,19 @@
 //     change republishes `goedit: status ...` on the serial console — the
 //     marker the gate greps and the row the seat paints are one string.
 //
+// M107c (#2320) teaches the editor to speak compiler. GOBUILD.ELF runs in
+// the shell (never spawned from here — the review notes' EL0-slot
+// arithmetic) and writes `<dir>/.BUILD/ERRORS.TXT`, one `file:line:col:
+// msg` per line. Ctrl-E reads it and opens the error panel: up/down move,
+// Return jumps to the selected row, Escape closes; Ctrl-N/Ctrl-P step
+// next/prev straight from the document. A jump lands the caret on the
+// diagnostic's position; a row naming another file opens that file in the
+// one buffer — the single-buffer answer to "the right buffer" — refused as
+// `dirty` while unsaved work stands. The refusals are named: `none` (no
+// diagnostics, including the empty file a clean rebuild leaves), `stale`
+// (the file was saved after the list's build — mtime compared through the
+// slot-79 stat op), `no-position`, `end`, `miss lines=` and `rc=`.
+//
 // What this is NOT: EDIT.BIN's feature list. No syntax highlighting, no
 // multi-file buffers or tabs, no LSP, no auto-indent — follow-on cards own
 // all of those.
@@ -146,6 +159,12 @@ const (
 	// M42 UX r2 / WMS8 Gate 4 rehomed (#1485): the unsaved-changes dialog.
 	markerUnsaved = "goedit: win_unsaved"
 
+	// M107c (#2320): the build-error list's receipts. One prefix carries
+	// every shape: `n=` (rows loaded), `sel=` (panel selection), `jump
+	// line= col=` (a landing), and the named refusals `none` / `stale` /
+	// `dirty` / `no-position` / `end` / `miss lines=` / `rc=`.
+	markerErrs = "goedit: errors "
+
 	// #2199 second pass: the new features' receipts. Undo/redo report the
 	// stack depth they left and the caret's landing offset; the mark and the
 	// clipboard ops report their outcome (n= bytes moved, or the negative
@@ -187,6 +206,15 @@ const (
 	// is unbound in both seats (checked against tabwm and gotabwm).
 	keyR     = 0x72
 	keyCtrlR = 0x12
+	// M107c: the diagnostics chords. Ctrl-E opens/refreshes the error list,
+	// Ctrl-N/Ctrl-P are next/prev — all unshifted letters, unbound in both
+	// tab seats (checked against tabwm and gotabwm like Ctrl-R above).
+	keyE     = 0x65
+	keyCtrlE = 0x05
+	keyN     = 0x6e
+	keyCtrlN = 0x0e
+	keyP     = 0x70
+	keyCtrlP = 0x10
 	// backspace/delete/return/escape codepoints (the kernel sends the
 	// codepoint in arg1).
 	codeBackspace = 0x08
@@ -213,6 +241,8 @@ const (
 	// Zig app's 5-digit bound on a goto line number.
 	barMax        = 32
 	gotoDigitsMax = 5
+	// diagRowsMax bounds the error panel's visible rows (M107c).
+	diagRowsMax = 8
 
 	// defaultPath is the share fixture the gate seeds.
 	defaultPath = "/host/EDIT/SEED.TXT"
@@ -241,7 +271,8 @@ const (
 )
 
 // inputMode is which surface owns the keyboard: the document, the find bar,
-// the goto-line bar (M20 U3), or the replace bar (#2199).
+// the goto-line bar (M20 U3), the replace bar (#2199), or the diagnostics
+// panel (M107c).
 type inputMode uint8
 
 const (
@@ -249,6 +280,7 @@ const (
 	modeFind
 	modeGoto
 	modeReplace
+	modeDiags
 )
 
 // clipWrite/clipRead are the machine-global clipboard (sys_clipboard_set/get,
@@ -350,6 +382,17 @@ type editor struct {
 	// from under the editing session. nil when the open-time acquire was
 	// refused (another writer holds it live) — every save then retries.
 	lease *vi.FileLease
+
+	// M107c (#2320): the loaded build-error list. diagsPath is the
+	// ERRORS.TXT it came from and diagsMtime that file's stamp at load —
+	// the baseline the jump-time staleness check compares file mtimes
+	// against. diagsSel is the panel selection AND the last-jumped row (-1
+	// before any landing). diagsArg is the --diags= override.
+	diags      []diagRow
+	diagsPath  string
+	diagsMtime int64
+	diagsSel   int
+	diagsArg   string
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -393,6 +436,7 @@ func leaseFixture(path, mode string) bool {
 func main() {
 	args := vi.Args()
 	path := defaultPath
+	diagPath := ""
 	if len(args) > 1 && len(args[1]) > 0 {
 		path = args[1]
 	}
@@ -403,6 +447,9 @@ func main() {
 			}
 			if strings.HasPrefix(a, "--lease-fixture=") {
 				leaseFixture(path, strings.TrimPrefix(a, "--lease-fixture="))
+			}
+			if strings.HasPrefix(a, "--diags=") {
+				diagPath = strings.TrimPrefix(a, "--diags=")
 			}
 		}
 	}
@@ -426,7 +473,7 @@ func main() {
 		vi.ConsoleLine("goedit: declare refused")
 	}
 
-	e := &editor{ta: ta, path: path}
+	e := &editor{ta: ta, path: path, diagsArg: diagPath}
 	e.load()
 	// The layout is read once, at open: it decides which physical keys are
 	// dead. A change made in GOSET while this editor is open applies to the
@@ -491,8 +538,15 @@ func main() {
 // The caret starts at the END of the buffer, which is what keeps the go-edit
 // gate's typed characters appending to the seed exactly as they did before the
 // caret existed.
+// bufRead is the buffer-read seam: vi.ReadFileAll in the guest, substituted
+// in host tests (the same shape errRead in diags.go takes for the
+// diagnostics file).
+var bufRead = func(p string, max int) ([]byte, int64) {
+	return vi.ReadFileAll(p, max)
+}
+
 func (e *editor) load() {
-	b, rc := vi.ReadFileAll(e.path, maxBuffer)
+	b, rc := bufRead(e.path, maxBuffer)
 	if rc < 0 {
 		e.buf = nil
 		e.cur = 0
@@ -557,7 +611,7 @@ func (e *editor) commitAll(rs []rune) bool {
 	for _, r := range rs {
 		if e.mode == modeEdit {
 			changed = e.insert(r) || changed
-		} else {
+		} else if e.mode != modeDiags {
 			changed = e.barAppend(r) || changed
 		}
 	}
@@ -606,6 +660,11 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if isChord(ev, keyR, keyCtrlR) {
 		return e.openBar(modeReplace)
 	}
+	// M107c: Ctrl-E loads the build diagnostics and opens the list panel —
+	// a bar-style chord, so it answers from any mode like the bars do.
+	if isChord(ev, keyE, keyCtrlE) {
+		return e.openErrors()
+	}
 	switch e.mode {
 	case modeFind:
 		return e.barKey(ev, e.runFind)
@@ -613,6 +672,8 @@ func (e *editor) handleKey(ev vi.Event) bool {
 		return e.barKey(ev, e.runGoto)
 	case modeReplace:
 		return e.replaceBarKey(ev)
+	case modeDiags:
+		return e.diagsKey(ev)
 	}
 	// #2199 chords, all on the usage column via chord() so the shifted
 	// spellings stay distinct: ctrl-z undoes, ctrl-shift-z and ctrl-y redo,
@@ -632,6 +693,14 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if chord(ev, 'a', false) {
 		e.selectAll()
 		return true
+	}
+	// M107c: next/prev diagnostic. Each step jumps straight to the row
+	// after/before the last landing; the list loads on first use.
+	if chord(ev, 'n', false) {
+		return e.stepDiag(1)
+	}
+	if chord(ev, 'p', false) {
+		return e.stepDiag(-1)
 	}
 	if chord(ev, 'x', false) {
 		e.cut()
@@ -1571,7 +1640,9 @@ func (e *editor) draw() {
 	if caretRow >= 0 && caretRow < maxLines {
 		e.fill(textOrigin+caretCol*adv, chromeH+4+caretRow*lineH, caretW, 8, colCaret)
 	}
-	if e.mode != modeEdit {
+	if e.mode == modeDiags {
+		e.drawDiags(w, h)
+	} else if e.mode != modeEdit {
 		label := "Find: "
 		if e.mode == modeGoto {
 			label = "Goto: "
@@ -1599,6 +1670,53 @@ func (e *editor) draw() {
 			e.drawPreedit(textOrigin+col*adv, barY, pre)
 		}
 	}
+}
+
+// drawDiags paints the M107c error panel: up to diagRowsMax rows anchored
+// above the bar row — each the ERRORS.TXT line it came from, the selection
+// under-painted like the text selection — and a bar line naming the
+// selected row's file:line:col. Rows wider than the window are clipped at
+// the last full cell, never split mid-glyph.
+func (e *editor) drawDiags(w, h int) {
+	if len(e.diags) == 0 {
+		e.mode = modeEdit
+		return
+	}
+	if e.diagsSel < 0 || e.diagsSel >= len(e.diags) {
+		e.diagsSel = 0
+	}
+	adv := font.Advance(1)
+	cols := (w - 2*textOrigin) / adv
+	barY := h - lineH - 2
+	// The window shows at most diagRowsMax rows ending near the selection;
+	// a longer list scrolls by that anchor, bottom-aligned.
+	first := e.diagsSel - diagRowsMax + 1
+	if first < 0 {
+		first = 0
+	}
+	y := barY - lineH
+	for i := first + diagRowsMax - 1; i >= first; i-- {
+		if i < len(e.diags) {
+			text := e.diags[i].raw
+			if utf8.RuneCountInString(text) > cols && cols > 0 {
+				cut := cols
+				for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
+					cut--
+				}
+				text = text[:cut]
+			}
+			if i == e.diagsSel {
+				e.fill(0, y, w, lineH, colSel)
+			}
+			e.drawText(textOrigin, y, text, colText)
+		}
+		y -= lineH
+	}
+	r := e.diags[e.diagsSel]
+	label := "Err " + vi.Itoa64(int64(e.diagsSel+1)) + "/" +
+		vi.Itoa64(int64(len(e.diags))) + ": " + r.file + ":" +
+		vi.Itoa64(int64(r.line)) + ":" + vi.Itoa64(int64(r.col))
+	e.drawText(textOrigin, barY, label, colDim)
 }
 
 // drawPreedit paints a pending dead-key accent in the caret colour with an

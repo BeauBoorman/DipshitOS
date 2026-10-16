@@ -93,7 +93,7 @@ func Shout(s string) string { return strings.ToUpper(s) }
 			st = int64(cmd.ProcessState.ExitCode())
 		}
 		// Persist the capture like the guest's stream-bound file does.
-		_ = os.WriteFile(capturePath, cap2, 0o644)
+		_ = os.WriteFile(capturePath+"~", cap2, 0o644)
 		return st, 0, cap2, nil
 	}
 
