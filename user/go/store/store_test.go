@@ -370,8 +370,8 @@ func (f *fakeDeadlineConn) Recv(p []byte) (int, error) {
 	f.in = f.in[n:]
 	return n, nil
 }
-func (f *fakeDeadlineConn) Close() error               { return nil }
-func (f *fakeDeadlineConn) SetRecvDeadline(ns int64)   { f.deadlines = append(f.deadlines, ns) }
+func (f *fakeDeadlineConn) Close() error             { return nil }
+func (f *fakeDeadlineConn) SetRecvDeadline(ns int64) { f.deadlines = append(f.deadlines, ns) }
 
 // TestWireSessionDeadlineIsRelative: the 20 s session bound is a budget
 // (relative), not uptime+20 s (absolute) — the first deadline call is

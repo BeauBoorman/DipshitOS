@@ -425,7 +425,7 @@ func TestVerifyAllTrusted(t *testing.T) {
 	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse keyring_missing" {
 		t.Fatalf("keyring_missing: rc=%d logs=%v", rc, logs)
 	}
-	rc, logs = h.runCmd("verify", "--expect=" + st.ID + ":" + logSHA)
+	rc, logs = h.runCmd("verify", "--expect="+st.ID+":"+logSHA)
 	if rc != 2 || len(logs) != 1 || logs[0] != "flint: refuse usage" {
 		t.Fatalf("expect without --all: rc=%d logs=%v", rc, logs)
 	}
