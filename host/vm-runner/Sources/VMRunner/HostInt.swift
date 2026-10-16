@@ -290,3 +290,56 @@ enum HostInt {
         FileHandle.standardOutput.write(Data("host-int: armed lanes=\(lanes) epoch=\(epoch)\n".utf8))
     }
 }
+
+// MARK: - HostIntSession — the shared lane session every M108 lane rides
+//
+// ONE credential load, ONE epoch, ONE ARMED record naming every live lane
+// (ADR 0051 D2): the seat adopts (epoch, mask) and accepts only records
+// bearing them, so two lanes armed by independent epochs would refuse each
+// other stale_epoch forever. M108b carried the session inside
+// HostClipboard.arm; M108c hoisted it so --host-clipboard and --host-drop
+// arm together.
+final class HostIntSession {
+    let shareDir: URL
+    let laneDir: URL
+    let key: Data
+    let epoch: UInt32
+    let mask: UInt8
+
+    private init(shareDir: URL, key: Data, epoch: UInt32, mask: UInt8) {
+        self.shareDir = shareDir
+        self.laneDir = HostInt.laneDir(shareDir: shareDir)
+        self.key = key
+        self.epoch = epoch
+        self.mask = mask
+    }
+
+    /// Arm the session: load the `host-int` credential, create HOSTINT/,
+    /// mint the epoch, publish the one ARMED record naming every live lane
+    /// in mask. `requested` is the lane names the operator asked for — a
+    /// refused arm logs each lane's own refusal and returns nil (fail
+    /// closed per lane, never a boot failure).
+    static func arm(shareDir: URL, mask: UInt8, requested: [String]) -> HostIntSession? {
+        guard let key = HostInt.loadKey(shareDir: shareDir) else {
+            for lane in requested { HostInt.logRefuse(lane: lane, reason: .noCredential) }
+            return nil
+        }
+        let laneDir = HostInt.laneDir(shareDir: shareDir)
+        do {
+            try FileManager.default.createDirectory(at: laneDir, withIntermediateDirectories: true)
+        } catch {
+            for lane in requested { HostInt.logRefuse(lane: lane, reason: .ioError) }
+            return nil
+        }
+        let epoch = UInt32.random(in: 1...UInt32.max)
+        guard let rec = HostInt.encode(tag: .armed, flags: 0, seq: 1, epoch: epoch,
+                                       payload: Data([mask]), key: key),
+              HostInt.publish(laneDir: laneDir, name: HostInt.recordName(tag: .armed, seq: 1), body: rec)
+        else {
+            for lane in requested { HostInt.logRefuse(lane: lane, reason: .ioError) }
+            return nil
+        }
+        HostInt.logArmed(mask: mask, epoch: epoch)
+        return HostIntSession(shareDir: shareDir, key: key, epoch: epoch, mask: mask)
+    }
+}

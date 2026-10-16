@@ -87,8 +87,21 @@ func hostintSeatInit() {
 		Delete: hostintDeleteFile,
 		Log:    hostintLog,
 	}, hostintMarkerPrefix)
-	hostintEngine.Consume = hostclipApply
+	hostintEngine.Consume = hostintConsume
 	hostClipBuf = make([]byte, clipKernelMax)
+}
+
+// hostintConsume routes seat-inbound records to their lane — M108b owns
+// CLIP_IN (hostclip.go), M108c owns DROP (hostdrop.go). A tag with no
+// tenant is refused lane_disabled.
+func hostintConsume(tag uint8, rec hostint.Record) string {
+	switch tag {
+	case hostint.TagClipIn:
+		return hostclipApply(rec)
+	case hostint.TagDrop:
+		return hostdropApply(rec)
+	}
+	return hostint.RefuseLaneDisabled
 }
 
 // hostintSeatTick is the per-composite-tick drive: consume what the lane
