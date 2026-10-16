@@ -428,6 +428,41 @@ func TestGeometry(t *testing.T) {
 	}
 }
 
+// TestGeometryCeilItable: an odd-MiB volume has an inode_count that is not
+// a multiple of 32, so the itable must round up (ADR 0050 D3). Truncating
+// once wrote the tail inode records into the root directory's data block.
+func TestGeometryCeilItable(t *testing.T) {
+	const size = 17 << 20
+	img := make([]byte, size)
+	if err := formatImage(img, goldenID, goldenTime); err != nil {
+		t.Fatal(err)
+	}
+	g, err := geometryFor(size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.InodeCount != 272 || g.InodeCount%InodesPerBlock == 0 {
+		t.Fatalf("inode_count %d: want a non-multiple of %d", g.InodeCount, InodesPerBlock)
+	}
+	if g.ItableBlocks != (g.InodeCount+InodesPerBlock-1)/InodesPerBlock {
+		t.Fatalf("itable_blocks %d != ceil(inode_count/32)", g.ItableBlocks)
+	}
+	// Block data_first is the root directory's block: mkfs leaves it zero.
+	if !isZero(block(img, g.DataFirst)) {
+		t.Fatal("data_first block nonzero — itable aliases the data region")
+	}
+	// The last inode's slot must land inside the itable.
+	if last := g.InodeCount - 1; g.ItableFirst+last/InodesPerBlock >= g.DataFirst {
+		t.Fatalf("inode %d maps to block %d >= data_first %d", last,
+			g.ItableFirst+last/InodesPerBlock, g.DataFirst)
+	}
+	for _, f := range checkImage(img) {
+		if !f.info {
+			t.Fatalf("17 MiB image fails check: %v", f)
+		}
+	}
+}
+
 // TestCheckDetects runs the corruption battery: each mutation must surface
 // the named refusal the ADR assigns it.
 func TestCheckDetects(t *testing.T) {

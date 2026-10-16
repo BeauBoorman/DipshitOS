@@ -131,7 +131,8 @@ func (s *superblock) checkGeometry() error {
 	if bb := (s.volumeBlocks + 8*BlockLen - 1) / (8 * BlockLen); s.bbitmapFirst != s.ibitmapFirst+1 || s.bbitmapBlocks != bb {
 		return bad("bbitmap placement")
 	}
-	if s.itableFirst != s.bbitmapFirst+s.bbitmapBlocks || s.itableBlocks != s.inodeCount/InodesPerBlock {
+	if s.itableFirst != s.bbitmapFirst+s.bbitmapBlocks ||
+		s.itableBlocks != (s.inodeCount+InodesPerBlock-1)/InodesPerBlock {
 		return bad("itable placement")
 	}
 	if s.dataFirst != s.itableFirst+s.itableBlocks || s.dataFirst+s.dataBlocks != s.volumeBlocks {

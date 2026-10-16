@@ -16,7 +16,7 @@
 //	block 2 .. 2+J-1   journal region   (DESC + n*payload + COMMIT records)
 //	ibitmap            1 block, 1 bit per inode (inode 0 is pre-allocated)
 //	bbitmap            ceil(volume_blocks/8/4096) blocks, 1 bit per block
-//	itable             inode_count/32 blocks, 128 B per inode
+//	itable             ceil(inode_count/32) blocks, 128 B per inode
 //	data region        the rest; block 0 of it is the root directory's
 //
 // This file is pure data: no syscalls, no dependencies outside stdlib.
@@ -221,7 +221,7 @@ func geometryFor(volumeBytes uint64) (Geometry, error) {
 	vb := uint32(volumeBytes / BlockLen)
 	journal := uint32(clamp(uint64(vb)/16, 512, 2048))
 	inodes := uint32(clamp(volumeBytes/65536, MinInodes, MaxInodes))
-	itable := inodes / InodesPerBlock
+	itable := (inodes + InodesPerBlock - 1) / InodesPerBlock
 	bbitmap := (vb + 8*BlockLen - 1) / (8 * BlockLen)
 	g := Geometry{
 		VolumeBytes:   volumeBytes,

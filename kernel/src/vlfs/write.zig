@@ -277,6 +277,7 @@ fn freeInode(t: *Txn, ino: u32) Error!void {
     t.walk[ino / 8] &= ~(@as(u8, 1) << @intCast(ino % 8));
     try t.append(t.vol.ibitmap_first, t.walk);
     const blk = t.vol.itable_first + ino / vlfs.inodes_per_block;
+    if (blk >= t.vol.itable_first + t.vol.itable_blocks) return error.BadInode;
     try t.readCurrent(blk, t.walk);
     const rec = t.walk[(ino % vlfs.inodes_per_block) * vlfs.inode_len ..][0..vlfs.inode_len];
     @memset(rec, 0);
@@ -303,6 +304,7 @@ fn writeInodeRec(out: *[vlfs.inode_len]u8, rec: vlfs.Inode) void {
 /// Stage the itable block holding `ino` with `rec` written into its slot.
 fn stageInode(t: *Txn, ino: u32, rec: vlfs.Inode) Error!void {
     const blk = t.vol.itable_first + ino / vlfs.inodes_per_block;
+    if (blk >= t.vol.itable_first + t.vol.itable_blocks) return error.BadInode;
     try t.readCurrent(blk, t.walk);
     const slot = t.walk[(ino % vlfs.inodes_per_block) * vlfs.inode_len ..][0..vlfs.inode_len];
     writeInodeRec(slot, rec);
