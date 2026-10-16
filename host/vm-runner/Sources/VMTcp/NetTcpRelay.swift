@@ -273,11 +273,15 @@ public final class NetTcpRelay {
         let payloadLen = n > dataOff ? n - dataOff : 0
         let seq = tcpSeq(buf)
         let rel = Int32(bitPattern: seq &- rcvNxt)
-        if rel > 0 {
+        // A wrapped delta of exactly 2^31 (Int32.min) is direction-
+        // ambiguous and never a legitimate retransmit — and negating it
+        // would trap the whole runner. It answers .gap either way
+        // (#2366); magnitude cannot trap for the rest.
+        if rel > 0 || rel == Int32.min {
             onLog("NET-TCP-RELAY: dropped a \(payloadLen)-byte guest segment ahead of the in-order bound (seq 0x\(hex32(seq)), expecting 0x\(hex32(rcvNxt))) — not forwarded upstream; the guest's retransmit fills the gap")
             return .gap
         }
-        let skip = min(Int(-rel), payloadLen)
+        let skip = min(Int(rel.magnitude), payloadLen)
         let fresh = payloadLen - skip
         guard fresh > 0 else {
             onLog("NET-TCP-RELAY: deduplicated a retransmitted guest segment (seq 0x\(hex32(seq)), \(payloadLen) bytes already delivered upstream)")

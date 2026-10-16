@@ -285,6 +285,40 @@ final class NetTcpRelayTests: XCTestCase {
         XCTAssertTrue(logged(matching: "ahead of the in-order bound"))
     }
 
+    // #2366 — a segment whose seq sits exactly 2^31 from the in-order
+    // bound computes rel == Int32.min either way; negating that used to
+    // SIGTRAP the whole runner. Both directions are .gap, and the legs
+    // one byte inside each edge keep their old meaning — ahead stays
+    // .gap, behind stays a wholly-covered retransmit (.duplicate).
+    func testSeqAtInt32MinOffsetIsAGapNotATrap() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(), 58)
+        let up = try upstream(relay)
+        defer { close(up); relay.shutdown() }
+        _ = relay.guestAckSegment(seg(seq: guestIsn + 1, ack: serverIsn + 1), 54)
+        let bound = guestIsn &+ 1 // rcvNxt after begin
+
+        // Exactly 2^31 ahead of the bound: rel == Int32.min — the old trap.
+        let ahead31 = seg(seq: bound &+ 0x8000_0000, ack: serverIsn + 1, payload: [UInt8](repeating: 0x61, count: 10))
+        XCTAssertEqual(relay.guestDataSegment(ahead31, ahead31.count), .gap)
+
+        // Exactly 2^31 behind is the same wrapped delta — also .gap.
+        let behind31 = seg(seq: bound &- 0x8000_0000, ack: serverIsn + 1, payload: [UInt8](repeating: 0x61, count: 10))
+        XCTAssertEqual(relay.guestDataSegment(behind31, behind31.count), .gap)
+
+        // One byte inside each edge: 2^31-1 ahead is still a gap;
+        // 2^31-1 behind is a retransmit the dedup path already covers.
+        let aheadEdge = seg(seq: bound &+ 0x7FFF_FFFF, ack: serverIsn + 1, payload: [UInt8](repeating: 0x61, count: 10))
+        XCTAssertEqual(relay.guestDataSegment(aheadEdge, aheadEdge.count), .gap)
+        let behindEdge = seg(seq: bound &- 0x7FFF_FFFF, ack: serverIsn + 1, payload: [UInt8](repeating: 0x61, count: 10))
+        XCTAssertEqual(relay.guestDataSegment(behindEdge, behindEdge.count), .duplicate)
+
+        // None of it went upstream, and the in-order bound never moved.
+        XCTAssertTrue(noUpstreamBytes(up))
+        XCTAssertEqual(relay.currentSeqAck().ack, bound)
+        XCTAssertTrue(logged(matching: "ahead of the in-order bound"))
+    }
+
     // Upstream EOF propagates as FIN once the buffered bytes drain.
     func testUpstreamCloseDeliversBufferedBytesThenFin() throws {
         let relay = makeRelay()
