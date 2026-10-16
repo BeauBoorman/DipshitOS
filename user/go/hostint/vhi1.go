@@ -131,9 +131,13 @@ func stemTag(stem string) (uint8, bool) {
 }
 
 // LaneName is the tag's lane name for the refuse markers ("clip", "drop",
-// "notify"). ARMED is the handshake itself, not a lane: "".
+// "notify"). ARMED is the handshake itself, not a lane: tag-0 refusals are
+// the engine's own scan-level ones (the dir-list io_error, a malformed
+// ARMED) and render "dirlist" so `lane=` never goes empty.
 func LaneName(tag uint8) string {
 	switch tag {
+	case TagArmed:
+		return "dirlist"
 	case TagClipIn, TagClipOut:
 		return "clip"
 	case TagDrop:
@@ -277,8 +281,11 @@ func putLe32(b []byte, v uint32) {
 // EncodeRecord builds one wire record: header + payload + HMAC-SHA256 tag.
 // A payload over PayloadMax is refused with nil — producers truncate first
 // (and set FlagTruncated) rather than emit a record that cannot be read.
+// Flags outside bit0 are refused the same way: bits 1-7 are reserved, and
+// a decoder that names them bad_record must never see a record this writer
+// signed.
 func EncodeRecord(key []byte, tag, flags uint8, seq, epoch uint32, payload []byte) []byte {
-	if len(payload) > PayloadMax || tagStem(tag) == "" {
+	if len(payload) > PayloadMax || tagStem(tag) == "" || flags&^FlagTruncated != 0 {
 		return nil
 	}
 	out := make([]byte, HeaderLen+len(payload)+MACLen)
@@ -295,9 +302,10 @@ func EncodeRecord(key []byte, tag, flags uint8, seq, epoch uint32, payload []byt
 }
 
 // DecodeRecord parses the wire form. ok=false means a bad_record refusal:
-// wrong magic, bad tag, reserved nonzero, plen > 512, or a total size that
-// does not match header+payload+mac exactly. MAC verification is a separate
-// step (Verify) so the two refusal names stay distinct.
+// wrong magic, bad tag, a flag bit outside FlagTruncated, reserved nonzero,
+// plen > 512, or a total size that does not match header+payload+mac
+// exactly. MAC verification is a separate step (Verify) so the two refusal
+// names stay distinct.
 func DecodeRecord(raw []byte) (rec Record, ok bool) {
 	if len(raw) < HeaderLen+MACLen || len(raw) > RecordMax {
 		return rec, false
@@ -306,6 +314,9 @@ func DecodeRecord(raw []byte) (rec Record, ok bool) {
 		return rec, false
 	}
 	if tagStem(raw[4]) == "" {
+		return rec, false
+	}
+	if raw[5]&^FlagTruncated != 0 {
 		return rec, false
 	}
 	if raw[6] != 0 || raw[7] != 0 {

@@ -160,6 +160,39 @@ func TestBuildSurfacesCompilerDiags(t *testing.T) {
 	}
 }
 
+// The capture temp (the `~` publish-temp beside each diag stem) is swept
+// once the step's bytes came back — .BUILD must not accumulate one per
+// step per build.
+func TestBuildRemovesDiagCaptureTemps(t *testing.T) {
+	dir, manifest := stageFixture(t)
+	f := &fakeExec{}
+	withFakeExec(t, f)
+	// Stand in for the guest's truncate-open: each spawn leaves the
+	// capture file the driver must remove.
+	execAndWait = func(image string, args []string, capturePath string) (int64, int64, []byte, error) {
+		if err := os.WriteFile(capturePath, []byte("noise\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return f.run(image, args, capturePath)
+	}
+	res := Build(Config{Dir: dir, Importcfg: []string{manifest}})
+	if res.ELF == "" {
+		t.Fatalf("build failed: %v", res.Diags)
+	}
+	if len(f.calls) != 3 {
+		t.Fatalf("calls = %v", f.calls)
+	}
+	for _, c := range f.calls {
+		if !strings.HasSuffix(c.capture, ".diag~") {
+			t.Fatalf("capture path = %q, want the .diag~ temp name", c.capture)
+		}
+	}
+	left, err := filepath.Glob(filepath.Join(dir, ".BUILD", "*.diag~"))
+	if err != nil || len(left) != 0 {
+		t.Fatalf("capture temps left in .BUILD: %v (err=%v)", left, err)
+	}
+}
+
 func TestBuildNoPackageStopsBeforeSpawn(t *testing.T) {
 	dir := t.TempDir()
 	writeSrc(t, dir, "main.go", "package main\nimport \"missing\"\nfunc main() {}\n")

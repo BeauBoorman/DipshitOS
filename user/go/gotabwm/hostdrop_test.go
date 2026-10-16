@@ -92,6 +92,35 @@ func TestHostdropConsentDeniedWithoutLaneBit(t *testing.T) {
 	}
 }
 
+// A control byte in a dropped name must never reach the serial marker:
+// it would split the line the class-B gate greps. The sanitizer maps
+// <0x20 and DEL to '?'; the toast text shares the sanitized string.
+func TestHostdropNameSanitized(t *testing.T) {
+	name, size, ok := dropPayload([]byte("\x05A\nB\x7fC\x01\x00\x00\x00\x00\x00\x00\x00"))
+	if !ok || name != "A?B?C" || size != 1 {
+		t.Fatalf("dropPayload = %q %d %v", name, size, ok)
+	}
+
+	resetNotify(t)
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(0xBEEF, hostint.LaneDrop)
+	hostintSeatTick()
+	f.plantDrop(0xBEEF, 1, "A\nB.QOI", 10)
+	hostintSeatTick()
+	if !f.hasLog(MarkerHostintDrop + "seq=1 name=A?B.QOI size=10") {
+		t.Fatalf("missing sanitized drop marker: %v", f.logs)
+	}
+	for _, l := range f.logs {
+		if strings.Contains(l, "name=A\nB") {
+			t.Fatalf("a raw newline reached a marker line: %q", l)
+		}
+	}
+	if notifyQueue[0].text != "host drop: A?B.QOI" {
+		t.Fatalf("toast text = %q, want the sanitized name", notifyQueue[0].text)
+	}
+}
+
 func TestDropPayloadDecode(t *testing.T) {
 	name, size, ok := dropPayload([]byte("\x03ABC\x01\x00\x00\x00\x00\x00\x00\x00"))
 	if !ok || name != "ABC" || size != 1 {
