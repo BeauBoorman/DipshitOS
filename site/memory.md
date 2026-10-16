@@ -49,8 +49,8 @@ from the VM's configured RAM size.
 
 ## Syscall table
 
-The runtime-built syscall table has 128 slots, of which 80 are registered
-(0–79). Anonymous `mmap` and `munmap` are slots 63 and 64; wall-clock setting
+The runtime-built syscall table has 128 slots, of which 88 are registered
+(0–87). Anonymous `mmap` and `munmap` are slots 63 and 64; wall-clock setting
 and filesystem metadata are slots 78 and 79. See [[userspace|Userspace & syscalls]]
 for the complete interface.
 

@@ -26,6 +26,8 @@ default VM stays byte-identical:
 | `--net` | the virtio-net device with a deterministic file-handle attachment |
 | `--net-nat` | the virtio-net device with a NAT attachment (real outbound connectivity) |
 | `--virtio-fs <host-dir>` | Apple's standard VirtioFS device for `/host`; explicit opt-in, does not change the boot default |
+| `--data-disk <img>` | a second virtio-blk device named `virelai-vlfs`; a `mkfs.vlfs`-formatted image mounts read-only at `/disk` (M100b/c) |
+| `--host-clipboard` | the bidirectional host↔guest clipboard lane over HMAC-signed `HOSTINT/` share files (M108b; rides `--cvc-file`) |
 
 The launcher also carries the deterministic scripted-input, network
 responder, host-share, and console seams the live gates use (`--script`, `--input-string`,

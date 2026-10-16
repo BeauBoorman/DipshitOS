@@ -7,7 +7,7 @@ tags: [guides, build]
 
 # Building
 
-The root build system is written in Zig 0.16.0. Everything is orchestrated by
+The root build system is written in Zig 0.17.0. Everything is orchestrated by
 `zig build` plus a small set of shell/Python helpers for the disk image.
 
 ## Build targets
@@ -54,7 +54,7 @@ runtime linker resolves — no host toolchain beyond Zig and `elf2bin.py`.
 
 ## Pinned toolchain
 
-Zig **0.16.0** is pinned in `.zigversion`. The host launcher builds with Swift
+Zig **0.17.0** is pinned in `.zigversion`. The host launcher builds with Swift
 (`swift build --package-path host/vm-runner`) against the macOS 27
 Virtualization.framework.
 

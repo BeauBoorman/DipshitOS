@@ -22,8 +22,13 @@ bounded state, and hardware-specific limits.
   not implement RSS or multi-queue pair selection.
 - **Host files.** The guest-facing `/host` API can use the retained
   custom-virtio file channel or the explicitly selected standard VirtioFS/FUSE
-  backend (`--virtio-fs`). There is no guest virtio-blk driver; firmware reads
-  the boot volume before the kernel starts.
+  backend (`--virtio-fs`).
+- **Block.** `virtio_blk.zig` (M100b) is a read/write virtio-blk driver for a
+  second DID-0x1042 function attached with `--data-disk`: pre-exit PCI
+  collection, post-MMU re-arm, `GET_ID` naming (`virelai-vlfs`), and a
+  negotiated FLUSH barrier (gate `live-vlfs-blk`). The kernel's VLFS reader
+  mounts a `mkfs.vlfs`-formatted image read-only at `/disk`. The boot volume
+  itself stays firmware-read — no guest code touches it post-exit.
 - **USB.** `xhci.zig` provides a bounded XHCI host controller and
   class/subclass/protocol matching. HID boot-protocol devices provide
   keyboard and pointer input; USB mass storage uses Bulk-Only Transport and

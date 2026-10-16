@@ -1,6 +1,6 @@
 # VirelaiOS
 
-[![CI](https://github.com/drawmeanelephant/DipshitOS/actions/workflows/ci.yml/badge.svg)](https://github.com/drawmeanelephant/DipshitOS/actions/workflows/ci.yml)
+[![CI](https://github.com/drawmeanelephant/VirelaiOS/actions/workflows/ci.yml/badge.svg)](https://github.com/drawmeanelephant/VirelaiOS/actions/workflows/ci.yml)
 
 A from-scratch AArch64 operating system. It boots under real UEFI firmware on
 **Apple silicon**, hosted by Apple's **Virtualization.framework**
@@ -11,26 +11,40 @@ is freestanding [Zig](https://ziglang.org/); the host launcher is Swift.
 The name is a joke. The engineering is not: every subsystem is either verified
 deterministically or **live-gated** on real hardware.
 
-📚 **Documentation site: <https://drawmeanelephant.github.io/DipshitOS/>**
+📚 **Documentation site: <https://drawmeanelephant.github.io/VirelaiOS/>**
 (compiled by [Boris](https://github.com/drawmeanelephant/boris) and published
 to GitHub Pages).
 
 ## Status
 
-Every milestone through **M86** has landed, and every milestone index but one
-has closed (observed 2026-09-29). The **boot default is the Go seat**:
+Every milestone through **M104** has landed (observed 2026-10-15; M96's index
+awaits only its owner acceptance run). The **boot default is the Go seat**:
 `GOTABWM.ELF` autostarts and hosts Go EL0
 clients over the `WM_RPC` tab contract, with Zig `TABWM.BIN` retained by
-decision (ADR 0034) as the `settings set wm tabwm` fallback. The one open arc is
-**M84, remote framebuffer** ([#1807](https://github.com/drawmeanelephant/DipshitOS/issues/1807)) —
-an RFB server a Mac can Screen Share into. The guest wire and its live gate
-landed; the macOS Screen Sharing tape is blocked on
-[#1835](https://github.com/drawmeanelephant/DipshitOS/issues/1835), because
-Screen Sharing refuses the `None` security type. The arcs around it — terminal
-graphics (`IMGCAT.ELF` over sixel) and window chrome with the published
-`appkit` canvas — are closed. [`docs/status.md`](docs/status.md) is the canonical
+decision (ADR 0034) as the `settings set wm tabwm` fallback. The open arcs on
+the ledger, with what is already on main:
+
+- **M100, a disk of our own** — ADR 0050's journaled guest filesystem (VLFS)
+  on a dedicated virtio-blk image: the RW block driver, the runner's
+  `--data-disk` attach, the `mkfs.vlfs` host formatter, and the kernel's
+  read path at `/disk` are landed; the journaled write path and fsck are
+  ahead.
+- **M101, software arrives signed** — `FLINT.ELF` speaks FLINT-SYNC/1
+  (`clone`/`pull`/`push`/`ls-remote`) against a host `flintd`, and verifies a
+  pinned publisher keyring before materializing; the install seam is ahead.
+- **M105/M106, FLINT host ports** — the `flintd` server shipped in
+  [flint-server](https://github.com/drawmeanelephant/flint-server); the Zig
+  host-client spec is landed.
+- **M107, the guest builds the guest** — `GOBUILD.ELF` walks an import graph
+  and drives the in-guest `cmd/compile`/`cmd/link` through a multi-package
+  build (`live-gobuild`); editor diagnostics navigation is in review.
+- **M108, through the glass** — ADR 0051's consented lanes: the bidirectional
+  host clipboard over HMAC-signed share files is landed and gated
+  (`live-host-clipboard`); file drop-in and notify-out are ahead.
+
+[`docs/status.md`](docs/status.md) is the canonical
 accounting and the readable summary is the
-[documentation site](https://drawmeanelephant.github.io/DipshitOS/).
+[documentation site](https://drawmeanelephant.github.io/VirelaiOS/).
 
 The first thirty-one milestones — the boot
 pipeline, the interactive `virelai>` monitor, userspace (allocator,
@@ -65,11 +79,16 @@ retired to `GOHTTPD.ELF` in M71l), offline preflight for the M26 network apps
 (N13/N14), and a
 wall-clock bounding fix for `sys_tcp_connect` (#613).
 
-**Right now:** the boot default is the Go seat, and the Go toolchain runs
-in-guest — a single boot autostarts `GOTABWM.ELF` and hosts Go clients as tabs
-(the shell `GOSH.ELF`, the editor `NOTE.ELF`), and the guest's own
-`cmd/compile` + `cmd/link` build and run the pinned hello program
-(`live-selfhost-go`). Everything since M31 is one row per milestone in
+**Right now:** the boot default is the Go seat, and the guest builds itself —
+a single boot autostarts `GOTABWM.ELF` and hosts Go clients as tabs
+(the shell `GOSH.ELF`, the editor `NOTE.ELF`), while `GOBUILD.ELF` drives the
+in-guest `cmd/compile` + `cmd/link` through a multi-package import graph
+(`live-gobuild`, the grown-up of `live-selfhost-go`'s pinned-hello loop).
+Boot with `--data-disk <img>` and the kernel mounts a `mkfs.vlfs`-formatted
+VLFS volume read-only at `/disk`. `FLINT.ELF` clones, pulls, and pushes
+signed source against a host `flintd`, and the seat and the Mac share one
+clipboard over HMAC-signed share files (`--host-clipboard`). Everything since
+M31 is one row per milestone in
 [`docs/status.md`](docs/status.md); this README does not duplicate that table.
 
 ## Quick start
@@ -78,8 +97,8 @@ To open a usable windowed desktop from a clean clone, run this from the
 repository root on Apple silicon with macOS 27 or newer:
 
 ```bash
-git clone https://github.com/drawmeanelephant/DipshitOS.git
-cd DipshitOS
+git clone https://github.com/drawmeanelephant/VirelaiOS.git
+cd VirelaiOS
 source tools/env-check.sh
 just session
 ```
@@ -236,7 +255,7 @@ just verify-vz         # class B, Apple silicon, boots real VMs
   empty Go app to a staged, gated EL0 client.
 
 See `AGENTS.md` for the project rules, and the
-[development guide](https://drawmeanelephant.github.io/DipshitOS/development.html)
+[development guide](https://drawmeanelephant.github.io/VirelaiOS/development.html)
 for how the pieces fit.
 
 ## License
@@ -245,4 +264,4 @@ VirelaiOS is **source-available, not open source** — the code is publicly
 visible so it can be reviewed and learned from, but you may not use, modify,
 redistribute, or incorporate it without written permission. Forks are not
 freedom. The binding terms are [`LICENSE`](LICENSE); a plain-language summary
-is on the [documentation site](https://drawmeanelephant.github.io/DipshitOS/license.html).
+is on the [documentation site](https://drawmeanelephant.github.io/VirelaiOS/license.html).

@@ -46,10 +46,11 @@ implemented in `kernel/src/exceptions.zig` and `kernel/src/mmu.zig`; see
 
 ## Syscall seam
 
-The syscall ABI is an append-only 128-slot table with **80 registered
-entries, slots 0–79**. It covers process control and IPC, windows and events,
-files and networking, time, threads, anonymous mappings, and filesystem
-metadata. Reserved table entries return `ENOSYS`.
+The syscall ABI is an append-only 128-slot table with **88 registered
+entries, slots 0–87**. It covers process control and IPC, windows and events,
+files and networking, time, threads, anonymous mappings, filesystem
+metadata, native sockets, and the observability/pid surface. Reserved table
+entries return `ENOSYS`.
 
 See [[userspace|Userspace & syscalls]] for the current numbered interface and
 [`kernel/src/syscall.zig`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/kernel/src/syscall.zig)

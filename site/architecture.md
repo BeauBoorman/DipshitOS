@@ -67,7 +67,7 @@ Three rules show up everywhere:
 | Scheduler | fixed 16-task pool, tick-driven scheduling, SMP support and per-core ready rings |
 | Processes | bounded registry, lifecycle states, exit-status propagation, IPC mailboxes |
 | SMP | PSCI `CPU_ON` core bringup, per-core schedulers, spinlocks, GICv3 SGI IPIs (M28) |
-| Syscalls | ADR 0007: 128-slot table, 80 registered slots (0–79), deterministic counters |
+| Syscalls | ADR 0007: 128-slot table, 88 registered slots (0–87), deterministic counters |
 | Networking | virtio-net → ARP → IPv4/ICMP → UDP → DHCP → DNS → TCP (client + `GOHTTPD.ELF` passive-open server), plus a NAT mode and the EL0 TCP seam |
 | Graphics | virtio-gpu framebuffer → text → Road Pops → Driving Award compositor |
 | Audio | virtio-snd → PCM playback → `beep` → the EL0 audio seam (slots 42–45) |

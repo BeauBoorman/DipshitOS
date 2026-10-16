@@ -22,6 +22,7 @@ virtio-net transport, built in bounded fixed-BSS staging.
 | DNS | `dns.zig` | RFC 1035 client: A-record queries over UDP, parse + extract, `net dns <hostname>` |
 | TCP | `tcp.zig` | RFC 793: client (handshake, one in-flight segment, bounded retransmission) + passive-open server |
 | TCP seam | `syscall.zig` TCP slots | `sys_tcp_connect`/`sys_tcp_send`/`sys_tcp_recv`/`sys_tcp_close` for EL0 |
+| Sockets | `socket_core` + slot 80 | B6 #1873: native generation-tagged handles — one passive listener with up to two simultaneous children; `AGENTD.ELF` and the SSH server run on it |
 | HTTPD | `user/go/httpd` (`GOHTTPD.ELF`) | Go HTTP/1.1 web server over the passive-open listener (gate `live-httpd`; Zig `user/src/httpd.zig` retired in M71l) |
 
 ## What works end to end
@@ -70,9 +71,10 @@ translates the frames — that is the point of NAT.
 - `GOTRACEROUTE.ELF` is a peer reachability probe, not route discovery: the
   current ICMP syscall has neither TTL selection nor time-exceeded responses.
   Its `-m` option bounds attempts; it does not set a packet TTL.
-- TCP is **single-connection**: one client connect and one passive-open
-  listener; no TCP loopback, no congestion control, fixed window 4096,
-  payload ≤ 64 bytes in one segment.
+- TCP is **bounded**: the legacy slots 30–33 seam is a singleton client,
+  while the slot-80 native socket family allows one passive listener with at
+  most two simultaneous children system-wide; no TCP loopback, no congestion
+  control, fixed window 4096, payload ≤ 64 bytes in one segment.
 - RTO is fixed (3 ticks) with no Karn/exponential backoff; 10 retransmissions
   then an honest abort.
 - DHCP has no hostname/DNS options and no relay; the lease is enforced but the
@@ -84,7 +86,8 @@ translates the frames — that is the point of NAT.
 <Aside kind="warning">
 
 **LIMITATION.** No routing beyond the NAT gateway and no IPv6. TCP is a
-single-connection client + passive-open listener, not a general-purpose
-network stack — the tower proves the protocol shapes and the syscall seam.
+singleton client plus one bounded passive listener (two children), not a
+general-purpose network stack — the tower proves the protocol shapes and the
+syscall seam.
 
 </Aside>

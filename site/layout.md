@@ -11,9 +11,9 @@ tags: [development, layout]
 virelaios/
 ├── AGENTS.md                  project rules (read first)
 ├── README.md                  concise landing surface → this site
-├── build.zig / build.zig.zon  root build system (Zig 0.16)
+├── build.zig / build.zig.zon  root build system (Zig 0.17)
 ├── justfile                   command aliases
-├── .zigversion                pinned Zig version (0.16.0)
+├── .zigversion                pinned Zig version (0.17.0)
 ├── boot/src/main.zig          the AArch64 UEFI boot loader (handoff v2)
 ├── kernel/src/*.zig           the freestanding kernel + all subsystems
 ├── user/src/*.zig             the EL0 demo programs (built to .BIN images)

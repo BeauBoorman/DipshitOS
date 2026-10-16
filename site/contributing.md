@@ -14,7 +14,7 @@ short version.
 
 | Tool | Pin |
 |------|-----|
-| Zig | 0.16.0 (`.zigversion`) |
+| Zig | 0.17.0 (`.zigversion`) |
 | Host Swift | macOS 27 SDK (Virtualization.framework) |
 | Python | 3 (disk-image tooling, stdlib only) |
 | Shell | bash (gate scripts) |

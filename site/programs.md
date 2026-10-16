@@ -78,6 +78,9 @@ change; their build recipe is `bash tools/go/build-netdiag.sh`.
 | `GONETSTAT.ELF` | `user/go/netstat` (`tools/go/build-netdiag.sh`) | slot-62 network dashboard; gate `live-netstat` |
 | `GODNS.ELF` | `user/go/dns` (`tools/go/build-netdiag.sh`) | UDP DNS A-record lookup; gate `live-n5-dns` |
 | `GOTRACEROUTE.ELF` | `user/go/traceroute` (`tools/go/build-netdiag.sh`) | bounded direct-peer ICMP echo reachability; gate `live-n7-traceroute` |
+| `FLINT.ELF` | `user/go/flint` | M103/M101: the agent-native SCM — Atoms/Ops/Streams with Ed25519-signed Changes — speaking FLINT-SYNC/1 (`clone`/`pull`/`push`/`ls-remote`) behind a pinned publisher keyring; gate `go-flint` |
+| `GOBUILD.ELF` | `user/go/gobuild` (`tools/go/build-gobuild.sh`) | M107a/b: the in-guest build driver — import graph, `-importcfg` generation, `GOCMDCOMPILE.ELF`/`GOCMDLINK.ELF` children, named refusals (`dep_unsupported`, `closure_too_large`); gate `live-gobuild` |
+| `BTMATH.ELF` | `user/go/btmath` (`tools/go/build-btmath.sh`) | Bubble Tea v2's real `tea.Program` under `GOOS=virelai` via the M72c compiler-overlay mechanism (module-cache source, no vendor dump); gate `go-btmath` |
 | `PLUGIN.SO` | loaded via `dlopen`/`dlsym` | M31 E5: runtime-loadable plugin modules |
 
 The flat images come from `zig build` (Zig → ELF → `elf2bin.py` → a flat

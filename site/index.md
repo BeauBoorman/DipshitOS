@@ -22,11 +22,16 @@ see [[evidence]].
 
 ## Current status
 
-Milestones through **M86** have landed. **M87**, first impressions and remote
-terminal, is still open: the remote workflow's class-C acceptance needs a
-separate connecting machine and an authorized SSH target, neither of which was
-supplied as of 2026-10-02. The table below is the first 31 milestones; the
-current tracker is
+Milestones through **M104** have landed. Five arcs are open on the ledger —
+**M100** (a journaled guest filesystem on virtio-blk: the RW driver, the
+runner's `--data-disk` attach, the `mkfs.vlfs` formatter, and the kernel's
+`/disk` read path are on main), **M101** (signed software distribution:
+`FLINT.ELF`'s FLINT-SYNC/1 remote verbs and publisher keyring are on main),
+**M105** (the Zig FLINT host client — the `flintd` server already shipped),
+**M107** (the in-guest dev loop: `GOBUILD.ELF` drives the guest's own Go
+toolchain through a multi-package build), and **M108** (host integration: the
+bidirectional host clipboard over signed share files is on main). The table
+below is the first 31 milestones; the current tracker is
 [`docs/status.md`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/docs/status.md)
 and [[roadmap]].
 
@@ -72,7 +77,9 @@ contract; Zig `TABWM.BIN` is retained by decision (ADR 0034) as the
 closed since — read
 [`docs/status.md`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/docs/status.md)
 for what is open today instead of a date-stamped claim from this page. The Go
-toolchain already builds and runs programs in-guest (`live-selfhost-go`).
+toolchain already builds and runs programs in-guest (`live-selfhost-go`), and
+`GOBUILD.ELF` drives that toolchain through a multi-package import graph with
+named refusals (`live-gobuild`).
 
 <Aside kind="info">
 
@@ -93,10 +100,10 @@ A single boot of VirelaiOS gets you, in order:
 - A window manager — **Driving Award** — compositing a terminal and a live
   clock overlay.
 - EL0 user programs, exec'd from the host share, running as real processes
-  with a syscall ABI of **80 implemented slots** (0–79 of a 128-slot table) covering IPC,
+  with a syscall ABI of **88 implemented slots** (0–87 of a 128-slot table) covering IPC,
   windows, files, events, process control, TCP, filesystem mutation,
-  clipboard, app timers, audio, pipes, fonts, ping, net-stats, and anonymous
-  memory.
+  clipboard, app timers, audio, pipes, fonts, ping, net-stats, anonymous
+  memory, native sockets, and the observability/pid surface.
 - Networking from raw Ethernet frames up through ARP, IPv4/ICMP, UDP, DHCP,
   and TCP — client **and** passive-open server (`GOHTTPD.ELF` serves the
   guest's own files over HTTP/1.1; the Zig `HTTPD.BIN` was retired in M71l)
@@ -124,6 +131,14 @@ A single boot of VirelaiOS gets you, in order:
   application timers that post `TIMER` events instead of spin loops.
 - Sound: a virtio-snd device, PCM playback from EL0, a boot chime, and a
   melody app that plays Twinkle Twinkle Little Star.
+- A disk of its own (opt-in): `--data-disk <img>` attaches a second virtio-blk
+  function and the kernel mounts a `mkfs.vlfs`-formatted VLFS volume
+  read-only at `/disk` — the journaled write path is M100d's card, not yet
+  landed.
+- A bridge to the Mac (opt-in): `--host-clipboard` syncs the guest clipboard
+  with a named pasteboard through HMAC-signed share files, seat-mediated and
+  byte-silent when off; `FLINT.ELF` clones/pulls/pushes signed source against
+  a host `flintd` over FLINT-SYNC/1.
 
 ![A live VirelaiOS boot: the Go seat GOTABWM with its tab strip across the top and the Go editor NOTE.ELF hosting a document in the tab below](index.assets/screenshot.png "A live VirelaiOS boot")
 
@@ -157,7 +172,7 @@ fixtures, the serial logs are not committed.*
 ## What it runs on
 
 - **Host:** Apple silicon, macOS 27 or newer, Apple's Virtualization.framework.
-- **Guest:** AArch64, freestanding Zig (pinned **Zig 0.16.0**), no libc.
+- **Guest:** AArch64, freestanding Zig (pinned **Zig 0.17.0**), no libc.
 - **Not supported:** Linux, Unix, QEMU, x86, any other emulator. There is
   deliberately no QEMU path.
 
