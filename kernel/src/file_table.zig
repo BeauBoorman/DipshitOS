@@ -99,9 +99,9 @@ pub const Partition = enum {
     /// `disk:`) — the guest's own journaled volume on the dedicated
     /// virtio-blk device. Mounted per boot only when the `virelai-vlfs`
     /// device is present and its superblock validates; absent or refused,
-    /// paths here answer ENOENT and the boot proceeds share-only. v1 is
-    /// read-only: every object is world-readable inside the guest and no
-    /// mutation path exists (M100d owns writes).
+    /// paths here answer ENOENT and the boot proceeds share-only. M100d
+    /// owns writes: every mutation is a committed journal transaction and
+    /// every object is world-accessible inside the guest in v1 (D6).
     disk,
     /// #1072 (ADR 0020): the virtual terminal device (`/dev/tty`) — a
     /// process's controlling terminal, backed by `terminal.zig`. Not a
@@ -750,13 +750,13 @@ pub fn contained_open(pid: u64, root_bytes: []const u8, relative: []const u8, wr
     if (slot == max_handles_per_process) return -5;
     if (disk_root != null) {
         // VLFS contained open (ADR 0050 D6): the pinned lookup resolves
-        // through the vlfs backend; a write access is the v1 read-only
-        // refusal (AccessDenied → EACCES).
+        // through the vlfs backend; a write access on a read-only mount
+        // refuses at open (AccessDenied → EACCES).
         const token = metadata.openToken(vlfs_disk.backend(disk_root.?), vlfs_disk.authorizer, relative, if (writing) .write else .read) catch |err| return metadata_errno(err);
         var h = FileHandle{
             .in_use = true,
             .partition = .disk,
-            .flags = MODE_READ,
+            .flags = if (writing) MODE_WRITE else MODE_READ,
             .path_len = @intCast(path.len),
             .contained = true,
             .disk_handle = @intCast(token),
@@ -870,8 +870,8 @@ fn pin_directory(h: *const FileHandle) metadata.Directory {
 }
 
 fn release_pin(h: *FileHandle) void {
-    // `.disk` pins release through the VLFS backend (a no-op in v1 — an
-    // inode-number pin on a read-only volume cannot dangle).
+    // `.disk` pins release through the VLFS backend (a no-op — an
+    // inode-number pin carries no backend reference to drop).
     if (h.partition == .disk) {
         const backend = vlfs_disk.backend("");
         if (backend.ops) |ops| ops.release(backend.context, pin_object(h));
@@ -3533,5 +3533,45 @@ test "file_table: writable /disk mkdir-then-create inside fresh dir (M100f)" {
     var buf: [64]u8 = undefined;
     const n = read(0, @intCast(fr), &buf);
     try std.testing.expectEqualStrings(body, buf[0..@intCast(n)]);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fr)));
+}
+
+test "file_table: contained write-open on writable /disk mints a write handle (issue #2375)" {
+    init();
+    defer vlfs_disk.detach();
+    try vlfs_build(vlfs_empty_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDiskRw.source(&vlfs_test_img)));
+
+    // Seed a file through the plain open path.
+    const fd = open(0, "/disk/SEED.TXT", MODE_WRITE | MODE_CREATE);
+    try std.testing.expect(fd >= 0);
+    try std.testing.expectEqual(@as(i64, 13), write(0, @intCast(fd), "seed content\n"));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fd)));
+
+    // The contained write-open mints a MODE_WRITE handle on a writable
+    // mount — write and truncate through it commit (the #2375 bug minted
+    // MODE_READ, so both refused EACCES after a successful open).
+    const cfd = contained_open(0, "/disk", "SEED.TXT", true);
+    try std.testing.expect(cfd >= 0);
+    try std.testing.expectEqual(@as(i64, 3), write(0, @intCast(cfd), "ZZZ"));
+    try std.testing.expectEqual(@as(i64, 0), truncate(0, @intCast(cfd), 3));
+    var cmeta: metadata.Wire = undefined;
+    try std.testing.expectEqual(@as(i64, 0), handle_metadata(0, @intCast(cfd), metadata.handle_file, &cmeta));
+    try std.testing.expectEqual(@as(u64, 3), cmeta.size);
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(cfd)));
+
+    // A contained read-open stays read-only (host-branch parity).
+    const crd = contained_open(0, "/disk", "SEED.TXT", false);
+    try std.testing.expect(crd >= 0);
+    try std.testing.expectEqual(@as(i64, -7), write(0, @intCast(crd), "X"));
+    try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(crd)));
+
+    // The committed bytes read back through a plain open: write covered
+    // the first 3 bytes of the seed, truncate dropped the rest.
+    const fr = open(0, "/disk/SEED.TXT", MODE_READ);
+    try std.testing.expect(fr >= 0);
+    var buf: [16]u8 = undefined;
+    const n = read(0, @intCast(fr), &buf);
+    try std.testing.expectEqualStrings("ZZZ", buf[0..@intCast(n)]);
     try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fr)));
 }
