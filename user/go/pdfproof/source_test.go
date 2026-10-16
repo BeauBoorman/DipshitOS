@@ -354,6 +354,10 @@ func TestGeneratedMaxima(t *testing.T) {
 	in := os.Getenv("PDF_PROOF_MAXIMA")
 	if in == "" {
 		in = "../../../artifacts/m89-acceptance/reference/sources"
+		if _, err := os.Stat(in); os.IsNotExist(err) {
+			t.Skip("artifacts/m89-acceptance/reference/sources is not materialized; " +
+				"run `python3 -B tools/pdf-proof/oracle.py generate artifacts/m89-acceptance/reference` (tools/pdf-proof/README.md)")
+		}
 	}
 	paths, err := filepath.Glob(filepath.Join(in, "*.pdf"))
 	if err != nil || len(paths) != 4 {
@@ -395,10 +399,15 @@ func TestGeneratedCapacities(t *testing.T) {
 	if err = json.Unmarshal(b, &recipe); err != nil {
 		t.Fatal(err)
 	}
+	const capDir = "../../../artifacts/m89-acceptance/reference/sources/capacity"
+	if _, err := os.Stat(capDir); os.IsNotExist(err) {
+		t.Skip("artifacts/m89-acceptance/reference/sources/capacity is not materialized; " +
+			"run `python3 -B tools/pdf-proof/oracle.py generate artifacts/m89-acceptance/reference` (tools/pdf-proof/README.md)")
+	}
 	arena := make([]byte, pdf.ArenaBytes)
 	for _, row := range recipe.Capacities {
 		t.Run(row.ID, func(t *testing.T) {
-			b, err := os.ReadFile("../../../artifacts/m89-acceptance/reference/sources/capacity/" + row.ID + ".pdf")
+			b, err := os.ReadFile(capDir + "/" + row.ID + ".pdf")
 			if err != nil {
 				t.Fatal(err)
 			}
