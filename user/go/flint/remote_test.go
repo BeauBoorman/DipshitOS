@@ -1131,6 +1131,66 @@ func TestRemotePushStaleHead(t *testing.T) {
 	}
 }
 
+// TestRemotePullShortRead: a remote that ends the read before its
+// advertised head must not leave the replica looking current — pull
+// refuses stream_malformed and records nothing, mirroring the head
+// checks clone and verify --remote already run.
+func TestRemotePullShortRead(t *testing.T) {
+	srv := newFakeServer()
+	h := newRemoteHarness(t, srv)
+	st, lines := mkSignedStream(t, h, "main", 2)
+	srv.addStream(st, lines)
+	if rc, logs := h.runCmd("clone", "10.0.0.2:4748", "main"); rc != 0 {
+		t.Fatalf("clone: %v", logs)
+	}
+
+	// The remote serves one new Change but advertises a head beyond it.
+	cid, err := h.uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c3 := Change{
+		ID: cid, Parent: st.Head, Stream: st.ID,
+		TS: 1760000003000, Message: "srv third",
+		Ops: []Op{}, Merged: nil,
+	}
+	signServerChange(t, &c3)
+	l3, err := MarshalChangeLine(c3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clonedHead := *st.Head
+	srvSt := srv.streams[st.ID]
+	srvSt.lines = append(srvSt.lines, bytes.TrimRight(l3, "\n"))
+	ghost, err := h.uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvSt.rec.Head = &ghost
+
+	rc, logs := h.runCmd("pull")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse stream_malformed head mismatch" {
+		t.Fatalf("pull short read: rc=%d logs=%v", rc, logs)
+	}
+	// Nothing landed: the local log and record stay at the cloned head.
+	got, err := h.fs.ReadFile("/host/FLINT/streams/"+st.ID+".jsonl", MaxFileReadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gl, err := ReadJSONLLines(got)
+	if err != nil || len(gl) != 2 {
+		t.Fatalf("local log lines=%d err=%v", len(gl), err)
+	}
+	recBytes, _ := h.fs.ReadFile("/host/FLINT/streams/"+st.ID+".json", MaxFileReadBytes)
+	var rec Stream
+	if err := json.Unmarshal(recBytes, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Head == nil || *rec.Head != clonedHead {
+		t.Fatalf("record head=%v want %v", rec.Head, clonedHead)
+	}
+}
+
 func TestRemotePullForkNeeded(t *testing.T) {
 	srv := newFakeServer()
 	h := newRemoteHarness(t, srv)

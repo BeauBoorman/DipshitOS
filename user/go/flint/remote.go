@@ -1231,6 +1231,14 @@ func cmdPull(fs FS, root string, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The pulled chain must end at the remote-advertised head — clone
+	// (:1014) and verify --remote (:914) hold the same line. A remote
+	// that ends the read early would leave the replica looking current
+	// while silently trailing; authenticity already holds (every Change
+	// is pull-gated) but freshness does not.
+	if last.ID != *remoteHead {
+		return refuse("stream_malformed", "head mismatch")
+	}
 	var buf bytes.Buffer
 	for _, line := range fetched {
 		buf.Write(line)

@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"virelai/sshlib"
 )
 
 // A second pinned publisher seed for wrong-key legs — not in the harness
@@ -334,6 +337,97 @@ func TestPullKeyringMatrix(t *testing.T) {
 	rc, logs = h2.runCmd("verify", "--all")
 	if rc != 0 {
 		t.Fatalf("verify --all after revoke: rc=%d logs=%v", rc, logs)
+	}
+}
+
+// TestVerifyAllTrusted covers `verify --all --trusted` — the
+// materialization gate STORE execs: the publisher keyring runs over the
+// LOCAL replica (a share writer's appended Change refuses by name), and
+// --expect binds the folded log bytes so a mid-flight swap refuses
+// log_changed.
+func TestVerifyAllTrusted(t *testing.T) {
+	altPub := pubHexForSeed(t, testAltSeedHex)
+
+	seedLocal := func(t *testing.T, h *remoteHarness, seedHex string) *Stream {
+		st, lines := mkSignedStreamSeed(t, h, "main", 2, seedHex)
+		rec, _ := json.Marshal(st)
+		if err := h.fs.WriteFileSafe(streamRecordPath(h.root, st.ID), append(rec, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		for _, l := range lines {
+			buf.Write(l)
+			buf.WriteByte('\n')
+		}
+		if err := h.fs.WriteFileSafe(streamLogPath(h.root, st.ID), buf.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	// Trusted author: per-change verified lines, then the bound log hash.
+	h := newRemoteHarness(t, newFakeServer())
+	st := seedLocal(t, h, testRFC8032SeedHex)
+	logBytes, err := h.fs.ReadFile(streamLogPath(h.root, st.ID), MaxFileReadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sshlib.SHA256Sum(logBytes)
+	logSHA := sshlib.EncodeHex(sum[:])
+	rc, logs := h.runCmd("verify", "--all", "--trusted", "--expect="+st.ID+":"+logSHA)
+	if rc != 0 {
+		t.Fatalf("verify --all --trusted: rc=%d logs=%v", rc, logs)
+	}
+	if len(logs) != 3 || !strings.HasSuffix(logs[0], "sig: verified") ||
+		!strings.HasSuffix(logs[1], "sig: verified") ||
+		logs[2] != "flint: log "+st.ID+" sha256="+logSHA {
+		t.Fatalf("logs=%v", logs)
+	}
+
+	// The bind refuses when the log the gate re-reads is not the log the
+	// caller hashed.
+	rc, logs = h.runCmd("verify", "--all", "--trusted",
+		"--expect="+st.ID+":"+strings.Repeat("0", 64))
+	if rc != 1 || logs[len(logs)-1] != "flint: refuse log_changed "+st.ID {
+		t.Fatalf("log_changed: rc=%d logs=%v", rc, logs)
+	}
+
+	// An unpinned author in the local replica → key_unknown; the same
+	// store passes plain --all because only the signature gate runs.
+	h2 := newRemoteHarness(t, newFakeServer())
+	seedLocal(t, h2, testAltSeedHex)
+	rc, logs = h2.runCmd("verify", "--all", "--trusted")
+	if rc != 1 || len(logs) != 1 || !strings.HasPrefix(logs[0], "flint: refuse key_unknown") {
+		t.Fatalf("key_unknown: rc=%d logs=%v", rc, logs)
+	}
+	if rc, _ := h2.runCmd("verify", "--all"); rc != 0 {
+		t.Fatal("plain --all refused a well-signed log")
+	}
+
+	// Listed-but-revoked publisher → key_revoked at materialization.
+	if err := h2.fs.WriteFileSafe(keyringPath(h2.root), []byte(
+		"#v1\nkey="+testRFC8032PubHex+" name=rfc8032\nkey="+altPub+" name=alt\nrevoked="+altPub+"\n",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	rc, logs = h2.runCmd("verify", "--all", "--trusted")
+	if rc != 1 || len(logs) != 1 || !strings.HasPrefix(logs[0], "flint: refuse key_revoked") {
+		t.Fatalf("key_revoked: rc=%d logs=%v", rc, logs)
+	}
+
+	// No keyring → keyring_missing; --expect without --all → usage.
+	h3 := newRemoteHarness(t, newFakeServer())
+	if err := h3.fs.Remove(keyringPath(h3.root)); err != nil {
+		t.Fatal(err)
+	}
+	seedLocal(t, h3, testRFC8032SeedHex)
+	rc, logs = h3.runCmd("verify", "--all", "--trusted")
+	if rc != 1 || len(logs) != 1 || logs[0] != "flint: refuse keyring_missing" {
+		t.Fatalf("keyring_missing: rc=%d logs=%v", rc, logs)
+	}
+	rc, logs = h.runCmd("verify", "--expect="+st.ID+":"+logSHA)
+	if rc != 2 || len(logs) != 1 || logs[0] != "flint: refuse usage" {
+		t.Fatalf("expect without --all: rc=%d logs=%v", rc, logs)
 	}
 }
 
