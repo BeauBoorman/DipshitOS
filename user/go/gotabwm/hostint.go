@@ -106,11 +106,13 @@ func hostintConsume(tag uint8, rec hostint.Record) string {
 
 // hostintSeatTick is the per-composite-tick drive: consume what the lane
 // directory holds (adoption first), then produce what changed (the
-// clipboard lane's CLIP_OUT, M108b). ~1 Hz, bounded file ops.
+// clipboard lane's CLIP_OUT, M108b) and what the strip staged (the
+// notify-out lane's NOTIFY_OUT, M108d). ~1 Hz, bounded file ops.
 func hostintSeatTick() {
 	if hostintEngine == nil {
 		return
 	}
 	hostintEngine.Poll()
 	hostclipPoll()
+	hostnotifyPoll()
 }

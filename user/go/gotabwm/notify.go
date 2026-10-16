@@ -172,6 +172,9 @@ func notifyPush(tabID uint32, text string, ticks uint64) (string, bool, bool) {
 		expires:  ticks + NotifyTicks,
 		centerID: centerID,
 	})
+	// M108d (#2328, ADR 0051 D5): a toast that reached the strip stages its
+	// text for the notify-out lane — no-op unless an ARMED names the lane.
+	hostnotifyQueue(text)
 	// M99d (#2182): an accepted toast is audible too — one bounded stream
 	// play (open, prefill, start, end; the drain is confirmed on the next
 	// composite tick). DND returned above, so a held notice never chimes;
