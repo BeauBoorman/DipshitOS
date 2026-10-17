@@ -3,6 +3,11 @@ import AppKit
 /// The session front door. Gate windows do not use this controller.
 public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDelegate {
     public let lifecycle = HostLifecycle()
+    /// M114a (#2454): every menu action and the runner's `--host-cmd-after`
+    /// mirror dispatch through this bus. The session registers the verbs it
+    /// performs itself (below); the runner registers the rest on the same
+    /// instance (screenshot, headless stop).
+    public let commandBus = HostCommandBus()
     public let window: NSWindow
     public var onStop: (String, Int32) -> Void = { _, _ in }
     private let status = NSTextField(wrappingLabelWithString: "")
@@ -16,17 +21,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
                           backing: .buffered, defer: false)
         super.init()
         let app = NSApplication.shared
+        registerCommands()
         if presentWindow {
             app.setActivationPolicy(.regular)
             app.delegate = self
-            let menu = NSMenu()
-            let item = NSMenuItem()
-            let applicationMenu = NSMenu(title: "VirelaiOS")
-            applicationMenu.addItem(withTitle: "Quit VirelaiOS", action: #selector(NSApplication.terminate(_:)),
-                                    keyEquivalent: "q")
-            item.submenu = applicationMenu
-            menu.addItem(item)
-            app.mainMenu = menu
+            app.mainMenu = HostMenuBar.build(bus: commandBus)
             app.finishLaunching()
         }
         window.isReleasedWhenClosed = false
@@ -48,6 +47,27 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             window.makeKeyAndOrderFront(nil)
             app.activate()
         }
+    }
+
+    /// The verbs the session window performs itself. `quit` keeps the old
+    /// menu's exact path — NSApp.terminate → applicationShouldTerminate →
+    /// stop("quit") — now routed through the bus so it receipts.
+    private func registerCommands() {
+        commandBus.register(.about, HostCommandBus.Registration {
+            NSApp.orderFrontStandardAboutPanel(nil)
+            return .performed
+        })
+        commandBus.register(.quit, HostCommandBus.Registration {
+            NSApp.terminate(nil)
+            return .performed
+        })
+        commandBus.register(.stop, HostCommandBus.Registration(isEnabled: { [weak self] in
+            guard let self else { return false }
+            return self.lifecycle.state != .stopping && self.lifecycle.state != .stopped
+        }) { [weak self] in
+            self?.stop("menu-stop")
+            return .performed
+        })
     }
 
     public func attach(_ view: NSView) {

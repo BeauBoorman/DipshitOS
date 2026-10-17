@@ -98,6 +98,14 @@
 //          reason=no_bundle` per record instead. Requires --cvc-file and
 //          the `host-int` SECRETS.TXT row; OFF by default — no records
 //          polled, no center touched.)
+//         [--host-cmd-after <marker>:<verb>] (M114a #2454, index #2447:
+//          dispatch <verb> on the HostCommand bus — the same seam every
+//          AppKit menu item uses — once <marker> appears in the serial
+//          stream. Repeatable; <verb> is the suffix after the LAST colon
+//          and unknown verbs are a parse-time error. Every dispatch emits
+//          one `host-ui: cmd=<verb> state=<...>` receipt on stdout.
+//          Requires --script or --host-session, where the marker scan
+//          runs.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -635,6 +643,12 @@ var hostDrop: HostDrop?
 // banners under the session bundle (bare runner: `no_bundle` drops).
 var hostNotifyFlag = false
 var hostNotify: HostNotify?
+// M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
+// headless mirror of the HostCommand bus every menu item dispatches on
+// (index thesis 1: AppKit is never driven by synthesized clicks; the bus
+// is the testable seam). Repeatable; each armed trigger fires once on
+// its serial marker and the dispatch emits one `host-ui:` receipt.
+var hostCmdTriggers: [HostCommandTrigger] = []
 // The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
 // ARMED record naming every live lane — the seat adopts (epoch, mask), so
 // per-lane epochs would refuse each other stale_epoch forever.
@@ -1352,6 +1366,15 @@ while idx < arguments.count {
     } else if arg == "--host-drop-after", idx + 1 < arguments.count {
         hostDropAfter = arguments[idx + 1]
         idx += 2
+    } else if arg == "--host-cmd-after", idx + 1 < arguments.count {
+        // M114a: <marker>:<verb> — the verb is the suffix after the LAST
+        // colon (serial markers may carry their own). An unknown verb is
+        // a parse-time error, not a trigger that silently never fires.
+        guard let trigger = HostCommandTrigger(arguments[idx + 1]) else {
+            fail("--host-cmd-after expects <marker>:<verb>; verbs are: \(HostCommand.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        hostCmdTriggers.append(trigger)
+        idx += 2
     } else if arg == "--host-notify" {
         // M108d (#2328, ADR 0051 D5): the notify-out lane — seat toasts
         // become signed NOTIFY_OUT records the runner maps to banners
@@ -1756,6 +1779,12 @@ while idx < arguments.count {
 // interactive variant of the duplex console plumbing (claim 6684).
 let consoleTimeout: TimeInterval = (consoleMode && !timeoutExplicit) ? 0 : timeout
 let scriptMode = scriptPath != nil
+
+// M114a: --host-cmd-after's marker scan runs on the scripted/session
+// polls; refuse silently-never-firing modes up front.
+if !hostCmdTriggers.isEmpty, !scriptMode, !hostSessionMode {
+    fail("--host-cmd-after requires --script or --host-session (the serial-marker scan runs on the scripted and session polls).")
+}
 
 // ---------------------------------------------------------------------------
 // Terminal state management (used in console mode; no-ops elsewhere).
@@ -3049,6 +3078,34 @@ if hostSessionMode {
     hostApplication = HostApplication(serialLog: serialLogPath)
     hostApplication?.onStop = { reason, code in stopHostSession(reason, code: code) }
 }
+// M114a (#2454): the bus every UI action dispatches through — the session
+// window's own instance when it exists, a windowless one otherwise, so
+// --host-cmd-after dispatches verbs down the identical seam the menus use.
+let commandBus = hostApplication?.commandBus ?? HostCommandBus()
+// The verbs the runner performs itself: the framebuffer capture the
+// --screen/--screenshot-after path already owns (enabled once the display
+// view exists), and a headless stop/quit for runs with no session window
+// (in --host-session those verbs come from HostApplication's own
+// registration instead).
+if screenshotPath != nil || displayMode {
+    var hostUIShotCount = 0
+    commandBus.register(.screenshot, HostCommandBus.Registration(isEnabled: {
+        machineView != nil
+    }) {
+        hostUIShotCount += 1
+        let path = screenshotPathForLabel("hostui-\(hostUIShotCount)")
+        writeScreenshot(to: path)
+        return FileManager.default.fileExists(atPath: path) ? .performed : .failed
+    })
+}
+if !hostSessionMode {
+    let headlessStop = HostCommandBus.Registration(isEnabled: { runner.vm.state == .running }) {
+        runner.queue.async { runner.vm.stop { _ in } }
+        return .performed
+    }
+    commandBus.register(.stop, headlessStop)
+    commandBus.register(.quit, headlessStop)
+}
 // Set when vm.start completes successfully; consolePoll only treats a
 // .stopped/.error state as "session over" after the VM has actually started
 // (a fresh VZVirtualMachine is .stopped until boot begins).
@@ -3112,6 +3169,9 @@ if consoleMode {
     if let nvramConsolePath {
         print("  nvram console: \(nvramConsolePath)  (claim 0015 — post-exit console stream from the NVRAM channel; exit 0 iff bytes were found)")
     }
+}
+for t in hostCmdTriggers {
+    print("  host-cmd-after: \"\(t.marker)\" → \(t.command.rawValue)  (M114a #2454: HostCommand bus mirror — dispatch emits a host-ui: receipt)")
 }
 if let netCapturePath {
     print("  net: ENABLED (milestone five card N1, claim 1373) — virtio-net device attached, guest TX frames captured byte-exactly to \(netCapturePath), fixed MAC 02:00:00:00:00:01")
@@ -3454,16 +3514,20 @@ func captureScreenshot(at t: TimeInterval) {
 // ONCE the moment the marker appears in the serial log, under a stable
 // `-<label>` name (deterministic — the fixed 5/10/15 s captures cannot
 // guarantee a capture lands inside an EL0 hide/show window).
-func captureScreenshotMarker(_ label: String) {
-    let path: String
+// The `-<label>` path naming shared by --screenshot-after and the bus's
+// screenshot verb (M114a): <base>-<label>[.<ext>], or artifacts/ when no
+// --screen base was given.
+func screenshotPathForLabel(_ label: String) -> String {
     if let base = screenshotPath {
         let dot = (base as NSString).deletingPathExtension
         let ext = (base as NSString).pathExtension
-        path = ext.isEmpty ? "\(dot)-\(label)" : "\(dot)-\(label).\(ext)"
-    } else {
-        path = "artifacts/vm-screen-\(label).png"
+        return ext.isEmpty ? "\(dot)-\(label)" : "\(dot)-\(label).\(ext)"
     }
-    writeScreenshot(to: path)
+    return "artifacts/vm-screen-\(label).png"
+}
+
+func captureScreenshotMarker(_ label: String) {
+    writeScreenshot(to: screenshotPathForLabel(label))
 }
 
 // Shared capture body (ScreenCaptureKit first, cacheDisplay fallback):
@@ -4072,6 +4136,20 @@ func fireHostWriteIfMarker(_ text: String) {
         FileHandle.standardOutput.write(Data("HOST-WRITE: wrote \(relPath) (\(payload.utf8.count) bytes) after \"\(marker)\"\n".utf8))
     } catch {
         FileHandle.standardOutput.write(Data("HOST-WRITE: FAILED for \(relPath): \(error)\n".utf8))
+    }
+}
+
+// M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
+// headless mirror of the HostCommand bus. When a trigger's marker appears
+// in the serial stream the verb dispatches through the SAME bus the
+// AppKit menu items use, so a class-B run exercises the real seam instead
+// of a synthesized click (index thesis 1). Each trigger fires once; the
+// dispatch itself writes the `host-ui:` receipt.
+func fireHostCmdsIfMarker(_ text: String) {
+    for i in hostCmdTriggers.indices {
+        guard !hostCmdTriggers[i].fired, text.contains(hostCmdTriggers[i].marker) else { continue }
+        hostCmdTriggers[i].fired = true
+        commandBus.dispatch(hostCmdTriggers[i].command)
     }
 }
 
@@ -6618,6 +6696,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     fireHostWriteIfMarker(lastText)
     fireHostClipInIfMarker(lastText)
     fireHostDropIfMarker(lastText)
+    fireHostCmdsIfMarker(lastText)
     // Fix 3: the liveness heartbeat — unbuffered stderr every 30 s.
     if Date().timeIntervalSince(scriptPollLastBeat) >= 30 {
         scriptPollLastBeat = Date()
@@ -6703,6 +6782,11 @@ func stopHostSession(_ reason: String, code: Int32) {
 func hostSessionPoll() {
     guard let hostApplication,
           hostApplication.lifecycle.state != .stopping else { return }
+    // M114a: --host-cmd-after fires in session mode on the same serial-log
+    // scan the scripted poll uses — the mirror of choosing the menu item.
+    let sessionText = String(decoding: (try? Data(contentsOf: serialURL)) ?? Data(), as: UTF8.self)
+    if !sessionText.isEmpty { lastText = sessionText }
+    fireHostCmdsIfMarker(lastText)
     runner.queue.async {
         let state = runner.vm.state
         DispatchQueue.main.async {
