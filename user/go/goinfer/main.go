@@ -10,9 +10,11 @@ package main
 //	stub            deterministic PRNG-weights model, K=5 runs — the
 //	                live-gpu3d leg payload; needs no fetched weights
 //	model [path]    the owner-approved real model from a VIW image on the
-//	                share (default /host/GOINFER/SMOLLM2.VIW). Weights are
-//	                staged off-image per the card's licence gate; absent
-//	                bytes are a named failure, never a fabricated answer.
+//	                share (default /host/GOINFER/SMOLLM2.VIW): one load,
+//	                K=5 fixed-prompt decodes, licence receipt per run.
+//	                Weights are staged off-image per the card's licence
+//	                gate; absent bytes are a named failure, never a
+//	                fabricated answer.
 //
 // Receipts land in /host/GOINFER/RECEIPT.TSV — the same evidence seam
 // GPUTRIANGLE uses. On a device-less boot the app prints
@@ -20,6 +22,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +46,7 @@ const (
 	modelMaxNew = 64
 
 	stubK      = 5
+	modelK     = 5
 	stageBytes = 1 << 20 // load chunk; session.Write chunks finer anyway
 )
 
@@ -223,9 +228,12 @@ func (a *app) jStub() error {
 	return a.writeReceipts()
 }
 
-// jModel runs the owner-approved real model from a staged VIW image. The
-// file's absence is a named failure: the app never fabricates an answer
-// for weights it was never given.
+// jModel runs the owner-approved real model from a staged VIW image: one
+// stream-and-seal load — the file is hashed as it passes so the receipt
+// carries the staged sha256 — then K=5 greedy decodes of the card's fixed
+// prompt, each run emitting the licence receipt (licence, model, sha,
+// resident size) the card demands. The file's absence is a named failure:
+// the app never fabricates an answer for weights it was never given.
 func (a *app) jModel(path string) error {
 	if !a.h.FileExists(path) {
 		a.rec.row("model", "absent", path)
@@ -245,19 +253,98 @@ func (a *app) jModel(path string) error {
 		return err
 	}
 	defer s.Close()
-	ids, st, m, err := a.runOnce(s, src)
+
+	sum := sha256.New()
+	tr := io.TeeReader(src, sum)
+	t0 := a.h.Nanos()
+	im, err := readVIWHead(tr)
 	if err != nil {
 		a.rec.row("model", "run", errName(err))
 		return fmt.Errorf("model run: %w", err)
 	}
-	ans := m.tok.Decode(ids)
+	m, err := loadModel(im, tr, s, stageBytes)
+	if err != nil {
+		a.rec.row("model", "run", errName(err))
+		return fmt.Errorf("model run: %w", err)
+	}
+	defer m.freeBuffers(s)
+	eng, err := newEngine(s, m)
+	if err != nil {
+		a.rec.row("model", "run", errName(err))
+		return fmt.Errorf("model run: %w", err)
+	}
+	defer eng.free()
+	tok, err := parseTokenizer(im.Tok)
+	if err != nil {
+		a.rec.row("model", "run", errName(err))
+		return fmt.Errorf("model run: %w", err)
+	}
+	m.tok = tok
+	sha := hex.EncodeToString(sum.Sum(nil))
+	loadMs := (a.h.Nanos() - t0) / 1e6
+	resident := a.h.SelfMemBytes()
+
+	rec := m.cfg.Model
 	a.rec.row("model", "loaded", "params="+is(int(m.params)),
-		"vocab="+is(m.cfg.Vocab), "layers="+is(m.cfg.Layers))
-	a.rec.row("model", "answer", ans, "ids="+idlist(ids),
-		"submits="+is(int(st.Submits)), "completed="+is(int(st.Completed)))
+		"vocab="+is(m.cfg.Vocab), "layers="+is(m.cfg.Layers),
+		"load_ms="+is(int(loadMs)))
 	a.h.ConsoleLine("goinfer: loaded params=" + is(int(m.params)) +
-		" vocab=" + is(m.cfg.Vocab))
-	a.h.ConsoleLine(`goinfer: model answer "` + ans + `"`)
+		" vocab=" + is(m.cfg.Vocab) + " load_ms=" + is(int(loadMs)))
+	a.h.ConsoleLine("goinfer: licence=" + rec.License +
+		" model=" + rec.ID + " sha=" + sha +
+		" resident=" + strconv.FormatUint(resident, 10))
+	a.rec.row("model", "licence", "licence="+rec.License,
+		"model="+rec.ID, "source="+rec.Source,
+		"usha="+rec.UpstreamSHA256, "ssha="+sha,
+		"resident="+strconv.FormatUint(resident, 10))
+
+	prompt := tok.Encode(modelPrompt)
+	var first string
+	var firstIds string
+	var prev gpu3d.ComputeStatsBlock
+	for k := 1; k <= modelK; k++ {
+		d0 := a.h.Nanos()
+		ids, err := eng.generate(prompt, modelMaxNew)
+		if err != nil {
+			a.rec.row("model", "run", is(k), errName(err))
+			return fmt.Errorf("model run %d: %w", k, err)
+		}
+		ns := a.h.Nanos() - d0
+		tokps := "0"
+		if ns > 0 {
+			tokps = strconv.FormatFloat(float64(len(ids))*1e9/float64(ns), 'f', 2, 64)
+		}
+		st, err := s.Stats()
+		if err != nil {
+			return err
+		}
+		delta := st.Submits - prev.Submits
+		prev = st
+		ans := m.tok.Decode(ids)
+		a.rec.row("model", "run", is(k), "ids="+idlist(ids),
+			"toks="+is(len(ids)), "tokps="+tokps,
+			"submits="+is(int(delta)),
+			"licence="+rec.License, "model="+rec.ID,
+			"ssha="+sha, "resident="+strconv.FormatUint(resident, 10))
+		a.h.ConsoleLine("goinfer: model run k=" + is(k) +
+			" ids=" + idlist(ids) + " tokps=" + tokps)
+		if k == 1 {
+			first, firstIds = ans, idlist(ids)
+		} else if ans != first {
+			a.rec.row("model", "diverged", is(k))
+			a.h.ConsoleLine("goinfer: model diverged k=" + is(k))
+			return errors.New("model answer diverged")
+		}
+	}
+	st, err := s.Stats()
+	if err != nil {
+		return err
+	}
+	a.rec.row("model", "consistent", "K="+is(modelK), "ids="+firstIds)
+	a.rec.row("model", "answer", first, "ids="+firstIds,
+		"submits="+is(int(st.Submits)), "completed="+is(int(st.Completed)))
+	a.h.ConsoleLine("goinfer: model consistent K=" + is(modelK))
+	a.h.ConsoleLine(`goinfer: model answer "` + first + `"`)
 	a.h.ConsoleLine("goinfer: stats submits=" + is(int(st.Submits)) +
 		" completed=" + is(int(st.Completed)) +
 		" refusals=" + is(int(st.Refusals)) +
@@ -279,6 +366,10 @@ var (
 
 func run(h host, args []string) error {
 	a := &app{h: h}
+	// The journey-end marker every path emits — success, named refusal,
+	// unsupported, usage — so a gate leg can sequence on one line without
+	// knowing which outcome the journey took.
+	defer h.ConsoleLine("goinfer: done")
 	a.rec.row("schema", "1")
 	journey := ""
 	if len(args) > 0 {

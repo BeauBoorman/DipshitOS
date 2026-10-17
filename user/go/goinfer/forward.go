@@ -344,20 +344,23 @@ func (e *engine) kcacheEl(l, g int) int {
 	return (l*e.m.cfg.KVHeads + g) * e.m.cfg.SeqCap * dh
 }
 
-// cacheAppend uploads layer l's k/v row at position pos for every kv head
-// — one contiguous dh-vector write per head per matrix; earlier rows are
-// already device-side from previous positions.
-func (e *engine) cacheAppend(l, pos int) error {
+// cacheUpload stages layer l's k/v rows 0..pos for every kv head. The io
+// region is ONE layer's cache at a time — every layer overwrites it — so
+// attention must see the layer's whole history, not just the new row:
+// earlier rows still hold the previous layer's positions otherwise. The
+// guest-side arrays are [layer][kvhead][pos][dh] contiguous, so the full
+// upload is the same six-write cost the single-row append had.
+func (e *engine) cacheUpload(l, pos int) error {
 	c := e.m.cfg
 	dh := e.m.headDim()
 	for g := 0; g < c.KVHeads; g++ {
-		base := e.kcacheEl(l, g) + pos*dh
-		koff := e.off.kc + uint32(g*c.SeqCap*dh+pos*dh)*2
-		if err := e.put16(koff, e.kc[base:base+dh]); err != nil {
+		base := e.kcacheEl(l, g)
+		koff := e.off.kc + uint32(g*c.SeqCap*dh)*2
+		if err := e.put16(koff, e.kc[base:base+(pos+1)*dh]); err != nil {
 			return err
 		}
-		voff := e.off.vc + uint32(g*c.SeqCap*dh+pos*dh)*2
-		if err := e.put16(voff, e.vc[base:base+dh]); err != nil {
+		voff := e.off.vc + uint32(g*c.SeqCap*dh)*2
+		if err := e.put16(voff, e.vc[base:base+(pos+1)*dh]); err != nil {
 			return err
 		}
 	}
@@ -404,7 +407,7 @@ func (e *engine) step(tok, pos int) error {
 				e.vc[base+i] = gpu3d.F16bits(v[g*dh+i])
 			}
 		}
-		if err := e.cacheAppend(l, pos); err != nil {
+		if err := e.cacheUpload(l, pos); err != nil {
 			return err
 		}
 		// Attention: QG query heads share one kv head — one scores GEMM
@@ -424,8 +427,16 @@ func (e *engine) step(tok, pos int) error {
 			if err := e.get(e.off.scores, qg*(pos+1), e.scores); err != nil {
 				return err
 			}
+			// softmax(QK^T / sqrt(dh)) — the 1/sqrt(head_dim) factor every
+			// transformer applies; the stub's arbitrary answer masked its
+			// absence until a real model exposed it.
+			attnScale := float32(1 / math.Sqrt(float64(dh)))
 			for r := 0; r < qg; r++ {
-				softmaxInPlace(e.scores[r*(pos+1) : (r+1)*(pos+1)])
+				row := e.scores[r*(pos+1) : (r+1)*(pos+1)]
+				for i := range row {
+					row[i] *= attnScale
+				}
+				softmaxInPlace(row)
 			}
 			if err := e.put(e.off.probs, e.scores[:qg*(pos+1)]); err != nil {
 				return err

@@ -2,13 +2,15 @@
 # (GPUTRIANGLE.ELF) drives the opt-in VIR1 render device over the real seat
 # -> broker -> Metal path; the private profile's raw BGRA readback export and
 # the VZ scanout are pixel-proven by f1's independent comparator/geometry.
-# Twelve independent boots, one leg each: 01 triangle, 02 mixed margins,
+# Thirteen independent boots, one leg each: 01 triangle, 02 mixed margins,
 # 03 resize/second generation, 04 close/reuse, 05 native-only (no render
 # device), 06 malformed/auth (invalid battery + forged kind-17), 07
 # wrong/stale fence, 08 stall/timeout + next-open drain, 09 M111b GPU
 # compute (slot-90 GEMM submit->fence->readback + named refusal), 10 M111c
 # GOINFER stub-model inference K=5, 11 GOINFER on a device-less boot, 12
-# GOINFER weights-absent honesty. `wm=none`
+# GOINFER weights-absent honesty, 13 GOINFER owner-approved model
+# (SmolLM2-135M-Instruct, Apache-2.0) K=5 decode when a VIW is staged.
+# `wm=none`
 # is seeded so the seat is the spec's own scripted exec; every leg ends on
 # a marker only its script can print. Leg 05 RUNS FIRST: the seed share is
 # spec-scoped, so its no-receipt assert is only honest before any 3D leg
@@ -18,7 +20,7 @@
 # device/app never ran cannot pass. HOST PREREQUISITE (fails honestly):
 #   bash tools/go/build-gotabwm.sh tools/go/build-gputriangle.sh
 
-vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 12 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model inference"
+vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 13 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model + owner-approved SmolLM2 inference"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -93,6 +95,26 @@ for name in ("GOTABWM.ELF", "GPUTRIANGLE.ELF", "GOINFER.ELF"):
 with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
     f.write("#v2\nwm=none\n")
 print("staged Go seat + GPUTRIANGLE.ELF + GOINFER.ELF, wm=none")
+
+# The model VIW (M111c #2410, owner-approved SmolLM2-135M-Instruct): staged
+# ONLY when the operator produced it (tools/goinfer/convert-smollm2.py ->
+# artifacts/goinfer/SMOLLM2.VIW) — the clawback keeps the file optional.
+# A present file's sha256 must equal the pin recorded at staging time — a
+# wrong staged file is a hard failure, never a silently different model.
+# The bytes park in RUN_DIR, NOT the share: leg 12's weights-absent boot
+# must still find GOINFER/SMOLLM2.VIW missing; the leg-12 post hook moves
+# it onto the app's default path only for the model leg that follows.
+import hashlib
+VIW_PIN = "2f5d4c774ea89016ae2b049e288e21a73987fc1c37eb1a58fc1284fad86878bd"
+viw = os.path.join("artifacts", "goinfer", "SMOLLM2.VIW")
+if os.path.exists(viw):
+    sha = hashlib.sha256(open(viw, "rb").read()).hexdigest()
+    if sha != VIW_PIN:
+        sys.exit("staged VIW sha256 %s != pinned %s" % (sha, VIW_PIN))
+    shutil.copy(viw, os.path.join(rd, "SMOLLM2.VIW"))
+    print("model VIW verified against pin, parked until leg 12 runs")
+else:
+    print("no staged VIW: leg 13 asserts the weights-absent path")
 PY
 
 # --- leg 05 (run first): native-only --------------------------------------
@@ -520,9 +542,10 @@ vgate_assert 10 serial-count 'goinfer: stub run k=' 5
 vgate_assert 10 serial-contains 'goinfer: stub consistent K=5'
 vgate_assert 10 serial-contains 'goinfer: stub answer'
 # The pinned stub answer — observed on the Metal path 2026-10-17 (and
-# byte-identical to the kernel-emulating host fake's decode). Any drift is
-# a real-path regression, not a re-pin.
-vgate_assert 10 serial-count 'ids=210,210,210,175,189,36,58,143,36,23,36,23,58,176,217,34' 5
+# byte-identical to the kernel-emulating host fake's decode). The sequence
+# moved once when the forward path's attention scale landed (the real
+# model exposed its absence); any drift now is a real-path regression.
+vgate_assert 10 serial-count 'ids=196,99,196,196,196,196,196,196,99,133,99,99,99,99,99,133' 5
 vgate_assert 10 serial-contains 'goinfer OK'
 vgate_assert 10 serial-absent 'goinfer: error'
 vgate_assert 10 serial-absent 'goinfer: diverged'
@@ -563,3 +586,101 @@ vgate_assert 12 serial-absent 'goinfer: model answer'
 vgate_assert 12 serial-absent 'gpu3d: timeout'
 vgate_assert 12 output-contains 'compute-submits=0'
 vgate_assert 12 output-contains 'refusals=0'
+# Leg 12's boot proved the named refusal; NOW the parked VIW (when one
+# exists) lands on the app's default path so the model leg that follows
+# loads it exactly like an operator's install. Strict optional-file
+# semantics: an absent staged file is a skipped move, not a failure.
+vgate_assert 12 python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ["VG_SHARE"]
+src = os.path.join(rd, "SMOLLM2.VIW")
+if not os.path.exists(src):
+    print("no parked VIW (clawback state: legs run weights-absent)")
+    sys.exit(0)
+dst_dir = os.path.join(share, "GOINFER")
+os.makedirs(dst_dir, exist_ok=True)
+os.replace(src, os.path.join(dst_dir, "SMOLLM2.VIW"))
+print("model VIW staged at GOINFER/SMOLLM2.VIW for leg 13")
+PY
+
+# --- leg 13: GOINFER owner-approved model, K=5 (M111c, issue #2410) -------
+# The licence gate's second half: the real model answers the card's fixed
+# ChatML prompt on the same Metal compute path, five consecutive greedy
+# decodes on one stream-and-seal load, each run emitting the licence
+# receipt (licence / model / staged sha / resident size) the card demands.
+# The leg is honest in BOTH states of the staged file — the clawback
+# condition made a gate property: when GOINFER/SMOLLM2.VIW is on the share
+# the pinned ids and K=5 consistency MUST appear; when it is not (the file
+# deleted is the model removed), the same named refusal leg 12 proves must
+# appear instead. Either way 'goinfer: done' ends the journey for the rx
+# sequencing, and a staged file whose sha differs from the pin fails hard.
+vgate_run 13 -- \
+    --screen '$RUN_DIR/screen-13' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-goinfer-model.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-rx.txt' \
+    --script3-after 'goinfer: done' \
+    --script-expect 'rx-g3-ok' --timeout 5400
+
+vgate_assert 13 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 13 serial-contains 'gotabwm: holding seat'
+vgate_assert 13 serial-contains 'goinfer: done'
+vgate_assert 13 serial-absent 'gpu3d: timeout'
+vgate_assert 13 serial-absent 'gpu3d: badresp'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 serial-absent 'goinfer: diverged'
+vgate_assert 13 output-contains 'compute-refusals=0'
+vgate_assert 13 output-contains 'refusals=0'
+vgate_assert 13 python <<'PY'
+import hashlib, os, sys
+share = os.environ["VG_SHARE"]
+ser = open(os.environ["VG_SER"], errors="replace").read()
+VIW_PIN = "2f5d4c774ea89016ae2b049e288e21a73987fc1c37eb1a58fc1284fad86878bd"
+# The pinned greedy answer — the 64 ids observed on the Metal path
+# 2026-10-17 ("The capital of France is Paris. ..."), byte-identical to
+# the kernel-emulating host fake's decode. Determinism, not fluency, is
+# the pin; a drift is a real-path regression.
+ANSWER_IDS = "504,3575,282,4649,314,7042,30,7042,314,253,2240,338,553,719,253,2257,282,8238,327,4936,28,6578,28,284,16597,327,5034,30,657,314,3807,281,260,1911,282,260,4206,282,9017,28,10000,411,260,26061,21633,367,7042,28,284,314,253,2240,338,553,719,253,2257,282,8238,327,4936,28,6578,28"
+staged = os.path.join(share, "GOINFER", "SMOLLM2.VIW")
+if not os.path.exists(staged):
+    # Clawback state: the model is gone, the named refusal must still be
+    # the only answer the app gives — never a fabricated one.
+    for want in ("goinfer: weights absent", "goinfer: error absent",
+                 "goinfer: done"):
+        if want not in ser:
+            sys.exit("absent-path marker missing: %r" % want)
+    if "goinfer: model answer" in ser:
+        sys.exit("model answer appeared without a staged VIW")
+    print("no staged VIW: weights-absent refusal verified (clawback clean)")
+    sys.exit(0)
+sha = hashlib.sha256(open(staged, "rb").read()).hexdigest()
+if sha != VIW_PIN:
+    sys.exit("staged VIW sha256 %s != pinned %s" % (sha, VIW_PIN))
+for want in ("goinfer: licence=Apache-2.0 " +
+             "model=HuggingFaceTB/SmolLM2-135M-Instruct sha=" + VIW_PIN,
+             "goinfer: loaded params=",
+             "goinfer: model consistent K=5",
+             "goinfer: model answer ",
+             "goinfer OK"):
+    if want not in ser:
+        sys.exit("model-path marker missing: %r" % want)
+if ser.count("goinfer: model run k=") != 5:
+    sys.exit("want 5 model run lines:\n%s" % ser)
+if ser.count("ids=" + ANSWER_IDS) != 5:
+    sys.exit("pinned ids did not appear on every run")
+if "tokps=" not in ser:
+    sys.exit("no tok/s evidence emitted")
+body = open(os.path.join(share, "GOINFER", "RECEIPT.TSV")).read()
+for row in ("model\tlicence\tlicence=Apache-2.0\t" +
+            "model=HuggingFaceTB/SmolLM2-135M-Instruct",
+            "ssha=" + VIW_PIN, "resident=",
+            "model\tconsistent\tK=5"):
+    if row not in body:
+        sys.exit("receipt missing %r\n%s" % (row, body))
+if body.count("model\trun\t") != 5:
+    sys.exit("receipt wants 5 model run rows:\n%s" % body)
+print("model leg: pinned sha, licence receipt, K=5 consistent answer verified")
+PY

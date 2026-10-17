@@ -28,6 +28,11 @@ type host interface {
 	// OpenComp takes the compute session (slot 90); ENXIO maps to
 	// gpu3d.ErrComputeNoDevice, which journeys answer "unsupported".
 	OpenComp() (dev, error)
+	// Nanos is the monotonic clock for tok/s evidence.
+	Nanos() int64
+	// SelfMemBytes is this process's owned resident footprint (the proc
+	// table's v2 MemBytes); 0 when the row cannot be found.
+	SelfMemBytes() uint64
 }
 
 // --- guest platform -----------------------------------------------------------
@@ -82,3 +87,28 @@ func (guestHost) OpenRead(path string) (io.ReadCloser, error) {
 }
 
 func (guestHost) OpenComp() (dev, error) { return gpu3d.OpenCompute() }
+
+func (guestHost) Nanos() int64 { return vi.Nanos() }
+
+// SelfMemBytes finds this process in the v2 proc table by name — there is
+// no self-pid syscall, so the scan is the seam's own convention (an
+// ambiguous name reports 0 rather than guessing, same as lease.go).
+func (guestHost) SelfMemBytes() uint64 {
+	var rows [64]vi.ProcRow
+	n, rc := vi.ProcsV2(rows[:])
+	if rc < 0 || n <= 0 {
+		return 0
+	}
+	found := false
+	var mem uint64
+	for i := 0; i < n; i++ {
+		if rows[i].State != vi.ProcRunning || rows[i].Name() != appName {
+			continue
+		}
+		if found {
+			return 0
+		}
+		found, mem = true, rows[i].MemBytes
+	}
+	return mem
+}

@@ -18,6 +18,7 @@ type fakeHost struct {
 	dirs    map[string]bool
 	devs    []*fakeDev
 	openErr error
+	now     int64
 }
 
 func newFakeHost() *fakeHost {
@@ -58,6 +59,15 @@ func (f *fakeHost) OpenComp() (dev, error) {
 	f.devs = append(f.devs, d)
 	return d, nil
 }
+
+// Nanos advances a fixed tick per call so tok/s fields are populated and
+// deterministic without a real clock.
+func (f *fakeHost) Nanos() int64 {
+	f.now += 1e6
+	return f.now
+}
+
+func (f *fakeHost) SelfMemBytes() uint64 { return 30 << 20 }
 
 func (f *fakeHost) hasConsole(sub string) bool {
 	for _, l := range f.console {

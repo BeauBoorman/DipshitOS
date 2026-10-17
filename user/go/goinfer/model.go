@@ -317,14 +317,17 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 }
 
 // tensorDest decides a payload's destination: a guest-side accumulator
-// (norms, embed) or nil — device weight.
+// (norms, embed) or nil — device weight. Accumulators are preallocated to
+// the payload length so the streamed append never doubles past its size.
 func (m *model) tensorDest(t viwTensor) *[]byte {
 	switch t.Name {
 	case tEmbed:
-		m.embedRaw = new([]byte)
+		b := make([]byte, 0, t.PayLen)
+		m.embedRaw = &b
 		return m.embedRaw
 	case tFinalN:
-		m.finalRaw = new([]byte)
+		b := make([]byte, 0, t.PayLen)
+		m.finalRaw = &b
 		return m.finalRaw
 	}
 	if li := layerIndex(t.Name); li >= 0 && li < m.cfg.Layers {
@@ -332,10 +335,12 @@ func (m *model) tensorDest(t viwTensor) *[]byte {
 		sub := t.Name[strings.IndexByte(t.Name, '.')+1:]
 		switch sub {
 		case tAttnN:
-			lw.attnRaw = new([]byte)
+			b := make([]byte, 0, t.PayLen)
+			lw.attnRaw = &b
 			return lw.attnRaw
 		case tFfnN:
-			lw.ffnRaw = new([]byte)
+			b := make([]byte, 0, t.PayLen)
+			lw.ffnRaw = &b
 			return lw.ffnRaw
 		}
 	}
@@ -390,7 +395,7 @@ const (
 	stubHeads   = 4
 	stubKVHeads = 4
 	stubVocab   = 256
-	stubSeq     = 64
+	stubSeq     = 256 // ≥ the fixed model prompt so a stub-staged model run fits
 	stubGroup   = 32 // weight quantization group
 )
 
