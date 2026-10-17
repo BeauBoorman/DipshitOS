@@ -975,7 +975,10 @@ pub fn net_send(ops: *const Ops, dev: *Device, frame: []const u8) SendResult {
     // used-ring advance must not be attributed to the next request.
     ops.invalidate(@intFromPtr(&dev.tx_used), @sizeOf(VirtqUsed));
     if (dev.tx_avail.idx != dev.tx_used.idx) {
-        if (!wait_tx_completion(ops, dev)) return .timeout;
+        if (!wait_tx_completion(ops, dev)) {
+            tx_poll_timeouts +%= 1; // #2436: the device stopped consuming
+            return .timeout;
+        }
     }
 
     // One device-read descriptor covering the whole frame. The staging
@@ -995,7 +998,10 @@ pub fn net_send(ops: *const Ops, dev: *Device, frame: []const u8) SendResult {
     ops.clean(@intFromPtr(&dev.tx_avail), @sizeOf(VirtqAvail));
     ops.clean(@intFromPtr(frame.ptr), frame.len);
     ops.notify(1);
-    if (!wait_tx_completion(ops, dev)) return .timeout;
+    if (!wait_tx_completion(ops, dev)) {
+        tx_poll_timeouts +%= 1; // #2436: the device stopped consuming
+        return .timeout;
+    }
     dev.tx_bytes +%= frame.len;
     return .ok;
 }
@@ -1359,12 +1365,122 @@ fn socket_transmit(_: ?*anyopaque, outbound: native_socket.core.Outbound) bool {
     return net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n]) == .ok;
 }
 
+/// #2436 diagnostics: `net_send` completion-poll exhaustions — the device
+/// (VZ's attachment write into the capture socketpair) stopped consuming
+/// for a whole poll budget. Surfaced by the idle-loop diag line.
+pub var tx_poll_timeouts: u64 = 0;
+
+/// #2436 diagnostics (bounded, transition-only): the agentctl-under-flood
+/// conn-death evidence. `net_socket_poll` snapshots a child that just
+/// turned terminal; the shell idle loop drains the 4-deep queue onto the
+/// console — one line per EVENT, never per frame. `socket_core.zig`
+/// itself is untouched (claimed by M113c).
+pub const ConnTomb = struct {
+    slot: usize,
+    /// `.none` here means "released live" (releaseAt — the app's close
+    /// raced no terminal state); `.eof` is the clean FIN dance and is
+    /// NOT tombstoned (every healthy session ends there).
+    outcome: native_socket.core.Outcome,
+    state: native_socket.core.State,
+    local_port: u16,
+    remote_port: u16,
+    owner: u64,
+    retries: u8,
+    tx_len: usize,
+    rx_len: usize,
+    peer_window: u32,
+    in_flight: u32,
+    rto_ms: u64,
+    last_tx_age_ms: u64,
+    tx_poll_timeouts: u64,
+};
+const tomb_max = 4;
+var tombs: [tomb_max]ConnTomb = undefined;
+var tomb_head: usize = 0;
+var tomb_count: usize = 0;
+var diag_child_state: [native_socket.core.conn_limit]native_socket.core.State = @splat(.terminal);
+var diag_child_tomb: [native_socket.core.conn_limit]ConnTomb = undefined;
+var diag_last_counters: native_socket.core.Counters = .{};
+var diag_last_tpt: u64 = 0;
+var diag_last_rm1: u64 = 0;
+
+fn sock_diag_watch() void {
+    const now = native_socket.now();
+    for (&native_socket.sockets.children, 0..) |*entry, i| {
+        const was = diag_child_state[i];
+        if (entry.*) |*c| {
+            // Keep a live snapshot so a straight release can still name
+            // the conn's last shape (the fields are gone by then).
+            diag_child_tomb[i] = .{
+                .slot = i,
+                .outcome = c.outcome,
+                .state = c.state,
+                .local_port = c.local.port,
+                .remote_port = c.remote.port,
+                .owner = c.owner,
+                .retries = c.retries,
+                .tx_len = c.tx_len,
+                .rx_len = c.rx_len,
+                .peer_window = c.peer_window,
+                .in_flight = c.snd_nxt -% c.snd_una,
+                .rto_ms = c.rto_ns_cur / 1_000_000,
+                .last_tx_age_ms = (now -| c.last_tx) / 1_000_000,
+                .tx_poll_timeouts = tx_poll_timeouts,
+            };
+            diag_child_state[i] = c.state;
+        } else {
+            diag_child_state[i] = .terminal;
+        }
+        if (was == .terminal) continue;
+        // A conn that went terminal abnormally, or one released while
+        // still half_open/established/closing — the flake's two teardown
+        // shapes. The .eof finish is every healthy session's end and
+        // stays silent.
+        const died = entry.* != null and entry.*.?.state == .terminal and entry.*.?.outcome != .eof;
+        const released_live = entry.* == null and was != .terminal;
+        if ((died or released_live) and tomb_count < tomb_max) {
+            tombs[(tomb_head + tomb_count) % tomb_max] = if (entry.* != null) diag_child_tomb[i] else blk: {
+                var t = diag_child_tomb[i];
+                t.state = .terminal;
+                break :blk t;
+            };
+            tomb_count += 1;
+        }
+    }
+}
+
+/// Idle-loop drain: pop one connection tombstone; null when empty.
+pub fn net_diag_tomb() ?ConnTomb {
+    if (tomb_count == 0) return null;
+    const t = tombs[tomb_head];
+    tomb_head = (tomb_head + 1) % tomb_max;
+    tomb_count -= 1;
+    return t;
+}
+
+/// The socket-table counters plus the transport's own poll timeouts and
+/// the bit-0 ready-probe count; `probe` is the last bit-0 probe's shape,
+/// non-null only when that count moved — the caller prints one line per
+/// change.
+pub fn net_diag_counters() ?struct { c: native_socket.core.Counters, tpt: u64, rm1: u64, probe: ?native_socket.ReadyProbe } {
+    const cur = native_socket.sockets.counters;
+    const tpt = tx_poll_timeouts;
+    const rm1 = native_socket.ready_mask1_count;
+    if (std.meta.eql(cur, diag_last_counters) and tpt == diag_last_tpt and rm1 == diag_last_rm1) return null;
+    const probe: ?native_socket.ReadyProbe = if (rm1 != diag_last_rm1) native_socket.ready_mask1_probe else null;
+    diag_last_counters = cur;
+    diag_last_tpt = tpt;
+    diag_last_rm1 = rm1;
+    return .{ .c = cur, .tpt = tpt, .rm1 = rm1, .probe = probe };
+}
+
 /// NET lock held. Bounded maintenance even with no application traffic.
 pub fn net_socket_poll() void {
     native_socket.poll();
     for (0..native_socket.core.conn_limit * 2 + 1) |_| {
         if (native_socket.sockets.flush(null, socket_transmit) != .sent) break;
     }
+    sock_diag_watch();
 }
 
 pub fn net_socket_dns_send(server: [4]u8, query: []const u8) SendResult {

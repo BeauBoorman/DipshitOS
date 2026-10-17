@@ -104,8 +104,18 @@ func (c *drainConn) Recv(p []byte) (int, error) {
 			return 0, errFromRc(rc)
 		}
 		// readable-but-empty is the FIN/RST — fail closed (the vi.Conn
-		// contract).
+		// contract). But bit 0 also fires for a segment that landed
+		// between the drain and the probe — re-read once: fresh bytes
+		// prove the peer alive, and an honest empty second drain is the
+		// only way bit0 can mean a close.
 		if mask&1 != 0 {
+			n2, rc := tcpRecvFn(p[:max])
+			if rc < 0 {
+				return 0, errFromRc(rc)
+			}
+			if n2 > 0 {
+				return n2, nil
+			}
 			c.peerGone = true
 			return 0, vi.ErrPeerGone
 		}
@@ -143,9 +153,23 @@ func (c *drainConn) Send(p []byte) (int, error) {
 		}
 		if mask&2 == 0 {
 			// readable-but-empty while unwritable: the peer went away.
+			// The same re-read disambiguation as Recv — bit0 alone can
+			// mean a segment landed after the drain, not a close.
 			if mask&1 != 0 && n == 0 {
-				c.peerGone = true
-				return sent, vi.ErrPeerGone
+				n2, rc := tcpRecvFn(scrap[:])
+				if rc < 0 {
+					return sent, errFromRc(rc)
+				}
+				if n2 > 0 {
+					if len(c.pre)+n2 > pendingMax {
+						c.peerGone = true
+						return sent, vi.ErrPeerGone
+					}
+					c.pre = append(c.pre, scrap[:n2]...)
+				} else {
+					c.peerGone = true
+					return sent, vi.ErrPeerGone
+				}
 			}
 			if nanosFn() >= deadline {
 				return sent, errTimeout

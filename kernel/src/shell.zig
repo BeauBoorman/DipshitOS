@@ -3968,6 +3968,18 @@ fn park_body(mon: *monitor.Monitor) callconv(.c) void {
             virtio_net.tcp.now_ticks = timer.ticks;
             virtio_net.net_rx_drain();
             virtio_net.net_socket_poll();
+            // Issue #2436: conn-death tombstones + counter transitions —
+            // captured under the bracket, printed after release (the
+            // retransmit-print lock order precedent below).
+            var diag_tombs: [4]virtio_net.ConnTomb = undefined;
+            var diag_ntombs: usize = 0;
+            while (virtio_net.net_diag_tomb()) |t| {
+                if (diag_ntombs < diag_tombs.len) {
+                    diag_tombs[diag_ntombs] = t;
+                    diag_ntombs += 1;
+                }
+            }
+            const diag_diff = virtio_net.net_diag_counters();
             // Issue #119 (audit follow-up 3): the autonomous DHCP lease
             // lifecycle — advance T1/T2/expiry from the idle loop (the
             // polled-drain time engine, the same seam as tcp.poll_rto)
@@ -3980,6 +3992,21 @@ fn park_body(mon: *monitor.Monitor) callconv(.c) void {
             // stays command-triggered.
             monitor.net_dhcp_autonomous(mon);
             svclock.net.release();
+            for (diag_tombs[0..diag_ntombs]) |t| {
+                var tbuf: [256]u8 = undefined;
+                const tline = std.fmt.bufPrint(&tbuf, "net: conn-diag slot={d} lport={d} rport={d} owner={d} state={s} outcome={s} retries={d} txlen={d} rxlen={d} pwnd={d} flight={d} lasttx={d}ms rto={d}ms txpollt={d}\n", .{ t.slot, t.local_port, t.remote_port, t.owner, @tagName(t.state), @tagName(t.outcome), t.retries, t.tx_len, t.rx_len, t.peer_window, t.in_flight, t.last_tx_age_ms, t.rto_ms, t.tx_poll_timeouts }) catch continue;
+                mon.console.puts(tline);
+            }
+            if (diag_diff) |d| {
+                var cbuf: [384]u8 = undefined;
+                const cline = std.fmt.bufPrint(&cbuf, "net: sock-diag malformed={d} foreign={d} dup={d} rxfull={d} capref={d} refdrop={d} txref={d} retx={d} timedout={d} badopt={d} ooo={d} txpollt={d} rm1={d}\n", .{ d.c.malformed, d.c.foreign, d.c.duplicates, d.c.rx_full, d.c.capacity_refused, d.c.refusal_dropped, d.c.tx_refused, d.c.retransmitted, d.c.timed_out, d.c.dropped_options, d.c.ooo_held, d.tpt, d.rm1 }) catch "";
+                mon.console.puts(cline);
+                if (d.probe) |p| {
+                    var pbuf: [256]u8 = undefined;
+                    const pline = std.fmt.bufPrint(&pbuf, "net: ready-diag mask1 rxlen={d} peerfin={} state={s} outcome={s} lport={d} rport={d} flight={d}\n", .{ p.rx_len, p.peer_fin, @tagName(p.state), @tagName(p.outcome), p.lport, p.rport, p.in_flight }) catch continue;
+                    mon.console.puts(pline);
+                }
+            }
             // Claim 6050 (milestone seven I3): drain the keyboard/pointer
             // event FIFO — poll the XHCI interrupt-IN endpoints, decode the
             // HID reports, and push decoded bytes for the NEXT shell poll
