@@ -631,3 +631,372 @@ for t in tombs[:8]:
     print("=== %s ===" % os.path.basename(t))
     print(open(t, errors="replace").read()[:4000])
 PY
+
+# ---------------------------------------------------------------------------
+# M112b (#2414) run 04 — the package-test leg. GOBUILD.ELF's `test` verb runs
+# the pinned package list (user/go/gobuild/testpkgs.txt, staged as
+# /host/TESTPKGS.TXT): for every run row the guest's own cmd/compile builds a
+# test ELF — package test variant + external test package + a generated
+# testmain driving testing.MainStart — and the guest's own cmd/link links it,
+# then the driver execs it under -test.v with its stream bound to a capture
+# file and reduces it to a named verdict. GOSELF-style receipts land per leg
+# on the share: /host/TESTOUT/<TAG>.ok|.fail plus the aggregate TESTS.MF
+# manifest and TESTOUT/summary.txt. `excluded` rows are pinned
+# non-participants — every user/go package with test files that is not run
+# in-guest is named in the list AND in the manifest with its reason
+# (needs_asm / dep_unsupported / host_fixture / module_closure).
+
+vgate_file script4.txt <<'EOF'
+exec GOBUILD.ELF test
+EOF
+
+vgate_setup_python <<'PY'
+import os, re, shutil, sys
+
+share = os.path.join(os.environ["RUN_DIR"], "share")
+repo = os.getcwd()
+
+# Stale products must not fake this run: the manifest, the per-leg receipts,
+# the scratch TMPDIR, and every prior test ELF go before anything is staged.
+for stale in ("TESTS.MF",):
+    p = os.path.join(share, stale)
+    if os.path.exists(p):
+        os.remove(p)
+for name in list(os.listdir(share)):
+    if name.startswith("T_") and name.endswith(".ELF"):
+        os.remove(os.path.join(share, name))
+outdir = os.path.join(share, "TESTOUT")
+if os.path.isdir(outdir):
+    shutil.rmtree(outdir)
+os.makedirs(outdir)
+os.makedirs(os.path.join(share, "TESTTMP"), exist_ok=True)
+
+shutil.copyfile("user/go/gobuild/testpkgs.txt",
+                os.path.join(share, "TESTPKGS.TXT"))
+
+rows, excluded = [], []
+for line in open("user/go/gobuild/testpkgs.txt"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    f = line.split()
+    if f[0] == "excluded":
+        excluded.append(f[1])
+    else:
+        rows.append(f[0])
+if len(excluded) == 0:
+    sys.exit("testpkgs.txt names no exclusions — the card requires them")
+
+# The test variant's closure is the package's own (transitive virelai deps
+# already under SRC/ from the fleet leg's staging) PLUS any deps the test
+# files add. Run rows get their test surface staged: *_test.go, testdata/
+# and the *.txt inputs tests read; dep packages get non-test sources only.
+# Same build-tag discipline as the fleet walker's: only files this
+# toolchain would compile.
+BUILD_TAGS = {"virelai", "arm64", "gc"}
+KNOWN_GOOS = {"aix", "android", "darwin", "dragonfly", "freebsd", "hurd",
+              "illumos", "ios", "js", "linux", "nacl", "netbsd", "openbsd",
+              "plan9", "solaris", "wasip1", "virelai", "windows", "zos"}
+KNOWN_GOARCH = {"386", "amd64", "amd64p32", "arm", "armbe", "arm64",
+                "arm64be", "loong64", "mips", "mipsle", "mips64",
+                "mips64le", "mips64p32", "mips64p32le", "ppc", "ppc64",
+                "ppc64le", "riscv", "riscv64", "s390x", "sparc",
+                "sparc64", "wasm"}
+IMP = re.compile(r'"([A-Za-z0-9_][A-Za-z0-9_./-]*)"')
+ARCHIVE_TIER = {"virelai/vi", "virelai/vsys"}
+
+def _eval_expr(tok, i):
+    if tok[i] == "!":
+        v, i = _eval_expr(tok, i + 1)
+        return (not v), i
+    if tok[i] == "(":
+        v, i = _eval_or(tok, i + 1)
+        return v, i + 1
+    return (tok[i] in BUILD_TAGS), i
+
+def _eval_and(tok, i):
+    v, i = _eval_expr(tok, i)
+    while i < len(tok) and tok[i] == "&&":
+        w, i = _eval_expr(tok, i + 1)
+        v = v and w
+    return v, i
+
+def _eval_or(tok, i):
+    v, i = _eval_and(tok, i)
+    while i < len(tok) and tok[i] == "||":
+        w, i = _eval_and(tok, i + 1)
+        v = v or w
+    return v, i
+
+def _tok(expr):
+    return re.findall(r'[A-Za-z0-9_.]+|&&|\|\||!|\(|\)', expr)
+
+def filename_target_ok(name):
+    base = name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if base.endswith("_test"):
+        base = base[:-5]
+    parts = base.split("_")
+    if len(parts) < 2:
+        return True
+    last = parts[-1]
+    second = parts[-2] if len(parts) >= 3 else ""
+    if last in KNOWN_GOARCH:
+        if last != "arm64":
+            return False
+        return second not in KNOWN_GOOS or second == "virelai"
+    if last in KNOWN_GOOS:
+        return last == "virelai"
+    return True
+
+def buildable_go(path):
+    if not filename_target_ok(path):
+        return False
+    gobuild, plusbuilds = None, []
+    try:
+        for line in open(path, errors="replace"):
+            s = line.strip()
+            if s.startswith("//go:build"):
+                v, _ = _eval_or(_tok(s[len("//go:build"):]), 0)
+                gobuild = v
+            elif s.startswith("// +build"):
+                groups = s[len("// +build"):].split()
+                line_ok = False
+                for grp in groups:
+                    atoms = grp.split(",")
+                    line_ok = all(
+                        (a[1:] not in BUILD_TAGS) if a.startswith("!")
+                        else (a in BUILD_TAGS)
+                        for a in atoms)
+                    if line_ok:
+                        break
+                plusbuilds.append(line_ok)
+            elif s.startswith("//") or s == "":
+                continue
+            else:
+                break
+    except OSError:
+        return True
+    if gobuild is not None:
+        return gobuild
+    if plusbuilds:
+        return all(plusbuilds)
+    return True
+
+def go_imports(path):
+    imps, inblock = [], False
+    for line in open(path, errors="replace"):
+        s = line.split("//", 1)[0].strip() if "import" not in line else line.strip()
+        if s.startswith("//"):
+            continue
+        if not inblock and s.startswith("import"):
+            rest = s[len("import"):].strip()
+            if rest.startswith("("):
+                inblock = True
+                continue
+            m = IMP.search(rest)
+            if m:
+                imps.append(m.group(1))
+            continue
+        if inblock:
+            if s.startswith(")"):
+                inblock = False
+                continue
+            m = IMP.search(s)
+            if m:
+                imps.append(m.group(1))
+    return imps
+
+def stage_pkg(rel, is_run_row, seen, queue):
+    """Stage user/go/<pkg> under SRC/<rel>; True when newly done."""
+    src_abs = os.path.join(repo, "user", "go", rel[len("virelai/"):])
+    dst = os.path.join(share, "SRC", rel)
+    if rel in seen or not os.path.isdir(src_abs):
+        return rel in seen
+    os.makedirs(dst, exist_ok=True)
+    n = 0
+    for name in sorted(os.listdir(src_abs)):
+        sp = os.path.join(src_abs, name)
+        if os.path.isfile(sp) and name.endswith(".go") \
+                and (is_run_row or not name.endswith("_test.go")):
+            shutil.copyfile(sp, os.path.join(dst, name))
+            n += 1
+        elif is_run_row and os.path.isfile(sp) and name.endswith(".txt"):
+            # e.g. gobuild's tests read fleet.txt/testpkgs.txt as data.
+            shutil.copyfile(sp, os.path.join(dst, name))
+        elif is_run_row and os.path.isfile(sp) and name.endswith(".golden"):
+            # e.g. supervise's receipt compare reads crash-receipt.golden.
+            shutil.copyfile(sp, os.path.join(dst, name))
+    if is_run_row:
+        td = os.path.join(src_abs, "testdata")
+        if os.path.isdir(td):
+            shutil.copytree(td, os.path.join(dst, "testdata"))
+    if n == 0:
+        return False
+    seen.add(rel)
+    # Imports to follow: all buildable files for run rows (the test
+    # variant's closure), non-test only for pure dep packages.
+    for fn in sorted(os.listdir(dst)):
+        fp = os.path.join(dst, fn)
+        if not fn.endswith(".go"):
+            continue
+        if not is_run_row and fn.endswith("_test.go"):
+            continue
+        if not buildable_go(fp):
+            continue
+        for imp in go_imports(fp):
+            if imp.startswith("virelai/") and imp not in ARCHIVE_TIER:
+                queue.append((imp, False))
+    return True
+
+seen = set()
+queue = [(rel, True) for rel in rows]
+missing = []
+while queue:
+    rel, is_row = queue.pop(0)
+    if rel in seen:
+        continue
+    if not stage_pkg(rel, is_row, seen, queue):
+        missing.append(rel)
+
+# A name the line-scanner picked up but that has no dir is not fatal: it is
+# either a quoted path inside a test body (gobuild's fixtures embed raw
+# Go sources) or a genuinely missing dep — and a genuinely missing dep is
+# the DRIVER's named refusal (dep_unsupported/no_package in TESTS.MF), not
+# a staging bug this script should fabricate a failure for.
+if missing:
+    print("test staging note: %d quoted paths have no source dir (fixture "
+          "strings or real dep gaps the driver names): %s"
+          % (len(set(missing)), sorted(set(missing))))
+print("test packages: %d run rows + %d named exclusions; %d source dirs under SRC/"
+      % (len(rows), len(excluded), len(seen)))
+PY
+
+# Run 04: one driver run over the pinned list — ~4-6 spawn-and-wait children
+# per leg (variant + external + testmain compiles, the link, the -test.v
+# exec), so the timeout matches the fleet leg's reasoning exactly: a share-
+# channel link is the slow step and there are fifty of them.
+vgate_run 04 -- --script '$RUN_DIR/script4.txt' --script-expect 'test: tests ' --timeout 5400
+
+vgate_assert 04 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 04 serial-contains 'exec: loaded GOBUILD.ELF'
+vgate_assert 04 serial-contains 'test: virelai/clockfmt pass'
+vgate_assert 04 serial-contains 'test: virelai/vi excluded needs_asm'
+vgate_assert 04 serial-contains 'test: virelai/css excluded host_fixture'
+vgate_assert 04 serial-contains 'test: manifest -> /host/TESTS.MF'
+vgate_assert 04 serial-contains 'test: receipts -> /host/TESTOUT'
+vgate_assert 04 serial-contains 'test: tests OK'
+vgate_assert 04 serial-absent 'test: tests INCOMPLETE'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent 'exited status=139'
+vgate_assert 04 serial-absent 'cannot allocate memory'
+
+# TESTS.MF is the deliverable: every pinned run row passed with a real test
+# count and a sha256'd ELF on the share, every excluded row is named with
+# its reason, and a GOSELF-style receipt file exists per leg — the share
+# holds the evidence, not just the serial log.
+vgate_assert 04 python <<'PY'
+import os, sys
+sys.path.insert(0, os.path.join("tools", "lib"))
+import elf_rules
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+
+def elf_tag(pkg, idx):
+    name = "T_" + "".join(c if c.isalnum() else "_" for c in pkg).upper() + ".ELF"
+    return name if len(name) <= 26 else "TT%02d.ELF" % idx
+
+# The pinned list staged on the share is authoritative for this run.
+lst = open(os.path.join(share, "TESTPKGS.TXT")).read()
+run_rows, ex_rows = [], {}
+for line in lst.splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    f = line.split()
+    if f[0] == "excluded":
+        ex_rows[f[1]] = " ".join(f[2:])
+    else:
+        run_rows.append(f[0])
+if not run_rows or not ex_rows:
+    sys.exit("FAIL: TESTPKGS.TXT must hold run rows AND exclusions")
+
+mf = os.path.join(share, "TESTS.MF")
+if not os.path.exists(mf):
+    sys.exit("FAIL: no TESTS.MF on the share")
+rows = {}
+for line in open(mf):
+    if not line.strip() or line.startswith("#"):
+        continue
+    f = line.rstrip("\n").split("\t")
+    r = {"state": f[1]}
+    for kv in f[2:]:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            r[k] = v
+    rows[f[0]] = r
+if set(rows) != set(run_rows) | set(ex_rows):
+    sys.exit("FAIL: manifest rows drifted: missing=%s extra=%s"
+             % (sorted((set(run_rows) | set(ex_rows)) - set(rows)),
+                sorted(set(rows) - (set(run_rows) | set(ex_rows)))))
+
+# Every run row: passed, at least one real test verdict, receipt file,
+# a sha256'd test ELF that satisfies the kernel's loader rules.
+passed, ntests = 0, 0
+for i, pkg in enumerate(run_rows):
+    r = rows[pkg]
+    if r["state"] != "passed":
+        sys.exit("FAIL: %s state=%s code=%s note=%s"
+                 % (pkg, r["state"], r.get("code"), r.get("note")))
+    if int(r.get("tests", "0")) < 1:
+        sys.exit("FAIL: %s passed with tests=0 — no real verdicts" % pkg)
+    ntests += int(r["tests"])
+    passed += 1
+    tag = r["tag"]
+    if tag != elf_tag(pkg, i):
+        sys.exit("FAIL: %s tag=%s, want %s" % (pkg, tag, elf_tag(pkg, i)))
+    for col in ("src", "tc", "elf"):
+        if len(r.get(col, "")) != 64:
+            sys.exit("FAIL: %s %s is not a sha256 (%r)" % (pkg, col, r.get(col)))
+    receipt = os.path.join(share, "TESTOUT", tag + ".ok")
+    if not os.path.exists(receipt):
+        sys.exit("FAIL: no receipt for %s at %s" % (pkg, receipt))
+    body = open(receipt).read()
+    if "passed" not in body or ("pkg=" + pkg) not in body:
+        sys.exit("FAIL: %s receipt does not name the leg: %r" % (pkg, body[:120]))
+    elf = os.path.join(share, tag)
+    if not os.path.exists(elf):
+        sys.exit("FAIL: %s passed but no %s on the share" % (pkg, tag))
+    rec, fails = elf_rules.check_file(elf, tag)
+    if fails:
+        for fl in fails:
+            print("FAIL: " + fl)
+        sys.exit(1)
+
+# Every exclusion: named in the manifest, carrying its reason.
+for pkg, reason in ex_rows.items():
+    r = rows[pkg]
+    if r["state"] != "excluded" or not r.get("code") or not r.get("note"):
+        sys.exit("FAIL: %s exclusion unnamed: %r" % (pkg, r))
+    if reason.split(":")[0] != r["code"]:
+        sys.exit("FAIL: %s code=%s, want %s" % (pkg, r["code"], reason.split(":")[0]))
+
+# summary.txt mirrors GOSELF's OUT/ discipline: counts the host can diff.
+sm = open(os.path.join(share, "TESTOUT", "summary.txt")).read()
+want = "passed=%d" % passed
+if want not in sm:
+    sys.exit("FAIL: summary.txt missing %r: %r" % (want, sm))
+print("test manifest: %d/%d run rows passed (%d tests), %d exclusions named, "
+      "receipts + loader-clean ELFs on the share" % (passed, len(run_rows), ntests, len(ex_rows)))
+PY
+
+# Diagnostic, never-fail: child crashes leave kernel tombstones — surface
+# them so a mid-test fault is legible evidence, not an invisible stack.
+vgate_assert 04 python <<'PY'
+import glob, os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+tombs = sorted(glob.glob(os.path.join(share, "crash", "*.txt")))
+if not tombs:
+    print("no crash tombstones on the share")
+for t in tombs[:8]:
+    print("=== %s ===" % os.path.basename(t))
+    print(open(t, errors="replace").read()[:4000])
+PY

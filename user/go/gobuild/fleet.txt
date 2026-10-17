@@ -28,6 +28,8 @@ GOSOUND.ELF virelai/sound
 # this tree and the pin is not a share-visible input.
 GOSTALGIA.ELF external:gostalgia
 FLINT.ELF virelai/flint
-STORE.ELF virelai/store
+# M110c (#2405) split virelai/store into a library package plus a thin CLI
+# at store/main — the row names the main package, not the library.
+STORE.ELF virelai/store/main
 AGENTD.ELF virelai/agentd
 GOBUILD.ELF virelai/gobuild

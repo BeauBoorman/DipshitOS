@@ -1,3 +1,5 @@
+//go:build !virelai
+
 package main
 
 import (

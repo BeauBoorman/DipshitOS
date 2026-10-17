@@ -80,6 +80,12 @@ func (g *Graph) resolve(imp Import, archives map[string]string, table map[string
 			Msg: `import "C": cgo does not exist on GOOS=virelai`})
 		return
 	}
+	if g.Packages[imp.Path] != nil {
+		// Already resolved — the test build pre-registers its synthetic
+		// packages (the test variant and the <pkg>_test external package,
+		// which live in the same dir, not under <root>/<path>).
+		return
+	}
 	if dir := joinPath(g.Dir, imp.Path); validRelPath(imp.Path) && dirHasGoFiles(dir) {
 		if g.Packages[imp.Path] == nil {
 			g.Packages[imp.Path] = &Package{Path: imp.Path, Dir: dir, Local: true}
@@ -156,13 +162,25 @@ func ImportGraphR(dir, root string, archives map[string]string, table map[string
 		g.Diags = append(g.Diags, Diag{Code: "no_main", File: main.Files[0],
 			Msg: "build dir is package " + strconv.Quote(main.Name) + ", not package main"})
 	}
+	g.resolveQueue([]*Package{main}, archives, table)
+	return g
+}
 
-	// Resolve + recurse breadth-first: a local import discovered while
-	// loading P enqueues P's resolution AFTER its files are parsed, which
-	// keeps diagnostics ordered by discovery. locals counts every local
-	// package including main — each is one compile child the build will run.
-	locals := 1
-	queue := []*Package{main}
+// resolveQueue runs the shared resolution walk over a starting set of
+// already-loaded local packages: a local import discovered while loading P
+// enqueues P's resolution AFTER its files are parsed, which keeps
+// diagnostics ordered by discovery. The caller pre-loads its root packages
+// (a program dir for ImportGraphR; the test variant + external test package
+// for the M112b test build) — new locals discovered by resolution load
+// through the standard non-test listing.
+func (g *Graph) resolveQueue(start []*Package, archives map[string]string, table map[string]pkgRow) {
+	locals := 0
+	for _, p := range g.Packages {
+		if p.Local {
+			locals++
+		}
+	}
+	queue := append([]*Package{}, start...)
 	for len(queue) > 0 {
 		p := queue[0]
 		queue = queue[1:]
@@ -178,7 +196,7 @@ func ImportGraphR(dir, root string, archives map[string]string, table map[string
 							Msg: "closure_too_large: local package closure " +
 								strconv.Itoa(locals) + " > cap " +
 								strconv.Itoa(maxLocalPackages)})
-						return g // refuse before a single child is spawned
+						return // refuse before a single child is spawned
 					}
 					g.load(np)
 					queue = append(queue, np)
@@ -188,7 +206,6 @@ func ImportGraphR(dir, root string, archives map[string]string, table map[string
 	}
 	g.sortLocal()
 	assignStems(g)
-	return g
 }
 
 // load fills p's Name/Files/Imports by listing its directory and parsing
@@ -200,6 +217,23 @@ func (g *Graph) load(p *Package) {
 		g.Diags = append(g.Diags, Diag{Code: "io", File: p.Dir, Msg: err.Error()})
 		return
 	}
+	g.loadFiles(p, files)
+	// A package whose virelai-selected sources include .s needs cmd/asm,
+	// which the in-guest toolchain does not ship (ADR 0035 D4: compile +
+	// link only). Naming it here beats letting the linker find the missing
+	// bodies — the refusal says WHICH package and WHICH files.
+	if asm := buildableAsm(p.Dir); len(asm) > 0 {
+		g.Diags = append(g.Diags, Diag{Code: "needs_asm", File: p.Dir,
+			Msg: "needs_asm: package " + strconv.Quote(p.Path) +
+				" requires an assembler for " + strings.Join(asm, ", ") +
+				" (no cmd/asm on GOOS=virelai)"})
+	}
+}
+
+// loadFiles is load's inner loop over an explicit file list — the test
+// build's variant package adds its internal _test.go files to the same
+// parse/import pass the non-test listing drives.
+func (g *Graph) loadFiles(p *Package, files []string) {
 	fset := token.NewFileSet()
 	for _, f := range files {
 		path := joinPath(p.Dir, f)
@@ -243,16 +277,6 @@ func (g *Graph) load(p *Package) {
 	if p.Name == "" && len(p.Files) == 0 && len(g.Diags) == 0 {
 		g.Diags = append(g.Diags, Diag{Code: "io", File: p.Dir,
 			Msg: "no buildable .go files"})
-	}
-	// A package whose virelai-selected sources include .s needs cmd/asm,
-	// which the in-guest toolchain does not ship (ADR 0035 D4: compile +
-	// link only). Naming it here beats letting the linker find the missing
-	// bodies — the refusal says WHICH package and WHICH files.
-	if asm := buildableAsm(p.Dir); len(asm) > 0 {
-		g.Diags = append(g.Diags, Diag{Code: "needs_asm", File: p.Dir,
-			Msg: "needs_asm: package " + strconv.Quote(p.Path) +
-				" requires an assembler for " + strings.Join(asm, ", ") +
-				" (no cmd/asm on GOOS=virelai)"})
 	}
 }
 

@@ -30,6 +30,10 @@ func init() {
 //	              [-manifest MF] [-nosmoke]                    M112a: the
 //	                                                        pinned fleet +
 //	                                                        FLEET.MF manifest
+//	gobuild test [-list TESTPKGS.TXT] [-root SRC] [-outdir DIR]
+//	              [-receipts DIR] [-manifest MF]              M112b: the
+//	                                                        pinned package
+//	                                                        tests + receipts
 func main() {
 	rc := run(vi.Args())
 	// Yield a tick before exiting so a parent shell polling vi.Wait blocks
@@ -45,6 +49,9 @@ func run(argv []string) int {
 	}
 	if len(args) > 0 && args[0] == "fleet" {
 		return runFleetArgs(args[1:])
+	}
+	if len(args) > 0 && args[0] == "test" {
+		return runTestArgs(args[1:])
 	}
 	verb := "build"
 	if len(args) > 0 && (args[0] == "build" || args[0] == "graph") {
@@ -102,7 +109,91 @@ func usage(why string) int {
 	vsys.Println("gobuild: usage: gobuild [build] <dir> [-o OUT.ELF] [-importcfg CFG] [-pkgdb TBL]")
 	vsys.Println("gobuild:        gobuild graph <dir> [-importcfg CFG] [-pkgdb TBL]")
 	vsys.Println("gobuild:        gobuild fleet [-list FLEET.TXT] [-root SRC] [-outdir DIR] [-refs DIR] [-manifest MF] [-nosmoke]")
+	vsys.Println("gobuild:        gobuild test [-list TESTPKGS.TXT] [-root SRC] [-outdir DIR] [-receipts DIR] [-manifest MF]")
 	return 2
+}
+
+// runTestArgs parses the test verb's flag set (no positional args — the
+// pinned list is the input).
+func runTestArgs(args []string) int {
+	tc := testCfg{}
+	for i := 0; i < len(args); i++ {
+		val := func() (string, bool) {
+			if i+1 >= len(args) {
+				return "", false
+			}
+			i++
+			return args[i], true
+		}
+		switch args[i] {
+		case "-list":
+			if v, ok := val(); !ok {
+				return usage("-list needs a path")
+			} else {
+				tc.List = v
+			}
+		case "-root":
+			if v, ok := val(); !ok {
+				return usage("-root needs a path")
+			} else {
+				tc.Root = v
+			}
+		case "-outdir":
+			if v, ok := val(); !ok {
+				return usage("-outdir needs a path")
+			} else {
+				tc.OutDir = v
+			}
+		case "-receipts":
+			if v, ok := val(); !ok {
+				return usage("-receipts needs a path")
+			} else {
+				tc.ReceiptDir = v
+			}
+		case "-manifest":
+			if v, ok := val(); !ok {
+				return usage("-manifest needs a path")
+			} else {
+				tc.Manifest = v
+			}
+		case "-importcfg":
+			if v, ok := val(); !ok {
+				return usage("-importcfg needs a path")
+			} else {
+				tc.Importcfg = append(tc.Importcfg, v)
+			}
+		case "-pkgdb":
+			if v, ok := val(); !ok {
+				return usage("-pkgdb needs a path")
+			} else {
+				tc.PkgDB = append(tc.PkgDB, v)
+			}
+		default:
+			return usage("test: unknown flag " + args[i])
+		}
+	}
+	if tc.List == "" {
+		tc.List = "/host/TESTPKGS.TXT"
+	}
+	if tc.Root == "" {
+		tc.Root = "/host/SRC"
+	}
+	if tc.OutDir == "" {
+		tc.OutDir = "/host"
+	}
+	if tc.ReceiptDir == "" {
+		tc.ReceiptDir = "/host/TESTOUT"
+	}
+	if tc.Manifest == "" {
+		tc.Manifest = "/host/TESTS.MF"
+	}
+	if len(tc.Importcfg) == 0 {
+		tc.Importcfg = []string{"/host/GOIMPORT.CFG"}
+	}
+	if len(tc.PkgDB) == 0 {
+		tc.PkgDB = []string{"/host/GOPKGS.TXT"}
+	}
+	return runTest(tc)
 }
 
 // runFleetArgs parses the fleet verb's own flag set (no positional args —
