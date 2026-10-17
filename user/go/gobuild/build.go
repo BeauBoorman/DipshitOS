@@ -186,9 +186,11 @@ func (s stepOut) failed() bool { return s.err != nil || s.step.Status != 0 }
 func runStep(cfg Config, label, image string, args []string, diagFile string) stepOut {
 	// The capture temp rides the `~` publish-temp convention beside the
 	// diag stem and is removed once the step's bytes came back — .BUILD
-	// must not accumulate one temp per step per build.
+	// must not accumulate one temp per step per build. The seam takes the
+	// stem so the guest's truncate-open is the `~` name the publish guard
+	// recognises.
 	capture := diagFile + "~"
-	status, ms, captured, err := execAndWait(image, args, capture)
+	status, ms, captured, err := execAndWait(image, args, diagFile)
 	_ = os.Remove(capture)
 	out := stepOut{step: Step{Label: label, Image: image, Status: status, Ms: ms}}
 	if err != nil {

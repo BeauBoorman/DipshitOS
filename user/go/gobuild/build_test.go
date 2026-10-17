@@ -168,9 +168,9 @@ func TestBuildRemovesDiagCaptureTemps(t *testing.T) {
 	f := &fakeExec{}
 	withFakeExec(t, f)
 	// Stand in for the guest's truncate-open: each spawn leaves the
-	// capture file the driver must remove.
+	// `~` capture file beside the stem the driver must remove.
 	execAndWait = func(image string, args []string, capturePath string) (int64, int64, []byte, error) {
-		if err := os.WriteFile(capturePath, []byte("noise\n"), 0o644); err != nil {
+		if err := os.WriteFile(capturePath+"~", []byte("noise\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		return f.run(image, args, capturePath)
@@ -183,8 +183,8 @@ func TestBuildRemovesDiagCaptureTemps(t *testing.T) {
 		t.Fatalf("calls = %v", f.calls)
 	}
 	for _, c := range f.calls {
-		if !strings.HasSuffix(c.capture, ".diag~") {
-			t.Fatalf("capture path = %q, want the .diag~ temp name", c.capture)
+		if !strings.HasSuffix(c.capture, ".diag") {
+			t.Fatalf("capture path = %q, want the .diag stem", c.capture)
 		}
 	}
 	left, err := filepath.Glob(filepath.Join(dir, ".BUILD", "*.diag~"))
