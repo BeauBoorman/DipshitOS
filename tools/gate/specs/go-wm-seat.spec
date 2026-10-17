@@ -85,6 +85,21 @@
 # ceiling (maxTicks 90) with the tab still open, nothing ever says `host
 # done`/`tab close`, and the run ends by KILLING the seat -- process exit,
 # which still unwinds through the kernel's exit seam (`wm: unregistered`).
+#
+# M109e (#2401) adds runs 12-14: the seat's agent watch on the M109c audit
+# lane. The indicator is the AGENT badge in the clock panel's badge row, lit
+# while a MAC-verified session-open receipt stands without its close; the
+# notify lanes are seat toasts (sender id 0, the hostdrop shape) for the
+# three agent milestones — FLINT.ELF commit / push and STORE.ELF install —
+# recognized inside verified ok+exit-0 gosh.run receipts. The flag is the
+# agent-hmac row's allowlist, the ADR 0051 D7 posture: run 12/13's share
+# names GOTABWM.ELF (and OWNERS.TXT binds the image uid_system-owned, the
+# same serve condition agentd itself meets), run 14's names only
+# AGENTD.ELF,GOTOP.ELF — valid signed receipts sit in AGENT/AUDIT the whole
+# run and the boot stays byte-silent. Run 12's snapshot reads the badge and
+# the toast off the guest's own composed scanout; the forged close proves
+# the MAC is the gate. Runs 01/05/11 also assert `gotabwm: agent` absent —
+# on the seeded share there is no SECRETS.TXT at all.
 
 vgate_name go-wm-seat "issues #1313/#1317/#1318 M57a+b+c: a Go WM registers the slot-65 seat and HOSTS GOCALC.ELF/NOTE.ELF/GOVIEW.ELF on VZ"
 vgate_share seed
@@ -221,6 +236,97 @@ print("staged GOVIEW.ELF into share (%d bytes) + TEST.QOI" %
       os.path.getsize(os.path.join(share, "GOVIEW.ELF")))
 PY
 
+# M109e (#2401): runs 12-14 drive the agent watch through staged
+# alternate shares. The receipts are real lane files — the JSON line the
+# daemon's emit writes plus its 64-hex HMAC-SHA256 under the pinned
+# agent-hmac row — so the seat verifies them against the same secret it
+# is provisioned with. Staged files publish atomically through `vf mv`
+# (the lane's own publish shape), which is what makes a mid-run arrival
+# a live receipt rather than boot backlog.
+vgate_setup_python <<'PY'
+import hashlib, hmac, json, os, shutil, sys
+rd = os.environ["RUN_DIR"]
+run = rd
+elf = os.path.join(".build", "go", "GOTABWM.ELF")
+if not os.path.exists(elf):
+    sys.exit("GOTABWM.ELF missing (expected " + elf + ") - build it first: "
+             "bash tools/go/build-gotabwm.sh")
+KEY = "a5" * 32  # the pinned receipt key (the go-agentd.spec vector)
+
+def receipt(agent, verb, args, result):
+    line = ('{"seq":1,"epoch":"b0000001","agent":%s,"verb":%s,"args":%s,'
+            '"ts":100,"mono":200,"result":%s}'
+            % (json.dumps(agent), json.dumps(verb), args, json.dumps(result)))
+    mac = hmac.new(KEY.encode(), line.encode(), hashlib.sha256).hexdigest()
+    return (line + "\n" + mac + "\n").encode()
+
+def write_at(root, rel, body):
+    dst = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as f:
+        f.write(body if isinstance(body, bytes) else body.encode())
+
+def stage(tag, secrets_rows, audit, staged):
+    alt = os.path.join(run, tag + "-share")
+    os.makedirs(alt, exist_ok=True)
+    shutil.copy(elf, os.path.join(alt, "GOTABWM.ELF"))
+    # wm=none keeps the boot shim-only (the spec's Phase-1 contract), the
+    # seat is opted in explicitly, and wm!=gotabwm suppresses the
+    # first-boot workspace exec the empty SESSION.TABS would trigger.
+    write_at(alt, "SETTINGS.TXT", "#v2\nwm=none\n")
+    # OWNERS.TXT binds GOTABWM.ELF uid_system-owned with no non-owner
+    # write — the serve condition an allowlisted image must meet.
+    write_at(alt, "OWNERS.TXT", "#v1\nGOTABWM.ELF\t644\t0\t-\n")
+    write_at(alt, "SECRETS.TXT", secrets_rows)
+    for rel, body in audit:
+        write_at(alt, os.path.join("AGENT", "AUDIT", rel), body)
+    for rel, body in staged:
+        write_at(alt, os.path.join("AGENT", "STAGED", rel), body)
+    return alt
+
+GOSH = lambda cmd, st: ('{"cmd":%s,"timeout_ms":10000,"exit_status":%d}'
+                        % (json.dumps(cmd), st))
+
+secrets_on = ("#v1\nagent-hmac\t1000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF,GOTABWM.ELF\n")
+secrets_off = ("#v1\nagent-hmac\t1000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF\n")
+
+# Run 12's share: one backlog fs.read (the catch-up leg), then the staged
+# publishes — session open, the three milestones, and a forged close.
+a12 = stage("agent", secrets_on,
+    audit=[("RCPT-b0000001-00000001",
+            receipt("devin", "fs.read", '{"path":"APP/main.go","size":4,"sha256_8":"deadbeef"}', "ok"))],
+    staged=[
+        ("R1", receipt("devin", "session", '{"event":"open"}', "ok")),
+        ("R2", receipt("devin", "gosh.run", GOSH('FLINT.ELF commit -m "x"', 0), "ok")),
+        ("R3", receipt("devin", "gosh.run", GOSH("FLINT.ELF push --remote=10.0.0.2:4750 --stream=main", 0), "ok")),
+        ("R4", receipt("devin", "gosh.run", GOSH("STORE.ELF install main --remote=10.0.0.2:4750", 0), "ok")),
+        # The forged close: a valid-shape file with a junk MAC — it must
+        # be named `rcpt bad`, must not print a close marker, and must
+        # not take the badge down.
+        ("R5", b'{"seq":1,"epoch":"b0000001","agent":"devin","verb":"session",'
+               b'"args":{"event":"close"},"ts":100,"mono":200,"result":"ok"}\n'
+               + b"0" * 64 + b"\n"),
+    ])
+
+# Run 13's share: the open is boot backlog (the catch-up lights the
+# badge from it) and the real close publishes live.
+a13 = stage("agent-close", secrets_on,
+    audit=[("RCPT-b0000001-00000001",
+            receipt("devin", "session", '{"event":"open"}', "ok"))],
+    staged=[("R2", receipt("devin", "session", '{"event":"close"}', "client_close"))])
+
+# Run 14's share: verifiable receipts and the row exist — but the
+# allowlist does not name the seat, so the watch is the flags-off
+# posture: no init marker, no poll, no output.
+a14 = stage("agent-off", secrets_off,
+    audit=[
+        ("RCPT-b0000001-00000001", receipt("devin", "session", '{"event":"open"}', "ok")),
+        ("RCPT-b0000001-00000002", receipt("devin", "gosh.run", GOSH('FLINT.ELF commit -m "x"', 0), "ok")),
+    ],
+    staged=[])
+print("agent-watch shares staged: %s / %s / %s" % (a12, a13, a14))
+PY
+
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script.txt' \
@@ -285,6 +391,10 @@ vgate_assert 01 serial-contains 'gotabwm: host done'
 # run) and there is no index-4 row after exit.
 vgate_assert 01 serial-contains 'dui: windows=4 focused='
 vgate_assert 01 serial-count 'dui[4]: user' 1
+# M109e: no agent-hmac row names the seat on this share — the watch's
+# flags-off posture is byte-silent even though it exec'd and ran the
+# whole choreography.
+vgate_assert 01 serial-absent 'gotabwm: agent'
 vgate_assert 01 serial-absent '[EXC] parking:'
 vgate_assert 01 serial-absent 'exited status=139'
 
@@ -646,6 +756,9 @@ vgate_assert 05 serial-absent 'gotabwm: host done'
 vgate_assert 05 serial-absent 'gocalc: close'
 vgate_assert 05 serial-contains 'wm: unregistered, shim resumed'
 vgate_assert 05 serial-contains 'rx-gotabwm-live-ok'
+# M109e: 91 polls, never an agent line — flags-off byte-silence on the
+# longest-running boot in this spec.
+vgate_assert 05 serial-absent 'gotabwm: agent'
 vgate_assert 05 serial-absent '[EXC] parking:'
 vgate_assert 05 serial-absent 'exited status=139'
 
@@ -1357,5 +1470,258 @@ vgate_assert 11 serial-contains '42 sys_audio_info calls=1'
 vgate_assert 11 serial-contains '43 sys_audio_play calls=0'
 vgate_assert 11 serial-absent 'ENXIO'
 vgate_assert 11 serial-contains 'rx-gotabwm-snd-nodev-ok'
+vgate_assert 11 serial-absent 'gotabwm: agent'
 vgate_assert 11 serial-absent '[EXC] parking:'
 vgate_assert 11 serial-absent 'exited status=139'
+
+# --- M109e (#2401) run 12: the agent indicator + milestone notify lanes ---
+#
+# The armed share names GOTABWM.ELF on the agent-hmac allowlist, so the
+# seat holds the receipt key and only MAC-verified RCPT-* files can move
+# its chrome. The choreography:
+#
+#   gotabwm: agent watch             armed at init — the flag flipped on
+#   gotabwm: agent verb fs.read      the boot backlog replayed
+#   gotabwm: agent caught n=1 bad=0  the catch-up is DONE — script3's
+#                                     anchor: everything it publishes is
+#                                     a live receipt, toastable
+#   vf mv AGENT/STAGED/R* -> AUDIT/  the lane's own publish shape lands
+#                                     all five receipts inside one poll
+#   gotabwm: agent session open      the indicator turns on (badge in
+#   agent=devin                       the clock panel's badge row)
+#   gotabwm: agent milestone <name>  commit / push / install, each from a
+#   gotabwm: notify id=0 agent: ...  verified ok+exit-0 gosh.run receipt,
+#                                     toasted through the ordinary
+#                                     kind-12 path — strip, center,
+#                                     notify-out lane, chime policy
+#   gotabwm: agent rcpt bad          the forged close: named once, no
+#                                     close marker, badge stays on
+#   gotabwm: notify paint id=0       the toasts are on the scanout — the
+#                                     snapshot reads badge + strip off
+#                                     the guest's own composed frame
+vgate_file script-12.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-12.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-12.txt <<'EOF'
+vf mv AGENT/STAGED/R1 AGENT/AUDIT/RCPT-b0000001-00000002
+vf mv AGENT/STAGED/R2 AGENT/AUDIT/RCPT-b0000001-00000003
+vf mv AGENT/STAGED/R3 AGENT/AUDIT/RCPT-b0000001-00000004
+vf mv AGENT/STAGED/R4 AGENT/AUDIT/RCPT-b0000001-00000005
+vf mv AGENT/STAGED/R5 AGENT/AUDIT/RCPT-b0000001-00000006
+echo rx-gotabwm-agent-ok
+EOF
+
+vgate_run 12 -- \
+    --cvc-file '$RUN_DIR/agent-share' \
+    --screen '$RUN_DIR/screen' \
+    --via-virtio --cvc-snap \
+    --snapshot-after 'gotabwm: notify paint id=' \
+    --snapshot-out '$RUN_DIR/snap-12' \
+    --script '$RUN_DIR/script-12.txt' \
+    --script2 '$RUN_DIR/script2-12.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-12.txt' \
+    --script3-after 'gotabwm: agent caught ' \
+    --script-expect 'gotabwm: notify paint id=' --timeout 300
+
+vgate_assert 12 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 12 serial-contains 'gotabwm: mode live'
+# The armed marker is the flag flip; the catch-up replayed the backlog
+# fs.read by name before script3's publishes could land.
+vgate_assert 12 serial-contains 'gotabwm: agent watch'
+vgate_assert 12 serial-contains 'gotabwm: agent verb fs.read'
+vgate_assert 12 serial-contains 'gotabwm: agent caught n=1 bad=0'
+# The live burst: indicator on, three milestones toasted, the forged
+# close refused by name — and it printed no close marker and took
+# nothing down.
+vgate_assert 12 serial-contains 'gotabwm: agent session open agent=devin'
+vgate_assert 12 serial-contains 'gotabwm: agent milestone commit'
+vgate_assert 12 serial-contains 'gotabwm: agent milestone push'
+vgate_assert 12 serial-contains 'gotabwm: agent milestone install'
+vgate_assert 12 serial-contains 'gotabwm: notify id=0 agent: commit ok'
+vgate_assert 12 serial-contains 'gotabwm: notify id=0 agent: push ok'
+vgate_assert 12 serial-contains 'gotabwm: notify id=0 agent: install ok'
+vgate_assert 12 serial-contains 'gotabwm: notify paint id=0'
+vgate_assert 12 serial-contains 'gotabwm: agent rcpt bad RCPT-b0000001-00000006'
+vgate_assert 12 serial-absent 'gotabwm: agent session close'
+vgate_assert 12 serial-contains 'rx-gotabwm-agent-ok'
+vgate_assert 12 serial-absent '[EXC] parking:'
+vgate_assert 12 serial-absent 'exited status=139'
+
+# The publishes landed in the lane itself — the same AUDIT directory the
+# daemon writes (the alt share is this run's --cvc-file, not the seeded
+# share the share-* asserts read).
+vgate_assert 12 python <<'PY'
+import os, sys
+alt = os.path.join(os.environ["RUN_DIR"], "agent-share")
+dst = os.path.join(alt, "AGENT", "AUDIT", "RCPT-b0000001-00000002")
+try:
+    body = open(dst, "rb").read()
+except OSError:
+    sys.exit("the published open receipt is not in AGENT/AUDIT")
+if b'"event":"open"' not in body:
+    sys.exit("the published file is not the session-open receipt")
+staged = os.path.join(alt, "AGENT", "STAGED")
+left = [n for n in os.listdir(staged) if n.startswith("R")]
+if left:
+    sys.exit("unconsumed staged receipts remain: %r" % left)
+print("all five staged receipts published into AGENT/AUDIT")
+PY
+
+# The causal order is the whole chain: armed -> caught-up -> live open ->
+# milestones -> forged refusal -> the presented frame that carries them.
+vgate_assert 12 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+names = ["gotabwm: agent watch", "gotabwm: agent caught n=1 bad=0",
+         "gotabwm: agent session open agent=devin",
+         "gotabwm: agent milestone commit", "gotabwm: agent milestone push",
+         "gotabwm: agent milestone install",
+         "gotabwm: agent rcpt bad RCPT-b0000001-00000006",
+         "gotabwm: notify paint id=0"]
+positions = [ser.find(name) for name in names]
+if any(p < 0 for p in positions) or positions != sorted(positions):
+    sys.exit("agent-watch order: " + repr(list(zip(names, positions))))
+print("agent watch chain OK: armed -> caught -> open -> commit/push/install "
+      "-> forged refused -> presented")
+PY
+
+# The pixel proof, on the guest's own composed frame: the AGENT badge in
+# the clock panel's badge row reads Accent (nothing else in that zone is
+# accent — the panel's accent rule is its left edge, outside the probe),
+# and the bottom toast panel is Surface with its own rule + ink. The
+# badge sits at the panel's right edge: chromeRect is (1124,692,148,20),
+# the badge row ends at 1124+148-6=1266, and AGENT is 5 cells x 8px in
+# the bitmap face = [1226,1266) x [698,706).
+vgate_assert 12 snapshot 'snap-12-*.raw' <<'PY'
+import sys
+from collections import Counter
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("no full BGRX scanout in the agent snapshot")
+def px(x, y):
+    i = (y * W + x) * 4
+    return raw[i + 2], raw[i + 1], raw[i]
+ACCENT = (0x3b, 0x82, 0xf6)
+SURFACE = (0x22, 0x2d, 0x35)
+INK = (0xe6, 0xed, 0xf3)
+accent = 0
+for y in range(698, 706):
+    for x in range(1226, 1266):
+        r, g, b = px(x, y)
+        if b > 150 and b > r + 40 and b > g + 40:
+            accent += 1
+if accent < 20:
+    sys.exit("only %d accent pixels in the badge zone — the AGENT tag did "
+             "not paint while the session was open" % accent)
+modal = Counter(px(x, y) for y in range(692, 712) for x in range(8, 216))
+best, n = modal.most_common(1)[0]
+if best != SURFACE:
+    sys.exit("the bottom toast rect's modal colour is #%02x%02x%02x, want "
+             "Surface — no toast on the scanout" % best)
+ink = modal.get(INK, 0)
+if ink < 20:
+    sys.exit("only %d ink pixels in the toast rect — the milestone text did "
+             "not paint" % ink)
+print("agent badge accent px=%d; toast modal=Surface n=%d ink=%d"
+      % (accent, n, ink))
+PY
+
+# --- M109e (#2401) run 13: the session close takes the badge back down ---
+#
+# Same armed share shape; the open is boot backlog so the catch-up itself
+# lights the indicator, then the close publishes live — one marker for
+# each transition.
+vgate_file script-13.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-13.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-13.txt <<'EOF'
+vf mv AGENT/STAGED/R2 AGENT/AUDIT/RCPT-b0000001-00000002
+echo rx-gotabwm-close-ok
+EOF
+
+vgate_run 13 -- \
+    --cvc-file '$RUN_DIR/agent-close-share' \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script-13.txt' \
+    --script2 '$RUN_DIR/script2-13.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-13.txt' \
+    --script3-after 'gotabwm: agent caught ' \
+    --script-expect 'gotabwm: agent session close ' --timeout 300
+
+vgate_assert 13 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 13 serial-contains 'gotabwm: agent watch'
+vgate_assert 13 serial-contains 'gotabwm: agent session open agent=devin'
+vgate_assert 13 serial-contains 'gotabwm: agent caught n=1 bad=0'
+vgate_assert 13 serial-contains 'gotabwm: agent session close agent=devin'
+vgate_assert 13 serial-contains 'rx-gotabwm-close-ok'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 serial-absent 'exited status=139'
+
+vgate_assert 13 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+o = ser.find("gotabwm: agent session open agent=devin")
+c = ser.find("gotabwm: agent caught n=1 bad=0")
+x = ser.find("gotabwm: agent session close agent=devin")
+if not (0 <= o < c < x):
+    sys.exit("session transitions out of order: open=%d caught=%d close=%d"
+             % (o, c, x))
+print("catch-up lit the badge from backlog, the live close took it down")
+PY
+
+# --- M109e (#2401) run 14: flags-off is byte-silent ---------------------
+#
+# The strongest off-posture there is: the receipts are REAL (valid MACs
+# under the same pinned key) and the agent-hmac row EXISTS — it simply
+# does not name the seat. The watch's probe comes back unserved, so the
+# boot never prints a line: not the armed marker, not the catch-up, not
+# a verb line, nothing. `gotabwm: tick` counted proves the composite
+# loop — and therefore the would-be poll — actually ran with the data
+# sitting right there.
+vgate_file script-14.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-14.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-14.txt <<'EOF'
+echo rx-gotabwm-off-ok
+EOF
+
+vgate_run 14 -- \
+    --cvc-file '$RUN_DIR/agent-off-share' \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script-14.txt' \
+    --script2 '$RUN_DIR/script2-14.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-14.txt' \
+    --script3-after 'gotabwm: tick' --script3-delay 12 \
+    --script-expect 'rx-gotabwm-off-ok' --timeout 300
+
+vgate_assert 14 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 14 serial-contains 'gotabwm: mode live'
+vgate_assert 14 serial-count 'gotabwm: tick' 8
+# The byte-silence contract: a dozen polls over real, verifiable
+# receipts and not one agent line — the row was never served to the seat.
+vgate_assert 14 serial-absent 'gotabwm: agent'
+vgate_assert 14 serial-contains 'rx-gotabwm-off-ok'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 serial-absent 'exited status=139'
