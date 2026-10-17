@@ -1,5 +1,7 @@
 package vi
 
+import "unsafe"
+
 // M56c (issue #1314): address-hinted mmap for the shared-anonymous present
 // path (slot 63; ADR 0016 shared-anon, ADR 0026 the Go-runtime port).
 //
@@ -41,4 +43,21 @@ func MmapHint(hint uintptr, size int, prot, flags uint64) ([]byte, error) {
 		return nil, errno(-r)
 	}
 	return mmapSlice(uintptr(r), n), nil
+}
+
+// Munmap releases the region `b` maps (sys_munmap, slot 64) — the MmapHint
+// counterpart. Pass the slice MmapHint handed back: its base and length are
+// exactly the reservation's, so a caller cannot tear half a region by
+// accident. A shared-anon surface is full-region only (#2113); a private
+// anonymous window unmaps page by page. Off the guest this degrades to
+// -ENOSYS, same as MmapHint.
+func Munmap(b []byte) error {
+	if len(b) == 0 {
+		return errno(ErrEINVAL)
+	}
+	r := syscall2(SlotMunmap, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
+	if r < 0 {
+		return errno(-r)
+	}
+	return nil
 }
