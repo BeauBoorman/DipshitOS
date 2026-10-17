@@ -73,6 +73,11 @@ pub const filename = "OWNERS.TXT";
 /// from `secret.zig`, which imports THIS module) so `ensure_secret_file`
 /// can flag it by construction without a circular dependency.
 pub const secret_filename = "SECRETS.TXT";
+/// The grant table's share file (ADR 0054 D7, M113c #2419). Same split:
+/// `grant.zig` imports this module, so `ensure_grant_file`'s name lives
+/// here. Its contents are POLICY, not a secret — the secret class is
+/// taken for integrity (the file ABI is the only EL0 write surface).
+pub const grant_filename = "GRANTS.TXT";
 
 /// ADR 0024 D3 defaults (owner/other policy; group is reserved/zero).
 pub const default_file_mode: u16 = 0o644;
@@ -354,7 +359,26 @@ pub fn system_owned_key(key: []const u8) bool {
 /// 0644 file). The entry persists to `OWNERS.TXT` on the next save, which
 /// is exactly what a guest chmod already triggers.
 pub fn ensure_secret_file() bool {
-    if (find(.host, secret_filename)) |e| {
+    return ensureSecretClass(secret_filename);
+}
+
+/// M113c (#2419, ADR 0054 D7): `GRANTS.TXT` is secret-class BY
+/// CONSTRUCTION exactly like `SECRETS.TXT` — same `0600`/`uid_system`/
+/// `secret = true` shape, minted at load and at boot even when the file
+/// is absent. The contents are policy, not secret material; the class is
+/// taken for INTEGRITY: the file ABI is the only write path an EL0
+/// process has, and `secretDenies` refuses its read/list/delete/create
+/// for every actor while the mode bits refuse a non-owner write.
+pub fn ensure_grant_file() bool {
+    return ensureSecretClass(grant_filename);
+}
+
+/// The shared by-construction registration both secret-class files use:
+/// upgrade an existing entry (never downgrade, never un-poison) or mint
+/// the `0600`/`uid_system`/`secret` entry. False only when the bounded
+/// table cannot hold the class — callers fail closed then.
+fn ensureSecretClass(name: []const u8) bool {
+    if (find(.host, name)) |e| {
         e.used = true;
         e.deny = false;
         e.secret = true;
@@ -364,7 +388,7 @@ pub fn ensure_secret_file() bool {
     slot.used = true;
     slot.deny = false;
     slot.secret = true;
-    setEntry(slot, .host, secret_filename, 0o600, process.uid_system, true);
+    setEntry(slot, .host, name, 0o600, process.uid_system, true);
     entry_count += 1;
     return true;
 }
