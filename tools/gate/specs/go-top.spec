@@ -113,6 +113,48 @@ if not os.path.exists(psrc):
              "bash tools/go/build-pulse.sh")
 shutil.copy(psrc, os.path.join(share, "PULSE.ELF"))
 print("staged PULSE.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "PULSE.ELF")))
+# M109c run 05: the agent-activity leg. Stage the audit lane AGENT/AUDIT/
+# would carry after an AGENTD session — four RCPT files, one with a
+# deliberately bad MAC — plus the agent-hmac row GOTOP shares with
+# AGENTD.ELF (ADR 0052 D4; GOTOP.ELF must be uid_system-owned for the
+# app-bound row to be served, hence the OWNERS.TXT entry).
+import hashlib as _hashlib, hmac as _hmac
+KEY = "a5" * 32
+open(os.path.join(share, "SECRETS.TXT"), "w").write(
+    "#v1\n" + "agent-hmac\t1000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF\n")
+open(os.path.join(share, "OWNERS.TXT"), "w").write(
+    "#v1\nGOTOP.ELF\t644\t0\t-\n")
+adir = os.path.join(share, "AGENT", "AUDIT")
+os.makedirs(adir, exist_ok=True)
+
+
+def rcpt(seq, agent, verb, args, result, forge=False):
+    line = ('{"seq":%d,"epoch":"01020304","agent":"%s","verb":"%s",'
+            '"args":%s,"ts":1761234567,"mono":42,"result":"%s"}'
+            % (seq, agent, verb, args, result))
+    mac = _hmac.new(KEY.encode(), line.encode(), _hashlib.sha256).hexdigest()
+    if forge:
+        mac = ("0" if mac[0] != "0" else "1") + mac[1:]
+    return (line + "\n" + mac + "\n").encode()
+
+
+open(os.path.join(adir, "RCPT-01020304-00000001"), "wb").write(
+    rcpt(1, "-", "session", '{"event":"open"}', "ok"))
+open(os.path.join(adir, "RCPT-01020304-00000002"), "wb").write(
+    rcpt(2, "devin", "fs.write",
+         '{"path":"HELLO.TXT","size":27,"sha256_8":"01234567"}', "ok"))
+open(os.path.join(adir, "RCPT-01020304-00000003"), "wb").write(
+    rcpt(3, "viewer", "fs.read", '{"path":"SEED.TXT"}', "cap_required:file"))
+open(os.path.join(adir, "RCPT-01020304-00000004"), "wb").write(
+    rcpt(4, "mallory", "gosh.run", '{"cmd":"rm -rf /"}', "ok", forge=True))
+# A second-epoch receipt from an older boot — the lane keeps it, the view
+# shows it verified.
+open(os.path.join(adir, "RCPT-00aa11bb-00000007"), "wb").write(
+    rcpt(7, "ghost", "proc.list", '{}', "ok"))
+# Foreign files the view must skip.
+open(os.path.join(adir, "RCPT-01020304-0000000~"), "wb").write(b"tmp\n")
+open(os.path.join(adir, "OTHER.TXT"), "wb").write(b"x\n")
+print("staged audit lane (5 receipts, 1 forged, + noise files)")
 PY
 
 vgate_run 01 -- \
@@ -356,3 +398,40 @@ if int(m.group(2)) == 0 or int(m.group(3)) == 0:
     sys.exit("FAIL: pulse usage has no real memory figures: %r" % m.group(0))
 print("pulse usage ok: cpux10=%s memused=%sB memtotal=%sB" % m.groups())
 PY
+
+
+# --- Run 05 (M109c #2399): the agent-activity tab renders the audit lane ------
+#
+# A staged AGENT/AUDIT lane — three good receipts and one forged MAC —
+# renders through the `g` chord: GOTOP marks each RCPT verified/forged
+# under the shared agent-hmac row (served to GOTOP.ELF through the same
+# app-bound SECRETS.TXT entry AGENTD uses). The leg fails before the tab
+# exists: `top: tab=agent` and the `top: agent` markers are never printed.
+vgate_file script5a.txt <<'EOS'
+dui close 2
+echo rx-gotop-agent-ok
+EOS
+
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-string 'g' \
+    --input-string-after 'top: ready' \
+    --script3 '$RUN_DIR/script5a.txt' \
+    --script3-after 'top: agent rcpt agent=- verb=session result=ok mark=v' \
+    --script-expect 'rx-gotop-agent-ok' --timeout 150
+
+vgate_assert 05 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 05 serial-contains 'top: ready'
+vgate_assert 05 serial-contains 'top: tab=agent'
+vgate_assert 05 serial-contains 'top: agent n=5 verified=4 bad=1 key=yes'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=viewer verb=fs.read result=cap_required:file mark=v'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=mallory verb=gosh.run result=ok mark=!'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=ghost verb=proc.list result=ok mark=v'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=- verb=session result=ok mark=v'
+vgate_assert 05 serial-contains 'top: win_close'
+vgate_assert 05 serial-contains 'top: exiting 43'
+vgate_assert 05 serial-contains 'rx-gotop-agent-ok'
+vgate_assert 05 serial-absent '[EXC] parking:'

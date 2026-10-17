@@ -29,6 +29,7 @@ func mustReq(t *testing.T, line string) *request {
 // seamScope saves and restores every substitutable seam a test touches.
 func seamScope(t *testing.T) {
 	t.Helper()
+	prevLane, prevAList, prevTime := lane, auditListFn, timeFn
 	saved := []func(){
 		func() { procsFn = procsSave },
 		func() { readFileFn = readSave },
@@ -52,6 +53,9 @@ func seamScope(t *testing.T) {
 		func() { consoleFn = consoleSave },
 		func() { sleepFn = sleepSave },
 		func() { exitFn = exitSave },
+		func() { lane = prevLane },
+		func() { auditListFn = prevAList },
+		func() { timeFn = prevTime },
 	}
 	t.Cleanup(func() {
 		for _, restore := range saved {

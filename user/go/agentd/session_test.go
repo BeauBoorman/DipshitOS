@@ -63,13 +63,17 @@ func authLine(t *testing.T, agentID string) string {
 }
 
 // sessionSeams installs the seams a session test needs: the marker log,
-// the agent-hmac probe, the fixed challenge, and a readFileFn that serves
-// only the keyring (body parameterizable).
+// the agent-hmac probe, the fixed challenge, a readFileFn that serves
+// only the keyring (body parameterizable), and the M109c audit fakes —
+// receipts publish into sessShare under a pinned key/epoch so a test can
+// read them back and verify their MACs.
 func sessionSeams(t *testing.T, keyring string) *[]string {
 	t.Helper()
 	logs := &[]string{}
 	prevConsole, prevSecret, prevRandom, prevRead :=
 		consoleFn, secretGetFn, randomFn, readFileFn
+	prevWrite, prevDel, prevAList, prevTime, prevLane :=
+		writeFileFn, deleteFileFn, auditListFn, timeFn, lane
 	consoleFn = func(s string) { *logs = append(*logs, s) }
 	secretGetFn = func(name string, out []byte) int {
 		if name != secretName {
@@ -91,9 +95,22 @@ func sessionSeams(t *testing.T, keyring string) *[]string {
 		}
 		return prevRead(path, max)
 	}
+	writeFileFn = func(path string, b []byte) int64 {
+		sessShare[path] = append([]byte(nil), b...)
+		return 0
+	}
+	deleteFileFn = func(path string) int64 {
+		delete(sessShare, path)
+		return 0
+	}
+	auditListFn = func() []string { return shareReceiptNames(sessShare) }
+	timeFn = func() int64 { return 1761234567 }
+	lane = auditLane{key: []byte("receipt-key"), epoch: 0x01020304}
 	t.Cleanup(func() {
 		consoleFn, secretGetFn, randomFn, readFileFn =
 			prevConsole, prevSecret, prevRandom, prevRead
+		writeFileFn, deleteFileFn, auditListFn, timeFn, lane =
+			prevWrite, prevDel, prevAList, prevTime, prevLane
 	})
 	return logs
 }
@@ -401,9 +418,11 @@ func posture(t *testing.T, args []string, uid, caps uint32, principalOK bool, st
 	l := &[]string{}
 	oldConsole, oldArgs, oldPrincipal, oldSecret, oldDir, oldRead, oldListen, oldExit :=
 		consoleFn, argsFn, principalFn, secretGetFn, dirListFn, readFileFn, listenFn, exitFn
+	oldRandom, oldAList, oldTime, prevLane := randomFn, auditListFn, timeFn, lane
 	t.Cleanup(func() {
 		consoleFn, argsFn, principalFn, secretGetFn, dirListFn, readFileFn, listenFn, exitFn =
 			oldConsole, oldArgs, oldPrincipal, oldSecret, oldDir, oldRead, oldListen, oldExit
+		randomFn, auditListFn, timeFn, lane = oldRandom, oldAList, oldTime, prevLane
 	})
 	consoleFn = func(s string) { *l = append(*l, s) }
 	argsFn = func() []string { return args }
@@ -439,6 +458,16 @@ func posture(t *testing.T, args []string, uid, caps uint32, principalOK bool, st
 		}
 		return 0, 0
 	}
+	// auditInit's deps: the epoch draw, a quiet clock, and an empty lane.
+	randomFn = func(p []byte) (int, error) {
+		for i := range p {
+			p[i] = byte(i)
+		}
+		return len(p), nil
+	}
+	auditListFn = func() []string { return nil }
+	timeFn = func() int64 { return 0 }
+	lane = auditLane{}
 	listenFn = func(port uint16) (*vi.Conn, error) {
 		return nil, errors.New("test: listen must not be reached")
 	}
