@@ -2073,6 +2073,12 @@ pub fn build(b: *std.Build) void {
         "kernel/src/handoff.zig",
         "kernel/src/input.zig",
         "kernel/src/ipv4.zig",
+        // M117b (issue #2474, ADR 0057): the v6 datapath — header
+        // parse/build, the address set, the pseudo-header checksum; and
+        // the NDP half — NS/NA/RS/RA builders, the bounded table,
+        // solicited-only learning, the RA acceptance walk, the tick-seam
+        // DAD/RS drive (class A).
+        "kernel/src/ipv6.zig",
         "kernel/src/lineedit.zig",
         "kernel/src/machine.zig",
         "kernel/src/mailbox.zig",
@@ -2080,6 +2086,7 @@ pub fn build(b: *std.Build) void {
         "kernel/src/memmap.zig",
         "kernel/src/mmu.zig",
         "kernel/src/monitor.zig",
+        "kernel/src/ndp.zig",
         "kernel/src/nvram_console.zig",
         "kernel/src/process.zig",
         "kernel/src/psci.zig",

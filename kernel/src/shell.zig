@@ -3968,6 +3968,12 @@ fn park_body(mon: *monitor.Monitor) callconv(.c) void {
             virtio_net.tcp.now_ticks = timer.ticks;
             virtio_net.net_rx_drain();
             virtio_net.net_socket_poll();
+            // M117b (#2474, ADR 0057 D4/D5): stamp the NDP clock and drive
+            // the bounded RS train + one-probe DAD on the same polled-
+            // drain time engine; the promote/conflict transitions print
+            // (the net_dhcp_autonomous shape).
+            virtio_net.ndp.now_ticks = timer.ticks;
+            monitor.net_ndp_autonomous(mon);
             // Issue #2436: conn-death tombstones + counter transitions —
             // captured under the bracket, printed after release (the
             // retransmit-print lock order precedent below).
@@ -4449,7 +4455,7 @@ test "shell: mock-fed end-to-end session produces the exact transcript" {
         "  find        recursive file search with glob patterns ('find / -name \"*.BIN\"' — bounded 3 levels, 256 results)\n" ++
         "  inventory   list all installed applications from APPS.TXT with sizes and types (D16)\n" ++
         "networking\n" ++
-        "  net         virtio-net transport + RX + ARP + ICMP + UDP + DHCP + TCP + DNS: device DID, MAC, queues, feature bits, RX counters ('net recv' prints received frames; 'net ip <a.b.c.d>' sets the static IP; 'net arp [<a.b.c.d>]' shows/resolves the ARP table; 'net ping <a.b.c.d>' sends an ICMP echo request; 'net udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]' drives UDP; 'net dhcp' runs the bounded DHCP client one step per invocation; 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]' drives the bounded TCP client; 'net dns <hostname> [<server>]' resolves DNS A-records)\n" ++
+        "  net         virtio-net transport + RX + ARP + ICMP + UDP + DHCP + TCP + DNS + IPv6/NDP: device DID, MAC, queues, feature bits, RX counters ('net recv' prints received frames; 'net ip <a.b.c.d>' sets the static IP; 'net arp [<a.b.c.d>]' shows/resolves the ARP table; 'net ping <a.b.c.d>' sends an ICMP echo request; 'net udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]' drives UDP; 'net dhcp' runs the bounded DHCP client one step per invocation; 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]' drives the bounded TCP client; 'net dns <hostname> [<server>]' resolves DNS A-records; 'net ip6' shows the SLAAC address set; 'net ndp [<v6-addr>]' shows/resolves the NDP table; 'net ping6 <v6-addr>' sends an ICMPv6 echo request)\n" ++
         "  netsend     send a known Ethernet frame (bounded staging, TX + used-ring drain)\n" ++
         "graphics / input\n" ++
         "  font        terminal font size: small 8x8 (default), medium 16x16, large 24x24 (M20-U1); the same rung zooms the bound terminal grid 7x13/8x16/10x21 (M80i)\n" ++

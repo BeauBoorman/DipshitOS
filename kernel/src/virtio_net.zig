@@ -80,6 +80,16 @@ pub const ipv4 = @import("ipv4.zig");
 pub const udp = @import("udp.zig");
 pub const dhcp = @import("dhcp.zig"); // N8 (claim 0351): the bounded RFC 2131 client (port 68)
 pub const tcp = @import("tcp.zig"); // N10 (claim 7026): the bounded RFC 793 client
+/// M117b (issue #2474, ADR 0057): the IPv6/ICMPv6 layer (pure logic;
+/// the RX drain dispatches ethertype 0x86dd here beside the N3/N4
+/// dispatch and the monitor's `net ip6`/`net ping6` subcommands drive
+/// the address set + echo requests).
+pub const ipv6 = @import("ipv6.zig");
+/// M117b (issue #2474, ADR 0057): the NDP layer (pure logic; the
+/// ICMPv6 dispatch inside ipv6.zig hands NS/NA/RS/RA here, and
+/// `net_ndp_poll` drives its bounded RS train + one-probe DAD on the
+/// tick seam).
+pub const ndp = @import("ndp.zig");
 pub const native_socket = @import("socket_native.zig");
 pub const net_log = @import("net_log.zig"); // M26 N15 (issue #442): network event ring buffer
 
@@ -142,6 +152,9 @@ pub var net_packed: bool = false;
 // ---------------------------------------------------------------------------
 
 pub const eth_type_ipv4: u16 = 0x0800;
+/// M117b (issue #2474, ADR 0057 D1): the IPv6 ethertype — one leaf on
+/// the existing demux seam.
+pub const eth_type_ipv6: u16 = 0x86dd;
 pub const eth_hdr_len: usize = 14; // dst MAC (6) + src MAC (6) + ethertype (2)
 /// Payload bound = the standard Ethernet MTU (1500) without offload
 /// features. `netsend` truncates honestly at this bound.
@@ -782,6 +795,11 @@ fn transport_init(ops: *const Ops, dev: *Device, rearm: bool) bool {
         net_mac_source = .fallback;
     }
     format_mac(&net_mac, &net_mac_text);
+    // M117b (#2474, ADR 0057 D3): the link-local forms when the device
+    // MAC is known — the modified EUI-64 IID is a pure function of it.
+    // Idempotent across the post-exit rearm (a live address is not
+    // re-tentatived).
+    ipv6.form_link_local(&net_mac);
 
     if (rearm) {
         evidence.dump_str("VN rearm st=");
@@ -1046,24 +1064,39 @@ pub fn net_rx_arm() bool {
     ops.clean(@intFromPtr(&dev.rx_avail), @sizeOf(VirtqAvail));
     ops.notify(0);
     rx_armed = true;
+    // M117b (#2474, ADR 0057 D4): arming RX starts the bounded Router
+    // Solicitation train — idempotent (the drain re-arms after every
+    // completion).
+    ndp.rx_armed();
     return true;
 }
 
-/// MAC filter: accept own MAC + broadcast (`ff:ff:ff:ff:ff:ff`), drop the
-/// rest. `off` is the frame start in the buffer (the `rx_hdr_len`
-/// constant — pinned from observation at claim time). Pure and
-/// host-testable.
+/// MAC filter: accept own MAC + broadcast (`ff:ff:ff:ff:ff:ff`) + the
+/// bounded v6 multicast set (ADR 0057 D2: all-nodes `33:33:00:00:00:01`
+/// and the solicited-node group `33:33:ff:xx:xx:xx` of every
+/// formed-or-tentative v6 address — they share the IID, so the set is
+/// ONE computed group, never stored). Everything else still drops.
+/// `off` is the frame start in the buffer (the `rx_hdr_len` constant —
+/// pinned from observation at claim time). Pure and host-testable.
 pub fn mac_accept(off: usize, buf: []const u8, own: *const [6]u8) bool {
     if (off + 6 > buf.len) return false;
     const dst = buf[off .. off + 6];
     var own_match = true;
     var bcast = true;
+    var allnodes = true;
     var i: usize = 0;
     while (i < 6) : (i += 1) {
         if (dst[i] != own[i]) own_match = false;
         if (dst[i] != 0xff) bcast = false;
+        if (dst[i] != ipv6.all_nodes_mac[i]) allnodes = false;
     }
-    return own_match or bcast;
+    if (own_match or bcast or allnodes) return true;
+    // The solicited-node group: admitted once an IID exists (the
+    // link-local formed-or-tentative — every owned address shares the
+    // IID's low 24 bits).
+    if (ipv6.have_iid and dst[0] == 0x33 and dst[1] == 0x33 and dst[2] == 0xff and
+        dst[3] == ipv6.iid[5] and dst[4] == ipv6.iid[6] and dst[5] == ipv6.iid[7]) return true;
+    return false;
 }
 
 /// Push `frame` (the RAW device-written buffer bytes) into the bounded
@@ -1169,6 +1202,12 @@ pub fn net_rx_drain() void {
         // reassemble — honest bound). The raw frame stays in the FIFO
         // for `net recv` observation, same seam.
         rx_ipv4(rx_buf[rx_hdr_len..dev_len]);
+        // M117b (#2474, ADR 0057 D1): the 0x86dd leaf on the same demux
+        // seam — self-filters on ethertype like the ARP/IPv4 handlers;
+        // NDP answers (NA) and ICMPv6 echo replies are built into
+        // tx_staging and transmitted on the same TX path. The raw frame
+        // stays in the FIFO for `net recv` observation.
+        rx_ipv6(rx_buf[rx_hdr_len..dev_len]);
     }
     _ = net_rx_arm();
 }
@@ -1212,6 +1251,154 @@ fn rx_ipv4(frame: []const u8) void {
         .ok => ipv4.replies_sent += 1,
         else => ipv4.reply_tx_fail += 1,
     }
+}
+
+/// M117b (#2474, ADR 0057 D1): dispatch one accepted Ethernet frame to
+/// the IPv6 layer. `frame` starts at the Ethernet header (the RX
+/// virtio_net_hdr already skipped). An NS for an owned address is
+/// answered with an NA; an ICMPv6 echo request for an owned address is
+/// answered byte-exact; an RA feeds SLAAC (D4); a solicited NA is
+/// learned; every drop is counted by cause. A send failure is counted
+/// honestly (`reply_tx_fail` on the right counter), same as the v4
+/// path.
+fn rx_ipv6(frame: []const u8) void {
+    const reply = ipv6.handle_rx(frame, &net_mac, tx_staging[tx_hdr_len..]) orelse return;
+    // The zeroed virtio_net_hdr prefix — the observed claim-1373 TX
+    // contract (a stale header's flags/gso fields would corrupt the
+    // delivered reply).
+    @memset(tx_staging[0..tx_hdr_len], 0);
+    switch (net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + reply.len])) {
+        .ok => if (reply.na) {
+            ndp.na_sent += 1;
+        } else {
+            ipv6.replies_sent += 1;
+        },
+        else => if (reply.na) {
+            ndp.reply_tx_fail += 1;
+        } else {
+            ipv6.reply_tx_fail += 1;
+        },
+    }
+}
+
+/// The v6 send result (M117b, ADR 0057 D3/D9): the v4 `SendResult`
+/// plus the named refusals — kept a separate enum so the v4 enum's
+/// exhaustive switches are untouched.
+pub const Send6Result = enum {
+    ok,
+    not_ready,
+    timeout,
+    /// The next-hop MAC is not in the NDP table (`net ndp <addr>`
+    /// resolves it first — an echo needs a unicast dst).
+    no_peer,
+    /// A non-link-local destination with no valid global — never a
+    /// silent link-local leak (D3).
+    no_src6,
+    /// An off-link destination with no recorded router (D9).
+    no_route6,
+    /// A multicast, unspecified, or loopback destination (D9).
+    bad_dst6,
+};
+
+/// M117b (#2474, ADR 0057 D4/D5): the tick-seam driver for the bounded
+/// RS train + one-probe DAD, on the same polled-drain time engine as
+/// `net_dhcp_poll` (the caller stamps `ndp.now_ticks` first). Order per
+/// call: promote tentative addresses whose wait elapsed, transmit any
+/// pending DAD probes, then pace the ≤3 Router Solicitations one per
+/// tick. Returns the transitions so the caller can print them (the
+/// `net_dhcp_poll` shape — sends here, print decisions stay with the
+/// monitor).
+pub const NdpPoll = struct {
+    promoted_ll: bool = false,
+    promoted_g6: bool = false,
+    rs_sent: bool = false, // a Router Solicitation went out this poll
+};
+
+pub fn net_ndp_poll() NdpPoll {
+    var ev: NdpPoll = .{};
+    if (!net_ready) return ev;
+    while (ndp.dad_due()) |addr| {
+        if (ipv6.promote(&addr)) {
+            if (std.mem.eql(u8, &addr, &ipv6.link_local)) {
+                ev.promoted_ll = true;
+            } else {
+                ev.promoted_g6 = true;
+            }
+        }
+    }
+    while (ndp.dad_pending()) |p| {
+        @memset(tx_staging[0..tx_hdr_len], 0);
+        const n = ndp.build_dad_ns(tx_staging[tx_hdr_len .. tx_hdr_len + ndp.frame_len_max], &net_mac, &p.addr);
+        switch (net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n])) {
+            .ok => {
+                ndp.dad_mark_sent(p.slot);
+                ndp.dad_sent += 1;
+            },
+            else => {
+                ndp.reply_tx_fail += 1;
+                return ev; // the TX path is wedged — retry next poll
+            },
+        }
+    }
+    if (ndp.rs_due()) {
+        @memset(tx_staging[0..tx_hdr_len], 0);
+        const n = ndp.build_rs(tx_staging[tx_hdr_len .. tx_hdr_len + ndp.frame_len_max], &net_mac, &ipv6.link_local);
+        switch (net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n])) {
+            .ok => {
+                ndp.rs_note_sent();
+                ev.rs_sent = true;
+            },
+            else => ndp.reply_tx_fail += 1,
+        }
+    }
+    return ev;
+}
+
+/// M117b (#2474, ADR 0057 D9): transmit a NEIGHBOR SOLICITATION for the
+/// NEXT HOP toward `dst` — the literal address when on-link, the
+/// router's link-local when off-link (the `net_arp_request` next-hop
+/// precedent). The NA is learned asynchronously by the RX drain.
+/// Named refusals: `bad_dst6` (multicast/unspecified/loopback),
+/// `no_src6` (no valid link-local to source from), `no_route6`
+/// (off-link, no router). The frame length lands in `out_len` (86).
+pub fn net_ndp_solicit(dst: ipv6.Addr, out_len: *usize) Send6Result {
+    if (!net_ready) return .not_ready;
+    if (ipv6.is_bad_dst(dst)) return .bad_dst6;
+    if (ipv6.link_local_state != .valid) return .no_src6; // the NS's source
+    const target = ipv6.next_hop(&dst) orelse return .no_route6;
+    @memset(tx_staging[0..tx_hdr_len], 0);
+    const n = ndp.build_ns(tx_staging[tx_hdr_len .. tx_hdr_len + ndp.frame_len_max], &net_mac, &ipv6.link_local, &target);
+    out_len.* = n;
+    return switch (net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n])) {
+        .ok => .ok,
+        .timeout => .timeout,
+        else => .not_ready,
+    };
+}
+
+/// M117b (#2474, ADR 0057 D3/D9): transmit an ICMPv6 ECHO REQUEST to
+/// `dst` — the Ethernet dst is the NEXT HOP's learned MAC (the peer
+/// itself on-link, the router off-link), the v6 src is D3's source
+/// selection, the v6 dst stays the literal peer. The next hop must be
+/// resolved first (`net ndp <addr>` — the pending-slot + tick-seam
+/// wait is the ARP shape). Named refusals: `bad_dst6` / `no_route6` /
+/// `no_src6` / `no_peer`. The frame length lands in `out_len` (66). The
+/// reply is observed asynchronously by the RX drain (`pongs_observed`
+/// + `last_seq`).
+pub fn net_ping6_request(dst: ipv6.Addr, out_len: *usize) Send6Result {
+    if (!net_ready) return .not_ready;
+    if (ipv6.is_bad_dst(dst)) return .bad_dst6;
+    const target = ipv6.next_hop(&dst) orelse return .no_route6;
+    const src = ipv6.select_src(&dst) orelse return .no_src6;
+    const peer_mac = ndp.lookup(&target) orelse return .no_peer;
+    @memset(tx_staging[0..tx_hdr_len], 0);
+    const n = ipv6.build_echo_request(tx_staging[tx_hdr_len .. tx_hdr_len + ipv6.ipv6_frame_min + 4], &net_mac, &src, &dst, &peer_mac);
+    out_len.* = n;
+    return switch (net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n])) {
+        .ok => .ok,
+        .timeout => .timeout,
+        else => .not_ready,
+    };
 }
 
 /// Card N3 (claim 7293): transmit an ARP REQUEST for `target_ip`
