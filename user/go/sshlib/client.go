@@ -3,6 +3,8 @@
 // it over vi.Conn; host tests drive it against Server with no VM.
 package sshlib
 
+import "virelai/ed25519"
+
 const (
 	// Distinct local failure stages (user/src/ssh.zig). 0 is also a remote
 	// exec success; 255 is OpenSSH-style "no exit-status".
@@ -344,7 +346,7 @@ func (c *Client) sendECDHInit() {
 		c.fail("kex", "Entropy", ExitKex, "entropy")
 		return
 	}
-	qC, ok := X25519Base(eph)
+	qC, ok := ed25519.X25519Base(eph)
 	if !ok {
 		c.fail("kex", "BadEphemeralKey", ExitKex, "bad ephemeral secret")
 		return
@@ -387,7 +389,7 @@ func (c *Client) handleECDHReply(payload []byte) {
 	Wipe(c.cfg.Ephemeral)
 	c.cfg.Ephemeral = nil
 	copy(qSa[:], qS)
-	kRaw, ok := X25519(eph, qSa)
+	kRaw, ok := ed25519.X25519(eph, qSa)
 	Wipe(eph[:])
 	if !ok {
 		c.fail("kex", "WeakSharedSecret", ExitKex, "all-zero shared secret")
@@ -427,7 +429,7 @@ func verifyHostSig(sigBlob, h []byte, host [32]byte) bool {
 	}
 	var sig [64]byte
 	copy(sig[:], sigBytes)
-	return EdVerify(sig, h, host)
+	return ed25519.EdVerify(sig, h, host)
 }
 
 func (c *Client) checkPin() bool {
@@ -583,7 +585,7 @@ func (c *Client) handleUserauthFail(payload []byte) {
 }
 
 func (c *Client) sendPublickey() {
-	pub := EdDerivePublic(c.cfg.UserSeed)
+	pub := ed25519.EdDerivePublic(c.cfg.UserSeed)
 	var kb Writer
 	kb.StrS(AlgoEd25519)
 	kb.Str(pub[:])
@@ -596,7 +598,7 @@ func (c *Client) sendPublickey() {
 	signed.BoolVal(true)
 	signed.StrS(AlgoEd25519)
 	signed.Str(kb.B)
-	sig := EdSign(signed.B, c.cfg.UserSeed)
+	sig := ed25519.EdSign(signed.B, c.cfg.UserSeed)
 	var sb Writer
 	sb.StrS(AlgoEd25519)
 	sb.Str(sig[:])

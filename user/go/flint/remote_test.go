@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	ved25519 "virelai/ed25519"
 
 	"virelai/sshlib"
 )
@@ -779,7 +780,7 @@ func pubHexForSeed(t *testing.T, seedHex string) string {
 	}
 	var arr [32]byte
 	copy(arr[:], seed)
-	pub := sshlib.EdDerivePublic(arr)
+	pub := ved25519.EdDerivePublic(arr)
 	return sshlib.EncodeHex(pub[:])
 }
 

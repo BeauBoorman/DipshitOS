@@ -1,6 +1,10 @@
 package sshlib
 
-import "testing"
+import (
+	"testing"
+
+	"virelai/ed25519"
+)
 
 func pump(t *testing.T, cl *Client, srv *Server, rounds int) {
 	t.Helper()
@@ -25,7 +29,7 @@ func TestClientNewkeysThenServiceConcatenated(t *testing.T) {
 	userSeed, _ := ParseHex32("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
 	alice, _ := ParseHex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 	bob, _ := ParseHex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-	hostPub := EdDerivePublic(hostSeed)
+	hostPub := ed25519.EdDerivePublic(hostSeed)
 	cc, sc := testClientCfg(userSeed, hostSeed, alice, bob, hostPub, true, true, "VIRELAI-GATE-EXEC")
 	cl := NewClient(cc)
 	srv := NewServer(sc)
@@ -58,7 +62,7 @@ func TestClientNewkeysThenServiceConcatenated(t *testing.T) {
 }
 
 func testClientCfg(userSeed, hostSeed, alice, bob [32]byte, pin [32]byte, hasPin, hasSeed bool, cmd string) (ClientConfig, ServerConfig) {
-	userPub := EdDerivePublic(userSeed)
+	userPub := ed25519.EdDerivePublic(userSeed)
 	cl := ClientConfig{
 		User:      "alice",
 		Cmd:       cmd,
@@ -89,7 +93,7 @@ func TestClientKexAuthExec(t *testing.T) {
 	userSeed, _ := ParseHex32("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
 	alice, _ := ParseHex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 	bob, _ := ParseHex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-	hostPub := EdDerivePublic(hostSeed)
+	hostPub := ed25519.EdDerivePublic(hostSeed)
 	cc, sc := testClientCfg(userSeed, hostSeed, alice, bob, hostPub, true, true, "VIRELAI-GATE-EXEC")
 	cl := NewClient(cc)
 	srv := NewServer(sc)
@@ -138,7 +142,7 @@ func TestClientMissingCredential(t *testing.T) {
 	userSeed, _ := ParseHex32("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
 	alice, _ := ParseHex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 	bob, _ := ParseHex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-	hostPub := EdDerivePublic(hostSeed)
+	hostPub := ed25519.EdDerivePublic(hostSeed)
 	cc, sc := testClientCfg(userSeed, hostSeed, alice, bob, hostPub, true, false, "VIRELAI-GATE-EXEC")
 	cl := NewClient(cc)
 	srv := NewServer(sc)
@@ -154,7 +158,7 @@ func TestClientAuthRejected(t *testing.T) {
 	wrongSeed, _ := ParseHex32("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7")
 	alice, _ := ParseHex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 	bob, _ := ParseHex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-	hostPub := EdDerivePublic(hostSeed)
+	hostPub := ed25519.EdDerivePublic(hostSeed)
 	cc, sc := testClientCfg(userSeed, hostSeed, alice, bob, hostPub, true, true, "VIRELAI-GATE-EXEC")
 	cc.UserSeed = wrongSeed
 	cl := NewClient(cc)
@@ -170,7 +174,7 @@ func TestClientTamperedMAC(t *testing.T) {
 	userSeed, _ := ParseHex32("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
 	alice, _ := ParseHex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 	bob, _ := ParseHex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-	hostPub := EdDerivePublic(hostSeed)
+	hostPub := ed25519.EdDerivePublic(hostSeed)
 	cc, sc := testClientCfg(userSeed, hostSeed, alice, bob, hostPub, true, true, "VIRELAI-GATE-EXEC")
 	cl := NewClient(cc)
 	srv := NewServer(sc)

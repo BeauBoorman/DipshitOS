@@ -3,6 +3,8 @@ package sshlib
 import (
 	"bytes"
 	"testing"
+
+	"virelai/ed25519"
 )
 
 // A fully scripted server peer for the client state machine: every byte the
@@ -69,15 +71,15 @@ func newScriptedServer(t *testing.T, cl *Client) *scriptedServer {
 		t.Fatal("no ECDH_INIT after server KEXINIT")
 	}
 	// Build a valid ECDH_REPLY over the real transcript.
-	qS, ok := X25519Base(ss.eph)
+	qS, ok := ed25519.X25519Base(ss.eph)
 	if !ok {
 		t.Fatal("qS")
 	}
 	var kSBlob Writer
 	kSBlob.StrS(AlgoEd25519)
-	hostPub := EdDerivePublic(ss.hostSeed)
+	hostPub := ed25519.EdDerivePublic(ss.hostSeed)
 	kSBlob.Str(hostPub[:])
-	kRaw, ok := X25519(ss.eph, mustHex32B(t, rfc7748AlicePubHex))
+	kRaw, ok := ed25519.X25519(ss.eph, mustHex32B(t, rfc7748AlicePubHex))
 	if !ok {
 		t.Fatal("shared")
 	}
@@ -86,7 +88,7 @@ func newScriptedServer(t *testing.T, cl *Client) *scriptedServer {
 		[]byte(IdentLine), []byte(IdentLine),
 		cl.iC, ss.iS, kSBlob.B, cl.qC, qS[:], kMpint,
 	)
-	sig := EdSign(h[:], ss.hostSeed)
+	sig := ed25519.EdSign(h[:], ss.hostSeed)
 	var sigBlob Writer
 	sigBlob.StrS(AlgoEd25519)
 	sigBlob.Str(sig[:])
@@ -499,7 +501,7 @@ func TestClientKexInitNegatives(t *testing.T) {
 	cl := setup()
 	var kSBlob Writer
 	kSBlob.StrS(AlgoEd25519)
-	hostPub := EdDerivePublic(mustHex32B(t, rfc8032Test1SeedHex))
+	hostPub := ed25519.EdDerivePublic(mustHex32B(t, rfc8032Test1SeedHex))
 	kSBlob.Str(hostPub[:])
 	var sigBlob Writer
 	sigBlob.StrS(AlgoEd25519)
@@ -507,7 +509,7 @@ func TestClientKexInitNegatives(t *testing.T) {
 	var reply Writer
 	reply.Byte(MsgKexECDHReply)
 	reply.Str(kSBlob.B)
-	qS, _ := X25519Base(mustHex32B(t, rfc7748BobHex))
+	qS, _ := ed25519.X25519Base(mustHex32B(t, rfc7748BobHex))
 	reply.Str(qS[:])
 	reply.Str(sigBlob.B)
 	cl.Feed(plainFrame(reply.B))
@@ -533,11 +535,11 @@ func TestClientECDHReplyNegatives(t *testing.T) {
 		}
 		return cl, ss
 	}
-	hostPub := EdDerivePublic(mustHex32B(t, rfc8032Test1SeedHex))
+	hostPub := ed25519.EdDerivePublic(mustHex32B(t, rfc8032Test1SeedHex))
 	var kSBlob Writer
 	kSBlob.StrS(AlgoEd25519)
 	kSBlob.Str(hostPub[:])
-	qS, _ := X25519Base(mustHex32B(t, rfc7748BobHex))
+	qS, _ := ed25519.X25519Base(mustHex32B(t, rfc7748BobHex))
 	reply := func(edit func(w *Writer)) []byte {
 		var w Writer
 		w.Byte(MsgKexECDHReply)
@@ -548,14 +550,14 @@ func TestClientECDHReplyNegatives(t *testing.T) {
 		return w.B
 	}
 	validSig := func(cl *Client, ss *scriptedServer) []byte {
-		kRaw, ok := X25519(ss.eph, mustHex32B(t, rfc7748AlicePubHex))
+		kRaw, ok := ed25519.X25519(ss.eph, mustHex32B(t, rfc7748AlicePubHex))
 		if !ok {
 			t.Fatal("k")
 		}
 		kMpint := Mpint(kRaw[:])
 		h := ExchangeHash([]byte(IdentLine), []byte(IdentLine),
 			cl.iC, ss.iS, kSBlob.B, cl.qC, qS[:], kMpint)
-		sig := EdSign(h[:], ss.hostSeed)
+		sig := ed25519.EdSign(h[:], ss.hostSeed)
 		var sb Writer
 		sb.StrS(AlgoEd25519)
 		sb.Str(sig[:])
@@ -996,7 +998,7 @@ func (c *scriptedClient) takeKexInit(out []byte) {
 }
 
 func (c *scriptedClient) ecdhInit() []byte {
-	q, ok := X25519Base(c.eph)
+	q, ok := ed25519.X25519Base(c.eph)
 	if !ok {
 		c.t.Fatal("qC")
 	}
@@ -1039,7 +1041,7 @@ func (c *scriptedClient) finishKex(out []byte, hostPub [32]byte) []byte {
 	kS, _ := r.Str()
 	qS, _ := r.Str()
 	sigBlob, _ := r.Str()
-	kRaw, ok := X25519(c.eph, [32]byte(qS))
+	kRaw, ok := ed25519.X25519(c.eph, [32]byte(qS))
 	if !ok {
 		c.t.Fatal("shared")
 	}
@@ -1051,7 +1053,7 @@ func (c *scriptedClient) finishKex(out []byte, hostPub [32]byte) []byte {
 	sr := Reader{B: sigBlob}
 	alg, _ := sr.StrUTF8()
 	sig, _ := sr.Str()
-	if alg != AlgoEd25519 || len(sig) != 64 || !EdVerify([64]byte(sig), h[:], hostPub) {
+	if alg != AlgoEd25519 || len(sig) != 64 || !ed25519.EdVerify([64]byte(sig), h[:], hostPub) {
 		c.t.Fatal("host signature did not verify over recomputed H")
 	}
 	c.session = h[:]
@@ -1100,7 +1102,7 @@ func (c *scriptedClient) feedEnc(out []byte) [][]byte {
 }
 
 func serverCfg(t *testing.T) ServerConfig {
-	userPub := EdDerivePublic(mustHex32B(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
+	userPub := ed25519.EdDerivePublic(mustHex32B(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
 	return ServerConfig{
 		HostSeed:  mustHex32B(t, rfc8032Test1SeedHex),
 		Keys:      []AuthKey{{User: "alice", Pub: userPub}},
@@ -1209,7 +1211,7 @@ func TestServerKexIllegalMessages(t *testing.T) {
 		{"ecdh init trailing", func() []byte {
 			var w Writer
 			w.Byte(MsgKexECDHInit)
-			q, _ := X25519Base(mustHex32B(t, rfc7748AliceHex))
+			q, _ := ed25519.X25519Base(mustHex32B(t, rfc7748AliceHex))
 			w.Str(q[:])
 			w.Byte(0)
 			return w.B
@@ -1265,7 +1267,7 @@ func TestServerEncryptedIllegalTransitions(t *testing.T) {
 	pubkeyFields := func(w *Writer) {
 		w.BoolVal(true)
 		w.StrS(AlgoEd25519)
-		userPub := EdDerivePublic(mustHex32B(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
+		userPub := ed25519.EdDerivePublic(mustHex32B(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
 		var kb Writer
 		kb.StrS(AlgoEd25519)
 		kb.Str(userPub[:])
@@ -1308,7 +1310,7 @@ func TestServerEncryptedIllegalTransitions(t *testing.T) {
 				w.StrS(AlgoEd25519)
 				var kb Writer
 				kb.StrS(AlgoEd25519)
-				p := EdDerivePublic(mustHex32B(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
+				p := ed25519.EdDerivePublic(mustHex32B(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
 				kb.Str(p[:])
 				w.Str(kb.B)
 			})}, false, func(t *testing.T, c *scriptedClient, out [][]byte) {

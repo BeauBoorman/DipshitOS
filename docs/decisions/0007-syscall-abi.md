@@ -2553,3 +2553,26 @@ process). `live-n5-dns` gains the depth legs: AAAA, multi-answer,
 TTL cache hit + expiry, concurrent transactions on distinct source
 ports, spoof/wrong-question rejection, and the explicit `TC=1`
 refusal with no TCP fallback.
+
+## Amendment (2026-10-16, M109b #2398 — slot 88 `sys_scanout_read`, the bounded scanout-read seam)
+
+ADR 0052's `ui.screenshot` needs pixels no existing slot exposes:
+`MmapScanout` deliberately maps the writable full frame only to the
+registered seat (ADR 0048's compositor posture), and the monitor's BMP
+capture is an EL1h path. This additive amendment freezes slot 88 in the
+dispatch table (every existing number stays frozen;
+`implemented_count` is now 89) — the READ side of the scanout, for any
+EL0 caller, asymmetric to the seat-only writable bind.
+
+| 88 | `sys_scanout_read` | `scanout_read(x, y, w, h, buf, len) -> i64` | Copy the (x, y, w, h) rectangle of the virtio-gpu framebuffer (B8G8R8X8, 1280×720 — the pixels the display DMAs, so what is returned is what the seat is showing) OUT through uaccess, one scanline band per copy. Returns the byte count copied (`w*h*4`). `ENXIO` when the framebuffer is not armed; `EINVAL` for a zero rect, a rect reaching past the frame, a `len` that is not exactly `w*h*4`, or a rect over `scanout_read_max` (64 KiB — a caller wanting more reads more rects); `EFAULT` for a bad `buf` (the check runs per row, so a mid-rect fault can leave earlier rows copied — stated, not hidden). No capability gate: the rect is read-only and bounded, and every EL0 principal is uid_user with caps 0. |
+
+The EL0 consumer is `vi.ScanoutRead` (user/go/vi/scanout.go); AGENTD's
+`ui.screenshot` reads row bands through it and downsamples to a bounded
+RGB565 thumbnail — the full frame is never copied out in one call.
+
+### Observable contract
+
+`go-agentd` gains the `ui.screenshot` leg: a live seat answers with a
+bounded thumbnail, a seatless daemon answers `seat_absent`. Every other
+spec keeps its wire shape; the framebuffer was never readable at EL0
+before, so nothing changes for existing callers.

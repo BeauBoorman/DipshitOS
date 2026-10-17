@@ -1,10 +1,14 @@
-// AGENTD.ELF — the agent control channel daemon (ADR 0044). One JSON-Lines
-// session at a time on guest TCP 4747 behind an HMAC-SHA256 challenge.
-// Startup posture refuses before Listen; every auth failure is damped and
-// relistened; nothing sensitive is ever logged (D6).
+// AGENTD.ELF — the agent control channel daemon (ADR 0044, ADR 0052).
+// One JSON-Lines session at a time on guest TCP 4747 behind an
+// agent-named Ed25519 challenge (virelai-agent/2 — v1 HMAC is removed:
+// old clients fail closed at the greeting). Startup posture refuses
+// before Listen; every auth failure is damped and relistened; nothing
+// sensitive is ever logged (D6).
 package main
 
 import (
+	"strings"
+
 	"virelai/vi"
 )
 
@@ -57,8 +61,21 @@ func main() {
 		refuseExit("no-credential")
 		return
 	}
+	switch _, code := keyringLoad(); code {
+	case "":
+	case "missing":
+		refuseExit("no-keyring")
+		return
+	default:
+		refuseExit("keyring-malformed")
+		return
+	}
 	if !dirExists(sandboxDir) {
 		refuseExit("no-root")
+		return
+	}
+	if !dirExists(auditDir) {
+		refuseExit("no-audit")
 		return
 	}
 	if allowExec {
@@ -127,27 +144,30 @@ func errKind(err error) string {
 	return err.Error()
 }
 
-// session runs one connection: the key is loaded fresh, the greeting and
-// single auth attempt run, then the request loop. The key, challenge and
-// reply buffers are wiped when the session ends (D2). It returns true
-// when the AUTH phase failed (the caller applies the 1 s damping before
-// relistening); request-phase endings are not damped.
+// session runs one connection: the keyring is read fresh (per-session
+// resolution, ADR 0052 D6), the greeting and single auth attempt run,
+// then the request loop. The challenge and reply buffers are wiped when
+// the session ends (D2). It returns true when the AUTH phase failed
+// (the caller applies the 1 s damping before relistening); request-phase
+// endings are not damped.
 func session(c connIO, allowExec bool) bool {
 	r := newLineReader(c)
 
-	key, keyOK := loadKey()
-	if !keyOK {
+	kr, kcode := keyringLoad()
+	if kcode != "" {
+		// The posture check passed at start but the file is gone or
+		// unreadable now — no identity can be resolved, so there is no
+		// auth verdict to give.
 		consoleFn(markerSessEnd + "io_error")
 		return false
 	}
-	defer wipeBytes(key)
 
 	challenge, ok := agentChallenge()
 	if !ok {
 		consoleFn(markerSessEnd + "io_error")
 		return false
 	}
-	greeting := `{"proto":"virelai-agent/1","auth":"hmac-sha256","challenge":"` +
+	greeting := `{"proto":"virelai-agent/2","auth":"ed25519","challenge":"` +
 		hexString(challenge[:]) + `"}`
 	if err := sendLine(c, greeting); err != nil {
 		consoleFn(markerSessEnd + "client_close")
@@ -167,40 +187,91 @@ func session(c connIO, allowExec bool) bool {
 		return true
 	}
 	// A first line carrying a verb key is auth_required regardless of what
-	// else it holds (D2); anything else must be exactly {"auth":"<hex>"}.
+	// else it holds (D2); anything else must be exactly
+	// {"agent":"<id>","auth":"<128 hex>"}.
 	for _, m := range v.membs {
 		if m.key == "verb" {
 			authEndCode(c, "preauth")
 			return true
 		}
 	}
-	if len(v.membs) != 1 || v.membs[0].key != "auth" || v.membs[0].val.kind != jStr {
+	var agentID, authHex string
+	haveAgent, haveAuth := false, false
+	for _, m := range v.membs {
+		if m.val.kind != jStr {
+			authEndCode(c, "malformed")
+			return true
+		}
+		switch m.key {
+		case "agent":
+			if haveAgent {
+				authEndCode(c, "malformed")
+				return true
+			}
+			agentID, haveAgent = m.val.str, true
+		case "auth":
+			if haveAuth {
+				authEndCode(c, "malformed")
+				return true
+			}
+			authHex, haveAuth = m.val.str, true
+		default:
+			authEndCode(c, "malformed")
+			return true
+		}
+	}
+	if !haveAgent || !haveAuth {
 		authEndCode(c, "malformed")
 		return true
 	}
-	authHex := v.membs[0].val.str
-	mac := agentMAC(key, &challenge)
-	verdict := ctEqStr(hexString(mac[:]), authHex)
-	wipeBytes(mac[:])
-	wipeBytes(challenge[:])
-	wipeBytes(line) // the reply bytes held the MAC
-	if !verdict {
-		authEndCode(c, "mac")
+	// Resolve the claimed id against the session's keyring: unknown ids
+	// and revoked keys are refused by name (D2), and revocation is
+	// checked before the signature — a revoked credential never reaches
+	// the verify path.
+	row := kr.lookup(agentID)
+	if row == nil {
+		authEndCode(c, "agent_unknown")
 		return true
 	}
-	consoleFn(markerAuthOK)
-
-	ready := `{"ok":true,"session":"ready","verbs":["proc.list","proc.get","fs.read","fs.write","ui.windows"`
-	if allowExec {
-		ready += `,"gosh.run"`
+	if kr.revoked[row.pub] {
+		authEndCode(c, "agent_revoked")
+		return true
 	}
-	ready += `]}`
-	if err := sendLine(c, ready); err != nil {
+	verdict := agentVerify(authHex, &challenge, row)
+	wipeBytes(challenge[:])
+	wipeBytes(line) // the reply bytes held the signature
+	if !verdict {
+		authEndCode(c, "sig")
+		return true
+	}
+	consoleFn(markerAuthOK + " agent=" + agentID)
+	sess := &sessionCtx{agentID: agentID, caps: row.caps, allowExec: allowExec}
+
+	var sb strings.Builder
+	sb.WriteString(`{"ok":true,"session":"ready","agent":`)
+	jwriteStr(&sb, agentID)
+	sb.WriteString(`,"caps":[`)
+	for i, capw := range row.list {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		jwriteStr(&sb, capw)
+	}
+	sb.WriteString(`],"verbs":[`)
+	for i, verb := range advertisedVerbs(sess) {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		jwriteStr(&sb, verb)
+	}
+	sb.WriteString(`]}`)
+	if err := sendLine(c, sb.String()); err != nil {
 		consoleFn(markerSessEnd + "client_close")
 		return false
 	}
 
-	// Request loop: one response per line, strictly in order.
+	// Request loop: one response per line, strictly in order — a
+	// streamed verb emits its chunk lines ahead of its result.
 	for {
 		c.SetRecvDeadline(idleBudgetNs)
 		line, outcome := r.readLine(lineMaxSession)
@@ -221,7 +292,7 @@ func session(c connIO, allowExec bool) bool {
 			consoleFn(markerSessEnd + "io_error")
 			return false
 		}
-		serveLine(c, line, allowExec)
+		serveLine(c, line, sess)
 	}
 }
 
@@ -243,13 +314,19 @@ func authEnd(c connIO, outcome int, _ string) {
 }
 
 // authEndCode finishes a failed auth attempt: one error line, the auth-fail
-// marker with its D2 reason, and the session-end line.
+// marker with its D2 reason, and the session-end line. agent_unknown and
+// agent_revoked carry their own wire codes (ADR 0052 D2 — a refused
+// credential is named); everything else maps onto the v1 codes.
 func authEndCode(c connIO, reason string) {
 	code := "auth_failed"
 	msg := errMessages["auth_failed"]
-	if reason == "preauth" {
+	switch reason {
+	case "preauth":
 		code = "auth_required"
 		msg = errMessages["auth_required"]
+	case "agent_unknown", "agent_revoked":
+		code = reason
+		msg = errMessages[reason]
 	}
 	_ = sendLine(c, respondErr(-1, code, msg))
 	consoleFn(markerAuthFail + reason)
@@ -259,7 +336,9 @@ func authEndCode(c connIO, reason string) {
 // serveLine parses one post-auth line, runs it through dispatch, and writes
 // the response with its req/refuse marker. Every refusal here is non-fatal
 // (D4: the fatal codes are transport-level and handled by the caller).
-func serveLine(c connIO, line []byte, allowExec bool) {
+// sess.emit carries a verb's bounded output chunks as stream lines ahead
+// of the single result line.
+func serveLine(c connIO, line []byte, sess *sessionCtx) {
 	id := int64(-1)
 	verb := "-"
 	v, code := parseLine(line)
@@ -273,7 +352,20 @@ func serveLine(c connIO, line []byte, allowExec bool) {
 	}
 	var result string
 	if code == "" {
-		result, code = dispatch(req, allowExec)
+		seq := 0
+		sess.emit = func(chunk []byte) {
+			var sb strings.Builder
+			sb.WriteString(`{"id":`)
+			writeID(&sb, id)
+			sb.WriteString(`,"ok":true,"stream":`)
+			sb.WriteString(vi.Itoa64(int64(seq)))
+			sb.WriteString(`,"data_b64":`)
+			jwriteStr(&sb, b64Encode(chunk))
+			sb.WriteByte('}')
+			_ = sendLine(c, sb.String())
+			seq++
+		}
+		result, code = dispatch(req, sess)
 	}
 	bare, detail := splitCode(code)
 	if bare == "" {
@@ -331,7 +423,11 @@ var errMessages = map[string]string{
 	"spawn_failed":     "could not start the command",
 	"timed_out":        "command exceeded its time budget",
 	"seat_unsupported": "the window seat cannot answer this query",
+	"seat_absent":      "no window seat is running",
 	"seat_timeout":     "the window seat did not answer in time",
+	"cap_required":     "the agent's declared caps do not include this capability",
+	"agent_unknown":    "no keyring row names this agent",
+	"agent_revoked":    "the keyring revokes this credential",
 	"io_error":         "kernel call failed",
 	"auth_required":    "authenticate before sending requests",
 	"auth_failed":      "authentication failed",
