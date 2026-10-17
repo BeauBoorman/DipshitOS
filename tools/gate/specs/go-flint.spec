@@ -119,8 +119,24 @@
 # run 14's `store ls` — the honest negatives print in the same boot as
 # the happy path.
 #
-# This spec is grown across M103a-d/M101a-e and is NOT vgate_repeat-safe
-# (runs 01-03, 05-07, 08-10, and 14-17 share /host state across boots).
+# Runs 18-19 (M110b #2404): the signed catalog. The `rel` fixture now
+# carries ADR 0055's optional consts (summary/description/category); a
+# SECOND publisher key (pinned `name=acme` in TRUSTED.TXT) signs stream
+# `rel2` whose release carries every catalog field including a pinned
+# icon blob; and stream `legacy` ships a bare four-const manifest. Run
+# 18 renders the catalog — `store ls` folds each release stream's consts
+# + derived publisher fingerprint, --category/--search filter it, and
+# `store info rel2` renders the detail card. Run 19 is the refusal leg —
+# `store info rel` against a tampered-description drop refuses
+# release_mismatch — plus the legacy release installing + execing. They
+# split across boots because a socket-heavy catalog pass depletes the
+# task pool for the reaper's schedule (the same race that split the
+# M101a sync runs — observed: `newosproc`/`wait failed` ate the install
+# execs when one boot ran six store verbs).
+#
+# This spec is grown across M103a-d/M101a-e + M110b and is NOT
+# vgate_repeat-safe (runs 01-03, 05-07, 08-10, and 14-19 share /host
+# state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
@@ -138,8 +154,9 @@
 # 10 ends on `flint: merge conflicts=1`, run 11 ends on `flint: clone ok`,
 # run 12 ends on `flint: pull up to date`, run 13 ends on `flint: refuse
 # auth_failed`, runs 14/15 end on `virelai-go OK` (the v1 install, then the
-# rollback restoring it), run 16 ends on `m101e: torn-state legs done`, and
-# run 17 ends on `m101e: negatives done`.
+# rollback restoring it), run 16 ends on `m101e: torn-state legs done`, run
+# 17 ends on `m101e: negatives done`, run 18 ends on `m110b: catalog ls
+# done`, and run 19 ends on `m110b: catalog legs done`.
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -211,7 +228,7 @@ EOF
 vgate_file script-14.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec GOSH.ELF -c "STORE.ELF ls --remote=10.0.0.2:4749;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROP;GOHELLO.ELF"
+exec GOSH.ELF -c "STORE.ELF ls --remote=10.0.0.2:4749 --channel=/host/DROP;STORE.ELF install rel --remote=10.0.0.2:4749 --channel=/host/DROP;GOHELLO.ELF"
 EOF
 
 # Runs 15-17 drive the multi-line install legs through staged .SH files —
@@ -233,6 +250,18 @@ vgate_file script-17.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec GOSH.ELF -c "source /host/FLINTJ/17.SH"
+EOF
+
+vgate_file script-18.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/18.SH"
+EOF
+
+vgate_file script-19.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/19.SH"
 EOF
 
 vgate_setup_python <<'PY'
@@ -609,10 +638,21 @@ elf_sha = hashlib.sha256(elf_bytes).hexdigest()
 # producer machinery is upstream's card anyway (flint-client#49). The
 # fixture's signature still goes through the full M101b verify path —
 # the consumer's evidence is unchanged.
+# M110b (#2404): the v1/v2 manifests carry ADR 0055's optional signed
+# catalog consts — summary + description + category — so `store ls`/`info`
+# render them out of the signed atoms. A second publisher (rel2) and a
+# bare four-const legacy stream join the catalog below.
+REL_SUMMARY = "Go Hello greets VirelaiOS"
+REL_DESCRIPTION = ("Go Hello prints a greeting over the serial console.\n"
+                   "It is the fleet's smallest signed release.")
+REL_CATEGORY = "demo"
 gen = subprocess.run(
     ["go", "test", "./store", "-run", "TestGenReleaseFixture", "-count=1"],
     cwd="user/go",
-    env={**os.environ, "STORE_GEN_FIXTURE": "1"},
+    env={**os.environ, "STORE_GEN_FIXTURE": "1",
+         "STORE_FIXTURE_SUMMARY": REL_SUMMARY,
+         "STORE_FIXTURE_DESCRIPTION": REL_DESCRIPTION,
+         "STORE_FIXTURE_CATEGORY": REL_CATEGORY},
     capture_output=True, text=True)
 if gen.returncode != 0:
     sys.exit("release fixture generation failed:\n" + gen.stdout[-2000:] + gen.stderr[-2000:])
@@ -687,11 +727,11 @@ with open(os.path.join(flintd_store, "streams", rel_stream_id + ".jsonl"), "w") 
     f.write(rel_change_line + "\n")
 shutil.copy(os.path.join("image", "apps.txt"), os.path.join(store_share, "APPS.TXT"))
 
-def write_drop(drop, rel_text, elf):
-    d = os.path.join(store_share, drop, "rel")
+def write_drop(drop, rel_text, elf, sname="rel", bin_name="GOHELLO.ELF"):
+    d = os.path.join(store_share, drop, sname)
     os.makedirs(d, exist_ok=True)
     open(os.path.join(d, "release.go"), "w", encoding="utf-8").write(rel_text)
-    open(os.path.join(d, "GOHELLO.ELF"), "wb").write(elf)
+    open(os.path.join(d, bin_name), "wb").write(elf)
 
 write_drop("DROP", release_go, elf_bytes)
 
@@ -730,6 +770,9 @@ def gen_release_fixture(env):
                     g.stdout[-2000:], g.stderr[-2000:]))
 
 
+# The v2 manifest keeps v1's catalog consts (the parented-Change diff
+# reconstructs the parent release.go with the same optional set — see
+# fixture_gen_test.go's env-knob comment).
 gen_release_fixture({
     "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-v2.elf"),
     "STORE_FIXTURE_VERSION": "2.0.0",
@@ -738,8 +781,51 @@ gen_release_fixture({
     "STORE_FIXTURE_PREV_VERSION": "1.0.0",
     "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c002",
     "STORE_FIXTURE_TS": "1760000100000",
+    "STORE_FIXTURE_SUMMARY": REL_SUMMARY,
+    "STORE_FIXTURE_DESCRIPTION": REL_DESCRIPTION,
+    "STORE_FIXTURE_CATEGORY": REL_CATEGORY,
     "STORE_FIXTURE_DIR": fixture_dir,
     "STORE_FIXTURE_TAG": "v2",
+})
+
+# M110b (#2404): the two-publisher catalog. A second publisher key signs
+# stream `rel2` — BOUNCE carries every ADR 0055 catalog field including a
+# ReleaseIconSHA256 pin naming the <stream>/icon channel blob (D7) — and
+# stream `legacy` ships a bare four-const manifest (D4 backward-compat:
+# a v1-format release still installs).
+ICON_BLOB = (b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'>"
+             b"<rect width='8' height='8' fill='#36c'/>"
+             b"<circle cx='4' cy='4' r='3' fill='#fff'/></svg>\n")
+icon_sha = hashlib.sha256(ICON_BLOB).hexdigest()
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.abspath(gohello),
+    "STORE_FIXTURE_NAME": "BOUNCE",
+    "STORE_FIXTURE_VERSION": "1.4.0",
+    "STORE_FIXTURE_ROW": "BOUNCE.ELF | Bounce | g | dock=false",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000b011",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c010",
+    "STORE_FIXTURE_TS": "1760000400000",
+    "STORE_FIXTURE_MSG": "bounce release",
+    "STORE_FIXTURE_SEED_HEX": "b3" * 32,
+    "STORE_FIXTURE_SUMMARY": "A bouncing ball demo",
+    "STORE_FIXTURE_DESCRIPTION": ("Bounce renders a ball on the desktop.\n"
+                                  "Shipped by a second publisher."),
+    "STORE_FIXTURE_CATEGORY": "game",
+    "STORE_FIXTURE_ICON_SHA256": icon_sha,
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "rel2",
+})
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.abspath(gohello),
+    "STORE_FIXTURE_NAME": "LEGACY",
+    "STORE_FIXTURE_VERSION": "0.9.0",
+    "STORE_FIXTURE_ROW": "LEGACY.ELF | Legacy | g | dock=false",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000b012",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c011",
+    "STORE_FIXTURE_TS": "1760000500000",
+    "STORE_FIXTURE_MSG": "legacy four-const release",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "legacy",
 })
 gen_release_fixture({
     "STORE_FIXTURE_EMPTY": "1",
@@ -779,6 +865,12 @@ def load_gen_change(tag):
 
 badkey_ch, badkey_line = load_gen_change("badkey")
 revkey_ch, revkey_line = load_gen_change("revkey")
+rel2_ch, rel2_line = load_gen_change("rel2")
+legacy_ch, legacy_line = load_gen_change("legacy")
+rel2_go = open(os.path.join(fixture_dir, "release-rel2.go"),
+               "r", encoding="utf-8").read()
+legacy_go = open(os.path.join(fixture_dir, "release-legacy.go"),
+                 "r", encoding="utf-8").read()
 
 # flintd serves the two negative-key streams — remote-only, so `store ls`
 # and `store install` must clone them over the wire and the keyring gate
@@ -794,11 +886,27 @@ for ch, line, sname in ((badkey_ch, badkey_line, "badkey"),
              "created": ch["ts"], "forked_from": None},
             separators=(",", ":")) + "\n")
 
-# The consumer keyring keeps the release author pinned and gains a
-# revoked= row for revkey's author; badkey's author stays absent
-# (key_unknown).
+# M110b: flintd also serves the second publisher's `rel2` and the legacy
+# `legacy` stream; the consumer replica is staged verbatim like `rel`'s
+# (the wire `read` cannot carry a release-sized Change — spec header).
+for ch, line, sname in ((rel2_ch, rel2_line, "rel2"),
+                        (legacy_ch, legacy_line, "legacy")):
+    for store_root in (flintd_store, os.path.join(store_share, "FLINT")):
+        with open(os.path.join(store_root, "streams", ch["stream"] + ".jsonl"), "w") as f:
+            f.write(line + "\n")
+        with open(os.path.join(store_root, "streams", ch["stream"] + ".json"), "w") as f:
+            f.write(json.dumps(
+                {"id": ch["stream"], "name": sname, "head": ch["id"],
+                 "created": ch["ts"], "forked_from": None},
+                separators=(",", ":")) + "\n")
+
+# The consumer keyring keeps the release author pinned, gains the second
+# publisher (rel2's author, labeled acme — ADR 0055 D5's trusted display
+# name), and a revoked= row for revkey's author; badkey's author stays
+# absent (key_unknown).
 with open(os.path.join(store_share, "FLINT", "TRUSTED.TXT"),
           "a", encoding="utf-8") as f:
+    f.write("key=" + rel2_ch["author"] + " name=acme\n")
     f.write("revoked=" + revkey_ch["author"] + "\n")
 
 # The v2 replica advance — run 15's script lands it by file copy (the
@@ -817,6 +925,26 @@ with open(os.path.join(store_share, "FLINTJ", "rel-v2.json"),
 write_drop("DROPV2", release_v2_go, elf_v2)
 write_drop("DROPV2BAD", release_v2_go, elf_v2 + b"\x00")
 write_drop("DROPV2SIG", release_v2_tampered, elf_v2)
+
+# M110b drops: the second publisher's stream + icon blob (the D7 member
+# `<stream>/icon` — pinned, fetched on demand, never by install/ls), the
+# legacy four-const stream, and a drop whose rel release.go carries a
+# tampered ReleaseDescription (the atom hash moves off the signed set ->
+# release_mismatch).
+write_drop("DROP", rel2_go, elf_bytes, sname="rel2", bin_name="BOUNCE.ELF")
+open(os.path.join(store_share, "DROP", "rel2", "icon"), "wb").write(ICON_BLOB)
+write_drop("DROP", legacy_go, elf_bytes, sname="legacy", bin_name="LEGACY.ELF")
+desc_tampered = release_v2_go.replace("smallest signed release",
+                                      "smallest unsigned release")
+assert desc_tampered != release_v2_go
+# DROPBADDESC is the full DROP with only rel's release.go tampered, so a
+# catalog `ls` over it refuses rel's entry (release_mismatch) at ANY
+# replica head — the v1-vs-v2 mismatch the DROP copy would show depends
+# on run 15's record advance landing on the share, which the virtio-fs
+# window has lost once (observed: run 18's ls silently filtered rel).
+shutil.copytree(os.path.join(store_share, "DROP"),
+                os.path.join(store_share, "DROPBADDESC"))
+write_drop("DROPBADDESC", desc_tampered, elf_v2)
 
 flintj_m101e = {
     # 15: advance the replica to v2, update, exec the new bytes, roll back,
@@ -854,6 +982,33 @@ flintj_m101e = {
         "STORE.ELF install badkey --remote=10.0.0.2:4749 --channel=/host/DROP\n"
         "STORE.ELF install revkey --remote=10.0.0.2:4749 --channel=/host/DROP\n"
         "echo m101e: negatives done\n"
+    ),
+    # 18 (M110b): the signed catalog — the --category listing plus the
+    # two-publisher detail card. Six back-to-back store verbs in one boot
+    # lost execs to the task-pool reclamation race (observed `newosproc`
+    # + `wait failed`), so the catalog legs split across boots like the
+    # M101a sync runs did. NOTE: do NOT pace with gosh `sleep` — bSleep
+    # parks 100·n ticks (~100 s per unit, a pre-existing quirk in
+    # user/go/shlib/builtins.go) and two `sleep 2` lines consumed an
+    # entire 300 s run budget (observed).
+    "18.SH": (
+        "STORE.ELF ls --remote=10.0.0.2:4749 --channel=/host/DROP --category=game\n"
+        "STORE.ELF info rel2 --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+        "echo m110b: catalog ls done\n"
+    ),
+    # 19 (M110b): the --search listing, the tampered-description refusal,
+    # and the legacy four-const install, on a fresh boot so the run-18
+    # sockets can't starve the install's execs. The ls runs over
+    # DROPBADDESC: the tampered v2 manifest mismatches the signed atom
+    # set at whatever head the replica stands at, so rel's
+    # catalog-invalid marker does not depend on run 15's record advance
+    # surviving the share.
+    "19.SH": (
+        "STORE.ELF ls --remote=10.0.0.2:4749 --channel=/host/DROPBADDESC --search=bounce\n"
+        "STORE.ELF info rel --remote=10.0.0.2:4749 --channel=/host/DROPBADDESC\n"
+        "STORE.ELF install legacy --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+        "LEGACY.ELF\n"
+        "echo m110b: catalog legs done\n"
     ),
 }
 for sname, sbody in flintj_m101e.items():
@@ -1313,10 +1468,20 @@ vgate_run 14 -- \
     --script-expect-tail 3 --timeout 300
 
 vgate_assert 14 serial-contains 'store: stream main no-release'
-vgate_assert 14 serial-contains 'store: stream rel release'
 vgate_assert 14 serial-contains 'store: stream badkey sync-failed'
 vgate_assert 14 serial-contains 'store: stream revkey sync-failed'
-vgate_assert 14 serial-contains 'store: ls ok'
+# M110b: `store ls` renders the signed catalog — every release stream's
+# manifest consts plus the derived publisher fingerprint (the head
+# Change's author key, labeled from TRUSTED.TXT). Two pinned publishers
+# and one legacy four-const stream.
+vgate_assert 14 serial-contains 'store: stream rel release name=GOHELLO version=1.0.0 category=demo'
+vgate_assert 14 serial-contains 'store: stream rel2 release name=BOUNCE version=1.4.0 category=game'
+vgate_assert 14 serial-contains 'store: stream legacy release name=LEGACY version=0.9.0 category=-'
+vgate_assert 14 serial-contains 'publisher_state=trusted summary=-'
+vgate_assert 14 serial-contains 'publisher_name=sync-seed publisher_state=trusted'
+vgate_assert 14 serial-contains 'publisher_name=acme publisher_state=trusted'
+vgate_assert 14 serial-contains 'summary=Go Hello greets VirelaiOS'
+vgate_assert 14 serial-contains 'store: ls ok entries=3'
 vgate_assert 14 serial-contains 'sig: verified'
 vgate_assert 14 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
 vgate_assert 14 serial-contains 'virelai-go OK'
@@ -1520,4 +1685,116 @@ for sid in ("0199de2d-dc00-7000-8000-00000000e010",
 if os.path.exists(os.path.join(share, "STORECAP.OUT")):
     sys.exit("store left its FLINT capture scratch file behind")
 print("run-17 remove + all four refused installs left zero partial state")
+PY
+
+# ---- 18: M110b (#2404) signed catalog — filtered listings + the ------
+# ---- two-publisher detail card --------------------------------------
+vgate_run 18 -- \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap18.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-18.txt' \
+    --script-expect 'm110b: catalog ls done' \
+    --script-expect-tail 3 --timeout 300
+
+# The filtered listing renders exactly the one matching entry; the
+# filtered-out release lines pin the behavior.
+vgate_assert 18 serial-count 'store: ls ok entries=1' 1
+vgate_assert 18 serial-count 'store: stream rel2 release name=BOUNCE version=1.4.0 category=game' 1
+# `rel` filters out cleanly — whether its catalog-invalid marker prints
+# here depends on which head the replica's record read back (the share
+# has dropped that write once); run 19 asserts the marker deterministically
+# against the tampered drop.
+vgate_assert 18 serial-absent 'store: stream rel release'
+vgate_assert 18 serial-absent 'store: stream legacy release'
+vgate_assert 18 serial-contains 'store: stream main no-release'
+vgate_assert 18 serial-count 'store: stream badkey sync-failed' 1
+vgate_assert 18 serial-count 'store: stream revkey sync-failed' 1
+vgate_assert 18 serial-contains 'store: name BOUNCE'
+vgate_assert 18 serial-contains 'store: category game'
+vgate_assert 18 serial-contains 'store: summary A bouncing ball demo'
+vgate_assert 18 serial-contains 'publisher_name=acme publisher_state=trusted'
+vgate_assert 18 serial-contains 'store: head 0199de2d-dc00-7000-8000-00000000c010'
+vgate_assert 18 serial-contains 'store: installed no'
+vgate_assert 18 serial-contains 'store: row BOUNCE.ELF | Bounce | g | dock=false'
+vgate_assert 18 serial-contains 'store:   Bounce renders a ball on the desktop.'
+vgate_assert 18 serial-contains 'store:   Shipped by a second publisher.'
+vgate_assert 18 serial-contains 'store: info ok'
+vgate_assert 18 serial-absent 'store: refuse'
+vgate_assert 18 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 18 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 18 serial-absent '[EXC] parking:'
+vgate_assert 18 python <<'PY'
+import hashlib, json, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+# The sha256 field on the rel2 card pins the real delivered ELF, and the
+# icon_sha256 field pins the staged <stream>/icon blob (ADR 0055 D7).
+elf_sha = hashlib.sha256(open(os.path.join(".build", "go", "GOHELLO.ELF"), "rb").read()).hexdigest()
+icon_sha = hashlib.sha256(open(os.path.join(share, "DROP", "rel2", "icon"), "rb").read()).hexdigest()
+if "store: sha256 " + elf_sha not in ser:
+    sys.exit("rel2 card missing sha256=" + elf_sha)
+if "store: icon_sha256 " + icon_sha not in ser:
+    sys.exit("rel2 card missing icon_sha256=" + icon_sha)
+rel2 = json.loads(open(os.path.join(run, "fixtures", "release-rel2-stream.jsonl"),
+                      "r", encoding="utf-8").read())
+if ("store: publisher " + rel2["author"] +
+        " publisher_name=acme publisher_state=trusted") not in ser:
+    sys.exit("derived publisher fingerprint missing or mislabeled for rel2")
+print("run-18 catalog render verified: filters + two-publisher card")
+PY
+
+# ---- 19: M110b (#2404) — tampered-description refusal + legacy -------
+# ---- four-const install ---------------------------------------------
+vgate_run 19 -- \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap19.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-19.txt' \
+    --script-expect 'm110b: catalog legs done' \
+    --script-expect-tail 3 --timeout 300
+
+# The --search leg repeats the filtered-catalog behavior: exactly one
+# match, same invalid/absent markers for the rest.
+vgate_assert 19 serial-count 'store: ls ok entries=1' 1
+vgate_assert 19 serial-count 'store: stream rel2 release name=BOUNCE version=1.4.0 category=game' 1
+vgate_assert 19 serial-absent 'store: stream rel release'
+vgate_assert 19 serial-absent 'store: stream legacy release'
+vgate_assert 19 serial-count 'store: stream rel catalog-invalid release_mismatch' 1
+vgate_assert 19 serial-count 'store: stream badkey sync-failed' 1
+vgate_assert 19 serial-count 'store: stream revkey sync-failed' 1
+vgate_assert 19 serial-count 'store: refuse release_mismatch' 1
+vgate_assert 19 serial-contains 'store: install ok LEGACY.ELF version=0.9.0'
+vgate_assert 19 serial-contains 'virelai-go OK'
+vgate_assert 19 serial-absent 'store: refuse summary_invalid'
+vgate_assert 19 serial-absent 'store: refuse description_invalid'
+vgate_assert 19 serial-absent 'store: refuse category_unknown'
+vgate_assert 19 serial-absent 'store: refuse sync_failed'
+vgate_assert 19 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 19 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 19 serial-absent '[EXC] parking:'
+vgate_assert 19 python <<'PY'
+import os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+
+# The legacy install landed tracked bytes: ELF + manifest row + state.
+legacy = open(os.path.join(share, "LEGACY.ELF"), "rb").read()
+if legacy != open(os.path.join(".build", "go", "GOHELLO.ELF"), "rb").read():
+    sys.exit("LEGACY.ELF bytes differ from the signed ELF")
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if "LEGACY.ELF | Legacy | g | dock=false\n" not in apps:
+    sys.exit("LEGACY row missing from APPS.TXT: %r" % apps)
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "name=LEGACY.ELF stream=legacy head=0199de2d-dc00-7000-8000-00000000c011" not in state:
+    sys.exit("STORE.TXT missing legacy entry: %r" % state)
+if "GOHELLO" in state:
+    sys.exit("GOHELLO crept back into STORE.TXT")
+print("run-19 verified: tampered description refused, legacy release installed")
 PY

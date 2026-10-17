@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"virelai/flint/parser"
 )
@@ -67,12 +68,19 @@ func foldReleaseOps(changes []Change) map[atomKey]string {
 	return out
 }
 
-// release holds the four authenticated consts of a verified release.go.
+// release holds the authenticated consts of a verified release.go: the
+// four required ones plus the optional ADR 0055 catalog fields when the
+// publisher declared them ("" means the const is absent).
 type release struct {
 	Name        string
 	Version     string
 	ELFSHA256   string
 	ManifestRow string
+
+	Summary     string
+	Description string
+	Category    string
+	IconSHA256  string
 }
 
 // requiredConsts are the four const declarations a release.go must carry
@@ -83,6 +91,25 @@ var requiredConsts = []string{
 	"ReleaseVersion",
 	"ReleaseELFSHA256",
 	"ReleaseManifestRow",
+}
+
+// optionalConsts are the ADR 0055 D3 signed catalog consts a release.go
+// may carry beside the required four. Every one is an authenticated atom
+// — a catalog never displays a byte the publisher's key did not sign.
+// Consts outside required+optional are signed extras a reader ignores
+// (ADR 0055 D4).
+var optionalConsts = []string{
+	"ReleaseSummary",
+	"ReleaseDescription",
+	"ReleaseCategory",
+	"ReleaseIconSHA256",
+}
+
+// releaseCategories is the closed category vocabulary (ADR 0055 D3.1) —
+// adding or renaming a word is an ADR amendment, not a code edit.
+var releaseCategories = map[string]bool{
+	"app": true, "demo": true, "dev": true, "doc": true, "game": true,
+	"media": true, "net": true, "system": true, "tool": true,
 }
 
 // verifyRelease parses the fetched release.go into FLINT atoms and
@@ -171,6 +198,15 @@ func parseRelease(src []byte) (*release, error) {
 						vals[want] = v
 					}
 				}
+				for _, want := range optionalConsts {
+					if n.Name == want {
+						v, err := strconv.Unquote(lit.Value)
+						if err != nil {
+							return nil, refuse("release_malformed", n.Name)
+						}
+						vals[want] = v
+					}
+				}
 			}
 		}
 	}
@@ -188,7 +224,67 @@ func parseRelease(src []byte) (*release, error) {
 	if err := r.validate(); err != nil {
 		return nil, err
 	}
+	// A PRESENT catalog const is validated to its bound — a signed field
+	// outside its grammar is a malformed manifest refused by name, never
+	// a value to sanitize (ADR 0055 D3). An absent const stays "".
+	if v, ok := vals["ReleaseSummary"]; ok {
+		if !validSummary(v) {
+			return nil, refuse("summary_invalid", "ReleaseSummary")
+		}
+		r.Summary = v
+	}
+	if v, ok := vals["ReleaseDescription"]; ok {
+		if !validDescription(v) {
+			return nil, refuse("description_invalid", "ReleaseDescription")
+		}
+		r.Description = v
+	}
+	if v, ok := vals["ReleaseCategory"]; ok {
+		if !releaseCategories[v] {
+			return nil, refuse("category_unknown", v)
+		}
+		r.Category = v
+	}
+	if v, ok := vals["ReleaseIconSHA256"]; ok {
+		if !isHex64(v) {
+			return nil, refuse("hash_invalid", "ReleaseIconSHA256")
+		}
+		r.IconSHA256 = v
+	}
 	return r, nil
+}
+
+// validSummary enforces the ReleaseSummary grammar (ADR 0055 D3): one
+// line of 1-128 bytes of valid UTF-8 with no C0/C1/DEL control
+// characters — "one line" falls out of the control-character ban.
+func validSummary(s string) bool {
+	if len(s) < 1 || len(s) > 128 || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return false
+		}
+	}
+	return true
+}
+
+// validDescription enforces the ReleaseDescription grammar (ADR 0055
+// D3): 1-2048 bytes of valid UTF-8 where '\n' is the only permitted
+// control character.
+func validDescription(s string) bool {
+	if len(s) < 1 || len(s) > 2048 || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r == '\n' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return false
+		}
+	}
+	return true
 }
 
 // validate enforces the per-const grammar: the name is a bounded ELF

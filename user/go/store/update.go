@@ -132,7 +132,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 		return runErr(err)
 	}
 	consoleFn("store: verified " + ent.Stream)
-	signed, err := headReleaseOps(logBytes, rec.Head)
+	signed, _, err := headReleaseOps(logBytes, rec.Head)
 	if err != nil {
 		return runErr(err)
 	}
