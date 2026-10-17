@@ -172,6 +172,12 @@ Threads and their current state (the tracker is authoritative):
 | **M111 — Compute: the Metal GPU as a bounded compute device** | **Active** — a (ADR 0053, #2408) landed PR #2428; **b (#2409)**: slot-90 `sys_gpucomp` end to end — VIC1 probe, kernel broker, Metal GEMM/SOFTMAX/DEQUANT pipelines, Go SDK, `live-gpu3d` leg 09 (GEMM submit→fence→readback + refusal); **d (#2411)**: GOTOP gpu tab — real busy/queued/last-kernel/submit-ledger counters through the handle-free STATS op (`go-top` leg 06); c/e open (#2410, #2412). | #2384; cards #2408–#2412 |
 | **M112 — Self-host the userspace: the guest builds, tests, and releases the fleet** | **Active** — sub-cards filed (#2413–#2416), lanes a→{b∥c}→d; fleet-closure card claimed. | #2385; cards #2413–#2416 |
 | **M113 — Trust depth: measured boot, per-app network policy, syscall profiles** | **Active** — a (#2417, ADR 0054) landed PR #2427; b (#2418): `measure.zig` + verified-boot chain landed PR #2429; c (#2419) landed PR #2442; d (#2420): signed `ReleaseCaps` + GOSET grants consent pane in PR; e/f open (#2421, #2422). | #2386; cards #2417–#2422 |
+| **M114 — The host app becomes a Mac app: menus, capture, inspector, media** | **Active** — sub-cards filed (#2454–#2459), lanes a→{b∥c∥d∥e}→f. | #2447; cards #2454–#2459 |
+| **M115 — The machine keeps itself: profiles, guest-driven suspend, snapshots, self-update** | **Active** — sub-cards filed (#2460–#2466), lanes a→{b∥c}→{d∥e}→f→g. | #2448; cards #2460–#2466 |
+| **M116 — Trust defaults: the grant table enforces** | **Active** — sub-cards filed (#2467–#2472), lanes a→b→{c∥d∥e}→f; a consumes M113f audit data. | #2449; cards #2467–#2472 |
+| **M117 — The network grows up: IPv6 and a real LAN** | **Active** — sub-cards filed (#2473–#2478), lanes a→b→c, d ∥ a, e→f after d. | #2450; cards #2473–#2478 |
+| **M118 — Sound goes both ways: bounded audio capture** | **Active** — sub-cards filed (#2479–#2484), lanes a→b→c→{d∥e}→f. | #2451; cards #2479–#2484 |
+| **M119 — Performance is a contract: benchmarks as gates** | **Active** — sub-cards filed (#2485–#2490), lanes a→b, c∥d∥e independent, f on all. | #2452; cards #2485–#2490 |
 
 
 ## Gate status
