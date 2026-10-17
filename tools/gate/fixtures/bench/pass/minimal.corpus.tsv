@@ -1,0 +1,4 @@
+# minimal valid corpus fixture for bench-check.py --selftest
+id	leg	op	shape	metric	unit	instrument
+demo-lat	demo-leg	a demo op	a demo shape	demo: metric=	us	demo instrument
+demo-rate	demo-leg	a second op	same shape	demo: rate=	KiB/s	demo instrument

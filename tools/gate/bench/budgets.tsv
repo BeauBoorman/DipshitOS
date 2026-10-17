@@ -1,0 +1,38 @@
+# budgets.tsv -- M119a (#2485): the budget table. One row per corpus id
+# (join corpus.tsv on `id`). A budget is a CONTRACT: the number the bench
+# fails past, derived from a MEASURED baseline by the named margin --
+# `budget = baseline x margin`, checked by tools/gate/bench-check.py.
+# A row with no baseline, no margin, or no citation does not ship.
+#
+# Columns:
+#   id        corpus row id (must exist in corpus.tsv)
+#   cmp       `<=` (upper bound: latency, wall, buffered bytes) or
+#             `>=` (lower bound: throughput)
+#   budget    the contract number in the row's unit
+#   baseline  the MEASURED value the budget is pinned from. Where the
+#             instrument's resolution bounds the observation (e.g. a value
+#             observed below one tick), the baseline is the resolution
+#             floor, stated on the issue with the raw observation.
+#   margin    the named headroom: `x<F>`, `+|-<P>%`, or `+|-<N>` (in unit)
+#   ref       where the baseline run is recorded: `#<issue>`, `issue:<n>`,
+#             or `gate:<id>` (+ optional `; <note>`)
+#
+# Baselines measured 2026-10-17 on the development host (Apple silicon,
+# macOS 27.2, this branch's tree) and recorded on issue #2485. Two rows
+# sit at their instrument's resolution floor: `sysinfo` uptime printed
+# ticks=0 (the whole boot fits in the first 1 Hz tick; the runner's own
+# marker wait observed ~1.0 s wall to 'kernel terminal state'), and the
+# GOSH `time` builtin printed real=0.00s for both commands (centisecond
+# resolution) -- both baselines are the floor, stated there.
+#
+id	cmp	budget	baseline	margin	ref
+boot-shell	<=	4	1	x4	#2485
+gosh-cmd-ls	<=	0.05	0.01	+400%	#2485
+gosh-cmd-echo	<=	0.05	0.01	+400%	#2485
+hf-read	>=	4221	8442	-50%	#2485
+pcm-drain	<=	8192	4096	x2	#2485
+wm-present-cadence	<=	2554	1277	x2	#2485
+wm-present-latency	<=	1532847	1021898	+50%	#2485
+smp-scale-c1	<=	135311026	67655513	x2	#2485
+smp-scale-c2	<=	52699882	26349941	x2	#2485
+smp-scale-c4	<=	66754980	33377490	x2	#2485
