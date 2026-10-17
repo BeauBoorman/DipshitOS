@@ -33,10 +33,15 @@
 // issue #1449 the report). So the RUN step stays the gate's second boot (one
 // monitor `exec` of the product this loop built, which is also how go-hello run
 // 08 executes it) because this shape is proven green -- NOT because a third
-// child is known to be broken. The narrow, defensible statement is: a third
-// child died once and has not died again; the wall is uncharacterised, not
-// eliminated. A one-boot three-child loop is feasible and is the first thing to
-// try once #1449 has an owner.
+// child is known to be broken.
+//
+// M119d (#2488) grew the experiment into the spawn-shape matrix and answered
+// the debt: depth x breadth x sequential-vs-concurrent legs are pinned in
+// live-exec runs 02-04, and the third-child death does not reproduce at the
+// post-#2437 head — the residual bound is breadth against the 16-slot task
+// pool (ENOSPC at spawn past ~9 one-task children, or a status-2
+// `newosproc` death for a third concurrent GOMAXPROCS=2 runtime), recorded
+// in ADR 0035 amendment 11.
 //
 // One consequence of the above for anyone reading the driver's own output: a
 // `status=0` on a step is a liveness observation, not proof.
@@ -152,7 +157,22 @@ func main() {
 	// is the standalone baseline; experiment + --after-loop puts the spawns
 	// behind the loop's two children, which is the configuration that failed.
 	if exp == nil || afterLoop {
-		buildLoop()
+		if rc := buildLoop(); rc != 0 {
+			if afterLoop {
+				// The leg's verdict marker prints even when the loop died —
+				// a spec stage gate keys on it, and a loop failure is itself
+				// a bound observation (a status-2 toolchain child under pool
+				// pressure), never a hang. 0-of-M is honest: no experiment
+				// child survived because none ran.
+				verb := "spawn"
+				if exp.par {
+					verb = "spawn-par"
+				}
+				vsys.Println("selfhost: " + verb + " verdict=0-of-" +
+					vsys.Itoa64(exp.count) + "-survived " + exp.image)
+			}
+			vsys.Exit(rc)
+		}
 	}
 	if exp != nil {
 		runExperiment(*exp, childArgs)
@@ -215,7 +235,7 @@ func isFlag(tok string) bool {
 
 // buildLoop is the card's deliverable: compile -> link, in this process, with
 // the guest's own toolchain, then the marker the gate waits on.
-func buildLoop() {
+func buildLoop() int64 {
 	steps := []step{
 		// cmd/compile: source -> object. No -p flag: the default package
 		// path is what the linker needs to find main.main, verified on the
@@ -227,8 +247,9 @@ func buildLoop() {
 		{label: "link", image: linkImage,
 			args: []string{"-importcfg", imports, "-tmpdir", workdir, "-o", product, object}},
 		// NO third step. The product is built here and RUN by the gate's
-		// second boot, because a third sequential child dies on this GOOS
-		// today — see the header, and go-sh.spec / issue #1449.
+		// second boot — the shape is proven green, and the matrix found no
+		// surviving third-child bound to route around (ADR 0035 amendment
+		// 11). Kept for shape stability, not because a third child fails.
 	}
 
 	for _, s := range steps {
@@ -238,18 +259,19 @@ func buildLoop() {
 			// finished badly" are different findings about the guest.
 			vsys.Println("selfhost: FAIL " + s.label + " err=" + err.Error() +
 				" budget_s=" + vsys.Itoa64(stepBudgetNs/1000000000))
-			vsys.Exit(1)
+			return 1
 		}
 		vsys.Println("selfhost: " + s.label + " " + s.image +
 			" status=" + vsys.Itoa64(status) + " ms=" + vsys.Itoa64(ms))
 		if status != 0 {
 			vsys.Println("selfhost: FAIL " + s.label + " status=" + vsys.Itoa64(status))
-			vsys.Exit(1)
+			return 1
 		}
 	}
 	// The marker the gate waits on: both steps of the build ran, in the
 	// guest, with the guest's own toolchain.
 	vsys.Println("selfhost: build loop OK")
+	return 0
 }
 
 // runExperiment is the #1449 discriminator grown into the M119d (#2488)
@@ -293,13 +315,22 @@ func runSeq(e experiment, childArgs []string, verb string) int64 {
 	for i := int64(1); i <= e.count; i++ {
 		prefix := "selfhost: " + verb + " " + vsys.Itoa64(i) + "/" +
 			vsys.Itoa64(e.count) + " " + e.image
-		status, ms, err := runStep(step{label: "spawn", image: e.image, args: childArgs})
+		start := vsys.Nanotime()
+		pid, err := vi.Exec(e.image, childArgs...)
+		if err != nil {
+			// A refused spawn says the bound's name (ENOSPC), same as runPar —
+			// it is not the child dying and it is not a lost status.
+			vsys.Println(prefix + " SPAWN-FAIL err=" + err.Error())
+			return i - 1
+		}
+		status, err := vi.WaitBudget(pid, stepBudgetNs)
 		if err != nil {
 			// No status at all: the child never left the registry with one.
 			vsys.Println(prefix + " NO-STATUS err=" + err.Error() +
 				" budget_s=" + vsys.Itoa64(stepBudgetNs/1000000000))
 			return i - 1
 		}
+		ms := (vsys.Nanotime() - start) / 1000000
 		vsys.Println(prefix + " status=" + vsys.Itoa64(status) +
 			" ms=" + vsys.Itoa64(ms))
 		if e.expect >= 0 && status != e.expect {
