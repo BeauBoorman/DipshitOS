@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"virelai/flint/parser"
+	"virelai/vi"
 )
 
 // releaseFile is the conventional file a release stream tracks.
@@ -70,7 +71,9 @@ func foldReleaseOps(changes []Change) map[atomKey]string {
 
 // release holds the authenticated consts of a verified release.go: the
 // four required ones plus the optional ADR 0055 catalog fields when the
-// publisher declared them ("" means the const is absent).
+// publisher declared them ("" means the const is absent). Caps carries
+// ADR 0054 D10's ReleaseCaps — the signed word request STORE proposes
+// and GOSET consent lands (nil = the release declares nothing).
 type release struct {
 	Name        string
 	Version     string
@@ -81,6 +84,7 @@ type release struct {
 	Description string
 	Category    string
 	IconSHA256  string
+	Caps        []string
 }
 
 // requiredConsts are the four const declarations a release.go must carry
@@ -93,16 +97,19 @@ var requiredConsts = []string{
 	"ReleaseManifestRow",
 }
 
-// optionalConsts are the ADR 0055 D3 signed catalog consts a release.go
-// may carry beside the required four. Every one is an authenticated atom
-// — a catalog never displays a byte the publisher's key did not sign.
-// Consts outside required+optional are signed extras a reader ignores
+// optionalConsts are the signed consts a release.go may carry beside
+// the required four: the ADR 0055 D3 catalog fields plus ADR 0054 D10's
+// ReleaseCaps — the grant-word request the publisher declares and the
+// user decides. Every one is an authenticated atom — a reader never
+// displays or proposes a byte the publisher's key did not sign. Consts
+// outside required+optional are signed extras a reader ignores
 // (ADR 0055 D4).
 var optionalConsts = []string{
 	"ReleaseSummary",
 	"ReleaseDescription",
 	"ReleaseCategory",
 	"ReleaseIconSHA256",
+	"ReleaseCaps",
 }
 
 // releaseCategories is the closed category vocabulary (ADR 0055 D3.1) —
@@ -251,7 +258,55 @@ func parseRelease(src []byte) (*release, error) {
 		}
 		r.IconSHA256 = v
 	}
+	if v, ok := vals["ReleaseCaps"]; ok {
+		caps, err := parseReleaseCaps(v)
+		if err != nil {
+			return nil, err
+		}
+		r.Caps = caps
+	}
 	return r, nil
+}
+
+// releaseCapsMax bounds the ReleaseCaps const (ADR 0054 D10, grammar
+// pinned with M113d): the whole nine-word vocabulary joined by commas is
+// 57 bytes, so 64 is far past honest and keeps a manifest from staging a
+// word-list soak.
+const releaseCapsMax = 64
+
+// parseReleaseCaps enforces the ReleaseCaps grammar — a comma-separated
+// list of distinct words drawn from the grant word vocabulary
+// (kernel/src/grant.zig's caps= vocabulary; ADR 0054 D9). A present
+// const must carry at least one word: an empty declaration is a manifest
+// bug, not a semantic. `caps_invalid` names a malformed shape (empty
+// const, empty element, duplicate, oversize); `caps_unknown` names a
+// word outside the closed vocabulary — like ADR 0055's category rule, an
+// unclassifiable word is refused rather than rendered.
+//
+// The returned list is canonicalized to vocabulary order so every
+// downstream surface (STORE.TXT, the proposed row line, the pane) shows
+// one byte-shape for one word set.
+func parseReleaseCaps(v string) ([]string, error) {
+	if v == "" || len(v) > releaseCapsMax {
+		return nil, refuse("caps_invalid", "ReleaseCaps")
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, w := range strings.Split(v, ",") {
+		if w == "" || seen[w] {
+			return nil, refuse("caps_invalid", w)
+		}
+		if !vi.GrantWordKnown(w) {
+			return nil, refuse("caps_unknown", w)
+		}
+		seen[w] = true
+	}
+	for _, w := range vi.GrantWordVocab {
+		if seen[w] {
+			out = append(out, w)
+		}
+	}
+	return out, nil
 }
 
 // validSummary enforces the ReleaseSummary grammar (ADR 0055 D3): one

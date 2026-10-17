@@ -187,7 +187,7 @@ func (v *servicesView) Save(receipts func()) error {
 }
 
 func (a *panel) openServices() {
-	a.showChords, a.showServices = false, true
+	a.showChords, a.showServices, a.showGrants = false, true, false
 	a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
 	a.services.Refresh()
 	a.serviceStatus()

@@ -574,11 +574,13 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 		if st.Head != nil {
 			if err := writeStateEntry(fs, &storeEntry{
 				Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+				Caps: strings.Join(rel.Caps, ","),
 			}); err != nil {
 				return runErr(err)
 			}
 		}
 		ConsoleFn("store: already installed " + bin + " version=" + rel.Version)
+		grantSync(bin, rel.ELFSHA256, rel.Caps)
 		return 0
 	}
 	elfPath := "/host/" + bin
@@ -625,6 +627,7 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 	if st.Head != nil {
 		if err := writeStateEntry(fs, &storeEntry{
 			Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+			Caps: strings.Join(rel.Caps, ","),
 		}); err != nil {
 			_ = fs.WriteFileSafe(appsPath, renderManifest(lines))
 			if !elfOrphan {
@@ -634,6 +637,7 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 		}
 	}
 	ConsoleFn("store: install ok " + bin + " version=" + rel.Version)
+	grantSync(bin, rel.ELFSHA256, rel.Caps)
 	return 0
 }
 
