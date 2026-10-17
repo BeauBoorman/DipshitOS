@@ -9,3 +9,6 @@ import "errors"
 func execAndWaitGuest(image string, args []string, capturePath string) (status int64, ms int64, captured []byte, err error) {
 	return -1, 0, nil, errors.New("gobuild: no guest exec off virelai")
 }
+
+// Host stub for the fleet smoke exec — same seam shape as execAndWaitGuest.
+func execSmokeGuest(name string) string { return "spawn=host" }

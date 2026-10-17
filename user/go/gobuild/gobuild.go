@@ -7,7 +7,9 @@
 // an in-process library call (ADR 0035 amendment 6).
 //
 // Package resolution order is pinned by the card: the program's own directory
-// first (import "x" -> <dir>/x/*.go), then the package table's denylist
+// first (import "x" -> <dir>/x/*.go), then the fleet's source root when the
+// build runs with Config.Root (import "x" -> <root>/x/*.go — M112a's staged
+// source tree), then the package table's denylist
 // (a policy refusal beats a stale archive), then the staged package archives
 // an importcfg manifest names (the /host/GOIMPORT.CFG + GPKG_*.a layout
 // tools/go/stage-selfhost.sh establishes from tools/go/pkg-table.txt). There

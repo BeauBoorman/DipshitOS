@@ -20,18 +20,28 @@ type Step struct {
 // Result is what a build attempt produced. ELF is set only on success;
 // Diags is the ERRORS.TXT payload; Steps is the per-child record (the
 // card's tombstone rule — a dead child is reported, never retried).
+// SrcFiles is the compiled source set (every local package's files, in
+// build order) — the fleet manifest hashes exactly this set.
 type Result struct {
-	ELF   string
-	Diags []Diag
-	Steps []Step
-	Order []string // local package build order
+	ELF      string
+	Diags    []Diag
+	Steps    []Step
+	Order    []string // local package build order
+	SrcFiles []string // compiled .go files across the local closure
 }
 
 // Config is one build's wiring. The zero images are the staged toolchain
 // names; Importcfg nil means the stage-selfhost manifest path and PkgDB nil
-// the staged package table beside it.
+// the staged package table beside it. Root is the fleet's second local
+// tier (empty = the M107a program-dir-only resolution).
+//
+// The kernel's streamed-ELF exec path counts the image name against
+// max_exec_args (exec.zig: `1 + args.len > max_exec_args`), so a build can
+// pass at most SEVEN child args — "-importcfg CFG -tmpdir WD -o OUT OBJ"
+// is exactly that bound; a further "-w" is an exec refusal, not a flag.
 type Config struct {
 	Dir          string   // program dir (share path, e.g. /host/WSP)
+	Root         string   // fleet source root (e.g. /host/SRC); empty = off
 	Out          string   // default: <Dir>/<basename>.ELF
 	Importcfg    []string // staged-archive manifests; default {"/host/GOIMPORT.CFG"}
 	PkgDB        []string // package tables; default {"/host/GOPKGS.TXT"}
@@ -104,11 +114,11 @@ func Build(cfg Config) Result {
 	table, tdiags := loadPkgTable(cfg.PkgDB)
 	res.Diags = append(res.Diags, tdiags...)
 
-	g := ImportGraph(cfg.Dir, archives, table)
+	g := ImportGraphR(cfg.Dir, cfg.Root, archives, table)
 	res.Diags = append(res.Diags, g.Diags...)
-	res.Diags = append(res.Diags, checkMangles(g)...)
 	for _, p := range g.Order {
 		res.Order = append(res.Order, p.Path)
+		res.SrcFiles = append(res.SrcFiles, p.Files...)
 	}
 	if len(res.Diags) > 0 {
 		writeErrors(cfg.WorkDir, res.Diags)
@@ -123,11 +133,10 @@ func Build(cfg Config) Result {
 		if !pkg.Local {
 			continue
 		}
-		stem := "P_" + manglePath(pkg.Path)
-		obj := archivePath(cfg.WorkDir, pkg.Path)
-		rsp := joinPath(cfg.WorkDir, stem+".rsp")
-		icfg := joinPath(cfg.WorkDir, stem+".cfg")
-		diagFile := joinPath(cfg.WorkDir, stem+".diag")
+		obj := archivePath(cfg.WorkDir, pkg.Stem)
+		rsp := joinPath(cfg.WorkDir, pkg.Stem+".rsp")
+		icfg := joinPath(cfg.WorkDir, pkg.Stem+".cfg")
+		diagFile := joinPath(cfg.WorkDir, pkg.Stem+".diag")
 		if err := writeFile(rsp, []byte(strings.Join(pkg.Files, "\n")+"\n")); err != nil {
 			return fail(Diag{Code: "io", File: rsp, Msg: err.Error()})
 		}
@@ -153,7 +162,7 @@ func Build(cfg Config) Result {
 		return fail(Diag{Code: "io", File: lcfg, Msg: err.Error()})
 	}
 	args := []string{"-importcfg", lcfg, "-tmpdir", cfg.WorkDir, "-o", cfg.Out,
-		archivePath(cfg.WorkDir, "main")}
+		archivePath(cfg.WorkDir, g.Main.Stem)}
 	if d, bad := checkArgv(cfg.LinkImage, args); bad {
 		return fail(d)
 	}
