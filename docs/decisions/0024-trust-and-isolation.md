@@ -230,6 +230,16 @@ and preserves the caller's. (e) There is no elevation syscall and no
 setter on the principal surface — class-A audits every implemented slot
 name and the gate table so a privilege setter cannot land unnoticed.
 
+**M113a note (2026-10-16, #2417 — ADR 0054):** the grant table holds this
+clause, it does not relax it. A measured-exec grant applies a *word mask*
+(a narrowing of which ADR 0007 slot groups a process may call), never a
+capability bit: a granted process remains `uid_user` + no caps, `exec`
+still preserves uid and caps, and there is still no syscall that raises
+either. The table's sources are kernel-owned and EL0-unwritable except
+through the seat-gated admin slot (D10 note), so "the only way to gain
+privilege is for the kernel itself to create the process" stays exactly
+true — grants only *remove* power relative to the baseline.
+
 ### D6. Remote auth: a fresh challenge, verified in userland by M47, gated by the kernel pump
 The Stage-1 shared secret is **replaced** (not layered) by a
 challenge-response handshake over the same M46 seam:
@@ -364,6 +374,20 @@ shape and never-logged contract are unchanged. The provisioned bindings:
 `net-hmac`/`net-ed25519` → `GOSH.ELF`, `ssh-user-ed25519` → `GOSSH.ELF`,
 `ssh-host-ed25519` → `GOSSHD.ELF`.
 
+**M113a note (2026-10-16, #2417 — ADR 0054):** `GRANTS.TXT` joins the
+secret class as the second member. Its contents are policy, not a secret —
+the class is taken for *integrity*: secret-class-by-construction is the
+existing mechanism that makes a share file unreachable through the file
+ABI, and the file ABI is the only write path an EL0 process has. The
+kernel registers it at load and at boot (the `ensure_secret_file`
+pattern), so `OWNERS.TXT` never has to name it, rename/delete stay
+denied, and the never-logged discipline is inherited. Posture is revealed
+through `sys_grant_query` (D10 note) — the `sys_secret_get` shape of a
+kernel-mediated read for a file-ABI-denied file. The M97g fourth-field
+app-binding shows name-only binding is forgeable; a grant row binds image
+*content* via `sha256`, which is strictly stronger, and a mismatch
+refuses `grant_stale` rather than silently degrading to the baseline.
+
 ### D9. Settings (non-secret) keep their existing contract
 `SETTINGS.TXT` and `kernel/src/settings.zig` are unchanged in format and
 semantics; they gain no secret keys. The "store" is one engine with two
@@ -401,6 +425,18 @@ cross-principal target needs `CAP_PROC_ADMIN` (else `EACCES`), the EL1h
 monitor has no pid and is never a target, and the monitor's
 `exec -u<uid>` admin spawn is the only EL0-unreachable path that can name
 a principal. `implemented_count` stays 72.
+
+**M113a note (2026-10-16, #2417 — ADR 0054):** two additive slots are
+reserved (numbers 88/89 at merge, per D10's append-only rule):
+`sys_grant_admin` — the ONE write path into `GRANTS.TXT`, gated like the
+M97g clipboard pair (the registered WM seat or `CAP_PROC_ADMIN`; never
+the app the row names) — and `sys_grant_query`, the caller's own posture
+read for the trust viewer. The `capability_gates` table also grows
+*word-gate* rows alongside cap rows: a slot's required grant word is
+checked through the same `gated()`-style lookup at dispatch, plus one
+sub-op check on slot 80's open-class ops (`0`/`8`/`10`) for `net`. In
+`audit` mode a failed word check receipts `audit:word_denied` and does
+not refuse; `enforce` is a separate owner decision.
 
 ### D11. Verification is two-class, and the boot default does not move
 - **Class A:** principal defaults and inheritance in `process.zig`; the
