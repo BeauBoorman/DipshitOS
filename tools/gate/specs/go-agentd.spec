@@ -1,4 +1,9 @@
 # go-agentd.spec -- M98 (#2145, ADR 0044) + M109b (#2398, ADR 0052)
+# + M109c (#2399, ADR 0052 D4): the audit trail. Every dispatch — allowed
+# and refused — plus each auth outcome and session open/close leaves a
+# MAC'd RCPT-<epoch>-<seq> file in AGENT/AUDIT/, and the python legs below
+# verify those receipts on the share against the pinned agent-hmac row
+# (the M108 lane shape: one record per file, bounded, signed).
 # class-B: the agent control channel. Run 01 is the full journey on a
 # live seat under virelai-agent/2: the Ed25519 handshake names agent
 # devin, all seven verbs green (fs depth, streamed gosh.run, the
@@ -118,12 +123,14 @@ agents_txt = (
     + "revoked=%s\n" % PUBS["bobby"]
 )
 open(os.path.join(share, "AGENTS.TXT"), "w").write(agents_txt)
-# The pinned-vector secret (ASCII 'a5' x 32) app-bound to AGENTD.ELF; the
-# image must be uid_system-owned with no non-owner write for the binding
-# to be served (ADR 0024 D5/M97g). agent-hmac stays the M109c receipt
-# key + the no-credential posture probe — the door key is Ed25519 now.
+# The pinned-vector secret (ASCII 'a5' x 32) app-bound to AGENTD.ELF and
+# GOTOP.ELF (ADR 0052 D4 — the allowlist widened when the viewer landed);
+# the image must be uid_system-owned with no non-owner write for the
+# binding to be served (ADR 0024 D5/M97g). agent-hmac is the M109c
+# receipt key + the no-credential posture probe — the door key is
+# Ed25519 now.
 KEY = "a5" * 32
-secrets = "#v1\n" + "agent-hmac\t1000\t" + KEY + "\tAGENTD.ELF\n"
+secrets = "#v1\n" + "agent-hmac\t1000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF\n"
 open(os.path.join(share, "SECRETS.TXT"), "w").write(secrets)
 open(os.path.join(share, "OWNERS.TXT"), "w").write(
     "#v1\nAGENTD.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n"
@@ -261,6 +268,50 @@ want = open(os.path.join(run, "agents-expect.txt"), "rb").read()
 if have != want:
     sys.exit("FAIL: AGENTS.TXT changed on the share")
 print("run-01 share hygiene ok")
+PY
+
+# M109c: the journey's dispatch receipts land in AGENT/AUDIT/ — allowed
+# and refused alike, every one MAC-verified under the agent-hmac row, and
+# no payload bytes (size+sha256_8 only; the cmd text exception is the
+# ADR's own). The lane caps at 64 files, so asserts are set-membership,
+# not counts.
+vgate_assert 01 python <<'PY'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir)
+               if n.startswith("RCPT-") and not n.endswith("~"))
+if not names:
+    sys.exit("FAIL: no receipts in AGENT/AUDIT: %r" % os.listdir(adir))
+if len(names) > 64:
+    sys.exit("FAIL: audit bound exceeded: %d files" % len(names))
+KEY = b"a5" * 32
+seen = set()
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read()
+    if b"agentctl-payload-sentinel-44" in body or b"agentctl-nested-payload-sentinel-52" in body:
+        sys.exit("FAIL: payload bytes reached receipt %s" % n)
+    lines = body.split(b"\n")
+    if len(lines) != 3 or lines[2] != b"":
+        sys.exit("FAIL: receipt %s is not two lines" % n)
+    want = hmac.new(KEY, lines[0], hashlib.sha256).hexdigest().encode()
+    if lines[1] != want:
+        sys.exit("FAIL: receipt %s MAC mismatch" % n)
+    r = json.loads(lines[0])
+    seen.add((r.get("agent"), r.get("verb"), r.get("result")))
+for need in (
+    ("devin", "fs.write", "ok"),
+    ("devin", "fs.read", "path_rejected"),
+    ("devin", "gosh.run", "timed_out"),
+):
+    if need not in seen:
+        sys.exit("FAIL: no %r receipt; saw %r" % (need, sorted(seen)))
+if not any(a == "devin" and v == "session" for a, v, _ in seen):
+    sys.exit("FAIL: no session-frame receipt; saw %r" % sorted(seen))
+if not any(r == "unknown_verb" for _, _, r in seen):
+    sys.exit("FAIL: no unknown_verb receipt; saw %r" % sorted(seen))
+print("run-01 audit ok: %d receipts, all MAC'd, refusals included" % len(names))
 PY
 
 # ---- 02: wrong signature -> auth_failed, damped relisten ----------------------
@@ -428,6 +479,40 @@ vgate_assert 09 output-contains 'NET-TCP-STREAM: probe exited status=0'
 vgate_assert 09 serial-absent '0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b'
 vgate_assert 09 serial-absent '[EXC] parking:'
 
+# M109c: the cap-absent refusals are receipted too — viewer's session on a
+# small share (no rotation) shows open, the allowed proc.list, the five
+# named cap_required results, and the close, all MAC-verified.
+vgate_assert 09 python <<'PY2'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir) if n.startswith("RCPT-"))
+if not names:
+    sys.exit("FAIL: no receipts in AGENT/AUDIT")
+KEY = b"a5" * 32
+seen = set()
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read().split(b"\n")
+    if len(body) != 3 or body[1] != hmac.new(KEY, body[0], hashlib.sha256).hexdigest().encode():
+        sys.exit("FAIL: receipt %s malformed or MAC-bad" % n)
+    r = json.loads(body[0])
+    seen.add((r.get("agent"), r.get("verb"), r.get("result")))
+for need in (
+    ("-", "session", "ok"),
+    ("viewer", "proc.list", "ok"),
+    ("viewer", "fs.read", "cap_required:file"),
+    ("viewer", "fs.write", "cap_required:file"),
+    ("viewer", "ui.windows", "cap_required:window"),
+    ("viewer", "ui.screenshot", "cap_required:window"),
+    ("viewer", "gosh.run", "cap_required:term"),
+    ("viewer", "session", "client_close"),
+):
+    if need not in seen:
+        sys.exit("FAIL: no %r receipt; saw %r" % (need, sorted(seen)))
+print("run-09 audit ok: %d receipts incl. the cap_required matrix" % len(names))
+PY2
+
 # ---- 10: a revoked credential refuses by name --------------------------------
 # bobby's row is listed AND revoked: the signature is valid under the
 # listed key and still refused agent_revoked — revocation wins over
@@ -455,6 +540,28 @@ vgate_assert 10 output-contains 'NET-TCP-STREAM: probe exited status=1'
 vgate_assert 10 serial-absent '0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c'
 vgate_assert 10 serial-absent '[EXC] parking:'
 
+# M109c: a refused credential is receipted by name — the claimed agent id
+# and its agent_revoked verdict are on the share, MAC-verified.
+vgate_assert 10 python <<'PY2'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir) if n.startswith("RCPT-"))
+KEY = b"a5" * 32
+seen = set()
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read().split(b"\n")
+    if len(body) != 3 or body[1] != hmac.new(KEY, body[0], hashlib.sha256).hexdigest().encode():
+        sys.exit("FAIL: receipt %s malformed or MAC-bad" % n)
+    r = json.loads(body[0])
+    ev = (r.get("args") or {}).get("event", "")
+    seen.add((r.get("agent"), r.get("verb"), ev, r.get("result")))
+if ("bobby", "session", "auth_fail", "agent_revoked") not in seen:
+    sys.exit("FAIL: no bobby agent_revoked receipt; saw %r" % sorted(seen))
+print("run-10 audit ok: revoked credential receipted by name")
+PY2
+
 # ---- 11: an unlisted id refuses by name ---------------------------------------
 vgate_run 11 -- \
     --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 \
@@ -478,6 +585,27 @@ vgate_assert 11 output-contains 'AGENTCTL: PASS unknown'
 vgate_assert 11 output-contains 'NET-TCP-STREAM: probe exited status=1'
 vgate_assert 11 serial-absent '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a'
 vgate_assert 11 serial-absent '[EXC] parking:'
+
+# M109c: an unlisted id is receipted by the name it claimed.
+vgate_assert 11 python <<'PY2'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir) if n.startswith("RCPT-"))
+KEY = b"a5" * 32
+seen = set()
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read().split(b"\n")
+    if len(body) != 3 or body[1] != hmac.new(KEY, body[0], hashlib.sha256).hexdigest().encode():
+        sys.exit("FAIL: receipt %s malformed or MAC-bad" % n)
+    r = json.loads(body[0])
+    ev = (r.get("args") or {}).get("event", "")
+    seen.add((r.get("agent"), r.get("verb"), ev, r.get("result")))
+if ("mallory", "session", "auth_fail", "agent_unknown") not in seen:
+    sys.exit("FAIL: no mallory agent_unknown receipt; saw %r" % sorted(seen))
+print("run-11 audit ok: unknown id receipted by claimed name")
+PY2
 
 # ---- 12: no AGENTS.TXT refuses no-keyring before any Listen -------------------
 vgate_run 12 -- \
