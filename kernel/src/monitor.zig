@@ -350,7 +350,7 @@ pub fn ensure_registry() []const Command {
             .{ .name = "mem", .help = "summarize the EFI memory map", .usage = "mem", .category = .memory_state, .handler = cmd_mem },
             .{ .name = "mbox", .dom = svclock.dom_bit(.ev), .help = "per-process IPC mailbox: pending messages and drain counters", .usage = "mbox [<pid>]", .category = .tasks_processes, .max_args = 1, .handler = cmd_mbox },
             .{ .name = "mount", .dom = svclock.dom_bit(.file), .help = "report the host-share file store (HF6: the FAT volumes are gone)", .usage = "mount", .category = .storage, .max_args = 1, .handler = cmd_mount },
-            .{ .name = "net", .dom = svclock.dom_bit(.net), .help = "virtio-net transport + RX + ARP + ICMP + UDP + DHCP + TCP + DNS: device DID, MAC, queues, feature bits, RX counters ('net recv' prints received frames; 'net ip <a.b.c.d>' sets the static IP; 'net arp [<a.b.c.d>]' shows/resolves the ARP table; 'net ping <a.b.c.d>' sends an ICMP echo request; 'net udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]' drives UDP; 'net dhcp' runs the bounded DHCP client one step per invocation; 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]' drives the bounded TCP client; 'net dns <hostname> [<server>]' resolves DNS A-records)", .usage = "net [recv|ip <addr>|arp [<addr>]|ping <addr>|udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]|dhcp|tcp [connect <addr> <port>|send <len>|recv|close|reset]|dns <host> [<server>]]", .category = .networking, .max_args = 5, .handler = cmd_net },
+            .{ .name = "net", .dom = svclock.dom_bit(.net), .help = "virtio-net transport + RX + ARP + ICMP + UDP + DHCP + TCP + DNS + IPv6/NDP: device DID, MAC, queues, feature bits, RX counters ('net recv' prints received frames; 'net ip <a.b.c.d>' sets the static IP; 'net arp [<a.b.c.d>]' shows/resolves the ARP table; 'net ping <a.b.c.d>' sends an ICMP echo request; 'net udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]' drives UDP; 'net dhcp' runs the bounded DHCP client one step per invocation; 'net tcp [connect <addr> <port>|send <len>|recv|close|reset]' drives the bounded TCP client; 'net dns <hostname> [<server>]' resolves DNS A-records; 'net ip6' shows the SLAAC address set; 'net ndp [<v6-addr>]' shows/resolves the NDP table; 'net ping6 <v6-addr>' sends an ICMPv6 echo request)", .usage = "net [recv|ip <addr>|arp [<addr>]|ping <addr>|udp [listen <port>|close <port>|send <addr> <port> <len>|recv [<port>]]|dhcp|tcp [connect <addr> <port>|send <len>|recv|close|reset]|dns <host> [<server>]|ip6|ndp [<v6-addr>]|ping6 <v6-addr>]", .category = .networking, .max_args = 5, .handler = cmd_net },
             .{ .name = "netsend", .dom = svclock.dom_bit(.net), .help = "send a known Ethernet frame (bounded staging, TX + used-ring drain)", .usage = "netsend <bytes>", .category = .networking, .min_args = 1, .max_args = 1, .handler = cmd_netsend },
             .{ .name = "pages", .help = "physical page allocator pool", .usage = "pages [selftest]", .category = .memory_state, .max_args = 1, .handler = cmd_pages },
             .{ .name = "pci", .help = "enumerate PCI devices on the bus", .usage = "pci", .category = .memory_state, .handler = cmd_pci },
@@ -5089,6 +5089,9 @@ fn cmd_net(m: *Monitor, args: []const []const u8) ExecError {
         if (std.mem.eql(u8, args[0], "dhcp")) return cmd_net_dhcp(m, args[1..]);
         if (std.mem.eql(u8, args[0], "tcp")) return cmd_net_tcp(m, args[1..]);
         if (std.mem.eql(u8, args[0], "dns")) return cmd_net_dns(m, args[1..]);
+        if (std.mem.eql(u8, args[0], "ip6")) return cmd_net_ip6(m, args[1..]);
+        if (std.mem.eql(u8, args[0], "ndp")) return cmd_net_ndp(m, args[1..]);
+        if (std.mem.eql(u8, args[0], "ping6")) return cmd_net_ping6(m, args[1..]);
         if (std.mem.eql(u8, args[0], "status")) return cmd_net_status(m, args[1..]);
         if (std.mem.eql(u8, args[0], "route")) return cmd_net_route(m, args[1..]);
         if (std.mem.eql(u8, args[0], "log")) return cmd_net_log(m, args[1..]);
@@ -5395,7 +5398,121 @@ fn cmd_net(m: *Monitor, args: []const []const u8) ExecError {
     m.console.puts(",timeout=");
     m.console.print_u64(dns.timed_out);
     m.console.puts("\n");
+    // M117b (#2474, ADR 0057 D13): the v6 layer — the address set, the
+    // router + on-link records, the NDP and ICMPv6 counters. Appended
+    // under the standing append-only convention — existing substring
+    // asserts stay green.
+    virtio_net.ndp.now_ticks = timer.ticks;
+    net_ndp_autonomous(m); // promote/conflict transitions print even here
+    m.console.puts(" v6=ll=");
+    print_ip6_or_dash(m, virtio_net.ipv6.link_local, virtio_net.ipv6.link_local_state != .none);
+    m.console.puts(",g6=");
+    print_ip6_or_dash(m, virtio_net.ipv6.global, virtio_net.ipv6.global_state != .none);
+    m.console.puts(",rt=");
+    print_ip6_or_dash(m, virtio_net.ipv6.router_addr, virtio_net.ipv6.router_valid);
+    m.console.puts(",onl=");
+    if (virtio_net.ipv6.onlink_valid) {
+        var pbuf: [39]u8 = undefined;
+        const pn = virtio_net.ipv6.format_ip6(virtio_net.ipv6.onlink_prefix, &pbuf);
+        m.console.puts(pbuf[0..pn]);
+        m.console.puts("/");
+        m.console.print_u64(virtio_net.ipv6.onlink_len);
+    } else {
+        m.console.puts("-");
+    }
+    m.console.puts("\n");
+    m.console.puts(" ndp=rs=");
+    m.console.print_u64(virtio_net.ndp.rs_sent);
+    m.console.puts(",dad=");
+    m.console.print_u64(virtio_net.ndp.dad_sent);
+    m.console.puts(",dadc=");
+    m.console.print_u64(virtio_net.ndp.dad_conflicts);
+    m.console.puts(",ra=");
+    m.console.print_u64(virtio_net.ndp.ra_accepted);
+    m.console.puts(",for=");
+    m.console.print_u64(virtio_net.ndp.ra_foreign);
+    m.console.puts(",mal=");
+    m.console.print_u64(virtio_net.ndp.ra_malformed);
+    m.console.puts(",opt=");
+    m.console.print_u64(virtio_net.ndp.opt_skipped);
+    m.console.puts(",ns=");
+    m.console.print_u64(virtio_net.ndp.ns_sent);
+    m.console.puts(",na=");
+    m.console.print_u64(virtio_net.ndp.na_sent);
+    m.console.puts(",learn=");
+    m.console.print_u64(virtio_net.ndp.learned);
+    m.console.puts(",unsol=");
+    m.console.print_u64(virtio_net.ndp.na_unsolicited);
+    m.console.puts(",drop=");
+    m.console.print_u64(virtio_net.ndp.ndp_drop + virtio_net.ndp.rs_dropped);
+    m.console.puts(",redir=");
+    m.console.print_u64(virtio_net.ndp.redirect_dropped);
+    m.console.puts(",fail=");
+    m.console.print_u64(virtio_net.ndp.reply_tx_fail);
+    m.console.puts("\n");
+    m.console.puts(" icmp6=req=");
+    m.console.print_u64(virtio_net.ipv6.requests_sent);
+    m.console.puts(",repl=");
+    m.console.print_u64(virtio_net.ipv6.replies_sent);
+    m.console.puts(",pong=");
+    m.console.print_u64(virtio_net.ipv6.pongs_observed);
+    m.console.puts(",err=");
+    m.console.print_u64(virtio_net.ipv6.icmp6_err);
+    m.console.puts(",drop=");
+    m.console.print_u64(virtio_net.ipv6.dropped_short + virtio_net.ipv6.dropped_len + virtio_net.ipv6.dropped_nexthdr + virtio_net.ipv6.dropped_dst + virtio_net.ipv6.dropped_checksum + virtio_net.ipv6.dropped_proto + virtio_net.ipv6.dropped_type);
+    m.console.puts(",fail=");
+    m.console.print_u64(virtio_net.ipv6.reply_tx_fail);
+    m.console.puts(",seq=");
+    m.console.print_u64(virtio_net.ipv6.last_seq);
+    m.console.puts("\n");
     return .none;
+}
+
+/// Print a v6 address or "-" (unset). The 39-byte buffer covers the
+/// longest uncompressed form.
+fn print_ip6_or_dash(m: *Monitor, addr: virtio_net.ipv6.Addr, set: bool) void {
+    if (!set) {
+        m.console.puts("-");
+        return;
+    }
+    var buf: [39]u8 = undefined;
+    const n = virtio_net.ipv6.format_ip6(addr, &buf);
+    m.console.puts(buf[0..n]);
+}
+
+/// M117b (#2474, ADR 0057 D4/D5): the autonomous NDP transitions —
+/// drive the tick-seam poll (the net_dhcp_autonomous shape) and print
+/// the DAD promotes + conflicts as they happen, one line per event —
+/// the live gate's deterministic stage markers.
+pub fn net_ndp_autonomous(m: *Monitor) void {
+    const ev = virtio_net.net_ndp_poll();
+    var buf: [39]u8 = undefined;
+    if (ev.promoted_ll) {
+        const n = virtio_net.ipv6.format_ip6(virtio_net.ipv6.link_local, &buf);
+        m.console.puts("net: v6 ll=");
+        m.console.puts(buf[0..n]);
+        m.console.puts(" valid\n");
+    }
+    if (ev.promoted_g6) {
+        const n = virtio_net.ipv6.format_ip6(virtio_net.ipv6.global, &buf);
+        m.console.puts("net: v6 g6=");
+        m.console.puts(buf[0..n]);
+        m.console.puts(" valid\n");
+    }
+    if (ev.rs_sent) {
+        // One bounded line per RS — the live gate's "the train is done"
+        // stage marker ('net: v6 rs=3').
+        m.console.puts("net: v6 rs=");
+        m.console.print_u64(virtio_net.ndp.rs_sent);
+        m.console.puts("\n");
+    }
+    if (virtio_net.ndp.last_conflict) |c| {
+        const n = virtio_net.ipv6.format_ip6(c, &buf);
+        m.console.puts("net: v6 dad-conflict ");
+        m.console.puts(buf[0..n]);
+        m.console.puts("\n");
+        virtio_net.ndp.last_conflict = null;
+    }
 }
 
 /// `net dhcp` — card N8 (claim 0351) + card N9 (claim 9489): drive the
@@ -6461,6 +6578,258 @@ fn cmd_net_ping(m: *Monitor, args: []const []const u8) ExecError {
         .no_peer => {
             err_prefix(m);
             m.console.print_line("peer not in ARP table (net arp <a.b.c.d> first)");
+        },
+    }
+    return .none;
+}
+
+/// `net ip6` — M117b (#2474, ADR 0057 D3/D13): report the v6 address
+/// set — the link-local and the SLAAC global with their DAD states,
+/// the router record, and the on-link prefix. Report-only: the monitor
+/// never assigns v6 addresses (SLAAC forms them).
+fn cmd_net_ip6(m: *Monitor, args: []const []const u8) ExecError {
+    if (args.len != 0) {
+        print_usage(m, lookup("net").?);
+        return .usage;
+    }
+    if (!virtio_net.net_ready) {
+        m.console.print_line("net ip6: no virtio-net device");
+        return .none;
+    }
+    virtio_net.ndp.now_ticks = timer.ticks;
+    virtio_net.net_rx_drain();
+    net_ndp_autonomous(m);
+    m.console.puts("net ip6: ll=");
+    print_ip6_or_dash(m, virtio_net.ipv6.link_local, virtio_net.ipv6.link_local_state != .none);
+    m.console.puts(" ");
+    m.console.puts(state_name(virtio_net.ipv6.link_local_state));
+    m.console.puts(" g6=");
+    print_ip6_or_dash(m, virtio_net.ipv6.global, virtio_net.ipv6.global_state != .none);
+    m.console.puts(" ");
+    m.console.puts(state_name(virtio_net.ipv6.global_state));
+    m.console.puts("\n");
+    m.console.puts("net ip6: rt=");
+    print_ip6_or_dash(m, virtio_net.ipv6.router_addr, virtio_net.ipv6.router_valid);
+    m.console.puts(" lt=");
+    m.console.print_u64(virtio_net.ipv6.router_lifetime);
+    m.console.puts(" onl=");
+    if (virtio_net.ipv6.onlink_valid) {
+        var pbuf: [39]u8 = undefined;
+        const pn = virtio_net.ipv6.format_ip6(virtio_net.ipv6.onlink_prefix, &pbuf);
+        m.console.puts(pbuf[0..pn]);
+        m.console.puts("/");
+        m.console.print_u64(virtio_net.ipv6.onlink_len);
+    } else {
+        m.console.puts("-");
+    }
+    m.console.puts("\n");
+    return .none;
+}
+
+/// The DAD state tag printed beside each address.
+fn state_name(s: virtio_net.ipv6.AddrState) []const u8 {
+    return switch (s) {
+        .none => "-",
+        .tentative => "tentative",
+        .valid => "valid",
+        .conflicted => "conflicted",
+    };
+}
+
+/// `net ndp [<v6-addr>]` — M117b (#2474, ADR 0057 D5). No argument:
+/// drain the RX ring and print the bounded table + the counters (the
+/// `net arp` shape). With an argument: resolve — a table hit prints
+/// the peer, a miss transmits a Neighbor Solicitation for the NEXT HOP
+/// (the literal address on-link, the router off-link; the NA is
+/// learned asynchronously by the drain). Named refusals per D3/D9.
+fn cmd_net_ndp(m: *Monitor, args: []const []const u8) ExecError {
+    if (args.len == 0) {
+        if (!virtio_net.net_ready) {
+            m.console.print_line("net ndp: no virtio-net device");
+            return .none;
+        }
+        virtio_net.net_rx_drain();
+        var count: usize = 0;
+        for (&virtio_net.ndp.table) |*e| {
+            if (e.valid) count += 1;
+        }
+        m.console.puts("net ndp: entries=");
+        m.console.print_u64(@intCast(count));
+        m.console.puts("\n");
+        var abuf: [39]u8 = undefined;
+        var macbuf: [17]u8 = undefined;
+        for (&virtio_net.ndp.table) |*e| {
+            if (!e.valid) continue;
+            const an = virtio_net.ipv6.format_ip6(e.addr, &abuf);
+            m.console.puts("net ndp: ");
+            m.console.puts(abuf[0..an]);
+            m.console.puts(" -> ");
+            virtio_net.format_mac(&e.mac, &macbuf);
+            m.console.puts(&macbuf);
+            m.console.puts("\n");
+        }
+        m.console.puts("net ndp: rs=");
+        m.console.print_u64(virtio_net.ndp.rs_sent);
+        m.console.puts(",dad=");
+        m.console.print_u64(virtio_net.ndp.dad_sent);
+        m.console.puts(",dadc=");
+        m.console.print_u64(virtio_net.ndp.dad_conflicts);
+        m.console.puts(",ra=");
+        m.console.print_u64(virtio_net.ndp.ra_accepted);
+        m.console.puts(",for=");
+        m.console.print_u64(virtio_net.ndp.ra_foreign);
+        m.console.puts(",mal=");
+        m.console.print_u64(virtio_net.ndp.ra_malformed);
+        m.console.puts(",opt=");
+        m.console.print_u64(virtio_net.ndp.opt_skipped);
+        m.console.puts(",ns=");
+        m.console.print_u64(virtio_net.ndp.ns_sent);
+        m.console.puts(",na=");
+        m.console.print_u64(virtio_net.ndp.na_sent);
+        m.console.puts(",learn=");
+        m.console.print_u64(virtio_net.ndp.learned);
+        m.console.puts(",unsol=");
+        m.console.print_u64(virtio_net.ndp.na_unsolicited);
+        m.console.puts(",drop=");
+        m.console.print_u64(virtio_net.ndp.ndp_drop + virtio_net.ndp.rs_dropped);
+        m.console.puts(",redir=");
+        m.console.print_u64(virtio_net.ndp.redirect_dropped);
+        m.console.puts(",fail=");
+        m.console.print_u64(virtio_net.ndp.reply_tx_fail);
+        m.console.puts("\n");
+        return .none;
+    }
+    if (args.len != 1) {
+        print_usage(m, lookup("net").?);
+        return .usage;
+    }
+    const addr = virtio_net.ipv6.parse_ip6(args[0]) orelse {
+        err_prefix(m);
+        m.console.puts("invalid address: ");
+        m.console.puts(args[0]);
+        m.console.puts("\n");
+        return .invalid_argument;
+    };
+    if (!virtio_net.net_ready) {
+        err_prefix(m);
+        m.console.print_line("no virtio-net device");
+        return .none;
+    }
+    virtio_net.ndp.now_ticks = timer.ticks;
+    virtio_net.net_rx_drain();
+    net_ndp_autonomous(m);
+    var abuf: [39]u8 = undefined;
+    const an = virtio_net.ipv6.format_ip6(addr, &abuf);
+    const target = virtio_net.ipv6.next_hop(&addr);
+    if (target) |t| {
+        if (virtio_net.ndp.lookup(&t)) |mac| {
+            m.console.puts("net ndp: ");
+            m.console.puts(abuf[0..an]);
+            m.console.puts(" is at ");
+            var macbuf: [17]u8 = undefined;
+            virtio_net.format_mac(&mac, &macbuf);
+            m.console.puts(&macbuf);
+            m.console.puts("\n");
+            return .none;
+        }
+    }
+    var frame_len: usize = 0;
+    switch (virtio_net.net_ndp_solicit(addr, &frame_len)) {
+        .ok => {
+            virtio_net.ndp.ns_sent += 1;
+            m.console.puts("net ndp: request for ");
+            m.console.puts(abuf[0..an]);
+            m.console.puts(" sent (");
+            m.console.print_u64(@intCast(frame_len));
+            m.console.puts(" bytes)\n");
+        },
+        .bad_dst6 => {
+            err_prefix(m);
+            m.console.print_line("bad_dst6 (multicast/unspecified/loopback destination)");
+        },
+        .no_src6 => {
+            err_prefix(m);
+            m.console.print_line("no_src6 (no valid link-local — net ip6)");
+        },
+        .no_route6 => {
+            err_prefix(m);
+            m.console.print_line("no_route6 (off-link destination and no router)");
+        },
+        .not_ready => {
+            err_prefix(m);
+            m.console.print_line("transport unready");
+        },
+        .timeout => {
+            err_prefix(m);
+            m.console.print_line("request TX timeout (device did not complete within the poll budget)");
+        },
+        .no_peer => unreachable, // solicitation goes out regardless of the table
+    }
+    return .none;
+}
+
+/// `net ping6 <v6-addr>` — M117b (#2474, ADR 0057 D6/D9): transmit an
+/// ICMPv6 echo request — the Ethernet dst is the next hop's learned MAC
+/// (the peer on-link, the router off-link), so the next hop must be in
+/// the NDP table (`net ndp <addr>` resolves it first). The reply is
+/// observed asynchronously by the RX drain (`pongs_observed` + the
+/// `net` report's `seq=`). Named refusals per D3/D9.
+fn cmd_net_ping6(m: *Monitor, args: []const []const u8) ExecError {
+    if (args.len != 1) {
+        print_usage(m, lookup("net").?);
+        return .usage;
+    }
+    const addr = virtio_net.ipv6.parse_ip6(args[0]) orelse {
+        err_prefix(m);
+        m.console.puts("invalid address: ");
+        m.console.puts(args[0]);
+        m.console.puts("\n");
+        return .invalid_argument;
+    };
+    if (!virtio_net.net_ready) {
+        err_prefix(m);
+        m.console.print_line("no virtio-net device");
+        return .none;
+    }
+    virtio_net.ndp.now_ticks = timer.ticks;
+    virtio_net.net_rx_drain();
+    net_ndp_autonomous(m);
+    var frame_len: usize = 0;
+    switch (virtio_net.net_ping6_request(addr, &frame_len)) {
+        .ok => {
+            virtio_net.ipv6.requests_sent += 1;
+            virtio_net.ipv6.ping6_seq +%= 1;
+            m.console.puts("net ping6: echo request to ");
+            var abuf: [39]u8 = undefined;
+            const an = virtio_net.ipv6.format_ip6(addr, &abuf);
+            m.console.puts(abuf[0..an]);
+            m.console.puts(" sent (");
+            m.console.print_u64(@intCast(frame_len));
+            m.console.puts(" bytes)\n");
+        },
+        .bad_dst6 => {
+            err_prefix(m);
+            m.console.print_line("bad_dst6 (multicast/unspecified/loopback destination)");
+        },
+        .no_route6 => {
+            err_prefix(m);
+            m.console.print_line("no_route6 (off-link destination and no router)");
+        },
+        .no_src6 => {
+            err_prefix(m);
+            m.console.print_line("no_src6 (no valid source address — net ip6)");
+        },
+        .no_peer => {
+            err_prefix(m);
+            m.console.print_line("peer not in NDP table (net ndp <addr> first)");
+        },
+        .not_ready => {
+            err_prefix(m);
+            m.console.print_line("transport unready");
+        },
+        .timeout => {
+            err_prefix(m);
+            m.console.print_line("echo request TX timeout (device did not complete within the poll budget)");
         },
     }
     return .none;

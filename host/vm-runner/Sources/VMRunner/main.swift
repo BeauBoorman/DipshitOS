@@ -153,6 +153,20 @@
 //          host clock for every served timestamp, so a gate can prove the
 //          guest clock really moved; default 0; requires
 //          --net-sntp-respond.)
+//         [--net-ra-respond <v6-prefix>/64] [--net-ndp-respond <v6-addr>]
+//          [--net-icmp6-respond <v6-addr>] (M117b #2474, ADR 0057 D10: the
+//          three v6 hermetic responders — request-driven synthesizers in
+//          the capture thread, the --net-arp-respond shape. On a guest
+//          Router Solicitation, --net-ra-respond answers with an RA from
+//          the router link-local fe80::ff:fe00:2 carrying the argument
+//          /64 prefix as an A+L PIO. On a guest Neighbor Solicitation
+//          whose target is a listed address, --net-ndp-respond (repeatable)
+//          answers with an NA (S=1 O=1, TLLA 02:00:00:00:00:02); when
+//          --net-ra-respond is set the router link-local is implicitly
+//          listed. On an ICMPv6 echo request for the address,
+//          --net-icmp6-respond answers with the echo reply — id/seq/
+//          payload byte-exact. All require --net. An unlisted target or
+//          an unset flag goes unanswered — the refusal leg.)
 //         [--net-dhcp-respond <lease-ip>] (milestone five card N8, claim
 //          0351: a tiny deterministic host-side DHCP server inside the
 //          capture thread — the guest's DHCPDISCOVER is answered with an
@@ -721,6 +735,29 @@ var netArpRespondHostIP: [UInt8]?
 // Driven by the guest's actual request bytes, not a sleep. nil = the
 // guest's echo requests go unanswered (the default VM is unchanged).
 var netIcmpRespondHostIP: [UInt8]?
+// M117b (issue #2474, ADR 0057 D10): the three v6 hermetic responders —
+// request-driven synthesizers inside the capture thread, the
+// --net-arp-respond shape. `--net-ra-respond <v6-prefix>/64` answers a
+// guest Router Solicitation with a Router Advertisement from the router
+// link-local fe80::ff:fe00:2 (the EUI-64 derivation of the fixed host
+// MAC, deterministic + gate-assertable) carrying the argument prefix as
+// an A+L /64 PIO. `--net-ndp-respond <v6-addr>` (repeatable) answers a
+// guest Neighbor Solicitation whose target is a listed address with a
+// Neighbor Advertisement (S=1 O=1, TLLA 02:00:00:00:00:02); when
+// --net-ra-respond is set the router link-local is implicitly listed —
+// the guest's router-resolution NS is answered without a second flag.
+// An NS for an unlisted target goes unanswered (the refusal leg).
+// `--net-icmp6-respond <v6-addr>` answers an ICMPv6 echo request for the
+// address byte-exact (id/seq/payload, the --net-icmp-respond mirror).
+// All write into the SAME attachment socket end (VZ reads fds[0], so
+// the guest receives it). nil flag = unanswered = the default VM
+// unchanged.
+var netRaRespondPrefix: [UInt8]? // the advertised /64 (16 bytes, IID bits zero)
+var netNdpRespondAddrs: [[UInt8]] = []
+var netIcmp6RespondAddr: [UInt8]?
+// The hermetic router's link-local — the modified-EUI-64 derivation of
+// the fixed host MAC 02:00:00:00:00:02 (ADR 0057 D10).
+let netRouterLinkLocal: [UInt8] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x02]
 // Milestone five card N5 (claim 8552): `--net-udp-respond <host-ip>:<host-port>`
 // answers the guest's UDP datagrams from the HOST side — a tiny
 // deterministic host-side UDP responder inside the capture thread: when
@@ -1453,6 +1490,31 @@ while idx < arguments.count {
             fail("--net-icmp-respond requires a dotted-quad IPv4 address, got '\(arguments[idx + 1])'.")
         }
         netIcmpRespondHostIP = parts
+        idx += 2
+    } else if arg == "--net-ra-respond", idx + 1 < arguments.count {
+        // M117b: <v6-prefix>/64 — e.g. 2001:db8:64::/64 (the advertised
+        // PIO; the IID bits belong to the guest, the responder zeroes
+        // them so the advertised prefix is honest).
+        let halves = arguments[idx + 1].split(separator: "/")
+        guard halves.count == 2, Int(halves[1]) == 64,
+              var pfx = parseIPv6(String(halves[0])) else {
+            fail("--net-ra-respond requires a v6 /64 prefix like 2001:db8:64::/64, got '\(arguments[idx + 1])'.")
+        }
+        for i in 8..<16 { pfx[i] = 0 }
+        netRaRespondPrefix = pfx
+        idx += 2
+    } else if arg == "--net-ndp-respond", idx + 1 < arguments.count {
+        // M117b: repeatable — each instance lists one answerable target.
+        guard let addr = parseIPv6(arguments[idx + 1]) else {
+            fail("--net-ndp-respond requires a v6 address, got '\(arguments[idx + 1])'.")
+        }
+        netNdpRespondAddrs.append(addr)
+        idx += 2
+    } else if arg == "--net-icmp6-respond", idx + 1 < arguments.count {
+        guard let addr = parseIPv6(arguments[idx + 1]) else {
+            fail("--net-icmp6-respond requires a v6 address, got '\(arguments[idx + 1])'.")
+        }
+        netIcmp6RespondAddr = addr
         idx += 2
     } else if arg == "--net-udp-respond", idx + 1 < arguments.count {
         // Parse the host ip:port now (fail early, like --timeout).
@@ -2334,6 +2396,15 @@ if netInjectPath != nil, netCapturePath == nil {
 if netArpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-arp-respond requires --net (the ARP reply is written into the SAME attachment's socket).")
 }
+if netRaRespondPrefix != nil, netCapturePath == nil {
+    fail("--net-ra-respond requires --net (the RA is written into the SAME attachment's socket).")
+}
+if !netNdpRespondAddrs.isEmpty, netCapturePath == nil {
+    fail("--net-ndp-respond requires --net (the NA is written into the SAME attachment's socket).")
+}
+if netIcmp6RespondAddr != nil, netCapturePath == nil {
+    fail("--net-icmp6-respond requires --net (the echo reply is written into the SAME attachment's socket).")
+}
 if netIcmpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-icmp-respond requires --net (the ICMP reply is written into the SAME attachment's socket).")
 }
@@ -2571,6 +2642,34 @@ if let netCapturePath {
                 buildIcmpEchoReply(&reply, buf, n, arpHostMAC, hostIP)
                 try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 print("NET-ICMP: answered the guest's echo request for \(hostIP[0]).\(hostIP[1]).\(hostIP[2]).\(hostIP[3]) (id \(reply[38] << 8 | reply[39]), seq \(reply[40] << 8 | reply[41]))")
+            }
+            // M117b (#2474, ADR 0057 D10): the three v6 responders — the
+            // same request-driven shape as the N3 ARP responder. A guest
+            // Router Solicitation is answered with the hermetic RA (src
+            // the router link-local, dst all-nodes — the guest's D2
+            // filter admits it); an NS for a listed target (explicit
+            // --net-ndp-respond entries + the router link-local when
+            // --net-ra-respond is set) is answered with the NA; an
+            // ICMPv6 echo request for the listed address is answered
+            // byte-exact. Unlisted targets and unset flags go
+            // unanswered — the refusal leg.
+            if let pfx = netRaRespondPrefix, isRouterSolicitation(buf, n) {
+                var reply = [UInt8](repeating: 0, count: 102)
+                buildRouterAdvertisement(&reply, arpHostMAC, pfx)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                print("NET-RA: answered the guest's router solicitation with an RA advertising \(v6Text(pfx))/64 from fe80::ff:fe00:2")
+            }
+            if isNeighborSolicitation(buf, n), let target = ndpRespondTarget(buf, n) {
+                var reply = [UInt8](repeating: 0, count: 86)
+                buildNeighborAdvertisement(&reply, buf, n, arpHostMAC, target)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                print("NET-NDP: answered the guest's neighbor solicitation for \(v6Text(target)) (NA S=1 O=1, host MAC 02:00:00:00:00:02)")
+            }
+            if let addr = netIcmp6RespondAddr, isIcmp6EchoRequest(buf, n, addr) {
+                var reply = [UInt8](repeating: 0, count: n)
+                buildIcmp6EchoReply(&reply, buf, n, arpHostMAC)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                print("NET-ICMP6: answered the guest's echo request for \(v6Text(addr)) (id \(reply[58] << 8 | reply[59]), seq \(reply[60] << 8 | reply[61]))")
             }
             // Card N5: if the guest sent a UDP datagram to our ip:port,
             // echo it back from the host (same socket direction; the
@@ -3230,6 +3329,16 @@ if let hostIP = netArpRespondHostIP {
 if let hostIP = netIcmpRespondHostIP {
     let ipText = hostIP.map(String.init).joined(separator: ".")
     print("  net-icmp-respond: ENABLED (milestone five card N4, claim 0148) — the host answers the guest's ICMP echo requests for \(ipText) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if let pfx = netRaRespondPrefix {
+    print("  net-ra-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's router solicitations with an RA from fe80::ff:fe00:2 advertising \(v6Text(pfx))/64 (A+L, host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if !netNdpRespondAddrs.isEmpty || netRaRespondPrefix != nil {
+    let names = netNdpRespondAddrs.map { v6Text($0) }.joined(separator: ", ")
+    print("  net-ndp-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's neighbor solicitations for [\(names)]\(netRaRespondPrefix != nil ? " plus the router link-local fe80::ff:fe00:2" : "") (NA S=1 O=1, host MAC 02:00:00:00:00:02) via the capture thread; unlisted targets go unanswered")
+}
+if let addr = netIcmp6RespondAddr {
+    print("  net-icmp6-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's ICMPv6 echo requests for \(v6Text(addr)) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
 }
 if let hostIP = netUdpRespondHostIP, let hostPort = netUdpRespondHostPort {
     let ipText = hostIP.map(String.init).joined(separator: ".")
@@ -5785,6 +5894,208 @@ func isIcmpEchoRequest(_ buf: [UInt8], _ n: Int, _ hostIP: [UInt8]) -> Bool {
     for w in words { sum += UInt32(w) }
     while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
     return UInt16(~sum & 0xffff)
+}
+
+// M117b (#2474, ADR 0057 D10): parse a text IPv6 address — any
+// inet_pton-legal form ("::" compression, mixed case). The runner is a
+// host process; Darwin's inet_pton is the honest parser (no hand-rolled
+// hex walk).
+@Sendable func parseIPv6(_ text: String) -> [UInt8]? {
+    var addr = in6_addr()
+    return text.withCString { cstr in
+        guard inet_pton(AF_INET6, cstr, &addr) == 1 else { return nil }
+        return withUnsafeBytes(of: &addr) { Array($0) }
+    }
+}
+
+// M117b: the canonical text form of a v6 address (inet_ntop — the same
+// compressed shape the guest's formatter emits for these values).
+@Sendable func v6Text(_ a: [UInt8]) -> String {
+    var addr = in6_addr()
+    withUnsafeMutableBytes(of: &addr) { $0.copyBytes(from: a) }
+    var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+    inet_ntop(AF_INET6, &addr, &buf, socklen_t(INET6_ADDRSTRLEN))
+    return String(cString: buf)
+}
+
+// M117b: the ICMPv6 pseudo-header checksum — 16-byte src + dst, the
+// 32-bit upper-layer length, 3 zero bytes + next-header — over `msg`
+// (RFC 8200 §8.1; the checksum field must be zero during the build).
+@Sendable func icmp6Checksum(_ srcIP: [UInt8], _ dstIP: [UInt8], _ msg: [UInt8], _ nextHeader: UInt8) -> UInt16 {
+    var sum: UInt32 = 0
+    var i = 0
+    while i < 16 {
+        sum += (UInt32(srcIP[i]) << 8) | UInt32(srcIP[i + 1])
+        sum += (UInt32(dstIP[i]) << 8) | UInt32(dstIP[i + 1])
+        i += 2
+    }
+    sum += UInt32(msg.count >> 16) + UInt32(msg.count & 0xffff)
+    sum += UInt32(nextHeader)
+    i = 0
+    while i + 1 < msg.count {
+        sum += (UInt32(msg[i]) << 8) | UInt32(msg[i + 1])
+        i += 2
+    }
+    if i < msg.count { sum += UInt32(msg[i]) << 8 }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
+    return UInt16(~sum & 0xffff)
+}
+
+// M117b: is the datagram an IPv6 frame carrying ICMPv6 of the given
+// type? Ethernet II ethertype 0x86dd, version 6, next-header 58 (the
+// guest sends terminal next-headers only), the ICMPv6 type byte at 54.
+@Sendable func isIcmp6Type(_ buf: [UInt8], _ n: Int, _ type: UInt8) -> Bool {
+    guard n >= 56 else { return false }
+    guard buf[12] == 0x86 && buf[13] == 0xdd else { return false }
+    guard buf[14] >> 4 == 0x6 else { return false }
+    guard buf[20] == 58 else { return false }
+    return buf[54] == type
+}
+
+@Sendable func isRouterSolicitation(_ buf: [UInt8], _ n: Int) -> Bool {
+    return isIcmp6Type(buf, n, 133)
+}
+
+@Sendable func isNeighborSolicitation(_ buf: [UInt8], _ n: Int) -> Bool {
+    return isIcmp6Type(buf, n, 135)
+}
+
+// M117b: the NS's target when it names an answerable address — an
+// explicit --net-ndp-respond entry, or the router link-local implicitly
+// listed by --net-ra-respond (the guest's router-resolution NS is
+// answered without a second flag). nil = unanswered (the refusal leg).
+@Sendable func ndpRespondTarget(_ buf: [UInt8], _ n: Int) -> [UInt8]? {
+    guard n >= 78 else { return nil }
+    let target = [UInt8](buf[62..<78])
+    for a in netNdpRespondAddrs where a == target { return target }
+    if netRaRespondPrefix != nil, target == netRouterLinkLocal { return target }
+    return nil
+}
+
+// M117b: is the datagram an ICMPv6 echo request for `addr`?
+@Sendable func isIcmp6EchoRequest(_ buf: [UInt8], _ n: Int, _ addr: [UInt8]) -> Bool {
+    guard isIcmp6Type(buf, n, 128) else { return false }
+    return [UInt8](buf[38..<54]) == addr
+}
+
+// M117b: synthesize the ROUTER ADVERTISEMENT to a guest RS: dst
+// all-nodes (33:33:00:00:00:01 / ff02::1 — the guest's D2 filter admits
+// it), src the router link-local, hop 255, cur-hop 64, M|O 0, router
+// lifetime 1800, reachable/retrans 0, ONE Prefix Information option
+// carrying the argument /64 with A+L and finite recorded lifetimes
+// (valid 86400, preferred 14400). 102 bytes total.
+@Sendable func buildRouterAdvertisement(_ reply: inout [UInt8], _ hostMAC: [UInt8], _ prefix: [UInt8]) {
+    reply = [UInt8](repeating: 0, count: 102)
+    reply[0...5] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01] // all-nodes dst
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd
+    reply[14] = 0x60 // version 6
+    reply[18] = 0
+    reply[19] = 48 // payload_len: 16-byte RA fixed part + 32-byte PIO
+    reply[20] = 58 // ICMPv6
+    reply[21] = 255 // hop limit — the NDP standing check
+    reply[22...37] = netRouterLinkLocal[0...15] // src = the router link-local
+    reply[38] = 0xff
+    reply[39] = 0x02
+    reply[53] = 0x01 // dst = ff02::1 (all-nodes)
+    let src = netRouterLinkLocal
+    var dst = [UInt8](repeating: 0, count: 16)
+    dst[0] = 0xff
+    dst[1] = 0x02
+    dst[15] = 0x01
+    // ICMPv6 RA: type 134, code 0, checksum, cur-hop 64, flags 0,
+    // lifetime 1800, reachable 0, retrans 0.
+    reply[54] = 134
+    reply[58] = 64
+    reply[60] = 0x07
+    reply[61] = 0x08 // router lifetime 1800
+    // PIO at 70: type 3, len 4, prefix_len 64, flags A|L (0xc0),
+    // valid 86400, preferred 14400, reserved 0, prefix.
+    reply[70] = 3
+    reply[71] = 4
+    reply[72] = 64
+    reply[73] = 0xc0
+    reply[74] = 0
+    reply[75] = 1
+    reply[76] = 0x51
+    reply[77] = 0x80 // valid lifetime 86400
+    reply[78] = 0
+    reply[79] = 0
+    reply[80] = 0x46
+    reply[81] = 0x50 // preferred lifetime 14400
+    reply[86...101] = prefix[0...15]
+    let chk = icmp6Checksum(src, dst, [UInt8](reply[54..<102]), 58)
+    reply[56] = UInt8(chk >> 8)
+    reply[57] = UInt8(chk & 0xff)
+}
+
+// M117b: synthesize the NEIGHBOR ADVERTISEMENT to the guest's NS in
+// `req`: dst = the request's observed Ethernet source (all-nodes when
+// its v6 src was :: — the DAD answer), src = the solicited `target`,
+// flags S|O, target echoed, TLLA = the host MAC, hop 255. 86 bytes.
+@Sendable func buildNeighborAdvertisement(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ target: [UInt8]) {
+    reply = [UInt8](repeating: 0, count: 86)
+    let reqSrc = [UInt8](req[22..<38])
+    let unspecified = reqSrc == [UInt8](repeating: 0, count: 16)
+    if unspecified {
+        reply[0...5] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01] // all-nodes
+    } else {
+        reply[0...5] = req[6...11] // dst = the observed src MAC
+    }
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd
+    reply[14] = 0x60
+    reply[18] = 0
+    reply[19] = 32 // payload_len: flags(4) + target(16) + TLLA(8) + hdr(4)
+    reply[20] = 58
+    reply[21] = 255
+    reply[22...37] = target[0...15] // src = the solicited target
+    if unspecified {
+        reply[38] = 0xff
+        reply[39] = 0x02
+        reply[53] = 0x01 // dst = ff02::1
+    } else {
+        reply[38...53] = reqSrc[0...15] // dst = the requester's address
+    }
+    reply[54] = 136 // NA
+    reply[58] = 0x60 // flags S|O
+    reply[62...77] = target[0...15] // target echoed
+    reply[78] = 2 // TLLA option type
+    reply[79] = 1 // length 1
+    reply[80...85] = hostMAC[0...5]
+    let dst = [UInt8](reply[38..<54])
+    let chk = icmp6Checksum(target, dst, [UInt8](reply[54..<86]), 58)
+    reply[56] = UInt8(chk >> 8)
+    reply[57] = UInt8(chk & 0xff)
+}
+
+// M117b: synthesize the ICMPv6 ECHO REPLY to the echo request in `req`
+// — Ethernet dst/src swapped, v6 src/dst swapped (the reply's src is
+// the address it was sent to), hop 64, type 129, id/seq/payload echoed
+// byte-exact, the pseudo-header checksum recomputed.
+@Sendable func buildIcmp6EchoReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8]) {
+    reply = [UInt8](repeating: 0, count: n)
+    reply[0...5] = req[6...11] // dst = the requester's MAC
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd
+    reply[14] = 0x60
+    reply[18...19] = req[18...19] // payload_len (unchanged; TC/flow stays 0)
+    reply[20] = 58
+    reply[21] = 64 // hop limit — echo traffic, not NDP
+    reply[22...37] = req[38...53] // src = the addressed address
+    reply[38...53] = req[22...37] // dst = the requester's address
+    reply[54] = 129 // echo reply
+    if n > 58 {
+        reply[58...n - 1] = req[58...n - 1] // id + seq + payload echoed
+    }
+    let src = [UInt8](reply[22..<38])
+    let dst = [UInt8](reply[38..<54])
+    let chk = icmp6Checksum(src, dst, [UInt8](reply[54..<n]), 58)
+    reply[56] = UInt8(chk >> 8)
+    reply[57] = UInt8(chk & 0xff)
 }
 
 // Card N5 (claim 8552): is the datagram a UDP datagram addressed to
