@@ -1988,6 +1988,7 @@ if secureBootEnabled {
     } catch {
         fail("Could not create EFI variable store at \(varsURL.path): \(error)")
     }
+#if SPIKE
     if #available(macOS 27.0, *) {
         guard let pkPath = secureBootPKPath,
               let der = FileManager.default.contents(atPath: pkPath),
@@ -2029,6 +2030,9 @@ if secureBootEnabled {
     } else {
         fail("--secure-boot requires macOS 27+ (VZEFIVariableStore Secure Boot APIs).")
     }
+#else
+    fail("--secure-boot requires a SPIKE build (macOS 27 SDK Secure Boot types); rebuild with `swift build --package-path host/vm-runner --configuration release -Xswiftc -DSPIKE` (`zig build spike-virtio` drives it). This binary cannot enroll Secure Boot signatures.")
+#endif
 } else if FileManager.default.fileExists(atPath: varsURL.path) {
     variableStore = VZEFIVariableStore(url: varsURL)
 } else {
