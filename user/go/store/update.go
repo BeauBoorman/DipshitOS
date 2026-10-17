@@ -1,6 +1,8 @@
 package store
 
 import (
+	"strings"
+
 	"virelai/sshlib"
 )
 
@@ -195,7 +197,8 @@ func Update(fs FS, root, arg, remoteFlag, channelArg string) int {
 	}
 	state[bin] = &storeEntry{
 		Name: bin, Stream: ent.Stream, Head: newHead, SHA256: rel.ELFSHA256,
-		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevRow: curRow,
+		Caps:     strings.Join(rel.Caps, ","),
+		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevCaps: ent.Caps, PrevRow: curRow,
 	}
 	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
 		return runErr(err)
@@ -209,6 +212,7 @@ func Update(fs FS, root, arg, remoteFlag, channelArg string) int {
 	}
 	_ = fs.Remove(prevStagePath(bin))
 	ConsoleFn("store: update ok " + bin + " version=" + rel.Version)
+	grantSync(bin, rel.ELFSHA256, rel.Caps)
 	return 0
 }
 
@@ -283,7 +287,8 @@ func Rollback(fs FS, arg string) int {
 	}
 	state[bin] = &storeEntry{
 		Name: bin, Stream: ent.Stream, Head: ent.PrevHead, SHA256: ent.PrevSHA,
-		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevRow: curRow,
+		Caps:     ent.PrevCaps,
+		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevCaps: ent.Caps, PrevRow: curRow,
 	}
 	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
 		return runErr(err)
@@ -293,5 +298,8 @@ func Rollback(fs FS, arg string) int {
 	}
 	_ = fs.Remove(prevStagePath(bin))
 	ConsoleFn("store: rollback ok " + bin + " head=" + ent.PrevHead)
+	// The live sha is back at PrevSHA: re-pin the grant row to the image
+	// the user rolled back to — the same non-widening keep update runs.
+	grantSync(bin, ent.PrevSHA, splitGrantWords(ent.PrevCaps))
 	return 0
 }
