@@ -790,4 +790,194 @@ final class GPU3DRendererTests: XCTestCase {
         let mem = FlatMemory(bytes: 0x30_0000)
         XCTAssertNil(GPU3DMetalRenderer(memory: mem, device: nil))
     }
+
+    // MARK: - M111b compute (#2409, ADR 0053)
+
+    /// COMPUTE_SUBMIT: header + the frozen 64-byte kernel descriptor.
+    private func computeReq(_ kd: GPU3DWire.KernelDesc, ctx: UInt32,
+                            fence: UInt64 = 0xC0FF_EE00) -> [UInt8] {
+        var r = header(GPU3DWire.cmdComputeSubmit, ctx: ctx, fence: fence, fenced: true)
+        push32(kd.kernelID, into: &r)
+        push32(kd.flags, into: &r)
+        push32(kd.d0, into: &r)
+        push32(kd.d1, into: &r)
+        push32(kd.d2, into: &r)
+        push32(kd.aux, into: &r)
+        for b in kd.bufs {
+            push32(b.buf, into: &r)
+            push32(b.byteOff, into: &r)
+        }
+        push64(0, into: &r) // reserved
+        return r
+    }
+
+    /// Bring up one ctx with `n` buffer resources (res 2..n+1) backed
+    /// 4 KiB apart from `gpaBase`.
+    private func computeBringUp(_ device: GPU3DDevice, ctx: UInt32,
+                                buffers: Int, gpaBase: UInt64 = 0x10_0000) {
+        var els: [FakeElement] = [FakeElement(ctxCreateReq(ctx))]
+        for i in 0..<buffers {
+            let res = UInt32(i + 2)
+            els.append(FakeElement(create3DReq(ctx: ctx, res: res, target: 0,
+                                               format: 0, bind: 0, w: 4096, h: 1)))
+            els.append(FakeElement(attachBackingReq(ctx: ctx, res: res,
+                                                    addr: gpaBase + UInt64(i) * 0x1000,
+                                                    len: 4096)))
+            els.append(FakeElement(ctxResReq(GPU3DWire.cmdCtxAttachResource,
+                                             ctx: ctx, res: res)))
+        }
+        drive(device, els)
+        for (i, el) in els.enumerated() {
+            XCTAssertEqual(responseType(el), GPU3DWire.respOkNoData,
+                           "compute bring-up step \(i) refused")
+        }
+    }
+
+    private func f16bytes(_ vals: [Float16]) -> [UInt8] {
+        var out: [UInt8] = []
+        for v in vals {
+            out.append(UInt8(v.bitPattern & 0xff))
+            out.append(UInt8(v.bitPattern >> 8))
+        }
+        return out
+    }
+
+    /// The whole point of the card, at Metal level: upload A/B into
+    /// target_buffer resources, fenced COMPUTE_SUBMIT(GEMM), poll→fence
+    /// → element returned, and a TRANSFER_FROM_HOST readback holds the
+    /// exact f16 product — submit → fence → readback.
+    func testMetalComputeGemmRoundTrip() throws {
+        let mem = FlatMemory(bytes: 0x40_0000)
+        guard let renderer = makeRenderer(mem) else { return }
+        XCTAssertTrue(renderer.gpu3dComputeReady, "compute pipelines must build")
+        let device = GPU3DDevice(backend: renderer)
+        renderer.device = device
+
+        let ctx: UInt32 = 1
+        computeBringUp(device, ctx: ctx, buffers: 3) // res 2,3,4 at 0x100000+
+
+        // A = [[1,2],[3,4]], B = [[5,6],[7,8]] — f16 row-major.
+        mem.mem.replaceSubrange(0x10_0000..<0x10_0008,
+                                with: f16bytes([1, 2, 3, 4]))
+        mem.mem.replaceSubrange(0x10_1000..<0x10_1008,
+                                with: f16bytes([5, 6, 7, 8]))
+        for res: UInt32 in [2, 3] {
+            let up = FakeElement(transferReq(GPU3DWire.cmdTransferToHost3D,
+                                             ctx: ctx, res: res,
+                                             box: (0, 0, 0, 8, 1, 1)))
+            drive(device, [up])
+            XCTAssertEqual(responseType(up), GPU3DWire.respOkNoData,
+                           "buffer upload res \(res)")
+        }
+
+        var kd = GPU3DWire.KernelDesc()
+        kd.kernelID = GPU3DWire.kernelGEMM
+        kd.d0 = 2; kd.d1 = 2; kd.d2 = 2
+        kd.bufs = [.init(buf: 2), .init(buf: 3), .init(buf: 4), .init()]
+        let sub = FakeElement(computeReq(kd, ctx: ctx, fence: 0xBEEF_0001))
+        drive(device, [sub])
+        XCTAssertFalse(sub.returned, "consumption is not completion")
+        XCTAssertEqual(device.pendingFenceID, 0xBEEF_0001)
+
+        let completions = renderer.gpuCompletions
+        waitUntil({ renderer.gpuCompletions > completions }, "Metal compute completion")
+        drive(device, [])
+        XCTAssertTrue(sub.returned, "the real fence did not release the element")
+        XCTAssertEqual(responseType(sub), GPU3DWire.respOkNoData)
+        XCTAssertEqual(renderer.computeSubmits, 1)
+
+        // Read C back through the buffer readback leg.
+        let rb = FakeElement(transferReq(GPU3DWire.cmdTransferFromHost3D,
+                                         ctx: ctx, res: 4,
+                                         box: (0, 0, 0, 8, 1, 1)))
+        drive(device, [rb])
+        XCTAssertEqual(responseType(rb), GPU3DWire.respOkNoData)
+
+        // C = A·B = [[19,22],[43,50]] — exact in f16.
+        let want = f16bytes([19, 22, 43, 50])
+        XCTAssertEqual(Array(mem.mem[0x10_2000..<0x10_2008]), want)
+    }
+
+    /// DEQUANT i8-symmetric at Metal level: out[i] = q[i] * s[i/G] in
+    /// f16 — exercises a second pipeline and the absent-slot dummy.
+    func testMetalComputeDequantI8() throws {
+        let mem = FlatMemory(bytes: 0x40_0000)
+        guard let renderer = makeRenderer(mem) else { return }
+        let device = GPU3DDevice(backend: renderer)
+        renderer.device = device
+        let ctx: UInt32 = 1
+        computeBringUp(device, ctx: ctx, buffers: 3) // res 2 packed, 3 scales, 4 out
+
+        // q = [1,2,-1,-2,0,1,2,3] i8 in ONE group of 32 (the legal group
+        // sizes are 32/64/128); scale s[0] = 2.0.
+        let q: [UInt8] = [1, 2, 0xff, 0xfe, 0, 1, 2, 3]
+        var scales: [UInt8] = []
+        push32(Float(2.0).bitPattern, into: &scales)
+        mem.mem.replaceSubrange(0x10_0000..<0x10_0008, with: q)
+        mem.mem.replaceSubrange(0x10_1000..<0x10_1004, with: scales)
+        for res: UInt32 in [2, 3] {
+            let up = FakeElement(transferReq(GPU3DWire.cmdTransferToHost3D,
+                                             ctx: ctx, res: res,
+                                             box: (0, 0, 0, 8, 1, 1)))
+            drive(device, [up])
+            XCTAssertEqual(responseType(up), GPU3DWire.respOkNoData)
+        }
+
+        var kd = GPU3DWire.KernelDesc()
+        kd.kernelID = GPU3DWire.kernelDequant
+        kd.d0 = 8; kd.d1 = 32; kd.aux = GPU3DWire.dequantFmtI8Sym
+        kd.bufs = [.init(buf: 2), .init(buf: 3), .init(), .init(buf: 4)]
+        let sub = FakeElement(computeReq(kd, ctx: ctx, fence: 0xBEEF_0002))
+        drive(device, [sub])
+        let completions = renderer.gpuCompletions
+        waitUntil({ renderer.gpuCompletions > completions }, "Metal compute completion")
+        drive(device, [])
+        XCTAssertTrue(sub.returned)
+        XCTAssertEqual(responseType(sub), GPU3DWire.respOkNoData)
+
+        let rb = FakeElement(transferReq(GPU3DWire.cmdTransferFromHost3D,
+                                         ctx: ctx, res: 4,
+                                         box: (0, 0, 0, 16, 1, 1)))
+        drive(device, [rb])
+        XCTAssertEqual(responseType(rb), GPU3DWire.respOkNoData)
+        // out = q[i] * 2.0 = [2, 4, -2, -4, 0, 2, 4, 6] in f16.
+        let want = f16bytes([2, 4, -2, -4, 0, 2, 4, 6])
+        XCTAssertEqual(Array(mem.mem[0x10_2000..<0x10_2010]), want)
+    }
+
+    /// A buffer slot naming a resource of ANOTHER context is a named
+    /// refusal — the context isolation the whole device contract rests
+    /// on; Metal never sees it. res 5 exists ONLY on ctx 1: naming it
+    /// from ctx 2 must refuse even though the resource id is real.
+    func testComputeBindingCannotReachAcrossContexts() throws {
+        let mem = FlatMemory(bytes: 0x40_0000)
+        guard let renderer = makeRenderer(mem) else { return }
+        let device = GPU3DDevice(backend: renderer)
+        renderer.device = device
+        computeBringUp(device, ctx: 1, buffers: 4, gpaBase: 0x10_0000) // ctx1 owns res 2..5
+        computeBringUp(device, ctx: 2, buffers: 3, gpaBase: 0x20_0000) // ctx2 owns res 2..4
+
+        var kd = GPU3DWire.KernelDesc()
+        kd.kernelID = GPU3DWire.kernelGEMM
+        kd.d0 = 2; kd.d1 = 2; kd.d2 = 2
+        kd.bufs = [.init(buf: 2), .init(buf: 3), .init(buf: 4), .init()]
+        // Same res ids, right ctx: ctx 2's own buffers complete the run.
+        let fine = FakeElement(computeReq(kd, ctx: 2, fence: 0xBEEF_0003))
+        drive(device, [fine])
+        let completions = renderer.gpuCompletions
+        waitUntil({ renderer.gpuCompletions > completions }, "Metal compute completion")
+        drive(device, [])
+        XCTAssertTrue(fine.returned)
+
+        // res 5 is live under ctx 1 — naming it from ctx 2 is a named
+        // binding refusal, not a resource the device would serve.
+        var kdBad = GPU3DWire.KernelDesc()
+        kdBad.kernelID = GPU3DWire.kernelSoftmax
+        kdBad.d0 = 1; kdBad.d1 = 8
+        kdBad.bufs = [.init(buf: 2), .init(buf: 5), .init(), .init()]
+        let bad = FakeElement(computeReq(kdBad, ctx: 2, fence: 0xBEEF_0004))
+        drive(device, [bad])
+        XCTAssertEqual(device.lastRefusal, .badKernelBinding)
+        XCTAssertEqual(responseType(bad), GPU3DWire.respErrInvalidResourceID)
+    }
 }

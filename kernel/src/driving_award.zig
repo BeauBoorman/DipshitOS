@@ -58,6 +58,7 @@ pub const geom = @import("wnd_core.zig"); // M32 WMS3 (issue #623): the shared p
 pub const process = @import("process.zig"); // #1056 item 2: resolve a window's owning process name (the non-tabapp tab-title fallback)
 pub const terminal = @import("terminal.zig"); // #1082 (ADR 0020 A4/A6): window-bound terminal grid + close auto-detach
 pub const gpu3d_broker = @import("gpu3d_broker.zig"); // M102d1 (#2166): window death revokes its GPU3D context (remove_user_at)
+const gpu3d_compute = @import("gpu3d_compute.zig"); // M111b (#2409): owner death revokes its compute session (close_owner)
 
 /// M27 G13: Focus-follows-mouse configuration and dialog previous-focus tracking
 pub var focus_follows_mouse: bool = false;
@@ -2199,6 +2200,11 @@ pub fn resize_current_id() ?u8 {
 /// exited process's pid). Returns how many windows were released. Pure
 /// BSS writes (safe in the exception context the exit path runs in).
 pub fn close_owner(owner: usize) usize {
+    // M111b (#2409): a dying owner's GPU3D compute session revokes here —
+    // the one per-process teardown funnel the exit inventory reaches
+    // (compute binds no window, so remove_user_at never sees it). Handle
+    // invalidation first, the bounded device drain second.
+    gpu3d_compute.owner_exit(owner);
     // M52 card 3 (#1240): a dead drag SOURCE leaves no live pointer capture.
     // The Arc4 #237 drag payload is process-scoped (`drag_source_pid`) and
     // its only clear sites are the drop path and `sys_drag_read`, so a

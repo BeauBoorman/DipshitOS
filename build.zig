@@ -2061,6 +2061,10 @@ pub fn build(b: *std.Build) void {
         // wire contract plus the transport/context lifecycle against a
         // fake-device transcript (class A; the VZ render is a later card).
         "kernel/src/gpu3d_device.zig",
+        // M111b (issue #2409): the compute broker behind slot 90 — its
+        // fake-device transcripts pin the session/buffer/RUN lifecycle
+        // and every named refusal (class A).
+        "kernel/src/gpu3d_compute.zig",
         "kernel/src/gpu3d_wire.zig",
         "kernel/src/handoff.zig",
         "kernel/src/input.zig",

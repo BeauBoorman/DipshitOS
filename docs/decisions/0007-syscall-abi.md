@@ -2576,3 +2576,31 @@ RGB565 thumbnail — the full frame is never copied out in one call.
 bounded thumbnail, a seatless daemon answers `seat_absent`. Every other
 spec keeps its wire shape; the framebuffer was never readable at EL0
 before, so nothing changes for existing callers.
+
+## Amendment (2026-10-17, M111b #2409 — slot 90 `sys_gpucomp`, the bounded GPU-compute seam; slot 89 reserved)
+
+ADR 0053's compute surface needs one syscall that is NOT a seat
+subcommand: slot 65's broker is window-geometry-shaped (the cmd-22
+descriptor carries window_id) and compute sessions are process-owned,
+not window-owned. This additive amendment freezes slot 90 in the
+dispatch table (every existing number stays frozen;
+`implemented_count` is now 91). Slot 89 is simultaneously frozen as the
+named ENOSYS reservation ADR 0054 holds for `sys_grant_admin` — a dense
+table means the reservation is a real row, not a hole.
+
+| 89 | `sys_grant_admin` | reserved — ADR 0054 | Named ENOSYS stub until M113c lands it; the row exists so the table stays dense. |
+| 90 | `sys_gpucomp` | `gpucomp(op, a0, a1, a2, ptr, len) -> i64` | Copy the frozen 128-byte descriptor at `ptr` in through checked uaccess and run its broker op (`gpu3d_compute.zig`: OPEN/CLOSE/BUF_ALLOC/BUF_FREE/WRITE/READ/SEAL/RUN/STATS). `a0` must echo `desc.op` and `a1..a3` must be zero — a mismatch is `EINVAL` before the descriptor is even fetched. `len` must equal exactly 128. Ops: OPEN takes the single owner-keyed session (generation-bearing handle, `ENOSPC` when taken, `ENXIO` when no VIC1 device or `ready=0`); BUF_ALLOC bounds buffers at 16 per session / 16 MiB each (`flags` bit 0 selects the weight class that stages through the shared 4 MiB window); WRITE/READ move bytes through one fenced transfer per call (`arg_a`=user VA, `arg_b`=len, `arg_c`=buffer offset); SEAL detaches a buffer's backing (later WRITE/READ is `EINVAL`); RUN validates and submits the embedded 64-byte kernel descriptor — GEMM (id 1, `M·N ≤ 2²²`), SOFTMAX (id 2, cols `2..49152`, `rows·cols ≤ 2²²`), DEQUANT (id 3, group `∈{32,64,128}`, `n ≤ 2²⁴`) — and returns when the device fence completes, since the kernel's bounded exchange IS the fence wait; STATS copies the frozen 64-byte counters block to `arg_a` and needs no handle. Refusals: `EINVAL` malformed descriptor/shape/binding; `EBADF` bad or stale (post-generation-bump) handle; `ENOSPC` pool or tenancy exhausted; `ENXIO`/`ENOSYS` no device; `EAGAIN` device busy (one outstanding); `ETIMEDOUT` exchange deadline (poisons the session; `ENOENT` thereafter); `EFAULT` bad user VA; `EIO` device-level fault. Owner exit revokes: the generation is bumped first, then the session drains — every later op on the stale handle is `EBADF`. |
+
+The EL0 consumer is `vi.Gpucomp` (user/go/vi/gpucompute.go) with the
+`gpu3d` package's `ComputeSession` — open/alloc/write/run/read/close and
+the named error table mirroring this refusal list. The gate evidence is
+leg 09 of `live-gpu3d.spec`: a 2×2 f16 GEMM round trip pinned to
+`19,22,43,50` plus a kernel-id refusal that must not poison the session.
+
+### Observable contract
+
+`gputriangle gemm` prints `gputri: gemm c=19,22,43,50` only after the
+fence-matched readback verifies; `gputriangle gemmrefuse` prints the
+named `refused invalid` and a live STATS line. On a host without the
+VIC1 capset (or `ready=0`) the journeys answer `gputri: unsupported` and
+no compute receipt exists — the same honesty rule as the render legs.

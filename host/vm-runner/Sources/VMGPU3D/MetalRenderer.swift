@@ -71,6 +71,74 @@ fragment float4 virelai_fragment(VirglOut in [[stage_in]]) {
 }
 """
 
+/// The M111 kernel library v1 (ADR 0053 D3) — three compute kernels, the
+/// entire shader language: GEMM (f16 in/out, f32 accumulate, optional
+/// f16 bias[N] and a B-as-[N,K] transpose flag), row-wise SOFTMAX on f32,
+/// and DEQUANT (i8 symmetric / u4 asymmetric, low nibble first). Original
+/// host MSL written for this card — no third-party shader code.
+private let virelaiComputeMSL = """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void vic1_gemm(device const half *a [[buffer(0)]],
+                      device const half *b [[buffer(1)]],
+                      device half *c       [[buffer(2)]],
+                      device const half *bias [[buffer(3)]],
+                      constant uint &m     [[buffer(4)]],
+                      constant uint &n     [[buffer(5)]],
+                      constant uint &k     [[buffer(6)]],
+                      constant uint &flags [[buffer(7)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= n || gid.y >= m) return;
+    float acc = 0.0f;
+    for (uint kk = 0; kk < k; kk++) {
+        float av = float(a[gid.y * k + kk]);
+        /* flags bit1: B is [N,K] (transposed); bit0: buf3 carries bias[N] */
+        float bv = (flags & 2u) ? float(b[gid.x * k + kk]) : float(b[kk * n + gid.x]);
+        acc += av * bv;
+    }
+    if (flags & 1u) acc += float(bias[gid.x]);
+    c[gid.y * n + gid.x] = half(acc);
+}
+
+kernel void vic1_softmax(device const float *in  [[buffer(0)]],
+                         device float *out       [[buffer(1)]],
+                         constant uint &rows     [[buffer(4)]],
+                         constant uint &cols     [[buffer(5)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= rows) return;
+    device const float *src = in + gid * cols;
+    device float *dst = out + gid * cols;
+    float mx = src[0];
+    for (uint i = 1; i < cols; i++) mx = max(mx, src[i]);
+    float sum = 0.0f;
+    for (uint i = 0; i < cols; i++) sum += exp(src[i] - mx);
+    float inv = 1.0f / sum;
+    for (uint i = 0; i < cols; i++) dst[i] = exp(src[i] - mx) * inv;
+}
+
+kernel void vic1_dequant(device const uchar *q      [[buffer(0)]],
+                         device const float *scales [[buffer(1)]],
+                         device const float *zeros  [[buffer(2)]],
+                         device half *out           [[buffer(3)]],
+                         constant uint &n           [[buffer(4)]],
+                         constant uint &group       [[buffer(5)]],
+                         constant uint &fmt         [[buffer(6)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    uint g = gid / group;
+    if (fmt == 1u) {
+        /* i8 symmetric: out = q * s */
+        out[gid] = half(float(char(q[gid])) * scales[g]);
+    } else {
+        /* u4 asymmetric: 2 nibbles/byte, low nibble first; out=(q4-z)*s */
+        uchar packed = q[gid >> 1];
+        int nib = (gid & 1u) ? int(packed >> 4) : int(packed & 0xfu);
+        out[gid] = half((float(nib) - zeros[g]) * scales[g]);
+    }
+}
+"""
+
 /// The Metal backend for the VIR1 render device. Failable: no Metal
 /// device means the card's named BLOCKED — `init` returns nil, the
 /// device keeps advertising ready=0, and nothing manufactures a
@@ -87,20 +155,24 @@ public final class GPU3DMetalRenderer: GPU3DBackend {
         var uploadedBytes = 0
     }
 
-    /// A render submission whose fence is not yet reported. Retains the
-    /// Metal objects the in-flight command buffer references until the
-    /// completion handler runs — a reset/close cannot free memory the
-    /// GPU still touches.
+    /// A render/compute submission whose fence is not yet reported.
+    /// Retains the Metal objects the in-flight command buffer references
+    /// until the completion handler runs — a reset/close cannot free
+    /// memory the GPU still touches.
     private final class InFlight {
         let serial: UInt64
         let ctxID: UInt32
-        let texture: MTLTexture
+        let texture: MTLTexture?
         let buffer: MTLBuffer?
+        /// Compute dispatches retain every bound buffer (M111).
+        let buffers: [MTLBuffer]
         var arrived = false    // Metal completion handler ran
         var completed = false  // completion is reportable (release gates)
-        init(serial: UInt64, ctxID: UInt32, texture: MTLTexture, buffer: MTLBuffer?) {
+        init(serial: UInt64, ctxID: UInt32, texture: MTLTexture?,
+             buffer: MTLBuffer?, buffers: [MTLBuffer] = []) {
             self.serial = serial; self.ctxID = ctxID
             self.texture = texture; self.buffer = buffer
+            self.buffers = buffers
         }
     }
 
@@ -108,6 +180,13 @@ public final class GPU3DMetalRenderer: GPU3DBackend {
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
     private let memory: GPU3DMemory
+    /// M111 (ADR 0053): the three compute pipelines + the dummy binding
+    /// for absent descriptor slots. Nil only when the compute MSL failed
+    /// to build — render stays live, VIC1 reports ready=0.
+    private var computePipelines: (gemm: MTLComputePipelineState,
+                                   softmax: MTLComputePipelineState,
+                                   dequant: MTLComputePipelineState)?
+    private var computeDummy: MTLBuffer?
     /// The device core this backend serves — the read-only channel for
     /// the held request's fence id (b2's frozen interface carries the
     /// guest's u64 fence only in the held element).
@@ -188,9 +267,31 @@ public final class GPU3DMetalRenderer: GPU3DBackend {
         self.pipeline = pipeline
         self.memory = memory
         self.metalDeviceName = mtl.name
+
+        // M111 compute: build the three pipelines alongside render. A
+        // compute build failure degrades to VIC1 ready=0 — the render
+        // profile this device already promised is unaffected.
+        if let lib = try? mtl.makeLibrary(source: virelaiComputeMSL, options: nil),
+           let fGemm = lib.makeFunction(name: "vic1_gemm"),
+           let fSoftmax = lib.makeFunction(name: "vic1_softmax"),
+           let fDequant = lib.makeFunction(name: "vic1_dequant"),
+           let pGemm = try? mtl.makeComputePipelineState(function: fGemm),
+           let pSoftmax = try? mtl.makeComputePipelineState(function: fSoftmax),
+           let pDequant = try? mtl.makeComputePipelineState(function: fDequant),
+           let dummy = mtl.makeBuffer(length: 16, options: .storageModeShared) {
+            computePipelines = (pGemm, pSoftmax, pDequant)
+            computeDummy = dummy
+        }
     }
 
     public var gpu3dReady: Bool { true }
+    /// VIC1 word 7: 1 only when all three pipelines built.
+    public var gpu3dComputeReady: Bool { computePipelines != nil }
+
+    /// Compute dispatches actually encoded to Metal.
+    public private(set) var computeSubmits = 0
+    /// Compute submissions refused before any Metal work.
+    public private(set) var computeRefusals = 0
 
     // MARK: - Lifecycle
 
@@ -350,31 +451,55 @@ public final class GPU3DMetalRenderer: GPU3DBackend {
         }
         let t = transfer
         if toHost {
-            // The only profile upload: a linear buffer range into the
-            // vertex buffer. Box must be a flat run at offset 0..len.
-            guard res.buffer != nil, t.box.x == 0, t.box.y == 0, t.box.z == 0,
+            // A linear buffer range: box.x is the resource-side offset,
+            // offset is the offset into the attached backing (the virtio
+            // contract). The pinned render upload uses x=0/offset=0;
+            // compute's chunked weight/I/O writes ride the general form
+            // (ADR 0053 D4 — the staging window sits at backing offset 0).
+            guard res.buffer != nil, t.box.y == 0, t.box.z == 0,
                   t.box.h == 1, t.box.d == 1, t.stride == 0, t.layerStride == 0,
                   UInt64(t.box.w) + t.offset <= backingBytes(res),
-                  t.offset + UInt64(t.box.w) <= UInt64(res.spec.width) else {
+                  UInt64(t.box.x) + UInt64(t.box.w) <= UInt64(res.spec.width) else {
                 return .failed(.refused)
             }
+            // A write racing in-flight compute could mix halves of a
+            // tensor — refuse rather than let the GPU read a prefix.
+            if let f = inFlight, !f.completed { return .failed(.refused) }
             guard let bytes = readBacking(res.backing, offset: t.offset,
                                           count: Int(t.box.w)) else {
                 return .failed(.faulted)
             }
             var updated = res
-            let dst = updated.buffer!.contents().advanced(by: Int(t.offset))
+            let dst = updated.buffer!.contents().advanced(by: Int(t.box.x))
             dst.copyMemory(from: bytes, byteCount: bytes.count)
             updated.uploadedBytes = max(updated.uploadedBytes,
-                                        Int(t.offset) + bytes.count)
+                                        Int(t.box.x) + bytes.count)
             contexts[ctxID]?[t.resourceID] = updated
             return .done
         }
 
-        // Readback: BGRA8 ordered AFTER the draw — in-flight incomplete
-        // work for this context means the pixels are not final; refuse
-        // rather than return a prefix of the frame.
+        // Readback: ordered AFTER in-flight work — the pixels/values are
+        // not final until the held fence completes; refuse rather than
+        // return a prefix of the result.
         if let f = inFlight, !f.completed { return .failed(.refused) }
+        if let buffer = res.buffer {
+            // M111 (ADR 0053 D4): a target_buffer readback is the linear
+            // case — box.x selects the resource range, offset the
+            // backing destination. No texture, no stride.
+            guard t.box.y == 0, t.box.z == 0, t.box.d == 1, t.box.h == 1,
+                  t.stride == 0, t.layerStride == 0,
+                  UInt64(t.box.x) + UInt64(t.box.w) <= UInt64(res.spec.width),
+                  t.offset + UInt64(t.box.w) <= backingBytes(res) else {
+                return .failed(.refused)
+            }
+            let src = buffer.contents().advanced(by: Int(t.box.x))
+            let bytes = Array(UnsafeBufferPointer(
+                start: src.assumingMemoryBound(to: UInt8.self), count: Int(t.box.w)))
+            guard writeBacking(res.backing, offset: t.offset, bytes: bytes) else {
+                return .failed(.faulted)
+            }
+            return .done
+        }
         guard let texture = res.texture, t.box.x == 0, t.box.y == 0, t.box.z == 0,
               t.box.d == 1, t.box.w == res.spec.width, t.box.h == res.spec.height,
               t.offset == 0, t.stride == res.spec.width * 4, t.layerStride == 0,
@@ -495,6 +620,100 @@ public final class GPU3DMetalRenderer: GPU3DBackend {
             // never reports; withhold mode waits for release.
             self?.noteGPUCompletion(record)
         }
+        inFlight = record
+        cb.commit()
+        lock.unlock()
+        return fenceCompletionIsGPUCompletion ? .deferred : .done
+    }
+
+    // MARK: - Compute (M111, issue #2409 / ADR 0053)
+
+    /// COMPUTE_SUBMIT: dispatch one frozen kernel. The device dispatcher
+    /// has already proven the descriptor's shape and bindings; the
+    /// backend re-resolves each slot against ITS own table so a binding
+    /// is never trusted without a live MTLBuffer behind it. Same one-
+    /// in-flight rule, same fence seam: the request completes only when
+    /// the Metal command buffer's completion handler fires.
+    public func gpu3dComputeSubmit(context ctxID: UInt32,
+                                   desc: GPU3DWire.KernelDesc) -> GPU3DWorkResult {
+        lock.lock()
+        func refuse() -> GPU3DWorkResult {
+            computeRefusals += 1
+            lock.unlock()
+            return .failed(.refused)
+        }
+        guard inFlight == nil else {
+            lock.unlock()
+            return .failed(.refused)
+        }
+        guard let pipes = computePipelines, let dummy = computeDummy else {
+            return refuse()
+        }
+        guard let table = contexts[ctxID] else { return refuse() }
+
+        // Resolve the four slots; absent ({0,0}) slots take the dummy so
+        // a declared binding is never nil.
+        var bound: [MTLBuffer] = []
+        var offsets: [Int] = []
+        for slot in desc.bufs {
+            if slot.buf == 0 {
+                bound.append(dummy)
+                offsets.append(0)
+                continue
+            }
+            guard let res = table[slot.buf], res.attached, let buf = res.buffer else {
+                return refuse()
+            }
+            bound.append(buf)
+            offsets.append(Int(slot.byteOff))
+        }
+
+        guard let cb = queue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else {
+            lock.unlock()
+            return .failed(.faulted)
+        }
+        var grid = MTLSize(width: 1, height: 1, depth: 1)
+        var tg = MTLSize(width: 64, height: 1, depth: 1)
+        switch desc.kernelID {
+        case GPU3DWire.kernelGEMM:
+            enc.setComputePipelineState(pipes.gemm)
+            for i in 0..<4 { enc.setBuffer(bound[i], offset: offsets[i], index: i) }
+            var m = desc.d0, n = desc.d1, k = desc.d2, fl = desc.flags
+            enc.setBytes(&m, length: 4, index: 4)
+            enc.setBytes(&n, length: 4, index: 5)
+            enc.setBytes(&k, length: 4, index: 6)
+            enc.setBytes(&fl, length: 4, index: 7)
+            grid = MTLSize(width: Int(n), height: Int(m), depth: 1)
+            tg = MTLSize(width: 8, height: 8, depth: 1)
+        case GPU3DWire.kernelSoftmax:
+            enc.setComputePipelineState(pipes.softmax)
+            for i in 0..<2 { enc.setBuffer(bound[i], offset: offsets[i], index: i) }
+            var rows = desc.d0, cols = desc.d1
+            enc.setBytes(&rows, length: 4, index: 4)
+            enc.setBytes(&cols, length: 4, index: 5)
+            grid = MTLSize(width: Int(desc.d0), height: 1, depth: 1)
+        case GPU3DWire.kernelDequant:
+            enc.setComputePipelineState(pipes.dequant)
+            for i in 0..<4 { enc.setBuffer(bound[i], offset: offsets[i], index: i) }
+            var n = desc.d0, g = desc.d1, fmt = desc.aux & 0xff
+            enc.setBytes(&n, length: 4, index: 4)
+            enc.setBytes(&g, length: 4, index: 5)
+            enc.setBytes(&fmt, length: 4, index: 6)
+            grid = MTLSize(width: Int(desc.d0), height: 1, depth: 1)
+        default:
+            enc.endEncoding()
+            return refuse()
+        }
+        enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+
+        computeSubmits += 1
+        let serial = nextSerial
+        nextSerial += 1
+        let record = InFlight(serial: serial, ctxID: ctxID,
+                              texture: nil, buffer: nil, buffers: bound)
+        cb.addCompletedHandler { [weak self] _ in self?.noteGPUCompletion(record) }
         inFlight = record
         cb.commit()
         lock.unlock()

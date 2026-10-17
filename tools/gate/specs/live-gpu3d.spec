@@ -2,12 +2,13 @@
 # (GPUTRIANGLE.ELF) drives the opt-in VIR1 render device over the real seat
 # -> broker -> Metal path; the private profile's raw BGRA readback export and
 # the VZ scanout are pixel-proven by f1's independent comparator/geometry.
-# Eight independent boots, one leg each: 01 triangle, 02 mixed margins,
+# Nine independent boots, one leg each: 01 triangle, 02 mixed margins,
 # 03 resize/second generation, 04 close/reuse, 05 native-only (no render
 # device), 06 malformed/auth (invalid battery + forged kind-17), 07
-# wrong/stale fence, 08 stall/timeout + next-open drain. `wm=none` is
-# seeded so the seat is the spec's own scripted exec; every leg ends on a
-# marker only its script can print. Leg 05 RUNS FIRST: the seed share is
+# wrong/stale fence, 08 stall/timeout + next-open drain, 09 M111b GPU
+# compute (slot-90 GEMM submit->fence->readback + named refusal). `wm=none`
+# is seeded so the seat is the spec's own scripted exec; every leg ends on
+# a marker only its script can print. Leg 05 RUNS FIRST: the seed share is
 # spec-scoped, so its no-receipt assert is only honest before any 3D leg
 # has written GPUTRI/ files to it.
 # exec-order: assert-proven -- each run's expect marker is printed by the
@@ -15,7 +16,7 @@
 # device/app never ran cannot pass. HOST PREREQUISITE (fails honestly):
 #   bash tools/go/build-gotabwm.sh tools/go/build-gputriangle.sh
 
-vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 8 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle"
+vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 9 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -46,6 +47,14 @@ EOF
 
 vgate_file script-forged.txt <<'EOF'
 exec GPUTRIANGLE.ELF forged
+EOF
+
+vgate_file script-gemm.txt <<'EOF'
+exec GPUTRIANGLE.ELF gemm
+EOF
+
+vgate_file script-gemmrefuse.txt <<'EOF'
+exec GPUTRIANGLE.ELF gemmrefuse
 EOF
 
 vgate_file script-rx.txt <<'EOF'
@@ -398,3 +407,53 @@ vgate_assert 08 serial-contains 'gputri OK'
 vgate_assert 08 serial-absent 'gputri: published'
 vgate_assert 08 output-contains 'retired-pending=1'
 vgate_assert 08 output-contains 'stale-fences=0'
+
+# --- leg 09: GPU compute round trip + refusal (M111b, issue #2409) -------
+# The same physical device, the second capset: GPUTRIANGLE's `gemm`
+# journey opens a sys_gpucomp session (slot 90), stages A=[[1,2],[3,4]]
+# and B=[[5,6],[7,8]] into target-buffer resources, submits the pinned
+# 2x2 f16 GEMM — the RUN call IS the bounded fence wait — and reads C
+# back through the pool. [[19,22],[43,50]] on the console is the observed
+# product of a REAL Metal compute pipeline, not a guest-side answer.
+# `gemmrefuse` then runs a descriptor with kernel id 9 — outside the
+# curated mask — and must see the named EINVAL refusal while the session
+# stays live enough to answer STATS (a refusal is not a poison).
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-gemm.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-gemmrefuse.txt' \
+    --script3-after 'gputri OK' \
+    --script-expect 'gputri: stats refusals=1' --timeout 180
+
+vgate_assert 09 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 09 serial-contains 'gputri: gemm c=19,22,43,50 submits='
+vgate_assert 09 serial-contains 'gputri: refused invalid'
+vgate_assert 09 serial-contains 'gputri: stats refusals=1'
+vgate_assert 09 serial-absent 'gpu3d: timeout'
+vgate_assert 09 serial-absent 'gpu3d: badresp'
+vgate_assert 09 serial-absent '[EXC] parking:'
+# The runner advertised the second capset and a REAL compute pipeline —
+# compute=1 is the honest-ready bit, not a capability claim.
+vgate_assert 09 output-contains 'VIC1 capset 0x56494331'
+vgate_assert 09 output-contains 'compute=1'
+# One compute submit reached Metal; the kernel-id refusal happened
+# guest-side and never touched the device — zero renders, zero refusals.
+vgate_assert 09 output-contains 'compute-submits=1 compute-refusals=0'
+vgate_assert 09 output-contains 'draws=0'
+vgate_assert 09 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+gemm = open(os.path.join(share, "GPUTRI", "RECEIPT-GEMM.TSV")).read()
+refuse = open(os.path.join(share, "GPUTRI", "RECEIPT-REFUSE.TSV")).read()
+for row in ("compute\talloc", "compute\tuploaded", "compute\tfence-ok",
+            "compute\tpublished\tc=19,22,43,50\tsubmits=1\tcompleted=1"):
+    if row not in gemm:
+        sys.exit("gemm receipt missing %r\n%s" % (row, gemm))
+for row in ("compute\trefused\tinvalid", "compute\tstats\trefusals=1"):
+    if row not in refuse:
+        sys.exit("refuse receipt missing %r\n%s" % (row, refuse))
+print("compute receipt rows verified")
+PY

@@ -12,6 +12,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"virelai/gpu3d"
 	"virelai/vi"
@@ -595,5 +596,183 @@ func TestSceneVertsMapToFixturePixels(t *testing.T) {
 		if v.RGB != 0xf800 {
 			t.Fatalf("sceneVerts[%d] rgb %#x want red 0xf800", i, v.RGB)
 		}
+	}
+}
+
+// --- M111b compute journeys (issue #2409) -------------------------------------
+//
+// The guest side of slot 90 pinned host-side: a fake kernel answers the
+// sys_gpucomp descriptor stream — WRITE/READ move bytes through the app's
+// own mapped windows (the desc's arg_a is a real VA into them), and
+// RUN(GEMM) computes C = A·B in f16, so the pinned readback exercises the
+// whole encode→dispatch→readback chain.
+
+// compKernel fakes sys_gpucomp: buffers are byte slices keyed by issued
+// handle; descriptor VAs resolve through the windows CompMap handed out.
+type compKernel struct {
+	maps     map[uintptr][]byte // window base VA -> window
+	bufs     map[uint64][]byte
+	nextBuf  uint64
+	submits  uint64
+	refusals uint64
+}
+
+func (k *compKernel) mmap(_ uintptr, size int, _, _ uint64) ([]byte, error) {
+	b := make([]byte, size)
+	k.maps[sliceAddr(b)] = b
+	return b, nil
+}
+
+func sliceAddr(b []byte) uintptr {
+	if len(b) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&b[0]))
+}
+
+// window resolves a descriptor VA (arg_a) + length into the mapped window
+// that contains it — the same range check the kernel's uaccess does.
+func (k *compKernel) window(va uint64, n uint64) []byte {
+	for base, b := range k.maps {
+		if va >= uint64(base) && va+uint64(n) <= uint64(base)+uint64(len(b)) {
+			return b[va-uint64(base):][:n]
+		}
+	}
+	return nil
+}
+
+func u64le(b []byte) uint64 {
+	var v uint64
+	for i := 0; i < 8; i++ {
+		v |= uint64(b[i]) << (8 * i)
+	}
+	return v
+}
+
+func gpu3dLE32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+func (k *compKernel) sys(desc []byte) int64 {
+	if len(desc) != vi.GpucompDescBytes {
+		return -vi.ErrEINVAL
+	}
+	switch op := gpu3dLE32(desc[0:]); op {
+	case vi.GpucompOpen:
+		k.bufs = map[uint64][]byte{}
+		return 0x1_0007 // generation 1 | ctx 7
+	case vi.GpucompClose:
+		return 0
+	case vi.GpucompBufAlloc:
+		k.nextBuf++
+		h := 1<<24 | k.nextBuf<<16 | 0x7 // gen | slot | ctx — buffer handle
+		k.bufs[h] = make([]byte, u64le(desc[16:]))
+		return int64(h)
+	case vi.GpucompWrite, vi.GpucompRead:
+		h := u64le(desc[8:])
+		b, ok := k.bufs[h]
+		if !ok {
+			return -vi.ErrEBADF
+		}
+		win := k.window(u64le(desc[16:]), u64le(desc[24:]))
+		if win == nil {
+			return -vi.ErrEFAULT
+		}
+		off := u64le(desc[32:])
+		if off+uint64(len(win)) > uint64(len(b)) {
+			return -vi.ErrEINVAL
+		}
+		if op == vi.GpucompWrite {
+			copy(b[off:], win)
+		} else {
+			copy(win, b[off:])
+		}
+		return 0
+	case vi.GpucompRun:
+		if gpu3dLE32(desc[64:]) != vi.GpuKernelGEMM {
+			k.refusals++
+			return -vi.ErrEINVAL // kernel id outside the curated mask
+		}
+		k.submits++
+		a := k.bufs[u64le(desc[88:])]
+		bb := k.bufs[u64le(desc[96:])]
+		c := k.bufs[u64le(desc[104:])]
+		if a == nil || bb == nil || c == nil {
+			k.refusals++
+			return -vi.ErrEINVAL
+		}
+		f := func(x []byte, i int) float32 {
+			return gpu3d.F32bits(uint16(x[2*i]) | uint16(x[2*i+1])<<8)
+		}
+		for r := 0; r < 2; r++ {
+			for cc := 0; cc < 2; cc++ {
+				v := f(a, r*2)*f(bb, cc) + f(a, r*2+1)*f(bb, 2+cc)
+				h := gpu3d.F16bits(v)
+				c[2*(r*2+cc)] = byte(h)
+				c[2*(r*2+cc)+1] = byte(h >> 8)
+			}
+		}
+		return 0
+	case vi.GpucompStats:
+		dst := k.window(u64le(desc[16:]), 64)
+		if dst == nil {
+			return -vi.ErrEFAULT
+		}
+		for i := range dst[:64] {
+			dst[i] = 0
+		}
+		for i := 0; i < 8; i++ {
+			dst[32+i] = byte(k.submits >> (8 * i)) // submits
+			dst[40+i] = byte(k.submits >> (8 * i)) // completed
+			dst[48+i] = byte(k.refusals >> (8 * i))
+		}
+		return 0
+	}
+	return -vi.ErrEINVAL
+}
+
+// compJourney swaps the package seams: CompSyscall answers the descriptor
+// stream and CompMap registers each window under its REAL base address so
+// the desc's arg_a resolves the way uaccess would.
+func compJourney(t *testing.T, h *fakeHost, k *compKernel, journey string) error {
+	t.Helper()
+	oldSys, oldMap := gpu3d.CompSyscall, gpu3d.CompMap
+	gpu3d.CompSyscall = k.sys
+	gpu3d.CompMap = k.mmap
+	t.Cleanup(func() { gpu3d.CompSyscall, gpu3d.CompMap = oldSys, oldMap })
+	return run(h, journey)
+}
+
+func TestGemmJourneyRoundTrip(t *testing.T) {
+	h, _ := newFakeHost()
+	k := &compKernel{maps: map[uintptr][]byte{}}
+	if err := compJourney(t, h, k, "gemm"); err != nil {
+		t.Fatalf("gemm: %v", err)
+	}
+	if !hasLine(h, "gputri: gemm c=19,22,43,50") {
+		t.Fatalf("markers: %v", h.lines)
+	}
+	if !hasLine(h, "gputri OK") {
+		t.Fatalf("markers: %v", h.lines)
+	}
+	if k.submits != 1 {
+		t.Fatalf("submits=%d", k.submits)
+	}
+}
+
+func TestGemmRefuseJourneyNamesTheRefusal(t *testing.T) {
+	h, _ := newFakeHost()
+	k := &compKernel{maps: map[uintptr][]byte{}}
+	if err := compJourney(t, h, k, "gemmrefuse"); err != nil {
+		t.Fatalf("gemmrefuse: %v", err)
+	}
+	if !hasLine(h, "gputri: refused invalid") {
+		t.Fatalf("markers: %v", h.lines)
+	}
+	if !hasLine(h, "gputri: stats refusals=1") {
+		t.Fatalf("markers: %v", h.lines)
+	}
+	if k.submits != 0 {
+		t.Fatalf("a refusal must not submit")
 	}
 }

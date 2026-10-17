@@ -764,6 +764,51 @@ pub fn probe_caps() Error!wire.Vir1Caps {
 }
 
 // ---------------------------------------------------------------------------
+// The VIC1 compute profile probe (M111, ADR 0053 D1) — separate from
+// probe_caps so a device with no second capset keeps VIR1 intact. An
+// index-1 refusal or a non-VIC1 answer is Unsupported: guest-side every
+// compute op then answers ENXIO and the render path never notices.
+// ---------------------------------------------------------------------------
+
+/// The validated VIC1 profile (valid only when `vic1_valid`).
+pub var vic1: wire.Vic1Caps = .{ .version = 0, .max_buffers_per_ctx = 0, .max_buffer_bytes = 0, .kernels_mask = 0, .max_dim = 0, .max_elems = 0, .reserved = 0, .ready = 0 };
+pub var vic1_valid: bool = false;
+
+/// GET_CAPSET_INFO index 1 -> GET_CAPSET VIC1 v1. Every bound word is
+/// pinned (same rule as probe_caps); a device that refuses index 1 or
+/// answers a different profile maps to the same named refusals.
+pub fn probe_vic1() Error!wire.Vic1Caps {
+    var req: [wire.ctx_create_req_len]u8 = undefined;
+    const n1 = wire.encode_get_capset_info(&req, wire.capset_index_compute, next_fence());
+    const c1 = exchange(req[0..n1], wire.resp_ok_capset_info, wire.get_capset_info_resp_len) catch |e| {
+        // The device has no second capset (an ERR reply or a
+        // broken/timed-out exchange) — compute is unsupported.
+        if (e == error.BadResponse or e == error.ResponseTruncated or e == error.ResponseOversized) return error.Unsupported;
+        return e;
+    };
+    const info = wire.parse_capset_info(resp_bytes(c1.used_len)) orelse return error.CapsetTruncated;
+    if (info.capset_id != wire.capset_vic1) return error.CapsetProfile;
+    if (info.max_version != wire.vic1_version) return error.CapsetVersion;
+    if (info.max_size != wire.vic1_payload_len) return error.CapsetSize;
+
+    const n2 = wire.encode_get_capset(&req, wire.capset_vic1, wire.vic1_version, next_fence());
+    const c2 = try exchange(req[0..n2], wire.resp_ok_capset, wire.capset_resp_hdr_len + wire.vic1_payload_len);
+    if (c2.used_len != wire.capset_resp_hdr_len + wire.vic1_payload_len) return error.CapsetTruncated;
+    const found = wire.parse_vic1(resp_bytes(c2.used_len)[wire.capset_resp_hdr_len..]) orelse return error.CapsetTruncated;
+    if (found.version != wire.vic1_version or
+        found.max_buffers_per_ctx != wire.vic1_max_buffers or
+        found.max_buffer_bytes != wire.vic1_max_buffer_bytes or
+        found.kernels_mask != wire.vic1_kernels_mask or
+        found.max_dim != wire.vic1_max_dim or
+        found.max_elems != wire.vic1_max_elems or
+        found.reserved != 0 or
+        found.ready > 1) return error.CapsetBounds;
+    vic1 = found;
+    vic1_valid = true;
+    return vic1;
+}
+
+// ---------------------------------------------------------------------------
 // The bounded context lifecycle
 // ---------------------------------------------------------------------------
 
@@ -797,6 +842,17 @@ pub fn live_count() usize {
         if (s.live) n += 1;
     }
     return n;
+}
+
+/// The first non-live ctx_id (1..`max_contexts`), or null when the shared
+/// pool is full — the compute broker's context allocator (M111): render
+/// and compute sessions draw from the SAME device-wide pool of 2, so a
+/// compute OPEN refuses ENOSPC whenever both slots are live.
+pub fn ctx_free_slot() ?u32 {
+    for (&slots, 0..) |s, i| {
+        if (!s.live) return @intCast(i + 1);
+    }
+    return null;
 }
 
 fn ctx_name(ctx_id: u32, buf: *[6]u8) []const u8 {
@@ -852,6 +908,8 @@ pub fn reset_state() void {
     fence_counter = 0;
     caps_valid = false;
     caps = .{ .version = 0, .max_width = 0, .max_height = 0, .contexts = 0, .resources_per_context = 0, .max_submit_bytes = 0, .shader_pair = 0, .ready = 0 };
+    vic1_valid = false;
+    vic1 = .{ .version = 0, .max_buffers_per_ctx = 0, .max_buffer_bytes = 0, .kernels_mask = 0, .max_dim = 0, .max_elems = 0, .reserved = 0, .ready = 0 };
     slots = @splat(.{ .live = false, .generation = 0 });
     g3_cmds = 0;
     g3_errors = 0;
@@ -888,6 +946,12 @@ const FakeDevice = struct {
     caps_ready: u32 = 1,
     caps_corrupt_idx: usize = 8, // index 8 = no overwrite
     caps_corrupt_val: u32 = 0,
+    // M111 (ADR 0053 D1): index-1 capset answers — absent means the fake
+    // device has no VIC1 and refuses the index with an error response.
+    vic1_present: bool = true,
+    vic1_ready: u32 = 1,
+    vic1_corrupt_idx: usize = 8,
+    vic1_corrupt_val: u32 = 0,
     reply_type_override: ?u32 = null,
     reply_ctx_override: ?u32 = null,
     reply_fence_override: ?u64 = null,
@@ -927,19 +991,35 @@ fn fake_wait(handle: u32, budget: usize) ?u32 {
     var len: usize = 0;
     switch (req_hdr.type) {
         wire.cmd_get_capset_info => {
-            len = wire.get_capset_info_resp_len;
-            write_resp_hdr(resp, wire.resp_ok_capset_info, req_hdr);
-            std.mem.writeInt(u32, resp[24..28], fake.capset_id, .little);
-            std.mem.writeInt(u32, resp[28..32], fake.capset_max_version, .little);
-            std.mem.writeInt(u32, resp[32..36], fake.capset_max_size, .little);
-            std.mem.writeInt(u32, resp[36..40], 0, .little);
+            const index = std.mem.readInt(u32, req[24..28], .little);
+            if (index == wire.capset_index_compute and !fake.vic1_present) {
+                // No second capset: an error reply echoing the request.
+                len = wire.nodata_resp_len;
+                write_resp_hdr(resp, wire.resp_err_unspec, req_hdr);
+            } else {
+                len = wire.get_capset_info_resp_len;
+                write_resp_hdr(resp, wire.resp_ok_capset_info, req_hdr);
+                const id: u32 = if (index == wire.capset_index_compute) wire.capset_vic1 else fake.capset_id;
+                std.mem.writeInt(u32, resp[24..28], id, .little);
+                std.mem.writeInt(u32, resp[28..32], fake.capset_max_version, .little);
+                std.mem.writeInt(u32, resp[32..36], fake.capset_max_size, .little);
+                std.mem.writeInt(u32, resp[36..40], 0, .little);
+            }
         },
         wire.cmd_get_capset => {
+            const id = std.mem.readInt(u32, req[24..28], .little);
             len = wire.capset_resp_hdr_len + wire.vir1_payload_len;
             write_resp_hdr(resp, wire.resp_ok_capset, req_hdr);
-            wire.encode_vir1_caps(resp[24..][0..wire.vir1_payload_len], fake.caps_ready);
-            if (fake.caps_corrupt_idx < 8) {
-                std.mem.writeInt(u32, resp[24 + fake.caps_corrupt_idx * 4 ..][0..4], fake.caps_corrupt_val, .little);
+            if (id == wire.capset_vic1) {
+                wire.encode_vic1_caps(resp[24..][0..wire.vic1_payload_len], fake.vic1_ready);
+                if (fake.vic1_corrupt_idx < 8) {
+                    std.mem.writeInt(u32, resp[24 + fake.vic1_corrupt_idx * 4 ..][0..4], fake.vic1_corrupt_val, .little);
+                }
+            } else {
+                wire.encode_vir1_caps(resp[24..][0..wire.vir1_payload_len], fake.caps_ready);
+                if (fake.caps_corrupt_idx < 8) {
+                    std.mem.writeInt(u32, resp[24 + fake.caps_corrupt_idx * 4 ..][0..4], fake.caps_corrupt_val, .little);
+                }
             }
         },
         wire.cmd_ctx_create => {

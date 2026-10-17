@@ -1798,7 +1798,7 @@ test "monitor: syscalls is registered and reports deterministic rows" {
     try std.testing.expectEqualStrings("numbered syscall table and counters", lookup("syscalls").?.help);
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{"syscalls"}));
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=89\n" ++
+        "syscalls: slots=64 implemented=90\n" ++
             "  0 sys_ping calls=0\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1887,7 +1887,10 @@ test "monitor: syscalls is registered and reports deterministic rows" {
             "  85 sys_udp_recv_from calls=0\n" ++
             "  86 sys_udp_close calls=0\n" ++
             "  87 sys_getpid calls=0\n" ++
-            "  88 sys_scanout_read calls=0\n",
+            "  88 sys_scanout_read calls=0\n" ++
+            // Slot 89 is the non-reportable ADR-0054 reservation stub;
+            // slot 90 is the real M111b compute seam.
+            "  90 sys_gpucomp calls=0\n",
         env.mock.contents(),
     );
 }

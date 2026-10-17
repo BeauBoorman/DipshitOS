@@ -182,10 +182,30 @@ public final class GPU3DDevice {
         let ctxID = req.header.ctxID
         switch req.command {
         case .getCapsetInfo(let index):
-            guard index == W.capsetIndex else { return .refuse(.invalidCapset) }
-            return .reply(type: W.respOkCapsetInfo, payload: W.capsetInfoPayload())
+            switch index {
+            case W.capsetIndex:
+                return .reply(type: W.respOkCapsetInfo, payload: W.capsetInfoPayload())
+            case W.vic1Index:
+                // M111 (ADR 0053 D1): index 1 is answered only when a
+                // backend is attached — a backend-less device advertises
+                // num_capsets=1 and this probe is the refusal.
+                guard backend != nil else { return .refuse(.invalidCapset) }
+                return .reply(type: W.respOkCapsetInfo,
+                              payload: W.capsetInfoPayload(capsetID: W.capsetVIC1,
+                                                           version: W.vic1Version,
+                                                           size: W.vic1PayloadSize))
+            default:
+                return .refuse(.invalidCapset)
+            }
 
         case .getCapset(let id, let version):
+            if id == W.capsetVIC1 {
+                guard backend != nil, version == W.vic1Version else {
+                    return .refuse(.invalidCapset)
+                }
+                return .reply(type: W.respOkCapset,
+                              payload: W.vic1CapsetPayload(ready: backend?.gpu3dComputeReady ?? false))
+            }
             guard id == W.capsetID, version == W.capsetVersion else {
                 return .refuse(.invalidCapset)
             }
@@ -242,8 +262,21 @@ public final class GPU3DDevice {
                 guard ctx.resources[spec.resourceID] == nil else {
                     return .refuse(.duplicateResource)
                 }
-                guard ctx.resources.count < W.maxResourcesPerContext else {
-                    return .refuse(.resourceLimit)
+                // Two resource budgets, one per profile (ADR 0053 D1/D3):
+                // render resources keep VIR1's pinned 2/context while
+                // target_buffer byte windows answer to VIC1's 16/context.
+                let buffers = ctx.resources.values.filter {
+                    $0.target == VirglStreamConst.targetBuffer
+                }.count
+                let renderResources = ctx.resources.count - buffers
+                if spec.target == VirglStreamConst.targetBuffer {
+                    guard buffers < W.vic1MaxBuffersPerCtx else {
+                        return .refuse(.resourceLimit)
+                    }
+                } else {
+                    guard renderResources < W.maxResourcesPerContext else {
+                        return .refuse(.resourceLimit)
+                    }
                 }
                 if backend.gpu3dCreateResource(context: ctxID, spec: spec) != nil {
                     return .refuse(.backendRefused)
@@ -324,7 +357,113 @@ public final class GPU3DDevice {
             return forward(req) { backend, _ in
                 work(backend.gpu3dSubmit(context: ctxID, stream: stream), req)
             }
+
+        case .computeSubmit(let kd):
+            return forward(req) { backend, ctx in
+                // The one-outstanding rule outranks per-request
+                // validation: a busy device never examined this
+                // descriptor (deviceBusy, same as a second deferred
+                // submit reaching work() below).
+                guard pending == nil else { return .refuse(.deviceBusy) }
+                // The frozen kernel library's own validation (ADR 0053
+                // D3): kernel id, dims, flags, aux and buffer bindings
+                // all refuse by name BEFORE the backend sees work.
+                if let why = validateKernelDesc(kd, ctx: ctx) {
+                    return .refuse(why)
+                }
+                return work(backend.gpu3dComputeSubmit(context: ctxID, desc: kd), req)
+            }
         }
+    }
+
+    /// The D3 kernel-descriptor checks the dispatcher owns: shape rules
+    /// (dims/flags/aux — `badKernelShape`, an id outside the mask —
+    /// `unknownKernel`) and buffer bindings (`badKernelBinding` — a slot
+    /// naming no attached target_buffer of THIS context, or a tensor
+    /// whose byte span overruns the buffer's extent). The wire decoder
+    /// already proved the envelope shape and reserved==0.
+    private func validateKernelDesc(_ kd: GPU3DWire.KernelDesc, ctx: Context) -> GPU3DRefusal? {
+        let W = GPU3DWire.self
+
+        // A used slot must name an attached target_buffer resource of this
+        // context and the declared tensor must fit its byte extent.
+        func bind(_ s: GPU3DWire.KernelDesc.Buf, need: UInt64) -> GPU3DRefusal? {
+            guard s.buf != 0,
+                  let res = ctx.resources[s.buf],
+                  ctx.attached.contains(s.buf),
+                  res.target == VirglStreamConst.targetBuffer else {
+                return .badKernelBinding
+            }
+            guard need <= UInt64(res.width),
+                  UInt64(s.byteOff) <= UInt64(res.width) - need else {
+                return .badKernelBinding
+            }
+            return nil
+        }
+
+        // An absent slot must be the all-zero pair — anything else is a
+        // shape violation, not a binding miss.
+        func absent(_ s: GPU3DWire.KernelDesc.Buf) -> GPU3DRefusal? {
+            (s.buf == 0 && s.byteOff == 0) ? nil : .badKernelShape
+        }
+
+        switch kd.kernelID {
+        case W.kernelGEMM:
+            guard kd.flags & ~(W.gemmFlagBias | W.gemmFlagBTransposed) == 0,
+                  kd.aux == 0, kd.reserved == 0 else { return .badKernelShape }
+            let m = UInt64(kd.d0), n = UInt64(kd.d1), k = UInt64(kd.d2)
+            guard m >= 1, n >= 1, k >= 1,
+                  m <= UInt64(W.vic1MaxDim), n <= UInt64(W.vic1MaxDim), k <= UInt64(W.vic1MaxDim),
+                  m * n <= UInt64(W.vic1Max2DElems) else { return .badKernelShape }
+            if let r = bind(kd.bufs[0], need: m * k * 2) { return r } // A f16 [M,K]
+            if let r = bind(kd.bufs[1], need: k * n * 2) { return r } // B f16
+            if let r = bind(kd.bufs[2], need: m * n * 2) { return r } // C f16 out
+            if kd.flags & W.gemmFlagBias != 0 {
+                if let r = bind(kd.bufs[3], need: n * 2) { return r } // bias f16 [N]
+            } else if let r = absent(kd.bufs[3]) { return r }
+
+        case W.kernelSoftmax:
+            guard kd.flags & ~W.softmaxFlagInPlace == 0,
+                  kd.d2 == 0, kd.aux == 0, kd.reserved == 0 else { return .badKernelShape }
+            let rows = UInt64(kd.d0), cols = UInt64(kd.d1)
+            guard rows >= 1, cols >= 2,
+                  rows <= UInt64(W.vic1MaxDim), cols <= UInt64(W.vic1SoftmaxMaxCols),
+                  rows * cols <= UInt64(W.vic1Max2DElems) else { return .badKernelShape }
+            let bytes = rows * cols * 4
+            if let r = bind(kd.bufs[0], need: bytes) { return r } // in f32
+            if let r = bind(kd.bufs[1], need: bytes) { return r } // out f32
+            // in == out is legal only when the caller declared it in-place.
+            if kd.bufs[0].buf == kd.bufs[1].buf,
+               kd.flags & W.softmaxFlagInPlace == 0 { return .badKernelShape }
+            if let r = absent(kd.bufs[2]) { return r }
+            if let r = absent(kd.bufs[3]) { return r }
+
+        case W.kernelDequant:
+            guard kd.flags == 0, kd.d2 == 0, kd.reserved == 0,
+                  kd.aux >> 8 == 0 else { return .badKernelShape }
+            let n = UInt64(kd.d0)
+            guard n >= 1, n <= UInt64(W.vic1MaxElems),
+                  W.dequantGroupSizes.contains(kd.d1) else { return .badKernelShape }
+            let group = UInt64(kd.d1)
+            let groups = (n + group - 1) / group
+            guard groups <= UInt64(W.vic1MaxGroups) else { return .badKernelShape }
+            switch kd.aux & 0xff {
+            case W.dequantFmtI8Sym:
+                if let r = bind(kd.bufs[0], need: n) { return r } // packed q8
+                if let r = absent(kd.bufs[2]) { return r } // symmetric: no zeros
+            case W.dequantFmtU4Asym:
+                if let r = bind(kd.bufs[0], need: (n + 1) / 2) { return r } // packed nibbles
+                if let r = bind(kd.bufs[2], need: groups * 4) { return r } // zeros f32
+            default:
+                return .badKernelShape
+            }
+            if let r = bind(kd.bufs[1], need: groups * 4) { return r } // scales f32
+            if let r = bind(kd.bufs[3], need: n * 2) { return r } // out f16
+
+        default:
+            return .unknownKernel
+        }
+        return nil
     }
 
     /// Shared gate for every render-path command: a backend must exist
@@ -455,8 +594,11 @@ public final class GPU3DDevice {
         case .invalidResource, .duplicateResource:
             return GPU3DWire.respErrInvalidResourceID
         case .invalidCapset, .invalidParameter, .reservedBits,
-             .trailingBytes, .truncatedRequest:
+             .trailingBytes, .truncatedRequest,
+             .unknownKernel, .badKernelShape:
             return GPU3DWire.respErrInvalidParameter
+        case .badKernelBinding:
+            return GPU3DWire.respErrInvalidResourceID
         default:
             return GPU3DWire.respErrUnspec
         }
@@ -540,8 +682,9 @@ public final class GPU3DHostDevice: NSObject {
     /// two virtio-gpu-shaped queues, VIRGL offered as an OPTIONAL bit
     /// (the mandatory private VIR1 capability match is what actually
     /// binds the profile), and the 16-byte config space reporting zero
-    /// scanouts and one cap-set. d3 attaches this under --gpu3d-metal;
-    /// nothing here changes the default VM shape.
+    /// scanouts and one cap-set per attached profile — VIR1 always, VIC1
+    /// when a backend is attached (M111, ADR 0053 D1). d3 attaches this
+    /// under --gpu3d-metal; nothing here changes the default VM shape.
     public func makeConfiguration() -> VZCustomVirtioDeviceConfiguration {
         let config = VZCustomVirtioDeviceConfiguration()
         config.deviceID = GPU3DWire.deviceID
@@ -550,7 +693,8 @@ public final class GPU3DHostDevice: NSObject {
         config.virtioQueueCount = GPU3DWire.queueCount
         config.optionalFeatures.subset0 = GPU3DWire.featureVirgl
         config.deviceSpecificConfiguration = VZVirtioDeviceSpecificConfiguration(
-            configurationData: Data(GPU3DWire.deviceConfigBytes))
+            configurationData: Data(GPU3DWire.deviceConfigBytes(
+                numCapsets: core.backend != nil ? 2 : 1)))
         config.provider = VZCustomVirtioDeviceDelegateProvider(
             deviceQueue: deviceQueue, delegate: configDelegate)
         return config
