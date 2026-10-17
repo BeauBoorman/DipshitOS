@@ -211,9 +211,21 @@ on peer FIN/RST, or on `line_too_long`.
   a session. The stream is plaintext, as in ADR 0024 D7.
 - Server authentication to the client.
 - More than one client.
-- TCP for anything else in the guest while `AGENTD.ELF` holds the socket.
-  That includes `gosh.run` commands that use the network: fetch, DNS, SSH
-  and RFB fail as busy.
+- ~~TCP for anything else in the guest while `AGENTD.ELF` holds the
+  socket.~~ **Amended (M109a, 2026-10-16, #2397, ADR 0052 D5):** this
+  bullet was written when the kernel TCP was a process-wide singleton.
+  M99g (#2185) replaced it with the slot-80 handle ABI over a bounded
+  table (`listener_limit = 4`, `conn_limit = 4`, `owner_limit = 4`,
+  `child_limit = 2`, `kernel/src/socket_core.zig:31-41`), so an AGENTD
+  listener no longer excludes other guest TCP. Observed on
+  `live-ssh-server` run 03 (this branch, 2026-10-16): the agentd
+  listener, two concurrent SSH sessions and a WEB.ELF outbound fetch
+  shared one socket table — three distinct 5-tuples with interleaved
+  windows. A `gosh.run` child's own `vi.Dial` (e.g. `flint push`)
+  works while the daemon holds its listener; past the table bound a
+  new open is `ENOSPC` → `ErrConnBusy` — the named busy refusal moved
+  to a different wall, it did not disappear. Still not provided: a
+  second client on 4747, and a second listener in the same process.
 - Guaranteed `ui.windows` rows. The seat query rides the M97g-F2 bind, so
   a co-resident EL0 process cannot forge a reply that satisfies the
   caller's wait without quoting the session token (D5). The rows are
