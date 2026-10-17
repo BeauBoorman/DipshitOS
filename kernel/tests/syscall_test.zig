@@ -5073,10 +5073,10 @@ test "syscall: shared anon revoke-on-exit — owner exit revokes the peer seat; 
     try std.testing.expect(scheduler.is_terminated(owner_task));
     try std.testing.expect(shared_region.info(h) == null);
     try std.testing.expectEqual(@as(u16, 1), alloc.page_refcount(pa_base));
-    // Simulate the reap's release_resources unref of the owner's dynamic page.
-    // The reap's release_resources unref frees the page (1 -> 0); a second
-    // free attempt then does nothing (the honest "already freed" probe).
-    try std.testing.expect(alloc.unref_page(pa_base));
+    // #2430: the exit seam's early release unrefs the owner's dynamic page
+    // NOW (1 -> 0, freed) — the lifecycle reap only frees the kstack and
+    // page-table root, so no recorded ref survives to unref here.
+    try std.testing.expect(alloc.page_refcount_recorded(pa_base) == null);
     try std.testing.expect(!alloc.unref_page(pa_base));
 
     // The seam's own wm_server.unregister already tore the seat down — a
@@ -5215,10 +5215,10 @@ test "syscall: M52 exit-path inventory — the owner's death through the schedul
     try std.testing.expect(wm_server.registered());
     try std.testing.expectEqual(@as(?usize, wm_pid), wm_server.registered_pid());
 
-    // Cleanup: the reap's release_resources unref frees the owner's dynamic
-    // page (1 -> 0; the second probe is the honest "already freed" check),
-    // then the WM seat tears down for the aggregated binary.
-    try std.testing.expect(alloc.unref_page(pa_base));
+    // Cleanup: the exit seam's early release already unref'd the owner's
+    // dynamic page (1 -> 0, freed — no recorded ref survives), then the WM
+    // seat tears down for the aggregated binary.
+    try std.testing.expect(alloc.page_refcount_recorded(pa_base) == null);
     try std.testing.expect(!alloc.unref_page(pa_base));
     try std.testing.expect(wm_server.unregister(wm_pid));
 }

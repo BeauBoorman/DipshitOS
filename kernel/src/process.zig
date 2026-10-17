@@ -474,21 +474,48 @@ pub fn init() void {
 /// pages are never freed under it. Claim 4613: also called at the task-
 /// level reap (`release_pages_on_reap`) — the freed page fields are
 /// zeroed there so a later `release_resources` is a no-op.
-fn release_resources(p: *Process) void {
-    if (p.addr_space.text_pages > 0) _ = alloc.free_pages(p.addr_space.text_phys, p.addr_space.text_pages);
-    if (p.addr_space.data_pages > 0) _ = alloc.free_pages(p.addr_space.data_phys, p.addr_space.data_pages);
-    if (p.addr_space.interp_pages > 0) _ = alloc.free_pages(p.addr_space.interp_phys, p.addr_space.interp_pages);
-    if (p.addr_space.lib_pages > 0) _ = alloc.free_pages(p.addr_space.lib_phys, p.addr_space.lib_pages);
-    if (p.addr_space.ro_pages > 0) _ = alloc.free_pages(p.addr_space.ro_phys, p.addr_space.ro_pages);
-    if (p.addr_space.stack_pages > 0) _ = alloc.free_pages(p.addr_space.stack_phys, p.addr_space.stack_pages);
-    if (p.kernel_stack.pages > 0) _ = alloc.free_pages(p.kernel_stack.phys, p.kernel_stack.pages);
+/// #2430: the bulk of a dead process's page-pool footprint — image
+/// apertures, demand-faulted pages, mmap blocks — can return the moment
+/// its LAST task exits: that task is already .zombie inside
+/// exit_current_locked and can never touch its user address space again.
+/// Only the exiting task's kernel stack (still running on it) and the
+/// page-table root (TTBR0 is live until the context switch) wait for the
+/// lifecycle reap. Returning the bulk at last-exit removes the page-hold
+/// window the idle reaper's latency created: under exec churn the
+/// dead-children backlog used to drain the whole pool — dir_open ENOMEM,
+/// demand-populate failures delivered as status-139 children.
+fn release_user_resources(p: *Process) void {
+    const s = &p.addr_space;
+    // Zero every freed field (same idiom as root_phys below): the early
+    // last-exit release runs BEFORE the lifecycle reap's release_resources,
+    // and a second free_pages on a phys a new owner already took is an
+    // aliasing bug — the re-allocated page is handed to a third user whose
+    // writes corrupt it (observed: exec'd text executing garbage, EC=0).
+    if (s.text_pages > 0) _ = alloc.free_pages(s.text_phys, s.text_pages);
+    s.text_phys = 0;
+    s.text_pages = 0;
+    if (s.data_pages > 0) _ = alloc.free_pages(s.data_phys, s.data_pages);
+    s.data_phys = 0;
+    s.data_pages = 0;
+    if (s.interp_pages > 0) _ = alloc.free_pages(s.interp_phys, s.interp_pages);
+    s.interp_phys = 0;
+    s.interp_pages = 0;
+    if (s.lib_pages > 0) _ = alloc.free_pages(s.lib_phys, s.lib_pages);
+    s.lib_phys = 0;
+    s.lib_pages = 0;
+    if (s.ro_pages > 0) _ = alloc.free_pages(s.ro_phys, s.ro_pages);
+    s.ro_phys = 0;
+    s.ro_pages = 0;
+    if (s.stack_pages > 0) _ = alloc.free_pages(s.stack_phys, s.stack_pages);
+    s.stack_phys = 0;
+    s.stack_pages = 0;
     // M29 VM Depth: unref/free all dynamically faulted and mmap'd pages
     var i: usize = 0;
-    while (i < @min(p.addr_space.dynamic_page_count, max_dynamic_pages)) : (i += 1) {
-        const pa = p.addr_space.dynamic_pages[i];
+    while (i < @min(s.dynamic_page_count, max_dynamic_pages)) : (i += 1) {
+        const pa = s.dynamic_pages[i];
         if (pa != 0) _ = alloc.unref_page(pa);
     }
-    var block = p.addr_space.dynamic_head;
+    var block = s.dynamic_head;
     while (block) |b| {
         for (b.pages[0..b.count]) |pa| {
             if (pa != 0) _ = alloc.unref_page(pa);
@@ -496,12 +523,17 @@ fn release_resources(p: *Process) void {
         block = b.next;
         _ = alloc.free_pages(@intFromPtr(b), 1);
     }
-    p.addr_space.dynamic_head = null;
-    p.addr_space.dynamic_tail = null;
-    p.addr_space.dynamic_page_count = 0;
-    p.addr_space.mmap_region_count = 0;
-    @memset(&p.addr_space.mmap_regions, MmapRegion{});
+    s.dynamic_head = null;
+    s.dynamic_tail = null;
+    s.dynamic_page_count = 0;
+    s.mmap_region_count = 0;
+    @memset(&s.mmap_regions, MmapRegion{});
     p.mem_usage = 0;
+}
+
+fn release_resources(p: *Process) void {
+    release_user_resources(p);
+    if (p.kernel_stack.pages > 0) _ = alloc.free_pages(p.kernel_stack.phys, p.kernel_stack.pages);
     // #2116: the process's page-table tree dies with it — every table the
     // root reaches is a per-root allocation (the identity clone copies, it
     // never shares), so the whole subtree returns to the carve-out free
@@ -1066,6 +1098,18 @@ pub fn request_process_exit(task_id: usize, status: u64) ?usize {
         processes[id].exit_status_snapshot = status;
     }
     return id;
+}
+
+/// #2430: return the bulk of an exited process's page-pool footprint NOW —
+/// called by the scheduler's exit teardown once `on_task_exit` reports the
+/// last task out. The lifecycle reap still frees the exiting task's kernel
+/// stack and the page-table root (see release_user_resources). Idempotent
+/// against the reap/recycle paths: every freed field is left zero.
+pub fn release_user_resources_early(id: usize) void {
+    const taken = svclock.acquire_missing(svclock.dom_bit(.kernel));
+    defer svclock.release_set(taken);
+    if (id >= max_processes or processes[id].state != .exited) return;
+    release_user_resources(&processes[id]);
 }
 
 /// Free the allocator-backed pages of the exited process that last ran on

@@ -162,7 +162,12 @@ func memFreeWithClear(ap unsafe.Pointer, n uintptr, clear bool) {
 			memCheck()"""),
 ]
 old = all(s.count(before) == 1 and after not in s for before, after in changes)
-new = all(s.count(after) == 1 and before not in s for before, after in changes)
+# The 3d2 unmap patch rewrites memFreeWithClear's clear-branch afterwards,
+# so the already-patched state is marked by the function + call site, not
+# the exact clear-branch text this block writes.
+new = ("func memFreeWithClear(" in s
+       and "memFreeWithClear(r, l, false)" in s
+       and all(before not in s for before, _ in changes))
 if not (old or new):
     sys.exit("apply: SourceDrift: runtime/mem_sbrk.go alignment padding")
 if old:
@@ -174,6 +179,169 @@ PYEOF
 )"
 if [ "$padding" = "patched" ]; then
     edits=$((edits+1)); log "patched runtime/mem_sbrk.go (virelai fresh alignment padding)"
+fi
+
+# --- 3d2. runtime/mem_sbrk.go: a free/unused hands the phys back, not a --
+# free-list link. Stock sbrk keeps every released page mapped — cleared or
+# scavenged, never handed back — so an exec'd child's footprint is its
+# cumulative peak, and the M112a fleet's driver (~95 MiB) plus a link
+# child (~133 MiB) drains the 256 MiB guest pool mid-run (#2430). On
+# virelai every release path (the free-list insert, the break-shrink, the
+# scavenger's sysUnused) calls virMunmap: the kernel drops the phys while
+# the freed VA keeps its mmap region record, so a later touch/sysUsed
+# demand-faults a fresh zero page back in and the reuse paths are
+# unchanged. The memclr goes too: the page is gone, and writing zeros
+# into it would only fault a replacement straight back in.
+memreturn="$(python3 - "$F/runtime/mem_sbrk.go" <<'PYEOF'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+s = p.read_text()
+changes = [
+    ("""func memFreeWithClear(ap unsafe.Pointer, n uintptr, clear bool) {
+	n = memRound(n)
+	if clear {
+		memclrNoHeapPointers(ap, n)
+	}""",
+     """func memFreeWithClear(ap unsafe.Pointer, n uintptr, clear bool) {
+	n = memRound(n)
+	if GOOS == "virelai" {
+		// Return the freed span's phys to the kernel NOW (sys_munmap):
+		// the freed VA keeps its mmap region record, so a later touch
+		// demand-faults a fresh zero page back in — the free-list reuse
+		// path is unchanged while the span's pages stop being held. The
+		// memclr is dropped: the page is gone, and writing zeros into it
+		// would only fault a replacement straight back in (the demand
+		// refill is zero by construction).
+		virMunmap(ap, n)
+	} else if clear {
+		memclrNoHeapPointers(ap, n)
+	}"""),
+    ("""			// Address range being freed is at the end of memory,
+			// so record a new lower value for end of memory.
+			// Can't actually shrink address space because segment is shared.
+			memclrNoHeapPointers(v, n)
+			bloc -= n""",
+     """			// Address range being freed is at the end of memory,
+			// so record a new lower value for end of memory.
+			// Can't actually shrink address space because segment is shared.
+			// virelai: the memclr is replaced by an unmap — the phys
+			// returns to the pool and a re-sbrk re-maps it demand-zero.
+			if GOOS == "virelai" {
+				virMunmap(v, memRound(n))
+			} else {
+				memclrNoHeapPointers(v, n)
+			}
+			bloc -= n"""),
+    ("""func sysUnusedOS(v unsafe.Pointer, n uintptr) {
+}""",
+     """func sysUnusedOS(v unsafe.Pointer, n uintptr) {
+	// virelai: the scavenger's "unused" hint becomes a real release —
+	// the scavenged span's phys returns to the kernel (sys_munmap) while
+	// the VA keeps its mmap region record, so a later sysUsed/touch
+	// demand-faults a fresh zero page back in. Without this, stock sbrk
+	// held every scavenged page mapped — a child's footprint stayed at
+	// its cumulative peak and the fleet's aggregate drained the pool.
+	if GOOS == "virelai" {
+		systemstack(func() {
+			virMunmap(v, memRound(n))
+		})
+	}
+}"""),
+]
+old = all(s.count(before) == 1 and after not in s for before, after in changes)
+new = all(s.count(after) == 1 and before not in s for before, after in changes)
+if not (old or new):
+    sys.exit("apply: SourceDrift: runtime/mem_sbrk.go virelai unmap")
+if old:
+    for before, after in changes:
+        s = s.replace(before, after, 1)
+    p.write_text(s)
+print("patched" if old else "clean")
+PYEOF
+)"
+if [ "$memreturn" = "patched" ]; then
+    edits=$((edits+1)); log "patched runtime/mem_sbrk.go (virelai releases unmap phys)"
+fi
+
+# --- 3d3. runtime/mgcpacer.go: default GOGC + GOMEMLIMIT for the 256 MiB -
+# guest. Stock Go runs GC off (GOGC=100 → ~2x-live heap, no GOMEMLIMIT cap)
+# — an exec'd child's footprint then rides ~2x its live set, and the M112a
+# fleet's link children (~56k pages) OOM-killed mid-fleet at free=0 (#2430).
+# On virelai the defaults tighten: GOGC=30 keeps the heap near its live set
+# (smaller allocation bursts), and GOMEMLIMIT caps heap-in-use at 190 MiB so
+# a child's heap + driver + statics stay inside the ~64k-page pool.
+memlimit="$(python3 - "$F/runtime/mgcpacer.go" <<'PYEOF'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+s = p.read_text()
+changes = [
+    ("""func readGOGC() int32 {
+	p := gogetenv("GOGC")
+	if p == "off" {
+		return -1
+	}
+	if n, err := strconv.ParseInt(p, 10, 32); err == nil {
+		return int32(n)
+	}
+	return 100
+}""",
+     """func readGOGC() int32 {
+	p := gogetenv("GOGC")
+	if p == "off" {
+		return -1
+	}
+	if n, err := strconv.ParseInt(p, 10, 32); err == nil {
+		return int32(n)
+	}
+	if GOOS == "virelai" {
+		// virelai: the 256 MiB guest's pool is ~64k pages, so an exec'd
+		// child can't afford the default GC target's 2x-live heap —
+		// a link child at ~56k pages OOM-killed mid-fleet (#2430).
+		// A low GOGC keeps the heap tight against its live set (the
+		// GC runs at ~20% growth instead of 100%), so the child's
+		// footprint stays near what it actually needs.
+		return 20
+	}
+	return 100
+}"""),
+    ("""func readGOMEMLIMIT() int64 {
+	p := gogetenv("GOMEMLIMIT")
+	if p == "" || p == "off" {
+		return math.MaxInt64
+	}""",
+     """func readGOMEMLIMIT() int64 {
+	p := gogetenv("GOMEMLIMIT")
+	if p == "" || p == "off" {
+		if GOOS == "virelai" {
+			// virelai: the 256 MiB guest's whole page pool is ~64k
+			// pages; a resident driver plus an exec'd child sharing it
+			// must not grow past ~200 MiB of heap-in-use or the demand-
+			// fault path drains to free=0 and the child dies 139 (#2430 —
+			// observed: link children at ~56k pages OOM-killing mid-fleet).
+			// The cap bounds heap-in-use (stacks, runtime and the binary's
+			// statics are extra), so children collect to stay under it.
+			return 200 << 20
+		}
+		return math.MaxInt64
+	}"""),
+]
+old = all(s.count(before) == 1 and after not in s for before, after in changes)
+new = all(s.count(after) == 1 and before not in s for before, after in changes)
+if not (old or new):
+    sys.exit("apply: SourceDrift: runtime/mgcpacer.go virelai GC limits")
+if old:
+    for before, after in changes:
+        s = s.replace(before, after, 1)
+    p.write_text(s)
+print("patched" if old else "clean")
+PYEOF
+)"
+if [ "$memlimit" = "patched" ]; then
+    edits=$((edits+1)); log "patched runtime/mgcpacer.go (virelai GOGC/GOMEMLIMIT)"
 fi
 
 # --- 3e. runtime/lock_sema.go: spinning semaphores (no OS primitives) --

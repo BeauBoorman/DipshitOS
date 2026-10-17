@@ -996,12 +996,32 @@ pub fn populate_user_page(pid: usize, root: u64, va: u64, for_write: bool) bool 
     if (!demand) return false;
     // The fault is only serviceable when the region admits the access — an
     // already-mapped page faults for its own reason (permissions, COW was
-    // tried above) and must be delivered, not re-populated.
-    if (mmu.leaf_el0_visible(root, page)) return false;
+    // tried above) and must be delivered, not re-populated. But a leaf that
+    // NOW permits the access means a sibling core's populate won the lock
+    // first — the faulting access retries against the fresh leaf and
+    // succeeds, so the fault is resolved, not delivered (#2430).
+    if (mmu.leaf_el0_visible(root, page)) {
+        if (mmu.leaf_permits_access(root, page, for_write)) {
+            demand_fault_count += 1;
+            return true;
+        }
+        return false;
+    }
     if (for_write) {
         if (!writable) return false;
     } else if (!readable and !writable) return false;
-    const pa = alloc.alloc_pages(1) orelse return false;
+    var pa_opt = alloc.alloc_pages(1);
+    if (pa_opt == null) {
+        // #2430: a delivered fault at an empty pool must not be fatal while
+        // dead work still holds pages — reap the zombie backlog first (each
+        // slot frees its kernel stack + page-table root), then retry. The
+        // idle reaper is a lazy drain; under exec churn the backlog is the
+        // margin between a served fault and a status-139 child.
+        while (scheduler.reap_oldest_zombie()) {}
+        pa_opt = alloc.alloc_pages(1);
+        if (pa_opt == null) return false;
+    }
+    const pa = pa_opt.?;
     zero_phys_page(pa);
     if (!process.record_dynamic_page(pid, pa)) {
         _ = alloc.free_pages(pa, 1);
@@ -2222,13 +2242,16 @@ test "exceptions: #2112 — populate refuses already-mapped and permission-denie
     try std.testing.expect(process.add_mmap_region(pid, ro_va, 4096, 1, 0x22)); // R only
 
     // A genuine demand write populates exactly once; a second fault on the
-    // SAME page (already EL0-visible) allocates nothing — before #2112 the
-    // retry loop leaked a page per fault until the pool drained.
+    // SAME page allocates nothing — before #2112 the retry loop leaked a
+    // page per fault until the pool drained. #2430: a leaf that already
+    // permits the access RESOLVES the fault (a sibling core's populate may
+    // have won the lock first — the retry then succeeds), rather than
+    // delivering it; still allocates nothing.
     try std.testing.expect(populate_user_page(pid, root, rw_va, true));
     try std.testing.expect(mmu.leaf_el0_visible(root, rw_va));
     const free_after_first = alloc.stats().free_pages;
-    try std.testing.expect(!populate_user_page(pid, root, rw_va, true));
-    try std.testing.expect(!populate_user_page(pid, root, rw_va, false));
+    try std.testing.expect(populate_user_page(pid, root, rw_va, true));
+    try std.testing.expect(populate_user_page(pid, root, rw_va, false));
     try std.testing.expectEqual(free_after_first, alloc.stats().free_pages);
 
     // A WRITE fault against a read-only region is a program fault to

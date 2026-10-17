@@ -529,3 +529,12 @@ func sbrk(n uintptr) unsafe.Pointer {
 //
 //go:noescape
 func virMmap(addr unsafe.Pointer, n uintptr) int
+
+// virMunmap unmaps [addr, addr+n) (sys_munmap slot 64): the kernel unmaps
+// the leaves, unrefs the recorded dynamic pages, and returns the phys to
+// the pool. A partial unmap keeps the mmap region record, so a later
+// touch demand-faults a fresh zero page back in — the scavenged span's
+// reuse path is unchanged while its pages stop being held.
+//
+//go:noescape
+func virMunmap(addr unsafe.Pointer, n uintptr) int
