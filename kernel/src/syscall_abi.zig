@@ -153,10 +153,13 @@ pub const slots = [_]Slot{
     row(86, "sys_udp_close", .{.int}),
     row(87, "sys_getpid", .{}),
     row(88, "sys_scanout_read", .{ .int, .int, .int, .int, .ptr, .int }),
-    // The ADR 0054 (M113c #2419) reservation — scanout_read took its
-    // first pick (88); 89 stays reserved and answers ENOSYS until the
-    // grant-admin card defines it.
-    row(89, "sys_grant_admin", .{}),
+    // M113c (#2419, ADR 0054 D7/D11, ADR 0007 amendment): slot 89 is the
+    // ONE in-guest read/write path for GRANTS.TXT user rows —
+    // `sys_grant_admin(op, index, ptr, len)`: op 0 marshals user row
+    // `index` as its grants line into `ptr`, op 1 sets the row from the
+    // line at `ptr` and persists. Gated to the registered WM seat or
+    // CAP_PROC_ADMIN, and never the app the row names.
+    row(89, "sys_grant_admin", .{ .int, .int, .ptr, .int }),
     row(90, "sys_gpucomp", .{ .int, .int, .int, .int, .ptr, .int }),
 };
 

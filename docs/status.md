@@ -171,7 +171,7 @@ Threads and their current state (the tracker is authoritative):
 | **M110 — The store as an ecosystem: software arrives signed, from anyone** | **Active** — sub-cards filed (#2403–#2407), lanes a→b→{c∥d}→e; ADR 0055 (release manifest as catalog entry) in flight. | #2383; cards #2403–#2407 |
 | **M111 — Compute: the Metal GPU as a bounded compute device** | **Active** — a (ADR 0053, #2408) landed PR #2428; **b (#2409)**: slot-90 `sys_gpucomp` end to end — VIC1 probe, kernel broker, Metal GEMM/SOFTMAX/DEQUANT pipelines, Go SDK, `live-gpu3d` leg 09 (GEMM submit→fence→readback + refusal); c/d/e open (#2410–#2412). | #2384; cards #2408–#2412 |
 | **M112 — Self-host the userspace: the guest builds, tests, and releases the fleet** | **Active** — sub-cards filed (#2413–#2416), lanes a→{b∥c}→d; fleet-closure card claimed. | #2385; cards #2413–#2416 |
-| **M113 — Trust depth: measured boot, per-app network policy, syscall profiles** | **Active** — sub-cards filed (#2417–#2422), serial lanes a→f; ADR 0054 (verified+measured boot, kernel grant table) in flight. | #2386; cards #2417–#2422 |
+| **M113 — Trust depth: measured boot, per-app network policy, syscall profiles** | **Active** — a (#2417, ADR 0054) landed PR #2427; b (#2418): `measure.zig` + verified-boot chain landed PR #2429; c (#2419): measured exec + kernel grant table + audit-mode word gates in PR; d/e/f open (#2420–#2422). | #2386; cards #2417–#2422 |
 
 
 ## Gate status

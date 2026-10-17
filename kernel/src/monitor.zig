@@ -7871,6 +7871,15 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
             m.console.print_line(": truncated image (file ends before the bytes its header promises)");
             return .invalid_argument;
         },
+        // M113c (#2419, ADR 0054 D8): a grant row names this image but
+        // the measured digest mismatched — refused by name, never
+        // fell open.
+        .grant_stale => {
+            err_prefix(m);
+            m.console.puts(name);
+            m.console.print_line(": exec refused (grant_stale — a named grant row's sha256 does not match this image)");
+            return .invalid_argument;
+        },
     }
 }
 

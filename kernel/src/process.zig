@@ -36,6 +36,13 @@ const memmap = @import("memmap.zig"); // host-test fixture view (page-ownership 
 const mmu = @import("mmu.zig"); // #2116: the per-root page-table tree dies with the process
 const svclock = @import("svclock.zig");
 
+/// M113c (#2419, ADR 0054 D8): the ambient word set — every grant word,
+/// today's per-process authority when no row narrows it. Defined HERE
+/// rather than imported to keep the dependency one-way (grant.zig
+/// already consumes this module); grant.zig comptime-asserts its own
+/// `baseline` equals this constant.
+pub const word_baseline: u32 = 0x1ff;
+
 /// Bounded process registry size (fixed BSS array). Milestone sixteen C3
 /// (claim 0339): grew 8 -> 16 — at the new 8-program concurrency the
 /// registry saturated at 8/8 (the boot payload's exited slot recycled, no
@@ -311,6 +318,16 @@ const Process = struct {
     /// syscall. The `sys_procs` snapshot row deliberately omits it.
     uid: u32 = uid_user,
     caps: u32 = 0,
+    /// M113c (#2419, ADR 0054 D8/D9): the measured-exec word set — the
+    /// grant row's words intersected with the baseline, applied at exec;
+    /// `word_baseline` (every word) for a process no row names. Word
+    /// masks only narrow; no syscall may widen one. `measured`/
+    /// `measured_ok` carry the exec-time image digest the audit receipts
+    /// quote (zeros for a process that was never exec-measured — the
+    /// boot payload, kernel spawns).
+    words: u32 = word_baseline,
+    measured: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
+    measured_ok: bool = false,
     /// Claim 0826: the executor's EL1 exception stack (allocator-backed
     /// for exec'd programs, the static boot stack for the payload).
     kernel_stack: KernelStack = .{},
@@ -429,6 +446,7 @@ fn reset_process(p: *Process) void {
     @memset(std.mem.asBytes(p), 0);
     p.addr_space.mmap_next_va = mmap_default_va;
     p.uid = uid_user;
+    p.words = word_baseline;
     p.task_id = null;
     p.thread_tasks = @as([max_threads]?usize, @splat(@as(?usize, null)));
 }
@@ -871,6 +889,36 @@ pub fn memory_snapshot(id: usize) ?struct {
 pub fn principal(id: usize) ?Principal {
     if (id >= max_processes or processes[id].state == .free) return null;
     return .{ .uid = processes[id].uid, .caps = processes[id].caps };
+}
+
+/// M113c (#2419, ADR 0054 D8): apply the exec-measured grant outcome —
+/// the row's words (already intersected with the baseline by
+/// `grant.decide`) plus the image digest the audit receipts quote.
+/// Called once at create by the exec loader; there is no setter path for
+/// EL0, and `mask` is clamped to the baseline so a stored mask can never
+/// exceed ambient authority.
+pub fn set_grant(id: usize, mask: u32, digest: [32]u8, measured_ok: bool) void {
+    if (id >= max_processes or processes[id].state == .free) return;
+    processes[id].words = mask & word_baseline;
+    processes[id].measured = digest;
+    processes[id].measured_ok = measured_ok;
+}
+
+/// M113c (#2419, ADR 0054 D9): the word set the dispatch seam enforces —
+/// `word_baseline` for an invalid/free id (kernel-context callers carry
+/// no word mask and are never the EL0 principal the gate exists for).
+pub fn word_mask(id: usize) u32 {
+    if (id >= max_processes or processes[id].state == .free) return word_baseline;
+    return processes[id].words;
+}
+
+/// M113c (#2419): the exec measurement a word-denial receipt quotes.
+/// `ok` false means no measurement exists for this process (never
+/// exec'd); `digest` is zeros then, by convention.
+pub fn grant_state(id: usize) ?struct { words: u32, digest: [32]u8, measured_ok: bool } {
+    if (id >= max_processes or processes[id].state == .free) return null;
+    const p = &processes[id];
+    return .{ .words = p.words, .digest = p.measured, .measured_ok = p.measured_ok };
 }
 
 /// Bind a created process to its executor task slot (state -> running).

@@ -98,6 +98,12 @@ const elf_mod = @import("elf.zig");
 // M22 D3 (issue #326): crash-report symbol names — populated from the
 // loaded image's .symtab on every ELF exec, cleared on every other exec.
 const symbol = @import("symbol.zig");
+// M113c (#2419, ADR 0054 Part II): measured exec — the Part I primitive
+// and receipt, the grant table, and the serial-log seam the `stage=exec`
+// receipts ride on.
+const measure = @import("measure.zig");
+const grant = @import("grant.zig");
+const klog = @import("klog.zig");
 
 /// The STAGED load buffer: the DSK1/DSK3/contiguous-ELF paths still read
 /// the whole file through this array, so an image of those shapes larger
@@ -257,6 +263,12 @@ pub const ExecResult = enum {
     /// refusals (this file is small enough — it is incomplete) and from
     /// `not_found` (the file is present).
     image_truncated,
+    /// M113c (#2419, ADR 0054 D8): a grant row names this image but its
+    /// measured raw-file SHA-256 does not match the row's — the swapped
+    /// binary gets no grant and no baseline (never falls open). A
+    /// poisoned (malformed) row and a failed measurement are refused by
+    /// the same name.
+    grant_stale,
 };
 
 /// The loaded program image (BSS, page-aligned so the user root can map the
@@ -291,6 +303,84 @@ var last_pid: ?usize = null;
 /// before any exec succeeds).
 pub fn last_exec_pid() ?usize {
     return last_pid;
+}
+
+// ---------------------------------------------------------------------------
+// M113c (#2419, ADR 0054 D8): measured exec
+// ---------------------------------------------------------------------------
+
+/// The pending exec's measurement + grant outcome. Exec is a synchronous
+/// loader (the syscall path holds the FILE|KERNEL domains, the monitor is
+/// a single context), so one pending slot suffices — the same discipline
+/// `program` and `envp_*` already keep.
+var pending_words: u32 = grant.baseline;
+var pending_digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
+var pending_measured_ok: bool = false;
+var pending_name: []const u8 = "";
+
+/// Fixed BSS chunk for the measurement pass — the streamed gap path reads
+/// segment payloads straight into mapped pages and never holds the whole
+/// file, so the raw-file digest needs its own bounded read either way.
+var measure_chunk: [16 * 1024]u8 = undefined;
+
+/// SHA-256 the share file `name` (exactly `size` bytes, per the STAT the
+/// caller already took) in bounded chunks through the same channel the
+/// loader is about to read. False when a read fails mid-file — the
+/// caller treats that as "no digest", which a named row's hash check
+/// reads as fail-closed `grant_stale`.
+fn measure_image(name: []const u8, size: u64, out: *[measure.digest_len]u8) bool {
+    var h = measure.Sha256.init();
+    var offset: u64 = 0;
+    while (offset < size) {
+        const take: usize = @intCast(@min(measure_chunk.len, size - offset));
+        const n = virtio_file.read_at_into(name, offset, measure_chunk[0..take]) orelse return false;
+        if (n == 0) return false;
+        h.update(measure_chunk[0..n]);
+        offset += n;
+    }
+    h.final(out);
+    return true;
+}
+
+/// Emit one `stage=exec` receipt for the pending measurement (D4). The
+/// digest is zeros when the measurement itself failed — readable as
+/// "no measurement" in the record.
+fn emit_exec_receipt(verdict: []const u8) void {
+    var line: [measure.receipt_max]u8 = undefined;
+    const n = measure.receipt_line(&line, .exec, &pending_digest, verdict, pending_name, null);
+    klog.line(line[0..n]);
+}
+
+/// The loader's success point: stamp the process with the grant outcome
+/// (word mask + measured digest — word-denial receipts quote it later)
+/// and publish the `measured` receipt. A digest-less exec (measurement
+/// failed but no row required one) emits `unmeasured` — a stage that was
+/// not measured is never reported `measured`.
+fn note_exec_grant(proc_id: usize) void {
+    process.set_grant(proc_id, pending_words, pending_digest, pending_measured_ok);
+    emit_exec_receipt(if (pending_measured_ok) "measured" else "unmeasured");
+}
+
+/// The exec-time grant decision, taken once per `exec_file_impl` after
+/// the size checks and before any parse or mapping: a matching row
+/// applies its words, `grant_stale` refuses by name, and no row keeps
+/// the baseline. The `measured` receipt is published at the success
+/// point (`note_exec_grant`) — the receipt records a measurement that
+/// ran, not one that merely parsed.
+fn apply_exec_grant(name: []const u8, size: u64) ExecResult {
+    pending_name = name;
+    pending_words = grant.baseline;
+    pending_digest = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
+    pending_measured_ok = measure_image(name, size, &pending_digest);
+    switch (grant.decide(name, if (pending_measured_ok) &pending_digest else null)) {
+        .baseline => {},
+        .apply => |words| pending_words = words,
+        .stale => {
+            emit_exec_receipt("refused:grant_stale");
+            return .grant_stale;
+        },
+    }
+    return .ok;
 }
 
 /// What the current process's image is (claim 3848): the descriptor lives
@@ -469,6 +559,13 @@ fn exec_file_impl(name: []const u8, args: []const []const u8, pin: ?usize, princ
     if (virtio_file.stat(name, &st) != virtio_file.st_ok or st.is_dir) return .not_found;
     if (st.size > exec_image_max) return .image_too_large;
     if (st.size < dsk1_header_size) return .bad_magic;
+
+    // M113c (#2419, ADR 0054 D8): measure BEFORE the first byte is
+    // parsed or mapped — the digest is the raw-file SHA-256 the row
+    // pins, over the same channel bytes the loader is about to read. A
+    // named row whose hash is wrong refuses by name (`grant_stale`) and
+    // never falls open; no row means the baseline.
+    if (apply_exec_grant(name, st.size) == .grant_stale) return .grant_stale;
 
     // M70c-K (issue #1504): a file too big for the staging buffer is no
     // longer refused outright. `exec_program_max` is a bound of the STAGED
@@ -848,6 +945,7 @@ fn exec_file_impl(name: []const u8, args: []const []const u8, pin: ?usize, princ
     // Claim 6359 (slot 28 `sys_exec`): record the spawned pid at the true
     // success point so the EL0 caller can read it back.
     last_pid = proc_id;
+    note_exec_grant(proc_id);
     return .ok;
 }
 
@@ -1171,6 +1269,7 @@ fn exec_static_elf_gap(
         return .pool_full;
     }
     last_pid = proc_id;
+    note_exec_grant(proc_id);
     return .ok;
 }
 
@@ -1524,6 +1623,7 @@ fn exec_dynamic_elf(
         return .pool_full;
     }
     last_pid = proc_id;
+    note_exec_grant(proc_id);
     return .ok;
 }
 

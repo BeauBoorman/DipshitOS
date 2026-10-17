@@ -2066,6 +2066,10 @@ pub fn build(b: *std.Build) void {
         // and every named refusal (class A).
         "kernel/src/gpu3d_compute.zig",
         "kernel/src/gpu3d_wire.zig",
+        // M113c (issue #2419, ADR 0054 Part II): the grant table — its
+        // host tests pin the fail-closed parse, the stale-hash refusal,
+        // the table bound, and the no-widening contract (class A).
+        "kernel/src/grant.zig",
         "kernel/src/handoff.zig",
         "kernel/src/input.zig",
         "kernel/src/ipv4.zig",
