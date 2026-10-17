@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"bytes"
@@ -440,12 +440,12 @@ func remoteStreams(remote string) ([]Stream, error) {
 	if key != nil {
 		defer sshlib.Wipe(key[:])
 	}
-	consoleFn("store: wire key ok")
+	ConsoleFn("store: wire key ok")
 	conn, err := remoteDialFn(remote)
 	if err != nil {
 		return nil, err
 	}
-	consoleFn("store: wire dial ok")
+	ConsoleFn("store: wire dial ok")
 	// Bound the whole session, not each Recv: hello+auth+list each carry
 	// a 30 s default budget and a wedged remote makes them expire
 	// serially — past a gate run's window, with no output to show for it.
@@ -461,10 +461,10 @@ func remoteStreams(remote string) ([]Stream, error) {
 	if err := client.handshake(key); err != nil {
 		return nil, err
 	}
-	consoleFn("store: wire auth ok")
+	ConsoleFn("store: wire auth ok")
 	streams, err := client.list()
 	if err == nil {
-		consoleFn("store: wire list ok")
+		ConsoleFn("store: wire list ok")
 	}
 	if err != nil {
 		return nil, err

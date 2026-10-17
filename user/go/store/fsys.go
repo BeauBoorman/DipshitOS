@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"bytes"
@@ -49,12 +49,10 @@ func newFSErr(op, path string, rc int64) error {
 	return &FSError{Op: op, Path: path, Errno: name}
 }
 
-// guestFS implements FS over the VirelaiOS `vi` syscall package.
-type guestFS struct{}
+// GuestFS implements FS over the VirelaiOS `vi` syscall package.
+type GuestFS struct{}
 
-var activeFS FS = guestFS{}
-
-func (guestFS) ReadFile(path string, max int) ([]byte, error) {
+func (GuestFS) ReadFile(path string, max int) ([]byte, error) {
 	if max <= 0 {
 		max = MaxFileReadBytes
 	}
@@ -88,7 +86,7 @@ func (guestFS) ReadFile(path string, max int) ([]byte, error) {
 	return out, nil
 }
 
-func (guestFS) WriteFileSafe(path string, data []byte) error {
+func (GuestFS) WriteFileSafe(path string, data []byte) error {
 	if rc := vi.WriteFileSafe(path, data); rc < 0 {
 		return newFSErr("write", path, rc)
 	}
@@ -108,7 +106,7 @@ func canonShareDir(dir string) string {
 	}
 }
 
-func (guestFS) List(dir string) ([]DirEntry, error) {
+func (GuestFS) List(dir string) ([]DirEntry, error) {
 	if items, err := vi.ListDirAt(canonShareDir(dir)); err == nil {
 		out := make([]DirEntry, 0, len(items))
 		for _, it := range items {
@@ -133,14 +131,14 @@ func (guestFS) List(dir string) ([]DirEntry, error) {
 	return out, nil
 }
 
-func (guestFS) Remove(path string) error {
+func (GuestFS) Remove(path string) error {
 	if rc := vi.FileDelete(path); rc < 0 {
 		return newFSErr("remove", path, rc)
 	}
 	return nil
 }
 
-func (guestFS) Exists(path string) bool {
+func (GuestFS) Exists(path string) bool {
 	h, rc := vi.FileOpen(path, vi.ModeRead)
 	if rc >= 0 {
 		vi.FileClose(uint32(h))

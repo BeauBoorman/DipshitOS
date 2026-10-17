@@ -43,7 +43,12 @@ const max_queue: u16 = @intCast(descriptor_count);
 const root_nodeid: u64 = 1;
 const fuse_in_header_len: usize = 40;
 const fuse_out_header_len: usize = 16;
-const poll_budget: usize = 16_000_000;
+// One transact's poll budget. The cvc file channel uses 320M spins
+// (~1.5-2 s) for the same bounded-wait job; the FUSE path's much
+// shorter budget makes a streamed exec (>2 MiB: ~2.5k open/read/
+// release triples) a near-certain first-timeout victim on a loaded
+// host, and the timeout poisons fs_ready for the rest of the boot.
+const poll_budget: usize = 320_000_000;
 // Legacy caching is optional; one short-path entry plus root keeps the
 // encoded kernel below the unchanged 16 MiB loader ceiling. Longer paths
 // remain lossless, uncached. B3 never consumes this pathname cache.

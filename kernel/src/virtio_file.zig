@@ -180,7 +180,7 @@ pub const write_chunk_max: usize = reply_cap - reply_hdr_len - handle_len;
 /// VirtioFS negotiates a smaller FUSE max_write than the custom channel's
 /// 32 KiB request bound.
 pub fn write_chunk_limit() usize {
-    if (virtio_fs.available()) return @min(write_chunk_max, virtio_fs.write_chunk_limit());
+    if (prefer_fuse()) return @min(write_chunk_max, virtio_fs.write_chunk_limit());
     return write_chunk_max;
 }
 /// The most payload a READ reply can carry — the host bounds a read reply
@@ -404,6 +404,25 @@ pub fn available() bool {
     return virtio_fs.available() or (virtio_custom.cv_ready and virtio_custom.has_file_queue);
 }
 
+/// The legacy queue-5 file channel, armed. Bulk stat/read/write traffic
+/// prefers it over the FUSE backend when BOTH channels are armed: one
+/// exchange carries up to 32 KiB and waits a 320M-spin budget with a
+/// re-kick retry, while a FUSE transact carries 2 KiB and has no retry —
+/// a streamed exec or a multi-MiB file read over FUSE is thousands of
+/// short-budget polls that poison fs_ready on the first timeout under
+/// host load (observed: `exec` refusing streamed ELFs as
+/// "truncated image" mid-segment). The B3 metadata backend stays
+/// FUSE-only — the legacy channel has no pinned lookups.
+fn cvc_file_armed() bool {
+    return virtio_custom.cv_ready and virtio_custom.has_file_queue;
+}
+
+/// FUSE serves this call only when the legacy file queue is absent —
+/// bulk ops prefer the legacy channel (see `cvc_file_armed`).
+fn prefer_fuse() bool {
+    return virtio_fs.available() and !cvc_file_armed();
+}
+
 /// Cross-core serialization for the file queue (claim #899 — the z2a
 /// zc-leg OUT.TXT flake). Every queue-5 exchange assembles into the
 /// module-global request/reply buffers (vf_req_buf / vf_write_buf /
@@ -585,7 +604,7 @@ pub fn list(raw_path: []const u8, out: *ListResult) u8 {
         out.status = st_ok;
         return st_ok;
     }
-    if (virtio_fs.available()) {
+    if (prefer_fuse()) {
         const status = virtio_fs.list(path, @ptrCast(out.entries[0..]), &out.count);
         out.status = status;
         return status;
@@ -745,7 +764,7 @@ pub fn stat(raw_path: []const u8, out: *StatResult) u8 {
         }
         return st_not_found;
     }
-    if (virtio_fs.available()) {
+    if (prefer_fuse()) {
         var result = virtio_fs.StatResult{};
         const status = virtio_fs.stat(path, &result);
         out.status = status;
@@ -786,7 +805,7 @@ pub fn read(raw_path: []const u8, offset: u64) ReadResult {
         if (offset >= data.len) return .{ .status = st_ok, .data = "" };
         return .{ .status = st_ok, .data = data[@intCast(offset)..] };
     }
-    if (virtio_fs.available()) {
+    if (prefer_fuse()) {
         const result = virtio_fs.read(path, offset);
         return .{
             .status = result.status,
@@ -829,7 +848,7 @@ pub fn read_chunk(raw_path: []const u8, offset: u64, out: []u8) ReadChunkResult 
         @memcpy(out[0..take], src[0..take]);
         return .{ .status = st_ok, .bytes = take };
     }
-    if (virtio_fs.available()) {
+    if (prefer_fuse()) {
         const result = virtio_fs.read_chunk(path, offset, out);
         return .{ .status = result.status, .bytes = result.bytes };
     }
@@ -912,7 +931,7 @@ pub fn open(raw_path: []const u8, flags: u8, out_handle: *u16) u8 {
     const path = clean_path(raw_path);
     out_handle.* = 0;
     if (!available()) return st_host_error;
-    if (virtio_fs.available()) return virtio_fs.open(path, flags, out_handle);
+    if (prefer_fuse()) return virtio_fs.open(path, flags, out_handle);
     const n = exchange(op_open, flags, path, &vf_reply_buf) orelse return st_host_error;
     const rep = decode_reply(vf_reply_buf[0..n]);
     if (rep.status != st_ok) return rep.status;
@@ -923,14 +942,14 @@ pub fn open(raw_path: []const u8, flags: u8, out_handle: *u16) u8 {
 
 /// CLOSE a host handle (flush + free the slot).
 pub fn close(handle: u16) u8 {
-    if (virtio_fs.available()) return virtio_fs.close(handle);
+    if (prefer_fuse()) return virtio_fs.close(handle);
     return exchange_simple(op_close, handle);
 }
 
 /// FSYNC a host handle — real durability (the host calls synchronize() on
 /// the live FileHandle).
 pub fn fsync(handle: u16) u8 {
-    if (virtio_fs.available()) return virtio_fs.fsync(handle);
+    if (prefer_fuse()) return virtio_fs.fsync(handle);
     return exchange_simple(op_fsync, handle);
 }
 
@@ -948,7 +967,7 @@ fn exchange_simple(op: u8, handle: u16) u8 {
 pub fn write(handle: u16, data: []const u8, out_written: *u64) u8 {
     out_written.* = 0;
     if (!available()) return st_host_error;
-    if (virtio_fs.available()) return virtio_fs.write(handle, data, out_written);
+    if (prefer_fuse()) return virtio_fs.write(handle, data, out_written);
     if (data.len > write_chunk_max) return st_host_error;
     // The lock covers the ASSEMBLY too — vf_write_buf is module-global and
     // a concurrent (other-core) assembly would splice two requests (claim
@@ -976,7 +995,7 @@ pub fn write(handle: u16, data: []const u8, out_written: *u64) u8 {
 /// the cursor clamps the cursor; does not move the cursor otherwise).
 pub fn truncate(handle: u16, size: u64) u8 {
     if (!available()) return st_host_error;
-    if (virtio_fs.available()) return virtio_fs.truncate(handle, size);
+    if (prefer_fuse()) return virtio_fs.truncate(handle, size);
     var payload: [handle_len + truncate_size_len]u8 = undefined;
     write_le_u16(&payload, 0, handle);
     write_le_u64(&payload, handle_len, size);
@@ -1008,7 +1027,7 @@ fn rename_mode(raw_from: []const u8, raw_to: []const u8, mode: RenameMode) u8 {
     if (builtin.is_test) {
         if (test_rename) |callback| return callback(from, to, mode);
     }
-    if (virtio_fs.available()) return virtio_fs.rename(from, to, mode);
+    if (prefer_fuse()) return virtio_fs.rename(from, to, mode);
     var payload: [path_max * 2 + 1]u8 = undefined;
     @memcpy(payload[0..from.len], from);
     payload[from.len] = 0;
@@ -1022,7 +1041,7 @@ fn rename_mode(raw_from: []const u8, raw_to: []const u8, mode: RenameMode) u8 {
 /// MKDIR a directory on the host share (one level; parents must exist).
 /// Returns st_exists when the target already exists.
 pub fn mkdir(path: []const u8) u8 {
-    if (virtio_fs.available()) return virtio_fs.mkdir(path);
+    if (prefer_fuse()) return virtio_fs.mkdir(path);
     return exchange_path(op_mkdir, path);
 }
 
@@ -1041,7 +1060,7 @@ pub fn clone(raw_from: []const u8, raw_to: []const u8) u8 {
     const from = clean_path(raw_from);
     const to = clean_path(raw_to);
     if (!available()) return st_host_error;
-    if (virtio_fs.available()) return st_host_error;
+    if (prefer_fuse()) return st_host_error;
     if (from.len == 0 or to.len == 0 or from.len > path_max or to.len > path_max) return st_host_error;
     if (std.mem.indexOfScalar(u8, from, 0) != null or std.mem.indexOfScalar(u8, to, 0) != null) return st_host_error;
     var payload: [path_max * 2 + 1]u8 = undefined;
@@ -1056,7 +1075,7 @@ pub fn clone(raw_from: []const u8, raw_to: []const u8) u8 {
 /// DELETE a file or EMPTY directory on the host share. Non-empty
 /// directories fail honestly with a host error (never recursive).
 pub fn delete(path: []const u8) u8 {
-    if (virtio_fs.available()) return virtio_fs.delete(path);
+    if (prefer_fuse()) return virtio_fs.delete(path);
     return exchange_path(op_delete, path);
 }
 

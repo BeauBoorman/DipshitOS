@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build-store.sh -- build the M101c STORE install-seam CLI (user/go/store)
+# build-store.sh -- build the M101c STORE install-seam CLI (user/go/store/main)
 # with the GOOS=virelai fork toolchain.
 # Output: .build/go/STORE.ELF
 #
@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FORK_DIR="${GO_FORK_DIR:-$(dirname "$REPO")/go-virelai}"
-DIR="store"
+DIR="store/main"
 NAME="${GO_BUILD_NAME:-STORE}"
 # Same budget as FLINT (imports go/parser through virelai/flint/parser):
 # gap-layout ELFs are bounded by exec_image_max = 32 MiB on the file.
