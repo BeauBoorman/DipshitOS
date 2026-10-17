@@ -16,7 +16,7 @@
 > decision is deliberately boring: **one control queue, one new private
 > command (`COMPUTE_SUBMIT`), one new capset (`VIC1`) advertising a
 > curated three-kernel library — GEMM, SOFTMAX, DEQUANT — as the entire
-> shader language, and one new syscall slot (88) with owner-keyed,
+> shader language, and one new syscall slot (90) with owner-keyed,
 > generation-bearing handles.** Every byte of VIR1, every render
 > refusal and every M102 test stays byte-identical; a host that cannot
 > run Metal compute advertises `VIC1 ready=0` and the guest answers
@@ -86,7 +86,7 @@ only.
   `config.memorySize = 256 * 1024 * 1024`.
 - **The syscall table ends at slot 87 (observed).**
   `kernel/src/syscall_abi.zig:154` is `row(87, "sys_getpid", .{})`;
-  `slot_count = 128`. Slot 88 is the next free row. Slot 65 is
+  `slot_count = 128`. ADR 0054 reserved slots 88/89 for its grant-admin and audit rows; slot 90 is the next free row for this surface (amended post-merge — this ADR originally said 88 before 0054 landed). Slot 65 is
   seat-gated (`EACCES` non-WM) and cmd 22's descriptor is window-bound
   (`window_id` required on every op, ADR 0007 M102d1 amendment).
 - **Counters are a syscall row (observed).** `sys_procs` (slot 7) and
@@ -207,7 +207,7 @@ One new private envelope command inside the same header:
   `ctx_id` names the compute session's context.
 
 The kernel descriptor (64 bytes, LE — the same bytes on the wire and
-inside the slot-88 `RUN` descriptor):
+inside the slot-90 `RUN` descriptor):
 
 | off | size | field | rule |
 |----:|-----:|-------|------|
@@ -217,7 +217,7 @@ inside the slot-88 `RUN` descriptor):
 | 12 | 4 | `d1` | dim 1 |
 | 16 | 4 | `d2` | dim 2 / 0 |
 | 20 | 4 | `aux` | per-kernel (DEQUANT `fmt`); else 0 |
-| 24 | 32 | `bufs[4]` | four `{u32 buf, u32 byte_off}` slots — on the wire `buf` is the resource id; inside the slot-88 desc it is the caller's buffer **handle** and the broker translates |
+| 24 | 32 | `bufs[4]` | four `{u32 buf, u32 byte_off}` slots — on the wire `buf` is the resource id; inside the slot-90 desc it is the caller's buffer **handle** and the broker translates |
 | 56 | 8 | `reserved` | always 0 |
 
 A buf slot of `{0, 0}` is "absent" — slot 3 must be absent when the
@@ -272,7 +272,7 @@ smuggled to another process is useless. Owner exit revokes the session:
 handles invalidated first (generation bump), then the bounded drain —
 identical revocation order to cmd-22's.
 
-## D5 — The guest ABI: new slot 88 `sys_gpucomp`
+## D5 — The guest ABI: new slot 90 `sys_gpucomp`
 
 **Why a new slot and not slot-65 cmd 23.** Slot 65 is the seat's
 exclusive surface and cmd 22's descriptor is window-bound because render
@@ -286,7 +286,7 @@ for a process-owned kernel resource is an owner-keyed handle table on a
 normal slot — `sys_socket` (80), owned UDP (84–86), the file slots —
 and compute takes the next free row:
 
-| 88 | `sys_gpucomp` | `gpucomp(op, a0, a1, a2, ptr, len) -> i64` | `a0..a2` reserved (0); `ptr` → **128-byte** compute descriptor, `len` = 128 exactly. `EFAULT` unreadable; `EINVAL` malformed; `EBADF` bad/stale handle; `ENOSPC` pool/context exhausted; `ENXIO` no VIC1 device or `ready=0`; `EAGAIN` device busy; `ETIMEDOUT` exchange deadline; `ENOENT` poisoned session; `EIO` device fault |
+| 90 | `sys_gpucomp` | `gpucomp(op, a0, a1, a2, ptr, len) -> i64` | `a0..a2` reserved (0); `ptr` → **128-byte** compute descriptor, `len` = 128 exactly. `EFAULT` unreadable; `EINVAL` malformed; `EBADF` bad/stale handle; `ENOSPC` pool/context exhausted; `ENXIO` no VIC1 device or `ready=0`; `EAGAIN` device busy; `ETIMEDOUT` exchange deadline; `ENOENT` poisoned session; `EIO` device fault |
 
 The descriptor (128 B LE — `len` is 128, never 64):
 
@@ -389,7 +389,7 @@ This ADR carries the split; each card's own issue restates it.
 
 | card | scope | Touches | verification |
 |------|-------|---------|--------------|
-| **M111b** (#2409) | compute path end to end: VIC1 probe + `COMPUTE_SUBMIT` wire, kernel broker + pools, host decoder + Metal compute backend, slot 88 + Go client | `kernel/src/gpu3d_compute.zig` (new), `kernel/src/gpu3d_{device,submit,wire,broker}.zig`, `kernel/src/syscall.zig`, `kernel/src/syscall_abi.zig`, `docs/decisions/0007-syscall-abi.md` (the slot-88 amendment), `host/vm-runner/Sources/VMGPU3D/*`, `host/vm-runner/Tests/VMRunnerTests/GPU3D*Tests.swift`, `user/go/gpu3d/*`, `user/go/vi/gpucompute.go` (new) | `zig build test`; `swift test --filter GPU3D`; `cd user/go && go test ./...`; a submit→fence→readback round trip evidenced over serial |
+| **M111b** (#2409) | compute path end to end: VIC1 probe + `COMPUTE_SUBMIT` wire, kernel broker + pools, host decoder + Metal compute backend, slot 90 + Go client | `kernel/src/gpu3d_compute.zig` (new), `kernel/src/gpu3d_{device,submit,wire,broker}.zig`, `kernel/src/syscall.zig`, `kernel/src/syscall_abi.zig`, `docs/decisions/0007-syscall-abi.md` (the slot-90 amendment), `host/vm-runner/Sources/VMGPU3D/*`, `host/vm-runner/Tests/VMRunnerTests/GPU3D*Tests.swift`, `user/go/gpu3d/*`, `user/go/vi/gpucompute.go` (new) | `zig build test`; `swift test --filter GPU3D`; `cd user/go && go test ./...`; a submit→fence→readback round trip evidenced over serial |
 | **M111c** (#2410) | GOINFER: the tiny model answering in-guest on the GPU | `user/go/goinfer/*`, `tools/go/build-goinfer.sh`, `image/apps.txt`, `user/go/gotabwm/apps_test.go` | model name + licence + sha256 recorded on #2410 and owner-approved **before any fetch**; `go test`; the model's answer observed on serial and pinned |
 | **M111d** (#2411) | GOTOP `gpu` panel: busy, queue depth, last kernel time | `user/go/top/*` | `go test`; panel renders real counters; absent-device boot shows unsupported (the panel leg rides M111e's spec) |
 | **M111e** (#2412) | acceptance: class-B spec + status row + index closure | `tools/gate/specs/live-gpu-compute.spec` (new; extending `live-gpu3d` instead is a card-time choice, not renegotiation), `docs/status.md` | `live-gpu-compute` green on the reference host: the model answers, output pinned, K consecutive runs; owner sign-off |
