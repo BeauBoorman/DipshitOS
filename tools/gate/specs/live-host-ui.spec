@@ -23,8 +23,12 @@
 # startup dispatch emits the identical `capture=on` receipt a trigger,
 # Cmd+Opt+K or the toolbar pill would, then a --host-cmd-after trigger
 # toggles capture back off.
+#
+# Run 04 is M114d's (#2457): send-serial injects the --host-serial-send
+# line into the console pipe and the inspector verb's receipt reports
+# the drawer model saw the echo (saw=1).
 
-vgate_name live-host-ui "M114a #2454 + M114b #2455: HostCommand bus — --host-cmd-after/--host-capture-keys, host-ui: receipts"
+vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts"
 vgate_repeat 1 BOOTS
 
 vgate_file script.txt <<'EOF'
@@ -71,3 +75,24 @@ vgate_run 03 -- --screen '$RUN_DIR/screen3' --script '$RUN_DIR/script.txt' \
 vgate_assert 03 output-contains 'host-capture-keys: ENABLED'
 vgate_assert 03 output-contains 'host-ui: cmd=capture-keys state=performed capture=on'
 vgate_assert 03 output-contains 'host-ui: cmd=capture-keys state=performed capture=off'
+
+# Run 04 is M114d's (#2457): the send-serial verb writes the armed
+# --host-serial-send line into the console pipe — the same path --script
+# forwards through — and the drawer's ring buffer, fed from the same
+# serial text, reports it saw the echo. `send-serial` fires on the boot
+# marker and receipts `sent=1` from the model's own counter; the guest's
+# shell echoes the line back over serial (gosh's `line` record wraps the
+# command), and the second trigger fires `inspector` on that echo — its
+# receipt's `saw=1` is the drawer model testifying it ingested the
+# injected line, not just that a dispatch happened.
+
+vgate_run 04 -- --script '$RUN_DIR/script.txt' \
+    --host-serial-send 'echo inspector-ping' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:send-serial' \
+    --host-cmd-after 'inspector-ping:inspector' \
+    --script-expect 'host-ui-idle' --timeout 90
+
+vgate_assert 04 output-contains 'host-ui: cmd=send-serial state=performed sent=1'
+vgate_assert 04 serial-contains 'inspector-ping'
+vgate_assert 04 output-contains 'host-ui: cmd=inspector state=performed open=1'
+vgate_assert 04 output-contains 'saw=1'

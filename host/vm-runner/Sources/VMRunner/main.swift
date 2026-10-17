@@ -112,6 +112,12 @@
 //          VZVirtualMachineView exists — the same host-ui: receipt as
 //          ⌥⌘K / the toolbar pill / a --host-cmd-after trigger. Requires
 //          a view: --screen/--display/--host-session.)
+//         [--host-serial-send <line>] (M114d #2457, index #2447: arm the
+//          inspector drawer's input line — the send-serial verb (a
+//          --host-cmd-after trigger, or the drawer's Send) writes it into
+//          the console pipe, the same path --script forwards through.
+//          The dispatch receipts `disabled` without a guest RX path:
+//          --script/--console/--host-session/--vz-restore provide one.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -660,6 +666,16 @@ var hostCmdTriggers: [HostCommandTrigger] = []
 // on the bus once setupDisplayWindow has built the view, so the receipt
 // is identical to ⌥⌘K / the toolbar pill / a --host-cmd-after trigger.
 var hostCaptureKeys = false
+// M114d (#2457, index #2447): the inspector drawer's model — ONE
+// instance for the run. The serial polls feed it the growing log; the
+// `inspector`/`send-serial` verbs act on it; a session window's drawer
+// renders the same object, so a headless --host-cmd-after run exercises
+// the identical seam the open drawer does.
+let inspector = HostInspector()
+// `--host-serial-send <line>`: arms the drawer's input line headlessly —
+// the send-serial verb (a --host-cmd-after trigger, or the drawer's own
+// Send) writes it into the console pipe exactly as the field would.
+var hostSerialSend: String?
 // The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
 // ARMED record naming every live lane — the seat adopts (epoch, mask), so
 // per-lane epochs would refuse each other stale_epoch forever.
@@ -1389,6 +1405,13 @@ while idx < arguments.count {
         }
         hostCmdTriggers.append(trigger)
         idx += 2
+    } else if arg == "--host-serial-send", idx + 1 < arguments.count {
+        // M114d (#2457): arms the inspector's input line — a
+        // `--host-cmd-after …:send-serial` trigger writes it into the
+        // console pipe, the same path --script forwards through.
+        hostSerialSend = arguments[idx + 1]
+        inspector.inputLine = hostSerialSend!
+        idx += 2
     } else if arg == "--host-notify" {
         // M108d (#2328, ADR 0051 D5): the notify-out lane — seat toasts
         // become signed NOTIFY_OUT records the runner maps to banners
@@ -1803,6 +1826,11 @@ if !hostCmdTriggers.isEmpty, !scriptMode, !hostSessionMode {
 // into (--host-session implies --display by its own validation).
 if hostCaptureKeys, screenshotPath == nil, !displayMode {
     fail("--host-capture-keys requires --screen/--display or --host-session (there is no VZVirtualMachineView to capture keys into).")
+}
+// M114d: the injector is single-line — a newline would smuggle extra
+// commands past the drawer's one-line contract.
+if let line = hostSerialSend, line.contains("\n") {
+    fail("--host-serial-send takes a single line (no newline).")
 }
 
 // ---------------------------------------------------------------------------
@@ -2276,7 +2304,10 @@ if consoleMode || scriptMode {
         fail("Could not open serial log at \(serialURL.path): \(error)")
     }
     serialConfig.attachment = VZFileHandleSerialPortAttachment(
-        fileHandleForReading: vzRestore ? consoleInputPipe.fileHandleForReading : nil,
+        // M114d (#2457): --host-session gets the read end too — the
+        // drawer's injector (send-serial) needs a guest RX path; vzRestore
+        // already needed it for the probe's serial query.
+        fileHandleForReading: (vzRestore || hostSessionMode) ? consoleInputPipe.fileHandleForReading : nil,
         fileHandleForWriting: serialHandle
     )
 }
@@ -3094,7 +3125,7 @@ let vmDelegate = VMRunnerDelegate()
 let runner = Runner(configuration: config)
 runner.vm.delegate = vmDelegate
 if hostSessionMode {
-    hostApplication = HostApplication(serialLog: serialLogPath)
+    hostApplication = HostApplication(serialLog: serialLogPath, inspector: inspector)
     hostApplication?.onStop = { reason, code in stopHostSession(reason, code: code) }
 }
 // M114a (#2454): the bus every UI action dispatches through — the session
@@ -3150,6 +3181,41 @@ if !hostSessionMode {
     }
     commandBus.register(.stop, headlessStop)
     commandBus.register(.quit, headlessStop)
+}
+// M114d (#2457): the inspector drawer verbs. The model's serialSink is
+// the console pipe's write end wherever a guest RX path exists (the
+// --script/--console duplex attachment, --vz-restore's probe input, or
+// --host-session's read end) — without one the verb receipts `disabled`
+// instead of writing into a pipe nobody reads. `send-serial` is the
+// same registration in every mode, like screenshot: the drawer's Send
+// and --host-cmd-after dispatch it identically.
+if consoleMode || scriptMode || hostSessionMode || vzRestore {
+    inspector.serialSink = { line in
+        do {
+            try consoleInputPipe.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8))
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+commandBus.register(.sendSerial, HostCommandBus.Registration(
+    isEnabled: { inspector.serialSink != nil },
+    receiptDetail: { "sent=\(inspector.sentCount)" }
+) {
+    inspector.inject() ? .performed : .failed
+})
+if !hostSessionMode {
+    // Headless: no split pane exists, but the toggle is still honest —
+    // isOpen is model state a receipt reports (the session window
+    // registers its own pane-sliding variant in HostApplication).
+    commandBus.register(.inspector, HostCommandBus.Registration(
+        itemState: { inspector.isOpen },
+        receiptDetail: { inspector.receiptDetail }
+    ) {
+        inspector.isOpen.toggle()
+        return .performed
+    })
 }
 // Set when vm.start completes successfully; consolePoll only treats a
 // .stopped/.error state as "session over" after the VM has actually started
@@ -3217,6 +3283,9 @@ if consoleMode {
 }
 for t in hostCmdTriggers {
     print("  host-cmd-after: \"\(t.marker)\" → \(t.command.rawValue)  (M114a #2454: HostCommand bus mirror — dispatch emits a host-ui: receipt)")
+}
+if let line = hostSerialSend {
+    print("  host-serial-send: \(line.utf8.count) bytes armed  (M114d #2457: the send-serial verb / drawer injector writes the line into the console pipe)")
 }
 if hostCaptureKeys {
     print("  host-capture-keys: ENABLED (M114b #2455) — capture-keys dispatches on the HostCommand bus once the machine view exists; the host-ui: receipt is the same one ⌥⌘K / the toolbar pill emit")
@@ -3370,7 +3439,7 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
             mask |= HostInt.laneDrop
             dropWanted = true
         } else {
-            HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
+            hostIntRefuse("drop", .laneDisabled)
         }
     }
     if hostNotifyFlag {
@@ -3419,6 +3488,12 @@ runner.queue.async {
             if hostSessionMode {
                 FileHandle.standardError.write(Data("ERROR: VM failed to start: \(error)\n".utf8))
                 DispatchQueue.main.async {
+                    // M114d (#2457): a start refusal gets the crash card
+                    // too — the drawer opens on it.
+                    inspector.noteStop(PostmortemCard(
+                        ending: .crashed, state: "start",
+                        reason: StopReasonRecorder.describe(error),
+                        serialLines: inspector.ingestedCount))
                     hostApplication?.showFailure("VM failed to start: \(error)")
                 }
                 return
@@ -4063,7 +4138,7 @@ func writeMarkerDump(to path: String, ladder: [(name: String, offset: Int)]) {
 
 func poll() {
     if let data = try? Data(contentsOf: serialURL), let text = String(data: data, encoding: .utf8) {
-        if !text.isEmpty { lastText = text }
+        if !text.isEmpty { lastText = text; feedInspector(text) }
         serialMatched = text.contains(expectLine)
         if let terminalMarker { terminalMatched = text.contains(terminalMarker) }
         if serialMatched && terminalMatched {
@@ -4166,7 +4241,7 @@ func fireHostDropIfMarker(_ text: String) {
           text.contains(marker) else { return }
     hostDropFired = true
     guard let lane = hostDrop else {
-        HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
+        hostIntRefuse("drop", .laneDisabled)
         return
     }
     FileHandle.standardOutput.write(Data("host-drop: inject files=\(hostDropFiles.count) after \"\(marker)\"\n".utf8))
@@ -4195,6 +4270,32 @@ func fireHostWriteIfMarker(_ text: String) {
     } catch {
         FileHandle.standardOutput.write(Data("HOST-WRITE: FAILED for \(relPath): \(error)\n".utf8))
     }
+}
+
+// M114d (#2457): the inspector's feed — every poll hands it the same
+// serial-log snapshot it just read (the model's offset ingest keeps only
+// the new lines), plus a lane-directory seq scan when HostInt is armed:
+// a record filename's seq counts whether or not the file survives to the
+// next tick. Runs before fireHostCmdsIfMarker so a verb firing on a
+// marker this tick already saw the line ingested — `saw=` in a receipt
+// is then the model's truth, not a race.
+func feedInspector(_ text: String) {
+    inspector.ingest(serialText: text)
+    if let laneDir = hostIntSession?.laneDir {
+        for tag in [HostInt.Tag.clipIn, .clipOut, .notifyOut, .drop] {
+            for (_, seq) in HostInt.records(laneDir: laneDir, tag: tag) ?? [] {
+                inspector.noteHostIntSeq(seq)
+            }
+        }
+    }
+}
+
+// The runner's own `host-int: refuse` sites report to the model too —
+// lane-internal refusals reach stdout only (the model doc names that
+// limit); these are the refusals main.swift itself emits.
+func hostIntRefuse(_ lane: String, _ reason: HostInt.Refusal) {
+    HostInt.logRefuse(lane: lane, reason: reason)
+    inspector.noteHostMarker("host-int: refuse lane=\(lane) reason=\(reason.rawValue)")
 }
 
 // M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
@@ -6730,7 +6831,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     }
     // Lossy decode (fix 1): invalid bytes become U+FFFD, never nil.
     let text = String(decoding: (try? Data(contentsOf: serialURL)) ?? Data(), as: UTF8.self)
-    if !text.isEmpty { lastText = text }
+    if !text.isEmpty { lastText = text; feedInspector(text) }
     if matchedAt == nil, let expect = scriptExpect, text.contains(expect) {
         // Claim 4912: the kernel prints the exec reap/report lines
         // (`tasks` / `procs <name> exited status=N`) from the shell idle
@@ -6850,12 +6951,20 @@ func hostSessionPoll() {
     // M114a: --host-cmd-after fires in session mode on the same serial-log
     // scan the scripted poll uses — the mirror of choosing the menu item.
     let sessionText = String(decoding: (try? Data(contentsOf: serialURL)) ?? Data(), as: UTF8.self)
-    if !sessionText.isEmpty { lastText = sessionText }
+    if !sessionText.isEmpty { lastText = sessionText; feedInspector(sessionText) }
     fireHostCmdsIfMarker(lastText)
     runner.queue.async {
         let state = runner.vm.state
         DispatchQueue.main.async {
             if vmDidStart && (state == .stopped || state == .error) {
+                // M114d (#2457): the in-window postmortem — the drawer
+                // opens itself on the stop/crash card (state + the VZ
+                // delegate's reason + how deep the serial tail is).
+                inspector.noteStop(PostmortemCard(
+                    ending: state == .error ? .crashed : .stopped,
+                    state: "\(state.rawValue)",
+                    reason: vmDelegate.stopReasons.reason ?? StopReasonRecorder.noReason,
+                    serialLines: inspector.ingestedCount))
                 hostApplication.showFailure("VM ended (state=\(state.rawValue)).\(vmDelegate.verdict())")
             } else if timeout > 0 && Date() > deadline {
                 hostApplication.stop("session-timeout")
@@ -6922,6 +7031,11 @@ func installSignalHandlers() {
 }
 
 func consolePoll() {
+    // M114d (#2457): the drawer's tail feeds off the same serial log the
+    // tee is writing — the model's offset ingest keeps only new lines.
+    if let text = try? String(contentsOf: serialURL, encoding: .utf8), !text.isEmpty {
+        feedInspector(text)
+    }
     let state = runner.vm.state
     if vmDidStart && (state == .stopped || state == .error) {
         // The VM already ended, so VZ closed the serial pipe — the tee is

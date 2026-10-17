@@ -63,6 +63,11 @@ let package = Package(
         ),
         .target(
             name: "VMAppKit",
+            // M114d (#2457): the inspector model renders VMPostmortem's
+            // PostmortemCard — a pure-Foundation edge, so the
+            // Virtualization-free boundary NativeInputTests depends on
+            // is untouched.
+            dependencies: ["VMPostmortem"],
             path: "Sources/VMAppKit"
         ),
         // M102b2 (#2163): the host envelope for the experimental
