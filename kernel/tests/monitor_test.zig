@@ -1203,9 +1203,9 @@ test "monitor: handoff formatting is deterministic and validated" {
     var mon = env.monitor();
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{"handoff"}));
     try std.testing.expectEqualStrings(
-        "handoff v3\n" ++
+        "handoff v4\n" ++
             "  magic        0x00000000324b5344\n" ++
-            "  version      0x0000000000000003\n" ++
+            "  version      0x0000000000000004\n" ++
             "  kernel_base  0x000000007e4df000\n" ++
             "  kernel_size  0x00000000000823e8\n" ++
             "  system_table 0x000000000feed000\n" ++
@@ -1214,6 +1214,9 @@ test "monitor: handoff formatting is deterministic and validated" {
             "  stack_size   0x0000000000004000\n" ++
             "  flags        0x0000000000000000\n" ++
             "  boot_epoch   0xffffffffffffffff\n" ++
+            "  measured_ok  0x0000000000000000\n" ++
+            "  loader_sha256 0000000000000000000000000000000000000000000000000000000000000000\n" ++
+            "  kernel_sha256 0000000000000000000000000000000000000000000000000000000000000000\n" ++
             "  status       valid\n",
         env.mock.contents(),
     );

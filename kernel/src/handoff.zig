@@ -12,7 +12,7 @@
 const std = @import("std");
 
 pub const magic: u32 = 0x324b5344; // "DSK2"
-pub const version: u32 = 3;
+pub const version: u32 = 4;
 pub const expected_stack_size: u64 = 16 * 1024; // 16 KiB, ADR 0004 D5
 
 /// Sentinel for "the firmware gave no wall-clock epoch" (no RTC, or
@@ -36,6 +36,21 @@ pub const HandoffV2 = extern struct {
     /// widening explicit and non-silent (the boot stub, this module, and
     /// ADR 0004 move together).
     boot_epoch_secs: u64 = no_boot_epoch,
+    /// v4 additive (#2418, ADR 0054 Part I): the loader's measured
+    /// Authenticode SHA-256 of its own `\EFI\BOOT\BOOTAA64.EFI` image —
+    /// the `stage=loader` receipt digest. The kernel never re-reads the
+    /// boot volume, so the loader is the only honest source. Zeros when
+    /// `measured_ok` bit0 is clear.
+    measured_loader: [32]u8 = @splat(0),
+    /// v4 additive: the loader's raw-file SHA-256 of `\KERNEL.BIN` — the
+    /// digest it verified against its build-embedded pin before jumping,
+    /// republished as the `stage=kernel` receipt digest. Zeros when
+    /// `measured_ok` bit1 is clear.
+    measured_kernel: [32]u8 = @splat(0),
+    /// v4 additive: bit0 — `measured_loader` is a real digest; bit1 —
+    /// `measured_kernel` is a real digest. A clear bit must surface as
+    /// `unmeasured` on the receipt, never `measured`.
+    measured_ok: u64 = 0,
 };
 
 pub const ValidateError = enum {
@@ -101,6 +116,9 @@ fn valid_fixture() HandoffV2 {
         .stack_base = 0x7e520000,
         .stack_size = expected_stack_size,
         .flags = 0,
+        .measured_loader = @splat(0),
+        .measured_kernel = @splat(0),
+        .measured_ok = 0,
     };
 }
 
@@ -170,11 +188,24 @@ test "handoff: v3 carries the boot epoch after the frozen v2 layout (#1058)" {
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(HandoffV2, "flags"));
     // ...and the v3 epoch follows.
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(HandoffV2, "boot_epoch_secs"));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(HandoffV2));
 
     var h = valid_fixture();
     try std.testing.expectEqual(h.boot_epoch_secs, no_boot_epoch);
     h.boot_epoch_secs = 1_789_043_696;
     // The epoch is not part of the frozen validation contract.
+    try std.testing.expectEqual(ValidateError.none, validate(&h));
+}
+
+test "handoff: v4 carries the loader's measured digests after v3 (#2418)" {
+    // v4 additive: the two 32-byte measurement digests plus their validity
+    // word append after boot_epoch_secs; the frozen layout is untouched.
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(HandoffV2, "measured_loader"));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(HandoffV2, "measured_kernel"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(HandoffV2, "measured_ok"));
+    try std.testing.expectEqual(@as(usize, 144), @sizeOf(HandoffV2));
+
+    var h = valid_fixture();
+    h.measured_ok = 0x3;
+    // The measurement fields are not part of the frozen validation contract.
     try std.testing.expectEqual(ValidateError.none, validate(&h));
 }

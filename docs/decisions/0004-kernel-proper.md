@@ -237,7 +237,7 @@ DipshitOS kernel has seized control.
 (the success line defined by the milestone-one prompt), followed by a hex
 print of the kernel's own memory-map view as secondary evidence.
 
-### D5. Handoff contract (v2 → v3) (boot stub → kernel proper)
+### D5. Handoff contract (v2 → v3 → v4) (boot stub → kernel proper)
 
 Registers keep ADR 0002's ABI where it still means something:
 
@@ -254,7 +254,7 @@ via `AllocatePages`), owned by the kernel after exit:
 | offset | size | field |
 |--------|------|-------|
 | 0      | u32  | magic `0x324B5344` ("DSK2") |
-| 4      | u32  | version (3) |
+| 4      | u32  | version (4) |
 | 8      | u64  | `kernel_base` (mirror of x0) |
 | 16     | u64  | `kernel_size` (mirror of x1) |
 | 24     | u64  | `system_table` (mirror of x2) |
@@ -263,6 +263,9 @@ via `AllocatePages`), owned by the kernel after exit:
 | 48     | u64  | `stack_size` — 16 KiB for this milestone |
 | 56     | u64  | `flags` (0) |
 | 64     | u64  | `boot_epoch_secs` — **v3** (#1058, 2026-09-10): Unix wall-clock seconds from `RuntimeServices.GetTime` (days-from-civil over the broken-down face), or `0xFFFF_FFFF_FFFF_FFFF` (`no_boot_epoch`) when the firmware has no clock |
+| 72     | 32 B | `measured_loader` — **v4** (#2418, 2026-10-16, ADR 0054 Part I): the loader's measured PE/COFF Authenticode SHA-256 of its own `\EFI\BOOT\BOOTAA64.EFI` image, or zeros when `measured_ok` bit0 is clear |
+| 104    | 32 B | `measured_kernel` — **v4**: the loader's raw-file SHA-256 of `\KERNEL.BIN` — the digest it verified against its build-embedded pin before jumping — or zeros when `measured_ok` bit1 is clear |
+| 136    | u64  | `measured_ok` — **v4**: bit0 = `measured_loader` holds a real digest; bit1 = `measured_kernel` holds a real digest. A clear bit must surface as `unmeasured` on the chain receipt, never `measured` |
 
 The `boot_epoch_secs` field is a v3 addition: the **version bumps to 3** so
 the widening is explicit and non-silent — the frozen 0..64 bytes
@@ -274,6 +277,13 @@ a real system clock with or without a host share (the loader reads `GetTime`
 before the kernel's `ExitBootServices`); the sentinel preserves the honest
 uptime fallback when unavailable. `boot/src/main.zig`, `kernel/src/handoff.zig`,
 and this ADR move together.
+
+The v4 measurement fields are the same additive widening (version 4): the
+loader is the only honest source of the two boot-stage digests — the kernel
+never re-reads the boot volume after handoff, so the measured values travel
+in the record the loader already fills. They feed the ADR 0054 Part I chain
+receipt (`RCPT stage=…` lines on serial plus the `RCPT.TXT` share file);
+they are not part of the frozen validation contract.
 
 The stub additionally allocates the kernel stack (16 KiB, `EfiLoaderData`,
 4K-aligned) and records its bounds in the struct. The kernel validates

@@ -114,6 +114,7 @@ fn rp_read_source() ?u8 {
 // modules. This file keeps local aliases so the orchestration below reads
 // like the original; the marker names and values are evidence.zig's.
 const handoff = @import("handoff.zig");
+const measure = @import("measure.zig"); // M113b (ADR 0054 Part I): the measurement primitive + D4 chain receipt
 const mmu = @import("mmu.zig");
 const mmio = @import("mmio.zig");
 const pci = @import("pci.zig");
@@ -668,6 +669,17 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     if (comptime tx_transition_d) virtio_console.transition_tx_experiment(st, .d);
     klog.line_hook = uart_puts; // #990: arm the klog seam (first banner line goes direct)
     uart_puts("VirelaiOS kernel has seized control.\n");
+    // M113b (ADR 0054 Part I): publish the verified-boot chain receipt.
+    // The loader measured both stages (its own Authenticode digest, the
+    // raw KERNEL.BIN digest it verified before jumping) and carried them
+    // in the v4 handoff — the kernel never re-reads the boot volume, so
+    // these lines ARE the measurement record. The serial copy goes out
+    // here; the share copy lands at the file-channel arming point below.
+    var rcpt: [2 * measure.receipt_max]u8 = undefined;
+    var rcpt_len: usize = 0;
+    rcpt_len += measure.receipt_line(rcpt[rcpt_len..], .loader, &handoff_rec.measured_loader, if (handoff_rec.measured_ok & 1 != 0) "measured" else "unmeasured", null, null);
+    rcpt_len += measure.receipt_line(rcpt[rcpt_len..], .kernel, &handoff_rec.measured_kernel, if (handoff_rec.measured_ok & 2 != 0) "measured" else "unmeasured", null, null);
+    uart_puts(rcpt[0..rcpt_len]);
     // Claim 0013: after the first TX, record whether the TX path returned
     // (bytes may still be dropped by the device; the serial log is the gate,
     // but M2_TXOK! separates "TX hung" from "TX returned silently").
@@ -769,6 +781,14 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // shell runs without interrupt noise; the claim-9187 timer PPI stays
     // armed and the polled console paths are untouched.
     custom_virtio_spike();
+    // M113b (#2418, ADR 0054 D5): the chain receipt's second publication
+    // surface is the share file `RCPT.TXT` — the surface every
+    // file-channel gate already reads — written after the spike because
+    // the queue-5 arming lives inside it. Best effort; an absent channel
+    // leaves the serial copy as the record.
+    if (virtio_file.available()) {
+        _ = virtio_file.write_whole("RCPT.TXT", rcpt[0..rcpt_len]);
+    }
 
     // M102 card b1 (issue #2162): arm the GPU3D render channel post-MMU
     // (the claim-6420 discipline — the whole device state machine is
