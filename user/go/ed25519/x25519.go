@@ -9,7 +9,7 @@
 // verification paths in this package operate on public data and are not
 // constant-time.
 
-package sshlib
+package ed25519
 
 import "math/bits"
 

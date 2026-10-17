@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"unicode/utf8"
 
+	"virelai/ed25519"
 	"virelai/sshlib"
 )
 
@@ -269,5 +270,5 @@ func VerifyChange(c *Change) (bool, error) {
 	if !ok {
 		return false, refuse("change_malformed", "")
 	}
-	return sshlib.EdVerify(sig, msg, author), nil
+	return ed25519.EdVerify(sig, msg, author), nil
 }

@@ -152,6 +152,7 @@ pub const slots = [_]Slot{
     row(85, "sys_udp_recv_from", .{ .int, .ptr, .int }),
     row(86, "sys_udp_close", .{.int}),
     row(87, "sys_getpid", .{}),
+    row(88, "sys_scanout_read", .{ .int, .int, .int, .int, .ptr, .int }),
 };
 
 // op-dependent shapes override the base row. No pointed-to output or binary

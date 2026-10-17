@@ -4,7 +4,7 @@
 // rationale as sha256.go; pinned to the FIPS vectors and a host-stdlib
 // cross-check.
 
-package sshlib
+package ed25519
 
 // sha512K is the FIPS 180-4 §4.2.3 round-constant table (first 80 primes).
 var sha512K = [80]uint64{

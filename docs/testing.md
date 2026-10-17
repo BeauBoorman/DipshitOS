@@ -729,28 +729,35 @@ repaint (measured 1789 console-green pixels). The default-seat probe is
 `go-wm-console-ink` (#1561) and asserts console-green = 0. A serial-marker
 beat cannot see this.
 
-## Agent control channel (M98, issue #2145)
+## Agent control channel (M98 #2145, M109b #2398)
 
-`go-agentd` is the ADR 0044 class-B gate: eight boots of `AGENTD.ELF` on
-guest TCP 4747 behind an HMAC-SHA256 challenge, driven by the stdlib-only
-harness `tools/agentctl/agentctl.py` over the runner's hermetic
+`go-agentd` is the ADR 0044/0052 class-B gate: fourteen boots of
+`AGENTD.ELF` on guest TCP 4747 behind an agent-named Ed25519 challenge
+(`virelai-agent/2`, ADR 0052), driven by the stdlib-only harness
+`tools/agentctl/agentctl.py` over the runner's hermetic
 `--net-tcp-connect-stream` adapter (stdin is guest->host, stdout is
 host->guest, `AGENTCTL:` evidence rides stderr into the run log).
 
 | run | proves |
 |-----|--------|
-| 01 | seat + `--allow-exec` + Calc (Calc execs on the first `ui.windows` request — the 16-slot task pool cannot hold four Go runtimes at once, so it is staged after the journey's `gosh.run` calls): the handshake, all six verbs green, the whole in-session D4 refusal matrix, the `gosh.run` kill path, a second peer's SYN refused while the session stays up, and `line_too_long` ending it. `ui.windows` rides the M97g-F2 bind: agentd opens its own undeclared window on the first call, walks the ownership challenge, and its bound kind-16 page requests quote the session token (`gotabwm: rpc bind id=` is the serial proof) |
-| 02 | wrong MAC -> `auth_failed`, the 1 s damping, and an honest relisten |
+| 01 | seat + `--allow-exec` + Calc (Calc execs on the first `ui.windows` request — the 16-slot task pool cannot hold four Go runtimes at once, so it is staged after the journey's `gosh.run` calls): the `agent=devin` handshake, caps resolved per session, all seven verbs green — `fs.read`/`fs.write` through a staged `SUB/` directory, `gosh.run` answering a multi-chunk stream + truncation, `ui.screenshot` streaming the 160x90 RGB565 thumbnail through slot 88 — plus the whole in-session refusal matrix, the `gosh.run` kill path, a second peer's SYN refused while the session stays up, and `line_too_long` ending it. `ui.windows` rides the M97g-F2 bind (`gotabwm: rpc bind id=` is the serial proof) |
+| 02 | wrong signature -> `auth_failed`, the 1 s damping, and an honest relisten |
 | 03 | a `verb` line before auth -> `auth_required`, no request runs |
 | 04 | a silent client -> `auth_timeout` inside 15 s |
-| 05 | no `--allow-exec` and no seat: `gosh.run` absent from `verbs` -> `verb_disabled`, `ui.windows` -> `seat:"none"` |
+| 05 | no `--allow-exec` and no seat: `gosh.run` absent from `verbs` -> `verb_disabled`, `ui.windows` -> `seat:"none"`, `ui.screenshot` -> `seat_absent` |
 | 06–08 | startup posture: `exec -u0` -> `refuse privileged`, a store with no `agent-hmac` row -> `refuse no-credential`, no `AGENT/` directory -> `refuse no-root` — each before any `listen` |
+| 09 | `agent=viewer` (caps `process` only): the ready line advertises the two proc verbs, every other verb refuses `cap_required:<cap>` by name, `proc.list` still serves |
+| 10 | `agent=bobby` listed-and-revoked: a valid signature refuses `agent_revoked` (revocation wins over listing) |
+| 11 | a valid signature under no listed id refuses `agent_unknown` |
+| 12–14 | the ADR 0052 D1 postures: no `AGENTS.TXT` -> `refuse no-keyring`, an unparseable keyring -> `refuse keyring-malformed`, no `AGENT/AUDIT` -> `refuse no-audit` — each before any `listen` |
 
-Two runs stage a different share through a run-local `--cvc-file` (the
-runner takes the last assignment): `nocred-share` carries a `#v1` secrets
-file with no `agent-hmac` row, `noroot-share` has the row but no `AGENT/`
-directory. Every run asserts the key text, the `fs.write` payload
-sentinel and the `gosh.run` stdout sentinel never reach serial.
+The posture legs stage a different share through a run-local `--cvc-file`
+(the runner takes the last assignment): `nocred-share` carries a `#v1`
+secrets file with no `agent-hmac` row, `noroot-share` has no `AGENT/`,
+`nokeyring-share` has no `AGENTS.TXT`, `badkeyring-share` has an
+unparseable one, `noaudit-share` has no `AGENT/AUDIT`. Every run asserts
+the seed hexes, the `agent-hmac` value, the `fs.write` payload sentinels
+and the `gosh.run` stdout sentinel never reach serial.
 
 Host prerequisites — build the four guest ELFs first; the spec refuses a
 missing one by name:

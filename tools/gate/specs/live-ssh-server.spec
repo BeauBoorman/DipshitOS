@@ -132,6 +132,17 @@ for name, cmd in (("GOSSHD.ELF", "bash tools/go/build-sshd.sh"),
     shutil.copy(src, os.path.join(share, name))
 os.makedirs(os.path.join(share, "SSH"), exist_ok=True)
 os.makedirs(os.path.join(share, "AGENT"), exist_ok=True)
+# M109b posture: the audit lane and the agent keyring must exist or
+# AGENTD refuses before Listen. The row's caps are irrelevant here —
+# no client connects — but the file must parse whole.
+os.makedirs(os.path.join(share, "AGENT", "AUDIT"), exist_ok=True)
+sys.path.insert(0, os.path.join("tools", "agentctl"))
+import agentctl
+_ssh_seed = bytes.fromhex(
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+open(os.path.join(share, "AGENTS.TXT"), "w").write(
+    "#v1\nagent=devin key=" + agentctl.ed_public_key(_ssh_seed).hex()
+    + " caps=file\n")
 # sshd's host key + agentd's hmac credential, each app-bound (M97g).
 open(os.path.join(share, "SECRETS.TXT"), "w").write(
     "#v1\n"
@@ -143,6 +154,7 @@ open(os.path.join(share, "OWNERS.TXT"), "w").write(
     "GOSSHD.ELF\t644\t0\t-\n"
     "GOSH.ELF\t644\t0\t-\n"
     "AGENTD.ELF\t644\t0\t-\n"
+    "AGENTS.TXT\t444\t0\t-\n"
 )
 open(os.path.join(share, "SSH", "AUTHORIZED_KEYS"), "w").write(
     "#v1\n"

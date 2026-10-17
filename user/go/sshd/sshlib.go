@@ -1,6 +1,9 @@
 package main
 
-import "virelai/sshlib"
+import (
+	"virelai/ed25519"
+	"virelai/sshlib"
+)
 
 // Local aliases so the server state machine keeps the names it landed
 // with. The primitives live in virelai/sshlib so GOSSH.ELF can reuse
@@ -63,11 +66,11 @@ var (
 	parseHex32     = sshlib.ParseHex32
 	encodeHex      = sshlib.EncodeHex
 	wipe           = sshlib.Wipe
-	edDerivePublic = sshlib.EdDerivePublic
-	edSign         = sshlib.EdSign
-	edVerify       = sshlib.EdVerify
-	x25519         = sshlib.X25519
-	x25519Base     = sshlib.X25519Base
+	edDerivePublic = ed25519.EdDerivePublic
+	edSign         = ed25519.EdSign
+	edVerify       = ed25519.EdVerify
+	x25519         = ed25519.X25519
+	x25519Base     = ed25519.X25519Base
 	sha256Sum      = sshlib.SHA256Sum
 	encodePacket   = sshlib.EncodePacket
 	decodePacket   = sshlib.DecodePacket

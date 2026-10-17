@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	ved25519 "virelai/ed25519"
 	"virelai/sshlib"
 )
 
@@ -712,11 +713,11 @@ func TestPinnedSigVectorsAndStdlibOracle(t *testing.T) {
 	}
 
 	// 2. EdDerivePublic(seed) equals good.Author, and EdSign(seed, msg) equals stored sig.
-	derivedPub := sshlib.EdDerivePublic(seed)
+	derivedPub := ved25519.EdDerivePublic(seed)
 	if sshlib.EncodeHex(derivedPub[:]) != good.Author || good.Author != testRFC8032PubHex {
 		t.Fatalf("derived pub=%x want %s", derivedPub, good.Author)
 	}
-	gotSig := sshlib.EdSign(gotMsg, seed)
+	gotSig := ved25519.EdSign(gotMsg, seed)
 	if sshlib.EncodeHex(gotSig[:]) != good.Sig {
 		t.Fatalf("EdSign mismatch:\ngot:  %x\nwant: %s", gotSig, good.Sig)
 	}

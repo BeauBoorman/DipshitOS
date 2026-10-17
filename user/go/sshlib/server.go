@@ -4,6 +4,8 @@
 
 package sshlib
 
+import "virelai/ed25519"
+
 const (
 	MsgDisconnect      byte = 1
 	MsgIgnore          byte = 2
@@ -129,7 +131,7 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	return &Server{
 		cfg:     cfg,
-		HostPub: EdDerivePublic(cfg.HostSeed),
+		HostPub: ed25519.EdDerivePublic(cfg.HostSeed),
 		phase:   phaseVersion,
 	}
 }
@@ -353,7 +355,7 @@ func (s *Server) performKex() {
 		s.fail("entropy")
 		return
 	}
-	qS, ok := X25519Base(eph)
+	qS, ok := ed25519.X25519Base(eph)
 	if !ok {
 		s.fail("bad ephemeral secret")
 		return
@@ -361,7 +363,7 @@ func (s *Server) performKex() {
 	s.qS = qS[:]
 	var qC [32]byte
 	copy(qC[:], s.qC)
-	kRaw, ok := X25519(eph, qC)
+	kRaw, ok := ed25519.X25519(eph, qC)
 	Wipe(eph[:])
 	if !ok {
 		s.fail("all-zero shared secret")
@@ -379,7 +381,7 @@ func (s *Server) performKex() {
 		[]byte(s.clientVer), []byte(s.cfg.Ident),
 		s.iC, s.iS, kS, s.qC, s.qS, kMpint,
 	)
-	sig := EdSign(h[:], s.cfg.HostSeed)
+	sig := ed25519.EdSign(h[:], s.cfg.HostSeed)
 	var sigBlob Writer
 	sigBlob.StrS(AlgoEd25519)
 	sigBlob.Str(sig[:])
@@ -544,7 +546,7 @@ func (s *Server) handleUserauth(payload []byte) {
 	signed.Raw(payload[:sigOffset])
 	var sig [64]byte
 	copy(sig[:], sigBytes)
-	if !EdVerify(sig, signed.B, pub) {
+	if !ed25519.EdVerify(sig, signed.B, pub) {
 		s.cfg.Log("publickey rejected: signature does not verify")
 		s.sendUserauthFail()
 		return

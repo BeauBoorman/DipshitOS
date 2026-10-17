@@ -173,6 +173,12 @@ pub const sys_udp_close: u64 = 86;
 /// never be mistaken for the caller (the sys_procs first-name-match that
 /// misrouted a second instance's WM_RPC acks).
 pub const sys_getpid: u64 = 87;
+/// #2398 (ADR 0052 D3, ADR 0007 M109b amendment): a bounded read-only rect
+/// of the virtio-gpu scanout — the pixels the display DMAs, so AGENTD's
+/// ui.screenshot shows the caller what the seat shows the human. The
+/// writable full-frame bind stays registered-WM only (bind_scanout_surface);
+/// this slot is the READ side for any EL0 process.
+pub const sys_scanout_read: u64 = 88;
 /// Card G6 (claim 0487): the draw/window syscall seam — slots 12/13/14, the
 /// card's ONE ABI change (the ipc slots-5/6, slots-7/8, and udp slots-9/10/11
 /// precedents; every existing syscall number 0–11 stays frozen).
@@ -609,6 +615,7 @@ fn handler_for(comptime number: u64) Handler {
         sys_udp_recv_from => handle_udp_recv_from,
         sys_udp_close => handle_udp_close,
         sys_getpid => handle_getpid,
+        sys_scanout_read => handle_scanout_read,
         sys_win_open => handle_win_open,
         sys_win_fill => handle_win_fill,
         sys_win_present => handle_win_present,
@@ -723,7 +730,7 @@ fn doms_of(number: u64) u5 {
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
         sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
-        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid => k,
+        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read => k,
         sys_exit => svclock.all_bits,
         else => 0,
     };
@@ -1048,6 +1055,48 @@ fn handle_procs(args: Args, _: *exceptions.VectorFrame) u64 {
 /// non-process caller (an EL1h task) is EINVAL, matching sys_principal.
 fn handle_getpid(_: Args, _: *exceptions.VectorFrame) u64 {
     return process.find_by_task(scheduler.current_id()) orelse error_result(.einval);
+}
+
+// ---------------------------------------------------------------------------
+// #2398 (ADR 0052 D3, ADR 0007 M109b amendment): sys_scanout_read — slot 88
+// ---------------------------------------------------------------------------
+
+/// The per-call byte bound: 64 KiB of pixel data. A caller wanting more
+/// reads more rects; the frame itself stays kernel BSS either way.
+const scanout_read_max: u64 = 65536;
+
+/// `sys_scanout_read(x, y, w, h, buf, len)`: copy the (x, y, w, h) rectangle
+/// of the virtio-gpu framebuffer (B8G8R8X8, fb_width*fb_height — what the
+/// display DMAs) OUT through uaccess, one scanline band per copy_out.
+/// Returns the byte count copied (w*h*fb_bpp). `ENXIO` when the framebuffer
+/// is not armed; `EINVAL` for a zero rect, a rect reaching past the frame,
+/// or a `len` that is not exactly w*h*4 or over scanout_read_max; `EFAULT`
+/// for a bad `buf` — the uaccess check runs per row before any store, so a
+/// fault mid-rect leaves the rows already copied (stated, not hidden).
+fn handle_scanout_read(args: Args, _: *exceptions.VectorFrame) u64 {
+    if (!virtio_gpu.gpu_ready) return error_result(.enxio);
+    const x = args[0];
+    const y = args[1];
+    const w = args[2];
+    const h = args[3];
+    const fb_w: u64 = virtio_gpu.fb_width;
+    const fb_h: u64 = virtio_gpu.fb_height;
+    const bpp: u64 = virtio_gpu.fb_bpp;
+    if (w == 0 or h == 0) return error_result(.einval);
+    if (x >= fb_w or y >= fb_h) return error_result(.einval);
+    if (w > fb_w - x or h > fb_h - y) return error_result(.einval);
+    const row_bytes = w * bpp;
+    const need = row_bytes * h;
+    if (need > scanout_read_max or args[5] != need) return error_result(.einval);
+    const stride = @as(usize, virtio_gpu.fb_width) * virtio_gpu.fb_bpp;
+    var row: u64 = 0;
+    while (row < h) : (row += 1) {
+        const off = @as(usize, @intCast((y + row) * @as(u64, stride) + x * bpp));
+        if (uaccess.copy_out(args[4] + row * row_bytes, virtio_gpu.gpu_fb[off .. off + @as(usize, @intCast(row_bytes))], @intCast(row_bytes)) != .ok) {
+            return error_result(.efault);
+        }
+    }
+    return need;
 }
 
 // ---------------------------------------------------------------------------

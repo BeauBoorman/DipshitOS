@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""tools/agentctl/test_agentctl.py -- class-A tests for agentctl.py (ADR 0044
-AC3): the pinned HMAC vector, line framing and bounds, and the journeys run
-end to end against a wire-level daemon simulation.
+"""tools/agentctl/test_agentctl.py -- class-A tests for agentctl.py (ADR 0052
+AC3): the pinned Ed25519 vectors, line framing and bounds, and the journeys
+run end to end against a wire-level daemon simulation.
 
 Run: python3 -m unittest tools/agentctl/test_agentctl.py
 """
 
 import base64
-import hashlib
-import hmac
 import json
 import os
 import sys
@@ -17,23 +15,33 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agentctl  # noqa: E402
 
-KEY = b"a5" * 32  # the pinned-vector key (ASCII a5 x 32 = 64 bytes)
+# The fixture identities: the spec stages the same three agents in its
+# AGENTS.TXT — devin full caps, viewer process-only, bobby listed-and-
+# revoked. The sim holds the seeds (it computes the expected signature
+# itself); a real wire holds only the seeds host-side.
+DEVIN = ("devin", bytes.fromhex("0a" * 32))
+VIEWER = ("viewer", bytes.fromhex("0b" * 32))
+BOBBY = ("bobby", bytes.fromhex("0c" * 32))
 
 
-def pinned_mac(challenge):
-    return hmac.new(
-        KEY, agentctl.DOMAIN + challenge, hashlib.sha256
-    ).hexdigest()
-
-
-def valid_name(path):
-    if not path or len(path) > 31 or path in (".", ".."):
+def valid_path(path):
+    """The daemon's D3 path grammar mirrored loosely for the sim."""
+    if not path or len(path) > 48:
         return False
-    if not path[0].isalnum() or ord(path[0]) > 0x7E:
+    segs = path.split("/")
+    if len(segs) > 4:
         return False
-    return all(c.isalnum() or c in "._-" for c in path) and all(
-        ord(c) < 0x80 for c in path
-    )
+    if segs[0].upper() == "AUDIT":
+        return False
+    for s in segs:
+        if not s or len(s) > 31 or s in (".", ".."):
+            return False
+        if not s[0].isalnum() or ord(s[0]) > 0x7E:
+            return False
+        if not all(c.isalnum() or c in "._-" for c in s) or any(
+                ord(c) > 0x7E for c in s):
+            return False
+    return True
 
 
 class FakeWire:
@@ -57,7 +65,6 @@ class FakeWire:
     def read(self, n):
         if not self.inq:
             return b""
-        # Bytes already queued still drain after close; EOF follows them.
         out = bytes(self.inq[:n])
         del self.inq[:n]
         return out
@@ -81,39 +88,61 @@ class FakeWire:
         self.closed = True
 
 
-class SimDaemon:
-    """A minimal agentd for journey tests: greeting, MAC check, ready,
-    then a D3/D4-faithful dispatch over the canned fixture set."""
+# agent_id -> (seed, caps, revoked). The sim's AGENTS.TXT.
+KEYRING = {
+    "devin": (DEVIN[1], ["file", "process", "window", "term"], False),
+    "viewer": (VIEWER[1], ["process"], False),
+    "bobby": (BOBBY[1], ["file"], True),
+}
 
-    def __init__(self, w, key=KEY, allow_exec=True, seat=True,
-                 mute=False, challenge=bytes(range(32))):
+VERB_CAP = {
+    "proc.list": "process", "proc.get": "process",
+    "fs.read": "file", "fs.write": "file",
+    "ui.windows": "window", "ui.screenshot": "window",
+    "gosh.run": "term",
+}
+
+
+class SimDaemon:
+    """A minimal agentd for journey tests: v2 greeting, signature check
+    against the session keyring row, caps resolved onto the ready line,
+    then a D3/D4-faithful dispatch with stream chunks for the two
+    bounded-output verbs."""
+
+    def __init__(self, w, allow_exec=True, seat=True, mute=False,
+                 challenge=bytes(range(32)), keyring=None):
         self.w = w
-        self.key = key
         self.allow_exec = allow_exec
         self.seat = seat
         self.challenge = challenge
-        self.authed = False
+        self.keyring = KEYRING if keyring is None else keyring
+        self.row = None
+        self.caps = []
         self.hello_written = False
         w.push({
-            "proto": "virelai-agent/1",
-            "auth": "hmac-sha256",
+            "proto": "virelai-agent/2",
+            "auth": "ed25519",
             "challenge": challenge.hex(),
         })
         if mute:
-            # The real daemon waits 10 s; the sim answers at once and the
-            # journey still reads exactly the line the gate expects.
             w.push({"id": None, "ok": False,
                     "error": {"code": "auth_timeout", "message": "m"}})
             w.close()
         else:
             w.on_send = self.on_send
 
-    def err(self, rid, code):
+    def err(self, rid, code, msg=None):
         self.w.push({"id": rid, "ok": False,
-                     "error": {"code": code, "message": "m"}})
+                     "error": {"code": code,
+                               "message": msg or (code + " detail")}})
 
     def ok(self, rid, result):
         self.w.push({"id": rid, "ok": True, "result": result})
+
+    def stream(self, rid, payload):
+        for i in range(0, len(payload), 4608):
+            self.w.push({"id": rid, "ok": True, "stream": i // 4608,
+                         "data_b64": agentctl.b64e(payload[i:i + 4608])})
 
     def on_send(self, line):
         if len(line) + 1 > agentctl.MAX_LINE:
@@ -124,25 +153,40 @@ class SimDaemon:
         if code:
             self.err(None, code)
             return
-        if not self.authed:
+        if self.row is None:
             if "verb" in obj:
                 self.err(None, "auth_required")
                 self.w.close()
                 return
-            if set(obj) != {"auth"} or not isinstance(obj["auth"], str):
+            if set(obj) != {"agent", "auth"} or not all(
+                    isinstance(obj[k], str) for k in ("agent", "auth")):
                 self.err(None, "auth_failed")
                 self.w.close()
                 return
-            if obj["auth"] != pinned_mac(self.challenge):
+            ent = self.keyring.get(obj["agent"])
+            if ent is None:
+                self.err(None, "agent_unknown")
+                self.w.close()
+                return
+            if ent[2]:
+                self.err(None, "agent_revoked")
+                self.w.close()
+                return
+            want = agentctl.ed_sign(
+                agentctl.DOMAIN + self.challenge + b"\x00"
+                + obj["agent"].encode("utf-8"), ent[0])
+            if obj["auth"] != want.hex():
                 self.err(None, "auth_failed")
                 self.w.close()
                 return
-            self.authed = True
-            verbs = ["proc.list", "proc.get", "fs.read", "fs.write",
-                     "ui.windows"]
-            if self.allow_exec:
-                verbs.append("gosh.run")
-            self.w.push({"ok": True, "session": "ready", "verbs": verbs})
+            self.row = obj["agent"]
+            self.caps = ent[1]
+            verbs = [v for v, c in VERB_CAP.items() if c in self.caps]
+            if not self.allow_exec and "gosh.run" in verbs:
+                verbs.remove("gosh.run")
+            self.w.push({"ok": True, "session": "ready",
+                         "agent": self.row, "caps": self.caps,
+                         "verbs": verbs})
             return
         self.dispatch(obj)
 
@@ -156,14 +200,18 @@ class SimDaemon:
                 or not isinstance(verb, str)):
             self.err(rid if isinstance(rid, int) else None, "bad_request")
             return
-        if verb not in ("proc.list", "proc.get", "fs.read", "fs.write",
-                        "ui.windows", "gosh.run"):
+        cap = VERB_CAP.get(verb)
+        if cap is None:
             self.err(rid, "unknown_verb")
+            return
+        if cap not in self.caps:
+            self.err(rid, "cap_required", "cap missing: " + cap)
             return
         extra = [k for k in obj if k not in ("id", "verb")]
         allowed = {"proc.list": (), "proc.get": ("pid",),
                    "fs.read": ("path",), "fs.write": ("path", "data_b64"),
-                   "ui.windows": (), "gosh.run": ("cmd", "timeout_ms")}[verb]
+                   "ui.windows": (), "ui.screenshot": (),
+                   "gosh.run": ("cmd", "timeout_ms")}[verb]
         if any(k not in allowed for k in extra):
             self.err(rid, "bad_request")
             return
@@ -186,15 +234,22 @@ class SimDaemon:
         if not isinstance(path, str):
             self.err(rid, "bad_request")
             return
-        if not valid_name(path):
+        if not valid_path(path):
             self.err(rid, "path_rejected")
             return
         if path == "SEED.TXT":
             self.ok(rid, {"path": path, "size": len(agentctl.SEED_BYTES),
                           "data_b64": agentctl.b64e(agentctl.SEED_BYTES)})
+        elif path == "SUB/DEEP.TXT":
+            self.ok(rid, {"path": path, "size": len(agentctl.DEEP_BYTES),
+                          "data_b64": agentctl.b64e(agentctl.DEEP_BYTES)})
         elif path == "HELLO.TXT" and self.hello_written:
             self.ok(rid, {"path": path, "size": len(agentctl.PAYLOAD),
                           "data_b64": agentctl.b64e(agentctl.PAYLOAD)})
+        elif path == "SUB/NEW.TXT" and self.new_written:
+            self.ok(rid, {"path": path,
+                          "size": len(agentctl.NESTED_PAYLOAD),
+                          "data_b64": agentctl.b64e(agentctl.NESTED_PAYLOAD)})
         elif path == "BIG.BIN":
             self.err(rid, "too_large")
         else:
@@ -205,7 +260,7 @@ class SimDaemon:
         if not isinstance(path, str) or not isinstance(body, str):
             self.err(rid, "bad_request")
             return
-        if not valid_name(path):
+        if not valid_path(path):
             self.err(rid, "path_rejected")
             return
         try:
@@ -218,6 +273,8 @@ class SimDaemon:
             return
         if path == "HELLO.TXT":
             self.hello_written = True
+        if path == "SUB/NEW.TXT":
+            self.new_written = True
         self.ok(rid, {"path": path, "size": len(data)})
 
     def v_ui_windows(self, rid, obj):
@@ -227,6 +284,14 @@ class SimDaemon:
         self.ok(rid, {"seat": "gotabwm", "focused": 0, "windows": [
             {"index": 0, "id": 3, "title": "Calc", "focused": True,
              "pinned": False, "frozen": False}]})
+
+    def v_ui_screenshot(self, rid, obj):
+        if not self.seat:
+            self.err(rid, "seat_absent")
+            return
+        self.stream(rid, bytes((i % 251 + 1) for i in range(160 * 90 * 2)))
+        self.ok(rid, {"w": 160, "h": 90, "format": "rgb565le",
+                      "bytes": 160 * 90 * 2})
 
     def v_gosh_run(self, rid, obj):
         if not self.allow_exec:
@@ -252,21 +317,26 @@ class SimDaemon:
         if cmd == "sleep 5":
             self.err(rid, "timed_out")
             return
-        out, status = b"", 0
+        out, status, truncated = b"", 0, False
+        path = "/host/AGENT/WIDE.TXT"
         if cmd == "echo hello":
             out = b"hello\n"
         elif cmd == "echo " + agentctl.STDOUT_SENTINEL.decode():
             out = agentctl.STDOUT_SENTINEL + b"\n"
+        elif cmd == "cat %s %s %s" % (path, path, path):
+            out = agentctl.wide_bytes() * 3
+        elif cmd == "cat %s %s %s %s %s" % ((path,) * 5):
+            out = agentctl.wide_bytes() * 4  # capture stops at the bound
+            truncated = True
         elif cmd in ("cat NOPE.TXT", "cat /host/SECRETS.TXT"):
             status = 1
+        self.stream(rid, out)
         self.ok(rid, {"exit_status": status,
-                      "stdout_b64": agentctl.b64e(out), "truncated": False})
+                      "stdout_bytes": len(out), "truncated": truncated})
 
 
 def parse_flat(line):
-    """The daemon's flat-grammar read: (code, fields). Duplicate keys and
-    nested/array/null values are preserved here that json.loads alone would
-    lose, so the sim refuses the same lines the daemon does."""
+    """The daemon's flat-grammar read: (code, fields)."""
     try:
         v = json.loads(line, object_pairs_hook=lambda p: ("__obj__", p))
     except ValueError:
@@ -282,7 +352,7 @@ def parse_flat(line):
     fields = {}
     for k, val in pairs:
         if isinstance(val, tuple) or isinstance(val, list) or val is None:
-            return "bad_request", None  # nested object, array or null
+            return "bad_request", None
         if isinstance(val, float):
             return "bad_request", None
         if isinstance(val, int) and not isinstance(val, bool) and (
@@ -292,22 +362,23 @@ def parse_flat(line):
     return "", fields
 
 
-def connect_sim(key=KEY, allow_exec=True, seat=True, mute=False):
+def connect_sim(allow_exec=True, seat=True, mute=False):
     w = FakeWire()
-    SimDaemon(w, key, allow_exec, seat, mute)
+    SimDaemon(w, allow_exec, seat, mute)
     return agentctl.Session(w, w), w
 
 
-class TestPinnedVector(unittest.TestCase):
-    def test_pinned(self):
-        self.assertEqual(
-            pinned_mac(bytes(range(32))),
-            "e907b2015a16de6504cc2bc61da0d60156c3abe2b035601372840acb58feff04",
-        )
-        # The daemon's wire view: the same digest as one 64-hex member.
-        ch = bytes(range(32))
-        line = ('{"auth":"%s"}' % pinned_mac(ch)).encode()
-        self.assertEqual(len(json.loads(line)["auth"]), 64)
+class TestPinnedVectors(unittest.TestCase):
+    def test_ed25519_rfc(self):
+        agentctl.ed_selftest()
+
+    def test_sign_message_shape(self):
+        w = FakeWire()
+        s = agentctl.Session(w, w)
+        s.challenge = bytes(range(32))
+        msg = s.sign_message("devin")
+        want = agentctl.DOMAIN + bytes(range(32)) + b"\x00" + b"devin"
+        self.assertEqual(msg, want)
 
 
 class TestFraming(unittest.TestCase):
@@ -335,7 +406,7 @@ class TestFraming(unittest.TestCase):
 
     def test_line_bound(self):
         w = FakeWire()
-        w.inq += b"x" * (agentctl.MAX_LINE + 1)  # no LF ever arrives
+        w.inq += b"x" * (agentctl.MAX_LINE + 1)
         s = agentctl.Session(w, w)
         with self.assertRaises(agentctl.ProtoError):
             s.readline()
@@ -357,10 +428,6 @@ class TestFraming(unittest.TestCase):
             s.read_json()
 
     def test_buffered_pipe_reads_without_eof(self):
-        # A BufferedReader's read(n) would hold session bytes until the
-        # writer closed the pipe (observed class-B: the greeting only
-        # reached the client at teardown). read1 must return partial
-        # lines while the writer stays open.
         rfd, wfd = os.pipe()
         try:
             rd = os.fdopen(rfd, "rb")
@@ -384,19 +451,30 @@ class TestFraming(unittest.TestCase):
 class TestHandshake(unittest.TestCase):
     def test_connect_and_call(self):
         s, w = connect_sim()
-        verbs = s.connect(KEY)
+        verbs = s.connect(*DEVIN)
         self.assertIn("gosh.run", verbs)
         res = s.call("proc.list")
         self.assertEqual(res["procs"][0]["name"], "AGENTD.ELF")
-        self.assertEqual(w.lines[-1],
-                         b'{"id":1,"verb":"proc.list"}')
+        self.assertEqual(w.lines[-1], b'{"id":1,"verb":"proc.list"}')
 
     def test_wrong_key_is_auth_failed(self):
         s, w = connect_sim()
         s.greeting()
         with self.assertRaises(agentctl.Refused) as cm:
-            s.auth(b"wrong")
+            s.auth("devin", b"\x00" * 32)
         self.assertEqual(cm.exception.code, "auth_failed")
+
+    def test_revoked_and_unknown(self):
+        s, w = connect_sim()
+        s.greeting()
+        with self.assertRaises(agentctl.Refused) as cm:
+            s.auth(*BOBBY)
+        self.assertEqual(cm.exception.code, "agent_revoked")
+        s, w = connect_sim()
+        s.greeting()
+        with self.assertRaises(agentctl.Refused) as cm:
+            s.auth("mallory", DEVIN[1])
+        self.assertEqual(cm.exception.code, "agent_unknown")
 
     def test_bad_greeting_shape(self):
         w = FakeWire()
@@ -409,7 +487,7 @@ class TestHandshake(unittest.TestCase):
         w = FakeWire()
         SimDaemon(w)
         s = agentctl.Session(w, w)
-        s.connect(KEY)
+        s.connect(*DEVIN)
         w.on_send = lambda line: w.push(
             {"id": 999, "ok": True, "result": {}})
         with self.assertRaises(agentctl.ProtoError):
@@ -417,9 +495,9 @@ class TestHandshake(unittest.TestCase):
 
 
 class TestJourneys(unittest.TestCase):
-    def run_journey(self, name, key=KEY, **simkw):
+    def run_journey(self, name, cred=DEVIN, **simkw):
         s, w = connect_sim(**simkw)
-        steps = agentctl.JOURNEYS[name](s, key)
+        steps = agentctl.JOURNEYS[name](s, cred)
         fails = []
         for step_name, fn in steps:
             try:
@@ -430,11 +508,12 @@ class TestJourneys(unittest.TestCase):
 
     def test_journey_names(self):
         self.assertEqual(sorted(agentctl.JOURNEYS),
-                         ["badmac", "full", "mute", "noexec", "preauth"])
+                         ["badsig", "capsneg", "full", "mute", "noexec",
+                          "preauth", "revoked", "unknown"])
         self.assertTrue(agentctl.VANISH.issubset(agentctl.JOURNEYS))
         for name in agentctl.JOURNEYS:
             s, _ = connect_sim()
-            steps = agentctl.JOURNEYS[name](s, KEY)
+            steps = agentctl.JOURNEYS[name](s, DEVIN)
             self.assertTrue(steps, name)
             for step_name, fn in steps:
                 self.assertTrue(step_name)
@@ -448,8 +527,20 @@ class TestJourneys(unittest.TestCase):
         fails = self.run_journey("noexec", allow_exec=False, seat=False)
         self.assertEqual(fails, [])
 
-    def test_badmac(self):
-        fails = self.run_journey("badmac")
+    def test_capsneg(self):
+        fails = self.run_journey("capsneg", cred=VIEWER)
+        self.assertEqual(fails, [])
+
+    def test_badsig(self):
+        fails = self.run_journey("badsig")
+        self.assertEqual(fails, [])
+
+    def test_revoked(self):
+        fails = self.run_journey("revoked", cred=BOBBY)
+        self.assertEqual(fails, [])
+
+    def test_unknown(self):
+        fails = self.run_journey("unknown")
         self.assertEqual(fails, [])
 
     def test_preauth(self):
@@ -462,12 +553,9 @@ class TestJourneys(unittest.TestCase):
 
     def test_full_fails_when_calc_missing(self):
         s, w = connect_sim()
-        sim_verbs = s.connect(KEY)
+        sim_verbs = s.connect(*DEVIN)
         self.assertIn("gosh.run", sim_verbs)
-        # A seat that reports no Calc row must fail the ui.windows step —
-        # after the retry window (patched small) the staged GOCALC never
-        # shows up.
-        steps = dict(agentctl.JOURNEYS["full"](s, KEY))
+        steps = dict(agentctl.JOURNEYS["full"](s, DEVIN))
         w.on_send = lambda line: w.push(
             {"id": json.loads(line)["id"], "ok": True,
              "result": {"seat": "gotabwm", "focused": None, "windows": []}})
@@ -482,25 +570,37 @@ class TestJourneys(unittest.TestCase):
 
 class TestHarnessCLI(unittest.TestCase):
     def test_journey_choices(self):
-        for name in agentctl.JOURNEYS:
-            args = agentctl.main.__wrapped__ if False else None  # parse only
-        p = []
-        # argparse exits 2 on a bad choice.
-        import argparse as ap
         try:
             agentctl.main(["harness", "--journey", "bogus", "--key-file", "k"])
+            self.fail("bad journey accepted")
         except SystemExit as e:
-            p.append(e.code)
-        self.assertEqual(p, [2])
+            self.assertEqual(e.code, 2)
 
     def test_keyfile_required(self):
-        import io, contextlib
+        import io
+        import contextlib
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
                 agentctl.main(["harness", "--journey", "full"])
         except SystemExit as e:
             self.assertEqual(e.code, 2)
+        self.assertIn("--key-file", err.getvalue())
+
+    def test_read_cred(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("devin " + "0a" * 32 + "\n")
+            path = f.name
+        try:
+            agent, seed = agentctl.read_cred(path)
+            self.assertEqual(agent, "devin")
+            self.assertEqual(seed, DEVIN[1])
+        finally:
+            os.unlink(path)
+
+    def test_selftest_flag(self):
+        self.assertEqual(agentctl.main(["--selftest"]), 0)
 
 
 if __name__ == "__main__":

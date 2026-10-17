@@ -43,6 +43,7 @@ func seamScope(t *testing.T) {
 		func() { winOpenFn = winSave },
 		func() { winHideFn = winHideSave },
 		func() { wmWindowsFn = wmSave },
+		func() { scanoutFn = scanoutSave },
 		func() { agentWindow = -1 },
 		func() { secretGetFn = secretSave },
 		func() { principalFn = principalSave },
@@ -73,6 +74,7 @@ var (
 	winSave       = winOpenFn
 	winHideSave   = winHideFn
 	wmSave        = wmWindowsFn
+	scanoutSave   = scanoutFn
 	secretSave    = secretGetFn
 	principalSave = principalFn
 	randomSave    = randomFn
@@ -85,24 +87,26 @@ var (
 // fakeKernel is a scriptable kernel for the verb tests: a proc table, a
 // map of file contents, dir entries, and spawn/wait outcomes.
 type fakeKernel struct {
-	procs    []vi.ProcRow
-	files    map[string][]byte
-	dirs     map[string][]vi.DirEntry
-	fileErr  map[string]int64
-	writeErr int64
-	spawnErr error
-	spawnPID int64
-	waitErr  error
-	waitSt   int64
-	seatPid  int64
-	winID    int
-	winErr   int64
-	winW     uint32
-	winH     uint32
-	hidden   bool
-	wmRows   []vi.WmWindowRow
-	wmErr    error
-	outBody  []byte // what the spawned GOSH "wrote" to AGENTD.OUT
+	procs     []vi.ProcRow
+	files     map[string][]byte
+	dirs      map[string][]vi.DirEntry
+	fileErr   map[string]int64
+	writeErr  int64
+	spawnErr  error
+	spawnPID  int64
+	waitErr   error
+	waitSt    int64
+	seatPid   int64
+	winID     int
+	winErr    int64
+	winW      uint32
+	winH      uint32
+	hidden    bool
+	wmRows    []vi.WmWindowRow
+	wmErr     error
+	scanout   func(x, y, w, h uint32, buf []byte) int64
+	scanoutRc int64
+	outBody   []byte // what the spawned GOSH "wrote" to AGENTD.OUT
 	// captured
 	wrotePath string
 	wroteBody []byte
@@ -209,6 +213,15 @@ func (k *fakeKernel) install() {
 		}
 		return k.wmRows, k.wmErr
 	}
+	scanoutFn = func(x, y, w, h uint32, buf []byte) int64 {
+		if k.scanout != nil {
+			return k.scanout(x, y, w, h, buf)
+		}
+		if k.scanoutRc != 0 {
+			return k.scanoutRc
+		}
+		return int64(len(buf))
+	}
 }
 
 func dirEnt(name string, isDir bool) vi.DirEntry {
@@ -225,6 +238,29 @@ func proc(pid uint64, state uint64, st uint64, name string) vi.ProcRow {
 	copy(r.NameBuf[:], name)
 	return r
 }
+
+// capsOf builds a session cap set from words.
+func capsOf(words ...string) map[string]bool {
+	m := map[string]bool{}
+	for _, w := range words {
+		m[w] = true
+	}
+	return m
+}
+
+// testSess is the dispatch-level fixture session: caps as given, allowExec
+// as asked, chunks emitted captured into chunks when non-nil.
+func testSess(allowExec bool, chunks *[][]byte, caps ...string) *sessionCtx {
+	s := &sessionCtx{caps: capsOf(caps...), allowExec: allowExec}
+	if chunks != nil {
+		s.emit = func(b []byte) {
+			*chunks = append(*chunks, append([]byte(nil), b...))
+		}
+	}
+	return s
+}
+
+var allCaps = []string{"file", "process", "window", "term"}
 
 // --- NAME validator -------------------------------------------------------------
 
@@ -316,10 +352,13 @@ func TestFSReadGreenAndRed(t *testing.T) {
 	if _, code = verbFSRead(mustReq(t, `{"id":1,"verb":"fs.read","path":"SUB"}`)); code != "not_a_file" {
 		t.Fatalf("dir read code = %q", code)
 	}
-	// Every path_rejected shape in the gate matrix.
+	// Every path_rejected shape in the gate matrix — traversal,
+	// separators outside the depth grammar, the reserved audit lane,
+	// bad bytes, over-bound length and depth.
 	for _, p := range []string{
-		"../SECRETS.TXT", "/host/SECRETS.TXT", "SUB/X", ".", "..", "",
-		strings.Repeat("x", 32), "X~", "A\x00B",
+		"../SECRETS.TXT", "/host/SECRETS.TXT", "SUB/../X", ".", "..", "",
+		strings.Repeat("x", 49), "X~", "A\x00B", "AUDIT/R1", "audit/x",
+		"SUB//X", "SUB/", "/SUB", "A/B/C/D/E", "X" + strings.Repeat("y", 31),
 	} {
 		line := `{"id":1,"verb":"fs.read","path":` + quoteJSON(p) + `}`
 		v, _ := parseLine([]byte(line))
@@ -330,6 +369,17 @@ func TestFSReadGreenAndRed(t *testing.T) {
 		if _, code = verbFSRead(req); code != "path_rejected" {
 			t.Fatalf("path %q code = %q want path_rejected", p, code)
 		}
+	}
+	// A legal depth-2 name that does not exist is not_found, and one that
+	// does resolves through its parent directory.
+	k.files["/host/AGENT/SUB/DEEP.TXT"] = []byte("deep")
+	k.dirs["/host/AGENT/SUB"] = []vi.DirEntry{dirEnt("DEEP.TXT", false)}
+	if _, code = verbFSRead(mustReq(t, `{"id":1,"verb":"fs.read","path":"SUB/NOPE.TXT"}`)); code != "not_found" {
+		t.Fatalf("nested ENOENT code = %q", code)
+	}
+	res, code = verbFSRead(mustReq(t, `{"id":1,"verb":"fs.read","path":"SUB/DEEP.TXT"}`))
+	if code != "" || res != `{"path":"SUB/DEEP.TXT","size":4,"data_b64":"ZGVlcA=="}` {
+		t.Fatalf("nested read = %q code %q", res, code)
 	}
 	// Case-insensitive NAME match: seed.txt resolves to SEED.TXT's row —
 	// the kernel does the folding; the validator just accepts the name.
@@ -465,7 +515,7 @@ func TestGoshRunValidation(t *testing.T) {
 
 	// Disabled daemon: verb_disabled before anything runs.
 	if _, code := verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), false); code != "verb_disabled" {
+		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), testSess(false, nil, "term")); code != "verb_disabled" {
 		t.Fatalf("noexec code = %q", code)
 	}
 	if len(k.execArgv) != 0 {
@@ -485,7 +535,7 @@ func TestGoshRunValidation(t *testing.T) {
 		{`{"id":1,"verb":"gosh.run","cmd":"echo hi","timeout_ms":30001}`, "bad_request"},
 		{`{"id":1,"verb":"gosh.run","cmd":"echo hi","timeout_ms":"5"}`, "bad_request"},
 	} {
-		if _, code := dispatch(mustReq(t, tc.line), true); code != tc.code {
+		if _, code := dispatch(mustReq(t, tc.line), testSess(true, nil, allCaps...)); code != tc.code {
 			t.Fatalf("%s: code = %q want %q", tc.line, code, tc.code)
 		}
 		if len(k.execArgv) != 0 {
@@ -505,14 +555,18 @@ func TestGoshRunLifecycle(t *testing.T) {
 	}
 	k.install()
 
+	var chunks [][]byte
 	res, code := verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"echo hello"}`), true)
+		`{"id":1,"verb":"gosh.run","cmd":"echo hello"}`), testSess(true, &chunks, "term"))
 	if code != "" {
 		t.Fatal(code)
 	}
-	want := `{"exit_status":0,"stdout_b64":"aGVsbG8K","truncated":false}`
+	want := `{"exit_status":0,"stdout_bytes":6,"truncated":false}`
 	if res != want {
 		t.Fatalf("gosh.run = %q want %q", res, want)
+	}
+	if len(chunks) != 1 || string(chunks[0]) != "hello\n" {
+		t.Fatalf("stream chunks = %v", chunks)
 	}
 	if len(k.execArgv) != 3 || k.execArgv[0] != "GOSH.ELF" ||
 		k.execArgv[1] != "-c" || k.execArgv[2] != "echo hello > /host/AGENTD.OUT" {
@@ -535,7 +589,7 @@ func TestGoshRunLifecycle(t *testing.T) {
 	k.spawnErr = errors.New("ENOENT")
 	k.execArgv = nil
 	if _, code = verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), true); code != "spawn_failed" {
+		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), testSess(true, nil, "term")); code != "spawn_failed" {
 		t.Fatalf("spawn error code = %q", code)
 	}
 	k.spawnErr = nil
@@ -545,7 +599,7 @@ func TestGoshRunLifecycle(t *testing.T) {
 	logs = nil
 	k.waitErr = vi.ErrWaitGone
 	if _, code = verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"sleep 5","timeout_ms":1000}`), true); code != "timed_out" {
+		`{"id":1,"verb":"gosh.run","cmd":"sleep 5","timeout_ms":1000}`), testSess(true, nil, "term")); code != "timed_out" {
 		t.Fatalf("timeout code = %q", code)
 	}
 	if k.killed != 42 {
@@ -556,20 +610,35 @@ func TestGoshRunLifecycle(t *testing.T) {
 	}
 	k.waitErr = nil
 
-	// Truncated output: 4097 bytes in the capture → truncated flag, 4096
-	// bytes of payload.
-	k.outBody = make([]byte, 4097)
+	// Truncated output: outMax+1 bytes in the capture → truncated flag and
+	// exactly outMax bytes streamed, in order, in bounded chunks.
+	k.outBody = make([]byte, outMax+1)
+	for i := range k.outBody {
+		k.outBody[i] = byte(i % 251)
+	}
+	chunks = nil
 	res, code = verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), true)
-	if code != "" || !strings.Contains(res, `"truncated":true`) {
+		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), testSess(true, &chunks, "term"))
+	if code != "" || !strings.Contains(res, `"truncated":true`) ||
+		!strings.Contains(res, `"stdout_bytes":16384`) {
 		t.Fatalf("truncated = %q code %q", res, code)
+	}
+	var merged []byte
+	for i, c := range chunks {
+		if i < len(chunks)-1 && len(c) != streamChunk {
+			t.Fatalf("chunk %d = %d bytes, want %d", i, len(c), streamChunk)
+		}
+		merged = append(merged, c...)
+	}
+	if len(merged) != outMax || merged[100] != k.outBody[100] || merged[outMax-1] != k.outBody[outMax-1] {
+		t.Fatalf("streamed %d bytes, content drifted", len(merged))
 	}
 
 	// A nonzero child status is still ok:true — the command ran.
 	k.outBody = nil
 	k.waitSt = 3
 	res, code = verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"cat NOPE.TXT"}`), true)
+		`{"id":1,"verb":"gosh.run","cmd":"cat NOPE.TXT"}`), testSess(true, nil, "term"))
 	if code != "" || !strings.Contains(res, `"exit_status":3`) {
 		t.Fatalf("nonzero status = %q code %q", res, code)
 	}
@@ -596,7 +665,7 @@ func TestGoshRunENOSPCRetry(t *testing.T) {
 		return 42, nil
 	}
 	if _, code := verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), true); code != "" {
+		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), testSess(true, nil, "term")); code != "" {
 		t.Fatalf("transient ENOSPC code = %q", code)
 	}
 	if calls != 3 {
@@ -610,7 +679,7 @@ func TestGoshRunENOSPCRetry(t *testing.T) {
 		return 0, errors.New("ENOSPC")
 	}
 	if _, code := verbGoshRun(mustReq(t,
-		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), true); code != "spawn_failed" {
+		`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`), testSess(true, nil, "term")); code != "spawn_failed" {
 		t.Fatalf("persistent ENOSPC code = %q", code)
 	}
 	if yields == 0 {
@@ -660,11 +729,164 @@ func TestD4Coverage(t *testing.T) {
 		if vc != "" {
 			code = vc
 		} else {
-			res, code = dispatch(req, tc.exec)
+			res, code = dispatch(req, testSess(tc.exec, nil, allCaps...))
 		}
 		_ = res
 		if code != tc.code {
 			t.Fatalf("%s: code = %q want %q", tc.name, code, tc.code)
 		}
+	}
+}
+
+// --- path depth ------------------------------------------------------------
+
+func TestValidPathTable(t *testing.T) {
+	accept := []string{
+		"SEED.TXT", "seed.txt", "SUB/DEEP.TXT", "A/B/C/D.TXT",
+		"12345678901/12345678901/12345678901/1234567890",
+	}
+	for _, s := range accept {
+		if !validPath(s) {
+			t.Fatalf("validPath(%q) = false", s)
+		}
+	}
+	refuse := []string{
+		"", "A/B/C/D/E", strings.Repeat("x", 49), "AUDIT/X", "audit/f.txt",
+		"SUB//X", "SUB/", "/SUB", "SUB/../X", "SUB/.", "SUB/..",
+		"SUB/" + strings.Repeat("y", 32),
+	}
+	for _, s := range refuse {
+		if validPath(s) {
+			t.Fatalf("validPath(%q) = true", s)
+		}
+	}
+	if p, l := parentOf("A/B/C.TXT"); p != "A/B" || l != "C.TXT" {
+		t.Fatalf("parentOf = %q %q", p, l)
+	}
+	if p, l := parentOf("F.TXT"); p != "" || l != "F.TXT" {
+		t.Fatalf("parentOf flat = %q %q", p, l)
+	}
+}
+
+// --- the cap gate -------------------------------------------------------------
+
+// Every verb is behind its declared cap (ADR 0052 D3): a missing cap is
+// cap_required:<cap> before any argument check or syscall, and granting
+// the cap lets the request through to its own validation.
+func TestCapGate(t *testing.T) {
+	seamScope(t)
+	k := &fakeKernel{
+		procs:   []vi.ProcRow{proc(9, vi.ProcRunning, 0, "AGENTD.ELF")},
+		files:   map[string][]byte{"/host/AGENT/F.TXT": []byte("x")},
+		dirs:    map[string][]vi.DirEntry{sandboxDir: {dirEnt("F.TXT", false)}},
+		seatPid: 3,
+	}
+	k.install()
+	for _, tc := range []struct {
+		line string
+		cap  string
+	}{
+		{`{"id":1,"verb":"proc.list"}`, "process"},
+		{`{"id":1,"verb":"proc.get","pid":9}`, "process"},
+		{`{"id":1,"verb":"fs.read","path":"F.TXT"}`, "file"},
+		{`{"id":1,"verb":"fs.write","path":"F.TXT","data_b64":"eA=="}`, "file"},
+		{`{"id":1,"verb":"ui.windows"}`, "window"},
+		{`{"id":1,"verb":"ui.screenshot"}`, "window"},
+		{`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`, "term"},
+	} {
+		// Missing cap refuses by name — even with well-formed args.
+		sess := testSess(true, nil) // no caps at all
+		_, code := dispatch(mustReq(t, tc.line), sess)
+		if code != "cap_required:"+tc.cap {
+			t.Fatalf("%s missing cap = %q want cap_required:%s", tc.line, code, tc.cap)
+		}
+		// Every OTHER cap held still refuses — the gate is the declared
+		// cap, not any cap.
+		var others []string
+		for _, c := range allCaps {
+			if c != tc.cap {
+				others = append(others, c)
+			}
+		}
+		_, code = dispatch(mustReq(t, tc.line), testSess(true, nil, others...))
+		if code != "cap_required:"+tc.cap {
+			t.Fatalf("%s other caps = %q want cap_required:%s", tc.line, code, tc.cap)
+		}
+		// Held cap: the request reaches its own path (not cap_required).
+		_, code = dispatch(mustReq(t, tc.line), testSess(true, nil, allCaps...))
+		if code == "cap_required:"+tc.cap {
+			t.Fatalf("%s held cap still refused", tc.line)
+		}
+	}
+	// An unknown verb is unknown_verb regardless of caps — the cap table
+	// only names verbs that exist.
+	_, code := dispatch(mustReq(t, `{"id":1,"verb":"nope"}`), testSess(true, nil))
+	if code != "unknown_verb" {
+		t.Fatalf("unknown verb with no caps = %q", code)
+	}
+}
+
+// --- ui.screenshot -----------------------------------------------------------
+
+func TestUIScreenshot(t *testing.T) {
+	seamScope(t)
+	k := &fakeKernel{seatPid: 0}
+	k.install()
+	sess := testSess(true, nil, "window")
+
+	// No seat is the card's named refusal, before any scanout call.
+	if _, code := verbUIScreenshot(sess); code != "seat_absent" {
+		t.Fatalf("no-seat code = %q", code)
+	}
+	k.seatPid = 3
+	// An unarmed framebuffer is the same verdict (nothing to see).
+	k.scanoutRc = -vi.ErrENXIO
+	if _, code := verbUIScreenshot(sess); code != "seat_absent" {
+		t.Fatalf("ENXIO code = %q", code)
+	}
+	k.scanoutRc = -vi.ErrENOSYS
+	if _, code := verbUIScreenshot(sess); code != "seat_unsupported" {
+		t.Fatalf("ENOSYS code = %q", code)
+	}
+	k.scanoutRc = -vi.ErrENOMEM
+	if _, code := verbUIScreenshot(sess); code != "io_error:ENOMEM" {
+		t.Fatalf("ENOMEM code = %q", code)
+	}
+	// A live seat: paint pixel (sx,sy) = (B,G,R) by source coords and
+	// check the RGB565 conversion plus the chunk shape.
+	k.scanout = func(x, y, w, h uint32, buf []byte) int64 {
+		if x != 0 || w != uint32(vi.ScanoutWidth) || h != 1 {
+			t.Fatalf("band = x%d y%d w%d h%d", x, y, w, h)
+		}
+		for px := uint32(0); px < w; px++ {
+			buf[px*4] = byte(y % 256)    // B <- source row
+			buf[px*4+1] = byte(px % 256) // G <- source col
+			buf[px*4+2] = 0xf8           // R saturated -> r5 = 31
+			buf[px*4+3] = 0
+		}
+		return int64(len(buf))
+	}
+	var chunks [][]byte
+	sess.emit = func(b []byte) { chunks = append(chunks, append([]byte(nil), b...)) }
+	res, code := verbUIScreenshot(sess)
+	want := `{"w":160,"h":90,"format":"rgb565le","bytes":28800}`
+	if code != "" || res != want {
+		t.Fatalf("ui.screenshot = %q code %q", res, code)
+	}
+	var merged []byte
+	for _, c := range chunks {
+		if len(c) > streamChunk {
+			t.Fatalf("chunk %d bytes over bound", len(c))
+		}
+		merged = append(merged, c...)
+	}
+	if len(merged) != thumbW*thumbH*2 {
+		t.Fatalf("streamed %d bytes want %d", len(merged), thumbW*thumbH*2)
+	}
+	// Output pixel (tx=1, ty=0) samples source (8, 0): B=0, G=8, R=0xf8.
+	got := uint16(merged[2]) | uint16(merged[3])<<8
+	want16 := uint16(0xf8>>3)<<11 | uint16(8>>2)<<5 | uint16(0>>3)
+	if got != want16 {
+		t.Fatalf("pixel (1,0) = %04x want %04x", got, want16)
 	}
 }

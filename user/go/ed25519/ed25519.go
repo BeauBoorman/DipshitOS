@@ -1,11 +1,15 @@
-// Ed25519 (RFC 8032) for the SSH host key and publickey userauth.
+// Ed25519 (RFC 8032): signing and verification shared by the SSH stack and
+// AGENTD's v2 agent handshake (ADR 0052 D2).
 //
 // GOOS=virelai cannot import crypto/ed25519 (the stdlib crypto tree pulls
 // syscall/os) and cannot import math/big (it pulls the host syscall graph).
 // Field arithmetic reuses the Curve25519 fe51 limbs in x25519.go. Pinned to
 // RFC 8032 §7.1 TEST 1–3.
-
-package sshlib
+//
+// This package is the leaf ADR 0052 extracts from sshlib (M109b): the
+// signature scheme plus the field arithmetic it stands on, without the SSH
+// wire/stack an ELF-bounded daemon cannot afford.
+package ed25519
 
 import "math/bits"
 
@@ -29,7 +33,7 @@ func init() {
 }
 
 func feFromLEHex(s string) fe51 {
-	b, ok := ParseHex(s)
+	b, ok := parseHex(s)
 	if !ok || len(b) != 32 {
 		panic("ed25519: bad field constant")
 	}
@@ -358,10 +362,10 @@ func EdSign(msg []byte, seed [32]byte) [64]byte {
 	var sig [64]byte
 	copy(sig[:32], rEnc[:])
 	copy(sig[32:], sBytes[:])
-	Wipe(h[:])
-	Wipe(a[:])
-	Wipe(rBytes[:])
-	Wipe(kBytes[:])
+	wipe(h[:])
+	wipe(a[:])
+	wipe(rBytes[:])
+	wipe(kBytes[:])
 	return sig
 }
 

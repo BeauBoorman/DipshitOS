@@ -28,6 +28,7 @@ var (
 	winOpenFn    = vi.WinOpen
 	winHideFn    = vi.WinSetVisible
 	wmWindowsFn  = vi.WmWindows
+	scanoutFn    = vi.ScanoutRead
 	secretGetFn  = shlib.StoreGet
 	principalFn  = vi.Principal
 	randomFn     = vi.Random
@@ -47,9 +48,12 @@ const (
 	// secretName is the app-bound HMAC key row (D2).
 	secretName = "agent-hmac"
 	// sandboxDir is the host-share root fs.* may reach (D3), and
-	// sandboxPrefix is how it spells at the file ABI.
+	// sandboxPrefix is how it spells at the file ABI. auditDir is the
+	// receipt lane staged beside it (ADR 0052 D1 posture check 5) —
+	// unreachable through fs.* (the AUDIT name is reserved, paths.go).
 	sandboxDir    = "/host/AGENT"
 	sandboxPrefix = "/host/AGENT/"
+	auditDir      = "/host/AGENT/AUDIT"
 	// outPath holds one gosh.run's captured stdout, outside the sandbox
 	// on purpose (D3).
 	outPath      = "/host/AGENTD.OUT"
@@ -59,9 +63,13 @@ const (
 
 // Bound constants from D3/D4.
 const (
-	readMax        = 4096 // fs.read / fs.write body ceiling
-	outMax         = 4096 // gosh.run captured-stdout ceiling
-	cmdMax         = 192  // gosh.run cmd byte ceiling
+	readMax = 4096  // fs.read / fs.write body ceiling
+	outMax  = 16384 // gosh.run captured-stdout ceiling (streamed)
+	// streamChunk bounds one streamed response line's payload: b64 is
+	// 4/3 plus the envelope, so 4608 raw bytes stay well inside the
+	// 8192-byte session line bound.
+	streamChunk    = 4608
+	cmdMax         = 192 // gosh.run cmd byte ceiling
 	timeoutMaxMs   = 30000
 	timeoutDefMs   = 10000
 	maxProcRows    = 64 // D3: at most 64 rows, kernel order
@@ -74,10 +82,69 @@ const (
 	spawnRetryNs = int64(2) * 1e9
 )
 
+// sessionCtx is what one authenticated connection resolved: the claimed
+// agent id, the caps its keyring row declared (ADR 0052 D3 — resolved
+// once at auth, never re-read mid-session), the daemon's --allow-exec
+// kill switch, and the stream writer bounded-output verbs emit chunk
+// lines through.
+type sessionCtx struct {
+	agentID   string
+	caps      map[string]bool
+	allowExec bool
+	emit      func(chunk []byte)
+}
+
+// verbCap is the fixed verb->cap table (ADR 0052 D3): proc verbs take
+// `process`, fs takes `file`, the ui pair takes `window`, and gosh.run
+// takes `term` (AND-ed with --allow-exec inside the verb — the daemon
+// flag is the operator's kill switch, the cap is the per-agent grant).
+var verbCap = map[string]string{
+	"proc.list":     "process",
+	"proc.get":      "process",
+	"fs.read":       "file",
+	"fs.write":      "file",
+	"ui.windows":    "window",
+	"ui.screenshot": "window",
+	"gosh.run":      "term",
+}
+
+// allVerbs is the D3 verb set in declaration order, for the ready line.
+var allVerbs = []string{
+	"proc.list", "proc.get", "fs.read", "fs.write",
+	"ui.windows", "ui.screenshot", "gosh.run",
+}
+
+// advertisedVerbs is the session's resolved grant set: a verb appears
+// iff its cap is on the row (D2), and gosh.run also only when the
+// daemon's exec flag is on.
+func advertisedVerbs(sess *sessionCtx) []string {
+	var out []string
+	for _, v := range allVerbs {
+		if !sess.caps[verbCap[v]] {
+			continue
+		}
+		if v == "gosh.run" && !sess.allowExec {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // dispatch validates a request's argument set against its verb and runs
-// it. It returns (resultJSON, "") on success or ("", code) on refusal;
+// it. The cap gate runs before any argument check: a missing cap is the
+// named refusal cap_required:<cap> — refuse before touching anything,
+// and nothing under the cap runs for an agent that was never granted it
+// (D3). It returns (resultJSON, "") on success or ("", code) on refusal;
 // the caller owns the response envelope and the req/refuse markers.
-func dispatch(req *request, allowExec bool) (string, string) {
+func dispatch(req *request, sess *sessionCtx) (string, string) {
+	cap, known := verbCap[req.verb]
+	if !known {
+		return "", "unknown_verb"
+	}
+	if !sess.caps[cap] {
+		return "", "cap_required:" + cap
+	}
 	switch req.verb {
 	case "proc.list":
 		if !req.hasArgs() {
@@ -104,11 +171,16 @@ func dispatch(req *request, allowExec bool) (string, string) {
 			return "", "bad_request"
 		}
 		return verbUIWindows()
+	case "ui.screenshot":
+		if !req.hasArgs() {
+			return "", "bad_request"
+		}
+		return verbUIScreenshot(sess)
 	case "gosh.run":
 		if !req.hasArgs("cmd", "timeout_ms") {
 			return "", "bad_request"
 		}
-		return verbGoshRun(req, allowExec)
+		return verbGoshRun(req, sess)
 	}
 	return "", "unknown_verb"
 }
@@ -142,16 +214,22 @@ func fileErr(r int64, name string) (string, string) {
 	return ioErr(r)
 }
 
-// isDir reports whether NAME exists in the sandbox as a directory. The
-// kernel matches names case-insensitively (ADR 0024 D4); so does this.
-func isDir(name string) bool {
+// isDir reports whether a sandbox path resolves to a directory: the
+// parent is listed and the last segment matched. The kernel matches
+// names case-insensitively (ADR 0024 D4); so does this.
+func isDir(path string) bool {
+	parent, last := parentOf(path)
+	dir := sandboxDir
+	if parent != "" {
+		dir = sandboxPrefix + parent
+	}
 	var ents [vi.MaxDirEntries]vi.DirEntry
-	n, r := dirListFn(sandboxDir, ents[:])
+	n, r := dirListFn(dir, ents[:])
 	if r < 0 {
 		return false
 	}
 	for i := 0; i < n; i++ {
-		if ents[i].Dir() && foldEq(ents[i].NameString(), name) {
+		if ents[i].Dir() && foldEq(ents[i].NameString(), last) {
 			return true
 		}
 	}
@@ -275,7 +353,7 @@ func verbFSRead(req *request) (string, string) {
 	if !present || !ok {
 		return "", "bad_request"
 	}
-	if !validName(path) {
+	if !validPath(path) {
 		return "", "path_rejected"
 	}
 	b, r := readFileFn(sandboxPrefix+path, readMax+1)
@@ -305,7 +383,7 @@ func verbFSWrite(req *request) (string, string) {
 	if !present || !ok {
 		return "", "bad_request"
 	}
-	if !validName(path) {
+	if !validPath(path) {
 		return "", "path_rejected"
 	}
 	data, ok := b64Decode(body)
@@ -406,10 +484,75 @@ func jbool(b bool) string {
 	return "false"
 }
 
+// --- ui.screenshot ---------------------------------------------------------
+
+// The screenshot is a bounded RGB565 thumbnail of the scanout, read
+// through slot 88 (vi.ScanoutRead — the kernel's bounded read-only copy
+// of the framebuffer; the writable bind stays seat-only). thumbW x
+// thumbH keeps the 1280x720 frame's exact 16:9 at an 8:1 stride, so one
+// sampled row band per output row suffices and the payload is fixed at
+// thumbW*thumbH*2 = 28,800 bytes before chunking.
+const (
+	thumbW = 160
+	thumbH = 90
+)
+
+// verbUIScreenshot answers ui.screenshot. The seat is the semantic
+// anchor: "screenshot" means the desktop the human sees, so a daemon
+// with no registered seat refuses seat_absent by name before touching
+// the scanout (the card's named-refusal bar). Pixels arrive as stream
+// chunks through sess.emit; the result carries only the shape.
+func verbUIScreenshot(sess *sessionCtx) (string, string) {
+	if seatPidFn() <= 0 {
+		return "", "seat_absent"
+	}
+	var row [vi.ScanoutWidth * vi.ScanoutBPP]byte
+	out := make([]byte, 0, thumbW*thumbH*2)
+	stride := vi.ScanoutWidth / thumbW // 8 — the geometry is fixed 16:9
+	for ty := 0; ty < thumbH; ty++ {
+		sy := uint32(ty * (vi.ScanoutHeight / thumbH))
+		r := scanoutFn(0, sy, uint32(vi.ScanoutWidth), 1, row[:])
+		if r < 0 {
+			switch vi.ErrnoName(r) {
+			case "ENXIO":
+				return "", "seat_absent" // no armed framebuffer: nothing to see
+			case "ENOSYS":
+				return "", "seat_unsupported"
+			}
+			return ioErr(r)
+		}
+		for tx := 0; tx < thumbW; tx++ {
+			px := row[tx*stride*vi.ScanoutBPP:]
+			// B8G8R8X8 little-endian -> RGB565 little-endian.
+			v := uint16(px[2]>>3)<<11 | uint16(px[1]>>2)<<5 | uint16(px[0]>>3)
+			out = append(out, byte(v), byte(v>>8))
+		}
+	}
+	for len(out) > 0 {
+		n := streamChunk
+		if len(out) < n {
+			n = len(out)
+		}
+		if sess.emit != nil {
+			sess.emit(out[:n])
+		}
+		out = out[n:]
+	}
+	var sb strings.Builder
+	sb.WriteString(`{"w":`)
+	sb.WriteString(vi.Itoa64(thumbW))
+	sb.WriteString(`,"h":`)
+	sb.WriteString(vi.Itoa64(thumbH))
+	sb.WriteString(`,"format":"rgb565le","bytes":`)
+	sb.WriteString(vi.Itoa64(thumbW * thumbH * 2))
+	sb.WriteByte('}')
+	return sb.String(), ""
+}
+
 // --- gosh.run -------------------------------------------------------------------
 
-func verbGoshRun(req *request, allowExec bool) (string, string) {
-	if !allowExec {
+func verbGoshRun(req *request, sess *sessionCtx) (string, string) {
+	if !sess.allowExec {
 		return "", "verb_disabled"
 	}
 	cmd, present, ok := req.argStr("cmd")
@@ -474,11 +617,27 @@ func verbGoshRun(req *request, allowExec bool) (string, string) {
 		out = out[:outMax]
 	}
 	_ = deleteFileFn(outPath)
+	// Bounded streaming (M109b): the captured bytes ride stream chunk
+	// lines ahead of the result — the line bound never moves and the
+	// client reassembles seq order. GOSH's > redirect materializes the
+	// file only when the child exits, so chunking-after-reap is the
+	// honest streaming shape this pipe can offer.
+	streamed := len(out)
+	for len(out) > 0 {
+		n := streamChunk
+		if len(out) < n {
+			n = len(out)
+		}
+		if sess.emit != nil {
+			sess.emit(out[:n])
+		}
+		out = out[n:]
+	}
 	var sb strings.Builder
 	sb.WriteString(`{"exit_status":`)
 	sb.WriteString(vi.Itoa64(st))
-	sb.WriteString(`,"stdout_b64":`)
-	jwriteStr(&sb, b64Encode(out))
+	sb.WriteString(`,"stdout_bytes":`)
+	sb.WriteString(vi.Itoa64(int64(streamed)))
 	sb.WriteString(`,"truncated":`)
 	sb.WriteString(jbool(truncated))
 	sb.WriteByte('}')

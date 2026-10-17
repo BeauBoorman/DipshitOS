@@ -1,6 +1,7 @@
 package main
 
 import (
+	"virelai/ed25519"
 	"virelai/shlib"
 	"virelai/sshlib"
 	"virelai/vi"
@@ -60,7 +61,7 @@ func signChangeWithSeed(c *Change, seed []byte) error {
 		sshlib.Wipe(seed)
 	}()
 
-	pub := sshlib.EdDerivePublic(seedArr)
+	pub := ed25519.EdDerivePublic(seedArr)
 	c.Author = sshlib.EncodeHex(pub[:])
 
 	sorted := make([]Op, len(c.Ops))
@@ -72,7 +73,7 @@ func signChangeWithSeed(c *Change, seed []byte) error {
 	if err != nil {
 		return err
 	}
-	sig := sshlib.EdSign(msg, seedArr)
+	sig := ed25519.EdSign(msg, seedArr)
 	c.Sig = sshlib.EncodeHex(sig[:])
 	return nil
 }
