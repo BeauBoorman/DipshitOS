@@ -1042,10 +1042,10 @@ carrying `--spawn` is the tree-depth leg). Verdict lines name the image
 | tree depth-3 | 02C | GOSELFHOST -> `--spawn STATUS43.BIN 2` | parent 1-of-1, nested 2-of-2 |
 | concurrent breadth-8 | 03A | 8 x Zig | 8-of-8 |
 | concurrent breadth-12 | 03B | 12 x Zig | **9-of-12, three `SPAWN-FAIL err=ENOSPC`** |
-| concurrent breadth-3 | 03C | 3 x Go GOHELLO.ELF | 1..2-of-3, dead children exit status=2 (`newosproc`) |
-| amendment-8 exact shape | 04A | cmd/compile, cmd/link, then HELLO2.ELF | status=0 — **the tombstone shape survives** (see below: one pass saw leg 04B's own `link` die the named bound instead) |
-| heavy pair + depth | 04B | compile, link, then 3 x Go | 3-of-3; one pass: `link ... status=2` under backlog, verdict `0-of-3` |
-| heavy pair + breadth | 04C | compile, link, then 2 x Go concurrent | 2-of-2 |
+| concurrent breadth-3 | 03C | 3 x Go GOHELLO.ELF | 0..2-of-3, dead children exit status=2 (`newosproc`) |
+| amendment-8 exact shape | 04A | cmd/compile, cmd/link, then HELLO2.ELF | status=0, 5/5 — **the tombstone shape survives** |
+| heavy pair + depth | 04B | compile, link, then 3 x Go | 3-of-3, 5/5 (in an earlier assert revision one pass saw `link ... status=2` under backlog) |
+| heavy pair + breadth | 04C | compile, link, then 2 x Go concurrent | **0..2-of-2** — the bound fires most passes (zombie backlog + 2 x 4-task runtimes) |
 
 ### What the matrix says
 
