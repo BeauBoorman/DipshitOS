@@ -2,11 +2,13 @@
 # (GPUTRIANGLE.ELF) drives the opt-in VIR1 render device over the real seat
 # -> broker -> Metal path; the private profile's raw BGRA readback export and
 # the VZ scanout are pixel-proven by f1's independent comparator/geometry.
-# Nine independent boots, one leg each: 01 triangle, 02 mixed margins,
+# Twelve independent boots, one leg each: 01 triangle, 02 mixed margins,
 # 03 resize/second generation, 04 close/reuse, 05 native-only (no render
 # device), 06 malformed/auth (invalid battery + forged kind-17), 07
 # wrong/stale fence, 08 stall/timeout + next-open drain, 09 M111b GPU
-# compute (slot-90 GEMM submit->fence->readback + named refusal). `wm=none`
+# compute (slot-90 GEMM submit->fence->readback + named refusal), 10 M111c
+# GOINFER stub-model inference K=5, 11 GOINFER on a device-less boot, 12
+# GOINFER weights-absent honesty. `wm=none`
 # is seeded so the seat is the spec's own scripted exec; every leg ends on
 # a marker only its script can print. Leg 05 RUNS FIRST: the seed share is
 # spec-scoped, so its no-receipt assert is only honest before any 3D leg
@@ -57,6 +59,14 @@ vgate_file script-gemmrefuse.txt <<'EOF'
 exec GPUTRIANGLE.ELF gemmrefuse
 EOF
 
+vgate_file script-goinfer-stub.txt <<'EOF'
+exec GOINFER.ELF stub
+EOF
+
+vgate_file script-goinfer-model.txt <<'EOF'
+exec GOINFER.ELF model
+EOF
+
 vgate_file script-rx.txt <<'EOF'
 echo rx-g3-ok
 EOF
@@ -65,14 +75,15 @@ vgate_file script-rx-invalid.txt <<'EOF'
 echo rx-g3-invalid-ok
 EOF
 
-# GOTABWM.ELF and GPUTRIANGLE.ELF are .build products, not zig-out: stage
-# both plus the wm=none seat opt-in (go-wm-seat's own pattern) so each leg
-# boots exactly one seat and the app's build stamp is honoured.
+# GOTABWM.ELF, GPUTRIANGLE.ELF and GOINFER.ELF are .build products, not
+# zig-out: stage all three plus the wm=none seat opt-in (go-wm-seat's own
+# pattern) so each leg boots exactly one seat and each app's build stamp is
+# honoured.
 vgate_setup_python <<'PY'
 import os, shutil, sys
 rd = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
-for name in ("GOTABWM.ELF", "GPUTRIANGLE.ELF"):
+for name in ("GOTABWM.ELF", "GPUTRIANGLE.ELF", "GOINFER.ELF"):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
         sys.exit("%s missing (expected %s) - build it first: "
@@ -457,3 +468,93 @@ for row in ("compute\trefused\tinvalid", "compute\tstats\trefusals=1"):
         sys.exit("refuse receipt missing %r\n%s" % (row, refuse))
 print("compute receipt rows verified")
 PY
+
+# --- leg 11: GOINFER on a device-less boot (M111c, issue #2410) -----------
+# Runs ahead of leg 10 in file order: its no-receipt assert is only honest
+# before any goinfer leg has written GOINFER/ files to the spec-scoped
+# share — the same reason leg 05 sits first among the render legs.
+vgate_run 11 -- \
+    --screen '$RUN_DIR/screen-11' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-goinfer-stub.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-rx.txt' \
+    --script3-after 'goinfer: unsupported' \
+    --script-expect 'rx-g3-ok' --timeout 180
+
+vgate_assert 11 serial-absent 'gpu3d: armed'
+vgate_assert 11 serial-contains 'gotabwm: holding seat'
+vgate_assert 11 serial-contains 'goinfer: unsupported'
+vgate_assert 11 serial-absent 'goinfer: stub answer'
+vgate_assert 11 serial-absent 'goinfer: error'
+vgate_assert 11 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+p = os.path.join(share, "GOINFER")
+if os.path.exists(p):
+    sys.exit("GOINFER receipt dir exists on a native-only boot: %r" %
+             os.listdir(p))
+print("no GOINFER receipts on native-only boot")
+PY
+
+# --- leg 10: GOINFER stub-model inference, K=5 (M111c, issue #2410) -------
+# One exec, five complete runs of the deterministic PRNG-weights model —
+# each a fresh sys_gpucomp session, a full VIW stream-and-seal load, and a
+# greedy decode whose every matmul and vocab softmax rides GEMM/DEQUANT/
+# SOFTMAX on the real Metal pipelines. The answer is pinned because the
+# model is synthetic-by-construction; a real weights image pins its own
+# answer on the card's landing PR.
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-goinfer-stub.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-rx.txt' \
+    --script3-after 'goinfer OK' \
+    --script-expect 'rx-g3-ok' --timeout 180
+
+vgate_assert 10 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 10 serial-count 'goinfer: stub run k=' 5
+vgate_assert 10 serial-contains 'goinfer: stub consistent K=5'
+vgate_assert 10 serial-contains 'goinfer: stub answer'
+vgate_assert 10 serial-contains 'goinfer OK'
+vgate_assert 10 serial-absent 'goinfer: error'
+vgate_assert 10 serial-absent 'goinfer: diverged'
+vgate_assert 10 serial-absent 'gpu3d: timeout'
+vgate_assert 10 serial-absent 'gpu3d: badresp'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 output-contains 'compute-refusals=0'
+vgate_assert 10 output-contains 'refusals=0'
+vgate_assert 10 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+body = open(os.path.join(share, "GOINFER", "RECEIPT.TSV")).read()
+if body.count("stub\trun\t") != 5:
+    sys.exit("receipt wants 5 run rows:\n%s" % body)
+if "stub\tconsistent\tK=5" not in body:
+    sys.exit("receipt missing the consistency row\n%s" % body)
+print("goinfer receipt rows verified")
+PY
+
+# --- leg 12: weights absent is a named failure, not a fabricated answer --
+# `goinfer model` on a device-capable boot WITHOUT a staged VIW must name
+# its absence and stop — the licence gate's whole point is that the app
+# never invents weights it was never given.
+vgate_run 12 -- \
+    --screen '$RUN_DIR/screen-12' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-goinfer-model.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-rx.txt' \
+    --script3-after 'goinfer: error absent' \
+    --script-expect 'rx-g3-ok' --timeout 180
+
+vgate_assert 12 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 12 serial-contains 'goinfer: weights absent'
+vgate_assert 12 serial-contains 'goinfer: error absent'
+vgate_assert 12 serial-absent 'goinfer: model answer'
+vgate_assert 12 serial-absent 'gpu3d: timeout'
+vgate_assert 12 output-contains 'compute-submits=0'
+vgate_assert 12 output-contains 'refusals=0'
