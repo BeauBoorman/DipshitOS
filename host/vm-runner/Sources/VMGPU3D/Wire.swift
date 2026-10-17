@@ -82,6 +82,15 @@ public enum GPU3DRefusal: Error, Equatable {
     case backendRefused
     /// The element's write buffers could not hold the full response.
     case responseSpaceShort
+    /// COMPUTE_SUBMIT's kernel_id is outside the advertised kernels_mask
+    /// (M111, ADR 0053 D2/D3 — the library is GEMM/SOFTMAX/DEQUANT only).
+    case unknownKernel
+    /// A kernel descriptor's dims, flags or aux break the kernel's pinned
+    /// shape (bounds, reserved bits, absent-slot discipline).
+    case badKernelShape
+    /// A kernel-descriptor buffer slot names no attached buffer of this
+    /// context, or the declared tensor overruns the buffer's extent.
+    case badKernelBinding
 }
 
 public enum GPU3DWire {
@@ -171,6 +180,10 @@ public enum GPU3DWire {
     public static let vic1SoftmaxMaxCols: UInt32 = 49152
     /// DEQUANT's group-count bound: groups = ceil(n / group_size) ≤ 2^19.
     public static let vic1MaxGroups: UInt32 = 1 << 19
+    /// The pinned 2-D extent bound (D3): GEMM's M*N and SOFTMAX's
+    /// rows*cols both stay ≤ 2^22 elements — 8 MiB of f16 / 16 MiB of
+    /// f32, always inside one max-size buffer.
+    public static let vic1Max2DElems: UInt32 = 1 << 22
 
     /// The VIC1 capset payload: eight LE u32 words; `ready` reports whether
     /// a compute-capable backend is attached.
@@ -231,14 +244,24 @@ public enum GPU3DWire {
     //                          handles already); slot 3 absent = {0,0}
     //   56   8     reserved    always 0
     public struct KernelDesc: Equatable {
+        /// One buffer binding: res_id + byte_off; the all-zero pair means
+        /// "slot absent" (the guest broker translated its handles into
+        /// res_ids before encoding).
+        public struct Buf: Equatable {
+            public var buf: UInt32 = 0
+            public var byteOff: UInt32 = 0
+            public init(buf: UInt32 = 0, byteOff: UInt32 = 0) {
+                self.buf = buf
+                self.byteOff = byteOff
+            }
+        }
         public var kernelID: UInt32 = 0
         public var flags: UInt32 = 0
         public var d0: UInt32 = 0
         public var d1: UInt32 = 0
         public var d2: UInt32 = 0
         public var aux: UInt32 = 0
-        public var bufs: [(buf: UInt32, byteOff: UInt32)] =
-            [(0, 0), (0, 0), (0, 0), (0, 0)]
+        public var bufs: [Buf] = [Buf(), Buf(), Buf(), Buf()]
         public var reserved: UInt64 = 0
 
         public init() {}
@@ -594,14 +617,17 @@ public enum GPU3DWire {
             guard resourceID != 0 else { return .failure(.invalidResource) }
             // The profile's pinned bounds: 1..256 × 1..192, one plane,
             // single sample, no mip tail, no create flags. M111 (ADR 0053
-            // D4): a target_buffer resource is a 1-D byte range — its
-            // "width" is the byte size bounded by VIC1's 16 MiB, its
-            // height is pinned at 1.
+            // D4): a target_buffer resource is a flat 1-D byte range —
+            // "width" is the byte size bounded by VIC1's 16 MiB; height
+            // 1, one plane, no format/mip/sample semantics. bind is 16
+            // (VIRTIO_GPU_BIND_VERTEX — the render path's VBO) or 0 (the
+            // compute path's anonymous byte window).
             if target == 0 {
                 guard width >= 1, width <= vic1MaxBufferBytes,
-                      height == 1,
-                      depth <= 1, arraySize <= 1, lastLevel <= 1,
-                      nrSamples <= 1, flags == 0 else {
+                      height == 1, depth == 1, arraySize == 1,
+                      lastLevel == 0, nrSamples == 0,
+                      format == 0, flags == 0,
+                      bind == 0 || bind == 16 else {
                     return .failure(.invalidParameter)
                 }
             } else {
@@ -684,7 +710,7 @@ public enum GPU3DWire {
                 guard let buf = r.u32(), let off = r.u32() else {
                     return .failure(.truncatedRequest)
                 }
-                kd.bufs[i] = (buf, off)
+                kd.bufs[i] = .init(buf: buf, byteOff: off)
             }
             guard let reserved = r.u64() else { return .failure(.truncatedRequest) }
             guard reserved == 0 else { return .failure(.reservedBits) }

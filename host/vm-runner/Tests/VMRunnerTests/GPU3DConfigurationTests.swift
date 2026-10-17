@@ -33,14 +33,16 @@ final class GPU3DConfigurationTests: XCTestCase {
 
     /// The private render device, written down independently of the
     /// leaf's constants (deviceID 0x43, PCI 1af4:1083, VIRGL offered
-    /// optionally, 16-byte config space: 0 scanouts, 1 capset).
+    /// optionally, 16-byte config space: 0 scanouts, 2 capsets — VIR1 at
+    /// index 0 plus VIC1 at index 1 once M111b's compute backend is
+    /// attached, which is the only way --gpu3d-metal attaches).
     private var expectedRenderDevice: RC.DeviceDescriptor {
         RC.DeviceDescriptor(deviceID: 0x43, pciDID: 0x1083,
                             pciClass: 0x03, pciSubclass: 0x00,
                             queueCount: 2, optionalFeaturesSubset0: 0x1,
                             deviceSpecificConfiguration: [
                                 0, 0, 0, 0, 0, 0, 0, 0,
-                                0, 0, 0, 0, 1, 0, 0, 0,
+                                0, 0, 0, 0, 2, 0, 0, 0,
                             ])
     }
 

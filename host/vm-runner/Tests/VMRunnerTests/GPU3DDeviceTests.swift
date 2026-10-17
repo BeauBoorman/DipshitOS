@@ -881,4 +881,286 @@ final class GPU3DDeviceTests: XCTestCase {
         drive(device, [oob])
         XCTAssertEqual(device.lastRefusal, .invalidParameter)
     }
+
+    // MARK: - M111b compute (#2409, ADR 0053)
+
+    /// GET_CAPSET_INFO for index 1 (VIC1 discovery).
+    private func capsetInfoReqAt(_ index: UInt32) -> [UInt8] {
+        var req = capsetInfoReq
+        for i in 0..<4 { req[24 + i] = UInt8((index >> (8 * i)) & 0xff) }
+        return req
+    }
+
+    /// GET_CAPSET for a named capset id + version.
+    private func getCapsetReq(id: UInt32, version: UInt32 = 1) -> [UInt8] {
+        var req = capsetReq
+        for i in 0..<4 { req[24 + i] = UInt8((id >> (8 * i)) & 0xff) }
+        for i in 0..<4 { req[28 + i] = UInt8((version >> (8 * i)) & 0xff) }
+        return req
+    }
+
+    /// RESOURCE_CREATE_3D for a target_buffer byte window (target 0):
+    /// flat 1-D shape, no format/bind — the compute path's create.
+    private func bufferCreateReq(ctxID: UInt32 = 7, resourceID: UInt32,
+                                 size: UInt32 = 4096) -> [UInt8] {
+        var req = resourceCreateReq(ctxID: ctxID, resourceID: resourceID)
+        req[28] = 0 // target = 0 (buffer)
+        req[32] = 0 // format = 0 (no format semantics on a byte range)
+        req[36] = 0 // bind = 0 (not a vertex buffer)
+        for i in 0..<4 { req[40 + i] = UInt8((size >> (8 * i)) & 0xff) } // width = bytes
+        req[44] = 1 // height = 1
+        req[56] = 0 // last_level = 0 (the builder's texture value is 1)
+        return req
+    }
+
+    /// CTX_ATTACH_RESOURCE (0x0202) for a resource of ctx 7.
+    private func attachReq(ctxID: UInt32 = 7, resourceID: UInt32) -> [UInt8] {
+        resOpReq(GPU3DWire.cmdCtxAttachResource, ctxID: ctxID, resourceID: resourceID)
+    }
+
+    /// A fenced COMPUTE_SUBMIT for ctx_id 7 carrying the 64-byte kernel
+    /// descriptor verbatim (the wire is the guest's encode — the decoder
+    /// must round-trip the same layout the kernel emits).
+    private func computeSubmitReq(_ kd: GPU3DWire.KernelDesc,
+                                  ctxID: UInt32 = 7,
+                                  fence: UInt64 = 0x5a5a_0101_0202_0303,
+                                  fenced: Bool = true) -> [UInt8] {
+        var req: [UInt8] = [
+            0x00, 0x04, 0x00, 0x00, // type = COMPUTE_SUBMIT (0x0400)
+            0x00, 0x00, 0x00, 0x00, // flags (filled below)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fence_id
+            0x00, 0x00, 0x00, 0x00, // ctx_id
+            0x00, 0x00, 0x00, 0x00, // ring_idx + padding
+        ]
+        if fenced { req[4] = 0x01 }
+        for i in 0..<8 { req[8 + i] = UInt8((fence >> (8 * i)) & 0xff) }
+        for i in 0..<4 { req[16 + i] = UInt8((ctxID >> (8 * i)) & 0xff) }
+        func u32(_ v: UInt32) -> [UInt8] {
+            [UInt8(v & 0xff), UInt8((v >> 8) & 0xff),
+             UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)]
+        }
+        req += u32(kd.kernelID) + u32(kd.flags)
+        req += u32(kd.d0) + u32(kd.d1) + u32(kd.d2) + u32(kd.aux)
+        for b in kd.bufs { req += u32(b.buf) + u32(b.byteOff) }
+        req += [0, 0, 0, 0, 0, 0, 0, 0] // reserved
+        return req
+    }
+
+    /// A small GEMM descriptor: A[2×2]·B[2×2]→C[2×2], resources 5,6,7.
+    private func gemmDesc(res: (UInt32, UInt32, UInt32) = (5, 6, 7)) -> GPU3DWire.KernelDesc {
+        var kd = GPU3DWire.KernelDesc()
+        kd.kernelID = GPU3DWire.kernelGEMM
+        kd.d0 = 2; kd.d1 = 2; kd.d2 = 2
+        kd.bufs = [.init(buf: res.0), .init(buf: res.1), .init(buf: res.2), .init()]
+        return kd
+    }
+
+    /// Create a ctx and three attached 4 KiB buffers on it.
+    private func bufferSet(_ device: GPU3DDevice, _ ctxID: UInt32,
+                           _ backend: GPU3DTestBackend) {
+        create(device, ctxID)
+        for res: UInt32 in [5, 6, 7] {
+            drive(device, [FakeElement(bufferCreateReq(ctxID: ctxID, resourceID: res))])
+            drive(device, [FakeElement(attachReq(ctxID: ctxID, resourceID: res))])
+        }
+    }
+
+    /// VIC1 discovery: index 1 answers the pinned VIC1 payload only when
+    /// a backend is attached; ready tracks gpu3dComputeReady.
+    func testVic1CapsetDiscovery() {
+        // Backend-less device: index 1 is the honest refusal, and the
+        // config advertises one capset.
+        let solo = GPU3DDevice()
+        let miss = FakeElement(capsetInfoReqAt(1))
+        drive(solo, [miss])
+        XCTAssertEqual(solo.lastRefusal, .invalidCapset)
+        XCTAssertEqual(responseType(miss), GPU3DWire.respErrInvalidParameter)
+
+        // With a backend, index 1 answers "VIC1"/v1/32 and the capset
+        // payload carries the eight frozen words.
+        let backend = GPU3DTestBackend()
+        let device = GPU3DDevice(backend: backend)
+        let info = FakeElement(capsetInfoReqAt(1))
+        drive(device, [info])
+        XCTAssertEqual(info.written.count, 40)
+        XCTAssertEqual(responseType(info), GPU3DWire.respOkCapsetInfo)
+        XCTAssertEqual(Array(info.written[24..<28]), [0x31, 0x43, 0x49, 0x56]) // "VIC1" LE
+        XCTAssertEqual(Array(info.written[28..<32]), [0x01, 0x00, 0x00, 0x00])
+        XCTAssertEqual(Array(info.written[32..<36]), [0x20, 0x00, 0x00, 0x00])
+
+        let gc = FakeElement(getCapsetReq(id: GPU3DWire.capsetVIC1))
+        drive(device, [gc])
+        XCTAssertEqual(gc.written.count, 56)
+        XCTAssertEqual(responseType(gc), GPU3DWire.respOkCapset)
+        func word(_ i: Int) -> UInt32 {
+            UInt32(gc.written[24 + i * 4])
+                | UInt32(gc.written[24 + i * 4 + 1]) << 8
+                | UInt32(gc.written[24 + i * 4 + 2]) << 16
+                | UInt32(gc.written[24 + i * 4 + 3]) << 24
+        }
+        XCTAssertEqual(word(0), 1)                  // version
+        XCTAssertEqual(word(1), 16)                 // max buffers/context
+        XCTAssertEqual(word(2), 16 * 1024 * 1024)   // max buffer bytes
+        XCTAssertEqual(word(3), 7)                  // kernels_mask
+        XCTAssertEqual(word(4), 4096)               // max dim
+        XCTAssertEqual(word(5), 1 << 24)            // max elems
+        XCTAssertEqual(word(6), 0)                  // reserved
+        XCTAssertEqual(word(7), 0)                  // ready (backend off)
+
+        backend.computeReady = true
+        let gc2 = FakeElement(getCapsetReq(id: GPU3DWire.capsetVIC1))
+        drive(device, [gc2])
+        XCTAssertEqual(Array(gc2.written[52..<56]), [0x01, 0x00, 0x00, 0x00])
+
+        // Wrong version / index-2 probes refuse.
+        let badV = FakeElement(getCapsetReq(id: GPU3DWire.capsetVIC1, version: 2))
+        drive(device, [badV])
+        XCTAssertEqual(device.lastRefusal, .invalidCapset)
+        let badI = FakeElement(capsetInfoReqAt(2))
+        drive(device, [badI])
+        XCTAssertEqual(device.lastRefusal, .invalidCapset)
+    }
+
+    /// The happy path: three buffers + a fenced GEMM submit defers until
+    /// the backend reports the fence; the held element returns OK_NODATA.
+    func testComputeSubmitDefersAndFences() {
+        let backend = GPU3DTestBackend()
+        backend.computeReady = true
+        let device = GPU3DDevice(backend: backend)
+        bufferSet(device, 7, backend)
+
+        let el = FakeElement(computeSubmitReq(gemmDesc()))
+        drive(device, [el])
+        XCTAssertFalse(el.returned, "a deferred submit must hold the element")
+        XCTAssertEqual(device.pendingFenceID, 0x5a5a_0101_0202_0303)
+        XCTAssertEqual(backend.calls.last, "compute:7:1")
+
+        // An unknown fence reports nothing; the real one releases it —
+        // any new element drains the backend's poll at the batch top.
+        device.noteFenceCompleted(0xdead)
+        XCTAssertFalse(el.returned)
+        backend.polledFences = [0x5a5a_0101_0202_0303]
+        drive(device, [FakeElement(capsetInfoReqAt(0))])
+        XCTAssertTrue(el.returned)
+        XCTAssertEqual(responseType(el), GPU3DWire.respOkNoData)
+        XCTAssertNil(device.pendingFenceID)
+    }
+
+    /// The D2/D3 named refusals refuse before the backend is asked.
+    func testComputeSubmitRefusalTable() {
+        let backend = GPU3DTestBackend()
+        backend.computeReady = true
+        let device = GPU3DDevice(backend: backend)
+        bufferSet(device, 7, backend)
+
+        // kernel_id outside the mask → unknownKernel → EINVAL class.
+        var kd = gemmDesc()
+        kd.kernelID = 9
+        let unknown = FakeElement(computeSubmitReq(kd))
+        drive(device, [unknown])
+        XCTAssertEqual(device.lastRefusal, .unknownKernel)
+        XCTAssertEqual(responseType(unknown), GPU3DWire.respErrInvalidParameter)
+
+        // Zero dim → badKernelShape.
+        kd = gemmDesc()
+        kd.d0 = 0
+        let dimZero = FakeElement(computeSubmitReq(kd))
+        drive(device, [dimZero])
+        XCTAssertEqual(device.lastRefusal, .badKernelShape)
+
+        // A buf slot naming no resource of this ctx → badKernelBinding.
+        kd = gemmDesc(res: (5, 6, 77))
+        let missing = FakeElement(computeSubmitReq(kd))
+        drive(device, [missing])
+        XCTAssertEqual(device.lastRefusal, .badKernelBinding)
+        XCTAssertEqual(responseType(missing), GPU3DWire.respErrInvalidResourceID)
+
+        // A buf slot naming the ctx's TEXTURE (not a buffer) refuses too.
+        drive(device, [FakeElement(resourceCreateReq(ctxID: 7, resourceID: 9))])
+        drive(device, [FakeElement(attachReq(ctxID: 7, resourceID: 9))])
+        kd = gemmDesc(res: (5, 6, 9))
+        let texBind = FakeElement(computeSubmitReq(kd))
+        drive(device, [texBind])
+        XCTAssertEqual(device.lastRefusal, .badKernelBinding)
+
+        // The backend call log proves validation happened device-side:
+        // nothing reached gpu3dComputeSubmit.
+        XCTAssertFalse(backend.calls.contains { $0.hasPrefix("compute:") })
+
+        // An unfenced submit to the deferring backend is fenceRequired —
+        // the descriptor is valid so the backend IS asked; the wire-side
+        // refusal is the missing fence, not the math.
+        let unfenced = FakeElement(computeSubmitReq(gemmDesc(), fenced: false))
+        drive(device, [unfenced])
+        XCTAssertEqual(device.lastRefusal, .fenceRequired)
+    }
+
+    /// Compute shares the one-outstanding device slot with render: a
+    /// deferred SUBMIT_3D holds the slot; a compute submit is busy.
+    func testComputeSharesTheOneOutstandingSlot() {
+        let backend = GPU3DTestBackend()
+        backend.computeReady = true
+        let device = GPU3DDevice(backend: backend)
+        bufferSet(device, 7, backend)
+        create(device, 9)
+
+        let held = FakeElement(submitReq(ctxID: 7, fence: 0x42))
+        drive(device, [held])
+        XCTAssertEqual(device.pendingFenceID, 0x42)
+
+        let cs = FakeElement(computeSubmitReq(gemmDesc(), ctxID: 9, fence: 0x77))
+        drive(device, [cs])
+        XCTAssertEqual(device.lastRefusal, .deviceBusy)
+        XCTAssertTrue(cs.returned)
+        XCTAssertFalse(backend.calls.contains { $0.hasPrefix("compute:") })
+        device.noteFenceCompleted(0x42)
+        XCTAssertTrue(held.returned)
+    }
+
+    /// target_buffer creates carry VIC1's bounds: over 16 MiB, a non-flat
+    /// height, and a sixth live buffer? — the 16-buffer/context budget.
+    func testBufferResourceBounds() {
+        let backend = GPU3DTestBackend()
+        backend.computeReady = true
+        let device = GPU3DDevice(backend: backend)
+        create(device, 7)
+
+        // 16 MiB + 1 byte refuses.
+        let tooBig = FakeElement(bufferCreateReq(resourceID: 5, size: 16 * 1024 * 1024 + 1))
+        drive(device, [tooBig])
+        XCTAssertEqual(device.lastRefusal, .invalidParameter)
+
+        // height != 1 refuses (buffers are flat).
+        var tall = bufferCreateReq(resourceID: 5)
+        tall[44] = 2
+        let tallEl = FakeElement(tall)
+        drive(device, [tallEl])
+        XCTAssertEqual(device.lastRefusal, .invalidParameter)
+
+        // A nonzero format/bind refuses the flat shape.
+        var f = bufferCreateReq(resourceID: 5)
+        f[32] = 1
+        drive(device, [FakeElement(f)])
+        XCTAssertEqual(device.lastRefusal, .invalidParameter)
+
+        // Sixteen buffers is the VIC1 budget; the 17th is resourceLimit.
+        // (lastRefusal holds the earlier legs' named refusals — a success
+        // does not clear it — so the response word is what is asserted.)
+        for res: UInt32 in 1...16 {
+            let el = FakeElement(bufferCreateReq(resourceID: res))
+            drive(device, [el])
+            XCTAssertEqual(responseType(el), GPU3DWire.respOkNoData,
+                           "buffer \(res) refused: \(String(describing: device.lastRefusal))")
+        }
+        let seventeenth = FakeElement(bufferCreateReq(resourceID: 17))
+        drive(device, [seventeenth])
+        XCTAssertEqual(device.lastRefusal, .resourceLimit)
+
+        // But the render budget stays 2 in the same context.
+        let tex1 = FakeElement(resourceCreateReq(ctxID: 7, resourceID: 30))
+        let tex2 = FakeElement(resourceCreateReq(ctxID: 7, resourceID: 31))
+        let tex3 = FakeElement(resourceCreateReq(ctxID: 7, resourceID: 32))
+        drive(device, [tex1, tex2, tex3])
+        XCTAssertEqual(device.lastRefusal, .resourceLimit)
+    }
 }

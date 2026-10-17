@@ -127,8 +127,11 @@ public enum GPU3DRunnerConfiguration {
         public var deviceSpecificConfiguration: [UInt8]
     }
 
-    /// The one private render device this leaf can contribute
-    /// (0x43 / PCI 1af4:1083, VIR1 v1 — the #2160 contract).
+    /// The one private render+compute device this leaf can contribute
+    /// (0x43 / PCI 1af4:1083, VIR1 v1 + VIC1 v1 — the #2160/#2409
+    /// contract). The descriptor mirrors what makeConfiguration emits
+    /// once a real Metal backend is attached — the only way --gpu3d-metal
+    /// attaches at all — so num_capsets is the two-capset answer.
     public static let renderDeviceDescriptor = DeviceDescriptor(
         deviceID: GPU3DWire.deviceID,
         pciDID: GPU3DWire.pciDID,
@@ -136,7 +139,7 @@ public enum GPU3DRunnerConfiguration {
         pciSubclass: GPU3DWire.pciSubclass,
         queueCount: GPU3DWire.queueCount,
         optionalFeaturesSubset0: GPU3DWire.featureVirgl,
-        deviceSpecificConfiguration: GPU3DWire.deviceConfigBytes)
+        deviceSpecificConfiguration: GPU3DWire.deviceConfigBytes(numCapsets: 2))
 
     /// The complete custom-virtio device list after the options apply:
     /// absent flags leave `existing` untouched; the opt-in appends
@@ -286,15 +289,15 @@ public final class GPU3DRunnerAttachment {
     }
 
     /// Identity line printed at attach: host device identity, the private
-    /// profile and the REAL Metal device name — never token contents.
+    /// profiles and the REAL Metal device name — never token contents.
     public func banner() -> String {
         let mode = options.testMode.map { ", test-mode=\($0.rawValue) (SPIKE fault knob)" } ?? ""
-        return "gpu3d-metal: ENABLED (M102d3 #2168) — custom-virtio deviceID 0x43 (PCI 1af4:1083), class 0x03/0x00, 2 queues, VIR1 capset 0x56495231 v1; backend Metal \"\(renderer.metalDeviceName)\" ready=1 (real pipeline initialized)\(mode)"
+        return "gpu3d-metal: ENABLED (M102d3 #2168) — custom-virtio deviceID 0x43 (PCI 1af4:1083), class 0x03/0x00, 2 queues, VIR1 capset 0x56495231 v1 + VIC1 capset 0x56494331 v1 (M111b #2409); backend Metal \"\(renderer.metalDeviceName)\" ready=1 compute=\(renderer.gpu3dComputeReady ? 1 : 0) (real pipeline initialized)\(mode)"
     }
 
     /// Lifecycle counters at stop — observed numbers only.
     public func counters() -> String {
-        "gpu3d: resets=\(host.core.resetCount) refusals=\(host.core.refusalCount) retired-pending=\(host.core.retiredPending) stale-fences=\(host.core.staleCompletions); renderer draws=\(renderer.drawsEncoded) gpu-completions=\(renderer.gpuCompletions) submit-rejections=\(renderer.submitRejections) orphaned=\(renderer.orphanedCompletions); guest-mem mappings=\(memory.mappings) unmapped=\(memory.unmapped)"
+        "gpu3d: resets=\(host.core.resetCount) refusals=\(host.core.refusalCount) retired-pending=\(host.core.retiredPending) stale-fences=\(host.core.staleCompletions); renderer draws=\(renderer.drawsEncoded) gpu-completions=\(renderer.gpuCompletions) submit-rejections=\(renderer.submitRejections) orphaned=\(renderer.orphanedCompletions) compute-submits=\(renderer.computeSubmits) compute-refusals=\(renderer.computeRefusals); guest-mem mappings=\(memory.mappings) unmapped=\(memory.unmapped)"
     }
 }
 #endif

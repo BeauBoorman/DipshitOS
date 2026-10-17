@@ -628,7 +628,7 @@ fn handler_for(comptime number: u64) Handler {
         sys_udp_close => handle_udp_close,
         sys_getpid => handle_getpid,
         sys_scanout_read => handle_scanout_read,
-        sys_grant_admin => handle_grant_admin,
+        sys_grant_admin => handle_enosys,
         sys_gpucomp => handle_gpucomp,
         sys_win_open => handle_win_open,
         sys_win_fill => handle_win_fill,
@@ -1111,18 +1111,6 @@ fn handle_scanout_read(args: Args, _: *exceptions.VectorFrame) u64 {
         }
     }
     return need;
-}
-
-// ---------------------------------------------------------------------------
-// ADR 0054 reservation: sys_grant_admin — slot 89 (stub)
-// ---------------------------------------------------------------------------
-
-/// `sys_grant_admin` — the ADR 0054 (M113c #2419) reservation kept dense
-/// in the ABI table. Always ENOSYS until that card defines its contract;
-/// a real errno here would fabricate an implementation that does not
-/// exist.
-fn handle_grant_admin(_: Args, _: *exceptions.VectorFrame) u64 {
-    return error_result(.enosys);
 }
 
 // ---------------------------------------------------------------------------

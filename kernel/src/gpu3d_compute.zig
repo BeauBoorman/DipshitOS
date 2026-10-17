@@ -726,9 +726,9 @@ fn translate_kdesc(k: *wire.KernelDesc) Error!void {
             const kk = k.d2;
             if (m == 0 or n == 0 or kk == 0) return error.Invalid;
             if (m > wire.vic1_max_dim or n > wire.vic1_max_dim or kk > wire.vic1_max_dim) return error.Invalid;
-            if (@as(u64, m) * n > wire.vic1_max_elems or
-                @as(u64, m) * kk > wire.vic1_max_elems or
-                @as(u64, kk) * n > wire.vic1_max_elems) return error.Invalid;
+            // ADR 0053 D3 pins the OUTPUT extent M*N <= 2^22; the operand
+            // extents are bound by the buffer checks below.
+            if (@as(u64, m) * n > wire.vic1_max_2d_elems) return error.Invalid;
             k.bufs[0].buf = try resolve_buf(k.bufs[0], @as(u64, m) * kk * 2); // A f16 [M,K]
             k.bufs[1].buf = try resolve_buf(k.bufs[1], @as(u64, kk) * n * 2); // B f16
             k.bufs[2].buf = try resolve_buf(k.bufs[2], @as(u64, m) * n * 2); // C f16
@@ -741,9 +741,9 @@ fn translate_kdesc(k: *wire.KernelDesc) Error!void {
             if (k.d2 != 0 or k.aux != 0 or k.reserved != 0) return error.Invalid;
             const rows = k.d0;
             const cols = k.d1;
-            if (rows == 0 or cols == 0) return error.Invalid;
+            if (rows == 0 or cols < 2) return error.Invalid; // D3: cols in 2..49152
             if (rows > wire.vic1_max_dim or cols > wire.vic1_softmax_max_cols) return error.Invalid;
-            if (@as(u64, rows) * cols > wire.vic1_max_elems) return error.Invalid;
+            if (@as(u64, rows) * cols > wire.vic1_max_2d_elems) return error.Invalid;
             const bytes = @as(u64, rows) * cols * 4;
             const in_buf = k.bufs[0].buf;
             const out_buf = k.bufs[1].buf;
@@ -1200,6 +1200,68 @@ test "gpu3d_compute: second live OPEN is Exhausted; owner-exit revokes" {
     try std.testing.expect(h2 != 0);
 }
 
+test "gpu3d_compute: the D3 shape bounds refuse before any device submission" {
+    compute_setup();
+    const owner: usize = 29;
+    const h = try dispatch(&open_desc(), owner);
+    var bd: Desc = .{ .op = op_buf_alloc, .handle = h, .arg_a = 256 * 1024 };
+    const big = try dispatch(&bd, owner);
+
+    // SOFTMAX cols must be >= 2 (D3: cols in 2..49152) — cols=1 and
+    // cols=49153 are both badKernelShape, and 4097*49152 rows*cols
+    // overruns the pinned 2^22 product bound anyway.
+    var kd: wire.KernelDesc = .{
+        .kernel_id = wire.kernel_softmax,
+        .d0 = 1,
+        .d1 = 1,
+        .bufs = .{ .{ .buf = @truncate(big), .byte_off = 0 }, .{ .buf = @truncate(big), .byte_off = 0 }, .{}, .{} },
+    };
+    var rd: Desc = .{ .op = op_run, .handle = h };
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    const submits_before = counters.submits;
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+    kd.flags = wire.softmax_flag_inplace; // same buf twice is legal ONLY in-place
+    kd.d1 = 49153;
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+    kd.d0 = 4097; // rows beyond the per-dim bound
+    kd.d1 = 2;
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+
+    // GEMM: M*N over the pinned 2^22 output bound refuses; a dim of 0
+    // and an out-of-profile dim refuse the same way.
+    kd = .{
+        .kernel_id = wire.kernel_gemm,
+        .d0 = 4096,
+        .d1 = 4096,
+        .d2 = 1, // M*N = 2^24 > 2^22
+        .bufs = .{ .{ .buf = @truncate(big), .byte_off = 0 }, .{ .buf = @truncate(big), .byte_off = 0 }, .{ .buf = @truncate(big), .byte_off = 0 }, .{} },
+    };
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+    kd.d0 = 0;
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+
+    // GEMM with an unknown flag bit is badKernelShape, not a bind error.
+    kd = .{ .kernel_id = wire.kernel_gemm, .flags = 4, .d0 = 1, .d1 = 1, .d2 = 1 };
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+
+    // DEQUANT: fmt 0 and a group size outside {32,64,128} refuse.
+    kd = .{ .kernel_id = wire.kernel_dequant, .d0 = 128, .d1 = 96, .aux = wire.dequant_fmt_i8_sym };
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+    kd.d1 = 64;
+    kd.aux = 0; // no such fmt
+    wire.encode_kernel_desc(&rd.kdesc, &kd);
+    try std.testing.expectError(error.Invalid, dispatch(&rd, owner));
+
+    try std.testing.expectEqual(submits_before, counters.submits); // nothing posted
+    try std.testing.expect(counters.refusals >= 7);
+}
+
 test "gpu3d_compute: sixteen buffers then Exhausted; stale buffer refuses RUN binds" {
     compute_setup();
     const owner: usize = 23;
@@ -1235,4 +1297,3 @@ test "gpu3d_compute: sixteen buffers then Exhausted; stale buffer refuses RUN bi
     try std.testing.expect(sent.bufs[0].buf != 0 and sent.bufs[0].buf != @as(u32, @truncate(reborn)));
     try std.testing.expectEqual(sess.ctx.ctx_id * 256 + 1, sent.bufs[0].buf);
 }
-

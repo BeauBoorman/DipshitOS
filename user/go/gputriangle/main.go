@@ -49,6 +49,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"virelai/gpu3d"
@@ -268,6 +269,24 @@ func errName(err error) string {
 		return "refused"
 	case errors.Is(err, errUsage):
 		return "usage"
+	case errors.Is(err, gpu3d.ErrComputeInvalid):
+		return "invalid"
+	case errors.Is(err, gpu3d.ErrComputeBadHandle):
+		return "bad-handle"
+	case errors.Is(err, gpu3d.ErrComputeExhausted):
+		return "exhausted"
+	case errors.Is(err, gpu3d.ErrComputeNoDevice):
+		return "unsupported"
+	case errors.Is(err, gpu3d.ErrComputeBusy):
+		return "busy"
+	case errors.Is(err, gpu3d.ErrComputeTimedOut):
+		return "timeout"
+	case errors.Is(err, gpu3d.ErrComputeLost):
+		return "lost-context"
+	case errors.Is(err, gpu3d.ErrComputeFault):
+		return "fault"
+	case errors.Is(err, gpu3d.ErrComputeDevice):
+		return "device-fault"
 	default:
 		return "error"
 	}
@@ -440,10 +459,14 @@ func (a *app) openWindow(w, h uint32) error {
 // writeReceipts publishes the TSV receipt last: a `published` surface row in
 // it is only ever written after the surface file landed.
 func (a *app) writeReceipts() error {
+	return a.writeReceiptsAs(receiptPath)
+}
+
+func (a *app) writeReceiptsAs(path string) error {
 	if err := a.h.MkdirShare(receiptDir); err != nil {
 		return err
 	}
-	if err := a.h.WriteShareFile(receiptPath, a.rec.body()); err != nil {
+	if err := a.h.WriteShareFile(path, a.rec.body()); err != nil {
 		return err
 	}
 	a.h.ConsoleLine("gputri: receipt " + receiptPath)
@@ -660,6 +683,146 @@ func (a *app) jForged() error {
 	return nil
 }
 
+// --- M111b compute journeys (issue #2409) -------------------------------------
+//
+// The compute legs touch no window, seat or WM_RPC: sys_gpucomp (slot 90)
+// is a direct process seam. `gemm` is the pinned submit→fence→readback
+// round trip; `gemmrefuse` proves a malformed descriptor gets the named
+// EINVAL-class refusal and the session survives to answer STATS.
+//
+// The pinned product: A=[[1,2],[3,4]] · B=[[5,6],[7,8]] = [[19,22],[43,50]],
+// exact in f16 — the gate asserts the four words on the console line and
+// the receipt row.
+
+// f16pack writes vals as little-endian IEEE binary16.
+func f16pack(vals ...float32) []byte {
+	out := make([]byte, 2*len(vals))
+	for i, v := range vals {
+		h := gpu3d.F16bits(v)
+		out[2*i] = byte(h)
+		out[2*i+1] = byte(h >> 8)
+	}
+	return out
+}
+
+func f16unpack(b []byte) [4]float32 {
+	var out [4]float32
+	for i := 0; i < 4 && 2*i+1 < len(b); i++ {
+		out[i] = gpu3d.F32bits(uint16(b[2*i]) | uint16(b[2*i+1])<<8)
+	}
+	return out
+}
+
+func (a *app) jGemm() error {
+	s, err := gpu3d.OpenCompute()
+	if errors.Is(err, gpu3d.ErrComputeNoDevice) {
+		return gpu3d.ErrUnsupported // the no-device leg's own answer
+	}
+	if err != nil {
+		a.rec.row("compute", "open", errName(err))
+		a.h.ConsoleLine("gputri: open " + err.Error())
+		return fmt.Errorf("open: %w", err)
+	}
+	defer s.Close()
+
+	// Three I/O buffers: A, B, C — each a 64-byte window holding 2×2 f16.
+	bufA, err := s.AllocBuffer(64, gpu3d.BufIO)
+	if err != nil {
+		a.rec.row("compute", "alloc-a", errName(err))
+		return fmt.Errorf("alloc-a: %w", err)
+	}
+	bufB, err := s.AllocBuffer(64, gpu3d.BufIO)
+	if err != nil {
+		a.rec.row("compute", "alloc-b", errName(err))
+		return fmt.Errorf("alloc-b: %w", err)
+	}
+	bufC, err := s.AllocBuffer(64, gpu3d.BufIO)
+	if err != nil {
+		a.rec.row("compute", "alloc-c", errName(err))
+		return fmt.Errorf("alloc-c: %w", err)
+	}
+	a.rec.row("compute", "alloc", is(64*3))
+
+	if err := s.Write(bufA, 0, f16pack(1, 2, 3, 4)); err != nil {
+		a.rec.row("compute", "write-a", errName(err))
+		return fmt.Errorf("write-a: %w", err)
+	}
+	if err := s.Write(bufB, 0, f16pack(5, 6, 7, 8)); err != nil {
+		a.rec.row("compute", "write-b", errName(err))
+		return fmt.Errorf("write-b: %w", err)
+	}
+	a.rec.row("compute", "uploaded")
+
+	kd := gpu3d.KernelDesc{
+		Kernel: vi.GpuKernelGEMM,
+		D0:     2, D1: 2, D2: 2, // M=N=K=2
+		Bufs: [4]gpu3d.KernelBuf{
+			{Buf: uint32(bufA)}, {Buf: uint32(bufB)}, {Buf: uint32(bufC)}, {},
+		},
+	}
+	if err := s.Run(kd); err != nil {
+		a.rec.row("compute", "run", errName(err))
+		return fmt.Errorf("run: %w", err)
+	}
+	a.rec.row("compute", "fence-ok")
+
+	c := make([]byte, 8)
+	if err := s.Read(bufC, 0, c); err != nil {
+		a.rec.row("compute", "read", errName(err))
+		return fmt.Errorf("read: %w", err)
+	}
+	got := f16unpack(c)
+	want := [4]float32{19, 22, 43, 50}
+	if got != want {
+		a.rec.row("compute", "readback", "mismatch")
+		return errors.New("gemm readback mismatch")
+	}
+	st, err := s.Stats()
+	if err != nil {
+		return err
+	}
+	a.rec.row("compute", "published", "c=19,22,43,50",
+		"submits="+is(int(st.Submits)), "completed="+is(int(st.Completed)))
+	a.h.ConsoleLine("gputri: gemm c=19,22,43,50 submits=" +
+		is(int(st.Submits)) + " completed=" + is(int(st.Completed)))
+	// Distinct receipt file: the refuse journey writes its own — the two
+	// execs are separate processes, one TSV cannot span them.
+	return a.writeReceiptsAs(receiptDir + "/RECEIPT-GEMM.TSV")
+}
+
+func (a *app) jGemmRefuse() error {
+	s, err := gpu3d.OpenCompute()
+	if errors.Is(err, gpu3d.ErrComputeNoDevice) {
+		return gpu3d.ErrUnsupported
+	}
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+
+	buf, err := s.AllocBuffer(64, gpu3d.BufIO)
+	if err != nil {
+		return err
+	}
+	// kernel_id 9 is outside the curated mask — the named EINVAL refusal.
+	kd := gpu3d.KernelDesc{Kernel: 9, D0: 2, D1: 2, D2: 2}
+	kd.Bufs = [4]gpu3d.KernelBuf{{Buf: uint32(buf)}, {}, {}, {}}
+	if err := s.Run(kd); !errors.Is(err, gpu3d.ErrComputeInvalid) {
+		return errors.New("unknown kernel not refused invalid")
+	}
+	a.rec.row("compute", "refused", "invalid")
+	a.h.ConsoleLine("gputri: refused invalid")
+
+	// The session is still alive — a refusal is not a poison.
+	st, err := s.Stats()
+	if err != nil {
+		return err
+	}
+	a.rec.row("compute", "stats", "refusals="+is(int(st.Refusals)))
+	a.h.ConsoleLine("gputri: stats refusals=" + is(int(st.Refusals)))
+	return a.writeReceiptsAs(receiptDir + "/RECEIPT-REFUSE.TSV")
+}
+
 var errUsage = errors.New("usage")
 
 func run(h host, journey string) error {
@@ -680,6 +843,10 @@ func run(h host, journey string) error {
 		err = a.jInvalid()
 	case "forged":
 		err = a.jForged()
+	case "gemm":
+		err = a.jGemm()
+	case "gemmrefuse":
+		err = a.jGemmRefuse()
 	default:
 		err = errUsage
 	}

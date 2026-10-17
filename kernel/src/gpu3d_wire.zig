@@ -287,6 +287,10 @@ pub const vic1_max_elems: u32 = 1 << 24;
 pub const vic1_softmax_max_cols: u32 = 49152;
 /// DEQUANT's group-count bound: groups = ceil(n / group_size) <= 2^19.
 pub const vic1_max_groups: u32 = 1 << 19;
+/// The pinned 2-D extent bound (ADR 0053 D3): GEMM's output M*N and
+/// SOFTMAX's rows*cols both stay <= 2^22 elements — 8 MiB of f16 / 16 MiB
+/// of f32, always inside one max-size buffer.
+pub const vic1_max_2d_elems: u32 = 1 << 22;
 
 /// Parse the VIC1 capset payload (resp bytes 24..56 — exactly eight u32
 /// words). Returns null on any other length: a different-size reply is a

@@ -68,6 +68,17 @@ public protocol GPU3DBackend: AnyObject {
     /// request's fence ID.
     func gpu3dSubmit(context ctxID: UInt32, stream: [UInt8]) -> GPU3DWorkResult
 
+    /// Reported in VIC1 word 7 (ready=0|1) — a backend attached without a
+    /// working compute pipeline advertises the capset but answers 0, so
+    /// the guest's compute ops take the honest ENXIO (M111, ADR 0053 D1).
+    var gpu3dComputeReady: Bool { get }
+
+    /// COMPUTE_SUBMIT (0x0400): one frozen 64-byte kernel descriptor,
+    /// already shape- and binding-validated by the device dispatcher.
+    /// Deferred completion is the same fence contract as gpu3dSubmit —
+    /// the held element returns when this request's fence is reported.
+    func gpu3dComputeSubmit(context ctxID: UInt32, desc: GPU3DWire.KernelDesc) -> GPU3DWorkResult
+
     /// Polling completion channel: fence IDs that finished since the last
     /// call. The device drains this at the top of every queue batch —
     /// the polling model of #2160 item 4, no long waits anywhere.
@@ -84,6 +95,12 @@ public extension GPU3DBackend {
     func gpu3dDetachBacking(context ctxID: UInt32, resourceID: UInt32) -> GPU3DBackendFailure? { nil }
     func gpu3dAttachResource(context ctxID: UInt32, resourceID: UInt32) -> GPU3DBackendFailure? { nil }
     func gpu3dDetachResource(context ctxID: UInt32, resourceID: UInt32) -> GPU3DBackendFailure? { nil }
+    /// Default: no compute — the VIC1 payload reports ready=0 and every
+    /// COMPUTE_SUBMIT declines. The Metal backend overrides both.
+    var gpu3dComputeReady: Bool { false }
+    func gpu3dComputeSubmit(context ctxID: UInt32, desc: GPU3DWire.KernelDesc) -> GPU3DWorkResult {
+        .failed(.refused)
+    }
     func gpu3dPoll() -> [UInt64] { [] }
 }
 
@@ -114,6 +131,10 @@ public final class GPU3DTestBackend: GPU3DBackend {
     public init() {}
 
     public var gpu3dReady: Bool { ready }
+    /// VIC1's ready word — off by default so an existing test backend
+    /// keeps advertising a render-only profile unless the test opts in.
+    public var computeReady = false
+    public var gpu3dComputeReady: Bool { computeReady }
 
     private func fail() -> GPU3DBackendFailure? {
         defer { nextFailure = nil }
@@ -172,6 +193,12 @@ public final class GPU3DTestBackend: GPU3DBackend {
 
     public func gpu3dSubmit(context ctxID: UInt32, stream: [UInt8]) -> GPU3DWorkResult {
         calls.append("submit:\(ctxID):\(stream.count)")
+        if let f = nextFailure { nextFailure = nil; return .failed(f) }
+        return deferWork ? .deferred : .done
+    }
+
+    public func gpu3dComputeSubmit(context ctxID: UInt32, desc: GPU3DWire.KernelDesc) -> GPU3DWorkResult {
+        calls.append("compute:\(ctxID):\(desc.kernelID)")
         if let f = nextFailure { nextFailure = nil; return .failed(f) }
         return deferWork ? .deferred : .done
     }

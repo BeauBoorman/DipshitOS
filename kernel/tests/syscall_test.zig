@@ -156,7 +156,7 @@ test "syscall: M94 trace and profile control and remaining observability stub ar
 
 test "syscall: ABI metadata covers every registered row without pointers" {
     const abi = syscall.abi;
-    try std.testing.expectEqual(@as(usize, 89), abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 91), abi.slots.len);
     for (&abi.slots, 0..) |slot, index| {
         try std.testing.expectEqual(index, slot.number);
         try std.testing.expectEqualStrings(slot.name(), entry_info(index).?.name);
@@ -178,7 +178,7 @@ test "syscall: ABI metadata covers every registered row without pointers" {
             try std.testing.expect(earlier.number != item.number or earlier.selector != item.selector or earlier.op != item.op);
         }
     }
-    try std.testing.expect(abi.lookup(89) == null); // first free slot after #2398's sys_scanout_read (88)
+    try std.testing.expect(abi.lookup(91) == null); // first free slot after #2409's sys_gpucomp (90); 89 stays ADR 0054's reservation
     try std.testing.expectEqual(abi.ArgKind.string, abi.shape(79, .{ 0, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.fd, abi.shape(80, .{ 2, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.int, abi.shape(27, .{ 0, 0, 0, 0x8000000000000002, 0, 0 }).?.args[0].kind);
@@ -214,7 +214,7 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
             implemented += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 89), implemented);
+    try std.testing.expectEqual(@as(usize, 91), implemented);
     try std.testing.expectEqualStrings("sys_socket", entry_info(80).?.name);
     try std.testing.expectEqualStrings("sys_fs_metadata", entry_info(79).?.name);
     try std.testing.expectEqualStrings("sys_pipe_read", entry_info(sys_pipe_read).?.name);
@@ -289,6 +289,14 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
     try std.testing.expectEqualStrings("sys_futex", entry_info(sys_futex).?.name);
     // Issue #1228 (phase 0c): slot 75 is the EL0 fault-handler register.
     try std.testing.expectEqualStrings("sys_exnotify", entry_info(sys_exnotify).?.name);
+    // #2398 (ADR 0052): slot 88 is the bounded scanout read.
+    try std.testing.expectEqualStrings("sys_scanout_read", entry_info(syscall.sys_scanout_read).?.name);
+    // ADR 0054's reservation (M113c #2419): slot 89 stays a named ENOSYS
+    // stub — scanout_read took 88 first, so the grant rows renumber when
+    // that card lands; this row only keeps the table dense and honest.
+    try std.testing.expectEqualStrings("sys_grant_admin", entry_info(89).?.name);
+    // M111b (#2409, ADR 0053 D5): slot 90 is the GPU3D compute seam.
+    try std.testing.expectEqualStrings("sys_gpucomp", entry_info(syscall.sys_gpucomp).?.name);
 }
 
 test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
@@ -301,15 +309,16 @@ test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
     try std.testing.expectEqual(@as(u64, 41), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(u64, 1), call_count(sys_ping));
 
-    // Unregistered in-range slots still return ENOSYS. M94 reserves
-    // 81–83; M99i (#2187) takes 84–86 for the owned UDP seam; #2158
-    // takes 87 for sys_getpid; #2398 takes 88 for sys_scanout_read.
+    // In-range slots outside the implemented set still return ENOSYS:
+    // 89 is the registered ADR-0054 reservation row (an ENOSYS stub until
+    // #2419 lands the grant table), 91 is the first truly free slot —
+    // the two refusal paths are identical for callers.
     try std.testing.expect(exceptions.frame_write(&frame, 8, 89));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(u64, 1), call_count(89));
 
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 89));
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 91));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
 }
@@ -1397,7 +1406,7 @@ test "syscall: counters are monotonic and report is deterministic" {
     var con = mock.console();
     report(&con);
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=89\n" ++
+        "syscalls: slots=64 implemented=90\n" ++
             "  0 sys_ping calls=2\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1486,7 +1495,10 @@ test "syscall: counters are monotonic and report is deterministic" {
             "  85 sys_udp_recv_from calls=0\n" ++
             "  86 sys_udp_close calls=0\n" ++
             "  87 sys_getpid calls=0\n" ++
-            "  88 sys_scanout_read calls=0\n",
+            "  88 sys_scanout_read calls=0\n" ++
+            // Slot 89 (the ADR-0054 reservation) is reportable=false —
+            // a stub row must not read as a live syscall; 90 is real.
+            "  90 sys_gpucomp calls=0\n",
         mock.contents(),
     );
 }
@@ -2877,7 +2889,7 @@ test "syscall: slot-65 cmd 22 GPU3D — typed descriptor boundary on the existin
 
     // Slot count/table unchanged: cmd 22 is the only new kernel entry,
     // and it rides slot 65 — the dispatch table itself did not grow.
-    try std.testing.expectEqual(@as(usize, 89), syscall.abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 91), syscall.abi.slots.len);
     gpu3d_device.reset_state();
 }
 
@@ -5881,8 +5893,9 @@ test "syscall: SYS_TIME (slot 66, #1058) returns the firmware wall-clock epoch" 
     // TS5 slot 70 (sys_secret_get), TS4 slot 71 (sys_tty_net_auth);
     // M51 SSH-P1 (#1166) slot 72 (sys_getrandom); issue #1228 slot 75;
     // issue #1163 phase 2 slot 76 (sys_sock_ready); #2158 slot 87;
-    // #2398 slot 88 (sys_scanout_read).
-    try std.testing.expectEqual(@as(usize, 89), syscall.implemented_count);
+    // #2398 slot 88 (sys_scanout_read); M111b #2409 slots 89 (the ADR-0054
+    // reservation row) + 90 (sys_gpucomp).
+    try std.testing.expectEqual(@as(usize, 91), syscall.implemented_count);
 
     const saved_epoch = timer.boot_epoch_secs;
     const saved_ticks = timer.ticks;
@@ -6059,6 +6072,62 @@ test "syscall: sys_scanout_read (slot 88, #2398) copies a bounded scanout rect a
     try std.testing.expectEqual(error_result(.efault), dispatch(sys_scanout_read, .{ 16, 16, 8, 8, uaccess.diagnostic_unmapped, 256 }, &frame));
 }
 
+test "syscall: sys_gpucomp (slot 90, #2409) — descriptor boundary before the broker" {
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = a user process
+    scheduler.start();
+    var frame = fresh_frame();
+    const gpucomp = syscall.sys_gpucomp;
+    const compute = syscall.gpu3d_compute;
+
+    // An EL1h caller (the shell) is not a process: EINVAL — there is no
+    // pid to key a session to.
+    try std.testing.expectEqual(error_result(.einval), dispatch(gpucomp, .{ 1, 0, 0, 0, 0, compute.desc_len }, &frame));
+    try std.testing.expect(scheduler.yield_current());
+    try std.testing.expectEqual(@as(usize, 2), scheduler.current_id());
+
+    syscall.gpu3d_device.reset_state();
+    compute.reset_state();
+    defer {
+        compute.reset_state();
+        syscall.gpu3d_device.reset_state();
+    }
+
+    var desc: compute.Desc = .{ .op = compute.op_stats, .arg_a = 0x1000 };
+    const desc_ptr = @intFromPtr(&desc);
+    var block: compute.Stats = .{};
+    const block_ptr = @intFromPtr(&block);
+    set_user_regions(
+        .{ .base = desc_ptr, .len = compute.desc_len },
+        .{ .base = block_ptr, .len = @sizeOf(compute.Stats) },
+    );
+
+    // len must be the frozen 128 — anything else is EINVAL with no copy.
+    try std.testing.expectEqual(error_result(.einval), dispatch(gpucomp, .{ compute.op_stats, 0, 0, 0, desc_ptr, 64 }, &frame));
+    // a0..a2 are reserved-zero.
+    try std.testing.expectEqual(error_result(.einval), dispatch(gpucomp, .{ compute.op_stats, 1, 0, 0, desc_ptr, compute.desc_len }, &frame));
+    // The syscall's op arg must equal the descriptor's own op field.
+    try std.testing.expectEqual(error_result(.einval), dispatch(gpucomp, .{ compute.op_open, 0, 0, 0, desc_ptr, compute.desc_len }, &frame));
+    // An unreadable descriptor is EFAULT before any broker work.
+    try std.testing.expectEqual(error_result(.efault), dispatch(gpucomp, .{ compute.op_stats, 0, 0, 0, uaccess.diagnostic_unmapped, compute.desc_len }, &frame));
+
+    // STATS needs no handle and answers to any process — the device-free
+    // leg copies the zeroed 64-byte block out.
+    desc = .{ .op = compute.op_stats, .arg_a = block_ptr };
+    try std.testing.expectEqual(@as(u64, 0), dispatch(gpucomp, .{ compute.op_stats, 0, 0, 0, desc_ptr, compute.desc_len }, &frame));
+    try std.testing.expectEqual(@as(u32, 0), block.sessions_live);
+
+    // OPEN with no GPU3D device answers ENXIO, and every refusal above
+    // moved `refusals` — never `submits`.
+    desc = .{ .op = compute.op_open };
+    try std.testing.expectEqual(error_result(.enxio), dispatch(gpucomp, .{ compute.op_open, 0, 0, 0, desc_ptr, compute.desc_len }, &frame));
+    try std.testing.expect(compute.counters.refusals > 0);
+    try std.testing.expectEqual(@as(u64, 0), compute.counters.submits);
+}
+
 // ---------------------------------------------------------------------------
 // M50 TS3 (issue #1137, ADR 0024 D5/D10): the capability gate table + kill gate
 // ---------------------------------------------------------------------------
@@ -6102,13 +6171,14 @@ test "syscall: M50 TS3 gate table is explicit, bounded, and exactly the ADR 0024
         try std.testing.expectEqual(@as(?u32, null), syscall.gated(number));
     }
     // Every gated row names an EXISTING implemented slot, and TS3 adds NO
-    // slot: implemented_count is 79 after M83b's slot 78 (issue #1228's 75,
-    // ADR 0027's 73/74, issue #1163 phase 2's 76 and M66a's 77 came earlier).
+    // slot: implemented_count is 91 after M111b's slots 89/90 (#2409 —
+    // issue #1228's 75, ADR 0027's 73/74, issue #1163 phase 2's 76, M66a's
+    // 77, #2158's 87 and #2398's 88 came earlier).
     for (syscall.capability_gates) |gate| {
         try std.testing.expect(gate.number < syscall.implemented_count);
         try std.testing.expect(entry_info(gate.number) != null);
     }
-    try std.testing.expectEqual(@as(usize, 89), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 91), syscall.implemented_count);
 }
 
 test "syscall: no slot can raise uid/caps (TS3 consumes caps, adds no setter)" {
