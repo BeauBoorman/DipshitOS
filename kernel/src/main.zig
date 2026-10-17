@@ -29,6 +29,7 @@ const terminal = @import("terminal.zig"); // #1072 (ADR 0020): the terminal seam
 const settings = @import("settings.zig"); // milestone eight card U8 (claim 2649): persistent settings on DATA partition
 const file_table = @import("file_table.zig"); // M50 TS2 (#1136): OWNERS.TXT load at boot
 const secret = @import("secret.zig"); // M50 TS5 (#1139): SECRETS.TXT store load at the queue-5 arming point
+const grant = @import("grant.zig"); // M113c (#2419): GRANTS.TXT grant table load at the same arming point
 // Milestone four (claim 2665): virtio entropy driver + ChaCha20 CSPRNG.
 // The entropy device (DID 0x1044) seeds the CSPRNG post-MMU; `random` and
 // the exec-path ASLR consumer live off that seed.
@@ -2166,6 +2167,15 @@ fn custom_virtio_spike() void {
         // read at boot on a default share, and no boot line is emitted
         // (boot-default-unchanged).
         _ = secret.init_from_share();
+        // M113c (#2419, ADR 0054 Part II): the grant table loads at the
+        // SAME arming point, after OWNERS.TXT. `init_from_share`
+        // registers `GRANTS.TXT` as secret-class BY CONSTRUCTION before
+        // reading a byte — a file ABI call can never read or modify it —
+        // then parses `#v1` fail-closed (a malformed row poisons its
+        // name; a non-`#v1` schema poisons every name it lists). An
+        // absent file leaves an empty table and the audit posture —
+        // no boot line, boot-default unchanged.
+        _ = grant.init_from_share();
     } else {
         uart_puts("vf: queue 5 absent (no host file channel)\n");
     }
