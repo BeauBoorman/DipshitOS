@@ -48,6 +48,17 @@
 # instantaneous flags: a synchronous RUN leaves both at zero once its fence
 # completes, so the assert pins the ledger, not the flags.
 #
+# Run 07 (issue #2421, M113e) is the trust tab leg: a confined app and a
+# granted app run under real GRANTS.TXT rows first (CONFINE.BIN's socket
+# path receipts the kernel's own audit:net_denied while still connecting —
+# audit mode records, does not refuse), then GOTOP opens through the
+# monitor's admin spawn (`exec -u0`, the CAP_PROC_ADMIN half of the slot-89
+# gate) and `t` renders per-app posture: uid, declared-vs-granted words,
+# the measured sha256 against the row's pin, the ADR 0055-derived
+# publisher fingerprint, and the published RCPT.TXT receipts. The kernel's
+# own denial receipts on the same serial log cross-prove the rendered
+# denied-word sets are real.
+#
 # The old-row decode leg is pinned on the host, not here: a v2 kernel always
 # answers a tagged request with v2 rows, so "v1 stream decodes correctly"
 # is `go test ./vi ./top` (TestProcsV2OldKernel, TestUsageGoneOnV1) plus the
@@ -59,7 +70,7 @@
 #   bash tools/go/build-pulse.sh                    -> .build/go/PULSE.ELF
 #   bash tools/go/build-gputriangle.sh              -> .build/go/GPUTRIANGLE.ELF
 
-vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg; #2411: `c` gpu tab over real slot-90 counters"
+vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg; #2411: `c` gpu tab over real slot-90 counters; #2421: `t` trust tab — real grant posture + receipts"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -174,6 +185,50 @@ if not os.path.exists(trsrc):
              "bash tools/go/build-gputriangle.sh")
 shutil.copy(trsrc, os.path.join(share, "GPUTRIANGLE.ELF"))
 print("staged GPUTRIANGLE.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GPUTRIANGLE.ELF")))
+# M113e run 07 (issue #2421): the trust tab leg. CONFINE.BIN/GRANTD.BIN
+# are byte-identical TCP.BIN copies (live-trust-grants' controlled
+# variable — rows key the recorded name): CONFINE rides a confined
+# wildcard row (file only, so its socket path receipts audit:net_denied
+# while still connecting — audit records, does not refuse), GRANTD a
+# HASH-BOUND row pinned to the bytes staged here. STORE.TXT carries
+# GRANTD's signed ReleaseCaps declaration and stream name; the FLINT
+# stream replica under FLINT/streams/ is what ADR 0055 D5 derives the
+# publisher fingerprint from (the head change's author key). The OWNERS
+# rows split the two images' recorded owner uid (GRANTD operator-
+# provisioned uid_system, CONFINE the uid_user default). No other leg's
+# exec name is rowed, so GRANTS.TXT leaves their posture at baseline.
+tcp = os.path.join(share, "TCP.BIN")
+if not os.path.exists(tcp):
+    sys.exit("TCP.BIN missing from the seeded share - zig build first")
+for dst in ("CONFINE.BIN", "GRANTD.BIN"):
+    shutil.copyfile(tcp, os.path.join(share, dst))
+grantd_sha = _hashlib.sha256(
+    open(os.path.join(share, "GRANTD.BIN"), "rb").read()).hexdigest()
+open(os.path.join(share, "GRANTS.TXT"), "w").write(
+    "#v1\n"
+    "CONFINE.BIN\t*\tfile\n"
+    "GRANTD.BIN\t" + grantd_sha + "\tfile,net\n")
+with open(os.path.join(share, "OWNERS.TXT"), "a") as f:
+    f.write("GRANTD.BIN\t644\t0\t-\n")
+TRUST_STREAM = "0199de2d-dc00-7000-8000-00000000f020"
+TRUST_HEAD = "0199de2d-dc00-7000-8000-00000000f021"
+TRUST_PUB = "0123abcd" * 8
+tdir = os.path.join(share, "FLINT", "streams")
+os.makedirs(tdir, exist_ok=True)
+open(os.path.join(tdir, TRUST_STREAM + ".json"), "w").write(
+    '{"id":"%s","name":"trustrel","head":"%s","created":1760000000000,'
+    '"forked_from":null}\n' % (TRUST_STREAM, TRUST_HEAD))
+open(os.path.join(tdir, TRUST_STREAM + ".jsonl"), "w").write(
+    '{"id":"%s","parent":null,"stream":"%s","ts":1760000000000,'
+    '"author":"%s","message":"release","ops":[],"merged":null,'
+    '"sig":"%s"}\n' % (TRUST_HEAD, TRUST_STREAM, TRUST_PUB, "00" * 64))
+open(os.path.join(share, "STORE.TXT"), "w").write(
+    "#v1\n"
+    "name=GRANTD.BIN stream=trustrel head=" + TRUST_HEAD +
+    " sha256=" + grantd_sha +
+    " caps=file,net prev_head=- prev_sha256=- prev_caps=- prev_row=-\n")
+print("staged trust fixtures: confined+hash-bound rows, store entry, "
+      "stream replica (grantd sha256=%s)" % grantd_sha)
 PY
 
 vgate_run 01 -- \
@@ -523,4 +578,139 @@ if lastus < 1 or totalus < 1:
     sys.exit("FAIL: no kernel time recorded: %r" % marks[-1])
 print("gotop gpu ok: submits=%d completed=%d lastus=%d busy=%d queued=%d"
       % (submits, completed, lastus, busy, queued))
+PY
+
+
+# --- Run 07 (M113e #2421): the trust tab renders real posture -----------------
+#
+# script7a arms the echo peer and runs both fixture apps under their
+# GRANTS.TXT rows: CONFINE.BIN (wildcard `file`) receipts audit:net_denied
+# on its socket path AND still connects — audit records the would-be
+# denial, it does not refuse — while GRANTD.BIN (hash-bound `file,net`)
+# connects clean and receipts only audit:debug_denied. script7b then opens
+# GOTOP through the monitor's ADMIN spawn (`exec -u0` — uid_system +
+# kernel_caps, the CAP_PROC_ADMIN half of the slot-89 gate) so the grant
+# table is actually served to the view; `t` switches to the trust tab.
+#
+# The markers are the view's own evidence: per app, the OWNERS.TXT uid,
+# the declared-vs-granted word split (STORE.TXT ReleaseCaps vs the live
+# grant row), the viewer-measured sha256 against the row's pin, and the
+# publisher fingerprint derived off the FLINT stream replica — plus the
+# kernel's RCPT.TXT receipts verbatim. The kernel's own serial receipts
+# (`audit:*_denied name=...`) are the cross-proof that the rendered
+# denied-word set is the real posture. The run ends on the last receipt
+# marker — all of it program output (assert-proven).
+vgate_file script7a.txt <<'EOS'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec CONFINE.BIN
+exec GRANTD.BIN
+EOS
+
+vgate_file script7b.txt <<'EOS'
+exec -u0 GOTOP.ELF
+EOS
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen' \
+    --net '$RUN_DIR/cap7.bin' \
+    --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:9999 \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script7a.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --script3 '$RUN_DIR/script7b.txt' \
+    --script3-after 'procs GRANTD.BIN exited status=18' \
+    --input-string 't' \
+    --input-string-after 'top: ready' \
+    --script-expect 'top: trust rcpt RCPT stage=kernel' --timeout 180
+
+vgate_assert 07 serial-contains 'exec: loaded CONFINE.BIN'
+vgate_assert 07 serial-contains 'exec: loaded GRANTD.BIN'
+vgate_assert 07 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 07 serial-contains 'top: ready'
+vgate_assert 07 serial-contains 'top: tab=trust'
+vgate_assert 07 serial-contains 'top: trust n='
+vgate_assert 07 serial-contains 'top: trust app name=CONFINE.BIN'
+vgate_assert 07 serial-contains 'top: trust app name=GRANTD.BIN'
+vgate_assert 07 serial-contains 'top: trust rcpt RCPT stage=kernel'
+vgate_assert 07 serial-absent 'top: trust table=err='
+vgate_assert 07 serial-absent '[EXC] parking:'
+
+# The confined app's rendered posture vs the kernel's own receipts: GOTOP
+# shows granted=file and a denied set carrying net — and the kernel
+# DID receipt audit:net_denied for that same app on the same boot. The
+# granted app: hash-bound pin matches GOTOP's own measurement of the
+# staged bytes (verdict=match), declared==granted (file,net), and the
+# publisher fingerprint is the staged replica's head-change author.
+vgate_assert 07 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = ser.splitlines()
+
+apps = {}
+for l in lines:
+    m = re.match(r"top: trust app name=(\S+) uid=(\S+) declared=(\S+)"
+                 r" granted=(\S+) denied=(\S+) state=(\S+)", l.strip())
+    if m:
+        apps[m.group(1)] = m.groups()
+
+for want in ("CONFINE.BIN", "GRANTD.BIN"):
+    if want not in apps:
+        sys.exit("FAIL: no trust row for %s (saw %s)" % (want, sorted(apps)))
+
+co = apps["CONFINE.BIN"]
+if co[1] != "1000":
+    sys.exit("FAIL: CONFINE.BIN uid=%s want the uid_user default 1000" % co[1])
+if co[3] != "file":
+    sys.exit("FAIL: CONFINE.BIN granted=%s want file" % co[3])
+if "net" not in co[4].split(","):
+    sys.exit("FAIL: CONFINE.BIN denied=%s does not carry net" % co[4])
+
+gr = apps["GRANTD.BIN"]
+if gr[1] != "0":
+    sys.exit("FAIL: GRANTD.BIN uid=%s want the OWNERS uid_system row" % gr[1])
+if gr[2] != "file,net" or gr[3] != "file,net":
+    sys.exit("FAIL: GRANTD.BIN declared/granted = %s/%s want file,net/file,net"
+             % (gr[2], gr[3]))
+
+# The measured digest against the row's pin — GOTOP's own sha256 of the
+# staged file must equal the host-side pin the setup wrote into GRANTS.TXT.
+shas = {}
+for l in lines:
+    m = re.match(r"top: trust sha name=(\S+) measured=(\S+) pin=(\S+)"
+                 r" verdict=(\S+)", l.strip())
+    if m:
+        shas[m.group(1)] = m.groups()
+g = shas.get("GRANTD.BIN")
+if not g or g[3] != "match" or g[2] != g[1]:
+    sys.exit("FAIL: GRANTD.BIN sha marker = %r" % (g,))
+c = shas.get("CONFINE.BIN")
+if not c or c[3] != "wild":
+    sys.exit("FAIL: CONFINE.BIN sha marker = %r" % (c,))
+
+pubs = {}
+for l in lines:
+    m = re.match(r"top: trust pub name=(\S+) stream=(\S+) publisher=(\S+)",
+                 l.strip())
+    if m:
+        pubs[m.group(1)] = m.groups()
+p = pubs.get("GRANTD.BIN")
+if not p or p[1] != "trustrel" or p[2] != "0123abcd" * 8:
+    sys.exit("FAIL: GRANTD.BIN publisher = %r (want the staged head "
+             "author)" % (p,))
+if pubs.get("CONFINE.BIN", (None, None, "x"))[2] != "-":
+    sys.exit("FAIL: untracked CONFINE.BIN shows a publisher: %r"
+             % (pubs.get("CONFINE.BIN"),))
+
+# Cross-proof: the kernel's own denial receipts for the same apps on the
+# same boot — the rendered denied= set names what the kernel receipted.
+if "audit:net_denied name=CONFINE.BIN" not in ser:
+    sys.exit("FAIL: kernel never receipted CONFINE.BIN's net denial")
+if "audit:debug_denied name=GRANTD.BIN" not in ser:
+    sys.exit("FAIL: kernel never receipted GRANTD.BIN's debug denial")
+if "name=GRANTD.BIN word=net" in ser:
+    sys.exit("FAIL: GRANTD.BIN's granted word receipted a denial")
+print("gotop trust ok: confined granted=file denied(+net), "
+      "granted pin=match pub derived, kernel receipts agree")
 PY
