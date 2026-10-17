@@ -153,6 +153,11 @@ pub const slots = [_]Slot{
     row(86, "sys_udp_close", .{.int}),
     row(87, "sys_getpid", .{}),
     row(88, "sys_scanout_read", .{ .int, .int, .int, .int, .ptr, .int }),
+    // The ADR 0054 (M113c #2419) reservation — scanout_read took its
+    // first pick (88); 89 stays reserved and answers ENOSYS until the
+    // grant-admin card defines it.
+    row(89, "sys_grant_admin", .{}),
+    row(90, "sys_gpucomp", .{ .int, .int, .int, .int, .ptr, .int }),
 };
 
 // op-dependent shapes override the base row. No pointed-to output or binary

@@ -139,13 +139,61 @@ public enum GPU3DWire {
     public static let unrefLen = 28
     /// virtio-gpu device-specific config space: events_read, events_clear,
     /// num_scanouts, num_capsets — four LE u32. This device has no scanout
-    /// (the 2D compositor owns pixels) and exactly one cap-set.
-    public static let deviceConfigBytes: [UInt8] = [
-        0, 0, 0, 0, // events_read
-        0, 0, 0, 0, // events_clear
-        0, 0, 0, 0, // num_scanouts = 0 (render-only device)
-        1, 0, 0, 0, // num_capsets  = 1 (the VIR1 private profile)
-    ]
+    /// (the 2D compositor owns pixels); num_capsets is 1 with no compute
+    /// backend attached and 2 when the device carries one (M111, ADR 0053
+    /// D1 — the guest probes index 1 for VIC1 and refuses compute on a
+    /// single-capset device).
+    public static let deviceConfigBytes: [UInt8] = deviceConfigBytes(numCapsets: 1)
+
+    public static func deviceConfigBytes(numCapsets: UInt32) -> [UInt8] {
+        [
+            0, 0, 0, 0, // events_read
+            0, 0, 0, 0, // events_clear
+            0, 0, 0, 0, // num_scanouts = 0 (render-only device)
+            UInt8(numCapsets & 0xff), 0, 0, 0, // num_capsets
+        ]
+    }
+
+    // ---- The VIC1 compute capset (M111, ADR 0053 D1) -------------------------
+    /// GET_CAPSET_INFO index 1 reports the compute profile; "VIC1" packed
+    /// the VIR1 way (u32 0x56494331, wire bytes 31 43 49 56).
+    public static let capsetVIC1: UInt32 = 0x5649_4331
+    public static let vic1Index: UInt32 = 1
+    public static let vic1Version: UInt32 = 1
+    public static let vic1PayloadSize: UInt32 = 32
+    // The pinned VIC1 bound words (ADR 0053 D1).
+    public static let vic1MaxBuffersPerCtx: UInt32 = 16
+    public static let vic1MaxBufferBytes: UInt32 = 16 * 1024 * 1024
+    public static let vic1KernelsMask: UInt32 = 7 // bit0 GEMM, bit1 SOFTMAX, bit2 DEQUANT
+    public static let vic1MaxDim: UInt32 = 4096
+    public static let vic1MaxElems: UInt32 = 1 << 24
+    /// SOFTMAX's wider column bound (the tiny-model vocab head, D3).
+    public static let vic1SoftmaxMaxCols: UInt32 = 49152
+    /// DEQUANT's group-count bound: groups = ceil(n / group_size) ≤ 2^19.
+    public static let vic1MaxGroups: UInt32 = 1 << 19
+
+    /// The VIC1 capset payload: eight LE u32 words; `ready` reports whether
+    /// a compute-capable backend is attached.
+    public static func vic1CapsetPayload(ready: Bool) -> [UInt8] {
+        var out = [UInt8]()
+        out.reserveCapacity(Int(vic1PayloadSize))
+        for word in [vic1Version, vic1MaxBuffersPerCtx, vic1MaxBufferBytes,
+                     vic1KernelsMask, vic1MaxDim, vic1MaxElems, 0,
+                     ready ? 1 : 0] {
+            pushU32(word, into: &out)
+        }
+        return out
+    }
+
+    /// GET_CAPSET_INFO payload for either capset index.
+    public static func capsetInfoPayload(capsetID: UInt32, version: UInt32, size: UInt32) -> [UInt8] {
+        var out = [UInt8]()
+        pushU32(capsetID, into: &out)
+        pushU32(version, into: &out)
+        pushU32(size, into: &out)
+        pushU32(0, into: &out)
+        return out
+    }
 
     // ---- Command types (virtio-gpu numbering) ------------------------------
     public static let cmdGetCapsetInfo: UInt32 = 0x0108
@@ -161,6 +209,54 @@ public enum GPU3DWire {
     public static let cmdResourceUnref: UInt32 = 0x0102
     public static let cmdResourceAttachBacking: UInt32 = 0x0106
     public static let cmdResourceDetachBacking: UInt32 = 0x0107
+    /// The one private compute command (M111, ADR 0053 D2): 0x0400 sits
+    /// outside the standard virtio-gpu range (0x0100–0x0301) and outside
+    /// `unsupportedTypes` — a stock device calls it unknownCommand, this
+    /// one validates and runs it. The request is hdr + the 64-byte
+    /// frozen kernel descriptor = 88 bytes.
+    public static let cmdComputeSubmit: UInt32 = 0x0400
+    public static let computeSubmitLen = hdrLen + kernelDescLen
+    public static let kernelDescLen = 64
+
+    // ---- The frozen 64-byte kernel descriptor (ADR 0053 D3) ------------------
+    //   off  size  field
+    //   0    4     kernel_id   1 GEMM, 2 SOFTMAX, 3 DEQUANT
+    //   4    4     flags       per-kernel bits; undefined bits must be 0
+    //   8    4     d0          dim 0 (GEMM M / SOFTMAX rows / DEQUANT n)
+    //   12   4     d1          dim 1 (GEMM N / SOFTMAX cols / DEQUANT group_size)
+    //   16   4     d2          dim 2 (GEMM K / else 0)
+    //   20   4     aux         DEQUANT fmt in byte 0; else 0
+    //   24   32    bufs[4]     {u32 res_id, u32 byte_off} — resource ids on
+    //                          the wire (the guest broker translated its
+    //                          handles already); slot 3 absent = {0,0}
+    //   56   8     reserved    always 0
+    public struct KernelDesc: Equatable {
+        public var kernelID: UInt32 = 0
+        public var flags: UInt32 = 0
+        public var d0: UInt32 = 0
+        public var d1: UInt32 = 0
+        public var d2: UInt32 = 0
+        public var aux: UInt32 = 0
+        public var bufs: [(buf: UInt32, byteOff: UInt32)] =
+            [(0, 0), (0, 0), (0, 0), (0, 0)]
+        public var reserved: UInt64 = 0
+
+        public init() {}
+    }
+
+    public static let kernelGEMM: UInt32 = 1
+    public static let kernelSoftmax: UInt32 = 2
+    public static let kernelDequant: UInt32 = 3
+    /// GEMM flag bits.
+    public static let gemmFlagBias: UInt32 = 1
+    public static let gemmFlagBTransposed: UInt32 = 2
+    /// SOFTMAX flag bit 0: the caller declared in == out.
+    public static let softmaxFlagInPlace: UInt32 = 1
+    /// DEQUANT `aux` byte 0: i8 symmetric (scales only) or u4 asymmetric
+    /// (scales + zeros).
+    public static let dequantFmtI8Sym: UInt32 = 1
+    public static let dequantFmtU4Asym: UInt32 = 2
+    public static let dequantGroupSizes: Set<UInt32> = [32, 64, 128]
 
     /// virtio-gpu commands that exist but sit outside this private
     /// profile — 2D scanout/resource, cursor, EDID, UUID and blob paths
@@ -403,6 +499,10 @@ public enum GPU3DWire {
         case transferToHost3D(Transfer)
         case transferFromHost3D(Transfer)
         case submit3D(stream: [UInt8])
+        /// The one compute command: hdr + the verbatim 64-byte kernel
+        /// descriptor (semantic validation is the dispatcher's job — the
+        /// same split the kernel broker uses).
+        case computeSubmit(KernelDesc)
     }
 
     /// A decoded request: the (already validated) header plus command.
@@ -493,12 +593,24 @@ public enum GPU3DWire {
             guard padWord(68) else { return .failure(.reservedBits) }
             guard resourceID != 0 else { return .failure(.invalidResource) }
             // The profile's pinned bounds: 1..256 × 1..192, one plane,
-            // single sample, no mip tail, no create flags.
-            guard width >= 1, width <= maxWidth,
-                  height >= 1, height <= maxHeight,
-                  depth <= 1, arraySize <= 1, lastLevel <= 1,
-                  nrSamples <= 1, flags == 0 else {
-                return .failure(.invalidParameter)
+            // single sample, no mip tail, no create flags. M111 (ADR 0053
+            // D4): a target_buffer resource is a 1-D byte range — its
+            // "width" is the byte size bounded by VIC1's 16 MiB, its
+            // height is pinned at 1.
+            if target == 0 {
+                guard width >= 1, width <= vic1MaxBufferBytes,
+                      height == 1,
+                      depth <= 1, arraySize <= 1, lastLevel <= 1,
+                      nrSamples <= 1, flags == 0 else {
+                    return .failure(.invalidParameter)
+                }
+            } else {
+                guard width >= 1, width <= maxWidth,
+                      height >= 1, height <= maxHeight,
+                      depth <= 1, arraySize <= 1, lastLevel <= 1,
+                      nrSamples <= 1, flags == 0 else {
+                    return .failure(.invalidParameter)
+                }
             }
             cmd = .resourceCreate3D(ResourceCreate(
                 resourceID: resourceID, target: target, format: format,
@@ -559,6 +671,30 @@ public enum GPU3DWire {
                              layerStride: layerStride)
             cmd = hdr.type == cmdTransferToHost3D
                 ? .transferToHost3D(t) : .transferFromHost3D(t)
+
+        case cmdComputeSubmit:
+            if case .failure(let f) = fixed(computeSubmitLen) { return .failure(f) }
+            var kd = KernelDesc()
+            guard let kID = r.u32(), let kflags = r.u32(),
+                  let d0 = r.u32(), let d1 = r.u32(), let d2 = r.u32(),
+                  let aux = r.u32() else {
+                return .failure(.truncatedRequest)
+            }
+            for i in 0..<4 {
+                guard let buf = r.u32(), let off = r.u32() else {
+                    return .failure(.truncatedRequest)
+                }
+                kd.bufs[i] = (buf, off)
+            }
+            guard let reserved = r.u64() else { return .failure(.truncatedRequest) }
+            guard reserved == 0 else { return .failure(.reservedBits) }
+            kd.kernelID = kID
+            kd.flags = kflags
+            kd.d0 = d0
+            kd.d1 = d1
+            kd.d2 = d2
+            kd.aux = aux
+            cmd = .computeSubmit(kd)
 
         case cmdSubmit3D:
             guard bytes.count >= submit3DHdrLen else {

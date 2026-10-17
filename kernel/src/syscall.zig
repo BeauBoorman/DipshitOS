@@ -82,6 +82,7 @@ const klog = @import("klog.zig"); // #990: serial-log seam (hook armed by main.z
 pub const virtio_gpu = @import("virtio_gpu.zig"); // M32 WMS2 (issue #622): the G1 gpu-armed signal for the REGISTER ENXIO check
 pub const wm_server = @import("wm_server.zig"); // M32 WMS2 (issue #622): the render-server register backing slot 65
 pub const gpu3d_broker = @import("gpu3d_broker.zig"); // M102d1 (issue #2166): the typed GPU3D bridge behind slot-65 cmd 22
+pub const gpu3d_compute = @import("gpu3d_compute.zig"); // M111b (issue #2409): the slot-90 compute broker
 pub const gpu3d_device = @import("gpu3d_device.zig"); // M102d1: host tests arm the fake render-device transport on this seam
 pub const gpu3d_wire = @import("gpu3d_wire.zig"); // M102d1: wire constants for the same fake device
 pub const events = @import("events.zig"); // Milestone 9 (claim 1016): application event queues
@@ -179,6 +180,16 @@ pub const sys_getpid: u64 = 87;
 /// writable full-frame bind stays registered-WM only (bind_scanout_surface);
 /// this slot is the READ side for any EL0 process.
 pub const sys_scanout_read: u64 = 88;
+/// ADR 0054 (M113c #2419) reserved slots 88/89 for its grant-admin/audit
+/// pair; scanout_read took 88 first (ADR 0052, #2398), so 89 stays the
+/// ADR 0054 reservation and is an ENOSYS stub here — the card that
+/// implements it defines its args and handler.
+pub const sys_grant_admin: u64 = 89;
+/// M111b (issue #2409, ADR 0053 D5 + the ADR 0007 amendment): the GPU3D
+/// compute path — `sys_gpucomp(op, a0, a1, a2, ptr, len)` carries one
+/// frozen 128-byte descriptor whose `op` field must equal a0's op; the
+/// broker is gpu3d_compute.zig.
+pub const sys_gpucomp: u64 = 90;
 /// Card G6 (claim 0487): the draw/window syscall seam — slots 12/13/14, the
 /// card's ONE ABI change (the ipc slots-5/6, slots-7/8, and udp slots-9/10/11
 /// precedents; every existing syscall number 0–11 stays frozen).
@@ -586,6 +597,7 @@ pub fn ensure_table() *const [slot_count]Entry {
                     sys_trace => trace.implemented,
                     sys_profile => sampler.implemented,
                     sys_memstat => memstat.implemented,
+                    sys_grant_admin => false, // the ADR 0054 reservation stub — reserved, not implemented
                     else => true,
                 },
             };
@@ -616,6 +628,8 @@ fn handler_for(comptime number: u64) Handler {
         sys_udp_close => handle_udp_close,
         sys_getpid => handle_getpid,
         sys_scanout_read => handle_scanout_read,
+        sys_grant_admin => handle_grant_admin,
+        sys_gpucomp => handle_gpucomp,
         sys_win_open => handle_win_open,
         sys_win_fill => handle_win_fill,
         sys_win_present => handle_win_present,
@@ -730,7 +744,7 @@ fn doms_of(number: u64) u5 {
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
         sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
-        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read => k,
+        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read, sys_gpucomp => k,
         sys_exit => svclock.all_bits,
         else => 0,
     };
@@ -1097,6 +1111,54 @@ fn handle_scanout_read(args: Args, _: *exceptions.VectorFrame) u64 {
         }
     }
     return need;
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0054 reservation: sys_grant_admin — slot 89 (stub)
+// ---------------------------------------------------------------------------
+
+/// `sys_grant_admin` — the ADR 0054 (M113c #2419) reservation kept dense
+/// in the ABI table. Always ENOSYS until that card defines its contract;
+/// a real errno here would fabricate an implementation that does not
+/// exist.
+fn handle_grant_admin(_: Args, _: *exceptions.VectorFrame) u64 {
+    return error_result(.enosys);
+}
+
+// ---------------------------------------------------------------------------
+// M111b (issue #2409, ADR 0053 D5 + the ADR 0007 amendment): sys_gpucomp —
+// slot 90
+// ---------------------------------------------------------------------------
+
+/// `sys_gpucomp(op, a0, a1, a2, ptr, len)`: one frozen 128-byte compute
+/// descriptor (gpu3d_compute.Desc) — `op` is arg0 and must equal the
+/// descriptor's own op field (a mismatched pair is malformed, not
+/// shadowed); a0..a2 are reserved-zero and `len` must be exactly 128.
+/// The copy runs through checked uaccess BEFORE the broker sees anything:
+/// an unreadable ptr is EFAULT with zero device activity, and the broker
+/// works on the kernel-owned copy. The caller must be a process — an
+/// EL1h task cannot own a compute session.
+fn handle_gpucomp(args: Args, _: *exceptions.VectorFrame) u64 {
+    const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (args[1] != 0 or args[2] != 0 or args[3] != 0) return error_result(.einval);
+    if (args[5] != gpu3d_compute.desc_len) return error_result(.einval);
+    var desc: gpu3d_compute.Desc = .{};
+    const desc_bytes: *[gpu3d_compute.desc_len]u8 = @ptrCast(&desc);
+    if (uaccess.copy_in(desc_bytes, args[4], gpu3d_compute.desc_len) != .ok) {
+        return error_result(.efault);
+    }
+    if (args[0] != desc.op) return error_result(.einval); // arg0 names the descriptor's op
+    return gpu3d_compute.dispatch(&desc, pid) catch |e| return switch (e) {
+        error.Invalid => error_result(.einval),
+        error.BadHandle => error_result(.ebadf),
+        error.Exhausted => error_result(.enospc),
+        error.Unsupported => error_result(.enxio),
+        error.Busy => error_result(.eagain),
+        error.TimedOut => error_result(.etimedout),
+        error.LostContext => error_result(.enoent),
+        error.Access => error_result(.efault),
+        error.DeviceFault => error_result(.eio),
+    };
 }
 
 // ---------------------------------------------------------------------------
