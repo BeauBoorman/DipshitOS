@@ -440,6 +440,38 @@ Non-PCI platform facts:
     run executed while a second VZ gate held a running VM; the identical
     spec passed 18/18 when rerun with no concurrent VZ VM. The refusal is
     therefore not msd-specific and is aggravated by concurrent VZ load.
+    **[observed]** #2489 (M119e), 2026-10-17, macOS 27.2 (26B5112a), arm64:
+    the characterized bound — and it is broader than the card's framing.
+    A dedicated repro loop drove 600+ `restoreMachineStateFrom` calls
+    (same-process `--vz-restore --usb-msd` cycles, plus headless-base and
+    cross-process-load legs) across varying host load: **every call
+    refused `VZErrorDomain Code=12`, 0 passes** — with 1-8 foreign
+    `VMRunner` VMs resident AND across a ~90-second window with ZERO
+    other VMRunners resident (14 consecutive solo cycles, all refused).
+    Even a VMRunner binary built at the 071eef6b era — the code that went
+    18/18 green on 26B5101f — refuses identically, so this is NOT a
+    VirelaiOS runner regression. The reason string varies within one
+    build — "invalid argument" (~600) and "permission denied" (32) were
+    both recorded on 26B5112a — so Code=12 is the stable signature, not
+    the reason text. The refusal is image-independent (sparse-zeroed,
+    real MBR+FAT32, and no-overlay plain-disk boots all refuse
+    identically) and device-independent (matching #2261's all-legs
+    refusal). A second signature was observed at VM START:
+    `VZErrorDomain Code=2 "The storage device attachment is invalid."` on
+    ~4% of attach attempts under load, on both image shapes. What this
+    bounds: the M70g "8/9" flake is the leading edge of a refusal mode
+    that can saturate to 100% — observed correlated with concurrent VZ
+    load (#2261) and, on this session's host state, persistent even
+    without it; whether 26B5112a carries an unconditional restore
+    regression or the host was left degraded by churn cannot be decided
+    without a quiet reference host (the solo-pass evidence stays #2261's
+    18/18 on 26B5101f and M70g's 8/9 on 26B5086k). No guest-side or
+    runner-side fix applies — VZ offers no partial-state or quiesce API,
+    and the refusal is persistent (not flappable), so a retry would only
+    mask it. `live-vz-restore` run `msd` accepts a PASS or a Code=12
+    refusal carrying either recorded reason; the stricter legs still pin
+    PASS, so on a host in this state the spec reports the refusal
+    honestly as FAIL (observed: 13/18) rather than masking it.
   - **custom-virtio attached: VZ REFUSES** at `validateSaveRestoreSupport`:
     `VZErrorDomain Code=2 "Unsupported custom virtio device in configuration."`
     Every configuration carrying the custom-virtio device (input queue, host
