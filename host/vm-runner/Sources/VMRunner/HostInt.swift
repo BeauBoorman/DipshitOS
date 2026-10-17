@@ -40,6 +40,17 @@ enum HostInt {
     static let laneDrop: UInt8 = 1 << 1
     static let laneNotify: UInt8 = 1 << 2
 
+    /// The lane name a mask bit names ("clip"/"drop"/"notify") — the
+    /// `lane=` word refusal markers carry.
+    static func laneName(_ bit: UInt8) -> String {
+        switch bit {
+        case laneClip: return "clip"
+        case laneDrop: return "drop"
+        case laneNotify: return "notify"
+        default: return "?"
+        }
+    }
+
     enum Tag: UInt8 {
         case armed = 0     // h→g runner → seat:  payload [lane_mask u8]
         case clipOut = 1   // g→h seat → runner:  clipboard bytes (0 = clear)
@@ -313,6 +324,22 @@ final class HostIntSession {
     let epoch: UInt32
     let mask: UInt8
 
+    /// M114c (#2456): runtime lane suspension — the bits the operator
+    /// pulled out of the published mask. A suspend republishes ARMED
+    /// (next seq, same epoch) with the lane's bit cleared; the seat's
+    /// seq-gated adoption re-reads the mask and its emit path then
+    /// refuses the lane `lane_disabled` — the re-ARMED revocation the
+    /// engine was built for. The suspended mask is authoritative: lane
+    /// objects ask `isSuspended` rather than keeping their own flag.
+    private(set) var suspendedMask: UInt8 = 0
+    /// The next ARMED seq — the arm-time publish consumed seq 1.
+    private var armedSeq: UInt32 = 1
+
+    /// The mask as currently published: armed bits minus suspended bits.
+    var effectiveMask: UInt8 { mask & ~suspendedMask }
+
+    func isSuspended(_ bit: UInt8) -> Bool { suspendedMask & bit != 0 }
+
     private init(shareDir: URL, key: Data, epoch: UInt32, mask: UInt8) {
         self.shareDir = shareDir
         self.laneDir = HostInt.laneDir(shareDir: shareDir)
@@ -348,5 +375,32 @@ final class HostIntSession {
         }
         HostInt.logArmed(mask: mask, epoch: epoch)
         return HostIntSession(shareDir: shareDir, key: key, epoch: epoch, mask: mask)
+    }
+
+    /// M114c: flip one lane's published bit and republish ARMED under the
+    /// same epoch — the seat's seq-gated adoption reads the new mask on
+    /// its next poll (the serial `armed` lines narrate both directions).
+    /// false (after the lane's own io_error refusal) when the republish
+    /// fails — the flag rolls back so it never disagrees with the mask
+    /// the seat actually saw. A no-op toggle (setting a bit already in
+    /// that state) succeeds without republishing.
+    @discardableResult
+    func setSuspended(_ bit: UInt8, _ on: Bool) -> Bool {
+        guard bit != 0, mask & bit != 0 else { return false }
+        let prior = suspendedMask
+        if on { suspendedMask |= bit } else { suspendedMask &= ~bit }
+        if suspendedMask == prior { return true }
+        armedSeq += 1
+        guard let rec = HostInt.encode(tag: .armed, flags: 0, seq: armedSeq, epoch: epoch,
+                                       payload: Data([effectiveMask]), key: key),
+              HostInt.publish(laneDir: laneDir, name: HostInt.recordName(tag: .armed, seq: armedSeq), body: rec)
+        else {
+            suspendedMask = prior
+            armedSeq -= 1
+            HostInt.logRefuse(lane: HostInt.laneName(bit), reason: .ioError)
+            return false
+        }
+        HostInt.logArmed(mask: effectiveMask, epoch: epoch)
+        return true
     }
 }

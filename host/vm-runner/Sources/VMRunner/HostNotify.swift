@@ -58,6 +58,8 @@ final class HostNotify: NSObject {
     /// notification consent once. Bare — the whole class-B posture — takes
     /// the no_bundle path per record instead; nothing here is needed.
     func start() {
+        // M114c (#2456): the lane-notify bus verb, same seam as the menu.
+        HostIntCommands.registerLane(self)
         guard bundled else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -74,7 +76,20 @@ final class HostNotify: NSObject {
     /// order. Refused records are still deleted as met, but only
     /// `perTickMax` verified records are consumed per tick — anything
     /// beyond stays on disk and drains at the lane's own rate.
+    ///
+    /// M114c: while the session's notify bit is suspended the lane is a
+    /// hard off — every record for it is refused `lane_disabled` and
+    /// deleted (the seat stops emitting under the revoked mask, so this
+    /// is the in-flight/planted sweep, not a queue).
     func tick() {
+        if session.isSuspended(HostInt.laneNotify) {
+            guard let pending = HostInt.records(laneDir: laneDir, tag: .notifyOut) else { return }
+            for (name, _) in pending {
+                HostInt.logRefuse(lane: "notify", reason: .laneDisabled)
+                remove(laneDir.appendingPathComponent(name))
+            }
+            return
+        }
         guard let files = HostInt.records(laneDir: laneDir, tag: .notifyOut) else { return }
         var consumed = 0
         for (name, seq) in files {

@@ -48,8 +48,10 @@ final class HostDrop {
     }
 
     /// Create <share>/INBOX/ — the runner owns it at arm time (D4).
+    /// Also registers the lane-drop + send-file bus verbs (M114c #2456).
     @discardableResult
     func start() -> Bool {
+        HostIntCommands.registerLane(self)
         do {
             try FileManager.default.createDirectory(at: inboxDir, withIntermediateDirectories: true)
             return true
@@ -62,7 +64,13 @@ final class HostDrop {
     /// The one drop entry point: the NSView's performDragOperation and the
     /// --host-drop-file hook both land here. Items past the gesture bound
     /// are refused by name; the rest each take dropOne's per-file rules.
+    /// A suspended lane (M114c) refuses every item `lane_disabled` —
+    /// same refusal name the arm-time dead-lane path already uses.
     func drop(urls: [URL]) {
+        if session.isSuspended(HostInt.laneDrop) {
+            for _ in urls { HostInt.logRefuse(lane: "drop", reason: .laneDisabled) }
+            return
+        }
         if urls.count > Self.gestureMax {
             for _ in Self.gestureMax..<urls.count {
                 HostInt.logRefuse(lane: "drop", reason: .payloadTooLarge)

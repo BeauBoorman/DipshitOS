@@ -50,21 +50,52 @@ final class HostClipboard {
     func start() {
         lastChangeCount = board.changeCount
         armed = true
+        // M114c (#2456): the lane-clipboard bus verb — the Integration
+        // menu's toggle and --host-cmd-after dispatch on the same seam.
+        HostIntCommands.registerLane(self)
     }
 
     /// The 250 ms poll step: drain CLIP_OUT (guest→host), then check the
     /// pasteboard (host→guest). Both halves run every tick while armed.
+    ///
+    /// M114c: while the session's clip bit is suspended the lane is a
+    /// hard off — inbound records are refused `lane_disabled` (and
+    /// deleted: a plant or an in-flight record cannot outlive the lane's
+    /// own posture) and the pasteboard is left alone. On resume the
+    /// changeCount baseline is re-taken: suspended-era host copies do
+    /// NOT retro-deliver — the lane was off.
     func tick() {
         guard armed else { return }
+        if session.isSuspended(HostInt.laneClip) {
+            resumeBaseline = true
+            guard let files = HostInt.records(laneDir: laneDir, tag: .clipOut) else { return }
+            for (name, _) in files {
+                HostInt.logRefuse(lane: "clip", reason: .laneDisabled)
+                remove(laneDir.appendingPathComponent(name))
+            }
+            return
+        }
+        if resumeBaseline {
+            resumeBaseline = false
+            lastChangeCount = board.changeCount
+        }
         drainClipOut(key: key)
         pollPasteboard(key: key)
     }
+
+    private var resumeBaseline = false
 
     /// The `--host-clip-in` test hook: write text to the lane's pasteboard
     /// exactly as a user's host copy would — the next poll's changeCount
     /// bump carries it into a CLIP_IN. Deliberately does NOT set the echo
     /// guard (this is a genuine host change, not a lane reflection).
+    /// M114c: injecting into a suspended lane refuses `lane_disabled` —
+    /// nothing stages while the lane is off.
     func inject(_ text: String) -> Int {
+        if session.isSuspended(HostInt.laneClip) {
+            HostInt.logRefuse(lane: "clip", reason: .laneDisabled)
+            return board.changeCount
+        }
         board.clearContents()
         board.setString(text, forType: .string)
         return board.changeCount

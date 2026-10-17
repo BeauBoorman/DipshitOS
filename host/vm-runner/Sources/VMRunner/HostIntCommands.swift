@@ -1,0 +1,96 @@
+import AppKit
+import Foundation
+import VMAppKit
+
+// MARK: - HostIntCommands — M114c (#2456, index #2447): the M108 lanes'
+// verbs on the HostCommand action bus.
+//
+// The bus and the verbs are M114a's — this file is where M114c registers
+// the handlers the Integration menu projects. Each lane's start() calls
+// its registerLane once armed, wiring the verb onto `commandBus` — the
+// same bus --host-cmd-after and the AppKit menus dispatch on, so a
+// class-B run exercises the real seam. The lane objects and the session
+// are main.swift globals read lazily AT DISPATCH, so registration order
+// against the other lanes does not matter.
+//
+// lane-clipboard / lane-drop / lane-notify are the Integration menu's
+// toggles: dispatching flips the lane's published ARMED bit — the
+// session republishes ARMED (next seq, same epoch) with the bit
+// cleared/set; the seat's seq-gated adoption re-reads the mask and its
+// emit path then refuses the lane `lane_disabled` (the engine's
+// re-ARMED revocation). The checkmark is the lane's live state — the
+// mask bit is the posture, not a UI-only flag.
+//
+// send-file is "Send File to INBOX…": the drop lane's gesture through
+// the bus — the same drop(urls:) the NSView's performDragOperation and
+// --host-drop-file's marker path call. The headless source is the
+// --host-drop-file list itself (a gate stages paths without arming
+// --host-drop-after's marker); a bundled session with no staged list
+// opens an NSOpenPanel instead.
+enum HostIntCommands {
+
+    static func registerLane(_ lane: HostClipboard) {
+        commandBus.register(.laneClipboard, HostCommandBus.Registration(
+            itemState: { hostIntSession?.isSuspended(HostInt.laneClip) == false },
+            action: { toggle(HostInt.laneClip) }))
+    }
+
+    static func registerLane(_ lane: HostDrop) {
+        commandBus.register(.laneDrop, HostCommandBus.Registration(
+            itemState: { hostIntSession?.isSuspended(HostInt.laneDrop) == false },
+            action: { toggle(HostInt.laneDrop) }))
+        // A suspended drop lane greys the menu item AND refuses the
+        // dispatch — `state=disabled` is the receipt; the lane_disabled
+        // vocabulary line comes from drop()'s own suspended check on the
+        // paths that DO reach it (drag, the --host-drop-after marker).
+        commandBus.register(.sendFile, HostCommandBus.Registration(
+            isEnabled: { hostDrop != nil && hostIntSession?.isSuspended(HostInt.laneDrop) == false },
+            action: { sendFile() }))
+    }
+
+    static func registerLane(_ lane: HostNotify) {
+        commandBus.register(.laneNotify, HostCommandBus.Registration(
+            itemState: { hostIntSession?.isSuspended(HostInt.laneNotify) == false },
+            action: { toggle(HostInt.laneNotify) }))
+    }
+
+    /// The toggle: republish ARMED with the bit cleared (suspend) or set
+    /// (resume) under the same epoch. The republish is the whole action —
+    /// the seat's next poll adopts the new mask and its emit/consume
+    /// postures follow it.
+    private static func toggle(_ bit: UInt8) -> HostCommandBus.Outcome {
+        guard let session = hostIntSession else { return .unavailable }
+        return session.setSuspended(bit, !session.isSuspended(bit)) ? .performed : .failed
+    }
+
+    /// "Send File to INBOX…": drive the drop lane's gesture through the
+    /// bus. Headless runs ride the staged --host-drop-file list (with no
+    /// --host-drop-after marker fired, the list is otherwise inert — this
+    /// is what a --host-cmd-after leg sends); a bundled session picks
+    /// through an NSOpenPanel.
+    private static func sendFile() -> HostCommandBus.Outcome {
+        guard let drop = hostDrop else { return .unavailable }
+        if !hostDropFiles.isEmpty {
+            let urls = hostDropFiles.map { URL(fileURLWithPath: $0) }
+            FileHandle.standardOutput.write(Data("host-drop: send files=\(urls.count)\n".utf8))
+            drop.drop(urls: urls)
+            return .performed
+        }
+        // No staged list and no app bundle — a bare runner cannot raise
+        // the picker (NSOpenPanel needs NSApplication), so refuse rather
+        // than hang.
+        guard Bundle.main.bundleIdentifier != nil else {
+            FileHandle.standardOutput.write(Data("host-drop: send refused — no --host-drop-file list and no app bundle for a picker\n".utf8))
+            return .disabled
+        }
+        let panel = NSOpenPanel()
+        panel.message = "Send files to the guest's INBOX"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return .disabled }
+        FileHandle.standardOutput.write(Data("host-drop: send files=\(panel.urls.count)\n".utf8))
+        drop.drop(urls: panel.urls)
+        return .performed
+    }
+}
