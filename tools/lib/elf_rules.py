@@ -44,9 +44,11 @@ MAX_IMAGE = 33554432
 MAP_MAX = 67108864
 # kernel/src/elf.zig gap_base_max: no segment may reach into the kernel/hole.
 GAP_BASE_MAX = 0x1000_0000
-# The argv+envp block the kernel packs into the data segment's tail page
-# (initBlocFloor; ADR 0035 amendment 4): 0x908 bytes, so a segment that leaves
-# less page slack than this cannot be exec'd WITH arguments.
+# Historical: the kernel once packed argv+envp into the data segment's
+# tail slack and refused ELFs whose last segment left < 0x908 bytes.
+# b1c0c953 (M71m, #1572) replaced that with sizing the last segment's
+# pages to cover align8(mem_size)+argv+envp, so the image's own tail
+# slack is no longer required — the figure below is reported, not gated.
 NEED_SLACK = 0x908
 # kernel/src/exec.zig max_segments.
 MAX_SEGMENTS = 3
@@ -121,12 +123,10 @@ def check(data):
         fails.append("last segment not writable")
     if segs and not (segs[0][1] <= entry < segs[0][1] + segs[0][2]):
         fails.append("entry %#x not in segment 0 initialized bytes" % entry)
-    # The slack rule is stated on the LAST segment: it is the one the kernel
-    # packs argv+envp behind.
+    # The slack figure is reported (not gated): the kernel sizes the last
+    # segment's pages to cover align8(mem_size)+argv+envp, so the image's
+    # own tail slack no longer decides exec-with-args.
     slack = (-segs[-1][3]) % 4096 if segs else 0
-    if slack < NEED_SLACK:
-        fails.append("writable page slack %d < %#x (argv+envp block)"
-                     % (slack, NEED_SLACK))
     if len(data) > MAX_IMAGE:
         fails.append("file %d > exec_image_max" % len(data))
     return entry, segs, total, slack, fails

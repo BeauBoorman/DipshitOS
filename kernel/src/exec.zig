@@ -801,6 +801,9 @@ fn exec_file_impl(name: []const u8, args: []const []const u8, pin: ?usize, princ
         .{ .phys = kstack_phys, .pages = kstack_pages },
         principal,
     ) orelse {
+        // #2430: the built root's whole table subtree returns to the
+        // carve-out too — it owns no descriptor, so nothing else can.
+        _ = mmu.free_table_tree(rebuild.root_phys);
         _ = alloc.free_pages(text_phys, text_pages);
         if (data_pages > 0) _ = alloc.free_pages(data_phys, data_pages);
         _ = alloc.free_pages(stack_phys, stack_pages);
@@ -1122,6 +1125,8 @@ fn exec_static_elf_gap(
         .{ .phys = kstack_phys, .pages = kstack_pages },
         principal,
     ) orelse {
+        // #2430: free the built root's table subtree as well as the pages.
+        _ = mmu.free_table_tree(root_phys);
         var j: usize = 0;
         while (j < image.segment_count) : (j += 1) {
             if (seg_pages[j] > 0) _ = alloc.free_pages(seg_phys[j], seg_pages[j]);
@@ -1486,6 +1491,8 @@ fn exec_dynamic_elf(
         .{ .phys = kstack_phys, .pages = kstack_pages },
         principal,
     ) orelse {
+        // #2430: free the built root's table subtree as well as the pages.
+        _ = mmu.free_table_tree(root_phys);
         _ = alloc.free_pages(text_phys, text_pages);
         if (data_pages > 0) _ = alloc.free_pages(data_phys, data_pages);
         _ = alloc.free_pages(interp_text_phys, interp_text_pages);
@@ -2450,9 +2457,11 @@ test "exec: permanent occupant + recycle — one spare slot, pool_full, then the
     try std.testing.expectEqual(@as(usize, 3), scheduler.current_id());
     try std.testing.expect(scheduler.exit_current(43)); // user -> idle
     try std.testing.expectEqual(process.State.exited, process.info(2).?.state);
-    // The exited process holds its pages until the reap...
-    try std.testing.expectEqual(free_after_counter - filler_pages, alloc.stats().free_pages);
-    // ...the scheduler reap returns them (claim 4613) while the exited
+    // #2430: the exited process's user pages return AT EXIT (text + user
+    // stack); only the exiting task's kstack still waits for the reap...
+    const held_pages: u64 = (scheduler.task_stack_size + 4095) / 4096;
+    try std.testing.expectEqual(free_after_counter - filler_pages + (dsk1_exec_pages() - held_pages), alloc.stats().free_pages);
+    // ...the scheduler reap returns the rest (claim 4613) while the exited
     // descriptor stays in the procs table with its status.
     try std.testing.expect(scheduler.reap(3));
     try std.testing.expectEqual(free_after_counter - (filler_pages - dsk1_exec_pages()), alloc.stats().free_pages);
@@ -2533,10 +2542,11 @@ test "exec: kill reaps a permanent occupant — pages return, the slot is re-exe
     const killed = process.info(1).?;
     try std.testing.expectEqual(process.State.exited, killed.state);
     try std.testing.expectEqual(@as(u64, 137), killed.exit_status);
-    // The exited process holds its pages until the reap (the free
-    // count is unchanged from right after the exec)...
-    try std.testing.expectEqual(free_after_counter, alloc.stats().free_pages);
-    // ...then the scheduler reap returns them (exact +dsk1_exec_pages recovery).
+    // The exited process's user pages return at the exit (#2430 — text +
+    // user stack); only the kstack still waits for the reap...
+    const held_pages: u64 = (scheduler.task_stack_size + 4095) / 4096;
+    try std.testing.expectEqual(free_after_counter + dsk1_exec_pages() - held_pages, alloc.stats().free_pages);
+    // ...then the scheduler reap returns the rest (exact +dsk1_exec_pages total).
     try std.testing.expect(scheduler.reap(2));
     try std.testing.expectEqual(free_after_counter + dsk1_exec_pages(), alloc.stats().free_pages);
     try std.testing.expect(scheduler.has_free_slot());

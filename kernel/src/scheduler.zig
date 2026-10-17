@@ -2853,6 +2853,13 @@ fn exit_current_locked(status: u64, process_exit: bool) bool {
         // exception context.
         _ = shared_mmap.revoke_owner(pid);
         _ = shared_mmap.revoke_peer_role(pid);
+        // #2430: return the dead process's page-pool footprint NOW — the
+        // last task is a .zombie and can never touch user VA again. Only
+        // the exiting task's kstack + its live TTBR0 root stay for the
+        // lifecycle reap. Under exec churn the old reap-time-only release
+        // let dead-children pages drain the whole pool (dir_open ENOMEM,
+        // populate failures delivered as status-139 children).
+        process.release_user_resources_early(pid);
         file_table.reset_process(pid);
         tcp.close_owner(pid);
         @import("socket_native.zig").closeOwner(pid);
@@ -2990,18 +2997,20 @@ pub fn reap(id: usize) bool {
 /// (COUNTER.BIN) coexists with a steady exec → exit → reap → re-exec
 /// cycle without leaking.
 pub fn reap_one_zombie() void {
+    _ = reap_oldest_zombie();
+}
+
+/// #2430: reap ONE zombie and report whether it did — the demand-fault
+/// OOM path drains the backlog before declaring the pool empty. The audit
+/// probe is skipped (the caller already knows this is a reap context);
+/// the exit-report queue is filled exactly as the idle reaper fills it.
+pub fn reap_oldest_zombie() bool {
     var i: usize = 0;
     while (i < max_tasks) : (i += 1) {
-        // Claim 9094 (#810): validate the slot BEFORE reading its state —
-        // the idle reaper is where run-11 boots 2/3 faulted on wildly
-        // corrupted fields; the audit records the evidence first.
         audit.slot(i, .reap);
         if (tasks[i].state != .zombie) continue;
         const name = tasks[i].name;
         if (!reap(i)) continue;
-        // Card 3d (claim 1014): EVERY reap is queued (a full ring drops
-        // the oldest) — two reaps in one idle-loop window print two lines
-        // in order instead of collapsing.
         if (reap_report_count == exit_report_max) {
             reap_report_head = (reap_report_head + 1) % exit_report_max;
             reap_report_count -= 1;
@@ -3009,8 +3018,9 @@ pub fn reap_one_zombie() void {
         const report_index = (reap_report_head + reap_report_count) % exit_report_max;
         reap_reports[report_index] = .{ .name = name };
         reap_report_count += 1;
-        return;
+        return true;
     }
+    return false;
 }
 
 /// Claim 1747: the console-free background hook, run once per idle pass.
