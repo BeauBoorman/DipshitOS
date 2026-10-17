@@ -97,6 +97,8 @@ type panel struct {
 	showServices bool
 	services     servicesView
 	servicePoll  int64
+	showGrants   bool
+	grants       grantsView
 
 	listCtl     *listController
 	focus       *focusRing
@@ -349,6 +351,12 @@ func (a *panel) save() {
 		a.saveServices()
 		return
 	}
+	if a.showGrants {
+		// Grant writes are per-gesture through the admin slot — there is
+		// no table-shaped file for a bare Enter to publish.
+		a.status = "grants land per gesture — grant|refuse <BIN> + Enter"
+		return
+	}
 	if a.showChords {
 		// The registry view is read-only: the compiled table has nothing
 		// to publish, and the settings rows underneath must not be
@@ -418,6 +426,22 @@ func changedSettingKeys(before, after settings.File) []string {
 // alone: the panel does not guess a value space the kernel never declared —
 // type those as key=value, exactly like the kernel's own reader.
 func (a *panel) cycle(dir int) bool {
+	if a.showGrants {
+		if a.sel >= 0 && a.sel < len(a.grants.entries) {
+			e := a.grants.entries[a.sel]
+			if dir > 0 {
+				if err := a.grants.Grant(e.Name); err != nil {
+					a.status = "grant refused: " + err.Error()
+				} else {
+					a.status = "grant written"
+				}
+			} else {
+				a.grants.Decline(e.Name)
+				a.status = "consent declined"
+			}
+		}
+		return true
+	}
 	if a.showServices {
 		if a.sel >= 0 && a.sel < len(a.services.manifest.Services) {
 			s := a.services.manifest.Services[a.sel]
@@ -531,13 +555,22 @@ func (a *panel) key(ev vi.Event) bool {
 		a.exitRequested = true
 		return true
 	case keyEnter:
-		if strings.TrimSpace(a.input.Value()) == "services" {
+		switch strings.TrimSpace(a.input.Value()) {
+		case "services":
 			a.input.Clear()
 			a.openServices()
+			return true
+		case "grants":
+			a.input.Clear()
+			a.openGrants()
 			return true
 		}
 		if a.showServices {
 			a.serviceInput()
+			return true
+		}
+		if a.showGrants {
+			a.grantInput()
 			return true
 		}
 		if a.showChords {
@@ -591,7 +624,7 @@ func isShortcutsChord(ev vi.Event) bool {
 // shortcuts registry view. Opening the view prints its marker (after the
 // table it renders is in hand), so a gate can grep the registry's size.
 func (a *panel) toggleShortcuts() bool {
-	a.showServices = false
+	a.showServices, a.showGrants = false, false
 	a.showChords = !a.showChords
 	if a.showChords {
 		vi.ConsoleLine(markerShortcuts + vi.Itoa64(int64(len(chords.Global))))
@@ -666,6 +699,9 @@ func (a *panel) layout() {
 // headLabel names the surface the list is showing: the settings file's
 // table, or the M82c shortcuts registry.
 func (a *panel) headLabel() string {
+	if a.showGrants {
+		return "Grants  declared vs granted"
+	}
 	if a.showServices {
 		return "Services  " + svcmanifest.Path
 	}
@@ -684,6 +720,9 @@ func (a *panel) headLabel() string {
 // chord registry instead — chord, owner, description — one owner per chord
 // per dispatch point.
 func (a *panel) labels() []string {
+	if a.showGrants {
+		return a.grants.Labels()
+	}
 	if a.showServices {
 		return a.services.Labels()
 	}
