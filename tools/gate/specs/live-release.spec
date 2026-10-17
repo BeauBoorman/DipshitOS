@@ -431,17 +431,15 @@ vgate_assert 01 serial-contains 'fleet: FLINT.ELF built sha256='
 vgate_assert 01 serial-contains 'fleet: AGENTD.ELF built sha256='
 vgate_assert 01 serial-contains 'fleet: GOBUILD.ELF built sha256='
 # Named refusals (M112a semantics): GOFILES/PULSE/GOHELP need image/color,
-# which has no staged archive; GOSTALGIA is an external-tree row; STORE.ELF
-# refuses no_main — the fleet.txt row names the virelai/store LIBRARY dir
-# while the buildable package is virelai/store/main (tools/go/build-store.sh).
-# That row belongs to the gobuild fleet card's Touches, so this spec records
-# the observed refusal rather than editing the list under another claim.
+# which has no staged archive; GOSTALGIA is an external-tree row. STORE.ELF
+# builds via virelai/store/main — the fleet.txt row was pointed at
+# the package dir under this card (#2414); assert the built row, not a refusal.
 vgate_assert 01 serial-contains 'fleet: GOFILES.ELF refused dep_unsupported'
 vgate_assert 01 serial-contains 'fleet: PULSE.ELF refused dep_unsupported'
 vgate_assert 01 serial-contains 'fleet: GOHELP.ELF refused dep_unsupported'
 vgate_assert 01 serial-contains 'fleet: GOSTALGIA.ELF refused external_tree'
-vgate_assert 01 serial-contains 'fleet: STORE.ELF refused no_main'
-vgate_assert 01 serial-contains 'fleet: fleet OK built=14 refused=5'
+vgate_assert 01 serial-contains 'fleet: STORE.ELF built sha256='
+vgate_assert 01 serial-contains 'fleet: fleet OK built=15 refused=4'
 vgate_assert 01 serial-absent 'fleet: fleet INCOMPLETE'
 vgate_assert 01 serial-absent 'release: FAIL'
 vgate_assert 01 serial-absent '[EXC] parking:'
@@ -458,7 +456,7 @@ vgate_assert 02 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 02 serial-contains 'exec: loaded GORELEASE.ELF'
 vgate_assert 02 serial-contains 'release: inputs BOOTAA64.EFI sha256='
 vgate_assert 02 serial-contains 'release: inputs KERNEL.BIN sha256='
-vgate_assert 02 serial-contains 'release: fleet built=14 refused=5'
+vgate_assert 02 serial-contains 'release: fleet built=15 refused=4'
 vgate_assert 02 serial-contains 'release: bundle '
 vgate_assert 02 serial-contains 'release: image RELEASE.IMG bytes='
 vgate_assert 02 serial-contains 'release: manifest RELEASE.MF rows='

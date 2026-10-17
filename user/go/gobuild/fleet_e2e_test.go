@@ -1,3 +1,5 @@
+//go:build !virelai
+
 package main
 
 // A host rehearsal of the in-guest fleet build: the REAL fleet closure

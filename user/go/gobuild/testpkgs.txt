@@ -1,0 +1,121 @@
+# testpkgs.txt -- M112b (#2414): the pinned in-guest test package list.
+#
+# Run rows are bare package source dirs under the test root (/host/SRC):
+# GOBUILD compiles the package's test variant + external test package +
+# generated testmain into T_<mangled>.ELF, execs it with -test.v, and reads
+# the verdict out of the captured stream. `excluded <pkg> <reason>` rows are
+# pinned non-participants — every user/go package with _test.go files that
+# is NOT run in-guest appears here with its named reason (the card: "each
+# excluded package is named with its reason"), never silently skipped.
+#
+# Exclusion reasons observed/verified:
+#   needs_asm:          virelai-tagged .s gateways need cmd/asm, which the
+#                       in-guest toolchain does not ship (ADR 0035 D4)
+#   dep_unsupported:    the package's test closure needs a standard package
+#                       the M107b table does not stage (first missing dep
+#                       named in the reason)
+#   host_fixture:       tests read host-repo paths (../../../...) that do
+#                       not exist on the share
+#   host_env:           tests assert the host's ENOSYS stub semantics where
+#                       the guest's real channel answers differently
+#   guest_enosys:       tests need a syscall the guest channel does not
+#                       implement
+#   module_closure:     tests transit into the pinned Charm/module tree
+#                       that is staged only for the fleet build rows
+virelai/agentd
+virelai/chords
+virelai/clockfmt
+virelai/compose
+virelai/crashview
+virelai/dns
+virelai/fart
+virelai/fetch
+virelai/git
+virelai/gobuild
+virelai/godiff
+virelai/gostore
+virelai/gpu3d
+virelai/gsport/child
+virelai/gsport/fsys
+virelai/gsport/proc
+virelai/gsport/sig
+virelai/gsport/vfs
+virelai/heap
+virelai/hostint
+virelai/httpd
+virelai/icons
+virelai/init
+virelai/layout
+virelai/logfixture
+virelai/logview
+virelai/mime
+virelai/netstat
+virelai/ping
+virelai/rss/app
+virelai/rss/feed
+virelai/rss/keys
+virelai/rss/store
+virelai/selftest
+virelai/snapshot
+virelai/sound
+virelai/ssh
+virelai/strace
+virelai/supervise
+virelai/svcgraph
+virelai/term
+virelai/theme
+virelai/timesync
+virelai/top
+virelai/traceroute
+virelai/vector
+virelai/vectorconsumer
+excluded virelai/vi needs_asm: vi_arm64.s syscall gateway (archive tier)
+excluded virelai/vsys needs_asm: vsys_arm64.s + vsys_counter_arm64.s gateways (archive tier)
+excluded virelai/strace/fixture needs_asm: fault_arm64.s
+excluded virelai/css host_fixture: equivalence_test reads ../../../tests/fixtures/web/reference
+excluded virelai/settings host_fixture: settings_test reads ../../../kernel/src/settings.zig
+excluded virelai/view host_fixture: view_test reads ../../../tests/fixtures/{qoi,png}
+excluded virelai/store host_fixture: fixture_gen_test reads ../flint/testdata/sig + writes testdata
+excluded virelai/tabapp host_fixture: cellgrid_test reads ../../../kernel/src/font_atlas_data.zig
+excluded virelai/svgproof host_fixture: proof_test reads ../../../tests/fixtures + ../../../artifacts
+excluded virelai/pdfproof host_fixture: source_test reads ../../../artifacts
+excluded virelai/svcmanifest host_fixture: TestFixtures reads ../../../tests/fixtures/init/manifests
+excluded virelai/webstyle host_fixture: TestReferenceSetBounds reads ../../../tests/fixtures/web/reference
+excluded virelai/svg host_fixture: TestPinnedAnalyticFixture reads ../../../tests/fixtures/svg
+excluded virelai/gsport/guard host_fixture: TestRealTreesClean walks the host repo tree for guard roots
+excluded virelai/note host_env: TestLoadSaveOutcomesOnHost asserts the file channel is ENOSYS (it is real in-guest)
+excluded virelai/gputriangle host_env: TestBindSurfaceIssuesTheMmapSyscall asserts the host stub's ENOSYS (the guest syscall is real)
+excluded virelai/gsport/tty guest_enosys: TestReadReturnsNormalizedBytes needs the pipe syscall the guest channel lacks
+excluded virelai/edit guest_enosys: TestFileMtimeHost calls os.Chtimes (not implemented on the guest channel)
+excluded virelai/goset host_env: settings panel tests assert no /host/SETTINGS.TXT exists (the gate stages one for wm=none)
+excluded virelai/pdf dep_unsupported: needs compress/zlib (M107b table does not stage it)
+excluded virelai/calc dep_unsupported: golden_test needs image/png
+excluded virelai/draw dep_unsupported: golden_test needs image/png
+excluded virelai/gotabwm dep_unsupported: golden tests need image/png
+excluded virelai/widgets dep_unsupported: golden tests need image/png
+excluded virelai/observe dep_unsupported: needs debug/elf+debug/dwarf
+excluded virelai/prof dep_unsupported: needs debug/elf+debug/dwarf
+excluded virelai/imgcat dep_unsupported: needs image/png+crypto
+excluded virelai/r3d/internal dep_unsupported: needs crypto/fips140 closure
+excluded virelai/rfb dep_unsupported: needs crypto + image/draw
+excluded virelai/sshlib dep_unsupported: needs crypto/hmac+fips140 closure
+excluded virelai/shlib dep_unsupported: needs crypto/hmac+fips140 closure
+excluded virelai/git/gitread dep_unsupported: needs compress/zlib+crypto
+excluded virelai/appkit dep_unsupported: golden tests need image/png+crypto
+excluded virelai/ttf dep_unsupported: golden tests need image/png+crypto
+excluded virelai/webrender dep_unsupported: golden tests need image/png+crypto
+excluded virelai/browser dep_unsupported: needs image/png+crypto (also TestMain + hostile fixtures)
+excluded virelai/flint dep_unsupported: needs crypto/ed25519+hmac closure
+excluded virelai/ed25519 dep_unsupported: cross-checks against crypto/ecdh+crypto/ed25519
+excluded virelai/sshd dep_unsupported: needs crypto closure
+excluded virelai/tls dep_unsupported: needs crypto/tls-scale closure
+excluded virelai/gsport/ipc dep_unsupported: needs net+netip+internal/singleflight
+excluded virelai/flint/parser dep_unsupported: parser_test drives os/exec corpus tooling
+excluded virelai/proffixture dep_unsupported: needs os/exec
+excluded virelai/svfixture dep_unsupported: gate_test needs os/exec
+excluded virelai/charmhello module_closure: charm.land/bubbletea test closure
+excluded virelai/files module_closure: bubbletea test closure
+excluded virelai/gitui module_closure: bubbletea test closure
+excluded virelai/help module_closure: bubbletea test closure
+excluded virelai/rss module_closure: bubbletea test closure
+excluded virelai/pulse module_closure: bubbletea+osc52 test closure
