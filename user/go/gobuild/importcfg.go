@@ -2,7 +2,6 @@ package main
 
 import (
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -78,7 +77,7 @@ func compileImportcfg(g *Graph, workdir string, pkg *Package) []byte {
 		}
 		file := dep.Archive
 		if dep.Local {
-			file = archivePath(workdir, dep.Path)
+			file = archivePath(workdir, dep.Stem)
 		}
 		b.WriteString("packagefile " + dep.Path + "=" + file + "\n")
 	}
@@ -111,22 +110,26 @@ func linkImportcfg(g *Graph, workdir string, archives map[string]string) []byte 
 		if p == "main" {
 			continue // main is the linker's positional object, not a packagefile
 		}
-		b.WriteString("packagefile " + p + "=" + archivePath(workdir, p) + "\n")
+		b.WriteString("packagefile " + p + "=" +
+			archivePath(workdir, g.Packages[p].Stem) + "\n")
 	}
 	return []byte(b.String())
 }
 
 // archivePath names the archive the driver builds a local package into.
-// Share name components cap at 31 bytes (kernel/src/file_table.zig), so the
-// mangled path is checked — a too-long name is refused by the caller.
-func archivePath(workdir, path string) string {
-	return joinPath(workdir, "P_"+manglePath(path)+".a")
+// The stem — not the import path — is the name, because share name
+// components cap at 31 bytes (kernel/src/file_table.zig): long paths
+// ("github.com/charmbracelet/x/ansi/parser") take an indexed stem
+// (assignStems), never a truncated one.
+func archivePath(workdir, stem string) string {
+	return joinPath(workdir, stem+".a")
 }
 
 // manglePath flattens an import path into one share-name component.
 // "x/y" -> "x_y". Two different paths CAN collide here ("a/b" vs "a_b") —
-// checkMangles refuses that pair by name rather than let one overwrite
-// the other's archive mid-build.
+// assignStems detects that pair (and any over-length stem) and gives the
+// later one an indexed name rather than letting one overwrite the other's
+// archive mid-build.
 func manglePath(path string) string {
 	var b strings.Builder
 	for _, c := range path {
@@ -138,31 +141,4 @@ func manglePath(path string) string {
 		}
 	}
 	return b.String()
-}
-
-// checkMangles verifies every local package's derived file stem is unique
-// and fits the 31-byte share-name bound. Returns diags for collisions.
-func checkMangles(g *Graph) []Diag {
-	seen := map[string]string{}
-	var diags []Diag
-	for _, p := range g.Packages {
-		if !p.Local {
-			continue
-		}
-		stem := manglePath(p.Path)
-		if other, dup := seen[stem]; dup {
-			diags = append(diags, Diag{Code: "name_collision",
-				Msg: "import paths " + strconv.Quote(other) + " and " +
-					strconv.Quote(p.Path) + " both mangle to " + stem})
-			continue
-		}
-		seen[stem] = p.Path
-		// "P_" + stem + ".a" must fit one 31-byte share name.
-		if len("P_"+stem+".a") > 31 {
-			diags = append(diags, Diag{Code: "name_too_long",
-				Msg: "import path " + strconv.Quote(p.Path) +
-					" mangles past the 31-byte share-name bound"})
-		}
-	}
-	return diags
 }

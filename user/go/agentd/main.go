@@ -78,6 +78,10 @@ func main() {
 		refuseExit("no-audit")
 		return
 	}
+	if code := auditInit(); code != "" {
+		refuseExit(code)
+		return
+	}
 	if allowExec {
 		consoleFn(markerStart + "on")
 	} else {
@@ -144,13 +148,38 @@ func errKind(err error) string {
 	return err.Error()
 }
 
-// session runs one connection: the keyring is read fresh (per-session
+// session runs one connection inside its audit bracket: the open receipt
+// is written at accept, one auth_fail receipt per failed verdict (the
+// claimed id when there is one), and the close receipt with the end
+// reason — allowed and refused activity alike (ADR 0052 D4). runSession
+// fills the trail; the emits here keep open..close in seq order around
+// the per-verb receipts.
+func session(c connIO, allowExec bool) bool {
+	tr := &sessionTrail{end: "client_close"}
+	auditSessionEvent("-", "open", "ok")
+	failed := runSession(c, allowExec, tr)
+	if tr.verdict != "" {
+		agent := tr.claimed
+		if agent == "" {
+			agent = "-"
+		}
+		auditSessionEvent(agent, "auth_fail", tr.verdict)
+	}
+	agent := "-"
+	if tr.authed {
+		agent = tr.claimed
+	}
+	auditSessionEvent(agent, "close", tr.end)
+	return failed
+}
+
+// runSession runs one connection: the keyring is read fresh (per-session
 // resolution, ADR 0052 D6), the greeting and single auth attempt run,
 // then the request loop. The challenge and reply buffers are wiped when
 // the session ends (D2). It returns true when the AUTH phase failed
 // (the caller applies the 1 s damping before relistening); request-phase
 // endings are not damped.
-func session(c connIO, allowExec bool) bool {
+func runSession(c connIO, allowExec bool, tr *sessionTrail) bool {
 	r := newLineReader(c)
 
 	kr, kcode := keyringLoad()
@@ -158,18 +187,21 @@ func session(c connIO, allowExec bool) bool {
 		// The posture check passed at start but the file is gone or
 		// unreadable now — no identity can be resolved, so there is no
 		// auth verdict to give.
+		tr.end = "io_error"
 		consoleFn(markerSessEnd + "io_error")
 		return false
 	}
 
 	challenge, ok := agentChallenge()
 	if !ok {
+		tr.end = "io_error"
 		consoleFn(markerSessEnd + "io_error")
 		return false
 	}
 	greeting := `{"proto":"virelai-agent/2","auth":"ed25519","challenge":"` +
 		hexString(challenge[:]) + `"}`
 	if err := sendLine(c, greeting); err != nil {
+		tr.end = "client_close"
 		consoleFn(markerSessEnd + "client_close")
 		return false
 	}
@@ -178,12 +210,12 @@ func session(c connIO, allowExec bool) bool {
 	c.SetRecvDeadline(authBudgetNs)
 	line, outcome := r.readLine(lineMaxPreAuth)
 	if outcome != readOK {
-		authEnd(c, outcome, "")
+		authEnd(c, outcome, tr)
 		return true
 	}
 	v, code := parseLine(line)
 	if code != "" {
-		authEndCode(c, "malformed")
+		authEndCode(c, "malformed", tr)
 		return true
 	}
 	// A first line carrying a verb key is auth_required regardless of what
@@ -191,7 +223,7 @@ func session(c connIO, allowExec bool) bool {
 	// {"agent":"<id>","auth":"<128 hex>"}.
 	for _, m := range v.membs {
 		if m.key == "verb" {
-			authEndCode(c, "preauth")
+			authEndCode(c, "preauth", tr)
 			return true
 		}
 	}
@@ -199,29 +231,30 @@ func session(c connIO, allowExec bool) bool {
 	haveAgent, haveAuth := false, false
 	for _, m := range v.membs {
 		if m.val.kind != jStr {
-			authEndCode(c, "malformed")
+			authEndCode(c, "malformed", tr)
 			return true
 		}
 		switch m.key {
 		case "agent":
 			if haveAgent {
-				authEndCode(c, "malformed")
+				authEndCode(c, "malformed", tr)
 				return true
 			}
 			agentID, haveAgent = m.val.str, true
+			tr.claimed = agentID
 		case "auth":
 			if haveAuth {
-				authEndCode(c, "malformed")
+				authEndCode(c, "malformed", tr)
 				return true
 			}
 			authHex, haveAuth = m.val.str, true
 		default:
-			authEndCode(c, "malformed")
+			authEndCode(c, "malformed", tr)
 			return true
 		}
 	}
 	if !haveAgent || !haveAuth {
-		authEndCode(c, "malformed")
+		authEndCode(c, "malformed", tr)
 		return true
 	}
 	// Resolve the claimed id against the session's keyring: unknown ids
@@ -230,20 +263,21 @@ func session(c connIO, allowExec bool) bool {
 	// the verify path.
 	row := kr.lookup(agentID)
 	if row == nil {
-		authEndCode(c, "agent_unknown")
+		authEndCode(c, "agent_unknown", tr)
 		return true
 	}
 	if kr.revoked[row.pub] {
-		authEndCode(c, "agent_revoked")
+		authEndCode(c, "agent_revoked", tr)
 		return true
 	}
 	verdict := agentVerify(authHex, &challenge, row)
 	wipeBytes(challenge[:])
 	wipeBytes(line) // the reply bytes held the signature
 	if !verdict {
-		authEndCode(c, "sig")
+		authEndCode(c, "sig", tr)
 		return true
 	}
+	tr.authed = true
 	consoleFn(markerAuthOK + " agent=" + agentID)
 	sess := &sessionCtx{agentID: agentID, caps: row.caps, allowExec: allowExec}
 
@@ -266,6 +300,7 @@ func session(c connIO, allowExec bool) bool {
 	}
 	sb.WriteString(`]}`)
 	if err := sendLine(c, sb.String()); err != nil {
+		tr.end = "client_close"
 		consoleFn(markerSessEnd + "client_close")
 		return false
 	}
@@ -278,17 +313,21 @@ func session(c connIO, allowExec bool) bool {
 		switch outcome {
 		case readOK:
 		case readPeerGone:
+			tr.end = "client_close"
 			consoleFn(markerSessEnd + "client_close")
 			return false
 		case readTimeout:
 			_ = sendLine(c, respondErr(-1, "idle_timeout", errMessages["idle_timeout"]))
+			tr.end = "idle_timeout"
 			consoleFn(markerSessEnd + "idle_timeout")
 			return false
 		case readTooLong:
 			_ = sendLine(c, respondErr(-1, "line_too_long", errMessages["line_too_long"]))
+			tr.end = "line_too_long"
 			consoleFn(markerSessEnd + "line_too_long")
 			return false
 		default:
+			tr.end = "io_error"
 			consoleFn(markerSessEnd + "io_error")
 			return false
 		}
@@ -296,19 +335,27 @@ func session(c connIO, allowExec bool) bool {
 	}
 }
 
-// authEnd maps a pre-auth read outcome onto its D2/D4 ending.
-func authEnd(c connIO, outcome int, _ string) {
+// authEnd maps a pre-auth read outcome onto its D2/D4 ending. The trail
+// records the end reason and — where a verdict fired — its named refusal
+// for the auth_fail receipt; a peer that vanished or overran the line
+// limit without a verdict leaves only the close.
+func authEnd(c connIO, outcome int, tr *sessionTrail) {
 	switch outcome {
 	case readTimeout:
 		_ = sendLine(c, respondErr(-1, "auth_timeout", errMessages["auth_timeout"]))
 		consoleFn(markerAuthFail + "timeout")
+		tr.verdict = "auth_timeout"
+		tr.end = "auth_timeout"
 		consoleFn(markerSessEnd + "auth_timeout")
 	case readPeerGone:
+		tr.end = "client_close"
 		consoleFn(markerSessEnd + "client_close")
 	case readTooLong:
 		_ = sendLine(c, respondErr(-1, "line_too_long", errMessages["line_too_long"]))
+		tr.end = "line_too_long"
 		consoleFn(markerSessEnd + "line_too_long")
 	default:
+		tr.end = "io_error"
 		consoleFn(markerSessEnd + "io_error")
 	}
 }
@@ -316,8 +363,9 @@ func authEnd(c connIO, outcome int, _ string) {
 // authEndCode finishes a failed auth attempt: one error line, the auth-fail
 // marker with its D2 reason, and the session-end line. agent_unknown and
 // agent_revoked carry their own wire codes (ADR 0052 D2 — a refused
-// credential is named); everything else maps onto the v1 codes.
-func authEndCode(c connIO, reason string) {
+// credential is named); everything else maps onto the v1 codes. The trail
+// records the wire code as the verdict and the end reason alike.
+func authEndCode(c connIO, reason string, tr *sessionTrail) {
 	code := "auth_failed"
 	msg := errMessages["auth_failed"]
 	switch reason {
@@ -329,6 +377,8 @@ func authEndCode(c connIO, reason string) {
 		msg = errMessages[reason]
 	}
 	_ = sendLine(c, respondErr(-1, code, msg))
+	tr.verdict = code
+	tr.end = code
 	consoleFn(markerAuthFail + reason)
 	consoleFn(markerSessEnd + code)
 }
@@ -346,9 +396,9 @@ func serveLine(c connIO, line []byte, sess *sessionCtx) {
 	if code == "" {
 		req, code = validateRequest(v)
 		id = reqID(req)
-		if code == "" {
-			verb = req.verb
-		}
+	}
+	if req != nil && req.hasVerb {
+		verb = req.verb
 	}
 	var result string
 	if code == "" {
@@ -367,6 +417,9 @@ func serveLine(c connIO, line []byte, sess *sessionCtx) {
 		}
 		result, code = dispatch(req, sess)
 	}
+	// Every dispatch leaves a receipt — the D4 record lands before the
+	// answer so the attempt is on file even if the send cannot be.
+	auditVerb(sess, verb, req, result, code)
 	bare, detail := splitCode(code)
 	if bare == "" {
 		if err := sendLine(c, respondOK(id, result)); err == nil {

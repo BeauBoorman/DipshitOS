@@ -578,6 +578,12 @@ func verbGoshRun(req *request, sess *sessionCtx) (string, string) {
 		ms = timeoutDefMs
 	}
 	_ = deleteFileFn(outPath)
+	// D4 residual (a): the attempt is on record BEFORE the child starts —
+	// a term-capped agent can reach AUDIT/ through a shell line, so this
+	// intent receipt is the untouchable-in-order part of the trail. The
+	// post-dispatch receipt still carries the real result (ok/timed_out/
+	// spawn_failed); the pair is one dispatch's record, not a double count.
+	lane.emit(sess.agentID, "gosh.run", auditArgs(req, "", "intent"), "ok")
 	// The task pool is bounded; a just-exited child's slots stay zombies
 	// until the idle task reaps them, so a back-to-back spawn can land
 	// ENOSPC. That refusal is transient — yield and retry a bounded window

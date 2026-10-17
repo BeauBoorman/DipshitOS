@@ -291,9 +291,8 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
     try std.testing.expectEqualStrings("sys_exnotify", entry_info(sys_exnotify).?.name);
     // #2398 (ADR 0052): slot 88 is the bounded scanout read.
     try std.testing.expectEqualStrings("sys_scanout_read", entry_info(syscall.sys_scanout_read).?.name);
-    // ADR 0054's reservation (M113c #2419): slot 89 stays a named ENOSYS
-    // stub — scanout_read took 88 first, so the grant rows renumber when
-    // that card lands; this row only keeps the table dense and honest.
+    // M113c (#2419, ADR 0054): slot 89 is the grant admin read/write
+    // path — the named reservation is implemented.
     try std.testing.expectEqualStrings("sys_grant_admin", entry_info(89).?.name);
     // M111b (#2409, ADR 0053 D5): slot 90 is the GPU3D compute seam.
     try std.testing.expectEqualStrings("sys_gpucomp", entry_info(syscall.sys_gpucomp).?.name);
@@ -310,12 +309,12 @@ test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
     try std.testing.expectEqual(@as(u64, 1), call_count(sys_ping));
 
     // In-range slots outside the implemented set still return ENOSYS:
-    // 89 is the registered ADR-0054 reservation row (an ENOSYS stub until
-    // #2419 lands the grant table), 91 is the first truly free slot —
-    // the two refusal paths are identical for callers.
+    // 89 is implemented (M113c #2419) — a non-process caller gets the
+    // slot's own EINVAL rather than ENOSYS; 91 is the first truly free
+    // slot.
     try std.testing.expect(exceptions.frame_write(&frame, 8, 89));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
-    try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
+    try std.testing.expectEqual(error_result(.einval), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(u64, 1), call_count(89));
 
     try std.testing.expect(exceptions.frame_write(&frame, 8, 91));
@@ -1406,7 +1405,7 @@ test "syscall: counters are monotonic and report is deterministic" {
     var con = mock.console();
     report(&con);
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=90\n" ++
+        "syscalls: slots=64 implemented=91\n" ++
             "  0 sys_ping calls=2\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1496,8 +1495,8 @@ test "syscall: counters are monotonic and report is deterministic" {
             "  86 sys_udp_close calls=0\n" ++
             "  87 sys_getpid calls=0\n" ++
             "  88 sys_scanout_read calls=0\n" ++
-            // Slot 89 (the ADR-0054 reservation) is reportable=false —
-            // a stub row must not read as a live syscall; 90 is real.
+            // M113c (#2419): slot 89 is implemented and reportable.
+            "  89 sys_grant_admin calls=0\n" ++
             "  90 sys_gpucomp calls=0\n",
         mock.contents(),
     );
@@ -5073,10 +5072,10 @@ test "syscall: shared anon revoke-on-exit — owner exit revokes the peer seat; 
     try std.testing.expect(scheduler.is_terminated(owner_task));
     try std.testing.expect(shared_region.info(h) == null);
     try std.testing.expectEqual(@as(u16, 1), alloc.page_refcount(pa_base));
-    // Simulate the reap's release_resources unref of the owner's dynamic page.
-    // The reap's release_resources unref frees the page (1 -> 0); a second
-    // free attempt then does nothing (the honest "already freed" probe).
-    try std.testing.expect(alloc.unref_page(pa_base));
+    // #2430: the exit seam's early release unrefs the owner's dynamic page
+    // NOW (1 -> 0, freed) — the lifecycle reap only frees the kstack and
+    // page-table root, so no recorded ref survives to unref here.
+    try std.testing.expect(alloc.page_refcount_recorded(pa_base) == null);
     try std.testing.expect(!alloc.unref_page(pa_base));
 
     // The seam's own wm_server.unregister already tore the seat down — a
@@ -5215,10 +5214,10 @@ test "syscall: M52 exit-path inventory — the owner's death through the schedul
     try std.testing.expect(wm_server.registered());
     try std.testing.expectEqual(@as(?usize, wm_pid), wm_server.registered_pid());
 
-    // Cleanup: the reap's release_resources unref frees the owner's dynamic
-    // page (1 -> 0; the second probe is the honest "already freed" check),
-    // then the WM seat tears down for the aggregated binary.
-    try std.testing.expect(alloc.unref_page(pa_base));
+    // Cleanup: the exit seam's early release already unref'd the owner's
+    // dynamic page (1 -> 0, freed — no recorded ref survives), then the WM
+    // seat tears down for the aggregated binary.
+    try std.testing.expect(alloc.page_refcount_recorded(pa_base) == null);
     try std.testing.expect(!alloc.unref_page(pa_base));
     try std.testing.expect(wm_server.unregister(wm_pid));
 }
@@ -7578,4 +7577,77 @@ test "syscall: copy_in/load_u32 consult the read resolver — a refused source f
     // appended nothing.
     try std.testing.expectEqual(@as(u64, 4), dispatch(sys_pipe_read, .{ @intFromPtr(&src) + 4, 8, 0, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_pipe_read, .{ @intFromPtr(&src) + 8, 8, 0, 0, 0, 0 }, &frame));
+}
+
+// ---------------------------------------------------------------------------
+// M113c (#2419, ADR 0054 Part II): the word gate at the dispatch seam
+// ---------------------------------------------------------------------------
+
+var receipt_scratch: [256]u8 = undefined;
+var receipt_len: usize = 0;
+
+fn capture_receipt(bytes: []const u8) void {
+    const take = @min(bytes.len, receipt_scratch.len);
+    @memcpy(receipt_scratch[0..take], bytes[0..take]);
+    receipt_len = take;
+}
+
+test "syscall: the M113c word mask receipts audit denials and enforces EACCES at the dispatch seam" {
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 -> pid 0 (register_user binds it)
+    scheduler.start();
+    var frame = fresh_frame();
+    var hops: usize = 0;
+    while (scheduler.current_id() != 2 and hops < 8) : (hops += 1) _ = scheduler.yield_current();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.current_id());
+    const pid = process.find_by_task(2).?;
+    // The exec-applied mask a `words:-` row would leave: no words at all.
+    const digest: [32]u8 = @as([32]u8, @splat(@as(u8, 0xab)));
+    process.set_grant(pid, 0, digest, true);
+
+    const prev_hook = syscall.klog.line_hook;
+    defer syscall.klog.line_hook = prev_hook;
+    syscall.klog.line_hook = capture_receipt;
+    defer _ = syscall.grant.load("#v1\n");
+
+    // AUDIT posture (the ship default): the denied word receipts through
+    // klog AND the call still lands — slot 30's own port-0 EINVAL proves
+    // the seam let it through to the handler.
+    _ = syscall.grant.load("#v1\n");
+    receipt_len = 0;
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_tcp_connect, .{ 0x0a000002, 0, 0, 0, 0, 0 }, &frame));
+    const audit_line = receipt_scratch[0..receipt_len];
+    try std.testing.expect(std.mem.indexOf(u8, audit_line, "stage=exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_line, "verdict=audit:net_denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_line, "name=user-el0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_line, "word=net") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_line, "sha256=ababab") != null);
+
+    // Slot 80's open-class ops carry the net word (op 10 = connect)
+    // even though the slot itself is ungrouped; a handle op (2 = send)
+    // carries none — the receipt stays silent.
+    receipt_len = 0;
+    _ = dispatch(syscall.sys_socket, .{ 10, 0, 0, 0, 0, 0 }, &frame);
+    try std.testing.expect(std.mem.indexOf(u8, receipt_scratch[0..receipt_len], "audit:net_denied") != null);
+    receipt_len = 0;
+    _ = dispatch(syscall.sys_socket, .{ 2, 0, 0, 0, 0, 0 }, &frame);
+    try std.testing.expectEqual(@as(usize, 0), receipt_len);
+
+    // An ungrouped slot (89) is never the word seam's business — its own
+    // seat gate answers EACCES here and no receipt is emitted.
+    receipt_len = 0;
+    try std.testing.expectEqual(error_result(.eacces), dispatch(89, .{ 0, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(usize, 0), receipt_len);
+
+    // ENFORCE posture (a `#v1 mode=enforce` header — the owner-flipped
+    // posture, not the default): the same denied word refuses EACCES
+    // before the handler's own EINVAL is reachable, and the receipt
+    // names the refusal.
+    _ = syscall.grant.load("#v1 mode=enforce\n");
+    receipt_len = 0;
+    try std.testing.expectEqual(error_result(.eacces), dispatch(sys_tcp_connect, .{ 0x0a000002, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(std.mem.indexOf(u8, receipt_scratch[0..receipt_len], "verdict=refused:net_denied") != null);
 }

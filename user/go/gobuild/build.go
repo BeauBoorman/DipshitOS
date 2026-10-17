@@ -20,18 +20,28 @@ type Step struct {
 // Result is what a build attempt produced. ELF is set only on success;
 // Diags is the ERRORS.TXT payload; Steps is the per-child record (the
 // card's tombstone rule — a dead child is reported, never retried).
+// SrcFiles is the compiled source set (every local package's files, in
+// build order) — the fleet manifest hashes exactly this set.
 type Result struct {
-	ELF   string
-	Diags []Diag
-	Steps []Step
-	Order []string // local package build order
+	ELF      string
+	Diags    []Diag
+	Steps    []Step
+	Order    []string // local package build order
+	SrcFiles []string // compiled .go files across the local closure
 }
 
 // Config is one build's wiring. The zero images are the staged toolchain
 // names; Importcfg nil means the stage-selfhost manifest path and PkgDB nil
-// the staged package table beside it.
+// the staged package table beside it. Root is the fleet's second local
+// tier (empty = the M107a program-dir-only resolution).
+//
+// The kernel's streamed-ELF exec path counts the image name against
+// max_exec_args (exec.zig: `1 + args.len > max_exec_args`), so a build can
+// pass at most SEVEN child args — "-importcfg CFG -tmpdir WD -o OUT OBJ"
+// is exactly that bound; a further "-w" is an exec refusal, not a flag.
 type Config struct {
 	Dir          string   // program dir (share path, e.g. /host/WSP)
+	Root         string   // fleet source root (e.g. /host/SRC); empty = off
 	Out          string   // default: <Dir>/<basename>.ELF
 	Importcfg    []string // staged-archive manifests; default {"/host/GOIMPORT.CFG"}
 	PkgDB        []string // package tables; default {"/host/GOPKGS.TXT"}
@@ -65,11 +75,10 @@ const (
 // can read it back. Tests substitute a fake and never spawn.
 var execAndWait = execAndWaitGuest
 
-// Build compiles dir's package graph into an ELF. Every failure mode lands
-// in Result.Diags — driver diagnostics and parsed child output alike — and
-// in <dir>/.BUILD/ERRORS.TXT; the return value is complete even when the
-// build failed (the console driver prints from it, tests assert on it).
-func Build(cfg Config) Result {
+// defaultConfig fills the fields every caller needs but only Build owned:
+// the toolchain images, workdir, output and the staged manifests. The test
+// build's Config bypasses Build, so it defaults through this same path.
+func defaultConfig(cfg *Config) {
 	if cfg.CompileImage == "" {
 		cfg.CompileImage = compileImage
 	}
@@ -88,6 +97,14 @@ func Build(cfg Config) Result {
 	if len(cfg.PkgDB) == 0 {
 		cfg.PkgDB = []string{"/host/GOPKGS.TXT"}
 	}
+}
+
+// Build compiles dir's package graph into an ELF. Every failure mode lands
+// in Result.Diags — driver diagnostics and parsed child output alike — and
+// in <dir>/.BUILD/ERRORS.TXT; the return value is complete even when the
+// build failed (the console driver prints from it, tests assert on it).
+func Build(cfg Config) Result {
+	defaultConfig(&cfg)
 	res := Result{}
 
 	fail := func(d Diag) Result {
@@ -104,13 +121,27 @@ func Build(cfg Config) Result {
 	table, tdiags := loadPkgTable(cfg.PkgDB)
 	res.Diags = append(res.Diags, tdiags...)
 
-	g := ImportGraph(cfg.Dir, archives, table)
+	g := ImportGraphR(cfg.Dir, cfg.Root, archives, table)
 	res.Diags = append(res.Diags, g.Diags...)
-	res.Diags = append(res.Diags, checkMangles(g)...)
 	for _, p := range g.Order {
 		res.Order = append(res.Order, p.Path)
+		res.SrcFiles = append(res.SrcFiles, p.Files...)
 	}
 	if len(res.Diags) > 0 {
+		writeErrors(cfg.WorkDir, res.Diags)
+		return res
+	}
+	return driveBuild(cfg, g, archives, res)
+}
+
+// driveBuild runs the child-driving half of a build over a resolved graph:
+// one compile child per local package in dependency order plus one link
+// child. Build and the M112b test build share it — the test path differs
+// only in HOW the graph is loaded (a test variant, an external test
+// package and a generated testmain in place of the program dir).
+func driveBuild(cfg Config, g *Graph, archives map[string]string, res Result) Result {
+	fail := func(d Diag) Result {
+		res.Diags = append(res.Diags, d)
 		writeErrors(cfg.WorkDir, res.Diags)
 		return res
 	}
@@ -123,11 +154,10 @@ func Build(cfg Config) Result {
 		if !pkg.Local {
 			continue
 		}
-		stem := "P_" + manglePath(pkg.Path)
-		obj := archivePath(cfg.WorkDir, pkg.Path)
-		rsp := joinPath(cfg.WorkDir, stem+".rsp")
-		icfg := joinPath(cfg.WorkDir, stem+".cfg")
-		diagFile := joinPath(cfg.WorkDir, stem+".diag")
+		obj := archivePath(cfg.WorkDir, pkg.Stem)
+		rsp := joinPath(cfg.WorkDir, pkg.Stem+".rsp")
+		icfg := joinPath(cfg.WorkDir, pkg.Stem+".cfg")
+		diagFile := joinPath(cfg.WorkDir, pkg.Stem+".diag")
 		if err := writeFile(rsp, []byte(strings.Join(pkg.Files, "\n")+"\n")); err != nil {
 			return fail(Diag{Code: "io", File: rsp, Msg: err.Error()})
 		}
@@ -153,7 +183,7 @@ func Build(cfg Config) Result {
 		return fail(Diag{Code: "io", File: lcfg, Msg: err.Error()})
 	}
 	args := []string{"-importcfg", lcfg, "-tmpdir", cfg.WorkDir, "-o", cfg.Out,
-		archivePath(cfg.WorkDir, "main")}
+		archivePath(cfg.WorkDir, g.Main.Stem)}
 	if d, bad := checkArgv(cfg.LinkImage, args); bad {
 		return fail(d)
 	}
@@ -182,8 +212,22 @@ func (s stepOut) failed() bool { return s.err != nil || s.step.Status != 0 }
 
 // runStep spawns one child, waits, and folds its captured output into
 // diags. A nonzero status records the tombstone as a diag naming the child
-// — the card's no-papering-over rule.
+// — the card's no-papering-over rule. A step whose child crashes on the
+// EL0 slot-churn signature (the kernel reaps zombies one per idle pass;
+// ~250-child drives transiently fill the registry — #2430's mechanism) is
+// retried once: the reaper catches up within a tick, and the retry marker
+// rides the step's own diag trail.
 func runStep(cfg Config, label, image string, args []string, diagFile string) stepOut {
+	out := runStepOnce(cfg, label, image, args, diagFile)
+	if out.failed() && transientExec(out.diags, nil) {
+		out = runStepOnce(cfg, label, image, args, diagFile)
+		out.diags = append(out.diags, Diag{Code: "retried",
+			Msg: label + ": retried once after transient slot-churn crash"})
+	}
+	return out
+}
+
+func runStepOnce(cfg Config, label, image string, args []string, diagFile string) stepOut {
 	// The capture temp rides the `~` publish-temp convention beside the
 	// diag stem and is removed once the step's bytes came back — .BUILD
 	// must not accumulate one temp per step per build. The seam takes the

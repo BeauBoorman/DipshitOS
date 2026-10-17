@@ -63,6 +63,7 @@ allow os
 allow path
 allow path/filepath
 allow reflect
+allow regexp
 allow runtime
 allow slices
 allow sort
@@ -71,6 +72,7 @@ allow strings
 allow sync
 allow sync/atomic
 allow syscall
+allow testing
 allow time
 allow unicode
 allow unicode/utf16

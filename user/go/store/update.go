@@ -1,6 +1,8 @@
-package main
+package store
 
 import (
+	"strings"
+
 	"virelai/sshlib"
 )
 
@@ -78,10 +80,10 @@ func loadTrackedApp(fs FS, arg string) (bin string, ent *storeEntry, lines []str
 	return
 }
 
-// cmdUpdate implements `store update <name> [--remote=<r>]
+// Update implements `store update <name> [--remote=<r>]
 // [--channel=<c>]`.
-func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
-	consoleFn("store: update " + arg)
+func Update(fs FS, root, arg, remoteFlag, channelArg string) int {
+	ConsoleFn("store: update " + arg)
 	bin, ent, lines, curELF, curRow, err := loadTrackedApp(fs, arg)
 	if err != nil {
 		return runErr(err)
@@ -90,7 +92,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
-	consoleFn("store: remote " + remote)
+	ConsoleFn("store: remote " + remote)
 	ch, err := openChannel(fs, channelArg)
 	if err != nil {
 		return runErr(err)
@@ -102,6 +104,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("sync")
 	if err := syncStream(fs, remote, ent.Stream, byName); err != nil {
 		return runErr(err)
 	}
@@ -115,7 +118,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	}
 	newHead := *rec.Head
 	if newHead == ent.Head {
-		consoleFn("store: update " + bin + " up to date")
+		ConsoleFn("store: update " + bin + " up to date")
 		return 0
 	}
 
@@ -123,7 +126,8 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	// keyring + Ed25519 (in the FLINT.ELF child, `verify --all --trusted`
 	// bound to the exact log bytes below), signed release.go atom match,
 	// ELF sha256.
-	consoleFn("store: verify " + ent.Stream)
+	emitLeg("verify")
+	ConsoleFn("store: verify " + ent.Stream)
 	logBytes, err := streamLogBytes(fs, root, rec.ID)
 	if err != nil {
 		return runErr(err)
@@ -131,7 +135,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if err := verifyStore(rec.ID, logBytes); err != nil {
 		return runErr(err)
 	}
-	consoleFn("store: verified " + ent.Stream)
+	ConsoleFn("store: verified " + ent.Stream)
 	signed, _, err := headReleaseOps(logBytes, rec.Head)
 	if err != nil {
 		return runErr(err)
@@ -139,6 +143,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if len(signed) == 0 {
 		return runErr(refuse("release_missing", ent.Stream))
 	}
+	emitLeg("fetch")
 	src, err := ch.fetch(ent.Stream+"/"+releaseFile, MaxReleaseBytes)
 	if err != nil {
 		return runErr(err)
@@ -157,6 +162,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("sha")
 	sum := sshlib.SHA256Sum(elf)
 	if sshlib.EncodeHex(sum[:]) != rel.ELFSHA256 {
 		return runErr(refuse("elf_mismatch", bin))
@@ -175,6 +181,7 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	// does .prev rotate to the staged bytes. A kill between the commit
 	// and the rotation leaves PrevSHA naming <bin>.prev.new instead of
 	// <bin>.prev; rollback reads whichever matches.
+	emitLeg("publish")
 	if err := fs.WriteFileSafe(prevStagePath(bin), curELF); err != nil {
 		return runErr(err)
 	}
@@ -190,11 +197,13 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 	}
 	state[bin] = &storeEntry{
 		Name: bin, Stream: ent.Stream, Head: newHead, SHA256: rel.ELFSHA256,
-		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevRow: curRow,
+		Caps:     strings.Join(rel.Caps, ","),
+		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevCaps: ent.Caps, PrevRow: curRow,
 	}
 	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
 		return runErr(err)
 	}
+	emitLeg("prev")
 	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
 		// Committed already: the staged file still hashes to the new
 		// PrevSHA, so rollback is not lost — but the rotation did not
@@ -202,7 +211,8 @@ func cmdUpdate(fs FS, root, arg, remoteFlag, channelArg string) int {
 		return runErr(err)
 	}
 	_ = fs.Remove(prevStagePath(bin))
-	consoleFn("store: update ok " + bin + " version=" + rel.Version)
+	ConsoleFn("store: update ok " + bin + " version=" + rel.Version)
+	grantSync(bin, rel.ELFSHA256, rel.Caps)
 	return 0
 }
 
@@ -238,13 +248,13 @@ func readRollbackBytes(fs FS, bin string, ent *storeEntry) ([]byte, error) {
 	return nil, refuse("prev_mismatch", bin)
 }
 
-// cmdRollback implements `store rollback <name>`: publish the retained
+// Rollback implements `store rollback <name>`: publish the retained
 // bytes (sha-checked against STORE.TXT over both candidate names),
 // restore the prior row, rotate .prev to the ELF being replaced through
 // the same staged->commit->publish order update uses, and swap the
 // state pair.
-func cmdRollback(fs FS, arg string) int {
-	consoleFn("store: rollback " + arg)
+func Rollback(fs FS, arg string) int {
+	ConsoleFn("store: rollback " + arg)
 	bin, ent, lines, curELF, curRow, err := loadTrackedApp(fs, arg)
 	if err != nil {
 		return runErr(err)
@@ -252,6 +262,7 @@ func cmdRollback(fs FS, arg string) int {
 	if ent.PrevHead == "" {
 		return runErr(refuse("no_rollback", bin))
 	}
+	emitLeg("prev")
 	prevELF, err := readRollbackBytes(fs, bin, ent)
 	if err != nil {
 		return runErr(err)
@@ -260,6 +271,7 @@ func cmdRollback(fs FS, arg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("publish")
 	if err := fs.WriteFileSafe(prevStagePath(bin), curELF); err != nil {
 		return runErr(err)
 	}
@@ -275,7 +287,8 @@ func cmdRollback(fs FS, arg string) int {
 	}
 	state[bin] = &storeEntry{
 		Name: bin, Stream: ent.Stream, Head: ent.PrevHead, SHA256: ent.PrevSHA,
-		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevRow: curRow,
+		Caps:     ent.PrevCaps,
+		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevCaps: ent.Caps, PrevRow: curRow,
 	}
 	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
 		return runErr(err)
@@ -284,6 +297,9 @@ func cmdRollback(fs FS, arg string) int {
 		return runErr(err)
 	}
 	_ = fs.Remove(prevStagePath(bin))
-	consoleFn("store: rollback ok " + bin + " head=" + ent.PrevHead)
+	ConsoleFn("store: rollback ok " + bin + " head=" + ent.PrevHead)
+	// The live sha is back at PrevSHA: re-pin the grant row to the image
+	// the user rolled back to — the same non-widening keep update runs.
+	grantSync(bin, ent.PrevSHA, splitGrantWords(ent.PrevCaps))
 	return 0
 }

@@ -2604,3 +2604,35 @@ fence-matched readback verifies; `gputriangle gemmrefuse` prints the
 named `refused invalid` and a live STATS line. On a host without the
 VIC1 capset (or `ready=0`) the journeys answer `gputri: unsupported` and
 no compute receipt exists — the same honesty rule as the render legs.
+
+## Amendment (2026-10-19, M113c #2419 — slot 89 `sys_grant_admin`, the bounded grant-table seam)
+
+ADR 0054 Part II lands the kernel-owned grant table (measured exec +
+word gates). The table's user rows live in `GRANTS.TXT`, secret-class by
+construction — the file ABI can never read or modify them — so the ONE
+in-guest read/write path is this additive amendment. The slot number
+does not move: M111b froze 89 as the named ENOSYS reservation and this
+amendment implements it in place (every existing number stays frozen;
+`implemented_count` is still 91 — the row already existed).
+
+| 89 | `sys_grant_admin` | `grant_admin(op, index, ptr, len) -> i64` | The seat-gated admin seam for `GRANTS.TXT` user rows. op 0 READ: marshal user row `index` (valid rows, insertion order) as its grants line `name<TAB>sha256|*<TAB>words` (no newline) into `ptr` — returns the line length, `ENOENT` when the index is out of range, `EINVAL` when `len` cannot hold the line. op 1 WRITE: parse the grants line at `ptr`/`len` STRICTLY (`EINVAL` for any malformed field — the file's poison rule applies to files, not to an answered syscall), insert-or-update the row by name (a row can only ever carry words inside the baseline — `*` rows narrow only), then persist `GRANTS.TXT` through the kernel file channel. `ENOSPC` when the bounded table is full (never eviction); `ENXIO` when no host file channel exists; `EIO` when the persist fails — the in-kernel table rolls back so it never diverges from a refused write. `EFAULT` for a bad `ptr`. Gate: the registered WM seat (the user's gesture mediator, ADR 0051) or `CAP_PROC_ADMIN`; `EINVAL` for a non-process caller; `EACCES` for any other caller AND for a write whose row names the CALLER's recorded image — an app never writes its own grant row, even through the seat (ADR 0054 D11). Unknown ops are `EINVAL`. |
+
+The grant words gate the existing dispatch table by WORD, not by slot —
+the per-process word mask (computed at exec from the measured image)
+is checked once at the dispatch seam against the ADR 0054 D9 word→slot
+map, plus slot 80's open-class ops (0 listen, 8 beginDns, 10 connect)
+for the `net` word. `audit` mode (the ship posture) receipts every
+would-be denial and refuses nothing; `enforce` makes a denied word an
+`EACCES` answer on the existing slots — no new refusal shapes.
+
+### Observable contract
+
+`live-trust-grants` is the class-B leg set: a confined app's slot-80
+socket open emits `audit:net_denied` receipts while the call still
+lands (audit is a record, not a refusal); a swapped ELF behind a
+hash-bound row refuses `grant_stale` at exec; `GRANTS.TXT` is
+unreadable AND unwritable through the file ABI (both the kernel `vf`
+seam and an EL0 `cat`/`>` get the named refusals); a granted app runs
+unchanged. Host-side seeded `GRANTS.TXT` needs no consumer app — the
+admin slot is proven at class A (authorization, strict parse, ENOSPC,
+rollback) and the read op is exercised by the same seam.

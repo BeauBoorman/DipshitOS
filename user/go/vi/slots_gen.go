@@ -160,7 +160,7 @@ var SyscallSlots = [...]SyscallSlot{
 	{SlotUDPClose, "sys_udp_close", 1, [6]SyscallArg{{Kind: ArgInt}}},
 	{SlotGetpid, "sys_getpid", 0, [6]SyscallArg{}},
 	{SlotScanoutRead, "sys_scanout_read", 6, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
-	{SlotGrantAdmin, "sys_grant_admin", 0, [6]SyscallArg{}},
+	{SlotGrantAdmin, "sys_grant_admin", 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotGpucomp, "sys_gpucomp", 6, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 }
 

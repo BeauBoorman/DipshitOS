@@ -156,13 +156,22 @@ func dirPages(token uint64) ([]DirItem, int64) {
 // ListDirAt lists the canonical directory dir: slot-79 paged snapshots for
 // host-share paths, the legacy 16-row sys_dir_list window for USB volumes
 // (the metadata ABI is host-only — kernel metadata_root refuses every
-// other root). A full legacy window returns ErrTreeLimit, the same named
+// other root), and — when the share is the legacy channel and the metadata
+// snapshot is unavailable — the slot-27 directory protocol's own paged
+// listing. A full legacy window returns ErrTreeLimit, the same named
 // refusal the snapshot's own bound produces.
 func ListDirAt(dir string) ([]DirItem, error) {
 	if usbCanonDir(dir) {
 		return usbDirList(dir)
 	}
 	items, rc := dirSnapshot(dir)
+	if rc == -ErrENOSYS {
+		// The legacy file channel cannot serve the metadata snapshot
+		// (kernel metadata_backend's ops are VirtioFS-only) — but the
+		// slot-27 directory protocol IS served there: same snapshot
+		// bound, same per-page reauthorization.
+		items, rc = dirV2List(dir)
+	}
 	if rc == 0 {
 		return items, nil
 	}
@@ -170,6 +179,95 @@ func ListDirAt(dir string) ([]DirItem, error) {
 		return nil, ErrTreeLimit
 	}
 	return nil, errno(-rc)
+}
+
+// --- the slot-27 directory protocol (directory.zig's version-bit ops) --------
+//
+// The v2 wire: one open under the sys_dir_list slot returns a snapshot
+// token, pages of directory.Entry rows come back by offset until end=1,
+// and the token closes. The kernel implements it for the legacy channel
+// through the host's op_dir_open/page/close exchange — the same protocol
+// virtio_file.snapshot drives in-kernel — and for VirtioFS natively.
+const (
+	dirV2Version = 1 << 63 // directory.version
+	dirV2OpenOp  = dirV2Version | 1
+	dirV2PageOp  = dirV2Version | 2
+	dirV2CloseOp = dirV2Version | 3
+)
+
+// dirV2Entry is directory.Entry's frozen 272-byte wire row.
+type dirV2Entry struct {
+	name    [dirNameMax + 1]byte
+	size    uint64
+	nameLen uint16
+	isDir   uint8
+	_       [5]byte
+}
+
+// dirV2Page is directory.Page: the 16-byte header then page_max rows.
+type dirV2Page struct {
+	next    uint64
+	count   uint32
+	end     uint32
+	entries [dirPageMax]dirV2Entry
+}
+
+// dirV2List lists canonical dir through the slot-27 open/page/close
+// protocol. Returns (items, 0) on success, (nil, kernel result) on any
+// failure — the snapshot is closed on every path once open.
+func dirV2List(canon string) ([]DirItem, int64) {
+	if !strings.HasPrefix(canon, "/") {
+		return nil, -ErrEINVAL
+	}
+	root := "/host" + strings.TrimSuffix(canon, "/")
+	tok := svc6(SlotDirList, strPtr(root), uintptr(len(root)), 0, dirV2OpenOp, 0, 0)
+	if tok <= 0 {
+		return nil, tok
+	}
+	items, rc := dirV2Pages(uint64(tok))
+	if cr := svc6(SlotDirList, uintptr(tok), 0, 0, dirV2CloseOp, 0, 0); rc == 0 && cr != 0 {
+		rc = cr
+	}
+	if rc != 0 {
+		return nil, rc
+	}
+	return items, 0
+}
+
+// dirV2Pages drains one open snapshot with the same protocol discipline
+// dirPages holds: a count the return value does not back, a next that
+// does not advance, or a non-final empty page is a protocol violation.
+func dirV2Pages(token uint64) ([]DirItem, int64) {
+	var items []DirItem
+	var offset uint64
+	for {
+		var page dirV2Page
+		n := svc6(SlotDirList, uintptr(token), uintptr(offset),
+			uintptr(unsafe.Pointer(&page)), dirV2PageOp, dirPageMax, 0)
+		if n < 0 {
+			return nil, n
+		}
+		if n > dirPageMax || page.count != uint32(n) || page.end > 1 ||
+			page.next != offset+uint64(n) || page.next > dirEntryMax ||
+			(n == 0 && page.end != 1) {
+			return nil, -ErrEINVAL
+		}
+		for i := int64(0); i < n; i++ {
+			e := &page.entries[i]
+			if e.nameLen == 0 || e.nameLen > dirNameMax {
+				return nil, -ErrEINVAL
+			}
+			items = append(items, DirItem{
+				Name:  string(e.name[:e.nameLen]),
+				IsDir: e.isDir != 0,
+				Size:  e.size,
+			})
+		}
+		if page.end == 1 {
+			return items, 0
+		}
+		offset = page.next
+	}
 }
 
 // usbCanonDir reports whether the canonical dir names a USB volume root or

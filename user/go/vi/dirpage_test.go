@@ -260,3 +260,140 @@ func TestListDirAtUsbFullWindow(t *testing.T) {
 		t.Fatalf("full usb window = %v, %v; want nil, ErrTreeLimit", items, err)
 	}
 }
+
+// --- the slot-27 directory-protocol fallback (legacy channel) -----------------
+
+// fakeV2Kernel serves the slot-27 open/page/close ops: the directory
+// protocol the kernel uses for the legacy file channel when the slot-79
+// metadata snapshot is unavailable (ListDirAt's transport fallback).
+type fakeV2Kernel struct {
+	entries   []DirItem
+	openRc    int64
+	root      string
+	opened    int
+	pageCalls int
+	closed    bool
+	mutate    func(p *dirV2Page, n int64) int64
+}
+
+func (k *fakeV2Kernel) hook(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+	if num != SlotDirList {
+		return -ErrENOSYS
+	}
+	switch a3 {
+	case dirV2OpenOp:
+		k.root = unsafe.String((*byte)(unsafe.Pointer(a0)), int(a1))
+		if k.openRc < 0 {
+			return k.openRc
+		}
+		k.opened++
+		return 9
+	case dirV2PageOp:
+		if a0 != 9 {
+			return -ErrEBADF
+		}
+		k.pageCalls++
+		offset, limit := uint64(a1), uint64(a4)
+		if offset > uint64(len(k.entries)) {
+			return -1
+		}
+		n := uint64(len(k.entries)) - offset
+		if n > limit {
+			n = limit
+		}
+		p := (*dirV2Page)(unsafe.Pointer(a2))
+		p.count = uint32(n)
+		p.next = offset + n
+		p.end = 0
+		if p.next == uint64(len(k.entries)) {
+			p.end = 1
+		}
+		for i := uint64(0); i < n; i++ {
+			it := k.entries[offset+i]
+			e := &p.entries[i]
+			for j := range e.name {
+				e.name[j] = 0
+			}
+			copy(e.name[:], it.Name)
+			e.nameLen = uint16(len(it.Name))
+			e.size = it.Size
+			if it.IsDir {
+				e.isDir = 1
+			}
+		}
+		if k.mutate != nil {
+			return k.mutate(p, int64(n))
+		}
+		return int64(n)
+	case dirV2CloseOp:
+		k.closed = true
+		return 0
+	}
+	return -ErrEINVAL
+}
+
+// installV2Kernel answers -ENOSYS on the slot-79 ops (the legacy
+// channel's ContainmentUnavailable) and serves slot-27 v2 from k.
+func installV2Kernel(k *fakeV2Kernel) func() {
+	prev6 := SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		if num == SlotFsMetadata {
+			return -ErrENOSYS
+		}
+		return k.hook(num, a0, a1, a2, a3, a4, a5)
+	})
+	return func() { SetSyscallHook6ForTest(prev6) }
+}
+
+func TestListDirAtV2Fallback(t *testing.T) {
+	k := &fakeV2Kernel{}
+	for i := 0; i < 33; i++ {
+		k.entries = append(k.entries, DirItem{Name: "F" + Itoa64(int64(i)) + ".TXT"})
+	}
+	k.entries[0].IsDir = true
+	k.entries[1].Size = 4096
+	defer installV2Kernel(k)()
+
+	items, err := ListDirAt("/AGENT/AUDIT")
+	if err != nil || len(items) != 33 {
+		t.Fatalf("v2 listing = %d items, %v", len(items), err)
+	}
+	if k.root != "/host/AGENT/AUDIT" {
+		t.Fatalf("root = %q, want /host/AGENT/AUDIT", k.root)
+	}
+	if k.pageCalls != 3 || !k.closed {
+		t.Fatalf("pages=%d closed=%v, want 3 true", k.pageCalls, k.closed)
+	}
+	if !items[0].IsDir || items[2].IsDir || items[1].Size != 4096 {
+		t.Fatalf("flags/size = %+v", items[:3])
+	}
+}
+
+func TestListDirAtV2Error(t *testing.T) {
+	k := &fakeV2Kernel{openRc: -ErrENOENT}
+	defer installV2Kernel(k)()
+	items, err := ListDirAt("/AGENT/MISSING")
+	if items != nil || err == nil {
+		t.Fatalf("missing v2 dir = %v, %v", items, err)
+	}
+}
+
+// The slot-79 snapshot wins when it works: a VirtioFS share never falls
+// through to the legacy protocol.
+func TestListDirAtV2NotReachedOnMeta(t *testing.T) {
+	k := &fakeV2Kernel{}
+	prev6 := SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		if num == SlotDirList {
+			return k.hook(num, a0, a1, a2, a3, a4, a5)
+		}
+		mk := &fakeMetaKernel{pageErrAt: -1, entries: []DirItem{{Name: "VIA79"}}}
+		return mk.hook(num, a0, a1, a2, a3, a4, a5)
+	})
+	defer SetSyscallHook6ForTest(prev6)
+	items, err := ListDirAt("/d")
+	if err != nil || len(items) != 1 || items[0].Name != "VIA79" {
+		t.Fatalf("meta listing = %v, %v", items, err)
+	}
+	if k.opened != 0 {
+		t.Fatal("the legacy protocol ran under a working slot-79")
+	}
+}

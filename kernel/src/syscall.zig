@@ -78,7 +78,7 @@ pub const uaccess = @import("uaccess.zig"); // claim 6120: fault-safe copy-in
 pub const userspace = @import("userspace.zig");
 pub const driving_award = @import("driving_award.zig"); // claim 1543/0487 (cards G5/G6): the window manager this seam renders into
 pub const wnd_core = @import("wnd_core.zig");
-const klog = @import("klog.zig"); // #990: serial-log seam (hook armed by main.zig) // M32 WMS4 (issue #624): the SET_WINDOW chrome-descriptor ABI (single source with the WM server)
+pub const klog = @import("klog.zig"); // #990: serial-log seam (hook armed by main.zig) // M32 WMS4 (issue #624): the SET_WINDOW chrome-descriptor ABI (single source with the WM server)
 pub const virtio_gpu = @import("virtio_gpu.zig"); // M32 WMS2 (issue #622): the G1 gpu-armed signal for the REGISTER ENXIO check
 pub const wm_server = @import("wm_server.zig"); // M32 WMS2 (issue #622): the render-server register backing slot 65
 pub const gpu3d_broker = @import("gpu3d_broker.zig"); // M102d1 (issue #2166): the typed GPU3D bridge behind slot-65 cmd 22
@@ -102,6 +102,8 @@ pub const fbtext = @import("text.zig"); // M20-U1 (claim 5127): sys_font_size's 
 pub const shared_region = @import("shared_region.zig"); // M33 SB1 (claim 7418): the D2 shared-anon capability policy (ADR 0016)
 pub const shared_mmap = @import("shared_mmap.zig"); // M33 SB2 (claim 8878): the shared-anon MMU wiring (owner RW / WM RO leaves)
 pub const secret = @import("secret.zig"); // M50 TS5 (issue #1139, ADR 0024 D8): the SECRETS.TXT secret store behind sys_secret_get
+pub const grant = @import("grant.zig"); // M113c (#2419, ADR 0054 Part II): the grant table behind the word gates + slot 89
+pub const measure = @import("measure.zig"); // M113b/c: the receipt format the word-denial lines reuse
 
 const builtin = @import("builtin");
 pub const mmu = @import("mmu.zig");
@@ -557,6 +559,9 @@ var udp_send_staging: [udp.payload_max]u8 = undefined;
 var udp_recv_scratch: [udp.datagram_max]u8 = undefined;
 /// M99i (#2187): the slot-85 copy-out staging — src-IP prefix + datagram.
 var udp_recv_from_scratch: [udp.recv_from_max]u8 = undefined;
+/// M113c (#2419): the slot-89 staging — one grants line (`name<TAB>
+/// sha|*<TAB>words`) marshaled per call in either direction.
+var grant_admin_scratch: [grant.line_max]u8 = undefined;
 /// Milestone 12 (claim 7483): fixed BSS scratch for TCP send payload.
 var tcp_send_staging: [tcp.payload_max]u8 = undefined;
 /// Milestone 14 (claim 0169): fixed BSS scratch for the clipboard (set
@@ -597,7 +602,6 @@ pub fn ensure_table() *const [slot_count]Entry {
                     sys_trace => trace.implemented,
                     sys_profile => sampler.implemented,
                     sys_memstat => memstat.implemented,
-                    sys_grant_admin => false, // the ADR 0054 reservation stub — reserved, not implemented
                     else => true,
                 },
             };
@@ -628,7 +632,7 @@ fn handler_for(comptime number: u64) Handler {
         sys_udp_close => handle_udp_close,
         sys_getpid => handle_getpid,
         sys_scanout_read => handle_scanout_read,
-        sys_grant_admin => handle_enosys,
+        sys_grant_admin => handle_grant_admin,
         sys_gpucomp => handle_gpucomp,
         sys_win_open => handle_win_open,
         sys_win_fill => handle_win_fill,
@@ -740,6 +744,9 @@ fn doms_of(number: u64) u5 {
         sys_udp_listen, sys_udp_send, sys_udp_recv, sys_udp_send_from, sys_udp_recv_from, sys_udp_close, sys_tcp_connect, sys_tcp_send, sys_tcp_recv, sys_tcp_close, sys_sock_ready, sys_socket, sys_ping_send, sys_ping_poll, sys_net_stats => n,
         sys_file_open, sys_file_read, sys_file_write, sys_file_close, sys_dir_list, sys_file_delete, sys_file_rename, sys_file_truncate, sys_file_free, sys_file_sync, sys_fs_metadata => f,
         sys_exec => f | k,
+        // M113c (#2419): the admin slot persists GRANTS.TXT through the
+        // file channel AND reads the caller's registry row.
+        sys_grant_admin => f | k,
         sys_trace => f | k, // M94b's atomic arm-and-exec needs both domains.
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
@@ -768,6 +775,26 @@ pub fn dispatch(number: u64, args: Args, frame: *exceptions.VectorFrame) u64 {
     defer if (doms != 0) svclock.release_set(doms);
     call_counts[svclock.core_id()][number] +%= 1;
     const handler = ensure_table()[number].handler orelse return error_result(.enosys);
+    // M113c (#2419, ADR 0054 D9): the per-process word mask, computed at
+    // exec from the grant table, gates every slot in a word's group —
+    // queried at this ONE seam so the gated set is the table, not a
+    // per-handler convention. Slot 80's open-class ops carry `net` (the
+    // family is op-multiplexed; its slot stays ungrouped). `audit`
+    // receipts the would-be denial and lets the call through; `enforce`
+    // makes it an honest EACCES — flipping the default is a separate
+    // owner decision (D12). Kernel-context callers resolve no pid and
+    // are never the EL0 principal the gate exists for.
+    var required = grant.slot_word(number);
+    if (number == sys_socket and grant.socket_open_op(args[0])) required |= grant.word_net;
+    if (required != 0) {
+        if (process.find_by_task(scheduler.current_id())) |pid| {
+            const missing = required & ~process.word_mask(pid);
+            if (missing != 0) {
+                emit_word_denial(pid, @intCast(@ctz(missing)));
+                if (grant.enforceMode()) return error_result(.eacces);
+            }
+        }
+    }
     const traced_call = trace.before(number, args, frame);
     const result = handler(args, frame);
     trace.after(traced_call, number, args, result);
@@ -2358,6 +2385,97 @@ fn handle_secret_get(args: Args, _: *exceptions.VectorFrame) u64 {
 }
 
 // ---------------------------------------------------------------------------
+// M113c (#2419, ADR 0054 Part II): the word gates + slot 89 sys_grant_admin
+// ---------------------------------------------------------------------------
+
+/// D9/D4: publish one audit receipt for a would-be word denial (audit
+/// mode) or the actual denial (enforce). The `name=` and `sha256=` are
+/// the caller's recorded image and its exec measurement — the receipt
+/// names WHO was denied, not what it asked for (the `word=` field does
+/// that).
+fn emit_word_denial(pid: usize, bit: u5) void {
+    var digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
+    var name: []const u8 = "";
+    if (process.grant_state(pid)) |gs| digest = gs.digest;
+    if (process.info(pid)) |pinfo| name = pinfo.name;
+    const wname = grant.wordName(bit);
+    var verdict_buf: [40]u8 = undefined;
+    const verdict = std.fmt.bufPrint(&verdict_buf, "{s}:{s}_denied", .{
+        if (grant.enforceMode()) "refused" else "audit", wname,
+    }) catch return;
+    var line: [measure.receipt_max]u8 = undefined;
+    const n = measure.receipt_line(&line, .exec, &digest, verdict, name, wname);
+    klog.line(line[0..n]);
+}
+
+/// D7/D11: slot 89 admits the registered WM seat (the user's gesture
+/// mediator — the consent path a widening write needs) or a principal
+/// holding `CAP_PROC_ADMIN`. Same shape as `clipboard_authorized`.
+fn grant_admin_authorized(pid: usize) bool {
+    const caller = process.principal(pid) orelse return false;
+    if (caller.has(process.cap_proc_admin)) return true;
+    if (wm_server.registered_pid()) |seat| return seat == pid;
+    return false;
+}
+
+/// D11: never the app the row names — a write whose row name resolves to
+/// the CALLER's recorded image is refused, so no app widens its own
+/// grant even when it holds the seat. The registry's name window bounds
+/// the comparison the same way `sys_procs` sees it.
+fn grant_row_names_caller(pid: usize, row_name: []const u8) bool {
+    const pinfo = process.info(pid) orelse return false;
+    const take = @min(row_name.len, process.name_max);
+    return std.ascii.eqlIgnoreCase(pinfo.name, row_name[0..take]);
+}
+
+/// M113c (#2419, ADR 0054 D7, ADR 0007 amendment): slot 89 —
+/// `sys_grant_admin(op, index, ptr, len)` — the ONE in-guest read/write
+/// path for `GRANTS.TXT`'s user rows.
+///
+///   - op 0 READ: marshal user row `index` as its grants line
+///     (`name<TAB>sha256|*<TAB>words`, no newline) into `ptr`; `ENOENT`
+///     when the index is out of range, `EINVAL` when `len` cannot hold
+///     the line.
+///   - op 1 WRITE: parse the grants line at `ptr`/`len` STRICTLY
+///     (`EINVAL` for malformed input — the file's poison rule applies to
+///     files, not to an answered syscall), insert-or-update the row by
+///     name, and persist `GRANTS.TXT` through the kernel channel.
+///     `ENOSPC` when the bounded table is full (never eviction), `ENXIO`
+///     with no host channel, `EIO` when the persist fails — the table
+///     rolls back so it never diverges from the refused write.
+///
+/// The gate runs BEFORE any argument is touched: the registered WM seat
+/// or `CAP_PROC_ADMIN`, and never the app the row names.
+fn handle_grant_admin(args: Args, _: *exceptions.VectorFrame) u64 {
+    const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (!grant_admin_authorized(pid)) return error_result(.eacces);
+    switch (args[0]) {
+        0 => {
+            if (args[1] > std.math.maxInt(u32)) return error_result(.einval);
+            const n = grant.row_line(@intCast(args[1]), &grant_admin_scratch) orelse return error_result(.enoent);
+            if (args[3] < n) return error_result(.einval);
+            if (uaccess.copy_out(args[2], grant_admin_scratch[0..n], n) != .ok) return error_result(.efault);
+            return @intCast(n);
+        },
+        1 => {
+            const len: usize = @intCast(args[3]);
+            if (len == 0 or len > grant.line_max) return error_result(.einval);
+            if (uaccess.copy_in(grant_admin_scratch[0..len], args[2], len) != .ok) return error_result(.efault);
+            const line = grant_admin_scratch[0..len];
+            if (grant_row_names_caller(pid, grant.line_name(line))) return error_result(.eacces);
+            return switch (grant.admin_set_line(line)) {
+                .ok => 0,
+                .einval => error_result(.einval),
+                .enospc => error_result(.enospc),
+                .enxio => error_result(.enxio),
+                .eio => error_result(.eio),
+            };
+        },
+        else => return error_result(.einval),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // M51 SSH-P1 (issue #1166, ADR 0025 D5): sys_getrandom — slot 72
 // ---------------------------------------------------------------------------
 
@@ -3343,6 +3461,9 @@ fn handle_exec(args: Args, _: *exceptions.VectorFrame) u64 {
         .bad_elf, .unsupported_arch, .no_pt_load, .too_many_segments, .segment_too_large, .image_truncated => error_result(.einval),
         .not_found => error_result(.enoent),
         .pool_full, .out_of_memory, .table_full, .process_full => error_result(.enospc),
+        // M113c (#2419): a named grant row's sha256 did not match this
+        // image — the refusal receipt names it, the caller sees EACCES.
+        .grant_stale => error_result(.eacces),
     };
 }
 

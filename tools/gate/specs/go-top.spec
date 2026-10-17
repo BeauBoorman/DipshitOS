@@ -38,6 +38,16 @@
 # the v2 rows arrived — absent on a v1 kernel — and a `2` chord repaints the
 # Processes tab with real CPU%/MEM columns over the same busy guest.
 #
+# Run 06 (issue #2411, M111d) is the gpu tab leg: GPUTRIANGLE's `gemm`
+# journey runs one real Metal compute submit first (slot-90 sys_gpucomp,
+# --gpu3d-metal arms the VIC1 device), then GOTOP opens and `c` switches to
+# the gpu tab. The `top: gpu` marker is printed only after the handle-free
+# STATS op returned, so its submits/completed/lastus fields are nonzero
+# evidence of a real kernel — the run ends on that marker (assert-proven,
+# the same convention run 03 uses). busy/queued are the broker's
+# instantaneous flags: a synchronous RUN leaves both at zero once its fence
+# completes, so the assert pins the ledger, not the flags.
+#
 # The old-row decode leg is pinned on the host, not here: a v2 kernel always
 # answers a tagged request with v2 rows, so "v1 stream decodes correctly"
 # is `go test ./vi ./top` (TestProcsV2OldKernel, TestUsageGoneOnV1) plus the
@@ -47,8 +57,9 @@
 #   bash tools/go/build-gotop.sh                    -> .build/go/GOTOP.ELF
 #   bash tools/go/build-go.sh tools/go/smpscale.go  -> .build/go/GOSCALE.ELF
 #   bash tools/go/build-pulse.sh                    -> .build/go/PULSE.ELF
+#   bash tools/go/build-gputriangle.sh              -> .build/go/GPUTRIANGLE.ELF
 
-vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg"
+vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg; #2411: `c` gpu tab over real slot-90 counters"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -113,6 +124,56 @@ if not os.path.exists(psrc):
              "bash tools/go/build-pulse.sh")
 shutil.copy(psrc, os.path.join(share, "PULSE.ELF"))
 print("staged PULSE.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "PULSE.ELF")))
+# M109c run 05: the agent-activity leg. Stage the audit lane AGENT/AUDIT/
+# would carry after an AGENTD session — four RCPT files, one with a
+# deliberately bad MAC — plus the agent-hmac row GOTOP shares with
+# AGENTD.ELF (ADR 0052 D4; GOTOP.ELF must be uid_system-owned for the
+# app-bound row to be served, hence the OWNERS.TXT entry).
+import hashlib as _hashlib, hmac as _hmac
+KEY = "a5" * 32
+open(os.path.join(share, "SECRETS.TXT"), "w").write(
+    "#v1\n" + "agent-hmac\t1000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF\n")
+open(os.path.join(share, "OWNERS.TXT"), "w").write(
+    "#v1\nGOTOP.ELF\t644\t0\t-\n")
+adir = os.path.join(share, "AGENT", "AUDIT")
+os.makedirs(adir, exist_ok=True)
+
+
+def rcpt(seq, agent, verb, args, result, forge=False):
+    line = ('{"seq":%d,"epoch":"01020304","agent":"%s","verb":"%s",'
+            '"args":%s,"ts":1761234567,"mono":42,"result":"%s"}'
+            % (seq, agent, verb, args, result))
+    mac = _hmac.new(KEY.encode(), line.encode(), _hashlib.sha256).hexdigest()
+    if forge:
+        mac = ("0" if mac[0] != "0" else "1") + mac[1:]
+    return (line + "\n" + mac + "\n").encode()
+
+
+open(os.path.join(adir, "RCPT-01020304-00000001"), "wb").write(
+    rcpt(1, "-", "session", '{"event":"open"}', "ok"))
+open(os.path.join(adir, "RCPT-01020304-00000002"), "wb").write(
+    rcpt(2, "devin", "fs.write",
+         '{"path":"HELLO.TXT","size":27,"sha256_8":"01234567"}', "ok"))
+open(os.path.join(adir, "RCPT-01020304-00000003"), "wb").write(
+    rcpt(3, "viewer", "fs.read", '{"path":"SEED.TXT"}', "cap_required:file"))
+open(os.path.join(adir, "RCPT-01020304-00000004"), "wb").write(
+    rcpt(4, "mallory", "gosh.run", '{"cmd":"rm -rf /"}', "ok", forge=True))
+# A second-epoch receipt from an older boot — the lane keeps it, the view
+# shows it verified.
+open(os.path.join(adir, "RCPT-00aa11bb-00000007"), "wb").write(
+    rcpt(7, "ghost", "proc.list", '{}', "ok"))
+# Foreign files the view must skip.
+open(os.path.join(adir, "RCPT-01020304-0000000~"), "wb").write(b"tmp\n")
+open(os.path.join(adir, "OTHER.TXT"), "wb").write(b"x\n")
+print("staged audit lane (5 receipts, 1 forged, + noise files)")
+# M111d run 06: GPUTRIANGLE.ELF is the compute-submit fixture — its `gemm`
+# journey is the real slot-90 workload whose counters the gpu tab must show.
+trsrc = os.path.join(".build", "go", "GPUTRIANGLE.ELF")
+if not os.path.exists(trsrc):
+    sys.exit("GPUTRIANGLE.ELF missing (expected " + trsrc + ") - build it first: "
+             "bash tools/go/build-gputriangle.sh")
+shutil.copy(trsrc, os.path.join(share, "GPUTRIANGLE.ELF"))
+print("staged GPUTRIANGLE.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GPUTRIANGLE.ELF")))
 PY
 
 vgate_run 01 -- \
@@ -355,4 +416,111 @@ if not m:
 if int(m.group(2)) == 0 or int(m.group(3)) == 0:
     sys.exit("FAIL: pulse usage has no real memory figures: %r" % m.group(0))
 print("pulse usage ok: cpux10=%s memused=%sB memtotal=%sB" % m.groups())
+PY
+
+
+# --- Run 05 (M109c #2399): the agent-activity tab renders the audit lane ------
+#
+# A staged AGENT/AUDIT lane — three good receipts and one forged MAC —
+# renders through the `g` chord: GOTOP marks each RCPT verified/forged
+# under the shared agent-hmac row (served to GOTOP.ELF through the same
+# app-bound SECRETS.TXT entry AGENTD uses). The leg fails before the tab
+# exists: `top: tab=agent` and the `top: agent` markers are never printed.
+vgate_file script5a.txt <<'EOS'
+dui close 2
+echo rx-gotop-agent-ok
+EOS
+
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-string 'g' \
+    --input-string-after 'top: ready' \
+    --script3 '$RUN_DIR/script5a.txt' \
+    --script3-after 'top: agent rcpt agent=- verb=session result=ok mark=v' \
+    --script-expect 'rx-gotop-agent-ok' --timeout 150
+
+vgate_assert 05 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 05 serial-contains 'top: ready'
+vgate_assert 05 serial-contains 'top: tab=agent'
+vgate_assert 05 serial-contains 'top: agent n=5 verified=4 bad=1 key=yes'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=viewer verb=fs.read result=cap_required:file mark=v'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=mallory verb=gosh.run result=ok mark=!'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=ghost verb=proc.list result=ok mark=v'
+vgate_assert 05 serial-contains 'top: agent rcpt agent=- verb=session result=ok mark=v'
+vgate_assert 05 serial-contains 'top: win_close'
+vgate_assert 05 serial-contains 'top: exiting 43'
+vgate_assert 05 serial-contains 'rx-gotop-agent-ok'
+vgate_assert 05 serial-absent '[EXC] parking:'
+
+
+# --- Run 06 (M111d #2411): the gpu tab shows real slot-90 counters ------------
+#
+# GPUTRIANGLE.ELF's `gemm` journey does the real work first — a Metal GEMM
+# submit through sys_gpucomp (slot 90) that the host's own counter line
+# proves reached the device (compute-submits=1). GOTOP then opens on the
+# same boot and `c` switches to the gpu tab; the `top: gpu` marker prints
+# only after the handle-free STATS op returned the broker's block. The run
+# ends on that marker — a boot in which the tab never sampled cannot reach
+# it (assert-proven, run 03's convention).
+vgate_file script6a.txt <<'EOF2'
+exec GPUTRIANGLE.ELF gemm
+EOF2
+
+vgate_file script6b.txt <<'EOF2'
+exec GOTOP.ELF
+EOF2
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script6a.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --script3 '$RUN_DIR/script6b.txt' \
+    --script3-after 'gputri: gemm c=19,22,43,50' \
+    --input-string 'c' \
+    --input-string-after 'top: ready' \
+    --script-expect 'top: gpu busy=' --timeout 180
+
+vgate_assert 06 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 06 serial-contains 'exec: loaded GPUTRIANGLE.ELF'
+vgate_assert 06 serial-contains 'gputri: gemm c=19,22,43,50 submits=1 completed=1'
+vgate_assert 06 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 06 serial-contains 'top: ready'
+vgate_assert 06 serial-contains 'top: tab=gpu'
+vgate_assert 06 serial-contains 'top: gpu busy='
+vgate_assert 06 serial-absent 'top: gpu err='
+vgate_assert 06 serial-absent '[EXC] parking:'
+# The runner advertised the second capset and a REAL compute pipeline; one
+# submit reached Metal — the host's own ledger, not the guest's claim.
+vgate_assert 06 output-contains 'VIC1 capset 0x56494331'
+vgate_assert 06 output-contains 'compute=1'
+vgate_assert 06 output-contains 'compute-submits=1'
+
+# The marker's counters are real: a completed submit means submits/completed
+# are nonzero and lastus carries the kernel's measured run time. busy and
+# queued are instantaneous flags — honestly zero after the fence — and are
+# pinned present, not nonzero.
+vgate_assert 06 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+marks = [l for l in ser.splitlines() if l.strip().startswith("top: gpu busy=")]
+if not marks:
+    sys.exit("FAIL: no `top: gpu` stats marker — the tab never sampled")
+m = re.search(r"busy=(\d+) queued=(\d+) sessions=(\d+) lastus=(\d+)"
+              r" totalus=(\d+) submits=(\d+) completed=(\d+)"
+              r" refusals=(\d+) timeouts=(\d+)", marks[-1])
+if not m:
+    sys.exit("FAIL: `top: gpu` marker is not the full counter set: %r" % marks[-1])
+busy, queued, sessions, lastus, totalus, submits, completed, refusals, timeouts = \
+    (int(g) for g in m.groups())
+if submits < 1 or completed < 1:
+    sys.exit("FAIL: no submit completed in the ledger: %r" % marks[-1])
+if lastus < 1 or totalus < 1:
+    sys.exit("FAIL: no kernel time recorded: %r" % marks[-1])
+print("gotop gpu ok: submits=%d completed=%d lastus=%d busy=%d queued=%d"
+      % (submits, completed, lastus, busy, queued))
 PY

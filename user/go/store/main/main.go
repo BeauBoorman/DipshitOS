@@ -14,11 +14,16 @@
 // Every failure is a named refusal — `store: refuse <code>` — and a
 // failed install leaves zero partial state: no ELF, no row, no
 // half-copied file.
+//
+// M110c (#2405): this file is only the CLI shell. The verbs live in
+// package store (user/go/store) so GOSTORE.ELF can link them in-process
+// instead of nesting a STORE.ELF exec — see user/go/store/errors.go.
 package main
 
 import (
 	"strings"
 
+	"virelai/store"
 	"virelai/vi"
 )
 
@@ -28,25 +33,6 @@ var argvEnvpGuard [0x1000]byte
 
 func init() {
 	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
-
-var consoleFn = vi.ConsoleLine
-
-// RefuseError is a named STORE refusal (`store: refuse <code> ...`).
-type RefuseError struct {
-	Code   string
-	Detail string
-}
-
-func (e *RefuseError) Error() string {
-	if e.Detail == "" {
-		return "store: refuse " + e.Code
-	}
-	return "store: refuse " + e.Code + " " + e.Detail
-}
-
-func refuse(code, detail string) error {
-	return &RefuseError{Code: code, Detail: detail}
 }
 
 func main() {
@@ -75,7 +61,7 @@ const usageLine = "store: usage: store ls [--remote=<r>] [--channel=<dir|http://
 
 func run(args []string) int {
 	if len(args) == 0 {
-		consoleFn(usageLine)
+		store.ConsoleFn(usageLine)
 		return 2
 	}
 	var positional []string
@@ -91,7 +77,7 @@ func run(args []string) int {
 		case strings.HasPrefix(a, "--category="):
 			categoryFlag = a[len("--category="):]
 		case strings.HasPrefix(a, "-"):
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		default:
 			positional = append(positional, a)
@@ -101,57 +87,42 @@ func run(args []string) int {
 	switch args[0] {
 	case "ls":
 		if len(positional) != 0 {
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		}
-		return cmdLs(activeFS, DefaultStoreRoot, remoteFlag, channelArg, searchFlag, categoryFlag)
+		return store.Ls(store.GuestFS{}, store.DefaultStoreRoot, remoteFlag, channelArg, searchFlag, categoryFlag)
 	case "info":
 		if len(positional) != 1 || filterArgs {
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		}
-		return cmdInfo(activeFS, DefaultStoreRoot, positional[0], remoteFlag, channelArg)
+		return store.Info(store.GuestFS{}, store.DefaultStoreRoot, positional[0], remoteFlag, channelArg)
 	case "install":
 		if len(positional) != 1 || filterArgs {
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		}
-		return cmdInstall(activeFS, DefaultStoreRoot, positional[0], remoteFlag, channelArg)
+		return store.Install(store.GuestFS{}, store.DefaultStoreRoot, positional[0], remoteFlag, channelArg)
 	case "update":
 		if len(positional) != 1 || filterArgs {
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		}
-		return cmdUpdate(activeFS, DefaultStoreRoot, positional[0], remoteFlag, channelArg)
+		return store.Update(store.GuestFS{}, store.DefaultStoreRoot, positional[0], remoteFlag, channelArg)
 	case "rollback":
 		if len(positional) != 1 || remoteFlag != "" || channelArg != "" || filterArgs {
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		}
-		return cmdRollback(activeFS, positional[0])
+		return store.Rollback(store.GuestFS{}, positional[0])
 	case "remove":
 		if len(positional) != 1 || remoteFlag != "" || channelArg != "" || filterArgs {
-			consoleFn(usageLine)
+			store.ConsoleFn(usageLine)
 			return 2
 		}
-		return cmdRemove(activeFS, positional[0])
+		return store.Remove(store.GuestFS{}, positional[0])
 	default:
-		consoleFn(usageLine)
+		store.ConsoleFn(usageLine)
 		return 2
 	}
-}
-
-func runErr(err error) int {
-	if err == nil {
-		return 0
-	}
-	if re, ok := err.(*RefuseError); ok {
-		consoleFn(re.Error())
-		if re.Code == "usage" {
-			return 2
-		}
-		return 1
-	}
-	consoleFn("store: error " + err.Error())
-	return 1
 }

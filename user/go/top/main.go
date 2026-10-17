@@ -27,6 +27,12 @@
 // Kill IS the live proof (the card's D2): `k`, or the Kill button, arms the
 // selected pid through slot 29, and the kernel converts it into the reserved
 // status 137. A refusal (cross-principal EACCES) is printed, never hidden.
+//
+// The gpu tab (M111d, issue #2411) makes the compute workload observable the
+// way the CPU already is: `c` (or the GPU button) shows the sys_gpucomp
+// counters — busy, queue depth, last kernel time, and the submit ledger —
+// sampled through gpu3d.SampleStats, the kernel's handle-free STATS op, so
+// the monitor never takes the single compute session from a real workload.
 package main
 
 import (
@@ -55,6 +61,8 @@ const (
 	markerReady      = "top: ready"
 	markerProcs      = "top: tab=procs"
 	markerNetwork    = "top: tab=network"
+	markerAgent      = "top: tab=agent"
+	markerGPU        = "top: tab=gpu"
 	markerRefreshed  = "top: refreshed ok"
 	markerKill       = "top: kill pid="
 	markerCount      = "top: procs n="
@@ -97,21 +105,28 @@ type page int
 const (
 	pageProcs page = iota
 	pageNetwork
+	pageAgent
+	pageGPU
 )
 
 // Native layout (top.zig's native_* rects, so GOTOP opens where TOP opened).
 var (
-	natRefresh = widgets.Rect{X: 6, Y: 6, W: 54, H: 20}
-	natKill    = widgets.Rect{X: 64, Y: 6, W: 38, H: 20}
-	natAuto    = widgets.Rect{X: 106, Y: 6, W: 42, H: 20}
-	natProcs   = widgets.Rect{X: 152, Y: 6, W: 44, H: 20}
-	natNetwork = widgets.Rect{X: 200, Y: 6, W: 38, H: 20}
-	// The filter field sits where Zig TOP.BIN's native_filter_input sat —
-	// (296,6,80,20) with its "Filter:" label to the left — and the summary
-	// line shifts right of it.
-	natFilterLabel = widgets.Rect{X: 238, Y: 6, W: 56, H: 20}
-	natFilter      = widgets.Rect{X: 296, Y: 6, W: 80, H: 20}
-	natSummary     = widgets.Rect{X: 384, Y: 6, W: 122, H: 20}
+	natRefresh = widgets.Rect{X: 6, Y: 6, W: 52, H: 20}
+	natKill    = widgets.Rect{X: 62, Y: 6, W: 36, H: 20}
+	natAuto    = widgets.Rect{X: 102, Y: 6, W: 40, H: 20}
+	natProcs   = widgets.Rect{X: 146, Y: 6, W: 42, H: 20}
+	natNetwork = widgets.Rect{X: 192, Y: 6, W: 34, H: 20}
+	// M109c's third tab took the slack between Net and the filter plate:
+	// the filter row compressed a little to keep one toolbar line.
+	natAgent = widgets.Rect{X: 230, Y: 6, W: 38, H: 20}
+	// M111d's fourth tab (GPU) compressed the row once more.
+	natGPU = widgets.Rect{X: 272, Y: 6, W: 32, H: 20}
+	// The filter field sits near where Zig TOP.BIN's native_filter_input
+	// sat — its "Filter:" label to the left — and the summary line ends
+	// the row.
+	natFilterLabel = widgets.Rect{X: 308, Y: 6, W: 44, H: 20}
+	natFilter      = widgets.Rect{X: 354, Y: 6, W: 70, H: 20}
+	natSummary     = widgets.Rect{X: 428, Y: 6, W: 78, H: 20}
 	natHeader      = widgets.Rect{X: 6, Y: 52, W: 500, H: 16}
 	natList        = widgets.Rect{X: 6, Y: 70, W: 500, H: 256}
 	natFoot        = widgets.Rect{X: 6, Y: 330, W: 500, H: 18}
@@ -122,6 +137,8 @@ type app struct {
 	ta   *tabapp.TabApp
 	tab  *Table
 	net  *NetView
+	ag   *AgentView
+	gpu  *GPUView
 	pg   page
 	auto bool
 
@@ -133,6 +150,8 @@ type app struct {
 	autoBtn    widgets.Button
 	procsBtn   widgets.Button
 	netBtn     widgets.Button
+	agentBtn   widgets.Button
+	gpuBtn     widgets.Button
 	summary    widgets.Text
 	header     widgets.Text
 	foot       widgets.Text
@@ -176,6 +195,8 @@ func main() {
 		ta:  ta,
 		tab: NewTable(),
 		net: NewNetView(),
+		ag:  NewAgentView(),
+		gpu: NewGPUView(),
 		pg:  pageProcs,
 	}
 	a.bindFilter()
@@ -234,6 +255,12 @@ func (a *app) refreshAll(rows, announce bool) {
 		return
 	}
 	a.net.Refresh()
+	if a.pg == pageAgent {
+		a.refreshAgent()
+	}
+	if a.pg == pageGPU {
+		a.refreshGPU()
+	}
 	running, exited, _ := a.tab.Counts()
 	vi.ConsoleLine(markerCount + vi.Itoa64(int64(n)) +
 		" running=" + vi.Itoa64(int64(running)) +
@@ -306,12 +333,21 @@ func (a *app) layout() {
 	a.autoBtn = widgets.Button{R: scaleR(natAuto), Label: "Auto", Pressed: a.auto}
 	a.procsBtn = widgets.Button{R: scaleR(natProcs), Label: "Procs"}
 	a.netBtn = widgets.Button{R: scaleR(natNetwork), Label: "Net"}
-	if a.pg == pageProcs {
+	a.agentBtn = widgets.Button{R: scaleR(natAgent), Label: "Agent"}
+	a.gpuBtn = widgets.Button{R: scaleR(natGPU), Label: "GPU"}
+	switch a.pg {
+	case pageProcs:
 		a.procsBtn.Face = t.Accent
 		a.procsBtn.LabelRGB = t.OnAccent
-	} else {
+	case pageNetwork:
 		a.netBtn.Face = t.Accent
 		a.netBtn.LabelRGB = t.OnAccent
+	case pageAgent:
+		a.agentBtn.Face = t.Accent
+		a.agentBtn.LabelRGB = t.OnAccent
+	case pageGPU:
+		a.gpuBtn.Face = t.Accent
+		a.gpuBtn.LabelRGB = t.OnAccent
 	}
 
 	a.summary = widgets.Text{R: scaleR(natSummary), Label: a.status, Fg: t.Muted, Bg: t.Bg}
@@ -321,11 +357,16 @@ func (a *app) layout() {
 	a.filter.R = scaleR(natFilter)
 
 	items := a.items
-	if a.pg == pageNetwork {
-		items = a.net.Lines()
-	}
 	sel := a.tab.SelIndex()
-	if a.pg == pageNetwork {
+	switch a.pg {
+	case pageNetwork:
+		items = a.net.Lines()
+		sel = -1
+	case pageAgent:
+		items = a.ag.Lines()
+		sel = -1
+	case pageGPU:
+		items = a.gpu.Lines()
 		sel = -1
 	}
 	a.list = widgets.List{
@@ -380,11 +421,16 @@ func (a *app) ensureVisible() {
 
 // footLine is the keyboard hint / status line.
 func (a *app) footLine() string {
-	if a.pg == pageNetwork {
+	switch a.pg {
+	case pageNetwork:
 		return "n procs   r refresh   a auto   rx/s " + vi.Itoa64(int64(a.net.RXRate)) +
 			" B   tx/s " + vi.Itoa64(int64(a.net.TXRate)) + " B"
+	case pageAgent:
+		return "p procs   n net   c gpu   r refresh   a auto   v verified ! forged ? no-key x bad"
+	case pageGPU:
+		return "p procs   n net   g agent   r refresh   a auto"
 	}
-	return "k kill   r refresh   a auto   n net   / filter   1-6 sort"
+	return "k kill   r refresh   a auto   n net   g agent   c gpu   / filter   1-6 sort"
 }
 
 func (a *app) draw() {
@@ -394,6 +440,8 @@ func (a *app) draw() {
 	a.summary.Draw(cv)
 	a.procsBtn.Draw(cv)
 	a.netBtn.Draw(cv)
+	a.agentBtn.Draw(cv)
+	a.gpuBtn.Draw(cv)
 	a.refreshBtn.Draw(cv)
 	a.killBtn.Draw(cv)
 	a.autoBtn.Draw(cv)
@@ -413,13 +461,43 @@ func (a *app) setPage(p page) bool {
 		return false
 	}
 	a.pg = p
-	if p == pageNetwork {
+	switch p {
+	case pageNetwork:
 		a.net.Refresh()
 		vi.ConsoleLine(markerNetwork)
-	} else {
+	case pageAgent:
+		vi.ConsoleLine(markerAgent)
+		a.refreshAgent()
+	case pageGPU:
+		vi.ConsoleLine(markerGPU)
+		a.refreshGPU()
+	default:
 		vi.ConsoleLine(markerProcs)
 	}
 	return true
+}
+
+// refreshAgent resamples the audit lane and prints its serial evidence:
+// the count/verdict line, then one bounded marker per receipt row — the
+// same row-dump discipline printRows uses on the procs tab.
+func (a *app) refreshAgent() {
+	a.ag.Refresh()
+	vi.ConsoleLine(a.ag.Marker())
+	for i := 0; i < rowMarkerMax; i++ {
+		line, ok := a.ag.RowMarker(i)
+		if !ok {
+			break
+		}
+		vi.ConsoleLine(line)
+	}
+}
+
+// refreshGPU resamples the slot-90 counters and prints the serial evidence —
+// one marker carrying the whole block (the tab's rows are few and fixed, so
+// there is no per-row dump to bound).
+func (a *app) refreshGPU() {
+	a.gpu.Refresh()
+	vi.ConsoleLine(a.gpu.Marker())
 }
 
 // toggleAuto arms or disarms the 1 Hz app timer (slot 40/41).
@@ -575,6 +653,10 @@ func (a *app) handleKey(ev vi.Event) bool {
 		return a.setPage(pageNetwork)
 	case 'p', 'P':
 		return a.setPage(pageProcs)
+	case 'g', 'G':
+		return a.setPage(pageAgent)
+	case 'c', 'C':
+		return a.setPage(pageGPU)
 	case '/', 'f', 'F':
 		if a.pg == pageProcs {
 			return a.openFilter()
@@ -633,6 +715,12 @@ func (a *app) handleClick(x, y int) bool {
 	}
 	if a.netBtn.HitTest(x, y) {
 		return a.setPage(pageNetwork)
+	}
+	if a.agentBtn.HitTest(x, y) {
+		return a.setPage(pageAgent)
+	}
+	if a.gpuBtn.HitTest(x, y) {
+		return a.setPage(pageGPU)
 	}
 	if a.refreshBtn.HitTest(x, y) {
 		a.refreshAll(true, true)

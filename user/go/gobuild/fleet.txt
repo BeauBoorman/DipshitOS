@@ -1,0 +1,35 @@
+# fleet.txt -- M112a (#2413): the pinned fleet GOBUILD builds in-guest.
+#
+# The fleet is pinned, not discovered: the fifteen `.ELF` rows of
+# image/apps.txt (ZC.BIN and TABWM.BIN are Zig, out of scope) plus the four
+# Go ELFs that are not apps.txt rows — FLINT, STORE, AGENTD and GOBUILD
+# itself. image/apps.txt is not edited and does not name this list.
+#
+# Format: <NAME.ELF> <source dir under the fleet root> — the driver's
+# /host/SRC/<dir> must hold a `package main`. `external:<what>` marks a row
+# whose sources are not stageable on the share and earns a named refusal,
+# never a silently skipped row.
+GOCALC.ELF virelai/calc
+NOTE.ELF virelai/note
+GOEDIT.ELF virelai/edit
+GOFILES.ELF virelai/files
+GOTERM.ELF virelai/term
+WEB.ELF virelai/browser
+PULSE.ELF virelai/pulse
+GOSH.ELF virelai/sh
+GOHELP.ELF virelai/help
+GOTOP.ELF virelai/top
+GOSET.ELF virelai/goset
+GODIFF.ELF virelai/godiff
+GOVIEW.ELF virelai/view
+GOSOUND.ELF virelai/sound
+# GOSTALGIA.ELF is built on the host from a pinned external checkout plus
+# overlay trees (tools/go/build-gostalgia.sh): its sources are not part of
+# this tree and the pin is not a share-visible input.
+GOSTALGIA.ELF external:gostalgia
+FLINT.ELF virelai/flint
+# M110c (#2405) split virelai/store into a library package plus a thin CLI
+# at store/main — the row names the main package, not the library.
+STORE.ELF virelai/store/main
+AGENTD.ELF virelai/agentd
+GOBUILD.ELF virelai/gobuild

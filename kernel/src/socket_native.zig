@@ -304,6 +304,30 @@ fn allocLocalPort() ?u16 {
 /// shape: bit0 = a read outcome is pending (queued bytes, EOF, close, a
 /// peer FIN/RST), bit1 = established with nothing unacked in flight.
 /// WouldBlock when the caller holds no socket (the handler maps EAGAIN).
+/// #2436 diagnostics: the last bit-0 probe's full shape — whether the
+/// caller's "readable-but-empty = peer gone" verdict fired on queued
+/// RX data (a race between the 0-recv and the probe) or an honest
+/// FIN/terminal/closing. Bounded: one record + a count.
+pub const ReadyProbe = struct {
+    rx_len: usize,
+    peer_fin: bool,
+    state: core.State,
+    outcome: core.Outcome,
+    lport: u16,
+    rport: u16,
+    in_flight: u32,
+};
+pub var ready_mask1_count: u64 = 0;
+pub var ready_mask1_probe: ReadyProbe = .{
+    .rx_len = 0,
+    .peer_fin = false,
+    .state = .terminal,
+    .outcome = .none,
+    .lport = 0,
+    .rport = 0,
+    .in_flight = 0,
+};
+
 pub fn legacyReady(owner: u64) core.Error!u64 {
     const c = legacyConn(owner) orelse {
         if (legacyListenerSlot(owner) != null) return 0;
@@ -318,5 +342,17 @@ pub fn legacyReady(owner: u64) core.Error!u64 {
     var mask: u64 = 0;
     if (c.rx_len != 0 or c.peer_fin or c.state == .terminal or c.state == .closing) mask |= 1;
     if (c.state == .established and c.tx_len == 0) mask |= 2;
+    if (mask & 1 != 0) {
+        ready_mask1_count +%= 1;
+        ready_mask1_probe = .{
+            .rx_len = c.rx_len,
+            .peer_fin = c.peer_fin,
+            .state = c.state,
+            .outcome = c.outcome,
+            .lport = c.local.port,
+            .rport = c.remote.port,
+            .in_flight = c.snd_nxt -% c.snd_una,
+        };
+    }
     return mask;
 }

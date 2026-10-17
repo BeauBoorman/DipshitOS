@@ -134,18 +134,72 @@
 # M101a sync runs — observed: `newosproc`/`wait failed` ate the install
 # execs when one boot ran six store verbs).
 #
-# This spec is grown across M103a-d/M101a-e + M110b and is NOT
-# vgate_repeat-safe (runs 01-03, 05-07, 08-10, and 14-19 share /host
-# state across boots).
+# Runs 20-21 (M110d #2406): the third-party publisher drill on a FRESH
+# share (tp-share, the runs 05-07 --cvc-file pattern). The acme key
+# signs a THIRD release stream `acme` whose ELF is the fixture app
+# (tools/gate/fixtures/third-party-app/acmeapp.go — an in-repo stand-in
+# for a foreign publisher's program, built per run by the setup hook so
+# its sha256 always matches the signed manifest). `acme` is served on
+# the same flintd as every other release stream — one remote, one lane:
+# a second listener on its own port is only a second process for a
+# sibling gate's lsof-sweep to murder mid-suite (observed: a foreign
+# gate's flintd answered for this spec's second listener the first time
+# these runs were attempted). Its replica is staged on store-share too
+# (run 14's catalog now lists the acme publisher's second app, so the
+# 4-entry count is the honest one). tp-share is the fresh consumer —
+# its own APPS.TXT/STORE.TXT, every release replica staged verbatim (the
+# staged-bytes seam; without them `store ls` would try to clone a
+# release-sized Change), the drops, and a TRUSTED.TXT that pins
+# sync-seed + acme and revokes revkey's author, plus a staged variant
+# with acme moved to a revoked= row. Run 20 is the run-14 shape on the
+# fresh share: the catalog lists the acme entry, `store install acme`
+# verifies + publishes ACMEAPP.ELF, and the app runs (`acme-app OK` —
+# asserted on run 21's fresh boot: the exec right after a socket-heavy
+# install is the shape the task-pool race eats, observed `gosh:
+# ACMEAPP.ELF: not found` on a green install). Run 21 is the
+# install-time negatives by name: `store install badkey`/`revkey`
+# clone over the wire and refuse key_unknown/key_revoked inside
+# FLINT.ELF; then the in-guest keyring swap revokes the acme publisher
+# AFTER its app was published AND installed — `store install acme` now
+# refuses key_revoked at the verify --all --trusted gate, the strongest
+# form of "revoked after publish" (an already-synced release refused at
+# materialization; the installed bytes stay, revocation gates only new
+# installs). The legs split across boots for the same task-pool reason
+# as runs 18-19.
+#
+# Runs 22-24 (M113d #2420, ADR 0054 D10): ReleaseCaps declare + consent
+# on a fresh `caps-share` under the bare shim (wm=none — the go-calc
+# drive shape: GOSET.ELF is typed via --input-string). `caprel` is
+# a signed release stream whose manifests carry ReleaseCaps: v1 asks
+# file,net, v2 narrows to file, v3 widens to file,debug,net. Run 22
+# installs it unprivileged (STORE can only `grant propose` — the admin
+# slot refuses it EACCES), execs GOHELLO at the ambient baseline, then
+# GOSET -u0 (the monitor's admin spawn — CAP_PROC_ADMIN, the
+# cap half of the seat-or-cap gate) opens the grants pane: `refuse`
+# declines without a write, `grant` lands (bin, sha, words) through slot
+# 89. Run 23's non-widening update re-pins the row to the new image with
+# the consented words verbatim (`store: grant keep`, no fresh ask). Run
+# 24's widening update leaves the row stale — the unconsented v3 image
+# refuses `grant_stale` at exec — until the pane's re-consent binds the
+# widened set.
+#
+# This spec is grown across M103a-d/M101a-e + M110b/d + M113d and is NOT
+# vgate_repeat-safe (runs 01-03, 05-07, 08-10, 14-21, and 22-24 share
+# /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
 #   bash tools/go/build-gosh.sh  -> .build/go/GOSH.ELF
 #   bash tools/go/build-store.sh -> .build/go/STORE.ELF
 #   bash tools/go/build-go.sh    -> .build/go/GOHELLO.ELF
+#   bash tools/go/build-goset.sh -> .build/go/GOSET.ELF       (runs 22/24)
+#   (no seat: wm=none keeps every EL0 slot for the Go legs)
 #   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-17 only;
 #   the hook zig-builds flintd. flint-server is drawmeanelephant's repo under
 #   the VirelaiOS proprietary source-available license (not GPL-family).
+#   The setup hook builds the M110d fixture app itself
+#   (tools/gate/fixtures/third-party-app/acmeapp.go ->
+#   .build/go/ACMEAPP.ELF via build-go.sh + the fork toolchain).
 #
 # exec-order: assert-proven -- run 01 ends on `flint: parse files=`, run 02
 # ends on `flint: status `, run 03 ends on `sig_invalid`, run 04 ends on
@@ -156,7 +210,10 @@
 # auth_failed`, runs 14/15 end on `virelai-go OK` (the v1 install, then the
 # rollback restoring it), run 16 ends on `m101e: torn-state legs done`, run
 # 17 ends on `m101e: negatives done`, run 18 ends on `m110b: catalog ls
-# done`, and run 19 ends on `m110b: catalog legs done`.
+# done`, run 19 ends on `m110b: catalog legs done`, run 20 ends on `m110d:
+# install done`, and run 21 ends on `m110d: negatives done`. Runs 22/24
+# end on `goset: grant written name=GOHELLO.ELF`; run 23 ends on `m113d:
+# keep done`.
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -262,6 +319,18 @@ vgate_file script-19.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec GOSH.ELF -c "source /host/FLINTJ/19.SH"
+EOF
+
+vgate_file script-20.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/20.SH"
+EOF
+
+vgate_file script-21.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOSH.ELF -c "source /host/FLINTJ/21.SH"
 EOF
 
 vgate_setup_python <<'PY'
@@ -626,6 +695,21 @@ import hashlib
 elf_bytes = open(gohello, "rb").read()
 elf_sha = hashlib.sha256(elf_bytes).hexdigest()
 
+# M110d (#2406): the third-party fixture app. Built per run with the
+# same fork toolchain path as the other guests so the signed release
+# manifest's sha256 always matches the delivered ELF — a frozen fixture
+# would go stale the way the release fixture does (the guest build is
+# not bit-reproducible). GO_BUILD_NAME pins the gate-canonical output
+# name; the program is a runtime-only println app like tools/go/hello.go.
+subprocess.check_call(
+    ["bash", "tools/go/build-go.sh",
+     "tools/gate/fixtures/third-party-app/acmeapp.go"],
+    env={**os.environ, "GO_BUILD_NAME": "ACMEAPP"})
+acme_elf = os.path.join(".build", "go", "ACMEAPP.ELF")
+if not os.path.isfile(acme_elf):
+    sys.exit("ACMEAPP.ELF missing after build-go.sh (expected " + acme_elf + ")")
+acme_bytes = open(acme_elf, "rb").read()
+
 # The signed release Change is minted by store's env-gated generator
 # test (user/go/store/fixture_gen_test.go): it parses the release
 # manifest with the real parser, replicates FLINT's canonical bytes, and
@@ -848,6 +932,28 @@ gen_release_fixture({
     "STORE_FIXTURE_TAG": "revkey",
 })
 
+# M110d (#2406): the acme publisher's own app on stream `acme` — signed
+# by the same second-publisher seed as rel2 (the keyring's name=acme
+# row), carrying the ADR 0055 catalog consts, pinning the just-built
+# ACMEAPP.ELF.
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.abspath(acme_elf),
+    "STORE_FIXTURE_NAME": "ACMEAPP",
+    "STORE_FIXTURE_VERSION": "1.0.0",
+    "STORE_FIXTURE_ROW": "ACMEAPP.ELF | Acme App | x | dock=false",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000b013",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c012",
+    "STORE_FIXTURE_TS": "1760000600000",
+    "STORE_FIXTURE_MSG": "acme app release",
+    "STORE_FIXTURE_SEED_HEX": "b3" * 32,
+    "STORE_FIXTURE_SUMMARY": "Acme's first VirelaiOS app",
+    "STORE_FIXTURE_DESCRIPTION": ("Acme App greets the guest from a\n"
+                                  "second publisher key."),
+    "STORE_FIXTURE_CATEGORY": "app",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "acme",
+})
+
 rel_v2_line = open(os.path.join(fixture_dir, "release-v2-stream.jsonl"),
                    "r", encoding="utf-8").read().strip()
 rel_v2 = json.loads(rel_v2_line)
@@ -867,10 +973,13 @@ badkey_ch, badkey_line = load_gen_change("badkey")
 revkey_ch, revkey_line = load_gen_change("revkey")
 rel2_ch, rel2_line = load_gen_change("rel2")
 legacy_ch, legacy_line = load_gen_change("legacy")
+acme_ch, acme_line = load_gen_change("acme")
 rel2_go = open(os.path.join(fixture_dir, "release-rel2.go"),
                "r", encoding="utf-8").read()
 legacy_go = open(os.path.join(fixture_dir, "release-legacy.go"),
                  "r", encoding="utf-8").read()
+acme_go = open(os.path.join(fixture_dir, "release-acme.go"),
+               "r", encoding="utf-8").read()
 
 # flintd serves the two negative-key streams — remote-only, so `store ls`
 # and `store install` must clone them over the wire and the keyring gate
@@ -889,8 +998,11 @@ for ch, line, sname in ((badkey_ch, badkey_line, "badkey"),
 # M110b: flintd also serves the second publisher's `rel2` and the legacy
 # `legacy` stream; the consumer replica is staged verbatim like `rel`'s
 # (the wire `read` cannot carry a release-sized Change — spec header).
+# M110d: `acme` joins the same store — the acme publisher's second app —
+# served + staged like the others.
 for ch, line, sname in ((rel2_ch, rel2_line, "rel2"),
-                        (legacy_ch, legacy_line, "legacy")):
+                        (legacy_ch, legacy_line, "legacy"),
+                        (acme_ch, acme_line, "acme")):
     for store_root in (flintd_store, os.path.join(store_share, "FLINT")):
         with open(os.path.join(store_root, "streams", ch["stream"] + ".jsonl"), "w") as f:
             f.write(line + "\n")
@@ -934,6 +1046,9 @@ write_drop("DROPV2SIG", release_v2_tampered, elf_v2)
 write_drop("DROP", rel2_go, elf_bytes, sname="rel2", bin_name="BOUNCE.ELF")
 open(os.path.join(store_share, "DROP", "rel2", "icon"), "wb").write(ICON_BLOB)
 write_drop("DROP", legacy_go, elf_bytes, sname="legacy", bin_name="LEGACY.ELF")
+# M110d: the acme app's drop — `store ls` folds its manifest on
+# store-share the same way as the other release streams.
+write_drop("DROP", acme_go, acme_bytes, sname="acme", bin_name="ACMEAPP.ELF")
 desc_tampered = release_v2_go.replace("smallest signed release",
                                       "smallest unsigned release")
 assert desc_tampered != release_v2_go
@@ -1016,7 +1131,303 @@ for sname, sbody in flintj_m101e.items():
          "w", encoding="utf-8").write(sbody)
 
 
-print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, and store-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
+# ---- M110d (#2406): the third-party publisher drill -------------------
+# The fresh consumer share: its own APPS.TXT/STORE.TXT, the FULL release
+# replica set staged verbatim (the wire `read` cannot carry a
+# release-sized Change — the spec header's staged-bytes seam), the
+# per-stream drops `store ls` folds, and a keyring that pins sync-seed +
+# acme and revokes revkey's author while badkey's stays absent. The
+# revoked variant run 21 swaps in moves acme itself to a revoked= row —
+# revocation AFTER publish, exercised at materialization.
+tp_share = os.path.join(run, "tp-share")
+os.makedirs(os.path.join(tp_share, "FLINTJ"), exist_ok=True)
+os.makedirs(os.path.join(tp_share, "FLINT", "streams"), exist_ok=True)
+for name in ("FLINT.ELF", "GOSH.ELF", "STORE.ELF"):
+    shutil.copy(os.path.join(".build", "go", name), os.path.join(tp_share, name))
+open(os.path.join(tp_share, "OWNERS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nFLINT.ELF\t644\t0\t-\nSTORE.ELF\t644\t0\t-\n"
+)
+open(os.path.join(tp_share, "SECRETS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nflint-remote\t1000\t" + AUTH_KEY_HEX + "\tFLINT.ELF,STORE.ELF\n"
+)
+open(os.path.join(tp_share, "FLINT", "TRUSTED.TXT"),
+     "w", encoding="utf-8").write(
+    "#v1\nkey=" + good_changes[-1]["author"] + " name=sync-seed\n"
+    "key=" + acme_ch["author"] + " name=acme\n"
+    "revoked=" + revkey_ch["author"] + "\n"
+)
+for ch, line, sname, created in (
+        (good_changes[-1], good_raw.decode("utf-8").strip(), "main",
+         good_changes[0]["ts"]),
+        (rel_change, rel_change_line, "rel", 1760000000000),
+        (rel2_ch, rel2_line, "rel2", rel2_ch["ts"]),
+        (legacy_ch, legacy_line, "legacy", legacy_ch["ts"]),
+        (acme_ch, acme_line, "acme", acme_ch["ts"])):
+    with open(os.path.join(tp_share, "FLINT", "streams",
+                           ch["stream"] + ".jsonl"), "wb") as f:
+        if isinstance(line, bytes):
+            f.write(line)
+        else:
+            f.write((line + "\n").encode("utf-8"))
+    with open(os.path.join(tp_share, "FLINT", "streams",
+                           ch["stream"] + ".json"), "w") as f:
+        f.write(json.dumps(
+            {"id": ch["stream"], "name": sname, "head": ch["id"],
+             "created": created, "forked_from": None},
+            separators=(",", ":")) + "\n")
+shutil.copy(os.path.join("image", "apps.txt"), os.path.join(tp_share, "APPS.TXT"))
+
+open(os.path.join(tp_share, "FLINTJ", "trusted-revoked.txt"),
+     "w", encoding="utf-8").write(
+    "#v1\nkey=" + good_changes[-1]["author"] + " name=sync-seed\n"
+    "revoked=" + acme_ch["author"] + "\n"
+    "revoked=" + revkey_ch["author"] + "\n"
+)
+
+
+def tp_drop(sname, rel_text, elf, bin_name):
+    dd = os.path.join(tp_share, "DROP", sname)
+    os.makedirs(dd, exist_ok=True)
+    open(os.path.join(dd, "release.go"), "w", encoding="utf-8").write(rel_text)
+    open(os.path.join(dd, bin_name), "wb").write(elf)
+
+
+tp_drop("rel", release_go, elf_bytes, "GOHELLO.ELF")
+tp_drop("rel2", rel2_go, elf_bytes, "BOUNCE.ELF")
+open(os.path.join(tp_share, "DROP", "rel2", "icon"), "wb").write(ICON_BLOB)
+tp_drop("legacy", legacy_go, elf_bytes, "LEGACY.ELF")
+tp_drop("acme", acme_go, acme_bytes, "ACMEAPP.ELF")
+
+# 20: catalog + install + run — the run-14 shape on the fresh share.
+# `store ls` refreshes nothing (the staged replicas' heads match the
+# remote's) but does attempt the two remote-only clones, so the named
+# keyring refusals print inside the happy-path boot exactly like run 14.
+open(os.path.join(tp_share, "FLINTJ", "20.SH"), "w", encoding="utf-8").write(
+    "STORE.ELF ls --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "STORE.ELF install acme --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "ACMEAPP.ELF\n"
+    "echo m110d: install done\n"
+)
+# 21: a second boot proves the installed app persists and still runs
+# BEFORE any socket session (the fresh-boot exec is the reclaim-safe
+# one — the same line right after run 20's socket-heavy install is the
+# shape the task-pool race eats). The revoked-after-publish leg runs
+# next — this card's new negative — ahead of the clone-negative legs:
+# each refused clone is ~3 socket sessions of retries, so the legs
+# late in the script are the first execs the task-pool race eats
+# (observed in both orders). The keyring swap revokes acme AND revkey
+# before all three installs, so the refusals land the same names
+# regardless of order.
+open(os.path.join(tp_share, "FLINTJ", "21.SH"), "w", encoding="utf-8").write(
+    "ACMEAPP.ELF\n"
+    "cat /host/FLINTJ/trusted-revoked.txt > /host/FLINT/TRUSTED.TXT\n"
+    "STORE.ELF install acme --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "STORE.ELF install badkey --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "STORE.ELF install revkey --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "echo m110d: negatives done\n"
+)
+
+
+# ---- M113d (#2420): ReleaseCaps declare + consent ----------------------
+# `caprel` is a third release stream whose signed manifests carry ADR
+# 0054 D10's ReleaseCaps — v1 asks file,net, v2 narrows to file (the
+# non-widening keep leg), v3 widens to file,debug,net (the re-ask leg).
+# Runs 22-24 drive the whole lifecycle on one fresh share under the Go
+# seat: STORE.ELF unprivileged can only PROPOSE (the admin slot refuses
+# it EACCES — nothing the publisher signs becomes power), GOSET.ELF
+# exec'd -u0 (the monitor's admin spawn — the CAP_PROC_ADMIN half of the
+# seat-or-cap gate) is the consenting pane, and -u0 update runs the
+# keep's sha re-pin through the same slot.
+goset_elf = os.path.join(".build", "go", "GOSET.ELF")
+if not os.path.isfile(goset_elf):
+    sys.exit("GOSET.ELF missing (expected " + goset_elf +
+             ") - build it first: bash tools/go/build-goset.sh")
+
+caprel_stream_id = "0199de2d-dc00-7000-8000-00000000f010"
+elf_v3 = elf_bytes.replace(mark_v1, b"virelai-go V3")
+assert elf_v3 != elf_bytes
+
+gen_release_fixture({
+    "STORE_FIXTURE_STREAM": caprel_stream_id,
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000f001",
+    "STORE_FIXTURE_CAPS": "file,net",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "caprel-v1",
+})
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-v2.elf"),
+    "STORE_FIXTURE_VERSION": "2.0.0",
+    "STORE_FIXTURE_STREAM": caprel_stream_id,
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000f002",
+    "STORE_FIXTURE_PARENT": "0199de2d-dc00-7000-8000-00000000f001",
+    "STORE_FIXTURE_PREV_ELF": os.path.abspath(gohello),
+    "STORE_FIXTURE_PREV_VERSION": "1.0.0",
+    "STORE_FIXTURE_TS": "1760000001000",
+    "STORE_FIXTURE_CAPS": "file",
+    "STORE_FIXTURE_PREV_CAPS": "file,net",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "caprel-v2",
+})
+open(os.path.join(fixture_dir, "gohello-v3.elf"), "wb").write(elf_v3)
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-v3.elf"),
+    "STORE_FIXTURE_VERSION": "3.0.0",
+    "STORE_FIXTURE_STREAM": caprel_stream_id,
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000f003",
+    "STORE_FIXTURE_PARENT": "0199de2d-dc00-7000-8000-00000000f002",
+    "STORE_FIXTURE_PREV_ELF": os.path.join(fixture_dir, "gohello-v2.elf"),
+    "STORE_FIXTURE_PREV_VERSION": "2.0.0",
+    "STORE_FIXTURE_TS": "1760000002000",
+    "STORE_FIXTURE_CAPS": "file,debug,net",
+    "STORE_FIXTURE_PREV_CAPS": "file",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "caprel-v3",
+})
+caprel = {}
+for tag in ("caprel-v1", "caprel-v2", "caprel-v3"):
+    caprel[tag] = (
+        open(os.path.join(fixture_dir, "release-%s-stream.jsonl" % tag),
+             "r", encoding="utf-8").read().strip(),
+        open(os.path.join(fixture_dir, "release-%s.go" % tag),
+             "r", encoding="utf-8").read(),
+    )
+caprel_v1, caprel_v2, caprel_v3 = (json.loads(caprel[t][0])
+                                 for t in ("caprel-v1", "caprel-v2", "caprel-v3"))
+
+caps_share = os.path.join(run, "caps-share")
+os.makedirs(os.path.join(caps_share, "FLINTJ"), exist_ok=True)
+os.makedirs(os.path.join(caps_share, "FLINT", "streams"), exist_ok=True)
+for name in ("FLINT.ELF", "GOSH.ELF", "STORE.ELF", "GOSET.ELF"):
+    shutil.copy(os.path.join(".build", "go", name), os.path.join(caps_share, name))
+# NO seat (wm=none — the go-calc shim shape): a seat + GOSH + STORE +
+# the FLINT child is four Go runtimes at once, the shape the task-pool
+# race eats (observed: `newosproc: sys_thread create failed` inside the
+# install leg), and typed input under a shim lands on the only window —
+# GOSET's — with no seat-side focus arbitration to race (observed: the
+# Zig seat's `tab-switch idx=1` stole focus over `goset: ready`).
+shutil.copy(os.path.join("image", "apps.txt"), os.path.join(caps_share, "APPS.TXT"))
+if os.path.isfile(os.path.join("image", "WALLPAPER.QOI")):
+    shutil.copy(os.path.join("image", "WALLPAPER.QOI"),
+                os.path.join(caps_share, "WALLPAPER.QOI"))
+if os.path.isfile(os.path.join("user", "src", "lib", "fixtures", "qoi",
+                               "mascot_64x64.qoi")):
+    shutil.copy(os.path.join("user", "src", "lib", "fixtures", "qoi",
+                             "mascot_64x64.qoi"),
+                os.path.join(caps_share, "SEXIBURGER.QOI"))
+for src, dst in (("Inter-Regular.ttf", "INTER.TTF"),
+                 ("Inter-Bold.ttf", "INTERB.TTF"),
+                 ("Inter-Italic.ttf", "INTERI.TTF"),
+                 ("Inter-BoldItalic.ttf", "INTERBI.TTF"),
+                 ("FiraCode-Regular.ttf", "FIRACODE.TTF")):
+    p = os.path.join("image", "fonts", src)
+    if os.path.isfile(p):
+        shutil.copy(p, os.path.join(caps_share, dst))
+open(os.path.join(caps_share, "SETTINGS.TXT"), "w", encoding="utf-8").write(
+    "#v2\nwm=none\n")
+open(os.path.join(caps_share, "OWNERS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nFLINT.ELF\t644\t0\t-\nSTORE.ELF\t644\t0\t-\n"
+)
+open(os.path.join(caps_share, "SECRETS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nflint-remote\t1000\t" + AUTH_KEY_HEX + "\tFLINT.ELF,STORE.ELF\n" +
+    # The keep path runs STORE -u0: uid_system lanes are served to the
+    # admin principal only, so the admin STORE gets its own lane for the
+    # same remote key.
+    "flint-remote\t0\t" + AUTH_KEY_HEX + "\tFLINT.ELF,STORE.ELF\n"
+)
+open(os.path.join(caps_share, "FLINT", "TRUSTED.TXT"),
+     "w", encoding="utf-8").write(
+    "#v1\nkey=" + good_changes[-1]["author"] + " name=sync-seed\n"
+)
+# The v1 replica — the staged-bytes seam again, local AND remote: pull
+# only ever runs `heads` (the remote record stays at v1, so the .SH
+# file-copy advances read as already-ahead like run 15's).
+caprel_line_v1 = caprel["caprel-v1"][0]
+for store_root in (flintd_store, os.path.join(caps_share, "FLINT")):
+    with open(os.path.join(store_root, "streams",
+                           caprel_stream_id + ".jsonl"), "w") as f:
+        f.write(caprel_line_v1 + "\n")
+    with open(os.path.join(store_root, "streams",
+                           caprel_stream_id + ".json"), "w") as f:
+        f.write(json.dumps(
+            {"id": caprel_stream_id, "name": "caprel",
+             "head": caprel_v1["id"], "created": caprel_v1["ts"],
+             "forked_from": None},
+            separators=(",", ":")) + "\n")
+
+
+def caps_drop(drop, tag, elf):
+    d = os.path.join(caps_share, drop, "caprel")
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "release.go"), "w",
+         encoding="utf-8").write(caprel[tag][1])
+    open(os.path.join(d, "GOHELLO.ELF"), "wb").write(elf)
+
+
+caps_drop("DROP", "caprel-v1", elf_bytes)
+caps_drop("DROPV2G", "caprel-v2", elf_v2)
+caps_drop("DROPV3G", "caprel-v3", elf_v3)
+
+# The replica advances (v1+v2 then v1+v2+v3 chains + rolled record
+# heads) the .SH legs land by file copy.
+with open(os.path.join(caps_share, "FLINTJ", "caprel-v2.jsonl"),
+          "w", encoding="utf-8") as f:
+    f.write(caprel_line_v1 + "\n" + caprel["caprel-v2"][0] + "\n")
+# gosh's readBounded caps one `cat` at 4096 bytes — a 3-line file is
+# ~4.9 KiB, so 24.SH appends the v3 line alone instead of overwriting
+# with the whole chain (the error text would otherwise land IN the
+# stream file and `flint pull` would refuse change_malformed).
+with open(os.path.join(caps_share, "FLINTJ", "caprel-v3-last.jsonl"),
+          "w", encoding="utf-8") as f:
+    f.write(caprel["caprel-v3"][0] + "\n")
+for tag, head in (("caprel-v2", caprel_v2["id"]),
+                  ("caprel-v3", caprel_v3["id"])):
+    with open(os.path.join(caps_share, "FLINTJ", tag + ".json"),
+              "w", encoding="utf-8") as f:
+        f.write(json.dumps(
+            {"id": caprel_stream_id, "name": "caprel", "head": head,
+             "created": caprel_v1["ts"], "forked_from": None},
+            separators=(",", ":")) + "\n")
+
+flintj_m113d = {
+    # 22: install the caps-bearing release (STORE unprivileged — it can
+    # only propose), then exec the installed app at the ambient
+    # baseline: no grant row means every word stays ambient, and the
+    # consent pane's refuse/grant gestures are the legs after this
+    # script ends.
+    "22.SH": (
+        "STORE.ELF install caprel --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+        "GOHELLO.ELF\n"
+        "echo m113d: install done\n"
+    ),
+    # 23: advance to the non-widening v2 (file ⊆ consented file,net) and
+    # update under -u0 — STORE sees the row, re-pins its sha to the new
+    # image with the consented words verbatim, and the v2 exec runs.
+    "23.SH": (
+        "cat /host/FLINTJ/caprel-v2.jsonl > /host/FLINT/streams/" + caprel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/caprel-v2.json > /host/FLINT/streams/" + caprel_stream_id + ".json\n"
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV2G\n"
+        "GOHELLO.ELF\n"
+        "echo m113d: keep done\n"
+    ),
+    # 24: advance to the widening v3 (debug ∉ consented file,net) and
+    # update under -u0 — the row is left bound to v2's image (stale:
+    # the unconsented image refuses grant_stale at exec), the ask is
+    # re-proposed, and the pane's consent is the leg after this script.
+    "24.SH": (
+        "cat /host/FLINTJ/caprel-v2.jsonl > /host/FLINT/streams/" + caprel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/caprel-v3-last.jsonl >> /host/FLINT/streams/" + caprel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/caprel-v3.json > /host/FLINT/streams/" + caprel_stream_id + ".json\n"
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV3G\n"
+        "GOHELLO.ELF\n"
+        "echo m113d: widening done\n"
+    ),
+}
+for sname, sbody in flintj_m113d.items():
+    open(os.path.join(caps_share, "FLINTJ", sname),
+         "w", encoding="utf-8").write(sbody)
+
+
+print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, store-share, tp-share, and caps-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
 PY
 
 # ---- 01: M103a in-guest parse-corpus over /host/FLINTC -----------------------
@@ -1473,15 +1884,18 @@ vgate_assert 14 serial-contains 'store: stream revkey sync-failed'
 # M110b: `store ls` renders the signed catalog — every release stream's
 # manifest consts plus the derived publisher fingerprint (the head
 # Change's author key, labeled from TRUSTED.TXT). Two pinned publishers
-# and one legacy four-const stream.
+# and one legacy four-const stream. M110d: the acme publisher's second
+# app joins the fold — the 4-entry count is the honest one.
 vgate_assert 14 serial-contains 'store: stream rel release name=GOHELLO version=1.0.0 category=demo'
 vgate_assert 14 serial-contains 'store: stream rel2 release name=BOUNCE version=1.4.0 category=game'
 vgate_assert 14 serial-contains 'store: stream legacy release name=LEGACY version=0.9.0 category=-'
+vgate_assert 14 serial-contains 'store: stream acme release name=ACMEAPP version=1.0.0 category=app'
 vgate_assert 14 serial-contains 'publisher_state=trusted summary=-'
 vgate_assert 14 serial-contains 'publisher_name=sync-seed publisher_state=trusted'
 vgate_assert 14 serial-contains 'publisher_name=acme publisher_state=trusted'
 vgate_assert 14 serial-contains 'summary=Go Hello greets VirelaiOS'
-vgate_assert 14 serial-contains 'store: ls ok entries=3'
+vgate_assert 14 serial-contains 'summary=Acme'"'"'s first VirelaiOS app'
+vgate_assert 14 serial-contains 'store: ls ok entries=4'
 vgate_assert 14 serial-contains 'sig: verified'
 vgate_assert 14 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
 vgate_assert 14 serial-contains 'virelai-go OK'
@@ -1575,8 +1989,10 @@ want_state = ("#v1\n"
               "name=GOHELLO.ELF stream=rel "
               "head=0199de2d-dc00-7000-8000-00000000c001 "
               "sha256=" + v1sha + " "
+              "caps=- "
               "prev_head=0199de2d-dc00-7000-8000-00000000c002 "
               "prev_sha256=" + v2sha + " "
+              "prev_caps=- "
               "prev_row=GOHELLO.ELF | Go Hello | g | dock=false\n")
 got_state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
 if got_state != want_state:
@@ -1629,8 +2045,10 @@ want_state = ("#v1\n"
               "name=GOHELLO.ELF stream=rel "
               "head=0199de2d-dc00-7000-8000-00000000c001 "
               "sha256=" + v1sha + " "
+              "caps=- "
               "prev_head=0199de2d-dc00-7000-8000-00000000c002 "
               "prev_sha256=" + v2sha + " "
+              "prev_caps=- "
               "prev_row=GOHELLO.ELF | Go Hello | g | dock=false\n")
 got_state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
 if got_state != want_state:
@@ -1797,4 +2215,297 @@ if "name=LEGACY.ELF stream=legacy head=0199de2d-dc00-7000-8000-00000000c011" not
 if "GOHELLO" in state:
     sys.exit("GOHELLO crept back into STORE.TXT")
 print("run-19 verified: tampered description refused, legacy release installed")
+PY
+
+# ---- 20: M110d (#2406) fresh share — catalog lists the acme app, ------
+# ---- install verifies + publishes it, the app runs -------------------
+vgate_run 20 -- \
+    --cvc-file '$RUN_DIR/tp-share' \
+    --virtio-fs '$RUN_DIR/tp-share' \
+    --net '$RUN_DIR/cap20.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-20.txt' \
+    --script-expect 'm110d: install done' \
+    --script-expect-tail 3 --timeout 300
+
+# The catalog fold over the fresh share: the acme entry renders with its
+# signed consts + the derived acme fingerprint beside the other three
+# release streams, and the remote-only negative-key streams refuse
+# their clones inside the same boot.
+vgate_assert 20 serial-contains 'store: stream acme release name=ACMEAPP version=1.0.0 category=app'
+vgate_assert 20 serial-contains 'store: stream rel2 release name=BOUNCE version=1.4.0 category=game'
+vgate_assert 20 serial-contains 'publisher_name=acme publisher_state=trusted'
+vgate_assert 20 serial-contains 'summary=Acme'"'"'s first VirelaiOS app'
+vgate_assert 20 serial-contains 'store: stream main no-release'
+vgate_assert 20 serial-contains 'store: stream badkey sync-failed'
+vgate_assert 20 serial-contains 'store: stream revkey sync-failed'
+vgate_assert 20 serial-contains 'store: ls ok entries=4'
+vgate_assert 20 serial-count 'flint: refuse key_unknown' 1
+vgate_assert 20 serial-count 'flint: refuse key_revoked' 1
+vgate_assert 20 serial-contains 'sig: verified'
+vgate_assert 20 serial-contains 'store: install ok ACMEAPP.ELF version=1.0.0'
+vgate_assert 20 serial-absent 'store: refuse'
+vgate_assert 20 serial-absent 'sig_invalid'
+vgate_assert 20 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 20 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 20 serial-absent '[EXC] parking:'
+vgate_assert 20 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "tp-share")
+
+elf = os.path.join(share, "ACMEAPP.ELF")
+if not os.path.isfile(elf):
+    sys.exit("ACMEAPP.ELF missing at tp-share root after install")
+got = hashlib.sha256(open(elf, "rb").read()).hexdigest()
+want = hashlib.sha256(open(os.path.join(".build", "go", "ACMEAPP.ELF"), "rb").read()).hexdigest()
+if got != want:
+    sys.exit("installed ACMEAPP.ELF hash %s != built %s" % (got, want))
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if apps.count("ACMEAPP.ELF |") != 1:
+    sys.exit("expected exactly one ACMEAPP row in APPS.TXT: %r" % apps)
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "name=ACMEAPP.ELF stream=acme head=0199de2d-dc00-7000-8000-00000000c012" not in state:
+    sys.exit("STORE.TXT missing acme entry: %r" % state)
+trusted = open(os.path.join(share, "FLINT", "TRUSTED.TXT"), "r", encoding="utf-8").read()
+if "key=" not in trusted or "name=acme" not in trusted:
+    sys.exit("TRUSTED.TXT moved before the revocation leg: %r" % trusted)
+for sid in ("0199de2d-dc00-7000-8000-00000000e010",
+            "0199de2d-dc00-7000-8000-00000000e011"):
+    if os.path.exists(os.path.join(share, "FLINT", "streams", sid + ".jsonl")):
+        sys.exit("key-refused clone wrote a local replica for " + sid)
+print("run-20 fresh share installed+ran the third-party app; negatives left no local state")
+PY
+
+# ---- 21: M110d (#2406) install-time negatives by name + the ----------
+# ---- revoked-after-publish leg --------------------------------------
+vgate_run 21 -- \
+    --cvc-file '$RUN_DIR/tp-share' \
+    --virtio-fs '$RUN_DIR/tp-share' \
+    --net '$RUN_DIR/cap21.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-21.txt' \
+    --script-expect 'm110d: negatives done' \
+    --script-expect-tail 3 --timeout 300
+
+vgate_assert 21 serial-contains 'acme-app OK'
+vgate_assert 21 serial-count 'flint: refuse key_unknown' 1
+vgate_assert 21 serial-count 'flint: refuse key_revoked' 2
+vgate_assert 21 serial-count 'store: refuse sync_failed' 3
+vgate_assert 21 serial-absent 'store: install ok'
+vgate_assert 21 serial-absent 'sig_invalid'
+vgate_assert 21 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 21 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 21 serial-absent '[EXC] parking:'
+vgate_assert 21 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "tp-share")
+
+# The keyring swap landed verbatim, and revocation gated only NEW
+# installs: run 20's published bytes + rows survive untouched.
+trusted = open(os.path.join(share, "FLINT", "TRUSTED.TXT"), "r", encoding="utf-8").read()
+staged = open(os.path.join(share, "FLINTJ", "trusted-revoked.txt"), "r", encoding="utf-8").read()
+if trusted != staged:
+    sys.exit("TRUSTED.TXT after the swap != staged revoked variant: %r" % trusted)
+got = hashlib.sha256(open(os.path.join(share, "ACMEAPP.ELF"), "rb").read()).hexdigest()
+want = hashlib.sha256(open(os.path.join(".build", "go", "ACMEAPP.ELF"), "rb").read()).hexdigest()
+if got != want:
+    sys.exit("installed ACMEAPP.ELF moved under refused installs")
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if apps.count("ACMEAPP.ELF |") != 1:
+    sys.exit("ACMEAPP row moved under refused installs: %r" % apps)
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "name=ACMEAPP.ELF stream=acme head=0199de2d-dc00-7000-8000-00000000c012" not in state:
+    sys.exit("STORE.TXT acme entry moved under refused installs: %r" % state)
+for sid in ("0199de2d-dc00-7000-8000-00000000e010",
+            "0199de2d-dc00-7000-8000-00000000e011"):
+    if os.path.exists(os.path.join(share, "FLINT", "streams", sid + ".jsonl")):
+        sys.exit("key-refused clone wrote a local replica for " + sid)
+print("run-21 verified: key_unknown + key_revoked refused by name; revoked publisher's already-synced release refused at install")
+PY
+# ---- 22: M113d (#2420) declare + consent -------------------------------
+# The seat boots (go-gostore's shape), STORE.ELF installs caprel
+# unprivileged — the admin slot refuses it EACCES, so the install can
+# only PROPOSE the row the manifest asked for. GOHELLO.ELF then execs at
+# the ambient baseline (no row, every word ambient — the refused-consent
+# posture is the default). GOSET.ELF -u0 (the monitor's admin spawn —
+# the CAP_PROC_ADMIN half of the seat-or-cap gate) opens the grants
+# pane: one row marker per install shows declared-vs-granted, `refuse`
+# declines without a write, `grant` lands (bin, sha, words) through slot
+# 89.
+vgate_file script-22.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-22.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/22.SH"
+EOF
+
+vgate_file script3-22.txt <<'EOF'
+exec -u0 GOSET.ELF
+EOF
+
+vgate_run 22 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-22' \
+    --cvc-file '$RUN_DIR/caps-share' \
+    --virtio-fs '$RUN_DIR/caps-share' \
+    --net '$RUN_DIR/cap22.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-22.txt' \
+    --script2 '$RUN_DIR/script2-22.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script3 '$RUN_DIR/script3-22.txt' \
+    --script3-after 'm113d: install done' \
+    --input-string $'grants\nrefuse GOHELLO.ELF\ngrant GOHELLO.ELF\n' \
+    --input-string-after 'goset: ready ' \
+    --script-expect 'goset: grant written name=GOHELLO.ELF' --timeout 300
+
+vgate_assert 22 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
+vgate_assert 22 serial-contains 'store: grant propose GOHELLO.ELF words=file,net'
+vgate_assert 22 serial-contains 'goset: grants n='
+vgate_assert 22 serial-contains 'goset: grant row name=GOHELLO.ELF declared=file,net granted=- state=pending'
+vgate_assert 22 serial-contains 'goset: grant declined name=GOHELLO.ELF'
+vgate_assert 22 serial-contains 'goset: grant written name=GOHELLO.ELF words=file,net'
+# The pre-consent exec ran at the ambient baseline — no row, every word
+# ambient, and no refused verdict anywhere in the boot.
+vgate_assert 22 serial-contains 'virelai-go OK'
+vgate_assert 22 serial-absent 'verdict=refused'
+vgate_assert 22 serial-absent 'goset: grant refuse name=GOHELLO.ELF'
+vgate_assert 22 serial-absent '[EXC] parking:'
+vgate_assert 22 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 22 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 22 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+
+sha = hashlib.sha256(open(os.path.join(share, "GOHELLO.ELF"), "rb").read()).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,net"]:
+    sys.exit("GRANTS.TXT after consent: %r (sha %s)" % (lines, sha))
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file,net" not in state:
+    sys.exit("STORE.TXT did not record the declared ask: %r" % state)
+print("run-22 verified: propose -> decline -> consent wrote the hash-bound row")
+PY
+
+# ---- 23: M113d (#2420) non-widening update keeps the grant -------------
+# caprel v2 asks file — a subset of the consented file,net. The update
+# under -u0 reads the row, re-pins its sha binding to the new image with
+# the consented words verbatim (the keep — no fresh ask), and the v2
+# bytes exec.
+vgate_file script-23.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-23.txt <<'EOF'
+exec -u0 GOSH.ELF -c "source /host/FLINTJ/23.SH"
+EOF
+
+vgate_run 23 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-23' \
+    --cvc-file '$RUN_DIR/caps-share' \
+    --virtio-fs '$RUN_DIR/caps-share' \
+    --net '$RUN_DIR/cap23.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-23.txt' \
+    --script2 '$RUN_DIR/script2-23.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script-expect 'm113d: keep done' --timeout 300
+
+vgate_assert 23 serial-contains 'store: update ok GOHELLO.ELF version=2.0.0'
+vgate_assert 23 serial-contains 'store: grant keep GOHELLO.ELF words=file,net'
+vgate_assert 23 serial-contains 'virelai-go V2'
+vgate_assert 23 serial-absent 'store: grant propose'
+vgate_assert 23 serial-absent 'verdict=refused'
+vgate_assert 23 serial-absent '[EXC] parking:'
+vgate_assert 23 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 23 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+
+elf = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+sha = hashlib.sha256(elf).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,net"]:
+    sys.exit("GRANTS.TXT after the keep: %r (sha %s)" % (lines, sha))
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file " not in state + " " or "prev_caps=file,net" not in state:
+    sys.exit("STORE.TXT lost the caps history: %r" % state)
+print("run-23 verified: non-widening update re-pinned the row to the new image")
+PY
+
+# ---- 24: M113d (#2420) widening update re-asks; consent re-pins --------
+# caprel v3 asks file,debug,net — debug is NOT inside the consented
+# file,net, so this is a distinct consent event: the update leaves the
+# row bound to v2's image (the unconsented image refuses grant_stale at
+# exec — the widening never silently lands), re-proposes, and the
+# pane's `grant` writes the widened set bound to v3.
+vgate_file script-24.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-24.txt <<'EOF'
+exec -u0 GOSH.ELF -c "source /host/FLINTJ/24.SH"
+EOF
+
+vgate_file script3-24.txt <<'EOF'
+exec -u0 GOSET.ELF
+EOF
+
+vgate_run 24 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-24' \
+    --cvc-file '$RUN_DIR/caps-share' \
+    --virtio-fs '$RUN_DIR/caps-share' \
+    --net '$RUN_DIR/cap24.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-24.txt' \
+    --script2 '$RUN_DIR/script2-24.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script3 '$RUN_DIR/script3-24.txt' \
+    --script3-after 'm113d: widening done' \
+    --input-string $'grants\ngrant GOHELLO.ELF\n' \
+    --input-string-after 'goset: ready ' \
+    --script-expect 'goset: grant written name=GOHELLO.ELF' --timeout 300
+
+vgate_assert 24 serial-contains 'store: update ok GOHELLO.ELF version=3.0.0'
+vgate_assert 24 serial-contains 'store: grant propose GOHELLO.ELF words=file,debug,net'
+# The unconsented v3 image is refused at exec — the widening did not
+# silently ride the old consent.
+vgate_assert 24 serial-contains 'verdict=refused:grant_stale'
+vgate_assert 24 serial-contains 'goset: grant row name=GOHELLO.ELF declared=file,debug,net granted=file,net state=stale'
+vgate_assert 24 serial-contains 'goset: grant written name=GOHELLO.ELF words=file,debug,net'
+vgate_assert 24 serial-absent 'store: grant keep GOHELLO.ELF'
+vgate_assert 24 serial-absent '[EXC] parking:'
+vgate_assert 24 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 24 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+
+elf = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+sha = hashlib.sha256(elf).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,debug,net"]:
+    sys.exit("GRANTS.TXT after re-consent: %r" % lines)
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file,debug,net" not in state or "prev_caps=file" not in state:
+    sys.exit("STORE.TXT lost the declared-vs-prior ask: %r" % state)
+print("run-24 verified: widening re-asked, consent bound the widened row to v3")
 PY

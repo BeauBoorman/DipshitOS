@@ -359,9 +359,16 @@ func (s *ComputeSession) Stats() (ComputeStatsBlock, error) {
 	if err := compErr(rc); err != nil {
 		return b, err
 	}
+	return decodeStats(s.stats), nil
+}
+
+// decodeStats reads the frozen 64-byte STATS block (ADR 0053 D6) out of a
+// mapped window — the one decode both Stats and SampleStats share.
+func decodeStats(blk []byte) ComputeStatsBlock {
+	var b ComputeStatsBlock
 	u32 := func(at int) uint32 {
-		return uint32(s.stats[at]) | uint32(s.stats[at+1])<<8 |
-			uint32(s.stats[at+2])<<16 | uint32(s.stats[at+3])<<24
+		return uint32(blk[at]) | uint32(blk[at+1])<<8 |
+			uint32(blk[at+2])<<16 | uint32(blk[at+3])<<24
 	}
 	u64 := func(at int) uint64 {
 		return uint64(u32(at)) | uint64(u32(at+4))<<32
@@ -376,7 +383,44 @@ func (s *ComputeSession) Stats() (ComputeStatsBlock, error) {
 	b.Completed = u64(40)
 	b.Refusals = u64(48)
 	b.Timeouts = u64(56)
-	return b, nil
+	return b
+}
+
+// statsScratchVA is the stats-only window's hint — compMapBytes above the
+// session aperture so a process holding a session AND sampling stats does
+// not collide with its own mapping.
+const statsScratchVA = compScratchVA + compMapBytes
+
+// statsWindow is the lazily-mapped descriptor+block aperture SampleStats
+// reuses. The kernel caps a process's mmap table at 16 entries and there
+// is no munmap, so a fresh map per call would exhaust it inside seconds
+// of a 1 Hz poll.
+var statsWindow []byte
+
+// SampleStats reads the broker's frozen 64-byte STATS block WITHOUT
+// claiming the compute session — STATS is handle-free in the kernel
+// (gpu3d_compute's do_stats needs only a destination VA), so a monitor can
+// poll the counters while a real workload holds the single OPEN.
+func SampleStats() (ComputeStatsBlock, error) {
+	var b ComputeStatsBlock
+	if statsWindow == nil {
+		window, err := CompMap(statsScratchVA, 4096,
+			vi.ProtRead|vi.ProtWrite, vi.MapAnonymous)
+		if err != nil {
+			return b, err
+		}
+		statsWindow = window
+	}
+	desc := statsWindow[:vi.GpucompDescBytes]
+	blk := statsWindow[vi.GpucompDescBytes : vi.GpucompDescBytes+vi.GpucompStatsBytes]
+	d := vi.GpucompDesc{Op: vi.GpucompStats, ArgA: stageVA(blk)}
+	if err := d.EncodeDesc(desc); err != nil {
+		return b, err
+	}
+	if err := compErr(CompSyscall(desc)); err != nil {
+		return b, err
+	}
+	return decodeStats(blk), nil
 }
 
 // stageVA is the payload pointer the kernel copies through checked

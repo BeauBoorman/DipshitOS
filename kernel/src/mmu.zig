@@ -723,7 +723,13 @@ fn clone_into_user_root_apertures(
             // The slot intersects a user aperture: the clone must descend
             // to the page level, splitting a covering block if needed, and
             // building the walk from an empty source when the identity
-            // tree has no entry here (above the blanket).
+            // tree has no entry here (above the blanket). #2430: the block
+            // split's synthetic source is a scratch table — it is never
+            // linked into the clone, so it must be handed back to the
+            // carve-out after the descend (leaked one per intersection
+            // before this; ~a dozen dead tables per Go exec drained the
+            // 512-page pool over a fleet build).
+            var synthetic_src: ?*align(4096) [512]u64 = null;
             const child_src: *const [512]u64 = if (desc == 0)
                 &empty_table
             else if ((desc & 3) == 3)
@@ -731,11 +737,15 @@ fn clone_into_user_root_apertures(
                     discard_table(dst, level);
                     return null;
                 }
-            else
-                split_block_view(desc) orelse {
+            else blk: {
+                const view = split_block_view(desc) orelse {
                     discard_table(dst, level);
                     return null;
                 };
+                synthetic_src = view;
+                break :blk view;
+            };
+            defer if (synthetic_src) |view| free_table(@intFromPtr(view));
             const child = clone_into_user_root_apertures(child_src, level + 1, slot_va, apertures) orelse {
                 discard_table(dst, level);
                 return null;
@@ -1002,6 +1012,18 @@ pub fn map_user_cow_page(root_phys: u64, va: u64, pa: u64) bool {
     return true;
 }
 
+/// #2430: does `va`'s leaf under `root` already permit an EL0 access of
+/// `for_write` kind? Two cores can demand-fault the same fresh page —
+/// serialized on the kernel-domain lock, the second populate sees the leaf
+/// the first just wrote; the retry then succeeds, so that fault is
+/// resolved, not a program fault to deliver.
+pub fn leaf_permits_access(root_phys: u64, va: u64, for_write: bool) bool {
+    const lp = get_user_leaf(root_phys, va) orelse return false;
+    const ap = (lp.* >> 6) & 0b11;
+    const el0_access = (ap & 1) != 0;
+    return if (for_write) ap == 1 else el0_access;
+}
+
 /// Lookup the L3 descriptor pointer for `va` in the user root (or null if not mapped).
 pub fn get_user_leaf(root_phys: u64, va: u64) ?*u64 {
     if (root_phys == 0) return null;
@@ -1094,6 +1116,26 @@ test "mmu: an aperture above the identity blanket still gets EL0 leaves (issue #
     const leaf = get_user_leaf(root, stack_va + 4096).?;
     try std.testing.expectEqual(stack_pa + 4096, leaf.* & 0x0000_ffff_ffff_f000);
     try std.testing.expectEqual(@as(u64, 1), (leaf.* >> 6) & 3); // EL0 RW
+}
+
+test "mmu: #2430 — a block-split clone returns its scratch table to the carve-out" {
+    reset();
+    // An identity 2 MiB block leaf under the aperture's slot: the clone
+    // must synthesize a page-level source table (`split_block_view`) to
+    // descend through it. That scratch table is never linked into the
+    // clone — before the fix it was abandoned per intersection, so a
+    // build+free cycle leaked carve-out pages until `build_user_root`
+    // returned table_full under exec churn.
+    _ = new_table(); // consume index zero as the (zeroed) identity root
+    try std.testing.expect(map_block(userspace.text_va & ~@as(u64, block_size - 1), .device));
+    try std.testing.expect(map_block(userspace.stack_va & ~@as(u64, block_size - 1), .device));
+    const baseline = tables_used();
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const root = build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+        try std.testing.expect(free_table_tree(root) > 0);
+    }
+    try std.testing.expectEqual(baseline, tables_used());
 }
 
 test "mmu: leaf_el0_visible rejects the EL1-only identity overlay (issue #1391)" {

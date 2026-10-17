@@ -1,8 +1,10 @@
-package main
+package store
 
 import (
 	"sort"
 	"strings"
+
+	"virelai/vi"
 )
 
 // STORE.TXT is the M101d (#2316) installed-app state file: one line per
@@ -19,10 +21,15 @@ import (
 // and '|' fields survive without an escape layer):
 //
 //	name=<BIN.ELF> stream=<s> head=<id> sha256=<64hex> \
-//	    prev_head=<id|-> prev_sha256=<64hex|-> prev_row=<row|->
+//	    caps=<w1,w2|-> prev_head=<id|-> prev_sha256=<64hex|-> \
+//	    prev_caps=<w1,w2|-> prev_row=<row|->
 //
-// The three prev_* fields are all-or-none: an app with no recorded
-// rollback target carries three '-'.
+// caps is the M113d (#2420, ADR 0054 D10) declared ReleaseCaps of the
+// installed release — the signed word request a grants pane shows as
+// "declared" and consent writes as the row's words. '-' means the
+// release declared nothing. prev_head/prev_sha256/prev_row are
+// all-or-none; prev_caps rides alongside ('-' = the prior release's
+// declaration was not recorded).
 const (
 	statePath     = "/host/STORE.TXT"
 	stateMaxBytes = 64 * 1024 // far past honest: ~1 KiB per app line
@@ -34,8 +41,10 @@ type storeEntry struct {
 	Stream   string // release stream name the app installs/updates from
 	Head     string // installed stream head (change id)
 	SHA256   string // sha256 hex of the installed ELF at Head
+	Caps     string // declared ReleaseCaps at Head, canonical csv; "" = none
 	PrevHead string // prior installed head; "" when no rollback target
 	PrevSHA  string // sha256 hex of <BIN>.prev; "" when PrevHead is ""
+	PrevCaps string // prior declared caps; "" when PrevHead is ""
 	PrevRow  string // prior manifest row, verbatim; "" when PrevHead is ""
 }
 
@@ -63,6 +72,8 @@ func parseStateLine(line string) (*storeEntry, error) {
 	e := &storeEntry{}
 	rest := line
 	e.PrevRow = "-"
+	e.Caps = "-"
+	e.PrevCaps = "-"
 	if i := strings.Index(line, " prev_row="); i >= 0 {
 		e.PrevRow = line[i+len(" prev_row="):]
 		rest = line[:i]
@@ -85,6 +96,10 @@ func parseStateLine(line string) (*storeEntry, error) {
 			e.PrevHead = v
 		case "prev_sha256":
 			e.PrevSHA = v
+		case "caps":
+			e.Caps = v
+		case "prev_caps":
+			e.PrevCaps = v
 		default:
 			return nil, refuse("state_malformed", line)
 		}
@@ -100,16 +115,50 @@ func parseStateLine(line string) (*storeEntry, error) {
 	if !isHex64(e.SHA256) {
 		return nil, refuse("state_malformed", line)
 	}
-	// prev_* are all-or-none.
-	none := e.PrevHead == "-" && e.PrevSHA == "-" && e.PrevRow == "-"
+	if !validCapsField(e.Caps) || !validCapsField(e.PrevCaps) {
+		return nil, refuse("state_malformed", line)
+	}
+	// prev_head/prev_sha256/prev_row are all-or-none. prev_caps rides
+	// alongside: '-' when the prior release's declaration was not
+	// recorded — but a caps history with no rollback target is nonsense
+	// and refuses like any partial set.
+	none := e.PrevHead == "-" && e.PrevSHA == "-" && e.PrevRow == "-" && e.PrevCaps == "-"
 	all := e.PrevHead != "-" && isHex64(e.PrevSHA) && e.PrevRow != "-" && e.PrevRow != ""
 	if !none && !all {
 		return nil, refuse("state_malformed", line)
 	}
 	if none {
-		e.PrevHead, e.PrevSHA, e.PrevRow = "", "", ""
+		e.PrevHead, e.PrevSHA, e.PrevCaps, e.PrevRow = "", "", "", ""
+	}
+	if e.Caps == "-" {
+		e.Caps = ""
+	}
+	if e.PrevCaps == "-" {
+		e.PrevCaps = ""
 	}
 	return e, nil
+}
+
+// validCapsField enforces the caps=/prev_caps= grammar: '-' (no declared
+// caps) or a comma-separated list drawn from the grant word vocabulary —
+// the same words ReleaseCaps may name. Anything else is a malformed
+// state line, never a word set to guess at.
+func validCapsField(v string) bool {
+	if v == "-" {
+		return true
+	}
+	if v == "" {
+		return false
+	}
+	for _, w := range strings.Split(v, ",") {
+		if w == "" {
+			return false
+		}
+		if !vi.GrantWordKnown(w) {
+			return false
+		}
+	}
+	return true
 }
 
 // loadState reads STORE.TXT into a name->entry map. An absent file is an
@@ -163,12 +212,21 @@ func renderState(state map[string]*storeEntry) []byte {
 		if pr == "" {
 			pr = "-"
 		}
+		caps, pc := e.Caps, e.PrevCaps
+		if caps == "" {
+			caps = "-"
+		}
+		if pc == "" {
+			pc = "-"
+		}
 		b.WriteString("name=" + e.Name +
 			" stream=" + e.Stream +
 			" head=" + e.Head +
 			" sha256=" + e.SHA256 +
+			" caps=" + caps +
 			" prev_head=" + ph +
 			" prev_sha256=" + ps +
+			" prev_caps=" + pc +
 			" prev_row=" + pr + "\n")
 	}
 	return []byte(b.String())

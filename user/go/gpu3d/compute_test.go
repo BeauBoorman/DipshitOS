@@ -214,6 +214,79 @@ func TestComputeEncodeRejectsForeignKdesc(t *testing.T) {
 	}
 }
 
+// TestSampleStatsDecodesTheBlock is the session-free sampler (M111d): the
+// STATS op is handle-free in the kernel, so a monitor polls the counters
+// without an OPEN — and never claims the single session.
+func TestSampleStatsDecodesTheBlock(t *testing.T) {
+	statsWindow = nil // the lazy window must not leak a stale map between tests
+	t.Cleanup(func() { statsWindow = nil })
+	var window []byte
+	f := &compFake{replies: map[uint32]int64{vi.GpucompStats: 0}}
+	oldSys, oldMap := CompSyscall, CompMap
+	CompSyscall = func(desc []byte) int64 {
+		f.run(desc)
+		// The kernel writes the 64-byte block at arg_a — the window's
+		// stats offset, which the fake mapped.
+		put := func(at int, v uint64) {
+			for i := 0; i < 8; i++ {
+				window[at+i] = byte(v >> (8 * i))
+			}
+		}
+		putU32s := func(at int, v uint32) { put(at, uint64(v)) }
+		putU32s(128, 1) // busy
+		putU32s(132, 2) // queued
+		putU32s(136, 1) // sessions_live
+		put(144, 1234)  // last_kernel_us
+		put(152, 5678)  // total_kernel_us
+		put(160, 3)     // submits
+		put(168, 3)     // completed
+		put(176, 1)     // refusals
+		put(184, 0)     // timeouts
+		return 0
+	}
+	CompMap = func(_ uintptr, size int, _, _ uint64) ([]byte, error) {
+		window = make([]byte, size)
+		return window, nil
+	}
+	t.Cleanup(func() { CompSyscall, CompMap = oldSys, oldMap })
+
+	st, err := SampleStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One STATS descriptor went out; no OPEN preceded it.
+	if len(f.calls) != 1 || getU32(f.calls[0]) != vi.GpucompStats {
+		t.Fatalf("calls=%d ops=%v", len(f.calls), f.calls)
+	}
+	if st.Busy != 1 || st.Queued != 2 || st.SessionsLive != 1 ||
+		st.LastKernelUs != 1234 || st.TotalKernelUs != 5678 ||
+		st.Submits != 3 || st.Completed != 3 || st.Refusals != 1 || st.Timeouts != 0 {
+		t.Fatalf("stats=%+v", st)
+	}
+	// A second sample reuses the mapped window (the mmap table is bounded).
+	maps := 0
+	CompMap = func(_ uintptr, size int, _, _ uint64) ([]byte, error) {
+		maps++
+		return make([]byte, size), nil
+	}
+	if _, err := SampleStats(); err != nil {
+		t.Fatal(err)
+	}
+	if maps != 0 {
+		t.Fatalf("SampleStats re-mapped %d times", maps)
+	}
+}
+
+func TestSampleStatsRefusals(t *testing.T) {
+	statsWindow = nil
+	t.Cleanup(func() { statsWindow = nil })
+	f := &compFake{replies: map[uint32]int64{vi.GpucompStats: -vi.ErrENXIO}}
+	compHarness(t, f)
+	if _, err := SampleStats(); !errors.Is(err, ErrComputeNoDevice) {
+		t.Fatalf("err=%v, want ErrComputeNoDevice", err)
+	}
+}
+
 func TestComputeReadRoundTripsStaging(t *testing.T) {
 	f := &compFake{replies: map[uint32]int64{vi.GpucompOpen: 7}}
 	compHarness(t, f)

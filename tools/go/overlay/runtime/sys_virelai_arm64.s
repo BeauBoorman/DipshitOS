@@ -16,6 +16,7 @@
 #define VIR_SYS_YIELD     2
 #define VIR_SYS_EXIT      3
 #define VIR_SYS_MMAP      63
+#define VIR_SYS_MUNMAP    64
 #define VIR_SYS_TIME      66
 #define VIR_SYS_GETRANDOM 72
 
@@ -59,6 +60,22 @@ TEXT runtime·virMmap(SB),NOSPLIT|NOFRAME,$0-24
 	MOVD	$VIR_MMAP_PROT_RW, R2
 	MOVD	$VIR_MAP_ANON, R3
 	MOVD	$VIR_SYS_MMAP, R8
+	SVC
+	MOVD	R0, ret+16(FP)
+	RET
+
+// func virMunmap(addr unsafe.Pointer, n uintptr) int — sys_munmap (slot
+// 64): x0 is the page-aligned address, x1 the length. The kernel unmaps
+// the leaves, unrefs the recorded dynamic pages, and drops the freed phys
+// back into the pool — the scavenger's sysUnused call is what reaches it
+// on this sbrk port, so a freed span's PHYSICAL pages return instead of
+// staying mapped on the in-process free/scavenged lists. The freed VA
+// keeps its mmap region record, so a later touch demand-faults a fresh
+// zero page back in — reuse stays transparent.
+TEXT runtime·virMunmap(SB),NOSPLIT|NOFRAME,$0-24
+	MOVD	addr+0(FP), R0
+	MOVD	n+8(FP), R1
+	MOVD	$VIR_SYS_MUNMAP, R8
 	SVC
 	MOVD	R0, ret+16(FP)
 	RET

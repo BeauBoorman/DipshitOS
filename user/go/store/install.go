@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"strings"
@@ -205,23 +205,95 @@ func syncIfMoved(fs FS, root, remote string, st Stream, byName map[string]*Strea
 
 // syncRemoteStreams refreshes every remote stream's local replica via
 // syncIfMoved, tolerating per-stream refusals — an untrusted publisher's
-// clone is refused inside FLINT.ELF and reports sync-failed rather than
-// failing the enumeration. It returns the local records keyed by name.
-func syncRemoteStreams(fs FS, root, remote string, streams []Stream) (map[string]*Stream, error) {
+// clone is refused inside FLINT.ELF and lands in the failed set rather
+// than failing the enumeration. It returns the local records keyed by
+// name. The caller renders each failed stream (`ls`'s sync-failed line
+// or a GOSTORE row) — the fold itself stays quiet so in-process callers
+// get the data, not a second copy of the output.
+func syncRemoteStreams(fs FS, root, remote string, streams []Stream, failed map[string]bool) (map[string]*Stream, error) {
 	for _, st := range streams {
 		byName, _, err := listStreamRecords(fs, root)
 		if err != nil {
 			return nil, err
 		}
 		if err := syncIfMoved(fs, root, remote, st, byName); err != nil {
-			consoleFn("store: stream " + st.Name + " sync-failed")
+			failed[st.Name] = true
 		}
 	}
 	byName, _, err := listStreamRecords(fs, root)
 	return byName, err
 }
 
-// cmdLs implements `store ls [--remote=<r>] [--channel=<c>]
+// CatalogRow is one remote stream's line in the M110c browse view: the
+// ADR 0055 catalog verdict — a folded signed release, a stream carrying
+// none, or the per-stream refusal the sync/fold leg reported. Rows keep
+// the remote's enumeration order.
+type CatalogRow struct {
+	Stream string
+	// Status is "release", "no-release", "sync-failed", or
+	// "catalog-invalid"; Refusal carries the refusal code for the last.
+	Status  string
+	Refusal string
+	// Entry is the authenticated catalog card (nil unless Status is
+	// "release"). Installed is whether APPS.TXT already carries the
+	// release's bin — display state, never a gate.
+	Entry     *CatalogEntry
+	Installed bool
+}
+
+// LoadCatalog runs the `store ls` fold and returns the per-stream rows —
+// the model the GOSTORE browse view renders instead of re-paying the wire
+// session STORE's printed lines describe. Read verbs get no LegFn legs:
+// the signed-pipeline leg narration belongs to the mutating verbs.
+func LoadCatalog(fs FS, root, remoteFlag, channelArg, search, category string) ([]CatalogRow, error) {
+	remote, err := resolveRemote(fs, root, remoteFlag)
+	if err != nil {
+		return nil, err
+	}
+	ch, err := openChannel(fs, channelArg)
+	if err != nil {
+		return nil, err
+	}
+	streams, err := remoteStreamsFn(remote)
+	if err != nil {
+		return nil, err
+	}
+	kr, _ := loadKeyring(fs, root) // absent/corrupt -> publisher unverified
+	failed := map[string]bool{}
+	byName, err := syncRemoteStreams(fs, root, remote, streams, failed)
+	if err != nil {
+		return nil, err
+	}
+	lines, lerr := loadManifest(fs)
+	rows := make([]CatalogRow, 0, len(streams))
+	for _, st := range streams {
+		rec, ok := byName[st.Name]
+		if failed[st.Name] || !ok {
+			rows = append(rows, CatalogRow{Stream: st.Name, Status: "sync-failed"})
+			continue
+		}
+		e, err := loadCatalogEntry(fs, root, ch, rec, kr)
+		if err != nil {
+			rows = append(rows, CatalogRow{Stream: st.Name, Status: "catalog-invalid", Refusal: refuseCodeOf(err)})
+			continue
+		}
+		if e == nil {
+			rows = append(rows, CatalogRow{Stream: st.Name, Status: "no-release"})
+			continue
+		}
+		if !e.matches(search, category) {
+			continue
+		}
+		row := CatalogRow{Stream: st.Name, Status: "release", Entry: e}
+		if lerr == nil && manifestHasBin(lines, e.Rel.Name+".ELF") {
+			row.Installed = true
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// Ls implements `store ls [--remote=<r>] [--channel=<c>]
 // [--search=<s>] [--category=<c>]`: enumerate the remote's streams over
 // the wire, refresh the local replica when the remote head moved, and
 // fold each stream's head into its ADR 0055 catalog entry — the release
@@ -233,62 +305,45 @@ func syncRemoteStreams(fs FS, root, remote string, streams []Stream) (map[string
 // install. A stream whose channel release.go is missing, tampered, or
 // malformed is marked catalog-invalid with the refusal name rather than
 // silently rendered.
-func cmdLs(fs FS, root string, remoteFlag, channelArg, search, category string) int {
-	consoleFn("store: ls")
+func Ls(fs FS, root string, remoteFlag, channelArg, search, category string) int {
+	ConsoleFn("store: ls")
 	remote, err := resolveRemote(fs, root, remoteFlag)
 	if err != nil {
 		return runErr(err)
 	}
-	consoleFn("store: remote " + remote)
-	ch, err := openChannel(fs, channelArg)
-	if err != nil {
-		return runErr(err)
-	}
-	streams, err := remoteStreamsFn(remote)
-	if err != nil {
-		return runErr(err)
-	}
-	kr, _ := loadKeyring(fs, root) // absent/corrupt -> publisher unverified
-	byName, err := syncRemoteStreams(fs, root, remote, streams)
+	ConsoleFn("store: remote " + remote)
+	rows, err := LoadCatalog(fs, root, remoteFlag, channelArg, search, category)
 	if err != nil {
 		return runErr(err)
 	}
 	entries := 0
-	for _, st := range streams {
-		rec, ok := byName[st.Name]
-		if !ok {
-			continue // sync-failed already reported
-		}
-		e, err := loadCatalogEntry(fs, root, ch, rec, kr)
-		if err != nil {
-			consoleFn("store: stream " + st.Name + " catalog-invalid " + refuseCodeOf(err))
+	for _, r := range rows {
+		if r.Status == "release" {
+			entries++
+			ConsoleFn("store: stream " + r.Stream + " release " + r.Entry.line())
 			continue
 		}
-		if e == nil {
-			consoleFn("store: stream " + st.Name + " no-release")
-			continue
+		line := "store: stream " + r.Stream + " " + r.Status
+		if r.Refusal != "" {
+			line += " " + r.Refusal
 		}
-		if !e.matches(search, category) {
-			continue
-		}
-		entries++
-		consoleFn("store: stream " + st.Name + " release " + e.line())
+		ConsoleFn(line)
 	}
-	consoleFn("store: ls ok entries=" + vi.Itoa64(int64(entries)))
+	ConsoleFn("store: ls ok entries=" + vi.Itoa64(int64(entries)))
 	return 0
 }
 
-// cmdInfo implements `store info <name> [--remote=<r>] [--channel=<c>]`:
+// Info implements `store info <name> [--remote=<r>] [--channel=<c>]`:
 // the single-stream detail view of the same catalog fold. The selector
 // resolves a remote stream by name or id first, then by ReleaseName —
 // `store info GOHELLO` and `store info rel` name the same card.
-func cmdInfo(fs FS, root, sel, remoteFlag, channelArg string) int {
-	consoleFn("store: info " + sel)
+func Info(fs FS, root, sel, remoteFlag, channelArg string) int {
+	ConsoleFn("store: info " + sel)
 	remote, err := resolveRemote(fs, root, remoteFlag)
 	if err != nil {
 		return runErr(err)
 	}
-	consoleFn("store: remote " + remote)
+	ConsoleFn("store: remote " + remote)
 	ch, err := openChannel(fs, channelArg)
 	if err != nil {
 		return runErr(err)
@@ -309,7 +364,7 @@ func cmdInfo(fs FS, root, sel, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
-	var entry *catalogEntry
+	var entry *CatalogEntry
 	if target != nil {
 		// The named stream: sync just it — an enumeration-wide sync would
 		// re-pay every per-stream refusal for one card.
@@ -362,46 +417,46 @@ func cmdInfo(fs FS, root, sel, remoteFlag, channelArg string) int {
 	if entry == nil {
 		return runErr(refuse("release_missing", target.Name))
 	}
-	consoleFn("store: stream " + entry.Stream)
-	consoleFn("store: name " + entry.Rel.Name)
-	consoleFn("store: version " + entry.Rel.Version)
-	consoleFn("store: category " + orDash(entry.Rel.Category))
-	consoleFn("store: summary " + orDash(entry.Rel.Summary))
-	consoleFn("store: sha256 " + entry.Rel.ELFSHA256)
-	consoleFn("store: icon_sha256 " + orDash(entry.Rel.IconSHA256))
-	consoleFn("store: publisher " + entry.Publisher +
+	ConsoleFn("store: stream " + entry.Stream)
+	ConsoleFn("store: name " + entry.Rel.Name)
+	ConsoleFn("store: version " + entry.Rel.Version)
+	ConsoleFn("store: category " + orDash(entry.Rel.Category))
+	ConsoleFn("store: summary " + orDash(entry.Rel.Summary))
+	ConsoleFn("store: sha256 " + entry.Rel.ELFSHA256)
+	ConsoleFn("store: icon_sha256 " + orDash(entry.Rel.IconSHA256))
+	ConsoleFn("store: publisher " + entry.Publisher +
 		" publisher_name=" + orDash(entry.PubLabel) +
 		" publisher_state=" + entry.PubState)
-	consoleFn("store: head " + entry.Head)
+	ConsoleFn("store: head " + entry.Head)
 	installed := "no"
 	if lines, lerr := loadManifest(fs); lerr != nil {
 		return runErr(lerr)
 	} else if manifestHasBin(lines, entry.Rel.Name+".ELF") {
 		installed = "yes"
 	}
-	consoleFn("store: installed " + installed)
-	consoleFn("store: row " + entry.Rel.ManifestRow)
+	ConsoleFn("store: installed " + installed)
+	ConsoleFn("store: row " + entry.Rel.ManifestRow)
 	if entry.Rel.Description == "" {
-		consoleFn("store: description -")
+		ConsoleFn("store: description -")
 	} else {
-		consoleFn("store: description")
+		ConsoleFn("store: description")
 		for _, line := range strings.Split(entry.Rel.Description, "\n") {
-			consoleFn("store:   " + line)
+			ConsoleFn("store:   " + line)
 		}
 	}
-	consoleFn("store: info ok")
+	ConsoleFn("store: info ok")
 	return 0
 }
 
-// cmdInstall implements `store install <stream> [--remote=<r>]
+// Install implements `store install <stream> [--remote=<r>]
 // [--channel=<c>]` — the full verify-then-install pipeline.
-func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
-	consoleFn("store: install " + stream)
+func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
+	ConsoleFn("store: install " + stream)
 	remote, err := resolveRemote(fs, root, remoteFlag)
 	if err != nil {
 		return runErr(err)
 	}
-	consoleFn("store: remote " + remote)
+	ConsoleFn("store: remote " + remote)
 	ch, err := openChannel(fs, channelArg)
 	if err != nil {
 		return runErr(err)
@@ -417,6 +472,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("sync")
 	if err := syncStream(fs, remote, stream, byName); err != nil {
 		return runErr(err)
 	}
@@ -439,7 +495,8 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	// Change is exactly what the relay cannot carry back (remoteStreams
 	// documents the ~1460 B fill boundary), so the remote read stalls
 	// where the local fold does not.
-	consoleFn("store: verify " + stream)
+	emitLeg("verify")
+	ConsoleFn("store: verify " + stream)
 	logBytes, err := streamLogBytes(fs, root, id)
 	if err != nil {
 		return runErr(err)
@@ -447,7 +504,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	if err := verifyStore(id, logBytes); err != nil {
 		return runErr(err)
 	}
-	consoleFn("store: verified " + stream)
+	ConsoleFn("store: verified " + stream)
 
 	// 2. Signed release manifest atoms at head — folded from the bound
 	// bytes, up to the record head.
@@ -460,6 +517,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	}
 
 	// 3. Fetch + verify release.go over the untrusted channel.
+	emitLeg("fetch")
 	src, err := ch.fetch(stream+"/"+releaseFile, MaxReleaseBytes)
 	if err != nil {
 		return runErr(err)
@@ -478,6 +536,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("sha")
 	sum := sshlib.SHA256Sum(elf)
 	if sshlib.EncodeHex(sum[:]) != rel.ELFSHA256 {
 		return runErr(refuse("elf_mismatch", bin))
@@ -515,11 +574,13 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 		if st.Head != nil {
 			if err := writeStateEntry(fs, &storeEntry{
 				Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+				Caps: strings.Join(rel.Caps, ","),
 			}); err != nil {
 				return runErr(err)
 			}
 		}
-		consoleFn("store: already installed " + bin + " version=" + rel.Version)
+		ConsoleFn("store: already installed " + bin + " version=" + rel.Version)
+		grantSync(bin, rel.ELFSHA256, rel.Caps)
 		return 0
 	}
 	elfPath := "/host/" + bin
@@ -547,6 +608,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	// no partial state survives. The entry records the resolved stream
 	// NAME (not the selector: `update` pulls it by name) and head id;
 	// prev_* stay empty until the first update retains a rollback target.
+	emitLeg("publish")
 	if !elfOrphan {
 		if err := fs.WriteFileSafe(elfPath, elf); err != nil {
 			return runErr(err)
@@ -565,6 +627,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 	if st.Head != nil {
 		if err := writeStateEntry(fs, &storeEntry{
 			Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+			Caps: strings.Join(rel.Caps, ","),
 		}); err != nil {
 			_ = fs.WriteFileSafe(appsPath, renderManifest(lines))
 			if !elfOrphan {
@@ -573,15 +636,16 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 			return runErr(err)
 		}
 	}
-	consoleFn("store: install ok " + bin + " version=" + rel.Version)
+	ConsoleFn("store: install ok " + bin + " version=" + rel.Version)
+	grantSync(bin, rel.ELFSHA256, rel.Caps)
 	return 0
 }
 
-// cmdRemove implements `store remove <name>` — the symmetric case: the
+// Remove implements `store remove <name>` — the symmetric case: the
 // manifest row goes first (a crash leaves an orphan file, never a
 // dangling row), then the ELF.
-func cmdRemove(fs FS, arg string) int {
-	consoleFn("store: remove " + arg)
+func Remove(fs FS, arg string) int {
+	ConsoleFn("store: remove " + arg)
 	bin, ok := normalizeBin(arg)
 	if !ok {
 		return runErr(refuse("name_invalid", arg))
@@ -593,6 +657,7 @@ func cmdRemove(fs FS, arg string) int {
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("publish")
 	if _, ok := state[bin]; ok {
 		delete(state, bin)
 		if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
@@ -633,7 +698,7 @@ func cmdRemove(fs FS, arg string) int {
 			return runErr(err)
 		}
 	}
-	consoleFn("store: remove ok " + bin)
+	ConsoleFn("store: remove ok " + bin)
 	return 0
 }
 

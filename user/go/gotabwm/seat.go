@@ -347,6 +347,10 @@ func main() {
 	// reads the host-int credential once; absent is byte-silent (D7). The
 	// lane runs in BOTH seat modes — it is not demo choreography.
 	hostintSeatInit()
+	// M109e (#2401, ADR 0052): the agent-activity watch on the M109c
+	// receipt lane. Same credential posture — the agent-hmac row served
+	// to this image is the whole flag; unserved is byte-silent.
+	agentSeatInit()
 	if demoMode {
 		vi.ConsoleLine(MarkerModeDemo)
 	} else {
@@ -557,6 +561,9 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	// host-sourced clipboard write this tick is already badged on the same
 	// presented frame.
 	hostintSeatTick()
+	// M109e (#2401): the agent watch runs in the same lane pass — a
+	// session receipt seen this tick is badged on the same frame.
+	agentSeatTick()
 	chromeTick(scan, ticks)
 	if launch.open {
 		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)

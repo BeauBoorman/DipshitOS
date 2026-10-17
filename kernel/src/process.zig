@@ -36,6 +36,13 @@ const memmap = @import("memmap.zig"); // host-test fixture view (page-ownership 
 const mmu = @import("mmu.zig"); // #2116: the per-root page-table tree dies with the process
 const svclock = @import("svclock.zig");
 
+/// M113c (#2419, ADR 0054 D8): the ambient word set — every grant word,
+/// today's per-process authority when no row narrows it. Defined HERE
+/// rather than imported to keep the dependency one-way (grant.zig
+/// already consumes this module); grant.zig comptime-asserts its own
+/// `baseline` equals this constant.
+pub const word_baseline: u32 = 0x1ff;
+
 /// Bounded process registry size (fixed BSS array). Milestone sixteen C3
 /// (claim 0339): grew 8 -> 16 — at the new 8-program concurrency the
 /// registry saturated at 8/8 (the boot payload's exited slot recycled, no
@@ -311,6 +318,16 @@ const Process = struct {
     /// syscall. The `sys_procs` snapshot row deliberately omits it.
     uid: u32 = uid_user,
     caps: u32 = 0,
+    /// M113c (#2419, ADR 0054 D8/D9): the measured-exec word set — the
+    /// grant row's words intersected with the baseline, applied at exec;
+    /// `word_baseline` (every word) for a process no row names. Word
+    /// masks only narrow; no syscall may widen one. `measured`/
+    /// `measured_ok` carry the exec-time image digest the audit receipts
+    /// quote (zeros for a process that was never exec-measured — the
+    /// boot payload, kernel spawns).
+    words: u32 = word_baseline,
+    measured: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
+    measured_ok: bool = false,
     /// Claim 0826: the executor's EL1 exception stack (allocator-backed
     /// for exec'd programs, the static boot stack for the payload).
     kernel_stack: KernelStack = .{},
@@ -429,6 +446,7 @@ fn reset_process(p: *Process) void {
     @memset(std.mem.asBytes(p), 0);
     p.addr_space.mmap_next_va = mmap_default_va;
     p.uid = uid_user;
+    p.words = word_baseline;
     p.task_id = null;
     p.thread_tasks = @as([max_threads]?usize, @splat(@as(?usize, null)));
 }
@@ -474,21 +492,48 @@ pub fn init() void {
 /// pages are never freed under it. Claim 4613: also called at the task-
 /// level reap (`release_pages_on_reap`) — the freed page fields are
 /// zeroed there so a later `release_resources` is a no-op.
-fn release_resources(p: *Process) void {
-    if (p.addr_space.text_pages > 0) _ = alloc.free_pages(p.addr_space.text_phys, p.addr_space.text_pages);
-    if (p.addr_space.data_pages > 0) _ = alloc.free_pages(p.addr_space.data_phys, p.addr_space.data_pages);
-    if (p.addr_space.interp_pages > 0) _ = alloc.free_pages(p.addr_space.interp_phys, p.addr_space.interp_pages);
-    if (p.addr_space.lib_pages > 0) _ = alloc.free_pages(p.addr_space.lib_phys, p.addr_space.lib_pages);
-    if (p.addr_space.ro_pages > 0) _ = alloc.free_pages(p.addr_space.ro_phys, p.addr_space.ro_pages);
-    if (p.addr_space.stack_pages > 0) _ = alloc.free_pages(p.addr_space.stack_phys, p.addr_space.stack_pages);
-    if (p.kernel_stack.pages > 0) _ = alloc.free_pages(p.kernel_stack.phys, p.kernel_stack.pages);
+/// #2430: the bulk of a dead process's page-pool footprint — image
+/// apertures, demand-faulted pages, mmap blocks — can return the moment
+/// its LAST task exits: that task is already .zombie inside
+/// exit_current_locked and can never touch its user address space again.
+/// Only the exiting task's kernel stack (still running on it) and the
+/// page-table root (TTBR0 is live until the context switch) wait for the
+/// lifecycle reap. Returning the bulk at last-exit removes the page-hold
+/// window the idle reaper's latency created: under exec churn the
+/// dead-children backlog used to drain the whole pool — dir_open ENOMEM,
+/// demand-populate failures delivered as status-139 children.
+fn release_user_resources(p: *Process) void {
+    const s = &p.addr_space;
+    // Zero every freed field (same idiom as root_phys below): the early
+    // last-exit release runs BEFORE the lifecycle reap's release_resources,
+    // and a second free_pages on a phys a new owner already took is an
+    // aliasing bug — the re-allocated page is handed to a third user whose
+    // writes corrupt it (observed: exec'd text executing garbage, EC=0).
+    if (s.text_pages > 0) _ = alloc.free_pages(s.text_phys, s.text_pages);
+    s.text_phys = 0;
+    s.text_pages = 0;
+    if (s.data_pages > 0) _ = alloc.free_pages(s.data_phys, s.data_pages);
+    s.data_phys = 0;
+    s.data_pages = 0;
+    if (s.interp_pages > 0) _ = alloc.free_pages(s.interp_phys, s.interp_pages);
+    s.interp_phys = 0;
+    s.interp_pages = 0;
+    if (s.lib_pages > 0) _ = alloc.free_pages(s.lib_phys, s.lib_pages);
+    s.lib_phys = 0;
+    s.lib_pages = 0;
+    if (s.ro_pages > 0) _ = alloc.free_pages(s.ro_phys, s.ro_pages);
+    s.ro_phys = 0;
+    s.ro_pages = 0;
+    if (s.stack_pages > 0) _ = alloc.free_pages(s.stack_phys, s.stack_pages);
+    s.stack_phys = 0;
+    s.stack_pages = 0;
     // M29 VM Depth: unref/free all dynamically faulted and mmap'd pages
     var i: usize = 0;
-    while (i < @min(p.addr_space.dynamic_page_count, max_dynamic_pages)) : (i += 1) {
-        const pa = p.addr_space.dynamic_pages[i];
+    while (i < @min(s.dynamic_page_count, max_dynamic_pages)) : (i += 1) {
+        const pa = s.dynamic_pages[i];
         if (pa != 0) _ = alloc.unref_page(pa);
     }
-    var block = p.addr_space.dynamic_head;
+    var block = s.dynamic_head;
     while (block) |b| {
         for (b.pages[0..b.count]) |pa| {
             if (pa != 0) _ = alloc.unref_page(pa);
@@ -496,12 +541,17 @@ fn release_resources(p: *Process) void {
         block = b.next;
         _ = alloc.free_pages(@intFromPtr(b), 1);
     }
-    p.addr_space.dynamic_head = null;
-    p.addr_space.dynamic_tail = null;
-    p.addr_space.dynamic_page_count = 0;
-    p.addr_space.mmap_region_count = 0;
-    @memset(&p.addr_space.mmap_regions, MmapRegion{});
+    s.dynamic_head = null;
+    s.dynamic_tail = null;
+    s.dynamic_page_count = 0;
+    s.mmap_region_count = 0;
+    @memset(&s.mmap_regions, MmapRegion{});
     p.mem_usage = 0;
+}
+
+fn release_resources(p: *Process) void {
+    release_user_resources(p);
+    if (p.kernel_stack.pages > 0) _ = alloc.free_pages(p.kernel_stack.phys, p.kernel_stack.pages);
     // #2116: the process's page-table tree dies with it — every table the
     // root reaches is a per-root allocation (the identity clone copies, it
     // never shares), so the whole subtree returns to the carve-out free
@@ -873,6 +923,36 @@ pub fn principal(id: usize) ?Principal {
     return .{ .uid = processes[id].uid, .caps = processes[id].caps };
 }
 
+/// M113c (#2419, ADR 0054 D8): apply the exec-measured grant outcome —
+/// the row's words (already intersected with the baseline by
+/// `grant.decide`) plus the image digest the audit receipts quote.
+/// Called once at create by the exec loader; there is no setter path for
+/// EL0, and `mask` is clamped to the baseline so a stored mask can never
+/// exceed ambient authority.
+pub fn set_grant(id: usize, mask: u32, digest: [32]u8, measured_ok: bool) void {
+    if (id >= max_processes or processes[id].state == .free) return;
+    processes[id].words = mask & word_baseline;
+    processes[id].measured = digest;
+    processes[id].measured_ok = measured_ok;
+}
+
+/// M113c (#2419, ADR 0054 D9): the word set the dispatch seam enforces —
+/// `word_baseline` for an invalid/free id (kernel-context callers carry
+/// no word mask and are never the EL0 principal the gate exists for).
+pub fn word_mask(id: usize) u32 {
+    if (id >= max_processes or processes[id].state == .free) return word_baseline;
+    return processes[id].words;
+}
+
+/// M113c (#2419): the exec measurement a word-denial receipt quotes.
+/// `ok` false means no measurement exists for this process (never
+/// exec'd); `digest` is zeros then, by convention.
+pub fn grant_state(id: usize) ?struct { words: u32, digest: [32]u8, measured_ok: bool } {
+    if (id >= max_processes or processes[id].state == .free) return null;
+    const p = &processes[id];
+    return .{ .words = p.words, .digest = p.measured, .measured_ok = p.measured_ok };
+}
+
 /// Bind a created process to its executor task slot (state -> running).
 /// Returns false for an invalid id or a process that is not `created`.
 pub fn bind(id: usize, task_id: usize) bool {
@@ -1066,6 +1146,18 @@ pub fn request_process_exit(task_id: usize, status: u64) ?usize {
         processes[id].exit_status_snapshot = status;
     }
     return id;
+}
+
+/// #2430: return the bulk of an exited process's page-pool footprint NOW —
+/// called by the scheduler's exit teardown once `on_task_exit` reports the
+/// last task out. The lifecycle reap still frees the exiting task's kernel
+/// stack and the page-table root (see release_user_resources). Idempotent
+/// against the reap/recycle paths: every freed field is left zero.
+pub fn release_user_resources_early(id: usize) void {
+    const taken = svclock.acquire_missing(svclock.dom_bit(.kernel));
+    defer svclock.release_set(taken);
+    if (id >= max_processes or processes[id].state != .exited) return;
+    release_user_resources(&processes[id]);
 }
 
 /// Free the allocator-backed pages of the exited process that last ran on

@@ -311,9 +311,19 @@ func paintChrome(scan []byte, width, height int, clock string) int {
 	// M108b (#2325, ADR 0051 D3): the clipboard state badge — M97g's
 	// seat-visibility rule carried across the glass. While the last buffer
 	// write was host-sourced it shows the distinct host-marked state.
+	// M109e (#2401): the badge row packs right-to-left — CLIP holds the
+	// right edge and the agent indicator sits beside it.
+	bx := x + w - chromePad
 	if tag, rgb, ok := hostClipBadge(); ok {
 		tw := seatTextWidth(tag, seatSmallPx)
-		seatText(c, clip, x+w-chromePad-tw, ty, seatSmallPx, tag, rgb)
+		bx -= tw
+		seatText(c, clip, bx, ty, seatSmallPx, tag, rgb)
+		bx -= 6
+	}
+	if tag, rgb, ok := agentBadge(); ok {
+		tw := seatTextWidth(tag, seatSmallPx)
+		bx -= tw
+		seatText(c, clip, bx, ty, seatSmallPx, tag, rgb)
 	}
 	return written
 }
