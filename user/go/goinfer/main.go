@@ -132,16 +132,14 @@ func (a *app) openComp() (dev, error) {
 	return a.h.OpenComp()
 }
 
-// runOnce is one full inference lifecycle: open the session, stream the
-// VIW through staging into sealed weight buffers, generate greedily,
-// close. The K=5 leg is five of these — a run is the whole pipeline, not
-// a loop tick.
-func (a *app) runOnce(src io.Reader) (ids []int, st gpu3d.ComputeStatsBlock, m *model, err error) {
-	s, err := a.openComp()
-	if err != nil {
-		return nil, st, nil, err
-	}
-	defer s.Close()
+// runOnce is one full inference lifecycle on the journey's session:
+// stream the VIW through staging into sealed weight buffers, generate
+// greedily, free every buffer. The K=5 leg is five of these — a run is
+// the whole pipeline, not a loop tick. (The session is per-journey, not
+// per-run: OpenCompute maps a fixed-VA window that Close does not unmap
+// — a process can open exactly one session, which is also the realistic
+// resident-app pattern.)
+func (a *app) runOnce(s dev, src io.Reader) (ids []int, st gpu3d.ComputeStatsBlock, m *model, err error) {
 	im, err := readVIWHead(src)
 	if err != nil {
 		return nil, st, nil, err
@@ -179,28 +177,38 @@ func (a *app) runOnce(src io.Reader) (ids []int, st gpu3d.ComputeStatsBlock, m *
 }
 
 // jStub is the gate leg: K=5 complete runs of the deterministic stub
-// model, each a fresh session, every answer pinned-identical by
-// construction. A divergence would mean the device or the path is
-// nondeterministic — the app says so instead of printing K=5.
+// model — each a fresh VIW load and greedy decode on the journey's one
+// compute session — every answer pinned-identical by construction. A
+// divergence would mean the device or the path is nondeterministic; the
+// app says so instead of printing K=5.
 func (a *app) jStub() error {
+	s, err := a.openComp()
+	if errors.Is(err, gpu3d.ErrComputeNoDevice) {
+		return gpu3d.ErrUnsupported
+	}
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	img := synthStub()
 	var first string
 	var firstIds string
+	var prev gpu3d.ComputeStatsBlock
 	for k := 1; k <= stubK; k++ {
-		img := synthStub()
-		ids, st, m, err := a.runOnce(bytes.NewReader(img))
-		if errors.Is(err, gpu3d.ErrComputeNoDevice) {
-			return gpu3d.ErrUnsupported
-		}
+		ids, st, m, err := a.runOnce(s, bytes.NewReader(img))
 		if err != nil {
 			a.rec.row("stub", "run", is(k), errName(err))
 			return fmt.Errorf("stub run %d: %w", k, err)
 		}
+		// Stats accumulate per session; the per-run count is the delta.
+		delta := st.Submits - prev.Submits
+		prev = st
 		ans := m.tok.Decode(ids)
 		a.rec.row("stub", "run", is(k), "ids="+idlist(ids),
-			"submits="+is(int(st.Submits)), "completed="+is(int(st.Completed)))
+			"submits="+is(int(delta)), "completed="+is(int(st.Completed)))
 		a.h.ConsoleLine("goinfer: stub run k=" + is(k) +
 			" ids=" + idlist(ids) + " answer=" + strconv.Quote(ans) +
-			" submits=" + is(int(st.Submits)))
+			" submits=" + is(int(delta)))
 		if k == 1 {
 			first, firstIds = ans, idlist(ids)
 		} else if ans != first {
@@ -229,10 +237,15 @@ func (a *app) jModel(path string) error {
 		return err
 	}
 	defer src.Close()
-	ids, st, m, err := a.runOnce(src)
+	s, err := a.openComp()
 	if errors.Is(err, gpu3d.ErrComputeNoDevice) {
 		return gpu3d.ErrUnsupported
 	}
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	ids, st, m, err := a.runOnce(s, src)
 	if err != nil {
 		a.rec.row("model", "run", errName(err))
 		return fmt.Errorf("model run: %w", err)
@@ -291,7 +304,7 @@ func run(h host, args []string) error {
 	}
 	if err != nil {
 		_ = a.writeReceipts()
-		a.h.ConsoleLine("goinfer: error " + errName(err))
+		a.h.ConsoleLine("goinfer: error " + errName(err) + " (" + err.Error() + ")")
 		return err
 	}
 	a.h.ConsoleLine("goinfer OK")

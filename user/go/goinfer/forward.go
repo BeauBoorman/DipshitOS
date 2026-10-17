@@ -344,21 +344,20 @@ func (e *engine) kcacheEl(l, g int) int {
 	return (l*e.m.cfg.KVHeads + g) * e.m.cfg.SeqCap * dh
 }
 
-// cacheFlush uploads layer l's k/v caches for all kv heads up to position
-// pos (inclusive) into the io kc/vc regions — one contiguous span per
-// head, token-major so each is a single WRITE.
-func (e *engine) cacheFlush(l, pos int) error {
+// cacheAppend uploads layer l's k/v row at position pos for every kv head
+// — one contiguous dh-vector write per head per matrix; earlier rows are
+// already device-side from previous positions.
+func (e *engine) cacheAppend(l, pos int) error {
 	c := e.m.cfg
 	dh := e.m.headDim()
 	for g := 0; g < c.KVHeads; g++ {
-		base := e.kcacheEl(l, g)
-		n := (pos + 1) * dh
-		koff := e.off.kc + uint32(g*c.SeqCap*dh)*2
-		if err := e.put16(koff, e.kc[base:base+n]); err != nil {
+		base := e.kcacheEl(l, g) + pos*dh
+		koff := e.off.kc + uint32(g*c.SeqCap*dh+pos*dh)*2
+		if err := e.put16(koff, e.kc[base:base+dh]); err != nil {
 			return err
 		}
-		voff := e.off.vc + uint32(g*c.SeqCap*dh)*2
-		if err := e.put16(voff, e.vc[base:base+n]); err != nil {
+		voff := e.off.vc + uint32(g*c.SeqCap*dh+pos*dh)*2
+		if err := e.put16(voff, e.vc[base:base+dh]); err != nil {
 			return err
 		}
 	}
@@ -405,7 +404,7 @@ func (e *engine) step(tok, pos int) error {
 				e.vc[base+i] = gpu3d.F16bits(v[g*dh+i])
 			}
 		}
-		if err := e.cacheFlush(l, pos); err != nil {
+		if err := e.cacheAppend(l, pos); err != nil {
 			return err
 		}
 		// Attention: QG query heads share one kv head — one scores GEMM

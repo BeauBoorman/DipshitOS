@@ -18,7 +18,7 @@
 # device/app never ran cannot pass. HOST PREREQUISITE (fails honestly):
 #   bash tools/go/build-gotabwm.sh tools/go/build-gputriangle.sh
 
-vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 9 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip"
+vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 12 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model inference"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -92,7 +92,7 @@ for name in ("GOTABWM.ELF", "GPUTRIANGLE.ELF", "GOINFER.ELF"):
     shutil.copy(src, os.path.join(share, name))
 with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
     f.write("#v2\nwm=none\n")
-print("staged Go seat + GPUTRIANGLE.ELF, wm=none")
+print("staged Go seat + GPUTRIANGLE.ELF + GOINFER.ELF, wm=none")
 PY
 
 # --- leg 05 (run first): native-only --------------------------------------
@@ -498,12 +498,13 @@ print("no GOINFER receipts on native-only boot")
 PY
 
 # --- leg 10: GOINFER stub-model inference, K=5 (M111c, issue #2410) -------
-# One exec, five complete runs of the deterministic PRNG-weights model —
-# each a fresh sys_gpucomp session, a full VIW stream-and-seal load, and a
-# greedy decode whose every matmul and vocab softmax rides GEMM/DEQUANT/
-# SOFTMAX on the real Metal pipelines. The answer is pinned because the
-# model is synthetic-by-construction; a real weights image pins its own
-# answer on the card's landing PR.
+# One exec, five complete runs of the deterministic PRNG-weights model on
+# the journey's single sys_gpucomp session — each a full VIW
+# stream-and-seal load, a buffer rebuild, and a greedy decode whose every
+# matmul and vocab softmax rides GEMM/DEQUANT/SOFTMAX on the real Metal
+# pipelines. The answer is pinned because the model is
+# synthetic-by-construction; a real weights image pins its own answer on
+# the card's landing PR.
 vgate_run 10 -- \
     --screen '$RUN_DIR/screen-10' \
     --gpu3d-metal \
@@ -518,6 +519,10 @@ vgate_assert 10 serial-contains 'gpu3d: armed did=0x1083'
 vgate_assert 10 serial-count 'goinfer: stub run k=' 5
 vgate_assert 10 serial-contains 'goinfer: stub consistent K=5'
 vgate_assert 10 serial-contains 'goinfer: stub answer'
+# The pinned stub answer — observed on the Metal path 2026-10-17 (and
+# byte-identical to the kernel-emulating host fake's decode). Any drift is
+# a real-path regression, not a re-pin.
+vgate_assert 10 serial-count 'ids=210,210,210,175,189,36,58,143,36,23,36,23,58,176,217,34' 5
 vgate_assert 10 serial-contains 'goinfer OK'
 vgate_assert 10 serial-absent 'goinfer: error'
 vgate_assert 10 serial-absent 'goinfer: diverged'

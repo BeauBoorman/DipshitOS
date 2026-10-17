@@ -194,8 +194,11 @@ func TestStubRunsDeterministicAndCoversKernels(t *testing.T) {
 	if err := run(h, []string{"stub"}); err != nil {
 		t.Fatalf("run stub: %v", err)
 	}
-	if len(h.devs) != stubK {
-		t.Fatalf("sessions = %d want %d", len(h.devs), stubK)
+	// One journey, one compute session (the fixed-VA window makes a process
+	// single-session anyway): the five runs share it and each frees its own
+	// buffers.
+	if len(h.devs) != 1 {
+		t.Fatalf("sessions = %d want 1", len(h.devs))
 	}
 	d := h.devs[0]
 	for _, k := range []uint32{kernelGEMM, kernelSoftmax, kernelDequant} {
