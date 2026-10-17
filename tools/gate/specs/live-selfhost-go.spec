@@ -27,10 +27,22 @@
 #   bash tools/go/build-go.sh tools/go/selfhost.go   -> .build/go/GOSELFHOST.ELF
 #   bash tools/go/build-gotool.sh                    -> .build/go/GOCMD*.ELF
 #   bash tools/go/stage-selfhost.sh                  -> .build/go/selfhost/
+#   bash tools/go/build-gobuild.sh                   -> .build/go/GOBUILD.ELF
+#   bash tools/go/build-<app>.sh per fleet ELF       -> .build/go/<NAME>.ELF
+#     (gocalc note goedit files goterm web pulse gosh help gotop goset
+#      godiff goview gosound flint store agentd — REF/ names them)
 # exec-order: assert-proven -- run 01 ends on a marker only the driver prints,
 # and its asserts read the driver's own steps; run 02 ends on the executed
 # program's own pinned line. A loop that never ran cannot go green. See
 # tools/gate/SPEC.md.
+#
+# M112a (#2413) run 03 — the fleet leg. GOBUILD.ELF's `fleet` verb builds
+# every row of the pinned list (user/go/gobuild/fleet.txt, staged as
+# /host/FLEET.TXT) from the staged source tree (/host/SRC) with the real
+# M107b policy table, writes the source->ELF manifest to /host/FLEET.MF, and
+# smoke-execs each product once. GOSTALGIA's `external:` row earns the named
+# refusal by design — its source is a pinned host-side checkout plus overlay
+# trees, not share-stageable source.
 
 vgate_name live-selfhost-go "issue #1544 M70c-S2: the guest's own toolchain builds the pinned hello in one loop, and the product runs"
 vgate_share seed
@@ -161,3 +173,461 @@ vgate_assert 02 serial-contains 'virelai-go OK'
 vgate_assert 02 serial-absent '[EXC] parking:'
 vgate_assert 02 serial-absent 'exited status=139'
 vgate_assert 02 serial-absent 'cannot allocate memory'
+
+# ---------------------------------------------------------------------------
+# M112a (#2413) run 03 — the fleet leg. One boot, one driver run: the pinned
+# 19-row list, per-ELF named refusals (never a silently widened allowlist),
+# the FLEET.MF manifest on the share, and a bounded smoke exec per product.
+# wm=none keeps every EL0 task slot free for toolchain children.
+
+vgate_file script3.txt <<'EOF'
+exec GOBUILD.ELF fleet
+EOF
+
+vgate_setup_python <<'PY'
+import os, re, shutil, subprocess, sys
+
+share = os.path.join(os.environ["RUN_DIR"], "share")
+repo = os.getcwd()
+
+# Stale products must not fake a later run (same rule as the HELLO sweep):
+# the manifest and the guest-built ELFs go BEFORE the driver itself is
+# staged, because GOBUILD.ELF is both the staged driver and a fleet row.
+mf = os.path.join(share, "FLEET.MF")
+if os.path.exists(mf):
+    os.remove(mf)
+for line in open("user/go/gobuild/fleet.txt"):
+    line = line.strip()
+    if line and not line.startswith("#"):
+        p = os.path.join(share, line.split()[0])
+        if os.path.isfile(p):
+            os.remove(p)
+
+# The in-guest driver + the pinned list.
+if not os.path.exists(".build/go/GOBUILD.ELF"):
+    sys.exit(".build/go/GOBUILD.ELF missing — bash tools/go/build-gobuild.sh")
+shutil.copy(".build/go/GOBUILD.ELF", os.path.join(share, "GOBUILD.ELF"))
+shutil.copy("user/go/gobuild/fleet.txt", os.path.join(share, "FLEET.TXT"))
+
+# wm=none: no seat ever starts, so the ~250 sequential toolchain children
+# and the smoke execs never contend for EL0 task slots.
+open(os.path.join(share, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
+
+# --- the pinned fleet rows --------------------------------------------------
+rows = []
+for line in open("user/go/gobuild/fleet.txt"):
+    line = line.strip()
+    if line and not line.startswith("#"):
+        name, src = line.split()
+        rows.append((name, src))
+if len(rows) != 19:
+    sys.exit("fleet.txt pins %d rows, expected 19" % len(rows))
+
+# --- host-built reference ELFs -> REF/ (the manifest's host= column) --------
+os.makedirs(os.path.join(share, "REF"), exist_ok=True)
+n_ref = 0
+for name, _ in rows:
+    p = os.path.join(".build", "go", name)
+    if os.path.exists(p):
+        shutil.copy(p, os.path.join(share, "REF", name))
+        n_ref += 1
+print("staged %d host reference ELFs under REF/" % n_ref)
+
+# --- the fleet source tree -> SRC/ ------------------------------------------
+# virelai/<pkg> maps to user/go/<pkg>. Third-party module imports map to the
+# pinned module-cache copies — the same pins the three Charm apps' host
+# builds declare (THIRD-PARTY.txt) — under their import path, minus the
+# @version. Resolution in-guest is local-source, so the archive allowlist is
+# untouched and the manifest's src= column covers them.
+MODVER = {
+    "charm.land/bubbletea/v2": "v2.0.9",
+    "github.com/aymanbagabas/go-osc52/v2": "v2.0.1",
+    "github.com/charmbracelet/colorprofile": "v0.4.3",
+    "github.com/charmbracelet/lipgloss": "v1.1.0",
+    "github.com/charmbracelet/ultraviolet": "v0.0.0-20260703014108-f5a850f9c2b7",
+    "github.com/charmbracelet/x/ansi": "v0.11.7",
+    "github.com/charmbracelet/x/cellbuf": "v0.0.15",
+    "github.com/charmbracelet/x/term": "v0.2.2",
+    "github.com/charmbracelet/x/windows": "v0.2.2",
+    "github.com/clipperhouse/displaywidth": "v0.11.0",
+    "github.com/clipperhouse/uax29/v2": "v2.7.0",
+    "github.com/lucasb-eyer/go-colorful": "v1.4.0",
+    "github.com/mattn/go-isatty": "v0.0.20",
+    "github.com/mattn/go-runewidth": "v0.0.23",
+    "github.com/muesli/cancelreader": "v0.2.2",
+    "github.com/muesli/termenv": "v0.16.0",
+    "github.com/rivo/uniseg": "v0.4.7",
+    "github.com/xo/terminfo": "v0.0.0-20220910002029-abceb7e1c41e",
+    "golang.org/x/sync": "v0.21.0",
+}
+modcache = None
+
+# virelai/vi and virelai/vsys are the archive tier, not source: their .s
+# gateways need cmd/asm, which the in-guest toolchain does not ship. They
+# resolve through GOIMPORT.CFG's staged GPKG_*.a archives.
+ARCHIVE_TIER = {"virelai/vi", "virelai/vsys"}
+
+IMP = re.compile(r'"([A-Za-z0-9_][A-Za-z0-9_./-]*)"')
+
+# The driver's build tag set is exactly {virelai, arm64, gc} — virelai is NOT
+# in Go's unix GOOS set, so "unix"-tagged code is out (that is why the Charm
+# apps carry shims). The walker must only follow imports of files this
+# toolchain would compile.
+BUILD_TAGS = {"virelai", "arm64", "gc"}
+
+def _eval_expr(tok, i):
+    """tiny //go:build evaluator: !, &&, ||, parens over tag atoms."""
+    if tok[i] == "!":
+        v, i = _eval_expr(tok, i + 1)
+        return (not v), i
+    if tok[i] == "(":
+        v, i = _eval_or(tok, i + 1)
+        return v, i + 1  # consume ')'
+    v = tok[i] in BUILD_TAGS
+    return v, i + 1
+
+def _eval_and(tok, i):
+    v, i = _eval_expr(tok, i)
+    while i < len(tok) and tok[i] == "&&":
+        w, i = _eval_expr(tok, i + 1)
+        v = v and w
+    return v, i
+
+def _eval_or(tok, i):
+    v, i = _eval_and(tok, i)
+    while i < len(tok) and tok[i] == "||":
+        w, i = _eval_and(tok, i + 1)
+        v = v or w
+    return v, i
+
+def _tok(expr):
+    return re.findall(r'[A-Za-z0-9_.]+|&&|\|\||!|\(|\)', expr)
+
+# go/build's filename platform rule (internal/syslist lists): a final
+# _<GOOS>/_<GOARCH> component selects that platform, x_<GOOS>_<GOARCH> the
+# pair; unrecognised tokens constrain nothing. The driver applies the same
+# rule in-guest — the walker must agree or it will stage imports the in-guest
+# selection never reads.
+KNOWN_GOOS = {"aix", "android", "darwin", "dragonfly", "freebsd", "hurd",
+              "illumos", "ios", "js", "linux", "nacl", "netbsd", "openbsd",
+              "plan9", "solaris", "wasip1", "virelai", "windows", "zos"}
+KNOWN_GOARCH = {"386", "amd64", "amd64p32", "arm", "armbe", "arm64",
+                "arm64be", "loong64", "mips", "mipsle", "mips64",
+                "mips64le", "mips64p32", "mips64p32le", "ppc", "ppc64",
+                "ppc64le", "riscv", "riscv64", "s390x", "sparc",
+                "sparc64", "wasm"}
+
+def filename_target_ok(name):
+    base = name.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if base.endswith("_test"):
+        base = base[:-5]
+    parts = base.split("_")
+    if len(parts) < 2:
+        return True
+    last = parts[-1]
+    second = parts[-2] if len(parts) >= 3 else ""
+    if last in KNOWN_GOARCH:
+        if last != "arm64":
+            return False
+        return second not in KNOWN_GOOS or second == "virelai"
+    if last in KNOWN_GOOS:
+        return last == "virelai"
+    return True
+
+def buildable_go(path):
+    """True when this file would compile under //go:build virelai."""
+    if not filename_target_ok(path):
+        return False
+    gobuild, plusbuilds = None, []
+    try:
+        for line in open(path, errors="replace"):
+            s = line.strip()
+            if s.startswith("//go:build"):
+                v, _ = _eval_or(_tok(s[len("//go:build"):]), 0)
+                gobuild = v
+            elif s.startswith("// +build"):
+                # legacy: comma = AND, space = OR, lines AND together
+                groups = s[len("// +build"):].split()
+                line_ok = False
+                for grp in groups:
+                    atoms = grp.split(",")
+                    line_ok = all(
+                        (a[1:] not in BUILD_TAGS) if a.startswith("!")
+                        else (a in BUILD_TAGS)
+                        for a in atoms)
+                    if line_ok:
+                        break
+                plusbuilds.append(line_ok)
+            elif s.startswith("//") or s == "":
+                continue
+            else:
+                break
+    except OSError:
+        return True  # unreadable stays the driver's problem
+    if gobuild is not None:
+        return gobuild
+    if plusbuilds:
+        return all(plusbuilds)
+    return True
+
+def go_imports(path):
+    imps, inblock = [], False
+    for line in open(path, errors="replace"):
+        s = line.split("//", 1)[0].strip() if "import" not in line else line.strip()
+        if s.startswith("//"):
+            continue
+        if not inblock and s.startswith("import"):
+            rest = s[len("import"):].strip()
+            if rest.startswith("("):
+                inblock = True
+                continue
+            m = IMP.search(rest)
+            if m:
+                imps.append(m.group(1))
+            continue
+        if inblock:
+            if s.startswith(")"):
+                inblock = False
+                continue
+            m = IMP.search(s)
+            if m:
+                imps.append(m.group(1))
+    return imps
+
+def modsrc(imp):
+    """map an import path to (module root in cache, subpath) or None."""
+    global modcache
+    best = None
+    for m in MODVER:
+        if imp == m or imp.startswith(m + "/"):
+            if best is None or len(m) > len(best):
+                best = m
+    if best is None:
+        return None
+    if modcache is None:
+        modcache = subprocess.run(["go", "env", "GOMODCACHE"],
+                                  capture_output=True, text=True).stdout.strip()
+        if not modcache:
+            sys.exit("go env GOMODCACHE returned nothing")
+    rel = imp[len(best):].lstrip("/")
+    return os.path.join(modcache, best + "@" + MODVER[best], rel)
+
+def stage_dir(src_abs, dst_rel, seen):
+    """copy one package dir's .go surface; return True if newly staged."""
+    dst = os.path.join(share, "SRC", dst_rel)
+    if dst_rel in seen:
+        return False
+    if not os.path.isdir(src_abs):
+        return False
+    os.makedirs(dst, exist_ok=True)
+    n = 0
+    for name in sorted(os.listdir(src_abs)):
+        sp = os.path.join(src_abs, name)
+        if os.path.isfile(sp) and name.endswith(".go") and not name.endswith("_test.go"):
+            shutil.copyfile(sp, os.path.join(dst, name))
+            n += 1
+    if n == 0:
+        return False
+    seen.add(dst_rel)
+    return True
+
+# The overlay facts the host builds apply (tools/go/build-{files,pulse,
+# help}.sh): two bubbletea files are REPLACED (their upstream build tags
+# would otherwise select wrong-GOOS implementations), and termenv/go-isatty
+# get an additive virelai shim file. Same rules, same files.
+OVERLAY = os.path.join("tools", "go", "overlay", "charm")
+BUBBLE = "charm.land/bubbletea/v2"
+
+queue = []
+for name, src in rows:
+    if src.startswith("external:"):
+        continue
+    # src is virelai/<app>: the program dir under the source root.
+    queue.append((os.path.join(repo, "user", "go", src[len("virelai/"):]), src))
+
+staged = set()
+files_total = 0
+missing = []
+while queue:
+    src_abs, rel = queue.pop()
+    if rel in staged:
+        continue
+    if not os.path.isdir(src_abs):
+        missing.append(rel)
+        continue
+    if not stage_dir(src_abs, rel, staged):
+        missing.append(rel)
+        continue
+    dst = os.path.join(share, "SRC", rel)
+    files_total += len(os.listdir(dst))
+    # apply the charm overlay rules to staged module copies
+    if rel == BUBBLE:
+        for old, new in (("termios_other.go", "termios_virelai.go"),
+                         ("signals_unix.go", "signals_virelai.go")):
+            ov = os.path.join(repo, OVERLAY, new)
+            orig = os.path.join(dst, old)
+            if os.path.exists(orig):
+                os.remove(orig)
+            shutil.copyfile(ov, os.path.join(dst, new))
+    if rel == "github.com/muesli/termenv":
+        shutil.copyfile(os.path.join(repo, OVERLAY, "termenv_virelai.go"),
+                        os.path.join(dst, "termenv_virelai.go"))
+    if rel == "github.com/mattn/go-isatty":
+        shutil.copyfile(os.path.join(repo, OVERLAY, "isatty_virelai.go"),
+                        os.path.join(dst, "isatty_virelai.go"))
+    # walk this dir's imports — but only from files this toolchain selects
+    # (a darwin- or windows-only file's imports are not ours to stage).
+    for fn in sorted(os.listdir(dst)):
+        fp = os.path.join(dst, fn)
+        if not fn.endswith(".go") or not buildable_go(fp):
+            continue
+        for imp in go_imports(fp):
+            if imp.startswith("virelai/"):
+                if imp in ARCHIVE_TIER:
+                    continue
+                queue.append((os.path.join(repo, "user", "go",
+                                           imp[len("virelai/"):]), imp))
+            elif "." in imp.split("/")[0]:
+                md = modsrc(imp)
+                if md is None:
+                    missing.append(imp + " (no pinned module)")
+                else:
+                    queue.append((md, imp))
+
+if missing:
+    sys.exit("fleet source staging incomplete — not stageable under SRC/: %s"
+             % sorted(set(missing)))
+print("fleet source tree: %d package dirs, %d .go files under SRC/"
+      % (len(staged), files_total))
+PY
+
+# Run 03: one driver, ~250 sequential spawn-and-wait children, 18 smoke
+# execs. The timeout is wide for the same reason run 01's is — a link child
+# reading tens of MiB of archives off the 2048-byte share channel is slow,
+# and there are eighteen of them. A premature kill would fake failure, not
+# evidence.
+vgate_run 03 -- --script '$RUN_DIR/script3.txt' --script-expect 'fleet: fleet ' --timeout 5400
+
+vgate_assert 03 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 03 serial-contains 'exec: loaded GOBUILD.ELF'
+vgate_assert 03 serial-contains 'fleet: GOCALC.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: NOTE.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOEDIT.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOTERM.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: WEB.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOSH.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOTOP.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOSET.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GODIFF.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOVIEW.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOSOUND.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: FLINT.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: STORE.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: AGENTD.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOBUILD.ELF built sha256='
+vgate_assert 03 serial-contains 'fleet: GOFILES.ELF refused dep_unsupported'
+vgate_assert 03 serial-contains 'fleet: PULSE.ELF refused dep_unsupported'
+vgate_assert 03 serial-contains 'fleet: GOHELP.ELF refused dep_unsupported'
+vgate_assert 03 serial-contains 'fleet: GOSTALGIA.ELF refused external_tree'
+vgate_assert 03 serial-contains 'fleet: smoke GOCALC.ELF'
+vgate_assert 03 serial-contains 'fleet: smoke GOBUILD.ELF'
+vgate_assert 03 serial-contains 'fleet: manifest -> /host/FLEET.MF'
+vgate_assert 03 serial-contains 'fleet: fleet OK built=15 refused=4'
+vgate_assert 03 serial-absent 'fleet: fleet INCOMPLETE'
+vgate_assert 03 serial-absent '[EXC] parking:'
+vgate_assert 03 serial-absent 'cannot allocate memory'
+vgate_assert 03 serial-absent 'exited status=139'
+
+# The manifest is the card's deliverable: every pinned row carries the
+# source hash, the toolchain stamp, and both sha256 columns; every built
+# ELF passes the kernel's own loader rules (the same elf_rules the other
+# runs share). Refusals are named, never silent.
+vgate_assert 03 python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.path.join("tools", "lib"))
+import elf_rules
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+
+mf = os.path.join(share, "FLEET.MF")
+if not os.path.exists(mf):
+    sys.exit("FAIL: no FLEET.MF on the share")
+lines = [l for l in open(mf).read().splitlines() if l and not l.startswith("#")]
+if len(lines) != 19:
+    sys.exit("FAIL: FLEET.MF has %d rows, want 19" % len(lines))
+
+built, refused, failed = [], [], []
+for line in lines:
+    f = line.split("\t")
+    row = {}
+    name, state = f[0], f[1]
+    for kv in f[2:]:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            row[k] = v
+    for col in ("src", "tc", "guest", "host", "hash"):
+        if col not in row:
+            sys.exit("FAIL: %s row missing %s=" % (name, col))
+    if row["tc"] == "-" or len(row["tc"]) != 64:
+        sys.exit("FAIL: %s has no toolchain stamp" % name)
+    if state == "built":
+        for col in ("src", "guest"):
+            if len(row[col]) != 64:
+                sys.exit("FAIL: %s %s is not a sha256" % (name, col))
+        if not row.get("smoke") or row["smoke"] == "-":
+            sys.exit("FAIL: %s built but no smoke verdict" % name)
+        if row["hash"] not in ("match", "host-missing") and \
+           not row["hash"].startswith("mismatch:"):
+            sys.exit("FAIL: %s unnamed hash verdict %r" % (name, row["hash"]))
+        built.append(name)
+    elif state == "refused":
+        if row.get("code") in ("", None):
+            sys.exit("FAIL: %s refused without naming the refusal" % name)
+        refused.append(name)
+    else:
+        failed.append(name)
+
+# The pinned list says exactly which of the 19 build; a drift either way is
+# a spec-level finding, not a shrug. GOFILES/PULSE/GOHELP refuse
+# dep_unsupported: their closure needs image/color, which M107b's table
+# deliberately does not stage (the card's "never silently widen" means the
+# refusal is the answer, not a wider allowlist). GOSTALGIA's sources are a
+# host-side pin — external_tree.
+want_built = {"GOCALC.ELF", "NOTE.ELF", "GOEDIT.ELF", "GOTERM.ELF",
+              "WEB.ELF", "GOSH.ELF", "GOTOP.ELF", "GOSET.ELF", "GODIFF.ELF",
+              "GOVIEW.ELF", "GOSOUND.ELF", "FLINT.ELF", "STORE.ELF",
+              "AGENTD.ELF", "GOBUILD.ELF"}
+want_refused = {"GOSTALGIA.ELF", "GOFILES.ELF", "PULSE.ELF", "GOHELP.ELF"}
+if set(built) != want_built:
+    sys.exit("FAIL: built set drifted: missing=%s extra=%s"
+             % (sorted(want_built - set(built)), sorted(set(built) - want_built)))
+if set(refused) != want_refused:
+    sys.exit("FAIL: refused set = %s, want %s" % (sorted(refused), sorted(want_refused)))
+if failed:
+    sys.exit("FAIL: %d ELFs failed mid-build: %s" % (len(failed), failed))
+
+for name in built:
+    elf = os.path.join(share, name)
+    if not os.path.exists(elf):
+        sys.exit("FAIL: %s marked built but no product on the share" % name)
+    receipt, fails = elf_rules.check_file(elf, name)
+    if fails:
+        for fl in fails:
+            print("FAIL: " + fl)
+        sys.exit(1)
+print("fleet manifest: %d built + %d refused, all loader-clean, named "
+      "verdicts per row" % (len(built), len(refused)))
+PY
+
+# Diagnostic, never-fail: child crashes write kernel tombstones to
+# crash/<pid>-<name>.txt on the share — surface them in the report so a
+# mid-fleet fault is legible evidence, not an invisible stack.
+vgate_assert 03 python <<'PY'
+import glob, os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+tombs = sorted(glob.glob(os.path.join(share, "crash", "*.txt")))
+if not tombs:
+    print("no crash tombstones on the share")
+for t in tombs[:8]:
+    print("=== %s ===" % os.path.basename(t))
+    print(open(t, errors="replace").read()[:4000])
+PY

@@ -17,18 +17,27 @@ import (
 func readFile(path string) ([]byte, error)  { return os.ReadFile(path) }
 func writeFile(path string, b []byte) error { return os.WriteFile(path, b, 0o644) }
 
-// listGoFiles returns dir's buildable-candidate .go files, sorted, skipping
-// the exclusions the go tool applies: _test.go, dot/underscore-prefixed
-// names.
+// dirEnt is one directory entry the driver needs: name + is-dir.
+type dirEnt struct {
+	name  string
+	isDir bool
+}
+
+// dirEntries is the driver's directory listing — the implementations live
+// in fs_list_virelai.go / fs_list_host.go. NEVER os.ReadDir on the guest:
+// the virelai runtime's readdir is the legacy 16-row sys_dir_list window
+// and a directory past 16 entries refuses ENOSPC
+// (go-virelai/src/syscall/fs_virelai.go ReadDirent); the fleet's package
+// dirs routinely exceed that.
 func listGoFiles(dir string) ([]string, error) {
-	ents, err := os.ReadDir(dir)
+	ents, err := dirEntries(dir)
 	if err != nil {
 		return nil, err
 	}
 	var out []string
 	for _, e := range ents {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") ||
+		name := e.name
+		if e.isDir || !strings.HasSuffix(name, ".go") ||
 			strings.HasSuffix(name, "_test.go") ||
 			strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
 			continue

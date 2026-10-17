@@ -264,14 +264,59 @@ func TestSpawnErrorIsNotAStatus(t *testing.T) {
 	}
 }
 
-func TestNameMangleCollisionRefused(t *testing.T) {
+// Two import paths whose manglePath collides ("a/b" vs "a_b") used to be a
+// name_collision refusal; M112a's assignStems resolves the pair
+// deterministically — the later (sorted) path takes an indexed stem — so
+// both compile instead of neither. The constraint the kernel imposes is
+// share-name uniqueness, and indexed stems satisfy it exactly.
+func TestNameMangleCollisionGetsIndexedStem(t *testing.T) {
 	dir := t.TempDir()
 	writeSrc(t, dir, "main.go", "package main\nimport (\"a/b\"; \"a_b\")\nfunc main() {}\n")
 	writeSrc(t, dir, "a/b/x.go", "package b\n")
 	writeSrc(t, dir, "a_b/x.go", "package a_b\n")
 	g := ImportGraph(dir, nil, nil)
-	diags := checkMangles(g)
-	if !hasCode(diags, "name_collision") {
-		t.Fatalf("want name_collision, got %v", diags)
+	if len(g.Diags) != 0 {
+		t.Fatalf("a mangle collision is a naming problem, not a refusal: %v", g.Diags)
+	}
+	stems := map[string]string{}
+	for _, p := range g.Packages {
+		if p.Local {
+			if _, dup := stems[p.Stem]; dup {
+				t.Fatalf("stem %q assigned twice", p.Stem)
+			}
+			stems[p.Stem] = p.Path
+		}
+	}
+	if g.Packages["a/b"].Stem == g.Packages["a_b"].Stem {
+		t.Fatal("colliding paths must not share a stem")
+	}
+}
+
+// An import path that mangles past the share-name bound takes an indexed
+// stem — fleet module paths like github.com/charmbracelet/x/ansi/parser
+// are the real case.
+func TestOverlongPathGetsIndexedStem(t *testing.T) {
+	dir := t.TempDir()
+	long := "github.com/charmbracelet/x/ansi/parser"
+	writeSrc(t, dir, "main.go", "package main\nimport \""+long+"\"\nfunc main() {}\n")
+	writeSrc(t, dir, long+"/p.go", "package parser\n")
+	g := ImportGraphR(dir, dir, nil, nil)
+	if len(g.Diags) != 0 {
+		t.Fatalf("unexpected diags: %v", g.Diags)
+	}
+	stem := g.Packages[long].Stem
+	if len(stem)+len(".diag~") > 31 {
+		t.Fatalf("stem %q breaks the 31-byte share-name bound", stem)
+	}
+}
+
+// An asm-bearing local package is a named refusal, not a late link error.
+func TestNeedsAsmRefused(t *testing.T) {
+	dir := t.TempDir()
+	writeSrc(t, dir, "main.go", "package main\nfunc main() {}\n")
+	writeSrc(t, dir, "svc.s", "//go:build virelai\n\nTEXT ·x(SB), $0-0\n\tRET\n")
+	g := ImportGraph(dir, nil, nil)
+	if !hasCode(g.Diags, "needs_asm") {
+		t.Fatalf("want needs_asm, got %v", codes(g.Diags))
 	}
 }

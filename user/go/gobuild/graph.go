@@ -31,14 +31,20 @@ type Package struct {
 	Files   []string // .go files to compile, in declared order
 	Imports []Import // direct imports minus "unsafe"
 	Archive string   // staged archive path for !Local packages
+	Stem    string   // workdir file stem (assigned by assignStems)
 	Local   bool
 }
 
 // Graph is the resolved import closure of the program rooted at Dir.
 // Order lists the LOCAL packages in dependency order (a package always
-// follows the local packages it imports) — the compile sequence.
+// follows the local packages it imports) — the compile sequence. Root is
+// an optional second local tier (the fleet's source tree): an import that
+// is not a program-local dir resolves under Root before the deny/archive
+// tiers, which is how a staged `virelai/*` (or pinned module) tree turns
+// into local packages without touching the archive policy.
 type Graph struct {
 	Dir      string
+	Root     string
 	Main     *Package
 	Packages map[string]*Package
 	Order    []*Package
@@ -79,6 +85,19 @@ func (g *Graph) resolve(imp Import, archives map[string]string, table map[string
 			g.Packages[imp.Path] = &Package{Path: imp.Path, Dir: dir, Local: true}
 		}
 		return
+	}
+	// The fleet's second local tier (M112a): <root>/<import path>. A staged
+	// source tree answers imports the program dir cannot — and never reaches
+	// the archive tier, so virelai/vi and virelai/vsys stay archive-resolved
+	// by simply not being staged (there is no in-guest assembler for their
+	// .s gateways).
+	if g.Root != "" {
+		if dir := joinPath(g.Root, imp.Path); validRelPath(imp.Path) && dirHasGoFiles(dir) {
+			if g.Packages[imp.Path] == nil {
+				g.Packages[imp.Path] = &Package{Path: imp.Path, Dir: dir, Local: true}
+			}
+			return
+		}
 	}
 	if row, ok := table[imp.Path]; ok && row.denied {
 		// The refusal's name goes in the message: ERRORS.TXT renders
@@ -121,7 +140,14 @@ func (g *Graph) resolve(imp Import, archives map[string]string, table map[string
 // closure BEFORE it spends the boot budget on hundreds of sequential
 // compile children.
 func ImportGraph(dir string, archives map[string]string, table map[string]pkgRow) *Graph {
-	g := &Graph{Dir: dir, Packages: map[string]*Package{}}
+	return ImportGraphR(dir, "", archives, table)
+}
+
+// ImportGraphR is ImportGraph with the fleet's source root: imports that
+// are not program-local resolve under root (a staged source tree) before
+// the deny/archive tiers.
+func ImportGraphR(dir, root string, archives map[string]string, table map[string]pkgRow) *Graph {
+	g := &Graph{Dir: dir, Root: root, Packages: map[string]*Package{}}
 	main := &Package{Path: "main", Dir: dir, Local: true}
 	g.Packages["main"] = main
 	g.load(main)
@@ -161,6 +187,7 @@ func ImportGraph(dir string, archives map[string]string, table map[string]pkgRow
 		}
 	}
 	g.sortLocal()
+	assignStems(g)
 	return g
 }
 
@@ -216,6 +243,108 @@ func (g *Graph) load(p *Package) {
 	if p.Name == "" && len(p.Files) == 0 && len(g.Diags) == 0 {
 		g.Diags = append(g.Diags, Diag{Code: "io", File: p.Dir,
 			Msg: "no buildable .go files"})
+	}
+	// A package whose virelai-selected sources include .s needs cmd/asm,
+	// which the in-guest toolchain does not ship (ADR 0035 D4: compile +
+	// link only). Naming it here beats letting the linker find the missing
+	// bodies — the refusal says WHICH package and WHICH files.
+	if asm := buildableAsm(p.Dir); len(asm) > 0 {
+		g.Diags = append(g.Diags, Diag{Code: "needs_asm", File: p.Dir,
+			Msg: "needs_asm: package " + strconv.Quote(p.Path) +
+				" requires an assembler for " + strings.Join(asm, ", ") +
+				" (no cmd/asm on GOOS=virelai)"})
+	}
+}
+
+// buildableAsm lists dir's .s files that this toolchain would assemble. A
+// .s has no package clause, so constraints are read as leading comment
+// lines directly; an unconstrained .s builds for every GOOS, and a file
+// whose constraint excludes virelai (…_windows.s shape) is not an asm
+// dependency of this build.
+func buildableAsm(dir string) []string {
+	ents, err := dirEntries(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		name := e.name
+		if e.isDir || !strings.HasSuffix(name, ".s") {
+			continue
+		}
+		if !fileNameTargetOK(name) {
+			continue // x_linux.s: not this target's file
+		}
+		src, err := readFile(joinPath(dir, name))
+		if err != nil {
+			out = append(out, name)
+			continue // unreadable .s is still an asm dependency
+		}
+		if asmFileBuildable(src) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// asmFileBuildable evaluates an .s file's leading //go:build / +build
+// constraints against this toolchain's tag set.
+func asmFileBuildable(src []byte) bool {
+	for _, line := range strings.Split(string(src), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "//") {
+			break // first non-comment line ends the constraint zone
+		}
+		expr, err := constraint.Parse(strings.TrimPrefix(line, "//"))
+		if err != nil || expr == nil {
+			continue
+		}
+		if constraint.IsGoBuild(line) || strings.HasPrefix(line, "// +build") {
+			if !expr.Eval(isBuildTag) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// stemMaxBytes bounds a workdir file stem so "<stem>.diag~" (the longest
+// derived name: the step capture's publish temp) stays inside the 31-byte
+// share-name limit (kernel/src/file_table.zig).
+const stemMaxBytes = 31 - len(".diag~")
+
+// assignStems gives each local package a workdir-unique, share-legal file
+// stem. The readable "P_"+manglePath wins when it fits and is unique; deep
+// module paths (charm.land/bubbletea/v2, github.com/charmbracelet/x/ansi/…)
+// exceed the name bound and take a P%03d index assigned in sorted order —
+// deterministic, and the compile/link importcfgs keep the true path in text.
+func assignStems(g *Graph) {
+	var names []string
+	for _, p := range g.Packages {
+		if p.Local {
+			names = append(names, p.Path)
+		}
+	}
+	sort.Strings(names)
+	seen := map[string]bool{}
+	idx := 0
+	for _, n := range names {
+		stem := "P_" + manglePath(n)
+		if len(stem) > stemMaxBytes || seen[stem] {
+			for {
+				stem = "P" + strconv.Itoa(idx)
+				idx++
+				if !seen[stem] {
+					break
+				}
+			}
+		}
+		seen[stem] = true
+		g.Packages[n].Stem = stem
 	}
 }
 
@@ -287,10 +416,67 @@ func syntaxDiags(err error) []Diag {
 	return []Diag{{Code: "syntax", Msg: err.Error()}}
 }
 
+// The GOOS/GOARCH name lists go/build uses for filename matching
+// (internal/syslist): a final _<GOOS>/_<GOARCH> component selects that
+// platform, x_<GOOS>_<GOARCH> selects the pair, and unrecognised tokens
+// ("other", "unix", "posix") constrain nothing. The fleet's module trees
+// lean on this — constants_linux.go must NOT compile for virelai.
+var knownGOOSFile = map[string]bool{
+	"aix": true, "android": true, "darwin": true, "dragonfly": true,
+	"freebsd": true, "hurd": true, "illumos": true, "ios": true, "js": true,
+	"linux": true, "nacl": true, "netbsd": true, "openbsd": true,
+	"plan9": true, "solaris": true, "wasip1": true, "virelai": true,
+	"windows": true, "zos": true,
+}
+var knownGOARCHFile = map[string]bool{
+	"386": true, "amd64": true, "amd64p32": true, "arm": true,
+	"armbe": true, "arm64": true, "arm64be": true, "loong64": true,
+	"mips": true, "mipsle": true, "mips64": true, "mips64le": true,
+	"mips64p32": true, "mips64p32le": true, "ppc": true, "ppc64": true,
+	"ppc64le": true, "riscv": true, "riscv64": true, "s390x": true,
+	"sparc": true, "sparc64": true, "wasm": true,
+}
+
+// fileNameTargetOK evaluates go/build's filename platform rule for the
+// driver's fixed target (GOOS=virelai, GOARCH=arm64). path may carry
+// directories; only the last component's _-suffixes matter.
+func fileNameTargetOK(path string) bool {
+	base := path
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	if i := strings.LastIndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.TrimSuffix(base, "_test")
+	parts := strings.Split(base, "_")
+	if len(parts) < 2 {
+		return true
+	}
+	last := parts[len(parts)-1]
+	second := ""
+	if len(parts) >= 3 {
+		second = parts[len(parts)-2]
+	}
+	if knownGOARCHFile[last] {
+		if last != "arm64" {
+			return false
+		}
+		return !knownGOOSFile[second] || second == "virelai"
+	}
+	if knownGOOSFile[last] {
+		return last == "virelai"
+	}
+	return true
+}
+
 // buildable reports whether src's build constraints admit this toolchain
 // (GOOS=virelai GOARCH=arm64, the gc compiler — the only toolchain the guest
 // has). A malformed constraint line is a "syntax" diag, not a skip.
 func buildable(path string, src []byte) (bool, *Diag) {
+	if !fileNameTargetOK(path) {
+		return false, nil // x_linux.go, x_386.s: not this target's file
+	}
 	fset := token.NewFileSet()
 	f, err := goparser.ParseFile(fset, path, src,
 		goparser.PackageClauseOnly|goparser.SkipObjectResolution|goparser.ParseComments)

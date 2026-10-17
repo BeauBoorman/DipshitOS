@@ -8,10 +8,14 @@ import (
 	"unsafe"
 )
 
-// rawsvc6 is the raw six-argument SVC — the same idiom vi's own gateway
-// uses (user/go/vi/vi_arm64.s); a copy lives here because vi's is
-// unexported and vi is outside this card's Touches (the gobuild
-// spawn_guest.go precedent).
+// rawsvc6 is the raw six-argument SVC, bound to vi's unexported gateway by
+// linkname. M112a (#2413) replaced the private .s copy: an asm trampoline
+// is the one thing the in-guest toolchain cannot rebuild (no cmd/asm on
+// GOOS=virelai), and GOEDIT is a fleet member that must build in-guest.
+// virelai/vi.syscall6 comes out of the staged GPKG archive — identical
+// instruction sequence, no second gateway.
+//
+//go:linkname rawsvc6 virelai/vi.syscall6
 func rawsvc6(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64
 
 // Slot-79 fs_metadata op 0 (kernel/src/fs_metadata.zig stat_op) writes the
