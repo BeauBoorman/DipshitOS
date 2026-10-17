@@ -37,6 +37,24 @@
 # seat but no `host-int` row -- one arm, three named refusals, boot
 # continues with every lane dead and no directories created.
 #
+# Run 04 is M114c (#2456): runtime lane suspend/resume over the HostCommand
+# bus (`--host-cmd-after` fires the same verbs the Integration menu's
+# toggles dispatch). Clip + drop are suspended right at arm (the bus
+# republishes ARMED under the same epoch with the bits cleared; the seat
+# re-adopts `lanes=notify`); while suspended the --host-clip-in inject and
+# the --host-drop-after gesture are both refused lane_disabled and
+# send-file receipts `disabled`; clip + drop resume on the stored marker
+# (the seat re-adopts `lanes=clip,drop,notify` a second time) and the
+# suspended-era write crosses as clip-out seq=1 — the lane held its diff,
+# not lost it; send-file then performs and SENDME.QOI lands in INBOX/ ->
+# seat DROP notice -> toast -> NOTIFY_OUT -> the bare runner's named
+# no_bundle drop. Guest-side emit under a revoked mask prints
+# lane_disabled ONLY when a toast is already staged for the lane
+# (staging and emit pair inside one seat tick, so it cannot be planted
+# in class B — the path is pinned by gotabwm/hostnotify_test.go's
+# re-ARMED case); the class-B legs observe the runner-side lane_disabled
+# refusals + the seat's mask re-adoption lines + the deferred emit.
+#
 # The credential rides the share's SECRETS.TXT, bound to GOTABWM.ELF (the
 # ADR 0024 D8 app binding). --screen arms the virtio-gpu the seat's
 # WmctlRegister requires AND the display path the drop lane needs.
@@ -76,6 +94,14 @@ EOF
 # in flight (the runner's echo guard must NOT bounce it back).
 vgate_file script-read.txt <<'EOF'
 clip
+EOF
+
+# M114c run 04: the suspended-era clipboard write — `clip` stores while
+# the clip lane is suspended; the emit is deferred until resume (the
+# seat's own deferral evidence: stored under the revoked mask, crossing
+# after re-adoption).
+vgate_file script-susp.txt <<'EOF'
+clip m114c-deferred
 EOF
 
 vgate_setup_python <<'PY'
@@ -133,6 +159,12 @@ for n in ("A.QOI", "B.QOI", "C.QOI", "D.QOI", "TAIL1.QOI", "TAIL2.QOI"):
     shutil.copy(qoi, os.path.join(src_dir, n))
 with open(os.path.join(src_dir, "BIG.BIN"), "wb") as f:
     f.truncate(65 * 1024 * 1024)  # sparse: over the 64 MiB cap, instant
+# M114c run 04: the send-file source — the --host-drop-file list doubles
+# as the bus verb's file source. --host-drop-after 'lanes=notify' fires
+# the marker-path drop WHILE drop is suspended (the lane_disabled
+# refusal); the bus's send-file then delivers the same list post-resume.
+os.makedirs(os.path.join(run, "send-src"), exist_ok=True)
+shutil.copy(qoi, os.path.join(run, "send-src", "SENDME.QOI"))
 open(os.path.join(run, "key-sentinel.txt"), "w").write(KEY + "\n")
 # The flags-off and no_credential postures need shares the lane never
 # armed: the runner owns HOSTINT//INBOX/ creation, so a boot on THESE
@@ -394,4 +426,103 @@ for d in ("HOSTINT", "INBOX"):
     if os.path.isdir(os.path.join(share, d)):
         sys.exit("FAIL: no_credential arm created " + d + "/")
 print("run-03 no_credential refusal ok")
+PY
+
+# ---- 04: M114c runtime lane suspend/resume + send-file over the bus -----
+# The marker chain is strictly ordered by the seat's own armed lines:
+# arm (lanes=clip,drop,notify) -> both suspends fire -> seat adopts
+# lanes=notify -> the suspended-lane workload runs -> the stored clip
+# write's marker resumes clip (lanes=clip,notify) -> the deferred write's
+# clip-out seq=1 resumes drop (lanes=clip,drop,notify a second time) AND
+# fires send-file on the same scan, argv-ordered resume-then-send.
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen-04' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-susp.txt' --script2-after 'lanes=notify' \
+    --host-clipboard --host-pasteboard 'virelai-m114c-clip' \
+    --host-clip-in 'm114c-suspended-paste' --host-clip-in-after 'lanes=notify' \
+    --host-drop \
+    --host-drop-file '$RUN_DIR/send-src/SENDME.QOI' \
+    --host-drop-after 'lanes=notify' \
+    --host-notify \
+    --host-cmd-after 'gotabwm: hostint armed:lane-clipboard' \
+    --host-cmd-after 'gotabwm: hostint armed:lane-drop' \
+    --host-cmd-after 'lanes=notify:send-file' \
+    --host-cmd-after 'clip: stored 14 bytes:lane-clipboard' \
+    --host-cmd-after 'clip: stored 14 bytes:lane-drop' \
+    --host-cmd-after 'gotabwm: hostint clip-out seq=1:send-file' \
+    --script-expect 'gotabwm: notify id=0 host drop: SENDME.QOI' --script-expect-tail 10 --timeout 300
+
+# The arm + the seat's re-adoptions narrate the suspension arc: suspended
+# lanes leave the published mask, resumed lanes return.
+vgate_assert 04 output-contains 'host-int: armed lanes=clip,drop,notify epoch='
+vgate_assert 04 output-contains 'host-int: armed lanes=notify epoch='
+vgate_assert 04 serial-contains 'lanes=notify'
+vgate_assert 04 serial-contains 'lanes=clip,notify'
+vgate_assert 04 serial-count 'lanes=clip,drop,notify' 2
+# The bus receipts: two toggles each (suspend + resume) performing, the
+# send-file refused while the drop lane was suspended and performed after
+# resume.
+vgate_assert 04 output-contains 'host-ui: cmd=lane-clipboard state=performed'
+vgate_assert 04 output-contains 'host-ui: cmd=lane-drop state=performed'
+vgate_assert 04 output-contains 'host-ui: cmd=send-file state=disabled'
+vgate_assert 04 output-contains 'host-ui: cmd=send-file state=performed'
+# Suspended lanes refuse lane_disabled (the ADR 0051 vocabulary, both
+# directions): the marker-fired clip-in inject refused at the lane's
+# entry; the marker-fired drop gesture refused the same way.
+vgate_assert 04 output-contains 'host-int: refuse lane=clip reason=lane_disabled'
+vgate_assert 04 output-contains 'host-int: refuse lane=drop reason=lane_disabled'
+# Resume recovery: the write made WHILE clip was suspended crosses as the
+# lane's first emit after resume — the diff survived the suspension.
+vgate_assert 04 serial-contains 'clip: stored 14 bytes'
+vgate_assert 04 serial-contains 'gotabwm: hostint clip-out seq=1 len=14'
+# send-file: the staged list lands SENDME.QOI in INBOX/, the seat's DROP
+# apply toasts it, and the toast crosses the notify lane back out.
+vgate_assert 04 output-contains 'host-drop: send files=1'
+vgate_assert 04 output-contains 'host-drop: file seq=1 name=SENDME.QOI'
+vgate_assert 04 serial-contains 'gotabwm: hostint drop seq=1 name=SENDME.QOI'
+vgate_assert 04 serial-contains 'gotabwm: notify id=0 host drop: SENDME.QOI'
+vgate_assert 04 serial-contains 'gotabwm: hostint notify-out seq=1'
+vgate_assert 04 output-contains 'host-notify: dropped reason=no_bundle seq=1 n=1'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-04.out"), errors="replace").read()
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# The suspension ordering is real, not just presence: suspend receipts
+# before the suspended-lane refusals, refusals before the resume + landing.
+def idx(s):
+    i = out.find(s)
+    if i < 0: sys.exit("FAIL: missing " + s)
+    return i
+susp = idx("host-ui: cmd=lane-drop state=performed")
+refuse = idx("host-int: refuse lane=drop reason=lane_disabled")
+land = idx("host-drop: file seq=1 name=SENDME.QOI")
+if not (susp < refuse < land):
+    sys.exit("FAIL: suspend/refuse/landing not ordered")
+# INBOX holds the send-file landing (run 01's own drops share this share —
+# SENDME.QOI lands by its own name, byte-identical to the fixture).
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+want = os.path.getsize("tests/fixtures/qoi/viewer_160x120.qoi")
+got = os.path.join(share, "INBOX", "SENDME.QOI")
+if not os.path.isfile(got):
+    sys.exit("FAIL: INBOX/SENDME.QOI missing")
+if os.path.getsize(got) != want:
+    sys.exit("FAIL: INBOX/SENDME.QOI size != %d" % want)
+# The send-file was the ONLY thing that could publish SENDME.QOI: the
+# suspended-era marker gesture refused before publishing, so exactly one
+# DROP record ever reached INBOX (the runner's `host-drop: file` line —
+# the seat's own `hostint drop` echo also sits in the merged output).
+if out.count("host-drop: file seq=") != 1:
+    sys.exit("FAIL: %d host-drop landings" % out.count("host-drop: file seq="))
+# The suspended-era clip write crossed exactly once — after resume.
+if out.count("host-clip: out ") != 1:
+    sys.exit("FAIL: expected exactly 1 host-clip: out (the resumed emit)")
+# Never-logged: lane key + payload text stay off every host-* lane line.
+key = open(os.path.join(run, "key-sentinel.txt")).read().strip()
+if key in out:
+    sys.exit("FAIL: the lane key reached runner stdout")
+print("run-04: suspend -> lane_disabled refusals -> resume recovery +"
+      " send-file landing all held")
 PY
