@@ -167,15 +167,33 @@
 # installs). The legs split across boots for the same task-pool reason
 # as runs 18-19.
 #
-# This spec is grown across M103a-d/M101a-e + M110b/d and is NOT
-# vgate_repeat-safe (runs 01-03, 05-07, 08-10, and 14-21 share /host
-# state across boots).
+# Runs 22-24 (M113d #2420, ADR 0054 D10): ReleaseCaps declare + consent
+# on a fresh `caps-share` under the bare shim (wm=none — the go-calc
+# drive shape: GOSET.ELF is typed via --input-string). `caprel` is
+# a signed release stream whose manifests carry ReleaseCaps: v1 asks
+# file,net, v2 narrows to file, v3 widens to file,debug,net. Run 22
+# installs it unprivileged (STORE can only `grant propose` — the admin
+# slot refuses it EACCES), execs GOHELLO at the ambient baseline, then
+# GOSET -u0 (the monitor's admin spawn — CAP_PROC_ADMIN, the
+# cap half of the seat-or-cap gate) opens the grants pane: `refuse`
+# declines without a write, `grant` lands (bin, sha, words) through slot
+# 89. Run 23's non-widening update re-pins the row to the new image with
+# the consented words verbatim (`store: grant keep`, no fresh ask). Run
+# 24's widening update leaves the row stale — the unconsented v3 image
+# refuses `grant_stale` at exec — until the pane's re-consent binds the
+# widened set.
+#
+# This spec is grown across M103a-d/M101a-e + M110b/d + M113d and is NOT
+# vgate_repeat-safe (runs 01-03, 05-07, 08-10, 14-21, and 22-24 share
+# /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
 #   bash tools/go/build-gosh.sh  -> .build/go/GOSH.ELF
 #   bash tools/go/build-store.sh -> .build/go/STORE.ELF
 #   bash tools/go/build-go.sh    -> .build/go/GOHELLO.ELF
+#   bash tools/go/build-goset.sh -> .build/go/GOSET.ELF       (runs 22/24)
+#   (no seat: wm=none keeps every EL0 slot for the Go legs)
 #   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-17 only;
 #   the hook zig-builds flintd. flint-server is drawmeanelephant's repo under
 #   the VirelaiOS proprietary source-available license (not GPL-family).
@@ -193,7 +211,9 @@
 # rollback restoring it), run 16 ends on `m101e: torn-state legs done`, run
 # 17 ends on `m101e: negatives done`, run 18 ends on `m110b: catalog ls
 # done`, run 19 ends on `m110b: catalog legs done`, run 20 ends on `m110d:
-# install done`, and run 21 ends on `m110d: negatives done`.
+# install done`, and run 21 ends on `m110d: negatives done`. Runs 22/24
+# end on `goset: grant written name=GOHELLO.ELF`; run 23 ends on `m113d:
+# keep done`.
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -1208,7 +1228,206 @@ open(os.path.join(tp_share, "FLINTJ", "21.SH"), "w", encoding="utf-8").write(
 )
 
 
-print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, store-share, and tp-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
+# ---- M113d (#2420): ReleaseCaps declare + consent ----------------------
+# `caprel` is a third release stream whose signed manifests carry ADR
+# 0054 D10's ReleaseCaps — v1 asks file,net, v2 narrows to file (the
+# non-widening keep leg), v3 widens to file,debug,net (the re-ask leg).
+# Runs 22-24 drive the whole lifecycle on one fresh share under the Go
+# seat: STORE.ELF unprivileged can only PROPOSE (the admin slot refuses
+# it EACCES — nothing the publisher signs becomes power), GOSET.ELF
+# exec'd -u0 (the monitor's admin spawn — the CAP_PROC_ADMIN half of the
+# seat-or-cap gate) is the consenting pane, and -u0 update runs the
+# keep's sha re-pin through the same slot.
+goset_elf = os.path.join(".build", "go", "GOSET.ELF")
+if not os.path.isfile(goset_elf):
+    sys.exit("GOSET.ELF missing (expected " + goset_elf +
+             ") - build it first: bash tools/go/build-goset.sh")
+
+caprel_stream_id = "0199de2d-dc00-7000-8000-00000000f010"
+elf_v3 = elf_bytes.replace(mark_v1, b"virelai-go V3")
+assert elf_v3 != elf_bytes
+
+gen_release_fixture({
+    "STORE_FIXTURE_STREAM": caprel_stream_id,
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000f001",
+    "STORE_FIXTURE_CAPS": "file,net",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "caprel-v1",
+})
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-v2.elf"),
+    "STORE_FIXTURE_VERSION": "2.0.0",
+    "STORE_FIXTURE_STREAM": caprel_stream_id,
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000f002",
+    "STORE_FIXTURE_PARENT": "0199de2d-dc00-7000-8000-00000000f001",
+    "STORE_FIXTURE_PREV_ELF": os.path.abspath(gohello),
+    "STORE_FIXTURE_PREV_VERSION": "1.0.0",
+    "STORE_FIXTURE_TS": "1760000001000",
+    "STORE_FIXTURE_CAPS": "file",
+    "STORE_FIXTURE_PREV_CAPS": "file,net",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "caprel-v2",
+})
+open(os.path.join(fixture_dir, "gohello-v3.elf"), "wb").write(elf_v3)
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-v3.elf"),
+    "STORE_FIXTURE_VERSION": "3.0.0",
+    "STORE_FIXTURE_STREAM": caprel_stream_id,
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000f003",
+    "STORE_FIXTURE_PARENT": "0199de2d-dc00-7000-8000-00000000f002",
+    "STORE_FIXTURE_PREV_ELF": os.path.join(fixture_dir, "gohello-v2.elf"),
+    "STORE_FIXTURE_PREV_VERSION": "2.0.0",
+    "STORE_FIXTURE_TS": "1760000002000",
+    "STORE_FIXTURE_CAPS": "file,debug,net",
+    "STORE_FIXTURE_PREV_CAPS": "file",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "caprel-v3",
+})
+caprel = {}
+for tag in ("caprel-v1", "caprel-v2", "caprel-v3"):
+    caprel[tag] = (
+        open(os.path.join(fixture_dir, "release-%s-stream.jsonl" % tag),
+             "r", encoding="utf-8").read().strip(),
+        open(os.path.join(fixture_dir, "release-%s.go" % tag),
+             "r", encoding="utf-8").read(),
+    )
+caprel_v1, caprel_v2, caprel_v3 = (json.loads(caprel[t][0])
+                                 for t in ("caprel-v1", "caprel-v2", "caprel-v3"))
+
+caps_share = os.path.join(run, "caps-share")
+os.makedirs(os.path.join(caps_share, "FLINTJ"), exist_ok=True)
+os.makedirs(os.path.join(caps_share, "FLINT", "streams"), exist_ok=True)
+for name in ("FLINT.ELF", "GOSH.ELF", "STORE.ELF", "GOSET.ELF"):
+    shutil.copy(os.path.join(".build", "go", name), os.path.join(caps_share, name))
+# NO seat (wm=none — the go-calc shim shape): a seat + GOSH + STORE +
+# the FLINT child is four Go runtimes at once, the shape the task-pool
+# race eats (observed: `newosproc: sys_thread create failed` inside the
+# install leg), and typed input under a shim lands on the only window —
+# GOSET's — with no seat-side focus arbitration to race (observed: the
+# Zig seat's `tab-switch idx=1` stole focus over `goset: ready`).
+shutil.copy(os.path.join("image", "apps.txt"), os.path.join(caps_share, "APPS.TXT"))
+if os.path.isfile(os.path.join("image", "WALLPAPER.QOI")):
+    shutil.copy(os.path.join("image", "WALLPAPER.QOI"),
+                os.path.join(caps_share, "WALLPAPER.QOI"))
+if os.path.isfile(os.path.join("user", "src", "lib", "fixtures", "qoi",
+                               "mascot_64x64.qoi")):
+    shutil.copy(os.path.join("user", "src", "lib", "fixtures", "qoi",
+                             "mascot_64x64.qoi"),
+                os.path.join(caps_share, "SEXIBURGER.QOI"))
+for src, dst in (("Inter-Regular.ttf", "INTER.TTF"),
+                 ("Inter-Bold.ttf", "INTERB.TTF"),
+                 ("Inter-Italic.ttf", "INTERI.TTF"),
+                 ("Inter-BoldItalic.ttf", "INTERBI.TTF"),
+                 ("FiraCode-Regular.ttf", "FIRACODE.TTF")):
+    p = os.path.join("image", "fonts", src)
+    if os.path.isfile(p):
+        shutil.copy(p, os.path.join(caps_share, dst))
+open(os.path.join(caps_share, "SETTINGS.TXT"), "w", encoding="utf-8").write(
+    "#v2\nwm=none\n")
+open(os.path.join(caps_share, "OWNERS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nFLINT.ELF\t644\t0\t-\nSTORE.ELF\t644\t0\t-\n"
+)
+open(os.path.join(caps_share, "SECRETS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nflint-remote\t1000\t" + AUTH_KEY_HEX + "\tFLINT.ELF,STORE.ELF\n" +
+    # The keep path runs STORE -u0: uid_system lanes are served to the
+    # admin principal only, so the admin STORE gets its own lane for the
+    # same remote key.
+    "flint-remote\t0\t" + AUTH_KEY_HEX + "\tFLINT.ELF,STORE.ELF\n"
+)
+open(os.path.join(caps_share, "FLINT", "TRUSTED.TXT"),
+     "w", encoding="utf-8").write(
+    "#v1\nkey=" + good_changes[-1]["author"] + " name=sync-seed\n"
+)
+# The v1 replica — the staged-bytes seam again, local AND remote: pull
+# only ever runs `heads` (the remote record stays at v1, so the .SH
+# file-copy advances read as already-ahead like run 15's).
+caprel_line_v1 = caprel["caprel-v1"][0]
+for store_root in (flintd_store, os.path.join(caps_share, "FLINT")):
+    with open(os.path.join(store_root, "streams",
+                           caprel_stream_id + ".jsonl"), "w") as f:
+        f.write(caprel_line_v1 + "\n")
+    with open(os.path.join(store_root, "streams",
+                           caprel_stream_id + ".json"), "w") as f:
+        f.write(json.dumps(
+            {"id": caprel_stream_id, "name": "caprel",
+             "head": caprel_v1["id"], "created": caprel_v1["ts"],
+             "forked_from": None},
+            separators=(",", ":")) + "\n")
+
+
+def caps_drop(drop, tag, elf):
+    d = os.path.join(caps_share, drop, "caprel")
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "release.go"), "w",
+         encoding="utf-8").write(caprel[tag][1])
+    open(os.path.join(d, "GOHELLO.ELF"), "wb").write(elf)
+
+
+caps_drop("DROP", "caprel-v1", elf_bytes)
+caps_drop("DROPV2G", "caprel-v2", elf_v2)
+caps_drop("DROPV3G", "caprel-v3", elf_v3)
+
+# The replica advances (v1+v2 then v1+v2+v3 chains + rolled record
+# heads) the .SH legs land by file copy.
+with open(os.path.join(caps_share, "FLINTJ", "caprel-v2.jsonl"),
+          "w", encoding="utf-8") as f:
+    f.write(caprel_line_v1 + "\n" + caprel["caprel-v2"][0] + "\n")
+# gosh's readBounded caps one `cat` at 4096 bytes — a 3-line file is
+# ~4.9 KiB, so 24.SH appends the v3 line alone instead of overwriting
+# with the whole chain (the error text would otherwise land IN the
+# stream file and `flint pull` would refuse change_malformed).
+with open(os.path.join(caps_share, "FLINTJ", "caprel-v3-last.jsonl"),
+          "w", encoding="utf-8") as f:
+    f.write(caprel["caprel-v3"][0] + "\n")
+for tag, head in (("caprel-v2", caprel_v2["id"]),
+                  ("caprel-v3", caprel_v3["id"])):
+    with open(os.path.join(caps_share, "FLINTJ", tag + ".json"),
+              "w", encoding="utf-8") as f:
+        f.write(json.dumps(
+            {"id": caprel_stream_id, "name": "caprel", "head": head,
+             "created": caprel_v1["ts"], "forked_from": None},
+            separators=(",", ":")) + "\n")
+
+flintj_m113d = {
+    # 22: install the caps-bearing release (STORE unprivileged — it can
+    # only propose), then exec the installed app at the ambient
+    # baseline: no grant row means every word stays ambient, and the
+    # consent pane's refuse/grant gestures are the legs after this
+    # script ends.
+    "22.SH": (
+        "STORE.ELF install caprel --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+        "GOHELLO.ELF\n"
+        "echo m113d: install done\n"
+    ),
+    # 23: advance to the non-widening v2 (file ⊆ consented file,net) and
+    # update under -u0 — STORE sees the row, re-pins its sha to the new
+    # image with the consented words verbatim, and the v2 exec runs.
+    "23.SH": (
+        "cat /host/FLINTJ/caprel-v2.jsonl > /host/FLINT/streams/" + caprel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/caprel-v2.json > /host/FLINT/streams/" + caprel_stream_id + ".json\n"
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV2G\n"
+        "GOHELLO.ELF\n"
+        "echo m113d: keep done\n"
+    ),
+    # 24: advance to the widening v3 (debug ∉ consented file,net) and
+    # update under -u0 — the row is left bound to v2's image (stale:
+    # the unconsented image refuses grant_stale at exec), the ask is
+    # re-proposed, and the pane's consent is the leg after this script.
+    "24.SH": (
+        "cat /host/FLINTJ/caprel-v2.jsonl > /host/FLINT/streams/" + caprel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/caprel-v3-last.jsonl >> /host/FLINT/streams/" + caprel_stream_id + ".jsonl\n"
+        "cat /host/FLINTJ/caprel-v3.json > /host/FLINT/streams/" + caprel_stream_id + ".json\n"
+        "STORE.ELF update GOHELLO --remote=10.0.0.2:4749 --channel=/host/DROPV3G\n"
+        "GOHELLO.ELF\n"
+        "echo m113d: widening done\n"
+    ),
+}
+for sname, sbody in flintj_m113d.items():
+    open(os.path.join(caps_share, "FLINTJ", sname),
+         "w", encoding="utf-8").write(sbody)
+
+
+print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, store-share, tp-share, and caps-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
 PY
 
 # ---- 01: M103a in-guest parse-corpus over /host/FLINTC -----------------------
@@ -1770,8 +1989,10 @@ want_state = ("#v1\n"
               "name=GOHELLO.ELF stream=rel "
               "head=0199de2d-dc00-7000-8000-00000000c001 "
               "sha256=" + v1sha + " "
+              "caps=- "
               "prev_head=0199de2d-dc00-7000-8000-00000000c002 "
               "prev_sha256=" + v2sha + " "
+              "prev_caps=- "
               "prev_row=GOHELLO.ELF | Go Hello | g | dock=false\n")
 got_state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
 if got_state != want_state:
@@ -1824,8 +2045,10 @@ want_state = ("#v1\n"
               "name=GOHELLO.ELF stream=rel "
               "head=0199de2d-dc00-7000-8000-00000000c001 "
               "sha256=" + v1sha + " "
+              "caps=- "
               "prev_head=0199de2d-dc00-7000-8000-00000000c002 "
               "prev_sha256=" + v2sha + " "
+              "prev_caps=- "
               "prev_row=GOHELLO.ELF | Go Hello | g | dock=false\n")
 got_state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
 if got_state != want_state:
@@ -2102,4 +2325,187 @@ for sid in ("0199de2d-dc00-7000-8000-00000000e010",
     if os.path.exists(os.path.join(share, "FLINT", "streams", sid + ".jsonl")):
         sys.exit("key-refused clone wrote a local replica for " + sid)
 print("run-21 verified: key_unknown + key_revoked refused by name; revoked publisher's already-synced release refused at install")
+PY
+# ---- 22: M113d (#2420) declare + consent -------------------------------
+# The seat boots (go-gostore's shape), STORE.ELF installs caprel
+# unprivileged — the admin slot refuses it EACCES, so the install can
+# only PROPOSE the row the manifest asked for. GOHELLO.ELF then execs at
+# the ambient baseline (no row, every word ambient — the refused-consent
+# posture is the default). GOSET.ELF -u0 (the monitor's admin spawn —
+# the CAP_PROC_ADMIN half of the seat-or-cap gate) opens the grants
+# pane: one row marker per install shows declared-vs-granted, `refuse`
+# declines without a write, `grant` lands (bin, sha, words) through slot
+# 89.
+vgate_file script-22.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-22.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/22.SH"
+EOF
+
+vgate_file script3-22.txt <<'EOF'
+exec -u0 GOSET.ELF
+EOF
+
+vgate_run 22 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-22' \
+    --cvc-file '$RUN_DIR/caps-share' \
+    --virtio-fs '$RUN_DIR/caps-share' \
+    --net '$RUN_DIR/cap22.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-22.txt' \
+    --script2 '$RUN_DIR/script2-22.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script3 '$RUN_DIR/script3-22.txt' \
+    --script3-after 'm113d: install done' \
+    --input-string $'grants\nrefuse GOHELLO.ELF\ngrant GOHELLO.ELF\n' \
+    --input-string-after 'goset: ready ' \
+    --script-expect 'goset: grant written name=GOHELLO.ELF' --timeout 300
+
+vgate_assert 22 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
+vgate_assert 22 serial-contains 'store: grant propose GOHELLO.ELF words=file,net'
+vgate_assert 22 serial-contains 'goset: grants n='
+vgate_assert 22 serial-contains 'goset: grant row name=GOHELLO.ELF declared=file,net granted=- state=pending'
+vgate_assert 22 serial-contains 'goset: grant declined name=GOHELLO.ELF'
+vgate_assert 22 serial-contains 'goset: grant written name=GOHELLO.ELF words=file,net'
+# The pre-consent exec ran at the ambient baseline — no row, every word
+# ambient, and no refused verdict anywhere in the boot.
+vgate_assert 22 serial-contains 'virelai-go OK'
+vgate_assert 22 serial-absent 'verdict=refused'
+vgate_assert 22 serial-absent 'goset: grant refuse name=GOHELLO.ELF'
+vgate_assert 22 serial-absent '[EXC] parking:'
+vgate_assert 22 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 22 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 22 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+
+sha = hashlib.sha256(open(os.path.join(share, "GOHELLO.ELF"), "rb").read()).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,net"]:
+    sys.exit("GRANTS.TXT after consent: %r (sha %s)" % (lines, sha))
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file,net" not in state:
+    sys.exit("STORE.TXT did not record the declared ask: %r" % state)
+print("run-22 verified: propose -> decline -> consent wrote the hash-bound row")
+PY
+
+# ---- 23: M113d (#2420) non-widening update keeps the grant -------------
+# caprel v2 asks file — a subset of the consented file,net. The update
+# under -u0 reads the row, re-pins its sha binding to the new image with
+# the consented words verbatim (the keep — no fresh ask), and the v2
+# bytes exec.
+vgate_file script-23.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-23.txt <<'EOF'
+exec -u0 GOSH.ELF -c "source /host/FLINTJ/23.SH"
+EOF
+
+vgate_run 23 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-23' \
+    --cvc-file '$RUN_DIR/caps-share' \
+    --virtio-fs '$RUN_DIR/caps-share' \
+    --net '$RUN_DIR/cap23.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-23.txt' \
+    --script2 '$RUN_DIR/script2-23.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script-expect 'm113d: keep done' --timeout 300
+
+vgate_assert 23 serial-contains 'store: update ok GOHELLO.ELF version=2.0.0'
+vgate_assert 23 serial-contains 'store: grant keep GOHELLO.ELF words=file,net'
+vgate_assert 23 serial-contains 'virelai-go V2'
+vgate_assert 23 serial-absent 'store: grant propose'
+vgate_assert 23 serial-absent 'verdict=refused'
+vgate_assert 23 serial-absent '[EXC] parking:'
+vgate_assert 23 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 23 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+
+elf = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+sha = hashlib.sha256(elf).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,net"]:
+    sys.exit("GRANTS.TXT after the keep: %r (sha %s)" % (lines, sha))
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file " not in state + " " or "prev_caps=file,net" not in state:
+    sys.exit("STORE.TXT lost the caps history: %r" % state)
+print("run-23 verified: non-widening update re-pinned the row to the new image")
+PY
+
+# ---- 24: M113d (#2420) widening update re-asks; consent re-pins --------
+# caprel v3 asks file,debug,net — debug is NOT inside the consented
+# file,net, so this is a distinct consent event: the update leaves the
+# row bound to v2's image (the unconsented image refuses grant_stale at
+# exec — the widening never silently lands), re-proposes, and the
+# pane's `grant` writes the widened set bound to v3.
+vgate_file script-24.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-24.txt <<'EOF'
+exec -u0 GOSH.ELF -c "source /host/FLINTJ/24.SH"
+EOF
+
+vgate_file script3-24.txt <<'EOF'
+exec -u0 GOSET.ELF
+EOF
+
+vgate_run 24 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-24' \
+    --cvc-file '$RUN_DIR/caps-share' \
+    --virtio-fs '$RUN_DIR/caps-share' \
+    --net '$RUN_DIR/cap24.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-24.txt' \
+    --script2 '$RUN_DIR/script2-24.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script3 '$RUN_DIR/script3-24.txt' \
+    --script3-after 'm113d: widening done' \
+    --input-string $'grants\ngrant GOHELLO.ELF\n' \
+    --input-string-after 'goset: ready ' \
+    --script-expect 'goset: grant written name=GOHELLO.ELF' --timeout 300
+
+vgate_assert 24 serial-contains 'store: update ok GOHELLO.ELF version=3.0.0'
+vgate_assert 24 serial-contains 'store: grant propose GOHELLO.ELF words=file,debug,net'
+# The unconsented v3 image is refused at exec — the widening did not
+# silently ride the old consent.
+vgate_assert 24 serial-contains 'verdict=refused:grant_stale'
+vgate_assert 24 serial-contains 'goset: grant row name=GOHELLO.ELF declared=file,debug,net granted=file,net state=stale'
+vgate_assert 24 serial-contains 'goset: grant written name=GOHELLO.ELF words=file,debug,net'
+vgate_assert 24 serial-absent 'store: grant keep GOHELLO.ELF'
+vgate_assert 24 serial-absent '[EXC] parking:'
+vgate_assert 24 serial-absent 'abababababababababababababababababababababababababababababababab'
+vgate_assert 24 python <<'PY'
+import hashlib, os, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+
+elf = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+sha = hashlib.sha256(elf).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,debug,net"]:
+    sys.exit("GRANTS.TXT after re-consent: %r" % lines)
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file,debug,net" not in state or "prev_caps=file" not in state:
+    sys.exit("STORE.TXT lost the declared-vs-prior ask: %r" % state)
+print("run-24 verified: widening re-asked, consent bound the widened row to v3")
 PY
