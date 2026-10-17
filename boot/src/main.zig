@@ -37,6 +37,13 @@ const std = @import("std");
 const uefi = std.os.uefi;
 const build_options = @import("build_options");
 const efi_time = @import("efi_time.zig"); // #1058: pure EFI_TIME -> Unix epoch
+// M113b (ADR 0054 Part I): the measured-boot primitive — the same
+// kernel-local SHA-256 the kernel's `measure.zig` carries (one
+// implementation, imported here as a named build import), and the
+// generated `kernel_digest` module holding the expected raw SHA-256 of
+// KERNEL.BIN that build.zig computes after elf2bin.
+const measure = @import("measure");
+const kernel_digest = @import("kernel_digest");
 
 /// Convert a comptime ASCII string into a null-terminated UTF-16LE array as
 /// required by the EFI APIs. (All of our strings are pure ASCII.)
@@ -79,9 +86,32 @@ const kernel_header_size: usize = 24;
 const kernel_header_size_reloc: usize = 40;
 const kernel_reloc_entry_size: usize = 24;
 const kernel_max_size: u64 = 16 * 1024 * 1024; // sanity cap for this milestone
+// M113b (ADR 0054): the loader's own image path on the ESP — the
+// self-measurement source for the `stage=loader` receipt digest.
+const loader_image_path = utf16z("\\EFI\\BOOT\\BOOTAA64.EFI");
+// The named KERNEL.BIN refusal (ADR 0054 D3): ESP receipt + ConOut line,
+// then return-to-firmware halt. The NVRAM `VirelaiBoot` variable is the
+// host-observable copy — under the gate harness the ESP writes land in a
+// discarded ASIF overlay, while the per-run variable store persists.
+const refused_path = utf16z("\\REFUSED.TXT");
+const refused_text = "kernel_hash_mismatch\n";
+const line_refused = utf16z("refused: kernel_hash_mismatch\r\n");
+const boot_variable_name = utf16z("VirelaiBoot");
+const boot_variable_refused = "refused=kernel_hash_mismatch";
+// The project's variable vendor GUID (M2M2_VIRELAIOS-M — the same GUID the
+// kernel's marker ladder writes under; mirrored from kernel/evidence.zig).
+const virelai_vendor_guid = uefi.Guid{
+    .time_low = 0x4d324d32,
+    .time_mid = 0x5f44,
+    .time_high_and_version = 0x4950,
+    .clock_seq_high_and_reserved = 0x53,
+    .clock_seq_low = 0x48,
+    .node = .{ 0x49, 0x54, 0x4f, 0x53, 0x2d, 0x4d },
+};
 
 /// Handoff contract v2 (ADR 0004 D5). The stub allocates this record in a
-/// dedicated EfiLoaderData page and passes its address in x3.
+/// dedicated EfiLoaderData page and passes its address in x3. Mirrored from
+/// kernel/src/handoff.zig — the two move together on every version bump.
 const HandoffV2 = extern struct {
     magic: u32,
     version: u32,
@@ -93,9 +123,18 @@ const HandoffV2 = extern struct {
     stack_size: u64,
     flags: u64,
     boot_epoch_secs: u64,
+    /// v4 additive (#2418, ADR 0054 Part I): the loader's measured
+    /// Authenticode SHA-256 of `\EFI\BOOT\BOOTAA64.EFI` (zeros when
+    /// `measured_ok` bit0 is clear) and the raw-file SHA-256 of
+    /// `\KERNEL.BIN` it verified before jumping (zeros when bit1 is
+    /// clear). The kernel republishes both on the chain receipt — it never
+    /// re-reads the boot volume.
+    measured_loader: [32]u8,
+    measured_kernel: [32]u8,
+    measured_ok: u64,
 };
 const handoff_magic: u32 = 0x324B5344; // "DSK2"
-const handoff_version: u32 = 3;
+const handoff_version: u32 = 4;
 /// #1058: sentinel for "no wall-clock epoch from firmware".
 const no_boot_epoch: u64 = efi_time.no_epoch;
 const kernel_stack_size: usize = 16 * 1024;
@@ -171,8 +210,27 @@ fn load_and_enter_kernel(st: *const uefi.tables.SystemTable) void {
     const root = fs.openVolume() catch return;
     defer root.close() catch {};
 
+    // M113b (ADR 0054 D2): self-measurement for the `stage=loader` chain
+    // receipt. The loader's own digest is the PE/COFF Authenticode hash —
+    // the convention the firmware db pins under Secure Boot — so the same
+    // file the firmware just verified is re-measured here and carried to
+    // the kernel in the v4 handoff. Best effort: a failed read leaves the
+    // digest zeroed and the receipt says `unmeasured`.
+    var measured_loader_digest = @as([32]u8, @splat(0));
+    var measured_ok: u64 = 0;
+    if (measure_loader_image(root, boot_services)) |d| {
+        measured_loader_digest = d;
+        measured_ok |= 1;
+    }
+
     const kernel_file = root.open(&kernel_path, .read, .{}) catch return;
     defer kernel_file.close() catch {};
+
+    // M113b: the KERNEL.BIN measurement. Every byte of the file is hashed
+    // as it is consumed — header, content, the KRN2 relocation table, and
+    // any tail past image_size — so the pin covers the whole file, not
+    // only the span the header declares.
+    var kernel_hasher = measure.Sha256.init();
 
     // 1. Read the format header (a KRN2-sized buffer; only the fields the
     //    magic implies are used). See the constants block for the layout.
@@ -197,6 +255,7 @@ fn load_and_enter_kernel(st: *const uefi.tables.SystemTable) void {
     const content_end: u64 = if (is_reloc) reloc_offset else image_size;
     if (content_end <= header_size or content_end > image_size) return;
     const content_size: usize = @intCast(content_end - header_size);
+    kernel_hasher.update(header[0..header_size]);
 
     // 2. Allocate exactly enough pages (Boot Services, any free region).
     //    AllocatePages returns 4K-aligned pages -- the base alignment that
@@ -226,15 +285,44 @@ fn load_and_enter_kernel(st: *const uefi.tables.SystemTable) void {
         if (got == 0) return; // short read: image truncated
         filled += got;
     }
+    // The content bytes as they sit in the FILE — hashed before the
+    // relocation pass writes (value + base) into them.
+    kernel_hasher.update(dst_slice);
 
     // 3a. KRN2: apply the absolute-relocation table. LLVM emits base-0
     //     pointer tables (jump tables, outlined-function pointer tables) that
     //     PC-relative addressing cannot fix; each entry writes
     //     (value + kernel_base) into the content. See issue #1042 and ADR
     //     0019. A malformed table aborts the handoff (the loader returns).
+    //     The table bytes are file bytes too — hashed as they are read.
     if (is_reloc) {
-        if (!apply_relocations(kernel_file, dst_slice, base, reloc_offset, reloc_count)) return;
+        if (!apply_relocations(kernel_file, dst_slice, base, reloc_offset, reloc_count, &kernel_hasher)) return;
     }
+
+    // 3a-ii. Tail: any bytes the file carries past `image_size` are part of
+    //    the pinned image — a file that smuggles extra data must not hash
+    //    equal to the canonical KERNEL.BIN.
+    {
+        var tail: [4096]u8 = undefined;
+        while (true) {
+            const got = kernel_file.read(&tail) catch break;
+            if (got == 0) break;
+            kernel_hasher.update(tail[0..got]);
+        }
+    }
+
+    // 3a-iii. The pin (ADR 0054 D2): the measured digest must equal the
+    //    raw SHA-256 of the KERNEL.BIN this loader was built against —
+    //    baked into the image as the generated `kernel_digest` import. A
+    //    mismatch is the named refusal `kernel_hash_mismatch`: an ESP
+    //    receipt + ConOut line + the NVRAM copy, then return to firmware.
+    var kernel_digest_actual: [measure.digest_len]u8 = undefined;
+    kernel_hasher.final(&kernel_digest_actual);
+    if (!std.mem.eql(u8, &kernel_digest_actual, &kernel_digest.kernel_sha256)) {
+        refuse_kernel_hash_mismatch(st, root);
+        return;
+    }
+    measured_ok |= 2;
 
     if (st.con_out) |con_out| {
         _ = con_out.outputString(&line_loading) catch {};
@@ -270,6 +358,9 @@ fn load_and_enter_kernel(st: *const uefi.tables.SystemTable) void {
         .stack_size = kernel_stack_size,
         .flags = 0,
         .boot_epoch_secs = read_boot_epoch(st),
+        .measured_loader = measured_loader_digest,
+        .measured_kernel = kernel_digest_actual,
+        .measured_ok = measured_ok,
     };
 
     // 5. Jump. entry_offset is file-relative (includes the header); with
@@ -350,17 +441,122 @@ fn dump_memory_map(st: *const uefi.tables.SystemTable) void {
     f.flush() catch {};
 }
 
+/// M113b (ADR 0054 D2): read `\EFI\BOOT\BOOTAA64.EFI` — the same bytes the
+/// firmware just verified when Secure Boot is on — and return its PE/COFF
+/// Authenticode SHA-256, the digest convention the db pins. The image is
+/// small (~170 KiB), so it is read whole into an EfiLoaderData allocation.
+/// Null on any failure: the caller records `unmeasured`, never guesses.
+fn measure_loader_image(root: *uefi.protocol.File, boot_services: *uefi.tables.BootServices) ?[32]u8 {
+    const image_file = root.open(&loader_image_path, .read, .{}) catch return null;
+    defer image_file.close() catch {};
+
+    var info_buf: [256]u8 align(8) = undefined;
+    const info = image_file.getInfo(.file, &info_buf) catch return null;
+    const size: usize = @intCast(info.file_size);
+    // A PE image needs at least the DOS header + PE headers; 4 MiB is a
+    // generous ceiling for a loader image (today's is ~170 KiB).
+    if (size < 0x40 or size > 4 * 1024 * 1024) return null;
+
+    const pages = boot_services.allocatePages(.any, .loader_data, (size + 4095) / 4096) catch return null;
+    const buf: [*]u8 = @ptrCast(pages.ptr);
+    var filled: usize = 0;
+    while (filled < size) {
+        const got = image_file.read(buf[filled..size]) catch return null;
+        if (got == 0) return null;
+        filled += got;
+    }
+    return authenticode_sha256(buf[0..size]);
+}
+
+/// The PE/COFF Authenticode digest: the image hashed in file order,
+/// skipping the CheckSum field (4 bytes), the security data-directory
+/// entry (8 bytes), and the Attribute Certificate Table it points to (a
+/// file offset, not an RVA). This is the convention the M113a probe
+/// observed the firmware db enforcing (ADR 0054 Grounding 3): a raw-file
+/// SHA-256 is REFUSED, this digest BOOTED. Null on a malformed image.
+fn authenticode_sha256(bytes: []const u8) ?[32]u8 {
+    if (bytes.len < 0x40) return null;
+    const pe_off: usize = std.mem.readInt(u32, bytes[0x3c..][0..4], .little);
+    if (pe_off + 24 > bytes.len) return null;
+    if (!std.mem.eql(u8, bytes[pe_off..][0..4], "PE\x00\x00")) return null;
+    const opt_off = pe_off + 4 + 20; // PE signature + COFF header
+    const magic = std.mem.readInt(u16, bytes[opt_off..][0..2], .little);
+    const dir_base: usize = switch (magic) {
+        0x10b => opt_off + 96, // PE32 data directories
+        0x20b => opt_off + 112, // PE32+ data directories
+        else => return null,
+    };
+    const num_dirs_off: usize = switch (magic) {
+        0x10b => opt_off + 92,
+        0x20b => opt_off + 108,
+        else => unreachable,
+    };
+    if (num_dirs_off + 4 > bytes.len) return null;
+    const num_dirs = std.mem.readInt(u32, bytes[num_dirs_off..][0..4], .little);
+    const checksum_off = opt_off + 64;
+    const secdir_off = dir_base + 4 * 8; // IMAGE_DIRECTORY_ENTRY_SECURITY
+
+    var h = measure.Sha256.init();
+    if (num_dirs <= 4 or secdir_off + 8 > bytes.len) {
+        // No security entry to skip: hash everything but the checksum.
+        if (checksum_off + 4 > bytes.len) return null;
+        h.update(bytes[0..checksum_off]);
+        h.update(bytes[checksum_off + 4 ..]);
+    } else {
+        const cert_off: usize = std.mem.readInt(u32, bytes[secdir_off..][0..4], .little);
+        const cert_size: usize = std.mem.readInt(u32, bytes[secdir_off + 4 ..][0..4], .little);
+        if (checksum_off + 4 > secdir_off) return null;
+        h.update(bytes[0..checksum_off]);
+        h.update(bytes[checksum_off + 4 .. secdir_off]);
+        const content_end: usize = if (cert_off == 0) bytes.len else @min(cert_off, bytes.len);
+        if (secdir_off + 8 > content_end) return null;
+        h.update(bytes[secdir_off + 8 .. content_end]);
+        if (cert_off != 0) {
+            if (cert_off + cert_size > bytes.len) return null;
+            h.update(bytes[cert_off + cert_size ..]);
+        }
+    }
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// The named KERNEL.BIN refusal (ADR 0054 D3): `kernel_hash_mismatch`
+/// lands in three places — the ConOut line (invisible on VZ, kept for
+/// non-VZ firmware), the ESP receipt `\REFUSED.TXT`, and the non-volatile
+/// variable `VirelaiBoot` whose write survives in the host-visible
+/// per-run variable store (the gate's observation channel — ESP writes
+/// are trapped inside the discarded ASIF overlay). The caller then
+/// returns to the firmware, which halts the VM as in the probe.
+fn refuse_kernel_hash_mismatch(st: *const uefi.tables.SystemTable, root: *uefi.protocol.File) void {
+    if (st.con_out) |con_out| {
+        _ = con_out.outputString(&line_refused) catch {};
+    }
+    if (root.open(&refused_path, .read_write_create, .{})) |refused| {
+        defer refused.close() catch {};
+        _ = refused.write(refused_text) catch {};
+        refused.flush() catch {};
+    } else |_| {}
+    _ = st.runtime_services.setVariable(
+        &boot_variable_name,
+        &virelai_vendor_guid,
+        .{ .non_volatile = true, .bootservice_access = true, .runtime_access = true },
+        boot_variable_refused,
+    ) catch {};
+}
+
 /// Apply a KRN2 absolute-relocation table (issue #1042): for each 24-byte
 /// entry { u64 offset, u64 value, u32 width, u32 _ }, write (value + base) as
 /// `width` bytes at content offset `offset`. Returns false on a malformed or
 /// out-of-bounds entry so the caller aborts the handoff rather than jumping
 /// into a half-patched image.
-fn apply_relocations(file: *uefi.protocol.File, content: []u8, base: u64, reloc_offset: u64, reloc_count: u64) bool {
+fn apply_relocations(file: *uefi.protocol.File, content: []u8, base: u64, reloc_offset: u64, reloc_count: u64, hasher: *measure.Sha256) bool {
     file.setPosition(reloc_offset) catch return false;
     var i: u64 = 0;
     while (i < reloc_count) : (i += 1) {
         var entry: [kernel_reloc_entry_size]u8 = undefined;
         if ((file.read(&entry) catch return false) < kernel_reloc_entry_size) return false;
+        hasher.update(&entry);
         const offset = std.mem.readInt(u64, entry[0..8], .little);
         const value = std.mem.readInt(u64, entry[8..16], .little);
         const width = std.mem.readInt(u32, entry[16..20], .little);

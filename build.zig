@@ -164,6 +164,27 @@ pub fn build(b: *std.Build) void {
     const install_kernel = b.addInstallFileWithDir(kernel_bin, .bin, "KERNEL.BIN");
     b.getInstallStep().dependOn(&install_kernel.step);
 
+    // M113b (#2418, ADR 0054 D2): the loader pins KERNEL.BIN. The expected
+    // raw-file SHA-256 is computed here — after elf2bin emits the image,
+    // before the loader compile — and carried into boot/src/main.zig as
+    // the generated `kernel_digest` import, so the pin can never drift
+    // from the artifact it guards. The loader compile therefore depends
+    // on the kernel image: a one-directional DAG (kernel ELF -> KERNEL.BIN
+    // -> digest -> BOOTAA64.EFI). The `measure` import gives the loader
+    // the same kernel-local SHA-256 the kernel publishes with — one
+    // implementation in the guest.
+    const kernel_digest_gen = b.addSystemCommand(&.{
+        "python3", "-c",
+        \\import hashlib, sys
+        \\digest = hashlib.sha256(open(sys.argv[1], 'rb').read()).digest()
+        \\body = 'pub const kernel_sha256: [32]u8 = .{ ' + ', '.join('0x%02x' % byte for byte in digest) + ' };\n'
+        \\open(sys.argv[2], 'w').write(body)
+    });
+    kernel_digest_gen.addFileArg(kernel_bin);
+    const kernel_digest_zig = kernel_digest_gen.addOutputFileArg("kernel_digest.zig");
+    efi.root_module.addAnonymousImport("kernel_digest", .{ .root_source_file = kernel_digest_zig });
+    efi.root_module.addAnonymousImport("measure", .{ .root_source_file = b.path("kernel/src/measure.zig") });
+
     // ------------------------------------------------------------------
     // Guest: ESP user program (milestone-three card 6, claim 6783) — a
     // small freestanding AArch64 flat image (USER.BIN, same DSK1 format as
@@ -2047,6 +2068,7 @@ pub fn build(b: *std.Build) void {
         "kernel/src/lineedit.zig",
         "kernel/src/machine.zig",
         "kernel/src/mailbox.zig",
+        "kernel/src/measure.zig",
         "kernel/src/memmap.zig",
         "kernel/src/mmu.zig",
         "kernel/src/monitor.zig",

@@ -26,6 +26,7 @@ pub const exceptions = @import("exceptions.zig");
 pub const gic = @import("gic.zig");
 pub const handoff = @import("handoff.zig");
 pub const mailbox = @import("mailbox.zig"); // claim 5965: per-process IPC rings behind `mbox`
+pub const measure = @import("measure.zig"); // #2418 (M113b): the digest hex the v4 handoff view prints
 pub const memmap = @import("memmap.zig");
 pub const mmu = @import("mmu.zig"); // claim 5804: per-task TTBR0 roots + user-root inventory
 pub const pci = @import("pci.zig");
@@ -992,7 +993,7 @@ fn cmd_uname(m: *Monitor, args: []const []const u8) ExecError {
 fn cmd_handoff(m: *Monitor, args: []const []const u8) ExecError {
     _ = args;
     const h = &m.state.handoff;
-    m.console.print_line("handoff v3");
+    m.console.print_line("handoff v4");
     const fields = [_]struct { label: []const u8, value: u64 }{
         .{ .label = "magic", .value = h.magic },
         .{ .label = "version", .value = h.version },
@@ -1004,6 +1005,7 @@ fn cmd_handoff(m: *Monitor, args: []const []const u8) ExecError {
         .{ .label = "stack_size", .value = h.stack_size },
         .{ .label = "flags", .value = h.flags },
         .{ .label = "boot_epoch", .value = h.boot_epoch_secs },
+        .{ .label = "measured_ok", .value = h.measured_ok },
     };
     for (fields) |field| {
         m.console.puts("  ");
@@ -1014,6 +1016,17 @@ fn cmd_handoff(m: *Monitor, args: []const []const u8) ExecError {
         m.console.print_hex(field.value);
         m.console.puts("\n");
     }
+    // v4 (#2418, ADR 0054): the loader's boot-stage digests — the receipt
+    // the kernel published at boot is these exact values.
+    var digest_hex: [64]u8 = undefined;
+    _ = measure.hex_digest(&digest_hex, &h.measured_loader);
+    m.console.puts("  loader_sha256 ");
+    m.console.puts(&digest_hex);
+    m.console.puts("\n");
+    _ = measure.hex_digest(&digest_hex, &h.measured_kernel);
+    m.console.puts("  kernel_sha256 ");
+    m.console.puts(&digest_hex);
+    m.console.puts("\n");
     m.console.puts("  status");
     var pad: usize = "status".len;
     while (pad < 12) : (pad += 1) m.console.putc(' ');

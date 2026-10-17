@@ -5,6 +5,15 @@
 // (--overlay-base: macOS 27 DiskImageKit stacked image — read-only base +
 //  throwaway ASIF overlay per run; positional <disk-image> is then ignored.
 //  --vars <path>: per-run EFI variable store.)
+//         [--secure-boot --secure-boot-pk <DER cert>
+//          --secure-boot-db-efi <PE> | --secure-boot-db-hash <64-hex>]
+//          (M113b #2418, ADR 0054 Part I: opt-in UEFI Secure Boot — a
+//          FRESH per-run variable store, a custom Platform Key, and db
+//          entries of PE/COFF Authenticode digests (the convention the
+//          firmware enforces) or raw hashes. The firmware refuses an
+//          unpinned BOOTAA64.EFI before any guest code runs. Both
+//          db flags are repeatable. OFF by default: without the flag the
+//          store and every device are byte-identical.)
 //         [--vz-restore] (claim #1370: standalone headless save/restore probe —
 //          real VZ pause/saveMachineStateTo/stop/restoreMachineStateFrom/resume;
 //          a fresh post-restore serial query must recover a RAM-only clipboard
@@ -1012,6 +1021,20 @@ var netNatEnabled = false
 var overlayBasePath: String?
 var varsOverridePath: String?
 
+// M113b (#2418, ADR 0054 Part I): the opt-in verified-boot flag family.
+// `--secure-boot` builds a FRESH per-run variable store, enables UEFI
+// Secure Boot with a custom Platform Key (`--secure-boot-pk`, a DER
+// X.509 certificate), and enrolls the db as SHA-256 entries — either the
+// PE/COFF Authenticode digest of each `--secure-boot-db-efi <PE>` image
+// (the convention the firmware enforces — the M113a probe pinned it) or
+// a raw 64-hex digest from `--secure-boot-db-hash`. Flags OFF is
+// byte-identical: the store is created/opened exactly as before and the
+// boot default does not move.
+var secureBootEnabled = false
+var secureBootPKPath: String?
+var secureBootDbEfiPaths: [String] = []
+var secureBootDbHashes: [String] = []
+
 var idx = arguments.count > 1 && arguments[1].hasPrefix("--") ? 1 : 2
 while idx < arguments.count {
     let arg = arguments[idx]
@@ -1143,6 +1166,18 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--vz-restore-verify-output", idx + 1 < arguments.count {
         vzRestoreVerifyOutput = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--secure-boot" {
+        secureBootEnabled = true
+        idx += 1
+    } else if arg == "--secure-boot-pk", idx + 1 < arguments.count {
+        secureBootPKPath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--secure-boot-db-efi", idx + 1 < arguments.count {
+        secureBootDbEfiPaths.append(arguments[idx + 1])
+        idx += 2
+    } else if arg == "--secure-boot-db-hash", idx + 1 < arguments.count {
+        secureBootDbHashes.append(arguments[idx + 1])
         idx += 2
     } else if arg == "--virtio-fs", idx + 1 < arguments.count {
         virtioFSShareDir = arguments[idx + 1]
@@ -1843,6 +1878,20 @@ if vzRestoreSaveDir != nil || vzRestoreLoadDir != nil {
         fail("--vz-restore-save and --vz-restore-load are mutually exclusive (one process saves, another loads).")
     }
 }
+// M113b (#2418): the verified-boot flag family is all-or-nothing —
+// enrollment flags without the arming flag are a loud error, never a
+// silently ignored flag (the hardware-contract convention).
+if !secureBootEnabled, secureBootPKPath != nil || !secureBootDbEfiPaths.isEmpty || !secureBootDbHashes.isEmpty {
+    fail("--secure-boot-pk/--secure-boot-db-efi/--secure-boot-db-hash require --secure-boot.")
+}
+if secureBootEnabled {
+    guard secureBootPKPath != nil else {
+        fail("--secure-boot requires --secure-boot-pk <DER X.509 certificate path>.")
+    }
+    guard !secureBootDbEfiPaths.isEmpty || !secureBootDbHashes.isEmpty else {
+        fail("--secure-boot requires at least one of --secure-boot-db-efi <PE path> or --secure-boot-db-hash <64-hex>.")
+    }
+}
 
 let overlayMode = overlayBasePath != nil
 let diskURL = URL(fileURLWithPath: diskImagePath)
@@ -1853,10 +1902,138 @@ if !overlayMode {
 }
 let artifactsDir = URL(fileURLWithPath: "artifacts")
 try? FileManager.default.createDirectory(at: artifactsDir, withIntermediateDirectories: true)
+// M113b (#2418, ADR 0054 D5): the PE/COFF Authenticode digest — the image
+// hashed in file order skipping the CheckSum field (4 bytes), the
+// IMAGE_DIRECTORY_ENTRY_SECURITY entry (8 bytes), and the Attribute
+// Certificate Table it points to (a file offset, not an RVA). This is the
+// convention the M113a probe observed the firmware db enforcing (ADR 0054
+// Grounding 3: the raw file hash is refused, this digest boots).
+func peAuthenticodeSHA256(_ data: Data) -> Data? {
+    let b = [UInt8](data)
+    func u16le(_ off: Int) -> Int { Int(b[off]) | (Int(b[off + 1]) << 8) }
+    func u32le(_ off: Int) -> Int {
+        Int(b[off]) | (Int(b[off + 1]) << 8) | (Int(b[off + 2]) << 16) | (Int(b[off + 3]) << 24)
+    }
+    guard b.count >= 0x40 else { return nil }
+    let peOff = u32le(0x3c)
+    guard peOff + 24 <= b.count,
+          b[peOff] == 0x50, b[peOff + 1] == 0x45, b[peOff + 2] == 0, b[peOff + 3] == 0 else { return nil }
+    let optOff = peOff + 4 + 20 // PE signature + COFF header
+    let magic = u16le(optOff)
+    let dirBase: Int
+    let numDirsOff: Int
+    switch magic {
+    case 0x10b: dirBase = optOff + 96; numDirsOff = optOff + 92 // PE32
+    case 0x20b: dirBase = optOff + 112; numDirsOff = optOff + 108 // PE32+
+    default: return nil
+    }
+    guard numDirsOff + 4 <= b.count else { return nil }
+    let numDirs = u32le(numDirsOff)
+    let checksumOff = optOff + 64
+    let secDirOff = dirBase + 4 * 8 // IMAGE_DIRECTORY_ENTRY_SECURITY
+    var hasher = SHA256()
+    if numDirs <= 4 || secDirOff + 8 > b.count {
+        guard checksumOff + 4 <= b.count else { return nil }
+        hasher.update(data: data[0..<checksumOff])
+        hasher.update(data: data[(checksumOff + 4)..<b.count])
+    } else {
+        let certOff = u32le(secDirOff)
+        let certSize = u32le(secDirOff + 4)
+        guard checksumOff + 4 <= secDirOff else { return nil }
+        hasher.update(data: data[0..<checksumOff])
+        hasher.update(data: data[(checksumOff + 4)..<secDirOff])
+        let contentEnd = certOff == 0 ? b.count : min(certOff, b.count)
+        guard secDirOff + 8 <= contentEnd else { return nil }
+        hasher.update(data: data[(secDirOff + 8)..<contentEnd])
+        if certOff != 0 {
+            guard certOff + certSize <= b.count else { return nil }
+            hasher.update(data: data[(certOff + certSize)..<b.count])
+        }
+    }
+    return Data(hasher.finalize())
+}
+
+/// Parse a 64-hex-char digest string into bytes (nil on bad input).
+func dataFromHex(_ hex: String) -> Data? {
+    let chars = Array(hex.utf8)
+    guard chars.count % 2 == 0 else { return nil }
+    var out = Data()
+    out.reserveCapacity(chars.count / 2)
+    var i = 0
+    func nibble(_ c: UInt8) -> UInt8? {
+        switch c {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return c - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return c - UInt8(ascii: "A") + 10
+        default: return nil
+        }
+    }
+    while i + 1 < chars.count {
+        guard let hi = nibble(chars[i]), let lo = nibble(chars[i + 1]) else { return nil }
+        out.append(hi << 4 | lo)
+        i += 2
+    }
+    return out
+}
+
 let varsURL = URL(fileURLWithPath: varsOverridePath ?? "artifacts/efi-vars.bin")
 try? FileManager.default.createDirectory(at: varsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 let variableStore: VZEFIVariableStore
-if FileManager.default.fileExists(atPath: varsURL.path) {
+if secureBootEnabled {
+    // M113b (#2418, ADR 0054 D5): a FRESH per-run store — enrollment is
+    // one-shot setup, not accumulated state, so any existing file at this
+    // path is deliberately overwritten.
+    do {
+        variableStore = try VZEFIVariableStore(creatingVariableStoreAt: varsURL, options: .allowOverwrite)
+    } catch {
+        fail("Could not create EFI variable store at \(varsURL.path): \(error)")
+    }
+#if SPIKE
+    if #available(macOS 27.0, *) {
+        guard let pkPath = secureBootPKPath,
+              let der = FileManager.default.contents(atPath: pkPath),
+              let platformKey = SecCertificateCreateWithData(nil, der as CFData) else {
+            fail("--secure-boot-pk: cannot load a DER X.509 certificate from '\(secureBootPKPath ?? "")'.")
+        }
+        var signatures: [VZEFISignature] = []
+        for pePath in secureBootDbEfiPaths {
+            guard let pe = FileManager.default.contents(atPath: pePath) else {
+                fail("--secure-boot-db-efi: cannot read '\(pePath)'.")
+            }
+            guard let digest = peAuthenticodeSHA256(pe) else {
+                fail("--secure-boot-db-efi: '\(pePath)' is not a well-formed PE/COFF image.")
+            }
+            signatures.append(.sha256(digest))
+            print("  secure-boot: db += authenticode(\(pePath)) = \(digest.map { String(format: "%02x", $0) }.joined())")
+        }
+        for hexDigest in secureBootDbHashes {
+            guard let digest = dataFromHex(hexDigest), digest.count == 32 else {
+                fail("--secure-boot-db-hash: '\(hexDigest)' is not 32 bytes of hex.")
+            }
+            signatures.append(.sha256(digest))
+            print("  secure-boot: db += hash \(hexDigest)")
+        }
+        do {
+            try variableStore.enableSecureBoot(platformKey: platformKey)
+            let dbList = VZEFISignatureList(signatures: signatures)
+            // ADR 0054 D1: custom PK + a db of the pinned digests only —
+            // KEK and dbx stay empty, no Microsoft signatures are enrolled.
+            let enrollment = VZEFISignatureDatabaseConfiguration(
+                keyExchangeKeys: [],
+                dbSignatures: [dbList],
+                dbxSignatures: [])
+            try variableStore.enrollSecureBootSignatures(enrollment)
+            print("  secure-boot: enabled pk=\(pkPath) db_hashes=\(signatures.count) vars=\(varsURL.path) (fresh per-run store)")
+        } catch {
+            fail("--secure-boot: enrollment failed: \(error)")
+        }
+    } else {
+        fail("--secure-boot requires macOS 27+ (VZEFIVariableStore Secure Boot APIs).")
+    }
+#else
+    fail("--secure-boot requires a SPIKE build (macOS 27 SDK Secure Boot types); rebuild with `swift build --package-path host/vm-runner --configuration release -Xswiftc -DSPIKE` (`zig build spike-virtio` drives it). This binary cannot enroll Secure Boot signatures.")
+#endif
+} else if FileManager.default.fileExists(atPath: varsURL.path) {
     variableStore = VZEFIVariableStore(url: varsURL)
 } else {
     do {
