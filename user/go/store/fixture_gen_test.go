@@ -30,8 +30,13 @@ import (
 // key_unknown/key_revoked negatives serve from flintd.
 //
 //	STORE_FIXTURE_ELF          ELF whose sha256 the manifest pins (default .build/go/GOHELLO.ELF)
+//	STORE_FIXTURE_NAME         ReleaseName                     (default "GOHELLO")
 //	STORE_FIXTURE_VERSION      ReleaseVersion                  (default "1.0.0")
-//	STORE_FIXTURE_ROW          ReleaseManifestRow              (default the GOHELLO row)
+//	STORE_FIXTURE_ROW          ReleaseManifestRow              (default derived from NAME)
+//	STORE_FIXTURE_SUMMARY      ReleaseSummary                  (ADR 0055 optional; "" omits the const)
+//	STORE_FIXTURE_DESCRIPTION  ReleaseDescription              (optional)
+//	STORE_FIXTURE_CATEGORY     ReleaseCategory                 (optional)
+//	STORE_FIXTURE_ICON_SHA256  ReleaseIconSHA256               (optional)
 //	STORE_FIXTURE_STREAM       stream uuid                     (default `rel`)
 //	STORE_FIXTURE_CHANGE       change id                       (default genChangeID)
 //	STORE_FIXTURE_PARENT       parent change id                (default none)
@@ -46,6 +51,12 @@ import (
 //	                           nonempty -> release-<tag>-stream.jsonl/release-<tag>.go)
 //	STORE_FIXTURE_EMPTY=1      empty-ops change only — no ELF read, no release.go
 //
+// A parented Change diffs against a parent release.go reconstructed with
+// the SAME optional-const set — the generator emits add/modify ops only,
+// so a child that drops a const would leave the parent's atom signed at
+// head. Atom ids derive from the const's qualified name, so a const
+// keeps its id across releases regardless of declaration order.
+//
 // The canonical-bytes port below mirrors user/go/flint/change.go +
 // store.go (sigMsg / opsHash / opBytes / sortOps). Keep them in
 // lockstep: a drifted generator mints a change that fails `verify`.
@@ -59,26 +70,30 @@ const (
 	genRelRow       = "GOHELLO.ELF | Go Hello | g | dock=false"
 )
 
-var genAtomIDs = []string{
-	"0199de2d-dc00-7000-8000-00000000d001",
-	"0199de2d-dc00-7000-8000-00000000d002",
-	"0199de2d-dc00-7000-8000-00000000d003",
-	"0199de2d-dc00-7000-8000-00000000d004",
+// genAtomID derives the atom id for a manifest const from its qualified
+// name — the same const keeps the same id across successive releases, so
+// a regenerated parented Change diffs into modify ops on the SAME atoms
+// instead of adds that would leave the parent's atoms signed at head.
+// The tail is name-hash-derived; the fixed groups keep UUIDv7 shape.
+func genAtomID(name string) string {
+	sum := sshlib.SHA256Sum([]byte(name))
+	return "0199de2d-dc00-7000-8000-" + hex.EncodeToString(sum[26:32])
 }
 
 type genSpec struct {
-	elfPath, version, row, streamID, changeID, parent, msg string
-	seedFile, seedHex, prevElf, prevVersion, dir, tag      string
-	ts                                                     int64
-	empty                                                  bool
+	elfPath, name, version, row, streamID, changeID, parent, msg string
+	summary, description, category, iconSHA                      string
+	seedFile, seedHex, prevElf, prevVersion, dir, tag            string
+	ts                                                           int64
+	empty                                                        bool
 }
 
 func genSpecFromEnv(t *testing.T) genSpec {
 	t.Helper()
 	s := genSpec{
 		elfPath:     os.Getenv("STORE_FIXTURE_ELF"),
+		name:        "GOHELLO",
 		version:     "1.0.0",
-		row:         genRelRow,
 		streamID:    genStreamID,
 		changeID:    genChangeID,
 		parent:      os.Getenv("STORE_FIXTURE_PARENT"),
@@ -95,8 +110,13 @@ func genSpecFromEnv(t *testing.T) genSpec {
 		s.elfPath = filepath.Join("..", "..", "..", ".build", "go", "GOHELLO.ELF")
 	}
 	for env, dst := range map[string]*string{
+		"STORE_FIXTURE_NAME":         &s.name,
 		"STORE_FIXTURE_VERSION":      &s.version,
 		"STORE_FIXTURE_ROW":          &s.row,
+		"STORE_FIXTURE_SUMMARY":      &s.summary,
+		"STORE_FIXTURE_DESCRIPTION":  &s.description,
+		"STORE_FIXTURE_CATEGORY":     &s.category,
+		"STORE_FIXTURE_ICON_SHA256":  &s.iconSHA,
 		"STORE_FIXTURE_STREAM":       &s.streamID,
 		"STORE_FIXTURE_CHANGE":       &s.changeID,
 		"STORE_FIXTURE_MSG":          &s.msg,
@@ -106,6 +126,13 @@ func genSpecFromEnv(t *testing.T) genSpec {
 	} {
 		if v := os.Getenv(env); v != "" {
 			*dst = v
+		}
+	}
+	if s.row == "" {
+		if s.name == "GOHELLO" {
+			s.row = genRelRow
+		} else {
+			s.row = s.name + ".ELF | " + s.name + " | g | dock=false"
 		}
 	}
 	tsText := os.Getenv("STORE_FIXTURE_TS")
@@ -152,7 +179,7 @@ func TestGenReleaseFixture(t *testing.T) {
 			t.Fatalf("read ELF %s: %v", spec.elfPath, err)
 		}
 		sum := sshlib.SHA256Sum(elf)
-		relText = genReleaseGo(sshlib.EncodeHex(sum[:]), spec.version, spec.row)
+		relText = spec.releaseGo(sshlib.EncodeHex(sum[:]), spec.version)
 
 		// Parse the manifest through the real parser — the atom hashes
 		// the ops carry are exactly what verifyRelease recomputes
@@ -165,13 +192,21 @@ func TestGenReleaseFixture(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if len(atoms) != 4 {
-			t.Fatalf("expected 4 release atoms, got %d", len(atoms))
+		wantAtoms := len(requiredConsts)
+		for _, opt := range []string{spec.summary, spec.description, spec.category, spec.iconSHA} {
+			if opt != "" {
+				wantAtoms++
+			}
+		}
+		if len(atoms) != wantAtoms {
+			t.Fatalf("expected %d release atoms, got %d", wantAtoms, len(atoms))
 		}
 
 		// A parented Change diffs against the parent release: atoms whose
 		// hash moved become modify ops (old_hash = the parent's hash);
-		// untouched atoms emit no op — a real commit's diff shape.
+		// untouched atoms emit no op — a real commit's diff shape. The
+		// parent manifest carries the same optional-const set — see the
+		// env-knob comment.
 		prevHash := map[string]string(nil)
 		if spec.prevElf != "" {
 			pElf, err := os.ReadFile(spec.prevElf)
@@ -180,7 +215,7 @@ func TestGenReleaseFixture(t *testing.T) {
 			}
 			pSum := sshlib.SHA256Sum(pElf)
 			prevAtoms, err := p.Parse("release.go",
-				[]byte(genReleaseGo(sshlib.EncodeHex(pSum[:]), spec.prevVersion, spec.row)))
+				[]byte(spec.releaseGo(sshlib.EncodeHex(pSum[:]), spec.prevVersion)))
 			if err != nil {
 				t.Fatalf("parse prev: %v", err)
 			}
@@ -190,10 +225,10 @@ func TestGenReleaseFixture(t *testing.T) {
 			}
 		}
 
-		for i, a := range atoms {
+		for _, a := range atoms {
 			span := Span{File: a.File, Start: a.Start, End: a.End}
 			op := Op{
-				AtomID:     genAtomIDs[i],
+				AtomID:     genAtomID(a.Name),
 				Kind:       a.Kind,
 				NewName:    a.Name,
 				NewSpan:    &span,
@@ -254,15 +289,34 @@ func TestGenReleaseFixture(t *testing.T) {
 	t.Logf("generated release fixture: change %s, ops=%d", change.ID, len(change.Ops))
 }
 
-// genReleaseGo renders the release manifest text — the same shape the
-// gate stages (DO NOT change the const names: verifyRelease keys on
-// them).
-func genReleaseGo(elfSHA, version, row string) string {
-	return "package release\n\n" +
-		"const ReleaseName = \"GOHELLO\"\n" +
-		"const ReleaseVersion = \"" + version + "\"\n" +
-		"const ReleaseELFSHA256 = \"" + elfSHA + "\"\n" +
-		"const ReleaseManifestRow = \"" + row + "\"\n"
+// releaseGo renders the release manifest text — the same shape the gate
+// stages (DO NOT change the const names: verifyRelease keys on them).
+// The optional ADR 0055 catalog consts are emitted only when the spec
+// declares them; strconv.Quote keeps multi-line descriptions inside one
+// literal.
+func (s genSpec) releaseGo(elfSHA, version string) string {
+	var b strings.Builder
+	b.WriteString("package release\n\n")
+	emit := func(name, val string) {
+		b.WriteString("const " + name + " = " + strconv.Quote(val) + "\n")
+	}
+	emit("ReleaseName", s.name)
+	emit("ReleaseVersion", version)
+	emit("ReleaseELFSHA256", elfSHA)
+	emit("ReleaseManifestRow", s.row)
+	if s.summary != "" {
+		emit("ReleaseSummary", s.summary)
+	}
+	if s.description != "" {
+		emit("ReleaseDescription", s.description)
+	}
+	if s.category != "" {
+		emit("ReleaseCategory", s.category)
+	}
+	if s.iconSHA != "" {
+		emit("ReleaseIconSHA256", s.iconSHA)
+	}
+	return b.String()
 }
 
 // ---- canonical-bytes port (mirrors user/go/flint/change.go) -----------

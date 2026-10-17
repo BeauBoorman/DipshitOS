@@ -1,6 +1,8 @@
 package main
 
 import (
+	"strings"
+
 	"virelai/sshlib"
 	"virelai/vi"
 )
@@ -131,13 +133,15 @@ func streamID(byName, byID map[string]*Stream, sel string) (string, error) {
 // un-committed tail must not materialize ahead of the head STORE
 // records. A nil head folds nothing (nothing is committed); a head
 // absent from the log is stream_malformed — record and log disagree.
-func headReleaseOps(logBytes []byte, head *string) (map[atomKey]string, error) {
+// The second return is the head Change's author — the derived publisher
+// fingerprint of ADR 0055 D5 ("" when the stream is headless).
+func headReleaseOps(logBytes []byte, head *string) (map[atomKey]string, string, error) {
 	changes, err := parseStreamChanges(logBytes)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if head == nil {
-		return foldReleaseOps(nil), nil
+		return foldReleaseOps(nil), "", nil
 	}
 	end := -1
 	for i, c := range changes {
@@ -147,9 +151,9 @@ func headReleaseOps(logBytes []byte, head *string) (map[atomKey]string, error) {
 		}
 	}
 	if end < 0 {
-		return nil, refuse("stream_malformed", "head not in log")
+		return nil, "", refuse("stream_malformed", "head not in log")
 	}
-	return foldReleaseOps(changes[:end+1]), nil
+	return foldReleaseOps(changes[:end+1]), changes[end].Author, nil
 }
 
 // verifyStore runs the materialization gate inside FLINT.ELF: the
@@ -181,63 +185,211 @@ var remoteStreamsFn = func(remote string) ([]Stream, error) {
 	return streams, err
 }
 
-// cmdLs implements `store ls [--remote=<r>]`: enumerate the remote's
-// streams over the wire, refresh the local replica when the remote head
-// moved, and report whether each stream's head ops carry a release
-// manifest. A current replica needs no pull at all — the wire `read`
-// behind clone/pull cannot carry a release-sized Change anyway (the
-// relay drop is documented on remoteStreams), so ls is expected to see
-// replicas the share already materialized, exactly like install.
-func cmdLs(fs FS, root string, remoteFlag string) int {
+// syncIfMoved refreshes st's local replica when it is absent or behind
+// the remote head; a current replica needs no pull at all — the wire
+// `read` behind clone/pull cannot carry a release-sized Change anyway
+// (the relay drop is documented on remoteStreams), so the catalog is
+// expected to see replicas the share already materialized, exactly like
+// install.
+func syncIfMoved(fs FS, root, remote string, st Stream, byName map[string]*Stream) error {
+	rec, found := byName[st.Name]
+	localHead := (*string)(nil)
+	if found {
+		localHead = rec.Head
+	}
+	if !found || (st.Head != nil && (localHead == nil || *localHead != *st.Head)) {
+		return syncStream(fs, remote, st.Name, byName)
+	}
+	return nil
+}
+
+// syncRemoteStreams refreshes every remote stream's local replica via
+// syncIfMoved, tolerating per-stream refusals — an untrusted publisher's
+// clone is refused inside FLINT.ELF and reports sync-failed rather than
+// failing the enumeration. It returns the local records keyed by name.
+func syncRemoteStreams(fs FS, root, remote string, streams []Stream) (map[string]*Stream, error) {
+	for _, st := range streams {
+		byName, _, err := listStreamRecords(fs, root)
+		if err != nil {
+			return nil, err
+		}
+		if err := syncIfMoved(fs, root, remote, st, byName); err != nil {
+			consoleFn("store: stream " + st.Name + " sync-failed")
+		}
+	}
+	byName, _, err := listStreamRecords(fs, root)
+	return byName, err
+}
+
+// cmdLs implements `store ls [--remote=<r>] [--channel=<c>]
+// [--search=<s>] [--category=<c>]`: enumerate the remote's streams over
+// the wire, refresh the local replica when the remote head moved, and
+// fold each stream's head into its ADR 0055 catalog entry — the release
+// manifest consts read out of the signed atoms plus the derived
+// publisher fingerprint. A current replica needs no pull at all — the
+// wire `read` behind clone/pull cannot carry a release-sized Change
+// anyway (the relay drop is documented on remoteStreams), so ls is
+// expected to see replicas the share already materialized, exactly like
+// install. A stream whose channel release.go is missing, tampered, or
+// malformed is marked catalog-invalid with the refusal name rather than
+// silently rendered.
+func cmdLs(fs FS, root string, remoteFlag, channelArg, search, category string) int {
 	consoleFn("store: ls")
 	remote, err := resolveRemote(fs, root, remoteFlag)
 	if err != nil {
 		return runErr(err)
 	}
 	consoleFn("store: remote " + remote)
+	ch, err := openChannel(fs, channelArg)
+	if err != nil {
+		return runErr(err)
+	}
 	streams, err := remoteStreamsFn(remote)
 	if err != nil {
 		return runErr(err)
 	}
+	kr, _ := loadKeyring(fs, root) // absent/corrupt -> publisher unverified
+	byName, err := syncRemoteStreams(fs, root, remote, streams)
+	if err != nil {
+		return runErr(err)
+	}
+	entries := 0
 	for _, st := range streams {
-		byName, byID, err := listStreamRecords(fs, root)
+		rec, ok := byName[st.Name]
+		if !ok {
+			continue // sync-failed already reported
+		}
+		e, err := loadCatalogEntry(fs, root, ch, rec, kr)
 		if err != nil {
-			return runErr(err)
+			consoleFn("store: stream " + st.Name + " catalog-invalid " + refuseCodeOf(err))
+			continue
 		}
-		rec, found := byName[st.Name]
-		localHead := (*string)(nil)
-		if found {
-			localHead = rec.Head
-		}
-		if !found || (st.Head != nil && (localHead == nil || *localHead != *st.Head)) {
-			if err := syncStream(fs, remote, st.Name, byName); err != nil {
-				consoleFn("store: stream " + st.Name + " sync-failed")
-				continue
-			}
-		}
-		byName, byID, err = listStreamRecords(fs, root)
-		if err != nil {
-			return runErr(err)
-		}
-		id, err := streamID(byName, byID, st.Name)
-		if err != nil {
-			return runErr(err)
-		}
-		logBytes, err := streamLogBytes(fs, root, id)
-		if err != nil {
-			return runErr(err)
-		}
-		signed, err := headReleaseOps(logBytes, byID[id].Head)
-		if err != nil {
-			return runErr(err)
-		}
-		if len(signed) > 0 {
-			consoleFn("store: stream " + st.Name + " release")
-		} else {
+		if e == nil {
 			consoleFn("store: stream " + st.Name + " no-release")
+			continue
+		}
+		if !e.matches(search, category) {
+			continue
+		}
+		entries++
+		consoleFn("store: stream " + st.Name + " release " + e.line())
+	}
+	consoleFn("store: ls ok entries=" + vi.Itoa64(int64(entries)))
+	return 0
+}
+
+// cmdInfo implements `store info <name> [--remote=<r>] [--channel=<c>]`:
+// the single-stream detail view of the same catalog fold. The selector
+// resolves a remote stream by name or id first, then by ReleaseName —
+// `store info GOHELLO` and `store info rel` name the same card.
+func cmdInfo(fs FS, root, sel, remoteFlag, channelArg string) int {
+	consoleFn("store: info " + sel)
+	remote, err := resolveRemote(fs, root, remoteFlag)
+	if err != nil {
+		return runErr(err)
+	}
+	consoleFn("store: remote " + remote)
+	ch, err := openChannel(fs, channelArg)
+	if err != nil {
+		return runErr(err)
+	}
+	streams, err := remoteStreamsFn(remote)
+	if err != nil {
+		return runErr(err)
+	}
+	kr, _ := loadKeyring(fs, root)
+	var target *Stream
+	for i := range streams {
+		if streams[i].Name == sel || streams[i].ID == sel {
+			target = &streams[i]
+			break
 		}
 	}
-	consoleFn("store: ls ok")
+	byName, _, err := listStreamRecords(fs, root)
+	if err != nil {
+		return runErr(err)
+	}
+	var entry *catalogEntry
+	if target != nil {
+		// The named stream: sync just it — an enumeration-wide sync would
+		// re-pay every per-stream refusal for one card.
+		if err := syncIfMoved(fs, root, remote, *target, byName); err != nil {
+			return runErr(refuse("sync_failed", target.Name))
+		}
+		byName, _, err = listStreamRecords(fs, root)
+		if err != nil {
+			return runErr(err)
+		}
+		rec, ok := byName[target.Name]
+		if !ok {
+			return runErr(refuse("stream_missing", target.Name))
+		}
+		entry, err = loadCatalogEntry(fs, root, ch, rec, kr)
+		if err != nil {
+			return runErr(err)
+		}
+	} else {
+		// ReleaseName fallback (`store info GOHELLO`): scan each remote
+		// stream's catalog entry for a name match, tolerating per-stream
+		// refusals the same way ls does.
+		want := strings.ToUpper(sel)
+		for i := range streams {
+			if serr := syncIfMoved(fs, root, remote, streams[i], byName); serr != nil {
+				continue
+			}
+			byName, _, err = listStreamRecords(fs, root)
+			if err != nil {
+				return runErr(err)
+			}
+			rec, ok := byName[streams[i].Name]
+			if !ok {
+				continue
+			}
+			e, cerr := loadCatalogEntry(fs, root, ch, rec, kr)
+			if cerr != nil || e == nil {
+				continue
+			}
+			if e.Rel.Name == want {
+				entry = e
+				target = &streams[i]
+				break
+			}
+		}
+	}
+	if target == nil {
+		return runErr(refuse("stream_missing", sel))
+	}
+	if entry == nil {
+		return runErr(refuse("release_missing", target.Name))
+	}
+	consoleFn("store: stream " + entry.Stream)
+	consoleFn("store: name " + entry.Rel.Name)
+	consoleFn("store: version " + entry.Rel.Version)
+	consoleFn("store: category " + orDash(entry.Rel.Category))
+	consoleFn("store: summary " + orDash(entry.Rel.Summary))
+	consoleFn("store: sha256 " + entry.Rel.ELFSHA256)
+	consoleFn("store: icon_sha256 " + orDash(entry.Rel.IconSHA256))
+	consoleFn("store: publisher " + entry.Publisher +
+		" publisher_name=" + orDash(entry.PubLabel) +
+		" publisher_state=" + entry.PubState)
+	consoleFn("store: head " + entry.Head)
+	installed := "no"
+	if lines, lerr := loadManifest(fs); lerr != nil {
+		return runErr(lerr)
+	} else if manifestHasBin(lines, entry.Rel.Name+".ELF") {
+		installed = "yes"
+	}
+	consoleFn("store: installed " + installed)
+	consoleFn("store: row " + entry.Rel.ManifestRow)
+	if entry.Rel.Description == "" {
+		consoleFn("store: description -")
+	} else {
+		consoleFn("store: description")
+		for _, line := range strings.Split(entry.Rel.Description, "\n") {
+			consoleFn("store:   " + line)
+		}
+	}
+	consoleFn("store: info ok")
 	return 0
 }
 
@@ -299,7 +451,7 @@ func cmdInstall(fs FS, root, stream, remoteFlag, channelArg string) int {
 
 	// 2. Signed release manifest atoms at head — folded from the bound
 	// bytes, up to the record head.
-	signed, err := headReleaseOps(logBytes, st.Head)
+	signed, _, err := headReleaseOps(logBytes, st.Head)
 	if err != nil {
 		return runErr(err)
 	}

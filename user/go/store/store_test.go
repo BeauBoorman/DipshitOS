@@ -55,17 +55,25 @@ func releaseOps(t *testing.T, src []byte) map[atomKey]string {
 // cover every release.go atom, into fs under DefaultStoreRoot.
 func streamWithRelease(t *testing.T, fs *memFS, name string, src []byte) {
 	t.Helper()
-	ops := map[string]string{}
+	streamWithReleaseAs(t, fs, name, testStreamID,
+		"0199de2d-dc00-7000-8000-00000000c001", strings.Repeat("ab", 32), src)
+}
+
+// streamWithReleaseAs is streamWithRelease with the stream id, change id,
+// and head-change author (the derived publisher fingerprint) as knobs —
+// two-publisher catalog tests sign the second stream with a second key.
+func streamWithReleaseAs(t *testing.T, fs *memFS, name, streamID, changeID, author string, src []byte) {
+	t.Helper()
 	p, _ := parser.ForPath("release.go")
 	atoms, err := p.Parse("release.go", src)
 	if err != nil {
 		t.Fatalf("parse release.go: %v", err)
 	}
 	change := Change{
-		ID:     "0199de2d-dc00-7000-8000-00000000c001",
-		Stream: testStreamID,
+		ID:     changeID,
+		Stream: streamID,
 		TS:     1760000000000,
-		Author: strings.Repeat("ab", 32),
+		Author: author,
 		Ops:    []Op{},
 		Sig:    strings.Repeat("cd", 64),
 	}
@@ -81,14 +89,12 @@ func streamWithRelease(t *testing.T, fs *memFS, name string, src []byte) {
 			NewHash: hex.EncodeToString(a.Hash[:]),
 		})
 		i++
-		ops[a.Name] = "set"
 	}
-	_ = ops
-	rec := Stream{ID: testStreamID, Name: name, Head: &change.ID, Created: 1}
+	rec := Stream{ID: streamID, Name: name, Head: &change.ID, Created: 1}
 	rb, _ := json.Marshal(rec)
-	fs.files[streamRecordPath(DefaultStoreRoot, testStreamID)] = append(rb, '\n')
+	fs.files[streamRecordPath(DefaultStoreRoot, streamID)] = append(rb, '\n')
 	lb, _ := json.Marshal(change)
-	fs.files[streamLogPath(DefaultStoreRoot, testStreamID)] = append(lb, '\n')
+	fs.files[streamLogPath(DefaultStoreRoot, streamID)] = append(lb, '\n')
 	fs.dirs[DefaultStoreRoot] = true
 	fs.dirs[DefaultStoreRoot+"/streams"] = true
 }
@@ -769,7 +775,7 @@ func TestLs(t *testing.T) {
 		return 0, nil
 	}
 
-	rc := cmdLs(fs, DefaultStoreRoot, "10.0.0.2:4749")
+	rc := cmdLs(fs, DefaultStoreRoot, "10.0.0.2:4749", "/host/DROP", "", "")
 	if rc != 0 {
 		t.Fatalf("ls rc=%d lines=%v", rc, *lines)
 	}
@@ -778,6 +784,281 @@ func TestLs(t *testing.T) {
 		!strings.Contains(joined, "store: stream main no-release") ||
 		!strings.Contains(joined, "store: ls ok") {
 		t.Fatalf("unexpected ls output: %v", *lines)
+	}
+}
+
+// releaseGoCat renders a release.go carrying the ADR 0055 optional
+// catalog consts alongside the required four ("" omits a const).
+func releaseGoCat(name, version string, elf []byte, row, summary, desc, cat, icon string) []byte {
+	src := string(releaseGo(name, version, elf, row))
+	emit := func(cname, val string) {
+		if val != "" {
+			src += fmt.Sprintf("const %s = %q\n", cname, val)
+		}
+	}
+	emit("ReleaseSummary", summary)
+	emit("ReleaseDescription", desc)
+	emit("ReleaseCategory", cat)
+	emit("ReleaseIconSHA256", icon)
+	return []byte(src)
+}
+
+// ---- ADR 0055 catalog fields ----------------------------------------------
+
+func TestParseReleaseCatalog(t *testing.T) {
+	icon := strings.Repeat("9f", 32)
+	src := releaseGoCat("GOHELLO", "1.0.0", testELF,
+		"GOHELLO.ELF | Go Hello | g | dock=false",
+		"Greets the guest", "Line one.\nLine two.", "demo", icon)
+	rel, err := parseRelease(src)
+	if err != nil {
+		t.Fatalf("parseRelease catalog: %v", err)
+	}
+	if rel.Summary != "Greets the guest" || rel.Description != "Line one.\nLine two." ||
+		rel.Category != "demo" || rel.IconSHA256 != icon {
+		t.Fatalf("catalog fields: %+v", rel)
+	}
+
+	// A legacy four-const release parses with empty catalog fields.
+	rel, err = parseRelease(releaseGo("GOHELLO", "1.0.0", testELF, "GOHELLO.ELF | X | x"))
+	if err != nil || rel.Summary != "" || rel.Category != "" || rel.IconSHA256 != "" || rel.Description != "" {
+		t.Fatalf("legacy release: %+v err=%v", rel, err)
+	}
+
+	// Unknown signed consts are ignored (D4) — including identity-claiming
+	// names, which must never render as publisher information (D5).
+	unknown := append(releaseGo("GOHELLO", "1.0.0", testELF, "GOHELLO.ELF | X | x"),
+		[]byte("const ReleasePublisher = \"mallory\"\nconst ReleaseFuture = \"x\"\n")...)
+	rel, err = parseRelease(unknown)
+	if err != nil || rel.Name != "GOHELLO" {
+		t.Fatalf("unknown consts not ignored: %v %+v", err, rel)
+	}
+
+	for _, tc := range []struct {
+		name string
+		src  []byte
+		want string
+	}{
+		{"summary empty", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "", "", ""), ""}, // skipped below
+		{"summary control", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "a\tb", "", "", ""), "summary_invalid"},
+		{"summary long", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", strings.Repeat("s", 129), "", "", ""), "summary_invalid"},
+		{"summary bad utf8", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "a\xffb", "", "", ""), "summary_invalid"},
+		{"description tab", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "a\tb", "", ""), "description_invalid"},
+		{"description ok newline", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "a\nb", "", ""), ""},
+		{"category bad", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "", "gaming", ""), "category_unknown"},
+		{"category ok", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "", "net", ""), ""},
+		{"icon short", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "", "", "abcd"), "hash_invalid"},
+		{"icon upper", releaseGoCat("GOHELLO", "1", testELF, "GOHELLO.ELF | X | x", "", "", "", strings.Repeat("9F", 32)), "hash_invalid"},
+	} {
+		if tc.want == "" {
+			if _, err := parseRelease(tc.src); err != nil {
+				t.Fatalf("%s: unexpected refusal %v", tc.name, err)
+			}
+			continue
+		}
+		_, err := parseRelease(tc.src)
+		refuseCode(t, err, tc.want)
+	}
+}
+
+func TestKeyring(t *testing.T) {
+	pub1, pub2, bad := strings.Repeat("ab", 32), strings.Repeat("e5", 32), strings.Repeat("0f", 32)
+	body := "#v1\n" +
+		"key=" + pub1 + " name=sync-seed\n" +
+		"key=" + pub2 + " name=acme\n" +
+		"revoked=" + bad + "\n"
+	kr, err := parseKeyring([]byte(body))
+	if err != nil {
+		t.Fatalf("parseKeyring: %v", err)
+	}
+	if st, label := kr.publisherState(pub1); st != "trusted" || label != "sync-seed" {
+		t.Fatalf("pub1: %s %q", st, label)
+	}
+	if st, _ := kr.publisherState(bad); st != "revoked" {
+		t.Fatalf("bad: %s", st)
+	}
+	if st, _ := kr.publisherState(strings.Repeat("11", 32)); st != "unknown" {
+		t.Fatalf("unknown: %s", st)
+	}
+	for _, corrupt := range []string{
+		"", "#v2\nkey=" + pub1 + " name=x\n",
+		"#v1\nkey=zz name=x\n",
+		"#v1\nkey=" + pub1 + "\n",
+		"#v1\nkey=" + pub1 + " name=a\nkey=" + pub1 + " name=b\n",
+		"#v1\nbogus=1\n",
+	} {
+		if _, err := parseKeyring([]byte(corrupt)); err == nil {
+			t.Fatalf("accepted corrupt keyring %q", corrupt)
+		} else {
+			refuseCode(t, err, "keyring_malformed")
+		}
+	}
+	fs := newMemFS()
+	if _, err := loadKeyring(fs, DefaultStoreRoot); err == nil {
+		t.Fatal("absent keyring accepted")
+	} else {
+		refuseCode(t, err, "keyring_missing")
+	}
+}
+
+// seedCatalog adds the second publisher's stream (rel2, author e5*32) plus
+// TRUSTED.TXT to a seeded consumer and returns it.
+func seedCatalog(t *testing.T, fs *memFS) {
+	t.Helper()
+	src2 := releaseGoCat("BOUNCE", "1.4.0", testELF,
+		"BOUNCE.ELF | Bounce | g | dock=false",
+		"A bouncing ball demo", "Renders a ball.\nSecond line.", "game",
+		strings.Repeat("42", 32))
+	streamWithReleaseAs(t, fs, "rel2", "0199de2d-dc00-7000-8000-00000000c200",
+		"0199de2d-dc00-7000-8000-00000000c201", strings.Repeat("e5", 32), src2)
+	fs.dirs["/host/DROP/rel2"] = true
+	fs.files["/host/DROP/rel2/release.go"] = src2
+	fs.files["/host/DROP/rel2/BOUNCE.ELF"] = testELF
+	fs.files[keyringPath(DefaultStoreRoot)] = []byte(
+		"#v1\nkey=" + strings.Repeat("ab", 32) + " name=sync-seed\n" +
+			"key=" + strings.Repeat("e5", 32) + " name=acme\n")
+}
+
+func TestLsCatalog(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	seedCatalog(t, fs)
+	head := "0199de2d-dc00-7000-8000-00000000c001"
+	head2 := "0199de2d-dc00-7000-8000-00000000c201"
+	prev := remoteStreamsFn
+	defer func() { remoteStreamsFn = prev }()
+	remoteStreamsFn = func(remote string) ([]Stream, error) {
+		return []Stream{
+			{ID: testStreamID, Name: "rel", Head: &head},
+			{ID: "0199de2d-dc00-7000-8000-00000000c200", Name: "rel2", Head: &head2},
+		}, nil
+	}
+	execFn = func(name string, args ...string) (int64, error) {
+		t.Fatalf("unexpected exec %v — replicas are current", args)
+		return 1, nil
+	}
+
+	rc := cmdLs(fs, DefaultStoreRoot, "10.0.0.2:4749", "/host/DROP", "", "")
+	if rc != 0 {
+		t.Fatalf("ls rc=%d lines=%v", rc, *lines)
+	}
+	joined := strings.Join(*lines, "\n")
+	for _, want := range []string{
+		"store: stream rel release name=GOHELLO version=1.0.0 category=-",
+		"store: stream rel2 release name=BOUNCE version=1.4.0 category=game",
+		"publisher=" + strings.Repeat("ab", 32) + " publisher_name=sync-seed publisher_state=trusted",
+		"publisher=" + strings.Repeat("e5", 32) + " publisher_name=acme publisher_state=trusted",
+		"summary=A bouncing ball demo",
+		"store: ls ok entries=2",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in:\n%s", want, joined)
+		}
+	}
+
+	// --category keeps only matching catalog entries.
+	*lines = nil
+	rc = cmdLs(fs, DefaultStoreRoot, "10.0.0.2:4749", "/host/DROP", "", "game")
+	if rc != 0 {
+		t.Fatalf("ls --category rc=%d", rc)
+	}
+	joined = strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "store: stream rel2 release") ||
+		strings.Contains(joined, "store: stream rel release") ||
+		!strings.Contains(joined, "store: ls ok entries=1") {
+		t.Fatalf("category filter wrong:\n%s", joined)
+	}
+
+	// --search matches summary/name case-insensitively.
+	*lines = nil
+	rc = cmdLs(fs, DefaultStoreRoot, "10.0.0.2:4749", "/host/DROP", "BOUNCING", "")
+	if rc != 0 {
+		t.Fatalf("ls --search rc=%d", rc)
+	}
+	joined = strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "store: stream rel2 release") ||
+		strings.Contains(joined, "store: stream rel release") {
+		t.Fatalf("search filter wrong:\n%s", joined)
+	}
+
+	// A tampered channel release.go marks the stream release-invalid
+	// (verified against the signed atoms) and does not fail the listing.
+	fs.files["/host/DROP/rel/release.go"] = releaseGo("GOHELLO", "9.9.9", testELF, "GOHELLO.ELF | Go Hello | g | dock=false")
+	*lines = nil
+	rc = cmdLs(fs, DefaultStoreRoot, "10.0.0.2:4749", "/host/DROP", "", "")
+	if rc != 0 {
+		t.Fatalf("ls tampered rc=%d", rc)
+	}
+	joined = strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "store: stream rel catalog-invalid release_mismatch") ||
+		!strings.Contains(joined, "store: stream rel2 release") ||
+		!strings.Contains(joined, "store: ls ok entries=1") {
+		t.Fatalf("tampered catalog wrong:\n%s", joined)
+	}
+}
+
+func TestInfo(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	seedCatalog(t, fs)
+	head := "0199de2d-dc00-7000-8000-00000000c001"
+	head2 := "0199de2d-dc00-7000-8000-00000000c201"
+	prev := remoteStreamsFn
+	defer func() { remoteStreamsFn = prev }()
+	remoteStreamsFn = func(remote string) ([]Stream, error) {
+		return []Stream{
+			{ID: testStreamID, Name: "rel", Head: &head},
+			{ID: "0199de2d-dc00-7000-8000-00000000c200", Name: "rel2", Head: &head2},
+		}, nil
+	}
+	execFn = func(name string, args ...string) (int64, error) {
+		t.Fatalf("unexpected exec %v", args)
+		return 1, nil
+	}
+
+	// By stream name.
+	rc := cmdInfo(fs, DefaultStoreRoot, "rel2", "10.0.0.2:4749", "/host/DROP")
+	if rc != 0 {
+		t.Fatalf("info rc=%d lines=%v", rc, *lines)
+	}
+	joined := strings.Join(*lines, "\n")
+	for _, want := range []string{
+		"store: name BOUNCE", "store: version 1.4.0", "store: category game",
+		"store: summary A bouncing ball demo",
+		"store: icon_sha256 " + strings.Repeat("42", 32),
+		"store: publisher " + strings.Repeat("e5", 32) + " publisher_name=acme publisher_state=trusted",
+		"store: head " + head2,
+		"store: installed no",
+		"store: row BOUNCE.ELF | Bounce | g | dock=false",
+		"store:   Renders a ball.", "store:   Second line.",
+		"store: info ok",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in:\n%s", want, joined)
+		}
+	}
+
+	// By ReleaseName (the fallback scan).
+	*lines = nil
+	rc = cmdInfo(fs, DefaultStoreRoot, "bounce", "10.0.0.2:4749", "/host/DROP")
+	if rc != 0 || !strings.Contains(strings.Join(*lines, "\n"), "store: name BOUNCE") {
+		t.Fatalf("info by ReleaseName rc=%d:\n%s", rc, strings.Join(*lines, "\n"))
+	}
+
+	// Unknown selector -> stream_missing.
+	*lines = nil
+	rc = cmdInfo(fs, DefaultStoreRoot, "nope", "10.0.0.2:4749", "/host/DROP")
+	if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse stream_missing") {
+		t.Fatalf("info unknown rc=%d:\n%s", rc, strings.Join(*lines, "\n"))
+	}
+
+	// A tampered channel manifest refuses by name.
+	fs.files["/host/DROP/rel/release.go"] = releaseGoCat("GOHELLO", "1.0.0", testELF,
+		"GOHELLO.ELF | Go Hello | g | dock=false", "tampered", "", "", "")
+	*lines = nil
+	rc = cmdInfo(fs, DefaultStoreRoot, "rel", "10.0.0.2:4749", "/host/DROP")
+	if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse release_mismatch") {
+		t.Fatalf("info tampered rc=%d:\n%s", rc, strings.Join(*lines, "\n"))
 	}
 }
 
@@ -1502,9 +1783,12 @@ func TestFoldToRecordHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := headReleaseOps(logBytes, rec.Head)
+	signed, author, err := headReleaseOps(logBytes, rec.Head)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if author != strings.Repeat("ab", 32) {
+		t.Fatalf("head author %q, want the seeded publisher key", author)
 	}
 	if err := verifyRelease(srcV1, signed); err != nil {
 		t.Fatalf("v1 should verify at head: %v", err)
@@ -1516,7 +1800,7 @@ func TestFoldToRecordHead(t *testing.T) {
 	// A head absent from the log is stream_malformed; a nil head folds
 	// nothing (nothing is committed).
 	bogus := "0199de2d-dc00-7000-8000-00000000dead"
-	if _, err := headReleaseOps(logBytes, &bogus); err == nil {
+	if _, _, err := headReleaseOps(logBytes, &bogus); err == nil {
 		t.Fatal("head absent from log accepted")
 	} else {
 		re := err.(*RefuseError)
@@ -1524,7 +1808,7 @@ func TestFoldToRecordHead(t *testing.T) {
 			t.Fatalf("refusal %v", err)
 		}
 	}
-	if signed, err := headReleaseOps(logBytes, nil); err != nil || len(signed) != 0 {
+	if signed, _, err := headReleaseOps(logBytes, nil); err != nil || len(signed) != 0 {
 		t.Fatalf("nil head folded %d atoms, %v", len(signed), err)
 	}
 }
