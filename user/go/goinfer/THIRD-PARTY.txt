@@ -1,0 +1,28 @@
+GOINFER.ELF — third-party software notices
+==========================================
+
+The GOINFER.ELF guest binary links only the Go standard library (the
+VirelaiOS Go fork) and the in-repo virelai/* packages — no third-party
+Go modules.
+
+Model weights (optional runtime input, never in git or the boot image)
+----------------------------------------------------------------------
+
+When an operator stages a converted model on the share
+(/host/GOINFER/SMOLLM2.VIW), the file derives from:
+
+  Model:   HuggingFaceTB/SmolLM2-135M-Instruct
+  Source:  https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct
+  Licence: Apache License 2.0
+           https://www.apache.org/licenses/LICENSE-2.0
+
+  model.safetensors  sha256 5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c
+  tokenizer.json     sha256 9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c
+
+Both digests are pinned inside tools/goinfer/convert-smollm2.py — the
+converter refuses any other bytes. The staged VIW's own sha256 is pinned
+in tools/gate/specs/live-gpu3d.spec and re-verified by the guest app,
+which emits a per-run licence receipt carrying these fields. Deleting
+the staged file removes the model entirely (the card's clawback
+condition): no copy or reference lives in the image, the fleet, or the
+app beyond the optional default path.
