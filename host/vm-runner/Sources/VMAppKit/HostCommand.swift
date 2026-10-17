@@ -30,6 +30,10 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case sendFile = "send-file"
     // Debug menu — M114d/e register the remaining handlers.
     case inspector
+    // M114d (#2457): the drawer injector's verb — no menu item of its
+    // own; the drawer's Send button and `--host-cmd-after …:send-serial`
+    // dispatch it, writing `HostInspector.inputLine` to the console pipe.
+    case sendSerial = "send-serial"
     case screenshot
     case record
 }

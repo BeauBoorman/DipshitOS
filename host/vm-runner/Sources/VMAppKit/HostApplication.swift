@@ -22,8 +22,18 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public let commandBus = HostCommandBus()
     public let window: NSWindow
     public var onStop: (String, Int32) -> Void = { _, _ in }
+    /// M114d (#2457): the drawer model — owned by the runner, injected
+    /// here so the window's split pane, the bus verbs and the headless
+    /// `--host-cmd-after` mirror all act on the ONE instance.
+    public let inspector: HostInspector
     private let status = NSTextField(wrappingLabelWithString: "")
     private let content = NSView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
+    /// M114d: the collapsible split — the guest pane on top, the
+    /// inspector drawer below it, collapsed until the `inspector` verb
+    /// (⌥⌘I) or a postmortem opens it.
+    private let split = NSSplitView()
+    private let guestArea = NSView()
+    private lazy var drawer = HostInspectorView(model: inspector, bus: commandBus)
     private var guestView: NSView?
     /// M114b (#2455): the attached machine view, when it is one — the
     /// `capture-keys` verb toggles its `capturesSystemKeys`.
@@ -39,8 +49,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// the pill by it.
     public static let captureKeysToolbarItem = NSToolbarItem.Identifier("virelai.capture-keys")
 
-    public init(serialLog: String, presentWindow: Bool = true) {
+    public init(serialLog: String, inspector: HostInspector = HostInspector(), presentWindow: Bool = true) {
         self.serialLog = serialLog
+        self.inspector = inspector
         // M114b (#2455): the window is resizable + fullscreen-capable now;
         // the content is aspect-locked to the 16:9 guest scanout so host
         // scaling never distorts the framebuffer (the guest resolution
@@ -64,6 +75,20 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         window.delegate = self
         window.contentView = content
         window.acceptsMouseMovedEvents = true
+        // M114d (#2457): the split — guestArea (top) + drawer (bottom,
+        // collapsed). The drawer keeps its height across window resizes;
+        // the guest pane flexes, and the VZ view inside it letterboxes.
+        split.isVertical = false
+        split.dividerStyle = .thin
+        split.frame = content.bounds
+        split.autoresizingMask = [.width, .height]
+        split.addArrangedSubview(guestArea)
+        split.addArrangedSubview(drawer)
+        split.setHoldingPriority(.defaultLow, forSubviewAt: 0)
+        split.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
+        content.addSubview(split)
+        drawer.isHidden = !inspector.isOpen
+        inspector.onChange = { [weak self] in self?.syncInspector() }
         // M114b: the toolbar carries the capture-keys pill — a third
         // surface on the same verb (⌥⌘K / --host-capture-keys are the
         // other two); it dispatches through the bus like everything else.
@@ -83,24 +108,24 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         badgeLabel.textColor = .white
         badgeLabel.translatesAutoresizingMaskIntoConstraints = false
         captureBadge.addSubview(badgeLabel)
-        content.addSubview(captureBadge)
+        guestArea.addSubview(captureBadge)
         NSLayoutConstraint.activate([
             badgeLabel.leadingAnchor.constraint(equalTo: captureBadge.leadingAnchor, constant: 10),
             badgeLabel.trailingAnchor.constraint(equalTo: captureBadge.trailingAnchor, constant: -10),
             badgeLabel.topAnchor.constraint(equalTo: captureBadge.topAnchor, constant: 3),
             badgeLabel.bottomAnchor.constraint(equalTo: captureBadge.bottomAnchor, constant: -3),
-            captureBadge.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            captureBadge.topAnchor.constraint(equalTo: content.topAnchor, constant: 8),
+            captureBadge.centerXAnchor.constraint(equalTo: guestArea.centerXAnchor),
+            captureBadge.topAnchor.constraint(equalTo: guestArea.topAnchor, constant: 8),
         ])
         captureBadge.isHidden = true
         status.alignment = .center
         status.font = .systemFont(ofSize: 18)
         status.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(status)
+        guestArea.addSubview(status)
         NSLayoutConstraint.activate([
-            status.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            status.centerYAnchor.constraint(equalTo: content.centerYAnchor),
-            status.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, constant: -80)
+            status.centerXAnchor.constraint(equalTo: guestArea.centerXAnchor),
+            status.centerYAnchor.constraint(equalTo: guestArea.centerYAnchor),
+            status.widthAnchor.constraint(lessThanOrEqualTo: guestArea.widthAnchor, constant: -80)
         ])
         renderState()
         if presentWindow {
@@ -160,6 +185,42 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             self.refreshCaptureAffordance()
             return .performed
         })
+        // M114d (#2457): the inspector drawer toggle — the verb flips the
+        // model's isOpen and the split pane follows through syncInspector
+        // (a --host-cmd-after trigger lands the identical dispatch). The
+        // receipt carries the model's live state — open, tail depth, and
+        // whether the last injected line echoed back — the same detail
+        // the headless registration prints.
+        commandBus.register(.inspector, HostCommandBus.Registration(
+            itemState: { [weak self] in self?.inspector.isOpen ?? false },
+            receiptDetail: { [weak self] in self?.inspector.receiptDetail }
+        ) { [weak self] in
+            guard let self else { return .failed }
+            self.inspector.isOpen.toggle()
+            return .performed
+        })
+    }
+
+    /// The visible affordance of the drawer — the class-A seam tests
+    /// read instead of poking AppKit. `inspector.isOpen` is the model's
+    /// truth; the split pane mirrors it through syncInspector.
+    public var inspectorVisible: Bool { inspector.isOpen }
+
+    /// Model → pane: the drawer's hidden flag mirrors `isOpen`, and an
+    /// open gets a real share of the window (260pt, halved on a small
+    /// one). Called on every model change — ingest batches included —
+    /// so the tail, counters and postmortem card stay live.
+    private func syncInspector() {
+        let open = inspector.isOpen
+        if drawer.isHidden == open {
+            drawer.isHidden = !open
+            if open {
+                split.layoutSubtreeIfNeeded()
+                let h = split.bounds.height
+                split.setPosition(max(h - 260, h / 2), ofDividerAt: 0)
+            }
+        }
+        drawer.reload()
     }
 
     /// The badge + pill mirror the live `capturesSystemKeys` property —
@@ -211,9 +272,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         guestView = view
         captureTarget = view as? HostKeyCapturing
         refreshCaptureAffordance()
-        view.frame = content.bounds
+        view.frame = guestArea.bounds
         view.autoresizingMask = [.width, .height]
-        content.addSubview(view, positioned: .below, relativeTo: status)
+        guestArea.addSubview(view, positioned: .below, relativeTo: status)
         renderState()
     }
 
