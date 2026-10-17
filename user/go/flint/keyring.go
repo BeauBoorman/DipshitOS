@@ -14,9 +14,14 @@
 //
 // `#v1` is the only accepted header; blank lines and `#` comments are
 // skipped; every other row must match the grammar exactly. A `revoked=`
-// row invalidates the key for NEW Changes — installed content stays
-// (rollback is M101d). Public keys are data, not secrets: the file lives
-// on the share, never in the slot-70 lane (contrast `flint-remote`).
+// row invalidates the key for NEW Changes — and revocation is decided
+// at MATERIALIZATION too: `verify --all --trusted` (the install/update
+// gate) runs this same CheckAuthor, so a revoked publisher's already-
+// synced release refuses key_revoked at `store install`/`update`. What
+// revocation never touches is content ALREADY installed — a live app
+// and its retained .prev bytes stay (rollback is M101d). Public keys
+// are data, not secrets: the file lives on the share, never in the
+// slot-70 lane (contrast `flint-remote`).
 package main
 
 import (

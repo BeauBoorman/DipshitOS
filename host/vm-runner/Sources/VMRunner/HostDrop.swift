@@ -1,13 +1,15 @@
 import AppKit
+import Darwin
 import Foundation
 
 // MARK: - HostDrop — the M108c file-drop lane, host half (ADR 0051 D4)
 //
 // `--host-drop` arms the lane: the display view registers `.fileURL` and a
 // drag of files onto the VM window lands each one in <share>/INBOX/, then a
-// signed DROP record names it for the seat's toast. Delivery is a plain
-// FileManager copy — the runner already owns the share folder, so there is
-// no transport to bound beyond the per-gesture caps.
+// signed DROP record names it for the seat's toast. Delivery is an fd→fd
+// stream off an O_NOFOLLOW open — the runner already owns the share folder,
+// so there is no transport to bound beyond the per-gesture caps; the fd is
+// what keeps the kind check and the copy on the same inode.
 //
 // The rules (ADR 0051 D4):
 //   - ≤ 64 MiB per file (payload_too_large), ≤ 16 files per gesture —
@@ -70,12 +72,27 @@ final class HostDrop {
     }
 
     private func dropOne(_ url: URL) {
-        let vals = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard vals?.isRegularFile == true else {
+        // Open the source O_NOFOLLOW and fstat it: the kind/size check and
+        // the payload copy then act on the SAME inode — the check-then-copy
+        // window closes, and a final-component symlink (planted or swapped
+        // in) refuses ELOOP at open rather than copyItem preserving it as
+        // a link in the guest-visible INBOX.
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            HostInt.logRefuse(lane: "drop", reason: errno == ELOOP ? .unsupportedKind : .ioError)
+            return
+        }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            HostInt.logRefuse(lane: "drop", reason: .ioError)
+            return
+        }
+        guard st.st_mode & S_IFMT == S_IFREG else {
             HostInt.logRefuse(lane: "drop", reason: .unsupportedKind)
             return
         }
-        let size = Int64(vals?.fileSize ?? 0)
+        let size = Int64(st.st_size)
         guard size <= Self.fileMax else {
             HostInt.logRefuse(lane: "drop", reason: .payloadTooLarge)
             return
@@ -85,12 +102,22 @@ final class HostDrop {
             HostInt.logRefuse(lane: "drop", reason: .nameRejected)
             return
         }
-        // Publish the payload: copy to <name>~ then rename — the share's
-        // atomicity rule (the WriteFileSafe/HF3 pattern, host side).
+        // Publish the payload: copy fd→fd into <name>~ then rename — the
+        // share's atomicity rule (the WriteFileSafe/HF3 pattern, host
+        // side). O_EXCL on the temp means a guest-planted `<name>~` can
+        // only fail the drop, never redirect it.
         let tmp = inboxDir.appendingPathComponent(name + "~")
         let dst = inboxDir.appendingPathComponent(name)
+        let tfd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, st.st_mode & 0o777)
+        guard tfd >= 0, Self.copyFd(fd, to: tfd) else {
+            if tfd >= 0 { close(tfd) }
+            try? FileManager.default.removeItem(at: tmp)
+            HostInt.logRefuse(lane: "drop", reason: .ioError)
+            return
+        }
+        fsync(tfd)
+        close(tfd)
         do {
-            try FileManager.default.copyItem(at: url, to: tmp)
             try FileManager.default.moveItem(at: tmp, to: dst)
         } catch {
             try? FileManager.default.removeItem(at: tmp)
@@ -118,6 +145,33 @@ final class HostDrop {
         }
         dropSeq = seq
         FileHandle.standardOutput.write(Data("host-drop: file seq=\(seq) name=\(name) size=\(size)\n".utf8))
+    }
+
+    /// The payload copy itself: fd→fd through one bounce buffer. The
+    /// source is the O_NOFOLLOW-opened inode the kind/size check ran on,
+    /// so a path swap between check and copy cannot redirect it.
+    private static func copyFd(_ src: Int32, to dst: Int32) -> Bool {
+        var buf = [UInt8](repeating: 0, count: 256 * 1024)
+        return buf.withUnsafeMutableBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress else { return false }
+            while true {
+                let n = read(src, base, ptr.count)
+                if n == 0 { return true }
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                var done = 0
+                while done < n {
+                    let w = write(dst, base + done, n - done)
+                    if w < 0 {
+                        if errno == EINTR { continue }
+                        return false
+                    }
+                    done += w
+                }
+            }
+        }
     }
 
     /// The D4 name rule: fold every byte outside [A-Za-z0-9._-] to `_`,

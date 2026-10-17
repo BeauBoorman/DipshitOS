@@ -1,4 +1,8 @@
-# live-vlfs-crash.spec -- M100e (issue #2310, ADR 0050 D5) class-B
+# live-vlfs-crash.spec -- M100e/M100g (issues #2310/#2312, ADR 0050 D5)
+# class-B: the STANDING crash-resilience acceptance gate. The M100e
+# kill-mid-write proof at vgate_repeat 5 is the permanent record; M100g
+# raised the default from 3 so every invocation is itself K=5 consecutive
+# kill/remount cycles.
 #
 # gate: crash recovery on real VZ hardware. Three legs over data-disk
 # images built in setup; the kill is the runner's own vm.stop (a hard
@@ -20,10 +24,10 @@
 # FLUSH correctness under a host power cut (that is the class-A crash-state
 # enumerator in kernel/src/vlfs/write.zig tests).
 
-vgate_name live-vlfs-crash "M100e (#2310) class-B: kill-mid-write -> remount replay consistency"
+vgate_name live-vlfs-crash "M100e/g (#2310/#2312) class-B: STANDING crash-resilience gate — kill-mid-write -> remount replay consistency"
 vgate_fmt kernel/src/main.zig kernel/src/vlfs/*.zig build.zig
-vgate_repeat 3 BOOTS
-vgate_note "K consecutive full-spec runs green is the acceptance record (BOOTS overrides the default 3)"
+vgate_repeat 5 BOOTS
+vgate_note "K=5 consecutive full-spec runs green is the M100g acceptance record (BOOTS overrides the default 5)"
 
 # mkreplay.py: rebuild replay.img fresh — an empty 16 MiB golden volume
 # plus one committed, uncheckpointed journal txn that installs REPLAY.TXT

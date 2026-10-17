@@ -50,6 +50,14 @@ jobs:
         with:
           version: 0.17.0
 
+      - name: Setup Go 1.27
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27"
+          # The Go modules have no external dependencies; there is no
+          # go.sum to key a cache on.
+          cache: false
+
       # --- Class A: the whole portable set, via the recipe devs run -----
       # `just verify-portable` IS the class-A gate set (docs/testing.md):
       # formatting, unit tests, transcript mock test, guest/image builds,

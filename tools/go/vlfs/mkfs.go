@@ -38,13 +38,13 @@ func formatImage(img []byte, volumeID, mkfsTime uint64) error {
 	// Inode table: every slot carries a valid checksum (the format pins a
 	// trailing FNV-1a on every structure, free or not). Inode 1 is the
 	// empty root directory — kind 2, one extent covering a single zeroed
-	// data block.
-	itable := img[uint64(g.ItableFirst)*BlockLen : uint64(g.ItableFirst+g.ItableBlocks)*BlockLen]
+	// data block. Each slot is sliced out of its own itable block so a
+	// partial tail block can never spill writes into the data region.
 	for i := uint32(0); i < g.InodeCount; i++ {
-		slot := itable[uint64(i)*InodeBytes : uint64(i+1)*InodeBytes]
+		slot := block(img, g.ItableFirst+i/InodesPerBlock)[uint64(i%InodesPerBlock)*InodeBytes:][:InodeBytes]
 		binary.LittleEndian.PutUint32(slot[inCksum:], fnv1a(slot[:inCksum]))
 	}
-	root := itable[RootInode*InodeBytes : (RootInode+1)*InodeBytes]
+	root := block(img, g.ItableFirst)[RootInode*InodeBytes:][:InodeBytes]
 	for i := range root {
 		root[i] = 0
 	}

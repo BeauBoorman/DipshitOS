@@ -103,8 +103,11 @@ func TestBrowserConnectUsesExplicitFiveSecondBudget(t *testing.T) {
 	var portWord uintptr
 	prev := vi.SyscallHookForTest()
 	vi.SetSyscallHookForTest(func(slot, x0, x1, x2, x3 uintptr) int64 {
-		if slot == vi.SlotTCPConnect {
-			portWord = x1
+		// DialTimeout rides the slot-80 handle ABI: x0 is the op, and a
+		// connect carries ip in x1 and port|timeoutMs<<16 in x2.
+		if slot == vi.SlotSocket && x0 == vi.SockOpConnect {
+			portWord = x2
+			return 0x11 // a table handle
 		}
 		return prev(slot, x0, x1, x2, x3)
 	})

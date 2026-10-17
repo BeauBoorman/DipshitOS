@@ -28,7 +28,10 @@ const MarkerHostintDrop = "gotabwm: hostint drop "
 
 // dropPayload decodes the D4 notice payload [name_len u8][name][size
 // u64le]. ok=false is the caller's bad_record refusal — a length that does
-// not add up exactly is a malformed record, not a delivery.
+// not add up exactly is a malformed record, not a delivery. The name goes
+// verbatim into the serial marker line and the toast text, so it is
+// sanitized on decode (dropName): a raw control byte would split the
+// marker the class-B gate greps.
 func dropPayload(p []byte) (name string, size uint64, ok bool) {
 	if len(p) < 1+1+8 {
 		return "", 0, false
@@ -40,7 +43,22 @@ func dropPayload(p []byte) (name string, size uint64, ok bool) {
 	for i := 7; i >= 0; i-- {
 		size = size<<8 | uint64(p[1+n+i])
 	}
-	return string(p[1 : 1+n]), size, true
+	return dropName(p[1 : 1+n]), size, true
+}
+
+// dropName renders the payload's raw name bytes marker-safe: control bytes
+// (<0x20, DEL) become '?' — a newline in a host-dropped filename would
+// otherwise split the serial marker line. Bytes ≥ 0x80 pass through: the
+// name may be UTF-8 and the sender is the trusted runner.
+func dropName(raw []byte) string {
+	b := make([]byte, len(raw))
+	for i, c := range raw {
+		if c < 0x20 || c == 0x7f {
+			c = '?'
+		}
+		b[i] = c
+	}
+	return string(b)
 }
 
 // hostdropApply is the engine's Consume hook for TagDrop — verified

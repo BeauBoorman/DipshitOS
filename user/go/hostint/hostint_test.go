@@ -16,12 +16,16 @@ var testKey = []byte(strings.Repeat("a5", 32))
 type fakeDir struct {
 	files    map[string][]byte
 	absent   bool
+	listErr  bool // a real channel failure — (nil, false), not the absent case
 	logs     []string
 	consumed []Record
 	consumedReasons []string
 }
 
 func (d *fakeDir) list() ([]vi.DirItem, bool) {
+	if d.listErr {
+		return nil, false
+	}
 	if d.absent {
 		return nil, true
 	}
@@ -144,6 +148,23 @@ func TestDecodeRefusals(t *testing.T) {
 		if _, ok := DecodeRecord(raw); ok {
 			t.Fatalf("%s: decoded a malformed record", name)
 		}
+	}
+}
+
+// Flag bits 1-7 are reserved (the writer sends 0): the encoder refuses
+// them outright and the decoder names a wire record carrying one a
+// bad_record — one grammar on both ends of the channel.
+func TestRecordFlagsReservedRefused(t *testing.T) {
+	if EncodeRecord(testKey, TagClipIn, 0x02, 1, 9, []byte("x")) != nil {
+		t.Fatal("encode with a reserved flag bit must refuse")
+	}
+	raw := EncodeRecord(testKey, TagClipIn, FlagTruncated, 1, 9, []byte("x"))
+	if raw == nil {
+		t.Fatal("FlagTruncated is the one legal flag")
+	}
+	raw[5] |= 0x02
+	if _, ok := DecodeRecord(raw); ok {
+		t.Fatal("a reserved flag bit must decode as bad_record")
 	}
 }
 
@@ -322,6 +343,22 @@ func TestEngineEmitAndBackpressure(t *testing.T) {
 	}
 	if _, r := e.Emit(TagClipOut, 0, []byte("x")); r != RefuseBackpressure {
 		t.Fatalf("fifth emit refused %q want backpressured", r)
+	}
+}
+
+// A real dir-list failure is an io_error refusal, and the marker names a
+// lane — never the empty `lane=` a bare tag-0 used to render.
+func TestEngineDirListErrorNamesDirlist(t *testing.T) {
+	d := &fakeDir{files: map[string][]byte{}, listErr: true}
+	e := d.engine()
+	e.Poll()
+	if !d.hasLog("refuse lane=dirlist reason=io_error") {
+		t.Fatalf("missing named dir-list refusal; logs=%v", d.logs)
+	}
+	// The refusal is latched: a still-broken channel does not re-log.
+	e.Poll()
+	if len(d.logs) != 1 {
+		t.Fatalf("io_error must latch, logs=%v", d.logs)
 	}
 }
 

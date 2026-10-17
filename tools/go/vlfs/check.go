@@ -7,6 +7,10 @@ import (
 	"sort"
 )
 
+// bitsPerMapBlock is the number of volume-block bits one bbitmap block
+// carries — the kernel's write.zig `bits_per_map_block`.
+const bitsPerMapBlock = 8 * BlockLen
+
 // finding is one check result: code is a named ADR 0050 refusal; info marks
 // the informational reports (journal_torn, journal_unreplayed) that describe
 // expected post-kill state rather than corruption.
@@ -127,7 +131,8 @@ func (s *superblock) checkGeometry() error {
 	if bb := (s.volumeBlocks + 8*BlockLen - 1) / (8 * BlockLen); s.bbitmapFirst != s.ibitmapFirst+1 || s.bbitmapBlocks != bb {
 		return bad("bbitmap placement")
 	}
-	if s.itableFirst != s.bbitmapFirst+s.bbitmapBlocks || s.itableBlocks != s.inodeCount/InodesPerBlock {
+	if s.itableFirst != s.bbitmapFirst+s.bbitmapBlocks ||
+		s.itableBlocks != (s.inodeCount+InodesPerBlock-1)/InodesPerBlock {
 		return bad("itable placement")
 	}
 	if s.dataFirst != s.itableFirst+s.itableBlocks || s.dataFirst+s.dataBlocks != s.volumeBlocks {
@@ -355,7 +360,6 @@ scan:
 	// Inode table: checksums and kind values on every slot, against the
 	// as-replayed inode bitmap.
 	ibitmap := c.read(c.g.IbitmapFirst)
-	bbitmap := c.read(c.g.BbitmapFirst)
 	c.inodes = make([][]byte, c.g.InodeCount)
 	c.ibUsed = make([]bool, c.g.InodeCount)
 	for i := uint32(0); i < c.g.InodeCount; i++ {
@@ -399,8 +403,17 @@ scan:
 
 	// bbitmap: structural blocks marked; every data-region bit must be
 	// explained by exactly one reference (leaks and unmarked use both fail).
+	// The map spans BbitmapBlocks blocks, one bit per volume block; index
+	// it like the kernel's map_idx and cache the covering block so the
+	// scan re-reads it once per bitsPerMapBlock bits, not once per bit.
+	var bbitmap []byte
+	bbIdx := ^uint32(0)
 	for b := uint32(0); b < c.g.VolumeBlocks; b++ {
-		marked := bitmapGet(bbitmap, b)
+		if idx := b / bitsPerMapBlock; idx != bbIdx {
+			bbIdx = idx
+			bbitmap = c.read(c.g.BbitmapFirst + idx)
+		}
+		marked := bitmapGet(bbitmap, b%bitsPerMapBlock)
 		owner, used := c.referenced[b]
 		switch {
 		case b < c.g.DataFirst:

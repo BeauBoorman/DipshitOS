@@ -87,26 +87,43 @@ func hostclipPoll() {
 	if hostClipSeen && h == hostClipHash && n == hostClipLen {
 		return
 	}
-	wasSeen := hostClipSeen
-	hostClipSeen, hostClipHash, hostClipLen = true, h, n
-	if !wasSeen && n == 0 {
+	if !hostClipSeen && n == 0 {
 		// An empty buffer at first observation is the baseline, not a
 		// clear — arming must not push an empty pasteboard item.
+		hostClipSeen, hostClipHash, hostClipLen = true, h, n
 		return
 	}
 	if !utf8.Valid(cur) {
+		// Non-text can never cross the lane, so the refusal consumes the
+		// change: commit the seen-state and name it once — retrying
+		// would re-log the refusal every tick.
+		hostClipSeen, hostClipHash, hostClipLen = true, h, n
 		eng.RefuseLane(hostint.TagClipOut, hostint.RefuseNotText)
 		return
 	}
 	seq, refusal := eng.Emit(hostint.TagClipOut, 0, cur)
-	if refusal != "" {
+	switch refusal {
+	case "":
+		// The seen-state commits only on a published record: a refused
+		// emit leaves the diff live so the change retries next tick.
+		hostClipSeen, hostClipHash, hostClipLen = true, h, n
+		markClipSource(false)
+		sum := shlib.SHA256Sum(cur)
+		hostintLog(MarkerHostintClipOut + "seq=" + vi.Itoa64(int64(seq)) +
+			" len=" + vi.Itoa64(int64(n)) + " sha=" + hostint.HexDigest8(sum[:]))
+	case hostint.RefuseBackpressure:
+		// The runner holds MaxOutstanding of ours unconsumed — stay
+		// silent and hold the seen-state: the diff fires again next tick
+		// (the 250 ms drain paces us), and a marker here would repeat
+		// every tick for the whole stall.
+	default:
+		// A hard refusal (lane_disabled on a re-ARMED mask change, an
+		// io_error, too_large) consumes the change: commit the
+		// seen-state so it is named once — retrying would loop the
+		// marker on a posture that cannot carry it.
+		hostClipSeen, hostClipHash, hostClipLen = true, h, n
 		eng.RefuseLane(hostint.TagClipOut, refusal)
-		return
 	}
-	markClipSource(false)
-	sum := shlib.SHA256Sum(cur)
-	hostintLog(MarkerHostintClipOut + "seq=" + vi.Itoa64(int64(seq)) +
-		" len=" + vi.Itoa64(int64(n)) + " sha=" + hostint.HexDigest8(sum[:]))
 }
 
 // hostclipApply is the CLIP_IN tenant of hostintConsume — the engine's

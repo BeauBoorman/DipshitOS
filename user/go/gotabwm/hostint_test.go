@@ -127,6 +127,15 @@ func (f *hostintFixture) clipOutPayloads() [][]byte {
 	return out
 }
 
+// drainClipOut simulates the runner's consume: delete every CLIPOUT-* file.
+func (f *hostintFixture) drainClipOut() {
+	for name := range f.files {
+		if strings.HasPrefix(name, "CLIPOUT-") {
+			delete(f.files, name)
+		}
+	}
+}
+
 func TestHostintSeatInitAbsentCredentialIsSilent(t *testing.T) {
 	f := newHostintFixture(t, "")
 	f.key = nil
@@ -206,6 +215,51 @@ func TestHostintClipInBadMACRefused(t *testing.T) {
 	}
 	if !f.hasLog("reason=bad_mac") {
 		t.Fatalf("missing bad_mac refusal: %v", f.logs)
+	}
+}
+
+func TestHostintClipOutBackpressuredRetries(t *testing.T) {
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(9, hostint.LaneClip)
+	hostintSeatTick()
+
+	// Fill the runner-visible window: four emitted, none consumed.
+	for i, text := range []string{"c1", "c2", "c3", "c4"} {
+		f.clip = []byte(text)
+		hostintSeatTick()
+		if n := len(f.clipOutPayloads()); n != i+1 {
+			t.Fatalf("tick %d: %d CLIP_OUT records", i, n)
+		}
+	}
+	// A fifth change diffs but cannot emit while four are outstanding:
+	// silent — no refuse marker — and the seen-state stays uncommitted
+	// so the change retries next tick rather than dropping for good.
+	f.clip = []byte("held")
+	hostintSeatTick()
+	if n := len(f.clipOutPayloads()); n != hostint.MaxOutstanding {
+		t.Fatalf("emitted past the bound: %d", n)
+	}
+	if f.hasLog("refuse lane=clip") {
+		t.Fatalf("backpressure logged a refuse marker: %v", f.logs)
+	}
+	// The runner drains; the held change emits next tick with the next
+	// seq — without the retry the host pasteboard would have diverged
+	// until the next guest-side write.
+	f.drainClipOut()
+	hostintSeatTick()
+	outs := f.clipOutPayloads()
+	if len(outs) != 1 || string(outs[0]) != "held" {
+		t.Fatalf("resumed emit: %v", outs)
+	}
+	if !f.hasLog(MarkerHostintClipOut + "seq=5 len=4") {
+		t.Fatalf("missing resumed clip-out marker: %v", f.logs)
+	}
+	// The retried emit committed the seen-state: one more tick emits
+	// nothing for the same buffer.
+	hostintSeatTick()
+	if n := len(f.clipOutPayloads()); n != 1 {
+		t.Fatalf("re-emitted a committed change: %d records", n)
 	}
 }
 

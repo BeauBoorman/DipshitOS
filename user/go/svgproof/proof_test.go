@@ -45,6 +45,10 @@ func TestCorpusAndNoAllocations(t *testing.T) {
 func TestExclusionsBoundariesAnd100CycleReuse(t *testing.T) {
 	base := "../../../artifacts/m90-acceptance/negatives"
 	data, err := os.ReadFile(filepath.Join(base, "negative.tsv"))
+	if os.IsNotExist(err) {
+		t.Skip("artifacts/m90-acceptance/negatives is not materialized; " +
+			"run `bash tools/svg-proof/build.sh` (needs the provisioned Go fork; tools/svg-proof/README.md)")
+	}
 	if err != nil {
 		t.Fatal("negative corpus must be materialized first", err)
 	}

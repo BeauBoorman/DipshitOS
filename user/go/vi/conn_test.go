@@ -85,18 +85,18 @@ func (f *connFake) sock(op int, a1, a2, a3 uintptr) int64 {
 	f.opLog = append(f.opLog, op)
 	h64 := uint64(a1)
 	switch op {
-	case sockOpListen:
+	case SockOpListen:
 		if f.listenErr != 0 {
 			return f.listenErr
 		}
 		return int64(f.mintListener())
-	case sockOpConnect:
+	case SockOpConnect:
 		f.op10Calls++
 		if f.connectErr != 0 {
 			return f.connectErr
 		}
 		return int64(f.mint(1))
-	case sockOpAccept:
+	case SockOpAccept:
 		s := f.socks[h64]
 		if s == nil || len(s.pending) == 0 {
 			return -ErrEAGAIN
@@ -105,7 +105,7 @@ func (f *connFake) sock(op int, a1, a2, a3 uintptr) int64 {
 		s.pending = s.pending[1:]
 		f.socks[h].accepted = true
 		return int64(h)
-	case sockOpReady:
+	case SockOpReady:
 		f.readyCalls++
 		if f.readyScript != nil {
 			return f.readyScript(h64, f.readyCalls)
@@ -128,7 +128,7 @@ func (f *connFake) sock(op int, a1, a2, a3 uintptr) int64 {
 			mask |= readyWrite
 		}
 		return mask
-	case sockOpRead:
+	case SockOpRead:
 		s := f.socks[h64]
 		if s == nil || s.closed {
 			return -errSockClosed
@@ -142,7 +142,7 @@ func (f *connFake) sock(op int, a1, a2, a3 uintptr) int64 {
 			return rc
 		}
 		return 0
-	case sockOpSend:
+	case SockOpSend:
 		s := f.socks[h64]
 		if s == nil || s.closed {
 			return -errSockClosed
@@ -160,20 +160,20 @@ func (f *connFake) sock(op int, a1, a2, a3 uintptr) int64 {
 			return f.sockSendRC
 		}
 		return int64(a3)
-	case sockOpClose:
+	case SockOpClose:
 		if s := f.socks[h64]; s != nil {
 			s.closed = true
 		}
 		f.closeCalls++
 		return 0
-	case sockOpShutdown:
+	case SockOpShutdown:
 		if s := f.socks[h64]; s != nil {
 			s.shutdown = true
 		}
 		return 0
-	case sockOpPeer:
+	case SockOpPeer:
 		return int64(0x0a000002<<16 | 8080)
-	case sockOpTable:
+	case SockOpTable:
 		for i, row := range f.op12Rows {
 			var b [24]byte
 			for j := 0; j < 8; j++ {
@@ -313,7 +313,7 @@ func TestDial_TimeoutRefusalIsClean(t *testing.T) {
 	if c, err := DialTimeout("10.0.0.2", 8081, 5*time.Second); c != nil || !errors.Is(err, errno(ErrETIMEDOUT)) {
 		t.Fatalf("timeout = %v, %v", c, err)
 	}
-	if f.opsCalled(sockOpClose) != 0 {
+	if f.opsCalled(SockOpClose) != 0 {
 		t.Fatal("a refused connect owed a close — the kernel already released it")
 	}
 	f.connectErr = 0
@@ -473,7 +473,7 @@ func TestListen_StillTheLegacyPath(t *testing.T) {
 		t.Fatalf("connect = %d calls to %08x:%d, want 1 call to 0:2222",
 			f.connectCalls, f.connectIP, f.connectPort)
 	}
-	if f.op10Calls != 0 || f.opsCalled(sockOpListen) != 0 {
+	if f.op10Calls != 0 || f.opsCalled(SockOpListen) != 0 {
 		t.Fatal("vi.Listen took the handle path")
 	}
 	if !c.listening || c.Handle() != 0 {
@@ -503,8 +503,8 @@ func TestSocketListen_MintsAHandle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SocketListen: %v", err)
 	}
-	if f.opsCalled(sockOpListen) != 1 {
-		t.Fatalf("op-0 calls = %d, want 1", f.opsCalled(sockOpListen))
+	if f.opsCalled(SockOpListen) != 1 {
+		t.Fatalf("op-0 calls = %d, want 1", f.opsCalled(SockOpListen))
 	}
 	if ln.Handle() == 0 || !ln.listening {
 		t.Fatal("SocketListen must return a handle listener")
@@ -512,9 +512,9 @@ func TestSocketListen_MintsAHandle(t *testing.T) {
 	if err := ln.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if f.opsCalled(sockOpClose) != 1 || f.opsCalled(sockOpShutdown) != 0 {
+	if f.opsCalled(SockOpClose) != 1 || f.opsCalled(SockOpShutdown) != 0 {
 		t.Fatalf("listener close = %d close / %d shutdown, want 1 / 0",
-			f.opsCalled(sockOpClose), f.opsCalled(sockOpShutdown))
+			f.opsCalled(SockOpClose), f.opsCalled(SockOpShutdown))
 	}
 }
 
@@ -631,8 +631,8 @@ func TestSend_ChunksByConfirmedCounts(t *testing.T) {
 			t.Fatalf("sent byte %d = %d", i, f.sentBytes[i])
 		}
 	}
-	if f.opsCalled(sockOpSend) != 3 {
-		t.Fatalf("op-3 sends = %d, want 3", f.opsCalled(sockOpSend))
+	if f.opsCalled(SockOpSend) != 3 {
+		t.Fatalf("op-3 sends = %d, want 3", f.opsCalled(SockOpSend))
 	}
 }
 
@@ -644,7 +644,7 @@ func TestSend_ParksOnWouldBlock(t *testing.T) {
 	calls := 0
 	f.sockSendErr = map[uint64]int64{}
 	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
-		if num == SlotSocket && int(a0) == sockOpSend {
+		if num == SlotSocket && int(a0) == SockOpSend {
 			calls++
 			if calls == 1 {
 				return -ErrEAGAIN
@@ -672,8 +672,8 @@ func TestRecv_DeliversQueuedBytes(t *testing.T) {
 	if err != nil || n != 11 || string(buf[:n]) != "hello world" {
 		t.Fatalf("Recv = %d, %v, %q want 11, nil, hello world", n, err, buf[:n])
 	}
-	if f.opsCalled(sockOpRead) != 1 || f.opsCalled(sockOpReady) != 1 {
-		t.Fatalf("recv = %d read / %d ready ops", f.opsCalled(sockOpRead), f.opsCalled(sockOpReady))
+	if f.opsCalled(SockOpRead) != 1 || f.opsCalled(SockOpReady) != 1 {
+		t.Fatalf("recv = %d read / %d ready ops", f.opsCalled(SockOpRead), f.opsCalled(SockOpReady))
 	}
 }
 
@@ -782,9 +782,9 @@ func TestClose_ReleasesTheHandle(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if f.opsCalled(sockOpShutdown) != 1 || f.opsCalled(sockOpClose) != 1 {
+	if f.opsCalled(SockOpShutdown) != 1 || f.opsCalled(SockOpClose) != 1 {
 		t.Fatalf("close = %d shutdown / %d release, want 1/1",
-			f.opsCalled(sockOpShutdown), f.opsCalled(sockOpClose))
+			f.opsCalled(SockOpShutdown), f.opsCalled(SockOpClose))
 	}
 	if !f.socks[c.Handle()].shutdown || !f.socks[c.Handle()].closed {
 		t.Fatal("the kernel did not see FIN-then-release")
@@ -792,7 +792,7 @@ func TestClose_ReleasesTheHandle(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("double Close = %v, want nil", err)
 	}
-	if f.opsCalled(sockOpClose) != 1 {
+	if f.opsCalled(SockOpClose) != 1 {
 		t.Fatal("the second Close must be a no-op")
 	}
 	if _, err := c.Recv(make([]byte, 8)); !errors.Is(err, ErrConnClosed) {
@@ -809,7 +809,7 @@ func TestRecv_EmptyBufferIsNoop(t *testing.T) {
 	if n, err := c.Recv(nil); n != 0 || err != nil {
 		t.Fatalf("Recv(nil) = %d, %v want 0, nil", n, err)
 	}
-	if f.recvCalls != 0 || f.opsCalled(sockOpRead) != 0 {
+	if f.recvCalls != 0 || f.opsCalled(SockOpRead) != 0 {
 		t.Fatal("an empty recv must not touch the kernel")
 	}
 }
@@ -831,8 +831,8 @@ func TestSocketTable_ParsesRows(t *testing.T) {
 	if rows[1].Kind != 1 || rows[1].State != 1 || rows[1].RemotePort != 12345 || rows[1].RemoteIP != [4]byte{10, 0, 0, 2} {
 		t.Fatalf("conn row = %+v", rows[1])
 	}
-	if f.opsCalled(sockOpTable) != 1 {
-		t.Fatalf("op-12 calls = %d, want 1", f.opsCalled(sockOpTable))
+	if f.opsCalled(SockOpTable) != 1 {
+		t.Fatalf("op-12 calls = %d, want 1", f.opsCalled(SockOpTable))
 	}
 }
 

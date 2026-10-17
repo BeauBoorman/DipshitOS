@@ -70,6 +70,10 @@ public enum DataDisk {
             try handle.truncate(atOffset: createBytes)
             try handle.close()
         } catch {
+            // A failed create must not leave the 0-byte file behind — the
+            // next launch would refuse it by name as badImageSize(0)
+            // where the intent was a fresh image.
+            try? fm.removeItem(atPath: url.path)
             throw PrepareError.couldNotSize("\(error)")
         }
         return Prepared(url: url, sectors: createBytes / 512, created: true)
