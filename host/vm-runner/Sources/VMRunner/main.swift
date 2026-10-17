@@ -106,6 +106,12 @@
 //          one `host-ui: cmd=<verb> state=<...>` receipt on stdout.
 //          Requires --script or --host-session, where the marker scan
 //          runs.)
+//         [--host-capture-keys] (M114b #2455, index #2447: arm the machine
+//          view's capturesSystemKeys at startup by dispatching the
+//          capture-keys verb on the HostCommand bus once the
+//          VZVirtualMachineView exists — the same host-ui: receipt as
+//          ⌥⌘K / the toolbar pill / a --host-cmd-after trigger. Requires
+//          a view: --screen/--display/--host-session.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -649,6 +655,11 @@ var hostNotify: HostNotify?
 // is the testable seam). Repeatable; each armed trigger fires once on
 // its serial marker and the dispatch emits one `host-ui:` receipt.
 var hostCmdTriggers: [HostCommandTrigger] = []
+// M114b (#2455): `--host-capture-keys` arms the machine view's
+// capturesSystemKeys at startup — by dispatching the capture-keys verb
+// on the bus once setupDisplayWindow has built the view, so the receipt
+// is identical to ⌥⌘K / the toolbar pill / a --host-cmd-after trigger.
+var hostCaptureKeys = false
 // The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
 // ARMED record naming every live lane — the seat adopts (epoch, mask), so
 // per-lane epochs would refuse each other stale_epoch forever.
@@ -1366,6 +1377,9 @@ while idx < arguments.count {
     } else if arg == "--host-drop-after", idx + 1 < arguments.count {
         hostDropAfter = arguments[idx + 1]
         idx += 2
+    } else if arg == "--host-capture-keys" {
+        hostCaptureKeys = true
+        idx += 1
     } else if arg == "--host-cmd-after", idx + 1 < arguments.count {
         // M114a: <marker>:<verb> — the verb is the suffix after the LAST
         // colon (serial markers may carry their own). An unknown verb is
@@ -1784,6 +1798,11 @@ let scriptMode = scriptPath != nil
 // polls; refuse silently-never-firing modes up front.
 if !hostCmdTriggers.isEmpty, !scriptMode, !hostSessionMode {
     fail("--host-cmd-after requires --script or --host-session (the serial-marker scan runs on the scripted and session polls).")
+}
+// M114b: --host-capture-keys needs a VZVirtualMachineView to capture keys
+// into (--host-session implies --display by its own validation).
+if hostCaptureKeys, screenshotPath == nil, !displayMode {
+    fail("--host-capture-keys requires --screen/--display or --host-session (there is no VZVirtualMachineView to capture keys into).")
 }
 
 // ---------------------------------------------------------------------------
@@ -3098,6 +3117,32 @@ if screenshotPath != nil || displayMode {
         return FileManager.default.fileExists(atPath: path) ? .performed : .failed
     })
 }
+// M114b (#2455): the headless viewport verbs — the same two the session
+// window registers on its own bus instance in HostApplication, here bound
+// to the scripted run's evidence window + machine view so --host-cmd-after
+// exercises the identical seam. (In --host-session HostApplication's own
+// registrations stand; the runner never overwrites them.)
+if !hostSessionMode, screenshotPath != nil || displayMode {
+    commandBus.register(.fullscreen, HostCommandBus.Registration(
+        isEnabled: { machineWindow?.isVisible ?? false },
+        itemState: { machineWindow?.styleMask.contains(.fullScreen) ?? false }
+    ) {
+        machineWindow?.toggleFullScreen(nil)
+        return .performed
+    })
+    commandBus.register(.captureKeys, HostCommandBus.Registration(
+        isEnabled: { machineView != nil },
+        itemState: { machineView?.capturesSystemKeys ?? false },
+        receiptDetail: {
+            guard let view = machineView else { return nil }
+            return "capture=\(view.capturesSystemKeys ? "on" : "off")"
+        }
+    ) {
+        guard let view = machineView else { return .failed }
+        view.capturesSystemKeys.toggle()
+        return .performed
+    })
+}
 if !hostSessionMode {
     let headlessStop = HostCommandBus.Registration(isEnabled: { runner.vm.state == .running }) {
         runner.queue.async { runner.vm.stop { _ in } }
@@ -3172,6 +3217,9 @@ if consoleMode {
 }
 for t in hostCmdTriggers {
     print("  host-cmd-after: \"\(t.marker)\" → \(t.command.rawValue)  (M114a #2454: HostCommand bus mirror — dispatch emits a host-ui: receipt)")
+}
+if hostCaptureKeys {
+    print("  host-capture-keys: ENABLED (M114b #2455) — capture-keys dispatches on the HostCommand bus once the machine view exists; the host-ui: receipt is the same one ⌥⌘K / the toolbar pill emit")
 }
 if let netCapturePath {
     print("  net: ENABLED (milestone five card N1, claim 1373) — virtio-net device attached, guest TX frames captured byte-exactly to \(netCapturePath), fixed MAC 02:00:00:00:00:01")
@@ -3422,7 +3470,11 @@ func setupDisplayWindow() {
     } else {
         app.setActivationPolicy(.accessory)
     }
-    let window = hostApplication?.window ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled], backing: .buffered, defer: false)
+    // M114b: the evidence window gets the same resizable + 16:9-locked
+    // chrome as the session window, so the fullscreen/capture-keys verbs
+    // performed on it are real, not just receipted.
+    let window = hostApplication?.window ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+    window.contentAspectRatio = NSSize(width: 16, height: 9)
     let view = TraceView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
     view.trace = ["direct", "diag", "pid", "drag", "warp", "cg"].contains(pointerRoute)
     view.nativeInput = nativeInput
@@ -3485,6 +3537,12 @@ func setupDisplayWindow() {
     }
     machineView = view
     machineWindow = window
+    // M114b (#2455): --host-capture-keys rides the bus — one dispatch once
+    // the view exists, so startup capture lands in the same host-ui:
+    // receipt as ⌥⌘K / the toolbar pill / a --host-cmd-after trigger.
+    if hostCaptureKeys, machineView?.capturesSystemKeys == false {
+        commandBus.dispatch(.captureKeys)
+    }
 }
 
 // Milestone six card G1 (claim 6053): the 5/10/15 s screenshot capture,
@@ -5094,6 +5152,13 @@ final class TraceView: VZVirtualMachineView {
         return true
     }
 }
+
+// M114b (#2455): the session window's capture-keys verb toggles the view
+// through the HostKeyCapturing seam — VMAppKit stays Virtualization-free,
+// so the retroactive conformance lives here where Virtualization is
+// already imported. `capturesSystemKeys` is inherited from
+// VZVirtualMachineView and satisfies the protocol as-is.
+extension TraceView: HostKeyCapturing {}
 
 func pmo(_ s: String) {
     FileHandle.standardOutput.write(Data("PTR-TRACE: \(s)\n".utf8))

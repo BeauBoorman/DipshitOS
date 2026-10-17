@@ -84,13 +84,22 @@ public final class HostCommandBus: NSObject {
         /// Toggle items (the M114c lane switches) read their checkmark
         /// state here during menu validation.
         public var itemState: () -> Bool
+        /// M114b (#2455): toggle verbs append their post-action state to
+        /// the receipt (`state=performed capture=on`) so a gate asserting
+        /// the receipt reads the real property, not just that the action
+        /// ran. Read after every dispatch that found a registration —
+        /// including `disabled`/`failed`, where the live state is still
+        /// honest evidence. nil registration → nil detail → no suffix.
+        public var receiptDetail: () -> String?
         public var action: () -> Outcome
 
         public init(isEnabled: @escaping () -> Bool = { true },
                     itemState: @escaping () -> Bool = { false },
+                    receiptDetail: @escaping () -> String? = { nil },
                     action: @escaping () -> Outcome) {
             self.isEnabled = isEnabled
             self.itemState = itemState
+            self.receiptDetail = receiptDetail
             self.action = action
         }
     }
@@ -123,12 +132,14 @@ public final class HostCommandBus: NSObject {
     @discardableResult
     public func dispatch(_ command: HostCommand) -> Outcome {
         let outcome: Outcome
+        var detail: String?
         if let registration = registrations[command] {
             outcome = registration.isEnabled() ? registration.action() : .disabled
+            detail = registration.receiptDetail()
         } else {
             outcome = .unavailable
         }
-        emit("host-ui: cmd=\(command.rawValue) state=\(outcome.rawValue)")
+        emit("host-ui: cmd=\(command.rawValue) state=\(outcome.rawValue)\(detail.map { " \($0)" } ?? "")")
         return outcome
     }
 

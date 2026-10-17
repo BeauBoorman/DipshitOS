@@ -73,6 +73,44 @@ final class HostCommandTests: XCTestCase {
         ])
     }
 
+    func testReceiptDetailAppendsThePostActionState() {
+        let sink = Sink()
+        let bus = makeBus(sink)
+        var on = false
+        bus.register(.captureKeys, HostCommandBus.Registration(
+            itemState: { on },
+            receiptDetail: { "capture=\(on ? "on" : "off")" }
+        ) {
+            on.toggle()
+            return .performed
+        })
+        // M114b: a toggle's receipt carries the property it toggled, so a
+        // gate asserting the receipt reads the real post-action state.
+        XCTAssertEqual(bus.dispatch(.captureKeys), .performed)
+        XCTAssertEqual(bus.dispatch(.captureKeys), .performed)
+        XCTAssertEqual(sink.lines, [
+            "host-ui: cmd=capture-keys state=performed capture=on",
+            "host-ui: cmd=capture-keys state=performed capture=off",
+        ])
+    }
+
+    func testReceiptDetailOnADisabledVerbStillReportsLiveState() {
+        let sink = Sink()
+        let bus = makeBus(sink)
+        bus.register(.captureKeys, HostCommandBus.Registration(
+            isEnabled: { false },
+            receiptDetail: { "capture=off" }
+        ) { .performed })
+        XCTAssertEqual(bus.dispatch(.captureKeys), .disabled)
+        XCTAssertEqual(sink.lines, ["host-ui: cmd=capture-keys state=disabled capture=off"])
+        // Unregistered stays detail-free.
+        XCTAssertEqual(bus.dispatch(.laneNotify), .unavailable)
+        XCTAssertEqual(sink.lines, [
+            "host-ui: cmd=capture-keys state=disabled capture=off",
+            "host-ui: cmd=lane-notify state=unavailable",
+        ])
+    }
+
     func testActionCanReportFailure() {
         let sink = Sink()
         let bus = makeBus(sink)
