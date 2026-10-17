@@ -1016,3 +1016,93 @@ buffer charge refused it as `staging_too_large`). `zig fmt --check` clean, `just
 verify-portable` exit 0
 including `verify-bss-budget` (.bss 12,020,408 B / 13,631,488 B). Targeted class-B
 regressions for the changed exec seam: `live-el0-exec` 1/1, `live-exec` 1/1.
+
+## Amendment 11 — M119d (#2488): the third-child death, measured by shape — a bound, not a death
+
+Amendment 8 left the debt named but uncharacterised: "a third sequential exec
+from one EL0 parent died once and has not died again; the wall is
+uncharacterised, not eliminated." This amendment is the characterisation the
+debt owed: a spawn-shape matrix over one EL0 parent — sequential depth,
+concurrent breadth, tree depth, and the exact failing shape — pinned as
+permanent legs of the `live-exec` gate (runs 02-04), K=5.
+
+The driver is the same `tools/go/selfhost.go` amendment 8 measured with, plus
+two additions the matrix needed: `--spawn-par` (every child spawned before any
+wait, so the pool holds them all live at once — the breadth leg) and `--`
+(everything after it is the spawned child's own argv — a GOSELFHOST child
+carrying `--spawn` is the tree-depth leg). Verdict lines name the image
+(`verdict=K-of-M-survived IMAGE`) so each leg's end is a unique serial marker.
+
+### The matrix, observed (VZ, this branch)
+
+| shape | leg | children of the one EL0 parent | observed |
+| --- | --- | --- | --- |
+| sequential depth-5 | 02A | 5 x Zig STATUS43.BIN (exits 43) | 5-of-5 |
+| sequential depth-5 | 02B | 5 x Go GOHELLO.ELF | 5-of-5 |
+| tree depth-3 | 02C | GOSELFHOST -> `--spawn STATUS43.BIN 2` | parent 1-of-1, nested 2-of-2 |
+| concurrent breadth-8 | 03A | 8 x Zig | 8-of-8 |
+| concurrent breadth-12 | 03B | 12 x Zig | **9-of-12, three `SPAWN-FAIL err=ENOSPC`** |
+| concurrent breadth-3 | 03C | 3 x Go GOHELLO.ELF | 0..2-of-3, dead children exit status=2 (`newosproc`) |
+| amendment-8 exact shape | 04A | cmd/compile, cmd/link, then HELLO2.ELF | status=0, 5/5 — **the tombstone shape survives** |
+| heavy pair + depth | 04B | compile, link, then 3 x Go | 3-of-3, 5/5 (in an earlier assert revision one pass saw `link ... status=2` under backlog) |
+| heavy pair + breadth | 04C | compile, link, then 2 x Go concurrent | **0..2-of-2** — the bound fires most passes (zombie backlog + 2 x 4-task runtimes) |
+
+### What the matrix says
+
+- **The third-child death does not reproduce.** Across the legs' spawned
+  children there are zero status=139 tombstones, zero `[EXC] parking:`, zero
+  `cannot allocate memory`, zero wedges — including leg 04A, the exact
+  configuration that produced amendment 8's `far=0x47c29000` abort. Between
+  the two heads sits PR #2437's lifecycle chain — early user-page release at
+  last-task exit, the populate-race retry, the scratch-table leak fix, and
+  the toolchain's `virMunmap`/`GOMEMLIMIT` — which names the candidates for
+  both observed deaths (a level-3 permission fault and a schedinit GC
+  corruption, both explainable by freed-phys aliasing / false populate
+  faults). The original observations are not withdrawn — they happened — but
+  at this head the death is **unreproduced under the shape that produced it**,
+  which is the strongest statement the matrix can make.
+- **The residual bound is BREADTH, not depth — and it is the task pool, named
+  twice.** `scheduler.max_tasks` = 16: three kernel tasks plus 13 user slots.
+  A Go parent (4 Ms at the compiled GOMAXPROCS=2 default) plus nine one-task
+  Zig children fills it exactly: the 10th+ `sys_exec` gets `pool_full` ->
+  ENOSPC, observed as `SPAWN-FAIL` lines with the parent and the spawned
+  nine unharmed (9-of-12, stable across passes). Under the same parent,
+  concurrent Go children bound at 2: each runtime wants ~4 task slots of Ms,
+  so the third's `newosproc` (sys_thread, slot 73) hits the dry pool inside
+  schedinit and throws `sys_thread create failed` -> status=2 — a clean
+  runtime refusal, not a tombstone. Which child draws the short straw is
+  scheduler order, so the leg pins the refusal's SHAPE (verdict printed,
+  statuses named) rather than a fixed count.
+- **The bound is not positional — it can bite a sequential Go child too.**
+  Once in the K-sweep, leg 04B's `link` — the SECOND child of a fresh driver —
+  died `newosproc ... sys_thread create failed` -> status=2 at ms=1002, i.e.
+  inside schedinit while the pool was still paying zombie backlog from the
+  previous leg's toolchain children (the reaper drains one task per idle
+  pass). "A third child dies" was never about the ordinal: it is "a Go
+  runtime child spawned while the pool cannot serve its Ms". This is the
+  named bound the card asks the ADR to record: `scheduler.max_tasks` vs live
+  + zombie task demand, expressed as ENOSPC at `sys_exec` or a status-2
+  `newosproc` death inside the child — both named, neither a wedge, neither
+  the amendment-8 tombstone. It is also the same signature as the M112a/d
+  `newosproc` transients, now with its pool accounting.
+- **The matrix also surfaced and fixed a wait-side defect.** `sys_exec` can
+  legitimately return pid 0 — `create_as` recycles the lowest free registry
+  descriptor, and once the registry churns, slot 0 goes to live children —
+  but `vi.Probe`/`vi.WaitBudget` treated `pid <= 0` as invalid, so a pid-0
+  child ran to completion while the caller read EINVAL (observed twice in the
+  matrix: the breadth leg's third Go child, `spawned pid=0`, and the nested
+  leg's second grandchild). This is the "lost spawn" signature M112a/d saw
+  (`sync_failed exec`) and `user/go/gobuild/spawn_guest.go`'s `waitChild`
+  already carried a local workaround for it — the fix belongs in `vi`, where
+  only a negative pid is now not a pid.
+
+### Consequence
+
+Amendment 8's conservative shape — two children plus a monitor `exec` for the
+product — was kept "because that shape is proven green". Nothing in the matrix
+says a third child dies: a one-boot three-child loop is unblocked as far as
+this bound is concerned (the residual `GOGC`/pool sizing under sustained
+toolchain churn is a different question, owned by the fleet drivers). The
+named bound going forward is `scheduler.max_tasks` under concurrency —
+refusals are ENOSPC at spawn or a status-2 `newosproc` death, both named,
+neither a wedge.

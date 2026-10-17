@@ -33,10 +33,15 @@
 // issue #1449 the report). So the RUN step stays the gate's second boot (one
 // monitor `exec` of the product this loop built, which is also how go-hello run
 // 08 executes it) because this shape is proven green -- NOT because a third
-// child is known to be broken. The narrow, defensible statement is: a third
-// child died once and has not died again; the wall is uncharacterised, not
-// eliminated. A one-boot three-child loop is feasible and is the first thing to
-// try once #1449 has an owner.
+// child is known to be broken.
+//
+// M119d (#2488) grew the experiment into the spawn-shape matrix and answered
+// the debt: depth x breadth x sequential-vs-concurrent legs are pinned in
+// live-exec runs 02-04, and the third-child death does not reproduce at the
+// post-#2437 head — the residual bound is breadth against the 16-slot task
+// pool (ENOSPC at spawn past ~9 one-task children, or a status-2
+// `newosproc` death for a third concurrent GOMAXPROCS=2 runtime), recorded
+// in ADR 0035 amendment 11.
 //
 // One consequence of the above for anyone reading the driver's own output: a
 // `status=0` on a step is a liveness observation, not proof.
@@ -89,14 +94,20 @@ type step struct {
 	args  []string
 }
 
-// The #1449 EXPERIMENT, off unless asked for:
+// The #1449 / M119d (#2488) EXPERIMENT, off unless asked for:
 //
-//	exec GOSELFHOST.ELF --spawn <image> <count> [expected-status] [--after-loop]
+//	exec GOSELFHOST.ELF [--after-loop] (--spawn|--spawn-par) <image> <count> [expected-status] [-- child-args...]
 //
-// spawns that image count times, SEQUENTIALLY, from this one EL0 parent and
-// reports each child's status; with --after-loop the build loop's two children
-// run first, i.e. the spawns become the THIRD child of the same parent. It
-// exists because both observed third-child deaths used a GO child (go-sh's
+// --spawn runs the image count times SEQUENTIALLY (spawn -> wait -> next)
+// from this one EL0 parent; --spawn-par is the BREADTH leg of the spawn-shape
+// matrix — it spawns all count children back-to-back first, then waits each
+// in spawn order, so the pool sees them all live at once. Tokens after `--`
+// become every spawned child's own argv, which is what makes the tree-depth
+// leg possible: a GOSELFHOST child carrying its own --spawn is a grandchild
+// driver. With --after-loop the build loop's two children run first, i.e. the
+// experiment's children are number 3+ of the same parent.
+//
+// It exists because both observed third-child deaths used a GO child (go-sh's
 // children are GOSH.ELF; this loop's third was the linked product), so "a third
 // sequential exec from one EL0 parent" and "a third live Go runtime" predict
 // the same tombstone and the record could not tell them apart. A non-Go child
@@ -109,51 +120,122 @@ type step struct {
 // is what isolates the real difference: the loop's first two children are
 // cmd/compile (24 MiB image, 23 MiB mapped) and cmd/link.
 //
-// It is a MEASUREMENT, not a gate: no spec asserts its verdict, because
-// pinning a bug's present shape into a class-B gate would freeze it.
+// M119d (#2488) pins the matrix into live-exec: the verdict line now names
+// the image (`selfhost: spawn-par verdict=K-of-M-survived IMAGE`) so a spec
+// can stage-gate the NEXT leg on a marker that is unique within the boot, and
+// a spawn refusal reports SPAWN-FAIL with the errno instead of silently
+// counting as absent. A leg that cannot finish still prints its verdict line —
+// K < M is the bound, not a hang.
 const (
 	spawnFlag     = "--spawn"
+	spawnParFlag  = "--spawn-par"
 	afterLoopFlag = "--after-loop"
+	childSep      = "--"
 )
+
+// experiment is one parsed spawn leg: which image, how many children,
+// sequential or concurrent, and the status each child is expected to leave
+// (-1 = report whatever came back).
+type experiment struct {
+	par    bool
+	image  string
+	count  int64
+	expect int64
+}
 
 func main() {
 	rest := vi.Args()
 	if len(rest) > 0 {
 		rest = rest[1:] // argv[0] is this program's name
 	}
-	spawnArgs, afterLoop := splitExperimentArgs(rest)
-	// The normal path (no --spawn) is the loop alone; --spawn alone is the
-	// standalone baseline; --spawn --after-loop puts the spawns behind the
-	// loop's two children, which is the configuration that failed.
-	if len(spawnArgs) == 0 || afterLoop {
-		buildLoop()
+	exp, childArgs, afterLoop, errMsg := parseExperimentArgs(rest)
+	if errMsg != "" {
+		vsys.Println("selfhost: " + errMsg)
+		vsys.Exit(2)
 	}
-	if len(spawnArgs) > 0 {
-		runSpawnExperiment(spawnArgs)
+	// The normal path (no experiment) is the loop alone; an experiment alone
+	// is the standalone baseline; experiment + --after-loop puts the spawns
+	// behind the loop's two children, which is the configuration that failed.
+	if exp == nil || afterLoop {
+		if rc := buildLoop(); rc != 0 {
+			if afterLoop {
+				// The leg's verdict marker prints even when the loop died —
+				// a spec stage gate keys on it, and a loop failure is itself
+				// a bound observation (a status-2 toolchain child under pool
+				// pressure), never a hang. 0-of-M is honest: no experiment
+				// child survived because none ran.
+				verb := "spawn"
+				if exp.par {
+					verb = "spawn-par"
+				}
+				vsys.Println("selfhost: " + verb + " verdict=0-of-" +
+					vsys.Itoa64(exp.count) + "-survived " + exp.image)
+			}
+			vsys.Exit(rc)
+		}
+	}
+	if exp != nil {
+		runExperiment(*exp, childArgs)
 	}
 }
 
-// splitExperimentArgs pulls the argv-gated experiment out of the program's own
-// arguments. Everything between --spawn and the next flag is the experiment's
-// ((image), (count), optional (expected-status)).
-func splitExperimentArgs(args []string) (spawn []string, afterLoop bool) {
+// parseExperimentArgs pulls the argv-gated experiment out of the program's own
+// arguments: one --spawn/--spawn-par flag followed by its positional tail
+// (image, count, optional expected-status — everything up to the next flag),
+// --after-loop anywhere, and `--` closing the driver's own argv so the rest is
+// the spawned children's argv.
+func parseExperimentArgs(args []string) (exp *experiment, childArgs []string, afterLoop bool, errMsg string) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case spawnFlag:
-			for i+1 < len(args) && args[i+1] != afterLoopFlag {
-				i++
-				spawn = append(spawn, args[i])
-			}
+		case childSep:
+			return exp, args[i+1:], afterLoop, ""
 		case afterLoopFlag:
 			afterLoop = true
+		case spawnFlag, spawnParFlag:
+			if exp != nil {
+				return nil, nil, false, "one spawn experiment per invocation"
+			}
+			e := experiment{par: args[i] == spawnParFlag, expect: -1}
+			var pos []string
+			for i+1 < len(args) && !isFlag(args[i+1]) {
+				i++
+				pos = append(pos, args[i])
+			}
+			if len(pos) < 2 {
+				return nil, nil, false, "spawn needs <image> <count> [expected-status]"
+			}
+			e.image = pos[0]
+			count, ok := parseInt(pos[1])
+			if !ok || count < 1 {
+				return nil, nil, false, "spawn count must be a positive integer: " + pos[1]
+			}
+			e.count = count
+			if len(pos) > 2 {
+				if e.expect, ok = parseInt(pos[2]); !ok {
+					return nil, nil, false, "spawn expected-status must be an integer: " + pos[2]
+				}
+			}
+			if len(pos) > 3 {
+				return nil, nil, false, "child argv goes after `--`, not in the spawn tail"
+			}
+			exp = &e
+		default:
+			return nil, nil, false, "unknown argument: " + args[i]
 		}
 	}
-	return spawn, afterLoop
+	return exp, nil, afterLoop, ""
+}
+
+// isFlag reports whether tok starts a new option rather than belonging to the
+// current flag's positional tail. The `--` separator is a flag for this
+// purpose — the parser sees it and hands the rest to the children.
+func isFlag(tok string) bool {
+	return len(tok) >= 2 && tok[0] == '-' && tok[1] == '-'
 }
 
 // buildLoop is the card's deliverable: compile -> link, in this process, with
 // the guest's own toolchain, then the marker the gate waits on.
-func buildLoop() {
+func buildLoop() int64 {
 	steps := []step{
 		// cmd/compile: source -> object. No -p flag: the default package
 		// path is what the linker needs to find main.main, verified on the
@@ -165,8 +247,9 @@ func buildLoop() {
 		{label: "link", image: linkImage,
 			args: []string{"-importcfg", imports, "-tmpdir", workdir, "-o", product, object}},
 		// NO third step. The product is built here and RUN by the gate's
-		// second boot, because a third sequential child dies on this GOOS
-		// today — see the header, and go-sh.spec / issue #1449.
+		// second boot — the shape is proven green, and the matrix found no
+		// surviving third-child bound to route around (ADR 0035 amendment
+		// 11). Kept for shape stability, not because a third child fails.
 	}
 
 	for _, s := range steps {
@@ -176,67 +259,135 @@ func buildLoop() {
 			// finished badly" are different findings about the guest.
 			vsys.Println("selfhost: FAIL " + s.label + " err=" + err.Error() +
 				" budget_s=" + vsys.Itoa64(stepBudgetNs/1000000000))
-			vsys.Exit(1)
+			return 1
 		}
 		vsys.Println("selfhost: " + s.label + " " + s.image +
 			" status=" + vsys.Itoa64(status) + " ms=" + vsys.Itoa64(ms))
 		if status != 0 {
 			vsys.Println("selfhost: FAIL " + s.label + " status=" + vsys.Itoa64(status))
-			vsys.Exit(1)
+			return 1
 		}
 	}
 	// The marker the gate waits on: both steps of the build ran, in the
 	// guest, with the guest's own toolchain.
 	vsys.Println("selfhost: build loop OK")
+	return 0
 }
 
-// runSpawnExperiment is the #1449 discriminator (see spawnFlag). It is a small
-// argv-driven measurement, so it deliberately shares runStep — the same exec
-// slot, the same wait rule and the same ceiling as the build loop, because the
-// question is about THIS parent's third child, not about a fresh one.
-func runSpawnExperiment(args []string) {
-	if len(args) < 2 {
-		vsys.Println("selfhost: spawn needs <image> <count> [expected-status]")
-		vsys.Exit(2)
+// runExperiment is the #1449 discriminator grown into the M119d (#2488)
+// spawn-shape matrix. It deliberately shares runStep — the same exec slot,
+// the same wait rule and the same ceiling as the build loop, because the
+// question is about THIS parent's children, not about a fresh one.
+//
+// Sequential mode (--spawn) is the original measurement: spawn, wait, repeat —
+// depth. Parallel mode (--spawn-par) spawns all count children BEFORE waiting
+// any — breadth: the pool holds every child live at once, which is the shape
+// sequential legs never produce and the one the task-pool bound
+// (scheduler.max_tasks, 16) bites first.
+//
+// Both modes end on the same verdict line — `verdict=K-of-M-survived IMAGE`,
+// printed even when a leg fails partway, because a spec stage gate keys on it
+// and K < M is itself the finding. "Survived" means the child spawned AND left
+// the registry with a status that matches the expectation when one was given.
+func runExperiment(e experiment, childArgs []string) {
+	verb := "spawn"
+	if e.par {
+		verb = "spawn-par"
 	}
-	image := args[0]
-	count, ok := parseInt(args[1])
-	if !ok || count < 1 {
-		vsys.Println("selfhost: spawn count must be a positive integer: " + args[1])
-		vsys.Exit(2)
+	survived := int64(0)
+	if e.par {
+		survived = runPar(e, childArgs, verb)
+	} else {
+		survived = runSeq(e, childArgs, verb)
 	}
-	expect := int64(-1) // -1 = no expectation, report whatever came back
-	if len(args) > 2 {
-		if expect, ok = parseInt(args[2]); !ok {
-			vsys.Println("selfhost: spawn expected-status must be an integer: " + args[2])
-			vsys.Exit(2)
+	vsys.Println("selfhost: " + verb + " verdict=" + vsys.Itoa64(survived) +
+		"-of-" + vsys.Itoa64(e.count) + "-survived " + e.image)
+	if survived < e.count {
+		vsys.Exit(1)
+	}
+}
+
+// runSeq spawns the image count times, waiting for each child before the next
+// spawn — the depth leg. It stops at the first failure: a child whose spawn or
+// wait fails leaves no status to count, and a sequential leg that kept going
+// would hide WHICH child died behind the survivors.
+func runSeq(e experiment, childArgs []string, verb string) int64 {
+	for i := int64(1); i <= e.count; i++ {
+		prefix := "selfhost: " + verb + " " + vsys.Itoa64(i) + "/" +
+			vsys.Itoa64(e.count) + " " + e.image
+		start := vsys.Nanotime()
+		pid, err := vi.Exec(e.image, childArgs...)
+		if err != nil {
+			// A refused spawn says the bound's name (ENOSPC), same as runPar —
+			// it is not the child dying and it is not a lost status.
+			vsys.Println(prefix + " SPAWN-FAIL err=" + err.Error())
+			return i - 1
 		}
-	}
-	for i := int64(1); i <= count; i++ {
-		prefix := "selfhost: spawn " + vsys.Itoa64(i) + "/" + vsys.Itoa64(count) +
-			" " + image
-		status, ms, err := runStep(step{label: "spawn", image: image})
+		status, err := vi.WaitBudget(pid, stepBudgetNs)
 		if err != nil {
 			// No status at all: the child never left the registry with one.
 			vsys.Println(prefix + " NO-STATUS err=" + err.Error() +
 				" budget_s=" + vsys.Itoa64(stepBudgetNs/1000000000))
-			vsys.Println("selfhost: spawn verdict=" + vsys.Itoa64(i-1) + "-of-" +
-				vsys.Itoa64(count) + "-survived")
-			vsys.Exit(1)
+			return i - 1
 		}
+		ms := (vsys.Nanotime() - start) / 1000000
 		vsys.Println(prefix + " status=" + vsys.Itoa64(status) +
 			" ms=" + vsys.Itoa64(ms))
-		if expect >= 0 && status != expect {
+		if e.expect >= 0 && status != e.expect {
 			// The child that dies is the one whose status does not match; a
 			// tombstone arrives here as the kernel's own 139.
-			vsys.Println(prefix + " unexpected status (expected " + vsys.Itoa64(expect) + ")")
-			vsys.Println("selfhost: spawn verdict=" + vsys.Itoa64(i-1) + "-of-" +
-				vsys.Itoa64(count) + "-survived")
-			vsys.Exit(1)
+			vsys.Println(prefix + " unexpected status (expected " + vsys.Itoa64(e.expect) + ")")
+			return i - 1
 		}
 	}
-	vsys.Println("selfhost: spawn verdict=" + vsys.Itoa64(count) + "-of-" +
-		vsys.Itoa64(count) + "-survived")
+	return e.count
+}
+
+// runPar is the breadth leg: spawn count children back-to-back — a refusal
+// mid-sweep (a pool-full sys_exec) is a SPAWN-FAIL line, not a stop — then
+// wait each spawned child in order. The pool sees all children live at once;
+// a Go child's schedinit newosproc transients and a refused exec surface
+// here as different markers (status!=expect / NO-STATUS vs SPAWN-FAIL err=).
+// ms is the WAIT time for that child, not its runtime — children that finished
+// before their turn in the wait order report small ms by construction.
+func runPar(e experiment, childArgs []string, verb string) int64 {
+	pids := make([]int64, e.count)
+	spawned := make([]bool, e.count)
+	for i := int64(1); i <= e.count; i++ {
+		prefix := "selfhost: " + verb + " " + vsys.Itoa64(i) + "/" +
+			vsys.Itoa64(e.count) + " " + e.image
+		pid, err := vi.Exec(e.image, childArgs...)
+		if err != nil {
+			// A refused spawn is the bound the matrix is looking for, said
+			// by name — it is not the child dying and it is not this driver.
+			vsys.Println(prefix + " SPAWN-FAIL err=" + err.Error())
+			continue
+		}
+		pids[i-1] = pid
+		spawned[i-1] = true
+		vsys.Println(prefix + " spawned pid=" + vsys.Itoa64(pid))
+	}
+	survived := int64(0)
+	for i := int64(1); i <= e.count; i++ {
+		if !spawned[i-1] {
+			continue
+		}
+		prefix := "selfhost: " + verb + " " + vsys.Itoa64(i) + "/" +
+			vsys.Itoa64(e.count) + " " + e.image
+		status, err := vi.WaitBudget(pids[i-1], stepBudgetNs)
+		if err != nil {
+			vsys.Println(prefix + " NO-STATUS err=" + err.Error() +
+				" budget_s=" + vsys.Itoa64(stepBudgetNs/1000000000))
+			continue
+		}
+		vsys.Println(prefix + " status=" + vsys.Itoa64(status))
+		if e.expect >= 0 && status != e.expect {
+			vsys.Println(prefix + " unexpected status (expected " + vsys.Itoa64(e.expect) + ")")
+			continue
+		}
+		survived++
+	}
+	return survived
 }
 
 // parseInt is the tiny decimal reader the experiment's argv needs; vsys has
