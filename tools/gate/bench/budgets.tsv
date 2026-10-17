@@ -25,14 +25,23 @@
 # GOSH `time` builtin printed real=0.00s for both commands (centisecond
 # resolution) -- both baselines are the floor, stated there.
 #
+# Margins re-pinned on #2486 (same host, same day): the first live-bench
+# runs showed intra-host spread wider than the margins named from single
+# samples -- hf-read 2799..8442 KiB/s across 8 same-shape boots (-67%),
+# smp-scale-c1 72.0M..157.4M ticks (2.33x), smp-scale-c2 26.3M..82.8M
+# (3.15x). The baselines stay (still the best-case observations); the
+# margins now cover the observed spread: hf-read -75% (2799 min, budget
+# 2110), c1/c2 x4. smp-scale-c4's observed max (51.7M, 1.55x) already
+# fits its x2, unchanged.
+#
 id	cmp	budget	baseline	margin	ref
 boot-shell	<=	4	1	x4	#2485
 gosh-cmd-ls	<=	0.05	0.01	+400%	#2485
 gosh-cmd-echo	<=	0.05	0.01	+400%	#2485
-hf-read	>=	4221	8442	-50%	#2485
+hf-read	>=	2110	8442	-75%	#2485; spread re-measured on #2486
 pcm-drain	<=	8192	4096	x2	#2485
 wm-present-cadence	<=	2554	1277	x2	#2485
 wm-present-latency	<=	1532847	1021898	+50%	#2485
-smp-scale-c1	<=	135311026	67655513	x2	#2485
-smp-scale-c2	<=	52699882	26349941	x2	#2485
+smp-scale-c1	<=	270622052	67655513	x4	#2485; spread re-measured on #2486
+smp-scale-c2	<=	105399764	26349941	x4	#2485; spread re-measured on #2486
 smp-scale-c4	<=	66754980	33377490	x2	#2485
