@@ -45,3 +45,4 @@ GOSOUND.ELF | Sound | a | dock=false | v=2 | caps=file,window,audio | opens=audi
 ZC.BIN | Zig Compiler | z | dock=false | v=2 | caps=file,memory,process
 TABWM.BIN | Tabbed Desktop | m
 GOSTALGIA.ELF | Gostalgia | o | dock=false | v=2 | argv=shell --root /host/GS | caps=file,window,term,process
+GOSTORE.ELF | Store | i | dock=false | v=2 | caps=file,net

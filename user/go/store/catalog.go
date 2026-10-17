@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"strings"
@@ -12,9 +12,9 @@ import (
 // stream's head Change — labeled from TRUSTED.TXT; no const may claim
 // identity.
 
-// catalogEntry is one release stream's catalog card: the validated
+// CatalogEntry is one release stream's catalog card: the validated
 // manifest consts plus the derived publisher fingerprint.
-type catalogEntry struct {
+type CatalogEntry struct {
 	Stream string   // remote stream name (the channel's <stream>/ dir)
 	Head   string   // local record head the manifest folded at
 	Rel    *release // the authenticated consts
@@ -34,7 +34,7 @@ type catalogEntry struct {
 // head carries no release manifest returns (nil, nil); a missing,
 // tampered, or out-of-grammar manifest returns the named refusal — the
 // caller decides whether it is per-stream trivia (ls) or fatal (info).
-func loadCatalogEntry(fs FS, root string, ch channel, rec *Stream, kr *keyring) (*catalogEntry, error) {
+func loadCatalogEntry(fs FS, root string, ch channel, rec *Stream, kr *keyring) (*CatalogEntry, error) {
 	logBytes, err := streamLogBytes(fs, root, rec.ID)
 	if err != nil {
 		return nil, err
@@ -57,7 +57,7 @@ func loadCatalogEntry(fs FS, root string, ch channel, rec *Stream, kr *keyring) 
 	if err != nil {
 		return nil, err
 	}
-	e := &catalogEntry{Stream: rec.Name, Rel: rel, Publisher: author}
+	e := &CatalogEntry{Stream: rec.Name, Rel: rel, Publisher: author}
 	if rec.Head != nil {
 		e.Head = *rec.Head
 	}
@@ -72,7 +72,7 @@ func loadCatalogEntry(fs FS, root string, ch channel, rec *Stream, kr *keyring) 
 // matches applies the `store ls` filters: --category is an exact match
 // on the closed vocabulary word, --search is a case-insensitive
 // substring over the stream name and the manifest's display fields.
-func (e *catalogEntry) matches(search, category string) bool {
+func (e *CatalogEntry) matches(search, category string) bool {
 	if category != "" && e.Rel.Category != category {
 		return false
 	}
@@ -93,7 +93,7 @@ func (e *catalogEntry) matches(search, category string) bool {
 // line renders the one-line catalog row printed after
 // `store: stream <name> release` — summary last because it may hold
 // spaces; "-" marks a const the publisher did not declare.
-func (e *catalogEntry) line() string {
+func (e *CatalogEntry) line() string {
 	return "name=" + e.Rel.Name +
 		" version=" + e.Rel.Version +
 		" category=" + orDash(e.Rel.Category) +
