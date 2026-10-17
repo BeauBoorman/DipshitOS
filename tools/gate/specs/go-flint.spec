@@ -183,9 +183,23 @@
 # refuses `grant_stale` at exec — until the pane's re-consent binds the
 # widened set.
 #
-# This spec is grown across M103a-d/M101a-e + M110b/d + M113d and is NOT
-# vgate_repeat-safe (runs 01-03, 05-07, 08-10, 14-21, and 22-24 share
-# /host state across boots).
+# Run 25 (M113f #2422): the acceptance chain — ONE app taken end to end
+# in ONE boot on a pristine copy of the caps-share staging (runs 22-24
+# mutate that share). The guest script installs caprel (the signed
+# ReleaseCaps — `store: grant propose`), runs GOSET in the -u0 gosh so
+# the seat-cap consent lands the hash-bound row, execs GOHELLO under
+# the row (verdict=measured + audit:<word>_denied receipts for the
+# words its image actually touches outside file,net), and renders
+# GOTOP's trust tab — declare -> consent -> measured exec -> audit
+# receipt -> viewer, the #2422 chain verbatim. GOSET is inside the
+# .SH (not a monitor spawn) so the confined exec and the viewer come
+# after it in guest-script order; the typed consent goes over
+# --input-chords (the burst ends on `escape` to hand the console back)
+# and GOTOP's tab switch is the --input-string slot.
+#
+# This spec is grown across M103a-d/M101a-e + M110b/d + M113d + M113f
+# and is NOT vgate_repeat-safe (runs 01-03, 05-07, 08-10, 14-21, and
+# 22-25 share /host state across boots).
 #
 # HOST PREREQ:
 #   bash tools/go/build-flint.sh -> .build/go/FLINT.ELF
@@ -193,6 +207,7 @@
 #   bash tools/go/build-store.sh -> .build/go/STORE.ELF
 #   bash tools/go/build-go.sh    -> .build/go/GOHELLO.ELF
 #   bash tools/go/build-goset.sh -> .build/go/GOSET.ELF       (runs 22/24)
+#   bash tools/go/build-gotop.sh -> .build/go/GOTOP.ELF       (run 25)
 #   (no seat: wm=none keeps every EL0 slot for the Go legs)
 #   ../flint-server checkout (or FLINT_SERVER_DIR=...) for runs 11-17 only;
 #   the hook zig-builds flintd. flint-server is drawmeanelephant's repo under
@@ -213,7 +228,9 @@
 # done`, run 19 ends on `m110b: catalog legs done`, run 20 ends on `m110d:
 # install done`, and run 21 ends on `m110d: negatives done`. Runs 22/24
 # end on `goset: grant written name=GOHELLO.ELF`; run 23 ends on `m113d:
-# keep done`.
+# keep done`; run 25 ends on GOTOP's rendered trust-app marker for the
+# confined GOHELLO.ELF — the last program output in the chain (every
+# asserted line is program output).
 
 vgate_name go-flint "M103 #2253/#2251/#2252/#2254 (ADR 0049): FLINT.ELF parser corpus, flat-file store, signed commit, fork, and semantic merge on Ops"
 vgate_share seed
@@ -1426,8 +1443,42 @@ for sname, sbody in flintj_m113d.items():
     open(os.path.join(caps_share, "FLINTJ", sname),
          "w", encoding="utf-8").write(sbody)
 
+# ---- M113f (#2422): the acceptance chain leg ------------------------------
+# m113f-share is a pristine copy of caps-share's staging — runs 22-24
+# mutate that share (the consent row, the v2/v3 image moves) and the
+# chain leg must open on a declared-only store like run 22 did. GOTOP.ELF
+# joins the bundle for the viewer step.
+gotop_elf = os.path.join(".build", "go", "GOTOP.ELF")
+if not os.path.isfile(gotop_elf):
+    sys.exit("GOTOP.ELF missing (expected " + gotop_elf +
+             ") - build it first: bash tools/go/build-gotop.sh")
+m113f_share = os.path.join(run, "m113f-share")
+shutil.copytree(caps_share, m113f_share)
+shutil.copy(gotop_elf, os.path.join(m113f_share, "GOTOP.ELF"))
+# The guest script IS the ordering (gosh foregrounds each command):
+# install declares the signed ask -> GOSET (inside the -u0 gosh, so the
+# consent write carries CAP_PROC_ADMIN) exits on the typed `escape` ->
+# GOHELLO execs under the row the consent just wrote -> GOTOP opens ->
+# the still-arriving chord tail parks it on the trust tab with auto-
+# refresh -> the chain-done echo. GOTOP deliberately comes AFTER GOSET:
+# a resident viewer + STORE install overflowed the 16-entry task pool
+# (`newosproc: sys_thread create failed`, observed twice — once each
+# under default and single-core layouts) because STORE and the viewer's
+# Go runtimes spawn threads on demand.
+open(os.path.join(m113f_share, "FLINTJ", "M113F.SH"),
+     "w", encoding="utf-8").write(
+    "STORE.ELF install caprel --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "echo m113f: declared\n"
+    "GOSET.ELF\n"
+    "GOHELLO.ELF\n"
+    "GOTOP.ELF &\n"
+    "sleep 8\n"
+    "kill %1\n"
+    "echo m113f: chain done\n"
+)
 
-print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, store-share, tp-share, and caps-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
+
+print("staged FLINT.ELF, GOSH.ELF, STORE.ELF, /host/FLINTC, /host/FLINTW, /host/FLINTV, /host/FLINTJ, nosign-share, clean-share, conflict-share, sync-share, badauth-share, store-share, tp-share, caps-share, and m113f-share (%d files, %d atoms)" % (manifest["files"], len(atoms)))
 PY
 
 # ---- 01: M103a in-guest parse-corpus over /host/FLINTC -----------------------
@@ -2508,4 +2559,144 @@ state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
 if "caps=file,debug,net" not in state or "prev_caps=file" not in state:
     sys.exit("STORE.TXT lost the declared-vs-prior ask: %r" % state)
 print("run-24 verified: widening re-asked, consent bound the widened row to v3")
+PY
+
+# ---- 25: M113f (#2422) — ONE app through the whole chain, ONE boot --------
+# caprel-v1's signed ReleaseCaps declares file,net; the pane's consent
+# lands the hash-bound row through slot 89; the confined exec measures in
+# (verdict=measured) and receipts audit:<word>_denied for every word the
+# image touches outside the row — audit mode records, it never refuses;
+# GOTOP's trust tab renders the same posture back. --input-chords types
+# the consent conversation (grants pane -> grant -> two padding returns
+# so the slot-89 persist has landed before `escape` hands the console
+# back); the chord tail then carries ~15 s of harmless down/up padding
+# (row navigation in whatever window is up) so the `t` reaches GOTOP's
+# window only after the .SH has run the confined GOHELLO and opened the
+# viewer — the `t` parks it on the trust tab and ONE post-consent
+# render prints the markers this leg asserts. The script-expect is the
+# trust-app marker itself: under the deferred `smp: secondary runs=`
+# drain, the post-kill `chain done` echo in the .SH can sit in queue
+# past the timeout even though every step ran (observed).
+vgate_file script-25.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script2-25.txt <<'EOF'
+exec -u0 GOSH.ELF -c "source /host/FLINTJ/M113F.SH"
+EOF
+
+vgate_run 25 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-25' \
+    --cvc-file '$RUN_DIR/m113f-share' \
+    --virtio-fs '$RUN_DIR/m113f-share' \
+    --net '$RUN_DIR/cap25.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-25.txt' \
+    --script2 '$RUN_DIR/script2-25.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --input-chords 'g,r,a,n,t,s,return,g,r,a,n,t,space,G,O,H,E,L,L,O,.,E,L,F,return,return,return,escape,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,down,up,t' \
+    --input-chords-after 'goset: ready ' \
+    --script-expect 'top: trust app name=GOHELLO.ELF' --timeout 300
+
+# declared: the signed ReleaseCaps survived verify + publish, and the ask
+# is surfaced — nothing consented yet.
+vgate_assert 25 serial-contains 'store: install ok GOHELLO.ELF version=1.0.0'
+vgate_assert 25 serial-contains 'store: grant propose GOHELLO.ELF words=file,net'
+vgate_assert 25 serial-contains 'm113f: declared'
+# consent: the grants pane landed the hash-bound row through slot 89.
+vgate_assert 25 serial-contains 'goset: grants n='
+vgate_assert 25 serial-contains 'goset: grant written name=GOHELLO.ELF words=file,net'
+# measured exec + the denied word receipted in audit — and the call still
+# landed (audit records, never refuses: 'virelai-go OK' printed).
+vgate_assert 25 serial-contains 'verdict=measured name=GOHELLO.ELF'
+vgate_assert 25 serial-contains 'audit:debug_denied name=GOHELLO.ELF word=debug'
+vgate_assert 25 serial-contains 'virelai-go OK'
+# viewer: GOTOP renders the confined posture of the same app.
+vgate_assert 25 serial-contains 'top: tab=trust'
+vgate_assert 25 serial-contains 'top: trust app name=GOHELLO.ELF'
+vgate_assert 25 serial-absent 'verdict=refused'
+vgate_assert 25 serial-absent '[EXC] parking:'
+vgate_assert 25 serial-absent 'abababababababababababababababababababababababababababababababab'
+# The share's own record + the rendered-vs-kernel cross-proof: the row
+# the consent wrote is hash-bound to the installed bytes with exactly
+# the declared words; GOTOP's rendered denied set names every word the
+# kernel receipted a denial for on the same boot; the rendered sha pin
+# and publisher come from the share's own stream replica, not constants.
+vgate_assert 25 python <<'PY'
+import hashlib, json, os, re, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "m113f-share")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+elf = open(os.path.join(share, "GOHELLO.ELF"), "rb").read()
+sha = hashlib.sha256(elf).hexdigest()
+grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
+lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
+if lines != ["GOHELLO.ELF\t" + sha + "\tfile,net"]:
+    sys.exit("GRANTS.TXT after the chain leg: %r (sha %s)" % (lines, sha))
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if "caps=file,net" not in state:
+    sys.exit("STORE.TXT did not record the declared ask: %r" % state)
+
+rows = {}
+for l in ser.splitlines():
+    m = re.match(r"top: trust app name=(\S+) uid=(\S+) declared=(\S+)"
+                 r" granted=(\S+) denied=(\S+) state=(\S+)", l.strip())
+    if m:
+        rows[m.group(1)] = m.groups()
+g = rows.get("GOHELLO.ELF")
+if not g:
+    sys.exit("GOTOP rendered no trust row for GOHELLO.ELF")
+if g[2] != "file,net" or g[3] != "file,net":
+    sys.exit("rendered declared/granted = %s/%s want file,net/file,net"
+             % (g[2], g[3]))
+denied = set(g[4].split(","))
+
+receipted = set(re.findall(
+    r"verdict=audit:(\w+)_denied name=GOHELLO\.ELF", ser))
+if "debug" not in receipted:
+    sys.exit("the confined exec receipted no debug denial: %r" % receipted)
+if not receipted <= denied:
+    sys.exit("kernel-receipted %r escapes the rendered denied set %r"
+             % (sorted(receipted), sorted(denied)))
+
+shas = {}
+for l in ser.splitlines():
+    m = re.match(r"top: trust sha name=(\S+) measured=(\S+) pin=(\S+)"
+                 r" verdict=(\S+)", l.strip())
+    if m:
+        shas[m.group(1)] = m.groups()
+s = shas.get("GOHELLO.ELF")
+if not s or s[3] != "match" or s[1] != sha or s[2] != sha:
+    sys.exit("GOTOP sha verdict = %r (want match against %s)" % (s, sha))
+
+# The publisher is the staged replica's head-change author (ADR 0055 D5)
+# — derived, never a constant in the spec.
+sid = "0199de2d-dc00-7000-8000-00000000f010"
+rec = json.loads(open(os.path.join(
+    share, "FLINT", "streams", sid + ".json")).read())
+head = rec["head"]
+author = None
+for line in open(os.path.join(
+        share, "FLINT", "streams", sid + ".jsonl")).read().splitlines():
+    if not line:
+        continue
+    ch = json.loads(line)
+    if ch.get("id") == head:
+        author = ch.get("author")
+pubs = {}
+for l in ser.splitlines():
+    m = re.match(r"top: trust pub name=(\S+) stream=(\S+) publisher=(\S+)",
+                 l.strip())
+    if m:
+        pubs[m.group(1)] = m.groups()
+p = pubs.get("GOHELLO.ELF")
+if not p or p[1] != "caprel" or p[2] != author:
+    sys.exit("GOTOP publisher = %r (want stream=caprel author=%s)"
+             % (p, author))
+print("run-25 verified: declare -> consent -> measured exec -> audit "
+      "receipt -> viewer, one app, one boot")
 PY
