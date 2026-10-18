@@ -98,6 +98,26 @@
 //          reason=no_bundle` per record instead. Requires --cvc-file and
 //          the `host-int` SECRETS.TXT row; OFF by default — no records
 //          polled, no center touched.)
+//         [--host-cmd-after <marker>:<verb>] (M114a #2454, index #2447:
+//          dispatch <verb> on the HostCommand bus — the same seam every
+//          AppKit menu item uses — once <marker> appears in the serial
+//          stream. Repeatable; <verb> is the suffix after the LAST colon
+//          and unknown verbs are a parse-time error. Every dispatch emits
+//          one `host-ui: cmd=<verb> state=<...>` receipt on stdout.
+//          Requires --script or --host-session, where the marker scan
+//          runs.)
+//         [--host-capture-keys] (M114b #2455, index #2447: arm the machine
+//          view's capturesSystemKeys at startup by dispatching the
+//          capture-keys verb on the HostCommand bus once the
+//          VZVirtualMachineView exists — the same host-ui: receipt as
+//          ⌥⌘K / the toolbar pill / a --host-cmd-after trigger. Requires
+//          a view: --screen/--display/--host-session.)
+//         [--host-serial-send <line>] (M114d #2457, index #2447: arm the
+//          inspector drawer's input line — the send-serial verb (a
+//          --host-cmd-after trigger, or the drawer's Send) writes it into
+//          the console pipe, the same path --script forwards through.
+//          The dispatch receipts `disabled` without a guest RX path:
+//          --script/--console/--host-session/--vz-restore provide one.)
 //         [--cvc-console-file <path>] (claim 0680: structured console —
 //          capture every queue-1 guest log line to <path>; also arms the
 //          guest's console tee with a kind-3 control message once the pool
@@ -145,6 +165,20 @@
 //          host clock for every served timestamp, so a gate can prove the
 //          guest clock really moved; default 0; requires
 //          --net-sntp-respond.)
+//         [--net-ra-respond <v6-prefix>/64] [--net-ndp-respond <v6-addr>]
+//          [--net-icmp6-respond <v6-addr>] (M117b #2474, ADR 0057 D10: the
+//          three v6 hermetic responders — request-driven synthesizers in
+//          the capture thread, the --net-arp-respond shape. On a guest
+//          Router Solicitation, --net-ra-respond answers with an RA from
+//          the router link-local fe80::ff:fe00:2 carrying the argument
+//          /64 prefix as an A+L PIO. On a guest Neighbor Solicitation
+//          whose target is a listed address, --net-ndp-respond (repeatable)
+//          answers with an NA (S=1 O=1, TLLA 02:00:00:00:00:02); when
+//          --net-ra-respond is set the router link-local is implicitly
+//          listed. On an ICMPv6 echo request for the address,
+//          --net-icmp6-respond answers with the echo reply — id/seq/
+//          payload byte-exact. All require --net. An unlisted target or
+//          an unset flag goes unanswered — the refusal leg.)
 //         [--net-dhcp-respond <lease-ip>] (milestone five card N8, claim
 //          0351: a tiny deterministic host-side DHCP server inside the
 //          capture thread — the guest's DHCPDISCOVER is answered with an
@@ -635,6 +669,27 @@ var hostDrop: HostDrop?
 // banners under the session bundle (bare runner: `no_bundle` drops).
 var hostNotifyFlag = false
 var hostNotify: HostNotify?
+// M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
+// headless mirror of the HostCommand bus every menu item dispatches on
+// (index thesis 1: AppKit is never driven by synthesized clicks; the bus
+// is the testable seam). Repeatable; each armed trigger fires once on
+// its serial marker and the dispatch emits one `host-ui:` receipt.
+var hostCmdTriggers: [HostCommandTrigger] = []
+// M114b (#2455): `--host-capture-keys` arms the machine view's
+// capturesSystemKeys at startup — by dispatching the capture-keys verb
+// on the bus once setupDisplayWindow has built the view, so the receipt
+// is identical to ⌥⌘K / the toolbar pill / a --host-cmd-after trigger.
+var hostCaptureKeys = false
+// M114d (#2457, index #2447): the inspector drawer's model — ONE
+// instance for the run. The serial polls feed it the growing log; the
+// `inspector`/`send-serial` verbs act on it; a session window's drawer
+// renders the same object, so a headless --host-cmd-after run exercises
+// the identical seam the open drawer does.
+let inspector = HostInspector()
+// `--host-serial-send <line>`: arms the drawer's input line headlessly —
+// the send-serial verb (a --host-cmd-after trigger, or the drawer's own
+// Send) writes it into the console pipe exactly as the field would.
+var hostSerialSend: String?
 // The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
 // ARMED record naming every live lane — the seat adopts (epoch, mask), so
 // per-lane epochs would refuse each other stale_epoch forever.
@@ -707,6 +762,29 @@ var netArpRespondHostIP: [UInt8]?
 // Driven by the guest's actual request bytes, not a sleep. nil = the
 // guest's echo requests go unanswered (the default VM is unchanged).
 var netIcmpRespondHostIP: [UInt8]?
+// M117b (issue #2474, ADR 0057 D10): the three v6 hermetic responders —
+// request-driven synthesizers inside the capture thread, the
+// --net-arp-respond shape. `--net-ra-respond <v6-prefix>/64` answers a
+// guest Router Solicitation with a Router Advertisement from the router
+// link-local fe80::ff:fe00:2 (the EUI-64 derivation of the fixed host
+// MAC, deterministic + gate-assertable) carrying the argument prefix as
+// an A+L /64 PIO. `--net-ndp-respond <v6-addr>` (repeatable) answers a
+// guest Neighbor Solicitation whose target is a listed address with a
+// Neighbor Advertisement (S=1 O=1, TLLA 02:00:00:00:00:02); when
+// --net-ra-respond is set the router link-local is implicitly listed —
+// the guest's router-resolution NS is answered without a second flag.
+// An NS for an unlisted target goes unanswered (the refusal leg).
+// `--net-icmp6-respond <v6-addr>` answers an ICMPv6 echo request for the
+// address byte-exact (id/seq/payload, the --net-icmp-respond mirror).
+// All write into the SAME attachment socket end (VZ reads fds[0], so
+// the guest receives it). nil flag = unanswered = the default VM
+// unchanged.
+var netRaRespondPrefix: [UInt8]? // the advertised /64 (16 bytes, IID bits zero)
+var netNdpRespondAddrs: [[UInt8]] = []
+var netIcmp6RespondAddr: [UInt8]?
+// The hermetic router's link-local — the modified-EUI-64 derivation of
+// the fixed host MAC 02:00:00:00:00:02 (ADR 0057 D10).
+let netRouterLinkLocal: [UInt8] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x02]
 // Milestone five card N5 (claim 8552): `--net-udp-respond <host-ip>:<host-port>`
 // answers the guest's UDP datagrams from the HOST side — a tiny
 // deterministic host-side UDP responder inside the capture thread: when
@@ -1352,6 +1430,25 @@ while idx < arguments.count {
     } else if arg == "--host-drop-after", idx + 1 < arguments.count {
         hostDropAfter = arguments[idx + 1]
         idx += 2
+    } else if arg == "--host-capture-keys" {
+        hostCaptureKeys = true
+        idx += 1
+    } else if arg == "--host-cmd-after", idx + 1 < arguments.count {
+        // M114a: <marker>:<verb> — the verb is the suffix after the LAST
+        // colon (serial markers may carry their own). An unknown verb is
+        // a parse-time error, not a trigger that silently never fires.
+        guard let trigger = HostCommandTrigger(arguments[idx + 1]) else {
+            fail("--host-cmd-after expects <marker>:<verb>; verbs are: \(HostCommand.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        hostCmdTriggers.append(trigger)
+        idx += 2
+    } else if arg == "--host-serial-send", idx + 1 < arguments.count {
+        // M114d (#2457): arms the inspector's input line — a
+        // `--host-cmd-after …:send-serial` trigger writes it into the
+        // console pipe, the same path --script forwards through.
+        hostSerialSend = arguments[idx + 1]
+        inspector.inputLine = hostSerialSend!
+        idx += 2
     } else if arg == "--host-notify" {
         // M108d (#2328, ADR 0051 D5): the notify-out lane — seat toasts
         // become signed NOTIFY_OUT records the runner maps to banners
@@ -1430,6 +1527,31 @@ while idx < arguments.count {
             fail("--net-icmp-respond requires a dotted-quad IPv4 address, got '\(arguments[idx + 1])'.")
         }
         netIcmpRespondHostIP = parts
+        idx += 2
+    } else if arg == "--net-ra-respond", idx + 1 < arguments.count {
+        // M117b: <v6-prefix>/64 — e.g. 2001:db8:64::/64 (the advertised
+        // PIO; the IID bits belong to the guest, the responder zeroes
+        // them so the advertised prefix is honest).
+        let halves = arguments[idx + 1].split(separator: "/")
+        guard halves.count == 2, Int(halves[1]) == 64,
+              var pfx = parseIPv6(String(halves[0])) else {
+            fail("--net-ra-respond requires a v6 /64 prefix like 2001:db8:64::/64, got '\(arguments[idx + 1])'.")
+        }
+        for i in 8..<16 { pfx[i] = 0 }
+        netRaRespondPrefix = pfx
+        idx += 2
+    } else if arg == "--net-ndp-respond", idx + 1 < arguments.count {
+        // M117b: repeatable — each instance lists one answerable target.
+        guard let addr = parseIPv6(arguments[idx + 1]) else {
+            fail("--net-ndp-respond requires a v6 address, got '\(arguments[idx + 1])'.")
+        }
+        netNdpRespondAddrs.append(addr)
+        idx += 2
+    } else if arg == "--net-icmp6-respond", idx + 1 < arguments.count {
+        guard let addr = parseIPv6(arguments[idx + 1]) else {
+            fail("--net-icmp6-respond requires a v6 address, got '\(arguments[idx + 1])'.")
+        }
+        netIcmp6RespondAddr = addr
         idx += 2
     } else if arg == "--net-udp-respond", idx + 1 < arguments.count {
         // Parse the host ip:port now (fail early, like --timeout).
@@ -1756,6 +1878,22 @@ while idx < arguments.count {
 // interactive variant of the duplex console plumbing (claim 6684).
 let consoleTimeout: TimeInterval = (consoleMode && !timeoutExplicit) ? 0 : timeout
 let scriptMode = scriptPath != nil
+
+// M114a: --host-cmd-after's marker scan runs on the scripted/session
+// polls; refuse silently-never-firing modes up front.
+if !hostCmdTriggers.isEmpty, !scriptMode, !hostSessionMode {
+    fail("--host-cmd-after requires --script or --host-session (the serial-marker scan runs on the scripted and session polls).")
+}
+// M114b: --host-capture-keys needs a VZVirtualMachineView to capture keys
+// into (--host-session implies --display by its own validation).
+if hostCaptureKeys, screenshotPath == nil, !displayMode {
+    fail("--host-capture-keys requires --screen/--display or --host-session (there is no VZVirtualMachineView to capture keys into).")
+}
+// M114d: the injector is single-line — a newline would smuggle extra
+// commands past the drawer's one-line contract.
+if let line = hostSerialSend, line.contains("\n") {
+    fail("--host-serial-send takes a single line (no newline).")
+}
 
 // ---------------------------------------------------------------------------
 // Terminal state management (used in console mode; no-ops elsewhere).
@@ -2228,7 +2366,10 @@ if consoleMode || scriptMode {
         fail("Could not open serial log at \(serialURL.path): \(error)")
     }
     serialConfig.attachment = VZFileHandleSerialPortAttachment(
-        fileHandleForReading: vzRestore ? consoleInputPipe.fileHandleForReading : nil,
+        // M114d (#2457): --host-session gets the read end too — the
+        // drawer's injector (send-serial) needs a guest RX path; vzRestore
+        // already needed it for the probe's serial query.
+        fileHandleForReading: (vzRestore || hostSessionMode) ? consoleInputPipe.fileHandleForReading : nil,
         fileHandleForWriting: serialHandle
     )
 }
@@ -2304,6 +2445,15 @@ if netInjectPath != nil, netCapturePath == nil {
 }
 if netArpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-arp-respond requires --net (the ARP reply is written into the SAME attachment's socket).")
+}
+if netRaRespondPrefix != nil, netCapturePath == nil {
+    fail("--net-ra-respond requires --net (the RA is written into the SAME attachment's socket).")
+}
+if !netNdpRespondAddrs.isEmpty, netCapturePath == nil {
+    fail("--net-ndp-respond requires --net (the NA is written into the SAME attachment's socket).")
+}
+if netIcmp6RespondAddr != nil, netCapturePath == nil {
+    fail("--net-icmp6-respond requires --net (the echo reply is written into the SAME attachment's socket).")
 }
 if netIcmpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-icmp-respond requires --net (the ICMP reply is written into the SAME attachment's socket).")
@@ -2542,6 +2692,34 @@ if let netCapturePath {
                 buildIcmpEchoReply(&reply, buf, n, arpHostMAC, hostIP)
                 try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 print("NET-ICMP: answered the guest's echo request for \(hostIP[0]).\(hostIP[1]).\(hostIP[2]).\(hostIP[3]) (id \(reply[38] << 8 | reply[39]), seq \(reply[40] << 8 | reply[41]))")
+            }
+            // M117b (#2474, ADR 0057 D10): the three v6 responders — the
+            // same request-driven shape as the N3 ARP responder. A guest
+            // Router Solicitation is answered with the hermetic RA (src
+            // the router link-local, dst all-nodes — the guest's D2
+            // filter admits it); an NS for a listed target (explicit
+            // --net-ndp-respond entries + the router link-local when
+            // --net-ra-respond is set) is answered with the NA; an
+            // ICMPv6 echo request for the listed address is answered
+            // byte-exact. Unlisted targets and unset flags go
+            // unanswered — the refusal leg.
+            if let pfx = netRaRespondPrefix, isRouterSolicitation(buf, n) {
+                var reply = [UInt8](repeating: 0, count: 102)
+                buildRouterAdvertisement(&reply, arpHostMAC, pfx)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                print("NET-RA: answered the guest's router solicitation with an RA advertising \(v6Text(pfx))/64 from fe80::ff:fe00:2")
+            }
+            if isNeighborSolicitation(buf, n), let target = ndpRespondTarget(buf, n) {
+                var reply = [UInt8](repeating: 0, count: 86)
+                buildNeighborAdvertisement(&reply, buf, n, arpHostMAC, target)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                print("NET-NDP: answered the guest's neighbor solicitation for \(v6Text(target)) (NA S=1 O=1, host MAC 02:00:00:00:00:02)")
+            }
+            if let addr = netIcmp6RespondAddr, isIcmp6EchoRequest(buf, n, addr) {
+                var reply = [UInt8](repeating: 0, count: n)
+                buildIcmp6EchoReply(&reply, buf, n, arpHostMAC)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                print("NET-ICMP6: answered the guest's echo request for \(v6Text(addr)) (id \(reply[58] << 8 | reply[59]), seq \(reply[60] << 8 | reply[61]))")
             }
             // Card N5: if the guest sent a UDP datagram to our ip:port,
             // echo it back from the host (same socket direction; the
@@ -3046,8 +3224,97 @@ let vmDelegate = VMRunnerDelegate()
 let runner = Runner(configuration: config)
 runner.vm.delegate = vmDelegate
 if hostSessionMode {
-    hostApplication = HostApplication(serialLog: serialLogPath)
+    hostApplication = HostApplication(serialLog: serialLogPath, inspector: inspector)
     hostApplication?.onStop = { reason, code in stopHostSession(reason, code: code) }
+}
+// M114a (#2454): the bus every UI action dispatches through — the session
+// window's own instance when it exists, a windowless one otherwise, so
+// --host-cmd-after dispatches verbs down the identical seam the menus use.
+let commandBus = hostApplication?.commandBus ?? HostCommandBus()
+// The verbs the runner performs itself: the framebuffer capture the
+// --screen/--screenshot-after path already owns (enabled once the display
+// view exists), and a headless stop/quit for runs with no session window
+// (in --host-session those verbs come from HostApplication's own
+// registration instead).
+if screenshotPath != nil || displayMode {
+    var hostUIShotCount = 0
+    commandBus.register(.screenshot, HostCommandBus.Registration(isEnabled: {
+        machineView != nil
+    }) {
+        hostUIShotCount += 1
+        let path = screenshotPathForLabel("hostui-\(hostUIShotCount)")
+        writeScreenshot(to: path)
+        return FileManager.default.fileExists(atPath: path) ? .performed : .failed
+    })
+}
+// M114b (#2455): the headless viewport verbs — the same two the session
+// window registers on its own bus instance in HostApplication, here bound
+// to the scripted run's evidence window + machine view so --host-cmd-after
+// exercises the identical seam. (In --host-session HostApplication's own
+// registrations stand; the runner never overwrites them.)
+if !hostSessionMode, screenshotPath != nil || displayMode {
+    commandBus.register(.fullscreen, HostCommandBus.Registration(
+        isEnabled: { machineWindow?.isVisible ?? false },
+        itemState: { machineWindow?.styleMask.contains(.fullScreen) ?? false }
+    ) {
+        machineWindow?.toggleFullScreen(nil)
+        return .performed
+    })
+    commandBus.register(.captureKeys, HostCommandBus.Registration(
+        isEnabled: { machineView != nil },
+        itemState: { machineView?.capturesSystemKeys ?? false },
+        receiptDetail: {
+            guard let view = machineView else { return nil }
+            return "capture=\(view.capturesSystemKeys ? "on" : "off")"
+        }
+    ) {
+        guard let view = machineView else { return .failed }
+        view.capturesSystemKeys.toggle()
+        return .performed
+    })
+}
+if !hostSessionMode {
+    let headlessStop = HostCommandBus.Registration(isEnabled: { runner.vm.state == .running }) {
+        runner.queue.async { runner.vm.stop { _ in } }
+        return .performed
+    }
+    commandBus.register(.stop, headlessStop)
+    commandBus.register(.quit, headlessStop)
+}
+// M114d (#2457): the inspector drawer verbs. The model's serialSink is
+// the console pipe's write end wherever a guest RX path exists (the
+// --script/--console duplex attachment, --vz-restore's probe input, or
+// --host-session's read end) — without one the verb receipts `disabled`
+// instead of writing into a pipe nobody reads. `send-serial` is the
+// same registration in every mode, like screenshot: the drawer's Send
+// and --host-cmd-after dispatch it identically.
+if consoleMode || scriptMode || hostSessionMode || vzRestore {
+    inspector.serialSink = { line in
+        do {
+            try consoleInputPipe.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8))
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+commandBus.register(.sendSerial, HostCommandBus.Registration(
+    isEnabled: { inspector.serialSink != nil },
+    receiptDetail: { "sent=\(inspector.sentCount)" }
+) {
+    inspector.inject() ? .performed : .failed
+})
+if !hostSessionMode {
+    // Headless: no split pane exists, but the toggle is still honest —
+    // isOpen is model state a receipt reports (the session window
+    // registers its own pane-sliding variant in HostApplication).
+    commandBus.register(.inspector, HostCommandBus.Registration(
+        itemState: { inspector.isOpen },
+        receiptDetail: { inspector.receiptDetail }
+    ) {
+        inspector.isOpen.toggle()
+        return .performed
+    })
 }
 // Set when vm.start completes successfully; consolePoll only treats a
 // .stopped/.error state as "session over" after the VM has actually started
@@ -3113,6 +3380,15 @@ if consoleMode {
         print("  nvram console: \(nvramConsolePath)  (claim 0015 — post-exit console stream from the NVRAM channel; exit 0 iff bytes were found)")
     }
 }
+for t in hostCmdTriggers {
+    print("  host-cmd-after: \"\(t.marker)\" → \(t.command.rawValue)  (M114a #2454: HostCommand bus mirror — dispatch emits a host-ui: receipt)")
+}
+if let line = hostSerialSend {
+    print("  host-serial-send: \(line.utf8.count) bytes armed  (M114d #2457: the send-serial verb / drawer injector writes the line into the console pipe)")
+}
+if hostCaptureKeys {
+    print("  host-capture-keys: ENABLED (M114b #2455) — capture-keys dispatches on the HostCommand bus once the machine view exists; the host-ui: receipt is the same one ⌥⌘K / the toolbar pill emit")
+}
 if let netCapturePath {
     print("  net: ENABLED (milestone five card N1, claim 1373) — virtio-net device attached, guest TX frames captured byte-exactly to \(netCapturePath), fixed MAC 02:00:00:00:00:01")
 }
@@ -3170,6 +3446,16 @@ if let hostIP = netArpRespondHostIP {
 if let hostIP = netIcmpRespondHostIP {
     let ipText = hostIP.map(String.init).joined(separator: ".")
     print("  net-icmp-respond: ENABLED (milestone five card N4, claim 0148) — the host answers the guest's ICMP echo requests for \(ipText) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if let pfx = netRaRespondPrefix {
+    print("  net-ra-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's router solicitations with an RA from fe80::ff:fe00:2 advertising \(v6Text(pfx))/64 (A+L, host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if !netNdpRespondAddrs.isEmpty || netRaRespondPrefix != nil {
+    let names = netNdpRespondAddrs.map { v6Text($0) }.joined(separator: ", ")
+    print("  net-ndp-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's neighbor solicitations for [\(names)]\(netRaRespondPrefix != nil ? " plus the router link-local fe80::ff:fe00:2" : "") (NA S=1 O=1, host MAC 02:00:00:00:00:02) via the capture thread; unlisted targets go unanswered")
+}
+if let addr = netIcmp6RespondAddr {
+    print("  net-icmp6-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's ICMPv6 echo requests for \(v6Text(addr)) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
 }
 if let hostIP = netUdpRespondHostIP, let hostPort = netUdpRespondHostPort {
     let ipText = hostIP.map(String.init).joined(separator: ".")
@@ -3262,7 +3548,7 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
             mask |= HostInt.laneDrop
             dropWanted = true
         } else {
-            HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
+            hostIntRefuse("drop", .laneDisabled)
         }
     }
     if hostNotifyFlag {
@@ -3311,6 +3597,12 @@ runner.queue.async {
             if hostSessionMode {
                 FileHandle.standardError.write(Data("ERROR: VM failed to start: \(error)\n".utf8))
                 DispatchQueue.main.async {
+                    // M114d (#2457): a start refusal gets the crash card
+                    // too — the drawer opens on it.
+                    inspector.noteStop(PostmortemCard(
+                        ending: .crashed, state: "start",
+                        reason: StopReasonRecorder.describe(error),
+                        serialLines: inspector.ingestedCount))
                     hostApplication?.showFailure("VM failed to start: \(error)")
                 }
                 return
@@ -3362,7 +3654,11 @@ func setupDisplayWindow() {
     } else {
         app.setActivationPolicy(.accessory)
     }
-    let window = hostApplication?.window ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled], backing: .buffered, defer: false)
+    // M114b: the evidence window gets the same resizable + 16:9-locked
+    // chrome as the session window, so the fullscreen/capture-keys verbs
+    // performed on it are real, not just receipted.
+    let window = hostApplication?.window ?? NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+    window.contentAspectRatio = NSSize(width: 16, height: 9)
     let view = TraceView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
     view.trace = ["direct", "diag", "pid", "drag", "warp", "cg"].contains(pointerRoute)
     view.nativeInput = nativeInput
@@ -3425,6 +3721,12 @@ func setupDisplayWindow() {
     }
     machineView = view
     machineWindow = window
+    // M114b (#2455): --host-capture-keys rides the bus — one dispatch once
+    // the view exists, so startup capture lands in the same host-ui:
+    // receipt as ⌥⌘K / the toolbar pill / a --host-cmd-after trigger.
+    if hostCaptureKeys, machineView?.capturesSystemKeys == false {
+        commandBus.dispatch(.captureKeys)
+    }
 }
 
 // Milestone six card G1 (claim 6053): the 5/10/15 s screenshot capture,
@@ -3454,16 +3756,20 @@ func captureScreenshot(at t: TimeInterval) {
 // ONCE the moment the marker appears in the serial log, under a stable
 // `-<label>` name (deterministic — the fixed 5/10/15 s captures cannot
 // guarantee a capture lands inside an EL0 hide/show window).
-func captureScreenshotMarker(_ label: String) {
-    let path: String
+// The `-<label>` path naming shared by --screenshot-after and the bus's
+// screenshot verb (M114a): <base>-<label>[.<ext>], or artifacts/ when no
+// --screen base was given.
+func screenshotPathForLabel(_ label: String) -> String {
     if let base = screenshotPath {
         let dot = (base as NSString).deletingPathExtension
         let ext = (base as NSString).pathExtension
-        path = ext.isEmpty ? "\(dot)-\(label)" : "\(dot)-\(label).\(ext)"
-    } else {
-        path = "artifacts/vm-screen-\(label).png"
+        return ext.isEmpty ? "\(dot)-\(label)" : "\(dot)-\(label).\(ext)"
     }
-    writeScreenshot(to: path)
+    return "artifacts/vm-screen-\(label).png"
+}
+
+func captureScreenshotMarker(_ label: String) {
+    writeScreenshot(to: screenshotPathForLabel(label))
 }
 
 // Shared capture body (ScreenCaptureKit first, cacheDisplay fallback):
@@ -3941,7 +4247,7 @@ func writeMarkerDump(to path: String, ladder: [(name: String, offset: Int)]) {
 
 func poll() {
     if let data = try? Data(contentsOf: serialURL), let text = String(data: data, encoding: .utf8) {
-        if !text.isEmpty { lastText = text }
+        if !text.isEmpty { lastText = text; feedInspector(text) }
         serialMatched = text.contains(expectLine)
         if let terminalMarker { terminalMatched = text.contains(terminalMarker) }
         if serialMatched && terminalMatched {
@@ -4044,7 +4350,7 @@ func fireHostDropIfMarker(_ text: String) {
           text.contains(marker) else { return }
     hostDropFired = true
     guard let lane = hostDrop else {
-        HostInt.logRefuse(lane: "drop", reason: .laneDisabled)
+        hostIntRefuse("drop", .laneDisabled)
         return
     }
     FileHandle.standardOutput.write(Data("host-drop: inject files=\(hostDropFiles.count) after \"\(marker)\"\n".utf8))
@@ -4072,6 +4378,46 @@ func fireHostWriteIfMarker(_ text: String) {
         FileHandle.standardOutput.write(Data("HOST-WRITE: wrote \(relPath) (\(payload.utf8.count) bytes) after \"\(marker)\"\n".utf8))
     } catch {
         FileHandle.standardOutput.write(Data("HOST-WRITE: FAILED for \(relPath): \(error)\n".utf8))
+    }
+}
+
+// M114d (#2457): the inspector's feed — every poll hands it the same
+// serial-log snapshot it just read (the model's offset ingest keeps only
+// the new lines), plus a lane-directory seq scan when HostInt is armed:
+// a record filename's seq counts whether or not the file survives to the
+// next tick. Runs before fireHostCmdsIfMarker so a verb firing on a
+// marker this tick already saw the line ingested — `saw=` in a receipt
+// is then the model's truth, not a race.
+func feedInspector(_ text: String) {
+    inspector.ingest(serialText: text)
+    if let laneDir = hostIntSession?.laneDir {
+        for tag in [HostInt.Tag.clipIn, .clipOut, .notifyOut, .drop] {
+            for (_, seq) in HostInt.records(laneDir: laneDir, tag: tag) ?? [] {
+                inspector.noteHostIntSeq(seq)
+            }
+        }
+    }
+}
+
+// The runner's own `host-int: refuse` sites report to the model too —
+// lane-internal refusals reach stdout only (the model doc names that
+// limit); these are the refusals main.swift itself emits.
+func hostIntRefuse(_ lane: String, _ reason: HostInt.Refusal) {
+    HostInt.logRefuse(lane: lane, reason: reason)
+    inspector.noteHostMarker("host-int: refuse lane=\(lane) reason=\(reason.rawValue)")
+}
+
+// M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
+// headless mirror of the HostCommand bus. When a trigger's marker appears
+// in the serial stream the verb dispatches through the SAME bus the
+// AppKit menu items use, so a class-B run exercises the real seam instead
+// of a synthesized click (index thesis 1). Each trigger fires once; the
+// dispatch itself writes the `host-ui:` receipt.
+func fireHostCmdsIfMarker(_ text: String) {
+    for i in hostCmdTriggers.indices {
+        guard !hostCmdTriggers[i].fired, text.contains(hostCmdTriggers[i].marker) else { continue }
+        hostCmdTriggers[i].fired = true
+        commandBus.dispatch(hostCmdTriggers[i].command)
     }
 }
 
@@ -5017,6 +5363,13 @@ final class TraceView: VZVirtualMachineView {
     }
 }
 
+// M114b (#2455): the session window's capture-keys verb toggles the view
+// through the HostKeyCapturing seam — VMAppKit stays Virtualization-free,
+// so the retroactive conformance lives here where Virtualization is
+// already imported. `capturesSystemKeys` is inherited from
+// VZVirtualMachineView and satisfies the protocol as-is.
+extension TraceView: HostKeyCapturing {}
+
 func pmo(_ s: String) {
     FileHandle.standardOutput.write(Data("PTR-TRACE: \(s)\n".utf8))
 }
@@ -5707,6 +6060,208 @@ func isIcmpEchoRequest(_ buf: [UInt8], _ n: Int, _ hostIP: [UInt8]) -> Bool {
     for w in words { sum += UInt32(w) }
     while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
     return UInt16(~sum & 0xffff)
+}
+
+// M117b (#2474, ADR 0057 D10): parse a text IPv6 address — any
+// inet_pton-legal form ("::" compression, mixed case). The runner is a
+// host process; Darwin's inet_pton is the honest parser (no hand-rolled
+// hex walk).
+@Sendable func parseIPv6(_ text: String) -> [UInt8]? {
+    var addr = in6_addr()
+    return text.withCString { cstr in
+        guard inet_pton(AF_INET6, cstr, &addr) == 1 else { return nil }
+        return withUnsafeBytes(of: &addr) { Array($0) }
+    }
+}
+
+// M117b: the canonical text form of a v6 address (inet_ntop — the same
+// compressed shape the guest's formatter emits for these values).
+@Sendable func v6Text(_ a: [UInt8]) -> String {
+    var addr = in6_addr()
+    withUnsafeMutableBytes(of: &addr) { $0.copyBytes(from: a) }
+    var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+    inet_ntop(AF_INET6, &addr, &buf, socklen_t(INET6_ADDRSTRLEN))
+    return String(cString: buf)
+}
+
+// M117b: the ICMPv6 pseudo-header checksum — 16-byte src + dst, the
+// 32-bit upper-layer length, 3 zero bytes + next-header — over `msg`
+// (RFC 8200 §8.1; the checksum field must be zero during the build).
+@Sendable func icmp6Checksum(_ srcIP: [UInt8], _ dstIP: [UInt8], _ msg: [UInt8], _ nextHeader: UInt8) -> UInt16 {
+    var sum: UInt32 = 0
+    var i = 0
+    while i < 16 {
+        sum += (UInt32(srcIP[i]) << 8) | UInt32(srcIP[i + 1])
+        sum += (UInt32(dstIP[i]) << 8) | UInt32(dstIP[i + 1])
+        i += 2
+    }
+    sum += UInt32(msg.count >> 16) + UInt32(msg.count & 0xffff)
+    sum += UInt32(nextHeader)
+    i = 0
+    while i + 1 < msg.count {
+        sum += (UInt32(msg[i]) << 8) | UInt32(msg[i + 1])
+        i += 2
+    }
+    if i < msg.count { sum += UInt32(msg[i]) << 8 }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
+    return UInt16(~sum & 0xffff)
+}
+
+// M117b: is the datagram an IPv6 frame carrying ICMPv6 of the given
+// type? Ethernet II ethertype 0x86dd, version 6, next-header 58 (the
+// guest sends terminal next-headers only), the ICMPv6 type byte at 54.
+@Sendable func isIcmp6Type(_ buf: [UInt8], _ n: Int, _ type: UInt8) -> Bool {
+    guard n >= 56 else { return false }
+    guard buf[12] == 0x86 && buf[13] == 0xdd else { return false }
+    guard buf[14] >> 4 == 0x6 else { return false }
+    guard buf[20] == 58 else { return false }
+    return buf[54] == type
+}
+
+@Sendable func isRouterSolicitation(_ buf: [UInt8], _ n: Int) -> Bool {
+    return isIcmp6Type(buf, n, 133)
+}
+
+@Sendable func isNeighborSolicitation(_ buf: [UInt8], _ n: Int) -> Bool {
+    return isIcmp6Type(buf, n, 135)
+}
+
+// M117b: the NS's target when it names an answerable address — an
+// explicit --net-ndp-respond entry, or the router link-local implicitly
+// listed by --net-ra-respond (the guest's router-resolution NS is
+// answered without a second flag). nil = unanswered (the refusal leg).
+@Sendable func ndpRespondTarget(_ buf: [UInt8], _ n: Int) -> [UInt8]? {
+    guard n >= 78 else { return nil }
+    let target = [UInt8](buf[62..<78])
+    for a in netNdpRespondAddrs where a == target { return target }
+    if netRaRespondPrefix != nil, target == netRouterLinkLocal { return target }
+    return nil
+}
+
+// M117b: is the datagram an ICMPv6 echo request for `addr`?
+@Sendable func isIcmp6EchoRequest(_ buf: [UInt8], _ n: Int, _ addr: [UInt8]) -> Bool {
+    guard isIcmp6Type(buf, n, 128) else { return false }
+    return [UInt8](buf[38..<54]) == addr
+}
+
+// M117b: synthesize the ROUTER ADVERTISEMENT to a guest RS: dst
+// all-nodes (33:33:00:00:00:01 / ff02::1 — the guest's D2 filter admits
+// it), src the router link-local, hop 255, cur-hop 64, M|O 0, router
+// lifetime 1800, reachable/retrans 0, ONE Prefix Information option
+// carrying the argument /64 with A+L and finite recorded lifetimes
+// (valid 86400, preferred 14400). 102 bytes total.
+@Sendable func buildRouterAdvertisement(_ reply: inout [UInt8], _ hostMAC: [UInt8], _ prefix: [UInt8]) {
+    reply = [UInt8](repeating: 0, count: 102)
+    reply[0...5] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01] // all-nodes dst
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd
+    reply[14] = 0x60 // version 6
+    reply[18] = 0
+    reply[19] = 48 // payload_len: 16-byte RA fixed part + 32-byte PIO
+    reply[20] = 58 // ICMPv6
+    reply[21] = 255 // hop limit — the NDP standing check
+    reply[22...37] = netRouterLinkLocal[0...15] // src = the router link-local
+    reply[38] = 0xff
+    reply[39] = 0x02
+    reply[53] = 0x01 // dst = ff02::1 (all-nodes)
+    let src = netRouterLinkLocal
+    var dst = [UInt8](repeating: 0, count: 16)
+    dst[0] = 0xff
+    dst[1] = 0x02
+    dst[15] = 0x01
+    // ICMPv6 RA: type 134, code 0, checksum, cur-hop 64, flags 0,
+    // lifetime 1800, reachable 0, retrans 0.
+    reply[54] = 134
+    reply[58] = 64
+    reply[60] = 0x07
+    reply[61] = 0x08 // router lifetime 1800
+    // PIO at 70: type 3, len 4, prefix_len 64, flags A|L (0xc0),
+    // valid 86400, preferred 14400, reserved 0, prefix.
+    reply[70] = 3
+    reply[71] = 4
+    reply[72] = 64
+    reply[73] = 0xc0
+    reply[74] = 0
+    reply[75] = 1
+    reply[76] = 0x51
+    reply[77] = 0x80 // valid lifetime 86400
+    reply[78] = 0
+    reply[79] = 0
+    reply[80] = 0x46
+    reply[81] = 0x50 // preferred lifetime 14400
+    reply[86...101] = prefix[0...15]
+    let chk = icmp6Checksum(src, dst, [UInt8](reply[54..<102]), 58)
+    reply[56] = UInt8(chk >> 8)
+    reply[57] = UInt8(chk & 0xff)
+}
+
+// M117b: synthesize the NEIGHBOR ADVERTISEMENT to the guest's NS in
+// `req`: dst = the request's observed Ethernet source (all-nodes when
+// its v6 src was :: — the DAD answer), src = the solicited `target`,
+// flags S|O, target echoed, TLLA = the host MAC, hop 255. 86 bytes.
+@Sendable func buildNeighborAdvertisement(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ target: [UInt8]) {
+    reply = [UInt8](repeating: 0, count: 86)
+    let reqSrc = [UInt8](req[22..<38])
+    let unspecified = reqSrc == [UInt8](repeating: 0, count: 16)
+    if unspecified {
+        reply[0...5] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01] // all-nodes
+    } else {
+        reply[0...5] = req[6...11] // dst = the observed src MAC
+    }
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd
+    reply[14] = 0x60
+    reply[18] = 0
+    reply[19] = 32 // payload_len: flags(4) + target(16) + TLLA(8) + hdr(4)
+    reply[20] = 58
+    reply[21] = 255
+    reply[22...37] = target[0...15] // src = the solicited target
+    if unspecified {
+        reply[38] = 0xff
+        reply[39] = 0x02
+        reply[53] = 0x01 // dst = ff02::1
+    } else {
+        reply[38...53] = reqSrc[0...15] // dst = the requester's address
+    }
+    reply[54] = 136 // NA
+    reply[58] = 0x60 // flags S|O
+    reply[62...77] = target[0...15] // target echoed
+    reply[78] = 2 // TLLA option type
+    reply[79] = 1 // length 1
+    reply[80...85] = hostMAC[0...5]
+    let dst = [UInt8](reply[38..<54])
+    let chk = icmp6Checksum(target, dst, [UInt8](reply[54..<86]), 58)
+    reply[56] = UInt8(chk >> 8)
+    reply[57] = UInt8(chk & 0xff)
+}
+
+// M117b: synthesize the ICMPv6 ECHO REPLY to the echo request in `req`
+// — Ethernet dst/src swapped, v6 src/dst swapped (the reply's src is
+// the address it was sent to), hop 64, type 129, id/seq/payload echoed
+// byte-exact, the pseudo-header checksum recomputed.
+@Sendable func buildIcmp6EchoReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8]) {
+    reply = [UInt8](repeating: 0, count: n)
+    reply[0...5] = req[6...11] // dst = the requester's MAC
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd
+    reply[14] = 0x60
+    reply[18...19] = req[18...19] // payload_len (unchanged; TC/flow stays 0)
+    reply[20] = 58
+    reply[21] = 64 // hop limit — echo traffic, not NDP
+    reply[22...37] = req[38...53] // src = the addressed address
+    reply[38...53] = req[22...37] // dst = the requester's address
+    reply[54] = 129 // echo reply
+    if n > 58 {
+        reply[58...n - 1] = req[58...n - 1] // id + seq + payload echoed
+    }
+    let src = [UInt8](reply[22..<38])
+    let dst = [UInt8](reply[38..<54])
+    let chk = icmp6Checksum(src, dst, [UInt8](reply[54..<n]), 58)
+    reply[56] = UInt8(chk >> 8)
+    reply[57] = UInt8(chk & 0xff)
 }
 
 // Card N5 (claim 8552): is the datagram a UDP datagram addressed to
@@ -6587,7 +7142,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     }
     // Lossy decode (fix 1): invalid bytes become U+FFFD, never nil.
     let text = String(decoding: (try? Data(contentsOf: serialURL)) ?? Data(), as: UTF8.self)
-    if !text.isEmpty { lastText = text }
+    if !text.isEmpty { lastText = text; feedInspector(text) }
     if matchedAt == nil, let expect = scriptExpect, text.contains(expect) {
         // Claim 4912: the kernel prints the exec reap/report lines
         // (`tasks` / `procs <name> exited status=N`) from the shell idle
@@ -6618,6 +7173,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     fireHostWriteIfMarker(lastText)
     fireHostClipInIfMarker(lastText)
     fireHostDropIfMarker(lastText)
+    fireHostCmdsIfMarker(lastText)
     // Fix 3: the liveness heartbeat — unbuffered stderr every 30 s.
     if Date().timeIntervalSince(scriptPollLastBeat) >= 30 {
         scriptPollLastBeat = Date()
@@ -6703,10 +7259,23 @@ func stopHostSession(_ reason: String, code: Int32) {
 func hostSessionPoll() {
     guard let hostApplication,
           hostApplication.lifecycle.state != .stopping else { return }
+    // M114a: --host-cmd-after fires in session mode on the same serial-log
+    // scan the scripted poll uses — the mirror of choosing the menu item.
+    let sessionText = String(decoding: (try? Data(contentsOf: serialURL)) ?? Data(), as: UTF8.self)
+    if !sessionText.isEmpty { lastText = sessionText; feedInspector(sessionText) }
+    fireHostCmdsIfMarker(lastText)
     runner.queue.async {
         let state = runner.vm.state
         DispatchQueue.main.async {
             if vmDidStart && (state == .stopped || state == .error) {
+                // M114d (#2457): the in-window postmortem — the drawer
+                // opens itself on the stop/crash card (state + the VZ
+                // delegate's reason + how deep the serial tail is).
+                inspector.noteStop(PostmortemCard(
+                    ending: state == .error ? .crashed : .stopped,
+                    state: "\(state.rawValue)",
+                    reason: vmDelegate.stopReasons.reason ?? StopReasonRecorder.noReason,
+                    serialLines: inspector.ingestedCount))
                 hostApplication.showFailure("VM ended (state=\(state.rawValue)).\(vmDelegate.verdict())")
             } else if timeout > 0 && Date() > deadline {
                 hostApplication.stop("session-timeout")
@@ -6773,6 +7342,11 @@ func installSignalHandlers() {
 }
 
 func consolePoll() {
+    // M114d (#2457): the drawer's tail feeds off the same serial log the
+    // tee is writing — the model's offset ingest keeps only new lines.
+    if let text = try? String(contentsOf: serialURL, encoding: .utf8), !text.isEmpty {
+        feedInspector(text)
+    }
     let state = runner.vm.state
     if vmDidStart && (state == .stopped || state == .error) {
         // The VM already ended, so VZ closed the serial pipe — the tee is

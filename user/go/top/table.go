@@ -479,6 +479,16 @@ func (t *Table) SortBy(col Column) {
 func (t *Table) SortColumn() Column  { return t.col }
 func (t *Table) SortAscending() bool { return t.asc }
 
+// Names is every process's registry name in snapshot order — the join key
+// the trust tab works from (one sys_procs read feeds both views).
+func (t *Table) Names() []string {
+	out := make([]string, len(t.rows))
+	for i := range t.rows {
+		out[i] = t.rows[i].Name
+	}
+	return out
+}
+
 // Counts is (running, exited, total) over the snapshot.
 func (t *Table) Counts() (int, int, int) {
 	running, exited := 0, 0

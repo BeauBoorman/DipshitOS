@@ -100,6 +100,24 @@ final class StopReasonTests: XCTestCase {
         XCTAssertEqual(rec.verdictSuffix(), " reason=guest-powered-off")
     }
 
+    // MARK: - M114d (#2457): the in-window card's content model
+
+    /// The card's two endings are different headlines — "stopped" is a
+    /// VZ-narrated shutdown, "crashed" is an error state or a start
+    /// refusal — and the rows are the three facts in stable order.
+    func testPostmortemCardVocabularyAndRowOrder() {
+        let stopped = PostmortemCard(ending: .stopped, state: "3",
+                                   reason: StopReasonRecorder.cleanStop, serialLines: 42)
+        XCTAssertEqual(stopped.title, "VM stopped")
+        XCTAssertEqual(stopped.rows,
+                       ["state=3", "reason=guest-powered-off", "serial tail: 42 line(s)"])
+        let crashed = PostmortemCard(ending: .crashed, state: "4",
+                                   reason: "domain=VZErrorDomain code=1", serialLines: 0)
+        XCTAssertEqual(crashed.title, "VM crashed")
+        XCTAssertEqual(crashed.rows[0], "state=4")
+        XCTAssertEqual(crashed.rows[1], "reason=domain=VZErrorDomain code=1")
+    }
+
     // MARK: - the race the delegate queue creates
 
     /// VZ invokes the delegate on the VM's own queue while the runner's polls

@@ -31,3 +31,17 @@ func TestMmapHintRoundsToPage(t *testing.T) {
 		t.Fatalf("odd size should reach the syscall: %v", err)
 	}
 }
+
+func TestMunmapRejectsEmpty(t *testing.T) {
+	if err := Munmap(nil); err != errno(ErrEINVAL) {
+		t.Fatalf("nil unmap err = %v want EINVAL", err)
+	}
+}
+
+// Off the guest the slot-64 stub answers ENOSYS, matching MmapHint's
+// degrade — the wrapper must pass the syscall's verdict straight back.
+func TestMunmapHostDegrades(t *testing.T) {
+	if err := Munmap(make([]byte, PageSize)); err != errno(ErrENOSYS) {
+		t.Fatalf("host Munmap = %v want ENOSYS", err)
+	}
+}

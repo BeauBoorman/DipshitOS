@@ -15,7 +15,13 @@
 #      without this the shell has nothing to `exec`;
 #   3. boot with the GPU window + USB keyboard/pointing devices attached
 #      (`--display --input`);
-#   4. let the compiled boot default apply: M59 (issue #1298) flipped `wm`
+#   4. arm the M108 host-integration lanes by DEFAULT (M114c, issue #2456):
+#      provision the `host-int` credential in the share's SECRETS.TXT
+#      (app-bound to GOTABWM.ELF, which OWNERS.TXT names uid_system-owned)
+#      and boot with `--host-clipboard --host-drop --host-notify --sound
+#      --net-nat`. `--no-host-int` disarms the three lanes (and skips the
+#      credential); `--no-sound`/`--no-net-nat` switch their own feature;
+#   5. let the compiled boot default apply: M59 (issue #1298) flipped `wm`
 #      to the GO seat, so a boot lands in GOTABWM.ELF. The `.virelairc` in
 #      the share says so and offers the two escapes -- `settings set wm
 #      tabwm` for the Zig desktop, VIRELAI_SESSION_NO_TABWM=1
@@ -31,8 +37,15 @@
 # This is NOT a gate and is not run in CI.
 #
 # Usage:
-#   bash tools/session.sh            # windowed desktop
+#   bash tools/session.sh            # windowed desktop + host lanes armed
+#   bash tools/session.sh --no-host-int   # windowed desktop, lanes off
 #   just session
+#
+# Flags:
+#   --no-host-int    do NOT arm --host-clipboard/--host-drop/--host-notify
+#                    (and skip the host-int credential provisioning)
+#   --no-sound       do not attach the audio device
+#   --no-net-nat     do not attach the NAT network device
 #
 # Environment:
 #   VIRELAI_SESSION_SHARE=<dir>      share directory (default artifacts/session-share)
@@ -50,6 +63,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+HOST_INT=1
+SOUND=1
+NET_NAT=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-host-int) HOST_INT=0 ;;
+        --no-sound)    SOUND=0 ;;
+        --no-net-nat)  NET_NAT=0 ;;
+        *) echo "session: unknown argument '$arg' (supported: --no-host-int --no-sound --no-net-nat)" >&2; exit 2 ;;
+    esac
+done
 
 SHARE="${VIRELAI_SESSION_SHARE:-$ROOT/artifacts/session-share}"
 SERIAL_LOG="$ROOT/artifacts/session-serial.log"
@@ -203,6 +228,36 @@ fi
 clock_secs=$(( 10#$(date +%H) * 3600 + 10#$(date +%M) * 60 + 10#$(date +%S) ))
 printf '%s\n' "$clock_secs" > "$SHARE/.clock"
 
+# --- 3c. the host-integration credential (M114c #2456, ADR 0051) ----------
+# The M108 lanes are signed VHI1 records in the share: the runner HMACs
+# under the `host-int` row of the share's SECRETS.TXT, and the seat reads
+# the SAME row through sys_secret_get bound to GOTABWM.ELF — binding also
+# needs GOTABWM.ELF named uid_system-owned in OWNERS.TXT (ADR 0024 D8).
+# Both rows are provisioned idempotently: an existing row is kept (the
+# credential persists across sessions, matching the share's persistence)
+# and an existing file keeps every other row. --no-host-int skips this
+# entirely AND disarms the lanes below.
+if [ "$HOST_INT" = "1" ]; then
+    SECRETS_FILE="$SHARE/SECRETS.TXT"
+    if [ -f "$SECRETS_FILE" ] && [ "$(head -n1 "$SECRETS_FILE")" != "#v1" ]; then
+        echo "session: WARNING — $SECRETS_FILE is not a #v1 secrets file; the host-int credential was NOT provisioned and the lanes will refuse no_credential at arm"
+    elif ! grep -q $'^host-int\t1000\t' "$SECRETS_FILE" 2>/dev/null; then
+        host_int_key="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+        [ -f "$SECRETS_FILE" ] || printf '#v1\n' > "$SECRETS_FILE"
+        printf 'host-int\t1000\t%s\tGOTABWM.ELF\n' "$host_int_key" >> "$SECRETS_FILE"
+        echo "session: provisioned the host-int credential in $SECRETS_FILE (app-bound to GOTABWM.ELF)"
+    fi
+    OWNERS_FILE="$SHARE/OWNERS.TXT"
+    if [ -f "$OWNERS_FILE" ] && [ "$(head -n1 "$OWNERS_FILE")" != "#v1" ]; then
+        echo "session: WARNING — $OWNERS_FILE is not a #v1 owners file; GOTABWM.ELF may not read the host-int credential"
+    elif ! grep -q $'^GOTABWM.ELF\t' "$OWNERS_FILE" 2>/dev/null; then
+        [ -f "$OWNERS_FILE" ] || printf '#v1\n' > "$OWNERS_FILE"
+        printf 'GOTABWM.ELF\t644\t0\t-\n' >> "$OWNERS_FILE"
+    elif ! grep -q $'^GOTABWM.ELF\t644\t0\t' "$OWNERS_FILE" 2>/dev/null; then
+        echo "session: WARNING — $OWNERS_FILE owns GOTABWM.ELF to a non-system uid; sys_secret_get will refuse the host-int row (ADR 0024 D8)"
+    fi
+fi
+
 # --- 4. boot ----------------------------------------------------------------
 # Per-run throwaway EFI variable store; the disk image stays pristine via
 # --overlay-base (a fresh ASIF overlay is discarded at runner exit).
@@ -240,6 +295,13 @@ trap 'end_session HUP 129' HUP
 # workspace without requiring a startup click.
 printf '%s\n' 'dui focus 0' > "$RUN_DIR/session-start.txt"
 
+LANE_FLAGS=()
+if [ "$HOST_INT" = "1" ]; then
+    LANE_FLAGS+=(--host-clipboard --host-drop --host-notify)
+fi
+if [ "$SOUND" = "1" ]; then LANE_FLAGS+=(--sound); fi
+if [ "$NET_NAT" = "1" ]; then LANE_FLAGS+=(--net-nat); fi
+
 cat <<EOF
 
 >>>>>>>>>> VirelaiOS session <<<<<<<<<<
@@ -250,6 +312,15 @@ seat remains available with \`settings set wm tabwm\`.
 
   * the seat's markers and the guest shell output are in
       artifacts/session-serial.log
+EOF
+if [ "$HOST_INT" = "1" ]; then
+    cat <<EOF
+  * host lanes armed: clipboard + file-drop + notify (Integration menu has
+    live suspend/resume toggles + "Send File to INBOX"; --no-host-int
+    disarms). macOS may ask once for notification permission.
+EOF
+fi
+cat <<EOF
 
 The guest serial log is written to artifacts/session-serial.log.
 Your files persist in: $SHARE
@@ -266,6 +337,7 @@ env -u __CFBundleIdentifier "$SESSION_APP/Contents/MacOS/VirelaiOS" \
     --cvc-file "$SHARE" \
     --script "$RUN_DIR/session-start.txt" --script-after 'gotabwm: win focus' \
     --display --input --host-session \
+    "${LANE_FLAGS[@]}" \
     --timeout 0 &
 RUNNER_PID=$!
 echo "session: owned VM pid=$RUNNER_PID app=$SESSION_APP"

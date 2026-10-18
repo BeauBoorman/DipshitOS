@@ -155,16 +155,22 @@ func TestWaitKernelErrorKeepsPolling(t *testing.T) {
 
 // TestWaitArgumentGuard pins the pid guard and the budget constant's
 // sanity (the deadline must cover the M49-bar foreground waits).
+//
+// M119d (#2488): pid 0 is a VALID pid — the process registry recycles its
+// lowest free descriptor (kernel/src/process.zig pins "COUNTER reuses pid
+// 0"), so Wait(0) is a real wait that goes ErrWaitGone on an empty table,
+// not EINVAL. Only a negative pid is refused.
 func TestWaitArgumentGuard(t *testing.T) {
+	if waitBudgetNs < int64(60)*int64(1e9) {
+		t.Fatalf("wait budget %d ns is too tight for shell waits", waitBudgetNs)
+	}
+	shrinkBudget(t, int64(30)*int64(1e6))
 	installHook(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 { return 0 })
-	if _, err := Wait(0); !errors.Is(err, errno(ErrEINVAL)) {
-		t.Fatalf("Wait(0) err = %v, want EINVAL", err)
+	if _, err := Wait(0); !errors.Is(err, ErrWaitGone) {
+		t.Fatalf("Wait(0) err = %v, want ErrWaitGone (pid 0 is a real slot)", err)
 	}
 	if _, err := Wait(-1); !errors.Is(err, errno(ErrEINVAL)) {
 		t.Fatalf("Wait(-1) err = %v, want EINVAL", err)
-	}
-	if waitBudgetNs < int64(60)*int64(1e9) {
-		t.Fatalf("wait budget %d ns is too tight for shell waits", waitBudgetNs)
 	}
 }
 

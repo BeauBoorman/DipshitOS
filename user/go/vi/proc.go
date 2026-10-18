@@ -38,8 +38,14 @@ const (
 // that was seen running and then vanishes is the caller's recycled-pid
 // case — Probe reports Absent and the caller applies the seen-then-gone
 // status-0 rule with its own memory.
+//
+// pid 0 is a REAL registry slot: create_as (kernel/src/process.zig) hands
+// out the lowest free descriptor, and once the registry has recycled, slot 0
+// goes to live children — a sys_exec can legitimately return pid 0 (observed
+// in the M119d spawn matrix, live-exec run 03: `spawned pid=0`). Only a
+// negative pid is not a pid.
 func Probe(pid int64) (int64, int) {
-	if pid <= 0 {
+	if pid < 0 {
 		return -1, ProbeAbsent
 	}
 	var rows [16]ProcRow
@@ -78,7 +84,7 @@ func Wait(pid int64) (int64, error) { return WaitBudget(pid, waitBudgetNs) }
 // reaped-and-recycled rule, same ErrWaitGone for a pid that never appears;
 // only the deadline moves.
 func WaitBudget(pid int64, budgetNs int64) (int64, error) {
-	if pid <= 0 {
+	if pid < 0 {
 		return -1, errno(ErrEINVAL)
 	}
 	deadline := Nanos() + budgetNs

@@ -13,8 +13,13 @@
 #              save completes every time; the restore PASSED 8 of 9 cycles and
 #              once (under this harness) failed VZErrorRestore 12 "permission
 #              denied" — not reproduced by file shape, location, or preceding
-#              run. The run therefore asserts the deterministic half hard and
-#              accepts exactly those two cycle outcomes; anything else FAILs.
+#              run. #2489's repro loop then measured the refusal directly: under
+#              concurrent VZ load every restoreMachineStateFrom refuses
+#              Code=12, and the reason string is not stable — "invalid
+#              argument" and "permission denied" were both observed on one host
+#              build (26B5112a). The run therefore asserts the deterministic
+#              half hard and accepts a PASS or a Code=12 refusal carrying
+#              either recorded reason; anything else FAILs.
 #   cvc        custom-virtio attached: VZ REFUSES at validateSaveRestoreSupport
 #              (VZErrorDomain 2 "Unsupported custom virtio device in
 #              configuration.") — the negative result, pinned verbatim.
@@ -28,6 +33,10 @@
 vgate_name live-vz-restore "Real VZ pause/save/stop/restore/resume preserves a RAM-only clipboard marker; M70g G3 cross-process + device verdicts"
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_share none
+# M119e (#2489): VZSR_LOOPS=N re-runs the whole matrix N times — the repro
+# loop for the Code=12 restore refusal (save/load stay adjacent per
+# iteration; efi-vars is recreated per run either way).
+vgate_repeat 1 VZSR_LOOPS
 
 vgate_run 01 -- --vz-restore --timeout 90
 
@@ -95,7 +104,8 @@ import os
 import re
 from pathlib import Path
 run = Path(os.environ['RUN_DIR'])
-save_out = (run / 'run-save.out').read_bytes()
+save_tag = 'save' + os.environ['VG_TAG'][len('load'):]  # 'load-03' -> 'save-03'
+save_out = (run / ('run-%s.out' % save_tag)).read_bytes()
 m = re.search(rb'SAVE PASS pid (\d+) saved state\+overlay\+marker (VZSR-[0-9A-F-]{36})', save_out)
 assert m, save_out[-400:]
 save_pid, saved = m.group(1), m.group(2)
@@ -166,10 +176,10 @@ if b'VZ-RESTORE: PASS CPU/memory/device restore; fresh serial query recovered RA
     print('msd: full cycle PASS')
 else:
     refusal = (b'ERROR: VZ-RESTORE: restore: restoreMachineStateFrom: Error Domain=VZErrorDomain Code=12' in out
-               and b'permission denied' in out)
-    assert refusal, 'neither the PASS verdict nor the one observed refusal shape: ' + out[-600:].decode('utf-8', 'replace')
+               and (b'permission denied' in out or b'invalid argument' in out))
+    assert refusal, 'neither the PASS verdict nor an observed refusal shape: ' + out[-600:].decode('utf-8', 'replace')
     assert len(markers) == 1, markers
-    print('msd: observed refusal shape (VZErrorRestore 12 permission denied) -- recorded, see hardware-contract')
+    print('msd: observed refusal shape (VZErrorRestore 12) -- recorded, see hardware-contract')
 PY
 
 # The negative result: VZ refuses the custom-virtio device at validation, before

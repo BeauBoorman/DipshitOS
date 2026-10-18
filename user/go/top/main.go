@@ -63,6 +63,7 @@ const (
 	markerNetwork    = "top: tab=network"
 	markerAgent      = "top: tab=agent"
 	markerGPU        = "top: tab=gpu"
+	markerTrust      = "top: tab=trust"
 	markerRefreshed  = "top: refreshed ok"
 	markerKill       = "top: kill pid="
 	markerCount      = "top: procs n="
@@ -107,6 +108,7 @@ const (
 	pageNetwork
 	pageAgent
 	pageGPU
+	pageTrust
 )
 
 // Native layout (top.zig's native_* rects, so GOTOP opens where TOP opened).
@@ -118,14 +120,15 @@ var (
 	natNetwork = widgets.Rect{X: 192, Y: 6, W: 34, H: 20}
 	// M109c's third tab took the slack between Net and the filter plate:
 	// the filter row compressed a little to keep one toolbar line.
-	natAgent = widgets.Rect{X: 230, Y: 6, W: 38, H: 20}
-	// M111d's fourth tab (GPU) compressed the row once more.
-	natGPU = widgets.Rect{X: 272, Y: 6, W: 32, H: 20}
+	// M111d's GPU and M113e's Trust compressed it once more each.
+	natAgent = widgets.Rect{X: 226, Y: 6, W: 34, H: 20}
+	natGPU   = widgets.Rect{X: 264, Y: 6, W: 28, H: 20}
+	natTrust = widgets.Rect{X: 296, Y: 6, W: 34, H: 20}
 	// The filter field sits near where Zig TOP.BIN's native_filter_input
 	// sat — its "Filter:" label to the left — and the summary line ends
 	// the row.
-	natFilterLabel = widgets.Rect{X: 308, Y: 6, W: 44, H: 20}
-	natFilter      = widgets.Rect{X: 354, Y: 6, W: 70, H: 20}
+	natFilterLabel = widgets.Rect{X: 334, Y: 6, W: 40, H: 20}
+	natFilter      = widgets.Rect{X: 378, Y: 6, W: 46, H: 20}
 	natSummary     = widgets.Rect{X: 428, Y: 6, W: 78, H: 20}
 	natHeader      = widgets.Rect{X: 6, Y: 52, W: 500, H: 16}
 	natList        = widgets.Rect{X: 6, Y: 70, W: 500, H: 256}
@@ -139,6 +142,7 @@ type app struct {
 	net  *NetView
 	ag   *AgentView
 	gpu  *GPUView
+	tr   *TrustView
 	pg   page
 	auto bool
 
@@ -152,6 +156,7 @@ type app struct {
 	netBtn     widgets.Button
 	agentBtn   widgets.Button
 	gpuBtn     widgets.Button
+	trustBtn   widgets.Button
 	summary    widgets.Text
 	header     widgets.Text
 	foot       widgets.Text
@@ -197,6 +202,7 @@ func main() {
 		net: NewNetView(),
 		ag:  NewAgentView(),
 		gpu: NewGPUView(),
+		tr:  NewTrustView(),
 		pg:  pageProcs,
 	}
 	a.bindFilter()
@@ -260,6 +266,9 @@ func (a *app) refreshAll(rows, announce bool) {
 	}
 	if a.pg == pageGPU {
 		a.refreshGPU()
+	}
+	if a.pg == pageTrust {
+		a.refreshTrust()
 	}
 	running, exited, _ := a.tab.Counts()
 	vi.ConsoleLine(markerCount + vi.Itoa64(int64(n)) +
@@ -335,6 +344,7 @@ func (a *app) layout() {
 	a.netBtn = widgets.Button{R: scaleR(natNetwork), Label: "Net"}
 	a.agentBtn = widgets.Button{R: scaleR(natAgent), Label: "Agent"}
 	a.gpuBtn = widgets.Button{R: scaleR(natGPU), Label: "GPU"}
+	a.trustBtn = widgets.Button{R: scaleR(natTrust), Label: "Trust"}
 	switch a.pg {
 	case pageProcs:
 		a.procsBtn.Face = t.Accent
@@ -348,6 +358,9 @@ func (a *app) layout() {
 	case pageGPU:
 		a.gpuBtn.Face = t.Accent
 		a.gpuBtn.LabelRGB = t.OnAccent
+	case pageTrust:
+		a.trustBtn.Face = t.Accent
+		a.trustBtn.LabelRGB = t.OnAccent
 	}
 
 	a.summary = widgets.Text{R: scaleR(natSummary), Label: a.status, Fg: t.Muted, Bg: t.Bg}
@@ -367,6 +380,9 @@ func (a *app) layout() {
 		sel = -1
 	case pageGPU:
 		items = a.gpu.Lines()
+		sel = -1
+	case pageTrust:
+		items = a.tr.Lines()
 		sel = -1
 	}
 	a.list = widgets.List{
@@ -426,11 +442,13 @@ func (a *app) footLine() string {
 		return "n procs   r refresh   a auto   rx/s " + vi.Itoa64(int64(a.net.RXRate)) +
 			" B   tx/s " + vi.Itoa64(int64(a.net.TXRate)) + " B"
 	case pageAgent:
-		return "p procs   n net   c gpu   r refresh   a auto   v verified ! forged ? no-key x bad"
+		return "p procs   n net   c gpu   t trust   r refresh   a auto   v verified ! forged ? no-key x bad"
 	case pageGPU:
-		return "p procs   n net   g agent   r refresh   a auto"
+		return "p procs   n net   g agent   t trust   r refresh   a auto"
+	case pageTrust:
+		return "p procs   n net   g agent   c gpu   r refresh   a auto"
 	}
-	return "k kill   r refresh   a auto   n net   g agent   c gpu   / filter   1-6 sort"
+	return "k kill   r refresh   a auto   n net   g agent   c gpu   t trust   / filter   1-6 sort"
 }
 
 func (a *app) draw() {
@@ -442,6 +460,7 @@ func (a *app) draw() {
 	a.netBtn.Draw(cv)
 	a.agentBtn.Draw(cv)
 	a.gpuBtn.Draw(cv)
+	a.trustBtn.Draw(cv)
 	a.refreshBtn.Draw(cv)
 	a.killBtn.Draw(cv)
 	a.autoBtn.Draw(cv)
@@ -471,6 +490,9 @@ func (a *app) setPage(p page) bool {
 	case pageGPU:
 		vi.ConsoleLine(markerGPU)
 		a.refreshGPU()
+	case pageTrust:
+		vi.ConsoleLine(markerTrust)
+		a.refreshTrust()
 	default:
 		vi.ConsoleLine(markerProcs)
 	}
@@ -498,6 +520,34 @@ func (a *app) refreshAgent() {
 func (a *app) refreshGPU() {
 	a.gpu.Refresh()
 	vi.ConsoleLine(a.gpu.Marker())
+}
+
+// refreshTrust resamples the trust posture against the SAME process
+// snapshot the procs table just took (one sys_procs read per refresh —
+// the tab joins the table's rows, never a second snapshot). The serial
+// evidence is the summary line, then a bounded per-app dump of the
+// posture/hash/publisher markers and the receipt lines.
+func (a *app) refreshTrust() {
+	a.tr.Refresh(a.tab.Names())
+	vi.ConsoleLine(a.tr.Marker())
+	for i := 0; i < rowMarkerMax; i++ {
+		line, ok := a.tr.AppMarker(i)
+		if !ok {
+			break
+		}
+		vi.ConsoleLine(line)
+		sha, _ := a.tr.ShaMarker(i)
+		vi.ConsoleLine(sha)
+		pub, _ := a.tr.PubMarker(i)
+		vi.ConsoleLine(pub)
+	}
+	for i := 0; i < rowMarkerMax; i++ {
+		line, ok := a.tr.RcptMarker(i)
+		if !ok {
+			break
+		}
+		vi.ConsoleLine(line)
+	}
 }
 
 // toggleAuto arms or disarms the 1 Hz app timer (slot 40/41).
@@ -657,6 +707,8 @@ func (a *app) handleKey(ev vi.Event) bool {
 		return a.setPage(pageAgent)
 	case 'c', 'C':
 		return a.setPage(pageGPU)
+	case 't', 'T':
+		return a.setPage(pageTrust)
 	case '/', 'f', 'F':
 		if a.pg == pageProcs {
 			return a.openFilter()
@@ -721,6 +773,9 @@ func (a *app) handleClick(x, y int) bool {
 	}
 	if a.gpuBtn.HitTest(x, y) {
 		return a.setPage(pageGPU)
+	}
+	if a.trustBtn.HitTest(x, y) {
+		return a.setPage(pageTrust)
 	}
 	if a.refreshBtn.HitTest(x, y) {
 		a.refreshAll(true, true)

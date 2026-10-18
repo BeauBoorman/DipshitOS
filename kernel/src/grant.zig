@@ -16,8 +16,9 @@
 //!
 //!   - BASE rows are compiled into `KERNEL.BIN` (`base_rows` below): the
 //!     Part I chain pins the kernel image, so the compiled table is
-//!     verified by construction. M113c ships the mechanism with an empty
-//!     base set — base-row policy is an owner decision, not a default.
+//!     verified by construction. M116a lands the owner decision the
+//!     mechanism shipped empty for — the fleet policy, generated into
+//!     kernel/src/grant_fleet.zig from image/fleet-grants.txt.
 //!   - USER rows live in `GRANTS.TXT` on the host share, secret-class BY
 //!     CONSTRUCTION exactly like `SECRETS.TXT` (`trust.ensure_grant_file`
 //!     runs before the file is read): the file ABI — the only write path
@@ -165,15 +166,21 @@ pub fn enforceMode() bool {
 // ---------------------------------------------------------------------------
 
 /// A compiled-in base row literal (verified by the Part I boot chain —
-/// a different table is a different KERNEL.BIN digest). M113c ships none:
-/// the mechanism is landed, base-row policy is not.
+/// a different table is a different KERNEL.BIN digest).
 pub const BaseRow = struct {
     name: []const u8,
     /// 32 raw-file digest bytes, or null for the `*` wildcard (narrow only).
     sha256: ?[measure.digest_len]u8,
     words: u32,
 };
-pub const base_rows = [_]BaseRow{};
+/// M116a (#2467): the fleet policy — one `*` narrow-only row per shipped
+/// app, authored from the M113f audit data (#2422) in
+/// image/fleet-grants.txt and GENERATED into kernel/src/grant_fleet.zig
+/// by tools/grants/fleet_grants.py (regenerate, don't hand-edit). The
+/// user table's 16-row bound cannot hold the ~31-app fleet, so owner
+/// policy lives in the compiled table — the signing is the Part I boot
+/// chain itself: a different table is a different KERNEL.BIN digest.
+pub const base_rows = &@import("grant_fleet.zig").rows;
 
 const Row = struct {
     used: bool = false,
@@ -831,4 +838,98 @@ test "grant: admin set validates strictly, updates in place, bounds the table" {
     var over_buf: [name_max + 1]u8 = @as([name_max + 1]u8, @splat(@as(u8, 'A')));
     try std.testing.expect(!validName(over_buf[0..]));
     try std.testing.expectEqualStrings("A.ELF", line_name("A.ELF\t*\tnet"));
+}
+
+/// Read a repo data file for a host test: the `zig build test` root runs
+/// from the repo root; the `../../` form covers a runner that sets cwd to
+/// the module's own directory (the sexiburger manifest-pin pattern).
+fn readRepoFile(path: []const u8, cap: usize) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(cap),
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            const alt = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "../../{s}",
+                .{path},
+            );
+            defer std.testing.allocator.free(alt);
+            return std.Io.Dir.cwd().readFileAlloc(
+                std.testing.io,
+                alt,
+                std.testing.allocator,
+                .limited(cap),
+            );
+        },
+        else => |e| return e,
+    };
+}
+
+test "grant: fleet base rows cover the shipped roster (M116a #2467)" {
+    // The card's acceptance, as a class-A check inside `zig build test`:
+    // the policy data (image/fleet-grants.txt — name, observed audit
+    // set, authored mask, reason) is generated into the compiled table,
+    // so every shipped app must hit a base row, every row's mask must
+    // cover its observed audit set, and every widening must carry a
+    // named reason. A missing app or a narrower mask fails here.
+    init();
+    // Repo data read like sexiburger's manifest pin: the `zig build test`
+    // root runs from the repo root; the `../../` form covers a runner
+    // that sets cwd to the module's own directory.
+    const apps_txt = try readRepoFile("image/apps.txt", 8 * 1024);
+    defer std.testing.allocator.free(apps_txt);
+    const policy = try readRepoFile("image/fleet-grants.txt", 32 * 1024);
+    defer std.testing.allocator.free(policy);
+
+    var policy_names: [64][]const u8 = undefined;
+    var policy_count: usize = 0;
+    var pit = std.mem.splitScalar(u8, policy, '\n');
+    while (pit.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var fit = std.mem.splitScalar(u8, line, '\t');
+        const name = fit.next() orelse return error.BadPolicyLine;
+        const observed = fit.next() orelse return error.BadPolicyLine;
+        const mask = fit.next() orelse return error.BadPolicyLine;
+        const reason = fit.next() orelse return error.BadPolicyLine;
+        try std.testing.expect(policy_count < policy_names.len);
+        policy_names[policy_count] = name;
+        policy_count += 1;
+        const obs_mask = parseWords(observed) orelse return error.BadObserved;
+        const row_mask = parseWords(mask) orelse return error.BadMask;
+        // mask ⊇ observed; a strict widening (or an un-audited app, whose
+        // observed set is `-`) requires a named reason.
+        try std.testing.expect((obs_mask & ~row_mask) == 0);
+        if (row_mask != obs_mask or obs_mask == 0)
+            try std.testing.expect(!std.mem.eql(u8, reason, "-"));
+        // The compiled table carries exactly this mask — a stale
+        // generated file is a test failure, not a silent divergence.
+        switch (lookup(name)) {
+            .row => |r| try std.testing.expectEqual(row_mask, r.words & baseline),
+            else => return error.MissingBaseRow,
+        }
+        switch (decide(name, null)) {
+            .apply => |w| try std.testing.expectEqual(row_mask, w),
+            else => return error.WildcardRowDidNotApply,
+        }
+    }
+
+    // Every apps.txt field-1 name has a policy row (the manifest roster
+    // is the acceptance's roster; SERVICE_FLEET in the tool covers the
+    // non-manifest half).
+    var ait = std.mem.splitScalar(u8, apps_txt, '\n');
+    while (ait.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0 or t[0] == '#') continue;
+        const bar = std.mem.indexOfScalar(u8, t, '|') orelse continue;
+        const name = std.mem.trim(u8, t[0..bar], " ");
+        if (name.len == 0) continue;
+        var found = false;
+        for (policy_names[0..policy_count]) |n| {
+            if (std.mem.eql(u8, n, name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }

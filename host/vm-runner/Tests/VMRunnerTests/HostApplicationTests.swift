@@ -14,7 +14,12 @@ final class HostApplicationTests: XCTestCase {
         host.attach(view)
         XCTAssertEqual(host.window.title, "VirelaiOS — Starting VM")
         XCTAssertTrue(view.isHidden)
-        let status = try XCTUnwrap(host.window.contentView?.subviews.compactMap { $0 as? NSTextField }.first)
+        // M114d (#2457): the label now lives inside the split's guest
+        // pane — find the field by its content, not its depth.
+        func fields(in view: NSView) -> [NSTextField] {
+            view.subviews.flatMap { ($0 as? NSTextField).map { [$0] } ?? fields(in: $0) }
+        }
+        let status = try XCTUnwrap(fields(in: host.window.contentView!).first { $0.stringValue.contains("/fixture/serial.log") })
         XCTAssertTrue(status.stringValue.contains("/fixture/serial.log"))
         XCTAssertFalse(status.isHidden)
         host.didStart()

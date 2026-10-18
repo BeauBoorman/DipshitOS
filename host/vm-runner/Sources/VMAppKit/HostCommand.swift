@@ -1,0 +1,197 @@
+import AppKit
+
+/// M114a (#2454, index #2447): the verbs of the HostCommand action bus —
+/// the one seam every host-UI action dispatches through. Menu items and
+/// the runner's `--host-cmd-after <marker>:<verb>` flag share the
+/// dispatcher below, so every UI feature is exercisable headlessly and
+/// AppKit is never driven by synthesized clicks (index thesis 1 — the
+/// macOS activation walls of claims #151/#4769 refuse that from
+/// background processes).
+///
+/// The raw value IS the wire verb: it is what `--host-cmd-after` parses
+/// and what the `host-ui: cmd=<verb>` receipt prints, so it never
+/// changes once published. Cases are declared for the menus the M114
+/// index lays out; a verb with no registered handler reports
+/// `unavailable` until its card wires it (later cards add verbs, not
+/// menus).
+public enum HostCommand: String, CaseIterable, Sendable {
+    // VirelaiOS menu.
+    case about
+    case quit
+    // Machine menu.
+    case stop
+    // View menu — M114b registers the handlers.
+    case fullscreen
+    case captureKeys = "capture-keys"
+    // Integration menu — M114c registers the handlers.
+    case laneClipboard = "lane-clipboard"
+    case laneDrop = "lane-drop"
+    case laneNotify = "lane-notify"
+    case sendFile = "send-file"
+    // Debug menu — M114d/e register the remaining handlers.
+    case inspector
+    // M114d (#2457): the drawer injector's verb — no menu item of its
+    // own; the drawer's Send button and `--host-cmd-after …:send-serial`
+    // dispatch it, writing `HostInspector.inputLine` to the console pipe.
+    case sendSerial = "send-serial"
+    case screenshot
+    // M114e (#2458): the ⌘⇧6 chord toggles `record`; `record-start`/
+    // `record-stop` are the card's explicit leg verbs — same recorder,
+    // idempotent edges, so a gate names the transition it wants rather
+    // than counting dispatches.
+    case record
+    case recordStart = "record-start"
+    case recordStop = "record-stop"
+}
+
+/// One armed `--host-cmd-after <marker>:<verb>` instance. The verb is the
+/// suffix after the LAST colon, so serial markers may carry colons of
+/// their own (the `--host-write-after` precedent: guest markers do).
+public struct HostCommandTrigger {
+    public let marker: String
+    public let command: HostCommand
+    public var fired = false
+
+    public init?(_ spec: String) {
+        guard let colon = spec.lastIndex(of: ":"),
+              let command = HostCommand(rawValue: String(spec[spec.index(after: colon)...]))
+        else { return nil }
+        let marker = String(spec[spec.startIndex..<colon])
+        guard !marker.isEmpty else { return nil }
+        self.marker = marker
+        self.command = command
+    }
+}
+
+/// The dispatcher. Every call arrives on the main queue (menu validation,
+/// menu actions, and the runner's scripted/session polls all run there),
+/// so the bus takes no lock.
+///
+/// One receipt per dispatch, always — even a verb that could not run, so
+/// a gate asserting the receipt reads `disabled`/`unavailable` instead
+/// of silence:
+///
+///     host-ui: cmd=<verb> state=<outcome>
+public final class HostCommandBus: NSObject {
+    /// The `state=<...>` word of a `host-ui:` receipt.
+    public enum Outcome: String, Sendable {
+        /// The action ran.
+        case performed
+        /// A handler is registered but refused at dispatch time (e.g.
+        /// "Stop VM" while the session is already stopping).
+        case disabled
+        /// No handler is registered for the verb in this session — the
+        /// menu item renders disabled for the same reason.
+        case unavailable
+        /// The action ran and reported failure.
+        case failed
+    }
+
+    public struct Registration {
+        /// Menu validation and dispatch both ask this live — a disabled
+        /// verb stays on the menu, greyed, rather than disappearing.
+        public var isEnabled: () -> Bool
+        /// Toggle items (the M114c lane switches) read their checkmark
+        /// state here during menu validation.
+        public var itemState: () -> Bool
+        /// M114b (#2455): toggle verbs append their post-action state to
+        /// the receipt (`state=performed capture=on`) so a gate asserting
+        /// the receipt reads the real property, not just that the action
+        /// ran. Read after every dispatch that found a registration —
+        /// including `disabled`/`failed`, where the live state is still
+        /// honest evidence. nil registration → nil detail → no suffix.
+        public var receiptDetail: () -> String?
+        public var action: () -> Outcome
+
+        public init(isEnabled: @escaping () -> Bool = { true },
+                    itemState: @escaping () -> Bool = { false },
+                    receiptDetail: @escaping () -> String? = { nil },
+                    action: @escaping () -> Outcome) {
+            self.isEnabled = isEnabled
+            self.itemState = itemState
+            self.receiptDetail = receiptDetail
+            self.action = action
+        }
+    }
+
+    /// The receipt sink. The runner leaves the default — unbuffered
+    /// stdout, the `host-clip:`/`host-drop:` line precedent — and tests
+    /// capture it.
+    public var emit: (String) -> Void
+
+    /// M114e (#2458): the bounded MP4 recorder every bus carries — the
+    /// one verb family whose handler needs nothing the runner owns: the
+    /// capture surface is any AppKit view (the session attaches its guest
+    /// view; a headless run's single evidence window is discovered
+    /// through NSApp) and the output dir resolves from the runner's own
+    /// `--cvc-file`/`--virtio-fs` argv. Self-registering on the bus is
+    /// the M114c registration-side-effect pattern for a card whose
+    /// Touches exclude main.swift: the bare `HostCommandBus()` a scripted
+    /// `--host-cmd-after` run builds and the session window's bus
+    /// dispatch the identical seam.
+    public let recorder = HostRecorder()
+
+    private var registrations: [HostCommand: Registration] = [:]
+
+    public init(emit: ((String) -> Void)? = nil) {
+        self.emit = emit ?? {
+            FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
+        }
+        super.init()
+        let recorder = self.recorder
+        register(.record, Registration(
+            isEnabled: { recorder.canStart },
+            itemState: { recorder.isRecording },
+            receiptDetail: { recorder.receiptDetail },
+            action: { recorder.toggle() }))
+        register(.recordStart, Registration(
+            isEnabled: { recorder.canStart },
+            itemState: { recorder.isRecording },
+            receiptDetail: { recorder.receiptDetail },
+            action: { recorder.start() }))
+        register(.recordStop, Registration(
+            isEnabled: { recorder.isRecording },
+            itemState: { recorder.isRecording },
+            receiptDetail: { recorder.receiptDetail },
+            action: { recorder.stop() }))
+    }
+
+    public func register(_ command: HostCommand, _ registration: Registration) {
+        registrations[command] = registration
+    }
+
+    public func isRegistered(_ command: HostCommand) -> Bool {
+        registrations[command] != nil
+    }
+
+    public func isEnabled(_ command: HostCommand) -> Bool {
+        registrations[command]?.isEnabled() ?? false
+    }
+
+    @discardableResult
+    public func dispatch(_ command: HostCommand) -> Outcome {
+        let outcome: Outcome
+        var detail: String?
+        if let registration = registrations[command] {
+            outcome = registration.isEnabled() ? registration.action() : .disabled
+            detail = registration.receiptDetail()
+        } else {
+            outcome = .unavailable
+        }
+        emit("host-ui: cmd=\(command.rawValue) state=\(outcome.rawValue)\(detail.map { " \($0)" } ?? "")")
+        return outcome
+    }
+
+    // MARK: Menu seam — the menu is a projection of the bus.
+
+    @objc public func dispatchItem(_ item: NSMenuItem) {
+        guard let command = item.representedObject as? HostCommand else { return }
+        dispatch(command)
+    }
+
+    @objc public func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard let command = item.representedObject as? HostCommand else { return true }
+        item.state = registrations[command]?.itemState() == true ? .on : .off
+        return isEnabled(command)
+    }
+}

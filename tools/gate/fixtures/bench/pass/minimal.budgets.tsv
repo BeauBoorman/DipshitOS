@@ -1,0 +1,5 @@
+# minimal valid budgets fixture: every corpus row budgeted, every budget
+# baseline+margin consistent.
+id	cmp	budget	baseline	margin	ref
+demo-lat	<=	200	100	x2	#1
+demo-rate	>=	500	1000	-50%	issue:2

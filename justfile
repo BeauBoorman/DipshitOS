@@ -41,6 +41,7 @@ verify-portable:
     bash tools/verify-bss-budget.sh
     bash tools/verify-vf-class-a.sh
     bash tools/gate/test-gate-run.sh
+    python3 tools/gate/bench-check.py
     bash tools/go/test-ensure-guest-elf.sh
 
 # The class-B fleet is DISCOVERED, not listed (M40 GF5): every spec in

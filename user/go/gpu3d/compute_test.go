@@ -30,12 +30,13 @@ func (f *compFake) run(desc []byte) int64 {
 
 func compHarness(t *testing.T, f *compFake) {
 	t.Helper()
-	oldSys, oldMap := CompSyscall, CompMap
+	oldSys, oldMap, oldUnmap := CompSyscall, CompMap, CompUnmap
 	CompSyscall = f.run
 	CompMap = func(_ uintptr, size int, _, _ uint64) ([]byte, error) {
 		return make([]byte, size), nil
 	}
-	t.Cleanup(func() { CompSyscall, CompMap = oldSys, oldMap })
+	CompUnmap = func([]byte) error { return nil }
+	t.Cleanup(func() { CompSyscall, CompMap, CompUnmap = oldSys, oldMap, oldUnmap })
 }
 
 func TestKernelDescEncodeLayout(t *testing.T) {
@@ -196,6 +197,133 @@ func TestComputeOpenRefusals(t *testing.T) {
 		if !errors.Is(err, tc.want) {
 			t.Fatalf("open rc=%d → %v, want %v", tc.rc, err, tc.want)
 		}
+	}
+}
+
+// #2494: a refused OPEN must still release the fixed-VA window — before
+// the unmap landed, one ENOSPC left the band claimed for the process's
+// lifetime, so the retry the refusal invites could never succeed.
+func TestComputeRefusedOpenUnmaps(t *testing.T) {
+	var unmaps [][]byte
+	f := &compFake{replies: map[uint32]int64{vi.GpucompOpen: -vi.ErrENOSPC}}
+	compHarness(t, f)
+	CompUnmap = func(b []byte) error {
+		unmaps = append(unmaps, b)
+		return nil
+	}
+	if _, err := OpenCompute(); !errors.Is(err, ErrComputeExhausted) {
+		t.Fatalf("err=%v, want ErrComputeExhausted", err)
+	}
+	if len(unmaps) != 1 || len(unmaps[0]) != compMapBytes {
+		t.Fatalf("unmaps=%d, want the one refused window released", len(unmaps))
+	}
+	// The window is free: a retry after the other session drained opens
+	// normally.
+	f.replies[vi.GpucompOpen] = 0x0000_0001_0000_0007
+	s, err := OpenCompute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #2494: the landable unit — a second session in one process. Close must
+// unmap the fixed-VA window so the next OpenCompute can claim the same
+// band again.
+func TestComputeSecondSession(t *testing.T) {
+	var maps, unmaps int
+	f := &compFake{replies: map[uint32]int64{vi.GpucompOpen: 0x0000_0001_0000_0007}}
+	compHarness(t, f)
+	CompMap = func(_ uintptr, size int, _, _ uint64) ([]byte, error) {
+		maps++
+		return make([]byte, size), nil
+	}
+	CompUnmap = func([]byte) error {
+		unmaps++
+		return nil
+	}
+
+	s1, err := OpenCompute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if maps != 1 || unmaps != 1 {
+		t.Fatalf("after close: maps=%d unmaps=%d, want 1/1", maps, unmaps)
+	}
+	// The second session maps a fresh window and runs a full op.
+	s2, err := OpenCompute()
+	if err != nil {
+		t.Fatalf("second OpenCompute: %v", err)
+	}
+	if maps != 2 {
+		t.Fatalf("maps=%d, want 2", maps)
+	}
+	buf, err := s2.AllocBuffer(4096, BufIO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Write(buf, 0, []byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if unmaps != 2 {
+		t.Fatalf("unmaps=%d, want 2", unmaps)
+	}
+	// Close stays idempotent: a third Close does not unmap again.
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if unmaps != 2 {
+		t.Fatalf("double-Close unmapped again: unmaps=%d", unmaps)
+	}
+}
+
+// #2494 follow-through: once Close has dropped the window, no later op
+// may stage into the unmapped VA — every session op refuses with the
+// same ErrComputeBadHandle the kernel gives a stale handle.
+func TestComputePostCloseOpsRefuse(t *testing.T) {
+	f := &compFake{replies: map[uint32]int64{
+		vi.GpucompOpen:     7,
+		vi.GpucompBufAlloc: 0x0000_0005_0001_0007,
+	}}
+	compHarness(t, f)
+	s, err := OpenCompute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf, err := s.AllocBuffer(4096, BufIO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := len(f.calls)
+	if err := s.Write(buf, 0, []byte{1}); !errors.Is(err, ErrComputeBadHandle) {
+		t.Fatalf("write after close=%v, want ErrComputeBadHandle", err)
+	}
+	var out [4]byte
+	if err := s.Read(buf, 0, out[:]); !errors.Is(err, ErrComputeBadHandle) {
+		t.Fatalf("read after close=%v, want ErrComputeBadHandle", err)
+	}
+	if _, err := s.Stats(); !errors.Is(err, ErrComputeBadHandle) {
+		t.Fatalf("stats after close=%v, want ErrComputeBadHandle", err)
+	}
+	if err := s.Run(KernelDesc{Kernel: vi.GpuKernelGEMM}); !errors.Is(err, ErrComputeBadHandle) {
+		t.Fatalf("run after close=%v, want ErrComputeBadHandle", err)
+	}
+	if _, err := s.AllocBuffer(64, BufIO); !errors.Is(err, ErrComputeBadHandle) {
+		t.Fatalf("alloc after close=%v, want ErrComputeBadHandle", err)
+	}
+	if len(f.calls) != calls {
+		t.Fatalf("post-close ops issued %d syscalls", len(f.calls)-calls)
 	}
 }
 
