@@ -105,6 +105,8 @@ final class NetTcpRelayTests: XCTestCase {
         return cond()
     }
 
+    private struct UpstreamTimeout: Error {}
+
     /// A real loopback listener on an ephemeral port; starts the relay
     /// against it and returns the accepted upstream fd.
     private func upstream(_ relay: NetTcpRelay) throws -> Int32 {
@@ -130,9 +132,25 @@ final class NetTcpRelayTests: XCTestCase {
             }
         }
         relay.start("127.0.0.1", UInt16(bigEndian: actual.sin_port))
+        // A listener goes readable once a handshake completes — poll
+        // before accept() so a starved dial fails at the bound instead
+        // of parking the test inside the syscall (#2507).
+        var pfd = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+        guard poll(&pfd, 1, 5000) == 1, (pfd.revents & Int16(POLLIN)) != 0 else {
+            close(listener)
+            throw UpstreamTimeout()
+        }
         let up = accept(listener, nil, nil)
         XCTAssertGreaterThanOrEqual(up, 0)
         close(listener)
+        // The socket is accepted but the reader thread may not have
+        // cleared `connecting` yet — guest payload in that window is
+        // dropped as .dialing (#2377) and this harness never
+        // retransmits, so the request would never reach `up`. The
+        // connect log posts after the flag clears; waiting for it
+        // makes the forwarding path deterministic under a saturated
+        // host.
+        XCTAssertTrue(waitFor { self.logged(matching: "connected") })
         return up
     }
 
@@ -141,15 +159,28 @@ final class NetTcpRelayTests: XCTestCase {
         XCTAssertEqual(n, bytes.count)
     }
 
-    /// Read exactly `count` bytes from a blocking fd (bounded spin — the
-    /// relay writes guest data synchronously).
-    private func readUpstream(_ fd: Int32, _ count: Int) -> [UInt8] {
+    /// Read exactly `count` bytes from a blocking fd, giving up at the
+    /// deadline. Every read() is gated on poll() for the time
+    /// remaining, so zero arriving bytes cannot park the test inside
+    /// the syscall — the old bare read() once held the suite ~30
+    /// minutes when a starved relay never wrote (#2507).
+    private func readUpstream(_ fd: Int32, _ count: Int, timeout: TimeInterval = 5) -> [UInt8] {
         var out = [UInt8]()
         var buf = [UInt8](repeating: 0, count: max(1, count))
-        let deadline = Date().addingTimeInterval(5)
-        while out.count < count, Date() < deadline {
-            let n = read(fd, &buf, buf.count)
-            if n > 0 { out += buf[0..<n] } else { Thread.sleep(forTimeInterval: 0.005) }
+        let deadline = Date().addingTimeInterval(timeout)
+        while out.count < count {
+            let ms = Int32((deadline.timeIntervalSinceNow * 1000).rounded(.up))
+            guard ms > 0 else { break }
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let rc = poll(&pfd, 1, ms)
+            if rc < 0 && errno == EINTR { continue }
+            guard rc > 0 else { break }
+            // Any revents — POLLIN, HUP, ERR — makes read() return at
+            // once; only a silent socket blocks, and poll already
+            // ruled that out.
+            let n = read(fd, &buf, count - out.count)
+            guard n > 0 else { break }
+            out += buf[0..<n]
         }
         return out
     }
@@ -238,6 +269,28 @@ final class NetTcpRelayTests: XCTestCase {
         _ = relay.pump()
         XCTAssertTrue(waitFor { self.frameCount == 3 })
         XCTAssertEqual(payload(of: frame(at: 2)), Array(response[2920..<3000]))
+    }
+
+    // #2507 — the readUpstream deadline is real: a live upstream that
+    // delivers fewer bytes than asked (then silence) returns at the
+    // bound instead of parking inside read() — the failure mode that
+    // once held the suite ~30 minutes.
+    func testReadUpstreamDeadlineBoundsASilentUpstream() throws {
+        let relay = makeRelay()
+        relay.begin(synFrame: syn(), 58)
+        let up = try upstream(relay)
+        defer { close(up); relay.shutdown() }
+
+        let t0 = Date()
+        // Zero bytes ever: the forced-timeout leg.
+        XCTAssertEqual(readUpstream(up, 16, timeout: 0.5), [])
+        XCTAssertLessThan(Date().timeIntervalSince(t0), 4)
+
+        // Two bytes arrive then silence: the partial leg returns what
+        // came at the bound rather than waiting on the rest forever.
+        let req = seg(seq: guestIsn + 1, ack: serverIsn + 1, payload: [0x52, 0x53])
+        XCTAssertEqual(relay.guestDataSegment(req, req.count), .forwarded(fresh: 2))
+        XCTAssertEqual(readUpstream(up, 16, timeout: 0.5), [0x52, 0x53])
     }
 
     // #2349 bug 2 — retransmit dedup on the guest->upstream direction.
