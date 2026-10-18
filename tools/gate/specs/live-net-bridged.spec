@@ -23,11 +23,22 @@
 # the branch is byte-assertable: the daemon's DHCP serves host=.1,
 # guest=.2, and the lease records mask=0.0.0.0 gw=0.0.0.0 (the observed
 # wire contents — the OFFER/ACK carries no option 1 or 3).
+#
+# M117f (#2478): h1 is the LAN-httpd leg — setup binds a real HTTP/1.0
+# responder on THIS host's en0 IPv4:8077 (the host's own stack is a LAN
+# peer from the bridged guest) and the guest ARPs, TCP-connects, and
+# reads the canned 200 byte-patterned on the wire. The leg is
+# conditional on en0 carrying an IPv4; the named entitlements/iface
+# refusals short-circuit it exactly like b1. vgate_repeat makes the
+# acceptance K: 3 consecutive green spec runs.
 
-vgate_name live-net-bridged "M117d #2476 ADR 0057 D11 — --net-bridged/--net-vmnet named refusals + dual-branch lease/LAN-ping"
+vgate_name live-net-bridged "M117d #2476 ADR 0057 D11 — --net-bridged/--net-vmnet named refusals + dual-branch lease/LAN-ping; M117f h1 LAN-httpd"
+vgate_repeat 3 BOOTS
+vgate_note "K=3 consecutive green spec runs is the M117f (#2478) acceptance record (BOOTS overrides the default 3)"
 vgate_note "r1-r5 named refusals (host-independent): bogus iface, exclusivity x2, subnet requires+base"
 vgate_note "b1 --net-bridged en0: dev-signed -> dhcp bound + gw ping; ad-hoc -> com.apple.vm.networking refusal"
 vgate_note "v1 --net-vmnet --net-vmnet-subnet: bound 192.168.77.2 + ping host 192.168.77.1, or named vmnet_return_t refusal"
+vgate_note "h1 --net-bridged en0: dev-signed -> dhcp bound + tcp connect/GET to the host's LAN httpd on en0:8077, or the same named refusals"
 
 # r1-r5: the named refusals — the runner exits rc=1 before any VM is
 # configured, so the output file carries the ERROR line and nothing else
@@ -194,4 +205,142 @@ if "offer=1" in ser and "net dhcp: request sent" not in ser:
     sys.exit("FAIL: DHCP OFFER arrived but the REQUEST never went out")
 if "net: dhcp bound ip=192.168.77.2" in ser and " dhcp=bound,ip=192.168.77.2" not in ser:
     sys.exit("FAIL: bound transition without the bound counter line")
+PY
+
+# h1: the M117f (#2478) LAN-httpd leg — a bridged boot reaches a real
+# httpd on the LAN. The httpd is THIS host's own en0 stack: setup binds
+# an HTTP/1.0 responder on the en0 IPv4, port 8077, and generates h1.s2
+# with the concrete target. The guest's bounded TCP client ARPs the
+# peer, completes the three-way handshake, sends a data segment, and
+# reads the canned 200 back byte-patterned on the wire — 'net tcp recv:
+# 48 54 54 50 2f 31 2e 30' is "HTTP/1.0" in hex, which only a real
+# HTTP-speaking peer produces. The responder holds the connection open
+# (the boot-08 shape) so the reply is read while the guest is still
+# ESTABLISHED — a data+FIN burst could close the bounded client before
+# `net tcp recv` ran.
+#
+# The leg inherits b1's host truth: on an ad-hoc-signed runner the
+# com.apple.vm.networking refusal fires before any VM is configured and
+# the python assert passes on the refusal line; on a development-signed
+# runner carrying the restricted keys the full chain must land. When
+# en0 carries no IPv4 there is no LAN peer to reach — s2 degrades to
+# the DHCP pump and the assert requires the lease and markers only.
+vgate_file h1_httpd.py <<'EOF'
+# h1's LAN httpd: one canned HTTP/1.0 200 per connection, replied on any
+# received bytes and then held open (the guest's `net tcp recv` must find
+# the peer ESTABLISHED when it reads). peer_watch scopes this process to
+# the gate's own lifetime.
+import socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((host, port))
+srv.listen(8)
+srv.settimeout(1.0)
+RESP = b"HTTP/1.0 200 OK\r\nContent-Length: 13\r\n\r\nlan-httpd-ok\n"
+conns = []
+deadline = time.time() + 3600
+while time.time() < deadline:
+    try:
+        conn, _ = srv.accept()
+    except OSError:
+        continue
+    conn.settimeout(5.0)
+    try:
+        conn.recv(65536)
+        conn.sendall(RESP)
+    except OSError:
+        pass
+    conns.append(conn)
+EOF
+
+vgate_file h1.s1 <<'EOF'
+net
+echo h1-pumped
+EOF
+
+vgate_file h1.s3 <<'EOF'
+net tcp
+net tcp recv
+net tcp close
+net tcp
+net tcp
+echo h1-ok
+EOF
+
+vgate_setup_python <<'PY'
+# h1: discover the en0 IPv4 the bridged guest can reach, start the LAN
+# httpd scoped to this gate invocation, and only THEN generate h1.s2 —
+# the connect chain is written only when the responder provably accepted
+# a probe connection (a dead httpd cannot false-red the leg; the bound
+# named in the assert is a missing en0 IPv4 or a refused bind, and in
+# both cases the DHCP pump + markers still run).
+import os, socket, subprocess, sys, time
+rd = os.environ["RUN_DIR"]
+ip = ""
+try:
+    ip = subprocess.run(["ipconfig", "getifaddr", "en0"],
+                        capture_output=True, text=True, timeout=10).stdout.strip()
+except Exception:
+    pass
+httpd_up = False
+if ip:
+    watch = os.path.join("user", "go", "browser", "peer_watch.py")
+    log = open(os.path.join(rd, "h1-httpd.log"), "wb")
+    proc = subprocess.Popen(
+        [sys.executable, watch, str(os.getppid()),
+         sys.executable, os.path.join(rd, "h1_httpd.py"), ip, "8077"],
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(20):
+        try:
+            probe = socket.create_connection((ip, 8077), timeout=1)
+            probe.close()
+            httpd_up = True
+            break
+        except OSError:
+            time.sleep(0.25)
+    if httpd_up:
+        print("h1: LAN httpd pid=%d listening on %s:8077" % (proc.pid, ip))
+    else:
+        print("h1: httpd never accepted on %s:8077 — degrading to lease+markers (see h1-httpd.log)" % ip)
+open(os.path.join(rd, "h1.ip"), "w").write(ip + "\n" if httpd_up else "")
+# The bounded DHCP client never retransmits a lost DISCOVER, so s2 pumps
+# it the way b1 does before spending the ARP/connect chain.
+lines = ["net dhcp"] * 10
+if httpd_up:
+    lines += ["net arp " + ip, "net arp " + ip,
+              "net tcp connect " + ip + " 8077",
+              "net tcp", "net tcp", "net tcp send 8", "net tcp"]
+lines += ["echo h1-sent"]
+open(os.path.join(rd, "h1.s2"), "w").write("\n".join(lines) + "\n")
+PY
+
+# The run mirrors b1: s1 stays neutral while the bridged attachment
+# settles, s2 is heartbeat-gated past the observed VZ attach latency,
+# and s3 runs 2 s after h1-sent so the LAN round-trip (connect already
+# done in s2; the 200 lands well inside the delay) is drained before
+# `net tcp recv` prints it.
+vgate_run h1 -- --net-bridged en0 --script '$RUN_DIR/h1.s1' --script2 '$RUN_DIR/h1.s2' --script2-after 'timer heartbeat ticks=45' --script3 '$RUN_DIR/h1.s3' --script3-after 'h1-sent' --script3-delay 2 --script-expect 'h1-ok' --timeout 120
+vgate_allow_rc h1 0 1
+vgate_assert h1 python <<'PY'
+import os, sys
+rd = os.environ["RUN_DIR"]
+out = open(os.path.join(rd, "run-" + os.environ["VG_TAG"] + ".out"),
+           errors="replace").read()
+if "requires the com.apple.vm.networking entitlement" in out:
+    sys.exit(0)  # named refusal leg — the absent entitlement named itself
+if "is not in VZBridgedNetworkInterface.networkInterfaces" in out:
+    sys.exit(0)  # named refusal leg — en0 is not bridgeable on this host
+ser_path = os.environ.get("VG_SER", "")
+ser = open(ser_path, errors="replace").read() if ser_path and os.path.exists(ser_path) else ""
+need = ["net: dhcp bound ip=", "h1-ok"]
+ip_path = os.path.join(rd, "h1.ip")
+ip = open(ip_path).read().strip() if os.path.exists(ip_path) else ""
+if ip:
+    need += ["net tcp: established (peer=" + ip + ":8077)",
+             "net tcp recv: 48 54 54 50 2f 31 2e 30",
+             "net tcp: connection closed"]
+missing = [n for n in need if n not in ser]
+if missing:
+    sys.exit("FAIL: neither the com.apple.vm.networking refusal nor the LAN-httpd leg completed; missing: " + " | ".join(missing))
 PY
