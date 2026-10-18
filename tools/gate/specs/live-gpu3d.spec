@@ -152,7 +152,7 @@ PY
 # --- leg 01: triangle ----------------------------------------------------
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen-01' \
-    --screenshot-after 'gputri: win-present' \
+    --screenshot-after 'gpu3d presented' \
     --gpu3d-metal \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-tri.txt' \
@@ -205,7 +205,9 @@ vgate_assert 01 output-contains 'draws=1 gpu-completions=1'
 vgate_assert 01 output-contains 'submit-rejections=0'
 vgate_assert 01 output-contains 'refusals=0'
 # The final scanout contains the triangle's red interior AND the non-red
-# clear field — one capture, fired on the successful present marker. The
+# clear field — one capture, fired on the seat's `gpu3d presented` marker
+# (the composite lands there; `gputri: win-present` precedes it and raced
+# the capture under concurrent VM load). The
 # PNG is a ScreenCaptureKit capture of the composited macOS window, so the
 # framebuffer's exact values arrive colour-managed: on this host fb
 # 255,0,0 reads as (234,51,35) and fb 16,32,48 as (20,32,47) — stable
