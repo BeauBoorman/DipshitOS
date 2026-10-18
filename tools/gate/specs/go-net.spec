@@ -705,6 +705,9 @@ while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
         continue
+    if data[i+12:i+14] == b"\x86\xdd":  # M117b's autonomous v6 frames — skip
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
+        continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
     size = 14 + struct.unpack_from("!H", data, i + 16)[0]
     frames.append(data[i:i+size])
