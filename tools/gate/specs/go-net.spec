@@ -332,10 +332,18 @@ pathlib.Path("artifacts", "go-net-connect-wire" + suffix + ".bin").write_bytes(d
 syns = []
 i = 0
 while i < len(data):
+<<<<<<< HEAD
+    # M117b (#2474): the IPv6 datapath emits NDP/ICMPv6 frames — legitimate
+    # capture traffic now. Decode past them; the v4 analysis is unchanged.
+    et = data[i+12:i+14]
+    if et == b"\x86\xdd":
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
+=======
     et = data[i+12:i+14]
     if et == b"\x86\xdd":  # M117b's autonomous v6 frames (DAD NS, RS) — skip
         size = 14 + 40 + struct.unpack_from("!H", data, i+18)[0]
         i += size
+>>>>>>> origin/main
         continue
     assert et in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
     size = 42 if et == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
@@ -372,9 +380,14 @@ syns = []
 i = 0
 while i < len(data):
     et = data[i+12:i+14]
+<<<<<<< HEAD
+    if et == b"\x86\xdd":
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
+=======
     if et == b"\x86\xdd":  # M117b's autonomous v6 frames (DAD NS, RS) — skip
         size = 14 + 40 + struct.unpack_from("!H", data, i+18)[0]
         i += size
+>>>>>>> origin/main
         continue
     assert et in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
     size = 42 if et == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
@@ -506,7 +519,11 @@ while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
         continue
+<<<<<<< HEAD
+    if data[i+12:i+14] == b"\x86\xdd":
+=======
     if data[i+12:i+14] == b"\x86\xdd":  # M117b's autonomous v6 frames — skip
+>>>>>>> origin/main
         i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
         continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
@@ -705,7 +722,11 @@ while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
         continue
+<<<<<<< HEAD
+    if data[i+12:i+14] == b"\x86\xdd":
+=======
     if data[i+12:i+14] == b"\x86\xdd":  # M117b's autonomous v6 frames — skip
+>>>>>>> origin/main
         i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
         continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"

@@ -35,7 +35,7 @@ fn run(args: *const sdk.startup.Startup) !void {
         var storage: [16]std.Io.net.HostName.LookupResult = undefined;
         var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&storage);
         const name = try std.Io.net.HostName.init("myhost.local");
-        var canonical: [255]u8 = undefined;
+        var canonical: [254]u8 = undefined;
         try name.lookup(sdk.io, &queue, .{ .port = 8090, .family = .ip4, .canonical_name_buffer = &canonical });
         const resolved = try queue.getOne(sdk.io);
         try check(std.mem.eql(u8, &resolved.address.ip4.bytes, &.{ 10, 0, 0, 2 }));

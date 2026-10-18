@@ -79,7 +79,7 @@ fn file_close(fd: u32) void {
     );
 }
 
-pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
+pub export fn _start(argc: usize, argv: ?[*]const [256]u8) callconv(.c) noreturn {
     var path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
     var path_len: usize = 0;
     if (argc >= 1) {
@@ -92,7 +92,7 @@ pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn 
     run(path_buf[0..path_len]);
 }
 
-fn copy_arg(dst: *[40]u8, len: *usize, slot: [32]u8) void {
+fn copy_arg(dst: *[40]u8, len: *usize, slot: [256]u8) void {
     const n = std.mem.indexOfScalar(u8, &slot, 0) orelse slot.len;
     const take = @min(n, dst.len);
     @memcpy(dst[0..take], slot[0..take]);

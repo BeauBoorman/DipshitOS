@@ -32,7 +32,7 @@ with open(os.path.join(os.environ["RUN_DIR"], "keys.txt"), "wb") as f:
     f.write(b"\x12")
 PY
 
-vgate_run 01 -- --input --display --script '$RUN_DIR/script.txt' --input-chords "s,p,e,c,i,a,l,return,e,c,h,o,space,s,e,a,r,c,h,-,l,i,v,e,-,o,k,return" --input-chords-after "fill-ready" --input-chords-delay 2.0 --script2 '$RUN_DIR/keys.txt' --script2-after "fill-ready" --script-expect "search-live-ok" --timeout 240
+vgate_run 01 -- --input --display --script '$RUN_DIR/script.txt' --input-chords "s,p,e,c,i,a,l,return,e,c,h,o,space,s,e,a,r,c,h,-,l,i,v,e,-,o,k,return" --input-chords-after "(reverse-i-search)`_`" --input-chords-delay 2.0 --script2 '$RUN_DIR/keys.txt' --script2-after "fill-ready" --script-expect "search-live-ok" --timeout 240
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 01 serial-contains 'fill-ready'

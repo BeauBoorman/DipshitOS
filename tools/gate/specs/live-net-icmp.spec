@@ -144,7 +144,29 @@ vgate_assert p1 serial-contains 'net recv: frames=1'
 vgate_assert p1 serial-contains-file live-net-icmp-recv-1.txt
 vgate_assert p1 serial-contains ' icmp=req=0,repl=1,pong=0,drop=0,fail=0,seq=0'
 vgate_assert p1 serial-contains 'net-icmp-ok'
-vgate_assert p1 capture-equals live-net-icmp-cap-1.bin live-net-icmp-reply-1.bin
+vgate_assert p1 python <<'PY'
+import os, sys
+def _v4only(cap):
+    # M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+    # noise to this v4 contract; drop them by the v6 length decode.
+    out = bytearray(); i = 0
+    while i < len(cap):
+        et = cap[i+12:i+14]
+        if et == b"\x86\xdd":
+            i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19])
+        elif et == b"\x08\x06":
+            out += cap[i:i+42]; i += 42
+        else:
+            fl = 14 + ((cap[i+16] << 8) | cap[i+17])
+            out += cap[i:i+fl]; i += fl
+    return bytes(out)
+rd = os.environ["RUN_DIR"]
+cap = _v4only(open(os.path.join(rd, "live-net-icmp-cap-1.bin"), "rb").read())
+want = open(os.path.join(rd, "live-net-icmp-reply-1.bin"), "rb").read()
+if cap != want:
+    sys.exit("FAIL: icmp reply capture != fixture (v6-filtered)")
+print("icmp reply byte-exact (v6-filtered)")
+PY
 
 vgate_assert p2 serial-contains 'net ip: ip=10.0.0.1'
 vgate_assert p2 serial-contains 'net ping: echo request to 10.0.0.2 sent (46 bytes)'
@@ -152,11 +174,43 @@ vgate_assert p2 serial-contains ' icmp=req=1,repl=0,pong=1,drop=0,fail=0,seq=1'
 vgate_assert p2 serial-contains 'net arp: 10.0.0.2 -> 02:00:00:00:00:02'
 vgate_assert p2 serial-contains 'net arp: req=1,repl=0,learn=1,drop=0,fail=0'
 vgate_assert p2 serial-contains 'net-icmp-ok'
-vgate_assert p2 capture-equals live-net-icmp-cap-2.bin live-net-icmp-fixture-2.bin
+vgate_assert p2 python <<'PY'
+import os, sys
+def _v4only(cap):
+    # M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+    # noise to this v4 contract; drop them by the v6 length decode.
+    out = bytearray(); i = 0
+    while i < len(cap):
+        et = cap[i+12:i+14]
+        if et == b"\x86\xdd":
+            i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19])
+        elif et == b"\x08\x06":
+            out += cap[i:i+42]; i += 42
+        else:
+            fl = 14 + ((cap[i+16] << 8) | cap[i+17])
+            out += cap[i:i+fl]; i += fl
+    return bytes(out)
+rd = os.environ["RUN_DIR"]
+cap = _v4only(open(os.path.join(rd, "live-net-icmp-cap-2.bin"), "rb").read())
+want = open(os.path.join(rd, "live-net-icmp-fixture-2.bin"), "rb").read()
+if cap != want:
+    sys.exit("FAIL: icmp request capture != fixture (v6-filtered)")
+print("icmp request byte-exact (v6-filtered)")
+PY
 
 vgate_assert p3 serial-contains 'net ip: ip=10.0.0.1'
 vgate_assert p3 serial-contains 'net recv: frames=1'
 vgate_assert p3 serial-contains-file live-net-icmp-recv-3.txt
 vgate_assert p3 serial-contains ' icmp=req=0,repl=0,pong=0,drop=1,fail=0,seq=0'
 vgate_assert p3 serial-contains 'net-icmp-ok'
-vgate_assert p3 capture-empty live-net-icmp-cap-3.bin
+vgate_assert p3 python <<'PY'
+import os, sys
+rd = os.environ["RUN_DIR"]
+cap = open(os.path.join(rd, "live-net-icmp-cap-3.bin"), "rb").read()
+i = 0
+while i < len(cap):
+    if cap[i+12:i+14] == b"\x86\xdd":
+        i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19]); continue
+    sys.exit("FAIL: non-NDP frame in the refused-ping capture")
+print("refused-ping clean (NDP filtered)")
+PY

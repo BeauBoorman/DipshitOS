@@ -68,7 +68,28 @@ else:
 PY
 vgate_assert p1 serial-contains 'net: rx=frames=1,bytes=72,filtered=0,overflow=0,fifo=0'
 vgate_assert p1 serial-contains 'netsend: tx ok'
-vgate_assert p1 capture-equals live-net-rx-cap-1.bin live-net-rx-fixture-1.bin
+vgate_assert p1 python <<'PY'
+import os, sys
+def _v4only(cap):
+    # M117b (#2474): drop boot-time NDP/ICMPv6 noise by the v6 decode.
+    out = bytearray(); i = 0
+    while i < len(cap):
+        et = cap[i+12:i+14]
+        if et == b"\x86\xdd":
+            i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19])
+        elif et == b"\x08\x06":
+            out += cap[i:i+42]; i += 42
+        else:
+            fl = 14 + ((cap[i+16] << 8) | cap[i+17])
+            out += cap[i:i+fl]; i += fl
+    return bytes(out)
+rd = os.environ["RUN_DIR"]
+cap = _v4only(open(rd+"/live-net-rx-cap-1.bin","rb").read())
+want = open(rd+"/live-net-rx-fixture-1.bin","rb").read()
+if cap != want:
+    sys.exit("FAIL: rx capture != fixture (v6-filtered)")
+print("rx byte-exact (v6-filtered)")
+PY
 
 vgate_assert p2 serial-contains 'net: rx-armed'
 vgate_assert p2 serial-contains 'net: rx-obs len='

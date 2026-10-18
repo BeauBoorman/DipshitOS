@@ -57,7 +57,7 @@ const execPaceTicks = 2
 // died inside its own runtime (`newosproc`) leaves slots the reaper
 // reclaims on a timeslice, so the second attempt waits longer than the
 // normal pace.
-const flintRetryTicks = 3
+const flintRetryTicks = 8
 
 // flintAttempts bounds retries. The post-socket task/file-channel
 // reclamation race can lose an exec spawn OR its registry entry several

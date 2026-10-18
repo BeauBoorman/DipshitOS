@@ -87,12 +87,14 @@ if not re.search(r"name=USER\.BIN uid=\d+ caps=\d+ state=exited", ser):
 # Pages: >= 2 reads, phase-2 free = phase-1 free - 97 (one more live
 # USER.BIN: 1 text + 48 user-stack + 48 kernel-stack pages at the 192 KiB
 # task_stack_size from #1336; a leak would drop further).
+# `pages` output interleaves with the counter/exec prints mid-token
+# (`total=0x00` / `user: exec ok` / `0000000000febf free=...`), so
+# per-line matching misses the continuation. Window after each marker.
 frees = []
-for l in lines:
-    if "pages: armed=1 total=" in l:
-        m = re.search(r".*free=0x([0-9a-f]+).*", l)
-        if m:
-            frees.append(int(m.group(1), 16))
+for m in re.finditer(r"pages: armed=1 total=", ser):
+    fm = re.search(r"free=0x([0-9a-f]+)", ser[m.start():m.start() + 700])
+    if fm:
+        frees.append(int(fm.group(1), 16))
 if len(frees) < 2:
     sys.exit("FAIL: fewer than 2 pages reads")
 if frees[0] - frees[1] != 97:

@@ -3411,7 +3411,7 @@ fn entryExport(m: *const Module) ?u32 {
     return main orelse start;
 }
 
-pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
+pub export fn _start(argc: usize, argv: ?[*]const [256]u8) callconv(.c) noreturn {
     if (argc < 1 or argv == null) fail("wasm: usage: exec WASM.BIN <module.wasm>\n", 2);
     const slot = argv.?[0];
     const name_len = std.mem.indexOfScalar(u8, &slot, 0) orelse slot.len;

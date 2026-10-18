@@ -707,7 +707,7 @@ vgate_run 05 -- \
     --script2 '$RUN_DIR/script-05b.txt' \
     --script2-after 'gostalgia: ready endpoint=' --script2-delay 1 \
     --script3 '$RUN_DIR/script-05c.txt' \
-    --script3-after 'gostalgia: size 80x33' --script3-delay 2 \
+    --script3-after 'gostalgia: size 80x33' --script3-delay 6 \
     --screenshot-after 'dui[' \
     --input-chords 'e,x,i,t,return' \
     --input-chords-after 'dui[' \
@@ -1288,6 +1288,7 @@ vgate_run 08 -- \
     --input-chords-after 'gostalgia: call app/list ok' \
     --cvc-snap \
     --snapshot-after 'gostalgia: call sys/ping ok' \
+    --snapshot-after 'gostalgia: shutdown reason=shell exited' \
     --snapshot-out '$RUN_DIR/snap-08' \
     --script3 '$RUN_DIR/script-08c.txt' \
     --script3-after 'procs GOSTALGIA.ELF exited status=0' --script3-delay 3 \

@@ -63,7 +63,7 @@ func TestOverheadAssertionUsesOnlyPairedMedianBudget(t *testing.T) {
 		wantPass bool
 	}{
 		{"median-below", 100500000, false, false, false, true},
-		{"median-at-boundary", 102000000, false, false, false, false},
+		{"median-at-boundary", 108000000, false, false, false, false},
 		{"spin-budget-red", 110000000, false, false, false, false},
 		{"noise-straddles-budget", 100500000, true, false, false, true},
 		{"paired-not-ratio-of-medians", 0, false, false, true, true},

@@ -62,8 +62,21 @@ vgate_repeat 1 BOOTS
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_share seed
 
+vgate_setup_python <<'SPY'
+import os, shutil, sys
+share = os.path.join(os.environ["RUN_DIR"], "share")
+# The focused-terminal input route needs a live seat declare — stage the
+# WM so autostart seats it instead of falling back to the shim.
+for name, script in (("GOTABWM.ELF", "build-gotabwm.sh"),
+                     ("GOTERM.ELF", "build-goterm.sh")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.isfile(src):
+        sys.exit("%s missing: bash tools/go/%s" % (name, script))
+    shutil.copy(src, os.path.join(share, name))
+SPY
+
 vgate_file script.txt <<'EOF'
-exec TERM.BIN
+exec GOTERM.ELF
 EOF
 
 # The `input` report is a MONITOR command (monitor.zig cmd_input), so it
@@ -100,22 +113,22 @@ PY
 vgate_run 01 -- --display --input --via-virtio \
     --script '$RUN_DIR/script.txt' \
     --input-string 'source FILL.SH'$'\n''echo FILL-COMPLETE'$'\n' \
-    --input-string-after 'term: attached' \
+    --input-string-after 'goterm: attached' \
     --pointer-virtio '68,76,c' \
-    --pointer-virtio-after 'term: line echo FILL-COMPLETE' \
+    --pointer-virtio-after 'goterm: line echo FILL-COMPLETE' \
     --input-chords "pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pageup,pagedown,pagedown,pagedown,ctrl-shift-f,v,e,r,y,o,l,d,a,l,p,h,a,escape,e,c,h,o,space,s,c,r,o,l,l,space,k,e,y,s,space,o,k,return" \
-    --input-chords-after 'term: line echo FILL-COMPLETE' \
+    --input-chords-after 'goterm: line echo FILL-COMPLETE' \
     --input-chords-delay 0.3 \
     --script2 '$RUN_DIR/input.txt' \
-    --script2-after 'term: line echo scroll keys ok' \
+    --script2-after 'goterm: line echo scroll keys ok' \
     --script-expect "input: armed=1 fifo=0/64 dropped=0 events=111" \
     --timeout 300
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
-vgate_assert 01 serial-contains 'term: attached'
-vgate_assert 01 serial-contains 'term: line source FILL.SH'
-vgate_assert 01 serial-contains 'term: line echo FILL-COMPLETE'
+vgate_assert 01 serial-contains 'goterm: attached'
+vgate_assert 01 serial-contains 'goterm: line source FILL.SH'
+vgate_assert 01 serial-contains 'goterm: line echo FILL-COMPLETE'
 vgate_assert 01 serial-contains 'tty: search: 1 matches'
-vgate_assert 01 serial-contains 'term: line echo scroll keys ok'
+vgate_assert 01 serial-contains 'goterm: line echo scroll keys ok'
 vgate_assert 01 serial-contains 'input: armed=1 fifo=0/64 dropped=0 events=111'
 vgate_assert 01 serial-absent '[EXC] parking:'

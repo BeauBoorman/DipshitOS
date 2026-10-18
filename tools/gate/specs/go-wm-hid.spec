@@ -911,17 +911,29 @@ if len(set(ids)) != 3:
 ids = tuple(ids)
 start = ids.index(int(rail_m.group(1)))
 want_wrap = ids[(start + 1) % len(ids)]
-want_direct = ids[1]
+# Ctrl+2 selects the second RAIL cell — under the MRU rail that is the
+# wrap order's second entry, not the open order's.
+want_direct = None  # resolved after the wrap order is read
 
 wrap_o_i, wrap_o = first_order_after(wrap_i)
 direct_i = first_after("gotabwm: alt-tab id=", wrap_i)
 direct_o_i, direct_o = first_order_after(direct_i)
 if not (rail_i < wrap_i < wrap_o_i < direct_i < direct_o_i):
     sys.exit("chord marker/order chain out of order")
-for order in (wrap_o, direct_o):
-    got_ids = tuple(int(order.group(i)) for i in range(1, 4))
-    if got_ids != ids:
-        sys.exit("chord changed rail order: got %s want %s" % (got_ids, ids))
+# The rail now MRU-orders: a wrap chord pulls the focused cell to the
+# front, a direct chord focuses without reordering. The contract below
+# checks the observed orders against exactly that rule, not the older
+# tab-open-order invariant.
+wrap_order = tuple(int(wrap_o.group(i)) for i in range(1, 4))
+want_order = (want_wrap,) + tuple(i for i in ids if i != want_wrap)
+if wrap_order != want_order:
+    sys.exit("wrap chord order: got %s want %s (focused-first MRU)" %
+             (wrap_order, want_order))
+direct_order = tuple(int(direct_o.group(i)) for i in range(1, 4))
+if direct_order != wrap_order:
+    sys.exit("direct chord reordered the rail: got %s want %s" %
+             (direct_order, wrap_order))
+want_direct = wrap_order[1]
 if int(wrap_o.group(7)) != want_wrap:
     sys.exit("Ctrl+Tab focused %s want next rail cell %s" % (
         wrap_o.group(7), want_wrap))

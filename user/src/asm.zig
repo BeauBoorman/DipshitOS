@@ -651,7 +651,7 @@ pub fn error_name(kind: ErrorKind) []const u8 {
 // Entry point: exec ASM.BIN <source> [<output>]
 // ---------------------------------------------------------------------------
 
-pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
+pub export fn _start(argc: usize, argv: ?[*]const [256]u8) callconv(.c) noreturn {
     // M34 HF6 (issue #740): bare names route to the host share (the ESP
     // is gone).
     var src_path_buf: [40]u8 = @as([40]u8, @splat(@as(u8, 0)));
@@ -675,7 +675,7 @@ pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn 
     run(src_path_buf[0..src_len], out_path_buf[0..out_len]);
 }
 
-fn copy_arg(dst: *[40]u8, len: *usize, slot: [32]u8) void {
+fn copy_arg(dst: *[40]u8, len: *usize, slot: [256]u8) void {
     const n = std.mem.indexOfScalar(u8, &slot, 0) orelse slot.len;
     const take = @min(n, dst.len);
     @memcpy(dst[0..take], slot[0..take]);

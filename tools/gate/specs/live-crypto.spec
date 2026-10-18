@@ -16,7 +16,7 @@ echo rx-crypto-ok
 EOF
 
 vgate_setup_python <<'PY'
-import os, hashlib, hmac
+import os, hashlib, hmac, struct
 
 run_dir = os.environ["RUN_DIR"]
 share = os.path.join(run_dir, "share")
@@ -35,6 +35,24 @@ line = "cryptod: sha256=%s hmac=%s" % (
 )
 with open(os.path.join(run_dir, "expected.txt"), "w") as f:
     f.write(line + "\n")
+
+# exec CRYPTOD.BIN CRYPTO.TXT passes an argument: the flat-bin argv block
+# (2 KiB) must fit inside the content's last page (exec.zig argv_va_for),
+# so content sizes in the (2048, 4096) mod-4096 window refuse with
+# 'no_args_room'. Pad the staged copy with load-inert zeros past it —
+# image_size (u64 at offset 16) covers header + content, so the pad must
+# write the field AND extend the file, or the zeros are invisible.
+p = os.path.join(share, "CRYPTOD.BIN")
+size = os.path.getsize(p)
+content = size - 24
+if 2048 < content % 4096:
+    want = (content // 4096 + 1) * 4096 + 8 + 24
+    with open(p, "r+b") as f:
+        f.seek(16)
+        f.write(struct.pack("<Q", want))
+        f.truncate(want)
+    size = os.path.getsize(p)
+print("live-crypto: staged CRYPTOD.BIN argv-pad check, size=%d" % size)
 print("live-crypto: host KAT = " + line)
 PY
 
@@ -54,7 +72,7 @@ vgate_assert 01 serial-absent '[EXC] parking:'
 # compare against the literals committed in this spec, and against the
 # generated expected.txt. A stale literal or a drifted fixture fails here.
 vgate_assert 01 python <<'PY'
-import os, hashlib, hmac
+import os, hashlib, hmac, struct
 
 RUN_DIR = os.environ["RUN_DIR"]
 data = bytes(range(256))

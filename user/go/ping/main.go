@@ -323,7 +323,7 @@ func runPing(cfg pingArgs) {
 		}
 		got := false
 		var rtt uint32
-		for polls := 0; polls < 50; polls++ {
+		for polls := 0; polls < 200; polls++ {
 			var p uint64
 			if cfg.V6 {
 				p = vi.Ping6Poll()

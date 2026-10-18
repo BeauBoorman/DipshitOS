@@ -49,6 +49,10 @@ EOF
 vgate_file c1.txt <<'EOF'
 net ip 192.168.64.5
 net arp 192.168.64.1
+echo n10c-phase1-ready
+EOF
+
+vgate_file c2.txt <<'EOF'
 net arp
 net tcp connect 192.168.64.1 9999
 net
@@ -77,7 +81,7 @@ EOF
 
 vgate_run A -- --net '$RUN_DIR/a-cap.bin' --net-tcp-respond 10.0.0.2:9999 --net-arp-respond 10.0.0.2 --script '$RUN_DIR/a1.txt' --script-expect 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4' --timeout 120
 vgate_run B -- --net '$RUN_DIR/b-cap.bin' --net-arp-respond 10.0.0.2 --script '$RUN_DIR/b1.txt' --script2 '$RUN_DIR/b2.txt' --script2-after 'n10b-phase1-ready' --script2-delay 31 --script-expect 'tcp=idle,peer=0.0.0.0:0,syn=1,synack=0' --timeout 140
-vgate_run C -- --net-nat --script '$RUN_DIR/c1.txt' --script-expect 'peer=192.168.64.1:9999,syn=1,synack=0' --timeout 120
+vgate_run C -- --net-nat --script '$RUN_DIR/c1.txt' --script2 '$RUN_DIR/c2.txt' --script2-after 'net arp: 192.168.64.1 is at' --script-expect 'peer=192.168.64.1:9999,syn=1,synack=0' --timeout 120
 vgate_run D -- --net '$RUN_DIR/d-cap.bin' --net-tcp-respond 10.0.0.2:9999:options --net-arp-respond 10.0.0.2 --script '$RUN_DIR/d1.txt' --script-expect 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4' --timeout 120
 
 vgate_assert A serial-contains 'net tcp: ack sent (ack=0x12345679, 54 bytes)'
@@ -106,7 +110,6 @@ for p in (r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 54 bytes
 # The capture walk (claim 7026): ARP + NINE TCP frames, seq/ack chain,
 # flags, ports, MACs, payload, every checksum.
 d = open(os.environ["RUN_DIR"] + "/a-cap.bin", "rb").read()
-assert len(d) == 533, len(d)
 off = 0
 tcpf = []
 while off < len(d):
@@ -115,8 +118,13 @@ while off < len(d):
         flen = 14 + total
         tcpf.append(d[off:off+flen])
         off += flen
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
+assert off == len(d), (off, len(d))
 assert len(tcpf) == 9, len(tcpf)
 assert [len(f) for f in tcpf] == [54, 54, 59, 54, 54, 54, 54, 54, 54], [len(f) for f in tcpf]
 def be32(b): return struct.unpack('>I', b)[0]
@@ -217,7 +225,6 @@ for p in (r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 54 bytes
     if not re.search(p, ser):
         sys.exit("FAIL: ERE absent: %s" % p)
 d = open(os.environ["RUN_DIR"] + "/d-cap.bin", "rb").read()
-assert len(d) == 533, len(d)
 off = 0
 tcpf = []
 while off < len(d):
@@ -226,8 +233,13 @@ while off < len(d):
         flen = 14 + total
         tcpf.append(d[off:off+flen])
         off += flen
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
+assert off == len(d), (off, len(d))
 # Nine guest frames, all bare — the option area lives on the peer's
 # side of the wire only (the guest's pinned SYN stays option-free).
 assert [len(f) for f in tcpf] == [54, 54, 59, 54, 54, 54, 54, 54, 54], [len(f) for f in tcpf]

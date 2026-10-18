@@ -171,7 +171,7 @@ func main() {
 				vsys.Println("selfhost: " + verb + " verdict=0-of-" +
 					vsys.Itoa64(exp.count) + "-survived " + exp.image)
 			}
-			vsys.Exit(rc)
+			vsys.Exit(int(rc))
 		}
 	}
 	if exp != nil {

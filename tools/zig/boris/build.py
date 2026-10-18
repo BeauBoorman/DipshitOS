@@ -70,13 +70,84 @@ def run(command, log, cwd=ROOT):
     return result.stdout + result.stderr
 
 
+def _repeat17(text):
+    """zig 0.17 removed the `x ** n` array-repeat operator (its lexer now
+    reads `**` as the pointer-of-pointer type suffix). Every upstream site
+    is a single-element repeat, which @splat covers exactly: `[_]T{e} ** n`
+    -> `@as([n]T, @splat(e))`, the declared-form `name: [n]T = .{e} ** n`
+    -> `@as([n]T, @splat(e))`, and uniform string repeats `"c" ** n` ->
+    `&@as([n*len]u8, @splat('c'))`. Semantics are unchanged — this is a
+    syntax port, not a patch."""
+    import re
+    def decl(m):
+        return "%s: [%s]%s = @as([%s]%s, @splat(%s))" % (
+            m.group(1), m.group(2), m.group(3), m.group(2), m.group(3),
+            m.group(4))
+    def arr(m):
+        return "@as([%s]%s, @splat(%s))" % (m.group(3), m.group(1),
+                                            m.group(2))
+    def lit(m):
+        body, n = m.group(1), int(m.group(2))
+        assert len(set(body)) == 1, "non-uniform repeat literal: " + body
+        return "&@as([%d:0]u8, @splat('%s'))" % (len(body) * n, body[0])
+    n_expr = r"[^,;\n()]+(?:\([^)]*\)[^,;\n()]*)*"
+    out = re.sub(r"(\w+): \[(\w+)\](.+) = \.\{([^}]*)\} \*\* \2\b",
+                 decl, text)
+    out = re.sub(r"\[_\]([^\s{]+)\{([^}]*)\} \*\* (" + n_expr + r")",
+                 arr, out)
+    out = re.sub(r'"([^"]+)" \*\* (\d+)\b', lit, out)
+    # zig 0.17's Type reflection split `.fields` (EnumField records) into
+    # parallel `field_names`/`field_values` lists, and `std.meta.fields`
+    # is a compileError. The three rewrite shapes upstream uses follow.
+    out = out.replace('@"enum".fields.len', '@"enum".field_names.len')
+    had_enum_loop = ('@"enum".fields, 0..) |field' in out or
+                     '@"enum".fields) |field|' in out)
+    out = out.replace('@"enum".fields, 0..) |field, i|',
+                      '@"enum".field_names, 0..) |field_name, i|')
+    out = out.replace('@"enum".fields) |field|',
+                      '@"enum".field_names) |field_name|')
+    # The two enum-loop files use `field.name` only inside those loops.
+    if had_enum_loop:
+        out = out.replace("field.name", "field_name")
+    out = out.replace("std.meta.fields(artifact_inventory.Kind).len",
+                      '@typeInfo(artifact_inventory.Kind).@"enum".field_names.len')
+    old_fn = """fn enumWireNames(comptime E: type) [std.meta.fields(E).len][]const u8 {
+    comptime {
+        const fields = std.meta.fields(E);
+        var names: [fields.len][]const u8 = undefined;
+        for (fields, 0..) |field, index| names[index] = @field(E, field.name).name();"""
+    new_fn = """fn enumWireNames(comptime E: type) [@typeInfo(E).@"enum".field_names.len][]const u8 {
+    comptime {
+        const names = @typeInfo(E).@"enum".field_names;
+        var wire: [names.len][]const u8 = undefined;
+        for (names, 0..) |name, index| wire[index] = @field(E, name).name();"""
+    if old_fn in out:
+        out = out.replace(old_fn, new_fn)
+        out = out.replace("        return names;\n    }\n}\n\ntest \"publication proof pack",
+                          "        return wire;\n    }\n}\n\ntest \"publication proof pack")
+    return out
+
+
+def materialize17(work):
+    """Upstream-verbatim tree with only the zig-0.17 repeat-syntax port —
+    the unpatched modes still test upstream, just readable by the pinned
+    compiler."""
+    target = work / "source17"
+    for path in LOCK["boris"]["files"]:
+        data = (INPUTS / "boris" / path).read_bytes()
+        out = target / path
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(_repeat17(data.decode()).encode())
+    return target
+
+
 def materialize(work):
     """Boris-only exclusions, never patch the SDK or the dependency cache."""
     target = work / "source"
     patches = json.loads((HERE / "patches.json").read_text())
     stack_patches = json.loads((HERE / "workspace-patches.json").read_text())
     for path in LOCK["boris"]["files"]:
-        data = (INPUTS / "boris" / path).read_bytes()
+        data = _repeat17((INPUTS / "boris" / path).read_bytes().decode()).encode()
         if path in patches or path in stack_patches:
             text = data.decode()
             for edit in patches.get(path, []):
@@ -133,7 +204,7 @@ def build(mode, work, cache=sdk.DEFAULT_CACHE):
     guest_modes = ("guest", "guest-oom", "guest-resources", "guest-no-entropy", "guest-short-entropy", "audit")
     guest = mode in guest_modes
     patched = guest or mode in ("patched-host", "patched-test", "patched-upstream-test")
-    source = materialize(work) if patched else INPUTS / "boris"
+    source = materialize(work) if patched else materialize17(work)
     tests = mode in ("test", "upstream-test", "patched-test", "patched-upstream-test")
     output = work / ({"guest-resources": "BORISFULL.BIN", "guest-oom": "BORISOOM.BIN",
                      "guest-no-entropy": "BORISNO.BIN", "guest-short-entropy": "BORISSHORT.BIN"}.get(mode, "BORIS.BIN") if guest else "boris-oracle")

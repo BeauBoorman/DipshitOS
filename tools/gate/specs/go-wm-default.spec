@@ -363,8 +363,8 @@ import os, sys
 share = os.environ["VG_SHARE"]
 text = open(os.path.join(share, "APPS.TXT"), encoding="utf-8").read()
 rows = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
-if len(rows) != 16:
-    sys.exit("manifest has %d rows, want 16 (M99c's GOSOUND row grew it)" % len(rows))
+if len(rows) != 19:
+    sys.exit("manifest has %d rows, want 19 (M99c/M110c/M111c rows grew it)" % len(rows))
 dock = 0
 v2 = 0
 for ln in rows:
@@ -1290,8 +1290,10 @@ vgate_run 19 -- \
     --script '$RUN_DIR/script-m91-observe.txt' --script-after 'gosh: prompt' \
     --snapshot-after 'gotabwm: launcher presented' \
     --snapshot-out '$RUN_DIR/menu-19' \
-    --pointer-virtio '272,702,d;272,702,u;270,222,d;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;960,10;800,400,u' \
     --pointer-virtio-after 'gosh: prompt' \
+    --input-chords 'g,o,t,e,r,m,return' \
+    --input-chords-after 'gotabwm: launcher presented' \
     --input-string $'source /host/M91-WORKFLOW.SH\n' \
     --input-string-after 'goterm: prompt' \
     --script-expect 'goterm: done status=0' --script-expect-tail 4 --timeout 180
@@ -1343,14 +1345,20 @@ vgate_file script-m91-relaunch.txt <<'EOF'
 set GOMAXPROCS=1
 exec GOTERM.ELF
 EOF
+vgate_file script-20-filter.txt <<'EOF'
+goedit
+EOF
+
 vgate_run 20 -- \
     --screen '$RUN_DIR/screen-20' --via-virtio \
     --script '$RUN_DIR/script-m91-relaunch.txt' \
     --script-after 'gotabwm: present' \
     --input-string $'cat /host/M91-1925.RECEIPT\n' \
     --input-string-after 'goterm: prompt' \
-    --pointer-virtio '272,702,d;272,702,u;270,174,d;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;960,10;800,400,u' \
     --pointer-virtio-after 'goterm: done status=0' \
+    --script2 '$RUN_DIR/script-20-filter.txt' \
+    --script2-after 'gotabwm: launcher presented' --script2-delay 1 \
     --input-chords 'w,o,r,k,e,d,return,ctrl-s,ctrl-3' \
     --input-chords-after 'goedit: present' \
     --script-expect 'gotabwm: alt-tab id=' --script-expect-tail 4 --timeout 180

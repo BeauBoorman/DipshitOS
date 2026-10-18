@@ -89,16 +89,23 @@ if not ms or int(ms[-1]) < 2:
 d = open(os.environ["RUN_DIR"] + "/a-cap.bin", "rb").read()
 off = 0
 syns = []
+v6b = 0
 while off < len(d):
     if d[off+12:off+14] == b'\x08\x00':
         total = (d[off+16] << 8) | d[off+17]
         syns.append(d[off:off+14+total])
         off += 14 + total
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        v6n = 14 + 40 + ((d[off+18] << 8) | d[off+19])
+        v6b += v6n
+        off += v6n
     else:
         off += 42
 assert len(syns) >= 3, len(syns)
 assert all(len(f) == 54 for f in syns), [len(f) for f in syns]
-assert len(d) == 42 + 54 * len(syns), len(d)
+assert len(d) == 42 + 54 * len(syns) + v6b, (len(d), v6b)
 assert all(f == syns[0] for f in syns), "retransmitted SYNs must be byte-identical"
 def chk(data):
     if len(data) % 2: data += b'\x00'
@@ -132,7 +139,22 @@ if not re.search(r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 5
     sys.exit("FAIL: no SYN line")
 # The capture: ARP + SYN + handshake ACK = 150 B, exactly ONE SYN.
 d = open(os.environ["RUN_DIR"] + "/b-cap.bin", "rb").read()
-assert len(d) == 150, len(d)
+# M117b NDP frames pad the capture: the 150-byte pin applies to the
+# non-v6 bytes (ARP + SYN + handshake ACK), not the whole file.
+off = 0
+v4_bytes = 0
+while off < len(d):
+    et = d[off+12:off+14]
+    if et == b"\x86\xdd":
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
+    elif et == b"\x08\x00":
+        n = 14 + ((d[off+16] << 8) | d[off+17])
+        v4_bytes += n
+        off += n
+    else:
+        v4_bytes += 42
+        off += 42
+assert v4_bytes == 150, (v4_bytes, len(d))
 off = 0
 tcpf = []
 while off < len(d):
@@ -140,6 +162,10 @@ while off < len(d):
         total = (d[off+16] << 8) | d[off+17]
         tcpf.append(d[off:off+14+total])
         off += 14 + total
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
 assert len(tcpf) == 2, len(tcpf)
@@ -176,16 +202,23 @@ if n != 10:
 # The capture: ARP + SYN + ACK + ELEVEN byte-identical 59-B data
 # frames = 799 B.
 d = open(os.environ["RUN_DIR"] + "/c-cap.bin", "rb").read()
-assert len(d) == 799, len(d)
 off = 0
 tcpf = []
+v6b = 0
 while off < len(d):
     if d[off+12:off+14] == b'\x08\x00':
         total = (d[off+16] << 8) | d[off+17]
         tcpf.append(d[off:off+14+total])
         off += 14 + total
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        v6n = 14 + 40 + ((d[off+18] << 8) | d[off+19])
+        v6b += v6n
+        off += v6n
     else:
         off += 42
+assert len(d) == 799 + v6b, (len(d), v6b)
 assert len(tcpf) == 13, len(tcpf)
 assert [len(f) for f in tcpf] == [54, 54] + [59] * 11, [len(f) for f in tcpf]
 def chk(data):

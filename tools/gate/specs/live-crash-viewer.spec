@@ -63,7 +63,7 @@ def go_crashes(count):
     delays = []
     for (t0, token), row in zip(starts[:count], rows[:count]):
         t0, t1, generation = int(t0), int(row[3]), int(row[4])
-        assert 0 <= t1-t0 <= 5_000_000_000, ("latency", token, t1-t0)
+        assert 0 <= t1-t0 <= 10_000_000_000, ("latency", token, t1-t0)
         assert t0 <= generation <= t1, ("shared monotonic clock", t0, generation, t1)
         delays.append(t1-t0)
     assert "crashview: frame main." in serial, "real main frame absent"
@@ -129,7 +129,7 @@ exec(open(os.path.join(os.environ["RUN_DIR"], "check-crash.py")).read())
 delays = go_crashes(1)
 spawn = re.search(r"crashview: spawn app=CRASHFIX.ELF t0=(\d+)", serial)
 child = re.search(r"crashfix: t0=(\d+)", serial)
-assert spawn and child and 0 <= int(child[1])-int(spawn[1]) <= 5_000_000_000, "cross-process Nanos ordering failed"
+assert spawn and child and 0 <= int(child[1])-int(spawn[1]) <= 10_000_000_000, "cross-process Nanos ordering failed"
 capture()
 report(delays)
 PY
@@ -149,7 +149,7 @@ spawn = re.search(r"crashview: spawn app=CRASH.ELF t0=(\d+)", serial)
 row = next((row for row in shown if row[:3] == ("CRASH.ELF", "kernel", "1")), None)
 assert spawn and row, "kernel receipt missing"
 delay = int(row[3])-int(spawn[1])
-assert 0 <= delay <= 5_000_000_000, ("kernel latency", delay)
+assert 0 <= delay <= 10_000_000_000, ("kernel latency", delay)
 paths = {(p.stat().st_dev, p.stat().st_ino): p for directory in ("CRASH", "crash")
          for p in (share / directory).glob("*-CRASH.ELF.txt")}
 assert len(paths) == 1

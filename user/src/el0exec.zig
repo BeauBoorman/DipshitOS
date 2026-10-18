@@ -159,6 +159,7 @@ fn value_return_slot(slot: u64) bool {
         44, // sys_audio_volume: 0..100 gain (handle_audio_volume). Host oracle omits 44 — its corpora never land a small-vol success; do not drop this row to "match" host.
         63, // sys_mmap: mapped address
         66, // sys_time: wall clock seconds
+        87, // sys_getpid (#2158, ADR 0048): the caller's pid
         => true,
         else => false,
     };

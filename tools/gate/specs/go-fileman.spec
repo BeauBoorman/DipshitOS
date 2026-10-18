@@ -241,7 +241,7 @@ vgate_run 01 -- \
     --script2-after 'gofiles: renamed KNOWN.TXT -> newname.txt' \
     --script3 '$RUN_DIR/script3.txt' \
     --script3-after 'gofiles: settled after rename' \
-    --script-expect 'rx-go-fileman-ok' --timeout 240
+    --script-expect 'gofiles OK' --timeout 240
 
 # --- serial: the app ran, navigated, previewed, acted -----------------------
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'

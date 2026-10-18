@@ -72,7 +72,7 @@ vgate_run 01 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-intruder \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -94,11 +94,12 @@ vgate_assert 01 serial-contains 'gotabwm: rfb key usage=44'
 vgate_assert 01 serial-contains 'gotabwm: rfb pointer x=800 y=600 buttons=1'
 vgate_assert 01 serial-contains 'gotabwm: launcher dismiss'
 vgate_assert 01 serial-contains 'gotabwm: rfb drop peer'
-# Over the cap: the kernel has one connection and refuses a second peer's
-# SYN with RST+ACK (M84f, #1836 — RFC 793 §3.4); the session it knocked
-# on is intact.
+# Under M99f's per-listener two-child table (#2184) the kernel ADMITS the
+# second SYN (child 2 of 2); the seat then drops the extra peer at the
+# RFB layer (`rfb drop peer`), so the session still serves one viewer.
+# The kernel's RST refusal now lives at the third SYN.
 vgate_assert 01 output-contains 'NET-TCP-INTRUDER: sent a second SYN from port'
-vgate_assert 01 output-contains 'NET-TCP-INTRUDER: the guest refused (RST)'
+vgate_assert 01 output-contains 'NET-TCP-INTRUDER: the guest ADMITTED (SYN-ACK)'
 vgate_assert 01 serial-absent '[EXC] parking:'
 vgate_assert 01 serial-absent 'exited status=139'
 vgate_assert 01 python <<'PY'
@@ -111,11 +112,11 @@ ordered(ser, ("gocalc: present", "gotabwm: rfb ready", "gotabwm: rfb frame",
               "gotabwm: launcher dismiss", "gotabwm: rfb pointer x=800 y=600 buttons=1"))
 ordered(ser, ("gotabwm: rfb ready", "gotabwm: rfb drop peer", "gotabwm: rfb done"))
 probe_ok(out)
-if "NET-TCP-INTRUDER: the guest refused (RST)" not in out:
-    sys.exit("the over-cap second SYN was not refused (no RST for the second viewer)")
-if "NET-TCP-INTRUDER: the guest ADMITTED (SYN-ACK)" in out:
-    sys.exit("the guest admitted a second viewer's SYN while serving the first")
-print("RFB pixels + seat key/pointer receipts ordered; FIN closed it; the second SYN was refused (RST)")
+if "NET-TCP-INTRUDER: the guest ADMITTED (SYN-ACK)" not in out:
+    sys.exit("the second SYN saw no SYN-ACK — the M99f two-child listener should admit it")
+if "rfb drop peer" not in ser:
+    sys.exit("the seat did not drop the admitted second peer at the RFB layer")
+print("RFB pixels + seat key/pointer receipts ordered; FIN closed it; the second SYN was admitted (M99f child 2) and the seat dropped the extra peer")
 PY
 
 # ---- 02: a viewer that asks for VNC password auth (never offered) ----
@@ -128,7 +129,7 @@ vgate_run 02 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=security \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -163,7 +164,7 @@ vgate_run 03 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=malformed \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -200,7 +201,7 @@ vgate_run 04 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=stall \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -232,7 +233,7 @@ vgate_run 05 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=die-drag \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -269,7 +270,7 @@ vgate_run 06 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=die-focus \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \

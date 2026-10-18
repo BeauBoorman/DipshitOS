@@ -2921,7 +2921,7 @@ pub fn compileFiles(sources: []const []const u8) !usize {
 // word is the output; every word before it is a source (up to MAX_FILES).
 // Backward compatible: `zc a.z` compiles one source to the default output,
 // and no args compiles /host/MAIN.Z -> /host/MAIN.ELF.
-pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn {
+pub export fn _start(argc: usize, argv: ?[*]const [256]u8) callconv(.c) noreturn {
     var src_path_bufs: [MAX_FILES][40]u8 = @as([MAX_FILES][40]u8, @splat(@as([40]u8, @as([40]u8, @splat(@as(u8, 0))))));
     var src_lens: [MAX_FILES]usize = @as([MAX_FILES]usize, @splat(@as(usize, 0)));
     var src_paths: [MAX_FILES][]const u8 = undefined;
@@ -2955,7 +2955,7 @@ pub export fn _start(argc: usize, argv: ?[*]const [32]u8) callconv(.c) noreturn 
     run(src_paths[0..src_count], out_path_buf[0..out_len]);
 }
 
-fn copy_arg(dst: *[40]u8, len: *usize, slot: [32]u8) void {
+fn copy_arg(dst: *[40]u8, len: *usize, slot: [256]u8) void {
     const n = std.mem.indexOfScalar(u8, &slot, 0) orelse slot.len;
     const take = @min(n, dst.len);
     @memcpy(dst[0..take], slot[0..take]);

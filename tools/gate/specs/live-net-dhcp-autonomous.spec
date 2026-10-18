@@ -51,6 +51,24 @@ if not re.search(r"net dhcp: rebinding \(T2, elapsed=[0-9]+\) request sent \(298
 # The capture: 1222 B with the unicast RENEW + broadcast REBIND at
 # the N9-pinned offsets.
 cap = open(os.environ["RUN_DIR"] + "/cap.bin", "rb").read()
+# M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+# noise to this v4 contract; drop them by the v6 length decode so the
+# pinned sizes/offsets below stay byte-exact.
+_v4 = bytearray()
+_i = 0
+while _i < len(cap):
+    _et = cap[_i+12:_i+14]
+    if _et == b"\x86\xdd":
+        _i += 14 + 40 + ((cap[_i+18] << 8) | cap[_i+19])
+    elif _et == b"\x08\x06":
+        _v4 += cap[_i:_i+42]
+        _i += 42
+    else:
+        _fl = 14 + ((cap[_i+16] << 8) | cap[_i+17])
+        _v4 += cap[_i:_i+_fl]
+        _i += _fl
+cap = bytes(_v4)
+
 if len(cap) != 1222:
     sys.exit("FAIL: capture size %d, want 1222" % len(cap))
 h = cap.hex()

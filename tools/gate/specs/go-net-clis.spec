@@ -274,6 +274,10 @@ while off < len(d):
         off += flen
         if f[23] == 17 and f[30:34] == bytes([10, 0, 0, 2]) and f[36:38] == b"\x00\x7b":
             queries.append(f)
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
 if len(queries) != 1:
@@ -351,6 +355,10 @@ while off < len(d):
         off += flen
         if f[23] == 17 and f[30:34] == bytes([10, 0, 0, 2]) and f[36:38] == b"\x00\x7b":
             queries += 1
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
 if queries != 1:
@@ -452,6 +460,10 @@ while off < len(d):
         off += flen
         if len(f) >= 42 and f[23] == 17 and f[30:34] == bytes([10,0,0,2]) and f[36:38] == b"\x00\x35":
             ports.append((f[34] << 8) | f[35])
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
 if len(ports) != 1:
