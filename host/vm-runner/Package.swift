@@ -89,9 +89,17 @@ let package = Package(
             name: "VMTcp",
             path: "Sources/VMTcp"
         ),
+        // M115b (#2461, ADR 0056): the virelai-ctl/1 session codec — the
+        // HMAC-challenged guest→host control channel behind --vsock-ctl.
+        // Pure Swift/CryptoKit, zero Virtualization imports, so
+        // `swift test` drives the whole refusal matrix without a VM.
+        .target(
+            name: "VSCtl",
+            path: "Sources/VSCtl"
+        ),
         .executableTarget(
             name: "VMRunner",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"],
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VSCtl"],
             path: "Sources/VMRunner"
         ),
         // M118a (#2479): the `--sound-in` observation vehicle — a standalone
@@ -106,7 +114,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VSCtl"]
         )
     ],
     swiftLanguageModes: [.v5]
