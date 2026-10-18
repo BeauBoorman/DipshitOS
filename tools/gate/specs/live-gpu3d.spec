@@ -152,7 +152,7 @@ PY
 # --- leg 01: triangle ----------------------------------------------------
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen-01' \
-    --screenshot-after 'gputri: win-present' \
+    --screenshot-after 'gotabwm: gpu3d presented' \
     --gpu3d-metal \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-tri.txt' \
