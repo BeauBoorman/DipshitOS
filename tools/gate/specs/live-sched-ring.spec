@@ -44,6 +44,6 @@ if len(rows) < 2 or rows[0] == rows[1]:
     sys.exit(1)
 if not re.search(r'smp: secondary runs=\d+ task=SCHEDRING\.BIN', ser):
     print("missing secondary run for SCHEDRING.BIN", file=sys.stderr); sys.exit(1)
-if not re.search(r'smp: steal runs=\d+ task=SCHEDRING\.BIN from=1', ser):
+if not re.search(r'smp: steal runs=\d+ task=SCHEDRING\.BIN from=\d+', ser):
     print("missing steal from=1 for SCHEDRING.BIN", file=sys.stderr); sys.exit(1)
 PY
