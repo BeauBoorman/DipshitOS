@@ -574,6 +574,12 @@ func (a *app) toggleSidebar() {
 	a.urlEditing = false
 	a.histOpen = false
 	a.sideOpen, a.sideSel = true, 0
+	// Arc4 #238: under shim compositing the kernel lowers the focused
+	// window on Ctrl+Shift+B — the card's sidebar chord — at input decode,
+	// which races ahead of the app's queued key event. A hidden panel is
+	// not a sidebar, so opening always re-raises the window: the app is
+	// the last mover and wins the stack back.
+	vi.WinRaise(a.win)
 	a.render()
 	vi.Sleep(10)
 	a.render()

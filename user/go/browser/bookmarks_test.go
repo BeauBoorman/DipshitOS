@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"virelai/vi"
 	"virelai/webrender"
 )
 
@@ -332,6 +333,31 @@ func TestSidebarPaintsRows(t *testing.T) {
 	}
 	if ink < 20 {
 		t.Fatalf("no row text painted: %d", ink)
+	}
+}
+
+// The card's chord (Ctrl+Shift+B) and Firefox's sidebar key (Ctrl+B) land
+// on one toggle through the app key table; bare b stays the legacy
+// bookmark add/remove. The kernel's own Ctrl+Shift+B window-lower is a
+// shim-compositing side effect, not the app's routing.
+func TestBookmarkChords(t *testing.T) {
+	a := &app{hist: newHistory(), text: webrender.Bitmap{}}
+	a.key(keyB, vi.ModCtrl|vi.ModShift)
+	if !a.sideOpen {
+		t.Fatal("Ctrl+Shift+B did not open the sidebar")
+	}
+	a.key(keyB, vi.ModCtrl)
+	if a.sideOpen {
+		t.Fatal("Ctrl+B did not close the sidebar")
+	}
+	a.key(keyB, vi.ModCtrl)
+	if !a.sideOpen {
+		t.Fatal("Ctrl+B did not open the sidebar")
+	}
+	a.sideOpen = false
+	a.key(keyB, 0)
+	if !strings.Contains(a.status, "bookmark") {
+		t.Fatalf("bare b lost the legacy toggle: status=%q", a.status)
 	}
 }
 

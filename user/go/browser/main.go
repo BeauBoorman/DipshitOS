@@ -1061,12 +1061,13 @@ func (a *app) key(usage uint32, flags uint16) {
 		a.cancelLoad()
 	case keyB:
 		if ctrl {
-			// The card's chord is Ctrl+Shift+B. A Ctrl+B without shift is
-			// consumed quietly — it must not fall through to the bare-B
-			// bookmark toggle on a partial chord.
-			if flags&vi.ModShift != 0 {
-				a.toggleSidebar()
-			}
+			// The card's chord is Ctrl+Shift+B; bare Ctrl+B is Firefox's
+			// sidebar key — one toggle either way. NOTE: under shim
+			// compositing the kernel also lowers the focused window on
+			// Ctrl+Shift+B (input.zig, Arc4 #238, kept with no WM
+			// coverage): the sidebar still toggles, the window just sinks
+			// — so Ctrl+B is the path that stays visible seatless.
+			a.toggleSidebar()
 			return
 		}
 		a.bookmarkToggleUI()
