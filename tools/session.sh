@@ -28,10 +28,17 @@
 #      for the classic floating-window WM. When the Go seat or its starter
 #      shell cannot be built, the rc falls back to `tabwm start` and says so.
 #
-# The canonical `artifacts/disk.img` is attached READ-ONLY through a
-# throwaway ASIF overlay, so a session never mutates the shared gate image.
-# User files, settings, history, and the wallpaper live in the share and
-# persist between sessions.
+# M115c (issue #2462): the session is a PERSISTENT machine. Everything that
+# used to be thrown away per run lives in a `.virelaivm` profile bundle
+# (default artifacts/session.virelaivm): the EFI variable store, the ASIF
+# overlay over the read-only gate image (boot-disk writes now survive a
+# relaunch), the vlfs.img data disk, the share/ directory, the machine
+# identifier, and the saved-state/ dir reserved for M115d. The bundle's
+# manifest also pins a stable identity the packaged session app stamps as
+# its CFBundleIdentifier at a stable path, so macOS TCC sees ONE
+# responsible process across sessions and sound/notify grants stick.
+# User files, settings, history, and the wallpaper live in the profile's
+# share/ and persist between sessions.
 #
 # Apple silicon + macOS 27+ only (Virtualization.framework + DiskImageKit).
 # This is NOT a gate and is not run in CI.
@@ -46,9 +53,26 @@
 #                    (and skip the host-int credential provisioning)
 #   --no-sound       do not attach the audio device
 #   --no-net-nat     do not attach the NAT network device
+#   --save-capable   ride the share on Apple's virtio-fs instead of
+#                    --cvc-file so VZ save/restore does not refuse the
+#                    device set (M120a): suspend/snapshot are ARMED, but
+#                    the cvc-only host lanes (clipboard/drop/notify) and
+#                    the app-bound credentials (host-int, os-update,
+#                    agent-hmac) cannot be served on this posture.
+#   --resume         boot the profile's saved-state/ (the continuation of
+#                    a ctl suspend); implies --save-capable
+#   --provision-only mint + seed + provision, then exit before packaging
+#                    or launching (the class-B gate drives its own boots)
+#
+# M120a (issue #2558): the session always boots with --vsock --vsock-ctl
+# and always carries the vsock-ctl credential, so the PWR menu's Suspend
+# gets an honest verdict instead of `no_device`. The share transport is
+# the M115g split made a flag: cvc-file for the app-bound lanes (the
+# default), virtio-fs when save/restore must not be refused.
 #
 # Environment:
-#   VIRELAI_SESSION_SHARE=<dir>      share directory (default artifacts/session-share)
+#   VIRELAI_SESSION_PROFILE=<path>   .virelaivm bundle (default artifacts/session.virelaivm)
+#   VIRELAI_SESSION_SHARE=<dir>      share directory (default <profile>/share)
 #   VIRELAI_SESSION_NO_TABWM=1       no seat autostart: the floating-window WM
 #   VIRELAI_SESSION_NO_GOTABWM=1     do not build/stage the Go seat and shell
 #                                    (the rc then falls back to `tabwm start`)
@@ -67,16 +91,23 @@ cd "$ROOT"
 HOST_INT=1
 SOUND=1
 NET_NAT=1
+SAVE_CAPABLE=0
+RESUME=0
+PROVISION_ONLY=0
 for arg in "$@"; do
     case "$arg" in
-        --no-host-int) HOST_INT=0 ;;
-        --no-sound)    SOUND=0 ;;
-        --no-net-nat)  NET_NAT=0 ;;
-        *) echo "session: unknown argument '$arg' (supported: --no-host-int --no-sound --no-net-nat)" >&2; exit 2 ;;
+        --no-host-int)    HOST_INT=0 ;;
+        --no-sound)       SOUND=0 ;;
+        --no-net-nat)     NET_NAT=0 ;;
+        --save-capable)   SAVE_CAPABLE=1 ;;
+        --resume)         RESUME=1; SAVE_CAPABLE=1 ;;
+        --provision-only) PROVISION_ONLY=1 ;;
+        *) echo "session: unknown argument '$arg' (supported: --no-host-int --no-sound --no-net-nat --save-capable --resume --provision-only)" >&2; exit 2 ;;
     esac
 done
 
-SHARE="${VIRELAI_SESSION_SHARE:-$ROOT/artifacts/session-share}"
+PROFILE="${VIRELAI_SESSION_PROFILE:-$ROOT/artifacts/session.virelaivm}"
+SHARE="${VIRELAI_SESSION_SHARE:-$PROFILE/share}"
 SERIAL_LOG="$ROOT/artifacts/session-serial.log"
 RUNNER="host/vm-runner/.build/release/VMRunner"
 
@@ -92,6 +123,56 @@ fi
 
 [ -x "$RUNNER" ] || { echo "session: ERROR — $RUNNER is missing; run 'just session' without VIRELAI_SESSION_SKIP_BUILD=1 (or build it with 'swift build --package-path host/vm-runner --configuration release -Xswiftc -DSPIKE')"; exit 1; }
 [ -f "$ROOT/artifacts/disk.img" ] || { echo "session: ERROR — artifacts/disk.img is missing; create it with 'zig build image'"; exit 1; }
+
+# --- 1b. mint/validate the profile bundle BEFORE seeding --------------------
+# --profile-init exits after create-or-load: an absent path is minted, an
+# existing bundle is validated, and a corrupt manifest refuses by name here
+# rather than mid-boot.
+"$RUNNER" --profile "$PROFILE" --profile-init
+# Pin the boot base image absolutely so the bundle boots from any cwd.
+python3 - "$PROFILE/config.json" "$ROOT/artifacts/disk.img" <<'PY'
+import json, os, sys, tempfile
+cfg_path, base = sys.argv[1], os.path.abspath(sys.argv[2])
+with open(cfg_path) as f:
+    cfg = json.load(f)
+if cfg.get("baseImage") != base:
+    cfg["baseImage"] = base
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg_path))
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, cfg_path)
+PY
+# One-time migration: a pre-M115c default share moves into the bundle.
+if [ -z "${VIRELAI_SESSION_SHARE:-}" ] && [ -d "$ROOT/artifacts/session-share" ] && [ -z "$(ls -A "$SHARE" 2>/dev/null)" ]; then
+    echo "session: migrating artifacts/session-share into $SHARE"
+    cp -R "$ROOT/artifacts/session-share/." "$SHARE/"
+fi
+
+# --- 1c. format the profile's vlfs.img data disk (M120a #2558) ----------
+# A fresh bundle has no vlfs.img at all (the mint only creates dirs), so
+# the guest's /disk mount refuses not_vlfs and nothing persists. Format it
+# once with the same mkfs.vlfs the VLFS gates drive. The --check probe is
+# the gate: an absent/unformatted image is minted, a clean volume (even
+# one with an unreplayed journal — informational, rc 0) is kept, and a
+# structurally CORRUPT volume is warned about but NEVER reformatted —
+# silently rewriting it would destroy data.
+MKFS="$ROOT/.build/go/mkfs.vlfs"
+if [ ! -x "$MKFS" ] && [ -f "$ROOT/tools/go/vlfs/build.sh" ]; then
+    bash "$ROOT/tools/go/vlfs/build.sh" || true
+fi
+VLFS_IMG="$PROFILE/vlfs.img"
+if [ -x "$MKFS" ]; then
+    vlfs_check="$("$MKFS" --check "$VLFS_IMG" 2>&1)" || true
+    if [ ! -f "$VLFS_IMG" ] || printf '%s' "$vlfs_check" | grep -q 'not_vlfs'; then
+        "$MKFS" "$VLFS_IMG" && echo "session: formatted $VLFS_IMG (VLFS data disk)"
+    elif ! printf '%s' "$vlfs_check" | grep -q 'check: clean'; then
+        echo "session: WARNING — $VLFS_IMG fails its VLFS check and was NOT reformatted (that would destroy data):"
+        printf '%s\n' "$vlfs_check" | head -5 | sed 's/^/session:           /'
+    fi
+else
+    echo "session: WARNING — mkfs.vlfs unavailable (no .build/go/mkfs.vlfs and tools/go/vlfs/build.sh missing or failed); the profile's data disk stays unformatted and /disk will not mount"
+fi
 
 # --- 2. seed the persistent share (idempotent; never clobbers user files) ---
 mkdir -p "$SHARE"
@@ -187,6 +268,27 @@ PY
     fi
 fi
 
+# The persistence tools (M120a #2558): not manifest apps — the credentials
+# below bind to them, so a session without them carries dead rows. GOUPD.ELF
+# signs staged OS updates under the `os-update` row; AGENTD.ELF serves the
+# agent channel under `agent-hmac`. They stage outside the NO_GOTABWM
+# guard: --no-gotabwm disables the SEAT, not the machine's own wiring.
+# Same contract as the manifest apps: warn-only, never copy a stale output.
+for app in GOUPD.ELF AGENTD.ELF; do
+    builder="$(printf '%s' "${app%.ELF}" | tr '[:upper:]' '[:lower:]')"
+    script="$ROOT/tools/go/build-$builder.sh"
+    if [ ! -f "$script" ]; then
+        echo "session: WARNING — $app unavailable: missing builder $script"
+    elif ! bash "$script"; then
+        echo "session: WARNING — $app unavailable: builder failed ($script)"
+    elif [ ! -s "$ROOT/.build/go/$app" ]; then
+        echo "session: WARNING — $app unavailable: builder produced no binary"
+    else
+        cp "$ROOT/.build/go/$app" "$SHARE/$app"
+        echo "session: staged $app"
+    fi
+done
+
 # --- 3. the session startup file (only written when absent) -----------------
 RC_FILE="$SHARE/.virelairc"
 if [ ! -f "$RC_FILE" ]; then
@@ -228,51 +330,169 @@ fi
 clock_secs=$(( 10#$(date +%H) * 3600 + 10#$(date +%M) * 60 + 10#$(date +%S) ))
 printf '%s\n' "$clock_secs" > "$SHARE/.clock"
 
-# --- 3c. the host-integration credential (M114c #2456, ADR 0051) ----------
-# The M108 lanes are signed VHI1 records in the share: the runner HMACs
-# under the `host-int` row of the share's SECRETS.TXT, and the seat reads
-# the SAME row through sys_secret_get bound to GOTABWM.ELF — binding also
-# needs GOTABWM.ELF named uid_system-owned in OWNERS.TXT (ADR 0024 D8).
-# Both rows are provisioned idempotently: an existing row is kept (the
-# credential persists across sessions, matching the share's persistence)
-# and an existing file keeps every other row. --no-host-int skips this
-# entirely AND disarms the lanes below.
-if [ "$HOST_INT" = "1" ]; then
-    SECRETS_FILE="$SHARE/SECRETS.TXT"
-    if [ -f "$SECRETS_FILE" ] && [ "$(head -n1 "$SECRETS_FILE")" != "#v1" ]; then
-        echo "session: WARNING — $SECRETS_FILE is not a #v1 secrets file; the host-int credential was NOT provisioned and the lanes will refuse no_credential at arm"
-    elif ! grep -q $'^host-int\t1000\t' "$SECRETS_FILE" 2>/dev/null; then
-        host_int_key="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
-        [ -f "$SECRETS_FILE" ] || printf '#v1\n' > "$SECRETS_FILE"
-        printf 'host-int\t1000\t%s\tGOTABWM.ELF\n' "$host_int_key" >> "$SECRETS_FILE"
-        echo "session: provisioned the host-int credential in $SECRETS_FILE (app-bound to GOTABWM.ELF)"
+# --- 3c. the session credentials (M114c #2456, M120a #2558) -------------
+# Four SECRETS.TXT rows, all idempotent: an existing row is KEPT (the
+# credential persists across sessions, matching the share's persistence),
+# an existing file keeps every other row, and no value is ever logged.
+#   vsock-ctl   uid_system, app-unbound — the ctl channel's HMAC key; the
+#               host reads the share's file directly so the row serves on
+#               EITHER share transport (ADR 0056 D2).
+#   os-update   the Ed25519 seed GOUPD.ELF signs staged updates with
+#               (app-bound; the profile's config.updatePubkey pins the
+#               public half — derived below, never minted twice).
+#   agent-hmac  bound to AGENTD.ELF,GOTOP.ELF — the agent channel key
+#               (ADR 0052 D4).
+#   host-int    the M108 lanes' VHI1 HMAC key, bound to GOTABWM.ELF
+#               (M114c, ADR 0051) — provisioned only under --host-int.
+# Every bound row also needs its app named uid_system-owned in OWNERS.TXT
+# (ADR 0024 D8). On a --save-capable boot the bound rows still exist but
+# are unservable by design — OWNERS.TXT and the bound-secret path live on
+# the cvc queue-5 arming point (the M115g transport split).
+SECRETS_FILE="$SHARE/SECRETS.TXT"
+OWNERS_FILE="$SHARE/OWNERS.TXT"
+secrets_v1=1
+owners_v1=1
+if [ -f "$SECRETS_FILE" ] && [ "$(head -n1 "$SECRETS_FILE")" != "#v1" ]; then
+    secrets_v1=0
+    echo "session: WARNING — $SECRETS_FILE is not a #v1 secrets file; no session credentials were provisioned (vsock-ctl sessions will refuse no_credential)"
+fi
+if [ -f "$OWNERS_FILE" ] && [ "$(head -n1 "$OWNERS_FILE")" != "#v1" ]; then
+    owners_v1=0
+    echo "session: WARNING — $OWNERS_FILE is not a #v1 owners file; app-bound credentials may not be served"
+fi
+
+# ensure_secret <name> <uid> [binding] — mint a fresh random row when the
+# name is absent; keep an existing row verbatim (warn when its uid is not
+# the one the channel requires).
+ensure_secret() {
+    local name="$1" uid="$2" bind="${3:-}"
+    [ "$secrets_v1" = "1" ] || return 0
+    if grep -q "^${name}"$'\t' "$SECRETS_FILE" 2>/dev/null; then
+        if ! grep -q "^${name}"$'\t'"${uid}"$'\t' "$SECRETS_FILE" 2>/dev/null; then
+            echo "session: WARNING — the ${name} row in $SECRETS_FILE does not carry uid ${uid}; the channel that needs it will refuse"
+        fi
+        return 0
     fi
-    OWNERS_FILE="$SHARE/OWNERS.TXT"
-    if [ -f "$OWNERS_FILE" ] && [ "$(head -n1 "$OWNERS_FILE")" != "#v1" ]; then
-        echo "session: WARNING — $OWNERS_FILE is not a #v1 owners file; GOTABWM.ELF may not read the host-int credential"
-    elif ! grep -q $'^GOTABWM.ELF\t' "$OWNERS_FILE" 2>/dev/null; then
+    local key
+    key="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+    [ -f "$SECRETS_FILE" ] || printf '#v1\n' > "$SECRETS_FILE"
+    if [ -n "$bind" ]; then
+        printf '%s\t%s\t%s\t%s\n' "$name" "$uid" "$key" "$bind" >> "$SECRETS_FILE"
+        echo "session: provisioned the ${name} credential in $SECRETS_FILE (app-bound to $bind)"
+    else
+        printf '%s\t%s\t%s\n' "$name" "$uid" "$key" >> "$SECRETS_FILE"
+        echo "session: provisioned the ${name} credential in $SECRETS_FILE"
+    fi
+}
+
+# ensure_owner <app> — the uid_system OWNERS.TXT row a bound credential
+# needs to be served to that app (same keep-and-warn contract).
+ensure_owner() {
+    local app="$1"
+    [ "$owners_v1" = "1" ] || return 0
+    if ! grep -q "^${app}"$'\t' "$OWNERS_FILE" 2>/dev/null; then
         [ -f "$OWNERS_FILE" ] || printf '#v1\n' > "$OWNERS_FILE"
-        printf 'GOTABWM.ELF\t644\t0\t-\n' >> "$OWNERS_FILE"
-    elif ! grep -q $'^GOTABWM.ELF\t644\t0\t' "$OWNERS_FILE" 2>/dev/null; then
-        echo "session: WARNING — $OWNERS_FILE owns GOTABWM.ELF to a non-system uid; sys_secret_get will refuse the host-int row (ADR 0024 D8)"
+        printf '%s\t644\t0\t-\n' "$app" >> "$OWNERS_FILE"
+    elif ! grep -q "^${app}"$'\t'"644"$'\t'"0"$'\t' "$OWNERS_FILE" 2>/dev/null; then
+        echo "session: WARNING — $OWNERS_FILE owns $app to a non-system uid; sys_secret_get will refuse its bound rows (ADR 0024 D8)"
     fi
+}
+
+ensure_secret vsock-ctl 0
+ensure_secret os-update 1000 GOUPD.ELF
+ensure_secret agent-hmac 1000 AGENTD.ELF,GOTOP.ELF
+ensure_owner GOUPD.ELF
+ensure_owner GOTOP.ELF
+ensure_owner AGENTD.ELF
+if [ "$HOST_INT" = "1" ]; then
+    ensure_secret host-int 1000 GOTABWM.ELF
+    ensure_owner GOTABWM.ELF
+fi
+
+# Pin config.updatePubkey to the os-update row's public half so
+# --apply-update verifies GOUPD's signatures without --update-key. The
+# seed is read from whatever row survived (ours or a user's), derived
+# with agentctl's stdlib Ed25519, and only FILLS an absent pin — a
+# mismatch is named, never silently rewritten.
+if [ "$secrets_v1" = "1" ]; then
+    python3 - "$PROFILE/config.json" "$SECRETS_FILE" "$ROOT/tools/agentctl" <<'PY' || \
+        echo "session: WARNING — could not pin config.updatePubkey from the os-update row; --apply-update will need --update-key"
+import json, os, sys, tempfile
+cfg_path, secrets_path, agentctl_dir = sys.argv[1:4]
+seed = None
+try:
+    with open(secrets_path) as f:
+        for line in f:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) >= 3 and fields[0] == "os-update":
+                seed = fields[2]
+                break
+except OSError:
+    pass
+if seed is None:
+    sys.exit(0)
+sys.path.insert(0, agentctl_dir)
+import agentctl
+pub = agentctl.ed_public_key(bytes.fromhex(seed)).hex()
+with open(cfg_path) as f:
+    cfg = json.load(f)
+if not cfg.get("updatePubkey"):
+    cfg["updatePubkey"] = pub
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg_path))
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, cfg_path)
+    print("session: pinned config.updatePubkey to the os-update row's public key")
+elif cfg["updatePubkey"] != pub:
+    print("session: WARNING — config.updatePubkey does not match the os-update "
+          "row's public key; --apply-update would refuse sig_invalid (fix one "
+          "of them by hand)", file=sys.stderr)
+PY
 fi
 
 # --- 4. boot ----------------------------------------------------------------
-# Per-run throwaway EFI variable store; the disk image stays pristine via
-# --overlay-base (a fresh ASIF overlay is discarded at runner exit).
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/virelai-session.XXXXXX")"
-cleanup() { rm -rf "$RUN_DIR"; }
-trap cleanup EXIT
+if [ "$PROVISION_ONLY" = "1" ]; then
+    echo "session: provisioning complete profile=$PROFILE share=$SHARE save_capable=$SAVE_CAPABLE"
+    exit 0
+fi
 
-# Package only this invocation's runner, not the share. Launch its executable
-# directly so the terminal owns/waits for the VM process (not `open`'s helper).
-# The raw VMRunner remains the CLI gate entrypoint.
-SESSION_APP="$RUN_DIR/VirelaiOS.app"
+if [ "$RESUME" = "1" ] && [ ! -f "$PROFILE/saved-state/state.vzsave" ]; then
+    echo "session: ERROR — --resume needs a suspended machine, but $PROFILE/saved-state/state.vzsave is absent (nothing has suspended into this profile)" >&2
+    exit 1
+fi
+
+# The only per-run scratch is run/session-start.txt inside the bundle; EFI
+# vars, the boot overlay, vlfs.img, share/ and machine-id.bin persist.
+# The Go seat's startup probe waits for a focus-loss event after opening its
+# own window. In an automated gate the harness focuses the monitor window;
+# provide the same one-shot handoff here so a fresh desktop reaches its shell
+# workspace without requiring a startup click.
+mkdir -p "$PROFILE/run"
+printf '%s\n' 'dui focus 0' > "$PROFILE/run/session-start.txt"
+
+# Package the runner INSIDE the profile at a stable path, stamped with the
+# manifest's identity as CFBundleIdentifier. A stable path + a stable bundle
+# id + a signature refreshed only when the binary changes is what keeps
+# macOS TCC treating every session as ONE responsible process. Launch the
+# executable directly so the terminal owns/waits for the VM process (not
+# `open`'s helper). The raw VMRunner remains the CLI gate entrypoint.
+SESSION_APP="$PROFILE/VirelaiOS.app"
 mkdir -p "$SESSION_APP/Contents/MacOS"
-cp "$ROOT/host/vm-runner/Resources/Session-Info.plist" "$SESSION_APP/Contents/Info.plist"
-cp "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS"
-codesign --force --sign - --entitlements "$ROOT/host/vm-runner/entitlements.plist" "$SESSION_APP"
+python3 - "$ROOT/host/vm-runner/Resources/Session-Info.plist" \
+          "$SESSION_APP/Contents/Info.plist" "$PROFILE/manifest.json" <<'PY'
+import json, plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    plist = plistlib.load(f)
+with open(sys.argv[3]) as f:
+    plist["CFBundleIdentifier"] = json.load(f)["identity"]
+with open(sys.argv[2], "wb") as f:
+    plistlib.dump(plist, f)
+PY
+if ! cmp -s "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS" || ! codesign --verify "$SESSION_APP" >/dev/null 2>&1; then
+    cp "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS"
+    codesign --force --sign - --entitlements "$ROOT/host/vm-runner/entitlements.plist" "$SESSION_APP"
+fi
 
 RUNNER_PID=""
 end_session() {
@@ -289,18 +509,41 @@ trap 'end_session INT 130' INT
 trap 'end_session TERM 143' TERM
 trap 'end_session HUP 129' HUP
 
-# The Go seat's startup probe waits for a focus-loss event after opening its
-# own window. In an automated gate the harness focuses the monitor window;
-# provide the same one-shot handoff here so a fresh desktop reaches its shell
-# workspace without requiring a startup click.
-printf '%s\n' 'dui focus 0' > "$RUN_DIR/session-start.txt"
-
+# The share transport is the M115g split made a flag (M120a #2558):
+# --cvc-file is the custom-virtio device VZ save/restore refuses, so a
+# save-capable run rides the bundle's share on Apple's virtio-fs instead
+# — and the cvc-only host lanes go with the transport they need.
+SHARE_FLAGS=()
 LANE_FLAGS=()
-if [ "$HOST_INT" = "1" ]; then
-    LANE_FLAGS+=(--host-clipboard --host-drop --host-notify)
+if [ "$SAVE_CAPABLE" = "1" ]; then
+    SHARE_FLAGS+=(--virtio-fs "$SHARE")
+    if [ "$HOST_INT" = "1" ]; then
+        echo "session: --save-capable rides virtio-fs: the cvc-only host lanes (clipboard/drop/notify) are OFF this boot"
+    fi
+else
+    SHARE_FLAGS+=(--cvc-file "$SHARE")
+    if [ "$HOST_INT" = "1" ]; then
+        LANE_FLAGS+=(--host-clipboard --host-drop --host-notify)
+    fi
 fi
 if [ "$SOUND" = "1" ]; then LANE_FLAGS+=(--sound); fi
 if [ "$NET_NAT" = "1" ]; then LANE_FLAGS+=(--net-nat); fi
+
+# --vsock --vsock-ctl arm the virelai-ctl/1 channel on every posture: the
+# PWR menu's Suspend then gets an honest verdict — `unsupported` on the
+# cvc transport, a real save on virtio-fs — instead of `no_device`.
+VSOCK_FLAGS=(--vsock --vsock-ctl)
+
+# A resume continues a machine mid-syscall: the first-boot focus script
+# has no monitor to talk to (and its 'gotabwm: win focus' anchor never
+# reprints), so the scripted-input flags stay off the resume command.
+BOOT_INPUT_FLAGS=()
+RESUME_FLAGS=()
+if [ "$RESUME" = "1" ]; then
+    RESUME_FLAGS+=(--resume "$PROFILE")
+else
+    BOOT_INPUT_FLAGS+=(--script "$PROFILE/run/session-start.txt" --script-after 'gotabwm: win focus')
+fi
 
 cat <<EOF
 
@@ -313,29 +556,48 @@ seat remains available with \`settings set wm tabwm\`.
   * the seat's markers and the guest shell output are in
       artifacts/session-serial.log
 EOF
-if [ "$HOST_INT" = "1" ]; then
+if [ "$HOST_INT" = "1" ] && [ "$SAVE_CAPABLE" != "1" ]; then
     cat <<EOF
   * host lanes armed: clipboard + file-drop + notify (Integration menu has
     live suspend/resume toggles + "Send File to INBOX"; --no-host-int
     disarms). macOS may ask once for notification permission.
 EOF
 fi
+if [ "$SAVE_CAPABLE" = "1" ]; then
+    cat <<EOF
+  * share posture: virtio-fs (save-capable) — the PWR menu's Suspend and
+    snapshots are armed; the cvc-only host lanes are OFF this boot.
+    Relaunch without --save-capable/--resume for the clipboard/drop/notify
+    lanes and the app-bound credentials (host-int, os-update, agent-hmac).
+EOF
+else
+    cat <<EOF
+  * share posture: cvc-file — the host lanes and every app-bound
+    credential are live; the PWR menu's Suspend answers 'unsupported'
+    (a cvc share cannot be saved). Relaunch with --save-capable for
+    save/restore, or --resume to continue a suspended machine.
+EOF
+fi
 cat <<EOF
 
 The guest serial log is written to artifacts/session-serial.log.
-Your files persist in: $SHARE
+The machine persists in: $PROFILE
+  (boot overlay, EFI vars, vlfs.img, share/, machine id, saved-state/)
 Close the VM window, choose Quit VirelaiOS (Cmd-Q), or press Ctrl-C here
-to stop the VM. Rerun this command to relaunch; VM RAM is not persisted.
+to stop the VM. Rerun this command to relaunch; VM RAM is not persisted
+unless you suspend it (PWR menu, --save-capable posture).
 
 EOF
 
 # A GUI parent's bundle identity belongs to that app, not this CLI runner.
 # Do not let macOS associate the independent VM window with Factory/Terminal.
 env -u __CFBundleIdentifier "$SESSION_APP/Contents/MacOS/VirelaiOS" \
-    --overlay-base "$ROOT/artifacts/disk.img" --vars "$RUN_DIR/efi-vars.bin" \
+    --profile "$PROFILE" \
+    "${RESUME_FLAGS[@]}" \
     --serial "$SERIAL_LOG" \
-    --cvc-file "$SHARE" \
-    --script "$RUN_DIR/session-start.txt" --script-after 'gotabwm: win focus' \
+    "${SHARE_FLAGS[@]}" \
+    "${VSOCK_FLAGS[@]}" \
+    "${BOOT_INPUT_FLAGS[@]}" \
     --display --input --host-session \
     "${LANE_FLAGS[@]}" \
     --timeout 0 &

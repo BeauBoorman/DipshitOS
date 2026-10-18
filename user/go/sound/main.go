@@ -8,6 +8,11 @@
 // is M99b's vi.AudioStream on slot 43. Memory is constant in the file's
 // size: one read block, one output period, the resampler window.
 //
+// M118e (issue #2483) adds the record half (rec.go / recwav.go): argv verbs
+// `record <seconds> <out.wav>` and `meter [seconds]` run the kernel's ONE
+// capture stream (slot 92, v1 tuple S16/48k/mono) with a live mic meter in
+// the same window — GOREC's bounded flow adopted by the player.
+//
 // Every marker below is printed only AFTER the syscall it reports, so the
 // live-sound-playback gate's asserts can only pass if the app really ran.
 package main
@@ -97,10 +102,21 @@ const (
 	stDone
 )
 
+// runMode picks the app's face: the WAV player (default) or the M118e
+// record/meter verbs dispatched on argv[1] in main.
+type runMode int
+
+const (
+	modePlay runMode = iota
+	modeRecord
+	modeMeter
+)
+
 type app struct {
 	ta   *tabapp.TabApp
 	name string // file basename, for the title band
 	path string
+	mode runMode
 
 	st     playState
 	reason string // stRefused text
@@ -118,6 +134,19 @@ type app struct {
 
 	submitted uint64 // output bytes accepted this playback (position readout)
 
+	// Record/meter state (modeRecord/modeMeter — rec.go): the capture
+	// counters and the meter's readings. recTotal is the target PCM bytes;
+	// recGot what has landed; recLevel/recPeak the meter's 0..100 readings;
+	// levelBucket/levelTick the level marker's throttle; recStop the user's
+	// `s` stop.
+	recSecs, recTotal int
+	recGot            int
+	recLevel, recPeak int
+	recTicks          int
+	levelBucket       int
+	levelTick         int
+	recStop           bool
+
 	// vol is the §5.2 volume slider (slot-44 stream gain) and volDrag its
 	// pressed state; volReady is false until the settings row seeded it.
 	vol      widgets.Slider
@@ -128,6 +157,19 @@ type app struct {
 
 func main() {
 	a := &app{st: stEmpty}
+
+	// M118e: the record verbs dispatch before the play path — argv[1] is a
+	// mode word, not a file. A file literally named "record" or "meter"
+	// cannot be a play target, the same collision any verb grammar makes.
+	if argv := vi.Args(); len(argv) >= 2 {
+		switch argv[1] {
+		case "record":
+			vi.Exit(a.recordMain(argv))
+		case "meter":
+			vi.Exit(a.meterMain(argv))
+		}
+	}
+
 	path := argPath()
 	a.path = path
 	a.name = basename(path)
@@ -177,7 +219,7 @@ func main() {
 // works headless; draw/service/eventLoop no-op or exit when a.ta is nil.
 func (a *app) openWindow() {
 	ta := tabapp.Init(tabapp.Config{
-		Name: appName, Title: titleOf(a.path),
+		Name: appName, Title: a.title(),
 		X: winX, Y: winY, W: winW, H: winH,
 	})
 	if ta == nil {
@@ -514,13 +556,18 @@ func (a *app) service() bool {
 			}
 		}
 	}
-	pos := a.submitted / uint64(a.out.FrameBytes()) / uint64(a.out.Rate)
-	if pos != a.position {
-		a.position = pos
-		a.draw()
-		a.ta.Present()
+	// The position readout is play-mode state only — a capture pump carries
+	// its progress in recGot, and a.out is unset (a zero Rate/FrameBytes
+	// would fault the division).
+	if a.mode == modePlay {
+		pos := a.submitted / uint64(a.out.FrameBytes()) / uint64(a.out.Rate)
+		if pos != a.position {
+			a.position = pos
+			a.draw()
+			a.ta.Present()
+		}
 	}
-	return a.quit || a.stop
+	return a.quit || a.stop || a.recStop
 }
 
 // HID usages (the file_browser/notepad key map): Arg0 is the physical key,
@@ -547,30 +594,40 @@ func (a *app) key(ev vi.Event) {
 	case keyQ, keyEscape:
 		a.quit = true
 	case keyS:
-		if a.st == stPlaying && a.stream != nil {
+		if a.mode != modePlay {
+			// `s` stops a live capture — the pump unwinds at the next
+			// chunk boundary; a stopped record writes no file.
+			if a.st == stRecording || a.st == stMetering {
+				a.recStop = true
+			}
+		} else if a.st == stPlaying && a.stream != nil {
 			a.stream.Abort()
 			a.stream = nil
 			vi.ConsoleLine(markerStopped)
 			a.stop = true
 		}
 	case keySpace, keyP, keyEnter:
-		if a.st == stStopped || a.st == stDone {
+		if a.mode == modePlay && (a.st == stStopped || a.st == stDone) {
 			a.st = stLoaded
 		}
 	case keyLeft:
-		if a.st != stEmpty && a.st != stNoDevice && a.st != stRefused {
+		if a.mode == modePlay && a.st != stEmpty && a.st != stNoDevice && a.st != stRefused {
 			a.setVolume(a.volume() - 5)
 		}
 	case keyRight:
-		if a.st != stEmpty && a.st != stNoDevice && a.st != stRefused {
+		if a.mode == modePlay && a.st != stEmpty && a.st != stNoDevice && a.st != stRefused {
 			a.setVolume(a.volume() + 5)
 		}
 	}
 }
 
 // pointer drives the volume slider: press grabs the knob, drag maps x to the
-// 0..100 gain, release ends it. Returns whether the frame changed.
+// 0..100 gain, release ends it. Returns whether the frame changed. Capture
+// has no gain knob, so the record/meter faces take no pointer input.
 func (a *app) pointer(ev vi.Event) bool {
+	if a.mode != modePlay {
+		return false
+	}
 	switch ev.Kind {
 	case vi.EvMouseDown:
 		if ev.Flags&vi.BtnLeft == 0 || !a.vol.HitTest(int(ev.Arg0), int(ev.Arg1)) {
@@ -716,6 +773,18 @@ func titleOf(path string) string {
 	return appTitle + ": " + basename(path)
 }
 
+// title is the window title for the current mode: the record/meter verbs
+// name their own face, the player keeps its file-driven title.
+func (a *app) title() string {
+	switch a.mode {
+	case modeRecord:
+		return "Sound Recorder"
+	case modeMeter:
+		return "Mic Meter"
+	}
+	return titleOf(a.path)
+}
+
 // rateHzTable decodes a RATE_* code to Hz. Index = virtio-snd rate bit;
 // the kernel's snd_rate_hz only negotiates the 8k..48k span, and the seat
 // params carry the CODE verbatim regardless — this table is for the
@@ -833,13 +902,18 @@ func (a *app) draw() {
 	// Title band, then the body text below it.
 	s.Fill(0, 0, W, titleBandH, theme.Current.Surface)
 	s.Fill(0, titleBandH, W, 1, theme.Current.Border)
-	webrender.DrawText(s, 6, 4, webrender.UpperASCII(titleOf(a.path)),
+	webrender.DrawText(s, 6, 4, webrender.UpperASCII(a.title()),
 		1, false, theme.Current.Text, webrender.Clip{X: 0, Y: 0, W: W, H: titleBandH})
 
 	body := webrender.Clip{X: 0, Y: titleBandH + 2, W: W, H: H - titleBandH - 2}
 	line := func(n int, text string, rgb uint32) {
 		webrender.DrawText(s, 8, titleBandH+10+n*14,
 			webrender.UpperASCII(text), 1, false, rgb, body)
+	}
+
+	if a.mode != modePlay {
+		a.drawRec(s, cv, body, W)
+		return
 	}
 
 	switch a.st {
@@ -893,4 +967,59 @@ func (a *app) draw() {
 		}
 		a.vol.Draw(cv)
 	}
+}
+
+// drawRec is the record/meter face: the mode line, the live level rendered
+// as the Slider's non-interactive form (the §5.2 idiom the position bar and
+// volume row already use), the captured/target progress and the state line.
+// The meter is BOUNDED by the chunk read — each captured recChunkBytes
+// piece moves one reading, never a thread of its own.
+func (a *app) drawRec(s webrender.Surface, cv widgets.Canvas, body webrender.Clip, W int) {
+	line := func(n int, text string, rgb uint32) {
+		webrender.DrawText(s, 8, titleBandH+10+n*14,
+			webrender.UpperASCII(text), 1, false, rgb, body)
+	}
+
+	mode := "rec"
+	if a.mode == modeMeter {
+		mode = "meter"
+	}
+	title := mode
+	if a.name != "" {
+		title = mode + " " + a.name
+	}
+	line(0, title, theme.Current.Text)
+
+	// The meter bar: the level fills 0..100 of the width — the same
+	// anatomy as the volume slider but read-only (no drag state).
+	meterY := titleBandH + 10 + 2*14
+	(&widgets.Slider{
+		R:     widgets.Rect{X: 8, Y: meterY - 3, W: W - 16, H: widgets.SliderKnobD},
+		Min:   0,
+		Max:   100,
+		Value: a.recLevel,
+	}).Draw(cv)
+
+	line(3, "level "+vi.Itoa64(int64(a.recLevel))+"%  peak "+
+		vi.Itoa64(int64(a.recPeak))+"%", theme.Current.Text)
+	line(4, clock(uint64(a.recGot)/uint64(wavRecByteRate))+" / "+
+		clock(uint64(a.recSecs)), theme.Current.Muted)
+
+	state := "recording"
+	switch a.st {
+	case stMetering:
+		state = "metering"
+	case stStopped:
+		state = "stopped — no file"
+	case stRecDone:
+		if a.mode == modeMeter {
+			state = "done"
+		} else {
+			state = "wrote " + a.name
+		}
+	case stRefused:
+		state = "refused: " + a.reason
+	}
+	line(5, state, theme.Current.Text)
+	line(6, "s stop  q quit", theme.Current.Muted)
 }

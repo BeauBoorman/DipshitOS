@@ -117,8 +117,10 @@ pub fn beginDns(owner: u64, server: [4]u8, query: []const u8) core.Error!core.Ha
         return error.InvalidArgument;
     // M117e (#2477, ADR 0057 D12): the resolver's address is a
     // destination — the row's `if=` scope applies (a LAN resolver is a
-    // `bridged` peer, the island's forwarder is `nat` fabric).
-    if (grant.net_open(owner, .{ .v4 = server }) != .allow and grant.enforceMode())
+    // `bridged` peer, the island's forwarder is `nat` fabric). M116d
+    // (#2470): the `to=` tuple is (server, 53) — the resolver's only
+    // destination port.
+    if (grant.net_open(owner, .{ .v4 = server }, 53) != .allow and grant.enforceMode())
         return error.AccessDenied;
     if (dns != null or sockets.next_generation > std.math.maxInt(i64) >> core.slot_bits) return error.Capacity;
     // Pin one legacy listen-table seat so nobody can bind it concurrently.
@@ -316,9 +318,10 @@ pub fn legacyListen(owner: u64, local_ip: [4]u8, port: u16) core.Error!void {
 pub fn legacyOpen(owner: u64, local_ip: [4]u8, remote_ip: [4]u8, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
     // M117e (#2477, ADR 0057 D12): the grant row's `net` scope — a
     // `bridged`-class destination (an L2-adjacent peer) outside the row's
-    // `if=` set is refused by name. `audit` receipts and proceeds;
-    // `enforce` is an honest EACCES before any slot is spent.
-    if (grant.net_open(owner, .{ .v4 = remote_ip }) != .allow and grant.enforceMode())
+    // `if=` set is refused by name; M116d (#2470) adds the `to=`
+    // (literal, port) allowlist on the same check. `audit` receipts and
+    // proceeds; `enforce` is an honest EACCES before any slot is spent.
+    if (grant.net_open(owner, .{ .v4 = remote_ip }, remote_port) != .allow and grant.enforceMode())
         return error.AccessDenied;
     registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
     const port = allocLocalPort() orelse return error.Capacity;
@@ -334,9 +337,10 @@ pub fn legacyOpen(owner: u64, local_ip: [4]u8, remote_ip: [4]u8, remote_port: u1
 pub fn legacyOpen6(owner: u64, local6: ipv6.Addr, remote6: ipv6.Addr, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
     // M117e (#2477, ADR 0057 D12): the v6 half of the scope check — the
     // literal is matched against the row's `v6=` prefixes AND its path
-    // class against `if=`; off-policy refuses `v6_literal_denied`/
-    // `bridged_denied` by name (enforce) or receipts it (audit).
-    if (grant.net_open(owner, .{ .v6 = remote6 }) != .allow and grant.enforceMode())
+    // class against `if=`; M116d (#2470) adds the `to=` (literal, port)
+    // allowlist — `to=[v6]:port` entries gate v6 connects the same way.
+    // Off-policy refuses by name (enforce) or receipts it (audit).
+    if (grant.net_open(owner, .{ .v6 = remote6 }, remote_port) != .allow and grant.enforceMode())
         return error.AccessDenied;
     registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
     const port = allocLocalPort() orelse return error.Capacity;

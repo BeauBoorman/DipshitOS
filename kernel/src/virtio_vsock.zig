@@ -55,7 +55,15 @@ const hdr_size: usize = 44;
 const op_request: u16 = 1;
 const op_response: u16 = 2;
 const op_rst: u16 = 3;
+const op_shutdown: u16 = 4;
+const op_rw: u16 = 5;
+const op_credit_update: u16 = 6;
 const type_stream: u16 = 1;
+
+/// SHUTDOWN flags field bits (§5.10.6.4): bit 0 = peer should stop
+/// receiving (our RX), bit 1 = peer should stop sending (their TX).
+const flag_shutdown_rx: u32 = 1;
+const flag_shutdown_tx: u32 = 2;
 
 /// rx buffers carry the peer's hdr + payload. The probe exchanges 44-byte
 /// control packets only, but a host DATA packet could arrive on an open
@@ -146,7 +154,9 @@ var ev_queue: Queue = undefined; // queue 2: transport events
 
 var rx_bufs: [rx_buf_count][rx_buf_size]u8 align(64) = undefined;
 var ev_bufs: [ev_buf_count][ev_buf_size]u8 align(64) = undefined;
-var tx_buf: [hdr_size]u8 align(64) = undefined;
+/// Header + one message-sized payload: the ctl client (M115b) sends real
+/// lines, not just control packets.
+var tx_buf: [hdr_size + rx_buf_size]u8 align(64) = undefined;
 
 /// Ephemeral guest source ports, bumping per connect so consecutive
 /// `vsock <port>` commands are distinct connections to the host.
@@ -456,7 +466,7 @@ pub fn connect(dst_port: u32) ConnectResult {
     next_src_port +%= 1;
     vs_last_src_port = src_port;
 
-    @memset(&tx_buf, 0);
+    @memset(tx_buf[0..hdr_size], 0);
     write64(&tx_buf, hdr_src_cid, vs_guest_cid);
     write64(&tx_buf, hdr_dst_cid, host_cid);
     write32(&tx_buf, hdr_src_port, src_port);
@@ -495,13 +505,179 @@ pub fn connect(dst_port: u32) ConnectResult {
             const r_src_port = read32(buf, hdr_src_port);
             const r_dst_port = read32(buf, hdr_dst_port);
             if (r_dst_port != src_port or r_src_port != dst_port) continue;
-            if (r_op == op_response) result = .connected;
+            if (r_op == op_response) {
+                result = .connected;
+                if (open_conn) |conn| {
+                    conn.src_port = src_port;
+                    conn.dst_port = dst_port;
+                    conn.tx_cnt = 0;
+                    conn.rx_cnt = 0;
+                    conn.peer_buf_alloc = read32(buf, hdr_buf_alloc);
+                    conn.peer_fwd_cnt = read32(buf, hdr_fwd_cnt);
+                    conn.peer_eof = false;
+                }
+            }
             if (r_op == op_rst) result = .refused;
         }
     }
     // Flush the reposted rx buffers before the result is returned.
     kick(&rx_queue, 0);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// M115b (#2461, ADR 0056): the stream data path — the `vsock ctl` client's
+// send/recv/shutdown on top of connect(). One outstanding connection at a
+// time (the monitor serializes commands); Conn records the port pair and
+// both ends' credit counters so OP_RW packets stay inside the peer window.
+// ---------------------------------------------------------------------------
+
+/// A live stream connection's wire state.
+pub const Conn = struct {
+    src_port: u32 = 0,
+    dst_port: u32 = 0,
+    /// Payload bytes we have sent (our tx counter).
+    tx_cnt: u32 = 0,
+    /// Payload bytes we have consumed — advertised as `fwd_cnt`.
+    rx_cnt: u32 = 0,
+    /// Peer's advertised receive window and consumption counter, taken
+    /// from the most recent matching packet (RESPONSE sets both).
+    peer_buf_alloc: u32 = 0,
+    peer_fwd_cnt: u32 = 0,
+    /// Peer sent SHUTDOWN for its TX direction — no more data will come.
+    peer_eof: bool = false,
+};
+
+/// Set by open() right before it polls, so the RESPONSE handler can hand
+/// the freshly connected pair's credit back out. Cleared after return.
+var open_conn: ?*Conn = null;
+
+/// Connect and keep the connection: same REQUEST/RESPONSE/RST poll as the
+/// probe, but a `.connected` verdict leaves `conn` armed for send/recv —
+/// the caller owns teardown (shutdown or rst).
+pub fn open(dst_port: u32, conn: *Conn) ConnectResult {
+    conn.* = .{};
+    open_conn = conn;
+    defer open_conn = null;
+    return connect(dst_port);
+}
+
+/// Transmit `bytes` as one OP_RW inside the peer's advertised window.
+/// `.no_credit` means the peer's buf_alloc cannot take it yet; `.ok`
+/// advances the connection's tx counter.
+pub fn send(conn: *Conn, bytes: []const u8) enum { ok, no_credit } {
+    if (!vs_ready or bytes.len == 0 or bytes.len > rx_buf_size) return .no_credit;
+    const in_flight = conn.tx_cnt -% conn.peer_fwd_cnt;
+    if (conn.peer_buf_alloc < in_flight or bytes.len > conn.peer_buf_alloc - in_flight) {
+        return .no_credit;
+    }
+    @memcpy(tx_buf[hdr_size .. hdr_size + bytes.len], bytes);
+    write64(&tx_buf, hdr_src_cid, vs_guest_cid);
+    write64(&tx_buf, hdr_dst_cid, host_cid);
+    write32(&tx_buf, hdr_src_port, conn.src_port);
+    write32(&tx_buf, hdr_dst_port, conn.dst_port);
+    write32(&tx_buf, hdr_len, @intCast(bytes.len));
+    write16(&tx_buf, hdr_type, type_stream);
+    write16(&tx_buf, hdr_op, op_rw);
+    write32(&tx_buf, hdr_flags, 0);
+    write32(&tx_buf, hdr_buf_alloc, rx_credit);
+    write32(&tx_buf, hdr_fwd_cnt, conn.rx_cnt);
+    mmu.clean_dcache_range(@intFromPtr(&tx_buf), hdr_size + bytes.len);
+
+    const desc_index: u16 = @intCast(tx_queue.avail.idx % tx_queue.size);
+    tx_queue.desc[desc_index] = .{
+        .addr = mmu.to_phys(@intFromPtr(&tx_buf)),
+        .len = @intCast(hdr_size + bytes.len),
+        .flags = 0,
+        .next = 0,
+    };
+    tx_queue.avail.ring[tx_queue.avail.idx % tx_queue.size] = desc_index;
+    tx_queue.avail.idx +%= 1;
+    kick(&tx_queue, 1);
+    conn.tx_cnt +%= @intCast(bytes.len);
+    return .ok;
+}
+
+/// One drain of the rx ring against `conn`: copies at most one packet's
+/// payload into `out`. `.data` reports consumed bytes (rx_cnt advanced —
+/// the buffers repost underneath it, so our advertised window is always
+/// the full ring), `.eof` is the peer's SHUTDOWN, `.reset` a peer RST,
+/// `.none` an empty poll.
+pub const RecvVerdict = enum { data, eof, reset, none };
+pub const RecvResult = struct { verdict: RecvVerdict, len: usize = 0 };
+
+pub fn recv(conn: *Conn, out: []u8) RecvResult {
+    var result: RecvResult = .{ .verdict = .none };
+    while (pop_used(&rx_queue)) |used| {
+        if (used.id >= rx_buf_count) continue;
+        const buf = rx_bufs[used.id][0..];
+        mmu.invalidate_dcache_range(@intFromPtr(buf.ptr), @min(buf.len, used.len));
+        defer post_buffer(&rx_queue, buf, @intCast(used.id));
+        if (used.len < hdr_size) continue;
+        const r_src_port = read32(buf, hdr_src_port);
+        const r_dst_port = read32(buf, hdr_dst_port);
+        if (r_dst_port != conn.src_port or r_src_port != conn.dst_port) continue;
+        // Every matching packet carries the peer's current credit pair.
+        conn.peer_buf_alloc = read32(buf, hdr_buf_alloc);
+        conn.peer_fwd_cnt = read32(buf, hdr_fwd_cnt);
+        const r_op = read16(buf, hdr_op);
+        const plen: usize = @intCast(read32(buf, hdr_len));
+        if (r_op == op_rst) {
+            result = .{ .verdict = .reset };
+            break;
+        }
+        if (r_op == op_shutdown) {
+            conn.peer_eof = true;
+            result = .{ .verdict = .eof };
+            break;
+        }
+        if (r_op == op_rw and plen > 0 and used.len >= hdr_size + plen) {
+            const n = @min(plen, out.len);
+            @memcpy(out[0..n], buf[hdr_size .. hdr_size + n]);
+            conn.rx_cnt +%= @intCast(plen);
+            result = .{ .verdict = .data, .len = n };
+            break;
+        }
+        // CREDIT_UPDATE and other ops only refresh the credit pair above.
+    }
+    kick(&rx_queue, 0);
+    return result;
+}
+
+/// Clean close: OP_SHUTDOWN for both directions. The peer may still RST;
+/// the reply is drained by the caller's final recv poll, not here.
+pub fn shutdown(conn: *Conn) void {
+    write_ctl(conn, op_shutdown, flag_shutdown_rx | flag_shutdown_tx);
+}
+
+/// Abortive close: OP_RST — also the answer to a peer misbehaving.
+pub fn rst(conn: *Conn) void {
+    write_ctl(conn, op_rst, 0);
+}
+
+fn write_ctl(conn: *Conn, op: u16, flags: u32) void {
+    if (!vs_ready) return;
+    @memset(tx_buf[0..hdr_size], 0);
+    write64(&tx_buf, hdr_src_cid, vs_guest_cid);
+    write64(&tx_buf, hdr_dst_cid, host_cid);
+    write32(&tx_buf, hdr_src_port, conn.src_port);
+    write32(&tx_buf, hdr_dst_port, conn.dst_port);
+    write16(&tx_buf, hdr_type, type_stream);
+    write16(&tx_buf, hdr_op, op);
+    write32(&tx_buf, hdr_flags, flags);
+    write32(&tx_buf, hdr_buf_alloc, rx_credit);
+    write32(&tx_buf, hdr_fwd_cnt, conn.rx_cnt);
+    mmu.clean_dcache_range(@intFromPtr(&tx_buf), hdr_size);
+    const desc_index: u16 = @intCast(tx_queue.avail.idx % tx_queue.size);
+    tx_queue.desc[desc_index] = .{
+        .addr = mmu.to_phys(@intFromPtr(&tx_buf)),
+        .len = hdr_size,
+        .flags = 0,
+        .next = 0,
+    };
+    tx_queue.avail.ring[tx_queue.avail.idx % tx_queue.size] = desc_index;
+    tx_queue.avail.idx +%= 1;
+    kick(&tx_queue, 1);
 }
 
 // ---------------------------------------------------------------------------

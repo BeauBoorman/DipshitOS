@@ -23,12 +23,21 @@ public final class HostInspectorView: NSView {
     private let cardBox = NSBox()
     private let cardTitle = NSTextField(labelWithString: "")
     private let cardBody = NSTextField(wrappingLabelWithString: "")
+    /// M127e (#2603): the AGENTD sub-pane — the receipt lane's rows
+    /// beside the serial tail, a pure projection of `bus.agent` (the
+    /// same model the pill and the lane-agent verb read). Hidden when
+    /// no companion is armed.
+    private let agentBox = NSStackView()
+    private let agentHeader = NSTextField(labelWithString: "")
+    private let agentScroll = NSScrollView()
+    private let agentView = NSTextView()
 
     /// The last strings actually rendered — reload() is called on every
     /// model change, so it diffs instead of clobbering the text view
     /// (and the operator's scroll position) twice a second.
     private var renderedTail = ""
     private var renderedCard = ""
+    private var renderedAgent = ""
 
     public init(model: HostInspector, bus: HostCommandBus) {
         self.model = model
@@ -92,6 +101,25 @@ public final class HostInspectorView: NSView {
         scroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scroll)
 
+        agentHeader.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        agentHeader.textColor = .secondaryLabelColor
+        agentHeader.lineBreakMode = .byTruncatingTail
+        agentView.isEditable = false
+        agentView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        agentView.textContainerInset = NSSize(width: 6, height: 6)
+        agentView.textContainer?.widthTracksTextView = true
+        agentView.autoresizingMask = [.width]
+        agentScroll.documentView = agentView
+        agentScroll.hasVerticalScroller = true
+        agentScroll.drawsBackground = false
+        agentBox.orientation = .vertical
+        agentBox.alignment = .leading
+        agentBox.spacing = 4
+        agentBox.addArrangedSubview(agentHeader)
+        agentBox.addArrangedSubview(agentScroll)
+        agentBox.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(agentBox)
+
         NSLayoutConstraint.activate([
             cardBox.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             cardBox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
@@ -118,9 +146,19 @@ public final class HostInspectorView: NSView {
 
             scroll.topAnchor.constraint(equalTo: filterField.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            scroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+
+            agentBox.topAnchor.constraint(equalTo: filterField.bottomAnchor, constant: 8),
+            agentBox.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            agentBox.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            agentBox.widthAnchor.constraint(equalToConstant: 380),
+            agentScroll.widthAnchor.constraint(equalTo: agentBox.widthAnchor),
         ])
+        // The tail's trailing edge pins to the agent pane while it shows
+        // and to the drawer's edge while it does not — one of the two is
+        // always active.
+        tailTrailingAgent = scroll.trailingAnchor.constraint(equalTo: agentBox.leadingAnchor, constant: -8)
+        tailTrailingEdge = scroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8)
         // The header rows pin below the card while it shows and below the
         // drawer top while it does not — one of the two is always active.
         cardTop = filterField.topAnchor.constraint(equalTo: cardBox.bottomAnchor, constant: 8)
@@ -134,6 +172,10 @@ public final class HostInspectorView: NSView {
     /// The filter row's two top anchors — exactly one active at a time.
     private var cardTop: NSLayoutConstraint!
     private var collapsedTop: NSLayoutConstraint!
+    /// The tail's two trailing anchors — the agent pane takes the right
+    /// side when a companion is armed.
+    private var tailTrailingAgent: NSLayoutConstraint!
+    private var tailTrailingEdge: NSLayoutConstraint!
 
     /// Whether the postmortem card is on screen — the class-A seam.
     public var postmortemVisible: Bool { !cardBox.isHidden }
@@ -141,6 +183,13 @@ public final class HostInspectorView: NSView {
     /// The tail text the view is currently rendering — tests read the
     /// projection rather than the raw model.
     public var renderedTailText: String { renderedTail }
+
+    /// The agent sub-pane's seams — whether the pane is on screen, the
+    /// summary it renders, and its receipt text. Tests read the
+    /// projection rather than the raw model.
+    public var agentSubpaneVisible: Bool { !agentBox.isHidden }
+    public var agentSummaryText: String { agentHeader.stringValue }
+    public var renderedAgentText: String { renderedAgent }
 
     /// Refresh every projection from the model. Called from
     /// `model.onChange` (main queue, the polls' cadence).
@@ -152,6 +201,22 @@ public final class HostInspectorView: NSView {
             tailView.scrollToEndOfDocument(nil)
         }
         countersLabel.stringValue = model.hostIntSummary
+        // The agent sub-pane: armed companions project their summary +
+        // flagged receipt rows; a shareless/agentless run hides it.
+        let agent = bus?.agent
+        let armed = agent?.companionArmed ?? false
+        agentBox.isHidden = !armed
+        tailTrailingAgent.isActive = armed
+        tailTrailingEdge.isActive = !armed
+        if armed, let agent {
+            agentHeader.stringValue = "AGENTD — \(agent.agentSummary)"
+            let rows = agent.receiptRows.joined(separator: "\n")
+            if rows != renderedAgent {
+                renderedAgent = rows
+                agentView.string = rows
+                agentView.scrollToEndOfDocument(nil)
+            }
+        }
         let card = model.postmortem
         cardBox.isHidden = card == nil
         cardTop.isActive = card != nil

@@ -2690,3 +2690,24 @@ The SoundInProbe `--sound-in --share` leg execs `GOSELF.ELF
 answer `captured=8192` (a consented host) or `refused=ETIMEDOUT` (a denied
 one — the bounded outcome, never a hang), with `overcap=EINVAL` and
 `oddlen=EINVAL` named either way.
+
+## Amendment (2026-10-18, M115d #2463 — slot 93 `sys_vsock_ctl`, the EL0 door to virelai-ctl/1)
+
+ADR 0056 D5 named this slot: the ONLY in-guest `virelai-ctl/1` initiator
+was the kernel monitor, because the HMAC credential is a `uid_system`
+`SECRETS.TXT` row that `sys_secret_get` (slot 70) serves to no EL0
+principal. This amendment freezes slot 93 as the narrow door: the kernel
+keeps the credential and runs ONE authenticated session on the caller's
+behalf; EL0 supplies a verb (and the optional `name` operand) and reads
+back the verdict — no challenge, MAC or key bytes ever cross the seam.
+Every existing number stays frozen; `implemented_count` is now 94.
+
+| 93 | `sys_vsock_ctl` | `vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr, code_cap) -> i64` | Run one `virelai-ctl/1` session over the virtio-vsock transport: connect to the host's `--vsock-ctl-port` listener (1209), answer the HMAC challenge with the kernel-held `vsock-ctl` row, send `{"id":1,"verb":"…"[,"name":"…"]}`, relay the reply, close. `suspend` runs the guest quiesce between auth and request — the VLFS fsync (when the data disk is mounted), the settings re-save, and the `SUSPEND.MARK` request receipt on the share — and a quiesce failure aborts before the verb leaves; the machine is never frozen half-prepared. Sessions serialize one at a time (the transport is a single-connection device); a second caller answers `busy`. Returns **0** when the reply was `ok:true` — for `suspend` that return may land on the far side of a host save/restore, so the caller's next instruction IS the resume. A refused session returns the refusal code's byte length and writes the ADR 0056 D4 name into `code_ptr` (`no_device`, `no_credential`, `connect_refused`, `connect_timeout`, `bad_greeting`, `auth_failed`, `auth_timeout`, `conn_lost`, `line_too_long`, `replay`, `unknown_verb`, `unimplemented`, `no_state`, `unsupported`, `save_failed`, `busy`, `io_error`, `malformed`), truncated to `code_cap`. `EINVAL` for a non-process caller or a `verb_len`/`name_len` outside 1..31/0..31; `EFAULT` for a bad pointer. |
+
+The Go half is `vi.VsockCtl` (`user/go/vi/vsockctl.go`, slot 93 marshaled
+through `svc6`). GOSH's `suspend` builtin and GOTABWM's PWR-menu Suspend
+row are the two callers the card ships; the kernel monitor's `vsock ctl`
+command shares the same session engine (`kernel/src/vsock_ctl.zig`).
+
+The slot joins no `word_*` grant group today — the same ungrouped-service
+posture slots 88/91/92 took.

@@ -709,6 +709,25 @@ func (g *goshHost) SecretNames() ([]string, bool) {
 	return out, true
 }
 
+// Suspend is the guest-initiated power request (M115d, slot 93): the
+// kernel runs the whole authenticated ctl session under its uid_system
+// `vsock-ctl` credential — no key bytes cross the seam. The ok return
+// may land on the far side of a host save/restore.
+func (g *goshHost) Suspend() (bool, string) {
+	var code [40]byte
+	r := vi.VsockCtl("suspend", "", code[:])
+	if r == 0 {
+		return true, ""
+	}
+	if r > 0 {
+		if r > int64(len(code)) {
+			r = int64(len(code))
+		}
+		return false, string(code[:r])
+	}
+	return false, vi.ErrnoName(r)
+}
+
 func (g *goshHost) AppLogNames() []string {
 	names, rc := vi.AppLogNames()
 	if rc < 0 {

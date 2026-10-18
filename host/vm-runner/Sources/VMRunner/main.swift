@@ -33,10 +33,38 @@
 //          (validateSaveRestoreSupport + the full cycle); a refusal is
 //          printed as `VZ-RESTORE: validateSaveRestoreSupport REFUSED ...`
 //          before the error exit.
-//         [--vsock [--vsock-port <n>]] (M115a, #2460: attach Apple's
+//         [--vsock [--vsock-port <n>] [--vsock-ctl [--vsock-ctl-port <n>]]]
+//          (M115a, #2460: attach Apple's
 //          VZVirtioSocketDevice and arm a host listener on port <n>,
 //          default 1208. A guest connect to that port is accepted and
-//          printed as `VSOCK: listener accepted guest connect ...`.)
+//          printed as `VSOCK: listener accepted guest connect ...`.
+//          M115b, #2461: --vsock-ctl arms the virelai-ctl/1 endpoint on
+//          --vsock-ctl-port, default 1209 — the HMAC-challenged
+//          suspend/snapshot wire, keyed by the share's vsock-ctl
+//          SECRETS.TXT row (either host channel's share is read); no
+//          row, no listener. M115d, #2463: `suspend` is armed — pause,
+//          save into the profile's saved-state/, reply ok, stop, exit.)
+//         [--profile <path>] (M115c, #2462: boot from a .virelaivm bundle —
+//          a manifest-gated directory holding efi-vars.bin, the PERSISTENT
+//          overlay.asif over config.json's base image, vlfs.img, share/,
+//          machine-id.bin and saved-state/. An absent path is minted; an
+//          existing one must carry a readable virelaivm/1 manifest or the
+//          run refuses by name. Profile members are DEFAULTS: explicit
+//          --vars/--overlay-base/--data-disk/--cvc-file/--cpus flags win.
+//          --profile-init mints/validates the bundle and exits without
+//          booting — tools/session.sh runs it before seeding the share.)
+//         [--resume <path>] (M115d, #2463: boot the profile's saved-state/
+//          instead of the boot image — the continuation of a ctl `suspend`.
+//          Requires an existing bundle AND a written state.vzsave; both
+//          refuse by name. Mutually exclusive with --vz-restore and
+//          --profile-init; the ctl listener re-arms so the resumed
+//          machine can suspend again.)
+//         [--apply-update] [--rollback-update] [--update-key <64-hex>]
+//          (M115f, #2465: verify the signed staged set in <share>/UPDATE/
+//          and swap it in as the boot base image, retaining <base>.prev;
+//          --rollback-update swaps it back. The trust pin comes from
+//          --update-key or the profile's config.json updatePubkey. A
+//          refused set fails the run by name; absent is "none staged".)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -418,7 +446,9 @@ import VMAppKit
 import VMDiskImage
 import VMGPU3D
 import VMPostmortem
+import VMProfile
 import VMTcp
+import VSCtl
 import VSNTP
 import VSSH
 
@@ -504,6 +534,28 @@ var usbMsdPath: String? = nil
 // formatting is mkfs.vlfs's job, never the runner's. Off by default: without
 // the flag config.storageDevices keeps its single boot element.
 var dataDiskPath: String? = nil
+// M115c (issue #2462): `--profile <path>` boots a persistent machine from a
+// `.virelaivm` bundle instead of the flag-by-flag throwaway pieces. The
+// bundle's manifest members fill --vars/--overlay-base/--data-disk/
+// --cvc-file and its config.json fills cpus/ram/device defaults — every
+// explicit flag wins over the profile member it names. `--profile-init`
+// only mints/validates the bundle and exits (session.sh's pre-seed step).
+var profilePath: String?
+var profileInitOnly = false
+// M115d (#2463): `--resume <path>` boots the profile's saved machine
+// state instead of the boot image — the continuation of a ctl `suspend`.
+var resumeFromPath: String?
+// M115f (#2465): `--apply-update` verifies the guest-staged signed set in
+// <share>/UPDATE/ (UPDATE.MF + UPDATE.SIG over it) and swaps it in as the
+// boot base image, retaining the old base at <base>.prev and discarding
+// a profile's persistent overlay.asif. `--rollback-update` swaps .prev
+// back. `--update-key <64-hex>` pins the Ed25519 public key the manifest
+// must verify under; absent it, a profile's config.json updatePubkey
+// applies.
+var applyUpdate = false
+var rollbackUpdate = false
+var updateKeyHex: String?
+var memoryMiB = 256
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
 // VZVirtualMachineView after `--input-key-after <marker>` (default: the
@@ -610,7 +662,15 @@ var virtioFSShareDir: String?
 var vsockEnabled = false
 var vsockPort: UInt32 = 1208
 var vsockPortSet = false
+// M115b (#2461, ADR 0056): the virelai-ctl/1 control channel on the same
+// device. `--vsock-ctl` arms a second listener on `--vsock-ctl-port`
+// (default 1209) that serves the HMAC-challenged suspend/snapshot wire;
+// the credential is the share's `vsock-ctl` SECRETS.TXT row (uid_system).
+var vsockCtlEnabled = false
+var vsockCtlPort: UInt32 = VSCtl.defaultPort
+var vsockCtlPortSet = false
 var cpuCount = 2
+var cpusExplicit = false
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
 var expectLine = "firmware has agreed to cooperate"
@@ -1227,8 +1287,8 @@ while idx < arguments.count {
         let valued = ["--overlay-base", "--vars", "--serial", "--cpus", "--timeout",
                       "--vz-restore-save", "--vz-restore-load", "--vz-restore-witness",
                       "--vz-restore-verify-command", "--vz-restore-verify-output",
-                      "--usb-msd", "--virtio-fs", "--vsock-port"]
-        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock"]
+                      "--usb-msd", "--virtio-fs", "--vsock-port", "--vsock-ctl-port"]
+        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock", "--vsock-ctl"]
         guard valued.contains(arg) || bare.contains(arg) else {
             fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal, --vsock.")
         }
@@ -1289,6 +1349,24 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--data-disk", idx + 1 < arguments.count {
         dataDiskPath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--profile", idx + 1 < arguments.count {
+        profilePath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--resume", idx + 1 < arguments.count {
+        resumeFromPath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--profile-init" {
+        profileInitOnly = true
+        idx += 1
+    } else if arg == "--apply-update" {
+        applyUpdate = true
+        idx += 1
+    } else if arg == "--rollback-update" {
+        rollbackUpdate = true
+        idx += 1
+    } else if arg == "--update-key", idx + 1 < arguments.count {
+        updateKeyHex = arguments[idx + 1]
         idx += 2
     } else if arg == "--input-key", idx + 1 < arguments.count {
         guard let kc = UInt16(arguments[idx + 1]) else {
@@ -1375,11 +1453,22 @@ while idx < arguments.count {
         vsockPort = port
         vsockPortSet = true
         idx += 2
+    } else if arg == "--vsock-ctl" {
+        vsockCtlEnabled = true
+        idx += 1
+    } else if arg == "--vsock-ctl-port", idx + 1 < arguments.count {
+        guard let port = UInt32(arguments[idx + 1]), port != 0 else {
+            fail("--vsock-ctl-port requires a numeric port value in 1...4294967294.")
+        }
+        vsockCtlPort = port
+        vsockCtlPortSet = true
+        idx += 2
     } else if arg == "--cpus", idx + 1 < arguments.count {
         guard let n = Int(arguments[idx + 1]), n >= 1, n <= 8 else {
             fail("--cpus requires a count in 1...8, got '\(arguments[idx + 1])'.")
         }
         cpuCount = n
+        cpusExplicit = true
         idx += 2
     } else if arg == "--timeout", idx + 1 < arguments.count {
         timeout = TimeInterval(arguments[idx + 1]) ?? 30
@@ -2042,6 +2131,149 @@ while idx < arguments.count {
     }
 }
 
+// M115c (#2462): `--profile` resolves the bundle BEFORE the member paths
+// are consumed below. An absent path is minted; an existing directory must
+// carry a readable virelaivm/1 manifest (missing/corrupt refuses by name).
+// Every profile member is a default — an explicit --vars/--overlay-base/
+// --data-disk/--cvc-file/--cpus flag wins regardless of argument order.
+var activeProfile: VMProfile? = nil
+if profileInitOnly, profilePath == nil {
+    fail("--profile-init requires --profile <path>.")
+}
+// M115d (#2463): `--resume` IS a profile boot — it names the bundle and
+// flags the saved-state restore below. A resume names an existing
+// bundle by name; minting one to restore an empty saved-state would be
+// a silent no-suspend, so the load fails closed instead.
+if let resumeFromPath {
+    if profileInitOnly {
+        fail("--resume and --profile-init are mutually exclusive.")
+    }
+    if vzRestore {
+        fail("--resume and --vz-restore are mutually exclusive.")
+    }
+    if let profilePath, profilePath != resumeFromPath {
+        fail("--resume and --profile disagree (resume boots the named bundle; pass one path).")
+    }
+    profilePath = resumeFromPath
+}
+var resumeStateURL: URL? = nil
+if let profilePath {
+    do {
+        activeProfile = resumeFromPath != nil
+            ? try VMProfile.load(from: URL(fileURLWithPath: profilePath))
+            : try VMProfile.openOrCreate(at: URL(fileURLWithPath: profilePath))
+    } catch {
+        fail("\(resumeFromPath != nil ? "--resume" : "--profile"): \(error)")
+    }
+}
+if let _ = resumeFromPath {
+    // The file the ctl `suspend` verb writes — its absence is the honest
+    // "there is no suspended state" refusal, named up front.
+    let url = activeProfile!.savedStateURL.appendingPathComponent(SuspendCtl.stateFileName)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        fail("--resume: no saved state at \(url.path) (nothing has suspended into this profile).")
+    }
+    resumeStateURL = url
+    print("SUSPEND-RESUME: armed state=\(url.path)")
+}
+if let p = activeProfile {
+    if varsOverridePath == nil { varsOverridePath = p.efiVarsURL.path }
+    if overlayBasePath == nil { overlayBasePath = p.config.baseImage }
+    if dataDiskPath == nil, p.config.devices.dataDisk { dataDiskPath = p.vlfsURL.path }
+    if cvcFileShareDir == nil, virtioFSShareDir == nil, p.config.devices.share {
+        // The bundle's share/ rides the same host file channel --cvc-file
+        // attaches — including the implied six-queue device shape. An
+        // explicit --virtio-fs wins the slot: the custom-virtio device is
+        // the one VZ save/restore refuses, so a save-capable caller arms
+        // the share on the standard transport instead (M120a #2558).
+        cvcFileShareDir = p.shareURL.path
+        cvcSnapEnabled = true
+        viaVirtioEnabled = true
+        customVirtioEnabled = true
+        cvcEchoEnabled = true
+    }
+    if !cpusExplicit { cpuCount = p.config.cpus }
+    memoryMiB = p.config.memoryMiB
+    displayMode = displayMode || p.config.devices.display
+    inputMode = inputMode || p.config.devices.input
+    soundMode = soundMode || p.config.devices.sound
+    netNatEnabled = netNatEnabled || p.config.devices.netNat
+    vsockEnabled = vsockEnabled || p.config.devices.vsock
+}
+if profileInitOnly {
+    // Mint/validate the bundle and exit without booting — session.sh runs
+    // this before seeding the share, so a corrupt bundle refuses by name
+    // up front instead of mid-boot. The force-unwrap is safe: the guard
+    // above already proved a profile loaded.
+    let p = activeProfile!
+    print("profile: \(p.created ? "created" : "loaded") \(p.url.path)")
+    print("profile: identity=\(p.identity) cpus=\(p.config.cpus) memoryMiB=\(p.config.memoryMiB) base=\(p.config.baseImage)")
+    exit(0)
+}
+
+// M115f (#2465): the opt-in OS self-update legs. `--apply-update` runs
+// BEFORE the base image is opened: verify the signed staged set on the
+// armed share, then swap it in as the base (old base -> <base>.prev, a
+// profile's persistent overlay.asif discarded). `--rollback-update`
+// swaps .prev back. Both are pure file operations on host paths — the
+// guest can stage but can never choose whether the apply happens.
+if applyUpdate, rollbackUpdate {
+    fail("--apply-update and --rollback-update are mutually exclusive.")
+}
+if applyUpdate || rollbackUpdate {
+    guard let base = overlayBasePath else {
+        fail("\(rollbackUpdate ? "--rollback-update" : "--apply-update"): no_base (no base image — needs --overlay-base or --profile).")
+    }
+    let baseURL = URL(fileURLWithPath: base)
+    // A profile's persistent overlay belongs to the outgoing base — a
+    // swapped base starts with a fresh layer (the overlay is re-minted at
+    // the attach point below when absent).
+    let overlayURL = activeProfile?.overlayURL
+    if rollbackUpdate {
+        let hadOverlay = overlayURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        do {
+            let sha = try OSUpdate.rollback(baseImage: baseURL, overlay: overlayURL)
+            print("apply-update: rollback restored sha256=\(sha)")
+            if hadOverlay {
+                print("apply-update: overlay reset (stale sectors belong to the old base)")
+            }
+        } catch {
+            fail("apply-update: \(error)")
+        }
+    } else {
+        // The staged set lives on the share the guest writes — the armed
+        // --cvc-file / --virtio-fs dir or the bundle's share/.
+        guard let share = cvcFileShareDir ?? virtioFSShareDir else {
+            fail("apply-update: no_share (UPDATE/ is staged on the host share — arm --cvc-file/--virtio-fs or a profile share).")
+        }
+        if let updateDir = OSUpdate.stagedDir(shareDir: URL(fileURLWithPath: share)) {
+            // The trust pin: the flag wins; else the bundle's own
+            // config.json updatePubkey — a host-side value the guest
+            // cannot reach.
+            let keyHex = updateKeyHex ?? activeProfile?.config.updatePubkey
+            guard let keyHex, let keyData = dataFromHex(keyHex), keyData.count == 32 else {
+                fail("apply-update: no_key (--update-key <64-hex Ed25519 public key> or profile config updatePubkey).")
+            }
+            // The overlay marker is observable: the discard of a
+            // persistent overlay.asif is the proof no stale sector shadows
+            // the new base (the attach point re-mints it on THIS boot).
+            let hadOverlay = overlayURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            do {
+                let manifest = try OSUpdate.apply(updateDir: updateDir, baseImage: baseURL,
+                                                  publicKey: keyData, overlay: overlayURL)
+                print("apply-update: applied version=\(manifest.version) image=\(OSUpdate.imageName)")
+                if hadOverlay {
+                    print("apply-update: overlay reset (stale sectors belong to the old base)")
+                }
+            } catch {
+                fail("apply-update: \(error)")
+            }
+        } else {
+            print("apply-update: none staged")
+        }
+    }
+}
+
 // Console sessions run until the VM stops or the user ends the session,
 // unless an explicit --timeout was requested. Script mode is a non-
 // interactive variant of the duplex console plumbing (claim 6684).
@@ -2168,6 +2400,12 @@ if vzRestore, !timeout.isFinite || timeout <= 0 || timeout > 600 {
 if vsockPortSet, !vsockEnabled {
     fail("--vsock-port requires --vsock (the port names the host listener on the attached device).")
 }
+if vsockCtlEnabled, !vsockEnabled {
+    fail("--vsock-ctl requires --vsock (the control channel rides the same socket device).")
+}
+if vsockCtlPortSet, !vsockCtlEnabled {
+    fail("--vsock-ctl-port requires --vsock-ctl.")
+}
 if vzRestoreWitness != nil, !vzRestore {
     fail("--vz-restore-witness requires --vz-restore.")
 }
@@ -2200,6 +2438,12 @@ if secureBootEnabled {
     }
     guard !secureBootDbEfiPaths.isEmpty || !secureBootDbHashes.isEmpty else {
         fail("--secure-boot requires at least one of --secure-boot-db-efi <PE path> or --secure-boot-db-hash <64-hex>.")
+    }
+    // M115c (#2462): enrollment overwrites the vars file every run, which
+    // would destroy the profile's persistent efi-vars.bin — refuse the
+    // combination rather than silently mangling a bundle member.
+    guard activeProfile == nil else {
+        fail("--secure-boot builds a FRESH variable store each run; --profile's efi-vars.bin is persistent. The combination is refused.")
     }
 }
 
@@ -2357,7 +2601,7 @@ let bootLoader = VZEFIBootLoader()
 bootLoader.variableStore = variableStore
 let config = VZVirtualMachineConfiguration()
 config.bootLoader = bootLoader
-config.memorySize = 256 * 1024 * 1024
+config.memorySize = UInt64(memoryMiB) * 1024 * 1024
 config.cpuCount = cpuCount
 // M70g G3 (#1459): a saved machine state is bound to the platform's
 // machineIdentifier (VZGenericPlatformConfiguration.h: "When a virtual machine
@@ -2386,6 +2630,24 @@ if vzRestoreSaveDir != nil || vzRestoreLoadDir != nil {
             fail("--vz-restore-save: could not persist the machine identifier into '\(save)': \(error)")
         }
         print("  platform: machineIdentifier persisted to \(dir.appendingPathComponent("machine-id.bin").path) (--vz-restore-save)")
+    }
+    config.platform = platform
+} else if let p = activeProfile {
+    // M115c (#2462): a profiled machine keeps ONE machineIdentifier for its
+    // whole life — adopt the bundle's machine-id.bin (minted at create,
+    // reminted+persisted here if absent or unreadable by VZ) so a later
+    // saved state binds and every boot presents the same machine.
+    let platform = VZGenericPlatformConfiguration()
+    if let data = p.machineIdentifierData(),
+       let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+        platform.machineIdentifier = id
+    } else {
+        do {
+            try p.setMachineIdentifier(platform.machineIdentifier.dataRepresentation)
+        } catch {
+            fail("--profile: could not persist \(p.machineIdentifierURL.path): \(error)")
+        }
+        print("  platform: machineIdentifier minted into \(p.machineIdentifierURL.path)")
     }
     config.platform = platform
 }
@@ -2425,20 +2687,39 @@ do {
                 // cleanup; the load process (or a failed run's post-mortem)
                 // owns it.
                 stackDir = URL(fileURLWithPath: save, isDirectory: true)
+            } else if let p = activeProfile {
+                // M115c (#2462): the overlay lives INSIDE the bundle — a
+                // persisted member, never the throwaway tmp layer, and never
+                // the atexit cleanup.
+                stackDir = p.url
             } else {
                 stackDir = FileManager.default.temporaryDirectory
                     .appendingPathComponent("virelai-overlay-\(UUID().uuidString)", isDirectory: true)
                 overlayCleanupPath = stackDir.path
             }
             try FileManager.default.createDirectory(at: stackDir, withIntermediateDirectories: true)
-            let layer = ASIFCreationConfiguration.layer(
-                url: stackDir.appendingPathComponent("overlay.asif"),
-                type: .overlay(blockCount: Int(diskBase.blockCount)))
-            let stacked = try diskBase.appending(layer)
+            let overlayURL = stackDir.appendingPathComponent("overlay.asif")
+            let stacked: any StackedImage
+            if let p = activeProfile, FileManager.default.fileExists(atPath: overlayURL.path) {
+                // M115c: a profiled machine REOPENS its persisted overlay —
+                // guest writes to the boot disk survive across sessions.
+                // (The vz-restore-save leg above is unreachable with a
+                // profile: --profile is not in that probe's flag set.)
+                _ = p
+                let overlay = try DiskImage(opening: .open(url: overlayURL, mode: .readWrite))
+                stacked = try diskBase.appending(overlay)
+            } else {
+                let layer = ASIFCreationConfiguration.layer(
+                    url: overlayURL,
+                    type: .overlay(blockCount: Int(diskBase.blockCount)))
+                stacked = try diskBase.appending(layer)
+            }
             let attachment = try VZDiskImageStorageDeviceAttachment(diskImage: stacked)
             config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
             if vzRestoreSaveDir != nil {
                 print("  disk: \(base) (base, read-only) + persisted ASIF overlay in \(stackDir.path) (--vz-restore-save; kept for the load process)")
+            } else if activeProfile != nil {
+                print("  disk: \(base) (base, read-only) + persistent ASIF overlay \(overlayURL.path) (--profile)")
             } else {
                 print("  disk: \(base) (base, read-only) + throwaway ASIF overlay in \(stackDir.path)")
             }
@@ -3628,6 +3909,10 @@ final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
 // itself must outlive the VM's socket device for connects to keep landing.
 let vsockListenerDelegate = VsockListenerDelegate()
 let vsockListener = VZVirtioSocketListener()
+// M115b (#2461): the ctl listener + its credential-bearing delegate are
+// created at arm time (the key only exists once the share dir is known).
+var vsockCtlDelegate: VSockCtlListenerDelegate?
+let vsockCtlListener = VZVirtioSocketListener()
 
 // Held strongly: `VZVirtualMachine.delegate` is a weak property, so a
 // temporary would be deallocated immediately and never called.
@@ -3745,8 +4030,11 @@ let terminalDwell: TimeInterval = 2
 
 print("VIRELAIOS VM runner")
 print("  host: arm64 (Apple silicon), macOS \(osVersion.majorVersion).\(osVersion.minorVersion)")
-print("  disk: \(diskImagePath)")
-print("  memory: 256 MiB, cpus: \(cpuCount)")
+print("  disk: \(overlayBasePath ?? diskImagePath)")
+print("  memory: \(memoryMiB) MiB, cpus: \(cpuCount)")
+if let p = activeProfile {
+    print("  profile: \(p.url.path) identity=\(p.identity) (\(p.created ? "created" : "loaded"))")
+}
 if consoleMode {
     print("  mode: interactive console")
     print("  serial log: \(serialLogPath)  (guest output teed to terminal + log)")
@@ -4012,6 +4300,42 @@ runner.queue.async {
             vsockListener.delegate = vsockListenerDelegate
             socketDevice.setSocketListener(vsockListener, forPort: vsockPort)
             print("VSOCK: host listener armed port=\(vsockPort)")
+            // M115b (#2461, ADR 0056): the ctl endpoint is fail-closed —
+            // no `vsock-ctl` share credential, no listener, and a guest
+            // connect then gets the honest RST of an unlistened port.
+            if vsockCtlEnabled {
+                // M115d (#2463): the credential may ride EITHER host file
+                // channel — the profile share can attach through cvc-file
+                // or (for a save/restore-safe device set) virtio-fs.
+                let ctlShareDirs = [cvcFileShareDir, virtioFSShareDir].compactMap { $0 }
+                if let key = ctlShareDirs.lazy.compactMap({
+                    VSCtl.loadKey(shareDir: URL(fileURLWithPath: $0, isDirectory: true))
+                }).first {
+                    // M115d (#2463): the suspend verb's driver — the
+                    // profile's saved-state/ as destination, the
+                    // device set's save/restore verdict as the support
+                    // check. Both computed once here: the verb then
+                    // answers `no_state`/`unsupported` honestly or runs
+                    // the pause→save→reply→stop chain.
+                    var suspendUnsupported: String? = nil
+                    do { try config.validateSaveRestoreSupport() } catch {
+                        suspendUnsupported = "\(error as NSError)"
+                    }
+                    let suspendCtl = SuspendCtl(vm: runner.vm, queue: runner.queue,
+                                              savedStateDir: activeProfile?.savedStateURL,
+                                              unsupported: suspendUnsupported)
+                    let delegate = VSockCtlListenerDelegate(
+                        key: key,
+                        suspendHandler: { suspendCtl.begin() },
+                        onSuspendAccepted: { suspendCtl.finish() })
+                    vsockCtlDelegate = delegate
+                    vsockCtlListener.delegate = delegate
+                    socketDevice.setSocketListener(vsockCtlListener, forPort: vsockCtlPort)
+                    print("VSOCK-CTL: host listener armed port=\(vsockCtlPort) suspend=\(suspendUnsupported != nil ? "unsupported" : (activeProfile == nil ? "no_state" : "armed"))")
+                } else {
+                    print("VSOCK-CTL: refuse no_credential (no vsock-ctl row in the armed share's SECRETS.TXT)")
+                }
+            }
         } else {
             FileHandle.standardError.write(Data("ERROR: --vsock was attached but no VZVirtioSocketDevice is present on the VM.\n".utf8))
             exit(1)
@@ -4027,6 +4351,29 @@ runner.queue.async {
                                    verifyOutput: vzRestoreVerifyOutput,
                                    mode: .load(URL(fileURLWithPath: load, isDirectory: true)))
         probe.startFromSavedState()
+        return
+    }
+    if let resumeURL = resumeStateURL {
+        // M115d (#2463): `--resume` — restore the machine state a ctl
+        // `suspend` saved into the profile and continue the guest. The
+        // ctl listener is already armed above, so the resumed machine
+        // can suspend again.
+        runner.vm.restoreMachineStateFrom(url: resumeURL) { error in
+            if let error {
+                print("SUSPEND-RESUME: restore refused code=\((error as NSError).code) error=\(error as NSError)")
+                FileHandle.standardError.write(Data("ERROR: --resume restore failed: \(error as NSError)\n".utf8))
+                exit(1)
+            }
+            runner.vm.resume { result in
+                if case .failure(let error) = result {
+                    print("SUSPEND-RESUME: resume refused error=\(error as NSError)")
+                    FileHandle.standardError.write(Data("ERROR: --resume resume failed: \(error as NSError)\n".utf8))
+                    exit(1)
+                }
+                vmDidStart = true
+                print("SUSPEND-RESUME: restored \(SuspendCtl.stateFileName)")
+            }
+        }
         return
     }
     runner.vm.start { result in
@@ -7599,12 +7946,17 @@ func buildIcmpEchoReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ host
 //      death to a specific window instead of "no verdict at all".
 var scriptPollLastBeat: Date = Date()
 
+// M115d (#2463): set by SuspendCtl's accepted-suspend tail — the stop a
+// suspended VM lands is the teardown the guest asked for, so the poll's
+// early-stop failure branch must not outrace it.
+var suspendStopInFlight = false
+
 func scriptPoll(matchedAt: Date? = nil) {
     var matchedAt = matchedAt
     // An early VM stop ends the run: pass when the expected transcript was
     // already observed (the tail window simply cannot capture more output),
-    // otherwise fail.
-    if vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
+    // otherwise fail. A ctl `suspend` teardown is its own success path.
+    if !suspendStopInFlight && vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
         // Issue #1024: the state was sampled BEFORE this tick's log read —
         // a VM that stops in the gap after the previous read makes this
         // branch see "stopped" while the transcript already sits in the

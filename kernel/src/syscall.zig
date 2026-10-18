@@ -104,6 +104,8 @@ pub const shared_mmap = @import("shared_mmap.zig"); // M33 SB2 (claim 8878): the
 pub const secret = @import("secret.zig"); // M50 TS5 (issue #1139, ADR 0024 D8): the SECRETS.TXT secret store behind sys_secret_get
 pub const grant = @import("grant.zig"); // M113c (#2419, ADR 0054 Part II): the grant table behind the word gates + slot 89
 pub const measure = @import("measure.zig"); // M113b/c: the receipt format the word-denial lines reuse
+pub const vsock_ctl = @import("vsock_ctl.zig"); // M115d (#2463, ADR 0056): the virelai-ctl/1 session behind slot 93
+pub const road_pops = @import("road_pops.zig"); // M115d (#2463): the tee console the ctl session's markers ride
 
 const builtin = @import("builtin");
 pub const mmu = @import("mmu.zig");
@@ -302,6 +304,9 @@ pub const sys_audio_mute: u64 = 45;
 pub const sys_audio_rec_info: u64 = 91;
 /// M118c (issue #2481): `sys_audio_rec(format, rate, channels, buf, len)` — slot 92.
 pub const sys_audio_rec: u64 = 92;
+/// M115d (issue #2463, ADR 0056 D5 + ADR 0007 amendment):
+/// `sys_vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr, code_cap)` — slot 93.
+pub const sys_vsock_ctl: u64 = 93;
 /// Step 2 (Issue #205): `sys_win_fill_batch(buf_ptr, buf_len)` — slot 46.
 pub const sys_win_fill_batch: u64 = 46;
 /// Arc2 W1 (claim 3589, ADR 0013 D1): `sys_win_resize(id, w, h)` — slot 47.
@@ -682,6 +687,7 @@ fn handler_for(comptime number: u64) Handler {
         sys_audio_mute => handle_audio_mute,
         sys_audio_rec_info => handle_audio_rec_info,
         sys_audio_rec => handle_audio_rec,
+        sys_vsock_ctl => handle_vsock_ctl,
         sys_win_fill_batch => handle_win_fill_batch,
         sys_win_resize => handle_win_resize,
         48 => handle_drag_start,
@@ -762,6 +768,10 @@ fn doms_of(number: u64) u5 {
         // file channel AND reads the caller's registry row.
         sys_grant_admin => f | k,
         sys_trace => f | k, // M94b's atomic arm-and-exec needs both domains.
+        // M115d (#2463): the ctl session reads the kernel-held credential
+        // (KERNEL), quiesces VLFS + settings + the marker through the host
+        // file channel (FILE), and rides the vsock transport (NET).
+        sys_vsock_ctl => f | k | n,
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
         sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
@@ -795,8 +805,11 @@ pub fn dispatch(number: u64, args: Args, frame: *exceptions.VectorFrame) u64 {
     // per-handler convention. Slot 80's open-class ops carry `net` (the
     // family is op-multiplexed; its slot stays ungrouped). `audit`
     // receipts the would-be denial and lets the call through; `enforce`
-    // makes it an honest EACCES — flipping the default is a separate
-    // owner decision (D12). Kernel-context callers resolve no pid and
+    // makes it an honest EACCES. M116b (#2468): the floor a row-less
+    // process carries is `grant.ambient` — file/audio/net are row-only
+    // words; `mode=enforce` in GRANTS.TXT is what flips a boot's
+    // posture (absent stays `audit`, D12's standing contract).
+    // Kernel-context callers resolve no pid and
     // are never the EL0 principal the gate exists for.
     var required = grant.slot_word(number);
     if (number == sys_socket and grant.socket_open_op(args[0])) required |= grant.word_net;
@@ -3519,6 +3532,54 @@ fn handle_audio_rec(args: Args, _: *exceptions.VectorFrame) u64 {
         off += n;
     }
     return @intCast(off);
+}
+
+// ---------------------------------------------------------------------------
+// M115d (issue #2463, ADR 0056 D5 + ADR 0007 amendment): sys_vsock_ctl — slot 93
+// ---------------------------------------------------------------------------
+
+/// `sys_vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr,
+/// code_cap)`: run ONE `virelai-ctl/1` session on the caller's behalf over
+/// the virtio-vsock transport — connect to the host's `--vsock-ctl-port`
+/// listener, answer the HMAC challenge with the kernel-held `vsock-ctl`
+/// credential (a uid_system row no EL0 `sys_secret_get` principal can
+/// read — which is why the door exists at all rather than a raw stream),
+/// send the request line, relay the reply verdict. `suspend` runs the
+/// guest quiesce (VLFS fsync when mounted, the settings re-save, the
+/// `SUSPEND.MARK` request receipt) between auth and request, and a
+/// quiesce failure aborts before the verb leaves — the machine is never
+/// frozen half-prepared.
+///
+/// Returns 0 when the reply was `ok:true` — for `suspend`, that return
+/// may land on the far side of a host save/restore, so the caller's next
+/// instruction IS the resume. A refused session returns the refusal
+/// code's byte length and writes the ADR 0056 D4 name to `code_ptr`
+/// (`no_device`, `no_credential`, `connect_refused`, `unimplemented`,
+/// `unknown_verb`, `busy`, `io_error`, ...) — truncated to `code_cap`
+/// when the buffer is short. `EINVAL` for a non-process caller or a
+/// `verb_len`/`name_len` outside 1..31/0..31; `EFAULT` for a bad pointer.
+fn handle_vsock_ctl(args: Args, _: *exceptions.VectorFrame) u64 {
+    const verb_ptr = args[0];
+    const verb_len = args[1];
+    const name_ptr = args[2];
+    const name_len = args[3];
+    const code_ptr = args[4];
+    const code_cap = args[5];
+    _ = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (verb_len == 0 or verb_len > 31 or name_len > 31) return error_result(.einval);
+    var verb_buf: [32]u8 = undefined;
+    if (uaccess.copy_in(&verb_buf, verb_ptr, @intCast(verb_len)) != .ok) return error_result(.efault);
+    var name_buf: [32]u8 = undefined;
+    if (name_len > 0 and uaccess.copy_in(&name_buf, name_ptr, @intCast(name_len)) != .ok) return error_result(.efault);
+    const verdict = vsock_ctl.session(road_pops.tee_console(), verb_buf[0..@intCast(verb_len)], name_buf[0..@intCast(name_len)], .normal);
+    if (verdict.ok) return 0;
+    var text = verdict.codeText();
+    if (text.len == 0) text = "io_error";
+    if (code_cap > 0) {
+        const take = @min(text.len, @as(usize, @intCast(code_cap)));
+        if (uaccess.copy_out(code_ptr, text[0..take], take) != .ok) return error_result(.efault);
+    }
+    return @intCast(text.len);
 }
 
 /// Claim 6359 / issue #1333 (ADR 0007 slot 28): `sys_exec(path_ptr,

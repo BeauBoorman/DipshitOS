@@ -186,8 +186,14 @@ func (a *app) draw() {
 		text(padX, logTop+i*lineH, a.log[start+i], th.Muted)
 	}
 
-	// Footer: key hints + status.
+	// Footer: key hints + status. A standing consent prompt takes the
+	// hint line — the ask is modal (M116c).
 	c.FillRect(widgets.Rect{X: 0, Y: h - footerH, W: w, H: 1}, draw.Opaque(th.ChromeBg))
+	if a.pending != nil {
+		text(padX, h-footerH+4, a.pending.bin+" requests "+a.pending.words, th.Accent)
+		text(padX, h-footerH+16, "[g]rant consent — writes the grant row   [d]eny — keeps the ambient floor", th.Muted)
+		return
+	}
 	text(padX, h-footerH+4, "[l]ist [/]search [enter]detail [i]nstall [u]pdate [r]ollback [d]elete [q]uit", th.Muted)
 	if a.status != "" {
 		text(padX, h-footerH+16, a.status, th.Accent)

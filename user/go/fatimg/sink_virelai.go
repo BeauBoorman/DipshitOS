@@ -1,6 +1,6 @@
 //go:build virelai
 
-package main
+package fatimg
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 	"virelai/vi"
 )
 
-// viSink is the guest seqSink. The image is written to the sacrificial
+// viSink is the guest SeqSink. The image is written to the sacrificial
 // <path>~ temp and PUBLISHED on Close (fsync, close, delete+rename) — the
 // M81e/M66b contract the vi publish guard enforces: a crash mid-write
 // leaves a partial temp, never a torn RELEASE.IMG a later boot would
@@ -34,7 +34,7 @@ type viSink struct {
 	pos   uint64
 }
 
-func newSeqSink(path string) (seqSink, error) {
+func NewSeqSink(path string) (SeqSink, error) {
 	// The temp is the sacrificial <path>~ sibling the publish guard
 	// recognises: it may be truncated/rewritten freely, and a crash leaves
 	// it orphaned, never torn at the live path (vi.WriteFileSafe's rule).

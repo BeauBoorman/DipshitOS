@@ -1,4 +1,4 @@
-package main
+package fatimg
 
 // The GPT + FAT32 image writer (M112c, issue #2415): a Go port of
 // image/mkfat32.py's create path, producing the same deterministic layout —
@@ -9,7 +9,7 @@ package main
 // Two differences from the Python original, both forced by the channel the
 // bytes travel:
 //
-//   - The image is STREAMED through a seqSink instead of built as one
+//   - The image is STREAMED through a SeqSink instead of built as one
 //     in-memory image: the guest's os.File write path stages everything in
 //     a 16 MiB shadow (overlay/syscall/fs_virelai.go virShadowMax) and a
 //     ~34 MiB image cannot fit it.
@@ -25,6 +25,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"unicode/utf16"
 )
@@ -50,10 +51,10 @@ var (
 		0x53, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x32}
 )
 
-// seqSink is the write side of the image builder: strictly sequential bytes
+// SeqSink is the write side of the image builder: strictly sequential bytes
 // plus a zero-fill fast-forward. The guest implementation rides vi's file
 // slots; the host one is an *os.File (tests and the dev loop).
-type seqSink interface {
+type SeqSink interface {
 	// Write appends b at the current position.
 	Write(b []byte) (int, error)
 	// ZeroPad extends the stream with zeros so the position becomes `to`;
@@ -226,10 +227,10 @@ func dirEntry(name11 string, attr byte, cluster uint64, size uint32) []byte {
 	return e
 }
 
-// imageWriter emits the disk image through a seqSink, checking that every
+// imageWriter emits the disk image through a SeqSink, checking that every
 // region lands at the offset the layout says it must.
 type imageWriter struct {
-	s   seqSink
+	s   SeqSink
 	pos uint64 // stream position in bytes
 }
 
@@ -266,10 +267,10 @@ func (w *imageWriter) pad(to uint64) error {
 	return nil
 }
 
-// writeImage builds the whole disk image: protective MBR, primary GPT,
+// WriteImage builds the whole disk image: protective MBR, primary GPT,
 // the FAT32 ESP with the two boot files, then the backup GPT. sizeMB 0
 // means the FAT32 cluster-count floor, matching mkfat32.py's default.
-func writeImage(s seqSink, efi, kernel []byte, sizeMB uint64) (uint64, error) {
+func WriteImage(s SeqSink, efi, kernel []byte, sizeMB uint64) (uint64, error) {
 	var totalSectors uint64
 	if sizeMB > 0 {
 		totalSectors = sizeMB * 1024 * 1024 / sectorBytes
@@ -457,4 +458,39 @@ func writeImage(s seqSink, efi, kernel []byte, sizeMB uint64) (uint64, error) {
 		return 0, fmt.Errorf("image ended at %d bytes, want %d", w.pos, totalSectors*sectorBytes)
 	}
 	return w.pos, nil
+}
+
+// HashSink tees the image stream through sha256 — the manifest records the
+// digest of exactly what was written, zeros included.
+type HashSink struct {
+	Sink SeqSink
+	H    hash.Hash
+	pos  uint64
+}
+
+func (w *HashSink) Write(b []byte) (int, error) {
+	n, err := w.Sink.Write(b)
+	if n > 0 {
+		w.H.Write(b[:n])
+		w.pos += uint64(n)
+	}
+	return n, err
+}
+
+func (w *HashSink) Close() error { return w.Sink.Close() }
+
+func (w *HashSink) ZeroPad(to uint64) error {
+	if to < w.pos {
+		return fmt.Errorf("zeropad %d behind position %d", to, w.pos)
+	}
+	var zero [8192]byte
+	for w.pos < to {
+		n := uint64(len(zero))
+		if to-w.pos < n {
+			n = to - w.pos
+		}
+		w.H.Write(zero[:n])
+		w.pos += n
+	}
+	return w.Sink.ZeroPad(to)
 }

@@ -1,11 +1,11 @@
-# WEB.ELF bounded HTML/CSS/GET browser, plus GOFETCH TLS regression.
-# One exec per boot, ended by program markers or an anchored kernel receipt.
+# WEB.ELF bounded HTML/CSS/GET browser, plus GOFETCH TLS regression. One
+# exec per boot, ended by program markers or an anchored kernel receipt.
 # 01-11 retain render/link/fetch/error/cancel/store/offline/hostile behaviors.
-# 12 proves in-process GOFETCH TLS; 13 retains shim console-ink evidence.
-# 14 retains the pinned corpus on the surviving consumer.
-# 15-17 type real hostnames against original hermetic site stand-ins.
+# 12 proves in-process GOFETCH TLS; 13-14 retain shim console-ink + the
+# pinned corpus. 15-17 type real hostnames against hermetic stand-ins;
 # 18-20 prove wrong-host/expired/production-unknown-root refusal before GET.
 # 21 measures the largest reference with actual kernel ownership counters.
+<<<<<<< HEAD
 # 22-38 (M93g #1999, M99p): each frozen reference renders in-guest; the marker-
 # geometry crop SHA-256-matches its approved golden (web-proof/compare.py,
 # ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
@@ -15,6 +15,17 @@
 # three-pixel shim-border scanout composition; font markers are live-web-ttf's.
 # Prerequisites: build-web.sh browser WEB, browser WEB --gate,
 # fetch GOFETCH --gate. Gate artifacts retain WEB.ELF/GOFETCH.ELF guest names.
+=======
+# 22-38 (M93g #1999): each frozen reference renders in-guest; the marker-
+# geometry crop SHA-256-matches its approved M93e golden (web-proof/compare.py,
+# ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
+# v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
+# responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
+# grammar or TLS-over-v6 responder exists yet. No public-internet access,
+# scripts or POST; owner authorized the fixed three-pixel shim-border
+# composition; font markers are live-web-ttf's. Prereqs: build-web.sh
+# browser WEB and browser WEB --gate, fetch GOFETCH --gate.
+>>>>>>> origin/main
 
 vgate_name live-web "WEB: bounded CSS browser, exact M93 presentation, DNS/SNI/GET navigation and fail-closed TLS"
 vgate_share seed
@@ -195,10 +206,19 @@ if pid == 0:
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     conns = []
+<<<<<<< HEAD
     # The deadline must cover the seven boots ahead of 08 on the reference
     # host plus margin; observed 2026-10-18: 300 s expired mid-run and the
     # refused connect silently degraded boot 08 to the offline fallback.
     deadline = time.time() + 1200
+=======
+    # The deadline must outlive the whole spec, not the boot it serves:
+    # 300 s was sized when this spec had a dozen runs and expired mid-run
+    # on a 39-run fleet (observed 2026-10-18: upstream dial ECONNREFUSED,
+    # 'web: offline' instead of a load to cancel). The owner-pid watch is
+    # the real lifetime bound; this is only the orphan backstop.
+    deadline = time.time() + 7200
+>>>>>>> origin/main
     while time.time() < deadline:
         try:
             os.kill(owner, 0)
@@ -1589,6 +1609,7 @@ import subprocess, sys
 subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'fonts-size'])
 PY
 
+<<<<<<< HEAD
 # --- boot 39 (M126a #2593): the address bar + navigation leg --------------
 # One boot, all file-channel loads so every transition is instant. The chord
 # channel types ctrl-l + the path (its marker wait is keyed to the run
@@ -1714,3 +1735,114 @@ assert diff == 0, "PAGE rows under the menu differ from the approved raster: %d 
 print("live-web 39 history dropdown pixels ok (plate=%d ink=%d selrow=%d selbar=%d) + PAGE rows under it exact" %
       (plate, ink, selrow, selbar))
 PY
+=======
+# --- run v6: M117f (#2478, ADR 0057) — the v6 leg -------------------------
+# The card's thesis is "WEB.ELF fetches https over a v6 literal"; the honest
+# landable leg inside spec Touches is one step narrower, and this run pins
+# both halves of that bound:
+#   * WEB.ELF on https://[v6]:80/ names its refusal — 'web: error url'.
+#     user/go/browser/url.go's validHost accepts DNS labels only ("No
+#     userinfo, IPv6 ... is accepted"); webrender.URL stores a [4]byte
+#     IPv4. A v6 literal never reaches a dial.
+#   * The fetch itself is proven one layer down: GOWEB6.ELF (built in
+#     setup, the go-net connect6 shape) vi.Dials the BRACKETED v6 literal
+#     and does GET / -> 'HTTP/1.0 200 OK' against --net-tcp6-respond's
+#     answer table — the same hermetic responder the v4 fetch legs use.
+# A full https-over-v6 fetch needs a v6 URL grammar in the browser AND a
+# TLS-capable v6 responder (the TCP6 responder speaks the HTTP answer
+# table only — no :relay mode exists for v6): both are follow-on code
+# outside this card's Touches. SLAAC gates script2 exactly like the
+# go-net v6 run: a connect before 'net: v6 g6=... valid' refuses no_src6.
+
+vgate_file web6.go <<'EOF'
+package main
+
+import (
+    "time"
+    "virelai/vi"
+    "virelai/vsys"
+)
+
+func fail(s string) {
+    vsys.Println("web6: FAIL " + s)
+    vsys.Exit(1)
+}
+
+func main() {
+    // M117f (#2478): the bracketed v6 literal — the tagged op-10 marshal.
+    vsys.Println("web6: dialing [2001:db8:64::ff:fe00:2]:80")
+    c, err := vi.DialTimeout("[2001:db8:64::ff:fe00:2]", 80, 5*time.Second)
+    if err != nil { fail("dial " + err.Error()) }
+    if !c.IsV6() { fail("conn not family v6") }
+    vsys.Println("web6: connected")
+    if _, err = c.Send([]byte("GET / HTTP/1.0\r\nHost: v6\r\n\r\n")); err != nil { fail("send") }
+    c.SetRecvDeadline(5_000_000_000)
+    buf := make([]byte, vi.TCPPayloadMax)
+    n, err := c.Recv(buf)
+    if err != nil || n < 15 || string(buf[:15]) != "HTTP/1.0 200 OK" { fail("GET response") }
+    vsys.Println("web6: HTTP 200 over v6")
+    if err = c.Close(); err != nil { fail("close") }
+    vsys.Println("web6: done")
+    vsys.Exit(0)
+}
+EOF
+
+vgate_file script-v6-ready.txt <<'EOF'
+echo v6-ready
+EOF
+
+# exec spawns asynchronously, so the two programs are sequenced by stage
+# gates on their own markers: script2's WEB.ELF exec waits for SLAAC, and
+# script3's GOWEB6 exec waits for WEB.ELF's own 'web: ready'. The run ends
+# on 'web6: done' — a program marker, not a script echo — so the VM cannot
+# stop before the fetch completed.
+vgate_file script-v6.txt <<'EOF'
+net ndp 2001:db8:64::ff:fe00:2
+net ndp 2001:db8:64::ff:fe00:2
+net ip6
+exec WEB.ELF https://[2001:db8:64::ff:fe00:2]:80/
+EOF
+
+vgate_file script-v6-fetch.txt <<'EOF'
+exec GOWEB6.ELF
+EOF
+
+vgate_setup_python <<'PY'
+# Run v6: build GOWEB6.ELF onto the armed share — the same in-setup build
+# shape go-net.spec uses for GOCONNECT6 (issue #2475).
+import os, pathlib, subprocess
+rd = pathlib.Path(os.environ["RUN_DIR"])
+share = pathlib.Path(os.environ.get("VG_SHARE") or rd / "share")
+tmp = rd / "web6-build"
+tmp.mkdir(exist_ok=True)
+env = dict(os.environ, TMPDIR=str(tmp), GO_BUILD_OUT=str(share),
+           GO_BUILD_NAME="GOWEB6", GO_LDFLAGS_VALUE="-s -w")
+subprocess.run(["bash", "tools/go/build-go.sh", str(rd / "web6.go")], env=env, check=True)
+PY
+
+vgate_run v6 -- \
+    --screen '$RUN_DIR/screen-v6' --via-virtio --cvc-snap \
+    --net '$RUN_DIR/v6.cap' \
+    --net-ra-respond '2001:db8:64::/64' \
+    --net-ndp-respond '2001:db8:64::ff:fe00:2' \
+    --net-tcp6-respond '[2001:db8:64::ff:fe00:2]:80' \
+    --script '$RUN_DIR/script-v6-ready.txt' \
+    --script2 '$RUN_DIR/script-v6.txt' --script2-after 'net: v6 g6=2001:db8:64::ff:fe00:1 valid' \
+    --script3 '$RUN_DIR/script-v6-fetch.txt' --script3-after 'web: ready' \
+    --script-expect 'web6: done' --timeout 180
+
+vgate_assert v6 output-contains 'net-ra-respond: ENABLED'
+vgate_assert v6 output-contains 'net-ndp-respond: ENABLED'
+vgate_assert v6 output-contains 'net-tcp6-respond: ENABLED'
+vgate_assert v6 serial-contains 'net: v6 g6=2001:db8:64::ff:fe00:1 valid'
+vgate_assert v6 serial-contains 'net ndp: 2001:db8:64::ff:fe00:2 is at 02:00:00:00:00:02'
+vgate_assert v6 serial-contains 'web: error url'
+vgate_assert v6 serial-contains 'web: ready'
+vgate_assert v6 serial-absent 'web: fetch '
+vgate_assert v6 serial-contains 'web6: connected'
+vgate_assert v6 serial-contains 'web6: HTTP 200 over v6'
+vgate_assert v6 serial-contains 'web6: done'
+vgate_assert v6 serial-absent 'web6: FAIL'
+vgate_assert v6 serial-absent '[EXC] parking:'
+vgate_assert v6 output-contains 'NET-TCP6: answered'
+>>>>>>> origin/main

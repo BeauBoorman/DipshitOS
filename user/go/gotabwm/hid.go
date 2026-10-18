@@ -241,6 +241,11 @@ func handleWmKey(e vi.Event) {
 		vi.ConsoleLine(MarkerNotifyCenterClose)
 		return
 	}
+	// M115d (#2463): the open power menu's keys are the seat's alone —
+	// the sink window holds focus, so a hosted app sees nothing anyway.
+	if handlePowerKey(e) {
+		return
+	}
 	if handleLauncherKey(e) {
 		return
 	}
@@ -574,6 +579,19 @@ func handleWmPointer(e vi.Event) {
 			return
 		}
 	}
+	// M115d (#2463): the open power menu is chrome-modal the same way
+	// the launcher is — a press on its row runs the verb, a press
+	// anywhere else dismisses it, and nothing reaches content either
+	// way.
+	if powerMenuOpen {
+		if down {
+			dismissPowerMenu()
+			if powerMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
+				requestSuspend()
+			}
+		}
+		return
+	}
 	if launch.open {
 		if btn != 0 {
 			menuGesture = true
@@ -594,6 +612,12 @@ func handleWmPointer(e vi.Event) {
 		return
 	}
 	if down {
+		if powerBtnHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
+			menuGesture = true
+			railDragFrom, contentDown, sashDragging = -1, false, false
+			openPowerMenu()
+			return
+		}
 		if godMenuHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
 			menuGesture = true
 			railDragFrom, contentDown, sashDragging = -1, false, false

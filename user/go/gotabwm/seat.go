@@ -407,6 +407,11 @@ func main() {
 		if launch.open && launch.sink != 0 && !ensureLauncherFocus() {
 			dismissLauncher()
 		}
+		// M115d (#2463): the power menu's sink is reaped on the same
+		// dead-window discipline as the launcher's.
+		if powerMenuOpen && powerSink != 0 && !ensurePowerFocus() {
+			dismissPowerMenu()
+		}
 		e, ok := vi.PollEvent()
 		if !ok {
 			// #2260: block on the event queue instead of parking a whole
@@ -567,6 +572,12 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	chromeTick(scan, ticks)
 	if launch.open {
 		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	}
+	// M115d (#2463): the power menu floats above the rail and under the
+	// toasts, matching its pointer priority (the toast hit test runs
+	// first).
+	if powerMenuOpen {
+		_ = paintPowerMenu(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	}
 	// M79k (#1720): the notify strip is the LAST thing painted before the
 	// present, so it sits above the launcher and above the clock panel. A
