@@ -281,6 +281,74 @@ final class VMProfileTests: XCTestCase {
         }
     }
 
+    // MARK: M128b (#2606): clone + overlay reset
+
+    /// The safety-net leg: clone mints a NEW bundle carrying config +
+    /// share/ verbatim — and nothing else. Fresh identity, fresh dirs,
+    /// no overlay.asif (re-minted over the base on first boot), no
+    /// vlfs/efi-vars/machine-id — a clean test VM, not a disk fork.
+    func testCloneCopiesConfigAndShareOnly() throws {
+        let url = bundleURL("workstation.virelaivm")
+        let src = try VMProfile.create(
+            at: url, name: "workstation",
+            config: VMProfile.Config(cpus: 4, memoryMiB: 512, baseImage: "/abs/disk.img"))
+        try src.setMachineIdentifier(Data(repeating: 0xAB, count: 70))
+        try Data("overlay-bytes".utf8).write(to: src.overlayURL)
+        try Data("efi".utf8).write(to: src.efiVarsURL)
+        try Data("vlfs".utf8).write(to: src.vlfsURL)
+        try Data("notes".utf8).write(to: src.shareURL.appendingPathComponent("NOTES.TXT"))
+        try FileManager.default.createDirectory(
+            at: src.shareURL.appendingPathComponent("APPS"), withIntermediateDirectories: true)
+        try Data("bin".utf8).write(to: src.shareURL.appendingPathComponent("APPS/GO.ELF"))
+
+        let cloneURL = bundleURL("workstation-copy.virelaivm")
+        let clone = try src.clone(to: cloneURL)
+        XCTAssertTrue(clone.created)
+        XCTAssertEqual(clone.name, "workstation-copy")
+        XCTAssertEqual(clone.config, src.config)
+        XCTAssertNotEqual(clone.identity, src.identity)
+
+        // share/ survives verbatim, recursively.
+        XCTAssertEqual(try Data(contentsOf: clone.shareURL.appendingPathComponent("NOTES.TXT")),
+                       Data("notes".utf8))
+        XCTAssertEqual(try Data(contentsOf: clone.shareURL.appendingPathComponent("APPS/GO.ELF")),
+                       Data("bin".utf8))
+        // Nothing else rode over: fresh overlay/vars/vlfs/machine-id.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: clone.overlayURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: clone.vlfsURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: clone.efiVarsURL.path))
+        XCTAssertNil(clone.machineIdentifierData())
+        // The clone loads as an ordinary bundle.
+        XCTAssertEqual(try VMProfile.load(from: cloneURL).name, "workstation-copy")
+        // And the source is untouched.
+        XCTAssertEqual(src.machineIdentifierData(), Data(repeating: 0xAB, count: 70))
+    }
+
+    /// Clone refuses an occupied path by name — same contract as create.
+    func testCloneRefusesExistingPath() throws {
+        let src = try VMProfile.create(at: bundleURL())
+        let occupied = bundleURL("occupied.virelaivm")
+        try FileManager.default.createDirectory(at: occupied, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try src.clone(to: occupied)) { error in
+            guard case .missingManifest = error as? VMProfile.ProfileError else {
+                return XCTFail("expected missingManifest, got \(error)")
+            }
+        }
+    }
+
+    /// Reset removes the persistent overlay so the attach point re-mints
+    /// a fresh ASIF layer next boot; an absent overlay is already-reset.
+    func testResetOverlayRemovesMember() throws {
+        let p = try VMProfile.create(at: bundleURL())
+        XCTAssertFalse(try p.resetOverlay()) // nothing yet — idempotent
+        try Data("wedge".utf8).write(to: p.overlayURL)
+        XCTAssertTrue(try p.resetOverlay())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: p.overlayURL.path))
+        // Only the overlay went — the bundle still loads and share/ lives.
+        XCTAssertNoThrow(try VMProfile.load(from: p.url))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: p.shareURL.path))
+    }
+
     /// The identity key the session app stamps as CFBundleIdentifier:
     /// deterministic from the name, bundle-idish, and lowercase-safe.
     func testDefaultIdentityIsStableAndSafe() {

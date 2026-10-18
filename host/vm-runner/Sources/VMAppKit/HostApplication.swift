@@ -161,6 +161,26 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         // --host-cmd-after), the panel follows; closing the panel
         // flips it back through windowWillClose.
         commandBus.settings.onChange = { [weak self] in self?.syncSettings() }
+        // M128b (#2606): the profile manager's session seams — the
+        // confirm gate reads the live lifecycle state, asks through a
+        // real NSAlert, and a confirmed switch ends this session (the
+        // armed path already swapped, so the next launch boots the
+        // chosen machine).
+        commandBus.profiles.vmRunning = { [weak self] in
+            self?.lifecycle.state == .running
+        }
+        commandBus.profiles.confirm = { question in
+            let alert = NSAlert()
+            alert.messageText = question
+            alert.informativeText = "This cannot be undone while the VM is running."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Continue")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
+        commandBus.profiles.requestStop = { [weak self] reason in
+            self?.stop(reason)
+        }
         status.alignment = .center
         status.font = .systemFont(ofSize: 18)
         status.translatesAutoresizingMaskIntoConstraints = false
