@@ -89,6 +89,16 @@ let package = Package(
             dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"],
             path: "Sources/VMRunner"
         ),
+        // M118a (#2479): the `--sound-in` observation vehicle — a standalone
+        // minimal boot carrying VZVirtioSoundDeviceInputStreamConfiguration +
+        // VZHostAudioInputStreamSource, kept OUT of VMRunner because
+        // main.swift's flag loop has no extension point and the file is held
+        // by other active claims (#2475/#2476). Ad-hoc codesigned with the
+        // same entitlements.plist by the gate before use.
+        .executableTarget(
+            name: "SoundInProbe",
+            path: "Sources/SoundInProbe"
+        ),
         .testTarget(
             name: "VMRunnerTests",
             dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"]
