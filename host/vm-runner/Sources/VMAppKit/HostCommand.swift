@@ -40,7 +40,6 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case notifyClick = "notify-click"
     case revealExport = "reveal-export"
     case laneOutbox = "lane-outbox"
-    case laneAgent = "lane-agent"
     // Debug menu — M114d/e register the remaining handlers.
     case inspector
     // M114d (#2457): the drawer injector's verb — no menu item of its
