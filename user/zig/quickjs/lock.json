@@ -98,7 +98,7 @@
       "user/zig/k4o.zig": "0410cbecf1677012828eb8b831f4330190ccb3273ecd991061b51efbb2e31fe5",
       "user/zig/native.zig": "928fdc9633500ec6e00bce42b7d0418679395cbad389a8533910271a74e43678",
       "user/zig/network.zig": "e83e13c7d60a6fba90349ce1d8b5fe35a6d0f486dc6ee259e3216ae18082e112",
-      "user/zig/network_fixture.zig": "0b9f06304a6c4bf232877262a1eb104cb50eebb6a7e1927aadadee50f243f072",
+      "user/zig/network_fixture.zig": "c2acef13e652ed7c1e37505ddd752b0e17d2b34dcbf9967e7f90d7662ef604ab",
       "user/zig/network_test.zig": "89649d545d1d0c30a83c6698cd54d2955860de87a406897e0159116f812b20f3",
       "user/zig/oliver.zig": "247da6f57fc703bd4efb33aa623ed30174eaa2b037516a95788eeff9b139eed6",
       "user/zig/oliver_builtins.zig": "8f7565e0ab944377cff043bf03e94b37161221793b881473234111d9dd29ac1f",
