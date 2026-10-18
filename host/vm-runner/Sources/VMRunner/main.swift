@@ -2180,9 +2180,12 @@ if let p = activeProfile {
     if varsOverridePath == nil { varsOverridePath = p.efiVarsURL.path }
     if overlayBasePath == nil { overlayBasePath = p.config.baseImage }
     if dataDiskPath == nil, p.config.devices.dataDisk { dataDiskPath = p.vlfsURL.path }
-    if cvcFileShareDir == nil, p.config.devices.share {
+    if cvcFileShareDir == nil, virtioFSShareDir == nil, p.config.devices.share {
         // The bundle's share/ rides the same host file channel --cvc-file
-        // attaches — including the implied six-queue device shape.
+        // attaches — including the implied six-queue device shape. An
+        // explicit --virtio-fs wins the slot: the custom-virtio device is
+        // the one VZ save/restore refuses, so a save-capable caller arms
+        // the share on the standard transport instead (M120a #2558).
         cvcFileShareDir = p.shareURL.path
         cvcSnapEnabled = true
         viaVirtioEnabled = true
