@@ -475,6 +475,16 @@ func applyRPC(req vi.WmRpc) bool {
 		}
 		vi.ConsoleLine(MarkerRpcCycle)
 		return true
+	case wmKindPalette: // 19, client -> seat: summon the command palette
+		// M121a (#2564): the palette is seat-owned; a bound client asks
+		// for it over the same authenticated seam the declare rides. The
+		// request's payload is unused — the palette indexes live state.
+		openPalette()
+		if launch.open && launch.palette {
+			vi.ConsoleLine(MarkerRpcPalette)
+			return true
+		}
+		return false
 	case vi.WmRpcKindNavDeclare: // 9, client -> seat: the app navigated
 		// The path rides the request title, exactly as TABWM reads it.
 		// A re-declaration of the current entry is a no-op that still

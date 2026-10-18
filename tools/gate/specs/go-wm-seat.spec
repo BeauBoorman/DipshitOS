@@ -220,6 +220,21 @@ shutil.copy(src, os.path.join(share, "GOSET.ELF"))
 print("staged GOSET.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GOSET.ELF")))
 PY
 
+# M121a (#2564): run 15 hosts GOEDIT.ELF so the palette's 'edit' leg has a
+# tab to focus. HOST PREREQUISITE:
+#   bash tools/go/build-goedit.sh -> .build/go/GOEDIT.ELF
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOEDIT.ELF")
+if not os.path.exists(src):
+    sys.exit("GOEDIT.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-goedit.sh")
+shutil.copy(src, os.path.join(share, "GOEDIT.ELF"))
+print("staged GOEDIT.ELF into share (%d bytes)" % os.path.getsize(os.path.join(share, "GOEDIT.ELF")))
+PY
+
 # M71h (#1567): run 04 hosts the image viewer, so stage it and the QOI fixture
 # it opens. HOST PREREQUISITE: bash tools/go/build-goview.sh -> .build/go/GOVIEW.ELF
 vgate_setup_python <<'PY'
@@ -1725,3 +1740,91 @@ vgate_assert 14 serial-absent 'gotabwm: agent'
 vgate_assert 14 serial-contains 'rx-gotabwm-off-ok'
 vgate_assert 14 serial-absent '[EXC] parking:'
 vgate_assert 14 serial-absent 'exited status=139'
+
+
+# --- M121a (#2564) run 15: the seat-owned command palette -----------------
+#
+# ctrl+shift+p is the palette's summon chord — the seat row this card gave
+# it in the chords registry (pin, its previous owner, is re-homed on
+# ctrl-shift-n). The palette is the launcher's second face over the same
+# docked strip: type-to-filter over open tabs, the recent-file log,
+# settings keys, the help bundle and the chord registry, ranked by the
+# launcher's subsequence matcher.
+#
+# LIVE seat (vf rm GOTABWM.DEMO — the run 05/09 pattern) so no bounded
+# choreography races the legs. GOEDIT hosts first: it is the tab the
+# 'edit' leg focuses. Both legs ride ONE chord batch at the fixed
+# 0.25 s/stroke pacing:
+#
+#   ctrl-shift-p,e,d,i,t,return   'edit' -> the Edit tab row -> focus it
+#   ctrl-shift-p,s,e,t,t,return   'sett' -> a Settings row -> exec GOSET
+#
+# Leg order is deliberate: the focus leg needs only the already-hosted
+# Edit tab, and 'goset: declare accepted' — script3's anchor — can only
+# land AFTER 'palette exec GOSET.ELF' (the exec precedes the declare), so
+# the run's end gate can never outrun either leg.
+#
+# The `vf rm GOTABWM.IDLE.TEST` + `settings set idle_minutes 120` pair is
+# load-bearing: run 07 persists idle_minutes=1 and seeds the 2-ticks/min
+# fixture on this same share, which leaves dim=2/lock=4 in force — every
+# later stroke is then eaten as an idle WAKE rather than reaching the
+# palette (observed 2026-10-18: the whole chord batch woke the curtain
+# per-stroke and leaked 'edit\nsett\n' into GOEDIT's buffer). The reset
+# returns the idle policy to a horizon the chord batch cannot reach.
+vgate_file script-15.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm GOTABWM.IDLE.TEST
+settings set idle_minutes 120
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-15.txt <<'EOF'
+dui focus 0
+exec GOEDIT.ELF
+EOF
+
+vgate_file script3-15.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-palette-ok
+EOF
+
+vgate_run 15 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-15' \
+    --script '$RUN_DIR/script-15.txt' \
+    --script2 '$RUN_DIR/script2-15.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-shift-p,e,d,i,t,return,ctrl-shift-p,s,e,t,t,return' \
+    --input-chords-after 'goedit: declare accepted' \
+    --script3 '$RUN_DIR/script3-15.txt' \
+    --script3-after 'goset: declare accepted' \
+    --script-expect 'rx-gotabwm-palette-ok' --timeout 300
+
+vgate_assert 15 serial-contains 'settings: idle_minutes=120 (persisted)'
+vgate_assert 15 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 15 serial-contains 'gotabwm: mode live'
+vgate_assert 15 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 15 serial-contains 'goedit: declare accepted'
+vgate_assert 15 serial-contains 'gotabwm: rail n=1'
+# Leg 1: 'edit' ranks the open Edit tab first and focuses it — the focus
+# marker only prints on a successful tab pick.
+vgate_assert 15 serial-contains 'gotabwm: palette open n='
+vgate_assert 15 serial-contains 'gotabwm: palette filter q=edit n='
+vgate_assert 15 serial-contains 'gotabwm: palette focus id='
+vgate_assert 15 serial-contains 'gotabwm: palette dismiss'
+# Leg 2: 'sett' ranks a Settings row first and execs GOSET, which then
+# declares for real over WM_RPC — the launch is hosted, not just exec'd.
+# A seat-spawned exec does not print 'exec: loaded' (that is the monitor
+# command's line); its kernel-side record is the measured-boot receipt.
+vgate_assert 15 serial-contains 'gotabwm: palette filter q=sett n='
+vgate_assert 15 serial-contains 'gotabwm: palette exec GOSET.ELF'
+vgate_assert 15 serial-contains 'verdict=measured name=GOSET.ELF'
+vgate_assert 15 serial-contains 'goset: declare accepted'
+vgate_assert 15 serial-contains 'gotabwm: rail n=2'
+vgate_assert 15 serial-contains 'rx-gotabwm-palette-ok'
+vgate_assert 15 serial-absent '[EXC] parking:'
+vgate_assert 15 serial-absent 'exited status=139'

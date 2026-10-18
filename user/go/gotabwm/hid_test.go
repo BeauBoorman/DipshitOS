@@ -13,6 +13,9 @@ func TestHidUsagesMatchRunner(t *testing.T) {
 	if hidUsageP != 0x13 {
 		t.Fatalf("hidUsageP = %#x want 0x13 (USB HID 'p')", hidUsageP)
 	}
+	if hidUsageN != 0x11 {
+		t.Fatalf("hidUsageN = %#x want 0x11 (USB HID 'n')", hidUsageN)
+	}
 	if hidUsageT != 0x17 {
 		t.Fatalf("hidUsageT = %#x want 0x17 (USB HID 't')", hidUsageT)
 	}
@@ -211,10 +214,11 @@ func TestHandleWmKeyPinFocused(t *testing.T) {
 	if !tabs.FocusTab(4) {
 		t.Fatal("FocusTab")
 	}
+	// M121a: pin is ctrl-shift-n; ctrl-shift-p is the palette's chord now.
 	handleWmKey(vi.Event{
 		Kind:  vi.EvWmKey,
 		Flags: vi.ModCtrl | vi.ModShift,
-		Arg0:  uint32(hidUsageP),
+		Arg0:  uint32(hidUsageN),
 	})
 	if !tabs.At(0).Pinned || tabs.At(0).ID != 4 {
 		t.Fatalf("pin did not jump left: %+v pinned=%v", tabs.At(0), tabs.At(0).Pinned)
@@ -227,10 +231,10 @@ func TestHandleWmKeyPinFocused(t *testing.T) {
 	handleWmKey(vi.Event{
 		Kind:  vi.EvWmKey,
 		Flags: vi.ModCtrl | vi.ModShift,
-		Arg0:  uint32(hidUsageP),
+		Arg0:  uint32(hidUsageN),
 	})
 	if tabs.At(1).Pinned {
-		t.Fatal("second ctrl-shift-p must not pin the other tab")
+		t.Fatal("second ctrl-shift-n must not pin the other tab")
 	}
 }
 
@@ -1242,7 +1246,8 @@ func TestHidUsagesMatchRegistry(t *testing.T) {
 		return 0
 	}
 	for action, usage := range map[string]uint8{
-		"pin": hidUsageP, "reopen": hidUsageT, "duplicate": hidUsageD,
+		"pin": hidUsageN, "palette": hidUsageP,
+		"reopen": hidUsageT, "duplicate": hidUsageD,
 		"snapshot-bundle": hidUsageS,
 		"freeze-badge":    hidUsageF, "split-cycle": hidUsageV,
 		"nav-back": hidUsageLeftBracket, "nav-forward": hidUsageRightBracket,
@@ -1341,7 +1346,7 @@ func TestChordSummaryCounts(t *testing.T) {
 		}
 	}
 	got := chordSummary(len(chords.Global), seat, kernel, app)
-	want := "gotabwm: chords n=51 seat=23 kernel=12 app=16"
+	want := "gotabwm: chords n=52 seat=24 kernel=12 app=16"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
 	}

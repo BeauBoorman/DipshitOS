@@ -15,9 +15,10 @@ func TestGlobalValidates(t *testing.T) {
 }
 
 // TestFixtureRefused is the card's conflict test: the deliberately
-// conflicting fixture — FIXTURE.ELF claiming the seat's pin chord at the
-// seat's own dispatch point — is refused with the NAMED error, and the
-// refusal names the chord, the scope, and both owners.
+// conflicting fixture — FIXTURE.ELF claiming the seat's palette chord
+// (pin's home before M121a) at the seat's own dispatch point — is refused
+// with the NAMED error, and the refusal names the chord, the scope, and
+// both owners.
 func TestFixtureRefused(t *testing.T) {
 	bad := append(Global[:0:0], Global...)
 	bad = append(bad, FixtureRow())
@@ -110,7 +111,7 @@ func TestAppScopesAreIndependent(t *testing.T) {
 func TestLetterUsages(t *testing.T) {
 	for letter, usage := range map[string]uint8{
 		"a": UsageA, "c": UsageC, "d": UsageD, "e": UsageE, "f": UsageF,
-		"g": UsageG, "k": UsageK, "l": UsageL, "p": UsageP, "r": UsageR,
+		"g": UsageG, "k": UsageK, "l": UsageL, "n": UsageN, "p": UsageP, "r": UsageR,
 		"s": UsageS, "t": UsageT, "u": UsageU, "v": UsageV, "w": UsageW, "y": UsageY,
 	} {
 		if want := uint8(0x04 + letter[0] - 'a'); usage != want {
@@ -187,8 +188,8 @@ func TestCoexistenceRowsDocumented(t *testing.T) {
 func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 	wantActions := map[string]int{
 		"launcher": 1, "start-surface": 1, "cycle-focus": 4, "focus-index": 9,
-		"pin": 1, "reopen": 1, "duplicate": 1, "snapshot-bundle": 1, "freeze-badge": 1,
-		"split-cycle": 1, "nav-back": 1, "nav-forward": 1,
+		"pin": 1, "palette": 1, "reopen": 1, "duplicate": 1, "snapshot-bundle": 1,
+		"freeze-badge": 1, "split-cycle": 1, "nav-back": 1, "nav-forward": 1,
 	}
 	got := map[string]int{}
 	for _, r := range Global.SeatRows() {

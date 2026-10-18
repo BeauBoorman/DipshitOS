@@ -64,6 +64,7 @@ const (
 	UsageH            uint8 = 0x0B
 	UsageK            uint8 = 0x0E
 	UsageL            uint8 = 0x0F
+	UsageN            uint8 = 0x11
 	UsageP            uint8 = 0x13
 	UsageR            uint8 = 0x15
 	UsageS            uint8 = 0x16
@@ -268,17 +269,18 @@ func (t Table) Validate() error {
 // chord at the seat's own dispatch point.
 const fixtureOwner = "FIXTURE.ELF"
 
-// FixtureRow is the deliberate conflict: the seat's pin chord claimed by an
-// app at the seat's dispatch point. Appending it to Global must be refused
-// by Validate with ErrChordConflict — that refusal is the checker's test,
-// on the host and (seeded by /host/GOTABWM.CHORDCONFLICT) in the guest.
+// FixtureRow is the deliberate conflict: the seat's palette chord (pin's
+// home before M121a re-homed it) claimed by an app at the seat's dispatch
+// point. Appending it to Global must be refused by Validate with
+// ErrChordConflict — that refusal is the checker's test, on the host and
+// (seeded by /host/GOTABWM.CHORDCONFLICT) in the guest.
 func FixtureRow() Row {
 	return Row{
 		Chord:  Chord{Mods: ModCtrl | ModShift, Usage: UsageP},
 		Owner:  fixtureOwner,
 		Scope:  ScopeSeat,
 		Action: "pin",
-		Label:  "deliberately conflicting fixture (M82c): a second owner of the seat's pin chord",
+		Label:  "deliberately conflicting fixture (M82c): a second owner of the seat's palette chord",
 		Since:  "#1770",
 		Frozen: false,
 	}

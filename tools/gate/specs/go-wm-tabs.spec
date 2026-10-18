@@ -37,7 +37,8 @@
 #       to` is the proof the round trip closed over the real wire. This is
 #       the first run where a HOSTED Go app drives the kinds 9/10 seam.
 #   09  M79g (#1718): LIVE mode (the GOTABWM.DEMO trigger is removed first),
-#       GOCALC+NOTE.ELF. One rail click focuses Calc, ctrl-shift-p pins it,
+#       GOCALC+NOTE.ELF. One rail click focuses Calc, ctrl-shift-n pins it
+#       (pin's chord since M121a, when ctrl-shift-p went to the palette),
 #       ctrl-shift-f freezes it, and a rail DRAG moves it to the right — each
 #       mutation writes SESSION.TABS as it happens, and the run ends at its
 #       own rx marker with the seat still up.
@@ -644,8 +645,9 @@ PY
 # ---------------------------------------------------------------------------
 # Run 04 (M71e / #1564, M48 BT6): the frozen badge, end to end.
 #
-# Two clients as in run 01. `ctrl-shift-f` is Zig's BT6 binding; GOTABWM has
-# no conflicting ctrl-shift chord other than ctrl-shift-p.
+# Two clients as in run 01. `ctrl-shift-f` is Zig's BT6 binding; GOTABWM's
+# only other ctrl-shift letter chords then were ctrl-shift-p (pin — the
+# M121a palette's chord now) and friends.
 #
 # M79g (#1718): the chords are anchored on pin-stay's own marker — NOT on a
 # client-side marker like `note: tab-aware`. The two execs are unordered
@@ -1360,7 +1362,8 @@ PY
 #
 # Boot 09 is the mutation boot. GOCALC+NOTE declare, then BY HAND:
 #   ctrl-1            focus the left cell (Calc — NOTE's declare took focus)
-#   ctrl-shift-p      pin it
+#   ctrl-shift-n      pin it (M121a: pin moved off ctrl-shift-p, which the
+#                     command palette now owns)
 #   ctrl-shift-f      freeze it
 #   rail drag 0 -> 1  move it to the right, past the unpinned tab
 # Each of those is a real mutation and each one writes SESSION.TABS as it
@@ -1399,7 +1402,7 @@ vgate_run 09 -- \
     --script '$RUN_DIR/script-09.txt' \
     --script2 '$RUN_DIR/script2-09.txt' \
     --script2-after 'gotabwm: win focus' \
-    --input-chords 'ctrl-1,ctrl-shift-p,ctrl-shift-f' \
+    --input-chords 'ctrl-1,ctrl-shift-n,ctrl-shift-f' \
     --input-chords-after 'note: tab title notes.txt' \
     --pointer-virtio '100,8,d;700,8,u' \
     --pointer-virtio-after 'gotabwm: freeze id=' \
