@@ -1,0 +1,11 @@
+#v1 mode=enforce
+NONET.ELF	*	file,memory,process,debug
+NOFILE.ELF	*	memory,process,debug,net
+GRANTED.ELF	*	file,memory,process,debug,net
+WRITER.ELF	*	file,memory,process,debug
+STALE.ELF	1111111111111111111111111111111111111111111111111111111111111111	file,memory,process,debug,net
+BADSHA.ELF	nothexdigest	file,net
+BADWORDS.ELF	*	file,narnia
+BADTO.ELF	*	file,memory,process,debug,net	to=999.999.999.999:8080
+BADFS.ELF	*	file,memory,process,debug	fs=/usb/payload:rw
+BADCNT.ELF	*	file,net	fs=/host:ro	EXTRA
