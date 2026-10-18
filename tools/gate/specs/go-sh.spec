@@ -61,7 +61,7 @@ usage: log [APP]
 EOF
 
 vgate_file open-unknown.txt <<'EOF'
-exec GOSH.ELF -c "open SONG.OGG"
+exec GOSH.ELF -c "open SAVE.ZIP"
 EOF
 
 vgate_file finish-open-unknown.txt <<'EOF'
@@ -152,8 +152,8 @@ with open(os.path.join(share, "GOOSHSHRINK.TXT"), "w") as fh:
     fh.write("PREEXISTING-LONG-BODY\n" * 40)
 with open(os.path.join(share, "README.TXT"), "w") as fh:
     fh.write("open-contract-text\n")
-with open(os.path.join(share, "SONG.OGG"), "wb") as fh:
-    fh.write(b"OggS\x00\x02")
+with open(os.path.join(share, "SAVE.ZIP"), "wb") as fh:
+    fh.write(b"PK\x03\x04\x00\x02")
 shutil.copy(os.path.join(rd, "GOSH-HISTORY.TXT"),
             os.path.join(share, "GOSH-HISTORY.TXT"))
 print("staged GOSH.ELF, GOEDIT.ELF, WEB.ELF + STARTUP.SH and history fixture")
@@ -335,11 +335,11 @@ vgate_run 04 -- \
     --screen '$RUN_DIR/screen-open-unknown' \
     --script '$RUN_DIR/open-unknown.txt' \
     --script2 '$RUN_DIR/finish-open-unknown.txt' \
-    --script2-after 'gosh: open refused target=SONG.OGG reason=no handler for audio' \
+    --script2-after 'gosh: open refused target=SAVE.ZIP reason=no handler for archive' \
     --script-expect 'rx-gosh-open-unknown-ok' --timeout 240
 
-vgate_assert 04 serial-contains 'gosh: open refused target=SONG.OGG reason=no handler for audio'
-vgate_assert 04 serial-contains 'gosh: open: SONG.OGG: no handler for audio'
+vgate_assert 04 serial-contains 'gosh: open refused target=SAVE.ZIP reason=no handler for archive'
+vgate_assert 04 serial-contains 'gosh: open: SAVE.ZIP: no handler for archive'
 vgate_assert 04 serial-contains 'rx-gosh-open-unknown-ok'
 vgate_assert 04 serial-absent 'gosh: open launched'
 vgate_assert 04 serial-absent '[EXC] parking:'
