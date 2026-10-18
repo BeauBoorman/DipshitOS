@@ -51,13 +51,17 @@ func TestBoundedControlsKeepFocusAndScrollContract(t *testing.T) {
 	if a.sel != 2 || a.list.ScrollTop != 1 {
 		t.Fatal(a.sel, a.list.ScrollTop)
 	}
-	a.focus.Focus(1)
+	a.focus.Focus(2)
 	a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyTab, Flags: vi.ModShift})
-	if _, i := a.focus.Current(); i != 0 || !a.list.Focused || a.input.Focused {
+	if _, i := a.focus.Current(); i != 1 || !a.list.Focused || a.input.Focused {
 		t.Fatal("shift-tab focus")
 	}
 	a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyTab, Flags: vi.ModShift})
-	if _, i := a.focus.Current(); i != 3 || !a.quitBtn.Focused {
+	if _, i := a.focus.Current(); i != 0 || !a.tabs.Focused {
+		t.Fatal("shift-tab to the tab strip")
+	}
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyTab, Flags: vi.ModShift})
+	if _, i := a.focus.Current(); i != 4 || !a.quitBtn.Focused {
 		t.Fatal("focus wrap")
 	}
 }

@@ -199,32 +199,9 @@ func (a *app) historyDeleteNewest() bool {
 	return ledgerRewrite(historyPath, historySchema, rows[:len(rows)-1])
 }
 
-// bookmarkToggle adds the current target, or removes it when already saved.
-func (a *app) bookmarkToggle() (bool, bool) {
-	if a.target == "" {
-		return false, false
-	}
-	rows := ledgerRows(bookmarkPath)
-	kept := rows[:0:0]
-	found := -1
-	for i, r := range rows {
-		if strings.HasSuffix(r, "\t"+a.target) {
-			found = i
-			continue
-		}
-		kept = append(kept, r)
-	}
-	if found >= 0 {
-		ledgerRewrite(bookmarkPath, bookmarkSchema, kept)
-		return true, false
-	}
-	if !ledgerFieldOK(a.target) || !ledgerFieldOK(a.title) {
-		return false, false
-	}
-	row := itoa64(vi.Time()) + "\t" + a.target + "\t" + a.title
-	ledgerAppend(bookmarkPath, bookmarkSchema, row)
-	return true, true
-}
+// bookmarkToggle moved to bookmarks.go (M126b #2594): the store is now the
+// FLINT workspace atom table, not this ledger. bookmarkPath/bookmarkSchema
+// stay — loadBookmarks folds their rows into atoms once, on upgrade.
 
 // cookieMaxRows bounds the cookie ledger (M97f F2, #2105): a store is a
 // bounded jar, not a bottomless one — new rows past the cap evict the
@@ -336,7 +313,7 @@ func downloadName(target string) string {
 func (a *app) storeSummary() string {
 	return markerStores +
 		"history=" + itoa(ledgerCount(historyPath)) +
-		" bookmarks=" + itoa(ledgerCount(bookmarkPath)) +
+		" bookmarks=" + itoa(len(a.books)) +
 		" cookies=" + itoa(ledgerCount(cookiePath)) +
 		" cache=" + itoa(ledgerCount(cacheIdxPath)) +
 		" downloads=" + itoa(ledgerCount("/host/WEB-DOWNLOADS.TXT"))

@@ -84,6 +84,11 @@ const (
 	markerCache     = "web: cache store "
 	markerOffline   = "web: offline "
 	markerBookmark  = "web: bookmark "
+	markerBmStore   = "web: bookmark-store "
+	markerBmOpen    = "web: bookmarks n="
+	markerBmRow     = "web: bookmarks "
+	markerBmPick    = "web: bookmark pick "
+	markerBmErr     = "web: bookmark error"
 	markerCleared   = "web: cleared "
 	markerDownload  = "web: download "
 	markerBudget    = "web: budget "
@@ -225,6 +230,13 @@ type app struct {
 	urlEdit          textEditor
 	histOpen         bool
 	histSel          int
+	// The bookmark store (FLINT ws/bookmarks atom table) + its sidebar.
+	books          []bookmark
+	bookStream     string
+	booksErr       string
+	booksMigrated  int
+	sideOpen       bool
+	sideSel        int
 	controls         []*formControl
 	focusControl     *formControl
 	controlEdit      textEditor
@@ -355,8 +367,12 @@ func main() {
 	vi.WmMailRequest(vi.WmRpcKindAttachTab, uint32(id), 0, 0, 0, 0, appTitle, appName)
 	vi.WmMailRequest(vi.WmRpcKindDeclareFullscreen, uint32(id), 0, 0, 0, 0, appTitle, appName)
 	// The store inventory is read from disk at boot: it is how the gate sees
-	// that a previous run's rows persisted.
+	// that a previous run's rows persisted. The bookmark atoms load first so
+	// the count in this line is the on-disk truth, not a later cache.
+	a.loadBookmarks()
 	vi.ConsoleLine(a.storeSummary())
+	vi.ConsoleLine(markerBmStore + "ws=" + bookWSName + " atoms=" + itoa(len(a.books)) +
+		" migrated=" + itoa(a.booksMigrated) + " error=" + bmErrText(a.booksErr))
 
 	if target == "" {
 		a.showStartSurface()
@@ -553,7 +569,8 @@ func (a *app) showStartSurface() {
 	a.pageEnd = a.tNav0 + readDeadlineMs*1_000_000
 	body := []byte("<h1>VirelaiOS Browser</h1><p>No target. Pass a path or an HTTP URL on the command line:</p>" +
 		"<pre>exec WEB.ELF /host/PAGE.HTML\nexec WEB.ELF http://10.0.0.2/</pre>" +
-		"<p>Ctrl+L edits the URL. Enter loads it. Escape cancels. H or the v chip lists history. F1 shows bounded diagnostics.</p>" +
+		"<p>Ctrl+L edits the URL. Enter loads it. Escape cancels. H or the v chip lists history. " +
+		"Ctrl+D bookmarks the page. Ctrl+Shift+B opens the bookmark sidebar. F1 shows bounded diagnostics.</p>" +
 		"<p>This browser supports a declared CSS subset and GET forms. No JavaScript or POST.</p>")
 	a.target = ""
 	a.title = "Start"
@@ -1043,20 +1060,28 @@ func (a *app) key(usage uint32, flags uint16) {
 	case keyEscape, keyX:
 		a.cancelLoad()
 	case keyB:
-		if ok, added := a.bookmarkToggle(); ok {
-			if added {
-				vi.ConsoleLine(markerBookmark + "added")
-			} else {
-				vi.ConsoleLine(markerBookmark + "removed")
-			}
-			a.status = "bookmark"
-			a.dirty = true
+		if ctrl {
+			// The card's chord is Ctrl+Shift+B; bare Ctrl+B is Firefox's
+			// sidebar key — one toggle either way. NOTE: under shim
+			// compositing the kernel also lowers the focused window on
+			// Ctrl+Shift+B (input.zig, Arc4 #238, kept with no WM
+			// coverage): the sidebar still toggles, the window just sinks
+			// — so Ctrl+B is the path that stays visible seatless.
+			a.toggleSidebar()
+			return
 		}
+		a.bookmarkToggleUI()
 	case keyC:
 		vi.ConsoleLine(markerCleared + "cookies " + itoa(a.clearCookies()))
 		a.status = "cookies cleared"
 		a.dirty = true
 	case keyD:
+		if ctrl {
+			// Ctrl+D — the card's "bookmark this page" chord. Bare D keeps
+			// the legacy history-entry delete below.
+			a.bookmarkToggleUI()
+			return
+		}
 		vi.ConsoleLine(markerCleared + "history-entry " + boolStr(a.historyDeleteNewest()))
 		a.status = "history entry deleted"
 		a.dirty = true
@@ -1143,6 +1168,24 @@ func (a *app) click(x, y int) {
 			return
 		}
 	}
+	if a.sideOpen && inRect(x, y, 0, histMenuY, sideW, h-statusH-histMenuY) {
+		if a.sideCloseHit(x, y) {
+			a.sideOpen, a.dirty = false, true
+			return
+		}
+		if i, del, ok := a.sideHit(x, y); ok {
+			if del {
+				a.delBookmark(i)
+			} else {
+				a.pickBookmark(i)
+			}
+			return
+		}
+		// Any other click inside the docked panel is consumed — it must
+		// not fall through to a page link hiding under the plate.
+		a.dirty = true
+		return
+	}
 	if fieldHit {
 		a.focusURL()
 		return
@@ -1175,6 +1218,16 @@ func (a *app) move(x, y int) {
 			a.dirty = true
 		}
 		return
+	}
+	if a.sideOpen {
+		_, h := a.canvasSize()
+		if inRect(x, y, 0, histMenuY, sideW, h-statusH-histMenuY) {
+			if i, _, ok := a.sideHit(x, y); ok && i != a.sideSel {
+				a.sideSel = i
+				a.dirty = true
+			}
+			return
+		}
 	}
 	if a.lay == nil {
 		if a.hover != "" {
@@ -1338,6 +1391,9 @@ func (a *app) render() {
 		}
 	}
 	a.sampleFrame(vs, present)
+	if a.sideOpen {
+		a.paintSidebar(vs, clip, width, height)
+	}
 	if a.histOpen {
 		a.paintHistoryMenu(vs, clip, width)
 	}
@@ -1404,7 +1460,7 @@ func (a *app) paintErrorPage(vs virender) {
 	y += 18
 	webrender.DrawText(vs, 12, y, "kind: "+a.errKind, 1, false, webrender.ColorMuted, clip)
 	y += 24
-	webrender.DrawText(vs, 12, y, "Ctrl+L URL  R reload  < back  > forward  H history  Esc stop  Q quit", 1, false, webrender.ColorMuted, clip)
+	webrender.DrawText(vs, 12, y, "Ctrl+L URL  R reload  < back  > forward  H history  ^D mark  ^+B marks  Esc stop  Q quit", 1, false, webrender.ColorMuted, clip)
 }
 
 func (a *app) describeTarget() string {

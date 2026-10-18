@@ -335,25 +335,9 @@ func (v *grantsView) Decline(name string) {
 }
 
 // --- panel wiring ------------------------------------------------------------
-
-func (a *panel) openGrants() {
-	a.showChords, a.showServices, a.showGrants = false, false, true
-	a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
-	a.grants.Refresh()
-	a.grantStatus()
-	consoleLine("goset: grants n=" + vi.Itoa64(int64(len(a.grants.entries))))
-	for _, e := range a.grants.entries {
-		granted := "-"
-		if e.ReadErr != 0 {
-			granted = "?"
-		} else if e.Row != nil {
-			granted = e.Row.Words
-		}
-		consoleLine("goset: grant row name=" + e.Name +
-			" declared=" + vi.GrantWordsCanonical(e.Declared) +
-			" granted=" + granted + " state=" + e.state())
-	}
-}
+//
+// M122e (#2574): the open moved into panel.showTab — the tab-strip cell,
+// the typed `grants` line and Esc's pop all land the same switch.
 
 func (a *panel) grantStatus() {
 	if a.grants.stateErr != nil {
@@ -365,7 +349,7 @@ func (a *panel) grantStatus() {
 		a.status = "grant table unreadable (" + grantErr(a.grants.readErr) + ") — declared shown, consent needs the admin slot"
 		return
 	}
-	a.status = "grant|refuse <BIN> + Enter; settings returns"
+	a.status = "grant|refuse <BIN> + Enter, or click a row to grant; Esc returns"
 }
 
 // grantInput consumes the grants pane's typed line: `grant <BIN>`,
@@ -375,9 +359,7 @@ func (a *panel) grantInput() {
 	line := strings.TrimSpace(a.input.Value())
 	a.input.Clear()
 	if line == "settings" {
-		a.showGrants = false
-		a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
-		a.status = "key=value + Enter; services opens Services"
+		a.showTab(tabSettings)
 		return
 	}
 	verb, arg, found := strings.Cut(line, " ")

@@ -31,6 +31,11 @@ public enum HostMenuBar {
         let app = menu("VirelaiOS")
         app.addItem(action("About VirelaiOS", .about))
         app.addItem(.separator())
+        // M128a (#2605): ⌘, — the machine settings panel. The verb
+        // receipts `disabled` until a profile is armed, so the item
+        // greys on a flag-run (the bus's enablement is the menu's).
+        app.addItem(action("Machine Settings…", .settings, key: ","))
+        app.addItem(.separator())
         app.addItem(action("Quit VirelaiOS", .quit, key: "q"))
 
         let machine = menu("Machine")

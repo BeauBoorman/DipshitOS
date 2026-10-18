@@ -10,6 +10,10 @@
 # ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
 # 39 (M126a #2593): the address-bar/nav leg — a typed URL loads, the chips
 # drive back/forward/reload, and the history dropdown lists + revisits entries.
+# 40-41 (M126b #2594): the bookmark leg — Ctrl+D stores two pages as FLINT
+# ws/bookmarks atoms on the armed share, Ctrl+Shift+B's sidebar lists and
+# picks one, and boot 41 (a fresh VM on the SAME share) loads the surviving
+# atom off disk and navigates to it.
 # v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
 # responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
 # grammar or TLS-over-v6 responder exists yet. No public-internet access,
@@ -1827,3 +1831,154 @@ vgate_assert v6 serial-contains 'web6: done'
 vgate_assert v6 serial-absent 'web6: FAIL'
 vgate_assert v6 serial-absent '[EXC] parking:'
 vgate_assert v6 output-contains 'NET-TCP6: answered'
+
+# --- boots 40-41 (M126b #2594): the bookmark leg --------------------------
+# Boot 40 adds two pages (Ctrl+D), opens the sidebar (Ctrl+Shift+B), picks
+# row 0, and deletes it — all over the chord channel, all file-channel
+# loads. The store is the FLINT workspace shape on the armed share:
+# streams/<uuid>.json + ws/bookmarks/{WORKSPACE.json,ATOMS.jsonl}, which the
+# share-* asserts and a python glob read back after the run.
+# Boot 41 is the SAME armed share on a fresh VM: the boot-time store
+# inventory must report one surviving atom (the deleted row must stay
+# deleted), the sidebar lists it, and Enter navigates there.
+# Boot 40 opens the panel with bare Ctrl+B — Firefox's sidebar key, the
+# same toggle as the card's Ctrl+Shift+B — so the scanout snapshot sees a
+# raised window. Under shim compositing the kernel ALSO lowers the focused
+# window on Ctrl+Shift+B (input.zig, Arc4 #238, kept with no WM coverage —
+# OBSERVED: 'dui: lower-back id=2' precedes the app's own markers and the
+# panel hides behind the terminal), so the mandated chord is exercised
+# LAST, after the visible pick/remove — its marker evidence is binding.
+vgate_run 40 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-40' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-d,ctrl-l,/,h,o,s,t,/,N,E,X,T,.,H,T,M,L,return,ctrl-d,ctrl-b,return,delete,escape,ctrl-shift-b' --input-chords-after 'web: ready' \
+    --snapshot-after 'web: bookmarks n=2' \
+    --script-expect 'web: bookmarks n=1' --timeout 240
+
+vgate_assert 40 serial-absent 'web: budget over'
+vgate_assert 40 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 40 serial-contains 'web: bookmark-store ws=bookmarks atoms=0 migrated=0 error=-'
+vgate_assert 40 serial-count 'web: bookmark added' 2
+vgate_assert 40 serial-contains 'web: nav /host/NEXT.HTML'
+vgate_assert 40 serial-contains 'web: bookmarks n=2'
+vgate_assert 40 serial-contains 'web: bookmarks 0 /host/PAGE.HTML'
+vgate_assert 40 serial-contains 'web: bookmarks 1 /host/NEXT.HTML'
+vgate_assert 40 serial-contains 'web: bookmark pick /host/PAGE.HTML'
+vgate_assert 40 serial-contains 'web: nav /host/PAGE.HTML'
+vgate_assert 40 serial-contains 'web: bookmark removed'
+vgate_assert 40 serial-contains 'web: bookmarks n=1'
+vgate_assert 40 serial-contains 'web: bookmarks 0 /host/NEXT.HTML'
+vgate_assert 40 serial-absent 'web: bookmark error'
+vgate_assert 40 serial-absent 'web: error'
+vgate_assert 40 serial-absent '[EXC] parking:'
+vgate_assert 40 share-contains 'FLINT/ws/bookmarks/ATOMS.jsonl' '/host/NEXT.HTML'
+vgate_assert 40 share-contains 'FLINT/ws/bookmarks/WORKSPACE.json' '"name":"bookmarks"'
+vgate_assert 40 python <<'PY'
+import glob, json, os
+share = os.environ["VG_SHARE"]
+recs = glob.glob(os.path.join(share, "FLINT", "streams", "*.json"))
+assert recs, "no stream record under FLINT/streams"
+names = [json.loads(open(r).read()).get("name") for r in recs]
+assert "web-bookmarks" in names, "stream names %r" % names
+body = open(os.path.join(share, "FLINT", "ws", "bookmarks", "ATOMS.jsonl")).read()
+assert body.endswith("\n"), "torn atom append"
+rows = [json.loads(l) for l in body.split("\n") if l]
+assert len(rows) == 1, "expected the surviving atom only, got %d" % len(rows)
+at = rows[0]
+assert at["kind"] == "bookmark" and at["metadata"]["url"] == "/host/NEXT.HTML", at
+assert at["name"] and at["hash"] and at["sig_hash"] and at["id"], at
+print("live-web 40 store shape ok (stream record + one bookmark atom)")
+PY
+vgate_assert 40 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "web: bookmark added",
+    "web: nav /host/NEXT.HTML",
+    "web: bookmark added",
+    "web: bookmarks n=2",
+    "web: bookmark pick /host/PAGE.HTML",
+    "web: nav /host/PAGE.HTML",
+    "web: bookmark removed",
+    "web: bookmarks n=1",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 40 bookmark ordering ok (add, nav, add, open, pick, nav, remove, ctrl-shift-b open)")
+PY
+vgate_assert 40 snapshot 'snap-40-*.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+WX, WY = 40, 28  # WEB.ELF's raw-shim window origin
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the panel plate
+RULE = (0x2e, 0x3a, 0x44)     # theme.Dark.Rule: divider + selected row
+ACCENT = (0x3b, 0x82, 0xf6)   # theme.Dark.Accent: the current-page bar
+# The docked panel covers window x in [0,172), y in [48,368) -> scanout
+# [40,212) x [76,396). Row 0 (the selected row) sits at window y 66..82.
+plate = ink = selrow = 0
+for yy in range(76, 396):
+    for xx in range(41, 211):
+        c = px(xx, yy)
+        if near(c, SURFACE):
+            plate += 1
+        if min(c) > 150:
+            ink += 1
+for xx in range(41, 210):
+    if near(px(xx, 76 + 18 + 8), RULE):
+        selrow += 1
+divider = sum(1 for yy in range(80, 390) if near(px(40 + 171, yy), RULE))
+assert plate > 20000, "sidebar plate pixels %d" % plate
+assert ink > 40, "sidebar rows have no text ink: %d" % ink
+assert selrow > 80, "selected row fill pixels %d" % selrow
+assert divider > 200, "panel divider pixels %d" % divider
+print("live-web 40 sidebar pixels ok (plate=%d ink=%d selrow=%d divider=%d)" %
+      (plate, ink, selrow, divider))
+PY
+
+vgate_run 41 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-41' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-shift-b,return' --input-chords-after 'web: ready' \
+    --script-expect 'web: nav-ready n=1' --timeout 180
+
+vgate_assert 41 serial-absent 'web: budget over'
+vgate_assert 41 serial-contains ' bookmarks=1 '
+vgate_assert 41 serial-contains 'web: bookmark-store ws=bookmarks atoms=1 migrated=0 error=-'
+vgate_assert 41 serial-contains 'web: bookmarks n=1'
+vgate_assert 41 serial-contains 'web: bookmarks 0 /host/NEXT.HTML'
+vgate_assert 41 serial-contains 'web: bookmark pick /host/NEXT.HTML'
+vgate_assert 41 serial-contains 'web: nav /host/NEXT.HTML'
+vgate_assert 41 serial-contains 'web: nav-ready n=1'
+vgate_assert 41 serial-absent 'web: bookmark error'
+vgate_assert 41 serial-absent 'web: error'
+vgate_assert 41 serial-absent '[EXC] parking:'
+vgate_assert 41 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    " bookmarks=1 ",
+    "web: bookmark-store ws=bookmarks atoms=1",
+    "web: bookmarks n=1",
+    "web: bookmarks 0 /host/NEXT.HTML",
+    "web: bookmark pick /host/NEXT.HTML",
+    "web: nav /host/NEXT.HTML",
+    "web: nav-ready n=1",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 41 restart ordering ok (boot inventory, list, pick, nav)")
+PY

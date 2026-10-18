@@ -164,7 +164,7 @@ func TestPanelAppliesATypedRowOnlyForKnownKeys(t *testing.T) {
 // left alone rather than guessed at.
 func TestPanelKeyboardUsesBoundedTextField(t *testing.T) {
 	a := newPanel(nil)
-	a.focus.Focus(1)
+	a.focus.Focus(2)
 	for _, r := range []rune{'w', 'm', '=', 't'} {
 		if !a.handle(vi.Event{Kind: vi.EvKeyDown, Arg1: uint32(r)}) {
 			t.Fatalf("key %c was not accepted", r)
