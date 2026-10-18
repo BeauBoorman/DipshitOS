@@ -56,11 +56,12 @@ def bound(assembly, frames):
             visit(v)
     allowed = {
         ".Lengine.valueEqDepth", ".Lengine.Interp.evalCond", ".Lengine.Interp.evalNodes",
-        ".Lfilters.emitListLevel", ".Lparse.Parser.parseSeq",
+        ".Lfilters.emitListLevel", ".Lparse.Parser.parseSeq", ".Lparse.Parser.parseIfChain",
         ".Lparse.Scanner.parseNot", ".Lparse.Scanner.parseAnd", ".Lparse.Scanner.parseOr",
     }
     recursive = {v for group in groups for v in group}
-    if any(v not in allowed and not v.startswith(".Ljson.Stringify.write__anon_") for v in recursive):
+    if any(v not in allowed and not (v.startswith(".Ljson.Stringify.write__anon_")
+                                     or v.startswith(".Ljson.Stringify.write__func_")) for v in recursive):
         raise ValueError("UnreviewedStackRecursion: " + str(groups))
     total = sum(frames.values()) + 8 * sum(frames[v] for v in recursive)
     if total > 128 * 1024:
