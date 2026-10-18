@@ -1,8 +1,5 @@
 package vsys
 
-// virPathStaging is the uaccess-registered path buffer (see Open).
-var virPathStaging [MaxPathLen]byte
-
 // MaxFileIOBytes is the kernel's per-call file transfer bound
 // (kernel/src/file_table.zig, mirrored by user/go/vi).
 const MaxFileIOBytes = 2048
@@ -47,15 +44,22 @@ func Open(path string, flags uint32) (*File, error) {
 	if err := ValidatePath(path); err != nil {
 		return nil, err
 	}
-	// The path is staged in a package-level buffer inside the image's RW
-	// data segment: the kernel's copy_in validates the SOURCE against the
-	// caller's registered uaccess regions, and a freshly allocated slice
-	// lives in the sbrk heap (unregistered), so passing heap memory here
-	// fails. Same reason the runtime's write1 stages into virWriteStaging.
+	// The path is staged in a per-call stack buffer: the kernel's copy_in
+	// validates the SOURCE against the caller's registered uaccess
+	// regions, and the user stack is one (kernel/src/uaccess.zig — read
+	// regions are user text, user stack, and the dynamic segments), while
+	// a freshly allocated slice lives in the sbrk heap (unregistered), so
+	// passing heap memory here fails. A stack local is ALSO the fix for
+	// issue #2519: the old package-global virPathStaging let two Ms
+	// interleave the stage-copy and the svc — the same splice #2518 fixed
+	// in the cmd/compile overlay (cmd/compile's noder opens every source
+	// file on its own goroutine), where a spliced path opened the wrong
+	// file or ENOENT'd a name the share held.
 	// (No second length check: ValidatePath above already enforces
 	// MaxPathLen.)
-	copy(virPathStaging[:], path)
-	r, err := syscallResult(syscallFn(SlotFileOpen, strPtr(virPathStaging[:len(path)]), uintptr(len(path)), uintptr(flags), 0))
+	var staging [MaxPathLen]byte
+	copy(staging[:], path)
+	r, err := syscallResult(syscallFn(SlotFileOpen, strPtr(staging[:len(path)]), uintptr(len(path)), uintptr(flags), 0))
 	if err != nil {
 		return nil, err
 	}
