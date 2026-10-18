@@ -8,27 +8,35 @@
 # ELF and either rebuilds (ensure) or refuses (check).
 #
 # Usage:
-#   bash tools/go/ensure-guest-elf.sh check     GOSH|GOSSHD|GOSSH
-#   bash tools/go/ensure-guest-elf.sh ensure    GOSH|GOSSHD|GOSSH
-#   bash tools/go/ensure-guest-elf.sh stamp     GOSH|GOSSHD|GOSSH [elf-path]
+#   bash tools/go/ensure-guest-elf.sh check     <APP>
+#   bash tools/go/ensure-guest-elf.sh ensure    <APP>
+#   bash tools/go/ensure-guest-elf.sh stamp     <APP> [elf-path]
+#   bash tools/go/ensure-guest-elf.sh plan      <APP>...
+#   bash tools/go/ensure-guest-elf.sh builder   <APP>
 #   bash tools/go/ensure-guest-elf.sh needed-by <spec>
-#   bash tools/go/ensure-guest-elf.sh hash      GOSH|GOSSHD|GOSSH
+#   bash tools/go/ensure-guest-elf.sh hash      <APP>
+#
+# <APP> is an upper-case ELF base name (GOSH, GOSSHD, GOSSH, GOTABWM, ...).
+# The builder resolves to tools/go/build-<lower>.sh with the historical
+# exceptions GOSSHD->sshd, GOSSH->ssh, GOFILES->files, GOHELP->help.
 #
 # check:   fail closed with a named ensure-guest-elf error if missing/stale
 #          (no rebuild — that is what vgate.sh calls before zig build / boot).
-# ensure:  rebuild via tools/go/build-gosh.sh or build-sshd.sh when the
-#          stamp does not match, then stamp. Hash-cached: a matching stamp
-#          is a no-op. fleet.sh calls this once per invocation.
+# ensure:  rebuild via the app's tools/go/build-*.sh when the stamp does
+#          not match, then stamp. Hash-cached: a matching stamp is a no-op.
+#          fleet.sh calls this once per invocation.
 # stamp:   write the stamp for an ELF that was just built (build-*.sh).
+# plan:    one "APP status builder-path" line per app — the bulk query
+#          session.sh uses so a warm `just session` costs ONE hash pass,
+#          not one process spawn per app. status is fresh|stale|missing,
+#          or nobuilder when no builder script (or override) exists.
+# builder: print the resolved builder path (convention, no existence check).
 #
 # Environment:
 #   ENSURE_GUEST_ELF_ROOT         repo root (default: discovered)
 #   ENSURE_GUEST_ELF_OUTDIR       ELF directory (default: $ROOT/.build/go)
 #   ENSURE_GUEST_ELF_TOOLCHAIN    override the toolchain id mixed into the hash
-#   ENSURE_GUEST_ELF_BUILD_GOSH   override the GOSH builder (tests)
-#   ENSURE_GUEST_ELF_BUILD_GOSSHD override the GOSSHD builder (tests)
-#   ENSURE_GUEST_ELF_BUILD_GOSSH  override the GOSSH builder (tests)
-#   ENSURE_GUEST_ELF_BUILD_GOUPD  override the GOUPD builder (tests)
+#   ENSURE_GUEST_ELF_BUILD_<APP>  override the app's builder (tests)
 #
 set -euo pipefail
 
@@ -37,7 +45,7 @@ ROOT="${ENSURE_GUEST_ELF_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 OUTDIR="${ENSURE_GUEST_ELF_OUTDIR:-$ROOT/.build/go}"
 
 usage() {
-    sed -n 's/^#   bash tools\/go\/ensure-guest-elf.sh //p' "$0" | head -5 >&2
+    sed -n 's/^#   bash tools\/go\/ensure-guest-elf.sh //p' "$0" | head -7 >&2
     echo "ensure-guest-elf: usage: $1" >&2
     exit 2
 }
@@ -50,12 +58,16 @@ ROOT, OUTDIR = sys.argv[1], sys.argv[2]
 cmd = sys.argv[3]
 args = sys.argv[4:]
 
-APPS = {
-    "GOSH": "tools/go/build-gosh.sh",
-    "GOSSHD": "tools/go/build-sshd.sh",
-    "GOSSH": "tools/go/build-ssh.sh",
-    "GOUPD": "tools/go/build-goupd.sh",
+# The tools/go/build-<name>.sh convention. The historical exceptions are
+# named explicitly; everything else is the lower-cased app name.
+SPECIAL_BUILDERS = {
+    "GOSSHD": "sshd",
+    "GOSSH": "ssh",
+    "GOFILES": "files",
+    "GOHELP": "help",
 }
+
+APP_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
 
 def die(msg, rc=1):
@@ -75,15 +87,32 @@ def stamp_path(app):
     return os.path.join(OUTDIR, elf_name(app) + ".stamp")
 
 
+def norm_app(app):
+    # Callers speak either form: the manifest/ELF name (GOTABWM.ELF) or the
+    # base name (GOTABWM). Everything below uses the base.
+    return app[:-4] if app.endswith(".ELF") else app
+
+
 def builder_rel(app):
-    if app not in APPS:
-        die("ensure-guest-elf: unknown app %s (want GOSH, GOSSHD, GOSSH, or GOUPD)" % app, 2)
-    return APPS[app]
+    app = norm_app(app)
+    if not app or any(c not in APP_CHARS for c in app):
+        die("ensure-guest-elf: bad app name %r (want an upper-case ELF "
+            "base name, e.g. GOSH)" % app, 2)
+    return "tools/go/build-%s.sh" % SPECIAL_BUILDERS.get(app, app.lower())
+
+
+_TOOLCHAIN = {"done": False, "id": ""}
 
 
 def toolchain_id():
+    # One `go version` probe per helper invocation: `plan` hashes every
+    # session app in a single pass and must not spawn the fork 19 times.
+    if _TOOLCHAIN["done"]:
+        return _TOOLCHAIN["id"]
+    _TOOLCHAIN["done"] = True
     env = os.environ.get("ENSURE_GUEST_ELF_TOOLCHAIN")
     if env is not None:
+        _TOOLCHAIN["id"] = env
         return env
     fork = os.environ.get("GO_FORK_DIR") or os.path.join(os.path.dirname(ROOT), "go-virelai")
     go = os.path.join(fork, "bin", "go")
@@ -91,10 +120,10 @@ def toolchain_id():
         import subprocess
         try:
             out = subprocess.check_output([go, "version"], stderr=subprocess.DEVNULL, timeout=8)
-            return out.decode("utf-8", "replace").strip()
+            _TOOLCHAIN["id"] = out.decode("utf-8", "replace").strip()
         except (subprocess.SubprocessError, OSError):
-            return ""
-    return ""
+            pass
+    return _TOOLCHAIN["id"]
 
 
 def iter_source_rels(app):
@@ -125,12 +154,20 @@ def iter_source_rels(app):
     return ordered
 
 
+_DIGESTS = {}
+
+
 def file_digest(path):
+    # Every app's source set is the same user/go walk plus its builder, so
+    # a multi-app `plan` re-reads the same files without this cache.
+    if path in _DIGESTS:
+        return _DIGESTS[path]
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
-    return h.hexdigest()
+    _DIGESTS[path] = h.hexdigest()
+    return _DIGESTS[path]
 
 
 def source_hash(app):
@@ -237,7 +274,7 @@ def spec_needs(text, app):
 
 
 if cmd == "hash":
-    app = args[0] if args else ""
+    app = norm_app(args[0]) if args else ""
     builder_rel(app)
     sys.stdout.write(source_hash(app) + "\n")
     sys.exit(0)
@@ -255,8 +292,24 @@ if cmd == "needed-by":
             sys.stdout.write(app + "\n")
     sys.exit(0)
 
+if cmd == "builder":
+    app = norm_app(args[0]) if args else ""
+    sys.stdout.write(builder_rel(app) + "\n")
+    sys.exit(0)
+
+if cmd == "plan":
+    if not args:
+        die("ensure-guest-elf: plan <APP>...", 2)
+    for app in (norm_app(a) for a in args):
+        rel = builder_rel(app)
+        has_builder = os.path.isfile(os.path.join(ROOT, rel)) or \
+            bool(os.environ.get("ENSURE_GUEST_ELF_BUILD_" + app))
+        status = inspect(app)["status"] if has_builder else "nobuilder"
+        sys.stdout.write("%s %s %s\n" % (app, status, rel))
+    sys.exit(0)
+
 if cmd in ("inspect", "check", "stamp"):
-    app = args[0] if args else ""
+    app = norm_app(args[0]) if args else ""
     builder_rel(app)
     if cmd == "stamp":
         write_stamp(app, args[1] if len(args) > 1 else None)
@@ -281,48 +334,27 @@ PY
 }
 
 require_app() {
-    case "${1:-}" in
-        GOSH|GOSSHD|GOSSH|GOUPD) ;;
-        *) usage "check|ensure|stamp GOSH|GOSSHD|GOSSH|GOUPD" ;;
+    # The .ELF suffix is accepted and stripped — callers speak either form.
+    case "${1%.ELF}" in
+        ""|*[!A-Z0-9_]*|*.*) usage "check|ensure|stamp|builder <APP> — an upper-case ELF base name (GOSH, GOSSHD, GOTABWM, ...)" ;;
     esac
 }
 
 run_builder() {
-    local app="$1"
-    case "$app" in
-        GOSH)
-            if [ -n "${ENSURE_GUEST_ELF_BUILD_GOSH:-}" ]; then
-                bash -c "$ENSURE_GUEST_ELF_BUILD_GOSH"
-            else
-                bash "$ROOT/tools/go/build-gosh.sh"
-            fi
-            ;;
-        GOSSHD)
-            if [ -n "${ENSURE_GUEST_ELF_BUILD_GOSSHD:-}" ]; then
-                bash -c "$ENSURE_GUEST_ELF_BUILD_GOSSHD"
-            else
-                bash "$ROOT/tools/go/build-sshd.sh"
-            fi
-            ;;
-        GOSSH)
-            if [ -n "${ENSURE_GUEST_ELF_BUILD_GOSSH:-}" ]; then
-                bash -c "$ENSURE_GUEST_ELF_BUILD_GOSSH"
-            else
-                bash "$ROOT/tools/go/build-ssh.sh"
-            fi
-            ;;
-        GOUPD)
-            if [ -n "${ENSURE_GUEST_ELF_BUILD_GOUPD:-}" ]; then
-                bash -c "$ENSURE_GUEST_ELF_BUILD_GOUPD"
-            else
-                bash "$ROOT/tools/go/build-goupd.sh"
-            fi
-            ;;
-        *) usage "ensure GOSH|GOSSHD|GOSSH|GOUPD" ;;
-    esac
+    local app="$1" var="ENSURE_GUEST_ELF_BUILD_$1" script
+    if [ -n "${!var:-}" ]; then
+        bash -c "${!var}"
+        return
+    fi
+    script="$(python_helper builder "$app")"
+    if [ ! -f "$ROOT/$script" ]; then
+        echo "ensure-guest-elf: no builder for $app — $script is missing" >&2
+        return 1
+    fi
+    bash "$ROOT/$script"
 }
 
-[ $# -ge 1 ] || usage "check|ensure|stamp|needed-by|hash ..."
+[ $# -ge 1 ] || usage "check|ensure|stamp|plan|builder|needed-by|hash ..."
 cmd="$1"; shift
 
 case "$cmd" in
@@ -342,6 +374,14 @@ case "$cmd" in
         require_app "${1:-}"
         python_helper stamp "$1" "${2:-}"
         ;;
+    plan)
+        [ $# -ge 1 ] || usage "plan <APP>..."
+        python_helper plan "$@"
+        ;;
+    builder)
+        require_app "${1:-}"
+        python_helper builder "$1"
+        ;;
     ensure)
         require_app "${1:-}"
         # Fresh: check prints the cache-hit line and we are done. Stale or
@@ -356,5 +396,5 @@ case "$cmd" in
         python_helper stamp "$1"
         python_helper check "$1"
         ;;
-    *) usage "check|ensure|stamp GOSH|GOSSHD|GOSSH|GOUPD | needed-by <spec> | hash GOSH|GOSSHD|GOSSH|GOUPD" ;;
+    *) usage "check|ensure|stamp|builder <APP> | plan <APP>... | needed-by <spec> | hash <APP>" ;;
 esac

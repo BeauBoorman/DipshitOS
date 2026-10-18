@@ -9,7 +9,14 @@
 #
 #   1. build the guest + image + the SPIKE runner (the host file channel
 #      `--cvc-file` implies the custom-virtio device shape, which only the
-#      SPIKE build declares);
+#      SPIKE build declares) and the GO apps -- M122a (issue #2570): the
+#      app loop is INCREMENTAL, driven by tools/go/ensure-guest-elf.sh's
+#      source+ELF hash stamps, so a warm `just session` rebuilds only what
+#      changed instead of re-running ~19 unconditional builders. A
+#      toolchain doctor runs before any build and names the one command
+#      that fixes a missing piece (zig, swift, the GOOS=virelai fork)
+#      rather than letting it die deep in a build log or silently booting
+#      the Zig-seat fallback;
 #   2. seed a PERSISTENT host share (apps, APPS.TXT, wallpaper, fonts, and
 #      the Go seat) -- M34/HF6 removed the apps from the disk image, so
 #      without this the shell has nothing to `exec`;
@@ -63,6 +70,9 @@
 #                    a ctl suspend); implies --save-capable
 #   --provision-only mint + seed + provision, then exit before packaging
 #                    or launching (the class-B gate drives its own boots)
+#   --dry-run        report what a run would do — the toolchain doctor plus
+#                    each Go app's fresh/stale/missing/nobuilder plan row —
+#                    then exit before any build, staging, or boot
 #
 # M120a (issue #2558): the session always boots with --vsock --vsock-ctl
 # and always carries the vsock-ctl credential, so the PWR menu's Suspend
@@ -76,7 +86,11 @@
 #   VIRELAI_SESSION_NO_TABWM=1       no seat autostart: the floating-window WM
 #   VIRELAI_SESSION_NO_GOTABWM=1     do not build/stage the Go seat and shell
 #                                    (the rc then falls back to `tabwm start`)
-#   VIRELAI_SESSION_SKIP_BUILD=1     skip the build step (reuse the last build)
+#   VIRELAI_SESSION_SKIP_BUILD=1     skip EVERY build step — zig, swift, and
+#                                    the Go app builders — reusing the last
+#                                    .build/go output (staged files, the
+#                                    runner, and artifacts/disk.img must
+#                                    already exist)
 #
 # Controls: close the VM window, choose Quit VirelaiOS (Cmd-Q), or press
 # Ctrl-C in this terminal to stop the VM. Rerun the command to relaunch.
@@ -94,6 +108,7 @@ NET_NAT=1
 SAVE_CAPABLE=0
 RESUME=0
 PROVISION_ONLY=0
+DRY_RUN=0
 for arg in "$@"; do
     case "$arg" in
         --no-host-int)    HOST_INT=0 ;;
@@ -102,7 +117,8 @@ for arg in "$@"; do
         --save-capable)   SAVE_CAPABLE=1 ;;
         --resume)         RESUME=1; SAVE_CAPABLE=1 ;;
         --provision-only) PROVISION_ONLY=1 ;;
-        *) echo "session: unknown argument '$arg' (supported: --no-host-int --no-sound --no-net-nat --save-capable --resume --provision-only)" >&2; exit 2 ;;
+        --dry-run)        DRY_RUN=1 ;;
+        *) echo "session: unknown argument '$arg' (supported: --no-host-int --no-sound --no-net-nat --save-capable --resume --provision-only --dry-run)" >&2; exit 2 ;;
     esac
 done
 
@@ -110,9 +126,154 @@ PROFILE="${VIRELAI_SESSION_PROFILE:-$ROOT/artifacts/session.virelaivm}"
 SHARE="${VIRELAI_SESSION_SHARE:-$PROFILE/share}"
 SERIAL_LOG="$ROOT/artifacts/session-serial.log"
 RUNNER="host/vm-runner/.build/release/VMRunner"
+ENSURE="$ROOT/tools/go/ensure-guest-elf.sh"
+SKIP_BUILD=0
+if [ "${VIRELAI_SESSION_SKIP_BUILD:-0}" = "1" ]; then SKIP_BUILD=1; fi
+
+# --- 0. the Go app rebuild plan + toolchain doctor (M122a #2570) -------------
+# NAME is the existing manifest executable field, not a new schema. The seat
+# and first-boot shell are the only non-catalog prerequisites; the M120a
+# persistence tools (GOUPD/AGENTD — the credentials below bind to them) are
+# not manifest apps and stage even under VIRELAI_SESSION_NO_GOTABWM=1, which
+# disables the SEAT, not the machine's own wiring.
+session_go_apps() {
+    python3 - "$ROOT/image/apps.txt" "${VIRELAI_SESSION_NO_GOTABWM:-0}" <<'PY'
+import pathlib, sys
+names = []
+if sys.argv[2] != "1":
+    names = ["GOTABWM.ELF", "GOSH.ELF"]
+    for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "|" not in line:
+            continue
+        name = line.split("|", 1)[0].strip()
+        if name.endswith(".ELF") and name not in names:
+            names.append(name)
+for tool in ("GOUPD.ELF", "AGENTD.ELF"):
+    if tool not in names:
+        names.append(tool)
+print("\n".join(names))
+PY
+}
+
+go_app_builder() {  # NAME.ELF -> tools/go/build-*.sh (session-side mirror of ensure's builder_rel)
+    case "$1" in
+        GOFILES.ELF) echo "tools/go/build-files.sh" ;;
+        GOHELP.ELF)  echo "tools/go/build-help.sh" ;;
+        *) echo "tools/go/build-$(printf '%s\n' "${1%.ELF}" | tr '[:upper:]' '[:lower:]').sh" ;;
+    esac
+}
+
+GO_APPS="$(session_go_apps)"
+# One ensure-guest-elf pass: "APP fresh|stale|missing|nobuilder builder" per
+# line. A missing ensure-guest-elf degenerates to build-everything, the
+# pre-M122a behaviour.
+if [ -f "$ENSURE" ]; then
+    APP_PLAN="$(bash "$ENSURE" plan $GO_APPS)"
+else
+    APP_PLAN=""
+    echo "session: WARNING — $ENSURE is missing; freshness checks are off (every app rebuilds)" >&2
+fi
+app_status() {  # NAME.ELF -> fresh|stale|missing|nobuilder|unknown (plan rows key on the base name)
+    printf '%s\n' "$APP_PLAN" | awk -v app="${1%.ELF}" '$1 == app { print $2; found=1; exit } END { if (!found) print "unknown" }'
+}
+
+doctor_fail=0
+if [ "$SKIP_BUILD" = "1" ]; then
+    echo "session: doctor: skipped — VIRELAI_SESSION_SKIP_BUILD=1 reuses the last build"
+else
+    if command -v zig >/dev/null 2>&1; then
+        echo "session: doctor: zig ok"
+    else
+        echo "session: doctor: zig MISSING — the guest build needs it (fix: brew install zig)"
+        doctor_fail=1
+    fi
+    if command -v swift >/dev/null 2>&1; then
+        echo "session: doctor: swift ok"
+    else
+        echo "session: doctor: swift MISSING — the SPIKE VMRunner needs it (fix: install the Xcode Command Line Tools: xcode-select --install)"
+        doctor_fail=1
+    fi
+    # The GOOS=virelai fork matters only when a staged app must (re)build —
+    # a warm cache needs no Go toolchain at all. That is the point of the
+    # incremental build: do not demand a toolchain the run will not invoke.
+    need_build=0
+    for app in $GO_APPS; do
+        case "$(app_status "$app")" in
+            stale|missing|unknown) need_build=$((need_build + 1)) ;;
+        esac
+    done
+    FORK_DIR="${GO_FORK_DIR:-$(dirname "$ROOT")/go-virelai}"
+    if [ "$need_build" -eq 0 ]; then
+        echo "session: doctor: go-fork not needed — every staged app is fresh"
+    elif grep -q '"virelai"' "$FORK_DIR/src/internal/syslist/syslist.go" 2>/dev/null; then
+        if [ -x "$FORK_DIR/bin/go" ]; then
+            echo "session: doctor: go-fork ok ($FORK_DIR)"
+        else
+            echo "session: doctor: go-fork PATCHED BUT UNBUILT — $FORK_DIR/bin/go is missing and $need_build app(s) need a build"
+            echo "session: doctor:   fix: just go-toolchain"
+            doctor_fail=1
+        fi
+    else
+        echo "session: doctor: go-fork MISSING/UNPATCHED at $FORK_DIR — $need_build app(s) need a build"
+        echo "session: doctor:   fix: bash tools/go/apply.sh && just go-toolchain"
+        doctor_fail=1
+    fi
+    # mkfs.vlfs is the host-built data-disk formatter (M120a); it needs the
+    # stock host `go`, not the fork. Missing stays a warning — the session
+    # still boots, /disk just will not mount this run.
+    if [ -x "$ROOT/.build/go/mkfs.vlfs" ]; then
+        echo "session: doctor: mkfs.vlfs ok"
+    elif command -v go >/dev/null 2>&1; then
+        echo "session: doctor: mkfs.vlfs builds on demand via tools/go/vlfs/build.sh (host go ok)"
+    else
+        echo "session: doctor: mkfs.vlfs MISSING and no host go to build it (fix: brew install go) — vlfs.img stays unformatted"
+    fi
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo "session: --dry-run — nothing is built, staged, provisioned, or booted"
+    if [ "$SKIP_BUILD" = "1" ]; then
+        echo "session:   build step: skipped (VIRELAI_SESSION_SKIP_BUILD=1)"
+    else
+        echo "session:   build step: zig build; zig build image; swift build (SPIKE VMRunner) would run"
+    fi
+    echo "session:   Go apps (ensure-guest-elf plan):"
+    plan_fresh=0; plan_rebuild=0; plan_nobuilder=0
+    for app in $GO_APPS; do
+        status="$(app_status "$app")"
+        case "$status" in
+            fresh)
+                if [ "$SKIP_BUILD" != "1" ] && { [ ! -f "$SHARE/$app" ] || ! cmp -s "$ROOT/.build/go/$app" "$SHARE/$app"; }; then
+                    printf 'session:     %-14s fresh — up-to-date build, would restage into the share\n' "$app"
+                else
+                    printf 'session:     %-14s fresh — skip\n' "$app"
+                fi
+                plan_fresh=$((plan_fresh + 1)) ;;
+            nobuilder)
+                printf 'session:     %-14s no builder (%s) — stays unavailable\n' "$app" "$(go_app_builder "$app")"
+                plan_nobuilder=$((plan_nobuilder + 1)) ;;
+            *)
+                if [ "$SKIP_BUILD" = "1" ]; then
+                    printf 'session:     %-14s %s — build skipped (VIRELAI_SESSION_SKIP_BUILD=1)\n' "$app" "$status"
+                else
+                    printf 'session:     %-14s %s — would rebuild via %s\n' "$app" "$status" "$(go_app_builder "$app")"
+                fi
+                plan_rebuild=$((plan_rebuild + 1)) ;;
+        esac
+    done
+    printf 'session:   plan: %d fresh, %d would rebuild, %d without a builder\n' "$plan_fresh" "$plan_rebuild" "$plan_nobuilder"
+    exit 0
+fi
+
+if [ "$doctor_fail" = "1" ]; then
+    echo "session: ERROR — the toolchain doctor found a MISSING piece (above). Fix it and rerun; nothing was built or booted." >&2
+    echo "session:   to reuse the previous build's output instead: VIRELAI_SESSION_SKIP_BUILD=1 just session" >&2
+    exit 1
+fi
 
 # --- 1. build ---------------------------------------------------------------
-if [ "${VIRELAI_SESSION_SKIP_BUILD:-0}" != "1" ]; then
+if [ "$SKIP_BUILD" != "1" ]; then
     echo "session: building guest + image (zig build, zig build image)"
     zig build
     zig build image
@@ -215,6 +376,64 @@ fi
 [ -f "$ROOT/image/fonts/NotoSerif-Regular.ttf" ] && cp "$ROOT/image/fonts/NotoSerif-Regular.ttf" "$SHARE/NOTOSERF.TTF"
 [ -f "$ROOT/image/fonts/NotoSansJP-Regular.ttf" ] && cp "$ROOT/image/fonts/NotoSansJP-Regular.ttf" "$SHARE/NOTOCJK.TTF"
 
+# stage_go_app <NAME.ELF> — the M122a incremental build step. The plan above
+# already knows each app's freshness: a `fresh` ELF is never rebuilt and a
+# share copy identical to .build/go is never rewritten, so a warm run stages
+# nothing. `stale`/`missing` go through ensure-guest-elf, which rebuilds,
+# stamps, and re-checks (a builder that writes the wrong bytes still fails
+# closed). A failed builder never copies a stale output or reports success;
+# a binary already on a persistent share remains user-owned — exec still
+# validates that image and reports a real load failure.
+stage_go_app() {
+    local app="$1" script status out
+    script="$ROOT/$(go_app_builder "$app")"
+    if [ "$SKIP_BUILD" = "1" ]; then
+        # The skip flag covers the Go builders too: reuse the last .build/go
+        # output verbatim — or the share's own copy when even that is gone.
+        if [ -s "$ROOT/.build/go/$app" ]; then
+            :
+        elif [ -s "$SHARE/$app" ]; then
+            echo "session: $app kept from the share (build skipped)"
+            return 0
+        else
+            echo "session: WARNING — $app unavailable: no prior build (VIRELAI_SESSION_SKIP_BUILD=1)"
+            return 0
+        fi
+    else
+        status="$(app_status "$app")"
+        if [ "$status" != "fresh" ]; then
+            local var="ENSURE_GUEST_ELF_BUILD_${app%.ELF}"
+            if [ ! -f "$script" ] && [ -z "${!var:-}" ]; then
+                echo "session: WARNING — $app unavailable: missing builder $script"
+                return 0
+            fi
+            echo "session: building $app — $status (bash $(go_app_builder "$app"))"
+            if ! out="$(bash "$ENSURE" ensure "${app%.ELF}" 2>&1)"; then
+                # The builder exiting nonzero keeps ensure's own "cannot
+                # stamp" from firing; an exit-0 builder with no output dies
+                # at the stamp step instead. Name which happened.
+                case "$out" in
+                    *"ensure-guest-elf: cannot stamp"*) reason="builder produced no binary" ;;
+                    *) reason="builder failed" ;;
+                esac
+                echo "session: WARNING — $app unavailable: $reason ($script)"
+                printf '%s\n' "$out" | tail -8 | sed 's/^/session:           /'
+                return 0
+            fi
+        fi
+        if [ ! -s "$ROOT/.build/go/$app" ]; then
+            echo "session: WARNING — $app unavailable: builder produced no binary ($script)"
+            return 0
+        fi
+    fi
+    if [ -f "$SHARE/$app" ] && cmp -s "$ROOT/.build/go/$app" "$SHARE/$app"; then
+        echo "session: $app up-to-date"
+    else
+        cp "$ROOT/.build/go/$app" "$SHARE/$app"
+        echo "session: staged $app"
+    fi
+}
+
 # The GO seat (M59, issue #1298): the compiled `wm` default is `gotabwm`, so
 # a default boot looks for GOTABWM.ELF ON THE SHARE. Build it with the
 # GOOS=virelai fork toolchain and stage it; if that is unavailable the
@@ -222,42 +441,11 @@ fi
 # rc below says which). The default first-boot workspace also needs GOSH.ELF.
 GO_SEAT_STAGED=0
 if [ "${VIRELAI_SESSION_NO_GOTABWM:-0}" != "1" ]; then
-    # NAME is the existing manifest executable field, not a new schema. The
-    # seat and first-boot shell are the only non-catalog prerequisites.
-    go_apps="$(python3 - "$ROOT/image/apps.txt" <<'PY'
-import pathlib, sys
-names = ["GOTABWM.ELF", "GOSH.ELF"]
-for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
-    line = line.strip()
-    if not line or line.startswith("#") or "|" not in line:
-        continue
-    name = line.split("|", 1)[0].strip()
-    if name.endswith(".ELF") and name not in names:
-        names.append(name)
-print("\n".join(names))
-PY
-)"
     while IFS= read -r app; do
-        case "$app" in
-            GOFILES.ELF) builder=files ;;
-            GOHELP.ELF) builder=help ;;
-            *) builder="$(printf '%s' "${app%.ELF}" | tr '[:upper:]' '[:lower:]')" ;;
-        esac
-        script="$ROOT/tools/go/build-$builder.sh"
-        if [ ! -f "$script" ]; then
-            echo "session: WARNING — $app unavailable: missing builder $script"
-        elif ! bash "$script"; then
-            echo "session: WARNING — $app unavailable: builder failed ($script)"
-        elif [ ! -s "$ROOT/.build/go/$app" ]; then
-            echo "session: WARNING — $app unavailable: builder produced no binary"
-        else
-            cp "$ROOT/.build/go/$app" "$SHARE/$app"
-            echo "session: staged $app"
-        fi
-        # A failed builder never copies a stale output or reports success.
-        # A binary already on a persistent share remains user-owned; exec
-        # still validates that image and reports a real load failure.
-    done <<< "$go_apps"
+        [ -n "$app" ] || continue
+        case "$app" in GOUPD.ELF|AGENTD.ELF) continue ;; esac
+        stage_go_app "$app"
+    done <<< "$GO_APPS"
     if [ -s "$SHARE/GOTABWM.ELF" ] && [ -s "$SHARE/GOSH.ELF" ]; then
         GO_SEAT_STAGED=1
     else
@@ -275,18 +463,7 @@ fi
 # guard: --no-gotabwm disables the SEAT, not the machine's own wiring.
 # Same contract as the manifest apps: warn-only, never copy a stale output.
 for app in GOUPD.ELF AGENTD.ELF; do
-    builder="$(printf '%s' "${app%.ELF}" | tr '[:upper:]' '[:lower:]')"
-    script="$ROOT/tools/go/build-$builder.sh"
-    if [ ! -f "$script" ]; then
-        echo "session: WARNING — $app unavailable: missing builder $script"
-    elif ! bash "$script"; then
-        echo "session: WARNING — $app unavailable: builder failed ($script)"
-    elif [ ! -s "$ROOT/.build/go/$app" ]; then
-        echo "session: WARNING — $app unavailable: builder produced no binary"
-    else
-        cp "$ROOT/.build/go/$app" "$SHARE/$app"
-        echo "session: staged $app"
-    fi
+    stage_go_app "$app"
 done
 
 # --- 3. the session startup file (only written when absent) -----------------

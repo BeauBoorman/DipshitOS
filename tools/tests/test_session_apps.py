@@ -67,6 +67,8 @@ class SessionAppsTest(unittest.TestCase):
                   "host/vm-runner/Resources", "fake-bin", "run-temp"):
             (self.root / d).mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / "tools/session.sh", self.root / "tools/session.sh")
+        shutil.copy(ROOT / "tools/go/ensure-guest-elf.sh",
+                    self.root / "tools/go/ensure-guest-elf.sh")
         shutil.copy(ROOT / "image/apps.txt", self.root / "image/apps.txt")
         shutil.copy(ROOT / "tools/agentctl/agentctl.py",
                     self.root / "tools/agentctl/agentctl.py")
@@ -77,6 +79,28 @@ class SessionAppsTest(unittest.TestCase):
         signer = self.root / "fake-bin/codesign"
         signer.write_text("#!/bin/sh\nprintf 'fixture codesign\\n'\n")
         signer.chmod(0o755)
+        # The M122a doctor requires zig+swift on PATH when the build step
+        # runs; the fakes log every invocation so a test can prove a step
+        # ran (or, in --dry-run, provably did not).
+        for tool in ("zig", "swift"):
+            fake = self.root / f"fake-bin/{tool}"
+            fake.write_text(f"#!/bin/sh\necho {tool} >> .build/go/tool-log\n")
+            fake.chmod(0o755)
+        # A minimal patched-looking GOOS=virelai fork: bin/go answers
+        # `go version` (ensure-guest-elf's toolchain id probe) and
+        # syslist.go carries the '"virelai"' marker apply.sh checks for.
+        fork = self.root / "fake-go-virelai"
+        (fork / "bin").mkdir(parents=True)
+        go = fork / "bin/go"
+        go.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = version ]; then\n"
+            "    echo 'go version go1.27.1-fake virelai/arm64'\n"
+            "fi\n")
+        go.chmod(0o755)
+        (fork / "src/internal/syslist").mkdir(parents=True)
+        (fork / "src/internal/syslist/syslist.go").write_text(
+            'var KnownOS = map[string]bool{\n\t"virelai":   true,\n}\n')
         (self.root / "artifacts/disk.img").write_bytes(b"fake image")
         mkfs = self.root / ".build/go/mkfs.vlfs"
         mkfs.write_text(FAKE_MKFS)
@@ -85,15 +109,22 @@ class SessionAppsTest(unittest.TestCase):
         for name, builder in (APPS | PERSIST_TOOLS).items():
             (self.root / f"tools/go/build-{builder}.sh").write_text(
                 "#!/bin/sh\n"
-                f"printf '{name} built\\n' > .build/go/{name}.ELF\n")
+                f"printf '{name} built\\n' > .build/go/{name}.ELF\n"
+                f"echo {name} >> .build/go/build-log\n")
         self.share = self.root / "isolated-share"
         self.profile = self.root / "artifacts/session.virelaivm"
         self.env = dict(os.environ, VIRELAI_SESSION_SHARE=str(self.share),
-                        VIRELAI_SESSION_SKIP_BUILD="1",
+                        GO_FORK_DIR=str(fork),
                         TMPDIR=str(self.root / "run-temp"),
                         PATH=str(self.root / "fake-bin") + os.pathsep + os.environ["PATH"])
+        self.env.pop("VIRELAI_SESSION_SKIP_BUILD", None)
         self.env.pop("VIRELAI_SESSION_NO_GOTABWM", None)
         self.env.pop("VIRELAI_SESSION_NO_TABWM", None)
+
+    def builder_invocations(self):
+        """Fake-builder call log: one app name per line, appended per run."""
+        log = self.root / ".build/go/build-log"
+        return log.read_text().split() if log.exists() else []
 
     def write_runner(self, body):
         runner = self.root / "host/vm-runner/.build/release/VMRunner"
@@ -211,7 +242,7 @@ class SessionAppsTest(unittest.TestCase):
                 ["bash", str(self.root / "tools/session.sh")], env=self.env,
                 stdout=log, stderr=log)
             try:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + 30
                 while not (self.share / "owned-pid").exists() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertTrue((self.share / "owned-pid").exists())
@@ -329,6 +360,89 @@ class SessionAppsTest(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 1)
         self.assertIn("--resume needs a suspended machine", result.stderr)
+
+    # --- M122a (#2570): incremental builds + toolchain doctor -------------
+
+    def plan_row(self, output, app):
+        for line in output.splitlines():
+            if line.startswith("session:") and app in line:
+                return line
+        return ""
+
+    def test_warm_run_never_rebuilds_or_restages_fresh_elfs(self):
+        first = self.run_session()
+        self.assertIn("session: staged GOSH.ELF", first)
+        cold = self.builder_invocations()
+        self.assertIn("GOSH", cold)
+        second = self.run_session()
+        # Every built app reports up-to-date; no builder ran; the share was
+        # not rewritten.
+        for name in APPS:
+            self.assertIn(f"session: {name}.ELF up-to-date", second)
+            self.assertNotIn(f"session: staged {name}.ELF", second)
+        self.assertEqual(self.builder_invocations(), cold)
+        self.assertIn("go-fork not needed", second)
+        for name in APPS:
+            self.assertEqual((self.share / f"{name}.ELF").read_text(),
+                             f"{name} built\n")
+
+    def test_dry_run_reports_plan_and_mutates_nothing(self):
+        # Cold tree: every buildable app reports a pending rebuild.
+        out = self.run_session(["--dry-run"])
+        self.assertIn("--dry-run", out)
+        self.assertIn("would rebuild via tools/go/build-gosh.sh",
+                      self.plan_row(out, "GOSH.ELF"))
+        self.assertIn("no builder", self.plan_row(out, "GODIFF.ELF"))
+        self.assertNotIn("fake runner flags:", out)
+        self.assertFalse((self.root / ".build/go/build-log").exists())
+        self.assertFalse((self.root / ".build/go/tool-log").exists())
+        self.assertFalse(self.share.exists())
+        self.assertFalse(self.profile.exists())
+        # Warm tree: a dry run skips the up-to-date ELFs by name and does
+        # not add a single builder or zig/swift invocation.
+        self.run_session()
+        builds = self.builder_invocations()
+        tool_log = self.root / ".build/go/tool-log"
+        tools = tool_log.read_text().split() if tool_log.exists() else []
+        out = self.run_session(["--dry-run"])
+        self.assertIn("fresh", self.plan_row(out, "GOSH.ELF"))
+        self.assertNotIn("would rebuild", self.plan_row(out, "GOSH.ELF"))
+        self.assertIn("no builder", self.plan_row(out, "GODIFF.ELF"))
+        self.assertEqual(self.builder_invocations(), builds)
+        self.assertEqual(tool_log.read_text().split(), tools)
+        self.assertNotIn("fake runner flags:", out)
+
+    def test_missing_go_toolchain_fails_before_boot_with_fix_command(self):
+        self.env.pop("GO_FORK_DIR", None)
+        result = subprocess.run(
+            ["bash", str(self.root / "tools/session.sh")], env=self.env,
+            capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("go-fork MISSING", combined)
+        self.assertIn("bash tools/go/apply.sh && just go-toolchain", combined)
+        # The doctor refuses before any build step, staging, or boot.
+        self.assertNotIn("building guest + image", combined)
+        self.assertNotIn("fake runner flags:", combined)
+        self.assertFalse((self.root / ".build/go/build-log").exists())
+        self.assertFalse((self.root / ".build/go/tool-log").exists())
+
+    def test_skip_build_covers_the_go_builders_too(self):
+        self.env["VIRELAI_SESSION_SKIP_BUILD"] = "1"
+        out = self.run_session()
+        self.assertFalse((self.root / ".build/go/build-log").exists())
+        self.assertIn("no prior build (VIRELAI_SESSION_SKIP_BUILD=1)", out)
+        self.assertFalse((self.share / "GOSH.ELF").exists())
+        self.assertIn("tabwm start", (self.share / ".virelairc").read_text())
+
+    def test_skip_build_reuses_the_prior_go_output(self):
+        self.run_session()
+        self.env["VIRELAI_SESSION_SKIP_BUILD"] = "1"
+        builds = self.builder_invocations()
+        out = self.run_session()
+        self.assertEqual(self.builder_invocations(), builds)
+        self.assertEqual((self.share / "GOSH.ELF").read_text(), "GOSH built\n")
+        self.assertIn("session: GOSH.ELF up-to-date", out)
 
 
 if __name__ == "__main__":
