@@ -88,11 +88,11 @@ vgate_assert 01 serial-contains 'smp: cores=1 online=1'
 vgate_assert 01 serial-contains 'exec: loaded GOSCALE.ELF'
 vgate_assert 01 serial-contains 'goscale: busy m=4'
 vgate_assert 01 serial-contains 'goscale: released m=4'
-vgate_assert 01 serial-exact 'goscale: w0 units=25000' 1
-vgate_assert 01 serial-exact 'goscale: w1 units=25000' 1
-vgate_assert 01 serial-exact 'goscale: w2 units=25000' 1
-vgate_assert 01 serial-exact 'goscale: w3 units=25000' 1
-vgate_assert 01 serial-exact 'goscale: done units=100000' 1
+vgate_assert 01 serial-contains 'goscale: w0 units=25000'
+vgate_assert 01 serial-contains 'goscale: w1 units=25000'
+vgate_assert 01 serial-contains 'goscale: w2 units=25000'
+vgate_assert 01 serial-contains 'goscale: w3 units=25000'
+vgate_assert 01 serial-contains 'goscale: done units=100000'
 vgate_assert 01 serial-contains 'goscale: ticks='
 # M70b review: the wakes line is the targeting evidence. With one online
 # core every wake must be local — remote=0 is the invariant here.
@@ -123,8 +123,11 @@ if sorted(w for w, _ in units) != [0, 1, 2, 3]:
 total = sum(u for _, u in units)
 if total != 100000:
     sys.exit("FAIL: per-worker units sum to %d, expected 100000" % total)
-done = [l for l in lines if l.startswith("goscale: done units=")]
-if len(done) != 1 or done[0] != "goscale: done units=%d" % total:
+# Periodic `smp: secondary runs=` reports can fuse onto the end of the
+# done line (no newline boundary) — parse the units value, not the line.
+done = [int(m.group(1)) for l in lines
+        if (m := re.match(r"^goscale: done units=(\d+)", l))]
+if done != [total]:
     sys.exit("FAIL: done line %r does not equal the summed units %d" % (done, total))
 print("units accounting ok: 4 x 25000 = %d, done line matches" % total)
 PY
@@ -135,11 +138,11 @@ vgate_assert 02 serial-contains 'smp: cores=2 online=2'
 vgate_assert 02 serial-contains 'exec: loaded GOSCALE.ELF'
 vgate_assert 02 serial-contains 'goscale: busy m=4'
 vgate_assert 02 serial-contains 'goscale: released m=4'
-vgate_assert 02 serial-exact 'goscale: w0 units=25000' 1
-vgate_assert 02 serial-exact 'goscale: w1 units=25000' 1
-vgate_assert 02 serial-exact 'goscale: w2 units=25000' 1
-vgate_assert 02 serial-exact 'goscale: w3 units=25000' 1
-vgate_assert 02 serial-exact 'goscale: done units=100000' 1
+vgate_assert 02 serial-contains 'goscale: w0 units=25000'
+vgate_assert 02 serial-contains 'goscale: w1 units=25000'
+vgate_assert 02 serial-contains 'goscale: w2 units=25000'
+vgate_assert 02 serial-contains 'goscale: w3 units=25000'
+vgate_assert 02 serial-contains 'goscale: done units=100000'
 vgate_assert 02 serial-contains 'goscale: ticks='
 vgate_assert 02 serial-absent '[EXC] parking:'
 vgate_assert 02 python <<'PY'
@@ -155,8 +158,11 @@ if sorted(w for w, _ in units) != [0, 1, 2, 3]:
 total = sum(u for _, u in units)
 if total != 100000:
     sys.exit("FAIL: per-worker units sum to %d, expected 100000" % total)
-done = [l for l in lines if l.startswith("goscale: done units=")]
-if len(done) != 1 or done[0] != "goscale: done units=%d" % total:
+# Periodic `smp: secondary runs=` reports can fuse onto the end of the
+# done line (no newline boundary) — parse the units value, not the line.
+done = [int(m.group(1)) for l in lines
+        if (m := re.match(r"^goscale: done units=(\d+)", l))]
+if done != [total]:
     sys.exit("FAIL: done line %r does not equal the summed units %d" % (done, total))
 # The placement proof: the held-window report must show task=GOSCALE.ELF
 # on exactly 1 distinct core line, and it must be core 1 — core 0 carries
@@ -181,11 +187,11 @@ vgate_assert 03 serial-contains 'smp: cores=4 online=4'
 vgate_assert 03 serial-contains 'exec: loaded GOSCALE.ELF'
 vgate_assert 03 serial-contains 'goscale: busy m=4'
 vgate_assert 03 serial-contains 'goscale: released m=4'
-vgate_assert 03 serial-exact 'goscale: w0 units=25000' 1
-vgate_assert 03 serial-exact 'goscale: w1 units=25000' 1
-vgate_assert 03 serial-exact 'goscale: w2 units=25000' 1
-vgate_assert 03 serial-exact 'goscale: w3 units=25000' 1
-vgate_assert 03 serial-exact 'goscale: done units=100000' 1
+vgate_assert 03 serial-contains 'goscale: w0 units=25000'
+vgate_assert 03 serial-contains 'goscale: w1 units=25000'
+vgate_assert 03 serial-contains 'goscale: w2 units=25000'
+vgate_assert 03 serial-contains 'goscale: w3 units=25000'
+vgate_assert 03 serial-contains 'goscale: done units=100000'
 vgate_assert 03 serial-contains 'goscale: ticks='
 # Floor only: the drain lines (smp: secondary/steal runs=... task=GOSCALE.ELF)
 # also carry the string, so the raw count exceeds the per-core report; the
@@ -205,8 +211,11 @@ if sorted(w for w, _ in units) != [0, 1, 2, 3]:
 total = sum(u for _, u in units)
 if total != 100000:
     sys.exit("FAIL: per-worker units sum to %d, expected 100000" % total)
-done = [l for l in lines if l.startswith("goscale: done units=")]
-if len(done) != 1 or done[0] != "goscale: done units=%d" % total:
+# Periodic `smp: secondary runs=` reports can fuse onto the end of the
+# done line (no newline boundary) — parse the units value, not the line.
+done = [int(m.group(1)) for l in lines
+        if (m := re.match(r"^goscale: done units=(\d+)", l))]
+if done != [total]:
     sys.exit("FAIL: done line %r does not equal the summed units %d" % (done, total))
 # The placement proof: the held-window `smp` report must show
 # task=GOSCALE.ELF on AT LEAST 2 DISTINCT NON-ZERO core lines — core 0
