@@ -13,18 +13,17 @@ vgate_fmt boot/src/*.zig kernel/src/*.zig build.zig
 vgate_file script-1.txt <<'EOF'
 net ip 192.168.64.5
 net arp 192.168.64.1
-net ping 192.168.64.1
 echo nat-phase1-ready
 EOF
 
 vgate_file script-2.txt <<'EOF'
-net arp 192.168.64.1
+net ping 192.168.64.1
 net arp
 net
 echo nat-obs-done
 EOF
 
-vgate_run 01 -- --net-nat --script '$RUN_DIR/script-1.txt' --script2 '$RUN_DIR/script-2.txt' --script2-after 'nat-phase1-ready' --script-expect 'nat-obs-done' --timeout 40
+vgate_run 01 -- --net-nat --script '$RUN_DIR/script-1.txt' --script2 '$RUN_DIR/script-2.txt' --script2-after 'net arp: 192.168.64.1 is at' --script-expect 'nat-obs-done' --timeout 40
 
 vgate_assert 01 serial-contains 'net ip: ip=192.168.64.5'
 vgate_assert 01 serial-contains 'net arp: request for 192.168.64.1 sent (42 bytes)'
