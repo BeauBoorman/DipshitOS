@@ -49,10 +49,7 @@ pats = [
 # so whole-line matching never sees the joined line. Strip the marker
 # lines and rejoin — the fragments concatenate back to the full lines.
 ser = open(os.environ["VG_SER"], errors="replace").read()
-joined = "".join(
-    l for l in ser.splitlines(keepends=True)
-    if "counter: alive" not in l
-)
+joined = re.sub(r"\n[^\n]*counter: alive[^\n]*\n", "", ser)
 if "fg: job 1 still running" not in joined:
     sys.exit("FAIL: fg still-running line absent")
 lines = joined.splitlines()
