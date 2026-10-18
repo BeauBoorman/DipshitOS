@@ -90,10 +90,23 @@ func (e *textEditor) key(usage, symbol uint32, flags uint16) bool {
 
 func (a *app) focusURL() {
 	a.urlEditing = true
+	a.histOpen = false
 	a.focusControl = nil
 	a.urlEdit.reset(a.target, maxURLBytes)
 	a.dirty = true
 	vi.ConsoleLine("web: url-focus")
+}
+
+// submitURL is Enter in the address bar — also the ">" action chip's click
+// path while the field edits.
+func (a *app) submitURL() {
+	target := a.urlEdit.text
+	a.urlEditing = false
+	from := a.target
+	if from == "" {
+		from = "url-entry"
+	}
+	a.navigate(target, from)
 }
 
 func (a *app) keyEvent(ev vi.Event) {
@@ -103,14 +116,8 @@ func (a *app) keyEvent(ev vi.Event) {
 	}
 	if a.urlEditing {
 		switch ev.Arg0 {
-		case 0x28:
-			target := a.urlEdit.text
-			a.urlEditing = false
-			from := a.target
-			if from == "" {
-				from = "url-entry"
-			}
-			a.navigate(target, from)
+		case keyReturn:
+			a.submitURL()
 		case keyEscape:
 			a.urlEditing = false
 			a.dirty = true
@@ -119,6 +126,9 @@ func (a *app) keyEvent(ev vi.Event) {
 				a.dirty = true
 			}
 		}
+		return
+	}
+	if a.histMenuKey(ev.Arg0) {
 		return
 	}
 	if ev.Arg0 == 0x3a { // F1: bounded diagnostics list, scoped to this app
