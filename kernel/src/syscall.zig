@@ -115,6 +115,14 @@ pub const slot_count: usize = abi.slot_count;
 /// reserved pipe slots (M19) — the gap is intentional, see
 /// docs/archive/agent-concurrency-plan.md §8.
 /// M19 P1 (issue #290): slots 56/57 are the bounded pipe.
+/// M117c (#2475, ADR 0057 D10): the family tag shared by the ping
+/// (59/60) and socket-connect (80 op 10) marshal — placed where the
+/// v4 API carries the IPv4 word (args[0] for ping, args[1] for op 10),
+/// a value above u32 so no IPv4 word can alias it. The 16-byte literal
+/// then arrives through the existing `uaccess.copy_in` seam on the
+/// pointer arg (ping: args[1]; op 10: args[3]).
+pub const family_v6_tag: u64 = 0x0000_86dd_0000_0006;
+
 /// M26 N1 (issue #399): slots 59/60 are ping send/poll.
 /// M26 N2 (issue #400): slot 62 is the net-stats snapshot.
 /// M29 (issue #598): slots 63/64 are sys_mmap/sys_munmap.
@@ -1708,6 +1716,23 @@ fn handle_font_size(args: Args, _: *exceptions.VectorFrame) u64 {
 /// caller should `net arp <ip>` first).
 fn handle_ping_send(args: Args, _: *exceptions.VectorFrame) u64 {
     const ip_raw = args[0];
+    if (ip_raw == family_v6_tag) {
+        // M117c (#2475): `sys_ping_send(tag, ptr)` — the 16-byte v6
+        // literal through the copy_in seam. `net_ping6_request` refuses
+        // honestly (bad_dst6 / no_src6 / no_route6 / no_peer — resolve
+        // the next hop with `net ndp <addr>` first, same as v4 ARP).
+        var addr6: virtio_net.ipv6.Addr = undefined;
+        if (uaccess.copy_in(&addr6, args[1], 16) != .ok) return error_result(.efault);
+        var out_len: usize = 0;
+        switch (virtio_net.net_ping6_request(addr6, &out_len)) {
+            .ok => {
+                virtio_net.ipv6.requests_sent += 1;
+                virtio_net.ipv6.ping6_seq +%= 1;
+                return 0;
+            },
+            else => return error_result(.einval),
+        }
+    }
     const ip: [4]u8 = .{
         @truncate(ip_raw >> 24),
         @truncate(ip_raw >> 16),
@@ -1730,8 +1755,13 @@ fn handle_ping_send(args: Args, _: *exceptions.VectorFrame) u64 {
 /// whether a pong has landed. Returns the last echo reply sequence
 /// (`ipv4.last_seq`, u16) if `pongs_observed > 0`, else 0. The caller
 /// sends one ping and polls until the expected sequence appears.
-fn handle_ping_poll(_: Args, _: *exceptions.VectorFrame) u64 {
+/// M117c (#2475): `sys_ping_poll(tag)` — the v6 half, `ipv6.last_seq`.
+fn handle_ping_poll(args: Args, _: *exceptions.VectorFrame) u64 {
     virtio_net.net_rx_drain();
+    if (args[0] == family_v6_tag) {
+        if (virtio_net.ipv6.pongs_observed == 0) return 0;
+        return virtio_net.ipv6.last_seq;
+    }
     if (virtio_net.ipv4.pongs_observed == 0) return 0;
     return virtio_net.ipv4.last_seq;
 }
@@ -2753,7 +2783,7 @@ fn handle_socket(args: Args, _: *exceptions.VectorFrame) u64 {
             if (tcp.state != .idle and tcp.state != .closed and
                 (tcp.listen_port == args[2] or (!tcp.is_server and args[2] == tcp.default_src_port)))
                 return error_result(.enospc);
-            const h = native_socket.sockets.listen(pid, .{ .ip = ip, .port = @intCast(args[2]) }, native_socket.now()) catch |err| return socket_error(err);
+            const h = native_socket.sockets.listen(pid, native_socket.core.ep4(ip, @intCast(args[2])), native_socket.now()) catch |err| return socket_error(err);
             return h.value;
         },
         1 => return (native_socket.sockets.accept(pid, handle) catch |err| return socket_error(err)).value,
@@ -2807,22 +2837,46 @@ fn handle_socket(args: Args, _: *exceptions.VectorFrame) u64 {
             // outbound connections. The bound is the table's own
             // (owner_limit/conn_limit): Capacity -> ENOSPC, never a
             // userland copy.
-            if (!virtio_net.net_ready or !virtio_net.arp.ip_set()) return error_result(.einval);
+            // M117c (#2475, ADR 0057 D8/D10): the same op carries a v6
+            // literal — args[1] = `family_v6_tag`, args[3] = pointer to
+            // the 16-byte address (the uaccess.copy_in seam, family-tagged
+            // — never an IPv4-mapped translation). The local address is
+            // D3's select_src, the next hop D9's (resolved through the
+            // NDP table — `net ndp` or an earlier exchange), and the
+            // connect wait is byte-identical below.
+            if (!virtio_net.net_ready) return error_result(.einval);
             const ip_raw = args[1];
             const port_word = args[2];
             const dst_port: u16 = @truncate(port_word);
             const timeout_ms: u32 = @truncate(port_word >> 16);
-            if (ip_raw == 0 or ip_raw > 0xffffffff or dst_port == 0 or
-                port_word >> 48 != 0 or args[3] != 0) return error_result(.einval);
-            const ip = native_socket.ipBytes(ip_raw);
-            if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
-            const peer_mac = virtio_net.arp.lookup(ip) orelse return error_result(.einval);
+            if (dst_port == 0 or port_word >> 48 != 0) return error_result(.einval);
+            var peer_mac: [6]u8 = undefined;
+            var remote6: virtio_net.ipv6.Addr = undefined;
+            var local6: virtio_net.ipv6.Addr = undefined;
+            var ip: [4]u8 = undefined;
+            const v6 = ip_raw == family_v6_tag;
+            if (v6) {
+                if (uaccess.copy_in(&remote6, args[3], 16) != .ok) return error_result(.efault);
+                if (virtio_net.ipv6.is_bad_dst(remote6) or virtio_net.ipv6.is_owned(&remote6)) return error_result(.einval);
+                local6 = virtio_net.ipv6.select_src(&remote6) orelse return error_result(.einval);
+                const target = virtio_net.ipv6.next_hop(&remote6) orelse return error_result(.einval);
+                peer_mac = virtio_net.ndp.lookup(&target) orelse return error_result(.einval);
+            } else {
+                if (!virtio_net.arp.ip_set()) return error_result(.einval);
+                if (ip_raw == 0 or ip_raw > 0xffffffff or args[3] != 0) return error_result(.einval);
+                ip = native_socket.ipBytes(ip_raw);
+                if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
+                peer_mac = virtio_net.arp.lookup(ip) orelse return error_result(.einval);
+            }
             const start_pct = timer.cntpct();
             const deadline = tcp.ConnectDeadline.init(start_pct, timer.freq, timeout_ms);
             if (!builtin.is_test and deadline == null) return error_result(.einval);
             const timeout_result = error_result(if (timeout_ms == 0) .einval else .etimedout);
             const isn: u32 = @truncate(csprng.random_u64());
-            const h = native_socket.legacyOpen(pid, virtio_net.arp.own_ip, ip, dst_port, peer_mac, isn) catch |err| return socket_error(err);
+            const h = if (v6)
+                native_socket.legacyOpen6(pid, local6, remote6, dst_port, peer_mac, isn) catch |err| return socket_error(err)
+            else
+                native_socket.legacyOpen(pid, virtio_net.arp.own_ip, ip, dst_port, peer_mac, isn) catch |err| return socket_error(err);
             tcp.syn_sent += 1; // `net`/`sys_net_stats` mirror — same row slot 30 writes
             const cslot: usize = @intCast((h.value & native_socket.core.slot_mask) - native_socket.core.conn_slot_base);
             var test_iterations: usize = 0;
@@ -3586,7 +3640,7 @@ fn handle_tcp_connect(args: Args, frame: *exceptions.VectorFrame) u64 {
         if (c.state == .terminal) {
             native_socket.releaseConn(c);
         } else {
-            if (c.state == .established and std.mem.eql(u8, &ip, &c.remote.ip) and dst_port == c.remote.port) return 0;
+            if (c.state == .established and c.remote.family == .v4 and std.mem.eql(u8, &ip, &c.remote.ip) and dst_port == c.remote.port) return 0;
             return error_result(.einval);
         }
     }

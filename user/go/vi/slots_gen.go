@@ -165,6 +165,9 @@ var SyscallSlots = [...]SyscallSlot{
 }
 
 var SyscallVariants = [...]SyscallVariant{
+	{59, 0, 148283745894406, 2, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgPtr}}},
+	{60, 0, 148283745894406, 1, [6]SyscallArg{{Kind: ArgInt}}},
+	{80, 1, 148283745894406, 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}}},
 	{27, 3, 9223372036854775809, 4, [6]SyscallArg{{Kind: ArgString, LengthArg: 1, LengthMask: ^uint64(0)}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgFlags}}},
 	{27, 3, 9223372036854775810, 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgFlags}, {Kind: ArgInt}}},
 	{27, 3, 9223372036854775811, 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgFlags}}},

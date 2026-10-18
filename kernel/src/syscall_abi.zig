@@ -165,7 +165,18 @@ pub const slots = [_]Slot{
 
 // op-dependent shapes override the base row. No pointed-to output or binary
 // payload is classified as text; redacted slots have no variants.
+//
+// M117c (#2475): the v6 marshal — `family_v6_tag` (148283745894406 =
+// 0x0000_86dd_0000_0006; decimal here because the slots_gen.go mirror's
+// regex parses `variant(...)` op values literally, and trailing comments
+// would break its row shape) occupies the argument the v4 form used for
+// the IP word, and the 16-byte literal arrives through the pointer arg.
+// The selector is the tag position (args[0] for ping send/poll, args[1]
+// for socket op 10).
 pub const variants = [_]Variant{
+    variant(59, 0, 148283745894406, .{ .int, .ptr }),
+    variant(60, 0, 148283745894406, .{.int}),
+    variant(80, 1, 148283745894406, .{ .int, .int, .int, .ptr }),
     variant(27, 3, 9223372036854775809, .{ str(1), .int, .int, .flags }),
     variant(27, 3, 9223372036854775810, .{ .int, .int, .ptr, .flags, .int }),
     variant(27, 3, 9223372036854775811, .{ .int, .int, .int, .flags }),

@@ -170,6 +170,117 @@ public func buildTcpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ ho
     return frameLen
 }
 
+// M117c (#2475, ADR 0057): the IPv6 analogues of the N10 helpers — the
+// same segment shapes on the fixed 40-byte header (ethertype 0x86dd,
+// next-header 6, the TCP header at frame 54).
+public func isTcp6Segment(_ buf: [UInt8], _ n: Int, _ hostAddr: [UInt8], _ hostPort: UInt16) -> Bool {
+    guard n >= 74 else { return false }
+    guard buf[12] == 0x86 && buf[13] == 0xdd else { return false } // ethertype IPv6
+    guard buf[14] >> 4 == 0x6 else { return false } // version 6
+    guard buf[20] == 6 else { return false } // next header TCP
+    guard [UInt8](buf[38..<54]) == hostAddr else { return false } // dst address
+    let dstPort = (UInt16(buf[56]) << 8) | UInt16(buf[57])
+    return dstPort == hostPort
+}
+
+// M117c: the v6 TCP fields — flags at 54+13=67, seq at 58..62, ack at
+// 62..66.
+public func tcp6Flags(_ buf: [UInt8]) -> UInt8 {
+    return buf[67]
+}
+
+public func tcp6Seq(_ buf: [UInt8]) -> UInt32 {
+    return (UInt32(buf[58]) << 24) | (UInt32(buf[59]) << 16) | (UInt32(buf[60]) << 8) | UInt32(buf[61])
+}
+
+public func tcp6Ack(_ buf: [UInt8]) -> UInt32 {
+    return (UInt32(buf[62]) << 24) | (UInt32(buf[63]) << 16) | (UInt32(buf[64]) << 8) | UInt32(buf[65])
+}
+
+// M117c: the TCP checksum over the IPv6 pseudo-header — 16-byte src +
+// dst, the 32-bit upper-layer length, 3 zero bytes + next-header 6 —
+// over the segment (RFC 8200 §8.1; the checksum field must be zero by
+// the caller). The v4 pseudo-header's "zero + proto + len" row is the
+// v6 fixed header's real fields, so the shape matches.
+@Sendable public func tcp6Checksum(_ src: [UInt8], _ dst: [UInt8], _ segment: [UInt8]) -> UInt16 {
+    var sum: UInt32 = 0
+    var i = 0
+    while i < 16 {
+        sum += (UInt32(src[i]) << 8) | UInt32(src[i + 1])
+        sum += (UInt32(dst[i]) << 8) | UInt32(dst[i + 1])
+        i += 2
+    }
+    sum += UInt32(segment.count >> 16) + UInt32(segment.count & 0xffff)
+    sum += 6 // next header TCP
+    i = 0
+    while i + 1 < segment.count {
+        sum += (UInt32(segment[i]) << 8) | UInt32(segment[i + 1])
+        i += 2
+    }
+    if i < segment.count { sum += UInt32(segment[i]) << 8 } // trailing odd byte
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16) }
+    return UInt16((~sum) & 0xffff)
+}
+
+// M117c (#2475): synthesize a TCP/IPv6 reply to the guest's segment in
+// `req` into `reply`: Ethernet dst/src swapped, ethertype 0x86dd, v6
+// src/dst swapped (the reply's src is the address it was sent to), the
+// TCP header at 54 (src = the host port, dst = the guest's src port,
+// seq/ack/flags, the FIXED window 4096, no options), the echoed payload
+// when present; the pseudo-header checksum recomputed. Returns the
+// frame length (74 + the payload).
+public func buildTcp6Reply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ hostPort: UInt16, _ srvSeq: UInt32, _ ack: UInt32, _ flags: UInt8, _ payload: [UInt8]) -> Int {
+    _ = n
+    let frameLen = 74 + payload.count
+    reply = [UInt8](repeating: 0, count: frameLen)
+    // Ethernet: dst = the guest's MAC, src = the host MAC.
+    reply[0...5] = req[6...11]
+    reply[6...11] = hostMAC[0...5]
+    reply[12] = 0x86
+    reply[13] = 0xdd // ethertype IPv6
+    // IPv6: version 6, payload_len = TCP header + payload, next header 6,
+    // hop 64; src = the addressed address, dst = the sender's address.
+    reply[14] = 0x60
+    let payloadLen = 20 + payload.count
+    reply[18] = UInt8(payloadLen >> 8)
+    reply[19] = UInt8(payloadLen & 0xff)
+    reply[20] = 6
+    reply[21] = 64
+    reply[22...37] = req[38...53] // src = the addressed address
+    reply[38...53] = req[22...37] // dst = the sender's address
+    // TCP: src = the host port, dst = the guest's src port, seq/ack,
+    // data offset 5 (no options), the flags, window 4096, urgent 0.
+    reply[54] = UInt8(hostPort >> 8)
+    reply[55] = UInt8(hostPort & 0xff)
+    reply[56] = req[54]
+    reply[57] = req[55]
+    reply[58] = UInt8(srvSeq >> 24)
+    reply[59] = UInt8((srvSeq >> 16) & 0xff)
+    reply[60] = UInt8((srvSeq >> 8) & 0xff)
+    reply[61] = UInt8(srvSeq & 0xff)
+    reply[62] = UInt8(ack >> 24)
+    reply[63] = UInt8((ack >> 16) & 0xff)
+    reply[64] = UInt8((ack >> 8) & 0xff)
+    reply[65] = UInt8(ack & 0xff)
+    reply[66] = 0x50 // data offset 5 (no options)
+    reply[67] = flags
+    reply[68] = 0x10 // window 4096
+    reply[69] = 0x00
+    // Checksum field at 70..72 (zeroed by the memset), urgent 72..74 (0).
+    if !payload.isEmpty {
+        reply[74...74 + payload.count - 1] = payload[0...payload.count - 1]
+    }
+    let srcIP = [UInt8](reply[22..<38])
+    let dstIP = [UInt8](reply[38..<54])
+    var seg = [UInt8](reply[54..<frameLen])
+    seg[16] = 0
+    seg[17] = 0
+    let tcpChk = tcp6Checksum(srcIP, dstIP, seg)
+    reply[70] = UInt8(tcpChk >> 8)
+    reply[71] = UInt8(tcpChk & 0xff)
+    return frameLen
+}
+
 // SH7 (#1083, ADR 0020 Amendment B): match a guest-originated TCP segment
 // in the HOST-CLIENT direction — src IP/port = the guest listener, dst port
 // = the host client's fixed source port (the reverse of `isTcpSegment`).
