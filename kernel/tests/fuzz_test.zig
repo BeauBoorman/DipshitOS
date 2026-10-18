@@ -135,6 +135,8 @@ fn value_return_slots(slot: u64) bool {
         // runs before 41) arms exactly one, so a hostile cancel of a hostile
         // set is 1 by contract, not by accident.
         syscall.sys_timer_cancel => true,
+        // getpid (#2158, ADR 0048): the CALLER's pid — a value return.
+        syscall.sys_getpid => true,
         else => false,
     };
 }
