@@ -5,27 +5,17 @@
 # pinned corpus. 15-17 type real hostnames against hermetic stand-ins;
 # 18-20 prove wrong-host/expired/production-unknown-root refusal before GET.
 # 21 measures the largest reference with actual kernel ownership counters.
-<<<<<<< HEAD
-# 22-38 (M93g #1999, M99p): each frozen reference renders in-guest; the marker-
-# geometry crop SHA-256-matches its approved golden (web-proof/compare.py,
-# ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
-# 39 (M126a #2593): the address-bar/nav leg — a typed URL loads, the chips
-# drive back/forward/reload, and the history dropdown lists + revisits entries.
-# No public-internet fleet access, scripts or POST. Owner authorized the fixed
-# three-pixel shim-border scanout composition; font markers are live-web-ttf's.
-# Prerequisites: build-web.sh browser WEB, browser WEB --gate,
-# fetch GOFETCH --gate. Gate artifacts retain WEB.ELF/GOFETCH.ELF guest names.
-=======
 # 22-38 (M93g #1999): each frozen reference renders in-guest; the marker-
 # geometry crop SHA-256-matches its approved M93e golden (web-proof/compare.py,
 # ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
+# 39 (M126a #2593): the address-bar/nav leg — a typed URL loads, the chips
+# drive back/forward/reload, and the history dropdown lists + revisits entries.
 # v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
 # responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
 # grammar or TLS-over-v6 responder exists yet. No public-internet access,
 # scripts or POST; owner authorized the fixed three-pixel shim-border
 # composition; font markers are live-web-ttf's. Prereqs: build-web.sh
 # browser WEB and browser WEB --gate, fetch GOFETCH --gate.
->>>>>>> origin/main
 
 vgate_name live-web "WEB: bounded CSS browser, exact M93 presentation, DNS/SNI/GET navigation and fail-closed TLS"
 vgate_share seed
@@ -206,19 +196,12 @@ if pid == 0:
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     conns = []
-<<<<<<< HEAD
-    # The deadline must cover the seven boots ahead of 08 on the reference
-    # host plus margin; observed 2026-10-18: 300 s expired mid-run and the
-    # refused connect silently degraded boot 08 to the offline fallback.
-    deadline = time.time() + 1200
-=======
     # The deadline must outlive the whole spec, not the boot it serves:
     # 300 s was sized when this spec had a dozen runs and expired mid-run
     # on a 39-run fleet (observed 2026-10-18: upstream dial ECONNREFUSED,
     # 'web: offline' instead of a load to cancel). The owner-pid watch is
     # the real lifetime bound; this is only the orphan backstop.
     deadline = time.time() + 7200
->>>>>>> origin/main
     while time.time() < deadline:
         try:
             os.kill(owner, 0)
@@ -1609,7 +1592,6 @@ import subprocess, sys
 subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'fonts-size'])
 PY
 
-<<<<<<< HEAD
 # --- boot 39 (M126a #2593): the address bar + navigation leg --------------
 # One boot, all file-channel loads so every transition is instant. The chord
 # channel types ctrl-l + the path (its marker wait is keyed to the run
@@ -1735,7 +1717,7 @@ assert diff == 0, "PAGE rows under the menu differ from the approved raster: %d 
 print("live-web 39 history dropdown pixels ok (plate=%d ink=%d selrow=%d selbar=%d) + PAGE rows under it exact" %
       (plate, ink, selrow, selbar))
 PY
-=======
+
 # --- run v6: M117f (#2478, ADR 0057) — the v6 leg -------------------------
 # The card's thesis is "WEB.ELF fetches https over a v6 literal"; the honest
 # landable leg inside spec Touches is one step narrower, and this run pins
@@ -1845,4 +1827,3 @@ vgate_assert v6 serial-contains 'web6: done'
 vgate_assert v6 serial-absent 'web6: FAIL'
 vgate_assert v6 serial-absent '[EXC] parking:'
 vgate_assert v6 output-contains 'NET-TCP6: answered'
->>>>>>> origin/main
