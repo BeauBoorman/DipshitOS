@@ -519,6 +519,37 @@ Non-PCI platform facts:
   - The custom-virtio negative remains pinned: VZ refuses it at
     `validateSaveRestoreSupport` on this host. VirtioFS remains explicit
     (`--virtio-fs`); the boot default and `/host` API are unchanged.
+- **M115a (#2460) — `VZVirtioSocketDevice` (`--vsock`): [observed]
+  2026-10-17, macOS 27.2 (26B5112a), arm64, `live-vsock-restore`:**
+  - **Configuration-eligible.** `config.socketDevices` carrying a
+    `VZVirtioSocketDeviceConfiguration` passes
+    `validateSaveRestoreSupport` — unlike every `VZCustomVirtioDevice`,
+    which VZ refuses at validation (`VZErrorDomain` Code=2). The device
+    is therefore the only in-SDK guest↔host channel that can reach the
+    restore question.
+  - **The channel works.** On a plain `--vsock` boot the guest sees the
+    modern virtio-pci device `0x1af4:0x1053` (virtio device ID 19), arms
+    rx/tx/event queues, reads `guest_cid` (observed 3), and a serial-driven
+    `vsock <port>` issues a stream `OP_REQUEST` to `VMADDR_CID_HOST` —
+    the runner's `VZVirtioSocketListener` on the port accepts it
+    (`VSOCK: listener accepted guest connect dport=1208`, guest prints
+    `vsock: connected`). An unlistened port answers `OP_RST`
+    (`vsock: refused`).
+  - **Save completes; the restore leg is bounded by the host.** The
+    cross-process `--vz-restore-save` run with vsock attached saves
+    cleanly (`SAVE PASS`). Every `restoreMachineStateFrom` attempt on
+    this host — vsock same-process, vsock cross-process load, and the
+    headless-base control — refused `VZErrorDomain` Code=12 ("permission
+    denied"), the M119e saturating bound already recorded above: on this
+    build the refusal is host-wide, not device-specific, so **whether a
+    guest connect survives restore is undecidable here**. The spec's
+    `load` leg accepts exactly two outcomes: CROSS-PROCESS PASS with the
+    post-restore connect accepted, or the verbatim Code=12 refusal.
+    A reference host where the bound does not saturate decides it.
+  - **Fallback if a refusal emerges on a quieter host:** the VirtioFS
+    marker + host-poll path (the M115 index's named fallback), since
+    `VZVirtioFileSystemDeviceConfiguration` is already proven
+    restore-safe (M83g above).
 - Config used: 256 MiB RAM, 2 vCPUs, optional virtio-gpu/sound/net devices
   (flag-gated; the default VM stays byte-identical without flags).
 - **A large image is not a RAM problem by itself, and the guest does not
