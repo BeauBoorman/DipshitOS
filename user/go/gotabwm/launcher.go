@@ -74,7 +74,9 @@ const (
 
 type launcherState struct {
 	open      bool
+	palette   bool // M121a: the strip is the command palette, not the APPS.TXT launcher
 	catalog   []AppEntry
+	results   []paletteEntry // palette-mode catalog (launcher.go ranks one of the two)
 	filter    string
 	filtered  []int
 	sel       int
@@ -161,7 +163,11 @@ func (l *launcherState) panelH() int {
 
 func (l *launcherState) refresh() {
 	l.painted = false
-	l.filtered = rankApps(l.catalog, l.filter)
+	if l.palette {
+		l.filtered = rankPalette(l.results, l.filter)
+	} else {
+		l.filtered = rankApps(l.catalog, l.filter)
+	}
 	if l.sel >= len(l.filtered) {
 		l.sel = len(l.filtered) - 1
 	}
@@ -216,22 +222,36 @@ func (l *launcherState) selected() (AppEntry, bool) {
 }
 
 func openLauncher() {
-	if launch.open {
+	if launch.open && !launch.palette {
 		dismissLauncher()
 		return
 	}
+	if !launch.open {
+		launch.err = ""
+		launch.prior, _ = tabs.Focused()
+		if !acquireLauncherFocus() {
+			vi.ConsoleLine("gotabwm: launcher unavailable " + launch.err)
+			// Never claim a modal menu while an app still owns keyboard focus.
+			// The always-visible button paints the failed-open error instead.
+			launch.open = launch.sink != 0
+			return
+		}
+	}
+	// M121a: the palette's strip swaps contents in place — the modal sink
+	// and the prior-focus record carry over. A cold open takes both here.
+	launch.palette = false
+	launch.open = true
+	loadLauncherCatalog()
+}
+
+// loadLauncherCatalog fills the strip with the APPS.TXT manifest and its
+// per-row availability reasons, then publishes the decode/open markers.
+// The palette's summon is the same shape over paletteSources (palette.go).
+func loadLauncherCatalog() {
 	launch.err = ""
-	launch.catalog, launch.reasons, launch.filtered = nil, nil, nil
+	launch.catalog, launch.reasons, launch.filtered, launch.results = nil, nil, nil, nil
 	launch.filter, launch.sel, launch.first = "", 0, 0
 	launch.painted, launch.launching = false, false
-	launch.prior, _ = tabs.Focused()
-	if !acquireLauncherFocus() {
-		vi.ConsoleLine("gotabwm: launcher unavailable " + launch.err)
-		// Never claim a modal menu while an app still owns keyboard focus.
-		// The always-visible button paints the failed-open error instead.
-		launch.open = launch.sink != 0
-		return
-	}
 	body, r := readAppsFile(appsPath, appsMaxBytes)
 	if r < 0 || body == nil {
 		launch.catalog = nil
@@ -239,15 +259,10 @@ func openLauncher() {
 	} else {
 		launch.catalog = parseAppsTXT(string(body))
 	}
-	launch.filter = ""
-	launch.sel = 0
-	launch.first = 0
-	launch.painted = false
 	launch.reasons = make([]string, len(launch.catalog))
 	for i, e := range launch.catalog {
 		launch.reasons[i] = appUnavailable(e)
 	}
-	launch.open = true
 	launch.refresh()
 	// The manifest's own report, before the launcher's: a reader that
 	// silently ignored every v2 field would still print `launcher open n=14`,
@@ -279,17 +294,30 @@ func dismissLauncher() {
 }
 
 func finishLauncher() {
+	marker := MarkerLaunchDismiss
+	if launch.palette {
+		marker = MarkerPaletteDismiss
+	}
 	launch.open = false
+	launch.palette = false
 	launch.filter = ""
 	launch.painted = false
-	vi.ConsoleLine(MarkerLaunchDismiss)
+	vi.ConsoleLine(marker)
 }
 
 func emitLaunchFilter() {
+	if launch.palette {
+		emitPaletteFilter()
+		return
+	}
 	vi.ConsoleLine(MarkerLaunchFilter + launch.filter + " n=" + vi.Itoa64(int64(len(launch.filtered))))
 }
 
 func execSelected() {
+	if launch.palette {
+		paletteExecSelected()
+		return
+	}
 	if launch.launching {
 		if releaseLauncherFocus(false) {
 			finishLauncher()
@@ -472,6 +500,12 @@ func handleLauncherKey(e vi.Event) bool {
 			openLauncher()
 			return true
 		}
+		if usage == hidUsageP && ctrl && shift {
+			// M121a: the palette's own summon chord is modal too —
+			// toggles an open palette, crosses over from the launcher.
+			openPalette()
+			return true
+		}
 		if len(launch.filter) < filterMax {
 			launch.filter += string(c)
 			launch.refresh()
@@ -555,7 +589,11 @@ func paintLauncher(scan []byte, width, height int) int {
 		written += seatFill(c, widgets.Rect{X: ex + launchEmblem - tok.BorderW, Y: ey, W: tok.BorderW, H: launchEmblem}, tok.Border)
 		seatText(c, strip, ex+24, ey+28, seatTextPx, "SB", tok.InkMuted)
 	}
-	seatText(c, strip, launchX+tok.PadMD, launchY+launchPromptY, seatTextPx, launchPrompt, tok.Ink)
+	prompt := launchPrompt
+	if launch.palette {
+		prompt = palettePrompt
+	}
+	seatText(c, strip, launchX+tok.PadMD, launchY+launchPromptY, seatTextPx, prompt, tok.Ink)
 	// The filter field: an inset control with the §2.3.5 Accent focus
 	// ring (the field IS the focus while the strip is open), the query,
 	// then the caret — the keystroke sink made visible.
@@ -571,7 +609,11 @@ func paintLauncher(scan []byte, width, height int) int {
 		seatText(c, strip, launchX+tok.PadMD, launchY+launchErrY, seatSmallPx, launchText(launch.err, 30), tok.Danger)
 	}
 	if len(launch.filtered) == 0 {
-		seatText(c, strip, launchX+tok.PadMD, launchY+launchHdr+6, seatTextPx, "No matching apps", tok.InkMuted)
+		empty := "No matching apps"
+		if launch.palette {
+			empty = "No matching commands"
+		}
+		seatText(c, strip, launchX+tok.PadMD, launchY+launchHdr+6, seatTextPx, empty, tok.InkMuted)
 	}
 	for i := launch.first; i < len(launch.filtered); i++ {
 		x, y, w, rh, ok := launch.rowRect(i, width, maxH)
@@ -579,21 +621,23 @@ func paintLauncher(scan []byte, width, height int) int {
 			break
 		}
 		ci := launch.filtered[i]
+		if launch.palette {
+			if ci < 0 || ci >= len(launch.results) {
+				continue
+			}
+			row := widgets.Rect{X: x, Y: y, W: w, H: rh}
+			paintLauncherRow(c, row, i == launch.sel)
+			written += seatArea(c, row)
+			e := launch.results[ci]
+			seatText(c, row, x+6, y+3, seatTextPx, launchText(e.label, 29), tok.Ink)
+			seatText(c, row, x+6, y+13, seatSmallPx, launchText(e.detail, 29), tok.Muted)
+			continue
+		}
 		if ci < 0 || ci >= len(launch.catalog) {
 			continue
 		}
 		row := widgets.Rect{X: x, Y: y, W: w, H: rh}
-		if i == launch.sel {
-			// §2.3.6: the selected row is a Selection fill carrying the
-			// 3px Accent left-edge marker — the Zig chrome's bar.
-			draw.FillRoundedRect(c, row, radiusControl, draw.Opaque(tok.Accent))
-			inner := row
-			inner.X += seatMarkerW
-			inner.W -= seatMarkerW
-			draw.FillRoundedRect(c, inner, radiusControl, draw.Opaque(tok.Selection))
-		} else {
-			draw.FillRoundedRect(c, row, radiusControl, draw.Opaque(tok.Surface))
-		}
+		paintLauncherRow(c, row, i == launch.sel)
 		written += seatArea(c, row)
 		ink := tok.Ink
 		reason := ""
@@ -611,6 +655,22 @@ func paintLauncher(scan []byte, width, height int) int {
 		seatText(c, row, x+6, y+6, seatTextPx, launchText(launch.catalog[ci].Label, 29), ink)
 	}
 	return written
+}
+
+// paintLauncherRow fills one result row: the §2.3.6 Selection fill with the
+// 3px Accent left-edge marker when selected, a flat Surface fill otherwise.
+// Both strip faces — the manifest launcher and the M121a palette — share it.
+func paintLauncherRow(c *draw.BufferCanvas, row widgets.Rect, selected bool) {
+	tok := theme.Current
+	if selected {
+		draw.FillRoundedRect(c, row, radiusControl, draw.Opaque(tok.Accent))
+		inner := row
+		inner.X += seatMarkerW
+		inner.W -= seatMarkerW
+		draw.FillRoundedRect(c, inner, radiusControl, draw.Opaque(tok.Selection))
+		return
+	}
+	draw.FillRoundedRect(c, row, radiusControl, draw.Opaque(tok.Surface))
 }
 
 func launchText(s string, max int) string {
