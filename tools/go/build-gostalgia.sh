@@ -56,6 +56,19 @@ if [ ! -x "$FORK_DIR/bin/go" ]; then
     log "provision it once with: bash tools/go/apply.sh && just go-toolchain"
     exit 1
 fi
+# Stage overlays must never live in the fork's src/: a src/gostalgia tree
+# resolves gostalgia/cmd/* in BOTH the stage module and the root std
+# module ("ambiguous import: found package gostalgia/cmd/gssmoke in
+# multiple modules" — #2634). apply.sh no longer copies them and prunes
+# the leak; fail here naming the remedy rather than the cryptic resolver
+# error.
+for d in gostalgia gostalgia-mods; do
+    if [ -e "$FORK_DIR/src/$d" ]; then
+        log "fork src tree carries the stage overlay src/$d —"
+        log "re-run bash tools/go/apply.sh (it removes the leak), then retry"
+        exit 1
+    fi
+done
 
 export GOROOT="$(cd "$FORK_DIR" && pwd)"
 export PATH="$GOROOT/bin:$PATH"
