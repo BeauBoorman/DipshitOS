@@ -229,6 +229,10 @@ the comment header at the top of `image/apps.txt`):
   WASM import contract's Cap names.
 - `opens=` names what the app can be handed: an M81b mime type (`text image
   audio archive binary`) or a URL scheme (`http https`).
+- Every launcher-visible row must open a window (M122c, #2572): a bare
+  launch that can only print usage to the serial console dies silently —
+  `TestManifestHonestyRowsOpenAWindowOrAreSeatBound` fails the row. A
+  pure-CLI tool does not get a row; it is driven from the shell's `exec`.
 - Keep the manifest small: every reader buffers 4096 bytes and a file at or
   over that is truncated at the last whole line, silently dropping tail rows
   from a seat's menu.

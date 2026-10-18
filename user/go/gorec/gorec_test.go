@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"virelai/tabapp"
 	"virelai/vi"
 )
 
@@ -352,5 +353,113 @@ func TestRunDiskPath(t *testing.T) {
 	}
 	if len(f.mkdirs) != 1 || f.mkdirs[0] != "/disk/REC" {
 		t.Fatalf("mkdirs=%v, want [/disk/REC]", f.mkdirs)
+	}
+}
+
+// --- the M122c windowed view ------------------------------------------------
+
+// A bare launch on a window-less host refuses the window honestly: the
+// headless usage line, status 2, and the one terminal marker — never a
+// silent death. The dispatch pin proves the bare argv reaches the view
+// path at all.
+func TestViewFallbackWithoutWindow(t *testing.T) {
+	f := &fakeRig{capInfo: readyInfo()}
+	f.install(t)
+	if rc := dispatch([]string{"GOREC.ELF"}); rc != 2 {
+		t.Fatalf("dispatch(bare) rc=%d, want 2", rc)
+	}
+	if !f.hasLine("gorec: window refused") {
+		t.Fatalf("no refusal line in %v", f.lines)
+	}
+	if f.lastLine() != "gorec: done" {
+		t.Fatalf("last=%q, want gorec: done", f.lastLine())
+	}
+}
+
+// The view's record gesture drives the SAME pipeline the CLI form does:
+// the fake seams see the identical call ladder and the log carries the
+// identical gorec: lines the console got (the tee).
+func TestViewRecordRunsTheSharedPipeline(t *testing.T) {
+	f := &fakeRig{capInfo: readyInfo()}
+	f.install(t)
+	v := newView(&tabapp.TabApp{W: viewW, H: viewH})
+	v.record()
+	if !f.hasLine("gorec: wrote " + viewPath + " seconds=" + vi.Itoa64(viewSeconds)) {
+		t.Fatalf("no wrote line in %v", f.lines)
+	}
+	if len(f.writes) != 1 || f.writes[0].path != viewPath {
+		t.Fatalf("writes=%v", f.writes)
+	}
+	// The in-window log mirrors the console: cap + wrote lines are in it.
+	var inLog bool
+	for _, l := range v.lines {
+		if strings.Contains(l, "gorec: wrote "+viewPath) {
+			inLog = true
+		}
+	}
+	if !inLog {
+		t.Fatalf("view log lacks the receipt: %v", v.lines)
+	}
+	if !strings.HasPrefix(v.capLine, "capture ready=1") {
+		t.Fatalf("capLine=%q", v.capLine)
+	}
+	if v.busy {
+		t.Fatal("busy flag stuck after the record")
+	}
+}
+
+// A refused record is shown, not hidden: ENXIO lands in the log and no
+// file is written.
+func TestViewRecordRefusalIsShown(t *testing.T) {
+	f := &fakeRig{capInfo: readyInfo(), capErr: vi.ErrNoAudioDevice}
+	f.install(t)
+	v := newView(&tabapp.TabApp{W: viewW, H: viewH})
+	v.record()
+	if len(f.writes) != 0 {
+		t.Fatalf("a refused record wrote: %v", f.writes)
+	}
+	var shown bool
+	for _, l := range v.lines {
+		if strings.Contains(l, "refused ENXIO") {
+			shown = true
+		}
+	}
+	if !shown {
+		t.Fatalf("refusal not in view log: %v", v.lines)
+	}
+}
+
+// The log is bounded — a long session cannot grow it.
+func TestViewLogBounded(t *testing.T) {
+	f := &fakeRig{capInfo: readyInfo()}
+	f.install(t)
+	v := newView(&tabapp.TabApp{W: viewW, H: viewH})
+	for i := 0; i < viewLogMax*3; i++ {
+		v.say("x")
+	}
+	if len(v.lines) != viewLogMax {
+		t.Fatalf("log n=%d, want %d", len(v.lines), viewLogMax)
+	}
+}
+
+// The whole bare-launch path, pinned: when the window opens, the view
+// reaches its event loop (PollEventRaw's ENOSYS exits it on the host) —
+// `gorec: view open id=` is the marker a seat leg can assert.
+func TestViewRunsWhenWindowOpens(t *testing.T) {
+	f := &fakeRig{capInfo: readyInfo()}
+	f.install(t)
+	old := openViewWindow
+	openViewWindow = func(tabapp.Config) *tabapp.TabApp {
+		return &tabapp.TabApp{Win: 7, W: viewW, H: viewH, OpenOK: true}
+	}
+	defer func() { openViewWindow = old }()
+	if rc := dispatch([]string{"GOREC.ELF"}); rc != 0 {
+		t.Fatalf("dispatch(bare) with a window rc=%d, want 0", rc)
+	}
+	if !f.hasLine("gorec: view open id=7") {
+		t.Fatalf("no open marker in %v", f.lines)
+	}
+	if f.lastLine() != "gorec: done" {
+		t.Fatalf("last=%q, want gorec: done", f.lastLine())
 	}
 }

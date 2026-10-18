@@ -50,11 +50,14 @@ NAME_MAX = 64
 
 # The non-manifest half of the fleet — shipped service/helper ELFs the
 # M113f audit exercised beside the apps.txt roster (plus GOSSH.ELF, which
-# the card names and the audit could not collect).
+# the card names and the audit could not collect). M122c (#2572) moved
+# three pure-CLI tools out of the manifest — a launcher row must open a
+# window — but they still ship and still `exec`, so their grant rows stay.
 SERVICE_FLEET = [
     "GOTABWM.ELF", "GOFETCH.ELF", "GOPING.ELF", "GOHTTPD.ELF",
     "GOSSHD.ELF", "GOBUILD.ELF", "FLINT.ELF", "STORE.ELF",
     "AGENTD.ELF", "INIT.ELF", "GOHELLO.ELF", "GOSSH.ELF",
+    "GOSNAP.ELF", "GODIFF.ELF", "ZC.BIN",
 ]
 
 

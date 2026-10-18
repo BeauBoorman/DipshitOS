@@ -232,8 +232,11 @@ func TestSummarizeAppsCountsRowsAndTheHighestVersion(t *testing.T) {
 		t.Fatalf("read image/apps.txt: %v", err)
 	}
 	s := SummarizeApps(parseAppsTXT(string(b)))
-	if s.Rows != 21 {
-		t.Fatalf("rows = %d want 21 (the honest catalog)", s.Rows)
+	// M122c (#2572) purged the three ghost rows (GODIFF/ZC.BIN/GOSNAP — a
+	// click could only die on a usage line or a silent serial write), so
+	// the honest catalog is 18 rows.
+	if s.Rows != 18 {
+		t.Fatalf("rows = %d want 18 (the honest catalog)", s.Rows)
 	}
 	// The receipt's headline: the manifest declares v2 rows, so a reader that
 	// ignored the tail would report v=0 and fail here.
@@ -340,6 +343,109 @@ func TestManifestCapsAreTheDeclaredVocabulary(t *testing.T) {
 			if !known[c] {
 				t.Fatalf("%s declares cap %q, outside the vocabulary %v", e.Bin, c, declared)
 			}
+		}
+	}
+}
+
+// --- M122c (#2572): manifest honesty ----------------------------------------
+
+// catalogHonesty is the gateable claim about every row a person can see in
+// the launcher: a click either opens a window ("window" — the proof file
+// named here must carry a window-open call) or is a seat-reserved name the
+// launcher refuses with a named reason ("seat"). A row absent from this
+// table fails the test — the catalog may not offer a launch that dies on a
+// usage line, and there is no bound terminal wrapper in the exec ABI to
+// launder one through (a spawned process's console writes go to serial,
+// never to a window's tty).
+var catalogHonesty = []struct {
+	bin   string
+	kind  string // "window" | "seat"
+	proof string // "window" rows: repo-relative file that opens the window
+}{
+	{"GOCALC.ELF", "window", "user/go/calc/main.go"},
+	{"NOTE.ELF", "window", "user/go/note/main.go"},
+	{"GOEDIT.ELF", "window", "user/go/edit/main.go"},
+	{"GOFILES.ELF", "window", "user/go/files/main.go"},
+	{"GOTERM.ELF", "window", "user/go/term/main.go"},
+	{"WEB.ELF", "window", "user/go/browser/main.go"},
+	{"PULSE.ELF", "window", "user/go/pulse/main.go"},
+	{"GOSH.ELF", "window", "user/go/sh/main.go"},
+	{"GOHELP.ELF", "window", "user/go/help/main.go"},
+	{"GOTOP.ELF", "window", "user/go/top/main.go"},
+	{"GOSET.ELF", "window", "user/go/goset/main.go"},
+	{"GOVIEW.ELF", "window", "user/go/view/main.go"},
+	{"GOSOUND.ELF", "window", "user/go/sound/main.go"},
+	{"GOSTALGIA.ELF", "window", "user/go/gsport/tty/tty.go"},
+	{"GOSTORE.ELF", "window", "user/go/gostore/main.go"},
+	{"GOINFER.ELF", "window", "user/go/goinfer/view.go"},
+	{"GOREC.ELF", "window", "user/go/gorec/view.go"},
+	{"TABWM.BIN", "seat", ""},
+}
+
+// windowMarkers are the calls that open (or bind) a window in this tree:
+// the tabapp path every Go app takes, or the raw window/tty syscalls an
+// app issues directly. A proof file containing none of them cannot be a
+// window row's bare launch.
+var windowMarkers = []string{
+	"tabapp.Init",
+	"tabapp.Attach",
+	"WinOpen(",
+	"TtyAttachWindow(",
+}
+
+func TestManifestHonestyRowsOpenAWindowOrAreSeatBound(t *testing.T) {
+	b, err := os.ReadFile("../../../image/apps.txt")
+	if err != nil {
+		t.Fatalf("read image/apps.txt: %v", err)
+	}
+	byBin := map[string]struct {
+		kind  string
+		proof string
+	}{}
+	for _, r := range catalogHonesty {
+		byBin[r.bin] = struct {
+			kind  string
+			proof string
+		}{r.kind, r.proof}
+	}
+	seen := map[string]bool{}
+	for _, e := range parseAppsTXT(string(b)) {
+		seen[e.Bin] = true
+		r, ok := byBin[e.Bin]
+		if !ok {
+			t.Fatalf("catalog row %s has no honesty entry — every launcher "+
+				"row must open a window (proof) or be a seat name", e.Bin)
+		}
+		switch r.kind {
+		case "seat":
+			// The launcher refuses these with the named reason before any
+			// staging probe, so the row is never a silent death.
+			if reason := appUnavailable(e); reason == "" {
+				t.Fatalf("seat row %s is launchable", e.Bin)
+			}
+		case "window":
+			src, err := os.ReadFile("../../../" + r.proof)
+			if err != nil {
+				t.Fatalf("%s proof %s unreadable: %v", e.Bin, r.proof, err)
+			}
+			found := false
+			for _, m := range windowMarkers {
+				if strings.Contains(string(src), m) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("%s: %s carries no window-open call — the row "+
+					"claims a window it cannot open", e.Bin, r.proof)
+			}
+		default:
+			t.Fatalf("honesty entry for %s has unknown kind %q", e.Bin, r.kind)
+		}
+	}
+	for bin := range byBin {
+		if !seen[bin] {
+			t.Fatalf("honesty entry %s is stale — no such catalog row", bin)
 		}
 	}
 }
