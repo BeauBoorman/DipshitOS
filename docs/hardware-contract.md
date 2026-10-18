@@ -575,6 +575,44 @@ Non-PCI platform facts:
 - The project targets Apple silicon / Virtualization.framework only; there
   is no QEMU path.
 
+## Capacity bounds (measured ceilings)
+
+M129c (#2612): every row below is a deliberate bound, not a stall — a
+caller that reaches one is refused by name. Each row gives the ceiling,
+the pinned constant (file or ADR), the symptom at the wall, and the leg
+that measured it. "Measured" means observed on a live boot; comptime
+constants are cited where they live. The live occupancy lines come from
+the monitor's `resources` command; the saturation run is
+`live-m16-resources` run 01 on this branch (2026-10-18): 13 concurrent
+`COUNTER.BIN`s take `tasks=3/16 → 16/16`, `procs=1/16 → 14/16`,
+`tables=38 → 306/512`, and the 14th `exec` prints `error: no free
+scheduler pool slot`. `live-sysinfo` run 01 reports `memory: usable=
+0x0febf000` (~255 MiB of the compiled 256 MiB).
+
+| Bound | Ceiling | Symptom at the wall | Source / measured by |
+|-------|---------|---------------------|----------------------|
+| Scheduler task pool | 16 slots = shell + worker + idle + **13 EL0t user slots** | `pool_full` → ENOSPC; serial `error: no free scheduler pool slot` | `scheduler.max_tasks` (`kernel/src/scheduler.zig`); **[observed]** `live-m16-resources` — 13 user programs fill it, the 14th refuses |
+| Concurrent Go runtimes | ~4 at `GOMAXPROCS=1` (3 tasks/runtime → 12+3=15/16); ~3 at compiled `GOMAXPROCS=2` (4 Ms/runtime → 12+3=15/16) | same `pool_full` wall — the one remaining user slot is not another seat | ADR 0027 D1/D6 (one M per task), ADR 0052; **[observed]** `go-wm-hid` run 07 seats four runtimes (seat+GOEDIT+GOTERM+GOCALC) exactly at the budget |
+| Process registry | 16 | `process_full` → ENOSPC; `process registry exhausted (all processes live; wait for one to exit)` | `process.max_processes` (`kernel/src/process.zig`); **[observed]** `live-m16-resources` `procs=14/16` |
+| Page-table carve-out | 512 pages (2 MiB fixed BSS; the count cursor is monotonic — rebuilds are never reclaimed) | `table_full` → ENOSPC; `page-table carve-out exhausted (too many user-root rebuilds)` | `mmu.table_page_count` (`kernel/src/mmu.zig`); **[observed]** M16 C4 claim 2714 — the composition needed 282 pages and outgrew the old 256 |
+| File handles per process | 8 | `-5` = ENOSPC (`HandleLimit` / table full) on open | `file_table.max_handles_per_process` (`kernel/src/file_table.zig`), ADR 0010; **[observed]** `live-m16-resources` `fds=8` |
+| Host share handle table | 8 slots (parity with the guest ABI — write cursors live on the host) | wire status `6` (handle error) | `VFWire.FileHandleTable` + `kernel/src/virtio_file.zig`; cap unit-tested host-side (`swift test`) |
+| Event FIFO / mailbox ring | 64 events, 32 messages per process | ENOSPC (-5) checked before any bytes are copied | `events.max_events`, `mailbox.max_messages`; **[observed]** `live-m16-resources` `events=64 mbox=32` |
+| User windows | 8 slots (ids 2..9; the registry total `max_windows` is 13) | `sys_win_open` → ENOSPC (-5) when all eight are open; ENOMEM (-10) when the pool has no contiguous run | `driving_award.user_windows_max` / `user_open`; occupancy audited live (`resources: windows=N/13`) |
+| mmap regions per process | 16 | `sys_mmap` → ENOMEM (-10) when `add_mmap_region` fails at the ceiling | `process.max_mmap_regions`; `go-stress` header: the kernel's loud-refusal budget, observed 8 on the landed roster |
+| Native TCP socket table | 4 listeners + 4 connections, ≤4 owners, ≤2 accepted children per listener, 24 KiB per-connection budget | `Capacity` → ENOSPC → `vi.ErrConnBusy` | `socket_core.zig` `listener_limit`/`conn_limit`/`owner_limit`/`child_limit`/`core_limit`; bounded table landed M99f/g (#2184/#2185) |
+| TCP window / segment | fixed advertised window 4096; payload ≤1460 B per segment (our MSS 1460); fixed src port 8000 on the legacy monitor client | oversized payload truncated honestly; peer RST kills the connection (`connection refused`) | `tcp.zig` `window`/`payload_max`/`our_mss`; **[observed]** `live-net-tcp-syscall` asserts the refusal packet `window=4096` |
+| Terminals | 4 | `terminal.create` → null → `-5` ENOSPC on the `/dev/tty` open | `terminal.max_terminals` (`kernel/src/terminal.zig`), minted lazily in `file_table.zig` |
+| Tabs (GOTABWM seat) | 16 | `full()` declines a new tab; persisted `.tabs` v2 state is ≤1110 B | `tabwm.max_tabs` (`user/src/tabwm.zig`), `gotabwm.MaxTabs` (ADR 0033 cap), `tools/go/tabcodec` |
+| EL0 share I/O rate | 2048 B per `sys_file_read`/`sys_file_write` call — the EL0 surface, not the wire (reply cap is 32 KiB) | a larger write is refused ENOSPC; a larger read truncates to 2048 — a payload costs ~15× more round trips than the wire needs; measured ~30 MB/s | `syscall.zig` cap; **[observed]** `go-hello` run 04: a 9,502,880 B read in 4,641 calls / 298,379 µs / 64,292 ns per call (CNTPCT_EL0) |
+| Host-file-channel wire caps | LIST ≤128 rows; READ ≤32,765 B/reply; WRITE ≤32,763 B/round trip; path ≤255 B; reply ≤32,768 B | status `3` (truncated) / `5` (exists) / `6` (handle error) | `virtio_file.reply_cap`/`write_chunk_max`, `VFWire`; byte-pinned by `tests/vf-*.bin` (`tools/verify-vf-class-a.sh`) |
+| vsock transport | 8 descriptors per queue; rx pool 4×2048 B; event pool 2×64 B; default host-listen port 1208 | unlistened port → `OP_RST` (`vsock: refused port=`) | `kernel/src/virtio_vsock.zig`; **[observed]** `live-vsock-restore` / M115a #2460 — connect accepted on 1208, RST on 9 |
+| Exec wait budget | `execWaitNs` = 15 s per spawned-child wait (the default `vi.Wait` budget is 120 s) | deadline → `vi.ErrWaitGone` ("wait: target not waitable") | `user/go/store/install.go`, `user/go/vi/proc.go`; **[observed]** M109f #2402 — a fresh-share FLINT clone lands `clone ok` ~21 s, past the bound: `live-agent-loop` run 06 fails 0/5 on a quiet host; margin card #2522 |
+| Host recorder | `hardCap` = 60 s at `fps` = 15 (≤ ~900 frames per take) | the cap timer ends the take honestly; receipt `recording=off frames=N bytes=B` | `HostRecorder.swift` (M114e #2458); **[observed]** `live-host-ui` run 05 drives record-start/record-stop; `HostRecorderTests` pin the cap |
+| Guest RAM (compiled default) | 256 MiB (`config.memorySize`); allocator bitmap + COW refcounts + identity map all span a fixed 4 GiB, so raising `memoryMiB` needs no kernel change | physical allocator exhausted → `out_of_memory` → ENOSPC `out of physical pages (text/stack/exception stack)` | `main.swift` `config.memorySize`; **[observed]** `live-sysinfo` `usable=0x0febf000`. M129a (#2610, parallel) moves the compiled default to 512 MiB — the task pool above stays the first concurrency binder |
+| Per-app RAM / exec image | file ≤32 MiB (`exec_image_max` → `image_too_large`); initialized bytes ≤32 MiB (`elf.load_max` → `segment_too_large`); mapped bytes ≤64 MiB (`elf.map_max` → `map_too_large`); one Go app costs ~45 MiB (32 MiB FIPS `.noptrbss` + eager BSS) | the named loader refusals, then `out_of_memory` past ~4-5 concurrent heavy apps | `kernel/src/exec.zig`/`elf.zig`, M72a #1579; per-app figure **[inferred]** from the index #2557 investigation — the M129a leg re-measures free pages at 512 |
+| Application timer | 1 countdown per process | second `sys_timer_set` re-arms the single slot (no queue) | `kernel/src/app_timers.zig`; **[observed]** `live-m16-resources` `timers=1` |
+
 ## Instruction set
 
 - **AArch64 (ARMv8 / ARMv9-A)**. All guest code compiles for
