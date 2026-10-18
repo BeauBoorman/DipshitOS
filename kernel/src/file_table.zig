@@ -1220,7 +1220,10 @@ pub fn set_mode(pid: u64, path_bytes: []const u8, mode: u16) i64 {
     // is a gate denial, never a persistence outcome.
     if (parsed.partition == .host and policyPinned(actorFor(pid), subpath, .admin)) return -7;
     var st = virtio_file.StatResult{};
-    if (virtio_file.stat(subpath, &st) != virtio_file.st_ok) return -6; // existing path only
+    // #2495: only a real not-found is ENOENT — a transport failure maps
+    // to EINVAL like every other residual host error.
+    const st_status = virtio_file.stat(subpath, &st);
+    if (st_status != virtio_file.st_ok) return hf_open_errno(st_status);
     switch (trust.set_mode(actorFor(pid), .host, subpath, mode)) {
         .ok => {},
         .eacces => return -7,
@@ -1699,7 +1702,12 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
         return @intCast(slot);
     }
     var st = virtio_file.StatResult{};
-    if (virtio_file.stat(subpath, &st) != virtio_file.st_ok) return -6; // ENOENT
+    // #2495: only a real not-found is ENOENT — a transport failure
+    // (timeout, host error) flattened to ENOENT here was the "served file
+    // reads ENOENT" signature; the residual maps to EINVAL like the
+    // write-open path already does.
+    const st_status = virtio_file.stat(subpath, &st);
+    if (st_status != virtio_file.st_ok) return hf_open_errno(st_status);
     if (st.is_dir) return -1; // EINVAL: a directory opens as its own path, not a handle
     handles[pid][slot] = .{
         .in_use = true,
