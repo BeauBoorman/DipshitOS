@@ -65,10 +65,14 @@ vgate_share seed
 vgate_setup_python <<'SPY'
 import os, shutil, sys
 share = os.path.join(os.environ["RUN_DIR"], "share")
-src = os.path.join(".build", "go", "GOTERM.ELF")
-if not os.path.isfile(src):
-    sys.exit("GOTERM.ELF missing: bash tools/go/build-goterm.sh")
-shutil.copy(src, os.path.join(share, "GOTERM.ELF"))
+# The focused-terminal input route needs a live seat declare — stage the
+# WM so autostart seats it instead of falling back to the shim.
+for name, script in (("GOTABWM.ELF", "build-gotabwm.sh"),
+                     ("GOTERM.ELF", "build-goterm.sh")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.isfile(src):
+        sys.exit("%s missing: bash tools/go/%s" % (name, script))
+    shutil.copy(src, os.path.join(share, name))
 SPY
 
 vgate_file script.txt <<'EOF'
