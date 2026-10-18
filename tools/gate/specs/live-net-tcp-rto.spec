@@ -139,7 +139,22 @@ if not re.search(r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 5
     sys.exit("FAIL: no SYN line")
 # The capture: ARP + SYN + handshake ACK = 150 B, exactly ONE SYN.
 d = open(os.environ["RUN_DIR"] + "/b-cap.bin", "rb").read()
-assert len(d) == 150, len(d)
+# M117b NDP frames pad the capture: the 150-byte pin applies to the
+# non-v6 bytes (ARP + SYN + handshake ACK), not the whole file.
+off = 0
+v4_bytes = 0
+while off < len(d):
+    et = d[off+12:off+14]
+    if et == b"\x86\xdd":
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
+    elif et == b"\x08\x00":
+        n = 14 + ((d[off+16] << 8) | d[off+17])
+        v4_bytes += n
+        off += n
+    else:
+        v4_bytes += 42
+        off += 42
+assert v4_bytes == 150, (v4_bytes, len(d))
 off = 0
 tcpf = []
 while off < len(d):
