@@ -28,10 +28,17 @@
 #      for the classic floating-window WM. When the Go seat or its starter
 #      shell cannot be built, the rc falls back to `tabwm start` and says so.
 #
-# The canonical `artifacts/disk.img` is attached READ-ONLY through a
-# throwaway ASIF overlay, so a session never mutates the shared gate image.
-# User files, settings, history, and the wallpaper live in the share and
-# persist between sessions.
+# M115c (issue #2462): the session is a PERSISTENT machine. Everything that
+# used to be thrown away per run lives in a `.virelaivm` profile bundle
+# (default artifacts/session.virelaivm): the EFI variable store, the ASIF
+# overlay over the read-only gate image (boot-disk writes now survive a
+# relaunch), the vlfs.img data disk, the share/ directory, the machine
+# identifier, and the saved-state/ dir reserved for M115d. The bundle's
+# manifest also pins a stable identity the packaged session app stamps as
+# its CFBundleIdentifier at a stable path, so macOS TCC sees ONE
+# responsible process across sessions and sound/notify grants stick.
+# User files, settings, history, and the wallpaper live in the profile's
+# share/ and persist between sessions.
 #
 # Apple silicon + macOS 27+ only (Virtualization.framework + DiskImageKit).
 # This is NOT a gate and is not run in CI.
@@ -48,7 +55,8 @@
 #   --no-net-nat     do not attach the NAT network device
 #
 # Environment:
-#   VIRELAI_SESSION_SHARE=<dir>      share directory (default artifacts/session-share)
+#   VIRELAI_SESSION_PROFILE=<path>   .virelaivm bundle (default artifacts/session.virelaivm)
+#   VIRELAI_SESSION_SHARE=<dir>      share directory (default <profile>/share)
 #   VIRELAI_SESSION_NO_TABWM=1       no seat autostart: the floating-window WM
 #   VIRELAI_SESSION_NO_GOTABWM=1     do not build/stage the Go seat and shell
 #                                    (the rc then falls back to `tabwm start`)
@@ -76,7 +84,8 @@ for arg in "$@"; do
     esac
 done
 
-SHARE="${VIRELAI_SESSION_SHARE:-$ROOT/artifacts/session-share}"
+PROFILE="${VIRELAI_SESSION_PROFILE:-$ROOT/artifacts/session.virelaivm}"
+SHARE="${VIRELAI_SESSION_SHARE:-$PROFILE/share}"
 SERIAL_LOG="$ROOT/artifacts/session-serial.log"
 RUNNER="host/vm-runner/.build/release/VMRunner"
 
@@ -92,6 +101,31 @@ fi
 
 [ -x "$RUNNER" ] || { echo "session: ERROR — $RUNNER is missing; run 'just session' without VIRELAI_SESSION_SKIP_BUILD=1 (or build it with 'swift build --package-path host/vm-runner --configuration release -Xswiftc -DSPIKE')"; exit 1; }
 [ -f "$ROOT/artifacts/disk.img" ] || { echo "session: ERROR — artifacts/disk.img is missing; create it with 'zig build image'"; exit 1; }
+
+# --- 1b. mint/validate the profile bundle BEFORE seeding --------------------
+# --profile-init exits after create-or-load: an absent path is minted, an
+# existing bundle is validated, and a corrupt manifest refuses by name here
+# rather than mid-boot.
+"$RUNNER" --profile "$PROFILE" --profile-init
+# Pin the boot base image absolutely so the bundle boots from any cwd.
+python3 - "$PROFILE/config.json" "$ROOT/artifacts/disk.img" <<'PY'
+import json, os, sys, tempfile
+cfg_path, base = sys.argv[1], os.path.abspath(sys.argv[2])
+with open(cfg_path) as f:
+    cfg = json.load(f)
+if cfg.get("baseImage") != base:
+    cfg["baseImage"] = base
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg_path))
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, cfg_path)
+PY
+# One-time migration: a pre-M115c default share moves into the bundle.
+if [ -z "${VIRELAI_SESSION_SHARE:-}" ] && [ -d "$ROOT/artifacts/session-share" ] && [ -z "$(ls -A "$SHARE" 2>/dev/null)" ]; then
+    echo "session: migrating artifacts/session-share into $SHARE"
+    cp -R "$ROOT/artifacts/session-share/." "$SHARE/"
+fi
 
 # --- 2. seed the persistent share (idempotent; never clobbers user files) ---
 mkdir -p "$SHARE"
@@ -259,20 +293,37 @@ if [ "$HOST_INT" = "1" ]; then
 fi
 
 # --- 4. boot ----------------------------------------------------------------
-# Per-run throwaway EFI variable store; the disk image stays pristine via
-# --overlay-base (a fresh ASIF overlay is discarded at runner exit).
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/virelai-session.XXXXXX")"
-cleanup() { rm -rf "$RUN_DIR"; }
-trap cleanup EXIT
+# The only per-run scratch is run/session-start.txt inside the bundle; EFI
+# vars, the boot overlay, vlfs.img, share/ and machine-id.bin persist.
+# The Go seat's startup probe waits for a focus-loss event after opening its
+# own window. In an automated gate the harness focuses the monitor window;
+# provide the same one-shot handoff here so a fresh desktop reaches its shell
+# workspace without requiring a startup click.
+mkdir -p "$PROFILE/run"
+printf '%s\n' 'dui focus 0' > "$PROFILE/run/session-start.txt"
 
-# Package only this invocation's runner, not the share. Launch its executable
-# directly so the terminal owns/waits for the VM process (not `open`'s helper).
-# The raw VMRunner remains the CLI gate entrypoint.
-SESSION_APP="$RUN_DIR/VirelaiOS.app"
+# Package the runner INSIDE the profile at a stable path, stamped with the
+# manifest's identity as CFBundleIdentifier. A stable path + a stable bundle
+# id + a signature refreshed only when the binary changes is what keeps
+# macOS TCC treating every session as ONE responsible process. Launch the
+# executable directly so the terminal owns/waits for the VM process (not
+# `open`'s helper). The raw VMRunner remains the CLI gate entrypoint.
+SESSION_APP="$PROFILE/VirelaiOS.app"
 mkdir -p "$SESSION_APP/Contents/MacOS"
-cp "$ROOT/host/vm-runner/Resources/Session-Info.plist" "$SESSION_APP/Contents/Info.plist"
-cp "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS"
-codesign --force --sign - --entitlements "$ROOT/host/vm-runner/entitlements.plist" "$SESSION_APP"
+python3 - "$ROOT/host/vm-runner/Resources/Session-Info.plist" \
+          "$SESSION_APP/Contents/Info.plist" "$PROFILE/manifest.json" <<'PY'
+import json, plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    plist = plistlib.load(f)
+with open(sys.argv[3]) as f:
+    plist["CFBundleIdentifier"] = json.load(f)["identity"]
+with open(sys.argv[2], "wb") as f:
+    plistlib.dump(plist, f)
+PY
+if ! cmp -s "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS" || ! codesign --verify "$SESSION_APP" >/dev/null 2>&1; then
+    cp "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS"
+    codesign --force --sign - --entitlements "$ROOT/host/vm-runner/entitlements.plist" "$SESSION_APP"
+fi
 
 RUNNER_PID=""
 end_session() {
@@ -288,12 +339,6 @@ end_session() {
 trap 'end_session INT 130' INT
 trap 'end_session TERM 143' TERM
 trap 'end_session HUP 129' HUP
-
-# The Go seat's startup probe waits for a focus-loss event after opening its
-# own window. In an automated gate the harness focuses the monitor window;
-# provide the same one-shot handoff here so a fresh desktop reaches its shell
-# workspace without requiring a startup click.
-printf '%s\n' 'dui focus 0' > "$RUN_DIR/session-start.txt"
 
 LANE_FLAGS=()
 if [ "$HOST_INT" = "1" ]; then
@@ -323,7 +368,8 @@ fi
 cat <<EOF
 
 The guest serial log is written to artifacts/session-serial.log.
-Your files persist in: $SHARE
+The machine persists in: $PROFILE
+  (boot overlay, EFI vars, vlfs.img, share/, machine id, saved-state/)
 Close the VM window, choose Quit VirelaiOS (Cmd-Q), or press Ctrl-C here
 to stop the VM. Rerun this command to relaunch; VM RAM is not persisted.
 
@@ -332,10 +378,10 @@ EOF
 # A GUI parent's bundle identity belongs to that app, not this CLI runner.
 # Do not let macOS associate the independent VM window with Factory/Terminal.
 env -u __CFBundleIdentifier "$SESSION_APP/Contents/MacOS/VirelaiOS" \
-    --overlay-base "$ROOT/artifacts/disk.img" --vars "$RUN_DIR/efi-vars.bin" \
+    --profile "$PROFILE" \
     --serial "$SERIAL_LOG" \
     --cvc-file "$SHARE" \
-    --script "$RUN_DIR/session-start.txt" --script-after 'gotabwm: win focus' \
+    --script "$PROFILE/run/session-start.txt" --script-after 'gotabwm: win focus' \
     --display --input --host-session \
     "${LANE_FLAGS[@]}" \
     --timeout 0 &

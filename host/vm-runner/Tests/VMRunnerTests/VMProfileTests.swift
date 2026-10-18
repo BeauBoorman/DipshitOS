@@ -1,0 +1,292 @@
+// VMProfileTests — M115c (issue #2462): the .virelaivm bundle contract,
+// pinned without a VM. Create, manifest-gated load (missing/corrupt/
+// foreign/unsafe members refuse BY NAME), atomic save, round trip.
+import XCTest
+@testable import VMProfile
+
+final class VMProfileTests: XCTestCase {
+    private var tmpDir: URL!
+
+    override func setUpWithError() throws {
+        tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmprofile-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        // A refusal test marks the bundle read-only; restore so cleanup works.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                               ofItemAtPath: tmpDir.path)
+        for child in (try? FileManager.default.contentsOfDirectory(atPath: tmpDir.path)) ?? [] {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                                   ofItemAtPath: tmpDir.appendingPathComponent(child).path)
+        }
+        try? FileManager.default.removeItem(at: tmpDir)
+    }
+
+    private func bundleURL(_ name: String = "test.virelaivm") -> URL {
+        tmpDir.appendingPathComponent(name, isDirectory: true)
+    }
+
+    // MARK: create
+
+    /// Create lays down the whole skeleton: manifest + config parse, the
+    /// share/ and saved-state/ dirs exist, and machine-id.bin is one uuid_t.
+    func testCreateWritesBundleSkeleton() throws {
+        let url = bundleURL()
+        let p = try VMProfile.create(at: url)
+        XCTAssertTrue(p.created)
+        XCTAssertEqual(p.identity, "org.virelaios.vm.test")
+        XCTAssertEqual(p.name, "test")
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: p.manifestURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: p.configURL.path))
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: p.shareURL.path, isDirectory: &isDir) && isDir.boolValue)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: p.savedStateURL.path, isDirectory: &isDir) && isDir.boolValue)
+        // The identifier's bytes are VZ's shape, not ours — minted by the
+        // runner at first boot, so absent on a fresh bundle.
+        XCTAssertNil(p.machineIdentifierData())
+
+        // The manifest is self-describing: format tag + the member map.
+        let raw = try JSONSerialization.jsonObject(with: Data(contentsOf: p.manifestURL)) as? [String: Any]
+        XCTAssertEqual(raw?["format"] as? String, VMProfile.formatID)
+        let members = raw?["members"] as? [String: String]
+        XCTAssertEqual(members?["config"], "config.json")
+        XCTAssertEqual(members?["efiVars"], "efi-vars.bin")
+        XCTAssertEqual(members?["overlay"], "overlay.asif")
+        XCTAssertEqual(members?["vlfs"], "vlfs.img")
+        XCTAssertEqual(members?["machineIdentifier"], "machine-id.bin")
+        XCTAssertEqual(members?["savedState"], "saved-state")
+        XCTAssertEqual(members?["share"], "share")
+    }
+
+    /// Create never adopts an existing path: a directory already there is
+    /// refused by name, a regular file is refused as not-a-bundle.
+    func testCreateRefusesExistingPath() throws {
+        let url = bundleURL("occupied.virelaivm")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try VMProfile.create(at: url)) { error in
+            guard case .missingManifest(let p) = error as? VMProfile.ProfileError else {
+                return XCTFail("expected missingManifest, got \(error)")
+            }
+            XCTAssertEqual(p, url.path)
+        }
+        let file = bundleURL("afile.virelaivm")
+        try Data().write(to: file)
+        XCTAssertThrowsError(try VMProfile.create(at: file)) { error in
+            guard case .notRegularFile(let p) = error as? VMProfile.ProfileError else {
+                return XCTFail("expected notRegularFile, got \(error)")
+            }
+            XCTAssertEqual(p, file.path)
+        }
+    }
+
+    // MARK: round trip
+
+    /// A non-default config + identity survives save → load exactly, and the
+    /// machine identifier minted at create is the SAME bytes after reload —
+    /// the stable identity the bundle exists to pin.
+    func testRoundTrip() throws {
+        let url = bundleURL("workstation.virelaivm")
+        var devices = VMProfile.Devices()
+        devices.sound = true
+        devices.display = true
+        devices.input = true
+        devices.netNat = true
+        devices.vsock = true
+        let config = VMProfile.Config(cpus: 4, memoryMiB: 512,
+                                      baseImage: "/abs/path/disk.img", devices: devices)
+        let minted = try VMProfile.create(at: url, name: "workstation",
+                                          identity: "org.virelaios.vm.workstation",
+                                          config: config)
+        // The runner mints the identifier via VZ at first boot; persist a
+        // blob here and require the SAME bytes after reload — the stable
+        // identity the bundle exists to pin.
+        let identifier = Data((0..<70).map { UInt8($0) })
+        try minted.setMachineIdentifier(identifier)
+        let loaded = try VMProfile.load(from: url)
+        XCTAssertFalse(loaded.created)
+        XCTAssertEqual(loaded.identity, "org.virelaios.vm.workstation")
+        XCTAssertEqual(loaded.name, "workstation")
+        XCTAssertEqual(loaded.config, config)
+        XCTAssertEqual(loaded.members, minted.members)
+        XCTAssertEqual(loaded.machineIdentifierData(), identifier,
+                       "the machine identifier must not change across loads")
+    }
+
+    /// Edits persist through save: a mutated config reloads identically.
+    func testSavePersistsEdits() throws {
+        let url = bundleURL()
+        var p = try VMProfile.create(at: url)
+        p.config.cpus = 8
+        p.config.memoryMiB = 1024
+        p.config.devices.vsock = true
+        try p.save()
+        let reloaded = try VMProfile.load(from: url)
+        XCTAssertEqual(reloaded.config.cpus, 8)
+        XCTAssertEqual(reloaded.config.memoryMiB, 1024)
+        XCTAssertTrue(reloaded.config.devices.vsock)
+    }
+
+    // MARK: atomic save
+
+    /// The save is write-tmp-then-rename: when the bundle directory is
+    /// read-only the write leg fails and the PREVIOUS manifest survives
+    /// byte-identical — never a truncated file — and no temp file leaks.
+    func testAtomicSaveFailurePreservesManifest() throws {
+        let url = bundleURL()
+        var p = try VMProfile.create(at: url)
+        let before = try FileManager.default.contentsOfDirectory(atPath: url.path).sorted()
+        let manifestBefore = try Data(contentsOf: p.manifestURL)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o555],
+                                              ofItemAtPath: url.path)
+        p.config.cpus = 7
+        XCTAssertThrowsError(try p.save()) { error in
+            guard case .couldNotSave = error as? VMProfile.ProfileError else {
+                return XCTFail("expected couldNotSave, got \(error)")
+            }
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: url.path)
+
+        XCTAssertEqual(try Data(contentsOf: p.manifestURL), manifestBefore,
+                       "a failed save must leave the old manifest intact")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: url.path).sorted(),
+                       before, "a failed save must not leak a temp file into the bundle")
+        // The bundle still loads — the refusal did not poison it.
+        XCTAssertNoThrow(try VMProfile.load(from: url))
+    }
+
+    /// A successful save swaps the file wholesale: manifest and config are
+    /// both re-written and still parse.
+    func testSaveIsAtomicWholesale() throws {
+        let url = bundleURL()
+        var p = try VMProfile.create(at: url)
+        p.name = "renamed"
+        p.config.cpus = 1
+        try p.save()
+        let loaded = try VMProfile.load(from: url)
+        XCTAssertEqual(loaded.name, "renamed")
+        XCTAssertEqual(loaded.config.cpus, 1)
+    }
+
+    // MARK: manifest refusals
+
+    /// A directory with no manifest refuses by NAME — the error carries the
+    /// manifest path, not just "missing".
+    func testMissingManifestRefusesByName() throws {
+        let url = bundleURL("bare.virelaivm")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            guard case .missingManifest(let p) = error as? VMProfile.ProfileError else {
+                return XCTFail("expected missingManifest, got \(error)")
+            }
+            XCTAssertEqual(p, url.appendingPathComponent("manifest.json").path)
+        }
+    }
+
+    /// Undecodable manifest bytes refuse as corrupt, naming the file.
+    func testCorruptManifestRefusesByName() throws {
+        let url = bundleURL()
+        _ = try VMProfile.create(at: url)
+        let manifest = url.appendingPathComponent("manifest.json")
+        try Data("not json {{{".utf8).write(to: manifest)
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            guard case .corruptManifest(let p) = error as? VMProfile.ProfileError else {
+                return XCTFail("expected corruptManifest, got \(error)")
+            }
+            XCTAssertEqual(p, manifest.path)
+        }
+    }
+
+    /// A well-formed manifest with a foreign format tag refuses by name —
+    /// a future format is never silently misread.
+    func testForeignFormatRefuses() throws {
+        let url = bundleURL()
+        _ = try VMProfile.create(at: url)
+        let manifest = url.appendingPathComponent("manifest.json")
+        var raw = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as! [String: Any]
+        raw["format"] = "virelaivm/999"
+        try JSONSerialization.data(withJSONObject: raw).write(to: manifest)
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            XCTAssertEqual(error as? VMProfile.ProfileError, .unsupportedFormat("virelaivm/999"))
+        }
+    }
+
+    /// A member name that escapes the bundle is a corrupt manifest — load
+    /// must never let a hand-edited manifest redirect vlfs.img to ../..
+    func testUnsafeMemberRefuses() throws {
+        let url = bundleURL()
+        _ = try VMProfile.create(at: url)
+        let manifest = url.appendingPathComponent("manifest.json")
+        var raw = try JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as! [String: Any]
+        var members = raw["members"] as! [String: String]
+        members["vlfs"] = "../escape.img"
+        raw["members"] = members
+        try JSONSerialization.data(withJSONObject: raw).write(to: manifest)
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            guard case .corruptManifest(let p) = error as? VMProfile.ProfileError else {
+                return XCTFail("expected corruptManifest, got \(error)")
+            }
+            XCTAssertEqual(p, manifest.path)
+        }
+    }
+
+    /// A corrupt config member refuses by name too, and an out-of-shape
+    /// value (cpus outside the runner's 1...8 bound) is the same refusal.
+    func testCorruptConfigRefusesByName() throws {
+        let url = bundleURL()
+        _ = try VMProfile.create(at: url)
+        let config = url.appendingPathComponent("config.json")
+        try Data("[]".utf8).write(to: config)
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            guard case .corruptConfig(let p) = error as? VMProfile.ProfileError else {
+                return XCTFail("expected corruptConfig, got \(error)")
+            }
+            XCTAssertEqual(p, config.path)
+        }
+        try Data(#"{"cpus": 99, "memoryMiB": 256, "baseImage": "artifacts/disk.img"}"#.utf8)
+            .write(to: config)
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            guard case .corruptConfig = error as? VMProfile.ProfileError else {
+                return XCTFail("expected corruptConfig, got \(error)")
+            }
+        }
+    }
+
+    // MARK: openOrCreate
+
+    /// The runner's semantics: absent path mints, a minted bundle loads
+    /// (and re-loading keeps the SAME identity + machine identifier), and
+    /// an existing non-bundle directory refuses.
+    func testOpenOrCreate() throws {
+        let url = bundleURL()
+        let first = try VMProfile.openOrCreate(at: url)
+        XCTAssertTrue(first.created)
+        try first.setMachineIdentifier(Data(repeating: 0xAB, count: 70))
+        let second = try VMProfile.openOrCreate(at: url)
+        XCTAssertFalse(second.created)
+        XCTAssertEqual(second.identity, first.identity)
+        XCTAssertEqual(second.machineIdentifierData(), Data(repeating: 0xAB, count: 70))
+
+        let intruder = tmpDir.appendingPathComponent("not-a-bundle", isDirectory: true)
+        try FileManager.default.createDirectory(at: intruder, withIntermediateDirectories: true)
+        try Data("hello".utf8).write(to: intruder.appendingPathComponent("README"))
+        XCTAssertThrowsError(try VMProfile.openOrCreate(at: intruder)) { error in
+            guard case .missingManifest = error as? VMProfile.ProfileError else {
+                return XCTFail("expected missingManifest, got \(error)")
+            }
+        }
+    }
+
+    /// The identity key the session app stamps as CFBundleIdentifier:
+    /// deterministic from the name, bundle-idish, and lowercase-safe.
+    func testDefaultIdentityIsStableAndSafe() {
+        XCTAssertEqual(VMProfile.defaultIdentity(for: "My VM"), "org.virelaios.vm.my-vm")
+        XCTAssertEqual(VMProfile.defaultIdentity(for: " Weird__Name!! "),
+                       "org.virelaios.vm.weird-name")
+        XCTAssertEqual(VMProfile.defaultIdentity(for: "!!!"), "org.virelaios.vm.profile")
+    }
+}

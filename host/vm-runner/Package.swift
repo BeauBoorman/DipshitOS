@@ -61,6 +61,13 @@ let package = Package(
             name: "VMDiskImage",
             path: "Sources/VMDiskImage"
         ),
+        // M115c (#2462): the `.virelaivm` profile bundle — manifest-gated
+        // create/load + atomic save behind the runner's `--profile`. Pure
+        // Swift/Foundation so `swift test` pins the format without a VM.
+        .target(
+            name: "VMProfile",
+            path: "Sources/VMProfile"
+        ),
         .target(
             name: "VMAppKit",
             // M114d (#2457): the inspector model renders VMPostmortem's
@@ -91,7 +98,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "VMRunner",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"],
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VMProfile"],
             path: "Sources/VMRunner"
         ),
         // M118a (#2479): the `--sound-in` observation vehicle — a standalone
@@ -106,7 +113,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VMProfile"]
         )
     ],
     swiftLanguageModes: [.v5]
