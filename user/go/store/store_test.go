@@ -10,6 +10,7 @@ import (
 
 	"virelai/flint/parser"
 	"virelai/sshlib"
+	"virelai/vi"
 )
 
 // ---- fixture helpers -----------------------------------------------------
@@ -121,6 +122,84 @@ func (f *fakeExec) run(name string, args ...string) (int64, error) {
 		}
 	}
 	return 0, nil
+}
+
+// ---- execFn kill-on-timeout -----------------------------------------------
+
+// stubExecInner swaps execFn's inner seams for fakes and restores them.
+// The fake spawn returns pid 7; wait/probe/kill behavior is set per test.
+func stubExecInner(t *testing.T, wait func(int64, int64) (int64, error), probe func(int64) (int64, int)) *[]uint64 {
+	t.Helper()
+	killed := &[]uint64{}
+	prevSpawn, prevWait, prevKill, prevProbe, prevSleep :=
+		execSpawnFn, waitBudgetFn, killFn, probeFn, sleepFn
+	execSpawnFn = func(name string, args ...string) (int64, error) { return 7, nil }
+	waitBudgetFn = wait
+	killFn = func(pid uint64) int64 { *killed = append(*killed, pid); return 0 }
+	probeFn = probe
+	sleepFn = func(uint64) {}
+	t.Cleanup(func() {
+		execSpawnFn, waitBudgetFn, killFn, probeFn, sleepFn =
+			prevSpawn, prevWait, prevKill, prevProbe, prevSleep
+	})
+	return killed
+}
+
+func TestExecKillOnWaitTimeout(t *testing.T) {
+	// A child that outlives execWaitNs is armed for kill and drained:
+	// the orphan cannot leak a task-pool slot into the retry's spawn
+	// (#2402's timed-out FLINT clone starving attempt 2 into newosproc).
+	probes := 0
+	killed := stubExecInner(t,
+		func(int64, int64) (int64, error) { return -1, vi.ErrWaitGone },
+		func(int64) (int64, int) {
+			probes++
+			if probes < 3 {
+				return -1, vi.ProbeRunning
+			}
+			return 137, vi.ProbeExited
+		})
+	st, err := execFn("FLINT.ELF", "clone")
+	if !errors.Is(err, vi.ErrWaitGone) || st != -1 {
+		t.Fatalf("execFn = (%d, %v), want (-1, ErrWaitGone)", st, err)
+	}
+	if len(*killed) != 1 || (*killed)[0] != 7 {
+		t.Fatalf("kill calls = %v, want [7]", *killed)
+	}
+	if probes != 3 {
+		t.Fatalf("drain probes = %d, want 3", probes)
+	}
+}
+
+func TestExecKillDrainsAbsentPid(t *testing.T) {
+	// The never-registered pid burns the budget the same way; Kill on it
+	// refuses EINVAL (ignored) and the drain exits on the first Absent.
+	probes := 0
+	stubExecInner(t,
+		func(int64, int64) (int64, error) { return -1, vi.ErrWaitGone },
+		func(int64) (int64, int) {
+			probes++
+			return -1, vi.ProbeAbsent
+		})
+	if _, err := execFn("FLINT.ELF", "pull"); !errors.Is(err, vi.ErrWaitGone) {
+		t.Fatalf("execFn err = %v, want ErrWaitGone", err)
+	}
+	if probes != 1 {
+		t.Fatalf("drain probes = %d, want 1", probes)
+	}
+}
+
+func TestExecNoKillOnCleanWait(t *testing.T) {
+	killed := stubExecInner(t,
+		func(int64, int64) (int64, error) { return 0, nil },
+		func(int64) (int64, int) { return -1, vi.ProbeExited })
+	st, err := execFn("FLINT.ELF", "verify")
+	if err != nil || st != 0 {
+		t.Fatalf("execFn = (%d, %v), want (0, nil)", st, err)
+	}
+	if len(*killed) != 0 {
+		t.Fatalf("kill called on clean wait: %v", *killed)
+	}
 }
 
 func collectConsole() (*[]string, func()) {
