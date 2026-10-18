@@ -139,6 +139,49 @@ final class VSCtlTests: XCTestCase {
         XCTAssertEqual(code(of: r3.reply), "bad_request")
     }
 
+    // M115d (#2463): the armed suspend — an injected driver answers the
+    // verb; `ok:true` names state=saved and sets acceptedSuspend for the
+    // transport's post-reply tail.
+    func testArmedSuspendAccepts() {
+        var s = authedSession()
+        var calls = 0
+        s.suspendHandler = {
+            calls += 1
+            return .accept
+        }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"suspend\"}")
+        XCTAssertFalse(r.fatal)
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(s.acceptedSuspend)
+        let line = String(decoding: r.reply, as: UTF8.self)
+        XCTAssertTrue(line.contains("\"id\":1"))
+        XCTAssertTrue(line.contains("\"ok\":true"))
+        XCTAssertTrue(line.contains("\"verb\":\"suspend\""))
+        XCTAssertTrue(line.contains("\"state\":\"saved\""))
+    }
+
+    func testArmedSuspendRefusalCodes() {
+        for want in ["no_state", "unsupported", "save_failed", "busy"] {
+            var s = authedSession()
+            s.suspendHandler = { .refuse(want) }
+            let r = s.feed(line: "{\"id\":1,\"verb\":\"suspend\"}")
+            XCTAssertEqual(code(of: r.reply), want, want)
+            XCTAssertFalse(s.acceptedSuspend)
+            XCTAssertTrue(String(decoding: r.reply, as: UTF8.self)
+                .contains(VSCtl.messages[want]!), want)
+        }
+    }
+
+    func testArmedSuspendConsumesTheIdOnRefusal() {
+        var s = authedSession()
+        s.suspendHandler = { .refuse("no_state") }
+        _ = s.feed(line: "{\"id\":1,\"verb\":\"suspend\"}")
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"suspend\"}")
+        XCTAssertEqual(code(of: r.reply), "replay")
+        let r2 = s.feed(line: "{\"id\":2,\"verb\":\"suspend\"}")
+        XCTAssertEqual(code(of: r2.reply), "no_state")
+    }
+
     func testBadRequestShapes() {
         let cases: [(String, String)] = [
             ("{\"id\":1}", "bad_request"),                       // verb absent

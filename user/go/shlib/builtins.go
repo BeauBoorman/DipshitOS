@@ -54,6 +54,8 @@ func init() {
 		"export": bExport, "read": bRead, "jobs": bJobs, "fg": bFg,
 		"kill":    bKill,
 		"history": bHistory, "help": bHelp, "exit": bExit, "monitor": bMonitor,
+		// M115d (issue #2463, ADR 0056): the guest-initiated suspend request.
+		"suspend": bSuspend,
 		"sleep": bSleep, "clear": bClear, "log": bLog, "date": bDate,
 		"time": bTime,
 		// M50 trust surface (ADR 0024): identity, owner-only chmod, and the
@@ -652,6 +654,7 @@ var helpCatalog = map[string]helpEntry{
 	"history": {group: "shell", usage: "history", blurb: "list this session's submitted lines, oldest first"},
 	"log":     {group: "shell", usage: "log [APP]", blurb: "read one app's bounded log ring, or all app rings"},
 	"monitor": {group: "shell", usage: "monitor", blurb: "hand the console back to the kernel monitor"},
+	"suspend": {group: "shell", usage: "suspend", blurb: "ask the host to freeze machine state into the profile (virelai-ctl/1 suspend)", notes: "The guest fsyncs VLFS and settings and records the request marker before the verb leaves; a refused request prints the ADR 0056 code and nothing is frozen. An `ok` reply may arrive after a save/restore — the session simply resumes."},
 	"time":    {group: "shell", usage: "time CMD [ARGS...] | time sync [SERVER]", blurb: "time a command, or set the clock from one SNTP query (default time.apple.com)", notes: "With CMD the command runs and `real N.NNs` reports on the terminal. SERVER is a name or a dotted IPv4 address. One query, no retry; on no reply the clock is left untouched and the exit is 1."},
 
 	// files
@@ -853,6 +856,27 @@ func bExit(c *cmdCtx) int {
 func bMonitor(c *cmdCtx) int {
 	c.sh.monitorRq = true
 	return 0
+}
+
+// bSuspend is the GOSH path to the seat's Suspend verb (M115d): one
+// ctl-session request through the kernel-held credential, verdict named
+// on the terminal. `suspend: ok` may print on the far side of a host
+// save/restore — the builtin's next line IS the resumed process.
+func bSuspend(c *cmdCtx) int {
+	if len(c.args) != 0 {
+		c.out([]byte("gosh: suspend\n"))
+		return 2
+	}
+	ok, code := c.sh.host.Suspend()
+	if ok {
+		c.out([]byte("suspend: ok\n"))
+		return 0
+	}
+	if code == "" {
+		code = "refused"
+	}
+	c.out([]byte("suspend: " + code + "\n"))
+	return 1
 }
 
 // bSleep parks the shell for about n "seconds" — at the glue's 100:1

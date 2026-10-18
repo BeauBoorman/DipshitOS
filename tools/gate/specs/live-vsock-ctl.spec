@@ -5,13 +5,16 @@
 # listener (`--vsock-ctl`, port 1209 — the M115a probe listener on 1208
 # stays up beside it), and the guest's `vsock ctl` monitor client runs a
 # session per command — connect, HMAC-challenge auth, one request line,
-# reply, shutdown. Positives: `suspend` and `snapshot SNAP-1` round-trip
-# to the named `unimplemented` refusal (the verbs are wired, not armed —
-# M115d/e do the acting), `frobnicate` answers `unknown_verb`, and `dup`
-# answers `replay` for the repeated request id. Auth negatives are driven
-# entirely from the guest side: `badauth` corrupts the MAC, `replay`
-# re-uses a captured auth line on a fresh connection (the new challenge
-# makes it `auth_failed`).
+# reply, shutdown. Positives: `snapshot SNAP-1` round-trips to the named
+# `unimplemented` refusal (M115e's verb is wired, not armed), `suspend`
+# is ARMED (M115d) — the guest runs its quiesce (the SUSPEND.MARK
+# request receipt + the settings re-save — VLFS absent on a seed-share
+# boot) then the host answers `unsupported` because this run's cvc share
+# device cannot be saved — `frobnicate` answers `unknown_verb`, and
+# `dup` answers `replay` for the repeated request id. Auth negatives are
+# driven entirely from the guest side: `badauth` corrupts the MAC,
+# `replay` re-uses a captured auth line on a fresh connection (the new
+# challenge makes it `auth_failed`).
 #
 # Run `nokey` is the fail-closed posture: a share without the `vsock-ctl`
 # SECRETS.TXT row — the runner refuses to arm (no listener, an honest RST
@@ -62,16 +65,23 @@ vsock ctl suspend
 echo ctl-nokey-done
 EOF
 
-# Full wire: both verbs round-trip to `unimplemented`, the unknown verb and
-# the duplicated id are refused by name, and both auth negatives die at
-# the challenge. The M115a probe listener still works alongside.
+# Full wire: `snapshot` round-trips to `unimplemented`, `suspend` runs
+# its guest quiesce then answers `unsupported` (this run's custom-virtio
+# share cannot be saved — M115d's honest refusal, never a frozen boot),
+# the unknown verb and the duplicated id are refused by name, and both
+# auth negatives die at the challenge. The M115a probe listener still
+# works alongside.
 vgate_run ok -- --vsock --vsock-ctl --script '$RUN_DIR/script.txt' --script-expect 'ctl-done' --timeout 120
 vgate_assert ok serial-contains 'vsock: ready did=0x1053'
 vgate_assert ok output-contains 'VSOCK: ENABLED host-listen-port=1208'
-vgate_assert ok output-contains 'VSOCK-CTL: host listener armed port=1209'
+vgate_assert ok output-contains 'VSOCK-CTL: host listener armed port=1209 suspend=unsupported'
 vgate_assert ok output-contains 'VSOCK-CTL: session opened'
 vgate_assert ok serial-count 'vsock-ctl: authed' 5
-vgate_assert ok serial-count 'vsock-ctl: reply id=1 ok=false code=unimplemented' 3
+vgate_assert ok serial-count 'vsock-ctl: reply id=1 ok=false code=unimplemented' 1
+vgate_assert ok serial-count 'vsock-ctl: reply id=1 ok=false code=unsupported' 2
+vgate_assert ok serial-contains 'vsock-ctl: suspend quiesce vlfs=absent settings=synced marker=seq=1'
+vgate_assert ok serial-contains 'vsock-ctl: suspend quiesce vlfs=absent settings=synced marker=seq=2'
+vgate_assert ok share-contains SUSPEND.MARK 'virelai-suspend-request/1 seq=2'
 vgate_assert ok serial-contains 'vsock-ctl: reply id=1 ok=false code=unknown_verb'
 vgate_assert ok serial-contains 'vsock-ctl: reply id=1 ok=false code=replay'
 vgate_assert ok serial-contains 'vsock-ctl: auth refused code=auth_failed'

@@ -880,6 +880,8 @@ func saveSeatState() func() {
 	rc, gh := railCloseHover, godButtonHover
 	mg := menuGesture
 	bp, mp := buttonPixels, menuPixels
+	pp := powerPixels
+	pm, ps, ph := powerMenuOpen, powerSink, powerBtnHover
 	sf := seatFonts
 	return func() {
 		tabs, launch = ts, pl
@@ -887,6 +889,8 @@ func saveSeatState() func() {
 		railCloseHover, godButtonHover = rc, gh
 		menuGesture = mg
 		buttonPixels, menuPixels = bp, mp
+		powerPixels = pp
+		powerMenuOpen, powerSink, powerBtnHover = pm, ps, ph
 		seatFonts = sf
 	}
 }

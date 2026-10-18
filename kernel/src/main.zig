@@ -803,6 +803,14 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // virtio-blk path are gone — settings load from the host share (a
     // no-op without a channel; defaults stay in force).
     settings.init_from_share();
+    // M115d (#2463): the secret + grant stores take the same early load.
+    // They still re-load at the queue-5 arming point below (the cvc
+    // channel's file wins on a both-armed boot, unchanged); a boot whose
+    // ONLY host channel is virtio-fs otherwise never read SECRETS.TXT —
+    // the ctl credential's guest half would refuse `no_credential` even
+    // with the row provisioned (observed live-suspend-resume sv1).
+    _ = secret.init_from_share();
+    _ = grant.init_from_share();
     // M50 TS2 (issue #1136, ADR 0024 D3): the ownership/mode metadata
     // (`OWNERS.TXT`) is loaded at the queue-5 arming point below, after the
     // host channel becomes available (the pre-probe "absent" state is not

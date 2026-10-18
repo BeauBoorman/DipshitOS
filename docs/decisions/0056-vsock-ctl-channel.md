@@ -227,3 +227,34 @@ discovering the wall mid-card.
   trips answered `unimplemented`; `frobnicate` → `unknown_verb`;
   `badauth`/`replay`/`dup` exercise modes refused by name; the
   no-credential posture refuses the endpoint itself.
+
+## Amendment (2026-10-18, M115d #2463 — `suspend` armed; the slot landed)
+
+**Status.** `suspend` is no longer `unimplemented`. M115d armed it end
+to end: the guest session runs the quiesce (VLFS fsync when mounted,
+the settings re-save, the `SUSPEND.MARK` request receipt on the share)
+between auth and request; the runner's driver pauses the VM, saves
+machine state into the profile's `saved-state/state.vzsave`, replies
+`{"id":1,"ok":true,"result":{"verb":"suspend","state":"saved"}}` — the
+reply is written BEFORE the stop so the frozen guest's first
+post-restore read is its answer — then stops and exits. `--resume
+<profile>` loads the same bundle and restores that file.
+
+**D5 timing resolved.** The `sys_vsock_ctl` ABI slot this ADR deferred
+landed with M115d (slot 93; the blocking claims #2468/#2481 had closed
+by then). GOSH's `suspend` builtin and GOTABWM's PWR-menu Suspend row
+are its two callers; the kernel monitor's `vsock ctl` verb keeps the
+same session engine.
+
+**D4 grew four codes** — `no_state` (no suspend destination armed —
+the run has no profile), `unsupported` (the attached device set fails
+`validateSaveRestoreSupport`, e.g. custom-virtio), `save_failed` (the
+pause/save op refused; the guest is resumed, never left frozen), and
+`busy` (a suspend is already in flight on the host side, or a ctl
+session already holds the transport). `unimplemented` remains the
+`snapshot` answer pending M115e.
+
+**The restore bound stands.** `restoreMachineStateFrom` on this host
+saturates at VZErrorDomain Code=12 — M119e's named bound.
+`live-suspend-resume` asserts the Code=12 refusal honestly rather than
+claiming a restore that cannot happen here.

@@ -41,7 +41,9 @@
 //          M115b, #2461: --vsock-ctl arms the virelai-ctl/1 endpoint on
 //          --vsock-ctl-port, default 1209 — the HMAC-challenged
 //          suspend/snapshot wire, keyed by the share's vsock-ctl
-//          SECRETS.TXT row; no row, no listener.)
+//          SECRETS.TXT row (either host channel's share is read); no
+//          row, no listener. M115d, #2463: `suspend` is armed — pause,
+//          save into the profile's saved-state/, reply ok, stop, exit.)
 //         [--profile <path>] (M115c, #2462: boot from a .virelaivm bundle —
 //          a manifest-gated directory holding efi-vars.bin, the PERSISTENT
 //          overlay.asif over config.json's base image, vlfs.img, share/,
@@ -51,6 +53,12 @@
 //          --vars/--overlay-base/--data-disk/--cvc-file/--cpus flags win.
 //          --profile-init mints/validates the bundle and exits without
 //          booting — tools/session.sh runs it before seeding the share.)
+//         [--resume <path>] (M115d, #2463: boot the profile's saved-state/
+//          instead of the boot image — the continuation of a ctl `suspend`.
+//          Requires an existing bundle AND a written state.vzsave; both
+//          refuse by name. Mutually exclusive with --vz-restore and
+//          --profile-init; the ctl listener re-arms so the resumed
+//          machine can suspend again.)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -528,6 +536,9 @@ var dataDiskPath: String? = nil
 // only mints/validates the bundle and exits (session.sh's pre-seed step).
 var profilePath: String?
 var profileInitOnly = false
+// M115d (#2463): `--resume <path>` boots the profile's saved machine
+// state instead of the boot image — the continuation of a ctl `suspend`.
+var resumeFromPath: String?
 var memoryMiB = 256
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
@@ -1326,6 +1337,9 @@ while idx < arguments.count {
     } else if arg == "--profile", idx + 1 < arguments.count {
         profilePath = arguments[idx + 1]
         idx += 2
+    } else if arg == "--resume", idx + 1 < arguments.count {
+        resumeFromPath = arguments[idx + 1]
+        idx += 2
     } else if arg == "--profile-init" {
         profileInitOnly = true
         idx += 1
@@ -2101,12 +2115,41 @@ var activeProfile: VMProfile? = nil
 if profileInitOnly, profilePath == nil {
     fail("--profile-init requires --profile <path>.")
 }
+// M115d (#2463): `--resume` IS a profile boot — it names the bundle and
+// flags the saved-state restore below. A resume names an existing
+// bundle by name; minting one to restore an empty saved-state would be
+// a silent no-suspend, so the load fails closed instead.
+if let resumeFromPath {
+    if profileInitOnly {
+        fail("--resume and --profile-init are mutually exclusive.")
+    }
+    if vzRestore {
+        fail("--resume and --vz-restore are mutually exclusive.")
+    }
+    if let profilePath, profilePath != resumeFromPath {
+        fail("--resume and --profile disagree (resume boots the named bundle; pass one path).")
+    }
+    profilePath = resumeFromPath
+}
+var resumeStateURL: URL? = nil
 if let profilePath {
     do {
-        activeProfile = try VMProfile.openOrCreate(at: URL(fileURLWithPath: profilePath))
+        activeProfile = resumeFromPath != nil
+            ? try VMProfile.load(from: URL(fileURLWithPath: profilePath))
+            : try VMProfile.openOrCreate(at: URL(fileURLWithPath: profilePath))
     } catch {
-        fail("--profile: \(error)")
+        fail("\(resumeFromPath != nil ? "--resume" : "--profile"): \(error)")
     }
+}
+if let _ = resumeFromPath {
+    // The file the ctl `suspend` verb writes — its absence is the honest
+    // "there is no suspended state" refusal, named up front.
+    let url = activeProfile!.savedStateURL.appendingPathComponent(SuspendCtl.stateFileName)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        fail("--resume: no saved state at \(url.path) (nothing has suspended into this profile).")
+    }
+    resumeStateURL = url
+    print("SUSPEND-RESUME: armed state=\(url.path)")
 }
 if let p = activeProfile {
     if varsOverridePath == nil { varsOverridePath = p.efiVarsURL.path }
@@ -4170,13 +4213,34 @@ runner.queue.async {
             // no `vsock-ctl` share credential, no listener, and a guest
             // connect then gets the honest RST of an unlistened port.
             if vsockCtlEnabled {
-                if let dir = cvcFileShareDir,
-                   let key = VSCtl.loadKey(shareDir: URL(fileURLWithPath: dir, isDirectory: true)) {
-                    let delegate = VSockCtlListenerDelegate(key: key)
+                // M115d (#2463): the credential may ride EITHER host file
+                // channel — the profile share can attach through cvc-file
+                // or (for a save/restore-safe device set) virtio-fs.
+                let ctlShareDirs = [cvcFileShareDir, virtioFSShareDir].compactMap { $0 }
+                if let key = ctlShareDirs.lazy.compactMap({
+                    VSCtl.loadKey(shareDir: URL(fileURLWithPath: $0, isDirectory: true))
+                }).first {
+                    // M115d (#2463): the suspend verb's driver — the
+                    // profile's saved-state/ as destination, the
+                    // device set's save/restore verdict as the support
+                    // check. Both computed once here: the verb then
+                    // answers `no_state`/`unsupported` honestly or runs
+                    // the pause→save→reply→stop chain.
+                    var suspendUnsupported: String? = nil
+                    do { try config.validateSaveRestoreSupport() } catch {
+                        suspendUnsupported = "\(error as NSError)"
+                    }
+                    let suspendCtl = SuspendCtl(vm: runner.vm, queue: runner.queue,
+                                              savedStateDir: activeProfile?.savedStateURL,
+                                              unsupported: suspendUnsupported)
+                    let delegate = VSockCtlListenerDelegate(
+                        key: key,
+                        suspendHandler: { suspendCtl.begin() },
+                        onSuspendAccepted: { suspendCtl.finish() })
                     vsockCtlDelegate = delegate
                     vsockCtlListener.delegate = delegate
                     socketDevice.setSocketListener(vsockCtlListener, forPort: vsockCtlPort)
-                    print("VSOCK-CTL: host listener armed port=\(vsockCtlPort)")
+                    print("VSOCK-CTL: host listener armed port=\(vsockCtlPort) suspend=\(suspendUnsupported != nil ? "unsupported" : (activeProfile == nil ? "no_state" : "armed"))")
                 } else {
                     print("VSOCK-CTL: refuse no_credential (no vsock-ctl row in the armed share's SECRETS.TXT)")
                 }
@@ -4196,6 +4260,29 @@ runner.queue.async {
                                    verifyOutput: vzRestoreVerifyOutput,
                                    mode: .load(URL(fileURLWithPath: load, isDirectory: true)))
         probe.startFromSavedState()
+        return
+    }
+    if let resumeURL = resumeStateURL {
+        // M115d (#2463): `--resume` — restore the machine state a ctl
+        // `suspend` saved into the profile and continue the guest. The
+        // ctl listener is already armed above, so the resumed machine
+        // can suspend again.
+        runner.vm.restoreMachineStateFrom(url: resumeURL) { error in
+            if let error {
+                print("SUSPEND-RESUME: restore refused code=\((error as NSError).code) error=\(error as NSError)")
+                FileHandle.standardError.write(Data("ERROR: --resume restore failed: \(error as NSError)\n".utf8))
+                exit(1)
+            }
+            runner.vm.resume { result in
+                if case .failure(let error) = result {
+                    print("SUSPEND-RESUME: resume refused error=\(error as NSError)")
+                    FileHandle.standardError.write(Data("ERROR: --resume resume failed: \(error as NSError)\n".utf8))
+                    exit(1)
+                }
+                vmDidStart = true
+                print("SUSPEND-RESUME: restored \(SuspendCtl.stateFileName)")
+            }
+        }
         return
     }
     runner.vm.start { result in
@@ -7768,12 +7855,17 @@ func buildIcmpEchoReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ host
 //      death to a specific window instead of "no verdict at all".
 var scriptPollLastBeat: Date = Date()
 
+// M115d (#2463): set by SuspendCtl's accepted-suspend tail — the stop a
+// suspended VM lands is the teardown the guest asked for, so the poll's
+// early-stop failure branch must not outrace it.
+var suspendStopInFlight = false
+
 func scriptPoll(matchedAt: Date? = nil) {
     var matchedAt = matchedAt
     // An early VM stop ends the run: pass when the expected transcript was
     // already observed (the tail window simply cannot capture more output),
-    // otherwise fail.
-    if vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
+    // otherwise fail. A ctl `suspend` teardown is its own success path.
+    if !suspendStopInFlight && vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
         // Issue #1024: the state was sampled BEFORE this tick's log read —
         // a VM that stops in the gap after the previous read makes this
         // branch see "stopped" while the transcript already sits in the
