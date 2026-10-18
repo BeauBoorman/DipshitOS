@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const udp = @import("udp.zig");
 const csprng = @import("csprng.zig");
 const ipv6 = @import("ipv6.zig"); // M117c (#2475): the v6 TCP claim + legacyOpen6
+const grant = @import("grant.zig"); // M117e (#2477): the net-scope check at the open ops
 pub var sockets: core.Core = .{};
 /// M97e-F5 (#2104): the DNS transaction's client port is a FRESH
 /// ephemeral draw per query (the IANA dynamic range 49152..65535) — a
@@ -114,6 +115,11 @@ fn ephemeralPort() ?u16 {
 pub fn beginDns(owner: u64, server: [4]u8, query: []const u8) core.Error!core.Handle {
     if (server[0] == 0 or server[0] == 127 or server[0] >= 224 or query.len < 17 or query.len > dns_max)
         return error.InvalidArgument;
+    // M117e (#2477, ADR 0057 D12): the resolver's address is a
+    // destination — the row's `if=` scope applies (a LAN resolver is a
+    // `bridged` peer, the island's forwarder is `nat` fabric).
+    if (grant.net_open(owner, .{ .v4 = server }) != .allow and grant.enforceMode())
+        return error.AccessDenied;
     if (dns != null or sockets.next_generation > std.math.maxInt(i64) >> core.slot_bits) return error.Capacity;
     // Pin one legacy listen-table seat so nobody can bind it concurrently.
     // A pre-existing bind is a capacity refusal, never silently intercepted.
@@ -308,6 +314,12 @@ pub fn legacyListen(owner: u64, local_ip: [4]u8, port: u16) core.Error!void {
 /// deterministic 8000 when free, else an honest ephemeral draw that
 /// skips every claimed TCP port.
 pub fn legacyOpen(owner: u64, local_ip: [4]u8, remote_ip: [4]u8, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
+    // M117e (#2477, ADR 0057 D12): the grant row's `net` scope — a
+    // `bridged`-class destination (an L2-adjacent peer) outside the row's
+    // `if=` set is refused by name. `audit` receipts and proceeds;
+    // `enforce` is an honest EACCES before any slot is spent.
+    if (grant.net_open(owner, .{ .v4 = remote_ip }) != .allow and grant.enforceMode())
+        return error.AccessDenied;
     registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
     const port = allocLocalPort() orelse return error.Capacity;
     return sockets.open(owner, core.ep4(local_ip, port), core.ep4(remote_ip, remote_port), remote_mac, now(), isn);
@@ -320,6 +332,12 @@ pub fn legacyOpen(owner: u64, local_ip: [4]u8, remote_ip: [4]u8, remote_port: u1
 /// off-link). One bounded connection slot and the same port claim as
 /// v4 — the family's bounds are shared.
 pub fn legacyOpen6(owner: u64, local6: ipv6.Addr, remote6: ipv6.Addr, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
+    // M117e (#2477, ADR 0057 D12): the v6 half of the scope check — the
+    // literal is matched against the row's `v6=` prefixes AND its path
+    // class against `if=`; off-policy refuses `v6_literal_denied`/
+    // `bridged_denied` by name (enforce) or receipts it (audit).
+    if (grant.net_open(owner, .{ .v6 = remote6 }) != .allow and grant.enforceMode())
+        return error.AccessDenied;
     registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
     const port = allocLocalPort() orelse return error.Capacity;
     return sockets.open(owner, core.ep6(local6, port), core.ep6(remote6, remote_port), remote_mac, now(), isn);
