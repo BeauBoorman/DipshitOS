@@ -258,3 +258,45 @@ session already holds the transport). `unimplemented` remains the
 saturates at VZErrorDomain Code=12 — M119e's named bound.
 `live-suspend-resume` asserts the Code=12 refusal honestly rather than
 claiming a restore that cannot happen here.
+
+## Amendment (2026-10-18, M115e #2464 — `snapshot` armed; `restore` added; GOSNAP.ELF)
+
+**Status.** `snapshot <name>` is no longer `unimplemented`. M115e armed
+it end to end and added a third verb, `restore <name>`; the ready line
+now lists `["suspend","snapshot","restore"]`. `GOSNAP.ELF` is the
+guest-side manager: `ls`/`save`/`restore`/`rm` over `/host/SNAPSHOTS/`
+and the ctl channel, with `restore`/`rm` behind a typed `confirm`
+consent gesture (the console-app analogue of GOSTORE's modal — a
+destructive verb is the ask, `confirm` is the gesture).
+
+**`snapshot <name>` parks on the share, not saved-state.** The host
+pauses the VM, `saveMachineStateTo`s `SNAPSHOTS/<name>.vzsave` under the
+armed share root (a `.part` write then rename — a listing never sees a
+half-written file), replies `ok:true` while the guest is still frozen —
+the suspend contract, so a `--resume` of this image reads its answer —
+then resumes the machine. A snapshot does not stop the run. Existing
+name → `exists` (never silently overwritten; `rm` is the replace path);
+no armed share → `no_state`; unsaveable device set → `unsupported`;
+a second in-flight save → `busy`.
+
+**`restore <name>` is a stage, not a rewind.** Restoring machine state
+is a VM-construction act — the running guest cannot be rewound — so the
+verb copies `SNAPSHOTS/<name>.vzsave` over the profile's
+`saved-state/state.vzsave` (the one path `--resume` already reads; a
+guest staging file + a new boot flag would do the same thing more
+slowly). The running machine is untouched; the next `--resume` restores
+the named image. A `suspend` between stage and resume supersedes the
+stage — its save overwrites `state.vzsave`, the same rule a suspend
+already applies to a previous suspend. Refusals: `not_found` (no such
+snapshot on the share), `no_state` (no profile armed), `io_error`.
+
+**D4 grew two codes** — `exists` and `not_found`. `no_state`'s message
+was generalized ("no save destination is armed") since snapshot answers
+it for a share, not a profile.
+
+**No kernel change.** A parked snapshot is crash-consistent: the guest
+does not quiesce for `snapshot` (the M115d quiesce remains `suspend`-only
+— suspend is the only verb that freezes the machine for a cold gap).
+Gate: `go-snap` (save/ls/rm/consent legs on virtio-fs, the staged
+restore, and the `ld` run pinning `SUSPEND-RESUME: restored` or the
+Code=12 bound).

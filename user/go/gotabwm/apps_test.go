@@ -232,8 +232,8 @@ func TestSummarizeAppsCountsRowsAndTheHighestVersion(t *testing.T) {
 		t.Fatalf("read image/apps.txt: %v", err)
 	}
 	s := SummarizeApps(parseAppsTXT(string(b)))
-	if s.Rows != 20 {
-		t.Fatalf("rows = %d want 20 (the honest catalog)", s.Rows)
+	if s.Rows != 21 {
+		t.Fatalf("rows = %d want 21 (the honest catalog)", s.Rows)
 	}
 	// The receipt's headline: the manifest declares v2 rows, so a reader that
 	// ignored the tail would report v=0 and fail here.

@@ -215,4 +215,84 @@ final class VSCtlTests: XCTestCase {
             to: dir.appendingPathComponent("SECRETS.TXT"), atomically: true, encoding: .utf8)
         XCTAssertNil(VSCtl.loadKey(shareDir: dir))
     }
+
+    // M115e (#2464): the armed snapshot/restore — injected drivers answer
+    // the verbs; `ok:true` carries the name and the saved/staged state.
+    func testArmedSnapshotAccepts() {
+        var s = authedSession()
+        var calls: [String] = []
+        s.snapshotHandler = { name in
+            calls.append(name)
+            return .accept
+        }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"snapshot\",\"name\":\"BEFORE-1\"}")
+        XCTAssertFalse(r.fatal)
+        XCTAssertEqual(calls, ["BEFORE-1"])
+        XCTAssertTrue(s.answeredSnapshot)
+        let line = String(decoding: r.reply, as: UTF8.self)
+        XCTAssertTrue(line.contains("\"id\":1"))
+        XCTAssertTrue(line.contains("\"ok\":true"))
+        XCTAssertTrue(line.contains("\"verb\":\"snapshot\""))
+        XCTAssertTrue(line.contains("\"name\":\"BEFORE-1\""))
+        XCTAssertTrue(line.contains("\"state\":\"saved\""))
+    }
+
+    func testArmedSnapshotRefusalsStillAnswer() {
+        // A refused save still counts as answered — the transport resumes
+        // the paused machine after writing the refusal.
+        for want in ["exists", "no_state", "unsupported", "save_failed", "busy"] {
+            var s = authedSession()
+            s.snapshotHandler = { _ in .refuse(want) }
+            let r = s.feed(line: "{\"id\":1,\"verb\":\"snapshot\",\"name\":\"S1\"}")
+            XCTAssertEqual(code(of: r.reply), want, want)
+            XCTAssertTrue(s.answeredSnapshot, want)
+            XCTAssertTrue(String(decoding: r.reply, as: UTF8.self)
+                .contains(VSCtl.messages[want]!), want)
+        }
+    }
+
+    func testArmedRestoreAccepts() {
+        var s = authedSession()
+        var calls: [String] = []
+        s.restoreHandler = { name in
+            calls.append(name)
+            return .accept
+        }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"restore\",\"name\":\"BEFORE-1\"}")
+        XCTAssertFalse(r.fatal)
+        XCTAssertEqual(calls, ["BEFORE-1"])
+        XCTAssertFalse(s.answeredSnapshot)
+        XCTAssertFalse(s.acceptedSuspend)
+        let line = String(decoding: r.reply, as: UTF8.self)
+        XCTAssertTrue(line.contains("\"verb\":\"restore\""))
+        XCTAssertTrue(line.contains("\"state\":\"staged\""))
+    }
+
+    func testArmedRestoreRefusals() {
+        for want in ["not_found", "no_state", "io_error"] {
+            var s = authedSession()
+            s.restoreHandler = { _ in .refuse(want) }
+            let r = s.feed(line: "{\"id\":1,\"verb\":\"restore\",\"name\":\"S1\"}")
+            XCTAssertEqual(code(of: r.reply), want, want)
+        }
+    }
+
+    func testRestoreRejectsABadNameLikeSnapshot() {
+        var s = authedSession()
+        s.restoreHandler = { _ in .accept }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"restore\",\"name\":\"a/b\"}")
+        XCTAssertEqual(code(of: r.reply), "name_rejected")
+        s = authedSession()
+        let r2 = s.feed(line: "{\"id\":1,\"verb\":\"restore\"}")
+        XCTAssertEqual(code(of: r2.reply), "bad_request")
+    }
+
+    func testReadyLineListsAllThreeVerbs() {
+        var s = CTLSession(key: pinKey, challenge: pinChallenge)
+        let (reply, _) = s.feed(line: authLine(mac: pinMAC))
+        let line = String(decoding: reply, as: UTF8.self)
+        for verb in ["suspend", "snapshot", "restore"] {
+            XCTAssertTrue(line.contains("\"\(verb)\""), verb)
+        }
+    }
 }
