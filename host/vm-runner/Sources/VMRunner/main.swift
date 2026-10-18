@@ -42,6 +42,15 @@
 //          --vsock-ctl-port, default 1209 — the HMAC-challenged
 //          suspend/snapshot wire, keyed by the share's vsock-ctl
 //          SECRETS.TXT row; no row, no listener.)
+//         [--profile <path>] (M115c, #2462: boot from a .virelaivm bundle —
+//          a manifest-gated directory holding efi-vars.bin, the PERSISTENT
+//          overlay.asif over config.json's base image, vlfs.img, share/,
+//          machine-id.bin and saved-state/. An absent path is minted; an
+//          existing one must carry a readable virelaivm/1 manifest or the
+//          run refuses by name. Profile members are DEFAULTS: explicit
+//          --vars/--overlay-base/--data-disk/--cvc-file/--cpus flags win.
+//          --profile-init mints/validates the bundle and exits without
+//          booting — tools/session.sh runs it before seeding the share.)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -423,6 +432,7 @@ import VMAppKit
 import VMDiskImage
 import VMGPU3D
 import VMPostmortem
+import VMProfile
 import VMTcp
 import VSCtl
 import VSNTP
@@ -510,6 +520,15 @@ var usbMsdPath: String? = nil
 // formatting is mkfs.vlfs's job, never the runner's. Off by default: without
 // the flag config.storageDevices keeps its single boot element.
 var dataDiskPath: String? = nil
+// M115c (issue #2462): `--profile <path>` boots a persistent machine from a
+// `.virelaivm` bundle instead of the flag-by-flag throwaway pieces. The
+// bundle's manifest members fill --vars/--overlay-base/--data-disk/
+// --cvc-file and its config.json fills cpus/ram/device defaults — every
+// explicit flag wins over the profile member it names. `--profile-init`
+// only mints/validates the bundle and exits (session.sh's pre-seed step).
+var profilePath: String?
+var profileInitOnly = false
+var memoryMiB = 256
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
 // VZVirtualMachineView after `--input-key-after <marker>` (default: the
@@ -624,6 +643,7 @@ var vsockCtlEnabled = false
 var vsockCtlPort: UInt32 = VSCtl.defaultPort
 var vsockCtlPortSet = false
 var cpuCount = 2
+var cpusExplicit = false
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
 var expectLine = "firmware has agreed to cooperate"
@@ -1303,6 +1323,12 @@ while idx < arguments.count {
     } else if arg == "--data-disk", idx + 1 < arguments.count {
         dataDiskPath = arguments[idx + 1]
         idx += 2
+    } else if arg == "--profile", idx + 1 < arguments.count {
+        profilePath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--profile-init" {
+        profileInitOnly = true
+        idx += 1
     } else if arg == "--input-key", idx + 1 < arguments.count {
         guard let kc = UInt16(arguments[idx + 1]) else {
             fail("--input-key requires a numeric macOS virtual keycode, got '\(arguments[idx + 1])'.")
@@ -1403,6 +1429,7 @@ while idx < arguments.count {
             fail("--cpus requires a count in 1...8, got '\(arguments[idx + 1])'.")
         }
         cpuCount = n
+        cpusExplicit = true
         idx += 2
     } else if arg == "--timeout", idx + 1 < arguments.count {
         timeout = TimeInterval(arguments[idx + 1]) ?? 30
@@ -2065,6 +2092,54 @@ while idx < arguments.count {
     }
 }
 
+// M115c (#2462): `--profile` resolves the bundle BEFORE the member paths
+// are consumed below. An absent path is minted; an existing directory must
+// carry a readable virelaivm/1 manifest (missing/corrupt refuses by name).
+// Every profile member is a default — an explicit --vars/--overlay-base/
+// --data-disk/--cvc-file/--cpus flag wins regardless of argument order.
+var activeProfile: VMProfile? = nil
+if profileInitOnly, profilePath == nil {
+    fail("--profile-init requires --profile <path>.")
+}
+if let profilePath {
+    do {
+        activeProfile = try VMProfile.openOrCreate(at: URL(fileURLWithPath: profilePath))
+    } catch {
+        fail("--profile: \(error)")
+    }
+}
+if let p = activeProfile {
+    if varsOverridePath == nil { varsOverridePath = p.efiVarsURL.path }
+    if overlayBasePath == nil { overlayBasePath = p.config.baseImage }
+    if dataDiskPath == nil, p.config.devices.dataDisk { dataDiskPath = p.vlfsURL.path }
+    if cvcFileShareDir == nil, p.config.devices.share {
+        // The bundle's share/ rides the same host file channel --cvc-file
+        // attaches — including the implied six-queue device shape.
+        cvcFileShareDir = p.shareURL.path
+        cvcSnapEnabled = true
+        viaVirtioEnabled = true
+        customVirtioEnabled = true
+        cvcEchoEnabled = true
+    }
+    if !cpusExplicit { cpuCount = p.config.cpus }
+    memoryMiB = p.config.memoryMiB
+    displayMode = displayMode || p.config.devices.display
+    inputMode = inputMode || p.config.devices.input
+    soundMode = soundMode || p.config.devices.sound
+    netNatEnabled = netNatEnabled || p.config.devices.netNat
+    vsockEnabled = vsockEnabled || p.config.devices.vsock
+}
+if profileInitOnly {
+    // Mint/validate the bundle and exit without booting — session.sh runs
+    // this before seeding the share, so a corrupt bundle refuses by name
+    // up front instead of mid-boot. The force-unwrap is safe: the guard
+    // above already proved a profile loaded.
+    let p = activeProfile!
+    print("profile: \(p.created ? "created" : "loaded") \(p.url.path)")
+    print("profile: identity=\(p.identity) cpus=\(p.config.cpus) memoryMiB=\(p.config.memoryMiB) base=\(p.config.baseImage)")
+    exit(0)
+}
+
 // Console sessions run until the VM stops or the user ends the session,
 // unless an explicit --timeout was requested. Script mode is a non-
 // interactive variant of the duplex console plumbing (claim 6684).
@@ -2230,6 +2305,12 @@ if secureBootEnabled {
     guard !secureBootDbEfiPaths.isEmpty || !secureBootDbHashes.isEmpty else {
         fail("--secure-boot requires at least one of --secure-boot-db-efi <PE path> or --secure-boot-db-hash <64-hex>.")
     }
+    // M115c (#2462): enrollment overwrites the vars file every run, which
+    // would destroy the profile's persistent efi-vars.bin — refuse the
+    // combination rather than silently mangling a bundle member.
+    guard activeProfile == nil else {
+        fail("--secure-boot builds a FRESH variable store each run; --profile's efi-vars.bin is persistent. The combination is refused.")
+    }
 }
 
 let overlayMode = overlayBasePath != nil
@@ -2386,7 +2467,7 @@ let bootLoader = VZEFIBootLoader()
 bootLoader.variableStore = variableStore
 let config = VZVirtualMachineConfiguration()
 config.bootLoader = bootLoader
-config.memorySize = 256 * 1024 * 1024
+config.memorySize = UInt64(memoryMiB) * 1024 * 1024
 config.cpuCount = cpuCount
 // M70g G3 (#1459): a saved machine state is bound to the platform's
 // machineIdentifier (VZGenericPlatformConfiguration.h: "When a virtual machine
@@ -2415,6 +2496,24 @@ if vzRestoreSaveDir != nil || vzRestoreLoadDir != nil {
             fail("--vz-restore-save: could not persist the machine identifier into '\(save)': \(error)")
         }
         print("  platform: machineIdentifier persisted to \(dir.appendingPathComponent("machine-id.bin").path) (--vz-restore-save)")
+    }
+    config.platform = platform
+} else if let p = activeProfile {
+    // M115c (#2462): a profiled machine keeps ONE machineIdentifier for its
+    // whole life — adopt the bundle's machine-id.bin (minted at create,
+    // reminted+persisted here if absent or unreadable by VZ) so a later
+    // saved state binds and every boot presents the same machine.
+    let platform = VZGenericPlatformConfiguration()
+    if let data = p.machineIdentifierData(),
+       let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+        platform.machineIdentifier = id
+    } else {
+        do {
+            try p.setMachineIdentifier(platform.machineIdentifier.dataRepresentation)
+        } catch {
+            fail("--profile: could not persist \(p.machineIdentifierURL.path): \(error)")
+        }
+        print("  platform: machineIdentifier minted into \(p.machineIdentifierURL.path)")
     }
     config.platform = platform
 }
@@ -2454,20 +2553,39 @@ do {
                 // cleanup; the load process (or a failed run's post-mortem)
                 // owns it.
                 stackDir = URL(fileURLWithPath: save, isDirectory: true)
+            } else if let p = activeProfile {
+                // M115c (#2462): the overlay lives INSIDE the bundle — a
+                // persisted member, never the throwaway tmp layer, and never
+                // the atexit cleanup.
+                stackDir = p.url
             } else {
                 stackDir = FileManager.default.temporaryDirectory
                     .appendingPathComponent("virelai-overlay-\(UUID().uuidString)", isDirectory: true)
                 overlayCleanupPath = stackDir.path
             }
             try FileManager.default.createDirectory(at: stackDir, withIntermediateDirectories: true)
-            let layer = ASIFCreationConfiguration.layer(
-                url: stackDir.appendingPathComponent("overlay.asif"),
-                type: .overlay(blockCount: Int(diskBase.blockCount)))
-            let stacked = try diskBase.appending(layer)
+            let overlayURL = stackDir.appendingPathComponent("overlay.asif")
+            let stacked: any StackedImage
+            if let p = activeProfile, FileManager.default.fileExists(atPath: overlayURL.path) {
+                // M115c: a profiled machine REOPENS its persisted overlay —
+                // guest writes to the boot disk survive across sessions.
+                // (The vz-restore-save leg above is unreachable with a
+                // profile: --profile is not in that probe's flag set.)
+                _ = p
+                let overlay = try DiskImage(opening: .open(url: overlayURL, mode: .readWrite))
+                stacked = try diskBase.appending(overlay)
+            } else {
+                let layer = ASIFCreationConfiguration.layer(
+                    url: overlayURL,
+                    type: .overlay(blockCount: Int(diskBase.blockCount)))
+                stacked = try diskBase.appending(layer)
+            }
             let attachment = try VZDiskImageStorageDeviceAttachment(diskImage: stacked)
             config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
             if vzRestoreSaveDir != nil {
                 print("  disk: \(base) (base, read-only) + persisted ASIF overlay in \(stackDir.path) (--vz-restore-save; kept for the load process)")
+            } else if activeProfile != nil {
+                print("  disk: \(base) (base, read-only) + persistent ASIF overlay \(overlayURL.path) (--profile)")
             } else {
                 print("  disk: \(base) (base, read-only) + throwaway ASIF overlay in \(stackDir.path)")
             }
@@ -3778,8 +3896,11 @@ let terminalDwell: TimeInterval = 2
 
 print("VIRELAIOS VM runner")
 print("  host: arm64 (Apple silicon), macOS \(osVersion.majorVersion).\(osVersion.minorVersion)")
-print("  disk: \(diskImagePath)")
-print("  memory: 256 MiB, cpus: \(cpuCount)")
+print("  disk: \(overlayBasePath ?? diskImagePath)")
+print("  memory: \(memoryMiB) MiB, cpus: \(cpuCount)")
+if let p = activeProfile {
+    print("  profile: \(p.url.path) identity=\(p.identity) (\(p.created ? "created" : "loaded"))")
+}
 if consoleMode {
     print("  mode: interactive console")
     print("  serial log: \(serialLogPath)  (guest output teed to terminal + log)")
