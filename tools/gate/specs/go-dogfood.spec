@@ -398,6 +398,21 @@ else:
           "boots the compiled default")
 PY
 
+# Boot 02 keeps the strip clean of boot 01's apps. M120b (#2559): a restored
+# session is LIVE now — the seat re-execs every backed row — so boot 01's
+# [Sh, notes.txt] file would spawn a real NOTE.ELF in the calc/browser boot,
+# and its `dogfood: note` is asserted ABSENT below. A count=0 v2 file reads
+# as restored (no first-boot starter, no `dogfood: gosh` either) with
+# nothing to re-exec. The fix was a delete before M120b, when restored rows
+# stayed dead placeholders; an empty file is the same intent one step over.
+vgate_assert 01 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x02\x00\x00\x00\x00\x00")
+print("between-run cleanup: empty SESSION.TABS for boot 02 "
+      "(restored-empty: no re-exec fan-out, no starter)")
+PY
+
 # --- boot 02: the calculator and the browser on the same default seat -------
 # Same share, same compiled default. D1 says the seat is the COMPILED default
 # and not a setting, and boot 02 is the boot where that could silently stop
@@ -488,6 +503,17 @@ if re.search(r"(?m)^tabwm: registered", ser):
     sys.exit("the Zig TABWM seat registered: this is not the default Go seat")
 print("boot 02 order ok: " + " < ".join(want) +
       " (and the shell/editor half is absent)")
+PY
+
+# Same neutralization for boot 03 (M120b #2559): boot 02's [Calc, web] file
+# would otherwise re-exec a real GOCALC.ELF into the GOSH pixel boot — an
+# extra hosted tab the scanout assert was never written around. Empty file,
+# same suppression.
+vgate_assert 02 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x02\x00\x00\x00\x00\x00")
+print("between-run cleanup: empty SESSION.TABS for boot 03")
 PY
 
 # --- boot 03: the shell tab's PIXELS on the default seat (M69g, #1558) ------
@@ -603,12 +629,11 @@ PY
 
 # Between-run cleanup for boot 04, on THIS tag's asserts: boots 01-03 share
 # one RUN_DIR, and the seat's close writes SESSION.TABS (writeSession,
-# once-only save-on-exit -- observed: boot 01 `session write n=2`, boots
-# 02/03 `session load n=2`). The restore side loads placeholder ids that
-# are not kernel windows, so closeHosted's WmctlWinClose fails on them,
-# the strip keeps its count, and boot 04's Enter-summon can never fire
-# (observed r4: `session load n=2`, rail n=3, no `tab close`, runner
-# reached --script-expect timeout with the seat at maxTicks). The setup
+# once-only save-on-exit -- observed: boot 01 `session write n=2`). Under
+# M120b (#2559) a restored row is RE-EXEC'd on the next boot — a live app
+# boot 04 never asked for — so the tag-02 cleanup above already leaves boot
+# 03 an EMPTY v2 file (no `session load` marker prints for count=0), and
+# this delete keeps boot 04's Enter-summon on an empty strip. The setup
 # hooks all run before boot 01 (vgate.sh's setup loop), so the delete has
 # to live HERE: the run/assert loop evaluates tag-03 asserts after run 03
 # and before run 04 (vgate.sh tag filter). The harness itself uses this
@@ -619,15 +644,11 @@ import os, sys
 share = os.environ.get("VG_SHARE")
 if not share:
     sys.exit("no armed share exported to the assert (vgate_share arm?)")
-ser = open(os.environ["VG_SER"], "rb").read()
-if b"gotabwm: session load" not in ser:
-    sys.exit("boot 03 did not load a session, but its close is what "
-             "leaves SESSION.TABS for boot 04 -- re-check the strip "
-             "assumption before moving this cleanup")
 st = os.path.join(share, "SESSION.TABS")
 if not os.path.exists(st):
-    sys.exit("boot 03 loaded SESSION.TABS but the file is gone at "
-             "between-run cleanup time")
+    sys.exit("boot 03's GOSH tab writes SESSION.TABS (declare mutates) — "
+             "the file is gone at between-run cleanup time; re-check the "
+             "strip assumption before moving this cleanup")
 os.remove(st)
 assert not os.path.exists(st), "SESSION.TABS survived removal"
 print("between-run cleanup: removed SESSION.TABS "
@@ -1208,8 +1229,8 @@ PY
 # budget, no auto-close -- by removing the trigger BETWEEN boots 04 and 05.
 # That is the same between-run slot boot 03's tag-03 assert uses for
 # SESSION.TABS (see above), and the SESSION.TABS goes here too: boot 04's close
-# left restored-placeholder ids that are not kernel windows, and boot 05 wants
-# the first-boot workspace branch (a real GOSH tab), not a strip of ghosts.
+# left a session the next boot would re-exec live (M120b), and boot 05 wants
+# the first-boot workspace branch (a real GOSH tab), not spawned ghosts.
 vgate_assert 04 python <<'PY'
 import os, sys
 share = os.environ.get("VG_SHARE")

@@ -1338,9 +1338,10 @@ runpy.run_path("tests/fixtures/desktop/m91/menu.py")["check"](
 PY
 
 # Relaunch on the SAME share, without touching the receipt or changing wm.
-# Restored tabs are honest placeholders, not restarted programs (M79g).
-# Launch a real Terminal to read the receipt, then pointer-launch Code Editor,
-# type/save actual text, and switch focus back to Terminal by the rail chord.
+# Restored tabs re-exec their recorded bins now (M120b #2559): boot 19's
+# [Sh, Term] file drops the unbacked Sh row and spawns a real GOTERM.ELF
+# into rail cell 1 — so the scripted Terminal is a SECOND one, and the
+# focus-back chord is ctrl-1, not the old placeholder-strip ctrl-3.
 vgate_file script-m91-relaunch.txt <<'EOF'
 set GOMAXPROCS=1
 exec GOTERM.ELF
@@ -1359,7 +1360,7 @@ vgate_run 20 -- \
     --pointer-virtio-after 'goterm: done status=0' \
     --script2 '$RUN_DIR/script-20-filter.txt' \
     --script2-after 'gotabwm: launcher presented' --script2-delay 1 \
-    --input-chords 'w,o,r,k,e,d,return,ctrl-s,ctrl-3' \
+    --input-chords 'w,o,r,k,e,d,return,ctrl-s,ctrl-1' \
     --input-chords-after 'goedit: present' \
     --script-expect 'gotabwm: alt-tab id=' --script-expect-tail 4 --timeout 180
 vgate_assert 20 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
@@ -1381,8 +1382,12 @@ assert got == (fixture / "receipt.expected").read_bytes(), "receipt changed acro
 edited = (share / "EDIT/SEED.TXT").read_bytes()
 assert edited == (fixture / "editor.expected").read_bytes(), edited
 s = pathlib.Path(os.environ["VG_SER"]).read_text(errors="replace")
-term = re.search(r"goterm: open id=(\d+)", s)
-assert term and "gotabwm: alt-tab id=" + term[1] in s, "focus did not return to real Terminal"
+terms = re.findall(r"goterm: open id=(\d+)", s)
+# M120b (#2559): the session re-execs boot 19's Term row AND the script
+# execs another, so either of the two Terminal windows is a legal focus
+# target for the final chord.
+assert terms and any(("gotabwm: alt-tab id=" + t) in s for t in terms), \
+    "focus did not return to a real Terminal"
 assert s.index("goedit: dirty") < s.index("goedit: saved") < s.index("gotabwm: alt-tab id=")
 out = pathlib.Path("artifacts/m91-workflow")
 suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")

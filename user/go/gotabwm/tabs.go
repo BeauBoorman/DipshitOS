@@ -128,6 +128,14 @@ const (
 	MarkerSessionLoad   = "gotabwm: session load n="
 	MarkerSessionTitles = "gotabwm: session titles="
 	MarkerSessionBad    = "gotabwm: session bad"
+	// M120b (#2559): the restore's live half. reexec counts the bins the
+	// seat exec'd back, live counts the rows a declare actually
+	// re-inhabited, and drop names a row nothing could run (unbacked bin,
+	// refused exec, dead or late pid).
+	MarkerSessionReexec = "gotabwm: session reexec n="
+	MarkerSessionLive   = "gotabwm: session live n="
+	MarkerSessionDrop   = "gotabwm: session drop "
+	MarkerSessionExec   = "gotabwm: session exec "
 	// M71e (#1564): the frozen-badge chord outcomes and the restore count.
 	// Zig's shapes are `tabwm: tab-freeze <id> on|off` and `freeze=<n>` on
 	// its tabs-applied line; these follow GOTABWM's own pin style

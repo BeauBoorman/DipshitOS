@@ -42,10 +42,12 @@
 #       ctrl-shift-f freezes it, and a rail DRAG moves it to the right — each
 #       mutation writes SESSION.TABS as it happens, and the run ends at its
 #       own rx marker with the seat still up.
-#   10  M79g (#1718): the second boot of that pair. No HID, no clients: the
-#       seat restores the file run 09 wrote and must report the ORDER, the
-#       pin bit and the frozen badge the user actually left — `session load
-#       n=2 mode=restore` plus the order/titles lines that carry them.
+#   10  M79g (#1718) + M120b (#2559): the second boot of that pair. No HID,
+#       no scripted clients: the seat restores the file run 09 wrote and
+#       re-execs the recorded bins — `session load n=2 mode=restore`,
+#       `session reexec n=2`, `session live n=2` — keeping the ORDER, the
+#       pin bit and the frozen badge the user actually left, on real window
+#       ids < 0x100 (adopted rows, not placeholder accumulation).
 #       M104e (#2272): the restored rail is also asserted as PIXELS — the
 #       §2.3.6 Selection + 3px Accent marker on the focused cell, the
 #       close glyph's zone, and the frozen badge.
@@ -90,7 +92,7 @@
 # HOST PREREQUISITE: bash tools/go/build-note.sh -> .build/go/NOTE.ELF
 # HOST PREREQUISITE: bash tools/go/build-web.sh wmrpcprobe WMRPCPROBE -> .build/go/WMRPCPROBE.ELF (run 11)
 
-vgate_name go-wm-tabs "issues #1400–#1405/#1426 + #1564 + #1707 + #1718: GOTABWM tabs, session, LAYOUT.txt, frozen badge, start surface, live titles, and a session file that records what the user did on VZ"
+vgate_name go-wm-tabs "issues #1400–#1405/#1426 + #1564 + #1707 + #1718 + #2559: GOTABWM tabs, session, LAYOUT.txt, frozen badge, start surface, live titles, and a session file that records what the user did on VZ"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -489,20 +491,42 @@ vgate_assert 02 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 02 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 02 serial-contains 'gotabwm: registered'
 vgate_assert 02 serial-contains 'gotabwm: settings wm=none'
-# M79g (#1718): `mode=restore` is the seat saying these ids are placeholder
-# rows read back from the file, NOT apps this boot re-executed (re-exec is a
-# policy card of its own). Boot 01's file now carries the strip it ended
-# with — one tab — because a close is a mutation too.
+# M120b (#2559): `mode=restore` still names the decode (the strip came from
+# the file), and `session reexec n=` is the live half — the seat re-exec'd
+# the recorded bin and the app's own declare adopted the row in place, so
+# the window id is a REAL kernel id (< 0x100), not the placeholder.
 vgate_assert 02 serial-contains 'gotabwm: session load n=1 mode=restore'
 vgate_assert 02 serial-contains 'gotabwm: session titles=notes.txt pin=0 active=0'
 vgate_assert 02 serial-contains 'gotabwm: session freeze n=0'
+vgate_assert 02 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 02 serial-contains 'gotabwm: session exec NOTE.ELF'
+# The re-exec'd app really hosted: its own declare is what opened the tab.
+vgate_assert 02 serial-contains 'note: tab-aware (full-viewport)'
+vgate_assert 02 serial-count 'gotabwm: tab open id=' 1
+vgate_assert 02 serial-contains 'gotabwm: session live n=1'
 vgate_assert 02 serial-contains 'gotabwm: order ids='
 vgate_assert 02 serial-contains 'pin=0'
 vgate_assert 02 serial-contains 'gotabwm: rail n=1 focus='
 vgate_assert 02 serial-contains 'gotabwm: layout file=/host/SELFTEST/LAYOUT.txt'
-# Restored placeholder ids are not kernel windows: skip split/close.
+# The card's ID bound: nothing the second boot treats as a live window is
+# >= 0x100 — the placeholder only ever existed between load and declare.
+vgate_assert 02 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+bad = []
+for m in re.finditer(
+        r"^gotabwm: (?:tab open|tab focus|tab close|host focus|host view|host close|rpc declare|rpc attach) id=(\d+)",
+        ser, re.M):
+    if int(m.group(1)) >= 0x100:
+        bad.append(m.group(0))
+if bad:
+    sys.exit("placeholder ids on live-window paths: %s" % bad)
+print("every live-window id on boot 02 is < 0x100")
+PY
+# A live restored tab still never splits (that path needs two live rows
+# the user made), and its teardown close is real.
 vgate_assert 02 serial-absent 'gotabwm: split '
-vgate_assert 02 serial-absent 'gotabwm: tab close id='
+vgate_assert 02 serial-contains 'gotabwm: tab close id='
 vgate_assert 02 serial-absent 'gotabwm: session bad'
 vgate_assert 02 share-contains SELFTEST/LAYOUT.txt 'bin=NOTE.ELF'
 vgate_assert 02 python <<'PY'
@@ -520,8 +544,9 @@ parsed = [line_re.match(line) for line in lines]
 if not all(parsed):
     sys.exit("bad LAYOUT line in %r" % lines)
 ids = [parsed[0].group(1)]
-if ids != ["256"]:
-    sys.exit("restored ids %s want 256 (sessionIDBase=0x100)" % ids)
+if ids == ["256"] or int(ids[0]) >= 256:
+    sys.exit("restored id %s still the placeholder — the settle republish "
+             "must carry the live window id (<0x100)" % ids)
 bins = [parsed[0].group(2)]
 if bins != ["NOTE.ELF"]:
     sys.exit("bins %s want NOTE.ELF" % bins)
@@ -529,8 +554,8 @@ if parsed[0].group(8) != "none":
     sys.exit("restore dump must be unsplit")
 if parsed[0].group(7) != "1":
     sys.exit("the restored tab must be the focused one, focus=%s" % parsed[0].group(7))
-print("LAYOUT.txt restore n=1 id=256 unsplit")
-# Boot 03 must not restore the Calc/notes.txt session placeholders.
+print("LAYOUT.txt restore n=1 id=%s live (<0x100) unsplit" % ids[0])
+# Boot 03 must not restore+re-exec the Calc/notes.txt session rows.
 stale = os.path.join(os.environ["VG_SHARE"], "SESSION.TABS")
 try:
     os.remove(stale)
@@ -632,8 +657,9 @@ vgate_assert 03 serial-absent 'exited status=139'
 vgate_assert 03 serial-absent 'newosproc: sys_thread create failed'
 
 # Run 04 must start on an EMPTY strip: run 03's two-tab choreography writes
-# SESSION.TABS (M62e), and a later boot that restores it adds placeholder
-# tabs AND sets stripDone. Same clear go-wm-tabs already does before run 03.
+# SESSION.TABS (M62e), and a later boot that restores it re-execs the
+# recorded bins (M120b) AND sets stripDone. Same clear go-wm-tabs already
+# does before run 03.
 vgate_assert 03 python <<'PY'
 import os, sys
 stale = os.path.join(os.environ["VG_SHARE"], "SESSION.TABS")
@@ -1208,8 +1234,8 @@ vgate_assert 07 serial-absent '[EXC] parking:'
 vgate_assert 07 serial-absent 'exited status=139'
 
 # Run 08 must start on an empty strip: run 07 now leaves a two-tab session
-# (M79g — the declares write it), which a restore would turn into placeholder
-# rows. Same clear the spec already does between the earlier runs.
+# (M79g — the declares write it), which a restore would re-exec (M120b).
+# Same clear the spec already does between the earlier runs.
 vgate_assert 07 python <<'PY'
 import os, sys
 stale = os.path.join(os.environ["VG_SHARE"], "SESSION.TABS")
@@ -1526,12 +1552,16 @@ if not (i_freeze < i_reorder < i_write):
 print("last session write at %d, after reorder at %d" % (i_write, i_reorder))
 PY
 
-# --- M79g (#1718): the second boot restores it ------------------------------
+# --- M79g (#1718) + M120b (#2559): the second boot re-execs it --------------
 #
-# No HID, no clients: the seat boots on the share run 09 left and must report
-# the ORDER, the pin bit and the frozen badge the user actually left. This is
-# the card's restore half, and `mode=restore` is the seat saying these rows
-# came from the file (placeholder ids, nothing re-executed).
+# No HID, no scripted clients: the seat boots on the share run 09 left and
+# must re-execute the recorded bins, keeping the ORDER, the pin bit, the
+# frozen badge and the focus the user actually left. `mode=restore` still
+# names the decode; `session reexec n=2` is the exec fan-out, `session live
+# n=2` is every pid's declare having re-inhabited its row, and the ids that
+# land on the strip are real kernel window ids (< 0x100 — re-exec, not
+# placeholder accumulation). The rx marker waits on `session live` so the
+# serial and LAYOUT.txt both describe the settled strip.
 vgate_file script-10.txt <<'EOF'
 set GOMAXPROCS=1
 wm
@@ -1557,13 +1587,22 @@ vgate_run 10 -- \
     --script2 '$RUN_DIR/script2-10.txt' \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-10.txt' \
-    --script3-after 'gotabwm: session load n=2 mode=restore' \
+    --script3-after 'gotabwm: session live n=2' \
     --script-expect 'rx-gotabwm-session-restore-ok' --timeout 300
 
 vgate_assert 10 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 10 serial-contains 'gotabwm: registered'
 vgate_assert 10 serial-contains 'gotabwm: mode live'
 vgate_assert 10 serial-contains 'gotabwm: session load n=2 mode=restore'
+# M120b (#2559): the re-exec half — both recorded bins exec'd, both apps
+# really hosted (their own declare markers, not the seat's), and the settle
+# reported both rows live.
+vgate_assert 10 serial-contains 'gotabwm: session reexec n=2'
+vgate_assert 10 serial-contains 'gotabwm: session live n=2'
+vgate_assert 10 serial-contains 'gotabwm: session exec NOTE.ELF'
+vgate_assert 10 serial-contains 'gotabwm: session exec GOCALC.ELF'
+vgate_assert 10 serial-count 'gotabwm: rpc declare id=' 2
+vgate_assert 10 serial-count 'gotabwm: tab open id=' 2
 # The order line the seat restored. Which tab sits in slot 0 is decided by
 # run 09's unsequenced execs (SPEC.md: `exec` returns at spawn), so the
 # expected line is derived from the SESSION.TABS run 09 left on the share —
@@ -1588,11 +1627,24 @@ vgate_assert 10 serial-contains 'gotabwm: order ids='
 vgate_assert 10 serial-contains 'pin=0,1'
 vgate_assert 10 serial-contains 'gotabwm: rail n=2 focus='
 vgate_assert 10 serial-contains 'gotabwm: layout file=/host/SELFTEST/LAYOUT.txt'
-# Restored rows are placeholders, not kernel windows: nothing split, closed
-# or re-executed, and no client ever declared.
+# M120b (#2559): the settle is the boundary — every id the strip treated as
+# live is < 0x100, and the placeholder rows that waited on declares never
+# became kernel windows themselves.
+vgate_assert 10 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+bad = []
+for m in re.finditer(
+        r"^gotabwm: (?:tab open|tab focus|tab close|host focus|host view|host close|rpc declare|rpc attach|alt-tab) id=(\d+)",
+        ser, re.M):
+    if int(m.group(1)) >= 0x100:
+        bad.append(m.group(0))
+if bad:
+    sys.exit("placeholder ids on live-window paths: %s" % bad)
+print("every live-window id on boot 10 is < 0x100")
+PY
 vgate_assert 10 serial-absent 'gotabwm: split '
 vgate_assert 10 serial-absent 'gotabwm: tab close id='
-vgate_assert 10 serial-absent 'gotabwm: tab open id='
 vgate_assert 10 serial-absent 'gotabwm: session bad'
 vgate_assert 10 serial-absent 'gotabwm: first-boot workspace'
 vgate_assert 10 serial-contains 'rx-gotabwm-session-restore-ok'
@@ -1600,7 +1652,8 @@ vgate_assert 10 serial-absent '[EXC] parking:'
 vgate_assert 10 serial-absent 'exited status=139'
 vgate_assert 10 python <<'PY'
 import os, re, sys
-# LAYOUT.txt is the restore dump: two placeholder rows, in the restored order.
+# LAYOUT.txt is the settle dump: the two restored rows carrying their real
+# window ids, in the recorded order.
 p = os.path.join(os.environ["VG_SHARE"], "SELFTEST/LAYOUT.txt")
 try:
     raw = open(p, "rb").read()
@@ -1614,9 +1667,12 @@ if len(lines) != 2:
 parsed = [line_re.match(line) for line in lines]
 if not all(parsed):
     sys.exit("bad LAYOUT line in %r" % lines)
-ids = [parsed[0].group(1), parsed[1].group(1)]
-if ids != ["256", "257"]:
-    sys.exit("restored ids %s want 256,257 (sessionIDBase=0x100)" % ids)
+ids = [int(parsed[0].group(1)), int(parsed[1].group(1))]
+if any(i >= 256 for i in ids):
+    sys.exit("restored ids %s still placeholders — re-exec must land live "
+             "window ids (<0x100)" % ids)
+if len(set(ids)) != 2:
+    sys.exit("live ids not unique: %s" % ids)
 # Row order follows run 09's file — which tab led is whichever client won
 # the unsequenced exec/bind race, so compare against SESSION.TABS itself.
 sb = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
@@ -1627,7 +1683,7 @@ if bins != want_bins:
     sys.exit("bins %s want %s (the order run 09 persisted)" % (bins, want_bins))
 if any(row[8] != "none" for row in parsed):
     sys.exit("restore dump must be unsplit")
-print("LAYOUT.txt restore n=2 ids=256,257 bins=%s in the restored order" % bins)
+print("LAYOUT.txt restore n=2 live ids=%s bins=%s in the recorded order" % (ids, bins))
 PY
 
 # M104e (#2272): the rail on the restored strip, as PIXELS. Two cells of

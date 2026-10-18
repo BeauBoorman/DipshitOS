@@ -9,6 +9,12 @@
 // one pin-stay snapshot — reorder a tab, pin it, freeze it, open or close
 // one, and the next boot restores that. The choreography's own write keeps
 // its marker.
+//
+// M120b (#2559): a restored strip is LIVE, not corpses. Each backed row is
+// re-exec'd and waits as a placeholder only until its pid's declare
+// re-inhabits it — order, pin, frozen and focus ride the row across the
+// swap. A row nothing can run is dropped by name, and a restore that leaves
+// no live row falls back to the first-boot workspace.
 package main
 
 import "virelai/vi"
@@ -24,6 +30,11 @@ const (
 	sessionMissing sessionLoadState = iota
 	sessionRestored
 	sessionCorrupt
+	// sessionEmpty: the file decoded, but nothing it recorded came back
+	// live — every row was unbacked or its re-exec failed. Distinct from a
+	// valid EMPTY file (count=0 stays sessionRestored: a boot that closed
+	// everything asked for an empty desktop, not a starter).
+	sessionEmpty
 )
 
 var (
@@ -79,12 +90,19 @@ var writeHostFile = func(path string, data []byte) bool {
 	return vi.WriteFileSafe(path, data) == 0
 }
 
+// readSessionFile is the ReadFileAll seam for loadSession (the writeHostFile
+// pattern): on the host it returns -ENOSYS, so the test drives restore
+// through this var.
+var readSessionFile = func(path string, max int) ([]byte, int64) {
+	return vi.ReadFileAll(path, max)
+}
+
 // sessionRows is the strip SESSION.TABS may honestly record: the tabs THIS
-// boot hosts. A row restored from a previous boot (a placeholder id, >=
-// sessionIDBase) was never re-exec'd — the card keeps re-exec out of scope —
-// so writing it back would grow the file with a row no app ever ran, and
-// across boots (restore, open one, reboot) that grows without bound. Focus
-// follows by id; a focus that sat on a dropped row records no active tab.
+// boot hosts. A row still waiting for its re-exec'd app to declare (a
+// placeholder id, >= sessionIDBase) is not a live client, so writing it
+// back would grow the file with a row no app is running yet; across boots
+// (restore, open one, reboot) that grows without bound. Focus follows by
+// id; a focus that sat on a dropped row records no active tab.
 func (s *TabStrip) sessionRows() TabStrip {
 	var out TabStrip
 	fid, has := s.Focused()
@@ -162,10 +180,17 @@ func restoreSessionBytes(strip *TabStrip, b []byte, readResult int64) (uint16, s
 }
 
 // loadSession reads SESSION.TABS. Missing is the first-boot branch; corrupt
-// or truncated bytes fail closed, while a present valid file is restored.
+// or truncated bytes fail closed, while a present valid file is restored
+// and (M120b) re-exec'd: each row with a recorded bin gets its executable
+// started again, and the rows nothing could run are dropped by name.
 func loadSession() sessionLoadState {
-	b, r := vi.ReadFileAll(sessionPath, tabsV2MaxBytes)
+	b, r := readSessionFile(sessionPath, tabsV2MaxBytes)
 	seq, state := restoreSessionBytes(&tabs, b, r)
+	// sessionEcho is the file's own echo, captured before re-exec mutates
+	// the strip: the restore-witness line reports what the FILE held, not
+	// what survived the exec fan-out (live-vz-restore's fixture legs pin
+	// the recorded titles across save and resume).
+	sessionEcho = sessionTitlesLine(&tabs)
 	if state == sessionMissing {
 		return state
 	}
@@ -178,19 +203,18 @@ func loadSession() sessionLoadState {
 		return state
 	}
 	// Placeholder ids (sessionIDBase+) are not kernel windows. Leave
-	// hostedApp=0 so a later Wmctl* cannot aim at 0x100+i. stripDone
-	// skips the live choreography that would close/split them.
+	// hostedApp=0 so a later Wmctl* cannot aim at 0x100+i until adoption
+	// swaps in a real id. stripDone skips the live choreography that
+	// would close/split the restored strip.
 	hostedApp = 0
 	stripDone = true
-	// M79g (#1718): `mode=restore` says what those ids ARE — placeholder
-	// rows (>= sessionIDBase) read back from the file, NOT apps this boot
-	// re-executed. Re-exec of restored tabs is a policy card of its own
-	// (explicitly out of scope here); until then the marker is the honest
-	// difference between a strip that came from disk and one that came
-	// from a declare. Suffixed, so every existing grep for the load line
-	// keeps matching.
+	// The echoes describe what the FILE held, printed before the re-exec
+	// fan-out drops or adopts anything: `mode=restore` names the decode
+	// path (a strip that came from disk, not from declares), titles and
+	// the freeze count are the round-trip proof, and the order/layout
+	// dumps still show the placeholder strip exactly as read back.
 	vi.ConsoleLine(MarkerSessionLoad + vi.Itoa64(int64(tabs.Count())) + " mode=restore")
-	vi.ConsoleLine(MarkerSessionTitles + sessionTitlesLine(&tabs))
+	vi.ConsoleLine(MarkerSessionTitles + sessionEcho)
 	// M71e (#1564): how many restored tabs came back carrying the frozen
 	// badge — the observable that the flag survived the round-trip. A
 	// separate line, not a field on the titles line above: that line's exact
@@ -198,14 +222,217 @@ func loadSession() sessionLoadState {
 	vi.ConsoleLine(MarkerSessionFreeze + vi.Itoa64(int64(tabs.FrozenCount())))
 	dumpOrder()
 	_ = writeLayoutFile()
+	// M120b (#2559): the restore's live half. Rows sit as placeholders only
+	// until their pid declares; the bound is the file's own row cap plus a
+	// task pool that refuses what cannot fit. A boot whose rows all dropped
+	// reports sessionEmpty so the caller can fall back to the starter.
+	vi.ConsoleLine(MarkerSessionReexec + vi.Itoa64(int64(reexecSession())))
+	if tabs.Count() == 0 {
+		return sessionEmpty
+	}
 	return state
+}
+
+// sessionReexecHold is the composite-tick budget a re-exec'd pid gets to
+// reach its declare before the placeholder row is dropped — the row is
+// honest about waiting, not a corpse. The budget is hostTicks-shaped:
+// every staged client declares well inside its first ticks.
+const sessionReexecHold = hostTicks
+
+// reexecWait pairs an exec'd pid with the placeholder row that pid is
+// re-inhabiting. The declare path matches on ReplyTo (the client's own
+// pid — the same identity the RPC binding checks), never on title: a
+// retitled row would never match its own record.
+type reexecWait struct {
+	pid uint8
+	id  uint32 // the placeholder window id the row still carries
+}
+
+var (
+	reexecPending [MaxTabs]reexecWait
+	reexecN       int
+	reexecHold    int
+	// sessionEcho is the file's titles/pin/active echo, captured at load
+	// before the re-exec fan-out mutates the strip; restoreWitnessLine
+	// reports it.
+	sessionEcho string
+)
+
+// dropRestoredRow removes a placeholder row that cannot become a live tab,
+// named by its recorded title. There is no kernel window behind a
+// placeholder id, so this is the local strip removal, not the WM close
+// seam — and a dropped row's bin still lands in the reopen LIFO, so
+// ctrl-shift-t can retry an app the pool refused.
+func dropRestoredRow(t0 Tab, why string) {
+	name := t0.Title
+	if name == "" {
+		name = t0.Bin
+	}
+	vi.ConsoleLine(MarkerSessionDrop + name + " " + why)
+	_ = tabs.CloseTab(t0.ID)
+}
+
+// reexecSession turns the just-restored placeholder strip into live tabs:
+// every backed row's bin is exec'd (the `.tabs` v2 row cap is the seat's
+// tab limit, and the kernel's task pool refuses what cannot fit — a refused
+// exec drops its row by name, which IS the pool bound). Each issued exec
+// leaves the row pending for its pid's declare. Returns the execs issued.
+func reexecSession() int {
+	var rows [MaxTabs]Tab
+	n := tabs.Count()
+	copy(rows[:], tabs.tabs[:n])
+	issued := 0
+	for i := 0; i < n; i++ {
+		t0 := rows[i]
+		if t0.Bin == "" {
+			dropRestoredRow(t0, "unbacked")
+			continue
+		}
+		pid, err := execApp(t0.Bin)
+		if err != nil || pid <= 0 || pid > 255 {
+			dropRestoredRow(t0, "exec")
+			continue
+		}
+		vi.ConsoleLine(MarkerSessionExec + t0.Bin)
+		reexecPending[reexecN] = reexecWait{pid: uint8(pid), id: t0.ID}
+		reexecN++
+		issued++
+	}
+	if reexecN > 0 {
+		reexecHold = sessionReexecHold
+		reexecSettleArmed = true
+	}
+	return issued
+}
+
+// adoptReexec re-inhabits a placeholder row with the declaring window: the
+// row keeps its recorded position, title, pin, frozen and focus — only the
+// dead placeholder id is swapped for the real window id. Returns the strip
+// index, or -1 when the pid is not a pending restore (a dropped row's late
+// declare joins as an ordinary new tab).
+func adoptReexec(pid uint8, id uint32) int {
+	for i := 0; i < reexecN; i++ {
+		if reexecPending[i].pid != pid {
+			continue
+		}
+		phid := reexecPending[i].id
+		reexecPending[i] = reexecPending[reexecN-1]
+		reexecPending[reexecN-1] = reexecWait{}
+		reexecN--
+		idx := tabs.index(phid)
+		if idx < 0 {
+			return -1
+		}
+		tabs.tabs[idx].ID = id
+		return idx
+	}
+	return -1
+}
+
+// procsAlive is the pid-liveness seam for the reap half: vi.Procs in the
+// guest, a stub in tests. Failing open (true) on an unreadable table keeps
+// a pending row from being reaped by an unavailable answer — the tick
+// deadline below is the backstop either way.
+var procsAlive = func(pid uint8) bool {
+	var rows [64]vi.ProcRow
+	n, r := vi.Procs(rows[:])
+	if r < 0 {
+		return true
+	}
+	for i := 0; i < n; i++ {
+		if uint8(rows[i].PID) == pid {
+			return rows[i].State == vi.ProcCreated || rows[i].State == vi.ProcRunning
+		}
+	}
+	return false
+}
+
+// reapSessionReexec runs on the composite cadence while restores are
+// outstanding: a pid that died before declaring drops its row now, and a
+// pid still pending when the hold expires drops its row too — a declare
+// that arrives afterwards joins as an ordinary new tab. When the set
+// drains, finishReexec lands the recorded focus and the live dumps.
+func reapSessionReexec() {
+	for i := 0; i < reexecN; {
+		if procsAlive(reexecPending[i].pid) {
+			i++
+			continue
+		}
+		if idx := tabs.index(reexecPending[i].id); idx >= 0 {
+			dropRestoredRow(tabs.At(idx), "dead")
+		}
+		reexecPending[i] = reexecPending[reexecN-1]
+		reexecPending[reexecN-1] = reexecWait{}
+		reexecN--
+	}
+	if reexecN > 0 && reexecHold > 0 {
+		reexecHold--
+		if reexecHold == 0 {
+			for reexecN > 0 {
+				if idx := tabs.index(reexecPending[reexecN-1].id); idx >= 0 {
+					dropRestoredRow(tabs.At(idx), "late")
+				}
+				reexecN--
+			}
+		}
+	}
+	maybeFinishReexec()
+}
+
+// reexecSettleArmed is the once-latch for the settle: armed by a restore
+// that issued execs, consumed when the pending set has fully drained —
+// by adoption or by the reap. A boot that never armed it never settles.
+var reexecSettleArmed bool
+
+func maybeFinishReexec() {
+	if reexecSettleArmed && reexecN == 0 {
+		reexecSettleArmed = false
+		finishReexec()
+	}
+}
+
+// finishReexec lands the recorded focus once the pending set has drained:
+// the focused row's live window gets the real raise (a later-declaring
+// window may have held kernel focus through the fan-out). If the focused
+// row never came back, the first live row takes it. The order and layout
+// dumps then go out with the real window ids.
+func finishReexec() {
+	fid, ok := tabs.Focused()
+	if !ok || fid >= sessionIDBase {
+		fid = 0
+		for i := 0; i < tabs.Count(); i++ {
+			if id := tabs.At(i).ID; id < sessionIDBase {
+				fid = id
+				break
+			}
+		}
+	}
+	live := 0
+	for i := 0; i < tabs.Count(); i++ {
+		if tabs.At(i).ID < sessionIDBase {
+			live++
+		}
+	}
+	if fid != 0 {
+		_ = tabs.FocusTab(fid)
+		hostedApp = fid
+		if focusRaise(fid) == 0 {
+			vi.ConsoleLine(MarkerTabFocus + vi.Itoa64(int64(fid)))
+			vi.ConsoleLine(MarkerHostFocus + vi.Itoa64(int64(fid)))
+		}
+	}
+	vi.ConsoleLine(MarkerSessionLive + vi.Itoa64(int64(live)))
+	dumpOrder()
+	_ = writeLayoutFile()
 }
 
 // firstBootWorkspace is only for the default Go seat. A deliberately selected
 // shim-only seat (wm=none) may exec GOTABWM for a gate, and the Zig fallback
-// (wm=tabwm) owns its own startup path.
+// (wm=tabwm) owns its own startup path. M120b: a restore that left no live
+// row (sessionEmpty) falls back here too — the starter is suppressed by a
+// session that came back, never by one that did not.
 func firstBootWorkspace(state sessionLoadState, wm string) bool {
-	return state == sessionMissing && wm == "gotabwm"
+	return (state == sessionMissing || state == sessionEmpty) && wm == "gotabwm"
 }
 
 func hasLiveGuestELF(rows []vi.ProcRow) bool {

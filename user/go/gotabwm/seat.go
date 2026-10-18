@@ -216,8 +216,11 @@ func detectRestoreWitness() bool {
 }
 
 func restoreWitnessLine() string {
+	// M120b (#2559): the session half is the FILE's echo, captured at load
+	// before the re-exec fan-out mutates the strip — the fixture proves the
+	// recorded titles survived the round trip, not which rows came back.
 	return MarkerRestoreWitness + "wm=" + restoreSettingsWM +
-		" theme=" + theme.Name() + " file=wake-fuse-ok " + sessionTitlesLine(&tabs)
+		" theme=" + theme.Name() + " file=wake-fuse-ok " + sessionEcho
 }
 
 // detectDemo probes the trigger's existence: found -> demo, absent (or any
@@ -547,6 +550,12 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	seatTick = ticks
 	vi.ConsoleLine(MarkerTick)
 	idleAdvance(ticks)
+	// M120b (#2559): pending session re-execs reap on the tick cadence —
+	// a pid that died before its declare, or outlived the declare window,
+	// drops its placeholder row rather than leaving a corpse on the rail.
+	if reexecN > 0 {
+		reapSessionReexec()
+	}
 	if tabs.Count() == 0 {
 		_ = paintBlank(scan, blankRGB())
 		startSurfaceTick(scan)

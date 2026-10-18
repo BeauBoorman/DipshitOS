@@ -403,20 +403,31 @@ func applyRPC(req vi.WmRpc) bool {
 		if !configureHostedChrome(id) {
 			return false
 		}
-		if tabs.OpenTab(id, req.TitleString()) {
+		// M120b (#2559): a declare from a pending re-exec pid ADOPTS the
+		// placeholder row it was exec'd for — position, title, pin, frozen
+		// and the recorded focus all ride the row, so the declare must not
+		// steal focus the way a fresh tab's does. The settle pass lands the
+		// recorded focus once the pending set drains.
+		adopted := adoptReexec(req.ReplyTo, id) >= 0
+		if adopted {
+			dogfoodHosted = true
+			vi.ConsoleLine(MarkerTabOpen + vi.Itoa64(int64(id)))
+		} else if tabs.OpenTab(id, req.TitleString()) {
 			noteStripOpen()
 			dogfoodHosted = true
 			vi.ConsoleLine(MarkerTabOpen + vi.Itoa64(int64(id)))
 		}
-		hostedApp = id
 		hostTicksLeft = hostTicks
-		// Focus and raise through the kernel's taskbar-click primitive, so the
-		// app receives the real WIN_FOCUS. New declares take focus so two
-		// clients leave exactly one focused tab (M62b).
-		if vi.WmctlTaskbarClick(id) == 0 {
-			_ = tabs.FocusTab(id)
-			vi.ConsoleLine(MarkerHostFocus + vi.Itoa64(int64(id)))
-			vi.ConsoleLine(MarkerTabFocus + vi.Itoa64(int64(id)))
+		if !adopted {
+			hostedApp = id
+			// Focus and raise through the kernel's taskbar-click primitive, so the
+			// app receives the real WIN_FOCUS. New declares take focus so two
+			// clients leave exactly one focused tab (M62b).
+			if vi.WmctlTaskbarClick(id) == 0 {
+				_ = tabs.FocusTab(id)
+				vi.ConsoleLine(MarkerHostFocus + vi.Itoa64(int64(id)))
+				vi.ConsoleLine(MarkerTabFocus + vi.Itoa64(int64(id)))
+			}
 		}
 		// Propose the full viewport. The kernel clamps (WM proposes, kernel
 		// clamps) and pushes WIN_RESIZE to the app, which relayouts.
@@ -429,6 +440,9 @@ func applyRPC(req vi.WmRpc) bool {
 		// execSelected has no marker-gated write site of its own), so the
 		// RPC — not the launcher — owns the write.
 		noteSessionMutation()
+		if adopted {
+			maybeFinishReexec()
+		}
 		return true
 	case vi.WmRpcKindRaise: // 1
 		if vi.WmctlTaskbarClick(id) == 0 {
@@ -442,18 +456,32 @@ func applyRPC(req vi.WmRpc) bool {
 		if !configureHostedChrome(id) {
 			return false
 		}
-		if tabs.OpenTab(id, req.TitleString()) {
+		// M120b (#2559): the same re-exec adoption as the declare arm — an
+		// attached window from a pending pid re-inhabits its row rather
+		// than appending and stealing the recorded focus.
+		adopted := adoptReexec(req.ReplyTo, id) >= 0
+		if adopted {
+			dogfoodHosted = true
+			vi.ConsoleLine(MarkerTabOpen + vi.Itoa64(int64(id)))
+			noteSessionMutation()
+		} else if tabs.OpenTab(id, req.TitleString()) {
 			noteStripOpen()
 			dogfoodHosted = true
 			vi.ConsoleLine(MarkerTabOpen + vi.Itoa64(int64(id)))
 			noteSessionMutation() // M79g (#1718): a new tab persists
 		}
 		// Same host-state sync as declare: an attach-without-declare client
-		// still lands on the strip with focus and the single-tab close budget.
-		_ = tabs.FocusTab(id)
-		hostedApp = id
+		// still lands on the strip with focus and the single-tab close
+		// budget. An adopted row keeps the recorded focus instead.
+		if !adopted {
+			_ = tabs.FocusTab(id)
+			hostedApp = id
+		}
 		hostTicksLeft = hostTicks
 		vi.ConsoleLine(MarkerRpcAttach + vi.Itoa64(int64(id)))
+		if adopted {
+			maybeFinishReexec()
+		}
 		return true
 	case vi.WmRpcKindDetachTab: // 6
 		closed := tabs.CloseTab(id)
