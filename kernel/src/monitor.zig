@@ -2353,17 +2353,11 @@ fn cmd_pages(m: *Monitor, args: []const []const u8) ExecError {
         return .none;
     }
     if (args.len == 1) return pages_selftest(m, s);
-    m.console.puts("pages: armed=1 total=");
-    m.console.print_hex(s.total_pages);
-    m.console.puts(" free=");
-    m.console.print_hex(s.free_pages);
-    m.console.puts(" excluded=");
-    m.console.print_hex(s.excluded_pages);
-    m.console.puts(" regions=");
-    m.console.print_hex(@intCast(s.region_count));
-    m.console.puts(" span=");
-    m.console.print_hex(s.span_pages);
-    m.console.puts("\n");
+    // #2649: ONE write — the live-long-lived gate parses free=, and a
+    // mid-token split by a concurrent write loses the hex run.
+    m.console.linef("pages: armed=1 total=0x{x:0>16} free=0x{x:0>16} excluded=0x{x:0>16} regions=0x{x:0>16} span=0x{x:0>16}\n", .{
+        s.total_pages, s.free_pages, s.excluded_pages, s.region_count, s.span_pages,
+    });
     return .none;
 }
 
@@ -2436,11 +2430,27 @@ fn pages_free_line(m: *Monitor, base: u64, n: u64, label: []const u8) bool {
 // ---------------------------------------------------------------------------
 
 fn cmd_echo(m: *Monitor, args: []const []const u8) ExecError {
+    // #2649: ONE write for the whole echoed line — the fleet asserts the
+    // marker whole-line (serial-exact / serial-contains), and a
+    // per-argument composition lets a foreign write split it mid-token.
+    var buf: [384]u8 = undefined;
+    var len: usize = 0;
     for (args, 0..) |arg, index| {
-        if (index > 0) m.console.putc(' ');
-        m.console.puts(arg);
+        if (index > 0) {
+            if (len >= buf.len) break;
+            buf[len] = ' ';
+            len += 1;
+        }
+        const n = @min(arg.len, buf.len - len);
+        @memcpy(buf[len..][0..n], arg[0..n]);
+        len += n;
+        if (n < arg.len) break; // truncated honestly at the bound
     }
-    m.console.puts("\n");
+    if (len < buf.len) {
+        buf[len] = '\n';
+        len += 1;
+    }
+    m.console.puts(buf[0..len]);
     return .none;
 }
 
@@ -4436,11 +4446,7 @@ fn cmd_settings(m: *Monitor, args: []const []const u8) ExecError {
         var i: usize = 0;
         while (i < settings.count()) : (i += 1) {
             if (settings.entry_at(i)) |e| {
-                m.console.puts("  ");
-                m.console.puts(e.key);
-                m.console.puts("=");
-                m.console.puts(e.val);
-                m.console.puts("\n");
+                m.console.linef("  {s}={s}\n", .{ e.key, e.val });
             }
         }
         return .none;
@@ -4451,11 +4457,7 @@ fn cmd_settings(m: *Monitor, args: []const []const u8) ExecError {
             return .usage;
         }
         if (settings.get(args[1])) |val| {
-            m.console.puts("settings: ");
-            m.console.puts(args[1]);
-            m.console.puts("=");
-            m.console.puts(val);
-            m.console.puts("\n");
+            m.console.linef("settings: {s}={s}\n", .{ args[1], val });
             return .none;
         }
         err_prefix(m);
@@ -4480,15 +4482,8 @@ fn cmd_settings(m: *Monitor, args: []const []const u8) ExecError {
             return .invalid_argument;
         }
         const saved = settings.save_to_share();
-        m.console.puts("settings: ");
-        m.console.puts(key);
-        m.console.puts("=");
-        m.console.puts(val);
-        if (saved) {
-            m.console.puts(" (persisted)\n");
-        } else {
-            m.console.puts(" (memory only)\n");
-        }
+        // #2649: ONE write — live-shell-default greps `settings: k=v (persisted)`.
+        m.console.linef("settings: {s}={s} ({s})\n", .{ key, val, if (saved) "persisted" else "memory only" });
         return .none;
     }
     if (std.mem.eql(u8, args[0], "reset")) {
@@ -4498,12 +4493,7 @@ fn cmd_settings(m: *Monitor, args: []const []const u8) ExecError {
         }
         settings.reset();
         const saved = settings.save_to_share();
-        m.console.puts("settings: reset to defaults");
-        if (saved) {
-            m.console.puts(" (persisted)\n");
-        } else {
-            m.console.puts(" (memory only)\n");
-        }
+        m.console.linef("settings: reset to defaults ({s})\n", .{if (saved) "persisted" else "memory only"});
         return .none;
     }
     print_usage(m, lookup("settings").?);

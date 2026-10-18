@@ -1461,47 +1461,65 @@ fn serial_lock_release() void {
 /// captures all output (the kernel banner, the shell's prompt, process
 /// stdout, tracer lines) from one choke point. A process launched by an
 /// async exec can write while the shell is idle at a live prompt (`virelai> `
-/// drawn, cursor mid-line); `process_stdout` consults this flag so foreign
+/// drawn, cursor mid-line); `uart_write_as` consults this flag so foreign
 /// output starts on its own line instead of merging onto the prompt (which
 /// swallowed the `elf: hello from HELLO.ELF` marker in the strace gate).
 var serial_at_bol: bool = true;
 
-/// WHICH PROCESS owns the current partial (mid-line) serial content, if
-/// any. `process_stdout` consults it so the claim-1714 fresh-line prepend
-/// fires only when FOREIGN output (the shell's newline-less prompt,
-/// kernel/tracer prints, or ANOTHER process's partial line) left the
-/// cursor mid-line — NOT when a program is mid-line composing its OWN
-/// multi-write line (USER.BIN's argv preamble is one logical line across
-/// three sys_write calls; the un-gated prepend fired on every call and
-/// split it, breaking verify-live-args). The owner pid makes two
-/// CONSECUTIVE programs distinct: HF4APP.ELF leaves its 20-byte marker
-/// mid-line and exits; DESKTOP.BIN's first write is foreign and must
-/// fresh-line (without the pid, the desktop appended directly onto the
-/// app's marker — `hostdesktop:` — breaking the vf gate's exact-line
-/// needles). Cleared by any newline (a terminated line never continues)
-/// and by any non-stdout partial write from `uart_puts` (the prompt case
-/// — that open line belongs to the shell, so the next process write must
-/// fresh-line).
-var stdout_line_owner_pid: ?usize = null;
+/// WHOSE content the open (mid-line) serial line belongs to — `.kernel`
+/// for shell/monitor/kernel output written through `uart_puts`, `.proc(pid)`
+/// for a user program's sys_write through `process_stdout`. #2649 (the
+/// M119f K-pass console/marker defects): a write arriving while a
+/// DIFFERENT writer's line is mid-composition must close that line with a
+/// newline first — bytes injected into a foreign open line fuse
+/// irreversibly (no boundary to rejoin on; observed as `smp:` drain tails
+/// fused onto an app's open line and marker halves fused when two writers
+/// shared one physical line), while closing it keeps every physical line
+/// a clean, recoverable unit.
+///
+/// This generalizes the claim-1714 fresh-line prepend, which only guarded
+/// process-vs-prompt writes (and only through `process_stdout`): kernel
+/// report lines used to land mid-composition on an app's open line
+/// because nothing checked ownership on the kernel side. Owner identity
+/// keeps the earlier pid rule's subtleties: a program composing one line
+/// across several sys_write calls keeps its line open (the USER.BIN argv
+/// preamble; the un-gated prepend split it, breaking verify-live-args), a
+/// DIFFERENT pid must fresh-line (the HF4APP.ELF marker → DESKTOP.BIN
+/// merge), a newline always clears ownership (a terminated line never
+/// continues), and a kernel-side partial write (the prompt) owns the line
+/// so the next process write fresh-lines.
+const SerialLineOwner = union(enum) {
+    kernel,
+    proc: usize,
+};
+var serial_line_owner: ?SerialLineOwner = null;
 
-fn uart_at_bol() bool {
-    return serial_at_bol;
+fn serial_owner_is(a: ?SerialLineOwner, b: SerialLineOwner) bool {
+    const o = a orelse return false;
+    if (std.meta.activeTag(o) != std.meta.activeTag(b)) return false;
+    return switch (o) {
+        .kernel => true,
+        .proc => |p| p == b.proc,
+    };
 }
 
 fn uart_putc(byte: u8) void {
-    // Cross-core serial TX (SMP user tasks): hold the lock for the whole
-    // line at the `uart_puts` level; a standalone putc (uart_hex and
-    // friends) takes it per byte. Holder-tracked, so the inner calls from
-    // a locked uart_puts are no-ops.
-    const reentrant = serial_lock_held();
-    if (!reentrant) serial_lock_acquire();
-    defer if (!reentrant) serial_lock_release();
+    // Cross-core serial TX (SMP user tasks): a standalone putc (uart_hex
+    // and friends) is a kernel-class one-byte write and takes the lock +
+    // open-line rule through uart_write_as; calls already under a held
+    // lock (the uart_write_as byte loop) go straight to the sink. The
+    // standalone form does NOT tail-flush — per-byte writers rely on the
+    // leaf's own newline/buffer-full flush (16 flushed descriptors per
+    // hex digit would be the regression).
+    if (!serial_lock_held()) {
+        uart_write_as_mode(.kernel, &[_]u8{byte}, false);
+        return;
+    }
     // Arc5 #243: capture every serial byte into the ring buffer so
     // crash tombstones can include the last 512 bytes of serial output.
     serial_ring.append(&[_]u8{byte});
     if (byte == '\n' or byte == '\r') {
         serial_at_bol = true;
-        stdout_line_owner_pid = null;
     } else {
         serial_at_bol = false;
     }
@@ -1651,26 +1669,48 @@ fn blk_probe_fail(stage: []const u8, e: virtio_blk.BlkError) void {
 }
 
 pub fn uart_puts(text: []const u8) void {
+    uart_write_as_mode(.kernel, text, true);
+}
+
+fn uart_write_as(owner: SerialLineOwner, text: []const u8) void {
+    uart_write_as_mode(owner, text, true);
+}
+
+/// One serial write under the TX lock, carrying the writer's identity so
+/// the open-line ownership rule applies uniformly: a write that arrives
+/// while a DIFFERENT writer's line is mid-composition closes that line
+/// with a newline first — foreign bytes can then never fuse into it
+/// (see `serial_line_owner`). The check, the close, the bytes, and the
+/// ownership update all run inside one critical section, so writers on
+/// different cores interleave only at line boundaries. A write that ends
+/// mid-line leaves ownership to its writer; one that ends a line frees it.
+/// Reentrant calls (a nested puts under a held lock) append in place —
+/// the outer write owns the line state, and closing it mid-composition
+/// would split the very write being interrupted. `tail_flush` carries the
+/// claim-0013 prompt rule (a newline-less write must still reach the
+/// host); standalone `uart_putc` passes false so per-byte callers stay on
+/// the leaf's own newline/buffer-full flush cadence.
+fn uart_write_as_mode(owner: SerialLineOwner, text: []const u8, tail_flush: bool) void {
     // The whole write is one critical section so a secondary core's
     // output never interleaves byte-wise with core 0's (holder-tracked:
     // a fault dump or nested puts on the same core proceeds).
     const reentrant = serial_lock_held();
     if (!reentrant) serial_lock_acquire();
     defer if (!reentrant) serial_lock_release();
+    if (!reentrant and text.len > 0 and !serial_at_bol and !serial_owner_is(serial_line_owner, owner)) uart_putc('\n');
     for (text) |byte| uart_putc(byte);
-    // A non-newline-terminated write from THIS path is shell/kernel output
-    // (the prompt): the open line belongs to the shell, so the next process
-    // write must fresh-line. (process_stdout re-asserts stdout ownership
-    // right after its own uart_puts call, so program lines stay open.)
-    if (text.len > 0 and text[text.len - 1] != '\n' and text[text.len - 1] != '\r') {
-        stdout_line_owner_pid = null;
+    if (!reentrant and text.len > 0) {
+        serial_line_owner = switch (text[text.len - 1]) {
+            '\n', '\r' => null,
+            else => owner,
+        };
     }
     // Claim 0013: a virtio-console line without a trailing newline (e.g. the
     // shell's prompt) must still reach the host — flush any buffered bytes.
     // In nvram-console builds the virtio transport is never touched; the
     // NVRAM sink does its own newline/buffer-flush batching.
     if (comptime !build_options.nvram_console) {
-        if (console_kind == .virtio and virtio_console.vp_tx_len > 0) virtio_console.virtio_pci_flush();
+        if (tail_flush and console_kind == .virtio and virtio_console.vp_tx_len > 0) virtio_console.virtio_pci_flush();
     }
 }
 
@@ -2268,32 +2308,27 @@ fn exception_report_writer(text: []const u8) void {
 }
 
 /// `write_fn` (process stdout) seam. `exception_report_writer` forwards to
-/// uart verbatim; this wrapper additionally starts the output on a fresh
-/// serial line when the cursor is mid-line — the case where an async-exec'd
-/// program writes while the shell is idle at a drawn prompt. Without it the
-/// program's first line merges onto the `virelai> ` prompt and the exact-line
-/// marker grep misses it (the strace gate). The prefixed newline flushes the
-/// buffered virtio prompt line first, then the program's output lands at
-/// column 0. When the shell already sits at a fresh line (the common
-/// foreground case) nothing is prepended.
+/// uart verbatim; this wrapper starts the output on a fresh serial line
+/// when the cursor is mid-line on FOREIGN content — the case where an
+/// async-exec'd program writes while the shell is idle at a drawn prompt.
+/// Without it the program's first line merges onto the `virelai> ` prompt
+/// and the exact-line marker grep misses it (the strace gate). The
+/// prefixed newline flushes the buffered virtio prompt line first, then
+/// the program's output lands at column 0. When the shell already sits at
+/// a fresh line (the common foreground case) nothing is prepended.
 fn process_stdout(text: []const u8) void {
-    // Claim 1714: foreign output (the shell's drawn prompt) left the cursor
-    // mid-line — start the program's output on a fresh line. But only when
-    // the open line is NOT THIS PROCESS's own: a program composing one line
-    // across several sys_write calls (USER.BIN's argv preamble) must stay
-    // contiguous, and a DIFFERENT process's partial line must not be
-    // continued (the HF4APP.ELF marker → DESKTOP.BIN merge above). The
-    // shell's prompt is not a process, so uart_puts clears the owner and
-    // the next process write fresh-lines (the claim-1714 intent).
-    const pid = scheduler.current_id();
-    const owns_open_line = stdout_line_owner_pid != null and stdout_line_owner_pid.? == pid;
-    if (!uart_at_bol() and !owns_open_line) uart_puts("\n");
-    uart_puts(text);
-    if (text.len > 0 and text[text.len - 1] != '\n' and text[text.len - 1] != '\r') {
-        stdout_line_owner_pid = pid;
-    } else {
-        stdout_line_owner_pid = null;
-    }
+    // Claim 1714 + #2649: the whole thing — fresh-line check, the closing
+    // newline when the open line belongs to a different writer (the shell's
+    // prompt, kernel prints, ANOTHER process's partial line), this write's
+    // bytes, and the ownership update — is ONE critical section. The old
+    // shape made the prepend decision outside the lock and issued the
+    // close + the body as two separate uart_puts calls, so a foreign write
+    // could still land between them and fuse (the M119f K-pass signature).
+    // Owner identity also keeps the claim-1714/merge subtleties: a program
+    // composing one line across several sys_write calls (USER.BIN's argv
+    // preamble) stays contiguous, while a DIFFERENT process's partial line
+    // is never continued.
+    uart_write_as(.{ .proc = scheduler.current_id() }, text);
 }
 
 /// Claim 9187 IRQ chain, registered as the exception module's dispatcher:

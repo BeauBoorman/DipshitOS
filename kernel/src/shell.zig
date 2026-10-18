@@ -371,23 +371,18 @@ pub fn bg_reap(mon: *monitor.Monitor) void {
         const info = process.info(jpid);
         const state = if (info) |inf| inf.state else .free;
         if (state != .exited and state != .free) continue; // still running
-        mon.console.puts("[");
-        mon.console.print_u64(@intCast(i + 1));
-        mon.console.puts("] Done: ");
+        // #2649: ONE write per marker line — the live jobs gate
+        // whole-line greps `[N] Done: NAME (exit=C)`, so a composition
+        // interrupted by a concurrent process write loses the match.
         if (info) |inf| {
-            mon.console.puts(inf.name);
             if (state == .exited) {
-                mon.console.puts(" (exit=");
-                mon.console.print_u64(inf.exit_status);
-                mon.console.puts(")");
+                mon.console.linef("[{d}] Done: {s} (exit={d})\n", .{ i + 1, inf.name, inf.exit_status });
             } else {
-                mon.console.puts(" (gone)");
+                mon.console.linef("[{d}] Done: {s} (gone)\n", .{ i + 1, inf.name });
             }
         } else {
-            mon.console.puts(job.name[0..job.name_len]);
-            mon.console.puts(" (gone)");
+            mon.console.linef("[{d}] Done: {s} (gone)\n", .{ i + 1, job.name[0..job.name_len] });
         }
-        mon.console.print_line("");
         bg_job_free(i + 1);
     }
 }
@@ -3450,20 +3445,15 @@ fn shell_handle_expanded(mon: *monitor.Monitor, line: []const u8) void {
             const inf = process.info(jpid);
             const st = if (inf) |x| x.state else .free;
             const running = st != .exited and st != .free;
-            mon.console.puts("[");
-            mon.console.print_u64(@intCast(i + 1));
-            mon.console.puts(if (running) "] Running: " else "] Done: ");
-            mon.console.puts(job.name[0..job.name_len]);
-            if (!running) {
-                if (inf != null and inf.?.state == .exited) {
-                    mon.console.puts(" (exit=");
-                    mon.console.print_u64(inf.?.exit_status);
-                    mon.console.puts(")");
-                } else {
-                    mon.console.puts(" (gone)");
-                }
+            // #2649: ONE write per row — the jobs gate whole-line greps.
+            const name = job.name[0..job.name_len];
+            if (running) {
+                mon.console.linef("[{d}] Running: {s}\n", .{ i + 1, name });
+            } else if (inf != null and inf.?.state == .exited) {
+                mon.console.linef("[{d}] Done: {s} (exit={d})\n", .{ i + 1, name, inf.?.exit_status });
+            } else {
+                mon.console.linef("[{d}] Done: {s} (gone)\n", .{ i + 1, name });
             }
-            mon.console.print_line("");
         }
         if (!any) mon.console.print_line("jobs: no background jobs");
         return;
@@ -3588,11 +3578,8 @@ fn shell_handle_expanded(mon: *monitor.Monitor, line: []const u8) void {
             if (bg_job_add(pid_after.?, pname)) {
                 for (&bg_jobs, 0..) |*job, i| {
                     if (job.pid == null or job.pid.? != pid_after.?) continue;
-                    mon.console.puts("[");
-                    mon.console.print_u64(@intCast(i + 1));
-                    mon.console.puts("] running: ");
-                    mon.console.puts(job.name[0..job.name_len]);
-                    mon.console.print_line("");
+                    // #2649: ONE write per row — the jobs gate greps it whole-line.
+                    mon.console.linef("[{d}] running: {s}\n", .{ i + 1, job.name[0..job.name_len] });
                     break;
                 }
             } else {
@@ -3621,25 +3608,18 @@ fn fg_parse_job_number(text: []const u8) ?usize {
 }
 
 fn fg_report_done(mon: *monitor.Monitor, n: usize, name: []const u8, inf: ?process.ProcessInfo) void {
-    mon.console.puts("[");
-    mon.console.print_u64(@intCast(n));
-    mon.console.puts("] Done: ");
+    // #2649: ONE write per marker line — the jobs gate greps it whole-line.
     if (inf) |pi| {
-        mon.console.puts(pi.name);
         if (pi.state == .exited) {
-            mon.console.puts(" (exit=");
-            mon.console.print_u64(pi.exit_status);
-            mon.console.puts(")");
+            mon.console.linef("[{d}] Done: {s} (exit={d})\n", .{ n, pi.name, pi.exit_status });
         } else {
-            mon.console.puts(" (gone)");
+            mon.console.linef("[{d}] Done: {s} (gone)\n", .{ n, pi.name });
         }
         // The child's own status becomes fg's status ($? sees it next).
         if (pi.state == .exited) set_exit_code(@intCast(@min(pi.exit_status, 255)));
     } else {
-        mon.console.puts(name[0..name.len]);
-        mon.console.puts(" (gone)");
+        mon.console.linef("[{d}] Done: {s} (gone)\n", .{ n, name[0..name.len] });
     }
-    mon.console.print_line("");
     bg_job_free(n);
 }
 
@@ -3657,9 +3637,7 @@ fn fg_run(mon: *monitor.Monitor, argv: []const []const u8) void {
     };
     const job = &bg_jobs[n - 1];
     const jpid = job.pid orelse {
-        mon.console.puts("fg: job ");
-        mon.console.print_u64(@intCast(n));
-        mon.console.print_line(" already done");
+        mon.console.linef("fg: job {d} already done\n", .{n});
         set_exit_ok(false);
         return;
     };
@@ -3682,9 +3660,7 @@ fn fg_run(mon: *monitor.Monitor, argv: []const []const u8) void {
     if (st == .exited or st == .free) {
         fg_report_done(mon, n, job.name[0..job.name_len], inf);
     } else {
-        mon.console.puts("fg: job ");
-        mon.console.print_u64(@intCast(n));
-        mon.console.print_line(" still running");
+        mon.console.linef("fg: job {d} still running\n", .{n});
         set_exit_ok(false);
     }
 }
