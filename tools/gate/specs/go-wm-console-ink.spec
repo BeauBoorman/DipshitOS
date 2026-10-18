@@ -42,7 +42,7 @@ EOF
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script2.txt' \
-    --script-after 'gotabwm: present' \
+    --script-after 'gosh: prompt' \
     --script-expect 'rx-console-ink-probe' \
     --screenshot-after 'rx-console-ink-probe' --timeout 240
 
