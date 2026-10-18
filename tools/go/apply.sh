@@ -70,8 +70,14 @@ tag_dedupe() {
 }
 
 # --- 2. overlay files (new, GOOS-gated) --------------------------------
+# gostalgia/ and gostalgia-mods/ are stage overlays: build-gostalgia.sh
+# applies them onto the pinned tree in .build/gostalgia-src, never onto
+# the fork. Copied into src/ they both fail make.bash (`go_bootstrap
+# install std` compiles them) and collide with the stage at package
+# resolution (ambiguous import: gostalgia/cmd/* found in two modules).
 log "copying overlay files"
-( cd "$REPO/tools/go/overlay" && find . -type f | while read -r f; do
+( cd "$REPO/tools/go/overlay" && find . -type f \
+    ! -path "./gostalgia/*" ! -path "./gostalgia-mods/*" | while read -r f; do
     mkdir -p "$FORK_DIR/src/$(dirname "$f")"
     cp "$f" "$FORK_DIR/src/$f"
 done )
