@@ -82,7 +82,9 @@ vgate_assert 01 serial-count 'status43: alive' 2
 # more than one group section, and `help <cmd>` prints the D1 usage line;
 # an unknown name gets the D3 shape rather than a dump of everything.
 vgate_assert 01 serial-contains 'builtins:'
-vgate_assert 01 serial-contains 'shell: alias clear date echo exit help history log monitor time unalias'
+# #2649: the catalog gained `suspend` (the completion-list drift the card
+# recorded) — pin the live list, not the M40-era one.
+vgate_assert 01 serial-contains 'shell: alias clear date echo exit help history log monitor suspend time unalias'
 vgate_assert 01 serial-contains 'identity: chmod id secrets whoami'
 vgate_assert 01 serial-contains 'usage: printf FORMAT [ARGS...]'
 vgate_assert 01 serial-contains 'subset: one pipe per line'

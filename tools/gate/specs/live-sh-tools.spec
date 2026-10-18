@@ -90,9 +90,18 @@ vgate_assert 01 serial-absent '[EXC] parking:'
 # grep reports no match (status 1) every time, and the victim's file
 # stays byte-exact. `-c` allows at most four `;` segments and expands the
 # body once before runFor binds the loop variable, so the loop emits
-# identical rows — byte-exactness is still the observable.
+# identical rows — byte-exactness is still the observable. Two traps in
+# the old line (#2649): parseFor DISCARDS everything after `done`, so
+# `done; sleep 25; echo VICTIM-DONE` never slept and never printed — the
+# marker only ever matched its own typed echo; and an echoed needle lets
+# --script-expect's substring search match the ECHO instantly, tearing
+# the VM down while the eighth reader was mid-flight (observed 7/8).
+# (gosh `sleep` cannot substitute here: it maps seconds to ticks at 100/s
+# while the kernel timer runs at 1 Hz.) The late marker is now HELLO.ELF's
+# banner — `elf: hello from HELLO.ELF` never appears in a typed script
+# line, so the expect waits for real output after the readers report.
 vgate_file pipevictim.txt <<'EOF'
-exec GOSH.ELF -c "for i in a b c d e f g h; do echo PIPE-OK | grep PIPE-OK >> /host/PIPED.TXT; done; sleep 25; echo VICTIM-DONE"
+exec GOSH.ELF -c "for i in a b c d e f g h; do echo PIPE-OK | grep PIPE-OK >> /host/PIPED.TXT; sort /host/APPS.TXT; done"
 EOF
 
 vgate_file pipehammer.txt <<'EOF'
@@ -104,11 +113,12 @@ exec TOOL.BIN grep PIPE-OK
 exec TOOL.BIN grep PIPE-OK
 exec TOOL.BIN grep PIPE-OK
 exec TOOL.BIN grep PIPE-OK
+exec HELLO.ELF
 EOF
 
-vgate_run 02 -- --script '$RUN_DIR/pipevictim.txt' --script2 '$RUN_DIR/pipehammer.txt' --script2-after 'exec: loaded GOSH.ELF' --script-expect 'VICTIM-DONE' --timeout 120
+vgate_run 02 -- --script '$RUN_DIR/pipevictim.txt' --script2 '$RUN_DIR/pipehammer.txt' --script2-after 'exec: loaded GOSH.ELF' --script-expect 'elf: hello from HELLO.ELF' --timeout 120
 
-vgate_assert 02 serial-contains 'VICTIM-DONE'
+vgate_assert 02 serial-contains 'elf: hello from HELLO.ELF'
 vgate_assert 02 serial-count 'tool: done status=1' 8
 vgate_assert 02 serial-absent 'tool: done status=0'
 vgate_assert 02 share-equals PIPED.TXT $'PIPE-OK\nPIPE-OK\nPIPE-OK\nPIPE-OK\nPIPE-OK\nPIPE-OK\nPIPE-OK\nPIPE-OK\n'
