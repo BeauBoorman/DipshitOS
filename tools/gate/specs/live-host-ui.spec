@@ -38,6 +38,13 @@
 # <share>/CAPTURES/ resolved from that same argv. The stop receipt's
 # frames=/bytes= are the writer's actuals; the asserts hold the PNG to
 # a signature and the MP4 to a real ftyp+moov.
+#
+# M114f (#2459) acceptance: taken together the five runs are the
+# full-window journey — bus dispatch (screenshot, clean stop), the
+# viewport verbs (fullscreen, capture-keys on/off, the
+# --host-capture-keys arming flag), the inspector's send-serial
+# injection, and the one-chord capture pair. The same bus's lane
+# suspend/resume leg lives in live-hostint run 04 (M114c, #2456).
 
 vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts, one-chord capture"
 vgate_repeat 1 BOOTS
