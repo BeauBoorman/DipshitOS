@@ -356,9 +356,12 @@ pub fn deliver(dst_port: u16, src_ip: [4]u8, datagram: []const u8) void {
     received += 1;
 }
 
-/// M117c (#2475): the v6 half of `deliver` — a datagram lands only in a
-/// listener of its own family; a v6 datagram for a port with no v6
-/// listener is dropped `dropped6_closed`, counted.
+/// M117c (#2475): the v6 half of `deliver` — the caller's slice is the
+/// datagram PAYLOAD (no EL0 marshal parses a v6 transport header, so
+/// the record is payload-only where v4 keeps the header; `net udp6
+/// recv` prints `len=` + the payload bytes). A v6 datagram lands only
+/// in a listener of its own family; a port with no v6 listener is
+/// dropped `dropped6_closed`, counted.
 pub fn deliver6(dst_port: u16, src6: ipv6.Addr, datagram: []const u8) void {
     const slot = find_listener_family(dst_port, true) orelse {
         dropped6_closed += 1;
@@ -518,7 +521,7 @@ pub fn handle_rx6(frame: []const u8) void {
         return;
     }
     const dst_port = (@as(u16, frame[56]) << 8) | frame[57];
-    deliver6(dst_port, src, datagram);
+    deliver6(dst_port, src, datagram[udp_hdr_len..]); // the record is payload-only (v6 has no EL0 marshal)
 }
 
 /// Build a UDP datagram (header + payload) into `buf` for the v6
@@ -932,8 +935,12 @@ test "udp6: checksum_udp6 verifies a built datagram and rejects a mutated one" {
     try std.testing.expect(checksum_udp6(&test_g6_guest, &test_g6_peer, &bad) != 0x0000);
     // The checksum field is never zero (v6 has no zero-checksum escape).
     try std.testing.expect(dg[6] != 0 or dg[7] != 0);
-    // A different address pair binds the checksum (the pseudo-header).
-    try std.testing.expect(checksum_udp6(&test_g6_peer, &test_g6_guest, &dg) != 0x0000);
+    // A different address binds the checksum (the pseudo-header) — note
+    // a src/dst SWAP provably does NOT: the one's-complement sum is
+    // commutative over the 32 pseudo-header bytes, so the check pins a
+    // genuinely different endpoint, not the swapped pair.
+    const other = ipv6.Addr{ 0x20, 0x01, 0x0d, 0xb8, 0, 0x64, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x99 };
+    try std.testing.expect(checksum_udp6(&test_g6_guest, &other, &dg) != 0x0000);
 }
 
 test "udp6: build_frame6 is byte-exact — 0x86dd, nh=17, the 40-byte header" {
