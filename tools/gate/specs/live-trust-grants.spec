@@ -12,6 +12,9 @@
 #   * TCP.BIN — a hash-bound row whose sha256 does not match the file:
 #     the measured exec refuses `grant_stale` and no process is born
 #     (a swapped ELF is no longer the granted image).
+#   * BOUND.BIN (M116a #2467) — the matching half: a hash-bound row whose
+#     sha256 is the staged file's real digest BINDS — the measured exec
+#     applies the row's mask (net granted, debug denied, connect lands).
 #   * GRANTS.TXT itself — denied at BOTH seams: the monitor's `vf cat`
 #     and the EL0 file ABI (TOOL.BIN `head` reads nothing; ASM.BIN
 #     cannot take it as an output path — a non-owner write is refused).
@@ -24,20 +27,23 @@ vgate_runner_flags -Xswiftc -DSPIKE
 vgate_fmt kernel/src/*.zig user/src/*.zig build.zig
 
 vgate_setup_python <<'PY'
-import os, shutil
+import hashlib, os, shutil
 rd = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
 src = os.path.join(share, "TCP.BIN")
-for dst in ("CONFINE.BIN", "GRANTD.BIN"):
+for dst in ("CONFINE.BIN", "GRANTD.BIN", "BOUND.BIN"):
     shutil.copyfile(src, os.path.join(share, dst))
 # The user-grant table. `#v1` with no mode field = audit (the ship
 # posture). `1`*64 is a valid-looking sha256 that cannot be TCP.BIN's —
-# a stale hash-bound row, refused by name at exec.
+# a stale hash-bound row, refused by name at exec. BOUND.BIN's row pins
+# the staged file's real digest — the binding half a non-`*` row owes.
+bound_sha = hashlib.sha256(open(os.path.join(share, "BOUND.BIN"), "rb").read()).hexdigest()
 open(os.path.join(share, "GRANTS.TXT"), "w").write(
     "#v1\n"
     "CONFINE.BIN\t*\tfile\n"
     "GRANTD.BIN\t*\tfile,net\n"
     "TCP.BIN\t" + "1" * 64 + "\tnet\n"
+    "BOUND.BIN\t" + bound_sha + "\tfile,net\n"
 )
 # ASM.BIN only reaches its output-open after a source assembles, so the
 # write leg needs one trivial real file.
@@ -66,6 +72,15 @@ echo grantd-typed
 EOF
 
 vgate_run 02 -- --net '$RUN_DIR/cap2.bin' --net-arp-respond 10.0.0.2 --net-tcp-respond 10.0.0.2:9999 --script '$RUN_DIR/script-02.txt' --script-expect 'procs GRANTD.BIN exited status=18' --timeout 90
+
+vgate_file script-03.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec BOUND.BIN
+echo bound-typed
+EOF
+
+vgate_run 03 -- --net '$RUN_DIR/cap3.bin' --net-arp-respond 10.0.0.2 --net-tcp-respond 10.0.0.2:9999 --script '$RUN_DIR/script-03.txt' --script-expect 'procs BOUND.BIN exited status=18' --timeout 90
 
 # --- the secret-class file: denied at both seams, untouched host-side ---
 vgate_assert 01 serial-contains 'vf cat: GRANTS.TXT: permission denied'
@@ -98,3 +113,15 @@ vgate_assert 02 serial-contains 'tcp: connected'
 vgate_assert 02 serial-contains 'procs GRANTD.BIN exited status=18'
 vgate_assert 02 serial-absent 'name=GRANTD.BIN word=net'
 vgate_assert 02 serial-contains 'name=GRANTD.BIN word=debug'
+
+# --- the hash-bound app: the row's digest matches, so the mask applies --
+# A wrong digest would refuse `grant_stale` (the TCP.BIN leg); a matching
+# one measures in and applies — net is granted (the connect lands, no
+# `net` denial) while `debug` receipts under the narrowed mask. Same
+# bytes as CONFINE/GRANTD: the binding, not the image, is the variable.
+vgate_assert 03 serial-contains 'verdict=measured name=BOUND.BIN'
+vgate_assert 03 serial-absent 'verdict=refused'
+vgate_assert 03 serial-contains 'tcp: connected'
+vgate_assert 03 serial-contains 'procs BOUND.BIN exited status=18'
+vgate_assert 03 serial-absent 'name=BOUND.BIN word=net'
+vgate_assert 03 serial-contains 'name=BOUND.BIN word=debug'
