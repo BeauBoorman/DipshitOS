@@ -162,14 +162,26 @@ func TestNoAllocationAndReuse(t *testing.T) {
 	dst := Target{make([]uint32, 4), 2, 2, 2}
 	for i := 0; i < 100; i++ {
 		b := Budget{Max: MaxWork}
-		if n := testing.AllocsPerRun(1, func() {
+		run := func() {
 			b.Used = 0
 			_, f := Rasterize(s, dst, ws, &b)
 			if f.Code != OK {
 				panic(f.Error())
 			}
-		}); n != 0 {
-			t.Fatal(n)
+		}
+		// AllocsPerRun compares the process-wide MemStats.Mallocs counter
+		// around the call, so a runtime-internal mallocgc that happens to
+		// land inside the window — a semaphore sudog for an STW in
+		// ReadMemStats/GOMAXPROCS/GC, a new M under scheduler churn —
+		// counts the same as an allocation by run itself (issue #2534).
+		// Such noise does not repeat on re-measurement; a real per-call
+		// allocation in Rasterize does, so retry before failing.
+		n := testing.AllocsPerRun(1, run)
+		for try := 0; n != 0 && try < 4; try++ {
+			n = testing.AllocsPerRun(1, run)
+		}
+		if n != 0 {
+			t.Fatalf("iteration %d: %v allocs", i, n)
 		}
 	}
 	if unsafe.Sizeof(Command{}) != 56 || unsafe.Sizeof(Paint{}) != 96 || scratchUsed > WorkspaceSize {
