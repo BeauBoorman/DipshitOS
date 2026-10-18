@@ -14,6 +14,9 @@
 # ws/bookmarks atoms on the armed share, Ctrl+Shift+B's sidebar lists and
 # picks one, and boot 41 (a fresh VM on the SAME share) loads the surviving
 # atom off disk and navigates to it.
+# 42 (M126c #2595): the find-in-page leg — Ctrl+F's bar searches the laid-out
+# text, the match set paints amber and the current match orange on the
+# scanout, Enter steps next (wrapping), Esc closes.
 # v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
 # responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
 # grammar or TLS-over-v6 responder exists yet. No public-internet access,
@@ -1981,4 +1984,82 @@ for marker in order:
     assert at >= 0, "missing or out of order: " + marker
     pos = at + 1
 print("live-web 41 restart ordering ok (boot inventory, list, pick, nav)")
+PY
+
+# --- boot 42 (M126c #2595): the find-in-page leg -----------------------------
+# One boot, a file-channel load, all chords. 'the' has exactly two matches
+# on PAGE.HTML ("the greedy", "the browser" — "The end." is a capital-T
+# miss, the matcher is case-sensitive). Each keystroke recomputes and
+# re-lands on match 1; the two Enters step forward and wrap; Escape closes.
+# The f1 pads are no-ops the open bar consumes — ~3 s of dwell so the
+# kind-4 snapshot request lands while the highlights are still on the
+# scanout (observed: without them the capture arrived after Escape's
+# clean repaint and pendingSnapPath collided on two close triggers).
+vgate_run 42 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-42' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape' --input-chords-after 'web: ready' \
+    --snapshot-after 'web: find hit=2/2' \
+    --script-expect 'web: find close' --timeout 180
+
+vgate_assert 42 serial-absent 'web: budget over'
+vgate_assert 42 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 42 serial-contains 'web: find open'
+vgate_assert 42 serial-contains "web: find 'the' n=2"
+vgate_assert 42 serial-contains 'web: find hit=1/2'
+vgate_assert 42 serial-contains 'web: find hit=2/2'
+vgate_assert 42 serial-contains 'web: find close'
+vgate_assert 42 serial-absent 'web: error'
+vgate_assert 42 serial-absent '[EXC] parking:'
+vgate_assert 42 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "web: find open",
+    "web: find 'the' n=2",
+    "web: find hit=1/2",
+    "web: find hit=2/2",
+    "web: find hit=1/2",   # the second Enter wraps to the first match
+    "web: find close",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 42 find ordering ok (open, search, step, wrap, close)")
+PY
+vgate_assert 42 snapshot 'snap-42-*.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+MATCH   = (0xb5, 0x89, 0x00)  # every match's fill
+CURRENT = (0xcb, 0x4b, 0x16)  # the current match's fill
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the bar's plate
+# The scanout is the whole screen; the content letterbox sits under the
+# window at (40,92). Count the two highlight inks anywhere in the window
+# and the bar's plate on its docked row (window y 352..368 -> scanout
+# 380..396).
+match = current = 0
+for yy in range(92, 380):
+    for xx in range(40, 552):
+        c = px(xx, yy)
+        if near(c, MATCH):
+            match += 1
+        elif near(c, CURRENT):
+            current += 1
+# The strip's plate is the row minus the field inset (the 404-px PageBg
+# field at window x 44..448): ~3.3k surface pixels minus its ink, so the
+# threshold counts the plate edges, not the whole row.
+plate = sum(1 for yy in range(380, 396) for xx in range(40, 552) if near(px(xx, yy), SURFACE))
+assert match >= 20, "match highlight pixels %d" % match
+assert current >= 10, "current-match highlight pixels %d" % current
+assert plate > 1500, "find bar plate pixels %d" % plate
+print("live-web 42 highlight pixels ok (match=%d current=%d plate=%d)" % (match, current, plate))
 PY
