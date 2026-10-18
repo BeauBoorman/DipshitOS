@@ -40,12 +40,18 @@ lines = ser.splitlines()
 # Legacy -E: the EL0 snapshot rows (honest table: the counter
 # running, the peer itself running, the exited boot payload, and a
 # state word on some row).
-for p in (r"peer: sees [0-9]+ COUNTER.BIN running",
-          r"peer: sees [0-9]+ PEER.BIN running",
-          r"peer: sees [0-9]+ user-el0 exited",
-          r"peer: sees [0-9]+ [^ ]+ (created|running|exited)"):
-    if not re.search(p, ser):
-        sys.exit("FAIL: ERE absent: %s" % p)
+# The peer's sees lines are byte-at-a-time writes that interleave with
+# the shell prompt and keystroke echo — its own bytes still arrive
+# in-order, so a bounded window with noise between fields is the honest
+# match (the field ORDER carries the evidence, not line atomicity).
+NOISE = r"[\s\S]{0,300}?"
+for name, state in (("COUNTER.BIN", "running"), ("PEER.BIN", "running"),
+                    ("user-el0", "exited")):
+    pat = r"peer: sees" + NOISE + r"[0-9]+" + NOISE + re.escape(name) + NOISE + state
+    if not re.search(pat, ser):
+        sys.exit("FAIL: ERE absent: %s %s" % (name, state))
+if not re.search(r"peer: sees" + NOISE + r"[0-9]+" + NOISE + r"[^ ]+" + NOISE + r"(created|running|exited)", ser):
+    sys.exit("FAIL: ERE absent: any sees row")
 # Monitor's own read: both running, distinct tasks + stacks.
 # Procs rows grew uid/caps (M50) between name and state.
 def first_row(name):
