@@ -13,15 +13,36 @@ import (
 // wiring is vi.Exec/FLINT.ELF children inside package store, and the
 // child's console lines reach serial verbatim from there too.
 var (
-	loadFn     = store.LoadCatalog
-	installFn  = store.Install
-	updateFn   = store.Update
-	rollbackFn = store.Rollback
-	removeFn   = store.Remove
-	consoleFn  = vi.ConsoleLine
-	sleepFn    = vi.Sleep
-	logLimit   = 96
+	loadFn       = store.LoadCatalog
+	installFn    = store.Install
+	updateFn     = store.Update
+	rollbackFn   = store.Rollback
+	removeFn     = store.Remove
+	consoleFn    = vi.ConsoleLine
+	sleepFn      = vi.Sleep
+	grantWriteFn = func(line string) int64 { return vi.GrantWriteLine(line) }
+	logLimit     = 96
 )
+
+// consentAsk is the install-time consent prompt (M116c #2469, ADR 0054
+// D10): a successful install of a caps-declaring release leaves the
+// signed ask standing — name, the installed image's pinned sha256, the
+// declared words — until a gesture answers it. `g` writes the
+// (name, sha, words) row through the admin slot (seat or CAP_PROC_ADMIN
+// — a plain GOSTORE reads the refused write back by name, it does not
+// land); `d`/Escape declines and the app keeps the ambient floor.
+//
+// Markers:
+//
+//	gostore: consent name=<BIN> words=<w>     — the prompt is standing
+//	gostore: grant written name=<BIN> words=<w> — consent landed the row
+//	gostore: grant declined name=<BIN>          — denial gesture, no write
+//	gostore: grant refuse name=<BIN> <reason>   — the write was refused
+type consentAsk struct {
+	bin   string
+	sha   string
+	words string // declared words, canonical csv
+}
 
 // app is the panel state. Detail, search, and the op log are pure state;
 // the only guest-coupled pieces are frame (the draw+present barrier) and
@@ -45,6 +66,7 @@ type app struct {
 	status  string
 	busy    bool
 	quit    bool
+	pending *consentAsk
 }
 
 func itoa(n int) string { return vi.Itoa64(int64(n)) }
@@ -191,12 +213,77 @@ func (a *app) runOp(verb, target string, op func() int) {
 			switch verb {
 			case "install":
 				r.Installed = true
+				// A caps-declaring release stands its signed ask as the
+				// install-time consent prompt (M116c): STORE already
+				// proposed the row; the gesture here answers it.
+				if r.Entry != nil && r.Entry.Rel != nil && len(r.Entry.Rel.Caps) > 0 {
+					a.pending = &consentAsk{
+						bin:   r.Entry.Rel.Name + ".ELF",
+						sha:   r.Entry.Rel.ELFSHA256,
+						words: vi.GrantWordsCanonical(r.Entry.Rel.Caps),
+					}
+					consoleFn("gostore: consent name=" + a.pending.bin +
+						" words=" + a.pending.words)
+					a.status = a.pending.bin + " requests " + a.pending.words +
+						" — [g]rant [d]eny"
+				}
 			case "remove":
 				r.Installed = false
 			}
 		}
 	}
 	a.repaint()
+}
+
+// grantErr maps a slot-89 negative errno to its marker token (the
+// goset/grants.go mapping, verbatim).
+func grantErr(rc int64) string {
+	switch rc {
+	case -vi.ErrEACCES:
+		return "eacces"
+	case -vi.ErrEINVAL:
+		return "einval"
+	case -vi.ErrENOSPC:
+		return "enospc"
+	case -vi.ErrENXIO:
+		return "enxio"
+	case -vi.ErrENOENT:
+		return "enoent"
+	default:
+		return "rc" + vi.Itoa64(rc)
+	}
+}
+
+// consentKey answers a standing install-time prompt. 'g' lands the row
+// through the admin slot; 'd' or Escape declines — the app keeps the
+// ambient floor either way the write goes (a refused write is named,
+// never silent).
+func (a *app) consentKey(ev vi.Event) {
+	p := a.pending
+	if ev.Arg0 == keyEscape {
+		a.pending = nil
+		consoleFn("gostore: grant declined name=" + p.bin)
+		a.status = "consent declined — " + p.bin + " keeps the ambient floor"
+		return
+	}
+	switch rune(ev.Arg1) {
+	case 'g':
+		a.pending = nil
+		line := vi.GrantLine(vi.GrantRow{Name: p.bin, SHA: p.sha, Words: p.words})
+		if rc := grantWriteFn(line); rc < 0 {
+			consoleFn("gostore: grant refuse name=" + p.bin + " " + grantErr(rc))
+			a.status = "grant refused: " + grantErr(rc)
+		} else {
+			consoleFn("gostore: grant written name=" + p.bin + " words=" + p.words)
+			a.status = "grant written — " + p.bin + " runs with " + p.words
+		}
+	case 'd':
+		a.pending = nil
+		consoleFn("gostore: grant declined name=" + p.bin)
+		a.status = "consent declined — " + p.bin + " keeps the ambient floor"
+	}
+	// Every other key is swallowed while the prompt stands — the ask is
+	// modal by design: an unanswered consent is not a background state.
 }
 
 // onLeg is package store's LegFn: each signed-pipeline leg boundary,
@@ -243,6 +330,11 @@ const (
 // key applies one EvKeyDown. Arg0 is the HID usage, Arg1 the decoded
 // rune — the same pair GOSET reads.
 func (a *app) key(ev vi.Event) {
+	if a.pending != nil {
+		a.consentKey(ev)
+		a.repaint()
+		return
+	}
 	if a.inputOn {
 		switch ev.Arg0 {
 		case keyEnter:
