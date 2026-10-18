@@ -27,6 +27,11 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case laneClipboard = "lane-clipboard"
     case laneDrop = "lane-drop"
     case laneNotify = "lane-notify"
+    // M127e (#2603, ADR 0051 v2): the agent-lane choke — pause/resume
+    // the runner's --net-tcp-connect-stream endpoint. The bus's `agent`
+    // companion registers it in init (the recorder precedent), so an
+    // unarmed run receipts `unavailable` from the action itself.
+    case laneAgent = "lane-agent"
     case sendFile = "send-file"
     // V2 lane verbs (ADR 0051 V2-D6) — declared once here; each lane's
     // own file registers its handler (a case with none reports
@@ -139,12 +144,20 @@ public final class HostCommandBus: NSObject {
     /// dispatch the identical seam.
     public let recorder = HostRecorder()
 
+    /// M127e (#2603): the AGENTD companion — audit-lane reader + the
+    /// `lane-agent` choke's model, self-registering on the bus like the
+    /// recorder. Injectable so a test owns its argv/share/endpoint
+    /// seams instead of the process's.
+    public let agent: HostAgentCompanion
+
     private var registrations: [HostCommand: Registration] = [:]
 
-    public init(emit: ((String) -> Void)? = nil) {
+    public init(emit: ((String) -> Void)? = nil, agent: HostAgentCompanion? = nil) {
         self.emit = emit ?? {
             FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
         }
+        self.agent = agent ?? HostAgentCompanion()
+        self.agent.emit = self.emit
         super.init()
         let recorder = self.recorder
         register(.record, Registration(
@@ -162,6 +175,15 @@ public final class HostCommandBus: NSObject {
             itemState: { recorder.isRecording },
             receiptDetail: { recorder.receiptDetail },
             action: { recorder.stop() }))
+        let agent = self.agent
+        register(.laneAgent, Registration(
+            itemState: { agent.laneFlowing },
+            receiptDetail: { agent.receiptDetail },
+            action: { agent.togglePause() }))
+        // The companion's audit poll self-arms only when a share is
+        // resolvable — a shareless run never schedules it (the flags-
+        // off posture, host side).
+        agent.startPolling()
     }
 
     public func register(_ command: HostCommand, _ registration: Registration) {
