@@ -1363,8 +1363,12 @@ PY
 # Relaunch on the SAME share, without touching the receipt or changing wm.
 # Restored tabs re-exec their recorded bins now (M120b #2559): boot 19's
 # [Sh, Term] file drops the unbacked Sh row and spawns a real GOTERM.ELF
-# into rail cell 1 — so the scripted Terminal is a SECOND one, and the
-# focus-back chord is ctrl-1, not the old placeholder-strip ctrl-3.
+# into rail cell 1 — so NO scripted Terminal runs at all (the re-exec'd
+# one reads the receipt), and the focus-back chord is ctrl-1, not the old
+# placeholder-strip ctrl-3. A scripted second term also costs a task-pool
+# slot the boot cannot spare: observed r20 — seat + restored Term +
+# scripted Term left GOEDIT's runtime unable to make an M
+# (`newosproc: sys_thread create failed`, no `goedit: present`).
 # The editor is opened by CLICKING its launcher row, not by filtering:
 # script2 feeds the kernel monitor (observed r20: `unknown command
 # 'goedit'` — filter text is HID input, and every HID channel this boot
@@ -1376,7 +1380,6 @@ PY
 # (120,199) lands inside row 2's rect (y=188..209).
 vgate_file script-m91-relaunch.txt <<'EOF'
 set GOMAXPROCS=1
-exec GOTERM.ELF
 EOF
 
 vgate_run 20 -- \
