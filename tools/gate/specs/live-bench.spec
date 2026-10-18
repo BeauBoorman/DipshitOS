@@ -156,6 +156,7 @@ def measure(row_id, ser):
         "smp-scale-c1": r"goscale: ticks=(\d+)",
         "smp-scale-c2": r"goscale: ticks=(\d+)",
         "smp-scale-c4": r"goscale: ticks=(\d+)",
+        "seat-mbox-burst": r"mburst: accepted=(\d+) of \d+ refused=\d+",
     }
     found = re.findall(patterns[row_id], ser)
     if not found:
@@ -239,6 +240,9 @@ need = {
     "GOSCALE.ELF": "bash tools/go/build-go.sh tools/go/smpscale.go",
     "GOBIG.ELF": "bash tools/go/build-go.sh tools/go/gobig.go",
     "GOREAD.ELF": "bash tools/go/build-go.sh tools/go/goread.go",
+    "GOTABWM.ELF": "bash tools/go/build-gotabwm.sh",
+    "GOSOUND.ELF": "bash tools/go/build-gosound.sh",
+    "GOMBURST.ELF": "bash tools/go/build-go.sh tools/go/mburst.go",
 }
 missing = [n for n in need if not os.path.exists(os.path.join(".build", "go", n))]
 if missing:
@@ -253,6 +257,27 @@ for n in need:
 # (the baseline source) carries.
 with open(os.path.join(share, "M91-PRESENTATION.TRACE"), "w") as f:
     f.write("v1\n")
+# The seat-mbox leg (M119c): the seat boots from the script, so the kernel
+# must never autostart it — same wm=none pinning live-sound-playback's
+# wav-toast carries once GOTABWM sits in the share.
+with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
+    f.write("#v2\nwm=none\n")
+# Its sustained-PCM source: the same 3 s 44.1 kHz s16 TONE.WAV
+# live-sound-playback stages (a real stream, not a beep stub).
+import math, struct
+d = os.path.join(share, "SND")
+os.makedirs(d, exist_ok=True)
+rate, frames = 44100, 132300
+data = bytearray()
+for i in range(frames):
+    v = int(0.2 * 32767 * math.sin(2 * math.pi * 440 * i / rate))
+    data += struct.pack("<hh", v, v)
+hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" +
+       b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, rate, rate * 4, 4, 16) +
+       b"data" + struct.pack("<I", len(data)))
+with open(os.path.join(d, "TONE.WAV"), "wb") as f:
+    f.write(hdr + data)
+print("staged SND/TONE.WAV (%d bytes)" % (len(hdr) + len(data)))
 PY
 
 # --- run 01: boot-shell -------------------------------------------------------
@@ -668,4 +693,60 @@ for p in sorted(glob.glob(os.path.join(os.environ["RUN_DIR"],
     if v is not None:
         samples.append(v)
 benchlib.leg_verdict("smp-scale-c4", samples)
+PY
+
+# --- run 07: seat-mbox (M119c #2487) ------------------------------------------
+# The M99 wav-toast starvation was the seat's 8-deep IPC mailbox refusing
+# client posts with ENOSPC while the seat was stalled draining an input
+# burst under sustained PCM — a post that never lands can never service
+# (the notify toast died here; pending high-water measured 7/8 on a
+# healthy run, one slot from the loss). This leg reproduces the pressure
+# deterministically: the seat streams PCM while GOMBURST posts 40
+# WM-RPC-shaped frames back-to-back, and a concurrently-draining seat
+# clears at most one serviceRPC pass during the burst. `accepted` lands
+# on the ring bound: <= 8+8 on the pre-fix kernel, >= 32 on the fix —
+# the budget separates them by construction, so the leg is red before
+# the raise and green after it. No retry: a measurement is never one.
+vgate_file script-mburst-seat.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+vgate_file script-mburst-stream.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOSOUND.ELF /host/SND/TONE.WAV
+EOF
+vgate_file script-mburst-post.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOMBURST.ELF
+EOF
+
+vgate_run mburst -- --sound --screen '$RUN_DIR/mburst-screen' --via-virtio \
+    --script '$RUN_DIR/script-mburst-seat.txt' \
+    --script2 '$RUN_DIR/script-mburst-stream.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-mburst-post.txt' \
+    --script3-after 'gosound: streaming gen=' \
+    --script-expect 'mburst: done' --timeout 240
+
+vgate_assert mburst serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert mburst serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert mburst serial-contains 'gotabwm: holding seat'
+vgate_assert mburst serial-contains 'gosound: streaming gen='
+vgate_assert mburst serial-contains 'exec: loaded GOMBURST.ELF'
+vgate_assert mburst serial-contains 'mburst: accepted='
+vgate_assert mburst serial-contains 'mburst: done'
+vgate_assert mburst serial-absent 'mburst: FAIL'
+vgate_assert mburst serial-absent '[EXC]'
+vgate_assert mburst python <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("seat-mbox-burst", ser)
+if v is None:
+    sys.exit("bench: no `mburst: accepted=` line — the burst never reported")
+benchlib.check("seat-mbox-burst", v)
 PY

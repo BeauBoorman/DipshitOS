@@ -618,9 +618,9 @@ test "syscall: ipc send refuses full, empty, and isolated targets exactly" {
     try std.testing.expectEqual(@as(usize, 1), mailbox.pending(peer_pid));
     try std.testing.expectEqual(@as(usize, mailbox.message_max), mailbox.message(peer_pid, 0).?.len);
     // Re-arm the window on `bytes` (the truncation block moved it to `long`),
-    // then fill the ring: 7 more sends fill the 8 slots (card 4b, claim
-    // 3179: the capacity is a data-path constant, re-derived 4 → 8); the
-    // 9th is ENOSPC.
+    // then fill the ring: max_messages - 1 more sends fill the slots (card
+    // 4b claim 3179 raised the capacity 4 → 8; M119c #2487 raised 8 → 32);
+    // the next is ENOSPC.
     set_user_regions(
         .{ .base = @intFromPtr(bytes.ptr), .len = bytes.len },
         .{ .base = 0, .len = 0 },

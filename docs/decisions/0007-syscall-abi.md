@@ -312,7 +312,7 @@ codes — is unchanged.
 Follow-on 3 card 3f freezes slots 5 and 6 in the dispatch table (the ONE
 ABI change in the follow-on 3 card set; everything else stays frozen):
 
-| 5 | `sys_ipc_send` | `ipc_send(target, buf, len) -> i64` | Copy `len` bytes (≤ 64; longer is truncated to the slot bound) from the caller's region through uaccess into process `target`'s bounded per-process mailbox (`kernel/src/mailbox.zig`: 8 × 64 B BSS ring per process id, FIFO — the capacity is a DATA-PATH CONSTANT, raised 4 → 8 by claim 3179 on card 4b; NOT a syscall number, this ABI row is unchanged). Returns the sent length; `EINVAL` for an out-of-range/free/exited target, `EFAULT` for a bad user pointer, `ENOSPC` when the target's ring is full (checked before any bytes are copied). |
+| 5 | `sys_ipc_send` | `ipc_send(target, buf, len) -> i64` | Copy `len` bytes (≤ 64; longer is truncated to the slot bound) from the caller's region through uaccess into process `target`'s bounded per-process mailbox (`kernel/src/mailbox.zig`: 32 × 64 B BSS ring per process id, FIFO — the capacity is a DATA-PATH CONSTANT, raised 4 → 8 by claim 3179 on card 4b and 8 → 32 by M119c #2487; NOT a syscall number, this ABI row is unchanged). Returns the sent length; `EINVAL` for an out-of-range/free/exited target, `EFAULT` for a bad user pointer, `ENOSPC` when the target's ring is full (checked before any bytes are copied). |
 | 6 | `sys_ipc_recv` | `ipc_recv(buf, max) -> i64` | Copy the caller's OWN oldest message out through uaccess (`max` > 64 clamps to it; `max` shorter than the message truncates the copy — both documented), consuming it. Returns the copied length; 0 when the mailbox is empty; `EINVAL` when the calling task is not a process; `EFAULT` leaves the message queued (peek → copy_out → drop). |
 
 `ENOSPC` (`-5`) joins the D3 error table: the target process's bounded
@@ -340,6 +340,19 @@ same `ENOSPC` (-5) — now at the 9th send — the same empty → 0 recv
 result, the same drain invariant `sent − recv == pending ≤ capacity`,
 and the same cross-process isolation (a process reaches only its own
 mailbox and a live target's).
+
+## Data-path note (2026-10-17, issue #2487 — M119c seat-drain starvation)
+
+M119c raises the mailbox capacity `mailbox.max_messages` 8 → 32 (the
+per-process ring grows 512 → 2048 B of fixed BSS — still no allocation)
+for the same reason and in the same shape as the 4 → 8 raise: it is a
+DATA-PATH CONSTANT, not a syscall number — the ABI stays frozen, a full
+ring still refuses with `ENOSPC` (-5), now at the 33rd send. The driver
+is the seat's composite loop, which drains its mailbox once per
+iteration; under sustained PCM the iteration stalls while the seat
+drains an input burst, posts backed up, and the 8-deep ring refused
+them (pending high-water measured 7/8 on a healthy run). The regression
+surface is live-bench `seat-mbox-burst`, which pins the bound.
 
 ## Amendment (2026-08-11, claim 5799 — the process-observability card)
 
