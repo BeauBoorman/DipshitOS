@@ -161,6 +161,13 @@ pub const slots = [_]Slot{
     // CAP_PROC_ADMIN, and never the app the row names.
     row(89, "sys_grant_admin", .{ .int, .int, .ptr, .int }),
     row(90, "sys_gpucomp", .{ .int, .int, .int, .int, .ptr, .int }),
+    // M118c (#2481, ADR 0007 amendment): the capture half of the audio
+    // seam — slot 91 reports the observed input capability (the slot-42
+    // shape for the RX direction), slot 92 runs ONE bounded capture into
+    // the caller's buffer (virtio_snd.snd_capture, the v1 tuple
+    // S16/48kHz/mono, len capped by the 64 KiB ring).
+    row(91, "sys_audio_rec_info", .{.ptr}),
+    row(92, "sys_audio_rec", .{ .int, .int, .int, .ptr, .int }),
 };
 
 // op-dependent shapes override the base row. No pointed-to output or binary

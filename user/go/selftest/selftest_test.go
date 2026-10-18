@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -77,6 +78,17 @@ type fakeFS struct {
 	winQueryErr   bool      // query fails
 	winFillErr    bool      // fill fails
 	winPresentErr bool      // present fails
+
+	// M118c (#2481): the capture seam's fake, mirroring the kernel's check
+	// order — a failing device (capErr) beats the tuple and length checks,
+	// then an over-cap tuple or a non-frame-aligned length refuses
+	// EINVAL-shaped, and a clean capture fills the buffer deterministically.
+	capInfo     vi.AudioCapInfo
+	capInfoErr  error
+	capNoDevice bool  // the source is absent: every valid call is ENXIO
+	capErr      error // the post-admission outcome (nil = capture)
+	capFill     byte  // the byte written across the captured buffer
+	capOverCap  bool  // the DELIBERATE lie: accept over-cap tuples
 }
 
 // popLease pops the next scripted value, sticking on the script's last
@@ -91,6 +103,11 @@ func (f *fakeFS) popLease(script []int64, calls *int) int64 {
 	}
 	return script[i]
 }
+
+// errFakeCapRefused is the EINVAL-shaped refusal the capture fake answers
+// for an over-cap tuple or a non-frame-aligned length. Its text is what the
+// receipt records — errno's name is the refusal's name.
+var errFakeCapRefused = errors.New("EINVAL")
 
 type fakeTrash struct {
 	path string
@@ -133,6 +150,10 @@ func newFakeFS() *fakeFS {
 		leaseAcqScript: []int64{0, -vi.ErrEAGAIN, 0, 0},
 		leaseChkScript: []int64{-vi.ErrEAGAIN, 0, 0},
 		leaseRelScript: []int64{-vi.ErrEAGAIN, 0},
+		// M118c: the honest default is the no-device fleet — the capture
+		// call answers the seam's ENXIO refusal.
+		capNoDevice: true,
+		capFill:     0x5a,
 	}
 }
 
@@ -261,6 +282,35 @@ func (f *fakeFS) syscalls() *syscalls {
 		leaseRelease: func(l *vi.FileLease) int64 {
 			f.leaseRelCalls++
 			return f.popLease(f.leaseRelScript, &f.leaseRelCalls)
+		},
+		capQuery: func() (vi.AudioCapInfo, error) {
+			if f.capInfoErr != nil {
+				return vi.AudioCapInfo{}, f.capInfoErr
+			}
+			return f.capInfo, nil
+		},
+		capCapture: func(format, rate, channels uint8, buf []byte) (int, error) {
+			// The kernel's check order: the length shape is EINVAL before
+			// the device is touched, a dead/absent device beats the tuple
+			// check, the over-cap tuple refuses before the drain runs, and
+			// the drain's outcome (capErr) is last.
+			if len(buf) == 0 || len(buf)%2 != 0 {
+				return 0, errFakeCapRefused
+			}
+			if f.capNoDevice {
+				return 0, vi.ErrNoAudioDevice
+			}
+			if !f.capOverCap && (format != vi.AudioCapFormat || rate != vi.AudioCapRate ||
+				channels != vi.AudioCapChannels) {
+				return 0, errFakeCapRefused
+			}
+			if f.capErr != nil {
+				return 0, f.capErr
+			}
+			for i := range buf {
+				buf[i] = f.capFill
+			}
+			return len(buf), nil
 		},
 		trashDelete: func(path string) (string, int64) {
 			body, ok := f.files[path]
@@ -588,8 +638,8 @@ const wantReport = "case intake pass\ncase intake-altered pass\n" +
 	"case file-fsync pass\ncase file-errors pass\n" +
 	"case file-write-safe pass\ncase trash pass\ncase file-write-publish pass\n" +
 	"case mime pass\ncase file-snapshot pass\ncase app-logs pass\n" +
-	"case file-lease pass\ncase window pass\ncase disk pass\n" +
-	"case clock-epoch pass\ncase clock-set pass\nsummary cases=24 failed=0\n"
+	"case file-lease pass\ncase window pass\ncase disk pass\ncase audio-capture pass\n" +
+	"case clock-epoch pass\ncase clock-set pass\nsummary cases=25 failed=0\n"
 
 // seedFixtures is the host's half of the intake contract: IN/fixture.txt holds
 // the canonical body, IN/altered.txt the altered one (ADR 0031 D2), and the
@@ -610,8 +660,8 @@ func TestRunCasesAllPassAndReportBytes(t *testing.T) {
 	seedFixtures(fs)
 	rs := runCases(fs.syscalls())
 
-	if len(rs) != 24 {
-		t.Fatalf("cases = %d, want 24", len(rs))
+	if len(rs) != 25 {
+		t.Fatalf("cases = %d, want 25", len(rs))
 	}
 	for _, r := range rs {
 		if !r.ok {
@@ -621,7 +671,7 @@ func TestRunCasesAllPassAndReportBytes(t *testing.T) {
 	if got := string(renderReport(rs)); got != wantReport {
 		t.Fatalf("report bytes:\n got %q\nwant %q", got, wantReport)
 	}
-	if got := string(renderSummary(rs)); got != "summary cases=24 failed=0\n" {
+	if got := string(renderSummary(rs)); got != "summary cases=25 failed=0\n" {
 		t.Fatalf("summary = %q", got)
 	}
 	if got := fs.files[helloPath]; !bytes.Equal(got, []byte(helloPayload)) {
@@ -707,7 +757,7 @@ func TestIntakeFailsOnAMutatedSeed(t *testing.T) {
 	if !strings.Contains(report, "case intake fail fixture mismatch") {
 		t.Fatalf("report lacks the intake failure: %q", report)
 	}
-	if !strings.Contains(report, "summary cases=24 failed=2") {
+	if !strings.Contains(report, "summary cases=25 failed=2") {
 		t.Fatalf("report summary wrong: %q", report)
 	}
 	if got := fs.files[intakeCopy]; !bytes.Equal(got, []byte(intakeAltered)) {
@@ -743,7 +793,7 @@ func TestIntakeFailsWhenTheFixtureIsMissing(t *testing.T) {
 	// The report is still complete: 24 cases, the 2 intake ones failed (the
 	// clock, file and window cases do not read IN/).
 	report := string(renderReport(rs))
-	if !strings.Contains(report, "summary cases=24 failed=2") {
+	if !strings.Contains(report, "summary cases=25 failed=2") {
 		t.Fatalf("report summary wrong: %q", report)
 	}
 	if lines := strings.Count(report, "\n"); lines != len(rs)+1 {
@@ -941,7 +991,7 @@ func TestFileWriteCaseFailsWhenTheWriteIsRefused(t *testing.T) {
 	if !strings.Contains(report, "case file-write fail ") {
 		t.Fatalf("report lacks the fail detail: %q", report)
 	}
-	if !strings.Contains(report, "summary cases=24 failed=1") {
+	if !strings.Contains(report, "summary cases=25 failed=1") {
 		t.Fatalf("report summary wrong: %q", report)
 	}
 }
@@ -2065,5 +2115,81 @@ func TestDiskCaseFailsOnAReadbackMismatch(t *testing.T) {
 	}
 	if got := string(fs.files[diskOk]); !strings.Contains(got, "match=no") {
 		t.Fatalf("receipt = %q, want the honest mismatch", got)
+	}
+}
+
+// M118c (#2481): the audio-capture case's three pass shapes — the
+// device-absent refusal (the default fleet's run-01 receipt), the bounded
+// drain refusal (the host's denied-mic answer), and the bounded-read
+// receipt — plus the shape violations that must FAIL.
+
+// The fake's honest default is the no-device fleet: slot 91 reports
+// ready=0 and slot 92 answers ENXIO — both for the capture AND for the
+// over-cap probe (the kernel checks the device first).
+func TestAudioCaptureCaseAbsent(t *testing.T) {
+	fs := newFakeFS()
+	if err := caseAudioCapture(fs.syscalls()); err != nil {
+		t.Fatalf("absent leg failed: %v", err)
+	}
+	want := "case audio-capture ready=0 refused=ENXIO overcap=ENXIO oddlen=EINVAL\n"
+	if got := string(fs.files[capOk]); got != want {
+		t.Fatalf("absent receipt = %q want %q", got, want)
+	}
+	if _, ok := fs.files[capCopy]; ok {
+		t.Fatal("the absent leg wrote capture bytes")
+	}
+}
+
+// The bounded drain refusal: a denied host completes zero buffers and the
+// kernel's ETIMEDOUT is the receipt — a pass shape, honestly named.
+func TestAudioCaptureCaseDrainTimeout(t *testing.T) {
+	fs := newFakeFS()
+	fs.capInfo = vi.AudioCapInfo{Ready: 1, Format: vi.AudioCapFormat,
+		Rate: vi.AudioCapRate, Channels: vi.AudioCapChannels}
+	fs.capNoDevice = false
+	fs.capErr = vi.ErrAudioCaptureTimeout
+	if err := caseAudioCapture(fs.syscalls()); err != nil {
+		t.Fatalf("drain-timeout leg failed: %v", err)
+	}
+	want := "case audio-capture ready=1 refused=ETIMEDOUT overcap=EINVAL oddlen=EINVAL\n"
+	if got := string(fs.files[capOk]); got != want {
+		t.Fatalf("timeout receipt = %q want %q", got, want)
+	}
+}
+
+// The captured receipt: the bytes the case read land on the share beside
+// the receipt line (the .copy convention), and the count is the kernel's.
+func TestAudioCaptureCaseCaptured(t *testing.T) {
+	fs := newFakeFS()
+	fs.capInfo = vi.AudioCapInfo{Ready: 1, Format: vi.AudioCapFormat,
+		Rate: vi.AudioCapRate, Channels: vi.AudioCapChannels}
+	fs.capNoDevice = false
+	if err := caseAudioCapture(fs.syscalls()); err != nil {
+		t.Fatalf("captured leg failed: %v", err)
+	}
+	want := "case audio-capture ready=1 captured=8192 nonzero=8192 overcap=EINVAL oddlen=EINVAL\n"
+	if got := string(fs.files[capOk]); got != want {
+		t.Fatalf("captured receipt = %q want %q", got, want)
+	}
+	pcm := fs.files[capCopy]
+	if len(pcm) != capBytes {
+		t.Fatalf("capture.copy is %d bytes, want %d", len(pcm), capBytes)
+	}
+	for i, b := range pcm {
+		if b != fs.capFill {
+			t.Fatalf("capture.copy[%d] = %#x want %#x", i, b, fs.capFill)
+		}
+	}
+}
+
+// A kernel that ACCEPTS an over-cap tuple is lying about the cap — the
+// case must fail, not quietly record it.
+func TestAudioCaptureCaseFailsWhenOverCapSucceeds(t *testing.T) {
+	fs := newFakeFS()
+	fs.capInfo.Ready = 1
+	fs.capNoDevice = false
+	fs.capOverCap = true
+	if err := caseAudioCapture(fs.syscalls()); err == nil {
+		t.Fatal("an over-cap capture that landed passed the case")
 	}
 }

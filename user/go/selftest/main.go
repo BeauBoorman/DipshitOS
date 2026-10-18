@@ -74,6 +74,12 @@ func main() {
 			_ = vi.Log(appName, "fixture: before panic")
 			panic("M82e fixture panic")
 		}
+		// M118c (#2481): the headless capture leg. The spec's SoundInProbe
+		// --sound-in boot has no GPU — no window, no REPORT.txt, just the
+		// audio-capture case's verdict on serial. Runs before tabapp.
+		if arg == "--capture-probe" {
+			captureProbe() // never returns
+		}
 	}
 	ta := tabapp.Init(tabapp.Config{
 		Name:  appName,

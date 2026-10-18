@@ -175,6 +175,8 @@ const (
 	ErrENOMEM       int64 = 10
 	ErrEAGAIN       int64 = 11
 	ErrETIMEDOUT    int64 = 12
+	// ErrEIO (13) is declared in gpucompute.go — the M111b seam that
+	// introduced the kernel's -13 row.
 )
 
 // File channel flags (ADR 0010).
@@ -1289,6 +1291,8 @@ func (e errno) Error() string {
 		return "EAGAIN"
 	case ErrETIMEDOUT:
 		return "ETIMEDOUT"
+	case ErrEIO:
+		return "EIO"
 	}
 	return "EIO"
 }

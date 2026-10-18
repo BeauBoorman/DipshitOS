@@ -298,6 +298,10 @@ pub const sys_audio_play: u64 = 43;
 pub const sys_audio_volume: u64 = 44;
 /// M15 follow-up (claim 9297): `sys_audio_mute(muted)` — slot 45.
 pub const sys_audio_mute: u64 = 45;
+/// M118c (issue #2481): `sys_audio_rec_info(out_ptr)` — slot 91.
+pub const sys_audio_rec_info: u64 = 91;
+/// M118c (issue #2481): `sys_audio_rec(format, rate, channels, buf, len)` — slot 92.
+pub const sys_audio_rec: u64 = 92;
 /// Step 2 (Issue #205): `sys_win_fill_batch(buf_ptr, buf_len)` — slot 46.
 pub const sys_win_fill_batch: u64 = 46;
 /// Arc2 W1 (claim 3589, ADR 0013 D1): `sys_win_resize(id, w, h)` — slot 47.
@@ -676,6 +680,8 @@ fn handler_for(comptime number: u64) Handler {
         sys_audio_play => handle_audio_play,
         sys_audio_volume => handle_audio_volume,
         sys_audio_mute => handle_audio_mute,
+        sys_audio_rec_info => handle_audio_rec_info,
+        sys_audio_rec => handle_audio_rec,
         sys_win_fill_batch => handle_win_fill_batch,
         sys_win_resize => handle_win_resize,
         48 => handle_drag_start,
@@ -759,7 +765,7 @@ fn doms_of(number: u64) u5 {
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
         sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
-        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read, sys_gpucomp => k,
+        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_audio_rec_info, sys_audio_rec, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read, sys_gpucomp => k,
         sys_exit => svclock.all_bits,
         else => 0,
     };
@@ -3432,6 +3438,87 @@ fn handle_audio_mute(args: Args, _: *exceptions.VectorFrame) u64 {
     if (muted > 1) return error_result(.einval);
     _ = virtio_snd.snd_set_mute(muted == 1);
     return 0;
+}
+
+/// M118c (issue #2481): slot 91 — sys_audio_rec_info(out_ptr)
+/// Copy the capture capability report out through uaccess as a 16-byte
+/// `AudioCapInfo` {ready, format, rate, channels, period_bytes,
+/// ring_bytes} — the slot-42 shape for the RX direction. `ready` reports
+/// the LAST OBSERVED stream-0 topology held to the v1 tuple (S16/48kHz/
+/// mono); this call runs no device exchange of its own. A soundless VM or
+/// an output-only stream is a successful call with `ready = 0` — absence
+/// is not an error at the info seam, the named refusal arrives at slot
+/// 92. Returns 0; `EINVAL` for a non-process caller, `EFAULT` for a bad
+/// buffer.
+fn handle_audio_rec_info(args: Args, _: *exceptions.VectorFrame) u64 {
+    const out_ptr = args[0];
+    _ = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    const saved = virtio_snd.audio_lock.lock();
+    defer virtio_snd.audio_lock.unlock(saved);
+    const info = virtio_snd.snd_cap_info();
+    const bytes = std.mem.asBytes(&info);
+    if (uaccess.copy_out(out_ptr, bytes, bytes.len) != .ok) return error_result(.efault);
+    return 0;
+}
+
+/// Map a capture refusal class to the ADR 0007 errno — the machine half
+/// of `cap_fail`'s text (M118c). Device-absent, missing RX queue, no
+/// input stream and a device that lacks the v1 tuple are all the audio
+/// seam's no-device refusal (ENXIO); an over-cap tuple is the caller's
+/// EINVAL; over-ring is the same "too long" name slot 43 uses; a bounded
+/// drain expiring is ETIMEDOUT; a full ring is ENOSPC; every device-level
+/// refusal is EIO.
+fn audio_rec_errno(refusal: virtio_snd.CapRefusal) ErrorCode {
+    return switch (refusal) {
+        .no_device, .rx_unarmed, .no_input => .enxio,
+        .over_cap => .einval,
+        .over_ring => .enametoolong,
+        .ring_full => .enospc,
+        .drain_timeout => .etimedout,
+        .none, .ctl_refused, .malformed, .device_refused, .epilogue => .eio,
+    };
+}
+
+/// Copy-out staging for the ring drain — bounded, under audio_lock.
+var cap_out_stage: [4096]u8 align(64) = undefined;
+
+/// M118c (issue #2481): slot 92 — sys_audio_rec(format, rate, channels, buf, len)
+/// Capture `len` bytes (`len`/2 frames — the v1 tuple is S16/mono) from
+/// stream 0's INPUT into the bounded kernel ring, then copy the ring out
+/// through uaccess. ONE stream, ONE call, bounded bytes: `len` is the
+/// per-call bound and can never exceed the 64 KiB ring. Returns the bytes
+/// copied out (== `len` on a complete capture). `EINVAL` for a
+/// non-process caller, a zero or non-frame-aligned `len`, or a tuple over
+/// the v1 cap (the named over-cap refusal); `ENAMETOOLONG` over
+/// `cap_ring_bytes`; `ENXIO` when no device is attached, the RX queue is
+/// unarmed, stream 0 is not INPUT, or the device cannot speak the tuple;
+/// `EFAULT` for a bad `buf` (checked per chunk — a mid-drain fault can
+/// leave earlier chunks copied); `ETIMEDOUT` when the bounded drain
+/// expires (the honest host-mic-denied outcome — zero frames is a refusal
+/// here, not a short read); `ENOSPC` when the ring refuses a write;
+/// `EIO` for a device-level refusal. Serialized with every other audio
+/// caller under `audio_lock`.
+fn handle_audio_rec(args: Args, _: *exceptions.VectorFrame) u64 {
+    const format: u8 = @truncate(args[0]);
+    const rate: u8 = @truncate(args[1]);
+    const channels: u8 = @truncate(args[2]);
+    const ptr = args[3];
+    const len = args[4];
+    _ = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (len == 0 or (len & 1) != 0) return error_result(.einval);
+    if (len > virtio_snd.cap_ring_bytes) return error_result(.enametoolong);
+    const saved = virtio_snd.audio_lock.lock();
+    defer virtio_snd.audio_lock.unlock(saved);
+    const st = virtio_snd.snd_capture(format, rate, channels, @intCast(len / virtio_snd.cap_frame_bytes));
+    if (st != virtio_snd.S_OK) return error_result(audio_rec_errno(virtio_snd.cap_refusal));
+    var off: usize = 0;
+    while (virtio_snd.cap_ring_used != 0 and off < len) {
+        const n = virtio_snd.cap_ring_pop(cap_out_stage[0..@min(cap_out_stage.len, len - off)]);
+        if (n == 0) break;
+        if (uaccess.copy_out(ptr + off, cap_out_stage[0..n], n) != .ok) return error_result(.efault);
+        off += n;
+    }
+    return @intCast(off);
 }
 
 /// Claim 6359 / issue #1333 (ADR 0007 slot 28): `sys_exec(path_ptr,

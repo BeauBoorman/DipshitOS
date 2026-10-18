@@ -115,6 +115,26 @@ if streams.isEmpty {
     let names = streams.map { $0 is VZVirtioSoundDeviceInputStreamConfiguration ? "input" : "output" }
     print("SOUND-IN: virtio-snd attached (\(names.joined(separator: "+")), host source+sink)")
 }
+// M118c (#2481): `--share <dir>` attaches the standard VirtioFS share (tag
+// "virelaios" — the tag `--virtio-fs` uses on VMRunner, and the one the
+// kernel's virtio_fs backend resolves). The guest's `exec` reads its apps
+// from the share, so the go-selftest capture leg's headless GOSELF.ELF
+// needs it. Off by default: the probe boots stay byte-identical without it.
+if let sharePath = flags.sharePath {
+    let shareURL = URL(fileURLWithPath: sharePath, isDirectory: true)
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: shareURL.path, isDirectory: &isDirectory),
+          isDirectory.boolValue else {
+        fail("--share requires an existing host directory, got '\(sharePath)'.")
+    }
+    let fileSystem = VZVirtioFileSystemDeviceConfiguration(tag: "virelaios")
+    fileSystem.share = VZSingleDirectoryShare(
+        directory: VZSharedDirectory(url: shareURL, readOnly: false)
+    )
+    config.directorySharingDevices = [fileSystem]
+    print("SOUND-IN: share attached tag=virelaios share=\(shareURL.path)")
+}
+
 // The host mic-consent state, recorded BEFORE the VM starts: an ad-hoc
 // signed CLI has no bundle/Info.plist, so this is the TCC answer the gate
 // harness sees (AVAuthorizationStatus: 0 notDetermined, 1 restricted,

@@ -26,6 +26,7 @@ struct SoundInFlags {
     var cpuCount = 2
     var sound = false
     var soundIn = false
+    var sharePath: String?
 
     /// Parse CommandLine.arguments. Returns nil + writes the named refusal
     /// to stderr on any malformed or unknown argument — a probe that cannot
@@ -80,6 +81,9 @@ struct SoundInFlags {
                 f.sound = true
             case "--sound-in":
                 f.soundIn = true
+            case "--share":
+                guard let v = value() else { return nil }
+                f.sharePath = v
             default:
                 return fail("unknown argument '\(arg)'")
             }
