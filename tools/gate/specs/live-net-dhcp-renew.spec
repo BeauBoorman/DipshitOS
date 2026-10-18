@@ -79,6 +79,24 @@ if not re.search(r"net dhcp: rebinding \(T2, elapsed=[0-9]+\) request sent \(298
 # 298 (unicast dst 02:00:00:00:00:02, dst IP + ciaddr 10.0.0.2) +
 # REBIND 298 (broadcast dst).
 cap = open(os.environ["RUN_DIR"] + "/a-cap.bin", "rb").read()
+# M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+# noise to this v4 contract; drop them by the v6 length decode so the
+# pinned sizes/offsets below stay byte-exact.
+_v4 = bytearray()
+_i = 0
+while _i < len(cap):
+    _et = cap[_i+12:_i+14]
+    if _et == b"\x86\xdd":
+        _i += 14 + 40 + ((cap[_i+18] << 8) | cap[_i+19])
+    elif _et == b"\x08\x06":
+        _v4 += cap[_i:_i+42]
+        _i += 42
+    else:
+        _fl = 14 + ((cap[_i+16] << 8) | cap[_i+17])
+        _v4 += cap[_i:_i+_fl]
+        _i += _fl
+cap = bytes(_v4)
+
 if len(cap) != 1222:
     sys.exit("FAIL: capture size %d, want 1222" % len(cap))
 h = cap.hex()
@@ -102,8 +120,23 @@ if not re.search(r"net dhcp: lease expired \(elapsed=[0-9]+ >= lease=100\)", ser
     sys.exit("FAIL: no lease-expired line")
 if not re.search(r"net dhcp: discover sent xid=0x[0-9a-f]+ \(286 bytes\)", ser):
     sys.exit("FAIL: no re-DISCOVER line")
-# Recovery capture holds at least DISCOVER + REQUEST + re-DISCOVER.
-n = len(open(os.environ["RUN_DIR"] + "/b-cap.bin", "rb").read())
+# Recovery capture holds at least DISCOVER + REQUEST + re-DISCOVER
+# (v6-filtered — M117b NDP noise must not mask a missing packet).
+cap = open(os.environ["RUN_DIR"] + "/b-cap.bin", "rb").read()
+_v4 = bytearray()
+_i = 0
+while _i < len(cap):
+    _et = cap[_i+12:_i+14]
+    if _et == b"\x86\xdd":
+        _i += 14 + 40 + ((cap[_i+18] << 8) | cap[_i+19])
+    elif _et == b"\x08\x06":
+        _v4 += cap[_i:_i+42]
+        _i += 42
+    else:
+        _fl = 14 + ((cap[_i+16] << 8) | cap[_i+17])
+        _v4 += cap[_i:_i+_fl]
+        _i += _fl
+n = len(_v4)
 if n < 870:
     sys.exit("FAIL: recovery capture %d B, want >= 870" % n)
 print("dhcp-renew B expiry + recovery ok")

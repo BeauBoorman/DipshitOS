@@ -84,6 +84,24 @@ if not re.search(r"net dhcp: discover sent xid=0x[0-9a-f]+ \(286 bytes\)", ser):
 # offsets byte-exact (dst ff*6, src guest MAC, ethertype, 68->67, op 1,
 # cookie, option 53 = 1 then 3).
 cap = open(os.environ["RUN_DIR"] + "/p1-cap.bin", "rb").read()
+# M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+# noise to this v4 contract; drop them by the v6 length decode so the
+# pinned sizes/offsets below stay byte-exact.
+_v4 = bytearray()
+_i = 0
+while _i < len(cap):
+    _et = cap[_i+12:_i+14]
+    if _et == b"\x86\xdd":
+        _i += 14 + 40 + ((cap[_i+18] << 8) | cap[_i+19])
+    elif _et == b"\x08\x06":
+        _v4 += cap[_i:_i+42]
+        _i += 42
+    else:
+        _fl = 14 + ((cap[_i+16] << 8) | cap[_i+17])
+        _v4 += cap[_i:_i+_fl]
+        _i += _fl
+cap = bytes(_v4)
+
 if len(cap) != 584:
     sys.exit("FAIL: capture size %d, want 584" % len(cap))
 h = cap.hex()

@@ -99,7 +99,29 @@ vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=87'
 vgate_assert 01 serial-contains 'net udp: rx=2,tx=2,loop=1,drop=0'
 vgate_assert 01 serial-contains ' udp=rx=2,tx=2,loop=1,drop=0'
 vgate_assert 01 serial-contains 'net-udp-ok'
-vgate_assert 01 capture-equals cap.bin fixture.bin
+vgate_assert 01 python <<'PY'
+import os, sys
+def _v4only(cap):
+    # M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+    # noise to this v4 contract; drop them by the v6 length decode.
+    out = bytearray(); i = 0
+    while i < len(cap):
+        et = cap[i+12:i+14]
+        if et == b"\x86\xdd":
+            i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19])
+        elif et == b"\x08\x06":
+            out += cap[i:i+42]; i += 42
+        else:
+            fl = 14 + ((cap[i+16] << 8) | cap[i+17])
+            out += cap[i:i+fl]; i += fl
+    return bytes(out)
+rd = os.environ["RUN_DIR"]
+cap = _v4only(open(os.path.join(rd, "cap.bin"), "rb").read())
+want = open(os.path.join(rd, "fixture.bin"), "rb").read()
+if cap != want:
+    sys.exit("FAIL: udp syscall capture != fixture (v6-filtered)")
+print("udp syscall byte-exact (v6-filtered)")
+PY
 vgate_assert 01 python <<'PY'
 import os, sys
 lines = open(os.environ["VG_SER"], errors="replace").read().splitlines()

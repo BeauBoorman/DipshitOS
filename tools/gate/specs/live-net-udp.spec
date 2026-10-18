@@ -150,7 +150,17 @@ vgate_assert p1 serial-contains 'net udp recv: [0] len=12'
 vgate_assert p1 serial-contains-file live-net-udp-recv-1.txt
 vgate_assert p1 serial-contains 'net udp: rx=1,tx=1,loop=1,drop=0'
 vgate_assert p1 serial-contains 'net-udp-ok'
-vgate_assert p1 capture-empty live-net-udp-cap-1.bin
+vgate_assert p1 python <<'PY'
+import os, sys
+rd = os.environ["RUN_DIR"]
+cap = open(os.path.join(rd, "live-net-udp-cap-1.bin"), "rb").read()
+i = 0
+while i < len(cap):
+    if cap[i+12:i+14] == b"\x86\xdd":
+        i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19]); continue
+    sys.exit("FAIL: non-NDP frame in the no-listener capture")
+print("no-listener clean (NDP filtered)")
+PY
 
 vgate_assert p2 serial-contains 'net ip: ip=10.0.0.1'
 vgate_assert p2 serial-contains 'net udp recv: port=7000'
@@ -167,11 +177,43 @@ vgate_assert p3 serial-contains 'net udp recv: [0] len=12'
 vgate_assert p3 serial-contains-file live-net-udp-recv-2.txt
 vgate_assert p3 serial-contains ' udp=rx=1,tx=1,loop=0,drop=0'
 vgate_assert p3 serial-contains 'net-udp-ok'
-vgate_assert p3 capture-equals live-net-udp-cap-3.bin live-net-udp-fixture-3.bin
+vgate_assert p3 python <<'PY'
+import os, sys
+def _v4only(cap):
+    # M117b (#2474): boot-time NDP/ICMPv6 frames ride the same capture —
+    # noise to this v4 contract; drop them by the v6 length decode.
+    out = bytearray(); i = 0
+    while i < len(cap):
+        et = cap[i+12:i+14]
+        if et == b"\x86\xdd":
+            i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19])
+        elif et == b"\x08\x06":
+            out += cap[i:i+42]; i += 42
+        else:
+            fl = 14 + ((cap[i+16] << 8) | cap[i+17])
+            out += cap[i:i+fl]; i += fl
+    return bytes(out)
+rd = os.environ["RUN_DIR"]
+cap = _v4only(open(os.path.join(rd, "live-net-udp-cap-3.bin"), "rb").read())
+want = open(os.path.join(rd, "live-net-udp-fixture-3.bin"), "rb").read()
+if cap != want:
+    sys.exit("FAIL: udp reply capture != fixture (v6-filtered)")
+print("udp reply byte-exact (v6-filtered)")
+PY
 
 vgate_assert p4 serial-contains 'net ip: ip=10.0.0.1'
 vgate_assert p4 serial-contains 'net udp recv: no datagrams for port 9998'
 vgate_assert p4 serial-contains 'net recv: [0] len=58'
 vgate_assert p4 serial-contains ' udp=rx=0,tx=0,loop=0,drop=1'
 vgate_assert p4 serial-contains 'net-udp-ok'
-vgate_assert p4 capture-empty live-net-udp-cap-4.bin
+vgate_assert p4 python <<'PY'
+import os, sys
+rd = os.environ["RUN_DIR"]
+cap = open(os.path.join(rd, "live-net-udp-cap-4.bin"), "rb").read()
+i = 0
+while i < len(cap):
+    if cap[i+12:i+14] == b"\x86\xdd":
+        i += 14 + 40 + ((cap[i+18] << 8) | cap[i+19]); continue
+    sys.exit("FAIL: non-NDP frame in the closed-port capture")
+print("closed-port clean (NDP filtered)")
+PY
