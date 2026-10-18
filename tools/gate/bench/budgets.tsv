@@ -45,3 +45,4 @@ wm-present-latency	<=	1532847	1021898	+50%	#2485
 smp-scale-c1	<=	270622052	67655513	x4	#2485; spread re-measured on #2486
 smp-scale-c2	<=	105399764	26349941	x4	#2485; spread re-measured on #2486
 smp-scale-c4	<=	66754980	33377490	x2	#2485
+seat-mbox-burst	>=	24	32	-8	#2487; ring bound, measured post-fix on this host

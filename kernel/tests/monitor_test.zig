@@ -1553,7 +1553,7 @@ test "monitor: resources audits the fixed pools at their bounds (C3 claim 0339)"
     try std.testing.expect(std.mem.indexOf(u8, out, "resources: windows=") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "/16\n") != null); // M65d: 3 kernel + 13 user
     try std.testing.expect(std.mem.indexOf(u8, out, "resources: tables=0/512\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "resources: events=64 mbox=8 fds=8 timers=1 tcp=1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "resources: events=64 mbox=32 fds=8 timers=1 tcp=1\n") != null);
 }
 
 test "monitor: procs reports the process table with lifecycle and exit status" {

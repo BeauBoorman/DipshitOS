@@ -327,7 +327,11 @@ var (
 func serviceRPC() int {
 	buf := serviceRPCBuf[:]
 	served := 0
-	for i := 0; i < 8; i++ {
+	// M119c (#2487): the kernel's ring grew 8 → 32 so a stalled seat
+	// stops refusing posts; the per-pass bound stays the client-side
+	// constant — a deeper backlog clears over multiple iterations,
+	// not one pass.
+	for i := 0; i < vi.MailboxMaxMessages; i++ {
 		n, r := vi.IpcRecv(buf[:])
 		if r < 0 || n < 38 {
 			return served

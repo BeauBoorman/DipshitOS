@@ -78,6 +78,8 @@ for prog in "${@:-$REPO/tools/go/hello.go}"; do
         # mapped-memory bound (`go-hello` run 11).
         goloadbss)  base="GOLOADBSS" ;;
         goread)     base="GOREAD" ;;
+        # M119c (#2487): the seat-mailbox burst-absorption fixture.
+        mburst)     base="GOMBURST" ;;
         gosyscall)  base="GOSYSCALL" ;;
         # #2354: the region-straddle large-read fixture (go-hello run 13).
         gobigread)  base="GOBIGREAD" ;;
@@ -98,7 +100,9 @@ for prog in "${@:-$REPO/tools/go/hello.go}"; do
         GONET | GOVINET | GOVIDNS | GOBIG) strip="-s -w" ;;
         # M70c (#1455): the share-read measurement fixture. It links the whole
         # `vi` surface, which is what puts it in this class.
-        GOREAD) strip="-s -w" ;;
+        # M119c (#2487): GOMBURST also links `vi` (IpcSend/WmctlSeatPid) —
+        # same class.
+        GOREAD | GOMBURST) strip="-s -w" ;;
         # M70c-S1P (#1525): the syscall-layer fixture — the std `syscall`
         # package for GOOS=virelai, which is smaller than `vi` but not small.
         GOSYSCALL) strip="-s -w" ;;

@@ -17,7 +17,8 @@
 //! scheduling.
 //!
 //! Ring shape: per process id, up to `max_messages` slots of `message_max`
-//! bytes each (8 × 64 B — card 4b, claim 3179, raised 4 → 8). FIFO
+//! bytes each (32 × 64 B — card 4b claim 3179 raised 4 → 8, M119c issue
+//! #2487 raised 8 → 32 for the stalled seat drain). FIFO
 //! discipline (head = oldest). `send` enqueues
 //! (a full ring refuses); `peek` copies the oldest message out WITHOUT
 //! consuming it; `drop` consumes it. The recv syscall does peek → uaccess
@@ -30,11 +31,15 @@
 const std = @import("std");
 const process = @import("process.zig"); // the registry bound (max_processes)
 
-/// Slots per process ring (8 messages outstanding per process — card 4b,
-/// claim 3179: a data-path constant raised 4 → 8, 256 → 512 B of BSS; NOT
-/// a syscall number — the ABI stays frozen, the follow-on-4 set's ABI
-/// changes are ONLY slots 7/8 on cards 4a/4c).
-pub const max_messages: usize = 8;
+/// Slots per process ring (32 messages outstanding per process — M119c,
+/// issue #2487: raised 8 → 32, 512 → 2048 B of BSS. The seat's mailbox is
+/// drained once per composite-loop iteration, and that iteration stalls
+/// while the seat drains an input burst under sustained PCM; the 8-deep
+/// ring then refused client posts with ENOSPC and the toast was lost —
+/// pending high-water measured 7/8 on a healthy live-sound-playback run.
+/// Same contract the events queue got in #2260 (16 → 64): a data-path
+/// constant raised 4 → 8 by card 4b claim 3179; NOT a syscall number.
+pub const max_messages: usize = 32;
 /// Bytes per message slot (a message longer than this is truncated at the
 /// send syscall; a recv buffer cap larger than this is clamped).
 pub const message_max: usize = 64;
