@@ -53,6 +53,7 @@ echo n10c-phase1-ready
 EOF
 
 vgate_file c2.txt <<'EOF'
+net arp 192.168.64.1
 net arp
 net tcp connect 192.168.64.1 9999
 net
@@ -81,7 +82,7 @@ EOF
 
 vgate_run A -- --net '$RUN_DIR/a-cap.bin' --net-tcp-respond 10.0.0.2:9999 --net-arp-respond 10.0.0.2 --script '$RUN_DIR/a1.txt' --script-expect 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4' --timeout 120
 vgate_run B -- --net '$RUN_DIR/b-cap.bin' --net-arp-respond 10.0.0.2 --script '$RUN_DIR/b1.txt' --script2 '$RUN_DIR/b2.txt' --script2-after 'n10b-phase1-ready' --script2-delay 31 --script-expect 'tcp=idle,peer=0.0.0.0:0,syn=1,synack=0' --timeout 140
-vgate_run C -- --net-nat --script '$RUN_DIR/c1.txt' --script2 '$RUN_DIR/c2.txt' --script2-after 'net arp: 192.168.64.1 is at' --script-expect 'peer=192.168.64.1:9999,syn=1,synack=0' --timeout 120
+vgate_run C -- --net-nat --script '$RUN_DIR/c1.txt' --script2 '$RUN_DIR/c2.txt' --script2-after 'n10c-phase1-ready' --script2-delay 2 --script-expect 'peer=192.168.64.1:9999,syn=1,synack=0' --timeout 120
 vgate_run D -- --net '$RUN_DIR/d-cap.bin' --net-tcp-respond 10.0.0.2:9999:options --net-arp-respond 10.0.0.2 --script '$RUN_DIR/d1.txt' --script-expect 'tcp=closed,peer=10.0.0.2:9999,syn=2,synack=2,ack=4' --timeout 120
 
 vgate_assert A serial-contains 'net tcp: ack sent (ack=0x12345679, 54 bytes)'

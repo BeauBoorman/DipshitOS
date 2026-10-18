@@ -16,14 +16,25 @@ net arp 192.168.64.1
 echo nat-phase1-ready
 EOF
 
+# ARP resolution is async: the script-1 `net arp` only sends the request —
+# learning is silent (the `is at` line prints only from a lookup that hits an
+# already-learned entry, so it can never gate script-2). script-2's probe
+# runs after --script2-delay, drains the learned reply, and issues the ping.
+# script-3 then gives the echo reply a real landing window before the counter
+# read — the legacy script slept 10 s here for the same reason.
 vgate_file script-2.txt <<'EOF'
+net arp 192.168.64.1
 net ping 192.168.64.1
+echo nat-pong-wait
+EOF
+
+vgate_file script-3.txt <<'EOF'
 net arp
 net
 echo nat-obs-done
 EOF
 
-vgate_run 01 -- --net-nat --script '$RUN_DIR/script-1.txt' --script2 '$RUN_DIR/script-2.txt' --script2-after 'net arp: 192.168.64.1 is at' --script-expect 'nat-obs-done' --timeout 40
+vgate_run 01 -- --net-nat --script '$RUN_DIR/script-1.txt' --script2 '$RUN_DIR/script-2.txt' --script2-after 'nat-phase1-ready' --script2-delay 2 --script3 '$RUN_DIR/script-3.txt' --script3-after 'nat-pong-wait' --script3-delay 5 --script-expect 'nat-obs-done' --timeout 40
 
 vgate_assert 01 serial-contains 'net ip: ip=192.168.64.5'
 vgate_assert 01 serial-contains 'net arp: request for 192.168.64.1 sent (42 bytes)'

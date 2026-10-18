@@ -25,6 +25,7 @@ vgate_runner_flags -Xswiftc -DSPIKE
 vgate_file script-1.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
+net arp 10.0.0.2
 exec GODNS.ELF example.com 10.0.0.2
 echo dns-launched
 EOF
@@ -37,12 +38,14 @@ EOF
 vgate_file script-aaaa.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
+net arp 10.0.0.2
 exec GODNS.ELF -6 example.com 10.0.0.2
 exec GODNS.ELF multi.example 10.0.0.2
 EOF
 
 vgate_file script-cache.txt <<'EOF'
 net ip 10.0.0.1
+net arp 10.0.0.2
 net arp 10.0.0.2
 exec GODNS.ELF --twice example.com 10.0.0.2
 EOF
