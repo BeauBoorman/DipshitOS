@@ -1,20 +1,20 @@
 {
   "version": 1,
-  "compiler": "go version go1.27.1 darwin/arm64",
-  "fork_revision": "9b011c37c1ac814d61a96833cfb3dbcbca969eae",
-  "compiler_sha256": "16ca97e8f7dbc8e3ae6053b53c3b506889efb7dd72b94bfcaf1b55a3980b786d",
+  "compiler": "go version go1.27.2 darwin/arm64",
+  "fork_revision": "522e5d99513920a96e67eaf39b95ebfd33c53e14",
+  "compiler_sha256": "0e31b4048d20cc834fea80fbdfbd25f8ee0b891917ce6a0ed4f8045e7b9f8a6a",
   "tool_sha256": {
-    "compile": "fd4d3b96609c38533c02874f9f5bb97b5715f2599ecb39c95575fdf1b28900f0",
-    "link": "baaa198fc973937d2fa990304e6e588723a3c028af2f885cf610ca0a0445adb4",
-    "asm": "38c0e9c8170ecf975441df911117c65caf773a64b40521e71610e04862fa9b9d"
+    "compile": "fa3f3f3d5807d2587827f938f125026ee0c167ba2d96d72ceb27df1e37a6c460",
+    "link": "3122dc419089d4692207db6f5922b7ed8e3867d4bd3a01f368c5fd8f2f1855b3",
+    "asm": "9e5cf3a9ae08ade9a5d6157261b15a68542b700cb7518ddb77d5f19271f3adc6"
   },
-  "fork_source_sha256": "b0e0d05e85df3315ecd7aebefee3fbc84f366aa4c5c1e1785ad039b8198d290d",
-  "overlay_sha256": "9ac927d381d05147e1d360b39af331e27bc3b7c542d9b301abf01371ef49a8b8",
+  "fork_source_sha256": "eb56c2acc08fa2ab61fc38016249f19d8294845a5498425824dbcf7845f48e65",
+  "overlay_sha256": "6952a6833c455ce38d29354f10afb704d8e281a54c9a3e03ee61964695112fef",
   "guest_source_sha256": {
     "user/go/pdf": "7c6537f514c8b804097847f891801902a1a2e3f988e76315e49dbb15084e4af3",
     "user/go/vector": "deac3edcb133999446289ff400c2d469aeab6d4f7c61a872b1ce159aec835f94",
-    "user/go/vi": "59aa50bb927887ad81adfeaf67f189dc832817e0e0bdeac7ab433421fedfeff9",
-    "user/go/vsys": "048353e7f3bb3a7ed5ce4204e7a89504090834e7e8f5d8d9a190b503e38ccddf"
+    "user/go/vi": "32b6429a38f274b5c07116cf9843e4aeacd25887097e848a90880f520e866333",
+    "user/go/vsys": "e3ad0d6dd8f330ab7abceff223a29783bee79ab270eb7c41bbe498b68db41e10"
   },
   "adapter_and_build_sha256": {
     "adapter.go": "498163ee1e385a0b215df53048115b96b21f4b65456e5246ea384187534fc4d1",

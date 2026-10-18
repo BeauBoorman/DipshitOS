@@ -19,10 +19,15 @@ def snapshot(root, fork):
     if not (fork/"bin/go").is_file():
         raise ValueError("MissingToolchain")
     version = subprocess.check_output([str(fork/"bin/go"), "version"], text=True).strip()
-    if version != "go version go1.27.1 darwin/arm64":
+    if version != "go version go1.27.2 darwin/arm64":
         raise ValueError("SourceDrift: compiler identity")
     for p in (root/"tools/go/overlay").rglob("*"):
-        if p.is_file() and p.read_bytes() != (fork/"src"/p.relative_to(root/"tools/go/overlay")).read_bytes():
+        rel = p.relative_to(root/"tools/go/overlay")
+        # gostalgia/ and gostalgia-mods/ are build-gostalgia stage overlays —
+        # apply.sh deliberately does NOT copy them into the fork's src/.
+        if rel.parts and rel.parts[0] in ("gostalgia", "gostalgia-mods"):
+            continue
+        if p.is_file() and p.read_bytes() != (fork/"src"/rel).read_bytes():
             raise ValueError("SourceDrift: overlay")
     return {
         "version": 1, "compiler": version,
