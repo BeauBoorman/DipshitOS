@@ -39,7 +39,11 @@ for name, script in (("GOTABWM.ELF", "build-gotabwm.sh"),
           % (name, os.path.getsize(os.path.join(share, name))))
 with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
     f.write("#v2\nwm=none\n")
-print("seeded SETTINGS.TXT (explicit GOTABWM launch)")
+# M79a made the close choreography demo-only, armed by the trigger's
+# presence — the gate's host close/done contract needs it seeded.
+with open(os.path.join(share, "GOTABWM.DEMO"), "w") as f:
+    f.write("demo\n")
+print("seeded SETTINGS.TXT (explicit GOTABWM launch) + GOTABWM.DEMO")
 PY
 
 vgate_run A -- \
