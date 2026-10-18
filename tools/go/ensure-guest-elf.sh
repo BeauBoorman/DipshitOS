@@ -28,6 +28,7 @@
 #   ENSURE_GUEST_ELF_BUILD_GOSH   override the GOSH builder (tests)
 #   ENSURE_GUEST_ELF_BUILD_GOSSHD override the GOSSHD builder (tests)
 #   ENSURE_GUEST_ELF_BUILD_GOSSH  override the GOSSH builder (tests)
+#   ENSURE_GUEST_ELF_BUILD_GOUPD  override the GOUPD builder (tests)
 #
 set -euo pipefail
 
@@ -53,6 +54,7 @@ APPS = {
     "GOSH": "tools/go/build-gosh.sh",
     "GOSSHD": "tools/go/build-sshd.sh",
     "GOSSH": "tools/go/build-ssh.sh",
+    "GOUPD": "tools/go/build-goupd.sh",
 }
 
 
@@ -75,7 +77,7 @@ def stamp_path(app):
 
 def builder_rel(app):
     if app not in APPS:
-        die("ensure-guest-elf: unknown app %s (want GOSH, GOSSHD, or GOSSH)" % app, 2)
+        die("ensure-guest-elf: unknown app %s (want GOSH, GOSSHD, GOSSH, or GOUPD)" % app, 2)
     return APPS[app]
 
 
@@ -248,7 +250,7 @@ if cmd == "needed-by":
         text = open(path, "r", encoding="utf-8", errors="replace").read()
     except OSError as e:
         die("ensure-guest-elf: cannot read spec %s: %s" % (path, e), 2)
-    for app in ("GOSH", "GOSSHD", "GOSSH"):
+    for app in ("GOSH", "GOSSHD", "GOSSH", "GOUPD"):
         if spec_needs(text, app):
             sys.stdout.write(app + "\n")
     sys.exit(0)
@@ -280,8 +282,8 @@ PY
 
 require_app() {
     case "${1:-}" in
-        GOSH|GOSSHD|GOSSH) ;;
-        *) usage "check|ensure|stamp GOSH|GOSSHD|GOSSH" ;;
+        GOSH|GOSSHD|GOSSH|GOUPD) ;;
+        *) usage "check|ensure|stamp GOSH|GOSSHD|GOSSH|GOUPD" ;;
     esac
 }
 
@@ -309,7 +311,14 @@ run_builder() {
                 bash "$ROOT/tools/go/build-ssh.sh"
             fi
             ;;
-        *) usage "ensure GOSH|GOSSHD|GOSSH" ;;
+        GOUPD)
+            if [ -n "${ENSURE_GUEST_ELF_BUILD_GOUPD:-}" ]; then
+                bash -c "$ENSURE_GUEST_ELF_BUILD_GOUPD"
+            else
+                bash "$ROOT/tools/go/build-goupd.sh"
+            fi
+            ;;
+        *) usage "ensure GOSH|GOSSHD|GOSSH|GOUPD" ;;
     esac
 }
 
@@ -347,5 +356,5 @@ case "$cmd" in
         python_helper stamp "$1"
         python_helper check "$1"
         ;;
-    *) usage "check|ensure|stamp GOSH|GOSSHD|GOSSH | needed-by <spec> | hash GOSH|GOSSHD|GOSSH" ;;
+    *) usage "check|ensure|stamp GOSH|GOSSHD|GOSSH|GOUPD | needed-by <spec> | hash GOSH|GOSSHD|GOSSH|GOUPD" ;;
 esac

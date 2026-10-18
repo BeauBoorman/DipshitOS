@@ -59,6 +59,12 @@
 //          refuse by name. Mutually exclusive with --vz-restore and
 //          --profile-init; the ctl listener re-arms so the resumed
 //          machine can suspend again.)
+//         [--apply-update] [--rollback-update] [--update-key <64-hex>]
+//          (M115f, #2465: verify the signed staged set in <share>/UPDATE/
+//          and swap it in as the boot base image, retaining <base>.prev;
+//          --rollback-update swaps it back. The trust pin comes from
+//          --update-key or the profile's config.json updatePubkey. A
+//          refused set fails the run by name; absent is "none staged".)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -539,6 +545,16 @@ var profileInitOnly = false
 // M115d (#2463): `--resume <path>` boots the profile's saved machine
 // state instead of the boot image — the continuation of a ctl `suspend`.
 var resumeFromPath: String?
+// M115f (#2465): `--apply-update` verifies the guest-staged signed set in
+// <share>/UPDATE/ (UPDATE.MF + UPDATE.SIG over it) and swaps it in as the
+// boot base image, retaining the old base at <base>.prev and discarding
+// a profile's persistent overlay.asif. `--rollback-update` swaps .prev
+// back. `--update-key <64-hex>` pins the Ed25519 public key the manifest
+// must verify under; absent it, a profile's config.json updatePubkey
+// applies.
+var applyUpdate = false
+var rollbackUpdate = false
+var updateKeyHex: String?
 var memoryMiB = 256
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
@@ -1343,6 +1359,15 @@ while idx < arguments.count {
     } else if arg == "--profile-init" {
         profileInitOnly = true
         idx += 1
+    } else if arg == "--apply-update" {
+        applyUpdate = true
+        idx += 1
+    } else if arg == "--rollback-update" {
+        rollbackUpdate = true
+        idx += 1
+    } else if arg == "--update-key", idx + 1 < arguments.count {
+        updateKeyHex = arguments[idx + 1]
+        idx += 2
     } else if arg == "--input-key", idx + 1 < arguments.count {
         guard let kc = UInt16(arguments[idx + 1]) else {
             fail("--input-key requires a numeric macOS virtual keycode, got '\(arguments[idx + 1])'.")
@@ -2181,6 +2206,69 @@ if profileInitOnly {
     print("profile: \(p.created ? "created" : "loaded") \(p.url.path)")
     print("profile: identity=\(p.identity) cpus=\(p.config.cpus) memoryMiB=\(p.config.memoryMiB) base=\(p.config.baseImage)")
     exit(0)
+}
+
+// M115f (#2465): the opt-in OS self-update legs. `--apply-update` runs
+// BEFORE the base image is opened: verify the signed staged set on the
+// armed share, then swap it in as the base (old base -> <base>.prev, a
+// profile's persistent overlay.asif discarded). `--rollback-update`
+// swaps .prev back. Both are pure file operations on host paths — the
+// guest can stage but can never choose whether the apply happens.
+if applyUpdate, rollbackUpdate {
+    fail("--apply-update and --rollback-update are mutually exclusive.")
+}
+if applyUpdate || rollbackUpdate {
+    guard let base = overlayBasePath else {
+        fail("\(rollbackUpdate ? "--rollback-update" : "--apply-update"): no_base (no base image — needs --overlay-base or --profile).")
+    }
+    let baseURL = URL(fileURLWithPath: base)
+    // A profile's persistent overlay belongs to the outgoing base — a
+    // swapped base starts with a fresh layer (the overlay is re-minted at
+    // the attach point below when absent).
+    let overlayURL = activeProfile?.overlayURL
+    if rollbackUpdate {
+        let hadOverlay = overlayURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        do {
+            let sha = try OSUpdate.rollback(baseImage: baseURL, overlay: overlayURL)
+            print("apply-update: rollback restored sha256=\(sha)")
+            if hadOverlay {
+                print("apply-update: overlay reset (stale sectors belong to the old base)")
+            }
+        } catch {
+            fail("apply-update: \(error)")
+        }
+    } else {
+        // The staged set lives on the share the guest writes — the armed
+        // --cvc-file / --virtio-fs dir or the bundle's share/.
+        guard let share = cvcFileShareDir ?? virtioFSShareDir else {
+            fail("apply-update: no_share (UPDATE/ is staged on the host share — arm --cvc-file/--virtio-fs or a profile share).")
+        }
+        if let updateDir = OSUpdate.stagedDir(shareDir: URL(fileURLWithPath: share)) {
+            // The trust pin: the flag wins; else the bundle's own
+            // config.json updatePubkey — a host-side value the guest
+            // cannot reach.
+            let keyHex = updateKeyHex ?? activeProfile?.config.updatePubkey
+            guard let keyHex, let keyData = dataFromHex(keyHex), keyData.count == 32 else {
+                fail("apply-update: no_key (--update-key <64-hex Ed25519 public key> or profile config updatePubkey).")
+            }
+            // The overlay marker is observable: the discard of a
+            // persistent overlay.asif is the proof no stale sector shadows
+            // the new base (the attach point re-mints it on THIS boot).
+            let hadOverlay = overlayURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            do {
+                let manifest = try OSUpdate.apply(updateDir: updateDir, baseImage: baseURL,
+                                                  publicKey: keyData, overlay: overlayURL)
+                print("apply-update: applied version=\(manifest.version) image=\(OSUpdate.imageName)")
+                if hadOverlay {
+                    print("apply-update: overlay reset (stale sectors belong to the old base)")
+                }
+            } catch {
+                fail("apply-update: \(error)")
+            }
+        } else {
+            print("apply-update: none staged")
+        }
+    }
 }
 
 // Console sessions run until the VM stops or the user ends the session,
