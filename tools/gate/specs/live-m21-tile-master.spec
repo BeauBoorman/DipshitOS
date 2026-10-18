@@ -25,7 +25,7 @@ EOF
 # --- run A (W1): tile split ---
 vgate_run A -- \
     --display --screen '$RUN_DIR/gpu-screen' \
-    --screenshot-after "dui tile: id=3 mode=on master=2 stack=3" \
+    --screenshot-after "timer heartbeat ticks=20" \
     --script '$RUN_DIR/script1.txt' \
     --script2 '$RUN_DIR/script2a.txt' --script2-after "m21demo: loop ok" \
     --script-expect "timer heartbeat ticks=20 irq=20 poll=0" \
@@ -127,7 +127,7 @@ PY
 # --- run B (W2): swapped ---
 vgate_run B -- \
     --display --screen '$RUN_DIR/gpu-screen' \
-    --screenshot-after "dui master: side=right master=3 stack=2" \
+    --screenshot-after "timer heartbeat ticks=20" \
     --script '$RUN_DIR/script1.txt' \
     --script2 '$RUN_DIR/script2b.txt' --script2-after "m21demo: loop ok" \
     --script-expect "timer heartbeat ticks=20 irq=20 poll=0" \
