@@ -929,7 +929,10 @@ vgate_assert 10 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
 vgate_assert 10 serial-contains 'gotabwm: settings wm=gotabwm'
 vgate_assert 10 serial-contains 'gotabwm: session load n='
 vgate_assert 10 serial-absent 'gotabwm: first-boot workspace'
-vgate_assert 10 serial-contains 'exec: loaded GOCALC.ELF'
+# The restore's re-exec, not a monitor exec, is what loads GOCALC now
+# (M120b): the kernel's `exec: loaded` marker belongs to scripted execs,
+# while the seat names every bin it fans back out.
+vgate_assert 10 serial-contains 'gotabwm: session exec GOCALC.ELF'
 vgate_assert 10 serial-contains 'gocalc: settings subscribed key=theme'
 vgate_assert 10 serial-contains 'exec: loaded GOSET.ELF'
 vgate_assert 10 serial-contains 'goset: set theme=light'
