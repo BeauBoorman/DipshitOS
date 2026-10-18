@@ -41,6 +41,12 @@ public final class HostRecorder {
     public var hardCap: TimeInterval = 60
     /// Capture cadence.
     public var fps: Double = 15
+    /// Encoder back-pressure queue depth. A produced frame the input
+    /// isn't ready for waits here instead of dropping (#2616: the
+    /// observed flake was a produced frame lost to encoder warm-up,
+    /// not a stale flag); only a stall sustained past this many
+    /// frames drops the oldest. Injectable for tests.
+    public var maxQueuedFrames = 8
 
     /// The session's guest view, set by HostApplication.attach. Weak —
     /// the view lives in the window hierarchy; a nil view simply means
@@ -78,6 +84,12 @@ public final class HostRecorder {
     private var outURL: URL?
     private var frameTimer: Timer?
     private var capTimer: Timer?
+    /// Produced frames the encoder has not accepted yet — drained by
+    /// flushPending() on each append and, bounded, by stop() before the
+    /// writer seals, so the receipt's frames= counts what the take
+    /// produced, not what the input happened to accept by the tick the
+    /// stop dispatch landed on.
+    private var pendingFrames: [(buffer: CVPixelBuffer, pts: CMTime)] = []
     private var lastRemainingSecond = -1
     private var sequence = 0
 
@@ -181,6 +193,7 @@ public final class HostRecorder {
         startedAt = now()
         frames = 0
         droppedFrames = 0
+        pendingFrames.removeAll()
         outURL = url
         isRecording = true
         append(first, at: .zero)
@@ -209,6 +222,21 @@ public final class HostRecorder {
         capTimer?.invalidate()
         frameTimer = nil
         capTimer = nil
+        // Drain produced frames the input hasn't accepted yet so the
+        // receipt's frames= is the take's real count — the encoder
+        // drains on its own threads, so bounded polling catches the
+        // warm-up lag; leftovers past the bound count as dropped,
+        // honestly.
+        var drained = 0.0
+        while !pendingFrames.isEmpty, drained < 5 {
+            flushPending()
+            if !pendingFrames.isEmpty {
+                Thread.sleep(forTimeInterval: 0.01)
+                drained += 0.01
+            }
+        }
+        droppedFrames += pendingFrames.count
+        pendingFrames.removeAll()
         writerInput?.markAsFinished()
         let done = DispatchSemaphore(value: 0)
         writer?.finishWriting { done.signal() }
@@ -233,6 +261,7 @@ public final class HostRecorder {
             return
         }
         guard let cg = produceFrame() else {
+            flushPending()
             droppedFrames += 1
             return
         }
@@ -271,8 +300,9 @@ public final class HostRecorder {
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
         ])
-        // Real-time pacing: the input pulls frames as they are produced,
-        // so a slow tick drops a frame instead of unbounded queueing.
+        // Real-time pacing: produced frames queue briefly while the
+        // encoder drains, and only a stall sustained past
+        // maxQueuedFrames drops the oldest — never unbounded queueing.
         input.expectsMediaDataInRealTime = true
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -299,18 +329,31 @@ public final class HostRecorder {
 
     private func append(_ image: CGImage, at pts: CMTime) {
         guard let adaptor, let writerInput else { return }
-        guard writerInput.isReadyForMoreMediaData else {
-            droppedFrames += 1
-            return
-        }
         guard let pb = pixelBuffer(from: image, pool: adaptor.pixelBufferPool) else {
             droppedFrames += 1
             return
         }
-        if adaptor.append(pb, withPresentationTime: pts) {
-            frames += 1
-        } else {
+        pendingFrames.append((pb, pts))
+        while pendingFrames.count > maxQueuedFrames {
+            pendingFrames.removeFirst()
             droppedFrames += 1
+        }
+        flushPending()
+    }
+
+    /// Hand queued frames to the writer while it will take them. The
+    /// input is real-time paced (`expectsMediaDataInRealTime`), so
+    /// readiness lags a burst of produced frames — the queue absorbs
+    /// that lag instead of losing frames the take actually produced.
+    private func flushPending() {
+        guard let adaptor, let writerInput else { return }
+        while writerInput.isReadyForMoreMediaData, let next = pendingFrames.first {
+            pendingFrames.removeFirst()
+            if adaptor.append(next.buffer, withPresentationTime: next.pts) {
+                frames += 1
+            } else {
+                droppedFrames += 1
+            }
         }
     }
 
