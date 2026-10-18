@@ -36,12 +36,19 @@ const memmap = @import("memmap.zig"); // host-test fixture view (page-ownership 
 const mmu = @import("mmu.zig"); // #2116: the per-root page-table tree dies with the process
 const svclock = @import("svclock.zig");
 
-/// M113c (#2419, ADR 0054 D8): the ambient word set — every grant word,
-/// today's per-process authority when no row narrows it. Defined HERE
-/// rather than imported to keep the dependency one-way (grant.zig
-/// already consumes this module); grant.zig comptime-asserts its own
-/// `baseline` equals this constant.
+/// M113c (#2419, ADR 0054 D8): every grant word — the vocabulary ceiling
+/// a row may express and `set_grant`'s clamp. Defined HERE rather than
+/// imported to keep the dependency one-way (grant.zig already consumes
+/// this module); grant.zig comptime-asserts its own `baseline` equals
+/// this constant.
 pub const word_baseline: u32 = 0x1ff;
+
+/// M116b (#2468): the ambient word set — the per-process authority a
+/// process carries when no row narrows it (and before exec stamps one).
+/// `word_baseline` minus the boundary-crossing words — file (0x01),
+/// audio (0x04), net (0x80); grant.zig's `ambient` documents why and
+/// comptime-asserts equality.
+pub const word_ambient: u32 = word_baseline & ~@as(u32, 0x01 | 0x04 | 0x80);
 
 /// Bounded process registry size (fixed BSS array). Milestone sixteen C3
 /// (claim 0339): grew 8 -> 16 — at the new 8-program concurrency the
@@ -320,12 +327,12 @@ const Process = struct {
     caps: u32 = 0,
     /// M113c (#2419, ADR 0054 D8/D9): the measured-exec word set — the
     /// grant row's words intersected with the baseline, applied at exec;
-    /// `word_baseline` (every word) for a process no row names. Word
+    /// `word_ambient` (the M116b floor) for a process no row names. Word
     /// masks only narrow; no syscall may widen one. `measured`/
     /// `measured_ok` carry the exec-time image digest the audit receipts
     /// quote (zeros for a process that was never exec-measured — the
     /// boot payload, kernel spawns).
-    words: u32 = word_baseline,
+    words: u32 = word_ambient,
     measured: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     measured_ok: bool = false,
     /// Claim 0826: the executor's EL1 exception stack (allocator-backed
@@ -446,7 +453,7 @@ fn reset_process(p: *Process) void {
     @memset(std.mem.asBytes(p), 0);
     p.addr_space.mmap_next_va = mmap_default_va;
     p.uid = uid_user;
-    p.words = word_baseline;
+    p.words = word_ambient;
     p.task_id = null;
     p.thread_tasks = @as([max_threads]?usize, @splat(@as(?usize, null)));
 }
@@ -928,7 +935,7 @@ pub fn principal(id: usize) ?Principal {
 /// `grant.decide`) plus the image digest the audit receipts quote.
 /// Called once at create by the exec loader; there is no setter path for
 /// EL0, and `mask` is clamped to the baseline so a stored mask can never
-/// exceed ambient authority.
+/// exceed the vocabulary ceiling.
 pub fn set_grant(id: usize, mask: u32, digest: [32]u8, measured_ok: bool) void {
     if (id >= max_processes or processes[id].state == .free) return;
     processes[id].words = mask & word_baseline;
@@ -937,10 +944,11 @@ pub fn set_grant(id: usize, mask: u32, digest: [32]u8, measured_ok: bool) void {
 }
 
 /// M113c (#2419, ADR 0054 D9): the word set the dispatch seam enforces —
-/// `word_baseline` for an invalid/free id (kernel-context callers carry
-/// no word mask and are never the EL0 principal the gate exists for).
+/// `word_ambient` for an invalid/free id (kernel-context callers carry
+/// no word mask and are never the EL0 principal the gate exists for;
+/// M116b: the fallback answers the floor, never the ceiling).
 pub fn word_mask(id: usize) u32 {
-    if (id >= max_processes or processes[id].state == .free) return word_baseline;
+    if (id >= max_processes or processes[id].state == .free) return word_ambient;
     return processes[id].words;
 }
 

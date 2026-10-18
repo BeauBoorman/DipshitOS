@@ -33,8 +33,9 @@
 //! `#v1[ key=value ...]` header + one `name<TAB>sha256|*<TAB>words` line
 //! per row; `words` is a comma-separated list (or `-`/empty for a row
 //! that narrows to nothing). The header's `mode=` field carries the
-//! enforcement posture: `mode=audit|enforce`, absent = `audit` (the
-//! arc's ship posture — D12). Fail-closed like `OWNERS.TXT`:
+//! enforcement posture: `mode=audit|enforce`, absent = `audit`
+//! (D12's standing contract — M116b lands `enforce` as the provisioned
+//! posture, not the boot default). Fail-closed like `OWNERS.TXT`:
 //!
 //!   - a malformed data line POISONS its name — the row acts as a
 //!     mismatched row (its binary refuses `grant_stale`), never silently
@@ -87,8 +88,9 @@ pub const file_max: usize = 32 + max_user_rows * (line_max + 1);
 
 // ---------------------------------------------------------------------------
 // The word vocabulary — the `caps=` words (ADR 0054 D9: one word = one
-// thing). `baseline` is every word set: today's ambient authority, so a
-// flags-off exec is byte-identical.
+// thing). `baseline` is every word set: the CEILING a row may express and
+// `set_grant`'s clamp — not what an unlisted binary carries. `ambient` is
+// that floor.
 // ---------------------------------------------------------------------------
 
 pub const word_file: u32 = 1 << 0;
@@ -103,13 +105,45 @@ pub const word_term: u32 = 1 << 8;
 pub const word_count: usize = 9;
 pub const baseline: u32 = (1 << word_count) - 1;
 
+/// M116b (#2468): the ambient word set — what a process no row names
+/// carries (D8's no-row floor, narrowed on the M113f audit data). Drops
+/// the words that cross the guest's trust boundary:
+///
+///   - `file`  — the host share: reads pick up host-side bytes, writes
+///               stage guest data where the host reads it back;
+///   - `audio` — virtio-snd drives playback AND capture since M118b —
+///               a microphone is an exfil/surveillance source;
+///   - `net`   — socket egress (the slot group plus the slot-80
+///               open-class ops).
+///
+/// Kept — and why:
+///
+///   - `debug`    — slots 0/1/3 are sys_ping/sys_write/sys_exit:
+///                  EXISTENCE verbs, not powers. A process that cannot
+///                  print or exit is not confined, it is stuck — the
+///                  M113f table shows every Go ELF calls them ambiently.
+///                  (The card's letter named `debug` for the drop; the
+///                  owner recorded this correction on #2468.)
+///   - `memory`/`process` — allocation and lifecycle; an exec'd child
+///                  carries the ambient set again, so spawning cannot
+///                  widen.
+///   - `timer`    — scheduling, no data crosses the boundary.
+///   - `window`/`term` — seat-local surfaces: paint and console attach
+///                  stay inside the boundary the seat already mediates.
+///
+/// Rows still express the whole vocabulary against `baseline` — a fleet
+/// or consented app's row keeps its `net`/`file`/`audio` words.
+pub const ambient: u32 = baseline & ~(word_file | word_audio | word_net);
+
 const vocab = [word_count][]const u8{ "file", "window", "audio", "timer", "memory", "process", "debug", "net", "term" };
 
 comptime {
-    // process.zig carries its own ambient constant (one-way dependency);
-    // a vocabulary change must land in both places.
+    // process.zig carries its own constants (one-way dependency); a
+    // vocabulary change must land in both places.
     if (baseline != process.word_baseline)
         @compileError("grant.baseline must equal process.word_baseline");
+    if (ambient != process.word_ambient)
+        @compileError("grant.ambient must equal process.word_ambient");
 }
 
 /// The word's display name by bit index (receipt `word=` field).
@@ -247,7 +281,11 @@ pub const OpenVerdict = union(enum) {
 // refuses nothing at the word seam; `enforce` makes a denied word an
 // honest EACCES. Parsed from the `#v1` header's `mode=` field; absent =
 // `audit` — the switch lives inside the secret-class file, off the
-/// EL0-writable surface.
+// EL0-writable surface. M116b (#2468) lands the enforce half: the
+// ambient floor is narrowed below, and a `mode=enforce` provisioned file
+// makes every denied word a named refusal. The absent-file posture stays
+// `audit` by owner decision — an unarmed boot keeps working; flipping
+// that default is its own later call.
 // ---------------------------------------------------------------------------
 
 pub const Mode = enum { audit, enforce };
@@ -386,18 +424,20 @@ comptime {
 var base_row_scratch: Row = .{};
 
 /// The exec verdict (ADR 0054 D8): apply a narrowed word set, refuse
-/// `grant_stale`, or take the baseline. `digest` is the measured
+/// `grant_stale`, or take the ambient floor. `digest` is the measured
 /// raw-file digest — null when the measurement itself failed (a named
 /// row is then unverifiable, which is fail-closed `stale`, never open).
 pub const Verdict = union(enum) {
-    baseline,
+    /// No row names this image — the ambient set applies (M116b: the
+    /// narrowed no-row floor, not the full vocabulary).
+    ambient,
     apply: u32,
     stale,
 };
 
 pub fn decide(name: []const u8, digest: ?*const [measure.digest_len]u8) Verdict {
     return switch (lookup(name)) {
-        .none => .baseline,
+        .none => .ambient,
         .poisoned => .stale,
         .row => |r| blk: {
             if (r.wildcard) break :blk .{ .apply = r.words & baseline };
@@ -865,7 +905,8 @@ var file_scratch: [file_max]u8 = undefined;
 /// file is absent, and a hand-seeded `OWNERS.TXT` row can only tighten),
 /// then read and parse it. Returns true only when a file was read and
 /// parsed; a default share (no file) is a silent no-op with an empty
-/// user table and `audit` posture — no boot line, boot-default unchanged.
+/// user table and `audit` posture — no boot line, boot-default
+/// unchanged (M116b: enforce arrives provisioned, `mode=enforce`).
 pub fn init_from_share() bool {
     init();
     if (!virtio_file.available()) return false;
@@ -1042,8 +1083,8 @@ test "grant: valid rows parse, match by hash, and narrow to the row's words" {
     try std.testing.expectEqual(Verdict{ .apply = word_file | word_net }, decide("gotop.elf", &da));
     // A wildcard row matches any digest but only narrows.
     try std.testing.expectEqual(Verdict{ .apply = word_file }, decide("CONFINED.ELF", &da));
-    // An unlisted binary takes the baseline.
-    try std.testing.expectEqual(Verdict.baseline, decide("OTHER.BIN", &da));
+    // An unlisted binary takes the ambient floor (M116b).
+    try std.testing.expectEqual(Verdict.ambient, decide("OTHER.BIN", &da));
     // Audit posture: no mode field -> audit.
     try std.testing.expect(!enforceMode());
 }
@@ -1073,7 +1114,7 @@ test "grant: unknown schema and bad header fields poison every listed name" {
     try std.testing.expectEqual(Verdict.stale, decide("FOO.ELF", &da));
     try std.testing.expectEqual(Verdict.stale, decide("BAR.ELF", &da));
     // The whole file is suspect — an UNLISTED name is not poisoned.
-    try std.testing.expectEqual(Verdict.baseline, decide("OTHER.BIN", &da));
+    try std.testing.expectEqual(Verdict.ambient, decide("OTHER.BIN", &da));
     // An unrecognized #v1 header field refuses the file the same way.
     init();
     _ = load("#v1 bogus=1\nFOO.ELF\t*\tnet\n");
@@ -1117,7 +1158,7 @@ test "grant: the table is bounded — ENOSPC, never silent eviction" {
     try std.testing.expectEqual(LoadResult.full, load(buf[0 .. pos + tail.len]));
     const da = hexDigest(sha_a);
     try std.testing.expectEqual(Verdict{ .apply = word_net }, decide("APP0.ELF", &da));
-    try std.testing.expectEqual(Verdict.baseline, decide("ONE.MORE", &da));
+    try std.testing.expectEqual(Verdict.ambient, decide("ONE.MORE", &da));
 }
 
 test "grant: word masks only narrow — no EL0 path widens past the baseline" {
@@ -1131,14 +1172,37 @@ test "grant: word masks only narrow — no EL0 path widens past the baseline" {
     for ([_][]const u8{ "A.ELF", "B.ELF", "UNLISTED.BIN" }) |name| {
         for ([_]?*const [measure.digest_len]u8{ &da, &db, null }) |d| {
             switch (decide(name, d)) {
-                .baseline => {},
+                .ambient => {},
                 .apply => |w| try std.testing.expect((w & ~baseline) == 0),
                 .stale => {},
             }
         }
     }
-    // The baseline itself is the full ambient vocabulary.
+    // The baseline itself remains the full vocabulary ceiling.
     try std.testing.expectEqual(@as(u32, 0x1ff), baseline);
+}
+
+test "grant: the ambient floor drops the boundary words, keeps existence (M116b)" {
+    init();
+    // The no-row floor: file/audio/net are row-only words now.
+    try std.testing.expectEqual(
+        baseline & ~(word_file | word_audio | word_net),
+        ambient,
+    );
+    // debug stays: sys_ping/sys_write/sys_exit are existence verbs —
+    // a process that cannot print or exit is stuck, not confined.
+    try std.testing.expect((ambient & word_debug) != 0);
+    try std.testing.expect((ambient & word_memory) != 0);
+    try std.testing.expect((ambient & word_process) != 0);
+    const da = hexDigest(sha_a);
+    try std.testing.expectEqual(Verdict.ambient, decide("UNLISTED.BIN", &da));
+    // A row still grants what ambient dropped — the floor is a floor,
+    // not a ceiling.
+    _ = load("#v1\nROWED.ELF\t*\tfile,net,audio\n");
+    try std.testing.expectEqual(
+        Verdict{ .apply = word_file | word_net | word_audio },
+        decide("ROWED.ELF", null),
+    );
 }
 
 test "grant: word -> slot-group map follows ADR 0054 D9" {
