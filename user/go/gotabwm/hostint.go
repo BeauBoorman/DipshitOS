@@ -91,23 +91,42 @@ func hostintSeatInit() {
 	hostClipBuf = make([]byte, clipKernelMax)
 }
 
+// The v2 hook vars (ADR 0051 V2-D7 — the shared seam): the dependent
+// cards bind them from their own files, and the nil default is exactly
+// the v1 behavior — an unbound NOTIFY_FOCUS consume refuses lane_disabled
+// and the outbox drive is a no-op.
+var (
+	// hostfocusConsume is M127c's NOTIFY_FOCUS route (hostfocus.go binds
+	// it): a verified click-through record asking the seat to focus a tab.
+	hostfocusConsume func(rec hostint.Record) string
+	// outboxTickFn is M127d's per-tick OUTBOX drive (hostoutbox.go binds
+	// it): the REQ-marker scan that turns app intents into signed emits.
+	outboxTickFn func()
+)
+
 // hostintConsume routes seat-inbound records to their lane — M108b owns
-// CLIP_IN (hostclip.go), M108c owns DROP (hostdrop.go). A tag with no
-// tenant is refused lane_disabled.
+// CLIP_IN (hostclip.go), M108c owns DROP (hostdrop.go), M127c owns
+// NOTIFY_FOCUS (hostfocus.go, bound through hostfocusConsume). A tag with
+// no tenant is refused lane_disabled.
 func hostintConsume(tag uint8, rec hostint.Record) string {
 	switch tag {
 	case hostint.TagClipIn:
 		return hostclipApply(rec)
 	case hostint.TagDrop:
 		return hostdropApply(rec)
+	case hostint.TagNotifyFocus:
+		if hostfocusConsume != nil {
+			return hostfocusConsume(rec)
+		}
 	}
 	return hostint.RefuseLaneDisabled
 }
 
 // hostintSeatTick is the per-composite-tick drive: consume what the lane
 // directory holds (adoption first), then produce what changed (the
-// clipboard lane's CLIP_OUT, M108b) and what the strip staged (the
-// notify-out lane's NOTIFY_OUT, M108d). ~1 Hz, bounded file ops.
+// clipboard lane's CLIP_OUT, M108b), what the strip staged (the notify-out
+// lane's NOTIFY_OUT, M108d) and what the OUTBOX markers request (M127d).
+// ~1 Hz, bounded file ops.
 func hostintSeatTick() {
 	if hostintEngine == nil {
 		return
@@ -115,4 +134,7 @@ func hostintSeatTick() {
 	hostintEngine.Poll()
 	hostclipPoll()
 	hostnotifyPoll()
+	if outboxTickFn != nil {
+		outboxTickFn()
+	}
 }

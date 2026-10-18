@@ -90,6 +90,8 @@ func chromeTick(scan []byte, ticks uint64) {
 	text := formatClock(face.h, face.m, face.s)
 	_ = paintChrome(scan, vi.ScanoutWidth, vi.ScanoutHeight, text)
 	_ = paintGodMenuButton(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	// M115d (#2463): the PWR button sits on the same band, right of Apps.
+	_ = paintPowerButton(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	if chromeLogged {
 		return
 	}

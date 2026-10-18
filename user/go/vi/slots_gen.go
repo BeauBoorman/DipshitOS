@@ -37,6 +37,9 @@ const (
 	SlotScanoutRead        uintptr = 88
 	SlotGrantAdmin         uintptr = 89
 	SlotGpucomp            uintptr = 90
+	SlotAudioRecInfo       uintptr = 91
+	SlotAudioRec           uintptr = 92
+	SlotVsockCtl           uintptr = 93
 )
 
 type SyscallArgKind uint8
@@ -162,9 +165,15 @@ var SyscallSlots = [...]SyscallSlot{
 	{SlotScanoutRead, "sys_scanout_read", 6, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotGrantAdmin, "sys_grant_admin", 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotGpucomp, "sys_gpucomp", 6, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotAudioRecInfo, "sys_audio_rec_info", 1, [6]SyscallArg{{Kind: ArgPtr}}},
+	{SlotAudioRec, "sys_audio_rec", 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotVsockCtl, "sys_vsock_ctl", 6, [6]SyscallArg{{Kind: ArgString, LengthArg: 1, LengthMask: ^uint64(0)}, {Kind: ArgInt}, {Kind: ArgString, LengthArg: 3, LengthMask: ^uint64(0)}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 }
 
 var SyscallVariants = [...]SyscallVariant{
+	{59, 0, 148283745894406, 2, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgPtr}}},
+	{60, 0, 148283745894406, 1, [6]SyscallArg{{Kind: ArgInt}}},
+	{80, 1, 148283745894406, 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}}},
 	{27, 3, 9223372036854775809, 4, [6]SyscallArg{{Kind: ArgString, LengthArg: 1, LengthMask: ^uint64(0)}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgFlags}}},
 	{27, 3, 9223372036854775810, 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgFlags}, {Kind: ArgInt}}},
 	{27, 3, 9223372036854775811, 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgFlags}}},

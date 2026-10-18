@@ -283,19 +283,16 @@ func errOf(r int64) Errno {
 
 // ----- path staging --------------------------------------------------------
 
-// virPathStaging is where every path is copied before the kernel validates
-// it (see the package comment). One buffer, no lock: VirelaiOS guest
-// processes are single-threaded for this surface today and a path copy is
-// finished before the syscall returns, so two goroutines can only race if
-// they are in Open simultaneously — which Go's own os layer serializes on
-// the file descriptor, not on this buffer. Named as a known constraint in
-// the port's card rather than papered over.
-var virPathStaging [virPathMax + 1]byte
-
-// stagedPath copies path into the staging buffer and returns its length.
-// It returns 0 for a path that cannot be passed: empty, longer than the
-// kernel's bound, or containing a NUL (which would truncate on the wire).
-func stagedPath(path string) int {
+// stagedPath copies path into staging and returns its length, or -1 for a
+// path that cannot be passed: empty, longer than the kernel's bound, or
+// containing a NUL (which would truncate on the wire). The buffer is the
+// CALLER's — a stack local at every call site — because issue #2495 proved
+// the alternative: the old package-global virPathStaging let two Ms
+// interleave a copy and an svc3 (cmd/compile's noder opens every source
+// file on its own goroutine under GOMAXPROCS=2), and the kernel then
+// validated a spliced path — opens returned ENOENT/EINVAL for names the
+// share held, or the WRONG existing file's bytes under the right name.
+func stagedPath(path string, staging *[virPathMax + 1]byte) int {
 	if len(path) == 0 || len(path) > virPathMax {
 		return -1
 	}
@@ -303,9 +300,9 @@ func stagedPath(path string) int {
 		if path[i] == 0 {
 			return -1
 		}
-		virPathStaging[i] = path[i]
+		staging[i] = path[i]
 	}
-	virPathStaging[len(path)] = 0
+	staging[len(path)] = 0
 	return len(path)
 }
 

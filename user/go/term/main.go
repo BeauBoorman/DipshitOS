@@ -563,6 +563,25 @@ func (g *termHost) Chmod(path string, mode uint16) error {
 	return nil
 }
 
+// Suspend is the guest-initiated power request (M115d, slot 93): the
+// kernel runs the whole authenticated ctl session under its uid_system
+// `vsock-ctl` credential — no key bytes cross the seam. The ok return
+// may land on the far side of a host save/restore.
+func (g *termHost) Suspend() (bool, string) {
+	var code [40]byte
+	r := vi.VsockCtl("suspend", "", code[:])
+	if r == 0 {
+		return true, ""
+	}
+	if r > 0 {
+		if r > int64(len(code)) {
+			r = int64(len(code))
+		}
+		return false, string(code[:r])
+	}
+	return false, vi.ErrnoName(r)
+}
+
 // SecretNames reads the caller's store entry NAMES (slot 70). The values are
 // deliberately not carried through this seam.
 func (g *termHost) SecretNames() ([]string, bool) {

@@ -161,11 +161,35 @@ pub const slots = [_]Slot{
     // CAP_PROC_ADMIN, and never the app the row names.
     row(89, "sys_grant_admin", .{ .int, .int, .ptr, .int }),
     row(90, "sys_gpucomp", .{ .int, .int, .int, .int, .ptr, .int }),
+    // M118c (#2481, ADR 0007 amendment): the capture half of the audio
+    // seam — slot 91 reports the observed input capability (the slot-42
+    // shape for the RX direction), slot 92 runs ONE bounded capture into
+    // the caller's buffer (virtio_snd.snd_capture, the v1 tuple
+    // S16/48kHz/mono, len capped by the 64 KiB ring).
+    row(91, "sys_audio_rec_info", .{.ptr}),
+    row(92, "sys_audio_rec", .{ .int, .int, .int, .ptr, .int }),
+    // M115d (#2463, ADR 0056 D5 + ADR 0007 amendment): slot 93 — the
+    // ONE EL0 door to the virelai-ctl/1 channel. The kernel keeps the
+    // uid_system credential and runs the whole authenticated session on
+    // the caller's behalf; EL0 names a verb (and an optional name arg)
+    // and gets the reply verdict back — no key ever crosses the seam.
+    row(93, "sys_vsock_ctl", .{ str(1), .int, str(3), .int, .ptr, .int }),
 };
 
 // op-dependent shapes override the base row. No pointed-to output or binary
 // payload is classified as text; redacted slots have no variants.
+//
+// M117c (#2475): the v6 marshal — `family_v6_tag` (148283745894406 =
+// 0x0000_86dd_0000_0006; decimal here because the slots_gen.go mirror's
+// regex parses `variant(...)` op values literally, and trailing comments
+// would break its row shape) occupies the argument the v4 form used for
+// the IP word, and the 16-byte literal arrives through the pointer arg.
+// The selector is the tag position (args[0] for ping send/poll, args[1]
+// for socket op 10).
 pub const variants = [_]Variant{
+    variant(59, 0, 148283745894406, .{ .int, .ptr }),
+    variant(60, 0, 148283745894406, .{.int}),
+    variant(80, 1, 148283745894406, .{ .int, .int, .int, .ptr }),
     variant(27, 3, 9223372036854775809, .{ str(1), .int, .int, .flags }),
     variant(27, 3, 9223372036854775810, .{ .int, .int, .ptr, .flags, .int }),
     variant(27, 3, 9223372036854775811, .{ .int, .int, .int, .flags }),

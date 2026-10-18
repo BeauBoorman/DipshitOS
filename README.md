@@ -135,6 +135,9 @@ Swift/Xcode command-line tools, and Python 3.
 Session options (set before `just session`):
 
 ```bash
+just session --save-capable        # virtio-fs share posture: suspend/snapshot armed
+just session --resume              # continue a suspended machine
+just session --no-host-int         # windowed desktop, host lanes off
 VIRELAI_SESSION_SHARE=/path/to/share just session
 VIRELAI_SESSION_NO_TABWM=1 just session
 VIRELAI_SESSION_NO_GOTABWM=1 just session

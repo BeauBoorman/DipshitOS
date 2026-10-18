@@ -88,6 +88,10 @@ const (
 	markerDownload  = "web: download "
 	markerBudget    = "web: budget "
 	markerOver      = "web: budget over "
+	markerHistOpen  = "web: history n="
+	markerHistRow   = "web: history "
+	markerHistPick  = "web: history pick "
+	markerReload    = "web: reload"
 	markerSettled   = "web: settled"
 	markerQuit      = "web: quit"
 	// The typography probes. They carry measurable facts (engine name,
@@ -138,6 +142,8 @@ const (
 	keyD        = 0x07
 	keyK        = 0x0e
 	keyS        = 0x16
+	keyH        = 0x0b
+	keyReturn   = 0x28
 )
 
 type app struct {
@@ -217,6 +223,8 @@ type app struct {
 	nativePix        []uint32
 	urlEditing       bool
 	urlEdit          textEditor
+	histOpen         bool
+	histSel          int
 	controls         []*formControl
 	focusControl     *formControl
 	controlEdit      textEditor
@@ -545,7 +553,7 @@ func (a *app) showStartSurface() {
 	a.pageEnd = a.tNav0 + readDeadlineMs*1_000_000
 	body := []byte("<h1>VirelaiOS Browser</h1><p>No target. Pass a path or an HTTP URL on the command line:</p>" +
 		"<pre>exec WEB.ELF /host/PAGE.HTML\nexec WEB.ELF http://10.0.0.2/</pre>" +
-		"<p>Ctrl+L edits the URL. Enter loads it. Escape cancels. F1 shows bounded diagnostics.</p>" +
+		"<p>Ctrl+L edits the URL. Enter loads it. Escape cancels. H or the v chip lists history. F1 shows bounded diagnostics.</p>" +
 		"<p>This browser supports a declared CSS subset and GET forms. No JavaScript or POST.</p>")
 	a.target = ""
 	a.title = "Start"
@@ -556,6 +564,7 @@ func (a *app) navigate(target, from string) {
 	if from != "history-back" && from != "history-forward" {
 		a.historyMove = false // a replacement navigation is a fresh visit
 	}
+	a.histOpen = false // a navigation always dismisses the history menu
 	if a.anchor(target) {
 		return
 	}
@@ -1062,6 +1071,8 @@ func (a *app) key(usage uint32, flags uint16) {
 		}
 	case keyR, keyF5:
 		a.reload()
+	case keyH:
+		a.toggleHistoryMenu()
 	case keyUp:
 		a.scrollBy(-40)
 	case keyDown:
@@ -1090,19 +1101,49 @@ func (a *app) key(usage uint32, flags uint16) {
 }
 
 func (a *app) click(x, y int) {
+	w, h := a.canvasSize()
 	switch {
 	case inRect(x, y, backX, backY, chipW, chipH):
+		a.histOpen = false
 		a.goBack()
 		return
 	case inRect(x, y, fwdX, backY, chipW, chipH):
+		a.histOpen = false
 		a.goForward()
 		return
 	case inRect(x, y, reloadX, backY, chipW, chipH):
-		a.reload()
+		a.histOpen = false
+		// The reload chip doubles as the stop chip while a load is in
+		// flight — the usual browser affordance.
+		if a.loading {
+			a.cancelLoad()
+		} else {
+			a.reload()
+		}
+		return
+	case inRect(x, y, actX(w), backY, chipW, chipH):
+		if a.urlEditing {
+			a.submitURL()
+		} else {
+			a.toggleHistoryMenu()
+		}
 		return
 	}
-	w, h := a.canvasSize()
-	if inRect(x, y, urlX, urlY, max(0, w-urlX-8), urlH) {
+	fieldHit := inRect(x, y, urlX, urlY, max(0, actX(w)-urlX-4), urlH)
+	if a.histOpen {
+		if i, ok := a.histMenuHit(x, y); ok {
+			a.pickHistory(i)
+			return
+		}
+		a.histOpen = false
+		if !fieldHit {
+			// A click outside chrome while the menu is open only
+			// dismisses it — it must not fall through to a page link.
+			a.dirty = true
+			return
+		}
+	}
+	if fieldHit {
 		a.focusURL()
 		return
 	}
@@ -1128,6 +1169,13 @@ func (a *app) click(x, y int) {
 }
 
 func (a *app) move(x, y int) {
+	if a.histOpen {
+		if i, ok := a.histMenuHit(x, y); ok && i != a.histSel {
+			a.histSel = i
+			a.dirty = true
+		}
+		return
+	}
 	if a.lay == nil {
 		if a.hover != "" {
 			a.hover = ""
@@ -1195,6 +1243,7 @@ func (a *app) reload() {
 		return
 	}
 	a.status = "reloading"
+	vi.ConsoleLine(markerReload + " " + a.target)
 	a.navigate(a.target, "")
 }
 
@@ -1240,9 +1289,24 @@ func (a *app) render() {
 	}
 	webrender.DrawText(vs, backX+3, backY+3, "<", 1, false, chevBack, clip)
 	webrender.DrawText(vs, fwdX+3, backY+3, ">", 1, false, chevFwd, clip)
-	webrender.DrawText(vs, reloadX+3, backY+3, "R", 1, false, webrender.ColorChromeInk, clip)
+	// Reload is the stop chip while a load is in flight.
+	reloadGlyph := "R"
+	if a.loading {
+		reloadGlyph = "X"
+	}
+	webrender.DrawText(vs, reloadX+3, backY+3, reloadGlyph, 1, false, webrender.ColorChromeInk, clip)
+	// The right-edge action chip: ">" submits the field while the URL edits,
+	// "v" opens the history dropdown otherwise.
+	actGlyph, actInk := "v", webrender.ColorMuted
+	switch {
+	case a.urlEditing:
+		actGlyph, actInk = ">", webrender.ColorAccent
+	case a.histOpen || a.hist.len() > 0:
+		actInk = webrender.ColorChromeInk
+	}
+	webrender.DrawText(vs, actX(width)+3, backY+3, actGlyph, 1, false, actInk, clip)
 
-	addressWidth := max(0, width-urlX-8)
+	addressWidth := max(0, actX(width)-urlX-4)
 	rect(urlX, urlY, addressWidth, urlH, webrender.ColorSurface)
 	rect(urlX, urlY, addressWidth, 1, webrender.ColorRule)
 	shown := a.target
@@ -1274,6 +1338,9 @@ func (a *app) render() {
 		}
 	}
 	a.sampleFrame(vs, present)
+	if a.histOpen {
+		a.paintHistoryMenu(vs, clip, width)
+	}
 	vi.ConsoleLine("web: viewport css=1280x720 x=" + itoa(present.X) +
 		" y=" + itoa(present.Y) + " w=" + itoa(present.W) + " h=" + itoa(present.H) + " s=" + itoa(a.scroll))
 
@@ -1337,7 +1404,7 @@ func (a *app) paintErrorPage(vs virender) {
 	y += 18
 	webrender.DrawText(vs, 12, y, "kind: "+a.errKind, 1, false, webrender.ColorMuted, clip)
 	y += 24
-	webrender.DrawText(vs, 12, y, "Ctrl+L URL  R reload  < back  > forward  Esc stop  Q quit", 1, false, webrender.ColorMuted, clip)
+	webrender.DrawText(vs, 12, y, "Ctrl+L URL  R reload  < back  > forward  H history  Esc stop  Q quit", 1, false, webrender.ColorMuted, clip)
 }
 
 func (a *app) describeTarget() string {

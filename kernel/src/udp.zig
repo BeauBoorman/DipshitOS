@@ -6,6 +6,14 @@
 //! checksum/fragment/dst checks stay in ipv4, never duplicated) and
 //! `virtio_net.zig`'s `net_udp_send` drives the transmit side (the N1
 //! one-request-at-a-time TX path) + the loopback path.
+//! M117c (#2475, ADR 0057 D8): the same datagrams over IPv6 — the v6
+//! pseudo-header (16-byte addrs, 32-bit length, next-header 17) via
+//! `ipv6.icmp6_checksum`, a `handle_rx6` demux leaf off `ipv6.zig`'s
+//! terminal next-header dispatch, and `build_frame6` for
+//! `virtio_net.net_udp6_send`. The listen table is family-tagged: an
+//! EL0/`net udp` bind is v4, a `net udp6 listen` bind is v6, and a
+//! datagram only ever lands in a listener of its own family — so the
+//! v4-only slot-10/84/85 EL0 marshal never sees a v6 datagram.
 //!
 //! Honest bounds: IPv4 only, UDP only (no TCP — later), the checksum is
 //! computed ALWAYS (the RFC 768 IPv4 "may be zero" escape is not used —
@@ -14,10 +22,14 @@
 //! NO listener are DROPPED, each with its own counter. The N5 guest
 //! RECEIVES and SENDS — it does not ANSWER UDP (the host answers,
 //! `--net-udp-respond`); a later card can add guest-side responders.
+//! v6's bound is tighter still: the checksum is MANDATORY inbound (a
+//! zero checksum field is a counted drop — RFC 8200 §8.1) and the dst
+//! must be an OWNED v6 address (no multicast delivery in this arc).
 
 const std = @import("std");
 const arp = @import("arp.zig"); // N3: our static IP (`arp.own_ip` — the ONE copy)
 const dhcp = @import("dhcp.zig"); // N8 (claim 0351): the DHCP client owns port 68
+const ipv6 = @import("ipv6.zig"); // M117c (#2475): the v6 Addr type + pseudo-header checksum
 
 pub const eth_hdr_len: usize = 14; // the same values as ipv4.zig (constants only — no circular import)
 pub const ipv4_hdr_len: usize = 20;
@@ -39,6 +51,11 @@ pub const recv_from_max: usize = 4 + datagram_max; // 524
 pub const frame_min: usize = eth_hdr_len + ipv4_hdr_len + udp_hdr_len; // 42
 /// The largest full frame: Ethernet + IPv4 + header + the bounded payload.
 pub const frame_max: usize = eth_hdr_len + ipv4_hdr_len + udp_hdr_len + payload_max; // 554
+/// M117c: the largest v6 frame — Ethernet + the 40-byte fixed v6 header +
+/// header + the bounded payload (a 512-byte payload fits the 1280-byte
+/// minimum-MTU envelope, so no PMTUD machinery is needed — D6).
+pub const ipv6_hdr_len: usize = 40;
+pub const frame6_max: usize = eth_hdr_len + ipv6_hdr_len + udp_hdr_len + payload_max; // 574
 /// Bounded listen table (the ARP-table pattern: 4 slots, pure BSS).
 pub const listen_slots: usize = 4;
 /// Bounded datagram buffer PER listener (drop-oldest, the N2 FIFO pattern).
@@ -57,6 +74,15 @@ pub var dropped_len: u64 = 0; // length < 8 or exceeding the frame's remaining b
 /// M99i (#2187): listen-table seats reclaimed from exited owners by the
 /// syscall layer (a program that exits without sys_udp_close).
 pub var stale_reclaimed: u64 = 0;
+// M117c (#2475): the v6 counters — separate from the v4 set so the `net`
+// report's ` udp6=` fragment names the family's own traffic (the v4 rows
+// stay byte-identical for a guest that never sees 0x86dd).
+pub var received6: u64 = 0; // v6 datagrams delivered into a v6 listener's buffer
+pub var sent6: u64 = 0; // `net udp6 send` datagrams (device TX)
+pub var dropped6_len: u64 = 0; // length < 8 or exceeding the v6 payload
+pub var dropped6_badsum: u64 = 0; // zero or mismatching v6 pseudo-header checksum
+pub var dropped6_closed: u64 = 0; // v6 datagram for a port with NO v6 listener
+pub var dropped6_dst: u64 = 0; // dst not an owned v6 address
 
 // ---------------------------------------------------------------------------
 // State (pure BSS, the fat.zig pattern)
@@ -72,6 +98,11 @@ pub const ListenEntry = struct {
     port: u16 = 0,
     /// M99i: owner pid of the binding process (`unowned` for kernel binds).
     owner: u64 = unowned,
+    /// M117c (#2475): the bind family — `sys_udp_listen`/`net udp listen`
+    /// bind v4, `net udp6 listen` binds v6. A datagram only lands in a
+    /// listener of its own family, so the v4-only EL0 marshal (slots
+    /// 10/84/85) can never observe a v6 datagram.
+    v6: bool = false,
     valid: bool = false,
 };
 
@@ -81,6 +112,11 @@ pub const Datagram = struct {
     /// slot-85 recv-from shape prepends it so a resolver can check the
     /// reply came from the server it asked.
     src_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    /// M117c: the sender's v6 address (valid only when `is6`). v6
+    /// datagrams never reach the v4 recv_from marshal — their listeners
+    /// are family-tagged — so `src_ip` stays the EL0 shape.
+    src6: ipv6.Addr = @splat(0),
+    is6: bool = false,
     bytes: [datagram_max]u8 = undefined,
 };
 
@@ -175,12 +211,23 @@ pub fn listen_port(port: u16) bool {
 /// `unowned` for kernel callers). Duplicate port or full table → false,
 /// the same honest bool `listen_port` always returned.
 pub fn listen_port_owned(port: u16, owner: u64) bool {
+    return listen_family(port, owner, false);
+}
+
+/// M117c (#2475): bind `port` as a v6 listener (the `net udp6 listen`
+/// path — kernel-owned, never EL0). A port may hold ONE bind per family;
+/// a same-family duplicate or a full table is refused.
+pub fn listen_port6(port: u16) bool {
+    return listen_family(port, unowned, true);
+}
+
+fn listen_family(port: u16, owner: u64, v6: bool) bool {
     for (&listen) |*e| {
-        if (e.valid and e.port == port) return false; // duplicate
+        if (e.valid and e.port == port and e.v6 == v6) return false; // duplicate
     }
     for (&listen) |*e| {
         if (!e.valid) {
-            e.* = .{ .port = port, .owner = owner, .valid = true };
+            e.* = .{ .port = port, .owner = owner, .v6 = v6, .valid = true };
             return true;
         }
     }
@@ -228,8 +275,17 @@ pub fn release_owner(owner: u64) usize {
 }
 
 pub fn close_port(port: u16) bool {
+    return close_family(port, false);
+}
+
+/// M117c: the v6 half of `close_port` (`net udp6 close`).
+pub fn close_port6(port: u16) bool {
+    return close_family(port, true);
+}
+
+fn close_family(port: u16, v6: bool) bool {
     for (&listen, 0..) |*e, i| {
-        if (e.valid and e.port == port) {
+        if (e.valid and e.port == port and e.v6 == v6) {
             e.valid = false;
             buf_head[i] = 0; // the listener's ring is drained with it
             buf_count[i] = 0;
@@ -240,8 +296,14 @@ pub fn close_port(port: u16) bool {
 }
 
 fn find_listener(port: u16) ?usize {
+    return find_listener_family(port, false);
+}
+
+/// The (port, family) seat — the v4 callers keep their port-only shape;
+/// v6 delivery/binds match on `e.v6` too (M117c).
+fn find_listener_family(port: u16, v6: bool) ?usize {
     for (listen, 0..) |e, i| {
-        if (e.valid and e.port == port) return i;
+        if (e.valid and e.port == port and e.v6 == v6) return i;
     }
     return null;
 }
@@ -259,6 +321,12 @@ pub fn reset() void {
     dropped_badsum = 0;
     dropped_closed = 0;
     dropped_len = 0;
+    received6 = 0;
+    sent6 = 0;
+    dropped6_len = 0;
+    dropped6_badsum = 0;
+    dropped6_closed = 0;
+    dropped6_dst = 0;
 }
 
 /// Deliver `datagram` (header + payload) from `src_ip` to the listener
@@ -277,6 +345,8 @@ pub fn deliver(dst_port: u16, src_ip: [4]u8, datagram: []const u8) void {
     const d = &buffers[slot][idx];
     d.len = @min(datagram.len, datagram_max);
     d.src_ip = src_ip;
+    d.src6 = @splat(0);
+    d.is6 = false; // a reused slot may have held a v6 datagram
     @memcpy(d.bytes[0..d.len], datagram[0..d.len]);
     if (count < buffer_slots) {
         buf_count[slot] = count + 1;
@@ -284,6 +354,34 @@ pub fn deliver(dst_port: u16, src_ip: [4]u8, datagram: []const u8) void {
         buf_head[slot] = (head + 1) % buffer_slots; // drop-oldest
     }
     received += 1;
+}
+
+/// M117c (#2475): the v6 half of `deliver` — the caller's slice is the
+/// datagram PAYLOAD (no EL0 marshal parses a v6 transport header, so
+/// the record is payload-only where v4 keeps the header; `net udp6
+/// recv` prints `len=` + the payload bytes). A v6 datagram lands only
+/// in a listener of its own family; a port with no v6 listener is
+/// dropped `dropped6_closed`, counted.
+pub fn deliver6(dst_port: u16, src6: ipv6.Addr, datagram: []const u8) void {
+    const slot = find_listener_family(dst_port, true) orelse {
+        dropped6_closed += 1;
+        return;
+    };
+    const head = buf_head[slot];
+    const count = buf_count[slot];
+    const idx = (head + count) % buffer_slots;
+    const d = &buffers[slot][idx];
+    d.len = @min(datagram.len, datagram_max);
+    d.src_ip = .{ 0, 0, 0, 0 };
+    d.src6 = src6;
+    d.is6 = true;
+    @memcpy(d.bytes[0..d.len], datagram[0..d.len]);
+    if (count < buffer_slots) {
+        buf_count[slot] = count + 1;
+    } else {
+        buf_head[slot] = (head + 1) % buffer_slots; // drop-oldest
+    }
+    received6 += 1;
 }
 
 /// True when the listen table has an entry for `port` (the syscall recv
@@ -306,6 +404,17 @@ pub fn peek(port: u16) ?Datagram {
 /// Pop the oldest datagram for the listener on `port` (null when empty).
 pub fn pop(port: u16) ?Datagram {
     const slot = find_listener(port) orelse return null;
+    if (buf_count[slot] == 0) return null;
+    const idx = buf_head[slot];
+    buf_head[slot] = (idx + 1) % buffer_slots;
+    buf_count[slot] -= 1;
+    return buffers[slot][idx];
+}
+
+/// M117c: pop the oldest datagram for the V6 listener on `port`
+/// (`net udp6 recv`; null when empty or not v6-listening).
+pub fn pop6(port: u16) ?Datagram {
+    const slot = find_listener_family(port, true) orelse return null;
     if (buf_count[slot] == 0) return null;
     const idx = buf_head[slot];
     buf_head[slot] = (idx + 1) % buffer_slots;
@@ -364,6 +473,89 @@ pub fn handle_rx(frame: []const u8) void {
         return;
     }
     deliver(dst_port, src, datagram);
+}
+
+// ---------------------------------------------------------------------------
+// M117c (#2475, ADR 0057 D8): UDP over IPv6 — the v6 pseudo-header checksum
+// + the demux leaf + the frame builder. The v4 paths above are untouched.
+// ---------------------------------------------------------------------------
+
+/// The UDP checksum over the v6 pseudo-header (16-byte src + dst, the
+/// 32-bit upper-layer length, next-header 17) + the datagram — the
+/// `ipv6.icmp6_checksum` machinery parameterized to UDP. Inbound v6 has
+/// NO zero-checksum escape (RFC 8200 §8.1 — a zero field is a drop).
+pub fn checksum_udp6(src: *const ipv6.Addr, dst: *const ipv6.Addr, datagram: []const u8) u16 {
+    return ipv6.icmp6_checksum(src, dst, datagram, ipv6.nexthdr_udp);
+}
+
+/// Process one frame that `ipv6.zig`'s terminal-dispatch identified as
+/// v6/UDP (registered as `ipv6.udp6_rx` by the drain — the `table_rx`
+/// delegate shape; ipv6 already validated the fixed header: version,
+/// payload_len coverage, hop_limit ≠ 0). The frame still starts at the
+/// Ethernet header. Delivers to the v6 listener for the dst port, or
+/// drops counted. The dst must be an OWNED address — the guest does not
+/// accept multicast-addressed UDP in this arc.
+pub fn handle_rx6(frame: []const u8) void {
+    if (ipv6.ethertype(frame) != ipv6.ethertype_ipv6 or ipv6.next_header(frame) != ipv6.nexthdr_udp) return; // not ours
+    if (frame.len < eth_hdr_len + ipv6_hdr_len + udp_hdr_len) {
+        dropped6_len += 1;
+        return;
+    }
+    const plen = ipv6.payload_len(frame);
+    const udp_len = (@as(u16, frame[58]) << 8) | frame[59];
+    if (udp_len < udp_hdr_len or udp_len > plen or frame.len < eth_hdr_len + ipv6_hdr_len + udp_len) {
+        dropped6_len += 1;
+        return;
+    }
+    const dst = ipv6.dst_addr(frame);
+    if (!ipv6.is_owned(&dst)) {
+        dropped6_dst += 1;
+        return;
+    }
+    const src = ipv6.src_addr(frame);
+    const datagram = frame[eth_hdr_len + ipv6_hdr_len .. eth_hdr_len + ipv6_hdr_len + udp_len];
+    // v6 has no zero-checksum escape: a zero field is a drop, and a
+    // nonzero field must verify (the pseudo-header binds src/dst).
+    if (std.mem.readInt(u16, datagram[6..8], .big) == 0 or checksum_udp6(&src, &dst, datagram) != 0x0000) {
+        dropped6_badsum += 1;
+        return;
+    }
+    const dst_port = (@as(u16, frame[56]) << 8) | frame[57];
+    deliver6(dst_port, src, datagram[udp_hdr_len..]); // the record is payload-only (v6 has no EL0 marshal)
+}
+
+/// Build a UDP datagram (header + payload) into `buf` for the v6
+/// pseudo-header pair `src6`/`dst6` — the `build_datagram` shape with
+/// the mandatory v6 checksum. Returns the datagram length.
+pub fn build_datagram6(buf: []u8, src6: *const ipv6.Addr, dst6: *const ipv6.Addr, src_port: u16, dst_port: u16, payload: []const u8) usize {
+    const plen = @min(payload.len, payload_max);
+    const total = udp_hdr_len + plen;
+    @memset(buf[0..total], 0);
+    buf[0] = @truncate(src_port >> 8);
+    buf[1] = @truncate(src_port);
+    buf[2] = @truncate(dst_port >> 8);
+    buf[3] = @truncate(dst_port);
+    buf[4] = @truncate(total >> 8);
+    buf[5] = @truncate(total);
+    @memcpy(buf[8..total], payload[0..plen]);
+    const c = checksum_udp6(src6, dst6, buf[0..total]);
+    buf[6] = @truncate(c >> 8);
+    buf[7] = @truncate(c);
+    return total;
+}
+
+/// Build the FULL Ethernet + IPv6 + UDP frame (the `build_frame` v6
+/// half): dst = the NEXT HOP's learned MAC (the peer on-link, the
+/// router off-link — the caller resolved it), ethertype 0x86dd, the
+/// 40-byte fixed header (version 6, payload_len, next-header 17, hop
+/// 64), then the datagram. `buf` must hold >= `frame6_max`. Returns the
+/// frame length (62 + the written payload).
+pub fn build_frame6(buf: []u8, dst_mac: [6]u8, own_mac: *const [6]u8, src6: *const ipv6.Addr, dst6: *const ipv6.Addr, src_port: u16, dst_port: u16, payload: []const u8) usize {
+    const plen = @min(payload.len, payload_max);
+    const frame_len = eth_hdr_len + ipv6_hdr_len + udp_hdr_len + plen;
+    ipv6.build_hdr(buf, &dst_mac, own_mac, src6, dst6, ipv6.nexthdr_udp, ipv6.hop_default, @intCast(udp_hdr_len + plen));
+    _ = build_datagram6(buf[eth_hdr_len + ipv6_hdr_len .. frame_len], src6, dst6, src_port, dst_port, payload[0..plen]);
+    return frame_len;
 }
 
 /// Build a FULL Ethernet + IPv4 + UDP frame with EXPLICIT dst/src
@@ -710,4 +902,118 @@ test "udp: deliver keeps the sender's IPv4 address for the recv-from shape" {
     deliver(49200, .{ 10, 0, 0, 9 }, &over);
     const d3 = pop(49200).?;
     try std.testing.expectEqual(datagram_max, d3.len);
+}
+
+// ---------------------------------------------------------------------------
+// M117c (#2475, ADR 0057): the v6 host tests — the pseudo-header checksum,
+// the frame builder's byte shape, the family demux, the mandatory
+// nonzero-checksum drop, and the owned-dst gate.
+// ---------------------------------------------------------------------------
+
+const test_g6_guest = ipv6.Addr{ 0x20, 0x01, 0x0d, 0xb8, 0, 0x64, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x01 };
+const test_g6_peer = ipv6.Addr{ 0x20, 0x01, 0x0d, 0xb8, 0, 0x64, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x02 };
+const test_mac_guest = [6]u8{ 0x02, 0, 0, 0, 0, 0x01 };
+const test_mac_peer = [6]u8{ 0x02, 0, 0, 0, 0, 0x02 };
+
+// Arm the guest's v6 address set the minimal way (is_owned reads the
+// pub state, same as the module's own tests).
+fn arm_v6() void {
+    ipv6.global = test_g6_guest;
+    ipv6.global_state = .valid;
+}
+fn disarm_v6() void {
+    ipv6.global = @splat(0);
+    ipv6.global_state = .none;
+}
+
+test "udp6: checksum_udp6 verifies a built datagram and rejects a mutated one" {
+    var dg: [12]u8 = undefined;
+    _ = build_datagram6(&dg, &test_g6_guest, &test_g6_peer, 7000, 9999, &.{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(@as(u16, 0x0000), checksum_udp6(&test_g6_guest, &test_g6_peer, &dg));
+    var bad = dg;
+    bad[8] ^= 0xff;
+    try std.testing.expect(checksum_udp6(&test_g6_guest, &test_g6_peer, &bad) != 0x0000);
+    // The checksum field is never zero (v6 has no zero-checksum escape).
+    try std.testing.expect(dg[6] != 0 or dg[7] != 0);
+    // A different address binds the checksum (the pseudo-header) — note
+    // a src/dst SWAP provably does NOT: the one's-complement sum is
+    // commutative over the 32 pseudo-header bytes, so the check pins a
+    // genuinely different endpoint, not the swapped pair.
+    const other = ipv6.Addr{ 0x20, 0x01, 0x0d, 0xb8, 0, 0x64, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x99 };
+    try std.testing.expect(checksum_udp6(&test_g6_guest, &other, &dg) != 0x0000);
+}
+
+test "udp6: build_frame6 is byte-exact — 0x86dd, nh=17, the 40-byte header" {
+    var frame: [frame6_max]u8 = undefined;
+    const n = build_frame6(&frame, test_mac_peer, &test_mac_guest, &test_g6_guest, &test_g6_peer, 7000, 5555, &.{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(@as(usize, 66), n); // 14 + 40 + 8 + 4
+    try std.testing.expectEqualSlices(u8, &test_mac_peer, frame[0..6]);
+    try std.testing.expectEqualSlices(u8, &test_mac_guest, frame[6..12]);
+    try std.testing.expectEqual(@as(u8, 0x86), frame[12]);
+    try std.testing.expectEqual(@as(u8, 0xdd), frame[13]);
+    try std.testing.expectEqual(@as(u8, 0x60), frame[14]); // version 6
+    try std.testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, frame[18..20], .big)); // payload_len
+    try std.testing.expectEqual(@as(u8, 17), frame[20]); // nh UDP
+    try std.testing.expectEqual(@as(u8, 64), frame[21]); // hop
+    try std.testing.expectEqualSlices(u8, &test_g6_guest, frame[22..38]);
+    try std.testing.expectEqualSlices(u8, &test_g6_peer, frame[38..54]);
+    try std.testing.expectEqual(@as(u16, 7000), std.mem.readInt(u16, frame[54..56], .big));
+    try std.testing.expectEqual(@as(u16, 5555), std.mem.readInt(u16, frame[56..58], .big));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, frame[62..66]);
+}
+
+test "udp6: handle_rx6 — the family demux, checksum gate, and dst gate" {
+    reset();
+    defer {
+        reset();
+        disarm_v6();
+    }
+    arm_v6();
+    // A v6 listener on 7000 and a v4 listener on 7001 — the datagram's
+    // family picks the listener, never the bare port.
+    try std.testing.expect(listen_port6(7000));
+    try std.testing.expect(listen_port(7001));
+
+    // A valid inbound datagram to our g6 dst lands on the v6 listener.
+    var frame: [frame6_max]u8 = undefined;
+    const n = build_frame6(&frame, test_mac_guest, &test_mac_peer, &test_g6_peer, &test_g6_guest, 9000, 7000, &.{ 0xaa, 0xbb });
+    handle_rx6(frame[0..n]);
+    const d = pop6(7000).?;
+    try std.testing.expectEqual(@as(usize, 2), d.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, d.bytes[0..2]);
+    try std.testing.expectEqualSlices(u8, &test_g6_peer, &d.src6);
+    try std.testing.expect(d.is6);
+    try std.testing.expectEqual(@as(u64, 1), received6);
+    // The v4 listener on the same span never saw it.
+    try std.testing.expect(pop(7001) == null);
+
+    // A v6 datagram to a v4-only port is a counted closed drop.
+    const n2 = build_frame6(&frame, test_mac_guest, &test_mac_peer, &test_g6_peer, &test_g6_guest, 9000, 7001, &.{1});
+    handle_rx6(frame[0..n2]);
+    try std.testing.expectEqual(@as(u64, 1), dropped6_closed);
+
+    // A zero UDP checksum is a drop (no v4-style escape).
+    var zframe: [frame6_max]u8 = undefined;
+    @memcpy(zframe[0..n2], frame[0..n2]);
+    zframe[60] = 0;
+    zframe[61] = 0;
+    handle_rx6(zframe[0..n2]);
+    try std.testing.expectEqual(@as(u64, 1), dropped6_badsum);
+
+    // A corrupted payload fails the pseudo-header checksum.
+    var badframe: [frame6_max]u8 = undefined;
+    @memcpy(badframe[0..n2], frame[0..n2]);
+    badframe[62] ^= 0xff;
+    handle_rx6(badframe[0..n2]);
+    try std.testing.expectEqual(@as(u64, 2), dropped6_badsum);
+
+    // A datagram for an address we do not own is a counted dst drop.
+    const foreign = ipv6.Addr{ 0x20, 0x01, 0x0d, 0xb8, 0, 0x64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99 };
+    const n3 = build_frame6(&frame, test_mac_guest, &test_mac_peer, &test_g6_peer, &foreign, 9000, 7000, &.{1});
+    handle_rx6(frame[0..n3]);
+    try std.testing.expectEqual(@as(u64, 1), dropped6_dst);
+
+    // A short frame is a counted length drop.
+    handle_rx6(frame[0 .. eth_hdr_len + ipv6_hdr_len]);
+    try std.testing.expectEqual(@as(u64, 1), dropped6_len);
 }

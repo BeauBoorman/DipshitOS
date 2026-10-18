@@ -54,6 +54,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const klog = @import("klog.zig");
 const mmio = @import("mmio.zig");
 const mmu = @import("mmu.zig");
 const pci = @import("pci.zig");
@@ -201,6 +202,17 @@ var tx_last_used: u16 = 0;
 pub var tx_armed: bool = false;
 pub var tx_queue_notify_off: u16 = 0; // queue 2 notify offset (observed)
 
+// Queue 3 = stream RX / capture (M118b, virtio-snd §4: 0=control, 1=event,
+// 2=tx, 3=rx). Armed unconditionally like queue 2 — the capture path
+// refuses by name when it isn't there.
+pub var rx_desc: [pcm.tx_descriptors]VirtqDesc align(64) = undefined;
+pub var rx_avail: VirtqAvail align(64) = undefined;
+pub var rx_used: VirtqUsed align(64) = undefined;
+var rx_last_used: u16 = 0;
+pub var rx_armed: bool = false;
+pub var rx_queue_notify_off: u16 = 0; // queue 3 notify offset
+pub const rx_queue_size: u16 = queue_size;
+
 /// Transport state. Discovery/setup run pre-exit; the re-arm runs post-MMU.
 pub var snd_dev: u32 = 0; // sound device PCI device number
 pub var snd_ready: bool = false; // transport initialized (control queue armed)
@@ -317,11 +329,13 @@ pub fn snd_cfg() ?struct { jacks: u32, streams: u32, chmaps: u32 } {
 /// the queue setup runs again after the MMU switch. Common-config MMIO
 /// writes work post-exit through the mapped Device window; PCI config-space
 /// reads must stay pre-exit (claim 0013). Unconditional and idempotent.
-/// Arms queue 0 (control) and queue 2 (stream-0 TX / playback — A2).
+/// Arms queue 0 (control), queue 2 (stream-0 TX / playback — A2) and queue
+/// 3 (stream-0 RX / capture — M118b).
 pub fn snd_rearm() bool {
     snd_ready = false;
     ctrl_armed = false;
     tx_armed = false;
+    rx_armed = false;
     beep_format = 0xff;
     if (snd_common == 0) return false;
     vp_write8(0x14, 0); // reset
@@ -337,9 +351,11 @@ pub fn snd_rearm() bool {
 
     ctrl_armed = arm_queue(0, &ctrl_desc, &ctrl_avail, &ctrl_used, &ctrl_last_used, &snd_queue_notify_off);
     tx_armed = arm_queue(2, &tx_desc, &tx_avail, &tx_used, &tx_last_used, &tx_queue_notify_off);
+    rx_armed = arm_queue(3, &rx_desc, &rx_avail, &rx_used, &rx_last_used, &rx_queue_notify_off);
 
     vp_write8(0x14, 1 | 2 | 8 | 4); // DRIVER_OK
     if ((vp_read8(0x14) & 4) == 0) return false;
+    // The RX queue's absence never gates playback — capture refuses by name.
     snd_ready = ctrl_armed and tx_armed;
     evidence.dump_str("VS rearm st=");
     evidence.dump_hex(vp_read8(0x14));
@@ -347,7 +363,14 @@ pub fn snd_rearm() bool {
     evidence.dump_hex(if (ctrl_armed) 1 else 0);
     evidence.dump_str(" tx=");
     evidence.dump_hex(if (tx_armed) 1 else 0);
+    evidence.dump_str(" rx=");
+    evidence.dump_hex(if (rx_armed) 1 else 0);
     evidence.dump_str("\n");
+    // M118b (#2480): the capture self-test — the boot chime's input twin.
+    // Runs at most once, at the moment the transport is live, and only
+    // prints when stream 0 reports INPUT (the --sound-in topology);
+    // output-only and no-device boots keep byte-identical serial.
+    if (snd_ready) snd_capture_probe();
     return snd_ready;
 }
 
@@ -640,6 +663,10 @@ pub var ctl_spins: usize = 0;
 pub var ctl_used_idx: u16 = 0;
 pub var ctl_used_id: u32 = 0;
 pub var ctl_used_len: u32 = 0;
+/// The used-ring poll budget for one control exchange. INPUT-stream START
+/// can block on host mic consent (the M118b observation), so the capture
+/// path widens its own budget rather than the shared one.
+pub var ctl_spin_budget: usize = 60_000_000;
 
 /// One control-queue exchange: submit [request][reply] and poll the used
 /// ring for completion. Returns the reply's status code (S_OK = 0 on
@@ -683,7 +710,7 @@ fn ctl_exchange(request: []const u8, reply_len: usize) u32 {
     while (true) : (spins += 1) {
         mmu.invalidate_dcache_range(@intFromPtr(&ctrl_used), @sizeOf(VirtqUsed));
         if (ctrl_used.idx != ctrl_last_used) break;
-        if (spins > 60_000_000) {
+        if (spins > ctl_spin_budget) {
             ctl_fail_stage = 3;
             ctl_spins = spins;
             ctl_used_idx = ctrl_used.idx;
@@ -1147,6 +1174,479 @@ pub fn snd_chime() u32 {
     return snd_beep(880, 220);
 }
 
+// ---------------------------------------------------------------------------
+// M118b (issue #2480): the CAPTURE (RX) path — queue 3 feeding ONE bounded
+// ring, capped at S16 / 48 kHz / mono, with named refusals for
+// device-absent, over-cap tuple, no-input-stream and ring-full. The v1
+// consumer is the boot self-test (snd_capture_probe, run once from
+// snd_rearm when stream 0 reports INPUT — the --sound-in topology);
+// the EL0 capture surface is M118c.
+// ---------------------------------------------------------------------------
+
+/// The v1 capture tuple — ONE stream, S16, 48 kHz, mono (the card's cap).
+/// A request for anything beyond it is a named refusal, never a silent
+/// conversion.
+pub const cap_format: u8 = FMT_S16;
+pub const cap_rate: u8 = RATE_48000;
+pub const cap_channels: u8 = 1;
+pub const cap_frame_bytes: u32 = 2; // S16 × mono
+
+/// The bounded capture ring (fixed BSS, the M14 rule): ~0.68 s of
+/// S16/48 kHz/mono. A write that would pass the bound refuses by name —
+/// the ring never wraps silently and never drops without counting it.
+pub const cap_ring_bytes: usize = 64 * 1024;
+pub const cap_max_frames: u32 = cap_ring_bytes / cap_frame_bytes;
+var cap_ring: [cap_ring_bytes]u8 align(64) = undefined;
+var cap_ring_wr: usize = 0;
+var cap_ring_rd: usize = 0;
+pub var cap_ring_used: usize = 0;
+pub var cap_ring_dropped: u64 = 0; // bytes refused by a full ring
+
+/// RX posting geometry: four period buffers in flight at a time, each
+/// 1024 S16-mono frames (~21 ms at 48 kHz).
+pub const cap_slots: usize = 4;
+pub const cap_period_bytes: u32 = 2048;
+/// The frames the boot self-test captures: 8192 × 2 B = 16 KiB (~171 ms).
+pub const cap_selftest_frames: u32 = 8192;
+/// The capture START exchange's own used-ring poll budget (~5× the shared
+/// 60 M): input-stream START can block on host mic consent — a bounded
+/// wait, still honest about a block.
+pub const cap_start_spin_budget: usize = 300_000_000;
+
+/// One posted RX buffer: [pcm_xfer][data period][pcm_status] — the same
+/// three-descriptor chain as TX with the data descriptor's direction
+/// flipped to device-writable (the device fills `data`, then writes
+/// `status`). `xfer`, `data` and `status` each sit on their own 64-byte
+/// line so the dcache ops never span regions with different directions.
+const CapBuf = extern struct {
+    xfer: u32 = 0, // stream_id (device-readable)
+    xfer_pad: [60]u8 = @splat(0),
+    data: [cap_period_bytes]u8 align(64) = @splat(0), // device-writable
+    status: PcmStatus = .{ .status = 0xffffffff, .latency_bytes = 0 }, // device-writable
+    status_pad: [56]u8 = @splat(0),
+};
+var cap_bufs: [cap_slots]CapBuf align(64) = @splat(.{});
+
+/// Capture accounting + last result (the gate's evidence; mirrors the
+/// beep_* honest-record naming).
+pub var cap_submitted: u32 = 0; // RX periods posted
+pub var cap_completed: u32 = 0; // RX periods the device completed
+pub var cap_frames: u32 = 0; // frames drained into the ring
+pub var cap_bytes: u64 = 0; // sample bytes drained
+pub var cap_nonzero: u64 = 0; // nonzero sample bytes (the silence detector)
+pub var cap_sum: u32 = 0x811c9dc5; // FNV-1a 32 over the drained bytes
+pub var cap_fail: []const u8 = ""; // honest refusal ("" = ok)
+
+/// M118c (#2481): the refusal class paired with `cap_fail`'s text — the
+/// slot-92 handler maps this to the ADR 0007 errno. The string is the
+/// human/serial record; the enum is the machine one (the EL0 seam never
+/// string-matches).
+pub const CapRefusal = enum(u8) {
+    none,
+    no_device, // no virtio-snd device attached
+    rx_unarmed, // queue 3 (stream RX) never armed
+    over_cap, // the requested tuple is beyond S16/48kHz/mono
+    over_ring, // the request exceeds the ring bound
+    no_input, // stream 0 is not INPUT, or lacks the v1 tuple
+    ctl_refused, // a control exchange refused or timed out
+    drain_timeout, // the bounded RX drain expired (e.g. host mic denied)
+    malformed, // malformed used-ring completion
+    device_refused, // the device refused a posted buffer
+    ring_full, // the bounded ring refused a write
+    epilogue, // STOP/RELEASE refused
+};
+pub var cap_refusal: CapRefusal = .none;
+
+fn cap_set_fail(why: []const u8, refusal: CapRefusal) void {
+    cap_fail = why;
+    cap_refusal = refusal;
+}
+
+/// M118c (#2481): the capture-side info struct `sys_audio_rec_info` copies
+/// out — the slot-42 shape for the RX direction. 16 bytes, fixed layout.
+pub const AudioCapInfo = extern struct {
+    ready: u32, // RX queue armed AND stream 0 last observed INPUT with the v1 tuple
+    format: u8, // the v1 capture tuple when ready (0xff when not)
+    rate: u8, // (0xff when not)
+    channels: u8, // (0 when not)
+    padding: u8,
+    period_bytes: u32, // one posted RX period
+    ring_bytes: u32, // the bounded ring — also the per-call byte bound
+};
+
+/// The capture capability report for slot 91: the LAST OBSERVED stream-0
+/// topology held to the v1 tuple — no device exchange in this call (the
+/// rearm-time self-test and every `snd_capture` refresh `beep_obs_*`, so a
+/// device-present boot always carries an observation; a never-probed or
+/// no-device boot reads ready=0 with the 0xff sentinels).
+pub fn snd_cap_info() AudioCapInfo {
+    const ready = snd_ready and ctrl_armed and rx_armed and
+        beep_obs_dir == D_INPUT and
+        cap_admit_caps(beep_obs_dir, beep_obs_formats, beep_obs_rates, beep_obs_ch_min) == null;
+    return .{
+        .ready = if (ready) 1 else 0,
+        .format = if (ready) cap_format else 0xff,
+        .rate = if (ready) cap_rate else 0xff,
+        .channels = if (ready) cap_channels else 0,
+        .padding = 0,
+        .period_bytes = cap_period_bytes,
+        .ring_bytes = @intCast(cap_ring_bytes),
+    };
+}
+/// Per-step control statuses (same roles as beep_*_status).
+pub var cap_info_status: u32 = 0xffffffff;
+pub var cap_params_status: u32 = 0xffffffff;
+pub var cap_prepare_status: u32 = 0xffffffff;
+pub var cap_start_status: u32 = 0xffffffff;
+pub var cap_stop_status: u32 = 0xffffffff;
+pub var cap_release_status: u32 = 0xffffffff;
+
+/// Append `bytes` to the ring FIFO. Refuses honestly when the free space
+/// is short — the bytes are counted in `cap_ring_dropped` and NOTHING is
+/// written (no partial write, no silent wrap).
+fn cap_ring_push(bytes: []const u8) error{RingFull}!void {
+    if (bytes.len > cap_ring_bytes - cap_ring_used) {
+        cap_ring_dropped += bytes.len;
+        return error.RingFull;
+    }
+    const head = @min(bytes.len, cap_ring_bytes - cap_ring_wr);
+    @memcpy(cap_ring[cap_ring_wr..][0..head], bytes[0..head]);
+    @memcpy(cap_ring[0 .. bytes.len - head], bytes[head..]);
+    cap_ring_wr = (cap_ring_wr + bytes.len) % cap_ring_bytes;
+    cap_ring_used += bytes.len;
+}
+
+/// Read up to `out.len` bytes FIFO; returns the count moved (0 = empty).
+pub fn cap_ring_pop(out: []u8) usize {
+    const n = @min(out.len, cap_ring_used);
+    const head = @min(n, cap_ring_bytes - cap_ring_rd);
+    @memcpy(out[0..head], cap_ring[cap_ring_rd..][0..head]);
+    @memcpy(out[head..n], cap_ring[0 .. n - head]);
+    cap_ring_rd = (cap_ring_rd + n) % cap_ring_bytes;
+    cap_ring_used -= n;
+    return n;
+}
+
+fn cap_ring_reset() void {
+    cap_ring_wr = 0;
+    cap_ring_rd = 0;
+    cap_ring_used = 0;
+    cap_ring_dropped = 0;
+}
+
+/// The request-vs-cap check (pure — class-A testable): anything beyond
+/// the v1 tuple is refused by NAME. Returns the refusal or null.
+pub fn cap_admit(format: u8, rate: u8, channels: u8) ?[]const u8 {
+    if (format != cap_format) return "capture format over cap (S16)";
+    if (rate != cap_rate) return "capture rate over cap (48kHz)";
+    if (channels != cap_channels) return "capture channels over cap (mono)";
+    return null;
+}
+
+/// The device-vs-cap check (pure): refuses by name when stream 0 is not
+/// an input or cannot speak the v1 tuple.
+pub fn cap_admit_caps(dir: u8, formats: u64, rates: u64, ch_min: u8) ?[]const u8 {
+    if (dir != D_INPUT) return "no input stream";
+    if (formats & (@as(u64, 1) << cap_format) == 0) return "device lacks S16 capture";
+    if (rates & (@as(u64, 1) << cap_rate) == 0) return "device lacks 48kHz capture";
+    if (ch_min > cap_channels) return "device lacks mono capture";
+    return null;
+}
+
+/// Post one RX slot on queue 3: chain [pcm_xfer][data (device-writable)]
+/// [pcm_status (device-writable)] — the TX chain with the data
+/// descriptor's direction flipped.
+fn rx_post(slot: usize) void {
+    const head: u16 = @intCast(slot * 3);
+    const buf = &cap_bufs[slot];
+    buf.xfer = 0; // stream 0
+    buf.status = .{ .status = 0xffffffff, .latency_bytes = 0 };
+    rx_desc[head] = .{ .addr = mmu.to_phys(@intFromPtr(&buf.xfer)), .len = 4, .flags = VIRTQ_DESC_F_NEXT, .next = head + 1 };
+    rx_desc[head + 1] = .{ .addr = mmu.to_phys(@intFromPtr(&buf.data)), .len = cap_period_bytes, .flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, .next = head + 2 };
+    rx_desc[head + 2] = .{ .addr = mmu.to_phys(@intFromPtr(&buf.status)), .len = @sizeOf(PcmStatus), .flags = VIRTQ_DESC_F_WRITE, .next = 0 };
+    mmu.clean_dcache_range(@intFromPtr(&rx_desc[head]), @sizeOf(VirtqDesc) * 3);
+    // The whole slot buffer is cleaned before the kick: `xfer` carries the
+    // CPU write; the device-WRITE regions (data + status) get it so a
+    // dirty BSS line can never writeback over the DMA payload. The
+    // completion side invalidates before the CPU reads.
+    mmu.clean_dcache_range(@intFromPtr(buf), @sizeOf(CapBuf));
+    const index = rx_avail.idx;
+    rx_avail.ring[index % rx_queue_size] = head;
+    rx_avail.idx = index +% 1;
+    mmu.clean_dcache_range(@intFromPtr(&rx_avail), @sizeOf(VirtqAvail));
+    kick(rx_queue_notify_off, 3);
+    cap_submitted += 1;
+}
+
+/// Consume one completed RX slot: verify the status the device wrote,
+/// push the sample bytes into the bounded ring, and fold them into the
+/// receipt (byte count + FNV-1a + nonzero count). `used_len` is the
+/// device's total written length spanning [data][status]; the sample
+/// payload is it minus the 8-byte pcm_status.
+fn rx_consume(slot: usize, used_len: u32) u32 {
+    const buf = &cap_bufs[slot];
+    mmu.invalidate_dcache_range(@intFromPtr(&buf.status), @sizeOf(PcmStatus));
+    if (buf.status.status != S_OK) {
+        cap_set_fail("RX device refused", .device_refused);
+        return 0xffffffff;
+    }
+    const payload = @min(used_len -| @sizeOf(PcmStatus), cap_period_bytes);
+    if (payload == 0) return S_OK;
+    mmu.invalidate_dcache_range(@intFromPtr(&buf.data), payload);
+    cap_ring_push(buf.data[0..payload]) catch {
+        cap_set_fail("capture ring full", .ring_full);
+        return 0xffffffff;
+    };
+    for (buf.data[0..payload]) |b| {
+        cap_sum = (cap_sum ^ b) *% 16777619;
+        if (b != 0) cap_nonzero += 1;
+    }
+    cap_bytes += payload;
+    cap_frames = @intCast(cap_bytes / cap_frame_bytes);
+    return S_OK;
+}
+
+/// Bounded capture: negotiate the v1 tuple on stream 0, then drain the
+/// RX queue into the ring until `want_frames` land. Returns S_OK, the
+/// failing step's status, or 0xffffffff on a transport/request refusal —
+/// `cap_fail` names every refusal. The caller serializes (the boot
+/// self-test today; the M118c syscall path under audio_lock later).
+pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
+    cap_set_fail("", .none);
+    if (!snd_ready or !ctrl_armed) {
+        cap_set_fail("no virtio-snd device", .no_device);
+        return 0xffffffff;
+    }
+    if (!rx_armed) {
+        cap_set_fail("RX queue (3) not armed", .rx_unarmed);
+        return 0xffffffff;
+    }
+    if (cap_admit(format, rate, channels)) |why| {
+        cap_set_fail(why, .over_cap);
+        return 0xffffffff;
+    }
+    if (want_frames == 0 or want_frames > cap_max_frames) {
+        cap_set_fail("capture request exceeds ring", .over_ring);
+        return 0xffffffff;
+    }
+    cap_ring_reset();
+    cap_submitted = 0;
+    cap_completed = 0;
+    cap_frames = 0;
+    cap_bytes = 0;
+    cap_nonzero = 0;
+    cap_recovered = false;
+    cap_sum = 0x811c9dc5; // FNV-1a basis
+    cap_info_status = 0xffffffff;
+    cap_params_status = 0xffffffff;
+    cap_prepare_status = 0xffffffff;
+    cap_start_status = 0xffffffff;
+    cap_stop_status = 0xffffffff;
+    cap_release_status = 0xffffffff;
+
+    // 1. What is stream 0 today? (The A1-finding workaround — the devcfg
+    //    counts read zero, so the driver asks.)
+    const info_st = snd_pcm_probe();
+    cap_info_status = info_st;
+    if (info_st != S_OK) {
+        cap_set_fail("PCM_INFO refused", .ctl_refused);
+        return info_st;
+    }
+    if (cap_admit_caps(beep_obs_dir, beep_obs_formats, beep_obs_rates, beep_obs_ch_min)) |why| {
+        cap_set_fail(why, .no_input);
+        return 0xffffffff;
+    }
+    // 2. Negotiate the v1 tuple.
+    const req = PcmSetParams{
+        .hdr = .{ .hdr = .{ .code = R_PCM_SET_PARAMS }, .stream_id = 0 },
+        .buffer_bytes = cap_ring_bytes,
+        .period_bytes = cap_period_bytes,
+        .features = 0,
+        .channels = cap_channels,
+        .format = cap_format,
+        .rate = cap_rate,
+        .padding = 0,
+    };
+    const params_st = ctl_exchange(std.mem.asBytes(&req), 4);
+    cap_params_status = params_st;
+    if (params_st != S_OK) {
+        cap_set_fail("SET_PARAMS refused", .ctl_refused);
+        return params_st;
+    }
+    const prep_st = ctl_pcm_simple(R_PCM_PREPARE);
+    cap_prepare_status = prep_st;
+    if (prep_st != S_OK) {
+        cap_set_fail("PREPARE refused", .ctl_refused);
+        return prep_st;
+    }
+    // 3. START, then post the slot buffers — the device fills a posted
+    //    period and completes it on the used ring. OBSERVED (2026-10-17,
+    //    live on VZ, M118b): posting the RX buffers BEFORE START wedges
+    //    the control queue — the START exchange times out; START-first
+    //    returns 0x8000 instantly. The order below is pinned by that.
+    //    INPUT START can also stall on host mic consent (TCC), so it gets
+    //    its own budget — bounded, never a hang.
+    ctl_spin_budget = cap_start_spin_budget;
+    const start_st = ctl_pcm_simple(R_PCM_START);
+    ctl_spin_budget = 60_000_000;
+    cap_start_status = start_st;
+    var outstanding: u32 = 0;
+    if (start_st != S_OK) {
+        cap_set_fail("START refused", .ctl_refused);
+        // Cleanup must not mask the primary refusal.
+        const cleanup = cap_fail;
+        const cleanup_refusal = cap_refusal;
+        _ = snd_capture_stop();
+        cap_fail = cleanup;
+        cap_refusal = cleanup_refusal;
+        snd_capture_recover();
+        return start_st;
+    }
+    // 4. Drain until want_frames or the bound (wall-clock when the timer
+    //    is live, a spin budget otherwise — the self-test asks for ~171 ms
+    //    of audio and gets seconds of slack).
+    for (0..cap_slots) |s| rx_post(s);
+    outstanding = cap_slots;
+    const want_bytes: usize = @as(usize, want_frames) * cap_frame_bytes;
+    const deadline_ns = snd_stream_now() + 5 * std.time.ns_per_s;
+    var spins: usize = 0;
+    while (cap_bytes < want_bytes and outstanding > 0) : (spins += 1) {
+        mmu.invalidate_dcache_range(@intFromPtr(&rx_used), @sizeOf(VirtqUsed));
+        if (rx_used.idx == rx_last_used) {
+            const expired = if (timer.freq != 0)
+                snd_stream_now() >= deadline_ns
+            else
+                spins > 400_000_000;
+            if (expired) {
+                cap_set_fail("RX drain timeout", .drain_timeout);
+                break;
+            }
+            continue;
+        }
+        const used_elem = rx_used.ring[rx_last_used % rx_queue_size];
+        rx_last_used +%= 1;
+        outstanding -= 1;
+        cap_completed += 1;
+        if (used_elem.id % 3 != 0 or used_elem.id / 3 >= cap_slots) {
+            cap_set_fail("RX malformed completion", .malformed);
+            break;
+        }
+        const slot = used_elem.id / 3;
+        if (rx_consume(slot, used_elem.len) != S_OK) break;
+        if (cap_bytes < want_bytes) {
+            rx_post(slot);
+            outstanding += 1;
+        }
+    }
+    const tail_st = blk: {
+        // The epilogue's own refusal never masks the drain's primary one.
+        const primary = cap_fail;
+        const primary_refusal = cap_refusal;
+        const s = snd_capture_stop();
+        if (primary.len != 0) {
+            cap_fail = primary;
+            cap_refusal = primary_refusal;
+            break :blk s;
+        }
+        break :blk s;
+    };
+    snd_capture_recover();
+    if (cap_fail.len != 0) return 0xffffffff;
+    return tail_st;
+}
+
+/// OBSERVED (2026-10-17, live on VZ): a mic-denied input stream wedges
+/// the whole control channel — after the bounded drain times out, STOP,
+/// RELEASE and even PCM_INFO all stop answering (transport-level
+/// 0xffffffff, never a device status). The virtio reset inside
+/// `snd_rearm` is the recovery: re-arm the transport so the next caller
+/// finds a working device (the same reset the mixer's recovery path
+/// uses). The capture's own result is unchanged — recovery is for the
+/// NEXT user of the device.
+pub var cap_recovered: bool = false;
+fn snd_capture_recover() void {
+    if (cap_stop_status == 0xffffffff or cap_release_status == 0xffffffff) {
+        cap_recovered = true;
+        _ = snd_rearm();
+    }
+}
+
+/// The capture epilogue: STOP → RELEASE + a bounded drain of the posted
+/// buffers the device returns on stop (virtio-snd: STOP completes pending
+/// I/O — consume the entries so a later capture never reads stale
+/// completions). Records cap_stop_status/cap_release_status.
+fn snd_capture_stop() u32 {
+    const stop_st = ctl_pcm_simple(R_PCM_STOP);
+    cap_stop_status = stop_st;
+    // Best-effort: bounded wait for in-flight completions, then RELEASE
+    // regardless — a device that never returns them is not a hang reason.
+    var spins: usize = 0;
+    var completed: u32 = 0;
+    while (completed < cap_slots and spins < 60_000_000) : (spins += 1) {
+        mmu.invalidate_dcache_range(@intFromPtr(&rx_used), @sizeOf(VirtqUsed));
+        if (rx_used.idx == rx_last_used) continue;
+        _ = rx_used.ring[rx_last_used % rx_queue_size];
+        rx_last_used +%= 1;
+        completed += 1;
+    }
+    const rel_st = ctl_pcm_simple(R_PCM_RELEASE);
+    cap_release_status = rel_st;
+    if (stop_st != S_OK) {
+        cap_set_fail("STOP refused", .epilogue);
+        return stop_st;
+    }
+    if (rel_st != S_OK) {
+        cap_set_fail("RELEASE refused", .epilogue);
+        return rel_st;
+    }
+    return S_OK;
+}
+
+var cap_probe_done: bool = false;
+
+/// The boot self-test — the capture path's boot-chime twin. Runs at most
+/// once, from snd_rearm at the moment the transport is live (the
+/// single-threaded boot context needs no audio_lock; the once-flag keeps
+/// the mixer-reset rearm path from re-entering). SILENT unless stream 0
+/// reports INPUT — output-only and no-device boots keep byte-identical
+/// serial. On INPUT (the --sound-in topology) it runs one bounded capture
+/// and prints the receipt plus the named-refusal exercise: the gate's
+/// evidence and the mic-TCC question's answer.
+fn snd_capture_probe() void {
+    if (cap_probe_done) return;
+    cap_probe_done = true;
+    if (!snd_ready or !ctrl_armed or !rx_armed) return;
+    if (snd_pcm_probe() != S_OK or beep_obs_dir != D_INPUT) return;
+    var buf: [384]u8 = undefined;
+    cap_line(&buf, "cap: rx capture fmt={d} rate={d} ch={d} want={d}", .{ cap_format, cap_rate, cap_channels, cap_selftest_frames });
+    const st = snd_capture(cap_format, cap_rate, cap_channels, cap_selftest_frames);
+    cap_line(&buf, "cap: info=0x{x:0>16} params=0x{x:0>16} prepare=0x{x:0>16} start=0x{x:0>16}", .{ cap_info_status, cap_params_status, cap_prepare_status, cap_start_status });
+    if (st == S_OK) {
+        cap_line(&buf, "cap: captured={d} frames bytes={d} ring={d}/{d} dropped={d} nonzero={d} sum=0x{x:0>8}", .{ cap_frames, cap_bytes, cap_ring_used, cap_ring_bytes, cap_ring_dropped, cap_nonzero, cap_sum });
+        cap_line(&buf, "cap: stop=0x{x:0>16} release=0x{x:0>16}", .{ cap_stop_status, cap_release_status });
+        cap_line(&buf, "cap: ok", .{});
+    } else {
+        cap_line(&buf, "cap: captured={d} frames bytes={d} nonzero={d}", .{ cap_frames, cap_bytes, cap_nonzero });
+        // The exchange diagnostics name the failing stage: 1 unarmed /
+        // 2 oversize / 3 drain timeout / 4 bad used id / 5 short reply.
+        cap_line(&buf, "cap: FAILED ({s}) ctl stage={d} stop=0x{x:0>16} release=0x{x:0>16} recovered={d}", .{ cap_fail, ctl_fail_stage, cap_stop_status, cap_release_status, @intFromBool(cap_recovered) });
+    }
+    // The named-refusal exercise — pure checks plus the ring bound, no
+    // device touch, so the gate sees the refusal names whatever the
+    // device did. `snd_capture` with an over-ring request refuses before
+    // probing, leaving the receipt's accounting intact.
+    const fwhy = cap_admit(FMT_FLOAT, cap_rate, cap_channels) orelse "";
+    const rwhy = cap_admit(cap_format, RATE_44100, cap_channels) orelse "";
+    const cwhy = cap_admit(cap_format, cap_rate, 2) orelse "";
+    _ = snd_capture(cap_format, cap_rate, cap_channels, cap_max_frames + 1);
+    cap_line(&buf, "cap: refuse fmt '{s}' rate '{s}' ch '{s}' ring '{s}'", .{ fwhy, rwhy, cwhy, cap_fail });
+}
+
+fn cap_line(buf: []u8, comptime fmt: []const u8, args: anytype) void {
+    const s = std.fmt.bufPrint(buf, fmt ++ "\n", args) catch return;
+    klog.line(s);
+}
+
 const StatusLine = extern struct {
     status: u32 = 0xffffffff,
     latency_bytes: u32 = 0,
@@ -1507,6 +2007,148 @@ fn synth_sine(freq: u32, frames: u32, format: u8, channels: u8, rate: u8, start_
 // ---------------------------------------------------------------------------
 // Host tests — only the pieces that need no device
 // ---------------------------------------------------------------------------
+
+test "virtio_snd: capture ring is bounded, FIFO across the wrap, and refuses a full write" {
+    cap_ring_reset();
+    var a: [10_000]u8 = undefined;
+    var b: [60_000]u8 = undefined;
+    for (&a, 0..) |*p, i| p.* = @truncate(i *% 31 +% 7);
+    for (&b, 0..) |*p, i| p.* = @truncate(i *% 17 +% 3);
+    try cap_ring_push(&a);
+    try std.testing.expectEqual(@as(usize, a.len), cap_ring_used);
+    // A write that would pass the bound refuses: nothing partial lands,
+    // the refused bytes are counted.
+    try std.testing.expectError(error.RingFull, cap_ring_push(&b));
+    try std.testing.expectEqual(@as(u64, b.len), cap_ring_dropped);
+    try std.testing.expectEqual(@as(usize, a.len), cap_ring_used);
+    // Pop part of A, then land B — wr wraps the end of the buffer.
+    var out: [cap_ring_bytes]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 8_000), cap_ring_pop(out[0..8_000]));
+    try std.testing.expectEqualSlices(u8, a[0..8_000], out[0..8_000]);
+    try cap_ring_push(&b);
+    try std.testing.expectEqual(@as(usize, 2_000 + b.len), cap_ring_used);
+    // FIFO order survives the wrap: the A remainder, then all of B.
+    const got = cap_ring_pop(&out);
+    try std.testing.expectEqual(@as(usize, 62_000), got);
+    try std.testing.expectEqualSlices(u8, a[8_000..], out[0..2_000]);
+    try std.testing.expectEqualSlices(u8, b[0..], out[2_000..62_000]);
+    try std.testing.expectEqual(@as(usize, 0), cap_ring_used);
+    try std.testing.expectEqual(@as(usize, 0), cap_ring_pop(out[0..1]));
+    cap_ring_reset();
+}
+
+test "virtio_snd: capture admits exactly the v1 tuple and refuses beyond it by name" {
+    try std.testing.expect(cap_admit(cap_format, cap_rate, cap_channels) == null);
+    try std.testing.expectEqualStrings("capture format over cap (S16)", cap_admit(FMT_FLOAT, cap_rate, cap_channels).?);
+    try std.testing.expectEqualStrings("capture format over cap (S16)", cap_admit(FMT_S32, cap_rate, cap_channels).?);
+    try std.testing.expectEqualStrings("capture rate over cap (48kHz)", cap_admit(cap_format, RATE_44100, cap_channels).?);
+    try std.testing.expectEqualStrings("capture rate over cap (48kHz)", cap_admit(cap_format, RATE_8000, cap_channels).?);
+    try std.testing.expectEqualStrings("capture channels over cap (mono)", cap_admit(cap_format, cap_rate, 2).?);
+    try std.testing.expectEqualStrings("capture channels over cap (mono)", cap_admit(cap_format, cap_rate, 0).?);
+    // The device-side check: direction and the advertised bitmaps.
+    const fmts = (@as(u64, 1) << FMT_S16) | (@as(u64, 1) << FMT_FLOAT);
+    const rates = (@as(u64, 1) << RATE_48000) | (@as(u64, 1) << RATE_44100);
+    try std.testing.expect(cap_admit_caps(D_INPUT, fmts, rates, 1) == null);
+    try std.testing.expectEqualStrings("no input stream", cap_admit_caps(D_OUTPUT, fmts, rates, 1).?);
+    try std.testing.expectEqualStrings("device lacks S16 capture", cap_admit_caps(D_INPUT, @as(u64, 1) << FMT_FLOAT, rates, 1).?);
+    try std.testing.expectEqualStrings("device lacks 48kHz capture", cap_admit_caps(D_INPUT, fmts, @as(u64, 1) << RATE_44100, 1).?);
+    try std.testing.expectEqualStrings("device lacks mono capture", cap_admit_caps(D_INPUT, fmts, rates, 2).?);
+}
+
+test "virtio_snd: capture refuses honestly when absent or over-cap" {
+    // Device-absent: refused by name, no hang.
+    snd_ready = false;
+    ctrl_armed = false;
+    rx_armed = false;
+    defer {
+        snd_ready = false;
+        ctrl_armed = false;
+        rx_armed = false;
+    }
+    try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 1024));
+    try std.testing.expectEqualStrings("no virtio-snd device", cap_fail);
+    try std.testing.expectEqual(CapRefusal.no_device, cap_refusal);
+    snd_ready = true;
+    ctrl_armed = true;
+    try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 1024));
+    try std.testing.expectEqualStrings("RX queue (3) not armed", cap_fail);
+    try std.testing.expectEqual(CapRefusal.rx_unarmed, cap_refusal);
+    // Armed but over-cap tuple / over-ring request: refused BEFORE any
+    // control exchange — the refusals are deterministic.
+    rx_armed = true;
+    try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(FMT_FLOAT, cap_rate, cap_channels, 1024));
+    try std.testing.expectEqualStrings("capture format over cap (S16)", cap_fail);
+    try std.testing.expectEqual(CapRefusal.over_cap, cap_refusal);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, cap_max_frames + 1));
+    try std.testing.expectEqualStrings("capture request exceeds ring", cap_fail);
+    try std.testing.expectEqual(CapRefusal.over_ring, cap_refusal);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 0));
+    try std.testing.expectEqualStrings("capture request exceeds ring", cap_fail);
+    try std.testing.expectEqual(CapRefusal.over_ring, cap_refusal);
+}
+
+test "virtio_snd: cap info reports the observed INPUT verdict with the v1 tuple" {
+    // M118c (#2481): snd_cap_info is the slot-91 report — the last observed
+    // stream-0 topology held to the v1 tuple, never a device exchange.
+    snd_ready = false;
+    ctrl_armed = false;
+    rx_armed = false;
+    const saved_dir = beep_obs_dir;
+    const saved_formats = beep_obs_formats;
+    const saved_rates = beep_obs_rates;
+    const saved_ch_min = beep_obs_ch_min;
+    defer {
+        snd_ready = false;
+        ctrl_armed = false;
+        rx_armed = false;
+        beep_obs_dir = saved_dir;
+        beep_obs_formats = saved_formats;
+        beep_obs_rates = saved_rates;
+        beep_obs_ch_min = saved_ch_min;
+    }
+    // No device: not ready, the sentinel tuple.
+    var info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 0), info.ready);
+    try std.testing.expectEqual(@as(u8, 0xff), info.format);
+    try std.testing.expectEqual(@as(u8, 0xff), info.rate);
+    try std.testing.expectEqual(@as(u8, 0), info.channels);
+    try std.testing.expectEqual(@as(u32, cap_period_bytes), info.period_bytes);
+    try std.testing.expectEqual(@as(u32, @intCast(cap_ring_bytes)), info.ring_bytes);
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(AudioCapInfo));
+    // Armed + stream 0 last observed INPUT with the v1 tuple: ready, the
+    // cap constants reported.
+    snd_ready = true;
+    ctrl_armed = true;
+    rx_armed = true;
+    beep_obs_dir = D_INPUT;
+    beep_obs_formats = (@as(u64, 1) << FMT_S16) | (@as(u64, 1) << FMT_FLOAT);
+    beep_obs_rates = @as(u64, 1) << RATE_48000;
+    beep_obs_ch_min = 1;
+    info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 1), info.ready);
+    try std.testing.expectEqual(cap_format, info.format);
+    try std.testing.expectEqual(cap_rate, info.rate);
+    try std.testing.expectEqual(cap_channels, info.channels);
+    // Stream 0 observed OUTPUT (--sound only): ready=0 honestly.
+    beep_obs_dir = D_OUTPUT;
+    info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 0), info.ready);
+    // Armed but never probed (a device whose capture self-test skipped):
+    // the 0xff observation is not an input — ready=0.
+    beep_obs_dir = 0xff;
+    info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 0), info.ready);
+}
+
+test "virtio_snd: capture DMA layout and cap geometry are bounded" {
+    try std.testing.expectEqual(@as(u16, 4), rx_queue_size);
+    try std.testing.expectEqual(@as(usize, 2176), @sizeOf(CapBuf));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(CapBuf, "data"));
+    try std.testing.expectEqual(@as(usize, 2112), @offsetOf(CapBuf, "status"));
+    try std.testing.expectEqual(@as(u32, cap_ring_bytes / 2), cap_max_frames);
+    try std.testing.expect(cap_selftest_frames * cap_frame_bytes <= cap_ring_bytes);
+    try std.testing.expect(cap_slots * 3 <= pcm.tx_descriptors);
+}
 
 test "virtio_snd: spec shapes — config layout, queue size, DID constants" {
     // The device-config counts are le32 at offsets 0/4/8 (virtio-snd

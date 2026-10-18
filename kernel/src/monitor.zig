@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const osver = @import("osver.zig"); // M115f (#2465): the build-stamped OS version sysinfo reports
 pub const alloc = @import("alloc.zig");
 pub const console = @import("console.zig");
 pub const esp_exec = @import("exec.zig"); // claim 6783: load a user program from the host share and enter it at EL0
@@ -44,6 +45,8 @@ pub const terminal = @import("terminal.zig"); // M73f-2 (#1632): the tty seam be
 pub const virtio_net = @import("virtio_net.zig"); // milestone five card N1 (claim 1373): the net transport behind `net`/`netsend`
 pub const virtio_gpu = @import("virtio_gpu.zig"); // milestone six card G1 (claim 6053): the gpu transport + framebuffer behind `screen`
 pub const virtio_snd = @import("virtio_snd.zig"); // milestone fifteen card A1 (claim 6140): the virtio-snd transport behind `sound`
+pub const virtio_vsock = @import("virtio_vsock.zig"); // M115a (issue #2460): the virtio-vsock transport behind `vsock`
+const vsock_ctl = @import("vsock_ctl.zig"); // M115b (issue #2461, ADR 0056): the `vsock ctl` control-channel client
 pub const road_pops = @import("road_pops.zig"); // milestone six card G3 (claim 1574): the Road Pops tee console behind `roadpops`
 pub const fbtext = @import("text.zig"); // milestone six card G2 (claim 3194): framebuffer text rendering behind `text`
 pub const xhci = @import("xhci.zig"); // milestone seven card I1 (claim 4272): the XHCI host-controller transport behind `usb`
@@ -301,8 +304,9 @@ pub const Command = struct {
 /// 5127) grows it 53 -> 54 (`font`). Milestone twenty-two D3 (issue #326)
 /// grows it 54 -> 55 (`sym`). Milestone twenty-two D5 (issue #328)
 /// grows it 55 -> 56 (`strace`). Milestone twenty-two D6 (issue #329)
-/// grows it 56 -> 57 (`ps`).
-pub const registry_count: usize = 78; // 77 + `tty` (M73f-2 #1632)
+/// grows it 56 -> 57 (`ps`). M115a (issue #2460) grows it 78 -> 79
+/// (`vsock`).
+pub const registry_count: usize = 79; // 78 + `vsock` (M115a #2460)
 
 /// `sym <file>` reads at most this many bytes for on-disk symtab inspection
 /// (M22 D3). ELF symbol tables live near the file tail; 64 KiB covers every
@@ -354,6 +358,7 @@ pub fn ensure_registry() []const Command {
             .{ .name = "netsend", .dom = svclock.dom_bit(.net), .help = "send a known Ethernet frame (bounded staging, TX + used-ring drain)", .usage = "netsend <bytes>", .category = .networking, .min_args = 1, .max_args = 1, .handler = cmd_netsend },
             .{ .name = "pages", .help = "physical page allocator pool", .usage = "pages [selftest]", .category = .memory_state, .max_args = 1, .handler = cmd_pages },
             .{ .name = "pci", .help = "enumerate PCI devices on the bus", .usage = "pci", .category = .memory_state, .handler = cmd_pci },
+            .{ .name = "vsock", .help = "virtio-vsock transport (M115a/b): 'vsock' reports the arm state, 'vsock <port>' connects to the host listener and reports connected/refused/timeout, 'vsock ctl <verb>' runs one control-channel session", .usage = "vsock [<port>] | vsock ctl [badauth|replay|dup] <verb> [name]", .category = .networking, .max_args = 4, .handler = cmd_vsock },
             .{ .name = "procs", .help = "process registry: image, address space, lifecycle, exit status", .usage = "procs", .category = .tasks_processes, .max_args = 2, .handler = cmd_procs },
             .{ .name = "random", .help = "print n random bytes from the seeded CSPRNG (hex)", .usage = "random [n]", .category = .system, .max_args = 1, .handler = cmd_random },
             .{ .name = "resources", .help = "fixed-pool audit: scheduler tasks, process registry, windows, page-table carve-out, and per-process ring bounds", .usage = "resources", .category = .memory_state, .handler = cmd_resources },
@@ -514,7 +519,7 @@ fn match_one(prefix: []const u8, verbs: []const []const u8) ?[]const u8 {
 
 fn sub_verb_complete(cmd: []const u8, prefix: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, cmd, "net"))
-        return match_one(prefix, &.{ "recv", "ip", "arp", "ping", "udp", "dhcp", "tcp" });
+        return match_one(prefix, &.{ "recv", "ip", "arp", "ping", "udp", "udp6", "dhcp", "tcp", "dns", "ip6", "ndp", "ping6", "status", "route", "log" });
     if (std.mem.eql(u8, cmd, "dui"))
         return match_one(prefix, &.{ "focus", "raise", "move", "close", "list", "hit", "cycle" });
     if (std.mem.eql(u8, cmd, "usb"))
@@ -866,6 +871,12 @@ fn cmd_sysinfo(m: *Monitor, args: []const []const u8) ExecError {
     } else {
         m.console.print_line("invalid");
     }
+
+    // OS identity — M115f (#2465): the build-stamped version label
+    // (-Dos-version). An applied update carries a new label, so the
+    // version line is the in-guest proof the base image changed.
+    m.console.puts("  os:         version=");
+    m.console.print_line(osver.label);
 
     // CPU & Timer
     m.console.puts("  cpu:        arch=aarch64 timer_armed=");
@@ -2519,6 +2530,79 @@ fn cmd_clip(m: *Monitor, args: []const []const u8) ExecError {
     m.console.puts("clip: stored ");
     m.console.print_u64(stored);
     m.console.puts(" bytes\n");
+    return .none;
+}
+
+/// `vsock [<port>]` (M115a, issue #2460) — the guest→host connect half of
+/// the `VZVirtioSocketDevice` save/restore probe. With no argument it
+/// re-prints the bare arm line — the spec's whole-line witness, identical
+/// pre-save and post-restore since it carries no device state. `vsock
+/// <port>` issues one stream OP_REQUEST to VMADDR_CID_HOST:<port> on the
+/// tx queue and reports the rx-ring answer: `connected` (OP_RESPONSE — the
+/// host's VZVirtioSocketListener accepted), `refused` (OP_RST — no
+/// listener on that port), or `timeout` (no answer inside the poll budget
+/// — the degraded verdict a broken restore would produce). Absent/unarmed
+/// device reports honestly.
+fn cmd_vsock(m: *Monitor, args: []const []const u8) ExecError {
+    // M115b (#2461, ADR 0056): `vsock ctl [badauth|replay|dup] <verb>
+    // [name]` runs one virelai-ctl/1 session against the runner's
+    // --vsock-ctl-port listener — connect, HMAC-challenge auth, request
+    // line, reply verdict, shutdown. The exercise modes exist for the
+    // gate's auth negatives.
+    if (args.len > 0 and std.mem.eql(u8, args[0], "ctl")) {
+        vsock_ctl.run(m.console, args[1..]);
+        return .none;
+    }
+    if (!virtio_vsock.vs_ready) {
+        m.console.print_line("vsock: absent (no virtio-vsock device armed)");
+        return .none;
+    }
+    m.console.print_line("vsock: ready did=0x1053");
+    if (args.len == 0) {
+        m.console.puts("vsock: dev=");
+        m.console.print_hex(virtio_vsock.vs_dev);
+        m.console.puts(" cid=");
+        m.console.print_hex(virtio_vsock.vs_guest_cid);
+        m.console.puts("\n");
+        return .none;
+    }
+    const parsed = parseInt(args[0]) catch {
+        err_prefix(m);
+        m.console.puts("invalid port: ");
+        m.console.puts(args[0]);
+        m.console.puts("\n");
+        return .invalid_argument;
+    };
+    if (parsed == 0 or parsed > 0xffff_fffe) {
+        err_prefix(m);
+        m.console.puts("port out of range: ");
+        m.console.puts(args[0]);
+        m.console.puts("\n");
+        return .invalid_argument;
+    }
+    const port: u32 = @intCast(parsed);
+    m.console.puts("vsock: connect port=");
+    m.console.print_u64(port);
+    m.console.puts("\n");
+    switch (virtio_vsock.connect(port)) {
+        .connected => {
+            m.console.puts("vsock: connected port=");
+            m.console.print_u64(port);
+            m.console.puts(" sport=");
+            m.console.print_u64(virtio_vsock.vs_last_src_port);
+            m.console.puts("\n");
+        },
+        .refused => {
+            m.console.puts("vsock: refused port=");
+            m.console.print_u64(port);
+            m.console.puts(" (peer RST)\n");
+        },
+        .timeout => {
+            m.console.puts("vsock: timeout port=");
+            m.console.print_u64(port);
+            m.console.puts(" (no reply inside the poll budget)\n");
+        },
+    }
     return .none;
 }
 
@@ -5092,6 +5176,7 @@ fn cmd_net(m: *Monitor, args: []const []const u8) ExecError {
         if (std.mem.eql(u8, args[0], "ip6")) return cmd_net_ip6(m, args[1..]);
         if (std.mem.eql(u8, args[0], "ndp")) return cmd_net_ndp(m, args[1..]);
         if (std.mem.eql(u8, args[0], "ping6")) return cmd_net_ping6(m, args[1..]);
+        if (std.mem.eql(u8, args[0], "udp6")) return cmd_net_udp6(m, args[1..]);
         if (std.mem.eql(u8, args[0], "status")) return cmd_net_status(m, args[1..]);
         if (std.mem.eql(u8, args[0], "route")) return cmd_net_route(m, args[1..]);
         if (std.mem.eql(u8, args[0], "log")) return cmd_net_log(m, args[1..]);
@@ -5464,6 +5549,16 @@ fn cmd_net(m: *Monitor, args: []const []const u8) ExecError {
     m.console.print_u64(virtio_net.ipv6.reply_tx_fail);
     m.console.puts(",seq=");
     m.console.print_u64(virtio_net.ipv6.last_seq);
+    m.console.puts("\n");
+    // M117c (#2475): the v6 UDP row — family-tagged counters so a
+    // `udp6=` fragment names the family's own traffic (the v4 ` udp=`
+    // row above stays byte-identical for a guest that never sees 0x86dd).
+    m.console.puts(" udp6=rx=");
+    m.console.print_u64(virtio_net.udp.received6);
+    m.console.puts(",tx=");
+    m.console.print_u64(virtio_net.udp.sent6);
+    m.console.puts(",drop=");
+    m.console.print_u64(virtio_net.udp.dropped6_len + virtio_net.udp.dropped6_badsum + virtio_net.udp.dropped6_closed + virtio_net.udp.dropped6_dst);
     m.console.puts("\n");
     return .none;
 }
@@ -7046,6 +7141,228 @@ fn cmd_net_udp_recv_port(m: *Monitor, port: u16) usize {
     }
     if (count == 0) {
         m.console.puts("net udp recv: no datagrams for port ");
+        m.console.print_u64(port);
+        m.console.puts("\n");
+    }
+    return count;
+}
+
+/// M117c (#2475, ADR 0057 D8): `net udp6` — the v6 half of `net udp`.
+/// Same bounded listen table (family-tagged — a v6 bind never sees a
+/// v4 datagram and vice versa) with a v6 literal on `send`. The refuse
+/// names are Send6Result's (`bad_dst6`/`no_src6`/`no_route6`/`no_peer`).
+fn cmd_net_udp6(m: *Monitor, args: []const []const u8) ExecError {
+    if (args.len == 0) {
+        var count: usize = 0;
+        for (&virtio_net.udp.listen) |e| {
+            if (e.valid and e.v6) count += 1;
+        }
+        m.console.puts("net udp6: entries=");
+        m.console.print_u64(@intCast(count));
+        m.console.puts("\n");
+        for (&virtio_net.udp.listen) |e| {
+            if (!e.valid or !e.v6) continue;
+            m.console.puts("net udp6: port=");
+            m.console.print_u64(e.port);
+            m.console.puts("\n");
+        }
+        m.console.puts("net udp6: rx=");
+        m.console.print_u64(virtio_net.udp.received6);
+        m.console.puts(",tx=");
+        m.console.print_u64(virtio_net.udp.sent6);
+        m.console.puts(",drop=");
+        m.console.print_u64(virtio_net.udp.dropped6_len + virtio_net.udp.dropped6_badsum + virtio_net.udp.dropped6_closed + virtio_net.udp.dropped6_dst);
+        m.console.puts("\n");
+        return .none;
+    }
+    if (std.mem.eql(u8, args[0], "listen")) {
+        if (args.len != 2) {
+            print_usage(m, lookup("net").?);
+            return .usage;
+        }
+        const port = parse_port(args[1]) orelse {
+            err_prefix(m);
+            m.console.puts("invalid port: ");
+            m.console.puts(args[1]);
+            m.console.puts("\n");
+            return .invalid_argument;
+        };
+        if (!virtio_net.udp.listen_port6(port)) {
+            err_prefix(m);
+            m.console.print_line("listen failed (table full or duplicate)");
+            return .none;
+        }
+        m.console.puts("net udp6: listening on ");
+        m.console.print_u64(port);
+        m.console.puts("\n");
+        return .none;
+    }
+    if (std.mem.eql(u8, args[0], "close")) {
+        if (args.len != 2) {
+            print_usage(m, lookup("net").?);
+            return .usage;
+        }
+        const port = parse_port(args[1]) orelse {
+            err_prefix(m);
+            m.console.puts("invalid port: ");
+            m.console.puts(args[1]);
+            m.console.puts("\n");
+            return .invalid_argument;
+        };
+        if (!virtio_net.udp.close_port6(port)) {
+            err_prefix(m);
+            m.console.puts("not listening (v6) on ");
+            m.console.print_u64(port);
+            m.console.puts("\n");
+            return .none;
+        }
+        m.console.puts("net udp6: closed ");
+        m.console.print_u64(port);
+        m.console.puts("\n");
+        return .none;
+    }
+    if (std.mem.eql(u8, args[0], "send")) {
+        if (args.len != 4) {
+            print_usage(m, lookup("net").?);
+            return .usage;
+        }
+        const addr = virtio_net.ipv6.parse_ip6(args[1]) orelse {
+            err_prefix(m);
+            m.console.puts("invalid v6 address: ");
+            m.console.puts(args[1]);
+            m.console.puts("\n");
+            return .invalid_argument;
+        };
+        const port = parse_port(args[2]) orelse {
+            err_prefix(m);
+            m.console.puts("invalid port: ");
+            m.console.puts(args[2]);
+            m.console.puts("\n");
+            return .invalid_argument;
+        };
+        const len = parseInt(args[3]) catch {
+            err_prefix(m);
+            m.console.puts("invalid length: ");
+            m.console.puts(args[3]);
+            m.console.puts("\n");
+            return .invalid_argument;
+        };
+        if (len < 1 or len > virtio_net.udp.payload_max) {
+            err_prefix(m);
+            m.console.puts("length must be between 1 and ");
+            m.console.print_u64(virtio_net.udp.payload_max);
+            m.console.puts("\n");
+            return .invalid_argument;
+        }
+        // The deterministic payload — bytes 01 02 03 04… (the v4 shape).
+        var payload: [virtio_net.udp.payload_max]u8 = undefined;
+        var pi: usize = 0;
+        while (pi < len) : (pi += 1) payload[pi] = @as(u8, @truncate(pi)) +% 1;
+        var frame_len: usize = 0;
+        switch (virtio_net.net_udp6_send(addr, port, payload[0..@intCast(len)], &frame_len)) {
+            .ok => {
+                m.console.puts("net udp6: sent ");
+                m.console.print_u64(len);
+                m.console.puts(" bytes to ");
+                var abuf: [39]u8 = undefined;
+                const an = virtio_net.ipv6.format_ip6(addr, &abuf);
+                m.console.puts(abuf[0..an]);
+                m.console.puts(":");
+                m.console.print_u64(port);
+                m.console.puts(" (");
+                m.console.print_u64(@intCast(frame_len));
+                m.console.puts(" bytes)\n");
+            },
+            .not_ready => {
+                err_prefix(m);
+                m.console.print_line("transport not ready (no virtio-net device)");
+            },
+            .timeout => {
+                err_prefix(m);
+                m.console.print_line("datagram TX timeout (device did not complete within the poll budget)");
+            },
+            .no_peer => {
+                err_prefix(m);
+                m.console.print_line("next hop not in NDP table (net ndp <v6-addr> first)");
+            },
+            .no_src6 => {
+                err_prefix(m);
+                m.console.print_line("no_src6 (no valid v6 source for this dst — net ip6)");
+            },
+            .no_route6 => {
+                err_prefix(m);
+                m.console.print_line("no_route6 (off-link dst and no recorded router)");
+            },
+            .bad_dst6 => {
+                err_prefix(m);
+                m.console.print_line("bad_dst6 (multicast/unspecified/loopback/mapped destination)");
+            },
+        }
+        return .none;
+    }
+    if (std.mem.eql(u8, args[0], "recv")) {
+        if (args.len > 2) {
+            print_usage(m, lookup("net").?);
+            return .usage;
+        }
+        virtio_net.net_rx_drain();
+        if (args.len == 2) {
+            const port = parse_port(args[1]) orelse {
+                m.console.puts("net udp6: invalid port: ");
+                m.console.puts(args[1]);
+                m.console.puts("\n");
+                return .invalid_argument;
+            };
+            _ = cmd_net_udp6_recv_port(m, port);
+            return .none;
+        }
+        var total: usize = 0;
+        for (&virtio_net.udp.listen) |e| {
+            if (!e.valid or !e.v6) continue;
+            total += cmd_net_udp6_recv_port(m, e.port);
+        }
+        m.console.puts("net udp6 recv: total=");
+        m.console.print_u64(@intCast(total));
+        m.console.puts("\n");
+        return .none;
+    }
+    print_usage(m, lookup("net").?);
+    return .usage;
+}
+
+/// Drain + print the datagrams buffered for ONE v6 listener — the
+/// `net udp6 recv` shape: the peer's v6 address is part of the record.
+fn cmd_net_udp6_recv_port(m: *Monitor, port: u16) usize {
+    var count: usize = 0;
+    while (virtio_net.udp.pop6(port)) |d| {
+        if (count == 0) {
+            m.console.puts("net udp6 recv: port=");
+            m.console.print_u64(port);
+            m.console.puts("\n");
+        }
+        m.console.puts("net udp6 recv: [");
+        m.console.print_u64(@intCast(count));
+        m.console.puts("] len=");
+        m.console.print_u64(@intCast(d.len));
+        m.console.puts(" from=");
+        var abuf: [39]u8 = undefined;
+        const an = virtio_net.ipv6.format_ip6(d.src6, &abuf);
+        m.console.puts(abuf[0..an]);
+        m.console.puts("\n");
+        m.console.puts("net udp6 recv: ");
+        var bi: usize = 0;
+        while (bi < d.len) : (bi += 1) {
+            if (bi > 0) m.console.puts(" ");
+            const b = d.bytes[bi];
+            const hex = "0123456789abcdef";
+            var two: [2]u8 = .{ hex[b >> 4], hex[b & 0xf] };
+            m.console.puts(&two);
+        }
+        m.console.puts("\n");
+        count += 1;
+    }
+    if (count == 0) {
+        m.console.puts("net udp6 recv: no datagrams for port ");
         m.console.print_u64(port);
         m.console.puts("\n");
     }

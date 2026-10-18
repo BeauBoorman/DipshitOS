@@ -243,8 +243,9 @@ pub const Device = struct {
 /// virtio_net_hdr (12 B, observed contract) followed by the Ethernet frame
 /// (dst/src/ethertype/payload) here, submits the whole buffer, drains the
 /// used ring, and reports byte counts. No heap — bounded by
-/// `tx_hdr_len + frame_max` (1526 B).
-pub var tx_staging: [tx_hdr_len + frame_max]u8 = undefined;
+/// `tx_hdr_len + frame6 staging` — sized for the largest frame either
+/// family can produce (a full-segment v6 TCP frame, 1534 B; M117c).
+pub var tx_staging: [tx_hdr_len + tcp.frame6_max]u8 = undefined;
 
 // ---------------------------------------------------------------------------
 // RX path (milestone five, card N2 — claim 6076)
@@ -1262,6 +1263,12 @@ fn rx_ipv4(frame: []const u8) void {
 /// honestly (`reply_tx_fail` on the right counter), same as the v4
 /// path.
 fn rx_ipv6(frame: []const u8) void {
+    // M117c (#2475): register the transport delegates the first time the
+    // drain runs — ipv6.zig never imports udp/tcp/socket_native (the
+    // `table_rx` import-free shape). A frame is checked BEFORE the
+    // delegates see it (the fixed-header validation) and AFTER them
+    // (each layer self-gates on dst/port and counts its own drops).
+    native_socket.registerTableRx();
     const reply = ipv6.handle_rx(frame, &net_mac, tx_staging[tx_hdr_len..]) orelse return;
     // The zeroed virtio_net_hdr prefix — the observed claim-1373 TX
     // contract (a stale header's flags/gso fields would corrupt the
@@ -1473,6 +1480,34 @@ pub fn net_udp_send_from(target_ip: [4]u8, src_port: u16, dst_port: u16, payload
     return r;
 }
 
+/// M117c (#2475, ADR 0057 D9): transmit a UDP datagram over IPv6 — the
+/// `net_udp_send` shape under the v6 routing rules: the source is D3's
+/// selection (link-local for a link-local peer, the SLAAC global
+/// otherwise), the Ethernet dst is the NEXT HOP's learned MAC (the peer
+/// on-link, the router off-link — `net ndp <addr>` resolves it first).
+/// Named refusals: `bad_dst6` (multicast/unspecified/loopback/mapped),
+/// `no_src6`, `no_route6`, `no_peer`. The reply is observed
+/// asynchronously by the RX drain (a `net udp6 listen`'d port's ring).
+/// No v6 loopback: a self-addressed datagram is a `no_peer` refusal,
+/// matching the stateless-v6 bound (D9).
+pub fn net_udp6_send(dst6: ipv6.Addr, dst_port: u16, payload: []const u8, out_len: *usize) Send6Result {
+    if (!net_ready) return .not_ready;
+    if (ipv6.is_bad_dst(dst6) or ipv6.is_owned(&dst6)) return .bad_dst6;
+    const src6 = ipv6.select_src(&dst6) orelse return .no_src6;
+    const target = ipv6.next_hop(&dst6) orelse return .no_route6;
+    const peer_mac = ndp.lookup(&target) orelse return .no_peer;
+    @memset(tx_staging[0..tx_hdr_len], 0);
+    const n = udp.build_frame6(tx_staging[tx_hdr_len .. tx_hdr_len + udp.frame6_max], peer_mac, &net_mac, &src6, &dst6, udp.default_src_port, dst_port, payload);
+    out_len.* = n;
+    const r = net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n]);
+    if (r == .ok) udp.sent6 += 1;
+    return switch (r) {
+        .ok => .ok,
+        .timeout => .timeout,
+        else => .not_ready,
+    };
+}
+
 /// Card N8 (claim 0351): transmit the DHCP client's current message (a
 /// DISCOVER or a REQUEST — built by `dhcp` into `dhcp.msg`) on the N1 TX
 /// path. The card's ONE N5-layer seam change: a DHCP frame goes out with
@@ -1546,8 +1581,16 @@ pub fn net_tcp_send(segment: []const u8, out_len: *usize) SendResult {
 }
 
 fn socket_transmit(_: ?*anyopaque, outbound: native_socket.core.Outbound) bool {
-    if (!net_ready or !arp.ip_set()) return false;
+    if (!net_ready) return false;
     @memset(tx_staging[0..tx_hdr_len], 0);
+    // M117c (#2475): family dispatch — a v6 connection's outbound frames
+    // ride the 40-byte fixed header (no `arp.ip_set()` preflight — the
+    // caller's connect already proved a valid src6 + resolved next hop).
+    if (outbound.local.family == .v6) {
+        const n = tcp.build_frame6(tx_staging[tx_hdr_len .. tx_hdr_len + tcp.frame6_max], &net_mac, &outbound.local.addr6, outbound.remote_mac, &outbound.remote.addr6, outbound.bytes);
+        return net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n]) == .ok;
+    }
+    if (!arp.ip_set()) return false;
     const n = tcp.build_frame(tx_staging[tx_hdr_len .. tx_hdr_len + tcp.frame_max], &net_mac, outbound.local.ip, outbound.remote_mac, outbound.remote.ip, outbound.bytes);
     return net_send(&net_ops, &net_dev, tx_staging[0 .. tx_hdr_len + n]) == .ok;
 }

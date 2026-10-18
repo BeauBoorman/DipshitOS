@@ -28,10 +28,43 @@
 //          saves state + the ASIF overlay + the marker into <dir> and exits;
 //          a NEW process restores from <dir> instead of booting and must
 //          recover the marker.) Device knobs --display/--input/--usb-msd/
-//          --custom-virtio are accepted under --vz-restore so their
-//          save/restore verdict can be measured (validateSaveRestoreSupport
-//          + the full cycle); a refusal is printed as `VZ-RESTORE:
-//          validateSaveRestoreSupport REFUSED ...` before the error exit.
+//          --custom-virtio/--gpu3d-metal/--vsock are accepted under
+//          --vz-restore so their save/restore verdict can be measured
+//          (validateSaveRestoreSupport + the full cycle); a refusal is
+//          printed as `VZ-RESTORE: validateSaveRestoreSupport REFUSED ...`
+//          before the error exit.
+//         [--vsock [--vsock-port <n>] [--vsock-ctl [--vsock-ctl-port <n>]]]
+//          (M115a, #2460: attach Apple's
+//          VZVirtioSocketDevice and arm a host listener on port <n>,
+//          default 1208. A guest connect to that port is accepted and
+//          printed as `VSOCK: listener accepted guest connect ...`.
+//          M115b, #2461: --vsock-ctl arms the virelai-ctl/1 endpoint on
+//          --vsock-ctl-port, default 1209 — the HMAC-challenged
+//          suspend/snapshot wire, keyed by the share's vsock-ctl
+//          SECRETS.TXT row (either host channel's share is read); no
+//          row, no listener. M115d, #2463: `suspend` is armed — pause,
+//          save into the profile's saved-state/, reply ok, stop, exit.)
+//         [--profile <path>] (M115c, #2462: boot from a .virelaivm bundle —
+//          a manifest-gated directory holding efi-vars.bin, the PERSISTENT
+//          overlay.asif over config.json's base image, vlfs.img, share/,
+//          machine-id.bin and saved-state/. An absent path is minted; an
+//          existing one must carry a readable virelaivm/1 manifest or the
+//          run refuses by name. Profile members are DEFAULTS: explicit
+//          --vars/--overlay-base/--data-disk/--cvc-file/--cpus flags win.
+//          --profile-init mints/validates the bundle and exits without
+//          booting — tools/session.sh runs it before seeding the share.)
+//         [--resume <path>] (M115d, #2463: boot the profile's saved-state/
+//          instead of the boot image — the continuation of a ctl `suspend`.
+//          Requires an existing bundle AND a written state.vzsave; both
+//          refuse by name. Mutually exclusive with --vz-restore and
+//          --profile-init; the ctl listener re-arms so the resumed
+//          machine can suspend again.)
+//         [--apply-update] [--rollback-update] [--update-key <64-hex>]
+//          (M115f, #2465: verify the signed staged set in <share>/UPDATE/
+//          and swap it in as the boot base image, retaining <base>.prev;
+//          --rollback-update swaps it back. The trust pin comes from
+//          --update-key or the profile's config.json updatePubkey. A
+//          refused set fails the run by name; absent is "none staged".)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -98,6 +131,17 @@
 //          reason=no_bundle` per record instead. Requires --cvc-file and
 //          the `host-int` SECRETS.TXT row; OFF by default — no records
 //          polled, no center touched.)
+//         [--host-outbox] (M127d #2602, ADR 0051 V2-D5: the guest→host
+//          export lane — GOSH `export` / GOFILES "Export to Host" stage
+//          <share>/OUTBOX/<name> + a REQ intent marker; the seat signs an
+//          OUTBOX record and the runner verifies, then moves the payload
+//          to --host-outbox-dir (default ~/Downloads). Caps: ≤64 MiB/file
+//          at move time, ≤64 exports/epoch, ≤1 record per tick. Requires
+//          --cvc-file and the `host-int` SECRETS.TXT row; OFF by default
+//          — no OUTBOX/, no records.)
+//         [--host-outbox-dir <path>] (modifier on --host-outbox: the
+//          export landing. Default ~/Downloads — the flag is the gate
+//          redirect, so a class-B run never touches a real Downloads.)
 //         [--host-cmd-after <marker>:<verb>] (M114a #2454, index #2447:
 //          dispatch <verb> on the HostCommand bus — the same seam every
 //          AppKit menu item uses — once <marker> appears in the serial
@@ -179,6 +223,20 @@
 //          --net-icmp6-respond answers with the echo reply — id/seq/
 //          payload byte-exact. All require --net. An unlisted target or
 //          an unset flag goes unanswered — the refusal leg.)
+//         [--net-udp6-respond [<v6-addr>]:<host-port>]
+//          [--net-tcp6-respond [<v6-addr>]:<host-port>] (M117c #2475,
+//          ADR 0057: the v6 transport responders — the N5 UDP echo and
+//          the N10 TCP handshake/echo shapes on the fixed 40-byte
+//          header. The bracketed literal keeps the address's own colons
+//          out of the port split — the same shape `vi.Dial` speaks.
+//          The UDP6 reply echoes the datagram byte-exact (v6 src/dst
+//          swapped, UDP ports swapped, the pseudo-header checksum over
+//          the 16-byte addresses recomputed). The TCP6 server answers
+//          the guest's SYN with a SYN-ACK (the FIXED ISN 0x12345678),
+//          data with an ACK + the payload echoed (or the HTTP 200 on a
+//          GET / port 80/8080 — the v4 responder's same answer table),
+//          and FIN with FIN-ACK; per-connection state keys on the
+//          guest's v6 src addr:port. Both require --net.)
 //         [--net-dhcp-respond <lease-ip>] (milestone five card N8, claim
 //          0351: a tiny deterministic host-side DHCP server inside the
 //          capture thread — the guest's DHCPDISCOVER is answered with an
@@ -250,6 +308,31 @@
 //          contract. OFF by default: without the flag
 //          config.networkDevices stays [] — every existing gate is
 //          byte-identical.)
+//         [--net-bridged <iface>] (M117d, issue #2476, ADR 0057 D11:
+//          attach one VZVirtioNetworkDeviceConfiguration with a
+//          VZBridgedNetworkDeviceAttachment on the named
+//          VZBridgedNetworkInterface — the guest sits on the host's real
+//          LAN (its own MAC, a real DHCP lease). OFF by default. Every
+//          missing piece refuses by name: an <iface> absent from
+//          VZBridgedNetworkInterface.networkInterfaces names itself; the
+//          com.apple.vm.networking entitlement absent from this binary's
+//          signature names itself (it is a RESTRICTED entitlement — an
+//          ad-hoc codesign cannot carry it; entitlements-net.plist is the
+//          set for a development-signed build). Mutually exclusive with
+//          --net/--net-nat/--net-vmnet — one network device per guest.)
+//         [--net-vmnet] (M117d, issue #2476, ADR 0057 D11: attach one
+//          VZVirtioNetworkDeviceConfiguration with a
+//          VZVmnetNetworkDeviceAttachment on a shared-mode vmnet logical
+//          network (vmnet_network_create, macOS 26+ — the daemon serves
+//          DHCP + NAT44/66 by default). OFF by default. A non-success
+//          vmnet_return_t from vmnet_network_create fails carrying the
+//          status and naming the com.apple.developer.networking.vmnet
+//          entitlement (or root) the daemon demands — also restricted,
+//          also in entitlements-net.plist. Same mutual exclusivity.
+//          [--net-vmnet-subnet <a.b.c.d>/<len>] pins the network's IPv4
+//          subnet (e.g. 192.168.77.0/24 — the daemon picks a rotating
+//          /24 under 192.168/16 otherwise). The address must be the
+//          network base. Requires --net-vmnet.)
 //         [--net-inject <file>] [--net-inject-after <text>] (milestone five
 //          card N2, claim 6076: the host->guest RX direction of the SAME
 //          --net attachment — the file's bytes are written into the socket
@@ -360,13 +443,23 @@ import DiskImageKit
 #endif
 import Foundation
 import ScreenCaptureKit
+import Security
 import Virtualization
+// M117d (#2476, ADR 0057 D11): vmnet.framework backs --net-vmnet. The
+// vmnet_network_* symbols are macOS 26+, so they exist wherever this
+// runner's deployment floor applies; the module-level guard keeps an
+// older-SDK toolchain compiling — the flag then refuses by name.
+#if canImport(vmnet)
+import vmnet
+#endif
 import VFWire
 import VMAppKit
 import VMDiskImage
 import VMGPU3D
 import VMPostmortem
+import VMProfile
 import VMTcp
+import VSCtl
 import VSNTP
 import VSSH
 
@@ -452,6 +545,28 @@ var usbMsdPath: String? = nil
 // formatting is mkfs.vlfs's job, never the runner's. Off by default: without
 // the flag config.storageDevices keeps its single boot element.
 var dataDiskPath: String? = nil
+// M115c (issue #2462): `--profile <path>` boots a persistent machine from a
+// `.virelaivm` bundle instead of the flag-by-flag throwaway pieces. The
+// bundle's manifest members fill --vars/--overlay-base/--data-disk/
+// --cvc-file and its config.json fills cpus/ram/device defaults — every
+// explicit flag wins over the profile member it names. `--profile-init`
+// only mints/validates the bundle and exits (session.sh's pre-seed step).
+var profilePath: String?
+var profileInitOnly = false
+// M115d (#2463): `--resume <path>` boots the profile's saved machine
+// state instead of the boot image — the continuation of a ctl `suspend`.
+var resumeFromPath: String?
+// M115f (#2465): `--apply-update` verifies the guest-staged signed set in
+// <share>/UPDATE/ (UPDATE.MF + UPDATE.SIG over it) and swaps it in as the
+// boot base image, retaining the old base at <base>.prev and discarding
+// a profile's persistent overlay.asif. `--rollback-update` swaps .prev
+// back. `--update-key <64-hex>` pins the Ed25519 public key the manifest
+// must verify under; absent it, a profile's config.json updatePubkey
+// applies.
+var applyUpdate = false
+var rollbackUpdate = false
+var updateKeyHex: String?
+var memoryMiB = 256
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
 // VZVirtualMachineView after `--input-key-after <marker>` (default: the
@@ -550,7 +665,23 @@ var vzRestoreWitness: String?
 var vzRestoreVerifyCommand: String?
 var vzRestoreVerifyOutput: String?
 var virtioFSShareDir: String?
+// M115a (#2460): Apple's standard VSOCK device (`VZVirtioSocketDevice`) —
+// the probe for a restore-safe guest↔host channel. `--vsock` attaches the
+// device and arms a host listener on `--vsock-port` (default 1208); under
+// `--vz-restore` the card measures whether the device survives
+// save/restore and a post-restore guest connect is still accepted.
+var vsockEnabled = false
+var vsockPort: UInt32 = 1208
+var vsockPortSet = false
+// M115b (#2461, ADR 0056): the virelai-ctl/1 control channel on the same
+// device. `--vsock-ctl` arms a second listener on `--vsock-ctl-port`
+// (default 1209) that serves the HMAC-challenged suspend/snapshot wire;
+// the credential is the share's `vsock-ctl` SECRETS.TXT row (uid_system).
+var vsockCtlEnabled = false
+var vsockCtlPort: UInt32 = VSCtl.defaultPort
+var vsockCtlPortSet = false
 var cpuCount = 2
+var cpusExplicit = false
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
 var expectLine = "firmware has agreed to cooperate"
@@ -669,6 +800,15 @@ var hostDrop: HostDrop?
 // banners under the session bundle (bare runner: `no_bundle` drops).
 var hostNotifyFlag = false
 var hostNotify: HostNotify?
+// M127d (#2602, ADR 0051 V2-D5): `--host-outbox` arms the export lane —
+// the seat signs OUTBOX records for REQ-marked payloads under
+// <share>/OUTBOX/ and the runner moves them to `--host-outbox-dir`
+// (default ~/Downloads; the flag is the gate redirect — a class-B run
+// never touches a real Downloads). No display precondition: exports are
+// not a window gesture.
+var hostOutboxFlag = false
+var hostOutboxDir: String?
+var hostOutbox: HostOutbox?
 // M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
 // headless mirror of the HostCommand bus every menu item dispatches on
 // (index thesis 1: AppKit is never driven by synthesized clicks; the bus
@@ -782,6 +922,15 @@ var netIcmpRespondHostIP: [UInt8]?
 var netRaRespondPrefix: [UInt8]? // the advertised /64 (16 bytes, IID bits zero)
 var netNdpRespondAddrs: [[UInt8]] = []
 var netIcmp6RespondAddr: [UInt8]?
+// M117c (#2475, ADR 0057): the v6 transport responders — the N5 UDP echo
+// and the N10 TCP handshake+echo shapes on the 40-byte fixed header
+// (ethertype 0x86dd, next-header 17 / 6). Both take `[v6-addr]:port` —
+// the same bracketed literal shape `vi.Dial` speaks — so an address's
+// own colons never confuse the parse.
+var netUdp6RespondAddr: [UInt8]?
+var netUdp6RespondPort: UInt16?
+var netTcp6RespondAddr: [UInt8]?
+var netTcp6RespondPort: UInt16?
 // The hermetic router's link-local — the modified-EUI-64 derivation of
 // the fixed host MAC 02:00:00:00:00:02 (ADR 0057 D10).
 let netRouterLinkLocal: [UInt8] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x02]
@@ -953,6 +1102,22 @@ let netTcpSrvConnLimit = 16
 func netTcpConnKey(_ guestIP: [UInt8], _ guestPort: UInt16) -> String {
     "\(guestIP[0]).\(guestIP[1]).\(guestIP[2]).\(guestIP[3]):\(guestPort)"
 }
+// M117c (#2475): the v6 connection key — the v6 address rendered
+// compactly so it shares the bounded `netTcpSrvConns` table without ever
+// colliding with a dotted-quad key.
+func netTcp6ConnKey(_ guestAddr: [UInt8], _ guestPort: UInt16) -> String {
+    "v6:" + v6Text(guestAddr) + ":\(guestPort)"
+}
+/// The v6 connection a guest segment belongs to — the v4
+/// `netTcpSrvConn(for:)` shape on the 40-byte header (src at 22..38,
+/// ports at 54..58).
+func netTcp6SrvConn(for buf: [UInt8]) -> NetTcpSrvConn {
+    let key = netTcp6ConnKey([UInt8](buf[22..<38]), (UInt16(buf[54]) << 8) | UInt16(buf[55]))
+    if let conn = netTcpSrvConns[key] { return conn }
+    let conn = NetTcpSrvConn()
+    netTcpSrvConns[key] = conn
+    return conn
+}
 /// The connection a guest segment belongs to — lazily created so every
 /// segment reaches the per-connection state machine (byte-identical with
 /// today's always-on scalar for the single-connection case).
@@ -1087,6 +1252,26 @@ var netTcpClients: [NetTcpClient] = []
 // VM is unchanged). Mutually exclusive with `--net` (one network device
 // per guest for now).
 var netNatEnabled = false
+// M117d (issue #2476, ADR 0057 D11): the opt-in real-LAN attachments.
+// `--net-bridged <iface>` attaches a VZBridgedNetworkDeviceAttachment on
+// the named VZBridgedNetworkInterface; `--net-vmnet` attaches a
+// VZVmnetNetworkDeviceAttachment on a shared-mode vmnet logical network
+// created up front (vmnet_network_create). Both are off by default,
+// mutually exclusive with --net/--net-nat/each other, and every missing
+// piece refuses by name — the absent interface, the absent
+// com.apple.vm.networking entitlement in this signature, or the
+// non-success vmnet_return_t the daemon returns when it lacks
+// com.apple.developer.networking.vmnet/root. netBridgedIface and
+// netVmnetNetwork hold the validated objects between flag checks and the
+// attachment assembly below.
+var netBridgedInterface: String?
+var netVmnetEnabled = false
+var netVmnetSubnet: (ip: [UInt8], prefixLen: Int)?
+var netBridgedIface: VZBridgedNetworkInterface?
+var netVmnetSubnetText: String?
+#if canImport(vmnet)
+var netVmnetNetwork: vmnet_network_ref?
+#endif
 
 // Issue #523 item 2 (claim 6637): run isolation.
 // `--overlay-base <path>`: open <path> READ-ONLY as the base of a
@@ -1122,10 +1307,10 @@ while idx < arguments.count {
         let valued = ["--overlay-base", "--vars", "--serial", "--cpus", "--timeout",
                       "--vz-restore-save", "--vz-restore-load", "--vz-restore-witness",
                       "--vz-restore-verify-command", "--vz-restore-verify-output",
-                      "--usb-msd", "--virtio-fs"]
-        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal"]
+                      "--usb-msd", "--virtio-fs", "--vsock-port", "--vsock-ctl-port"]
+        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock", "--vsock-ctl"]
         guard valued.contains(arg) || bare.contains(arg) else {
-            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal.")
+            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal, --vsock.")
         }
         if valued.contains(arg) {
             guard idx + 1 < arguments.count, !arguments[idx + 1].hasPrefix("--") else {
@@ -1184,6 +1369,24 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--data-disk", idx + 1 < arguments.count {
         dataDiskPath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--profile", idx + 1 < arguments.count {
+        profilePath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--resume", idx + 1 < arguments.count {
+        resumeFromPath = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--profile-init" {
+        profileInitOnly = true
+        idx += 1
+    } else if arg == "--apply-update" {
+        applyUpdate = true
+        idx += 1
+    } else if arg == "--rollback-update" {
+        rollbackUpdate = true
+        idx += 1
+    } else if arg == "--update-key", idx + 1 < arguments.count {
+        updateKeyHex = arguments[idx + 1]
         idx += 2
     } else if arg == "--input-key", idx + 1 < arguments.count {
         guard let kc = UInt16(arguments[idx + 1]) else {
@@ -1260,11 +1463,32 @@ while idx < arguments.count {
     } else if arg == "--virtio-fs", idx + 1 < arguments.count {
         virtioFSShareDir = arguments[idx + 1]
         idx += 2
+    } else if arg == "--vsock" {
+        vsockEnabled = true
+        idx += 1
+    } else if arg == "--vsock-port", idx + 1 < arguments.count {
+        guard let port = UInt32(arguments[idx + 1]), port != 0 else {
+            fail("--vsock-port requires a numeric port value in 1...4294967294.")
+        }
+        vsockPort = port
+        vsockPortSet = true
+        idx += 2
+    } else if arg == "--vsock-ctl" {
+        vsockCtlEnabled = true
+        idx += 1
+    } else if arg == "--vsock-ctl-port", idx + 1 < arguments.count {
+        guard let port = UInt32(arguments[idx + 1]), port != 0 else {
+            fail("--vsock-ctl-port requires a numeric port value in 1...4294967294.")
+        }
+        vsockCtlPort = port
+        vsockCtlPortSet = true
+        idx += 2
     } else if arg == "--cpus", idx + 1 < arguments.count {
         guard let n = Int(arguments[idx + 1]), n >= 1, n <= 8 else {
             fail("--cpus requires a count in 1...8, got '\(arguments[idx + 1])'.")
         }
         cpuCount = n
+        cpusExplicit = true
         idx += 2
     } else if arg == "--timeout", idx + 1 < arguments.count {
         timeout = TimeInterval(arguments[idx + 1]) ?? 30
@@ -1456,6 +1680,15 @@ while idx < arguments.count {
         // never touches the queue shape.
         hostNotifyFlag = true
         idx += 1
+    } else if arg == "--host-outbox" {
+        // M127d (#2602, ADR 0051 V2-D5): the guest→host export lane —
+        // REQ-marked payloads under OUTBOX/ become signed records the
+        // runner verifies and moves out. Modifier on --cvc-file.
+        hostOutboxFlag = true
+        idx += 1
+    } else if arg == "--host-outbox-dir", idx + 1 < arguments.count {
+        hostOutboxDir = arguments[idx + 1]
+        idx += 2
     } else if arg == "--cvc-console-file", idx + 1 < arguments.count {
         // Claim 0680: structured console — capture every queue-1 guest log
         // line to this file and arm the guest's console tee (kind-3) when
@@ -1552,6 +1785,37 @@ while idx < arguments.count {
             fail("--net-icmp6-respond requires a v6 address, got '\(arguments[idx + 1])'.")
         }
         netIcmp6RespondAddr = addr
+        idx += 2
+    } else if arg == "--net-udp6-respond", idx + 1 < arguments.count {
+        // M117c (#2475): '[v6-addr]:port' — the bracket keeps the
+        // address's own colons out of the port split.
+        let token = arguments[idx + 1]
+        guard token.hasPrefix("["), let close = token.firstIndex(of: "]") else {
+            fail("--net-udp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        let addrText = String(token[token.index(after: token.startIndex)..<close])
+        guard let addr = parseIPv6(addrText),
+              token[token.index(after: close)..<token.endIndex].hasPrefix(":"),
+              let port = UInt16(token[token.index(after: close)..<token.endIndex].dropFirst()) else {
+            fail("--net-udp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        netUdp6RespondAddr = addr
+        netUdp6RespondPort = port
+        idx += 2
+    } else if arg == "--net-tcp6-respond", idx + 1 < arguments.count {
+        // M117c (#2475): the same '[v6-addr]:port' bracketed shape.
+        let token = arguments[idx + 1]
+        guard token.hasPrefix("["), let close = token.firstIndex(of: "]") else {
+            fail("--net-tcp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        let addrText = String(token[token.index(after: token.startIndex)..<close])
+        guard let addr = parseIPv6(addrText),
+              token[token.index(after: close)..<token.endIndex].hasPrefix(":"),
+              let port = UInt16(token[token.index(after: close)..<token.endIndex].dropFirst()) else {
+            fail("--net-tcp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        netTcp6RespondAddr = addr
+        netTcp6RespondPort = port
         idx += 2
     } else if arg == "--net-udp-respond", idx + 1 < arguments.count {
         // Parse the host ip:port now (fail early, like --timeout).
@@ -1867,9 +2131,175 @@ while idx < arguments.count {
     } else if arg == "--net-nat" {
         netNatEnabled = true
         idx += 1
+    } else if arg == "--net-bridged", idx + 1 < arguments.count {
+        netBridgedInterface = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--net-vmnet" {
+        netVmnetEnabled = true
+        idx += 1
+    } else if arg == "--net-vmnet-subnet", idx + 1 < arguments.count {
+        // <a.b.c.d>/<len> — the subnet base for the vmnet logical
+        // network (the daemon assigns a rotating /24 without it). Must be
+        // the network address: the daemon interprets the value literally
+        // and a non-base address is a silent different network.
+        let halves = arguments[idx + 1].split(separator: "/")
+        let parts = halves.count == 2 ? halves[0].split(separator: ".").compactMap { UInt8($0) } : []
+        guard halves.count == 2, let len = Int(halves[1]), (1...31).contains(len), parts.count == 4 else {
+            fail("--net-vmnet-subnet requires '<a.b.c.d>/<len>' like 192.168.77.0/24, got '\(arguments[idx + 1])'.")
+        }
+        let mv: UInt32 = ~UInt32(0) << (32 - len)
+        let av = UInt32(parts[0]) << 24 | UInt32(parts[1]) << 16 | UInt32(parts[2]) << 8 | UInt32(parts[3])
+        guard av & mv == av else {
+            fail("--net-vmnet-subnet: '\(arguments[idx + 1])' is not the network base (host bits set).")
+        }
+        netVmnetSubnet = (parts, len)
+        idx += 2
     } else {
         serialLogPath = arg
         idx += 1
+    }
+}
+
+// M115c (#2462): `--profile` resolves the bundle BEFORE the member paths
+// are consumed below. An absent path is minted; an existing directory must
+// carry a readable virelaivm/1 manifest (missing/corrupt refuses by name).
+// Every profile member is a default — an explicit --vars/--overlay-base/
+// --data-disk/--cvc-file/--cpus flag wins regardless of argument order.
+var activeProfile: VMProfile? = nil
+if profileInitOnly, profilePath == nil {
+    fail("--profile-init requires --profile <path>.")
+}
+// M115d (#2463): `--resume` IS a profile boot — it names the bundle and
+// flags the saved-state restore below. A resume names an existing
+// bundle by name; minting one to restore an empty saved-state would be
+// a silent no-suspend, so the load fails closed instead.
+if let resumeFromPath {
+    if profileInitOnly {
+        fail("--resume and --profile-init are mutually exclusive.")
+    }
+    if vzRestore {
+        fail("--resume and --vz-restore are mutually exclusive.")
+    }
+    if let profilePath, profilePath != resumeFromPath {
+        fail("--resume and --profile disagree (resume boots the named bundle; pass one path).")
+    }
+    profilePath = resumeFromPath
+}
+var resumeStateURL: URL? = nil
+if let profilePath {
+    do {
+        activeProfile = resumeFromPath != nil
+            ? try VMProfile.load(from: URL(fileURLWithPath: profilePath))
+            : try VMProfile.openOrCreate(at: URL(fileURLWithPath: profilePath))
+    } catch {
+        fail("\(resumeFromPath != nil ? "--resume" : "--profile"): \(error)")
+    }
+}
+if let _ = resumeFromPath {
+    // The file the ctl `suspend` verb writes — its absence is the honest
+    // "there is no suspended state" refusal, named up front.
+    let url = activeProfile!.savedStateURL.appendingPathComponent(SuspendCtl.stateFileName)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        fail("--resume: no saved state at \(url.path) (nothing has suspended into this profile).")
+    }
+    resumeStateURL = url
+    print("SUSPEND-RESUME: armed state=\(url.path)")
+}
+if let p = activeProfile {
+    if varsOverridePath == nil { varsOverridePath = p.efiVarsURL.path }
+    if overlayBasePath == nil { overlayBasePath = p.config.baseImage }
+    if dataDiskPath == nil, p.config.devices.dataDisk { dataDiskPath = p.vlfsURL.path }
+    if cvcFileShareDir == nil, virtioFSShareDir == nil, p.config.devices.share {
+        // The bundle's share/ rides the same host file channel --cvc-file
+        // attaches — including the implied six-queue device shape. An
+        // explicit --virtio-fs wins the slot: the custom-virtio device is
+        // the one VZ save/restore refuses, so a save-capable caller arms
+        // the share on the standard transport instead (M120a #2558).
+        cvcFileShareDir = p.shareURL.path
+        cvcSnapEnabled = true
+        viaVirtioEnabled = true
+        customVirtioEnabled = true
+        cvcEchoEnabled = true
+    }
+    if !cpusExplicit { cpuCount = p.config.cpus }
+    memoryMiB = p.config.memoryMiB
+    displayMode = displayMode || p.config.devices.display
+    inputMode = inputMode || p.config.devices.input
+    soundMode = soundMode || p.config.devices.sound
+    netNatEnabled = netNatEnabled || p.config.devices.netNat
+    vsockEnabled = vsockEnabled || p.config.devices.vsock
+}
+if profileInitOnly {
+    // Mint/validate the bundle and exit without booting — session.sh runs
+    // this before seeding the share, so a corrupt bundle refuses by name
+    // up front instead of mid-boot. The force-unwrap is safe: the guard
+    // above already proved a profile loaded.
+    let p = activeProfile!
+    print("profile: \(p.created ? "created" : "loaded") \(p.url.path)")
+    print("profile: identity=\(p.identity) cpus=\(p.config.cpus) memoryMiB=\(p.config.memoryMiB) base=\(p.config.baseImage)")
+    exit(0)
+}
+
+// M115f (#2465): the opt-in OS self-update legs. `--apply-update` runs
+// BEFORE the base image is opened: verify the signed staged set on the
+// armed share, then swap it in as the base (old base -> <base>.prev, a
+// profile's persistent overlay.asif discarded). `--rollback-update`
+// swaps .prev back. Both are pure file operations on host paths — the
+// guest can stage but can never choose whether the apply happens.
+if applyUpdate, rollbackUpdate {
+    fail("--apply-update and --rollback-update are mutually exclusive.")
+}
+if applyUpdate || rollbackUpdate {
+    guard let base = overlayBasePath else {
+        fail("\(rollbackUpdate ? "--rollback-update" : "--apply-update"): no_base (no base image — needs --overlay-base or --profile).")
+    }
+    let baseURL = URL(fileURLWithPath: base)
+    // A profile's persistent overlay belongs to the outgoing base — a
+    // swapped base starts with a fresh layer (the overlay is re-minted at
+    // the attach point below when absent).
+    let overlayURL = activeProfile?.overlayURL
+    if rollbackUpdate {
+        let hadOverlay = overlayURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        do {
+            let sha = try OSUpdate.rollback(baseImage: baseURL, overlay: overlayURL)
+            print("apply-update: rollback restored sha256=\(sha)")
+            if hadOverlay {
+                print("apply-update: overlay reset (stale sectors belong to the old base)")
+            }
+        } catch {
+            fail("apply-update: \(error)")
+        }
+    } else {
+        // The staged set lives on the share the guest writes — the armed
+        // --cvc-file / --virtio-fs dir or the bundle's share/.
+        guard let share = cvcFileShareDir ?? virtioFSShareDir else {
+            fail("apply-update: no_share (UPDATE/ is staged on the host share — arm --cvc-file/--virtio-fs or a profile share).")
+        }
+        if let updateDir = OSUpdate.stagedDir(shareDir: URL(fileURLWithPath: share)) {
+            // The trust pin: the flag wins; else the bundle's own
+            // config.json updatePubkey — a host-side value the guest
+            // cannot reach.
+            let keyHex = updateKeyHex ?? activeProfile?.config.updatePubkey
+            guard let keyHex, let keyData = dataFromHex(keyHex), keyData.count == 32 else {
+                fail("apply-update: no_key (--update-key <64-hex Ed25519 public key> or profile config updatePubkey).")
+            }
+            // The overlay marker is observable: the discard of a
+            // persistent overlay.asif is the proof no stale sector shadows
+            // the new base (the attach point re-mints it on THIS boot).
+            let hadOverlay = overlayURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            do {
+                let manifest = try OSUpdate.apply(updateDir: updateDir, baseImage: baseURL,
+                                                  publicKey: keyData, overlay: overlayURL)
+                print("apply-update: applied version=\(manifest.version) image=\(OSUpdate.imageName)")
+                if hadOverlay {
+                    print("apply-update: overlay reset (stale sectors belong to the old base)")
+                }
+            } catch {
+                fail("apply-update: \(error)")
+            }
+        } else {
+            print("apply-update: none staged")
+        }
     }
 }
 
@@ -1996,6 +2426,15 @@ if hostSessionMode {
 if vzRestore, !timeout.isFinite || timeout <= 0 || timeout > 600 {
     fail("--vz-restore requires --timeout in (0, 600] seconds; it never runs unbounded.")
 }
+if vsockPortSet, !vsockEnabled {
+    fail("--vsock-port requires --vsock (the port names the host listener on the attached device).")
+}
+if vsockCtlEnabled, !vsockEnabled {
+    fail("--vsock-ctl requires --vsock (the control channel rides the same socket device).")
+}
+if vsockCtlPortSet, !vsockCtlEnabled {
+    fail("--vsock-ctl-port requires --vsock-ctl.")
+}
 if vzRestoreWitness != nil, !vzRestore {
     fail("--vz-restore-witness requires --vz-restore.")
 }
@@ -2028,6 +2467,12 @@ if secureBootEnabled {
     }
     guard !secureBootDbEfiPaths.isEmpty || !secureBootDbHashes.isEmpty else {
         fail("--secure-boot requires at least one of --secure-boot-db-efi <PE path> or --secure-boot-db-hash <64-hex>.")
+    }
+    // M115c (#2462): enrollment overwrites the vars file every run, which
+    // would destroy the profile's persistent efi-vars.bin — refuse the
+    // combination rather than silently mangling a bundle member.
+    guard activeProfile == nil else {
+        fail("--secure-boot builds a FRESH variable store each run; --profile's efi-vars.bin is persistent. The combination is refused.")
     }
 }
 
@@ -2185,7 +2630,7 @@ let bootLoader = VZEFIBootLoader()
 bootLoader.variableStore = variableStore
 let config = VZVirtualMachineConfiguration()
 config.bootLoader = bootLoader
-config.memorySize = 256 * 1024 * 1024
+config.memorySize = UInt64(memoryMiB) * 1024 * 1024
 config.cpuCount = cpuCount
 // M70g G3 (#1459): a saved machine state is bound to the platform's
 // machineIdentifier (VZGenericPlatformConfiguration.h: "When a virtual machine
@@ -2214,6 +2659,24 @@ if vzRestoreSaveDir != nil || vzRestoreLoadDir != nil {
             fail("--vz-restore-save: could not persist the machine identifier into '\(save)': \(error)")
         }
         print("  platform: machineIdentifier persisted to \(dir.appendingPathComponent("machine-id.bin").path) (--vz-restore-save)")
+    }
+    config.platform = platform
+} else if let p = activeProfile {
+    // M115c (#2462): a profiled machine keeps ONE machineIdentifier for its
+    // whole life — adopt the bundle's machine-id.bin (minted at create,
+    // reminted+persisted here if absent or unreadable by VZ) so a later
+    // saved state binds and every boot presents the same machine.
+    let platform = VZGenericPlatformConfiguration()
+    if let data = p.machineIdentifierData(),
+       let id = VZGenericMachineIdentifier(dataRepresentation: data) {
+        platform.machineIdentifier = id
+    } else {
+        do {
+            try p.setMachineIdentifier(platform.machineIdentifier.dataRepresentation)
+        } catch {
+            fail("--profile: could not persist \(p.machineIdentifierURL.path): \(error)")
+        }
+        print("  platform: machineIdentifier minted into \(p.machineIdentifierURL.path)")
     }
     config.platform = platform
 }
@@ -2253,20 +2716,39 @@ do {
                 // cleanup; the load process (or a failed run's post-mortem)
                 // owns it.
                 stackDir = URL(fileURLWithPath: save, isDirectory: true)
+            } else if let p = activeProfile {
+                // M115c (#2462): the overlay lives INSIDE the bundle — a
+                // persisted member, never the throwaway tmp layer, and never
+                // the atexit cleanup.
+                stackDir = p.url
             } else {
                 stackDir = FileManager.default.temporaryDirectory
                     .appendingPathComponent("virelai-overlay-\(UUID().uuidString)", isDirectory: true)
                 overlayCleanupPath = stackDir.path
             }
             try FileManager.default.createDirectory(at: stackDir, withIntermediateDirectories: true)
-            let layer = ASIFCreationConfiguration.layer(
-                url: stackDir.appendingPathComponent("overlay.asif"),
-                type: .overlay(blockCount: Int(diskBase.blockCount)))
-            let stacked = try diskBase.appending(layer)
+            let overlayURL = stackDir.appendingPathComponent("overlay.asif")
+            let stacked: any StackedImage
+            if let p = activeProfile, FileManager.default.fileExists(atPath: overlayURL.path) {
+                // M115c: a profiled machine REOPENS its persisted overlay —
+                // guest writes to the boot disk survive across sessions.
+                // (The vz-restore-save leg above is unreachable with a
+                // profile: --profile is not in that probe's flag set.)
+                _ = p
+                let overlay = try DiskImage(opening: .open(url: overlayURL, mode: .readWrite))
+                stacked = try diskBase.appending(overlay)
+            } else {
+                let layer = ASIFCreationConfiguration.layer(
+                    url: overlayURL,
+                    type: .overlay(blockCount: Int(diskBase.blockCount)))
+                stacked = try diskBase.appending(layer)
+            }
             let attachment = try VZDiskImageStorageDeviceAttachment(diskImage: stacked)
             config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
             if vzRestoreSaveDir != nil {
                 print("  disk: \(base) (base, read-only) + persisted ASIF overlay in \(stackDir.path) (--vz-restore-save; kept for the load process)")
+            } else if activeProfile != nil {
+                print("  disk: \(base) (base, read-only) + persistent ASIF overlay \(overlayURL.path) (--profile)")
             } else {
                 print("  disk: \(base) (base, read-only) + throwaway ASIF overlay in \(stackDir.path)")
             }
@@ -2455,6 +2937,12 @@ if !netNdpRespondAddrs.isEmpty, netCapturePath == nil {
 if netIcmp6RespondAddr != nil, netCapturePath == nil {
     fail("--net-icmp6-respond requires --net (the echo reply is written into the SAME attachment's socket).")
 }
+if netUdp6RespondAddr != nil, netCapturePath == nil {
+    fail("--net-udp6-respond requires --net (the UDP reply is written into the SAME attachment's socket).")
+}
+if netTcp6RespondAddr != nil, netCapturePath == nil {
+    fail("--net-tcp6-respond requires --net (the TCP replies are written into the SAME attachment's socket).")
+}
 if netIcmpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-icmp-respond requires --net (the ICMP reply is written into the SAME attachment's socket).")
 }
@@ -2527,6 +3015,113 @@ if netTcpConnectSSHMode {
 // validation shape: a clear fail, like the responder requirements above).
 if netNatEnabled, netCapturePath != nil {
     fail("--net-nat is mutually exclusive with --net (one network device per guest for now).")
+}
+// M117d (issue #2476, ADR 0057 D11): the opt-in real-LAN attachments get
+// the same one-network-device bound, then their own named refusals — the
+// absent interface names itself, the absent com.apple.vm.networking
+// entitlement names itself (checked in THIS signature: it is what VZ's
+// config.validate() consults), and a non-success vmnet_return_t carries
+// its status. Both keys are restricted entitlements an ad-hoc codesign
+// cannot carry (observed 2026-10-17, macOS 27.2: amfid kills the process
+// before main — "adhoc signed but contains restricted entitlements"), so
+// they live in host/vm-runner/entitlements-net.plist for a
+// development-signed build; entitlements.plist stays the ad-hoc-safe set.
+func runnerHasEntitlement(_ name: String) -> Bool {
+    guard let task = SecTaskCreateFromSelf(nil),
+          let value = SecTaskCopyValueForEntitlement(task, name as CFString, nil) else {
+        return false
+    }
+    return (value as? Bool) ?? (value as? NSNumber)?.boolValue ?? false
+}
+#if canImport(vmnet)
+func vmnetStatusName(_ status: vmnet_return_t) -> String {
+    switch status.rawValue {
+    case 1000: return "VMNET_SUCCESS"
+    case 1001: return "VMNET_FAILURE"
+    case 1002: return "VMNET_MEM_FAILURE"
+    case 1003: return "VMNET_INVALID_ARGUMENT"
+    case 1004: return "VMNET_SETUP_INCOMPLETE"
+    case 1005: return "VMNET_INVALID_ACCESS"
+    case 1006: return "VMNET_PACKET_TOO_BIG"
+    case 1007: return "VMNET_BUFFER_EXHAUSTED"
+    case 1008: return "VMNET_TOO_MANY_PACKETS"
+    case 1009: return "VMNET_SHARING_SERVICE_BUSY"
+    case 1010: return "VMNET_NOT_AUTHORIZED"
+    default: return "vmnet_return_t(\(status.rawValue))"
+    }
+}
+func ipv4Text(_ addr: in_addr) -> String {
+    let b = UInt32(bigEndian: addr.s_addr)
+    return "\(b >> 24 & 0xff).\(b >> 16 & 0xff).\(b >> 8 & 0xff).\(b & 0xff)"
+}
+func prefixLen(_ mask: in_addr) -> Int {
+    Int((UInt32(bigEndian: mask.s_addr)).nonzeroBitCount)
+}
+#endif
+if netBridgedInterface != nil {
+    if netCapturePath != nil {
+        fail("--net-bridged is mutually exclusive with --net (one network device per guest for now).")
+    }
+    if netNatEnabled {
+        fail("--net-bridged is mutually exclusive with --net-nat (one network device per guest for now).")
+    }
+    if netVmnetEnabled {
+        fail("--net-bridged is mutually exclusive with --net-vmnet (one network device per guest for now).")
+    }
+    let wanted = netBridgedInterface!
+    guard let iface = VZBridgedNetworkInterface.networkInterfaces.first(where: { $0.identifier == wanted }) else {
+        let available = VZBridgedNetworkInterface.networkInterfaces.map { $0.identifier }.joined(separator: ",")
+        fail("--net-bridged: interface '\(wanted)' is not in VZBridgedNetworkInterface.networkInterfaces (bridgeable here: \(available.isEmpty ? "<none>" : available)).")
+    }
+    if !runnerHasEntitlement("com.apple.vm.networking") {
+        fail("--net-bridged requires the com.apple.vm.networking entitlement, which this binary's signature does not carry. It is a RESTRICTED entitlement on macOS 27: an ad-hoc codesign (--sign -) carrying it is killed by amfid before main() (observed). Sign with a development identity using host/vm-runner/entitlements-net.plist, or use --net/--net-nat instead.")
+    }
+    netBridgedIface = iface
+}
+if netVmnetEnabled {
+    if netCapturePath != nil {
+        fail("--net-vmnet is mutually exclusive with --net (one network device per guest for now).")
+    }
+    if netNatEnabled {
+        fail("--net-vmnet is mutually exclusive with --net-nat (one network device per guest for now).")
+    }
+    if netBridgedInterface != nil {
+        fail("--net-vmnet is mutually exclusive with --net-bridged (one network device per guest for now).")
+    }
+#if canImport(vmnet)
+    var netVmnetStatus = vmnet_return_t.VMNET_SUCCESS
+    guard let vmnetConfig = vmnet_network_configuration_create(operating_modes_t.VMNET_SHARED_MODE, &netVmnetStatus) else {
+        fail("--net-vmnet: vmnet_network_configuration_create failed (vmnet_return_t=\(netVmnetStatus.rawValue) \(vmnetStatusName(netVmnetStatus))).")
+    }
+    if let subnet = netVmnetSubnet {
+        // The daemon's set_ipv4_subnet takes the GATEWAY address — the
+        // second address of the range — not the base (observed in
+        // apple/containerization's configureSubnetV4, and by the daemon's
+        // own refusal: passing the base gives "can't have the gateway at
+        // the subnet address" at interface start, err 49).
+        let mv: UInt32 = ~UInt32(0) << (32 - subnet.prefixLen)
+        let av = UInt32(subnet.ip[0]) << 24 | UInt32(subnet.ip[1]) << 16 | UInt32(subnet.ip[2]) << 8 | UInt32(subnet.ip[3])
+        var saddr = in_addr(s_addr: (av + 1).byteSwapped)
+        var smask = in_addr(s_addr: mv.byteSwapped)
+        let setStatus = vmnet_network_configuration_set_ipv4_subnet(vmnetConfig, &saddr, &smask)
+        guard setStatus == .VMNET_SUCCESS else {
+            fail("--net-vmnet-subnet: vmnet_network_configuration_set_ipv4_subnet failed (vmnet_return_t=\(setStatus.rawValue) \(vmnetStatusName(setStatus))).")
+        }
+    }
+    var netVmnetCreateStatus = vmnet_return_t.VMNET_SUCCESS
+    guard let network = vmnet_network_create(vmnetConfig, &netVmnetCreateStatus) else {
+        fail("--net-vmnet: vmnet_network_create failed (vmnet_return_t=\(netVmnetCreateStatus.rawValue) \(vmnetStatusName(netVmnetCreateStatus))) — the vmnet daemon requires the com.apple.developer.networking.vmnet entitlement or root (observed in the daemon's client_entitlement_check). The entitlement is restricted: an ad-hoc codesign cannot carry it — sign with a development identity using host/vm-runner/entitlements-net.plist.")
+    }
+    netVmnetNetwork = network
+    var netSub = in_addr(), netMask = in_addr()
+    vmnet_network_get_ipv4_subnet(network, &netSub, &netMask)
+    netVmnetSubnetText = "\(ipv4Text(netSub))/\(prefixLen(netMask))"
+#else
+    fail("--net-vmnet requires a macOS 26+ SDK build (vmnet_network_create); this binary was compiled without vmnet.framework.")
+#endif
+}
+if netVmnetSubnet != nil, !netVmnetEnabled {
+    fail("--net-vmnet-subnet requires --net-vmnet.")
 }
 // M70g G2 (#1459): the bridge secret comes from the file OR the inline spec,
 // never both; the file form is preferred because argv is world-readable.
@@ -2602,6 +3197,16 @@ if hostNotifyFlag {
         fail("--host-notify requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
     }
 }
+// M127d (#2602, ADR 0051 V2-D5): the outbox lane is the same modifier
+// shape — no display prerequisite (exports are not a window gesture).
+if hostOutboxFlag || hostOutboxDir != nil {
+    guard hostOutboxFlag else {
+        fail("--host-outbox-dir is a modifier on --host-outbox (no lane to redirect).")
+    }
+    guard cvcFileEnabled else {
+        fail("--host-outbox requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
+    }
+}
 // Claim 9367: --pointer-virtio rides the four-queue device; the after-marker
 // only makes sense with a sequence to schedule.
 if pointerVirtioScript == nil, pointerVirtioAfter != nil {
@@ -2635,6 +3240,15 @@ if let sharePath = virtioFSShareDir {
     )
     config.directorySharingDevices = [fileSystem]
     print("VIRTIO-FS: ENABLED tag=virelaios share=\(shareURL.path) read-write")
+}
+// M115a (#2460): Apple's standard virtio-socket device — the candidate
+// restore-safe guest↔host channel (the custom-virtio device is refused by
+// validateSaveRestoreSupport; this probe measures whether the SDK's own
+// vsock device is). Attached only under --vsock; the host listener on
+// --vsock-port is armed on the live device after the VM object exists.
+if vsockEnabled {
+    config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+    print("VSOCK: ENABLED host-listen-port=\(vsockPort)")
 }
 // Claim 0680: build the trigger list — one numbered raw file per
 // --snapshot-after instance, in registration order.
@@ -2720,6 +3334,73 @@ if let netCapturePath {
                 buildIcmp6EchoReply(&reply, buf, n, arpHostMAC)
                 try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 print("NET-ICMP6: answered the guest's echo request for \(v6Text(addr)) (id \(reply[58] << 8 | reply[59]), seq \(reply[60] << 8 | reply[61]))")
+            }
+            // M117c (#2475, ADR 0057): the v6 transport responders — the
+            // same request-driven shapes as N5/N10 on the fixed 40-byte
+            // header (UDP at frame 54, TCP at frame 54). A listed
+            // [addr]:port answers; anything else goes unanswered.
+            if let addr = netUdp6RespondAddr, let port = netUdp6RespondPort,
+               isUdp6Datagram(buf, n, addr, port) {
+                var reply = [UInt8](repeating: 0, count: n)
+                buildUdp6Reply(&reply, buf, n, arpHostMAC, addr, port)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                let srcPort = (UInt16(buf[54]) << 8) | UInt16(buf[55])
+                print("NET-UDP6: answered the guest's datagram for [\(v6Text(addr))]:\(port) (reply to guest src port \(srcPort), \(n - 62) payload bytes)")
+            }
+            if let addr = netTcp6RespondAddr, let port = netTcp6RespondPort,
+               isTcp6Segment(buf, n, addr, port) {
+                let flags = tcp6Flags(buf)
+                let seq = tcp6Seq(buf)
+                var reply = [UInt8](repeating: 0, count: 4096)
+                var payload = [UInt8]()
+                let dataOff = 54 + max(5, Int(buf[66] >> 4)) * 4
+                if n > dataOff { payload = [UInt8](buf[dataOff..<n]) }
+                let isSyn = (flags & 0x02) != 0 && (flags & 0x10) == 0
+                let isFin = (flags & 0x01) != 0
+                let isRst = (flags & 0x04) != 0
+                let connKey = netTcp6ConnKey([UInt8](buf[22..<38]), (UInt16(buf[54]) << 8) | UInt16(buf[55]))
+                if isRst {
+                    netTcp6SrvConn(for: buf).closed = true
+                    print("NET-TCP6: observed the guest's RST (seq 0x\(hex32(seq)))")
+                } else if isSyn {
+                    if !netTcpSrvAdmit(connKey) {
+                        let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, 0, seq &+ 1, 0x14, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                        print("NET-TCP6: refused the guest's SYN (seq 0x\(hex32(seq))); \(netTcpSrvConnLimit) connections already live")
+                    } else {
+                        let conn = NetTcpSrvConn()
+                        netTcpSrvConns[connKey] = conn
+                        let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, netTcpSrvIsn, seq &+ 1, 0x12, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                        print("NET-TCP6: answered the guest's SYN (seq 0x\(hex32(seq))) with a SYN-ACK (seq 0x\(hex32(netTcpSrvIsn)), ack 0x\(hex32(seq &+ 1)))")
+                    }
+                } else if isFin {
+                    let conn = netTcp6SrvConn(for: buf)
+                    let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, conn.srvNxt, seq &+ 1, 0x11, payload)
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    conn.closed = true
+                    print("NET-TCP6: answered the guest's FIN (seq 0x\(hex32(seq))) with a FIN-ACK (seq 0x\(hex32(conn.srvNxt)), ack 0x\(hex32(seq &+ 1)))")
+                } else if !payload.isEmpty {
+                    let conn = netTcp6SrvConn(for: buf)
+                    var responsePayload = payload
+                    let isGet = payload.count >= 4 && payload[0] == 0x47 && payload[1] == 0x45 && payload[2] == 0x54 && payload[3] == 0x20
+                    if port == 80 || port == 8080 || isGet {
+                        let body = "Hello from VirelaiOS Host!\n"
+                        let httpBody = "HTTP/1.0 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                        responsePayload = Array(httpBody.utf8)
+                    }
+                    let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, responsePayload)
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    if isGet || port == 80 {
+                        print("NET-TCP6: answered the guest's HTTP request with 200 OK (\(responsePayload.count) bytes)")
+                    } else {
+                        print("NET-TCP6: echoed the guest's \(payload.count)-byte data (ack 0x\(hex32(seq &+ UInt32(payload.count))), \(payload.count) payload bytes)")
+                    }
+                    conn.srvNxt = conn.srvNxt &+ UInt32(responsePayload.count)
+                } else {
+                    _ = netTcp6SrvConn(for: buf)
+                    print("NET-TCP6: observed the guest's ACK (ack 0x\(hex32(tcp6Ack(buf))))")
+                }
             }
             // Card N5: if the guest sent a UDP datagram to our ip:port,
             // echo it back from the host (same socket direction; the
@@ -3073,6 +3754,35 @@ if let netCapturePath {
     }
     natConfig.macAddress = fixedMAC
     config.networkDevices = [natConfig]
+} else if let bridgedIface = netBridgedIface {
+    // M117d (issue #2476, ADR 0057 D11): the bridged attachment — the
+    // guest shares the host's physical interface and sits on the real
+    // LAN with the SAME fixed locally-administered MAC the other
+    // attachments pin (the iface and the com.apple.vm.networking
+    // entitlement were both checked by name during flag validation).
+    let bridgedAttachment = VZBridgedNetworkDeviceAttachment(interface: bridgedIface)
+    let bridgedConfig = VZVirtioNetworkDeviceConfiguration()
+    bridgedConfig.attachment = bridgedAttachment
+    guard let fixedMAC = VZMACAddress(string: "02:00:00:00:00:01") else {
+        fail("Could not parse the fixed net MAC address.")
+    }
+    bridgedConfig.macAddress = fixedMAC
+    config.networkDevices = [bridgedConfig]
+} else if netVmnetEnabled {
+    // M117d (issue #2476, ADR 0057 D11): the vmnet attachment — the
+    // shared-mode logical network was created up front (flag validation
+    // fails carrying the vmnet_return_t on a non-success, so reaching
+    // here means the network exists).
+#if canImport(vmnet)
+    let vmnetAttachment = VZVmnetNetworkDeviceAttachment(network: netVmnetNetwork!)
+    let vmnetNetConfig = VZVirtioNetworkDeviceConfiguration()
+    vmnetNetConfig.attachment = vmnetAttachment
+    guard let fixedMAC = VZMACAddress(string: "02:00:00:00:00:01") else {
+        fail("Could not parse the fixed net MAC address.")
+    }
+    vmnetNetConfig.macAddress = fixedMAC
+    config.networkDevices = [vmnetNetConfig]
+#endif
 } else {
     config.networkDevices = []
 }
@@ -3154,6 +3864,7 @@ if vzRestore {
     if customVirtioEnabled { vzRestoreExtras.append(("custom-virtio", customVirtio: true)) }
     if gpu3dOptions.metal { vzRestoreExtras.append(("gpu3d-metal", customVirtio: true)) }
     if virtioFSShareDir != nil { vzRestoreExtras.append(("virtio-fs", customVirtio: false)) }
+    if vsockEnabled { vzRestoreExtras.append(("vsock", customVirtio: false)) }
     let vzRestoreDevices = vzRestoreExtras.isEmpty ? "headless-base" : vzRestoreExtras.map(\.name).joined(separator: ",")
     print("VZ-RESTORE: devices=\(vzRestoreDevices) mode=\(vzRestoreLoadDir != nil ? "load" : vzRestoreSaveDir != nil ? "save" : "same-process")")
     do {
@@ -3216,6 +3927,31 @@ final class VMRunnerDelegate: NSObject, VZVirtualMachineDelegate {
     /// without VZ narrating it says so).
     func verdict() -> String { stopReasons.verdictSuffix() }
 }
+
+// M115a (#2460): the host-side accept half of the vsock probe. VZ calls the
+// delegate on the VM's queue whenever the guest issues a connect to the
+// listened port; each accepted connection is retained because the SDK
+// documents that an accepted connection's fd dies with the object.
+final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
+    private var connections: [VZVirtioSocketConnection] = []
+
+    func listener(_ listener: VZVirtioSocketListener,
+                  shouldAcceptNewConnection connection: VZVirtioSocketConnection,
+                  from socketDevice: VZVirtioSocketDevice) -> Bool {
+        connections.append(connection)
+        print("VSOCK: listener accepted guest connect dport=\(connection.destinationPort) sport=\(connection.sourcePort) n=\(connections.count)")
+        return true
+    }
+}
+
+// Held strongly: `VZVirtioSocketListener.delegate` is weak, and the listener
+// itself must outlive the VM's socket device for connects to keep landing.
+let vsockListenerDelegate = VsockListenerDelegate()
+let vsockListener = VZVirtioSocketListener()
+// M115b (#2461): the ctl listener + its credential-bearing delegate are
+// created at arm time (the key only exists once the share dir is known).
+var vsockCtlDelegate: VSockCtlListenerDelegate?
+let vsockCtlListener = VZVirtioSocketListener()
 
 // Held strongly: `VZVirtualMachine.delegate` is a weak property, so a
 // temporary would be deallocated immediately and never called.
@@ -3333,8 +4069,11 @@ let terminalDwell: TimeInterval = 2
 
 print("VIRELAIOS VM runner")
 print("  host: arm64 (Apple silicon), macOS \(osVersion.majorVersion).\(osVersion.minorVersion)")
-print("  disk: \(diskImagePath)")
-print("  memory: 256 MiB, cpus: \(cpuCount)")
+print("  disk: \(overlayBasePath ?? diskImagePath)")
+print("  memory: \(memoryMiB) MiB, cpus: \(cpuCount)")
+if let p = activeProfile {
+    print("  profile: \(p.url.path) identity=\(p.identity) (\(p.created ? "created" : "loaded"))")
+}
 if consoleMode {
     print("  mode: interactive console")
     print("  serial log: \(serialLogPath)  (guest output teed to terminal + log)")
@@ -3457,6 +4196,12 @@ if !netNdpRespondAddrs.isEmpty || netRaRespondPrefix != nil {
 if let addr = netIcmp6RespondAddr {
     print("  net-icmp6-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's ICMPv6 echo requests for \(v6Text(addr)) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
 }
+if let addr = netUdp6RespondAddr, let port = netUdp6RespondPort {
+    print("  net-udp6-respond: ENABLED (M117c #2475, ADR 0057) — the host echoes the guest's UDP/IPv6 datagrams for [\(v6Text(addr))]:\(port) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if let addr = netTcp6RespondAddr, let port = netTcp6RespondPort {
+    print("  net-tcp6-respond: ENABLED (M117c #2475, ADR 0057) — the host answers the guest's bounded TCP/IPv6 client on [\(v6Text(addr))]:\(port) (host MAC 02:00:00:00:00:02, server ISN 0x\(hex32(netTcpSrvIsn))) via the capture thread (deterministic, request-driven)")
+}
 if let hostIP = netUdpRespondHostIP, let hostPort = netUdpRespondHostPort {
     let ipText = hostIP.map(String.init).joined(separator: ".")
     print("  net-udp-respond: ENABLED (milestone five card N5, claim 8552) — the host answers the guest's UDP datagrams for \(ipText):\(hostPort) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
@@ -3522,6 +4267,12 @@ if let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort {
 if netNatEnabled {
     print("  net-nat: ENABLED (milestone five card N7, claim 4678) — VZNATNetworkDeviceAttachment attached (host router + NAT; no capture file — guest-observed counters are the gate's evidence)")
 }
+if let iface = netBridgedInterface {
+    print("  net-bridged: ENABLED (M117d, issue #2476, ADR 0057 D11) — VZBridgedNetworkDeviceAttachment on \(iface) (com.apple.vm.networking carried in signature; the guest sits on the real LAN — guest-observed counters are the gate's evidence)")
+}
+if netVmnetEnabled {
+    print("  net-vmnet: ENABLED (M117d, issue #2476, ADR 0057 D11) — VZVmnetNetworkDeviceAttachment on a shared-mode vmnet network\(netVmnetSubnetText.map { " (gateway \($0))" } ?? "") (the daemon serves DHCP + NAT; guest-observed counters are the gate's evidence)")
+}
 
 // M108 (#2325/#2326, ADR 0051): arm the live lanes BEFORE the VM starts —
 // the ARMED record lands in the share now, so the seat's first poll after
@@ -3533,7 +4284,7 @@ if netNatEnabled {
 // The drop lane's display precondition (D4): the drop target is the
 // display view, so a headless runner refuses lane_disabled at arm and the
 // drop bit never enters the mask.
-if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
+if hostClipboardFlag || hostDropFlag || hostNotifyFlag || hostOutboxFlag {
     let shareURL = URL(fileURLWithPath: cvcFileShareDir!, isDirectory: true)
     var mask: UInt8 = 0
     var requested: [String] = []
@@ -3555,6 +4306,10 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
         mask |= HostInt.laneNotify
         requested.append("notify")
     }
+    if hostOutboxFlag {
+        mask |= HostInt.laneOutbox
+        requested.append("outbox")
+    }
     if mask != 0 {
         hostIntSession = HostIntSession.arm(shareDir: shareURL, mask: mask, requested: requested)
     }
@@ -3571,15 +4326,74 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
             hostNotify = HostNotify(session: session)
             hostNotify?.start()
         }
+        if hostOutboxFlag {
+            // --host-outbox-dir redirects the landing; absent it the
+            // lane default is ~/Downloads (the flag is what keeps a
+            // class-B run out of the real one).
+            let dest = hostOutboxDir.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+            hostOutbox = HostOutbox(session: session, destDir: dest)
+            hostOutbox?.start()
+        }
         // One shared 250 ms drain for every consuming lane — the notify
-        // lane rides the same poll as the clipboard drain (ADR 0051 D5).
-        if hostClipboard != nil || hostNotify != nil {
+        // and outbox lanes ride the same poll as the clipboard drain
+        // (ADR 0051 D5, V2-D5).
+        if hostClipboard != nil || hostNotify != nil || hostOutbox != nil {
             DispatchQueue.main.async { hostIntTick() }
         }
     }
 }
 
 runner.queue.async {
+    // M115a (#2460): arm the host vsock listener on the VM's queue BEFORE
+    // any boot or restore — a post-restore guest connect must find the
+    // listener already in place in the loading process too.
+    if vsockEnabled {
+        if let socketDevice = runner.vm.socketDevices.first as? VZVirtioSocketDevice {
+            vsockListener.delegate = vsockListenerDelegate
+            socketDevice.setSocketListener(vsockListener, forPort: vsockPort)
+            print("VSOCK: host listener armed port=\(vsockPort)")
+            // M115b (#2461, ADR 0056): the ctl endpoint is fail-closed —
+            // no `vsock-ctl` share credential, no listener, and a guest
+            // connect then gets the honest RST of an unlistened port.
+            if vsockCtlEnabled {
+                // M115d (#2463): the credential may ride EITHER host file
+                // channel — the profile share can attach through cvc-file
+                // or (for a save/restore-safe device set) virtio-fs.
+                let ctlShareDirs = [cvcFileShareDir, virtioFSShareDir].compactMap { $0 }
+                if let key = ctlShareDirs.lazy.compactMap({
+                    VSCtl.loadKey(shareDir: URL(fileURLWithPath: $0, isDirectory: true))
+                }).first {
+                    // M115d (#2463): the suspend verb's driver — the
+                    // profile's saved-state/ as destination, the
+                    // device set's save/restore verdict as the support
+                    // check. Both computed once here: the verb then
+                    // answers `no_state`/`unsupported` honestly or runs
+                    // the pause→save→reply→stop chain.
+                    var suspendUnsupported: String? = nil
+                    do { try config.validateSaveRestoreSupport() } catch {
+                        suspendUnsupported = "\(error as NSError)"
+                    }
+                    let suspendCtl = SuspendCtl(vm: runner.vm, queue: runner.queue,
+                                              savedStateDir: activeProfile?.savedStateURL,
+                                              unsupported: suspendUnsupported)
+                    let delegate = VSockCtlListenerDelegate(
+                        key: key,
+                        suspendHandler: { suspendCtl.begin() },
+                        onSuspendAccepted: { suspendCtl.finish() })
+                    vsockCtlDelegate = delegate
+                    vsockCtlListener.delegate = delegate
+                    socketDevice.setSocketListener(vsockCtlListener, forPort: vsockCtlPort)
+                    print("VSOCK-CTL: host listener armed port=\(vsockCtlPort) suspend=\(suspendUnsupported != nil ? "unsupported" : (activeProfile == nil ? "no_state" : "armed"))")
+                } else {
+                    print("VSOCK-CTL: refuse no_credential (no vsock-ctl row in the armed share's SECRETS.TXT)")
+                }
+            }
+        } else {
+            FileHandle.standardError.write(Data("ERROR: --vsock was attached but no VZVirtioSocketDevice is present on the VM.\n".utf8))
+            exit(1)
+        }
+    }
     if vzRestore, let load = vzRestoreLoadDir {
         // M70g G3 (#1459): the load process never boots — it restores the
         // other process's saved state into this fresh VZVirtualMachine.
@@ -3590,6 +4404,29 @@ runner.queue.async {
                                    verifyOutput: vzRestoreVerifyOutput,
                                    mode: .load(URL(fileURLWithPath: load, isDirectory: true)))
         probe.startFromSavedState()
+        return
+    }
+    if let resumeURL = resumeStateURL {
+        // M115d (#2463): `--resume` — restore the machine state a ctl
+        // `suspend` saved into the profile and continue the guest. The
+        // ctl listener is already armed above, so the resumed machine
+        // can suspend again.
+        runner.vm.restoreMachineStateFrom(url: resumeURL) { error in
+            if let error {
+                print("SUSPEND-RESUME: restore refused code=\((error as NSError).code) error=\(error as NSError)")
+                FileHandle.standardError.write(Data("ERROR: --resume restore failed: \(error as NSError)\n".utf8))
+                exit(1)
+            }
+            runner.vm.resume { result in
+                if case .failure(let error) = result {
+                    print("SUSPEND-RESUME: resume refused error=\(error as NSError)")
+                    FileHandle.standardError.write(Data("ERROR: --resume resume failed: \(error as NSError)\n".utf8))
+                    exit(1)
+                }
+                vmDidStart = true
+                print("SUSPEND-RESUME: restored \(SuspendCtl.stateFileName)")
+            }
+        }
         return
     }
     runner.vm.start { result in
@@ -4322,6 +5159,7 @@ func captureScreenshotIfMarker(_ text: String) {
 func hostIntTick() {
     hostClipboard?.tick()
     hostNotify?.tick()
+    hostOutbox?.tick()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { hostIntTick() }
 }
 
@@ -4391,7 +5229,7 @@ func fireHostWriteIfMarker(_ text: String) {
 func feedInspector(_ text: String) {
     inspector.ingest(serialText: text)
     if let laneDir = hostIntSession?.laneDir {
-        for tag in [HostInt.Tag.clipIn, .clipOut, .notifyOut, .drop] {
+        for tag in [HostInt.Tag.clipIn, .clipOut, .notifyOut, .drop, .outbox, .notifyFocus] {
             for (_, seq) in HostInt.records(laneDir: laneDir, tag: tag) ?? [] {
                 inspector.noteHostIntSeq(seq)
             }
@@ -6321,6 +7159,56 @@ func buildUdpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     reply[41] = UInt8(udpChk & 0xff)
 }
 
+// M117c (#2475): is the datagram a UDP/IPv6 datagram addressed to
+// `addr:port`? Ethernet II ethertype 0x86dd, version 6, next-header 17,
+// the 16-byte dst address match, the dst port match. UDP over v6 is
+// at frame 54 (14-byte Ethernet + the 40-byte fixed header).
+@Sendable func isUdp6Datagram(_ buf: [UInt8], _ n: Int, _ addr: [UInt8], _ port: UInt16) -> Bool {
+    guard n >= 62 else { return false }
+    guard buf[12] == 0x86 && buf[13] == 0xdd else { return false } // ethertype IPv6
+    guard buf[14] >> 4 == 0x6 else { return false } // version 6
+    guard buf[20] == 17 else { return false } // next header UDP
+    guard [UInt8](buf[38..<54]) == addr else { return false } // dst address
+    let dstPort = (UInt16(buf[56]) << 8) | UInt16(buf[57])
+    return dstPort == port
+}
+
+// M117c (#2475): synthesize the UDP/IPv6 REPLY to the datagram in `req`
+// (the guest's bytes) into `reply` (same length): Ethernet dst/src
+// swapped, ethertype 0x86dd, v6 src/dst swapped, payload_len echoed,
+// hop 64, UDP src port = the host port, dst port = the sender's src
+// port, the payload ECHOED byte-exact; the UDP pseudo-header checksum
+// recomputed over the v6 addresses (icmp6Checksum is the generic
+// 16-byte pseudo-header — nh 17 here).
+@Sendable func buildUdp6Reply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ addr: [UInt8], _ port: UInt16) {
+    reply = [UInt8](repeating: 0, count: n)
+    reply[0...5] = req[6...11] // dst = the sender's MAC
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd // ethertype IPv6
+    reply[14] = 0x60 // version 6
+    reply[18...19] = req[18...19] // payload_len (unchanged)
+    reply[20] = 17 // next header UDP
+    reply[21] = 64 // hop limit
+    reply[22...37] = addr[0...15] // src = the addressed address
+    reply[38...53] = req[22...37] // dst = the sender's address
+    reply[54] = UInt8(port >> 8)
+    reply[55] = UInt8(port & 0xff)
+    reply[56] = req[54] // the sender's src port
+    reply[57] = req[55]
+    reply[58...59] = req[58...59] // UDP length (unchanged)
+    if n > 62 {
+        reply[62...n - 1] = req[62...n - 1] // payload echoed
+    }
+    let dst = [UInt8](reply[38..<54])
+    var datagram = [UInt8](reply[54..<n])
+    datagram[6] = 0
+    datagram[7] = 0 // zero the checksum field during the computation
+    let udpChk = icmp6Checksum(addr, dst, datagram, 17)
+    reply[60] = UInt8(udpChk >> 8)
+    reply[61] = UInt8(udpChk & 0xff)
+}
+
 // M99i (issue #2187): hex helper for --net-dns-answer6.
 func parseHexBytes(_ hex: String) -> [UInt8]? {
     guard hex.count % 2 == 0 else { return nil }
@@ -7112,12 +8000,17 @@ func buildIcmpEchoReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ host
 //      death to a specific window instead of "no verdict at all".
 var scriptPollLastBeat: Date = Date()
 
+// M115d (#2463): set by SuspendCtl's accepted-suspend tail — the stop a
+// suspended VM lands is the teardown the guest asked for, so the poll's
+// early-stop failure branch must not outrace it.
+var suspendStopInFlight = false
+
 func scriptPoll(matchedAt: Date? = nil) {
     var matchedAt = matchedAt
     // An early VM stop ends the run: pass when the expected transcript was
     // already observed (the tail window simply cannot capture more output),
-    // otherwise fail.
-    if vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
+    // otherwise fail. A ctl `suspend` teardown is its own success path.
+    if !suspendStopInFlight && vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
         // Issue #1024: the state was sampled BEFORE this tick's log read —
         // a VM that stops in the gap after the previous read makes this
         // branch see "stopped" while the transcript already sits in the

@@ -2,7 +2,9 @@ package vsys
 
 import (
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -136,6 +138,46 @@ func TestFile_WriteMapsKernelErrno(t *testing.T) {
 	if _, err := f.Write([]byte("x")); !errors.Is(err, error(Errno(ErrEACCES))) {
 		t.Fatalf("Write = %v, want Errno(EACCES)", err)
 	}
+}
+
+// TestOpen_ConcurrentOpensShareNoStaging hammers Open from many goroutines
+// with distinct paths through the injected kernel. Issue #2519 (sibling of
+// #2495/#2518): the old package-global virPathStaging had no serialization
+// between the stage-copy and the svc, so two Ms could interleave them and
+// the kernel would validate a spliced path — `go test -race` flags the old
+// code's concurrent writes to the shared buffer; per-call stack staging
+// has no shared state to race on.
+func TestOpen_ConcurrentOpensShareNoStaging(t *testing.T) {
+	fakeKern(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		switch num {
+		case SlotFileOpen:
+			return 3
+		case SlotFileClose:
+			return 0
+		}
+		return -ErrEINVAL
+	})
+	const goroutines = 32
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			path := fmt.Sprintf("/host/FM/F%02d.TXT", g)
+			for i := 0; i < 64; i++ {
+				f, err := Open(path, ModeRead)
+				if err != nil {
+					t.Errorf("Open(%q) = %v", path, err)
+					return
+				}
+				if err := f.Close(); err != nil {
+					t.Errorf("Close(%q) = %v", path, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }
 
 func TestOpen_ReadFileAsksForModeRead(t *testing.T) {

@@ -194,7 +194,7 @@ type windowPixels struct {
 	pixels []uint32
 }
 
-var buttonPixels, menuPixels windowPixels
+var buttonPixels, menuPixels, powerPixels windowPixels
 var chromeScratch []byte
 var writeWindowChrome = vi.WmctlSetWindowChrome
 
@@ -259,6 +259,12 @@ func (p *windowPixels) upload(scan []byte, width, x, y, w, h int, rect func(int,
 
 func syncSeatChrome(scan []byte) {
 	x, y, w, h := godMenuRect(vi.ScanoutWidth, vi.ScanoutHeight)
+	// M115d (#2463): the PWR button lives on the same chrome band — the
+	// chrome window's upload region widens to cover it so a hosted tab
+	// cannot hide the power affordance either.
+	if px, _, pw, _ := powerBtnRect(vi.ScanoutWidth, vi.ScanoutHeight); pw > 0 && px+pw > x+w {
+		w = px + pw - x
+	}
 	if buttonPixels.id == 0 {
 		// Opening an ordinary window focuses it. Restore the live hosted
 		// destination immediately, including the menu sink if it is open.
@@ -302,6 +308,19 @@ func syncSeatChrome(scan []byte) {
 		}
 		menuPixels.upload(scan, vi.ScanoutWidth, launchX, launchY, launchW, h, fills.Rect)
 		_ = vi.WinRaise(menuPixels.id)
+	}
+	// M115d (#2463): the open power menu uploads its panel to its own
+	// sink window, the same seat-chrome discipline as menuPixels.
+	if powerMenuOpen && powerSink != 0 {
+		px, py, pw, ph := powerMenuRect(vi.ScanoutWidth, vi.ScanoutHeight)
+		if powerPixels.id != int(powerSink) {
+			powerPixels = windowPixels{id: int(powerSink)}
+			if !setSeatWindowChrome(powerPixels.id) {
+				return
+			}
+		}
+		powerPixels.upload(scan, vi.ScanoutWidth, px, py, pw, ph, fills.Rect)
+		_ = vi.WinRaise(powerPixels.id)
 	}
 	fills.Flush()
 }

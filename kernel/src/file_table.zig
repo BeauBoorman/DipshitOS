@@ -48,6 +48,7 @@ const driving_award = @import("driving_award.zig");
 // M50 TS2 (issue #1136, ADR 0024 D3/D4): the file-ownership/mode predicate
 // and the bounded metadata table `OWNERS.TXT` persists.
 const trust = @import("trust.zig");
+const grant = @import("grant.zig"); // M116d (#2470): the row's `fs=` path scope at the path-bearing entry points
 pub const directory = @import("directory.zig");
 pub const metadata = @import("fs_metadata.zig");
 // M100c (issue #2308, ADR 0050): the VLFS reader and its mounted-volume
@@ -617,6 +618,45 @@ fn hostAllowed(pid: u64, path: []const u8, want: trust.Want) bool {
     return trust.check(actor, .host, path, want) == .allow;
 }
 
+/// M116d (#2470, ADR 0054 D9): the grant row's `fs=` path scope. The
+/// op's canonical `/vol[/sub]` — volume name plus the already-parsed
+/// subpath — must fall under a listed prefix, and a `ro` prefix
+/// refuses the mutating ops by name (`fs_write_denied` vs
+/// `fs_path_denied`). `.tty` is a device, not a filesystem path, and
+/// never scoped; `.usb`/`.usb_fat` can never match a vocabulary that
+/// only names `/host` and `/disk`, so a scoped row refuses them by
+/// name. `audit` receipts and the op proceeds; `enforce` is EACCES —
+/// the word gate's standing posture (D12). Handle ops (read, write,
+/// truncate, sync, close) are covered transitively — a process cannot
+/// hold a handle it never scoped open — and `free_space` takes a
+/// volume, not a path, so it carries no check.
+fn fsScopedDenied(pid: u64, partition: Partition, subpath: []const u8, want: grant.FsWant) bool {
+    if (partition == .tty) return false;
+    const vol: []const u8 = switch (partition) {
+        .host => "host",
+        .disk => "disk",
+        .usb, .usb_fat => "usb",
+        .tty => unreachable,
+    };
+    var canon: [8 + max_path_len]u8 = undefined;
+    canon[0] = '/';
+    @memcpy(canon[1 .. 1 + vol.len], vol);
+    var n: usize = 1 + vol.len;
+    if (subpath.len != 0) {
+        canon[n] = '/';
+        n += 1;
+        @memcpy(canon[n .. n + subpath.len], subpath);
+        n += subpath.len;
+    }
+    return grant.fs_access(pid, canon[0..n], want) != .allow and grant.enforceMode();
+}
+
+/// The fs-scope access class an open's flags name — any mutating flag
+/// is `write`; a plain read open is `read`.
+fn fsOpenWant(flags: u32) grant.FsWant {
+    return if ((flags & (MODE_WRITE | MODE_CREATE | MODE_APPEND | MODE_DIR)) != 0) .write else .read;
+}
+
 pub fn metadata_errno(err: metadata.Error) i64 {
     return switch (err) {
         error.MetadataUnavailable, error.ContainmentUnavailable => -4,
@@ -721,14 +761,18 @@ fn join_metadata(root: []const u8, relative: []const u8, out: []u8) metadata.Err
 
 pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, out: *metadata.Wire) i64 {
     if (pid >= process.max_processes) return -1;
-    if (disk_metadata_root(root_bytes) catch |err| return metadata_errno(err)) |droot| {
+    const disk_root = disk_metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    var full: [max_path_len]u8 = undefined;
+    const joined = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, if (disk_root != null) .disk else .host, joined, .read)) return -7;
+    if (disk_root) |droot| {
         const value = metadata.stat(vlfs_disk.backend(droot), vlfs_disk.authorizer, relative) catch |err| return metadata_errno(err);
         out.* = metadata.Wire.from(value);
         return 0;
     }
-    const path = metadata_root(root_bytes) catch |err| return metadata_errno(err);
-    var root = virtio_file.MetadataRoot{ .path = path };
-    var auth = MetadataAuth{ .pid = pid, .root = path };
+    var root = virtio_file.MetadataRoot{ .path = root_path };
+    var auth = MetadataAuth{ .pid = pid, .root = root_path };
     const value = metadata.stat(virtio_file.metadata_backend(&root), auth.authorizer(), relative) catch |err| return metadata_errno(err);
     out.* = metadata.Wire.from(value);
     return 0;
@@ -742,6 +786,7 @@ pub fn contained_open(pid: u64, root_bytes: []const u8, relative: []const u8, wr
     const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var full: [max_path_len]u8 = undefined;
     const path = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, if (disk_root != null) .disk else .host, path, if (writing) .write else .read)) return -7;
     if (!ensure_handles()) return -10;
     defer release_empty_handles();
     if (resource_count(pid) >= max_handles_per_process) return -5;
@@ -788,6 +833,7 @@ pub fn metadata_dir_open(pid: u64, root_bytes: []const u8, relative: []const u8)
     const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var full: [max_path_len]u8 = undefined;
     const path = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, if (disk_root != null) .disk else .host, path, .read)) return -7;
     if (!ensure_handles()) return -10;
     defer release_empty_handles();
     if (resource_count(pid) >= max_handles_per_process) return -5;
@@ -834,6 +880,7 @@ pub fn metadata_dir_open(pid: u64, root_bytes: []const u8, relative: []const u8)
 pub fn metadata_dir_page(pid: u64, token: u64, offset: u64, limit: u64, page: *metadata.Page) i64 {
     const h = dir_handle(pid, token) orelse return -2;
     if (!h.rich_directory) return -2;
+    if (fsScopedDenied(pid, h.partition, h.path[0..h.path_len], .read)) return -7;
     var auth = MetadataAuth{ .pid = pid, .root = "" };
     MetadataAuth.check(&auth, h.path[0..h.path_len], .metadata) catch |err| return metadata_errno(err);
     if (limit == 0 or limit > directory.page_max) return -1;
@@ -961,6 +1008,7 @@ pub fn pin_open(pid: u64, root_bytes: []const u8, relative: []const u8) i64 {
     const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
     var full: [max_path_len]u8 = undefined;
     const path = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, if (disk_root != null) .disk else .host, path, .read)) return -7;
     if (!ensure_handles()) return -10;
     defer release_empty_handles();
     const slot = free_resource_slot(pid) orelse return -5;
@@ -981,6 +1029,7 @@ pub fn pin_child(pid: u64, token: u64, name: []const u8) i64 {
     const parent = live_pin(pid, token) orelse return -2;
     var child: [max_path_len]u8 = undefined;
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, parent.partition, path, .read)) return -7;
     const slot = free_resource_slot(pid) orelse return -5;
     if (next_dir_token > std.math.maxInt(i64)) return -5;
     const object = if (parent.partition == .disk)
@@ -1014,6 +1063,7 @@ pub fn handle_metadata(pid: u64, handle: u64, kind: u64, out: *metadata.Wire) i6
     var value: metadata.Metadata = undefined;
     if (kind == metadata.handle_directory) {
         const h = live_pin(pid, handle) orelse return -2;
+        if (fsScopedDenied(pid, h.partition, h.path[0..h.path_len], .read)) return -7;
         if (h.partition == .disk) {
             value = metadata.directoryMetadata(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(h)) catch |err| return metadata_errno(err);
         } else {
@@ -1023,6 +1073,7 @@ pub fn handle_metadata(pid: u64, handle: u64, kind: u64, out: *metadata.Wire) i6
         if (handle >= max_handles_per_process or handles.len == 0) return -2;
         const h = &handles[pid][handle];
         if (!h.in_use or h.dir_token != 0 or h.is_dir) return -2;
+        if (fsScopedDenied(pid, h.partition, h.path[0..h.path_len], .read)) return -7;
         if (h.partition == .disk) {
             if (!h.contained or h.disk_handle == 0) return -4;
             value = metadata.handleMetadata(vlfs_disk.backend(""), vlfs_disk.authorizer, h.disk_handle, h.path[0..h.path_len]) catch |err| return metadata_errno(err);
@@ -1041,6 +1092,7 @@ pub fn pin_create(pid: u64, token: u64, name: []const u8) i64 {
     const parent = live_pin(pid, token) orelse return -2;
     var child: [max_path_len]u8 = undefined;
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, parent.partition, path, .write)) return -7;
     const slot = free_resource_slot(pid) orelse return -5;
     if (parent.partition == .disk) {
         const created = metadata.createFile(vlfs_disk.backend(""), vlfs_disk.authorizer, pin_directory(parent), name) catch |err| return metadata_errno(err);
@@ -1079,6 +1131,7 @@ pub fn pin_mkdir(pid: u64, token: u64, name: []const u8) i64 {
     const parent = live_pin(pid, token) orelse return -2;
     var child: [max_path_len]u8 = undefined;
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, parent.partition, path, .write)) return -7;
     const slot = free_resource_slot(pid) orelse return -5;
     if (next_dir_token > std.math.maxInt(i64)) return -5;
     if (parent.partition == .disk) {
@@ -1098,6 +1151,7 @@ pub fn pin_remove(pid: u64, token: u64, name: []const u8, kind: u64) i64 {
     const parent = live_pin(pid, token) orelse return -2;
     var child: [max_path_len]u8 = undefined;
     const path = metadata.childPath(parent.path[0..parent.path_len], name, &child) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, parent.partition, path, .write)) return -7;
     const want: metadata.Kind = if (kind == metadata.remove_directory) .directory else .file;
     if (parent.partition == .disk) {
         const backend = vlfs_disk.backend("");
@@ -1134,6 +1188,8 @@ pub fn pin_rename(pid: u64, from_token: u64, from_name: []const u8, to_token: u6
     var target: [max_path_len]u8 = undefined;
     const from_path = metadata.childPath(from.path[0..from.path_len], from_name, &source) catch |err| return metadata_errno(err);
     const to_path = metadata.childPath(to.path[0..to.path_len], to_name, &target) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, from.partition, from_path, .write)) return -7;
+    if (fsScopedDenied(pid, to.partition, to_path, .write)) return -7;
     if (from.partition == .disk or to.partition == .disk) {
         // Same-volume only by ABI; a cross-partition rename refuses.
         if (from.partition != .disk or to.partition != .disk) return -1;
@@ -1209,6 +1265,8 @@ pub fn set_mode(pid: u64, path_bytes: []const u8, mode: u16) i64 {
     if (path_bytes.len == 0 or path_bytes.len > max_path_len) return -1;
     const parsed = parse_path(path_bytes) orelse return -1;
     if (parsed.partition == .tty) return -1; // device semantics
+    // M116d: the row's fs= scope — a chmod is a mutation.
+    if (fsScopedDenied(pid, parsed.partition, parsed.path[0..parsed.parsed_len()], .write)) return -7;
     // `.usb` and `.usb_fat` are fixed read-only 0444 for every actor;
     // `.disk` has no per-file trust table in v1 — chmod is refused by name.
     if (parsed.partition == .usb or parsed.partition == .usb_fat or parsed.partition == .disk) return -7;
@@ -1220,7 +1278,10 @@ pub fn set_mode(pid: u64, path_bytes: []const u8, mode: u16) i64 {
     // is a gate denial, never a persistence outcome.
     if (parsed.partition == .host and policyPinned(actorFor(pid), subpath, .admin)) return -7;
     var st = virtio_file.StatResult{};
-    if (virtio_file.stat(subpath, &st) != virtio_file.st_ok) return -6; // existing path only
+    // #2495: only a real not-found is ENOENT — a transport failure maps
+    // to EINVAL like every other residual host error.
+    const st_status = virtio_file.stat(subpath, &st);
+    if (st_status != virtio_file.st_ok) return hf_open_errno(st_status);
     switch (trust.set_mode(actorFor(pid), .host, subpath, mode)) {
         .ok => {},
         .eacces => return -7,
@@ -1489,6 +1550,12 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
 
     const parsed = parse_path(path_bytes) orelse return -1;
 
+    // M116d (#2470): the row's `fs=` path scope, before any partition
+    // dispatch — a scoped row names the only volumes/prefixes the app
+    // may touch, so a `.usb`/`.usb_fat` open is refused by name here
+    // too (no `fs=` token can ever name one).
+    if (fsScopedDenied(pid, parsed.partition, parsed.path[0..parsed.parsed_len()], fsOpenWant(flags))) return -7;
+
     // M43 U3 (issue #1034): the `.usb` raw block device. READ-ONLY: any
     // write-ish flag is EINVAL; no device or no capacity is ENOENT. The
     // handle's size is the disk's byte length (clamped to the frozen u32
@@ -1699,7 +1766,12 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
         return @intCast(slot);
     }
     var st = virtio_file.StatResult{};
-    if (virtio_file.stat(subpath, &st) != virtio_file.st_ok) return -6; // ENOENT
+    // #2495: only a real not-found is ENOENT — a transport failure
+    // (timeout, host error) flattened to ENOENT here was the "served file
+    // reads ENOENT" signature; the residual maps to EINVAL like the
+    // write-open path already does.
+    const st_status = virtio_file.stat(subpath, &st);
+    if (st_status != virtio_file.st_ok) return hf_open_errno(st_status);
     if (st.is_dir) return -1; // EINVAL: a directory opens as its own path, not a handle
     handles[pid][slot] = .{
         .in_use = true,
@@ -1984,6 +2056,7 @@ pub fn dir_open(pid: u64, path_bytes: []const u8) i64 {
     if (parsed.partition != .host and parsed.partition != .disk) return -4;
     const path = parsed.path[0..parsed.path_len];
     if (!directory.valid_path(path, directory.depth_max)) return -8;
+    if (fsScopedDenied(pid, parsed.partition, path, .read)) return -7;
     if (parsed.partition == .host and !hostAllowed(pid, path, .list)) return -7;
     if (parsed.partition == .disk and !vlfs_disk.mounted()) return -6;
     if (!ensure_handles()) return -10;
@@ -2062,6 +2135,7 @@ fn dir_handle(pid: u64, token: u64) ?*FileHandle {
 pub fn dir_page(pid: u64, token: u64, offset: u64, limit: u64, page: *directory.Page) i64 {
     const h = dir_handle(pid, token) orelse return -2;
     if (h.rich_directory or h.pin) return -2;
+    if (fsScopedDenied(pid, h.partition, h.path[0..h.path_len], .read)) return -7;
     // `.disk` carries no trust table (ADR 0050 D6): listing is world-granted.
     if (h.partition == .host and !hostAllowed(pid, h.path[0..h.path_len], .list)) return -7;
     if (limit == 0 or limit > directory.page_max) return -1;
@@ -2096,6 +2170,9 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
         ParsedPath{ .partition = .host, .path = @as([max_path_len]u8, @splat(@as(u8, 0))), .path_len = 0 }
     else
         parse_path(path_bytes) orelse return -1;
+
+    // M116d: the fs= scope — the empty path is the share root.
+    if (fsScopedDenied(pid, parsed.partition, parsed.path[0..parsed.parsed_len()], .read)) return -7;
 
     // M50 TS2 (ADR 0024 D4): the host-share ownership/mode gate for listing.
     if (parsed.partition == .host and !hostAllowed(pid, parsed.path[0..parsed.path_len], .list)) return -7; // EACCES
@@ -2203,6 +2280,8 @@ pub fn delete(pid: u64, path_bytes: []const u8) i64 {
     if (pid >= process.max_processes) return -1;
     if (path_bytes.len == 0 or path_bytes.len > max_path_len) return -1;
     const parsed = parse_path(path_bytes) orelse return -1;
+    // M116d: the fs= scope — a delete is a mutation.
+    if (fsScopedDenied(pid, parsed.partition, parsed.path[0..parsed.parsed_len()], .write)) return -7;
     // M100d (issue #2309): `.disk` deletes are a journaled removal (the
     // dirent tombstones, the blocks and inode free, in one transaction).
     // `.usb`/`.usb_fat`/`.tty` stay refused by name — without this guard
@@ -2256,6 +2335,9 @@ pub fn rename_mode(pid: u64, old_bytes: []const u8, new_bytes: []const u8, mode:
     if (old.partition != new.partition) return -1; // cross-partition unsupported
     const oldp = old.path[0..old.parsed_len()];
     const newp = new.path[0..new.parsed_len()];
+    // M116d: the fs= scope on BOTH ends — a rename mutates each.
+    if (fsScopedDenied(pid, old.partition, oldp, .write)) return -7;
+    if (fsScopedDenied(pid, new.partition, newp, .write)) return -7;
     // M100d (issue #2309): a same-volume `.disk` rename is one journaled
     // transaction (tombstone + insert + inode updates); `exists` and the
     // other named refusals map onto the errno rows.

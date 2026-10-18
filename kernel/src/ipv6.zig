@@ -74,13 +74,24 @@ pub var dropped_len: u64 = 0; // jumbogram (payload_len 0), length not covered, 
 pub var dropped_nexthdr: u64 = 0; // non-terminal next-header (D7 — no extension walk)
 pub var dropped_dst: u64 = 0; // dst not an owned address / all-nodes / our SNM group
 pub var dropped_checksum: u64 = 0; // ICMPv6 pseudo-header checksum mismatch
-pub var dropped_proto: u64 = 0; // terminal UDP/TCP — transport over v6 is M117c
+pub var dropped_proto: u64 = 0; // a UDP/TCP frame with no registered transport delegate
 pub var dropped_type: u64 = 0; // ICMPv6 types outside the pinned dispatch
 pub var icmp6_err: u64 = 0; // types 1-4 (errors) — recorded, never acted on (no PMTUD)
 pub var replies_sent: u64 = 0; // echo replies to requests for our addresses
 pub var requests_sent: u64 = 0; // `net ping6` echo requests transmitted
 pub var pongs_observed: u64 = 0; // echo replies received (the ping6's pong)
 pub var reply_tx_fail: u64 = 0; // replies we built but could not transmit
+
+/// M117c (#2475, ADR 0057 D7/D8): the transport delegates — terminal
+/// next-headers 17 (UDP) and 6 (TCP) hand the VALIDATED frame (version,
+/// payload_len coverage, hop_limit ≠ 0 — the fixed-header checks above
+/// already ran) to the transport layer, which self-gates on the dst /
+/// dst port and counts its own drops. Registered by virtio_net.zig's
+/// drain (the `table_rx` import-free delegate shape — ipv6 never imports
+/// udp/tcp/socket_native). Unset = the M117b shape: counted
+/// `dropped_proto`.
+pub var udp6_rx: ?*const fn (frame: []const u8) void = null;
+pub var tcp6_rx: ?*const fn (frame: []const u8) bool = null;
 /// The last observed reply sequence (the ping6 proof, the v4 `last_seq`
 /// shape).
 pub var last_seq: u16 = 0;
@@ -157,10 +168,20 @@ pub fn is_loopback(a: Addr) bool {
     return std.mem.eql(u8, &a, &addr_loopback);
 }
 
+/// ::ffff:a.b.c.d — an IPv4-mapped literal (M117c, ADR 0057 D8: mapped
+/// literals are REFUSED, never translated — the stack keeps the two
+/// wire shapes distinct).
+pub fn is_mapped_v4(a: Addr) bool {
+    return a[0] == 0 and a[1] == 0 and a[2] == 0 and a[3] == 0 and
+        a[4] == 0 and a[5] == 0 and a[6] == 0 and a[7] == 0 and
+        a[8] == 0 and a[9] == 0 and a[10] == 0xff and a[11] == 0xff;
+}
+
 /// Destinations the guest never originates (D9): multicast, the
-/// unspecified address, loopback — the `bad_dst6` refusal.
+/// unspecified address, loopback, an IPv4-mapped literal (M117c —
+/// refused, not translated) — the `bad_dst6` refusal.
 pub fn is_bad_dst(a: Addr) bool {
-    return is_multicast(a) or is_unspecified(a) or is_loopback(a);
+    return is_multicast(a) or is_unspecified(a) or is_loopback(a) or is_mapped_v4(a);
 }
 
 /// Whether `addr` matches `prefix` under `len` leading bits (0..128).
@@ -534,8 +555,10 @@ pub fn icmp_seq(frame: []const u8) u16 {
 /// The shared frame prefix: Ethernet dst/src + the 40-byte fixed header
 /// (version 6, TC/flow zero, payload_len, next-header, hop_limit,
 /// src, dst). The whole frame is zeroed first — reserved and checksum
-/// fields start at 0. The message follows at offset 54.
-fn build_hdr(buf: []u8, dst_mac: *const [6]u8, own_mac: *const [6]u8, src: *const Addr, dst: *const Addr, nexthdr: u8, hop: u8, plen: u16) void {
+/// fields start at 0. The message follows at offset 54. Public for
+/// M117c's transport builders (`udp.build_frame6`, `tcp.build_frame6` —
+/// the same builders, a second pseudo-header layout per D8).
+pub fn build_hdr(buf: []u8, dst_mac: *const [6]u8, own_mac: *const [6]u8, src: *const Addr, dst: *const Addr, nexthdr: u8, hop: u8, plen: u16) void {
     @memset(buf[0 .. eth_hdr_len + ipv6_hdr_len + plen], 0);
     @memcpy(buf[0..6], dst_mac);
     @memcpy(buf[6..12], own_mac);
@@ -636,7 +659,23 @@ pub fn handle_rx(frame: []const u8, own_mac: *const [6]u8, reply_buf: []u8) ?RxR
         return null;
     }
     if (nh != nexthdr_icmpv6) {
-        dropped_proto += 1; // UDP/TCP over v6 is M117c's surface
+        // M117c (#2475): the terminal transport headers hand the
+        // already-validated frame to their registered delegate (the
+        // `table_rx` shape); each layer self-gates on dst/port and
+        // counts its own drops. Unset delegates keep the M117b
+        // counted-drop shape.
+        if (nh == nexthdr_udp) {
+            if (udp6_rx) |rx| {
+                rx(frame);
+                return null;
+            }
+        } else if (nh == nexthdr_tcp) {
+            if (tcp6_rx) |rx| {
+                _ = rx(frame);
+                return null;
+            }
+        }
+        dropped_proto += 1;
         return null;
     }
     const dst = dst_addr(frame);
@@ -764,6 +803,8 @@ fn reset() void {
     onlink_valid = false;
     onlink_prefix = @splat(0);
     onlink_len = 0;
+    udp6_rx = null; // M117c delegates re-register on the next drain
+    tcp6_rx = null;
 }
 
 fn form_pair() void {

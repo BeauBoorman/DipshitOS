@@ -61,6 +61,13 @@ let package = Package(
             name: "VMDiskImage",
             path: "Sources/VMDiskImage"
         ),
+        // M115c (#2462): the `.virelaivm` profile bundle — manifest-gated
+        // create/load + atomic save behind the runner's `--profile`. Pure
+        // Swift/Foundation so `swift test` pins the format without a VM.
+        .target(
+            name: "VMProfile",
+            path: "Sources/VMProfile"
+        ),
         .target(
             name: "VMAppKit",
             // M114d (#2457): the inspector model renders VMPostmortem's
@@ -89,14 +96,32 @@ let package = Package(
             name: "VMTcp",
             path: "Sources/VMTcp"
         ),
+        // M115b (#2461, ADR 0056): the virelai-ctl/1 session codec — the
+        // HMAC-challenged guest→host control channel behind --vsock-ctl.
+        // Pure Swift/CryptoKit, zero Virtualization imports, so
+        // `swift test` drives the whole refusal matrix without a VM.
+        .target(
+            name: "VSCtl",
+            path: "Sources/VSCtl"
+        ),
         .executableTarget(
             name: "VMRunner",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"],
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VSCtl", "VMProfile"],
             path: "Sources/VMRunner"
+        ),
+        // M118a (#2479): the `--sound-in` observation vehicle — a standalone
+        // minimal boot carrying VZVirtioSoundDeviceInputStreamConfiguration +
+        // VZHostAudioInputStreamSource, kept OUT of VMRunner because
+        // main.swift's flag loop has no extension point and the file is held
+        // by other active claims (#2475/#2476). Ad-hoc codesigned with the
+        // same entitlements.plist by the gate before use.
+        .executableTarget(
+            name: "SoundInProbe",
+            path: "Sources/SoundInProbe"
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VSCtl", "VMProfile"]
         )
     ],
     swiftLanguageModes: [.v5]

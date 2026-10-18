@@ -71,8 +71,9 @@ var Global = Table{
 		"focus rail cell 8; out of range is a no-op", "#1717 (M79f)", false},
 	{Chord{ModCtrl, UsageDigit1 + 8}, "seat", ScopeSeat, "focus-index",
 		"focus rail cell 9; out of range is a no-op", "#1717 (M79f)", false},
-	{Chord{ModCtrl | ModShift, UsageP}, "seat", ScopeSeat, "pin",
-		"pin the focused tab", "#1420 (M63b)", false},
+	{Chord{ModCtrl | ModShift, UsageN}, "seat", ScopeSeat, "pin",
+		"pin the focused tab — re-homed off ctrl+shift+p, which the " +
+			"command palette owns since M121a", "#1420 (M63b); chord #2564 (M121a)", false},
 	{Chord{ModCtrl | ModShift, UsageT}, "seat", ScopeSeat, "reopen",
 		"reopen the most recently closed tab", "#1563 (M71d)", false},
 	{Chord{ModCtrl | ModShift, UsageD}, "seat", ScopeSeat, "duplicate",
@@ -92,6 +93,9 @@ var Global = Table{
 		"step the focused tab's history back", "#1708 (M79e)", false},
 	{Chord{ModCtrl | ModShift, UsageRightBracket}, "seat", ScopeSeat, "nav-forward",
 		"step the focused tab's history forward", "#1708 (M79e)", false},
+	{Chord{ModCtrl | ModShift, UsageP}, "seat", ScopeSeat, "palette",
+		"summon the command palette — tabs, recent files, settings, " +
+			"help topics and this registry, subsequence-ranked", "#2564 (M121a)", false},
 
 	// --- apps: each app's own chords, live while that app is focused
 	// (ADR 0009 KEY_DOWN). GOSH's are the shlib line editor's

@@ -11,7 +11,10 @@
 //	alt-tab       -> FocusTab + WmctlTaskbarClick (cmd 12), wrapping
 //	ctrl-tab      -> the same wrapping cycle; shift reverses it (M79f)
 //	ctrl-1..9     -> focus the Nth rail cell; out-of-range is a no-op (M79f)
-//	ctrl-shift-p  -> Pin() the focused tab
+//	ctrl-shift-p  -> the M121a command palette (palette.go; was Pin until
+//	                 #2564 took the chord)
+//	ctrl-shift-n  -> Pin() the focused tab (M121a: re-homed off
+//	                 ctrl+shift+p)
 //	ctrl-shift-t  -> reopen the most recently closed tab (re-exec its bin)
 //	ctrl-shift-d  -> duplicate the focused tab (re-exec its bin)
 //	ctrl-shift-f  -> toggle the focused tab's frozen BADGE (M71e / #1564)
@@ -44,8 +47,10 @@
 //
 // M71d pick: Ctrl+Shift+T / Ctrl+Shift+D are Zig TABWM's own BT1 bindings
 // (user/src/tabwm.zig:151/:427). They are free on GOTABWM — the only
-// ctrl-shift chord bound here is ctrl-shift-p, and Ctrl+T (Zig's "+ New
-// tab") is not bound at all on this seat, whose launcher is Ctrl+Space.
+// ctrl-shift chord bound here then was ctrl-shift-p, and Ctrl+T (Zig's "+
+// New tab") is not bound at all on this seat, whose launcher is Ctrl+Space.
+// M121a (#2564) then gave ctrl-shift-p to the command palette and re-homed
+// pin on ctrl-shift-n.
 //
 // M71e pick: Ctrl+Shift+F is Zig TABWM's own freeze binding (user/src/
 // tabwm.zig:1448). It is a BADGE there too — Zig checks `frozen` in no close
@@ -85,6 +90,7 @@ const (
 	// pins these locals against it so the two cannot drift.
 	hidUsageD uint8 = 0x07 // 'd'
 	hidUsageF uint8 = 0x09 // 'f'; M71e (#1564) freeze-badge toggle
+	hidUsageN uint8 = 0x11 // 'n'; M121a (#2564) pin, re-homed off ctrl-shift-p
 	hidUsageP uint8 = 0x13
 	hidUsageS uint8 = 0x16 // 's'; M81g (#1767) snapshot bundle
 	hidUsageT uint8 = 0x17 // 't'
@@ -210,6 +216,11 @@ func runSeatAction(action string, c chords.Chord) {
 		}
 	case "pin":
 		_ = applyHidPin()
+	case "palette":
+		// M121a (#2564): the summon chord's dispatch half. The modal half
+		// (an already-open palette eats every key, including this chord as
+		// a toggle) is handleLauncherKey's.
+		openPalette()
 	case "reopen":
 		_ = applyReopen()
 	case "duplicate":
@@ -239,6 +250,11 @@ func handleWmKey(e vi.Event) {
 		notifyCenterOpen = false
 		notifyCenterPainted = false
 		vi.ConsoleLine(MarkerNotifyCenterClose)
+		return
+	}
+	// M115d (#2463): the open power menu's keys are the seat's alone —
+	// the sink window holds focus, so a hosted app sees nothing anyway.
+	if handlePowerKey(e) {
 		return
 	}
 	if handleLauncherKey(e) {
@@ -574,6 +590,19 @@ func handleWmPointer(e vi.Event) {
 			return
 		}
 	}
+	// M115d (#2463): the open power menu is chrome-modal the same way
+	// the launcher is — a press on its row runs the verb, a press
+	// anywhere else dismisses it, and nothing reaches content either
+	// way.
+	if powerMenuOpen {
+		if down {
+			dismissPowerMenu()
+			if powerMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
+				requestSuspend()
+			}
+		}
+		return
+	}
 	if launch.open {
 		if btn != 0 {
 			menuGesture = true
@@ -594,6 +623,12 @@ func handleWmPointer(e vi.Event) {
 		return
 	}
 	if down {
+		if powerBtnHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
+			menuGesture = true
+			railDragFrom, contentDown, sashDragging = -1, false, false
+			openPowerMenu()
+			return
+		}
 		if godMenuHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
 			menuGesture = true
 			railDragFrom, contentDown, sashDragging = -1, false, false

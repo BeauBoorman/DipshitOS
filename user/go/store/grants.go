@@ -103,3 +103,117 @@ func grantSync(bin, sha string, declared []string) {
 	}
 	ConsoleFn("store: grant keep " + bin + " words=" + vi.GrantWordsCanonical(rowWords))
 }
+
+// ---------------------------------------------------------------------------
+// M116c (#2469, ADR 0054 D10): install-time consent. The signed ReleaseCaps
+// an install proposes is ANSWERED by the same gesture GOSET's pane lands:
+// `store consent <name>` writes the recorded (name, installed sha256,
+// declared words) row through slot 89 — the write still needs the seat or
+// CAP_PROC_ADMIN, so nothing the publisher signs becomes power off a
+// script. `store decline <name>` is the refusal gesture: no write, the app
+// keeps the ambient floor. Both verbs answer only a REAL pending ask —
+// consent on an app with no recorded declaration is `no_ask`, on a bin the
+// store never tracked is `not_installed`.
+//
+// Markers (printed AFTER the step they name):
+//
+//	store: consent <BIN>                       — the gesture, echoed first
+//	store: grant written name=<BIN> words=<w>  — the row landed
+//	store: consent declined name=<BIN>         — refused; ambient stands
+//	store: refuse <code> <detail>              — the named refusal
+// ---------------------------------------------------------------------------
+
+// ConsentLine returns the GRANTS.TXT line a consent gesture for bin lands
+// — name, the installed image's recorded sha256, the release's declared
+// words — so every consent surface (this verb, GOSTORE's prompt) writes
+// the same bytes. Errors: not_installed (no STORE.TXT entry), no_ask (the
+// installed release declared nothing), or the state-file refusal.
+func ConsentLine(fs FS, bin string) (string, error) {
+	state, err := loadState(fs)
+	if err != nil {
+		return "", err
+	}
+	e, ok := state[bin]
+	if !ok {
+		return "", refuse("not_installed", bin)
+	}
+	if e.Caps == "" {
+		return "", refuse("no_ask", bin)
+	}
+	return vi.GrantLine(vi.GrantRow{
+		Name:  e.Name,
+		SHA:   e.SHA256,
+		Words: vi.GrantWordsCanonical(splitGrantWords(e.Caps)),
+	}), nil
+}
+
+// grantWriteErr maps a slot-89 write errno to its named refusal.
+func grantWriteErr(rc int64) error {
+	switch -rc {
+	case vi.ErrEACCES:
+		return refuse("eacces", "")
+	case vi.ErrEINVAL:
+		return refuse("einval", "")
+	case vi.ErrENOSPC:
+		return refuse("enospc", "")
+	case vi.ErrENXIO:
+		return refuse("enxio", "")
+	case vi.ErrEIO:
+		return refuse("eio", "")
+	}
+	return refuse("grant_refused", vi.Itoa64(-rc))
+}
+
+// Consent implements `store consent <name>` — the scriptable install-time
+// consent gesture: land the pending ask's row through the admin slot.
+func Consent(fs FS, arg string) int {
+	bin, ok := normalizeBin(arg)
+	if !ok {
+		return runErr(refuse("name_invalid", arg))
+	}
+	ConsoleFn("store: consent " + bin)
+	line, err := ConsentLine(fs, bin)
+	if err != nil {
+		return runErr(err)
+	}
+	if rc := grantWriteFn(line); rc < 0 {
+		return runErr(grantWriteErr(rc))
+	}
+	if _, words, ok := grantLineWords(line); ok {
+		ConsoleFn("store: grant written name=" + bin + " words=" + words)
+	}
+	return 0
+}
+
+// Decline implements `store decline <name>` — the refusal gesture for the
+// pending ask: no write, the app keeps the ambient floor. It still names a
+// REAL ask (not_installed/no_ask refuse the same way consent does) — a
+// decline for nothing is silence a gate cannot tell from a typo.
+func Decline(fs FS, arg string) int {
+	bin, ok := normalizeBin(arg)
+	if !ok {
+		return runErr(refuse("name_invalid", arg))
+	}
+	ConsoleFn("store: decline " + bin)
+	if _, err := ConsentLine(fs, bin); err != nil {
+		return runErr(err)
+	}
+	ConsoleFn("store: consent declined name=" + bin)
+	return 0
+}
+
+// grantLineWords splits a `name<TAB>sha|*<TAB>words` line back into its
+// words field — the line ConsentLine just built, so the parse cannot
+// fail in practice; the bool only guards against a substituted seam.
+func grantLineWords(line string) (string, string, bool) {
+	f0 := strings.IndexByte(line, '\t')
+	if f0 <= 0 {
+		return "", "", false
+	}
+	rest := line[f0+1:]
+	f1 := strings.IndexByte(rest, '\t')
+	if f1 < 0 {
+		return "", "", false
+	}
+	return line[:f0], rest[f1+1:], true
+}

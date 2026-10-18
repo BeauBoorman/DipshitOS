@@ -240,9 +240,10 @@ case app-logs pass
 case file-lease pass
 case window pass
 case disk pass
+case audio-capture pass
 case clock-epoch pass
 case clock-set pass
-summary cases=24 failed=0
+summary cases=25 failed=0
 EOF
 vgate_file clock-set.expected <<'EOF'
 case clock-set refused=4 stepped=+100 restored=yes
@@ -676,6 +677,7 @@ vgate_assert 01 serial-contains 'selftest: case file-snapshot pass'
 vgate_assert 01 serial-contains 'selftest: case app-logs pass'
 vgate_assert 01 serial-contains 'selftest: case file-lease pass'
 vgate_assert 01 serial-contains 'selftest: case window pass'
+vgate_assert 01 serial-contains 'selftest: case audio-capture pass'
 # The files were written BEFORE the summary (ADR 0031 ordering).
 vgate_assert 01 serial-contains 'selftest: report /host/SELFTEST/REPORT.txt n='
 vgate_assert 01 serial-contains 'selftest: summary /host/SELFTEST/OUT/summary.txt n='
@@ -711,7 +713,7 @@ vgate_assert 01 share-equals SELFTEST/OUT/clock-set.ok clock-set.expected
 vgate_assert 01 share-contains SELFTEST/OUT/file-lease.copy 'token=0123456789abcdef'
 vgate_assert 01 share-contains SELFTEST/OUT/file-lease.copy 'path=/host/SELFTEST/LEASE/TARGET.TXT'
 vgate_assert 01 share-equals CRASH/GOSELF.ELF.TXT app-log-receipt.expected
-vgate_assert 01 share-contains SELFTEST/OUT/summary.txt 'summary cases=24 failed=0'
+vgate_assert 01 share-contains SELFTEST/OUT/summary.txt 'summary cases=25 failed=0'
 
 # The load-bearing assert: the copies and the receipts on the host's own
 # filesystem must be byte-exact, the share's directory state must agree with
@@ -788,7 +790,7 @@ win_open_rect = (32, 32, 640, 400)
 win_viewport_w = 1100
 win_viewport_h = 720
 
-want_summary = b"summary cases=24 failed=0\n"
+want_summary = b"summary cases=25 failed=0\n"
 want_hello = b"goself smoke\n"
 want_intake_receipt = b"case intake path=IN/fixture.txt bytes=25 match=yes\n"
 want_altered_receipt = b"case intake-altered path=IN/altered.txt bytes=25 differs=yes\n"
@@ -906,6 +908,14 @@ require(os.path.join(out, "file-errors.ok"), want_errors_receipt, "ERRORS RECEIP
 # live-vlfs-dataroot.spec.
 require(os.path.join(out, "file-disk.ok"), b"case disk mounted=no skipped\n",
         "DISK RECEIPT (no data disk attached)")
+# M118c (#2481): the capture seam's device-absent receipt. This boot
+# attaches no sound device, so slot 92 must refuse by name (ENXIO) and the
+# over-cap probe inherits the same no-device name (the kernel checks the
+# device before the tuple) while the odd-length shape is EINVAL first. The
+# bounded-read half is the SoundInProbe leg below.
+require(os.path.join(out, "audio-capture.ok"),
+        b"case audio-capture ready=0 refused=ENXIO overcap=ENXIO oddlen=EINVAL\n",
+        "CAPTURE RECEIPT (no sound device attached)")
 require(os.path.join(out, "append.copy"), append_body, "APPEND COPY")
 require(os.path.join(out, "bigwrite.copy"), bigwrite_body, "BIGWRITE COPY")
 require(os.path.join(out, "clamp.copy"), clamp_body, "CLAMP COPY")
@@ -1139,6 +1149,7 @@ for name, path in (("intake.txt", os.path.join(out, "intake.txt")),
                    ("append.copy", os.path.join(out, "append.copy")),
                    ("bigwrite.copy", os.path.join(out, "bigwrite.copy")),
                    ("clamp.copy", os.path.join(out, "clamp.copy")),
+                   ("audio-capture.ok", os.path.join(out, "audio-capture.ok")),
                    ("window.txt", os.path.join(out, "window.txt"))):
     shutil.copy(path, "artifacts/go-selftest-share-%s%s" % (name, suffix))
 print("host read-back byte-exact: file-ABI evidence roundtrip.copy %d B, "
@@ -1152,6 +1163,113 @@ print("window receipt agreed with the kernel and the WM: win=%d (kernel `open:`,
       "app `goself: open`, WM `tab-switch`); kernel open rect %r; read-back "
       "geometry %dx%d (the tab-aware viewport, not the open rect)"
       % (win_id, kern_rect, win_w, win_h))
+PY
+
+# M118c (#2481): the EL0 capture leg. SoundInProbe --sound-in --share puts
+# the input stream at index 0 and arms the VirtioFS share (the kernel's
+# virtio_fs backend — exec's only app source), so the monitor can run
+# `GOSELF.ELF --capture-probe`: the headless form of the audio-capture
+# case, which prints the verdict to serial and files the receipt on the
+# share. Whether frames actually arrive is the HOST's mic-consent answer
+# (M118b observed: an unentitled launcher is denied without a prompt and
+# the device completes nothing), so BOTH outcomes are pinned — a consented
+# host prints the 8192-byte receipt, a denied host the bounded
+# `refused=ETIMEDOUT`. Never a hang, never silence.
+vgate_assert 01 python <<'PY'
+import os, re, shutil, subprocess, sys
+
+rd = os.environ["RUN_DIR"]
+suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")
+probe = os.path.join(os.getcwd(), "host/vm-runner/.build/release/SoundInProbe")
+if not os.path.exists(probe):
+    sys.exit("SoundInProbe missing at %s (the package swift build precedes the run)" % probe)
+codesign = subprocess.run(
+    ["codesign", "--force", "--sign", "-", "--entitlements",
+     "host/vm-runner/entitlements.plist", probe],
+    capture_output=True, text=True)
+if codesign.returncode != 0:
+    sys.exit("codesign of SoundInProbe failed: %s%s" % (codesign.stdout, codesign.stderr))
+
+# A scratch share carrying just GOSELF.ELF — the probe boot's only app
+# source is the VirtioFS share (exec streams the ELF over FUSE reads).
+share = os.path.join(rd, "capture-share")
+os.makedirs(share, exist_ok=True)
+src = os.path.join(".build", "go", "GOSELF.ELF")
+if not os.path.exists(src):
+    sys.exit("GOSELF.ELF missing (expected " + src + ")")
+shutil.copy(src, os.path.join(share, "GOSELF.ELF"))
+
+script = os.path.join(rd, "capture-script.txt")
+with open(script, "w") as fh:
+    fh.write("exec GOSELF.ELF --capture-probe\n")
+serial = os.path.join(rd, "capture-serial.log")
+run = subprocess.run(
+    [probe, "--disk", "artifacts/disk.img",
+     "--vars", os.path.join(rd, "capture-vars.bin"),
+     "--serial", serial,
+     "--sound-in", "--share", share,
+     "--script", script,
+     "--script-expect", "goself: capture done",
+     "--timeout", "180"],
+    capture_output=True, text=True)
+with open(os.path.join(rd, "capture-run.txt"), "w") as fh:
+    fh.write(run.stdout + run.stderr)
+if os.path.exists(serial):
+    shutil.copyfile(serial, "artifacts/go-selftest-serial-capture%s.log" % suffix)
+if run.returncode != 0:
+    sys.exit("SoundInProbe --sound-in --share exited %d:\n%s%s"
+             % (run.returncode, run.stdout[-1500:], run.stderr[-1500:]))
+text = open(serial, errors="replace").read()
+
+# The guest took the scripted exec and the case ran to its verdict marker.
+for want in ("exec: loaded GOSELF.ELF", "goself: capture done"):
+    if want not in text:
+        sys.exit("guest serial missing %r — the headless probe never finished" % want)
+
+# The verdict line is the receipt the case computed — ready=1 means the
+# kernel's slot-91 report observed stream 0 INPUT with the v1 tuple.
+m = re.search(r"goself: case audio-capture ready=(\d+)"
+              r"(?: captured=(\d+) nonzero=(\d+)| refused=(\w+))"
+              r" overcap=(\w+) oddlen=(\w+)", text)
+if not m:
+    sys.exit("no capture verdict line in the serial log")
+ready, captured, nonzero, refused, overcap, oddlen = m.groups()
+if ready != "1":
+    sys.exit("slot 91 did not report the observed INPUT stream (ready=%s)" % ready)
+if overcap != "EINVAL" or oddlen != "EINVAL":
+    sys.exit("the named negatives were not EINVAL: overcap=%s oddlen=%s" % (overcap, oddlen))
+if captured is not None:
+    # The bounded read landed: exactly the request, no more.
+    if int(captured) != 8192 or int(nonzero) > 8192:
+        sys.exit("bounded-read receipt broken: captured=%s nonzero=%s" % (captured, nonzero))
+elif refused != "ETIMEDOUT":
+    # The denied host's honest outcome — the bounded drain refusal, zero
+    # frames. Any other refusal means the seam named something it should
+    # not have.
+    sys.exit("capture refused %s, want ETIMEDOUT (or the captured receipt)" % refused)
+if "selftest: case audio-capture pass" not in text:
+    sys.exit("the capture case did not pass")
+
+# The share carries the same receipt the serial printed — the guest's file
+# channel is the second reporter, and it must agree byte-for-byte.
+receipt = os.path.join(share, "SELFTEST", "OUT", "audio-capture.ok")
+if os.path.exists(receipt):
+    want_line = "case audio-capture ready=%s" % ready
+    body = open(receipt).read()
+    if not body.startswith(want_line):
+        sys.exit("share receipt disagrees with serial: %r" % body)
+    if captured is not None:
+        pcm = os.path.join(share, "SELFTEST", "OUT", "capture.copy")
+        if not os.path.exists(pcm) or os.path.getsize(pcm) != int(captured):
+            sys.exit("capture.copy missing or wrong size on the share")
+else:
+    sys.exit("the headless case never filed its receipt on the share")
+
+if "[EXC] parking" in text:
+    sys.exit("guest parked an exception during the capture leg")
+print("capture leg: ready=%s outcome=%s" %
+      (ready, "captured=%s nonzero=%s" % (captured, nonzero) if captured
+       else "refused=" + refused))
 PY
 
 vgate_assert 01 python <<'PY'

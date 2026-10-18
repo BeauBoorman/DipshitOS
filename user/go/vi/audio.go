@@ -380,3 +380,97 @@ func audioChunks(n int, f func(off, end int) (int, error)) (int, error) {
 	}
 	return total, nil
 }
+
+// M118c (#2481, ADR 0007 amendment): the capture half of the audio seam —
+// slots 91/92, the RX twins of 42/43. The kernel owns ONE capture stream
+// capped at the v1 tuple (S16 / 48 kHz / mono) feeding a bounded 64 KiB
+// ring; these bindings marshal that seam, they do not negotiate.
+
+// AudioCapInfo is slot 91's out struct: 16 bytes, the kernel's
+// field order and widths (kernel/src/virtio_snd.zig `AudioCapInfo`):
+//
+//	 0  ready        u32  RX queue armed AND stream 0 last observed INPUT
+//	                     speaking the v1 tuple (0 = no usable capture source)
+//	 4  format       u8   the v1 tuple when ready, AudioFmtNone when not
+//	 5  rate         u8   (0xff when not ready)
+//	 6  channels     u8   (0 when not ready)
+//	 7  padding      u8
+//	 8  period_bytes u32  one posted RX period (2048)
+//	12  ring_bytes   u32  the bounded ring — also the per-call byte bound
+//
+// `ready` reports the LAST OBSERVED stream-0 topology — slot 91 runs no
+// device exchange of its own (the rearm-time kernel self-test and every
+// slot-92 call refresh the observation). A soundless VM or an output-only
+// stream is a successful call with Ready == 0, the same honesty rule as
+// slot 42: absence is not an error at the info seam.
+type AudioCapInfo struct {
+	Ready       uint32
+	Format      uint8
+	Rate        uint8
+	Channels    uint8
+	Padding     uint8
+	PeriodBytes uint32
+	RingBytes   uint32
+}
+
+// The v1 capture tuple — the ONLY tuple slot 92 accepts. Exported so the
+// gate and this binding state the kernel's constants (cap_format /
+// cap_rate / cap_channels in virtio_snd.zig) instead of three copies.
+const (
+	AudioCapFormat   uint8 = AudioFmtS16 // FMT_S16
+	AudioCapRate     uint8 = 7           // RATE_48000
+	AudioCapChannels uint8 = 1           // mono
+)
+
+// The slot-92 geometry: the posted RX period and the per-call byte bound
+// (the ring's capacity — a call can never ask for more than the ring).
+const (
+	AudioCapPeriodBytes = 2048
+	AudioCapRingBytes   = 64 * 1024
+)
+
+// ErrAudioCaptureTimeout is the kernel's ETIMEDOUT: the bounded RX drain
+// expired before the request landed. On a host whose mic consent is
+// denied the device completes nothing, so this is the honest answer —
+// zero frames is a refusal, never a short read. Compare with == or
+// errors.Is.
+var ErrAudioCaptureTimeout = errno(ErrETIMEDOUT)
+
+// AudioCapQuery reads the capture capability report (slot 91). It never
+// fails on a healthy EL0 caller: a guest with no capture source gets
+// Ready == 0, not an error.
+func AudioCapQuery() (AudioCapInfo, error) {
+	var out AudioCapInfo
+	r := svc1(SlotAudioRecInfo, uintptr(unsafe.Pointer(&out)))
+	if r < 0 {
+		return AudioCapInfo{}, errno(-r)
+	}
+	return out, nil
+}
+
+// AudioCapture records len(buf) bytes (len(buf)/2 frames) at the
+// requested tuple into buf and returns the bytes landed — len(buf) on a
+// complete capture. The request is ONE bounded read: the kernel fills its
+// ring from the RX queue and copies it out in bounded chunks.
+//
+// The refusals are the kernel's, passed through unchanged like
+// AudioVolume's out-of-range EINVAL: an over-cap tuple is EINVAL (the
+// named over-cap refusal — nothing is silently converted), a zero or
+// non-frame-aligned length is EINVAL, over AudioCapRingBytes is
+// ENAMETOOLONG, device-absent / unarmed RX / a non-INPUT stream 0 is
+// ErrNoAudioDevice, an expired bounded drain is ErrAudioCaptureTimeout, a
+// full ring is ENOSPC, and a device-level refusal is EIO.
+//
+// An empty buffer is a no-op: (0, nil) — the kernel's EINVAL for a zero
+// length never fires, same rule as AudioPlay.
+func AudioCapture(format, rate, channels uint8, buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	r := svc6(SlotAudioRec, uintptr(format), uintptr(rate), uintptr(channels),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0)
+	if r < 0 {
+		return 0, errno(-r)
+	}
+	return int(r), nil
+}

@@ -33,8 +33,9 @@
 //! `#v1[ key=value ...]` header + one `name<TAB>sha256|*<TAB>words` line
 //! per row; `words` is a comma-separated list (or `-`/empty for a row
 //! that narrows to nothing). The header's `mode=` field carries the
-//! enforcement posture: `mode=audit|enforce`, absent = `audit` (the
-//! arc's ship posture — D12). Fail-closed like `OWNERS.TXT`:
+//! enforcement posture: `mode=audit|enforce`, absent = `audit`
+//! (D12's standing contract — M116b lands `enforce` as the provisioned
+//! posture, not the boot default). Fail-closed like `OWNERS.TXT`:
 //!
 //!   - a malformed data line POISONS its name — the row acts as a
 //!     mismatched row (its binary refuses `grant_stale`), never silently
@@ -63,6 +64,10 @@ const std = @import("std");
 const measure = @import("measure.zig");
 const trust = @import("trust.zig");
 const virtio_file = @import("virtio_file.zig");
+const process = @import("process.zig");
+const arp = @import("arp.zig"); // M117e: v4 destination path class
+const ipv6 = @import("ipv6.zig"); // M117e: the v6 Addr + path class
+const klog = @import("klog.zig"); // M117e: the scope-denial receipt channel
 
 pub const filename = "GRANTS.TXT";
 
@@ -71,16 +76,31 @@ pub const filename = "GRANTS.TXT";
 pub const name_max: usize = 64;
 /// Bounded user table: full ⇒ `ENOSPC` on insert, never eviction.
 pub const max_user_rows: usize = 16;
+/// M116d (#2470): the bound on `to=` endpoints one row may list.
+pub const max_to_endpoints: usize = 4;
+/// M116d: the bound on `fs=` path rules one row may list.
+pub const max_fs_rules: usize = 4;
+/// M116d: the widest canonical `/vol[/sub]` scope path — a policy
+/// prefix bound, deliberately narrower than `file_table.max_path_len`.
+pub const fs_path_max: usize = 96;
+/// The widest a scope field gets — the `v6=` prefixes at full literal
+/// width, the two `if=` tokens, `to=` endpoints at v6 bracket width,
+/// `fs=` rules at `fs_path_max`, and separators.
+pub const scope_max: usize = max_v6_prefixes * (3 + 39 + 1 + 3) +
+    (3 + 7) + (3 + 3) +
+    max_to_endpoints * (3 + 1 + 39 + 1 + 1 + 5) +
+    max_fs_rules * (3 + fs_path_max + 3) + 15;
 /// The widest a serialized row line gets (name + sha + the whole word
-/// vocabulary + separators).
-pub const line_max: usize = name_max + 1 + 64 + 1 + 64;
+/// vocabulary + the scope field + separators).
+pub const line_max: usize = name_max + 1 + 64 + 1 + 64 + 1 + scope_max;
 /// The serialized `GRANTS.TXT` bound: header + `mode=` + one line per row.
 pub const file_max: usize = 32 + max_user_rows * (line_max + 1);
 
 // ---------------------------------------------------------------------------
 // The word vocabulary — the `caps=` words (ADR 0054 D9: one word = one
-// thing). `baseline` is every word set: today's ambient authority, so a
-// flags-off exec is byte-identical.
+// thing). `baseline` is every word set: the CEILING a row may express and
+// `set_grant`'s clamp — not what an unlisted binary carries. `ambient` is
+// that floor.
 // ---------------------------------------------------------------------------
 
 pub const word_file: u32 = 1 << 0;
@@ -95,13 +115,45 @@ pub const word_term: u32 = 1 << 8;
 pub const word_count: usize = 9;
 pub const baseline: u32 = (1 << word_count) - 1;
 
+/// M116b (#2468): the ambient word set — what a process no row names
+/// carries (D8's no-row floor, narrowed on the M113f audit data). Drops
+/// the words that cross the guest's trust boundary:
+///
+///   - `file`  — the host share: reads pick up host-side bytes, writes
+///               stage guest data where the host reads it back;
+///   - `audio` — virtio-snd drives playback AND capture since M118b —
+///               a microphone is an exfil/surveillance source;
+///   - `net`   — socket egress (the slot group plus the slot-80
+///               open-class ops).
+///
+/// Kept — and why:
+///
+///   - `debug`    — slots 0/1/3 are sys_ping/sys_write/sys_exit:
+///                  EXISTENCE verbs, not powers. A process that cannot
+///                  print or exit is not confined, it is stuck — the
+///                  M113f table shows every Go ELF calls them ambiently.
+///                  (The card's letter named `debug` for the drop; the
+///                  owner recorded this correction on #2468.)
+///   - `memory`/`process` — allocation and lifecycle; an exec'd child
+///                  carries the ambient set again, so spawning cannot
+///                  widen.
+///   - `timer`    — scheduling, no data crosses the boundary.
+///   - `window`/`term` — seat-local surfaces: paint and console attach
+///                  stay inside the boundary the seat already mediates.
+///
+/// Rows still express the whole vocabulary against `baseline` — a fleet
+/// or consented app's row keeps its `net`/`file`/`audio` words.
+pub const ambient: u32 = baseline & ~(word_file | word_audio | word_net);
+
 const vocab = [word_count][]const u8{ "file", "window", "audio", "timer", "memory", "process", "debug", "net", "term" };
 
 comptime {
-    // process.zig carries its own ambient constant (one-way dependency);
-    // a vocabulary change must land in both places.
-    if (baseline != @import("process.zig").word_baseline)
+    // process.zig carries its own constants (one-way dependency); a
+    // vocabulary change must land in both places.
+    if (baseline != process.word_baseline)
         @compileError("grant.baseline must equal process.word_baseline");
+    if (ambient != process.word_ambient)
+        @compileError("grant.ambient must equal process.word_ambient");
 }
 
 /// The word's display name by bit index (receipt `word=` field).
@@ -146,11 +198,164 @@ pub fn socket_open_op(op: u64) bool {
 }
 
 // ---------------------------------------------------------------------------
+// The row's scope qualifiers — an optional FOURTH field
+// (`name<TAB>sha|*<TAB>words<TAB>scope`), a CSV of qualifier tokens;
+// absent or `-` is unconstrained — the three-field row shape,
+// byte-identical. M117e (#2477, ADR 0057 D12) landed the net qualifiers;
+// M116d (#2470) adds the endpoint allowlist and the file path rules.
+//
+//   `v6=<prefix>/<len>`  a v6-family connect's literal must match one
+//                        listed prefix — off-list refuses
+//                        `v6_literal_denied`. Bounded: `max_v6_prefixes`
+//                        per row, more is a malformed row (poison).
+//   `if=<nat|bridged>`   the destination's PATH CLASS must be in the
+//                        set — `nat` is the router-mediated reach the
+//                        NAT island has always had (and the router
+//                        itself, which is island fabric), `bridged` an
+//                        L2-adjacent peer — the class a bridged/vmnet
+//                        LAN adds. Off-set refuses `<class>_denied`.
+//   `to=<host>:<port>`   the (destination, port) tuple a connect or
+//                        resolver open asks for must match one listed
+//                        endpoint — `to=10.0.0.2:8080` for v4,
+//                        `to=[2001:db8::1]:443` for v6. Off-list
+//                        refuses `to_denied`. Bounded: `max_to_endpoints`.
+//   `fs=<path>:<ro|rw>`  a file op's canonical `/vol[/sub]` path must
+//                        fall under a listed prefix; a `ro` prefix
+//                        carries reads only — a mutation under it (or
+//                        any path under no prefix) refuses
+//                        `fs_write_denied`/`fs_path_denied`. The
+//                        vocabulary is `/host` and `/disk` — a scoped
+//                        row names no usb path, so usb access is
+//                        refused by name. Bounded: `max_fs_rules`.
+//
+// Scope only ever narrows — every qualifier REMOVES reach — so a
+// wildcard row may carry it freely. The net qualifiers are evaluated at
+// the destination-bearing open ops (slot-80 op 8 beginDns and op 10
+// connect, v4 and v6, plus the legacy slot-30 connect that funnels the
+// same table entry point); listen binds no destination and is
+// unconstrained. The `fs=` rules are evaluated at file_table's
+// path-bearing entry points — open/delete/rename/list/mode, the
+// slot-79 root+relative ops, and every pin use (the pin's recorded
+// path reauthorizes like B5); handle ops are covered transitively —
+// a process cannot hold a handle it never scoped open. Like the word
+// gate, `audit` receipts the would-be denial and lets the call
+// through; `enforce` refuses EACCES.
+// ---------------------------------------------------------------------------
+
+/// `if=` vocabulary bits — the destination's egress path class.
+pub const if_nat: u8 = 1 << 0;
+pub const if_bridged: u8 = 1 << 1;
+/// The bound on `v6=` prefixes one row may list.
+pub const max_v6_prefixes: usize = 4;
+
+/// The destination's egress path class — the `if=` token vocabulary and
+/// the `<class>_denied` receipt names.
+pub const PathClass = enum {
+    /// Router-mediated: an off-link destination resolved through the
+    /// default gateway / recorded v6 router, or the router itself.
+    nat,
+    /// L2-adjacent: an on-link destination the wire resolves directly —
+    /// the reach a bridged or vmnet LAN adds beyond the island.
+    bridged,
+
+    fn bit(c: PathClass) u8 {
+        return switch (c) {
+            .nat => if_nat,
+            .bridged => if_bridged,
+        };
+    }
+
+    fn token(c: PathClass) []const u8 {
+        return @tagName(c);
+    }
+};
+
+pub const V6Prefix = struct {
+    addr: ipv6.Addr = @splat(0),
+    len: u8 = 0,
+};
+
+/// M116d (#2470): one `to=` endpoint — a (literal, port) tuple an
+/// open-class op's destination must match. Families never cross: a
+/// v4 destination cannot satisfy a v6 entry or vice versa.
+pub const ToEndpoint = union(enum) {
+    v4: struct { ip: [4]u8, port: u16 },
+    v6: struct { addr: ipv6.Addr, port: u16 },
+};
+
+/// M116d: one `fs=` path rule — a canonical `/vol[/sub]` prefix
+/// (`/host` or `/disk` volumes only) and whether mutations under it
+/// are in scope. `writable` is the `rw` suffix; absent it is `ro`.
+pub const FsRule = struct {
+    path: [fs_path_max]u8 = @as([fs_path_max]u8, @splat(@as(u8, 0))),
+    path_len: u8 = 0,
+    writable: bool = false,
+};
+
+/// One row's scope. `v6_count == 0` leaves v6 literals unconstrained;
+/// `if_mask == 0` the path class; `to_count == 0` the endpoint tuple;
+/// `fs_count == 0` file paths — every empty qualifier is the
+/// unconstrained shape a scope-less row serializes byte-identically.
+pub const Scope = struct {
+    v6: [max_v6_prefixes]V6Prefix = @splat(.{}),
+    v6_count: u8 = 0,
+    if_mask: u8 = 0,
+    to: [max_to_endpoints]ToEndpoint = @splat(.{ .v4 = .{ .ip = @splat(0), .port = 0 } }),
+    to_count: u8 = 0,
+    fs: [max_fs_rules]FsRule = @splat(.{}),
+    fs_count: u8 = 0,
+
+    pub fn isEmpty(s: Scope) bool {
+        return s.v6_count == 0 and s.if_mask == 0 and s.to_count == 0 and s.fs_count == 0;
+    }
+};
+
+/// The destination a destination-bearing open presents to the scope
+/// check: the v4 literal or the v6 literal the caller asked for.
+pub const ScopedDst = union(enum) {
+    v4: [4]u8,
+    v6: ipv6.Addr,
+};
+
+/// The scope check's answer. `path` names the destination's own class
+/// (the refusal is `bridged_denied`/`nat_denied` by name); `to` is the
+/// M116d endpoint allowlist miss (`to_denied`); `stale` is the D8
+/// contract reapplied mid-flight — a row that names the image but no
+/// longer binds it.
+pub const OpenVerdict = union(enum) {
+    allow,
+    v6_literal,
+    path: PathClass,
+    to,
+    stale,
+};
+
+/// M116d (#2470): the file-scope check's access classes — every
+/// mutation (write/create/append/mkdir/delete/rename/mode) is `write`;
+/// opens-for-read, stats and listings are `read`.
+pub const FsWant = enum { read, write };
+
+/// The fs-scope check's answer. `path` is a path under no listed
+/// prefix (`fs_path_denied`); `write` a mutation under a read-only
+/// one (`fs_write_denied`); `stale` the same mid-flight D8 contract
+/// the net check re-applies.
+pub const FsVerdict = union(enum) {
+    allow,
+    path,
+    write,
+    stale,
+};
+
+// ---------------------------------------------------------------------------
 // The enforcement posture (D12): `audit` receipts would-be denials and
 // refuses nothing at the word seam; `enforce` makes a denied word an
 // honest EACCES. Parsed from the `#v1` header's `mode=` field; absent =
 // `audit` — the switch lives inside the secret-class file, off the
-/// EL0-writable surface.
+// EL0-writable surface. M116b (#2468) lands the enforce half: the
+// ambient floor is narrowed below, and a `mode=enforce` provisioned file
+// makes every denied word a named refusal. The absent-file posture stays
+// `audit` by owner decision — an unarmed boot keeps working; flipping
+// that default is its own later call.
 // ---------------------------------------------------------------------------
 
 pub const Mode = enum { audit, enforce };
@@ -172,6 +377,11 @@ pub const BaseRow = struct {
     /// 32 raw-file digest bytes, or null for the `*` wildcard (narrow only).
     sha256: ?[measure.digest_len]u8,
     words: u32,
+    /// The scope qualifiers — null for every fleet row today. A POINTER,
+    /// not an inline struct: the ~31-row table is rodata, and an inline
+    /// Scope would reserve its full (post-M116d) width per row even
+    /// when every row carries none.
+    scope: ?*const Scope = null,
 };
 /// M116a (#2467): the fleet policy — one `*` narrow-only row per shipped
 /// app, authored from the M113f audit data (#2422) in
@@ -193,6 +403,8 @@ const Row = struct {
     name_len: u8 = 0,
     sha256: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0))),
     words: u32 = 0,
+    /// M117e: the net scope the optional fourth field carried.
+    scope: Scope = .{},
 };
 
 var user_rows: [max_user_rows]Row = @as([max_user_rows]Row, @splat(@as(Row, .{})));
@@ -263,6 +475,7 @@ pub fn lookup(name: []const u8) Lookup {
                 .name_len = @intCast(b.name.len),
                 .sha256 = b.sha256 orelse @as([measure.digest_len]u8, @splat(@as(u8, 0))),
                 .words = b.words & baseline,
+                .scope = if (b.scope) |s| s.* else .{},
             };
             @memcpy(r.name[0..b.name.len], b.name);
             return .{ .row = r };
@@ -284,18 +497,20 @@ comptime {
 var base_row_scratch: Row = .{};
 
 /// The exec verdict (ADR 0054 D8): apply a narrowed word set, refuse
-/// `grant_stale`, or take the baseline. `digest` is the measured
+/// `grant_stale`, or take the ambient floor. `digest` is the measured
 /// raw-file digest — null when the measurement itself failed (a named
 /// row is then unverifiable, which is fail-closed `stale`, never open).
 pub const Verdict = union(enum) {
-    baseline,
+    /// No row names this image — the ambient set applies (M116b: the
+    /// narrowed no-row floor, not the full vocabulary).
+    ambient,
     apply: u32,
     stale,
 };
 
 pub fn decide(name: []const u8, digest: ?*const [measure.digest_len]u8) Verdict {
     return switch (lookup(name)) {
-        .none => .baseline,
+        .none => .ambient,
         .poisoned => .stale,
         .row => |r| blk: {
             if (r.wildcard) break :blk .{ .apply = r.words & baseline };
@@ -318,6 +533,7 @@ const ParsedLine = struct {
     wildcard: bool = false,
     sha256: [measure.digest_len]u8 = undefined,
     words: u32 = 0,
+    scope: Scope = .{},
 };
 
 fn validName(name: []const u8) bool {
@@ -346,6 +562,133 @@ fn parseWords(s: []const u8) ?u32 {
     return mask;
 }
 
+/// M117e: a `v6=` token's prefix length — decimal digits, 0..128.
+fn parsePrefixLen(s: []const u8) ?u8 {
+    if (s.len == 0 or s.len > 3) return null;
+    var v: u16 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    if (v > 128) return null;
+    return @intCast(v);
+}
+
+/// M116d (#2470): a `to=` token's port — decimal digits, 1..65535. A
+/// `:0` entry could never match an open (the ops refuse port 0 as an
+/// argument), so it is malformed policy, not a dead list entry.
+fn parsePort(s: []const u8) ?u16 {
+    if (s.len == 0 or s.len > 5) return null;
+    var v: u32 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    if (v == 0 or v > 65535) return null;
+    return @intCast(v);
+}
+
+/// M116d: a `to=` token — `a.b.c.d:port` for v4, `[v6-literal]:port`
+/// for v6. Null on any malformed shape — the caller poisons the row.
+fn parseEndpoint(s: []const u8) ?ToEndpoint {
+    if (s.len == 0) return null;
+    if (s[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, s, ']') orelse return null;
+        const addr = ipv6.parse_ip6(s[1..close]) orelse return null;
+        if (close + 1 >= s.len or s[close + 1] != ':') return null;
+        const port = parsePort(s[close + 2 ..]) orelse return null;
+        return .{ .v6 = .{ .addr = addr, .port = port } };
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const ip = arp.parse_ip(s[0..colon]) orelse return null;
+    const port = parsePort(s[colon + 1 ..]) orelse return null;
+    return .{ .v4 = .{ .ip = ip, .port = port } };
+}
+
+/// The canonical volume-rooted shape an `fs=` path takes: `/host`,
+/// `/host/<sub>`, `/disk`, `/disk/<sub>` — never bare, never the
+/// `vol:` shorthand, and no `.`/`..`/empty component (the canonical
+/// request form collapses slashes and file_table refuses traversal
+/// before the check, so a prefix that could only match a rejected
+/// shape is malformed, not dead policy).
+fn validFsScopePath(path: []const u8) bool {
+    if (path.len == 0 or path.len > fs_path_max or path[0] != '/') return false;
+    const rest = path[1..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const vol = rest[0..slash];
+    if (!std.mem.eql(u8, vol, "host") and !std.mem.eql(u8, vol, "disk")) return false;
+    var it = std.mem.splitScalar(u8, rest[slash..], '/');
+    while (it.next()) |comp| {
+        if (comp.len == 0) continue;
+        if (std.mem.eql(u8, comp, ".") or std.mem.eql(u8, comp, "..")) return false;
+        for (comp) |c| {
+            if (c < 0x20 or c == 0x7f) return false;
+        }
+    }
+    return true;
+}
+
+/// M116d: an `fs=` token — `<canonical>:<ro|rw>`, split on the LAST
+/// colon so a path containing one is still readable. Trailing slashes
+/// normalize away (`/host/` is `/host`). Null on a bad suffix or a
+/// non-canonical path — the caller poisons the row.
+fn parseFsRule(s: []const u8) ?FsRule {
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const writable = if (std.mem.eql(u8, s[colon + 1 ..], "rw"))
+        true
+    else if (std.mem.eql(u8, s[colon + 1 ..], "ro"))
+        false
+    else
+        return null;
+    var path = s[0..colon];
+    while (path.len > 1 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
+    if (!validFsScopePath(path)) return null;
+    var rule: FsRule = .{ .writable = writable };
+    @memcpy(rule.path[0..path.len], path);
+    rule.path_len = @intCast(path.len);
+    return rule;
+}
+
+/// The optional fourth field — `-`/empty is unconstrained; else a CSV
+/// of `v6=<prefix>/<len>` (bounded by `max_v6_prefixes`),
+/// `if=<nat|bridged>`, `to=<host>:<port>` (bounded by
+/// `max_to_endpoints`) and `fs=<path>:<ro|rw>` (bounded by
+/// `max_fs_rules`) tokens. Null on any malformed or overflowing token
+/// — the caller poisons the row (fail closed, the line grammar's
+/// standing rule).
+fn parseScope(s: []const u8) ?Scope {
+    if (s.len == 0 or std.mem.eql(u8, s, "-")) return .{};
+    var scope: Scope = .{};
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "v6=")) {
+            const spec = tok[3..];
+            const slash = std.mem.lastIndexOfScalar(u8, spec, '/') orelse return null;
+            const addr = ipv6.parse_ip6(spec[0..slash]) orelse return null;
+            const len = parsePrefixLen(spec[slash + 1 ..]) orelse return null;
+            if (scope.v6_count >= max_v6_prefixes) return null;
+            scope.v6[scope.v6_count] = .{ .addr = addr, .len = len };
+            scope.v6_count += 1;
+        } else if (std.mem.startsWith(u8, tok, "if=")) {
+            const name = tok[3..];
+            if (std.mem.eql(u8, name, "nat")) {
+                scope.if_mask |= if_nat;
+            } else if (std.mem.eql(u8, name, "bridged")) {
+                scope.if_mask |= if_bridged;
+            } else return null;
+        } else if (std.mem.startsWith(u8, tok, "to=")) {
+            if (scope.to_count >= max_to_endpoints) return null;
+            scope.to[scope.to_count] = parseEndpoint(tok[3..]) orelse return null;
+            scope.to_count += 1;
+        } else if (std.mem.startsWith(u8, tok, "fs=")) {
+            if (scope.fs_count >= max_fs_rules) return null;
+            scope.fs[scope.fs_count] = parseFsRule(tok[3..]) orelse return null;
+            scope.fs_count += 1;
+        } else return null;
+    }
+    return scope;
+}
+
 const LineResult = enum {
     /// A row landed (valid or poisoned).
     applied,
@@ -361,11 +704,11 @@ const LineResult = enum {
 /// whose name cannot key a row (empty or over `name_max`) cannot poison;
 /// the over-long case is counted separately instead.
 fn parseLine(line: []const u8) LineResult {
-    var fields: [3][]const u8 = .{ "", "", "" };
+    var fields: [4][]const u8 = .{ "", "", "", "" };
     var nfields: usize = 0;
     var it = std.mem.splitScalar(u8, line, '\t');
     while (it.next()) |f| {
-        if (nfields < 3) fields[nfields] = f;
+        if (nfields < 4) fields[nfields] = f;
         nfields += 1;
     }
     const name = fields[0];
@@ -375,10 +718,13 @@ fn parseLine(line: []const u8) LineResult {
         if (name.len > name_max) overlong_names += 1;
         return .skipped;
     }
-    var poison = nfields != 3;
+    // M117e: three fields is the standing row shape; a fourth carries the
+    // net scope. Five or more is malformed.
+    var poison = nfields != 3 and nfields != 4;
     var sha: [measure.digest_len]u8 = undefined;
     var wildcard = false;
     var words: u32 = 0;
+    var scope: Scope = .{};
     if (!poison) {
         if (std.mem.eql(u8, fields[1], "*")) {
             wildcard = true;
@@ -394,12 +740,20 @@ fn parseLine(line: []const u8) LineResult {
         }
     }
     if (!poison and wildcard and (words & ~baseline) != 0) poison = true;
+    if (!poison and nfields == 4) {
+        if (parseScope(fields[3])) |sc| {
+            scope = sc;
+        } else {
+            poison = true;
+        }
+    }
     if (findRow(name)) |r| {
         r.poisoned = poison;
         if (!poison) {
             r.wildcard = wildcard;
             r.sha256 = sha;
             r.words = words;
+            r.scope = scope;
         }
         return .applied;
     }
@@ -411,6 +765,7 @@ fn parseLine(line: []const u8) LineResult {
         r.wildcard = wildcard;
         r.sha256 = sha;
         r.words = words;
+        r.scope = scope;
     }
     user_count += 1;
     return .applied;
@@ -540,9 +895,103 @@ fn row_line_into(r: *const Row, out: []u8) ?usize {
             first = false;
         }
     }
+    // M117e: the scope field appears only when the row carries one — a
+    // scope-less row serializes exactly the three-field shape it had
+    // before the qualifier existed.
+    if (!r.scope.isEmpty()) {
+        if (pos + 1 > out.len) return null;
+        out[pos] = '\t';
+        pos += 1;
+        const n = scope_field_into(&r.scope, out[pos..]) orelse return null;
+        pos += n;
+    }
     if (pos + 1 > out.len) return null;
     out[pos] = '\n';
     return pos + 1;
+}
+
+/// Marshal the scope CSV — `v6=` prefixes in stored order, the `if=`
+/// tokens in bit order, then the `to=` endpoints and `fs=` rules in
+/// stored order. Returns bytes written; null when `out` cannot hold
+/// the whole field (the caller's `line_max` bound always can).
+fn scope_field_into(s: *const Scope, out: []u8) ?usize {
+    var pos: usize = 0;
+    var first = true;
+    for (s.v6[0..s.v6_count]) |p| {
+        if (!first) {
+            if (pos + 1 > out.len) return null;
+            out[pos] = ',';
+            pos += 1;
+        }
+        if (pos + 3 > out.len) return null;
+        @memcpy(out[pos .. pos + 3], "v6=");
+        pos += 3;
+        var abuf: [39]u8 = undefined;
+        const alen = ipv6.format_ip6(p.addr, &abuf);
+        if (pos + alen + 1 > out.len) return null;
+        @memcpy(out[pos .. pos + alen], abuf[0..alen]);
+        pos += alen;
+        const written = std.fmt.bufPrint(out[pos..], "/{d}", .{p.len}) catch return null;
+        pos += written.len;
+        first = false;
+    }
+    inline for (.{ PathClass.nat, PathClass.bridged }) |c| {
+        if ((s.if_mask & c.bit()) != 0) {
+            if (!first) {
+                if (pos + 1 > out.len) return null;
+                out[pos] = ',';
+                pos += 1;
+            }
+            if (pos + 3 > out.len) return null;
+            @memcpy(out[pos .. pos + 3], "if=");
+            pos += 3;
+            const tok = c.token();
+            if (pos + tok.len > out.len) return null;
+            @memcpy(out[pos .. pos + tok.len], tok);
+            pos += tok.len;
+            first = false;
+        }
+    }
+    // M116d: the `to=` endpoints — v4 dotted:port, v6 bracketed:port.
+    for (s.to[0..s.to_count]) |e| {
+        if (!first) {
+            if (pos + 1 > out.len) return null;
+            out[pos] = ',';
+            pos += 1;
+        }
+        if (pos + 3 > out.len) return null;
+        @memcpy(out[pos .. pos + 3], "to=");
+        pos += 3;
+        const written = switch (e) {
+            .v4 => |v| std.fmt.bufPrint(out[pos..], "{d}.{d}.{d}.{d}:{d}", .{ v.ip[0], v.ip[1], v.ip[2], v.ip[3], v.port }) catch return null,
+            .v6 => |v| blk: {
+                var abuf: [39]u8 = undefined;
+                const alen = ipv6.format_ip6(v.addr, &abuf);
+                break :blk std.fmt.bufPrint(out[pos..], "[{s}]:{d}", .{ abuf[0..alen], v.port }) catch return null;
+            },
+        };
+        pos += written.len;
+        first = false;
+    }
+    // M116d: the `fs=` rules — the canonical prefix plus `:ro`/`:rw`.
+    for (s.fs[0..s.fs_count]) |rule| {
+        if (!first) {
+            if (pos + 1 > out.len) return null;
+            out[pos] = ',';
+            pos += 1;
+        }
+        const path = rule.path[0..rule.path_len];
+        const suffix: []const u8 = if (rule.writable) ":rw" else ":ro";
+        if (pos + 3 + path.len + suffix.len > out.len) return null;
+        @memcpy(out[pos .. pos + 3], "fs=");
+        pos += 3;
+        @memcpy(out[pos .. pos + path.len], path);
+        pos += path.len;
+        @memcpy(out[pos .. pos + suffix.len], suffix);
+        pos += suffix.len;
+        first = false;
+    }
+    return pos;
 }
 
 /// Marshal user row `index` (valid rows only, insertion order) as its
@@ -580,14 +1029,14 @@ pub const AdminResult = enum { ok, einval, enospc, enxio, eio };
 /// `eio` — the caller's table never diverges from the share it saw
 /// refused.
 pub fn admin_set_line(line: []const u8) AdminResult {
-    var fields: [3][]const u8 = .{ "", "", "" };
+    var fields: [4][]const u8 = .{ "", "", "", "" };
     var nfields: usize = 0;
     var it = std.mem.splitScalar(u8, line, '\t');
     while (it.next()) |f| {
-        if (nfields < 3) fields[nfields] = f;
+        if (nfields < 4) fields[nfields] = f;
         nfields += 1;
     }
-    if (nfields != 3 or !validName(fields[0])) return .einval;
+    if ((nfields != 3 and nfields != 4) or !validName(fields[0])) return .einval;
     var sha: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
     var wildcard = false;
     if (std.mem.eql(u8, fields[1], "*")) {
@@ -597,33 +1046,49 @@ pub fn admin_set_line(line: []const u8) AdminResult {
     }
     const words = parseWords(fields[2]) orelse return .einval;
     if (wildcard and (words & ~baseline) != 0) return .einval;
+    var scope: Scope = .{};
+    if (nfields == 4) scope = parseScope(fields[3]) orelse return .einval;
     if (!virtio_file.available()) return .enxio;
 
-    admin_backup = user_rows;
     admin_backup_count = user_count;
     if (findRow(fields[0])) |r| {
+        admin_backup_row = r.*;
+        admin_backup_existed = true;
         r.poisoned = false;
         r.wildcard = wildcard;
         r.sha256 = sha;
         r.words = words;
+        r.scope = scope;
     } else {
+        admin_backup_existed = false;
         const r = freeSlot() orelse return .enospc;
-        r.* = .{ .used = true, .wildcard = wildcard, .sha256 = sha, .words = words };
+        r.* = .{ .used = true, .wildcard = wildcard, .sha256 = sha, .words = words, .scope = scope };
         @memcpy(r.name[0..fields[0].len], fields[0]);
         r.name_len = @intCast(fields[0].len);
         user_count += 1;
     }
     if (!persist()) {
-        user_rows = admin_backup;
-        user_count = admin_backup_count;
+        if (findRow(fields[0])) |r| {
+            if (admin_backup_existed) {
+                r.* = admin_backup_row;
+            } else {
+                r.* = .{};
+                user_count = admin_backup_count;
+            }
+        }
         return .eio;
     }
     return .ok;
 }
 
 /// BSS rollback state for `admin_set_line` — the slot is dom-locked, so
-/// one backup suffices (never on the EL1 stack).
-var admin_backup: [max_user_rows]Row = undefined;
+/// one row's backup suffices (never on the EL1 stack): the set inserts
+/// or updates exactly ONE row, so rollback restores that row's prior
+/// contents or frees the slot it took, plus the count. (The whole-table
+/// copy predates the scope fields — backing up 16 full Scopes cost
+/// several KiB of BSS for nothing the operation can change.)
+var admin_backup_row: Row = .{};
+var admin_backup_existed: bool = false;
 var admin_backup_count: usize = 0;
 
 /// The name a grants line carries (field 0) — the slot's self-name check
@@ -650,7 +1115,8 @@ var file_scratch: [file_max]u8 = undefined;
 /// file is absent, and a hand-seeded `OWNERS.TXT` row can only tighten),
 /// then read and parse it. Returns true only when a file was read and
 /// parsed; a default share (no file) is a silent no-op with an empty
-/// user table and `audit` posture — no boot line, boot-default unchanged.
+/// user table and `audit` posture — no boot line, boot-default
+/// unchanged (M116b: enforce arrives provisioned, `mode=enforce`).
 pub fn init_from_share() bool {
     init();
     if (!virtio_file.available()) return false;
@@ -658,6 +1124,242 @@ pub fn init_from_share() bool {
     const n = virtio_file.read_whole(filename, &file_scratch) orelse return false;
     _ = load(file_scratch[0..n]);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// M117e (#2477, ADR 0057 D12): the scope check at the open-class op.
+// ---------------------------------------------------------------------------
+
+fn zero4(ip: [4]u8) bool {
+    return std.mem.eql(u8, &ip, &.{ 0, 0, 0, 0 });
+}
+
+/// The destination's egress path class, computed from the stack's own
+/// routing state — never the host's word for the attachment. `bridged`
+/// is the class a real LAN adds: a destination the wire resolves
+/// DIRECTLY (v4 `arp.next_hop` answers the literal, v6 `ipv6.next_hop`
+/// answers the address — on-link). `nat` is the router-mediated path
+/// the island always had — an off-link destination, an unroutable one
+/// (classified by intent, refused by the transport anyway), or the
+/// router itself, which is the island's own fabric rather than a peer.
+pub fn dstClass(dst: ScopedDst) PathClass {
+    return switch (dst) {
+        .v4 => |ip| blk: {
+            const gw = arp.default_gateway();
+            if (!zero4(gw) and std.mem.eql(u8, &ip, &gw)) break :blk .nat;
+            break :blk if (std.mem.eql(u8, &arp.next_hop(ip), &ip)) .bridged else .nat;
+        },
+        .v6 => |a| blk: {
+            if (ipv6.router_valid and std.mem.eql(u8, &a, &ipv6.router_addr)) break :blk .nat;
+            const nh = ipv6.next_hop(&a) orelse break :blk .nat;
+            break :blk if (std.mem.eql(u8, &nh, &a)) .bridged else .nat;
+        },
+    };
+}
+
+/// Evaluate one row's scope against a (destination, port) tuple. The
+/// `to=` bound gates every destination-bearing open; the v6-prefix
+/// bound gates only v6 literals (a v4 destination is not a v6
+/// literal); the `if=` bound gates every destination's class. Empty
+/// scope allows — the fast path every scope-less row takes.
+pub fn scopeEval(scope: *const Scope, dst: ScopedDst, port: u16) OpenVerdict {
+    if (scope.isEmpty()) return .allow;
+    // M116d: the `to=` endpoint allowlist — the (literal, port) tuple
+    // must match one listed endpoint, families exact.
+    if (scope.to_count != 0) {
+        var match = false;
+        for (scope.to[0..scope.to_count]) |e| {
+            match = switch (dst) {
+                .v4 => |ip| e == .v4 and e.v4.port == port and std.mem.eql(u8, &ip, &e.v4.ip),
+                .v6 => |a| e == .v6 and e.v6.port == port and std.mem.eql(u8, &a, &e.v6.addr),
+            };
+            if (match) break;
+        }
+        if (!match) return .to;
+    }
+    if (dst == .v6 and scope.v6_count != 0) {
+        var match = false;
+        for (scope.v6[0..scope.v6_count]) |p| {
+            if (ipv6.prefix_match(dst.v6, p.addr, p.len)) {
+                match = true;
+                break;
+            }
+        }
+        if (!match) return .v6_literal;
+    }
+    const class = dstClass(dst);
+    if (scope.if_mask != 0 and (scope.if_mask & class.bit()) == 0)
+        return .{ .path = class };
+    return .allow;
+}
+
+fn startsWithIC(hay: []const u8, prefix: []const u8) bool {
+    if (prefix.len > hay.len) return false;
+    return std.ascii.eqlIgnoreCase(hay[0..prefix.len], prefix);
+}
+
+/// Lookup for the open-class check: the caller's recorded image name is
+/// the registry's DISPLAY name (process.name_max = 16 — a truncation
+/// bound, not the row-key bound). A name at that bound may be a longer
+/// exec name's prefix, so an exact miss scans for the row it could be a
+/// prefix of — a scoped row never goes unseen because the display name
+/// truncated it.
+fn lookupProcess(name: []const u8) Lookup {
+    const l = lookup(name);
+    switch (l) {
+        .none => {},
+        else => return l,
+    }
+    if (name.len < process.name_max) return .none;
+    for (&user_rows) |*r| {
+        if (r.used and startsWithIC(r.name[0..r.name_len], name))
+            return if (r.poisoned) .poisoned else .{ .row = r };
+    }
+    for (base_rows) |*b| {
+        if (startsWithIC(b.name, name)) {
+            const r = &base_row_scratch;
+            r.* = .{
+                .used = true,
+                .wildcard = b.sha256 == null,
+                .name_len = @intCast(b.name.len),
+                .sha256 = b.sha256 orelse @as([measure.digest_len]u8, @splat(@as(u8, 0))),
+                .words = b.words & baseline,
+                .scope = if (b.scope) |s| s.* else .{},
+            };
+            @memcpy(r.name[0..b.name.len], b.name);
+            return .{ .row = r };
+        }
+    }
+    return .none;
+}
+
+/// The row a scope check resolves for `pid`: the registry-name row,
+/// still bound to the exec-measured image (D8's contract — a
+/// mid-flight rewrite that no longer binds is `stale`, fail-closed,
+/// never silently unscoped). `.none` is no row — unconstrained, the
+/// same rule as the word gate's unrowed verdict.
+const ScopedRow = union(enum) {
+    none,
+    stale,
+    row: *const Row,
+};
+
+fn scopedRow(pid: usize) ScopedRow {
+    const pinfo = process.info(pid) orelse return .none;
+    return switch (lookupProcess(pinfo.name)) {
+        .none => .none,
+        .poisoned => .stale,
+        .row => |r| blk: {
+            if (!r.wildcard) {
+                const gs = process.grant_state(pid) orelse break :blk .stale;
+                if (!gs.measured_ok or !std.mem.eql(u8, &gs.digest, &r.sha256)) break :blk .stale;
+            }
+            break :blk .{ .row = r };
+        },
+    };
+}
+
+/// The open-class-op scope check (M117e + M116d): resolve the owner's
+/// row, confirm it still binds the exec-measured image, and evaluate
+/// the qualifiers against the (destination, port) tuple — `port` is
+/// the op's destination port (the resolver's 53 for beginDns, the
+/// connect's remote port). `audit` mode receipts the denial and the
+/// caller proceeds anyway; `enforce` makes the caller refuse EACCES.
+/// Kernel-context owners (no resolvable pid, the `unowned` sentinel)
+/// carry no row — same rule as the word gate.
+pub fn net_open(owner: u64, dst: ScopedDst, port: u16) OpenVerdict {
+    if (owner >= process.max_processes) return .allow;
+    const pid: usize = @intCast(owner);
+    const verdict: OpenVerdict = switch (scopedRow(pid)) {
+        .none => .allow,
+        .stale => .stale,
+        .row => |r| scopeEval(&r.scope, dst, port),
+    };
+    if (verdict != .allow) emit_scope_denial(pid, verdict);
+    return verdict;
+}
+
+/// M116d (#2470): evaluate one row's `fs=` rules against a canonical
+/// `/vol[/sub]` path — the SAME canonicalization file_table produces
+/// (volume prefix + the share/disk-relative subpath, slashes already
+/// collapsed). The op is allowed when SOME matching prefix permits the
+/// access: a `rw` prefix carries reads too, a `ro` prefix refuses a
+/// mutation as `write`, and a path under no prefix is `path`. Empty
+/// `fs_count` is the unconstrained fast path.
+pub fn fsScopeEval(scope: *const Scope, path: []const u8, want: FsWant) FsVerdict {
+    if (scope.fs_count == 0) return .allow;
+    var matched = false;
+    for (scope.fs[0..scope.fs_count]) |rule| {
+        const prefix = rule.path[0..rule.path_len];
+        if (!pathAtOrUnder(path, prefix)) continue;
+        matched = true;
+        if (want == .read or rule.writable) return .allow;
+    }
+    return if (matched) .write else .path;
+}
+
+/// The canonical-path prefix test — case-insensitive like the share's
+/// OWNERS.TXT keys (APFS canonicalization), component-bounded so
+/// `/host/APPS` never names `/host/APPS2`.
+fn pathAtOrUnder(path: []const u8, prefix: []const u8) bool {
+    if (path.len < prefix.len or !std.ascii.eqlIgnoreCase(path[0..prefix.len], prefix)) return false;
+    return path.len == prefix.len or path[prefix.len] == '/';
+}
+
+/// The file-seam scope check (M116d): the row's `fs=` rules evaluated
+/// against the op's canonical path, same row-resolution and mid-flight
+/// binding contract as `net_open`. `audit` receipts and the caller
+/// proceeds; `enforce` makes the caller refuse EACCES.
+pub fn fs_access(owner: u64, path: []const u8, want: FsWant) FsVerdict {
+    if (owner >= process.max_processes) return .allow;
+    const pid: usize = @intCast(owner);
+    const verdict: FsVerdict = switch (scopedRow(pid)) {
+        .none => .allow,
+        .stale => .stale,
+        .row => |r| fsScopeEval(&r.scope, path, want),
+    };
+    if (verdict != .allow) emit_fs_denial(pid, verdict);
+    return verdict;
+}
+
+/// The scope denial's receipt — the `emit_word_denial` shape with the
+/// qualifier name in the verdict field (`v6_literal`, `bridged`, `nat`,
+/// `to`, `stale`) and `word=net` (the scoped word the open rode in on).
+fn emit_scope_denial(pid: usize, verdict: OpenVerdict) void {
+    const qname: []const u8 = switch (verdict) {
+        .v6_literal => "v6_literal",
+        .path => |c| c.token(),
+        .to => "to",
+        .stale => "stale",
+        .allow => return,
+    };
+    emit_denial(pid, qname, "net");
+}
+
+/// The fs-scope denial's receipt (M116d) — the same shape, `word=file`
+/// and `fs_path`/`fs_write`/`stale` in the verdict field.
+fn emit_fs_denial(pid: usize, verdict: FsVerdict) void {
+    const qname: []const u8 = switch (verdict) {
+        .path => "fs_path",
+        .write => "fs_write",
+        .stale => "stale",
+        .allow => return,
+    };
+    emit_denial(pid, qname, "file");
+}
+
+fn emit_denial(pid: usize, qname: []const u8, word: []const u8) void {
+    var digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
+    var name: []const u8 = "";
+    if (process.grant_state(pid)) |gs| digest = gs.digest;
+    if (process.info(pid)) |pinfo| name = pinfo.name;
+    var verdict_buf: [40]u8 = undefined;
+    const vtext = std.fmt.bufPrint(&verdict_buf, "{s}:{s}_denied", .{
+        if (enforceMode()) "refused" else "audit", qname,
+    }) catch return;
+    var line: [measure.receipt_max]u8 = undefined;
+    const n = measure.receipt_line(&line, .exec, &digest, vtext, name, word);
+    klog.line(line[0..n]);
 }
 
 // ---------------------------------------------------------------------------
@@ -684,8 +1386,8 @@ test "grant: valid rows parse, match by hash, and narrow to the row's words" {
     try std.testing.expectEqual(Verdict{ .apply = word_file | word_net }, decide("gotop.elf", &da));
     // A wildcard row matches any digest but only narrows.
     try std.testing.expectEqual(Verdict{ .apply = word_file }, decide("CONFINED.ELF", &da));
-    // An unlisted binary takes the baseline.
-    try std.testing.expectEqual(Verdict.baseline, decide("OTHER.BIN", &da));
+    // An unlisted binary takes the ambient floor (M116b).
+    try std.testing.expectEqual(Verdict.ambient, decide("OTHER.BIN", &da));
     // Audit posture: no mode field -> audit.
     try std.testing.expect(!enforceMode());
 }
@@ -715,7 +1417,7 @@ test "grant: unknown schema and bad header fields poison every listed name" {
     try std.testing.expectEqual(Verdict.stale, decide("FOO.ELF", &da));
     try std.testing.expectEqual(Verdict.stale, decide("BAR.ELF", &da));
     // The whole file is suspect — an UNLISTED name is not poisoned.
-    try std.testing.expectEqual(Verdict.baseline, decide("OTHER.BIN", &da));
+    try std.testing.expectEqual(Verdict.ambient, decide("OTHER.BIN", &da));
     // An unrecognized #v1 header field refuses the file the same way.
     init();
     _ = load("#v1 bogus=1\nFOO.ELF\t*\tnet\n");
@@ -759,7 +1461,7 @@ test "grant: the table is bounded — ENOSPC, never silent eviction" {
     try std.testing.expectEqual(LoadResult.full, load(buf[0 .. pos + tail.len]));
     const da = hexDigest(sha_a);
     try std.testing.expectEqual(Verdict{ .apply = word_net }, decide("APP0.ELF", &da));
-    try std.testing.expectEqual(Verdict.baseline, decide("ONE.MORE", &da));
+    try std.testing.expectEqual(Verdict.ambient, decide("ONE.MORE", &da));
 }
 
 test "grant: word masks only narrow — no EL0 path widens past the baseline" {
@@ -773,14 +1475,37 @@ test "grant: word masks only narrow — no EL0 path widens past the baseline" {
     for ([_][]const u8{ "A.ELF", "B.ELF", "UNLISTED.BIN" }) |name| {
         for ([_]?*const [measure.digest_len]u8{ &da, &db, null }) |d| {
             switch (decide(name, d)) {
-                .baseline => {},
+                .ambient => {},
                 .apply => |w| try std.testing.expect((w & ~baseline) == 0),
                 .stale => {},
             }
         }
     }
-    // The baseline itself is the full ambient vocabulary.
+    // The baseline itself remains the full vocabulary ceiling.
     try std.testing.expectEqual(@as(u32, 0x1ff), baseline);
+}
+
+test "grant: the ambient floor drops the boundary words, keeps existence (M116b)" {
+    init();
+    // The no-row floor: file/audio/net are row-only words now.
+    try std.testing.expectEqual(
+        baseline & ~(word_file | word_audio | word_net),
+        ambient,
+    );
+    // debug stays: sys_ping/sys_write/sys_exit are existence verbs —
+    // a process that cannot print or exit is stuck, not confined.
+    try std.testing.expect((ambient & word_debug) != 0);
+    try std.testing.expect((ambient & word_memory) != 0);
+    try std.testing.expect((ambient & word_process) != 0);
+    const da = hexDigest(sha_a);
+    try std.testing.expectEqual(Verdict.ambient, decide("UNLISTED.BIN", &da));
+    // A row still grants what ambient dropped — the floor is a floor,
+    // not a ceiling.
+    _ = load("#v1\nROWED.ELF\t*\tfile,net,audio\n");
+    try std.testing.expectEqual(
+        Verdict{ .apply = word_file | word_net | word_audio },
+        decide("ROWED.ELF", null),
+    );
 }
 
 test "grant: word -> slot-group map follows ADR 0054 D9" {
@@ -932,4 +1657,280 @@ test "grant: fleet base rows cover the shipped roster (M116a #2467)" {
         }
         try std.testing.expect(found);
     }
+}
+
+// ---------------------------------------------------------------------------
+// M117e (#2477) host tests — the scope grammar and the open-class check's
+// pure halves. `net_open`'s pid resolution and the live EACCES are the
+// class-B spec's legs (live-net-policy).
+// ---------------------------------------------------------------------------
+
+test "grant: scope field parses, serializes, and round-trips (M117e)" {
+    init();
+    _ = load("#v1\nV6APP.ELF\t*\tfile,net\tv6=2001:db8:64::/64,if=nat\nLANAPP.ELF\t*\tnet\tif=bridged\nPLAIN.ELF\t*\tnet\nDASH.ELF\t*\tnet\t-\n");
+    try std.testing.expectEqual(@as(usize, 4), count());
+    switch (lookup("V6APP.ELF")) {
+        .row => |r| {
+            try std.testing.expectEqual(@as(u8, 1), r.scope.v6_count);
+            try std.testing.expectEqual(@as(u8, 64), r.scope.v6[0].len);
+            try std.testing.expectEqual(if_nat, r.scope.if_mask);
+        },
+        else => return error.MissingRow,
+    }
+    switch (lookup("LANAPP.ELF")) {
+        .row => |r| try std.testing.expectEqual(if_bridged, r.scope.if_mask),
+        else => return error.MissingRow,
+    }
+    switch (lookup("DASH.ELF")) {
+        .row => |r| try std.testing.expect(r.scope.isEmpty()),
+        else => return error.MissingRow,
+    }
+    var buf: [file_max]u8 = undefined;
+    const n = save(&buf);
+    const text = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, text, "V6APP.ELF\t*\tfile,net\tv6=2001:db8:64::/64,if=nat\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "LANAPP.ELF\t*\tnet\tif=bridged\n") != null);
+    // Scope-less rows keep the three-field shape — the fourth field
+    // appears only when the row carries one.
+    try std.testing.expect(std.mem.indexOf(u8, text, "PLAIN.ELF\t*\tnet\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "DASH.ELF\t*\tnet\n") != null);
+    try std.testing.expectEqual(LoadResult.ok, load(text));
+    switch (lookup("V6APP.ELF")) {
+        .row => |r| try std.testing.expectEqual(@as(u8, 1), r.scope.v6_count),
+        else => return error.MissingRow,
+    }
+}
+
+test "grant: malformed scope poisons the row (M117e)" {
+    init();
+    _ = load("#v1\nBAD.ELF\t*\tnet\tif=narnia\nBADV6.ELF\t*\tnet\tv6=zzz/64\nOVER.ELF\t*\tnet\tv6=2001:db8::/64,v6=2001:db9::/64,v6=2001:dba::/64,v6=2001:dbb::/64,v6=2001:dbc::/64\n");
+    const da = hexDigest(sha_a);
+    for ([_][]const u8{ "BAD.ELF", "BADV6.ELF", "OVER.ELF" }) |n| {
+        switch (lookup(n)) {
+            .poisoned => {},
+            else => return error.ExpectedPoison,
+        }
+        try std.testing.expectEqual(Verdict.stale, decide(n, &da));
+    }
+    // A five-field line poisons too.
+    init();
+    _ = load("#v1\nFIVE.ELF\t*\tnet\tif=nat\textra\n");
+    switch (lookup("FIVE.ELF")) {
+        .poisoned => {},
+        else => return error.ExpectedPoison,
+    }
+    // The admin path's strict parse refuses a bad scope before any I/O.
+    try std.testing.expectEqual(AdminResult.einval, admin_set_line("A.ELF\t*\tnet\tif=narnia"));
+}
+
+test "grant: a truncated registry name still sees a longer scoped row (M117e)" {
+    init();
+    _ = load("#v1\nABCDEFGHIJKLMNOPQ.ELF\t*\tnet\tif=nat\n");
+    // "ABCDEFGHIJKLMNOP" is the 16-byte display bound — a longer exec
+    // name truncates to it, and the prefix fallback must still bind.
+    switch (lookupProcess("ABCDEFGHIJKLMNOP")) {
+        .row => |r| try std.testing.expectEqual(if_nat, r.scope.if_mask),
+        else => return error.MissingRow,
+    }
+    // An unrelated prefix does not bind.
+    switch (lookupProcess("ABCDEFGHIJKLMNOZ")) {
+        .none => {},
+        else => return error.ExpectedNone,
+    }
+}
+
+test "grant: dstClass names the path the wire takes (M117e)" {
+    const saved_ip = arp.own_ip;
+    const saved_mask = arp.own_mask;
+    const saved_gw = arp.gateway;
+    const saved_rv = ipv6.router_valid;
+    const saved_ra = ipv6.router_addr;
+    const saved_rl = ipv6.router_lifetime;
+    const saved_ov = ipv6.onlink_valid;
+    const saved_op = ipv6.onlink_prefix;
+    const saved_ol = ipv6.onlink_len;
+    defer {
+        arp.own_ip = saved_ip;
+        arp.own_mask = saved_mask;
+        arp.gateway = saved_gw;
+        ipv6.router_valid = saved_rv;
+        ipv6.router_addr = saved_ra;
+        ipv6.router_lifetime = saved_rl;
+        ipv6.onlink_valid = saved_ov;
+        ipv6.onlink_prefix = saved_op;
+        ipv6.onlink_len = saved_ol;
+    }
+    // The island fixture: a /24 with the router at .1.
+    arp.own_ip = .{ 192, 168, 64, 5 };
+    arp.own_mask = .{ 255, 255, 255, 0 };
+    arp.gateway = .{ 192, 168, 64, 1 };
+    try std.testing.expectEqual(PathClass.bridged, dstClass(.{ .v4 = .{ 192, 168, 64, 9 } }));
+    try std.testing.expectEqual(PathClass.nat, dstClass(.{ .v4 = .{ 10, 9, 8, 7 } }));
+    try std.testing.expectEqual(PathClass.nat, dstClass(.{ .v4 = .{ 192, 168, 64, 1 } }));
+    // The v6 fixture: router + on-link prefix recorded.
+    const router = ipv6.parse_ip6("fe80::ff:fe00:2").?;
+    ipv6.router_valid = true;
+    ipv6.router_addr = router;
+    ipv6.router_lifetime = 1800;
+    ipv6.onlink_valid = true;
+    ipv6.onlink_prefix = ipv6.parse_ip6("2001:db8:64::").?;
+    ipv6.onlink_len = 64;
+    const ll_peer = ipv6.parse_ip6("fe80::1234").?;
+    const onl_peer = ipv6.parse_ip6("2001:db8:64::ff:fe00:2").?;
+    const off_peer = ipv6.parse_ip6("2001:db8:99::5").?;
+    try std.testing.expectEqual(PathClass.bridged, dstClass(.{ .v6 = ll_peer }));
+    try std.testing.expectEqual(PathClass.bridged, dstClass(.{ .v6 = onl_peer }));
+    try std.testing.expectEqual(PathClass.nat, dstClass(.{ .v6 = off_peer }));
+    try std.testing.expectEqual(PathClass.nat, dstClass(.{ .v6 = router }));
+    // No router recorded: an off-link destination is still router-mediated
+    // by intent — the transport refuses it regardless.
+    ipv6.router_valid = false;
+    try std.testing.expectEqual(PathClass.nat, dstClass(.{ .v6 = off_peer }));
+}
+
+test "grant: scopeEval refuses by name (M117e)" {
+    const saved_ip = arp.own_ip;
+    const saved_mask = arp.own_mask;
+    const saved_gw = arp.gateway;
+    defer {
+        arp.own_ip = saved_ip;
+        arp.own_mask = saved_mask;
+        arp.gateway = saved_gw;
+    }
+    arp.own_ip = .{ 192, 168, 64, 5 };
+    arp.own_mask = .{ 255, 255, 255, 0 };
+    arp.gateway = .{ 192, 168, 64, 1 };
+    const onl_peer = ipv6.parse_ip6("2001:db8:64::ff:fe00:2").?;
+    const off_peer = ipv6.parse_ip6("fd00::5").?;
+    var sc: Scope = .{};
+    sc.v6[0] = .{ .addr = ipv6.parse_ip6("2001:db8:64::").?, .len = 64 };
+    sc.v6_count = 1;
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&sc, .{ .v6 = onl_peer }, 80));
+    try std.testing.expectEqual(OpenVerdict.v6_literal, scopeEval(&sc, .{ .v6 = off_peer }, 80));
+    // A v4 destination is not a v6 literal — the prefix bound does not see it.
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&sc, .{ .v4 = .{ 10, 9, 8, 7 } }, 80));
+    const nat_only: Scope = .{ .if_mask = if_nat };
+    try std.testing.expectEqual(OpenVerdict{ .path = .bridged }, scopeEval(&nat_only, .{ .v4 = .{ 192, 168, 64, 9 } }, 80));
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&nat_only, .{ .v4 = .{ 10, 9, 8, 7 } }, 80));
+    try std.testing.expectEqual(OpenVerdict{ .path = .bridged }, scopeEval(&nat_only, .{ .v6 = ipv6.parse_ip6("fe80::1234").? }, 80));
+    const bridged_only: Scope = .{ .if_mask = if_bridged };
+    try std.testing.expectEqual(OpenVerdict{ .path = .nat }, scopeEval(&bridged_only, .{ .v4 = .{ 10, 9, 8, 7 } }, 80));
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&bridged_only, .{ .v4 = .{ 192, 168, 64, 9 } }, 80));
+    // The empty scope allows everything — the fast path scope-less rows take.
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&Scope{}, .{ .v4 = .{ 192, 168, 64, 9 } }, 80));
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&Scope{}, .{ .v6 = off_peer }, 80));
+}
+
+// ---------------------------------------------------------------------------
+// M116d (#2470) host tests — the `to=` endpoint allowlist and the `fs=`
+// path rules: grammar, serialization, and the evaluators' pure halves.
+// `net_open`'s/`fs_access`'s live EACCES legs are the class-B specs.
+// ---------------------------------------------------------------------------
+
+test "grant: to= endpoints and fs= rules parse, serialize, and round-trip (M116d)" {
+    init();
+    _ = load("#v1\nEPAPP.ELF\t*\tnet\tto=10.0.0.2:8080,to=[2001:db8::5]:443\nFSAPP.ELF\t*\tfile\tfs=/host/APPS:ro,fs=/disk/appdata:rw\nBOTH.ELF\t*\tfile,net\tif=nat,to=10.0.0.2:53,fs=/host:ro\n");
+    try std.testing.expectEqual(@as(usize, 3), count());
+    switch (lookup("EPAPP.ELF")) {
+        .row => |r| {
+            try std.testing.expectEqual(@as(u8, 2), r.scope.to_count);
+            try std.testing.expect(r.scope.to[0] == .v4);
+            try std.testing.expectEqual(@as(u16, 8080), r.scope.to[0].v4.port);
+            try std.testing.expectEqual([4]u8{ 10, 0, 0, 2 }, r.scope.to[0].v4.ip);
+            try std.testing.expect(r.scope.to[1] == .v6);
+            try std.testing.expectEqual(@as(u16, 443), r.scope.to[1].v6.port);
+        },
+        else => return error.MissingRow,
+    }
+    switch (lookup("FSAPP.ELF")) {
+        .row => |r| {
+            try std.testing.expectEqual(@as(u8, 2), r.scope.fs_count);
+            try std.testing.expectEqualStrings("/host/APPS", r.scope.fs[0].path[0..r.scope.fs[0].path_len]);
+            try std.testing.expect(!r.scope.fs[0].writable);
+            try std.testing.expectEqualStrings("/disk/appdata", r.scope.fs[1].path[0..r.scope.fs[1].path_len]);
+            try std.testing.expect(r.scope.fs[1].writable);
+        },
+        else => return error.MissingRow,
+    }
+    var buf: [file_max]u8 = undefined;
+    const n = save(&buf);
+    const text = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, text, "EPAPP.ELF\t*\tnet\tto=10.0.0.2:8080,to=[2001:db8::5]:443\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "FSAPP.ELF\t*\tfile\tfs=/host/APPS:ro,fs=/disk/appdata:rw\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "BOTH.ELF\t*\tfile,net\tif=nat,to=10.0.0.2:53,fs=/host:ro\n") != null);
+    try std.testing.expectEqual(LoadResult.ok, load(text));
+    switch (lookup("FSAPP.ELF")) {
+        .row => |r| try std.testing.expectEqual(@as(u8, 2), r.scope.fs_count),
+        else => return error.MissingRow,
+    }
+}
+
+test "grant: malformed to=/fs= tokens poison the row (M116d)" {
+    init();
+    _ = load("#v1\nB1.ELF\t*\tnet\tto=10.0.0.2\nB2.ELF\t*\tnet\tto=10.0.0.2:0\nB3.ELF\t*\tnet\tto=999.0.0.2:80\nB4.ELF\t*\tnet\tto=[2001:db8::5]\nB5.ELF\t*\tfile\tfs=/etc:ro\nB6.ELF\t*\tfile\tfs=/disk/appdata\nB7.ELF\t*\tfile\tfs=/host/../x:rw\nB8.ELF\t*\tfile\tfs=/host/a:ro,fs=/host/b:ro,fs=/host/c:ro,fs=/host/d:ro,fs=/host/e:ro\nB9.ELF\t*\tnet\tto=1.2.3.4:5,to=1.2.3.4:6,to=1.2.3.4:7,to=1.2.3.4:8,to=1.2.3.4:9\n");
+    const da = hexDigest(sha_a);
+    for ([_][]const u8{ "B1.ELF", "B2.ELF", "B3.ELF", "B4.ELF", "B5.ELF", "B6.ELF", "B7.ELF", "B8.ELF", "B9.ELF" }) |n| {
+        switch (lookup(n)) {
+            .poisoned => {},
+            else => return error.ExpectedPoison,
+        }
+        try std.testing.expectEqual(Verdict.stale, decide(n, &da));
+    }
+    // The admin path's strict parse refuses the same shapes before I/O.
+    try std.testing.expectEqual(AdminResult.einval, admin_set_line("A.ELF\t*\tnet\tto=10.0.0.2:0"));
+    try std.testing.expectEqual(AdminResult.einval, admin_set_line("A.ELF\t*\tfile\tfs=/etc:ro"));
+}
+
+test "grant: the to= allowlist gates the (dst, port) tuple (M116d)" {
+    var sc: Scope = .{};
+    sc.to[0] = .{ .v4 = .{ .ip = .{ 10, 0, 0, 2 }, .port = 8080 } };
+    sc.to[1] = .{ .v6 = .{ .addr = ipv6.parse_ip6("2001:db8::5").?, .port = 443 } };
+    sc.to_count = 2;
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&sc, .{ .v4 = .{ 10, 0, 0, 2 } }, 8080));
+    // Right host, wrong port — and right port, wrong host — both miss.
+    try std.testing.expectEqual(OpenVerdict.to, scopeEval(&sc, .{ .v4 = .{ 10, 0, 0, 2 } }, 9090));
+    try std.testing.expectEqual(OpenVerdict.to, scopeEval(&sc, .{ .v4 = .{ 10, 0, 0, 9 } }, 8080));
+    try std.testing.expectEqual(OpenVerdict.allow, scopeEval(&sc, .{ .v6 = ipv6.parse_ip6("2001:db8::5").? }, 443));
+    try std.testing.expectEqual(OpenVerdict.to, scopeEval(&sc, .{ .v6 = ipv6.parse_ip6("2001:db8::5").? }, 444));
+    // Families never cross: a v4 tuple cannot satisfy a v6 entry.
+    try std.testing.expectEqual(OpenVerdict.to, scopeEval(&sc, .{ .v4 = .{ 10, 0, 0, 2 } }, 443));
+}
+
+test "grant: fsScopeEval allows under a prefix, refuses off-list and ro writes (M116d)" {
+    var sc: Scope = .{};
+    @memcpy(sc.fs[0].path[0..10], "/host/APPS");
+    sc.fs[0].path_len = 10;
+    sc.fs[0].writable = false;
+    @memcpy(sc.fs[1].path[0..13], "/disk/appdata");
+    sc.fs[1].path_len = 13;
+    sc.fs[1].writable = true;
+    sc.fs_count = 2;
+    // Reads and writes under the right prefixes.
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&sc, "/host/APPS/OK.TXT", .read));
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&sc, "/host/APPS", .read));
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&sc, "/disk/appdata/x/y", .write));
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&sc, "/disk/appdata", .write));
+    // Case-insensitive like the share's keys.
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&sc, "/host/apps/ok.txt", .read));
+    // A mutation under the ro prefix is fs_write_denied.
+    try std.testing.expectEqual(FsVerdict.write, fsScopeEval(&sc, "/host/APPS/NEW.TXT", .write));
+    // Under no prefix is fs_path_denied — including the share root and
+    // a sibling that shares the byte prefix but not the component.
+    try std.testing.expectEqual(FsVerdict.path, fsScopeEval(&sc, "/host", .read));
+    try std.testing.expectEqual(FsVerdict.path, fsScopeEval(&sc, "/host/OTHER.TXT", .read));
+    try std.testing.expectEqual(FsVerdict.path, fsScopeEval(&sc, "/host/APPS2/x", .read));
+    try std.testing.expectEqual(FsVerdict.path, fsScopeEval(&sc, "/disk/other/z", .write));
+    // Most-permissive match: a rw child prefix rescues a write a ro
+    // parent alone would refuse.
+    var layered: Scope = .{};
+    @memcpy(layered.fs[0].path[0..5], "/host");
+    layered.fs[0].path_len = 5;
+    @memcpy(layered.fs[1].path[0..10], "/host/APPS");
+    layered.fs[1].path_len = 10;
+    layered.fs[1].writable = true;
+    layered.fs_count = 2;
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&layered, "/host/APPS/x", .write));
+    try std.testing.expectEqual(FsVerdict.write, fsScopeEval(&layered, "/host/OTHER/x", .write));
+    // The unconstrained fast path.
+    try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&Scope{}, "/host/anything", .write));
 }

@@ -9,6 +9,7 @@ import (
 
 	"virelai/clockfmt"
 	"virelai/mime"
+	"virelai/outbox"
 	"virelai/settings"
 	"virelai/timesync"
 	"virelai/vi"
@@ -54,6 +55,8 @@ func init() {
 		"export": bExport, "read": bRead, "jobs": bJobs, "fg": bFg,
 		"kill":    bKill,
 		"history": bHistory, "help": bHelp, "exit": bExit, "monitor": bMonitor,
+		// M115d (issue #2463, ADR 0056): the guest-initiated suspend request.
+		"suspend": bSuspend,
 		"sleep": bSleep, "clear": bClear, "log": bLog, "date": bDate,
 		"time": bTime,
 		// M50 trust surface (ADR 0024): identity, owner-only chmod, and the
@@ -383,6 +386,12 @@ func bUnset(c *cmdCtx) int {
 	return 0
 }
 
+// bExport is two gestures on one word: `export NAME=VALUE` / `export
+// NAME` is the SH.BIN env builtin unchanged (a set variable wins the word
+// — POSIX precedence), and `export PATH` with NAME unset stages the file
+// into /host/OUTBOX/ with a REQ intent marker for the seat's signed
+// export (ADR 0051 V2-D5). An unset name that resolves to no file gets
+// the same "not set" the env form always printed.
 func bExport(c *cmdCtx) int {
 	if len(c.args) == 0 {
 		for _, v := range c.sh.env.List() {
@@ -394,11 +403,10 @@ func bExport(c *cmdCtx) int {
 	}
 	eq := strings.IndexByte(c.args[0], '=')
 	if eq < 0 {
-		if !c.sh.env.Export(c.args[0]) {
-			c.out([]byte("gosh: export: " + c.args[0] + ": not set\n"))
-			return 1
+		if c.sh.env.Export(c.args[0]) {
+			return 0
 		}
-		return 0
+		return bExportFile(c)
 	}
 	if eq == 0 {
 		c.out([]byte("gosh: export NAME=VALUE\n"))
@@ -407,6 +415,40 @@ func bExport(c *cmdCtx) int {
 	c.sh.env.Set(c.args[0][:eq], c.args[0][eq+1:])
 	c.sh.env.Export(c.args[0][:eq])
 	return 0
+}
+
+// exportToHost is the OUTBOX stage seam — production binds the shared
+// virelai/outbox gesture; tests pin the refusal vocabulary without a
+// guest.
+var exportToHost = func(path string) (string, string) {
+	return outbox.Guest.Export(path)
+}
+
+// bExportFile is the M127d host export: stage the payload + REQ marker
+// through the lane's shared gesture; the seat's next tick turns the REQ
+// into a signed OUTBOX record and the runner moves the file to the
+// host's download dir. Refusals carry the lane vocabulary (gone,
+// unsupported_kind, payload_too_large, name_rejected, io_error).
+func bExportFile(c *cmdCtx) int {
+	rp, rerr := c.sh.resolvePath(c.args[0])
+	if rerr != nil {
+		c.out([]byte("gosh: export: " + c.args[0] + ": " + rerr.Error() + "\n"))
+		return 1
+	}
+	name, refusal := exportToHost(rp.host)
+	if refusal == "" {
+		c.sh.host.Marker("gosh: export staged name=" + name)
+		c.out([]byte("exported " + name + " to host\n"))
+		return 0
+	}
+	if refusal == outbox.RefuseGone {
+		c.out([]byte("gosh: export: " + c.args[0] + ": not set\n"))
+		return 1
+	}
+	c.sh.host.Marker("gosh: export refused target=" + c.args[0] +
+		" reason=" + refusal)
+	c.out([]byte("gosh: export: " + c.args[0] + ": " + refusal + "\n"))
+	return 1
 }
 
 // bRead takes one line from bound stdin (a pipe or redirect), or from the
@@ -652,6 +694,7 @@ var helpCatalog = map[string]helpEntry{
 	"history": {group: "shell", usage: "history", blurb: "list this session's submitted lines, oldest first"},
 	"log":     {group: "shell", usage: "log [APP]", blurb: "read one app's bounded log ring, or all app rings"},
 	"monitor": {group: "shell", usage: "monitor", blurb: "hand the console back to the kernel monitor"},
+	"suspend": {group: "shell", usage: "suspend", blurb: "ask the host to freeze machine state into the profile (virelai-ctl/1 suspend)", notes: "The guest fsyncs VLFS and settings and records the request marker before the verb leaves; a refused request prints the ADR 0056 code and nothing is frozen. An `ok` reply may arrive after a save/restore — the session simply resumes."},
 	"time":    {group: "shell", usage: "time CMD [ARGS...] | time sync [SERVER]", blurb: "time a command, or set the clock from one SNTP query (default time.apple.com)", notes: "With CMD the command runs and `real N.NNs` reports on the terminal. SERVER is a name or a dotted IPv4 address. One query, no retry; on no reply the clock is left untouched and the exit is 1."},
 
 	// files
@@ -671,7 +714,7 @@ var helpCatalog = map[string]helpEntry{
 	"printenv": {group: "environment", usage: "printenv [NAME...]", blurb: "print the named variables' values"},
 	"set":      {group: "environment", usage: "set [NAME=VALUE]", blurb: "set a variable, or list the environment", notes: "`set -o` is refused: this shell has one fixed editing model, no vi mode."},
 	"unset":    {group: "environment", usage: "unset NAME", blurb: "remove one variable"},
-	"export":   {group: "environment", usage: "export [NAME=VALUE]", blurb: "set a variable and pass it to executed children"},
+	"export":   {group: "environment", usage: "export [NAME=VALUE|PATH]", blurb: "set a variable and pass it to executed children — or stage a file for the host's Downloads"},
 
 	// scripts
 	"true":     {group: "scripts", usage: "true", blurb: "succeed (status 0)"},
@@ -853,6 +896,27 @@ func bExit(c *cmdCtx) int {
 func bMonitor(c *cmdCtx) int {
 	c.sh.monitorRq = true
 	return 0
+}
+
+// bSuspend is the GOSH path to the seat's Suspend verb (M115d): one
+// ctl-session request through the kernel-held credential, verdict named
+// on the terminal. `suspend: ok` may print on the far side of a host
+// save/restore — the builtin's next line IS the resumed process.
+func bSuspend(c *cmdCtx) int {
+	if len(c.args) != 0 {
+		c.out([]byte("gosh: suspend\n"))
+		return 2
+	}
+	ok, code := c.sh.host.Suspend()
+	if ok {
+		c.out([]byte("suspend: ok\n"))
+		return 0
+	}
+	if code == "" {
+		code = "refused"
+	}
+	c.out([]byte("suspend: " + code + "\n"))
+	return 1
 }
 
 // bSleep parks the shell for about n "seconds" — at the glue's 100:1

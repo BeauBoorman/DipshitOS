@@ -39,24 +39,30 @@ enum HostInt {
     static let laneClip: UInt8 = 1 << 0
     static let laneDrop: UInt8 = 1 << 1
     static let laneNotify: UInt8 = 1 << 2
+    /// v2: the OUTBOX export lane. NOTIFY_FOCUS needs no bit of its own —
+    /// it rides lane_notify (both directions of a lane share one bit).
+    static let laneOutbox: UInt8 = 1 << 3
 
-    /// The lane name a mask bit names ("clip"/"drop"/"notify") — the
-    /// `lane=` word refusal markers carry.
+    /// The lane name a mask bit names ("clip"/"drop"/"notify"/"outbox") —
+    /// the `lane=` word refusal markers carry.
     static func laneName(_ bit: UInt8) -> String {
         switch bit {
         case laneClip: return "clip"
         case laneDrop: return "drop"
         case laneNotify: return "notify"
+        case laneOutbox: return "outbox"
         default: return "?"
         }
     }
 
     enum Tag: UInt8 {
-        case armed = 0     // h→g runner → seat:  payload [lane_mask u8]
-        case clipOut = 1   // g→h seat → runner:  clipboard bytes (0 = clear)
-        case clipIn = 2    // h→g runner → seat:  UTF-8 text ≤ 512
-        case notifyOut = 3 // g→h seat → runner:  toast text ≤ 24
-        case drop = 4      // h→g runner → seat:  [name_len][name][size u64le]
+        case armed = 0       // h→g runner → seat:  payload [lane_mask u8]
+        case clipOut = 1     // g→h seat → runner:  clipboard bytes (0 = clear)
+        case clipIn = 2      // h→g runner → seat:  UTF-8 text ≤ 512
+        case notifyOut = 3   // g→h seat → runner:  toast text ≤ 24
+        case drop = 4        // h→g runner → seat:  [name_len][name][size u64le]
+        case outbox = 5      // g→h seat → runner:  the DROP shape, reversed (v2)
+        case notifyFocus = 6 // h→g runner → seat:  plen MUST be 0 (v2)
 
         var stem: String {
             switch self {
@@ -65,16 +71,19 @@ enum HostInt {
             case .clipIn: return "CLIPIN"
             case .notifyOut: return "NOTIFY"
             case .drop: return "DROP"
+            case .outbox: return "OUTBOX"
+            case .notifyFocus: return "NFOCUS"
             }
         }
 
         /// The lane name the refusal markers carry ("clip", "drop",
-        /// "notify"). ARMED is the handshake, not a lane.
+        /// "notify", "outbox"). ARMED is the handshake, not a lane.
         var lane: String {
             switch self {
             case .clipIn, .clipOut: return "clip"
             case .drop: return "drop"
-            case .notifyOut: return "notify"
+            case .notifyOut, .notifyFocus: return "notify"
+            case .outbox: return "outbox"
             case .armed: return ""
             }
         }
@@ -85,7 +94,8 @@ enum HostInt {
             switch self {
             case .clipIn, .clipOut: return HostInt.laneClip
             case .drop: return HostInt.laneDrop
-            case .notifyOut: return HostInt.laneNotify
+            case .notifyOut, .notifyFocus: return HostInt.laneNotify
+            case .outbox: return HostInt.laneOutbox
             case .armed: return 0
             }
         }
@@ -97,6 +107,8 @@ enum HostInt {
             case "CLIPIN": return .clipIn
             case "NOTIFY": return .notifyOut
             case "DROP": return .drop
+            case "OUTBOX": return .outbox
+            case "NFOCUS": return .notifyFocus
             default: return nil
             }
         }
@@ -120,11 +132,18 @@ enum HostInt {
         case noBundle = "no_bundle"
         case authDenied = "auth_denied"
         case ioError = "io_error"
+        // v2 additions (ADR 0051 V2-D6): gone names a target that no
+        // longer exists; quotaExceeded is the per-epoch OUTBOX cap.
+        case gone = "gone"
+        case quotaExceeded = "quota_exceeded"
     }
 
     struct Record {
         var tag: Tag
         var flags: UInt8
+        /// The v2 sender_id — the kernel window id the record is about
+        /// (0 = none; v1 records carry 0 here by construction).
+        var sender: UInt16
         var seq: UInt32
         var epoch: UInt32
         var payload: Data
@@ -165,14 +184,19 @@ enum HostInt {
 
     /// Build one wire record: header + payload + HMAC tag. nil when the
     /// payload exceeds the bound — the producer truncates first (and sets
-    /// the TRUNCATED flag) rather than emit an unreadable record.
-    static func encode(tag: Tag, flags: UInt8, seq: UInt32, epoch: UInt32, payload: Data, key: Data) -> Data? {
+    /// the TRUNCATED flag) rather than emit an unreadable record. v2:
+    /// `sender` is the window-id correlation field; every v1-shaped call
+    /// leaves it 0. A NOTIFY_FOCUS record is refused unless plen is 0
+    /// and sender is nonzero — the header is its whole payload.
+    static func encode(tag: Tag, flags: UInt8, sender: UInt16 = 0, seq: UInt32, epoch: UInt32, payload: Data, key: Data) -> Data? {
         guard payload.count <= payloadMax else { return nil }
+        if tag == .notifyFocus, payload.count != 0 || sender == 0 { return nil }
         var out = Data()
         out.append(contentsOf: [0x56, 0x48, 0x49, 0x31]) // "VHI1"
         out.append(tag.rawValue)
         out.append(flags)
-        out.append(contentsOf: [0, 0])
+        out.append(UInt8(sender & 0xff))
+        out.append(UInt8((sender >> 8) & 0xff))
         for shift in [0, 8, 16, 24] { out.append(UInt8((seq >> shift) & 0xff)) }
         for shift in [0, 8, 16, 24] { out.append(UInt8((epoch >> shift) & 0xff)) }
         out.append(UInt8(payload.count & 0xff))
@@ -183,18 +207,20 @@ enum HostInt {
     }
 
     /// Parse the wire form. nil is a bad_record refusal — wrong magic, bad
-    /// tag, reserved nonzero, plen > 512, or a total size that does not
-    /// equal header+payload+mac.
+    /// tag, plen > 512, a NOTIFY_FOCUS with a nonempty payload, or a
+    /// total size that does not equal header+payload+mac. v2: bytes 6..7
+    /// are sender_id, not reserved zeros.
     static func decode(_ raw: Data) -> Record? {
         guard raw.count >= headerLen + macLen, raw.count <= recordMax else { return nil }
         guard raw[0] == 0x56, raw[1] == 0x48, raw[2] == 0x49, raw[3] == 0x31,
-              let tag = Tag(rawValue: raw[4]),
-              raw[6] == 0, raw[7] == 0 else { return nil }
+              let tag = Tag(rawValue: raw[4]) else { return nil }
         let plen = Int(raw[16]) | (Int(raw[17]) << 8)
         guard plen <= payloadMax, raw.count == headerLen + plen + macLen else { return nil }
+        guard tag != .notifyFocus || plen == 0 else { return nil }
         let rec = Record(
             tag: tag,
             flags: raw[5],
+            sender: UInt16(raw[6]) | (UInt16(raw[7]) << 8),
             seq: UInt32(raw[8]) | (UInt32(raw[9]) << 8) | (UInt32(raw[10]) << 16) | (UInt32(raw[11]) << 24),
             epoch: UInt32(raw[12]) | (UInt32(raw[13]) << 8) | (UInt32(raw[14]) << 16) | (UInt32(raw[15]) << 24),
             payload: raw.subdata(in: headerLen..<headerLen + plen),
@@ -304,6 +330,7 @@ enum HostInt {
         if mask & laneClip != 0 { names.append("clip") }
         if mask & laneDrop != 0 { names.append("drop") }
         if mask & laneNotify != 0 { names.append("notify") }
+        if mask & laneOutbox != 0 { names.append("outbox") }
         let lanes = names.isEmpty ? "-" : names.joined(separator: ",")
         FileHandle.standardOutput.write(Data("host-int: armed lanes=\(lanes) epoch=\(epoch)\n".utf8))
     }

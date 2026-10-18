@@ -53,6 +53,11 @@ type fakeHost struct {
 	killErr   map[int64]string // pid -> errno name the kill arm refuses with
 	waitCalls int              // WaitExternal call counter
 
+	// M115d (#2463): the suspend verdict the seam reports.
+	suspends    int
+	suspendOK   bool
+	suspendCode string
+
 	exitedPids   []int64 // ExternalExited pids, in order
 	exitedKilled []bool  // the killed flag each carried
 }
@@ -182,6 +187,11 @@ func (f *fakeHost) ProbeExternal(pid int64) (int64, int) {
 }
 
 func (f *fakeHost) SleepTick() { f.ticks = append(f.ticks, 1) }
+
+func (f *fakeHost) Suspend() (bool, string) {
+	f.suspends++
+	return f.suspendOK, f.suspendCode
+}
 
 func (f *fakeHost) ReadFile(path string, max int) ([]byte, error) {
 	if name, ok := f.denied[path]; ok {
@@ -513,6 +523,31 @@ func TestEngineExitAndMonitor(t *testing.T) {
 	st, act = sh.RunLine("monitor")
 	if act != ActionMonitor || st != 0 {
 		t.Fatalf("monitor = (%d, %v), want (0, monitor)", st, act)
+	}
+}
+
+// TestSuspendBuiltin pins the M115d verdict surface: the kernel relays
+// the host's reply, and the builtin names it — `suspend: ok` on the
+// accept (which may land after a save/restore), `suspend: <code>` on a
+// refusal, status 2 on an arg.
+func TestSuspendBuiltin(t *testing.T) {
+	h := newFakeHost()
+	run, _ := session(h)
+	h.suspendOK = true
+	if st := run("suspend"); st != 0 || string(h.out) != "suspend: ok\n" {
+		t.Fatalf("suspend = (%d, %q), want (0, ok)", st, h.out)
+	}
+	if h.suspends != 1 {
+		t.Fatalf("suspends = %d, want 1", h.suspends)
+	}
+	h.out = nil
+	h.suspendOK, h.suspendCode = false, "no_credential"
+	if st := run("suspend"); st != 1 || string(h.out) != "suspend: no_credential\n" {
+		t.Fatalf("suspend refused = (%d, %q), want (1, no_credential)", st, h.out)
+	}
+	h.out = nil
+	if st := run("suspend now"); st != 2 || !strings.Contains(string(h.out), "suspend\n") {
+		t.Fatalf("suspend with arg = (%d, %q), want (2, usage)", st, h.out)
 	}
 }
 

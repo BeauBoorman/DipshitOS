@@ -181,8 +181,10 @@ console:
 # Boot an interactive WINDOWED desktop session from a clean checkout (class C — Apple silicon + macOS 27+).
 # Builds the guest, image, and SPIKE runner; seeds the persistent share; opens the Go seat's first-boot shell workspace.
 # Ctrl-C ends the session; serial log at artifacts/session-serial.log. See README for the VIRELAI_SESSION_* options.
-session:
-    zig build session
+# Pass-through flags (M120a #2558): `just session --save-capable` rides virtio-fs so suspend/snapshot
+# are armed; `just session --resume` continues a suspended machine.
+session *ARGS:
+    bash tools/session.sh {{ARGS}}
 
 # Inspect the EFI binary and disk image (class A — zig build inspect)
 inspect:

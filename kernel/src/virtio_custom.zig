@@ -1107,6 +1107,32 @@ pub fn park_chain(head: u16) void {
     }
 }
 
+/// Consumed used entries on the file queue that named no live element and
+/// no parked head — a device fabrication or a double-consumed id. Bounded
+/// counter only (issue #2495): observed non-zero would mean the host
+/// returned an element the driver never posted.
+pub var stale_used_count: u32 = 0;
+
+/// A consumed used entry carrying a parked head's id: its late reply
+/// arrived, the element is done — free the chain and drop it from the
+/// parked list. Any other consumed id is a fabrication — counted, never
+/// attributed, never freed. Mirrors gpu3d's reap_parked_id (claim #899
+/// follow-through): the previous wait-loop dropped these entries without
+/// freeing, so a parked chain whose reply arrived DURING a later exchange
+/// was never reclaimed — every park permanently leaked its descriptors.
+fn reap_parked_id(id: u32) void {
+    for (&parked_heads, 0..) |*h, idx| {
+        if (idx >= parked_count) break;
+        if (h.* == id) {
+            free_chain(&cv_rings[file_qidx], @intCast(id));
+            parked_count -= 1;
+            parked_heads[idx] = parked_heads[parked_count];
+            return;
+        }
+    }
+    stale_used_count += 1;
+}
+
 /// Reap parked chains whose used-ring entry has now appeared (the host's
 /// late reply arrived). Called after every completed exchange while the
 /// caller still holds the file-channel lock, so it never races. Consumes
@@ -1127,14 +1153,51 @@ pub fn reap_parked() void {
         if (r.used.idx == r.last_used) break;
         const elem = r.used.ring[r.last_used % queue_size];
         r.last_used +%= 1;
-        for (&parked_heads, 0..) |*h, idx| {
-            if (h.* == elem.id) {
-                free_chain(r, @intCast(elem.id));
-                parked_count -= 1;
-                parked_heads[idx] = parked_heads[parked_count];
-                break;
-            }
+        reap_parked_id(elem.id);
+    }
+}
+
+/// A parked element stays ARMED in the avail ring — the host may dequeue
+/// and serve it at any later moment (issue #2495). Its descriptors still
+/// point at the caller's shared request/reply buffers, so a late serve
+/// reads whatever request the NEXT exchange staged there — re-executing
+/// it (a duplicated write/open/rename mutates share state a second time)
+/// — and writes its reply into the live reply buffer between exchanges.
+/// Before a timed-out chain is parked, repoint its descriptors at the
+/// caller-provided sink buffers: the late serve then performs a fixed
+/// benign request and drops its reply in the sink, never live state.
+///
+/// Store order keeps every torn device view benign: the length is zeroed
+/// and made visible BEFORE the address moves, and the new length is
+/// published only after the new address is — the device can never observe
+/// <stale buffer, nonzero new length>, the combination that would let it
+/// read live buffer contents. Each descriptor's existing flags/next are
+/// preserved (the chain shape the host recorded is unchanged).
+pub fn neutralize_chain(qidx: u16, head: u16, req_sink: []const u8, reply_sink: []u8) void {
+    if (qidx >= armed_queues) return;
+    const r = &cv_rings[qidx];
+    if (!r.armed) return;
+    var cur = head;
+    while (true) {
+        const d = &r.desc[cur];
+        const is_write = (d.flags & vq_write) != 0;
+        const last = (d.flags & vq_next) == 0;
+        const sink_ptr = if (is_write) @intFromPtr(reply_sink.ptr) else @intFromPtr(req_sink.ptr);
+        const sink_len: u32 = @intCast(if (is_write) reply_sink.len else req_sink.len);
+        d.len = 0;
+        if (comptime !builtin.is_test) {
+            asm volatile ("dsb ish" ::: .{ .memory = true });
         }
+        d.addr = mmu.to_phys(sink_ptr);
+        if (comptime !builtin.is_test) {
+            asm volatile ("dsb ish" ::: .{ .memory = true });
+        }
+        d.len = sink_len;
+        if (last) break;
+        cur = d.next;
+    }
+    if (comptime !builtin.is_test) {
+        mmu.clean_dcache_range(@intFromPtr(&r.desc), @sizeOf(VirtqDesc) * queue_size);
     }
 }
 
@@ -1173,6 +1236,13 @@ pub fn wait(qidx: u16, handle: u16, budget: usize, reply_buf: []u8) ?u32 {
                 }
                 return elem.len;
             }
+            // #2495: a consumed non-matching id on the file queue is a
+            // parked head's late reply — free its chain here, at the point
+            // of consumption. The previous shape just advanced past it, so
+            // the parked list never shrank and every park leaked its
+            // descriptors (reap_parked could only ever observe entries
+            // landing in the microsecond window after this wait returned).
+            if (qidx == file_qidx) reap_parked_id(elem.id);
         }
     }
     return null;
@@ -1727,6 +1797,74 @@ test "virtio_custom: park_chain keeps a timed-out head out of the free list unti
     try std.testing.expectEqual(parked_heads.len, parked_count);
     parked_count = 0;
     cv_ready = false;
+}
+
+test "virtio_custom: wait reaps a consumed parked head; a fabricated id is only counted (#2495)" {
+    cv_ready = true;
+    defer cv_ready = false;
+    const rr = &cv_rings[file_qidx];
+    ring_init(rr);
+    rr.armed = true;
+    const saved_armed = armed_queues;
+    defer armed_queues = saved_armed;
+    armed_queues = file_qidx + 1;
+    parked_count = 0;
+    stale_used_count = 0;
+    // A parked 2-desc chain (its reply never arrived) ahead of the live
+    // element the wait is for — the congestion shape from the card.
+    const p1 = alloc_chain(rr, 2).?;
+    park_chain(p1);
+    const live = alloc_chain(rr, 2).?;
+    rr.used.ring[0] = .{ .id = p1, .len = 0 };
+    rr.used.ring[1] = .{ .id = live, .len = 7 };
+    rr.used.idx = 2;
+    var reply_buf: [16]u8 = undefined;
+    const n = wait(file_qidx, live, 100, reply_buf[0..]).?;
+    try std.testing.expectEqual(@as(u32, 7), n);
+    // The consumed parked entry was reaped AT the consume point: chain
+    // freed, list empty, both descriptors back in the pool (the previous
+    // shape left it parked forever — every park leaked two descriptors).
+    try std.testing.expectEqual(@as(u16, 0), parked_count);
+    try std.testing.expectEqual(@as(u16, queue_size - 2), rr.free_count);
+    try std.testing.expectEqual(@as(u32, 0), stale_used_count);
+    // A fabricated id — no live element, no parked head — is consumed and
+    // counted, never attributed and never freed.
+    rr.used.ring[2] = .{ .id = 31, .len = 1 };
+    rr.used.idx = 3;
+    try std.testing.expect(wait(file_qidx, 4, 50, reply_buf[0..]) == null);
+    try std.testing.expectEqual(@as(u32, 1), stale_used_count);
+    try std.testing.expectEqual(@as(u16, queue_size - 2), rr.free_count);
+    cv_rings[file_qidx].armed = false;
+}
+
+test "virtio_custom: neutralize_chain repoints a posted chain at the sink buffers (#2495)" {
+    const rr = &cv_rings[file_qidx];
+    ring_init(rr);
+    rr.armed = true;
+    const saved_armed = armed_queues;
+    defer armed_queues = saved_armed;
+    armed_queues = file_qidx + 1;
+    var req_buf: [32]u8 align(16) = @splat(0xaa);
+    var rep_buf: [64]u8 align(16) = @splat(0xbb);
+    var sink_req: [20]u8 align(16) = @splat(0);
+    var sink_rep: [64]u8 align(16) = @splat(0);
+    const head = alloc_chain(rr, 2).?;
+    post_avail(rr, head, &.{req_buf[0..]}, rep_buf[0..], false);
+    neutralize_chain(file_qidx, head, sink_req[0..], sink_rep[0..]);
+    // The chain shape (NEXT/WRITE flags, next links) is preserved; every
+    // descriptor's address+length now names the sinks, so a late serve
+    // can neither read a live request buffer nor write a live reply one.
+    const rd = rr.desc[head];
+    try std.testing.expectEqual(mmu.to_phys(@intFromPtr(&sink_req)), rd.addr);
+    try std.testing.expectEqual(@as(u32, 20), rd.len);
+    try std.testing.expect((rd.flags & vq_next) != 0);
+    try std.testing.expect((rd.flags & vq_write) == 0);
+    const td = rr.desc[rd.next];
+    try std.testing.expectEqual(mmu.to_phys(@intFromPtr(&sink_rep)), td.addr);
+    try std.testing.expectEqual(@as(u32, 64), td.len);
+    try std.testing.expect((td.flags & vq_write) != 0);
+    try std.testing.expectEqual(@as(u16, 0), td.next);
+    cv_rings[file_qidx].armed = false;
 }
 
 test "virtio_custom: the reply read is length-driven, clamped to the buffer" {

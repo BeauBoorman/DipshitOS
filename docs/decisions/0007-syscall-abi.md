@@ -2649,3 +2649,65 @@ seam and an EL0 `cat`/`>` get the named refusals); a granted app runs
 unchanged. Host-side seeded `GRANTS.TXT` needs no consumer app — the
 admin slot is proven at class A (authorization, strict parse, ENOSPC,
 rollback) and the read op is exercised by the same seam.
+
+## Amendment (2026-10-17, M118c #2481 — slots 91/92 `sys_audio_rec_info`/`sys_audio_rec`, the bounded capture seam)
+
+M118b landed the kernel's virtio-snd capture path (queue 3, one bounded
+64 KiB ring, the v1 tuple S16/48 kHz/mono, named refusals); this additive
+amendment is its EL0 half — the RX twins of slots 42/43, freezing slots
+91 and 92 in the dispatch table (every existing number stays frozen;
+`implemented_count` is now 93). ONE stream, ONE call, bounded bytes —
+there is no open/close handle and no streaming API in v1: a call captures
+`len` bytes (`len/2` frames) from stream 0's INPUT and copies the ring
+out, serialized with playback under `audio_lock` (the control queue is
+shared).
+
+| 91 | `sys_audio_rec_info` | `audio_rec_info(out_ptr) -> i64` | Copy the capture capability report out through uaccess as a fixed **16-byte** `AudioCapInfo` {`ready`, `format`, `rate`, `channels`, `period_bytes`, `ring_bytes`} — the slot-42 shape for the RX direction. `ready` reports the LAST OBSERVED stream-0 topology held to the v1 tuple (the rearm-time self-test and every slot-92 call refresh the observation; this call runs no device exchange of its own). When not ready the tuple fields are the 0xff/0 sentinels — a soundless VM or an output-only stream is a successful call with `ready = 0`, the same honesty rule as slot 42: absence is not an error at the info seam. Returns 0; `EINVAL` for a non-process caller, `EFAULT` for a bad buffer. |
+| 92 | `sys_audio_rec` | `audio_rec(format, rate, channels, buf, len) -> i64` | Capture `len` bytes (`len/2` frames) at the requested tuple into `buf`: negotiate the tuple on stream 0, START the input, drain the RX queue into the bounded ring until the request lands or the bounded wait expires, then copy the ring out through uaccess in 4 KiB chunks. Returns the bytes copied out (`len` on a complete capture — the receipt is the count). Refusals by name: `EINVAL` for a non-process caller, a zero or non-frame-aligned `len`, or a tuple beyond the v1 cap (the over-cap refusal — nothing is silently converted; the device check precedes the tuple check, so an absent device answers ENXIO to an over-cap call); `ENAMETOOLONG` over `cap_ring_bytes` (64 KiB — the per-call bound, the same name slot 43 uses); `ENXIO` when no device is attached (the default VM), the RX queue is unarmed, stream 0 is not INPUT, or the device cannot speak the tuple; `EFAULT` for a bad `buf` (checked per chunk — a mid-drain fault can leave earlier chunks copied); `ETIMEDOUT` when the bounded drain expires — the honest host-mic-denied outcome, where zero frames is a refusal and never a short read; `ENOSPC` when the ring refuses a write; `EIO` for a device-level refusal (a refused control exchange, a malformed completion, a refused posted buffer, or a refused STOP/RELEASE). |
+
+The Go half is `vi.AudioCapQuery`/`vi.AudioCapture` (user/go/vi/audio.go)
+with the refusal surface exported as `ErrNoAudioDevice` (ENXIO) and
+`ErrAudioCaptureTimeout` (ETIMEDOUT). The wire names say `rec` (record —
+the GOREC vocabulary of M118d), not `cap`: the TS3 name audit refuses any
+row named like a privilege, and `cap` collides — the kernel internals keep
+the `cap_*`/`snd_capture` vocabulary.
+
+The two slots join no `word_*` grant group today: ADR 0054 D9's
+word→slot map lives in `kernel/src/grant.zig`, which M117e (#2477) holds
+under an active claim — grouping them under `word_audio` is deferred to
+that card's owner, the same ungrouped-service posture slot 88 took.
+`audit` mode makes it non-blocking: the seam receipts, nothing is denied.
+
+### Observable contract
+
+`go-selftest` carries both legs. Run 01 (no sound device) records the
+device-absent named refusal in `OUT/audio-capture.ok` (`ready=0
+refused=ENXIO overcap=ENXIO oddlen=EINVAL`) — and it is the check ORDER
+that receipt pins: a non-frame-aligned length is EINVAL before the device
+is touched, while an over-cap tuple behind an absent device is ENXIO.
+The SoundInProbe `--sound-in --share` leg execs `GOSELF.ELF
+--capture-probe` headless: slot 91 must report `ready=1` and slot 92 must
+answer `captured=8192` (a consented host) or `refused=ETIMEDOUT` (a denied
+one — the bounded outcome, never a hang), with `overcap=EINVAL` and
+`oddlen=EINVAL` named either way.
+
+## Amendment (2026-10-18, M115d #2463 — slot 93 `sys_vsock_ctl`, the EL0 door to virelai-ctl/1)
+
+ADR 0056 D5 named this slot: the ONLY in-guest `virelai-ctl/1` initiator
+was the kernel monitor, because the HMAC credential is a `uid_system`
+`SECRETS.TXT` row that `sys_secret_get` (slot 70) serves to no EL0
+principal. This amendment freezes slot 93 as the narrow door: the kernel
+keeps the credential and runs ONE authenticated session on the caller's
+behalf; EL0 supplies a verb (and the optional `name` operand) and reads
+back the verdict — no challenge, MAC or key bytes ever cross the seam.
+Every existing number stays frozen; `implemented_count` is now 94.
+
+| 93 | `sys_vsock_ctl` | `vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr, code_cap) -> i64` | Run one `virelai-ctl/1` session over the virtio-vsock transport: connect to the host's `--vsock-ctl-port` listener (1209), answer the HMAC challenge with the kernel-held `vsock-ctl` row, send `{"id":1,"verb":"…"[,"name":"…"]}`, relay the reply, close. `suspend` runs the guest quiesce between auth and request — the VLFS fsync (when the data disk is mounted), the settings re-save, and the `SUSPEND.MARK` request receipt on the share — and a quiesce failure aborts before the verb leaves; the machine is never frozen half-prepared. Sessions serialize one at a time (the transport is a single-connection device); a second caller answers `busy`. Returns **0** when the reply was `ok:true` — for `suspend` that return may land on the far side of a host save/restore, so the caller's next instruction IS the resume. A refused session returns the refusal code's byte length and writes the ADR 0056 D4 name into `code_ptr` (`no_device`, `no_credential`, `connect_refused`, `connect_timeout`, `bad_greeting`, `auth_failed`, `auth_timeout`, `conn_lost`, `line_too_long`, `replay`, `unknown_verb`, `unimplemented`, `no_state`, `unsupported`, `save_failed`, `busy`, `io_error`, `malformed`), truncated to `code_cap`. `EINVAL` for a non-process caller or a `verb_len`/`name_len` outside 1..31/0..31; `EFAULT` for a bad pointer. |
+
+The Go half is `vi.VsockCtl` (`user/go/vi/vsockctl.go`, slot 93 marshaled
+through `svc6`). GOSH's `suspend` builtin and GOTABWM's PWR-menu Suspend
+row are the two callers the card ships; the kernel monitor's `vsock ctl`
+command shares the same session engine (`kernel/src/vsock_ctl.zig`).
+
+The slot joins no `word_*` grant group today — the same ungrouped-service
+posture slots 88/91/92 took.

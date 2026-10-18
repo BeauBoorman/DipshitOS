@@ -440,14 +440,15 @@ func Open(path string, mode int, perm uint32) (fd int, err error) {
 		}
 	}
 
-	n := stagedAbs(path)
+	var staging [virPathMax + 1]byte
+	n := stagedAbs(path, &staging)
 	if n < 0 {
 		if len(path) > virPathMax {
 			return -1, ENAMETOOLONG
 		}
 		return -1, EINVAL
 	}
-	r := svc3(virSysFileOpen, uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(n), uintptr(flags))
+	r := svc3(virSysFileOpen, uintptr(unsafe.Pointer(&staging[0])), uintptr(n), uintptr(flags))
 	if r < 0 {
 		return -1, errnoErr(errOf(r))
 	}
@@ -523,12 +524,13 @@ func virPathExists(path string) bool {
 // isDir reports whether path is a directory by trying to list it. Any
 // failure means "not a directory as far as this kernel can tell".
 func isDir(path string) bool {
-	n := stagedAbs(path)
+	var staging [virPathMax + 1]byte
+	n := stagedAbs(path, &staging)
 	if n < 0 {
 		return false
 	}
 	var row [direntSize]byte
-	r := svc4(virSysDirList, uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(n),
+	r := svc4(virSysDirList, uintptr(unsafe.Pointer(&staging[0])), uintptr(n),
 		uintptr(unsafe.Pointer(&row[0])), 1)
 	return r >= 0
 }
@@ -783,14 +785,15 @@ func Pipe(p []int) error { return ENOSYS }
 // — there is no mode model at EL0 (ADR 0024 D1; slot 69 sets the M50
 // ownership table, which is a different thing).
 func Mkdir(path string, perm uint32) error {
-	n := stagedAbs(path)
+	var staging [virPathMax + 1]byte
+	n := stagedAbs(path, &staging)
 	if n < 0 {
 		if len(path) > virPathMax {
 			return ENAMETOOLONG
 		}
 		return EINVAL
 	}
-	r := svc3(virSysFileOpen, uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(n),
+	r := svc3(virSysFileOpen, uintptr(unsafe.Pointer(&staging[0])), uintptr(n),
 		uintptr(kmodeWrite|kmodeCreate|kmodeDir))
 	if r < 0 {
 		return errnoErr(errOf(r))
@@ -807,14 +810,15 @@ func Rmdir(path string) error { return deletePath(path) }
 func Unlink(path string) error { return deletePath(path) }
 
 func deletePath(path string) error {
-	n := stagedAbs(path)
+	var staging [virPathMax + 1]byte
+	n := stagedAbs(path, &staging)
 	if n < 0 {
 		if len(path) > virPathMax {
 			return ENAMETOOLONG
 		}
 		return EINVAL
 	}
-	r := svc2(virSysDelete, uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(n))
+	r := svc2(virSysDelete, uintptr(unsafe.Pointer(&staging[0])), uintptr(n))
 	if r < 0 {
 		return errnoErr(errOf(r))
 	}
@@ -824,18 +828,17 @@ func deletePath(path string) error {
 // Rename publishes oldPath as newPath (slot 35). The host REFUSES a live
 // target (the file-domain EEXIST), so this is not a POSIX rename-over.
 func Rename(from, to string) error {
-	nf := stagedAbs(from)
+	var old, cur [virPathMax + 1]byte
+	nf := stagedAbs(from, &old)
 	if nf < 0 {
 		return EINVAL
 	}
-	var old [virPathMax + 1]byte
-	copy(old[:], virPathStaging[:nf])
-	nt := stagedAbs(to)
+	nt := stagedAbs(to, &cur)
 	if nt < 0 {
 		return EINVAL
 	}
 	r := svc4(virSysRename, uintptr(unsafe.Pointer(&old[0])), uintptr(nf),
-		uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(nt))
+		uintptr(unsafe.Pointer(&cur[0])), uintptr(nt))
 	if r < 0 {
 		return errnoErr(errOf(r))
 	}
@@ -867,15 +870,16 @@ func listRows(dir string, max int) ([]Dirent, error) {
 	if max <= 0 || max > virDirRowsMax {
 		max = virDirRowsMax
 	}
+	var staging [virPathMax + 1]byte
 	n := 0
 	if dir != "" {
-		n = stagedAbs(dir)
+		n = stagedAbs(dir, &staging)
 		if n < 0 {
 			return nil, EINVAL
 		}
 	}
 	rows := make([]Dirent, max)
-	r := svc4(virSysDirList, uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(n),
+	r := svc4(virSysDirList, uintptr(unsafe.Pointer(&staging[0])), uintptr(n),
 		uintptr(unsafe.Pointer(&rows[0])), uintptr(max))
 	if r < 0 {
 		return nil, errnoErr(errOf(r))
@@ -968,14 +972,15 @@ func statPath(path string) (Stat_t, error) {
 // returning, whatever happens.
 func statByReading(abs string) (Stat_t, error) {
 	var st Stat_t
-	n := stagedPath(abs)
+	var staging [virPathMax + 1]byte
+	n := stagedPath(abs, &staging)
 	if n < 0 {
 		if len(abs) > virPathMax {
 			return st, ENAMETOOLONG
 		}
 		return st, EINVAL
 	}
-	r := svc3(virSysFileOpen, uintptr(unsafe.Pointer(&virPathStaging[0])), uintptr(n), uintptr(kmodeRead))
+	r := svc3(virSysFileOpen, uintptr(unsafe.Pointer(&staging[0])), uintptr(n), uintptr(kmodeRead))
 	if r < 0 {
 		return st, errnoErr(errOf(r))
 	}
@@ -1132,16 +1137,18 @@ func Getcwd(buf []byte) (n int, err error) {
 }
 
 // stagedAbs resolves path against the port's cwd, stages the ABSOLUTE form
-// in virPathStaging, and returns its length (or -1). Every path-taking call
-// goes through this: the kernel resolves nothing, so a relative path that
-// reached it would be looked up at the share root and silently succeed
-// against the wrong file.
-func stagedAbs(path string) int {
+// in the caller's staging buffer, and returns its length (or -1). Every
+// path-taking call goes through this: the kernel resolves nothing, so a
+// relative path that reached it would be looked up at the share root and
+// silently succeed against the wrong file. The buffer is a caller-local
+// stack frame, not a shared global — two Ms staging concurrent calls must
+// never splice each other's bytes (issue #2495).
+func stagedAbs(path string, staging *[virPathMax + 1]byte) int {
 	abs, err := resolvePath(path)
 	if err != nil {
 		return -1
 	}
-	return stagedPath(abs)
+	return stagedPath(abs, staging)
 }
 
 // resolvePath makes path absolute against the port's cwd. ".." is resolved

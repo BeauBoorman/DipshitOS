@@ -75,6 +75,7 @@
 #   bash tools/go/build-goterm.sh         ->  .build/go/GOTERM.ELF    (boot 04)
 #   bash tools/go/build-charmhello.sh     ->  .build/go/CHARMHELLO.ELF (boot 04)
 #   bash tools/go/build-files.sh          ->  .build/go/GOFILES.ELF   (boots 05/06)
+#   bash tools/go/build-gosound.sh        ->  .build/go/GOSOUND.ELF   (boot 07)
 #   (the page is the pinned fixture user/go/browser/testdata/gate-page.html,
 #    staged as /host/DOGFOOD.HTML; no new fixture)
 #
@@ -138,6 +139,16 @@
 # seat live; nothing else about the default seat is overridden (still no `wm`
 # row anywhere). The corrupt-history half of the card is go-wm-default's
 # boots 13-16.
+#
+# M118e (#2483) adds boot 07: GOSOUND's RECORD mode on the default seat. The
+# dogfood runner attaches no audio device at all, so the boot pins the
+# mode's existence and the device-absent honest outcome (slot 91 ready=0,
+# slot 92's ENXIO, no file on the share). The assert-time SoundInProbe
+# --sound-in --share leg then repeats the record under a real input stream
+# -- the consented shape lands a WAV the host re-verifies off the share
+# (header, duration, sha256), the mic-denied shape is the bounded ETIMEDOUT
+# refusal with no file: both pinned, exactly as live-sound-record does for
+# GOREC.
 #
 # exec-order: assert-proven -- every phase gate is anchored on guest output
 # (the seat's, an app's, or the kernel's own marker: dogfood: seat ->
@@ -209,7 +220,8 @@ for name, how in (("GOTABWM.ELF", "build-gotabwm.sh"),
                   ("WEB.ELF", "build-web.sh browser WEB"),
                   ("GOTERM.ELF", "build-goterm.sh"),
                   ("CHARMHELLO.ELF", "build-charmhello.sh"),
-                  ("GOFILES.ELF", "build-files.sh")):
+                  ("GOFILES.ELF", "build-files.sh"),
+                  ("GOSOUND.ELF", "build-gosound.sh")):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
         sys.exit(name + " missing (expected " + src + ") - build it first: "
@@ -222,8 +234,8 @@ shutil.copy(os.path.join("user", "go", "browser", "testdata", "gate-page.html"),
 if os.path.exists(os.path.join(share, "SETTINGS.TXT")):
     sys.exit("SETTINGS.TXT already present in the share; the dogfood beat must "
              "boot with no persisted `wm`")
-print("staged GOTABWM/GOSH/NOTE/GOCALC/WEB + DOGFOOD.HTML from the pinned "
-      "gate-page.html fixture")
+print("staged GOTABWM/GOSH/NOTE/GOCALC/WEB/GOTERM/CHARMHELLO/GOFILES/GOSOUND "
+      "+ DOGFOOD.HTML from the pinned gate-page.html fixture")
 PY
 
 # M82d2 (#1785): boot 05's notice sender is GOFILES.ELF (its completed copy
@@ -877,11 +889,33 @@ vgate_assert 04 serial-contains 'dogfood: seat'
 vgate_assert 04 share-contains APPS.TXT 'NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text'
 vgate_assert 04 share-contains APPS.TXT 'WEB.ELF | Web | w | dock=true | v=2 | caps=net | opens=http,https'
 # The seat's own decode receipt, printed by the launcher as it parses
+<<<<<<< HEAD
 # (apps.go SummarizeApps): 19 rows, the highest row version the file
 # declares, this build's schema, and how many rows spoke each trailing key.
 # A parser that skipped the tail would still print `launcher open n=19` and
 # would report v=0 here.
 vgate_assert 04 serial-contains 'gotabwm: apps decode n=19 v=2 schema=2'
+=======
+# (apps.go SummarizeApps): every row of the share's manifest, the highest
+# row version the file declares, this build's schema, and how many rows
+# spoke each trailing key. A parser that skipped the tail would still print
+# `launcher open n=` and would report v=0 here. The row count is derived
+# from the staged APPS.TXT, not a literal -- a literal went stale the day
+# image/apps.txt gained a row (observed: n=15 pinned while the file held 20).
+vgate_assert 04 python <<'PY'
+import os, re, sys
+share = os.environ["VG_SHARE"]
+rows = [l for l in open(os.path.join(share, "APPS.TXT"), errors="replace")
+        if re.match(r"^[A-Z]", l)]
+want = "gotabwm: apps decode n=%d v=2 schema=2" % len(rows)
+ser = open(os.environ["VG_SER"], errors="replace").read()
+if want not in ser:
+    m = re.search(r"gotabwm: apps decode .*", ser)
+    sys.exit("want %r in serial, saw %r"
+             % (want, m.group(0) if m else "absent"))
+print("apps decode receipt matches the share manifest: %d rows" % len(rows))
+PY
+>>>>>>> origin/main
 
 # --- (a) the docked Terminal entry opens through the launcher ---------------
 # The seat's own 16-tick choreography emptied the strip first; without it
@@ -1550,4 +1584,224 @@ assert txt0 >= 20 and txt1 >= 20, ("the restored notices' text is not on the sca
 assert txt2 == 0, ("a third row painted text (%d px): the center holds more than the "
                    "two restored notices" % txt2)
 print("the reopened center shows exactly the two restored notices, DND on")
+PY
+
+# Between-run cleanup for boot 07, on THIS tag's asserts: boot 07 wants the
+# first-boot workspace branch (a real starter GOSH tab to exec from), so a
+# SESSION.TABS left by any earlier seat close must not survive into it --
+# the same between-run slot boots 03->04 and 04->05 already use.
+vgate_assert 06 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share arm?)")
+st = os.path.join(share, "SESSION.TABS")
+if os.path.exists(st):
+    os.remove(st)
+    assert not os.path.exists(st), "SESSION.TABS survived removal"
+    print("between-run cleanup: removed SESSION.TABS "
+          "(boot 07 summons on an empty strip)")
+else:
+    print("between-run cleanup: no SESSION.TABS to remove "
+          "(boot 07 already boots an empty strip)")
+PY
+
+# ---------------------------------------------------------------------------
+# M118e (#2483): boot 07 -- GOSOUND's record mode on the default seat
+# ---------------------------------------------------------------------------
+# `exec GOSOUND.ELF record N out.wav` is the M118e verb: the player becomes a
+# recorder, bounded by construction (seconds <= 30, one WriteFileSafe
+# publish, the kernel's 64 KiB ring bounding every slot-92 call) with the mic
+# meter live in the window while frames land.
+#
+# This spec runs NO audio device -- no --sound and no --sound-in anywhere on
+# the dogfood runner -- so boot 07 pins exactly the two truths the boot can
+# prove honestly: the mode EXISTS on the default seat (the verb dispatches,
+# the cap report prints) and the device-absent refusal is the named ENXIO
+# with no file written -- the same receipt shape GOREC's live-sound-record
+# pins on the flag-off side.
+#
+#   gotabwm: win focus    script a: `dui focus 0`, the phase-1 idiom every
+#                         boot here shares.
+#   gosh: prompt          script b: the record verb on the starter shell.
+#   gosound: rec done     script c: the run's own end marker. `rec done` is
+#                         the mode's terminal marker -- it prints on EVERY
+#                         path (wrote, refused, stopped), so a refusal can
+#                         never stall the run.
+
+vgate_file script-07a.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script-07b.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOSOUND.ELF record 1 /host/GOSOUND/dogfood.wav
+EOF
+
+vgate_file script-07c.txt <<'EOF'
+echo rx-dogfood-07-ok
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --script '$RUN_DIR/script-07a.txt' \
+    --script-after 'gotabwm: win focus' \
+    --script2 '$RUN_DIR/script-07b.txt' \
+    --script2-after 'gosh: prompt' \
+    --script3 '$RUN_DIR/script-07c.txt' \
+    --script3-after 'gosound: rec done' \
+    --script-expect 'rx-dogfood-07-ok' --timeout 300
+
+vgate_assert 07 serial-contains 'dogfood: seat'
+vgate_assert 07 serial-contains 'gosh: prompt'
+vgate_assert 07 serial-contains 'exec: loaded GOSOUND.ELF'
+# The mode exists: the verb parsed, the mode marker printed, and a window
+# opened on the seat (the meter's canvas -- no frames ever arrive on this
+# boot, so the meter's level stays 0 and no `level=` line prints).
+vgate_assert 07 serial-contains 'gosound: rec secs=1 out=/host/GOSOUND/dogfood.wav'
+vgate_assert 07 serial-contains 'gosound: open id='
+# The honest outcome: slot 91 reports no usable capture source and slot 92
+# answers ENXIO -- zero frames is a refusal, never a short read.
+vgate_assert 07 serial-contains 'gosound: cap ready=0'
+vgate_assert 07 serial-contains 'gosound: rec refused ENXIO at=0 of=96000'
+vgate_assert 07 serial-contains 'gosound: rec done'
+vgate_assert 07 serial-absent 'gosound: rec wrote'
+vgate_assert 07 serial-absent 'gosound: rec level='
+vgate_assert 07 serial-contains 'rx-dogfood-07-ok'
+vgate_assert 07 serial-absent '[EXC] parking'
+vgate_assert 07 serial-absent 'exited status=139'
+
+# A refused record leaves nothing behind on the share -- the guest's file
+# channel is the second reporter and its silence must agree with serial.
+vgate_assert 07 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+p = os.path.join(share, "GOSOUND", "dogfood.wav")
+if os.path.exists(p):
+    sys.exit("the absent-device refusal left a file behind: " + p)
+PY
+
+# The capture leg -- SoundInProbe --sound-in --share: the input stream at
+# index 0, the VirtioFS share as exec's app source and the WAV's /host. The
+# guest takes 2 s of the v1 tuple in 8192-byte chunks (the meter's tick);
+# each landed chunk feeds the level marker and the window's meter. A
+# consented host lands a file the host re-verifies byte for byte; a denied
+# host prints the bounded ETIMEDOUT and the share stays empty -- never a
+# hang, never a truncated WAV. Same two-outcome pin as live-sound-record.
+vgate_assert 07 python <<'PY'
+import hashlib, os, re, shutil, subprocess, sys
+
+rd = os.environ["RUN_DIR"]
+suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")
+probe = os.path.join(os.getcwd(), "host/vm-runner/.build/release/SoundInProbe")
+if not os.path.exists(probe):
+    sys.exit("SoundInProbe missing at %s (the package swift build precedes the run)" % probe)
+codesign = subprocess.run(
+    ["codesign", "--force", "--sign", "-", "--entitlements",
+     "host/vm-runner/entitlements.plist", probe],
+    capture_output=True, text=True)
+if codesign.returncode != 0:
+    sys.exit("codesign of SoundInProbe failed: %s%s" % (codesign.stdout, codesign.stderr))
+
+share = os.path.join(rd, "gosound-share")
+os.makedirs(share, exist_ok=True)
+src = os.path.join(".build", "go", "GOSOUND.ELF")
+if not os.path.exists(src):
+    sys.exit("GOSOUND.ELF missing (expected %s) - build it first: "
+             "bash tools/go/build-gosound.sh" % src)
+shutil.copy(src, os.path.join(share, "GOSOUND.ELF"))
+
+script = os.path.join(rd, "gosound-rec-script.txt")
+with open(script, "w") as fh:
+    fh.write("exec GOSOUND.ELF record 2 /host/GOSOUND/clip.wav\n")
+serial = os.path.join(rd, "gosound-rec-serial.log")
+run = subprocess.run(
+    [probe, "--disk", "artifacts/disk.img",
+     "--vars", os.path.join(rd, "gosound-rec-vars.bin"),
+     "--serial", serial,
+     "--sound-in", "--share", share,
+     "--script", script,
+     "--script-expect", "gosound: rec done",
+     "--timeout", "180"],
+    capture_output=True, text=True)
+with open(os.path.join(rd, "gosound-rec-run.txt"), "w") as fh:
+    fh.write(run.stdout + run.stderr)
+if os.path.exists(serial):
+    shutil.copyfile(serial, "artifacts/go-dogfood-serial-gosound-rec%s.log" % suffix)
+if run.returncode != 0:
+    sys.exit("SoundInProbe --sound-in --share (GOSOUND record) exited %d:\n%s%s"
+             % (run.returncode, run.stdout[-1500:], run.stderr[-1500:]))
+text = open(serial, errors="replace").read()
+
+# The guest took the scripted exec and ran to its terminal marker.
+for want in ("exec: loaded GOSOUND.ELF", "gosound: rec done"):
+    if want not in text:
+        sys.exit("guest serial missing %r -- the recorder never finished" % want)
+m = re.search(r"gosound: cap ready=(\d+)", text)
+if not m or m.group(1) != "1":
+    sys.exit("slot 91 did not report the observed INPUT stream "
+             "(cap line: %r)" % (m.group(0) if m else "absent"))
+
+clip = os.path.join(share, "GOSOUND", "clip.wav")
+wrote = re.search(r"gosound: rec wrote (\S+) seconds=(\d+) frames=(\d+)"
+                  r" bytes=(\d+) peak=(\d+) sha256=([0-9a-f]{64})", text)
+refused = re.search(r"gosound: rec refused (\w+)", text)
+
+if wrote:
+    path, seconds, frames, nbytes, peak, sha = wrote.groups()
+    if path != "/host/GOSOUND/clip.wav" or seconds != "2":
+        sys.exit("receipt path/seconds wrong: %r" % wrote.group(0))
+    if int(frames) != 96000 or int(nbytes) != 192000:
+        sys.exit("receipt arithmetic broken: frames=%s bytes=%s"
+                 % (frames, nbytes))
+    if not os.path.isfile(clip):
+        sys.exit("guest reported wrote but the share holds no clip.wav")
+    # Lift the evidence before the share is torn down.
+    kept = os.path.join(rd, "share-GOSOUND_clip.wav")
+    shutil.copyfile(clip, kept)
+    shutil.copyfile(kept, "artifacts/go-dogfood-share-GOSOUND_clip%s.wav" % suffix)
+    body = open(clip, "rb").read()
+    # The whole 44-byte header is determined by the v1 tuple -- byte-compare
+    # it, then recompute duration and sha256 off the share, never trusting
+    # the receipt for either.
+    want_hdr = (
+        b"RIFF" + (36 + 192000).to_bytes(4, "little") + b"WAVE"
+        + b"fmt " + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")      # WAVE_FORMAT_PCM
+        + (1).to_bytes(2, "little")      # mono
+        + (48000).to_bytes(4, "little")
+        + (96000).to_bytes(4, "little")  # byte rate
+        + (2).to_bytes(2, "little")      # block align
+        + (16).to_bytes(2, "little")     # bits
+        + b"data" + (192000).to_bytes(4, "little")
+    )
+    if len(body) != 44 + 192000 or body[:44] != want_hdr:
+        sys.exit("clip.wav is not the expected PCM16/48k/mono RIFF/WAVE: "
+                 "len=%d" % len(body))
+    data_len = int.from_bytes(body[40:44], "little")
+    if data_len % 96000 != 0 or data_len // 96000 != 2:
+        sys.exit("recomputed duration is not 2 s: data=%d B" % data_len)
+    if hashlib.sha256(body).hexdigest() != sha:
+        sys.exit("share file sha256 disagrees with the guest's receipt")
+    # The meter really ran: at least one reading reached serial (the first
+    # captured chunk always prints its level).
+    if "gosound: rec level=" not in text:
+        sys.exit("the wrote receipt landed but no meter level ever printed")
+    print("record leg: captured=192000 peak=%s sha256=%s verified off the share"
+          % (peak, sha))
+elif refused:
+    name = refused.group(1)
+    if name != "ETIMEDOUT":
+        sys.exit("capture refused %s, want ETIMEDOUT (or the wrote receipt)"
+                 % name)
+    if "gosound: rec wrote" in text:
+        sys.exit("both refused and wrote markers present")
+    if os.path.exists(clip):
+        sys.exit("a refused record left a WAV behind")
+    if "gosound: rec level=" in text:
+        sys.exit("a meter level printed on a refused record -- no frames "
+                 "could have landed")
+    print("record leg: host mic denied -- bounded ETIMEDOUT, no file (pass shape)")
+else:
+    sys.exit("no outcome: neither a wrote receipt nor a refused marker")
 PY

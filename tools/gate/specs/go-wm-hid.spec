@@ -57,8 +57,8 @@
 #
 # Run 08 (M82c / #1770): the global shortcuts registry. The monitor seeds
 # GOTABWM.CHORDCONFLICT, so the seat's prologue feeds the checker the
-# deliberately conflicting fixture (FIXTURE.ELF claiming the seat's pin
-# chord at the seat's own dispatch point) and prints the full named
+# deliberately conflicting fixture (FIXTURE.ELF claiming the seat's palette
+# chord — pin's home before M121a) and prints the full named
 # refusal, then the whole table (one `gotabwm: chord` line per row) and the
 # summary. The seat carries on with the UNTOUCHED shipped table: the
 # fixture is a refusal exercise, not a reconfiguration. GOSET then opens
@@ -220,7 +220,7 @@ vgate_run 01 -- \
     --pointer-virtio-after 'gotabwm: rail n=2' \
     --input-string 'XYZ' \
     --input-string-after 'gotabwm: rail-click id=' \
-    --input-chords 'ctrl-s,ctrl-shift-p,alt-tab' \
+    --input-chords 'ctrl-s,ctrl-shift-n,alt-tab' \
     --input-chords-after 'goedit: dirty' \
     --script3 '$RUN_DIR/script3.txt' \
     --script3-after 'wm: unregistered, shim resumed' \
@@ -895,9 +895,20 @@ rail_i, rail_m = first_match(re.compile(r"^gotabwm: rail n=3 focus=(\d+)$"))
 wrap_i = first_after("gotabwm: alt-tab id=", rail_i)
 if wrap_i <= max(edit_i, term_i, calc_i):
     sys.exit("M79f chords must follow all three client opens")
-ids = (int(edit_m.group(1)), int(term_m.group(1)), int(calc_m.group(1)))
+# The rail's cell order is the SEAT's host order — the three execs race,
+# so the clients' own open-marker order need not match it (observed
+# 2026-10-18 under load: declares landed 4,5,3 while the client markers
+# printed 3,4,5). Read the seat's tab-open chain instead.
+ids = []
+for line in ser:
+    m = re.match(r"^gotabwm: tab open id=(\d+)$", line)
+    if m:
+        ids.append(int(m.group(1)))
+    if len(ids) == 3:
+        break
 if len(set(ids)) != 3:
-    sys.exit("client ids are not distinct: %s" % (ids,))
+    sys.exit("seat tab-open chain is not three distinct ids: %s" % (ids,))
+ids = tuple(ids)
 start = ids.index(int(rail_m.group(1)))
 want_wrap = ids[(start + 1) % len(ids)]
 # Ctrl+2 selects the second RAIL cell — under the MRU rail that is the
@@ -939,8 +950,9 @@ PY
 #
 # The monitor seeds GOTABWM.CHORDCONFLICT before the seat execs: the prologue
 # validates the shipped table (fail-closed), feeds the checker the
-# deliberately conflicting fixture — FIXTURE.ELF claiming the seat's pin
-# chord (ctrl+shift+p) at the seat's own dispatch point — prints the full
+# deliberately conflicting fixture — FIXTURE.ELF claiming the seat's
+# palette chord (ctrl+shift+p; pin's home until M121a re-homed it to
+# ctrl-shift-n) at the seat's own dispatch point — prints the full
 # named refusal, then the whole table (one `gotabwm: chord` line per row)
 # and the summary line. The seat carries on with the UNTOUCHED shipped
 # table: the fixture is a refusal exercise, not a reconfiguration. GOSET

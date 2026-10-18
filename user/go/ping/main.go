@@ -7,10 +7,14 @@
 // it by binary name and nothing else. PING.BIN and user/src/ping.zig are
 // deleted by that card (D2: ping is the one Zig net CLI this card retires).
 //
-// CLI: `exec GOPING.ELF [-c count] <a.b.c.d>`
+// CLI: `exec GOPING.ELF [-c count] <a.b.c.d>` — and, since M117c (#2475),
+// `exec GOPING.ELF [-c count] <v6-addr>` or `exec GOPING6.ELF ...`
+// (GOSH links GOPING6.ELF to the same image): a v6 literal — bare `x::y`
+// or bracketed — selects the ICMPv6 half (`vi.Ping6Send`/`Ping6Poll`, the
+// tagged marshal on slots 59/60).
 //
 //	-c count: number of pings, 1..100 (default 5)
-//	<a.b.c.d>: dotted IPv4 address
+//	<a.b.c.d>: dotted IPv4 address; <v6-addr> a v6 literal
 //	`exec GOPING.ELF -h` prints help
 //
 // Output shape (grep-able by the two specs):
@@ -114,8 +118,10 @@ func (s *Stats) max() uint32 {
 // pingArgs is one parsed command line.
 type pingArgs struct {
 	IP    [4]byte
+	IP6   [16]byte // the v6 literal (V6 only)
 	IPStr string
 	Count int
+	V6    bool // M117c (#2475): the literal was v6 — Ping6Send/Ping6Poll
 }
 
 // isIPv4Literal reports whether s parses as a dotted quad (the guard that
@@ -125,28 +131,43 @@ func isIPv4Literal(s string) bool {
 	return err == nil
 }
 
+// looksLikeAddress covers argv[0] detection for BOTH families — a bare or
+// bracketed v6 literal must not be mistaken for the image name.
+func looksLikeAddress(s string) bool {
+	if vi.IsV6Literal(s) {
+		_, err := vi.ParseIPv6(s)
+		return err == nil
+	}
+	return isIPv4Literal(s)
+}
+
 // cliArgs returns the real arguments, dropping argv[0] when it is the image
 // name. The kernel's ELF gap path prepends the image name (kernel/src/exec.zig
 // exec_static_elf_gap: "Go's os.Args[0] is the program name"), while the
 // older flat path does not, so the name is dropped only when it does not
 // already look like an argument — the same rule GOSH's own argv handling
-// uses.
-func cliArgs(raw []string) []string {
+// uses. M117c: `GOPING6` / `GOPING6.ELF` as argv[0] is ALSO the v6 selector
+// — it is dropped AND returned as the forced family.
+func cliArgs(raw []string) (args []string, force6 bool) {
 	if len(raw) == 0 {
-		return nil
+		return nil, false
 	}
 	switch first := raw[0]; {
 	case first == "-c" || first == "-h" || first == "--help":
-		return raw
-	case isIPv4Literal(first):
-		return raw
+		return raw, false
+	case looksLikeAddress(first):
+		return raw, false
+	case first == "GOPING6" || first == "GOPING6.ELF" || first == "ping6":
+		return raw[1:], true
 	}
-	return raw[1:]
+	return raw[1:], false
 }
 
-// parseArgs parses `[-c count] <a.b.c.d>`. ok is false on any usage error;
-// help is true when -h/--help was named.
-func parseArgs(args []string) (a pingArgs, ok bool, help bool) {
+// parseArgs parses `[-c count] <addr>` where addr is a dotted quad, a bare
+// v6 literal, or a bracketed one ([x::y]). ok is false on any usage error;
+// help is true when -h/--help was named. force6 (the GOPING6 image name)
+// makes a bare literal REQUIRE the v6 parse.
+func parseArgs(args []string, force6 bool) (a pingArgs, ok bool, help bool) {
 	a.Count = defaultCount
 	i := 0
 	if i < len(args) && args[i] == "-c" {
@@ -167,11 +188,20 @@ func parseArgs(args []string) (a pingArgs, ok bool, help bool) {
 		if a.IPStr != "" {
 			return pingArgs{}, false, false
 		}
-		ip, err := vsys.ParseIPv4(args[i])
-		if err != nil {
-			return pingArgs{}, false, false
+		if force6 || vi.IsV6Literal(args[i]) {
+			addr, err := vi.ParseIPv6(args[i])
+			if err != nil {
+				return pingArgs{}, false, false
+			}
+			a.IP6 = addr
+			a.V6 = true
+		} else {
+			ip, err := vsys.ParseIPv4(args[i])
+			if err != nil {
+				return pingArgs{}, false, false
+			}
+			a.IP = ip
 		}
-		a.IP = ip
 		a.IPStr = args[i]
 	}
 	if a.IPStr == "" {
@@ -211,6 +241,7 @@ func printHelp() {
 	vi.Console("GOPING.ELF - VirelaiOS ICMP ping (M71n)\n" +
 		"usage: exec GOPING.ELF [-c count] <a.b.c.d>\n" +
 		"       exec GOPING.ELF -h   show this help\n" +
+		"       exec GOPING6.ELF [-c count] <v6-addr>  ICMPv6 echo (M117c)\n" +
 		"  -c count  number of pings, 1..100 (default 5)\n" +
 		"exit statuses: 0 ok, 1 usage, 2 offline (no IP - net ip/net dhcp),\n" +
 		"               3 no route (net arp <a.b.c.d> first)\n" +
@@ -220,12 +251,12 @@ func printHelp() {
 func main() {
 	argvEnvpGuard[0] = 1
 
-	args := cliArgs(vi.Args())
+	args, force6 := cliArgs(vi.Args())
 	if len(args) == 0 {
 		printHelp()
 		vi.Exit(exitOK)
 	}
-	cfg, ok, help := parseArgs(args)
+	cfg, ok, help := parseArgs(args, force6)
 	if help {
 		printHelp()
 		vi.Exit(exitOK)
@@ -238,14 +269,18 @@ func main() {
 	// N13/N14 preflight: one sys_net_stats snapshot before the first send.
 	// Offline / no-route exit FAST with the human message instead of burning
 	// the per-ping bounded poll. A refused snapshot is NetUnknown, which
-	// keeps the legacy path rather than inventing a verdict.
-	switch verdict, _ := vi.NetPreflight(cfg.IP); verdict {
-	case vi.NetOfflineNoIP:
-		vi.Console(vi.NetDiagnosisMessage("ping", verdict, cfg.IP))
-		vi.Exit(exitOffline)
-	case vi.NetNoRoute:
-		vi.Console(vi.NetDiagnosisMessage("ping", verdict, cfg.IP))
-		vi.Exit(exitNoRoute)
+	// keeps the legacy path rather than inventing a verdict. M117c: the v6
+	// half has no preflight verdict — Ping6Send's named refusal (bad_dst6 /
+	// no_src6 / no_route6 / no_peer → EINVAL) is the honest answer instead.
+	if !cfg.V6 {
+		switch verdict, _ := vi.NetPreflight(cfg.IP); verdict {
+		case vi.NetOfflineNoIP:
+			vi.Console(vi.NetDiagnosisMessage("ping", verdict, cfg.IP))
+			vi.Exit(exitOffline)
+		case vi.NetNoRoute:
+			vi.Console(vi.NetDiagnosisMessage("ping", verdict, cfg.IP))
+			vi.Exit(exitNoRoute)
+		}
 	}
 
 	runPing(cfg)
@@ -254,16 +289,31 @@ func main() {
 
 func runPing(cfg pingArgs) {
 	// Header
-	vi.Console("PING " + cfg.IPStr + " (" + cfg.IPStr + "): 56 data bytes\n")
+	if cfg.V6 {
+		vi.Console("PING6 " + cfg.IPStr + " (" + cfg.IPStr + "): 56 data bytes\n")
+	} else {
+		vi.Console("PING " + cfg.IPStr + " (" + cfg.IPStr + "): 56 data bytes\n")
+	}
 
 	var stats Stats
 	for seq := 1; seq <= cfg.Count; seq++ {
 		// The poll sequence is read BEFORE the send so a stale reply from the
 		// previous sequence cannot be mistaken for this one's.
-		prev := vi.PingPoll()
-		if err := vi.PingSend(cfg.IP); err != nil {
-			// Send refused — peer not in ARP, no IP, or no device. Honest
-			// loss, not a fabricated reply.
+		var prev uint64
+		if cfg.V6 {
+			prev = vi.Ping6Poll()
+		} else {
+			prev = vi.PingPoll()
+		}
+		var err error
+		if cfg.V6 {
+			err = vi.Ping6Send(cfg.IP6)
+		} else {
+			err = vi.PingSend(cfg.IP)
+		}
+		if err != nil {
+			// Send refused — peer not in ARP/NDP, no source address, or no
+			// device. Honest loss, not a fabricated reply.
 			vi.Console("ping: send to " + cfg.IPStr + " failed (" + err.Error() + ")\n")
 			stats.recordLoss()
 			if seq < cfg.Count {
@@ -274,7 +324,12 @@ func runPing(cfg pingArgs) {
 		got := false
 		var rtt uint32
 		for polls := 0; polls < 200; polls++ {
-			p := vi.PingPoll()
+			var p uint64
+			if cfg.V6 {
+				p = vi.Ping6Poll()
+			} else {
+				p = vi.PingPoll()
+			}
 			if p != 0 && p != prev {
 				got = true
 				rtt = uint32(polls + 1)
@@ -291,7 +346,11 @@ func runPing(cfg pingArgs) {
 			continue
 		}
 		stats.record(rtt)
-		vi.Console("64 bytes from " + cfg.IPStr + ": icmp_seq=" + vsys.Itoa64(int64(seq)) +
+		seqToken := "icmp_seq="
+		if cfg.V6 {
+			seqToken = "icmp6_seq="
+		}
+		vi.Console("64 bytes from " + cfg.IPStr + ": " + seqToken + vsys.Itoa64(int64(seq)) +
 			" ttl=64 time=" + vsys.Itoa64(int64(rtt)) + " ms\n")
 		if seq < cfg.Count {
 			vi.Sleep(1)

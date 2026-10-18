@@ -104,6 +104,8 @@ pub const shared_mmap = @import("shared_mmap.zig"); // M33 SB2 (claim 8878): the
 pub const secret = @import("secret.zig"); // M50 TS5 (issue #1139, ADR 0024 D8): the SECRETS.TXT secret store behind sys_secret_get
 pub const grant = @import("grant.zig"); // M113c (#2419, ADR 0054 Part II): the grant table behind the word gates + slot 89
 pub const measure = @import("measure.zig"); // M113b/c: the receipt format the word-denial lines reuse
+pub const vsock_ctl = @import("vsock_ctl.zig"); // M115d (#2463, ADR 0056): the virelai-ctl/1 session behind slot 93
+pub const road_pops = @import("road_pops.zig"); // M115d (#2463): the tee console the ctl session's markers ride
 
 const builtin = @import("builtin");
 pub const mmu = @import("mmu.zig");
@@ -115,6 +117,14 @@ pub const slot_count: usize = abi.slot_count;
 /// reserved pipe slots (M19) — the gap is intentional, see
 /// docs/archive/agent-concurrency-plan.md §8.
 /// M19 P1 (issue #290): slots 56/57 are the bounded pipe.
+/// M117c (#2475, ADR 0057 D10): the family tag shared by the ping
+/// (59/60) and socket-connect (80 op 10) marshal — placed where the
+/// v4 API carries the IPv4 word (args[0] for ping, args[1] for op 10),
+/// a value above u32 so no IPv4 word can alias it. The 16-byte literal
+/// then arrives through the existing `uaccess.copy_in` seam on the
+/// pointer arg (ping: args[1]; op 10: args[3]).
+pub const family_v6_tag: u64 = 0x0000_86dd_0000_0006;
+
 /// M26 N1 (issue #399): slots 59/60 are ping send/poll.
 /// M26 N2 (issue #400): slot 62 is the net-stats snapshot.
 /// M29 (issue #598): slots 63/64 are sys_mmap/sys_munmap.
@@ -290,6 +300,13 @@ pub const sys_audio_play: u64 = 43;
 pub const sys_audio_volume: u64 = 44;
 /// M15 follow-up (claim 9297): `sys_audio_mute(muted)` — slot 45.
 pub const sys_audio_mute: u64 = 45;
+/// M118c (issue #2481): `sys_audio_rec_info(out_ptr)` — slot 91.
+pub const sys_audio_rec_info: u64 = 91;
+/// M118c (issue #2481): `sys_audio_rec(format, rate, channels, buf, len)` — slot 92.
+pub const sys_audio_rec: u64 = 92;
+/// M115d (issue #2463, ADR 0056 D5 + ADR 0007 amendment):
+/// `sys_vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr, code_cap)` — slot 93.
+pub const sys_vsock_ctl: u64 = 93;
 /// Step 2 (Issue #205): `sys_win_fill_batch(buf_ptr, buf_len)` — slot 46.
 pub const sys_win_fill_batch: u64 = 46;
 /// Arc2 W1 (claim 3589, ADR 0013 D1): `sys_win_resize(id, w, h)` — slot 47.
@@ -668,6 +685,9 @@ fn handler_for(comptime number: u64) Handler {
         sys_audio_play => handle_audio_play,
         sys_audio_volume => handle_audio_volume,
         sys_audio_mute => handle_audio_mute,
+        sys_audio_rec_info => handle_audio_rec_info,
+        sys_audio_rec => handle_audio_rec,
+        sys_vsock_ctl => handle_vsock_ctl,
         sys_win_fill_batch => handle_win_fill_batch,
         sys_win_resize => handle_win_resize,
         48 => handle_drag_start,
@@ -748,10 +768,14 @@ fn doms_of(number: u64) u5 {
         // file channel AND reads the caller's registry row.
         sys_grant_admin => f | k,
         sys_trace => f | k, // M94b's atomic arm-and-exec needs both domains.
+        // M115d (#2463): the ctl session reads the kernel-held credential
+        // (KERNEL), quiesces VLFS + settings + the marker through the host
+        // file channel (FILE), and rides the vsock transport (NET).
+        sys_vsock_ctl => f | k | n,
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
         sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
-        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read, sys_gpucomp => k,
+        sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_audio_rec_info, sys_audio_rec, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read, sys_gpucomp => k,
         sys_exit => svclock.all_bits,
         else => 0,
     };
@@ -781,8 +805,11 @@ pub fn dispatch(number: u64, args: Args, frame: *exceptions.VectorFrame) u64 {
     // per-handler convention. Slot 80's open-class ops carry `net` (the
     // family is op-multiplexed; its slot stays ungrouped). `audit`
     // receipts the would-be denial and lets the call through; `enforce`
-    // makes it an honest EACCES — flipping the default is a separate
-    // owner decision (D12). Kernel-context callers resolve no pid and
+    // makes it an honest EACCES. M116b (#2468): the floor a row-less
+    // process carries is `grant.ambient` — file/audio/net are row-only
+    // words; `mode=enforce` in GRANTS.TXT is what flips a boot's
+    // posture (absent stays `audit`, D12's standing contract).
+    // Kernel-context callers resolve no pid and
     // are never the EL0 principal the gate exists for.
     var required = grant.slot_word(number);
     if (number == sys_socket and grant.socket_open_op(args[0])) required |= grant.word_net;
@@ -1708,6 +1735,23 @@ fn handle_font_size(args: Args, _: *exceptions.VectorFrame) u64 {
 /// caller should `net arp <ip>` first).
 fn handle_ping_send(args: Args, _: *exceptions.VectorFrame) u64 {
     const ip_raw = args[0];
+    if (ip_raw == family_v6_tag) {
+        // M117c (#2475): `sys_ping_send(tag, ptr)` — the 16-byte v6
+        // literal through the copy_in seam. `net_ping6_request` refuses
+        // honestly (bad_dst6 / no_src6 / no_route6 / no_peer — resolve
+        // the next hop with `net ndp <addr>` first, same as v4 ARP).
+        var addr6: virtio_net.ipv6.Addr = undefined;
+        if (uaccess.copy_in(&addr6, args[1], 16) != .ok) return error_result(.efault);
+        var out_len: usize = 0;
+        switch (virtio_net.net_ping6_request(addr6, &out_len)) {
+            .ok => {
+                virtio_net.ipv6.requests_sent += 1;
+                virtio_net.ipv6.ping6_seq +%= 1;
+                return 0;
+            },
+            else => return error_result(.einval),
+        }
+    }
     const ip: [4]u8 = .{
         @truncate(ip_raw >> 24),
         @truncate(ip_raw >> 16),
@@ -1730,8 +1774,13 @@ fn handle_ping_send(args: Args, _: *exceptions.VectorFrame) u64 {
 /// whether a pong has landed. Returns the last echo reply sequence
 /// (`ipv4.last_seq`, u16) if `pongs_observed > 0`, else 0. The caller
 /// sends one ping and polls until the expected sequence appears.
-fn handle_ping_poll(_: Args, _: *exceptions.VectorFrame) u64 {
+/// M117c (#2475): `sys_ping_poll(tag)` — the v6 half, `ipv6.last_seq`.
+fn handle_ping_poll(args: Args, _: *exceptions.VectorFrame) u64 {
     virtio_net.net_rx_drain();
+    if (args[0] == family_v6_tag) {
+        if (virtio_net.ipv6.pongs_observed == 0) return 0;
+        return virtio_net.ipv6.last_seq;
+    }
     if (virtio_net.ipv4.pongs_observed == 0) return 0;
     return virtio_net.ipv4.last_seq;
 }
@@ -2753,7 +2802,7 @@ fn handle_socket(args: Args, _: *exceptions.VectorFrame) u64 {
             if (tcp.state != .idle and tcp.state != .closed and
                 (tcp.listen_port == args[2] or (!tcp.is_server and args[2] == tcp.default_src_port)))
                 return error_result(.enospc);
-            const h = native_socket.sockets.listen(pid, .{ .ip = ip, .port = @intCast(args[2]) }, native_socket.now()) catch |err| return socket_error(err);
+            const h = native_socket.sockets.listen(pid, native_socket.core.ep4(ip, @intCast(args[2])), native_socket.now()) catch |err| return socket_error(err);
             return h.value;
         },
         1 => return (native_socket.sockets.accept(pid, handle) catch |err| return socket_error(err)).value,
@@ -2807,22 +2856,46 @@ fn handle_socket(args: Args, _: *exceptions.VectorFrame) u64 {
             // outbound connections. The bound is the table's own
             // (owner_limit/conn_limit): Capacity -> ENOSPC, never a
             // userland copy.
-            if (!virtio_net.net_ready or !virtio_net.arp.ip_set()) return error_result(.einval);
+            // M117c (#2475, ADR 0057 D8/D10): the same op carries a v6
+            // literal — args[1] = `family_v6_tag`, args[3] = pointer to
+            // the 16-byte address (the uaccess.copy_in seam, family-tagged
+            // — never an IPv4-mapped translation). The local address is
+            // D3's select_src, the next hop D9's (resolved through the
+            // NDP table — `net ndp` or an earlier exchange), and the
+            // connect wait is byte-identical below.
+            if (!virtio_net.net_ready) return error_result(.einval);
             const ip_raw = args[1];
             const port_word = args[2];
             const dst_port: u16 = @truncate(port_word);
             const timeout_ms: u32 = @truncate(port_word >> 16);
-            if (ip_raw == 0 or ip_raw > 0xffffffff or dst_port == 0 or
-                port_word >> 48 != 0 or args[3] != 0) return error_result(.einval);
-            const ip = native_socket.ipBytes(ip_raw);
-            if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
-            const peer_mac = virtio_net.arp.lookup(ip) orelse return error_result(.einval);
+            if (dst_port == 0 or port_word >> 48 != 0) return error_result(.einval);
+            var peer_mac: [6]u8 = undefined;
+            var remote6: virtio_net.ipv6.Addr = undefined;
+            var local6: virtio_net.ipv6.Addr = undefined;
+            var ip: [4]u8 = undefined;
+            const v6 = ip_raw == family_v6_tag;
+            if (v6) {
+                if (uaccess.copy_in(&remote6, args[3], 16) != .ok) return error_result(.efault);
+                if (virtio_net.ipv6.is_bad_dst(remote6) or virtio_net.ipv6.is_owned(&remote6)) return error_result(.einval);
+                local6 = virtio_net.ipv6.select_src(&remote6) orelse return error_result(.einval);
+                const target = virtio_net.ipv6.next_hop(&remote6) orelse return error_result(.einval);
+                peer_mac = virtio_net.ndp.lookup(&target) orelse return error_result(.einval);
+            } else {
+                if (!virtio_net.arp.ip_set()) return error_result(.einval);
+                if (ip_raw == 0 or ip_raw > 0xffffffff or args[3] != 0) return error_result(.einval);
+                ip = native_socket.ipBytes(ip_raw);
+                if (std.mem.eql(u8, &ip, &virtio_net.arp.own_ip)) return error_result(.einval);
+                peer_mac = virtio_net.arp.lookup(ip) orelse return error_result(.einval);
+            }
             const start_pct = timer.cntpct();
             const deadline = tcp.ConnectDeadline.init(start_pct, timer.freq, timeout_ms);
             if (!builtin.is_test and deadline == null) return error_result(.einval);
             const timeout_result = error_result(if (timeout_ms == 0) .einval else .etimedout);
             const isn: u32 = @truncate(csprng.random_u64());
-            const h = native_socket.legacyOpen(pid, virtio_net.arp.own_ip, ip, dst_port, peer_mac, isn) catch |err| return socket_error(err);
+            const h = if (v6)
+                native_socket.legacyOpen6(pid, local6, remote6, dst_port, peer_mac, isn) catch |err| return socket_error(err)
+            else
+                native_socket.legacyOpen(pid, virtio_net.arp.own_ip, ip, dst_port, peer_mac, isn) catch |err| return socket_error(err);
             tcp.syn_sent += 1; // `net`/`sys_net_stats` mirror — same row slot 30 writes
             const cslot: usize = @intCast((h.value & native_socket.core.slot_mask) - native_socket.core.conn_slot_base);
             var test_iterations: usize = 0;
@@ -3380,6 +3453,135 @@ fn handle_audio_mute(args: Args, _: *exceptions.VectorFrame) u64 {
     return 0;
 }
 
+/// M118c (issue #2481): slot 91 — sys_audio_rec_info(out_ptr)
+/// Copy the capture capability report out through uaccess as a 16-byte
+/// `AudioCapInfo` {ready, format, rate, channels, period_bytes,
+/// ring_bytes} — the slot-42 shape for the RX direction. `ready` reports
+/// the LAST OBSERVED stream-0 topology held to the v1 tuple (S16/48kHz/
+/// mono); this call runs no device exchange of its own. A soundless VM or
+/// an output-only stream is a successful call with `ready = 0` — absence
+/// is not an error at the info seam, the named refusal arrives at slot
+/// 92. Returns 0; `EINVAL` for a non-process caller, `EFAULT` for a bad
+/// buffer.
+fn handle_audio_rec_info(args: Args, _: *exceptions.VectorFrame) u64 {
+    const out_ptr = args[0];
+    _ = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    const saved = virtio_snd.audio_lock.lock();
+    defer virtio_snd.audio_lock.unlock(saved);
+    const info = virtio_snd.snd_cap_info();
+    const bytes = std.mem.asBytes(&info);
+    if (uaccess.copy_out(out_ptr, bytes, bytes.len) != .ok) return error_result(.efault);
+    return 0;
+}
+
+/// Map a capture refusal class to the ADR 0007 errno — the machine half
+/// of `cap_fail`'s text (M118c). Device-absent, missing RX queue, no
+/// input stream and a device that lacks the v1 tuple are all the audio
+/// seam's no-device refusal (ENXIO); an over-cap tuple is the caller's
+/// EINVAL; over-ring is the same "too long" name slot 43 uses; a bounded
+/// drain expiring is ETIMEDOUT; a full ring is ENOSPC; every device-level
+/// refusal is EIO.
+fn audio_rec_errno(refusal: virtio_snd.CapRefusal) ErrorCode {
+    return switch (refusal) {
+        .no_device, .rx_unarmed, .no_input => .enxio,
+        .over_cap => .einval,
+        .over_ring => .enametoolong,
+        .ring_full => .enospc,
+        .drain_timeout => .etimedout,
+        .none, .ctl_refused, .malformed, .device_refused, .epilogue => .eio,
+    };
+}
+
+/// Copy-out staging for the ring drain — bounded, under audio_lock.
+var cap_out_stage: [4096]u8 align(64) = undefined;
+
+/// M118c (issue #2481): slot 92 — sys_audio_rec(format, rate, channels, buf, len)
+/// Capture `len` bytes (`len`/2 frames — the v1 tuple is S16/mono) from
+/// stream 0's INPUT into the bounded kernel ring, then copy the ring out
+/// through uaccess. ONE stream, ONE call, bounded bytes: `len` is the
+/// per-call bound and can never exceed the 64 KiB ring. Returns the bytes
+/// copied out (== `len` on a complete capture). `EINVAL` for a
+/// non-process caller, a zero or non-frame-aligned `len`, or a tuple over
+/// the v1 cap (the named over-cap refusal); `ENAMETOOLONG` over
+/// `cap_ring_bytes`; `ENXIO` when no device is attached, the RX queue is
+/// unarmed, stream 0 is not INPUT, or the device cannot speak the tuple;
+/// `EFAULT` for a bad `buf` (checked per chunk — a mid-drain fault can
+/// leave earlier chunks copied); `ETIMEDOUT` when the bounded drain
+/// expires (the honest host-mic-denied outcome — zero frames is a refusal
+/// here, not a short read); `ENOSPC` when the ring refuses a write;
+/// `EIO` for a device-level refusal. Serialized with every other audio
+/// caller under `audio_lock`.
+fn handle_audio_rec(args: Args, _: *exceptions.VectorFrame) u64 {
+    const format: u8 = @truncate(args[0]);
+    const rate: u8 = @truncate(args[1]);
+    const channels: u8 = @truncate(args[2]);
+    const ptr = args[3];
+    const len = args[4];
+    _ = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (len == 0 or (len & 1) != 0) return error_result(.einval);
+    if (len > virtio_snd.cap_ring_bytes) return error_result(.enametoolong);
+    const saved = virtio_snd.audio_lock.lock();
+    defer virtio_snd.audio_lock.unlock(saved);
+    const st = virtio_snd.snd_capture(format, rate, channels, @intCast(len / virtio_snd.cap_frame_bytes));
+    if (st != virtio_snd.S_OK) return error_result(audio_rec_errno(virtio_snd.cap_refusal));
+    var off: usize = 0;
+    while (virtio_snd.cap_ring_used != 0 and off < len) {
+        const n = virtio_snd.cap_ring_pop(cap_out_stage[0..@min(cap_out_stage.len, len - off)]);
+        if (n == 0) break;
+        if (uaccess.copy_out(ptr + off, cap_out_stage[0..n], n) != .ok) return error_result(.efault);
+        off += n;
+    }
+    return @intCast(off);
+}
+
+// ---------------------------------------------------------------------------
+// M115d (issue #2463, ADR 0056 D5 + ADR 0007 amendment): sys_vsock_ctl — slot 93
+// ---------------------------------------------------------------------------
+
+/// `sys_vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr,
+/// code_cap)`: run ONE `virelai-ctl/1` session on the caller's behalf over
+/// the virtio-vsock transport — connect to the host's `--vsock-ctl-port`
+/// listener, answer the HMAC challenge with the kernel-held `vsock-ctl`
+/// credential (a uid_system row no EL0 `sys_secret_get` principal can
+/// read — which is why the door exists at all rather than a raw stream),
+/// send the request line, relay the reply verdict. `suspend` runs the
+/// guest quiesce (VLFS fsync when mounted, the settings re-save, the
+/// `SUSPEND.MARK` request receipt) between auth and request, and a
+/// quiesce failure aborts before the verb leaves — the machine is never
+/// frozen half-prepared.
+///
+/// Returns 0 when the reply was `ok:true` — for `suspend`, that return
+/// may land on the far side of a host save/restore, so the caller's next
+/// instruction IS the resume. A refused session returns the refusal
+/// code's byte length and writes the ADR 0056 D4 name to `code_ptr`
+/// (`no_device`, `no_credential`, `connect_refused`, `unimplemented`,
+/// `unknown_verb`, `busy`, `io_error`, ...) — truncated to `code_cap`
+/// when the buffer is short. `EINVAL` for a non-process caller or a
+/// `verb_len`/`name_len` outside 1..31/0..31; `EFAULT` for a bad pointer.
+fn handle_vsock_ctl(args: Args, _: *exceptions.VectorFrame) u64 {
+    const verb_ptr = args[0];
+    const verb_len = args[1];
+    const name_ptr = args[2];
+    const name_len = args[3];
+    const code_ptr = args[4];
+    const code_cap = args[5];
+    _ = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (verb_len == 0 or verb_len > 31 or name_len > 31) return error_result(.einval);
+    var verb_buf: [32]u8 = undefined;
+    if (uaccess.copy_in(&verb_buf, verb_ptr, @intCast(verb_len)) != .ok) return error_result(.efault);
+    var name_buf: [32]u8 = undefined;
+    if (name_len > 0 and uaccess.copy_in(&name_buf, name_ptr, @intCast(name_len)) != .ok) return error_result(.efault);
+    const verdict = vsock_ctl.session(road_pops.tee_console(), verb_buf[0..@intCast(verb_len)], name_buf[0..@intCast(name_len)], .normal);
+    if (verdict.ok) return 0;
+    var text = verdict.codeText();
+    if (text.len == 0) text = "io_error";
+    if (code_cap > 0) {
+        const take = @min(text.len, @as(usize, @intCast(code_cap)));
+        if (uaccess.copy_out(code_ptr, text[0..take], take) != .ok) return error_result(.efault);
+    }
+    return @intCast(text.len);
+}
+
 /// Claim 6359 / issue #1333 (ADR 0007 slot 28): `sys_exec(path_ptr,
 /// path_len, argv_ptr, argc)` — the EL0 exec seam. Marshals the path
 /// (and, when `argc` is 1..=8, a packed card-3e argv block) through the
@@ -3586,7 +3788,7 @@ fn handle_tcp_connect(args: Args, frame: *exceptions.VectorFrame) u64 {
         if (c.state == .terminal) {
             native_socket.releaseConn(c);
         } else {
-            if (c.state == .established and std.mem.eql(u8, &ip, &c.remote.ip) and dst_port == c.remote.port) return 0;
+            if (c.state == .established and c.remote.family == .v4 and std.mem.eql(u8, &ip, &c.remote.ip) and dst_port == c.remote.port) return 0;
             return error_result(.einval);
         }
     }

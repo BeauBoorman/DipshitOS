@@ -535,6 +535,8 @@ func (m *model) handleKey(ev keys.Event) {
 			m.pasteClip()
 		case 'o':
 			m.startOpenWith()
+		case 'e':
+			m.exportSel()
 		}
 	}
 }

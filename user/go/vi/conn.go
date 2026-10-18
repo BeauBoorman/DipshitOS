@@ -116,7 +116,9 @@ type Conn struct {
 	handle    uint64 // the table handle; 0 for the legacy slot-30 view
 	serve     uint64 // a handle listener's bound serving child (Accept)
 	ip        [4]byte
+	ip6       [16]byte // the v6 literal Dial'd (v6 only)
 	port      uint16
+	v6        bool // the connection is family v6
 	open      bool
 	listening bool
 	peerGone  bool
@@ -152,10 +154,13 @@ func sockErr(rc int64) error {
 }
 
 // Dial connects to host:port. host may be a dotted-quad IPv4 literal
-// (dialed directly) or a name (resolved via ResolveDNS against
-// DefaultDNSServer first). The kernel's connect blocks until the
-// handshake lands or its 30 s timeout expires; a refusal maps to the
-// kernel's errno (ENOSPC -> ErrConnBusy by name).
+// (dialed directly), a v6 literal — bare `x::y` or bracketed `[x::y]`,
+// M117c's tagged marshal (ADR 0057 D8/D10: never an IPv4-mapped
+// translation) — or a name (resolved via ResolveDNS against
+// DefaultDNSServer first; the resolver is the v4 surface, so a name is
+// always a v4 answer). The kernel's connect blocks until the handshake
+// lands or its 30 s timeout expires; a refusal maps to the kernel's
+// errno (ENOSPC -> ErrConnBusy by name).
 func Dial(host string, port uint16) (*Conn, error) {
 	return dial(host, port, 0)
 }
@@ -181,6 +186,17 @@ func DialTimeout(host string, port uint16, d time.Duration) (*Conn, error) {
 func dial(host string, port uint16, timeoutMs uint32) (*Conn, error) {
 	if port == 0 {
 		return nil, errno(ErrEINVAL)
+	}
+	if IsV6Literal(host) {
+		addr, err := ParseIPv6(host)
+		if err != nil {
+			return nil, errno(ErrEINVAL)
+		}
+		rc := sock(SockOpConnect, familyV6Tag, uintptr(port)|uintptr(timeoutMs)<<16, bytePtr(addr[:]))
+		if rc < 0 {
+			return nil, sockErr(rc)
+		}
+		return &Conn{handle: uint64(rc), v6: true, ip6: addr, port: port, open: true}, nil
 	}
 	ip, perr := vsys.ParseIPv4(host)
 	if perr != nil {
@@ -352,6 +368,20 @@ func (c *Conn) IP() [4]byte {
 		return [4]byte{}
 	}
 	return c.ip
+}
+
+// IsV6 reports whether the connection is IPv6 (M117c — a literal Dial).
+// IP6 returns the peer's v6 address (the [4]byte IP word cannot carry
+// it; for a v4 conn IP6 is zero and IsV6 false).
+func (c *Conn) IsV6() bool {
+	return c != nil && c.v6
+}
+
+func (c *Conn) IP6() [16]byte {
+	if c == nil {
+		return [16]byte{}
+	}
+	return c.ip6
 }
 
 // Port returns the peer's port.

@@ -142,7 +142,8 @@ func TestSessionWriteThroughMutationChain(t *testing.T) {
 		t.Fatalf("after reorder: %+v", recs)
 	}
 
-	// 2. ctrl-shift-p: the pin bit, and the re-partition Pin() performs.
+	// 2. ctrl-shift-n (pin's chord since M121a): the pin bit, and the
+	//    re-partition Pin() performs.
 	if !applyHidPin() {
 		t.Fatal("applyHidPin")
 	}

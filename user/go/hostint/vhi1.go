@@ -19,12 +19,16 @@ package hostint
 
 import "virelai/shlib"
 
-// VHI1 record layout (ADR 0051 D2 — fixed binary header, payload, tag):
+// VHI1 record layout (ADR 0051 D2 + the v2 amendment — fixed binary
+// header, payload, tag):
 //
 //	0..3    magic  "VHI1"
 //	4       tag    u8: 0=ARMED 1=CLIP_OUT 2=CLIP_IN 3=NOTIFY_OUT 4=DROP
+//	               5=OUTBOX 6=NOTIFY_FOCUS (v2)
 //	5       flags  u8: bit0 TRUNCATED; bits 1-7 reserved (writer sends 0)
-//	6..7    reserved (0)
+//	6..7    sender_id u16le — the kernel window id the record is about;
+//	        v1 wrote reserved zeros, so v1 records carry 0 here and a v1
+//	        reader's bad_record on nonzero is the correct skew answer
 //	8..11   seq    u32le — per-tag monotonic, starts at 1 per epoch
 //	12..15  epoch  u32le — the runner's per-boot nonce
 //	16..17  plen   u16le — payload bytes, 0..512
@@ -54,12 +58,14 @@ const (
 
 // Record tags (direction is in the tag; each tag's consumer is fixed).
 const (
-	TagArmed     uint8 = 0 // h→g runner → seat: payload [lane_mask u8]
-	TagClipOut   uint8 = 1 // g→h seat → runner: clipboard bytes (0 = clear)
-	TagClipIn    uint8 = 2 // h→g runner → seat: UTF-8 text ≤ 512
-	TagNotifyOut uint8 = 3 // g→h seat → runner: toast text ≤ 24
-	TagDrop      uint8 = 4 // h→g runner → seat: [name_len u8][name][size u64le]
-	tagCount           = 5
+	TagArmed       uint8 = 0 // h→g runner → seat: payload [lane_mask u8]
+	TagClipOut     uint8 = 1 // g→h seat → runner: clipboard bytes (0 = clear)
+	TagClipIn      uint8 = 2 // h→g runner → seat: UTF-8 text ≤ 512
+	TagNotifyOut   uint8 = 3 // g→h seat → runner: toast text ≤ 24
+	TagDrop        uint8 = 4 // h→g runner → seat: [name_len u8][name][size u64le]
+	TagOutbox      uint8 = 5 // g→h seat → runner: the DROP shape, reversed (v2)
+	TagNotifyFocus uint8 = 6 // h→g runner → seat: plen MUST be 0 (v2)
+	tagCount             = 7
 )
 
 // FlagTruncated is the record flags bit0: the producer cut the payload at
@@ -67,10 +73,13 @@ const (
 const FlagTruncated uint8 = 0x01
 
 // ARMED lane_mask bits — the runner names every lane its flags enabled.
+// NOTIFY_FOCUS rides lane_notify: both directions of a lane share one
+// bit (the LaneBit rule).
 const (
 	LaneClip   uint8 = 1 << 0
 	LaneDrop   uint8 = 1 << 1
 	LaneNotify uint8 = 1 << 2
+	LaneOutbox uint8 = 1 << 3
 )
 
 // The refusal vocabulary (ADR 0051 D2): one set of names, both ends,
@@ -93,10 +102,16 @@ const (
 	RefuseNoBundle     = "no_bundle"
 	RefuseAuthDenied   = "auth_denied"
 	RefuseIO           = "io_error"
+	// v2 additions (ADR 0051 V2-D6): gone names a target that no longer
+	// exists (a REQ's absent payload, a dead focus tab, a vanished INBOX
+	// file); quota_exceeded is the per-epoch OUTBOX export cap.
+	RefuseGone  = "gone"
+	RefuseQuota = "quota_exceeded"
 )
 
 // tagStem is the filename stem per tag (ARMED-00000001, CLIPIN-00000007,
-// CLIPOUT-…, NOTIFY-…, DROP-…). "" marks an out-of-range tag.
+// CLIPOUT-…, NOTIFY-…, DROP-…, OUTBOX-…, NFOCUS-…). "" marks an
+// out-of-range tag.
 func tagStem(tag uint8) string {
 	switch tag {
 	case TagArmed:
@@ -109,6 +124,10 @@ func tagStem(tag uint8) string {
 		return "NOTIFY"
 	case TagDrop:
 		return "DROP"
+	case TagOutbox:
+		return "OUTBOX"
+	case TagNotifyFocus:
+		return "NFOCUS"
 	}
 	return ""
 }
@@ -126,6 +145,10 @@ func stemTag(stem string) (uint8, bool) {
 		return TagNotifyOut, true
 	case "DROP":
 		return TagDrop, true
+	case "OUTBOX":
+		return TagOutbox, true
+	case "NFOCUS":
+		return TagNotifyFocus, true
 	}
 	return 0, false
 }
@@ -142,8 +165,10 @@ func LaneName(tag uint8) string {
 		return "clip"
 	case TagDrop:
 		return "drop"
-	case TagNotifyOut:
+	case TagNotifyOut, TagNotifyFocus:
 		return "notify"
+	case TagOutbox:
+		return "outbox"
 	}
 	return ""
 }
@@ -156,8 +181,10 @@ func LaneBit(tag uint8) uint8 {
 		return LaneClip
 	case TagDrop:
 		return LaneDrop
-	case TagNotifyOut:
+	case TagNotifyOut, TagNotifyFocus:
 		return LaneNotify
+	case TagOutbox:
+		return LaneOutbox
 	}
 	return 0
 }
@@ -180,6 +207,12 @@ func MaskNames(mask uint8) string {
 			out += ","
 		}
 		out += "notify"
+	}
+	if mask&LaneOutbox != 0 {
+		if out != "" {
+			out += ","
+		}
+		out += "outbox"
 	}
 	if out == "" {
 		return "-"
@@ -259,8 +292,11 @@ func ParseName(name string) (tag uint8, seq uint32, ok bool) {
 // Record is a decoded lane record. Payload and signed alias the caller's
 // raw buffer — callers must not retain either past the buffer's reuse.
 type Record struct {
-	Tag     uint8
-	Flags   uint8
+	Tag   uint8
+	Flags uint8
+	// Sender is the v2 sender_id — the kernel window id the record is
+	// about (0 = none). Tags that carry no correlation send 0.
+	Sender  uint16
 	Seq     uint32
 	Epoch   uint32
 	Payload []byte
@@ -283,15 +319,29 @@ func putLe32(b []byte, v uint32) {
 // (and set FlagTruncated) rather than emit a record that cannot be read.
 // Flags outside bit0 are refused the same way: bits 1-7 are reserved, and
 // a decoder that names them bad_record must never see a record this writer
-// signed.
+// signed. The v1 form — every tag that carries no correlation sends
+// sender_id 0.
 func EncodeRecord(key []byte, tag, flags uint8, seq, epoch uint32, payload []byte) []byte {
+	return EncodeRecordSender(key, tag, flags, 0, seq, epoch, payload)
+}
+
+// EncodeRecordSender is the v2 form: sender is the kernel window id the
+// record is about (NOTIFY_OUT's toast source, NOTIFY_FOCUS's target). A
+// NOTIFY_FOCUS record is refused unless plen is 0 and sender is nonzero —
+// the header is its whole payload, so a senderless focus request is
+// malformed, not "focus nothing".
+func EncodeRecordSender(key []byte, tag, flags uint8, sender uint16, seq, epoch uint32, payload []byte) []byte {
 	if len(payload) > PayloadMax || tagStem(tag) == "" || flags&^FlagTruncated != 0 {
+		return nil
+	}
+	if tag == TagNotifyFocus && (len(payload) != 0 || sender == 0) {
 		return nil
 	}
 	out := make([]byte, HeaderLen+len(payload)+MACLen)
 	copy(out[0:4], "VHI1")
 	out[4] = tag
 	out[5] = flags
+	putLe16(out[6:8], sender)
 	putLe32(out[8:12], seq)
 	putLe32(out[12:16], epoch)
 	putLe16(out[16:18], uint16(len(payload)))
@@ -302,10 +352,10 @@ func EncodeRecord(key []byte, tag, flags uint8, seq, epoch uint32, payload []byt
 }
 
 // DecodeRecord parses the wire form. ok=false means a bad_record refusal:
-// wrong magic, bad tag, a flag bit outside FlagTruncated, reserved nonzero,
-// plen > 512, or a total size that does not match header+payload+mac
-// exactly. MAC verification is a separate step (Verify) so the two refusal
-// names stay distinct.
+// wrong magic, bad tag, a flag bit outside FlagTruncated, plen > 512, a
+// NOTIFY_FOCUS with a nonempty payload, or a total size that does not
+// match header+payload+mac exactly. MAC verification is a separate step
+// (Verify) so the two refusal names stay distinct.
 func DecodeRecord(raw []byte) (rec Record, ok bool) {
 	if len(raw) < HeaderLen+MACLen || len(raw) > RecordMax {
 		return rec, false
@@ -319,15 +369,16 @@ func DecodeRecord(raw []byte) (rec Record, ok bool) {
 	if raw[5]&^FlagTruncated != 0 {
 		return rec, false
 	}
-	if raw[6] != 0 || raw[7] != 0 {
-		return rec, false
-	}
 	plen := int(le16(raw[16:18]))
 	if plen > PayloadMax || len(raw) != HeaderLen+plen+MACLen {
 		return rec, false
 	}
+	if raw[4] == TagNotifyFocus && plen != 0 {
+		return rec, false
+	}
 	rec.Tag = raw[4]
 	rec.Flags = raw[5]
+	rec.Sender = le16(raw[6:8])
 	rec.Seq = le32(raw[8:12])
 	rec.Epoch = le32(raw[12:16])
 	rec.Payload = raw[HeaderLen : HeaderLen+plen]

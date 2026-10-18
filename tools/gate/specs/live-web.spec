@@ -1,18 +1,21 @@
-# WEB.ELF bounded HTML/CSS/GET browser, plus GOFETCH TLS regression.
-# One exec per boot, ended by program markers or an anchored kernel receipt.
+# WEB.ELF bounded HTML/CSS/GET browser, plus GOFETCH TLS regression. One
+# exec per boot, ended by program markers or an anchored kernel receipt.
 # 01-11 retain render/link/fetch/error/cancel/store/offline/hostile behaviors.
-# 12 proves in-process GOFETCH TLS; 13 retains shim console-ink evidence.
-# 14 retains the pinned corpus on the surviving consumer.
-# 15-17 type real hostnames against original hermetic site stand-ins.
+# 12 proves in-process GOFETCH TLS; 13-14 retain shim console-ink + the
+# pinned corpus. 15-17 type real hostnames against hermetic stand-ins;
 # 18-20 prove wrong-host/expired/production-unknown-root refusal before GET.
 # 21 measures the largest reference with actual kernel ownership counters.
-# 22-36 (M93g #1999): each frozen reference renders in-guest; the marker-
+# 22-38 (M93g #1999): each frozen reference renders in-guest; the marker-
 # geometry crop SHA-256-matches its approved M93e golden (web-proof/compare.py,
 # ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
-# No public-internet fleet access, scripts or POST. Owner authorized the fixed
-# three-pixel shim-border scanout composition; font markers are live-web-ttf's.
-# Prerequisites: build-web.sh browser WEB, browser WEB --gate,
-# fetch GOFETCH --gate. Gate artifacts retain WEB.ELF/GOFETCH.ELF guest names.
+# 39 (M126a #2593): the address-bar/nav leg — a typed URL loads, the chips
+# drive back/forward/reload, and the history dropdown lists + revisits entries.
+# v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
+# responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
+# grammar or TLS-over-v6 responder exists yet. No public-internet access,
+# scripts or POST; owner authorized the fixed three-pixel shim-border
+# composition; font markers are live-web-ttf's. Prereqs: build-web.sh
+# browser WEB and browser WEB --gate, fetch GOFETCH --gate.
 
 vgate_name live-web "WEB: bounded CSS browser, exact M93 presentation, DNS/SNI/GET navigation and fail-closed TLS"
 vgate_share seed
@@ -193,7 +196,12 @@ if pid == 0:
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     conns = []
-    deadline = time.time() + 300
+    # The deadline must outlive the whole spec, not the boot it serves:
+    # 300 s was sized when this spec had a dozen runs and expired mid-run
+    # on a 39-run fleet (observed 2026-10-18: upstream dial ECONNREFUSED,
+    # 'web: offline' instead of a load to cancel). The owner-pid watch is
+    # the real lifetime bound; this is only the orphan backstop.
+    deadline = time.time() + 7200
     while time.time() < deadline:
         try:
             os.kill(owner, 0)
@@ -1583,3 +1591,239 @@ vgate_assert 38 snapshot 'snap-38-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'fonts-size'])
 PY
+
+# --- boot 39 (M126a #2593): the address bar + navigation leg --------------
+# One boot, all file-channel loads so every transition is instant. The chord
+# channel types ctrl-l + the path (its marker wait is keyed to the run
+# deadline, unlike --input-string's fixed 40 s, which expired before
+# url-focus on this boot — observed 2026-10-18); the pointer channel then
+# clicks the back/forward/reload chips, the history chip, a dropdown row,
+# and reopens the dropdown LAST so the kind-4 snapshot cannot drain after
+# the pick closed it (observed: the capture outran an open menu while queued
+# pointer steps were still draining). Inert hovers pace the fixed 2.5 s
+# pointer transport around the typed navigation and each reload. Snapshots
+# grade PAGE after the repaint and after back, NEXT after the typed URL, and
+# the open dropdown's pixels (plate, selected row, cursor bar) so "history
+# list shown" is proven on the scanout, not only on serial.
+vgate_run 39 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-39' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-l,/,h,o,s,t,/,N,E,X,T,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --pointer-virtio '100,68;100,68;100,68;100,68;100,68;50,67,c;100,68;100,68;100,68;66,67,c;100,68;100,68;100,68;85,69,c;100,68;100,68;100,68;537,69,c;100,68;100,68;300,100,c;100,68;100,68;537,69,c' \
+    --pointer-virtio-after 'web: ready' \
+    --snapshot-after 'web: repaint' \
+    --snapshot-after 'web: nav /host/NEXT.HTML' \
+    --snapshot-after 'web: history n=3' \
+    --script-expect 'web: history n=3' --timeout 240
+
+vgate_assert 39 serial-absent 'web: budget over'
+vgate_assert 39 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 39 serial-contains 'web: url-focus'
+vgate_assert 39 serial-count 'web: url /host/NEXT.HTML' 3
+vgate_assert 39 serial-count 'web: nav /host/NEXT.HTML' 2
+vgate_assert 39 serial-contains 'web: history back'
+vgate_assert 39 serial-contains 'web: history forward'
+vgate_assert 39 serial-contains 'web: reload /host/NEXT.HTML'
+vgate_assert 39 serial-contains 'web: history n=2'
+vgate_assert 39 serial-contains 'web: history 0 /host/NEXT.HTML'
+vgate_assert 39 serial-contains 'web: history 1 /host/PAGE.HTML'
+vgate_assert 39 serial-contains 'web: history pick /host/PAGE.HTML'
+vgate_assert 39 serial-contains 'web: nav-ready n=4'
+vgate_assert 39 serial-contains 'web: history n=3'
+vgate_assert 39 serial-absent 'web: error'
+vgate_assert 39 serial-absent '[EXC] parking:'
+vgate_assert 39 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "web: url /host/PAGE.HTML",
+    "web: url-focus",
+    "web: nav /host/NEXT.HTML",
+    "web: history back",
+    "web: nav /host/PAGE.HTML",
+    "web: history forward",
+    "web: reload /host/NEXT.HTML",
+    "web: history n=2",
+    "web: history pick /host/PAGE.HTML",
+    "web: nav-ready n=4",
+    "web: history n=3",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 39 nav ordering ok (type->load, back, forward, reload, list, pick, relist)")
+PY
+vgate_assert 39 snapshot 'snap-39-0.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'page'])
+PY
+vgate_assert 39 snapshot 'snap-39-1.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'next'])
+PY
+vgate_assert 39 snapshot 'snap-39-2.raw' <<'PY'
+import sys
+sys.path.insert(0, 'user/go/browser')
+import pixel_probe
+# The approved PAGE raster, decoded by the probe's own PNG reader.
+want = pixel_probe.decode_png('user/go/browser/testdata/presentation/page.png')
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+WX, WY = 40, 28  # WEB.ELF's raw-shim window origin
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the dropdown plate
+RULE = (0x2e, 0x3a, 0x44)     # theme.Dark.Rule: border + selected-row fill
+ACCENT = (0x3b, 0x82, 0xf6)   # theme.Dark.Accent: the cursor row's left bar
+# The plate covers window x in [6,504), rows at window y=48+16i; three
+# entries are listed (n=3), so rows 0-2 sit at window y in [48,96) ->
+# scanout [76,124).
+plate = ink = selrow = 0
+for yy in range(76, 124):
+    for xx in range(46, 544):
+        c = px(xx, yy)
+        if near(c, SURFACE):
+            plate += 1
+        if min(c) > 150:
+            ink += 1
+# Row 0 is the selected row (rule fill) and carries the accent cursor bar.
+for xx in range(100, 540):
+    if near(px(xx, 84), RULE):
+        selrow += 1
+selbar = sum(1 for yy in range(78, 90)
+             if near(px(46, yy), ACCENT) or near(px(47, yy), ACCENT))
+assert plate > 3000, "dropdown plate pixels %d" % plate
+assert ink > 40, "history rows have no text ink: %d" % ink
+assert selrow > 300, "selected row fill pixels %d" % selrow
+assert selbar >= 8, "cursor accent bar pixels %d" % selbar
+# Below the plate and its shadow the pick's target must be on screen:
+# exact-match the PAGE raster rows (content crop rows 40..287 -> scanout
+# 28+64+row), skipping the shim border columns (window x<4 or x>=508).
+diff = 0
+for row in range(40, 288):
+    sy = WY + 64 + row
+    for xx in range(44, 548):
+        c = px(xx, sy)
+        w = want[(row*512 + (xx-WX))*3:][:3]
+        if c != (w[0], w[1], w[2]):
+            diff += 1
+assert diff == 0, "PAGE rows under the menu differ from the approved raster: %d px" % diff
+print("live-web 39 history dropdown pixels ok (plate=%d ink=%d selrow=%d selbar=%d) + PAGE rows under it exact" %
+      (plate, ink, selrow, selbar))
+PY
+
+# --- run v6: M117f (#2478, ADR 0057) — the v6 leg -------------------------
+# The card's thesis is "WEB.ELF fetches https over a v6 literal"; the honest
+# landable leg inside spec Touches is one step narrower, and this run pins
+# both halves of that bound:
+#   * WEB.ELF on https://[v6]:80/ names its refusal — 'web: error url'.
+#     user/go/browser/url.go's validHost accepts DNS labels only ("No
+#     userinfo, IPv6 ... is accepted"); webrender.URL stores a [4]byte
+#     IPv4. A v6 literal never reaches a dial.
+#   * The fetch itself is proven one layer down: GOWEB6.ELF (built in
+#     setup, the go-net connect6 shape) vi.Dials the BRACKETED v6 literal
+#     and does GET / -> 'HTTP/1.0 200 OK' against --net-tcp6-respond's
+#     answer table — the same hermetic responder the v4 fetch legs use.
+# A full https-over-v6 fetch needs a v6 URL grammar in the browser AND a
+# TLS-capable v6 responder (the TCP6 responder speaks the HTTP answer
+# table only — no :relay mode exists for v6): both are follow-on code
+# outside this card's Touches. SLAAC gates script2 exactly like the
+# go-net v6 run: a connect before 'net: v6 g6=... valid' refuses no_src6.
+
+vgate_file web6.go <<'EOF'
+package main
+
+import (
+    "time"
+    "virelai/vi"
+    "virelai/vsys"
+)
+
+func fail(s string) {
+    vsys.Println("web6: FAIL " + s)
+    vsys.Exit(1)
+}
+
+func main() {
+    // M117f (#2478): the bracketed v6 literal — the tagged op-10 marshal.
+    vsys.Println("web6: dialing [2001:db8:64::ff:fe00:2]:80")
+    c, err := vi.DialTimeout("[2001:db8:64::ff:fe00:2]", 80, 5*time.Second)
+    if err != nil { fail("dial " + err.Error()) }
+    if !c.IsV6() { fail("conn not family v6") }
+    vsys.Println("web6: connected")
+    if _, err = c.Send([]byte("GET / HTTP/1.0\r\nHost: v6\r\n\r\n")); err != nil { fail("send") }
+    c.SetRecvDeadline(5_000_000_000)
+    buf := make([]byte, vi.TCPPayloadMax)
+    n, err := c.Recv(buf)
+    if err != nil || n < 15 || string(buf[:15]) != "HTTP/1.0 200 OK" { fail("GET response") }
+    vsys.Println("web6: HTTP 200 over v6")
+    if err = c.Close(); err != nil { fail("close") }
+    vsys.Println("web6: done")
+    vsys.Exit(0)
+}
+EOF
+
+vgate_file script-v6-ready.txt <<'EOF'
+echo v6-ready
+EOF
+
+# exec spawns asynchronously, so the two programs are sequenced by stage
+# gates on their own markers: script2's WEB.ELF exec waits for SLAAC, and
+# script3's GOWEB6 exec waits for WEB.ELF's own 'web: ready'. The run ends
+# on 'web6: done' — a program marker, not a script echo — so the VM cannot
+# stop before the fetch completed.
+vgate_file script-v6.txt <<'EOF'
+net ndp 2001:db8:64::ff:fe00:2
+net ndp 2001:db8:64::ff:fe00:2
+net ip6
+exec WEB.ELF https://[2001:db8:64::ff:fe00:2]:80/
+EOF
+
+vgate_file script-v6-fetch.txt <<'EOF'
+exec GOWEB6.ELF
+EOF
+
+vgate_setup_python <<'PY'
+# Run v6: build GOWEB6.ELF onto the armed share — the same in-setup build
+# shape go-net.spec uses for GOCONNECT6 (issue #2475).
+import os, pathlib, subprocess
+rd = pathlib.Path(os.environ["RUN_DIR"])
+share = pathlib.Path(os.environ.get("VG_SHARE") or rd / "share")
+tmp = rd / "web6-build"
+tmp.mkdir(exist_ok=True)
+env = dict(os.environ, TMPDIR=str(tmp), GO_BUILD_OUT=str(share),
+           GO_BUILD_NAME="GOWEB6", GO_LDFLAGS_VALUE="-s -w")
+subprocess.run(["bash", "tools/go/build-go.sh", str(rd / "web6.go")], env=env, check=True)
+PY
+
+vgate_run v6 -- \
+    --screen '$RUN_DIR/screen-v6' --via-virtio --cvc-snap \
+    --net '$RUN_DIR/v6.cap' \
+    --net-ra-respond '2001:db8:64::/64' \
+    --net-ndp-respond '2001:db8:64::ff:fe00:2' \
+    --net-tcp6-respond '[2001:db8:64::ff:fe00:2]:80' \
+    --script '$RUN_DIR/script-v6-ready.txt' \
+    --script2 '$RUN_DIR/script-v6.txt' --script2-after 'net: v6 g6=2001:db8:64::ff:fe00:1 valid' \
+    --script3 '$RUN_DIR/script-v6-fetch.txt' --script3-after 'web: ready' \
+    --script-expect 'web6: done' --timeout 180
+
+vgate_assert v6 output-contains 'net-ra-respond: ENABLED'
+vgate_assert v6 output-contains 'net-ndp-respond: ENABLED'
+vgate_assert v6 output-contains 'net-tcp6-respond: ENABLED'
+vgate_assert v6 serial-contains 'net: v6 g6=2001:db8:64::ff:fe00:1 valid'
+vgate_assert v6 serial-contains 'net ndp: 2001:db8:64::ff:fe00:2 is at 02:00:00:00:00:02'
+vgate_assert v6 serial-contains 'web: error url'
+vgate_assert v6 serial-contains 'web: ready'
+vgate_assert v6 serial-absent 'web: fetch '
+vgate_assert v6 serial-contains 'web6: connected'
+vgate_assert v6 serial-contains 'web6: HTTP 200 over v6'
+vgate_assert v6 serial-contains 'web6: done'
+vgate_assert v6 serial-absent 'web6: FAIL'
+vgate_assert v6 serial-absent '[EXC] parking:'
+vgate_assert v6 output-contains 'NET-TCP6: answered'

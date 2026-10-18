@@ -51,6 +51,7 @@
 const std = @import("std");
 pub const arp = @import("arp.zig"); // N3: our static IP (`arp.own_ip` — the ONE copy)
 const csprng = @import("csprng.zig"); // the kernel CSPRNG — the server's ISN draw (M97e-F2 rider)
+const ipv6 = @import("ipv6.zig"); // M117c (#2475): v6 Addr + the pseudo-header checksum + the frame prefix
 
 // ---------------------------------------------------------------------------
 // Wire constants (RFC 793)
@@ -78,6 +79,10 @@ pub const payload_max: usize = 1500 - ipv4_hdr_len - tcp_hdr_len;
 pub const segment_max: usize = tcp_hdr_len + payload_max; // 1480
 /// The largest full frame: Ethernet + IPv4 + the bounded segment.
 pub const frame_max: usize = eth_hdr_len + ipv4_hdr_len + segment_max; // 1514
+/// M117c (#2475): the largest v6 frame — Ethernet + the 40-byte fixed
+/// header + the same bounded segment (a full payload still fits the
+/// 1280-byte v6 minimum MTU envelope).
+pub const frame6_max: usize = eth_hdr_len + 40 + segment_max; // 1534
 /// The smallest full frame: Ethernet + IPv4 + the 20-byte header.
 pub const frame_min: usize = eth_hdr_len + ipv4_hdr_len + tcp_hdr_len; // 54
 /// The receive window bound in bytes (M99h #2186): the singleton's RX
@@ -405,28 +410,7 @@ pub fn checksum_tcp(src: [4]u8, dst: [4]u8, segment: []const u8) u16 {
 /// at `payload_max`. Returns the segment length (20 + the written
 /// payload).
 pub fn build_segment(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, payload: []const u8) usize {
-    const plen = @min(payload.len, payload_max);
-    const total = tcp_hdr_len + plen;
-    @memset(buf[0..total], 0);
-    buf[0] = @truncate(src_port >> 8);
-    buf[1] = @truncate(src_port);
-    buf[2] = @truncate(dst_port >> 8);
-    buf[3] = @truncate(dst_port);
-    buf[4] = @truncate(seq >> 24);
-    buf[5] = @truncate(seq >> 16);
-    buf[6] = @truncate(seq >> 8);
-    buf[7] = @truncate(seq);
-    buf[8] = @truncate(ack >> 24);
-    buf[9] = @truncate(ack >> 16);
-    buf[10] = @truncate(ack >> 8);
-    buf[11] = @truncate(ack);
-    buf[12] = 0x50; // data offset 5 (no options) — the honest bound
-    buf[13] = flags;
-    buf[14] = @truncate(window >> 8);
-    buf[15] = @truncate(window);
-    // Checksum field at 16..18 — zeroed by the memset during the computation.
-    // Urgent pointer at 18..20 = 0 (no urgent data).
-    @memcpy(buf[20..total], payload[0..plen]);
+    const total = buildSeg(buf, src_port, dst_port, seq, ack, flags, &.{}, payload);
     const c = checksum_tcp(src_ip, dst_ip, buf[0..total]);
     buf[16] = @truncate(c >> 8);
     buf[17] = @truncate(c);
@@ -440,6 +424,18 @@ pub fn build_segment(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst
 /// active-open SYN; the legacy connection's SYN stays bare (its wire
 /// bytes are pinned by the live fleet gates).
 pub fn build_segment_opts(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, opts: []const u8, payload: []const u8) usize {
+    const total = buildSeg(buf, src_port, dst_port, seq, ack, flags, opts, payload);
+    const c = checksum_tcp(src_ip, dst_ip, buf[0..total]);
+    buf[16] = @truncate(c >> 8);
+    buf[17] = @truncate(c);
+    return total;
+}
+
+/// The checksum-free segment body shared by the v4 and v6 builders
+/// (M117c — the segment bytes are family-independent; only the
+/// pseudo-header differs, filled by the caller's checksum pass). The
+/// checksum field is left zeroed by the memset.
+fn buildSeg(buf: []u8, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, opts: []const u8, payload: []const u8) usize {
     const plen = @min(payload.len, payload_max);
     const opad = (opts.len + 3) & ~@as(usize, 3);
     const total = tcp_hdr_len + opad + plen;
@@ -460,12 +456,52 @@ pub fn build_segment_opts(buf: []u8, src_ip: [4]u8, dst_ip: [4]u8, src_port: u16
     buf[13] = flags;
     buf[14] = @truncate(window >> 8);
     buf[15] = @truncate(window);
+    // Checksum field at 16..18 — zeroed by the memset during the computation.
+    // Urgent pointer at 18..20 = 0 (no urgent data).
     @memcpy(buf[20 .. 20 + opts.len], opts);
     @memcpy(buf[20 + opad .. total], payload[0..plen]);
-    const c = checksum_tcp(src_ip, dst_ip, buf[0..total]);
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// M117c (#2475, ADR 0057 D8): TCP over IPv6 — the v6 pseudo-header
+// checksum + the family-tagged builders. The v4 paths above are
+// untouched; the segment bytes themselves are family-independent.
+// ---------------------------------------------------------------------------
+
+/// The TCP checksum over the v6 pseudo-header (16-byte src + dst, the
+/// 32-bit upper-layer length, next-header 6) — the
+/// `ipv6.icmp6_checksum` machinery parameterized to TCP.
+pub fn checksum_tcp6(src: *const ipv6.Addr, dst: *const ipv6.Addr, segment: []const u8) u16 {
+    return ipv6.icmp6_checksum(src, dst, segment, ipv6.nexthdr_tcp);
+}
+
+/// The v6 half of `build_segment_opts` — identical segment bytes, the
+/// v6 pseudo-header checksum.
+pub fn build_segment_opts6(buf: []u8, src6: *const ipv6.Addr, dst6: *const ipv6.Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, opts: []const u8, payload: []const u8) usize {
+    const total = buildSeg(buf, src_port, dst_port, seq, ack, flags, opts, payload);
+    const c = checksum_tcp6(src6, dst6, buf[0..total]);
     buf[16] = @truncate(c >> 8);
     buf[17] = @truncate(c);
     return total;
+}
+
+/// The v6 half of `build_segment` (no option area).
+pub fn build_segment6(buf: []u8, src6: *const ipv6.Addr, dst6: *const ipv6.Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, payload: []const u8) usize {
+    return build_segment_opts6(buf, src6, dst6, src_port, dst_port, seq, ack, flags, &.{}, payload);
+}
+
+/// Build the FULL Ethernet + IPv6 + TCP frame into `buf` (must hold >=
+/// `eth_hdr_len + ipv6.hdr_len + segment.len`): dst MAC (the NEXT HOP —
+/// the caller resolved it), src MAC, ethertype 0x86dd, the 40-byte
+/// fixed v6 header (version 6, next-header 6, hop 64), then the
+/// pre-built segment. Returns the frame length (74 + the segment
+/// payload).
+pub fn build_frame6(buf: []u8, own_mac: *const [6]u8, src6: *const ipv6.Addr, dst_mac: [6]u8, dst6: *const ipv6.Addr, segment: []const u8) usize {
+    const frame_len = eth_hdr_len + ipv6.ipv6_hdr_len + segment.len;
+    ipv6.build_hdr(buf, &dst_mac, own_mac, src6, dst6, ipv6.nexthdr_tcp, ipv6.hop_default, @intCast(segment.len));
+    @memcpy(buf[eth_hdr_len + ipv6.ipv6_hdr_len .. frame_len], segment);
+    return frame_len;
 }
 
 /// M99h (#2186, card h1): the bounded option-list scan. Walks the
