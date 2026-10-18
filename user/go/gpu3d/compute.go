@@ -173,11 +173,13 @@ const compMapBytes = compStageBytes + 4096
 const compScratchVA = 0x0000_0002_8000_0000
 
 // ComputeSession is one live OPEN: owner-keyed, generation-bearing,
-// single-tenancy (a second OPEN is ErrComputeExhausted). Not safe for
-// concurrent use — the device itself allows at most one outstanding
-// request.
+// single-tenancy (a second CONCURRENT OPEN is ErrComputeExhausted; a
+// second session after Close works — Close releases the fixed-VA
+// window). Not safe for concurrent use — the device itself allows at
+// most one outstanding request.
 type ComputeSession struct {
 	handle uint64
+	window []byte // the whole compMapBytes aperture, for unmap on Close
 	desc   []byte // window[0:128] — the descriptor bytes
 	stats  []byte // window[128:192] — the STATS block
 	stage  []byte // window[4096:] — WRITE/READ payloads
@@ -186,15 +188,22 @@ type ComputeSession struct {
 
 // CompSyscall issues one sys_gpucomp on the encoded descriptor page;
 // CompMap reserves a uaccess-reachable window (vi.MmapHint in the
-// guest). Both are the deliberate injection seam — host tests replace
-// them to drive a session offline, exactly like the render client's
-// injectable Transport.
+// guest) and CompUnmap releases it (vi.Munmap). All three are the
+// deliberate injection seam — host tests replace them to drive a
+// session offline, exactly like the render client's injectable
+// Transport.
 var (
 	CompSyscall = vi.Gpucomp
 	CompMap     = vi.MmapHint
+	CompUnmap   = vi.Munmap
 )
 
 func (s *ComputeSession) call(d vi.GpucompDesc) (int64, error) {
+	if s.closed {
+		// The window is gone after Close — never encode into it, and
+		// answer with the same refusal the kernel gives a stale handle.
+		return -vi.ErrEBADF, nil
+	}
 	if err := d.EncodeDesc(s.desc); err != nil {
 		return 0, err
 	}
@@ -211,32 +220,55 @@ func OpenCompute() (*ComputeSession, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.window = window
 	s.desc = window[:vi.GpucompDescBytes]
 	s.stats = window[vi.GpucompDescBytes : vi.GpucompDescBytes+vi.GpucompStatsBytes]
 	s.stage = window[4096:]
 	rc, err := s.call(vi.GpucompDesc{Op: vi.GpucompOpen})
-	if err != nil {
-		return nil, err
+	if err == nil {
+		err = compErr(rc)
 	}
-	if err := compErr(rc); err != nil {
+	if err != nil {
+		// A refused OPEN must not keep the fixed-VA aperture claimed —
+		// the process's next OpenCompute maps this same band.
+		_ = s.unmapWindow()
 		return nil, err
 	}
 	s.handle = uint64(rc)
 	return s, nil
 }
 
-// Close invalidates the handle (every later op is EBADF) and drains the
-// session's buffers and ctx. Idempotent.
+// unmapWindow releases the descriptor/staging aperture so the fixed-VA
+// band at compScratchVA is claimable by the process's next session.
+// Idempotent; the sub-slices go nil so no later op can stage into the
+// unmapped VA.
+func (s *ComputeSession) unmapWindow() error {
+	if s.window == nil {
+		return nil
+	}
+	err := CompUnmap(s.window)
+	s.window, s.desc, s.stats, s.stage = nil, nil, nil, nil
+	return err
+}
+
+// Close invalidates the handle (every later op is EBADF), drains the
+// session's buffers and ctx, and unmaps the fixed-VA window — the bit
+// #2494 was missing, which capped a process at one session ever.
+// Idempotent.
 func (s *ComputeSession) Close() error {
 	if s == nil || s.closed {
 		return nil
 	}
-	s.closed = true
 	rc, err := s.call(vi.GpucompDesc{Op: vi.GpucompClose, Handle: s.handle})
+	s.closed = true
+	unmapErr := s.unmapWindow()
 	if err != nil {
 		return err
 	}
-	return compErr(rc)
+	if cerr := compErr(rc); cerr != nil {
+		return cerr
+	}
+	return unmapErr
 }
 
 // AllocBuffer reserves a bounded buffer: `size` bytes (1..16 MiB); weight
@@ -392,9 +424,9 @@ func decodeStats(blk []byte) ComputeStatsBlock {
 const statsScratchVA = compScratchVA + compMapBytes
 
 // statsWindow is the lazily-mapped descriptor+block aperture SampleStats
-// reuses. The kernel caps a process's mmap table at 16 entries and there
-// is no munmap, so a fresh map per call would exhaust it inside seconds
-// of a 1 Hz poll.
+// reuses. The kernel caps a process's mmap table at 16 entries, so one
+// process-lifetime page is kept rather than a map/unmap pair per call —
+// a 1 Hz poll would otherwise churn the bounded table for no gain.
 var statsWindow []byte
 
 // SampleStats reads the broker's frozen 64-byte STATS block WITHOUT
