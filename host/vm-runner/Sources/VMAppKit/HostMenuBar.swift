@@ -47,6 +47,7 @@ public enum HostMenuBar {
         integration.addItem(action("Clipboard", .laneClipboard))
         integration.addItem(action("File Drop", .laneDrop))
         integration.addItem(action("Notifications", .laneNotify))
+        integration.addItem(action("Agent Channel", .laneAgent))
         integration.addItem(.separator())
         integration.addItem(action("Send File to INBOX…", .sendFile))
 
