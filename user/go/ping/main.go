@@ -51,15 +51,6 @@ const (
 	exitNoRoute = 3
 )
 
-// argvEnvpGuard pads the writable segment's bss so its end keeps at least
-// 0x908 bytes of page slack: the kernel packs argv+envp into the tail of the
-// writable segment and protects that block against the runtime's break
-// (mmap_collides), so the break must start past it or the runtime's first
-// mmap is refused. GOPING runs in a console exec whose argv is short, but the
-// envp half is a fixed 2048-byte block — the same reason GOFETCH/WEB carry a
-// pad. build-goping.sh asserts the resulting slack from the linked ELF.
-var argvEnvpGuard [0x1000]byte
-
 // ---------------------------------------------------------------------------
 // Pure logic — host-testable
 // ---------------------------------------------------------------------------
@@ -249,8 +240,6 @@ func printHelp() {
 }
 
 func main() {
-	argvEnvpGuard[0] = 1
-
 	args, force6 := cliArgs(vi.Args())
 	if len(args) == 0 {
 		printHelp()

@@ -12,14 +12,6 @@ import (
 	"virelai/vi"
 )
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the
-// page boundary for the kernel's packed argv+envp (see GOSH.ELF).
-var argvEnvpGuard [0x2000]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
-
 // Serial markers (D6). Nothing past the marker word is ever a secret, a
 // path, a command, or a payload — the suffix carries ids, verbs, codes,
 // and errno names only.

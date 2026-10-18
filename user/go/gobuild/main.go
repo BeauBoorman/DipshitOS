@@ -8,14 +8,7 @@ import (
 	"virelai/vsys"
 )
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the
-// page boundary for the kernel's packed argv+envp (GOSH.ELF / FLINT.ELF
-// carry the same guard).
-var argvEnvpGuard [0x1000]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
+var consoleFn = vi.ConsoleLine
 
 // GOBUILD.ELF <verb> — the surface the card asks for under gosh's bare-name
 // resolution (`gobuild <dir>` / `exec GOBUILD.ELF <dir>`; a standalone ELF

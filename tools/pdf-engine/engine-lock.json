@@ -1,20 +1,20 @@
 {
   "version": 1,
   "compiler": "go version go1.27.2 darwin/arm64",
-  "fork_revision": "522e5d99513920a96e67eaf39b95ebfd33c53e14",
+  "fork_revision": "dcaeaf730c18f755896e5f0601b4ae0c2812e89d",
   "compiler_sha256": "0e31b4048d20cc834fea80fbdfbd25f8ee0b891917ce6a0ed4f8045e7b9f8a6a",
   "tool_sha256": {
     "compile": "fa3f3f3d5807d2587827f938f125026ee0c167ba2d96d72ceb27df1e37a6c460",
     "link": "3122dc419089d4692207db6f5922b7ed8e3867d4bd3a01f368c5fd8f2f1855b3",
     "asm": "9e5cf3a9ae08ade9a5d6157261b15a68542b700cb7518ddb77d5f19271f3adc6"
   },
-  "fork_source_sha256": "ce41aab80aa8c62e92f47e984db0b81acadbde2e84400e2b82eeba5e7580619f",
-  "overlay_sha256": "6952a6833c455ce38d29354f10afb704d8e281a54c9a3e03ee61964695112fef",
+  "fork_source_sha256": "e57ee880470f6dbcc36673051545f336cb688bb4618bf8cf5f978e61ebc05c78",
+  "overlay_sha256": "7900a531be8dc1d1ea9b7a8105ffdce0bb71219de6496d7fad1e25a357213373",
   "guest_source_sha256": {
     "user/go/pdf": "7c6537f514c8b804097847f891801902a1a2e3f988e76315e49dbb15084e4af3",
     "user/go/vector": "deac3edcb133999446289ff400c2d469aeab6d4f7c61a872b1ce159aec835f94",
-    "user/go/vi": "32b6429a38f274b5c07116cf9843e4aeacd25887097e848a90880f520e866333",
-    "user/go/vsys": "e3ad0d6dd8f330ab7abceff223a29783bee79ab270eb7c41bbe498b68db41e10"
+    "user/go/vi": "5dd95233cba598336fd519c71727bdb737f21b832f50c954cdd5c53b468c9b74",
+    "user/go/vsys": "91db2795a9d5e7bc58fcb7f45432ad065e768c42d3f6b980260cad852694307b"
   },
   "adapter_and_build_sha256": {
     "adapter.go": "498163ee1e385a0b215df53048115b96b21f4b65456e5246ea384187534fc4d1",

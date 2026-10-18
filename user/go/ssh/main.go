@@ -19,14 +19,6 @@ const (
 	knownHostsPath = "SSH/KNOWN_HOSTS"
 )
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the
-// page boundary for the kernel's packed argv+envp (see GOSH.ELF).
-var argvEnvpGuard [0x11b0]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
-
 func main() {
 	args := vi.Args()
 	if len(args) > 0 {

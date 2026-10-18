@@ -30,8 +30,10 @@ const (
 	// asserts `user-exec exited status=43`, so the successor keeps it.
 	exitQuit = 43
 
-	// maxPathLen mirrors VIEW.BIN's argv bound ("argv slots are 32 bytes").
-	maxPathLen = 32
+	// maxPathLen is the usable bytes of one kernel argv slot (M71m:
+	// arg_slot_bytes 256 - 1 for the NUL); vi.ExecArgMax names the same
+	// bound. The kernel refuses a longer argv before this process starts.
+	maxPathLen = vi.ExecArgMax
 
 	markerOpen        = "gview: open id="
 	markerTabAware    = "gview: tab-aware (full-viewport)"

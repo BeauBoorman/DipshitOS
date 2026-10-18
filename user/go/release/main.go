@@ -24,15 +24,6 @@ import (
 	"virelai/vsys"
 )
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the
-// page boundary for the kernel's packed argv+envp (GOBUILD.ELF / FLINT.ELF
-// carry the same guard).
-var argvEnvpGuard [0x1000]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
-
 func main() {
 	argv := vi.Args()
 	if len(argv) == 0 && runtime.GOOS != "virelai" {
