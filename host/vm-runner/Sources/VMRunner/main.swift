@@ -33,10 +33,15 @@
 //          (validateSaveRestoreSupport + the full cycle); a refusal is
 //          printed as `VZ-RESTORE: validateSaveRestoreSupport REFUSED ...`
 //          before the error exit.
-//         [--vsock [--vsock-port <n>]] (M115a, #2460: attach Apple's
+//         [--vsock [--vsock-port <n>] [--vsock-ctl [--vsock-ctl-port <n>]]]
+//          (M115a, #2460: attach Apple's
 //          VZVirtioSocketDevice and arm a host listener on port <n>,
 //          default 1208. A guest connect to that port is accepted and
-//          printed as `VSOCK: listener accepted guest connect ...`.)
+//          printed as `VSOCK: listener accepted guest connect ...`.
+//          M115b, #2461: --vsock-ctl arms the virelai-ctl/1 endpoint on
+//          --vsock-ctl-port, default 1209 — the HMAC-challenged
+//          suspend/snapshot wire, keyed by the share's vsock-ctl
+//          SECRETS.TXT row; no row, no listener.)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -419,6 +424,7 @@ import VMDiskImage
 import VMGPU3D
 import VMPostmortem
 import VMTcp
+import VSCtl
 import VSNTP
 import VSSH
 
@@ -610,6 +616,13 @@ var virtioFSShareDir: String?
 var vsockEnabled = false
 var vsockPort: UInt32 = 1208
 var vsockPortSet = false
+// M115b (#2461, ADR 0056): the virelai-ctl/1 control channel on the same
+// device. `--vsock-ctl` arms a second listener on `--vsock-ctl-port`
+// (default 1209) that serves the HMAC-challenged suspend/snapshot wire;
+// the credential is the share's `vsock-ctl` SECRETS.TXT row (uid_system).
+var vsockCtlEnabled = false
+var vsockCtlPort: UInt32 = VSCtl.defaultPort
+var vsockCtlPortSet = false
 var cpuCount = 2
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
@@ -1227,8 +1240,8 @@ while idx < arguments.count {
         let valued = ["--overlay-base", "--vars", "--serial", "--cpus", "--timeout",
                       "--vz-restore-save", "--vz-restore-load", "--vz-restore-witness",
                       "--vz-restore-verify-command", "--vz-restore-verify-output",
-                      "--usb-msd", "--virtio-fs", "--vsock-port"]
-        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock"]
+                      "--usb-msd", "--virtio-fs", "--vsock-port", "--vsock-ctl-port"]
+        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock", "--vsock-ctl"]
         guard valued.contains(arg) || bare.contains(arg) else {
             fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal, --vsock.")
         }
@@ -1374,6 +1387,16 @@ while idx < arguments.count {
         }
         vsockPort = port
         vsockPortSet = true
+        idx += 2
+    } else if arg == "--vsock-ctl" {
+        vsockCtlEnabled = true
+        idx += 1
+    } else if arg == "--vsock-ctl-port", idx + 1 < arguments.count {
+        guard let port = UInt32(arguments[idx + 1]), port != 0 else {
+            fail("--vsock-ctl-port requires a numeric port value in 1...4294967294.")
+        }
+        vsockCtlPort = port
+        vsockCtlPortSet = true
         idx += 2
     } else if arg == "--cpus", idx + 1 < arguments.count {
         guard let n = Int(arguments[idx + 1]), n >= 1, n <= 8 else {
@@ -2167,6 +2190,12 @@ if vzRestore, !timeout.isFinite || timeout <= 0 || timeout > 600 {
 }
 if vsockPortSet, !vsockEnabled {
     fail("--vsock-port requires --vsock (the port names the host listener on the attached device).")
+}
+if vsockCtlEnabled, !vsockEnabled {
+    fail("--vsock-ctl requires --vsock (the control channel rides the same socket device).")
+}
+if vsockCtlPortSet, !vsockCtlEnabled {
+    fail("--vsock-ctl-port requires --vsock-ctl.")
 }
 if vzRestoreWitness != nil, !vzRestore {
     fail("--vz-restore-witness requires --vz-restore.")
@@ -3628,6 +3657,10 @@ final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
 // itself must outlive the VM's socket device for connects to keep landing.
 let vsockListenerDelegate = VsockListenerDelegate()
 let vsockListener = VZVirtioSocketListener()
+// M115b (#2461): the ctl listener + its credential-bearing delegate are
+// created at arm time (the key only exists once the share dir is known).
+var vsockCtlDelegate: VSockCtlListenerDelegate?
+let vsockCtlListener = VZVirtioSocketListener()
 
 // Held strongly: `VZVirtualMachine.delegate` is a weak property, so a
 // temporary would be deallocated immediately and never called.
@@ -4012,6 +4045,21 @@ runner.queue.async {
             vsockListener.delegate = vsockListenerDelegate
             socketDevice.setSocketListener(vsockListener, forPort: vsockPort)
             print("VSOCK: host listener armed port=\(vsockPort)")
+            // M115b (#2461, ADR 0056): the ctl endpoint is fail-closed —
+            // no `vsock-ctl` share credential, no listener, and a guest
+            // connect then gets the honest RST of an unlistened port.
+            if vsockCtlEnabled {
+                if let dir = cvcFileShareDir,
+                   let key = VSCtl.loadKey(shareDir: URL(fileURLWithPath: dir, isDirectory: true)) {
+                    let delegate = VSockCtlListenerDelegate(key: key)
+                    vsockCtlDelegate = delegate
+                    vsockCtlListener.delegate = delegate
+                    socketDevice.setSocketListener(vsockCtlListener, forPort: vsockCtlPort)
+                    print("VSOCK-CTL: host listener armed port=\(vsockCtlPort)")
+                } else {
+                    print("VSOCK-CTL: refuse no_credential (no vsock-ctl row in the armed share's SECRETS.TXT)")
+                }
+            }
         } else {
             FileHandle.standardError.write(Data("ERROR: --vsock was attached but no VZVirtioSocketDevice is present on the VM.\n".utf8))
             exit(1)

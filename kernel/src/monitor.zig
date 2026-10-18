@@ -45,6 +45,7 @@ pub const virtio_net = @import("virtio_net.zig"); // milestone five card N1 (cla
 pub const virtio_gpu = @import("virtio_gpu.zig"); // milestone six card G1 (claim 6053): the gpu transport + framebuffer behind `screen`
 pub const virtio_snd = @import("virtio_snd.zig"); // milestone fifteen card A1 (claim 6140): the virtio-snd transport behind `sound`
 pub const virtio_vsock = @import("virtio_vsock.zig"); // M115a (issue #2460): the virtio-vsock transport behind `vsock`
+const vsock_ctl = @import("vsock_ctl.zig"); // M115b (issue #2461, ADR 0056): the `vsock ctl` control-channel client
 pub const road_pops = @import("road_pops.zig"); // milestone six card G3 (claim 1574): the Road Pops tee console behind `roadpops`
 pub const fbtext = @import("text.zig"); // milestone six card G2 (claim 3194): framebuffer text rendering behind `text`
 pub const xhci = @import("xhci.zig"); // milestone seven card I1 (claim 4272): the XHCI host-controller transport behind `usb`
@@ -356,7 +357,7 @@ pub fn ensure_registry() []const Command {
             .{ .name = "netsend", .dom = svclock.dom_bit(.net), .help = "send a known Ethernet frame (bounded staging, TX + used-ring drain)", .usage = "netsend <bytes>", .category = .networking, .min_args = 1, .max_args = 1, .handler = cmd_netsend },
             .{ .name = "pages", .help = "physical page allocator pool", .usage = "pages [selftest]", .category = .memory_state, .max_args = 1, .handler = cmd_pages },
             .{ .name = "pci", .help = "enumerate PCI devices on the bus", .usage = "pci", .category = .memory_state, .handler = cmd_pci },
-            .{ .name = "vsock", .help = "virtio-vsock transport + connect probe (M115a): 'vsock' reports the arm state, 'vsock <port>' connects to the host listener and reports connected/refused/timeout", .usage = "vsock [<port>]", .category = .networking, .max_args = 1, .handler = cmd_vsock },
+            .{ .name = "vsock", .help = "virtio-vsock transport (M115a/b): 'vsock' reports the arm state, 'vsock <port>' connects to the host listener and reports connected/refused/timeout, 'vsock ctl <verb>' runs one control-channel session", .usage = "vsock [<port>] | vsock ctl [badauth|replay|dup] <verb> [name]", .category = .networking, .max_args = 4, .handler = cmd_vsock },
             .{ .name = "procs", .help = "process registry: image, address space, lifecycle, exit status", .usage = "procs", .category = .tasks_processes, .max_args = 2, .handler = cmd_procs },
             .{ .name = "random", .help = "print n random bytes from the seeded CSPRNG (hex)", .usage = "random [n]", .category = .system, .max_args = 1, .handler = cmd_random },
             .{ .name = "resources", .help = "fixed-pool audit: scheduler tasks, process registry, windows, page-table carve-out, and per-process ring bounds", .usage = "resources", .category = .memory_state, .handler = cmd_resources },
@@ -2536,6 +2537,15 @@ fn cmd_clip(m: *Monitor, args: []const []const u8) ExecError {
 /// — the degraded verdict a broken restore would produce). Absent/unarmed
 /// device reports honestly.
 fn cmd_vsock(m: *Monitor, args: []const []const u8) ExecError {
+    // M115b (#2461, ADR 0056): `vsock ctl [badauth|replay|dup] <verb>
+    // [name]` runs one virelai-ctl/1 session against the runner's
+    // --vsock-ctl-port listener — connect, HMAC-challenge auth, request
+    // line, reply verdict, shutdown. The exercise modes exist for the
+    // gate's auth negatives.
+    if (args.len > 0 and std.mem.eql(u8, args[0], "ctl")) {
+        vsock_ctl.run(m.console, args[1..]);
+        return .none;
+    }
     if (!virtio_vsock.vs_ready) {
         m.console.print_line("vsock: absent (no virtio-vsock device armed)");
         return .none;
