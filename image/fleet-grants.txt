@@ -1,0 +1,60 @@
+# Fleet grant policy — M116a (#2467), ADR 0054 Part II base rows.
+#
+# One line per shipped app:
+#
+#   NAME <TAB> OBSERVED <TAB> MASK <TAB> REASON
+#
+#   NAME      the exec-recorded image name (a GRANTS.TXT row key).
+#   OBSERVED  the words the app called under the M113f audit (#2422,
+#             comment-6243607948: 29 apps, one confined `NAME<TAB>*<TAB>-`
+#             boot each, `audit:<word>_denied` receipts = calls made), or
+#             `-` when the audit could not run it.
+#   MASK      the authored grant word set, in vocabulary order
+#             (file window audio timer memory process debug net term).
+#   REASON    `-` when MASK == OBSERVED; otherwise the named reason the
+#             mask is wider than observed — the card's rule is mask ⊇
+#             observed and never wider without a named reason.
+#
+# Every row is `*`-bound (name-only, narrow-only): these become compiled
+# base rows (kernel/src/grant_fleet.zig, GENERATED — do not hand-edit;
+# regenerate with `python3 tools/grants/fleet_grants.py emit`), verified
+# by the Part I boot chain — a different table is a different KERNEL.BIN
+# digest. Wildcard is the audit data's own suggested shape; a `*` row can
+# only narrow, so a renamed binary can only lose power, never gain.
+#
+# Provenance key for REASON: "audit note" cites the M113f table's own
+# notes; "declared" cites the app's apps.txt caps=/opens= contract;
+# "surface" cites vi.*/sys_* call sites in the app's source for paths the
+# 35 s audit window could not reach.
+
+GOCALC.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+NOTE.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+GOEDIT.ELF	window,memory,process,debug	file,window,memory,process,debug	opens=text,binary handler contract; no file was handed in the audit window
+GOFILES.ELF	window,memory,process,debug	file,window,memory,process,debug	declared caps=file; a file manager whose file ops were unexercised in the audit window is broken under enforce
+GOTERM.ELF	window,memory,process,debug	window,memory,process,debug,term	audit note: GOTERM never reached its term path — the window open fails first under the no-seat shim; a terminal emulator's own word is term
+WEB.ELF	window,memory,process,debug	window,memory,process,debug,net	declared caps=net + opens=http,https; no fetch was driven in the audit window
+PULSE.ELF	window,memory,process,debug	file,window,timer,memory,process,debug,term	surface: FileOpen/FileRead + TtyAttach + EvTimer call sites (user/go/pulse)
+GOSH.ELF	file,memory,process,debug	file,memory,process,debug,term	declared caps=file,process,term; audited via -c only — the interactive path was not exercised
+GOHELP.ELF	window,memory,process,debug	file,window,memory,process,debug,term	surface: ReadFileAll for help topics + TtyAttach for the tty pane (user/go/help)
+GOTOP.ELF	file,window,memory,process,debug	file,window,memory,process,debug,net	surface: NetStats* pane — slot 62 sys_net_stats is net-grouped (user/go/top)
+GOSET.ELF	window,memory,process,debug	file,window,memory,process,debug	declared caps=file; the settings-write path was not exercised in the audit window
+GODIFF.ELF	memory,process,debug	file,memory,process,debug	declared caps=file; a diff tool reads both inputs
+GOVIEW.ELF	window,memory,process,debug	file,window,memory,process,debug	opens=image handler contract; no image was handed in the audit window
+GOSOUND.ELF	window,memory,process,debug	file,window,audio,memory,process,debug	declared caps=file,window,audio + opens=audio; playback was not exercised
+GOSTORE.ELF	window,memory,process,debug	file,window,memory,process,debug,net	declared caps=file,net; the install/fetch path (Dial + WriteFileSafe) was not exercised
+GOTABWM.ELF	window,memory,process,debug	file,window,audio,memory,process,debug,net	surface: the seat reads /host/APPS.TXT + settings (File*/ReadFileAll), drives AudioStream*, and holds the Listen/TCP* remote lane (user/go/gotabwm)
+GOSTALGIA.ELF	window,memory,process,debug	file,window,memory,process,debug,term	declared caps=file,window,term,process; argv=shell --root /host/GS reads ROM files and the tty win_open was refused under the no-seat shim
+GOFETCH.ELF	memory,process,debug,net	file,memory,process,debug,net	surface: WriteFileSafe output path (user/go/fetch)
+GOPING.ELF	memory,process,debug,net	memory,process,debug,net	-
+GOHTTPD.ELF	memory,process,debug,net	file,memory,process,debug,net	surface: FileOpen/FileRead — the daemon serves files (user/go/httpd)
+GOSSHD.ELF	memory,process,debug	file,memory,process,debug,net	audit note: exit 1 — refuses before bind without hostkey, so SocketListen (net) and ReadFileAll/FileDelete (file) never ran
+GOBUILD.ELF	memory,process,debug	file,memory,process,debug	audit note: usage exit — startup words only; the build path opens sources and writes objects (FileOpen)
+FLINT.ELF	memory,process,debug	file,memory,process,debug,net	audit note: usage exit — startup words only; workspace File* ops and Dial remote streams (user/go/flint)
+STORE.ELF	memory,process,debug	file,memory,process,debug,net	audit note: usage exit — startup words only; the install path is Dial + WriteFileSafe (user/go/store)
+AGENTD.ELF	memory,process,debug	file,window,memory,process,debug,net	audit note: refuse no-credential — startup words only; Listen/TCP* lanes, File* verb ops, WinOpen session UI (user/go/agentd)
+INIT.ELF	memory,process,debug	file,memory,process,debug	audit note: argv-refusal path — startup words only; ReadFileAll config read (user/go/init)
+GOHELLO.ELF	memory,process,debug	memory,process,debug	-
+GOINFER.ELF	-	file,memory,process,debug	not audited — M111c landed after the M113f run; declared caps=file + the observed Go-runtime ambient set (debug,memory,process); surface File*/WriteFileSafe
+GOSSH.ELF	-	file,memory,process,debug,net	uncollectable — audit note: build-ssh fails its argv+envp slack check (pre-existing); vi.Dial (net) + ReadFileAll known_hosts/secrets (file) + ambient
+ZC.BIN	file,debug	file,memory,process,debug	declared caps=file,memory,process; the audit's bare invocation never reached a compile
+TABWM.BIN	window	window,memory,process,debug	fallback seat: the no-seat shim left it a one-word app; its call surface is sys_exec + sys_mmap + sys_wmctl + sys_write (user/src/tabwm.zig)
