@@ -870,12 +870,33 @@ print("the restore request is a ONE-SHOT: consumed by the boot 09 refusal, "
       "and boot 09 armed nothing, so it is gone from the share")
 PY
 
+# Between-run pin for boot 10 (M120b #2559): the session file a boot
+# restores is LIVE now — every backed row re-execs — so the file is staged
+# deterministically here rather than inherited from whichever write the
+# earlier boots happened to leave. One Calc row, the same `.tabs` v2
+# encoding live-vz-restore's fixture writes: the boot's `session load`
+# marker still fires, the starter stays suppressed, and the re-exec itself
+# provides the subscribed calculator the proof needs — a scripted second
+# exec would double it (gocalc: open id= is asserted exactly once).
+vgate_assert 09 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+session = (bytes([2, 1, 1, 0, 0, 0]) +
+           b"Calc".ljust(32, b"\0") + bytes([0]) + bytes(12) +
+           b"GOCALC.ELF".ljust(24, b"\0"))
+with open(os.path.join(share, "SESSION.TABS"), "wb") as f:
+    f.write(session)
+print("between-run pin: SESSION.TABS = one backed Calc row for boot 10 "
+      "(restored session -> live re-exec, not a scripted duplicate)")
+PY
+
 # --- M82b (#1769): settings broadcast reaches a live second app -------------
-# Boot 01's hosted app already persisted a session, so the rebooted default
-# seat does not auto-open the first-boot GOSH workspace. Boot 10 therefore has
-# exactly the two apps this proof needs: GOSET writes theme=light while GOCALC
-# remains live and subscribed to theme. SETTINGS.TXT is still the persistent
-# source of truth; the WM_RPC notice only names the changed key.
+# A persisted session means the rebooted default seat does not auto-open the
+# first-boot GOSH workspace — and under M120b the restore's own re-exec is
+# what puts GOCALC on the strip, subscribed to theme. GOSET is the second
+# app, scripted as before: it writes theme=light while GOCALC remains live.
+# SETTINGS.TXT is still the persistent source of truth; the WM_RPC notice
+# only names the changed key.
 vgate_file script-10.txt <<'EOF'
 settings set wm gotabwm
 settings set keyboard_layout us
@@ -885,7 +906,6 @@ EOF
 
 vgate_file script-10-seat.txt <<'EOF'
 dui focus 0
-exec GOCALC.ELF
 EOF
 
 vgate_file script-10-publish.txt <<'EOF'
