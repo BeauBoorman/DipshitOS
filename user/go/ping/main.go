@@ -273,7 +273,7 @@ func runPing(cfg pingArgs) {
 		}
 		got := false
 		var rtt uint32
-		for polls := 0; polls < 50; polls++ {
+		for polls := 0; polls < 200; polls++ {
 			p := vi.PingPoll()
 			if p != 0 && p != prev {
 				got = true
