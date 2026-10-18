@@ -1,16 +1,16 @@
 //go:build !virelai
 
-package main
+package fatimg
 
 import "os"
 
-// osSink is the host seqSink used by tests and dev runs: a plain file.
+// osSink is the host SeqSink used by tests and dev runs: a plain file.
 type osSink struct {
 	f   *os.File
 	pos uint64
 }
 
-func newSeqSink(path string) (seqSink, error) {
+func NewSeqSink(path string) (SeqSink, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err

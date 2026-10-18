@@ -99,6 +99,12 @@ public struct VMProfile: Equatable {
         /// given (typically absolute); a relative path resolves against the
         /// runner's working directory.
         public var baseImage = "artifacts/disk.img"
+        /// M115f (#2465): the pinned Ed25519 public key (64 lowercase hex)
+        /// that may sign this machine's staged OS updates. Bundle-side,
+        /// guest-unreachable — the share the guest writes cannot move the
+        /// pin. Empty = no key configured; --apply-update then needs
+        /// --update-key.
+        public var updatePubkey: String?
         public var devices = Devices()
 
         public init() {}
@@ -115,6 +121,7 @@ public struct VMProfile: Equatable {
             cpus = try c.decodeIfPresent(Int.self, forKey: .cpus) ?? 2
             memoryMiB = try c.decodeIfPresent(Int.self, forKey: .memoryMiB) ?? 256
             baseImage = try c.decodeIfPresent(String.self, forKey: .baseImage) ?? "artifacts/disk.img"
+            updatePubkey = try c.decodeIfPresent(String.self, forKey: .updatePubkey)
             devices = try c.decodeIfPresent(Devices.self, forKey: .devices) ?? Devices()
         }
     }

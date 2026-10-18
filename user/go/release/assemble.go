@@ -14,7 +14,7 @@ package main
 //              recorded guest= sha256, then add APPS.TXT, SETTINGS.TXT, the
 //              driver itself, and the share assets that are present.
 //   image    — stream the GPT+FAT32 boot volume to the share through the
-//              seqSink (image.go; kernel FAT stays read-only by design).
+//              fatimg.SeqSink (fatimg; kernel FAT stays read-only by design).
 //   manifest — write RELEASE.MF (share root and inside the bundle).
 //
 // `gorelease assemble` skips the fleet phase (the fleet products are
@@ -23,11 +23,11 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
-	"hash"
 	"os"
 	"path"
 	"strconv"
 
+	"virelai/fatimg"
 	"virelai/vsys"
 )
 
@@ -300,12 +300,12 @@ func runAssemble(cfg relCfg) int {
 		itoa(built) + " fleet, " + itoa(assets) + " assets)")
 
 	// --- image: the GPT+FAT32 boot volume, streamed to the share ----------
-	sink, err := newSeqSink(cfg.Image)
+	sink, err := fatimg.NewSeqSink(cfg.Image)
 	if err != nil {
 		return failPhase("image", err)
 	}
-	hw := &hashSink{s: sink, h: sha256.New()}
-	imgBytes, err := writeImage(hw, efiBytes, kernelBytes, cfg.SizeMB)
+	hw := &fatimg.HashSink{Sink: sink, H: sha256.New()}
+	imgBytes, err := fatimg.WriteImage(hw, efiBytes, kernelBytes, cfg.SizeMB)
 	if err != nil {
 		sink.Close()
 		return failPhase("image", err)
@@ -313,7 +313,7 @@ func runAssemble(cfg relCfg) int {
 	if err := sink.Close(); err != nil {
 		return failPhase("image", fmt.Errorf("close %s: %w", cfg.Image, err))
 	}
-	imgSum := fmt.Sprintf("%x", hw.h.Sum(nil))
+	imgSum := fmt.Sprintf("%x", hw.H.Sum(nil))
 	vsys.Println("release: image " + path.Base(cfg.Image) +
 		" bytes=" + strconv.FormatUint(imgBytes, 10) + " sha256=" + imgSum)
 
@@ -339,41 +339,6 @@ func runAssemble(cfg relCfg) int {
 	vsys.Println("release: release OK image=" + strconv.FormatUint(imgBytes, 10) +
 		" bundle=" + itoa(len(rows)) + " files")
 	return 0
-}
-
-// hashSink tees the image stream through sha256 — the manifest records the
-// digest of exactly what was written, zeros included.
-type hashSink struct {
-	s   seqSink
-	h   hash.Hash
-	pos uint64
-}
-
-func (w *hashSink) Write(b []byte) (int, error) {
-	n, err := w.s.Write(b)
-	if n > 0 {
-		w.h.Write(b[:n])
-		w.pos += uint64(n)
-	}
-	return n, err
-}
-
-func (w *hashSink) Close() error { return w.s.Close() }
-
-func (w *hashSink) ZeroPad(to uint64) error {
-	if to < w.pos {
-		return fmt.Errorf("zeropad %d behind position %d", to, w.pos)
-	}
-	var zero [8192]byte
-	for w.pos < to {
-		n := uint64(len(zero))
-		if to-w.pos < n {
-			n = to - w.pos
-		}
-		w.h.Write(zero[:n])
-		w.pos += n
-	}
-	return w.s.ZeroPad(to)
 }
 
 func itoa(v int) string { return strconv.Itoa(v) }

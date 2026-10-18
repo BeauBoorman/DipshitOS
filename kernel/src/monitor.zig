@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const osver = @import("osver.zig"); // M115f (#2465): the build-stamped OS version sysinfo reports
 pub const alloc = @import("alloc.zig");
 pub const console = @import("console.zig");
 pub const esp_exec = @import("exec.zig"); // claim 6783: load a user program from the host share and enter it at EL0
@@ -870,6 +871,12 @@ fn cmd_sysinfo(m: *Monitor, args: []const []const u8) ExecError {
     } else {
         m.console.print_line("invalid");
     }
+
+    // OS identity — M115f (#2465): the build-stamped version label
+    // (-Dos-version). An applied update carries a new label, so the
+    // version line is the in-guest proof the base image changed.
+    m.console.puts("  os:         version=");
+    m.console.print_line(osver.label);
 
     // CPU & Timer
     m.console.puts("  cpu:        arch=aarch64 timer_armed=");

@@ -115,6 +115,11 @@ pub fn build(b: *std.Build) void {
     // module is linker-eliminated from default builds (byte-identical).
     const walk_probe = b.option(bool, "walk-probe", "Diagnostic: post-switch walk-validity probe battery with per-probe NVRAM markers (claim 7896; default off)") orelse false;
     const kernel_options = b.addOptions();
+    // M115f (#2465): the OS version label the kernel stamps into `sysinfo`.
+    // The self-update channel ships a KERNEL.BIN built with a different
+    // -Dos-version, so an applied update is visible inside the guest.
+    const os_version = b.option([]const u8, "os-version", "OS version label stamped into the kernel; `sysinfo` reports it as version= (default \"dev\")") orelse "dev";
+    kernel_options.addOption([]const u8, "os_version", os_version);
     kernel_options.addOption(bool, "nvram_console", nvram_console);
     kernel_options.addOption(bool, "probe_var", probe_var);
     kernel_options.addOption(bool, "preexit_tx", preexit_tx);

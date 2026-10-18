@@ -169,6 +169,7 @@ const marker_seam = evidence.marker_seam;
 // false and the virtio TX path is byte-identical.
 const build_options = @import("build_options");
 const nvram_console = @import("nvram_console.zig");
+const osver = @import("osver.zig"); // M115f (#2465): the -Dos-version label `sysinfo` reports
 
 // Claim 0021: firmware MMU-state capture (default off; the default build is
 // byte-identical). Records the firmware's live MMU registers and a bounded
@@ -265,6 +266,11 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // seconds) so userspace has a real system clock with or without a host
     // share. `no_boot_epoch` keeps the honest uptime fallback.
     timer.set_boot_epoch_secs(handoff_rec.boot_epoch_secs);
+
+    // M115f (#2465): publish the build-stamped OS version (-Dos-version)
+    // for `sysinfo` — an applied update carries a new label, so the
+    // version line is the in-guest proof the base image changed.
+    osver.label = build_options.os_version;
 
     print_pre_exit_error(st, "VirelaiOS: kernel entered\r\n");
     evidence.set_marker(marker_entry);
