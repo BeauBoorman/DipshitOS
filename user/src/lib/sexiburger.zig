@@ -922,7 +922,7 @@ test "sexiburger manifest: the real image/apps.txt decodes whole under the v1 fo
     // additive change is invisible to the Zig seats.
     var out: [64]MenuApp = undefined;
     const n = parse_apps_manifest(text, &out);
-    try std.testing.expectEqual(@as(usize, 19), n);
+    try std.testing.expectEqual(@as(usize, 20), n);
 
     // The dock set is what the mirrors claim about this file. WND.BIN's
     // god-menu selection test says "8 dock + dup stems past the cutoff" and
