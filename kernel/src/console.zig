@@ -77,6 +77,19 @@ pub const Console = struct {
         self.write("\n");
     }
 
+    /// Format one whole line into a bounded stack buffer and emit it as a
+    /// SINGLE write. A line assembled over several `write` calls can be
+    /// interrupted mid-composition by a foreign writer on another core —
+    /// the M119f K-pass console defect (#2649; the claim-881-slice-4 rule
+    /// already applied open-coded in the scheduler drains) — so lines the
+    /// live gates grep on are built once and written once. An oversized
+    /// format drops the line honestly at the bounded buffer.
+    pub fn linef(self: Console, comptime fmt: []const u8, args: anytype) void {
+        var buf: [384]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        self.write(line);
+    }
+
     pub fn flush(self: Console) void {
         self.vtable.flush(self.ctx);
     }

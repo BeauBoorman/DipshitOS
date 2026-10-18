@@ -91,8 +91,14 @@ def tid(name):
             if m:
                 return m.group(1)
     return None
+# Legacy intent: the phase-3 task REUSES a freed slot rather than growing
+# the table. The pin used to name the counter's own slot, but the boot
+# user-el0 payload's slot frees first (its reap lands between the phases),
+# so the allocator's lowest-free pick may be either — observed USER.BIN on
+# task 2 while COUNTER.BIN held 3 (#2649). `ut <= ct` proves no fresh slot
+# grew past the old high-water mark, i.e. a freed slot was reused.
 ct, ut = tid("COUNTER.BIN"), tid("USER.BIN")
-if ct is None or ut is None or ct != ut:
-    sys.exit("FAIL: slot not reused counter=%s user=%s" % (ct, ut))
+if ct is None or ut is None or int(ut) > int(ct):
+    sys.exit("FAIL: no freed slot reused counter=%s user=%s" % (ct, ut))
 print("kill markers + recovery + slot ok")
 PY
