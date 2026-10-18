@@ -53,11 +53,18 @@ public enum VSCtl {
         "io_error": "transport failure",
         // M115d (#2463): the suspend verb's refusal names — a request
         // with no armed destination, a device set VZ cannot save, a
-        // failed save, and a suspend already in flight.
-        "no_state": "no suspend save destination is armed",
+        // failed save, and a suspend already in flight. M115e (#2464)
+        // reuses them for snapshot/restore and adds two of its own.
+        "no_state": "no save destination is armed",
         "unsupported": "this device set cannot be saved",
         "save_failed": "the machine-state save refused",
         "busy": "a suspend is already in flight",
+        // M115e (#2464): named-snapshot refusals — a snapshot that is
+        // already stored is never silently overwritten (the consent path
+        // is `rm` first), and a restore of a name the share does not
+        // hold refuses by name.
+        "exists": "a snapshot by that name already exists",
+        "not_found": "no snapshot by that name",
     ]
 
     /// Load the `vsock-ctl` row's value from the share's SECRETS.TXT —
@@ -253,10 +260,26 @@ public struct CTLSession {
     /// Nil keeps the M115b stub answer (`unimplemented`).
     public var suspendHandler: (() -> SuspendVerdict)?
 
+    /// M115e (#2464): the named-snapshot drivers, injected the same way.
+    /// `snapshot` parks the RUNNING machine's state on the share as
+    /// `SNAPSHOTS/<name>.vzsave` and then continues it; `restore` stages
+    /// a named file as the next `--resume` target. Nil keeps the M115b
+    /// stub answer (`unimplemented`).
+    public var snapshotHandler: ((String) -> SuspendVerdict)?
+    public var restoreHandler: ((String) -> SuspendVerdict)?
+
     /// Set when the last judged request was an ACCEPTED suspend — the
     /// transport's post-reply hook (write-then-stop) reads it. Reset on
     /// every feed.
     public private(set) var acceptedSuspend = false
+
+    /// Set when the last judged request ran the snapshot driver, accept
+    /// or refuse — the transport's post-reply hook (write-then-resume)
+    /// reads it. The reply ordering is the suspend contract: the verdict
+    /// is on the wire before the machine continues, so a `--resume` of
+    /// this image finds its answer already delivered. Reset on every
+    /// feed.
+    public private(set) var answeredSnapshot = false
 
     /// The session's 32-byte challenge is injected — the glue supplies
     /// SecRandomCopyBytes; tests pin it.
@@ -331,7 +354,7 @@ public struct CTLSession {
             return (errorLine("auth_failed", id: nil), true)
         }
         authed = true
-        return (Data("{\"ok\":true,\"session\":\"ready\",\"verbs\":[\"suspend\",\"snapshot\"]}\n".utf8), false)
+        return (Data("{\"ok\":true,\"session\":\"ready\",\"verbs\":[\"suspend\",\"snapshot\",\"restore\"]}\n".utf8), false)
     }
 
     /// `name` passes the ADR 0044 NAME grammar: 1-31 bytes of
@@ -351,6 +374,7 @@ public struct CTLSession {
 
     private mutating func feedRequest(line: String) -> (Data, Bool) {
         acceptedSuspend = false
+        answeredSnapshot = false
         let obj: [String: FlatValue]
         switch FlatParse.object(line) {
         case .ok(let o): obj = o
@@ -392,16 +416,46 @@ public struct CTLSession {
             guard case .str(let name) = obj["name"] else {
                 return (errorLine("bad_request", id: nil), false)
             }
+            lastID = id
             guard validName(name) else {
-                lastID = id
                 return (errorLine("name_rejected", id: id), false)
             }
+            // M115e (#2464): the armed verb asks the injected driver —
+            // pause, save `SNAPSHOTS/<name>.vzsave` on the share, reply
+            // ok while the guest is still frozen, then resume (the glue's
+            // post-reply hook). A nil handler is the M115b stub posture.
+            if let snapshotHandler {
+                let verdict = snapshotHandler(name)
+                answeredSnapshot = true
+                guard verdict.accepted else {
+                    return (errorLine(verdict.code, id: id), false)
+                }
+                return (Data("{\"id\":\(id),\"ok\":true,\"result\":{\"verb\":\"snapshot\",\"name\":\"\(name)\",\"state\":\"saved\"}}\n".utf8), false)
+            }
+            return (errorLine("unimplemented", id: id), false)
+        case "restore":
+            // M115e (#2464): stage a named share snapshot as the next
+            // `--resume` target — a host-side copy over the profile's
+            // saved-state file, the one path the resume guard reads. The
+            // running machine is untouched; the rewind happens next boot.
+            guard case .str(let name) = obj["name"] else {
+                return (errorLine("bad_request", id: nil), false)
+            }
+            lastID = id
+            guard validName(name) else {
+                return (errorLine("name_rejected", id: id), false)
+            }
+            if let restoreHandler {
+                let verdict = restoreHandler(name)
+                guard verdict.accepted else {
+                    return (errorLine(verdict.code, id: id), false)
+                }
+                return (Data("{\"id\":\(id),\"ok\":true,\"result\":{\"verb\":\"restore\",\"name\":\"\(name)\",\"state\":\"staged\"}}\n".utf8), false)
+            }
+            return (errorLine("unimplemented", id: id), false)
         default:
             lastID = id
             return (errorLine("unknown_verb", id: id), false)
         }
-        lastID = id
-        // M115b wires the channel; M115d/e arm the actions.
-        return (errorLine("unimplemented", id: id), false)
     }
 }
