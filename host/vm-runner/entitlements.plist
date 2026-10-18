@@ -5,5 +5,13 @@
     <!-- Required to use Virtualization.framework on recent macOS releases. -->
     <key>com.apple.security.virtualization</key>
     <true/>
+    <!-- M117d (#2476, ADR 0057 D11): the net-bridged / net-vmnet flags
+         need com.apple.vm.networking / com.apple.developer.networking.vmnet.
+         Both are RESTRICTED entitlements on macOS 27: an ad-hoc-signed
+         binary carrying either is killed by amfid before main() (observed
+         2026-10-17, macOS 27.2: "The file is adhoc signed but contains
+         restricted entitlements"). They therefore live in the sibling
+         entitlements-net.plist for a development-signed build — this file
+         stays the ad-hoc-safe set every gate's codesign step depends on. -->
 </dict>
 </plist>

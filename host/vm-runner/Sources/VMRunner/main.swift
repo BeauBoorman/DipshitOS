@@ -250,6 +250,31 @@
 //          contract. OFF by default: without the flag
 //          config.networkDevices stays [] — every existing gate is
 //          byte-identical.)
+//         [--net-bridged <iface>] (M117d, issue #2476, ADR 0057 D11:
+//          attach one VZVirtioNetworkDeviceConfiguration with a
+//          VZBridgedNetworkDeviceAttachment on the named
+//          VZBridgedNetworkInterface — the guest sits on the host's real
+//          LAN (its own MAC, a real DHCP lease). OFF by default. Every
+//          missing piece refuses by name: an <iface> absent from
+//          VZBridgedNetworkInterface.networkInterfaces names itself; the
+//          com.apple.vm.networking entitlement absent from this binary's
+//          signature names itself (it is a RESTRICTED entitlement — an
+//          ad-hoc codesign cannot carry it; entitlements-net.plist is the
+//          set for a development-signed build). Mutually exclusive with
+//          --net/--net-nat/--net-vmnet — one network device per guest.)
+//         [--net-vmnet] (M117d, issue #2476, ADR 0057 D11: attach one
+//          VZVirtioNetworkDeviceConfiguration with a
+//          VZVmnetNetworkDeviceAttachment on a shared-mode vmnet logical
+//          network (vmnet_network_create, macOS 26+ — the daemon serves
+//          DHCP + NAT44/66 by default). OFF by default. A non-success
+//          vmnet_return_t from vmnet_network_create fails carrying the
+//          status and naming the com.apple.developer.networking.vmnet
+//          entitlement (or root) the daemon demands — also restricted,
+//          also in entitlements-net.plist. Same mutual exclusivity.
+//          [--net-vmnet-subnet <a.b.c.d>/<len>] pins the network's IPv4
+//          subnet (e.g. 192.168.77.0/24 — the daemon picks a rotating
+//          /24 under 192.168/16 otherwise). The address must be the
+//          network base. Requires --net-vmnet.)
 //         [--net-inject <file>] [--net-inject-after <text>] (milestone five
 //          card N2, claim 6076: the host->guest RX direction of the SAME
 //          --net attachment — the file's bytes are written into the socket
@@ -360,7 +385,15 @@ import DiskImageKit
 #endif
 import Foundation
 import ScreenCaptureKit
+import Security
 import Virtualization
+// M117d (#2476, ADR 0057 D11): vmnet.framework backs --net-vmnet. The
+// vmnet_network_* symbols are macOS 26+, so they exist wherever this
+// runner's deployment floor applies; the module-level guard keeps an
+// older-SDK toolchain compiling — the flag then refuses by name.
+#if canImport(vmnet)
+import vmnet
+#endif
 import VFWire
 import VMAppKit
 import VMDiskImage
@@ -1087,6 +1120,26 @@ var netTcpClients: [NetTcpClient] = []
 // VM is unchanged). Mutually exclusive with `--net` (one network device
 // per guest for now).
 var netNatEnabled = false
+// M117d (issue #2476, ADR 0057 D11): the opt-in real-LAN attachments.
+// `--net-bridged <iface>` attaches a VZBridgedNetworkDeviceAttachment on
+// the named VZBridgedNetworkInterface; `--net-vmnet` attaches a
+// VZVmnetNetworkDeviceAttachment on a shared-mode vmnet logical network
+// created up front (vmnet_network_create). Both are off by default,
+// mutually exclusive with --net/--net-nat/each other, and every missing
+// piece refuses by name — the absent interface, the absent
+// com.apple.vm.networking entitlement in this signature, or the
+// non-success vmnet_return_t the daemon returns when it lacks
+// com.apple.developer.networking.vmnet/root. netBridgedIface and
+// netVmnetNetwork hold the validated objects between flag checks and the
+// attachment assembly below.
+var netBridgedInterface: String?
+var netVmnetEnabled = false
+var netVmnetSubnet: (ip: [UInt8], prefixLen: Int)?
+var netBridgedIface: VZBridgedNetworkInterface?
+var netVmnetSubnetText: String?
+#if canImport(vmnet)
+var netVmnetNetwork: vmnet_network_ref?
+#endif
 
 // Issue #523 item 2 (claim 6637): run isolation.
 // `--overlay-base <path>`: open <path> READ-ONLY as the base of a
@@ -1867,6 +1920,29 @@ while idx < arguments.count {
     } else if arg == "--net-nat" {
         netNatEnabled = true
         idx += 1
+    } else if arg == "--net-bridged", idx + 1 < arguments.count {
+        netBridgedInterface = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--net-vmnet" {
+        netVmnetEnabled = true
+        idx += 1
+    } else if arg == "--net-vmnet-subnet", idx + 1 < arguments.count {
+        // <a.b.c.d>/<len> — the subnet base for the vmnet logical
+        // network (the daemon assigns a rotating /24 without it). Must be
+        // the network address: the daemon interprets the value literally
+        // and a non-base address is a silent different network.
+        let halves = arguments[idx + 1].split(separator: "/")
+        let parts = halves.count == 2 ? halves[0].split(separator: ".").compactMap { UInt8($0) } : []
+        guard halves.count == 2, let len = Int(halves[1]), (1...31).contains(len), parts.count == 4 else {
+            fail("--net-vmnet-subnet requires '<a.b.c.d>/<len>' like 192.168.77.0/24, got '\(arguments[idx + 1])'.")
+        }
+        let mv: UInt32 = ~UInt32(0) << (32 - len)
+        let av = UInt32(parts[0]) << 24 | UInt32(parts[1]) << 16 | UInt32(parts[2]) << 8 | UInt32(parts[3])
+        guard av & mv == av else {
+            fail("--net-vmnet-subnet: '\(arguments[idx + 1])' is not the network base (host bits set).")
+        }
+        netVmnetSubnet = (parts, len)
+        idx += 2
     } else {
         serialLogPath = arg
         idx += 1
@@ -2528,6 +2604,113 @@ if netTcpConnectSSHMode {
 if netNatEnabled, netCapturePath != nil {
     fail("--net-nat is mutually exclusive with --net (one network device per guest for now).")
 }
+// M117d (issue #2476, ADR 0057 D11): the opt-in real-LAN attachments get
+// the same one-network-device bound, then their own named refusals — the
+// absent interface names itself, the absent com.apple.vm.networking
+// entitlement names itself (checked in THIS signature: it is what VZ's
+// config.validate() consults), and a non-success vmnet_return_t carries
+// its status. Both keys are restricted entitlements an ad-hoc codesign
+// cannot carry (observed 2026-10-17, macOS 27.2: amfid kills the process
+// before main — "adhoc signed but contains restricted entitlements"), so
+// they live in host/vm-runner/entitlements-net.plist for a
+// development-signed build; entitlements.plist stays the ad-hoc-safe set.
+func runnerHasEntitlement(_ name: String) -> Bool {
+    guard let task = SecTaskCreateFromSelf(nil),
+          let value = SecTaskCopyValueForEntitlement(task, name as CFString, nil) else {
+        return false
+    }
+    return (value as? Bool) ?? (value as? NSNumber)?.boolValue ?? false
+}
+#if canImport(vmnet)
+func vmnetStatusName(_ status: vmnet_return_t) -> String {
+    switch status.rawValue {
+    case 1000: return "VMNET_SUCCESS"
+    case 1001: return "VMNET_FAILURE"
+    case 1002: return "VMNET_MEM_FAILURE"
+    case 1003: return "VMNET_INVALID_ARGUMENT"
+    case 1004: return "VMNET_SETUP_INCOMPLETE"
+    case 1005: return "VMNET_INVALID_ACCESS"
+    case 1006: return "VMNET_PACKET_TOO_BIG"
+    case 1007: return "VMNET_BUFFER_EXHAUSTED"
+    case 1008: return "VMNET_TOO_MANY_PACKETS"
+    case 1009: return "VMNET_SHARING_SERVICE_BUSY"
+    case 1010: return "VMNET_NOT_AUTHORIZED"
+    default: return "vmnet_return_t(\(status.rawValue))"
+    }
+}
+func ipv4Text(_ addr: in_addr) -> String {
+    let b = UInt32(bigEndian: addr.s_addr)
+    return "\(b >> 24 & 0xff).\(b >> 16 & 0xff).\(b >> 8 & 0xff).\(b & 0xff)"
+}
+func prefixLen(_ mask: in_addr) -> Int {
+    Int((UInt32(bigEndian: mask.s_addr)).nonzeroBitCount)
+}
+#endif
+if netBridgedInterface != nil {
+    if netCapturePath != nil {
+        fail("--net-bridged is mutually exclusive with --net (one network device per guest for now).")
+    }
+    if netNatEnabled {
+        fail("--net-bridged is mutually exclusive with --net-nat (one network device per guest for now).")
+    }
+    if netVmnetEnabled {
+        fail("--net-bridged is mutually exclusive with --net-vmnet (one network device per guest for now).")
+    }
+    let wanted = netBridgedInterface!
+    guard let iface = VZBridgedNetworkInterface.networkInterfaces.first(where: { $0.identifier == wanted }) else {
+        let available = VZBridgedNetworkInterface.networkInterfaces.map { $0.identifier }.joined(separator: ",")
+        fail("--net-bridged: interface '\(wanted)' is not in VZBridgedNetworkInterface.networkInterfaces (bridgeable here: \(available.isEmpty ? "<none>" : available)).")
+    }
+    if !runnerHasEntitlement("com.apple.vm.networking") {
+        fail("--net-bridged requires the com.apple.vm.networking entitlement, which this binary's signature does not carry. It is a RESTRICTED entitlement on macOS 27: an ad-hoc codesign (--sign -) carrying it is killed by amfid before main() (observed). Sign with a development identity using host/vm-runner/entitlements-net.plist, or use --net/--net-nat instead.")
+    }
+    netBridgedIface = iface
+}
+if netVmnetEnabled {
+    if netCapturePath != nil {
+        fail("--net-vmnet is mutually exclusive with --net (one network device per guest for now).")
+    }
+    if netNatEnabled {
+        fail("--net-vmnet is mutually exclusive with --net-nat (one network device per guest for now).")
+    }
+    if netBridgedInterface != nil {
+        fail("--net-vmnet is mutually exclusive with --net-bridged (one network device per guest for now).")
+    }
+#if canImport(vmnet)
+    var netVmnetStatus = vmnet_return_t.VMNET_SUCCESS
+    guard let vmnetConfig = vmnet_network_configuration_create(operating_modes_t.VMNET_SHARED_MODE, &netVmnetStatus) else {
+        fail("--net-vmnet: vmnet_network_configuration_create failed (vmnet_return_t=\(netVmnetStatus.rawValue) \(vmnetStatusName(netVmnetStatus))).")
+    }
+    if let subnet = netVmnetSubnet {
+        // The daemon's set_ipv4_subnet takes the GATEWAY address — the
+        // second address of the range — not the base (observed in
+        // apple/containerization's configureSubnetV4, and by the daemon's
+        // own refusal: passing the base gives "can't have the gateway at
+        // the subnet address" at interface start, err 49).
+        let mv: UInt32 = ~UInt32(0) << (32 - subnet.prefixLen)
+        let av = UInt32(subnet.ip[0]) << 24 | UInt32(subnet.ip[1]) << 16 | UInt32(subnet.ip[2]) << 8 | UInt32(subnet.ip[3])
+        var saddr = in_addr(s_addr: (av + 1).byteSwapped)
+        var smask = in_addr(s_addr: mv.byteSwapped)
+        let setStatus = vmnet_network_configuration_set_ipv4_subnet(vmnetConfig, &saddr, &smask)
+        guard setStatus == .VMNET_SUCCESS else {
+            fail("--net-vmnet-subnet: vmnet_network_configuration_set_ipv4_subnet failed (vmnet_return_t=\(setStatus.rawValue) \(vmnetStatusName(setStatus))).")
+        }
+    }
+    var netVmnetCreateStatus = vmnet_return_t.VMNET_SUCCESS
+    guard let network = vmnet_network_create(vmnetConfig, &netVmnetCreateStatus) else {
+        fail("--net-vmnet: vmnet_network_create failed (vmnet_return_t=\(netVmnetCreateStatus.rawValue) \(vmnetStatusName(netVmnetCreateStatus))) — the vmnet daemon requires the com.apple.developer.networking.vmnet entitlement or root (observed in the daemon's client_entitlement_check). The entitlement is restricted: an ad-hoc codesign cannot carry it — sign with a development identity using host/vm-runner/entitlements-net.plist.")
+    }
+    netVmnetNetwork = network
+    var netSub = in_addr(), netMask = in_addr()
+    vmnet_network_get_ipv4_subnet(network, &netSub, &netMask)
+    netVmnetSubnetText = "\(ipv4Text(netSub))/\(prefixLen(netMask))"
+#else
+    fail("--net-vmnet requires a macOS 26+ SDK build (vmnet_network_create); this binary was compiled without vmnet.framework.")
+#endif
+}
+if netVmnetSubnet != nil, !netVmnetEnabled {
+    fail("--net-vmnet-subnet requires --net-vmnet.")
+}
 // M70g G2 (#1459): the bridge secret comes from the file OR the inline spec,
 // never both; the file form is preferred because argv is world-readable.
 if let fileSecret = consoleTCPSecretFromFile {
@@ -3073,6 +3256,35 @@ if let netCapturePath {
     }
     natConfig.macAddress = fixedMAC
     config.networkDevices = [natConfig]
+} else if let bridgedIface = netBridgedIface {
+    // M117d (issue #2476, ADR 0057 D11): the bridged attachment — the
+    // guest shares the host's physical interface and sits on the real
+    // LAN with the SAME fixed locally-administered MAC the other
+    // attachments pin (the iface and the com.apple.vm.networking
+    // entitlement were both checked by name during flag validation).
+    let bridgedAttachment = VZBridgedNetworkDeviceAttachment(interface: bridgedIface)
+    let bridgedConfig = VZVirtioNetworkDeviceConfiguration()
+    bridgedConfig.attachment = bridgedAttachment
+    guard let fixedMAC = VZMACAddress(string: "02:00:00:00:00:01") else {
+        fail("Could not parse the fixed net MAC address.")
+    }
+    bridgedConfig.macAddress = fixedMAC
+    config.networkDevices = [bridgedConfig]
+} else if netVmnetEnabled {
+    // M117d (issue #2476, ADR 0057 D11): the vmnet attachment — the
+    // shared-mode logical network was created up front (flag validation
+    // fails carrying the vmnet_return_t on a non-success, so reaching
+    // here means the network exists).
+#if canImport(vmnet)
+    let vmnetAttachment = VZVmnetNetworkDeviceAttachment(network: netVmnetNetwork!)
+    let vmnetNetConfig = VZVirtioNetworkDeviceConfiguration()
+    vmnetNetConfig.attachment = vmnetAttachment
+    guard let fixedMAC = VZMACAddress(string: "02:00:00:00:00:01") else {
+        fail("Could not parse the fixed net MAC address.")
+    }
+    vmnetNetConfig.macAddress = fixedMAC
+    config.networkDevices = [vmnetNetConfig]
+#endif
 } else {
     config.networkDevices = []
 }
@@ -3521,6 +3733,12 @@ if let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort {
 }
 if netNatEnabled {
     print("  net-nat: ENABLED (milestone five card N7, claim 4678) — VZNATNetworkDeviceAttachment attached (host router + NAT; no capture file — guest-observed counters are the gate's evidence)")
+}
+if let iface = netBridgedInterface {
+    print("  net-bridged: ENABLED (M117d, issue #2476, ADR 0057 D11) — VZBridgedNetworkDeviceAttachment on \(iface) (com.apple.vm.networking carried in signature; the guest sits on the real LAN — guest-observed counters are the gate's evidence)")
+}
+if netVmnetEnabled {
+    print("  net-vmnet: ENABLED (M117d, issue #2476, ADR 0057 D11) — VZVmnetNetworkDeviceAttachment on a shared-mode vmnet network\(netVmnetSubnetText.map { " (gateway \($0))" } ?? "") (the daemon serves DHCP + NAT; guest-observed counters are the gate's evidence)")
 }
 
 // M108 (#2325/#2326, ADR 0051): arm the live lanes BEFORE the VM starts —
