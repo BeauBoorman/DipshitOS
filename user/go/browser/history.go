@@ -52,6 +52,28 @@ func (h *history) canBack() bool    { return h.pos > 0 }
 func (h *history) canForward() bool { return h.pos >= 0 && h.pos+1 < len(h.entries) }
 func (h *history) len() int         { return len(h.entries) }
 
+// recent returns the newest-first tail of the stack, capped at n: the rows
+// the history dropdown lists (M126a #2593). Row i is entries[len-1-i].
+func (h *history) recent(n int) []entry {
+	if n > len(h.entries) {
+		n = len(h.entries)
+	}
+	out := make([]entry, n)
+	for i := 0; i < n; i++ {
+		out[i] = h.entries[len(h.entries)-1-i]
+	}
+	return out
+}
+
+// cursorRow is the row index recent() assigns the cursor entry, -1 when the
+// stack is empty. The dropdown marks it as the "you are here" row.
+func (h *history) cursorRow() int {
+	if h.pos < 0 {
+		return -1
+	}
+	return len(h.entries) - 1 - h.pos
+}
+
 // back moves the cursor one entry toward the oldest and returns it.
 func (h *history) back() (entry, bool) {
 	if !h.canBack() {

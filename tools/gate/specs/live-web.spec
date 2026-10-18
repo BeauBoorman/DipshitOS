@@ -6,9 +6,11 @@
 # 15-17 type real hostnames against original hermetic site stand-ins.
 # 18-20 prove wrong-host/expired/production-unknown-root refusal before GET.
 # 21 measures the largest reference with actual kernel ownership counters.
-# 22-36 (M93g #1999): each frozen reference renders in-guest; the marker-
-# geometry crop SHA-256-matches its approved M93e golden (web-proof/compare.py,
+# 22-38 (M93g #1999, M99p): each frozen reference renders in-guest; the marker-
+# geometry crop SHA-256-matches its approved golden (web-proof/compare.py,
 # ADR 0028 D9 exact RGB8, zero tolerance; the comparator self-test runs in setup).
+# 39 (M126a #2593): the address-bar/nav leg — a typed URL loads, the chips
+# drive back/forward/reload, and the history dropdown lists + revisits entries.
 # No public-internet fleet access, scripts or POST. Owner authorized the fixed
 # three-pixel shim-border scanout composition; font markers are live-web-ttf's.
 # Prerequisites: build-web.sh browser WEB, browser WEB --gate,
@@ -193,7 +195,10 @@ if pid == 0:
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     conns = []
-    deadline = time.time() + 300
+    # The deadline must cover the seven boots ahead of 08 on the reference
+    # host plus margin; observed 2026-10-18: 300 s expired mid-run and the
+    # refused connect silently degraded boot 08 to the offline fallback.
+    deadline = time.time() + 1200
     while time.time() < deadline:
         try:
             os.kill(owner, 0)
@@ -1582,4 +1587,130 @@ vgate_assert 38 serial-absent '[EXC] parking:'
 vgate_assert 38 snapshot 'snap-38-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'tools/web-proof/compare.py', sys.argv[1], 'fonts-size'])
+PY
+
+# --- boot 39 (M126a #2593): the address bar + navigation leg --------------
+# One boot, all file-channel loads so every transition is instant. The chord
+# channel types ctrl-l + the path (its marker wait is keyed to the run
+# deadline, unlike --input-string's fixed 40 s, which expired before
+# url-focus on this boot — observed 2026-10-18); the pointer channel then
+# clicks the back/forward/reload chips, the history chip, a dropdown row,
+# and reopens the dropdown LAST so the kind-4 snapshot cannot drain after
+# the pick closed it (observed: the capture outran an open menu while queued
+# pointer steps were still draining). Inert hovers pace the fixed 2.5 s
+# pointer transport around the typed navigation and each reload. Snapshots
+# grade PAGE after the repaint and after back, NEXT after the typed URL, and
+# the open dropdown's pixels (plate, selected row, cursor bar) so "history
+# list shown" is proven on the scanout, not only on serial.
+vgate_run 39 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-39' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-l,/,h,o,s,t,/,N,E,X,T,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --pointer-virtio '100,68;100,68;100,68;100,68;100,68;50,67,c;100,68;100,68;100,68;66,67,c;100,68;100,68;100,68;85,69,c;100,68;100,68;100,68;537,69,c;100,68;100,68;300,100,c;100,68;100,68;537,69,c' \
+    --pointer-virtio-after 'web: ready' \
+    --snapshot-after 'web: repaint' \
+    --snapshot-after 'web: nav /host/NEXT.HTML' \
+    --snapshot-after 'web: history n=3' \
+    --script-expect 'web: history n=3' --timeout 240
+
+vgate_assert 39 serial-absent 'web: budget over'
+vgate_assert 39 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 39 serial-contains 'web: url-focus'
+vgate_assert 39 serial-count 'web: url /host/NEXT.HTML' 3
+vgate_assert 39 serial-count 'web: nav /host/NEXT.HTML' 2
+vgate_assert 39 serial-contains 'web: history back'
+vgate_assert 39 serial-contains 'web: history forward'
+vgate_assert 39 serial-contains 'web: reload /host/NEXT.HTML'
+vgate_assert 39 serial-contains 'web: history n=2'
+vgate_assert 39 serial-contains 'web: history 0 /host/NEXT.HTML'
+vgate_assert 39 serial-contains 'web: history 1 /host/PAGE.HTML'
+vgate_assert 39 serial-contains 'web: history pick /host/PAGE.HTML'
+vgate_assert 39 serial-contains 'web: nav-ready n=4'
+vgate_assert 39 serial-contains 'web: history n=3'
+vgate_assert 39 serial-absent 'web: error'
+vgate_assert 39 serial-absent '[EXC] parking:'
+vgate_assert 39 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "web: url /host/PAGE.HTML",
+    "web: url-focus",
+    "web: nav /host/NEXT.HTML",
+    "web: history back",
+    "web: nav /host/PAGE.HTML",
+    "web: history forward",
+    "web: reload /host/NEXT.HTML",
+    "web: history n=2",
+    "web: history pick /host/PAGE.HTML",
+    "web: nav-ready n=4",
+    "web: history n=3",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 39 nav ordering ok (type->load, back, forward, reload, list, pick, relist)")
+PY
+vgate_assert 39 snapshot 'snap-39-0.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'page'])
+PY
+vgate_assert 39 snapshot 'snap-39-1.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'next'])
+PY
+vgate_assert 39 snapshot 'snap-39-2.raw' <<'PY'
+import sys
+sys.path.insert(0, 'user/go/browser')
+import pixel_probe
+# The approved PAGE raster, decoded by the probe's own PNG reader.
+want = pixel_probe.decode_png('user/go/browser/testdata/presentation/page.png')
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+WX, WY = 40, 28  # WEB.ELF's raw-shim window origin
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the dropdown plate
+RULE = (0x2e, 0x3a, 0x44)     # theme.Dark.Rule: border + selected-row fill
+ACCENT = (0x3b, 0x82, 0xf6)   # theme.Dark.Accent: the cursor row's left bar
+# The plate covers window x in [6,504), rows at window y=48+16i; three
+# entries are listed (n=3), so rows 0-2 sit at window y in [48,96) ->
+# scanout [76,124).
+plate = ink = selrow = 0
+for yy in range(76, 124):
+    for xx in range(46, 544):
+        c = px(xx, yy)
+        if near(c, SURFACE):
+            plate += 1
+        if min(c) > 150:
+            ink += 1
+# Row 0 is the selected row (rule fill) and carries the accent cursor bar.
+for xx in range(100, 540):
+    if near(px(xx, 84), RULE):
+        selrow += 1
+selbar = sum(1 for yy in range(78, 90)
+             if near(px(46, yy), ACCENT) or near(px(47, yy), ACCENT))
+assert plate > 3000, "dropdown plate pixels %d" % plate
+assert ink > 40, "history rows have no text ink: %d" % ink
+assert selrow > 300, "selected row fill pixels %d" % selrow
+assert selbar >= 8, "cursor accent bar pixels %d" % selbar
+# Below the plate and its shadow the pick's target must be on screen:
+# exact-match the PAGE raster rows (content crop rows 40..287 -> scanout
+# 28+64+row), skipping the shim border columns (window x<4 or x>=508).
+diff = 0
+for row in range(40, 288):
+    sy = WY + 64 + row
+    for xx in range(44, 548):
+        c = px(xx, sy)
+        w = want[(row*512 + (xx-WX))*3:][:3]
+        if c != (w[0], w[1], w[2]):
+            diff += 1
+assert diff == 0, "PAGE rows under the menu differ from the approved raster: %d px" % diff
+print("live-web 39 history dropdown pixels ok (plate=%d ink=%d selrow=%d selbar=%d) + PAGE rows under it exact" %
+      (plate, ink, selrow, selbar))
 PY
