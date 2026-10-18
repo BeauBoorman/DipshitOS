@@ -43,6 +43,12 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// `capturesSystemKeys` is on.
     private weak var captureKeysPill: NSButton?
     private let captureBadge = NSView()
+    /// M114e (#2458): the counting-down recording badge — visible exactly
+    /// while the bus's recorder is running, showing the cap seconds left
+    /// ("● REC 42s"). The recorder's onChange drives it, so the headless
+    /// bus and the menu chord light the same affordance.
+    private let recordBadge = NSView()
+    private let recordBadgeLabel = NSTextField(labelWithString: "")
     private let serialLog: String
 
     /// The toolbar item identifier for the capture-keys pill — tests find
@@ -118,6 +124,27 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             captureBadge.topAnchor.constraint(equalTo: guestArea.topAnchor, constant: 8),
         ])
         captureBadge.isHidden = true
+        // M114e: the REC badge — the captureBadge pattern pinned to the
+        // top-right so the two affordances never overlap.
+        recordBadge.wantsLayer = true
+        recordBadge.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.75).cgColor
+        recordBadge.layer?.cornerRadius = 11
+        recordBadge.translatesAutoresizingMaskIntoConstraints = false
+        recordBadgeLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        recordBadgeLabel.textColor = .white
+        recordBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        recordBadge.addSubview(recordBadgeLabel)
+        guestArea.addSubview(recordBadge)
+        NSLayoutConstraint.activate([
+            recordBadgeLabel.leadingAnchor.constraint(equalTo: recordBadge.leadingAnchor, constant: 10),
+            recordBadgeLabel.trailingAnchor.constraint(equalTo: recordBadge.trailingAnchor, constant: -10),
+            recordBadgeLabel.topAnchor.constraint(equalTo: recordBadge.topAnchor, constant: 3),
+            recordBadgeLabel.bottomAnchor.constraint(equalTo: recordBadge.bottomAnchor, constant: -3),
+            recordBadge.trailingAnchor.constraint(equalTo: guestArea.trailingAnchor, constant: -12),
+            recordBadge.topAnchor.constraint(equalTo: guestArea.topAnchor, constant: 8),
+        ])
+        recordBadge.isHidden = true
+        commandBus.recorder.onChange = { [weak self] in self?.refreshRecordAffordance() }
         status.alignment = .center
         status.font = .systemFont(ofSize: 18)
         status.translatesAutoresizingMaskIntoConstraints = false
@@ -228,6 +255,17 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// class-A tests.
     public var keysCaptureAffordanceVisible: Bool { !captureBadge.isHidden }
 
+    /// M114e: the badge's visibility + countdown text — class-A tests
+    /// read these instead of poking AppKit.
+    public var recordAffordanceVisible: Bool { !recordBadge.isHidden }
+    public var recordAffordanceText: String { recordBadgeLabel.stringValue }
+
+    private func refreshRecordAffordance() {
+        let recorder = commandBus.recorder
+        recordBadge.isHidden = !recorder.isRecording
+        recordBadgeLabel.stringValue = "● REC \(recorder.remaining)s"
+    }
+
     private func refreshCaptureAffordance() {
         let on = captureTarget?.capturesSystemKeys ?? false
         captureBadge.isHidden = !on
@@ -271,6 +309,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public func attach(_ view: NSView) {
         guestView = view
         captureTarget = view as? HostKeyCapturing
+        // M114e: the session's record surface — the bus's recorder films
+        // this view instead of discovering a window through NSApp.
+        commandBus.recorder.captureView = view
         refreshCaptureAffordance()
         view.frame = guestArea.bounds
         view.autoresizingMask = [.width, .height]

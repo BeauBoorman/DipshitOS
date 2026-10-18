@@ -35,7 +35,13 @@ public enum HostCommand: String, CaseIterable, Sendable {
     // dispatch it, writing `HostInspector.inputLine` to the console pipe.
     case sendSerial = "send-serial"
     case screenshot
+    // M114e (#2458): the ⌘⇧6 chord toggles `record`; `record-start`/
+    // `record-stop` are the card's explicit leg verbs — same recorder,
+    // idempotent edges, so a gate names the transition it wants rather
+    // than counting dispatches.
     case record
+    case recordStart = "record-start"
+    case recordStop = "record-stop"
 }
 
 /// One armed `--host-cmd-after <marker>:<verb>` instance. The verb is the
@@ -113,12 +119,41 @@ public final class HostCommandBus: NSObject {
     /// capture it.
     public var emit: (String) -> Void
 
+    /// M114e (#2458): the bounded MP4 recorder every bus carries — the
+    /// one verb family whose handler needs nothing the runner owns: the
+    /// capture surface is any AppKit view (the session attaches its guest
+    /// view; a headless run's single evidence window is discovered
+    /// through NSApp) and the output dir resolves from the runner's own
+    /// `--cvc-file`/`--virtio-fs` argv. Self-registering on the bus is
+    /// the M114c registration-side-effect pattern for a card whose
+    /// Touches exclude main.swift: the bare `HostCommandBus()` a scripted
+    /// `--host-cmd-after` run builds and the session window's bus
+    /// dispatch the identical seam.
+    public let recorder = HostRecorder()
+
     private var registrations: [HostCommand: Registration] = [:]
 
     public init(emit: ((String) -> Void)? = nil) {
         self.emit = emit ?? {
             FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
         }
+        super.init()
+        let recorder = self.recorder
+        register(.record, Registration(
+            isEnabled: { recorder.canStart },
+            itemState: { recorder.isRecording },
+            receiptDetail: { recorder.receiptDetail },
+            action: { recorder.toggle() }))
+        register(.recordStart, Registration(
+            isEnabled: { recorder.canStart },
+            itemState: { recorder.isRecording },
+            receiptDetail: { recorder.receiptDetail },
+            action: { recorder.start() }))
+        register(.recordStop, Registration(
+            isEnabled: { recorder.isRecording },
+            itemState: { recorder.isRecording },
+            receiptDetail: { recorder.receiptDetail },
+            action: { recorder.stop() }))
     }
 
     public func register(_ command: HostCommand, _ registration: Registration) {
