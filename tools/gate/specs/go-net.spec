@@ -332,8 +332,14 @@ pathlib.Path("artifacts", "go-net-connect-wire" + suffix + ".bin").write_bytes(d
 syns = []
 i = 0
 while i < len(data):
-    assert data[i+12:i+14] in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
-    size = 42 if data[i+12:i+14] == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
+    # M117b (#2474): the IPv6 datapath emits NDP/ICMPv6 frames — legitimate
+    # capture traffic now. Decode past them; the v4 analysis is unchanged.
+    et = data[i+12:i+14]
+    if et == b"\x86\xdd":
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
+        continue
+    assert et in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
+    size = 42 if et == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
     f = data[i:i+size]
     if f[12:14] == b"\x08\x00" and f[23] == 6 and f[37:38] == b"\x91" and f[36] == 0x1f:
         assert f[30:34] == bytes([10,0,0,2]) and f[47] == 2, "silent port transmitted something other than SYN"
@@ -366,8 +372,12 @@ pathlib.Path("artifacts", "go-net-connect-legacy-wire" + suffix + ".bin").write_
 syns = []
 i = 0
 while i < len(data):
-    assert data[i+12:i+14] in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
-    size = 42 if data[i+12:i+14] == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
+    et = data[i+12:i+14]
+    if et == b"\x86\xdd":
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
+        continue
+    assert et in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
+    size = 42 if et == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
     f = data[i:i+size]
     if f[12:14] == b"\x08\x00" and f[23] == 6 and f[36:38] == b"\x1f\x91":
         assert f[30:34] == bytes([10,0,0,2]) and f[47] == 2
@@ -495,6 +505,9 @@ i = 0
 while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
+        continue
+    if data[i+12:i+14] == b"\x86\xdd":
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
         continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
     size = 14 + struct.unpack_from("!H", data, i + 16)[0]
@@ -691,6 +704,9 @@ i = 0
 while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
+        continue
+    if data[i+12:i+14] == b"\x86\xdd":
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
         continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
     size = 14 + struct.unpack_from("!H", data, i + 16)[0]

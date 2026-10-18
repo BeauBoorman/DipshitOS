@@ -188,8 +188,10 @@ import os, sys
 share = os.environ["VG_SHARE"]
 seeded = set(open(os.path.join(os.environ["RUN_DIR"], "seeded.txt")).read().split())
 # The guest shell writes its own history file during any run that execs
-# from it — a legitimate share write by the harness, not by gsvfs.
-shell_owned = {"HISTORY.TXT"}
+# from it, and the kernel's measured-boot path (M113b #2418) drops the
+# exec receipt RCPT.TXT at the share root — legitimate harness/kernel
+# share writes, not gsvfs's.
+shell_owned = {"HISTORY.TXT", "RCPT.TXT"}
 stray = []
 for dp, _, fs in os.walk(share):
     for f in fs:
