@@ -910,13 +910,6 @@ vgate_assert 04 serial-contains 'dogfood: seat'
 vgate_assert 04 share-contains APPS.TXT 'NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text'
 vgate_assert 04 share-contains APPS.TXT 'WEB.ELF | Web | w | dock=true | v=2 | caps=net | opens=http,https'
 # The seat's own decode receipt, printed by the launcher as it parses
-<<<<<<< HEAD
-# (apps.go SummarizeApps): 19 rows, the highest row version the file
-# declares, this build's schema, and how many rows spoke each trailing key.
-# A parser that skipped the tail would still print `launcher open n=19` and
-# would report v=0 here.
-vgate_assert 04 serial-contains 'gotabwm: apps decode n=19 v=2 schema=2'
-=======
 # (apps.go SummarizeApps): every row of the share's manifest, the highest
 # row version the file declares, this build's schema, and how many rows
 # spoke each trailing key. A parser that skipped the tail would still print
@@ -936,7 +929,6 @@ if want not in ser:
              % (want, m.group(0) if m else "absent"))
 print("apps decode receipt matches the share manifest: %d rows" % len(rows))
 PY
->>>>>>> origin/main
 
 # --- (a) the docked Terminal entry opens through the launcher ---------------
 # The seat's own 16-tick choreography emptied the strip first; without it
