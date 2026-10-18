@@ -135,13 +135,13 @@ if not os.path.exists(chain):
 cmd = [
     sys.executable,
     os.path.join("user", "src", "lib", "tls", "vectors", "tlsresponder.py"),
-    "--host", "127.0.0.1", "--port", "24533",
+    "--host", "127.0.0.1", "--port", "24633",
     "--cert", chain, "--key", os.path.join(cfx, "leaf-ec.key"),
     "--body", "go-net-clis-ok\n", "--accept", "2", "--timeout", "3600",
 ]
 log = open(os.path.join(rd, "tlsresponder.log"), "wb")
 proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-print("go-net-clis: tlsresponder pid=%d on 127.0.0.1:24533" % proc.pid)
+print("go-net-clis: tlsresponder pid=%d on 127.0.0.1:24633" % proc.pid)
 PY
 
 # --- boot 01: GOSH execs GOPING.ELF over the ICMP responder ----------------
@@ -195,7 +195,7 @@ PY
 vgate_run 02 -- \
     --screen '$RUN_DIR/screen-02' \
     --net '$RUN_DIR/cap-02.bin' --net-arp-respond 10.0.0.2 \
-    --net-tcp-respond 10.0.0.2:24533:relay --net-tcp-respond-relay 127.0.0.1:24533 \
+    --net-tcp-respond 10.0.0.2:24533:relay --net-tcp-respond-relay 127.0.0.1:24633 \
     --script '$RUN_DIR/net.txt' \
     --script2 '$RUN_DIR/sh.txt' --script2-after 'net arp: ' \
     --script3 '$RUN_DIR/typed-fetch.bin' --script3-after 'gosh: attached' \
