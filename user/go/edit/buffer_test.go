@@ -2,6 +2,8 @@ package main
 
 import (
 	"testing"
+
+	"virelai/find"
 )
 
 // buffer_test.go pins the pure layer (#2199): splices round-trip, runs merge
@@ -162,7 +164,7 @@ func TestReplaceAllMatchesFindTotal(t *testing.T) {
 	doc := []byte("one two one\ntwo one")
 	pat, repl := []byte("one"), []byte("X")
 	sp := replaceAllSplices(doc, pat, repl)
-	if total, _, _ := findFrom(doc, pat, 0); total != len(sp) {
+	if total, _, _ := find.From(doc, pat, 0); total != len(sp) {
 		t.Fatalf("replaceAll = %d splices, find total %d", len(sp), total)
 	}
 	got := applySplices(doc, sp, false)

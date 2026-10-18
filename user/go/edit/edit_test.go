@@ -5,6 +5,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"virelai/find"
 	"virelai/vi"
 )
 
@@ -138,7 +139,7 @@ func TestFindAndGotoMarkers(t *testing.T) {
 	// The live walk types exactly this document
 	// (`h,e,l,l,o,return,w,o,r,l,d,return,t,e,x,t`).
 	doc := []byte("hello\nworld\ntext")
-	total, ordinal, off := findFrom(doc, []byte("wor"), len(doc))
+	total, ordinal, off := find.From(doc, []byte("wor"), len(doc))
 	if total != 1 || ordinal != 1 || off != 6 {
 		t.Fatalf("find 'wor' = (total=%d ordinal=%d off=%d) want (1,1,6)", total, ordinal, off)
 	}
@@ -161,41 +162,9 @@ func TestFindAndGotoMarkers(t *testing.T) {
 	}
 }
 
-// findFrom: the forward search, the ordinal among ALL matches, and the wrap to
-// the first match when nothing is at or after the caret.
-func TestFindFrom(t *testing.T) {
-	doc := []byte("one two one two")
-	// From the caret at the end, the search wraps to the first match.
-	if total, ord, off := findFrom(doc, []byte("one"), len(doc)); total != 2 || ord != 1 || off != 0 {
-		t.Fatalf("wrapped find = (%d,%d,%d) want (2,1,0)", total, ord, off)
-	}
-	// A caret AT the second match's start lands on it and reports ordinal 2:
-	// the rule is "the first match at or after the caret".
-	if total, ord, off := findFrom(doc, []byte("one"), 8); total != 2 || ord != 2 || off != 8 {
-		t.Fatalf("second-match find = (%d,%d,%d) want (2,2,8)", total, ord, off)
-	}
-	// A caret INSIDE a match is past that match's start, so with no match left
-	// to run to the search wraps to the first one (the same rule, not a second
-	// one) - which is what makes a repeat Return re-report the same single
-	// match instead of inventing one.
-	if total, ord, off := findFrom(doc, []byte("one"), 9); total != 2 || ord != 1 || off != 0 {
-		t.Fatalf("in-match find = (%d,%d,%d) want (2,1,0)", total, ord, off)
-	}
-	// Matches do not overlap: "aba" holds ONE "aba", not a sliding pair.
-	if total, _, _ := findFrom([]byte("ababa"), []byte("aba"), 0); total != 1 {
-		t.Fatalf("non-overlapping total = %d want 1", total)
-	}
-	// No match, empty pattern, and a pattern longer than the buffer.
-	if _, _, off := findFrom(doc, []byte("zzz"), 0); off != -1 {
-		t.Fatalf("no-match off = %d want -1", off)
-	}
-	if total, _, off := findFrom(doc, nil, 0); total != 0 || off != -1 {
-		t.Fatalf("empty pattern = (%d,%d) want (0,-1)", total, off)
-	}
-	if total, _, off := findFrom([]byte("ab"), []byte("abc"), 0); total != 0 || off != -1 {
-		t.Fatalf("long pattern = (%d,%d) want (0,-1)", total, off)
-	}
-}
+// find.From's own tests moved with the matcher to package virelai/find
+// (M126c #2595); what stays here is the app's use of it, in
+// TestFindAndGotoMarkers and the bar walk below.
 
 // countLines/lineOffset/parseLine are the goto bar's rule set, and the edge
 // cases are the ones the Zig app pinned: an empty buffer is one line, a

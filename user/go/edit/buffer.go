@@ -7,7 +7,11 @@ package main
 // returns what the edit makes of it, so the class-A tests pin the same rules
 // the live gate drives.
 
-import "unicode/utf8"
+import (
+	"unicode/utf8"
+
+	"virelai/find"
+)
 
 // splice is one atomic text replacement: at pos, the bytes `old` became the
 // bytes `ins`. Positions in an op are in the coordinates of the buffer the
@@ -189,26 +193,18 @@ func splicedLen(bufLen int, sp []splice, undo bool) int {
 }
 
 // replaceAllSplices returns one splice per non-overlapping match of pat —
-// the same scan rule findFrom counts with, so len(result) IS the total find
-// would report. Positions are original-buffer coordinates, which is also
-// what keeps a replacement that CONTAINS the pattern terminating: no splice
-// ever sees inserted text.
+// the shared matcher's scan (package virelai/find, M126c #2595), so
+// len(result) IS the total find would report. Positions are
+// original-buffer coordinates, which is also what keeps a replacement that
+// CONTAINS the pattern terminating: no splice ever sees inserted text.
 func replaceAllSplices(buf, pat, repl []byte) []splice {
-	if len(pat) == 0 || len(pat) > len(buf) {
-		return nil
-	}
 	var sp []splice
-	for i := 0; i+len(pat) <= len(buf); {
-		if matchAt(buf, i, pat) {
-			sp = append(sp, splice{
-				pos: i,
-				old: append([]byte{}, buf[i:i+len(pat)]...),
-				ins: append([]byte{}, repl...),
-			})
-			i += len(pat)
-			continue
-		}
-		i++
+	for _, pos := range find.All(buf, pat) {
+		sp = append(sp, splice{
+			pos: pos,
+			old: append([]byte{}, buf[pos:pos+len(pat)]...),
+			ins: append([]byte{}, repl...),
+		})
 	}
 	return sp
 }
