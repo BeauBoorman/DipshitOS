@@ -31,7 +31,6 @@ EOF
 vgate_run 01 -- --script '$RUN_DIR/script.txt' --script-expect 'jobs-done' --timeout 60
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel'
-vgate_assert 01 serial-contains 'fg: job 1 still running'
 vgate_assert 01 serial-contains 'jobs-done'
 vgate_assert 01 python <<'PY'
 import os, re, sys
@@ -45,7 +44,18 @@ pats = [
     r"\[1\] Running: COUNTER.BIN",
     r"\[2\] Done: STATUS43.BIN \(exit=43\)",
 ]
-lines = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+# A running job's `counter: alive` markers interleave between the shell's
+# own puts fragments (e.g. "fg: job 1" / " still running", "[2" / " Done:"),
+# so whole-line matching never sees the joined line. Strip the marker
+# lines and rejoin — the fragments concatenate back to the full lines.
+ser = open(os.environ["VG_SER"], errors="replace").read()
+joined = "".join(
+    l for l in ser.splitlines(keepends=True)
+    if "counter: alive" not in l
+)
+if "fg: job 1 still running" not in joined:
+    sys.exit("FAIL: fg still-running line absent")
+lines = joined.splitlines()
 bad = [(p, sum(1 for l in lines if re.fullmatch(p, l))) for p in pats]
 bad = [(p, c) for p, c in bad if c != 1]
 if bad:
