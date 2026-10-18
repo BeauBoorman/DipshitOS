@@ -16,10 +16,6 @@ const (
 	exitFailure = 1
 )
 
-// Preserve space for the kernel's fixed argv/envp block in the writable
-// segment so the guest Go runtime can initialize its heap.
-var argvEnvpGuard [0x1000]byte
-
 type dnsArgs struct {
 	host   string
 	server [4]byte
@@ -155,7 +151,6 @@ func itoa(v int64) string {
 }
 
 func main() {
-	argvEnvpGuard[0] = 1
 	cfg, ok := parseArgs(vi.Args())
 	if !ok {
 		vi.Console("dns: usage: exec GODNS.ELF [-6|--aaaa] [--twice] [--gap <ticks>] <hostname> [<server_ip>]\n")

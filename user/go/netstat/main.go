@@ -22,10 +22,6 @@ const (
 	refreshTicks = 4 // ~1 Hz at the Zig app's 250 ms scheduler quantum
 )
 
-// argvEnvpGuard keeps space for the kernel's fixed argv/envp block in the
-// writable segment, as required by the GOOS=virelai loader/runtime contract.
-var argvEnvpGuard [0x2000]byte
-
 // canvas carries the frame surface (the window's bound pages through
 // tabapp.Attach, or the FillerCanvas degrade) plus the socket-table diff
 // state — the serial log of table changes headless runs assert.
@@ -255,7 +251,6 @@ func drawSnapshot(c *canvas, s vi.NetStats) {
 }
 
 func main() {
-	argvEnvpGuard[0] = 1
 	win, rc := vi.WinOpen(winX, winY, winW, winH)
 	if rc < 0 {
 		headlessMain()

@@ -191,7 +191,7 @@ def linked(work, cache, hosted=False, baseline=False):
         frames = sdk.stack_frames((work / "fixture.s").read_text())
         if re.search(r"(?m)^\s*[A-Za-z][^\n]*\b[wx]18\b", (work / "fixture.s").read_text()):
             raise ValueError("ReservedX18")
-        rt_objects = sorted((work / "cache/global").glob("o/*/libcompiler_rt_zcu.o"))
+        rt_objects = sorted((work / "cache/global").glob("o/*/*compiler_rt_zcu.o"))
         rt = [inspection.compiler_rt_object(path, (work / "fixture.s").read_text(),
                                            sorted(output.glob("*.o")) if output else []) for path in rt_objects]
         if not rt:

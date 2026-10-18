@@ -59,23 +59,9 @@ if [ "$SIZE" -gt "$MAX_BYTES" ]; then
 fi
 log "size ok (< $MAX_BYTES bytes)"
 
-python3 - "$OUT" <<'PY'
-import struct, sys
-d = open(sys.argv[1], "rb").read()
-e_phoff, = struct.unpack_from("<Q", d, 0x20)
-e_phentsize, e_phnum = struct.unpack_from("<HH", d, 0x36)
-mem = 0
-for i in range(e_phnum):
-    off = e_phoff + i * e_phentsize
-    p_type, p_flags = struct.unpack_from("<II", d, off)
-    if p_type == 1 and (p_flags & 2):  # PT_LOAD, W — the writable segment
-        mem = struct.unpack_from("<Q", d, off + 40)[0]  # p_memsz
-slack = (-mem) % 4096
-need = 0x908
-if slack < need:
-    sys.exit("build-gostore: writable segment memsz %#x leaves only %#x bytes of "
-             "page slack; the kernel's argv+envp protection needs >= %#x or the "
-             "runtime's first mmap is refused (grow user/go/gostore argvEnvpGuard)"
-             % (mem, slack, need))
-print("build-gostore: argv+envp slack ok (memsz %#x, slack %#x bytes)" % (mem, slack))
-PY
+# Issue #1648: no argv+envp tail-slack assert here. Under M71m (#1572) the
+# kernel packs the 4096-B block at align8(mem_size) and sizes the segment
+# to cover it; the runtime floors the sbrk break at memRound(argv_va +
+# 4096) (initBlocFloor), which is >= argv_end_va for any image alignment.
+# Binary-side page slack never enters the rule (same removal as
+# build-gosh.sh).

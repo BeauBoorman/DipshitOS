@@ -37,16 +37,7 @@ const (
 // server does not trust it to be small.
 const maxPinnedBytes = 256 * 1024
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the page
-// boundary for the kernel's packed argv+envp (see GOSSHD.ELF / GOSH.ELF). The
-// size is chosen so this binary's writable segment leaves well over the 0x908
-// bytes of page slack the kernel's first mmap needs; the build script verifies
-// it and says so by name if a future edit moves the segment end.
-var argvEnvpGuard [0x4000]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
+// -------------------------------------------------------------------------
 
 func main() {
 	port := listenPort(vi.Args())

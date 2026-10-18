@@ -26,7 +26,7 @@
 //! Card 3e (claim 4636): the kernel extends the ENTRY contract (not a
 //! syscall) — `_start` receives argc in x0 and the argv block VA in x1.
 //! When argc > 0 the payload prints one `user: arg=<n>` line per argument
-//! (the block is 8 slots of 32 bytes, NUL-terminated, inside this
+//! (the block is 8 slots of 256 bytes, NUL-terminated, inside this
 //! program's READ-ONLY text page) BEFORE the existing markers. A no-args
 //! exec (argc=0) prints exactly the markers earlier cards assert, so every
 //! existing live gate stays byte-identical.

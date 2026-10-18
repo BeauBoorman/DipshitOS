@@ -28,15 +28,6 @@ const (
 	natH     = 480
 )
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the
-// page boundary for the kernel's packed argv+envp — GOSTORE spawns
-// FLINT.ELF children through the same seam STORE.ELF uses.
-var argvEnvpGuard [0x1000]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
-
 func cliArgs(raw []string) []string {
 	if len(raw) == 0 {
 		return nil

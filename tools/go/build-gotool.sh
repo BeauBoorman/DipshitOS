@@ -61,11 +61,13 @@ build cmd/compile GOCMDCOMPILE
 build cmd/link    GOCMDLINK
 
 # The invariants, asserted from the linked ELFs. Every one of these is a rule
-# kernel/src/elf.zig's parse_impl enforces, plus the argv+envp page-slack rule
-# tools/go/build-gosh.sh states for the same reason (kernel/src/process.zig
-# mmap_collides): the kernel packs the 0x900-byte argv+envp block into the
-# writable segment's tail and extends the data aperture's collision bound
-# through it, while the sbrk break starts at memRound(moduledata.end).
+# kernel/src/elf.zig's parse_impl enforces. The argv+envp page-slack rule is
+# gone with #1648: under M71m (#1572) the kernel packs the 4096-B block at
+# align8(mem_size) and sizes the segment to cover it, and the runtime floors
+# the sbrk break at memRound(argv_va + 4096) (initBlocFloor), which is
+# >= argv_end_va for any image alignment — binary-side page slack never
+# enters the rule. Slack is still printed (tools/lib/elf_rules.py reports
+# the same figure, not gated).
 python3 - "$OUT_DIR/GOCMDCOMPILE.ELF" "$OUT_DIR/GOCMDLINK.ELF" <<'PY'
 import struct, sys
 
@@ -73,7 +75,6 @@ MAX_BYTES = 33554432   # exec_image_max / load_max
 MAP_MAX   = 67108864   # elf.map_max (M72a #1579: the MAPPED bound)
 GAP_MAX   = 0x1000_0000  # elf.gap_base_max
 MAX_SEG   = 3            # elf.max_segments
-NEED_SLACK = 0x908       # argv+envp block (0x900) + 8-byte alignment step
 
 rc = 0
 for path in sys.argv[1:]:
@@ -119,9 +120,6 @@ for path in sys.argv[1:]:
     if segs and not (segs[0]["va"] <= entry < segs[0]["va"] + segs[0]["fsz"]):
         fails.append("entry %#x not in segment 0 initialized bytes" % entry)
     slack = (-segs[-1]["msz"]) % 4096 if segs else 0
-    if slack < NEED_SLACK:
-        fails.append("writable page slack %d < %#x (argv+envp block; grow "
-                     "the argvEnvpGuard pad in the overlay)" % (slack, NEED_SLACK))
     print("build-gotool: %s segs=%d file=%d memsz=%d (%#x) slack=%d (%#x)"
           % (name, len(segs), len(d), total, total, slack, slack))
     if fails:
@@ -129,7 +127,6 @@ for path in sys.argv[1:]:
         for f in fails:
             print("build-gotool: FAIL %s: %s" % (name, f))
 if rc:
-    sys.exit("build-gotool: refusing to stage an image the loader would "
-             "reject or the argv+envp block would break")
-print("build-gotool: every loader rule and the argv+envp slack ok")
+    sys.exit("build-gotool: refusing to stage an image the loader would reject")
+print("build-gotool: every loader rule ok")
 PY

@@ -22,15 +22,6 @@ done
 python3 - "$FORK_DIR" "$GOPATH_DIR" <<'PY'
 import json, pathlib, sys
 fork, temp = map(pathlib.Path, sys.argv[1:])
-source = fork / "src/cmd/compile/internal/ssa/func.go"
-text = source.read_text()
-assert "package ssa" in text and "virelaiProfileArgvGuard" not in text
-# Only this named fixture receives the same tail-page guard the normal
-# toolchain overlay supplies. Original source is Go's BSD-3-Clause code;
-# this temporary compiler overlay changes no fork file.
-guard = temp / "ssa-guard.go"
-guard.write_text(text + "\nvar virelaiProfileArgvGuard [2048]byte\n"
-                 "func init() { virelaiProfileArgvGuard[0] = 1 }\n")
 checks_source = fork / "src/cmd/compile/internal/ssa/compile.go"
 checks = checks_source.read_text()
 assert checks.count("checkFunc(f)") == 2, "SourceDrift: SSA check call sites"
@@ -42,7 +33,7 @@ checks = checks.replace("checkFunc(f)",
 checks_overlay = temp / "ssa-checks.go"
 checks_overlay.write_text(checks)
 (temp / "overlay.json").write_text(json.dumps({"Replace": {
-    str(source): str(guard), str(checks_source): str(checks_overlay)}}))
+    str(checks_source): str(checks_overlay)}}))
 PY
 GOOS=virelai GOARCH=arm64 go build -tags virelaitoolchain \
     -overlay "$GOPATH_DIR/overlay.json" \

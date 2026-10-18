@@ -60,12 +60,9 @@ for i in range(phnum):
         break
 if not mem:
     sys.exit("build-netdiag: %s has no writable PT_LOAD segment" % name)
-slack = (-mem) % 4096
-need = 0x908
-if slack < need:
-    sys.exit("build-netdiag: %s writable memsz %#x leaves %#x page slack; need %#x (argvEnvpGuard)"
-             % (name, mem, slack, need))
-print("build-netdiag: %s argv+envp slack ok (memsz %#x, slack %#x bytes)" %
-      (name, mem, slack))
+# Issue #1648: no argv+envp tail-slack assert. Under M71m (#1572) the kernel
+# sizes the segment to cover the 4096-B block and initBlocFloor lifts the
+# break past it — binary-side page slack never enters the rule.
+print("build-netdiag: %s writable PT_LOAD present (memsz %#x)" % (name, mem))
 PY
 done

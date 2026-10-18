@@ -19,9 +19,6 @@ const (
 	pollLimit       = 50
 )
 
-// Keep the kernel's packed argv/envp block clear of the Go runtime break.
-var argvEnvpGuard [0x1000]byte
-
 type traceArgs struct {
 	ip          [4]byte
 	ipText      string
@@ -148,7 +145,6 @@ func run(cfg traceArgs) bool {
 }
 
 func main() {
-	argvEnvpGuard[0] = 1
 	cfg, ok := parseArgs(vi.Args())
 	if !ok {
 		vi.Console("traceroute: usage: exec GOTRACEROUTE.ELF [-m max_attempts] [-q probes] [<ip>]\n")

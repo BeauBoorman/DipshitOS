@@ -16,7 +16,7 @@
   "tools/quickjs-runtime/safety.py": "5854ae8e5c881014203faf3860acd8c483469cdc5ad044aa5aaf7d703b7ac5ed"
  },
  "private_inputs": {
-  "tools/quickjs-runtime/build.py": "c3586b31ff611c6fa88671c94fec7860be5d807d63643cef47e11723b0b217ae",
+  "tools/quickjs-runtime/build.py": "a99745f3196ca48d53162f625187c4a7a76220bbcf40976d26bc6d679028a1aa",
   "tools/quickjs-runtime/check.py": "4f3639edb32d65935de07aa63a393bea6d9ed1dc93b2d2ff19b03bdc56c421a8",
   "tools/quickjs-runtime/inspection.py": "98a9b9cc999e133af787f8ce12cdd5270284e20dfc35abf8a6715be16582ec5c",
   "tools/quickjs-runtime/materialize.py": "aecd756d2ba85ad159942836eac4979e6aa7de408f5c9eb41d19fa5355d4e6f9",

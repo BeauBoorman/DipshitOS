@@ -10,14 +10,6 @@ import (
 	"virelai/vi"
 )
 
-// argvEnvpGuard keeps the writable segment's bss end far enough from the
-// page boundary for the kernel's packed argv+envp (see GOSH.ELF / AGENTD.ELF).
-var argvEnvpGuard [0x1000]byte
-
-func init() {
-	argvEnvpGuard[len(argvEnvpGuard)-1] = byte(len(argvEnvpGuard) & 0xff)
-}
-
 var consoleFn = vi.ConsoleLine
 
 func main() {

@@ -13,9 +13,6 @@ import (
 
 var sink uint64
 
-// Keep the existing host ELF/argv inspector's tail-page guard satisfied.
-var argvEnvpGuard [2048]byte
-
 //go:noinline
 func fixedWork(seed uint64) uint64 {
 	for i := uint64(0); i < 80_000_000; i++ {
@@ -127,8 +124,6 @@ func run() error {
 	}
 	// Populate runtime and code pages before either measurement arm.
 	sink = fixedWork(1)
-	argvEnvpGuard[0] = byte(sink)
-	runtime.KeepAlive(&argvEnvpGuard)
 	var off, on [measurementPairs]int64
 	var sampleCount uint64
 	var dropped uint64
