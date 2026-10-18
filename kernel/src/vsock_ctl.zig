@@ -1,14 +1,22 @@
 //! The `virelai-ctl/1` guest-side client (M115b, issue #2461, ADR 0056) —
 //! the kernel half of the guest→host control channel.
 //!
-//! Driven by the monitor's `vsock ctl <verb>` command: one command is one
-//! connection — connect to the host's `--vsock-ctl-port` listener, read the
-//! greeting's challenge, answer `HMAC-SHA256(key, domain || 0x00 ||
-//! challenge)` from the `vsock-ctl` SECRETS.TXT row (a uid_system credential
-//! the kernel store serves to no EL0 reader), send the request line, print
-//! the reply's verdict fields, shut down. The wire grammar is pinned in the
-//! ADR; `user/go/vsockctl` is the same protocol for the EL0 binding the
-//! ABI-slot follow-up lands.
+//! Two drivers share one session engine: the monitor's `vsock ctl <verb>`
+//! command and the EL0 `sys_vsock_ctl` slot (M115d, issue #2463, ADR 0007
+//! amendment). One call is one connection — connect to the host's
+//! `--vsock-ctl-port` listener, read the greeting's challenge, answer
+//! `HMAC-SHA256(key, domain || 0x00 || challenge)` from the `vsock-ctl`
+//! SECRETS.TXT row (a uid_system credential the kernel store serves to no
+//! EL0 reader), send the request line, print the reply's verdict fields,
+//! shut down. The wire grammar is pinned in the ADR; `user/go/vsockctl`
+//! is the same protocol in Go for host-test mirrors.
+//!
+//! M115d arms `suspend`: a session for that verb first runs the guest
+//! quiesce — fsync the VLFS data disk (when mounted), re-publish
+//! SETTINGS.TXT through its own fsync'd path, and write the
+//! `SUSPEND.MARK` request marker on the share — THEN sends the verb. A
+//! quiesce failure aborts the request by name before it is sent; the
+//! machine is never frozen half-prepared.
 //!
 //! Three exercise modes exist for the gate's auth negatives, and only for
 //! that: `badauth` corrupts the MAC, `replay` re-uses a captured auth line
@@ -23,7 +31,12 @@ const std = @import("std");
 const console = @import("console.zig");
 const measure = @import("measure.zig");
 const secret = @import("secret.zig");
+const settings = @import("settings.zig");
+const spinlock = @import("spinlock.zig");
+const virtio_file = @import("virtio_file.zig");
 const virtio_vsock = @import("virtio_vsock.zig");
+const vlfs = @import("vlfs/vlfs.zig");
+const vlfs_disk = @import("vlfs/disk.zig");
 
 /// The runner's default `--vsock-ctl-port`; `vsock ctl` connects there.
 /// Distinct from the M115a probe listener (1208) — a ctl session is a
@@ -44,10 +57,35 @@ pub const secret_uid: u32 = 0;
 pub const pre_auth_max: usize = 256;
 pub const line_max: usize = 1024;
 
+/// The suspend request marker (M115d): written to the share by the
+/// quiesce step before the verb is sent — a REQUEST receipt, never a
+/// "suspended" claim (a refused reply leaves the marker behind, and that
+/// is the honest record of what the guest asked for).
+pub const suspend_marker = "SUSPEND.MARK";
+
+/// One session's outcome — what the syscall hands back to EL0. `ok` is the
+/// reply's `ok:true`; `code` names any refusal (host or local), matching
+/// the printed `code=` marker when one exists.
+pub const Verdict = struct {
+    ok: bool = false,
+    id: ?u32 = null,
+    code: [40]u8 = undefined,
+    code_len: usize = 0,
+
+    pub fn codeText(self: *const Verdict) []const u8 {
+        return self.code[0..self.code_len];
+    }
+
+    fn refuse(self: *Verdict, code: []const u8) void {
+        @memcpy(self.code[0..code.len], code);
+        self.code_len = code.len;
+    }
+};
+
 /// Encodable request words: `[A-Za-z0-9._-]` only, so a verb or name can
 /// never break the JSON line it rides. Grammar refusals belong to the
 /// host (`name_rejected` et al.) — the kernel encodes, the host judges.
-fn encodable(word: []const u8) bool {
+pub fn encodable(word: []const u8) bool {
     if (word.len == 0 or word.len > 31) return false;
     for (word) |c| {
         const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
@@ -196,62 +234,128 @@ fn recvLine(conn: *virtio_vsock.Conn, buf: []u8) RecvLine {
 
 /// Print a reply line's verdict as `vsock-ctl: reply [id=N] ok=<b>
 /// [code=<c>]` — the assertable marker; refusal replies may carry no id.
-/// A reply without a readable verdict reports itself as malformed.
-fn printReply(c: console.Console, line: []const u8) void {
+/// Returns what was read off the line so the session can hand the same
+/// verdict to a caller; a malformed line is reported, never guessed.
+fn printReply(c: console.Console, line: []const u8) Verdict {
+    var v: Verdict = .{};
     c.puts("vsock-ctl: reply");
     if (jsonId(line)) |id| {
+        v.id = id;
         c.puts(" id=");
         c.print_u64(id);
     }
     const ok = jsonOk(line) orelse {
         c.print_line(" malformed");
-        return;
+        v.refuse("malformed");
+        return v;
     };
+    v.ok = ok;
     c.puts(if (ok) " ok=true" else " ok=false");
     if (jsonStr(line, "code")) |code| {
+        if (code.len <= v.code.len) v.refuse(code);
         c.puts(" code=");
         c.puts(code);
     }
     c.puts("\n");
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// M115d (issue #2463): the suspend quiesce — fsync the persisted surfaces
+// and write the request marker BEFORE the verb leaves the guest.
+// ---------------------------------------------------------------------------
+
+/// The marker's `seq=` tail as a pure parse — absent or unparseable is 0
+/// (the marker is evidence, not state the suspend needs). Host-tested.
+fn markerSeq(body: []const u8) u64 {
+    const at = std.mem.indexOf(u8, body, "seq=") orelse return 0;
+    var v: u64 = 0;
+    var digits: usize = 0;
+    for (body[at + 4 ..]) |b| {
+        if (b < '0' or b > '9') break;
+        v = v * 10 + (b - '0');
+        digits += 1;
+    }
+    return if (digits > 0) v else 0;
+}
+
+/// The previous request's `seq` off the share's marker — each suspend
+/// carries a monotone receipt (1 on the first).
+fn suspendSeq() u64 {
+    var buf: [96]u8 = undefined;
+    const n = virtio_file.read_whole(suspend_marker, &buf) orelse return 0;
+    return markerSeq(buf[0..n]);
+}
+
+/// The guest's half of `suspend`: fsync VLFS when it is mounted, re-save
+/// SETTINGS.TXT through its own fsync'd publish path, and write the
+/// `SUSPEND.MARK` request receipt — then the verb may leave. A failure
+/// anywhere aborts by name: the machine never freezes half-quiesced.
+/// Returns false with the refusal already printed.
+fn suspendPrepare(c: console.Console) bool {
+    var vlfs_state: []const u8 = "absent";
+    if (vlfs_disk.mounted()) {
+        vlfs_disk.sync() catch |err| {
+            c.puts("vsock-ctl: suspend quiesce failed vlfs=");
+            c.print_line(vlfs.refusalName(err));
+            return false;
+        };
+        vlfs_state = "synced";
+    }
+    if (!settings.save_to_share()) {
+        c.print_line("vsock-ctl: suspend quiesce failed settings=save_refused");
+        return false;
+    }
+    const seq = suspendSeq() + 1;
+    var mark: [64]u8 = undefined;
+    const body = std.fmt.bufPrint(&mark, "virelai-suspend-request/1 seq={d}\n", .{seq}) catch return false;
+    if (virtio_file.write_whole(suspend_marker, body) != virtio_file.st_ok) {
+        c.print_line("vsock-ctl: suspend quiesce failed marker=write_refused");
+        return false;
+    }
+    c.puts("vsock-ctl: suspend quiesce vlfs=");
+    c.puts(vlfs_state);
+    c.puts(" settings=synced marker=seq=");
+    c.print_u64(seq);
+    c.puts("\n");
+    return true;
 }
 
 const Mode = enum { normal, badauth, replay, dup };
 
-/// `vsock ctl <verb> [name]` plus the exercise modes. Prints one
-/// `vsock-ctl:` verdict line per step the gate needs to see.
-pub fn run(c: console.Console, args: []const []const u8) void {
+/// The transport is one outstanding connection on shared statics —
+/// `virtio_vsock.open` arms a single `open_conn` and `send` stages into
+/// one `tx_buf` — so the monitor and the slot-93 callers serialize here:
+/// a session already in flight refuses the next `busy` rather than
+/// interleave frames.
+var session_lock = spinlock.Spinlock.init();
+
+/// One ctl session, end to end. Prints the `vsock-ctl:` verdict markers
+/// whatever the driver; `suspend` runs the M115d quiesce between auth and
+/// request. Returns the reply's verdict (or the local refusal's code).
+pub fn session(c: console.Console, verb: []const u8, name: []const u8, mode: Mode) Verdict {
+    var v: Verdict = .{};
+    if (!session_lock.try_lock()) {
+        c.print_line("vsock-ctl: refuse busy");
+        v.refuse("busy");
+        return v;
+    }
+    defer session_lock.unlock();
     if (!virtio_vsock.vs_ready) {
         c.print_line("vsock-ctl: refuse no_device");
-        return;
+        v.refuse("no_device");
+        return v;
     }
-    var mode: Mode = .normal;
-    var rest = args;
-    if (args.len > 0) {
-        if (std.mem.eql(u8, args[0], "badauth")) {
-            mode = .badauth;
-            rest = args[1..];
-        } else if (std.mem.eql(u8, args[0], "replay")) {
-            mode = .replay;
-            rest = args[1..];
-        } else if (std.mem.eql(u8, args[0], "dup")) {
-            mode = .dup;
-            rest = args[1..];
-        }
-    }
-    if (rest.len == 0 or rest.len > 2) {
-        c.print_line("vsock-ctl: usage 'vsock ctl [badauth|replay|dup] <verb> [name]'");
-        return;
-    }
-    const verb = rest[0];
-    const name: []const u8 = if (rest.len == 2) rest[1] else "";
-    if (!encodable(verb) or (rest.len == 2 and !encodable(name))) {
+    if (!encodable(verb) or (name.len > 0 and !encodable(name))) {
         c.print_line("vsock-ctl: refuse bad_arg");
-        return;
+        v.refuse("bad_arg");
+        return v;
     }
     var keybuf: [64]u8 = undefined;
     const key = ctlKey(&keybuf) orelse {
         c.print_line("vsock-ctl: refuse no_credential");
-        return;
+        v.refuse("no_credential");
+        return v;
     };
     // A captured auth line, for the replay mode's second connection.
     var captured: [128]u8 = undefined;
@@ -262,11 +366,13 @@ pub fn run(c: console.Console, args: []const []const u8) void {
         .connected => {},
         .refused => {
             c.print_line("vsock-ctl: connect refused");
-            return;
+            v.refuse("connect_refused");
+            return v;
         },
         .timeout => {
             c.print_line("vsock-ctl: connect timeout");
-            return;
+            v.refuse("connect_timeout");
+            return v;
         },
     }
     c.puts("vsock-ctl: connected port=");
@@ -282,13 +388,15 @@ pub fn run(c: console.Console, args: []const []const u8) void {
             if (n > pre_auth_max) {
                 c.print_line("vsock-ctl: greeting too_long");
                 virtio_vsock.rst(&conn);
-                return;
+                v.refuse("line_too_long");
+                return v;
             }
             var challenge: [32]u8 = undefined;
             if (!challengeFrom(line[0..n], &challenge)) {
                 c.print_line("vsock-ctl: refuse bad_greeting");
                 virtio_vsock.rst(&conn);
-                return;
+                v.refuse("bad_greeting");
+                return v;
             }
             var mac: [measure.digest_len]u8 = undefined;
             var msg: [64]u8 = undefined;
@@ -305,13 +413,15 @@ pub fn run(c: console.Console, args: []const []const u8) void {
         else => {
             c.print_line("vsock-ctl: greeting failed");
             virtio_vsock.rst(&conn);
-            return;
+            v.refuse("io_error");
+            return v;
         },
     }
     if (virtio_vsock.send(&conn, auth_line[0..auth_len]) != .ok) {
         c.print_line("vsock-ctl: send auth failed");
         virtio_vsock.rst(&conn);
-        return;
+        v.refuse("io_error");
+        return v;
     }
     @memcpy(captured[0..auth_len], auth_line[0..auth_len]);
     captured_len = auth_len;
@@ -321,23 +431,27 @@ pub fn run(c: console.Console, args: []const []const u8) void {
             if (jsonOk(line[0..n]) != true) {
                 c.puts("vsock-ctl: auth refused");
                 if (jsonStr(line[0..n], "code")) |code| {
+                    if (code.len <= v.code.len) v.refuse(code);
                     c.puts(" code=");
                     c.puts(code);
                 }
                 c.puts("\n");
                 virtio_vsock.rst(&conn);
-                return;
+                if (v.code_len == 0) v.refuse("auth_failed");
+                return v;
             }
             c.print_line("vsock-ctl: authed");
         },
         .eof, .reset => {
             c.print_line("vsock-ctl: auth refused code=conn_lost");
-            return;
+            v.refuse("conn_lost");
+            return v;
         },
         else => {
             c.print_line("vsock-ctl: auth timeout");
             virtio_vsock.rst(&conn);
-            return;
+            v.refuse("auth_timeout");
+            return v;
         },
     }
 
@@ -362,7 +476,8 @@ pub fn run(c: console.Console, args: []const []const u8) void {
         }
         if (!opened) {
             c.print_line("vsock-ctl: replay reconnect failed");
-            return;
+            v.refuse("io_error");
+            return v;
         }
         // Drain the fresh greeting; the challenge inside differs — that is
         // the whole point of the negative.
@@ -372,33 +487,58 @@ pub fn run(c: console.Console, args: []const []const u8) void {
             .line => |n| {
                 c.puts("vsock-ctl: replay refused");
                 if (jsonStr(line[0..n], "code")) |code| {
+                    if (code.len <= v.code.len) v.refuse(code);
                     c.puts(" code=");
                     c.puts(code);
                 }
                 c.puts("\n");
             },
-            else => c.print_line("vsock-ctl: replay conn_lost"),
+            else => {
+                c.print_line("vsock-ctl: replay conn_lost");
+                v.refuse("conn_lost");
+            },
         }
         virtio_vsock.rst(&conn2);
-        return;
+        return v;
+    }
+
+    // ---- M115d: the suspend quiesce rides between auth and request -------
+    // Every suspend request quiesces first — dup mode's first request is
+    // a real suspend (its forged second send is the negative).
+    if (std.mem.eql(u8, verb, "suspend") and name.len == 0) {
+        if (!suspendPrepare(c)) {
+            virtio_vsock.rst(&conn);
+            v.refuse("io_error");
+            return v;
+        }
     }
 
     // ---- request(s) -------------------------------------------------------
     var req: [128]u8 = undefined;
-    const req_len = (if (rest.len == 2)
+    const req_len = (if (name.len > 0)
         std.fmt.bufPrint(&req, "{{\"id\":1,\"verb\":\"{s}\",\"name\":\"{s}\"}}\n", .{ verb, name }) catch unreachable
     else
         std.fmt.bufPrint(&req, "{{\"id\":1,\"verb\":\"{s}\"}}\n", .{verb}) catch unreachable).len;
     if (virtio_vsock.send(&conn, req[0..req_len]) != .ok) {
         c.print_line("vsock-ctl: send request failed");
         virtio_vsock.rst(&conn);
-        return;
+        v.refuse("io_error");
+        return v;
     }
     switch (recvLine(&conn, &line)) {
-        .line => |n| printReply(c, line[0..n]),
-        .eof => c.print_line("vsock-ctl: reply eof"),
-        .reset => c.print_line("vsock-ctl: reply reset"),
-        else => c.print_line("vsock-ctl: reply timeout"),
+        .line => |n| v = printReply(c, line[0..n]),
+        .eof => {
+            c.print_line("vsock-ctl: reply eof");
+            v.refuse("conn_lost");
+        },
+        .reset => {
+            c.print_line("vsock-ctl: reply reset");
+            v.refuse("conn_lost");
+        },
+        else => {
+            c.print_line("vsock-ctl: reply timeout");
+            v.refuse("io_error");
+        },
     }
 
     // dup: the identical request line again — id still 1, the host's name
@@ -406,13 +546,43 @@ pub fn run(c: console.Console, args: []const []const u8) void {
     if (mode == .dup) {
         _ = virtio_vsock.send(&conn, req[0..req_len]);
         switch (recvLine(&conn, &line)) {
-            .line => |n| printReply(c, line[0..n]),
-            else => c.print_line("vsock-ctl: dup reply lost"),
+            .line => |n| v = printReply(c, line[0..n]),
+            else => {
+                c.print_line("vsock-ctl: dup reply lost");
+                v.refuse("conn_lost");
+            },
         }
     }
 
     virtio_vsock.shutdown(&conn);
     c.print_line("vsock-ctl: closed");
+    return v;
+}
+
+/// `vsock ctl <verb> [name]` plus the exercise modes. Prints one
+/// `vsock-ctl:` verdict line per step the gate needs to see.
+pub fn run(c: console.Console, args: []const []const u8) void {
+    var mode: Mode = .normal;
+    var rest = args;
+    if (args.len > 0) {
+        if (std.mem.eql(u8, args[0], "badauth")) {
+            mode = .badauth;
+            rest = args[1..];
+        } else if (std.mem.eql(u8, args[0], "replay")) {
+            mode = .replay;
+            rest = args[1..];
+        } else if (std.mem.eql(u8, args[0], "dup")) {
+            mode = .dup;
+            rest = args[1..];
+        }
+    }
+    if (rest.len == 0 or rest.len > 2) {
+        c.print_line("vsock-ctl: usage 'vsock ctl [badauth|replay|dup] <verb> [name]'");
+        return;
+    }
+    const verb = rest[0];
+    const name: []const u8 = if (rest.len == 2) rest[1] else "";
+    _ = session(c, verb, name, mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,4 +626,13 @@ test "vsock_ctl: fixed-shape reply extraction" {
     for (0..32) |i| try std.testing.expectEqual(@as(u8, @intCast(i)), ch[i]);
     var bad: [32]u8 = undefined;
     try std.testing.expect(!challengeFrom("{\"challenge\":\"xyz\"}", &bad));
+}
+
+test "vsock_ctl: suspend marker seq reads its own tail" {
+    try std.testing.expectEqual(@as(u64, 1), markerSeq("virelai-suspend-request/1 seq=1\n"));
+    try std.testing.expectEqual(@as(u64, 41), markerSeq("virelai-suspend-request/1 seq=41\n"));
+    try std.testing.expectEqual(@as(u64, 0), markerSeq("virelai-suspend-request/1\n"));
+    try std.testing.expectEqual(@as(u64, 0), markerSeq("seq="));
+    try std.testing.expectEqual(@as(u64, 0), markerSeq(""));
+    try std.testing.expectEqual(@as(u64, 7), markerSeq("seq=7 trailing junk"));
 }

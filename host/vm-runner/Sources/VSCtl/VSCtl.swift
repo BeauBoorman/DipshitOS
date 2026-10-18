@@ -51,6 +51,13 @@ public enum VSCtl {
         "line_too_long": "line exceeds its byte limit",
         "idle_timeout": "no request inside the idle budget",
         "io_error": "transport failure",
+        // M115d (#2463): the suspend verb's refusal names — a request
+        // with no armed destination, a device set VZ cannot save, a
+        // failed save, and a suspend already in flight.
+        "no_state": "no suspend save destination is armed",
+        "unsupported": "this device set cannot be saved",
+        "save_failed": "the machine-state save refused",
+        "busy": "a suspend is already in flight",
     ]
 
     /// Load the `vsock-ctl` row's value from the share's SECRETS.TXT —
@@ -213,6 +220,17 @@ public enum FlatParse {
 // arrive already LF-stripped; feed returns the reply line to write and
 // whether the session dies after it (fatal codes close the connection).
 
+/// M115d (#2463): the suspend driver's verdict — `accepted` means the
+/// machine-state file exists on disk and the reply may say `ok:true`;
+/// a refusal carries the ADR 0056 code the guest should read.
+public struct SuspendVerdict {
+    public var accepted: Bool
+    public var code: String
+
+    public static var accept: SuspendVerdict { SuspendVerdict(accepted: true, code: "") }
+    public static func refuse(_ code: String) -> SuspendVerdict { SuspendVerdict(accepted: false, code: code) }
+}
+
 public struct CTLSession {
     public enum Verdict {
         case reply(Data)      // write this line, keep going
@@ -228,6 +246,17 @@ public struct CTLSession {
     /// Whether the handshake completed — the glue's timeout-refusal picks
     /// its code off this (auth_timeout vs idle_timeout).
     public var authedForMarker: Bool { authed }
+
+    /// M115d (#2463): the suspend driver, injected by the glue. It runs
+    /// AFTER the request is judged and BEFORE the reply is written, so an
+    /// `ok:true` reply only ever follows a save that actually landed.
+    /// Nil keeps the M115b stub answer (`unimplemented`).
+    public var suspendHandler: (() -> SuspendVerdict)?
+
+    /// Set when the last judged request was an ACCEPTED suspend — the
+    /// transport's post-reply hook (write-then-stop) reads it. Reset on
+    /// every feed.
+    public private(set) var acceptedSuspend = false
 
     /// The session's 32-byte challenge is injected — the glue supplies
     /// SecRandomCopyBytes; tests pin it.
@@ -321,6 +350,7 @@ public struct CTLSession {
     }
 
     private mutating func feedRequest(line: String) -> (Data, Bool) {
+        acceptedSuspend = false
         let obj: [String: FlatValue]
         switch FlatParse.object(line) {
         case .ok(let o): obj = o
@@ -345,6 +375,19 @@ public struct CTLSession {
         switch verb {
         case "suspend":
             guard obj["name"] == nil else { return (errorLine("bad_request", id: nil), false) }
+            lastID = id
+            // M115d (#2463): the armed verb asks the injected driver —
+            // an ok reply means the save exists; a refusal carries its
+            // own name. A nil handler is the M115b stub posture.
+            if let suspendHandler {
+                let verdict = suspendHandler()
+                guard verdict.accepted else {
+                    return (errorLine(verdict.code, id: id), false)
+                }
+                acceptedSuspend = true
+                return (Data("{\"id\":\(id),\"ok\":true,\"result\":{\"verb\":\"suspend\",\"state\":\"saved\"}}\n".utf8), false)
+            }
+            return (errorLine("unimplemented", id: id), false)
         case "snapshot":
             guard case .str(let name) = obj["name"] else {
                 return (errorLine("bad_request", id: nil), false)

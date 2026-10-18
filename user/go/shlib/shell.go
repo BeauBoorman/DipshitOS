@@ -188,6 +188,14 @@ type Host interface {
 	ReadTTYLine() (string, bool)
 	// SleepSeconds parks the caller for about n seconds.
 	SleepSeconds(n int)
+	// Suspend runs one virelai-ctl/1 `suspend` session on the caller's
+	// behalf (M115d, slot 93): the kernel authenticates with its
+	// uid_system credential and relays the host's verdict — the seam
+	// carries no credential bytes by design. ok=true only when the reply
+	// was `ok:true` (for suspend that return may land on the far side of
+	// a host save/restore — the caller's next instruction is the
+	// resume); a refused session reports its ADR 0056 code name.
+	Suspend() (ok bool, code string)
 }
 
 // Env is the shell-local variable table: insertion-ordered, with the

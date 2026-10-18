@@ -156,7 +156,7 @@ test "syscall: M94 trace and profile control and remaining observability stub ar
 
 test "syscall: ABI metadata covers every registered row without pointers" {
     const abi = syscall.abi;
-    try std.testing.expectEqual(@as(usize, 93), abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 94), abi.slots.len);
     for (&abi.slots, 0..) |slot, index| {
         try std.testing.expectEqual(index, slot.number);
         try std.testing.expectEqualStrings(slot.name(), entry_info(index).?.name);
@@ -178,7 +178,7 @@ test "syscall: ABI metadata covers every registered row without pointers" {
             try std.testing.expect(earlier.number != item.number or earlier.selector != item.selector or earlier.op != item.op);
         }
     }
-    try std.testing.expect(abi.lookup(93) == null); // first free slot after #2481's sys_audio_rec_info/rec (91/92); 89 was ADR 0054's reservation
+    try std.testing.expect(abi.lookup(94) == null); // first free slot after #2463's sys_vsock_ctl (93); 89 was ADR 0054's reservation
     try std.testing.expectEqual(abi.ArgKind.string, abi.shape(79, .{ 0, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.fd, abi.shape(80, .{ 2, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.int, abi.shape(27, .{ 0, 0, 0, 0x8000000000000002, 0, 0 }).?.args[0].kind);
@@ -214,7 +214,7 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
             implemented += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 93), implemented);
+    try std.testing.expectEqual(@as(usize, 94), implemented);
     try std.testing.expectEqualStrings("sys_socket", entry_info(80).?.name);
     try std.testing.expectEqualStrings("sys_fs_metadata", entry_info(79).?.name);
     try std.testing.expectEqualStrings("sys_pipe_read", entry_info(sys_pipe_read).?.name);
@@ -317,7 +317,7 @@ test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
     try std.testing.expectEqual(error_result(.einval), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(u64, 1), call_count(89));
 
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 93));
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 94));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
 }
@@ -1405,7 +1405,7 @@ test "syscall: counters are monotonic and report is deterministic" {
     var con = mock.console();
     report(&con);
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=93\n" ++
+        "syscalls: slots=64 implemented=94\n" ++
             "  0 sys_ping calls=2\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1499,7 +1499,8 @@ test "syscall: counters are monotonic and report is deterministic" {
             "  89 sys_grant_admin calls=0\n" ++
             "  90 sys_gpucomp calls=0\n" ++
             "  91 sys_audio_rec_info calls=0\n" ++
-            "  92 sys_audio_rec calls=0\n",
+            "  92 sys_audio_rec calls=0\n" ++
+            "  93 sys_vsock_ctl calls=0\n",
         mock.contents(),
     );
 }
@@ -2890,7 +2891,7 @@ test "syscall: slot-65 cmd 22 GPU3D — typed descriptor boundary on the existin
 
     // Slot count/table unchanged: cmd 22 is the only new kernel entry,
     // and it rides slot 65 — the dispatch table itself did not grow.
-    try std.testing.expectEqual(@as(usize, 93), syscall.abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 94), syscall.abi.slots.len);
     gpu3d_device.reset_state();
 }
 
@@ -5897,7 +5898,7 @@ test "syscall: SYS_TIME (slot 66, #1058) returns the firmware wall-clock epoch" 
     // #2398 slot 88 (sys_scanout_read); M111b #2409 slots 89 (the ADR-0054
     // reservation row) + 90 (sys_gpucomp); M118c #2481 slots 91/92
     // (sys_audio_rec_info, sys_audio_rec).
-    try std.testing.expectEqual(@as(usize, 93), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 94), syscall.implemented_count);
 
     const saved_epoch = timer.boot_epoch_secs;
     const saved_ticks = timer.ticks;
@@ -6180,7 +6181,7 @@ test "syscall: M50 TS3 gate table is explicit, bounded, and exactly the ADR 0024
         try std.testing.expect(gate.number < syscall.implemented_count);
         try std.testing.expect(entry_info(gate.number) != null);
     }
-    try std.testing.expectEqual(@as(usize, 93), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 94), syscall.implemented_count);
 }
 
 test "syscall: no slot can raise uid/caps (TS3 consumes caps, adds no setter)" {

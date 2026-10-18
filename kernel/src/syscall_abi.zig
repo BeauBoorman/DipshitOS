@@ -168,6 +168,12 @@ pub const slots = [_]Slot{
     // S16/48kHz/mono, len capped by the 64 KiB ring).
     row(91, "sys_audio_rec_info", .{.ptr}),
     row(92, "sys_audio_rec", .{ .int, .int, .int, .ptr, .int }),
+    // M115d (#2463, ADR 0056 D5 + ADR 0007 amendment): slot 93 — the
+    // ONE EL0 door to the virelai-ctl/1 channel. The kernel keeps the
+    // uid_system credential and runs the whole authenticated session on
+    // the caller's behalf; EL0 names a verb (and an optional name arg)
+    // and gets the reply verdict back — no key ever crosses the seam.
+    row(93, "sys_vsock_ctl", .{ str(1), .int, str(3), .int, .ptr, .int }),
 };
 
 // op-dependent shapes override the base row. No pointed-to output or binary

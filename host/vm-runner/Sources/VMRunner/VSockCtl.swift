@@ -21,12 +21,23 @@ final class VSockCtlSession {
     private var session: CTLSession
     private let queue = DispatchQueue(label: "vsock-ctl-session")
     private let onDone: (VSockCtlSession) -> Void
+    /// M115d (#2463): runs AFTER the reply is written when the request
+    /// was an accepted suspend — the runner's stop+exit tail. The reply
+    /// ordering is the wire contract: `ok:true` lands first so the saved
+    /// guest's first post-restore read is its answer.
+    private let onSuspendAccepted: (() -> Void)?
 
-    init(connection: VZVirtioSocketConnection, key: Data, onDone: @escaping (VSockCtlSession) -> Void) {
+    init(connection: VZVirtioSocketConnection, key: Data,
+         suspendHandler: (() -> SuspendVerdict)? = nil,
+         onSuspendAccepted: (() -> Void)? = nil,
+         onDone: @escaping (VSockCtlSession) -> Void) {
         self.connection = connection
         var rng = SystemRandomNumberGenerator()
         let challenge = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &rng) }
-        self.session = CTLSession(key: key, challenge: challenge)
+        var session = CTLSession(key: key, challenge: challenge)
+        session.suspendHandler = suspendHandler
+        self.session = session
+        self.onSuspendAccepted = onSuspendAccepted
         self.onDone = onDone
     }
 
@@ -135,6 +146,13 @@ final class VSockCtlSession {
             if let code = Self.replyCode(reply) {
                 print("VSOCK-CTL: reply code=\(code)\(fatal ? " (session closed)" : "")")
             }
+            // M115d (#2463): an accepted suspend replies ok FIRST (the
+            // guest freezes mid-read and finds the answer on restore),
+            // then the runner stops the VM and the run ends.
+            if session.acceptedSuspend {
+                print("VSOCK-CTL: reply ok=true verb=suspend")
+                onSuspendAccepted?()
+            }
             if fatal { return }
             // Post-auth lines relax to the session limit and the idle
             // budget.
@@ -160,18 +178,118 @@ final class VSockCtlSession {
 final class VSockCtlListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
     private let key: Data
     private var sessions: [VSockCtlSession] = []
+    /// M115d (#2463): the suspend driver + the post-reply tail, shared
+    /// by every session the listener accepts.
+    private let suspendHandler: (() -> SuspendVerdict)?
+    private let onSuspendAccepted: (() -> Void)?
 
-    init(key: Data) { self.key = key }
+    init(key: Data,
+         suspendHandler: (() -> SuspendVerdict)? = nil,
+         onSuspendAccepted: (() -> Void)? = nil) {
+        self.key = key
+        self.suspendHandler = suspendHandler
+        self.onSuspendAccepted = onSuspendAccepted
+    }
 
     func listener(_ listener: VZVirtioSocketListener,
                   shouldAcceptNewConnection connection: VZVirtioSocketConnection,
                   from socketDevice: VZVirtioSocketDevice) -> Bool {
         guard sessions.count < VSCtl.maxSessions else { return false }
-        let session = VSockCtlSession(connection: connection, key: key) { [weak self] done in
+        let session = VSockCtlSession(connection: connection, key: key,
+                                      suspendHandler: suspendHandler,
+                                      onSuspendAccepted: onSuspendAccepted) { [weak self] done in
             self?.sessions.removeAll { $0 === done }
         }
         sessions.append(session)
         session.start()
         return true
+    }
+}
+
+// MARK: - SuspendCtl — the M115d (#2463) suspend action
+
+/// The runner's suspend driver behind the ctl `suspend` verb.
+/// `begin()` runs synchronously on the session's serial queue — pause
+/// the VM, save machine state into the profile's `saved-state/`, and
+/// report the verdict so the reply means what it says: `ok:true` only
+/// ever follows a state file that exists. `finish()` runs after the
+/// reply is written: stop the VM and exit — a suspended run is done,
+/// and `--resume` is the continuation.
+final class SuspendCtl {
+    /// The machine-state file inside a profile's saved-state/ — the one
+    /// name both the save and `--resume` agree on.
+    static let stateFileName = "state.vzsave"
+
+    private let vm: VZVirtualMachine
+    private let queue: DispatchQueue
+    /// The profile's saved-state directory; nil when no profile is
+    /// armed — the `no_state` refusal.
+    private let savedStateDir: URL?
+    /// A validateSaveRestoreSupport refusal (custom-virtio et al.) —
+    /// the `unsupported` code, computed once at arm time.
+    private let unsupported: String?
+    private var inFlight = false
+
+    init(vm: VZVirtualMachine, queue: DispatchQueue,
+         savedStateDir: URL?, unsupported: String?) {
+        self.vm = vm
+        self.queue = queue
+        self.savedStateDir = savedStateDir
+        self.unsupported = unsupported
+    }
+
+    /// The wire verdict for one `suspend` request. Runs the VZ calls on
+    /// the VM's own queue and waits — the session's serial queue is the
+    /// caller, so a semaphore hop is the honest serialization.
+    func begin() -> SuspendVerdict {
+        if inFlight { return .refuse("busy") }
+        if unsupported != nil { return .refuse("unsupported") }
+        guard let dir = savedStateDir else { return .refuse("no_state") }
+        inFlight = true
+        let stateURL = dir.appendingPathComponent(Self.stateFileName)
+        // A fresh suspend SUPERSEDES the previous saved state — VZ
+        // refuses to create the file over an existing one (observed
+        // live-suspend-resume sv2: VZErrorDomain Code=11 "File exists").
+        try? FileManager.default.removeItem(at: stateURL)
+        let done = DispatchSemaphore(value: 0)
+        var verdict = SuspendVerdict.refuse("io_error")
+        queue.async { [vm] in
+            vm.pause { result in
+                if case .failure(let error) = result {
+                    FileHandle.standardError.write(Data("ERROR: VSOCK-CTL: suspend pause refused: \(error as NSError)\n".utf8))
+                    verdict = .refuse("save_failed")
+                    done.signal()
+                    return
+                }
+                print("VSOCK-CTL: suspend paused; saving \(stateURL.path)")
+                vm.saveMachineStateTo(url: stateURL) { error in
+                    if let error {
+                        FileHandle.standardError.write(Data("ERROR: VSOCK-CTL: suspend save refused: \(error as NSError)\n".utf8))
+                        // The guest is paused mid-request and the freeze
+                        // it asked for never landed — bring it back.
+                        vm.resume { _ in done.signal() }
+                        verdict = .refuse("save_failed")
+                        return
+                    }
+                    print("VSOCK-CTL: suspend saved \(Self.stateFileName)")
+                    verdict = .accept
+                    done.signal()
+                }
+            }
+        }
+        done.wait()
+        return verdict
+    }
+
+    /// The post-reply tail: the ok line is on the wire (the guest will
+    /// read it on restore), so the run ends through the runner's own
+    /// finish path. `suspendStopInFlight` tells scriptPoll the coming
+    /// stop is the suspend teardown, never an early-stop failure.
+    func finish() {
+        queue.async {
+            print("VSOCK-CTL: suspend stopping")
+            suspendStopInFlight = true
+            VMRunner.finish(success: true)
+        }
     }
 }
