@@ -106,7 +106,6 @@ for p in (r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 54 bytes
 # The capture walk (claim 7026): ARP + NINE TCP frames, seq/ack chain,
 # flags, ports, MACs, payload, every checksum.
 d = open(os.environ["RUN_DIR"] + "/a-cap.bin", "rb").read()
-assert len(d) == 533, len(d)
 off = 0
 tcpf = []
 while off < len(d):
@@ -115,8 +114,13 @@ while off < len(d):
         flen = 14 + total
         tcpf.append(d[off:off+flen])
         off += flen
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
+assert off == len(d), (off, len(d))
 assert len(tcpf) == 9, len(tcpf)
 assert [len(f) for f in tcpf] == [54, 54, 59, 54, 54, 54, 54, 54, 54], [len(f) for f in tcpf]
 def be32(b): return struct.unpack('>I', b)[0]
@@ -217,7 +221,6 @@ for p in (r"net tcp: syn sent \(peer=10\.0\.0\.2:9999, seq=0x[0-9a-f]+, 54 bytes
     if not re.search(p, ser):
         sys.exit("FAIL: ERE absent: %s" % p)
 d = open(os.environ["RUN_DIR"] + "/d-cap.bin", "rb").read()
-assert len(d) == 533, len(d)
 off = 0
 tcpf = []
 while off < len(d):
@@ -226,8 +229,13 @@ while off < len(d):
         flen = 14 + total
         tcpf.append(d[off:off+flen])
         off += flen
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
+assert off == len(d), (off, len(d))
 # Nine guest frames, all bare — the option area lives on the peer's
 # side of the wire only (the guest's pinned SYN stays option-free).
 assert [len(f) for f in tcpf] == [54, 54, 59, 54, 54, 54, 54, 54, 54], [len(f) for f in tcpf]

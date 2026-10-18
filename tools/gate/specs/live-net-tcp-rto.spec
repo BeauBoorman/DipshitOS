@@ -89,16 +89,23 @@ if not ms or int(ms[-1]) < 2:
 d = open(os.environ["RUN_DIR"] + "/a-cap.bin", "rb").read()
 off = 0
 syns = []
+v6b = 0
 while off < len(d):
     if d[off+12:off+14] == b'\x08\x00':
         total = (d[off+16] << 8) | d[off+17]
         syns.append(d[off:off+14+total])
         off += 14 + total
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        v6n = 14 + 40 + ((d[off+18] << 8) | d[off+19])
+        v6b += v6n
+        off += v6n
     else:
         off += 42
 assert len(syns) >= 3, len(syns)
 assert all(len(f) == 54 for f in syns), [len(f) for f in syns]
-assert len(d) == 42 + 54 * len(syns), len(d)
+assert len(d) == 42 + 54 * len(syns) + v6b, (len(d), v6b)
 assert all(f == syns[0] for f in syns), "retransmitted SYNs must be byte-identical"
 def chk(data):
     if len(data) % 2: data += b'\x00'
@@ -140,6 +147,10 @@ while off < len(d):
         total = (d[off+16] << 8) | d[off+17]
         tcpf.append(d[off:off+14+total])
         off += 14 + total
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
 assert len(tcpf) == 2, len(tcpf)
@@ -184,6 +195,10 @@ while off < len(d):
         total = (d[off+16] << 8) | d[off+17]
         tcpf.append(d[off:off+14+total])
         off += 14 + total
+    elif d[off+12:off+14] == b"\x86\xdd":
+        # M117b (#2474): NDP/ICMPv6 frames are legitimate capture traffic;
+        # skip them by the v6 length decode (14 + 40 + payload_len).
+        off += 14 + 40 + ((d[off+18] << 8) | d[off+19])
     else:
         off += 42
 assert len(tcpf) == 13, len(tcpf)
