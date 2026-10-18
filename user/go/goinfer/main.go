@@ -7,6 +7,10 @@ package main
 //
 // Journeys (the seat exec's argv):
 //
+//	(bare)          M122c (#2572): the windowed view — Stub/Model buttons
+//	                and a log mirroring every goinfer: line, for the
+//	                launcher's "LLM Infer" row. One compute session per
+//	                process: a spent session says so, honestly.
 //	stub            deterministic PRNG-weights model, K=5 runs — the
 //	                live-gpu3d leg payload; needs no fetched weights
 //	model [path]    the owner-approved real model from a VIW image on the
@@ -402,13 +406,23 @@ func run(h host, args []string) error {
 	return nil
 }
 
+// dispatch picks the presentation: a bare launch is a person clicking the
+// catalog row — the windowed view, not a usage error on a console they
+// cannot see (M122c). An argv names a journey.
+func dispatch(args []string) int {
+	if len(args) == 0 {
+		return runView()
+	}
+	if err := run(guestHost{}, args); err != nil {
+		return 1
+	}
+	return 0
+}
+
 func main() {
 	var args []string
 	if a := vi.Args(); len(a) > 1 {
 		args = a[1:]
 	}
-	if err := run(guestHost{}, args); err != nil {
-		vi.Exit(1)
-	}
-	vi.Exit(0)
+	vi.Exit(dispatch(args))
 }

@@ -3,6 +3,11 @@
 //
 //	exec GOREC.ELF <seconds> <out.wav>
 //
+// M122c (#2572): a BARE launch is the windowed view — the launcher's
+// "Recorder" row opens a tabapp window with the capture tuple, a Record
+// button/'r' key and the same gorec: lines in-window. The two-argument
+// form stays the headless record every gate drives.
+//
 // It records <seconds> of the v1 capture tuple (S16 / 48 kHz / mono — the
 // only tuple sys_audio_rec, slot 92, accepts) into a proper RIFF/WAVE file
 // published crash-safe through vi.WriteFileSafe (temp + fsync +
@@ -58,12 +63,23 @@ var (
 )
 
 func main() {
-	vi.Exit(run(args()))
+	vi.Exit(dispatch(args()))
 }
 
-// run is the whole program as a testable function: it returns the exit
-// status main passes to vi.Exit. `gorec: done` is deferred so EVERY exit
-// path ends on the one anchor the gate's stage script waits for.
+// dispatch picks the presentation: a bare launch is a person clicking the
+// catalog row — the windowed view, not a usage line on a console they
+// cannot see (M122c). The two-argument form is the headless record every
+// gate drives.
+func dispatch(argv []string) int {
+	if len(argv) == 1 {
+		return runView()
+	}
+	return run(argv)
+}
+
+// run is the whole headless program as a testable function: it returns the
+// exit status main passes to vi.Exit. `gorec: done` is deferred so EVERY
+// exit path ends on the one anchor the gate's stage script waits for.
 func run(argv []string) int {
 	defer console("gorec: done")
 
@@ -71,6 +87,14 @@ func run(argv []string) int {
 	if !ok {
 		return 2
 	}
+	return record(secs, path)
+}
+
+// record is the capture pipeline both presentations share: query the
+// tuple, fill one WAV body through the bounded ring loop, publish
+// crash-safe, print the receipt. The view tees the same console lines
+// into its log, so every word is identical whichever way it was reached.
+func record(secs int, path string) int {
 	total := pcmBytes(secs)
 
 	info, err := capQuery()

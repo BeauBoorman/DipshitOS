@@ -152,6 +152,12 @@ if sys.argv[2] != "1":
 for tool in ("GOUPD.ELF", "AGENTD.ELF"):
     if tool not in names:
         names.append(tool)
+# M122c (#2572): catalog rows open a window, so the pure-CLI tools left
+# the manifest — but they stay staged, because `exec GOSNAP.ELF ls` /
+# `exec GODIFF.ELF a b` in a shell are how they are honestly driven.
+for tool in ("GOSNAP.ELF", "GODIFF.ELF"):
+    if tool not in names:
+        names.append(tool)
 print("\n".join(names))
 PY
 }

@@ -61,6 +61,22 @@ if os.path.exists(p):
     sys.exit("the absent-device refusal left a file behind: " + p)
 PY
 
+# Run 02 -- M122c (#2572): a BARE `exec GOREC.ELF` is the launcher's click.
+# It must open the windowed view — `gorec: view open id=` on serial — never
+# fall to the usage line. The run ends on the marker; the window is torn
+# down with the boot.
+vgate_file script-view.txt <<'EOF'
+exec GOREC.ELF
+EOF
+
+vgate_run 02 -- --script '$RUN_DIR/script-view.txt' --script-expect 'gorec: view open id=' --timeout 90
+
+vgate_assert 02 serial-contains 'exec: loaded GOREC.ELF'
+vgate_assert 02 serial-contains 'gorec: view open id='
+vgate_assert 02 serial-absent 'gorec: window refused'
+vgate_assert 02 serial-absent 'gorec: usage:'
+vgate_assert 02 serial-absent '[EXC] parking'
+
 # The capture leg -- SoundInProbe --sound-in --share: the input stream at
 # index 0, the VirtioFS share as exec's app source and the WAV's /host. The
 # guest takes 2 s of the v1 tuple (192000 B = 3 bounded slot-92 calls) and

@@ -39,13 +39,10 @@ GOSH.ELF | Shell | s | dock=false | v=2 | caps=file,process,term
 GOHELP.ELF | Help | h
 GOTOP.ELF | Top | p | dock=true
 GOSET.ELF | Settings | g | dock=false | v=2 | caps=file
-GODIFF.ELF | File Diff | d | dock=false | v=2 | caps=file
 GOVIEW.ELF | Image Viewer | v | dock=false | v=2 | opens=image
 GOSOUND.ELF | Sound | a | dock=false | v=2 | caps=file,window,audio | opens=audio
-ZC.BIN | Zig Compiler | z | dock=false | v=2 | caps=file,memory,process
 TABWM.BIN | Tabbed Desktop | m
 GOSTALGIA.ELF | Gostalgia | o | dock=false | v=2 | argv=shell --root /host/GS | caps=file,window,term,process
 GOSTORE.ELF | Store | i | dock=false | v=2 | caps=file,net
 GOINFER.ELF | LLM Infer | l | dock=false | v=2 | caps=file
-GOSNAP.ELF | Snapshots | b | dock=false | v=2 | caps=file
 GOREC.ELF | Recorder | r | dock=false | v=2 | caps=file,audio
