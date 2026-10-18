@@ -28,10 +28,15 @@
 //          saves state + the ASIF overlay + the marker into <dir> and exits;
 //          a NEW process restores from <dir> instead of booting and must
 //          recover the marker.) Device knobs --display/--input/--usb-msd/
-//          --custom-virtio are accepted under --vz-restore so their
-//          save/restore verdict can be measured (validateSaveRestoreSupport
-//          + the full cycle); a refusal is printed as `VZ-RESTORE:
-//          validateSaveRestoreSupport REFUSED ...` before the error exit.
+//          --custom-virtio/--gpu3d-metal/--vsock are accepted under
+//          --vz-restore so their save/restore verdict can be measured
+//          (validateSaveRestoreSupport + the full cycle); a refusal is
+//          printed as `VZ-RESTORE: validateSaveRestoreSupport REFUSED ...`
+//          before the error exit.
+//         [--vsock [--vsock-port <n>]] (M115a, #2460: attach Apple's
+//          VZVirtioSocketDevice and arm a host listener on port <n>,
+//          default 1208. A guest connect to that port is accepted and
+//          printed as `VSOCK: listener accepted guest connect ...`.)
 //         [--timeout <s|0>] (0 = run until Ctrl-C) [--expect <line>] [--terminal-marker <line>]
 //         [--host-session] (tools/session.sh's bundled local front door;
 //          close/Quit stop the VM, failures stay visible until dismissed)
@@ -516,6 +521,14 @@ var vzRestoreWitness: String?
 var vzRestoreVerifyCommand: String?
 var vzRestoreVerifyOutput: String?
 var virtioFSShareDir: String?
+// M115a (#2460): Apple's standard VSOCK device (`VZVirtioSocketDevice`) —
+// the probe for a restore-safe guest↔host channel. `--vsock` attaches the
+// device and arms a host listener on `--vsock-port` (default 1208); under
+// `--vz-restore` the card measures whether the device survives
+// save/restore and a post-restore guest connect is still accepted.
+var vsockEnabled = false
+var vsockPort: UInt32 = 1208
+var vsockPortSet = false
 var cpuCount = 2
 var timeout: TimeInterval = 30
 var timeoutExplicit = false
@@ -1044,10 +1057,10 @@ while idx < arguments.count {
         let valued = ["--overlay-base", "--vars", "--serial", "--cpus", "--timeout",
                       "--vz-restore-save", "--vz-restore-load", "--vz-restore-witness",
                       "--vz-restore-verify-command", "--vz-restore-verify-output",
-                      "--usb-msd", "--virtio-fs"]
-        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal"]
+                      "--usb-msd", "--virtio-fs", "--vsock-port"]
+        let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock"]
         guard valued.contains(arg) || bare.contains(arg) else {
-            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal.")
+            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal, --vsock.")
         }
         if valued.contains(arg) {
             guard idx + 1 < arguments.count, !arguments[idx + 1].hasPrefix("--") else {
@@ -1181,6 +1194,16 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--virtio-fs", idx + 1 < arguments.count {
         virtioFSShareDir = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--vsock" {
+        vsockEnabled = true
+        idx += 1
+    } else if arg == "--vsock-port", idx + 1 < arguments.count {
+        guard let port = UInt32(arguments[idx + 1]), port != 0 else {
+            fail("--vsock-port requires a numeric port value in 1...4294967294.")
+        }
+        vsockPort = port
+        vsockPortSet = true
         idx += 2
     } else if arg == "--cpus", idx + 1 < arguments.count {
         guard let n = Int(arguments[idx + 1]), n >= 1, n <= 8 else {
@@ -1858,6 +1881,9 @@ if hostSessionMode {
 if vzRestore, !timeout.isFinite || timeout <= 0 || timeout > 600 {
     fail("--vz-restore requires --timeout in (0, 600] seconds; it never runs unbounded.")
 }
+if vsockPortSet, !vsockEnabled {
+    fail("--vsock-port requires --vsock (the port names the host listener on the attached device).")
+}
 if vzRestoreWitness != nil, !vzRestore {
     fail("--vz-restore-witness requires --vz-restore.")
 }
@@ -2486,6 +2512,15 @@ if let sharePath = virtioFSShareDir {
     config.directorySharingDevices = [fileSystem]
     print("VIRTIO-FS: ENABLED tag=virelaios share=\(shareURL.path) read-write")
 }
+// M115a (#2460): Apple's standard virtio-socket device — the candidate
+// restore-safe guest↔host channel (the custom-virtio device is refused by
+// validateSaveRestoreSupport; this probe measures whether the SDK's own
+// vsock device is). Attached only under --vsock; the host listener on
+// --vsock-port is armed on the live device after the VM object exists.
+if vsockEnabled {
+    config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+    print("VSOCK: ENABLED host-listen-port=\(vsockPort)")
+}
 // Claim 0680: build the trigger list — one numbered raw file per
 // --snapshot-after instance, in registration order.
 do {
@@ -2976,6 +3011,7 @@ if vzRestore {
     if customVirtioEnabled { vzRestoreExtras.append(("custom-virtio", customVirtio: true)) }
     if gpu3dOptions.metal { vzRestoreExtras.append(("gpu3d-metal", customVirtio: true)) }
     if virtioFSShareDir != nil { vzRestoreExtras.append(("virtio-fs", customVirtio: false)) }
+    if vsockEnabled { vzRestoreExtras.append(("vsock", customVirtio: false)) }
     let vzRestoreDevices = vzRestoreExtras.isEmpty ? "headless-base" : vzRestoreExtras.map(\.name).joined(separator: ",")
     print("VZ-RESTORE: devices=\(vzRestoreDevices) mode=\(vzRestoreLoadDir != nil ? "load" : vzRestoreSaveDir != nil ? "save" : "same-process")")
     do {
@@ -3038,6 +3074,27 @@ final class VMRunnerDelegate: NSObject, VZVirtualMachineDelegate {
     /// without VZ narrating it says so).
     func verdict() -> String { stopReasons.verdictSuffix() }
 }
+
+// M115a (#2460): the host-side accept half of the vsock probe. VZ calls the
+// delegate on the VM's queue whenever the guest issues a connect to the
+// listened port; each accepted connection is retained because the SDK
+// documents that an accepted connection's fd dies with the object.
+final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
+    private var connections: [VZVirtioSocketConnection] = []
+
+    func listener(_ listener: VZVirtioSocketListener,
+                  shouldAcceptNewConnection connection: VZVirtioSocketConnection,
+                  from socketDevice: VZVirtioSocketDevice) -> Bool {
+        connections.append(connection)
+        print("VSOCK: listener accepted guest connect dport=\(connection.destinationPort) sport=\(connection.sourcePort) n=\(connections.count)")
+        return true
+    }
+}
+
+// Held strongly: `VZVirtioSocketListener.delegate` is weak, and the listener
+// itself must outlive the VM's socket device for connects to keep landing.
+let vsockListenerDelegate = VsockListenerDelegate()
+let vsockListener = VZVirtioSocketListener()
 
 // Held strongly: `VZVirtualMachine.delegate` is a weak property, so a
 // temporary would be deallocated immediately and never called.
@@ -3294,6 +3351,19 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
 }
 
 runner.queue.async {
+    // M115a (#2460): arm the host vsock listener on the VM's queue BEFORE
+    // any boot or restore — a post-restore guest connect must find the
+    // listener already in place in the loading process too.
+    if vsockEnabled {
+        if let socketDevice = runner.vm.socketDevices.first as? VZVirtioSocketDevice {
+            vsockListener.delegate = vsockListenerDelegate
+            socketDevice.setSocketListener(vsockListener, forPort: vsockPort)
+            print("VSOCK: host listener armed port=\(vsockPort)")
+        } else {
+            FileHandle.standardError.write(Data("ERROR: --vsock was attached but no VZVirtioSocketDevice is present on the VM.\n".utf8))
+            exit(1)
+        }
+    }
     if vzRestore, let load = vzRestoreLoadDir {
         // M70g G3 (#1459): the load process never boots — it restores the
         // other process's saved state into this fresh VZVirtualMachine.

@@ -134,6 +134,7 @@ const virtio_custom = @import("virtio_custom.zig"); // claim 0828: custom-virtio
 const gpu3d_device = @import("gpu3d_device.zig"); // M102b1 (issue #2162): experimental GPU3D channel (DID 0x1083)
 const virtio_file = @import("virtio_file.zig"); // M34 HF1+HF2 (issues #735/#736): host file channel client (queue 5)
 const virtio_fs = @import("virtio_fs.zig"); // M83g: standard VirtioFS/FUSE backend for /host
+const virtio_vsock = @import("virtio_vsock.zig"); // M115a (issue #2460): VZVirtioSocketDevice save/restore probe (DID 0x1053)
 // M34 HF5 (issue #739): one-time /data → /host migration at boot.
 
 const HandoffV2 = handoff.HandoffV2;
@@ -430,6 +431,12 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // attaches no such device, so `g3_probed` is false on every existing
     // gate and the boot output stays byte-identical.
     const g3_probed = gpu3d_device.probe();
+    // M115a (issue #2460): the standard virtio-vsock device (DID 0x1053,
+    // the runner's `--vsock` attachment) — PRE-EXIT discovery only, the
+    // claim-0013 discipline. The default runner attaches no socket device,
+    // so `vsock_probed` is false on every existing gate and the boot
+    // output stays byte-identical.
+    const vsock_probed = virtio_vsock.probe();
 
     var exited = false;
     var attempt: usize = 0;
@@ -476,7 +483,7 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // (discovered pre-exit) are handed to mmu.build_identity_map as the
     // extra Device windows above the blanket; mmu.zig stays
     // transport-agnostic.
-    var extra_windows: [14]mmu.DeviceWindow = undefined;
+    var extra_windows: [16]mmu.DeviceWindow = undefined;
     var extra_count: usize = 0;
     if (virtio_console.vp_ready and virtio_console.vp_bar0 != 0) {
         extra_windows[extra_count] = .{ .base = virtio_console.vp_bar0, .len = 0x10000 };
@@ -504,6 +511,10 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
         extra_count += 1;
     }
     if (fs_probed) extra_count += virtio_fs.add_device_windows(extra_windows[extra_count..]);
+    // M115a (issue #2460): the vsock transport BARs — the same Device-
+    // window treatment as fs so post-MMU common-config reads + queue
+    // notify reach the device. Absent device: no window, no change.
+    if (vsock_probed) extra_count += virtio_vsock.add_device_windows(extra_windows[extra_count..]);
     // Milestone four (claim 2665): the entropy transport BAR (pre-exit
     // resolved) — same Device-window treatment as the console/blk/custom
     // transports so post-MMU common-config reads reach the device.
@@ -591,6 +602,35 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
             uart_hex(virtio_fs.fs_feature_hi);
             uart_puts(" request-queues=");
             uart_hex(virtio_fs.fs_request_queues);
+            uart_puts("\n");
+        }
+    }
+    // M115a (issue #2460): arm the vsock transport post-MMU (the claim-6420
+    // discipline — the whole device state machine is re-programmed on the
+    // pre-exit-resolved addresses; the pre-rearm status is printed so the
+    // host sees whether VZ reset the device at ExitBootServices). Absent
+    // device: `vsock_probed` is false, nothing is printed, and the boot
+    // output stays byte-identical.
+    if (vsock_probed) {
+        uart_puts("vsock: pre-rearm st=");
+        uart_hex8(virtio_vsock.vs_status());
+        uart_puts("\n");
+        if (virtio_vsock.init()) {
+            // The bare "vsock: ready did=0x1053" line is the spec's witness
+            // (whole-line match): identical at arm and at every `vsock`
+            // monitor command, so a post-restore serial query reproduces
+            // the pre-save line byte-for-byte.
+            uart_puts("vsock: ready did=0x1053\n");
+            uart_puts("vsock: dev=");
+            uart_hex(virtio_vsock.vs_dev);
+            uart_puts(" cid=");
+            uart_hex(virtio_vsock.vs_guest_cid);
+            uart_puts("\n");
+        } else {
+            uart_puts("vsock: arm failed did=0x1053 dev=");
+            uart_hex(virtio_vsock.vs_dev);
+            uart_puts(" stage=");
+            uart_hex(virtio_vsock.vs_fail_stage);
             uart_puts("\n");
         }
     }

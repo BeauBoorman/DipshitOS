@@ -44,6 +44,7 @@ pub const terminal = @import("terminal.zig"); // M73f-2 (#1632): the tty seam be
 pub const virtio_net = @import("virtio_net.zig"); // milestone five card N1 (claim 1373): the net transport behind `net`/`netsend`
 pub const virtio_gpu = @import("virtio_gpu.zig"); // milestone six card G1 (claim 6053): the gpu transport + framebuffer behind `screen`
 pub const virtio_snd = @import("virtio_snd.zig"); // milestone fifteen card A1 (claim 6140): the virtio-snd transport behind `sound`
+pub const virtio_vsock = @import("virtio_vsock.zig"); // M115a (issue #2460): the virtio-vsock transport behind `vsock`
 pub const road_pops = @import("road_pops.zig"); // milestone six card G3 (claim 1574): the Road Pops tee console behind `roadpops`
 pub const fbtext = @import("text.zig"); // milestone six card G2 (claim 3194): framebuffer text rendering behind `text`
 pub const xhci = @import("xhci.zig"); // milestone seven card I1 (claim 4272): the XHCI host-controller transport behind `usb`
@@ -301,8 +302,9 @@ pub const Command = struct {
 /// 5127) grows it 53 -> 54 (`font`). Milestone twenty-two D3 (issue #326)
 /// grows it 54 -> 55 (`sym`). Milestone twenty-two D5 (issue #328)
 /// grows it 55 -> 56 (`strace`). Milestone twenty-two D6 (issue #329)
-/// grows it 56 -> 57 (`ps`).
-pub const registry_count: usize = 78; // 77 + `tty` (M73f-2 #1632)
+/// grows it 56 -> 57 (`ps`). M115a (issue #2460) grows it 78 -> 79
+/// (`vsock`).
+pub const registry_count: usize = 79; // 78 + `vsock` (M115a #2460)
 
 /// `sym <file>` reads at most this many bytes for on-disk symtab inspection
 /// (M22 D3). ELF symbol tables live near the file tail; 64 KiB covers every
@@ -354,6 +356,7 @@ pub fn ensure_registry() []const Command {
             .{ .name = "netsend", .dom = svclock.dom_bit(.net), .help = "send a known Ethernet frame (bounded staging, TX + used-ring drain)", .usage = "netsend <bytes>", .category = .networking, .min_args = 1, .max_args = 1, .handler = cmd_netsend },
             .{ .name = "pages", .help = "physical page allocator pool", .usage = "pages [selftest]", .category = .memory_state, .max_args = 1, .handler = cmd_pages },
             .{ .name = "pci", .help = "enumerate PCI devices on the bus", .usage = "pci", .category = .memory_state, .handler = cmd_pci },
+            .{ .name = "vsock", .help = "virtio-vsock transport + connect probe (M115a): 'vsock' reports the arm state, 'vsock <port>' connects to the host listener and reports connected/refused/timeout", .usage = "vsock [<port>]", .category = .networking, .max_args = 1, .handler = cmd_vsock },
             .{ .name = "procs", .help = "process registry: image, address space, lifecycle, exit status", .usage = "procs", .category = .tasks_processes, .max_args = 2, .handler = cmd_procs },
             .{ .name = "random", .help = "print n random bytes from the seeded CSPRNG (hex)", .usage = "random [n]", .category = .system, .max_args = 1, .handler = cmd_random },
             .{ .name = "resources", .help = "fixed-pool audit: scheduler tasks, process registry, windows, page-table carve-out, and per-process ring bounds", .usage = "resources", .category = .memory_state, .handler = cmd_resources },
@@ -2519,6 +2522,70 @@ fn cmd_clip(m: *Monitor, args: []const []const u8) ExecError {
     m.console.puts("clip: stored ");
     m.console.print_u64(stored);
     m.console.puts(" bytes\n");
+    return .none;
+}
+
+/// `vsock [<port>]` (M115a, issue #2460) — the guest→host connect half of
+/// the `VZVirtioSocketDevice` save/restore probe. With no argument it
+/// re-prints the bare arm line — the spec's whole-line witness, identical
+/// pre-save and post-restore since it carries no device state. `vsock
+/// <port>` issues one stream OP_REQUEST to VMADDR_CID_HOST:<port> on the
+/// tx queue and reports the rx-ring answer: `connected` (OP_RESPONSE — the
+/// host's VZVirtioSocketListener accepted), `refused` (OP_RST — no
+/// listener on that port), or `timeout` (no answer inside the poll budget
+/// — the degraded verdict a broken restore would produce). Absent/unarmed
+/// device reports honestly.
+fn cmd_vsock(m: *Monitor, args: []const []const u8) ExecError {
+    if (!virtio_vsock.vs_ready) {
+        m.console.print_line("vsock: absent (no virtio-vsock device armed)");
+        return .none;
+    }
+    m.console.print_line("vsock: ready did=0x1053");
+    if (args.len == 0) {
+        m.console.puts("vsock: dev=");
+        m.console.print_hex(virtio_vsock.vs_dev);
+        m.console.puts(" cid=");
+        m.console.print_hex(virtio_vsock.vs_guest_cid);
+        m.console.puts("\n");
+        return .none;
+    }
+    const parsed = parseInt(args[0]) catch {
+        err_prefix(m);
+        m.console.puts("invalid port: ");
+        m.console.puts(args[0]);
+        m.console.puts("\n");
+        return .invalid_argument;
+    };
+    if (parsed == 0 or parsed > 0xffff_fffe) {
+        err_prefix(m);
+        m.console.puts("port out of range: ");
+        m.console.puts(args[0]);
+        m.console.puts("\n");
+        return .invalid_argument;
+    }
+    const port: u32 = @intCast(parsed);
+    m.console.puts("vsock: connect port=");
+    m.console.print_u64(port);
+    m.console.puts("\n");
+    switch (virtio_vsock.connect(port)) {
+        .connected => {
+            m.console.puts("vsock: connected port=");
+            m.console.print_u64(port);
+            m.console.puts(" sport=");
+            m.console.print_u64(virtio_vsock.vs_last_src_port);
+            m.console.puts("\n");
+        },
+        .refused => {
+            m.console.puts("vsock: refused port=");
+            m.console.print_u64(port);
+            m.console.puts(" (peer RST)\n");
+        },
+        .timeout => {
+            m.console.puts("vsock: timeout port=");
+            m.console.print_u64(port);
+            m.console.puts(" (no reply inside the poll budget)\n");
+        },
+    }
     return .none;
 }
 
