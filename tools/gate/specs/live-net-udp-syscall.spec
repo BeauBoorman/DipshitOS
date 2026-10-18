@@ -82,7 +82,7 @@ open(os.environ["RUN_DIR"] + "/fixture.bin", "wb").write(req_arp + req_udp)
 print("fixture: %d bytes (42-byte ARP request + 46-byte datagram)" % len(req_arp + req_udp))
 PY
 
-vgate_run 01 -- --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 --net-udp-respond 10.0.0.2:9999 --script '$RUN_DIR/script-1.txt' --script2 '$RUN_DIR/script-2.txt' --script2-after 'udp: got ping' --script-expect 'tasks user-exec reaped' --timeout 90
+vgate_run 01 -- --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 --net-udp-respond 10.0.0.2:9999 --script '$RUN_DIR/script-1.txt' --script2 '$RUN_DIR/script-2.txt' --script2-after 'udp: send err' --script-expect 'tasks user-exec reaped' --timeout 90
 
 vgate_assert 01 serial-contains 'net ip: ip=10.0.0.1'
 vgate_assert 01 serial-contains 'udp: listen ok'
@@ -124,8 +124,12 @@ print("udp syscall byte-exact (v6-filtered)")
 PY
 vgate_assert 01 python <<'PY'
 import os, sys
-lines = open(os.environ["VG_SER"], errors="replace").read().splitlines()
-ser = "\n".join(lines)
+import re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# smp:/prompt lines split app's marker mid-line (`udp: got `/`ping`);
+# the fragments merge when the interposed line leaves with its newline.
+ser = re.sub(r"\n[^\n]*smp: [^\n]*\n", "", ser)
+lines = ser.splitlines()
 # Markers IN ORDER (the claim-1014 line-number pattern).
 order = ["udp: listen ok", "udp: loop ping", "udp: got ping",
          "udp: recv err -1", "udp: send err -1",
