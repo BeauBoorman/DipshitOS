@@ -131,6 +131,9 @@ func (a *app) keyEvent(ev vi.Event) {
 	if a.histMenuKey(ev.Arg0) {
 		return
 	}
+	if a.sideKey(ev.Arg0) {
+		return
+	}
 	if ev.Arg0 == 0x3a { // F1: bounded diagnostics list, scoped to this app
 		a.showDiagnostics = !a.showDiagnostics
 		a.dirty = true
