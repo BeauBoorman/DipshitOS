@@ -131,6 +131,17 @@
 //          reason=no_bundle` per record instead. Requires --cvc-file and
 //          the `host-int` SECRETS.TXT row; OFF by default — no records
 //          polled, no center touched.)
+//         [--host-outbox] (M127d #2602, ADR 0051 V2-D5: the guest→host
+//          export lane — GOSH `export` / GOFILES "Export to Host" stage
+//          <share>/OUTBOX/<name> + a REQ intent marker; the seat signs an
+//          OUTBOX record and the runner verifies, then moves the payload
+//          to --host-outbox-dir (default ~/Downloads). Caps: ≤64 MiB/file
+//          at move time, ≤64 exports/epoch, ≤1 record per tick. Requires
+//          --cvc-file and the `host-int` SECRETS.TXT row; OFF by default
+//          — no OUTBOX/, no records.)
+//         [--host-outbox-dir <path>] (modifier on --host-outbox: the
+//          export landing. Default ~/Downloads — the flag is the gate
+//          redirect, so a class-B run never touches a real Downloads.)
 //         [--host-cmd-after <marker>:<verb>] (M114a #2454, index #2447:
 //          dispatch <verb> on the HostCommand bus — the same seam every
 //          AppKit menu item uses — once <marker> appears in the serial
@@ -789,6 +800,15 @@ var hostDrop: HostDrop?
 // banners under the session bundle (bare runner: `no_bundle` drops).
 var hostNotifyFlag = false
 var hostNotify: HostNotify?
+// M127d (#2602, ADR 0051 V2-D5): `--host-outbox` arms the export lane —
+// the seat signs OUTBOX records for REQ-marked payloads under
+// <share>/OUTBOX/ and the runner moves them to `--host-outbox-dir`
+// (default ~/Downloads; the flag is the gate redirect — a class-B run
+// never touches a real Downloads). No display precondition: exports are
+// not a window gesture.
+var hostOutboxFlag = false
+var hostOutboxDir: String?
+var hostOutbox: HostOutbox?
 // M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
 // headless mirror of the HostCommand bus every menu item dispatches on
 // (index thesis 1: AppKit is never driven by synthesized clicks; the bus
@@ -1660,6 +1680,15 @@ while idx < arguments.count {
         // never touches the queue shape.
         hostNotifyFlag = true
         idx += 1
+    } else if arg == "--host-outbox" {
+        // M127d (#2602, ADR 0051 V2-D5): the guest→host export lane —
+        // REQ-marked payloads under OUTBOX/ become signed records the
+        // runner verifies and moves out. Modifier on --cvc-file.
+        hostOutboxFlag = true
+        idx += 1
+    } else if arg == "--host-outbox-dir", idx + 1 < arguments.count {
+        hostOutboxDir = arguments[idx + 1]
+        idx += 2
     } else if arg == "--cvc-console-file", idx + 1 < arguments.count {
         // Claim 0680: structured console — capture every queue-1 guest log
         // line to this file and arm the guest's console tee (kind-3) when
@@ -3168,6 +3197,16 @@ if hostNotifyFlag {
         fail("--host-notify requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
     }
 }
+// M127d (#2602, ADR 0051 V2-D5): the outbox lane is the same modifier
+// shape — no display prerequisite (exports are not a window gesture).
+if hostOutboxFlag || hostOutboxDir != nil {
+    guard hostOutboxFlag else {
+        fail("--host-outbox-dir is a modifier on --host-outbox (no lane to redirect).")
+    }
+    guard cvcFileEnabled else {
+        fail("--host-outbox requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
+    }
+}
 // Claim 9367: --pointer-virtio rides the four-queue device; the after-marker
 // only makes sense with a sequence to schedule.
 if pointerVirtioScript == nil, pointerVirtioAfter != nil {
@@ -4245,7 +4284,7 @@ if netVmnetEnabled {
 // The drop lane's display precondition (D4): the drop target is the
 // display view, so a headless runner refuses lane_disabled at arm and the
 // drop bit never enters the mask.
-if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
+if hostClipboardFlag || hostDropFlag || hostNotifyFlag || hostOutboxFlag {
     let shareURL = URL(fileURLWithPath: cvcFileShareDir!, isDirectory: true)
     var mask: UInt8 = 0
     var requested: [String] = []
@@ -4267,6 +4306,10 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
         mask |= HostInt.laneNotify
         requested.append("notify")
     }
+    if hostOutboxFlag {
+        mask |= HostInt.laneOutbox
+        requested.append("outbox")
+    }
     if mask != 0 {
         hostIntSession = HostIntSession.arm(shareDir: shareURL, mask: mask, requested: requested)
     }
@@ -4283,9 +4326,19 @@ if hostClipboardFlag || hostDropFlag || hostNotifyFlag {
             hostNotify = HostNotify(session: session)
             hostNotify?.start()
         }
+        if hostOutboxFlag {
+            // --host-outbox-dir redirects the landing; absent it the
+            // lane default is ~/Downloads (the flag is what keeps a
+            // class-B run out of the real one).
+            let dest = hostOutboxDir.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+            hostOutbox = HostOutbox(session: session, destDir: dest)
+            hostOutbox?.start()
+        }
         // One shared 250 ms drain for every consuming lane — the notify
-        // lane rides the same poll as the clipboard drain (ADR 0051 D5).
-        if hostClipboard != nil || hostNotify != nil {
+        // and outbox lanes ride the same poll as the clipboard drain
+        // (ADR 0051 D5, V2-D5).
+        if hostClipboard != nil || hostNotify != nil || hostOutbox != nil {
             DispatchQueue.main.async { hostIntTick() }
         }
     }
@@ -5106,6 +5159,7 @@ func captureScreenshotIfMarker(_ text: String) {
 func hostIntTick() {
     hostClipboard?.tick()
     hostNotify?.tick()
+    hostOutbox?.tick()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { hostIntTick() }
 }
 
@@ -5175,7 +5229,7 @@ func fireHostWriteIfMarker(_ text: String) {
 func feedInspector(_ text: String) {
     inspector.ingest(serialText: text)
     if let laneDir = hostIntSession?.laneDir {
-        for tag in [HostInt.Tag.clipIn, .clipOut, .notifyOut, .drop] {
+        for tag in [HostInt.Tag.clipIn, .clipOut, .notifyOut, .drop, .outbox, .notifyFocus] {
             for (_, seq) in HostInt.records(laneDir: laneDir, tag: tag) ?? [] {
                 inspector.noteHostIntSeq(seq)
             }

@@ -33,6 +33,13 @@ public enum HostCommand: String, CaseIterable, Sendable {
     // unarmed run receipts `unavailable` from the action itself.
     case laneAgent = "lane-agent"
     case sendFile = "send-file"
+    // V2 lane verbs (ADR 0051 V2-D6) — declared once here; each lane's
+    // own file registers its handler (a case with none reports
+    // `unavailable`). M127d wires reveal-export + lane-outbox; M127c
+    // wires notify-click; M127e wires lane-agent.
+    case notifyClick = "notify-click"
+    case revealExport = "reveal-export"
+    case laneOutbox = "lane-outbox"
     // Debug menu — M114d/e register the remaining handlers.
     case inspector
     // M114d (#2457): the drawer injector's verb — no menu item of its
