@@ -43,6 +43,7 @@
 const virtio_custom = @import("virtio_custom.zig");
 pub const virtio_fs = @import("virtio_fs.zig");
 const spinlock = @import("spinlock.zig");
+const klog = @import("klog.zig");
 /// Claim 9094 (#810 writer hunt): the task-ring audit is a LIVE-gate
 /// instrument only — the scheduler import is comptime-conditional so
 /// host-test binaries never pull in scheduler's whole import tree (its
@@ -325,8 +326,9 @@ pub fn build_read_payload(path: []const u8, offset: u64, out: []u8) ?usize {
 /// flood, so the z2a zc leg timed out, silently failed its file ops, and
 /// recycled chains under the host (claim #899). 320M ≈ 1.5-2 s: timeouts
 /// become vanishingly rare, and the retry + parked-chain path makes even
-/// that case honest (fail fast, never corrupt).
-pub const exchange_budget: usize = 320_000_000;
+/// that case honest (fail fast, never corrupt). A `var` so host tests can
+/// shrink it — the timeout/park path is exercised without a ~2 s spin.
+pub var exchange_budget: usize = 320_000_000;
 
 /// BSS staging — the flat kernel does not relocate, so every buffer the
 /// device touches must hold a runtime-correct address (claim 0015: no
@@ -467,34 +469,98 @@ fn clamped_len(n: u32, reply_buf: []u8) u32 {
     return @intCast(@min(@as(usize, n), reply_buf.len));
 }
 
+/// A parked element stays armed on the device (issue #2495): its
+/// descriptors keep pointing at the shared request/reply buffers, so the
+/// host's late serve would read whatever the NEXT exchange staged —
+/// re-executing it, a duplicated mutation op against live share state —
+/// and drop its reply into the live reply buffer. A parked chain's
+/// descriptors are repointed at these sinks instead: the request is a
+/// STAT of a name the share never holds (read-only, no host state, no
+/// host-log line), and the reply lands where nothing live reads it.
+var vf_park_req: [request_hdr_len + 16]u8 align(16) = undefined;
+var vf_park_req_len: usize = 0;
+var vf_park_reply: [64]u8 align(16) = undefined;
+
+fn park_sinks() void {
+    if (vf_park_req_len != 0) return;
+    vf_park_req_len = encode_request(op_stat, 0, ".vf-parked-sink", &vf_park_req) orelse 0;
+}
+
+/// Ops whose host-side effect is read-only. Only these may resubmit after
+/// a timeout park: a parked element that the host had ALREADY dequeued
+/// before neutralization can still execute the original request once —
+/// harmless for a read, a double-apply for a mutation (open/write/close/
+/// rename/mkdir/delete/clone/truncate/fsync keep the honest failure).
+fn resubmit_safe(op: u8) bool {
+    return switch (op) {
+        op_probe, op_list, op_read, op_stat, op_dir_page => true,
+        else => false,
+    };
+}
+
+/// Bounded transport diagnostics (#2495): `park_count` is timed-out
+/// exchanges (each parked element was neutralized), `resubmit_count` is
+/// the idempotent retries a host congestion stall survived, and
+/// `virtio_custom.stale_used_count` counts consumed used-ring entries
+/// that named neither a live element nor a parked head.
+pub var vf_park_count: u32 = 0;
+pub var vf_resubmit_count: u32 = 0;
+
+/// One bounded serial line per park — parks are rare by definition (a
+/// double poll-budget timeout), and the op byte names WHICH request the
+/// host stalled on.
+fn log_park(op: u8, head: u16) void {
+    var buf: [56]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "vf: exchange timeout — parked head={d} op=0x{x}\n", .{ head, op }) catch return;
+    klog.line(s);
+}
+
 fn exchange_raw_inner(req: []const u8, reply_buf: []u8) ?u32 {
-    vf_scatter[0] = req;
-    const handle = virtio_custom.submit_ex(virtio_custom.file_qidx, &vf_scatter, reply_buf, false) orelse return null;
-    const n = virtio_custom.wait(virtio_custom.file_qidx, handle, exchange_budget, reply_buf) orelse {
+    // #2495: one resubmit is allowed for read-only ops (resubmit_safe). A
+    // timed-out element is neutralized before the retry leaves, so the
+    // stale serve the park used to allow — the host executing the NEXT
+    // request a second time, or its reply landing in the live buffer —
+    // cannot happen; a single congestion stall no longer fails the op.
+    var submits: usize = 0;
+    while (true) {
+        submits += 1;
+        vf_scatter[0] = req;
+        const handle = virtio_custom.submit_ex(virtio_custom.file_qidx, &vf_scatter, reply_buf, false) orelse return null;
+        if (virtio_custom.wait(virtio_custom.file_qidx, handle, exchange_budget, reply_buf)) |n| {
+            virtio_custom.reap_parked();
+            virtio_custom.free_chain_q(virtio_custom.file_qidx, handle);
+            return clamped_len(n, reply_buf);
+        }
         // Claim #899 discipline: a timed-out exchange means the host is
         // SLOW, not dead — the element is still posted. Re-kick so a
         // callback that ran too early (or a dropped notification) rescans
-        // and serves it, then wait one more budget. If it STILL times out,
-        // park the chain instead of freeing it: recycling now would let
-        // the next submit reuse the same head while the element is still
-        // queued on the host side, and the host's late reply (or its
-        // re-read of the recycled descriptors) would corrupt the next
-        // exchange (the "request length mismatch" refusals). A parked
-        // chain stays out of the free list until reap_parked observes its
-        // reply — the ring never leaks AND never misattributes.
+        // and serves it, then wait one more budget.
         virtio_custom.kick_q(virtio_custom.file_qidx);
         if (virtio_custom.wait(virtio_custom.file_qidx, handle, exchange_budget, reply_buf)) |n2| {
             virtio_custom.reap_parked();
             virtio_custom.free_chain_q(virtio_custom.file_qidx, handle);
             return clamped_len(n2, reply_buf);
         }
+        // Still unanswered: park the chain instead of freeing it —
+        // recycling now would let the next submit reuse the same head
+        // while the element is still queued on the host side. And now
+        // NEUTRALIZE its descriptors first (park_sinks): the armed element
+        // can still be dequeued later, and without the repoint its serve
+        // reads the shared request buffer after the next exchange stages
+        // it (a stale-serve: the host double-executes whatever request —
+        // including mutations — is there) and writes into the live reply
+        // buffer. The parked chain stays out of the free list until its
+        // consumed used entry reaps it — the ring never leaks AND never
+        // misattributes.
+        park_sinks();
+        virtio_custom.neutralize_chain(virtio_custom.file_qidx, handle, vf_park_req[0..vf_park_req_len], &vf_park_reply);
         virtio_custom.park_chain(handle);
         virtio_custom.reap_parked();
-        return null;
-    };
-    virtio_custom.reap_parked();
-    virtio_custom.free_chain_q(virtio_custom.file_qidx, handle);
-    return clamped_len(n, reply_buf);
+        vf_park_count += 1;
+        log_park(req[0], handle);
+        if (!resubmit_safe(req[0]) or submits >= 2) return null;
+        vf_resubmit_count += 1;
+    }
 }
 
 /// One bounded exchange on queue 5: encode the request into the shared
@@ -1855,4 +1921,77 @@ test "virtio_file: M97d-F3 (#2088) — an over-reported pattern write refuses in
     try testing.expectEqual(st_ok, ok.status);
     try testing.expectEqual(@as(u64, 10), ok.total);
     try testing.expectEqual(@as(usize, 1), ok.chunks);
+}
+
+test "virtio_file: #2495 — a stalled read op is neutralized, parked, resubmitted once, and reaped on consume" {
+    _ = arm_test_transport();
+    defer disarm_test_transport();
+    const r = &virtio_custom.cv_rings[virtio_custom.file_qidx];
+    const saved_budget = exchange_budget;
+    defer exchange_budget = saved_budget;
+    exchange_budget = 32;
+    vf_park_count = 0;
+    vf_resubmit_count = 0;
+    virtio_custom.stale_used_count = 0;
+
+    // Nothing staged: stat stalls through BOTH submits (the op is
+    // resubmit-safe), parks both, and fails honestly — st_host_error,
+    // never a misattributed reply.
+    var st_res = StatResult{};
+    try testing.expectEqual(st_host_error, stat("NOPE.TXT", &st_res));
+    try testing.expectEqual(@as(u32, 2), vf_park_count);
+    try testing.expectEqual(@as(u32, 1), vf_resubmit_count);
+    try testing.expectEqual(@as(u16, 2), virtio_custom.parked_count);
+    // Both parked chains were neutralized: their request descriptors now
+    // point at the sink request (a stat the host always answers
+    // not-found), their reply descriptors at the sink buffer — a late
+    // serve can neither re-execute a reused request nor touch the live
+    // reply buffer.
+    for (virtio_custom.parked_heads[0..virtio_custom.parked_count]) |h| {
+        const rd = r.desc[h];
+        try testing.expectEqual(@as(u64, @intFromPtr(&vf_park_req)), rd.addr);
+        try testing.expectEqual(@as(u32, @intCast(vf_park_req_len)), rd.len);
+        const td = r.desc[rd.next];
+        try testing.expectEqual(@as(u64, @intFromPtr(&vf_park_reply)), td.addr);
+        try testing.expectEqual(@as(u32, @intCast(vf_park_reply.len)), td.len);
+    }
+
+    // The parked heads' late replies arriving during the NEXT exchange's
+    // wait are consumed at the match point and reaped — both chains freed
+    // before the live element's entry matches.
+    const live = r.free[r.free_count - 1];
+    r.used.ring[0] = .{ .id = virtio_custom.parked_heads[0], .len = 3 };
+    r.used.ring[1] = .{ .id = virtio_custom.parked_heads[1], .len = 3 };
+    r.used.ring[2] = .{ .id = live, .len = reply_hdr_len + 9 };
+    r.used.idx = 3;
+    vf_reply_buf[0] = st_ok;
+    write_le_u16(&vf_reply_buf, 1, 9);
+    write_le_u64(&vf_reply_buf, reply_hdr_len, 5);
+    vf_reply_buf[reply_hdr_len + 8] = 0;
+    try testing.expectEqual(st_ok, stat("F.TXT", &st_res));
+    try testing.expectEqual(@as(u64, 5), st_res.size);
+    try testing.expectEqual(@as(u16, 0), virtio_custom.parked_count);
+    try testing.expectEqual(@as(u16, virtio_custom.queue_size), r.free_count);
+    try testing.expectEqual(@as(u32, 0), virtio_custom.stale_used_count);
+}
+
+test "virtio_file: #2495 — a timed-out mutation parks once and never resubmits" {
+    _ = arm_test_transport();
+    defer disarm_test_transport();
+    const saved_budget = exchange_budget;
+    defer exchange_budget = saved_budget;
+    exchange_budget = 32;
+    vf_park_count = 0;
+    vf_resubmit_count = 0;
+    virtio_custom.parked_count = 0;
+    // op_write is not idempotent — an unknown-outcome mutation fails
+    // honestly rather than risking a double-apply on the share.
+    var payload: [handle_len + 4]u8 = undefined;
+    write_le_u16(&payload, 0, 3);
+    @memset(payload[handle_len..], 0x41);
+    const n = encode_request(op_write, 0, &payload, &vf_write_buf).?;
+    try testing.expect(exchange_raw(vf_write_buf[0..n], &vf_reply_buf) == null);
+    try testing.expectEqual(@as(u32, 1), vf_park_count);
+    try testing.expectEqual(@as(u32, 0), vf_resubmit_count);
+    try testing.expectEqual(@as(u16, 1), virtio_custom.parked_count);
 }
