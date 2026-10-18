@@ -789,8 +789,11 @@ pub fn dispatch(number: u64, args: Args, frame: *exceptions.VectorFrame) u64 {
     // per-handler convention. Slot 80's open-class ops carry `net` (the
     // family is op-multiplexed; its slot stays ungrouped). `audit`
     // receipts the would-be denial and lets the call through; `enforce`
-    // makes it an honest EACCES — flipping the default is a separate
-    // owner decision (D12). Kernel-context callers resolve no pid and
+    // makes it an honest EACCES. M116b (#2468): the floor a row-less
+    // process carries is `grant.ambient` — file/audio/net are row-only
+    // words; `mode=enforce` in GRANTS.TXT is what flips a boot's
+    // posture (absent stays `audit`, D12's standing contract).
+    // Kernel-context callers resolve no pid and
     // are never the EL0 principal the gate exists for.
     var required = grant.slot_word(number);
     if (number == sys_socket and grant.socket_open_op(args[0])) required |= grant.word_net;

@@ -313,7 +313,7 @@ pub fn last_exec_pid() ?usize {
 /// loader (the syscall path holds the FILE|KERNEL domains, the monitor is
 /// a single context), so one pending slot suffices — the same discipline
 /// `program` and `envp_*` already keep.
-var pending_words: u32 = grant.baseline;
+var pending_words: u32 = grant.ambient;
 var pending_digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
 var pending_measured_ok: bool = false;
 var pending_name: []const u8 = "";
@@ -363,17 +363,18 @@ fn note_exec_grant(proc_id: usize) void {
 
 /// The exec-time grant decision, taken once per `exec_file_impl` after
 /// the size checks and before any parse or mapping: a matching row
-/// applies its words, `grant_stale` refuses by name, and no row keeps
-/// the baseline. The `measured` receipt is published at the success
+/// applies its words, `grant_stale` refuses by name, and no row leaves
+/// the ambient set (M116b — the narrowed floor, not the vocabulary).
+/// The `measured` receipt is published at the success
 /// point (`note_exec_grant`) — the receipt records a measurement that
 /// ran, not one that merely parsed.
 fn apply_exec_grant(name: []const u8, size: u64) ExecResult {
     pending_name = name;
-    pending_words = grant.baseline;
+    pending_words = grant.ambient;
     pending_digest = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
     pending_measured_ok = measure_image(name, size, &pending_digest);
     switch (grant.decide(name, if (pending_measured_ok) &pending_digest else null)) {
-        .baseline => {},
+        .ambient => {},
         .apply => |words| pending_words = words,
         .stale => {
             emit_exec_receipt("refused:grant_stale");
@@ -564,7 +565,7 @@ fn exec_file_impl(name: []const u8, args: []const []const u8, pin: ?usize, princ
     // parsed or mapped — the digest is the raw-file SHA-256 the row
     // pins, over the same channel bytes the loader is about to read. A
     // named row whose hash is wrong refuses by name (`grant_stale`) and
-    // never falls open; no row means the baseline.
+    // never falls open; no row means the ambient set (M116b).
     if (apply_exec_grant(name, st.size) == .grant_stale) return .grant_stale;
 
     // M70c-K (issue #1504): a file too big for the staging buffer is no
