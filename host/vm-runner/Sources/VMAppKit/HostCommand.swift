@@ -17,6 +17,12 @@ import AppKit
 public enum HostCommand: String, CaseIterable, Sendable {
     // VirelaiOS menu.
     case about
+    // M128a (#2605): ⌘, toggles the machine settings panel — the bus's
+    // `settings` companion (HostSettingsModel) edits the running
+    // profile's VMProfile.Config. Self-registers in init like the
+    // recorder/agent (argv resolution), so a profile-less run receipts
+    // `disabled` from the action's enablement.
+    case settings
     case quit
     // Machine menu.
     case stop
@@ -142,14 +148,24 @@ public final class HostCommandBus: NSObject {
     /// seams instead of the process's.
     public let agent: HostAgentCompanion
 
+    /// M128a (#2605): the machine settings model — the `settings` verb's
+    /// ⌘, panel state and the VMProfile.Config edit/save path, self-
+    /// registering on the bus like the recorder/agent so a bare
+    /// `HostCommandBus()` in a scripted `--host-cmd-after` run dispatches
+    /// the identical seam. Injectable so a test owns its profile seam.
+    public let settings: HostSettingsModel
+
     private var registrations: [HostCommand: Registration] = [:]
 
-    public init(emit: ((String) -> Void)? = nil, agent: HostAgentCompanion? = nil) {
+    public init(emit: ((String) -> Void)? = nil, agent: HostAgentCompanion? = nil,
+                settings: HostSettingsModel? = nil) {
         self.emit = emit ?? {
             FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
         }
         self.agent = agent ?? HostAgentCompanion()
         self.agent.emit = self.emit
+        self.settings = settings ?? HostSettingsModel()
+        self.settings.emit = self.emit
         super.init()
         let recorder = self.recorder
         register(.record, Registration(
@@ -172,6 +188,16 @@ public final class HostCommandBus: NSObject {
             itemState: { agent.laneFlowing },
             receiptDetail: { agent.receiptDetail },
             action: { agent.togglePause() }))
+        // M128a (#2605): ⌘, — enabled only when a profile is armed
+        // (`--profile`/`--resume` in argv or an injected profileURL); a
+        // settings edit is a profile write, so a flag-run has nothing
+        // for it and receipts `disabled`.
+        let settings = self.settings
+        register(.settings, Registration(
+            isEnabled: { settings.armed },
+            itemState: { settings.isOpen },
+            receiptDetail: { settings.receiptDetail },
+            action: { settings.toggle() }))
         // The companion's audit poll self-arms only when a share is
         // resolvable — a shareless run never schedules it (the flags-
         // off posture, host side).

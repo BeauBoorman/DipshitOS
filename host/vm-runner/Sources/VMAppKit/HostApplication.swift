@@ -35,6 +35,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     private let guestArea = NSView()
     private lazy var drawer = HostInspectorView(model: inspector, bus: commandBus)
     private var guestView: NSView?
+    /// M128a (#2605): the ⌘, machine settings panel — built lazily when
+    /// the `settings` verb first opens it, a projection of the bus's
+    /// HostSettingsModel.
+    private var settingsPanel: NSPanel?
+    private var settingsView: HostSettingsView?
     /// M114b (#2455): the attached machine view, when it is one — the
     /// `capture-keys` verb toggles its `capturesSystemKeys`.
     private weak var captureTarget: HostKeyCapturing?
@@ -151,6 +156,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         recordBadge.isHidden = true
         commandBus.recorder.onChange = { [weak self] in self?.refreshRecordAffordance() }
         commandBus.agent.onChange = { [weak self] in self?.refreshAgentAffordance() }
+        // M128a (#2605): the ⌘, settings panel mirrors the bus's
+        // settings model — isOpen flips under the verb (menu chord or
+        // --host-cmd-after), the panel follows; closing the panel
+        // flips it back through windowWillClose.
+        commandBus.settings.onChange = { [weak self] in self?.syncSettings() }
         status.alignment = .center
         status.font = .systemFont(ofSize: 18)
         status.translatesAutoresizingMaskIntoConstraints = false
@@ -238,6 +248,39 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// read instead of poking AppKit. `inspector.isOpen` is the model's
     /// truth; the split pane mirrors it through syncInspector.
     public var inspectorVisible: Bool { inspector.isOpen }
+
+    /// M128a (#2605): the settings panel's seams — the model's open
+    /// state and the panel's on-screen truth — the class-A reads
+    /// instead of poking AppKit.
+    public var settingsVisible: Bool { commandBus.settings.isOpen }
+    public var settingsPanelVisible: Bool { settingsPanel?.isVisible ?? false }
+
+    /// Model → panel: the panel's visibility mirrors `isOpen` (built on
+    /// first open), and the view repaints on every model change. The
+    /// session's ⌘, and a headless `--host-cmd-after …:settings` land
+    /// the identical model flip.
+    private func syncSettings() {
+        let model = commandBus.settings
+        if model.isOpen, settingsPanel == nil {
+            let view = HostSettingsView(model: model)
+            let panel = NSPanel(contentRect: view.frame,
+                                styleMask: [.titled, .closable],
+                                backing: .buffered, defer: false)
+            panel.title = "Machine Settings"
+            panel.contentView = view
+            panel.isReleasedWhenClosed = false
+            panel.delegate = self
+            settingsPanel = panel
+            settingsView = view
+        }
+        if model.isOpen {
+            settingsPanel?.center()
+            settingsPanel?.makeKeyAndOrderFront(nil)
+        } else {
+            settingsPanel?.orderOut(nil)
+        }
+        settingsView?.reload()
+    }
 
     /// Model → pane: the drawer's hidden flag mirrors `isOpen`, and an
     /// open gets a real share of the window (260pt, halved on a small
@@ -427,6 +470,15 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public func windowShouldClose(_ sender: NSWindow) -> Bool {
         stop("window-close")
         return false // Keep the stopping state visible until VZ completes.
+    }
+
+    /// M128a (#2605): closing the settings panel is the verb's other
+    /// edge — the model's isOpen flips back so the menu checkmark and
+    /// the `open=` receipt stay honest.
+    public func windowWillClose(_ notification: Notification) {
+        if notification.object as? NSWindow === settingsPanel {
+            commandBus.settings.isOpen = false
+        }
     }
 
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
