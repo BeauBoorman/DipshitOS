@@ -1362,12 +1362,18 @@ PY
 # [Sh, Term] file drops the unbacked Sh row and spawns a real GOTERM.ELF
 # into rail cell 1 — so the scripted Terminal is a SECOND one, and the
 # focus-back chord is ctrl-1, not the old placeholder-strip ctrl-3.
+# The editor is opened by CLICKING its launcher row, not by filtering:
+# script2 feeds the kernel monitor (observed r20: `unknown command
+# 'goedit'` — filter text is HID input, and every HID channel this boot
+# already owns is spoken for), and the stray 800,400 release was harmless
+# only while dead placeholder rows sat under it — on a live strip it is a
+# real press that rips keyboard focus off the launcher sink. GOEDIT sits
+# at catalog row 2 of this fixture's 18-row APPS.TXT (0=GOCALC, 1=NOTE):
+# the 264px panel paints rows at x=8..253, y=140+i*24 — a down at
+# (120,199) lands inside row 2's rect (y=188..209).
 vgate_file script-m91-relaunch.txt <<'EOF'
 set GOMAXPROCS=1
 exec GOTERM.ELF
-EOF
-vgate_file script-20-filter.txt <<'EOF'
-goedit
 EOF
 
 vgate_run 20 -- \
@@ -1376,10 +1382,8 @@ vgate_run 20 -- \
     --script-after 'gotabwm: present' \
     --input-string $'cat /host/M91-1925.RECEIPT\n' \
     --input-string-after 'goterm: prompt' \
-    --pointer-virtio '272,702,d;272,702,u;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;120,199,d;120,199,u' \
     --pointer-virtio-after 'goterm: done status=0' \
-    --script2 '$RUN_DIR/script-20-filter.txt' \
-    --script2-after 'gotabwm: launcher presented' --script2-delay 1 \
     --input-chords 'w,o,r,k,e,d,return,ctrl-s,ctrl-1' \
     --input-chords-after 'goedit: present' \
     --script-expect 'gotabwm: alt-tab id=' --script-expect-tail 4 --timeout 180
