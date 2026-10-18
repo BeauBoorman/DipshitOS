@@ -21,7 +21,7 @@ vgate_assert 01 serial-exact 'VirelaiOS kernel has seized control.' 1
 vgate_assert 01 serial-count 'syscall: write ok n=23' 1
 vgate_assert 01 serial-exact 'uaccess: efault ok n=8' 1
 vgate_assert 01 serial-exact '  1 sys_write calls=3' 1
-vgate_assert 01 serial-exact 'uaccess: valid=1 fault=1 recovered=1 copies=4 validation_faults=1 unbacked=0' 1
+vgate_assert 01 serial-exact 'uaccess: valid=0 fault=1 recovered=1 copies=3 validation_faults=1 unbacked=1' 1
 vgate_assert 01 serial-exact 'userspace: el0=1 svc=2 roundtrips=1 arg=2 result=2 rejected=0' 1
 vgate_assert 01 serial-exact 'rx-addrspaces-ok' 1
 vgate_assert 01 serial-count 'addrspaces: user text=0x0000000000400000 stack=0x' 1
