@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- M117d (#2476, ADR 0057 D11): the entitlement set a VMRunner needs
+         for the net-bridged / net-vmnet flags. Both net keys below are
+         RESTRICTED entitlements: a binary signed ad-hoc
+         ("codesign -s -") carrying them is killed by amfid before
+         main() — observed 2026-10-17 on macOS 27.2 with
+         "The file is adhoc signed but contains restricted entitlements"
+         (AppleMobileFileIntegrityError -424). This file exists for a
+         development-signed build only — sign the built VMRunner with a
+         development identity and this file as the codesign entitlements
+         input, e.g. "codesign -f -s IDENTITY -o runtime" plus this plist
+         against host/vm-runner/.build/release/VMRunner.
+
+         Do NOT merge these keys into entitlements.plist: gate_build_runner
+         (tools/lib/gate-run.sh) applies that file to every ad-hoc-signed
+         class-B runner, and doing so would kill every gate at exec. -->
+
+    <!-- Required to use Virtualization.framework on recent macOS releases. -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+
+    <!-- VZBridgedNetworkDeviceAttachment (the net-bridged flag). Named in
+         the SDK header and by VZ's own validation error:
+         "Using VZBridgedNetworkDeviceAttachment in a process that lacks
+         the com.apple.vm.networking entitlement." -->
+    <key>com.apple.vm.networking</key>
+    <true/>
+
+    <!-- VZVmnetNetworkDeviceAttachment / vmnet_network_create
+         (the net-vmnet flag). The key is not named in the SDK headers; it
+         was pinned by experiment on macOS 27.2: it is the only vmnet
+         entitlement string in /usr/libexec/InternetSharing's
+         client_entitlement_check ("xpc client does not have any vmnet
+         entitlement, nor is it root"), the daemon behind
+         vmnet_network_create. -->
+    <key>com.apple.developer.networking.vmnet</key>
+    <true/>
+</dict>
+</plist>
