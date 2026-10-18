@@ -77,6 +77,10 @@ const (
 	// M82c (#1770): the shortcuts registry view, opened with the panel's
 	// own registered chord (ctrl+shift+s, owner GOSET.ELF in the table).
 	markerShortcuts = "goset: shortcuts n="
+	// M122e (#2574): every view switch lands the same marker, whichever
+	// surface asked for it — a tab-strip click, the strip's Left/Right,
+	// the typed `services`/`grants` lines, or Esc popping a sub-view.
+	markerTab = "goset: tab "
 
 	inputMax = settings.MaxKey + settings.MaxVal + 2
 )
@@ -112,6 +116,10 @@ type panel struct {
 	saveBtn     widgets.Button
 	quitBtn     widgets.Button
 	paletteSwat [3]widgets.Rect
+	// M122e (#2574): the clickable view picker — Settings / Services /
+	// Grants / Shortcuts cells above the pane, a focus-ring member so Tab
+	// reaches it and Left/Right steps the view when it owns focus.
+	tabs tabStrip
 	// M104f: the dropdown popover over a vocabulary row, and the audio
 	// slider's drag state. Both ride the shared canvas; neither is a
 	// focus-ring member (Tab order is unchanged — they are row affordances).
@@ -188,10 +196,12 @@ func newPanel(ta *tabapp.TabApp) *panel {
 	a.input.Bg = 0x161c24
 	a.input.Caret = theme.Current.Caret
 	a.listCtl = &listController{List: &a.list}
+	a.tabs.Current = func() int { return a.activeTab() }
+	a.tabs.OnActivate = func(i int) bool { return a.showTab(i) }
 	a.saveCtl = &actionButton{Button: &a.saveBtn, OnActivate: func() bool { a.save(); return true }}
 	a.quitCtl = &actionButton{Button: &a.quitBtn, OnActivate: func() bool { a.exitRequested = true; return true }}
-	a.focus = &focusRing{items: []control{a.listCtl, &a.input, a.saveCtl, a.quitCtl}, index: -1}
-	a.focus.Focus(1)
+	a.focus = &focusRing{items: []control{&a.tabs, a.listCtl, &a.input, a.saveCtl, a.quitCtl}, index: -1}
+	a.focus.Focus(2)
 	a.file = settings.Load()
 	switch a.file.State {
 	case settings.StateCorrupt:
@@ -202,7 +212,7 @@ func newPanel(ta *tabapp.TabApp) *panel {
 		a.status = "corrupt file: read-only — ctrl+shift+h for shortcuts"
 	default:
 		a.disp = a.file.Display()
-		a.status = "key=value + Enter; services opens Services — idle curtain is visual"
+		a.status = "click a row or a tab; key=value + Enter; services opens Services — idle curtain is visual"
 	}
 	vi.ConsoleLine(markerReady + a.summary() + " mode=" + a.mode())
 	// M73m: a file that already chose `custom` shows its colours as rows.
@@ -473,6 +483,21 @@ func (a *panel) cycle(dir int) bool {
 	return a.set(key, settings.Next(vocab, cur))
 }
 
+// rowActivate is a left-click's row gesture (M122e #2574): select the row,
+// then take the same step the keyboard's Right arrow takes — a two-value
+// row toggles, a vocabulary row steps forward, a services row flips
+// enabled, a grants row lands its consent gesture, and a free-form key
+// names its typed path in the status line. The shortcuts registry is
+// read-only: the click only selects and says so.
+func (a *panel) rowActivate(i int) bool {
+	a.sel, a.list.Sel = i, i
+	if a.showChords {
+		a.status = "the shortcuts registry is compiled in — no values to cycle"
+		return true
+	}
+	return a.cycle(1)
+}
+
 // prevVocab is the backward step through the same cycle; a value outside the
 // vocabulary starts at the end, mirroring settings.Next's start-at-the-top.
 func prevVocab(vocab []string, cur string) string {
@@ -506,6 +531,11 @@ func (a *panel) handle(ev vi.Event) bool {
 		if a.focus.HandleClick(x, y) {
 			if current, _ := a.focus.Current(); current == a.listCtl {
 				a.sel = a.list.Sel
+				// M122e (#2574): a click ON a row is the row's gesture —
+				// select then cycle/toggle, the same step Right takes.
+				if i := a.list.ItemAt(x, y); i >= 0 {
+					return a.rowActivate(i)
+				}
 			}
 			return true
 		}
@@ -552,18 +582,21 @@ func (a *panel) key(ev vi.Event) bool {
 	}
 	switch k.Named() {
 	case keyEscape:
+		// M122e (#2574): Esc backs out one level before quitting — a
+		// sub-view pops to the Settings tab; already on Settings it quits.
+		if a.activeTab() != tabSettings {
+			return a.showTab(tabSettings)
+		}
 		a.exitRequested = true
 		return true
 	case keyEnter:
 		switch strings.TrimSpace(a.input.Value()) {
 		case "services":
 			a.input.Clear()
-			a.openServices()
-			return true
+			return a.showTab(tabServices)
 		case "grants":
 			a.input.Clear()
-			a.openGrants()
-			return true
+			return a.showTab(tabGrants)
 		}
 		if a.showServices {
 			a.serviceInput()
@@ -587,6 +620,9 @@ func (a *panel) key(ev vi.Event) bool {
 		a.sel = a.list.Sel
 		return changed
 	case keyLeft, keyRight:
+		if current, _ := a.focus.Current(); current == &a.tabs {
+			return a.tabs.OnKey(k)
+		}
 		if a.showChords {
 			a.status = "the shortcuts registry is compiled in — no values to cycle"
 			return true
@@ -620,19 +656,69 @@ func isShortcutsChord(ev vi.Event) bool {
 	return ev.Arg0 == uint32(chords.UsageH) || ev.Arg1 == 'H' || ev.Arg1 == 0x08
 }
 
+// activeTab is the strip cell the current view owns: the booleans stay the
+// source of truth; the strip mirrors them at layout time.
+func (a *panel) activeTab() int {
+	switch {
+	case a.showServices:
+		return tabServices
+	case a.showGrants:
+		return tabGrants
+	case a.showChords:
+		return tabShortcuts
+	default:
+		return tabSettings
+	}
+}
+
+// showTab is the ONE view switch — every caller (the strip's click, its
+// Left/Right, the typed `services`/`grants` lines, the shortcuts chord, Esc
+// popping a sub-view) lands the same `goset: tab <name>` marker and the same
+// selection reset, so the gate greps one line for whichever path ran.
+func (a *panel) showTab(i int) bool {
+	a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
+	switch i {
+	case tabServices:
+		a.showChords, a.showServices, a.showGrants = false, true, false
+		a.services.Refresh()
+		a.serviceStatus()
+		consoleLine("goset: services n=" + vi.Itoa64(int64(len(a.services.manifest.Services))))
+	case tabGrants:
+		a.showChords, a.showServices, a.showGrants = false, false, true
+		a.grants.Refresh()
+		a.grantStatus()
+		consoleLine("goset: grants n=" + vi.Itoa64(int64(len(a.grants.entries))))
+		for _, e := range a.grants.entries {
+			granted := "-"
+			if e.ReadErr != 0 {
+				granted = "?"
+			} else if e.Row != nil {
+				granted = e.Row.Words
+			}
+			consoleLine("goset: grant row name=" + e.Name +
+				" declared=" + vi.GrantWordsCanonical(e.Declared) +
+				" granted=" + granted + " state=" + e.state())
+		}
+	case tabShortcuts:
+		a.showChords, a.showServices, a.showGrants = true, false, false
+		vi.ConsoleLine(markerShortcuts + vi.Itoa64(int64(len(chords.Global))))
+		a.status = "the global shortcuts registry — one owner per chord (read-only)"
+	default:
+		a.showChords, a.showServices, a.showGrants = false, false, false
+		a.status = "type key=value + Enter to save"
+	}
+	consoleLine(markerTab + tabNames[i])
+	return true
+}
+
 // toggleShortcuts flips the panel between the settings table and the
 // shortcuts registry view. Opening the view prints its marker (after the
 // table it renders is in hand), so a gate can grep the registry's size.
 func (a *panel) toggleShortcuts() bool {
-	a.showServices, a.showGrants = false, false
-	a.showChords = !a.showChords
 	if a.showChords {
-		vi.ConsoleLine(markerShortcuts + vi.Itoa64(int64(len(chords.Global))))
-		a.status = "the global shortcuts registry — one owner per chord (read-only)"
-	} else {
-		a.status = "type key=value + Enter to save"
+		return a.showTab(tabSettings)
 	}
-	return true
+	return a.showTab(tabShortcuts)
 }
 
 // --- paint ------------------------------------------------------------------
@@ -640,16 +726,20 @@ func (a *panel) toggleShortcuts() bool {
 func (a *panel) layout() {
 	ta := a.ta
 	w := int(natW) - 16
+	// M122e (#2574): the tab strip leads the pane — Settings / Services /
+	// Grants / Shortcuts cells — with the view's own header line under it.
+	a.tabs.R = scaleR(ta, widgets.Rect{X: 8, Y: 8, W: w, H: 20})
+	a.tabs.Active = a.activeTab()
 	a.headTxt = widgets.Text{
-		R:     scaleR(ta, widgets.Rect{X: 8, Y: 8, W: w, H: 22}),
+		R:     scaleR(ta, widgets.Rect{X: 8, Y: 32, W: w, H: 14}),
 		Label: a.headLabel(),
 		Fg:    theme.Current.Text,
 		Bg:    theme.Current.Surface,
 	}
-	// 18px rows: the ten default rows fit; extra palette rows scroll.
+	// 18px rows: ten visible at a time; the rest of the table scrolls.
 	scrollTop, focused := a.list.ScrollTop, a.list.Focused
 	a.list = widgets.List{
-		R:         scaleR(ta, widgets.Rect{X: 8, Y: 36, W: w, H: 200}),
+		R:         scaleR(ta, widgets.Rect{X: 8, Y: 50, W: w, H: 184}),
 		Items:     a.labels(),
 		RowH:      scaleH(ta, 18),
 		Sel:       a.sel,
@@ -874,7 +964,11 @@ func decade(v int) string {
 // drawRowControls paints each visible settings row's affordance after the
 // list rows — Toggles, the volume Slider, and the dropdown buttons.
 func (a *panel) drawRowControls(cv widgets.RectCanvas) {
-	if a.showServices || a.showChords {
+	// The affordances name SETTINGS rows: in the services, grants or
+	// shortcuts panes the list renders other tables — a settings control
+	// over a foreign row would paint (and hit-test) a lie. (M122e fixup:
+	// grants was missing here — a grants row could wear row 0's toggle.)
+	if a.showServices || a.showGrants || a.showChords {
 		return
 	}
 	for i, row := range a.disp {
@@ -908,7 +1002,7 @@ func (a *panel) drawRowControls(cv widgets.RectCanvas) {
 // rowControlClick gives a left-click inside the list first shot at a row
 // affordance; a miss falls through to the existing focus/list handling.
 func (a *panel) rowControlClick(x, y int) bool {
-	if a.showServices || a.showChords {
+	if a.showServices || a.showGrants || a.showChords {
 		return false
 	}
 	for i, row := range a.disp {
@@ -966,6 +1060,7 @@ func (a *panel) draw() {
 	a.layout()
 	cv := a.ta.Canvas()
 	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(theme.Current.Bg))
+	a.tabs.Draw(cv)
 	a.headTxt.Draw(cv)
 	a.list.Draw(cv)
 	a.drawRowControls(cv)

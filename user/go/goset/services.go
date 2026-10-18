@@ -186,13 +186,8 @@ func (v *servicesView) Save(receipts func()) error {
 	return nil
 }
 
-func (a *panel) openServices() {
-	a.showChords, a.showServices, a.showGrants = false, true, false
-	a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
-	a.services.Refresh()
-	a.serviceStatus()
-	consoleLine("goset: services n=" + vi.Itoa64(int64(len(a.services.manifest.Services))))
-}
+// M122e (#2574): the open moved into panel.showTab — the tab-strip cell,
+// the typed `services` line and Esc's pop all land the same switch.
 
 func (a *panel) serviceStatus() {
 	if a.services.reason != "" {
@@ -200,16 +195,14 @@ func (a *panel) serviceStatus() {
 		consoleLine("goset: services refuse " + a.services.reason)
 		return
 	}
-	a.status = "name=on|off + Enter, or Tab then Left/Right, Enter; settings returns"
+	a.status = "name=on|off + Enter, click a row, or Tab then Left/Right, Enter; Esc returns"
 }
 
 func (a *panel) serviceInput() {
 	line := strings.TrimSpace(a.input.Value())
 	a.input.Clear()
 	if line == "settings" {
-		a.showServices = false
-		a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
-		a.status = "key=value + Enter; services opens Services"
+		a.showTab(tabSettings)
 		return
 	}
 	if line != "" {
