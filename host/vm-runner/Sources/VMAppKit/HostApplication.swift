@@ -54,6 +54,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// The toolbar item identifier for the capture-keys pill — tests find
     /// the pill by it.
     public static let captureKeysToolbarItem = NSToolbarItem.Identifier("virelai.capture-keys")
+    /// M127e (#2603): the AGENT status pill's toolbar identifier — a
+    /// second bus surface (its tap dispatches `lane-agent`, the
+    /// freeze/resume choke), present only when the companion is armed.
+    public static let agentToolbarItem = NSToolbarItem.Identifier("virelai.agent")
+    private weak var agentPill: NSButton?
 
     public init(serialLog: String, inspector: HostInspector = HostInspector(), presentWindow: Bool = true) {
         self.serialLog = serialLog
@@ -145,6 +150,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         ])
         recordBadge.isHidden = true
         commandBus.recorder.onChange = { [weak self] in self?.refreshRecordAffordance() }
+        commandBus.agent.onChange = { [weak self] in self?.refreshAgentAffordance() }
         status.alignment = .center
         status.font = .systemFont(ofSize: 18)
         status.translatesAutoresizingMaskIntoConstraints = false
@@ -266,6 +272,25 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         recordBadgeLabel.stringValue = "● REC \(recorder.remaining)s"
     }
 
+    /// M127e (#2603): the pill mirrors the companion model — session
+    /// dot, pause mark, rejected-receipt flag — and the drawer's agent
+    /// sub-pane repaints with it (syncInspector calls drawer.reload).
+    private func refreshAgentAffordance() {
+        agentPill?.title = commandBus.agent.pillText
+        drawer.reload()
+    }
+
+    /// The pill's projection — the class-A seams tests read rather than
+    /// poking the toolbar.
+    public var agentPillVisible: Bool { commandBus.agent.companionArmed }
+    public var agentPillText: String { commandBus.agent.pillText }
+
+    /// The pill is a bus surface like the menu item — a tap dispatches
+    /// `lane-agent` (freeze/resume the agent-channel endpoint).
+    @objc private func agentPillTapped(_ sender: NSButton) {
+        commandBus.dispatch(.laneAgent)
+    }
+
     private func refreshCaptureAffordance() {
         let on = captureTarget?.capturesSystemKeys ?? false
         captureBadge.isHidden = !on
@@ -281,7 +306,12 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     // MARK: NSToolbarDelegate — the pill is the only item for now.
 
     public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.flexibleSpace, HostApplication.captureKeysToolbarItem]
+        var ids: [NSToolbarItem.Identifier] = [.flexibleSpace, HostApplication.captureKeysToolbarItem]
+        // The AGENT pill exists only where a companion can be armed —
+        // an agentless run keeps the flags-off posture (no chrome for
+        // a lane that can never carry traffic).
+        if commandBus.agent.companionArmed { ids.append(HostApplication.agentToolbarItem) }
+        return ids
     }
 
     public func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -291,6 +321,22 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public func toolbar(_ toolbar: NSToolbar,
                         itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
                         willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        if itemIdentifier == HostApplication.agentToolbarItem {
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            let pill = NSButton(title: commandBus.agent.pillText, target: self,
+                                action: #selector(agentPillTapped(_:)))
+            pill.bezelStyle = .rounded
+            pill.font = .systemFont(ofSize: 12, weight: .semibold)
+            // A tap pauses/resumes — meaningful only when the channel
+            // exists; an audit-only companion still shows its status.
+            pill.isEnabled = commandBus.agent.channelArmed
+            item.view = pill
+            item.label = "Agent"
+            item.paletteLabel = "Agent Channel"
+            item.toolTip = "AGENTD sessions + HMAC-verified audit receipts — click freezes/resumes the agent channel"
+            agentPill = pill
+            return item
+        }
         guard itemIdentifier == HostApplication.captureKeysToolbarItem else { return nil }
         let item = NSToolbarItem(itemIdentifier: itemIdentifier)
         let pill = NSButton(title: "Capture Keys", target: self,
