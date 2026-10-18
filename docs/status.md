@@ -188,6 +188,7 @@ Threads and their current state (the tracker is authoritative):
 | **M127 — Through the glass 2.0** | **Filed** — sub-cards filed (#2599–#2604), lanes a→{b∥c∥d∥e}→f; VHI1 v2 — drop-to-open, notify click-through, consented `OUTBOX/` export, host AGENTD companion. Deferred M114 non-goal, now real. | #2555; cards #2599–#2604 |
 | **M128 — Workstation profiles** | **Filed** — sub-cards filed (#2605–#2609), lanes {a∥b∥c∥d}→e; `⌘,` machine settings (cpus/memoryMiB/devices/lanes), profile manager, `.virelaivm` Finder documents, guest-visible profile summary. | #2556; cards #2605–#2609 |
 | **M129 — Headroom: 512 MiB default, task-pool raise, capacity table** | **Filed** — sub-cards filed (#2610–#2612), lanes a→b, c∥a; compiled-default bump to 512 MiB (kernel untouched — bitmap spans 4 GiB), then the 16-slot task pool raise, then a measured capacity table in `hardware-contract.md`. | #2557; cards #2610–#2612 |
+| **M130 — It runs Doom (legally): GPL engine as a signed store payload** | **Filed** — sub-cards filed (#2618–#2623), lanes a→b→{c∥d}→e→f; card a is the license/engine ADR (GPL-as-app-payload policy, sibling-repo boundary, doomgeneric-shim vs from-scratch, WAD asset license) gating the rest; the store install is the first genuinely third-party app. Owner policy ratified 2026-10-18: GPL payloads okay via store, never in system/build/repo. | #2617; cards #2618–#2623 |
 
 
 ## Gate status
