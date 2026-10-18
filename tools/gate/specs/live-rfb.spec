@@ -72,7 +72,7 @@ vgate_run 01 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-intruder \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -129,7 +129,7 @@ vgate_run 02 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=security \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -164,7 +164,7 @@ vgate_run 03 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=malformed \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -201,7 +201,7 @@ vgate_run 04 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=stall \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -233,7 +233,7 @@ vgate_run 05 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=die-drag \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
@@ -270,7 +270,7 @@ vgate_run 06 -- \
     --net-tcp-connect 10.0.0.1:5900 \
     --net-tcp-connect-stream '.build/go/rfbprobe' \
     --net-tcp-connect-stream-arg -mode=die-focus \
-    --net-tcp-connect-after 'gocalc: present' \
+    --net-tcp-connect-after 'gotabwm: rfb listen' \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after 'gotabwm: win focus' \
