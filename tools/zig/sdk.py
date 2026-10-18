@@ -99,8 +99,12 @@ def prepare(cache):
                     output.parent.mkdir(parents=True, exist_ok=True)
                     output.write_bytes(data)
                     output.chmod(member.mode & 0o755)
-        # Additional files in the std tree can alter imports, too.
-        actual = {p.relative_to(stage).as_posix() for p in stage.rglob("*") if p.is_file() or p.is_symlink()}
+        # Additional files in the std tree can alter imports, too. Finder
+        # metadata (.DS_Store, ._AppleDouble) cannot, and on a shared
+        # workstation it lands unbidden mid-build.
+        actual = {p.relative_to(stage).as_posix() for p in stage.rglob("*")
+                  if (p.is_file() or p.is_symlink()) and not p.name.startswith(".DS_Store")
+                  and not p.name.startswith("._")}
         if actual != set(manifest):
             raise ValueError("materialized compiler/library has additional files")
         if not set(overlay) <= set(manifest):
