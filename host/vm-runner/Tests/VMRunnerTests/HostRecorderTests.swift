@@ -112,6 +112,9 @@ final class HostRecorderTests: XCTestCase {
         XCTAssertTrue(line.hasPrefix("host-ui: cmd=record state=performed recording=off frames=5 bytes="), line)
         XCTAssertTrue(line.contains(" file=capture-"), line)
         XCTAssertTrue(line.hasSuffix(".mp4"), line)
+        // Produced frames queue through encoder back-pressure — none is
+        // lost to the input's momentary not-ready during warm-up (#2616).
+        XCTAssertEqual(bus.recorder.droppedFrames, 0)
         let file = try XCTUnwrap(bus.recorder.lastFile)
         XCTAssertGreaterThan(bus.recorder.lastBytes, 0)
         let head = try Data(contentsOf: file).prefix(12)
