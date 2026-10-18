@@ -27,7 +27,7 @@ func atoi(s string) int {
 }
 
 func TestParseArgsDefaults(t *testing.T) {
-	a, ok, help := parseArgs([]string{"10.0.0.2"})
+	a, ok, help := parseArgs([]string{"10.0.0.2"}, false)
 	if !ok || help {
 		t.Fatalf("parseArgs ok=%v help=%v", ok, help)
 	}
@@ -37,24 +37,24 @@ func TestParseArgsDefaults(t *testing.T) {
 }
 
 func TestParseArgsCount(t *testing.T) {
-	a, ok, _ := parseArgs([]string{"-c", "3", "10.0.0.2"})
+	a, ok, _ := parseArgs([]string{"-c", "3", "10.0.0.2"}, false)
 	if !ok || a.Count != 3 {
 		t.Fatalf("parseArgs -c 3 = (%+v,%v)", a, ok)
 	}
-	if _, ok, _ := parseArgs([]string{"-c", "0", "10.0.0.2"}); ok {
+	if _, ok, _ := parseArgs([]string{"-c", "0", "10.0.0.2"}, false); ok {
 		t.Fatal("-c 0 must be a usage error")
 	}
-	if _, ok, _ := parseArgs([]string{"-c", "101", "10.0.0.2"}); ok {
+	if _, ok, _ := parseArgs([]string{"-c", "101", "10.0.0.2"}, false); ok {
 		t.Fatal("-c 101 must be a usage error")
 	}
-	if _, ok, _ := parseArgs([]string{"-c"}); ok {
+	if _, ok, _ := parseArgs([]string{"-c"}, false); ok {
 		t.Fatal("-c with no value must be a usage error")
 	}
 }
 
 func TestParseArgsHelp(t *testing.T) {
 	for _, flag := range []string{"-h", "--help"} {
-		if _, ok, help := parseArgs([]string{flag}); !ok || !help {
+		if _, ok, help := parseArgs([]string{flag}, false); !ok || !help {
 			t.Fatalf("parseArgs(%q) ok=%v help=%v, want help", flag, ok, help)
 		}
 	}
@@ -69,29 +69,68 @@ func TestParseArgsErrors(t *testing.T) {
 		{"10.0.0.256"},
 	}
 	for _, c := range cases {
-		if _, ok, help := parseArgs(c); ok || help {
+		if _, ok, help := parseArgs(c, false); ok || help {
 			t.Fatalf("parseArgs(%v) accepted", c)
 		}
+	}
+}
+
+// M117c (#2475): the v6 literal selects the ping6 path — bare or
+// bracketed — and GOPING6's argv[0] forces it.
+func TestParseArgsV6(t *testing.T) {
+	a, ok, _ := parseArgs([]string{"fe80::2"}, false)
+	if !ok || !a.V6 {
+		t.Fatalf("parseArgs bare v6 = (%+v,%v)", a, ok)
+	}
+	want := [16]byte{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02}
+	if a.IP6 != want {
+		t.Fatalf("IP6 = %v, want fe80::2", a.IP6)
+	}
+	a, ok, _ = parseArgs([]string{"-c", "2", "[2001:db8:64::2]"}, false)
+	if !ok || !a.V6 || a.Count != 2 || a.IPStr != "[2001:db8:64::2]" {
+		t.Fatalf("parseArgs bracketed v6 = (%+v,%v)", a, ok)
+	}
+	// force6 (GOPING6 argv[0]): a bare literal that is not a v4 quad.
+	a, ok, _ = parseArgs([]string{"fd00::64:1"}, true)
+	if !ok || !a.V6 {
+		t.Fatalf("parseArgs force6 = (%+v,%v)", a, ok)
+	}
+	// A malformed v6 literal is a usage error, never a v4 DNS name.
+	if _, ok, _ := parseArgs([]string{"fe80:::"}, false); ok {
+		t.Fatal("malformed v6 literal accepted")
+	}
+}
+
+func TestCliArgsV6(t *testing.T) {
+	// A bare v6 literal is an argument, not the image name.
+	got, f6 := cliArgs([]string{"fe80::2"})
+	if len(got) != 1 || f6 {
+		t.Fatalf("cliArgs bare v6 = %v f6=%v", got, f6)
+	}
+	// GOPING6.ELF as argv[0] is the image name AND the v6 selector.
+	got, f6 = cliArgs([]string{"GOPING6.ELF", "fe80::2"})
+	if len(got) != 1 || got[0] != "fe80::2" || !f6 {
+		t.Fatalf("cliArgs GOPING6 = %v f6=%v", got, f6)
 	}
 }
 
 // TestCliArgsDropsImageName pins the argv[0] rule: the kernel's ELF gap path
 // prepends the image name, and a raw argument list must not be mangled.
 func TestCliArgsDropsImageName(t *testing.T) {
-	got := cliArgs([]string{"GOPING.ELF", "-c", "3", "10.0.0.2"})
+	got, _ := cliArgs([]string{"GOPING.ELF", "-c", "3", "10.0.0.2"})
 	if len(got) != 3 || got[0] != "-c" {
 		t.Fatalf("cliArgs with image name = %v", got)
 	}
 	// No image name (the flat path): the arguments are already clean.
-	got = cliArgs([]string{"-c", "3", "10.0.0.2"})
+	got, _ = cliArgs([]string{"-c", "3", "10.0.0.2"})
 	if len(got) != 3 || got[0] != "-c" {
 		t.Fatalf("cliArgs without image name = %v", got)
 	}
-	got = cliArgs([]string{"10.0.0.2"})
+	got, _ = cliArgs([]string{"10.0.0.2"})
 	if len(got) != 1 || got[0] != "10.0.0.2" {
 		t.Fatalf("cliArgs bare IP = %v", got)
 	}
-	if got := cliArgs(nil); got != nil {
+	if got, _ := cliArgs(nil); got != nil {
 		t.Fatalf("cliArgs(nil) = %v", got)
 	}
 }

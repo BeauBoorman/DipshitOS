@@ -11,6 +11,7 @@ const timer = @import("timer.zig");
 const builtin = @import("builtin");
 const udp = @import("udp.zig");
 const csprng = @import("csprng.zig");
+const ipv6 = @import("ipv6.zig"); // M117c (#2475): the v6 TCP claim + legacyOpen6
 pub var sockets: core.Core = .{};
 /// M97e-F5 (#2104): the DNS transaction's client port is a FRESH
 /// ephemeral draw per query (the IANA dynamic range 49152..65535) — a
@@ -58,8 +59,25 @@ fn claimTcpFrame(frame: []const u8) bool {
     sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
     return true;
 }
+/// M117c (#2475): the v6 half of `claimTcpFrame` — `ipv6.zig`'s terminal
+/// dispatch hands VALIDATED v6/TCP frames (fixed header, next-header 6)
+/// here; the claim gates on an owned dst address + a table-owned dst
+/// port before the table's own parse sees it. Registered by
+/// `registerTableRx` — the same delegate shape, on `ipv6.tcp6_rx`.
+fn claimTcp6Frame(frame: []const u8) bool {
+    if (frame.len < 14 + ipv6.ipv6_hdr_len + core.wire.tcp_hdr_len or
+        frame[14] >> 4 != 6 or frame[20] != core.wire.protocol_tcp) return false;
+    const dst = ipv6.dst_addr(frame);
+    if (!ipv6.is_owned(&dst)) return false; // not ours — foreign, not a drop
+    const port = std.mem.readInt(u16, frame[14 + ipv6.ipv6_hdr_len + 2 ..][0..2], .big);
+    if (!sockets.tableOwns(port)) return false;
+    sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
+    return true;
+}
 pub fn registerTableRx() void {
     if (core.wire.table_rx == null) core.wire.table_rx = claimTcpFrame;
+    if (ipv6.tcp6_rx == null) ipv6.tcp6_rx = claimTcp6Frame;
+    if (ipv6.udp6_rx == null) ipv6.udp6_rx = udp.handle_rx6;
 }
 pub fn poll() void {
     registerTableRx();
@@ -172,6 +190,10 @@ pub fn ready(owner: u64, handle: core.Handle) core.Error!u64 {
 pub fn peer(owner: u64, handle: core.Handle) core.Error!u64 {
     _ = try sockets.status(owner, handle);
     const c = sockets.children[(handle.value & core.slot_mask) - core.conn_slot_base].?;
+    // M117c: the word marshal is v4-shaped; a v6 peer's address does not
+    // fit, so only its port is reported (a v6 conn's caller already knows
+    // the literal it dialed).
+    if (c.remote.family == .v6) return c.remote.port;
     return ipWord(c.remote.ip) << 16 | c.remote.port;
 }
 pub fn ownedCount(owner: u64) u64 {
@@ -276,7 +298,7 @@ pub fn legacyListen(owner: u64, local_ip: [4]u8, port: u16) core.Error!void {
     registerTableRx(); // an extra-slot listener's SYNs arrive before any poll
     if (legacyListenerSlot(owner)) |slot| sockets.releaseAt(slot);
     if (tcpPortClaimed(port)) return error.Capacity;
-    const handle = try sockets.listen(owner, .{ .ip = local_ip, .port = port }, now());
+    const handle = try sockets.listen(owner, core.ep4(local_ip, port), now());
     try sockets.markLegacy(owner, handle);
 }
 
@@ -288,7 +310,19 @@ pub fn legacyListen(owner: u64, local_ip: [4]u8, port: u16) core.Error!void {
 pub fn legacyOpen(owner: u64, local_ip: [4]u8, remote_ip: [4]u8, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
     registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
     const port = allocLocalPort() orelse return error.Capacity;
-    return sockets.open(owner, .{ .ip = local_ip, .port = port }, .{ .ip = remote_ip, .port = remote_port }, remote_mac, now(), isn);
+    return sockets.open(owner, core.ep4(local_ip, port), core.ep4(remote_ip, remote_port), remote_mac, now(), isn);
+}
+
+/// M117c (#2475, ADR 0057 D8/D10): the v6 half of `legacyOpen` — the
+/// slot-80 op-10 marshal hands the caller's v6 literal (the pointer-
+/// carried 16 bytes); `local6` is the kernel's select_src answer and
+/// `remote_mac` the resolved NEXT HOP (the peer on-link, the router
+/// off-link). One bounded connection slot and the same port claim as
+/// v4 — the family's bounds are shared.
+pub fn legacyOpen6(owner: u64, local6: ipv6.Addr, remote6: ipv6.Addr, remote_port: u16, remote_mac: [6]u8, isn: u32) core.Error!core.Handle {
+    registerTableRx(); // the outbound conn's SYN-ACK can arrive before any poll
+    const port = allocLocalPort() orelse return error.Capacity;
+    return sockets.open(owner, core.ep6(local6, port), core.ep6(remote6, remote_port), remote_mac, now(), isn);
 }
 fn allocLocalPort() ?u16 {
     if (!tcpPortClaimed(core.wire.default_src_port)) return core.wire.default_src_port;

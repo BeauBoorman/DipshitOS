@@ -332,8 +332,13 @@ pathlib.Path("artifacts", "go-net-connect-wire" + suffix + ".bin").write_bytes(d
 syns = []
 i = 0
 while i < len(data):
-    assert data[i+12:i+14] in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
-    size = 42 if data[i+12:i+14] == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
+    et = data[i+12:i+14]
+    if et == b"\x86\xdd":  # M117b's autonomous v6 frames (DAD NS, RS) — skip
+        size = 14 + 40 + struct.unpack_from("!H", data, i+18)[0]
+        i += size
+        continue
+    assert et in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
+    size = 42 if et == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
     f = data[i:i+size]
     if f[12:14] == b"\x08\x00" and f[23] == 6 and f[37:38] == b"\x91" and f[36] == 0x1f:
         assert f[30:34] == bytes([10,0,0,2]) and f[47] == 2, "silent port transmitted something other than SYN"
@@ -366,8 +371,13 @@ pathlib.Path("artifacts", "go-net-connect-legacy-wire" + suffix + ".bin").write_
 syns = []
 i = 0
 while i < len(data):
-    assert data[i+12:i+14] in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
-    size = 42 if data[i+12:i+14] == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
+    et = data[i+12:i+14]
+    if et == b"\x86\xdd":  # M117b's autonomous v6 frames (DAD NS, RS) — skip
+        size = 14 + 40 + struct.unpack_from("!H", data, i+18)[0]
+        i += size
+        continue
+    assert et in (b"\x08\x06", b"\x08\x00"), "unexpected capture frame"
+    size = 42 if et == b"\x08\x06" else 14 + struct.unpack_from("!H", data, i+16)[0]
     f = data[i:i+size]
     if f[12:14] == b"\x08\x00" and f[23] == 6 and f[36:38] == b"\x1f\x91":
         assert f[30:34] == bytes([10,0,0,2]) and f[47] == 2
@@ -495,6 +505,9 @@ i = 0
 while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
+        continue
+    if data[i+12:i+14] == b"\x86\xdd":  # M117b's autonomous v6 frames — skip
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
         continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
     size = 14 + struct.unpack_from("!H", data, i + 16)[0]
@@ -692,6 +705,9 @@ while i < len(data):
     if data[i+12:i+14] == b"\x08\x06":
         i += 42
         continue
+    if data[i+12:i+14] == b"\x86\xdd":  # M117b's autonomous v6 frames — skip
+        i += 14 + 40 + struct.unpack_from("!H", data, i + 18)[0]
+        continue
     assert data[i+12:i+14] == b"\x08\x00", "unexpected capture frame"
     size = 14 + struct.unpack_from("!H", data, i + 16)[0]
     frames.append(data[i:i+size])
@@ -871,3 +887,188 @@ vgate_assert pipe serial-contains 'gonetpipe: refused interfaces'
 vgate_assert pipe serial-contains 'gonetpipe: refused interface-addrs'
 vgate_assert pipe serial-absent 'gonetpipe: FAIL'
 vgate_assert pipe serial-absent '[EXC] parking:'
+
+# --- M117c (#2475, ADR 0057): the v6 transport legs -----------------------
+# UDP/IPv6 echo + TCP/IPv6 connect through the hermetic peer. The guest's
+# global forms from the RA's PIO + the EUI-64 IID ('net: v6 g6=... valid'
+# gates script2 — a connect before SLAAC settles would refuse no_src6),
+# the peer resolves through --net-ndp-respond, and the legs are:
+#   * `net udp6 listen/send/recv` — the monitor's own v6 datagram drive;
+#   * GOCONNECT6.ELF — `vi.Dial` on the BRACKETED v6 literal, then
+#     GET/200/close on the TCP6 responder;
+#   * GOPING.ELF on a bare v6 literal — the ping6 marshal (slots 59/60
+#     with the family tag).
+# HOST PREREQUISITE beyond the listed ones:
+#   bash tools/go/build-goping.sh -> .build/go/GOPING.ELF
+
+vgate_file connect6.go <<'EOF'
+package main
+
+import (
+    "time"
+    "virelai/vi"
+    "virelai/vsys"
+)
+
+func fail(s string) {
+    vsys.Println("net6connect: FAIL " + s)
+    vsys.Exit(1)
+}
+
+func main() {
+    // M117c (#2475): the bracketed v6 literal — the tagged op-10 marshal.
+    vsys.Println("net6connect: dialing [2001:db8:64::ff:fe00:2]:8080")
+    c, err := vi.DialTimeout("[2001:db8:64::ff:fe00:2]", 8080, 5*time.Second)
+    if err != nil { fail("dial " + err.Error()) }
+    if !c.IsV6() { fail("conn not family v6") }
+    vsys.Println("net6connect: connected")
+    if _, err = c.Send([]byte("GET / HTTP/1.0\r\n\r\n")); err != nil { fail("send") }
+    c.SetRecvDeadline(5_000_000_000)
+    buf := make([]byte, vi.TCPPayloadMax)
+    n, err := c.Recv(buf)
+    if err != nil || n < 15 || string(buf[:15]) != "HTTP/1.0 200 OK" { fail("GET response") }
+    if err = c.Close(); err != nil { fail("close") }
+    vsys.Println("net6connect: GET and close ok")
+    vsys.Println("net6connect: done")
+    vsys.Exit(0)
+}
+EOF
+
+vgate_file script-v6-ready.txt <<'EOF'
+echo v6-ready
+EOF
+
+vgate_file script-v6.txt <<'EOF'
+net ndp 2001:db8:64::ff:fe00:2
+net ip6
+net ndp 2001:db8:64::ff:fe00:2
+net udp6 listen 7000
+net udp6 send 2001:db8:64::ff:fe00:2 5555 4
+net udp6 recv 7000
+exec GOCONNECT6.ELF
+exec GOPING.ELF -c 2 2001:db8:64::ff:fe00:2
+echo v6-transport-ok
+EOF
+
+vgate_setup_python <<'PY'
+import os, pathlib, subprocess
+rd = pathlib.Path(os.environ["RUN_DIR"])
+share = pathlib.Path(os.environ.get("VG_SHARE") or rd / "share")
+tmp = rd / "connect-build"
+tmp.mkdir(exist_ok=True)
+env = dict(os.environ, TMPDIR=str(tmp), GO_BUILD_OUT=str(share),
+           GO_BUILD_NAME="GOCONNECT6", GO_LDFLAGS_VALUE="-s -w")
+subprocess.run(["bash", "tools/go/build-go.sh", str(rd / "connect6.go")], env=env, check=True)
+PY
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOPING.ELF")
+if not os.path.exists(src):
+    sys.exit("GOPING.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-goping.sh")
+shutil.copy(src, os.path.join(share, "GOPING.ELF"))
+print("staged GOPING.ELF (%d bytes)" % os.path.getsize(src))
+PY
+
+# Run v6 -- the hermetic v6 fleet: the RA arms SLAAC, the NDP responder
+# resolves the peer, then the UDP echo, the TCP6 connect and the ping6
+# legs all land on the same peer.
+vgate_run v6 -- --net '$RUN_DIR/v6.bin' \
+    --net-ra-respond '2001:db8:64::/64' \
+    --net-ndp-respond '2001:db8:64::ff:fe00:2' \
+    --net-icmp6-respond '2001:db8:64::ff:fe00:2' \
+    --net-udp6-respond '[2001:db8:64::ff:fe00:2]:5555' \
+    --net-tcp6-respond '[2001:db8:64::ff:fe00:2]:8080' \
+    --script '$RUN_DIR/script-v6-ready.txt' \
+    --script2 '$RUN_DIR/script-v6.txt' --script2-after 'net: v6 g6=2001:db8:64::ff:fe00:1 valid' \
+    --script-expect 'v6-transport-ok' --timeout 120
+
+vgate_assert v6 output-contains 'net-ra-respond: ENABLED'
+vgate_assert v6 output-contains 'net-udp6-respond: ENABLED'
+vgate_assert v6 output-contains 'net-tcp6-respond: ENABLED'
+vgate_assert v6 serial-contains 'net: v6 g6=2001:db8:64::ff:fe00:1 valid'
+vgate_assert v6 serial-contains 'net ndp: 2001:db8:64::ff:fe00:2 is at 02:00:00:00:00:02'
+vgate_assert v6 serial-contains 'net udp6: listening on 7000'
+vgate_assert v6 serial-contains 'net udp6: sent 4 bytes to 2001:db8:64::ff:fe00:2:5555'
+vgate_assert v6 serial-contains 'net udp6 recv: [0] len=4'
+vgate_assert v6 serial-contains 'net udp6 recv: 01 02 03 04'
+vgate_assert v6 serial-contains 'net6connect: connected'
+vgate_assert v6 serial-contains 'net6connect: GET and close ok'
+vgate_assert v6 serial-contains 'net6connect: done'
+vgate_assert v6 serial-contains 'PING6 2001:db8:64::ff:fe00:2'
+vgate_assert v6 serial-contains '2 packets received, 0% packet loss'
+vgate_assert v6 serial-contains 'v6-transport-ok'
+vgate_assert v6 serial-absent 'net6connect: FAIL'
+vgate_assert v6 serial-absent '[EXC] parking:'
+vgate_assert v6 output-contains 'NET-UDP6: answered'
+vgate_assert v6 output-contains 'NET-TCP6: answered'
+vgate_assert v6 output-contains 'NET-ICMP6: answered'
+# The wire walk: the capture carries the guest's frames only — every
+# 0x86dd frame either the autonomous SLAAC/NDP traffic or the legs'
+# UDP/TCP/echo frames. The UDP datagram's pseudo-header checksum and the
+# SYN's are recomputed here — a corrupt one could not have been answered.
+vgate_assert v6 python <<'PY'
+import os, struct
+data = open(os.environ["RUN_DIR"] + "/v6.bin", "rb").read()
+PEER = bytes([0x20,0x01,0x0d,0xb8,0,0x64,0,0,0,0,0,0xff,0xfe,0,0,2])
+G6 = bytes([0x20,0x01,0x0d,0xb8,0,0x64,0,0,0,0,0,0xff,0xfe,0,0,1])
+
+def cksum6(src, dst, msg, nh):
+    s = 0
+    for i in range(0, 16, 2):
+        s += (src[i] << 8) | src[i + 1]
+        s += (dst[i] << 8) | dst[i + 1]
+    s += (len(msg) >> 16) + (len(msg) & 0xffff) + nh
+    i = 0
+    while i + 1 < len(msg):
+        s += (msg[i] << 8) | msg[i + 1]
+        i += 2
+    if i < len(msg):
+        s += msg[i] << 8
+    while s >> 16:
+        s = (s & 0xffff) + (s >> 16)
+    return (~s) & 0xffff
+
+v6frames, udps, tcps, echo6 = [], [], [], []
+i = 0
+while i < len(data):
+    et = data[i+12:i+14]
+    if et == b"\x08\x06":
+        i += 42
+        continue
+    if et == b"\x08\x00":
+        size = 14 + struct.unpack_from("!H", data, i+16)[0]
+        i += size
+        continue
+    assert et == b"\x86\xdd", "unexpected capture frame"
+    size = 14 + 40 + struct.unpack_from("!H", data, i+18)[0]
+    v6frames.append(data[i:i+size])
+    i += size
+for f in v6frames:
+    nh = f[20]
+    src, dst = f[22:38], f[38:54]
+    plen = struct.unpack_from("!H", f, 18)[0]
+    msg = f[54:14+40+plen]
+    # The transport checksum field verifies to 0xffff -> recomputed sum is 0.
+    if nh == 17:
+        udps.append(f)
+        assert src == G6 and dst == PEER, "UDP6 datagram wrong endpoints"
+        assert (f[56] << 8) | f[57] == 5555, "UDP6 datagram wrong dst port"
+        assert cksum6(src, dst, msg, 17) == 0, "UDP6 pseudo-header checksum invalid"
+    elif nh == 6:
+        tcps.append(f)
+        assert src == G6 and dst == PEER, "TCP6 segment wrong endpoints"
+        assert (f[56] << 8) | f[57] == 8080, "TCP6 segment wrong dst port"
+        assert cksum6(src, dst, msg, 6) == 0, "TCP6 pseudo-header checksum invalid"
+    elif nh == 58 and f[54] == 128:
+        echo6.append(f)
+        assert cksum6(src, dst, msg, 58) == 0, "ICMPv6 echo checksum invalid"
+assert udps, "no UDP/IPv6 datagram on the wire"
+assert tcps, "no TCP/IPv6 segment on the wire"
+assert any(f[67] == 2 for f in tcps), "no TCP6 SYN on the wire"
+assert len(echo6) >= 2, "ping6 sent fewer than 2 echo requests"
+print("v6 transport ok: %d v6 frames (%d UDP, %d TCP, %d echo), checksums verify" % (len(v6frames), len(udps), len(tcps), len(echo6)))
+PY

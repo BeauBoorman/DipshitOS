@@ -25,6 +25,7 @@
 //! is still counted and dropped.
 const std = @import("std");
 pub const wire = @import("tcp.zig");
+const ipv6 = @import("ipv6.zig"); // M117c (#2475): the family-tagged Endpoint's v6 Addr + is_bad_dst
 
 /// Accepted children one listener may charge at once (the B6 two-client bound,
 /// preserved end-to-end by the native socket fixture).
@@ -71,7 +72,29 @@ pub const retry_limit: u8 = 10;
 /// it, so the advertised free space is exactly the honest bound.
 pub const recv_window: usize = wire.payload_max;
 const ooo_map_words = (recv_window + 63) / 64;
-pub const Endpoint = struct { ip: [4]u8, port: u16 };
+/// M117c (#2475, ADR 0057 D8): the endpoint pair is family-tagged — a
+/// v4 endpoint carries its address in `ip` (the pre-M117c field, its
+/// readers and literals untouched), a v6 endpoint in `addr6`.
+/// `same` compares the family too, so a v6 SYN can never satisfy a v4
+/// listener (or vice versa), and the checksum/build dispatch keys off
+/// `local.family`.
+pub const Family = enum(u8) { v4, v6 };
+pub const Endpoint = struct {
+    ip: [4]u8 = @splat(0),
+    /// The v6 address — only meaningful when `family == .v6`.
+    addr6: ipv6.Addr = @splat(0),
+    family: Family = .v4,
+    port: u16 = 0,
+};
+/// The v4 endpoint literal — the pre-M117c `{ ip, port }` caller shape.
+pub fn ep4(ip: [4]u8, port: u16) Endpoint {
+    return .{ .ip = ip, .port = port };
+}
+/// The v6 endpoint literal — `addr` is the caller's resolved peer or
+/// the `select_src` local.
+pub fn ep6(addr: ipv6.Addr, port: u16) Endpoint {
+    return .{ .family = .v6, .addr6 = addr, .port = port };
+}
 pub const Handle = struct { value: u64 };
 pub const Error = error{
     InvalidArgument,
@@ -265,7 +288,7 @@ pub const Core = struct {
         return self.portClaimed(port);
     }
     pub fn listen(self: *Core, owner: u64, local: Endpoint, now: u64) Error!Handle {
-        if (!validIp(local.ip) or local.port == 0) return error.InvalidArgument;
+        if (!validEndpoint(local) or local.port == 0) return error.InvalidArgument;
         // One listener per owner — B6's same-owner second-listen ENOSPC — and
         // no shared local port across listeners or connections.
         for (0..listener_limit) |slot| if (self.listenerAt(slot)) |l| {
@@ -312,7 +335,7 @@ pub const Core = struct {
     /// handle ABI (slot 80) is passive-only; only the legacy slot-30 shim
     /// calls `open`.
     pub fn open(self: *Core, owner: u64, local: Endpoint, remote: Endpoint, remote_mac: [6]u8, now: u64, fresh_isn: u32) Error!Handle {
-        if (!validIp(remote.ip) or remote.port == 0 or local.port == 0) return error.InvalidArgument;
+        if (!validEndpoint(remote) or remote.port == 0 or local.port == 0) return error.InvalidArgument;
         if (self.ownedSockets(owner) >= owner_limit) return error.Capacity;
         if (self.portClaimed(local.port)) return error.Capacity;
         try self.clock(now);
@@ -542,7 +565,13 @@ pub const Core = struct {
             return;
         }
         var refusal: Refusal = .{ .local = p.local, .remote = p.remote, .remote_mac = p.mac, .bytes = undefined };
-        _ = wire.build_segment(&refusal.bytes, p.local.ip, p.remote.ip, p.local.port, p.remote.port, 0, p.seq +% 1, wire.flag_rst | wire.flag_ack, &.{});
+        // M117c: the RST rides the same family as the segment that
+        // provoked it — the v6 build uses the 16-byte pseudo-header.
+        if (p.local.family == .v6) {
+            _ = wire.build_segment6(&refusal.bytes, &p.local.addr6, &p.remote.addr6, p.local.port, p.remote.port, 0, p.seq +% 1, wire.flag_rst | wire.flag_ack, &.{});
+        } else {
+            _ = wire.build_segment(&refusal.bytes, p.local.ip, p.remote.ip, p.local.port, p.remote.port, 0, p.seq +% 1, wire.flag_rst | wire.flag_ack, &.{});
+        }
         self.refusal = refusal;
     }
     fn received(self: *Core, c: *Connection, p: Parsed) void {
@@ -806,8 +835,22 @@ fn deadline(now: u64) u64 {
 fn validIp(ip: [4]u8) bool {
     return ip[0] != 0 and ip[0] != 127 and ip[0] < 224;
 }
+/// M117c: the family-aware endpoint validation — v4 keeps the
+/// `validIp` rules (nonzero, not loopback-net, not multicast); a v6
+/// endpoint refuses the `bad_dst6` set (multicast, unspecified,
+/// loopback, mapped-v4).
+fn validEndpoint(e: Endpoint) bool {
+    return switch (e.family) {
+        .v4 => validIp(e.ip),
+        .v6 => !ipv6.is_bad_dst(e.addr6),
+    };
+}
 fn same(a: Endpoint, b: Endpoint) bool {
-    return a.port == b.port and std.mem.eql(u8, &a.ip, &b.ip);
+    if (a.family != b.family or a.port != b.port) return false;
+    return switch (a.family) {
+        .v4 => std.mem.eql(u8, &a.ip, &b.ip),
+        .v6 => std.mem.eql(u8, &a.addr6, &b.addr6),
+    };
 }
 fn ackInRange(value: u32, first: u32, last: u32) bool {
     return value -% first <= last -% first;
@@ -857,12 +900,21 @@ fn build(c: *const Connection, buf: []u8, seq: u32, flags: u8, payload: []const 
     return buildOpts(c, buf, seq, flags, &.{}, payload);
 }
 fn buildOpts(c: *const Connection, buf: []u8, seq: u32, flags: u8, opts: []const u8, payload: []const u8) usize {
-    const len = wire.build_segment_opts(buf, c.local.ip, c.remote.ip, c.local.port, c.remote.port, seq, c.rcv_nxt, flags, opts, payload);
+    // M117c: the segment bytes are family-independent; only the
+    // pseudo-header checksum differs (16-byte v6 addresses).
+    const len = if (c.local.family == .v6)
+        wire.build_segment_opts6(buf, &c.local.addr6, &c.remote.addr6, c.local.port, c.remote.port, seq, c.rcv_nxt, flags, opts, payload)
+    else
+        wire.build_segment_opts(buf, c.local.ip, c.remote.ip, c.local.port, c.remote.port, seq, c.rcv_nxt, flags, opts, payload);
     // M99h: the advertised window is the queue's real free space — an
     // empty queue advertises the whole span, a partial read a slice.
     std.mem.writeInt(u16, buf[14..16], @intCast(rxFree(c)), .big);
     @memset(buf[16..18], 0);
-    std.mem.writeInt(u16, buf[16..18], wire.checksum_tcp(c.local.ip, c.remote.ip, buf[0..len]), .big);
+    const cksum = if (c.local.family == .v6)
+        wire.checksum_tcp6(&c.local.addr6, &c.remote.addr6, buf[0..len])
+    else
+        wire.checksum_tcp(c.local.ip, c.remote.ip, buf[0..len]);
+    std.mem.writeInt(u16, buf[16..18], cksum, .big);
     return len;
 }
 fn queue(c: *Connection, flags: u8, payload: []const u8, now: u64) void {
@@ -1000,6 +1052,10 @@ const Parsed = struct {
 };
 fn parse(frame: []const u8, bad_options: *bool) ?Parsed {
     bad_options.* = false;
+    if (frame.len < 14) return null;
+    // M117c: the v6 half — ethertype 0x86dd, the 40-byte fixed header,
+    // the same TCP-shaped tail.
+    if (frame[12] == 0x86 and frame[13] == 0xdd) return parse6(frame, bad_options);
     if (frame.len < wire.frame_min or frame[12] != 8 or frame[13] != 0 or frame[14] != 0x45 or frame[23] != 6) return null;
     const ip = frame[14..34];
     if (wire.fold(wire.sum_words(ip)) != 0 or std.mem.readInt(u16, ip[6..8], .big) & 0xbfff != 0) return null;
@@ -1026,8 +1082,52 @@ fn parse(frame: []const u8, bad_options: *bool) ?Parsed {
     const dst_port = std.mem.readInt(u16, seg[2..4], .big);
     if (src_port == 0 or dst_port == 0) return null;
     return .{
-        .local = .{ .ip = local, .port = dst_port },
-        .remote = .{ .ip = remote, .port = src_port },
+        .local = ep4(local, dst_port),
+        .remote = ep4(remote, src_port),
+        .mac = frame[6..12].*,
+        .seq = std.mem.readInt(u32, seg[4..8], .big),
+        .ack = std.mem.readInt(u32, seg[8..12], .big),
+        .flags = seg[13],
+        .window = std.mem.readInt(u16, seg[14..16], .big),
+        .mss = if (seg[13] & wire.flag_syn != 0) mss else 0,
+        .payload = seg[doff * 4 ..],
+    };
+}
+
+/// M117c (#2475, ADR 0057 D8): the v6 half of `parse` — the caller
+/// already saw ethertype 0x86dd. The fixed header is validated here the
+/// same way `ipv6.handle_rx` does (version, payload_len coverage,
+/// hop_limit — the D7 "no extension-header walk" bound: the terminal
+/// next-header must be TCP itself), then the segment tail shares the
+/// v4 shape checks (flags, data offset, option scan, ports) with a
+/// v6 pseudo-header checksum.
+fn parse6(frame: []const u8, bad_options: *bool) ?Parsed {
+    const frame6_min = 14 + ipv6.ipv6_hdr_len + wire.tcp_hdr_len;
+    if (frame.len < frame6_min) return null;
+    if (frame[14] >> 4 != 6 or frame[20] != wire.protocol_tcp or frame[21] == 0) return null;
+    const plen = std.mem.readInt(u16, frame[18..20], .big);
+    if (plen < wire.tcp_hdr_len or frame.len < 14 + ipv6.ipv6_hdr_len + @as(usize, plen)) return null;
+    const seg = frame[14 + ipv6.ipv6_hdr_len .. 14 + ipv6.ipv6_hdr_len + @as(usize, plen)];
+    if (seg[13] & ~@as(u8, 0x1f) != 0 or (seg[13] & (wire.flag_syn | wire.flag_fin)) == (wire.flag_syn | wire.flag_fin)) return null;
+    const doff: usize = seg[12] >> 4;
+    if (doff < 5 or doff * 4 > seg.len) return null;
+    var mss: u16 = 0;
+    wire.scanOptions(seg, wire.tcp_hdr_len, doff * 4 - wire.tcp_hdr_len, &mss) catch {
+        bad_options.* = true;
+        return null;
+    };
+    if (seg[13] & wire.flag_rst != 0 and (doff != 5 or seg.len != wire.tcp_hdr_len or seg[13] & (wire.flag_syn | wire.flag_fin) != 0)) return null;
+    const remote: ipv6.Addr = frame[22..38].*;
+    const local: ipv6.Addr = frame[38..54].*;
+    // The remote must be a legal v6 source (never multicast/unspecified/
+    // loopback/mapped), and the pseudo-header checksum must verify.
+    if (ipv6.is_bad_dst(remote) or wire.checksum_tcp6(&remote, &local, seg) != 0) return null;
+    const src_port = std.mem.readInt(u16, seg[0..2], .big);
+    const dst_port = std.mem.readInt(u16, seg[2..4], .big);
+    if (src_port == 0 or dst_port == 0) return null;
+    return .{
+        .local = ep6(local, dst_port),
+        .remote = ep6(remote, src_port),
         .mac = frame[6..12].*,
         .seq = std.mem.readInt(u32, seg[4..8], .big),
         .ack = std.mem.readInt(u32, seg[8..12], .big),

@@ -179,6 +179,20 @@
 //          --net-icmp6-respond answers with the echo reply — id/seq/
 //          payload byte-exact. All require --net. An unlisted target or
 //          an unset flag goes unanswered — the refusal leg.)
+//         [--net-udp6-respond [<v6-addr>]:<host-port>]
+//          [--net-tcp6-respond [<v6-addr>]:<host-port>] (M117c #2475,
+//          ADR 0057: the v6 transport responders — the N5 UDP echo and
+//          the N10 TCP handshake/echo shapes on the fixed 40-byte
+//          header. The bracketed literal keeps the address's own colons
+//          out of the port split — the same shape `vi.Dial` speaks.
+//          The UDP6 reply echoes the datagram byte-exact (v6 src/dst
+//          swapped, UDP ports swapped, the pseudo-header checksum over
+//          the 16-byte addresses recomputed). The TCP6 server answers
+//          the guest's SYN with a SYN-ACK (the FIXED ISN 0x12345678),
+//          data with an ACK + the payload echoed (or the HTTP 200 on a
+//          GET / port 80/8080 — the v4 responder's same answer table),
+//          and FIN with FIN-ACK; per-connection state keys on the
+//          guest's v6 src addr:port. Both require --net.)
 //         [--net-dhcp-respond <lease-ip>] (milestone five card N8, claim
 //          0351: a tiny deterministic host-side DHCP server inside the
 //          capture thread — the guest's DHCPDISCOVER is answered with an
@@ -815,6 +829,15 @@ var netIcmpRespondHostIP: [UInt8]?
 var netRaRespondPrefix: [UInt8]? // the advertised /64 (16 bytes, IID bits zero)
 var netNdpRespondAddrs: [[UInt8]] = []
 var netIcmp6RespondAddr: [UInt8]?
+// M117c (#2475, ADR 0057): the v6 transport responders — the N5 UDP echo
+// and the N10 TCP handshake+echo shapes on the 40-byte fixed header
+// (ethertype 0x86dd, next-header 17 / 6). Both take `[v6-addr]:port` —
+// the same bracketed literal shape `vi.Dial` speaks — so an address's
+// own colons never confuse the parse.
+var netUdp6RespondAddr: [UInt8]?
+var netUdp6RespondPort: UInt16?
+var netTcp6RespondAddr: [UInt8]?
+var netTcp6RespondPort: UInt16?
 // The hermetic router's link-local — the modified-EUI-64 derivation of
 // the fixed host MAC 02:00:00:00:00:02 (ADR 0057 D10).
 let netRouterLinkLocal: [UInt8] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x02]
@@ -985,6 +1008,22 @@ var netTcpSrvConns: [String: NetTcpSrvConn] = [:]
 let netTcpSrvConnLimit = 16
 func netTcpConnKey(_ guestIP: [UInt8], _ guestPort: UInt16) -> String {
     "\(guestIP[0]).\(guestIP[1]).\(guestIP[2]).\(guestIP[3]):\(guestPort)"
+}
+// M117c (#2475): the v6 connection key — the v6 address rendered
+// compactly so it shares the bounded `netTcpSrvConns` table without ever
+// colliding with a dotted-quad key.
+func netTcp6ConnKey(_ guestAddr: [UInt8], _ guestPort: UInt16) -> String {
+    "v6:" + v6Text(guestAddr) + ":\(guestPort)"
+}
+/// The v6 connection a guest segment belongs to — the v4
+/// `netTcpSrvConn(for:)` shape on the 40-byte header (src at 22..38,
+/// ports at 54..58).
+func netTcp6SrvConn(for buf: [UInt8]) -> NetTcpSrvConn {
+    let key = netTcp6ConnKey([UInt8](buf[22..<38]), (UInt16(buf[54]) << 8) | UInt16(buf[55]))
+    if let conn = netTcpSrvConns[key] { return conn }
+    let conn = NetTcpSrvConn()
+    netTcpSrvConns[key] = conn
+    return conn
 }
 /// The connection a guest segment belongs to — lazily created so every
 /// segment reaches the per-connection state machine (byte-identical with
@@ -1605,6 +1644,37 @@ while idx < arguments.count {
             fail("--net-icmp6-respond requires a v6 address, got '\(arguments[idx + 1])'.")
         }
         netIcmp6RespondAddr = addr
+        idx += 2
+    } else if arg == "--net-udp6-respond", idx + 1 < arguments.count {
+        // M117c (#2475): '[v6-addr]:port' — the bracket keeps the
+        // address's own colons out of the port split.
+        let token = arguments[idx + 1]
+        guard token.hasPrefix("["), let close = token.firstIndex(of: "]") else {
+            fail("--net-udp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        let addrText = String(token[token.index(after: token.startIndex)..<close])
+        guard let addr = parseIPv6(addrText),
+              token[token.index(after: close)..<token.endIndex].hasPrefix(":"),
+              let port = UInt16(token[token.index(after: close)..<token.endIndex].dropFirst()) else {
+            fail("--net-udp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        netUdp6RespondAddr = addr
+        netUdp6RespondPort = port
+        idx += 2
+    } else if arg == "--net-tcp6-respond", idx + 1 < arguments.count {
+        // M117c (#2475): the same '[v6-addr]:port' bracketed shape.
+        let token = arguments[idx + 1]
+        guard token.hasPrefix("["), let close = token.firstIndex(of: "]") else {
+            fail("--net-tcp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        let addrText = String(token[token.index(after: token.startIndex)..<close])
+        guard let addr = parseIPv6(addrText),
+              token[token.index(after: close)..<token.endIndex].hasPrefix(":"),
+              let port = UInt16(token[token.index(after: close)..<token.endIndex].dropFirst()) else {
+            fail("--net-tcp6-respond requires '[<v6-addr>]:<host-port>', got '\(token)'.")
+        }
+        netTcp6RespondAddr = addr
+        netTcp6RespondPort = port
         idx += 2
     } else if arg == "--net-udp-respond", idx + 1 < arguments.count {
         // Parse the host ip:port now (fail early, like --timeout).
@@ -2531,6 +2601,12 @@ if !netNdpRespondAddrs.isEmpty, netCapturePath == nil {
 if netIcmp6RespondAddr != nil, netCapturePath == nil {
     fail("--net-icmp6-respond requires --net (the echo reply is written into the SAME attachment's socket).")
 }
+if netUdp6RespondAddr != nil, netCapturePath == nil {
+    fail("--net-udp6-respond requires --net (the UDP reply is written into the SAME attachment's socket).")
+}
+if netTcp6RespondAddr != nil, netCapturePath == nil {
+    fail("--net-tcp6-respond requires --net (the TCP replies are written into the SAME attachment's socket).")
+}
 if netIcmpRespondHostIP != nil, netCapturePath == nil {
     fail("--net-icmp-respond requires --net (the ICMP reply is written into the SAME attachment's socket).")
 }
@@ -2903,6 +2979,73 @@ if let netCapturePath {
                 buildIcmp6EchoReply(&reply, buf, n, arpHostMAC)
                 try? netCaptureReadSocket?.write(contentsOf: Data(reply))
                 print("NET-ICMP6: answered the guest's echo request for \(v6Text(addr)) (id \(reply[58] << 8 | reply[59]), seq \(reply[60] << 8 | reply[61]))")
+            }
+            // M117c (#2475, ADR 0057): the v6 transport responders — the
+            // same request-driven shapes as N5/N10 on the fixed 40-byte
+            // header (UDP at frame 54, TCP at frame 54). A listed
+            // [addr]:port answers; anything else goes unanswered.
+            if let addr = netUdp6RespondAddr, let port = netUdp6RespondPort,
+               isUdp6Datagram(buf, n, addr, port) {
+                var reply = [UInt8](repeating: 0, count: n)
+                buildUdp6Reply(&reply, buf, n, arpHostMAC, addr, port)
+                try? netCaptureReadSocket?.write(contentsOf: Data(reply))
+                let srcPort = (UInt16(buf[54]) << 8) | UInt16(buf[55])
+                print("NET-UDP6: answered the guest's datagram for [\(v6Text(addr))]:\(port) (reply to guest src port \(srcPort), \(n - 62) payload bytes)")
+            }
+            if let addr = netTcp6RespondAddr, let port = netTcp6RespondPort,
+               isTcp6Segment(buf, n, addr, port) {
+                let flags = tcp6Flags(buf)
+                let seq = tcp6Seq(buf)
+                var reply = [UInt8](repeating: 0, count: 4096)
+                var payload = [UInt8]()
+                let dataOff = 54 + max(5, Int(buf[66] >> 4)) * 4
+                if n > dataOff { payload = [UInt8](buf[dataOff..<n]) }
+                let isSyn = (flags & 0x02) != 0 && (flags & 0x10) == 0
+                let isFin = (flags & 0x01) != 0
+                let isRst = (flags & 0x04) != 0
+                let connKey = netTcp6ConnKey([UInt8](buf[22..<38]), (UInt16(buf[54]) << 8) | UInt16(buf[55]))
+                if isRst {
+                    netTcp6SrvConn(for: buf).closed = true
+                    print("NET-TCP6: observed the guest's RST (seq 0x\(hex32(seq)))")
+                } else if isSyn {
+                    if !netTcpSrvAdmit(connKey) {
+                        let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, 0, seq &+ 1, 0x14, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                        print("NET-TCP6: refused the guest's SYN (seq 0x\(hex32(seq))); \(netTcpSrvConnLimit) connections already live")
+                    } else {
+                        let conn = NetTcpSrvConn()
+                        netTcpSrvConns[connKey] = conn
+                        let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, netTcpSrvIsn, seq &+ 1, 0x12, [])
+                        try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                        print("NET-TCP6: answered the guest's SYN (seq 0x\(hex32(seq))) with a SYN-ACK (seq 0x\(hex32(netTcpSrvIsn)), ack 0x\(hex32(seq &+ 1)))")
+                    }
+                } else if isFin {
+                    let conn = netTcp6SrvConn(for: buf)
+                    let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, conn.srvNxt, seq &+ 1, 0x11, payload)
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    conn.closed = true
+                    print("NET-TCP6: answered the guest's FIN (seq 0x\(hex32(seq))) with a FIN-ACK (seq 0x\(hex32(conn.srvNxt)), ack 0x\(hex32(seq &+ 1)))")
+                } else if !payload.isEmpty {
+                    let conn = netTcp6SrvConn(for: buf)
+                    var responsePayload = payload
+                    let isGet = payload.count >= 4 && payload[0] == 0x47 && payload[1] == 0x45 && payload[2] == 0x54 && payload[3] == 0x20
+                    if port == 80 || port == 8080 || isGet {
+                        let body = "Hello from VirelaiOS Host!\n"
+                        let httpBody = "HTTP/1.0 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
+                        responsePayload = Array(httpBody.utf8)
+                    }
+                    let replyLen = buildTcp6Reply(&reply, buf, n, arpHostMAC, port, conn.srvNxt, seq &+ UInt32(payload.count), 0x10, responsePayload)
+                    try? netCaptureReadSocket?.write(contentsOf: Data(reply[0..<replyLen]))
+                    if isGet || port == 80 {
+                        print("NET-TCP6: answered the guest's HTTP request with 200 OK (\(responsePayload.count) bytes)")
+                    } else {
+                        print("NET-TCP6: echoed the guest's \(payload.count)-byte data (ack 0x\(hex32(seq &+ UInt32(payload.count))), \(payload.count) payload bytes)")
+                    }
+                    conn.srvNxt = conn.srvNxt &+ UInt32(responsePayload.count)
+                } else {
+                    _ = netTcp6SrvConn(for: buf)
+                    print("NET-TCP6: observed the guest's ACK (ack 0x\(hex32(tcp6Ack(buf))))")
+                }
             }
             // Card N5: if the guest sent a UDP datagram to our ip:port,
             // echo it back from the host (same socket direction; the
@@ -3668,6 +3811,12 @@ if !netNdpRespondAddrs.isEmpty || netRaRespondPrefix != nil {
 }
 if let addr = netIcmp6RespondAddr {
     print("  net-icmp6-respond: ENABLED (M117b #2474, ADR 0057 D10) — the host answers the guest's ICMPv6 echo requests for \(v6Text(addr)) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if let addr = netUdp6RespondAddr, let port = netUdp6RespondPort {
+    print("  net-udp6-respond: ENABLED (M117c #2475, ADR 0057) — the host echoes the guest's UDP/IPv6 datagrams for [\(v6Text(addr))]:\(port) (host MAC 02:00:00:00:00:02) via the capture thread (deterministic, request-driven)")
+}
+if let addr = netTcp6RespondAddr, let port = netTcp6RespondPort {
+    print("  net-tcp6-respond: ENABLED (M117c #2475, ADR 0057) — the host answers the guest's bounded TCP/IPv6 client on [\(v6Text(addr))]:\(port) (host MAC 02:00:00:00:00:02, server ISN 0x\(hex32(netTcpSrvIsn))) via the capture thread (deterministic, request-driven)")
 }
 if let hostIP = netUdpRespondHostIP, let hostPort = netUdpRespondHostPort {
     let ipText = hostIP.map(String.init).joined(separator: ".")
@@ -6537,6 +6686,56 @@ func buildUdpReply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: 
     let udpChk = udpChecksum(hostIP, senderIP, datagram, udpLen)
     reply[40] = UInt8(udpChk >> 8)
     reply[41] = UInt8(udpChk & 0xff)
+}
+
+// M117c (#2475): is the datagram a UDP/IPv6 datagram addressed to
+// `addr:port`? Ethernet II ethertype 0x86dd, version 6, next-header 17,
+// the 16-byte dst address match, the dst port match. UDP over v6 is
+// at frame 54 (14-byte Ethernet + the 40-byte fixed header).
+@Sendable func isUdp6Datagram(_ buf: [UInt8], _ n: Int, _ addr: [UInt8], _ port: UInt16) -> Bool {
+    guard n >= 62 else { return false }
+    guard buf[12] == 0x86 && buf[13] == 0xdd else { return false } // ethertype IPv6
+    guard buf[14] >> 4 == 0x6 else { return false } // version 6
+    guard buf[20] == 17 else { return false } // next header UDP
+    guard [UInt8](buf[38..<54]) == addr else { return false } // dst address
+    let dstPort = (UInt16(buf[56]) << 8) | UInt16(buf[57])
+    return dstPort == port
+}
+
+// M117c (#2475): synthesize the UDP/IPv6 REPLY to the datagram in `req`
+// (the guest's bytes) into `reply` (same length): Ethernet dst/src
+// swapped, ethertype 0x86dd, v6 src/dst swapped, payload_len echoed,
+// hop 64, UDP src port = the host port, dst port = the sender's src
+// port, the payload ECHOED byte-exact; the UDP pseudo-header checksum
+// recomputed over the v6 addresses (icmp6Checksum is the generic
+// 16-byte pseudo-header — nh 17 here).
+@Sendable func buildUdp6Reply(_ reply: inout [UInt8], _ req: [UInt8], _ n: Int, _ hostMAC: [UInt8], _ addr: [UInt8], _ port: UInt16) {
+    reply = [UInt8](repeating: 0, count: n)
+    reply[0...5] = req[6...11] // dst = the sender's MAC
+    reply[6...11] = hostMAC[0...5] // src
+    reply[12] = 0x86
+    reply[13] = 0xdd // ethertype IPv6
+    reply[14] = 0x60 // version 6
+    reply[18...19] = req[18...19] // payload_len (unchanged)
+    reply[20] = 17 // next header UDP
+    reply[21] = 64 // hop limit
+    reply[22...37] = addr[0...15] // src = the addressed address
+    reply[38...53] = req[22...37] // dst = the sender's address
+    reply[54] = UInt8(port >> 8)
+    reply[55] = UInt8(port & 0xff)
+    reply[56] = req[54] // the sender's src port
+    reply[57] = req[55]
+    reply[58...59] = req[58...59] // UDP length (unchanged)
+    if n > 62 {
+        reply[62...n - 1] = req[62...n - 1] // payload echoed
+    }
+    let dst = [UInt8](reply[38..<54])
+    var datagram = [UInt8](reply[54..<n])
+    datagram[6] = 0
+    datagram[7] = 0 // zero the checksum field during the computation
+    let udpChk = icmp6Checksum(addr, dst, datagram, 17)
+    reply[60] = UInt8(udpChk >> 8)
+    reply[61] = UInt8(udpChk & 0xff)
 }
 
 // M99i (issue #2187): hex helper for --net-dns-answer6.
