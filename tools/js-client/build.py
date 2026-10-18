@@ -68,7 +68,7 @@ def build(work, cache, baseline=False, fixture=None):
         raise ValueError("ReservedX18")
     frames = sdk.stack_frames(assembly)
     rt = [inspection.compiler_rt_object(p, assembly, sorted(objects.glob("*.o")) if objects else [])
-          for p in sorted((work / "cache/global").glob("o/*/libcompiler_rt_zcu.o"))]
+          for p in sorted((work / "cache/global").glob("o/*/*compiler_rt_zcu.o"))]
     if not rt:
         raise ValueError("MissingCompilerRtInspection")
     (work / "compiler-rt.json").write_text(json.dumps(rt, sort_keys=True, indent=2) + "\n")
