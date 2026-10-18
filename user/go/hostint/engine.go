@@ -216,7 +216,7 @@ func (e *Engine) Poll() {
 			e.mask = rec.Payload[0]
 			e.del(name)
 			e.laneLog(e.Marker + " armed epoch=" + itoa(int64(rec.Epoch)) + " lanes=" + MaskNames(e.mask))
-		case TagClipIn, TagDrop:
+		case TagClipIn, TagDrop, TagNotifyFocus:
 			// Seat-consumed h→g tags. The mask bit is the consent posture:
 			// a signed record for a lane the runner did not arm is a
 			// consent_denied, per the ADR's reason mapping.
@@ -241,9 +241,9 @@ func (e *Engine) Poll() {
 				e.refuse(tag, reason)
 			}
 		default:
-			// Outbound tags (CLIP_OUT, NOTIFY_OUT) as files in the lane dir
-			// are the seat's own unconsumed emissions — the runner deletes
-			// them. A MAC-valid one is left alone either way.
+			// Outbound tags (CLIP_OUT, NOTIFY_OUT, OUTBOX) as files in the
+			// lane dir are the seat's own unconsumed emissions — the runner
+			// deletes them. A MAC-valid one is left alone either way.
 		}
 	}
 }
@@ -286,11 +286,19 @@ func (e *Engine) Outstanding(tag uint8) int {
 	return n
 }
 
-// Emit signs and publishes one outbound record for tag (CLIP_OUT today,
-// NOTIFY_OUT for M108d). The backpressure bound counts the tag's unconsumed
-// files in this tick's listing. Returns the emitted seq or a refusal code;
-// the success marker is the caller's because it is lane-specific.
+// Emit signs and publishes one outbound record for tag (CLIP_OUT,
+// NOTIFY_OUT, OUTBOX — the v1 form sends sender_id 0). The backpressure
+// bound counts the tag's unconsumed files in this tick's listing. Returns
+// the emitted seq or a refusal code; the success marker is the caller's
+// because it is lane-specific.
 func (e *Engine) Emit(tag uint8, flags uint8, payload []byte) (uint32, string) {
+	return e.EmitSender(tag, flags, 0, payload)
+}
+
+// EmitSender is the v2 form: the record carries sender_id. Tags whose
+// sender is nonzero are correlation records (NOTIFY_OUT naming the toast's
+// source tab is M127c's user); the OUTBOX lane emits with sender 0.
+func (e *Engine) EmitSender(tag uint8, flags uint8, sender uint16, payload []byte) (uint32, string) {
 	if !e.armed {
 		return 0, RefuseLaneDisabled
 	}
@@ -304,7 +312,7 @@ func (e *Engine) Emit(tag uint8, flags uint8, payload []byte) (uint32, string) {
 		return 0, RefuseBackpressure
 	}
 	seq := e.nextOut[tag] + 1
-	rec := EncodeRecord(e.key, tag, flags, seq, e.epoch, payload)
+	rec := EncodeRecordSender(e.key, tag, flags, sender, seq, e.epoch, payload)
 	if rec == nil {
 		return 0, RefuseBadRecord
 	}

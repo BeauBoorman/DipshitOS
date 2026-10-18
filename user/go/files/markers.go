@@ -71,6 +71,12 @@ const (
 	markerOpenLaunched = "gofiles: open launched "
 	markerOpenLaunchNo = "gofiles: open launch refused "
 
+	// M127d (#2602): "Export to Host". The marker names the staged
+	// payload (and the OUTBOX name it landed under when it differs);
+	// refusals carry the lane vocabulary word the stage returned.
+	markerExport   = "gofiles: export "
+	markerExportNo = "gofiles: export refused "
+
 	// M100f (#2311): the volumes root. The listing reuses markerList /
 	// markerEntry on the synthetic path "/", and the disk row's mount state
 	// is named every list (`not_mounted` is the kernel's own refusal name,

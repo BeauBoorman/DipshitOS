@@ -141,13 +141,87 @@ func TestDecodeRefusals(t *testing.T) {
 		"oversize":   make([]byte, RecordMax+1),
 		"bad magic":  append(append([]byte{}, "BAD!"...), good[4:]...),
 		"bad tag":    append(append([]byte{}, good[:4]...), append([]byte{9, 0, 0, 0}, good[8:]...)...),
-		"reserved":   append(append([]byte{}, good[:6]...), append([]byte{1, 0}, good[8:]...)...),
 		"plen drift": append(append([]byte{}, good[:16]...), append([]byte{5, 0}, good[18:]...)...),
 	}
 	for name, raw := range cases {
 		if _, ok := DecodeRecord(raw); ok {
 			t.Fatalf("%s: decoded a malformed record", name)
 		}
+	}
+}
+
+// v2: bytes 6..7 are sender_id, not reserved zeros. A v1 record carries
+// 0 there by construction; a nonzero sender decodes into the field and
+// the MAC domain is unchanged (bytes[0..18+plen) still covers it).
+func TestSenderIdRoundTrip(t *testing.T) {
+	raw := EncodeRecordSender(testKey, TagNotifyOut, 0, 4, 3, 9, []byte("toast"))
+	rec, ok := DecodeRecord(raw)
+	if !ok {
+		t.Fatal("a sender-bearing record must decode")
+	}
+	if rec.Sender != 4 {
+		t.Fatalf("sender = %d want 4", rec.Sender)
+	}
+	if !rec.Verify(testKey) {
+		t.Fatal("sender_id sits inside the MAC domain — verify must hold")
+	}
+	// The v1 form still encodes 0 and still decodes.
+	rec2, ok := DecodeRecord(EncodeRecord(testKey, TagClipIn, 0, 1, 9, []byte("x")))
+	if !ok || rec2.Sender != 0 {
+		t.Fatalf("v1 form: ok=%v sender=%d", ok, rec2.Sender)
+	}
+}
+
+// NOTIFY_FOCUS is plen 0 by grammar: a payload on the tag is bad_record
+// on decode and refused at encode; the encode side also refuses a
+// senderless focus request (the header is its whole payload).
+func TestNotifyFocusGrammar(t *testing.T) {
+	if EncodeRecordSender(testKey, TagNotifyFocus, 0, 0, 1, 9, nil) != nil {
+		t.Fatal("a senderless NOTIFY_FOCUS must refuse at encode")
+	}
+	if EncodeRecordSender(testKey, TagNotifyFocus, 0, 7, 1, 9, []byte("x")) != nil {
+		t.Fatal("a payload-bearing NOTIFY_FOCUS must refuse at encode")
+	}
+	raw := EncodeRecordSender(testKey, TagNotifyFocus, 0, 7, 1, 9, nil)
+	if raw == nil {
+		t.Fatal("plen-0 sender-bearing NOTIFY_FOCUS is the legal form")
+	}
+	rec, ok := DecodeRecord(raw)
+	if !ok || rec.Sender != 7 || rec.Tag != TagNotifyFocus {
+		t.Fatalf("decode: ok=%v sender=%d tag=%d", ok, rec.Sender, rec.Tag)
+	}
+	// Hand-mutate plen onto the wire form: still fails decode.
+	mut := append(append([]byte{}, raw[:16]...), append([]byte{1, 0, 'x'}, raw[18:]...)...)
+	if _, ok := DecodeRecord(mut); ok {
+		t.Fatal("a payload-bearing NFOCUS must decode as bad_record")
+	}
+}
+
+func TestOutboxTagAndLane(t *testing.T) {
+	for _, tc := range []struct {
+		tag  uint8
+		seq  uint32
+		want string
+	}{
+		{TagOutbox, 3, "OUTBOX-00000003"},
+		{TagNotifyFocus, 9, "NFOCUS-00000009"},
+	} {
+		if got := RecordName(tc.tag, tc.seq); got != tc.want {
+			t.Fatalf("RecordName(%d,%08x) = %q want %q", tc.tag, tc.seq, got, tc.want)
+		}
+		tag, seq, ok := ParseName(tc.want)
+		if !ok || tag != tc.tag || seq != tc.seq {
+			t.Fatalf("ParseName(%q) = %d,%d,%v", tc.want, tag, seq, ok)
+		}
+	}
+	if LaneBit(TagOutbox) != LaneOutbox || LaneName(TagOutbox) != "outbox" {
+		t.Fatal("outbox lane mapping wrong")
+	}
+	if LaneBit(TagNotifyFocus) != LaneNotify || LaneName(TagNotifyFocus) != "notify" {
+		t.Fatal("notify-focus rides the notify lane bit")
+	}
+	if got := MaskNames(LaneClip | LaneDrop | LaneNotify | LaneOutbox); got != "clip,drop,notify,outbox" {
+		t.Fatalf("MaskNames = %q", got)
 	}
 }
 
