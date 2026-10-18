@@ -256,3 +256,159 @@ func TestDetailLinesRenderCardFields(t *testing.T) {
 		}
 	}
 }
+
+// ---- M116c (#2469): install-time consent prompt ------------------------
+
+// capsRow is a catalog row whose release declares ReleaseCaps — the
+// install-time prompt's input.
+func capsRow() store.CatalogRow {
+	return store.CatalogRow{Stream: "caprel", Status: "release",
+		Entry: &store.CatalogEntry{
+			Stream: "caprel", Head: "h1", Publisher: "ab", PubState: "trusted",
+			Rel: &store.Release{Name: "GRANTME", Version: "1.0.0",
+				ELFSHA256:    strings.Repeat("ab", 32),
+				Caps:         []string{"file", "memory", "process", "debug", "net"},
+				ManifestRow: "GRANTME.ELF | Grant Me | g | dock=false"},
+		}}
+}
+
+func installCapsRow(t *testing.T, a *app) {
+	t.Helper()
+	loadFn = func(store.FS, string, string, string, string, string) ([]store.CatalogRow, error) {
+		return []store.CatalogRow{capsRow()}, nil
+	}
+	a.refresh()
+	installFn = func(store.FS, string, string, string, string) int { return 0 }
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'i'})
+}
+
+func TestInstallCapsReleaseStandsPrompt(t *testing.T) {
+	a, lines := testApp(t)
+	installCapsRow(t, a)
+	if a.pending == nil {
+		t.Fatal("install of a caps release left no consent prompt")
+	}
+	if a.pending.bin != "GRANTME.ELF" ||
+		a.pending.words != "file,memory,process,debug,net" {
+		t.Fatalf("pending %+v", a.pending)
+	}
+	var got bool
+	for _, l := range *lines {
+		got = got || l == "gostore: consent name=GRANTME.ELF words=file,memory,process,debug,net"
+	}
+	if !got {
+		t.Fatalf("consent marker missing in %v", *lines)
+	}
+}
+
+func TestInstallNoCapsLeavesNoPrompt(t *testing.T) {
+	a, _ := testApp(t)
+	loadFn = func(store.FS, string, string, string, string, string) ([]store.CatalogRow, error) {
+		return rowsFixture(), nil
+	}
+	a.refresh()
+	installFn = func(store.FS, string, string, string, string) int { return 0 }
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'i'})
+	if a.pending != nil {
+		t.Fatalf("capless install left a prompt: %+v", a.pending)
+	}
+}
+
+func TestConsentGrantWritesRow(t *testing.T) {
+	a, lines := testApp(t)
+	installCapsRow(t, a)
+	var writes []string
+	prev := grantWriteFn
+	grantWriteFn = func(line string) int64 { writes = append(writes, line); return 0 }
+	defer func() { grantWriteFn = prev }()
+
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'g'})
+	if a.pending != nil {
+		t.Fatal("'g' did not answer the prompt")
+	}
+	want := "GRANTME.ELF\t" + strings.Repeat("ab", 32) + "\tfile,memory,process,debug,net"
+	if len(writes) != 1 || writes[0] != want {
+		t.Fatalf("writes=%v want [%q]", writes, want)
+	}
+	var got bool
+	for _, l := range *lines {
+		got = got || l == "gostore: grant written name=GRANTME.ELF words=file,memory,process,debug,net"
+	}
+	if !got {
+		t.Fatalf("written marker missing in %v", *lines)
+	}
+}
+
+func TestConsentGrantRefusedIsNamed(t *testing.T) {
+	a, lines := testApp(t)
+	installCapsRow(t, a)
+	prev := grantWriteFn
+	grantWriteFn = func(string) int64 { return -vi.ErrEACCES }
+	defer func() { grantWriteFn = prev }()
+
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'g'})
+	var got bool
+	for _, l := range *lines {
+		got = got || l == "gostore: grant refuse name=GRANTME.ELF eacces"
+	}
+	if !got {
+		t.Fatalf("refuse marker missing in %v", *lines)
+	}
+}
+
+func TestConsentDenyWritesNothing(t *testing.T) {
+	a, lines := testApp(t)
+	installCapsRow(t, a)
+	var writes int
+	prev := grantWriteFn
+	grantWriteFn = func(string) int64 { writes++; return 0 }
+	defer func() { grantWriteFn = prev }()
+
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'd'})
+	if a.pending != nil {
+		t.Fatal("'d' did not answer the prompt")
+	}
+	if writes != 0 {
+		t.Fatalf("denial wrote %d rows", writes)
+	}
+	var got bool
+	for _, l := range *lines {
+		got = got || l == "gostore: grant declined name=GRANTME.ELF"
+	}
+	if !got {
+		t.Fatalf("declined marker missing in %v", *lines)
+	}
+}
+
+func TestConsentEscapeDeclines(t *testing.T) {
+	a, lines := testApp(t)
+	installCapsRow(t, a)
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyEscape})
+	if a.pending != nil {
+		t.Fatal("escape did not answer the prompt")
+	}
+	if a.quit {
+		t.Fatal("escape answered consent AND quit — the prompt must swallow it")
+	}
+	var got bool
+	for _, l := range *lines {
+		got = got || l == "gostore: grant declined name=GRANTME.ELF"
+	}
+	if !got {
+		t.Fatalf("declined marker missing in %v", *lines)
+	}
+}
+
+func TestConsentPromptIsModal(t *testing.T) {
+	a, _ := testApp(t)
+	installCapsRow(t, a)
+	// 'q' while the prompt stands must not quit — the ask is answered
+	// or it stands.
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'q'})
+	if a.quit {
+		t.Fatal("prompt did not swallow 'q'")
+	}
+	if a.pending == nil {
+		t.Fatal("'q' answered the prompt")
+	}
+}

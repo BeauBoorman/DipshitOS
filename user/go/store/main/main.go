@@ -57,7 +57,7 @@ func cliArgs(raw []string) []string {
 	return raw
 }
 
-const usageLine = "store: usage: store ls [--remote=<r>] [--channel=<dir|http://ip:port/base>] [--search=<s>] [--category=<c>] | store info <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store install <stream> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store update <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store rollback <name> | store remove <name>"
+const usageLine = "store: usage: store ls [--remote=<r>] [--channel=<dir|http://ip:port/base>] [--search=<s>] [--category=<c>] | store info <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store install <stream> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store update <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store rollback <name> | store remove <name> | store consent <name> | store decline <name>"
 
 func run(args []string) int {
 	if len(args) == 0 {
@@ -121,6 +121,18 @@ func run(args []string) int {
 			return 2
 		}
 		return store.Remove(store.GuestFS{}, positional[0])
+	case "consent":
+		if len(positional) != 1 || remoteFlag != "" || channelArg != "" || filterArgs {
+			store.ConsoleFn(usageLine)
+			return 2
+		}
+		return store.Consent(store.GuestFS{}, positional[0])
+	case "decline":
+		if len(positional) != 1 || remoteFlag != "" || channelArg != "" || filterArgs {
+			store.ConsoleFn(usageLine)
+			return 2
+		}
+		return store.Decline(store.GuestFS{}, positional[0])
 	default:
 		store.ConsoleFn(usageLine)
 		return 2
