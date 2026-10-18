@@ -1236,6 +1236,63 @@ pub var cap_bytes: u64 = 0; // sample bytes drained
 pub var cap_nonzero: u64 = 0; // nonzero sample bytes (the silence detector)
 pub var cap_sum: u32 = 0x811c9dc5; // FNV-1a 32 over the drained bytes
 pub var cap_fail: []const u8 = ""; // honest refusal ("" = ok)
+
+/// M118c (#2481): the refusal class paired with `cap_fail`'s text — the
+/// slot-92 handler maps this to the ADR 0007 errno. The string is the
+/// human/serial record; the enum is the machine one (the EL0 seam never
+/// string-matches).
+pub const CapRefusal = enum(u8) {
+    none,
+    no_device, // no virtio-snd device attached
+    rx_unarmed, // queue 3 (stream RX) never armed
+    over_cap, // the requested tuple is beyond S16/48kHz/mono
+    over_ring, // the request exceeds the ring bound
+    no_input, // stream 0 is not INPUT, or lacks the v1 tuple
+    ctl_refused, // a control exchange refused or timed out
+    drain_timeout, // the bounded RX drain expired (e.g. host mic denied)
+    malformed, // malformed used-ring completion
+    device_refused, // the device refused a posted buffer
+    ring_full, // the bounded ring refused a write
+    epilogue, // STOP/RELEASE refused
+};
+pub var cap_refusal: CapRefusal = .none;
+
+fn cap_set_fail(why: []const u8, refusal: CapRefusal) void {
+    cap_fail = why;
+    cap_refusal = refusal;
+}
+
+/// M118c (#2481): the capture-side info struct `sys_audio_rec_info` copies
+/// out — the slot-42 shape for the RX direction. 16 bytes, fixed layout.
+pub const AudioCapInfo = extern struct {
+    ready: u32, // RX queue armed AND stream 0 last observed INPUT with the v1 tuple
+    format: u8, // the v1 capture tuple when ready (0xff when not)
+    rate: u8, // (0xff when not)
+    channels: u8, // (0 when not)
+    padding: u8,
+    period_bytes: u32, // one posted RX period
+    ring_bytes: u32, // the bounded ring — also the per-call byte bound
+};
+
+/// The capture capability report for slot 91: the LAST OBSERVED stream-0
+/// topology held to the v1 tuple — no device exchange in this call (the
+/// rearm-time self-test and every `snd_capture` refresh `beep_obs_*`, so a
+/// device-present boot always carries an observation; a never-probed or
+/// no-device boot reads ready=0 with the 0xff sentinels).
+pub fn snd_cap_info() AudioCapInfo {
+    const ready = snd_ready and ctrl_armed and rx_armed and
+        beep_obs_dir == D_INPUT and
+        cap_admit_caps(beep_obs_dir, beep_obs_formats, beep_obs_rates, beep_obs_ch_min) == null;
+    return .{
+        .ready = if (ready) 1 else 0,
+        .format = if (ready) cap_format else 0xff,
+        .rate = if (ready) cap_rate else 0xff,
+        .channels = if (ready) cap_channels else 0,
+        .padding = 0,
+        .period_bytes = cap_period_bytes,
+        .ring_bytes = @intCast(cap_ring_bytes),
+    };
+}
 /// Per-step control statuses (same roles as beep_*_status).
 pub var cap_info_status: u32 = 0xffffffff;
 pub var cap_params_status: u32 = 0xffffffff;
@@ -1330,14 +1387,14 @@ fn rx_consume(slot: usize, used_len: u32) u32 {
     const buf = &cap_bufs[slot];
     mmu.invalidate_dcache_range(@intFromPtr(&buf.status), @sizeOf(PcmStatus));
     if (buf.status.status != S_OK) {
-        cap_fail = "RX device refused";
+        cap_set_fail("RX device refused", .device_refused);
         return 0xffffffff;
     }
     const payload = @min(used_len -| @sizeOf(PcmStatus), cap_period_bytes);
     if (payload == 0) return S_OK;
     mmu.invalidate_dcache_range(@intFromPtr(&buf.data), payload);
     cap_ring_push(buf.data[0..payload]) catch {
-        cap_fail = "capture ring full";
+        cap_set_fail("capture ring full", .ring_full);
         return 0xffffffff;
     };
     for (buf.data[0..payload]) |b| {
@@ -1355,21 +1412,21 @@ fn rx_consume(slot: usize, used_len: u32) u32 {
 /// `cap_fail` names every refusal. The caller serializes (the boot
 /// self-test today; the M118c syscall path under audio_lock later).
 pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
-    cap_fail = "";
+    cap_set_fail("", .none);
     if (!snd_ready or !ctrl_armed) {
-        cap_fail = "no virtio-snd device";
+        cap_set_fail("no virtio-snd device", .no_device);
         return 0xffffffff;
     }
     if (!rx_armed) {
-        cap_fail = "RX queue (3) not armed";
+        cap_set_fail("RX queue (3) not armed", .rx_unarmed);
         return 0xffffffff;
     }
     if (cap_admit(format, rate, channels)) |why| {
-        cap_fail = why;
+        cap_set_fail(why, .over_cap);
         return 0xffffffff;
     }
     if (want_frames == 0 or want_frames > cap_max_frames) {
-        cap_fail = "capture request exceeds ring";
+        cap_set_fail("capture request exceeds ring", .over_ring);
         return 0xffffffff;
     }
     cap_ring_reset();
@@ -1392,11 +1449,11 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     const info_st = snd_pcm_probe();
     cap_info_status = info_st;
     if (info_st != S_OK) {
-        cap_fail = "PCM_INFO refused";
+        cap_set_fail("PCM_INFO refused", .ctl_refused);
         return info_st;
     }
     if (cap_admit_caps(beep_obs_dir, beep_obs_formats, beep_obs_rates, beep_obs_ch_min)) |why| {
-        cap_fail = why;
+        cap_set_fail(why, .no_input);
         return 0xffffffff;
     }
     // 2. Negotiate the v1 tuple.
@@ -1413,13 +1470,13 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     const params_st = ctl_exchange(std.mem.asBytes(&req), 4);
     cap_params_status = params_st;
     if (params_st != S_OK) {
-        cap_fail = "SET_PARAMS refused";
+        cap_set_fail("SET_PARAMS refused", .ctl_refused);
         return params_st;
     }
     const prep_st = ctl_pcm_simple(R_PCM_PREPARE);
     cap_prepare_status = prep_st;
     if (prep_st != S_OK) {
-        cap_fail = "PREPARE refused";
+        cap_set_fail("PREPARE refused", .ctl_refused);
         return prep_st;
     }
     // 3. START, then post the slot buffers — the device fills a posted
@@ -1435,11 +1492,13 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     cap_start_status = start_st;
     var outstanding: u32 = 0;
     if (start_st != S_OK) {
-        cap_fail = "START refused";
+        cap_set_fail("START refused", .ctl_refused);
         // Cleanup must not mask the primary refusal.
         const cleanup = cap_fail;
+        const cleanup_refusal = cap_refusal;
         _ = snd_capture_stop();
         cap_fail = cleanup;
+        cap_refusal = cleanup_refusal;
         snd_capture_recover();
         return start_st;
     }
@@ -1459,7 +1518,7 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
             else
                 spins > 400_000_000;
             if (expired) {
-                cap_fail = "RX drain timeout";
+                cap_set_fail("RX drain timeout", .drain_timeout);
                 break;
             }
             continue;
@@ -1469,7 +1528,7 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
         outstanding -= 1;
         cap_completed += 1;
         if (used_elem.id % 3 != 0 or used_elem.id / 3 >= cap_slots) {
-            cap_fail = "RX malformed completion";
+            cap_set_fail("RX malformed completion", .malformed);
             break;
         }
         const slot = used_elem.id / 3;
@@ -1482,9 +1541,11 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     const tail_st = blk: {
         // The epilogue's own refusal never masks the drain's primary one.
         const primary = cap_fail;
+        const primary_refusal = cap_refusal;
         const s = snd_capture_stop();
         if (primary.len != 0) {
             cap_fail = primary;
+            cap_refusal = primary_refusal;
             break :blk s;
         }
         break :blk s;
@@ -1531,11 +1592,11 @@ fn snd_capture_stop() u32 {
     const rel_st = ctl_pcm_simple(R_PCM_RELEASE);
     cap_release_status = rel_st;
     if (stop_st != S_OK) {
-        cap_fail = "STOP refused";
+        cap_set_fail("STOP refused", .epilogue);
         return stop_st;
     }
     if (rel_st != S_OK) {
-        cap_fail = "RELEASE refused";
+        cap_set_fail("RELEASE refused", .epilogue);
         return rel_st;
     }
     return S_OK;
@@ -2006,19 +2067,77 @@ test "virtio_snd: capture refuses honestly when absent or over-cap" {
     }
     try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 1024));
     try std.testing.expectEqualStrings("no virtio-snd device", cap_fail);
+    try std.testing.expectEqual(CapRefusal.no_device, cap_refusal);
     snd_ready = true;
     ctrl_armed = true;
     try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 1024));
     try std.testing.expectEqualStrings("RX queue (3) not armed", cap_fail);
+    try std.testing.expectEqual(CapRefusal.rx_unarmed, cap_refusal);
     // Armed but over-cap tuple / over-ring request: refused BEFORE any
     // control exchange — the refusals are deterministic.
     rx_armed = true;
     try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(FMT_FLOAT, cap_rate, cap_channels, 1024));
     try std.testing.expectEqualStrings("capture format over cap (S16)", cap_fail);
+    try std.testing.expectEqual(CapRefusal.over_cap, cap_refusal);
     try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, cap_max_frames + 1));
     try std.testing.expectEqualStrings("capture request exceeds ring", cap_fail);
+    try std.testing.expectEqual(CapRefusal.over_ring, cap_refusal);
     try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 0));
     try std.testing.expectEqualStrings("capture request exceeds ring", cap_fail);
+    try std.testing.expectEqual(CapRefusal.over_ring, cap_refusal);
+}
+
+test "virtio_snd: cap info reports the observed INPUT verdict with the v1 tuple" {
+    // M118c (#2481): snd_cap_info is the slot-91 report — the last observed
+    // stream-0 topology held to the v1 tuple, never a device exchange.
+    snd_ready = false;
+    ctrl_armed = false;
+    rx_armed = false;
+    const saved_dir = beep_obs_dir;
+    const saved_formats = beep_obs_formats;
+    const saved_rates = beep_obs_rates;
+    const saved_ch_min = beep_obs_ch_min;
+    defer {
+        snd_ready = false;
+        ctrl_armed = false;
+        rx_armed = false;
+        beep_obs_dir = saved_dir;
+        beep_obs_formats = saved_formats;
+        beep_obs_rates = saved_rates;
+        beep_obs_ch_min = saved_ch_min;
+    }
+    // No device: not ready, the sentinel tuple.
+    var info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 0), info.ready);
+    try std.testing.expectEqual(@as(u8, 0xff), info.format);
+    try std.testing.expectEqual(@as(u8, 0xff), info.rate);
+    try std.testing.expectEqual(@as(u8, 0), info.channels);
+    try std.testing.expectEqual(@as(u32, cap_period_bytes), info.period_bytes);
+    try std.testing.expectEqual(@as(u32, @intCast(cap_ring_bytes)), info.ring_bytes);
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(AudioCapInfo));
+    // Armed + stream 0 last observed INPUT with the v1 tuple: ready, the
+    // cap constants reported.
+    snd_ready = true;
+    ctrl_armed = true;
+    rx_armed = true;
+    beep_obs_dir = D_INPUT;
+    beep_obs_formats = (@as(u64, 1) << FMT_S16) | (@as(u64, 1) << FMT_FLOAT);
+    beep_obs_rates = @as(u64, 1) << RATE_48000;
+    beep_obs_ch_min = 1;
+    info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 1), info.ready);
+    try std.testing.expectEqual(cap_format, info.format);
+    try std.testing.expectEqual(cap_rate, info.rate);
+    try std.testing.expectEqual(cap_channels, info.channels);
+    // Stream 0 observed OUTPUT (--sound only): ready=0 honestly.
+    beep_obs_dir = D_OUTPUT;
+    info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 0), info.ready);
+    // Armed but never probed (a device whose capture self-test skipped):
+    // the 0xff observation is not an input — ready=0.
+    beep_obs_dir = 0xff;
+    info = snd_cap_info();
+    try std.testing.expectEqual(@as(u32, 0), info.ready);
 }
 
 test "virtio_snd: capture DMA layout and cap geometry are bounded" {

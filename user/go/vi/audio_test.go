@@ -682,3 +682,130 @@ func TestAudioVolumeMuteHostFails(t *testing.T) {
 		t.Fatalf("host AudioMute = %v want ENOSYS", err)
 	}
 }
+
+// M118c (#2481): the capture seam — slots 91/92.
+
+// The AudioCapInfo wire layout is the kernel's (kernel/src/virtio_snd.zig
+// AudioCapInfo, 16 bytes — the slot-42 shape for the RX direction).
+func TestAudioCapInfoWireSize(t *testing.T) {
+	if got := unsafe.Sizeof(AudioCapInfo{}); got != 16 {
+		t.Fatalf("AudioCapInfo size = %d want 16", got)
+	}
+	offsets := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"Ready", unsafe.Offsetof(AudioCapInfo{}.Ready), 0},
+		{"Format", unsafe.Offsetof(AudioCapInfo{}.Format), 4},
+		{"Rate", unsafe.Offsetof(AudioCapInfo{}.Rate), 5},
+		{"Channels", unsafe.Offsetof(AudioCapInfo{}.Channels), 6},
+		{"Padding", unsafe.Offsetof(AudioCapInfo{}.Padding), 7},
+		{"PeriodBytes", unsafe.Offsetof(AudioCapInfo{}.PeriodBytes), 8},
+		{"RingBytes", unsafe.Offsetof(AudioCapInfo{}.RingBytes), 12},
+	}
+	for _, o := range offsets {
+		if o.got != o.want {
+			t.Fatalf("AudioCapInfo.%s offset = %d want %d", o.name, o.got, o.want)
+		}
+	}
+}
+
+// The v1 tuple constants are the kernel's cap_* values (virtio_snd.zig):
+// fmt 5 = FMT_S16, rate 7 = RATE_48000, ch 1 = mono. The ring is the
+// per-call byte bound.
+func TestAudioCapGeometry(t *testing.T) {
+	if AudioCapFormat != 5 || AudioCapRate != 7 || AudioCapChannels != 1 {
+		t.Fatalf("v1 tuple drifted: fmt=%d rate=%d ch=%d",
+			AudioCapFormat, AudioCapRate, AudioCapChannels)
+	}
+	if AudioCapPeriodBytes != 2048 {
+		t.Fatalf("AudioCapPeriodBytes = %d want 2048 (virtio_snd.cap_period_bytes)", AudioCapPeriodBytes)
+	}
+	if AudioCapRingBytes != 64*1024 {
+		t.Fatalf("AudioCapRingBytes = %d want 65536 (virtio_snd.cap_ring_bytes)", AudioCapRingBytes)
+	}
+	if SlotAudioRecInfo != 91 || SlotAudioRec != 92 {
+		t.Fatalf("capture slot numbers drifted: %d %d want 91 92", SlotAudioRecInfo, SlotAudioRec)
+	}
+	if ErrAudioCaptureTimeout != errno(ErrETIMEDOUT) {
+		t.Fatalf("ErrAudioCaptureTimeout = %v want errno(ETIMEDOUT)", ErrAudioCaptureTimeout)
+	}
+}
+
+// Slot 91 marshals the out pointer and returns the kernel's struct as-is.
+func TestAudioCapQueryWire(t *testing.T) {
+	var got [5]uintptr
+	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		got = [5]uintptr{num, a0, a1, a2, a3}
+		return -ErrENOSYS
+	})
+	defer SetSyscallHookForTest(prev)
+	if _, err := AudioCapQuery(); err != errno(ErrENOSYS) {
+		t.Fatalf("AudioCapQuery err = %v want ENOSYS", err)
+	}
+	if got[0] != SlotAudioRecInfo || got[1] == 0 || got[2] != 0 {
+		t.Fatalf("slot 91 args = %v want (91, &out, 0, …)", got)
+	}
+}
+
+// Slot 92 must SEND the tuple and length unchanged — an over-cap tuple is
+// the kernel's EINVAL to answer, not ours to clamp (the same property
+// TestAudioVolumeNoClamp pins on slot 44). And a fake kernel's refusal
+// codes must pass through by value.
+func TestAudioCaptureWire(t *testing.T) {
+	var got [7]uintptr
+	prev := SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		got = [7]uintptr{num, a0, a1, a2, a3, a4, a5}
+		return -ErrEINVAL // the kernel's named over-cap refusal
+	})
+	defer SetSyscallHook6ForTest(prev)
+	buf := make([]byte, 4096)
+	n, err := AudioCapture(AudioFmtFloat, AudioCapRate, AudioCapChannels, buf)
+	if got[0] != SlotAudioRec || got[1] != uintptr(AudioFmtFloat) ||
+		got[2] != uintptr(AudioCapRate) || got[3] != uintptr(AudioCapChannels) ||
+		got[4] != uintptr(unsafe.Pointer(&buf[0])) || got[5] != uintptr(len(buf)) {
+		t.Fatalf("slot 92 args = %v want (92, fmt, rate, ch, &buf, len)", got)
+	}
+	if n != 0 || err != errno(ErrEINVAL) {
+		t.Fatalf("over-cap capture = %d, %v want 0, EINVAL passed through", n, err)
+	}
+}
+
+// The bounded-read shape: the kernel's byte count is the receipt — a short
+// or over answer passes through untouched, and every named refusal maps to
+// its errno row.
+func TestAudioCaptureReceipt(t *testing.T) {
+	prev := SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		return int64(a4) // echo the length: a complete capture
+	})
+	buf := make([]byte, 8192)
+	n, err := AudioCapture(AudioCapFormat, AudioCapRate, AudioCapChannels, buf)
+	if n != len(buf) || err != nil {
+		t.Fatalf("capture = %d, %v want %d, nil", n, err, len(buf))
+	}
+	SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		return -ErrENXIO
+	})
+	if _, err = AudioCapture(AudioCapFormat, AudioCapRate, AudioCapChannels, buf); err != ErrNoAudioDevice {
+		t.Fatalf("device-absent capture err = %v want ErrNoAudioDevice", err)
+	}
+	SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		return -ErrETIMEDOUT
+	})
+	if _, err = AudioCapture(AudioCapFormat, AudioCapRate, AudioCapChannels, buf); err != ErrAudioCaptureTimeout {
+		t.Fatalf("drain-timeout capture err = %v want ErrAudioCaptureTimeout", err)
+	}
+	SetSyscallHook6ForTest(prev)
+
+	// An empty buffer is a no-op like AudioPlay — no syscall at all.
+	calls := 0
+	prev2 := SetSyscallHook6ForTest(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		calls++
+		return 0
+	})
+	defer SetSyscallHook6ForTest(prev2)
+	if n, err = AudioCapture(AudioCapFormat, AudioCapRate, AudioCapChannels, nil); n != 0 || err != nil || calls != 0 {
+		t.Fatalf("empty capture = %d, %v over %d calls, want 0, nil, 0", n, err, calls)
+	}
+}

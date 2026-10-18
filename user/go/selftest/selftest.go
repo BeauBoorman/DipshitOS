@@ -238,6 +238,122 @@ const (
 
 const epochReceipt = outDir + "/clock-epoch.ok"
 
+// M118c (#2481): the capture case's evidence — the receipt line plus the
+// captured PCM itself (the .copy convention: the file carries the bytes the
+// case READ, never what it intended). One bounded read of 8192 B = 4096
+// S16/48kHz/mono frames, ~85 ms.
+const (
+	capOk    = outDir + "/audio-capture.ok"
+	capCopy  = outDir + "/capture.copy"
+	capBytes = 8192
+)
+
+// audioCaptureVerdict runs the M118c capture drill and returns its receipt
+// line plus the captured bytes — the same text the windowed case files and
+// the headless --capture-probe leg prints to serial. THREE outcomes pass,
+// and the receipt says which: the device-absent refusal (ENXIO — the
+// default no-sound fleet), the bounded drain refusal (ETIMEDOUT — the
+// host's mic-consent answer completing nothing), and the bounded-read
+// receipt itself. Only a shape violation fails the case.
+func audioCaptureVerdict(s *syscalls) (line string, pcm []byte, err error) {
+	info, qerr := s.capQuery()
+	if qerr != nil {
+		return "", nil, errors.New("cap info: " + qerr.Error())
+	}
+	buf := make([]byte, capBytes)
+	// The negatives are part of the contract: a tuple beyond the v1 cap and
+	// a non-frame-aligned length must refuse by name, never silently
+	// convert or truncate. The kernel checks the device before the tuple,
+	// so on an absent device these answer ENXIO; with a ready input the
+	// over-cap refusal is EINVAL exactly.
+	_, ocErr := s.capCapture(vi.AudioFmtFloat, vi.AudioCapRate, vi.AudioCapChannels, buf)
+	if ocErr == nil {
+		return "", nil, errors.New("over-cap tuple captured instead of refusing")
+	}
+	if info.Ready != 0 && ocErr.Error() != "EINVAL" {
+		return "", nil, errors.New("over-cap refused " + ocErr.Error() + " want EINVAL")
+	}
+	var odd [3]byte
+	_, odErr := s.capCapture(vi.AudioCapFormat, vi.AudioCapRate, vi.AudioCapChannels, odd[:])
+	if odErr == nil {
+		return "", nil, errors.New("odd-length capture accepted")
+	}
+	head := "case audio-capture ready=" + strconv.Itoa(int(info.Ready))
+	neg := " overcap=" + ocErr.Error() + " oddlen=" + odErr.Error()
+	n, cerr := s.capCapture(vi.AudioCapFormat, vi.AudioCapRate, vi.AudioCapChannels, buf)
+	if cerr != nil {
+		switch cerr {
+		case vi.ErrNoAudioDevice:
+			// No usable capture source: the device is absent (the default
+			// fleet) or stream 0 is not INPUT — the seam's one no-device
+			// name covers both, ready= says which.
+			return head + " refused=ENXIO" + neg, nil, nil
+		case vi.ErrAudioCaptureTimeout:
+			// The honest zero-frame drain: the host denied mic consent, the
+			// bounded wait expired, zero bytes is the refusal's receipt.
+			return head + " refused=ETIMEDOUT" + neg, nil, nil
+		}
+		return "", nil, errors.New("capture " + cerr.Error())
+	}
+	if n != len(buf) {
+		return "", nil, errors.New("short read: captured=" + strconv.Itoa(n) +
+			" want " + strconv.Itoa(len(buf)))
+	}
+	nonzero := 0
+	for _, b := range buf {
+		if b != 0 {
+			nonzero++
+		}
+	}
+	return head + " captured=" + strconv.Itoa(n) +
+		" nonzero=" + strconv.Itoa(nonzero) + neg, buf, nil
+}
+
+// caseAudioCapture: M118c (#2481) — the EL0 capture seam's receipt. The
+// receipt + the captured bytes land on the share BEFORE the verdict, the
+// same evidence-first order as every other case.
+func caseAudioCapture(s *syscalls) error {
+	s.mkdir(outDir)
+	line, pcm, err := audioCaptureVerdict(s)
+	if line != "" {
+		if werr := writeReceipt(s, capOk, line); werr != nil {
+			return werr
+		}
+	}
+	if pcm != nil {
+		if cerr := copyBytes(s, capCopy, pcm); cerr != nil {
+			return cerr
+		}
+	}
+	return err
+}
+
+// captureProbe is the headless M118c device leg: `exec GOSELF.ELF
+// --capture-probe` under a SoundInProbe --sound-in --share boot — no
+// window, no REPORT.txt, just the capture verdict on the serial line (the
+// leg's evidence) and the receipt files on the share when one is armed.
+func captureProbe() {
+	s := guestSyscalls()
+	_ = s.mkdir(selftestDir)
+	_ = s.mkdir(outDir)
+	line, pcm, err := audioCaptureVerdict(&s)
+	if line != "" {
+		_ = writeReceipt(&s, capOk, line)
+		if pcm != nil {
+			_ = copyBytes(&s, capCopy, pcm)
+		}
+		vi.ConsoleLine("goself: " + line)
+	}
+	if err != nil {
+		vi.ConsoleLine("selftest: case audio-capture fail " + oneLine(err.Error()))
+		vi.ConsoleLine("goself: capture done")
+		vi.Exit(1)
+	}
+	vi.ConsoleLine("selftest: case audio-capture pass")
+	vi.ConsoleLine("goself: capture done")
+	vi.Exit(0)
+}
+
 // M83b (#1775): the clock-set case. The kernel's accepted range is
 // 2025-01-01..2100-01-01 UTC (timer.wall_epoch_min/max); the step is far
 // enough to be unmistakable next to the 1 Hz tick and small enough to stay
@@ -329,6 +445,12 @@ type syscalls struct {
 	logRead      func(app string) ([]byte, int64)
 	crashReceipt func(app, outcome string) int64
 
+	// M118c (#2481): the audio capture seam (ADR 0007 slots 91/92). The
+	// rows are functions for the same reason as writeSafe — the refusal
+	// NAME a capture returns is the property under test.
+	capQuery   func() (vi.AudioCapInfo, error)
+	capCapture func(format, rate, channels uint8, buf []byte) (int, error)
+
 	// M61e (#1385): the window surface. Separate from the file rows above
 	// because id/reqW/reqH are STATE the shell copied out of tabapp.Init, not
 	// syscall bindings — the three function rows are the ADR 0007 window rows
@@ -393,6 +515,8 @@ func guestSyscalls() syscalls {
 		logWrite:     vi.Log,
 		logRead:      vi.ReadLog,
 		crashReceipt: vi.WriteCrashReceipt,
+		capQuery:     vi.AudioCapQuery,
+		capCapture:   vi.AudioCapture,
 		// M61e: the real window rows. id/reqW/reqH stay -1/0 here — the shell
 		// binds them from tabapp.Init, so this function never claims a window
 		// the app did not get.
@@ -487,6 +611,11 @@ func cases() []testCase {
 		// no-disk fleet. Before the clock cases so their wall-time reads
 		// stay the tail.
 		{id: "disk", run: caseDisk},
+		// M118c (#2481): the audio capture seam (slots 91/92). The default
+		// fleet has no sound device, so run 01 records the device-absent
+		// named refusal; the bounded-read half is the spec's SoundInProbe
+		// --sound-in leg driving this same case headless.
+		{id: "audio-capture", run: caseAudioCapture},
 		// M83a (#1774): add the epoch receipt at the tail so existing
 		// report rows keep their order and their host-test indexes.
 		{id: "clock-epoch", run: caseClockEpoch},

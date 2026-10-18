@@ -37,6 +37,8 @@ const (
 	SlotScanoutRead        uintptr = 88
 	SlotGrantAdmin         uintptr = 89
 	SlotGpucomp            uintptr = 90
+	SlotAudioRecInfo       uintptr = 91
+	SlotAudioRec           uintptr = 92
 )
 
 type SyscallArgKind uint8
@@ -162,6 +164,8 @@ var SyscallSlots = [...]SyscallSlot{
 	{SlotScanoutRead, "sys_scanout_read", 6, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotGrantAdmin, "sys_grant_admin", 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotGpucomp, "sys_gpucomp", 6, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotAudioRecInfo, "sys_audio_rec_info", 1, [6]SyscallArg{{Kind: ArgPtr}}},
+	{SlotAudioRec, "sys_audio_rec", 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 }
 
 var SyscallVariants = [...]SyscallVariant{
