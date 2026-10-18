@@ -74,7 +74,9 @@ let package = Package(
             // PostmortemCard — a pure-Foundation edge, so the
             // Virtualization-free boundary NativeInputTests depends on
             // is untouched.
-            dependencies: ["VMPostmortem"],
+            // M128a (#2605): HostSettingsModel edits VMProfile.Config —
+            // also pure Foundation, same boundary preserved.
+            dependencies: ["VMPostmortem", "VMProfile"],
             path: "Sources/VMAppKit"
         ),
         // M102b2 (#2163): the host envelope for the experimental
