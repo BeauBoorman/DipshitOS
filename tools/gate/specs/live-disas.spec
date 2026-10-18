@@ -6,6 +6,21 @@ vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 1 BOOTS
 
+# exec DISAS.BIN /host/PROG.ELF 84 passes arguments: the flat-bin argv
+# block (2 KiB) must fit inside the content's last page (exec.zig
+# argv_va_for), so content sizes in the (2048, 4096) mod-4096 window
+# refuse with 'no_args_room'. Pad the staged copy with load-inert zeros.
+vgate_setup_python <<'PY'
+import os
+p = os.path.join(os.environ["RUN_DIR"], "share", "DISAS.BIN")
+size = os.path.getsize(p)
+if 2048 < size % 4096:
+    with open(p, "ab") as f:
+        f.write(b"\0" * ((size // 4096 + 1) * 4096 + 8 - size))
+print("live-disas: DISAS.BIN argv-pad check, size=%d -> %d" %
+      (size, os.path.getsize(p)))
+PY
+
 vgate_file script.txt <<'EOF'
 write PROG.S '_start:;mov x8, 3;mov x0, 71;svc 0'
 exec ASM.BIN /host/PROG.S /host/PROG.ELF

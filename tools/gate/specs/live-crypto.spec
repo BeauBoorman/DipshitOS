@@ -35,6 +35,18 @@ line = "cryptod: sha256=%s hmac=%s" % (
 )
 with open(os.path.join(run_dir, "expected.txt"), "w") as f:
     f.write(line + "\n")
+
+# exec CRYPTOD.BIN CRYPTO.TXT passes an argument: the flat-bin argv block
+# (2 KiB) must fit inside the content's last page (exec.zig argv_va_for),
+# so content sizes in the (2048, 4096) mod-4096 window refuse with
+# 'no_args_room'. Pad the staged copy with load-inert zeros past it.
+p = os.path.join(share, "CRYPTOD.BIN")
+size = os.path.getsize(p)
+if 2048 < size % 4096:
+    with open(p, "ab") as f:
+        f.write(b"\0" * ((size // 4096 + 1) * 4096 + 8 - size))
+print("live-crypto: staged CRYPTOD.BIN argv-pad check, size=%d -> %d" %
+      (size, os.path.getsize(p)))
 print("live-crypto: host KAT = " + line)
 PY
 
