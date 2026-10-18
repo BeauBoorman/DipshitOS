@@ -91,6 +91,7 @@ func (e *textEditor) key(usage, symbol uint32, flags uint16) bool {
 func (a *app) focusURL() {
 	a.urlEditing = true
 	a.histOpen = false
+	a.findDismiss() // the chrome inputs are mutually exclusive
 	a.focusControl = nil
 	a.urlEdit.reset(a.target, maxURLBytes)
 	a.dirty = true
@@ -112,6 +113,14 @@ func (a *app) submitURL() {
 func (a *app) keyEvent(ev vi.Event) {
 	if ev.Flags&vi.ModCtrl != 0 && ev.Arg0 == 0x0f { // focused WEB owns Ctrl+L
 		a.focusURL()
+		return
+	}
+	if ev.Flags&vi.ModCtrl != 0 && ev.Arg0 == keyF { // Ctrl+F — the bar's chord, owned from any mode
+		a.openFindBar()
+		return
+	}
+	if a.findOpen {
+		a.findBarKey(ev)
 		return
 	}
 	if a.urlEditing {

@@ -96,6 +96,8 @@ const (
 	markerHistOpen  = "web: history n="
 	markerHistRow   = "web: history "
 	markerHistPick  = "web: history pick "
+	markerFind      = "web: find "
+	markerFindHit   = "web: find hit="
 	markerReload    = "web: reload"
 	markerSettled   = "web: settled"
 	markerQuit      = "web: quit"
@@ -148,6 +150,7 @@ const (
 	keyK        = 0x0e
 	keyS        = 0x16
 	keyH        = 0x0b
+	keyF        = 0x09
 	keyReturn   = 0x28
 )
 
@@ -230,6 +233,14 @@ type app struct {
 	urlEdit          textEditor
 	histOpen         bool
 	histSel          int
+	// The find-in-page bar (M126c #2595): open state, the field, the index
+	// over the current layout, the shared matcher's offsets, and the
+	// 0-based current match (-1 = none). findbar.go has the behavior.
+	findOpen         bool
+	findEdit         textEditor
+	findIdx          *webrender.FindIndex
+	findMatches      []int
+	findCur          int
 	// The bookmark store (FLINT ws/bookmarks atom table) + its sidebar.
 	books          []bookmark
 	bookStream     string
@@ -570,7 +581,7 @@ func (a *app) showStartSurface() {
 	body := []byte("<h1>VirelaiOS Browser</h1><p>No target. Pass a path or an HTTP URL on the command line:</p>" +
 		"<pre>exec WEB.ELF /host/PAGE.HTML\nexec WEB.ELF http://10.0.0.2/</pre>" +
 		"<p>Ctrl+L edits the URL. Enter loads it. Escape cancels. H or the v chip lists history. " +
-		"Ctrl+D bookmarks the page. Ctrl+Shift+B opens the bookmark sidebar. F1 shows bounded diagnostics.</p>" +
+		"Ctrl+F finds in the page. Ctrl+D bookmarks the page. Ctrl+Shift+B opens the bookmark sidebar. F1 shows bounded diagnostics.</p>" +
 		"<p>This browser supports a declared CSS subset and GET forms. No JavaScript or POST.</p>")
 	a.target = ""
 	a.title = "Start"
@@ -1026,6 +1037,12 @@ func (a *app) loadBody(body []byte, target string) {
 	a.status = ""
 	a.logPaint = true
 	a.dirty = true
+	if a.findOpen {
+		// The bar survives a navigation: the new page re-searches the same
+		// pattern silently (the announceNavigation markers are the only
+		// ordering a gate can rely on mid-load).
+		a.findRecompute(false)
+	}
 	vi.ConsoleLine("web: diagnostics n=" + itoa(len(a.diagnostics)))
 	for _, d := range a.diagnostics {
 		vi.ConsoleLine("web: diagnostic " + d.Text)
@@ -1037,6 +1054,7 @@ func (a *app) setError(kind, target string) {
 	a.errMsg = errorMessage(kind, target)
 	a.lay = nil
 	a.doc = nil
+	a.findDismiss() // the error page has no findable text
 	a.controls, a.focusControl = nil, nil
 	a.scroll = 0
 	a.title = "Error"
@@ -1152,6 +1170,12 @@ func (a *app) click(x, y int) {
 		} else {
 			a.toggleHistoryMenu()
 		}
+		return
+	}
+	if a.findOpen && inRect(x, y, 0, findBarY(h), w, findBarH) {
+		// A click inside the open find strip is consumed — it must not
+		// fall through to a page link hiding under the plate.
+		a.dirty = true
 		return
 	}
 	fieldHit := inRect(x, y, urlX, urlY, max(0, actX(w)-urlX-4), urlH)
@@ -1380,6 +1404,7 @@ func (a *app) render() {
 		a.updateControlPaint()
 		webrender.Paint(a.lay, native, 0, 0, contentW, contentH, a.scroll)
 		a.painted = len(a.lay.Items)
+		a.paintFindHighlights(native)
 	} else {
 		a.paintErrorPage(native)
 	}
@@ -1396,6 +1421,9 @@ func (a *app) render() {
 	}
 	if a.histOpen {
 		a.paintHistoryMenu(vs, clip, width)
+	}
+	if a.findOpen {
+		a.paintFindBar(vs, clip, width, height)
 	}
 	vi.ConsoleLine("web: viewport css=1280x720 x=" + itoa(present.X) +
 		" y=" + itoa(present.Y) + " w=" + itoa(present.W) + " h=" + itoa(present.H) + " s=" + itoa(a.scroll))
@@ -1460,7 +1488,7 @@ func (a *app) paintErrorPage(vs virender) {
 	y += 18
 	webrender.DrawText(vs, 12, y, "kind: "+a.errKind, 1, false, webrender.ColorMuted, clip)
 	y += 24
-	webrender.DrawText(vs, 12, y, "Ctrl+L URL  R reload  < back  > forward  H history  ^D mark  ^+B marks  Esc stop  Q quit", 1, false, webrender.ColorMuted, clip)
+	webrender.DrawText(vs, 12, y, "Ctrl+L URL  R reload  < back  > forward  H history  ^F find  ^D mark  ^+B marks  Esc stop  Q quit", 1, false, webrender.ColorMuted, clip)
 }
 
 func (a *app) describeTarget() string {

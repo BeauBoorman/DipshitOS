@@ -43,10 +43,11 @@
 // as regressions:
 //
 //   - there is no case-sensitivity toggle, and the search is case-SENSITIVE
-//     (matchAt is a byte compare). The Zig app was case-insensitive with a
+//     (the shared matcher's at() is a byte compare — package virelai/find,
+//     extracted M126c #2595). The Zig app was case-insensitive with a
 //     compile-time constant and no live coverage for a toggle, so this is a
-//     real behaviour delta, pinned by `TestFindIsCaseSensitive` in
-//     edit_test.go rather than left to prose.
+//     real behaviour delta, pinned by `TestCaseSensitive` in
+//     find_test.go rather than left to prose.
 //   - the find/goto bars are not sticky: they close on a hit or a miss instead
 //     of staying open for the next search.
 //   - a miss keeps the caret where it was and prints `miss`; it does not
@@ -113,6 +114,7 @@ import (
 	"unicode/utf8"
 
 	"virelai/draw"
+	"virelai/find"
 	"virelai/heap"
 	"virelai/layout"
 	"virelai/settings"
@@ -924,7 +926,7 @@ func (e *editor) runFind() {
 	if len(pat) == 0 {
 		return
 	}
-	total, ordinal, off := findFrom(e.buf, pat, e.cur)
+	total, ordinal, off := find.From(e.buf, pat, e.cur)
 	if off < 0 {
 		vi.ConsoleLine(findMissMarker(pat))
 		return
@@ -1233,7 +1235,7 @@ func (e *editor) runReplace() {
 		vi.ConsoleLine(markerRepl + "' -> '" + string(repl) + "' no-pattern")
 		return
 	}
-	total, ordinal, off := findFrom(e.buf, pat, e.cur)
+	total, ordinal, off := find.From(e.buf, pat, e.cur)
 	if off < 0 {
 		vi.ConsoleLine(markerRepl + string(pat) + "' -> '" + string(repl) + "' no-match")
 		return
@@ -1448,51 +1450,6 @@ func gotoMarker(line, offset int) string {
 // gotoMissMarker is the goto bar's beyond-the-buffer shape.
 func gotoMissMarker(line, lines int) string {
 	return markerGoto + vi.Itoa64(int64(line)) + " miss lines=" + vi.Itoa64(int64(lines))
-}
-
-// findFrom searches buf for pat from byte offset `from`, and returns the
-// number of non-overlapping matches, the 1-based ordinal of the match the
-// caret lands on, and that match's offset. The first match at or after the
-// caret wins; when there is none the search wraps to the FIRST match (the find
-// bar's "search again from the top" rule, and what makes Return on a
-// single-match document report `hit=1/1`). No match returns -1.
-func findFrom(buf, pat []byte, from int) (total, ordinal, off int) {
-	off, ordinal = -1, 0
-	if len(pat) == 0 || len(pat) > len(buf) {
-		return 0, 0, -1
-	}
-	for i := 0; i+len(pat) <= len(buf); {
-		if matchAt(buf, i, pat) {
-			total++
-			if off < 0 && i >= from {
-				off, ordinal = i, total
-			}
-			i += len(pat)
-			continue
-		}
-		i++
-	}
-	if off < 0 {
-		for i := 0; i+len(pat) <= len(buf); i++ {
-			if matchAt(buf, i, pat) {
-				return total, 1, i
-			}
-		}
-	}
-	return total, ordinal, off
-}
-
-// matchAt reports whether pat matches at offset off.
-func matchAt(buf []byte, off int, pat []byte) bool {
-	if off < 0 || len(pat) == 0 || off+len(pat) > len(buf) {
-		return false
-	}
-	for i := 0; i < len(pat); i++ {
-		if buf[off+i] != pat[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // countLines is the number of '\n'-separated lines. An empty buffer is one

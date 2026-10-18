@@ -266,6 +266,8 @@ func TestMarkerConstants(t *testing.T) {
 		markerHistOpen: "web: history n=",
 		markerHistRow:  "web: history ",
 		markerHistPick: "web: history pick ",
+		markerFind:     "web: find ",
+		markerFindHit:  "web: find hit=",
 		markerReload:   "web: reload",
 	}
 	for got, expect := range want {
