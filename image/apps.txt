@@ -22,6 +22,12 @@
 #   opens= what the app can be handed: an M81b mime type (text image audio
 #          archive binary) or a URL scheme (http https; M81c #1763 dispatches
 #          those). Naming a type is not a second opinion about a file.
+#          M124a (#2580) extends the vocabulary with full type/subtype
+#          spellings (text/plain, image/png) — a bare family word accepts
+#          any subtype under it on the seat's drag hit-test, a subtype
+#          spelling accepts only itself. GOEDIT's opens=text already takes
+#          text/plain and GOVIEW's opens=image already takes image/png, so
+#          no row needed a new word for the seat leg.
 #
 # BUDGET: every reader buffers 4096 B — sexiburger.manifest_buf_max, which
 # wnd.zig's god_menu_manifest_max, tabwm.zig's overlay_manifest_max and the Go

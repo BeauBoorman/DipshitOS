@@ -96,6 +96,7 @@ var paletteFocus = focusHosted
 // live strip in the OTHER mode swaps contents without dropping the sink,
 // and a closed strip acquires the modal input sink first.
 func openPalette() {
+	dragAbort("chrome") // M124a: the modal palette takes the gesture
 	if launch.open && launch.palette {
 		dismissLauncher()
 		return

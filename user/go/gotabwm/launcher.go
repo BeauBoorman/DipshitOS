@@ -222,6 +222,9 @@ func (l *launcherState) selected() (AppEntry, bool) {
 }
 
 func openLauncher() {
+	// M124a (#2580): seat chrome taking the gesture ends any armed drag
+	// — the release the drag waited on is now a menu click.
+	dragAbort("chrome")
 	if launch.open && !launch.palette {
 		dismissLauncher()
 		return

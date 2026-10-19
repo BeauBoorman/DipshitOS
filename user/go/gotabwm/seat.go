@@ -598,6 +598,10 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	notifyTick(ticks)
 	painted := paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, ticks)
 	centerPainted := paintNotifyCenter(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	// M124a (#2580): the drag ghost paints over every other chrome layer
+	// — the gesture owns the frame while the button is held — and under
+	// the idle curtain like the rest (the curtain is visual, not input).
+	ghostPainted := paintDragGhost(scan)
 	switch idleState {
 	case idleDim:
 		_ = paintIdleDim(scan, vi.ScanoutWidth, vi.ScanoutHeight)
@@ -622,6 +626,9 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 		vi.ConsoleLine(line)
 	}
 	if line, once := notifyCenterPaintMarker(centerPainted > 0, presented); once {
+		vi.ConsoleLine(line)
+	}
+	if line, once := dragGhostPaintMarker(ghostPainted > 0, presented); once {
 		vi.ConsoleLine(line)
 	}
 	idlePresentedFrame(presented)

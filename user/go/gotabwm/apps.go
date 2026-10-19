@@ -31,7 +31,10 @@ type AppEntry struct {
 	// non-goal: nothing here grants or gates power).
 	Caps []string
 	// Opens is `opens=` — what the app can be handed: an M81b mime type
-	// name (text image audio archive binary) or a URL scheme.
+	// name (text image audio archive binary), a URL scheme, or since
+	// M124a (#2580) a full type/subtype spelling (text/plain, image/png).
+	// The seat's drag admission is opensAccepts in drag.go: a bare family
+	// word accepts any subtype under it.
 	Opens []string
 }
 
