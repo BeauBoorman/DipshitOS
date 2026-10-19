@@ -2944,3 +2944,28 @@ led = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
 assert any("WEB-DL-DLPIC.QOI" in r for r in led), "no ledger row for the download"
 print("live-web 48 share state ok (atoms, 86B download, ledger row)")
 PY
+
+# --- M121c (#2566) run 49: the '?' chord-hint overlay ----------------------
+# '?' in browsing mode raises the appkit overlay fed by the chord registry;
+# Esc closes it. n= is the row count: no WEB app rows registered + the
+# seat's globals — no kernel-terminal section, WEB's window is not a tty
+# front-end. The `hints row` lines are the serial copy of the plate.
+vgate_file script-hints.txt <<'EOFX'
+exec WEB.ELF /host/PAGE.HTML
+EOFX
+
+vgate_run 49 -- \
+    --screen '$RUN_DIR/screen-49' \
+    --via-virtio \
+    --script '$RUN_DIR/script-hints.txt' \
+    --input-chords '?,escape,q' \
+    --input-chords-after 'web: ready' \
+    --script-expect 'web: quit' --timeout 240
+
+vgate_assert 49 serial-contains 'web: ready'
+vgate_assert 49 serial-contains 'web: hints n=24'
+vgate_assert 49 serial-contains 'web: hints row ctrl+shift+p summon the command palette'
+vgate_assert 49 serial-absent 'web: hints row ctrl+shift+c '
+vgate_assert 49 serial-contains 'web: hints close'
+vgate_assert 49 serial-contains 'web: quit'
+vgate_assert 49 serial-absent '[EXC] parking:'

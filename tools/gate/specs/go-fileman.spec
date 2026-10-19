@@ -1226,3 +1226,37 @@ vgate_assert 13 serial-contains 'rx-go-fileman-execrefusal-ok'
 vgate_assert 13 serial-absent 'gofiles: open launched NOTES.TXT handler=MISSING.ELF'
 vgate_assert 13 serial-absent '[EXC] parking:'
 vgate_assert 13 serial-absent 'exited status=139'
+
+# --- M121c (#2566) run 14: the '?' chord-hint overlay ----------------------
+# A bare '?' rune opens the registry-fed overlay inside GOFILES's own ANSI
+# frame; Esc hands the keyboard back to the list. n= is the row count:
+# no GOFILES app rows + the seat's globals + the kernel terminal chrome
+# (a tty-bound window answers those chords too). The `hints row` lines are
+# the serial-readable copy of the plate, pinned against the shipped table.
+vgate_file script-14.txt <<'EOFX'
+exec GOFILES.ELF /host/FM
+EOFX
+
+vgate_file script3-14.txt <<'EOFX'
+dui close 2
+echo rx-go-fileman-hints-ok
+EOFX
+
+vgate_run 14 -- \
+    --screen '$RUN_DIR/fileman-screen-14' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-14.txt' \
+    --input-chords '?,escape,q' \
+    --input-chords-after 'gofiles: ready' \
+    --script-expect 'gofiles OK' --timeout 240
+
+vgate_assert 14 serial-contains 'gofiles: ready'
+vgate_assert 14 serial-contains 'gofiles: hints n=36'
+vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+p summon the command palette'
+vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+c copy the terminal selection'
+vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+k clear the terminal scrollback'
+vgate_assert 14 serial-contains 'gofiles: hints close'
+vgate_assert 14 serial-contains 'gofiles: key q'
+vgate_assert 14 serial-contains 'gofiles OK'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 serial-absent 'exited status=139'

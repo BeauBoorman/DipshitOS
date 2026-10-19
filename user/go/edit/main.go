@@ -192,13 +192,13 @@ const (
 	markerPaste  = "goedit: paste "
 	// M124a-2 (#2677): the drop target's receipt — `<mime> n=` on a
 	// splice, `no-payload`/`empty`/`rc=` for the refused shapes.
-	markerDrop    = "goedit: drop "
+	markerDrop = "goedit: drop "
 	// M124e (#2584): primary-selection markers — publish on selection
 	// change, paste on a seat delivery.
 	markerSelPub   = "goedit: selpub "
 	markerSelPaste = "goedit: sel-paste "
-	markerRepl    = "goedit: replace '"
-	markerReplAll = "goedit: replace-all '"
+	markerRepl     = "goedit: replace '"
+	markerReplAll  = "goedit: replace-all '"
 
 	// M123d (#2578): the shared in-app error banner. `banner` is the raise
 	// — the failure text the strip shows — printed only after the frame
@@ -206,6 +206,13 @@ const (
 	// `copy rc=` on a refused clipboard write, or `dismiss`).
 	markerBanner    = "goedit: banner "
 	markerBannerAct = "goedit: banner act "
+	// M121c (#2566): the '?' overlay's receipts. `hints n=` is the registry
+	// row count on the painted frame; each `hints row` line after it is the
+	// serial-readable copy of one row the plate shows, so the gate pins the
+	// content against the shipped table; `hints close` follows the frame
+	// the Esc-restore painted.
+	markerHints    = "goedit: hints "
+	markerHintsRow = "goedit: hints row "
 
 	// M81d (#1764): the advisory write lease's console receipts. The open
 	// marker names the holder pid the record now carries (the takeover's
@@ -316,6 +323,7 @@ const (
 	modeDiags
 	modePicker
 	modeDialog
+	modeHints // M121c (#2566): the '?' chord-hint overlay owns the keyboard
 )
 
 // clipWrite/clipRead are the machine-global clipboard (sys_clipboard_set/get,
@@ -470,6 +478,13 @@ type editor struct {
 	// prints only after the strip's own frame is on scanout.
 	banner      appkit.ErrorBanner
 	bannerFresh bool
+
+	// M121c (#2566): the shared '?' chord-hint overlay — the registry rows
+	// for this app's scope plus the seat's globals. hintsEmit latches the
+	// open/close edge so the marker prints only after its frame is on the
+	// scanout (the bannerFresh discipline).
+	hints     appkit.ChordHints
+	hintsEmit int // 1 = open receipt pending, 2 = close receipt pending
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -649,6 +664,7 @@ func main() {
 				e.bannerFlush()
 				e.markStage()
 				e.emitStatus()
+				e.hintsFlush()
 			}
 		}
 	}
@@ -760,7 +776,7 @@ func (e *editor) commitAll(rs []rune) bool {
 	for _, r := range rs {
 		if e.mode == modeEdit {
 			changed = e.insert(r) || changed
-		} else if e.mode != modeDiags && e.mode != modePicker && e.mode != modeDialog {
+		} else if e.mode != modeDiags && e.mode != modePicker && e.mode != modeDialog && e.mode != modeHints {
 			changed = e.barAppend(r) || changed
 		}
 	}
@@ -807,6 +823,19 @@ func (e *editor) handleKey(ev vi.Event) bool {
 		return e.pickerKey(ev)
 	case modeDialog:
 		return e.dialogKey(ev)
+	case modeHints:
+		return e.hintsKey(ev)
+	}
+	// M121c (#2566): '?' opens the chord-hint overlay from the document or
+	// the diagnostics panel — the registry's app + seat rows painted over
+	// the buffer. A bar keeps '?' as text (a find pattern may literally be
+	// '?'); the modals above own the keyboard while they stand.
+	if (e.mode == modeEdit || e.mode == modeDiags) && ev.Arg1 == '?' &&
+		ev.Flags&(modCtrl|vi.ModAlt) == 0 {
+		e.hints = appkit.NewChordHints(appName)
+		e.mode = modeHints
+		e.hintsEmit = 1
+		return true
 	}
 	if isChord(ev, keyF, keyCtrlF) {
 		return e.openBar(modeFind)
@@ -1055,6 +1084,35 @@ func (e *editor) pickerKey(ev vi.Event) bool {
 	e.hist = history{}
 	e.ensureLease()
 	return true
+}
+
+// hintsKey routes one key to the open '?' overlay: Esc (or a second '?')
+// closes it back to the document, the nav keys scroll a list longer than
+// the plate — every other key is consumed, the modal contract.
+func (e *editor) hintsKey(ev vi.Event) bool {
+	if _, done := e.hints.HandleKey(ev); done {
+		e.mode = modeEdit
+		e.hintsEmit = 2
+	}
+	return true
+}
+
+// hintsFlush prints the latched hints receipt after the frame it describes
+// is on the scanout — the same post-present discipline bannerFlush keeps.
+// The row dump is the serial-readable copy of the plate's content: it is
+// built from the registry's own rows, so a hard-coded cheat sheet could
+// never produce it.
+func (e *editor) hintsFlush() {
+	switch e.hintsEmit {
+	case 1:
+		vi.ConsoleLine(markerHints + "n=" + vi.Itoa64(int64(e.hints.ChordRows())))
+		for _, l := range e.hints.RowLines() {
+			vi.ConsoleLine(markerHintsRow + l)
+		}
+	case 2:
+		vi.ConsoleLine(markerHints + "close")
+	}
+	e.hintsEmit = 0
 }
 
 // dialogKey routes the discard-confirm: Yes continues into the picker the
@@ -1952,7 +2010,7 @@ func (e *editor) draw() {
 	// M123b (#2576): an empty buffer gets the shared empty-state plate —
 	// icon, headline and the chords that answer on a blank document — under
 	// the caret, which still paints at the text origin (type to insert).
-	if len(e.buf) == 0 && e.mode != modePicker && e.mode != modeDialog && e.mode != modeDiags {
+	if len(e.buf) == 0 && e.mode != modePicker && e.mode != modeDialog && e.mode != modeDiags && e.mode != modeHints {
 		(&widgets.EmptyState{
 			R:        widgets.Rect{X: textOrigin, Y: chromeH + 4, W: w - 2*textOrigin, H: h - chromeH - 8},
 			Icon:     "|",
@@ -1972,7 +2030,7 @@ func (e *editor) draw() {
 	}
 	if e.mode == modeDiags {
 		e.drawDiags(w, h)
-	} else if e.mode != modeEdit && e.mode != modePicker && e.mode != modeDialog {
+	} else if e.mode != modeEdit && e.mode != modePicker && e.mode != modeDialog && e.mode != modeHints {
 		label := "Find: "
 		if e.mode == modeGoto {
 			label = "Goto: "
@@ -2006,6 +2064,8 @@ func (e *editor) draw() {
 		e.pick.Draw(e.ta.Canvas())
 	} else if e.mode == modeDialog {
 		e.dlg.Draw(e.ta.Canvas())
+	} else if e.mode == modeHints {
+		e.hints.Draw(e.ta.Canvas())
 	}
 	// M123d: the error strip paints last of all — it stands over whatever
 	// the frame already drew.

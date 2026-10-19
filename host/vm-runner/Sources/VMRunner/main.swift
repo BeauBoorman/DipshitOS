@@ -6098,7 +6098,8 @@ func macKey(for ch: Character) -> (UInt16, Bool)? {
     case " ": return (0x31, false)
     case "_": return (0x1B, true)
     case ".": return (0x2F, false); case ",": return (0x2B, false)
-    case "/": return (0x2C, false); case "-": return (0x1B, false)
+    case "/": return (0x2C, false); case "?": return (0x2C, true)
+    case "-": return (0x1B, false)
     case "=": return (0x18, false); case "[": return (0x21, false)
     case "]": return (0x1E, false); case "\\": return (0x2A, false)
     case ";": return (0x29, false); case "'": return (0x27, false)
@@ -8624,7 +8625,7 @@ enum CustomVirtioSpike {
         case ";": return (0x33, false); case "'": return (0x34, false)
         case "`": return (0x35, false)
         case ",": return (0x36, false); case ".": return (0x37, false)
-        case "/": return (0x38, false)
+        case "/": return (0x38, false); case "?": return (0x38, true)
         default: return nil
         }
     }

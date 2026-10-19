@@ -866,3 +866,60 @@ assert i_rest < i_ready < i_env < i_done, (
 print(f"restore chain OK: back={back}B replayed; restored < ready < env/cwd "
       f"proofs")
 PY
+
+# --- M121c (#2566) run 05: the '?' chord-hint overlay + child pass-through --
+# GOTERM is a tty front-end: '?' at the prompt paints the registry's rows
+# on the alternate screen (app + seat + kernel-terminal chrome — this
+# window answers all three scopes) and a lone Esc pops it. The pass-through
+# half the card names: while `read` blocks inside RunLine the main loop is
+# not reading the tty, so a '?' keystroke is stdin, not the overlay chord —
+# proven by the byte landing in HINTS-Q.OUT on the share and by `hints`
+# being absent until after the echo submits.
+vgate_file script-hints.txt <<'EOFX'
+exec GOTERM.ELF
+EOFX
+
+vgate_file hints-done.txt <<'EOFX'
+echo rx-term-hints-ok
+EOFX
+
+vgate_run 05 -- --display --input --via-virtio --screen '$RUN_DIR/screen-05' \
+    --script '$RUN_DIR/script-hints.txt' \
+    --input-string 'read Q\n' --input-string-after 'goterm: prompt' \
+    --input-chords '?,return' --input-chords-after 'goterm: line read Q' \
+    --input-string 'echo $Q > /host/HINTS-Q.OUT\n' --input-string-after 'goterm: done status=0' \
+    --input-chords '?,escape' --input-chords-after 'goterm: line echo $Q > /host/HINTS-Q.OUT' \
+    --script2 '$RUN_DIR/hints-done.txt' \
+    --script2-after 'goterm: hints close' \
+    --script-expect 'rx-term-hints-ok' \
+    --timeout 240
+
+vgate_assert 05 serial-contains 'goterm: ready'
+vgate_assert 05 serial-contains 'goterm: line read Q'
+vgate_assert 05 serial-contains 'goterm: hints n=36'
+vgate_assert 05 serial-contains 'goterm: hints row ctrl+shift+c copy the terminal selection'
+vgate_assert 05 serial-contains 'goterm: hints row ctrl+shift+p summon the command palette'
+vgate_assert 05 serial-contains 'goterm: hints close'
+vgate_assert 05 serial-contains 'rx-term-hints-ok'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 share-contains 'HINTS-Q.OUT' '?'
+
+# The pass-through pin: `read` was blocking on stdin when the first '?' was
+# injected, so that byte had to go to the shell's stdin — the hints n= line
+# may only appear after the echo line, never inside the read window.
+vgate_assert 05 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+i_read = ser.find("goterm: line read Q")
+i_echo = ser.find("goterm: line echo $Q")
+i_hints = ser.find("goterm: hints n=")
+i_close = ser.find("goterm: hints close")
+for name, i in (("read line", i_read), ("echo line", i_echo),
+                ("hints open", i_hints), ("hints close", i_close)):
+    assert i >= 0, f"{name} marker missing"
+assert i_read < i_echo < i_hints < i_close, (
+    f"pass-through broken: read={i_read} echo={i_echo} "
+    f"hints={i_hints} close={i_close} — '?' reached the overlay while a "
+    f"child owned the tty")
+print("'?' pass-through OK: stdin byte to `read`, overlay only at the prompt")
+PY

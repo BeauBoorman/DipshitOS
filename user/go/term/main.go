@@ -33,6 +33,8 @@ package main
 import (
 	"strings"
 
+	"virelai/appkit"
+	"virelai/chords"
 	"virelai/shlib"
 	"virelai/tabapp"
 	"virelai/vi"
@@ -94,6 +96,12 @@ const (
 	// M124e (#2584): a seat primary-selection delivery landing in the line
 	// editor — n= is the staged byte count it fed.
 	markerSelPaste = "goterm: sel-paste "
+	// M121c (#2566): the '?' overlay's receipts. `hints n=` is the registry
+	// row count written to the alternate screen; each `hints row` line is
+	// the serial-readable copy of one row the grid shows; `hints close`
+	// follows the editor repaint that restores the prompt.
+	markerHints    = "goterm: hints "
+	markerHintsRow = "goterm: hints row "
 )
 
 func main() {
@@ -324,7 +332,18 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 			ta.PollSelPaste()
 			n, _ := vi.FileRead(fd, readBuf[:])
 			if n > 0 {
-				handle(editor.Feed(readBuf[:n]))
+				// M121c (#2566): a bare '?' keystroke at the prompt opens
+				// the chord-hint overlay on the tty's alternate screen. A
+				// '?' arriving inside a larger chunk (a paste, a typed
+				// burst) stays editor input; a '?' typed while a child
+				// owns the terminal never reaches this loop at all — the
+				// wait's tty read is the child's byte stream, the
+				// pass-through the card names.
+				if n == 1 && readBuf[0] == '?' {
+					hintsSession(ta, ts, fd, editor)
+				} else {
+					handle(editor.Feed(readBuf[:n]))
+				}
 			}
 			for editor.Pending() {
 				handle(editor.Feed(nil))
@@ -364,6 +383,106 @@ func leave(ta *tabapp.TabApp, fd uint32, sh *shlib.Shell, act shlib.Action) {
 		}
 	}
 	shutdown(ta, fd, sh.Status())
+}
+
+// hintsSession is the M121c (#2566) '?' overlay for a tty-bound window:
+// the kernel paints this terminal's grid, so the registry's rows go into
+// the alternate screen — title, the app + global + kernel-chrome sections,
+// footer — until a lone Esc (or a second '?') pops it and the editor
+// repaints the prompt. The overlay is one appkit.ChordHints: the same
+// model the canvas apps draw, rendered through Lines like GOFILES's ANSI
+// face. Markers print after the bytes that produce them.
+func hintsSession(ta *tabapp.TabApp, ts *termState, fd uint32, editor *shlib.Editor) {
+	h := appkit.NewChordHints(appName, chords.ScopeKernelTerminal)
+	cw, chh := vi.TerminalCell()
+	cols, rows := tabapp.CellGrid(ta.W, ta.H, cw, chh)
+
+	paint := func() {
+		lines := h.Lines(cols)
+		var b []byte
+		b = append(b, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"...)
+		for i := 0; i < rows; i++ {
+			var line string
+			switch {
+			case i == 0:
+				line = lines[0]
+			case i == rows-1:
+				line = lines[len(lines)-1]
+			default:
+				// h.Scroll indexes h.Rows; lines carries a 2-line
+				// preamble (title + blank), so the row window starts
+				// two lines in and ends before blank + footer.
+				idx := h.Scroll + i - 1 + 2
+				if idx < len(lines)-2 {
+					line = lines[idx]
+				}
+			}
+			b = append(b, line...)
+			if i < rows-1 {
+				b = append(b, '\r', '\n')
+			}
+		}
+		writeTTY(ts, fd, b)
+	}
+
+	paint()
+	vi.ConsoleLine(markerHints + "n=" + vi.Itoa64(int64(h.ChordRows())))
+	for _, l := range h.RowLines() {
+		vi.ConsoleLine(markerHintsRow + l)
+	}
+
+	var in [64]byte
+	for {
+		ta.PollStateAsk()
+		n, _ := vi.FileRead(fd, in[:])
+		if n > 0 {
+			for i := 0; i < n; i++ {
+				c := in[i]
+				switch {
+				case c == 0x1b && i+2 < n && in[i+1] == '[':
+					// A CSI sequence: scroll on arrows/Home/End/PgUp/PgDn.
+					fin := in[i+2]
+					i += 2
+					switch fin {
+					case 'A':
+						h.Move(-1)
+					case 'B':
+						h.Move(1)
+					case 'H':
+						h.Scroll = 0
+					case 'F':
+						h.Scroll = len(h.Rows) - 1
+					case '~':
+						// ESC [ 5 ~ / ESC [ 6 ~ — the digit is the byte
+						// before '~' when the sequence carries one.
+						if i-1 >= 0 && i < n && i-1 > 0 && in[i-1] == '5' {
+							h.Move(-(rows - 2))
+						} else {
+							h.Move(rows - 2)
+						}
+					}
+				case c == 0x1b || c == '?':
+					goto hintsDone
+				}
+			}
+			paint()
+		}
+		if ev, r, ok := vi.PollEventRaw(); ok {
+			if ta.Dispatch(ev) == tabapp.ActionClosed {
+				shutdown(ta, fd, 0)
+			}
+		} else if r < 0 {
+			shutdown(ta, fd, 1)
+		} else if n <= 0 {
+			vi.Sleep(1)
+		}
+	}
+hintsDone:
+	// Pop the alternate screen; the editor's repaint restores the prompt
+	// and the in-flight line exactly as the overlay found them.
+	writeTTY(ts, fd, []byte("\x1b[?1049l"))
+	writeTTY(ts, fd, editor.Repaint())
+	vi.ConsoleLine(markerHints + "close")
 }
 
 func shutdown(ta *tabapp.TabApp, fd uint32, status int) {

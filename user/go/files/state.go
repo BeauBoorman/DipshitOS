@@ -7,6 +7,7 @@ package main
 
 import (
 	"virelai/appkit"
+	"virelai/chords"
 	"virelai/mime"
 	"virelai/rss/keys"
 	"virelai/vi"
@@ -35,6 +36,7 @@ const (
 	modeConfirmDelete
 	modeOpenWith // M81b (#1762): the Open-with… candidate list owns the digits
 	modeContext  // M124d (#2583): the right-click menu owns keys until dismissed
+	modeHints    // M121c (#2566): the '?' chord-hint overlay owns the frame
 )
 
 // titleBarPx is the window title band the client area sits below: the
@@ -119,7 +121,17 @@ type model struct {
 	bannerFrom  string
 	bannerTo    string
 	bannerFresh bool
+
+	// M121c (#2566): the '?' chord-hint overlay — the registry's rows for
+	// this app's scope (none registered), the seat's globals, and the
+	// kernel terminal chrome (a tty-bound window answers those too),
+	// rendered ANSI inside this app's own frame.
+	hints appkit.ChordHints
 }
+
+// hintsBin names this app's registry scope — the untagged twin of
+// main.go's appName (the tagged file's constant cannot be read here).
+const hintsBin = "GOFILES.ELF"
 
 // newModel starts at path on a cols x rows grid and takes the first listing
 // (its markers ride pending for main to flush after the first paint).
@@ -603,6 +615,10 @@ func (m *model) handleKey(ev keys.Event) {
 		}
 		return
 	}
+	if m.mode == modeHints {
+		m.hintsKey(ev)
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		switch ev.Key {
 		case keys.KeyRune:
@@ -679,8 +695,65 @@ func (m *model) handleKey(ev keys.Event) {
 			m.startOpenWith()
 		case 'e':
 			m.exportSel()
+		case '?':
+			m.openHints()
 		}
 	}
+}
+
+// openHints raises the M121c (#2566) '?' overlay — the registry's rows for
+// this app's scope plus the seat's globals and the kernel terminal chrome,
+// all read off chords.Global so a hard-coded sheet can never drift. The
+// row markers ride pending like every other model receipt, so they print
+// after the frame that carries them.
+func (m *model) openHints() {
+	m.hints = appkit.NewChordHints(hintsBin, chords.ScopeKernelTerminal)
+	m.hints.R.W = m.cols * 8 // the overlay plate's logical width only — Lines uses cells
+	m.mode = modeHints
+	m.emit(markerHints + "n=" + vi.Itoa64(int64(m.hints.ChordRows())))
+	for _, l := range m.hints.RowLines() {
+		m.emit(markerHintsRow + l)
+	}
+}
+
+// hintsKey is the modeHints keyboard contract: Esc or a second '?' hands
+// the frame back to the list, and the nav keys scroll a list taller than
+// the window.
+func (m *model) hintsKey(ev keys.Event) {
+	vis := m.rows - 2 // the renderHints list window: title + footer off-grid
+	if vis < 1 {
+		vis = 1
+	}
+	switch ev.Key {
+	case keys.KeyEsc:
+		m.closeHints()
+	case keys.KeyRune:
+		if ev.Rune == '?' {
+			m.closeHints()
+		}
+	case keys.KeyUp:
+		m.hints.Move(-1)
+	case keys.KeyDown:
+		m.hints.Move(1)
+	case keys.KeyPageUp:
+		m.hints.Move(-vis)
+	case keys.KeyPageDown:
+		m.hints.Move(vis)
+	case keys.KeyHome:
+		m.hints.Scroll = 0
+	case keys.KeyEnd:
+		m.hints.Scroll = len(m.hints.Rows) - vis
+		if m.hints.Scroll < 0 {
+			m.hints.Scroll = 0
+		}
+	case keys.KeyCtrlC:
+		m.quit = true
+	}
+}
+
+func (m *model) closeHints() {
+	m.mode = modeNormal
+	m.emit(markerHints + "close")
 }
 
 // showVolumes is the `v` chord: jump straight to the synthetic volumes root
@@ -840,7 +913,7 @@ func (m *model) raiseBanner(text string, actions ...appkit.BannerAction) {
 // contextual actions — Copy Error and dismiss are the honest answers.
 func (m *model) raiseExecRefusal(bin string, err error) {
 	m.bannerOp = ""
-	m.raiseBanner("exec "+bin+" refused: "+err.Error())
+	m.raiseBanner("exec " + bin + " refused: " + err.Error())
 	m.status = "open: " + bin + " refused"
 }
 
