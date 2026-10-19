@@ -58,6 +58,16 @@ public final class HostRecorder {
     /// Test seam: the CAPTURES dir override. nil means "resolve from
     /// argv" (the production path).
     public var outDir: URL?
+    /// M120e (#2562): the bus wires this to the captures model so a take
+    /// lands where ⌘⇧5 does — `<share>/CAPTURES`, profile share included
+    /// (bare argv resolution misses a profile-armed share; a --profile
+    /// session's share never appears as a flag). A bare HostRecorder
+    /// keeps the argv-only resolution.
+    public var capturesSource: (() -> URL?)?
+    /// M120e (#2562): fired once per finished take with the on-disk URL —
+    /// the bus's captures model turns it into the saved badge + counter,
+    /// so a recording is a "capture saved" like a screenshot.
+    public var onSaved: ((URL) -> Void)?
     /// Test seam: the wall clock. Timers pace real time; frame PTSs and
     /// the cap check read this so a test can run a whole 60 s recording
     /// synchronously.
@@ -123,9 +133,10 @@ public final class HostRecorder {
     }
 
     /// The CAPTURES dir a start would write into, honoring the test
-    /// override before argv.
+    /// override, then the bus's captures model (the profile-share-aware
+    /// resolver), then argv.
     public func resolvedOutDir() -> URL? {
-        outDir ?? HostRecorder.capturesDir()
+        outDir ?? capturesSource?() ?? HostRecorder.capturesDir()
     }
 
     /// What `isEnabled` reports: a recording already running stays
@@ -244,6 +255,7 @@ public final class HostRecorder {
         if let outURL {
             lastFile = outURL
             lastBytes = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
+            onSaved?(outURL)
         }
         writer = nil
         writerInput = nil

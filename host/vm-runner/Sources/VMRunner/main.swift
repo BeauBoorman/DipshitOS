@@ -4099,6 +4099,8 @@ if let documentProfileURL {
     commandBus.settings.profileURL = documentProfileURL
     commandBus.profiles.profileURL = documentProfileURL
     commandBus.machine.profileURL = documentProfileURL
+    // M120e (#2562): captures route into the clicked bundle's share/ too.
+    commandBus.captures.profileURL = documentProfileURL
 }
 // M120c (#2560): the Machine-menu persistence verbs. The model resolves
 // the profile/share/base/key from argv itself; the pieces only the
@@ -4140,13 +4142,18 @@ commandBus.machine.snapshotDriver = { name in
 // registration instead).
 if screenshotPath != nil || displayMode {
     var hostUIShotCount = 0
-    commandBus.register(.screenshot, HostCommandBus.Registration(isEnabled: {
-        machineView != nil
-    }) {
+    commandBus.register(.screenshot, HostCommandBus.Registration(
+        isEnabled: { machineView != nil },
+        receiptDetail: { commandBus.captures.receiptDetail }
+    ) {
         hostUIShotCount += 1
-        let path = screenshotPathForLabel("hostui-\(hostUIShotCount)")
+        let path = screenshotPathForCapture("hostui-\(hostUIShotCount)")
         writeScreenshot(to: path)
-        return FileManager.default.fileExists(atPath: path) ? .performed : .failed
+        guard FileManager.default.fileExists(atPath: path) else { return .failed }
+        // M120e (#2562): a landed capture arms the saved badge + counter —
+        // the receipt's file= is the name the badge shows.
+        commandBus.captures.noteSaved(URL(fileURLWithPath: path))
+        return .performed
     })
 }
 // M114b (#2455): the headless viewport verbs — the same two the session
@@ -4797,6 +4804,23 @@ func screenshotPathForLabel(_ label: String) -> String {
     return "artifacts/vm-screen-\(label).png"
 }
 
+// M120e (#2562): the ⌘⇧5 verb's destination — `<share>/CAPTURES/` of the
+// armed share or the active profile (the recorder's own destination), with
+// the --screen basename + ext kept so a run's naming survives the reroute.
+// A shareless run keeps the historical <base>-<label>[.<ext>] / artifacts/
+// path — the card promises CAPTURES only where a share exists.
+func screenshotPathForCapture(_ label: String) -> String {
+    guard let dir = commandBus.captures.resolvedDir() else {
+        return screenshotPathForLabel(label)
+    }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let screen = (screenshotPath ?? "") as NSString
+    let stem = (screen.deletingPathExtension as NSString).lastPathComponent
+    let ext = screen.pathExtension
+    let name = "\(stem.isEmpty ? "vm-screen" : stem)-\(label).\(ext.isEmpty ? "png" : ext)"
+    return dir.appendingPathComponent(name).path
+}
+
 func captureScreenshotMarker(_ label: String) {
     writeScreenshot(to: screenshotPathForLabel(label))
 }
@@ -5442,6 +5466,20 @@ func feedInspector(_ text: String) {
 func hostIntRefuse(_ lane: String, _ reason: HostInt.Refusal) {
     HostInt.logRefuse(lane: lane, reason: reason)
     inspector.noteHostMarker("host-int: refuse lane=\(lane) reason=\(reason.rawValue)")
+}
+
+// M120e (#2562): one postmortem for every poll's "VM ended" observation —
+// the inspector's card + auto-open and the `host-inspector: postmortem`
+// receipt are the same model state the session window's drawer shows
+// (the index's identical-seam rule: headless modes get the model truth,
+// the session gets the real pane). Idempotent — a still-dead VM's repeat
+// observation re-notes nothing.
+func noteVMEnd(_ state: VZVirtualMachine.State) {
+    inspector.noteStop(PostmortemCard(
+        ending: state == .error ? .crashed : .stopped,
+        state: "\(state.rawValue)",
+        reason: vmDelegate.stopReasons.reason ?? StopReasonRecorder.noReason,
+        serialLines: inspector.ingestedCount))
 }
 
 // M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
@@ -8217,6 +8255,11 @@ func scriptPoll(matchedAt: Date? = nil) {
     // already observed (the tail window simply cannot capture more output),
     // otherwise fail. A ctl `suspend` teardown is its own success path.
     if !suspendStopInFlight && vmDidStart && (runner.vm.state == .stopped || runner.vm.state == .error) {
+        // M120e (#2562): the drawer notes the end in script mode too —
+        // the postmortem card + auto-open is the same model state the
+        // session window would show, and the receipt is the live leg's
+        // "drawer opened" evidence.
+        noteVMEnd(runner.vm.state)
         // Issue #1024: the state was sampled BEFORE this tick's log read —
         // a VM that stops in the gap after the previous read makes this
         // branch see "stopped" while the transcript already sits in the
@@ -8367,14 +8410,12 @@ func hostSessionPoll() {
         let state = runner.vm.state
         DispatchQueue.main.async {
             if vmDidStart && (state == .stopped || state == .error) {
-                // M114d (#2457): the in-window postmortem — the drawer
-                // opens itself on the stop/crash card (state + the VZ
-                // delegate's reason + how deep the serial tail is).
-                inspector.noteStop(PostmortemCard(
-                    ending: state == .error ? .crashed : .stopped,
-                    state: "\(state.rawValue)",
-                    reason: vmDelegate.stopReasons.reason ?? StopReasonRecorder.noReason,
-                    serialLines: inspector.ingestedCount))
+                // M114d (#2457) + M120e (#2562): the in-window postmortem
+                // — the drawer opens itself on the stop/crash card
+                // (state + the VZ delegate's reason + how deep the
+                // serial tail is), and the host-inspector: receipt is
+                // the same line the headless end paths print.
+                noteVMEnd(state)
                 hostApplication.showFailure("VM ended (state=\(state.rawValue)).\(vmDelegate.verdict())")
             } else if timeout > 0 && Date() > deadline {
                 hostApplication.stop("session-timeout")
@@ -8448,6 +8489,9 @@ func consolePoll() {
     }
     let state = runner.vm.state
     if vmDidStart && (state == .stopped || state == .error) {
+        // M120e (#2562): the console-mode end notes the postmortem too —
+        // same model, same receipt.
+        noteVMEnd(state)
         // The VM already ended, so VZ closed the serial pipe — the tee is
         // draining on its own; wait for it instead of the fixed 0.5 s sleep.
         // Claim #1278: report the delegate's reason alongside the state on the

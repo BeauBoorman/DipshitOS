@@ -85,6 +85,13 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// bus and the menu chord light the same affordance.
     private let recordBadge = NSView()
     private let recordBadgeLabel = NSTextField(labelWithString: "")
+    /// M120e (#2562): the transient "Saved <name>" badge — visible for
+    /// the captures model's badgeTTL after a ⌘⇧5 screenshot or a finished
+    /// recording lands. The model's onChange shows it; a one-shot timer
+    /// re-reads `savedBadgeVisible` to hide it — no polling.
+    private let savedBadge = NSView()
+    private let savedBadgeLabel = NSTextField(labelWithString: "")
+    private var savedBadgeTimer: Timer?
     /// M120c (#2560): the staged-update banner — a strip across the
     /// bottom of the guest pane, visible exactly while the armed share
     /// holds `<share>/UPDATE/` (the guest's GOUPD stage lands mid-run,
@@ -222,6 +229,26 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             recordBadge.topAnchor.constraint(equalTo: guestArea.topAnchor, constant: 8),
         ])
         recordBadge.isHidden = true
+        // M120e: the saved badge — the captureBadge pattern pinned under
+        // it, so a saved capture never overlaps the keys/REC affordances.
+        savedBadge.wantsLayer = true
+        savedBadge.layer?.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.8).cgColor
+        savedBadge.layer?.cornerRadius = 11
+        savedBadge.translatesAutoresizingMaskIntoConstraints = false
+        savedBadgeLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        savedBadgeLabel.textColor = .white
+        savedBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        savedBadge.addSubview(savedBadgeLabel)
+        guestArea.addSubview(savedBadge)
+        NSLayoutConstraint.activate([
+            savedBadgeLabel.leadingAnchor.constraint(equalTo: savedBadge.leadingAnchor, constant: 10),
+            savedBadgeLabel.trailingAnchor.constraint(equalTo: savedBadge.trailingAnchor, constant: -10),
+            savedBadgeLabel.topAnchor.constraint(equalTo: savedBadge.topAnchor, constant: 3),
+            savedBadgeLabel.bottomAnchor.constraint(equalTo: savedBadge.bottomAnchor, constant: -3),
+            savedBadge.centerXAnchor.constraint(equalTo: guestArea.centerXAnchor),
+            savedBadge.topAnchor.constraint(equalTo: guestArea.topAnchor, constant: 36),
+        ])
+        savedBadge.isHidden = true
         // M120c (#2560): the staged-update strip — bottom edge of the
         // guest pane, always present-but-hidden so a mid-run stage only
         // flips visibility. The poll is the arrival mechanism (UPDATE/
@@ -261,6 +288,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         }
         syncUpdateBanner()
         commandBus.recorder.onChange = { [weak self] in self?.refreshRecordAffordance() }
+        commandBus.captures.onChange = { [weak self] in self?.syncSavedBadge() }
         commandBus.agent.onChange = { [weak self] in self?.refreshAgentAffordance() }
         // M128a (#2605): the ⌘, settings panel mirrors the bus's
         // settings model — isOpen flips under the verb (menu chord or
@@ -374,6 +402,30 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// read instead of poking AppKit. `inspector.isOpen` is the model's
     /// truth; the split pane mirrors it through syncInspector.
     public var inspectorVisible: Bool { inspector.isOpen }
+    /// The drawer's on-screen truth — the class-A read for the M120e
+    /// postmortem auto-open (inspectorVisible is the model's side).
+    public var drawerVisible: Bool { !drawer.isHidden }
+
+    /// M120e (#2562): the saved badge's seams — the class-A reads instead
+    /// of poking the view hierarchy.
+    public var savedAffordanceVisible: Bool { !savedBadge.isHidden }
+    public var savedAffordanceText: String { savedBadgeLabel.stringValue }
+
+    /// Model → badge: show "✓ Saved <name>" while the captures model's
+    /// TTL runs; a one-shot timer lands the hide instead of polling.
+    public func syncSavedBadge() {
+        let model = commandBus.captures
+        savedBadge.isHidden = !model.savedBadgeVisible
+        savedBadgeLabel.stringValue = model.savedBadgeText
+        savedBadgeTimer?.invalidate()
+        savedBadgeTimer = nil
+        let left = model.badgeRemaining
+        if left > 0 {
+            savedBadgeTimer = Timer.scheduledTimer(withTimeInterval: left, repeats: false) { [weak self] _ in
+                self?.syncSavedBadge()
+            }
+        }
+    }
 
     /// M128a (#2605): the settings panel's seams — the model's open
     /// state and the panel's on-screen truth — the class-A reads
@@ -608,6 +660,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
 
     deinit {
         updateBannerTimer?.invalidate()
+        savedBadgeTimer?.invalidate()
     }
 
     private func reportFocus(_ reason: String) {

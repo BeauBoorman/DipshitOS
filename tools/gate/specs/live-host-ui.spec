@@ -53,6 +53,15 @@
 # guest's own M115d SuspendCtl freezes, saves saved-state/state.vzsave
 # and the run ends through the suspended-teardown path.
 #
+# Run 08 is M120e's (#2562): the failure-surfaces leg. The guest's own
+# `shutdown` monitor verb (EFI ResetSystem — the live-reboot shutdown
+# leg's proven mechanism) powers the VM off mid-run; the poll's
+# early-stop path notes the postmortem, the drawer model opens on its
+# own, and the `host-inspector: postmortem … open=1` line is the receipt.
+# The armed --virtio-fs share routes the screenshot verb's PNG into
+# <share>/CAPTURES/ — ⌘⇧5's destination — and the dispatch's
+# saved=/file= tail is the saved-badge truth a window would mirror.
+#
 # M114f (#2459) acceptance: taken together the five runs are the
 # full-window journey — bus dispatch (screenshot, clean stop), the
 # viewport verbs (fullscreen, capture-keys on/off, the
@@ -60,7 +69,7 @@
 # injection, and the one-chord capture pair. The same bus's lane
 # suspend/resume leg lives in live-hostint run 04 (M114c, #2456).
 
-vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts, one-chord capture"
+vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts, one-chord capture, postmortem auto-open + CAPTURES routing"
 vgate_repeat 1 BOOTS
 
 vgate_file script.txt <<'EOF'
@@ -84,6 +93,9 @@ EOF
 vgate_setup_python <<'PY'
 import json, os, shutil, subprocess, sys
 os.makedirs(os.path.join(os.environ["RUN_DIR"], "capshare", "CAPTURES"), exist_ok=True)
+# Run 08's share root only — CAPTURES itself must NOT preexist: the
+# screenshot verb creates it on write, which is part of the evidence.
+os.makedirs(os.path.join(os.environ["RUN_DIR"], "capshare8"), exist_ok=True)
 
 run = os.environ["RUN_DIR"]
 runner = os.path.join("host", "vm-runner", ".build", "release", "VMRunner")
@@ -307,4 +319,57 @@ state = os.path.join(os.environ["RUN_DIR"], "m120c.virelaivm",
 if not os.path.isfile(state) or os.path.getsize(state) == 0:
     sys.exit("suspend left no non-empty saved-state/state.vzsave")
 print("suspended state saved: %d bytes" % os.path.getsize(state))
+PY
+
+# Run 08 is M120e's (#2562) forced-failure leg: `shutdown` in the script
+# powers the VM off through EFI ResetSystem (live-reboot's mechanism) —
+# the early-stop path's noteStop opens the drawer model and emits the
+# `host-inspector: postmortem … open=1` receipt, and the armed
+# --virtio-fs share routes the screenshot verb's PNG into
+# <share>/CAPTURES/ (the verb creates the dir — setup only mints the
+# share root). The screenshot trigger anchors on the boot banner so the
+# capture provably lands BEFORE the shutdown lands; the expected marker
+# never arrives, so the run ends on the VM's own death (rc 1).
+# warm-cold: 08 (b) the leg exercises guest power-off semantics, not restore.
+
+vgate_file script-fail.txt <<'EOF'
+shutdown
+EOF
+
+vgate_run 08 -- --screen '$RUN_DIR/screen8' --virtio-fs '$RUN_DIR/capshare8' \
+    --script '$RUN_DIR/script-fail.txt' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:screenshot' \
+    --script-expect '__M120E_NEVER__' --timeout 90
+vgate_allow_rc 08 1
+
+vgate_assert 08 serial-echo shutdown
+vgate_assert 08 output-contains 'host-ui: cmd=screenshot state=performed saved=1 file=screen8-hostui-1.png'
+vgate_assert 08 output-contains 'host-cap: saved '
+vgate_assert 08 output-contains 'host-inspector: postmortem ending=stopped'
+vgate_assert 08 output-contains 'open=1'
+vgate_assert 08 output-contains 'VM ended before the expected transcript'
+# The screenshot landed in CAPTURES and nowhere else — the routing, not
+# just the write.
+vgate_assert 08 snapshot 'capshare8/CAPTURES/screen8-hostui-*' <<'PY'
+import os, sys
+p = sys.argv[1]
+with open(p, "rb") as f:
+    head = f.read(8)
+if head != b"\x89PNG\r\n\x1a\n":
+    sys.exit("CAPTURES screenshot is not a PNG: %r" % head)
+if os.path.getsize(p) == 0:
+    sys.exit("CAPTURES screenshot is empty")
+print("⌘⇧5 landed in CAPTURES: %s (%d bytes)" % (p, os.path.getsize(p)))
+PY
+vgate_assert 08 python <<'PY'
+import glob, os, shutil, sys
+run = os.environ["RUN_DIR"]
+if glob.glob(os.path.join(run, "screen8-hostui-*")):
+    sys.exit("screenshot leaked outside CAPTURES into the run dir")
+# Lift the capture like run 05 does — the teardown's keep-file copy
+# reads $RUN_DIR/<basename>, and the share dies with the temp dir.
+caps = glob.glob(os.path.join(run, "capshare8", "CAPTURES", "*"))
+for f in caps:
+    shutil.copy(f, os.path.join(run, os.path.basename(f)))
+print("no run-dir leak; lifted %d CAPTURES file(s)" % len(caps))
 PY

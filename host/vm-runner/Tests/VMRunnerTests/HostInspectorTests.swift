@@ -138,11 +138,46 @@ final class HostInspectorTests: XCTestCase {
 
     func testNoteStopSetsTheCardAndOpensTheDrawer() {
         let model = HostInspector()
+        model.emit = { _ in }
         let card = PostmortemCard(ending: .crashed, state: "4",
                                 reason: "domain=VZErrorDomain code=1", serialLines: 17)
         model.noteStop(card)
         XCTAssertEqual(model.postmortem, card)
         XCTAssertTrue(model.isOpen, "a stop/crash opens the drawer itself")
+    }
+
+    /// M120e (#2562): the note emits the postmortem receipt a live leg
+    /// greps — and only ONCE: the polls' repeated observation of a
+    /// still-dead VM must not re-emit or re-open a closed drawer.
+    func testNoteStopEmitsThePostmortemReceiptOnce() {
+        let model = HostInspector()
+        var lines: [String] = []
+        model.emit = { lines.append($0) }
+        let card = PostmortemCard(ending: .stopped, state: "0",
+                                reason: "guest-powered-off", serialLines: 3)
+        model.noteStop(card)
+        model.isOpen = false // the operator closed the drawer
+        model.noteStop(card) // the next poll tick re-observes the same end
+        XCTAssertEqual(lines, ["host-inspector: postmortem ending=stopped state=0 open=1"])
+        XCTAssertFalse(model.isOpen, "a repeat note does not re-open the drawer")
+        XCTAssertEqual(model.postmortem, card)
+    }
+
+    /// M120e (#2562): the session window's drawer really un-hides on a
+    /// postmortem — the auto-open the card promises, read off the actual
+    /// split pane, not just the model flag.
+    func testPostmortemOpensTheSessionDrawer() {
+        let model = HostInspector()
+        model.emit = { _ in }
+        let host = HostApplication(serialLog: "/fixture/serial.log", inspector: model, presentWindow: false)
+        XCTAssertFalse(host.drawerVisible)
+        // A non-presented window still owns real bounds — lay the split
+        // out so the drawer's un-hide resolves against them.
+        host.window.contentView?.layoutSubtreeIfNeeded()
+        model.noteStop(PostmortemCard(ending: .crashed, state: "4",
+                                    reason: "domain=VZErrorDomain code=1", serialLines: 9))
+        XCTAssertTrue(host.inspectorVisible)
+        XCTAssertTrue(host.drawerVisible)
     }
 
     // MARK: - the verb receipts

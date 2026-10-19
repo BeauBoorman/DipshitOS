@@ -173,9 +173,23 @@ public final class HostInspector {
     /// guest is never a silently empty window.
     public private(set) var postmortem: PostmortemCard?
 
+    /// M120e (#2562): the receipt sink — the `host-inspector: postmortem`
+    /// line a live leg greps, on the same stdout stream the bus's
+    /// `host-ui:` receipts and the models' `host-*:` lines share (the
+    /// HostMachineModel emit precedent).
+    public var emit: (String) -> Void = {
+        FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
+    }
+
+    /// M120e (#2562): the first end noted wins. The card is a capture of
+    /// the moment the VM left running; the polls' repeated observation of
+    /// a still-dead VM is not a new end — it must not re-emit the
+    /// receipt, re-open a drawer the operator closed, or churn the view.
     public func noteStop(_ card: PostmortemCard) {
+        guard postmortem == nil else { return }
         postmortem = card
         isOpen = true
+        emit("host-inspector: postmortem ending=\(card.ending.rawValue) state=\(card.state) open=1")
         changed()
     }
 

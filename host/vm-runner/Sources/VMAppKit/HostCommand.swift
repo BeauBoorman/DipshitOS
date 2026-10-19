@@ -169,6 +169,15 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
     /// dispatch the identical seam.
     public let recorder = HostRecorder()
 
+    /// M120e (#2562): the capture destination + saved-badge model —
+    /// where ⌘⇧5 and recordings land (`<share>/CAPTURES`, profile-share
+    /// aware) and the transient "Saved <name>" truth the session window
+    /// mirrors. Carried like the other companions so a scripted
+    /// `--host-cmd-after` run resolves the identical seam; the runner's
+    /// screenshot registration reads it for its destination and its
+    /// `saved=/file=` receipt tail.
+    public let captures = HostCaptures()
+
     /// M127e (#2603): the AGENTD companion — audit-lane reader + the
     /// `lane-agent` choke's model, self-registering on the bus like the
     /// recorder. Injectable so a test owns its argv/share/endpoint
@@ -215,8 +224,15 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
         self.profiles.emit = self.emit
         self.machine = machine ?? HostMachineModel()
         self.machine.emit = self.emit
+        self.captures.emit = self.emit
         super.init()
         let recorder = self.recorder
+        let captures = self.captures
+        // M120e (#2562): the recorder shares the captures model's
+        // destination (a profile-armed share resolves too) and reports
+        // each finished take as a saved capture — the badge's other half.
+        recorder.capturesSource = { captures.resolvedDir() }
+        recorder.onSaved = { captures.noteSaved($0) }
         register(.record, Registration(
             isEnabled: { recorder.canStart },
             itemState: { recorder.isRecording },
