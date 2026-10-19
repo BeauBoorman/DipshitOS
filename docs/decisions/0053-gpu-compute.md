@@ -30,7 +30,7 @@ Pin, before implementation: the wire surface (capset, command,
 descriptor), the queue and fence semantics, the kernel library v1 as an
 ABI (shapes, dtypes, bounds), the buffer model and who allocates, the
 counters GOTOP displays, the memory budget against the guest's
-**256 MiB**, the model licence gate, and the file-level Touches for
+**512 MiB**, the model licence gate, and the file-level Touches for
 M111b–e. Out of scope: any code, any fourth kernel, and any general
 shader path.
 
@@ -81,9 +81,11 @@ only.
   objects it retains (`MetalRenderer.swift:81-88`); guest backing is the
   DMA window, not the storage. After upload the device-side copy is
   authoritative — a detached buffer remains valid for kernels.
-- **Guest RAM is 256 MiB (observed).**
-  `host/vm-runner/Sources/VMRunner/main.swift:1873`:
-  `config.memorySize = 256 * 1024 * 1024`.
+- **Guest RAM is 512 MiB (observed).**
+  `host/vm-runner/Sources/VMRunner/main.swift` computes
+  `config.memorySize = UInt64(memoryMiB) * 1024 * 1024` with the M129a
+  (#2610) compiled default `memoryMiB = 512` (the `--memory-mib` flag
+  overrides it per run).
 - **The syscall table ends at slot 87 (observed).**
   `kernel/src/syscall_abi.zig:154` is `row(87, "sys_getpid", .{})`;
   `slot_count = 128`. ADR 0054 reserved slots 88/89 for its grant-admin and audit rows; slot 90 is the next free row for this surface (amended post-merge — this ADR originally said 88 before 0054 landed). Slot 65 is
@@ -342,10 +344,11 @@ card's three numbers) plus the totals; a `VIC1`-absent boot shows the
 panel as **unsupported**, exactly as the netview tab shows absent
 devices — never a fabricated zero-load.
 
-## D7 — The memory budget against 256 MiB
+## D7 — The memory budget against 512 MiB
 
 Numbers, not adjectives. Device-resident means host Metal memory — it
-does not consume the VM's 256 MiB.
+does not consume the VM's 512 MiB (M129a #2610 raised the compiled
+default from 256 MiB).
 
 | consumer | guest-resident | device-resident (host) |
 |----------|---------------:|-----------------------:|
@@ -355,7 +358,7 @@ does not consume the VM's 256 MiB.
 | Weights, ≤ `max_buffer_bytes` × ≤ 16 buffers | 0 (streamed + sealed) | ≤ 64 MiB chosen by M111c |
 | Workspace/scratch for kernels | 0 | ≤ 16 MiB |
 | GOINFER app (weights file streaming in ≤ 4 MiB chunks, Go runtime, CPU-side activations/logits) | ≤ 32 MiB | — |
-| **Compute feature total** | **≤ ~44 MiB (≤ 18 % of the 256 MiB VM)** | ≤ 80 MiB |
+| **Compute feature total** | **≤ ~44 MiB (≤ 9 % of the 512 MiB VM)** | ≤ 80 MiB |
 
 The rule the number enforces: the model is chosen so that *weights ÷
 4 MiB* upload chunks stay bounded in count and the sealed footprint

@@ -383,6 +383,17 @@ pub fn stats() Stats {
     return state.stats();
 }
 
+/// End (exclusive) of the tracked physical window — `bitmap_base +
+/// span_pages * page_size`, the top of the RAM span the allocator can
+/// hand out. VZ anchors guest RAM at 0x7000_0000 growing upward (M129a
+/// #2610: 256 MiB tops at 0x8000_0000, 512 MiB at 0x9000_0000), so this
+/// is the honest "kernel pointer ceiling" the claim-9094 audit bounds
+/// used to hardcode as 0x8000_0000. Returns 0 when the pool is unarmed
+/// (host tests, pre-init faults); callers keep a fixed fallback for that.
+pub fn tracked_end() u64 {
+    return state.bitmap_base + state.span_pages * page_size;
+}
+
 pub fn largest_free_run() u64 {
     return state.largest_free_run();
 }

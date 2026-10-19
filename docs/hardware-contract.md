@@ -550,7 +550,7 @@ Non-PCI platform facts:
     marker + host-poll path (the M115 index's named fallback), since
     `VZVirtioFileSystemDeviceConfiguration` is already proven
     restore-safe (M83g above).
-- Config used: 256 MiB RAM, 2 vCPUs, optional virtio-gpu/sound/net devices
+- Config used: 512 MiB RAM, 2 vCPUs, optional virtio-gpu/sound/net devices
   (flag-gated; the default VM stays byte-identical without flags).
 - **A large image is not a RAM problem by itself, and the guest does not
   stage it.** [observed] `GOBIG.ELF` — a real stripped `GOOS=virelai` Go
@@ -561,7 +561,7 @@ Non-PCI platform facts:
   the image's declared segments (`text`/`rodata`/`data`, W^X) and holds no
   whole-file buffer for that shape — the 2 MiB staging array is only for
   DSK1/DSK3/contiguous-ELF/PT_INTERP images, which are still refused past
-  it. The image-independent ceiling is the physical allocator: 256 MiB of
+  it. The image-independent ceiling is the physical allocator: 512 MiB of
   guest RAM, against a 32 MiB acceptance bound on the file.
 - **A guest read of the host share costs one round trip per 2 KiB, and runs
   at ~30 MB/s.** [observed] `go-hello` run 04 has the guest read a 9,502,880 B
@@ -586,8 +586,9 @@ the monitor's `resources` command; the saturation run is
 `live-m16-resources` run 01 on this branch (2026-10-18): 13 concurrent
 `COUNTER.BIN`s take `tasks=3/16 → 16/16`, `procs=1/16 → 14/16`,
 `tables=38 → 306/512`, and the 14th `exec` prints `error: no free
-scheduler pool slot`. `live-sysinfo` run 01 reports `memory: usable=
-0x0febf000` (~255 MiB of the compiled 256 MiB).
+scheduler pool slot`. A `sysinfo`/`pages` read on the M129a (#2610)
+512 MiB boot reports `memory: usable=0x1febf000` (~511 MiB of the
+compiled 512 MiB; `pages: total=0x1febf free=0x1eeb8 excluded=0x1007`).
 
 | Bound | Ceiling | Symptom at the wall | Source / measured by |
 |-------|---------|---------------------|----------------------|
@@ -609,7 +610,7 @@ scheduler pool slot`. `live-sysinfo` run 01 reports `memory: usable=
 | vsock transport | 8 descriptors per queue; rx pool 4×2048 B; event pool 2×64 B; default host-listen port 1208 | unlistened port → `OP_RST` (`vsock: refused port=`) | `kernel/src/virtio_vsock.zig`; **[observed]** `live-vsock-restore` / M115a #2460 — connect accepted on 1208, RST on 9 |
 | Exec wait budget | `execWaitNs` = 15 s per spawned-child wait (the default `vi.Wait` budget is 120 s) | deadline → `vi.ErrWaitGone` ("wait: target not waitable") | `user/go/store/install.go`, `user/go/vi/proc.go`; **[observed]** M109f #2402 — a fresh-share FLINT clone lands `clone ok` ~21 s, past the bound: `live-agent-loop` run 06 fails 0/5 on a quiet host; margin card #2522 |
 | Host recorder | `hardCap` = 60 s at `fps` = 15 (≤ ~900 frames per take) | the cap timer ends the take honestly; receipt `recording=off frames=N bytes=B` | `HostRecorder.swift` (M114e #2458); **[observed]** `live-host-ui` run 05 drives record-start/record-stop; `HostRecorderTests` pin the cap |
-| Guest RAM (compiled default) | 256 MiB (`config.memorySize`); allocator bitmap + COW refcounts + identity map all span a fixed 4 GiB, so raising `memoryMiB` needs no kernel change | physical allocator exhausted → `out_of_memory` → ENOSPC `out of physical pages (text/stack/exception stack)` | `main.swift` `config.memorySize`; **[observed]** `live-sysinfo` `usable=0x0febf000`. M129a (#2610, parallel) moves the compiled default to 512 MiB — the task pool above stays the first concurrency binder |
+| Guest RAM (compiled default) | 512 MiB (`config.memorySize`; `--memory-mib <n>` overrides, bounded 64…2048). VZ anchors guest RAM at phys 0x7000_0000 growing upward (**[observed]** 256 MiB → [0x7000_0000, 0x8000_0000), 512 MiB → [0x7000_0000, 0x9000_0000)); the allocator bitmap + COW refcounts + identity map span a fixed 4 GiB from that base, and the user-stack VA band opens at 4 GiB, so RAM must stay below it — 2304 MiB is the hard geometry ceiling, 2048 the flag bound | physical allocator exhausted → `out_of_memory` → ENOSPC `out of physical pages (text/stack/exception stack)`; a guest whose RAM reached the fixed user `stack_va` used to fail `build_identity_map` at M2_TABLE (zero serial) — M129a (#2610) moved the boot stack VA to 0x1_8000_0000 | `main.swift` `config.memorySize`; **[observed]** `sysinfo`/`pages` on the 512 MiB boot: `usable=0x1febf000`, `total=0x1febf free=0x1eeb8 excluded=0x1007`. M129a (#2610) moved the compiled default 256 → 512 MiB — the task pool above stays the first concurrency binder |
 | Per-app RAM / exec image | file ≤32 MiB (`exec_image_max` → `image_too_large`); initialized bytes ≤32 MiB (`elf.load_max` → `segment_too_large`); mapped bytes ≤64 MiB (`elf.map_max` → `map_too_large`); one Go app costs ~45 MiB (32 MiB FIPS `.noptrbss` + eager BSS) | the named loader refusals, then `out_of_memory` past ~4-5 concurrent heavy apps | `kernel/src/exec.zig`/`elf.zig`, M72a #1579; per-app figure **[inferred]** from the index #2557 investigation — the M129a leg re-measures free pages at 512 |
 | Application timer | 1 countdown per process | second `sys_timer_set` re-arms the single slot (no queue) | `kernel/src/app_timers.zig`; **[observed]** `live-m16-resources` `timers=1` |
 

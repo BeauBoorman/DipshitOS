@@ -40,7 +40,14 @@ extern var __user_stack_end: u8;
 /// well inside the TTBR0 space and distinct from each other; the user root
 /// maps ONLY these two ranges, so every other VA faults at EL0.
 pub const text_va: u64 = 0x0040_0000; // 4 MiB
-pub const stack_va: u64 = 0x8000_0000; // 2 GiB
+// M129a (#2610): 6 GiB — inside the exec-path ASLR band [4 GiB, 8 GiB),
+// above the identity blanket AND above the guest-RAM span. VZ anchors
+// guest RAM at phys 0x7000_0000 growing upward (observed: 256 MiB ends at
+// 0x8000_0000, 512 MiB at 0x9000_0000); the old 2 GiB default landed ON a
+// kernel-live Normal leaf once RAM reached it, and the user-root clone's
+// kernel_live_leaf refusal failed build_identity_map at M2_TABLE — zero
+// serial. A VA above the whole RAM window never collides.
+pub const stack_va: u64 = 0x1_8000_0000;
 
 /// Current EL0 user stack VA. Defaults to the fixed `stack_va`; the exec
 /// path (milestone four, claim 2665) randomizes it from the seeded CSPRNG

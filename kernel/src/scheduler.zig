@@ -3258,15 +3258,25 @@ pub fn user_timer_preemption_count() u64 {
 /// recorded violations via `drain` (main context, inside `maybe_report`).
 ///
 /// Bounds are strict supersets of observed LEGAL values: kernel pointers
-/// (image, BSS stacks, allocator frames) sit in [0x1000, 0x80000000) — the
-/// top of the guest's 2 GiB RAM @ 0 (the same ceiling as
-/// exceptions.deep_dump; the SEA at 0x80000178 proves nothing maps at or
-/// above it in this class). User-space VAs (sp_el0, the randomized user
+/// (image, BSS stacks, allocator frames) sit in [0x1000, alloc's tracked
+/// span end). VZ anchors guest RAM at 0x7000_0000 growing upward — at the
+/// M129a (#2610) 512 MiB default the kernel image loads ~0x8d52e…, ABOVE
+/// the claim-9094 fixed 0x8000_0000 bound, so the ceiling follows
+/// `alloc.tracked_end()` (the claim-9094 constant is only the pre-init /
+/// host-test fallback; same source as exceptions.deep_dump's bound).
+/// User-space VAs (sp_el0, the randomized user
 /// stack) are LEGAL as task fields and deliberately not validated. Task
 /// names are kernel string literals ("worker", "user-exec", …); process
 /// names are copied into BSS name buffers — all kernel memory.
 pub const audit = struct {
+    /// Fallback ceiling when the pool is unarmed (host tests / pre-init).
     pub const ram_ceiling: u64 = 0x8000_0000;
+
+    /// The live ceiling: the allocator's tracked span end once armed.
+    fn ceiling() u64 {
+        const end = alloc.tracked_end();
+        return if (end != 0) end else ram_ceiling;
+    }
     pub const Tag = enum { vf, reap, tick, drain };
     pub const Field = enum(u8) { state, name_ptr, name_len, sp, elr, ttbr0, p_state, p_name_len, p_task_id, p_kstack, p_text, p_stack };
     const max_violations: usize = 8;
@@ -3301,12 +3311,12 @@ pub const audit = struct {
 
     /// Legal kernel pointer: 0 or a RAM-class address.
     fn valid_ptr(v: u64) bool {
-        return v == 0 or (v >= 0x1000 and v < ram_ceiling);
+        return v == 0 or (v >= 0x1000 and v < ceiling());
     }
 
     /// Legal physical root/table pointer: page-aligned RAM-class or 0.
     fn valid_aligned(v: u64) bool {
-        return v == 0 or ((v & 0xfff) == 0 and v >= 0x1000 and v < ram_ceiling);
+        return v == 0 or ((v & 0xfff) == 0 and v >= 0x1000 and v < ceiling());
     }
 
     /// NOTE: saved PSTATE is deliberately NOT validated — observed legal

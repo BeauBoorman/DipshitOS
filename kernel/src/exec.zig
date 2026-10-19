@@ -131,7 +131,7 @@ pub const lib_slot_count: usize = 8;
 /// loader will take, whatever its format. A file past it is refused
 /// `image_too_large` up front, by name, so the caller sees "bigger than the
 /// loader accepts" rather than a confusing allocator failure later. 32 MiB
-/// admits the 27 MB `cmd/compile` with headroom while leaving the 256 MiB
+/// admits the 27 MB `cmd/compile` with headroom while leaving the 512 MiB
 /// guest room for the image's own heap; the true ceiling above this one is
 /// the physical allocator (`out_of_memory` when the segments cannot be
 /// backed), which is a memory-plan question, not a loader one.

@@ -70,6 +70,8 @@
 //          close/Quit stop the VM, failures stay visible until dismissed)
 //         [--cpus <n>] (claim 907: VCPU count, default 2 — the four-core
 //          four-domain stress gate boots 4)
+//         [--memory-mib <n>] (M129a #2610: guest RAM in MiB, 64...2048,
+//          default 512 — wins over a profile's config.json memoryMiB)
 //         [--console] [--console-tcp [host:]port[:secret]] [--console-tcp-secret-file <path>]
 //          (M70g G2 #1459: secret from a file's first line, never argv)
 //         [--debug-input] [--dump-marker <file>]
@@ -568,7 +570,10 @@ var resumeFromPath: String?
 var applyUpdate = false
 var rollbackUpdate = false
 var updateKeyHex: String?
-var memoryMiB = 256
+var memoryMiB = 512
+// M129a (#2610): like --cpus, an explicit --memory-mib wins over a profile's
+// config.json memoryMiB; without it the bundle's stored value applies.
+var memoryMiBExplicit = false
 // Milestone seven card I2 (claim 4116): the minimal synthesized-key seam.
 // `--input-key <mac-keycode>` posts one keyDown (no keyUp) into the
 // VZVirtualMachineView after `--input-key-after <marker>` (default: the
@@ -1505,6 +1510,18 @@ while idx < arguments.count {
         cpuCount = n
         cpusExplicit = true
         idx += 2
+    } else if arg == "--memory-mib", idx + 1 < arguments.count {
+        // M129a (#2610): VZ anchors guest RAM at phys 0x7000_0000 growing
+        // upward (observed 256/512 MiB boots). The kernel's user-stack
+        // ASLR band opens at 4 GiB, so the guest's RAM top
+        // (0x7000_0000 + size) must stay below it — 2304 MiB is the hard
+        // geometry ceiling; 2048 is the bounded flag value under it.
+        guard let n = Int(arguments[idx + 1]), n >= 64, n <= 2048 else {
+            fail("--memory-mib requires a size in 64...2048, got '\(arguments[idx + 1])'.")
+        }
+        memoryMiB = n
+        memoryMiBExplicit = true
+        idx += 2
     } else if arg == "--timeout", idx + 1 < arguments.count {
         timeout = TimeInterval(arguments[idx + 1]) ?? 30
         timeoutExplicit = true
@@ -2293,7 +2310,7 @@ if let p = activeProfile {
         cvcEchoEnabled = true
     }
     if !cpusExplicit { cpuCount = p.config.cpus }
-    memoryMiB = p.config.memoryMiB
+    if !memoryMiBExplicit { memoryMiB = p.config.memoryMiB }
     displayMode = displayMode || p.config.devices.display
     inputMode = inputMode || p.config.devices.input
     soundMode = soundMode || p.config.devices.sound

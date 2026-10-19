@@ -1127,12 +1127,18 @@ test "mmu: #2430 — a block-split clone returns its scratch table to the carve-
     // build+free cycle leaked carve-out pages until `build_user_root`
     // returned table_full under exec churn.
     _ = new_table(); // consume index zero as the (zeroed) identity root
+    // The fixture aperture stays BELOW the blanket: a Device leaf there is
+    // overlayable by design (the GIC hole), so the clone splits the block.
+    // Above the blanket a Device leaf is a kernel-live window the clone
+    // must refuse — `userspace.stack_va` lives up there now (M129a #2610),
+    // so it can no longer serve as this fixture's VA.
+    const fixture_stack_va: u64 = 0x1a40_0000;
     try std.testing.expect(map_block(userspace.text_va & ~@as(u64, block_size - 1), .device));
-    try std.testing.expect(map_block(userspace.stack_va & ~@as(u64, block_size - 1), .device));
+    try std.testing.expect(map_block(fixture_stack_va & ~@as(u64, block_size - 1), .device));
     const baseline = tables_used();
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        const root = build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+        const root = build_user_root(userspace.text_va, 0x1000, 64, fixture_stack_va, 0x2000, 8192).?;
         try std.testing.expect(free_table_tree(root) > 0);
     }
     try std.testing.expectEqual(baseline, tables_used());

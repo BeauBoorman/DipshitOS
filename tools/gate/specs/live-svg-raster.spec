@@ -21,7 +21,7 @@ os_version = subprocess.check_output(["sw_vers", "-productVersion"], text=True).
 if cpu != "Apple M4" or ram != 17179869184 or not os_version.startswith("27.2"):
     sys.exit("not ADR 0041 reference time hardware")
 env = dict(cpu=cpu, ram=ram, macos=os_version, host_load=os.getloadavg(),
-           vm=dict(vcpus=2, ram=268435456, framework="Apple Virtualization.framework"),
+           vm=dict(vcpus=2, ram=536870912, framework="Apple Virtualization.framework"),
            build=dict(compiler="Go 1.27.1", mode="optimized", cgo=False, trimpath=True, ldflags="-s -w"))
 (OUT / "host-environment.json").write_text(json.dumps(env, indent=2)+"\n")
 print("observed reference host; prepared isolated no-UI acceptance share")
@@ -66,7 +66,7 @@ vgate_assert icons serial-contains 'procs SVG.ELF exited status=0'
 vgate_assert icons serial-absent 'svg-proof: FAIL'
 vgate_assert icons serial-absent '[EXC] parking:'
 vgate_assert icons serial-absent 'fatal error:'
-vgate_assert icons output-contains 'memory: 256 MiB, cpus: 2'
+vgate_assert icons output-contains 'memory: 512 MiB, cpus: 2'
 vgate_assert icons python <<'PY'
 import sys
 from pathlib import Path

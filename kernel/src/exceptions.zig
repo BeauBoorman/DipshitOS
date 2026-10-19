@@ -511,6 +511,17 @@ fn append_u64(buf: []u8, value: u64) usize {
     return out;
 }
 
+/// Top of the audited RAM window for the bounded SEA-proof reads below:
+/// the allocator's tracked span end (VZ anchors guest RAM at 0x7000_0000
+/// growing upward — M129a #2610 moved the kernel image to ~0x8d52e… at
+/// 512 MiB, above the old fixed bound). The claim-9094 2 GiB constant is
+/// kept only as the pre-init/unarmed fallback (host tests, a fault before
+/// the pool exists).
+fn audited_ram_top() u64 {
+    const end = alloc.tracked_end();
+    return if (end != 0) end else 0x8000_0000;
+}
+
 /// Claim 9094 (#810): EL1h data-abort deep dump. Prints the translation
 /// system registers, a bounded 4-level stage-1 walk of `far` (root from
 /// TTBR0_EL1, 4 KiB granules; bails on non-RAM table addresses), and the
@@ -557,15 +568,16 @@ pub fn deep_dump(buf: []u8, esr: u64, far: u64, elr: u64, raw_sp: u64) []const u
     var table: u64 = root;
     const shift_table = [_]u6{ 39, 30, 21, 12 };
     const block_mask = [_]u64{ 0, 0x3f_ffff, 0x1f_ffff, 0xfff };
-    // Claim 9094 lesson: every read here must stay below the RAM ceiling
-    // (0x80000000 = top of the guest's 2 GiB RAM @ 0 — the kernel image
-    // loads at ~0x7daa…, i.e. 2 GiB − 22 MiB; run-13 far=0x20080296 =
-    // 512 MiB+ region; NOT the "256 MiB @ 0x70000000" label guessed
-    // earlier). The first version's unbound walk/crawl recursed
+    // Claim 9094 lesson: every read here must stay below the RAM ceiling.
+    // The ceiling is the allocator's tracked span end, not a constant —
+    // VZ anchors guest RAM at 0x7000_0000 growing upward (M129a #2610:
+    // 256 MiB ends at 0x8000_0000, 512 MiB at 0x9000_0000), so the kernel
+    // image at 512 loads ~0x8d52e…, ABOVE the old fixed 0x80000000 bound.
+    // The first version's unbound walk/crawl recursed
     // SEA-on-SEA inside the dump itself (the run-7/8 storm ate the boot
     // stack to text); bounded reads are SEA-proof, so one hang = exactly
     // one clean dump.
-    const ram_ceiling: u64 = 0x8000_0000;
+    const ram_ceiling: u64 = audited_ram_top();
     var level: u4 = 0;
     var done = false;
     var walk_ok = true;
@@ -667,7 +679,7 @@ pub fn el1h_extras(buf: []u8, frame: *const VectorFrame, elr: u64) []const u8 {
     // Instruction words around elr (bounded RAM reads; text sits below the
     // RAM ceiling in the booted image). Read-only, SEA-proof by the bounds.
     pos += append_slice(buf[pos..], "[DEEP] insn@elr-16..elr+16:\n");
-    const ram_ceiling: u64 = 0x8000_0000;
+    const ram_ceiling: u64 = audited_ram_top();
     var i: i64 = -4;
     while (i <= 4) : (i += 1) {
         const addr = elr +% @as(u64, @bitCast(i * 4));
