@@ -16,7 +16,7 @@ uname
 roadpops
 EOF
 
-vgate_run 01 -- --screen '$RUN_DIR/gpu-screen' --script '$RUN_DIR/script.txt' --expect "roadpops: armed target=fbtext" --script-expect "roadpops: armed=1 dirty=1 presents=1" --script-expect-tail 5.0 --timeout 30
+vgate_run 01 -- --screen '$RUN_DIR/gpu-screen' --script '$RUN_DIR/script.txt' --expect "roadpops: armed target=fbtext" --script-expect "roadpops: armed=1" --script-expect-tail 5.0 --timeout 30
 
 # The capture path is host-permission dependent: SCK when Screen Recording
 # is granted, the runner's documented cacheDisplay fallback otherwise (the
@@ -24,7 +24,9 @@ vgate_run 01 -- --screen '$RUN_DIR/gpu-screen' --script '$RUN_DIR/script.txt' --
 # below notes which path ran; the glyph/tripwire asserts are the contract.
 vgate_assert 01 python <<'PY'
 import os, sys
-out = open(os.environ["VG_OUT"], errors="replace").read()
+# The runner's stdout lives at $RUN_DIR/run-<tag>.out (the python assert env
+# carries RUN_DIR/VG_SER/VG_TAG/VG_SHARE; VG_OUT is shell-only).
+out = open(os.path.join(os.environ["RUN_DIR"], "run-01.out"), errors="replace").read()
 if "capture path: ScreenCaptureKit" in out:
     print("capture path: ScreenCaptureKit")
 elif "capture path: cacheDisplay fallback" in out:
@@ -33,6 +35,18 @@ else:
     sys.exit("FAIL: no capture-path report in the runner output")
 PY
 vgate_assert 01 serial-contains 'roadpops: armed target=fbtext'
+# The presents counter is a liveness signal (>=1 since arm); both it and the
+# transient dirty flag race with the idle loop's drain cadence — banner +
+# prompt batches may drain separately (observed presents=2) or coalesce.
+vgate_assert 01 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"roadpops: armed=(\d) dirty=(\d) presents=(\d+)", ser)
+assert m, "roadpops report missing"
+assert m.group(1) == "1", "fbtext target not armed"
+assert int(m.group(3)) >= 1, "no present since arm: %s" % m.group(0)
+print("roadpops:", m.group(0))
+PY
 vgate_assert 01 serial-contains 'text: boot banner presented'
 vgate_assert 01 serial-contains 'VirelaiOS - AArch64 firmware-assisted kernel monitor'
 vgate_assert 01 serial-absent '[EXC] parking:'

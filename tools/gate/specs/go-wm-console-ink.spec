@@ -148,18 +148,21 @@ if rail_ink == 0:
     sys.exit("FAIL: the rail band is empty -- the seat painted nothing, so an "
              "empty uncovered region would prove nothing")
 
-# 2. The uncovered region must stay dark, except for the seat's two known
-# bottom controls. Pin their exact guest rectangles (chrome.go); do NOT
-# exempt the whole footer, and reject console-green even inside the controls.
+# 2. The uncovered region must stay dark, except for the seat's three known
+# bottom controls. Pin their exact guest rectangles (chrome.go/power.go:
+# Apps 224..319, PWR 324..351, clock 1124..1271 on the gy=692..711 band);
+# do NOT exempt the whole footer, and reject console-green even inside the
+# controls.
 def bottom_control(x, y):
     gx, gy = x * 1280 // w, y * 720 // h
     if 692 <= gy < 712:
         if 224 <= gx < 320: return "apps"
+        if 324 <= gx < 352: return "pwr"
         if 1124 <= gx < 1272: return "clock"
     return None
 
 tot = interior = green = 0
-controls = {"apps": 0, "clock": 0}
+controls = {"apps": 0, "pwr": 0, "clock": 0}
 for y in range(h // 3, h - MARGIN, STEP):
     for x in range(MARGIN, w - MARGIN, STEP):
         rgb = px(x, y)
@@ -268,14 +271,16 @@ for seq, owner, seat, captured, ns, cx, cy, shown in rows:
     # The rail must stay a composed rail; a full blue/chrome-only intermediate
     # frame or blank capture cannot pass because it lacks the dark client body.
     # Run 01 saves only its first-boot GOSH; run 02 restores it and execs one
-    # more GOSH, for two tabs. Only the focused cell is Accent, not the whole rail.
+    # more GOSH, for two tabs. §2.3.6 paints the rail as cell fills — idle
+    # cells are BtnIdle, the focused cell is Selection plus a 3px Accent
+    # marker — NOT an Accent flood, so the vote counts the cell-fill family.
     # The rail contract is that it stays composed — a frame captured mid-
     # repaint can legitimately lack it transiently, so count the frames
     # where the rail IS present and require the majority (the contract is
     # "the rail is there", not "every scanout instant shows it").
     rail_present = sum(
         1 for y in range(1, 20) for x in range(12, 1260)
-        if pixels[y*1280+x] == 0x3b82f6) >= (1280//rail_n - 40)*18
+        if pixels[y*1280+x] in (0x2a4460, 0x2d3748, 0x4a5568, 0x3b82f6)) >= (1280//rail_n - 40)*18
     rail_votes.append(rail_present)
     assert sum(max((p>>16)&255,(p>>8)&255,p&255) < 100 for p in pixels) >= 1280*720//2, "blue/chrome-only frame"
     if shown == "1":
