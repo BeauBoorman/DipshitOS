@@ -26,7 +26,7 @@ func testModel(entries ...vi.DirEntry) model {
 	m.setSize(64, 23)
 	copy(m.entries[:], entries)
 	m.n = len(entries)
-	sortEntries(m.entries[:], m.n)
+	sortEntries(m.entries[:], m.n, m.sort)
 	m.clampSel()
 	m.status = "listed"
 	m.previewOf = ""

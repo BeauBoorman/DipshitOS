@@ -143,7 +143,23 @@ func main() {
 			leaseFixture(strings.TrimPrefix(a, "--lease-fixture="))
 		}
 	}
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH})
+	// M125c (#2588): the state hooks. SaveState reads the live model (the
+	// closure captures the variable, so an ask always serializes the
+	// current session) and prints its own marker — a save is an action,
+	// not a frame. RestoreState fires inside tabapp.Init, before the model
+	// exists: it only decodes; the apply lands once the first listing is
+	// in and the envelope's appver has been checked below.
+	var m model
+	var restored filesState
+	var restoredOK bool
+	ta := tabapp.Init(tabapp.Config{
+		Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH,
+		StateVersion: stateFmtVer,
+		SaveState:    func() []byte { return m.encodeState() },
+		RestoreState: func(b []byte) {
+			restored, restoredOK = decodeState(b)
+		},
+	})
 	if ta == nil {
 		vi.ConsoleLine("gofiles: error open -1")
 		vi.Exit(1)
@@ -175,7 +191,35 @@ func main() {
 	}
 
 	cols, rows := gridOf(ta.W, ta.H)
-	m := newModel(startPath(), cols, rows)
+	// M125c (#2588): a re-exec'd or reopened tab may have delivered a
+	// stored blob. The envelope's appver is the app's own stale check —
+	// a blob saved under a different format version is refused by name,
+	// never silently misread. A saved cwd that no longer exists walks up
+	// to the nearest existing parent.
+	start := startPath()
+	fellBack := false
+	if ta.Restored && ta.RestoredVersion == stateFmtVer && restoredOK {
+		resolved, fell := resolveStatePath(restored.path)
+		start = resolved
+		fellBack = fell
+	}
+	m = newModel(start, cols, rows)
+	switch {
+	case ta.Restored && ta.RestoredVersion == stateFmtVer && restoredOK:
+		m.applyState(restored)
+		if fellBack {
+			m.emit(markerStateCwd + restored.path + " -> " + m.path)
+		}
+		m.emit(markerStateRestore + m.path +
+			" sel=" + vi.Itoa64(int64(m.sel)) +
+			" top=" + vi.Itoa64(int64(m.top)) +
+			" view=" + vi.Itoa64(int64(m.view)) +
+			" sort=" + vi.Itoa64(int64(m.sort)))
+	case ta.Restored && ta.RestoredVersion != stateFmtVer:
+		m.emit(markerStateRefused + "ver=" + vi.Itoa64(int64(ta.RestoredVersion)))
+	case ta.Restored:
+		m.emit(markerStateRefused + "bad blob")
+	}
 	if !paint(fd, m) {
 		shutdown(ta, fd, 4)
 	}
@@ -200,6 +244,20 @@ func main() {
 
 	var in [64]byte
 	for {
+		// M125c (#2588): the seat's save_state ask is mailbox traffic,
+		// not an input event — answer it once per pass so a snapshot or
+		// tab-close ask is serviced before the window dies. The marker
+		// prints only on an acked handoff — "the seat stored the blob" —
+		// never on silence or a refused post.
+		if ta.PollStateAsk() {
+			vi.ConsoleLine(markerStateSave + m.path +
+				" sel=" + vi.Itoa64(int64(m.sel)) +
+				" top=" + vi.Itoa64(int64(m.top)) +
+				" view=" + vi.Itoa64(int64(m.view)) +
+				" sort=" + vi.Itoa64(int64(m.sort)) +
+				" len=" + vi.Itoa64(int64(len(m.encodeState()))))
+		}
+
 		// Keys and mouse reports: the tty read is non-blocking (0 when
 		// the queue is empty).
 		n, _ := vi.FileRead(fd, in[:])

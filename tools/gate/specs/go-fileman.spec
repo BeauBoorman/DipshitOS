@@ -50,12 +50,21 @@
 # exact silent-loss shape (editor holds the file, manager deletes it, the
 # editor's next save resurrects it) the lease makes visible.
 #
+# M125c (#2588) adds runs 07/08: the session save/restore leg on the M125a
+# protocol — the same app under GOTABWM (the go-wm-tabs runs 12/13 shape).
+# Run 07 navigates into FM7/SUB7, moves the cursor, flips view mode and
+# sort, then ctrl-shift-s snapshots: the seat's kind-20 ask collects the
+# app's five-field blob into SESSION.TABS's `AS` trailer (asserted
+# byte-level). Run 08 is a fresh boot: the seat restores the file, re-execs
+# GOFILES.ELF, and the app's own `state restored` marker names the cwd,
+# cursor, scroll, view and sort it decoded — the same session resumed.
+#
 # exec-order: assert-proven -- each run ends on its own `rx-go-fileman-*`
 # marker, which only its closing script prints, and that script waits on the
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761: GOFILES navigates, previews, renames, trashes, restores, and opens files"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588: GOFILES navigates, previews, renames, trashes, restores, opens files, and resumes its session"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -213,6 +222,32 @@ os.makedirs(fm6, exist_ok=True)
 note6 = os.path.join(fm6, "NOTE.TXT")
 with open(note6, "w") as f:
     f.write("leased-file-body\nsecond line\n")
+# M125c (#2588): runs 07/08 — the session save/restore leg. FM7 holds one
+# subdirectory to descend into (SUB7, two files so `j` provably moves the
+# cursor onto DEEP2.TXT) plus a top-level file. The leg rides the Go seat,
+# so GOTABWM.ELF is staged here alongside the app.
+fm7 = os.path.join(share, "FM7")
+sub7 = os.path.join(fm7, "SUB7")
+os.makedirs(sub7, exist_ok=True)
+with open(os.path.join(sub7, "DEEP1.TXT"), "w") as f:
+    f.write("deep-one\n")
+with open(os.path.join(sub7, "DEEP2.TXT"), "w") as f:
+    f.write("deep-two\n")
+with open(os.path.join(fm7, "A7.TXT"), "w") as f:
+    f.write("a7\n")
+wm = os.path.join(".build", "go", "GOTABWM.ELF")
+if not os.path.exists(wm):
+    sys.exit("GOTABWM.ELF missing (expected " + wm + ") - build it first: "
+             "bash tools/go/build-gotabwm.sh")
+shutil.copy(wm, os.path.join(share, "GOTABWM.ELF"))
+# Runs 07/08 need the SEAT to be the scripted `exec GOTABWM.ELF`, not the
+# kernel's wm=gotabwm autostart default (M59 #1298): an autostarted seat
+# restores SESSION.TABS before the host share is staged for its re-exec,
+# and the restore leg must read the file run 07 left — not a second seat
+# that registers after the share is already up. go-wm-tabs seeds the same
+# schema-v2 file for the same reason.
+with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
+    f.write("#v2\nwm=none\n")
 
 print("staged GOFILES.ELF (%d bytes), GOEDIT.ELF (%d bytes), %s (%d bytes), "
       "%s (%d bytes), GOVIEW.ELF (%d bytes), %s (%d bytes), %s (%d bytes), "
@@ -598,3 +633,163 @@ if got != want:
     raise SystemExit(1)
 print("leased file verified untouched on the host (%d bytes)" % len(got))
 PY
+
+# --- M125c (#2588): run 07, session SAVE on the snapshot chord -------------
+# The same app under the Go seat (the go-wm-tabs run 12 shape): GOFILES
+# descends into FM7/SUB7, moves the cursor onto DEEP2.TXT, flips to the
+# full-width list view and name sort — so all five serialized fields are
+# non-trivial — then ctrl-shift-s. The seat posts the kind-20 ask, the app
+# stages `u8 fmtver | u16 pathLen | path | u16 sel | u16 top | u8 view |
+# u8 sort` at the rendezvous file and posts the request; the seat stores
+# the blob on the tab's SESSION.TABS record. The trailer is asserted
+# byte-level: AS magic, appver=1, and every field decoded back.
+vgate_file script-07.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+dui focus 0
+exec GOFILES.ELF /host/FM7
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+wm
+dui
+echo rx-go-fileman-state-save-ok
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/fileman-state-screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script-07.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'return,j,tab,s,ctrl-shift-s' \
+    --input-chords-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-go-fileman-state-save-ok' --timeout 300
+
+vgate_assert 07 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 07 serial-contains 'gotabwm: registered'
+vgate_assert 07 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 07 serial-contains 'gofiles: declare accepted'
+# A fresh tab honestly has no stored state — no restore marker may print.
+vgate_assert 07 serial-absent 'gofiles: state restored'
+vgate_assert 07 serial-absent 'gofiles: state refused'
+# The navigation and the two mode chords all landed.
+vgate_assert 07 serial-contains 'gofiles: cd /host/FM7/SUB7'
+vgate_assert 07 serial-contains 'gofiles: view DEEP2.TXT'
+vgate_assert 07 serial-contains 'gofiles: viewmode list'
+vgate_assert 07 serial-contains 'gofiles: sort name'
+# The SEAT's half: the snapshot chord asked the bound tab; the app staged
+# 23 bytes at appver 1 (ver 1 + u16 len + 14-byte path + u16 sel + u16 top
+# + view + sort) and the seat stored + republished the session carrying it.
+vgate_assert 07 serial-contains 'gotabwm: state ask id='
+vgate_assert 07 serial-contains 'gotabwm: state save id='
+vgate_assert 07 serial-contains 'len=23 ver=1'
+vgate_assert 07 serial-contains 'gofiles: state save /host/FM7/SUB7 sel=1 top=0 view=1 sort=1 len=23'
+vgate_assert 07 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 07 serial-absent 'gotabwm: state drop'
+# Byte-level on the share: the .tabs v2 AS trailer framing and the blob's
+# own five fields — byte identity is the card's claim, not a checksum.
+vgate_assert 07 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] != 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (b[0], b[2]))
+off = 6 + 69
+if len(b) < off + 6 + 8 + 23:
+    sys.exit("SESSION.TABS too short for a state trailer: %d" % len(b))
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 1:
+    sys.exit("app_state header %r" % b[off:off+6])
+ent = b[off+6:off+14]
+if ent[0] != 0 or ent[1] != 1:
+    sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
+ln = int.from_bytes(ent[4:8], "little")
+blob = b[off+14:off+14+ln]
+# GOFILES blob v1: u8 fmtver | u16 pathLen LE | path | u16 sel LE |
+# u16 top LE | u8 view | u8 sort.
+if len(blob) != 23 or blob[0] != 1:
+    sys.exit("blob len=%d fmtver=%d" % (len(blob), blob[0] if blob else -1))
+plen = int.from_bytes(blob[1:3], "little")
+path = blob[3:3 + plen].decode()
+o = 3 + plen
+sel = int.from_bytes(blob[o:o+2], "little")
+top = int.from_bytes(blob[o+2:o+4], "little")
+view, sort = blob[o+4], blob[o+5]
+if path != "/host/FM7/SUB7":
+    sys.exit("saved cwd %r is not where the gate navigated" % path)
+if sel != 1 or top != 0 or view != 1 or sort != 1:
+    sys.exit("saved fields sel=%d top=%d view=%d sort=%d "
+             "want 1/0/1/1" % (sel, top, view, sort))
+print("SESSION.TABS app_state: idx=0 appver=1 len=%d cwd=%s sel=%d top=%d "
+      "view=list sort=name" % (ln, path, sel, top))
+PY
+vgate_assert 07 serial-contains 'rx-go-fileman-state-save-ok'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+
+# --- M125c (#2588): run 08, the RESTORE half -------------------------------
+# A FRESH boot on the share run 07 left: the seat loads SESSION.TABS,
+# re-execs GOFILES.ELF (no argv — the recorded row carries only the bin),
+# and the app's restore_state request gets the blob back byte-intact.
+# The proof is the app's own verdicts: `state restored /host/FM7/SUB7`
+# names the cwd, `sel=1` the cursor — visible again as the DEEP2.TXT
+# preview — and view=1 sort=1 the two mode bytes.
+vgate_file script-08.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-08.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-08.txt <<'EOF'
+wm
+dui
+echo rx-go-fileman-state-restore-ok
+EOF
+
+vgate_run 08 -- \
+    --screen '$RUN_DIR/fileman-restore-screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script-08.txt' \
+    --script2 '$RUN_DIR/script2-08.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-08.txt' \
+    --script3-after 'gofiles: state restored' \
+    --script-expect 'rx-go-fileman-state-restore-ok' --timeout 300
+
+vgate_assert 08 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 08 serial-contains 'gotabwm: registered'
+vgate_assert 08 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 08 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 08 serial-contains 'gotabwm: session exec GOFILES.ELF'
+vgate_assert 08 serial-contains 'gotabwm: session live n=1'
+vgate_assert 08 serial-contains 'gofiles: declare accepted'
+# The seat staged the stored blob for the re-exec'd tab and the app's own
+# decode applied it — the full protocol leg.
+vgate_assert 08 serial-contains 'gotabwm: state restore id='
+vgate_assert 08 serial-contains 'len=23 ver=1'
+vgate_assert 08 serial-contains 'gofiles: state restored /host/FM7/SUB7 sel=1 top=0 view=1 sort=1'
+# cwd restored: the first listing is the descended directory, and the
+# cursor is back on DEEP2.TXT (the preview names the selected entry).
+vgate_assert 08 serial-contains 'gofiles: list /host/FM7/SUB7 n=2'
+vgate_assert 08 serial-contains 'gofiles: view DEEP2.TXT'
+vgate_assert 08 serial-contains 'gofiles: ready'
+vgate_assert 08 serial-absent 'gofiles: state refused'
+# No fallback: the saved cwd still exists, so `state cwd` must not print.
+vgate_assert 08 serial-absent 'gofiles: state cwd '
+vgate_assert 08 serial-absent 'gotabwm: state drop'
+vgate_assert 08 serial-contains 'rx-go-fileman-state-restore-ok'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 serial-absent 'exited status=139'
