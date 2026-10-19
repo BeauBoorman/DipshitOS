@@ -79,22 +79,36 @@ const (
 	markerDone    = "goterm: done status="
 	markerClose   = "goterm: close"
 	markerRestart = "goterm: restart"
-	markerOK      = "goterm OK"
-	markerMonitor = "goterm: monitor"
-	markerMonErr  = "goterm: monitor failed"
-	markerOpenErr = "goterm: error open "
-	markerTtyErr  = "goterm: no /dev/tty"
-	markerAttErr  = "goterm: attach failed"
+	// M125e (#2590): restore markers. `state restored` prints only after
+	// the replay write and env application returned; `state refused` is
+	// the decode's whole-blob rejection (stale/short/over-declared), so
+	// a gate asserting restored can never confuse a refused blob for one.
+	markerStateRestored = "goterm: state restored"
+	markerStateRefused  = "goterm: state refused"
+	markerOK            = "goterm OK"
+	markerMonitor       = "goterm: monitor"
+	markerMonErr        = "goterm: monitor failed"
+	markerOpenErr       = "goterm: error open "
+	markerTtyErr        = "goterm: no /dev/tty"
+	markerAttErr        = "goterm: attach failed"
 )
 
 func main() {
+	// M125e (#2590): the session-state owner. RestoreState runs inside
+	// Init — before the tty is open — so it decodes into ts and
+	// runSession replays/applies once the tty exists. SaveState reads
+	// the LIVE session's shell through ts.sh (rebound per restart).
+	ts := &termState{}
 	ta := tabapp.Init(tabapp.Config{
-		Name:  appName,
-		Title: appTitle,
-		X:     64,
-		Y:     48,
-		W:     natW,
-		H:     natH,
+		Name:         appName,
+		Title:        appTitle,
+		X:            64,
+		Y:            48,
+		W:            natW,
+		H:            natH,
+		StateVersion: termStateVersion,
+		SaveState:    ts.save,
+		RestoreState: ts.restore,
 	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
@@ -121,7 +135,7 @@ func main() {
 		ta.CloseAndExit(2)
 	}
 	vi.ConsoleLine(markerAttach)
-	runSession(ta, fd)
+	runSession(ta, fd, ts)
 }
 
 // runSession is the startup block + editor loop over the attached tty.
@@ -129,8 +143,8 @@ func main() {
 // by the engine, output painted by the kernel — they print no marker,
 // because go-wm-hid asserts `goterm: line ` is ABSENT when nobody typed),
 // prompt load, history load, ready, first prompt.
-func runSession(ta *tabapp.TabApp, fd uint32) {
-	hst := &termHost{fd: fd}
+func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
+	hst := &termHost{fd: fd, st: ts}
 	hist := &shlib.History{}
 	sink := &shlib.HistorySink{}
 	sh := shlib.NewShell(hst, hist)
@@ -145,6 +159,13 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 		return ta != nil && ta.TabAware && ta.SetTabTitle(s)
 	}
 
+	// M125e (#2590): a restored blob replays its captured stream tail
+	// read-only — the same emulator re-derives the grid and its scroll
+	// ring — before the first session's startup contract runs.
+	if ts.restored {
+		ts.applyReplay(fd)
+	}
+
 	// A terminal owns the window; a shell is one guest in that window. Keep
 	// the same fd, host, and history across restarts so the new shell has
 	// the same terminal contract and recall, but none of the old shell's
@@ -152,6 +173,10 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 	for session := 0; ; session++ {
 		if session > 0 {
 			sh = shlib.NewShell(hst, hist)
+		}
+		ts.sh = sh
+		if ts.restored && session == 0 {
+			vi.ConsoleLine(ts.restoredMarker(ts.applyEnv(sh, hst)))
 		}
 		for _, ln := range startupLines() {
 			_, act := sh.RunLine(ln)
@@ -177,7 +202,7 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 		}
 
 		vi.ConsoleLine(markerReady)
-		_, _ = vi.FileWrite(fd, editor.Repaint())
+		writeTTY(ts, fd, editor.Repaint())
 		vi.ConsoleLine(markerPrompt)
 		if session > 0 {
 			// This marker is deliberately after the prompt write returned.
@@ -205,7 +230,7 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 			// so it can never claim an execution that did not happen.
 			vi.ConsoleLine(markerDone + vi.Itoa64(int64(st)))
 			if act == shlib.ActionExit && policy == restartStay {
-				writeTTY(fd, []byte(restartMessage(st)))
+				writeTTY(ts, fd, []byte(restartMessage(st)))
 				restart = true
 			} else if act != shlib.ActionContinue {
 				leave(ta, fd, sh, act)
@@ -220,7 +245,7 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 				// been `cd` — and the editor's own bytes are written, so
 				// this prompt is the one the next in-line repaint uses.
 				editor.SetPrompt(loadPrompt())
-				writeTTY(fd, editor.PromptBytes())
+				writeTTY(ts, fd, editor.PromptBytes())
 				// M98h: the tab title follows the cwd.
 				titles.Sync(shlib.TitleFor("Term", sh.Pwd()), sendTitle)
 				// M98f: bytes typed while a foreground child ran sit
@@ -235,7 +260,7 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 		}
 		handle = func(out []byte, ev shlib.EditEvent) {
 			if len(out) > 0 {
-				writeTTY(fd, out)
+				writeTTY(ts, fd, out)
 			}
 			switch ev.Kind {
 			case shlib.EvSubmit:
@@ -247,9 +272,9 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 				// says so and puts the original line back.
 				lines, err := sh.EditLine(ev.Line)
 				if err != nil {
-					writeTTY(fd, []byte("gosh: edit: "+err.Error()+"; line not run\r\n"))
+					writeTTY(ts, fd, []byte("gosh: edit: "+err.Error()+"; line not run\r\n"))
 					editor.SetValue(ev.Line)
-					writeTTY(fd, editor.Repaint())
+					writeTTY(ts, fd, editor.Repaint())
 					break
 				}
 				for _, ln := range lines {
@@ -264,8 +289,8 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 					return
 				}
 				eofPending = true
-				writeTTY(fd, []byte("\r\ngoterm: press Ctrl-D again to close\r\n"))
-				writeTTY(fd, editor.Repaint())
+				writeTTY(ts, fd, []byte("\r\ngoterm: press Ctrl-D again to close\r\n"))
+				writeTTY(ts, fd, editor.Repaint())
 			case shlib.EvCancel:
 				eofPending = false
 				// The editor already painted ^C and the fresh prompt.
@@ -274,6 +299,10 @@ func runSession(ta *tabapp.TabApp, fd uint32) {
 
 		var readBuf [64]byte
 		for !restart {
+			// M125e (#2590): the seat's save notice is a mailbox message,
+			// not an input event — answer it each pass so a snapshot or
+			// tab-close ask is serviced before the window dies.
+			ta.PollStateAsk()
 			n, _ := vi.FileRead(fd, readBuf[:])
 			if n > 0 {
 				handle(editor.Feed(readBuf[:n]))
@@ -329,7 +358,7 @@ func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
 	ta.CloseAndExit(status)
 }
 
-func writeTTY(fd uint32, b []byte) {
+func writeTTY(ts *termState, fd uint32, b []byte) {
 	for len(b) > 0 {
 		n := len(b)
 		if n > ttyWriteMax {
@@ -337,6 +366,11 @@ func writeTTY(fd uint32, b []byte) {
 		}
 		if _, r := vi.FileWrite(fd, b[:n]); r < 0 {
 			return
+		}
+		// M125e (#2590): the scrollback ring captures what was actually
+		// written — a refused chunk leaves no phantom bytes behind.
+		if ts != nil {
+			ts.capture(b[:n])
 		}
 		b = b[n:]
 	}
@@ -440,6 +474,7 @@ func startupLinesFrom(body string) []string {
 // seam between the two front-ends when the Touches allow touching both.
 type termHost struct {
 	fd   uint32
+	st   *termState // M125e (#2590): the scrollback tee + alt tracker
 	poll *shlib.TTYPoll
 }
 
@@ -447,7 +482,7 @@ func (g *termHost) Marker(line string) { vi.ConsoleLine(line) }
 
 // Out writes command output to the attached tty; the kernel paints it
 // into the window (ADR 0020 A4).
-func (g *termHost) Out(b []byte) { writeTTY(g.fd, b) }
+func (g *termHost) Out(b []byte) { writeTTY(g.st, g.fd, b) }
 
 // candidateNames expands name the way SH.BIN's resolver did: bare, .ELF
 // and .BIN suffixes, uppercase variants, in that order.
