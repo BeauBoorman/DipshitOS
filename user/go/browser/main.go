@@ -93,13 +93,24 @@ const (
 	markerBmErr     = "web: bookmark error"
 	markerCleared   = "web: cleared "
 	markerDownload  = "web: download "
-	markerBudget    = "web: budget "
-	markerOver      = "web: budget over "
-	markerHistOpen  = "web: history n="
-	markerHistRow   = "web: history "
-	markerHistPick  = "web: history pick "
-	markerFind      = "web: find "
-	markerFindHit   = "web: find hit="
+	// M126e (#2597): the download-flow markers — start/progress/done/
+	// cancelled/failed for the transfer itself, toast for the seat
+	// notice's verdict, open/folder for the completion plate's actions.
+	markerDlStart    = "web: download start "
+	markerDlProgress = "web: download progress "
+	markerDlDone     = "web: download done "
+	markerDlCancel   = "web: download cancelled "
+	markerDlFailed   = "web: download failed "
+	markerDlToast    = "web: download toast "
+	markerDlOpen     = "web: download open "
+	markerDlFolder   = "web: download folder "
+	markerBudget     = "web: budget "
+	markerOver       = "web: budget over "
+	markerHistOpen   = "web: history n="
+	markerHistRow    = "web: history "
+	markerHistPick   = "web: history pick "
+	markerFind       = "web: find "
+	markerFindHit    = "web: find hit="
 	// M125d (#2589): the session-state markers. `web: state restored` prints
 	// inside loadBody once the stored blob's fields re-applied to the fresh
 	// layout; `web: state refused` names a torn or foreign-version blob that
@@ -165,6 +176,7 @@ const (
 	keyS        = 0x16
 	keyH        = 0x0b
 	keyF        = 0x09
+	keyO        = 0x12
 	keyReturn   = 0x28
 )
 
@@ -278,6 +290,10 @@ type app struct {
 	memoryRemaining  int64
 	pageCancelled    bool
 	pendingEvents    []vi.Event
+	// M126e (#2597): the single-flight download — non-nil while a staged
+	// write is in flight AND while its completion plate is up (the plate's
+	// Open/Folder chips keep a target through a.dl).
+	dl *download
 	// M125d (#2589): the decoded session blob parked by noteState, consumed
 	// once by applyState on the first laid-out page after restore.
 	pend *webState
@@ -551,6 +567,15 @@ func (a *app) loop() {
 		}
 		// M125d (#2589): service a pending seat save ask once per pass.
 		a.pollStateAsk()
+		// M126e (#2597): the seat's kind-23 cancel and the staged write
+		// both advance here — the download keeps the loop's 1 ms pacing
+		// while it is in flight so the bar stays live.
+		if a.dl != nil && a.dl.active {
+			if op, ok := vi.PollProgressCancel(uint32(a.win)); ok && op == downloadOp {
+				a.cancelDownload()
+			}
+			a.dlStep()
+		}
 		ev, raw, ok := vi.Event{}, int64(0), false
 		if len(a.pendingEvents) > 0 {
 			ev, ok = a.pendingEvents[0], true
@@ -572,7 +597,8 @@ func (a *app) loop() {
 			// latency, and quiet tasks leave the shell's idle loop (which
 			// paces the composite and services the scanout snapshot) room
 			// to run on this single-user machine.
-			if a.loading || a.urlEditing || a.target == "" {
+			if a.loading || a.urlEditing || a.target == "" ||
+				(a.dl != nil && a.dl.active) {
 				vi.Sleep(1)
 			} else {
 				vi.Sleep(10)
@@ -608,6 +634,11 @@ func (a *app) loop() {
 			a.render()
 			a.dirty = false
 		}
+	}
+	// A window close mid-write is a cancel: the partial file must not
+	// outlive the app on the share looking like a finished download.
+	if a.dl != nil && a.dl.active {
+		a.cancelDownload()
 	}
 	vi.ConsoleLine(markerQuit)
 	vi.WinClose(a.win)
@@ -1121,6 +1152,17 @@ func (a *app) key(usage uint32, flags uint16) {
 	case keyQ:
 		a.quit = true
 	case keyEscape, keyX:
+		// The stop keys own every in-flight thing: an active download
+		// first, then a page load. On a completed plate they dismiss it.
+		if a.dl != nil {
+			if a.dl.active {
+				a.cancelDownload()
+			} else {
+				a.dl = nil
+				a.dirty = true
+			}
+			return
+		}
 		a.cancelLoad()
 	case keyB:
 		if ctrl {
@@ -1153,12 +1195,25 @@ func (a *app) key(usage uint32, flags uint16) {
 		a.status = "cache cleared"
 		a.dirty = true
 	case keyS:
-		if a.saveDownload() {
-			a.status = "saved to the share"
-			a.dirty = true
+		// 's' saves the loaded page body through the staged download
+		// flow (M126e): progress bar, seat row, completion plate, and
+		// the ledger row all come from the same path as a link download.
+		if len(a.lastBody) > 0 && a.target != "" && ledgerFieldOK(a.target) {
+			a.startDownload(a.target, a.lastBody)
 		}
 	case keyR, keyF5:
 		a.reload()
+	case keyO:
+		// Completion plate's Open — dispatch the saved file through
+		// mime.Open, the same contract GOFILES holds.
+		if a.dl != nil && a.dl.done {
+			a.openDownload()
+		}
+	case keyF:
+		// Completion plate's Show in Folder — GOFILES at the share root.
+		if a.dl != nil && a.dl.done {
+			a.folderDownload()
+		}
 	case keyH:
 		a.toggleHistoryMenu()
 	case keyUp:
@@ -1255,6 +1310,12 @@ func (a *app) click(x, y int) {
 		a.dirty = true
 		return
 	}
+	// M126e (#2597): the completion plate floats above the page — its
+	// chips act and the rest of the plate consumes the click so it cannot
+	// fall through to a link underneath.
+	if a.dlToastHitTest(x, y, w, h) {
+		return
+	}
 	if fieldHit {
 		a.focusURL()
 		return
@@ -1274,6 +1335,14 @@ func (a *app) click(x, y int) {
 		from := a.target
 		resolved, kind := resolveInput(relativeTo(from, target))
 		if kind == "empty" {
+			return
+		}
+		// M126e (#2597): a link whose target the sniff table already
+		// knows is non-text is a download, not a navigation — the
+		// browser renders HTML only, so saving the bytes is the honest
+		// result (an image link in GOVIEW, not markup noise on screen).
+		if kind != "unsupported" && wantsDownload(resolved) {
+			a.startDownload(resolved, nil)
 			return
 		}
 		a.navigate(resolved, from)
@@ -1475,7 +1544,23 @@ func (a *app) render() {
 
 	// Status line (drawn last so nothing can cover it).
 	rect(0, height-statusH, width, statusH, webrender.ColorChromeBg)
-	webrender.DrawText(vs, 6, height-statusH+2, fit(a.statusText(), width/8-2), 1, false, webrender.ColorMuted, clip)
+	statusCols := width/8 - 2
+	if a.dl != nil && a.dl.active {
+		// The progress bar owns the status line's right edge while a
+		// write is in flight; the text yields those columns to it.
+		statusCols -= dlBarW/8 + 2
+	}
+	webrender.DrawText(vs, 6, height-statusH+2, fit(a.statusText(), statusCols), 1, false, webrender.ColorMuted, clip)
+	// M126e (#2597): the in-flight bar on the status line, then the
+	// completion plate — last, so no other chrome covers it.
+	if a.dl != nil {
+		if a.dl.active {
+			a.paintDlBar(vs, width, height)
+		}
+		if a.dl.done {
+			a.paintDlToast(vs, width, height)
+		}
+	}
 
 	processed := f.Flush()
 	a.lastFills = processed
