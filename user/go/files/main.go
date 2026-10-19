@@ -71,6 +71,11 @@ func drainLaunch(m *model) {
 	if err != nil {
 		vi.ConsoleLine(markerOpenLaunchNo + baseName(r.path) +
 			" handler=" + r.bin + " err=" + err.Error())
+		// M123d (#2578): the refusal also stands inside the app — the
+		// shared error banner takes the status row with Copy Error and
+		// dismiss. The raise is post-paint, so bannerFresh makes the
+		// caller paint the strip's own frame next.
+		m.raiseExecRefusal(r.bin, err)
 		return
 	}
 	vi.ConsoleLine(markerOpenLaunched + baseName(r.path) +
@@ -107,6 +112,24 @@ func settle(m *model) {
 	m.renamedBatch = false
 	vi.Sleep(50) // hundreds of ms: the screenshot at the rename marker finishes first
 	vi.ConsoleLine(markerSettled)
+}
+
+// settleBanner paints the frame a post-paint banner raise is owed
+// (M123d #2578): drainLaunch's exec outcome lands after the batch's own
+// paint, so without this the strip would wait for the user's next event
+// to appear. The repaint reuses the batch barrier — paint, yield, flush —
+// so the `gofiles: banner …` marker still follows the frame that shows it.
+func settleBanner(m *model, fd uint32, ta *tabapp.TabApp) bool {
+	if !m.bannerFresh {
+		return true
+	}
+	m.bannerFresh = false
+	if !paint(fd, *m) {
+		return false
+	}
+	vi.Sleep(1)
+	flush(m, ta)
+	return true
 }
 
 // leaseFixture stamps a FOREIGN live lease record on the target path before
@@ -493,6 +516,9 @@ func onKey(m *model, fd uint32, ev keys.Event, ta *tabapp.TabApp) bool {
 	vi.Sleep(1)
 	flush(m, ta)
 	drainLaunch(m)
+	if !settleBanner(m, fd, ta) {
+		return false
+	}
 	vi.ConsoleLine(markerKey + keyLabel(ev))
 	vi.ConsoleLine(markerRepaint)
 	settle(m)
@@ -542,6 +568,9 @@ func onMouse(m *model, fd uint32, b, x, y int, released bool, ta *tabapp.TabApp)
 		vi.Sleep(1)
 		flush(m, ta)
 		drainLaunch(m)
+		if !settleBanner(m, fd, ta) {
+			return false
+		}
 		vi.ConsoleLine(markerRepaint)
 	}
 	if dragMove && m.pressRow >= 0 && !m.dragOn {

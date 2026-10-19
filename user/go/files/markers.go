@@ -88,6 +88,14 @@ const (
 	markerMenuSub   = "gofiles: menu openwith "
 	markerMenuClose = "gofiles: menu closed "
 
+	// M123d (#2578): the shared in-app error banner. `banner` is the raise
+	// — the failure text the strip shows; `banner act` is the resolution,
+	// naming the action ID that ran (replace/copy/cancel/dismiss) or the
+	// refusal that kept it from running. Both ride `pending`, so each
+	// line lands only after the frame that shows the strip.
+	markerBanner    = "gofiles: banner "
+	markerBannerAct = "gofiles: banner act "
+
 	// M127d (#2602): "Export to Host". The marker names the staged
 	// payload (and the OUTBOX name it landed under when it differs);
 	// refusals carry the lane vocabulary word the stage returned.

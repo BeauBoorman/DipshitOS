@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -139,7 +140,8 @@ func TestRenamePromptFlowAndRefusalMarkers(t *testing.T) {
 		t.Fatalf("prompt must close on commit, mode=%d", m.mode)
 	}
 
-	// Existing target: refused by name, still no syscall.
+	// Existing target: refused by name, still no syscall — and the M123d
+	// conflict banner stands until it is answered.
 	m.handleKey(runeKey('r'))
 	for _, r := range "SUB" {
 		m.handleKey(runeKey(r))
@@ -147,6 +149,22 @@ func TestRenamePromptFlowAndRefusalMarkers(t *testing.T) {
 	m.handleKey(keys.Event{Key: keys.KeyEnter})
 	if got := pendingJoined(&m); !strings.Contains(got, markerRenameNo) || !strings.Contains(got, "exists") {
 		t.Fatalf("existing-name refusal missing: %q", got)
+	}
+	if !m.banner.Open {
+		t.Fatal("a name-exists refusal must raise the Replace/Cancel banner")
+	}
+	// While the banner stands the list's bindings stay dead — 'r' must not
+	// reopen the prompt under it.
+	m.handleKey(runeKey('r'))
+	if m.mode == modeRename {
+		t.Fatal("a key under the open banner must not reach the list bindings")
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEsc})
+	if m.banner.Open || m.status != "rename cancelled" {
+		t.Fatalf("esc must dismiss the banner: open=%v status=%q", m.banner.Open, m.status)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerBannerAct+"dismiss") {
+		t.Fatalf("banner dismissal marker missing: %q", got)
 	}
 
 	// Valid target: the syscall runs; the host is ENOSYS, so the marker
@@ -161,6 +179,118 @@ func TestRenamePromptFlowAndRefusalMarkers(t *testing.T) {
 	}
 	if m.renamedBatch {
 		t.Fatal("a failed rename must not arm the settle marker")
+	}
+}
+
+func TestRenameConflictBannerArms(t *testing.T) {
+	// Cancel (digit 2, or Enter on the safe-last default) leaves both
+	// entries untouched.
+	m := testModel(entry("SUB", true), entry("KNOWN.TXT", false))
+	m.handleKey(keys.Event{Key: keys.KeyDown})
+	m.handleKey(runeKey('r'))
+	for _, r := range "SUB" {
+		m.handleKey(runeKey(r))
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEnter})
+	if !m.banner.Open {
+		t.Fatal("conflict did not raise the banner")
+	}
+	if line := m.statusLine(); !strings.Contains(line, "[1] Replace") ||
+		!strings.Contains(line, "[2] Cancel") || !strings.Contains(line, "SUB exists") {
+		t.Fatalf("status row must carry the conflict chord menu: %q", line)
+	}
+	m.handleKey(runeKey('2'))
+	if m.banner.Open {
+		t.Fatal("cancel left the banner open")
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerBannerAct+"cancel") {
+		t.Fatalf("cancel act marker missing: %q", got)
+	}
+	if m.status != "rename cancelled" {
+		t.Fatalf("cancel status = %q", m.status)
+	}
+
+	// Copy Error (c) publishes the text and names it on the act marker.
+	m.handleKey(runeKey('r'))
+	for _, r := range "SUB" {
+		m.handleKey(runeKey(r))
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEnter})
+	m.handleKey(runeKey('c'))
+	if m.banner.Open {
+		t.Fatal("copy left the banner open")
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerBannerAct+"copy") {
+		t.Fatalf("copy act marker missing: %q", got)
+	}
+
+	// Replace onto a DIRECTORY refuses before the op path — trashing a
+	// whole tree is not what Replace means.
+	m.handleKey(runeKey('r'))
+	for _, r := range "SUB" {
+		m.handleKey(runeKey(r))
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEnter})
+	m.handleKey(runeKey('1'))
+	if m.banner.Open {
+		t.Fatal("replace left the banner open")
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerBannerAct+"replace refused dir") {
+		t.Fatalf("dir replace must refuse: %q", got)
+	}
+}
+
+func TestRenameConflictReplaceFile(t *testing.T) {
+	// Replace (digit 1) onto a file runs delete-the-incumbent then the held
+	// rename — on the host the delete is ENOSYS, so the refusal marker
+	// proves the arm reached the op path instead of silently succeeding.
+	m := testModel(entry("KNOWN.TXT", false), entry("OTHER.TXT", false))
+	m.handleKey(keys.Event{Key: keys.KeyDown}) // sel = OTHER.TXT
+	m.handleKey(runeKey('r'))
+	for _, r := range "KNOWN.TXT" {
+		m.handleKey(runeKey(r))
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEnter})
+	if !m.banner.Open {
+		t.Fatal("file-name conflict did not raise the banner")
+	}
+	m.handleKey(runeKey('1'))
+	if m.banner.Open {
+		t.Fatal("replace left the banner open")
+	}
+	got := pendingJoined(&m)
+	if !strings.Contains(got, markerBannerAct+"replace refused rc=-4") {
+		t.Fatalf("replace arm should reach the syscall (host ENOSYS): %q", got)
+	}
+	if !strings.Contains(m.status, "refused") {
+		t.Fatalf("replace-refused status = %q", m.status)
+	}
+}
+
+func TestExecRefusalRaisesBanner(t *testing.T) {
+	// The drainLaunch arm (raiseExecRefusal is model-pure; main.go's own
+	// seam is guest-tagged): a refused vi.Exec raises the banner with no
+	// actions — Copy Error and dismiss are the only answers.
+	m := testModel(entry("KNOWN.TXT", false))
+	m.raiseExecRefusal("MISSING.ELF", errors.New("ENOENT"))
+	if !m.banner.Open {
+		t.Fatal("an exec refusal must raise the banner")
+	}
+	if !m.bannerFresh {
+		t.Fatal("a post-paint raise must ask main for the strip's frame")
+	}
+	if !strings.Contains(m.banner.Text, "MISSING.ELF") || !strings.Contains(m.banner.Text, "ENOENT") {
+		t.Fatalf("banner text = %q", m.banner.Text)
+	}
+	if len(m.banner.Actions) != 0 {
+		t.Fatal("an exec refusal carries no contextual actions")
+	}
+	m.bannerKey(runeKey('c'))
+	if got := pendingJoined(&m); !strings.Contains(got, markerBannerAct+"copy") {
+		t.Fatalf("copy resolution missing: %q", got)
+	}
+	if m.status != "error copied" {
+		t.Fatalf("copied status = %q", m.status)
 	}
 }
 

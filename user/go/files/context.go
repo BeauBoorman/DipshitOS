@@ -137,6 +137,11 @@ func (m *model) ctxSubLabels() []string {
 // list: a press on a row selects it and arms the menu there; a press off
 // the list dismisses an open menu and is otherwise a no-op.
 func (m *model) handleRightClick(x, y int) {
+	// M123d (#2578): no menu may open while the error banner stands — the
+	// strip is answered first.
+	if m.banner.Open {
+		return
+	}
 	col, row := x-1, y-1
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() ||
 		col >= m.listCols() {

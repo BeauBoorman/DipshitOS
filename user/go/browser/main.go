@@ -19,6 +19,7 @@ package main
 import (
 	"strings"
 
+	"virelai/appkit"
 	"virelai/settings"
 
 	"virelai/vi"
@@ -308,6 +309,13 @@ type app struct {
 	// M124b (#2581): the save-as picker — Ctrl+Shift+S raises the shared
 	// appkit.FilePicker modal, which owns input and paint while open.
 	pick savePick
+	// M123d (#2578): the shared appkit.ErrorBanner — the inline strip at
+	// the top of the content band for load/download/exec failures. bannerOp
+	// names the arm a retry replays ("load"/"download"), bannerTarget what
+	// it replays against; banner.go owns the raise/route/resolve/draw half.
+	banner       appkit.ErrorBanner
+	bannerOp     string
+	bannerTarget string
 }
 
 // virender adapts the kernel fill batcher to the renderer's Surface.
@@ -685,6 +693,9 @@ func (a *app) showStartSurface() {
 }
 
 func (a *app) navigate(target, from string) {
+	// M123d (#2578): a fresh navigation retires a standing error banner —
+	// its text describes the load the user just moved on from.
+	a.banner.Open = false
 	if from != "history-back" && from != "history-forward" {
 		a.historyMove = false // a replacement navigation is a fresh visit
 	}
@@ -1159,6 +1170,13 @@ func (a *app) setError(kind, target string) {
 	a.title = "Error"
 	a.logPaint = true
 	vi.ConsoleLine(markerError + kind)
+	// M123d (#2578): the failure also stands inline — the error page names
+	// what happened; the banner carries the actionable half (Retry on the
+	// transient kinds, Copy Error always). "cancelled" is the user's own
+	// stop, never a failure to answer.
+	if kind != "cancelled" {
+		a.raiseLoadBanner(kind, target)
+	}
 	a.dirty = true
 }
 
@@ -1275,6 +1293,12 @@ func (a *app) key(usage uint32, flags uint16) {
 func (a *app) click(x, y int) {
 	if a.pick.open { // M124b: the modal owns the click, wherever it lands
 		a.pickClick(x, y)
+		return
+	}
+	// M123d (#2578): a press inside the error strip is the banner's —
+	// buttons choose, × dismisses, the plate swallows; a press outside
+	// falls through to chrome and page as usual.
+	if a.bannerClick(x, y) {
 		return
 	}
 	w, h := a.canvasSize()
@@ -1596,6 +1620,9 @@ func (a *app) render() {
 			a.paintDlToast(vs, width, height)
 		}
 	}
+	// M123d (#2578): the error strip floats the top of the content band —
+	// above the page and the download plate, under the modal picker.
+	a.paintBanner(vs)
 
 	if a.pick.open { // M124b: the modal plate paints over chrome+status
 		a.paintPick()
