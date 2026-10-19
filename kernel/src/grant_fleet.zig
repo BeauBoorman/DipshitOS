@@ -22,6 +22,7 @@ pub const rows = [_]grant.BaseRow{
     .{ .name = "PULSE.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_timer | grant.word_memory | grant.word_process | grant.word_debug | grant.word_term },
     .{ .name = "GOSH.ELF", .sha256 = null, .words = grant.word_file | grant.word_memory | grant.word_process | grant.word_debug | grant.word_term },
     .{ .name = "GOHELP.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_memory | grant.word_process | grant.word_debug | grant.word_term },
+    .{ .name = "GOWELCOME.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_memory | grant.word_process | grant.word_debug },
     .{ .name = "GOTOP.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_memory | grant.word_process | grant.word_debug | grant.word_net },
     .{ .name = "GOSET.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_memory | grant.word_process | grant.word_debug },
     .{ .name = "GODIFF.ELF", .sha256 = null, .words = grant.word_file | grant.word_memory | grant.word_process | grant.word_debug },

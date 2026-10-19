@@ -80,6 +80,11 @@ const (
 	MarkerDogfoodSeat        = "dogfood: seat"
 	MarkerDogfoodOK          = "dogfood: ok"
 	MarkerFirstBootWorkspace = "gotabwm: first-boot workspace"
+	// M122b (#2571): the seat's successful exec of the first-boot tour —
+	// live mode only (the demo choreography's strip is asserted clean of
+	// it); the app's own gowelcome: markers prove the surface painted.
+	MarkerWelcomeTour = "gotabwm: welcome tour"
+	welcomeBin        = "GOWELCOME.ELF"
 	// M83g (#1780): emitted after a real composite tick. The VZ restore
 	// runner waits for a fresh copy after resuming the saved VM.
 	MarkerRestoreWitness = "gotabwm: restore witness "
@@ -385,6 +390,17 @@ func main() {
 			vi.ConsoleLine(MarkerFirstBootWorkspace)
 		} else {
 			vi.ConsoleLine("gotabwm: first-boot workspace failed " + err.Error())
+		}
+		// M122b (#2571): the welcome tour opens beside the starter shell on
+		// a LIVE first boot only — the demo choreography owns the strip and
+		// its auto-close would eat the tour as a second tab, and a restored
+		// session replays the strip the user left without ever landing here.
+		if !demoMode {
+			if _, err := execApp(welcomeBin); err == nil {
+				vi.ConsoleLine(MarkerWelcomeTour)
+			} else {
+				vi.ConsoleLine("gotabwm: welcome tour failed " + err.Error())
+			}
 		}
 	}
 
