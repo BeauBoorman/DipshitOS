@@ -218,6 +218,10 @@ vgate_file script2-02.txt <<'EOF'
 exec GOBUILD.ELF /host/EDBAD
 EOF
 
+# warm-cold: 02 (f) run 03 reads the share fixes this leg publishes
+#   ('the share persists across the spec's boots') — converting 02
+#   would wall its writes inside a private clone and starve 03
+#   (M131d #2641, ADR 0059 D7(f))
 vgate_run 02 -- \
     --script '$RUN_DIR/script-02.txt' \
     --script2 '$RUN_DIR/script2-02.txt' \

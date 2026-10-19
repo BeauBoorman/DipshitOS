@@ -567,6 +567,54 @@ PAIRS
         rc=1
     fi
 
+    # warm-census self-test (M131d #2641): fixtures under
+    # tools/gate/fixtures/warm-census/ (never fleet members -- never executed).
+    # pass/ must render expected.txt byte-for-byte under LC_ALL=C and the
+    # probe locale, and every fail/ fixture must trip its named error.
+    census_fixtures="$ROOT/tools/gate/fixtures/warm-census"
+    census_py="$ROOT/tools/gate/fleet-census.py"
+    if census_pass="$(LC_ALL=C python3 "$census_py" --spec-dir "$census_fixtures/pass" 2>&1)" && \
+       [ "$census_pass" = "$(cat "$census_fixtures/expected.txt")" ]; then
+        census_ok=1
+    else
+        echo "inventory-gates --check: FAIL -- warm-census pass fixtures no longer render expected.txt"
+        printf '%s\n' "$census_pass"
+        rc=1
+        census_ok=0
+    fi
+    if [ "$census_ok" -eq 1 ] && \
+       grep -qixE 'en_US\.utf-?8' <<< "$(locale -a 2>/dev/null || true)"; then
+        census_utf8="$(LC_ALL=en_US.UTF-8 LC_CTYPE=en_US.UTF-8 python3 "$census_py" --spec-dir "$census_fixtures/pass")"
+        if [ "$census_utf8" != "$census_pass" ]; then
+            echo "inventory-gates --check: FAIL -- warm-census render depends on the locale."
+            rc=1
+        fi
+    fi
+    if census_fail_out="$(python3 "$census_py" --spec-dir "$census_fixtures/fail" 2>&1)"; then
+        echo "inventory-gates --check: FAIL -- the warm census passed its FAIL fixtures."
+        printf '%s\n' "$census_fail_out"
+        rc=1
+    else
+        while IFS='|' read -r fixture needle; do
+            if ! grep -qF "$fixture" <<<"$census_fail_out" || \
+               ! grep -qF "$needle" <<<"$census_fail_out"; then
+                echo "inventory-gates --check: warm-census self-test FAILED -- $fixture no longer trips ('$needle' absent from its output)."
+                printf '%s\n' "$census_fail_out"
+                rc=1
+            fi
+        done <<'PAIRS'
+bad-class.spec|is not one of a-f
+declared-adopted.spec|is adopted
+declared-twice.spec|declared twice
+malformed-decl.spec|malformed
+no-separator.spec|missing -- separator
+unknown-leg.spec|names no vgate_run
+PAIRS
+        if [ "$rc" -eq 0 ]; then
+            echo "inventory-gates --check: OK (warm-census self-test: pass fixtures render + 6 FAIL fixtures flagged)"
+        fi
+    fi
+
     rm -rf "$tmpdir"
     exit "$rc"
 

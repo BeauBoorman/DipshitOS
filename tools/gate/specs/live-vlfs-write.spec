@@ -62,6 +62,7 @@ echo vlfs-write-b-done
 EOF
 
 vgate_run A -- --data-disk '$RUN_DIR/vlfs.img' --script '$RUN_DIR/script-A.txt' --script-expect 'vlfs-write-a-done' --timeout 90
+# warm-cold: B (f) reads files leg A wrote into the shared vlfs.img — a prior leg's side effects (ADR 0059 D7(f)); the image is outside the bundle so warm isolation never carries it
 vgate_run B -- --data-disk '$RUN_DIR/vlfs.img' --script '$RUN_DIR/script-B.txt' --script-expect 'vlfs-write-b-done' --timeout 180
 
 vgate_assert A output-contains 'data-disk: ENABLED'

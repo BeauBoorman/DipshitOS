@@ -22,7 +22,12 @@ EOF
 
 # Run 01 -- flag off, stock VMRunner: no sound flags, so `sound` and `beep`
 # answer the guest's named refusal (no virtio-snd device on the bus).
-vgate_run 01 -- --script '$RUN_DIR/script.txt' --script-after 'tasks user-el0 exited status=7' --script-expect 'beep:' --timeout 90
+# warm sweep (M131d #2641, ADR 0059): single-leg spec on share=none —
+# the leg's evidence is leg-epoch serial markers only, so it converts;
+# its first --script-after names a boot marker that D5 re-bases onto
+# the post-restore handshake.
+vgate_checkpoint sp --
+vgate_run 01 --from-checkpoint sp -- --script '$RUN_DIR/script.txt' --script-after 'tasks user-el0 exited status=7' --script-expect 'beep:' --timeout 90
 
 vgate_assert 01 serial-contains 'sound: no virtio-snd device (DID 0x1059 not found on bus 0)'
 vgate_assert 01 serial-contains 'error: beep: no virtio-snd device (DID 0x1059 not found on bus 0)'

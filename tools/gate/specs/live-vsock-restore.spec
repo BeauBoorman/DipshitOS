@@ -33,6 +33,9 @@ EOF
 
 # Channel works at all: device enumerates, the guest connect reaches the
 # host listener, and an unlistened port is refused honestly.
+# warm-cold: boot (b) this leg's job is producing a REAL cold-boot state
+#   for save/load to exercise — a checkpoint-restored boot leg would change
+#   the provenance the spec exists to measure (ADR 0059 D7(b))
 vgate_run boot -- --vsock --script '$RUN_DIR/script.txt' --script-expect 'vsock-boot-done' --timeout 90
 vgate_assert boot serial-contains 'vsock: ready did=0x1053'
 vgate_assert boot serial-contains 'vsock: connected port=1208'

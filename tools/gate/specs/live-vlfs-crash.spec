@@ -163,6 +163,11 @@ vf ls /disk
 echo vlfs-verify-1-done
 EOF
 
+# warm-cold: 01,02,03,04,05 (f) every leg sequences on a shared --data-disk
+#   image a sibling leg or assert built/crashed (02 verifies 01's killed
+#   vlfs.img, 04 verifies 03's, 05 replays the image 04's assert re-crafts)
+#   — the image is outside the bundle so warm isolation never carries it
+#   (ADR 0059 D7(f))
 vgate_run 01 -- --data-disk '$RUN_DIR/vlfs.img' --script '$RUN_DIR/script-w1.txt' --script-expect 'vlfs-committed-anchor-1' --script-expect-tail 1.5 --timeout 90
 
 vgate_assert 01 output-contains 'data-disk: ENABLED'

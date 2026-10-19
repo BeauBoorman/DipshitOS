@@ -16,6 +16,9 @@ usb devices
 echo xhci-obs-done
 EOF
 
+# warm-cold: 01 (a) 'xhci: init ok' / usb enumeration lines are emitted
+#   during kernel device init — base-boot bytes the warm epoch hides
+#   (ADR 0059 D7(a))
 vgate_run 01 -- --input --script '$RUN_DIR/script.txt' --script-expect "xhci-obs-done" --timeout 40
 
 vgate_assert 01 serial-contains 'xhci: init ok base=0x0000000050001000'

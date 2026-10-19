@@ -24,6 +24,10 @@
 #                     sorted (kind: spec | script) — what CI shards on
 #   count             member count
 #   ids [pattern]     member ids, optionally substring-filtered
+#   census [pattern]  per-spec warm-checkpoint leg census (ADR 0059 D1+D7):
+#                     legs / device-ineligible / semantic a-f / adopted /
+#                     unclassified, plus a FLEET row — parses specs, boots
+#                     nothing; `--legs` adds per-leg verdicts
 #   match <pattern>   ids matching a substring (errors when none)
 #   resolve <id>      echo the id for an exact name or unique prefix
 #   run <id|pattern>...  run the named members (or pattern groups), fail
@@ -210,6 +214,7 @@ main() {
         ids)     if [ $# -gt 0 ]; then fleet_match "$1"; else fleet_ids; fi ;;
         match)   [ $# -eq 1 ] || { echo "fleet: match <pattern>" >&2; exit 2; }
                  fleet_match "$1" ;;
+        census)  LC_ALL=C python3 "$FLEET_DIR/fleet-census.py" --spec-dir "$SPEC_DIR" "$@" ;;
         resolve) [ $# -eq 1 ] || { echo "fleet: resolve <id>" >&2; exit 2; }
                  fleet_resolve "$1" ;;
         run)     [ $# -ge 1 ] || { echo "fleet: run <id|pattern>..." >&2; exit 2; }

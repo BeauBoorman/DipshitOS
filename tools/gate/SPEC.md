@@ -229,3 +229,31 @@ count, since the guest prints it. Anything else that launches two programs from 
 author's to prove. The guard is itself regression-tested against
 `tools/gate/fixtures/exec-order/{fail,pass}` — never fleet members, never
 executed, excluded from the fleet because `fleet.sh` globs this directory only.
+
+## Cold declarations (`# warm-cold:`)
+
+`fleet.sh census` (ADR 0059, M131d) classifies every leg into device-ineligible,
+`--from-checkpoint` adopted, a D7 semantic class `a`–`f`, or `unclassified`.
+Classes (b), (c) and (e) are computed from flags (and (a) when an assert names
+a boot marker the warm epoch hides); classes (a), (d) and (f) that no flag
+reveals are declared by a spec comment:
+
+```
+# warm-cold: <tag>[,<tag>…] (<a–f>) <one-line reason>
+```
+
+| class | means |
+|---|---|
+| `a` | boot order / boot-output dependence — the leg's evidence is emitted before the checkpoint, so a restored leg never re-prints it |
+| `b` | restore/suspend/reboot semantics — the leg exercises checkpoint machinery itself |
+| `c` | host listeners, relays, clients, or runner-side machinery the D2 allow-list cannot express |
+| `d` | cross-boundary elapsed/budget timing |
+| `e` | host state outside the cloned share |
+| `f` | sibling-leg dependence — the leg expects a prior leg's side effects |
+
+A declaration can only **exclude** a leg — it never makes one eligible, and it
+cannot apply to a leg already carrying `--from-checkpoint`. The class must be
+one of `a`–`f`, the tag must name a real `vgate_run`, and each leg may be
+declared once; violations are hard failures in `fleet.sh census`. The parser
+is itself regression-tested against `tools/gate/fixtures/warm-census/{fail,pass}`
+via `tools/inventory-gates.sh --check` — never fleet members, never executed.

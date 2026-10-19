@@ -55,6 +55,9 @@ net
 echo n11c-done
 EOF
 
+# warm-cold: A,B,C (d) --script2-delay arms the retransmission-timer
+#   windows against host wall-clock — a timing budget formed across the
+#   freeze is uninterpretable post-restore (ADR 0059 D7(d))
 vgate_run A -- --net '$RUN_DIR/a-cap.bin' --net-arp-respond 10.0.0.2 --script '$RUN_DIR/a1.txt' --script2 '$RUN_DIR/a2.txt' --script2-after 'n11a-phase1-ready' --script2-delay 7 --script-expect 'n11a-done' --timeout 120
 vgate_run B -- --net '$RUN_DIR/b-cap.bin' --net-tcp-respond 10.0.0.2:9999 --net-arp-respond 10.0.0.2 --script '$RUN_DIR/b1.txt' --script2 '$RUN_DIR/b2.txt' --script2-after 'n11b-phase1-ready' --script2-delay 7 --script-expect 'n11b-done' --timeout 120
 # 34 wall-s no longer covers the 33 guest-tick abort at HEAD (guest
