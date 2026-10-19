@@ -9,11 +9,17 @@ def check(path, out):
     raw = Path(path).read_bytes()
     width, height = 1280, 720
     assert len(raw) == width * height * 4, "missing full guest scanout"
+    # The launcher is the #2054 left-edge strip: emblem + prompt + filter
+    # field, then manifest rows at y=140+24*i, labels at x=14 (a dimmed row
+    # paints its label at +3 and its reason at +13). Glyph masks are the
+    # shared 8x8 bitmap face (the gate share stages no FONTS.TXT, so the
+    # seat's degrade path paints them), first-lit-pixel ink vs cell bg.
     glyphs = [
-        ("Apps", 248, 86, [12, 30, 51, 51, 63, 51, 51, 0]),
-        ("Code Editor", 254, 170, [60, 102, 3, 3, 3, 102, 60, 0]),
-        ("Terminal", 254, 218, [63, 45, 12, 12, 12, 12, 30, 0]),
-        ("Files unavailable", 648, 194, [63, 102, 102, 62, 102, 102, 63, 0]),
+        ("prompt", 8, 88, [99, 99, 99, 107, 127, 119, 99, 0]),
+        ("Code Editor", 14, 194, [60, 102, 3, 3, 3, 102, 60, 0]),
+        ("Files (dimmed)", 14, 215, [127, 70, 22, 30, 22, 6, 15, 0]),
+        ("Binary not staged", 14, 225, [63, 102, 102, 62, 102, 102, 63, 0]),
+        ("Terminal", 14, 242, [63, 45, 12, 12, 12, 12, 30, 0]),
     ]
     for name, x, y, rows in glyphs:
         def pixel(dx, dy):

@@ -363,8 +363,9 @@ import os, sys
 share = os.environ["VG_SHARE"]
 text = open(os.path.join(share, "APPS.TXT"), encoding="utf-8").read()
 rows = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
-if len(rows) != 19:
-    sys.exit("manifest has %d rows, want 19 (M99c/M110c/M111c rows grew it)" % len(rows))
+if len(rows) != 18:
+    sys.exit("manifest has %d rows, want 18 (M99c/M110c/M111c grew it; the "
+             "M122c ghost-app purge removed GODIFF/ZC.BIN/GOSNAP)" % len(rows))
 dock = 0
 v2 = 0
 for ln in rows:
@@ -1313,7 +1314,7 @@ vgate_run 19 -- \
     --script '$RUN_DIR/script-m91-observe.txt' --script-after 'gosh: prompt' \
     --snapshot-after 'gotabwm: launcher presented' \
     --snapshot-out '$RUN_DIR/menu-19' \
-    --pointer-virtio '272,702,d;272,702,u;960,10;800,400,u' \
+    --pointer-virtio '272,702,c' \
     --pointer-virtio-after 'gosh: prompt' \
     --input-chords 'g,o,t,e,r,m,return' \
     --input-chords-after 'gotabwm: launcher presented' \
