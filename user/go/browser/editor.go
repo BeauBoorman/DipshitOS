@@ -119,6 +119,22 @@ func (a *app) keyEvent(ev vi.Event) {
 		a.openFindBar()
 		return
 	}
+	// M126d (#2596): per-tab zoom, owned from any mode like the other
+	// chords. '=' and '+' share usage 0x2e ('+' is shift+'='); the OS
+	// delivers the usage, so both chords land here.
+	if ev.Flags&vi.ModCtrl != 0 {
+		switch ev.Arg0 {
+		case 0x2e: // Ctrl+= / Ctrl++
+			a.zoomStep(1)
+			return
+		case 0x2d: // Ctrl+-
+			a.zoomStep(-1)
+			return
+		case 0x27: // Ctrl+0
+			a.zoomReset()
+			return
+		}
+	}
 	if a.findOpen {
 		a.findBarKey(ev)
 		return

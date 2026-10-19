@@ -89,7 +89,7 @@ func TestUAOriginTiersAndDefaults(t *testing.T) {
 		doc := webrender.ParseHTML([]byte(`<span id="target" style="` + tc.inline + `">text</span>`))
 		ua, _ := Parse([]byte(tc.ua))
 		author, _ := Parse([]byte(tc.author))
-		s, ds := cascade(doc, []*Stylesheet{author}, ua)
+		s, ds := cascade(doc, []*Stylesheet{author}, ua, webstyle.InitialFontSize)
 		if len(ds) != 0 || s.ForNode(find(doc, "target")).Color != rgba(tc.want) {
 			t.Fatal("origin tiers", ds)
 		}

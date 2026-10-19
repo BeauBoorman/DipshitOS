@@ -123,8 +123,12 @@ func (a *app) layoutPage() {
 		}
 	}
 	inline(a.doc.Root)
-	styles, ds := css.Cascade(a.doc, sheets)
+	// M126d (#2596): the font_size rung is the cascade's initial text size;
+	// the tab's zoom then scales every resolved px uniformly. Both re-run
+	// through here on change, so a zoomed font still wraps honestly.
+	styles, ds := css.CascadeBase(a.doc, sheets, int32(a.fontBase))
 	a.mergeDiagnostics(ds)
+	styles.Scale(a.zoomPct)
 	a.preflightImages(a.doc, styles)
 	if a.pageCancelled || a.quit {
 		return
