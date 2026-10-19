@@ -86,6 +86,14 @@ class SessionAppsTest(unittest.TestCase):
             fake = self.root / f"fake-bin/{tool}"
             fake.write_text(f"#!/bin/sh\necho {tool} >> .build/go/tool-log\n")
             fake.chmod(0o755)
+        # M128c (#2607): session.sh registers the assembled app with
+        # LaunchServices via `command -v lsregister` — shadow it so the
+        # real LS database is never touched and the call is assertable.
+        lsreg = self.root / "fake-bin/lsregister"
+        lsreg.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"${VIRELAI_SESSION_SHARE:-/tmp}/lsregister-calls.txt\"\n")
+        lsreg.chmod(0o755)
         # A minimal patched-looking GOOS=virelai fork: bin/go answers
         # `go version` (ensure-guest-elf's toolchain id probe) and
         # syslist.go carries the '"virelai"' marker apply.sh checks for.
@@ -216,8 +224,47 @@ class SessionAppsTest(unittest.TestCase):
         self.assertEqual(info["CFBundleIdentifier"], "org.virelaios.vm.fake")
         self.assertEqual(info["CFBundleName"], "VirelaiOS")
         self.assertEqual(info["CFBundleExecutable"], "VirelaiOS")
+        # M128c (#2607): the assembled app carries the document handler —
+        # the exported UTI and the document type ride the plist verbatim
+        # through the identity stamp.
+        self.assertEqual(
+            info["CFBundleDocumentTypes"][0]["LSItemContentTypes"],
+            ["org.virelaios.virelaivm"])
+        self.assertEqual(
+            info["UTExportedTypeDeclarations"][0]["UTTypeIdentifier"],
+            "org.virelaios.virelaivm")
         self.assertEqual(runner.read_text(), original)
         self.assertEqual(list((self.root / "run-temp").iterdir()), [])
+
+    # --- M128c (#2607): the .virelaivm Finder document ------------------
+
+    def test_virelaivm_document_type_and_ls_registration(self):
+        # The source plist exports the UTI as a PACKAGE with the
+        # filename-extension tag, and declares this app its editor.
+        info = plistlib.loads(
+            (ROOT / "host/vm-runner/Resources/Session-Info.plist").read_bytes())
+        decls = info["UTExportedTypeDeclarations"]
+        self.assertEqual(len(decls), 1)
+        decl = decls[0]
+        self.assertEqual(decl["UTTypeIdentifier"], "org.virelaios.virelaivm")
+        self.assertIn("com.apple.package", decl["UTTypeConformsTo"])
+        self.assertEqual(
+            decl["UTTypeTagSpecification"]["public.filename-extension"],
+            ["virelaivm"])
+        docs = info["CFBundleDocumentTypes"]
+        self.assertEqual(len(docs), 1)
+        doc = docs[0]
+        self.assertEqual(doc["LSItemContentTypes"], ["org.virelaios.virelaivm"])
+        self.assertTrue(doc["LSTypeIsPackage"])
+        self.assertEqual(doc["LSHandlerRank"], "Owner")
+
+        # The assembled app is registered with LaunchServices so a
+        # Finder double-click resolves the handler.
+        output = self.run_session()
+        app = self.profile / "VirelaiOS.app"
+        self.assertIn("session: registered the .virelaivm document handler", output)
+        calls = (self.share / "lsregister-calls.txt").read_text().splitlines()
+        self.assertEqual(calls, [f"-f {app}"])
 
     def test_runner_failure_is_reported_and_run_directory_removed(self):
         self.write_runner("echo 'fixture startup error' >&2\nexit 7\n")

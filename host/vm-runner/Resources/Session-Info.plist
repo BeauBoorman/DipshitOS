@@ -8,6 +8,39 @@
     <key>CFBundleExecutable</key><string>VirelaiOS</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>1</string>
+    <!-- M128c (#2607): the bundle is a document. The exported UTI marks
+         .virelaivm as a PACKAGE (com.apple.package, so Finder shows the
+         bundle as one file) and the document type makes this app its
+         handler, so a Finder double-click delivers an open-documents
+         event the runner turns into the armed profile. -->
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>org.virelaios.virelaivm</string>
+            <key>UTTypeDescription</key><string>VirelaiOS Machine</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>com.apple.package</string>
+                <string>public.directory</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array><string>virelaivm</string></array>
+            </dict>
+        </dict>
+    </array>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>VirelaiOS Machine</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Owner</string>
+            <key>LSTypeIsPackage</key><true/>
+            <key>LSItemContentTypes</key>
+            <array><string>org.virelaios.virelaivm</string></array>
+        </dict>
+    </array>
     <key>LSMinimumSystemVersion</key><string>27.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>

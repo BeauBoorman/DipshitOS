@@ -677,6 +677,19 @@ if ! cmp -s "$RUNNER" "$SESSION_APP/Contents/MacOS/VirelaiOS" || ! codesign --ve
     codesign --force --sign - --entitlements "$ROOT/host/vm-runner/entitlements.plist" "$SESSION_APP"
 fi
 
+# M128c (#2607): the assembled app is the .virelaivm document handler —
+# register it with LaunchServices so a Finder double-click resolves it.
+# A package-nested bundle is never scanned into the LS database on its
+# own and session.sh execs the binary directly (not via `open`), so the
+# handler registration has to happen here. warn-only: a failed register
+# keeps the session bootable, just not document-openable.
+LSREGISTER="$(command -v lsregister || echo /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister)"
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$SESSION_APP" >/dev/null 2>&1 \
+        && echo "session: registered the .virelaivm document handler ($SESSION_APP)" \
+        || echo "session: WARNING — lsregister -f $SESSION_APP failed; double-click open will not resolve"
+fi
+
 RUNNER_PID=""
 end_session() {
     local sig="$1" code="$2"
