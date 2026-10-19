@@ -98,7 +98,13 @@ const (
 	markerHistPick  = "web: history pick "
 	markerFind      = "web: find "
 	markerFindHit   = "web: find hit="
-	markerReload    = "web: reload"
+	// M125d (#2589): the session-state markers. `web: state restored` prints
+	// inside loadBody once the stored blob's fields re-applied to the fresh
+	// layout; `web: state refused` names a torn or foreign-version blob that
+	// was dropped whole, never half-applied.
+	markerStateRestored = "web: state restored"
+	markerStateRefused  = "web: state refused"
+	markerReload        = "web: reload"
 	markerSettled   = "web: settled"
 	markerQuit      = "web: quit"
 	// The typography probes. They carry measurable facts (engine name,
@@ -258,6 +264,9 @@ type app struct {
 	memoryRemaining  int64
 	pageCancelled    bool
 	pendingEvents    []vi.Event
+	// M125d (#2589): the decoded session blob parked by noteState, consumed
+	// once by applyState on the first laid-out page after restore.
+	pend *webState
 }
 
 // virender adapts the kernel fill batcher to the renderer's Surface.
@@ -377,6 +386,13 @@ func main() {
 	// seat, retain the raw shim; resize events determine the presentation.
 	vi.WmMailRequest(vi.WmRpcKindAttachTab, uint32(id), 0, 0, 0, 0, appTitle, appName)
 	vi.WmMailRequest(vi.WmRpcKindDeclareFullscreen, uint32(id), 0, 0, 0, 0, appTitle, appName)
+	// M125d (#2589): the tab row exists now, so the seat can answer a
+	// kind-21 restore. A re-exec'd WEB gets no argv — a stored blob is the
+	// only place its URL survives; ask BEFORE navigating so the restored
+	// target is the first load. No blob is the honest "start fresh".
+	if v, blob, ok := vi.RequestStateRestore(uint32(id), appName); ok {
+		a.noteState(v, blob)
+	}
 	// The store inventory is read from disk at boot: it is how the gate sees
 	// that a previous run's rows persisted. The bookmark atoms load first so
 	// the count in this line is the on-disk truth, not a later cache.
@@ -385,7 +401,9 @@ func main() {
 	vi.ConsoleLine(markerBmStore + "ws=" + bookWSName + " atoms=" + itoa(len(a.books)) +
 		" migrated=" + itoa(a.booksMigrated) + " error=" + bmErrText(a.booksErr))
 
-	if target == "" {
+	if a.pend != nil && a.pend.url != "" {
+		a.navigate(a.pend.url, "")
+	} else if target == "" {
 		a.showStartSurface()
 	} else {
 		a.navigate(target, "")
@@ -508,6 +526,8 @@ func (a *app) loop() {
 		if a.polls%250 == 0 {
 			vi.ConsoleLine(markerLoop + itoa(a.polls) + " ev=" + itoa(a.events) + " loading=" + boolStr(a.loading))
 		}
+		// M125d (#2589): service a pending seat save ask once per pass.
+		a.pollStateAsk()
 		ev, raw, ok := vi.Event{}, int64(0), false
 		if len(a.pendingEvents) > 0 {
 			ev, ok = a.pendingEvents[0], true
@@ -1031,6 +1051,7 @@ func (a *app) loadBody(body []byte, target string) {
 	a.tLayout = t2 - t1 - a.resourceWait
 	a.scroll = 0
 	a.applyFragment(target)
+	a.applyState() // M125d (#2589): the stored blob re-applies once, here
 	vi.ConsoleLine(markerParse + itoa(a.doc.Nodes) + " text=" + itoa(a.doc.TextBytes) + " truncated=" + boolStr(a.doc.Truncated))
 	vi.ConsoleLine(markerLayout + itoa(a.lay.Blocks) + " lines=" + itoa(a.lay.Lines) + " h=" + itoa(a.lay.Height))
 	a.title = pageTitle(a.doc, target)
@@ -1056,6 +1077,7 @@ func (a *app) setError(kind, target string) {
 	a.doc = nil
 	a.findDismiss() // the error page has no findable text
 	a.controls, a.focusControl = nil, nil
+	a.pend = nil // M125d: a failed restore load drops the blob, not replays it
 	a.scroll = 0
 	a.title = "Error"
 	a.logPaint = true
