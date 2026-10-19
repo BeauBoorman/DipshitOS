@@ -8,7 +8,7 @@
 # 3 kernel + 3×4 Ms + 1 spare). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# THIRTEEN vgate_runs share one seeded host share (`vgate_share seed`):
+# FIFTEEN vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -64,6 +64,14 @@
 #       wrote, re-execs GOTABAPP.ELF, and the app's restore_state request
 #       hands the blob back — `gotabapp: state restored len=30` is the
 #       app's own byte-identity verdict.
+#   14  M125b (#2587): GOEDIT.ELF as the state client — a real session:
+#       goto line 2, a find that lands its match selected, a replace-typed
+#       char, undo+redo, a mark-extended selection, then ctrl-s + the
+#       snapshot chord. SESSION.TABS's app_state trailer carries the blob.
+#   15  M125b (#2587): the second boot. The seat restores run 14's file,
+#       re-execs GOEDIT.ELF (bare bin — no argv exists on a re-exec), and
+#       `goedit: state restored` reports caret/selection/rings/histories
+#       back; a post-restore ctrl-z PROVES the ring is live, not a parse.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -1995,3 +2003,166 @@ vgate_assert 13 serial-absent 'gotabwm: state drop'
 vgate_assert 13 serial-contains 'rx-gotabwm-state-restore-ok'
 vgate_assert 13 serial-absent '[EXC] parking:'
 vgate_assert 13 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 14 (M125b / #2587): GOEDIT as the state client — a REAL session, not
+# the demo's literal bytes. On "alpha\nbeta\ngamma\n": goto line 2, find
+# "mma" (lands the match selected at 13..16), X replaces it, ctrl-z + a
+# shifted redo walk both rings, ctrl-shift-m + two lefts leave a 2-byte
+# selection, ctrl-s publishes, and the snapshot chord asks the seat to take
+# the blob — `state save` carries GOEDIT's appver=1 envelope into the
+# SESSION.TABS AS trailer.
+
+vgate_setup_python <<'PY'
+import os
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+ed = os.path.join(share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+with open(os.path.join(ed, "STATE.TXT"), "wb") as f:
+    f.write(b"alpha\nbeta\ngamma\n")
+print("seeded EDIT/STATE.TXT (17 bytes)")
+PY
+
+vgate_file script-14.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-14.txt <<'EOF'
+dui focus 0
+exec GOEDIT.ELF /host/EDIT/STATE.TXT
+EOF
+
+vgate_file script3-14.txt <<'EOF'
+wm
+dui
+echo rx-goedit-state-save-ok
+EOF
+
+vgate_run 14 -- \
+    --screen '$RUN_DIR/screen-14' \
+    --via-virtio \
+    --script '$RUN_DIR/script-14.txt' \
+    --script2 '$RUN_DIR/script2-14.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-g,2,return,ctrl-f,m,m,a,return,X,ctrl-z,ctrl-shift-z,ctrl-shift-m,left,left,ctrl-s,ctrl-shift-s' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-14.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-goedit-state-save-ok' --timeout 300
+
+vgate_assert 14 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 14 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 14 serial-contains 'goedit: declare accepted'
+vgate_assert 14 serial-contains 'goedit: read /host/EDIT/STATE.TXT n=17'
+# A fresh tab has no stored state — the restore request is the honest empty
+# answer, never a fabricated blob.
+vgate_assert 14 serial-absent 'goedit: state restored'
+# The session's receipts: the goto, the landed-and-selected find, the typed
+# replace, both ring walks, the mark selection, and the save.
+vgate_assert 14 serial-contains 'goedit: goto line=2 offset=6'
+vgate_assert 14 serial-contains "goedit: find 'mma' hit=1/1"
+vgate_assert 14 serial-contains 'goedit: undo n=0 cur=16'
+vgate_assert 14 serial-contains 'goedit: redo n=0 cur=14'
+vgate_assert 14 serial-contains 'goedit: mark set'
+vgate_assert 14 serial-contains 'goedit: status line=3/3 col=2 sel=2 *'
+vgate_assert 14 serial-contains 'goedit: saved /host/EDIT/STATE.TXT n=15'
+# The snapshot chord asked the bound tab; the seat stored the blob at
+# appver=1 and republished the session carrying it.
+vgate_assert 14 serial-contains 'gotabwm: state ask id='
+vgate_assert 14 serial-contains 'gotabwm: state save id='
+vgate_assert 14 serial-contains ' ver=1'
+vgate_assert 14 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 14 serial-absent 'gotabwm: state drop'
+# Byte-level on the share: the AS trailer framing and a non-empty GOEDIT
+# blob. The blob's internals are the app's own format — asserted by its
+# markers and by run 15's restore, not decoded here.
+vgate_assert 14 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] != 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (b[0], b[2]))
+off = 6 + 69
+if len(b) < off + 6 + 8:
+    sys.exit("SESSION.TABS too short for a state trailer: %d" % len(b))
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 1:
+    sys.exit("app_state header %r" % b[off:off+6])
+ent = b[off+6:off+14]
+if ent[0] != 0 or ent[1] != 1:
+    sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
+ln = int.from_bytes(ent[4:8], "little")
+blob = b[off+14:off+14+ln]
+if len(blob) != ln or ln == 0 or blob[0] != 1:
+    sys.exit("blob len=%d fmtver=%d" % (len(blob), blob[0] if ln else -1))
+print("SESSION.TABS app_state: idx=0 appver=1 len=%d (goedit fmt v1)" % ln)
+PY
+vgate_assert 14 serial-contains 'rx-goedit-state-save-ok'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 15 (M125b / #2587): the restore half. A FRESH boot loads the file run
+# 14 left, re-execs GOEDIT.ELF — bare bin, no argv: the blob's path field is
+# the ONLY place the file survives — and the app's kind-21 request hands
+# the envelope back. `goedit: state restored` reports the caret, the
+# 12..14 selection, one undo op and both histories; a post-restore ctrl-z
+# fires `undo n=0 cur=16` — proof the restored ring reverts, not just parses.
+
+vgate_file script-15.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-15.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-15.txt <<'EOF'
+wm
+dui
+echo rx-goedit-state-restore-ok
+EOF
+
+vgate_run 15 -- \
+    --screen '$RUN_DIR/screen-15' \
+    --via-virtio \
+    --script '$RUN_DIR/script-15.txt' \
+    --script2 '$RUN_DIR/script2-15.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-z' \
+    --input-chords-after 'goedit: status line=3/3 col=2 sel=2' \
+    --script3 '$RUN_DIR/script3-15.txt' \
+    --script3-after 'goedit: undo n=0' \
+    --script-expect 'rx-goedit-state-restore-ok' --timeout 300
+
+vgate_assert 15 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 15 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 15 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 15 serial-contains 'gotabwm: session exec GOEDIT.ELF'
+vgate_assert 15 serial-contains 'gotabwm: session live n=1'
+# The path came from the blob: the re-exec ran the bare bin, yet the editor
+# opened STATE.TXT — argv never exists on a restored session.
+vgate_assert 15 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 15 serial-contains 'goedit: read /host/EDIT/STATE.TXT n=15'
+# The seat staged the blob; GOEDIT's own apply reports caret, selection,
+# rings and histories.
+vgate_assert 15 serial-contains 'gotabwm: state restore id='
+vgate_assert 15 serial-contains ' ver=1'
+vgate_assert 15 serial-contains 'goedit: state restored cur=12 sel=12..14 undo=1 redo=0 fh=1 gh=1'
+vgate_assert 15 serial-absent 'goedit: state stale'
+vgate_assert 15 serial-absent 'gotabwm: state drop'
+# The restored status row: caret at 12 on line 3, two bytes selected, clean.
+vgate_assert 15 serial-contains 'goedit: status line=3/3 col=2 sel=2'
+# The restored undo ring is LIVE: ctrl-z reverts the saved op and lands the
+# caret at the end of the recovered region.
+vgate_assert 15 serial-contains 'goedit: undo n=0 cur=16'
+vgate_assert 15 serial-contains 'rx-goedit-state-restore-ok'
+vgate_assert 15 serial-absent '[EXC] parking:'
+vgate_assert 15 serial-absent 'exited status=139'

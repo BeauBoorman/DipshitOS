@@ -50,10 +50,14 @@ const histCap = 128
 // history is the bounded undo/redo record. open marks the top undo op as a
 // live run: any caret move, clipboard op, mode change or undo/redo closes it
 // (breakRun), so merging only ever joins truly consecutive keystrokes.
+// M125b (#2587): dropped counts ops a full ring evicted — the serialized
+// ring no longer reaches back to the buffer's base, which is exactly the
+// boundary "unsaved-buffer recovery beyond the undo ring" names.
 type history struct {
-	undo []editOp // oldest first; the top is undo[len-1]
-	redo []editOp // undo-most-recent last; popRedo takes the tail
-	open bool
+	undo    []editOp // oldest first; the top is undo[len-1]
+	redo    []editOp // undo-most-recent last; popRedo takes the tail
+	open    bool
+	dropped int
 }
 
 // hasNL reports whether b contains a newline. Typed runs break at newline
@@ -78,6 +82,7 @@ func (h *history) push(o editOp) {
 	if len(h.undo) == histCap {
 		copy(h.undo, h.undo[1:])
 		h.undo = h.undo[:histCap-1]
+		h.dropped++
 	}
 	h.undo = append(h.undo, o)
 	h.open = o.kind == opInsRun || o.kind == opDelRun
