@@ -1828,3 +1828,120 @@ vgate_assert 15 serial-contains 'gotabwm: rail n=2'
 vgate_assert 15 serial-contains 'rx-gotabwm-palette-ok'
 vgate_assert 15 serial-absent '[EXC] parking:'
 vgate_assert 15 serial-absent 'exited status=139'
+
+# --- M123c (#2577) run 16: progress rows + cancel, end to end -----------
+#
+# GOPROGRESS.ELF is the driver (user/go/goprogress): it owns a window,
+# binds it, posts one kind-22 report ("Copying", op=1, 40%), then polls
+# for the seat's kind-23 cancel once a tick. HOST PREREQUISITE:
+#   bash tools/go/build-web.sh goprogress GOPROGRESS -> .build/go/GOPROGRESS.ELF
+#
+# The chain and each marker that proves its link:
+#
+#   goprogress: bound id=<n>           the app's window bound to the Go
+#                                      seat (the kind-22 request rides the
+#                                      authenticated exchange)
+#   goprogress: progress sent op=1     the app's OWN ack — the seat
+#                                      applied the report
+#   gotabwm: notify progress id=<n>    the row exists (printed on create,
+#                                      never per update)
+#   gotabwm: notify center open        the scripted clock click opened it
+#   gotabwm: notify progress cancel    the row's Cancel zone was acted on;
+#                                      id=<n> op=1 sent=1
+#   goprogress: progress cancel op=1   the kind-23 push reached the app's
+#                                      mailbox — user intent delivered
+#
+# The pointer batch is anchored on the seat's create marker, like run 06
+# anchors on the paint: the row exists the instant `notify progress id=`
+# prints. (1198,702) is the clock panel — it opens the center; (876,227)
+# lands inside row 0's trailing-48px Cancel zone (the panel is x=380..900,
+# y=180; row 0 spans y=210..244; the zone is x>=852).
+#
+# exec-order: assert-proven -- the run ends on `rx-gotabwm-progress-ok`,
+# which only script3 prints, and script3 is held behind
+# `goprogress: progress cancel`, a marker only the app can print after
+# the kind-23 push lands.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOPROGRESS.ELF")
+if not os.path.exists(src):
+    sys.exit("GOPROGRESS.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-web.sh goprogress GOPROGRESS")
+shutil.copy(src, os.path.join(share, "GOPROGRESS.ELF"))
+print("staged GOPROGRESS.ELF into share (%d bytes)" %
+      os.path.getsize(os.path.join(share, "GOPROGRESS.ELF")))
+PY
+
+vgate_file script-16.txt <<'EOF'
+vf rm GOTABWM.DEMO
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-16.txt <<'EOF'
+dui focus 0
+exec GOPROGRESS.ELF
+EOF
+
+vgate_file script3-16.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-progress-ok
+EOF
+
+vgate_run 16 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-16' \
+    --script '$RUN_DIR/script-16.txt' \
+    --script2 '$RUN_DIR/script2-16.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --pointer-virtio '1198,702,d;1198,702,u;876,227,d;876,227,u' \
+    --pointer-virtio-after 'gotabwm: notify progress id=' \
+    --script3 '$RUN_DIR/script3-16.txt' \
+    --script3-after 'goprogress: progress cancel' \
+    --script-expect 'rx-gotabwm-progress-ok' --timeout 300
+
+vgate_assert 16 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 16 serial-contains 'gotabwm: mode live'
+vgate_assert 16 serial-absent 'gotabwm: mode demo'
+vgate_assert 16 serial-contains 'exec: loaded GOPROGRESS.ELF'
+vgate_assert 16 serial-contains 'goprogress: bound id='
+vgate_assert 16 serial-contains 'goprogress: progress sent op=1'
+vgate_assert 16 serial-absent 'goprogress: FAIL'
+vgate_assert 16 serial-contains 'gotabwm: notify progress id='
+vgate_assert 16 serial-contains 'gotabwm: notify center open'
+vgate_assert 16 serial-contains 'gotabwm: notify progress cancel id='
+vgate_assert 16 serial-contains ' op=1 sent=1'
+vgate_assert 16 serial-contains 'goprogress: progress cancel op=1'
+vgate_assert 16 serial-contains 'rx-gotabwm-progress-ok'
+vgate_assert 16 serial-absent '[EXC] parking:'
+vgate_assert 16 serial-absent 'exited status=139'
+
+# The causal order, like run 06's: the seat's create line precedes the
+# app's accepted ack (the ack is the ANSWER), and the seat's cancel line
+# precedes the app's observed cancel (the app can only print after the
+# kind-23 push lands). One sender id and one op throughout.
+vgate_assert 16 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+def at(pat, what):
+    m = re.search(pat, ser)
+    if not m:
+        sys.exit("no %s in the serial log" % what)
+    return m
+
+created = at(r"(?m)^gotabwm: notify progress id=(\d+) op=1 ", "the row's create line")
+sent = at(r"(?m)^goprogress: progress sent op=1$", "the app's accepted ack")
+cancelled = at(r"(?m)^gotabwm: notify progress cancel id=(\d+) op=1 sent=1$", "the seat's cancel push")
+seen = at(r"(?m)^goprogress: progress cancel op=1$", "the app's observed cancel")
+if not (created.start() < sent.start() and cancelled.start() < seen.start()):
+    sys.exit("progress chain out of order: create=%d sent=%d cancel=%d seen=%d"
+             % (created.start(), sent.start(), cancelled.start(), seen.start()))
+if created.group(1) != cancelled.group(1):
+    sys.exit("cancel named id=%s, want the reporter id=%s"
+             % (cancelled.group(1), created.group(1)))
+PY

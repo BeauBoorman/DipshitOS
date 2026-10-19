@@ -671,8 +671,20 @@ func encodeNotifyHistory(h []centerNotification) []byte {
 	}
 	buf := make([]byte, 0, notifyHistMaxBytes)
 	buf = append(buf, notifyHistMagic...)
-	buf = append(buf, byte(len(h)))
+	// M123c: progress rows are transient — the operation a row reported
+	// cannot resume under a restarted seat (window ids die with the
+	// seat's process), so the persisted history carries only notices.
+	n := 0
 	for _, e := range h {
+		if !e.progress {
+			n++
+		}
+	}
+	buf = append(buf, byte(n))
+	for _, e := range h {
+		if e.progress {
+			continue
+		}
 		src := clampNotifyField(e.source, notifyHistSrcMax)
 		text := clampNotifyField(e.text, notifyHistTextMax)
 		buf = append(buf, byte(len(src)), byte(len(text)))

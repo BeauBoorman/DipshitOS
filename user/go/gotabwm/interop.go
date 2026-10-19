@@ -608,6 +608,28 @@ func applyRPC(req vi.WmRpc) bool {
 		// the queue does not hold. The next composite tick paints it.
 		vi.ConsoleLine(MarkerNotify + vi.Itoa64(int64(id)) + " " + text)
 		return true
+	case vi.WmRpcKindProgress: // 22, client -> seat: one operation's progress
+		// M123c (#2577). The request title is BINARY (the kind-17/18
+		// precedent): op, pct, then the NUL-trimmed label — 22 bytes is
+		// the whole budget. An unknown sender or a malformed frame is
+		// refused like kind 12's empty text. Reports update the center's
+		// row in place and never raise a toast, so do-not-disturb does
+		// not gate them — suppression is for transients, and an
+		// operation's standing row is not one.
+		op, pct, label, ok := vi.DecodeProgressTitle(req.Title)
+		if !ok || tabs.index(id) < 0 {
+			return false
+		}
+		created, done := notifyProgressUpdate(id, req.ReplyTo, op, pct, label)
+		if created {
+			vi.ConsoleLine(MarkerNotifyProgress + vi.Itoa64(int64(id)) +
+				" op=" + vi.Itoa64(int64(op)) + " " + label)
+		}
+		if done {
+			vi.ConsoleLine(MarkerNotifyProgressDone + vi.Itoa64(int64(id)) +
+				" op=" + vi.Itoa64(int64(op)))
+		}
+		return true
 	case vi.WmRpcKindShareSurface: // 18, client -> seat: hand off its bound surface
 		return serveSurfaceShare(req)
 	case vi.WmRpcKindSaveState: // 20, client -> seat: collect its staged blob
