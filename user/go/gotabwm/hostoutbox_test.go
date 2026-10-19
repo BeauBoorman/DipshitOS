@@ -199,7 +199,11 @@ func TestHostoutboxSilentWithoutLaneBit(t *testing.T) {
 
 // The seam's v1 default: with M127c's hook unbound a NOTIFY_FOCUS record
 // refuses lane_disabled — the same answer an unclaimed tag always got.
+// (M127c bound the hook for real, so the test unbinds it explicitly.)
 func TestNotifyFocusDefaultsToLaneDisabled(t *testing.T) {
+	prev := hostfocusConsume
+	hostfocusConsume = nil
+	t.Cleanup(func() { hostfocusConsume = prev })
 	if got := hostintConsume(hostint.TagNotifyFocus, hostint.Record{}); got != hostint.RefuseLaneDisabled {
 		t.Fatalf("unbound focus consume = %q", got)
 	}

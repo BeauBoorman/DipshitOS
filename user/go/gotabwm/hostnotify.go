@@ -2,6 +2,9 @@
 //
 // Every toast the seat queues on the kind-12 strip while the lane is armed
 // also becomes a signed NOTIFY_OUT record carrying the same ≤24-byte text —
+// and, since M127c (ADR 0051 V2-D3), the toast's sender tab id in the
+// record's sender_id, so a macOS banner click can echo it back as a
+// NOTIFY_FOCUS (hostfocus.go owns the inbound half).
 // the strip itself is the M97g user-visible indicator, so what the user sees
 // on glass is exactly what crosses it. A notice held under do-not-disturb
 // never reaches the strip, so it never crosses either: DND's "do not flash
@@ -28,15 +31,29 @@ import (
 // (never-logged contract).
 const MarkerHostintNotifyOut = "gotabwm: hostint notify-out "
 
-// hostNotifyPending is the lane's outbound staging: toast texts accepted
+// hostNotifyPendingEntry is one staged toast: the wire-bounded text plus
+// its sender — the toast's tabID, which is the correlation a macOS banner
+// click echoes back as NOTIFY_FOCUS{sender_id} (M127c, ADR 0051 V2-D3).
+// Seat-originated toasts (host drops, agent milestones, action toasts)
+// stage sender 0: there is no tab to focus, so a click emits no record.
+type hostNotifyPendingEntry struct {
+	sender uint32
+	text   string
+}
+
+// hostNotifyPending is the lane's outbound staging: toasts accepted
 // since the last emit, oldest first, bounded at the strip's own depth.
-var hostNotifyPending []string
+var hostNotifyPending []hostNotifyPendingEntry
 
 // hostnotifyQueue is notifyPush's one-line hook: a toast that just reached
 // the strip stages its text for the lane. It runs only while the engine
 // holds a verified ARMED naming the notify bit — dormant otherwise, so a
 // flags-off or consent-off boot never buffers text for a lane that cannot
 // carry it.
+//
+// The sender is read off the strip itself: the hook runs immediately
+// after notifyPushAction's queue append, so the newest queued toast is
+// the one being staged — no second plumbing of tabID through the call.
 func hostnotifyQueue(text string) {
 	eng := hostintEngine
 	if eng == nil || !eng.Armed() || eng.LaneMask()&hostint.LaneNotify == 0 {
@@ -50,7 +67,11 @@ func hostnotifyQueue(text string) {
 		notifyDropped++
 		hostintLog(MarkerNotifyDrop + vi.Itoa64(int64(notifyDropped)))
 	}
-	hostNotifyPending = append(hostNotifyPending, text)
+	var sender uint32
+	if n := len(notifyQueue); n > 0 {
+		sender = notifyQueue[n-1].tabID
+	}
+	hostNotifyPending = append(hostNotifyPending, hostNotifyPendingEntry{sender: sender, text: text})
 }
 
 // hostnotifyPoll drains at most one pending toast per tick into a signed
@@ -62,14 +83,21 @@ func hostnotifyPoll() {
 	if eng == nil || len(hostNotifyPending) == 0 {
 		return
 	}
-	text := hostNotifyPending[0]
-	seq, refusal := eng.Emit(hostint.TagNotifyOut, 0, []byte(text))
+	entry := hostNotifyPending[0]
+	// The wire's sender_id is u16; a window id wider than that cannot
+	// cross. 0 is the honest name for "no tab to focus" (V2-D3: a click
+	// on such a banner raises the runner's window and stops).
+	sender := uint16(entry.sender)
+	if uint32(sender) != entry.sender {
+		sender = 0
+	}
+	seq, refusal := eng.EmitSender(hostint.TagNotifyOut, 0, sender, []byte(entry.text))
 	switch refusal {
 	case "":
 		hostNotifyPending = hostNotifyPending[1:]
-		sum := shlib.SHA256Sum([]byte(text))
+		sum := shlib.SHA256Sum([]byte(entry.text))
 		hostintLog(MarkerHostintNotifyOut + "seq=" + vi.Itoa64(int64(seq)) +
-			" len=" + vi.Itoa64(int64(len(text))) + " sha=" + hostint.HexDigest8(sum[:]))
+			" len=" + vi.Itoa64(int64(len(entry.text))) + " sha=" + hostint.HexDigest8(sum[:]))
 	case hostint.RefuseBackpressure:
 		// The runner has four of ours unconsumed — wait a tick.
 	default:

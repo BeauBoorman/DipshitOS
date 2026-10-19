@@ -1,5 +1,7 @@
+import AppKit
 import Foundation
 import UserNotifications
+import VMAppKit
 
 // MARK: - HostNotify — the M108d notify-out lane, host half (ADR 0051 D5)
 //
@@ -8,8 +10,18 @@ import UserNotifications
 // text budget), and the runner drains them on the shared 250 ms poll,
 // posting each as a UNUserNotificationCenter banner. A minimal delegate's
 // willPresent returns .banner so a toast shows while the runner is
-// frontmost; v1 is one-way FYI — a banner click lands nowhere (no delegate
-// action, no VM focus, no deep link).
+// frontmost.
+//
+// M127c (#2601, ADR 0051 V2-D3) closes the loop: a NOTIFY_OUT carries the
+// toast's sender tab id; the runner binds it to the banner it posts (the
+// sender rides userInfo) and keeps the same bounded consumed-record list
+// the `notify-click` bus verb consults. A banner click — didReceive — or
+// the verb, the class-B equivalent, fires one click path: raise the VM
+// window first (the click's first duty is always "bring the VM forward"),
+// then, when the sender is nonzero, emit a signed NOTIFY_FOCUS{sender}
+// (plen 0 — the header is the whole request) the seat turns into
+// focusHosted(sender). Sender 0 emits no record: a seat-originated toast
+// has no tab to focus, so the raise is the whole answer.
 //
 // The bundle split is named, not waved: UNUserNotificationCenter requires
 // a bundle identity, which only `just session` packaging provides
@@ -36,6 +48,14 @@ final class HostNotify: NSObject {
     /// clamped to the budget on a UTF-8 boundary before it can reach a
     /// banner.
     static let bodyMax = 24
+    /// The consumed-record list's bound (V2-D3): seq→sender for every
+    /// verified NOTIFY_OUT this lane consumed — posted or honestly
+    /// dropped — so the `notify-click` verb's "most recent" and
+    /// didReceive's identifier lookup work with no bundle and no banner.
+    /// Generous past the lane's own depth (the strip stages ≤ 4, the
+    /// runner drains ≤ 1/250 ms); the cap keeps a hostile guest's
+    /// validly-MAC'd flood from growing memory.
+    static let postedBound = 16
 
     private let session: HostIntSession
     private var laneDir: URL { session.laneDir }
@@ -43,23 +63,30 @@ final class HostNotify: NSObject {
     private var dropped = 0              // cumulative non-posted count
     private var ioLogged = Set<String>() // one io_error per filename
     private var authDenied = false
+    /// The bounded consumed list: oldest first, evicted past postedBound.
+    private var posted: [(seq: UInt32, sender: UInt16)] = []
+    private var focusSeq: UInt32 = 0     // next outbound NOTIFY_FOCUS seq
 
     /// Banners exist only under an app bundle; the bare gate runner has
     /// none, so the call is gated on identity BEFORE the center is ever
-    /// touched (an unbundled .current() must not be attempted).
-    private let bundled = Bundle.main.bundleIdentifier != nil
+    /// touched (an unbundled .current() must not be attempted). Internal
+    /// so a test can force the bare posture — an .xctest bundle HAS an
+    /// identifier but no consent-owning app to post through.
+    var bundled = Bundle.main.bundleIdentifier != nil
 
     init(session: HostIntSession) {
         self.session = session
         super.init()
     }
 
-    /// Arm the lane: on a bundle, install the willPresent delegate and ask
-    /// notification consent once. Bare — the whole class-B posture — takes
-    /// the no_bundle path per record instead; nothing here is needed.
+    /// Arm the lane: on a bundle, install the willPresent/didReceive
+    /// delegate and ask notification consent once. Bare — the whole
+    /// class-B posture — takes the no_bundle path per record instead;
+    /// nothing here is needed beyond the verbs.
     func start() {
         // M114c (#2456): the lane-notify bus verb, same seam as the menu.
         HostIntCommands.registerLane(self)
+        registerVerbs(on: commandBus)
         guard bundled else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -70,6 +97,28 @@ final class HostNotify: NSObject {
                 HostInt.logRefuse(lane: "notify", reason: .authDenied)
             }
         }
+    }
+
+    /// The lane's own bus verbs (V2-D6: each lane's file registers its own
+    /// — HostRecorder's self-registration precedent — not the shared
+    /// HostIntCommands table). `start()` binds the runner's commandBus;
+    /// tests bind their own, so the registration itself is class-A.
+    ///
+    /// `notify-click` is the class-B equivalent of the banner click: it
+    /// dispatches the IDENTICAL click path on the most recent consumed
+    /// NOTIFY_OUT, so a bare runner exercises the real seam. Nothing
+    /// consumed yet, or a suspended lane, receipts `disabled`.
+    func registerVerbs(on bus: HostCommandBus) {
+        bus.register(.notifyClick, HostCommandBus.Registration(
+            isEnabled: { [weak self] in
+                guard let self else { return false }
+                return self.posted.last != nil && !self.session.isSuspended(HostInt.laneNotify)
+            },
+            action: { [weak self] in
+                guard let self, let last = self.posted.last else { return .disabled }
+                self.click(sender: last.sender)
+                return .performed
+            }))
     }
 
     /// The 250 ms poll step (hostIntTick): drain NOTIFY_OUT records in seq
@@ -132,7 +181,12 @@ final class HostNotify: NSObject {
             guard consumed < Self.perTickMax else { break }
             lastSeq = seq
             remove(url)
-            post(text, seq: seq)
+            // V2-D3: the click path's correlation table — every VERIFIED
+            // record is remembered, posted or honestly dropped, so the
+            // verb's most-recent answer is the same one the delegate's.
+            posted.append((seq: seq, sender: rec.sender))
+            if posted.count > Self.postedBound { posted.removeFirst() }
+            post(text, seq: seq, sender: rec.sender)
             consumed += 1
         }
     }
@@ -140,7 +194,9 @@ final class HostNotify: NSObject {
     /// One verified toast → one banner, or one named drop. `post` asserts
     /// the hand-off to the center (the pixel is the class-C leg); a bare or
     /// unauthorized runner drops with its reason and the running count.
-    private func post(_ text: String, seq: UInt32) {
+    /// The sender rides the banner's userInfo so a click can answer it
+    /// without the seat ever re-deriving the correlation (V2-D3).
+    private func post(_ text: String, seq: UInt32, sender: UInt16) {
         if !bundled {
             dropped += 1
             FileHandle.standardOutput.write(Data("host-notify: dropped reason=no_bundle seq=\(seq) n=\(dropped)\n".utf8))
@@ -154,11 +210,65 @@ final class HostNotify: NSObject {
         let content = UNMutableNotificationContent()
         content.title = "VirelaiOS"
         content.body = Self.clamped(text)
+        content.userInfo = ["sender": NSNumber(value: sender)]
         let req = UNNotificationRequest(
             identifier: "vhi1-notify-\(session.epoch)-\(seq)",
             content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req) { _ in }
         FileHandle.standardOutput.write(Data("host-notify: post seq=\(seq)\n".utf8))
+    }
+
+    /// The shared click path (V2-D3) — didReceive's banner click and the
+    /// `notify-click` bus verb land here identically. The raise is the
+    /// first duty and happens even when no record follows; a nonzero
+    /// sender then emits a signed NOTIFY_FOCUS under the lane's own
+    /// books (per-tag seq, the 4-outstanding backpressure bound, the
+    /// suspended-mask consent check).
+    func click(sender: UInt16) {
+        raiseWindow()
+        guard sender != 0 else {
+            // A seat-originated toast has no tab to focus — the raise is
+            // the whole answer; emitting a record could only draw gone.
+            FileHandle.standardOutput.write(Data("host-notify: click id=0\n".utf8))
+            return
+        }
+        guard !session.isSuspended(HostInt.laneNotify) else {
+            HostInt.logRefuse(lane: "notify", reason: .laneDisabled)
+            return
+        }
+        guard HostInt.outstanding(laneDir: laneDir, tag: .notifyFocus) < HostInt.maxOutstanding else {
+            HostInt.logRefuse(lane: "notify", reason: .backpressured)
+            return
+        }
+        let seq = focusSeq + 1
+        guard let rec = HostInt.encode(tag: .notifyFocus, flags: 0, sender: sender,
+                                       seq: seq, epoch: session.epoch,
+                                       payload: Data(), key: session.key),
+              HostInt.publish(laneDir: laneDir,
+                              name: HostInt.recordName(tag: .notifyFocus, seq: seq), body: rec)
+        else {
+            HostInt.logRefuse(lane: "notify", reason: .ioError)
+            return
+        }
+        focusSeq = seq
+        FileHandle.standardOutput.write(Data("host-notify: click-focus id=\(sender) seq=\(seq)\n".utf8))
+    }
+
+    /// The click's first duty: bring the VM forward. Only a bundle owns
+    /// windows to raise — the bare gate runner skips it silently (the
+    /// `wantPointer` activation pattern main.swift already runs).
+    private func raiseWindow() {
+        guard bundled else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
+        NSApp.mainWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    /// The delegate's seq lookup: `vhi1-notify-<epoch>-<seq>` → the
+    /// bounded consumed list's sender, when the banner's own userInfo is
+    /// unavailable (a test-built notification, say).
+    func consumedSender(seq: UInt32) -> UInt16? {
+        posted.first { $0.seq == seq }?.sender
     }
 
     /// The bodyMax clamp: whole Characters drop off the tail until the
@@ -183,5 +293,29 @@ extension HostNotify: UNUserNotificationCenterDelegate {
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner])
+    }
+
+    /// V2-D3: the banner click. Only the default action counts — rich
+    /// notification actions are out of scope. The sender comes off the
+    /// banner's own userInfo (the record's correlation bound at post);
+    /// the bounded consumed list is the fallback for a banner whose
+    /// userInfo is absent.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        defer { completionHandler() }
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier else { return }
+        let req = response.notification.request
+        var sender = (req.content.userInfo["sender"] as? NSNumber)?.uint16Value
+        if sender == nil {
+            // `vhi1-notify-<epoch>-<seq>` → the consumed list.
+            let parts = req.identifier.split(separator: "-")
+            if parts.count == 4, parts[0] == "vhi1", parts[1] == "notify",
+               let seq = UInt32(parts[3]) {
+                sender = consumedSender(seq: seq)
+            }
+        }
+        guard let sender else { return } // not one of this lane's banners
+        click(sender: sender)
     }
 }

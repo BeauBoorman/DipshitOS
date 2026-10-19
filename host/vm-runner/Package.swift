@@ -123,7 +123,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VMRunnerTests",
-            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VSCtl", "VMProfile"]
+            dependencies: ["VFWire", "VSSH", "VSNTP", "VMPostmortem", "VMAppKit", "VMGPU3D", "VMDiskImage", "VMTcp", "VSCtl", "VMProfile", "VMRunner"]
         )
     ],
     swiftLanguageModes: [.v5]
