@@ -25,6 +25,26 @@ vgate_run TAG -- FLAGS...          # one boot; FLAGS pass through verbatim
                                    # to VMRunner after the harness-owned
                                    # --serial/--overlay-base/--vars and the
                                    #   selected share device/host directory
+vgate_run TAG --from-checkpoint CKPT [--warm-strict] [--warm-corrupt KIND] -- FLAGS...
+                                   # (ADR 0059, M131b #2639) a warm leg:
+                                   # restores checkpoint CKPT in a fresh
+                                   # VMRunner process. FLAGS may carry ONLY
+                                   # --script* and --timeout — an allow-list;
+                                   # the device/attachment shape is inherited
+                                   # from CKPT. --warm-strict pins
+                                   #   warm=restored (a refusal FAILs the leg);
+                                   # --warm-corrupt truncate-state halves the
+                                   #   leg's state.vzsave clone before restore.
+vgate_checkpoint TAG [--settle-after MARKER] -- FLAGS...
+                                   # (ADR 0059 D4) a dedicated base boot:
+                                   # cold boot with the group's device flags,
+                                   # settles on MARKER (default
+                                   #   'tasks user-el0 reaped') then a fresh
+                                   #   'virelai> ' prompt, then pause → save →
+                                   #   stop into $RUN_DIR/ckpt-TAG/. No
+                                   #   asserts, no leg workload; its serial
+                                   #   and stdout stay as
+                                   #   artifacts/NAME-ckpt-TAG-*.
 vgate_client TAG -- FLAGS...       # (M46 RC2 #1069) a during-run TCP client:
                                    # tools/lib/vgate-client.py runs in the
                                    # background while the TAG run boots; it
@@ -114,11 +134,41 @@ Rules:
   It is only valid when the already-built runner matches the spec's
   `vgate_runner_flags` (plain vs `-DSPIKE`): a stale-variant binary fails
   with the runner's SPIKE error, not a gate failure.
+- `VGATE_WARM=off` (ADR 0059 D8): run every `--from-checkpoint` leg cold
+  with its checkpoint's device flags + its original script flags — no base
+  boot runs, and the receipt records `warm=cold`. M131c's parity check and
+  the cold-vs-warm wall-clock numbers need it on the same revision.
+- **Warm legs (ADR 0059, M131b #2639).** A `vgate_checkpoint` boot pauses
+  at a quiescent prompt and persists a bundle — `state.vzsave`,
+  `overlay.asif`, `machine-id.bin`, a pinned `efi-vars.bin`, and `share/`
+  when the spec arms `*-virtiofs` — immutable once taken. A
+  `--from-checkpoint` leg gets its own `cp -c` clones of every bundle
+  member under `$RUN_DIR/warm-<tag>/`; `SHARE`/`VG_SHARE` point at the
+  leg's share clone, so `share-*` and `python` asserts see the leg's own
+  writes. After restore → resume the runner marks the serial-epoch
+  boundary, writes `\n`, and waits for a fresh `virelai> ` inside the
+  epoch before forwarding `--script` (D5): the leg's first `--script-after`
+  is re-based onto that handshake (the run output names the re-base), and
+  `vm-serial-<tag>.log` holds only post-restore bytes (D6). Later
+  `--scriptN-after` markers must re-fire inside the leg's own epoch.
+- **Refusal and receipt.** `restoreMachineStateFrom` refusing exits the
+  runner with status 75 and exactly one stdout line
+  `VZ-RESTORE: refused code=<N>`. On that signal — and only that signal —
+  a non-strict leg cold-boots once with its original flags (no retry); a
+  strict leg FAILs. A leg that restores and then fails asserts is never
+  re-run cold. Two classes are refused at spec load and never attempted
+  (D8's static Code=2 class): a `--from-checkpoint` leg in a
+  `vgate_share arm|seed` spec, and a `vgate_checkpoint` carrying a
+  custom-virtio-arming flag. Every leg's report line carries
+  `warm=restored|fallback(<code>)|cold` (plain `vgate_run` legs print
+  `warm=cold`); a refused strict leg reports `warm=refused(<code>)`.
 - Extending this file (new KINDs, new commands) is a spec-format change:
   it needs its own issue and a pilot proving it. GF3/GF4 add specs only.
-  The one amendment since M40 GF2 is issue #1386 (M61f): the `share-equals`
-  and `share-contains` kinds, piloted in `go-selftest.spec`. The serial
-  kinds were deliberately left alone, and no VZ CI enforcement was restored.
+  Amendments since M40 GF2: issue #1386 (M61f) added the `share-equals`
+  and `share-contains` kinds, piloted in `go-selftest.spec`; #2639 (M131b)
+  added `vgate_checkpoint` + `vgate_run --from-checkpoint`, piloted in
+  `vgate-warm-smoke.spec`. The serial kinds were deliberately left alone,
+  and no VZ CI enforcement was restored.
 - Since M40 GF5 (issue #940) the spec dir is the class-B fleet's single
   source of truth: dropping a `*.spec` here registers it in `just gate`,
   `just gates`, `just verify-vz`, the `vz-gates.yml` CI shards, and the
