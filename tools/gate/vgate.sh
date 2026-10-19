@@ -43,6 +43,11 @@ VGATE_RUNNER_FLAGS="" VGATE_REPEAT=1 VGATE_REPEAT_ENV=""
 VGATE_NOTES=() VGATE_FILE_NAMES=() VGATE_FILE_BODIES=()
 VGATE_SETUP_PY=() VGATE_RUN_TAGS=() VGATE_RUN_FLAGS=() VGATE_ALLOW_RC=() VGATE_ASSERTS=()
 VGATE_CLIENT_TAGS=() VGATE_CLIENT_ARGS=()
+# ADR 0059 (M131b #2639): warm-checkpoint legs. VGATE_CKPT_* hold the
+# declared base boots; the VGATE_RUN_* triples hold each leg's checkpoint
+# tag, strict pin and deliberate-corruption knob ("" when the leg is cold).
+VGATE_CKPT_TAGS=() VGATE_CKPT_FLAGS=() VGATE_CKPT_SETTLE=()
+VGATE_RUN_FROM_CKPT=() VGATE_RUN_STRICT=() VGATE_RUN_CORRUPT=()
 
 # --- the false-PASS guard, stage 1 (issue #1338) ------------------------------
 # Installed BEFORE the spec is sourced, because sourcing runs untrusted spec
@@ -70,13 +75,92 @@ vgate_file() {
     VGATE_FILE_NAMES+=("$1"); VGATE_FILE_BODIES+=("$b");
 }
 vgate_setup_python() { local b; b="$(cat; echo x)"; b="${b%x}"; VGATE_SETUP_PY+=("$b"); }
+vgate_checkpoint() {
+    # vgate_checkpoint TAG [--settle-after MARKER] -- <runner flags...>
+    # ADR 0059 D4: declares a dedicated base boot — cold boot, settle on the
+    # boot-settle marker (default `tasks user-el0 reaped`) then a fresh
+    # `virelai> ` prompt, then pause/save/stop into $RUN_DIR/ckpt-<TAG>/.
+    # It runs no leg workload and carries no asserts.
+    local tag="$1" settle="tasks user-el0 reaped"; shift
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+        case "$1" in
+            --settle-after)
+                [ $# -ge 2 ] || { echo "vgate: vgate_checkpoint $tag: --settle-after requires a marker" >&2; exit 2; }
+                settle="$2"; shift 2 ;;
+            *) echo "vgate: vgate_checkpoint $tag: unknown option '$1' (only --settle-after MARKER)" >&2; exit 2 ;;
+        esac
+    done
+    [ "${1:-}" = "--" ] || { echo "vgate: vgate_checkpoint $tag missing -- separator" >&2; exit 2; }
+    shift
+    # D1/D8: refuse at spec load the flags that make a configuration
+    # unsaveable (the Grounding-4 custom-virtio set), the harness-owned
+    # members a checkpoint cannot express, and modes a base boot cannot be.
+    local f
+    for f in "$@"; do
+        case "$f" in
+            --custom-virtio|--cvc-echo|--via-virtio|--pointer-virtio|--cvc-snap|--cvc-file|--cvc-console-file|--snapshot-after|--gpu3d-metal)
+                echo "vgate: vgate_checkpoint $tag: $f arms a VZCustomVirtioDevice — unsaveable (ADR 0059 D1); this checkpoint can never be taken" >&2
+                exit 2 ;;
+            --usb-msd|--console|--console-tcp|--console-tcp-secret-file|--host-*|--input-*|--pointer|--pointer-after|--pointer-route|--pointer-request-trust|--net-inject*|--key-*|--chords-*)
+                echo "vgate: vgate_checkpoint $tag: $f is leg-workload or host-state machinery, not a checkpoint's device shape (ADR 0059 D4/D7)" >&2
+                exit 2 ;;
+            --serial|--vars|--overlay-base|--virtio-fs|--vz-restore|--vz-restore-*|--profile|--profile-init|--resume|--rollback-update|--apply-update|--update-key|--script*|--expect|--terminal-marker)
+                echo "vgate: vgate_checkpoint $tag: $f is harness-owned or a mode flag — the checkpoint carries device/attachment flags only" >&2
+                exit 2 ;;
+        esac
+    done
+    VGATE_CKPT_TAGS+=("$tag")
+    VGATE_CKPT_SETTLE+=("$settle")
+    VGATE_CKPT_FLAGS+=("$(printf '%q ' "$@")")
+}
 vgate_run() {
-    # vgate_run TAG -- <runner flags...>
-    local tag="$1"; shift
+    # vgate_run TAG [--from-checkpoint CKPT [--warm-strict] [--warm-corrupt KIND]] -- <runner flags...>
+    # --from-checkpoint CKPT (ADR 0059 D2): the leg restores checkpoint CKPT
+    # into a fresh runner — its flag vector may carry ONLY --script* and
+    # --timeout (an allow-list, not a deny-list); the device/attachment shape
+    # is inherited from the checkpoint it resumes.
+    # --warm-strict (D8): pin warm=restored — a restore refusal FAILs the leg
+    # instead of degrading to a single cold boot.
+    # --warm-corrupt KIND (evidence hooks): mangle the leg's own bundle clone
+    # before restore; KIND=truncate-state halves state.vzsave.
+    local tag="$1" from_ckpt="" strict=0 corrupt=""; shift
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+        case "$1" in
+            --from-checkpoint)
+                [ $# -ge 2 ] || { echo "vgate: vgate_run $tag: --from-checkpoint requires a checkpoint tag" >&2; exit 2; }
+                from_ckpt="$2"; shift 2 ;;
+            --warm-strict) strict=1; shift ;;
+            --warm-corrupt)
+                [ $# -ge 2 ] || { echo "vgate: vgate_run $tag: --warm-corrupt requires a kind" >&2; exit 2; }
+                corrupt="$2"; shift 2 ;;
+            *) echo "vgate: vgate_run $tag: unknown option '$1' (use --from-checkpoint CKPT [--warm-strict] [--warm-corrupt KIND], then --)" >&2; exit 2 ;;
+        esac
+    done
     [ "${1:-}" = "--" ] || { echo "vgate: vgate_run $tag missing -- separator" >&2; exit 2; }
     shift
+    if [ -n "$from_ckpt" ]; then
+        local a
+        for a in "$@"; do
+            case "$a" in
+                --*) case "$a" in
+                        --script*|--timeout) ;;
+                        *) echo "vgate: vgate_run $tag --from-checkpoint $from_ckpt: '$a' is outside the warm-leg allow-list (ADR 0059 D2: only --script*/--timeout vary; the device shape is inherited)" >&2
+                           exit 2 ;;
+                     esac ;;
+            esac
+        done
+    elif [ "$strict" != 0 ] || [ -n "$corrupt" ]; then
+        echo "vgate: vgate_run $tag: --warm-strict/--warm-corrupt require --from-checkpoint" >&2; exit 2
+    fi
+    case "$corrupt" in
+        ""|truncate-state) ;;
+        *) echo "vgate: vgate_run $tag: unknown --warm-corrupt kind '$corrupt' (only truncate-state)" >&2; exit 2 ;;
+    esac
     VGATE_RUN_TAGS+=("$tag")
     VGATE_RUN_FLAGS+=("$(printf '%q ' "$@")")
+    VGATE_RUN_FROM_CKPT+=("$from_ckpt")
+    VGATE_RUN_STRICT+=("$strict")
+    VGATE_RUN_CORRUPT+=("$corrupt")
 }
 vgate_allow_rc() {
     # vgate_allow_rc TAG RC... -- allow specific runner exit code(s) for a tag (default: 0)
@@ -115,6 +199,25 @@ vgate_client() {
 source "$SPEC"
 [ -n "$VGATE_NAME" ] || { echo "vgate: spec sets no vgate_name" >&2; exit 2; }
 [ "${#VGATE_RUN_TAGS[@]}" -gt 0 ] || { echo "vgate: spec declares no vgate_run" >&2; exit 2; }
+
+# --- warm-leg spec-load refusals (ADR 0059 D1/D8: the static Code=2 class) --
+# These are decided from spec text and never attempted:
+for i in "${!VGATE_RUN_FROM_CKPT[@]}"; do
+    fck="${VGATE_RUN_FROM_CKPT[$i]}"
+    [ -n "$fck" ] || continue
+    if [ "$VGATE_SHARE" = arm ] || [ "$VGATE_SHARE" = seed ]; then
+        echo "vgate: ${VGATE_RUN_TAGS[$i]} --from-checkpoint in a 'vgate_share $VGATE_SHARE' spec — the harness-armed --cvc-file is a VZCustomVirtioDevice, unsaveable (ADR 0059 D1)" >&2
+        exit 2
+    fi
+    cfound=0
+    for ct in "${VGATE_CKPT_TAGS[@]}"; do [ "$ct" = "$fck" ] && cfound=1; done
+    [ "$cfound" = 1 ] || { echo "vgate: ${VGATE_RUN_TAGS[$i]} --from-checkpoint $fck: no 'vgate_checkpoint $fck' declared" >&2; exit 2; }
+    # D7(c): a warm leg cannot carry a host client — listener/relay/client
+    # state lives outside the bundle.
+    for ct in "${VGATE_CLIENT_TAGS[@]}"; do
+        [ "$ct" = "${VGATE_RUN_TAGS[$i]}" ] && { echo "vgate: vgate_client $ct on a --from-checkpoint leg — host client state is outside the checkpoint bundle (ADR 0059 D7(c))" >&2; exit 2; }
+    done
+done
 
 SUFFIX="${VIRELAI_GATE_SUFFIX:-}"
 art() { printf 'artifacts/%s%s' "$1" "$SUFFIX"; }
@@ -344,17 +447,80 @@ if [ -n "$VGATE_REPEAT_ENV" ] && [ -n "${!VGATE_REPEAT_ENV:-}" ] 2>/dev/null; th
     REPEAT="${!VGATE_REPEAT_ENV}"
 fi
 
+# --- warm checkpoint base boots (ADR 0059 D4/D9) -----------------------------
+# One base boot per spec invocation, ahead of every leg: cold boot → settle
+# marker → a fresh `virelai> ` prompt → pause/save/stop. The bundle under
+# $RUN_DIR/ckpt-<tag>/ is immutable once taken; each warm leg gets its own
+# clones (D3). VGATE_WARM=off skips base boots entirely — every
+# --from-checkpoint leg then runs cold with its checkpoint's flags and its
+# ORIGINAL script flags, and the receipt records warm=cold.
 PASS=0 TOTAL=0 n=0
+VGATE_WARM="${VGATE_WARM:-on}"
+CKPT_OK=" "
+if [ "$VGATE_WARM" != "off" ]; then
+for ci in "${!VGATE_CKPT_TAGS[@]}"; do
+    ctag="${VGATE_CKPT_TAGS[$ci]}"
+    settle="${VGATE_CKPT_SETTLE[$ci]}"
+    ckdir="$RUN_DIR/ckpt-$ctag"
+    mkdir -p "$ckdir"
+    TOTAL=$((TOTAL + 1))
+    echo; echo "=== $VGATE_NAME checkpoint $ctag ==="
+    # Same per-boot convention as a leg: the runner creates a fresh EFI store
+    # (gate_begin's placeholder is empty); the store this boot writes is the
+    # checkpoint epoch's, pinned into the bundle afterwards (D3).
+    rm -f "$RUN_DIR/vm-serial-ckpt-$ctag.log" "$RUN_DIR/efi-vars.bin"
+    eval "set -- ${VGATE_CKPT_FLAGS[$ci]}"
+    ckexp=()
+    for f in "$@"; do
+        f="${f//\$RUN_DIR/$RUN_DIR}"
+        f="${f//\$\{RUN_DIR\}/$RUN_DIR}"
+        ckexp+=("$f")
+    done
+    set +e
+    "$VZ_RUNNER_BIN" "${GATE_RUNNER_ARGS[@]}" \
+        --serial "$RUN_DIR/vm-serial-ckpt-$ctag.log" \
+        --vz-restore --vz-restore-save "$ckdir" --vz-restore-settle "$settle" \
+        --timeout 300 "${ckexp[@]}" > "$RUN_DIR/run-ckpt-$ctag.out" 2>&1
+    CRC=$?
+    set -e
+    [ -f "$RUN_DIR/vm-serial-ckpt-$ctag.log" ] && cp "$RUN_DIR/vm-serial-ckpt-$ctag.log" "$(art "$VGATE_NAME-ckpt-$ctag-serial.log")" || true
+    cp "$RUN_DIR/run-ckpt-$ctag.out" "$(art "$VGATE_NAME-ckpt-$ctag-run.txt")"
+    if [ "$CRC" = 0 ] && [ -f "$ckdir/state.vzsave" ] && [ -f "$ckdir/overlay.asif" ] && [ -f "$ckdir/machine-id.bin" ]; then
+        # Pinned store for the bundle (D3); a real boot always leaves it,
+        # a stub runner doesn't — the bundle member exists either way.
+        cp "$RUN_DIR/efi-vars.bin" "$ckdir/efi-vars.bin" 2>/dev/null || : > "$ckdir/efi-vars.bin"
+        if [ -n "${SHARE:-}" ]; then
+            cp -cR "$SHARE" "$ckdir/share" 2>/dev/null || cp -R "$SHARE" "$ckdir/share"
+        fi
+        CKPT_OK="$CKPT_OK$ctag "
+        echo "ckpt-$ctag: PASS (bundle: state.vzsave+overlay.asif+efi-vars.bin+machine-id.bin$([ -d "$ckdir/share" ] && printf '+share/'))" | tee -a "$REPORT"
+        PASS=$((PASS + 1))
+    else
+        echo "ckpt-$ctag: FAIL (runner rc=$CRC — no checkpoint bundle; warm legs on '$ctag' will not attempt)" | tee -a "$REPORT"
+    fi
+done
+fi
+ARMED_SHARE="${SHARE:-}"
+
 while [ "$n" -lt "$REPEAT" ]; do
     n=$((n + 1))
     for i in "${!VGATE_RUN_TAGS[@]}"; do
         base="${VGATE_RUN_TAGS[$i]}"
+        from_ckpt="${VGATE_RUN_FROM_CKPT[$i]}"
+        strict="${VGATE_RUN_STRICT[$i]}"
+        corrupt="${VGATE_RUN_CORRUPT[$i]}"
         if [ "$REPEAT" -gt 1 ]; then tag="${base}-$(printf '%02d' "$n")"; else tag="$base"; fi
         client_pid=""
         TOTAL=$((TOTAL + 1))
         echo; echo "=== $VGATE_NAME run $tag ==="
+        SHARE="$ARMED_SHARE"
         rm -f "$RUN_DIR/efi-vars.bin" "$RUN_DIR/vm-serial-$tag.log"
-        [ -n "${SHARE:-}" ] && rm -f "$SHARE/WINDOWS.SAV"
+        # A warm leg's share is its own checkpoint clone — the bundle's
+        # WINDOWS.SAV is authoritative, so the per-leg reset only applies to
+        # genuinely cold boots of the armed share.
+        if [ -n "${SHARE:-}" ] && { [ -z "$from_ckpt" ] || [ "$VGATE_WARM" = "off" ]; }; then
+            rm -f "$SHARE/WINDOWS.SAV"
+        fi
         set +e
         eval "set -- ${VGATE_RUN_FLAGS[$i]}"
         # Specs name $RUN_DIR files in flags; expand the literal token now
@@ -367,6 +533,27 @@ while [ "$n" -lt "$REPEAT" ]; do
         done
         set -- "${expanded[@]}"
         runner_args=("$@")
+        # ADR 0059 D2: a warm leg inherits its checkpoint's device shape —
+        # resolve the checkpoint's flag vector now, RUN_DIR-expanded like
+        # the leg's own.
+        ckpt_args=() ckdir="" legdir=""
+        if [ -n "$from_ckpt" ]; then
+            ckdir="$RUN_DIR/ckpt-$from_ckpt"
+            legdir="$RUN_DIR/warm-$tag"
+            cki=-1
+            for _ci in "${!VGATE_CKPT_TAGS[@]}"; do
+                [ "${VGATE_CKPT_TAGS[$_ci]}" = "$from_ckpt" ] && cki="$_ci"
+            done
+            eval "set -- ${VGATE_CKPT_FLAGS[$cki]}"
+            ckexp=()
+            for f in "$@"; do
+                f="${f//\$RUN_DIR/$RUN_DIR}"
+                f="${f//\$\{RUN_DIR\}/$RUN_DIR}"
+                ckexp+=("$f")
+            done
+            ckpt_args=("${ckexp[@]}")
+            set -- "${runner_args[@]}"
+        fi
         # M46 RC2 (#1069): launch the declared during-run TCP client(s) in the
         # background BEFORE the VM, so the hook can connect while it boots.
         # The client's positional args are isolated (runner_args preserves the
@@ -386,10 +573,91 @@ while [ "$n" -lt "$REPEAT" ]; do
             client_pid=$!
         done
         set -- "${runner_args[@]}"
-        host/vm-runner/.build/release/VMRunner "${GATE_RUNNER_ARGS[@]}" \
-            --serial "$RUN_DIR/vm-serial-$tag.log" "$@" > "$RUN_DIR/run-$tag.out" 2>&1
-        RC=$?
+        warm_field="cold"
+        if [ -n "$from_ckpt" ] && [ "$VGATE_WARM" = "off" ]; then
+            # VGATE_WARM=off (M131c/d parity knob): cold boot with the
+            # checkpoint's device flags + the leg's ORIGINAL script flags
+            # (the first --script-after waits on the real boot marker).
+            # A strict leg can never restore under this knob — FAIL it.
+            if [ "$strict" = 1 ]; then
+                echo "$tag: warm-strict under VGATE_WARM=off — nothing can restore" >> "$RUN_DIR/run-$tag.out"
+                RC=99
+            else
+                "$VZ_RUNNER_BIN" "${GATE_RUNNER_ARGS[@]}" \
+                    --serial "$RUN_DIR/vm-serial-$tag.log" \
+                    "${ckpt_args[@]}" "${runner_args[@]}" > "$RUN_DIR/run-$tag.out" 2>&1
+                RC=$?
+            fi
+        elif [ -n "$from_ckpt" ]; then
+            case "$CKPT_OK" in *" $from_ckpt "*) leg_blocked="" ;; *) leg_blocked=1 ;; esac
+            if [ -n "$leg_blocked" ]; then
+                RC=99
+                echo "$tag: no warm attempt — checkpoint ckpt-$from_ckpt failed earlier" >> "$RUN_DIR/run-$tag.out"
+                echo "$tag: FAIL — checkpoint ckpt-$from_ckpt failed; no warm attempt and no cold substitute (ADR 0059 D4)" | tee -a "$REPORT"
+                warm_field=""
+            else
+                # ADR 0059 D3: the leg's writable world is a fresh clone of
+                # the bundle — overlay, vars, state, machine-id, and the
+                # share when armed; the bundle itself is never touched.
+                mkdir -p "$legdir"
+                cp -c "$ckdir/state.vzsave" "$legdir/state.vzsave" 2>/dev/null || cp "$ckdir/state.vzsave" "$legdir/state.vzsave"
+                cp -c "$ckdir/overlay.asif" "$legdir/overlay.asif" 2>/dev/null || cp "$ckdir/overlay.asif" "$legdir/overlay.asif"
+                cp -c "$ckdir/efi-vars.bin" "$legdir/efi-vars.bin" 2>/dev/null || cp "$ckdir/efi-vars.bin" "$legdir/efi-vars.bin"
+                cp "$ckdir/machine-id.bin" "$legdir/machine-id.bin"
+                if [ -d "$ckdir/share" ]; then
+                    cp -cR "$ckdir/share" "$legdir/share" 2>/dev/null || cp -R "$ckdir/share" "$legdir/share"
+                    SHARE="$legdir/share"   # share-* / python asserts see the leg's own writes (D3)
+                fi
+                if [ "$corrupt" = "truncate-state" ]; then
+                    python3 -c 'import os,sys; p=sys.argv[1]; os.truncate(p, max(1, os.path.getsize(p)//2))' "$legdir/state.vzsave"
+                fi
+                # Harness-owned members retarget the leg's clones.
+                warm_args=()
+                j=0
+                while [ "$j" -lt "${#GATE_RUNNER_ARGS[@]}" ]; do
+                    ga="${GATE_RUNNER_ARGS[$j]}"
+                    case "$ga" in
+                        --vars) warm_args+=(--vars "$legdir/efi-vars.bin"); j=$((j+2)) ;;
+                        --virtio-fs) warm_args+=(--virtio-fs "$legdir/share"); j=$((j+2)) ;;
+                        *) warm_args+=("$ga"); j=$((j+1)) ;;
+                    esac
+                done
+                "$VZ_RUNNER_BIN" "${warm_args[@]}" \
+                    --serial "$RUN_DIR/vm-serial-$tag.log" \
+                    "${ckpt_args[@]}" --vz-restore --vz-restore-load "$legdir" \
+                    "${runner_args[@]}" > "$RUN_DIR/run-$tag-warm.out" 2>&1
+                RC=$?
+                if [ "$RC" = 75 ]; then
+                    # The dedicated refusal status (vzRestoreRefusedStatus):
+                    # exactly one stdout line names the VZErrorDomain code —
+                    # fallback fires ONLY on this signal, never on an assert
+                    # failure (ADR 0059 D8).
+                    rcode="$(sed -n 's/.*VZ-RESTORE: refused code=\([0-9][0-9]*\).*/\1/p' "$RUN_DIR/run-$tag-warm.out" | head -1)"
+                    if [ "$strict" = 1 ]; then
+                        warm_field="refused(${rcode:-?})"
+                        cp "$RUN_DIR/run-$tag-warm.out" "$RUN_DIR/run-$tag.out"
+                        echo "$tag: warm restore REFUSED code=${rcode:-?} — strict leg FAILs (ADR 0059 D8; no cold substitute)" | tee -a "$REPORT"
+                    else
+                        warm_field="fallback(${rcode:-?})"
+                        echo "$tag: warm restore REFUSED code=${rcode:-?} — degrading to a single cold boot (ADR 0059 D8; no retry)" | tee -a "$REPORT"
+                        rm -f "$RUN_DIR/vm-serial-$tag.log"
+                        "$VZ_RUNNER_BIN" "${warm_args[@]}" \
+                            --serial "$RUN_DIR/vm-serial-$tag.log" \
+                            "${ckpt_args[@]}" "${runner_args[@]}" > "$RUN_DIR/run-$tag.out" 2>&1
+                        RC=$?
+                    fi
+                else
+                    warm_field="restored"
+                    cp "$RUN_DIR/run-$tag-warm.out" "$RUN_DIR/run-$tag.out"
+                fi
+            fi
+        else
+            "$VZ_RUNNER_BIN" "${GATE_RUNNER_ARGS[@]}" \
+                --serial "$RUN_DIR/vm-serial-$tag.log" "${runner_args[@]}" > "$RUN_DIR/run-$tag.out" 2>&1
+            RC=$?
+        fi
         set -e
+        [ -f "$RUN_DIR/run-$tag-warm.out" ] && cp "$RUN_DIR/run-$tag-warm.out" "$(art "$VGATE_NAME-run-$tag-warm.txt")" || true
         VG_TAG="$tag" VG_SER="$RUN_DIR/vm-serial-$tag.log" VG_OUT="$RUN_DIR/run-$tag.out"
         [ -f "$VG_SER" ] && cp "$VG_SER" "$(art "$VGATE_NAME-serial-$tag.log")" || true
         cp "$VG_OUT" "$(art "$VGATE_NAME-run-$tag.txt")"
@@ -419,7 +687,7 @@ while [ "$n" -lt "$REPEAT" ]; do
             aa2="${rest%%$'\x1f'*}"; abody="${rest#*$'\x1f'}"
             vg_assert_one "$akind" "$aa1" "$aa2" "$abody" || run_ok=0
         done
-        echo "$tag: $([ "$run_ok" = 1 ] && echo PASS || echo FAIL)" | tee -a "$REPORT"
+        echo "$tag: $([ "$run_ok" = 1 ] && echo PASS || echo FAIL)${warm_field:+ warm=$warm_field}" | tee -a "$REPORT"
         [ "$run_ok" = 1 ] && PASS=$((PASS + 1))
     done
 done

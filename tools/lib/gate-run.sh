@@ -267,7 +267,7 @@ gate_build_runner() {
 # a verdict about the machine is expected. That is exactly why the entitlement
 # is asserted separately here, and why docs/vz-runner.md keeps the two apart.
 
-VZ_RUNNER_BIN="host/vm-runner/.build/release/VMRunner"
+VZ_RUNNER_BIN="${VZ_RUNNER_BIN:-host/vm-runner/.build/release/VMRunner}"
 VZ_RUNNER_ENTITLEMENT="com.apple.security.virtualization"
 
 # gate_assert_runner_entitled [BIN] -- the runner binary must actually carry

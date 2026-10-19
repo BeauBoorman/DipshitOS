@@ -661,6 +661,9 @@ let vzRestore = arguments.contains("--vz-restore")
 // booting, and must recover the marker by a fresh serial query.
 var vzRestoreSaveDir: String?
 var vzRestoreLoadDir: String?
+// ADR 0059 D4 (M131b #2639): on --vz-restore-save, the boot-settle marker
+// a checkpoint base boot waits for before pause/save/stop.
+var vzRestoreSettle: String?
 var vzRestoreWitness: String?
 var vzRestoreVerifyCommand: String?
 var vzRestoreVerifyOutput: String?
@@ -1304,13 +1307,20 @@ while idx < arguments.count {
     if vzRestore, arg.hasPrefix("--") {
         // M70g G3 (#1459): the probe also takes the save/load directory and
         // the device knobs whose save/restore support it measures.
+        // ADR 0059 (M131b #2639): --vz-restore-settle names the base boot's
+        // quiescent marker (save side); the --script* family arms a scripted
+        // warm leg on the --vz-restore-load side (D2's allow-list).
         let valued = ["--overlay-base", "--vars", "--serial", "--cpus", "--timeout",
                       "--vz-restore-save", "--vz-restore-load", "--vz-restore-witness",
                       "--vz-restore-verify-command", "--vz-restore-verify-output",
+                      "--vz-restore-settle",
+                      "--script", "--script-after", "--script-expect", "--script-expect-tail",
+                      "--script2", "--script2-after", "--script2-delay",
+                      "--script3", "--script3-after", "--script3-delay",
                       "--usb-msd", "--virtio-fs", "--vsock-port", "--vsock-ctl-port"]
         let bare = ["--vz-restore", "--display", "--input", "--custom-virtio", "--gpu3d-metal", "--vsock", "--vsock-ctl"]
         guard valued.contains(arg) || bare.contains(arg) else {
-            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal, --vsock.")
+            fail("--vz-restore is a standalone headless save/restore probe; supports only --overlay-base, --vars, --serial, --cpus, --timeout, --vz-restore-save/--vz-restore-load <dir>, --vz-restore-witness <serial-line>, --vz-restore-verify-command/--vz-restore-verify-output, --vz-restore-settle <marker>, the --script* family on --vz-restore-load, --virtio-fs <host-dir>, and the device knobs --display, --input, --usb-msd, --custom-virtio, --gpu3d-metal, --vsock.")
         }
         if valued.contains(arg) {
             guard idx + 1 < arguments.count, !arguments[idx + 1].hasPrefix("--") else {
@@ -1438,6 +1448,9 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--vz-restore-load", idx + 1 < arguments.count {
         vzRestoreLoadDir = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--vz-restore-settle", idx + 1 < arguments.count {
+        vzRestoreSettle = arguments[idx + 1]
         idx += 2
     } else if arg == "--vz-restore-witness", idx + 1 < arguments.count {
         vzRestoreWitness = arguments[idx + 1]
@@ -2453,6 +2466,24 @@ if vzRestoreSaveDir != nil || vzRestoreLoadDir != nil {
     guard vzRestore else { fail("--vz-restore-save/--vz-restore-load require --vz-restore.") }
     guard vzRestoreSaveDir == nil || vzRestoreLoadDir == nil else {
         fail("--vz-restore-save and --vz-restore-load are mutually exclusive (one process saves, another loads).")
+    }
+}
+// ADR 0059 (M131b #2639): the scripted warm-leg shape. --script under
+// --vz-restore is only meaningful on the load side — a save or
+// same-process run has no checkpoint to resume into a leg.
+if vzRestore, scriptPath != nil, vzRestoreLoadDir == nil {
+    fail("--script under --vz-restore requires --vz-restore-load — a scripted leg restores a checkpoint bundle; the save/same-process probes run no leg workload (ADR 0059 D2/D4).")
+}
+let vzWarmLeg = vzRestore && vzRestoreLoadDir != nil && scriptPath != nil
+if vzWarmLeg, vzRestoreWitness != nil {
+    fail("--vz-restore-witness + --script: a scripted warm leg's handshake replaces the probe's marker query (ADR 0059 D5) — pick one load path.")
+}
+if vzRestoreSettle != nil {
+    guard vzRestore, vzRestoreSaveDir != nil else {
+        fail("--vz-restore-settle requires --vz-restore-save — it names the base boot's quiescent marker (ADR 0059 D4).")
+    }
+    guard !vzRestoreSettle!.isEmpty, !vzRestoreSettle!.contains("\n") else {
+        fail("--vz-restore-settle requires one non-empty serial marker.")
     }
 }
 // M113b (#2418): the verified-boot flag family is all-or-nothing —
@@ -3867,6 +3898,9 @@ if vzRestore {
     if vsockEnabled { vzRestoreExtras.append(("vsock", customVirtio: false)) }
     let vzRestoreDevices = vzRestoreExtras.isEmpty ? "headless-base" : vzRestoreExtras.map(\.name).joined(separator: ",")
     print("VZ-RESTORE: devices=\(vzRestoreDevices) mode=\(vzRestoreLoadDir != nil ? "load" : vzRestoreSaveDir != nil ? "save" : "same-process")")
+    if vzWarmLeg {
+        print("VZ-RESTORE: warm leg — restore → D5 handshake → scripted run; a restore refusal exits \(vzRestoreRefusedStatus) with one stdout line (ADR 0059 D8)")
+    }
     do {
         try config.validateSaveRestoreSupport()
         print("VZ-RESTORE: validateSaveRestoreSupport passed; \(ProcessInfo.processInfo.operatingSystemVersionString), arm64")
@@ -4397,6 +4431,32 @@ runner.queue.async {
     if vzRestore, let load = vzRestoreLoadDir {
         // M70g G3 (#1459): the load process never boots — it restores the
         // other process's saved state into this fresh VZVirtualMachine.
+        if vzWarmLeg {
+            // ADR 0059 (M131b #2639): a scripted warm leg. Restore the leg's
+            // checkpoint clone, then the D5 handshake (serial-epoch mark →
+            // "\n" → fresh 'virelai> ' inside the epoch) seats the guest;
+            // only then does the ordinary script/expect/timeout machinery
+            // arm. The leg's first --script-after is re-based onto that
+            // handshake — a boot-settle marker cannot re-fire post-restore.
+            startGuestOutputTee()
+            let probe = VZRestoreProbe(vm: runner.vm, queue: runner.queue, serialURL: serialURL,
+                                       input: consoleInputPipe.fileHandleForWriting, timeout: timeout,
+                                       mode: .load(URL(fileURLWithPath: load, isDirectory: true)),
+                                       warm: true,
+                                       onSeated: {
+                vmDidStart = true
+                print("VZ-RESTORE: warm leg seated — arming the leg's script over the post-restore epoch (ADR 0059 D6)")
+                if let orig = scriptAfter {
+                    print("  warm: --script-after \"\(orig)\" re-based onto the post-restore handshake (ADR 0059 D5)")
+                }
+                forwardScriptOnce(path: scriptPath!, after: "virelai> ", label: "script", settle: 0.5)
+                startScript2Input()
+                startScript3Input()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { scriptPoll() }
+            })
+            probe.startFromSavedState()
+            return
+        }
         let probe = VZRestoreProbe(vm: runner.vm, queue: runner.queue, serialURL: serialURL,
                                    input: consoleInputPipe.fileHandleForWriting, timeout: timeout,
                                    witnessLine: vzRestoreWitness,
@@ -4459,7 +4519,7 @@ runner.queue.async {
                                        witnessLine: vzRestoreWitness,
                                        verifyCommand: vzRestoreVerifyCommand,
                                        verifyOutput: vzRestoreVerifyOutput,
-                                       mode: mode)
+                                       mode: mode, settleAfter: vzRestoreSettle)
             probe.start()
         }
     }
@@ -8269,8 +8329,13 @@ if hostSessionMode {
     if scriptMode { startScriptInput() }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { hostSessionPoll() }
 } else if vzRestore {
-    runner.queue.asyncAfter(deadline: .now() + timeout) {
-        fail("--vz-restore timed out; no successful restore verdict.")
+    // A warm leg's timeout is owned by scriptPoll (same deadline), which
+    // exits through the ordinary script verdict — the probe's hard fail
+    // is only for the marker-query modes that otherwise never leave.
+    if !vzWarmLeg {
+        runner.queue.asyncAfter(deadline: .now() + timeout) {
+            fail("--vz-restore timed out; no successful restore verdict.")
+        }
     }
 } else if consoleMode {
     // Install signal handlers BEFORE engaging raw/character mode so there is

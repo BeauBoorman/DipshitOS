@@ -568,6 +568,277 @@ else
     bad "live-k4o cleanup regression: $CASE_OUT"
 fi
 
+# --- M131b (#2639, ADR 0059): warm-checkpoint legs through real vgate.sh ----
+# A stub VMRunner shell script stands in for the binary (codesign is stubbed,
+# so it reads as entitled; VZ_RUNNER_BIN retargets the invocation). It never
+# boots a VM: save writes a canned bundle, load restores iff the clone's
+# state.vzsave still carries its magic (truncation => the real rc-75 refusal
+# shape), cold writes a boot banner + the leg's script into --serial.
+echo
+echo "── warm-checkpoint legs (ADR 0059, stub runner, no VM) ──"
+
+STUB_RUNNER="$TMP/vmrunner-stub"
+cat > "$STUB_RUNNER" <<'SH'
+#!/usr/bin/env bash
+serial=""; script=""; expect=""; save=""; load=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --serial) serial="$2"; shift 2 ;;
+        --script) script="$2"; shift 2 ;;
+        --script-expect) expect="$2"; shift 2 ;;
+        --vz-restore-save) save="$2"; shift 2 ;;
+        --vz-restore-load) load="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [ -n "$save" ]; then
+    [ -n "${STUB_VZ_LOG:-}" ] && echo save >> "$STUB_VZ_LOG"
+    echo VZSTATE > "$save/state.vzsave"
+    echo OVL > "$save/overlay.asif"
+    echo MID > "$save/machine-id.bin"
+    echo "VZ-RESTORE: SAVE PASS stub"
+    exit 0
+fi
+if [ -n "$load" ]; then
+    [ -n "${STUB_VZ_LOG:-}" ] && echo load >> "$STUB_VZ_LOG"
+    if [ "$(head -c 7 "$load/state.vzsave" 2>/dev/null)" != "VZSTATE" ]; then
+        echo "VZ-RESTORE: refused code=12"
+        exit 75
+    fi
+    [ -n "$serial" ] && { cat "$script" > "$serial" 2>/dev/null; [ -n "$expect" ] && echo "$expect" >> "$serial"; }
+    echo "VZ-RESTORE: warm leg seated — arming the leg's script over the post-restore epoch (stub)"
+    exit 0
+fi
+[ -n "${STUB_VZ_LOG:-}" ] && echo cold >> "$STUB_VZ_LOG"
+if [ -n "$serial" ]; then
+    {
+        echo "VirelaiOS kernel has seized control."
+        echo "tasks user-el0 reaped"
+        cat "$script" 2>/dev/null
+        [ -n "$expect" ] && echo "$expect"
+    } > "$serial"
+fi
+exit 0
+SH
+chmod +x "$STUB_RUNNER"
+
+# gate_begin needs the canonical overlay base; a placeholder suffices — the
+# stub never reads it. Remove it afterwards iff we created it.
+CREATED_IMG=0
+if [ ! -f artifacts/disk.img ]; then
+    : > artifacts/disk.img; CREATED_IMG=1
+fi
+
+WARM_SPEC="$TMP/warm-mini.spec"
+cat > "$WARM_SPEC" <<'SPEC'
+vgate_name warm-mini "stub-runner warm-leg plumbing check"
+vgate_share arm-virtiofs
+vgate_file s1.txt <<'EOF'
+echo c1-line
+EOF
+vgate_file s2.txt <<'EOF'
+echo w1-line
+EOF
+vgate_file s3.txt <<'EOF'
+echo w1b-line
+EOF
+vgate_file s4.txt <<'EOF'
+echo s1-line
+EOF
+vgate_file s5.txt <<'EOF'
+echo f1-line
+EOF
+vgate_checkpoint ck -- --timeout 240
+vgate_run c1 -- --script '$RUN_DIR/s1.txt' --script-after 'tasks user-el0 reaped' --script-expect c1-line --timeout 120
+vgate_assert c1 serial-contains 'c1-line'
+vgate_run w1 --from-checkpoint ck --warm-strict -- --script '$RUN_DIR/s2.txt' --script-after 'tasks user-el0 reaped' --script-expect w1-line --timeout 120
+vgate_assert w1 serial-contains 'w1-line'
+vgate_assert w1 serial-absent 'VirelaiOS kernel has seized control.'
+vgate_assert w1 output-contains 'warm leg seated'
+vgate_run w1b --from-checkpoint ck -- --script '$RUN_DIR/s3.txt' --script-after 'tasks user-el0 reaped' --script-expect w1b-line --timeout 120
+vgate_assert w1b serial-contains 'never-emitted'
+vgate_run s1 --from-checkpoint ck --warm-strict --warm-corrupt truncate-state -- --script '$RUN_DIR/s4.txt' --script-after 'tasks user-el0 reaped' --script-expect s1-line --timeout 120
+vgate_assert s1 output-contains 'VZ-RESTORE: refused code='
+vgate_run f1 --from-checkpoint ck --warm-corrupt truncate-state -- --script '$RUN_DIR/s5.txt' --script-after 'tasks user-el0 reaped' --script-expect f1-line --timeout 120
+vgate_assert f1 serial-contains 'f1-line'
+vgate_assert f1 python <<'PY'
+import os
+from pathlib import Path
+warm = Path(os.environ["RUN_DIR"]) / "run-f1-warm.out"
+assert warm.exists(), "the refused warm attempt's output must be kept as evidence"
+assert "VZ-RESTORE: refused code=" in warm.read_text()
+PY
+SPEC
+
+: > "$TMP/stub.log"
+STUB_CODESIGN_OUT="$ENTITLED_OUT" STUB_CODESIGN_RC=0
+export STUB_CODESIGN_OUT STUB_CODESIGN_RC
+STUB_HV_NAME=HV_SUCCESS STUB_HV_CODE=0x00000000
+export STUB_HV_NAME STUB_HV_CODE
+VZ_HV_PROBE_BIN="$STUB_PROBE"
+export VZ_HV_PROBE_BIN
+
+VGATE_NO_BUILD=1 VZ_RUNNER_BIN="$STUB_RUNNER" STUB_VZ_LOG="$TMP/stub.log" \
+    VIRELAI_RUN_DIR_BASE="$TMP" VIRELAI_KEEP_RUN=1 \
+    bash tools/gate/vgate.sh "$WARM_SPEC" > "$TMP/vgate-warm.out" 2>&1
+warm_rc=$?
+
+RUN_DIR_LEFT="$(ls -d "$TMP"/virelai-warm-mini.* 2>/dev/null | head -1)"
+
+# The stub's refusal path + the strict leg make the gate FAIL overall (w1b's
+# deliberately failing assert + s1's strict refusal), but every leg's receipt
+# must still be written.
+[ "$warm_rc" = 1 ] && ok "vgate exits 1 on the mixed PASS/FAIL warm spec (rc=$warm_rc)" \
+    || { bad "warm spec should exit 1, got rc=$warm_rc"; sed -n '1,15p' "$TMP/vgate-warm.out" | sed 's/^/      /'; }
+
+gate_report_file="artifacts/warm-mini-report.txt"
+[ -f "$gate_report_file" ] || { bad "no report file at $gate_report_file"; gate_report_file=/dev/null; }
+
+grep -q '^c1: PASS warm=cold$' "$gate_report_file" \
+    && ok "a plain vgate_run records warm=cold" \
+    || { bad "c1 should read 'PASS warm=cold'"; grep '^c1:' "$gate_report_file" | sed 's/^/      /'; }
+grep -q '^w1: PASS warm=restored$' "$gate_report_file" \
+    && ok "the strict warm leg records warm=restored" \
+    || { bad "w1 should read 'PASS warm=restored'"; grep '^w1:' "$gate_report_file" | sed 's/^/      /'; }
+grep -q '^w1b: FAIL warm=restored$' "$gate_report_file" \
+    && ok "a restored leg whose assert fails records FAIL warm=restored (no cold substitute)" \
+    || { bad "w1b should read 'FAIL warm=restored'"; grep '^w1b:' "$gate_report_file" | sed 's/^/      /'; }
+grep -q '^s1: FAIL warm=refused(12)$' "$gate_report_file" \
+    && ok "a refused strict leg records warm=refused(<code>)" \
+    || { bad "s1 should read 'FAIL warm=refused(12)'"; grep '^s1:' "$gate_report_file" | sed 's/^/      /'; }
+grep -q '^f1: PASS warm=fallback(12)$' "$gate_report_file" \
+    && ok "a refused non-strict leg degrades once and records warm=fallback(<code>)" \
+    || { bad "f1 should read 'PASS warm=fallback(12)'"; grep '^f1:' "$gate_report_file" | sed 's/^/      /'; }
+grep -q 'ckpt-ck: PASS' "$gate_report_file" \
+    && ok "the checkpoint base boot reports its own PASS row" \
+    || bad "ckpt-ck PASS row missing from the report"
+
+# Invocation census: 1 save, 4 loads (w1, w1b, s1, f1), 2 colds (c1 + f1's
+# fallback) — an assert failure must NOT have fired a cold rerun (D8).
+n_save="$(grep -c '^save$' "$TMP/stub.log" || true)"
+n_load="$(grep -c '^load$' "$TMP/stub.log" || true)"
+n_cold="$(grep -c '^cold$' "$TMP/stub.log" || true)"
+[ "$n_save" = 1 ] && ok "exactly one base boot ran (save=$n_save)" \
+    || bad "expected 1 save, got $n_save"
+[ "$n_load" = 4 ] && ok "each warm leg attempted restore exactly once (load=$n_load)" \
+    || bad "expected 4 loads, got $n_load"
+[ "$n_cold" = 2 ] && ok "cold boots only for the plain leg + the fallback leg (cold=$n_cold — assert failures never re-run)" \
+    || bad "expected 2 colds, got $n_cold"
+
+# D3: the bundle carries every member and each leg cloned its own copy.
+if [ -n "$RUN_DIR_LEFT" ] && [ -d "$RUN_DIR_LEFT/ckpt-ck" ]; then
+    for m in state.vzsave overlay.asif efi-vars.bin machine-id.bin; do
+        [ -f "$RUN_DIR_LEFT/ckpt-ck/$m" ] \
+            && ok "bundle member $m present" \
+            || bad "bundle member $m missing from ckpt-ck"
+    done
+    [ -d "$RUN_DIR_LEFT/ckpt-ck/share" ] \
+        && ok "bundle pins the armed share/ (arm-virtiofs)" \
+        || bad "bundle share/ missing"
+    [ -f "$RUN_DIR_LEFT/warm-w1/state.vzsave" ] && [ -d "$RUN_DIR_LEFT/warm-w1/share" ] \
+        && ok "w1 got its own state+share clones" \
+        || bad "w1's warm-<tag> clone set incomplete"
+    [ -f "$RUN_DIR_LEFT/warm-f1/state.vzsave" ] \
+        && ok "f1 got its own clones" \
+        || bad "f1's warm-<tag> clone set incomplete"
+else
+    bad "no ckpt-ck bundle under $RUN_DIR_LEFT"
+fi
+rm -rf "$RUN_DIR_LEFT" 2>/dev/null
+rm -f artifacts/warm-mini-*
+
+# VGATE_WARM=off: no base boot, every --from-checkpoint leg cold, warm=cold.
+: > "$TMP/stub.log"
+VGATE_NO_BUILD=1 VGATE_WARM=off VZ_RUNNER_BIN="$STUB_RUNNER" STUB_VZ_LOG="$TMP/stub.log" \
+    VIRELAI_RUN_DIR_BASE="$TMP" \
+    bash tools/gate/vgate.sh "$WARM_SPEC" > "$TMP/vgate-warm-off.out" 2>&1
+off_rc=$?
+n_save_off="$(grep -c '^save$' "$TMP/stub.log" || true)"
+n_load_off="$(grep -c '^load$' "$TMP/stub.log" || true)"
+n_cold_off="$(grep -c '^cold$' "$TMP/stub.log" || true)"
+# c1/w1b/f1 run cold; the two strict legs fail WITHOUT an invocation — under
+# off nothing can restore, so warm=cold can never satisfy a strict pin.
+[ "$n_save_off" = 0 ] && [ "$n_load_off" = 0 ] && [ "$n_cold_off" = 3 ] \
+    && ok "VGATE_WARM=off: no base boot, non-strict warm legs cold (save=0 load=0 cold=$n_cold_off)" \
+    || bad "VGATE_WARM=off census wrong: save=$n_save_off load=$n_load_off cold=$n_cold_off"
+grep -q '^w1: FAIL warm=cold$' "artifacts/warm-mini-report.txt" \
+    && ok "a strict leg under VGATE_WARM=off records FAIL warm=cold (nothing can restore)" \
+    || { bad "w1 under off should read 'FAIL warm=cold'"; grep '^w1:' artifacts/warm-mini-report.txt | sed 's/^/      /'; }
+grep -q '^f1: FAIL warm=cold$' "artifacts/warm-mini-report.txt" \
+    && ok "a non-strict warm leg under VGATE_WARM=off records warm=cold (FAIL here only because f1's assert requires a refused warm attempt, which off never makes)" \
+    || { bad "f1 under off should read 'FAIL warm=cold'"; grep '^f1:' artifacts/warm-mini-report.txt | sed 's/^/      /'; }
+rm -f artifacts/warm-mini-*
+
+# --- spec-load refusals (ADR 0059 D8's static Code=2 class) -------------------
+# These die before any build/boot machinery, so no stubs need to satisfy them
+# beyond the codesign/hv env already exported.
+refuse() {  # refuse <label> <spec-path> <expected-substring>
+    local label="$1" spec="$2" want="$3" out rc
+    out="$(VGATE_NO_BUILD=1 bash tools/gate/vgate.sh "$spec" 2>&1)"; rc=$?
+    if [ "$rc" = 2 ] && printf '%s' "$out" | grep -qF -- "$want"; then
+        ok "$label"
+    else
+        bad "$label — rc=$rc, want '$want': $(printf '%s' "$out" | tail -3 | tr '\n' '|')"
+    fi
+}
+
+cat > "$TMP/refuse-allowlist.spec" <<'SPEC'
+vgate_name refuse-allowlist "x"
+vgate_checkpoint ck -- --timeout 240
+vgate_run w --from-checkpoint ck -- --script /tmp/x --cpus 4 --timeout 60
+SPEC
+refuse "the warm-leg allow-list refuses a device flag (--cpus)" \
+    "$TMP/refuse-allowlist.spec" "outside the warm-leg allow-list"
+
+cat > "$TMP/refuse-cvc.spec" <<'SPEC'
+vgate_name refuse-cvc "x"
+vgate_checkpoint ck -- --custom-virtio --timeout 240
+vgate_run w --from-checkpoint ck -- --script /tmp/x --timeout 60
+SPEC
+refuse "a custom-virtio flag on vgate_checkpoint refuses at spec load" \
+    "$TMP/refuse-cvc.spec" "unsaveable (ADR 0059 D1)"
+
+cat > "$TMP/refuse-share.spec" <<'SPEC'
+vgate_name refuse-share "x"
+vgate_share arm
+vgate_checkpoint ck -- --timeout 240
+vgate_run w --from-checkpoint ck -- --script /tmp/x --timeout 60
+SPEC
+refuse "vgate_share arm + --from-checkpoint refuses (the armed --cvc-file is unsaveable)" \
+    "$TMP/refuse-share.spec" "unsaveable (ADR 0059 D1)"
+
+cat > "$TMP/refuse-unknown.spec" <<'SPEC'
+vgate_name refuse-unknown "x"
+vgate_run w --from-checkpoint nope -- --script /tmp/x --timeout 60
+SPEC
+refuse "--from-checkpoint of an undeclared checkpoint refuses" \
+    "$TMP/refuse-unknown.spec" "no 'vgate_checkpoint nope' declared"
+
+cat > "$TMP/refuse-client.spec" <<'SPEC'
+vgate_name refuse-client "x"
+vgate_checkpoint ck -- --timeout 240
+vgate_run w --from-checkpoint ck -- --script /tmp/x --timeout 60
+vgate_client w -- --connect 127.0.0.1:9
+SPEC
+refuse "vgate_client on a warm leg refuses (host state outside the bundle)" \
+    "$TMP/refuse-client.spec" "ADR 0059 D7(c)"
+
+cat > "$TMP/refuse-strict-bare.spec" <<'SPEC'
+vgate_name refuse-strict-bare "x"
+vgate_checkpoint ck -- --timeout 240
+vgate_run w --warm-strict -- --script /tmp/x --timeout 60
+SPEC
+refuse "--warm-strict without --from-checkpoint refuses" \
+    "$TMP/refuse-strict-bare.spec" "require --from-checkpoint"
+
+# The strict refusal path keeps the refused attempt's output as the leg's
+# evidence — already covered by s1's output-contains assert above, which only
+# holds if run-s1.out IS the refused warm attempt.
+
+rm -rf "$RUN_DIR_LEFT" 2>/dev/null
+rm -f artifacts/warm-mini-* artifacts/refuse-*-report.txt artifacts/refuse-*-gate.txt
+[ "$CREATED_IMG" = 1 ] && rm -f artifacts/disk.img
+
 # --- the real probe: it must build, and carry the right entitlement --------
 echo
 echo "── the shipped probe (no stubs) ──"
