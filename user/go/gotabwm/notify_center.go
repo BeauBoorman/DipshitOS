@@ -49,9 +49,14 @@ type centerNotification struct {
 	op       uint8
 	pct      int
 	pid      uint8
-	// snap is the crash-save slot name when this row is M125f's recovery
-	// offer: its click stages the restore, its row X the dismiss — not a
-	// sender focus. Empty on every ordinary notice.
+	// action is the seat action this row's body click runs — the same
+	// kind the toast carries (M125f's crash restore, M123a's
+	// retry/grant/copy). notifyActionNone on every ordinary notice.
+	action uint8
+	// snap is the action's payload: the crash-save slot name on M125f's
+	// recovery offer, M123a's binary name or error text. Its row's
+	// click is the action, not a sender focus. Empty on every ordinary
+	// notice.
 	snap string
 }
 
@@ -64,16 +69,16 @@ var (
 )
 
 func notifyCenterPush(tabID uint32, text string) uint32 {
-	return notifyCenterPushSnap(tabID, text, "")
+	return notifyCenterPushAction(tabID, text, notifyActionNone, "")
 }
 
-// notifyCenterPushSnap carries the crash-snap slot name onto the history
-// row so the offer survives its own toast's expiry: the row is the offer
-// after the toast fades.
-func notifyCenterPushSnap(tabID uint32, text string, snap string) uint32 {
+// notifyCenterPushAction carries the toast's action kind and payload
+// onto the history row so an actionable notice survives its own toast's
+// expiry: the row is the action after the toast fades.
+func notifyCenterPushAction(tabID uint32, text string, action uint8, snap string) uint32 {
 	source := "App " + vi.Itoa64(int64(tabID))
-	if snap != "" {
-		// The recovery offer is the seat's own, not a sender's — a
+	if action != notifyActionNone {
+		// An action toast is the seat's own, not a sender's — a
 		// bogus "App 0" would send a reader hunting for window zero.
 		source = "Seat"
 	} else if i := tabs.index(tabID); i >= 0 && tabs.At(i).Title != "" {
@@ -89,7 +94,7 @@ func notifyCenterPushSnap(tabID uint32, text string, snap string) uint32 {
 	}
 	notifyCenter = append(notifyCenter, centerNotification{
 		tabID: tabID, id: notifyCenterNextID, source: source, text: text,
-		snap: snap,
+		action: action, snap: snap,
 	})
 	notifyHistoryChanged()
 	return notifyCenterNextID
@@ -154,7 +159,7 @@ func dismissNotifyCenterEntry(index int) bool {
 		return false
 	}
 	entry := notifyCenter[index]
-	if entry.snap != "" {
+	if entry.action == notifyActionCrashSnap {
 		// M125f (#2591): dismissing the recovery offer's row is the
 		// offer's Dismiss gesture — resolved and consumed, like a click's
 		// Restore, only in the other direction.
@@ -170,7 +175,7 @@ func clearNotifyCenter() int {
 	// Snap offers inside a clear-all are dismissed one by one — the
 	// resolve is part of the removal, not a silent drop.
 	for _, entry := range notifyCenter {
-		if entry.snap != "" {
+		if entry.action == notifyActionCrashSnap {
 			crashSnapDismiss(entry.snap)
 		}
 	}
@@ -301,16 +306,16 @@ func notifyCenterClick(px, py uint32) bool {
 				}
 				return true
 			}
-			if entry.snap != "" {
-				// The recovery offer's row body is its Restore gesture —
+			if entry.action != notifyActionNone {
+				// An action row's body click is its action's gesture —
 				// the same arm a toast click runs, so the answer does not
-				// depend on which surface carried the offer. A resolved
-				// offer leaves both surfaces: the row like a dismissed
+				// depend on which surface carried the report. A resolved
+				// report leaves both surfaces: the row like a dismissed
 				// one, its toast like an expired one.
-				crashSnapRestore(entry.snap)
+				runNotifyAction(entry.action, entry.snap)
 				dismissNotifyCenter(index)
 				dropCenterRowToast(entry.id)
-				vi.ConsoleLine(MarkerNotifyCenterAction + "restore " + entry.snap)
+				vi.ConsoleLine(MarkerNotifyCenterAction + refusalActionName(entry.action) + " " + entry.snap)
 				return true
 			}
 			if !entry.sourceGone && tabs.index(entry.tabID) >= 0 {

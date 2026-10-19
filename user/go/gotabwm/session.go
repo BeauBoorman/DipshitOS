@@ -295,6 +295,7 @@ func reexecSession() int {
 		}
 		pid, err := execApp(t0.Bin)
 		if err != nil || pid <= 0 || pid > 255 {
+			seatRefusalErr(err, "exec "+t0.Bin, t0.Bin)
 			dropRestoredRow(t0, "exec")
 			continue
 		}

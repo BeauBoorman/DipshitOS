@@ -100,10 +100,14 @@ const (
 
 // notifyAction marks a toast whose click is a seat action, not a sender
 // focus. notifyActionNone is every ordinary notification; the crash-snap
-// offer (M125f) is the only action kind — its click stages the restore.
+// offer (M125f) stages a restore, and M123a's refusal kinds run Retry /
+// Open Settings / Copy Error through refusal.go's shared dispatch.
 const (
 	notifyActionNone      uint8 = 0
 	notifyActionCrashSnap uint8 = 1
+	notifyActionRetry     uint8 = 2
+	notifyActionGrant     uint8 = 3
+	notifyActionCopy      uint8 = 4
 )
 
 // notifyToast is one queued notification. tabID is the SENDER (the window
@@ -174,7 +178,7 @@ func notifyPushAction(tabID uint32, text string, ticks uint64, action uint8, sna
 	if text == "" {
 		return "", false, false
 	}
-	centerID := notifyCenterPushSnap(tabID, text, snap)
+	centerID := notifyCenterPushAction(tabID, text, action, snap)
 	if notifyDND {
 		return text, true, false
 	}
@@ -514,9 +518,9 @@ func notifyClicked(px, py uint32) int {
 	// The marker comes first: the toast IS gone at this point, whatever
 	// the kernel says about focusing a window that may have died.
 	vi.ConsoleLine(MarkerNotifyDismiss + vi.Itoa64(int64(id)))
-	if toast.action == notifyActionCrashSnap {
-		crashSnapRestore(toast.snap)
-		// A resolved offer leaves both surfaces: the paired history
+	if toast.action != notifyActionNone {
+		runNotifyAction(toast.action, toast.snap)
+		// A resolved report leaves both surfaces: the paired history
 		// row retires with the toast.
 		dropCenterRowByID(toast.centerID)
 		return 1

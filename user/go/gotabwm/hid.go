@@ -428,6 +428,7 @@ func applyReopen() bool {
 	pid, err := execApp(c.Bin)
 	if err != nil {
 		vi.ConsoleLine(MarkerReopenMissing + c.Bin)
+		seatRefusalErr(err, "exec "+c.Bin, c.Bin)
 		return false
 	}
 	// M125a (#2586): a reopen redelivers the close-time blob — staged by
@@ -448,6 +449,7 @@ func applyDuplicate() bool {
 	}
 	if _, err := execApp(bin); err != nil {
 		vi.ConsoleLine(MarkerDuplicateMissing + bin)
+		seatRefusalErr(err, "exec "+bin, bin)
 		return false
 	}
 	vi.ConsoleLine(MarkerDuplicate + bin)

@@ -381,6 +381,7 @@ func paletteExec(bin string) bool {
 	if _, err := execApp(bin); err != nil {
 		vi.ConsoleLine(MarkerPaletteMissing + bin)
 		launch.err = "Launch failed: " + bin
+		seatRefusalErr(err, "exec "+bin, bin)
 		return false
 	}
 	vi.ConsoleLine(MarkerPaletteExec + bin)
@@ -391,6 +392,7 @@ func paletteExecArgv(bin, arg string) bool {
 	if _, err := execApp(bin, arg); err != nil {
 		vi.ConsoleLine(MarkerPaletteMissing + bin)
 		launch.err = "Launch failed: " + bin
+		seatRefusalErr(err, "exec "+bin, bin)
 		return false
 	}
 	vi.ConsoleLine(MarkerPaletteExec + bin + " argv=" + arg)

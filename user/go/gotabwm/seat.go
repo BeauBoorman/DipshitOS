@@ -350,6 +350,9 @@ func main() {
 	// reads the host-int credential once; absent is byte-silent (D7). The
 	// lane runs in BOTH seat modes — it is not demo choreography.
 	hostintSeatInit()
+	// M123a (#2575): lane refusals ride the seat-owned log sink into
+	// toasts — armed only when the lane engine exists.
+	armRefusalLaneWatch()
 	// M109e (#2401, ADR 0052): the agent-activity watch on the M109c
 	// receipt lane. Same credential posture — the agent-hmac row served
 	// to this image is the whole flag; unserved is byte-silent.
