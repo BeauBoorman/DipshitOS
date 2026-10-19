@@ -41,6 +41,8 @@ func TestGuessBinShippingTitles(t *testing.T) {
 		{"Calc", "GOCALC.ELF"},
 		{"Notepad", "NOTE.ELF"},
 		{"Edit", "GOEDIT.ELF"},
+		{"Files", "GOFILES.ELF"},
+		{"Image Viewer", "GOVIEW.ELF"},
 		{"Term", "GOTERM.ELF"},
 		{"RSS Reader", "RSS.ELF"},
 		{"Other", "Other"},

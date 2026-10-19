@@ -261,6 +261,10 @@ func guessBin(title string) string {
 		// M125c (#2588): GOFILES's declared title — the session state leg
 		// re-execs the recorded row, so "Files" must name the real binary.
 		return "GOFILES.ELF"
+	case "Image Viewer":
+		// M124a-2 (#2677): GOVIEW's declared title — without the row its
+		// opens=image manifest can never resolve and every drop refuses.
+		return "GOVIEW.ELF"
 	case "GoTabApp":
 		// The M56d tabapp demo's declared title — the M125a spec leg's
 		// client, so its restore row must name the real binary.

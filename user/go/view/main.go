@@ -50,6 +50,10 @@ const (
 	markerWinClose    = "gview: win_close"
 	markerResize      = "gview: resize relayout "
 	markerExiting     = "gview: exiting "
+	// M124a-2 (#2677): the drop target's receipt — `<mime> WxH bytes=` on
+	// a decoded image, `no-payload`/`unsupported <tag>`/`decode <mime>`/
+	// `too-large` for the refused shapes.
+	markerDrop        = "gview: drop "
 	markerOpenErr     = "gview: open err"
 	markerReadErr     = "gview: read err"
 	markerTooLarge    = "gview: too large"
@@ -135,6 +139,10 @@ func main() {
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)) + " " + u32s(ta.W) + "x" + u32s(ta.H))
 
 	a := &app{ta: ta, name: basename(path), fm: formatOfHeader(head), zoomIdx: zoomDefaultIdx}
+	// M124a-2 (#2677): the drop target. The seat's opens=image admission
+	// filtered the mime; a delivered payload decodes through the same
+	// DecodeImage path as a file load, and the callback repaints itself.
+	a.ta.DropTarget = a.drop
 
 	if path == "" {
 		vi.ConsoleLine(markerEmpty)
@@ -260,6 +268,59 @@ func readImage(path string) ([]byte, loadState) {
 	return out, loadOkay
 }
 
+// drop is the M124a-2 (#2677) DropTarget: a delivered drag payload decodes
+// through the same DecodeImage path load() uses and replaces the shown
+// image — zoom and pan reset because the old geometry meant the old pixels.
+// A nil payload is the seat's "no envelope" case, named like a refusal; the
+// refused decodes name their shape, never a stack trace.
+func (a *app) drop(offer tabapp.DragOffer) {
+	if !a.applyDrop(offer) {
+		return
+	}
+	a.pushTitle()
+	a.draw()
+	a.ta.Present()
+}
+
+// applyDrop is drop's testable half: decode, replace the shown image, and
+// print the receipt. The chrome steps stay in the callback — a host test
+// has no seat to repaint for.
+func (a *app) applyDrop(offer tabapp.DragOffer) bool {
+	data := offer.Blob
+	if data == nil {
+		vi.ConsoleLine(markerDrop + "no-payload")
+		return false
+	}
+	im, err := webrender.DecodeImage(data)
+	if err != nil {
+		if errors.Is(err, webrender.ErrImageUnsupported) {
+			tag := formatOfHeader(data).tag()
+			if tag == "" || tag == "???" {
+				tag = "format"
+			}
+			vi.ConsoleLine(markerDrop + "unsupported " + tag)
+			return false
+		}
+		vi.ConsoleLine(markerDrop + "decode " + offer.Mime)
+		return false
+	}
+	if im.Width*im.Height > pixelsMax {
+		vi.ConsoleLine(markerDrop + "too-large")
+		return false
+	}
+	a.img = im
+	a.iw, a.ih = uint32(im.Width), uint32(im.Height)
+	a.fm = formatOfHeader(data)
+	a.name = "drop:" + offer.Mime
+	a.st = loadOkay
+	a.unsupportedTag = ""
+	a.zoomIdx = zoomDefaultIdx
+	a.ox, a.oy = 0, 0
+	vi.ConsoleLine(markerDrop + offer.Mime + " " + u32s(a.iw) + "x" + u32s(a.ih) +
+		" bytes=" + vi.Itoa64(int64(len(data))))
+	return true
+}
+
 // reportLoad prints the one marker that names how the load ended.
 func (a *app) reportLoad() {
 	switch a.st {
@@ -286,6 +347,9 @@ func (a *app) viewport() viewport { return viewportRect(a.ta.W, a.ta.H) }
 
 func (a *app) eventLoop() {
 	for {
+		// M124a-2: seat drag frames for this window — a delivered drop
+		// runs DropTarget (which repaints) here, one poll per loop turn.
+		a.ta.PollDrag()
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {

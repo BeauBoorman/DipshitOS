@@ -262,12 +262,18 @@ func TestClickSelectsThenOpens(t *testing.T) {
 		t.Fatalf("click selected %d, want 1", m.sel)
 	}
 	// Second click on the selected row opens it (cd into SUB is index 0 —
-	// so click index 0 first, then again).
+	// so click index 0 first, then again). M124a-2: the open settles on
+	// the RELEASE edge — a press alone pends it so a held move can arm a
+	// drag instead.
 	m.handleClick(3, 3) // index 0 = SUB
 	if m.sel != 0 {
 		t.Fatalf("click selected %d, want 0", m.sel)
 	}
 	m.handleClick(3, 3)
+	if m.path != "/host/FM" {
+		t.Fatalf("press alone must pend the open, path=%q", m.path)
+	}
+	m.releaseClick()
 	if m.path != "/host/FM/SUB" {
 		t.Fatalf("second click must open the dir, path=%q", m.path)
 	}

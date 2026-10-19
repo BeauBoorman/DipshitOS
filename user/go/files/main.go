@@ -159,6 +159,21 @@ func main() {
 		RestoreState: func(b []byte) {
 			restored, restoredOK = decodeState(b)
 		},
+		// M124a-2 (#2677): the drag source. A held move off a pressed row
+		// calls BeginDrag; the seat calls DragSource for the payload and
+		// reports the outcome back through DragEnd. GOFILES is a source
+		// only — nothing opens= it, so DropTarget stays nil.
+		DragSource: func() (string, []byte, bool) {
+			return m.dragOffer()
+		},
+		DragEnd: func(delivered bool, peer uint32) {
+			m.dragOn = false
+			if delivered {
+				vi.ConsoleLine(markerDragEnd + "delivered win=" + vi.Itoa64(int64(peer)))
+			} else {
+				vi.ConsoleLine(markerDragEnd + "cancelled")
+			}
+		},
 	})
 	if ta == nil {
 		vi.ConsoleLine("gofiles: error open -1")
@@ -184,9 +199,11 @@ func main() {
 	}
 	vi.ConsoleLine(markerAttach)
 	// M73i (#1635): enable xterm mouse reporting — ?1000 press/release
-	// edges, ?1006 SGR encoding — so rows are clickable. The kernel tracks
-	// the modes per screen (never painted).
-	if _, rcw := vi.FileWrite(fd, []byte("\x1b[?1000h\x1b[?1006h")); rcw < 0 {
+	// edges, ?1006 SGR encoding — so rows are clickable; M124a-2 (#2677)
+	// adds ?1002 button-motion so a held move off a pressed row can arm
+	// the seat-mediated drag. The kernel tracks the modes per screen
+	// (never painted).
+	if _, rcw := vi.FileWrite(fd, []byte("\x1b[?1000h\x1b[?1002h\x1b[?1006h")); rcw < 0 {
 		vi.ConsoleLine("gofiles: mouse enable failed")
 	}
 
@@ -249,6 +266,10 @@ func main() {
 		// tab-close ask is serviced before the window dies. The marker
 		// prints only on an acked handoff — "the seat stored the blob" —
 		// never on silence or a refused post.
+		// M124a-2: seat drag frames for this window — the DragEnd receipt
+		// or cancel lands here, one poll per loop turn like StateAsk.
+		ta.PollDrag()
+
 		if ta.PollStateAsk() {
 			vi.ConsoleLine(markerStateSave + m.path +
 				" sel=" + vi.Itoa64(int64(m.sel)) +
@@ -400,12 +421,13 @@ func feed(m *model, fd uint32, chunk []byte, ta *tabapp.TabApp) bool {
 				mouseTail = append([]byte(nil), kbuf...)
 				return true
 			}
+			released := kbuf[end] == 'm'
 			ok, b, x, y := parseSGRMouse(kbuf[:end+1])
 			kbuf = kbuf[end+1:]
 			if !ok {
 				continue
 			}
-			if !onMouse(m, fd, b, x, y, ta) {
+			if !onMouse(m, fd, b, x, y, released, ta) {
 				return false
 			}
 			continue
@@ -452,16 +474,27 @@ func onKey(m *model, fd uint32, ev keys.Event, ta *tabapp.TabApp) bool {
 	return true
 }
 
-// onMouse handles one SGR report: releases only get their marker (charmhello
-// precedent), a left press goes through the model as a cell click. `ta` is
-// the tab handle the M79k notify rides out on, same as onKey.
-func onMouse(m *model, fd uint32, b, x, y int, ta *tabapp.TabApp) bool {
-	pressed := b&32 == 0 && b&3 == 0 // left button, press edge
-	if pressed {
+// onMouse handles one SGR report: a left press goes through the model as a
+// cell click, a left release settles a pended open (M124a-2's deferred
+// "click again opens"), and a left button-motion (?1002, b=32+btn) arms the
+// seat-mediated drag of the pressed row — after the arm the seat owns the
+// pointer and no further reports arrive. `ta` is the tab handle the M79k
+// notify and the drag arm ride out on, same as onKey.
+func onMouse(m *model, fd uint32, b, x, y int, released bool, ta *tabapp.TabApp) bool {
+	left := b&3 == 0
+	press := !released && left && b&32 == 0
+	dragMove := !released && left && b&32 != 0
+	// A release settles the press's deferred open — but only when no drag
+	// stole the gesture (arm clears pendOpen).
+	if press {
 		next, _ := m.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
 		if nm, ok := next.(model); ok {
 			*m = nm
 		}
+	} else if released && left {
+		m.releaseClick()
+	}
+	if press || (released && left) {
 		if m.quit {
 			return false
 		}
@@ -472,6 +505,23 @@ func onMouse(m *model, fd uint32, b, x, y int, ta *tabapp.TabApp) bool {
 		flush(m, ta)
 		drainLaunch(m)
 		vi.ConsoleLine(markerRepaint)
+	}
+	if dragMove && m.pressRow >= 0 && !m.dragOn {
+		// A held move stole the gesture: the pended open is dead, and the
+		// arm either stages the payload (DragSource) or names its refusal.
+		m.pendOpen = false
+		if ta.BeginDrag() {
+			m.dragOn = true
+			m.emit(markerDragArm + m.dragName + " " + m.dragMT +
+				" len=" + vi.Itoa64(int64(m.dragLen)))
+		} else if m.dragName != "" {
+			m.emit(markerDragNo + m.dragName + " seat")
+		}
+		if !paint(fd, *m) {
+			return false
+		}
+		vi.Sleep(1)
+		flush(m, ta)
 	}
 	vi.ConsoleLine(markerMouse + vi.Itoa64(int64(b)) +
 		" x=" + vi.Itoa64(int64(x)) + " y=" + vi.Itoa64(int64(y)))
@@ -519,7 +569,7 @@ func parseSGRMouse(seq []byte) (bool, int, int, int) {
 func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
 	// Leave mouse reporting off, the alt screen, and show the cursor again
 	// before the window goes away.
-	_, _ = vi.FileWrite(fd, []byte("\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h"))
+	_, _ = vi.FileWrite(fd, []byte("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1049l\x1b[?25h"))
 	_ = vi.TtyAttach(vi.TtyDetach)
 	vi.FileClose(fd)
 	vi.ConsoleLine(markerClose)

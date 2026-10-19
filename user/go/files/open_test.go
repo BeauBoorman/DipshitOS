@@ -206,9 +206,11 @@ func TestOpenGesturesShareOneDecision(t *testing.T) {
 		"enter": func(m *model) { m.handleKey(keys.Event{Key: keys.KeyEnter}) },
 		"l":     func(m *model) { m.handleKey(runeKey('l')) },
 		"click": func(m *model) {
-			// Row 2 of the frame is the first list row; two clicks on it.
+			// Row 2 of the frame is the first list row; two clicks on it —
+			// the second click's open lands on its release edge.
 			m.handleClick(2, 3)
 			m.handleClick(2, 3)
+			m.releaseClick()
 		},
 	} {
 		withHead(t, qoiHead)
