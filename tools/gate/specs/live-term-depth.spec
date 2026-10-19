@@ -628,9 +628,10 @@ PY
 
 # --- M125e (#2590): GOTERM session state ------------------------------------
 # Runs 06/07 are SEATED boots of the save/restore half, mirroring the
-# go-wm-tabs runs 12/13 choreography: the seat binary was staged into
-# the share at tag 01 (the #1688 pattern) and is exec'd fresh here —
-# runs 03-05 simply never ran it. GOTERM declares, the user changes
+# go-wm-tabs runs 12/13 choreography: the tag-02 assert unstaged the
+# seat for the shim boots (03-05), so the tag-05 assert below re-stages
+# GOTABWM.ELF into the share and run 06 execs it fresh. GOTERM declares,
+# the user changes
 # directory, sets a variable, and paints a proof line — then the snapshot
 # chord asks every bound tab to serialize and the blob lands in
 # SESSION.TABS's `AS` trailer. Run 07 is a fresh boot: the seat loads the
@@ -655,11 +656,13 @@ shutil.copy(src, dst)
 print("staged %s into share (%d bytes)" % (dst, os.path.getsize(src)))
 PY
 
+# The share carries the seat (tag-05 stage), so wm_autostart races this
+# exec — go-wm-tabs runs 12/13 carry the same shape: whichever instance
+# registers first is the live seat, the loser prints `seat-taken` once.
 vgate_file script-06.txt <<'EOF'
 set GOMAXPROCS=1
 vf rm SESSION.TABS
 vf mkdir STATE
-wm
 exec GOTABWM.ELF
 EOF
 
@@ -671,16 +674,15 @@ vgate_file script3-06.txt <<'EOF'
 echo term-state-save-ok
 EOF
 
+# --input-string is a single runner slot (a repeat overwrites): the three
+# session lines go in ONE string, newline-submitted in order, and the
+# chord waits on the last line's marker.
 vgate_run 06 -- --display --input --via-virtio --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script-06.txt' \
     --script2 '$RUN_DIR/script2-06.txt' \
     --script2-after 'gotabwm: registered' \
-    --input-string 'cd STATE'$'\n' \
+    --input-string 'cd STATE'$'\n''set GOTERM_STATE_X=alive-7'$'\n''echo SCROLL-PROOF-LINE'$'\n' \
     --input-string-after 'goterm: ready' \
-    --input-string 'set GOTERM_STATE_X=alive-7'$'\n' \
-    --input-string-after 'goterm: line cd STATE' \
-    --input-string 'echo SCROLL-PROOF-LINE'$'\n' \
-    --input-string-after 'goterm: line set GOTERM_STATE_X=alive-7' \
     --input-chords 'ctrl-shift-s' \
     --input-chords-after 'goterm: line echo SCROLL-PROOF-LINE' \
     --script3 '$RUN_DIR/script3-06.txt' \
@@ -762,31 +764,54 @@ PY
 # are all asserted: the marker carries them, and two `test` lines make
 # the ENGINE prove the env var and cwd are live ($? is a status only the
 # real engine computes — the markerDone contract).
+#
+# The probes must be typed through the cv-input HID map, which has no
+# `$` or `"` usage (observed run 07 r1: KEY-SEQ aborted on the literal
+# `test "$X" = v` line and zero keystrokes landed). The engine check
+# therefore lives in share scripts: `source /PENV.SH` / `source /PCWD.SH`
+# are all-mappable, and each run's markerDone status IS the engine's own
+# verdict on the restored env/cwd.
+vgate_assert 06 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+for name, body in (
+    ("PENV.SH", "test $GOTERM_STATE_X = alive-7\n"),
+    ("PCWD.SH", "test $PWD = /STATE\n"),
+):
+    with open(os.path.join(share, name), "w") as f:
+        f.write(body)
+    print("wrote %s: %r" % (name, body))
+PY
+
 vgate_file script-07.txt <<'EOF'
 set GOMAXPROCS=1
 vf rm SNAPSHOT.BUNDLE
-wm
 exec GOTABWM.ELF
-EOF
-
-vgate_file script2-07.txt <<'EOF'
-dui focus 0
 EOF
 
 vgate_file script3-07.txt <<'EOF'
 echo term-state-restore-ok
 EOF
 
+# Input waits on `goterm: prompt` — the strictest precondition: the
+# editor loop is live AND finishReexec has long since committed the
+# adopted window's focus (serial: `tab focus id=3` -> `session live` ->
+# `state restore` -> `ready` -> `prompt`, over ~1.5 s). No `dui focus`:
+# it takes kernel window ids, not tab indices — `dui focus 0` aims at the
+# seat's own launcher, and the recorded focus arrives on its own anyway.
+#
+# script3 is held on the LAST probe's line marker, not the restore one:
+# the cv-input ladder paces one stroke per 0.25 s of guest rx-pool
+# consumption — gating the run's end on `state restored` let the expect
+# match mid-typing and the VM stopped with the strokes undelivered
+# (observed run 07 r3: two strokes enqueued, then SUCCESS). The line
+# marker can only print once the whole string was consumed.
 vgate_run 07 -- --display --input --via-virtio --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script-07.txt' \
-    --script2 '$RUN_DIR/script2-07.txt' \
-    --script2-after 'gotabwm: session live n=1' \
-    --input-string 'test "$GOTERM_STATE_X" = alive-7'$'\n' \
+    --input-string 'source /PENV.SH'$'\n''source /PCWD.SH'$'\n' \
     --input-string-after 'goterm: prompt' \
-    --input-string 'test "$PWD" = /STATE'$'\n' \
-    --input-string-after 'goterm: line test "$GOTERM_STATE_X" = alive-7' \
     --script3 '$RUN_DIR/script3-07.txt' \
-    --script3-after 'goterm: state restored' \
+    --script3-after 'goterm: line source /PCWD.SH' \
     --script-expect 'term-state-restore-ok' --timeout 300
 
 vgate_assert 07 serial-contains 'exec: loaded GOTABWM.ELF'
@@ -795,7 +820,9 @@ vgate_assert 07 serial-contains 'gotabwm: session load n=1 mode=restore'
 vgate_assert 07 serial-contains 'gotabwm: session reexec n=1'
 vgate_assert 07 serial-contains 'gotabwm: session exec GOTERM.ELF'
 vgate_assert 07 serial-contains 'gotabwm: session live n=1'
-vgate_assert 07 serial-contains 'exec: loaded GOTERM.ELF'
+# The seat's session reexec path names the bin but never crosses the
+# loader's `exec: loaded` line — `session exec GOTERM.ELF` is the marker.
+vgate_assert 07 serial-absent 'exec: loaded GOTERM.ELF'
 # The seat staged the stored blob for the re-exec'd tab; GOTERM's own
 # restore decoded it — the marker's fields ARE the serialized state.
 vgate_assert 07 serial-contains 'gotabwm: state restore id='
@@ -805,8 +832,8 @@ vgate_assert 07 serial-contains 'alt=0'
 vgate_assert 07 serial-contains 'tail=SCROLL-PROOF-LINE'
 vgate_assert 07 serial-contains 'goterm: ready'
 vgate_assert 07 serial-contains 'goterm: attached'
-vgate_assert 07 serial-contains 'goterm: line test "$GOTERM_STATE_X" = alive-7'
-vgate_assert 07 serial-contains 'goterm: line test "$PWD" = /STATE'
+vgate_assert 07 serial-contains 'goterm: line source /PENV.SH'
+vgate_assert 07 serial-contains 'goterm: line source /PCWD.SH'
 vgate_assert 07 serial-count 'goterm: done status=0' 2
 vgate_assert 07 serial-absent 'goterm: state refused'
 vgate_assert 07 serial-absent 'gotabwm: state drop'
@@ -816,7 +843,7 @@ vgate_assert 07 serial-absent '[EXC] parking:'
 
 # Ordering: the restore marker lands BEFORE the first prompt, and both
 # engine proofs run after it — a restored blob that never applied could
-# not produce `done status=0` on either test.
+# not produce `done status=0` on either probe.
 vgate_assert 07 python <<'PY'
 import os, re
 ser = open(os.environ["VG_SER"], errors="replace").read()
@@ -828,14 +855,14 @@ back = int(m.group(1))
 assert back > 0, "replayed scrollback is empty"
 i_rest = m.start()
 i_ready = ser.find("goterm: ready")
-i_test = ser.find('goterm: line test "$GOTERM_STATE_X" = alive-7')
-i_done = ser.find("goterm: done status=0", i_test)
+i_env = ser.find("goterm: line source /PENV.SH")
+i_done = ser.find("goterm: done status=0", i_env)
 for name, i in (("restored", i_rest), ("ready", i_ready),
-                ("test line", i_test), ("test done", i_done)):
+                ("probe line", i_env), ("probe done", i_done)):
     assert i >= 0, f"{name} marker missing from serial"
-assert i_rest < i_ready < i_test < i_done, (
+assert i_rest < i_ready < i_env < i_done, (
     f"restore chain out of order: restored={i_rest} ready={i_ready} "
-    f"test={i_test} done={i_done}")
+    f"probe={i_env} done={i_done}")
 print(f"restore chain OK: back={back}B replayed; restored < ready < env/cwd "
       f"proofs")
 PY
