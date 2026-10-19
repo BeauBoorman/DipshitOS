@@ -84,6 +84,11 @@ func TestHostNotifyEmitsOnToast(t *testing.T) {
 	if !rec.Verify(f.key) {
 		t.Fatal("record does not verify under the lane key")
 	}
+	// M127c (V2-D3): the record carries the toast's sender tab id — the
+	// correlation a banner click echoes back as NOTIFY_FOCUS.
+	if rec.Sender != 4 {
+		t.Fatalf("sender = %d, want 4", rec.Sender)
+	}
 	if string(rec.Payload) != "build done" {
 		t.Fatalf("payload = %q", rec.Payload)
 	}
@@ -168,8 +173,8 @@ func TestHostNotifyOverflowDropsOldest(t *testing.T) {
 	if len(hostNotifyPending) != hostint.MaxOutstanding {
 		t.Fatalf("pending = %v", hostNotifyPending)
 	}
-	if hostNotifyPending[0] != "t2" {
-		t.Fatalf("oldest staged = %q, want t2", hostNotifyPending[0])
+	if hostNotifyPending[0].text != "t2" {
+		t.Fatalf("oldest staged = %q, want t2", hostNotifyPending[0].text)
 	}
 	if notifyDropped == 0 || !f.hasLog(MarkerNotifyDrop) {
 		t.Fatalf("missing drop accounting: %v", f.logs)
@@ -255,5 +260,24 @@ func TestHostNotifyRevokedMaskClearsStaging(t *testing.T) {
 	}
 	if !f.hasLog("lane=notify reason=" + hostint.RefuseLaneDisabled) {
 		t.Fatalf("missing lane_disabled refusal: %v", f.logs)
+	}
+}
+
+func TestHostNotifySeatToastSendsSenderZero(t *testing.T) {
+	// V2-D3: a seat-originated toast (tab id 0 — a host drop, an agent
+	// milestone, an action toast) crosses with sender 0. A click on its
+	// banner raises the runner's window and emits no record.
+	f := newNotifyFixture(t, strings.Repeat("c8", 32))
+	hostintSeatInit()
+	f.plantArmed(7, hostint.LaneNotify)
+	hostintSeatTick()
+
+	if _, ok, _ := notifyPush(0, "seat notice", seatTick); !ok {
+		t.Fatal("seat toast refused")
+	}
+	hostintSeatTick()
+	recs := f.notifyRecords()
+	if len(recs) != 1 || recs[0].Sender != 0 {
+		t.Fatalf("records = %+v, want one sender-0 record", recs)
 	}
 }

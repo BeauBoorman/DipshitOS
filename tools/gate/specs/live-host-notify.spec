@@ -13,6 +13,15 @@
 # record logs `host-notify: dropped reason=no_bundle` — the ADR-named
 # honest answer; the banner pixel is the class-C owner leg.
 #
+# M127c (#2601, ADR 0051 V2-D3) extends run 01 with the click-through leg:
+# NOTIFY_OUT now carries the toast's sender tab id, and the
+# --host-cmd-after '…notify-out seq=5:notify-click' trigger fires the
+# IDENTICAL click path a banner's didReceive takes — the runner emits a
+# signed NOTIFY_FOCUS{sender} (NFOCUS-00000001) the seat verifies and runs
+# through focusHosted. By the fifth emit the runner's most-recent consumed
+# record is a GOFILES toast (the three drop toasts, sender 0, drained
+# first), so the click answers a real tab id, not a seat notice.
+#
 # Run 02 is the flags-off posture: same credentialed share, no lane flags —
 # no HOSTINT/, no markers either end, byte-silent.
 #
@@ -123,6 +132,7 @@ vgate_run 01 -- \
     --host-drop-file '$RUN_DIR/drop-src/B.QOI' \
     --host-drop-file '$RUN_DIR/drop-src/C.QOI' \
     --host-drop-after 'gotabwm: hostint armed' \
+    --host-cmd-after 'gotabwm: hostint notify-out seq=5:notify-click' \
     --script2 '$RUN_DIR/script-files.txt' --script2-after 'gotabwm: hostint armed' \
     --input-string $'Gcglphgjlphgjjlphgjjjlphgjjjjlp' \
     --input-string-after 'gofiles: ready' \
@@ -187,6 +197,40 @@ print("run-01 notify-out: %d emits, pace + drain + never-logged ok"
       % len(emitted))
 PY
 vgate_assert 01 serial-absent '[EXC] parking:'
+
+# M127c (#2601, ADR 0051 V2-D3): the click-through leg. The notify-click
+# bus verb fires once the seat's fifth emit marker is on serial — by then
+# the runner has consumed earlier NOTIFY_OUTs, so the verb has a
+# "most recent" to answer. The bare runner's click path is the same one
+# didReceive takes: emit a signed NOTIFY_FOCUS{sender} (NFOCUS-00000001)
+# which the seat verifies and turns into a real focus.
+vgate_assert 01 output-contains 'host-ui: cmd=notify-click state=performed'
+vgate_assert 01 output-contains 'host-notify: click-focus id='
+vgate_assert 01 serial-contains 'gotabwm: hostint notify-focus seq=1 id='
+vgate_assert 01 serial-contains 'gotabwm: tab focus id='
+vgate_assert 01 serial-contains 'gotabwm: host focus id='
+vgate_assert 01 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-01.out"), errors="replace").read()
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"host-notify: click-focus id=(\d+) seq=(\d+)", out)
+n = re.search(r"hostint notify-focus seq=(\d+) id=(\d+)", ser)
+if not m:
+    sys.exit("FAIL: no runner click-focus receipt")
+if not n:
+    sys.exit("FAIL: no seat notify-focus receipt")
+if m.group(1) == "0":
+    sys.exit("FAIL: click answered a sender-0 toast")
+if m.group(1) != n.group(2) or m.group(2) != n.group(1):
+    sys.exit("FAIL: click-focus %r vs seat notify-focus %r" % (m.groups(), n.groups()))
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+left = [x for x in os.listdir(os.path.join(share, "HOSTINT"))
+        if x.startswith("NFOCUS-")]
+if left:
+    sys.exit("FAIL: unconsumed NFOCUS records left: %r" % left)
+print("run-01 click-through: NFOCUS seq=%s focused tab %s" % (n.group(1), n.group(2)))
+PY
 
 # ---- 02: flags-off is byte-silent ---------------------------------------------
 # Same credential+seat posture on a CLEAN share, no --host-notify: the
