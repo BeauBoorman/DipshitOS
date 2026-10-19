@@ -128,6 +128,9 @@ EOF
 
 vgate_file script18.txt <<'EOF'
 exec GOFILES.ELF pick /host/FM8
+EOF
+
+vgate_file script19.txt <<'EOF'
 echo rx-go-fileman-pick-ok
 EOF
 
@@ -819,6 +822,8 @@ vgate_run 09 -- \
     --script '$RUN_DIR/script18.txt' \
     --input-chords 'P,I,C,K,M,E,.,T,X,T,return' \
     --input-chords-after 'gofiles: pick mode ' \
+    --script2 '$RUN_DIR/script19.txt' \
+    --script2-after 'gofiles: picked /host/FM8/PICKME.TXT' \
     --script-expect 'rx-go-fileman-pick-ok' --timeout 240
 
 vgate_assert 09 serial-contains 'exec: loaded GOFILES.ELF'
