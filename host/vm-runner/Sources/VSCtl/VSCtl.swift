@@ -65,6 +65,9 @@ public enum VSCtl {
         // hold refuses by name.
         "exists": "a snapshot by that name already exists",
         "not_found": "no snapshot by that name",
+        // M128d (#2608): the read-only summary verb has no armed state of
+        // its own — its answer carries "-" for what a profile-less run
+        // lacks rather than refusing. (No new refusal codes.)
     ]
 
     /// Load the `vsock-ctl` row's value from the share's SECRETS.TXT —
@@ -238,6 +241,40 @@ public struct SuspendVerdict {
     public static func refuse(_ code: String) -> SuspendVerdict { SuspendVerdict(accepted: false, code: code) }
 }
 
+/// M128d (#2608): the `profile-info` reply's payload — which machine the
+/// guest is. Read-only: `profile`/`base` are "-" when no profile/base is
+/// armed, `rollback` reports whether the armed base's `.prev` exists,
+/// `snapshots` counts the share's stored `*.vzsave` names.
+public struct ProfileSummary: Equatable {
+    public var profile: String
+    public var base: String
+    public var rollback: Bool
+    public var snapshots: UInt64
+
+    public init(profile: String, base: String, rollback: Bool, snapshots: UInt64) {
+        self.profile = profile
+        self.base = base
+        self.rollback = rollback
+        self.snapshots = snapshots
+    }
+}
+
+/// JSON-escape one value for the reply's string interpolation — the ctl
+/// writer builds lines by hand, so a profile name carrying `"` or `\`
+/// must not break the wire it rides.
+func ctlEscape(_ s: String) -> String {
+    var out = ""
+    for u in s.utf8 {
+        switch u {
+        case UInt8(ascii: "\""): out += "\\\""
+        case UInt8(ascii: "\\"): out += "\\\\"
+        case 0x00...0x1f: out += String(format: "\\u%04x", u)
+        default: out.append(Character(UnicodeScalar(u)))
+        }
+    }
+    return out
+}
+
 public struct CTLSession {
     public enum Verdict {
         case reply(Data)      // write this line, keep going
@@ -267,6 +304,12 @@ public struct CTLSession {
     /// stub answer (`unimplemented`).
     public var snapshotHandler: ((String) -> SuspendVerdict)?
     public var restoreHandler: ((String) -> SuspendVerdict)?
+
+    /// M128d (#2608): the `profile-info` answerer, injected by the glue.
+    /// Read-only — the handler samples the armed profile/share at request
+    /// time so a snapshot taken mid-run counts. Nil keeps the M115b stub
+    /// answer (`unimplemented`).
+    public var profileInfoHandler: (() -> ProfileSummary)?
 
     /// Set when the last judged request was an ACCEPTED suspend — the
     /// transport's post-reply hook (write-then-stop) reads it. Reset on
@@ -354,7 +397,7 @@ public struct CTLSession {
             return (errorLine("auth_failed", id: nil), true)
         }
         authed = true
-        return (Data("{\"ok\":true,\"session\":\"ready\",\"verbs\":[\"suspend\",\"snapshot\",\"restore\"]}\n".utf8), false)
+        return (Data("{\"ok\":true,\"session\":\"ready\",\"verbs\":[\"suspend\",\"snapshot\",\"restore\",\"profile-info\"]}\n".utf8), false)
     }
 
     /// `name` passes the ADR 0044 NAME grammar: 1-31 bytes of
@@ -451,6 +494,19 @@ public struct CTLSession {
                     return (errorLine(verdict.code, id: id), false)
                 }
                 return (Data("{\"id\":\(id),\"ok\":true,\"result\":{\"verb\":\"restore\",\"name\":\"\(name)\",\"state\":\"staged\"}}\n".utf8), false)
+            }
+            return (errorLine("unimplemented", id: id), false)
+        case "profile-info":
+            // M128d (#2608): the read-only machine summary — which
+            // .virelaivm armed this run, the base it boots, whether the
+            // base's .prev survives (a rollback target), and how many
+            // named snapshots the share parks. A bare-verb request; a
+            // `name` member is a bad_request like suspend's.
+            guard obj["name"] == nil else { return (errorLine("bad_request", id: nil), false) }
+            lastID = id
+            if let profileInfoHandler {
+                let s = profileInfoHandler()
+                return (Data("{\"id\":\(id),\"ok\":true,\"result\":{\"profile\":\"\(ctlEscape(s.profile))\",\"base\":\"\(ctlEscape(s.base))\",\"rollback\":\(s.rollback),\"snapshots\":\(s.snapshots)}}\n".utf8), false)
             }
             return (errorLine("unimplemented", id: id), false)
         default:

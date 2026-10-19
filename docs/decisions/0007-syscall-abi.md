@@ -2711,3 +2711,20 @@ command shares the same session engine (`kernel/src/vsock_ctl.zig`).
 
 The slot joins no `word_*` grant group today — the same ungrouped-service
 posture slots 88/91/92 took.
+
+## Amendment (2026-10-19, M128d #2608 — slot 93 relays `result` on ok)
+
+M115d's row left the reply's `result` member on the floor: the caller
+learned ok/refusal only, which was enough for verbs whose answer is the
+act itself (`suspend`). M128d's `profile-info` — and any later read verb —
+needs the payload. This amendment extends the row's return contract: on an
+`ok:true` reply the kernel now copies the reply's `result` member — the
+raw JSON value span, NUL-terminated when `code_cap` allows — into
+`code_ptr`; the return is still 0. The refusal contract is unchanged
+(positive length + the D4 name). Backward-compatible: every M115d caller
+reads only the return code on success, so a buffer it never consults now
+carries bytes it ignores. Callers wanting the payload size scan for the
+NUL; `code_cap` truncation leaves a valid-but-shorter span, never a
+partial name. `profile-info` is the card's sole new verb — a bare,
+read-only request answered from the host's armed profile/share state —
+surfaced through GOSET's Profile tab and GOTOP's profile line.

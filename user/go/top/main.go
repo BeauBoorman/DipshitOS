@@ -74,6 +74,11 @@ const (
 	markerRefreshErr = "top: procs err="
 	markerUsage      = "top: usage"
 
+	// M128d (#2608): the machine-identity line — one ctl `profile-info`
+	// session through slot 93 (the kernel holds the credential). Refusals
+	// name themselves; a bare run shows "refused <code>", never silence.
+	markerProfile = "top: profile "
+
 	// Filter markers (issue #2197): open/commit/cleared are the field's
 	// lifecycle; `top: filter=<text> n=<rows>` is printed after every edit
 	// rebuild, followed by a row dump of the narrowed view.
@@ -133,6 +138,9 @@ var (
 	natHeader      = widgets.Rect{X: 6, Y: 52, W: 500, H: 16}
 	natList        = widgets.Rect{X: 6, Y: 70, W: 500, H: 256}
 	natFoot        = widgets.Rect{X: 6, Y: 330, W: 500, H: 18}
+	// M128d (#2608): the machine-identity line sits under the hints —
+	// which .virelaivm this run is, the base it boots, rollback, snaps.
+	natProf        = widgets.Rect{X: 6, Y: 350, W: 500, H: 18}
 	natRowH        = 16
 )
 
@@ -148,6 +156,10 @@ type app struct {
 
 	items  []string
 	status string
+	// M128d: the profile summary line — sampled on startup and on every
+	// explicit refresh (never the 1 Hz tick: a ctl session per second is
+	// a heartbeat the channel doesn't need).
+	profLine string
 
 	refreshBtn widgets.Button
 	killBtn    widgets.Button
@@ -160,6 +172,7 @@ type app struct {
 	summary    widgets.Text
 	header     widgets.Text
 	foot       widgets.Text
+	profTxt    widgets.Text
 	list       widgets.List
 	scroll     widgets.Scrollbar // proc-list chrome (§5.2); absent while rows fit
 	scrollDrag bool              // the thumb is being dragged
@@ -261,6 +274,9 @@ func (a *app) refreshAll(rows, announce bool) {
 		return
 	}
 	a.net.Refresh()
+	if rows {
+		a.refreshProfile()
+	}
 	if a.pg == pageAgent {
 		a.refreshAgent()
 	}
@@ -288,6 +304,33 @@ func (a *app) refreshAll(rows, announce bool) {
 		vi.ConsoleLine(markerRefreshed)
 	}
 	a.rebuildItems()
+}
+
+// ctlProfile is the slot-93 seam — vi.VsockCtl on the guest, a fake in
+// host tests (the same discipline every other vi.* caller keeps).
+var ctlProfile = vi.VsockCtl
+
+// refreshProfile runs one ctl `profile-info` session and rewrites the
+// identity line — the profile name, the base image's name, whether the
+// base's .prev survives (a rollback target), and the stored snapshot
+// count. A refusal (or no channel at all) names its code in the same
+// line: the guest sees "which machine" or "why it cannot ask", never a
+// blank.
+func (a *app) refreshProfile() {
+	p, verdict := vi.FetchProfileInfo(ctlProfile)
+	if verdict != "" {
+		a.profLine = "profile: refused " + verdict
+		vi.ConsoleLine(markerProfile + "refused " + verdict)
+		return
+	}
+	rb := "no"
+	if p.Rollback {
+		rb = "yes"
+	}
+	a.profLine = "profile " + p.Name + "  base " + p.Base +
+		"  rollback " + rb + "  snaps " + vi.Itoa64(int64(p.Snapshots))
+	vi.ConsoleLine(markerProfile + "name=" + p.Name + " base=" + p.Base +
+		" rollback=" + rb + " snaps=" + vi.Itoa64(int64(p.Snapshots)))
 }
 
 // printRows emits one bounded marker per visible row — the serial evidence
@@ -366,6 +409,7 @@ func (a *app) layout() {
 	a.summary = widgets.Text{R: scaleR(natSummary), Label: a.status, Fg: t.Muted, Bg: t.Bg}
 	a.header = widgets.Text{R: scaleR(natHeader), Label: a.tab.Header(), Fg: t.Accent, Bg: t.Surface}
 	a.foot = widgets.Text{R: scaleR(natFoot), Label: a.footLine(), Fg: t.Muted, Bg: t.Bg}
+	a.profTxt = widgets.Text{R: scaleR(natProf), Label: a.profLine, Fg: t.Muted, Bg: t.Bg}
 	a.filterLabel = widgets.Text{R: scaleR(natFilterLabel), Label: "Filter:", Fg: t.Muted, Bg: t.Bg}
 	a.filter.R = scaleR(natFilter)
 
@@ -472,6 +516,7 @@ func (a *app) draw() {
 	a.list.Draw(cv)
 	a.scroll.Draw(cv)
 	a.foot.Draw(cv)
+	a.profTxt.Draw(cv)
 }
 
 // setPage switches tabs and reports it.

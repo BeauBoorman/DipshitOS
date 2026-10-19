@@ -33,10 +33,11 @@ const (
 	tabServices
 	tabGrants
 	tabShortcuts
+	tabProfile
 	tabCount
 )
 
-var tabNames = [tabCount]string{"settings", "services", "grants", "shortcuts"}
+var tabNames = [tabCount]string{"settings", "services", "grants", "shortcuts", "profile"}
 
 // cellRect is tab i's slice of the strip — the one geometry source Draw and
 // the hit test share (the widget Bounds() pattern).
