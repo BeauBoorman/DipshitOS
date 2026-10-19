@@ -64,7 +64,10 @@ func drainLaunch(m *model) {
 	if !ok {
 		return
 	}
-	pid, err := execApp(r.bin, r.path)
+	// The manifest's argv= tail rides ahead of the file path (M124d): the
+	// exec argv is [fixed args…, path], one slot always kept for the file.
+	argv := append(append([]string{}, r.args...), r.path)
+	pid, err := execApp(r.bin, argv...)
 	if err != nil {
 		vi.ConsoleLine(markerOpenLaunchNo + baseName(r.path) +
 			" handler=" + r.bin + " err=" + err.Error())
@@ -504,19 +507,32 @@ func onKey(m *model, fd uint32, ev keys.Event, ta *tabapp.TabApp) bool {
 // notify and the drag arm ride out on, same as onKey.
 func onMouse(m *model, fd uint32, b, x, y int, released bool, ta *tabapp.TabApp) bool {
 	left := b&3 == 0
+	right := b&3 == 2
 	press := !released && left && b&32 == 0
+	rpress := !released && right && b&32 == 0
 	dragMove := !released && left && b&32 != 0
 	// A release settles the press's deferred open — but only when no drag
 	// stole the gesture (arm clears pendOpen).
 	if press {
-		next, _ := m.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
-		if nm, ok := next.(model); ok {
-			*m = nm
+		if m.mode == modeContext {
+			// M124d (#2583): a left press while the menu is open picks a
+			// row or dismisses — it never reaches the list underneath.
+			m.handleMenuClick(x, y)
+		} else {
+			next, _ := m.Update(tea.MouseClickMsg{X: x, Y: y, Button: tea.MouseLeft})
+			if nm, ok := next.(model); ok {
+				*m = nm
+			}
 		}
 	} else if released && left {
 		m.releaseClick()
 	}
-	if press || (released && left) {
+	if rpress {
+		// M124d (#2583): a right press arms (or dismisses) the context
+		// menu — the release edge is a no-op so the menu stays open.
+		m.handleRightClick(x, y)
+	}
+	if press || rpress || (released && left) {
 		if m.quit {
 			return false
 		}

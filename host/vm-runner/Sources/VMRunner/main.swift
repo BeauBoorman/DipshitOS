@@ -6629,15 +6629,17 @@ func startPointerVirtioInject() {
                 for part in script.split(separator: ";") {
                     let fields = part.split(separator: ",", omittingEmptySubsequences: false).map { String($0).trimmingCharacters(in: .whitespaces) }
                     guard fields.count >= 2, let gx = Double(fields[0]), let gy = Double(fields[1]), gx >= 0, gy >= 0, gx <= 1280, gy <= 720 else {
-                        FileHandle.standardError.write(Data("ERROR: --pointer-virtio step '\(part)' is not <x>,<y>[,c|d|u] with 0<=x<=1280, 0<=y<=720\n".utf8))
+                        FileHandle.standardError.write(Data("ERROR: --pointer-virtio step '\(part)' is not <x>,<y>[,c|d|u|rc] with 0<=x<=1280, 0<=y<=720\n".utf8))
                         steps = []
                         break
                     }
                     // Grammar: bare = move (buttons 0); `c`/`1` = click
                     // (down+up at one point, the claim 9367 shape); `d`/`2`
-                    // = press-and-hold (down); `u`/`3` = release (up). The
-                    // WMS5 drag choreography is `<title>,d ; x1,y1 ; x2,y2 ;
-                    // ...,u` — held moves between down and up.
+                    // = press-and-hold (down); `u`/`3` = release (up);
+                    // `rc` = right-click (buttons bit1 down+up, M124d's
+                    // context-menu leg). The WMS5 drag choreography is
+                    // `<title>,d ; x1,y1 ; x2,y2 ; ...,u` — held moves
+                    // between down and up.
                     let mode: CustomVirtioSpike.PtrStep.Mode
                     if fields.count >= 3 && (fields[2] == "d" || fields[2] == "2") {
                         mode = .down
@@ -6645,6 +6647,8 @@ func startPointerVirtioInject() {
                         mode = .up
                     } else if fields.count >= 3 && (fields[2] == "c" || fields[2] == "1") {
                         mode = .click
+                    } else if fields.count >= 3 && fields[2] == "rc" {
+                        mode = .rightClick
                     } else {
                         mode = .move
                     }
@@ -8551,14 +8555,17 @@ enum CustomVirtioSpike {
 
     /// Claim 9367: one injected pointer report — absolute logical coords
     /// (HID 0..32767 convention; the guest maps them onto the framebuffer)
-    /// plus the button byte (bit0 = button 1).
+    /// plus the button byte (bit0 = button 1, bit1 = button 2/right).
     /// M32 WMS5 (issue #625): the step grammar gains `d` (down, held) and
     /// `u` (up) so a DRAG can be expressed: move to the title bar, down,
     /// move while held, up — the established `c` click still expands to
     /// down+up at one point (zero regression for the claim 9367 gates).
+    /// M124d (#2583): `rc` adds the right-button click for GOFILES'
+    /// context-menu leg (the guest already maps buttons bit1 to SGR
+    /// button 2 — only the injection grammar lacked a way to ask for it).
     struct PtrStep {
         enum Mode {
-            case move, click, down, up
+            case move, click, down, up, rightClick
         }
 
         let x: UInt16
@@ -8858,6 +8865,13 @@ enum CustomVirtioSpike {
                 case .click:
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) move buttons=0x0 x=\(s.x) y=\(s.y)"))
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0x01), "\(sequenceTag) down buttons=0x1 x=\(s.x) y=\(s.y)"))
+                    msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) up buttons=0x0 x=\(s.x) y=\(s.y)"))
+                case .rightClick:
+                    // Same click choreography, button byte bit1: the
+                    // guest's right-button edge logic sees a physical
+                    // right-click (driving_award maps it to SGR button 2).
+                    msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) move buttons=0x0 x=\(s.x) y=\(s.y)"))
+                    msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0x02), "\(sequenceTag) down buttons=0x2 x=\(s.x) y=\(s.y)"))
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) up buttons=0x0 x=\(s.x) y=\(s.y)"))
                 case .down:
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) move buttons=0x0 x=\(s.x) y=\(s.y)"))

@@ -59,12 +59,18 @@
 # GOFILES.ELF, and the app's own `state restored` marker names the cwd,
 # cursor, scroll, view and sort it decoded — the same session resumed.
 #
+# M124d (#2583) adds run 10: the right-click context menu. A real pointer
+# sequence (the `rc` step mode this card adds to --pointer-virtio) opens
+# the menu on NOTES.TXT's row, descends "Open With…", and picks GOEDIT.ELF
+# out of the opens=text submenu — the same decision/outcome marker pair
+# every open leg carries, plus GOEDIT's own read of the file it was handed.
+#
 # exec-order: assert-proven -- each run ends on its own `rx-go-fileman-*`
 # marker, which only its closing script prints, and that script waits on the
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, and resumes its session"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, and opens with the right-click menu"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -132,6 +138,16 @@ EOF
 
 vgate_file script19.txt <<'EOF'
 echo rx-go-fileman-pick-ok
+EOF
+
+vgate_file script-10.txt <<'EOF'
+exec GOFILES.ELF /host/FM9
+EOF
+
+vgate_file script3-10.txt <<'EOF'
+dui close 3
+dui close 2
+echo rx-go-fileman-openwith-ok
 EOF
 
 vgate_file script11.txt <<'EOF'
@@ -237,6 +253,14 @@ fm8 = os.path.join(share, "FM8")
 os.makedirs(fm8, exist_ok=True)
 with open(os.path.join(fm8, "PICKME.TXT"), "w") as f:
     f.write("pick-me-please\n")
+# M124d (#2583): run 10's context-menu directory — one text file so the
+# right-click row, the submenu membership, and the launched read all pin
+# to the same name. APPS.TXT itself is seeded by gate_seed_share_contents,
+# so the opens= rows the menu decodes are the shipping manifest's.
+fm9 = os.path.join(share, "FM9")
+os.makedirs(fm9, exist_ok=True)
+with open(os.path.join(fm9, "NOTES.TXT"), "w") as f:
+    f.write("open-with-me\n")
 # M125c (#2588): runs 07/08 — the session save/restore leg. FM7 holds one
 # subdirectory to descend into (SUB7, two files so `j` provably moves the
 # cursor onto DEEP2.TXT) plus a top-level file. The leg rides the Go seat,
@@ -838,3 +862,66 @@ vgate_assert 09 serial-absent 'gofiles: pick cancel'
 vgate_assert 09 serial-absent 'gofiles: list error'
 vgate_assert 09 serial-absent '[EXC] parking:'
 vgate_assert 09 serial-absent 'exited status=139'
+
+# --- M124d (#2583): run 10, the right-click Open With… submenu -----------
+# GOFILES in /host/FM9 on the kernel desktop (the run 01–06 shape: no
+# seat, window at 32,32, client origin y=48, SGR cell 8x16). The gesture
+# is one --pointer-virtio sequence of three clicks:
+#
+#   40,88,rc    right-click NOTES.TXT's row (list row 0 = SGR row 3, so
+#               the app reports `mouse b=2` and arms the menu anchored at
+#               the clicked cell)
+#   68,104,c    left-click the plate's "Open With…" row (top item 1 → SGR
+#               row 4) — descends into the opens= submenu
+#   172,120,c   left-click the submenu's second row (GOEDIT.ELF, marked
+#               "(default)" — the registry's text handler)
+#
+# The proof is the pair of markers every open leg carries — the DECISION
+# (`open chose … handler=GOEDIT.ELF`, which the menu emits for a manifest
+# pick exactly as the `o` list does for a registry pick) and the OUTCOME
+# (`open launched … pid=` after vi.Exec returned) — plus GOEDIT's own
+# `goedit: read` of the file the menu handed it. The menu's own markers
+# name the mime spelling opens= matched (text/plain) and the candidate
+# count (NOTE.ELF + GOEDIT.ELF, the manifest's two opens=text rows).
+vgate_run 10 -- \
+    --screen '$RUN_DIR/fileman-openwith-screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script-10.txt' \
+    --pointer-virtio '40,88,rc;68,104,c;172,120,c' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-10.txt' \
+    --script3-after 'gofiles: open launched NOTES.TXT handler=GOEDIT.ELF pid=' \
+    --script-expect 'rx-go-fileman-openwith-ok' --timeout 300
+
+vgate_assert 10 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 10 serial-contains 'gofiles: list /host/FM9 n=1'
+vgate_assert 10 serial-contains 'gofiles: entry NOTES.TXT file'
+
+# The right-press arrived as SGR button 2 and armed the menu on the row.
+vgate_assert 10 serial-contains 'gofiles: mouse b=2'
+vgate_assert 10 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=2'
+
+# The submenu: both opens=text manifest rows, and the descent named the
+# candidate count.
+vgate_assert 10 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=2'
+
+# The pick and the launch: decision marker, outcome marker, and GOEDIT's
+# own report that it read the file the menu named.
+vgate_assert 10 serial-contains 'gofiles: open chose NOTES.TXT type=text handler=GOEDIT.ELF'
+vgate_assert 10 serial-contains 'gofiles: open launched NOTES.TXT handler=GOEDIT.ELF pid='
+vgate_assert 10 serial-contains 'goedit: open id='
+vgate_assert 10 serial-contains 'goedit: read /host/FM9/NOTES.TXT n=13'
+
+# Clean teardown: both windows close through dui, the run marker prints.
+vgate_assert 10 serial-contains 'dui close: closed=3'
+vgate_assert 10 serial-contains 'dui close: closed=2'
+vgate_assert 10 serial-contains 'rx-go-fileman-openwith-ok'
+
+# The refusals that must NOT happen: no launch refusal, no dismiss after
+# the pick (a `menu closed` would mean a press missed the plate), and the
+# menu must not fall through to the list underneath.
+vgate_assert 10 serial-absent 'gofiles: open launch refused'
+vgate_assert 10 serial-absent 'gofiles: menu closed'
+vgate_assert 10 serial-absent 'gofiles: open file NOTES.TXT'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 serial-absent 'exited status=139'
