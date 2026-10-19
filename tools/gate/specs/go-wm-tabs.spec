@@ -8,7 +8,7 @@
 # 3 kernel + 3×4 Ms + 1 spare). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# FIFTEEN vgate_runs share one seeded host share (`vgate_share seed`):
+# SEVENTEEN vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -72,6 +72,14 @@
 #       re-execs GOEDIT.ELF (bare bin — no argv exists on a re-exec), and
 #       `goedit: state restored` reports caret/selection/rings/histories
 #       back; a post-restore ctrl-z PROVES the ring is live, not a parse.
+#   16  M125d (#2589): WEB.ELF as the state client — browse a form page,
+#       scroll, type into a text field, toggle a checkbox, move a select,
+#       then the snapshot chord. SESSION.TABS's AS trailer carries the
+#       app's v1 blob (target + scroll + zoom + field values).
+#   17  M125d (#2589): the second boot. The seat restores run 16's file,
+#       re-execs WEB.ELF (bare bin — the blob's url field is the only
+#       carrier), and `web: state restored` reports url/scroll/zoom and
+#       3/3 fields re-applied onto the refetched page.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -89,6 +97,7 @@
 #   bash tools/go/build-goterm.sh    ->  .build/go/GOTERM.ELF
 #   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF   (run 08)
 #   bash tools/go/build-tabapp.sh    ->  .build/go/GOTABAPP.ELF  (runs 12/13)
+#   bash tools/go/build-web.sh       ->  .build/go/WEB.ELF       (runs 16/17)
 #
 # exec-order: assert-proven -- each run ends on a marker only its script
 # prints (`rx-gotabwm-tabs-ok` / `rx-gotabwm-session-ok` / `rx-gotabwm-apps-ok`).
@@ -294,6 +303,31 @@ if not os.path.exists(src):
 shutil.copy(src, os.path.join(share, "GOTABAPP.ELF"))
 print("staged GOTABAPP.ELF into share (%d bytes)" %
       os.path.getsize(os.path.join(share, "GOTABAPP.ELF")))
+PY
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "WEB.ELF")
+if not os.path.exists(src):
+    sys.exit("WEB.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-web.sh")
+shutil.copy(src, os.path.join(share, "WEB.ELF"))
+# M125d (#2589): the state page. Taller than the 720 CSS px viewport so a
+# pagedown leaves a real scroll offset, with a text input, a checkbox and
+# a select — the three control shapes the v1 blob carries.
+with open(os.path.join(share, "FORM.HTML"), "w") as f:
+    f.write("<h1>state page</h1>"
+            '<p style="height:900px">spacer</p>'
+            '<form action="/host/FORM.HTML">'
+            '<input type="text" name="q">'
+            '<input type="checkbox" name="ck">'
+            '<select name="pick">'
+            "<option>alpha</option><option>beta</option>"
+            "</select></form>\n")
+print("staged WEB.ELF (%d bytes) + FORM.HTML" %
+      os.path.getsize(os.path.join(share, "WEB.ELF")))
 PY
 
 vgate_run 01 -- \
@@ -2166,3 +2200,167 @@ vgate_assert 15 serial-contains 'goedit: undo n=0 cur=16'
 vgate_assert 15 serial-contains 'rx-goedit-state-restore-ok'
 vgate_assert 15 serial-absent '[EXC] parking:'
 vgate_assert 15 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 16 (M125d / #2589): WEB as the state client — a real session, not the
+# demo's literal bytes. WEB.ELF opens /host/FORM.HTML (taller than the 720
+# CSS px viewport), pagedown leaves a real scroll offset, tab focuses the
+# text input and five letters land in it, tab+space checks the checkbox,
+# tab+down moves the select to "beta" — then ctrl-shift-s has the seat ask
+# and the app stage its v1 blob: url + scroll + zoom + the field values.
+
+vgate_file script-16.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-16.txt <<'EOF'
+dui focus 0
+exec WEB.ELF /host/FORM.HTML
+EOF
+
+vgate_file script3-16.txt <<'EOF'
+wm
+dui
+echo rx-web-state-save-ok
+EOF
+
+vgate_run 16 -- \
+    --screen '$RUN_DIR/screen-16' \
+    --via-virtio \
+    --script '$RUN_DIR/script-16.txt' \
+    --script2 '$RUN_DIR/script2-16.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'pagedown,tab,h,e,l,l,o,tab,space,tab,down,ctrl-shift-s' \
+    --input-chords-after 'web: ready' \
+    --script3 '$RUN_DIR/script3-16.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-web-state-save-ok' --timeout 300
+
+vgate_assert 16 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 16 serial-contains 'gotabwm: registered'
+vgate_assert 16 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 16 serial-contains 'web: url /host/FORM.HTML'
+vgate_assert 16 serial-contains 'web: ready'
+# A fresh tab honestly has no stored state — the restore request is the
+# honest empty answer, never a fabricated blob.
+vgate_assert 16 serial-absent 'web: state restored'
+vgate_assert 16 serial-absent 'web: state refused'
+# The session's receipts: the scroll, and the snapshot chord's ask that
+# the app answered — the seat stored WEB's appver=1 envelope.
+vgate_assert 16 serial-contains 'gotabwm: state ask id='
+vgate_assert 16 serial-contains 'gotabwm: state save id='
+vgate_assert 16 serial-contains ' ver=1'
+vgate_assert 16 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 16 serial-absent 'gotabwm: state drop'
+# Byte-level on the share: the AS trailer framing plus the blob's own
+# v1 header — url text, a real scroll offset, the 100% rung and all
+# three serialized fields (text/hello, checkbox/checked, select/beta).
+vgate_assert 16 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] != 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (b[0], b[2]))
+off = 6 + 69
+if len(b) < off + 6 + 8:
+    sys.exit("SESSION.TABS too short for a state trailer: %d" % len(b))
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 1:
+    sys.exit("app_state header %r" % b[off:off+6])
+ent = b[off+6:off+14]
+if ent[0] != 0 or ent[1] != 1:
+    sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
+ln = int.from_bytes(ent[4:8], "little")
+blob = b[off+14:off+14+ln]
+if len(blob) != ln or ln < 8:
+    sys.exit("blob len=%d" % ln)
+if blob[0] != 1 or blob[1] != 0:
+    sys.exit("blob fmtVer=%d flags=%d" % (blob[0], blob[1]))
+zoom = int.from_bytes(blob[2:4], "little")
+scroll = int.from_bytes(blob[4:8], "little")
+ul = int.from_bytes(blob[8:10], "little")
+url = blob[10:10+ul]
+if url != b"/host/FORM.HTML":
+    sys.exit("blob url %r" % url)
+nf = blob[10+ul]
+if nf != 3:
+    sys.exit("blob fields=%d want 3" % nf)
+if zoom != 100 or scroll <= 0:
+    sys.exit("zoom=%d scroll=%d" % (zoom, scroll))
+print("SESSION.TABS app_state: web v1 len=%d url=%r scroll=%d zoom=%d fields=%d"
+      % (ln, url, scroll, zoom, nf))
+PY
+vgate_assert 16 serial-contains 'rx-web-state-save-ok'
+vgate_assert 16 serial-absent '[EXC] parking:'
+vgate_assert 16 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 17 (M125d / #2589): the restore half. A FRESH boot loads the file run
+# 16 left, re-execs WEB.ELF — bare bin, no argv exists on a re-exec — and
+# the app's kind-21 request hands the envelope back. WEB navigates to the
+# blob's url, and `web: state restored` reports the re-clamped scroll, the
+# rung and 3/3 fields landed on the refetched page.
+
+vgate_file script-17.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-17.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-17.txt <<'EOF'
+wm
+dui
+echo rx-web-state-restore-ok
+EOF
+
+vgate_run 17 -- \
+    --screen '$RUN_DIR/screen-17' \
+    --via-virtio \
+    --script '$RUN_DIR/script-17.txt' \
+    --script2 '$RUN_DIR/script2-17.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-17.txt' \
+    --script3-after 'web: state restored' \
+    --script-expect 'rx-web-state-restore-ok' --timeout 300
+
+vgate_assert 17 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 17 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 17 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 17 serial-contains 'gotabwm: session exec WEB.ELF'
+vgate_assert 17 serial-contains 'gotabwm: session live n=1'
+# The url came from the blob: `session exec WEB.ELF` re-execs the bare bin
+# (no argv exists on a restored session), yet the browser opened FORM.HTML.
+vgate_assert 17 serial-contains 'web: url /host/FORM.HTML'
+vgate_assert 17 serial-contains 'gotabwm: state restore id='
+vgate_assert 17 serial-contains ' ver=1'
+vgate_assert 17 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(
+    r"^web: state restored url=(\S+) scroll=(\d+) zoom=(\d+) forms=(\d+)/(\d+)$",
+    ser, re.M)
+if not m:
+    sys.exit("missing 'web: state restored' line")
+if m.group(1) != "/host/FORM.HTML":
+    sys.exit("restored url " + m.group(1))
+if int(m.group(2)) <= 0:
+    sys.exit("restored scroll=%s want >0" % m.group(2))
+if m.group(3) != "100":
+    sys.exit("restored zoom=" + m.group(3))
+if m.group(4) != "3" or m.group(5) != "3":
+    sys.exit("restored forms=%s/%s want 3/3" % (m.group(4), m.group(5)))
+print("web state restored: url=%s scroll=%s zoom=%s forms=%s/%s" % m.groups())
+PY
+vgate_assert 17 serial-absent 'web: state refused'
+vgate_assert 17 serial-absent 'gotabwm: state drop'
+vgate_assert 17 serial-contains 'rx-web-state-restore-ok'
+vgate_assert 17 serial-absent '[EXC] parking:'
+vgate_assert 17 serial-absent 'exited status=139'
