@@ -98,14 +98,26 @@ const (
 	notifyTextPad   = 6           // text origin past the panel's left edge
 )
 
+// notifyAction marks a toast whose click is a seat action, not a sender
+// focus. notifyActionNone is every ordinary notification; the crash-snap
+// offer (M125f) is the only action kind — its click stages the restore.
+const (
+	notifyActionNone      uint8 = 0
+	notifyActionCrashSnap uint8 = 1
+)
+
 // notifyToast is one queued notification. tabID is the SENDER (the window
 // the request carried), and it is what a click focuses — not a slot index.
+// For an action toast (crashSnap) snap carries the slot name the click
+// resolves against; ordinary toasts leave it empty.
 type notifyToast struct {
 	tabID    uint32
 	text     string
 	born     uint64
 	expires  uint64
 	centerID uint32
+	action   uint8
+	snap     string
 }
 
 // notifyQueue is the seat's toast strip: oldest first, so the newest is
@@ -152,10 +164,17 @@ func notifyQueueSet(q []notifyToast) {
 // accepted all the same (ok is true), which is what keeps suppression from
 // ever losing one; the caller tells the two outcomes apart by notifyDND.
 func notifyPush(tabID uint32, text string, ticks uint64) (string, bool, bool) {
+	return notifyPushAction(tabID, text, ticks, notifyActionNone, "")
+}
+
+// notifyPushAction is notifyPush's action-carrying variant — identical
+// except the toast and its center row both remember which seat action a
+// click runs and the name it runs against (M125f's crash-snap offer).
+func notifyPushAction(tabID uint32, text string, ticks uint64, action uint8, snap string) (string, bool, bool) {
 	if text == "" {
 		return "", false, false
 	}
-	centerID := notifyCenterPush(tabID, text)
+	centerID := notifyCenterPushSnap(tabID, text, snap)
 	if notifyDND {
 		return text, true, false
 	}
@@ -171,6 +190,8 @@ func notifyPush(tabID uint32, text string, ticks uint64) (string, bool, bool) {
 		born:     ticks,
 		expires:  ticks + NotifyTicks,
 		centerID: centerID,
+		action:   action,
+		snap:     snap,
 	})
 	// M108d (#2328, ADR 0051 D5): a toast that reached the strip stages its
 	// text for the notify-out lane — no-op unless an ARMED names the lane.
@@ -483,6 +504,9 @@ func notifyClicked(px, py uint32) int {
 	if !ok {
 		return 0
 	}
+	// The entry is read before the removal: an action toast's click
+	// resolves its seat action (M125f's staged restore), not a focus.
+	toast := notifyQueue[i]
 	id, ok := notifyDismissByIndex(i)
 	if !ok {
 		return 0
@@ -490,6 +514,13 @@ func notifyClicked(px, py uint32) int {
 	// The marker comes first: the toast IS gone at this point, whatever
 	// the kernel says about focusing a window that may have died.
 	vi.ConsoleLine(MarkerNotifyDismiss + vi.Itoa64(int64(id)))
+	if toast.action == notifyActionCrashSnap {
+		crashSnapRestore(toast.snap)
+		// A resolved offer leaves both surfaces: the paired history
+		// row retires with the toast.
+		dropCenterRowByID(toast.centerID)
+		return 1
+	}
 	if !focusHosted(id) {
 		return 1
 	}

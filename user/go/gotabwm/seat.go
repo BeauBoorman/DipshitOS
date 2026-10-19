@@ -385,6 +385,11 @@ func main() {
 		}
 	}
 
+	// M125f (#2591): a parked crash slot (CRASHSNAP.LAST written by the
+	// previous boot's crash save) becomes the recovery toast — Restore
+	// stages it as the next --resume image, Dismiss consumes the offer.
+	crashSnapOffer()
+
 	// 6. Composite/present loop paced by the kind-18 tick - and the WM_RPC
 	//    serve loop (M57c / M62b): the seat hosts tabapp clients that declare
 	//    over the mailbox, keeps them on the in-process strip, and paints a
@@ -596,6 +601,9 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	// is never painted for one more frame, and so the dismiss marker lands
 	// in the same tick the pixels stop changing.
 	notifyTick(ticks)
+	// M125f (#2591): a crash receipt's deferred re-exec runs here — off
+	// the teardown event and clear of crashSave's whole-VM save.
+	crashRestartTick()
 	painted := paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, ticks)
 	centerPainted := paintNotifyCenter(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	// M124a (#2580): the drag ghost paints over every other chrome layer

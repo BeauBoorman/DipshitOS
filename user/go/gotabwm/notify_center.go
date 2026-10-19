@@ -49,6 +49,10 @@ type centerNotification struct {
 	op       uint8
 	pct      int
 	pid      uint8
+	// snap is the crash-save slot name when this row is M125f's recovery
+	// offer: its click stages the restore, its row X the dismiss — not a
+	// sender focus. Empty on every ordinary notice.
+	snap string
 }
 
 var (
@@ -60,8 +64,19 @@ var (
 )
 
 func notifyCenterPush(tabID uint32, text string) uint32 {
+	return notifyCenterPushSnap(tabID, text, "")
+}
+
+// notifyCenterPushSnap carries the crash-snap slot name onto the history
+// row so the offer survives its own toast's expiry: the row is the offer
+// after the toast fades.
+func notifyCenterPushSnap(tabID uint32, text string, snap string) uint32 {
 	source := "App " + vi.Itoa64(int64(tabID))
-	if i := tabs.index(tabID); i >= 0 && tabs.At(i).Title != "" {
+	if snap != "" {
+		// The recovery offer is the seat's own, not a sender's — a
+		// bogus "App 0" would send a reader hunting for window zero.
+		source = "Seat"
+	} else if i := tabs.index(tabID); i >= 0 && tabs.At(i).Title != "" {
 		source = tabs.At(i).Title
 	}
 	if len(notifyCenter) == NotifyCenterMax {
@@ -74,6 +89,7 @@ func notifyCenterPush(tabID uint32, text string) uint32 {
 	}
 	notifyCenter = append(notifyCenter, centerNotification{
 		tabID: tabID, id: notifyCenterNextID, source: source, text: text,
+		snap: snap,
 	})
 	notifyHistoryChanged()
 	return notifyCenterNextID
@@ -101,12 +117,10 @@ func dismissNotifyCenter(index int) bool {
 	return true
 }
 
-func dismissNotifyCenterEntry(index int) bool {
-	if index < 0 || index >= len(notifyCenter) {
-		return false
-	}
-	id := notifyCenter[index].id
-	dismissNotifyCenter(index)
+// dropCenterRowToast removes the toast paired to center row id, printing
+// its dismiss marker when one was live — a resolved or removed row never
+// leaves its toast behind to answer twice.
+func dropCenterRowToast(id uint32) {
 	keep := notifyQueue[:0]
 	dismissed := false
 	var sender uint32
@@ -122,10 +136,44 @@ func dismissNotifyCenterEntry(index int) bool {
 	if dismissed {
 		vi.ConsoleLine(MarkerNotifyDismiss + vi.Itoa64(int64(sender)))
 	}
+}
+
+// dropCenterRowByID removes the history row id when present — a resolved
+// offer's toast click retires the paired row with it.
+func dropCenterRowByID(id uint32) {
+	for i := range notifyCenter {
+		if notifyCenter[i].id == id {
+			dismissNotifyCenter(i)
+			return
+		}
+	}
+}
+
+func dismissNotifyCenterEntry(index int) bool {
+	if index < 0 || index >= len(notifyCenter) {
+		return false
+	}
+	entry := notifyCenter[index]
+	if entry.snap != "" {
+		// M125f (#2591): dismissing the recovery offer's row is the
+		// offer's Dismiss gesture — resolved and consumed, like a click's
+		// Restore, only in the other direction.
+		crashSnapDismiss(entry.snap)
+	}
+	id := entry.id
+	dismissNotifyCenter(index)
+	dropCenterRowToast(id)
 	return true
 }
 
 func clearNotifyCenter() int {
+	// Snap offers inside a clear-all are dismissed one by one — the
+	// resolve is part of the removal, not a silent drop.
+	for _, entry := range notifyCenter {
+		if entry.snap != "" {
+			crashSnapDismiss(entry.snap)
+		}
+	}
 	n := len(notifyCenter)
 	notifyCenter = nil
 	if n > 0 {
@@ -251,6 +299,18 @@ func notifyCenterClick(px, py uint32) bool {
 				if dismissNotifyCenterEntry(index) {
 					vi.ConsoleLine(MarkerNotifyCenterAction + "dismiss")
 				}
+				return true
+			}
+			if entry.snap != "" {
+				// The recovery offer's row body is its Restore gesture —
+				// the same arm a toast click runs, so the answer does not
+				// depend on which surface carried the offer. A resolved
+				// offer leaves both surfaces: the row like a dismissed
+				// one, its toast like an expired one.
+				crashSnapRestore(entry.snap)
+				dismissNotifyCenter(index)
+				dropCenterRowToast(entry.id)
+				vi.ConsoleLine(MarkerNotifyCenterAction + "restore " + entry.snap)
 				return true
 			}
 			if !entry.sourceGone && tabs.index(entry.tabID) >= 0 {

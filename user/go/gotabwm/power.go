@@ -190,17 +190,7 @@ var vsockCtlRequest = func(verb, name string, code []byte) int64 {
 func suspendVerdict() string {
 	var code [40]byte
 	r := vsockCtlRequest("suspend", "", code[:])
-	switch {
-	case r == 0:
-		return "ok"
-	case r > 0:
-		if r > int64(len(code)) {
-			r = int64(len(code))
-		}
-		return string(code[:r])
-	default:
-		return vi.ErrnoName(r)
-	}
+	return ctlVerdict(r, code[:])
 }
 
 // requestSuspend sends the seat's Suspend verb down the ctl channel and
