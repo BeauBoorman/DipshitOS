@@ -12,12 +12,6 @@ import (
 	"virelai/vsys"
 )
 
-// ticksPerSleepSecond mirrors the front-ends' constant (and their actual
-// behavior): `sleep N` converts seconds to ticks at 100:1 — on the real
-// 1 Hz kernel tick that is 100·N seconds. The interruptible path keeps
-// the same total so both hosts agree; Ctrl-C is the escape.
-const ticksPerSleepSecond = 100
-
 // killConfirmTicks bounds the post-Ctrl-C poll: sys_kill ARMS the target
 // (the exit arrives at its next ring selection, with status 137), so the
 // shell waits for the exit row rather than declaring death itself — but

@@ -180,11 +180,17 @@ func TestSleepCtrlC(t *testing.T) {
 		t.Fatalf("no ^C echo: %q", h.outString())
 	}
 	h.ttyIn = nil
+	ticksBefore := len(h.ticks)
 	if st := run("sleep 1"); st != 0 {
 		t.Fatalf("clean sleep status = %d, want 0", st)
 	}
 	if len(h.sleeps) != 0 {
 		t.Fatal("interactive sleep used blocking SleepSeconds")
+	}
+	// One second of sleep is ONE 1 Hz scheduler tick (kernel/src/timer.zig
+	// period_ns): a 100:1 conversion would park the shell ~100 s.
+	if got := len(h.ticks) - ticksBefore; got != 1 {
+		t.Fatalf("sleep 1 parked %d ticks, want 1", got)
 	}
 }
 

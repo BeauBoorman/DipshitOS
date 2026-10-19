@@ -53,7 +53,6 @@ const (
 	startupPath     = "/host/STARTUP.SH"
 	profilePath     = "/host/PROFILE.SH"
 	maxStartupBytes = 2048 // the startup contract's per-file cap
-	ticksPerSecond  = 100  // the scheduler tick is ~10 ms (kernel timer @ ~100 Hz)
 	ttyWriteMax     = 1024 // under the kernel's 2048-byte file-write stage cap
 
 	markerReady    = "gosh: ready"
@@ -841,6 +840,8 @@ func (g *goshHost) ReadTTYLine() (string, bool) {
 	return string(acc), true
 }
 
+// SleepSeconds parks n sys_sleep ticks — the kernel timer is 1 Hz
+// (kernel/src/timer.zig period_ns), so one tick IS one second.
 func (g *goshHost) SleepSeconds(n int) {
-	vi.Sleep(uint64(n) * ticksPerSecond)
+	vi.Sleep(uint64(n))
 }
