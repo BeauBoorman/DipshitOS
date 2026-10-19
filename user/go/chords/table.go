@@ -96,6 +96,17 @@ var Global = Table{
 	{Chord{ModCtrl | ModShift, UsageP}, "seat", ScopeSeat, "palette",
 		"summon the command palette — tabs, recent files, settings, " +
 			"help topics and this registry, subsequence-ranked", "#2564 (M121a)", false},
+	// M124e (#2584): the primary-paste chord is shift+insert, NOT the
+	// card's ctrl+shift+v — the seat row above already owns that chord for
+	// split-cycle (M79c) and the kernel's terminal-window path owns it for
+	// clipboard paste (M73e), so a third meaning would double-fire on the
+	// same keystroke. Shift+Insert is the canonical X11 primary-paste
+	// spelling and was free at every scope.
+	{Chord{ModShift, UsageInsert}, "seat", ScopeSeat, "sel-paste",
+		"paste the seat's primary selection into the focused cap'd tab " +
+			"— ctrl+shift+v is split-cycle (seat) and tty clipboard paste " +
+			"(kernel), so primary rides the canonical chord",
+		"#2584 (M124e)", false},
 
 	// --- apps: each app's own chords, live while that app is focused
 	// (ADR 0009 KEY_DOWN). GOSH's are the shlib line editor's

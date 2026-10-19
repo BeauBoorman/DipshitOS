@@ -28,6 +28,10 @@
 #          spelling accepts only itself. GOEDIT's opens=text already takes
 #          text/plain and GOVIEW's opens=image already takes image/png, so
 #          no row needed a new word for the seat leg.
+#   selection=  M124e (#2584): `primary` opts the app into the seat-owned
+#          primary selection — publish on select, deliver on middle-click
+#          or shift+insert. Unlike caps= this is a REAL gate: a row without
+#          it publishes nothing and is never delivered to.
 #
 # BUDGET: every reader buffers 4096 B — sexiburger.manifest_buf_max, which
 # wnd.zig's god_menu_manifest_max, tabwm.zig's overlay_manifest_max and the Go
@@ -36,9 +40,9 @@
 # host test in user/src/lib/sexiburger.zig pins this file under it.
 GOCALC.ELF | 64-bit Calc | c | dock=true
 NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text
-GOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary
+GOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary | selection=primary
 GOFILES.ELF | Files | f | dock=true | v=2 | caps=file,window
-GOTERM.ELF | Terminal | t | dock=true
+GOTERM.ELF | Terminal | t | dock=true | v=2 | selection=primary
 WEB.ELF | Web | w | dock=true | v=2 | caps=net | opens=http,https
 PULSE.ELF | Pulse | u | dock=true
 GOSH.ELF | Shell | s | dock=false | v=2 | caps=file,process,term

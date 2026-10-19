@@ -238,3 +238,160 @@ vgate_assert 02 serial-absent 'gview: drop unsupported'
 vgate_assert 02 serial-absent 'gview: drop decode'
 vgate_assert 02 serial-absent '[EXC] parking:'
 vgate_assert 02 serial-absent 'exited status=139'
+
+# --- M124e (#2584): the seat-owned primary selection -------------------------
+# Runs 03/04 are the card's seat leg: select in one app -> middle-click in
+# another pastes, gated by the manifest's `selection=primary` on BOTH ends.
+#
+#   03  GOEDIT /host/SEL.TXT, ctrl-a selects all -> `goedit: selpub` +
+#       `gotabwm: sel pub`; then GOTERM opens and a middle-click inside its
+#       pane stages the buffer at GOTERM's rendezvous and notices it —
+#       `gotabwm: sel paste` + `goterm: sel-paste`, and the pasted line
+#       (which ends in a newline) submits: `goterm: line echo sel-live-ok`.
+#   04  Same boot shape, but the middle-click target is GOFILES — its
+#       manifest row has no `selection=` cap. GOEDIT's publish still
+#       lands (the buffer fills), then the click is refused by name
+#       (`paste cap`) and no notice is ever posted: no `sel paste`, no
+#       `gofiles: sel-paste`. The shipped manifest itself is the
+#       fixture — one app opted in, one not.
+#
+# Geometry: no split is needed — GOTERM's declare proposes the full
+# viewport, so (640,400) sits inside its pane. The middle click rides the
+# `mc` pointer-virtio step (buttons bit2, this card's runner grammar).
+
+vgate_file script-03.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-03.txt <<'EOF'
+dui focus 0
+exec GOEDIT.ELF /host/SEL.TXT
+EOF
+
+vgate_file script3-03.txt <<'EOF'
+exec GOTERM.ELF
+EOF
+
+vgate_file script-04.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-04.txt <<'EOF'
+dui focus 0
+exec GOEDIT.ELF /host/SEL.TXT
+EOF
+
+vgate_file script3-04.txt <<'EOF'
+exec GOFILES.ELF /host/DRAG
+EOF
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+for elf, build in (("GOTERM.ELF", "tools/go/build-goterm.sh"),
+                   ("GOFILES.ELF", "tools/go/build-files.sh")):
+    src = os.path.join(".build", "go", elf)
+    if not os.path.exists(src):
+        sys.exit("%s missing (expected %s) - build it first: bash %s"
+                 % (elf, src, build))
+    shutil.copy(src, os.path.join(share, elf))
+# The selection fixture: its tail newline means a paste into GOTERM's line
+# editor SUBMITS — `goterm: line echo sel-live-ok` is the end-to-end proof
+# the bytes reached the shell, not just a buffer.
+with open(os.path.join(share, "SEL.TXT"), "w") as f:
+    f.write("echo sel-live-ok\n")
+print("staged GOTERM/GOFILES + SEL.TXT")
+PY
+
+# --- run 03: select in GOEDIT -> middle-click in GOTERM pastes ---------------
+# The chords fire after `goedit: present` (its event loop is live), the term
+# opens after the publish marker (ordering, not a race), and the middle click
+# waits on GOTERM's ready so its binding exists before the seat delivers.
+vgate_run 03 -- \
+    --screen '$RUN_DIR/sel-screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script-03.txt' \
+    --script2 '$RUN_DIR/script2-03.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-a' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-03.txt' \
+    --script3-after 'goedit: selpub n=17' \
+    --pointer-virtio '640,400,mc' \
+    --pointer-virtio-after 'goterm: ready' \
+    --script-expect 'goterm: done status=0' --timeout 300
+
+vgate_assert 03 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 03 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 03 serial-contains 'goedit: selpub n=17'
+vgate_assert 03 serial-contains 'gotabwm: sel pub id='
+vgate_assert 03 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 03 serial-contains 'goterm: ready'
+vgate_assert 03 serial-contains 'gotabwm: sel paste id='
+vgate_assert 03 serial-contains ' len=17'
+vgate_assert 03 serial-contains 'goterm: sel-paste n=17'
+vgate_assert 03 serial-contains 'goterm: line echo sel-live-ok'
+vgate_assert 03 serial-contains 'goterm: done status=0'
+vgate_assert 03 serial-absent 'gotabwm: sel refuse'
+vgate_assert 03 serial-absent '[EXC] parking:'
+vgate_assert 03 serial-absent 'exited status=139'
+
+# The ordering is the proof: publish -> delivery notice -> app consume ->
+# line submitted.
+vgate_assert 03 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+def first(prefix):
+    for i, l in enumerate(ser):
+        if prefix in l:
+            return i
+    sys.exit("missing " + prefix)
+pub = first("gotabwm: sel pub id=")
+paste = first("gotabwm: sel paste id=")
+take = first("goterm: sel-paste")
+line = first("goterm: line echo sel-live-ok")
+if not (pub < paste < take < line):
+    sys.exit("order pub@%d paste@%d take@%d line@%d" % (pub, paste, take, line))
+print("sel ordering: pub@%d paste@%d take@%d line@%d" % (pub, paste, take, line))
+PY
+
+# --- run 04: the cap is the gate ----------------------------------------------
+# Same boot shape, but the target is GOFILES — its manifest row has no
+# selection= cap. GOEDIT's publish still lands (the buffer fills), then the
+# middle-click inside GOFILES' pane is refused by name (`paste cap`) and no
+# notice is ever posted. The shipped manifest itself is the fixture: one app
+# opted in, one not.
+vgate_run 04 -- \
+    --screen '$RUN_DIR/sel-nocap-screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script-04.txt' \
+    --script2 '$RUN_DIR/script2-04.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-a' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-04.txt' \
+    --script3-after 'goedit: selpub n=17' \
+    --pointer-virtio '640,400,mc' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script-expect 'gotabwm: sel refuse' --timeout 300
+
+vgate_assert 04 serial-contains 'goedit: present'
+vgate_assert 04 serial-contains 'goedit: selpub n=17'
+vgate_assert 04 serial-contains 'gotabwm: sel pub id='
+vgate_assert 04 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 04 serial-contains 'gofiles: ready'
+vgate_assert 04 serial-contains 'gotabwm: sel refuse'
+vgate_assert 04 serial-contains ' paste cap'
+vgate_assert 04 serial-absent 'gotabwm: sel paste id='
+vgate_assert 04 serial-absent 'gofiles: sel-paste'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent 'exited status=139'

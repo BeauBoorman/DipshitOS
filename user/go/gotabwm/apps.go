@@ -36,6 +36,12 @@ type AppEntry struct {
 	// The seat's drag admission is opensAccepts in drag.go: a bare family
 	// word accepts any subtype under it.
 	Opens []string
+	// Selection is `selection=` — the app's opt-in to the seat's primary
+	// selection (M124e #2584). The only admitted value is "primary": with
+	// it the app may publish its selection and receive paste deliveries;
+	// without it the seat refuses both directions. Unlike caps= this gate
+	// is real — the seat enforces it on every request and delivery.
+	Selection string
 }
 
 const (
@@ -116,6 +122,8 @@ func parseAppLine(line string) (AppEntry, bool) {
 			e.Caps = splitComma(val)
 		case "opens":
 			e.Opens = splitComma(val)
+		case "selection":
+			e.Selection = val
 		default:
 			// A key this reader does not know is a NEWER row, not a bad
 			// one: the positional fields still say what to launch, and the
@@ -236,6 +244,8 @@ type DecodeSummary struct {
 	Argv   int
 	Caps   int
 	Opens  int
+	// M124e: how many rows opted into the seat's primary selection.
+	Sel int
 }
 
 // SummarizeApps is the pure report over a decoded catalog. Pure so the host
@@ -254,6 +264,9 @@ func SummarizeApps(catalog []AppEntry) DecodeSummary {
 		}
 		if len(e.Opens) > 0 {
 			s.Opens++
+		}
+		if e.Selection != "" {
+			s.Sel++
 		}
 	}
 	return s

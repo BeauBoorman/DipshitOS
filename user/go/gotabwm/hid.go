@@ -101,7 +101,12 @@ const (
 	hidUsageLeftBracket  uint8 = 0x2F // '['
 	hidUsageRightBracket uint8 = 0x30 // ']'
 	hidUsageTab          uint8 = 0x2B
-	hidBtnLeft           uint8 = 0x01
+	// M124e (#2584): the primary-paste chord is shift+insert — the card
+	// asked for ctrl+shift+v, but split-cycle owns it at this scope (M79c)
+	// and the kernel's tty path owns it at kernel-terminal scope (M73e).
+	hidUsageInsert uint8 = 0x70
+	hidBtnLeft     uint8 = 0x01
+	hidBtnMiddle   uint8 = 0x04
 )
 
 // execApp is the exec seam for the BT1 chords. It is vi.Exec in the guest;
@@ -240,6 +245,9 @@ func runSeatAction(action string, c chords.Chord) {
 		_ = applyNavStep(true)
 	case "nav-forward":
 		_ = applyNavStep(false)
+	case "sel-paste":
+		// M124e (#2584): shift+insert — the primary-paste chord.
+		applySelPasteChord()
 	}
 }
 
@@ -551,6 +559,10 @@ func handleWmPointer(e vi.Event) {
 	btn := uint8(e.Flags & 0xff)
 	down := pointerDownEdge(btn, prevPtrButtons)
 	up := pointerUpEdge(btn, prevPtrButtons)
+	// M124e (#2584): the middle-button's own down edge — the primary-paste
+	// gesture. It never starts a chrome path (those all key on the left
+	// edge), so it reaches the content tail where the delivery happens.
+	midDown := btn&hidBtnMiddle != 0 && prevPtrButtons&hidBtnMiddle == 0
 	prevPtrButtons = btn
 	// M124a (#2580): an armed guest drag owns every pointer sample —
 	// motion feeds the ghost's hit-test, the release edge settles the
@@ -748,6 +760,13 @@ func handleWmPointer(e vi.Event) {
 		return
 	}
 	if _, onRail := railCellAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight); !onRail {
+		if midDown {
+			// M124e (#2584): a middle press inside a hosted pane pastes
+			// the seat's primary selection into that window. The sample
+			// still forwards as content — the click is real, the paste
+			// is the seat's.
+			applySelPasteAt(px, py)
+		}
 		forwardContentPointer(px, py, btn)
 	}
 }

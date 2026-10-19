@@ -254,6 +254,11 @@ func TestSummarizeAppsCountsRowsAndTheHighestVersion(t *testing.T) {
 	if s.Caps == 0 || s.Opens == 0 {
 		t.Fatalf("caps/opens rows = %d/%d: the v2 tail is not being read", s.Caps, s.Opens)
 	}
+	// M124e (#2584): GOEDIT and GOTERM are the two selection=primary rows —
+	// pinned like argv so a third opt-in is a deliberate edit here too.
+	if s.Sel != 2 {
+		t.Fatalf("selection=primary rows = %d want 2 (GOEDIT + GOTERM)", s.Sel)
+	}
 }
 
 // The `opens=` vocabulary is M81b's mime table, not a second list: a name the

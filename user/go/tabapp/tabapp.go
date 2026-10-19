@@ -57,6 +57,15 @@ type Config struct {
 	DragSource func() (mime string, blob []byte, ok bool)
 	DropTarget func(offer DragOffer)
 	DragEnd    func(delivered bool, peer uint32)
+
+	// M124e (#2584): the primary-selection sink. The seat delivers a
+	// paste (middle-click inside this window's pane, its shift+insert
+	// chord, or an app's own pull request) by staging the buffer at this
+	// window's rendezvous path and pushing a kind-28 notice; the event
+	// loop calls PollSelPaste once per pass and SelPaste gets the bytes —
+	// nil when the staged envelope was absent (a transport failure the
+	// app is told about, never a silently-empty paste).
+	SelPaste func(text []byte)
 }
 
 // DragOffer is one delivered drop (M124a): the mime both sides agreed
@@ -115,6 +124,9 @@ type TabApp struct {
 	DropTarget func(offer DragOffer)
 	DragEnd    func(delivered bool, peer uint32)
 
+	// M124e (#2584): the primary-selection sink, copied from Config.
+	SelPaste func(text []byte)
+
 	// surf is the bound M33 window surface — the shared pages the depth
 	// engine paints and the compositor reads — nil when the bind refused
 	// and this app is on the degrade path. buf is surf viewed at the
@@ -162,6 +174,7 @@ func Init(cfg Config) *TabApp {
 	ta.DragSource = cfg.DragSource
 	ta.DropTarget = cfg.DropTarget
 	ta.DragEnd = cfg.DragEnd
+	ta.SelPaste = cfg.SelPaste
 	if ta.RestoreState != nil {
 		if v, blob, ok := vi.RequestStateRestore(uint32(win), cfg.Name); ok {
 			ta.Restored = true
@@ -431,6 +444,30 @@ func (t *TabApp) PollDrag() bool {
 		return true
 	}
 	return false
+}
+
+// PollSelPaste services the seat's asynchronous kind-28 delivery notice —
+// call it once per event-loop pass, the same discipline as PollDrag. A
+// waiting notice consumes this window's staged selection and hands
+// SelPaste the bytes; a notice whose staging never landed still surfaces
+// the hook with nil. False when no delivery was waiting or no SelPaste
+// hook is set (a cap-less app never gets one — the seat refuses the
+// delivery before it posts).
+func (t *TabApp) PollSelPaste() bool {
+	if t.SelPaste == nil || !vi.PollSelPaste(uint32(t.Win)) {
+		return false
+	}
+	b, _ := vi.SelTake(uint32(t.Win))
+	t.SelPaste(b)
+	return true
+}
+
+// RequestSelPaste is the pull half (kind 28 as a request): an app's own
+// keyboard-chord spelling of the paste gesture. The seat stages the
+// buffer and the bytes come back here; ok=false is the honest no-paste —
+// empty buffer, no cap, or a transport refusal, all the same answer.
+func (t *TabApp) RequestSelPaste() ([]byte, bool) {
+	return vi.RequestSelPaste(uint32(t.Win), t.Name)
 }
 
 // Scale maps r from a fromW x fromH canvas into toW x toH (integer math,

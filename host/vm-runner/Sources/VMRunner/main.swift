@@ -6649,6 +6649,8 @@ func startPointerVirtioInject() {
                         mode = .click
                     } else if fields.count >= 3 && fields[2] == "rc" {
                         mode = .rightClick
+                    } else if fields.count >= 3 && fields[2] == "mc" {
+                        mode = .middleClick
                     } else {
                         mode = .move
                     }
@@ -8563,9 +8565,11 @@ enum CustomVirtioSpike {
     /// M124d (#2583): `rc` adds the right-button click for GOFILES'
     /// context-menu leg (the guest already maps buttons bit1 to SGR
     /// button 2 — only the injection grammar lacked a way to ask for it).
+    /// M124e (#2584): `mc` adds the middle-button click (buttons bit2,
+    /// 0x04) — the primary-selection paste gesture's injection.
     struct PtrStep {
         enum Mode {
-            case move, click, down, up, rightClick
+            case move, click, down, up, rightClick, middleClick
         }
 
         let x: UInt16
@@ -8647,6 +8651,10 @@ enum CustomVirtioSpike {
         case "ctrl-shift-tab": return (hidModCtrl | hidModShift, 0x2B)
         case "escape": return (0, 0x29)
         case "insert": return (0, 0x70)
+        // M124e (#2584): the seat's primary-paste chord — the canonical
+        // X11 spelling, free at every scope (ctrl+shift+v is split-cycle
+        // at seat scope and tty clipboard paste at kernel-terminal scope).
+        case "shift-insert": return (hidModShift, 0x70)
         case "f1": return (0, 0x3A)
         case "f2": return (0, 0x3B)
         case "f3": return (0, 0x3C)
@@ -8872,6 +8880,14 @@ enum CustomVirtioSpike {
                     // right-click (driving_award maps it to SGR button 2).
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) move buttons=0x0 x=\(s.x) y=\(s.y)"))
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0x02), "\(sequenceTag) down buttons=0x2 x=\(s.x) y=\(s.y)"))
+                    msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) up buttons=0x0 x=\(s.x) y=\(s.y)"))
+                case .middleClick:
+                    // M124e: same click choreography, button byte bit2 —
+                    // the guest sees a physical middle-click (the seat's
+                    // hidBtnMiddle edge), which is the primary-paste
+                    // gesture when the target's manifest row opts in.
+                    msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) move buttons=0x0 x=\(s.x) y=\(s.y)"))
+                    msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0x04), "\(sequenceTag) down buttons=0x4 x=\(s.x) y=\(s.y)"))
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) up buttons=0x0 x=\(s.x) y=\(s.y)"))
                 case .down:
                     msgs.append((inputPointerMessage(x: s.x, y: s.y, buttons: 0), "\(sequenceTag) move buttons=0x0 x=\(s.x) y=\(s.y)"))
