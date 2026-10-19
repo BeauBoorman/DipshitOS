@@ -4098,6 +4098,40 @@ let commandBus = hostApplication?.commandBus ?? HostCommandBus()
 if let documentProfileURL {
     commandBus.settings.profileURL = documentProfileURL
     commandBus.profiles.profileURL = documentProfileURL
+    commandBus.machine.profileURL = documentProfileURL
+}
+// M120c (#2560): the Machine-menu persistence verbs. The model resolves
+// the profile/share/base/key from argv itself; the pieces only the
+// runner owns are the VZ drivers and the live posture reads — the same
+// SuspendCtl/SnapshotCtl pair the vsock-ctl wire serves, armed here for
+// EVERY run so a scripted --host-cmd-after dispatches the identical
+// seam the session menu does. The suspend driver's accept tail stops
+// the run exactly like the guest-initiated suspend; the snapshot
+// driver's resume-after-reply is a no-op on a refused save.
+var machineSaveUnsupported: String? = nil
+do { try config.validateSaveRestoreSupport() } catch {
+    machineSaveUnsupported = "\(error as NSError)"
+}
+let machineSuspendCtl = SuspendCtl(vm: runner.vm, queue: runner.queue,
+                                 savedStateDir: activeProfile?.savedStateURL,
+                                 unsupported: machineSaveUnsupported)
+let machineSnapshotCtl = SnapshotCtl(
+    vm: runner.vm, queue: runner.queue,
+    shareDir: (cvcFileShareDir ?? virtioFSShareDir)
+        .map { URL(fileURLWithPath: $0, isDirectory: true) },
+    unsupported: machineSaveUnsupported)
+commandBus.machine.saveCapable = { machineSaveUnsupported == nil }
+commandBus.machine.vmRunning = { [vm = runner.vm] in vm.state == .running }
+commandBus.machine.suspendDriver = {
+    let verdict = machineSuspendCtl.begin()
+    guard verdict.accepted else { return verdict.code }
+    machineSuspendCtl.finish()
+    return nil
+}
+commandBus.machine.snapshotDriver = { name in
+    let verdict = machineSnapshotCtl.save(name: name)
+    machineSnapshotCtl.resumeAfterReply()
+    return verdict.accepted ? nil : verdict.code
 }
 // The verbs the runner performs itself: the framebuffer capture the
 // --screen/--screenshot-after path already owns (enabled once the display

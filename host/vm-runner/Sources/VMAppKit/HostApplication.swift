@@ -85,6 +85,15 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// bus and the menu chord light the same affordance.
     private let recordBadge = NSView()
     private let recordBadgeLabel = NSTextField(labelWithString: "")
+    /// M120c (#2560): the staged-update banner — a strip across the
+    /// bottom of the guest pane, visible exactly while the armed share
+    /// holds `<share>/UPDATE/` (the guest's GOUPD stage lands mid-run,
+    /// so a poll drives it). Its Apply button dispatches the same
+    /// `apply-update` verb the Machine menu does.
+    private let updateBanner = NSView()
+    private let updateBannerLabel = NSTextField(labelWithString: "")
+    private weak var updateBannerApply: NSButton?
+    private var updateBannerTimer: Timer?
     private let serialLog: String
 
     /// M128c (#2607): set by main.swift's document-launch harvest — the
@@ -213,6 +222,44 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             recordBadge.topAnchor.constraint(equalTo: guestArea.topAnchor, constant: 8),
         ])
         recordBadge.isHidden = true
+        // M120c (#2560): the staged-update strip — bottom edge of the
+        // guest pane, always present-but-hidden so a mid-run stage only
+        // flips visibility. The poll is the arrival mechanism (UPDATE/
+        // is guest-written — no model event fires); the model's
+        // onChange covers the apply edge (the set renames to
+        // UPDATE.APPLIED and the strip hides).
+        updateBanner.wantsLayer = true
+        updateBanner.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.92).cgColor
+        updateBanner.translatesAutoresizingMaskIntoConstraints = false
+        updateBannerLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        updateBannerLabel.textColor = .black
+        updateBannerLabel.translatesAutoresizingMaskIntoConstraints = false
+        let updateApply = NSButton(title: "Apply Update", target: self,
+                                   action: #selector(updateApplyTapped(_:)))
+        updateApply.bezelStyle = .rounded
+        updateApply.font = .systemFont(ofSize: 12, weight: .semibold)
+        updateApply.translatesAutoresizingMaskIntoConstraints = false
+        updateBanner.addSubview(updateBannerLabel)
+        updateBanner.addSubview(updateApply)
+        guestArea.addSubview(updateBanner)
+        NSLayoutConstraint.activate([
+            updateBannerLabel.leadingAnchor.constraint(equalTo: updateBanner.leadingAnchor, constant: 12),
+            updateBannerLabel.centerYAnchor.constraint(equalTo: updateBanner.centerYAnchor),
+            updateBannerLabel.trailingAnchor.constraint(lessThanOrEqualTo: updateApply.leadingAnchor, constant: -8),
+            updateApply.trailingAnchor.constraint(equalTo: updateBanner.trailingAnchor, constant: -10),
+            updateApply.centerYAnchor.constraint(equalTo: updateBanner.centerYAnchor),
+            updateBanner.leadingAnchor.constraint(equalTo: guestArea.leadingAnchor),
+            updateBanner.trailingAnchor.constraint(equalTo: guestArea.trailingAnchor),
+            updateBanner.bottomAnchor.constraint(equalTo: guestArea.bottomAnchor),
+            updateBanner.heightAnchor.constraint(equalToConstant: 30),
+        ])
+        updateBanner.isHidden = true
+        updateBannerApply = updateApply
+        commandBus.machine.onChange = { [weak self] in self?.syncUpdateBanner() }
+        updateBannerTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.syncUpdateBanner()
+        }
+        syncUpdateBanner()
         commandBus.recorder.onChange = { [weak self] in self?.refreshRecordAffordance() }
         commandBus.agent.onChange = { [weak self] in self?.refreshAgentAffordance() }
         // M128a (#2605): the ⌘, settings panel mirrors the bus's
@@ -394,6 +441,34 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         recordBadgeLabel.stringValue = "● REC \(recorder.remaining)s"
     }
 
+    /// M120c (#2560): the banner's seams — the class-A reads instead of
+    /// poking the view hierarchy.
+    public var updateBannerVisible: Bool { !updateBanner.isHidden }
+    public var updateBannerText: String { updateBannerLabel.stringValue }
+
+    /// Model → strip: visible exactly while the armed share holds
+    /// UPDATE/. The label names the staged version when its manifest
+    /// parses; the Apply button greys when the verb's own posture fails
+    /// (no base, no trust pin) so the affordance never promises what
+    /// the dispatch would refuse.
+    public func syncUpdateBanner() {
+        let model = commandBus.machine
+        let staged = model.stagedUpdate != nil
+        updateBanner.isHidden = !staged
+        if staged {
+            updateBannerLabel.stringValue = "OS update staged"
+                + (model.stagedVersion.map { " (\($0))" } ?? "")
+                + " — apply to install on next boot"
+            updateBannerApply?.isEnabled = model.canApplyUpdate
+        }
+    }
+
+    /// The strip's Apply button is a bus surface like the menu item —
+    /// it dispatches the verb rather than touching the model.
+    @objc private func updateApplyTapped(_ sender: NSButton) {
+        commandBus.dispatch(.applyUpdate)
+    }
+
     /// M127e (#2603): the pill mirrors the companion model — session
     /// dot, pause mark, rejected-receipt flag — and the drawer's agent
     /// sub-pane repaints with it (syncInspector calls drawer.reload).
@@ -529,6 +604,10 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     private func focusGuest() {
         guard lifecycle.state == .running, let guestView else { return }
         window.makeFirstResponder(guestView)
+    }
+
+    deinit {
+        updateBannerTimer?.invalidate()
     }
 
     private func reportFocus(_ reason: String) {

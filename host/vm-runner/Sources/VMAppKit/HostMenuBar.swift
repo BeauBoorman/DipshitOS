@@ -41,6 +41,22 @@ public enum HostMenuBar {
         let machine = menu("Machine")
         machine.addItem(action("Stop VM", .stop))
         machine.addItem(.separator())
+        // M120c (#2560): the persistence lifecycle. Suspend saves the
+        // machine state into the profile's saved-state/ and stops the
+        // run (--resume continues it); Snapshot parks a menu-<stamp>
+        // .vzsave on the armed share for GOSNAP to restore; the update
+        // pair runs the M115f verify+swap/rollback on the base image;
+        // Reveal Share opens the armed share in Finder. Each item greys
+        // live on the machine model's posture — the bus's enablement is
+        // the menu's.
+        machine.addItem(action("Suspend", .suspend))
+        machine.addItem(action("Snapshot", .snapshot))
+        machine.addItem(.separator())
+        machine.addItem(action("Apply OS Update", .applyUpdate))
+        machine.addItem(action("Roll Back OS Update", .rollbackUpdate))
+        machine.addItem(.separator())
+        machine.addItem(action("Reveal Share in Finder", .revealShare))
+        machine.addItem(.separator())
         // M128b (#2606): the profile manager. New/clone mint sibling
         // bundles next to the armed one; reset-overlay re-mints the
         // armed bundle's overlay.asif on next boot; "Switch To" is a
