@@ -589,6 +589,13 @@ STUB_RUNNER="$TMP/vmrunner-stub"
 cat > "$STUB_RUNNER" <<'SH'
 #!/usr/bin/env bash
 serial=""; script=""; expect=""; save=""; load=""
+for a in "$@"; do
+    # M131c (#2640): an empty argv element is a corrupted flag vector — the
+    # real runner treats it as the legacy positional serial path. The stub
+    # refuses it so a bad splice (e.g. `printf %q` on zero args emitting
+    # `''`) fails loudly instead of passing through invisibly.
+    [ -z "$a" ] && { echo "stub-runner: empty argv element" >&2; exit 73; }
+done
 while [ $# -gt 0 ]; do
     case "$1" in
         --serial) serial="$2"; shift 2 ;;
@@ -656,7 +663,7 @@ EOF
 vgate_file s5.txt <<'EOF'
 echo f1-line
 EOF
-vgate_checkpoint ck -- --timeout 240
+vgate_checkpoint ck --
 vgate_run c1 -- --script '$RUN_DIR/s1.txt' --script-after 'tasks user-el0 reaped' --script-expect c1-line --timeout 120
 vgate_assert c1 serial-contains 'c1-line'
 vgate_run w1 --from-checkpoint ck --warm-strict -- --script '$RUN_DIR/s2.txt' --script-after 'tasks user-el0 reaped' --script-expect w1-line --timeout 120

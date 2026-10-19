@@ -27,29 +27,40 @@ from assertions import check
 check()
 PY
 
-vgate_run file -- --script '$RUN_DIR/file.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run refused -- --script '$RUN_DIR/refused.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run exact -- --script '$RUN_DIR/exact.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run over -- --script '$RUN_DIR/over.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run invalid -- --script '$RUN_DIR/invalid.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run dense -- --script '$RUN_DIR/dense.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run string -- --script '$RUN_DIR/string.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run conversion -- --script '$RUN_DIR/conversion.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run missing -- --script '$RUN_DIR/missing.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run denied -- --script '$RUN_DIR/denied.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run exists -- --script '$RUN_DIR/exists.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run bounds -- --script '$RUN_DIR/bounds.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+# ADR 0059 (M131c #2640): one dedicated base boot checkpoints the armed
+# arm-virtiofs guest at the default boot-settle marker `tasks user-el0 reaped`,
+# before any leg's workload (D4). The 16 script-only legs below restore it via
+# --from-checkpoint qjs; their first --script-after is re-based onto the
+# post-restore handshake (D5), while their later markers gate on the leg's own
+# exec and re-occur inside the leg's epoch. The seven cold legs keep a
+# `warm-cold:` comment naming their ADR D7 class.
+vgate_checkpoint qjs --
+
+vgate_run file --from-checkpoint qjs -- --script '$RUN_DIR/file.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run refused --from-checkpoint qjs -- --script '$RUN_DIR/refused.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run exact --from-checkpoint qjs -- --script '$RUN_DIR/exact.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run over --from-checkpoint qjs -- --script '$RUN_DIR/over.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run invalid --from-checkpoint qjs -- --script '$RUN_DIR/invalid.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run dense --from-checkpoint qjs -- --script '$RUN_DIR/dense.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run string --from-checkpoint qjs -- --script '$RUN_DIR/string.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run conversion --from-checkpoint qjs -- --script '$RUN_DIR/conversion.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run missing --from-checkpoint qjs -- --script '$RUN_DIR/missing.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run denied --from-checkpoint qjs -- --script '$RUN_DIR/denied.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run exists --from-checkpoint qjs -- --script '$RUN_DIR/exists.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run bounds --from-checkpoint qjs -- --script '$RUN_DIR/bounds.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+# warm-cold: cold (d) cold-start sampling — qjs-cold: sample= x5 + --script2-delay measure launch latency; a timing budget formed across the freeze is uninterpretable post-restore (ADR 0059 D7(d))
 vgate_run cold -- --script '$RUN_DIR/cold.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'procs QLAUNCH.BIN exited status=0' --script2-delay 2 --script-expect 'qjs-gate-done' --timeout 90
+# warm-cold: repl,session,evals,diagnostics,receipt,eof (c) --console-tcp bridges a live host socket into serial input — listener/bridge state lives outside the checkpoint bundle (ADR 0059 D7(c))
 vgate_run repl -- --console-tcp '127.0.0.1:24786' --timeout 180
-vgate_run line -- --script '$RUN_DIR/line.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/line-input.txt' --script2-after 'qjs: ready eval=0' --script3 '$RUN_DIR/after.txt' --script3-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
-vgate_run line-over -- --script '$RUN_DIR/line-over.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/line-over-input.txt' --script2-after 'qjs: ready eval=0' --script3 '$RUN_DIR/after.txt' --script3-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run line --from-checkpoint qjs -- --script '$RUN_DIR/line.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/line-input.txt' --script2-after 'qjs: ready eval=0' --script3 '$RUN_DIR/after.txt' --script3-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run line-over --from-checkpoint qjs -- --script '$RUN_DIR/line-over.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/line-over-input.txt' --script2-after 'qjs: ready eval=0' --script3 '$RUN_DIR/after.txt' --script3-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
 vgate_run session -- --console-tcp '127.0.0.1:24787' --timeout 180
 vgate_run evals -- --console-tcp '127.0.0.1:24788' --timeout 600
 vgate_run diagnostics -- --console-tcp '127.0.0.1:24789' --timeout 180
 vgate_run receipt -- --console-tcp '127.0.0.1:24790' --timeout 600
 vgate_run eof -- --console-tcp '127.0.0.1:24791' --timeout 90
-vgate_run idle -- --script '$RUN_DIR/idle.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 100
-vgate_run usage -- --script '$RUN_DIR/usage.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
+vgate_run idle --from-checkpoint qjs -- --script '$RUN_DIR/idle.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 100
+vgate_run usage --from-checkpoint qjs -- --script '$RUN_DIR/usage.txt' --script-after 'tasks user-el0 reaped' --script2 '$RUN_DIR/after.txt' --script2-after 'tasks user-exec reaped' --script-expect 'qjs-gate-done' --timeout 90
 
 vgate_assert file serial-contains 'procs QJS.BIN exited status=0'
 vgate_assert refused serial-contains 'procs QJS.BIN exited status=0'

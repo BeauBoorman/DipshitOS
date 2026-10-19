@@ -111,7 +111,11 @@ vgate_checkpoint() {
     done
     VGATE_CKPT_TAGS+=("$tag")
     VGATE_CKPT_SETTLE+=("$settle")
-    VGATE_CKPT_FLAGS+=("$(printf '%q ' "$@")")
+    # printf '%q' with NO args still emits `'' `, which evals to ONE empty
+    # element — spliced into a runner argv it lands as an empty positional
+    # (the runner treats it as the legacy serial-log path). A flag-less
+    # checkpoint stores "" and expands to zero words.
+    VGATE_CKPT_FLAGS+=("$([ $# -gt 0 ] && printf '%q ' "$@" || true)")
 }
 vgate_run() {
     # vgate_run TAG [--from-checkpoint CKPT [--warm-strict] [--warm-corrupt KIND]] -- <runner flags...>
@@ -157,7 +161,9 @@ vgate_run() {
         *) echo "vgate: vgate_run $tag: unknown --warm-corrupt kind '$corrupt' (only truncate-state)" >&2; exit 2 ;;
     esac
     VGATE_RUN_TAGS+=("$tag")
-    VGATE_RUN_FLAGS+=("$(printf '%q ' "$@")")
+    # Same empty-arg guard as vgate_checkpoint: a flag-less vgate_run would
+    # otherwise inject one empty positional into the runner argv.
+    VGATE_RUN_FLAGS+=("$([ $# -gt 0 ] && printf '%q ' "$@" || true)")
     VGATE_RUN_FROM_CKPT+=("$from_ckpt")
     VGATE_RUN_STRICT+=("$strict")
     VGATE_RUN_CORRUPT+=("$corrupt")
@@ -191,7 +197,7 @@ vgate_client() {
     [ "${1:-}" = "--" ] || { echo "vgate_client $tag missing -- separator" >&2; exit 2; }
     shift
     VGATE_CLIENT_TAGS+=("$tag")
-    VGATE_CLIENT_ARGS+=("$(printf '%q ' "$@")")
+    VGATE_CLIENT_ARGS+=("$([ $# -gt 0 ] && printf '%q ' "$@" || true)")
 }
 
 # --- load the spec (unknown commands fail under set -e) ----------------------
