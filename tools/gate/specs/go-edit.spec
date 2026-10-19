@@ -823,3 +823,46 @@ assert re.search(r"(?m)^clip: open /host/EDIT failed rc=-1\n", ser), \
     "kernel clipboard must read back exactly the banner's error text"
 print("clipboard read-back verified: the banner's own text left the VM")
 PY
+
+# --- M121c (#2566) run 12: the '?' chord-hint overlay ----------------------
+# A bare '?' keystroke opens the appkit overlay fed by the chord registry;
+# Esc closes it. The markers are the serial-readable copy of the plate:
+# n= is the row count (3 GOEDIT app rows + the seat's globals — the kernel
+# terminal rows do not apply to a canvas window), and each `hints row`
+# line is one registry row verbatim, so the content pin is the table, not
+# a screenshot.
+vgate_file script2-12.txt <<'EOFX'
+exec GOEDIT.ELF /host/EDIT/SEED.TXT
+EOFX
+
+vgate_file script3-12.txt <<'EOFX'
+dui close 2
+echo rx-goedit-hints-ok
+EOFX
+
+vgate_run 12 -- \
+    --screen '$RUN_DIR/screen-12' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-12.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords '?,escape' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-12.txt' \
+    --script3-after 'goedit: hints close' \
+    --script-expect 'rx-goedit-hints-ok' --timeout 240
+
+vgate_assert 12 serial-contains 'goedit: present'
+# The app's three rows + every seat row; NO kernel-terminal rows — this
+# window is not a tty front-end, so those chords do not answer here.
+vgate_assert 12 serial-contains 'goedit: hints n=27'
+vgate_assert 12 serial-contains 'goedit: hints row ctrl+s publish the buffer (save)'
+vgate_assert 12 serial-contains 'goedit: hints row ctrl+f '
+vgate_assert 12 serial-contains 'goedit: hints row ctrl+g '
+vgate_assert 12 serial-contains 'goedit: hints row ctrl+shift+p summon the command palette'
+vgate_assert 12 serial-absent 'goedit: hints row ctrl+shift+c '
+vgate_assert 12 serial-contains 'goedit: hints close'
+vgate_assert 12 serial-contains 'goedit: close'
+vgate_assert 12 serial-contains 'rx-goedit-hints-ok'
+vgate_assert 12 serial-absent '[EXC] parking:'
+vgate_assert 12 serial-absent 'exited status=139'

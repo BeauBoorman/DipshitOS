@@ -131,6 +131,11 @@ const (
 	// the content frame when no page is loaded and no load failed.
 	markerEmpty = "web: empty "
 	markerQuit  = "web: quit"
+	// M121c (#2566): the '?' overlay's receipts — `hints n=` the registry
+	// row count on the painted frame, one `hints row` per plate row (the
+	// serial-readable copy), `hints close` after the restored frame.
+	markerHints    = "web: hints "
+	markerHintsRow = "web: hints row "
 	// The typography probes. They carry measurable facts (engine name,
 	// per-glyph advances, line heights) rather than adjectives, so a silent
 	// regression to the 8x8 bitmap fails the class-B gate instead of only
@@ -316,6 +321,12 @@ type app struct {
 	banner       appkit.ErrorBanner
 	bannerOp     string
 	bannerTarget string
+	// M121c (#2566): the '?' chord-hint overlay — the registry's rows for
+	// this app's scope (none registered) plus the seat's globals, painted
+	// flat over the whole window like the picker plate. hintsEmit latches
+	// the open/close edge so its marker follows the frame that shows it.
+	hints     appkit.ChordHints
+	hintsEmit int // 1 = open receipt pending, 2 = close receipt pending
 }
 
 // virender adapts the kernel fill batcher to the renderer's Surface.
@@ -1627,6 +1638,9 @@ func (a *app) render() {
 	if a.pick.open { // M124b: the modal plate paints over chrome+status
 		a.paintPick()
 	}
+	if a.hints.Open { // M121c: the '?' overlay paints last of all
+		a.hints.Draw(vs)
+	}
 
 	processed := f.Flush()
 	a.lastFills = processed
@@ -1642,6 +1656,19 @@ func (a *app) render() {
 		vi.ConsoleLine(markerPaint + itoa(itemsOf(a)) + " fills=" + itoa(processed))
 		a.logPaint = false
 	}
+	// M121c: the hints receipt describes the frame just presented — the
+	// open count plus one row line per registry row the plate shows, or
+	// the close line after the restore frame.
+	switch a.hintsEmit {
+	case 1:
+		vi.ConsoleLine(markerHints + "n=" + itoa(a.hints.ChordRows()))
+		for _, l := range a.hints.RowLines() {
+			vi.ConsoleLine(markerHintsRow + l)
+		}
+	case 2:
+		vi.ConsoleLine(markerHints + "close")
+	}
+	a.hintsEmit = 0
 }
 
 func itemsOf(a *app) int {

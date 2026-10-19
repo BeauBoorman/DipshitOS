@@ -4,9 +4,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"virelai/appkit"
 	"virelai/layout"
 	"virelai/vi"
 	"virelai/webrender"
+	"virelai/widgets"
 )
 
 type textEditor struct {
@@ -115,6 +117,13 @@ func (a *app) keyEvent(ev vi.Event) {
 		a.pickKey(ev)
 		return
 	}
+	if a.hints.Open { // M121c: the '?' overlay owns every key while it stands
+		if _, done := a.hints.HandleKey(ev); done {
+			a.hintsEmit = 2
+		}
+		a.dirty = true
+		return
+	}
 	if ev.Flags&vi.ModCtrl != 0 && ev.Arg0 == 0x0f { // focused WEB owns Ctrl+L
 		a.focusURL()
 		return
@@ -194,7 +203,31 @@ func (a *app) keyEvent(ev vi.Event) {
 		a.focusNextControl(ev.Flags&vi.ModShift != 0)
 		return
 	}
+	// M121c (#2566): '?' opens the chord-hint overlay in browsing mode —
+	// every field mode above (URL bar, find bar, form controls, the
+	// picker's path field) keeps it as text; only the page surface takes
+	// it as the help chord.
+	if ev.Arg1 == '?' && ev.Flags&(vi.ModCtrl|vi.ModAlt) == 0 {
+		a.hints = appkit.NewChordHints(appName)
+		a.hints.R = hintsRect(a)
+		a.hintsEmit = 1
+		a.dirty = true
+		return
+	}
 	a.key(ev.Arg0, ev.Flags)
+}
+
+// hintsRect centres the overlay plate on the live canvas, clamped into it.
+func hintsRect(a *app) widgets.Rect {
+	w, h := a.canvasSize()
+	pw, ph := 432, 328
+	if pw > w-8 {
+		pw = w - 8
+	}
+	if ph > h-8 {
+		ph = h - 8
+	}
+	return widgets.Rect{X: (w - pw) / 2, Y: (h - ph) / 2, W: pw, H: ph}
 }
 
 func (a *app) anchor(target string) bool {

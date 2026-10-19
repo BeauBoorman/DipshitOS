@@ -58,12 +58,50 @@ func listWidth(cols int) int {
 // newline on the final row would scroll the path bar out of the visible
 // grid).
 func (m model) render() string {
+	if m.mode == modeHints {
+		return m.renderHints()
+	}
 	lines := m.renderLines()
 	frame := framePrologue + strings.Join(lines, "\n")
 	if m.mode == modeContext {
 		frame += m.renderCtxMenu()
 	}
 	return frame
+}
+
+// renderHints is the M121c (#2566) '?' overlay's ANSI face — the same
+// registry rows ChordHints.Draw paints on a canvas, laid over the whole
+// grid in this app's own palette. The window fits m.bodyRows() list rows
+// between the title band and the footer; Scroll windows a longer table.
+func (m model) renderHints() string {
+	src := m.hints.Lines(m.cols - 2)
+	// src is title, blank, the row lines (aligned with h.Rows), blank,
+	// footer — Scroll windows the row lines.
+	head, rest, foot := src[0], src[2:len(src)-2], src[len(src)-1]
+	body := m.rows - 2 // title row + footer row; the rest is list window
+	if body < 1 {
+		body = 1
+	}
+	lines := make([]string, 0, m.rows)
+	lines = append(lines, colPath+"  "+head+strings.Repeat(" ", max(0, m.cols-2-visLen(head)))+colReset)
+	for i := 0; i < body; i++ {
+		idx := m.hints.Scroll + i
+		if idx >= len(rest) {
+			lines = append(lines, strings.Repeat(" ", m.cols))
+			continue
+		}
+		row := rest[idx]
+		style := colFile
+		switch {
+		case idx > 0 && !strings.HasPrefix(row, " "):
+			style = colHead // a section header
+		case strings.HasPrefix(row, "    ("):
+			style = colDim // the "(none registered)" note
+		}
+		lines = append(lines, style+" "+clipVis(row, m.cols-1)+strings.Repeat(" ", max(0, m.cols-1-visLen(row)))+colReset)
+	}
+	lines = append(lines, colDim+" "+foot+colReset)
+	return framePrologue + strings.Join(lines, "\n")
 }
 
 // renderCtxMenu is the M124d (#2583) overlay: after the full grid repaint

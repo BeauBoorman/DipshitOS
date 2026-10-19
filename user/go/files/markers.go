@@ -78,6 +78,13 @@ const (
 	markerOpenLaunched = "gofiles: open launched "
 	markerOpenLaunchNo = "gofiles: open launch refused "
 
+	// M121c (#2566): the '?' overlay's receipts — `hints n=` the registry
+	// row count on the painted frame, one `hints row` per row the plate
+	// shows (the serial-readable copy), `hints close` after the restored
+	// list frame.
+	markerHints    = "gofiles: hints "
+	markerHintsRow = "gofiles: hints row "
+
 	// M124d (#2583): the right-click context menu. `menu` is the DECISION
 	// marker — the row, the mime spelling opens= matched against, and the
 	// eligible-handler count; `menu openwith` is the submenu descent
