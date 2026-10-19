@@ -1038,6 +1038,44 @@ func TrashDelete(path string) (string, int64) {
 	return id, 0
 }
 
+// TrashRestore restores the named trash item to its original path — the
+// per-entry half of the picker's trash rows (M124b #2581), which select by
+// id rather than taking the newest. Existing targets are never overwritten.
+func TrashRestore(id string) (path string, rc int64) {
+	if !validTrashID(id) {
+		return "", -ErrEINVAL
+	}
+	return trashRestore(id)
+}
+
+// trashRestore is the shared restore sequence: validate the receipt, rename
+// the item back to its recorded path, verify the landed bytes, append the
+// restore row, and drop the receipt. Any mid-sequence failure rolls the
+// rename back so a half-restored file never stands.
+func trashRestore(id string) (path string, rc int64) {
+	item := TrashItemPath(id)
+	target, b, _, tr := TrashRead(id)
+	if tr < 0 {
+		return "", tr
+	}
+	if wr := FileRename(item, target); wr < 0 {
+		return "", wr
+	}
+	got, gr := ReadFileAll(target, MaxFileBytes)
+	if gr < 0 || !bytes.Equal(got, b) {
+		_ = FileRename(target, item)
+		return "", -ErrEINVAL
+	}
+	if ar := appendRecent("restore", id, target, Time()); ar < 0 {
+		_ = FileRename(target, item)
+		return "", ar
+	}
+	if dr := FileDelete(TrashMetaPath(id)); dr < 0 {
+		return "", dr
+	}
+	return target, 0
+}
+
 // TrashRestoreLatest restores the newest still-present delete receipt to its
 // original path. Existing targets are never overwritten.
 func TrashRestoreLatest() (path, id string, rc int64) {
@@ -1051,28 +1089,12 @@ func TrashRestoreLatest() (path, id string, rc int64) {
 		if len(fields) != 4 || fields[1] != "delete" || !validTrashID(fields[2]) {
 			continue
 		}
-		item := TrashItemPath(fields[2])
-		target, body, _, tr := TrashRead(fields[2])
+		target, tr := trashRestore(fields[2])
 		if tr == ErrFileNotFound {
 			continue
 		}
 		if tr < 0 {
 			return "", "", tr
-		}
-		if wr := FileRename(item, target); wr < 0 {
-			return "", "", wr
-		}
-		got, gr := ReadFileAll(target, MaxFileBytes)
-		if gr < 0 || !bytes.Equal(got, body) {
-			_ = FileRename(target, item)
-			return "", "", -ErrEINVAL
-		}
-		if ar := appendRecent("restore", fields[2], target, Time()); ar < 0 {
-			_ = FileRename(target, item)
-			return "", "", ar
-		}
-		if dr := FileDelete(TrashMetaPath(fields[2])); dr < 0 {
-			return "", "", dr
 		}
 		return target, fields[2], 0
 	}

@@ -5,7 +5,7 @@ import (
 
 	"virelai/draw"
 	"virelai/layout"
-	"virelai/shlib"
+	"virelai/linebuf"
 	"virelai/theme"
 	"virelai/ttf"
 	"virelai/widgets"
@@ -125,7 +125,7 @@ func (c *ListController) ensureVisible() {
 	}
 }
 
-// TextField is a bounded GUI single-line editor. It uses shlib.LineBuffer for
+// TextField is a bounded GUI single-line editor. It uses linebuf.LineBuffer for
 // byte/caret operations while appkit owns normalized key handling and paint.
 //
 // The buffer holds UTF-8 and Max bounds its bytes. Text goes in and out one
@@ -141,7 +141,7 @@ func (c *ListController) ensureVisible() {
 // toward Surface (§2.3).
 type TextField struct {
 	R           widgets.Rect
-	Buffer      shlib.LineBuffer
+	Buffer      linebuf.LineBuffer
 	Fg          uint32
 	Bg          uint32
 	Caret       uint32
@@ -159,7 +159,7 @@ func NewTextField(r widgets.Rect, max int) TextField {
 	if max < 1 {
 		max = 1
 	}
-	return TextField{R: r, Buffer: shlib.NewLineBuffer(max), Max: max}
+	return TextField{R: r, Buffer: linebuf.NewLineBuffer(max), Max: max}
 }
 
 func (f *TextField) Bounds() widgets.Rect  { return f.R }

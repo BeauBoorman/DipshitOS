@@ -113,6 +113,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"virelai/appkit"
 	"virelai/draw"
 	"virelai/find"
 	"virelai/heap"
@@ -160,6 +161,13 @@ const (
 
 	// M42 UX r2 / WMS8 Gate 4 rehomed (#1485): the unsaved-changes dialog.
 	markerUnsaved = "goedit: win_unsaved"
+
+	// M124b (#2581): the shared file picker's receipts. `pick open <path>`
+	// and `pick save <path>` name the path the picker returned; `pick
+	// cancel` is the Escape receipt.
+	markerPickOpen   = "goedit: pick open "
+	markerPickSave   = "goedit: pick save "
+	markerPickCancel = "goedit: pick cancel"
 
 	// M107c (#2320): the build-error list's receipts. One prefix carries
 	// every shape: `n=` (rows loaded), `sel=` (panel selection), `jump
@@ -281,8 +289,9 @@ const (
 )
 
 // inputMode is which surface owns the keyboard: the document, the find bar,
-// the goto-line bar (M20 U3), the replace bar (#2199), or the diagnostics
-// panel (M107c).
+// the goto-line bar (M20 U3), the replace bar (#2199), the diagnostics
+// panel (M107c), or — M124b (#2581) — the shared file picker and the
+// discard-confirm dialog that can precede an open on a dirty buffer.
 type inputMode uint8
 
 const (
@@ -291,6 +300,8 @@ const (
 	modeGoto
 	modeReplace
 	modeDiags
+	modePicker
+	modeDialog
 )
 
 // clipWrite/clipRead are the machine-global clipboard (sys_clipboard_set/get,
@@ -428,6 +439,13 @@ type editor struct {
 	gotoHist []int
 	pend     *editState
 	pendBad  bool
+
+	// M124b (#2581): the shared picker and the discard-confirm dialog.
+	// pickOpenAsk marks that the open dialog's Yes answer means "now open
+	// the picker" — the only flow that can destroy unsaved bytes.
+	pick        appkit.FilePicker
+	dlg         appkit.Dialog
+	pickOpenAsk bool
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -682,7 +700,7 @@ func (e *editor) commitAll(rs []rune) bool {
 	for _, r := range rs {
 		if e.mode == modeEdit {
 			changed = e.insert(r) || changed
-		} else if e.mode != modeDiags {
+		} else if e.mode != modeDiags && e.mode != modePicker && e.mode != modeDialog {
 			changed = e.barAppend(r) || changed
 		}
 	}
@@ -721,6 +739,14 @@ func (e *editor) stageMarker() string {
 func (e *editor) handleKey(ev vi.Event) bool {
 	if ev.Kind != vi.EvKeyDown {
 		return false
+	}
+	// M124b: a modal surface owns the whole keyboard while it is up — the
+	// bar chords below must not fire under the picker or its guard dialog.
+	switch e.mode {
+	case modePicker:
+		return e.pickerKey(ev)
+	case modeDialog:
+		return e.dialogKey(ev)
 	}
 	if isChord(ev, keyF, keyCtrlF) {
 		return e.openBar(modeFind)
@@ -784,6 +810,15 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if chord(ev, 'v', false) {
 		e.paste()
 		return true
+	}
+	// M124b: Ctrl-O opens through the shared picker; Ctrl-Shift-S is the
+	// save-as. The save-as check must precede isSave, whose isChord does
+	// not read the Shift flag.
+	if chord(ev, 'o', false) {
+		return e.startPick(false)
+	}
+	if chord(ev, 's', true) {
+		return e.startPick(true)
 	}
 	if isSave(ev) {
 		// A failed Ctrl-S leaves the app alive and the buffer dirty: the
@@ -891,6 +926,101 @@ func (e *editor) closeBar() {
 	e.bar = e.bar[:0]
 	e.bar2 = e.bar2[:0]
 	e.bar2At = false
+}
+
+// startPick begins the M124b open/save flow. An open on a dirty buffer goes
+// through the discard-confirm first — the picker is the only flow that can
+// destroy unsaved bytes, so it gets a guard the bars never need. Save-as is
+// harmless (the buffer just publishes elsewhere) and opens the picker
+// straight away.
+func (e *editor) startPick(save bool) bool {
+	if !save && e.dirty {
+		e.dlg = appkit.NewConfirm("Unsaved buffer", "Open a file and discard the unsaved changes?")
+		e.pickOpenAsk = true
+		e.mode = modeDialog
+		return true
+	}
+	e.openPick(save)
+	return true
+}
+
+// openPick raises the shared picker over the editor's own window. The start
+// directory is the buffer's parent; save-as also pretypes the current name.
+func (e *editor) openPick(save bool) {
+	kind := appkit.PickOpen
+	if save {
+		kind = appkit.PickSave
+	}
+	dir := dirOf(e.path)
+	if dir == "" {
+		dir = "/host"
+	}
+	e.pick = appkit.NewFilePicker(kind, dir)
+	if save {
+		e.pick.Input = baseOf(e.path)
+	}
+	e.mode = modePicker
+}
+
+// pickerKey routes one key to the open picker and lands its Result: an open
+// re-loads the buffer at the picked path (the session's lease moves with the
+// path), a save-as republishes under the picked name, and cancel just hands
+// the keyboard back.
+func (e *editor) pickerKey(ev vi.Event) bool {
+	_, done := e.pick.HandleKey(ev)
+	if !done {
+		return true
+	}
+	save := e.pick.Kind == appkit.PickSave
+	res := e.pick.Result
+	e.mode = modeEdit
+	if res == "cancel" {
+		vi.ConsoleLine(markerPickCancel)
+		return true
+	}
+	if save {
+		e.path = res
+		vi.ConsoleLine(markerPickSave + res)
+		e.save()
+		return true
+	}
+	// Open: the lease belongs to the OLD path — release it first so the new
+	// file's session starts with the same acquire the boot path does.
+	e.releaseLease()
+	e.path = res
+	vi.ConsoleLine(markerPickOpen + res)
+	e.load()
+	e.dirty = false
+	e.selSet, e.markOn = false, false
+	e.hist = history{}
+	e.ensureLease()
+	return true
+}
+
+// dialogKey routes the discard-confirm: Yes continues into the picker the
+// guard was raised for; anything else (No, Escape) returns to the buffer.
+func (e *editor) dialogKey(ev vi.Event) bool {
+	_, done := e.dlg.HandleKey(ev)
+	if !done {
+		return true
+	}
+	yes := e.dlg.Result == "Yes"
+	openAsk := e.pickOpenAsk
+	e.pickOpenAsk = false
+	e.mode = modeEdit
+	if yes && openAsk {
+		e.openPick(false)
+	}
+	return true
+}
+
+// baseOf is a path's last segment (dirOf's counterpart, already package-local
+// for the diagnostics jump).
+func baseOf(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // barKey handles one key while a find/goto bar owns the keyboard: Return runs
@@ -1701,7 +1831,7 @@ func (e *editor) draw() {
 	}
 	if e.mode == modeDiags {
 		e.drawDiags(w, h)
-	} else if e.mode != modeEdit {
+	} else if e.mode != modeEdit && e.mode != modePicker && e.mode != modeDialog {
 		label := "Find: "
 		if e.mode == modeGoto {
 			label = "Goto: "
@@ -1728,6 +1858,13 @@ func (e *editor) draw() {
 			col := utf8.RuneCountInString(label) + utf8.RuneCount(e.bar)
 			e.drawPreedit(textOrigin+col*adv, barY, pre)
 		}
+	}
+	// M124b: the modal surfaces paint last, over the document — the picker's
+	// own canvas plate, then the guard dialog if one is up.
+	if e.mode == modePicker {
+		e.pick.Draw(e.ta.Canvas())
+	} else if e.mode == modeDialog {
+		e.dlg.Draw(e.ta.Canvas())
 	}
 }
 

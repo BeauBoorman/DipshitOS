@@ -124,8 +124,8 @@ const (
 	markerZoom     = "web: zoom "
 	markerFontSize = "web: font-size "
 	markerReload        = "web: reload"
-	markerSettled   = "web: settled"
-	markerQuit      = "web: quit"
+	markerSettled       = "web: settled"
+	markerQuit          = "web: quit"
 	// The typography probes. They carry measurable facts (engine name,
 	// per-glyph advances, line heights) rather than adjectives, so a silent
 	// regression to the 8x8 bitmap fails the class-B gate instead of only
@@ -274,12 +274,12 @@ type app struct {
 	fontBase  int
 	fontWatch bool
 	// The bookmark store (FLINT ws/bookmarks atom table) + its sidebar.
-	books          []bookmark
-	bookStream     string
-	booksErr       string
-	booksMigrated  int
-	sideOpen       bool
-	sideSel        int
+	books            []bookmark
+	bookStream       string
+	booksErr         string
+	booksMigrated    int
+	sideOpen         bool
+	sideSel          int
 	controls         []*formControl
 	focusControl     *formControl
 	controlEdit      textEditor
@@ -297,6 +297,9 @@ type app struct {
 	// M125d (#2589): the decoded session blob parked by noteState, consumed
 	// once by applyState on the first laid-out page after restore.
 	pend *webState
+	// M124b (#2581): the save-as picker — Ctrl+Shift+S raises the shared
+	// appkit.FilePicker modal, which owns input and paint while open.
+	pick savePick
 }
 
 // virender adapts the kernel fill batcher to the renderer's Surface.
@@ -1195,6 +1198,12 @@ func (a *app) key(usage uint32, flags uint16) {
 		a.status = "cache cleared"
 		a.dirty = true
 	case keyS:
+		if ctrl && flags&vi.ModShift != 0 {
+			// M124b (#2581): Ctrl+Shift+S is save-as — the shared picker;
+			// bare S / Ctrl+S keep the fixed WEB-DL-* download.
+			a.openSavePicker()
+			return
+		}
 		// 's' saves the loaded page body through the staged download
 		// flow (M126e): progress bar, seat row, completion plate, and
 		// the ledger row all come from the same path as a link download.
@@ -1244,6 +1253,10 @@ func (a *app) key(usage uint32, flags uint16) {
 }
 
 func (a *app) click(x, y int) {
+	if a.pick.open { // M124b: the modal owns the click, wherever it lands
+		a.pickClick(x, y)
+		return
+	}
 	w, h := a.canvasSize()
 	switch {
 	case inRect(x, y, backX, backY, chipW, chipH):
@@ -1560,6 +1573,10 @@ func (a *app) render() {
 		if a.dl.done {
 			a.paintDlToast(vs, width, height)
 		}
+	}
+
+	if a.pick.open { // M124b: the modal plate paints over chrome+status
+		a.paintPick()
 	}
 
 	processed := f.Flush()
