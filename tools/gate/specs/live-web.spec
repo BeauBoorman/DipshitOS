@@ -17,12 +17,19 @@
 # 42 (M126c #2595): the find-in-page leg — Ctrl+F's bar searches the laid-out
 # text, the match set paints amber and the current match orange on the
 # scanout, Enter steps next (wrapping), Esc closes.
+# 43 (M126d #2596): per-tab zoom Ctrl+=/-/0 with reflow + font_size setting.
+# 44 (M126e #2597): .QOI link click -> staged download -> completion plate ->
+# 'o' mime-opens GOVIEW.
+# 45-47 (M126f #2598): the K=3 acceptance journey — one boot per iteration of
+# browse -> bookmark -> find -> zoom -> download -> open in viewer, three
+# independent VMs on the shared armed share.
 # v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
 # responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
 # grammar or TLS-over-v6 responder exists yet. No public-internet access,
 # scripts or POST; owner authorized the fixed three-pixel shim-border
 # composition; font markers are live-web-ttf's. Prereqs: build-web.sh
-# browser WEB and browser WEB --gate, fetch GOFETCH --gate.
+# browser WEB and browser WEB --gate, fetch GOFETCH --gate,
+# build-goview.sh, build-files.sh.
 
 vgate_name live-web "WEB: bounded CSS browser, exact M93 presentation, DNS/SNI/GET navigation and fail-closed TLS"
 vgate_share seed
@@ -1991,17 +1998,19 @@ PY
 # on PAGE.HTML ("the greedy", "the browser" — "The end." is a capital-T
 # miss, the matcher is case-sensitive). Each keystroke recomputes and
 # re-lands on match 1; the two Enters step forward and wrap; Escape closes.
-# The f1 pads are no-ops the open bar consumes — ~6 s of dwell so the
+# The f1 pads are no-ops the open bar consumes — ~8 s of dwell so the
 # kind-4 snapshot request lands while the highlights are still on the
-# scanout (observed: without them the capture arrived after Escape's
-# clean repaint and pendingSnapPath collided on two close triggers; at
-# ~3 s the capture still raced Escape under fleet load).
+# scanout. The capture anchors on script3's 'find-shot' echo (3 s after
+# hit=2/2, mid-dwell) instead of the hit marker itself: observed 2026-10-19
+# under fleet load, a marker-anchored request was serviced after Escape's
+# clean repaint (the same race boots 45-47's comment describes).
 vgate_run 42 -- \
     --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
     --snapshot-out '$RUN_DIR/snap-42' \
     --script '$RUN_DIR/script-local.txt' \
-    --input-chords 'ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape' --input-chords-after 'web: ready' \
-    --snapshot-after 'web: find hit=2/2' \
+    --input-chords 'ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape' --input-chords-after 'web: ready' \
+    --script3 '$RUN_DIR/script-find-shot.txt' --script3-after 'web: find hit=2/2' --script3-delay 3 \
+    --snapshot-after 'find-shot' \
     --script-expect 'web: find close' --timeout 180
 
 vgate_assert 42 serial-absent 'web: budget over'
@@ -2214,6 +2223,44 @@ assert ib > 200 and iz > 200, "page ink missing: base=%d terminal=%d" % (ib, iz)
 print("live-web 43 snapshots ok (letterbox ink %d -> %d)" % (ib, iz))
 PY
 # --- boot 44 (M126e #2597): the download leg --------------------------------
+# The M126e PR carried this run without its staging (observed 2026-10-19:
+# the trimmed spec that produced its evidence lived in artifacts/ and the
+# vgate_file/setup lines never reached main). M126f restores them here.
+# `settings set font_size medium` pins base=13 — the geometry the leg's
+# evidence was produced at — so the 42,95 click does not depend on the
+# settings row an earlier boot happened to leave (boot 43 sets large).
+vgate_file script-dl.txt <<'EOF'
+settings set font_size medium
+exec WEB.ELF /host/DLPAGE.HTML
+EOF
+
+vgate_setup_python <<'PY'
+# Boot 44's fixtures: the download-link page, the 4x4 QOI it points at
+# (synthesized — every pixel a 0xfe RGB chunk, 14+16*4+8 = 86 bytes), and
+# the mime-open targets the completion plate can exec (OPEN -> GOVIEW,
+# FOLDER -> GOFILES; the leg exercises OPEN only).
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+shutil.copy(os.path.join("user", "go", "browser", "testdata", "gate-dl.html"),
+            os.path.join(share, "DLPAGE.HTML"))
+W = H = 4
+qoi = bytearray(b"qoif") + (W).to_bytes(4, "big") + (H).to_bytes(4, "big") + bytes([4, 0])
+for y in range(H):
+    for x in range(W):
+        qoi += bytes([0xfe, 0x30 + 20 * x, 0x60 + 20 * y, 0x90])
+qoi += bytes([0, 0, 0, 0, 0, 0, 0, 1])
+with open(os.path.join(share, "DLPIC.QOI"), "wb") as f:
+    f.write(bytes(qoi))
+for dst_name, build in (("GOVIEW.ELF", "bash tools/go/build-goview.sh"),
+                        ("GOFILES.ELF", "bash tools/go/build-files.sh")):
+    src = os.path.join(".build", "go", dst_name)
+    if not os.path.exists(src):
+        sys.exit(dst_name + " missing (expected " + src + ") - build it first: " + build)
+    shutil.copy(src, os.path.join(share, dst_name))
+print("live-web 44/45-47: staged DLPAGE.HTML + DLPIC.QOI (86B 4x4) + GOVIEW.ELF + GOFILES.ELF")
+PY
+
 # DLPAGE.HTML's first link targets DLPIC.QOI — an image extension the
 # mime table already knows, so the click downloads instead of navigating.
 # The staged write steps over event-loop passes: `web: download start`,
@@ -2308,4 +2355,592 @@ if got != want:
     print("SAVE-AS MISMATCH: %d bytes, want the PAGE.HTML body (%d bytes)" % (len(got), len(want)))
     raise SystemExit(1)
 print("save-as verified on the host: WEBSAVE.HTML == PAGE.HTML (%d bytes)" % len(got))
+PY
+
+# --- boots 46-48 (M126f #2598): the acceptance journey, K=3 -----------------
+# One boot per leg of the daily-browser arc, three independent VMs: a file-
+# channel load of PAGE.HTML (browse), Ctrl+D (bookmark),
+# Ctrl+F on 'the' with step+wrap (find), Ctrl+=/Ctrl+-/Ctrl+0 with a real
+# reflow (zoom), a typed-URL nav to DLPAGE.HTML and a click on its .QOI link
+# (download), then the completion plate's 'o' -> mime.Open -> GOVIEW (open in
+# viewer). The armed share is shared, so the boot-40 NEXT bookmark rides in:
+# 46 adds PAGE (atoms 1->2), 47 toggles it off (2->1), 48 adds it again
+# (1->2) — each boot's startup inventory proves the previous boot's store
+# write persisted, and the ' downloads=' count climbs one per leg.
+#
+# Channel choreography: everything keyboard-side is one --input-chords burst
+# after 'web: ready' (the chord watcher's marker wait is keyed to the run
+# deadline, unlike --input-string's fixed 40 s). The two six-second dwells
+# are pads the open find bar / the idle page swallow (f1 is consumed by the
+# bar — outside it f1 toggles the diagnostics overlay, which would pollute
+# the zoom-100 crop; 'g' binds to nothing in the page keymap).
+#
+# The kind-4 captures are marker-raced (the request copies the CURRENT
+# scanout), so the snapshots anchor on markers that postdate their frames:
+# snap-N-0 on 'find-shot' — script3's echo 4 s into the f1 dwell, well after
+# the hit=2/2 highlight paint; snap-N-1 on 'web: url-focus' — the page crop
+# (letterbox region) is untouched by the chrome url bar, and the zoom-100
+# reflow+repaint settled during the 'g' dwell; snap-N-2 on 'web: download
+# done ' — script2's 8 s delay keeps the plate up until its echo 'web-dl-open'
+# releases --input-key's 'o' (macOS keycode 0x1f). The gview end state is
+# serial-evidenced (open/loaded/ready markers); a fourth capture on 'gview:
+# ready' never lands — the run ends on that marker before queue 3 is serviced.
+# 'settings set font_size medium' pins base=13 so the zoom-100 crop is the
+# approved golden whatever settings row boot 43 left.
+
+vgate_file script-journey.txt <<'EOF'
+settings set font_size medium
+exec WEB.ELF /host/PAGE.HTML
+EOF
+
+vgate_file script-dl-open.txt <<'EOF'
+echo web-dl-open
+EOF
+
+vgate_file script-find-shot.txt <<'EOF'
+echo find-shot
+EOF
+
+vgate_run 46 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-46' \
+    --script '$RUN_DIR/script-journey.txt' \
+    --input-chords 'ctrl-d,ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape,ctrl-=,ctrl-=,ctrl-0,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,ctrl-l,/,h,o,s,t,/,D,L,P,A,G,E,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --pointer-virtio '42,95,c' --pointer-virtio-after 'web: nav-ready n=1' \
+    --snapshot-after 'find-shot' \
+    --snapshot-after 'web: url-focus' \
+    --snapshot-after 'web-dl-open' \
+    --script2 '$RUN_DIR/script-dl-open.txt' --script2-after 'web: download done ' --script2-delay 8 \
+    --script3 '$RUN_DIR/script-find-shot.txt' --script3-after 'web: find hit=2/2' --script3-delay 4 \
+    --input-key 31 --input-key-after 'web-dl-open' \
+    --script-expect 'gview: ready' --timeout 240
+
+vgate_assert 46 serial-absent 'web: budget over'
+vgate_assert 46 serial-contains 'settings: font_size=medium'
+vgate_assert 46 serial-contains 'web: font-size medium base=13'
+vgate_assert 46 serial-contains ' bookmarks=1 '
+vgate_assert 46 serial-contains ' downloads=2'
+vgate_assert 46 serial-contains 'web: bookmark-store ws=bookmarks atoms=1 migrated=0'
+vgate_assert 46 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 46 serial-contains 'web: settled'
+vgate_assert 46 serial-contains 'web: ready'
+vgate_assert 46 serial-contains 'web: bookmark added'
+vgate_assert 46 serial-contains 'web: find open'
+vgate_assert 46 serial-contains "web: find 'the' n=2"
+vgate_assert 46 serial-contains 'web: find hit=1/2'
+vgate_assert 46 serial-contains 'web: find hit=2/2'
+vgate_assert 46 serial-contains 'web: find close'
+vgate_assert 46 serial-contains 'web: zoom 110'
+vgate_assert 46 serial-contains 'web: zoom 125'
+vgate_assert 46 serial-contains 'web: zoom 100'
+vgate_assert 46 serial-count 'web: layout blocks=' 5
+vgate_assert 46 serial-contains 'web: url-focus'
+vgate_assert 46 serial-contains 'web: url /host/DLPAGE.HTML'
+vgate_assert 46 serial-contains 'web: nav /host/DLPAGE.HTML'
+vgate_assert 46 serial-contains 'web: navigated'
+vgate_assert 46 serial-contains 'web: nav-ready n=1'
+vgate_assert 46 serial-contains 'web: download start DLPIC.QOI bytes=86'
+vgate_assert 46 serial-contains 'web: download progress '
+vgate_assert 46 serial-contains 'web: download /host/WEB-DL-DLPIC.QOI '
+vgate_assert 46 serial-contains 'web: download done DLPIC.QOI type=image'
+vgate_assert 46 serial-contains 'web: download toast '
+vgate_assert 46 serial-contains 'web-dl-open'
+vgate_assert 46 serial-contains 'web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI'
+vgate_assert 46 serial-contains 'web: download open launched pid='
+vgate_assert 46 serial-contains 'gview: open id='
+vgate_assert 46 serial-contains 'gview: loaded WEB-DL-DLPIC.QOI 4x4'
+vgate_assert 46 serial-contains 'gview: ready'
+vgate_assert 46 serial-absent 'web: error'
+vgate_assert 46 serial-absent 'web: offline '
+vgate_assert 46 serial-absent 'web: download failed'
+vgate_assert 46 serial-absent 'web: bookmark error'
+vgate_assert 46 serial-absent '[EXC] parking:'
+vgate_assert 46 share-contains 'WEB-DOWNLOADS.TXT' 'WEB-DL-DLPIC.QOI'
+vgate_assert 46 share-contains 'FLINT/ws/bookmarks/ATOMS.jsonl' '/host/NEXT.HTML'
+vgate_assert 46 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "settings: font_size=medium",
+    "web: font-size medium base=13",
+    "web: stores ",
+    "web: url /host/PAGE.HTML",
+    "web: ready",
+    "web: bookmark added",
+    "web: find open",
+    "web: find 'the' n=2",
+    "web: find hit=1/2",
+    "web: find hit=2/2",
+    "web: find hit=1/2",
+    "web: find close",
+    "web: zoom 110",
+    "web: zoom 125",
+    "web: zoom 100",
+    "web: url-focus",
+    "web: url /host/DLPAGE.HTML",
+    "web: nav /host/DLPAGE.HTML",
+    "web: nav-ready n=1",
+    "web: download start DLPIC.QOI bytes=86",
+    "web: download progress ",
+    "web: download /host/WEB-DL-DLPIC.QOI",
+    "web: download done DLPIC.QOI type=image",
+    "web: download toast ",
+    "web-dl-open",
+    "web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI",
+    "web: download open launched pid=",
+    "gview: open id=",
+    "gview: loaded WEB-DL-DLPIC.QOI 4x4",
+    "gview: ready"
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 46 journey ordering ok (browse -> bookmark -> sidebar -> find -> zoom -> nav -> download -> open)")
+PY
+vgate_assert 46 snapshot 'snap-46-0.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+MATCH   = (0xb5, 0x89, 0x00)  # every match's fill
+CURRENT = (0xcb, 0x4b, 0x16)  # the current match's fill
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the bar's plate
+match = current = 0
+for yy in range(92, 380):
+    for xx in range(40, 552):
+        c = px(xx, yy)
+        if near(c, MATCH):
+            match += 1
+        elif near(c, CURRENT):
+            current += 1
+plate = sum(1 for yy in range(380, 396) for xx in range(40, 552) if near(px(xx, yy), SURFACE))
+assert match >= 20, "match highlight pixels %d" % match
+assert current >= 10, "current-match highlight pixels %d" % current
+assert plate > 1500, "find bar plate pixels %d" % plate
+print("live-web 46 journey: find highlights ok (match=%d current=%d plate=%d)" % (match, current, plate))
+PY
+vgate_assert 46 snapshot 'snap-46-1.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'page'])
+PY
+vgate_assert 46 snapshot 'snap-46-2.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+SURFACE  = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the plate fill
+ACCENT   = (0x3b, 0x82, 0xf6)  # theme.Dark.Accent: top rule + chip labels
+RULE     = (0x2e, 0x3a, 0x44)  # theme.Dark.Rule: chip borders
+CHROMEBG = (0x11, 0x17, 0x1c)  # theme.Dark.ChromeBg: chip fill
+# The completion plate: 232x42 at window (272,318) -> scanout x[312,544),
+# y[346,388). The 8 s script2 delay keeps 'o' back so the kind-4 stream
+# cannot outrun the plate.
+surface = accent_top = chips = chipink = 0
+for yy in range(346, 388):
+    for xx in range(312, 544):
+        c = px(xx, yy)
+        if near(c, SURFACE):
+            surface += 1
+        elif near(c, CHROMEBG):
+            chips += 1
+accent_top = sum(1 for xx in range(312, 544) if near(px(xx, 346), ACCENT))
+# Accent ink below the top rule = the OPEN/FOLDER/X labels.
+for yy in range(360, 384):
+    for xx in range(312, 544):
+        if near(px(xx, yy), ACCENT):
+            chipink += 1
+assert surface > 4000, "plate surface pixels %d" % surface
+assert accent_top > 150, "plate accent top-rule pixels %d" % accent_top
+assert chips > 800, "plate chip fill pixels %d" % chips
+assert chipink > 10, "plate chip label pixels %d" % chipink
+print("live-web 46 journey: completion plate ok (surface=%d accent_top=%d chips=%d chipink=%d)" %
+      (surface, accent_top, chips, chipink))
+PY
+vgate_assert 46 python <<'PY'
+import glob, os, json
+share = os.environ["VG_SHARE"]
+rows = [l for l in open(os.path.join(share, "FLINT", "ws", "bookmarks",
+        "ATOMS.jsonl")).read().splitlines() if l]
+import json
+atoms = [json.loads(l)["metadata"]["url"] for l in rows]
+assert sorted(atoms) == ["/host/NEXT.HTML", "/host/PAGE.HTML"], atoms
+dl = glob.glob(os.path.join(share, "WEB-DL-DLPIC.QOI"))
+assert dl, "no downloaded file on the share"
+assert os.path.getsize(dl[0]) == 86, "download size %d" % os.path.getsize(dl[0])
+led = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
+       errors="replace").read().splitlines() if l and not l.startswith("#")]
+assert any("WEB-DL-DLPIC.QOI" in r for r in led), "no ledger row for the download"
+print("live-web 46 share state ok (atoms, 86B download, ledger row)")
+PY
+vgate_run 47 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-47' \
+    --script '$RUN_DIR/script-journey.txt' \
+    --input-chords 'ctrl-d,ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape,ctrl-=,ctrl-=,ctrl-0,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,ctrl-l,/,h,o,s,t,/,D,L,P,A,G,E,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --pointer-virtio '42,95,c' --pointer-virtio-after 'web: nav-ready n=1' \
+    --snapshot-after 'find-shot' \
+    --snapshot-after 'web: url-focus' \
+    --snapshot-after 'web-dl-open' \
+    --script2 '$RUN_DIR/script-dl-open.txt' --script2-after 'web: download done ' --script2-delay 8 \
+    --script3 '$RUN_DIR/script-find-shot.txt' --script3-after 'web: find hit=2/2' --script3-delay 4 \
+    --input-key 31 --input-key-after 'web-dl-open' \
+    --script-expect 'gview: ready' --timeout 240
+
+vgate_assert 47 serial-absent 'web: budget over'
+vgate_assert 47 serial-contains 'settings: font_size=medium'
+vgate_assert 47 serial-contains 'web: font-size medium base=13'
+vgate_assert 47 serial-contains ' bookmarks=2 '
+vgate_assert 47 serial-contains ' downloads=3'
+vgate_assert 47 serial-contains 'web: bookmark-store ws=bookmarks atoms=2 migrated=0'
+vgate_assert 47 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 47 serial-contains 'web: settled'
+vgate_assert 47 serial-contains 'web: ready'
+vgate_assert 47 serial-contains 'web: bookmark removed'
+vgate_assert 47 serial-contains 'web: find open'
+vgate_assert 47 serial-contains "web: find 'the' n=2"
+vgate_assert 47 serial-contains 'web: find hit=1/2'
+vgate_assert 47 serial-contains 'web: find hit=2/2'
+vgate_assert 47 serial-contains 'web: find close'
+vgate_assert 47 serial-contains 'web: zoom 110'
+vgate_assert 47 serial-contains 'web: zoom 125'
+vgate_assert 47 serial-contains 'web: zoom 100'
+vgate_assert 47 serial-count 'web: layout blocks=' 5
+vgate_assert 47 serial-contains 'web: url-focus'
+vgate_assert 47 serial-contains 'web: url /host/DLPAGE.HTML'
+vgate_assert 47 serial-contains 'web: nav /host/DLPAGE.HTML'
+vgate_assert 47 serial-contains 'web: navigated'
+vgate_assert 47 serial-contains 'web: nav-ready n=1'
+vgate_assert 47 serial-contains 'web: download start DLPIC.QOI bytes=86'
+vgate_assert 47 serial-contains 'web: download progress '
+vgate_assert 47 serial-contains 'web: download /host/WEB-DL-DLPIC.QOI '
+vgate_assert 47 serial-contains 'web: download done DLPIC.QOI type=image'
+vgate_assert 47 serial-contains 'web: download toast '
+vgate_assert 47 serial-contains 'web-dl-open'
+vgate_assert 47 serial-contains 'web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI'
+vgate_assert 47 serial-contains 'web: download open launched pid='
+vgate_assert 47 serial-contains 'gview: open id='
+vgate_assert 47 serial-contains 'gview: loaded WEB-DL-DLPIC.QOI 4x4'
+vgate_assert 47 serial-contains 'gview: ready'
+vgate_assert 47 serial-absent 'web: error'
+vgate_assert 47 serial-absent 'web: offline '
+vgate_assert 47 serial-absent 'web: download failed'
+vgate_assert 47 serial-absent 'web: bookmark error'
+vgate_assert 47 serial-absent '[EXC] parking:'
+vgate_assert 47 share-contains 'WEB-DOWNLOADS.TXT' 'WEB-DL-DLPIC.QOI'
+vgate_assert 47 share-contains 'FLINT/ws/bookmarks/ATOMS.jsonl' '/host/NEXT.HTML'
+vgate_assert 47 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "settings: font_size=medium",
+    "web: font-size medium base=13",
+    "web: stores ",
+    "web: url /host/PAGE.HTML",
+    "web: ready",
+    "web: bookmark removed",
+    "web: find open",
+    "web: find 'the' n=2",
+    "web: find hit=1/2",
+    "web: find hit=2/2",
+    "web: find hit=1/2",
+    "web: find close",
+    "web: zoom 110",
+    "web: zoom 125",
+    "web: zoom 100",
+    "web: url-focus",
+    "web: url /host/DLPAGE.HTML",
+    "web: nav /host/DLPAGE.HTML",
+    "web: nav-ready n=1",
+    "web: download start DLPIC.QOI bytes=86",
+    "web: download progress ",
+    "web: download /host/WEB-DL-DLPIC.QOI",
+    "web: download done DLPIC.QOI type=image",
+    "web: download toast ",
+    "web-dl-open",
+    "web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI",
+    "web: download open launched pid=",
+    "gview: open id=",
+    "gview: loaded WEB-DL-DLPIC.QOI 4x4",
+    "gview: ready"
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 47 journey ordering ok (browse -> bookmark -> sidebar -> find -> zoom -> nav -> download -> open)")
+PY
+vgate_assert 47 snapshot 'snap-47-0.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+MATCH   = (0xb5, 0x89, 0x00)  # every match's fill
+CURRENT = (0xcb, 0x4b, 0x16)  # the current match's fill
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the bar's plate
+match = current = 0
+for yy in range(92, 380):
+    for xx in range(40, 552):
+        c = px(xx, yy)
+        if near(c, MATCH):
+            match += 1
+        elif near(c, CURRENT):
+            current += 1
+plate = sum(1 for yy in range(380, 396) for xx in range(40, 552) if near(px(xx, yy), SURFACE))
+assert match >= 20, "match highlight pixels %d" % match
+assert current >= 10, "current-match highlight pixels %d" % current
+assert plate > 1500, "find bar plate pixels %d" % plate
+print("live-web 47 journey: find highlights ok (match=%d current=%d plate=%d)" % (match, current, plate))
+PY
+vgate_assert 47 snapshot 'snap-47-1.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'page'])
+PY
+vgate_assert 47 snapshot 'snap-47-2.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+SURFACE  = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the plate fill
+ACCENT   = (0x3b, 0x82, 0xf6)  # theme.Dark.Accent: top rule + chip labels
+RULE     = (0x2e, 0x3a, 0x44)  # theme.Dark.Rule: chip borders
+CHROMEBG = (0x11, 0x17, 0x1c)  # theme.Dark.ChromeBg: chip fill
+# The completion plate: 232x42 at window (272,318) -> scanout x[312,544),
+# y[346,388). The 8 s script2 delay keeps 'o' back so the kind-4 stream
+# cannot outrun the plate.
+surface = accent_top = chips = chipink = 0
+for yy in range(346, 388):
+    for xx in range(312, 544):
+        c = px(xx, yy)
+        if near(c, SURFACE):
+            surface += 1
+        elif near(c, CHROMEBG):
+            chips += 1
+accent_top = sum(1 for xx in range(312, 544) if near(px(xx, 346), ACCENT))
+# Accent ink below the top rule = the OPEN/FOLDER/X labels.
+for yy in range(360, 384):
+    for xx in range(312, 544):
+        if near(px(xx, yy), ACCENT):
+            chipink += 1
+assert surface > 4000, "plate surface pixels %d" % surface
+assert accent_top > 150, "plate accent top-rule pixels %d" % accent_top
+assert chips > 800, "plate chip fill pixels %d" % chips
+assert chipink > 10, "plate chip label pixels %d" % chipink
+print("live-web 47 journey: completion plate ok (surface=%d accent_top=%d chips=%d chipink=%d)" %
+      (surface, accent_top, chips, chipink))
+PY
+vgate_assert 47 python <<'PY'
+import glob, os, json
+share = os.environ["VG_SHARE"]
+rows = [l for l in open(os.path.join(share, "FLINT", "ws", "bookmarks",
+        "ATOMS.jsonl")).read().splitlines() if l]
+import json
+atoms = [json.loads(l)["metadata"]["url"] for l in rows]
+assert atoms == ["/host/NEXT.HTML"], "PAGE must stay removed: %r" % atoms
+dl = glob.glob(os.path.join(share, "WEB-DL-DLPIC.QOI"))
+assert dl, "no downloaded file on the share"
+assert os.path.getsize(dl[0]) == 86, "download size %d" % os.path.getsize(dl[0])
+led = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
+       errors="replace").read().splitlines() if l and not l.startswith("#")]
+assert any("WEB-DL-DLPIC.QOI" in r for r in led), "no ledger row for the download"
+print("live-web 47 share state ok (atoms, 86B download, ledger row)")
+PY
+vgate_run 48 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-48' \
+    --script '$RUN_DIR/script-journey.txt' \
+    --input-chords 'ctrl-d,ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape,ctrl-=,ctrl-=,ctrl-0,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,g,ctrl-l,/,h,o,s,t,/,D,L,P,A,G,E,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --pointer-virtio '42,95,c' --pointer-virtio-after 'web: nav-ready n=1' \
+    --snapshot-after 'find-shot' \
+    --snapshot-after 'web: url-focus' \
+    --snapshot-after 'web-dl-open' \
+    --script2 '$RUN_DIR/script-dl-open.txt' --script2-after 'web: download done ' --script2-delay 8 \
+    --script3 '$RUN_DIR/script-find-shot.txt' --script3-after 'web: find hit=2/2' --script3-delay 4 \
+    --input-key 31 --input-key-after 'web-dl-open' \
+    --script-expect 'gview: ready' --timeout 240
+
+vgate_assert 48 serial-absent 'web: budget over'
+vgate_assert 48 serial-contains 'settings: font_size=medium'
+vgate_assert 48 serial-contains 'web: font-size medium base=13'
+vgate_assert 48 serial-contains ' bookmarks=1 '
+vgate_assert 48 serial-contains ' downloads=4'
+vgate_assert 48 serial-contains 'web: bookmark-store ws=bookmarks atoms=1 migrated=0'
+vgate_assert 48 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 48 serial-contains 'web: settled'
+vgate_assert 48 serial-contains 'web: ready'
+vgate_assert 48 serial-contains 'web: bookmark added'
+vgate_assert 48 serial-contains 'web: find open'
+vgate_assert 48 serial-contains "web: find 'the' n=2"
+vgate_assert 48 serial-contains 'web: find hit=1/2'
+vgate_assert 48 serial-contains 'web: find hit=2/2'
+vgate_assert 48 serial-contains 'web: find close'
+vgate_assert 48 serial-contains 'web: zoom 110'
+vgate_assert 48 serial-contains 'web: zoom 125'
+vgate_assert 48 serial-contains 'web: zoom 100'
+vgate_assert 48 serial-count 'web: layout blocks=' 5
+vgate_assert 48 serial-contains 'web: url-focus'
+vgate_assert 48 serial-contains 'web: url /host/DLPAGE.HTML'
+vgate_assert 48 serial-contains 'web: nav /host/DLPAGE.HTML'
+vgate_assert 48 serial-contains 'web: navigated'
+vgate_assert 48 serial-contains 'web: nav-ready n=1'
+vgate_assert 48 serial-contains 'web: download start DLPIC.QOI bytes=86'
+vgate_assert 48 serial-contains 'web: download progress '
+vgate_assert 48 serial-contains 'web: download /host/WEB-DL-DLPIC.QOI '
+vgate_assert 48 serial-contains 'web: download done DLPIC.QOI type=image'
+vgate_assert 48 serial-contains 'web: download toast '
+vgate_assert 48 serial-contains 'web-dl-open'
+vgate_assert 48 serial-contains 'web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI'
+vgate_assert 48 serial-contains 'web: download open launched pid='
+vgate_assert 48 serial-contains 'gview: open id='
+vgate_assert 48 serial-contains 'gview: loaded WEB-DL-DLPIC.QOI 4x4'
+vgate_assert 48 serial-contains 'gview: ready'
+vgate_assert 48 serial-absent 'web: error'
+vgate_assert 48 serial-absent 'web: offline '
+vgate_assert 48 serial-absent 'web: download failed'
+vgate_assert 48 serial-absent 'web: bookmark error'
+vgate_assert 48 serial-absent '[EXC] parking:'
+vgate_assert 48 share-contains 'WEB-DOWNLOADS.TXT' 'WEB-DL-DLPIC.QOI'
+vgate_assert 48 share-contains 'FLINT/ws/bookmarks/ATOMS.jsonl' '/host/NEXT.HTML'
+vgate_assert 48 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "settings: font_size=medium",
+    "web: font-size medium base=13",
+    "web: stores ",
+    "web: url /host/PAGE.HTML",
+    "web: ready",
+    "web: bookmark added",
+    "web: find open",
+    "web: find 'the' n=2",
+    "web: find hit=1/2",
+    "web: find hit=2/2",
+    "web: find hit=1/2",
+    "web: find close",
+    "web: zoom 110",
+    "web: zoom 125",
+    "web: zoom 100",
+    "web: url-focus",
+    "web: url /host/DLPAGE.HTML",
+    "web: nav /host/DLPAGE.HTML",
+    "web: nav-ready n=1",
+    "web: download start DLPIC.QOI bytes=86",
+    "web: download progress ",
+    "web: download /host/WEB-DL-DLPIC.QOI",
+    "web: download done DLPIC.QOI type=image",
+    "web: download toast ",
+    "web-dl-open",
+    "web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI",
+    "web: download open launched pid=",
+    "gview: open id=",
+    "gview: loaded WEB-DL-DLPIC.QOI 4x4",
+    "gview: ready"
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 48 journey ordering ok (browse -> bookmark -> sidebar -> find -> zoom -> nav -> download -> open)")
+PY
+vgate_assert 48 snapshot 'snap-48-0.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+MATCH   = (0xb5, 0x89, 0x00)  # every match's fill
+CURRENT = (0xcb, 0x4b, 0x16)  # the current match's fill
+SURFACE = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the bar's plate
+match = current = 0
+for yy in range(92, 380):
+    for xx in range(40, 552):
+        c = px(xx, yy)
+        if near(c, MATCH):
+            match += 1
+        elif near(c, CURRENT):
+            current += 1
+plate = sum(1 for yy in range(380, 396) for xx in range(40, 552) if near(px(xx, yy), SURFACE))
+assert match >= 20, "match highlight pixels %d" % match
+assert current >= 10, "current-match highlight pixels %d" % current
+assert plate > 1500, "find bar plate pixels %d" % plate
+print("live-web 48 journey: find highlights ok (match=%d current=%d plate=%d)" % (match, current, plate))
+PY
+vgate_assert 48 snapshot 'snap-48-1.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'page'])
+PY
+vgate_assert 48 snapshot 'snap-48-2.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+def near(c, want, tol=6):
+    return all(abs(a-b) <= tol for a, b in zip(c, want))
+SURFACE  = (0x22, 0x2d, 0x35)  # theme.Dark.Surface: the plate fill
+ACCENT   = (0x3b, 0x82, 0xf6)  # theme.Dark.Accent: top rule + chip labels
+RULE     = (0x2e, 0x3a, 0x44)  # theme.Dark.Rule: chip borders
+CHROMEBG = (0x11, 0x17, 0x1c)  # theme.Dark.ChromeBg: chip fill
+# The completion plate: 232x42 at window (272,318) -> scanout x[312,544),
+# y[346,388). The 8 s script2 delay keeps 'o' back so the kind-4 stream
+# cannot outrun the plate.
+surface = accent_top = chips = chipink = 0
+for yy in range(346, 388):
+    for xx in range(312, 544):
+        c = px(xx, yy)
+        if near(c, SURFACE):
+            surface += 1
+        elif near(c, CHROMEBG):
+            chips += 1
+accent_top = sum(1 for xx in range(312, 544) if near(px(xx, 346), ACCENT))
+# Accent ink below the top rule = the OPEN/FOLDER/X labels.
+for yy in range(360, 384):
+    for xx in range(312, 544):
+        if near(px(xx, yy), ACCENT):
+            chipink += 1
+assert surface > 4000, "plate surface pixels %d" % surface
+assert accent_top > 150, "plate accent top-rule pixels %d" % accent_top
+assert chips > 800, "plate chip fill pixels %d" % chips
+assert chipink > 10, "plate chip label pixels %d" % chipink
+print("live-web 48 journey: completion plate ok (surface=%d accent_top=%d chips=%d chipink=%d)" %
+      (surface, accent_top, chips, chipink))
+PY
+vgate_assert 48 python <<'PY'
+import glob, os, json
+share = os.environ["VG_SHARE"]
+rows = [l for l in open(os.path.join(share, "FLINT", "ws", "bookmarks",
+        "ATOMS.jsonl")).read().splitlines() if l]
+import json
+atoms = [json.loads(l)["metadata"]["url"] for l in rows]
+assert sorted(atoms) == ["/host/NEXT.HTML", "/host/PAGE.HTML"], atoms
+dl = glob.glob(os.path.join(share, "WEB-DL-DLPIC.QOI"))
+assert dl, "no downloaded file on the share"
+assert os.path.getsize(dl[0]) == 86, "download size %d" % os.path.getsize(dl[0])
+led = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
+       errors="replace").read().splitlines() if l and not l.startswith("#")]
+assert any("WEB-DL-DLPIC.QOI" in r for r in led), "no ledger row for the download"
+print("live-web 48 share state ok (atoms, 86B download, ledger row)")
 PY
