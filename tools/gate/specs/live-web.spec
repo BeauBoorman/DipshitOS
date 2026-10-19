@@ -2213,3 +2213,67 @@ ib, iz = ink(base), ink(zoom)
 assert ib > 200 and iz > 200, "page ink missing: base=%d terminal=%d" % (ib, iz)
 print("live-web 43 snapshots ok (letterbox ink %d -> %d)" % (ib, iz))
 PY
+# --- boot 44 (M126e #2597): the download leg --------------------------------
+# DLPAGE.HTML's first link targets DLPIC.QOI — an image extension the
+# mime table already knows, so the click downloads instead of navigating.
+# The staged write steps over event-loop passes: `web: download start`,
+# `web: download progress` on each tenth, the boot-09-shaped
+# `web: download <path> <bytes>` at commit, then `web: download done` and
+# the completion plate. 'o' is the plate's Open: mime dispatch execs
+# GOVIEW.ELF on the saved file, and GOVIEW's own `gview:` markers prove the
+# decode landed. Under the shim there is no Go seat — the kind-22 reports
+# and the kind-12 toast refuse fast, and `seat=`/`web: download toast`
+# say so instead of pretending.
+vgate_run 44 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-44' \
+    --script '$RUN_DIR/script-dl.txt' \
+    --pointer-virtio '42,95,c' --pointer-virtio-after 'web: ready' \
+    --input-chords 'o' --input-chords-after 'web: download done ' \
+    --snapshot-after 'web: download done ' \
+    --script-expect 'gview: ready' --timeout 180
+
+vgate_assert 44 serial-absent 'web: budget over'
+vgate_assert 44 serial-contains 'web: url /host/DLPAGE.HTML'
+vgate_assert 44 serial-contains 'web: ev kind=3'
+vgate_assert 44 serial-contains 'web: download start DLPIC.QOI bytes='
+vgate_assert 44 serial-contains 'web: download progress '
+vgate_assert 44 serial-contains 'web: download /host/WEB-DL-DLPIC.QOI '
+vgate_assert 44 serial-contains 'web: download done DLPIC.QOI type=image'
+vgate_assert 44 serial-contains 'web: download toast '
+vgate_assert 44 serial-contains 'web: download open GOVIEW.ELF /host/WEB-DL-DLPIC.QOI'
+vgate_assert 44 serial-contains 'web: download open launched pid='
+vgate_assert 44 serial-contains 'gview: open id='
+vgate_assert 44 serial-contains 'gview: loaded WEB-DL-DLPIC.QOI 4x4'
+vgate_assert 44 serial-contains 'gview: ready'
+vgate_assert 44 serial-absent 'web: error'
+vgate_assert 44 serial-absent 'web: download failed'
+vgate_assert 44 serial-absent '[EXC] parking:'
+vgate_assert 44 python <<'PY'
+import glob, os
+share = os.environ["VG_SHARE"]
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "web: download start DLPIC.QOI",
+    "web: download progress ",
+    "web: download /host/WEB-DL-DLPIC.QOI",
+    "web: download done DLPIC.QOI type=image",
+    "web: download toast ",
+    "web: download open GOVIEW.ELF",
+    "gview: loaded WEB-DL-DLPIC.QOI 4x4",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+dl = glob.glob(os.path.join(share, "WEB-DL-DLPIC.QOI"))
+assert dl, "no downloaded file on the share"
+size = os.path.getsize(dl[0])
+assert size == 86, "download size %d" % size
+rows = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
+        errors="replace").read().splitlines() if l and not l.startswith("#")]
+assert any("WEB-DL-DLPIC.QOI" in r for r in rows), "no ledger row for the download"
+print("live-web 44 download ok (start->progress->done->toast->open ordering, "
+      "share file %dB, ledger row)" % size)
+PY
