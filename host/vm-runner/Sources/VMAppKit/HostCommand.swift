@@ -26,6 +26,18 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case quit
     // Machine menu.
     case stop
+    // M120c (#2560): the persistence lifecycle verbs — suspend/snapshot
+    // ride the M115d/e drivers the runner injects into `machine`;
+    // apply-update/rollback-update run the M115f base-image swap;
+    // reveal-share opens the armed share in Finder. The model
+    // self-registers like the other companions, so a bare bus receipts
+    // `disabled` from the verbs' own posture (save-capable? staged?
+    // .prev? share?) and an unwired driver keeps the same answer.
+    case suspend
+    case snapshot
+    case applyUpdate = "apply-update"
+    case rollbackUpdate = "rollback-update"
+    case revealShare = "reveal-share"
     // M128b (#2606): the profile manager's four verbs — the model
     // (HostProfilesModel) self-registers in init like the recorder/
     // agent/settings companions, so a profile-less run receipts
@@ -177,10 +189,21 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
     /// Injectable so a test owns its profile/dir/confirm seams.
     public let profiles: HostProfilesModel
 
+    /// M120c (#2560): the machine lifecycle model — the five persistence
+    /// verbs' posture and actions, self-registering on the bus like the
+    /// other companions. The runner injects its VZ drivers + posture
+    /// reads (saveCapable/vmRunning/suspendDriver/snapshotDriver); the
+    /// model resolves profile/share/base/key from argv itself, so a bare
+    /// `HostCommandBus()` in a `--host-cmd-after` run dispatches the
+    /// identical seam and a posture-less run receipts `disabled`.
+    /// Injectable so a test owns its seams.
+    public let machine: HostMachineModel
+
     private var registrations: [HostCommand: Registration] = [:]
 
     public init(emit: ((String) -> Void)? = nil, agent: HostAgentCompanion? = nil,
-                settings: HostSettingsModel? = nil, profiles: HostProfilesModel? = nil) {
+                settings: HostSettingsModel? = nil, profiles: HostProfilesModel? = nil,
+                machine: HostMachineModel? = nil) {
         self.emit = emit ?? {
             FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
         }
@@ -190,6 +213,8 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
         self.settings.emit = self.emit
         self.profiles = profiles ?? HostProfilesModel()
         self.profiles.emit = self.emit
+        self.machine = machine ?? HostMachineModel()
+        self.machine.emit = self.emit
         super.init()
         let recorder = self.recorder
         register(.record, Registration(
@@ -243,6 +268,32 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
             isEnabled: { profiles.canSwitch },
             receiptDetail: { profiles.receiptDetail },
             action: { profiles.switchProfile() }))
+        // M120c (#2560): the persistence lifecycle verbs — the model's
+        // live posture gates each (save-capable + a destination for
+        // suspend/snapshot, a staged set + pin for apply, a .prev for
+        // rollback, a share for reveal), and its receipt tail carries
+        // the post-action truth.
+        let machine = self.machine
+        register(.suspend, Registration(
+            isEnabled: { machine.canSuspend },
+            receiptDetail: { machine.suspendDetail },
+            action: { machine.suspend() }))
+        register(.snapshot, Registration(
+            isEnabled: { machine.canSnapshot },
+            receiptDetail: { machine.snapshotDetail },
+            action: { machine.snapshot() }))
+        register(.applyUpdate, Registration(
+            isEnabled: { machine.canApplyUpdate },
+            receiptDetail: { machine.applyUpdateDetail },
+            action: { machine.applyUpdate() }))
+        register(.rollbackUpdate, Registration(
+            isEnabled: { machine.canRollbackUpdate },
+            receiptDetail: { machine.rollbackUpdateDetail },
+            action: { machine.rollbackUpdate() }))
+        register(.revealShare, Registration(
+            isEnabled: { machine.canRevealShare },
+            receiptDetail: { machine.revealShareDetail },
+            action: { machine.revealShare() }))
         // The companion's audit poll self-arms only when a share is
         // resolvable — a shareless run never schedules it (the flags-
         // off posture, host side).

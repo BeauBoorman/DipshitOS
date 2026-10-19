@@ -39,6 +39,20 @@
 # frames=/bytes= are the writer's actuals; the asserts hold the PNG to
 # a signature and the MP4 to a real ftyp+moov.
 #
+# Runs 06-07 are M120c's (#2560): the Machine-menu persistence verbs.
+# Run 01 additionally fires all five on a posture-less flag run — every
+# one receipts `disabled` (no profile, no share, nothing staged), the
+# enablement half of the card. Run 06 boots a minted .virelaivm on a
+# save-capable device set (devices.share off; the share rides
+# --virtio-fs — the standard transport validateSaveRestoreSupport
+# accepts, the custom-virtio --cvc-file being what it refuses):
+# `snapshot` performs FOR REAL (a menu-<stamp>.vzsave lands under
+# <share>/SNAPSHOTS/), `reveal-share` performs, and `apply-update`/
+# `rollback-update` still receipt `disabled` — the posture is read at
+# dispatch, not at arm. Run 07 fires `suspend` on the same posture: the
+# guest's own M115d SuspendCtl freezes, saves saved-state/state.vzsave
+# and the run ends through the suspended-teardown path.
+#
 # M114f (#2459) acceptance: taken together the five runs are the
 # full-window journey — bus dispatch (screenshot, clean stop), the
 # viewport verbs (fullscreen, capture-keys on/off, the
@@ -63,10 +77,29 @@ EOF
 
 # Run 05's share + CAPTURES dir must exist before the runner validates
 # --virtio-fs and before the screenshot verb writes into it (the boot
-# marker races ahead of record-start).
+# marker races ahead of record-start). Runs 06-07 mint their
+# .virelaivm here too — devices.share stays OFF so the share rides
+# --virtio-fs (the save-capable posture live-suspend-resume pinned;
+# --cvc-file's custom-virtio device is what save/restore refuses).
 vgate_setup_python <<'PY'
-import os
+import json, os, shutil, subprocess, sys
 os.makedirs(os.path.join(os.environ["RUN_DIR"], "capshare", "CAPTURES"), exist_ok=True)
+
+run = os.environ["RUN_DIR"]
+runner = os.path.join("host", "vm-runner", ".build", "release", "VMRunner")
+prof = os.path.join(run, "m120c.virelaivm")
+r = subprocess.run([runner, "--profile", prof, "--profile-init"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit("m120c profile mint refused: " + r.stdout + r.stderr)
+base = os.path.join(run, "m120c-base.img")
+shutil.copy(os.path.join("artifacts", "disk.img"), base)
+cfg_path = os.path.join(prof, "config.json")
+cfg = json.load(open(cfg_path))
+cfg["baseImage"] = base            # --overlay-base wins anyway; keeps the bundle coherent
+cfg.setdefault("devices", {})["share"] = False
+json.dump(cfg, open(cfg_path, "w"), indent=2, sort_keys=True)
+print("m120c profile minted; private base copy staged; devices.share=false")
 PY
 
 vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
@@ -75,6 +108,11 @@ vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
     --host-cmd-after 'VirelaiOS kernel has seized control.:capture-keys' \
     --host-cmd-after 'VirelaiOS kernel has seized control.:capture-keys' \
     --host-cmd-after 'VirelaiOS kernel has seized control.:send-file' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:suspend' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:snapshot' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:apply-update' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:rollback-update' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:reveal-share' \
     --script-expect 'host-ui-idle' --timeout 90
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
@@ -83,6 +121,14 @@ vgate_assert 01 output-contains 'host-ui: cmd=fullscreen state=performed'
 vgate_assert 01 output-contains 'host-ui: cmd=capture-keys state=performed capture=on'
 vgate_assert 01 output-contains 'host-ui: cmd=capture-keys state=performed capture=off'
 vgate_assert 01 output-contains 'host-ui: cmd=send-file state=unavailable'
+# M120c (#2560): on a posture-less flag run every lifecycle verb is
+# disabled — no saved-state dir (no profile), no share, nothing staged,
+# no .prev. Enablement is the receipt, not silence.
+vgate_assert 01 output-contains 'host-ui: cmd=suspend state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=snapshot state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=apply-update state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=rollback-update state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=reveal-share state=disabled'
 vgate_assert 01 output-contains 'framebuffer screenshot saved'
 vgate_assert 01 snapshot 'screen-hostui-*' <<'PY'
 import sys
@@ -200,4 +246,65 @@ if len(data) < 12 or data[4:8] != b"ftyp":
 if b"moov" not in data:
     sys.exit("CAPTURES recording has no moov box — the writer never finalized (%d bytes)" % len(data))
 print("CAPTURES recording is a finalized MP4: %s (%d bytes)" % (p, len(data)))
+PY
+
+# Run 06 is M120c's (#2560) armed-posture leg: the .virelaivm the setup
+# minted, the share riding --virtio-fs (the save-capable transport).
+# `snapshot` performs FOR REAL — the same SnapshotCtl the ctl wire
+# serves freezes the VM and writes SNAPSHOTS/menu-<stamp>.vzsave — and
+# `reveal-share` performs (the armed share resolves from argv).
+# `apply-update`/`rollback-update` still receipt disabled: nothing is
+# staged, no .prev exists — enablement is live posture, not arm-time
+# truth. The 'virelai> ' marker fires the verbs on a seated guest, well
+# ahead of the script's 'host-ui-idle' echo.
+vgate_run 06 -- --profile '$RUN_DIR/m120c.virelaivm' \
+    --overlay-base '$RUN_DIR/m120c-base.img' \
+    --virtio-fs '$RUN_DIR/m120c.virelaivm/share' \
+    --script '$RUN_DIR/script.txt' \
+    --host-cmd-after 'virelai> :snapshot' \
+    --host-cmd-after 'virelai> :apply-update' \
+    --host-cmd-after 'virelai> :rollback-update' \
+    --host-cmd-after 'virelai> :reveal-share' \
+    --script-expect 'host-ui-idle' --timeout 120
+
+vgate_assert 06 output-contains 'host-ui: cmd=snapshot state=performed'
+vgate_assert 06 output-contains 'host-ui: cmd=reveal-share state=performed'
+vgate_assert 06 output-contains 'host-ui: cmd=apply-update state=disabled'
+vgate_assert 06 output-contains 'host-ui: cmd=rollback-update state=disabled'
+# The performed snapshot is a file, not a receipt word — a
+# menu-<stamp>.vzsave under the armed share's SNAPSHOTS/, non-empty.
+vgate_assert 06 python <<'PY'
+import glob, os, sys
+snaps = glob.glob(os.path.join(
+    os.environ["RUN_DIR"], "m120c.virelaivm", "share",
+    "SNAPSHOTS", "menu-*.vzsave"))
+if not snaps:
+    sys.exit("no menu-*.vzsave under the armed share's SNAPSHOTS/")
+sizes = {os.path.basename(p): os.path.getsize(p) for p in snaps}
+if any(s == 0 for s in sizes.values()):
+    sys.exit("empty snapshot file: %r" % sizes)
+print("bus snapshot landed: %s" % sizes)
+PY
+
+# Run 07 is the suspend leg: same posture, the `suspend` verb drives the
+# M115d SuspendCtl — pause, save into the profile's saved-state/, then
+# the suspended-teardown ends the run (the script-expect is the
+# deliberately-unreached marker; the receipt + the state file are the
+# evidence).
+vgate_run 07 -- --profile '$RUN_DIR/m120c.virelaivm' \
+    --overlay-base '$RUN_DIR/m120c-base.img' \
+    --virtio-fs '$RUN_DIR/m120c.virelaivm/share' \
+    --script '$RUN_DIR/script.txt' \
+    --host-cmd-after 'virelai> :suspend' \
+    --script-expect 'host-ui-idle' --timeout 120
+
+vgate_assert 07 output-contains 'host-ui: cmd=suspend state=performed'
+vgate_assert 07 output-contains 'VSOCK-CTL: suspend saved state.vzsave'
+vgate_assert 07 python <<'PY'
+import os, sys
+state = os.path.join(os.environ["RUN_DIR"], "m120c.virelaivm",
+                     "saved-state", "state.vzsave")
+if not os.path.isfile(state) or os.path.getsize(state) == 0:
+    sys.exit("suspend left no non-empty saved-state/state.vzsave")
+print("suspended state saved: %d bytes" % os.path.getsize(state))
 PY
