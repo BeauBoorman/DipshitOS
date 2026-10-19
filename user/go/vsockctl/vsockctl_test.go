@@ -153,3 +153,26 @@ func TestSessionRefusals(t *testing.T) {
 		t.Fatalf("client sent %q on a malformed greeting", tr.w.String())
 	}
 }
+
+// M128d (#2608): `profile-info` is a bare-verb request on the wire, and
+// its ok reply carries the flat `result` object the kernel relays. The
+// guest-side field decode lives in vi (slot 93 owns the relay); this is
+// the wire shape the transport-level session must pass through.
+func TestProfileInfoOnTheWire(t *testing.T) {
+	req, err := EncodeRequest(7, "profile-info", "")
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if string(req) != `{"id":7,"verb":"profile-info"}`+"\n" {
+		t.Fatalf("request = %q (must carry no name member)", req)
+	}
+	r, err := ParseReply([]byte(`{"id":7,"ok":true,"result":{"profile":"prof","base":"disk.img","rollback":true,"snapshots":2}}`))
+	if err != nil || !r.OK || r.ID != 7 {
+		t.Fatalf("result reply: %+v err=%v", r, err)
+	}
+	// A name member on profile-info is the host's bad_request refusal.
+	r, err = ParseReply([]byte(`{"id":8,"ok":false,"error":{"code":"bad_request","message":"profile-info takes no name"}}`))
+	if err != nil || r.OK || r.Code != "bad_request" {
+		t.Fatalf("bad_request reply: %+v err=%v", r, err)
+	}
+}

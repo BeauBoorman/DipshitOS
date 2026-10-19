@@ -3552,7 +3552,12 @@ fn handle_audio_rec(args: Args, _: *exceptions.VectorFrame) u64 {
 ///
 /// Returns 0 when the reply was `ok:true` — for `suspend`, that return
 /// may land on the far side of a host save/restore, so the caller's next
-/// instruction IS the resume. A refused session returns the refusal
+/// instruction IS the resume. M128d (#2608): an ok reply's `result`
+/// member is also copied to `code_ptr` — the raw `{...}` span,
+/// NUL-terminated when `code_cap` leaves room — so a verb whose answer
+/// IS data (profile-info) crosses the seam while the return contract
+/// stays exactly what M115d froze (0 = ok, callers that never look at
+/// `code` on success see no change). A refused session returns the refusal
 /// code's byte length and writes the ADR 0056 D4 name to `code_ptr`
 /// (`no_device`, `no_credential`, `connect_refused`, `unimplemented`,
 /// `unknown_verb`, `busy`, `io_error`, ...) — truncated to `code_cap`
@@ -3572,7 +3577,17 @@ fn handle_vsock_ctl(args: Args, _: *exceptions.VectorFrame) u64 {
     var name_buf: [32]u8 = undefined;
     if (name_len > 0 and uaccess.copy_in(&name_buf, name_ptr, @intCast(name_len)) != .ok) return error_result(.efault);
     const verdict = vsock_ctl.session(road_pops.tee_console(), verb_buf[0..@intCast(verb_len)], name_buf[0..@intCast(name_len)], .normal);
-    if (verdict.ok) return 0;
+    if (verdict.ok) {
+        const raw = verdict.resultText();
+        if (raw.len > 0 and code_cap > 0) {
+            const cap: usize = @intCast(code_cap);
+            const take = @min(raw.len, cap - 1);
+            if (uaccess.copy_out(code_ptr, raw[0..take], take) != .ok) return error_result(.efault);
+            const nul: [1]u8 = .{0};
+            _ = uaccess.copy_out(code_ptr + take, &nul, 1);
+        }
+        return 0;
+    }
     var text = verdict.codeText();
     if (text.len == 0) text = "io_error";
     if (code_cap > 0) {

@@ -114,7 +114,7 @@ exec GOTOP.ELF
 EOF
 
 vgate_setup_python <<'PY'
-import os, shutil, sys
+import json, os, shutil, subprocess, sys
 rd = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
 src = os.path.join(".build", "go", "GOTOP.ELF")
@@ -229,6 +229,35 @@ open(os.path.join(share, "STORE.TXT"), "w").write(
     " caps=file,net prev_head=- prev_sha256=- prev_caps=- prev_row=-\n")
 print("staged trust fixtures: confined+hash-bound rows, store entry, "
       "stream replica (grantd sha256=%s)" % grantd_sha)
+# M128d run 08 (issue #2608): the profile-info leg. One minted
+# .virelaivm arms this boot — the bundle's name (prof) is the answer's
+# profile field — pointed at a private base.img whose .prev sibling makes
+# rollback true, while the seeded cvc share carries exactly two named
+# SNAPSHOTS members and the uid_system vsock-ctl credential (the cvc
+# channel wins the guest's SECRETS.TXT read on a both-armed boot, and the
+# host's snapshot count reads the armed share — both are the seeded one).
+with open(os.path.join(share, "SECRETS.TXT"), "a") as f:
+    f.write("vsock-ctl\t0\t" + KEY + "\n")
+snapdir = os.path.join(share, "SNAPSHOTS")
+os.makedirs(snapdir, exist_ok=True)
+for n in ("ALPHA", "BETA"):
+    open(os.path.join(snapdir, n + ".vzsave"), "wb").write(b"snap\n")
+prof = os.path.join(rd, "prof.virelaivm")
+if not os.path.exists(prof):
+    base = os.path.join(rd, "base.img")
+    shutil.copyfile(os.path.join("artifacts", "disk.img"), base)
+    open(base + ".prev", "wb").write(b"prev\n")
+    runner = os.path.join("host", "vm-runner", ".build", "release", "VMRunner")
+    r = subprocess.run([runner, "--profile", prof, "--profile-init"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("--profile-init refused the mint: " + r.stdout + r.stderr)
+    cfg_path = os.path.join(prof, "config.json")
+    cfg = json.load(open(cfg_path))
+    cfg["baseImage"] = base
+    cfg.setdefault("devices", {})["share"] = False
+    json.dump(cfg, open(cfg_path, "w"), indent=2, sort_keys=True)
+    print("minted profile fixture: base.img+.prev, 2 snapshots, ctl credential")
 PY
 
 vgate_run 01 -- \
@@ -714,3 +743,36 @@ if "name=GRANTD.BIN word=net" in ser:
 print("gotop trust ok: confined granted=file denied(+net), "
       "granted pin=match pub derived, kernel receipts agree")
 PY
+
+
+# --- Run 08 (M128d #2608): the profile-info line — guest-visible identity ----
+#
+# The minted fixture carries a KNOWN summary: profile `prof`, base
+# `base.img`, its `.prev` sibling (rollback=yes), and two SNAPSHOTS/
+# members (snaps=2). GOTOP opens on the profile's own share over
+# --virtio-fs with the ctl listener armed; the `top: profile` marker
+# prints only after the slot-93 session answered — a boot in which the
+# verb never reached the host, or the kernel dropped `result`, cannot
+# emit it (assert-proven, run 03's convention).
+vgate_file script8.txt <<'EOF'
+exec GOTOP.ELF
+EOF
+
+# --overlay-base repeats so the fixture's base.img (with its .prev
+# sibling) is the effective base — the last flag wins, so the answer's
+# base/rollback fields name the file the run actually booted.
+vgate_run 08 -- --profile '$RUN_DIR/prof.virelaivm' \
+    --overlay-base '$RUN_DIR/base.img' \
+    --vsock --vsock-ctl \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script8.txt' \
+    --script-expect 'top: profile name=prof base=base.img rollback=yes snaps=2' --timeout 150
+
+vgate_assert 08 output-contains 'VSOCK-CTL: host listener armed port=1209'
+vgate_assert 08 output-contains 'identity=org.virelaios.vm.prof (loaded)'
+vgate_assert 08 serial-contains 'vsock-ctl: authed'
+vgate_assert 08 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 08 serial-contains 'top: ready'
+vgate_assert 08 serial-contains 'top: profile name=prof base=base.img rollback=yes snaps=2'
+vgate_assert 08 serial-absent 'top: profile refused'
+vgate_assert 08 serial-absent '[EXC] parking:'

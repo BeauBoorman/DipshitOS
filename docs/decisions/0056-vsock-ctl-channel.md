@@ -300,3 +300,30 @@ does not quiesce for `snapshot` (the M115d quiesce remains `suspend`-only
 Gate: `go-snap` (save/ls/rm/consent legs on virtio-fs, the staged
 restore, and the `ld` run pinning `SUSPEND-RESUME: restored` or the
 Code=12 bound).
+
+## Amendment (2026-10-19, M128d #2608 — `profile-info`: the read verb)
+
+**Status.** D3 grows a fourth verb, `profile-info` — the first *read*
+verb. It is a bare request (no `name`; a supplied one is `bad_request`):
+the host answers `{"ok":true,"result":{"profile":"<armed .virelaivm name
+or ->","base":"<boot base basename or ->","rollback":<true iff
+<base>.prev exists>,"snapshots":<count of *.vzsave under the armed
+share's SNAPSHOTS/>}}`, reading the run's armed profile/share state —
+never mutating it. `unimplemented` when the run wired no profile sampler.
+The ready line now advertises `["suspend","snapshot","restore","profile-info"]`.
+
+**Kernel: slot 93 relays `result`.** The M115d row returned verdict only;
+the ok reply now also copies the reply's `result` member — the raw JSON
+value span, NUL-terminated — into `code_ptr` (ADR 0007's M128d amendment
+pins the contract). The guest-side reader is `vi.FetchProfileInfo`
++`ParseProfileInfo`: a bounded 512-byte buffer, a flat-object parse that
+refuses truncation, nesting and escaped controls — the fields are what
+the host answered, never a guess.
+
+**Surface.** GOSET's fifth tab (Profile) renders the four fields
+read-only — Enter/arrows/click answer a `read-only` status and write
+nothing — and GOTOP draws a one-line `profile <name> base <base>
+rollback <yes|no> snaps <n>` summary plus the `top: profile` serial
+marker the `go-top` spec asserts (run 08 mints a profile, plants
+`base.img.prev` and two `.vzsave`s, and checks the rendered row against
+the armed state).

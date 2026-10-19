@@ -122,6 +122,32 @@ func TestKillWithNoSelectionIsInert(t *testing.T) {
 	}
 }
 
+// TestProfileLine (M128d #2608): the slot-93 seam's answer lands in the
+// identity line; a refusal names its code instead of going silent.
+func TestProfileLine(t *testing.T) {
+	old := ctlProfile
+	t.Cleanup(func() { ctlProfile = old })
+	ctlProfile = func(verb, name string, code []byte) int64 {
+		if verb != vi.VerbProfileInfo {
+			t.Fatalf("verb=%q want profile-info", verb)
+		}
+		copy(code, `{"profile":"prof","base":"disk.img","rollback":true,"snapshots":2}`)
+		return 0
+	}
+	a := &app{}
+	a.refreshProfile()
+	if a.profLine != "profile prof  base disk.img  rollback yes  snaps 2" {
+		t.Fatalf("profLine=%q", a.profLine)
+	}
+	ctlProfile = func(_, _ string, code []byte) int64 {
+		return int64(copy(code, "no_credential"))
+	}
+	a.refreshProfile()
+	if a.profLine != "profile: refused no_credential" {
+		t.Fatalf("refused profLine=%q", a.profLine)
+	}
+}
+
 // TestFootLineNamesTheRealKeys keeps the hint honest on both tabs.
 func TestFootLineNamesTheRealKeys(t *testing.T) {
 	a := &app{net: NewNetView(), pg: pageProcs}

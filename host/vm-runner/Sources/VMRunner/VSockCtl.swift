@@ -37,6 +37,7 @@ final class VSockCtlSession {
          onSuspendAccepted: (() -> Void)? = nil,
          snapshotCtl: SnapshotCtl? = nil,
          restoreCtl: RestoreCtl? = nil,
+         profileInfo: (() -> ProfileSummary)? = nil,
          onDone: @escaping (VSockCtlSession) -> Void) {
         self.connection = connection
         var rng = SystemRandomNumberGenerator()
@@ -45,6 +46,7 @@ final class VSockCtlSession {
         session.suspendHandler = suspendHandler
         session.snapshotHandler = snapshotCtl.map { ctl in { name in ctl.save(name: name) } }
         session.restoreHandler = restoreCtl.map { ctl in { name in ctl.stage(name: name) } }
+        session.profileInfoHandler = profileInfo
         self.session = session
         self.snapshotCtl = snapshotCtl
         self.onSuspendAccepted = onSuspendAccepted
@@ -210,6 +212,10 @@ final class VSockCtlListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
     private let snapshotCtl: SnapshotCtl?
     private let restoreCtl: RestoreCtl?
 
+    /// M128d (#2608): the `profile-info` answerer every session gets —
+    /// samples the armed profile/share at request time.
+    private let profileInfo: () -> ProfileSummary
+
     init(key: Data,
          suspendHandler: (() -> SuspendVerdict)? = nil,
          onSuspendAccepted: (() -> Void)? = nil) {
@@ -236,6 +242,33 @@ final class VSockCtlListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
                               savedStateDir: activeProfile?.savedStateURL)
         snapshotCtl = snapCtl
         restoreCtl = rstCtl
+        // M128d (#2608): which machine the guest is. Read-only, so a run
+        // without a profile answers "-" fields rather than refusing —
+        // the snapshot count still reports from whatever share is armed.
+        let infoShare = shareDirs.first
+        profileInfo = {
+            let baseName = overlayBasePath
+                .map { URL(fileURLWithPath: $0).lastPathComponent } ?? "-"
+            var rollback = false
+            if let base = overlayBasePath {
+                let u = URL(fileURLWithPath: base)
+                let prev = u.deletingLastPathComponent()
+                    .appendingPathComponent(u.lastPathComponent + ".prev")
+                rollback = FileManager.default.fileExists(atPath: prev.path)
+            }
+            var snaps: UInt64 = 0
+            if let share = infoShare,
+               let names = try? FileManager.default.contentsOfDirectory(
+                   atPath: share.appendingPathComponent(
+                       SnapshotCtl.dirName, isDirectory: true).path) {
+                for n in names where n.hasSuffix(SnapshotCtl.fileSuffix) {
+                    snaps += 1
+                }
+            }
+            return ProfileSummary(profile: activeProfile?.name ?? "-",
+                                  base: baseName, rollback: rollback,
+                                  snapshots: snaps)
+        }
         print("VSOCK-CTL: snapshot=\(snapCtl.armState) restore=\(rstCtl.armState)")
     }
 
@@ -247,7 +280,8 @@ final class VSockCtlListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
                                       suspendHandler: suspendHandler,
                                       onSuspendAccepted: onSuspendAccepted,
                                       snapshotCtl: snapshotCtl,
-                                      restoreCtl: restoreCtl) { [weak self] done in
+                                      restoreCtl: restoreCtl,
+                                      profileInfo: profileInfo) { [weak self] done in
             self?.sessions.removeAll { $0 === done }
         }
         sessions.append(session)

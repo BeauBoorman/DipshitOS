@@ -79,8 +79,18 @@ const (
 	markerShortcuts = "goset: shortcuts n="
 	// M122e (#2574): every view switch lands the same marker, whichever
 	// surface asked for it — a tab-strip click, the strip's Left/Right,
-	// the typed `services`/`grants` lines, or Esc popping a sub-view.
+	// the typed `services`/`grants`/`profile` lines, or Esc popping a
+	// sub-view.
 	markerTab = "goset: tab "
+	// M128d (#2608): the machine-identity view — one ctl `profile-info`
+	// session through slot 93 answers which .virelaivm this run is, the
+	// base image's name, rollback availability, and the snapshot count.
+	// The marker lands only after the session answers; a refusal names
+	// its code in the same place.
+	markerProfile = "goset: profile "
+	// The read-only verdict the profile view names on every write path —
+	// one shared literal (the ELF ceiling counts bytes).
+	profReadOnly = "profile view is read-only"
 
 	inputMax = settings.MaxKey + settings.MaxVal + 2
 )
@@ -103,6 +113,12 @@ type panel struct {
 	servicePoll  int64
 	showGrants   bool
 	grants       grantsView
+	// M128d: the profile summary view — read-only rows sampled fresh on
+	// every entry through ctl profile-info (the kernel holds the secret;
+	// this app only ever names the verdict).
+	showProfile bool
+	prof        vi.ProfileInfo
+	profVerdict string
 
 	listCtl     *listController
 	focus       *focusRing
@@ -182,6 +198,31 @@ func main() {
 }
 
 func (a *panel) present() { a.draw(); a.ta.Present() }
+
+// ctlProfile is the slot-93 seam — vi.VsockCtl on the guest, a fake in
+// host tests (the same discipline every other vi.* caller keeps).
+var ctlProfile = vi.VsockCtl
+
+// refreshProfile samples the host's profile-info answer and names the
+// verdict. The profile view re-samples on every entry: a snapshot taken
+// mid-session is visible on the next visit, which is all a read-only
+// summary owes.
+func (a *panel) refreshProfile() {
+	a.prof, a.profVerdict = vi.FetchProfileInfo(ctlProfile)
+	if a.profVerdict != "" {
+		consoleLine(markerProfile + "refused " + a.profVerdict)
+		a.status = "profile: refused " + a.profVerdict
+		return
+	}
+	rb := "no"
+	if a.prof.Rollback {
+		rb = "yes"
+	}
+	consoleLine(markerProfile + "name=" + a.prof.Name +
+		" base=" + a.prof.Base + " rollback=" + rb +
+		" snaps=" + vi.Itoa64(int64(a.prof.Snapshots)))
+	a.status = "armed .virelaivm — read-only"
+}
 
 // newPanel decodes the file, names its verdict, and builds the display table.
 // A corrupt file is read-only: the compiled defaults are in force (that is what
@@ -375,6 +416,13 @@ func (a *panel) save() {
 		a.status = "the shortcuts registry is compiled in — ctrl+shift+h returns to Settings to save"
 		return
 	}
+	if a.showProfile {
+		// M128d: the profile view is read-only — a bare Enter must not
+		// write SETTINGS.TXT from a surface that shows no settings rows.
+		consoleLine(markerRefused)
+		a.status = profReadOnly
+		return
+	}
 	if a.file.State == settings.StateCorrupt {
 		vi.ConsoleLine(markerRefused)
 		a.status = "corrupt file: read-only"
@@ -461,6 +509,12 @@ func (a *panel) cycle(dir int) bool {
 		}
 		return true
 	}
+	if a.showProfile {
+		// The summary rows are facts, not a vocabulary — Left/Right on a
+		// profile row says so rather than cycling a lie.
+		a.status = profReadOnly
+		return true
+	}
 	if a.sel < 0 || a.sel >= len(a.disp) {
 		return false
 	}
@@ -493,6 +547,10 @@ func (a *panel) rowActivate(i int) bool {
 	a.sel, a.list.Sel = i, i
 	if a.showChords {
 		a.status = "the shortcuts registry is compiled in — no values to cycle"
+		return true
+	}
+	if a.showProfile {
+		a.status = profReadOnly
 		return true
 	}
 	return a.cycle(1)
@@ -597,6 +655,9 @@ func (a *panel) key(ev vi.Event) bool {
 		case "grants":
 			a.input.Clear()
 			return a.showTab(tabGrants)
+		case "profile":
+			a.input.Clear()
+			return a.showTab(tabProfile)
 		}
 		if a.showServices {
 			a.serviceInput()
@@ -610,6 +671,14 @@ func (a *panel) key(ev vi.Event) bool {
 			// The registry view is read-only: nothing to apply, nothing
 			// to save. Named in the status line, never a silent no-op.
 			a.status = "the shortcuts registry is compiled in — ctrl+shift+h returns to Settings"
+			return true
+		}
+		if a.showProfile {
+			// M128d: the summary is read-only — a key=value typed while
+			// it shows must not reach SETTINGS.TXT, and Enter doesn't
+			// save. Named in the status line, never a silent no-op.
+			a.input.Clear()
+			a.status = profReadOnly
 			return true
 		}
 		a.applyInput()
@@ -666,6 +735,8 @@ func (a *panel) activeTab() int {
 		return tabGrants
 	case a.showChords:
 		return tabShortcuts
+	case a.showProfile:
+		return tabProfile
 	default:
 		return tabSettings
 	}
@@ -679,12 +750,12 @@ func (a *panel) showTab(i int) bool {
 	a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
 	switch i {
 	case tabServices:
-		a.showChords, a.showServices, a.showGrants = false, true, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile = false, true, false, false
 		a.services.Refresh()
 		a.serviceStatus()
 		consoleLine("goset: services n=" + vi.Itoa64(int64(len(a.services.manifest.Services))))
 	case tabGrants:
-		a.showChords, a.showServices, a.showGrants = false, false, true
+		a.showChords, a.showServices, a.showGrants, a.showProfile = false, false, true, false
 		a.grants.Refresh()
 		a.grantStatus()
 		consoleLine("goset: grants n=" + vi.Itoa64(int64(len(a.grants.entries))))
@@ -700,11 +771,16 @@ func (a *panel) showTab(i int) bool {
 				" granted=" + granted + " state=" + e.state())
 		}
 	case tabShortcuts:
-		a.showChords, a.showServices, a.showGrants = true, false, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile = true, false, false, false
 		vi.ConsoleLine(markerShortcuts + vi.Itoa64(int64(len(chords.Global))))
 		a.status = "the global shortcuts registry — one owner per chord (read-only)"
+	case tabProfile:
+		// M128d (#2608): a fresh sample on every entry — the summary is
+		// read-only, so the session cost buys honesty, never staleness.
+		a.showChords, a.showServices, a.showGrants, a.showProfile = false, false, false, true
+		a.refreshProfile()
 	default:
-		a.showChords, a.showServices, a.showGrants = false, false, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile = false, false, false, false
 		a.status = "type key=value + Enter to save"
 	}
 	consoleLine(markerTab + tabNames[i])
@@ -798,6 +874,9 @@ func (a *panel) headLabel() string {
 	if a.showChords {
 		return "Shortcuts  n=" + vi.Itoa64(int64(len(chords.Global))) + "  (one owner per chord)"
 	}
+	if a.showProfile {
+		return "Profile  " + a.prof.Name + "  (read-only)"
+	}
 	return "Settings  " + settings.Path
 }
 
@@ -819,6 +898,9 @@ func (a *panel) labels() []string {
 	if a.showChords {
 		return chordLabels()
 	}
+	if a.showProfile {
+		return a.profileLabels()
+	}
 	out := make([]string, 0, len(a.disp))
 	for _, s := range a.disp {
 		line := s.Key + " = " + s.Val
@@ -828,6 +910,26 @@ func (a *panel) labels() []string {
 		out = append(out, line)
 	}
 	return out
+}
+
+// profileLabels renders the M128d summary as list rows — the armed
+// profile's name, its base image, whether the base's .prev survives (a
+// rollback target), and the stored snapshot count. A refused session is
+// still a row: the guest reads the refusal's code instead of a blank.
+func (a *panel) profileLabels() []string {
+	if a.profVerdict != "" {
+		return []string{"profile-info refused " + a.profVerdict}
+	}
+	rb := "no"
+	if a.prof.Rollback {
+		rb = "yes"
+	}
+	return []string{
+		"name = " + a.prof.Name,
+		"base = " + a.prof.Base,
+		"rollback = " + rb,
+		"snapshots = " + vi.Itoa64(int64(a.prof.Snapshots)),
+	}
 }
 
 // chordLabels renders the shortcuts registry for the list: one line per
@@ -967,8 +1069,9 @@ func (a *panel) drawRowControls(cv widgets.RectCanvas) {
 	// The affordances name SETTINGS rows: in the services, grants or
 	// shortcuts panes the list renders other tables — a settings control
 	// over a foreign row would paint (and hit-test) a lie. (M122e fixup:
-	// grants was missing here — a grants row could wear row 0's toggle.)
-	if a.showServices || a.showGrants || a.showChords {
+	// grants was missing here — a grants row could wear row 0's toggle;
+	// M128d's profile rows are facts, not settings vocabulary.)
+	if a.showServices || a.showGrants || a.showChords || a.showProfile {
 		return
 	}
 	for i, row := range a.disp {
@@ -1002,7 +1105,7 @@ func (a *panel) drawRowControls(cv widgets.RectCanvas) {
 // rowControlClick gives a left-click inside the list first shot at a row
 // affordance; a miss falls through to the existing focus/list handling.
 func (a *panel) rowControlClick(x, y int) bool {
-	if a.showServices || a.showGrants || a.showChords {
+	if a.showServices || a.showGrants || a.showChords || a.showProfile {
 		return false
 	}
 	for i, row := range a.disp {

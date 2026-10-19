@@ -65,15 +65,24 @@ pub const suspend_marker = "SUSPEND.MARK";
 
 /// One session's outcome — what the syscall hands back to EL0. `ok` is the
 /// reply's `ok:true`; `code` names any refusal (host or local), matching
-/// the printed `code=` marker when one exists.
+/// the printed `code=` marker when one exists. M128d (#2608): `result`
+/// captures an ok reply's `result` member verbatim (the raw `{...}` span)
+/// so the syscall can relay it — verbs whose answer IS data (profile-info)
+/// otherwise could never cross the seam.
 pub const Verdict = struct {
     ok: bool = false,
     id: ?u32 = null,
     code: [40]u8 = undefined,
     code_len: usize = 0,
+    result: [768]u8 = undefined,
+    result_len: usize = 0,
 
     pub fn codeText(self: *const Verdict) []const u8 {
         return self.code[0..self.code_len];
+    }
+
+    pub fn resultText(self: *const Verdict) []const u8 {
+        return self.result[0..self.result_len];
     }
 
     fn refuse(self: *Verdict, code: []const u8) void {
@@ -159,6 +168,70 @@ fn jsonOk(line: []const u8) ?bool {
     if (rest.len >= 4 and std.mem.eql(u8, rest[0..4], "true")) return true;
     if (rest.len >= 5 and std.mem.eql(u8, rest[0..5], "false")) return false;
     return null;
+}
+
+/// `"<key>":` member's raw value span — a quoted string (kept quoted), a
+/// balanced `{...}`/`[...]` span (string-aware), or a bare literal run
+/// (uint/true/false). null when the member is absent or the span never
+/// closes. Used to carry a reply's `result` object verbatim — the fixed
+/// grammar keeps nested members out of the flat readers, so the raw span
+/// is the honest relay (M128d).
+fn jsonValue(line: []const u8, key: []const u8) ?[]const u8 {
+    var pat: [32]u8 = undefined;
+    if (key.len + 3 > pat.len) return null;
+    const pat_str = std.fmt.bufPrint(&pat, "\"{s}\":", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, line, pat_str) orelse return null;
+    var i = at + pat_str.len;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    if (i >= line.len) return null;
+    switch (line[i]) {
+        '"' => {
+            var j = i + 1;
+            while (j < line.len) {
+                if (line[j] == '\\') {
+                    j += 2;
+                    continue;
+                }
+                if (line[j] == '"') return line[i .. j + 1];
+                j += 1;
+            }
+            return null;
+        },
+        '{', '[' => {
+            const open = line[i];
+            const close: u8 = if (open == '{') '}' else ']';
+            var depth: usize = 0;
+            var j = i;
+            while (j < line.len) {
+                const c = line[j];
+                if (c == '"') {
+                    j += 1;
+                    while (j < line.len) {
+                        if (line[j] == '\\') {
+                            j += 2;
+                            continue;
+                        }
+                        if (line[j] == '"') break;
+                        j += 1;
+                    }
+                    if (j >= line.len) return null;
+                } else if (c == open) {
+                    depth += 1;
+                } else if (c == close) {
+                    depth -= 1;
+                    if (depth == 0) return line[i .. j + 1];
+                }
+                j += 1;
+            }
+            return null;
+        },
+        else => {
+            var j = i;
+            while (j < line.len and line[j] != ',' and line[j] != '}' and
+                line[j] != ' ' and line[j] != '\t') j += 1;
+            return if (j > i) line[i..j] else null;
+        },
+    }
 }
 
 /// `"id":N` → the decimal id, or null.
@@ -255,6 +328,16 @@ fn printReply(c: console.Console, line: []const u8) Verdict {
         if (code.len <= v.code.len) v.refuse(code);
         c.puts(" code=");
         c.puts(code);
+    }
+    // M128d: an ok reply's `result` member is the verb's payload — capture
+    // the raw span so sys_vsock_ctl can relay it to EL0 (slot 93 returns 0
+    // for ok, so the bytes ride the code buffer NUL-terminated).
+    if (ok) {
+        if (jsonValue(line, "result")) |raw| {
+            const take = @min(raw.len, v.result.len);
+            @memcpy(v.result[0..take], raw[0..take]);
+            v.result_len = take;
+        }
     }
     c.puts("\n");
     return v;
@@ -626,6 +709,39 @@ test "vsock_ctl: fixed-shape reply extraction" {
     for (0..32) |i| try std.testing.expectEqual(@as(u8, @intCast(i)), ch[i]);
     var bad: [32]u8 = undefined;
     try std.testing.expect(!challengeFrom("{\"challenge\":\"xyz\"}", &bad));
+}
+
+test "vsock_ctl: result member relayed verbatim (M128d)" {
+    // The fixed-shape grammar refuses nested members to the flat readers,
+    // so the raw span is the relay: balanced braces, string-aware.
+    const reply = "{\"id\":1,\"ok\":true,\"result\":{\"profile\":\"work\",\"base\":\"disk.img\",\"rollback\":true,\"snapshots\":2}}";
+    try std.testing.expectEqualStrings(
+        "{\"profile\":\"work\",\"base\":\"disk.img\",\"rollback\":true,\"snapshots\":2}",
+        jsonValue(reply, "result").?,
+    );
+    // String-aware: a brace inside a string does not close the span.
+    const tricky = "{\"id\":2,\"ok\":true,\"result\":{\"a\":\"}\"}}";
+    try std.testing.expectEqualStrings("{\"a\":\"}\"}", jsonValue(tricky, "result").?);
+    // Escaped quotes inside a nested string don't end it early.
+    const esc = "{\"id\":3,\"ok\":true,\"result\":{\"a\":\"x\\\"y\"}}";
+    try std.testing.expectEqualStrings("{\"a\":\"x\\\"y\"}", jsonValue(esc, "result").?);
+    // A string member keeps its quotes; a bare literal ends at the comma/brace.
+    try std.testing.expectEqualStrings("\"ready\"", jsonValue("{\"ok\":true,\"session\":\"ready\"}", "session").?);
+    try std.testing.expectEqualStrings("1", jsonValue("{\"id\":1,\"ok\":true}", "id").?);
+    // Absent or unbalanced members report null, never a guess.
+    try std.testing.expectEqual(@as(?[]const u8, null), jsonValue(reply, "error"));
+    try std.testing.expectEqual(@as(?[]const u8, null), jsonValue("{\"result\":{\"a\":1", "result"));
+    // printReply captures it into the verdict only on ok.
+    var mock = console.MockConsole(1024){};
+    const v = printReply(mock.console(), reply);
+    try std.testing.expect(v.ok);
+    try std.testing.expectEqualStrings(
+        "{\"profile\":\"work\",\"base\":\"disk.img\",\"rollback\":true,\"snapshots\":2}",
+        v.resultText(),
+    );
+    const v2 = printReply(mock.console(), "{\"id\":2,\"ok\":false,\"error\":{\"code\":\"replay\"}}");
+    try std.testing.expect(!v2.ok);
+    try std.testing.expectEqual(@as(usize, 0), v2.result_len);
 }
 
 test "vsock_ctl: suspend marker seq reads its own tail" {

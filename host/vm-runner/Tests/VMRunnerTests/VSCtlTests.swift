@@ -287,11 +287,61 @@ final class VSCtlTests: XCTestCase {
         XCTAssertEqual(code(of: r2.reply), "bad_request")
     }
 
-    func testReadyLineListsAllThreeVerbs() {
+    // M128d (#2608): the armed profile-info — the injected sampler's
+    // fields land verbatim in the reply's result object.
+    func testArmedProfileInfoAccepts() {
+        var s = authedSession()
+        var calls = 0
+        s.profileInfoHandler = {
+            calls += 1
+            return ProfileSummary(profile: "work", base: "disk.img",
+                                  rollback: true, snapshots: 3)
+        }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"profile-info\"}")
+        XCTAssertFalse(r.fatal)
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(s.acceptedSuspend)
+        XCTAssertFalse(s.answeredSnapshot)
+        let line = String(decoding: r.reply, as: UTF8.self)
+        XCTAssertTrue(line.contains("\"id\":1"))
+        XCTAssertTrue(line.contains("\"ok\":true"))
+        XCTAssertTrue(line.contains("\"profile\":\"work\""))
+        XCTAssertTrue(line.contains("\"base\":\"disk.img\""))
+        XCTAssertTrue(line.contains("\"rollback\":true"))
+        XCTAssertTrue(line.contains("\"snapshots\":3"))
+    }
+
+    func testProfileInfoUnimplementedWithoutHandler() {
+        var s = authedSession()
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"profile-info\"}")
+        XCTAssertEqual(code(of: r.reply), "unimplemented")
+        XCTAssertFalse(r.fatal)
+    }
+
+    func testProfileInfoRejectsAName() {
+        var s = authedSession()
+        s.profileInfoHandler = { ProfileSummary(profile: "p", base: "b",
+                                                rollback: false, snapshots: 0) }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"profile-info\",\"name\":\"X\"}")
+        XCTAssertEqual(code(of: r.reply), "bad_request")
+    }
+
+    func testProfileInfoEscapesStrings() {
+        var s = authedSession()
+        s.profileInfoHandler = {
+            ProfileSummary(profile: "weird\"\\name", base: "b",
+                           rollback: false, snapshots: 0)
+        }
+        let r = s.feed(line: "{\"id\":1,\"verb\":\"profile-info\"}")
+        let line = String(decoding: r.reply, as: UTF8.self)
+        XCTAssertTrue(line.contains("\"profile\":\"weird\\\"\\\\name\""))
+    }
+
+    func testReadyLineListsAllVerbs() {
         var s = CTLSession(key: pinKey, challenge: pinChallenge)
         let (reply, _) = s.feed(line: authLine(mac: pinMAC))
         let line = String(decoding: reply, as: UTF8.self)
-        for verb in ["suspend", "snapshot", "restore"] {
+        for verb in ["suspend", "snapshot", "restore", "profile-info"] {
             XCTAssertTrue(line.contains("\"\(verb)\""), verb)
         }
     }

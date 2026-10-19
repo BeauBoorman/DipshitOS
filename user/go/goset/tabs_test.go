@@ -33,7 +33,7 @@ func TestTabStripClickSwitchesViews(t *testing.T) {
 		}
 	}
 
-	// Services is cell 1 of 4 over a 544px strip — the click focuses the
+	// Services is cell 1 of 5 over a 544px strip — the click focuses the
 	// strip and opens the pane; the marker names the view that landed.
 	click(140, 10)
 	if !a.showServices || a.activeTab() != tabServices {
@@ -52,10 +52,16 @@ func TestTabStripClickSwitchesViews(t *testing.T) {
 		t.Fatalf("no %q in %v", markerTab+"services", *events)
 	}
 
-	// Shortcuts is the last cell; Settings is cell 0 and takes the pane back.
-	click(500, 10)
+	// Shortcuts is cell 3; the M128d profile view is the last cell (cell
+	// 4) — its click lands a refused session on the host (no vsock slot),
+	// which is still a view landing.
+	click(380, 10)
 	if !a.showChords || a.activeTab() != tabShortcuts {
 		t.Fatal("shortcuts tab click did not open the registry view")
+	}
+	click(500, 10)
+	if !a.showProfile || a.activeTab() != tabProfile {
+		t.Fatal("profile tab click did not open the summary view")
 	}
 	click(60, 10)
 	if a.activeTab() != tabSettings {
@@ -76,7 +82,7 @@ func TestTabStripKeyboardStepsViews(t *testing.T) {
 	defer g.install(t)()
 
 	a.focus.Focus(0) // the strip
-	for _, want := range []int{tabServices, tabGrants, tabShortcuts, tabSettings} {
+	for _, want := range []int{tabServices, tabGrants, tabShortcuts, tabProfile, tabSettings} {
 		if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyRight}) {
 			t.Fatalf("Right did not step the strip to %d", want)
 		}
@@ -84,8 +90,8 @@ func TestTabStripKeyboardStepsViews(t *testing.T) {
 			t.Fatalf("after Right: active tab %d, want %d", a.activeTab(), want)
 		}
 	}
-	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyLeft}) || a.activeTab() != tabShortcuts {
-		t.Fatal("Left did not wrap back to the shortcuts pane")
+	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyLeft}) || a.activeTab() != tabProfile {
+		t.Fatal("Left did not wrap back to the profile pane")
 	}
 }
 
@@ -241,6 +247,69 @@ func TestEscapePopsSubViewThenQuits(t *testing.T) {
 	}
 	if b.dropdown.open || b.exitRequested {
 		t.Fatal("popover Esc must close the popover, not quit")
+	}
+}
+
+// M128d (#2608): the profile view is read-only — the ctl seam's answer
+// lands as rows and the marker, a refusal names its code as a row, and
+// neither Enter nor Left/Right writes anything.
+func TestProfileViewIsReadOnlySummary(t *testing.T) {
+	events, restore := captureConsole(t)
+	defer restore()
+	old := ctlProfile
+	defer func() { ctlProfile = old }()
+	ctlProfile = func(verb, name string, code []byte) int64 {
+		if verb != "profile-info" || name != "" {
+			t.Fatalf("ctl call verb=%q name=%q", verb, name)
+		}
+		copy(code, `{"profile":"work","base":"disk.img","rollback":true,"snapshots":2}`)
+		return 0
+	}
+
+	a := newStripPanel()
+	a.showTab(tabProfile)
+	wantRows := []string{"name = work", "base = disk.img", "rollback = yes", "snapshots = 2"}
+	got := a.profileLabels()
+	for i, w := range wantRows {
+		if i >= len(got) || got[i] != w {
+			t.Fatalf("profileLabels[%d] = %v, want %v", i, got, wantRows)
+		}
+	}
+	found := false
+	for _, e := range *events {
+		if e == markerProfile+"name=work base=disk.img rollback=yes snaps=2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no profile marker in %v", *events)
+	}
+	// Enter is refused — a bare keypress on this surface writes nothing
+	// and names the read-only verdict.
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: '\n'})
+	if !strings.Contains(a.status, "read-only") {
+		t.Fatalf("profile-tab Enter status = %q", a.status)
+	}
+	// A row click selects but never cycles.
+	a.rowActivate(0)
+	if !strings.Contains(a.status, "read-only") {
+		t.Fatalf("profile row click status = %q", a.status)
+	}
+
+	// The typed `profile` line is the same switch as the strip cell.
+	a.input.SetValue("profile")
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: '\n'})
+	if a.activeTab() != tabProfile {
+		t.Fatal("typed `profile` did not open the view")
+	}
+
+	// A refused session is still a row — the guest reads the code.
+	ctlProfile = func(_, _ string, code []byte) int64 {
+		return int64(copy(code, "no_credential"))
+	}
+	a.showTab(tabProfile)
+	if got := a.profileLabels(); len(got) != 1 || got[0] != "profile-info refused no_credential" {
+		t.Fatalf("refused profileLabels = %v", got)
 	}
 }
 
