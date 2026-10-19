@@ -2065,3 +2065,73 @@ vgate_assert 18 serial-contains 'verdict=measured name=GOSET.ELF'
 vgate_assert 18 serial-contains 'goset: declare accepted'
 vgate_assert 18 serial-absent '[EXC] parking:'
 vgate_assert 18 serial-absent 'exited status=139'
+
+# --- M123b (#2576) run 19: the launcher's zero-match empty state -----------
+# ctrl+space opens the strip, `zzz` drives the ranked list to zero matches
+# (no manifest row ranks it), and the results region paints the shared
+# widgets.EmptyState plate — Border ring, centred icon/headline/hint rows —
+# while the seat emits `gotabwm: launcher empty` once for the frame that
+# drew it. The snapshot reads the plate out of the guest's own scanout.
+vgate_file script-19.txt <<'EOS'
+vf rm GOTABWM.DEMO
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOS
+
+vgate_run 19 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-19' \
+    --script '$RUN_DIR/script-19.txt' \
+    --input-chords 'ctrl-space' --input-chords-after 'gotabwm: mode live' \
+    --input-string 'zzz' --input-string-after 'gotabwm: launcher open n=' \
+    --screenshot-after 'gotabwm: launcher empty' \
+    --script-expect 'gotabwm: launcher empty' --timeout 300
+
+vgate_assert 19 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 19 serial-contains 'gotabwm: mode live'
+vgate_assert 19 serial-contains 'gotabwm: launcher open n='
+vgate_assert 19 serial-contains 'gotabwm: launcher filter q=zzz n=0'
+vgate_assert 19 serial-contains 'gotabwm: launcher empty'
+vgate_assert 19 serial-absent 'gotabwm: launcher exec'
+vgate_assert 19 serial-absent '[EXC] parking:'
+vgate_assert 19 serial-absent 'exited status=139'
+
+# The plate: results region x=8..254, y=140..712 (the strip minus header and
+# accent rule), a 1px Border ring (51,65,85) around it, and centred text
+# inside — counted as pixels that are neither Surface nor Border, so the
+# assert holds whether the ui face resolved or the bitmap degrade painted.
+vgate_assert 19 snapshot 'screen-19-after' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want %d" % (len(raw), need))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])
+
+BORDER = (0x33, 0x41, 0x55)
+SURFACE = (0x22, 0x2d, 0x35)
+
+ring = textish = 0
+for x in range(8, 255):
+    for y in (140, 711):
+        if px(x, y) == BORDER:
+            ring += 1
+for y in range(141, 711):
+    for x in (8, 253):
+        if px(x, y) == BORDER:
+            ring += 1
+for y in range(160, 700):
+    for x in range(20, 240):
+        c = px(x, y)
+        if c != SURFACE and c != BORDER:
+            textish += 1
+print("launcher empty leg: border-ring=%d interior-non-plate=%d" % (ring, textish))
+assert ring >= 200, "empty-state border ring absent from the results region"
+assert textish >= 200, "no empty-state text inside the plate"
+PY

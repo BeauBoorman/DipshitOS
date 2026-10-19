@@ -138,8 +138,14 @@ func TestLauncherPaintsLabelsQueryAndUnavailableState(t *testing.T) {
 	}
 	launch.filtered, launch.err = nil, ""
 	paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	if countLaunchInk(scan, 8, 146, 120, 8, theme.Current.InkMuted) < 10 {
-		t.Fatal("no-match glyphs missing")
+	// M123b (#2576): the zero-match strip paints the shared empty-state
+	// plate — a Border ring around the results region with centred
+	// icon/headline/hint rows inside it.
+	if countLaunchInk(scan, 8, 140, 246, 560, theme.Current.Border) < 20 {
+		t.Fatal("empty-state border ring missing")
+	}
+	if countLaunchInk(scan, 8, 140, 246, 560, theme.Current.Muted) < 10 {
+		t.Fatal("empty-state hint glyphs missing")
 	}
 }
 

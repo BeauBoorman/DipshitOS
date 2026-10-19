@@ -137,6 +137,9 @@ const (
 	markerDeclare = "goedit: declare accepted"
 	markerRead    = "goedit: read "
 	markerPresent = "goedit: present"
+	// M123b (#2576): the shared empty-state plate on an empty buffer —
+	// printed once per transition into empty, from the paint that drew it.
+	markerEmpty   = "goedit: empty "
 	markerDirty   = "goedit: dirty"
 	markerSaved   = "goedit: saved "
 	markerSaveErr = "goedit: save error "
@@ -377,6 +380,9 @@ type editor struct {
 	// rec, when set, receives every fill instead of the window canvas. It is
 	// nil in the guest; host tests set it to observe the frame geometry.
 	rec func(x, y, w, h int, rgb uint32)
+	// emptyShown is the M123b marker latch: `goedit: empty` prints once per
+	// transition into an empty buffer, from the paint that drew the plate.
+	emptyShown bool
 
 	// M20 U3: cur is the caret as a byte offset into buf, clamped on every use
 	// so a buffer that shrank under it cannot index out of range; mode says
@@ -1825,6 +1831,24 @@ func (e *editor) draw() {
 		y += lineH
 		line++
 		start = i + 1
+	}
+	// M123b (#2576): an empty buffer gets the shared empty-state plate —
+	// icon, headline and the chords that answer on a blank document — under
+	// the caret, which still paints at the text origin (type to insert).
+	if len(e.buf) == 0 && e.mode != modePicker && e.mode != modeDialog && e.mode != modeDiags {
+		(&widgets.EmptyState{
+			R:        widgets.Rect{X: textOrigin, Y: chromeH + 4, W: w - 2*textOrigin, H: h - chromeH - 8},
+			Icon:     "|",
+			Headline: "Empty buffer",
+			Hints:    []string{"type to insert", "^O open · ^S save · ^F find · ^G goto"},
+		}).Draw(e.ta.Canvas())
+		if !e.emptyShown {
+			e.emptyShown = true
+			vi.ConsoleLine(markerEmpty + e.path)
+		}
+	}
+	if len(e.buf) != 0 {
+		e.emptyShown = false
 	}
 	if caretRow >= 0 && caretRow < maxLines {
 		e.fill(textOrigin+caretCol*adv, chromeH+4+caretRow*lineH, caretW, 8, colCaret)

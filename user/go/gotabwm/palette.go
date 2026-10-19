@@ -34,6 +34,8 @@ const (
 	MarkerPaletteFocus   = "gotabwm: palette focus id="
 	MarkerPaletteRun     = "gotabwm: palette run "
 	MarkerPaletteDismiss = "gotabwm: palette dismiss"
+	// M123b (#2576): the palette's zero-match empty state.
+	MarkerPaletteEmpty   = "gotabwm: palette empty"
 	MarkerPaletteMissing = "gotabwm: palette missing "
 	MarkerRpcPalette     = "gotabwm: rpc palette"
 

@@ -242,6 +242,9 @@ func (m *model) refresh() {
 		}
 	}
 	m.status = "listed"
+	if m.n == 0 {
+		m.emit(markerEmpty + m.path)
+	}
 	m.loadPreview()
 }
 

@@ -10,14 +10,17 @@ const (
 	markerDeclare   = "gofiles: declare accepted"
 	markerDeclareNo = "gofiles: declare refused"
 	markerList      = "gofiles: list "
-	markerEntry     = "gofiles: entry "
-	markerFound     = "gofiles: found KNOWN.TXT"
-	markerView      = "gofiles: view "
-	markerPresent   = "gofiles: present"
-	markerClose     = "gofiles: close"
-	markerOK        = "gofiles OK"
-	markerListErr   = "gofiles: list error "
-	markerCd        = "gofiles: cd "
+	// M123b (#2576): the shared empty-state panel painted over a zero-entry
+	// listing — emitted with the list marker family, flushed after the frame.
+	markerEmpty   = "gofiles: empty "
+	markerEntry   = "gofiles: entry "
+	markerFound   = "gofiles: found KNOWN.TXT"
+	markerView    = "gofiles: view "
+	markerPresent = "gofiles: present"
+	markerClose   = "gofiles: close"
+	markerOK      = "gofiles OK"
+	markerListErr = "gofiles: list error "
+	markerCd      = "gofiles: cd "
 	// M79e (#1708): the WM_RPC nav seam. `nav declare` is this app
 	// announcing where it navigated; `nav back` is the proof the round
 	// trip closed — the seat handed back a path and this app acted on it.

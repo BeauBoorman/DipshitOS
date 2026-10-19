@@ -645,3 +645,110 @@ if got != want:
     raise SystemExit(1)
 print("picker save-as verified on the host: %r (%d bytes)" % (got, len(got)))
 PY
+
+# --- M123b (#2576) run 10: the empty buffer's shared empty state -----------
+# Boot the editor on a path that does not exist: the create path opens an
+# empty buffer, the shared widgets.EmptyState plate paints in the document
+# area (icon, headline, chord hints), and `goedit: empty <path>` prints from
+# the paint that drew it. The snapshot counts the Surface plate inside the
+# window, which a bare document page cannot produce.
+vgate_setup_python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fresh = os.path.join(share, "EDIT", "FRESH.TXT")
+if os.path.exists(fresh):
+    sys.exit("EDIT/FRESH.TXT must not exist - the leg renders the empty buffer")
+PY
+
+vgate_file script2-10.txt <<'EOS'
+exec GOEDIT.ELF /host/EDIT/FRESH.TXT
+EOS
+
+vgate_file script3-10.txt <<'EOS'
+dui close 2
+echo rx-goedit-empty-ok
+EOS
+
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-10.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --screenshot-after 'goedit: empty /host/EDIT/FRESH.TXT' \
+    --script3 '$RUN_DIR/script3-10.txt' \
+    --script3-after 'goedit: empty /host/EDIT/FRESH.TXT' \
+    --script-expect 'rx-goedit-empty-ok' --timeout 240
+
+vgate_assert 10 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 10 serial-contains 'goedit: read /host/EDIT/FRESH.TXT n=0 rc='
+vgate_assert 10 serial-contains 'goedit: empty /host/EDIT/FRESH.TXT'
+vgate_assert 10 serial-contains 'goedit: present'
+vgate_assert 10 serial-contains 'rx-goedit-empty-ok'
+vgate_assert 10 serial-absent 'goedit: saved '
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 serial-absent 'exited status=139'
+
+# The scanout, 2x capture: the GOEDIT window's client area sits inside
+# x=64..1088, y=96..832; the empty-state plate is the dark Surface fill
+# (34,45,53) over the page background (24,32,38) — tens of thousands of
+# pixels when the plate paints, none when a blank document does not.
+vgate_assert 10 snapshot 'screen-10-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
+            row[x] = (row[x] + pred) & 0xff
+    out += row
+    prev = row
+
+plate = 0
+for y in range(200, 700):
+    for x in range(80, 1050):
+        k = (y * w + x) * bpp
+        if max(abs(out[k] - 34), abs(out[k+1] - 45), abs(out[k+2] - 53)) <= 12:
+            plate += 1
+print("goedit empty leg: surface-plate pixels=%d" % plate)
+assert plate >= 20000, "empty-state plate absent from the document area"
+PY
