@@ -499,7 +499,9 @@ var hostWriteFired = false
 // `--screenshot <path>` remains the evidence capture (the two combine:
 // `--display --screenshot`).
 var displayMode = false
-let hostSessionMode = CommandLine.arguments.contains("--host-session")
+// M128c (#2607): `var`, not `let` — a Finder-launched session arrives
+// bare and this flag is set when the open-documents event lands below.
+var hostSessionMode = CommandLine.arguments.contains("--host-session")
 var hostApplication: HostApplication?
 // Milestone seven card I1 (claim 4272; premise corrected by claim 3868):
 // `--input` attaches the keyboard + pointing devices
@@ -2158,6 +2160,62 @@ while idx < arguments.count {
         serialLogPath = arg
         idx += 1
     }
+}
+
+// M128c (#2607): the packaged session app is the `.virelaivm` document
+// handler (Session-Info.plist's CFBundleDocumentTypes). A Finder
+// double-click launches it BARE — argv is just the executable — and
+// delivers the clicked bundle as the open-documents AppleEvent after
+// finishLaunching. Harvest it here, before the boot shape is built, and
+// route it through the normal `--profile` resolution below so the bundle
+// is minted/refused by name exactly as a flag boot is. The posture is the
+// session front door's: --display --input --host-session, no deadline,
+// and the serial log inside the clicked bundle's run/ (cwd is not the
+// repo under a Finder launch, so the artifacts/ default cannot apply).
+// A bare UNBUNDLED run keeps its artifacts/disk.img default — the gate
+// fleet's plain VMRunner invocations never enter this block.
+var documentProfileURL: URL? = nil
+if arguments.count == 1, Bundle.main.bundleURL.pathExtension == "app" {
+    let opener = HostOpenDocuments()
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    app.delegate = opener
+    app.finishLaunching()
+    HostApplication.launchFinished = true
+    // `odoc` arrives through the app's EVENT queue, not a runloop source —
+    // RunLoop.run never dispatches it (observed: the harvest timed out,
+    // and the queued event landed on the failure window's delegate and
+    // was refused). Drive the same loop body NSApp.run() runs.
+    let openDeadline = Date().addingTimeInterval(5)
+    while opener.openedURL == nil, Date() < openDeadline {
+        autoreleasepool {
+            if let event = app.nextEvent(
+                matching: .any, until: Date().addingTimeInterval(0.05), inMode: .default, dequeue: true) {
+                app.sendEvent(event)
+            }
+        }
+    }
+    guard let clicked = opener.openedURL else {
+        HostApplication.presentLaunchFailure(
+            "VirelaiOS was launched without a .virelaivm machine document. Double-click a profile bundle in Finder, or run `just session`.")
+    }
+    // A Finder launch has no terminal — a corrupt bundle refuses in the
+    // session window, not on a stderr nobody can see.
+    do {
+        _ = try VMProfile.load(from: clicked)
+    } catch {
+        HostApplication.presentLaunchFailure("\(error)")
+    }
+    documentProfileURL = clicked
+    profilePath = clicked.path
+    hostSessionMode = true
+    displayMode = true
+    inputMode = true
+    timeout = 0
+    let runDir = clicked.appendingPathComponent("run", isDirectory: true)
+    try? FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
+    serialLogPath = runDir.appendingPathComponent("serial.log").path
+    print("host-open: document \(clicked.path)")
 }
 
 // M115c (#2462): `--profile` resolves the bundle BEFORE the member paths
@@ -3967,6 +4025,14 @@ if hostSessionMode {
 // window's own instance when it exists, a windowless one otherwise, so
 // --host-cmd-after dispatches verbs down the identical seam the menus use.
 let commandBus = hostApplication?.commandBus ?? HostCommandBus()
+// M128c (#2607): a document-launched session carries no `--profile` in
+// argv — the models' argv resolution would leave them unarmed. Arm them
+// on the clicked bundle so ⌘, and the Machine-menu verbs act on the
+// machine that is actually running.
+if let documentProfileURL {
+    commandBus.settings.profileURL = documentProfileURL
+    commandBus.profiles.profileURL = documentProfileURL
+}
 // The verbs the runner performs itself: the framebuffer capture the
 // --screen/--screenshot-after path already owns (enabled once the display
 // view exists), and a headless stop/quit for runs with no session window

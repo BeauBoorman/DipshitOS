@@ -1,4 +1,35 @@
 import AppKit
+import VMProfile
+
+/// M128c (#2607): the pre-boot open-documents capture. The packaged
+/// session app is the `.virelaivm` document handler, so a Finder
+/// double-click launches it BARE — no `--profile` in argv — and delivers
+/// the clicked bundle as the `odoc` AppleEvent after finishLaunching.
+/// main.swift installs this delegate for the launch window, pumps the
+/// run loop for the event, and hands the URL to the same `--profile`
+/// resolution a flag boot uses. A bare UNBUNDLED run never installs it,
+/// so the gate fleet's plain `VMRunner` invocations are untouched.
+public final class HostOpenDocuments: NSObject, NSApplicationDelegate {
+    /// Every URL the open-documents event(s) delivered, in arrival order.
+    public private(set) var documents: [URL] = []
+
+    /// The boot target: the first `.virelaivm` bundle, else the first
+    /// document at all (a foreign path is the `--profile` resolution's
+    /// named refusal to make, not this capture's).
+    public var openedURL: URL? {
+        documents.first { $0.pathExtension == VMProfile.bundleExtension } ?? documents.first
+    }
+
+    public func application(_ application: NSApplication, open urls: [URL]) {
+        documents.append(contentsOf: urls)
+    }
+
+    /// The single-file edge of the same event — still lands in the capture.
+    public func application(_ application: NSApplication, openFile filename: String) -> Bool {
+        documents.append(URL(fileURLWithPath: filename))
+        return true
+    }
+}
 
 /// M114b (#2455): the minimal surface the `capture-keys` verb needs — the
 /// attached machine view's `capturesSystemKeys` property. The runner's
@@ -56,6 +87,12 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     private let recordBadgeLabel = NSTextField(labelWithString: "")
     private let serialLog: String
 
+    /// M128c (#2607): set by main.swift's document-launch harvest — the
+    /// launch sequence already ran there so the `odoc` event could
+    /// dispatch; init must not post the launch notifications twice.
+    /// (AppKit exposes no public "did finish launching" property.)
+    public static var launchFinished = false
+
     /// The toolbar item identifier for the capture-keys pill — tests find
     /// the pill by it.
     public static let captureKeysToolbarItem = NSToolbarItem.Identifier("virelai.capture-keys")
@@ -64,6 +101,24 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// freeze/resume choke), present only when the companion is armed.
     public static let agentToolbarItem = NSToolbarItem.Identifier("virelai.agent")
     private weak var agentPill: NSButton?
+    /// M128c (#2607): a document-open landing on a live session — the
+    /// boot shape was fixed at launch, so a `.virelaivm` click while this
+    /// window exists is a second machine and is refused by name, never
+    /// silently dropped: a `host-open:` line plus the refusal alert (the
+    /// `openRefusalNotify` seam — an NSAlert in the session, a stub in
+    /// tests). The cold-launch leg is HostOpenDocuments.
+    public private(set) var refusedOpens: [URL] = []
+    /// Why the last document-open was refused — the class-A seam a test
+    /// reads instead of scraping stdout.
+    public private(set) var lastRefusalReason: String?
+    /// The refusal ask — an NSAlert in the session; tests stub it.
+    public var openRefusalNotify: (String) -> Void = { message in
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = "One window boots one machine. Stop the running VM, then open the other profile's own bundle."
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
 
     public init(serialLog: String, inspector: HostInspector = HostInspector(), presentWindow: Bool = true) {
         self.serialLog = serialLog
@@ -85,7 +140,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             app.setActivationPolicy(.regular)
             app.delegate = self
             app.mainMenu = HostMenuBar.build(bus: commandBus)
-            app.finishLaunching()
+            // M128c (#2607): a document-launched session already finished
+            // launching — the odoc harvest in main.swift had to run the
+            // launch sequence for the AppleEvent to dispatch. Re-finishing
+            // would re-post the launch notifications.
+            if !Self.launchFinished { app.finishLaunching() }
         }
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -504,6 +563,33 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         stop("quit")
         return .terminateLater // The runner exits only after VM stop + drain.
+    }
+
+    /// M128c (#2607): the live-session edge of the document handler — a
+    /// double-click on another `.virelaivm` while this machine occupies
+    /// the window is refused by name.
+    public func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { refuseOpen(url) }
+    }
+
+    /// The single-file edge of the same event. True — the refusal IS the
+    /// handling; returning false would stack a generic LaunchServices
+    /// error dialog on top of the named one.
+    public func application(_ application: NSApplication, openFile filename: String) -> Bool {
+        refuseOpen(URL(fileURLWithPath: filename))
+    }
+
+    @discardableResult
+    private func refuseOpen(_ url: URL) -> Bool {
+        refusedOpens.append(url)
+        let reason = url.pathExtension == VMProfile.bundleExtension
+            ? "a machine already occupies this window"
+            : "not a .\(VMProfile.bundleExtension) bundle"
+        lastRefusalReason = reason
+        print("host-open: refused \(url.path) (\(reason))")
+        fflush(stdout)
+        openRefusalNotify("'\(url.deletingPathExtension().lastPathComponent)' could not be opened — \(reason).")
+        return true
     }
 
     public static func presentLaunchFailure(_ message: String) -> Never {
