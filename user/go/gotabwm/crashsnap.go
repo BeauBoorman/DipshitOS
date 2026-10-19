@@ -232,6 +232,7 @@ func crashRestart() {
 	}
 	if err != nil {
 		crashLog(MarkerCrashRestartFail + c.Bin + " " + err.Error())
+		seatRefusalErr(err, "exec "+c.Bin, c.Bin)
 		return
 	}
 	if crashRestartedN < len(crashRestarted) {

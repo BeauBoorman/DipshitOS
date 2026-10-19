@@ -350,6 +350,9 @@ func execSelected() {
 	if err != nil {
 		vi.ConsoleLine(MarkerLaunchMissing + e.Bin)
 		launch.err = "Launch failed: " + bin
+		// M123a (#2575): the serial marker keeps its job; the toast
+		// gives the refusal a face with a per-errno action.
+		seatRefusalErr(err, "exec "+bin, bin)
 		return
 	}
 	if len(e.Args) > 0 {

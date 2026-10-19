@@ -1945,3 +1945,123 @@ if created.group(1) != cancelled.group(1):
     sys.exit("cancel named id=%s, want the reporter id=%s"
              % (cancelled.group(1), created.group(1)))
 PY
+
+# --- M123a (#2575) runs 17-18: kernel refusals become actionable toasts ---
+#
+# The seat's refusal sites post a notify toast with a per-errno action
+# (user/go/gotabwm/refusal.go); serial markers stay exactly as they were.
+#
+# Run 17 — missing binary -> toast -> Retry: APPS.TXT carries one Ghost
+# row for MISSING.ELF, which IS staged so the launcher's availability
+# probe admits it. script2 then `vf rm`s the binary behind the
+# 'launcher open' marker and the pointer batch (anchored on the first
+# presented launcher frame, one tick later — the rm lands well inside
+# that window) clicks the row: exec -> ENOENT -> refusal toast -> a
+# second click runs Retry, which execs again and reports ENOENT.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOCALC.ELF")
+if not os.path.isfile(src):
+    sys.exit("GOCALC.ELF missing - build it first: bash tools/go/build-gocalc.sh")
+shutil.copy(src, os.path.join(share, "MISSING.ELF"))
+# One-row manifest so the Ghost row is unambiguously the click target.
+open(os.path.join(share, "APPS.TXT"), "w").write(
+    "# v2 test manifest for the M123a missing-binary leg\n"
+    "MISSING.ELF | Ghost | g | dock=true\n")
+print("staged MISSING.ELF + one-row APPS.TXT")
+PY
+
+vgate_file script-17.txt <<'EOF'
+vf rm GOTABWM.DEMO
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-17.txt <<'EOF'
+vf rm MISSING.ELF
+echo rx-m123a-rm
+EOF
+
+vgate_run 17 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-17' \
+    --script '$RUN_DIR/script-17.txt' \
+    --input-chords 'ctrl-space' --input-chords-after 'gotabwm: mode live' \
+    --script2 '$RUN_DIR/script2-17.txt' --script2-after 'gotabwm: launcher open n=' \
+    --pointer-virtio '130,150,c;112,702,c' \
+    --pointer-virtio-after 'gotabwm: launcher presented' \
+    --script-expect 'gotabwm: refusal act retry MISSING.ELF ENOENT' --timeout 300
+
+vgate_assert 17 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 17 serial-contains 'gotabwm: mode live'
+vgate_assert 17 serial-contains 'gotabwm: launcher open n=1'
+vgate_assert 17 serial-contains 'rx-m123a-rm'
+# The serial marker keeps its job; the toast rides beside it.
+vgate_assert 17 serial-contains 'gotabwm: launcher missing MISSING.ELF'
+vgate_assert 17 serial-contains 'gotabwm: refusal ENOENT exec MISSING.ELF act=retry'
+vgate_assert 17 serial-contains 'gotabwm: notify paint'
+vgate_assert 17 serial-contains 'gotabwm: notify dismiss'
+# The click ran Retry: the re-exec refused ENOENT again, honestly named.
+vgate_assert 17 serial-contains 'gotabwm: refusal act retry MISSING.ELF ENOENT'
+vgate_assert 17 serial-absent '[EXC] parking:'
+vgate_assert 17 serial-absent 'exited status=139'
+
+# Run 18 — clipboard denied -> toast -> Open Settings (GOSET grants):
+# the seat's clipboard lane is armed, then `lane-clipboard` over the
+# HostCommand bus republishes ARMED with the clip bit cleared, so the
+# signed CLIP_IN is refused lane_disabled — a denial the seat converts
+# into the EACCES-class toast whose click execs GOSET.ELF (the ADR 0054
+# grants surface). HOST PREREQUISITE: GOSET.ELF staged beside the seat.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOSET.ELF")
+if not os.path.isfile(src):
+    sys.exit("GOSET.ELF missing - build it first: bash tools/go/build-goset.sh")
+shutil.copy(src, os.path.join(share, "GOSET.ELF"))
+# The lane credential (ADR 0024 D8 binding: uid_system OWNERS row +
+# image-bound SECRETS row). Value bytes ARE the HMAC key verbatim.
+KEY = "m123akey" * 8  # 64 bytes, ASCII
+open(os.path.join(share, "SECRETS.TXT"), "w").write(
+    "#v1\n" + "host-int\t1000\t" + KEY + "\tGOTABWM.ELF\n")
+open(os.path.join(share, "OWNERS.TXT"), "w").write(
+    "#v1\nGOTABWM.ELF\t644\t0\t-\n")
+print("staged GOSET.ELF + host-int credential")
+PY
+
+vgate_file script-18.txt <<'EOF'
+vf rm GOTABWM.DEMO
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+vgate_run 18 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-18' \
+    --script '$RUN_DIR/script-18.txt' \
+    --host-clipboard \
+    --host-cmd-after 'gotabwm: hostint armed:lane-clipboard' \
+    --host-clip-in 'm123a-denied' --host-clip-in-after 'lanes=-' \
+    --pointer-virtio '112,702,c' \
+    --pointer-virtio-after 'gotabwm: refusal EACCES lane-clip' \
+    --script-expect 'gotabwm: refusal act grant GOSET.ELF ok' --timeout 300
+
+vgate_assert 18 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 18 serial-contains 'gotabwm: mode live'
+vgate_assert 18 serial-contains 'gotabwm: hostint armed'
+# The suspension re-armed an empty mask; the signed CLIP_IN was refused.
+vgate_assert 18 serial-contains 'lanes=-'
+vgate_assert 18 serial-contains 'gotabwm: hostint refuse lane=clip reason=lane_disabled'
+vgate_assert 18 serial-contains 'gotabwm: refusal EACCES lane-clip act=grant'
+vgate_assert 18 serial-contains 'gotabwm: notify paint'
+vgate_assert 18 serial-contains 'gotabwm: notify dismiss'
+# The click ran the grant action: GOSET.ELF exec'd and declared.
+vgate_assert 18 serial-contains 'gotabwm: refusal act grant GOSET.ELF ok'
+vgate_assert 18 serial-contains 'verdict=measured name=GOSET.ELF'
+vgate_assert 18 serial-contains 'goset: declare accepted'
+vgate_assert 18 serial-absent '[EXC] parking:'
+vgate_assert 18 serial-absent 'exited status=139'
