@@ -271,6 +271,10 @@ func guessBin(title string) string {
 		return "GOTABAPP.ELF"
 	case "Term":
 		return "GOTERM.ELF"
+	case "Web":
+		// M125g (#2592): the browser's declared title — without the row a
+		// restored tab execs "Web" and the row drops by name.
+		return "WEB.ELF"
 	case "RSS Reader":
 		// The reader declares this title (user/go/rss). The default arm would
 		// otherwise record the title itself as the binary, and a restored tab
