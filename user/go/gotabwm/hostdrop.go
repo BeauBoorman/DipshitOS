@@ -5,8 +5,10 @@
 // DROP record. The seat's part is the NOTICE: the engine verifies
 // epoch/MAC/seq, this file decodes [name_len u8][name][size u64le], and
 // the toast `host drop: <name>` goes through the same bounded strip every
-// kind-12 notice uses. Click is dismiss-only by construction — the toast's
-// sender id is 0 and focusHosted(0) refuses, so there is no tab to focus.
+// kind-12 notice uses. M127b (V2-D4) makes the toast actionable: sender
+// stays 0 (there is still no tab to focus) but the click — or the center
+// row's activation — runs the `open-drop` action bound to the name the
+// verified record carried (dropopen.go).
 //
 // The payload file is unsigned bulk content by design: provenance is the
 // record, so a guest app planting a file in INBOX/ produces no notice and
@@ -74,7 +76,11 @@ func hostdropApply(rec hostint.Record) string {
 	text := "host drop: " + name
 	hostintLog(MarkerHostintDrop + "seq=" + vi.Itoa64(int64(rec.Seq)) +
 		" name=" + name + " size=" + vi.Itoa64(int64(size)))
-	_, _, dropped := notifyPush(0, text, seatTick)
+	// V2-D4: the toast carries the open-drop action bound to THIS record's
+	// sanitized name — the click can never be retargeted at a file the
+	// record did not announce. The binding lands on the center row too,
+	// so a DND-held notice stays actionable there.
+	_, _, dropped := notifyPushAction(0, text, seatTick, notifyActionDropOpen, name)
 	if dropped {
 		hostintLog(MarkerNotifyDrop + vi.Itoa64(int64(notifyDropped)))
 	}

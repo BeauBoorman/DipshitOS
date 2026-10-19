@@ -26,13 +26,13 @@ func TestHostdropConsumeToasts(t *testing.T) {
 	hostintSeatInit()
 	f.plantArmed(0xBEEF, hostint.LaneDrop)
 	hostintSeatTick()
-	if !f.hasLog(hostintMarkerPrefix+" armed epoch=48879 lanes=drop") {
+	if !f.hasLog(hostintMarkerPrefix + " armed epoch=48879 lanes=drop") {
 		t.Fatalf("missing armed marker: %v", f.logs)
 	}
 
 	f.plantDrop(0xBEEF, 1, "PHOTO.QOI", 4100)
 	hostintSeatTick()
-	if !f.hasLog(MarkerHostintDrop+"seq=1 name=PHOTO.QOI size=4100") {
+	if !f.hasLog(MarkerHostintDrop + "seq=1 name=PHOTO.QOI size=4100") {
 		t.Fatalf("missing drop marker: %v", f.logs)
 	}
 	if !f.hasLog("gotabwm: notify id=0 host drop: PHOTO.QOI") {
@@ -42,12 +42,22 @@ func TestHostdropConsumeToasts(t *testing.T) {
 		t.Fatalf("toast queue = %+v", notifyQueue)
 	}
 	if notifyQueue[0].tabID != 0 {
-		t.Fatal("drop toast carries a sender id — click must dismiss, not focus")
+		t.Fatal("drop toast carries a sender id — there is no tab to focus")
+	}
+	// V2-D4: the toast and its center row share the open-drop binding to
+	// THIS record's name — the click can never be retargeted.
+	if notifyQueue[0].action != notifyActionDropOpen ||
+		notifyQueue[0].snap != "PHOTO.QOI" {
+		t.Fatalf("drop toast = %+v want open-drop on PHOTO.QOI", notifyQueue[0])
+	}
+	if len(notifyCenter) != 1 || notifyCenter[0].action != notifyActionDropOpen ||
+		notifyCenter[0].snap != "PHOTO.QOI" {
+		t.Fatalf("center row = %+v want the same binding", notifyCenter)
 	}
 	// A stale DROP on the next tick is a named refusal, never a toast.
 	f.plantDrop(0xBEEF, 1, "PHOTO.QOI", 4100)
 	hostintSeatTick()
-	if !f.hasLog("lane=drop reason="+hostint.RefuseStaleSeq) {
+	if !f.hasLog("lane=drop reason=" + hostint.RefuseStaleSeq) {
 		t.Fatalf("missing stale_seq refusal: %v", f.logs)
 	}
 	if len(notifyQueue) != 1 {
@@ -66,7 +76,7 @@ func TestHostdropBadPayloadRefused(t *testing.T) {
 	f.files[hostint.RecordName(hostint.TagDrop, 1)] =
 		hostint.EncodeRecord(f.key, hostint.TagDrop, 0, 1, 9, p)
 	hostintSeatTick()
-	if !f.hasLog("lane=drop reason="+hostint.RefuseBadRecord) {
+	if !f.hasLog("lane=drop reason=" + hostint.RefuseBadRecord) {
 		t.Fatalf("missing bad_record refusal: %v", f.logs)
 	}
 	if len(notifyQueue) != 0 {
@@ -84,7 +94,7 @@ func TestHostdropConsentDeniedWithoutLaneBit(t *testing.T) {
 	hostintSeatTick()
 	f.plantDrop(7, 1, "SNEAK.QOI", 12)
 	hostintSeatTick()
-	if !f.hasLog("lane=drop reason="+hostint.RefuseConsent) {
+	if !f.hasLog("lane=drop reason=" + hostint.RefuseConsent) {
 		t.Fatalf("missing consent_denied refusal: %v", f.logs)
 	}
 	if len(notifyQueue) != 0 {
@@ -127,10 +137,10 @@ func TestDropPayloadDecode(t *testing.T) {
 		t.Fatalf("dropPayload = %q %d %v", name, size, ok)
 	}
 	for _, p := range [][]byte{
-		{},                       // empty
-		{0},                      // zero name_len alone
-		{2, 'A'},                 // truncated name
-		{1, 'A', 1, 2, 3},        // short size field
+		{},                                  // empty
+		{0},                                 // zero name_len alone
+		{2, 'A'},                            // truncated name
+		{1, 'A', 1, 2, 3},                   // short size field
 		{1, 'A', 1, 2, 3, 4, 5, 6, 7, 8, 9}, // trailing byte
 	} {
 		if _, _, ok := dropPayload(p); ok {
