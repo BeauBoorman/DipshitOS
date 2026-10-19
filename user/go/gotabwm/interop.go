@@ -368,6 +368,13 @@ func serviceRPC() int {
 		applied := false
 		if apply {
 			applied = applyRPC(req)
+			if !applied {
+				// The gate passed but the seat refused the request;
+				// `declare refused` client-side is otherwise silent
+				// about which step failed (#2652: live-rfb run 01).
+				vi.ConsoleLine(MarkerRpcRefuse + vi.Itoa64(int64(req.ID)) +
+					" apply kind=" + vi.Itoa64(int64(req.Kind&0x7f)))
+			}
 		} else if pad == vi.WmRpcPadPlain {
 			// #2260: name why the bound id refused — which pid asked,
 			// which kind, and whether any credentials rode the frame.
