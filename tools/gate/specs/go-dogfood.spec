@@ -197,6 +197,12 @@
 #     would paint its fullscreen window over the panes mid-gesture. The run
 #     ends on `goterm: done status=0` and the cvc-snap pixel assert proves
 #     the pasted line painted real ink.
+# M123e (#2579) adds no boot: a per-run assert (refusal-pair.py, staged
+# below) fails any refusal-shaped serial line -- `rc=-<n>` or a
+# `refuse[d]` verb -- that no UI-surface marker answers. The journey's
+# observed refusal set (boot 05's `gofiles: clip-sys rc=-7` receipt,
+# boot 06's refusal toast, boot 07's `gosound: rec refused ENXIO`) and
+# the named non-failure classes are documented in the helper.
 #
 # exec-order: assert-proven -- every phase gate is anchored on guest output
 # (the seat's, an app's, or the kernel's own marker: dogfood: seat ->
@@ -305,6 +311,116 @@ with open(os.path.join(notify, "SOURCE.TXT"), "w") as f:
     f.write("notify-policy-payload\n")
 print("staged NOTIFY/{DIR1,DIR2,SOURCE.TXT} for the M82d2 notify boots")
 PY
+# M123e (#2579): the refusal-pairing audit. Every boot's serial is scanned by
+# refusal-pair.py (written into $RUN_DIR here, asserted per run below): any
+# `rc=-<n>` or `refuse[d]` line must pair with a UI-surface marker in the same
+# boot -- the seat's M123a refusal toast, its notify surfaces, or the app's own
+# M123b/M123d banner/empty markers. The named non-failure classes (pre-UI init,
+# seat->app protocol acks, capability vocabulary, receipts) are documented in
+# the helper -- listed, never silently swallowed.
+vgate_file refusal-pair.py <<'EOF'
+# M123e (#2579) -- no serial-only refusals in the dogfood journey.
+#
+# Scans the run's serial ($VG_SER; tag 07 also scans the SoundInProbe sub-leg's
+# $RUN_DIR/gosound-rec-serial.log) for refusal-shaped lines and fails when one
+# carries no UI-surface marker.
+#
+# Refusal-shaped: `rc=-<n>` (a guest marker reporting a negative kernel return)
+# or a refuse/refused verb.
+#
+# PAIRED when a UI marker follows the line in the same serial:
+#   - seat: `gotabwm: refusal` (the M123a toast, incl. act/dedupe lines),
+#     `gotabwm: notify paint`, `gotabwm: notify held`
+#   - same app prefix: `<app>: banner`, `<app>: banner act`, `<app>: empty`
+#
+# Self-paired (the line IS the UI marker's serial receipt):
+#   - `gotabwm: refusal*` -- the toast's own marker
+#   - `<app>: banner*` / `<app>: empty` -- the banner/empty-state markers
+#   - `gosound: * refused` / `gosound: rec write refused rc=` -- GOSOUND parks
+#     its refused state in-window (stRefused; "Empty and refused park in the
+#     window", user/go/sound/main.go), so the marker reports a visible state
+#
+# Named non-failures (listed, not swallowed):
+#   init: refuse missing-init    pre-UI boot path; no seat exists yet, the
+#                                marker IS the record
+#   gotabwm: rpc refuse          seat->app RPC acks -- the kind's "not now";
+#   gotabwm: sel refuse          the app re-polls. Flow control, not failures
+#   cap: refuse                  the capability table's refusal-VOCABULARY
+#                                line, not an event
+#   gofiles: clip-sys rc=        M124c's best-effort file:// URI publish to the
+#                                kernel clipboard: EACCES under a cap-less
+#                                exec is the designed receipt (user/go/files/
+#                                state.go); the copy the user asked for worked
+#
+# A `<app>: notify refused` line pairs the same way -- a following
+# `gotabwm: notify` marker means the seat still queued/painted the notice.
+import bisect, os, re, sys
+
+REFUSAL = re.compile(r"rc=-\d|\brefus(?:e|ed|al)\b")
+SELF = ("gotabwm: refusal", ": banner", ": empty",
+        "gosound: rec refused", "gosound: meter refused", "gosound: refused",
+        "gosound: rec write refused")
+EXEMPT = ("init: refuse missing-init", "gotabwm: rpc refuse",
+          "gotabwm: sel refuse", "cap: refuse",
+          "gofiles: clip-sys rc=")
+SEAT_UI = ("gotabwm: refusal", "gotabwm: notify paint", "gotabwm: notify held")
+APP_UI = (": banner", ": empty")
+PREFIX = re.compile(r"^([a-z0-9]+):")
+
+
+def scan(lines, label):
+    seat_at = [i for i, l in enumerate(lines) if any(s in l for s in SEAT_UI)]
+    app_at = {}
+    for i, l in enumerate(lines):
+        if any(s in l for s in APP_UI):
+            m = PREFIX.match(l)
+            if m:
+                app_at.setdefault(m.group(1), []).append(i)
+    paired = selfp = exempt = 0
+    bad = []
+    for i, line in enumerate(lines):
+        if not REFUSAL.search(line):
+            continue
+        if any(x in line for x in EXEMPT):
+            exempt += 1
+            continue
+        if any(x in line for x in SELF):
+            selfp += 1
+            continue
+        ok = bisect.bisect_right(seat_at, i) < len(seat_at)
+        if not ok:
+            m = PREFIX.match(line)
+            if m and m.group(1) in app_at:
+                ok = bisect.bisect_right(app_at[m.group(1)], i) < len(
+                    app_at[m.group(1)])
+        if ok:
+            paired += 1
+        else:
+            bad.append(line.strip()[:160])
+    print("%s: refusal pairing -- %d paired, %d self-paired UI markers, "
+          "%d named non-failures, %d UNPAIRED"
+          % (label, paired, selfp, exempt, len(bad)))
+    for b in bad:
+        print("  UNPAIRED refusal: " + b)
+    return bad
+
+
+fail = 0
+fail += len(scan(
+    open(os.environ["VG_SER"], errors="replace").read().splitlines(),
+    "serial " + os.environ["VG_TAG"]))
+tag = os.environ["VG_TAG"]
+if tag == "07":
+    extra = os.path.join(os.environ["RUN_DIR"], "gosound-rec-serial.log")
+    if not os.path.exists(extra):
+        sys.exit("gosound-rec-serial.log missing (the SoundInProbe assert "
+                 "produces it before this leg)")
+    fail += len(scan(open(extra, errors="replace").read().splitlines(),
+                     "gosound-rec"))
+if fail:
+    sys.exit("%d serial-only refusal line(s) -- every rc<0/refusal in the "
+             "dogfood journey must carry a UI marker" % fail)
+EOF
 
 # M124f (#2585): boot 08's FLOW tree — exactly three name-sorted files so the
 # rows the journey presses are deterministic: NOTE.TXT row 0 (the drag's
@@ -488,6 +604,14 @@ print("between-run cleanup: empty SESSION.TABS for boot 02 "
       "(restored-empty: no re-exec fan-out, no starter)")
 PY
 
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 01 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
+PY
+
 # --- boot 02: the calculator and the browser on the same default seat -------
 # Same share, same compiled default. D1 says the seat is the COMPILED default
 # and not a setting, and boot 02 is the boot where that could silently stop
@@ -589,6 +713,14 @@ import os, sys
 share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
 open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x02\x00\x00\x00\x00\x00")
 print("between-run cleanup: empty SESSION.TABS for boot 03")
+PY
+
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 02 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
 PY
 
 # --- boot 03: the shell tab's PIXELS on the default seat (M69g, #1558) ------
@@ -728,6 +860,14 @@ os.remove(st)
 assert not os.path.exists(st), "SESSION.TABS survived removal"
 print("between-run cleanup: removed SESSION.TABS "
       "(boot 04 summons on an empty strip)")
+PY
+
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 03 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
 PY
 
 # --- boot 04: THE M73 ACCEPTANCE (M73z, #1638) ------------------------------
@@ -1287,6 +1427,14 @@ print("(e) rune cell rendered, alignment exact, no ink past col 79")
 PY
 
 # ---------------------------------------------------------------------------
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 04 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
+PY
+
 # M82d2 (#1785): the notifications center's policy, on the LIVE default seat
 # ---------------------------------------------------------------------------
 # Boots 01-04 run the seat in DEMO mode (the seeded GOTABWM.DEMO): a bounded
@@ -1537,6 +1685,14 @@ print("NOTIFY.HIST on the share: %d bytes, %d valid entries (%s), no temp left"
       % (len(raw), n, ", ".join(repr(t.decode()) for _, t in recs)))
 PY
 
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 05 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
+PY
+
 # --- boot 06: restart -> DND still on, both notices still there ---------------
 # A fresh VM on the same share. The seat that left was killed, not asked to
 # exit, so everything below survived on the strength of the crash-safe publish.
@@ -1695,6 +1851,14 @@ else:
 PY
 
 # ---------------------------------------------------------------------------
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 06 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
+PY
+
 # M118e (#2483): boot 07 -- GOSOUND's record mode on the default seat
 # ---------------------------------------------------------------------------
 # `exec GOSOUND.ELF record N out.wav` is the M118e verb: the player becomes a
