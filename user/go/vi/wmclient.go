@@ -267,6 +267,12 @@ var (
 	wmInboxMu      sync.Mutex
 	pendingWmInbox [MailboxMaxMessages]WmRpc
 	pendingWmCount int
+	// wmRecvBuf is package-level on purpose: the kernel writes through a
+	// uintptr, and a stack-allocated recv buffer can move if the goroutine
+	// stack grows mid-svc — the stale uintptr then lands the frame on the
+	// dead stack copy and the decode reads zeros. A global address is
+	// stable; wmInboxMu already serializes every recv.
+	wmRecvBuf [WmRpcMax]byte
 )
 
 func enqueueWmMessage(m WmRpc) {
@@ -306,14 +312,13 @@ func takePendingWmMessage(matches func(WmRpc) bool) (WmRpc, bool) {
 }
 
 func receiveWmMessage() (WmRpc, bool) {
-	var raw [WmRpcMax]byte
 	wmInboxMu.Lock()
-	n, r := IpcRecv(raw[:])
+	n, r := IpcRecv(wmRecvBuf[:])
 	wmInboxMu.Unlock()
 	if r < 0 || n < 38 {
 		return WmRpc{}, false
 	}
-	return DecodeWmRpc(raw[:n])
+	return DecodeWmRpc(wmRecvBuf[:n])
 }
 
 func nextWmSeq() uint8 {

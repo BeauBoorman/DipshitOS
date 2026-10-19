@@ -173,6 +173,9 @@ func dropRpcBinding(id uint32) {
 	// M125a (#2586): the ask latch and any staged rendezvous file die
 	// with the session too.
 	clearAppState(id)
+	// M124a (#2580): an armed drag dies with its source, and a staged
+	// handoff dies with its target — a reused id inherits neither.
+	dropDragWindow(id)
 }
 
 func dropAllRpcBindings() {
@@ -636,6 +639,10 @@ func applyRPC(req vi.WmRpc) bool {
 		return serveStateSave(req)
 	case vi.WmRpcKindRestoreState: // 21, client -> seat: hand the blob back
 		return serveStateRestore(req)
+	case vi.WmRpcKindDragBegin: // 24, client -> seat: arm a drag (M124a)
+		return serveDragBegin(req)
+	case vi.WmRpcKindDragCancel: // 26, client -> seat: abort its own drag
+		return serveDragCancel(req)
 	case vi.WmRpcKindSettingsSubscribe: // 13, client -> seat: subscribe to one key
 		return applySettingsSubscribe(req)
 	case vi.WmRpcKindSettingsPublish: // 14, writer -> seat: a persisted key changed

@@ -36,6 +36,14 @@ import (
 // it gets the stored bytes back byte-intact plus the tag they were saved
 // under. StateVersion tags every saved envelope so a stale serialization
 // is refused by the app's own check, never silently misread.
+//
+// M124a (#2580): the guest drag-and-drop hooks. DragSource is the
+// producer BeginDrag asks for the payload — (mime, blob, ok); the seat
+// then owns the ghost, the hit-test and the opens= admission. DropTarget
+// is invoked with the delivered offer when the seat lands a drop on this
+// window. DragEnd is the SOURCE's outcome notice: delivered=true with
+// the target's window id, or false on a cancel — optional because an app
+// that does not care who answered need not set it.
 type Config struct {
 	Name  string
 	Title string
@@ -45,6 +53,22 @@ type Config struct {
 	SaveState    func() []byte
 	RestoreState func([]byte)
 	StateVersion uint8
+
+	DragSource func() (mime string, blob []byte, ok bool)
+	DropTarget func(offer DragOffer)
+	DragEnd    func(delivered bool, peer uint32)
+}
+
+// DragOffer is one delivered drop (M124a): the mime both sides agreed
+// on — the frame's claim the seat checked the staged envelope against —
+// the source window's id, and the payload bytes consumed from this
+// app's own rendezvous path. A nil Blob means the staged envelope was
+// absent when the delivery notice was consumed: a transport failure the
+// target is told about, never a silently-empty payload.
+type DragOffer struct {
+	Mime string
+	Src  uint32
+	Blob []byte
 }
 
 // Action is what Dispatch decided the app should do with an event.
@@ -83,6 +107,13 @@ type TabApp struct {
 	// carried the bytes).
 	Restored        bool
 	RestoredVersion uint8
+
+	// M124a (#2580): the drag hooks, copied from Config the same way the
+	// state hooks are — the event loop calls PollDrag once per pass so a
+	// seat delivery or outcome lands inside the app's own slice.
+	DragSource func() (mime string, blob []byte, ok bool)
+	DropTarget func(offer DragOffer)
+	DragEnd    func(delivered bool, peer uint32)
 
 	// surf is the bound M33 window surface — the shared pages the depth
 	// engine paints and the compositor reads — nil when the bind refused
@@ -128,6 +159,9 @@ func Init(cfg Config) *TabApp {
 	ta.SaveState = cfg.SaveState
 	ta.RestoreState = cfg.RestoreState
 	ta.StateVersion = cfg.StateVersion
+	ta.DragSource = cfg.DragSource
+	ta.DropTarget = cfg.DropTarget
+	ta.DragEnd = cfg.DragEnd
 	if ta.RestoreState != nil {
 		if v, blob, ok := vi.RequestStateRestore(uint32(win), cfg.Name); ok {
 			ta.Restored = true
@@ -335,6 +369,68 @@ func (t *TabApp) SaveStateNow() bool {
 		blob = t.SaveState()
 	}
 	return vi.PostStateSave(uint32(t.Win), t.StateVersion, blob, t.Name)
+}
+
+// BeginDrag is the M124a source arm: DragSource produces (mime, blob),
+// the blob stages at this window's rendezvous path, and the kind-24
+// request posts with the mime in the frame title. The seat owns the
+// pointer from there — the app's job is done until PollDrag reports the
+// outcome (its DragEnd). False when no DragSource is set, the hook
+// refuses, the payload is over-bounded, or the seat refused the arm —
+// the ack is the refusal.
+func (t *TabApp) BeginDrag() bool {
+	if t.DragSource == nil {
+		return false
+	}
+	mime, blob, ok := t.DragSource()
+	if !ok {
+		return false
+	}
+	return vi.DragBegin(uint32(t.Win), mime, blob, t.Name)
+}
+
+// CancelDrag is the app-side Esc: abort this app's own armed drag. False
+// when no drag was armed or the request was refused.
+func (t *TabApp) CancelDrag() bool {
+	return vi.DragCancel(uint32(t.Win), t.Name)
+}
+
+// PollDrag services the seat's asynchronous drag frames — call it once
+// per event-loop pass, the same discipline as PollStateAsk. A delivery
+// consumes this window's staged payload and hands DropTarget the
+// DragOffer; a receipt reports DragEnd(true, target); a cancel reports
+// DragEnd(false, 0). False when no drag frame was waiting.
+func (t *TabApp) PollDrag() bool {
+	n, ok := vi.PollDragNotice(uint32(t.Win))
+	if !ok {
+		return false
+	}
+	switch n.Kind {
+	case vi.WmRpcKindDragDrop:
+		if n.Receipt {
+			if t.DragEnd != nil {
+				t.DragEnd(true, n.Peer)
+			}
+			return true
+		}
+		mime, blob, tok := vi.DragTake(uint32(t.Win))
+		if !tok {
+			// The delivery notice arrived but the staged envelope did
+			// not — the offer still surfaces, with the frame's own mime
+			// claim and a nil payload.
+			mime = n.Mime
+		}
+		if t.DropTarget != nil {
+			t.DropTarget(DragOffer{Mime: mime, Src: n.Peer, Blob: blob})
+		}
+		return true
+	case vi.WmRpcKindDragCancel:
+		if t.DragEnd != nil {
+			t.DragEnd(false, 0)
+		}
+		return true
+	}
+	return false
 }
 
 // Scale maps r from a fromW x fromH canvas into toW x toH (integer math,

@@ -40,10 +40,10 @@ const powerRowSuspend = "Suspend"
 // Button + menu geometry. The button is a square on the chrome band
 // between the Apps button and the clock panel; the menu floats above it.
 const (
-	powerBtnW  = 28
-	powerBtnGap = 4
-	powerMenuW = 88
-	powerMenuH = 26
+	powerBtnW    = 28
+	powerBtnGap  = 4
+	powerMenuW   = 88
+	powerMenuH   = 26
 	powerMenuGap = 4
 )
 
@@ -141,6 +141,7 @@ func releasePowerFocus() {
 }
 
 func openPowerMenu() {
+	dragAbort("chrome") // M124a: the modal menu takes the gesture
 	if powerMenuOpen {
 		return
 	}

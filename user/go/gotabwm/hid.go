@@ -550,6 +550,19 @@ func handleWmPointer(e vi.Event) {
 	down := pointerDownEdge(btn, prevPtrButtons)
 	up := pointerUpEdge(btn, prevPtrButtons)
 	prevPtrButtons = btn
+	// M124a (#2580): an armed guest drag owns every pointer sample —
+	// motion feeds the ghost's hit-test, the release edge settles the
+	// drop, and no chrome (toast, rail, sash, launcher) can see a click
+	// mid-drag while nothing forwards to content. The press that armed
+	// it already went through the normal content path before the
+	// drag_begin RPC landed; serveDragBegin clears its latches.
+	if drag.armed {
+		if up {
+			contentDown, railDragFrom, sashDragging = false, -1, false
+		}
+		handleDragPointer(px, py, up)
+		return
+	}
 	if menuGesture {
 		if btn == 0 {
 			menuGesture = false
