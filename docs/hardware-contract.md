@@ -550,6 +550,23 @@ Non-PCI platform facts:
     marker + host-poll path (the M115 index's named fallback), since
     `VZVirtioFileSystemDeviceConfiguration` is already proven
     restore-safe (M83g above).
+- **M131d (#2641) — warm-checkpoint fleet census + the vz-restore flag
+  bound: [observed] 2026-10-19, macOS 27.2 (26B5112a), arm64:**
+  - The runner's `--vz-restore` mode is a standalone headless probe with a
+    fixed flag allow-list: `--overlay-base`, `--vars`, `--serial`,
+    `--cpus`, `--timeout`, the `--vz-restore-*` knobs, the `--script*`
+    family on load, `--virtio-fs`, `--display`, `--input`, `--usb-msd`,
+    `--custom-virtio`, `--gpu3d-metal`, `--vsock`. A checkpoint base boot
+    carrying `--data-disk` exits rc=1 on the probe's usage guard — so legs
+    whose shape needs `--data-disk`, `--net*` capture/responders,
+    `--sound*`, console or input-injection machinery can never restore
+    under the current harness. `fleet.sh census` classes them (c).
+  - Fleet census (988 legs): 810 device-ineligible, semantic a=25 b=31
+    c=52 d=6 e=32 f=12, warm-adopted 20, unclassified 0.
+  - On this host every restore still refuses `VZErrorDomain` Code=12 —
+    warm legs degrade to a single cold boot (`warm=fallback(12)`), so the
+    fleet cold-vs-warm wall-clock row waits on the reference host where
+    `live-vz-restore` headless-base restores (`warm=restored`).
 - Config used: 512 MiB RAM, 2 vCPUs, optional virtio-gpu/sound/net devices
   (flag-gated; the default VM stays byte-identical without flags).
 - **A large image is not a RAM problem by itself, and the guest does not

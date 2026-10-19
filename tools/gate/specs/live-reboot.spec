@@ -16,6 +16,9 @@ vgate_file script-shutdown.txt <<'EOF'
 shutdown
 EOF
 
+# warm-cold: reboot,shutdown (b) the legs exercise EFI ResetSystem — a
+#   leg that restores a checkpoint and then reboots tests reboot semantics,
+#   not warm semantics; restore/reset machinery stays cold (ADR 0059 D7(b))
 vgate_run reboot -- --script '$RUN_DIR/script-reboot.txt' --script-expect '__NEVER_EXPECTED__' --timeout 45
 vgate_allow_rc reboot 1
 

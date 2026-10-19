@@ -58,6 +58,9 @@ net
 echo n9b-done
 EOF
 
+# warm-cold: A,B (d) --script2-delay arms the lease lifecycle's T1/T2/expiry
+#   windows against host wall-clock — a timing budget formed across the
+#   freeze is uninterpretable post-restore (ADR 0059 D7(d))
 vgate_run A -- --net '$RUN_DIR/a-cap.bin' --net-dhcp-respond 10.0.0.2:100 --net-arp-respond 10.0.0.2 --net-dhcp-respond-norenew --script '$RUN_DIR/a1.txt' --script2 '$RUN_DIR/a2.txt' --script2-after 'n9a-phase1-ready' --script2-delay 92 --script-expect 'n9a-done' --timeout 220
 vgate_run B -- --net '$RUN_DIR/b-cap.bin' --net-dhcp-respond 10.0.0.2:100 --net-dhcp-respond-norebind --script '$RUN_DIR/b1.txt' --script2 '$RUN_DIR/b2.txt' --script2-after 'n9b-phase1-ready' --script2-delay 106 --script-expect 'n9b-done' --timeout 220
 
