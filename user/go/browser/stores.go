@@ -258,6 +258,28 @@ func (a *app) clearCookies() int {
 
 // --- downloads -----------------------------------------------------------
 
+// saveDownload writes the current page body to the share and records it.
+func (a *app) saveDownload() bool {
+	return a.saveDownloadTo(downloadFmt + downloadName(a.target))
+}
+
+// saveDownloadTo is the write+ledger leg shared by the fixed download and
+// the M124b picker's chosen path.
+func (a *app) saveDownloadTo(path string) bool {
+	if len(a.lastBody) == 0 || a.target == "" || !ledgerFieldOK(a.target) {
+		return false
+	}
+	if !writeFileAll(path, a.lastBody) {
+		return false
+	}
+	ledgerAppend("/host/WEB-DOWNLOADS.TXT",
+		"# virelai-web-downloads v1 (unix-seconds<TAB>target<TAB>file<TAB>bytes)",
+		itoa64(vi.Time())+"\t"+a.target+"\t"+path+"\t"+itoa(len(a.lastBody)))
+	vi.ConsoleLine(markerDownload + path + " " + itoa(len(a.lastBody)))
+	return true
+}
+
+// downloadName derives a filesystem-safe name from a target.
 // downloadName derives a filesystem-safe name from a target, bounded to
 // dlNameMax so "/host/WEB-DL-"+name stays inside the kernel's 64-byte
 // path ceiling. The staged write itself lives in downloads.go (M126e).

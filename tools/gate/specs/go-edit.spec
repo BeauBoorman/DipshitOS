@@ -582,3 +582,66 @@ if got != want:
     raise SystemExit(1)
 print("replace-all result verified on the host: %r (%d bytes)" % (got, len(got)))
 PY
+
+# M124b (#2581) adds run 09: the shared appkit.FilePicker's open and save-as
+# legs. Ctrl-O raises the modal (clean buffer, so no discard confirm); a
+# typed name resolves against the current dir and picks PICK2.TXT
+# (`goedit: pick open` + the read marker). Ctrl-Shift-S then raises the
+# save-as face seeded with the open file's basename — nine backspaces clear
+# it, a fresh name goes in, and `goedit: pick save` + the saved marker land.
+# The host assert compares PICKSAVE.TXT's bytes to the PICK2.TXT seed
+# exactly: a save that did not write the loaded buffer cannot pass.
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+ed = os.path.join(share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+with open(os.path.join(ed, "PICK.TXT"), "wb") as f:
+    f.write(b"pick-me!\n")
+with open(os.path.join(ed, "PICK2.TXT"), "wb") as f:
+    f.write(b"pick-two\n")
+PY
+
+vgate_file script2-09.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/PICK.TXT
+EOF
+
+vgate_file script3-09.txt <<'EOF'
+dui close 2
+echo rx-goedit-pick-ok
+EOF
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-09.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-o,P,I,C,K,2,.,T,X,T,return,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,P,I,C,K,S,A,V,E,.,T,X,T,return' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-09.txt' \
+    --script3-after 'goedit: saved /host/EDIT/PICKSAVE.TXT' \
+    --script-expect 'rx-goedit-pick-ok' --timeout 240
+
+vgate_assert 09 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 09 serial-contains 'goedit: read /host/EDIT/PICK.TXT n=9'
+vgate_assert 09 serial-contains 'goedit: present'
+vgate_assert 09 serial-contains 'goedit: pick open /host/EDIT/PICK2.TXT'
+vgate_assert 09 serial-contains 'goedit: read /host/EDIT/PICK2.TXT n=9'
+vgate_assert 09 serial-contains 'goedit: pick save /host/EDIT/PICKSAVE.TXT'
+vgate_assert 09 serial-contains 'goedit: saved /host/EDIT/PICKSAVE.TXT n=9'
+vgate_assert 09 serial-contains 'rx-goedit-pick-ok'
+vgate_assert 09 serial-absent 'goedit: pick cancel'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
+
+vgate_assert 09 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+got = open(os.path.join(share, "EDIT", "PICKSAVE.TXT"), "rb").read()
+want = b"pick-two\n"
+if got != want:
+    print("PICKER SAVE-AS MISMATCH: got %r want %r" % (got, want))
+    raise SystemExit(1)
+print("picker save-as verified on the host: %r (%d bytes)" % (got, len(got)))
+PY

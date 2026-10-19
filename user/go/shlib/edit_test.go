@@ -46,44 +46,44 @@ func TestEditorTyping(t *testing.T) {
 func TestEditorUnicodeCursorEditsStayOnRuneBoundaries(t *testing.T) {
 	e := NewEditor("gosh> ", &History{})
 	feedE(e, "AöB")
-	if e.cur != len("AöB") {
-		t.Fatalf("initial cursor = %d, want %d", e.cur, len("AöB"))
+	if e.Caret() != len("AöB") {
+		t.Fatalf("initial cursor = %d, want %d", e.Caret(), len("AöB"))
 	}
 
 	feedE(e, "\x1b[D")
-	if e.cur != len("Aö") {
-		t.Fatalf("first left cursor = %d, want %d", e.cur, len("Aö"))
+	if e.Caret() != len("Aö") {
+		t.Fatalf("first left cursor = %d, want %d", e.Caret(), len("Aö"))
 	}
 	feedE(e, "\x1b[D")
-	if e.cur != 1 {
-		t.Fatalf("second left cursor = %d, want 1", e.cur)
+	if e.Caret() != 1 {
+		t.Fatalf("second left cursor = %d, want 1", e.Caret())
 	}
 	feedE(e, "\x1b[C")
-	if e.cur != len("Aö") {
-		t.Fatalf("right cursor = %d, want %d", e.cur, len("Aö"))
+	if e.Caret() != len("Aö") {
+		t.Fatalf("right cursor = %d, want %d", e.Caret(), len("Aö"))
 	}
 	feedE(e, "\x7f")
-	if string(e.buf) != "AB" || e.cur != 1 {
-		t.Fatalf("backspace left buf=%q cur=%d, want AB at 1", e.buf, e.cur)
+	if string(e.Bytes()) != "AB" || e.Caret() != 1 {
+		t.Fatalf("backspace left buf=%q cur=%d, want AB at 1", e.Bytes(), e.Caret())
 	}
 
 	feedE(e, "ø")
-	if string(e.buf) != "AøB" || e.cur != len("Aø") {
+	if string(e.Bytes()) != "AøB" || e.Caret() != len("Aø") {
 		t.Fatalf("Unicode insert left buf=%q cur=%d, want AøB at %d",
-			e.buf, e.cur, len("Aø"))
+			e.Bytes(), e.Caret(), len("Aø"))
 	}
 	feedE(e, "\x1b[3~")
-	if string(e.buf) != "Aø" || e.cur != len("Aø") {
+	if string(e.Bytes()) != "Aø" || e.Caret() != len("Aø") {
 		t.Fatalf("delete left buf=%q cur=%d, want Aø at %d",
-			e.buf, e.cur, len("Aø"))
+			e.Bytes(), e.Caret(), len("Aø"))
 	}
 
 	transposed := NewEditor("gosh> ", &History{})
 	feedE(transposed, "AöB")
 	feedE(transposed, "\x14")
-	if string(transposed.buf) != "ABö" || transposed.cur != len("ABö") {
+	if string(transposed.Bytes()) != "ABö" || transposed.Caret() != len("ABö") {
 		t.Fatalf("transpose left buf=%q cur=%d, want ABö at %d",
-			transposed.buf, transposed.cur, len("ABö"))
+			transposed.Bytes(), transposed.Caret(), len("ABö"))
 	}
 }
 
@@ -254,8 +254,8 @@ func TestEditorCompletion(t *testing.T) {
 		t.Fatalf("the no-candidate branch fired early")
 	}
 	out = feedE(e, "\t")
-	if string(e.buf) != "cat " || e.cur != 4 {
-		t.Fatalf("menu cycle = %q cur %d, want \"cat \" at 4", e.buf, e.cur)
+	if string(e.Bytes()) != "cat " || e.Caret() != 4 {
+		t.Fatalf("menu cycle = %q cur %d, want \"cat \" at 4", e.Bytes(), e.Caret())
 	}
 	// File candidates complete to the common prefix without a space.
 	feedE(e, "\r")
@@ -326,12 +326,12 @@ func TestEditorBurstDrain(t *testing.T) {
 func TestEditorLineCap(t *testing.T) {
 	e := NewEditor("gosh> ", &History{})
 	feedE(e, strings.Repeat("x", maxLineBytes))
-	if len(e.buf) != maxLineBytes {
-		t.Fatalf("line = %d bytes, want %d", len(e.buf), maxLineBytes)
+	if len(e.Bytes()) != maxLineBytes {
+		t.Fatalf("line = %d bytes, want %d", len(e.Bytes()), maxLineBytes)
 	}
 	out := feedE(e, "y")
-	if len(e.buf) != maxLineBytes {
-		t.Fatalf("line grew past the cap: %d bytes", len(e.buf))
+	if len(e.Bytes()) != maxLineBytes {
+		t.Fatalf("line grew past the cap: %d bytes", len(e.Bytes()))
 	}
 	if !strings.Contains(out, "\x07") {
 		t.Fatalf("overflow keystroke = %q, want a bell", out)
@@ -341,8 +341,8 @@ func TestEditorLineCap(t *testing.T) {
 	e2.Complete = func(req CompleteRequest) []string { return []string{req.Word + strings.Repeat("z", 64)} }
 	feedE(e2, strings.Repeat("q", maxLineBytes))
 	out = feedE(e2, "\t")
-	if len(e2.buf) != maxLineBytes {
-		t.Fatalf("completion grew past the cap: %d bytes", len(e2.buf))
+	if len(e2.Bytes()) != maxLineBytes {
+		t.Fatalf("completion grew past the cap: %d bytes", len(e2.Bytes()))
 	}
 	if !strings.Contains(out, "\x07") {
 		t.Fatalf("capped completion = %q, want a bell", out)
@@ -351,21 +351,20 @@ func TestEditorLineCap(t *testing.T) {
 
 func TestEditorRejectsUnicodeRuneAtomicallyAtLineCap(t *testing.T) {
 	e := NewEditor("gosh> ", &History{})
-	e.buf = []byte(strings.Repeat("x", maxLineBytes-1))
-	e.cur = len(e.buf)
+	e.SetValue(strings.Repeat("x", maxLineBytes-1))
 
 	out, _ := e.Feed([]byte{0xC3})
 	if !strings.Contains(string(out), "\x07") {
 		t.Fatalf("overflowing rune lead = %q, want a bell", out)
 	}
 	e.Feed([]byte{0xB6})
-	if len(e.buf) != maxLineBytes-1 || !utf8.Valid(e.buf) {
-		t.Fatalf("rejected rune changed line to len=%d valid=%v", len(e.buf), utf8.Valid(e.buf))
+	if len(e.Bytes()) != maxLineBytes-1 || !utf8.Valid(e.Bytes()) {
+		t.Fatalf("rejected rune changed line to len=%d valid=%v", len(e.Bytes()), utf8.Valid(e.Bytes()))
 	}
 
 	feedE(e, "y")
-	if len(e.buf) != maxLineBytes || e.buf[len(e.buf)-1] != 'y' {
-		t.Fatalf("input after rejected rune = len %d, tail %q; want ASCII y accepted", len(e.buf), e.buf[len(e.buf)-1:])
+	if len(e.Bytes()) != maxLineBytes || e.Bytes()[len(e.Bytes())-1] != 'y' {
+		t.Fatalf("input after rejected rune = len %d, tail %q; want ASCII y accepted", len(e.Bytes()), e.Bytes()[len(e.Bytes())-1:])
 	}
 }
 
@@ -400,8 +399,8 @@ func TestEditorLoneEscDoesNotEatTheNextByte(t *testing.T) {
 	if ev.Kind != evNone {
 		t.Fatalf("typing after ESC produced event %d", ev.Kind)
 	}
-	if string(e.buf) != "x" {
-		t.Fatalf("buf = %q want \"x\": the byte after a lone ESC was dropped", e.buf)
+	if string(e.Bytes()) != "x" {
+		t.Fatalf("buf = %q want \"x\": the byte after a lone ESC was dropped", e.Bytes())
 	}
 	if !strings.Contains(string(out), "x") {
 		t.Fatalf("repaint = %q, want the character painted", out)
@@ -410,8 +409,8 @@ func TestEditorLoneEscDoesNotEatTheNextByte(t *testing.T) {
 	e2 := NewEditor("gosh> ", &History{})
 	feedE(e2, "ab")
 	repaint := feedE(e2, "\x1bcd")
-	if string(e2.buf) != "abcd" {
-		t.Fatalf("buf = %q want \"abcd\"", e2.buf)
+	if string(e2.Bytes()) != "abcd" {
+		t.Fatalf("buf = %q want \"abcd\"", e2.Bytes())
 	}
 	if !strings.Contains(repaint, "abcd") {
 		t.Fatalf("repaint = %q, want abcd", repaint)
@@ -420,8 +419,8 @@ func TestEditorLoneEscDoesNotEatTheNextByte(t *testing.T) {
 	e3 := NewEditor("gosh> ", &History{})
 	feedE(e3, "ab")
 	feedE(e3, "\x1b[D")
-	if e3.cur != 1 {
-		t.Fatalf("cur = %d want 1 after ESC [ D", e3.cur)
+	if e3.Caret() != 1 {
+		t.Fatalf("cur = %d want 1 after ESC [ D", e3.Caret())
 	}
 }
 
@@ -496,8 +495,8 @@ func TestSearchPaintShowsTheMatch(t *testing.T) {
 	if !strings.Contains(out, "(reverse-i-search)`a`: alpha-three") {
 		t.Fatalf("first-byte paint = %q", out)
 	}
-	if string(e.buf) != "alpha-three" {
-		t.Fatalf("buf = %q, want the match loaded", e.buf)
+	if string(e.Bytes()) != "alpha-three" {
+		t.Fatalf("buf = %q, want the match loaded", e.Bytes())
 	}
 	out = feedE(e, "lpha")
 	if !strings.Contains(out, "(reverse-i-search)`alpha`: alpha-three") {
@@ -508,8 +507,8 @@ func TestSearchPaintShowsTheMatch(t *testing.T) {
 	if !strings.Contains(out, "(no match)") {
 		t.Fatalf("no-match paint = %q", out)
 	}
-	if string(e.buf) != "alpha-three" {
-		t.Fatalf("buf = %q, want the previous match kept", e.buf)
+	if string(e.Bytes()) != "alpha-three" {
+		t.Fatalf("buf = %q, want the previous match kept", e.Bytes())
 	}
 }
 
@@ -522,15 +521,15 @@ func TestSearchCancelRestoresTheDraft(t *testing.T) {
 		e := NewEditor("gosh> ", h)
 		feedE(e, "half-typed")
 		drainFeed(e, "\x12status")
-		if string(e.buf) != "status43" {
-			t.Fatalf("mid-search buf = %q", e.buf)
+		if string(e.Bytes()) != "status43" {
+			t.Fatalf("mid-search buf = %q", e.Bytes())
 		}
 		out := feedE(e, cancel)
 		if e.searching {
 			t.Fatalf("cancel %q left search mode on", cancel)
 		}
-		if string(e.buf) != "half-typed" || e.cur != len("half-typed") {
-			t.Fatalf("cancel %q restored %q (cur %d), want half-typed", cancel, e.buf, e.cur)
+		if string(e.Bytes()) != "half-typed" || e.Caret() != len("half-typed") {
+			t.Fatalf("cancel %q restored %q (cur %d), want half-typed", cancel, e.Bytes(), e.Caret())
 		}
 		if !strings.Contains(out, "half-typed") {
 			t.Fatalf("cancel %q paint = %q, want the draft repainted", cancel, out)
@@ -546,8 +545,8 @@ func TestSearchBackspaceTrimsTheQuery(t *testing.T) {
 	h.Push("status99")
 	e := NewEditor("gosh> ", h)
 	drainFeed(e, "\x12status")
-	if string(e.buf) != "status99" {
-		t.Fatalf("buf = %q want the newest match", e.buf)
+	if string(e.Bytes()) != "status99" {
+		t.Fatalf("buf = %q want the newest match", e.Bytes())
 	}
 	out := feedE(e, "\x7f")
 	if !strings.Contains(out, "(reverse-i-search)`statu") {
@@ -616,8 +615,8 @@ func TestSearchAcceptedLineStillSubmits(t *testing.T) {
 	e := NewEditor("gosh> ", h)
 	// Ctrl+R + query leaves the match loaded while search mode is still on.
 	drainFeed(e, "\x12echo")
-	if string(e.buf) != "echo hi" {
-		t.Fatalf("buf = %q want the match loaded mid-search", e.buf)
+	if string(e.Bytes()) != "echo hi" {
+		t.Fatalf("buf = %q want the match loaded mid-search", e.Bytes())
 	}
 	if !e.searching {
 		t.Fatal("query entry left search mode on by itself")
@@ -630,8 +629,8 @@ func TestSearchAcceptedLineStillSubmits(t *testing.T) {
 	if len(lines) != 0 {
 		t.Fatalf("accept also submitted %q", lines)
 	}
-	if string(e.buf) != "echo hi" {
-		t.Fatalf("buf = %q want the accepted recall", e.buf)
+	if string(e.Bytes()) != "echo hi" {
+		t.Fatalf("buf = %q want the accepted recall", e.Bytes())
 	}
 	if !strings.Contains(w, "gosh> ") {
 		t.Fatalf("accept paint = %q, want the prompt repainted", w)
@@ -643,8 +642,8 @@ func TestSearchAcceptedLineStillSubmits(t *testing.T) {
 	}
 	// Ground mode again: typing edits the fresh line.
 	feedE(e, "X")
-	if string(e.buf) != "X" {
-		t.Fatalf("buf = %q, want post-search typing in a fresh line", e.buf)
+	if string(e.Bytes()) != "X" {
+		t.Fatalf("buf = %q, want post-search typing in a fresh line", e.Bytes())
 	}
 }
 
@@ -657,16 +656,16 @@ func TestSearchCancelRestoresMidLineCursor(t *testing.T) {
 	e := NewEditor("gosh> ", h)
 	feedE(e, "abcdef")
 	feedE(e, "\x1b[D\x1b[D\x1b[D") // cursor between c and d
-	if e.cur != 3 {
-		t.Fatalf("setup cur = %d want 3", e.cur)
+	if e.Caret() != 3 {
+		t.Fatalf("setup cur = %d want 3", e.Caret())
 	}
 	drainFeed(e, "\x12status")
 	out := feedE(e, "\x1b")
 	if e.searching {
 		t.Fatal("cancel left search mode on")
 	}
-	if string(e.buf) != "abcdef" || e.cur != 3 {
-		t.Fatalf("cancel restored %q cur %d, want abcdef at 3", e.buf, e.cur)
+	if string(e.Bytes()) != "abcdef" || e.Caret() != 3 {
+		t.Fatalf("cancel restored %q cur %d, want abcdef at 3", e.Bytes(), e.Caret())
 	}
 	if !strings.Contains(out, "abcdef") {
 		t.Fatalf("cancel paint = %q, want the draft", out)
@@ -702,8 +701,8 @@ func TestSearchCancelMidChunkDefersRemainder(t *testing.T) {
 	if e.searching {
 		t.Fatal("cancel left search mode on")
 	}
-	if string(e.buf) != "half" {
-		t.Fatalf("buf after cancel = %q want the draft", e.buf)
+	if string(e.Bytes()) != "half" {
+		t.Fatalf("buf after cancel = %q want the draft", e.Bytes())
 	}
 	if !e.Pending() {
 		t.Fatal("cancel dropped the trailing ground bytes")
@@ -712,8 +711,8 @@ func TestSearchCancelMidChunkDefersRemainder(t *testing.T) {
 	if ev.Kind != evNone {
 		t.Fatalf("deferred typing produced event %d", ev.Kind)
 	}
-	if string(e.buf) != "halfXYZ" {
-		t.Fatalf("deferred typing = %q want halfXYZ", e.buf)
+	if string(e.Bytes()) != "halfXYZ" {
+		t.Fatalf("deferred typing = %q want halfXYZ", e.Bytes())
 	}
 }
 
@@ -732,8 +731,8 @@ func TestSearchCtrlRMidChunkDefersQuery(t *testing.T) {
 	if !e.searching {
 		t.Fatal("Ctrl+R did not enter search")
 	}
-	if string(e.buf) != "hello" {
-		t.Fatalf("buf = %q, query bytes leaked into the line", e.buf)
+	if string(e.Bytes()) != "hello" {
+		t.Fatalf("buf = %q, query bytes leaked into the line", e.Bytes())
 	}
 	if !e.Pending() {
 		t.Fatal("Ctrl+R dropped the query bytes")
@@ -742,8 +741,8 @@ func TestSearchCtrlRMidChunkDefersQuery(t *testing.T) {
 	if string(e.query) != "status" {
 		t.Fatalf("query = %q want status", e.query)
 	}
-	if string(e.buf) != "status43" {
-		t.Fatalf("buf = %q want the match loaded", e.buf)
+	if string(e.Bytes()) != "status43" {
+		t.Fatalf("buf = %q want the match loaded", e.Bytes())
 	}
 }
 
@@ -837,28 +836,28 @@ func TestEditorWordMotion(t *testing.T) {
 	feedE(e, "echo hello world")
 	feedE(e, "\x01")  // Home: start from the front
 	feedE(e, "\x1bf") // alt-f from 0: the end of "echo"
-	if e.cur != 4 {
-		t.Fatalf("alt-f cur = %d want 4", e.cur)
+	if e.Caret() != 4 {
+		t.Fatalf("alt-f cur = %d want 4", e.Caret())
 	}
 	feedE(e, "\x1bf") // from the space: the end of "hello"
-	if e.cur != 10 {
-		t.Fatalf("alt-f from whitespace cur = %d want 10", e.cur)
+	if e.Caret() != 10 {
+		t.Fatalf("alt-f from whitespace cur = %d want 10", e.Caret())
 	}
 	feedE(e, "\x1bb") // back to the start of "hello"
-	if e.cur != 5 {
-		t.Fatalf("alt-b cur = %d want 5", e.cur)
+	if e.Caret() != 5 {
+		t.Fatalf("alt-b cur = %d want 5", e.Caret())
 	}
 	feedE(e, "\x1bb") // over the space, to the start of "echo"
-	if e.cur != 0 {
-		t.Fatalf("alt-b over a space cur = %d want 0", e.cur)
+	if e.Caret() != 0 {
+		t.Fatalf("alt-b over a space cur = %d want 0", e.Caret())
 	}
 	if out := feedE(e, "\x1bb"); out != "" {
 		t.Fatalf("alt-b at the line start wrote %q, want nothing", out)
 	}
 	// Three more alt-f walk the cursor to the last byte.
 	feedE(e, "\x1bf\x1bf\x1bf")
-	if e.cur != len(e.buf) || string(e.buf) != "echo hello world" {
-		t.Fatalf("alt-f to the end = cur %d buf %q", e.cur, e.buf)
+	if e.Caret() != len(e.Bytes()) || string(e.Bytes()) != "echo hello world" {
+		t.Fatalf("alt-f to the end = cur %d buf %q", e.Caret(), e.Bytes())
 	}
 	if out := feedE(e, "\x1bf"); out != "" {
 		t.Fatalf("alt-f at the line end wrote %q, want nothing", out)
@@ -873,37 +872,37 @@ func TestEditorAltKillWords(t *testing.T) {
 	feedE(e, "echo hello world")
 	feedE(e, "\x01")         // Home: start from the front
 	out := feedE(e, "\x1bd") // alt-d at 0: kills "echo"
-	if string(e.buf) != " hello world" {
-		t.Fatalf("alt-d = %q", e.buf)
+	if string(e.Bytes()) != " hello world" {
+		t.Fatalf("alt-d = %q", e.Bytes())
 	}
 	if !strings.Contains(out, " hello world") {
 		t.Fatalf("alt-d repaint = %q", out)
 	}
 	feedE(e, "\x1bd") // from the leading space: kills " hello"
-	if string(e.buf) != " world" {
-		t.Fatalf("alt-d from whitespace = %q", e.buf)
+	if string(e.Bytes()) != " world" {
+		t.Fatalf("alt-d from whitespace = %q", e.Bytes())
 	}
 	// With nothing after the cursor, alt-d leaves the line alone.
 	feedE(e, "\x05") // Ctrl-E: to the end
 	feedE(e, "\x1bd")
-	if string(e.buf) != " world" || e.cur != 6 {
-		t.Fatalf("alt-d at the end = %q cur %d", e.buf, e.cur)
+	if string(e.Bytes()) != " world" || e.Caret() != 6 {
+		t.Fatalf("alt-d at the end = %q cur %d", e.Bytes(), e.Caret())
 	}
 	// Alt-Backspace is the same word-back kill as Ctrl-W, over ESC DEL and
 	// ESC BS alike.
 	e2 := NewEditor("gosh> ", &History{})
 	feedE(e2, "echo hello world")
 	feedE(e2, "\x1b\x7f")
-	if string(e2.buf) != "echo hello " {
-		t.Fatalf("alt-backspace = %q", e2.buf)
+	if string(e2.Bytes()) != "echo hello " {
+		t.Fatalf("alt-backspace = %q", e2.Bytes())
 	}
 	feedE(e2, "\x1b\x7f")
-	if string(e2.buf) != "echo " {
-		t.Fatalf("second alt-backspace = %q", e2.buf)
+	if string(e2.Bytes()) != "echo " {
+		t.Fatalf("second alt-backspace = %q", e2.Bytes())
 	}
 	feedE(e2, "\x1b\x08")
-	if string(e2.buf) != "" {
-		t.Fatalf("alt-backspace on ESC BS = %q", e2.buf)
+	if string(e2.Bytes()) != "" {
+		t.Fatalf("alt-backspace on ESC BS = %q", e2.Bytes())
 	}
 }
 
@@ -919,19 +918,19 @@ func TestEditorKillRingYank(t *testing.T) {
 	feedE(e, "\x17") // Ctrl-W kills "hello"
 	feedE(e, "\x01") // Home
 	feedE(e, "\x19") // Ctrl-Y, at the front of the line
-	if string(e.buf) != "helloecho " {
-		t.Fatalf("yank = %q", e.buf)
+	if string(e.Bytes()) != "helloecho " {
+		t.Fatalf("yank = %q", e.Bytes())
 	}
-	if e.cur != 5 {
-		t.Fatalf("yank left the cursor at %d want 5", e.cur)
+	if e.Caret() != 5 {
+		t.Fatalf("yank left the cursor at %d want 5", e.Caret())
 	}
 	// Ctrl-K's kill is yankable from the other end of the line.
 	e2 := NewEditor("gosh> ", &History{})
 	feedE(e2, "echo hi")
 	feedE(e2, "\x01\x0b") // Home, Ctrl-K
 	feedE(e2, "\x19")
-	if string(e2.buf) != "echo hi" {
-		t.Fatalf("ctrl-k yank = %q", e2.buf)
+	if string(e2.Bytes()) != "echo hi" {
+		t.Fatalf("ctrl-k yank = %q", e2.Bytes())
 	}
 	// The line cap still applies: a full line in the ring plus a byte on the
 	// line is one byte too many.
@@ -943,8 +942,8 @@ func TestEditorKillRingYank(t *testing.T) {
 	if !strings.Contains(out, "\x07") {
 		t.Fatalf("oversized yank = %q, want a bell", out)
 	}
-	if len(e3.buf) != 1 {
-		t.Fatalf("oversized yank grew the line to %d bytes", len(e3.buf))
+	if len(e3.Bytes()) != 1 {
+		t.Fatalf("oversized yank grew the line to %d bytes", len(e3.Bytes()))
 	}
 }
 
@@ -957,8 +956,8 @@ func TestEditorConsecutiveKillMerge(t *testing.T) {
 	feedE(e, "echo hello world")
 	feedE(e, "\x17\x17") // Ctrl-W twice: "world", then "hello "
 	feedE(e, "\x19")     // Ctrl-Y: both words, in line order
-	if string(e.buf) != "echo hello world" {
-		t.Fatalf("merged backward yank = %q", e.buf)
+	if string(e.Bytes()) != "echo hello world" {
+		t.Fatalf("merged backward yank = %q", e.Bytes())
 	}
 	// Forward kills append instead of prepending.
 	e2 := NewEditor("gosh> ", &History{})
@@ -966,8 +965,8 @@ func TestEditorConsecutiveKillMerge(t *testing.T) {
 	feedE(e2, "\x01")       // Home
 	feedE(e2, "\x1bd\x1bd") // alt-d twice
 	feedE(e2, "\x19")
-	if string(e2.buf) != "echo hello world" {
-		t.Fatalf("merged forward yank = %q", e2.buf)
+	if string(e2.Bytes()) != "echo hello world" {
+		t.Fatalf("merged forward yank = %q", e2.Bytes())
 	}
 	// A real cursor move in between breaks the chain: the ring keeps only
 	// the second kill, so the yank reads " two", not "one two".
@@ -978,8 +977,8 @@ func TestEditorConsecutiveKillMerge(t *testing.T) {
 	feedE(e3, "\x1b[C") // Right: the chain is over
 	feedE(e3, "\x1bd")  // kill "two"
 	feedE(e3, "\x19")   // Ctrl-Y
-	if string(e3.buf) != " two three" {
-		t.Fatalf("yank after a break = %q", e3.buf)
+	if string(e3.Bytes()) != " two three" {
+		t.Fatalf("yank after a break = %q", e3.Bytes())
 	}
 	// A move that cannot move is not an edit: Right at the end of the line
 	// changes nothing, so the chain survives and the third Ctrl-W merges
@@ -989,12 +988,12 @@ func TestEditorConsecutiveKillMerge(t *testing.T) {
 	feedE(e4, "\x17\x17") // Ctrl-W twice: the ring holds "hello world"
 	feedE(e4, "\x1b[C")   // Right at the end: nothing moves
 	feedE(e4, "\x17")     // Ctrl-W: merges with the two before it
-	if string(e4.buf) != "" {
-		t.Fatalf("third ctrl-w = %q", e4.buf)
+	if string(e4.Bytes()) != "" {
+		t.Fatalf("third ctrl-w = %q", e4.Bytes())
 	}
 	feedE(e4, "\x19")
-	if string(e4.buf) != "echo hello world" {
-		t.Fatalf("three-kill yank = %q", e4.buf)
+	if string(e4.Bytes()) != "echo hello world" {
+		t.Fatalf("three-kill yank = %q", e4.Bytes())
 	}
 }
 
@@ -1011,21 +1010,21 @@ func TestEditorTranspose(t *testing.T) {
 	}
 	feedE(e, "bc") // "abc", cursor at 3
 	feedE(e, "\x14")
-	if string(e.buf) != "acb" || e.cur != 3 {
-		t.Fatalf("Ctrl-T at the end = %q cur %d", e.buf, e.cur)
+	if string(e.Bytes()) != "acb" || e.Caret() != 3 {
+		t.Fatalf("Ctrl-T at the end = %q cur %d", e.Bytes(), e.Caret())
 	}
 	feedE(e, "\x01")   // Home
 	feedE(e, "\x1b[C") // Right: between "a" and "c"
 	feedE(e, "\x14")
-	if string(e.buf) != "cab" || e.cur != 2 {
-		t.Fatalf("Ctrl-T mid-line = %q cur %d", e.buf, e.cur)
+	if string(e.Bytes()) != "cab" || e.Caret() != 2 {
+		t.Fatalf("Ctrl-T mid-line = %q cur %d", e.Bytes(), e.Caret())
 	}
 	feedE(e, "\x01")
 	if out := feedE(e, "\x14"); out != "" {
 		t.Fatalf("Ctrl-T at the line start wrote %q", out)
 	}
-	if string(e.buf) != "cab" {
-		t.Fatalf("Ctrl-T at the line start changed the line to %q", e.buf)
+	if string(e.Bytes()) != "cab" {
+		t.Fatalf("Ctrl-T at the line start changed the line to %q", e.Bytes())
 	}
 }
 
@@ -1043,8 +1042,8 @@ func TestEditorAltPrefixAcrossChunks(t *testing.T) {
 	if ev.Kind != evNone {
 		t.Fatalf("ESC f produced event %d", ev.Kind)
 	}
-	if e.cur != 4 {
-		t.Fatalf("ESC f across chunks = cur %d want 4", e.cur)
+	if e.Caret() != 4 {
+		t.Fatalf("ESC f across chunks = cur %d want 4", e.Caret())
 	}
 	if !strings.Contains(string(out), "echo hello") {
 		t.Fatalf("ESC f repaint = %q", out)
@@ -1052,8 +1051,8 @@ func TestEditorAltPrefixAcrossChunks(t *testing.T) {
 	// ESC DEL across chunks is Alt-Backspace.
 	feedE(e, "\x1b")
 	feedE(e, "\x7f")
-	if string(e.buf) != " hello" {
-		t.Fatalf("ESC DEL across chunks = %q", e.buf)
+	if string(e.Bytes()) != " hello" {
+		t.Fatalf("ESC DEL across chunks = %q", e.Bytes())
 	}
 }
 
@@ -1067,8 +1066,8 @@ func TestEditorKillBytesUnchanged(t *testing.T) {
 		t.Fatalf("ctrl-k at the end = %q", out)
 	}
 	out := feedE(e, "\x17")
-	if !strings.HasSuffix(out, "    \rgosh> ") || string(e.buf) != "" || e.cur != 0 {
-		t.Fatalf("ctrl-w = %q, buf %q, cur %d", out, e.buf, e.cur)
+	if !strings.HasSuffix(out, "    \rgosh> ") || string(e.Bytes()) != "" || e.Caret() != 0 {
+		t.Fatalf("ctrl-w = %q, buf %q, cur %d", out, e.Bytes(), e.Caret())
 	}
 	if out := feedE(e, "\x15"); out != "\rgosh> \rgosh> " {
 		t.Fatalf("ctrl-u on an empty line = %q", out)
@@ -1157,13 +1156,13 @@ func TestCompletionMenuPages(t *testing.T) {
 			t.Fatalf("page 1 missing row %q in %q", row, out)
 		}
 	}
-	if string(e.buf) != "f" {
-		t.Fatalf("paging changed the line to %q", e.buf)
+	if string(e.Bytes()) != "f" {
+		t.Fatalf("paging changed the line to %q", e.Bytes())
 	}
 	// The last page pages no further: the next Tab starts cycling.
 	out = feedE(e, "\t")
-	if string(e.buf) != "f01" || e.cur != 3 {
-		t.Fatalf("cycle after the last page = %q cur %d", e.buf, e.cur)
+	if string(e.Bytes()) != "f01" || e.Caret() != 3 {
+		t.Fatalf("cycle after the last page = %q cur %d", e.Bytes(), e.Caret())
 	}
 	if strings.Contains(out, "f02") {
 		t.Fatalf("the post-page Tab painted a page again: %q", out)
@@ -1182,8 +1181,8 @@ func TestCompletionMenuCycle(t *testing.T) {
 		cur  int
 	}{{"cat ", 4}, {"cd ", 3}, {"clear ", 6}, {"cat ", 4}} {
 		feedE(e, "\t")
-		if string(e.buf) != want.line || e.cur != want.cur {
-			t.Fatalf("cycle = %q cur %d, want %q at %d", e.buf, e.cur, want.line, want.cur)
+		if string(e.Bytes()) != want.line || e.Caret() != want.cur {
+			t.Fatalf("cycle = %q cur %d, want %q at %d", e.Bytes(), e.Caret(), want.line, want.cur)
 		}
 	}
 	// A tail after the cursor is preserved: the cycle replaces the word, not
@@ -1194,8 +1193,8 @@ func TestCompletionMenuCycle(t *testing.T) {
 	feedE(e2, "\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D") // back onto the "c"
 	feedE(e2, "\t")                             // the menu
 	feedE(e2, "\t")                             // cycle
-	if string(e2.buf) != "cat  tail" || e2.cur != 4 {
-		t.Fatalf("cycle with a tail = %q cur %d", e2.buf, e2.cur)
+	if string(e2.Bytes()) != "cat  tail" || e2.Caret() != 4 {
+		t.Fatalf("cycle with a tail = %q cur %d", e2.Bytes(), e2.Caret())
 	}
 }
 
@@ -1213,8 +1212,8 @@ func TestCompletionMenuDismisses(t *testing.T) {
 	if e.menuOn {
 		t.Fatalf("a printable key did not dismiss the menu")
 	}
-	if string(e.buf) != "cx" {
-		t.Fatalf("the printable key did not insert: %q", e.buf)
+	if string(e.Bytes()) != "cx" {
+		t.Fatalf("the printable key did not insert: %q", e.Bytes())
 	}
 	if !strings.HasSuffix(out, "\rgosh> cx") {
 		t.Fatalf("dismiss + insert repaint = %q", out)
@@ -1226,8 +1225,8 @@ func TestCompletionMenuDismisses(t *testing.T) {
 	if e.menuOn {
 		t.Fatalf("Backspace did not dismiss the menu")
 	}
-	if string(e.buf) != "c" {
-		t.Fatalf("Backspace left %q, want \"c\"", e.buf)
+	if string(e.Bytes()) != "c" {
+		t.Fatalf("Backspace left %q, want \"c\"", e.Bytes())
 	}
 	// Arrows dismiss as well: the ESC of the sequence is enough.
 	feedE(e, "\t")
@@ -1248,8 +1247,8 @@ func TestCompletionMenuSingleCandidate(t *testing.T) {
 	e.Complete = menuHook
 	feedE(e, "ec")
 	out := feedE(e, "\t")
-	if string(e.buf) != "echo " || e.menuOn {
-		t.Fatalf("single candidate = %q menuOn %v", e.buf, e.menuOn)
+	if string(e.Bytes()) != "echo " || e.menuOn {
+		t.Fatalf("single candidate = %q menuOn %v", e.Bytes(), e.menuOn)
 	}
 	if !strings.HasSuffix(out, "\rgosh> echo ") {
 		t.Fatalf("single candidate repaint = %q", out)
@@ -1299,12 +1298,12 @@ func TestCompletionMenuRespectsLineCap(t *testing.T) {
 		t.Fatalf("the menu should be up")
 	}
 	feedE(e, "\t") // cycle to the first candidate: exactly the cap
-	if string(e.buf) != fits {
-		t.Fatalf("first cycle = %d bytes, want %d", len(e.buf), maxLineBytes)
+	if string(e.Bytes()) != fits {
+		t.Fatalf("first cycle = %d bytes, want %d", len(e.Bytes()), maxLineBytes)
 	}
 	out := feedE(e, "\t") // cycle to the longer one: over the cap
-	if string(e.buf) != fits {
-		t.Fatalf("the oversized cycle changed the line to %d bytes", len(e.buf))
+	if string(e.Bytes()) != fits {
+		t.Fatalf("the oversized cycle changed the line to %d bytes", len(e.Bytes()))
 	}
 	if !strings.Contains(out, "\x07") {
 		t.Fatalf("oversized cycle = %d bytes of output, want a bell", len(out))

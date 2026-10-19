@@ -255,7 +255,7 @@ func (e *Editor) paint() []byte {
 	// codes and bracket-marked spans that paint nothing (M80n #1730). A
 	// byte count here would write the wrong number of tail spaces and leave
 	// the old line's last cells on screen.
-	content := VisibleWidth(string(e.promptOut)) + VisibleWidth(string(e.buf))
+	content := VisibleWidth(string(e.promptOut)) + VisibleWidth(string(e.Bytes()))
 	tail := e.lastLen - content
 	if tail < 0 {
 		tail = 0
@@ -263,11 +263,11 @@ func (e *Editor) paint() []byte {
 	out := make([]byte, 0, content+tail+2+content)
 	out = append(out, '\r')
 	out = append(out, e.promptOut...)
-	out = append(out, e.buf...)
+	out = append(out, e.Bytes()...)
 	out = append(out, []byte(strings.Repeat(" ", tail))...)
 	out = append(out, '\r')
 	out = append(out, e.promptOut...)
-	out = append(out, e.buf[:e.cur]...)
+	out = append(out, e.Bytes()[:e.Caret()]...)
 	e.lastLen = content
 	return out
 }
@@ -313,7 +313,7 @@ func (e *Editor) Feed(chunk []byte) ([]byte, EditEvent) {
 		b := chunk[i]
 		incomplete := false
 		if e.state != edCSI {
-			if dropped, ring := e.discardOverflowingRune(b, maxLineBytes-len(e.buf)); dropped {
+			if dropped, ring := e.discardOverflowingRune(b, maxLineBytes-len(e.Bytes())); dropped {
 				if ring {
 					out = append(out, 0x07)
 				}
@@ -488,8 +488,8 @@ func (e *Editor) Pending() bool { return len(e.pending) > 0 }
 // Returns the paint for the search prompt.
 func (e *Editor) searchEnter() []byte {
 	e.breakKill()
-	e.draft = append(e.draft[:0], e.buf...)
-	e.draftCur = e.cur
+	e.draft = append(e.draft[:0], e.Bytes()...)
+	e.draftCur = e.Caret()
 	e.searching = true
 	e.query = e.query[:0]
 	return e.searchPaint()
@@ -506,8 +506,7 @@ func (e *Editor) searchPaint() []byte {
 	out := []byte("\r\n(reverse-i-search)`" + shown + "`: ")
 	if m, ok := e.searchMatch(string(e.query)); ok {
 		out = append(out, m...)
-		e.buf = append(e.buf[:0], m...)
-		e.cur = len(e.buf)
+		e.SetValue(string(m))
 	} else {
 		out = append(out, "(no match)"...)
 	}
@@ -577,8 +576,8 @@ func (e *Editor) searchExit(accept bool) []byte {
 	e.breakKill()
 	e.searching = false
 	if !accept {
-		e.buf = append(e.buf[:0], e.draft...)
-		e.cur = e.draftCur
+		e.SetValue(string(e.draft))
+		e.SetCaret(e.draftCur)
 	}
 	e.lastLen = 0
 	return append([]byte("\r\n"), e.paint()...)
@@ -599,7 +598,7 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 		return nil, EditEvent{}
 	case '\r', '\n':
 		e.breakKill()
-		line := string(e.buf)
+		line := string(e.Bytes())
 		// M98c (#2129): history expansion lives here — inside the Editor,
 		// before Push — so only typed interactive lines expand and both
 		// front-ends inherit it. On a change the expanded line is echoed,
@@ -618,16 +617,14 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 			line = expanded
 			out := append([]byte("\r\n"), expanded...)
 			out = append(out, '\r', '\n')
-			e.buf = e.buf[:0]
-			e.cur = 0
+			e.Clear()
 			e.hview = -1
 			e.lastLen = 0
 			e.hist.Push(line)
 			return out, EditEvent{Kind: EvSubmit, Line: line}
 		}
 		out := []byte("\r\n")
-		e.buf = e.buf[:0]
-		e.cur = 0
+		e.Clear()
 		e.hview = -1
 		e.lastLen = 0
 		e.hist.Push(line)
@@ -650,9 +647,9 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 		e.cx = true
 		return nil, EditEvent{}
 	case 0x0b: // Ctrl-K: kill to end
-		return e.killRegion(e.cur, len(e.buf), killForward)
+		return e.killRegion(e.Caret(), len(e.Bytes()), killForward)
 	case 0x15: // Ctrl-U: kill to start
-		return e.killRegion(0, e.cur, killBackward)
+		return e.killRegion(0, e.Caret(), killBackward)
 	case 0x17: // Ctrl-W: kill the word before the cursor
 		return e.keyKillWordBack()
 	case 0x19: // Ctrl-Y: yank the last kill back onto the line
@@ -665,15 +662,14 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 		return e.searchEnter(), EditEvent{}
 	case 0x03: // Ctrl-C: abandon the line
 		e.breakKill()
-		e.buf = e.buf[:0]
-		e.cur = 0
+		e.Clear()
 		e.hview = -1
 		e.lastLen = 0
 		e.RefreshPrompt()
 		out := append([]byte("^C\r\n"), e.paint()...)
 		return out, EditEvent{Kind: EvCancel}
 	case 0x04: // Ctrl-D on an empty line: EOF
-		if len(e.buf) == 0 {
+		if len(e.Bytes()) == 0 {
 			return nil, EditEvent{Kind: EvEOF}
 		}
 		return nil, EditEvent{}
@@ -683,52 +679,49 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 	if b < 0x20 {
 		return nil, EditEvent{} // other control bytes are not text
 	}
-	if len(e.buf) >= maxLineBytes {
+	if len(e.Bytes()) >= maxLineBytes {
 		return []byte{0x07}, EditEvent{} // line full: bell, no insert
 	}
 	// Printable: insert at the cursor.
 	e.breakKill()
-	e.buf = append(e.buf, 0)
-	copy(e.buf[e.cur+1:], e.buf[e.cur:])
-	e.buf[e.cur] = b
-	e.cur++
+	e.InsertByte(b)
 	return e.paint(), EditEvent{}
 }
 
 func (e *Editor) keyBackspace() ([]byte, EditEvent) {
-	if e.cur == 0 {
+	if e.Caret() == 0 {
 		return nil, EditEvent{}
 	}
 	e.breakKill()
-	start := previousRuneBoundary(e.buf, e.cur)
-	e.buf = append(e.buf[:start], e.buf[e.cur:]...)
-	e.cur = start
+	start := previousRuneBoundary(e.Bytes(), e.Caret())
+	e.Replace(start, e.Caret(), nil)
+	e.SetCaret(start)
 	return e.paint(), EditEvent{}
 }
 
 func (e *Editor) keyDelete() ([]byte, EditEvent) {
-	if e.cur < len(e.buf) {
+	if e.Caret() < len(e.Bytes()) {
 		e.breakKill()
-		end := nextRuneBoundary(e.buf, e.cur)
-		e.buf = append(e.buf[:e.cur], e.buf[end:]...)
+		end := nextRuneBoundary(e.Bytes(), e.Caret())
+		e.Replace(e.Caret(), end, nil)
 		return e.paint(), EditEvent{}
 	}
 	return nil, EditEvent{}
 }
 
 func (e *Editor) keyLeft() ([]byte, EditEvent) {
-	if e.cur > 0 {
+	if e.Caret() > 0 {
 		e.breakKill()
-		e.cur = previousRuneBoundary(e.buf, e.cur)
+		e.SetCaret(previousRuneBoundary(e.Bytes(), e.Caret()))
 		return e.paint(), EditEvent{}
 	}
 	return nil, EditEvent{}
 }
 
 func (e *Editor) keyRight() ([]byte, EditEvent) {
-	if e.cur < len(e.buf) {
+	if e.Caret() < len(e.Bytes()) {
 		e.breakKill()
-		e.cur = nextRuneBoundary(e.buf, e.cur)
+		e.SetCaret(nextRuneBoundary(e.Bytes(), e.Caret()))
 		return e.paint(), EditEvent{}
 	}
 	return nil, EditEvent{}
@@ -736,13 +729,13 @@ func (e *Editor) keyRight() ([]byte, EditEvent) {
 
 func (e *Editor) keyHome() ([]byte, EditEvent) {
 	e.breakKill()
-	e.cur = 0
+	e.SetCaret(0)
 	return e.paint(), EditEvent{}
 }
 
 func (e *Editor) keyEnd() ([]byte, EditEvent) {
 	e.breakKill()
-	e.cur = len(e.buf)
+	e.End()
 	return e.paint(), EditEvent{}
 }
 
@@ -759,8 +752,7 @@ func (e *Editor) histPrev() ([]byte, EditEvent) {
 		e.hview--
 	}
 	e.breakKill()
-	e.buf = append(e.buf[:0], e.hist.entries[e.hview]...)
-	e.cur = len(e.buf)
+	e.SetValue(string(e.hist.entries[e.hview]))
 	return e.paint(), EditEvent{}
 }
 
@@ -771,12 +763,10 @@ func (e *Editor) histNext() ([]byte, EditEvent) {
 	e.breakKill()
 	if e.hview < len(e.hist.entries)-1 {
 		e.hview++
-		e.buf = append(e.buf[:0], e.hist.entries[e.hview]...)
-		e.cur = len(e.buf)
+		e.SetValue(string(e.hist.entries[e.hview]))
 	} else {
 		e.hview = -1
-		e.buf = e.buf[:0]
-		e.cur = 0
+		e.Clear()
 	}
 	return e.paint(), EditEvent{}
 }
@@ -800,15 +790,15 @@ func (e *Editor) keyTab() ([]byte, EditEvent) {
 		}
 		return e.menuCycle()
 	}
-	start := e.cur
-	for start > 0 && e.buf[start-1] != ' ' {
+	start := e.Caret()
+	for start > 0 && e.Bytes()[start-1] != ' ' {
 		start--
 	}
-	word := string(e.buf[start:e.cur])
-	cmd, argIndex := stageCtx(string(e.buf), start)
+	word := string(e.Bytes()[start:e.Caret()])
+	cmd, argIndex := stageCtx(string(e.Bytes()), start)
 	cands := e.Complete(CompleteRequest{
-		Line:      string(e.buf),
-		Cursor:    e.cur,
+		Line:      string(e.Bytes()),
+		Cursor:    e.Caret(),
 		WordStart: start,
 		Word:      word,
 		ArgIndex:  argIndex,
@@ -847,9 +837,8 @@ func (e *Editor) keyTab() ([]byte, EditEvent) {
 // own output.
 func (e *Editor) keyEditLine() ([]byte, EditEvent) {
 	e.breakKill()
-	line := string(e.buf)
-	e.buf = e.buf[:0]
-	e.cur = 0
+	line := string(e.Bytes())
+	e.Clear()
 	e.hview = -1
 	e.lastLen = 0
 	return []byte("\r\n"), EditEvent{Kind: EvEdit, Line: line}
@@ -858,12 +847,13 @@ func (e *Editor) keyEditLine() ([]byte, EditEvent) {
 // ins inserts ins at the cursor unless that would pass the line cap, in
 // which case it answers with a bell and leaves the line alone.
 func (e *Editor) ins(ins []byte) ([]byte, EditEvent) {
-	if len(e.buf)+len(ins) > maxLineBytes {
+	if len(e.Bytes())+len(ins) > maxLineBytes {
 		return []byte{0x07}, EditEvent{}
 	}
 	e.breakKill()
-	e.buf = insertAt(e.buf, e.cur, ins)
-	e.cur += len(ins)
+	c := e.Caret()
+	e.Replace(c, c, ins)
+	e.SetCaret(c + len(ins))
 	return e.paint(), EditEvent{}
 }
 
@@ -920,16 +910,16 @@ const (
 // The end of the line is the floor.
 func (e *Editor) wordForward(i int) int {
 	j := i
-	for j < len(e.buf) && e.buf[j] != ' ' {
+	for j < len(e.Bytes()) && e.Bytes()[j] != ' ' {
 		j++
 	}
 	if j > i {
 		return j // inside a word: stop at its end
 	}
-	for j < len(e.buf) && e.buf[j] == ' ' {
+	for j < len(e.Bytes()) && e.Bytes()[j] == ' ' {
 		j++
 	}
-	for j < len(e.buf) && e.buf[j] != ' ' {
+	for j < len(e.Bytes()) && e.Bytes()[j] != ' ' {
 		j++
 	}
 	return j
@@ -939,16 +929,16 @@ func (e *Editor) wordForward(i int) int {
 // cursor, or -- on spaces -- the start of the previous word.
 func (e *Editor) wordBackward(i int) int {
 	j := i
-	if j > 0 && e.buf[j-1] == ' ' {
-		for j > 0 && e.buf[j-1] == ' ' {
+	if j > 0 && e.Bytes()[j-1] == ' ' {
+		for j > 0 && e.Bytes()[j-1] == ' ' {
 			j--
 		}
-		for j > 0 && e.buf[j-1] != ' ' {
+		for j > 0 && e.Bytes()[j-1] != ' ' {
 			j--
 		}
 		return j
 	}
-	for j > 0 && e.buf[j-1] != ' ' {
+	for j > 0 && e.Bytes()[j-1] != ' ' {
 		j--
 	}
 	return j
@@ -957,22 +947,22 @@ func (e *Editor) wordBackward(i int) int {
 // keyWordForward/keyWordBackward are alt-f and alt-b. At a line edge they
 // write nothing at all, the same silence keyLeft and keyRight keep.
 func (e *Editor) keyWordForward() ([]byte, EditEvent) {
-	j := e.wordForward(e.cur)
-	if j == e.cur {
+	j := e.wordForward(e.Caret())
+	if j == e.Caret() {
 		return nil, EditEvent{}
 	}
 	e.breakKill()
-	e.cur = j
+	e.SetCaret(j)
 	return e.paint(), EditEvent{}
 }
 
 func (e *Editor) keyWordBackward() ([]byte, EditEvent) {
-	j := e.wordBackward(e.cur)
-	if j == e.cur {
+	j := e.wordBackward(e.Caret())
+	if j == e.Caret() {
 		return nil, EditEvent{}
 	}
 	e.breakKill()
-	e.cur = j
+	e.SetCaret(j)
 	return e.paint(), EditEvent{}
 }
 
@@ -991,14 +981,14 @@ func (e *Editor) killRegion(lo, hi, dir int) ([]byte, EditEvent) {
 	if lo < 0 {
 		lo = 0
 	}
-	if hi > len(e.buf) {
-		hi = len(e.buf)
+	if hi > len(e.Bytes()) {
+		hi = len(e.Bytes())
 	}
 	if lo >= hi {
 		return e.paint(), EditEvent{}
 	}
-	killed := append([]byte(nil), e.buf[lo:hi]...)
-	if e.killDir == dir && e.cur == e.killLo {
+	killed := append([]byte(nil), e.Bytes()[lo:hi]...)
+	if e.killDir == dir && e.Caret() == e.killLo {
 		if dir == killBackward {
 			e.kill = append(killed, e.kill...)
 		} else {
@@ -1008,8 +998,8 @@ func (e *Editor) killRegion(lo, hi, dir int) ([]byte, EditEvent) {
 		e.kill = killed
 	}
 	e.killLo, e.killHi, e.killDir = lo, hi, dir
-	e.buf = append(e.buf[:lo], e.buf[hi:]...)
-	e.cur = lo
+	e.Replace(lo, hi, nil)
+	e.SetCaret(lo)
 	return e.paint(), EditEvent{}
 }
 
@@ -1017,21 +1007,21 @@ func (e *Editor) killRegion(lo, hi, dir int) ([]byte, EditEvent) {
 // the word in front of them. Ctrl-W's byte behaviour is unchanged -- it is the
 // same code as before this card, plus the ring.
 func (e *Editor) keyKillWordBack() ([]byte, EditEvent) {
-	j := e.cur
-	for j > 0 && e.buf[j-1] == ' ' {
+	j := e.Caret()
+	for j > 0 && e.Bytes()[j-1] == ' ' {
 		j--
 	}
-	for j > 0 && e.buf[j-1] != ' ' {
+	for j > 0 && e.Bytes()[j-1] != ' ' {
 		j--
 	}
-	return e.killRegion(j, e.cur, killBackward)
+	return e.killRegion(j, e.Caret(), killBackward)
 }
 
 // keyKillWordForward is alt-d: kill to the end of the word under the cursor,
 // or -- from whitespace -- through the end of the next word, so two alt-d
 // presses on "foo bar" leave nothing behind.
 func (e *Editor) keyKillWordForward() ([]byte, EditEvent) {
-	return e.killRegion(e.cur, e.wordForward(e.cur), killForward)
+	return e.killRegion(e.Caret(), e.wordForward(e.Caret()), killForward)
 }
 
 // keyYank is Ctrl-Y: insert the last kill at the cursor. An empty ring is a
@@ -1048,30 +1038,30 @@ func (e *Editor) keyYank() ([]byte, EditEvent) {
 // end of the line that is the last two characters; in the middle it is the
 // pair the cursor sits between, and the cursor follows them right.
 func (e *Editor) keyTranspose() ([]byte, EditEvent) {
-	if len(e.buf) < 2 {
+	if len(e.Bytes()) < 2 {
 		return nil, EditEvent{}
 	}
-	if e.cur == 0 {
+	if e.Caret() == 0 {
 		return nil, EditEvent{}
 	}
-	start, middle, end := 0, e.cur, e.cur
-	if e.cur >= len(e.buf) {
-		end = len(e.buf)
-		middle = previousRuneBoundary(e.buf, end)
-		start = previousRuneBoundary(e.buf, middle)
+	start, middle, end := 0, e.Caret(), e.Caret()
+	if e.Caret() >= len(e.Bytes()) {
+		end = len(e.Bytes())
+		middle = previousRuneBoundary(e.Bytes(), end)
+		start = previousRuneBoundary(e.Bytes(), middle)
 	} else {
-		start = previousRuneBoundary(e.buf, middle)
-		end = nextRuneBoundary(e.buf, middle)
+		start = previousRuneBoundary(e.Bytes(), middle)
+		end = nextRuneBoundary(e.Bytes(), middle)
 	}
 	if start == middle || middle == end {
 		return nil, EditEvent{}
 	}
 	leftLen, rightLen := middle-start, end-middle
 	var pair [8]byte // two UTF-8 scalars need at most eight bytes
-	copy(pair[:rightLen], e.buf[middle:end])
-	copy(pair[rightLen:rightLen+leftLen], e.buf[start:middle])
-	copy(e.buf[start:end], pair[:leftLen+rightLen])
-	e.cur = end
+	copy(pair[:rightLen], e.Bytes()[middle:end])
+	copy(pair[rightLen:rightLen+leftLen], e.Bytes()[start:middle])
+	e.Replace(start, end, pair[:leftLen+rightLen])
+	e.SetCaret(end)
 	e.breakKill()
 	return e.paint(), EditEvent{}
 }
@@ -1156,14 +1146,13 @@ func (e *Editor) menuCycle() ([]byte, EditEvent) {
 	}
 	e.menuAt = (e.menuAt + 1) % len(e.menu)
 	cand := e.menu[e.menuAt]
-	tail := append([]byte(nil), e.buf[e.cur:]...)
+	tail := append([]byte(nil), e.Bytes()[e.Caret():]...)
 	if e.menuStart+len(cand)+len(tail) > maxLineBytes {
 		return []byte{0x07}, EditEvent{} // would pass the line cap: bell, no change
 	}
 	e.breakKill()
-	e.buf = append(e.buf[:e.menuStart], cand...)
-	e.buf = append(e.buf, tail...)
-	e.cur = e.menuStart + len(cand)
+	e.Replace(e.menuStart, len(e.Bytes()), append(append([]byte(nil), cand...), tail...))
+	e.SetCaret(e.menuStart + len(cand))
 	return e.paint(), EditEvent{}
 }
 

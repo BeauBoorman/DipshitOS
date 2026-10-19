@@ -111,6 +111,10 @@ func (a *app) submitURL() {
 }
 
 func (a *app) keyEvent(ev vi.Event) {
+	if a.pick.open { // M124b: the modal owns every key — Ctrl+L included
+		a.pickKey(ev)
+		return
+	}
 	if ev.Flags&vi.ModCtrl != 0 && ev.Arg0 == 0x0f { // focused WEB owns Ctrl+L
 		a.focusURL()
 		return

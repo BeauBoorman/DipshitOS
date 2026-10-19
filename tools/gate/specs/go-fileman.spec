@@ -64,7 +64,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588: GOFILES navigates, previews, renames, trashes, restores, opens files, and resumes its session"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, and resumes its session"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -124,6 +124,11 @@ EOF
 vgate_file script17.txt <<'EOF'
 dui close 2
 echo rx-go-fileman-lease-ok
+EOF
+
+vgate_file script18.txt <<'EOF'
+exec GOFILES.ELF pick /host/FM8
+echo rx-go-fileman-pick-ok
 EOF
 
 vgate_file script11.txt <<'EOF'
@@ -222,6 +227,13 @@ os.makedirs(fm6, exist_ok=True)
 note6 = os.path.join(fm6, "NOTE.TXT")
 with open(note6, "w") as f:
     f.write("leased-file-body\nsecond line\n")
+# M124b (#2581): run 09's pick-mode directory — one file so the typed-name
+# pick is unambiguous (the multi-byte arrow path stays unreliable on the tty,
+# so the leg types the name into the picker's path field instead).
+fm8 = os.path.join(share, "FM8")
+os.makedirs(fm8, exist_ok=True)
+with open(os.path.join(fm8, "PICKME.TXT"), "w") as f:
+    f.write("pick-me-please\n")
 # M125c (#2588): runs 07/08 — the session save/restore leg. FM7 holds one
 # subdirectory to descend into (SUB7, two files so `j` provably moves the
 # cursor onto DEEP2.TXT) plus a top-level file. The leg rides the Go seat,
@@ -793,3 +805,31 @@ vgate_assert 08 serial-absent 'gotabwm: state drop'
 vgate_assert 08 serial-contains 'rx-go-fileman-state-restore-ok'
 vgate_assert 08 serial-absent '[EXC] parking:'
 vgate_assert 08 serial-absent 'exited status=139'
+
+# M124b (#2581) adds run 09: the pick mode — `exec GOFILES.ELF pick /host/FM8`
+# runs the shared appkit.FilePicker over the bound tty instead of the
+# file-manager model. Typed runes land in the picker's path field (the only
+# single-byte-input leg the tty transport keeps honest — there is no `j`
+# here, the field IS the move); Return resolves the name against the
+# picker's cwd, the picked path prints as the serial receipt the invoker
+# reads, and the app exits through the same shutdown as the manager.
+vgate_run 09 -- \
+    --screen '$RUN_DIR/fileman-pick-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script18.txt' \
+    --input-chords 'P,I,C,K,M,E,.,T,X,T,return' \
+    --input-chords-after 'gofiles: pick mode ' \
+    --script-expect 'rx-go-fileman-pick-ok' --timeout 240
+
+vgate_assert 09 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 09 serial-contains 'gofiles: attached'
+vgate_assert 09 serial-contains 'gofiles: pick mode /host/FM8'
+vgate_assert 09 serial-contains 'gofiles: repainted'
+vgate_assert 09 serial-contains 'gofiles: picked /host/FM8/PICKME.TXT'
+vgate_assert 09 serial-contains 'gofiles: close'
+vgate_assert 09 serial-contains 'gofiles OK'
+vgate_assert 09 serial-contains 'rx-go-fileman-pick-ok'
+vgate_assert 09 serial-absent 'gofiles: pick cancel'
+vgate_assert 09 serial-absent 'gofiles: list error'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'

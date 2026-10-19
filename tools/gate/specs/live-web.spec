@@ -2277,3 +2277,35 @@ assert any("WEB-DL-DLPIC.QOI" in r for r in rows), "no ledger row for the downlo
 print("live-web 44 download ok (start->progress->done->toast->open ordering, "
       "share file %dB, ledger row)" % size)
 PY
+
+# --- boot 45: M124b (#2581) save-as through appkit.FilePicker -------------
+# Ctrl-Shift-S raises the shared picker seeded with the download name
+# (PAGE.HTML — nine runes, nine backspaces to clear); a fresh name resolves
+# against the picker's cwd (/host) and the picked path runs the same
+# write+ledger leg as the fixed download, printing both markers. The host
+# assert compares WEBSAVE.HTML to the PAGE.HTML fixture byte-for-byte.
+vgate_run 45 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-45' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,W,E,B,S,A,V,E,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --snapshot-after 'web: save /host/WEBSAVE.HTML' \
+    --script-expect 'web: save /host/WEBSAVE.HTML' --timeout 240
+
+vgate_assert 45 serial-absent 'web: budget over'
+vgate_assert 45 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 45 serial-contains 'web: download /host/WEBSAVE.HTML '
+vgate_assert 45 serial-contains 'web: save /host/WEBSAVE.HTML'
+vgate_assert 45 serial-absent 'web: save cancel'
+vgate_assert 45 serial-absent 'web: error'
+vgate_assert 45 serial-absent '[EXC] parking:'
+vgate_assert 45 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+got = open(os.path.join(share, "WEBSAVE.HTML"), "rb").read()
+want = open(os.path.join(share, "PAGE.HTML"), "rb").read()
+if got != want:
+    print("SAVE-AS MISMATCH: %d bytes, want the PAGE.HTML body (%d bytes)" % (len(got), len(want)))
+    raise SystemExit(1)
+print("save-as verified on the host: WEBSAVE.HTML == PAGE.HTML (%d bytes)" % len(got))
+PY

@@ -138,9 +138,24 @@ func leaseFixture(target string) {
 }
 
 func main() {
-	for _, a := range vi.Args() {
+	// M124b (#2581): `pick [dir]` runs the shared appkit.FilePicker over
+	// the bound tty instead of the file-manager model — GOFILES's pick
+	// mode IS appkit.FilePicker, rendered ANSI.
+	pickOn := false
+	pickArg := ""
+	for i, a := range vi.Args() {
 		if strings.HasPrefix(a, "--lease-fixture=") {
 			leaseFixture(strings.TrimPrefix(a, "--lease-fixture="))
+		}
+		if i == 0 {
+			continue
+		}
+		if a == "pick" || a == "--pick" {
+			pickOn = true
+			continue
+		}
+		if pickOn && pickArg == "" && strings.HasPrefix(a, "/host") {
+			pickArg = a
 		}
 	}
 	// M125c (#2588): the state hooks. SaveState reads the live model (the
@@ -208,6 +223,13 @@ func main() {
 	}
 
 	cols, rows := gridOf(ta.W, ta.H)
+	if pickOn {
+		start := pickArg
+		if start == "" {
+			start = startPath()
+		}
+		pickMain(fd, ta, start, cols, rows)
+	}
 	// M125c (#2588): a re-exec'd or reopened tab may have delivered a
 	// stored blob. The envelope's appver is the app's own stale check —
 	// a blob saved under a different format version is refused by name,
