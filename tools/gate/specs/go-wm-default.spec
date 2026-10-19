@@ -870,12 +870,33 @@ print("the restore request is a ONE-SHOT: consumed by the boot 09 refusal, "
       "and boot 09 armed nothing, so it is gone from the share")
 PY
 
+# Between-run pin for boot 10 (M120b #2559): the session file a boot
+# restores is LIVE now — every backed row re-execs — so the file is staged
+# deterministically here rather than inherited from whichever write the
+# earlier boots happened to leave. One Calc row, the same `.tabs` v2
+# encoding live-vz-restore's fixture writes: the boot's `session load`
+# marker still fires, the starter stays suppressed, and the re-exec itself
+# provides the subscribed calculator the proof needs — a scripted second
+# exec would double it (gocalc: open id= is asserted exactly once).
+vgate_assert 09 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+session = (bytes([2, 1, 1, 0, 0, 0]) +
+           b"Calc".ljust(32, b"\0") + bytes([0]) + bytes(12) +
+           b"GOCALC.ELF".ljust(24, b"\0"))
+with open(os.path.join(share, "SESSION.TABS"), "wb") as f:
+    f.write(session)
+print("between-run pin: SESSION.TABS = one backed Calc row for boot 10 "
+      "(restored session -> live re-exec, not a scripted duplicate)")
+PY
+
 # --- M82b (#1769): settings broadcast reaches a live second app -------------
-# Boot 01's hosted app already persisted a session, so the rebooted default
-# seat does not auto-open the first-boot GOSH workspace. Boot 10 therefore has
-# exactly the two apps this proof needs: GOSET writes theme=light while GOCALC
-# remains live and subscribed to theme. SETTINGS.TXT is still the persistent
-# source of truth; the WM_RPC notice only names the changed key.
+# A persisted session means the rebooted default seat does not auto-open the
+# first-boot GOSH workspace — and under M120b the restore's own re-exec is
+# what puts GOCALC on the strip, subscribed to theme. GOSET is the second
+# app, scripted as before: it writes theme=light while GOCALC remains live.
+# SETTINGS.TXT is still the persistent source of truth; the WM_RPC notice
+# only names the changed key.
 vgate_file script-10.txt <<'EOF'
 settings set wm gotabwm
 settings set keyboard_layout us
@@ -885,7 +906,6 @@ EOF
 
 vgate_file script-10-seat.txt <<'EOF'
 dui focus 0
-exec GOCALC.ELF
 EOF
 
 vgate_file script-10-publish.txt <<'EOF'
@@ -909,7 +929,10 @@ vgate_assert 10 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
 vgate_assert 10 serial-contains 'gotabwm: settings wm=gotabwm'
 vgate_assert 10 serial-contains 'gotabwm: session load n='
 vgate_assert 10 serial-absent 'gotabwm: first-boot workspace'
-vgate_assert 10 serial-contains 'exec: loaded GOCALC.ELF'
+# The restore's re-exec, not a monitor exec, is what loads GOCALC now
+# (M120b): the kernel's `exec: loaded` marker belongs to scripted execs,
+# while the seat names every bin it fans back out.
+vgate_assert 10 serial-contains 'gotabwm: session exec GOCALC.ELF'
 vgate_assert 10 serial-contains 'gocalc: settings subscribed key=theme'
 vgate_assert 10 serial-contains 'exec: loaded GOSET.ELF'
 vgate_assert 10 serial-contains 'goset: set theme=light'
@@ -1338,15 +1361,25 @@ runpy.run_path("tests/fixtures/desktop/m91/menu.py")["check"](
 PY
 
 # Relaunch on the SAME share, without touching the receipt or changing wm.
-# Restored tabs are honest placeholders, not restarted programs (M79g).
-# Launch a real Terminal to read the receipt, then pointer-launch Code Editor,
-# type/save actual text, and switch focus back to Terminal by the rail chord.
+# Restored tabs re-exec their recorded bins now (M120b #2559): boot 19's
+# [Sh, Term] file drops the unbacked Sh row and spawns a real GOTERM.ELF
+# into rail cell 1 — so NO scripted Terminal runs at all (the re-exec'd
+# one reads the receipt), and the focus-back chord is ctrl-1, not the old
+# placeholder-strip ctrl-3. A scripted second term also costs a task-pool
+# slot the boot cannot spare: observed r20 — seat + restored Term +
+# scripted Term left GOEDIT's runtime unable to make an M
+# (`newosproc: sys_thread create failed`, no `goedit: present`).
+# The editor is opened by CLICKING its launcher row, not by filtering:
+# script2 feeds the kernel monitor (observed r20: `unknown command
+# 'goedit'` — filter text is HID input, and every HID channel this boot
+# already owns is spoken for), and the stray 800,400 release was harmless
+# only while dead placeholder rows sat under it — on a live strip it is a
+# real press that rips keyboard focus off the launcher sink. GOEDIT sits
+# at catalog row 2 of this fixture's 18-row APPS.TXT (0=GOCALC, 1=NOTE):
+# the 264px panel paints rows at x=8..253, y=140+i*24 — a down at
+# (120,199) lands inside row 2's rect (y=188..209).
 vgate_file script-m91-relaunch.txt <<'EOF'
 set GOMAXPROCS=1
-exec GOTERM.ELF
-EOF
-vgate_file script-20-filter.txt <<'EOF'
-goedit
 EOF
 
 vgate_run 20 -- \
@@ -1355,11 +1388,9 @@ vgate_run 20 -- \
     --script-after 'gotabwm: present' \
     --input-string $'cat /host/M91-1925.RECEIPT\n' \
     --input-string-after 'goterm: prompt' \
-    --pointer-virtio '272,702,d;272,702,u;960,10;800,400,u' \
+    --pointer-virtio '272,702,d;272,702,u;120,199,d;120,199,u' \
     --pointer-virtio-after 'goterm: done status=0' \
-    --script2 '$RUN_DIR/script-20-filter.txt' \
-    --script2-after 'gotabwm: launcher presented' --script2-delay 1 \
-    --input-chords 'w,o,r,k,e,d,return,ctrl-s,ctrl-3' \
+    --input-chords 'w,o,r,k,e,d,return,ctrl-s,ctrl-1' \
     --input-chords-after 'goedit: present' \
     --script-expect 'gotabwm: alt-tab id=' --script-expect-tail 4 --timeout 180
 vgate_assert 20 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
@@ -1381,8 +1412,12 @@ assert got == (fixture / "receipt.expected").read_bytes(), "receipt changed acro
 edited = (share / "EDIT/SEED.TXT").read_bytes()
 assert edited == (fixture / "editor.expected").read_bytes(), edited
 s = pathlib.Path(os.environ["VG_SER"]).read_text(errors="replace")
-term = re.search(r"goterm: open id=(\d+)", s)
-assert term and "gotabwm: alt-tab id=" + term[1] in s, "focus did not return to real Terminal"
+terms = re.findall(r"goterm: open id=(\d+)", s)
+# M120b (#2559): the session re-execs boot 19's Term row AND the script
+# execs another, so either of the two Terminal windows is a legal focus
+# target for the final chord.
+assert terms and any(("gotabwm: alt-tab id=" + t) in s for t in terms), \
+    "focus did not return to a real Terminal"
 assert s.index("goedit: dirty") < s.index("goedit: saved") < s.index("gotabwm: alt-tab id=")
 out = pathlib.Path("artifacts/m91-workflow")
 suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")

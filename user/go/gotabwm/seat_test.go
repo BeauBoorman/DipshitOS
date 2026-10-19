@@ -111,8 +111,10 @@ func TestIdleInvalidSettingFallsBackToFiveMinutes(t *testing.T) {
 
 func TestRestoreWitnessCapturesResumedSeatState(t *testing.T) {
 	oldTabs, oldTheme, oldWM := tabs, theme.Current, restoreSettingsWM
+	oldEcho := sessionEcho
 	defer func() {
 		tabs, theme.Current, restoreSettingsWM = oldTabs, oldTheme, oldWM
+		sessionEcho = oldEcho
 	}()
 	tabs = TabStrip{}
 	if !tabs.OpenTab(sessionIDBase, "Notes") || !tabs.OpenTab(sessionIDBase+1, "Calc") {
@@ -122,6 +124,9 @@ func TestRestoreWitnessCapturesResumedSeatState(t *testing.T) {
 		t.Fatal("focus restored active tab")
 	}
 	tabs.tabs[0].Pinned = true
+	// M120b (#2559): the witness reports the session FILE's echo, captured
+	// at load — not the live strip, which the re-exec fan-out now mutates.
+	sessionEcho = sessionTitlesLine(&tabs)
 	restoreSettingsWM = "gotabwm"
 	if !theme.Set("light") {
 		t.Fatal("select light theme")

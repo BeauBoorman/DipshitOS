@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"virelai/vi"
@@ -66,32 +68,47 @@ func TestRestoreSessionBranchesAndFirstBootWorkspace(t *testing.T) {
 // and interop.go use for execApp / closeWin.
 
 type sessionWriteLog struct {
-	writes [][]byte
+	writes [][]byte // SESSION.TABS publishes
+	layout [][]byte // LAYOUT.txt publishes (finishReexec / split dumps)
 	fail   bool
 }
 
 // install swaps the write seam and the close/focus WM seams, and restores
-// every global it touched (tabs, the seq counter, the dirty latch) on
-// cleanup: these tests share package state with the rest of the package.
+// every global it touched (tabs, the seq counter, the dirty latch, the
+// M120b re-exec state) on cleanup: these tests share package state with the
+// rest of the package.
 func (l *sessionWriteLog) install(t *testing.T) {
 	t.Helper()
 	savedWrite, savedTabs := writeHostFile, tabs
 	savedSeq, savedDirty := sessionSeq, sessionDirty
 	savedClose, savedRaise := closeWin, focusRaise
 	savedHosted := hostedApp
+	savedPending, savedN, savedHold := reexecPending, reexecN, reexecHold
+	savedArmed, savedEcho := reexecSettleArmed, sessionEcho
+	savedRead := readSessionFile
 	t.Cleanup(func() {
 		writeHostFile, tabs, sessionSeq, sessionDirty = savedWrite, savedTabs, savedSeq, savedDirty
 		closeWin, focusRaise = savedClose, savedRaise
 		hostedApp = savedHosted
+		reexecPending, reexecN, reexecHold = savedPending, savedN, savedHold
+		reexecSettleArmed, sessionEcho = savedArmed, savedEcho
+		readSessionFile = savedRead
 	})
 	writeHostFile = func(path string, data []byte) bool {
 		if l.fail {
 			return false
 		}
-		if path != sessionPath {
-			t.Fatalf("session write path = %q want %q", path, sessionPath)
+		// finishReexec republishes LAYOUT.txt through the same seam; the
+		// tests count SESSION.TABS writes, so the layout stream is kept
+		// separate and only the session one decodes.
+		switch path {
+		case sessionPath:
+			l.writes = append(l.writes, append([]byte(nil), data...))
+		case layoutPath:
+			l.layout = append(l.layout, append([]byte(nil), data...))
+		default:
+			t.Fatalf("session write path = %q want %q or %q", path, sessionPath, layoutPath)
 		}
-		l.writes = append(l.writes, append([]byte(nil), data...))
 		return true
 	}
 	closeWin = func(uint32) int64 { return 0 }
@@ -408,5 +425,375 @@ func TestHasLiveGuestELF(t *testing.T) {
 				t.Fatalf("hasLiveGuestELF = %v want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- M120b (#2559): SESSION.TABS live tab re-exec --------------------------
+//
+// Boot 2's restore is live tabs, never corpses: each backed row's bin is
+// exec'd, and the pid's kind-8/5 declare adopts the row in place so order,
+// pin, frozen and focus ride it. Rows nothing can run are dropped; a
+// restore that yields no live row falls back to the first-boot workspace.
+
+// seedSessionFile builds the `.tabs` v2 bytes for a strip that is exactly
+// the rows given: OpenTab would re-guess the bin, so the Bin fields are set
+// directly — a restored record's bin field is what the file says, not what
+// the title maps to.
+func seedSessionFile(t *testing.T, focusID uint32, rows ...Tab) []byte {
+	t.Helper()
+	var seed TabStrip
+	for i, r := range rows {
+		if !seed.OpenTab(uint32(i+1), r.Title) {
+			t.Fatal("OpenTab seed")
+		}
+		seed.tabs[i].Bin = r.Bin
+		seed.tabs[i].Pinned = r.Pinned
+		seed.tabs[i].Frozen = r.Frozen
+	}
+	if focusID != 0 {
+		if !seed.FocusTab(seed.tabs[int(focusID-1)].ID) {
+			t.Fatal("FocusTab seed")
+		}
+	}
+	raw, ok := seed.encodeTabsV2(9)
+	if !ok {
+		t.Fatal("encodeTabsV2")
+	}
+	return raw
+}
+
+// reexecEnv arms the seams a restore drives: the file read, the exec fan
+// out (returning sequential pids), the chrome decision, and pid liveness.
+// Returns the exec log and the pid each exec was assigned.
+func reexecEnv(t *testing.T, raw []byte, execErr map[string]bool) (*[]string, map[string]int64) {
+	t.Helper()
+	savedRead, savedExec := readSessionFile, execApp
+	savedChrome, savedProcs := configureHostedChrome, procsAlive
+	t.Cleanup(func() {
+		readSessionFile, execApp = savedRead, savedExec
+		configureHostedChrome, procsAlive = savedChrome, savedProcs
+	})
+	readSessionFile = func(path string, max int) ([]byte, int64) {
+		if path != sessionPath {
+			t.Fatalf("session read path = %q want %q", path, sessionPath)
+		}
+		return raw, int64(len(raw))
+	}
+	execed := []string{}
+	pids := map[string]int64{}
+	nextpid := int64(50)
+	execApp = func(name string, args ...string) (int64, error) {
+		if execErr[name] {
+			return 0, errors.New("exec refused")
+		}
+		execed = append(execed, name)
+		nextpid++
+		pids[name] = nextpid
+		return nextpid, nil
+	}
+	configureHostedChrome = func(uint32) bool { return true }
+	procsAlive = func(uint8) bool { return true }
+	return &execed, pids
+}
+
+// reexecDeclare feeds one kind-8 declare into applyRPC the way the
+// re-exec'd app would send it: the window id is fresh, ReplyTo is the
+// exec'd pid.
+func reexecDeclare(t *testing.T, pid uint8, winID uint32, title string) bool {
+	t.Helper()
+	req := vi.WmRpc{Kind: vi.WmRpcKindDeclareFullscreen, ID: uint8(winID), ReplyTo: pid}
+	req.SetTitle(title)
+	return applyRPC(req)
+}
+
+// TestSessionReexecAdoptsBackedRows is the card's spine: two backed rows
+// re-exec, the declares arrive in REVERSE order (the execs are unordered —
+// SPEC.md), and the rows are adopted in place so order, pin, frozen and the
+// recorded focus all survive.
+func TestSessionReexecAdoptsBackedRows(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 2,
+		Tab{Title: "Notepad", Bin: "NOTE.ELF"},
+		Tab{Title: "Calc", Bin: "GOCALC.ELF", Pinned: true, Frozen: true})
+	execed, pids := reexecEnv(t, raw, nil)
+	raised := []uint32{}
+	focusRaise = func(id uint32) int64 { raised = append(raised, id); return 0 }
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d want sessionRestored", state)
+	}
+	if reexecN != 2 {
+		t.Fatalf("pending = %d want 2", reexecN)
+	}
+	if got := *execed; len(got) != 2 || got[0] != "NOTE.ELF" || got[1] != "GOCALC.ELF" {
+		t.Fatalf("execed = %v want NOTE.ELF then GOCALC.ELF (file order)", got)
+	}
+	// Until their declares arrive the rows sit at placeholder ids.
+	if tabs.At(0).ID != sessionIDBase || tabs.At(1).ID != sessionIDBase+1 {
+		t.Fatalf("pre-adopt ids = %x,%x", tabs.At(0).ID, tabs.At(1).ID)
+	}
+
+	// The FOCUSED row declares second (pid order reversed): its adoption
+	// must not steal focus mid-flight — the settle pass owns it.
+	if !reexecDeclare(t, uint8(pids["GOCALC.ELF"]), 7, "Calc") {
+		t.Fatal("declare from pending pid refused")
+	}
+	if tabs.At(1).ID != 7 || !tabs.At(1).Pinned || !tabs.At(1).Frozen {
+		t.Fatalf("adopted row = %+v", tabs.At(1))
+	}
+	if fid, _ := tabs.Focused(); fid != 7 {
+		t.Fatalf("focus = %d want 7 (the recorded focused row)", fid)
+	}
+	if reexecN != 1 {
+		t.Fatalf("pending = %d want 1", reexecN)
+	}
+	if !reexecDeclare(t, uint8(pids["NOTE.ELF"]), 9, "Notepad") {
+		t.Fatal("second declare from pending pid refused")
+	}
+	if reexecN != 0 {
+		t.Fatalf("pending = %d want 0", reexecN)
+	}
+	// Order kept by construction: row 0 is the note, row 1 the calc.
+	if tabs.At(0).ID != 9 || tabs.At(0).Title != "Notepad" ||
+		tabs.At(1).ID != 7 || tabs.At(1).Title != "Calc" {
+		t.Fatalf("strip after adopt = %+v", tabs)
+	}
+	if fid, ok := tabs.Focused(); !ok || fid != 7 {
+		t.Fatalf("settled focus = %d ok=%v want 7", fid, ok)
+	}
+	if hostedApp != 7 {
+		t.Fatalf("hostedApp = %d want 7", hostedApp)
+	}
+	if len(raised) != 1 || raised[0] != 7 {
+		t.Fatalf("settle raises = %v want [7]", raised)
+	}
+	// Every adoption published the strip it produced; the last file carries
+	// only live rows (pending placeholders are never persisted) with the
+	// recorded flags intact.
+	if len(log.writes) < 2 {
+		t.Fatalf("session writes = %d want >= 2", len(log.writes))
+	}
+	_, recs, active, has := log.last(t)
+	if len(recs) != 2 || recs[0].Bin != "NOTE.ELF" || recs[1].Bin != "GOCALC.ELF" {
+		t.Fatalf("republished records = %+v", recs)
+	}
+	if !recs[1].Pinned || !recs[1].Frozen || recs[0].Pinned {
+		t.Fatalf("republished flags = %+v", recs)
+	}
+	if !has || active != 1 {
+		t.Fatalf("republished active = %d has=%v want 1", active, has)
+	}
+	// The settle republished LAYOUT.txt with the live window ids.
+	if len(log.layout) < 2 {
+		t.Fatalf("layout writes = %d want the load dump + the settle dump", len(log.layout))
+	}
+}
+
+// TestSessionReexecMixedUnbacked: a row with no recorded bin cannot be
+// re-exec'd — it is dropped by name while the backed row waits for its
+// declare.
+func TestSessionReexecMixedUnbacked(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 1,
+		Tab{Title: "Ghost", Bin: ""},
+		Tab{Title: "Calc", Bin: "GOCALC.ELF"})
+	execed, _ := reexecEnv(t, raw, nil)
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d want sessionRestored", state)
+	}
+	if got := *execed; len(got) != 1 || got[0] != "GOCALC.ELF" {
+		t.Fatalf("execed = %v want only GOCALC.ELF", got)
+	}
+	if tabs.Count() != 1 || tabs.At(0).Title != "Calc" {
+		t.Fatalf("strip = %+v want only the backed row", tabs)
+	}
+	if reexecN != 1 {
+		t.Fatalf("pending = %d want 1", reexecN)
+	}
+	// The dropped unbacked row is not reopenable — a row the seat never
+	// spawned has no bin to re-exec (ReopenLastClosed's own rule).
+	if _, ok := tabs.ReopenLastClosed(); ok {
+		t.Fatal("an unbacked drop must not enter the reopen LIFO")
+	}
+}
+
+// TestSessionReexecExecFailureDropsRow: a backed row whose exec the kernel
+// refuses (pool full, or a bin that is not a file) is dropped by name; the
+// rows that did exec still wait for their declares.
+func TestSessionReexecExecFailureDropsRow(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 1,
+		Tab{Title: "Calc", Bin: "GOCALC.ELF"},
+		Tab{Title: "Settings", Bin: "GOSET.ELF"})
+	execed, _ := reexecEnv(t, raw, map[string]bool{"GOSET.ELF": true})
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d want sessionRestored", state)
+	}
+	if got := *execed; len(got) != 1 || got[0] != "GOCALC.ELF" {
+		t.Fatalf("execed = %v want only GOCALC.ELF", got)
+	}
+	if tabs.Count() != 1 || tabs.At(0).Title != "Calc" {
+		t.Fatalf("strip = %+v want only the exec'd row", tabs)
+	}
+	// The refused bin IS reopenable — the record named a real executable,
+	// so ctrl-shift-t can retry it once the pool has room.
+	c, ok := tabs.ReopenLastClosed()
+	if !ok || c.Bin != "GOSET.ELF" {
+		t.Fatalf("reopen = %+v ok=%v want GOSET.ELF", c, ok)
+	}
+}
+
+// TestSessionReexecAllUnbackedFallsBack: when every row is unbacked the
+// restore leaves no live row, and the starter shell is NOT suppressed —
+// the state reads sessionEmpty and firstBootWorkspace fires.
+func TestSessionReexecAllUnbackedFallsBack(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 0,
+		Tab{Title: "Ghost", Bin: ""},
+		Tab{Title: "Shell", Bin: ""})
+	execed, _ := reexecEnv(t, raw, nil)
+
+	if state := loadSession(); state != sessionEmpty {
+		t.Fatalf("loadSession = %d want sessionEmpty", state)
+	}
+	if tabs.Count() != 0 || reexecN != 0 || len(*execed) != 0 {
+		t.Fatalf("count=%d pending=%d execed=%v", tabs.Count(), reexecN, *execed)
+	}
+	if !firstBootWorkspace(sessionEmpty, "gotabwm") {
+		t.Fatal("an all-dropped restore must reach the starter workspace")
+	}
+	if firstBootWorkspace(sessionEmpty, "none") || firstBootWorkspace(sessionRestored, "gotabwm") {
+		t.Fatal("fallback is only the default seat's empty restore")
+	}
+}
+
+// TestSessionReexecLateDeclareWindow: a pid still pending when the hold
+// expires drops its row; a declare that arrives afterwards joins as an
+// ordinary new tab, never resurrecting the placeholder.
+func TestSessionReexecLateDeclareWindow(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 0,
+		Tab{Title: "Calc", Bin: "GOCALC.ELF"},
+		Tab{Title: "Notepad", Bin: "NOTE.ELF"})
+	execed, pids := reexecEnv(t, raw, nil)
+	focusRaise = func(id uint32) int64 { return 0 }
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d want sessionRestored", state)
+	}
+	// One row's app makes it; the other never declares before the hold.
+	if !reexecDeclare(t, uint8(pids["GOCALC.ELF"]), 7, "Calc") {
+		t.Fatal("declare from pending pid refused")
+	}
+	reexecHold = 1
+	reapSessionReexec()
+	if reexecN != 0 || tabs.Count() != 1 || tabs.At(0).ID != 7 {
+		t.Fatalf("after the hold: pending=%d strip=%+v", reexecN, tabs)
+	}
+	if len(log.layout) < 2 {
+		t.Fatal("the settle did not republish LAYOUT.txt with the live id")
+	}
+	if len(*execed) != 2 {
+		t.Fatalf("execed = %v want both bins attempted", *execed)
+	}
+	// The dropped row's bin is reopenable — it named a real file.
+	if c, ok := tabs.ReopenLastClosed(); !ok || c.Bin == "" {
+		t.Fatal("a late drop still feeds the reopen LIFO")
+	}
+	// A declare from the (now dropped) pid is a normal open, not a ghost.
+	if !reexecDeclare(t, uint8(pids["NOTE.ELF"]), 8, "Notepad") {
+		t.Fatal("late declare refused")
+	}
+	if tabs.Count() != 2 || tabs.At(1).ID != 8 {
+		t.Fatalf("late declare joined as %+v", tabs)
+	}
+}
+
+// TestSessionReexecDeadPidReaped: a pid that exited before its declare is
+// reaped on the next composite tick — the row is dropped rather than
+// waiting out the hold.
+func TestSessionReexecDeadPidReaped(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 1,
+		Tab{Title: "Calc", Bin: "GOCALC.ELF"},
+		Tab{Title: "Notepad", Bin: "NOTE.ELF"})
+	_, pids := reexecEnv(t, raw, nil)
+	focusRaise = func(id uint32) int64 { return 0 }
+	procsAlive = func(pid uint8) bool { return pid != uint8(pids["GOCALC.ELF"]) }
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d want sessionRestored", state)
+	}
+	reapSessionReexec()
+	if reexecN != 1 || tabs.Count() != 1 || tabs.At(0).Title != "Notepad" {
+		t.Fatalf("after reap: pending=%d strip=%+v", reexecN, tabs)
+	}
+	// The surviving row's pid is still live; the hold has not run down.
+	if !reexecDeclare(t, uint8(pids["NOTE.ELF"]), 8, "Notepad") {
+		t.Fatal("surviving row's declare refused")
+	}
+	if tabs.At(0).ID != 8 || reexecN != 0 {
+		t.Fatalf("adopted = %+v pending=%d", tabs.At(0), reexecN)
+	}
+	if fid, _ := tabs.Focused(); fid != 8 {
+		t.Fatalf("focus = %d want 8 (row 0 was the recorded focus)", fid)
+	}
+}
+
+// TestSessionReexecUnknownPidOpensNewTab: a declare from a pid the restore
+// never exec'd is an ordinary tab — it appends, takes focus, and leaves the
+// pending rows alone.
+func TestSessionReexecUnknownPidOpensNewTab(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 0, Tab{Title: "Calc", Bin: "GOCALC.ELF"})
+	reexecEnv(t, raw, nil)
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d want sessionRestored", state)
+	}
+	if !reexecDeclare(t, 99, 7, "Edit") {
+		t.Fatal("unrelated declare refused")
+	}
+	if tabs.Count() != 2 || tabs.At(1).ID != 7 || tabs.At(1).Title != "Edit" {
+		t.Fatalf("unrelated declare joined as %+v", tabs)
+	}
+	if hostedApp != 7 {
+		t.Fatalf("hostedApp = %d want 7 (a fresh declare takes focus)", hostedApp)
+	}
+	if reexecN != 1 {
+		t.Fatalf("pending = %d want 1 (the restore row still waits)", reexecN)
+	}
+}
+
+// TestSessionEchoPinsTheFile: the witness line reports what the FILE held
+// even after the re-exec fan-out mutated the strip — and an absent file
+// echoes the empty strip exactly as before.
+func TestSessionEchoPinsTheFile(t *testing.T) {
+	var log sessionWriteLog
+	log.install(t)
+	raw := seedSessionFile(t, 1,
+		Tab{Title: "Calc", Bin: "GOCALC.ELF"},
+		Tab{Title: "Notepad", Bin: "NOTE.ELF", Pinned: true})
+	reexecEnv(t, raw, nil)
+
+	if state := loadSession(); state != sessionRestored {
+		t.Fatalf("loadSession = %d", state)
+	}
+	if sessionEcho != "Calc,Notepad pin=0,1 active=0" {
+		t.Fatalf("sessionEcho = %q", sessionEcho)
+	}
+	// Mutate the strip post-load: the echo is the file's, not the strip's.
+	tabs = TabStrip{}
+	if got := restoreWitnessLine(); !strings.Contains(got, sessionEcho) {
+		t.Fatalf("witness line %q lost the file echo %q", got, sessionEcho)
 	}
 }
