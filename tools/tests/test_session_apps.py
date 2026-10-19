@@ -380,6 +380,7 @@ class SessionAppsTest(unittest.TestCase):
         self.assertNotIn("--virtio-fs", launch)
         self.assertIn("--vsock --vsock-ctl", launch)
         self.assertIn("--host-clipboard", launch)
+        self.assertIn("--host-outbox", launch)
         self.assertIn("share posture: cvc-file", output)
 
     def test_save_capable_rides_virtiofs_and_disarms_cvc_lanes(self):
@@ -389,6 +390,7 @@ class SessionAppsTest(unittest.TestCase):
         self.assertNotIn("--cvc-file", launch)
         self.assertIn("--vsock --vsock-ctl", launch)
         self.assertNotIn("--host-clipboard", launch)
+        self.assertNotIn("--host-outbox", launch)
         self.assertIn("cvc-only host lanes", output)
         self.assertIn("share posture: virtio-fs", output)
 

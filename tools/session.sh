@@ -22,12 +22,13 @@
 #      without this the shell has nothing to `exec`;
 #   3. boot with the GPU window + USB keyboard/pointing devices attached
 #      (`--display --input`);
-#   4. arm the M108 host-integration lanes by DEFAULT (M114c, issue #2456):
+#   4. arm the host-integration lanes by DEFAULT (M114c #2456, M127d #2602):
 #      provision the `host-int` credential in the share's SECRETS.TXT
 #      (app-bound to GOTABWM.ELF, which OWNERS.TXT names uid_system-owned)
-#      and boot with `--host-clipboard --host-drop --host-notify --sound
-#      --net-nat`. `--no-host-int` disarms the three lanes (and skips the
-#      credential); `--no-sound`/`--no-net-nat` switch their own feature;
+#      and boot with `--host-clipboard --host-drop --host-notify
+#      --host-outbox --sound --net-nat`. `--no-host-int` disarms the four
+#      lanes (and skips the credential); `--no-sound`/`--no-net-nat` switch
+#      their own feature;
 #   5. let the compiled boot default apply: M59 (issue #1298) flipped `wm`
 #      to the GO seat, so a boot lands in GOTABWM.ELF. The `.virelairc` in
 #      the share says so and offers the two escapes -- `settings set wm
@@ -56,15 +57,16 @@
 #   just session
 #
 # Flags:
-#   --no-host-int    do NOT arm --host-clipboard/--host-drop/--host-notify
-#                    (and skip the host-int credential provisioning)
+#   --no-host-int    do NOT arm --host-clipboard/--host-drop/--host-notify/
+#                    --host-outbox (and skip the host-int credential
+#                    provisioning)
 #   --no-sound       do not attach the audio device
 #   --no-net-nat     do not attach the NAT network device
 #   --save-capable   ride the share on Apple's virtio-fs instead of
 #                    --cvc-file so VZ save/restore does not refuse the
 #                    device set (M120a): suspend/snapshot are ARMED, but
-#                    the cvc-only host lanes (clipboard/drop/notify) and
-#                    the app-bound credentials (host-int, os-update,
+#                    the cvc-only host lanes (clipboard/drop/notify/outbox)
+#                    and the app-bound credentials (host-int, os-update,
 #                    agent-hmac) cannot be served on this posture.
 #   --resume         boot the profile's saved-state/ (the continuation of
 #                    a ctl suspend); implies --save-capable
@@ -714,12 +716,12 @@ LANE_FLAGS=()
 if [ "$SAVE_CAPABLE" = "1" ]; then
     SHARE_FLAGS+=(--virtio-fs "$SHARE")
     if [ "$HOST_INT" = "1" ]; then
-        echo "session: --save-capable rides virtio-fs: the cvc-only host lanes (clipboard/drop/notify) are OFF this boot"
+        echo "session: --save-capable rides virtio-fs: the cvc-only host lanes (clipboard/drop/notify/outbox) are OFF this boot"
     fi
 else
     SHARE_FLAGS+=(--cvc-file "$SHARE")
     if [ "$HOST_INT" = "1" ]; then
-        LANE_FLAGS+=(--host-clipboard --host-drop --host-notify)
+        LANE_FLAGS+=(--host-clipboard --host-drop --host-notify --host-outbox)
     fi
 fi
 if [ "$SOUND" = "1" ]; then LANE_FLAGS+=(--sound); fi
@@ -754,17 +756,19 @@ seat remains available with \`settings set wm tabwm\`.
 EOF
 if [ "$HOST_INT" = "1" ] && [ "$SAVE_CAPABLE" != "1" ]; then
     cat <<EOF
-  * host lanes armed: clipboard + file-drop + notify (Integration menu has
-    live suspend/resume toggles + "Send File to INBOX"; --no-host-int
-    disarms). macOS may ask once for notification permission.
+  * host lanes armed: clipboard + file-drop + notify + export (Integration
+    menu has live suspend/resume toggles + "Send File to INBOX";
+    --no-host-int disarms). Exports land in ~/Downloads. macOS may ask
+    once for notification permission.
 EOF
 fi
 if [ "$SAVE_CAPABLE" = "1" ]; then
     cat <<EOF
   * share posture: virtio-fs (save-capable) — the PWR menu's Suspend and
     snapshots are armed; the cvc-only host lanes are OFF this boot.
-    Relaunch without --save-capable/--resume for the clipboard/drop/notify
-    lanes and the app-bound credentials (host-int, os-update, agent-hmac).
+    Relaunch without --save-capable/--resume for the
+    clipboard/drop/notify/outbox lanes and the app-bound credentials
+    (host-int, os-update, agent-hmac).
 EOF
 else
     cat <<EOF
