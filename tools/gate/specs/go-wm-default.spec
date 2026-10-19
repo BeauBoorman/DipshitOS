@@ -81,6 +81,9 @@ runpy.run_path("tests/fixtures/desktop/m91/fresh.py")["stage"]({
     "GOCALC": "build-gocalc.sh", "GOSET": "build-goset.sh",
     "GOTERM": "build-goterm.sh", "GOEDIT": "build-goedit.sh",
     "NOTE": "build-note.sh",
+    # M122b (#2571): the first-boot tour — staged so boot 19's live
+    # first-boot branch can exec it; the demo boots never reach it.
+    "GOWELCOME": "build-gowelcome.sh",
 })
 PY
 
@@ -298,6 +301,10 @@ vgate_assert 01 serial-contains 'gotabwm: present'
 # seat. The marker is the seat's successful sys_exec; these app/seat markers
 # prove that GOSH declared and the seat accepted it.
 vgate_assert 01 serial-contains 'gotabwm: first-boot workspace'
+# M122b (#2571): the welcome tour is LIVE-mode only — this demo boot's
+# choreography owns the strip and must never see it.
+vgate_assert 01 serial-absent 'gotabwm: welcome tour'
+vgate_assert 01 serial-absent 'gowelcome: open id='
 vgate_assert 01 serial-contains 'gosh: declare accepted'
 vgate_assert 01 serial-contains 'gotabwm: tab open id='
 vgate_assert 01 serial-contains 'gosh: prompt'
@@ -363,9 +370,10 @@ import os, sys
 share = os.environ["VG_SHARE"]
 text = open(os.path.join(share, "APPS.TXT"), encoding="utf-8").read()
 rows = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
-if len(rows) != 18:
-    sys.exit("manifest has %d rows, want 18 (M99c/M110c/M111c grew it; the "
-             "M122c ghost-app purge removed GODIFF/ZC.BIN/GOSNAP)" % len(rows))
+if len(rows) != 19:
+    sys.exit("manifest has %d rows, want 19 (M99c/M110c/M111c grew it; the "
+             "M122c ghost-app purge removed GODIFF/ZC.BIN/GOSNAP, M122b "
+             "added GOWELCOME)" % len(rows))
 dock = 0
 v2 = 0
 for ln in rows:
@@ -930,6 +938,10 @@ vgate_assert 10 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
 vgate_assert 10 serial-contains 'gotabwm: settings wm=gotabwm'
 vgate_assert 10 serial-contains 'gotabwm: session load n='
 vgate_assert 10 serial-absent 'gotabwm: first-boot workspace'
+# M122b (#2571): a restored strip replays what it recorded — the tour is
+# first-boot-only, never re-added on a restored boot.
+vgate_assert 10 serial-absent 'gotabwm: welcome tour'
+vgate_assert 10 serial-absent 'gowelcome: open id='
 # The restore's re-exec, not a monitor exec, is what loads GOCALC now
 # (M120b): the kernel's `exec: loaded` marker belongs to scripted execs,
 # while the seat names every bin it fans back out.
@@ -1324,6 +1336,13 @@ vgate_run 19 -- \
 vgate_assert 19 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
 vgate_assert 19 serial-contains 'gotabwm: mode live'
 vgate_assert 19 serial-contains 'gotabwm: first-boot workspace'
+# M122b (#2571): the live first-boot workspace opens the welcome tour
+# beside GOSH — the seat's exec marker plus the app's own open/declare/
+# present markers prove the surface painted.
+vgate_assert 19 serial-contains 'gotabwm: welcome tour'
+vgate_assert 19 serial-contains 'gowelcome: open id='
+vgate_assert 19 serial-contains 'gowelcome: declare accepted'
+vgate_assert 19 serial-contains 'gowelcome: present'
 vgate_assert 19 serial-contains 'gosh: declare accepted'
 vgate_assert 19 serial-contains 'gosh: prompt'
 vgate_assert 19 serial-exact 'gotabwm: launcher exec GOTERM.ELF' 1

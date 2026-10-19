@@ -36,6 +36,7 @@ WEB.ELF	window,memory,process,debug	window,memory,process,debug,net	declared cap
 PULSE.ELF	window,memory,process,debug	file,window,timer,memory,process,debug,term	surface: FileOpen/FileRead + TtyAttach + EvTimer call sites (user/go/pulse)
 GOSH.ELF	file,memory,process,debug	file,memory,process,debug,term	declared caps=file,process,term; audited via -c only — the interactive path was not exercised
 GOHELP.ELF	window,memory,process,debug	file,window,memory,process,debug,term	surface: ReadFileAll for help topics + TtyAttach for the tty pane (user/go/help)
+GOWELCOME.ELF	-	file,window,memory,process,debug	surface: ReadFileAll for the SETTINGS.TXT theme load + Exec for the one-click launchers (user/go/welcome); new app, not yet audited
 GOTOP.ELF	file,window,memory,process,debug	file,window,memory,process,debug,net	surface: NetStats* pane — slot 62 sys_net_stats is net-grouped (user/go/top)
 GOSET.ELF	window,memory,process,debug	file,window,memory,process,debug	declared caps=file; the settings-write path was not exercised in the audit window
 GODIFF.ELF	memory,process,debug	file,memory,process,debug	declared caps=file; a diff tool reads both inputs
