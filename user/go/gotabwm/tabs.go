@@ -280,6 +280,11 @@ func guessBin(title string) string {
 		// otherwise record the title itself as the binary, and a restored tab
 		// would look for a file named "RSS Reader".
 		return "RSS.ELF"
+	case "Sh":
+		// M123e (#2579): the shell's declared title — without the row a
+		// restored starter tab execs "Sh" and drops by name (go-dogfood
+		// boot 06: `refusal ENOENT exec Sh`).
+		return "GOSH.ELF"
 	default:
 		return title
 	}
