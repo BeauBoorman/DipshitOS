@@ -107,6 +107,16 @@ const (
 	markerStateCwd     = "gofiles: state cwd "
 	markerStateRefused = "gofiles: state refused "
 
+	// M124a-2 (#2677): the drag source's receipts. `drag arm` follows the
+	// seat's acked kind-24 (the payload is already staged under the source's
+	// /host/DRAG.<id>); `drag refused` names why no arm happened — no row, a
+	// volume/dir row, over the DragMax cap, a read rc, or the seat's own
+	// refusal; `drag end` is the seat's kind-25 outcome notice for an armed
+	// drag — `delivered win=<peer>` or `cancelled`.
+	markerDragArm = "gofiles: drag arm "
+	markerDragNo  = "gofiles: drag refused "
+	markerDragEnd = "gofiles: drag end "
+
 	// The view/sort chords' own markers.
 	markerViewMode = "gofiles: viewmode "
 	markerSort     = "gofiles: sort "

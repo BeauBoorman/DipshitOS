@@ -172,13 +172,16 @@ const (
 	// clipboard ops report their outcome (n= bytes moved, or the negative
 	// kernel code the M97g-F4 policy returned — rc=-7 is the receipt, not
 	// an error swallowed); the status line republishes its chrome text.
-	markerStatus  = "goedit: status "
-	markerUndo    = "goedit: undo "
-	markerRedo    = "goedit: redo "
-	markerMark    = "goedit: mark "
-	markerCopy    = "goedit: copy "
-	markerCut     = "goedit: cut "
-	markerPaste   = "goedit: paste "
+	markerStatus = "goedit: status "
+	markerUndo   = "goedit: undo "
+	markerRedo   = "goedit: redo "
+	markerMark   = "goedit: mark "
+	markerCopy   = "goedit: copy "
+	markerCut    = "goedit: cut "
+	markerPaste  = "goedit: paste "
+	// M124a-2 (#2677): the drop target's receipt — `<mime> n=` on a
+	// splice, `no-payload`/`empty`/`rc=` for the refused shapes.
+	markerDrop    = "goedit: drop "
 	markerRepl    = "goedit: replace '"
 	markerReplAll = "goedit: replace-all '"
 
@@ -502,6 +505,17 @@ func main() {
 		StateVersion: stateAppVer,
 		SaveState:    e.saveState,
 		RestoreState: e.noteState,
+		// M124a-2 (#2677): the drop target. The seat's opens=text,binary
+		// admission already filtered the mime; a delivered payload splices
+		// at the caret through the same op path as paste, then repaints —
+		// the callback runs inside PollDrag, where no frame is pending.
+		DropTarget: func(offer tabapp.DragOffer) {
+			e.drop(offer)
+			e.draw()
+			e.ta.Present()
+			e.markStage()
+			e.emitStatus()
+		},
 	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
@@ -542,6 +556,9 @@ func main() {
 		// an input event — answer it each pass so a snapshot/close ask is
 		// serviced before the window dies (the GOTABAPP discipline).
 		ta.PollStateAsk()
+		// M124a-2: seat drag frames for this window — a delivered drop runs
+		// DropTarget (which repaints itself) here, one poll per loop turn.
+		ta.PollDrag()
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
@@ -1238,6 +1255,35 @@ func (e *editor) paste() {
 	}
 	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: pos, old: old, ins: b}}}, pos+len(b))
 	vi.ConsoleLine(markerPaste + "n=" + vi.Itoa64(int64(len(b))))
+}
+
+// drop splices a delivered drag payload at the caret — the M124a-2 (#2677)
+// drop half of paste(): same over-selection shape, same one-undoable-op
+// semantics, the marker naming the seat-declared mime instead of a clipboard
+// n. A nil payload is the seat's "no envelope" case, named like a refusal.
+func (e *editor) drop(offer tabapp.DragOffer) {
+	b := offer.Blob
+	if b == nil {
+		vi.ConsoleLine(markerDrop + "no-payload")
+		return
+	}
+	if len(b) == 0 {
+		vi.ConsoleLine(markerDrop + "empty")
+		return
+	}
+	e.clampCaret()
+	pos := e.cur
+	var old []byte
+	if lo, hi, ok := e.selRange(); ok {
+		pos = lo
+		old = append([]byte{}, e.buf[lo:hi]...)
+	}
+	if splicedLen(len(e.buf), []splice{{pos: pos, old: old, ins: b}}, false) > maxBuffer {
+		vi.ConsoleLine(markerDrop + "rc=" + vi.Itoa64(-vsys.ErrENOMEM))
+		return
+	}
+	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: pos, old: old, ins: b}}}, pos+len(b))
+	vi.ConsoleLine(markerDrop + offer.Mime + " n=" + vi.Itoa64(int64(len(b))))
 }
 
 // --- status line ----------------------------------------------------------

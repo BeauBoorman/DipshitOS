@@ -79,6 +79,20 @@ type model struct {
 	// happened, main owns the one seam that talks to the seat.
 	notify string
 
+	// M124a-2 (#2677): the press gesture's drag arm. pressRow is the list
+	// index the live button-hold started on (-1 = the press was not on a
+	// row), pendOpen defers a press-on-selected-row's open to its release
+	// edge so a held move can arm the seat-mediated drag instead, and
+	// dragOn latches once the arm acks — while it holds the seat owns the
+	// pointer and no further reports reach the app. dragName/dragMT/
+	// dragLen carry the armed offer's facts for the arm marker.
+	pressRow int
+	pendOpen bool
+	dragOn   bool
+	dragName string
+	dragMT   string
+	dragLen  int
+
 	// M81f (#1766): the change-feed subscription for the listing being
 	// shown. The watcher's baseline is adopted by every refresh (the feed
 	// reports what the app did NOT cause); watchArmed gates the one-time
@@ -90,7 +104,7 @@ type model struct {
 // newModel starts at path on a cols x rows grid and takes the first listing
 // (its markers ride pending for main to flush after the first paint).
 func newModel(path string, cols, rows int) model {
-	m := model{path: path}
+	m := model{path: path, pressRow: -1}
 	m.setSize(cols, rows)
 	if now := vi.Time(); now >= 0 {
 		expired, rc := vi.TrashExpire(now)
@@ -446,9 +460,14 @@ func (m *model) goUp() {
 }
 
 // handleClick maps a kernel SGR mouse press (1-based cell coords over the
-// client area) onto the list: first click selects, second click opens —
-// the M58a mouse contract, kept over M73i reporting.
+// client area) onto the list: first press selects, press on the already-
+// selected row PENDS its open to the release edge — the M58a
+// "click again opens" contract re-stated for M124a-2 (#2677): a held move
+// off the press arms the seat-mediated drag, so "open" cannot fire until
+// the gesture proved it was a click and not a drag.
 func (m *model) handleClick(x, y int) {
+	m.pressRow = -1
+	m.pendOpen = false
 	col, row := x-1, y-1
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() {
 		return
@@ -460,13 +479,26 @@ func (m *model) handleClick(x, y int) {
 	if idx < 0 || idx >= m.n {
 		return
 	}
+	m.pressRow = idx
 	if idx == m.sel {
-		m.openSel()
+		m.pendOpen = true
 		return
 	}
 	m.sel = idx
 	m.ensureSelVisible()
 	m.loadPreview()
+}
+
+// releaseClick settles a press's open intent on the release edge: a press
+// that deferred its open (pendOpen) and was never stolen by a drag now
+// opens. Releases with nothing pending — a press on an unselected row, or
+// chrome — are honest no-ops.
+func (m *model) releaseClick() {
+	m.pressRow = -1
+	if m.pendOpen {
+		m.pendOpen = false
+		m.openSel()
+	}
 }
 
 // handleKey is the whole keyboard contract, decoded from the bound tty by

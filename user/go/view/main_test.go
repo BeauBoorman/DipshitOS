@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"virelai/tabapp"
 	"virelai/webrender"
 )
 
@@ -33,6 +34,7 @@ func TestMarkersAreAllGViewPrefixed(t *testing.T) {
 		"too large":   markerTooLarge,
 		"decode err":  markerDecodeErr,
 		"unsupported": markerUnsupported,
+		"drop":        markerDrop,
 	}
 	for what, m := range markers {
 		if !strings.HasPrefix(m, "gview: ") {
@@ -87,6 +89,34 @@ func TestGarbageAndTruncationAreDecodeFailures(t *testing.T) {
 		if im, err := webrender.DecodeImage(c.data); err == nil {
 			t.Errorf("%s: DecodeImage returned %dx%d and no error", c.what, im.Width, im.Height)
 		}
+	}
+}
+
+// TestDropDecodesThroughTheRendererPath is the M124a-2 (#2677) D1 check: a
+// delivered drag payload lands through the same DecodeImage as a file load,
+// replaces the shown image and resets the view state — refused shapes name
+// themselves and leave the image alone.
+func TestDropDecodesThroughTheRendererPath(t *testing.T) {
+	a := &app{zoomIdx: 2, ox: 9, oy: 7, st: loadFailedOpen}
+	if !a.applyDrop(tabapp.DragOffer{Mime: "image/png", Blob: readFixture(t, pngFixture)}) {
+		t.Fatal("the PNG fixture drop must apply")
+	}
+	if a.st != loadOkay || a.iw != 160 || a.ih != 120 {
+		t.Fatalf("drop state = (st=%v %dx%d), want okay 160x120", a.st, a.iw, a.ih)
+	}
+	if a.fm != fmtPNG || a.name != "drop:image/png" {
+		t.Fatalf("drop identity = (%v %q)", a.fm, a.name)
+	}
+	if a.zoomIdx != zoomDefaultIdx || a.ox != 0 || a.oy != 0 {
+		t.Fatal("a new image must reset zoom and pan")
+	}
+	// The refused shapes never replace.
+	img := a.img
+	if a.applyDrop(tabapp.DragOffer{Mime: "image/png"}) || a.img != img {
+		t.Fatal("a nil payload must not replace the image")
+	}
+	if a.applyDrop(tabapp.DragOffer{Mime: "text/plain", Blob: []byte("not an image at all, really")}) || a.img != img {
+		t.Fatal("undecodable bytes must not replace the image")
 	}
 }
 

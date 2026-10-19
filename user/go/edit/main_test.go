@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"virelai/layout"
+	"virelai/tabapp"
 	"virelai/vi"
 )
 
@@ -260,6 +261,30 @@ func TestCutCopyPasteThroughTheSlot(t *testing.T) {
 	e.undo()
 	if string(e.buf) != "clipthis" {
 		t.Fatalf("undo paste-over = %q", e.buf)
+	}
+}
+
+// TestDropSplicesLikePaste: M124a-2 (#2677) — a delivered drag payload is
+// a paste at the caret without the clipboard slot: over-selection is one
+// undoable op, an absent or empty payload leaves the buffer alone, and the
+// seat-declared mime lands on the marker.
+func TestDropSplicesLikePaste(t *testing.T) {
+	e := usEditor("clipthis")
+	e.drop(tabapp.DragOffer{Mime: "text/plain", Blob: []byte("drop")})
+	if string(e.buf) != "clipthisdrop" || e.cur != len("clipthisdrop") {
+		t.Fatalf("drop = (%q,cur=%d)", e.buf, e.cur)
+	}
+	// Over a selection it replaces — one op, one undo.
+	e.sel, e.selSet, e.cur = 0, true, 4
+	e.drop(tabapp.DragOffer{Mime: "text/plain", Blob: []byte("clip")})
+	if string(e.buf) != "clipthisdrop" || e.cur != 4 {
+		t.Fatalf("drop-over = (%q,cur=%d)", e.buf, e.cur)
+	}
+	// The refused shapes never splice.
+	e.drop(tabapp.DragOffer{Mime: "text/plain"})
+	e.drop(tabapp.DragOffer{Mime: "text/plain", Blob: []byte{}})
+	if string(e.buf) != "clipthisdrop" {
+		t.Fatalf("empty/nil drops must not splice: %q", e.buf)
 	}
 }
 
