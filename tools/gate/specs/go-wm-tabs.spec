@@ -2070,7 +2070,7 @@ vgate_assert 14 serial-contains "goedit: find 'mma' hit=1/1"
 vgate_assert 14 serial-contains 'goedit: undo n=0 cur=16'
 vgate_assert 14 serial-contains 'goedit: redo n=0 cur=14'
 vgate_assert 14 serial-contains 'goedit: mark set'
-vgate_assert 14 serial-contains 'goedit: status line=3/3 col=2 sel=2 *'
+vgate_assert 14 serial-contains 'goedit: status line=3/4 col=2 sel=2 *'
 vgate_assert 14 serial-contains 'goedit: saved /host/EDIT/STATE.TXT n=15'
 # The snapshot chord asked the bound tab; the seat stored the blob at
 # appver=1 and republished the session carrying it.
@@ -2137,7 +2137,7 @@ vgate_run 15 -- \
     --script2 '$RUN_DIR/script2-15.txt' \
     --script2-after 'gotabwm: win focus' \
     --input-chords 'ctrl-z' \
-    --input-chords-after 'goedit: status line=3/3 col=2 sel=2' \
+    --input-chords-after 'goedit: status line=3/4 col=2 sel=2' \
     --script3 '$RUN_DIR/script3-15.txt' \
     --script3-after 'goedit: undo n=0' \
     --script-expect 'rx-goedit-state-restore-ok' --timeout 300
@@ -2147,9 +2147,9 @@ vgate_assert 15 serial-contains 'gotabwm: session load n=1 mode=restore'
 vgate_assert 15 serial-contains 'gotabwm: session reexec n=1'
 vgate_assert 15 serial-contains 'gotabwm: session exec GOEDIT.ELF'
 vgate_assert 15 serial-contains 'gotabwm: session live n=1'
-# The path came from the blob: the re-exec ran the bare bin, yet the editor
-# opened STATE.TXT — argv never exists on a restored session.
-vgate_assert 15 serial-contains 'exec: loaded GOEDIT.ELF'
+# The path came from the blob: `session exec GOEDIT.ELF` re-execs the bare
+# bin (no argv marker exists), yet the editor opened STATE.TXT — argv never
+# exists on a restored session, so the blob is the only carrier.
 vgate_assert 15 serial-contains 'goedit: read /host/EDIT/STATE.TXT n=15'
 # The seat staged the blob; GOEDIT's own apply reports caret, selection,
 # rings and histories.
@@ -2159,7 +2159,7 @@ vgate_assert 15 serial-contains 'goedit: state restored cur=12 sel=12..14 undo=1
 vgate_assert 15 serial-absent 'goedit: state stale'
 vgate_assert 15 serial-absent 'gotabwm: state drop'
 # The restored status row: caret at 12 on line 3, two bytes selected, clean.
-vgate_assert 15 serial-contains 'goedit: status line=3/3 col=2 sel=2'
+vgate_assert 15 serial-contains 'goedit: status line=3/4 col=2 sel=2'
 # The restored undo ring is LIVE: ctrl-z reverts the saved op and lands the
 # caret at the end of the recovered region.
 vgate_assert 15 serial-contains 'goedit: undo n=0 cur=16'
