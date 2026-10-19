@@ -137,6 +137,7 @@ func wqPage(id uint8, start int, peers WmSeat, budget *int) ([]WmWindowRow, int,
 		// pad instead means the seat has no binding for id: fresh window,
 		// or a restarted seat that forgot the token.
 		var rows []WmWindowRow
+		echoes := 0 // challenge->echo pairs cap at wmBindMaxRounds, same as wmRequestGoTitle
 		for {
 			m, ok := waitWmReply16(req.Seq, req.ReplyTo, budget)
 			if !ok {
@@ -145,7 +146,8 @@ func wqPage(id uint8, start int, peers WmSeat, budget *int) ([]WmWindowRow, int,
 			switch m.Pad {
 			case WmRpcPadChallenge:
 				challenge := WmAuth(m)
-				if challenge == 0 ||
+				echoes++
+				if challenge == 0 || echoes > wmBindMaxRounds ||
 					bindSetTitle(int(id), WmBindChallengeTitle(challenge)) != 0 {
 					return nil, 0, wqSilent
 				}
