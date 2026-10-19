@@ -208,6 +208,11 @@ const (
 	// is unbound in both seats (checked against tabwm and gotabwm).
 	keyR     = 0x72
 	keyCtrlR = 0x12
+
+	// M125b (#2587): the session-state receipt — `restored` after a blob
+	// applied, `stale <why>` when it degraded to a plain open. The seat's
+	// own `gotabwm: state save/restore` lines carry the transport side.
+	markerState = "goedit: state "
 	// M107c: the diagnostics chords. Ctrl-E opens/refreshes the error list,
 	// Ctrl-N/Ctrl-P are next/prev — all unshifted letters, unbound in both
 	// tab seats (checked against tabwm and gotabwm like Ctrl-R above).
@@ -403,6 +408,23 @@ type editor struct {
 	diagsMtime int64
 	diagsSel   int
 	diagsArg   string
+
+	// M125b (#2587): the session-state fields. base is the file content the
+	// session opened on — the undo ring's anchor: replaying the ring onto
+	// base rebuilds an unsaved buffer at restore (it aliases the load-time
+	// slice and is never mutated, so it costs nothing to keep). diskLen/
+	// diskHash fingerprint the file as last seen on the share (load or
+	// save) — the stale-blob check. findHist/gotoHist are the bounded
+	// find/goto history, newest last. pend is the decoded blob waiting for
+	// load() to produce the buffer it applies against; pendBad marks a
+	// blob that failed to decode.
+	base     []byte
+	diskLen  int
+	diskHash uint64
+	findHist [][]byte
+	gotoHist []int
+	pend     *editState
+	pendBad  bool
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -464,6 +486,11 @@ func main() {
 		}
 	}
 
+	// M125b (#2587): the editor must exist before Init — the seat's
+	// restore_answer fires the RestoreState hook INSIDE it, so the blob
+	// decodes into the app's own state before the buffer even loads. The
+	// decoded path wins over argv: a session re-exec runs the bare bin.
+	e := &editor{path: path, diagsArg: diagPath}
 	ta := tabapp.Init(tabapp.Config{
 		Name:  appName,
 		Title: appTitle,
@@ -471,11 +498,16 @@ func main() {
 		Y:     32,
 		W:     natW,
 		H:     natH,
+
+		StateVersion: stateAppVer,
+		SaveState:    e.saveState,
+		RestoreState: e.noteState,
 	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
 		vi.Exit(1)
 	}
+	e.ta = ta
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)))
 	if ta.TabAware {
 		vi.ConsoleLine(markerDeclare)
@@ -483,8 +515,10 @@ func main() {
 		vi.ConsoleLine("goedit: declare refused")
 	}
 
-	e := &editor{ta: ta, path: path, diagsArg: diagPath}
 	e.load()
+	// The blob applies to the loaded buffer — staleness, ring replay and
+	// caret/selection all land here, before the layout/lease/draw pass.
+	e.applyRestored()
 	// The layout is read once, at open: it decides which physical keys are
 	// dead. A change made in GOSET while this editor is open applies to the
 	// next one; until then an unmapped dead key is ignored, as it always was.
@@ -504,6 +538,10 @@ func main() {
 	e.emitStatus()
 
 	for {
+		// M125b (#2587): the seat's save notice is a mailbox message, not
+		// an input event — answer it each pass so a snapshot/close ask is
+		// serviced before the window dies (the GOTABAPP discipline).
+		ta.PollStateAsk()
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
@@ -560,11 +598,17 @@ func (e *editor) load() {
 	if rc < 0 {
 		e.buf = nil
 		e.cur = 0
+		e.base = nil
+		e.diskLen = 0
+		e.diskHash = fnv1a64(nil)
 		vi.ConsoleLine(markerRead + e.path + " n=0 rc=" + vi.Itoa64(rc))
 		return
 	}
 	e.buf = b
 	e.cur = len(b)
+	e.base = b
+	e.diskLen = len(b)
+	e.diskHash = fnv1a64(b)
 	vi.ConsoleLine(markerRead + e.path + " n=" + vi.Itoa64(int64(len(b))))
 }
 
@@ -926,6 +970,7 @@ func (e *editor) runFind() {
 	if len(pat) == 0 {
 		return
 	}
+	e.pushFind(pat)
 	total, ordinal, off := find.From(e.buf, pat, e.cur)
 	if off < 0 {
 		vi.ConsoleLine(findMissMarker(pat))
@@ -947,6 +992,7 @@ func (e *editor) runGoto() {
 	if !ok {
 		return
 	}
+	e.pushGoto(n)
 	off := lineOffset(e.buf, n)
 	if off < 0 {
 		vi.ConsoleLine(gotoMissMarker(n, countLines(e.buf)))
@@ -1387,6 +1433,8 @@ func (e *editor) save() bool {
 		return false
 	}
 	e.dirty = false
+	e.diskLen = len(e.buf)
+	e.diskHash = fnv1a64(e.buf)
 	vi.ConsoleLine(markerSaved + e.path + " n=" + vi.Itoa64(int64(len(e.buf))))
 	return true
 }
