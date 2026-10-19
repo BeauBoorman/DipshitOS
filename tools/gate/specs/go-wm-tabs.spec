@@ -8,7 +8,7 @@
 # #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# SEVENTEEN vgate_runs share one seeded host share (`vgate_share seed`):
+# NINETEEN vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -80,6 +80,16 @@
 #       re-execs WEB.ELF (bare bin — the blob's url field is the only
 #       carrier), and `web: state restored` reports url/scroll/zoom and
 #       3/3 fields re-applied onto the refetched page.
+#   18  M125g (#2592): the acceptance — ONE session carrying all three real
+#       state clients (GOTERM + WEB + GOEDIT): the terminal gets cwd/env/
+#       scrollback from the share's own startup contract (PROFILE.SH),
+#       the editor gets typed text, the snapshot chord asks every bound
+#       tab, and the run's end IS the hard kill — VMRunner exits with the
+#       session live and nothing but the crash-safe SESSION.TABS publish
+#       crosses onto the share.
+#   19  M125g (#2592): the restart. A fresh boot decodes the file the kill
+#       left behind, re-execs all three rows, and each app's restore marker
+#       reports its own state back — cwd/env/scroll, url, caret/rings.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -328,6 +338,25 @@ with open(os.path.join(share, "FORM.HTML"), "w") as f:
             "</select></form>\n")
 print("staged WEB.ELF (%d bytes) + FORM.HTML" %
       os.path.getsize(os.path.join(share, "WEB.ELF")))
+PY
+
+vgate_setup_python <<'PY'
+import os
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+# M125g (#2592): the acceptance session's fixtures. EDIT/M125G.TXT is the
+# editor's open target; PROFILE.SH is the shell startup contract GOTERM
+# sources at every boot — `cd /M125G` + an env var + a proof line give the
+# terminal real cwd/env/scrollback state without spending an input phase
+# (the legs need the two scripted input slots elsewhere). The lines are
+# silent (no `goterm: line` markers — nobody typed them) and the other
+# GOTERM boot in this spec (run 03) asserts nothing they could trip.
+os.makedirs(os.path.join(share, "M125G"), exist_ok=True)
+with open(os.path.join(share, "PROFILE.SH"), "w") as f:
+    f.write("cd /M125G\nset M125G_X=alive-7\necho M125G-PROOF\n")
+with open(os.path.join(share, "EDIT", "M125G.TXT"), "wb") as f:
+    f.write(b"m125g-session\n")
+print("staged PROFILE.SH + EDIT/M125G.TXT (run 18/19 session fixtures)")
 PY
 
 vgate_run 01 -- \
@@ -2364,3 +2393,257 @@ vgate_assert 17 serial-absent 'gotabwm: state drop'
 vgate_assert 17 serial-contains 'rx-web-state-restore-ok'
 vgate_assert 17 serial-absent '[EXC] parking:'
 vgate_assert 17 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 18 (M125g / #2592): the session-fidelity acceptance — ONE live session
+# carrying ALL THREE state clients at once, the shape a person actually
+# leaves behind: a terminal mid-session, a browser on a page, an editor
+# mid-edit.
+#
+#   GOTERM + WEB.ELF open first (one script2 — their strip order races but
+#   nothing below reads it: NEITHER takes typed input). GOTERM's cwd/env/
+#   scrollback ride /host/PROFILE.SH (the share's startup contract, staged
+#   in setup — silent lines, so no `goterm: line` markers exist for them;
+#   the blob's own decode in the python assert is the save-leg proof).
+#   WEB's blob is argv state — url + zoom rung (scroll/forms already proven
+#   field-level by runs 16/17).
+#   script3 waits on `session write n=2` — the seat's republish after the
+#   SECOND declare — so GOEDIT is provably the last exec: a new declare
+#   takes focus (interop.go "New declares take focus"), which pins the
+#   chord burst on the editor deterministically. 'z,z,z' lands in the
+#   buffer (dirty, caret 3), then `ctrl-shift-s` asks every bound tab.
+#
+# The run's end IS the hard kill: the expect matches mid-session, VMRunner
+# exits, and the machine stops existing — no suspend, no vzsave, nothing
+# but the crash-safe SESSION.TABS publish crossing onto the share. Run 19
+# is the restart half.
+#
+# exec-order: assert-proven -- the run ends on `gotabwm: snapshot saved`,
+# which only the snapshot arm prints after its collect+publish; a client
+# that never ran leaves the ask unanswered and the marker absent.
+
+vgate_file script-18.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-18.txt <<'EOF'
+dui focus 0
+exec GOTERM.ELF
+exec WEB.ELF /host/FORM.HTML
+EOF
+
+vgate_file script3-18.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/M125G.TXT
+EOF
+
+vgate_run 18 -- \
+    --screen '$RUN_DIR/screen-18' \
+    --via-virtio \
+    --script '$RUN_DIR/script-18.txt' \
+    --script2 '$RUN_DIR/script2-18.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-18.txt' \
+    --script3-after 'gotabwm: session write n=2' \
+    --input-chords 'z,z,z,ctrl-shift-s' \
+    --input-chords-after 'goedit: present' \
+    --script-expect 'gotabwm: snapshot saved' --timeout 300
+
+vgate_assert 18 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 18 serial-contains 'gotabwm: registered'
+vgate_assert 18 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 18 serial-contains 'goterm: declare accepted'
+vgate_assert 18 serial-contains 'goterm: attached'
+vgate_assert 18 serial-contains 'goterm: prompt'
+vgate_assert 18 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 18 serial-contains 'web: url /host/FORM.HTML'
+vgate_assert 18 serial-contains 'web: ready'
+vgate_assert 18 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 18 serial-contains 'goedit: declare accepted'
+vgate_assert 18 serial-contains 'goedit: read /host/EDIT/M125G.TXT n=14'
+vgate_assert 18 serial-contains 'goedit: present'
+# Fresh tabs honestly answer no stored state — three empty restores.
+vgate_assert 18 serial-absent 'state restored'
+# The typed text landed BEFORE the ask: dirty buffer, caret at byte 3.
+vgate_assert 18 serial-contains 'goedit: status line=2/2 col=4 *'
+# The snapshot chord asked all three bound tabs; every one answered and
+# the seat republished the session carrying all three blobs.
+vgate_assert 18 serial-count 'gotabwm: state ask id=' 3
+vgate_assert 18 serial-count 'gotabwm: state save id=' 3
+vgate_assert 18 serial-contains 'gotabwm: session write n=3'
+vgate_assert 18 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 18 serial-absent 'gotabwm: state drop'
+# Byte-level on the share: the file the kill leaves behind — three v2
+# records (one bin each), the AS trailer carrying one appver=1 blob per
+# row, and GOTERM's blob decoded to the state PROFILE.SH produced.
+vgate_assert 18 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] != 3:
+    sys.exit("SESSION.TABS header ver=%d count=%d want v2 n=3"
+             % (b[0], b[2]))
+bins = []
+for i in range(3):
+    rec = b[6 + i * 69:6 + (i + 1) * 69]
+    bins.append(rec[45:69].split(b"\x00")[0].decode())
+off = 6 + 3 * 69
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 3:
+    sys.exit("app_state trailer %r want AS ver=1 n=3" % b[off:off+6])
+p = off + 6
+blobs = {}
+for _ in range(3):
+    ent = b[p:p+8]
+    ln = int.from_bytes(ent[4:8], "little")
+    blob = b[p+8:p+8+ln]
+    if len(blob) != ln or ln == 0:
+        sys.exit("entry idx=%d len=%d truncated" % (ent[0], ln))
+    if ent[1] != 1:
+        sys.exit("entry idx=%d appver=%d want 1" % (ent[0], ent[1]))
+    blobs[bins[ent[0]]] = blob
+    p += 8 + ln
+for name in ("GOTERM.ELF", "WEB.ELF", "GOEDIT.ELF"):
+    if name not in blobs:
+        sys.exit("no app_state blob for %s (bins=%s)" % (name, bins))
+# GOTERM v1: u8 fmt | u8 flags | u16 cwdLen | cwd | u16 envN | pairs |
+# u32 scLen | scroll.
+g = blobs["GOTERM.ELF"]
+if g[0] != 1:
+    sys.exit("goterm blob fmt=%d" % g[0])
+cwdLen = int.from_bytes(g[2:4], "little")
+cwd = g[4:4+cwdLen].decode()
+if cwd != "/M125G":
+    sys.exit("goterm blob cwd=%r want /M125G" % cwd)
+envN = int.from_bytes(g[4+cwdLen:6+cwdLen], "little")
+p = 6 + cwdLen
+pairs = []
+for _ in range(envN):
+    pl = int.from_bytes(g[p:p+2], "little")
+    p += 2
+    pairs.append(g[p:p+pl].decode())
+    p += pl
+if "M125G_X=alive-7" not in pairs:
+    sys.exit("goterm blob env=%r lost M125G_X" % pairs)
+scLen = int.from_bytes(g[p:p+4], "little")
+scroll = g[p+4:p+4+scLen]
+if b"M125G-PROOF" not in scroll:
+    sys.exit("goterm scrollback (%d B) lost the proof line" % scLen)
+# WEB v1: u8 fmt | u8 flags | u16 zoom | u32 scroll | u16 urlLen | url...
+w = blobs["WEB.ELF"]
+ul = int.from_bytes(w[8:10], "little")
+url = w[10:10+ul]
+if w[0] != 1 or url != b"/host/FORM.HTML":
+    sys.exit("web blob fmt=%d url=%r" % (w[0], url))
+# GOEDIT v1: fmt byte + a non-empty blob; its field-level proof is the
+# app's own restored marker in run 19, not a second decode here.
+e = blobs["GOEDIT.ELF"]
+if e[0] != 1:
+    sys.exit("goedit blob fmt=%d" % e[0])
+print("SESSION.TABS: 3 rows %s, AS n=3 all appver=1; goterm cwd=%r env=%d "
+      "scroll=%dB; web url=%r; goedit len=%d"
+      % (bins, cwd, envN, scLen, url, len(e)))
+PY
+vgate_assert 18 serial-absent '[EXC] parking:'
+vgate_assert 18 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 19 (M125g / #2592): the restart half. A fresh boot of the same share
+# decodes the file run 18's hard kill left behind, re-execs all three rows
+# (bare bins — argv never survives, the blob is the only carrier), and each
+# app's restore_state hands its envelope back. The per-app markers ARE the
+# per-field proof: goterm reports the saved cwd/env/scroll tail, web the
+# url it re-navigated to, goedit the caret and the live undo ring.
+#
+# script3 rides on `session live n=3` — the settle after every pending row
+# adopted — and the run then holds the expect-tail window so the three
+# post-adoption restore markers (each app's own pace) reach the serial log
+# before teardown. A dropped row never lets the marker print: the run would
+# time out, never silently pass.
+
+vgate_file script-19.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-19.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-19.txt <<'EOF'
+wm
+dui
+echo rx-m125g-back-ok
+EOF
+
+vgate_run 19 -- \
+    --screen '$RUN_DIR/screen-19' \
+    --via-virtio \
+    --script '$RUN_DIR/script-19.txt' \
+    --script2 '$RUN_DIR/script2-19.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-19.txt' \
+    --script3-after 'gotabwm: session live n=3' \
+    --script-expect 'rx-m125g-back-ok' --script-expect-tail 15 --timeout 300
+
+vgate_assert 19 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 19 serial-contains 'gotabwm: registered'
+# The restart: the kill-surviving file decoded, all three rows re-exec'd
+# (session exec names the BIN, never the loader's `exec: loaded` — the
+# seat's own spawn path carries no argv).
+vgate_assert 19 serial-contains 'gotabwm: session load n=3 mode=restore'
+vgate_assert 19 serial-contains 'gotabwm: session reexec n=3'
+vgate_assert 19 serial-contains 'gotabwm: session exec GOTERM.ELF'
+vgate_assert 19 serial-contains 'gotabwm: session exec WEB.ELF'
+vgate_assert 19 serial-contains 'gotabwm: session exec GOEDIT.ELF'
+vgate_assert 19 serial-contains 'gotabwm: session live n=3'
+# No row dropped, no blob refused: every stored envelope went home.
+vgate_assert 19 serial-count 'gotabwm: state restore id=' 3
+vgate_assert 19 serial-absent 'gotabwm: session drop'
+vgate_assert 19 serial-absent 'gotabwm: state drop'
+vgate_assert 19 serial-absent 'state refused'
+vgate_assert 19 serial-absent 'goedit: state stale'
+vgate_assert 19 serial-absent 'state mismatch'
+# Per-app exact state: the terminal reports the saved cwd + env + the
+# replayed stream tail; the browser reports the blob's url; the editor
+# reports the caret and live rings the typed 'zzz' produced.
+vgate_assert 19 serial-contains 'goterm: state restored cwd=/M125G'
+vgate_assert 19 serial-contains 'web: state restored url=/host/FORM.HTML'
+vgate_assert 19 serial-contains 'goedit: state restored cur=17'
+vgate_assert 19 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"goterm: state restored cwd=(\S+) env=(\d+) back=(\d+) "
+              r"alt=(\d+) tail=(.*)$", ser, re.M)
+if not m:
+    sys.exit("missing goterm restore marker")
+if m.group(1) != "/M125G":
+    sys.exit("goterm cwd=%s" % m.group(1))
+if int(m.group(3)) <= 0:
+    sys.exit("goterm replayed an empty stream")
+m2 = re.search(r"web: state restored url=(\S+) scroll=(\d+) zoom=(\d+) "
+               r"forms=(\d+)/(\d+)$", ser, re.M)
+if not m2:
+    sys.exit("missing web restore marker")
+if m2.group(3) != "100":
+    sys.exit("web zoom=%s" % m2.group(3))
+m3 = re.search(r"goedit: state restored cur=(\d+) sel=(\S+) undo=(\d+) "
+               r"redo=(\d+) fh=(\d+) gh=(\d+)", ser)
+if not m3:
+    sys.exit("missing goedit restore marker")
+if int(m3.group(3)) < 1:
+    sys.exit("goedit restored with an empty undo ring")
+print("restored: goterm cwd=%s env=%s back=%sB alt=%s tail=%r | "
+      "web url=%s scroll=%s zoom=%s forms=%s/%s | "
+      "goedit cur=%s sel=%s undo=%s" %
+      (m.group(1), m.group(2), m.group(3), m.group(4), m.group(5),
+       m2.group(1), m2.group(2), m2.group(3), m2.group(4), m2.group(5),
+       m3.group(1), m3.group(2), m3.group(3)))
+PY
+vgate_assert 19 serial-contains 'rx-m125g-back-ok'
+vgate_assert 19 serial-absent '[EXC] parking:'
+vgate_assert 19 serial-absent 'exited status=139'
