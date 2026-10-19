@@ -161,3 +161,52 @@ first.
   `.userbss` SECTION base and by having the root builder construct
   missing tables for aperture slots (`mmu.zig` host regression test).
   `live-addrspaces`/`live-args`/`live-entropy`/`live-zc` now catch it.
+
+## Implementation amendments (M129b, #2611 — task-pool raise)
+
+- **`max_tasks` 16 → 64; the process registry 16 → 64 alongside.** The
+  M65d sizing (3 kernel + 3 runtimes × 4 Ms + 1 spare) was correct at 256
+  MiB: the guest RAM bound masked the pool. At the 512 MiB compiled
+  default (M129a) the pool is the sole concurrency bound — the
+  service-graph boot seats ~14 tasks, and a restored session re-execs
+  enough runtimes to exhaust all 13 user slots, where the runtime's
+  `newosproc` throws on `-EAGAIN` (the M120b crash observed under
+  session re-exec, #2577 evidence). Semantics unchanged: D1's 1:1
+  M↔task mapping, D2's last-task-exit lifecycle, D3's slot-73 refusal —
+  an over-cap spawn still refuses `EAGAIN` by name, and an over-cap exec
+  still returns `pool_full` (`error: no free scheduler pool slot`).
+  Only the bound moved.
+- **N = 64 chosen from measured per-task cost at 512 MiB.** A live task
+  costs a 48-page (192 KiB) EL1 kernel stack allocated at spawn plus a
+  ~1 KiB fixed-BSS slot (`@sizeOf(Task)` = 1064 B). 61 user slots → a
+  worst-case ~11.4 MiB of kstacks, ~2.3% of the ~494 MiB observed free
+  at the 512 MiB boot. The exec-side binder is not the pool: each exec'd
+  root consumes ~20 pages of the 512-page mmu table carve-out, so exec
+  refuses `.table_full` at ~24 concurrent roots — the pool can only be
+  saturated by `sys_thread` tasks, which share their process's root.
+  61 user slots ≈ 15 compiled-GOMAXPROCS=2 runtimes (4 Ms each) —
+  roughly 4× the seated-runtime pressure that crashed #2577.
+- **Registry parity, not headroom.** Every live task needs a live
+  process descriptor, so a 32-slot registry would silently re-cap the
+  pool at ~32. Each descriptor costs ~33.5 KiB BSS (the inline
+  `dynamic_pages` table dominates); 64 descriptors ≈ 2.2 MiB — which
+  pushed the KRN2 image past the loader's 16 MiB sanity cap, so
+  `kernel_max_size` grew to 32 MiB (loader allocates from any free UEFI
+  region; the cap is a check, not a layout bound).
+- **`max_threads` 6 → 16 alongside.** The per-process bound is a
+  different knob — it caps extra task seats per descriptor, not the
+  global count — but the storm leg showed 6 was too tight to leave a
+  seated runtime any lazy-M headroom: a program at ~4 runtime tasks plus
+  a few `sys_thread` children hit the descriptor bound, and its next
+  `newosproc` threw `fatal error: newosproc` on EAGAIN while the pool
+  still had slots (`tasks=61/64` observed). The refusal was by name but
+  the wrong bound refused — 16 extra seats restore the intended order:
+  a program's own Ms stop binding first at ~17 tasks/proc, and the
+  pool still bounds the total.
+- **`futex_max` tracks `max_tasks`** (D4 seat table is one entry per
+  task), so wait capacity scales automatically.
+- **The monitor's refusal names are unchanged.** `sys_thread` reports
+  `EAGAIN`; `sys_exec` reports the monitor line by name. The
+  spawn-storm leg in `go-stress.spec` asserts both: N concurrent Go
+  tasks survive at `tasks=64/64`, and the over-cap exec refuses with
+  the named pool-full error.

@@ -1,6 +1,8 @@
 # Declarative cold boot survives an external prerequisite kill before seating.
 # Keep its already-started dependent; hold the seat until fresh readiness.
-# Two single-task native services keep the ADR 0042 desktop budget at 16.
+# Two single-task native services keep the ADR 0042 desktop budget's
+# task-pool occupancy bounded (the pool is 64 after M129b; the leg
+# asserts zombies=0, not a pinned count).
 # The negative boots must relinquish init's tasks before direct fallback.
 # exec-order: assert-proven -- observation scripts run only after the hosted shell prompt.
 vgate_name live-boot-order "M92: mid-boot restart, dependency order, kill receipt and single-seat fallback"
@@ -110,7 +112,7 @@ assert serial.index("gotabwm: registered") < serial.index("init: seated")
 assert serial.count("gotabwm: registered\n") == 1
 assert serial.count("gotabwm: first-boot workspace") == 1
 assert serial.count("gosh: prompt") == 1
-assert re.search(r"tasks: [^\n]*pool=16/16 zombies=0", serial), "cold-boot task budget not observed"
+assert re.search(r"tasks: [^\n]*pool=(\d+)/64 zombies=0", serial), "cold-boot task budget not observed"
 for binary in ("INIT.ELF", "INITPRE.BIN", "INITDEP.BIN", "GOTABWM.ELF", "GOSH.ELF"):
     assert re.search(r"procs: [^\n]*name=" + re.escape(binary) + r" [^\n]*state=running", serial), binary
 print("svcgraph lexical order, subsequent-poll readiness, one seat and one shell observed")
@@ -187,7 +189,7 @@ assert serial.count("initpre: ready") == 2
 assert serial.count("gotabwm: registered\n") == 1
 assert serial.count("gotabwm: first-boot workspace") == 1
 assert serial.count("gosh: prompt") == 1
-assert re.search(r"tasks: [^\n]*pool=16/16 zombies=0", serial), "kill-boot task budget not observed"
+assert re.search(r"tasks: [^\n]*pool=(\d+)/64 zombies=0", serial), "kill-boot task budget not observed"
 for binary in ("INIT.ELF", "INITPRE.BIN", "INITDEP.BIN", "GOTABWM.ELF", "GOSH.ELF"):
     assert re.search(r"procs: [^\n]*name=" + re.escape(binary) + r" [^\n]*state=running", serial), binary
 receipt = pathlib.Path(os.environ["VG_SHARE"], "CRASH/INITPRE.BIN.TXT").read_text()

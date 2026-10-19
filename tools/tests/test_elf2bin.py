@@ -294,15 +294,15 @@ class Elf2BinTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("mutually exclusive", log)
 
-    def test_unchanged_loader_ceiling_includes_header_and_table(self):
-        self.assertEqual(elf2bin.KERNEL_MAX_SIZE, 16777216)
+    def test_loader_ceiling_includes_header_and_table(self):
+        self.assertEqual(elf2bin.KERNEL_MAX_SIZE, 33554432)  # M129b #2611: 16→32 MiB
         for excess in (0, 1):
             with self.subTest(excess=excess), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "out.bin"
                 output.write_bytes(b"previous-good-image")
                 size = elf2bin.KERNEL_MAX_SIZE - 40 - 24 + excess
                 if excess:
-                    with self.assertRaisesRegex(ValueError, "total=16777217 over=1"):
+                    with self.assertRaisesRegex(ValueError, "total=33554433 over=1"):
                         elf2bin._build_flat_reloc("fixture", output, 0, 0,
                                                  bytearray(size), [], [(0, 8, 8)])
                     self.assertEqual(output.read_bytes(), b"previous-good-image")
@@ -311,7 +311,7 @@ class Elf2BinTests(unittest.TestCase):
                         rc = elf2bin._build_flat_reloc("fixture", output, 0, 0,
                                                       bytearray(size), [], [(0, 8, 8)])
                     self.assertEqual(rc, 0)
-                    self.assertEqual(output.stat().st_size, 16777216)
+                    self.assertEqual(output.stat().st_size, 33554432)
         data = linked_elf()
         struct.pack_into("<Q", data, 64 + 2 * 56 + 40, 1 << 40)
         self.refuse(data, "loader ceiling: content=1099511648256 table=96")

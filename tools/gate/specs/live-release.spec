@@ -18,7 +18,8 @@
 #
 # (The one-shot `gorelease release` verb still drives the fleet as a
 # spawned child for standalone use; the gate splits it so the fleet churn
-# does not run under an extra resident process — kernel max_tasks=16.)
+# does not run under an extra resident process — kernel max_tasks was 16,
+# 64 after M129b / #2611.)
 #
 # Run 03 boots the guest-built image (--overlay-base RELEASE.IMG) with the
 # guest-built bundle armed as the share (--cvc-file BUNDLE/) and execs the

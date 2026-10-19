@@ -1,10 +1,11 @@
-# live-scale.spec -- pool scale at the 16-slot budget (M65d / #1442;
-# GOMAXPROCS=1 seating still fits): counter + up
+# live-scale.spec -- pool scale at the 64-slot budget (M129b / #2611;
+# was 16 under M65d): counter + up
 # to nine USER.BINs live at once (>= 6 running rows, all-distinct
 # tasks/stacks), every load runs the EL0 flow, the worker advances
-# mid-span, and EITHER the eleventh exec is refused OR every exec fit
+# mid-span, and EITHER a later exec is refused OR every exec fit
 # (both prove the substance; both occur across runs). The tables
-# carve-out keeps headroom. No --script-expect (full window).
+# carve-out is exec's first wall at 64 (live-m16-resources owns that
+# refusal's exact count). No --script-expect (full window).
 # Mirrors tools/verify-live-scale.sh (claim 5795 + C3 claim 0339 + #1426).
 
 vgate_name live-scale "ten live programs at the pool budget on VZ"

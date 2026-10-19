@@ -50,7 +50,8 @@
 # stripDone and skips the auto-close.
 #
 # Run 07 (M79f / #1717): four Go runtimes (seat + GOEDIT + GOTERM + GOCALC)
-# at GOMAXPROCS=1, exactly at the M65 max_tasks=16 budget. Once the rail
+# at GOMAXPROCS=1 — that fit the M65 max_tasks=16 budget (64 after M129b).
+# Once the rail
 # reaches n=3, one chord batch proves Ctrl+Tab wrapping from the focused third
 # cell to cell 1, then Ctrl+2 focusing cell 2. Both chords intentionally emit
 # the established alt-tab marker chain because they share the same focus path.

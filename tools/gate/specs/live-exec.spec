@@ -63,32 +63,33 @@ exec GOSELFHOST.ELF --spawn GOSELFHOST.ELF 1 -- --spawn STATUS43.BIN 2
 EOF
 
 # Run 03, leg A: eight CONCURRENT Zig children — proves breadth itself is
-# not the bound (8 x 1-task children + the 4-task Go parent stay inside the
-# 13-slot user side of the 16-task pool).
+# not the bound (8 x 1-task children + the 4-task Go parent stay well
+# inside the 61-slot user side of the 64-task pool — M129b).
 vgate_file m03a.txt <<'EOF'
 exec GOSELFHOST.ELF --spawn-par STATUS43.BIN 8 43
 EOF
 
-# Run 03, leg B: twelve concurrent Zig children — deliberately past the
-# task pool (parent's Go runtime holds ~4 of the 13 usable slots, so fewer
-# than 12 can ever be live at once): the excess spawns must come back as
-# named SPAWN-FAIL refusals, never as deaths or wedges. The exact
-# spawned/refused split rides on the zombie backlog — the bound asserted
-# is that the pool refuses OVER-subscription, not an exact count.
+# Run 03, leg B: seventy concurrent Zig children — deliberately past the
+# capacity bounds (M129b: 70 exec'd roots alone outrun the 512-page table
+# carve-out ~24 deep, and the 61-slot user side of the pool sits right
+# behind it): the excess spawns must come back as named SPAWN-FAIL
+# refusals, never as deaths or wedges. The exact spawned/refused split
+# rides on the zombie backlog — the bound asserted is that over-
+# subscription refuses by name, not an exact count.
 vgate_file m03b.txt <<'EOF'
-exec GOSELFHOST.ELF --spawn-par STATUS43.BIN 12 43
+exec GOSELFHOST.ELF --spawn-par STATUS43.BIN 70 43
 EOF
 
-# Run 03, leg C: three CONCURRENT Go runtimes — deliberately over the
-# pool's runtime-side bound: a GOMAXPROCS=2 child needs ~4 task slots of
-# Ms (primary + sysmon + helpers), and a 4-task parent plus three such
-# children oversubscribes the 16-slot pool, so some child's newosproc
-# throws (`sys_thread create failed` -> status 2) — the failure must be a
-# named status, never the amendment-8 tombstone. Which child draws the
-# short straw is scheduler order, so the leg asserts only that a verdict
-# prints and no child dies badly.
+# Run 03, leg C: sixteen CONCURRENT Go runtimes — deliberately over the
+# pool's runtime-side bound (M129b): a GOMAXPROCS=2 child needs ~4 task
+# slots of Ms (primary + sysmon + helpers), and a 4-task parent plus
+# sixteen such children oversubscribes the 64-slot pool, so some child's
+# newosproc throws (`sys_thread create failed` -> status 2) — the failure
+# must be a named status, never the amendment-8 tombstone. Which child
+# draws the short straw is scheduler order, so the leg asserts only that
+# a verdict prints and no child dies badly.
 vgate_file m03c.txt <<'EOF'
-exec GOSELFHOST.ELF --spawn-par GOHELLO.ELF 3 0
+exec GOSELFHOST.ELF --spawn-par GOHELLO.ELF 16 0
 EOF
 
 # Run 04, leg A: the amendment-8 shape exactly — the build loop's
@@ -198,25 +199,26 @@ vgate_assert 02 serial-absent 'unexpected status'
 
 # Run 03 — the matrix's breadth legs: concurrent children live in the pool
 # at once. par-zig8 is the control (breadth itself is not the bound);
-# par-zig12 forces the SPAWN-side refusal (ENOSPC task pool — a named
-# bound, not a death); par-go3 oversubscribes the pool at RUNTIME init
-# (a child's newosproc Ms cannot all fit, so some child exits status=2 —
+# par-zig70 forces the SPAWN-side refusal (ENOSPC — the table carve-out
+# is exec's first wall at 64 slots, a named bound either way, not a
+# death); par-go16 oversubscribes the pool at RUNTIME init (a child's
+# newosproc Ms cannot all fit, so some child exits status=2 —
 # never a wedge, never a 139 tombstone).
 vgate_run 03 -- --script '$RUN_DIR/m03a.txt' \
     --script2 '$RUN_DIR/m03b.txt' --script2-after 'of-8-survived STATUS43.BIN' \
-    --script3 '$RUN_DIR/m03c.txt' --script3-after 'of-12-survived STATUS43.BIN' \
-    --script-expect 'of-3-survived GOHELLO.ELF' --timeout 240
+    --script3 '$RUN_DIR/m03c.txt' --script3-after 'of-70-survived STATUS43.BIN' \
+    --script-expect 'of-16-survived GOHELLO.ELF' --timeout 300
 
 vgate_assert 03 serial-contains 'selfhost: spawn-par verdict=8-of-8-survived STATUS43.BIN'
 # The breadth bound: over-subscription refuses by name. How many spawned
-# before the pool ran dry rides on zombie reaping, so the pin is on the
+# before the bounds ran dry rides on zombie reaping, so the pin is on the
 # refusal existing and the run completing — the exact split is reported.
 vgate_assert 03 serial-count 'SPAWN-FAIL' 1
-vgate_assert 03 serial-contains 'of-12-survived STATUS43.BIN'
+vgate_assert 03 serial-contains 'of-70-survived STATUS43.BIN'
 # The Go-runtime bound: a verdict always prints; status=2 newosproc deaths
 # are the expected shape of the refusal. The tombstones that make a bound
 # a BUG are what must be absent.
-vgate_assert 03 serial-contains 'of-3-survived GOHELLO.ELF'
+vgate_assert 03 serial-contains 'of-16-survived GOHELLO.ELF'
 vgate_assert 03 serial-absent 'exited status=139'
 vgate_assert 03 serial-absent '[EXC] parking:'
 vgate_assert 03 serial-absent 'cannot allocate memory'
@@ -224,22 +226,22 @@ vgate_assert 03 serial-absent 'NO-STATUS'
 vgate_assert 03 python <<'PY'
 import os, re, sys
 ser = open(os.environ["VG_SER"], errors="replace").read()
-# Report the breadth verdicts; the par-go3 leg's K is scheduler-dependent
+# Report the breadth verdicts; the par-go16 leg's K is scheduler-dependent
 # (which child's newosproc hits the full pool first), so it is read, not
-# pinned — but SOME refusal must have occurred: if all three Go children
+# pinned — but SOME refusal must have occurred: if all sixteen Go children
 # survived, the recorded bound is wrong and the ADR needs re-measuring.
 verdicts = re.findall(r"selfhost: spawn-par verdict=(\d+)-of-(\d+)-survived (\S+)", ser)
 for k, n, img in verdicts:
     print("spawn-par verdict: %s-of-%s survived %s" % (k, n, img))
-go3 = [k for k, n, img in verdicts if img == "GOHELLO.ELF" and n == "3"]
-if len(go3) != 1:
-    sys.exit("FAIL: no par-go3 verdict line")
-print("par-go3 survived count: %s of 3 (task-pool bound: a status-2 "
-      "newosproc death, never a crash)" % go3[0])
-zig12 = [k for k, n, img in verdicts if img == "STATUS43.BIN" and n == "12"]
-if len(zig12) != 1 or int(zig12[0]) >= 12:
-    sys.exit("FAIL: par-zig12 must refuse past the pool (K<12), got %r" % zig12)
-print("par-zig12 spawned/survived: %s of 12 (the rest SPAWN-FAIL ENOSPC)" % zig12[0])
+go16 = [k for k, n, img in verdicts if img == "GOHELLO.ELF" and n == "16"]
+if len(go16) != 1 or int(go16[0]) >= 16:
+    sys.exit("FAIL: par-go16 must refuse past the pool (K<16), got %r" % go16)
+print("par-go16 survived count: %s of 16 (task-pool bound: a status-2 "
+      "newosproc death, never a crash)" % go16[0])
+zig70 = [k for k, n, img in verdicts if img == "STATUS43.BIN" and n == "70"]
+if len(zig70) != 1 or int(zig70[0]) >= 70:
+    sys.exit("FAIL: par-zig70 must refuse past the bounds (K<70), got %r" % zig70)
+print("par-zig70 spawned/survived: %s of 70 (the rest SPAWN-FAIL ENOSPC)" % zig70[0])
 PY
 
 # Run 04 — the amendment-8 shape itself: after the build loop's compile+link

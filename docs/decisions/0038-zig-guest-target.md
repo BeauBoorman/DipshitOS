@@ -632,13 +632,14 @@ refuses through the unchanged SDK ELF checker/linker: compiler-emitted
 PT_TLS, PIC/TLSDESC and dynamic TLS are **not** implicitly loaded by B5.
 This is an explicit native context API, not a std.Thread port.
 
-**Lifetime/capacity:** six extra threads per process, the existing 16-task
-global pool (shell/worker/idle included), and one existing 192 KiB kernel
+**Lifetime/capacity:** sixteen extra threads per process, the existing
+64-task global pool (shell/worker/idle included) — both raised by M129b
+(#2611) from six and 16 — and one existing 192 KiB kernel
 exception stack per child. Caller-owned stack/TLS bytes charge the existing
 mapped-image or mmap limits. Allocation or pool exhaustion refuses with
 `Capacity`; no budget grows. An exited native child retains its task seat
 and exception stack until its single-use process-bound join token is
-consumed. Retained children count against the six-thread cap. Join can
+consumed. Retained children count against the sixteen-thread cap. Join can
 park or observe an already exited child, returns its u8 status, orders its
 writes and permits caller-storage reuse; idle reap frees the exception
 stack. Self/foreign/stale/double joins and dependency chains refuse.

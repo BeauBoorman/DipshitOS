@@ -11,7 +11,8 @@
 #
 # M94g (#2007) appends two boots. `session` runs ONE combined OBSERVE
 # process over a real GOEDIT -heap session: ADR 0043 D7 budgets 16 tasks
-# and three separate viewers would need 23, so OBSERVE is one four-task
+# (64 after M129b) and three separate viewers would need 23, so OBSERVE
+# is one four-task
 # process carrying the M94b filtered tracer, the M94c 100 Hz sampler, and
 # the M94d kernel-memstat/in-process-series join. `combined` re-runs the
 # M94c fixed-work fixture under all three at once against the D6 <3%
@@ -322,18 +323,18 @@ assert any(int(x[3]) != int(samples[0][3]) for x in samples[1:]), \
 print("OBSERVED heap live-bytes series:", [int(x[3]) for x in samples])
 
 # Task budget: the mid-session `tasks` table in the serial log — the
-# four-task combiner must be ONE process, and the whole pool stays <=16.
+# four-task combiner must be ONE process, and the whole pool stays <=64.
 # Only the monitor's own table rows (two-space indent) count: the periodic
 # 'tasks <name> advances=N' reports are not the table. Serial writes from
 # the heap publisher can interleave MID-LINE, splitting 'pool=N' from
-# '/16 zombies=0' — parse each field separately and stitch.
+# '/64 zombies=0' — parse each field separately and stitch.
 m = re.search(r"tasks: enabled=1 current=\d+ switches=\d+ pool=(\d+)", ser)
 assert m, "no tasks header in serial"
 pool = int(m[1])
 z = re.search(r"/(\d+) zombies=(\d+)", ser[m.start():m.start()+600])
 assert z, "no tasks capacity/zombies tail in serial"
 maximum = int(z[1])
-assert maximum == 16, maximum
+assert maximum == 64, maximum
 assert pool <= maximum, "pool %d exceeds %d" % (pool, maximum)
 # Rows start after the header tail (wherever the interleave put it);
 # z.end() is relative to the 600-byte window, so re-anchor on m.start().
@@ -344,7 +345,7 @@ gedit = sum(1 for name in rows if "GOEDIT" in name)
 # One observer process (a second/third viewer would exec again and add
 # named rows), never more than the four-task budget line, and the table's
 # row count is the pool count itself. Observed on the reference host:
-# pool=10/16 — Go processes run one user-exec executor plus spawned named
+# pool=10/64 — Go processes run one user-exec executor plus spawned named
 # threads, so OBSERVE shows fewer than the D7 estimate's 4.
 assert ser.count("exec: loaded OBSERVE.ELF") == 1
 # The zig observer's table row displays as a generic EL0 name (user-exec /
@@ -354,7 +355,7 @@ assert ser.count("exec: loaded OBSERVE.ELF") == 1
 assert 0 <= obs <= 4, "observer task rows out of budget: %r" % rows
 assert gedit >= 1, rows
 assert len(rows) == pool, (len(rows), pool, rows)
-print("OBSERVED tasks pool=%d/16 rows=%r" % (pool, rows))
+print("OBSERVED tasks pool=%d/64 rows=%r" % (pool, rows))
 PY
 
 # --- M94g (#2007) combined: fixed-work under tracer+sampler+heap poll ----

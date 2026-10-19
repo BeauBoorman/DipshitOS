@@ -26,8 +26,19 @@
 # budget rather than an allocator invariant. sys_futex ≥ floor (slot-74
 # contention); sys_thread ≥ 2 (multi-M runtime, M65c).
 #
+# M129b (#2611) spawn-storm leg (run 07): at the 512 MiB default the
+# 64-slot task pool is the sole concurrency bound — twelve GOSTORM.ELF
+# instances each seat six slot-73 children (sys_thread op 0, same seam
+# the runtime's newosproc rides) after a 2 s settle window that lets
+# every exec'd runtime finish seating its own Ms first, so only children
+# absorb the overshoot: the pool saturates at tasks=64/64 with all twelve
+# programs still alive, children refuse EAGAIN, and one more exec gets
+# the named `error: no free scheduler pool slot`.
+#
 # HOST PREREQUISITE (not hermetic — see tools/go/README.md):
-# `just go-toolchain` must have produced .build/go/GOSTRESS.ELF.
+# `just go-toolchain` must have produced .build/go/GOSTRESS.ELF; run 07
+# also needs .build/go/GOSTORM.ELF (bash tools/go/build-storm.sh) and
+# COUNTER.BIN.
 #
 # exec-order: assert-proven -- runs 01/02 are a single exec whose script2
 # waits on the kernel's final process-exit report to read its retained
@@ -428,4 +439,83 @@ print("heap 100-poll budget:", summary)
 with open(os.path.join("artifacts", "m94d-budget-" + os.environ["VG_TAG"] + ".json"), "w") as f:
     json.dump(summary, f)
 assert summary["mean_ns"] <= 100000 and summary["p95_ns"] <= 100000, summary
+PY
+
+# ---------------------------------------------------------------------------
+# M129b (#2611) run 07: spawn-storm — saturate the 64-slot task pool with
+# concurrent slot-73 children and prove the named over-cap refusal.
+# ---------------------------------------------------------------------------
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+for name in ("GOSTORM.ELF",):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit(name + " missing: bash tools/go/build-storm.sh")
+    shutil.copy(src, os.path.join(share, name))
+# COUNTER.BIN ships in the standard seed share (the kernel build's
+# zig-out/bin) — live-m16-resources execs it the same way.
+PY
+
+vgate_file script-storm.txt <<'EOF'
+exec GOSTORM.ELF 6 0
+exec GOSTORM.ELF 6 1
+exec GOSTORM.ELF 6 2
+exec GOSTORM.ELF 6 3
+exec GOSTORM.ELF 6 4
+exec GOSTORM.ELF 6 5
+exec GOSTORM.ELF 6 6
+exec GOSTORM.ELF 6 7
+exec GOSTORM.ELF 6 8
+exec GOSTORM.ELF 6 9
+exec GOSTORM.ELF 6 10
+exec GOSTORM.ELF 6 11
+EOF
+
+# script2 fires on the FIRST `gostorm: up` marker (~10 s post-exec: the
+# settle window lets every peer's runtime seat before children spawn);
+# the 25 s delay covers the staggered settles (~5.5 s spread) plus the
+# retry windows (a full-pool proc retries ~10 s: its 20 ms sleeps land
+# on ~1 s tick edges), so all twelve reports precede the read —
+# `resources` reads a stable saturated pool and the one-more-exec gets
+# the named pool-full refusal by name.
+vgate_file script2-storm.txt <<'EOF'
+resources
+exec COUNTER.BIN
+echo storm-pool-full
+EOF
+
+vgate_run 07 -- --script '$RUN_DIR/script-storm.txt' \
+    --script2 '$RUN_DIR/script2-storm.txt' --script2-after 'gostorm: up spawned=' \
+    --script2-delay 25 --script-expect 'storm-pool-full' --timeout 240
+
+vgate_assert 07 serial-count 'exec: loaded GOSTORM.ELF' 12
+vgate_assert 07 serial-count 'gostorm: up spawned=' 12
+vgate_assert 07 serial-contains 'resources: tasks=64/64'
+vgate_assert 07 serial-contains 'error: no free scheduler pool slot'
+vgate_assert 07 serial-contains 'storm-pool-full'
+vgate_assert 07 serial-absent 'fatal error:'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+ups = re.findall(r"gostorm: up spawned= (\d+)  refused= (\d+)", ser)
+if len(ups) != 12:
+    sys.exit("FAIL: expected 12 gostorm reports, got %d: %s" % (len(ups), ups))
+spawned = sum(int(a) for a, _ in ups)
+refused = sum(int(b) for _, b in ups)
+if refused == 0:
+    sys.exit("FAIL: no slot-73 EAGAIN refusal observed (over-cap spawn "
+             "must refuse by name)")
+# 12 procs x (runtime Ms + up to 6 children, ≤16-seat thread bound) must
+# cover the 61 user slots; saturation is separately asserted by
+# `resources: tasks=64/64`.
+if spawned == 0:
+    sys.exit("FAIL: no slot-73 child task seated")
+# The over-cap exec refusal follows the saturated-pool read.
+if ser.index("resources: tasks=64/64") >= ser.index("error: no free scheduler pool slot"):
+    sys.exit("FAIL: pool-full refusal did not follow the saturated read")
+print("go-storm leg OK: 12 procs, spawned=%d slot-73 children, refused=%d (EAGAIN), "
+      "tasks=64/64, exec pool_full by name" % (spawned, refused))
 PY

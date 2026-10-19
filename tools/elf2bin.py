@@ -62,7 +62,7 @@ HEADER_SIZE = 24
 HEADER_SIZE_SEGMENTS = 48
 HEADER_SIZE_RELOC = 40
 RELOC_ENTRY_SIZE = 24
-KERNEL_MAX_SIZE = 16 * 1024 * 1024  # boot/src/main.zig's unchanged loader ceiling
+KERNEL_MAX_SIZE = 32 * 1024 * 1024  # boot/src/main.zig's loader ceiling (M129b #2611: 16→32 — the 64-slot process registry's fixed BSS)
 
 SHT_SYMTAB = 2
 SHT_RELA = 4

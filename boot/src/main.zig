@@ -85,7 +85,12 @@ const kernel_magic_reloc: u32 = 0x324E524B;
 const kernel_header_size: usize = 24;
 const kernel_header_size_reloc: usize = 40;
 const kernel_reloc_entry_size: usize = 24;
-const kernel_max_size: u64 = 16 * 1024 * 1024; // sanity cap for this milestone
+// M129b (#2611): the sanity cap grew 16 → 32 MiB — the 64-slot process
+// registry adds ~1.6 MiB of fixed BSS (each descriptor inlines a
+// `dynamic_pages` record table) and pushed the image past 16 MiB.
+// Still only a sanity cap: the loader allocates from any free UEFI
+// Boot Services region, so no layout bound sits behind it.
+const kernel_max_size: u64 = 32 * 1024 * 1024; // sanity cap for this milestone
 // M113b (ADR 0054): the loader's own image path on the ESP — the
 // self-measurement source for the `stage=loader` receipt digest.
 const loader_image_path = utf16z("\\EFI\\BOOT\\BOOTAA64.EFI");

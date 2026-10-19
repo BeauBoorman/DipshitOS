@@ -118,9 +118,21 @@ const user_stack_section = if (builtin.object_format == .elf) ".userbss" else "_
 /// plus shell + worker + idle = 15 occupied. Same one-spare headroom as
 /// #1426 → 16 (`idle_id` stays `max_tasks - 1`; THIRTEEN EL0t user slots).
 /// WM specs still pin GOMAXPROCS=1 (3 Ms/runtime); that still fits.
+/// M129b (#2611): at the 512 MiB default (M129a) the pool is the sole
+/// concurrency bound — a service-graph boot plus a restored session can
+/// saturate all 16 slots, and the runtime's `newosproc` then throws on
+/// EAGAIN (the M120b crash observed under session re-exec). Measured cost
+/// per live task: a 48-page (192 KiB) EL1 kstack allocated at spawn plus
+/// a ~1 KiB BSS slot; the futex wait-table seats one entry per task.
+/// 64 slots = 61 EL0t user slots ≈ 15 compiled-GOMAXPROCS runtimes;
+/// worst-case kstack footprint 61 × 48 pages ≈ 11.4 MiB (~2.3% of the
+/// ~494 MiB observed free at the 512 MiB boot). The exec-side binder
+/// stays the 512-page table carve-out (~20 tables per live process
+/// root) — thread tasks share their process's root, so the pool can
+/// only be saturated by sys_thread tasks, not by exec'd programs alone.
 /// Fixed at comptime — no allocation, no dynamic registration or
 /// processes; the lifecycle's spawn/reap only recycle these slots.
-pub const max_tasks: usize = 16;
+pub const max_tasks: usize = 64;
 /// The idle task's fixed slot (registered by `init`, never recycled).
 pub const idle_id: usize = max_tasks - 1;
 /// The worker's static stack (BSS, like every other kernel global). The
