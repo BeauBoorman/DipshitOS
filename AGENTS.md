@@ -47,11 +47,17 @@ scoping doc. Canonical answer lives in one place.
 - Do not implement work from later milestones.
 - Do not introduce libc or POSIX.
 - Do not change the boot default unless the card is explicitly about doing so.
-- **No GPL-family code, ever.** Never vendor, copy, port, translate, link or
-  ship GPL, LGPL or AGPL code anywhere in VirelaiOS: the guest, the host app,
-  the build or this repository. A new dependency, host tool or test reference
-  must not be GPL-family either; if no alternative exists, stop and ask the
-  owner. Record the license whenever you adopt a third-party input.
+- **No GPL-family code in the system, the build, or this repository, ever.**
+  Never vendor, copy, port, translate, link or ship GPL, LGPL or AGPL code
+  in the guest system, the host app, the build or this repository. A new
+  dependency, host tool or test reference must not be GPL-family either; if
+  no alternative exists, stop and ask the owner. Record the license whenever
+  you adopt a third-party input.
+  - The one exception is a GPL-family program shipped as a signed store
+    payload built in its own sibling repository and installed through STORE
+    (ADR 0058): everything GPL — source, headers, patches, license text,
+    binaries — lives in that sibling repo and travels the signed channel,
+    never this repository, the system image, or the build.
 
 ## Evidence rules
 
