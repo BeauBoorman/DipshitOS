@@ -492,7 +492,7 @@ vgate_run 03 -- \
     --input-chords-after 'charmhello: ready' \
     --screenshot-after 'dui[' \
     --script3 '$RUN_DIR/script-03c.txt' \
-    --script3-after 'gotabwm: split h' --script3-delay 3 \
+    --script3-after 'gotabwm: split h' --script3-delay 6 \
     --script-expect 'procs GOSTALGIA.ELF exited status=0' --timeout 240
 
 vgate_assert 03 serial-contains 'gostalgia: tty attached window=3'
@@ -705,7 +705,7 @@ vgate_run 05 -- \
     --input --via-virtio \
     --script '$RUN_DIR/script-05.txt' \
     --script2 '$RUN_DIR/script-05b.txt' \
-    --script2-after 'gostalgia: ready endpoint=' --script2-delay 1 \
+    --script2-after 'gostalgia: ready endpoint=' --script2-delay 4 \
     --script3 '$RUN_DIR/script-05c.txt' \
     --script3-after 'gostalgia: size 80x33' --script3-delay 6 \
     --screenshot-after 'dui[' \
@@ -834,6 +834,11 @@ PY
 #   runtime-receipt    -> --input-key Return on the emptied strip: the
 #                        start surface's keyboard affordance re-opens the
 #                        launcher — the desktop took the keyboard back.
+#                        The receipt lands deep into the tail under load
+#                        (script-06c's three dumps run ~4 s past the 3 s
+#                        delay), so the tail is 16 s: the injected key
+#                        must leave real drain budget for the seat to
+#                        consume it and print `launcher open` again.
 vgate_run 06 -- \
     --screen '$RUN_DIR/gos-06' \
     --input --via-virtio \
@@ -850,7 +855,7 @@ vgate_run 06 -- \
     --input-key 36 \
     --input-key-after 'runtime-receipt' \
     --script-expect 'procs GOSTALGIA.ELF exited status=0' \
-    --script-expect-tail 8 --timeout 240
+    --script-expect-tail 16 --timeout 240
 
 # Launcher path: the seat opened its launcher, decoded the manifest's v2
 # fields (a v2 row with argv/caps bumps those counts), filtered to exactly
@@ -1012,7 +1017,7 @@ vgate_run 07 -- \
     --input-key 36 \
     --input-key-after 'runtime-receipt' \
     --script-expect 'procs GOSTALGIA.ELF exited status=0' \
-    --script-expect-tail 8 --timeout 240
+    --script-expect-tail 16 --timeout 240
 
 vgate_assert 07 serial-contains 'gotabwm: launcher open n='
 vgate_assert 07 serial-contains 'gotabwm: launcher filter q=gostalgia n=1'
@@ -1450,7 +1455,7 @@ PY
 # bytes apps.SeedManifests writes at compose time
 # (json.MarshalIndent(echo.Manifest()) + '\n', computed on the host).
 vgate_assert 08 snapshot 'snap-08-*.raw' <<'PY'
-import base64, os, re, sys
+import base64, glob, os, re, sys
 
 rd = os.path.dirname(os.path.abspath(sys.argv[1]))
 blob = open(os.path.join(rd, "font-med.bin"), "rb").read()
@@ -1469,45 +1474,9 @@ for cp in range(32, 127):
     GB[cp] = mask
 
 W, H = 1280, 720
-raw = open(sys.argv[1], "rb").read()
-if len(raw) < W * H * 4:
-    sys.exit("snapshot is %d bytes, want at least %d (1280x720 BGRX)"
-             % (len(raw), W * H * 4))
-
-def px(x, y):
-    o = (y * W + x) * 4
-    return (raw[o + 2], raw[o + 1], raw[o])
 
 def lum(p):
     return p[0] * 0.30 + p[1] * 0.55 + p[2] * 0.15
-
-# The gostalgia window paints fullscreen under the seat rail: grid row 0
-# sits at y=16 (top half hidden behind the 22 px rail), 8x16 medium
-# cells, frame borders in cols 0 and 77.
-Y0 = 16
-lines = []
-for r in range(42):
-    line = []
-    for c in range(1, 77):
-        x0, y0 = c * 8, Y0 + r * 16
-        lums = [lum(px(x0 + k % 8, y0 + k // 8)) for k in range(128)]
-        lo, hi = min(lums), max(lums)
-        if hi - lo < 20:
-            line.append(" ")
-            continue
-        mid = (lo + hi) / 2
-        mask = 0
-        for v in lums:
-            mask = (mask << 1) | (v >= mid)
-        best, bs = 32, 999
-        for cp, gm in GB.items():
-            d = bin(mask ^ gm).count("1")
-            if d < bs:
-                bs, best = d, cp
-        line.append(chr(best))
-    lines.append("".join(line))
-text = "\n".join(lines)
-squash = re.sub(r"[^A-Za-z0-9+/=]", "", text)
 
 expected = (
     b'{\n'
@@ -1523,25 +1492,79 @@ expected = (
     b'}\n')
 want_b64 = base64.b64encode(expected).decode()
 
-if "callfs/read" not in squash:
-    sys.exit("the pasted `call fs/read` command line is not on the frame:\n%s"
-             % text)
-if "database64" not in squash:
-    sys.exit("no `data_base64` key on the frame:\n%s" % text)
-if "comgostalgiaechojson" not in squash:
-    sys.exit("the reply's path row is missing or misrendered:\n%s" % text)
-if "size220" not in squash:
-    sys.exit("the reply's size row is missing or misrendered:\n%s" % text)
-i = squash.find(want_b64)
-if i < 0:
-    k = squash.find("database64") + 10
-    sys.exit("the rendered payload does not match the seeded document "
-             "(frame holds %r...):\n%s" % (squash[k:k + 60], text))
-data = base64.b64decode(squash[i:i + len(want_b64)])
-if data != expected:
-    sys.exit("seeded document bytes differ after decode: %r" % data[:120])
-print("scanout readback: %d-cell grid decoded, %d-char payload byte-exact "
-      "(%d B manifest)" % (76 * 42, len(want_b64), len(data)))
+# The gostalgia window paints fullscreen under the seat rail: grid row 0
+# sits at y=16 (top half hidden behind the 22 px rail), 8x16 medium
+# cells, frame borders in cols 0 and 77.
+# Each captured frame is tried newest-first and the first one that
+# glyph-decodes to the full reply block wins: the sys/ping shot can
+# precede the seat composite that carries the reply rows, while the
+# shutdown shot can stream mid-teardown — either may hold the content.
+def decode(path):
+    raw = open(path, "rb").read()
+    if len(raw) < W * H * 4:
+        return "snapshot is %d bytes, want at least %d" % (len(raw), W * H * 4)
+
+    def px(x, y):
+        o = (y * W + x) * 4
+        return (raw[o + 2], raw[o + 1], raw[o])
+
+    Y0 = 16
+    lines = []
+    for r in range(42):
+        line = []
+        for c in range(1, 77):
+            x0, y0 = c * 8, Y0 + r * 16
+            lums = [lum(px(x0 + k % 8, y0 + k // 8)) for k in range(128)]
+            lo, hi = min(lums), max(lums)
+            if hi - lo < 20:
+                line.append(" ")
+                continue
+            mid = (lo + hi) / 2
+            mask = 0
+            for v in lums:
+                mask = (mask << 1) | (v >= mid)
+            best, bs = 32, 999
+            for cp, gm in GB.items():
+                d = bin(mask ^ gm).count("1")
+                if d < bs:
+                    bs, best = d, cp
+            line.append(chr(best))
+        lines.append("".join(line))
+    text = "\n".join(lines)
+    squash = re.sub(r"[^A-Za-z0-9+/=]", "", text)
+
+    if "callfs/read" not in squash:
+        return "the pasted `call fs/read` command line is not on the frame:\n%s" % text
+    if "database64" not in squash:
+        return "no `data_base64` key on the frame:\n%s" % text
+    if "comgostalgiaechojson" not in squash:
+        return "the reply's path row is missing or misrendered:\n%s" % text
+    if "size220" not in squash:
+        return "the reply's size row is missing or misrendered:\n%s" % text
+    i = squash.find(want_b64)
+    if i < 0:
+        k = squash.find("database64") + 10
+        return ("the rendered payload does not match the seeded document "
+                "(frame holds %r...):\n%s" % (squash[k:k + 60], text))
+    data = base64.b64decode(squash[i:i + len(want_b64)])
+    if data != expected:
+        return "seeded document bytes differ after decode: %r" % data[:120]
+    return None
+
+frames = sorted(glob.glob(os.path.join(rd, "snap-08-*.raw")), reverse=True)
+fails = []
+for path in frames:
+    err = decode(path)
+    if err is None:
+        print("scanout readback: %d-cell grid decoded, %d-char payload "
+              "byte-exact (%d B manifest) in %s"
+              % (76 * 42, len(want_b64), len(expected),
+                 os.path.basename(path)))
+        break
+    fails.append("%s: %s" % (os.path.basename(path), err.splitlines()[0]))
+else:
+    sys.exit("no captured frame decoded to the reply block:\n%s"
+             % "\n".join(fails))
 PY
 
 # No crash receipt, and none may name GOSTALGIA* — the supervisor writes

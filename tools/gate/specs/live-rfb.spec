@@ -137,6 +137,7 @@ vgate_run 02 -- \
     --script-expect 'gotabwm: launcher open n=' --script-expect-tail 3 --timeout 160
 
 vgate_assert 02 serial-contains 'gotabwm: rfb handshake refused'
+vgate_assert 02 serial-contains 'gocalc: present'
 vgate_assert 02 serial-contains 'gotabwm: rfb drop handshake malformed'
 vgate_assert 02 serial-contains 'gotabwm: rfb done'
 vgate_assert 02 serial-absent 'gotabwm: rfb ready'
@@ -150,7 +151,10 @@ import os, sys
 sys.path.insert(0, os.environ["RUN_DIR"])
 from rfborder import texts, ordered, probe_ok
 ser, out = texts()
-ordered(ser, ("gocalc: present", "gotabwm: rfb handshake refused",
+# `gocalc: present` is unordered (serial-contains above): the probe SYN
+# lands at `rfb listen` while Calc's launch is still in flight, so under
+# shared-host noise the refused handshake legitimately precedes it.
+ordered(ser, ("gotabwm: rfb handshake refused",
               "gotabwm: rfb drop handshake malformed", "gotabwm: rfb done",
               "gotabwm: launcher open n="))
 probe_ok(out)

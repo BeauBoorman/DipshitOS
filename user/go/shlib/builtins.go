@@ -919,10 +919,9 @@ func bSuspend(c *cmdCtx) int {
 	return 1
 }
 
-// bSleep parks the shell for about n "seconds" — at the glue's 100:1
-// conversion that is 100·n of the kernel's 1 Hz ticks, so `sleep 1` is a
-// ~100 s park today (pre-existing; observed on VZ 2026-10-11). The 60
-// bound still applies; on an interactive host Ctrl-C is now the escape.
+// bSleep parks the shell for n seconds — one 1 Hz sys_sleep tick each
+// (kernel/src/timer.zig period_ns: a tick IS a second). The 60 bound still
+// applies; on an interactive host Ctrl-C is the escape.
 func bSleep(c *cmdCtx) int {
 	if len(c.args) != 1 {
 		c.out([]byte("gosh: sleep SECONDS\n"))
@@ -937,7 +936,7 @@ func bSleep(c *cmdCtx) int {
 		if intr := c.sh.ttyPoll(); intr != nil {
 			// M98f: tick-granular so Ctrl-C ends the sleep (the blocking
 			// SleepSeconds would hold the whole duration).
-			for i := 0; i < n*ticksPerSleepSecond; i++ {
+			for i := 0; i < n; i++ {
 				if intr.Interrupted() {
 					c.sh.host.Out([]byte("^C\r\n"))
 					return statusInterrupted
