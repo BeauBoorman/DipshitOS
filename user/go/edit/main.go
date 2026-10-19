@@ -200,6 +200,13 @@ const (
 	markerRepl    = "goedit: replace '"
 	markerReplAll = "goedit: replace-all '"
 
+	// M123d (#2578): the shared in-app error banner. `banner` is the raise
+	// — the failure text the strip shows — printed only after the frame
+	// that carries it is presented; `banner act` is the resolution (`copy`,
+	// `copy rc=` on a refused clipboard write, or `dismiss`).
+	markerBanner    = "goedit: banner "
+	markerBannerAct = "goedit: banner act "
+
 	// M81d (#1764): the advisory write lease's console receipts. The open
 	// marker names the holder pid the record now carries (the takeover's
 	// receipt); the save-error line carries the -ErrEAGAIN refusal when
@@ -456,6 +463,13 @@ type editor struct {
 	pick        appkit.FilePicker
 	dlg         appkit.Dialog
 	pickOpenAsk bool
+
+	// M123d (#2578): the shared error banner — the inline strip across the
+	// top of the document band for open/save failures (banner.go owns the
+	// raise/route/resolve half). bannerFresh latches a raise so the marker
+	// prints only after the strip's own frame is on scanout.
+	banner      appkit.ErrorBanner
+	bannerFresh bool
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -587,6 +601,7 @@ func main() {
 	// The first frame is on the scanout: the gate releases the injected
 	// keystrokes on this marker, so the editor is already in its event loop.
 	vi.ConsoleLine(markerPresent)
+	e.bannerFlush()
 	e.emitStatus()
 
 	for {
@@ -625,11 +640,13 @@ func main() {
 		case tabapp.ActionResized:
 			e.draw()
 			ta.Present()
+			e.bannerFlush()
 			e.emitStatus()
 		case tabapp.ActionNone:
 			if e.handle(ev) {
 				e.draw()
 				ta.Present()
+				e.bannerFlush()
 				e.markStage()
 				e.emitStatus()
 			}
@@ -662,6 +679,12 @@ func (e *editor) load() {
 		e.diskLen = 0
 		e.diskHash = fnv1a64(nil)
 		vi.ConsoleLine(markerRead + e.path + " n=0 rc=" + vi.Itoa64(rc))
+		// M123d (#2578): a missing file is the create path — the empty
+		// buffer is the documented answer, not a failure. Every other
+		// open refusal raises the shared error banner.
+		if rc != -vi.ErrENOENT {
+			e.raiseBanner("open " + e.path + " failed rc=" + vi.Itoa64(rc))
+		}
 		return
 	}
 	e.buf = b
@@ -690,6 +713,12 @@ func (e *editor) handle(ev vi.Event) bool {
 	if ev.Kind == vi.EvWinBlur {
 		return e.commitAll(e.stage.Flush())
 	}
+	// M123d: a press inside the open banner's strip is the banner's; a
+	// press anywhere else is not — the document takes no mouse input, so
+	// an outside click falls through untouched.
+	if e.banner.Open && ev.Kind == vi.EvMouseDown {
+		return e.bannerPress(int(ev.Arg0), int(ev.Arg1))
+	}
 	return e.key(ev)
 }
 
@@ -701,6 +730,12 @@ func (e *editor) handle(ev vi.Event) bool {
 func (e *editor) key(ev vi.Event) bool {
 	if ev.Kind != vi.EvKeyDown {
 		return false
+	}
+	// M123d: the open banner owns the keyboard ahead of even the dead-key
+	// stage — a pending accent stays pending and no key reaches the
+	// document or a bar while the strip stands.
+	if e.banner.Open {
+		return e.bannerKey(ev)
 	}
 	before, _ := e.stage.Pending()
 	step := e.stage.Feed(layout.Input{
@@ -1688,10 +1723,12 @@ func (e *editor) markDirty() {
 func (e *editor) save() bool {
 	if rc := e.ensureLease(); rc < 0 {
 		vi.ConsoleLine(markerSaveErr + e.path + " " + vi.Itoa64(rc))
+		e.raiseBanner("save " + e.path + " refused rc=" + vi.Itoa64(rc))
 		return false
 	}
 	if rc := vi.WriteFileSafe(e.path, e.buf); rc < 0 {
 		vi.ConsoleLine(markerSaveErr + e.path + " " + vi.Itoa64(rc))
+		e.raiseBanner("save " + e.path + " failed rc=" + vi.Itoa64(rc))
 		return false
 	}
 	e.dirty = false
@@ -1963,12 +2000,18 @@ func (e *editor) draw() {
 			e.drawPreedit(textOrigin+col*adv, barY, pre)
 		}
 	}
-	// M124b: the modal surfaces paint last, over the document — the picker's
-	// own canvas plate, then the guard dialog if one is up.
+	// M124b: the modal surfaces paint over the document — the picker's own
+	// canvas plate, then the guard dialog if one is up.
 	if e.mode == modePicker {
 		e.pick.Draw(e.ta.Canvas())
 	} else if e.mode == modeDialog {
 		e.dlg.Draw(e.ta.Canvas())
+	}
+	// M123d: the error strip paints last of all — it stands over whatever
+	// the frame already drew.
+	if e.banner.Open && e.ta != nil {
+		e.banner.R = e.bannerRect()
+		e.banner.Draw(e.ta.Canvas())
 	}
 }
 

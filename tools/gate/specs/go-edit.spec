@@ -686,6 +686,8 @@ vgate_assert 10 serial-contains 'goedit: empty /host/EDIT/FRESH.TXT'
 vgate_assert 10 serial-contains 'goedit: present'
 vgate_assert 10 serial-contains 'rx-goedit-empty-ok'
 vgate_assert 10 serial-absent 'goedit: saved '
+# M123d: a missing file is the create path — the banner must NOT raise here.
+vgate_assert 10 serial-absent 'goedit: banner '
 vgate_assert 10 serial-absent '[EXC] parking:'
 vgate_assert 10 serial-absent 'exited status=139'
 
@@ -751,4 +753,73 @@ for y in range(200, 700):
             plate += 1
 print("goedit empty leg: surface-plate pixels=%d" % plate)
 assert plate >= 20000, "empty-state plate absent from the document area"
+PY
+
+# --- M123d (#2578) run 11: the shared error banner --------------------------
+# The deferred GOEDIT leg (the file was held by #2584 until #2693 merged).
+# `exec -u0` — the capable path, so CAP_CLIPBOARD lets Copy Error land —
+# opens GOEDIT on a DIRECTORY: the read refuses EINVAL (rc=-1, not the
+# ENOENT create path run 10 keeps banner-free), so the shared
+# appkit.ErrorBanner stands over the document and `goedit: banner open
+# /host/EDIT failed rc=-1` prints only after the strip's own frame. `c` is
+# the Copy Error arm: `goedit: banner act copy`, and the monitor's `clip`
+# reads the strip's text back out of the KERNEL buffer — bytes a fake
+# marker cannot produce. A typed char plus Ctrl-S then hits the staged
+# live lease (`--lease-fixture=live`): `goedit: save error /host/EDIT -11`
+# and a second raise — `goedit: banner save /host/EDIT refused rc=-11` —
+# that Escape dismisses (`goedit: banner act dismiss`). No snapshot leg:
+# under the shim-composited seat the app surface never reaches the
+# framebuffer the --screen capture reads (run 10's plate assert has the
+# same gap on this path) — the strip's paint is proven by the appkit
+# widget's own coverage and go-fileman's pixel leg; here the raise marker
+# is post-paint and the copy arm is verified through the kernel buffer.
+vgate_file script2-11.txt <<'EOS'
+exec -u0 GOEDIT.ELF /host/EDIT --lease-fixture=live
+EOS
+
+vgate_file script3-11.txt <<'EOS'
+clip
+dui close 2
+echo rx-goedit-banner-ok
+EOS
+
+vgate_run 11 -- \
+    --screen '$RUN_DIR/screen-11' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-11.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'c,X,ctrl-s,escape' \
+    --input-chords-after 'goedit: banner open /host/EDIT' \
+    --script3 '$RUN_DIR/script3-11.txt' \
+    --script3-after 'goedit: banner act dismiss' \
+    --script-expect 'rx-goedit-banner-ok' --timeout 240
+
+vgate_assert 11 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 11 serial-contains 'goedit: lease fixture live'
+# A directory is not a readable file: EINVAL, not the ENOENT create path.
+vgate_assert 11 serial-contains 'goedit: read /host/EDIT n=0 rc=-1'
+# The staged live lease refuses the open-time acquire too.
+vgate_assert 11 serial-contains 'goedit: lease held rc=-11'
+# The raise marker is post-paint: the strip is on scanout when it prints.
+vgate_assert 11 serial-contains 'goedit: banner open /host/EDIT failed rc=-1'
+# `c` was the Copy Error arm — the clipboard write succeeded (u0).
+vgate_assert 11 serial-contains 'goedit: banner act copy'
+vgate_assert 11 serial-contains 'goedit: dirty'
+vgate_assert 11 serial-contains 'goedit: save error /host/EDIT -11'
+vgate_assert 11 serial-contains 'goedit: banner save /host/EDIT refused rc=-11'
+vgate_assert 11 serial-contains 'goedit: banner act dismiss'
+vgate_assert 11 serial-contains 'rx-goedit-banner-ok'
+vgate_assert 11 serial-absent 'goedit: saved '
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 serial-absent 'exited status=139'
+
+# The external read: the kernel clipboard must hold the strip's own text —
+# the banner is the only path that could have put it there.
+vgate_assert 11 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+assert re.search(r"(?m)^clip: open /host/EDIT failed rc=-1\n", ser), \
+    "kernel clipboard must read back exactly the banner's error text"
+print("clipboard read-back verified: the banner's own text left the VM")
 PY
