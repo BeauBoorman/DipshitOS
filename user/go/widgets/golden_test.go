@@ -161,6 +161,13 @@ func TestWidgetFaceGoldens(t *testing.T) {
 			(&widgets.Slider{R: rect(84, 70, 130, 20), Max: 100, Value: 20, Focused: true}).Draw(c)
 			(&widgets.Slider{R: rect(84, 100, 130, 20), Max: 100, Value: 60, Disabled: true}).Draw(c)
 		}},
+		{"emptystate", 220, 204, func(c *draw.BufferCanvas) {
+			// The M123b plate with the ui face, then the bitmap degrade.
+			(&widgets.EmptyState{R: rect(4, 4, 212, 110), Icon: "?", Headline: "No matching apps",
+				Hints: []string{"esc clears the filter", "type a new query"}, Face: face}).Draw(c)
+			(&widgets.EmptyState{R: rect(4, 122, 212, 76), Icon: "|", Headline: "bitmap",
+				Hints: []string{"^s saves"}}).Draw(c)
+		}},
 		{"textinput", 200, 104, func(c *draw.BufferCanvas) {
 			idle := &widgets.TextInput{R: rect(4, 4, 192, 28), Face: face}
 			idle.SetValue("notes.txt")

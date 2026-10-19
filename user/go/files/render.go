@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"virelai/vi"
+	"virelai/widgets"
 )
 
 // Colours are truecolour on purpose: the class-B snapshot asserts the
@@ -168,11 +169,33 @@ func (m model) renderLines() []string {
 	return lines
 }
 
+// emptyListRows is the M123b (#2576) blank-surface presenter on the VT
+// grid: the shared widgets.EmptyState's Lines form — icon, headline and
+// the chords that still answer on a zero-entry listing, centred in the
+// pane's body where the frame used to paint bare spaces.
+func (m model) emptyListRows(w, body int) []string {
+	return widgets.EmptyState{
+		Icon:     "Ø",
+		Headline: "This folder is empty",
+		Hints:    []string{"p paste · backspace up", "v volumes · q quit"},
+	}.Lines(w, body)
+}
+
 // listRow is one list line padded to w inside its style, so the selection
 // background spans the full pane. i is a SCREEN row: the scroll offset
 // m.top maps it onto the listing (the cursor is always inside the window —
 // ensureSelVisible owns that invariant).
 func (m model) listRow(i, w int) string {
+	if m.n == 0 && m.path != volsPath {
+		rows := m.emptyListRows(w, m.bodyRows())
+		if i >= len(rows) {
+			return strings.Repeat(" ", w)
+		}
+		if strings.TrimSpace(rows[i]) == "" {
+			return rows[i]
+		}
+		return colDim + rows[i] + colReset
+	}
 	idx := m.top + i
 	if idx >= m.n {
 		return strings.Repeat(" ", w)

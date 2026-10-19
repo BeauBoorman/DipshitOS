@@ -925,3 +925,112 @@ vgate_assert 10 serial-absent 'gofiles: menu closed'
 vgate_assert 10 serial-absent 'gofiles: open file NOTES.TXT'
 vgate_assert 10 serial-absent '[EXC] parking:'
 vgate_assert 10 serial-absent 'exited status=139'
+
+# --- M123b (#2576) run 11: the empty listing's shared empty state ----------
+# GOFILES boots on FME, a directory with no entries: the list pane renders
+# the shared widgets.EmptyState (icon, headline, chord hints) through the
+# kit's Lines form instead of bare rows, and the model emits
+# `gofiles: empty <path>` with the list marker family — markers flush only
+# after the frame they describe is painted, so the serial line is itself
+# the render receipt. The screenshot then counts the hint ink (120,130,144)
+# in the body's middle band, where nothing else on an empty listing paints.
+vgate_file script-11.txt <<'EOS'
+exec GOFILES.ELF /host/FME
+EOS
+
+vgate_file script2-11.txt <<'EOS'
+dui close 2
+echo rx-go-fileman-empty-ok
+EOS
+
+vgate_setup_python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fme = os.path.join(share, "FME")
+os.makedirs(fme, exist_ok=True)
+if os.listdir(fme):
+    sys.exit("FME must be empty - the leg renders the zero-entry listing")
+print("staged empty dir FME")
+PY
+
+vgate_run 11 -- \
+    --screen '$RUN_DIR/fileman-empty-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-11.txt' \
+    --screenshot-after 'gofiles: empty /host/FME' \
+    --script2 '$RUN_DIR/script2-11.txt' \
+    --script2-after 'gofiles: empty /host/FME' \
+    --script-expect 'rx-go-fileman-empty-ok' --timeout 240
+
+vgate_assert 11 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 11 serial-contains 'gofiles: list /host/FME n=0'
+vgate_assert 11 serial-contains 'gofiles: empty /host/FME'
+vgate_assert 11 serial-contains 'gofiles: ready'
+vgate_assert 11 serial-contains 'rx-go-fileman-empty-ok'
+vgate_assert 11 serial-absent 'gofiles: list error'
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 serial-absent 'exited status=139'
+
+# The scanout: 2x capture, window client x=64..1088 y=96..832, cell 16x32.
+# The empty state's centred stack lands in body rows 9..13 -> y=384..544 of
+# the capture, list pane x=64..512 (64-col grid, 45% pane). The hint rows
+# are the only dim (120,130,144) paint in that band on an empty listing.
+vgate_assert 11 snapshot 'fileman-empty-screen-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
+            row[x] = (row[x] + pred) & 0xff
+    out += row
+    prev = row
+
+dim = 0
+for y in range(384, 544):
+    for x in range(64, 512):
+        k = (y * w + x) * bpp
+        if max(abs(out[k] - 120), abs(out[k+1] - 130), abs(out[k+2] - 144)) <= 40:
+            dim += 1
+print("fileman empty leg: hint-ink pixels=%d" % dim)
+assert dim >= 30, "empty-state hint ink absent from the list pane's body band"
+PY

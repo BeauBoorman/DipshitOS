@@ -24,6 +24,7 @@ import (
 	"virelai/vi"
 	"virelai/webrender"
 	"virelai/webstyle"
+	"virelai/widgets"
 )
 
 // Raw shim geometry; the actual resized canvas controls presentation.
@@ -123,9 +124,12 @@ const (
 	// resolved default text size.
 	markerZoom     = "web: zoom "
 	markerFontSize = "web: font-size "
-	markerReload        = "web: reload"
-	markerSettled       = "web: settled"
-	markerQuit          = "web: quit"
+	markerReload   = "web: reload"
+	markerSettled  = "web: settled"
+	// M123b (#2576): the blank viewport — the shared empty-state plate owns
+	// the content frame when no page is loaded and no load failed.
+	markerEmpty = "web: empty "
+	markerQuit  = "web: quit"
 	// The typography probes. They carry measurable facts (engine name,
 	// per-glyph advances, line heights) rather than adjectives, so a silent
 	// regression to the 8x8 bitmap fails the class-B gate instead of only
@@ -262,11 +266,11 @@ type app struct {
 	// The find-in-page bar (M126c #2595): open state, the field, the index
 	// over the current layout, the shared matcher's offsets, and the
 	// 0-based current match (-1 = none). findbar.go has the behavior.
-	findOpen         bool
-	findEdit         textEditor
-	findIdx          *webrender.FindIndex
-	findMatches      []int
-	findCur          int
+	findOpen    bool
+	findEdit    textEditor
+	findIdx     *webrender.FindIndex
+	findMatches []int
+	findCur     int
 	// M126d (#2596): this tab's zoom rung (percent; 100 = the contract's
 	// own) and the default web text px resolved from font_size. zoom.go
 	// owns the ladder, the settings read, and the reflow.
@@ -297,6 +301,10 @@ type app struct {
 	// M125d (#2589): the decoded session blob parked by noteState, consumed
 	// once by applyState on the first laid-out page after restore.
 	pend *webState
+	// M123b (#2576): the start surface — no target, no error; render() paints
+	// the shared widgets.EmptyState plate into the viewport. Set by
+	// showStartSurface, cleared by the first real navigation.
+	blank bool
 	// M124b (#2581): the save-as picker — Ctrl+Shift+S raises the shared
 	// appkit.FilePicker modal, which owns input and paint while open.
 	pick savePick
@@ -308,6 +316,12 @@ type virender struct {
 	win  int
 	pix  []uint32
 	w, h int
+}
+
+// FillRect makes the fill-only surface a widgets.RectCanvas — the shared
+// empty state paints its flat bitmap form through it (M123b #2576).
+func (v virender) FillRect(r widgets.Rect, rgb uint32) {
+	v.Fill(r.X, r.Y, r.W, r.H, rgb)
 }
 
 func (v virender) Fill(x, y, w, h int, rgb uint32) {
@@ -477,7 +491,7 @@ func (a *app) settleIfNeeded() {
 	if a.settled || a.loading {
 		return
 	}
-	if a.lay == nil && a.errKind == "" {
+	if a.lay == nil && a.errKind == "" && !a.blank {
 		return
 	}
 	a.render()
@@ -650,19 +664,24 @@ func (a *app) loop() {
 
 // --- navigation -----------------------------------------------------------
 
-// showStartSurface renders the "nothing loaded" page (still a real page: the
-// same pipeline, no special-casing of the viewport).
+// showStartSurface renders the "nothing loaded" frame: the M123b (#2576)
+// shared empty-state plate owns the viewport — icon, headline and the chords
+// a blank page still answers. It owns no fetch (tBody stamps the same tick so
+// the budget math stays monotonic) and no layout, so `web: paint`/`parse`
+// markers stay honest about what the pipeline did.
 func (a *app) showStartSurface() {
 	a.tNav0 = vi.Nanos()
+	a.tBody = a.tNav0
 	a.pageEnd = a.tNav0 + readDeadlineMs*1_000_000
-	body := []byte("<h1>VirelaiOS Browser</h1><p>No target. Pass a path or an HTTP URL on the command line:</p>" +
-		"<pre>exec WEB.ELF /host/PAGE.HTML\nexec WEB.ELF http://10.0.0.2/</pre>" +
-		"<p>Ctrl+L edits the URL. Enter loads it. Escape cancels. H or the v chip lists history. " +
-		"Ctrl+F finds in the page. Ctrl+D bookmarks the page. Ctrl+Shift+B opens the bookmark sidebar. F1 shows bounded diagnostics.</p>" +
-		"<p>This browser supports a declared CSS subset and GET forms. No JavaScript or POST.</p>")
 	a.target = ""
 	a.title = "Start"
-	a.loadBody(body, "/")
+	a.lay, a.doc = nil, nil
+	a.errKind, a.errMsg = "", ""
+	a.scroll = 0
+	a.blank = true
+	a.logPaint = true
+	a.dirty = true
+	vi.ConsoleLine(markerEmpty + "start")
 }
 
 func (a *app) navigate(target, from string) {
@@ -673,6 +692,7 @@ func (a *app) navigate(target, from string) {
 	if a.anchor(target) {
 		return
 	}
+	a.blank = false // any navigation retires the start surface
 	a.closeLoad()
 	a.loading = false
 	a.tNav0 = vi.Nanos()
@@ -1532,6 +1552,8 @@ func (a *app) render() {
 		webrender.Paint(a.lay, native, 0, 0, contentW, contentH, a.scroll)
 		a.painted = len(a.lay.Items)
 		a.paintFindHighlights(native)
+	} else if a.blank {
+		a.paintEmptyState(native)
 	} else {
 		a.paintErrorPage(native)
 	}
@@ -1616,6 +1638,9 @@ func (a *app) statusText() string {
 		return "diagnostics=" + itoa(len(a.diagnostics)) + " (F1 list) " + a.diagnostics[0].Text
 	}
 	if a.lay == nil {
+		if a.blank {
+			return "start"
+		}
 		return "error"
 	}
 	max := webrender.ScrollMax(a.lay, contentH)
@@ -1626,6 +1651,24 @@ func (a *app) statusText() string {
 		status += " zoom=" + itoa(a.zoomPct) + "%"
 	}
 	return status
+}
+
+// paintEmptyState is the M123b (#2576) blank viewport: the shared
+// widgets.EmptyState plate centred in the content frame — icon, headline and
+// the chords the start surface answers — the same shape GOFILES, GOEDIT and
+// the launcher draw. The virender surface is fill-only, so the kit paints its
+// flat bitmap form.
+func (a *app) paintEmptyState(vs virender) {
+	const pad = 24
+	(&widgets.EmptyState{
+		R:        widgets.Rect{X: pad, Y: pad, W: contentW - 2*pad, H: contentH - 2*pad},
+		Icon:     "@",
+		Headline: "Nothing loaded",
+		Hints: []string{
+			"Ctrl+L type an address · Enter loads it",
+			"exec WEB.ELF /host/PAGE.HTML · H history · Q quit",
+		},
+	}).Draw(vs)
 }
 
 func (a *app) paintErrorPage(vs virender) {

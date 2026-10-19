@@ -371,3 +371,71 @@ vgate_assert 07 snapshot 'snap-07-*.raw' <<'PY'
 import subprocess, sys
 subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'png-grid'])
 PY
+
+# --- M123b (#2576) run 08: the blank viewport's shared empty state ---------
+# `exec WEB.ELF` with NO target paints the start surface — since M123b that
+# is the shared widgets.EmptyState plate through the fill-only virender
+# (icon, headline, chord hints), not a fetched page, so `web: empty start`
+# prints and the settle arc still lands (`repaint items=0` is the honest
+# count for a surface that owns no layout).
+vgate_file script-empty.txt <<'EOS'
+exec WEB.ELF
+EOS
+
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-08' \
+    --script '$RUN_DIR/script-empty.txt' \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'web: ready' --timeout 120
+
+vgate_assert 08 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 08 serial-contains 'web: open id='
+vgate_assert 08 serial-contains 'web: empty start'
+vgate_assert 08 serial-contains 'web: settled'
+vgate_assert 08 serial-contains 'web: repaint items=0'
+vgate_assert 08 serial-contains 'web: ready'
+vgate_assert 08 serial-contains 'web: budget startup-ms='
+vgate_assert 08 serial-absent 'web: error'
+vgate_assert 08 serial-absent 'web: budget over'
+vgate_assert 08 serial-absent '[EXC] parking:'
+
+# The scanout (1280x720 BGRX): the 512x384 raw-shim window at (40,28) puts
+# the presented viewport at x=40..552, y=92..380 — the empty-state plate is
+# the Surface fill (34,45,53) covering it minus a 24px inset margin, with
+# centred text rows inside (anything non-Surface/Border in the middle band).
+vgate_assert 08 snapshot 'snap-08-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want %d" % (len(raw), need))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])
+
+SURFACE = (0x22, 0x2d, 0x35)
+BORDER = (0x33, 0x41, 0x55)
+PAGEBG = (0x18, 0x20, 0x26)
+
+plate = ring = textish = 0
+for y in range(100, 375):
+    for x in range(50, 545):
+        c = px(x, y)
+        if c == SURFACE:
+            plate += 1
+        elif c == BORDER:
+            ring += 1
+for y in range(150, 320):
+    for x in range(80, 510):
+        c = px(x, y)
+        if c not in (SURFACE, BORDER, PAGEBG):
+            textish += 1
+print("web empty leg: plate=%d ring=%d interior-text=%d" % (plate, ring, textish))
+assert plate >= 40000, "empty-state plate absent from the blank viewport"
+assert ring >= 400, "empty-state border ring missing"
+assert textish >= 50, "no empty-state text inside the viewport plate"
+PY

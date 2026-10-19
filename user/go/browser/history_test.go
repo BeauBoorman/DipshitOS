@@ -263,6 +263,7 @@ func TestMarkerConstants(t *testing.T) {
 		markerFetch:    "web: fetch ",
 		markerRedirect: "web: redirect n=",
 		markerSettled:  "web: settled",
+		markerEmpty:    "web: empty ",
 		markerHistOpen: "web: history n=",
 		markerHistRow:  "web: history ",
 		markerHistPick: "web: history pick ",

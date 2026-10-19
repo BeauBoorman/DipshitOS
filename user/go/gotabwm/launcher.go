@@ -31,7 +31,10 @@ const (
 	MarkerLaunchDismiss = "gotabwm: launcher dismiss"
 	MarkerLaunchMissing = "gotabwm: launcher missing "
 	MarkerLaunchEmblem  = "gotabwm: launcher emblem "
-	MarkerAppsDecode    = "gotabwm: apps decode n="
+	// M123b (#2576): the zero-match empty state — printed once per filter
+	// change from the frame that painted the shared plate, not per paint.
+	MarkerLaunchEmpty = "gotabwm: launcher empty"
+	MarkerAppsDecode  = "gotabwm: apps decode n="
 
 	hidUsageSpace  uint8 = 0x2C
 	hidUsageEnter  uint8 = 0x28
@@ -73,22 +76,23 @@ const (
 )
 
 type launcherState struct {
-	open      bool
-	palette   bool // M121a: the strip is the command palette, not the APPS.TXT launcher
-	catalog   []AppEntry
-	results   []paletteEntry // palette-mode catalog (launcher.go ranks one of the two)
-	filter    string
-	filtered  []int
-	sel       int
-	first     int // first visible filtered row
-	reasons   []string
-	err       string
-	sink      uint32
-	prior     uint32
-	painted   bool
-	width     int
-	height    int
-	launching bool
+	open       bool
+	palette    bool // M121a: the strip is the command palette, not the APPS.TXT launcher
+	catalog    []AppEntry
+	results    []paletteEntry // palette-mode catalog (launcher.go ranks one of the two)
+	filter     string
+	filtered   []int
+	sel        int
+	first      int // first visible filtered row
+	reasons    []string
+	err        string
+	sink       uint32
+	prior      uint32
+	painted    bool
+	emptyShown bool // M123b: the `empty` marker printed for the current frame
+	width      int
+	height     int
+	launching  bool
 
 	// emblem is the decoded mascot raster, decoded once lazily (the
 	// god-menu button paints it every tick, long before the first
@@ -175,6 +179,7 @@ func (l *launcherState) refresh() {
 		l.sel = 0
 	}
 	l.first = 0
+	l.emptyShown = false // the filter change re-arms the empty marker
 	l.keepSelectionVisible()
 }
 
@@ -615,11 +620,33 @@ func paintLauncher(scan []byte, width, height int) int {
 		seatText(c, strip, launchX+tok.PadMD, launchY+launchErrY, seatSmallPx, launchText(launch.err, 30), tok.Danger)
 	}
 	if len(launch.filtered) == 0 {
-		empty := "No matching apps"
+		// M123b (#2576): the shared empty-state plate in the results
+		// region — icon, the same headlines, and the chords that still
+		// answer on a zero-match strip.
+		headline := "No matching apps"
+		marker := MarkerLaunchEmpty
 		if launch.palette {
-			empty = "No matching commands"
+			headline = "No matching commands"
+			marker = MarkerPaletteEmpty
 		}
-		seatText(c, strip, launchX+tok.PadMD, launchY+launchHdr+6, seatTextPx, empty, tok.InkMuted)
+		hints := []string{"type a filter · esc clears"}
+		if launch.filter == "" {
+			hints = []string{"esc dismisses"}
+		}
+		(&widgets.EmptyState{
+			R: widgets.Rect{X: launchX + tok.PadMD, Y: launchY + launchHdr,
+				W: launchW - 2*tok.PadMD - launchRule, H: maxH - launchHdr - tok.PadMD},
+			Icon:     "?",
+			Headline: headline,
+			Hints:    hints,
+			Face:     seatFaceUI(),
+		}).Draw(c)
+		written += seatArea(c, widgets.Rect{X: launchX + tok.PadMD, Y: launchY + launchHdr,
+			W: launchW - 2*tok.PadMD - launchRule, H: maxH - launchHdr - tok.PadMD})
+		if !launch.emptyShown {
+			launch.emptyShown = true
+			vi.ConsoleLine(marker)
+		}
 	}
 	for i := launch.first; i < len(launch.filtered); i++ {
 		x, y, w, rh, ok := launch.rowRect(i, width, maxH)
