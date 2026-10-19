@@ -577,6 +577,14 @@ fi
 echo
 echo "── warm-checkpoint legs (ADR 0059, stub runner, no VM) ──"
 
+# Same convention as the premature-exit block above: these cases drive the
+# real vgate.sh end to end, so they need a shell that clears the floor.
+# Literal `bash` is /bin/bash 3.2 under CI's job PATH, where every leg's
+# verdict collapsed into the floor's rc=2 refusal (job 117845817253).
+# Drive through $MODERN_BASH; where no modern bash exists, skip loudly
+# like the block above.
+if [ -n "$MODERN_BASH" ]; then
+
 STUB_RUNNER="$TMP/vmrunner-stub"
 cat > "$STUB_RUNNER" <<'SH'
 #!/usr/bin/env bash
@@ -680,7 +688,7 @@ export VZ_HV_PROBE_BIN
 
 VGATE_NO_BUILD=1 VZ_RUNNER_BIN="$STUB_RUNNER" STUB_VZ_LOG="$TMP/stub.log" \
     VIRELAI_RUN_DIR_BASE="$TMP" VIRELAI_KEEP_RUN=1 \
-    bash tools/gate/vgate.sh "$WARM_SPEC" > "$TMP/vgate-warm.out" 2>&1
+    "$MODERN_BASH" tools/gate/vgate.sh "$WARM_SPEC" > "$TMP/vgate-warm.out" 2>&1
 warm_rc=$?
 
 RUN_DIR_LEFT="$(ls -d "$TMP"/virelai-warm-mini.* 2>/dev/null | head -1)"
@@ -751,7 +759,7 @@ rm -f artifacts/warm-mini-*
 : > "$TMP/stub.log"
 VGATE_NO_BUILD=1 VGATE_WARM=off VZ_RUNNER_BIN="$STUB_RUNNER" STUB_VZ_LOG="$TMP/stub.log" \
     VIRELAI_RUN_DIR_BASE="$TMP" \
-    bash tools/gate/vgate.sh "$WARM_SPEC" > "$TMP/vgate-warm-off.out" 2>&1
+    "$MODERN_BASH" tools/gate/vgate.sh "$WARM_SPEC" > "$TMP/vgate-warm-off.out" 2>&1
 off_rc=$?
 n_save_off="$(grep -c '^save$' "$TMP/stub.log" || true)"
 n_load_off="$(grep -c '^load$' "$TMP/stub.log" || true)"
@@ -774,7 +782,7 @@ rm -f artifacts/warm-mini-*
 # beyond the codesign/hv env already exported.
 refuse() {  # refuse <label> <spec-path> <expected-substring>
     local label="$1" spec="$2" want="$3" out rc
-    out="$(VGATE_NO_BUILD=1 bash tools/gate/vgate.sh "$spec" 2>&1)"; rc=$?
+    out="$(VGATE_NO_BUILD=1 "$MODERN_BASH" tools/gate/vgate.sh "$spec" 2>&1)"; rc=$?
     if [ "$rc" = 2 ] && printf '%s' "$out" | grep -qF -- "$want"; then
         ok "$label"
     else
@@ -838,6 +846,12 @@ refuse "--warm-strict without --from-checkpoint refuses" \
 rm -rf "$RUN_DIR_LEFT" 2>/dev/null
 rm -f artifacts/warm-mini-* artifacts/refuse-*-report.txt artifacts/refuse-*-gate.txt
 [ "$CREATED_IMG" = 1 ] && rm -f artifacts/disk.img
+
+else
+    echo "  skip  no bash >= 4.4 anywhere on this host (running: $BASH_VERSION): the"
+    echo "  skip  warm-leg scenarios drive the real vgate.sh end to end; the floor"
+    echo "  skip  they sit behind is asserted above."
+fi
 
 # --- the real probe: it must build, and carry the right entitlement --------
 echo
