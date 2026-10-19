@@ -55,6 +55,12 @@ func main() {
 	vi.ConsoleLine("gotabapp: draw")
 	ta.Present()
 	vi.ConsoleLine("gotabapp: present")
+	// M125f (#2591): stage the blob without waiting for an ask. A crash
+	// arrives between asks; the seat's auto-save can only carry what the
+	// tab record already holds, so the demo posts its state up front.
+	if ta.SaveStateNow() {
+		vi.ConsoleLine("gotabapp: state posted")
+	}
 
 	for {
 		// M125a (#2586): the seat's save notice is a mailbox message, not

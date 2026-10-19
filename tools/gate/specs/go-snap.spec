@@ -35,10 +35,35 @@
 #          the rewind transcript or `restore refused code=12` — the
 #          bound live-suspend-resume already pins.
 #
+#   M125f (#2591) crash auto-snapshot legs, on the same profile:
+#   crash: GOTABWM.ELF hosts GOTABAPP.ELF; ctrl-shift-s stores the app's
+#          blob, then `kill GOTABAPP.ELF` is the force-crash — the seat's
+#          released-mirror hook reads the bound owner's status=137 exit,
+#          parks CRASH0 via the ctl snapshot verb, writes CRASHSNAP.LAST,
+#          and re-execs the binary so its own restore_state takes the
+#          pre-crash blob back.
+#   offer: a FRESH boot finds LAST and posts the recovery toast
+#          (`crashsnap offer CRASH0`); a pointer press on the toast is the
+#          Restore gesture — `restore CRASH0` stages state.vzsave and the
+#          one-shot offer file is consumed.
+#   ld-crash: `--resume` continues the crash-moment image: the seat's
+#          crash arm completes post-resume — `crash restart` re-execs the
+#          app and `state restored` is the pre-crash-bytes proof. Same
+#          M119e bound as ld: code=12 is the honest refusal.
+#
 # HOST PREREQ: bash tools/go/build-gosnap.sh -> .build/go/GOSNAP.ELF
+#              bash tools/go/build-gotabwm.sh -> .build/go/GOTABWM.ELF
+#              bash tools/go/build-tabapp.sh -> .build/go/GOTABAPP.ELF
 
 vgate_name go-snap "M115e #2464: GOSNAP.ELF named snapshots — ls/save/restore/rm, consent-gated, staged --resume restore"
 vgate_share none
+
+# The crash/offer legs need the SPIKE runner: offer's toast click rides
+# the custom-virtio INPUT queue (--pointer-virtio) — headless-safe,
+# unlike the VZ-view pointer whose NSEvents hit the claim-4769
+# activation wall. The offer run never saves, so a cv device is legal
+# there; the crash run stays pure-VZ because its vzsave refuses cv.
+vgate_runner_flags -Xswiftc -DSPIKE
 
 # The profile is minted INSIDE the setup hook (hooks precede every run)
 # — same shape as live-suspend-resume: the credential and the app land
@@ -60,8 +85,18 @@ if not os.path.exists(src):
     sys.exit("GOSNAP.ELF missing (expected " + src + ") — build it first: "
              "bash tools/go/build-gosnap.sh")
 shutil.copy(src, os.path.join(share, "GOSNAP.ELF"))
+# M125f (#2591): the crash legs also need the seat and its state client.
+for elf, tool in (("GOTABWM.ELF", "build-gotabwm.sh"),
+                  ("GOTABAPP.ELF", "build-tabapp.sh")):
+    s = os.path.join(".build", "go", elf)
+    if not os.path.exists(s):
+        sys.exit(elf + " missing (expected " + s + ") — build it first: "
+                 "bash tools/go/" + tool)
+    shutil.copy(s, os.path.join(share, elf))
 open(os.path.join(share, "SECRETS.TXT"), "w").write(
     "#v1\nvsock-ctl\t0\t" + "a5" * 32 + "\n")
+# shim-only boot: the seat is the explicit opt-in, never the default wm.
+open(os.path.join(share, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
 cfg_path = os.path.join(prof, "config.json")
 cfg = json.load(open(cfg_path))
 cfg.setdefault("devices", {})["share"] = False
@@ -216,4 +251,142 @@ for needle in (b"clip: snap-clip-1", b"gosnap-ld-done"):
     assert needle in serial, (needle, serial[-1500:])
 assert b"snap-clip-2" not in serial, "post-snapshot state survived the restore"
 print("resume: earlier state observed — clip=snap-clip-1, post-save change rewound")
+PY
+
+# ---------------------------------------------------------------------------
+# M125f (#2591): crash — force-crash the hosted state client and watch the
+# seat's auto-save arm: crash receipt -> rotated CRASH0 vzsave -> LAST ->
+# in-boot restart carrying the pre-crash blob back.
+
+vgate_file crash1.txt <<'EOF'
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+vgate_file crash2.txt <<'EOF'
+dui focus 0
+exec GOTABAPP.ELF
+EOF
+vgate_file crash3.txt <<'EOF'
+kill GOTABAPP.ELF
+EOF
+
+vgate_run crash -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
+  --vsock --vsock-ctl --screen '$RUN_DIR/screen' --input \
+  --script '$RUN_DIR/crash1.txt' \
+  --script2 '$RUN_DIR/crash2.txt' --script2-after 'gotabwm: win focus' \
+  --script3 '$RUN_DIR/crash3.txt' --script3-after 'gotabwm: state save id=' \
+  --script-expect 'gotabapp: state restored' --script-expect-tail 3 --timeout 300
+
+vgate_assert crash serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert crash serial-contains 'gotabapp: declare accepted'
+# The demo posts its blob unsolicited on present (SaveStateNow) — the
+# seat stores it on the tab record before the kill ever lands.
+vgate_assert crash serial-contains 'gotabwm: state save id='
+# The force-crash receipt: the kernel's exit report, then the seat's arm.
+vgate_assert crash serial-contains 'GOTABAPP.ELF exited status=137'
+vgate_assert crash serial-contains 'gotabwm: crash id='
+vgate_assert crash serial-contains 'status=137'
+vgate_assert crash serial-contains 'gotabwm: crashsnap save CRASH0 ok'
+vgate_assert crash output-contains 'VSOCK-CTL: snapshot saved CRASH0.vzsave'
+vgate_assert crash serial-contains 'gotabwm: crash restart GOTABAPP.ELF'
+# The restarted client's own byte-identity verdict — pre-crash state back.
+vgate_assert crash serial-contains 'gotabapp: state restored len=30'
+vgate_assert crash serial-absent 'gotabapp: state mismatch'
+vgate_assert crash serial-absent '[EXC]'
+vgate_assert crash python <<'PY'
+import os, sys
+from pathlib import Path
+share = Path(os.environ["RUN_DIR"]) / "prof.virelaivm" / "share"
+vz = share / "SNAPSHOTS" / "CRASH0.vzsave"
+assert vz.exists() and vz.stat().st_size > 0, "CRASH0.vzsave was never parked"
+last = (share / "CRASHSNAP.LAST").read_bytes()
+assert last == b"CRASH0\n", "LAST = %r" % last
+b = (share / "SESSION.TABS").read_bytes()
+assert b"gotabapp state v1: hello strip" in b, \
+    "the crash save's session file dropped the app's blob"
+print("CRASH0 parked (%d bytes), LAST offers it, blob rides .tabs" %
+      vz.stat().st_size)
+PY
+
+# ---------------------------------------------------------------------------
+# M125f (#2591): offer — a FRESH boot finds LAST, posts the recovery toast,
+# and a press on the toast is the Restore gesture: `restore CRASH0` stages
+# saved-state/state.vzsave and the offer file is consumed.
+
+vgate_file offer1.txt <<'EOF'
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+vgate_file offer2.txt <<'EOF'
+echo rx-crash-offer-ok
+EOF
+
+vgate_run offer -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
+  --vsock --vsock-ctl --screen '$RUN_DIR/screen' --input \
+  --script '$RUN_DIR/offer1.txt' \
+  --pointer-virtio '112,702,c' \
+  --pointer-virtio-after 'gotabwm: notify paint' \
+  --script2 '$RUN_DIR/offer2.txt' --script2-after 'gotabwm: crashsnap restore CRASH0 ok' \
+  --script-expect 'rx-crash-offer-ok' --timeout 300
+
+vgate_assert offer serial-contains 'gotabwm: registered'
+# The toast leg: offered, painted, clicked away by the press.
+vgate_assert offer serial-contains 'gotabwm: crashsnap offer CRASH0'
+vgate_assert offer serial-contains 'gotabwm: notify paint'
+vgate_assert offer serial-contains 'gotabwm: notify dismiss'
+vgate_assert offer serial-contains 'gotabwm: crashsnap restore CRASH0 ok'
+vgate_assert offer output-contains 'VSOCK-CTL: restore staged name=CRASH0'
+vgate_assert offer serial-contains 'rx-crash-offer-ok'
+vgate_assert offer serial-absent '[EXC]'
+vgate_assert offer python <<'PY'
+import os
+from pathlib import Path
+prof = Path(os.environ["RUN_DIR"]) / "prof.virelaivm"
+staged = prof / "saved-state" / "state.vzsave"
+vz = prof / "share" / "SNAPSHOTS" / "CRASH0.vzsave"
+assert staged.exists() and staged.stat().st_size > 0, "restore never staged"
+assert staged.read_bytes() == vz.read_bytes(), \
+    "the staged image is not byte-identical to CRASH0"
+assert not (prof / "share" / "CRASHSNAP.LAST").exists(), \
+    "the answered offer's LAST was not consumed"
+print("toast Restore staged state.vzsave (%d bytes); LAST consumed" %
+      staged.stat().st_size)
+PY
+
+# ---------------------------------------------------------------------------
+# M125f (#2591): ld-crash — `--resume` continues the crash-moment image: the
+# seat's crash arm resumes mid-ctl-reply, writes LAST, closes the dead row
+# and crash-restarts GOTABAPP.ELF; `state restored` on the resumed timeline
+# IS the pre-crash-bytes proof. The M119e bound stands: code=12 is the
+# honest refusal on this host.
+
+vgate_file ldc.txt <<'EOF'
+echo rx-crash-ld-done
+EOF
+
+vgate_run ld-crash -- --resume '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
+  --vsock --vsock-ctl --screen '$RUN_DIR/screen' --input \
+  --script-after 'vsock-ctl: closed' --script '$RUN_DIR/ldc.txt' \
+  --script-expect 'gotabapp: state restored' --timeout 180
+vgate_allow_rc ld-crash 0 1
+vgate_assert ld-crash output-contains 'SUSPEND-RESUME: armed state='
+vgate_assert ld-crash python <<'PY'
+import os, sys
+from pathlib import Path
+out = Path(os.environ["RUN_DIR"], "run-%s.out" % os.environ["VG_TAG"]).read_bytes()
+serial = Path(os.environ["VG_SER"]).read_bytes() if Path(os.environ["VG_SER"]).exists() else b""
+assert b"VirelaiOS kernel has seized control." not in serial, "a restore never boots"
+if b"SUSPEND-RESUME: restore refused code=12" in out:
+    print("bound: restoreMachineStateFrom -> VZErrorDomain Code=12 (M119e)")
+    sys.exit(0)
+assert b"SUSPEND-RESUME: restored" in out, out[-800:]
+# Restored: the crash arm completed on the resumed timeline — the restarted
+# client's restore_state took the pre-crash blob back.
+for needle in (b"gotabwm: crashsnap save CRASH0 ok",
+               b"gotabwm: crash restart GOTABAPP.ELF",
+               b"gotabapp: state restored len=30"):
+    assert needle in serial, (needle, serial[-1500:])
+print("resume: crash arm completed — CRASH0 saved, GOTABAPP restarted, blob restored")
 PY

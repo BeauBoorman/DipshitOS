@@ -345,7 +345,25 @@ func launcherWindowEvent(e vi.Event) {
 		launch.prior = 0
 	}
 	if tabs.index(id) >= 0 {
+		// M125f (#2591): a released tab the seat never closed is the
+		// kernel's teardown of a dead process. Its bound owner's exit
+		// status discriminates the crash receipt (nonzero) from a clean
+		// quit (0) — the crash arm runs while the row is still live so
+		// writeSession records it for the next boot's re-exec.
+		pid, status, crashed := seatCrashStatus(id)
+		if crashed {
+			crashLog(MarkerCrash + "id=" + vi.Itoa64(int64(id)) +
+				" pid=" + vi.Itoa64(int64(pid)) +
+				" status=" + vi.Itoa64(int64(status)))
+			crashSave()
+		}
 		_ = tabs.CloseTab(id)
+		if crashed {
+			// The restart runs on the next composite tick, off this
+			// event's teardown path — the just-saved machine image and
+			// the in-flight reap are both settled by then.
+			crashRestartPending = true
+		}
 		syncHostedFromStrip()
 	}
 	// M97g-F2 (#2080): the released window's binding and pending challenge
