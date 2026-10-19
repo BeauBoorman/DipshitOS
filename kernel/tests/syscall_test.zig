@@ -6914,39 +6914,41 @@ test "syscall B5: independent TP contexts, blocking join, status and exact kstac
     try std.testing.expectEqual(error_result(.einval), dispatch(sys_thread, .{ 2, tokens[0], 0, 0, 0, 0 }, &frame));
 }
 
-test "syscall B5: native live and retained threads share the existing six-thread capacity" {
+test "syscall B5: native live and retained threads share the existing thread capacity" {
     futex_boot_user();
-    var ram: [512 * 4096]u8 align(4096) = undefined;
-    const desc = [_]memmap.MemoryDescriptor{.{ .type = .conventional_memory, .physical_start = @intFromPtr(&ram), .virtual_start = 0, .number_of_pages = 512, .attribute = 0 }};
+    // M129b: max_threads = 16 extra seats — 16 × 48-page EL1 kstacks plus
+    // the boot overhead need more than the old 512-page fixture RAM.
+    var ram: [2048 * 4096]u8 align(4096) = undefined;
+    const desc = [_]memmap.MemoryDescriptor{.{ .type = .conventional_memory, .physical_start = @intFromPtr(&ram), .virtual_start = 0, .number_of_pages = 2048, .attribute = 0 }};
     try std.testing.expect(alloc.init(memmap.MapView.init(std.mem.asBytes(&desc), @sizeOf(memmap.MemoryDescriptor), 1), &.{}));
     try futex_drive_to_user();
-    var contexts: [7][64]u8 align(16) = undefined;
-    var stacks: [7][4096]u8 align(16) = undefined;
+    var contexts: [process.max_threads + 1][64]u8 align(16) = undefined;
+    var stacks: [process.max_threads + 1][4096]u8 align(16) = undefined;
     _ = scheduler.add_task_read_region(2, .{ .base = @intFromPtr(&contexts), .len = @sizeOf(@TypeOf(contexts)) });
     _ = scheduler.add_task_write_region(2, .{ .base = @intFromPtr(&contexts), .len = @sizeOf(@TypeOf(contexts)) });
     _ = scheduler.add_task_write_region(2, .{ .base = @intFromPtr(&stacks), .len = @sizeOf(@TypeOf(stacks)) });
     var frame = fresh_frame();
-    var tokens: [6]u64 = undefined;
+    var tokens: [process.max_threads]u64 = undefined;
     syscall.arm_task_regions();
     for (&tokens, 0..) |*token, i| {
         token.* = dispatch(sys_thread, .{ 0, userspace.text_va + 4, @intFromPtr(&stacks[i]) + 4096, i, @intFromPtr(&contexts[i]), 0 }, &frame);
         _ = try tls_task(token.*);
     }
     const before = alloc.stats().free_pages;
-    const seventh: Args = .{ 0, userspace.text_va + 4, @intFromPtr(&stacks[6]) + 4096, 0, @intFromPtr(&contexts[6]), 0 };
-    try std.testing.expectEqual(error_result(.eagain), dispatch(sys_thread, seventh, &frame));
+    const over: Args = .{ 0, userspace.text_va + 4, @intFromPtr(&stacks[process.max_threads]) + 4096, 0, @intFromPtr(&contexts[process.max_threads]), 0 };
+    try std.testing.expectEqual(error_result(.eagain), dispatch(sys_thread, over, &frame));
     try std.testing.expectEqual(before, alloc.stats().free_pages);
     const first = try tls_task(tokens[0]);
     try futex_yield_until(first);
     var death = fresh_frame();
     _ = dispatch(sys_thread, .{ 1, 0, 0, 0, 0, 0 }, &death);
     try futex_yield_until(2);
-    try std.testing.expectEqual(error_result(.eagain), dispatch(sys_thread, seventh, &frame));
+    try std.testing.expectEqual(error_result(.eagain), dispatch(sys_thread, over, &frame));
     _ = dispatch(sys_thread, .{ 2, tokens[0], 0, 0, 0, 0 }, &frame);
     try std.testing.expect(scheduler.reap(first));
-    const replacement = dispatch(sys_thread, seventh, &frame);
+    const replacement = dispatch(sys_thread, over, &frame);
     _ = try tls_task(replacement);
-    try std.testing.expect(replacement > tokens[5]);
+    try std.testing.expect(replacement > tokens[process.max_threads - 1]);
 }
 
 test "syscall B5: TLS and stack prefix validation refuse without seating a thread" {

@@ -1865,7 +1865,12 @@ fn test_seed(name: []const u8, content: []const u8) void {
 // exec owns text 1 + user stack 48 + EL1 kstack 48 = 97 pages. #1426
 // filled ten user slots (970 pages) inside 1024. M65d / #1442 fills
 // thirteen (1261 pages plus MMU tables) — 2048 pages (8 MiB) covers that.
-const fixture_pool_pages: usize = 2048;
+// M129b (#2611): the pool grew to 64. Exec'd roots are bounded by the
+// mmu table carve-out (~20 tables per live root), NOT the pool — the
+// saturation tests exec a bounded set and fill the rest with sys_thread
+// tasks (48-page kstack each, no new root). 8192 pages covers ten execs
+// (~970) plus ~55 thread kstacks (~2640) with margin.
+const fixture_pool_pages: usize = 8192;
 var fixture_pool: [fixture_pool_pages * 4096]u8 align(4096) = undefined;
 
 fn arm_allocator() void {
@@ -1880,6 +1885,28 @@ fn arm_allocator() void {
 fn dsk1_exec_pages() u64 {
     const stack_pages: u64 = (scheduler.task_stack_size + 4095) / 4096;
     return 1 + 2 * stack_pages;
+}
+
+/// M129b (#2611): at `max_tasks` = 64 an exec'd process owns ~97 pages
+/// plus ~20 tables of the 512-page mmu carve-out, so the carve-out is
+/// exec's first wall — the pool itself can only be saturated by
+/// `sys_thread` tasks, each of which owns just its 48-page EL1 kstack
+/// and shares its process's root (≤ `process.max_threads` extras per
+/// process). Spawn one thread per pass across `owners` until the pool
+/// is full or every proc is at its thread bound; returns the count.
+fn fill_pool_with_threads(owners: []const usize) usize {
+    var spawned: usize = 0;
+    var pass: usize = 0;
+    while (pass < process.max_threads and scheduler.has_free_slot()) : (pass += 1) {
+        for (owners) |pid| {
+            if (!scheduler.has_free_slot()) break;
+            const owner = process.info(pid).?;
+            if (scheduler.spawn_thread(owner.task_id.?, owner.text_va, 0x8000_0000, 0) != null) {
+                spawned += 1;
+            } else break;
+        }
+    }
+    return spawned;
 }
 
 /// One RX segment, optionally naming LD.SO, for the dynamic-exec tests.
@@ -2256,33 +2283,35 @@ test "exec: a second program loads and runs while the first is alive" {
     // Claim 0826: the exec gate is gone — the FIRST exec succeeds with the
     // pool slot free, and the rest succeed WITHOUT waiting for the earlier
     // programs to exit (the old `user_busy` refusal is gone). #1426/#1442:
-    // user slots = max_tasks - 3 (shell + worker + idle); M65d is 13.
-    const user_slots = scheduler.max_tasks - 3;
+    // user slots = max_tasks - 3 (shell + worker + idle). M129b (#2611):
+    // the carve-out is exec's wall, so exec a bounded set, then fill the
+    // remaining pool slots with sys_thread tasks sharing those roots.
+    const procs_exec = 10;
     var n: usize = 0;
-    while (n < user_slots) : (n += 1) {
+    while (n < procs_exec) : (n += 1) {
         try std.testing.expectEqual(ExecResult.ok, exec_file("USER.BIN", &.{}));
     }
-    // All user slots are live: RUNNING USER.BIN processes with their OWN
-    // roots, stacks, and executor tasks. Boot payload stayed as exited.
-    try std.testing.expectEqual(@as(usize, 1 + user_slots), process.count());
+    // All exec'd slots are live: RUNNING USER.BIN processes with their
+    // OWN roots, stacks, and executor tasks. Boot payload stayed exited.
+    try std.testing.expectEqual(@as(usize, 1 + procs_exec), process.count());
     const proc_a = process.info(1).?;
     const proc_b = process.info(2).?;
-    const proc_last = process.info(user_slots).?;
+    const proc_last = process.info(procs_exec).?;
     try std.testing.expectEqualStrings("USER.BIN", proc_a.name);
     try std.testing.expectEqualStrings("USER.BIN", proc_b.name);
     try std.testing.expectEqualStrings("USER.BIN", proc_last.name);
     n = 1;
-    while (n <= user_slots) : (n += 1) {
+    while (n <= procs_exec) : (n += 1) {
         const proc = process.info(n).?;
         try std.testing.expectEqual(process.State.running, proc.state);
         try std.testing.expectEqualStrings("USER.BIN", proc.name);
     }
     // Distinct executors, roots, and pages across the live processes.
     n = 1;
-    while (n <= user_slots) : (n += 1) {
+    while (n <= procs_exec) : (n += 1) {
         const left = process.info(n).?;
         var m: usize = n + 1;
-        while (m <= user_slots) : (m += 1) {
+        while (m <= procs_exec) : (m += 1) {
             const right = process.info(m).?;
             try std.testing.expect(left.task_id.? != right.task_id.?);
             try std.testing.expect(left.root_phys != right.root_phys);
@@ -2295,10 +2324,17 @@ test "exec: a second program loads and runs while the first is alive" {
     try std.testing.expect(proc_a.stack_phys != proc_b.stack_phys);
     try std.testing.expectEqualStrings("user-exec", scheduler.task_info(proc_a.task_id.?).?.name);
     try std.testing.expectEqualStrings("user-exec", scheduler.task_info(proc_last.task_id.?).?.name);
+    // Threads fill the pool: each of the ten procs seats ≤ max_threads
+    // extras (16) — 10 × 16 = 160 requests vs 51 free user slots → the
+    // pool saturates before the per-proc bound does.
+    var owners: [procs_exec]usize = undefined;
+    n = 1;
+    while (n <= procs_exec) : (n += 1) owners[n - 1] = n;
+    try std.testing.expect(fill_pool_with_threads(&owners) > 0);
     // The pool is the capacity gate: one more program cannot load.
     try std.testing.expect(!scheduler.has_free_slot());
     try std.testing.expectEqual(ExecResult.pool_full, exec_file("USER.BIN", &.{}));
-    try std.testing.expectEqual(@as(usize, 1 + user_slots), process.count()); // pool_full allocates nothing
+    try std.testing.expectEqual(@as(usize, 1 + procs_exec), process.count()); // pool_full allocates nothing
 
 }
 
@@ -2491,19 +2527,23 @@ test "exec: PEER.BIN loads by name — counter + peer fill the task pool" {
     // counter's — the serial log can tell the two programs apart).
     const peer_text: [*]const u8 = @ptrFromInt(peer.text_phys);
     try std.testing.expectEqualStrings("peer: got \n", peer_text[0..11]);
-    // Fill the remaining user slots (counter + peer already occupy two),
-    // then the pool is full: one more exec is pool_full, checked BEFORE
-    // any allocation (nothing leaks).
-    const user_slots = scheduler.max_tasks - 3;
+    // Fill the pool: counter + peer + eight more exec'd programs (the
+    // mmu table carve-out is exec's wall — M129b), then sys_thread tasks
+    // seat the rest. One more exec is pool_full, checked BEFORE any
+    // allocation (nothing leaks).
     const user_img = dsk1("user: hello from the ESP\n", 24, 24 + 25);
     test_seed("USER.BIN", user_img[0 .. 24 + 25]);
     var n: usize = 0;
-    while (n < user_slots - 2) : (n += 1) {
+    while (n < 8) : (n += 1) {
         try std.testing.expectEqual(ExecResult.ok, exec_file("USER.BIN", &.{}));
     }
+    var owners: [10]usize = undefined;
+    n = 1;
+    while (n <= 10) : (n += 1) owners[n - 1] = n;
+    try std.testing.expect(fill_pool_with_threads(&owners) > 0);
     try std.testing.expect(!scheduler.has_free_slot());
     try std.testing.expectEqual(ExecResult.pool_full, exec_file("USER.BIN", &.{}));
-    try std.testing.expectEqual(@as(usize, 1 + user_slots), process.count()); // boot exited + user_slots
+    try std.testing.expectEqual(@as(usize, 1 + 10), process.count()); // boot exited + ten live procs
 }
 
 test "exec: permanent occupant + recycle — one spare slot, pool_full, then the re-exec lands" {
@@ -2530,22 +2570,29 @@ test "exec: permanent occupant + recycle — one spare slot, pool_full, then the
     test_seed("USER.BIN", user_img[0 .. 24 + 25]);
 
     // The counter is the permanent occupant: it takes one slot and never
-    // exits (this test never drives it to exit). Remaining user slots fill
-    // with short programs so the pool is full (#1426/#1442: max_tasks-3).
-    const user_slots = scheduler.max_tasks - 3;
-    const filler = user_slots - 1;
+    // exits (this test never drives it to exit). Nine more exec'd programs
+    // join it — at max_tasks = 64 the mmu table carve-out is exec's wall
+    // (~20 tables per live root; M129b), so sys_thread tasks seated on the
+    // OTHER procs saturate the rest of the pool. pid 2 stays thread-free:
+    // the task that exits below then has no siblings to reap.
+    const fillers = 9;
     try std.testing.expectEqual(ExecResult.ok, exec_file("COUNTER.BIN", &.{})); // slot 2
     const free_after_counter = alloc.stats().free_pages;
     var n: usize = 0;
-    while (n < filler) : (n += 1) {
+    while (n < fillers) : (n += 1) {
         try std.testing.expectEqual(ExecResult.ok, exec_file("USER.BIN", &.{}));
     }
+    const held_pages: u64 = (scheduler.task_stack_size + 4095) / 4096;
+    var owners = [9]usize{ 1, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const thread_tasks = fill_pool_with_threads(&owners);
+    try std.testing.expect(thread_tasks > 0);
     try std.testing.expect(!scheduler.has_free_slot());
     // The capacity gate: one more exec while every user slot is live is
     // pool_full, checked BEFORE any allocation — nothing leaks.
     try std.testing.expectEqual(ExecResult.pool_full, exec_file("USER.BIN", &.{}));
-    const filler_pages = filler * dsk1_exec_pages();
-    try std.testing.expectEqual(free_after_counter - filler_pages, alloc.stats().free_pages);
+    const filler_pages = fillers * dsk1_exec_pages();
+    const thread_pages = thread_tasks * held_pages;
+    try std.testing.expectEqual(free_after_counter - filler_pages - thread_pages, alloc.stats().free_pages);
 
     // Drive the FIRST short program's exit + reap (the idle task's
     // lifecycle reap): its DSK1 pages (text 1 + stack + kstack) return
@@ -2560,12 +2607,11 @@ test "exec: permanent occupant + recycle — one spare slot, pool_full, then the
     try std.testing.expectEqual(process.State.exited, process.info(2).?.state);
     // #2430: the exited process's user pages return AT EXIT (text + user
     // stack); only the exiting task's kstack still waits for the reap...
-    const held_pages: u64 = (scheduler.task_stack_size + 4095) / 4096;
-    try std.testing.expectEqual(free_after_counter - filler_pages + (dsk1_exec_pages() - held_pages), alloc.stats().free_pages);
+    try std.testing.expectEqual(free_after_counter - filler_pages - thread_pages + (dsk1_exec_pages() - held_pages), alloc.stats().free_pages);
     // ...the scheduler reap returns the rest (claim 4613) while the exited
     // descriptor stays in the procs table with its status.
     try std.testing.expect(scheduler.reap(3));
-    try std.testing.expectEqual(free_after_counter - (filler_pages - dsk1_exec_pages()), alloc.stats().free_pages);
+    try std.testing.expectEqual(free_after_counter - (filler_pages - dsk1_exec_pages()) - thread_pages, alloc.stats().free_pages);
     try std.testing.expectEqual(process.State.exited, process.info(2).?.state);
     try std.testing.expectEqual(@as(u64, 43), process.info(2).?.exit_status);
     try std.testing.expectEqual(@as(u64, 0), process.info(2).?.text_pages);
@@ -2577,11 +2623,11 @@ test "exec: permanent occupant + recycle — one spare slot, pool_full, then the
     // its programs exited)...
     try std.testing.expectEqual(ExecResult.ok, exec_file("USER.BIN", &.{}));
     try std.testing.expectEqual(process.State.running, process.info(3).?.state);
-    // ...and with the counter + filler live programs the pool is full
-    // again: a subsequent exec is pool_full, still leak-free.
+    // ...and with the counter + filler live programs + thread tasks the
+    // pool is full again: a subsequent exec is pool_full, still leak-free.
     try std.testing.expect(!scheduler.has_free_slot());
     try std.testing.expectEqual(ExecResult.pool_full, exec_file("USER.BIN", &.{}));
-    try std.testing.expectEqual(free_after_counter - filler_pages, alloc.stats().free_pages);
+    try std.testing.expectEqual(free_after_counter - filler_pages - thread_pages, alloc.stats().free_pages);
     try std.testing.expectEqual(process.State.running, process.info(1).?.state);
 }
 

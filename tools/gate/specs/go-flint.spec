@@ -1462,6 +1462,7 @@ shutil.copy(gotop_elf, os.path.join(m113f_share, "GOTOP.ELF"))
 # the still-arriving chord tail parks it on the trust tab with auto-
 # refresh -> the chain-done echo. GOTOP deliberately comes AFTER GOSET:
 # a resident viewer + STORE install overflowed the 16-entry task pool
+# (64 after M129b / #2611 — the incident stayed in this shape at 16)
 # (`newosproc: sys_thread create failed`, observed twice — once each
 # under default and single-core layouts) because STORE and the viewer's
 # Go runtimes spawn threads on demand.

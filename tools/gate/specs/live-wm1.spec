@@ -1,6 +1,7 @@
 # live-wm1.spec — Lane 1 WM1: eight concurrent pool-backed user windows on VZ.
 #
-# M78c keeps this burst at the measured 16-slot task-pool wall. NOTE.ELF and
+# M78c kept this burst at the measured 16-slot task-pool wall (the pool is
+# 64 after M129b / #2611 — the burst now sits well inside it). NOTE.ELF and
 # GOTOP.ELF are the only two Go runtimes; SB4DAM.BIN and SEXITEST.BIN replace
 # the two retired fixture windows with existing one-window Zig residents. The
 # final three windows remain DEVCONS.BIN, RESMON.BIN, and PS.BIN.

@@ -122,7 +122,7 @@ pages selftest: free ok
 pages selftest: alloc 1153 -> none (out of memory)
 pages selftest: ok free=0x0000000000000480
 virelai> tasks
-tasks: enabled=0 current=0 switches=0 pool=4/16 zombies=0
+tasks: enabled=0 current=0 switches=0 pool=4/64 zombies=0
   shell    saves=0 resumes=0 advances=0 state=ready
   worker   saves=0 resumes=0 advances=0 state=ready
   user-el0 saves=0 resumes=0 advances=0 state=ready

@@ -4,8 +4,8 @@
 # shipping Go ELFs as tabs. Boot 01 hosts GOCALC.ELF + NOTE.ELF
 # (Zig CALC.BIN is gone, M62h / #1406; Zig NOTEPAD.BIN is gone, M66c / #1485). Boot 03 hosts GOEDIT.ELF + GOTERM.ELF:
 # both declared, focus switch, both alive, close one without killing the
-# seat, LAYOUT.txt names both bins. scheduler.max_tasks=16 (M65d / #1442:
-# 3 kernel + 3×4 Ms + 1 spare). The GOMAXPROCS=1 path still fits
+# seat, LAYOUT.txt names both bins. scheduler.max_tasks=64 (M129b /
+# #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
 # SEVENTEEN vgate_runs share one seeded host share (`vgate_share seed`):
@@ -155,7 +155,7 @@ wm
 echo rx-gotabwm-session-ok
 EOF
 
-# Boot 03: two shipping Go ELFs (GOEDIT + GOTERM). max_tasks=16 (M65d / #1442).
+# Boot 03: two shipping Go ELFs (GOEDIT + GOTERM). max_tasks=64 (M129b / #2611; was 16 under M65d).
 # GOMAXPROCS=1 still fits three Go runtimes (seat + two clients); it is the
 # exec envp knob (#1226).
 vgate_file script-03.txt <<'EOF'

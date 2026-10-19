@@ -36,9 +36,10 @@
 # --cvc-file in a run's own flags overrides the armed share for that
 # boot only, which is how one spec covers every absent-resource posture.
 #
-# Run 01 stages GOCALC LAST for the task pool: scheduler.max_tasks is 16
-# and a Go runtime holds ~4 slots (main + sysmon + startup Ms), so seat +
-# Calc + agentd + a gosh.run child cannot coexist. The journey's
+# Run 01 stages GOCALC LAST for the task pool: scheduler.max_tasks was 16
+# (64 after M129b / #2611) and a Go runtime holds ~4 slots (main + sysmon
+# + startup Ms), so seat + Calc + agentd + a gosh.run child could not
+# coexist. The journey's
 # gosh.run calls all land before ui.windows, so Calc execs when the
 # first 'verb=ui.windows' marker prints -- the harness then polls
 # ui.windows until the Calc row registers, and ui.screenshot runs after

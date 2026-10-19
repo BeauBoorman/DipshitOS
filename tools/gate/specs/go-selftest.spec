@@ -429,10 +429,10 @@ for app, seq, level, tag, msg in rows:
 apps = "".join(r[0] for r in rows)
 assert "ABA" in apps or "BAB" in apps, ("not a live interleave", apps)
 tasks = re.findall(r"tasks: enabled=.*?pool=(\d+)/(\d+)", serial)
-assert tasks and all(int(n) <= 16 and int(cap) == 16 for n, cap in tasks), tasks
+assert tasks and all(int(n) <= 64 and int(cap) == 64 for n, cap in tasks), tasks
 # The boot's user-el0 probe may still await reaping at this marker. Its one
-# transient slot does not change the three-runtime budget or the <=16 bar.
-assert any(15 <= int(n) <= 16 for n, cap in tasks), ("three live Go runtimes expected", tasks)
+# transient slot does not change the three-runtime budget or the <=64 bar.
+assert any(15 <= int(n) <= 64 for n, cap in tasks), ("three live Go runtimes expected", tasks)
 print("concurrent arrival tail and tasks observed:", apps, tasks)
 share = os.environ["VG_SHARE"]
 for app in ("A", "B"):
@@ -581,8 +581,10 @@ vgate_assert window serial-absent '[EXC] parking:'
 # ring read is EACCES. The viewer's own render is covered by every leg
 # above running the same -u0 path.
 # The legs are serialized (one run per exec): three concurrent Go apps
-# plus the desktop would overrun the global task table (max_tasks=16) and
-# the fixture would die in runtime startup before it could print.
+# plus the desktop sit near the top of the global task table's usable
+# occupancy (max_tasks=64 after M129b; it was 16 when this leg split —
+# serialization is retained, not re-proven) and a crowded boot can still
+# eat a late-starting runtime's Ms.
 vgate_file log-bound-seed.txt <<'EOF'
 exec -u0 LOGFIX.ELF C 1 2
 EOF

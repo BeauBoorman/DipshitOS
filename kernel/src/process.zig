@@ -55,8 +55,12 @@ pub const word_ambient: u32 = word_baseline & ~@as(u32, 0x01 | 0x04 | 0x80);
 /// registry saturated at 8/8 (the boot payload's exited slot recycled, no
 /// headroom), and "8+ apps on the desktop" (desktop launcher + 8 apps)
 /// needs room for nine live processes plus exited history before the
-/// oldest exited descriptor is recycled.
-pub const max_processes: usize = 16;
+/// oldest exited descriptor is recycled. M129b (#2611): raised 16 -> 64
+/// alongside `scheduler.max_tasks` so every live task's process can hold
+/// a descriptor — a pool-full user program can never orphan its process
+/// record. One descriptor costs ~33.5 KiB of BSS (the inline
+/// `dynamic_pages` record table dominates); 64 slots ≈ 2.2 MiB.
+pub const max_processes: usize = 64;
 /// Process-name buffer bound (the FAT 8.3 file name or a task-style name
 /// like "user-el0").
 pub const name_max: usize = 16;
@@ -173,10 +177,14 @@ pub const mmap_default_va: u64 = 0x0000_0000_1000_0000;
 /// primary task is `task_id` (the exec'd creator); `thread_tasks` holds the
 /// extra slots created via `sys_thread` op 0. Bounded by the descriptor
 /// (the task pool bounds it further: `scheduler.max_tasks` slots total,
-/// 16 after M65d / #1442). A GOMAXPROCS=2 runtime is 4 Ms (1 primary +
-/// 3 extra); 6 extra seats leave headroom for syscall-spawned Ms. Not a
-/// new per-process cap — ADR 0027 D1: the global pool is the bound.
-pub const max_threads: usize = 6;
+/// 64 after M129b / #2611). A GOMAXPROCS=2 runtime is 4 Ms (1 primary +
+/// 3 extra). M129b measured 6 extra seats too tight: a runtime that had
+/// seated ~3 Ms plus spawned tasks had no room for one more M and its
+/// `newosproc` threw on EAGAIN while the pool still had slots — the
+/// per-process bound, not the pool, refused it. 16 extra seats give a
+/// runtime ~12 lazy-M seats of headroom. Not a new per-process cap —
+/// ADR 0027 D1: the global pool is the bound.
+pub const max_threads: usize = 16;
 
 pub const MmapRegion = struct {
     base_va: u64 = 0,
@@ -2093,7 +2101,7 @@ test "process: last live task exit dies the process (ADR 0027 D2/D3)" {
     const id = create("T.BIN", .{}, .{}, .{}).?;
     try std.testing.expect(bind(id, 2));
     try std.testing.expect(bind_thread(id, 5));
-    try std.testing.expect(has_thread_capacity(id)); // max_threads = 6; one seat used
+    try std.testing.expect(has_thread_capacity(id)); // max_threads = 16; one seat used
     try std.testing.expectEqual(@as(?usize, id), find_by_task(2));
     try std.testing.expectEqual(@as(?usize, id), find_by_task(5));
     try std.testing.expectEqual(State.running, info(id).?.state);
@@ -2111,7 +2119,7 @@ test "process: last live task exit dies the process (ADR 0027 D2/D3)" {
 
 test "process: three GOMAXPROCS=2 runtimes bind 4 tasks each (M65d, #1442)" {
     // Seat + two hosted ELFs. Each runtime: primary + 3 extra (2 Ps +
-    // sysmon + template). max_threads = 6 extra still has headroom — not
+    // sysmon + template). max_threads = 16 extra still has headroom — not
     // a new per-process cap; the global pool is the bound (ADR 0027 D1).
     init();
     var r: usize = 0;

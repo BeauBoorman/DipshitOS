@@ -188,8 +188,10 @@ const (
 func osinit() {
 	physPageSize = 4096
 	// ADR 0027 D6 (ACCEPTED): the real phase-0b setting. Two Ps + the
-	// sysmon/template Ms ride the kernel's bounded task pool (11 slots);
-	// the go-goroutines gate proves cross-core scheduling of slot-73 tasks.
+	// sysmon/template Ms ride the kernel's bounded task pool (64 slots —
+	// M129b; ~4 Ms per runtime, ~15 compiled-GOMAXPROCS runtimes of
+	// headroom); the go-goroutines gate proves cross-core scheduling of
+	// slot-73 tasks.
 	// Issue #1226: GOMAXPROCS in the exec envp overrides this at schedinit;
 	// the default stays 2 (two vCPUs) — no osinit bump.
 	numCPUStartup = 2
