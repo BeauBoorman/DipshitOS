@@ -23,7 +23,24 @@ const (
 )
 
 func main() {
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH})
+	// M125a (#2586): the protocol's live client. The blob is a
+	// deliberately magic-free byte sequence — apps own the format, so the
+	// demo's contract is byte identity, not a header the seat could check.
+	// RestoreState prints its marker only on an EXACT match; a stale or
+	// torn blob says mismatch, never success.
+	const demoState = "gotabapp state v1: hello strip"
+	ta := tabapp.Init(tabapp.Config{
+		Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH,
+		StateVersion: 1,
+		SaveState:    func() []byte { return []byte(demoState) },
+		RestoreState: func(b []byte) {
+			if string(b) == demoState {
+				vi.ConsoleLine("gotabapp: state restored len=" + vi.Itoa64(int64(len(b))))
+			} else {
+				vi.ConsoleLine("gotabapp: state mismatch")
+			}
+		},
+	})
 	if ta == nil {
 		vi.ConsoleLine("gotabapp: error open -1")
 		vi.Exit(1)
@@ -40,6 +57,10 @@ func main() {
 	vi.ConsoleLine("gotabapp: present")
 
 	for {
+		// M125a (#2586): the seat's save notice is a mailbox message, not
+		// an input event — answer it each loop turn so a snapshot/close
+		// ask is serviced before the window dies.
+		ta.PollStateAsk()
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {

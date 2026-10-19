@@ -13,7 +13,7 @@ func TestRestoreSessionBranchesAndFirstBootWorkspace(t *testing.T) {
 	if !seed.OpenTab(0x41, "Sh") {
 		t.Fatal("OpenTab")
 	}
-	raw, ok := seed.encodeTabsV2(7)
+	raw, _, ok := seed.encodeTabsV2(7)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
@@ -121,7 +121,7 @@ func (l *sessionWriteLog) last(t *testing.T) (uint16, []tabsV2Record, int, bool)
 	if len(l.writes) == 0 {
 		t.Fatal("SESSION.TABS was never written")
 	}
-	seq, recs, active, has, ok := decodeTabsV2(l.writes[len(l.writes)-1])
+	seq, recs, active, has, _, ok := decodeTabsV2(l.writes[len(l.writes)-1])
 	if !ok {
 		t.Fatalf("last publish does not decode: %x", l.writes[len(l.writes)-1])
 	}
@@ -253,7 +253,7 @@ func TestSessionWriteSkipsRestoredPlaceholders(t *testing.T) {
 	if !seed.OpenTab(3, "Calc") || !seed.OpenTab(4, "Notepad") {
 		t.Fatal("OpenTab")
 	}
-	raw, ok := seed.encodeTabsV2(1)
+	raw, _, ok := seed.encodeTabsV2(1)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
@@ -338,11 +338,11 @@ func TestMutatedStripRoundTrips(t *testing.T) {
 	if !s.FocusTab(3) {
 		t.Fatal("FocusTab")
 	}
-	raw, ok := s.encodeTabsV2(11)
+	raw, _, ok := s.encodeTabsV2(11)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
-	seq, recs, active, has, ok := decodeTabsV2(raw)
+	seq, recs, active, has, _, ok := decodeTabsV2(raw)
 	if !ok || seq != 11 {
 		t.Fatalf("decode seq=%d ok=%v want 11", seq, ok)
 	}
@@ -357,12 +357,13 @@ func TestMutatedStripRoundTrips(t *testing.T) {
 		t.Fatalf("decoded %d records want %d", len(recs), len(want))
 	}
 	for i := range want {
-		if recs[i] != want[i] {
+		if recs[i].Title != want[i].Title || recs[i].Bin != want[i].Bin ||
+			recs[i].Pinned != want[i].Pinned || recs[i].Frozen != want[i].Frozen {
 			t.Fatalf("record %d = %+v want %+v", i, recs[i], want[i])
 		}
 	}
 	// Fail closed: a record chopped short is not a session.
-	if _, _, _, _, ok := decodeTabsV2(raw[:tabsV2HeaderBytes+tabsV2RecordBytes+10]); ok {
+	if _, _, _, _, _, ok := decodeTabsV2(raw[:tabsV2HeaderBytes+tabsV2RecordBytes+10]); ok {
 		t.Fatal("a truncated record decoded")
 	}
 	var restored TabStrip
@@ -455,7 +456,7 @@ func seedSessionFile(t *testing.T, focusID uint32, rows ...Tab) []byte {
 			t.Fatal("FocusTab seed")
 		}
 	}
-	raw, ok := seed.encodeTabsV2(9)
+	raw, _, ok := seed.encodeTabsV2(9)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}

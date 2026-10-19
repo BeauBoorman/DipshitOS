@@ -160,7 +160,10 @@ func captureBundle() ([]byte, int, int, bool) {
 	if b, rc := snapRead(settings.Path, settings.MaxBody+1); rc >= 0 && b != nil {
 		entries = append(entries, snapshot.Entry{Name: snapshot.EntrySettings, Body: b})
 	}
-	if b, rc := snapRead(sessionPath, tabsV2MaxBytes+1); rc >= 0 && b != nil {
+	// M125a (#2586): the session entry may now carry an app_state trailer,
+	// so the file bound is the codec's own cap — an oversize read is a
+	// truncation the bundle must not silently carry, so it is skipped.
+	if b, rc := snapRead(sessionPath, tabsV2MaxBytes+1); rc >= 0 && b != nil && len(b) <= tabsV2MaxBytes {
 		entries = append(entries, snapshot.Entry{Name: snapshot.EntrySession, Body: b})
 	}
 	docs := captureDocs()
@@ -250,6 +253,14 @@ func captureDocs() []snapshot.Entry {
 // card's archive step, deliberately not automatic — nothing here runs because
 // time passed, only because the chord was pressed.
 func saveSnapshot() bool {
+	// M125a (#2586): the bundle must carry each tab's CURRENT state —
+	// ask every bound tab to serialize, drain their answers inside the
+	// bounded collect, then republish SESSION.TABS so the captured bytes
+	// hold the blobs that just landed. Silent apps keep whatever they
+	// last stored; the snapshot never waits longer than the ask budget.
+	askAllStateSave("snap")
+	collectStateAsks()
+	_ = writeSession()
 	raw, entries, docs, ok := captureBundle()
 	if !ok {
 		snapLog(MarkerSnapshotFail + "capture")

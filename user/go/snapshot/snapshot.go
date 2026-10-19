@@ -80,10 +80,12 @@ const (
 	// most 31 bytes anyway; this is the container's own cap, checked before
 	// the mapping, not after.
 	MaxNameLen = 32
-	// MaxBody bounds ONE entry body. The settings table is 2 KB and the
-	// session strip a few KB, so this is generous for both; it exists so a
-	// corrupt length field cannot ask a reader for an unbounded allocation.
-	MaxBody = 64 * 1024
+	// MaxBody bounds ONE entry body. M125a (#2586): the session strip now
+	// carries a per-app state trailer (the `.tabs` v2 app_state blobs), so
+	// the entry cap moved to cover a session at its own 96 KiB file bound
+	// with room to spare; it exists so a corrupt length field cannot ask a
+	// reader for an unbounded allocation.
+	MaxBody = 128 * 1024
 	// MaxBundle bounds the WHOLE bundle. Chosen so settings + session + a
 	// full selection of documents still fits under vi.MaxFileBytes (256 KB),
 	// which is the hard ceiling of the share's reader — a bundle the reader

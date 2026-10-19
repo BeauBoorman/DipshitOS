@@ -324,3 +324,51 @@ func TestDecodeIsTotal(t *testing.T) {
 		t.Fatalf("nil: %v", err)
 	}
 }
+
+// M125a (#2586): the app_state trailer — byte identity with the guest
+// codec and per-entry corruption refusal.
+func TestEncodeDecodeAppStates(t *testing.T) {
+	s := State{
+		Seq: 1,
+		Tabs: []Tab{
+			{Title: "A", Bin: "A.ELF", AppState: []byte("blob-a"), AppStateVer: 5},
+			{Title: "B", Bin: "B.ELF"},
+			{Title: "C", Bin: "C.ELF", AppState: []byte("blob-c"), AppStateVer: 9},
+		},
+	}
+	raw, err := Encode(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Tabs[0].AppState) != "blob-a" || got.Tabs[0].AppStateVer != 5 ||
+		got.Tabs[1].AppState != nil ||
+		string(got.Tabs[2].AppState) != "blob-c" || got.Tabs[2].AppStateVer != 9 {
+		t.Fatalf("trailer round-trip = %+v", got.Tabs)
+	}
+	// A blob over AppStateMax is an Encode error, never a written file.
+	if _, err := Encode(State{Tabs: []Tab{{Title: "X", AppState: make([]byte, AppStateMax+1)}}}); err == nil {
+		t.Fatal("Encode wrote an over-cap blob")
+	}
+	// Exactly AppStateMax still fits the file cap.
+	if _, err := Encode(State{Tabs: []Tab{{Title: "X", AppState: make([]byte, AppStateMax)}}}); err != nil {
+		t.Fatalf("Encode refused exactly AppStateMax: %v", err)
+	}
+	// Corrupt the trailer's declared count: an entry pointing outside the
+	// records fails the decode as corrupt, not as a partial read.
+	hdr := HeaderBytes + 3*RecordBytes
+	raw[hdr+AppStateHdr] = 99
+	if _, err := Decode(raw); err == nil {
+		t.Fatal("orphaned app_state index decoded")
+	}
+	// Foreign magic: ignored wholesale, records still decode.
+	raw2, _ := Encode(s)
+	raw2[hdr] = 'X'
+	got2, err := Decode(raw2)
+	if err != nil || got2.Tabs[0].AppState != nil {
+		t.Fatalf("foreign section err=%v state=%x", err, got2.Tabs[0].AppState)
+	}
+}

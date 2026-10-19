@@ -170,6 +170,9 @@ func dropRpcBinding(id uint32) {
 	// peer mirror at owner teardown, so a reused id must never blit a dead
 	// window's pages (#2236 defect #13).
 	surfaceDropWindow(id)
+	// M125a (#2586): the ask latch and any staged rendezvous file die
+	// with the session too.
+	clearAppState(id)
 }
 
 func dropAllRpcBindings() {
@@ -417,6 +420,10 @@ func applyRPC(req vi.WmRpc) bool {
 			dogfoodHosted = true
 			vi.ConsoleLine(MarkerTabOpen + vi.Itoa64(int64(id)))
 		}
+		// M125a (#2586): a reopen's exec carries the closed tab's blob —
+		// attach it to the row its pid just landed on (harmless no-op for
+		// every other declare; a restored row's blob already rides it).
+		adoptPendingState(req.ReplyTo, id)
 		hostTicksLeft = hostTicks
 		if !adopted {
 			hostedApp = id
@@ -460,6 +467,7 @@ func applyRPC(req vi.WmRpc) bool {
 		// attached window from a pending pid re-inhabits its row rather
 		// than appending and stealing the recorded focus.
 		adopted := adoptReexec(req.ReplyTo, id) >= 0
+		adoptPendingState(req.ReplyTo, id)
 		if adopted {
 			dogfoodHosted = true
 			vi.ConsoleLine(MarkerTabOpen + vi.Itoa64(int64(id)))
@@ -484,6 +492,10 @@ func applyRPC(req vi.WmRpc) bool {
 		}
 		return true
 	case vi.WmRpcKindDetachTab: // 6
+		// M125a (#2586): a detach is the app's own close — it gets the
+		// same bounded save ask first so its blob reaches the reopen LIFO.
+		askStateSave(id, "detach")
+		collectStateAsks()
 		closed := tabs.CloseTab(id)
 		syncHostedFromStrip()
 		vi.ConsoleLine(MarkerRpcDetach + vi.Itoa64(int64(id)))
@@ -591,6 +603,10 @@ func applyRPC(req vi.WmRpc) bool {
 		return true
 	case vi.WmRpcKindShareSurface: // 18, client -> seat: hand off its bound surface
 		return serveSurfaceShare(req)
+	case vi.WmRpcKindSaveState: // 20, client -> seat: collect its staged blob
+		return serveStateSave(req)
+	case vi.WmRpcKindRestoreState: // 21, client -> seat: hand the blob back
+		return serveStateRestore(req)
 	case vi.WmRpcKindSettingsSubscribe: // 13, client -> seat: subscribe to one key
 		return applySettingsSubscribe(req)
 	case vi.WmRpcKindSettingsPublish: // 14, writer -> seat: a persisted key changed
@@ -664,6 +680,12 @@ func closeTabByID(id uint32) bool {
 	}
 	fid, focused := tabs.Focused()
 	wasFocused := focused && fid == id
+	// M125a (#2586): the closing tab gets its one-shot save ask before the
+	// window dies — the app's blob lands on its record in time for
+	// CloseTab to carry it into the reopen LIFO. Bounded: a dead or
+	// silent app costs stateAskRounds once.
+	askStateSave(id, "close")
+	collectStateAsks()
 	if closeWin(id) != 0 {
 		return false
 	}

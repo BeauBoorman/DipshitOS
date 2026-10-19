@@ -425,10 +425,15 @@ func applyReopen() bool {
 	if !ok {
 		return false
 	}
-	if _, err := execApp(c.Bin); err != nil {
+	pid, err := execApp(c.Bin)
+	if err != nil {
 		vi.ConsoleLine(MarkerReopenMissing + c.Bin)
 		return false
 	}
+	// M125a (#2586): a reopen redelivers the close-time blob — staged by
+	// the exec'd pid so the app's own declare attaches it to the new row,
+	// and its restore_state request hands it back.
+	stagePendingState(pid, c.StateVer, c.State)
 	vi.ConsoleLine(MarkerReopen + c.Bin)
 	return true
 }
