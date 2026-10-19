@@ -1991,15 +1991,16 @@ PY
 # on PAGE.HTML ("the greedy", "the browser" — "The end." is a capital-T
 # miss, the matcher is case-sensitive). Each keystroke recomputes and
 # re-lands on match 1; the two Enters step forward and wrap; Escape closes.
-# The f1 pads are no-ops the open bar consumes — ~3 s of dwell so the
+# The f1 pads are no-ops the open bar consumes — ~6 s of dwell so the
 # kind-4 snapshot request lands while the highlights are still on the
 # scanout (observed: without them the capture arrived after Escape's
-# clean repaint and pendingSnapPath collided on two close triggers).
+# clean repaint and pendingSnapPath collided on two close triggers; at
+# ~3 s the capture still raced Escape under fleet load).
 vgate_run 42 -- \
     --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
     --snapshot-out '$RUN_DIR/snap-42' \
     --script '$RUN_DIR/script-local.txt' \
-    --input-chords 'ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape' --input-chords-after 'web: ready' \
+    --input-chords 'ctrl-f,t,h,e,return,return,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,f1,escape' --input-chords-after 'web: ready' \
     --snapshot-after 'web: find hit=2/2' \
     --script-expect 'web: find close' --timeout 180
 
@@ -2062,4 +2063,153 @@ assert match >= 20, "match highlight pixels %d" % match
 assert current >= 10, "current-match highlight pixels %d" % current
 assert plate > 1500, "find bar plate pixels %d" % plate
 print("live-web 42 highlight pixels ok (match=%d current=%d plate=%d)" % (match, current, plate))
+PY
+
+# --- boot 43 (M126d #2596): per-tab zoom + the font_size setting ----------
+# One boot, all file-channel. `settings set font_size large` publishes the
+# row on the armed share BEFORE the exec, so WEB's startup read already
+# resolves base=17 (the kernel's rasterized text ladder: 11/13/17 px). The
+# chords then step the per-tab zoom ladder — Ctrl+= thrice (110/125/150),
+# Ctrl+- once (125), Ctrl+0 (100), and four more Ctrl+= back up to 175 — and
+# each step re-runs the cascade + layout: `web: layout` reprints with
+# different lines/height — reflow, not bitmap scaling. `web: zoom <pct>`
+# prints only AFTER the reflowed frame is on the wire (the
+# announceNavigation rule). A kind-4 snapshot request rides queue 3 and is
+# serviced at the guest's own pace — under load that is seconds — and the
+# runner's pendingSnapPath is a single slot a later trigger overwrites (the
+# boot-42 collision). So the two snapshots hang on frames that stay current:
+# `web: repaint` is followed by the settle sleeps and the ready wait, and
+# `web: zoom 175` is the run's last marker — its frame cannot go stale while
+# the drain window holds the VM. This boot runs LAST so the persisted row
+# cannot reach the exact-match golden legs.
+vgate_file script-zoom.txt <<'EOF'
+settings set font_size large
+exec WEB.ELF /host/PAGE.HTML
+EOF
+
+vgate_run 43 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-43' \
+    --script '$RUN_DIR/script-zoom.txt' \
+    --input-chords 'ctrl-=,ctrl-=,ctrl-=,ctrl--,ctrl-0,ctrl-=,ctrl-=,ctrl-=,ctrl-=' --input-chords-after 'web: ready' \
+    --snapshot-after 'web: repaint' \
+    --snapshot-after 'web: zoom 175' \
+    --script-expect 'web: zoom 175' --timeout 180
+
+vgate_assert 43 serial-absent 'web: budget over'
+vgate_assert 43 serial-contains 'settings: font_size=large'
+vgate_assert 43 serial-contains 'web: font-size large base=17'
+vgate_assert 43 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 43 serial-contains 'web: zoom 110'
+vgate_assert 43 serial-contains 'web: zoom 125'
+vgate_assert 43 serial-contains 'web: zoom 150'
+vgate_assert 43 serial-contains 'web: zoom 100'
+vgate_assert 43 serial-contains 'web: zoom 175'
+vgate_assert 43 serial-count 'web: layout blocks=' 10
+vgate_assert 43 serial-absent 'web: error'
+vgate_assert 43 serial-absent '[EXC] parking:'
+vgate_assert 43 share-contains 'SETTINGS.TXT' 'font_size=large'
+vgate_assert 43 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "settings: font_size=large",
+    "web: font-size large base=17",
+    "web: zoom 110",
+    "web: zoom 125",
+    "web: zoom 150",
+    "web: zoom 125",   # Ctrl+- steps back down the ladder
+    "web: zoom 100",   # Ctrl+0 resets
+    "web: zoom 110",
+    "web: zoom 125",
+    "web: zoom 150",
+    "web: zoom 175",   # and back up past the start to the terminal rung
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    assert at >= 0, "missing or out of order: " + marker
+    pos = at + 1
+print("live-web 43 zoom ordering ok (setting read, up x3, down, reset, up to 175)")
+PY
+vgate_assert 43 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Each `web: layout` reprint is a re-layout: index 0 is the initial load at
+# zoom 100, 1-9 follow the nine zoom chords (110/125/150/125/100/110/125/
+# 150/175). h and lines climb with the rung — a bitmap stretch would keep
+# them flat — and Ctrl+0's reset restores the 100% shape exactly.
+layouts = [(int(m.group(1)), int(m.group(2))) for m in
+           re.finditer(r"web: layout blocks=\d+ lines=(\d+) h=(\d+)", ser)]
+assert len(layouts) >= 10, "expected 10 layout prints (load + 9 zooms), got %d" % len(layouts)
+l0, l150, l100, l175 = layouts[0], layouts[3], layouts[5], layouts[9]
+assert l150[1] > l0[1], "zoom 150 height %d not above zoom 100 %d — no reflow" % (l150[1], l0[1])
+assert l150[0] >= l0[0], "zoom 150 lines shrank: %d -> %d" % (l0[0], l150[0])
+assert l100 == l0, "reset did not restore the 100%% shape: %r vs %r" % (l100, l0)
+assert l175[1] > l150[1], "zoom 175 height %d not above zoom 150 %d" % (l175[1], l150[1])
+print("live-web 43 reflow ok (h %d -> %d -> %d -> %d; lines %d -> %d -> %d -> %d)" %
+      (l0[1], l150[1], l100[1], l175[1], l0[0], l150[0], l100[0], l175[0]))
+PY
+vgate_assert 43 snapshot 'snap-43-0.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+WX, WY = 40, 28  # WEB.ELF's raw-shim window origin
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+# The letterbox (window y 64..352 -> scanout 92..380): count bright text ink.
+ink = 0
+for yy in range(92, 380):
+    for xx in range(40, 552):
+        if min(px(xx, yy)) > 150:
+            ink += 1
+assert ink > 200, "no page ink at base 17: %d" % ink
+print("live-web 43 base-17 page ink=%d" % ink)
+PY
+vgate_assert 43 snapshot 'snap-43-1.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+WX, WY = 40, 28
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+ink = 0
+for yy in range(92, 380):
+    for xx in range(40, 552):
+        if min(px(xx, yy)) > 150:
+            ink += 1
+# The terminal zoom-175 frame is captured through the drain window. The
+# scanout composite is guest-paced: under load this capture can still show
+# a stale window, so the reflow proof is the serial layout geometry above —
+# this probe only requires a live page frame in the letterbox.
+assert ink > 200, "terminal frame ink %d" % ink
+print("live-web 43 terminal frame ink=%d" % ink)
+PY
+vgate_assert 43 python <<'PY'
+import glob, os
+rd = os.environ["RUN_DIR"]
+W = 1280
+def load(name):
+    hits = sorted(glob.glob(os.path.join(rd, name)))
+    assert hits, "missing " + name
+    return open(hits[-1], "rb").read()
+def ink(d):
+    # Bright text pixels inside the letterbox (window y 64..352 -> 92..380).
+    n = 0
+    for y in range(92, 380):
+        for x in range(40, 552):
+            k = (y*W+x)*4
+            if min(d[k+2], d[k+1], d[k]) > 150:
+                n += 1
+    return n
+base, zoom = load("snap-43-0.raw"), load("snap-43-1.raw")
+ib, iz = ink(base), ink(zoom)
+# Both captures must carry a rendered page; whether the second window shows
+# the zoom-175 reflow or a pre-composite stale frame is transport timing,
+# not app state — the in-guest `web: layout` geometry above is the reflow
+# evidence. Report what was observed without grading on the race.
+assert ib > 200 and iz > 200, "page ink missing: base=%d terminal=%d" % (ib, iz)
+print("live-web 43 snapshots ok (letterbox ink %d -> %d)" % (ib, iz))
 PY

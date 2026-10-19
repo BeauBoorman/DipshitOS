@@ -19,6 +19,8 @@ package main
 import (
 	"strings"
 
+	"virelai/settings"
+
 	"virelai/vi"
 	"virelai/webrender"
 	"virelai/webstyle"
@@ -104,6 +106,12 @@ const (
 	// was dropped whole, never half-applied.
 	markerStateRestored = "web: state restored"
 	markerStateRefused  = "web: state refused"
+	// M126d (#2596): the zoom rung change and the font_size read/apply.
+	// `web: zoom <pct>` prints after the reflowed frame is on the wire;
+	// `web: font-size <value> base=<px>` names the stored row and the
+	// resolved default text size.
+	markerZoom     = "web: zoom "
+	markerFontSize = "web: font-size "
 	markerReload        = "web: reload"
 	markerSettled   = "web: settled"
 	markerQuit      = "web: quit"
@@ -247,6 +255,12 @@ type app struct {
 	findIdx          *webrender.FindIndex
 	findMatches      []int
 	findCur          int
+	// M126d (#2596): this tab's zoom rung (percent; 100 = the contract's
+	// own) and the default web text px resolved from font_size. zoom.go
+	// owns the ladder, the settings read, and the reflow.
+	zoomPct   int
+	fontBase  int
+	fontWatch bool
 	// The bookmark store (FLINT ws/bookmarks atom table) + its sidebar.
 	books          []bookmark
 	bookStream     string
@@ -375,12 +389,19 @@ func main() {
 		vi.ConsoleLine("web: error window")
 		vi.Exit(2)
 	}
-	a := &app{win: id, hist: newHistory(), tStart: t0}
+	a := &app{win: id, hist: newHistory(), tStart: t0, zoomPct: 100}
 	a.bindCanvas(winW, winH)
 	engine, uiState, monoState, serifState := loadTextEngine()
 	a.text = engine
 	vi.ConsoleLine(markerFonts + engine.Name() + " ui=" + uiState + " mono=" + monoState + " serif=" + serifState)
 	vi.ConsoleLine(markerText + textProbeString(engine))
+	// M126d (#2596): the GOSET font_size row sets the default web text
+	// size; read it once at startup, then subscribe so a live seat's
+	// notices re-apply it. A shim boot has no seat — the subscribe just
+	// refuses and the startup read still stands.
+	fontVal, fontPx := fontSizeRead()
+	a.fontBase = fontPx
+	vi.ConsoleLine(markerFontSize + fontVal + " base=" + itoa(fontPx))
 	vi.ConsoleLine(markerOpen + itoa(id))
 	// Fullscreen eligibility uses the existing seat RPC. With no responding
 	// seat, retain the raw shim; resize events determine the presentation.
@@ -393,6 +414,7 @@ func main() {
 	if v, blob, ok := vi.RequestStateRestore(uint32(id), appName); ok {
 		a.noteState(v, blob)
 	}
+	a.fontWatch = settings.Subscribe("font_size", uint32(id), appName)
 	// The store inventory is read from disk at boot: it is how the gate sees
 	// that a previous run's rows persisted. The bookmark atoms load first so
 	// the count in this line is the on-disk truth, not a later cache.
@@ -513,6 +535,7 @@ func (a *app) reportBudget() {
 
 func (a *app) loop() {
 	for !a.quit {
+		a.pollFontSize()
 		if a.loading {
 			for burst := 0; burst < 16 && a.loading; burst++ {
 				before := len(a.loadBuf)
@@ -1494,9 +1517,13 @@ func (a *app) statusText() string {
 		return "error"
 	}
 	max := webrender.ScrollMax(a.lay, contentH)
-	return "nodes=" + itoa(nodeCount(a.doc)) + " blocks=" + itoa(a.lay.Blocks) +
+	status := "nodes=" + itoa(nodeCount(a.doc)) + " blocks=" + itoa(a.lay.Blocks) +
 		" lines=" + itoa(a.lay.Lines) + " items=" + itoa(len(a.lay.Items)) +
 		" scroll=" + itoa(a.scroll) + "/" + itoa(max)
+	if a.zoomPct != 100 {
+		status += " zoom=" + itoa(a.zoomPct) + "%"
+	}
+	return status
 }
 
 func (a *app) paintErrorPage(vs virender) {

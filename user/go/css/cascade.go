@@ -6,25 +6,37 @@ import (
 )
 
 // Styles owns computed copies, not references into sheets or mutable DOM data.
+// base is the cascade's initial text size (M126d #2596): the browser's
+// font_size rung, InitialFontSize when the caller keeps the contract's own.
 type Styles struct {
 	values map[*webrender.Node]webstyle.ComputedStyle
+	base   int32
 }
 
 // ForNode returns the computed style for element and text nodes. Missing/nil
-// nodes and a nil Styles receiver safely return the frozen initial style.
+// nodes and a nil Styles receiver safely return the initial style at the
+// cascade's own base.
 func (s *Styles) ForNode(n *webrender.Node) webstyle.ComputedStyle {
 	if s != nil {
 		if v, ok := s.values[n]; ok {
 			return v
 		}
+		return initialStyleAt(s.base)
 	}
 	return initialStyle()
 }
 
 func initialStyle() webstyle.ComputedStyle {
+	return initialStyleAt(webstyle.InitialFontSize)
+}
+
+func initialStyleAt(base int32) webstyle.ComputedStyle {
+	if base <= 0 {
+		base = webstyle.InitialFontSize
+	}
 	return webstyle.ComputedStyle{
-		FontSize:        webstyle.Length{Kind: webstyle.LengthPx, Value: webstyle.InitialFontSize},
-		LineHeight:      webstyle.Length{Kind: webstyle.LengthPx, Value: 18},
+		FontSize:        webstyle.Length{Kind: webstyle.LengthPx, Value: base},
+		LineHeight:      webstyle.Length{Kind: webstyle.LengthPx, Value: (base*18 + 12) / 13},
 		Color:           webstyle.Color{Kind: webstyle.ColorRGBA, RGBA: 0xff000000},
 		BackgroundColor: webstyle.Color{Kind: webstyle.ColorRGBA},
 		Border: webstyle.Borders{
@@ -93,11 +105,45 @@ func applyRules(w *[propertyCount]winner, rules []rule, path []*webrender.Node, 
 // and parses inline declaration lists. Parse diagnostics are aggregated here
 // under the page-wide cap; callers should not append them a second time.
 func Cascade(doc *webrender.Document, sheets []*Stylesheet) (*Styles, []webstyle.Diagnostic) {
-	return cascade(doc, sheets, uaSheet)
+	return cascade(doc, sheets, uaSheet, webstyle.InitialFontSize)
 }
 
-func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*Styles, []webstyle.Diagnostic) {
-	s := &Styles{values: make(map[*webrender.Node]webstyle.ComputedStyle)}
+// CascadeBase is Cascade with an explicit initial text size in px: the
+// browser's default web text size taken from the font_size setting (M126d
+// #2596). A non-positive base selects the contract's own 13px initial, so a
+// caller that never learned a setting keeps the frozen look.
+func CascadeBase(doc *webrender.Document, sheets []*Stylesheet, base int32) (*Styles, []webstyle.Diagnostic) {
+	if base <= 0 {
+		base = webstyle.InitialFontSize
+	}
+	return cascade(doc, sheets, uaSheet, base)
+}
+
+// Scale multiplies every resolved pixel length — dimensions, margins,
+// padding, border widths, gaps, font metrics — by pct/100, in place. It is
+// the browser's per-tab zoom (M126d #2596): layout consumes only resolved
+// px, so scaling the computed styles before BuildBoxTree is a uniform page
+// zoom that still REFLOWS (text re-measures and re-wraps at the scaled
+// metrics), not a bitmap stretch of a finished frame. LengthPercent is a
+// share of the same viewport and needs no scaling; LengthEm/Rem are already
+// px by the time a cascade returns. pct==100 and non-positive pct are
+// no-ops.
+func (s *Styles) Scale(pct int) {
+	if s == nil || pct <= 0 || pct == 100 {
+		return
+	}
+	for n, st := range s.values {
+		for id := propertyID(0); id < propertyCount; id++ {
+			if l := lengthField(&st, id); l != nil && l.Kind == webstyle.LengthPx {
+				l.Value = int32((int64(l.Value)*int64(pct) + 50) / 100)
+			}
+		}
+		s.values[n] = st
+	}
+}
+
+func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet, base int32) (*Styles, []webstyle.Diagnostic) {
+	s := &Styles{values: make(map[*webrender.Node]webstyle.ComputedStyle), base: base}
 	var diags diagnostics
 	if doc == nil || doc.Root == nil {
 		diags.add(webstyle.DiagnosticInvalid, 0, 0, "invalid-input document")
@@ -140,7 +186,7 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 	// The root element's computed font-size, once it resolves — the rem base.
 	// Initial until then, which is the correct base for a rem on the root
 	// itself (its "parent" is the initial style).
-	rootFontPx := int32(webstyle.InitialFontSize)
+	rootFontPx := base
 	var walk func(*webrender.Node, webstyle.ComputedStyle, bool)
 	walk = func(n *webrender.Node, parent webstyle.ComputedStyle, parentNormal bool) {
 		if nodeStopped {
@@ -187,7 +233,7 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 				}
 			}
 		}
-		style := initialStyle()
+		style := initialStyleAt(base)
 		for _, b := range []*webstyle.Border{&style.Border.Top, &style.Border.Right, &style.Border.Bottom, &style.Border.Left} {
 			b.Color = webstyle.Color{Kind: webstyle.ColorCurrent}
 		}
@@ -210,7 +256,7 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 			} else if v.mode == valueInitial {
 				// Zero style carries length/factor initials. Fonts and foreground
 				// are explicitly resolved below; line-height normal is tracked.
-				initial := initialStyle()
+				initial := initialStyleAt(base)
 				v = valueOf(&initial, id)
 				if id >= pBorderTopWidth && id <= pBorderLeftColor && (id-pBorderTopWidth)%3 == 2 {
 					v.color = webstyle.Color{Kind: webstyle.ColorCurrent}
@@ -231,7 +277,7 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 			if parentPx <= 0 {
 				// The root's "parent" is the zero style; CSS resolves a root
 				// em/smaller against the initial medium.
-				parentPx = webstyle.InitialFontSize
+				parentPx = base
 			}
 			var px int64
 			switch style.FontSize.Kind {
@@ -279,7 +325,7 @@ func cascade(doc *webrender.Document, sheets []*Stylesheet, ua *Stylesheet) (*St
 		}
 		path = path[:len(path)-1]
 	}
-	walk(doc.Root, initialStyle(), true)
+	walk(doc.Root, initialStyleAt(base), true)
 	return s, diags.list
 }
 
