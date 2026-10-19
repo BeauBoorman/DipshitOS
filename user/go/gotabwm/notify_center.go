@@ -40,6 +40,15 @@ type centerNotification struct {
 	source     string
 	text       string
 	sourceGone bool
+	// M123c (#2577): a kind-22 progress row — progress reports an
+	// operation rather than recording a one-shot notice. op is the
+	// app-scoped id (title[0] of the request), pct the last reported
+	// 0..100 or -1 for indeterminate, pid the reporter's pid — the
+	// kind-23 cancel push's target.
+	progress bool
+	op       uint8
+	pct      int
+	pid      uint8
 }
 
 var (
@@ -228,13 +237,22 @@ func notifyCenterClick(px, py uint32) bool {
 	if pyi >= rowsY && pyi < rowsY+visible*notifyRowH {
 		index := (pyi - rowsY) / notifyRowH
 		if index < len(notifyCenter) {
-			if pxi >= x+w-34 {
+			entry := notifyCenter[index]
+			// M123c: a live progress row's trailing affordance is
+			// "Cancel" (the wider notifyProgressCancelW zone), not the
+			// plain dismiss X. A done row or one whose source is gone
+			// has nothing left to cancel — plain dismiss.
+			if entry.progress && !entry.progressDone() && !entry.sourceGone {
+				if pxi >= x+w-notifyProgressCancelW {
+					notifyProgressCancel(index)
+					return true
+				}
+			} else if pxi >= x+w-34 {
 				if dismissNotifyCenterEntry(index) {
 					vi.ConsoleLine(MarkerNotifyCenterAction + "dismiss")
 				}
 				return true
 			}
-			entry := notifyCenter[index]
 			if !entry.sourceGone && tabs.index(entry.tabID) >= 0 {
 				if focusNotifySource(entry.tabID) {
 					vi.ConsoleLine(MarkerNotifyCenterAction + "focus id=" + vi.Itoa64(int64(entry.tabID)))
@@ -320,11 +338,41 @@ func paintNotifyCenter(scan []byte, width, height int) int {
 		}
 		seatText(c, clip, x+notifyCenterPad, rowY+2, seatTextPx,
 			centerText(source, 48), fg)
-		seatText(c, clip, x+notifyCenterPad, rowY+16, seatTextPx,
-			centerText(entry.text, 48), tok.InkMuted)
-		// The row's dismiss glyph, centred on its trailing-34px hit zone.
-		seatGlyph(c, widgets.Rect{X: x + w - 34, Y: rowY, W: 34, H: notifyRowH},
-			closeIcon, tok.Muted, "X", x+w-28, rowY+10)
+		if entry.progress {
+			label := entry.text
+			if entry.pct >= 0 {
+				label = label + " " + vi.Itoa64(int64(entry.pct)) + "%"
+			}
+			seatText(c, clip, x+notifyCenterPad, rowY+16, seatTextPx,
+				centerText(label, 48), tok.InkMuted)
+			// The bar: accent fill for the reported fraction, or the
+			// sweeping segment while the total is unknown (seatTick
+			// drives it at the seat's own 1 Hz cadence).
+			barW := w - 2*notifyCenterPad - notifyProgressCancelW - notifyCenterPad
+			bar := widgets.Rect{X: x + notifyCenterPad, Y: rowY + 27, W: barW, H: 4}
+			written += seatFill(c, bar, tok.Rule)
+			if entry.pct >= 0 {
+				written += seatFill(c, widgets.Rect{X: bar.X, Y: bar.Y,
+					W: bar.W * entry.pct / 100, H: bar.H}, tok.Accent)
+			} else {
+				off, seg := notifyProgressSweep(seatTick, bar.W)
+				written += seatFill(c, widgets.Rect{X: bar.X + off, Y: bar.Y,
+					W: seg, H: bar.H}, tok.Accent)
+			}
+			if !entry.progressDone() && !entry.sourceGone {
+				seatText(c, clip, x+w-notifyProgressCancelW+4, rowY+13,
+					seatTextPx, "Cancel", tok.Muted)
+			} else {
+				seatGlyph(c, widgets.Rect{X: x + w - 34, Y: rowY, W: 34, H: notifyRowH},
+					closeIcon, tok.Muted, "X", x+w-28, rowY+10)
+			}
+		} else {
+			seatText(c, clip, x+notifyCenterPad, rowY+16, seatTextPx,
+				centerText(entry.text, 48), tok.InkMuted)
+			// The row's dismiss glyph, centred on its trailing-34px hit zone.
+			seatGlyph(c, widgets.Rect{X: x + w - 34, Y: rowY, W: 34, H: notifyRowH},
+				closeIcon, tok.Muted, "X", x+w-28, rowY+10)
+		}
 		if i+1 < rows && i+1 < len(notifyCenter) {
 			written += seatFill(c, widgets.Rect{X: x + notifyCenterPad, Y: rowY + notifyRowH - 1,
 				W: w - 2*notifyCenterPad, H: 1}, tok.Border)
