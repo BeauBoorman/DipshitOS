@@ -33,6 +33,7 @@ const (
 	modeRename
 	modeConfirmDelete
 	modeOpenWith // M81b (#1762): the Open-with… candidate list owns the digits
+	modeContext  // M124d (#2583): the right-click menu owns keys until dismissed
 )
 
 // titleBarPx is the window title band the client area sits below: the
@@ -74,6 +75,10 @@ type model struct {
 	openID    mime.ID
 	openCands []mime.Handler
 	launch    launchReq
+
+	// M124d (#2583): the right-click context menu — armed by a right SGR
+	// press on a row (context.go), painted as a CUP overlay (render.go).
+	ctx ctxMenu
 
 	// notify is the M79k (#1720) toast this batch wants raised, drained by
 	// main alongside `pending`. The model stays pure: it decides WHAT
@@ -534,6 +539,32 @@ func (m *model) handleKey(ev keys.Event) {
 			}
 		case keys.KeyEsc, keys.KeyBackspace:
 			m.cancelOpenWith()
+		case keys.KeyCtrlC:
+			m.quit = true
+		}
+		return
+	}
+	if m.mode == modeContext {
+		// The menu owns the keyboard: arrows walk the plate (and the open
+		// submenu), Right/Enter descend, Left closes the submenu, Esc
+		// dismisses — nothing leaks through to the list bindings.
+		switch ev.Key {
+		case keys.KeyUp:
+			m.ctxMove(-1)
+		case keys.KeyDown:
+			m.ctxMove(1)
+		case keys.KeyRight:
+			if !m.ctx.sub {
+				if m.ctx.sel == m.ctxOpenWithRow() {
+					m.ctxOpenSub()
+				}
+			}
+		case keys.KeyLeft:
+			m.ctx.sub = false
+		case keys.KeyEnter:
+			m.ctxCommit()
+		case keys.KeyEsc, keys.KeyBackspace:
+			m.cancelCtx()
 		case keys.KeyCtrlC:
 			m.quit = true
 		}

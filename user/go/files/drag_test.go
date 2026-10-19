@@ -31,8 +31,8 @@ func TestDragMimeNamesTheSniffedKind(t *testing.T) {
 		{"MYSTERY", []byte{0x00, 0x01, 0x02}, "application/octet-stream"},
 	}
 	for _, c := range cases {
-		if got := dragMime(c.name, c.head); got != c.want {
-			t.Errorf("dragMime(%q) = %q, want %q", c.name, got, c.want)
+		if got := fileMime(c.name, c.head); got != c.want {
+			t.Errorf("fileMime(%q) = %q, want %q", c.name, got, c.want)
 		}
 	}
 }

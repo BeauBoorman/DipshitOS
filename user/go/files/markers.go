@@ -44,9 +44,9 @@ const (
 	// M124c (#2582): the machine-clipboard half of a copy — the
 	// text/uri-list publish through slot 38 (rc= names the refusal,
 	// EACCES under the seat included).
-	markerClipSys       = "gofiles: clip-sys "
-	markerPasted        = "gofiles: pasted "
-	markerPasteNo       = "gofiles: paste refused "
+	markerClipSys = "gofiles: clip-sys "
+	markerPasted  = "gofiles: pasted "
+	markerPasteNo = "gofiles: paste refused "
 	// M79k (#1720): this app is the notify adopter. The seat owns the
 	// toast; the app's own half is the round trip. `notify sent` follows
 	// an accepted ack, `notify refused` an absent seat or a refused
@@ -74,6 +74,16 @@ const (
 	markerOpenCancel   = "gofiles: open cancelled "
 	markerOpenLaunched = "gofiles: open launched "
 	markerOpenLaunchNo = "gofiles: open launch refused "
+
+	// M124d (#2583): the right-click context menu. `menu` is the DECISION
+	// marker — the row, the mime spelling opens= matched against, and the
+	// eligible-handler count; `menu openwith` is the submenu descent
+	// (candidates= is named even when zero); the pick itself reuses
+	// `open chose`/`open launched` so one launch vocabulary covers both
+	// gestures; `menu closed` is the no-action dismissal.
+	markerMenu      = "gofiles: menu "
+	markerMenuSub   = "gofiles: menu openwith "
+	markerMenuClose = "gofiles: menu closed "
 
 	// M127d (#2602): "Export to Host". The marker names the staged
 	// payload (and the OUTBOX name it landed under when it differs);

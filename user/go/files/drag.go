@@ -49,19 +49,21 @@ func (m *model) dragOffer() (mt string, blob []byte, ok bool) {
 			m.status = refusalStatus("drag", rc)
 			return "", nil, false
 		}
-		m.dragMT = dragMime(name, data)
+		m.dragMT = fileMime(name, data)
 		m.dragLen = len(data)
 		return m.dragMT, data, true
 	}
 	return "", nil, false
 }
 
-// dragMime names the offer for the seat's opens= admission: the sniffed
-// family refined to a subtype for the formats the in-tree decoders
-// actually read (PNG for GOVIEW, text for GOEDIT). A bare family word is
-// still a legal mime on this wire — opensAccepts family-matches it — and
+// fileMime names a file for the opens= vocabulary: the sniffed family
+// refined to a subtype for the formats the in-tree decoders actually read
+// (PNG for GOVIEW, text for GOEDIT). The drag offer (M124a-2) declares it
+// to the seat's admission, and the M124d context menu matches manifest
+// opens= rows against the same spelling. A bare family word is still a
+// legal mime on this wire — opensAccepts family-matches it — and
 // "application/octet-stream" is the honest name for unknown bytes.
-func dragMime(name string, head []byte) string {
+func fileMime(name string, head []byte) string {
 	switch mime.Sniff(name, head) {
 	case mime.Text:
 		return "text/plain"

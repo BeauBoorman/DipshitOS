@@ -19,11 +19,14 @@ import (
 	"virelai/vi"
 )
 
-// launchReq is the exec main.go owes the frame: which binary, on which path.
-// Empty Bin means "nothing to launch".
+// launchReq is the exec main.go owes the frame: which binary, on which
+// path. Args is the manifest row's argv= tail (M124d) — fixed arguments
+// ahead of the file path; nil for the registry dispatches, which carry no
+// fixed argv. Empty Bin means "nothing to launch".
 type launchReq struct {
 	bin  string
 	path string
+	args []string
 }
 
 // maxCandidates bounds the Open-with list to the digits that exist.

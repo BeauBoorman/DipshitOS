@@ -26,6 +26,11 @@ const (
 	colDim  = "\x1b[38;2;120;130;144m"               // hints, padding notes
 	colSep  = "\x1b[38;2;60;72;88m"                  // pane separator
 
+	// The context menu's plate: a raised dark band a step off the list's
+	// ink. Selected rows reuse colSel; the "(no handlers)" empty row dims.
+	colMenu    = "\x1b[48;2;34;42;56;38;2;216;224;232m"
+	colMenuDim = "\x1b[48;2;34;42;56;38;2;120;130;144m"
+
 	// The alt-screen prologue every frame starts with (M72b: the window VT
 	// has ?1049/?25l/ED/CUP — each paint is a full, self-contained frame).
 	framePrologue = "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"
@@ -53,7 +58,69 @@ func listWidth(cols int) int {
 // grid).
 func (m model) render() string {
 	lines := m.renderLines()
-	return framePrologue + strings.Join(lines, "\n")
+	frame := framePrologue + strings.Join(lines, "\n")
+	if m.mode == modeContext {
+		frame += m.renderCtxMenu()
+	}
+	return frame
+}
+
+// renderCtxMenu is the M124d (#2583) overlay: after the full grid repaint
+// each plate row is painted in place by CUP — the menu floats over the
+// frame it was opened on without splicing styled line strings. Rows are
+// space-padded to the plate width so the background reads as one plate.
+func (m model) renderCtxMenu() string {
+	var b strings.Builder
+	tx, ty, tw, th := m.ctxTopRect()
+	labels := m.ctxTopLabels()
+	subRow := m.ctxOpenWithRow()
+	for i := 0; i < th; i++ {
+		label := ""
+		if i < len(labels) {
+			label = labels[i]
+		}
+		// Row text: a leading space, the label padded to the arrow
+		// column, then ">" for the submenu parent or a space.
+		text := " " + label
+		text += strings.Repeat(" ", tw-1-visLen(text))
+		if i == subRow {
+			text += ">"
+		} else {
+			text += " "
+		}
+		style := colMenu
+		if i == m.ctx.sel {
+			style = colSel
+		}
+		cup(&b, ty+i, tx)
+		b.WriteString(style + text + colReset)
+	}
+	if m.ctx.sub {
+		sx, sy, sw, sh := m.ctxSubRect()
+		subs := m.ctxSubLabels()
+		for i := 0; i < sh; i++ {
+			text := " " + subs[i]
+			text += strings.Repeat(" ", sw-visLen(text))
+			style := colMenu
+			if len(m.ctx.apps) == 0 {
+				style = colMenuDim
+			} else if i == m.ctx.subSel {
+				style = colSel
+			}
+			cup(&b, sy+i, sx)
+			b.WriteString(style + text + colReset)
+		}
+	}
+	return b.String()
+}
+
+// cup writes the VT cursor-position escape for a 0-based cell.
+func cup(b *strings.Builder, row, col int) {
+	b.WriteString("\x1b[")
+	b.WriteString(vi.Itoa64(int64(row + 1)))
+	b.WriteString(";")
+	b.WriteString(vi.Itoa64(int64(col + 1)))
+	b.WriteString("H")
 }
 
 func (m model) renderLines() []string {
