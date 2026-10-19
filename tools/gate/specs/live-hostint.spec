@@ -55,13 +55,45 @@
 # re-ARMED case); the class-B legs observe the runner-side lane_disabled
 # refusals + the seat's mask re-adoption lines + the deferred emit.
 #
+# Run 05 is the M127f (#2604) acceptance journey — the through-the-glass
+# 2.0 round trip on ONE armed session (lanes=drop,notify,outbox): the
+# host drop lands TRIP.QOI -> seat toast -> a pointer press on the OLDER
+# strip slot dispatches the drop-open action (M127b) while a GOFILES
+# paste toast stays newest; GOSH `export` rides the OUTBOX lane to
+# --host-outbox-dir (M127d); a `notify-click` bus verb answers the last
+# consumed NOTIFY_OUT — the sender-bound GOFILES toast — as a signed
+# NFOCUS the seat turns into focusHosted (M127c); and an AGENTD session
+# under agentctl's `full` journey feeds AGENT/AUDIT receipts the host
+# companion surfaces (`host-agent: watch`/`session open`/`close`) while
+# `lane-agent` SIGSTOP/SIGCONTs the stream child mid-session (M127e).
+# Ordering that makes it deterministic: the drop gesture waits for
+# `gofiles: ready` so the paste input lands on a focused GOFILES; the
+# paste input waits for the drop-toast marker so the GOFILES toast is
+# seq=2 (the sender the click-through answers); the drop-open rides the
+# center ROW (a persistent surface — no toast-expiry race): the pointer
+# train opens the clock panel once `agent verb ui.windows` prints, then
+# sweeps rows bottom-up so a dismissal can't shift the drop row out from
+# under a later press (run 01's D.QOI click gets the same fallback); the
+# lane-agent pause fires on
+# `agentd: auth ok` (the stream child provably exists, and — because the
+# connect itself waits on the paste toast — strictly after the burst) and
+# resume fires on the export emit, which script3 only stages post-auth.
+#
 # The credential rides the share's SECRETS.TXT, bound to GOTABWM.ELF (the
 # ADR 0024 D8 app binding). --screen arms the virtio-gpu the seat's
 # WmctlRegister requires AND the display path the drop lane needs.
+# exec-order: intentional -- run 05's later scripts exec several programs
+# (AGENTD/GOCALC/GOFILES at arm, then GOSH post-auth); each consumer is
+# gated on that program's own marker and the run ends on `hostint
+# notify-focus`, which no script prints.
 #
 # HOST PREREQ:
 #   bash tools/go/build-gotabwm.sh   ->  .build/go/GOTABWM.ELF
 #   bash tools/go/build-goview.sh    ->  .build/go/GOVIEW.ELF
+#   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF
+#   bash tools/go/build-gosh.sh      ->  .build/go/GOSH.ELF
+#   bash tools/go/build-agentd.sh    ->  .build/go/AGENTD.ELF
+#   bash tools/go/build-gocalc.sh    ->  .build/go/GOCALC.ELF
 #   GO_BUILD_NAME=GOCOMP bash tools/go/build-go.sh user/go/compose/main.go
 
 vgate_name live-hostint "M108e #2329: standing host-integration acceptance -- all lanes + negatives (ADR 0051)"
@@ -104,6 +136,33 @@ EOF
 vgate_file script-susp.txt <<'EOF'
 clip m114c-deferred
 EOF
+
+# ---- run 05 (M127f): the through-the-glass 2.0 journey ----------------------
+vgate_file script-v2-seat.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOTABWM.ELF
+EOF
+
+# Armed: AGENTD (the M127e companion leg's endpoint) and GOFILES (the
+# M127c sender toast) come up together; GOFILES is exec'd last so its
+# declare takes focus — the paste input's target.
+vgate_file script-v2-apps.txt <<'EOF'
+exec AGENTD.ELF --allow-exec
+exec GOCALC.ELF
+exec GOFILES.ELF /host/NFY
+EOF
+
+# Post-paste, post-auth: the runner's TCP connect waits for the paste
+# toast, so `agentd: auth ok` can only print once GOFILES's burst is
+# done — the GOCALC declare this script makes can never steal the
+# paste's focus. The export REQ then stages while the agent stream
+# child sits SIGSTOP'd — the seat drains it under a frozen agent and
+# the emit marker is what resumes the child.
+vgate_file script-v2-late.txt <<'EOF'
+exec GOSH.ELF -c "export DOCS/HELLO.TXT"
+EOF
+
 
 vgate_setup_python <<'PY'
 import hashlib, hmac, os, shutil, struct, sys
@@ -188,6 +247,72 @@ print("staged hostint share (3 ELFs + credential + 4 refusal plants"
       " + 18-path drop gesture) + 2 clean shares")
 PY
 
+vgate_setup_python <<'PY'
+import os, shutil, sys
+run = os.environ["RUN_DIR"]
+sys.path.insert(0, os.path.join("tools", "agentctl"))
+import agentctl
+# Run 05 stages on the armed share — the companion resolves argv's
+# first --cvc-file (the harness's own), so the audit lane must live on
+# the seeded share for host-agent: to see receipts.
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+for name, build in (
+    ("GOFILES.ELF", "bash tools/go/build-files.sh"),
+    ("GOSH.ELF", "bash tools/go/build-gosh.sh"),
+    ("AGENTD.ELF", "bash tools/go/build-agentd.sh"),
+    ("GOCALC.ELF", "bash tools/go/build-gocalc.sh"),
+):
+    src = os.path.join(".build", "go", name)
+    if not os.path.isfile(src):
+        sys.exit(name + " missing (expected " + src + ") - build it first: " + build)
+    shutil.copy(src, os.path.join(share, name))
+# The agent's Ed25519 identity: the seed stays host-side ($RUN_DIR key
+# file, never argv); AGENTS.TXT carries the public half with full caps
+# for the `full` journey.
+SEED = "0a" * 32
+pub = agentctl.ed_public_key(bytes.fromhex(SEED)).hex()
+open(os.path.join(share, "AGENTS.TXT"), "w").write(
+    "#v1\nagent=devin key=%s caps=file,process,window,term\n" % pub)
+open(os.path.join(run, "devin.key"), "w").write("devin " + SEED + "\n")
+# The M109c receipt key, appended beside the host-int row: agentd signs
+# with it, the seat's agentwatch and the host companion both verify —
+# one provisioned row, three readers (the ADR 0051 v2 double-reader).
+# (These are APPENDS — the block above owns the file's host-int row.)
+AKEY = "a5" * 32
+with open(os.path.join(share, "SECRETS.TXT"), "a") as f:
+    f.write("agent-hmac\t1000\t" + AKEY + "\tAGENTD.ELF,GOTABWM.ELF\n")
+with open(os.path.join(share, "OWNERS.TXT"), "a") as f:
+    f.write("AGENTD.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n")
+# The agent sandbox + the journey's fs fixture set (imported constants,
+# so the fixtures live in tools/agentctl).
+ad = os.path.join(share, "AGENT")
+os.makedirs(os.path.join(ad, "AUDIT"), exist_ok=True)
+os.makedirs(os.path.join(ad, "SUB"), exist_ok=True)
+open(os.path.join(ad, "SEED.TXT"), "wb").write(agentctl.SEED_BYTES)
+open(os.path.join(ad, "SUB", "DEEP.TXT"), "wb").write(agentctl.DEEP_BYTES)
+open(os.path.join(ad, "WIDE.TXT"), "wb").write(agentctl.wide_bytes())
+open(os.path.join(ad, "BIG.BIN"), "wb").write(b"\x00" * 4097)
+# The export source (GOSH resolves `export DOCS/x` against the share
+# root), the GOFILES paste range (one dir, one file — a single
+# `copied SRC.TXT` toast), and the journey's drop payload + landing dir.
+# OUTBOX/ is pre-created so the seat's first outbox poll cannot race the
+# runner's mkdir into an io_error refusal toast (which would push an
+# extra center row ahead of the drop's).
+os.makedirs(os.path.join(share, "DOCS"), exist_ok=True)
+open(os.path.join(share, "DOCS", "HELLO.TXT"), "w").write(
+    "through the glass, back again\n")
+os.makedirs(os.path.join(share, "NFY", "D1"), exist_ok=True)
+open(os.path.join(share, "NFY", "SRC.TXT"), "w").write(
+    "notify-range-payload\n")
+os.makedirs(os.path.join(share, "OUTBOX"), exist_ok=True)
+shutil.copy("tests/fixtures/qoi/viewer_160x120.qoi",
+            os.path.join(run, "drop-src", "TRIP.QOI"))
+os.makedirs(os.path.join(run, "dest05"), exist_ok=True)
+open(os.path.join(run, "agent-hmac-sentinel.txt"), "w").write(AKEY + "\n")
+print("staged v2 journey: +4 ELFs, agentd keyring + audit lane, DOCS/NFY"
+      " fixtures, TRIP.QOI + dest05")
+PY
+
 # ---- 01: every lane + every negative, one boot -------------------------------
 # --screen arms the virtio-gpu (WmctlRegister) AND the drop lane's
 # display precondition. The chain is strictly marker-ordered: both
@@ -226,9 +351,9 @@ vgate_run 01 -- \
     --host-drop-file '$RUN_DIR/drop-src/TAIL2.QOI' \
     --host-drop-after 'gotabwm: hostint armed' \
     --host-notify \
-    --pointer-virtio '112,702,c' \
+    --pointer-virtio '112,702,c;1250,702,c;640,465,c;640,431,c;640,397,c;640,363,c;640,329,c;640,295,c;640,261,c;640,227,c' \
     --pointer-virtio-after 'gotabwm: hostint drop seq=4 name=D.QOI' \
-    --script-expect 'clip: m108e-guest-copy-02' --script-expect-tail 12 --timeout 300
+    --script-expect 'clip: m108e-guest-copy-02' --script-expect-tail 130 --timeout 300
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 01 serial-contains 'exec: loaded GOTABWM.ELF'
@@ -536,4 +661,204 @@ if key in out:
     sys.exit("FAIL: the lane key reached runner stdout")
 print("run-04: suspend -> lane_disabled refusals -> resume recovery +"
       " send-file landing all held")
+PY
+
+# ---- 05: M127f (#2604) — the through-the-glass 2.0 journey, one boot --------
+# The ordering spine (each edge is causal, none is a sleep): armed ->
+# GOFILES declares focused -> the drop gesture lands TRIP.QOI and its
+# action toast stages for the notify lane AND the center -> the paste
+# input types into the still-focused GOFILES and `copied SRC.TXT` is the
+# NEWEST notify-out (seq=2, sender=tab) -> the first press opens the
+# center on the clock chrome, the second clicks history row 0 — the
+# drop's persistent row carries the same drop-open action the toast did,
+# with NO expiry window to race (M127b) -> GOVIEW opens -> the runner's
+# TCP connect, held on the paste toast, only now reaches agentd ->
+# `agentd: auth ok` pauses the agentctl stream child (lane-agent
+# SIGSTOP) and releases script3's GOCALC+export -> the seat drains the
+# REQ under a frozen agent and `hostint outbox seq=1` resumes the child
+# (SIGCONT) -> the `full` journey completes -> session end fires
+# `notify-click`: the last consumed record is the GOFILES toast, so the
+# bare runner emits a signed NFOCUS{sender} and the seat focuses the tab
+# (M127c). The AGENT/AUDIT receipts feed both mirrors — the seat's
+# agentwatch markers and the host companion's `host-agent:` lines.
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio \
+    --net '$RUN_DIR/cap05.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=full' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/devin.key' \
+    --net-tcp-connect-after 'gofiles: notify sent copied SRC.TXT' \
+    --script '$RUN_DIR/script-v2-seat.txt' \
+    --script2 '$RUN_DIR/script-v2-apps.txt' --script2-after 'gotabwm: hostint armed' \
+    --script3 '$RUN_DIR/script-v2-late.txt' --script3-after 'agentd: auth ok agent=devin' \
+    --host-drop \
+    --host-drop-file '$RUN_DIR/drop-src/TRIP.QOI' \
+    --host-drop-after 'gofiles: ready' \
+    --host-notify \
+    --host-outbox --host-outbox-dir '$RUN_DIR/dest05' \
+    --input-string 'Gcglp' \
+    --input-string-after 'gotabwm: notify id=0 host drop: TRIP.QOI' \
+    --pointer-virtio '320,10,c;1250,702,c;640,465,c;640,431,c;640,397,c;640,363,c;640,329,c;640,295,c;640,261,c;640,227,c' \
+    --pointer-virtio-after 'gotabwm: agent verb ui.windows' \
+    --host-cmd-after 'agentd: auth ok agent=devin:lane-agent' \
+    --host-cmd-after 'gotabwm: hostint outbox seq=1:lane-agent' \
+    --host-cmd-after 'agentd: session end:notify-click' \
+    --script-expect 'gotabwm: hostint notify-focus seq=1 id=' --script-expect-tail 95 --timeout 300
+
+vgate_assert 05 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 05 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 05 serial-contains 'gotabwm: registered'
+# ONE session, three lane bits named at both ends.
+vgate_assert 05 output-contains 'host-int: armed lanes=drop,notify,outbox epoch='
+vgate_assert 05 serial-contains 'gotabwm: hostint armed epoch='
+vgate_assert 05 serial-contains 'lanes=drop,notify,outbox'
+# The drop leg + the M127b click-open: the slot-0 press dispatched the
+# action toast, mime sniffed QOI -> GOVIEW, the INBOX path rode argv.
+vgate_assert 05 output-contains 'host-drop: inject files=1'
+vgate_assert 05 output-contains 'host-drop: file seq=1 name=TRIP.QOI'
+vgate_assert 05 serial-contains 'gotabwm: hostint drop seq=1 name=TRIP.QOI'
+vgate_assert 05 serial-contains 'gotabwm: notify id=0 host drop: TRIP.QOI'
+vgate_assert 05 serial-contains 'gotabwm: hostint drop-open name=TRIP.QOI app=GOVIEW.ELF'
+vgate_assert 05 serial-contains 'gview: open id='
+# The GOFILES sender toast: the last consumed NOTIFY_OUT record — the
+# correlation the notify-click answers.
+vgate_assert 05 serial-contains 'gofiles: notify sent copied SRC.TXT'
+vgate_assert 05 serial-contains 'gotabwm: hostint notify-out seq=1'
+vgate_assert 05 serial-contains 'gotabwm: hostint notify-out seq=2'
+vgate_assert 05 output-contains 'host-notify: dropped reason=no_bundle seq=1 n=1'
+vgate_assert 05 output-contains 'host-notify: dropped reason=no_bundle seq=2 n=2'
+# M127c click-through: the bus verb emitted NFOCUS-00000001 against the
+# sender, the seat verified it and ran focusHosted — the same seam the
+# bundled banner's didReceive takes.
+vgate_assert 05 output-contains 'host-ui: cmd=notify-click state=performed'
+vgate_assert 05 output-contains 'host-notify: click-focus id='
+vgate_assert 05 serial-contains 'gotabwm: hostint notify-focus seq=1 id='
+vgate_assert 05 serial-contains 'gotabwm: tab focus id='
+vgate_assert 05 serial-contains 'gotabwm: host focus id='
+# The M127d export leg: GOSH staged the REQ, the seat signed the record,
+# the runner moved the payload to dest05.
+vgate_assert 05 serial-contains 'gosh: export staged name=HELLO.TXT'
+vgate_assert 05 serial-contains 'gotabwm: hostint outbox seq=1 name=HELLO.TXT'
+vgate_assert 05 output-contains 'host-outbox: file seq=1 name=HELLO.TXT'
+# The M127e agent leg: the Ed25519 session ran the full journey while
+# the companion watched AGENT/AUDIT and lane-agent froze/thawed the
+# stream child mid-session.
+vgate_assert 05 serial-contains 'agentd: start exec=on'
+vgate_assert 05 serial-contains 'agentd: listen 4747'
+vgate_assert 05 serial-contains 'agentd: auth ok agent=devin'
+vgate_assert 05 serial-contains 'agentd: session end reason=line_too_long'
+vgate_assert 05 output-contains 'NET-TCP-STREAM: ENABLED'
+vgate_assert 05 output-contains 'AGENTCTL: PASS full'
+vgate_assert 05 output-contains 'NET-TCP-STREAM: probe exited status=0'
+vgate_assert 05 output-contains 'host-agent: watch'
+vgate_assert 05 output-contains 'host-agent: session open agent=-'
+vgate_assert 05 output-contains 'host-agent: session close agent=devin'
+vgate_assert 05 output-contains 'host-agent: lane paused pid='
+vgate_assert 05 output-contains 'host-agent: lane resumed pid='
+vgate_assert 05 output-contains 'host-ui: cmd=lane-agent state=performed paused=1'
+vgate_assert 05 output-contains 'host-ui: cmd=lane-agent state=performed paused=0'
+# The seat's own agentwatch mirror read the same lane.
+vgate_assert 05 serial-contains 'gotabwm: agent watch'
+vgate_assert 05 serial-contains 'gotabwm: agent session open agent=-'
+vgate_assert 05 serial-contains 'gotabwm: agent session close agent=devin'
+# Never-logged: lane key, receipt key, agent seed stay off serial/stdout.
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'agentd: auth fail'
+vgate_assert 05 serial-absent 'm108ekeym108ekey'
+vgate_assert 05 serial-absent 'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5'
+vgate_assert 05 serial-absent '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a'
+vgate_assert 05 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-05.out"), errors="replace").read()
+ser = open(os.environ["VG_SER"], errors="replace").read()
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+
+def sidx(s):
+    i = ser.find(s)
+    if i < 0: sys.exit("FAIL: missing serial marker " + s)
+    return i
+
+def oidx(s):
+    i = out.find(s)
+    if i < 0: sys.exit("FAIL: missing output marker " + s)
+    return i
+
+# The journey spine, in order: drop apply -> the drop toast -> the paste
+# toast -> the click dispatched drop-open -> the viewer opened.
+if not (sidx("hostint drop seq=1 name=TRIP.QOI")
+        < sidx("notify id=0 host drop: TRIP.QOI")
+        < sidx("gofiles: notify sent copied SRC.TXT")
+        < sidx("hostint drop-open name=TRIP.QOI")
+        < sidx("gview: open id=")):
+    sys.exit("FAIL: drop -> toast -> paste -> click -> open ordering broken")
+# The click-through answered a real tab id — never a seat toast — and
+# the seat's notify-focus named the same pair.
+m = re.search(r"host-notify: click-focus id=(\d+) seq=(\d+)", out)
+n = re.search(r"hostint notify-focus seq=(\d+) id=(\d+)", ser)
+if not m:
+    sys.exit("FAIL: no runner click-focus receipt")
+if not n:
+    sys.exit("FAIL: no seat notify-focus receipt")
+if m.group(1) == "0":
+    sys.exit("FAIL: click answered a sender-0 toast")
+if m.group(1) != n.group(2) or m.group(2) != n.group(1):
+    sys.exit("FAIL: click-focus %r vs seat notify-focus %r"
+             % (m.groups(), n.groups()))
+# The focused tab IS the toast's sender — the focus markers that follow
+# the notify-focus receipt name the same id.
+after = ser[n.end():]
+if ("gotabwm: tab focus id=" + n.group(2)) not in after or \
+   ("gotabwm: host focus id=" + n.group(2)) not in after:
+    sys.exit("FAIL: notify-focus did not focus the sender tab")
+# The agent choke: the companion saw the session, the child froze, the
+# journey still completed — pause strictly before resume before PASS.
+if not (oidx("host-agent: session open") > -1 and
+        oidx("host-agent: lane paused") < oidx("host-agent: lane resumed")
+        < oidx("AGENTCTL: PASS full")):
+    sys.exit("FAIL: pause/resume/pass ordering broken")
+# The landed files are byte-true: the drop sits in INBOX at fixture
+# size, the export moved to dest05 with the source's bytes.
+want = os.path.getsize("tests/fixtures/qoi/viewer_160x120.qoi")
+got = os.path.join(share, "INBOX", "TRIP.QOI")
+if not os.path.isfile(got) or os.path.getsize(got) != want:
+    sys.exit("FAIL: INBOX/TRIP.QOI missing or wrong size")
+exp = open(os.path.join(share, "DOCS", "HELLO.TXT"), "rb").read()
+landed = os.path.join(run, "dest05", "HELLO.TXT")
+if not os.path.isfile(landed) or open(landed, "rb").read() != exp:
+    sys.exit("FAIL: dest05/HELLO.TXT missing or content mismatch")
+# Lane hygiene: HOSTINT holds no unconsumed records (NFOCUS included),
+# no REQ marker survives, and the payload moved out of OUTBOX.
+left = [x for x in os.listdir(os.path.join(share, "HOSTINT"))
+        if not x.endswith("~")]
+if left:
+    sys.exit("FAIL: unconsumed lane files left in HOSTINT: %r" % left)
+ob = sorted(os.listdir(os.path.join(share, "OUTBOX")))
+if any(x.startswith("REQ-") for x in ob):
+    sys.exit("FAIL: REQ markers left in OUTBOX: %r" % ob)
+if "HELLO.TXT" in ob:
+    sys.exit("FAIL: the payload stayed in OUTBOX after landing")
+# The audit lane fed real receipts and the host companion verified
+# every one (a 'rcpt bad' line anywhere is tamper evidence).
+adir = os.path.join(share, "AGENT", "AUDIT")
+rcpts = [x for x in os.listdir(adir)
+         if x.startswith("RCPT-") and not x.endswith("~")]
+if not rcpts:
+    sys.exit("FAIL: no audit receipts landed in AGENT/AUDIT")
+if "host-agent: rcpt bad" in out:
+    sys.exit("FAIL: a receipt failed host-side MAC verification")
+# Never-logged on the runner side: neither key nor the seed reached
+# stdout (the serial transcript inside out may carry guest echoes only).
+for secret in (
+    open(os.path.join(run, "key-sentinel.txt")).read().strip(),
+    open(os.path.join(run, "agent-hmac-sentinel.txt")).read().strip(),
+    "0a" * 32,
+):
+    if secret in out:
+        sys.exit("FAIL: a key reached runner stdout")
+print("run-05 journey: %d receipts verified, drop-open + sender focus +"
+      " export landing + lane pause/resume all held" % len(rcpts))
 PY
