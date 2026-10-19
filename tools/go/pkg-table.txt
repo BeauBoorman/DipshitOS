@@ -36,6 +36,7 @@ allow bufio
 allow bytes
 allow cmp
 allow context
+allow crypto/sha256
 allow encoding
 allow encoding/base32
 allow encoding/base64

@@ -24,12 +24,47 @@ import (
 // seconds is generous for the verbs store spawns.
 const execWaitNs = int64(15) * int64(1e9)
 
+// killDrainTicks bounds the probe drain after a timed-out child is
+// killed. sys_kill only ARMS the exit — it fires at the child's next
+// ring selection (1 Hz ticks) and the descriptor recycles on the
+// reaper's schedule — so "the slot is coming back" is observed by
+// polling, bounded, never blocking.
+const killDrainTicks = 8
+
+// The inner syscalls are their own seams (the agentd discipline): tests
+// that replace execFn wholesale never reach them, but a test CAN
+// exercise execFn itself — the kill-on-timeout path — by faking a spawn
+// plus a budget expiry.
+var (
+	execSpawnFn  = vi.Exec
+	waitBudgetFn = vi.WaitBudget
+	killFn       = vi.Kill
+	probeFn      = vi.Probe
+)
+
 var execFn = func(name string, args ...string) (int64, error) {
-	pid, err := vi.Exec(name, args...)
+	pid, err := execSpawnFn(name, args...)
 	if err != nil {
 		return -1, err
 	}
-	return vi.WaitBudget(pid, execWaitNs)
+	status, err := waitBudgetFn(pid, execWaitNs)
+	if err == nil {
+		return status, nil
+	}
+	// ErrWaitGone with a live child leaves an orphan holding task-pool
+	// slots — observed on #2402's ~21 s FLINT clone: the timed-out verb
+	// kept its slots and attempt 2's spawn starved into newosproc. Kill
+	// the child and give the armed exit a few ticks to take before the
+	// caller's retry re-spawns. The never-appeared case drains on the
+	// first probe (Absent) and Kill just refuses EINVAL — same code.
+	_ = killFn(uint64(pid))
+	for i := 0; i < killDrainTicks; i++ {
+		if _, state := probeFn(pid); state != vi.ProbeRunning {
+			break
+		}
+		sleepFn(1)
+	}
+	return -1, err
 }
 
 var sleepFn = vi.Sleep
