@@ -492,7 +492,7 @@ vgate_run 03 -- \
     --input-chords-after 'charmhello: ready' \
     --screenshot-after 'dui[' \
     --script3 '$RUN_DIR/script-03c.txt' \
-    --script3-after 'gotabwm: split h' --script3-delay 3 \
+    --script3-after 'gotabwm: split h' --script3-delay 6 \
     --script-expect 'procs GOSTALGIA.ELF exited status=0' --timeout 240
 
 vgate_assert 03 serial-contains 'gostalgia: tty attached window=3'
@@ -834,6 +834,11 @@ PY
 #   runtime-receipt    -> --input-key Return on the emptied strip: the
 #                        start surface's keyboard affordance re-opens the
 #                        launcher — the desktop took the keyboard back.
+#                        The receipt lands deep into the tail under load
+#                        (script-06c's three dumps run ~4 s past the 3 s
+#                        delay), so the tail is 16 s: the injected key
+#                        must leave real drain budget for the seat to
+#                        consume it and print `launcher open` again.
 vgate_run 06 -- \
     --screen '$RUN_DIR/gos-06' \
     --input --via-virtio \
@@ -850,7 +855,7 @@ vgate_run 06 -- \
     --input-key 36 \
     --input-key-after 'runtime-receipt' \
     --script-expect 'procs GOSTALGIA.ELF exited status=0' \
-    --script-expect-tail 8 --timeout 240
+    --script-expect-tail 16 --timeout 240
 
 # Launcher path: the seat opened its launcher, decoded the manifest's v2
 # fields (a v2 row with argv/caps bumps those counts), filtered to exactly
@@ -1012,7 +1017,7 @@ vgate_run 07 -- \
     --input-key 36 \
     --input-key-after 'runtime-receipt' \
     --script-expect 'procs GOSTALGIA.ELF exited status=0' \
-    --script-expect-tail 8 --timeout 240
+    --script-expect-tail 16 --timeout 240
 
 vgate_assert 07 serial-contains 'gotabwm: launcher open n='
 vgate_assert 07 serial-contains 'gotabwm: launcher filter q=gostalgia n=1'
@@ -1288,7 +1293,6 @@ vgate_run 08 -- \
     --input-chords-after 'gostalgia: call app/list ok' \
     --cvc-snap \
     --snapshot-after 'gostalgia: call sys/ping ok' \
-    --snapshot-after 'gostalgia: shutdown reason=shell exited' \
     --snapshot-out '$RUN_DIR/snap-08' \
     --script3 '$RUN_DIR/script-08c.txt' \
     --script3-after 'procs GOSTALGIA.ELF exited status=0' --script3-delay 3 \

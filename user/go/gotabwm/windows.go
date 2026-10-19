@@ -212,6 +212,7 @@ func setWindowChrome(id int, hosted bool) bool {
 		chromeScratch, err = vi.MmapHint(scratchVA+vi.PageSize, vi.PageSize,
 			vi.ProtRead|vi.ProtWrite, vi.MapAnonymous)
 		if err != nil {
+			vi.ConsoleLine("gotabwm: chrome mmap failed " + err.Error())
 			return false
 		}
 	}
@@ -223,7 +224,12 @@ func setWindowChrome(id int, hosted bool) bool {
 	} else {
 		fillBorderChrome(desc)
 	}
-	return writeWindowChrome(uint32(id), desc) == 0
+	if c := writeWindowChrome(uint32(id), desc); c != 0 {
+		vi.ConsoleLine("gotabwm: chrome refuse id=" + vi.Itoa64(int64(id)) +
+			" r=" + vi.Itoa64(c))
+		return false
+	}
+	return true
 }
 
 // upload emits only changed, same-color horizontal runs, in batched fills.
