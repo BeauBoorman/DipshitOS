@@ -793,6 +793,9 @@ var hostPasteboardName: String?
 var hostClipInText: String?
 var hostClipInAfter: String?
 var hostClipInFired = false
+// M124c: a typed inject — file bytes + a negotiated mime.
+var hostClipInFile: String?
+var hostClipInMime: String?
 var hostClipboard: HostClipboard?
 // M108c (#2326, ADR 0051 D4): `--host-drop` arms the file-drop lane — the
 // display view registers .fileURL, dropped files land in <share>/INBOX/
@@ -1673,6 +1676,12 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--host-clip-in-after", idx + 1 < arguments.count {
         hostClipInAfter = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--host-clip-in-file", idx + 1 < arguments.count {
+        hostClipInFile = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--host-clip-in-mime", idx + 1 < arguments.count {
+        hostClipInMime = arguments[idx + 1]
         idx += 2
     } else if arg == "--host-drop" {
         // M108c (#2326, ADR 0051 D4): the host→guest file-drop lane —
@@ -3262,17 +3271,23 @@ if hostWriteAfter != nil || hostWritePath != nil || hostWriteContent != nil {
 // M108b (#2325, ADR 0051 D6): the lane flags are modifiers on --cvc-file —
 // the share IS the transport, so a lane flag without it is a fatal argument
 // error (loud, never a silent ignore — the --via-virtio rule).
-if hostClipboardFlag || hostPasteboardName != nil || hostClipInText != nil || hostClipInAfter != nil {
+if hostClipboardFlag || hostPasteboardName != nil || hostClipInText != nil || hostClipInAfter != nil || hostClipInFile != nil || hostClipInMime != nil {
     guard hostClipboardFlag else {
         fail("--host-pasteboard/--host-clip-in/--host-clip-in-after are modifiers on --host-clipboard (no lane to redirect or inject into).")
     }
     guard cvcFileEnabled else {
         fail("--host-clipboard requires --cvc-file <share-dir> (the lanes are signed files in that share — ADR 0051 D1).")
     }
-    if hostClipInAfter != nil, hostClipInText == nil {
-        fail("--host-clip-in-after requires --host-clip-in <text> (there is no pasteboard write to schedule).")
+    if hostClipInAfter != nil, hostClipInText == nil, hostClipInFile == nil {
+        fail("--host-clip-in-after requires --host-clip-in <text> or --host-clip-in-file <path> (there is no pasteboard write to schedule).")
     }
-    if hostClipInText != nil, hostClipInAfter == nil {
+    if hostClipInFile != nil, hostClipInMime == nil {
+        fail("--host-clip-in-file requires --host-clip-in-mime <mime> (the type the inject negotiates on the pasteboard).")
+    }
+    if hostClipInMime != nil, hostClipInFile == nil {
+        fail("--host-clip-in-mime requires --host-clip-in-file <path> (mime alone has no bytes to offer).")
+    }
+    if hostClipInText != nil || hostClipInFile != nil, hostClipInAfter == nil {
         // Default trigger: fire as soon as the seat announces the lane is
         // armed — the deterministic point where a CLIP_IN can be consumed.
         hostClipInAfter = "gotabwm: hostint armed"
@@ -5312,12 +5327,19 @@ func hostIntTick() {
 // carries in, not a seam that skips it. Fires once; the marker line carries
 // the byte count, never the text (never-logged contract).
 func fireHostClipInIfMarker(_ text: String) {
-    guard let marker = hostClipInAfter, !hostClipInFired, let body = hostClipInText,
+    guard let marker = hostClipInAfter, !hostClipInFired,
           text.contains(marker) else { return }
-    hostClipInFired = true
-    guard let lane = hostClipboard else { return }
-    let cc = lane.inject(body)
-    FileHandle.standardOutput.write(Data("host-clip: inject len=\(body.utf8.count) changeCount=\(cc) after \"\(marker)\"\n".utf8))
+    if let body = hostClipInText {
+        hostClipInFired = true
+        guard let lane = hostClipboard else { return }
+        let cc = lane.inject(body)
+        FileHandle.standardOutput.write(Data("host-clip: inject len=\(body.utf8.count) changeCount=\(cc) after \"\(marker)\"\n".utf8))
+    } else if let path = hostClipInFile, let mime = hostClipInMime {
+        hostClipInFired = true
+        guard let lane = hostClipboard else { return }
+        let cc = lane.injectTyped(path: path, mime: mime)
+        FileHandle.standardOutput.write(Data("host-clip: inject mime=\(mime) changeCount=\(cc) after \"\(marker)\"\n".utf8))
+    }
 }
 
 // M108c (#2326, ADR 0051 D6): marker-driven file drop (`--host-drop-file` +

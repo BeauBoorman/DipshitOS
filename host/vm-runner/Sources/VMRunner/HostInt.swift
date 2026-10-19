@@ -63,6 +63,10 @@ enum HostInt {
         case drop = 4        // h→g runner → seat:  [name_len][name][size u64le]
         case outbox = 5      // g→h seat → runner:  the DROP shape, reversed (v2)
         case notifyFocus = 6 // h→g runner → seat:  plen MUST be 0 (v2)
+        // M124c (#2582): typed clip — payload `u8 mime_len|mime|blob`.
+        // Dedicated tags keep raw-text records byte-identical.
+        case clipOutT = 7    // g→h seat → runner:  typed clipboard item
+        case clipInT = 8     // h→g runner → seat:  typed clipboard item
 
         var stem: String {
             switch self {
@@ -73,6 +77,8 @@ enum HostInt {
             case .drop: return "DROP"
             case .outbox: return "OUTBOX"
             case .notifyFocus: return "NFOCUS"
+            case .clipOutT: return "CLIPTOUT"
+            case .clipInT: return "CLIPTIN"
             }
         }
 
@@ -80,7 +86,7 @@ enum HostInt {
         /// "notify", "outbox"). ARMED is the handshake, not a lane.
         var lane: String {
             switch self {
-            case .clipIn, .clipOut: return "clip"
+            case .clipIn, .clipOut, .clipInT, .clipOutT: return "clip"
             case .drop: return "drop"
             case .notifyOut, .notifyFocus: return "notify"
             case .outbox: return "outbox"
@@ -92,7 +98,7 @@ enum HostInt {
         /// directions share it). ARMED has none.
         var laneBit: UInt8 {
             switch self {
-            case .clipIn, .clipOut: return HostInt.laneClip
+            case .clipIn, .clipOut, .clipInT, .clipOutT: return HostInt.laneClip
             case .drop: return HostInt.laneDrop
             case .notifyOut, .notifyFocus: return HostInt.laneNotify
             case .outbox: return HostInt.laneOutbox
@@ -109,6 +115,8 @@ enum HostInt {
             case "DROP": return .drop
             case "OUTBOX": return .outbox
             case "NFOCUS": return .notifyFocus
+            case "CLIPTOUT": return .clipOutT
+            case "CLIPTIN": return .clipInT
             default: return nil
             }
         }

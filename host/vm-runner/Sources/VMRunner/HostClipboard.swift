@@ -10,10 +10,20 @@ import Foundation
 // that is not the lane's own write becomes a signed CLIP_IN the seat
 // applies through slot 38.
 //
+// M124c (#2582) widened the lane from flat text to negotiated types: the
+// dedicated CLIP_OUT_T / CLIP_IN_T tags carry `u8 mime_len|mime|blob`, and
+// the pasteboard read negotiates by what is actually offered — image/png,
+// text/uri-list (file URLs), text/html — before falling back to .string.
+// Text stays on the original tags byte-identical; a text payload can never
+// be misread as an envelope because the tag, not a magic prefix, names the
+// shape.
+//
 // Bounds are the kernel clipboard's own (512 bytes): inbound text is cut
-// on a scalar boundary and marked TRUNCATED, never silently cut. The echo
-// guards are symmetric: the runner skips the changeCount bump its own
-// CLIP_OUT apply produced, and the seat skips its own CLIP_IN apply.
+// on a scalar boundary and marked TRUNCATED, never silently cut; a typed
+// item that cannot fit its envelope whole is refused too_large rather than
+// delivered half-decodeable. The echo guards are symmetric: the runner
+// skips the changeCount bump its own apply produced, and the seat skips
+// its own CLIP_IN apply.
 //
 // Consent (the M97g posture the ADR maps): the lane exists only while the
 // flag AND the provisioned host-int credential agree — a missing row is a
@@ -29,9 +39,15 @@ final class HostClipboard {
     private var armed = false
 
     private var clipInSeq: UInt32 = 0       // next outbound CLIP_IN seq
+    private var clipInTSeq: UInt32 = 0      // next outbound CLIP_IN_T seq
     private var lastClipOutSeq: UInt32 = 0  // last consumed CLIP_OUT seq
+    private var lastClipOutTSeq: UInt32 = 0 // last consumed CLIP_OUT_T seq
     private var lastChangeCount: Int = 0
-    private var echoGuard: String?          // the last string this lane wrote
+    /// The emission-form payload the runner's last apply would re-encode
+    /// to: text applies guard on the utf8 body, typed applies on the
+    /// `mime_len|mime|blob` envelope — one compare covers both, the same
+    /// shape a poll produces.
+    private var echoPayload: Data?
     private var ioLogged = Set<String>()    // one io_error per filename
 
     init(session: HostIntSession, pasteboardName: String?) {
@@ -68,10 +84,12 @@ final class HostClipboard {
         guard armed else { return }
         if session.isSuspended(HostInt.laneClip) {
             resumeBaseline = true
-            guard let files = HostInt.records(laneDir: laneDir, tag: .clipOut) else { return }
-            for (name, _) in files {
-                HostInt.logRefuse(lane: "clip", reason: .laneDisabled)
-                remove(laneDir.appendingPathComponent(name))
+            for tag in [HostInt.Tag.clipOut, .clipOutT] {
+                guard let files = HostInt.records(laneDir: laneDir, tag: tag) else { continue }
+                for (name, _) in files {
+                    HostInt.logRefuse(lane: "clip", reason: .laneDisabled)
+                    remove(laneDir.appendingPathComponent(name))
+                }
             }
             return
         }
@@ -101,10 +119,47 @@ final class HostClipboard {
         return board.changeCount
     }
 
+    /// The M124c test hook (`--host-clip-in-file` + `--host-clip-in-mime`):
+    /// write a TYPED item the way a real host copy would offer it — a PNG
+    /// lands as .png data, a uri-list as file-URL objects, html as .html
+    /// data + a .string fallback. Returns the pasteboard changeCount (or
+    /// -1 when the file is unreadable/the mime is unnegotiable) so the
+    /// caller's marker can prove the write happened.
+    func injectTyped(path: String, mime: String) -> Int {
+        if session.isSuspended(HostInt.laneClip) {
+            HostInt.logRefuse(lane: "clip", reason: .laneDisabled)
+            return board.changeCount
+        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            HostInt.logRefuse(lane: "clip", reason: .ioError)
+            return -1
+        }
+        board.clearContents()
+        switch mime {
+        case "image/png":
+            board.setData(data, forType: .png)
+        case "text/uri-list":
+            guard let urls = Self.uriListURLs(data), !urls.isEmpty else { return -1 }
+            board.writeObjects(urls as [NSPasteboardWriting])
+        case "text/html":
+            board.setData(data, forType: .html)
+            board.setString(String(decoding: data, as: UTF8.self), forType: .string)
+        default:
+            HostInt.logRefuse(lane: "clip", reason: .unsupportedKind)
+            return -1
+        }
+        return board.changeCount
+    }
+
     // MARK: guest → host
 
     private func drainClipOut(key: Data) {
-        guard let files = HostInt.records(laneDir: laneDir, tag: .clipOut) else { return }
+        drainTag(.clipOut, lastSeq: &lastClipOutSeq, key: key)
+        drainTag(.clipOutT, lastSeq: &lastClipOutTSeq, key: key)
+    }
+
+    private func drainTag(_ tag: HostInt.Tag, lastSeq: inout UInt32, key: Data) {
+        guard let files = HostInt.records(laneDir: laneDir, tag: tag) else { return }
         for (name, seq) in files {
             let url = laneDir.appendingPathComponent(name)
             guard let raw = try? Data(contentsOf: url) else {
@@ -114,7 +169,7 @@ final class HostClipboard {
                 continue
             }
             ioLogged.remove(name)
-            guard let rec = HostInt.decode(raw), rec.tag == .clipOut else {
+            guard let rec = HostInt.decode(raw), rec.tag == tag else {
                 HostInt.logRefuse(lane: "clip", reason: .badRecord)
                 remove(url)
                 continue
@@ -129,44 +184,158 @@ final class HostClipboard {
                 remove(url)
                 continue
             }
-            guard seq > lastClipOutSeq else {
+            guard seq > lastSeq else {
                 HostInt.logRefuse(lane: "clip", reason: .staleSeq)
                 remove(url)
                 continue
             }
-            guard let text = String(data: rec.payload, encoding: .utf8) else {
-                HostInt.logRefuse(lane: "clip", reason: .payloadNotText)
-                remove(url)
-                continue
-            }
-            board.clearContents()
-            if !text.isEmpty {
-                board.setString(text, forType: .string)
+            if tag == .clipOut {
+                guard let text = String(data: rec.payload, encoding: .utf8) else {
+                    HostInt.logRefuse(lane: "clip", reason: .payloadNotText)
+                    remove(url)
+                    continue
+                }
+                applyText(text)
+            } else {
+                guard let (mime, blob) = Self.decodeTyped(rec.payload) else {
+                    HostInt.logRefuse(lane: "clip", reason: .badRecord)
+                    remove(url)
+                    continue
+                }
+                if !applyTyped(mime: mime, blob: blob) {
+                    HostInt.logRefuse(lane: "clip", reason: .unsupportedKind)
+                    remove(url)
+                    continue
+                }
             }
             // Book our own write before the marker — the next changeCount
-            // poll sees this bump and the guard swallows it once.
-            echoGuard = text
+            // poll sees this bump and the guard swallows it once. The
+            // guard is the emission-form payload: what a fresh poll of the
+            // board would re-encode to.
+            echoPayload = rec.payload
             lastChangeCount = board.changeCount
-            lastClipOutSeq = seq
+            lastSeq = seq
             remove(url)
-            FileHandle.standardOutput.write(Data("host-clip: out seq=\(seq) sha256=\(HostInt.sha256_8(rec.payload)) len=\(rec.payload.count)\n".utf8))
+            if tag == .clipOut {
+                FileHandle.standardOutput.write(Data("host-clip: out seq=\(seq) sha256=\(HostInt.sha256_8(rec.payload)) len=\(rec.payload.count)\n".utf8))
+            } else {
+                let mime = Self.decodeTyped(rec.payload)?.0 ?? "?"
+                FileHandle.standardOutput.write(Data("host-clip: out seq=\(seq) mime=\(mime) sha256=\(HostInt.sha256_8(rec.payload)) len=\(rec.payload.count)\n".utf8))
+            }
         }
     }
 
+    /// Mirror a text CLIP_OUT to the pasteboard.
+    private func applyText(_ text: String) {
+        board.clearContents()
+        if !text.isEmpty {
+            board.setString(text, forType: .string)
+        }
+    }
+
+    /// Mirror a typed CLIP_OUT_T: the mime negotiates which pasteboard
+    /// type(s) get the bytes. False when the mime is one the host cannot
+    /// offer honestly.
+    private func applyTyped(mime: String, blob: Data) -> Bool {
+        board.clearContents()
+        switch mime {
+        case "image/png":
+            board.setData(blob, forType: .png)
+        case "text/uri-list":
+            guard let urls = Self.uriListURLs(blob), !urls.isEmpty else { return false }
+            board.writeObjects(urls as [NSPasteboardWriting])
+        case "text/html":
+            board.setData(blob, forType: .html)
+            board.setString(String(decoding: blob, as: UTF8.self), forType: .string)
+        default:
+            // An image/* the host cannot name, octet-stream — declare the
+            // raw type string so a matching paste still sees SOMETHING;
+            // never pretend it is text.
+            board.setData(blob, forType: NSPasteboard.PasteboardType(mime))
+        }
+        return true
+    }
+
     // MARK: host → guest
+
+    /// uri_list -> [NSURL fileURL]: the RFC 2483 read — every non-empty
+    /// line a file:// URI. nil when no line parses (caller treats it as a
+    /// mislabel, not an empty list).
+    static func uriListURLs(_ data: Data) -> [NSURL]? {
+        let text = String(decoding: data, as: UTF8.self)
+        var urls: [NSURL] = []
+        for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            let line = String(raw)
+            guard let u = URL(string: line), u.scheme != nil else { return nil }
+            urls.append(u as NSURL)
+        }
+        return urls.isEmpty ? nil : urls
+    }
+
+    /// The `mime_len|mime|blob` envelope — the mirror of the Go side's
+    /// hostint.EncodeTypedClip / DecodeTypedClip.
+    static func encodeTyped(mime: String, blob: Data) -> Data? {
+        let m = mime.utf8
+        guard !m.isEmpty, m.count <= 24, 1 + m.count + blob.count <= HostInt.payloadMax else { return nil }
+        var out = Data([UInt8(m.count)])
+        out.append(contentsOf: m)
+        out.append(blob)
+        return out
+    }
+
+    static func decodeTyped(_ payload: Data) -> (String, Data)? {
+        guard payload.count >= 2 else { return nil }
+        let ml = Int(payload[payload.startIndex])
+        guard ml > 0, ml <= 24, payload.count > 1 + ml else { return nil }
+        let mime = String(decoding: payload[payload.startIndex + 1 ..< payload.startIndex + 1 + ml], as: UTF8.self)
+        return (mime, payload.subdata(in: payload.startIndex + 1 + ml ..< payload.endIndex))
+    }
+
+    /// Read the pasteboard's offered types in negotiation order and return
+    /// the record to publish: (tag, payload). nil when nothing the lane
+    /// carries is on the board.
+    private func readBoard() -> (HostInt.Tag, Data)? {
+        if let png = board.data(forType: .png), !png.isEmpty,
+           let env = Self.encodeTyped(mime: "image/png", blob: png) {
+            return (.clipInT, env)
+        }
+        if let urls = board.readObjects(forClasses: [NSURL.self], options: nil) as? [NSURL], !urls.isEmpty {
+            let lines = urls.compactMap { $0.absoluteString }.joined(separator: "\n")
+            if let env = Self.encodeTyped(mime: "text/uri-list", blob: Data(lines.utf8)) {
+                return (.clipInT, env)
+            }
+        }
+        if let html = board.data(forType: .html), !html.isEmpty,
+           let env = Self.encodeTyped(mime: "text/html", blob: html) {
+            return (.clipInT, env)
+        }
+        return nil
+    }
 
     private func pollPasteboard(key: Data) {
         let cc = board.changeCount
         if cc == lastChangeCount { return }
         lastChangeCount = cc
+
+        if let (tag, payload) = readBoard() {
+            if payload == echoPayload {
+                // Our own apply echoing back — swallow it once.
+                echoPayload = nil
+                return
+            }
+            emit(key: key, tag: tag, payload: payload, truncated: false)
+            return
+        }
+
         guard let text = board.string(forType: .string) else {
-            // A bump with no string payload: the lane is UTF-8 text only.
+            // A bump with no string payload: nothing the lane carries.
             HostInt.logRefuse(lane: "clip", reason: .payloadNotText)
             return
         }
-        if text == echoGuard {
+        let body = Data(text.utf8)
+        if body == echoPayload {
             // Our own CLIP_OUT apply echoing back — swallow it once.
-            echoGuard = nil
+            echoPayload = nil
             return
         }
         // UTF-8-scalar-boundary truncation at the 512 lane bound.
@@ -180,19 +349,30 @@ final class HostClipboard {
             }
             payload.append(contentsOf: enc)
         }
-        if HostInt.outstanding(laneDir: laneDir, tag: .clipIn) >= HostInt.maxOutstanding {
+        emit(key: key, tag: .clipIn, payload: payload, truncated: truncated)
+    }
+
+    private func emit(key: Data, tag: HostInt.Tag, payload: Data, truncated: Bool) {
+        let outTag = tag
+        let seqField = outTag == .clipIn ? clipInSeq : clipInTSeq
+        if HostInt.outstanding(laneDir: laneDir, tag: outTag) >= HostInt.maxOutstanding {
             HostInt.logRefuse(lane: "clip", reason: .backpressured)
             return
         }
-        let seq = clipInSeq + 1
+        let seq = seqField + 1
         let flags: UInt8 = truncated ? 1 : 0
-        guard let rec = HostInt.encode(tag: .clipIn, flags: flags, seq: seq, epoch: epoch, payload: payload, key: key),
-              HostInt.publish(laneDir: laneDir, name: HostInt.recordName(tag: .clipIn, seq: seq), body: rec) else {
+        guard let rec = HostInt.encode(tag: outTag, flags: flags, seq: seq, epoch: epoch, payload: payload, key: key),
+              HostInt.publish(laneDir: laneDir, name: HostInt.recordName(tag: outTag, seq: seq), body: rec) else {
             HostInt.logRefuse(lane: "clip", reason: .ioError)
             return
         }
-        clipInSeq = seq
-        FileHandle.standardOutput.write(Data("host-clip: in seq=\(seq) sha256=\(HostInt.sha256_8(payload)) len=\(payload.count) truncated=\(truncated ? 1 : 0)\n".utf8))
+        if outTag == .clipIn { clipInSeq = seq } else { clipInTSeq = seq }
+        if outTag == .clipIn {
+            FileHandle.standardOutput.write(Data("host-clip: in seq=\(seq) sha256=\(HostInt.sha256_8(payload)) len=\(payload.count) truncated=\(truncated ? 1 : 0)\n".utf8))
+        } else {
+            let mime = Self.decodeTyped(payload)?.0 ?? "?"
+            FileHandle.standardOutput.write(Data("host-clip: in seq=\(seq) mime=\(mime) sha256=\(HostInt.sha256_8(payload)) len=\(payload.count) truncated=\(truncated ? 1 : 0)\n".utf8))
+        }
     }
 
     private func remove(_ url: URL) {

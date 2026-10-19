@@ -1,12 +1,17 @@
 // GOTABWM.ELF — M108b (#2325, ADR 0051 D3): the clipboard lane, seat half.
+// M124c (#2582) widened it from flat text to the typed vocabulary: the
+// kernel buffer still holds raw bytes, the TYPE is the vsys classification
+// of them, and non-plain content crosses on the dedicated CLIP_OUT_T /
+// CLIP_IN_T tags (`mime_len|mime|blob`) so text records stay byte-identical.
 //
 // Guest → host: once per tick the seat reads slot 39 — lawful because the
 // caller IS the registered seat (M97g's clipboard_authorized) — and diffs
-// (len, FNV-1a) against last tick. A change emits one signed CLIP_OUT. The
-// seat observes the BUFFER, not the caller, so every write syncs — terminal
-// chords, monitor `clip`, a capability holder's set, and the seat's own
-// CLIP_IN applies are indistinguishable to it. That is the M97g story: the
-// seat is the user-mediated observer, so what it sees is already consented.
+// (len, FNV-1a) against last tick. A change emits one signed CLIP_OUT (or
+// CLIP_OUT_T when the bytes classify typed). The seat observes the BUFFER,
+// not the caller, so every write syncs — terminal chords, monitor `clip`,
+// a capability holder's set, and the seat's own CLIP_IN applies are
+// indistinguishable to it. That is the M97g story: the seat is the
+// user-mediated observer, so what it sees is already consented.
 //
 // Host → guest: the engine's verified CLIP_IN is applied through slot 38 —
 // automatic while the lane is armed (the consent was the operator's flag
@@ -36,10 +41,14 @@ const clipKernelMax = 512
 
 // The lane markers the class-B gate greps. Payload text and MACs never
 // appear — seq, len and sha256[:8] are the whole story (never-logged).
+// M124c: the typed records carry a `mime=` field — the type is lane
+// metadata (a negotiation input), never payload bytes.
 const (
-	MarkerHostintClipOut = "gotabwm: hostint clip-out "
-	MarkerHostintClipIn  = "gotabwm: hostint clip-in "
-	MarkerHostintClipInd = "gotabwm: hostint clip-ind "
+	MarkerHostintClipOut  = "gotabwm: hostint clip-out "
+	MarkerHostintClipIn   = "gotabwm: hostint clip-in "
+	MarkerHostintClipOutT = "gotabwm: hostint clip-out-t "
+	MarkerHostintClipInT  = "gotabwm: hostint clip-in-t "
+	MarkerHostintClipInd  = "gotabwm: hostint clip-ind "
 )
 
 // The clipboard observe state. hostClipSourceHost is the seat-painted
@@ -93,15 +102,33 @@ func hostclipPoll() {
 		hostClipSeen, hostClipHash, hostClipLen = true, h, n
 		return
 	}
-	if !utf8.Valid(cur) {
-		// Non-text can never cross the lane, so the refusal consumes the
+	mime := vsys.ClipboardClassify(cur)
+	if mime == vsys.ClipOctet {
+		// Bytes no type can name still refuse — the lane widened for the
+		// named types, not for arbitrary binary. The refusal consumes the
 		// change: commit the seen-state and name it once — retrying
 		// would re-log the refusal every tick.
 		hostClipSeen, hostClipHash, hostClipLen = true, h, n
 		eng.RefuseLane(hostint.TagClipOut, hostint.RefuseNotText)
 		return
 	}
-	seq, refusal := eng.Emit(hostint.TagClipOut, 0, cur)
+	var seq uint32
+	var refusal string
+	if mime == vsys.ClipText {
+		seq, refusal = eng.Emit(hostint.TagClipOut, 0, cur)
+	} else {
+		// Typed content crosses on the dedicated tag — text records stay
+		// raw, so an un-upgraded peer never misreads an envelope. The
+		// envelope is inside the record's own 512: a buffer the mime
+		// header pushes past it is too_large, not a truncated record.
+		env := hostint.EncodeTypedClip(mime, cur)
+		if env == nil {
+			hostClipSeen, hostClipHash, hostClipLen = true, h, n
+			eng.RefuseLane(hostint.TagClipOutT, hostint.RefuseTooLarge)
+			return
+		}
+		seq, refusal = eng.Emit(hostint.TagClipOutT, 0, env)
+	}
 	switch refusal {
 	case "":
 		// The seen-state commits only on a published record: a refused
@@ -109,8 +136,14 @@ func hostclipPoll() {
 		hostClipSeen, hostClipHash, hostClipLen = true, h, n
 		markClipSource(false)
 		sum := shlib.SHA256Sum(cur)
-		hostintLog(MarkerHostintClipOut + "seq=" + vi.Itoa64(int64(seq)) +
-			" len=" + vi.Itoa64(int64(n)) + " sha=" + hostint.HexDigest8(sum[:]))
+		if mime == vsys.ClipText {
+			hostintLog(MarkerHostintClipOut + "seq=" + vi.Itoa64(int64(seq)) +
+				" len=" + vi.Itoa64(int64(n)) + " sha=" + hostint.HexDigest8(sum[:]))
+		} else {
+			hostintLog(MarkerHostintClipOutT + "seq=" + vi.Itoa64(int64(seq)) +
+				" mime=" + mime + " len=" + vi.Itoa64(int64(n)) +
+				" sha=" + hostint.HexDigest8(sum[:]))
+		}
 	case hostint.RefuseBackpressure:
 		// The runner holds MaxOutstanding of ours unconsumed — stay
 		// silent and hold the seen-state: the diff fires again next tick
@@ -155,6 +188,38 @@ func hostclipApply(rec hostint.Record) string {
 	return ""
 }
 
+// hostclipApplyT is the CLIP_IN_T tenant (M124c): a typed clipboard item —
+// envelope `mime_len|mime|blob`. The declared mime is negotiated metadata:
+// the seat applies the BLOB, but only when the bytes can honestly carry
+// the label (the SetTyped shape rule — a host that mislabels its payload
+// gets unsupported_kind, the same answer a guest writer would get).
+func hostclipApplyT(rec hostint.Record) string {
+	mime, blob, ok := hostint.DecodeTypedClip(rec.Payload)
+	if !ok || !vsys.ClipSpellingOK(mime) {
+		return hostint.RefuseBadRecord
+	}
+	if !vsys.ClipShapeOK(mime, blob) {
+		return hostint.RefuseUnsupported
+	}
+	n, rc := hostClipSet(blob)
+	if rc < 0 {
+		return hostint.RefuseIO
+	}
+	hostClipSeen = true
+	hostClipHash = fnv1a(blob[:n])
+	hostClipLen = n
+	markClipSource(true)
+	sum := shlib.SHA256Sum(blob[:n])
+	trunc := "0"
+	if rec.Flags&hostint.FlagTruncated != 0 {
+		trunc = "1"
+	}
+	hostintLog(MarkerHostintClipInT + "seq=" + vi.Itoa64(int64(rec.Seq)) +
+		" mime=" + mime + " len=" + vi.Itoa64(int64(n)) +
+		" sha=" + hostint.HexDigest8(sum[:]) + " truncated=" + trunc)
+	return ""
+}
+
 // markClipSource records the last buffer write's provenance and emits the
 // one-shot indicator marker on a host transition — the serial proof that
 // the chrome badge reflects it (the pixels are asserted by the paint test).
@@ -170,18 +235,35 @@ func markClipSource(host bool) {
 	}
 }
 
+// clipBadgeKind is the badge's type suffix — the classification of the
+// bytes the seat last observed, never of what a writer claimed. The card's
+// badge vocabulary is IMG (image/*) and FILE (text/uri-list); text/html
+// and plain text keep the untyped tag.
+func clipBadgeKind(b []byte) string {
+	switch vsys.ClipboardClassify(b) {
+	case vsys.ClipURIList:
+		return ":FILE"
+	case vsys.ClipPNG, vsys.ClipQOI, vsys.ClipGIF, vsys.ClipJPEG, vsys.ClipBMP:
+		return ":IMG"
+	}
+	return ""
+}
+
 // hostClipBadge is the seat-painted clipboard indicator's content: while
 // the lane is armed and the buffer holds something, a CLIP tag in the
-// chrome panel — tinted to the Accent and suffixed :H while the last write
-// was host-sourced, so a host paste landing guest-side is never invisible.
+// chrome panel — carrying the type suffix (CLIP:IMG, CLIP:FILE) when the
+// bytes classify, tinted to the Accent and suffixed :H while the last
+// write was host-sourced, so a host paste landing guest-side is never
+// invisible.
 func hostClipBadge() (text string, rgb uint32, ok bool) {
 	eng := hostintEngine
 	if eng == nil || !eng.Armed() || eng.LaneMask()&hostint.LaneClip == 0 || !hostClipSeen || hostClipLen == 0 {
 		return "", 0, false
 	}
 	tok := theme.Current
+	kind := clipBadgeKind(hostClipBuf[:hostClipLen])
 	if hostClipSourceHost {
-		return "CLIP:H", tok.Accent, true
+		return "CLIP" + kind + ":H", tok.Accent, true
 	}
-	return "CLIP", tok.Muted, true
+	return "CLIP" + kind, tok.Muted, true
 }

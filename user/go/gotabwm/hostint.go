@@ -112,6 +112,8 @@ func hostintConsume(tag uint8, rec hostint.Record) string {
 	switch tag {
 	case hostint.TagClipIn:
 		return hostclipApply(rec)
+	case hostint.TagClipInT:
+		return hostclipApplyT(rec)
 	case hostint.TagDrop:
 		return hostdropApply(rec)
 	case hostint.TagNotifyFocus:

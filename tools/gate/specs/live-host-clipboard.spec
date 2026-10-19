@@ -98,8 +98,37 @@ open(os.path.join(off, "SECRETS.TXT"), "w").write(
     "#v1\n" + "host-int\t1000\t" + KEY + "\tGOTABWM.ELF\n")
 open(os.path.join(off, "OWNERS.TXT"), "w").write(
     "#v1\nGOTABWM.ELF\t644\t0\t-\n")
+# M124c (#2582): the typed legs' fixtures. Two tiny PNGs — one for the
+# h->g inject, a DIFFERENT one for the GOVIEW copy (an identical blob
+# would hash-match the applied buffer and the seat's diff would never
+# fire). CLIPDIR holds one file so GOFILES' first-entry selection is
+# deterministic. GOVIEW/GOEDIT/GOFILES are exec'd -u0: the seat's own
+# launches are uid_user and slots 38/39 refuse them (M97g) — the same
+# capable path go-edit run 06 takes.
+import struct, zlib
+def tiny_png(rgb):
+    w = h = 4
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(
+            ">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+for elf in ("GOVIEW.ELF", "GOEDIT.ELF", "GOFILES.ELF"):
+    src2 = os.path.join(".build", "go", elf)
+    if not os.path.isfile(src2):
+        sys.exit(elf + " missing - build it first: "
+                 "GO_BUILD_NAME=" + elf.split('.')[0] +
+                 " bash tools/go/build-go.sh user/go/<dir>/main.go")
+    shutil.copy(src2, os.path.join(share, elf))
+open(os.path.join(run, "tiny-a.png"), "wb").write(tiny_png((255, 0, 0)))
+open(os.path.join(share, "TINY.PNG"), "wb").write(tiny_png((0, 0, 255)))
+os.makedirs(os.path.join(share, "CLIPDIR"), exist_ok=True)
+open(os.path.join(share, "CLIPDIR", "KNOWN.TXT"), "w").write("known\n")
 print("staged hostint share (GOTABWM + host-int credential + 2 refusal plants)"
-      " + flags-off share")
+      " + flags-off share + M124c typed fixtures")
 PY
 
 # ---- 01: both directions + refusal proofs, one boot -----------------------------
@@ -199,3 +228,75 @@ if os.path.isdir(os.path.join(share, "HOSTINT")):
     sys.exit("FAIL: flags-off run created HOSTINT/")
 print("run-02 flags-off silence ok")
 PY
+
+# ---- 03: typed h->g + g->h image/png, GOVIEW copy -> GOEDIT paste (M124c) ----
+# The seat leg's image half: a host PNG inject crosses as CLIP_IN_T (seat
+# applies the blob, badges CLIP:IMG:H); then GOVIEW (-u0: the seat's own
+# launches are uid_user and slot 38 refuses them) copies ITS PNG the other
+# way on CLIP_OUT_T, and a -u0 GOEDIT pastes the PNG bytes verbatim —
+# "paste as PNG". The two fixture PNGs differ deliberately: an identical
+# blob would hash-match the applied buffer and the seat's diff never
+# fires.
+vgate_file script-goview.txt <<'EOF'
+exec -u0 GOVIEW.ELF /host/TINY.PNG
+EOF
+
+vgate_file script-goedit.txt <<'EOF'
+exec -u0 GOEDIT.ELF
+EOF
+
+vgate_run 03 -- \
+    --screen '$RUN_DIR/screen-03' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-goview.txt' --script2-after 'gotabwm: hostint clip-in-t seq=1' \
+    --script3 '$RUN_DIR/script-goedit.txt' --script3-after 'gotabwm: hostint clip-out-t seq=1' \
+    --host-clipboard --host-pasteboard 'virelai-gate-clip-t' \
+    --host-clip-in-file '$RUN_DIR/tiny-a.png' --host-clip-in-mime 'image/png' \
+    --host-clip-in-after 'gotabwm: hostint armed' \
+    --input-string 'c' --input-string-after 'gview: ready' \
+    --input-chords 'ctrl-v' --input-chords-after 'goedit: present' \
+    --script-expect 'goedit: paste n=73' --script-expect-tail 6 --timeout 240
+
+vgate_assert 03 serial-contains 'gotabwm: hostint armed epoch='
+# h->g typed: the inject lands CLIP_IN_T seq=1 (73-byte blob inside an
+# 83-byte envelope); the seat applies it and marks the badge host-sourced.
+vgate_assert 03 output-contains 'host-clip: inject mime=image/png'
+vgate_assert 03 output-contains 'host-clip: in seq=1 mime=image/png sha256=55f6adb9 len=83 truncated=0'
+vgate_assert 03 serial-contains 'gotabwm: hostint clip-in-t seq=1 mime=image/png len=73 sha=3fd6e6be truncated=0'
+vgate_assert 03 serial-contains 'gotabwm: hostint clip-ind host'
+# g->h typed: 'c' in GOVIEW copies its PNG — the mime is read off the
+# file's magic — the seat emits CLIP_OUT_T, the runner mirrors the bytes.
+vgate_assert 03 serial-contains 'gview: copy mime=image/png n=73'
+vgate_assert 03 serial-contains 'gotabwm: hostint clip-out-t seq=1 mime=image/png len=73 sha=70ca7dc8'
+vgate_assert 03 serial-contains 'gotabwm: hostint clip-ind local'
+vgate_assert 03 output-contains 'host-clip: out seq=1 mime=image/png'
+# GOEDIT pastes the 73 PNG bytes — "copy image -> paste as PNG".
+vgate_assert 03 serial-contains 'goedit: paste n=73'
+vgate_assert 03 serial-absent '[EXC] parking:'
+
+# ---- 04: GOFILES copy -> uri-list -> GOEDIT pastes the path (M124c) ----
+# The seat leg's file half: 'c' in GOFILES publishes the entry's file://
+# URI as text/uri-list on the machine clipboard (its own in-app clip is
+# unchanged), the seat carries it as CLIP_OUT_T, the runner mirrors file
+# URLs, and GOEDIT's paste lands the URI — "copy file -> paste path".
+vgate_file script-gofiles.txt <<'EOF'
+exec -u0 GOFILES.ELF /host/CLIPDIR
+EOF
+
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen-04' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-gofiles.txt' --script2-after 'gotabwm: hostint armed' \
+    --script3 '$RUN_DIR/script-goedit.txt' --script3-after 'gotabwm: hostint clip-out-t seq=1' \
+    --host-clipboard --host-pasteboard 'virelai-gate-clip-t4' \
+    --input-string 'c' --input-string-after 'gofiles: ready' \
+    --input-chords 'ctrl-v' --input-chords-after 'goedit: present' \
+    --script-expect 'goedit: paste n=30' --script-expect-tail 6 --timeout 240
+
+vgate_assert 04 serial-contains 'gotabwm: hostint armed epoch='
+vgate_assert 04 serial-contains 'gofiles: clip copy KNOWN.TXT'
+vgate_assert 04 serial-contains 'gofiles: clip-sys n=30'
+vgate_assert 04 serial-contains 'gotabwm: hostint clip-out-t seq=1 mime=text/uri-list len=30 sha=c5313fce'
+vgate_assert 04 output-contains 'host-clip: out seq=1 mime=text/uri-list'
+vgate_assert 04 serial-contains 'goedit: paste n=30'
+vgate_assert 04 serial-absent '[EXC] parking:'

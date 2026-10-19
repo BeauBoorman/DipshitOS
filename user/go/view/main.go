@@ -17,6 +17,7 @@ import (
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/vsys"
 	"virelai/webrender"
 	"virelai/webrender/font"
 	"virelai/widgets"
@@ -60,6 +61,11 @@ const (
 	markerDecodeErr   = "gview: decode err"
 	markerUnsupported = "gview: unsupported "
 
+	// M124c (#2582): the typed-clipboard copy. `gview: copy mime=<m> n=<n>`
+	// after slot 38 stored the bytes; the refused form names why.
+	markerCopy       = "gview: copy "
+	markerCopyRefuse = "gview: copy refused "
+
 	markerOK = "goview OK"
 )
 
@@ -81,6 +87,7 @@ const (
 type app struct {
 	ta   *tabapp.TabApp
 	name string
+	path string
 	fm   format
 	st   loadState
 
@@ -138,7 +145,7 @@ func main() {
 	}
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)) + " " + u32s(ta.W) + "x" + u32s(ta.H))
 
-	a := &app{ta: ta, name: basename(path), fm: formatOfHeader(head), zoomIdx: zoomDefaultIdx}
+	a := &app{ta: ta, name: basename(path), path: path, fm: formatOfHeader(head), zoomIdx: zoomDefaultIdx}
 	// M124a-2 (#2677): the drop target. The seat's opens=image admission
 	// filtered the mime; a delivered payload decodes through the same
 	// DecodeImage path as a file load, and the callback repaints itself.
@@ -403,6 +410,9 @@ func (a *app) handle(ev vi.Event) bool {
 			return a.panBy(0, -1)
 		case keyDown:
 			return a.panBy(0, 1)
+		case keyCopy:
+			a.copy()
+			return false
 		case keyQuitQ, keyEscape:
 			vi.ConsoleLine(markerQuit)
 			a.ta.CloseAndExit(exitQuit)
@@ -422,6 +432,43 @@ func (a *app) handle(ev vi.Event) bool {
 		a.drag = false
 	}
 	return false
+}
+
+// copy pushes the open file's bytes to the typed clipboard (M124c): the
+// mime is read off the file's own magic — never the extension — so a PNG
+// named "pic.qoi" still crosses as image/png. The kernel buffer's 512-byte
+// bound is the cap; a bigger file is refused by name, not truncated into a
+// half-decodeable blob. A refused slot (EACCES under the seat) lands on the
+// marker like every other op here — the policy is the boundary.
+func (a *app) copy() {
+	refuse := func(why string) {
+		vi.ConsoleLine(markerCopyRefuse + why)
+	}
+	if a.path == "" {
+		refuse("empty")
+		return
+	}
+	data, st := readImage(a.path)
+	if st != loadOkay {
+		refuse("read")
+		return
+	}
+	var mime string
+	switch formatOfHeader(data) {
+	case fmtPNG:
+		mime = vsys.ClipPNG
+	case fmtQOI:
+		mime = vsys.ClipQOI
+	default:
+		refuse("type")
+		return
+	}
+	n, rc := vsys.ClipboardSetTyped(mime, data)
+	if rc < 0 {
+		vi.ConsoleLine(markerCopyRefuse + "rc=" + vi.Itoa64(rc))
+		return
+	}
+	vi.ConsoleLine(markerCopy + "mime=" + mime + " n=" + vi.Itoa64(int64(n)))
 }
 
 // pushTitle is VIEW.BIN's push_title: the window title carries the file, its
