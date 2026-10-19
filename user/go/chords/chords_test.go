@@ -190,7 +190,7 @@ func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 		"launcher": 1, "start-surface": 1, "cycle-focus": 4, "focus-index": 9,
 		"pin": 1, "palette": 1, "reopen": 1, "duplicate": 1, "snapshot-bundle": 1,
 		"freeze-badge": 1, "split-cycle": 1, "nav-back": 1, "nav-forward": 1,
-		"sel-paste": 1,
+		"sel-paste": 1, "close": 1, "move-left": 1, "move-right": 1,
 	}
 	got := map[string]int{}
 	for _, r := range Global.SeatRows() {
@@ -203,5 +203,32 @@ func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 	}
 	if len(got) != len(wantActions) {
 		t.Errorf("unexpected seat actions: %v", got)
+	}
+}
+
+// TestM121bTabChordPicks pins the card's chosen spellings: close is
+// ctrl+shift+w (the proposed ctrl+w is GOSH.ELF's kill-word — the seat must
+// never bind it) and the move pair is ctrl+shift+pageup/pagedown. The
+// collision half of the acceptance is TestGlobalValidates: these rows only
+// exist because they pass it.
+func TestM121bTabChordPicks(t *testing.T) {
+	want := map[Chord]string{
+		{ModCtrl | ModShift, UsageW}:        "close",
+		{ModCtrl | ModShift, UsagePageUp}:   "move-left",
+		{ModCtrl | ModShift, UsagePageDown}: "move-right",
+	}
+	got := map[Chord]string{}
+	for _, r := range Global.SeatRows() {
+		got[r.Chord] = r.Action
+	}
+	for c, action := range want {
+		if got[c] != action {
+			t.Errorf("seat chord %s: action %q want %q", c, got[c], action)
+		}
+	}
+	// Plain ctrl+w must never become a seat chord: it is GOSH.ELF's
+	// kill-word, and a seat row would eat the editor's key.
+	if _, bound := got[Chord{ModCtrl, UsageW}]; bound {
+		t.Error("ctrl+w must stay unbound at the seat (GOSH.ELF kill-word)")
 	}
 }

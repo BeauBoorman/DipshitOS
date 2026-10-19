@@ -28,6 +28,12 @@ func TestHidUsagesMatchRunner(t *testing.T) {
 	if hidUsageTab != 0x2B {
 		t.Fatalf("hidUsageTab = %#x want 0x2B (USB HID Tab)", hidUsageTab)
 	}
+	if hidUsageW != 0x1A {
+		t.Fatalf("hidUsageW = %#x want 0x1A (USB HID 'w')", hidUsageW)
+	}
+	if hidUsagePageUp != 0x4B || hidUsagePageDown != 0x4E {
+		t.Fatalf("page usages = %#x/%#x want 0x4B/0x4E", hidUsagePageUp, hidUsagePageDown)
+	}
 	if hidUsageSpace != 0x2C {
 		t.Fatalf("hidUsageSpace = %#x want 0x2C (USB HID Space)", hidUsageSpace)
 	}
@@ -235,6 +241,93 @@ func TestHandleWmKeyPinFocused(t *testing.T) {
 	})
 	if tabs.At(1).Pinned {
 		t.Fatal("second ctrl-shift-n must not pin the other tab")
+	}
+}
+
+// M121b (#2565): the move pair shifts the focused tab one rail cell through
+// the drag's Reorder path (focus follows by id, edges are honest no-ops),
+// and ctrl+shift+w closes the focused tab through closeTabByID — the same
+// `host close` / `tab close` / focus-handoff shape as every other close.
+// Plain ctrl+w stays the editor's (unbound here — no close, no move).
+func TestHandleWmKeyMoveAndCloseChords(t *testing.T) {
+	saved := tabs
+	savedHosted := hostedApp
+	closed := []uint32{}
+	raises := []uint32{}
+	prevClose, prevRaise := closeWin, focusRaise
+	closeWin = func(id uint32) int64 {
+		closed = append(closed, id)
+		return 0
+	}
+	focusRaise = func(id uint32) int64 {
+		raises = append(raises, id)
+		return 0
+	}
+	defer func() {
+		tabs = saved
+		hostedApp = savedHosted
+		closeWin, focusRaise = prevClose, prevRaise
+	}()
+	tabs = TabStrip{}
+	hostedApp = 0
+	if !tabs.OpenTab(3, "A") || !tabs.OpenTab(4, "B") || !tabs.OpenTab(5, "C") {
+		t.Fatal("OpenTab")
+	}
+	if !tabs.FocusTab(5) {
+		t.Fatal("FocusTab")
+	}
+	key := func(usage uint8) {
+		handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl | vi.ModShift, Arg0: uint32(usage)})
+	}
+	key(hidUsagePageUp) // 2 -> 1
+	if tabs.At(1).ID != 5 || tabs.At(2).ID != 4 {
+		t.Fatalf("move-left left ids=%d,%d,%d want 3,5,4",
+			tabs.At(0).ID, tabs.At(1).ID, tabs.At(2).ID)
+	}
+	if id, _ := tabs.Focused(); id != 5 {
+		t.Fatalf("focus did not follow the move: %d", id)
+	}
+	key(hidUsagePageDown) // 1 -> 2
+	if tabs.At(2).ID != 5 || tabs.At(1).ID != 4 {
+		t.Fatalf("move-right left ids=%d,%d,%d want 3,4,5",
+			tabs.At(0).ID, tabs.At(1).ID, tabs.At(2).ID)
+	}
+	if len(closed) != 0 {
+		t.Fatalf("the move pair closed %v", closed)
+	}
+	// The left edge is an honest no-op: focus tab 3 at index 0, move-left
+	// must change nothing.
+	if !tabs.FocusTab(3) {
+		t.Fatal("FocusTab 3")
+	}
+	key(hidUsagePageUp)
+	if tabs.At(0).ID != 3 || tabs.Count() != 3 {
+		t.Fatalf("move-left at the left edge mutated the strip: %+v", tabs.At(0))
+	}
+	// Plain ctrl+w is GOSH.ELF's kill-word — the seat must not close on it.
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageW)})
+	if len(closed) != 0 {
+		t.Fatalf("plain ctrl+w closed %v — it is the editor's chord", closed)
+	}
+	// ctrl+shift+w closes the focused tab: the WM close fires once with id 3,
+	// the strip drops to two tabs, and focus hands off to the neighbour that
+	// took its slot (M62b), so exactly one raise runs.
+	key(hidUsageW)
+	if len(closed) != 1 || closed[0] != 3 {
+		t.Fatalf("close chord closed %v want [3]", closed)
+	}
+	if tabs.Count() != 2 || tabs.At(0).ID != 4 || tabs.At(1).ID != 5 {
+		t.Fatalf("strip after close: ids=%d,%d want 4,5", tabs.At(0).ID, tabs.At(1).ID)
+	}
+	if id, _ := tabs.Focused(); id != 4 {
+		t.Fatalf("focus after the focused close = %d want 4", id)
+	}
+	if len(raises) != 1 || raises[0] != 4 {
+		t.Fatalf("focused close raised %v want [4]", raises)
+	}
+	// The closed tab landed on the reopen LIFO — ctrl+shift+t's source.
+	if c, ok := tabs.RecentlyClosed(0); !ok || c.Bin != "A" {
+		t.Fatalf("reopen stack top = %+v ok=%v want Bin A", c, ok)
 	}
 }
 
@@ -1350,7 +1443,7 @@ func TestChordSummaryCounts(t *testing.T) {
 		}
 	}
 	got := chordSummary(len(chords.Global), seat, kernel, app)
-	want := "gotabwm: chords n=53 seat=25 kernel=12 app=16"
+	want := "gotabwm: chords n=56 seat=28 kernel=12 app=16"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
 	}

@@ -107,6 +107,19 @@ var Global = Table{
 			"— ctrl+shift+v is split-cycle (seat) and tty clipboard paste " +
 			"(kernel), so primary rides the canonical chord",
 		"#2584 (M124e)", false},
+	// M121b (#2565): the tab-manipulation chords. Close rides ctrl+shift+w
+	// — the card's proposed ctrl+w is GOSH.ELF's kill-word (the app row
+	// below, "the chord the seat must never bind"); a seat row on it would
+	// eat the editor's key. The move pair rides the card's own
+	// ctrl+shift+pageup/pagedown — the kernel's frozen scroll rows are the
+	// unmodified spellings, one modifier block down.
+	{Chord{ModCtrl | ModShift, UsageW}, "seat", ScopeSeat, "close",
+		"close the focused tab — ctrl+w stays GOSH.ELF's kill-word",
+		"#2565 (M121b)", false},
+	{Chord{ModCtrl | ModShift, UsagePageUp}, "seat", ScopeSeat, "move-left",
+		"move the focused tab one rail cell left", "#2565 (M121b)", false},
+	{Chord{ModCtrl | ModShift, UsagePageDown}, "seat", ScopeSeat, "move-right",
+		"move the focused tab one rail cell right", "#2565 (M121b)", false},
 
 	// --- apps: each app's own chords, live while that app is focused
 	// (ADR 0009 KEY_DOWN). GOSH's are the shlib line editor's
