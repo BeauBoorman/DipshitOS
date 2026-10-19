@@ -180,6 +180,13 @@ func (a *app) keyEvent(ev vi.Event) {
 		a.dirty = true
 		return
 	}
+	// M123d (#2578): the open error banner owns the browsing-mode keys —
+	// chrome chords (Ctrl+L/F, zoom) and the field modes above still
+	// answer; a page interaction under the strip does not.
+	if a.banner.Open {
+		a.bannerKeyEvent(ev)
+		return
+	}
 	if a.controlKey(ev) {
 		return
 	}

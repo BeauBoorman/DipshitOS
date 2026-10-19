@@ -6,6 +6,7 @@
 package main
 
 import (
+	"virelai/appkit"
 	"virelai/mime"
 	"virelai/rss/keys"
 	"virelai/vi"
@@ -105,6 +106,19 @@ type model struct {
 	// armed marker. Polled from main's idle branch via watchStep.
 	watcher    vi.Watcher
 	watchArmed bool
+
+	// M123d (#2578): the shared appkit.ErrorBanner, rendered on the status
+	// row while it is open (the modal prompts' takeover idiom). It carries
+	// exec refusals (drainLaunch's outcome half) and the rename conflict's
+	// Replace/Cancel pair. bannerOp names which arm raised it ("rename" —
+	// bannerFrom/bannerTo hold the refused pair for Replace); bannerFresh
+	// tells main a raise happened post-paint so the banner's own frame is
+	// the next paint, not a lucky later event.
+	banner      appkit.ErrorBanner
+	bannerOp    string
+	bannerFrom  string
+	bannerTo    string
+	bannerFresh bool
 }
 
 // newModel starts at path on a cols x rows grid and takes the first listing
@@ -478,6 +492,16 @@ func (m *model) handleClick(x, y int) {
 	m.pressRow = -1
 	m.pendOpen = false
 	col, row := x-1, y-1
+	// M123d (#2578): while the error banner stands, a press on its row
+	// (the status line) dismisses it; presses elsewhere are swallowed —
+	// the strip holds the prompt open until it is answered.
+	if m.banner.Open {
+		if row == m.rows-2 {
+			m.banner.Dismiss()
+			m.bannerResolve()
+		}
+		return
+	}
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() {
 		return
 	}
@@ -513,6 +537,12 @@ func (m *model) releaseClick() {
 // handleKey is the whole keyboard contract, decoded from the bound tty by
 // keys.Decode (runes verbatim, CSI arrows, Return/Backspace/Esc).
 func (m *model) handleKey(ev keys.Event) {
+	// M123d (#2578): the open error banner owns the keyboard first — it is
+	// the status row while it stands, so no list binding may fire under it.
+	if m.banner.Open {
+		m.bannerKey(ev)
+		return
+	}
 	if m.mode == modeRename {
 		switch ev.Key {
 		case keys.KeyEnter:
@@ -769,7 +799,7 @@ func (m *model) commitRename() {
 		return
 	case containsName(m.entries[:], m.n, to):
 		m.emit(markerRenameNo + fromName + " -> " + to + " exists")
-		m.status = "rename: name exists"
+		m.raiseRenameConflict(fromName, to)
 		return
 	}
 	rc := renameEntry(m.path, fromName, to)
@@ -783,6 +813,140 @@ func (m *model) commitRename() {
 	m.renamedBatch = true
 	m.refresh()
 	m.status = "renamed " + to // refresh's "listed" must not mask it
+}
+
+// --- M123d (#2578): the shared error banner ---------------------------------
+//
+// The banner is the status row while it is open: raiseBanner shows it and
+// latches bannerFresh when the raise happened after the batch's paint
+// (drainLaunch's exec outcome), so main knows a second paint owes the
+// frame. Keys route through bannerKey — the appkit vocabulary on the tty
+// keyspace (digits pick actions, c is Copy Error, Enter takes the focused
+// safe-last button, Esc/Backspace dismiss) — and the resolution runs
+// through bannerResolve.
+
+// raiseBanner opens the banner over the status row and emits the raise
+// marker. The marker rides pending like every other model marker, so the
+// serial line still lands only after a frame that shows the strip.
+func (m *model) raiseBanner(text string, actions ...appkit.BannerAction) {
+	m.banner.Show(text, actions...)
+	m.bannerFresh = true
+	m.emit(markerBanner + text)
+}
+
+// raiseExecRefusal is drainLaunch's failure arm, kept on the model so the
+// raise itself is host-pinnable: the exec outcome lands after the batch's
+// own paint (bannerFresh asks main for the strip's frame), carries no
+// contextual actions — Copy Error and dismiss are the honest answers.
+func (m *model) raiseExecRefusal(bin string, err error) {
+	m.bannerOp = ""
+	m.raiseBanner("exec "+bin+" refused: "+err.Error())
+	m.status = "open: " + bin + " refused"
+}
+
+// raiseRenameConflict arms the Replace/Cancel banner for a name-exists
+// rename. The refused pair is remembered on the model — Replace cannot
+// re-ask the prompt, it runs delete-the-incumbent + rename directly.
+// Cancel is listed LAST: it is the focused default, so Enter never arms
+// the destructive arm by accident.
+func (m *model) raiseRenameConflict(from, to string) {
+	m.bannerOp = "rename"
+	m.bannerFrom, m.bannerTo = from, to
+	m.status = "rename: name exists"
+	m.raiseBanner("rename "+to+" exists",
+		appkit.BannerAction{ID: "replace", Label: "Replace"},
+		appkit.BannerAction{ID: "cancel", Label: "Cancel"})
+}
+
+// bannerKey feeds one key to the open banner. A resolved banner (Choice
+// set, Open cleared) hands straight to bannerResolve so the outcome — the
+// replace, the copy, or the dismissal — is applied in the same batch.
+func (m *model) bannerKey(ev keys.Event) {
+	switch ev.Key {
+	case keys.KeyEsc, keys.KeyBackspace:
+		m.banner.Dismiss()
+	case keys.KeyEnter:
+		m.banner.ActivateFocused()
+	case keys.KeyTab:
+		m.banner.Cycle(1)
+	case keys.KeyRune:
+		switch {
+		case ev.Rune >= '1' && ev.Rune <= '9':
+			m.banner.Activate(int(ev.Rune - '1'))
+		case ev.Rune == 'c' || ev.Rune == 'C':
+			m.banner.CopyChoice()
+		}
+	case keys.KeyCtrlC:
+		m.quit = true
+	}
+	if !m.banner.Open {
+		m.bannerResolve()
+	}
+}
+
+// bannerResolve acts on the banner's Choice once it closes. `replace`
+// runs the held rename's overwrite arm; `copy` publishes the error text
+// on the machine clipboard (ClipText — the same slot-38 seam a file copy
+// uses, different payload type); cancel/dismiss settles the prompt. Every
+// path names itself on `gofiles: banner act …` — a banner that resolved
+// silently would be a failure nobody saw answered.
+func (m *model) bannerResolve() {
+	choice := m.banner.Choice
+	m.banner.Choice = ""
+	op := m.bannerOp
+	m.bannerOp = ""
+	switch {
+	case choice == appkit.BannerCopy:
+		n, rc := vsys.ClipboardSetTyped(vsys.ClipText, []byte(m.banner.Text))
+		if rc < 0 {
+			m.emit(markerClipSys + "rc=" + vi.Itoa64(rc))
+		} else {
+			m.emit(markerClipSys + "n=" + vi.Itoa64(int64(n)))
+		}
+		m.emit(markerBannerAct + "copy")
+		m.status = "error copied"
+	case op == "rename" && choice == "replace":
+		m.replaceRename()
+	case op == "rename":
+		m.emit(markerBannerAct + choice)
+		m.status = "rename cancelled"
+	default:
+		m.emit(markerBannerAct + choice)
+	}
+}
+
+// replaceRename is the conflict banner's Replace arm: the incumbent entry
+// goes to TRASH (deleteEntry — lease-honest, and directories are refused
+// at the model like startDelete's) and the held rename runs against the
+// freed name. A refused delete leaves the rename untried; a `u` restore
+// can still pull the incumbent back out of TRASH.
+func (m *model) replaceRename() {
+	from, to := m.bannerFrom, m.bannerTo
+	m.bannerFrom, m.bannerTo = "", ""
+	for i := 0; i < m.n; i++ {
+		if m.entries[i].NameString() == to && m.entries[i].Dir() {
+			m.emit(markerBannerAct + "replace refused dir")
+			m.status = "replace: directories stay"
+			return
+		}
+	}
+	if _, rc := deleteEntry(m.path, to); rc < 0 {
+		m.emit(markerBannerAct + "replace refused rc=" + vi.Itoa64(rc))
+		m.status = refusalStatus("replace", rc)
+		return
+	}
+	rc := renameEntry(m.path, from, to)
+	if rc < 0 {
+		m.emit(markerRenameNo + from + " -> " + to + " rc=" + vi.Itoa64(rc))
+		m.status = refusalStatus("rename", rc)
+		return
+	}
+	m.emit(markerRenamed + from + " -> " + to)
+	m.emit(markerBannerAct + "replace " + to)
+	m.status = "renamed " + to
+	m.renamedBatch = true
+	m.refresh()
+	m.status = "renamed " + to
 }
 
 // startDelete arms the confirm step for a file; directories are refused

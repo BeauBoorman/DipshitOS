@@ -133,6 +133,14 @@ func (a *app) startDownload(target string, body []byte) {
 		if kind != "" {
 			vi.ConsoleLine(markerDlFailed + kind + " " + target)
 			a.status = "download failed: " + kind
+			// M123d (#2578): the fetch failure stands inline — Retry
+			// refetches the same target when the kind is transient.
+			if bannerRetryable(kind) {
+				a.raiseBanner("download", "download failed: "+kind+" — "+target, target,
+					appkit.BannerAction{ID: "retry", Label: "Retry"})
+			} else {
+				a.raiseBanner("", "download failed: "+kind+" — "+target, "")
+			}
 			a.dirty = true
 			return
 		}
@@ -141,6 +149,7 @@ func (a *app) startDownload(target string, body []byte) {
 	if len(body) == 0 || len(body) > dlCap {
 		vi.ConsoleLine(markerDlFailed + "empty " + target)
 		a.status = "download failed: empty"
+		a.raiseBanner("", "download failed: empty — "+target, "")
 		a.dirty = true
 		return
 	}
@@ -154,6 +163,8 @@ func (a *app) startDownload(target string, body []byte) {
 	if rc < 0 {
 		vi.ConsoleLine(markerDlFailed + "file " + path)
 		a.status = "download failed"
+		// M123d (#2578): the FS refusal stands inline too.
+		a.raiseBanner("", "download failed: file "+path, "")
 		a.dirty = true
 		return
 	}
@@ -290,11 +301,16 @@ func (a *app) cancelDownload() {
 }
 
 // failDownload is the write-side abort: same cleanup, different words.
+// M123d (#2578): the FS failure stands inline — the staged `~` file is
+// already gone, so the banner is Copy Error and dismiss, never a retry
+// that would have to refetch the whole body.
 func (a *app) failDownload(kind string) {
 	d := a.dl
 	vi.ConsoleLine(markerDlFailed + kind + " " + d.name)
+	target := d.target
 	a.dropDownload()
 	a.status = "download failed: " + kind
+	a.raiseBanner("", "download failed: "+kind+" — "+target, "")
 	a.dirty = true
 }
 
@@ -325,6 +341,12 @@ func (a *app) openDownload() {
 	if err != nil || pid <= 0 {
 		vi.ConsoleLine(markerDlOpen + "exec-failed " + req.Handler.Bin)
 		a.status = "open: " + req.Handler.Bin + " refused"
+		// M123d (#2578): the exec refusal stands inline with Copy Error.
+		etext := "exec refused"
+		if err != nil {
+			etext = err.Error()
+		}
+		a.raiseBanner("", "exec "+req.Handler.Bin+" refused: "+etext, "")
 		a.dirty = true
 		return
 	}
@@ -345,6 +367,12 @@ func (a *app) folderDownload() {
 	if err != nil || pid <= 0 {
 		vi.ConsoleLine(markerDlFolder + "exec-failed")
 		a.status = "show in folder: GOFILES refused"
+		// M123d (#2578): the exec refusal stands inline with Copy Error.
+		etext := "exec refused"
+		if err != nil {
+			etext = err.Error()
+		}
+		a.raiseBanner("", "exec GOFILES.ELF refused: "+etext, "")
 		a.dirty = true
 		return
 	}

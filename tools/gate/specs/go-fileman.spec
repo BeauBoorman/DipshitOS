@@ -898,12 +898,14 @@ vgate_assert 10 serial-contains 'gofiles: list /host/FM9 n=1'
 vgate_assert 10 serial-contains 'gofiles: entry NOTES.TXT file'
 
 # The right-press arrived as SGR button 2 and armed the menu on the row.
+# (M123d run 13 appends a third opens=text row — MISSING.ELF — so apps= and
+# candidates= count it; the clicked row is unchanged.)
 vgate_assert 10 serial-contains 'gofiles: mouse b=2'
-vgate_assert 10 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=2'
+vgate_assert 10 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=3'
 
-# The submenu: both opens=text manifest rows, and the descent named the
+# The submenu: the opens=text manifest rows, and the descent named the
 # candidate count.
-vgate_assert 10 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=2'
+vgate_assert 10 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=3'
 
 # The pick and the launch: decision marker, outcome marker, and GOEDIT's
 # own report that it read the file the menu named.
@@ -1034,3 +1036,193 @@ for y in range(384, 544):
 print("fileman empty leg: hint-ink pixels=%d" % dim)
 assert dim >= 30, "empty-state hint ink absent from the list pane's body band"
 PY
+
+# --- M123d (#2578) run 12: rename conflict -> banner -> Replace/Cancel ----
+# GOFILES boots on FMR (three plain files): a rename onto an existing name
+# raises the shared error banner on the status row — the DECISION marker
+# `gofiles: banner rename known.txt exists` rides pending, so it lands only
+# after the frame that shows the strip. `1` runs Replace (the incumbent
+# goes to TRASH, the held rename lands: `gofiles: banner act replace` +
+# `gofiles: renamed`); a second conflict answered with `2` is the Cancel
+# arm (`gofiles: banner act cancel`, nothing moved). The screenshot at the
+# first banner marker counts the warn ink (255,200,80) in the status band —
+# row 21 of the 64x23 grid -> y=768..800 of the 2x capture.
+vgate_file script-12.txt <<'EOS'
+exec GOFILES.ELF /host/FMR
+EOS
+
+vgate_file script2-12.txt <<'EOS'
+dui close 2
+echo rx-go-fileman-banner-ok
+EOS
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fmr = os.path.join(share, "FMR")
+os.makedirs(fmr, exist_ok=True)
+for name in ("known.txt", "other.txt", "third.txt"):
+    with open(os.path.join(fmr, name), "w") as f:
+        f.write(name + "\n")
+print("staged FMR with three files")
+PY
+
+vgate_run 12 -- \
+    --screen '$RUN_DIR/fileman-banner-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-12.txt' \
+    --input-chords 'j,r,k,n,o,w,n,.,t,x,t,return,1,r,k,n,o,w,n,.,t,x,t,return,2' \
+    --input-chords-after 'gofiles: ready' \
+    --screenshot-after 'gofiles: banner rename known.txt exists' \
+    --script2 '$RUN_DIR/script2-12.txt' \
+    --script2-after 'gofiles: banner act cancel' \
+    --script-expect 'rx-go-fileman-banner-ok' --timeout 240
+
+vgate_assert 12 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 12 serial-contains 'gofiles: list /host/FMR n=3'
+vgate_assert 12 serial-contains 'gofiles: rename refused other.txt -> known.txt exists'
+vgate_assert 12 serial-contains 'gofiles: banner rename known.txt exists'
+vgate_assert 12 serial-contains 'gofiles: banner act replace known.txt'
+vgate_assert 12 serial-contains 'gofiles: renamed other.txt -> known.txt'
+# The second conflict's Cancel arm: refused pair named, act marker, and no
+# second rename may have landed (third.txt still stands).
+vgate_assert 12 serial-contains 'gofiles: rename refused third.txt -> known.txt exists'
+vgate_assert 12 serial-contains 'gofiles: banner act cancel'
+vgate_assert 12 serial-contains 'gofiles: entry third.txt file'
+vgate_assert 12 serial-contains 'rx-go-fileman-banner-ok'
+vgate_assert 12 serial-absent 'gofiles: renamed third.txt'
+vgate_assert 12 serial-absent '[EXC] parking:'
+vgate_assert 12 serial-absent 'exited status=139'
+
+vgate_assert 12 snapshot 'fileman-banner-screen-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
+            row[x] = (row[x] + pred) & 0xff
+    out += row
+    prev = row
+
+# Warn-ink (255,200,80) text in the status band: the banner strip's row.
+warn = 0
+for y in range(768, 800):
+    for x in range(64, 1088):
+        k = (y * w + x) * bpp
+        if max(abs(out[k] - 255), abs(out[k+1] - 200), abs(out[k+2] - 80)) <= 24:
+            warn += 1
+print("fileman banner leg: warn-ink pixels=%d" % warn)
+assert warn >= 20, "banner text absent from the status band"
+PY
+
+# --- M123d (#2578) run 13: exec refusal -> banner --------------------------
+# A staged APPS.TXT tail row names a handler binary that does not exist:
+# MISSING.ELF accepts opens=text, so the right-click Open With… submenu
+# offers "Missing App" as its third row; picking it is a REAL vi.Exec
+# refusal (ENOENT) — `gofiles: open launch refused` then the in-app
+# `gofiles: banner exec MISSING.ELF refused:` strip, dismissed by Escape
+# (`gofiles: banner act dismiss`). The manifest append is additive: the
+# real rows still serve run 10's leg (its candidate count moves 2 -> 3).
+vgate_file script-13.txt <<'EOS'
+exec GOFILES.ELF /host/FMX
+EOS
+
+vgate_file script2-13.txt <<'EOS'
+dui close 2
+echo rx-go-fileman-execrefusal-ok
+EOS
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fmx = os.path.join(share, "FMX")
+os.makedirs(fmx, exist_ok=True)
+with open(os.path.join(fmx, "NOTES.TXT"), "w") as f:
+    f.write("hi from fmx\n")
+# The bogus handler row: v=2 schema, opens=text — appended to the manifest
+# gate-run seeded, so the real roster rows still serve the other legs.
+apps = os.path.join(share, "APPS.TXT")
+with open(apps) as f:
+    body = f.read()
+if "MISSING.ELF" not in body:
+    if not body.endswith("\n"):
+        body += "\n"
+    body += "MISSING.ELF | Missing App | x | dock=false | v=2 | opens=text\n"
+    with open(apps, "w") as f:
+        f.write(body)
+print("staged FMX + MISSING.ELF manifest row")
+PY
+
+# The gesture is pointer + chords: the right-press arms the menu on
+# NOTES.TXT's row (40,88 = list row 0, the run 10 geometry), then the
+# keyboard walks it — down to "Open With…", right descends, two downs land
+# on the third row (MISSING.ELF, appended last), return commits the exec,
+# and escape dismisses the refusal banner once it stands. Driving the
+# submenu by keys instead of a third pixel click keeps the leg honest
+# about WHAT it proves: the refusal, not the plate geometry.
+vgate_run 13 -- \
+    --screen '$RUN_DIR/fileman-execrefusal-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-13.txt' \
+    --pointer-virtio '40,88,rc' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --input-chords 'down,right,down,down,return,escape' \
+    --input-chords-after 'gofiles: menu NOTES.TXT mime=text/plain' \
+    --script2 '$RUN_DIR/script2-13.txt' \
+    --script2-after 'gofiles: banner act dismiss' \
+    --script-expect 'rx-go-fileman-execrefusal-ok' --timeout 300
+
+vgate_assert 13 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 13 serial-contains 'gofiles: list /host/FMX n=1'
+vgate_assert 13 serial-contains 'gofiles: mouse b=2'
+# Three opens=text rows now: NOTE.ELF, GOEDIT.ELF and the staged MISSING.ELF.
+vgate_assert 13 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=3'
+vgate_assert 13 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=3'
+vgate_assert 13 serial-contains 'gofiles: open chose NOTES.TXT type=text handler=MISSING.ELF'
+vgate_assert 13 serial-contains 'gofiles: open launch refused NOTES.TXT handler=MISSING.ELF'
+vgate_assert 13 serial-contains 'gofiles: banner exec MISSING.ELF refused:'
+vgate_assert 13 serial-contains 'gofiles: banner act dismiss'
+vgate_assert 13 serial-contains 'rx-go-fileman-execrefusal-ok'
+vgate_assert 13 serial-absent 'gofiles: open launched NOTES.TXT handler=MISSING.ELF'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 serial-absent 'exited status=139'

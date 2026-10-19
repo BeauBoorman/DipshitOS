@@ -439,3 +439,26 @@ assert plate >= 40000, "empty-state plate absent from the blank viewport"
 assert ring >= 400, "empty-state border ring missing"
 assert textish >= 50, "no empty-state text inside the viewport plate"
 PY
+
+# --- M123d (#2578) run 09: load failure -> shared error banner ------------
+# WEB pointed at a file that does not exist lands on the error page AND the
+# in-app banner: `web: banner load failed: file` is the raise marker the
+# app prints when the strip stands. Escape dismisses it — `web: banner act
+# dismiss` is the resolution. A permanent kind ("file") carries no Retry.
+vgate_file script-banner.txt <<'EOS'
+exec WEB.ELF /host/NOFILE.TXT
+EOS
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' --via-virtio \
+    --script '$RUN_DIR/script-banner.txt' \
+    --input-chords 'escape' \
+    --input-chords-after 'web: banner load failed: file' \
+    --script-expect 'web: banner act dismiss' --timeout 120
+
+vgate_assert 09 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 09 serial-contains 'web: error file'
+vgate_assert 09 serial-contains 'web: banner load failed: file'
+vgate_assert 09 serial-contains 'web: banner act dismiss'
+vgate_assert 09 serial-absent 'web: banner act retry'
+vgate_assert 09 serial-absent '[EXC] parking:'

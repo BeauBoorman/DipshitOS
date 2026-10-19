@@ -224,6 +224,11 @@ func (m model) previewRow(i int, plines []string, w int) string {
 }
 
 func (m model) statusLine() string {
+	// M123d (#2578): an open error banner takes the row — the same
+	// takeover the modal prompts hold, in the same warn ink.
+	if m.banner.Open {
+		return colWarn + " " + clipVis(m.banner.Line(0), m.cols-4) + colReset
+	}
 	switch m.mode {
 	case modeRename:
 		return colWarn + " rename to: " + m.input + "_" + colReset
