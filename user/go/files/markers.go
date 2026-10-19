@@ -95,4 +95,19 @@ const (
 	markerWatchRemoved = "gofiles: watch removed "
 	markerWatchChanged = "gofiles: watch changed "
 	markerWatchGone    = "gofiles: watch path gone"
+
+	// M125c (#2588): the session-state protocol (M125a's save/restore).
+	// `state save` is printed by the SaveState closure as the blob is
+	// staged — an action marker, not a frame one. `state restored` rides
+	// the first post-paint flush so it never precedes the listing it
+	// describes; `state cwd` names the nearest-existing-parent fallback;
+	// `state refused` is the app's own stale/malformed-blob verdict.
+	markerStateSave    = "gofiles: state save "
+	markerStateRestore = "gofiles: state restored "
+	markerStateCwd     = "gofiles: state cwd "
+	markerStateRefused = "gofiles: state refused "
+
+	// The view/sort chords' own markers.
+	markerViewMode = "gofiles: viewmode "
+	markerSort     = "gofiles: sort "
 )

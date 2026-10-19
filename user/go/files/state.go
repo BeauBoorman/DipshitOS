@@ -15,6 +15,18 @@ import (
 // until they are committed or cancelled.
 type editMode uint8
 
+// viewMode is the frame shape — M125c (#2588): the second pane layout is
+// what makes "view mode" real session state rather than a serialized
+// constant. Tab toggles it.
+type viewMode uint8
+
+const (
+	// viewSplit is the M74a two-pane frame: list | preview.
+	viewSplit viewMode = iota
+	// viewList drops the preview pane; the list spans the whole grid.
+	viewList
+)
+
 const (
 	modeNormal editMode = iota
 	modeRename
@@ -33,6 +45,9 @@ type model struct {
 	entries [vi.MaxDirEntries]vi.DirEntry
 	n       int
 	sel     int
+	top     int // first visible list row — the scroll position
+	view    viewMode
+	sort    sortMode
 
 	mode  editMode
 	input string // rename buffer (starts empty: type the new name)
@@ -121,6 +136,7 @@ func (m *model) setSize(cols, rows int) {
 		rows = 8
 	}
 	m.cols, m.rows = cols, rows
+	m.ensureSelVisible()
 }
 
 // bodyRows is the pane height: path bar + pane headers + status + hints.
@@ -138,6 +154,29 @@ func (m *model) clampSel() {
 	}
 	if m.sel < 0 || m.sel >= m.n {
 		m.sel = 0
+	}
+	m.ensureSelVisible()
+}
+
+// ensureSelVisible keeps the cursor inside the scroll window — the
+// invariant is top <= sel < top+bodyRows, with top re-tightened when the
+// listing shrinks. A selection the frame cannot show is the shape the
+// serialized `top` field restores against, and the thing a small window
+// would otherwise lose (M125c #2588).
+func (m *model) ensureSelVisible() {
+	body := m.bodyRows()
+	if m.sel < m.top {
+		m.top = m.sel
+	} else if m.sel >= m.top+body {
+		m.top = m.sel - body + 1
+	}
+	if m.n <= body {
+		m.top = 0
+	} else if m.top > m.n-body {
+		m.top = m.n - body
+	}
+	if m.top < 0 {
+		m.top = 0
 	}
 }
 
@@ -167,7 +206,7 @@ func (m *model) refresh() {
 		return
 	}
 	m.n = n
-	sortEntries(m.entries[:], m.n)
+	sortEntries(m.entries[:], m.n, m.sort)
 	m.clampSel()
 	m.watcher.Adopt(vi.DirSnapshot{OK: true, Rows: append([]vi.DirEntry(nil), m.entries[:m.n]...)})
 	m.emit(markerList + m.path + " n=" + vi.Itoa64(int64(m.n)))
@@ -320,6 +359,7 @@ func (m *model) move(delta int) {
 	if m.sel >= m.n {
 		m.sel = m.n - 1
 	}
+	m.ensureSelVisible()
 	m.loadPreview()
 }
 
@@ -413,10 +453,10 @@ func (m *model) handleClick(x, y int) {
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() {
 		return
 	}
-	if col >= listWidth(m.cols) {
+	if col >= m.listCols() {
 		return // preview pane: no click action in v1
 	}
-	idx := row - 2
+	idx := m.top + row - 2
 	if idx < 0 || idx >= m.n {
 		return
 	}
@@ -425,6 +465,7 @@ func (m *model) handleClick(x, y int) {
 		return
 	}
 	m.sel = idx
+	m.ensureSelVisible()
 	m.loadPreview()
 }
 
@@ -503,6 +544,8 @@ func (m *model) handleKey(ev keys.Event) {
 		m.goUp()
 	case keys.KeyCtrlC:
 		m.quit = true
+	case keys.KeyTab:
+		m.toggleView()
 	case keys.KeyRune:
 		switch ev.Rune {
 		case 'j':
@@ -521,6 +564,8 @@ func (m *model) handleKey(ev keys.Event) {
 			m.quit = true
 		case 'v':
 			m.showVolumes()
+		case 's':
+			m.cycleSort()
 		case 'r':
 			m.startRename()
 		case 'd':
@@ -551,6 +596,60 @@ func (m *model) showVolumes() {
 	m.sel = 0
 	m.emit(markerCd + m.path)
 	m.refresh()
+}
+
+// listCols is the left pane's cell width in the active view mode — the
+// whole grid in viewList (no preview pane), the 45% split otherwise.
+func (m model) listCols() int {
+	if m.view == viewList {
+		return m.cols
+	}
+	return listWidth(m.cols)
+}
+
+// toggleView is the Tab chord: swap the two-pane frame for a full-width
+// list. The preview still loads — selection semantics are unchanged —
+// but nothing paints it in viewList.
+func (m *model) toggleView() {
+	if m.view == viewSplit {
+		m.view = viewList
+	} else {
+		m.view = viewSplit
+	}
+	m.emit(markerViewMode + viewNameOf(m.view))
+	m.status = "view " + viewNameOf(m.view)
+}
+
+func viewNameOf(v viewMode) string {
+	if v == viewList {
+		return "list"
+	}
+	return "split"
+}
+
+// cycleSort is the `s` chord: walk dirs -> name -> size and re-sort the
+// live listing in place. The selected entry follows the re-sort by name —
+// the cursor stays on what the user was looking at, not the row index.
+func (m *model) cycleSort() {
+	m.sort = (m.sort + 1) % sortModeCount
+	selName := ""
+	if e, ok := m.selEntry(); ok {
+		selName = e.NameString()
+	}
+	if m.path != volsPath {
+		sortEntries(m.entries[:], m.n, m.sort)
+	}
+	m.sel = 0
+	for i := 0; i < m.n; i++ {
+		if m.entries[i].NameString() == selName {
+			m.sel = i
+			break
+		}
+	}
+	m.ensureSelVisible()
+	m.emit(markerSort + sortNameOf(m.sort))
+	m.status = "sort " + sortNameOf(m.sort)
+	m.loadPreview()
 }
 
 // atVolumes guards the mutating ops: the volumes root is a synthetic list,

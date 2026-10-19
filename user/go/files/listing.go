@@ -161,19 +161,47 @@ func labelsOf(entries []vi.DirEntry, n int) []string {
 	return out
 }
 
-// sortEntries puts directories first, then files, each group by name — the
-// order the class-B gate pins (SUB before KNOWN.TXT) and the order that
-// makes "the first row is the directory to navigate into" deterministic
-// regardless of the share's on-disk order.
-func sortEntries(entries []vi.DirEntry, n int) {
+// sortMode is the listing order — M125c (#2588) made it session state, so
+// the restored tab re-sorts into the order the user left rather than
+// always landing back on the default.
+type sortMode uint8
+
+const (
+	// sortDirs puts directories first, then files, each group by name —
+	// the order the class-B gate pins (SUB before KNOWN.TXT) and the order
+	// that makes "the first row is the directory to navigate into"
+	// deterministic regardless of the share's on-disk order.
+	sortDirs sortMode = iota
+	// sortName is one flat name-ascending order, dirs interleaved.
+	sortName
+	// sortSize is largest-first, name ascending to break ties.
+	sortSize
+	sortModeCount
+)
+
+// sortNameOf names a sortMode for the status line and the `gofiles: sort`
+// marker — stable vocabulary the gate can assert.
+func sortNameOf(mode sortMode) string {
+	switch mode {
+	case sortName:
+		return "name"
+	case sortSize:
+		return "size"
+	default:
+		return "dirs"
+	}
+}
+
+// sortEntries orders the first n entries under mode. Insertion sort:
+// n <= 16, stability irrelevant, no allocation.
+func sortEntries(entries []vi.DirEntry, n int, mode sortMode) {
 	if n > len(entries) {
 		n = len(entries)
 	}
-	// Insertion sort: n <= 16, stability irrelevant, no allocation.
 	for i := 1; i < n; i++ {
 		v := entries[i]
 		j := i - 1
-		for j >= 0 && entryLess(v, entries[j]) {
+		for j >= 0 && entryLess(v, entries[j], mode) {
 			entries[j+1] = entries[j]
 			j--
 		}
@@ -181,12 +209,23 @@ func sortEntries(entries []vi.DirEntry, n int) {
 	}
 }
 
-// entryLess is the dirs-first, name-ascending order.
-func entryLess(a, b vi.DirEntry) bool {
-	if a.Dir() != b.Dir() {
-		return a.Dir()
+// entryLess is the mode's order: sortDirs is dirs-first/name-ascending,
+// sortName is flat by name, sortSize is largest-first by name.
+func entryLess(a, b vi.DirEntry, mode sortMode) bool {
+	switch mode {
+	case sortName:
+		return a.NameString() < b.NameString()
+	case sortSize:
+		if a.Size != b.Size {
+			return a.Size > b.Size
+		}
+		return a.NameString() < b.NameString()
+	default:
+		if a.Dir() != b.Dir() {
+			return a.Dir()
+		}
+		return a.NameString() < b.NameString()
 	}
-	return a.NameString() < b.NameString()
 }
 
 // startPath is the directory the manager opens at: argv[1] when the

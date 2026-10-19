@@ -257,6 +257,10 @@ func guessBin(title string) string {
 		return "NOTE.ELF"
 	case "Edit":
 		return "GOEDIT.ELF"
+	case "Files":
+		// M125c (#2588): GOFILES's declared title — the session state leg
+		// re-execs the recorded row, so "Files" must name the real binary.
+		return "GOFILES.ELF"
 	case "GoTabApp":
 		// The M56d tabapp demo's declared title — the M125a spec leg's
 		// client, so its restore row must name the real binary.

@@ -57,11 +57,7 @@ func (m model) render() string {
 }
 
 func (m model) renderLines() []string {
-	lw := listWidth(m.cols)
-	pw := m.cols - lw - 1
-	if pw < 8 {
-		pw = 8
-	}
+	lw := m.listCols()
 	body := m.bodyRows()
 
 	lines := make([]string, 0, m.rows)
@@ -71,34 +67,51 @@ func (m model) renderLines() []string {
 
 	// Row 1: pane headers, aligned over their panes.
 	lhead := clipVis(" files ", lw)
-	rhead := clipVis(" preview: "+m.previewOf, pw)
-	lines = append(lines,
-		colHead+lhead+strings.Repeat(" ", lw-visLen(lhead))+colReset+
-			colSep+"│"+colReset+
-			colHead+rhead+strings.Repeat(" ", pw-visLen(rhead))+colReset)
+	if m.view == viewList {
+		// viewList (M125c #2588): no preview pane, no separator — the
+		// list spans the grid.
+		lines = append(lines,
+			colHead+lhead+strings.Repeat(" ", lw-visLen(lhead))+colReset)
+		for i := 0; i < body; i++ {
+			lines = append(lines, m.listRow(i, lw))
+		}
+	} else {
+		pw := m.cols - lw - 1
+		if pw < 8 {
+			pw = 8
+		}
+		rhead := clipVis(" preview: "+m.previewOf, pw)
+		lines = append(lines,
+			colHead+lhead+strings.Repeat(" ", lw-visLen(lhead))+colReset+
+				colSep+"│"+colReset+
+				colHead+rhead+strings.Repeat(" ", pw-visLen(rhead))+colReset)
 
-	// Body: list rows | separator | preview rows.
-	plines := strings.Split(m.preview, "\n")
-	for i := 0; i < body; i++ {
-		lines = append(lines, m.listRow(i, lw)+colSep+"│"+colReset+m.previewRow(i, plines, pw))
+		// Body: list rows | separator | preview rows.
+		plines := strings.Split(m.preview, "\n")
+		for i := 0; i < body; i++ {
+			lines = append(lines, m.listRow(i, lw)+colSep+"│"+colReset+m.previewRow(i, plines, pw))
+		}
 	}
 
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · o open with · e export · v volumes · backspace up · r rename · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("j/k move · enter open · o open with · e export · v volumes · tab view · s sort · backspace up · r rename · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }
 
 // listRow is one list line padded to w inside its style, so the selection
-// background spans the full pane.
+// background spans the full pane. i is a SCREEN row: the scroll offset
+// m.top maps it onto the listing (the cursor is always inside the window —
+// ensureSelVisible owns that invariant).
 func (m model) listRow(i, w int) string {
-	if i >= m.n {
+	idx := m.top + i
+	if idx >= m.n {
 		return strings.Repeat(" ", w)
 	}
-	e := m.entries[i]
-	if i == m.sel {
+	e := m.entries[idx]
+	if idx == m.sel {
 		label := clipVis(entryLabel(e), w-2)
 		return colSel + "> " + label +
 			strings.Repeat(" ", w-2-visLen(label)) + colReset
