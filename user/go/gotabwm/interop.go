@@ -176,6 +176,9 @@ func dropRpcBinding(id uint32) {
 	// M124a (#2580): an armed drag dies with its source, and a staged
 	// handoff dies with its target — a reused id inherits neither.
 	dropDragWindow(id)
+	// M124e (#2584): a staged selection handoff dies the same way. The
+	// seat's primary BUFFER survives — it outlives its publisher.
+	dropSelWindow(id)
 }
 
 func dropAllRpcBindings() {
@@ -643,6 +646,10 @@ func applyRPC(req vi.WmRpc) bool {
 		return serveDragBegin(req)
 	case vi.WmRpcKindDragCancel: // 26, client -> seat: abort its own drag
 		return serveDragCancel(req)
+	case vi.WmRpcKindSelPublish: // 27, client -> seat: store its selection (M124e)
+		return serveSelPublish(req)
+	case vi.WmRpcKindSelPaste: // 28, client -> seat: pull the primary buffer
+		return serveSelPaste(req)
 	case vi.WmRpcKindSettingsSubscribe: // 13, client -> seat: subscribe to one key
 		return applySettingsSubscribe(req)
 	case vi.WmRpcKindSettingsPublish: // 14, writer -> seat: a persisted key changed

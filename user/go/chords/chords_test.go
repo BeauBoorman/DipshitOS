@@ -190,6 +190,7 @@ func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 		"launcher": 1, "start-surface": 1, "cycle-focus": 4, "focus-index": 9,
 		"pin": 1, "palette": 1, "reopen": 1, "duplicate": 1, "snapshot-bundle": 1,
 		"freeze-badge": 1, "split-cycle": 1, "nav-back": 1, "nav-forward": 1,
+		"sel-paste": 1,
 	}
 	got := map[string]int{}
 	for _, r := range Global.SeatRows() {

@@ -1350,7 +1350,7 @@ func TestChordSummaryCounts(t *testing.T) {
 		}
 	}
 	got := chordSummary(len(chords.Global), seat, kernel, app)
-	want := "gotabwm: chords n=52 seat=24 kernel=12 app=16"
+	want := "gotabwm: chords n=53 seat=25 kernel=12 app=16"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
 	}

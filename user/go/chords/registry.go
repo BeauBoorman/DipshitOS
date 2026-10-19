@@ -88,6 +88,10 @@ const (
 	UsageLeft         uint8 = 0x50
 	UsageDown         uint8 = 0x51
 	UsageUp           uint8 = 0x52
+	// UsageInsert is the keymap's Insert usage (0x70 — the runner's "insert"
+	// token and input.zig's `\e[2~` encoder agree). M124e's primary-paste
+	// chord is shift+insert.
+	UsageInsert uint8 = 0x70
 )
 
 // Chord identifies one global shortcut: a modifier mask plus a USB HID
@@ -154,6 +158,8 @@ func usageName(u uint8) string {
 		return "["
 	case UsageRightBracket:
 		return "]"
+	case UsageInsert:
+		return "insert"
 	}
 	return fmt.Sprintf("0x%02x", u)
 }

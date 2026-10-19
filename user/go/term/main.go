@@ -91,6 +91,9 @@ const (
 	markerOpenErr       = "goterm: error open "
 	markerTtyErr        = "goterm: no /dev/tty"
 	markerAttErr        = "goterm: attach failed"
+	// M124e (#2584): a seat primary-selection delivery landing in the line
+	// editor — n= is the staged byte count it fed.
+	markerSelPaste = "goterm: sel-paste "
 )
 
 func main() {
@@ -296,6 +299,18 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 				// The editor already painted ^C and the fresh prompt.
 			}
 		}
+		// M124e (#2584): the seat's primary-selection delivery pastes into
+		// the line editor exactly like typed bytes — Feed through the same
+		// handler so a selection containing newlines submits the same way
+		// real input would. Bound inside the session so a restart rewires
+		// it to the fresh editor; the seat refuses the delivery when this
+		// app's manifest row lacks selection=primary.
+		ta.SelPaste = func(text []byte) {
+			vi.ConsoleLine(markerSelPaste + "n=" + vi.Itoa64(int64(len(text))))
+			if len(text) > 0 {
+				handle(editor.Feed(text))
+			}
+		}
 
 		var readBuf [64]byte
 		for !restart {
@@ -303,6 +318,10 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 			// not an input event — answer it each pass so a snapshot or
 			// tab-close ask is serviced before the window dies.
 			ta.PollStateAsk()
+			// M124e (#2584): a seat primary-selection delivery is mailbox
+			// traffic too — the notice lands here, the staged payload is
+			// consumed by SelTake, and the bytes ride editor.Feed.
+			ta.PollSelPaste()
 			n, _ := vi.FileRead(fd, readBuf[:])
 			if n > 0 {
 				handle(editor.Feed(readBuf[:n]))

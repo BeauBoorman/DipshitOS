@@ -193,6 +193,10 @@ const (
 	// M124a-2 (#2677): the drop target's receipt — `<mime> n=` on a
 	// splice, `no-payload`/`empty`/`rc=` for the refused shapes.
 	markerDrop    = "goedit: drop "
+	// M124e (#2584): primary-selection markers — publish on selection
+	// change, paste on a seat delivery.
+	markerSelPub   = "goedit: selpub "
+	markerSelPaste = "goedit: sel-paste "
 	markerRepl    = "goedit: replace '"
 	markerReplAll = "goedit: replace-all '"
 
@@ -540,6 +544,16 @@ func main() {
 			e.markStage()
 			e.emitStatus()
 		},
+		// M124e (#2584): the primary-selection paste sink — a seat
+		// delivery (middle-click into this pane, shift+insert focused)
+		// splices the bytes at the caret through the same op path.
+		SelPaste: func(text []byte) {
+			e.selPaste(text)
+			e.draw()
+			e.ta.Present()
+			e.markStage()
+			e.emitStatus()
+		},
 	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
@@ -583,6 +597,11 @@ func main() {
 		// M124a-2: seat drag frames for this window — a delivered drop runs
 		// DropTarget (which repaints itself) here, one poll per loop turn.
 		ta.PollDrag()
+		// M124e (#2584): seat primary-selection deliveries land the same
+		// way; and a selection the user just changed publishes itself the
+		// same pass (publishSel diffs, so a quiet pass costs a compare).
+		ta.PollSelPaste()
+		e.publishSel()
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
@@ -1420,6 +1439,67 @@ func (e *editor) drop(offer tabapp.DragOffer) {
 	}
 	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: pos, old: old, ins: b}}}, pos+len(b))
 	vi.ConsoleLine(markerDrop + offer.Mime + " n=" + vi.Itoa64(int64(len(b))))
+}
+
+// --- primary selection (M124e, #2584) ---------------------------------------
+// The seat owns the PRIMARY buffer; this app publishes its selection on
+// change and splices a delivered paste at the caret. Both directions are
+// gated by the manifest's selection=primary — the app speaks either way
+// and the seat's refusal is the opt-out, so the code below never checks
+// the cap itself.
+
+// selPub records the last-published range so publishSel only spends an RPC
+// on a real change. A cleared selection is never published — PRIMARY keeps
+// the LAST selection, not the current caret state.
+var (
+	selPubLo, selPubHi int
+	selPubOK           bool
+)
+
+// publishSel pushes the live selection to the seat's primary buffer when
+// it changed since the last publish. One compare per loop pass is the
+// whole idle cost; an RPC (stage + kind-27) fires only on a new non-empty
+// range. A refused ack (cap off, oversize) just means no publish — the
+// next change tries again, and the marker names the attempt honestly.
+func (e *editor) publishSel() {
+	if e.ta == nil || !e.ta.TabAware {
+		return
+	}
+	lo, hi, ok := e.selRange()
+	if !ok {
+		return
+	}
+	if selPubOK && lo == selPubLo && hi == selPubHi {
+		return
+	}
+	b := append([]byte{}, e.buf[lo:hi]...)
+	if vi.SelPublish(uint32(e.ta.Win), b, appName) {
+		selPubOK, selPubLo, selPubHi = true, lo, hi
+		vi.ConsoleLine(markerSelPub + "n=" + vi.Itoa64(int64(len(b))))
+	}
+}
+
+// selPaste splices a seat-delivered primary paste at the caret — the
+// paste()/drop() shape again: over the selection when one is pinned, one
+// undoable op, the marker naming the byte count it actually took.
+func (e *editor) selPaste(b []byte) {
+	if len(b) == 0 {
+		vi.ConsoleLine(markerSelPaste + "empty")
+		return
+	}
+	e.clampCaret()
+	pos := e.cur
+	var old []byte
+	if lo, hi, ok := e.selRange(); ok {
+		pos = lo
+		old = append([]byte{}, e.buf[lo:hi]...)
+	}
+	if splicedLen(len(e.buf), []splice{{pos: pos, old: old, ins: b}}, false) > maxBuffer {
+		vi.ConsoleLine(markerSelPaste + "rc=" + vi.Itoa64(-vsys.ErrENOMEM))
+		return
+	}
+	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: pos, old: old, ins: b}}}, pos+len(b))
+	vi.ConsoleLine(markerSelPaste + "n=" + vi.Itoa64(int64(len(b))))
 }
 
 // --- status line ----------------------------------------------------------
