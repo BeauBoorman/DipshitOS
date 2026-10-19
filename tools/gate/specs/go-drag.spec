@@ -18,18 +18,23 @@
 #       (`gview: drop image/png 160x120 bytes=`).
 #
 # Geometry: SplitVert tiles 0..640 / 640..1280 edge-to-edge (unset sash has
-# no gutter), the hosted window owns its whole pane (the rail paints over
-# the top 22 px) and its client rows start at the pane top. GOFILES' two
-# chrome rows occupy cells 0-1, so list row 0 (NOTE.TXT) centres near
-# y=40 and row 1 (PIC.PNG) near y=56; the release point (900,360) sits
-# mid-pane on the right. The press/motion samples stay inside the left
-# pane so the ?1002 report reaches GOFILES; once BeginDrag acks the seat
-# owns every later sample.
+# no gutter) and the hosted window starts at RailHeight=22 — observed on
+# the first gate run: a scanout-y press maps to SGR row (y-22)/16+1.
+# GOFILES' two chrome rows occupy cells 0-1, so list row 0 (NOTE.TXT)
+# centres near y=62 and row 1 (PIC.PNG) near y=78; the release point
+# (900,360) sits mid-pane on the right. The press/motion samples stay
+# inside the left pane so the ?1002 report reaches GOFILES; once
+# BeginDrag acks the seat owns every later sample. The samples pace at
+# 2.5 s per step and the first gate run showed the synchronous BeginDrag
+# RPC landing within a hair of the release edge — the extra held moves
+# between the arming motion and the release exist purely to give that
+# RPC wall-clock headroom (pre-arm moves just forward to the pressed
+# window as more ?1002 reports).
 #
-# exec-order: assert-proven -- each run ends on its own `rx-go-drag-*`
-# marker printed by a script3 gated on the app's own `drag end delivered`
-# receipt; a drag that never armed, never delivered, or was refused can
-# never reach the expect line.
+# exec-order: assert-proven -- each run ends on the app's own
+# `gofiles: drag end delivered` receipt (the expect is guest output, not
+# a script echo); a drag that never armed, never delivered, or was
+# refused can never reach it.
 
 vgate_name go-drag "M124a-2 #2677: GOFILES drags a file onto GOEDIT (text/plain splice) and GOVIEW (image/png decode) through the seat's drag session"
 vgate_share seed
@@ -43,16 +48,18 @@ wm
 exec GOTABWM.ELF
 EOF
 
+# The second app's exec rides script3 so it is issued only after
+# `gofiles: ready` — i.e. after GOFILES' window has opened. The seat
+# assigns panes in window-open order, so an unsequenced pair races (the
+# first gate run put GOVIEW on the left); this staging pins GOFILES to
+# tab 0 / the left pane deterministically.
 vgate_file script2-01.txt <<'EOF'
 dui focus 0
 exec GOFILES.ELF /host/DRAG
-exec GOEDIT.ELF
 EOF
 
 vgate_file script3-01.txt <<'EOF'
-wm
-dui
-echo rx-go-drag-edit-ok
+exec GOEDIT.ELF
 EOF
 
 vgate_file script-02.txt <<'EOF'
@@ -66,13 +73,10 @@ EOF
 vgate_file script2-02.txt <<'EOF'
 dui focus 0
 exec GOFILES.ELF /host/DRAG
-exec GOVIEW.ELF
 EOF
 
 vgate_file script3-02.txt <<'EOF'
-wm
-dui
-echo rx-go-drag-view-ok
+exec GOVIEW.ELF
 EOF
 
 vgate_setup_python <<'PY'
@@ -109,7 +113,7 @@ print("staged GOTABWM/GOFILES/GOEDIT/GOVIEW + DRAG/{NOTE.TXT,PIC.PNG}")
 PY
 
 # --- run 01: text/plain onto GOEDIT ----------------------------------------
-# The gesture is one drag: press on NOTE.TXT's row (x=40, y=40 — cell row 2,
+# The gesture is one drag: press on NOTE.TXT's row (x=40, y=62 — cell row 2,
 # the first list entry), a held move to (200,200) still inside the left pane
 # (the ?1002 report that arms the source), then release mid-right-pane. The
 # seat's kind-24 arm validated the staged envelope; the release hit-tests
@@ -122,11 +126,11 @@ vgate_run 01 -- \
     --script2-after 'gotabwm: win focus' \
     --input-chords 'ctrl-shift-v' \
     --input-chords-after 'gotabwm: rail n=2' \
-    --pointer-virtio '40,40,d;200,200;900,360,u' \
+    --pointer-virtio '40,62,d;200,200;320,240;480,280;900,360,u' \
     --pointer-virtio-after 'gotabwm: split v' \
     --script3 '$RUN_DIR/script3-01.txt' \
-    --script3-after 'gofiles: drag end delivered' \
-    --script-expect 'rx-go-drag-edit-ok' --timeout 300
+    --script3-after 'gofiles: ready' \
+    --script-expect 'gofiles: drag end delivered' --timeout 300
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 01 serial-contains 'exec: loaded GOTABWM.ELF'
@@ -159,8 +163,6 @@ vgate_assert 01 serial-contains ' mime=text/plain'
 # The target's half: the payload spliced through the paste path.
 vgate_assert 01 serial-contains 'goedit: drop text/plain n=8'
 vgate_assert 01 serial-contains 'gofiles: drag end delivered win='
-
-vgate_assert 01 serial-contains 'rx-go-drag-edit-ok'
 
 # The refusals that must NOT happen: no arm refusal, no cancel, no app-side
 # refusal marker, no pended open firing as a second click (the gesture stole
@@ -196,7 +198,7 @@ print("drag ordering: seat-arm@%d src-arm@%d seat-drop@%d splice@%d receipt@%d"
 PY
 
 # --- run 02: image/png onto GOVIEW -----------------------------------------
-# Identical shape, one row lower: press PIC.PNG (list row 1, y=56) and
+# Identical shape, one row lower: press PIC.PNG (list row 1, y=78) and
 # release over GOVIEW (opens=image). The viewer's DropTarget decodes the
 # envelope's bytes — `drop image/png 160x120 bytes=` is the whole proof.
 vgate_run 02 -- \
@@ -207,11 +209,11 @@ vgate_run 02 -- \
     --script2-after 'gotabwm: win focus' \
     --input-chords 'ctrl-shift-v' \
     --input-chords-after 'gotabwm: rail n=2' \
-    --pointer-virtio '40,56,d;200,200;900,360,u' \
+    --pointer-virtio '40,78,d;200,200;320,240;480,280;900,360,u' \
     --pointer-virtio-after 'gotabwm: split v' \
     --script3 '$RUN_DIR/script3-02.txt' \
-    --script3-after 'gofiles: drag end delivered' \
-    --script-expect 'rx-go-drag-view-ok' --timeout 300
+    --script3-after 'gofiles: ready' \
+    --script-expect 'gofiles: drag end delivered' --timeout 300
 
 vgate_assert 02 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 02 serial-contains 'gotabwm: registered'
@@ -229,7 +231,6 @@ vgate_assert 02 serial-contains 'gotabwm: drag drop id='
 vgate_assert 02 serial-contains ' mime=image/png'
 vgate_assert 02 serial-contains 'gview: drop image/png 160x120 bytes='
 vgate_assert 02 serial-contains 'gofiles: drag end delivered win='
-vgate_assert 02 serial-contains 'rx-go-drag-view-ok'
 vgate_assert 02 serial-absent 'gotabwm: drag refuse'
 vgate_assert 02 serial-absent 'gotabwm: drag cancel'
 vgate_assert 02 serial-absent 'gofiles: drag refused'
