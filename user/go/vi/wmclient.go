@@ -112,6 +112,14 @@ const (
 	WmRpcKindSettingsSubscribe uint8 = 13
 	WmRpcKindSettingsPublish   uint8 = 14
 	WmRpcKindSettingsChanged   uint8 = 15
+	// M125a (#2586): the per-app state protocol. Kind 20 is bidirectional:
+	// the seat pushes an asynchronous save notice (reply_to=0) and the app
+	// answers with a request; kind 21 is the app's restore request. The
+	// 38-byte frame cannot carry a blob, so both kinds rendezvous on the
+	// staged share file AppStatePath(id) — the frame is only the handoff
+	// signal. See wmstate.go.
+	WmRpcKindSaveState    uint8 = 20
+	WmRpcKindRestoreState uint8 = 21
 )
 
 // WmRpc is the 38-byte app-to-WM mailbox frame. Field order and widths are the

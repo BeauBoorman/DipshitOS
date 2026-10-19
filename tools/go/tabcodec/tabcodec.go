@@ -57,6 +57,27 @@ const (
 	FlagPinned uint8 = 0x01
 	FlagFrozen uint8 = 0x02
 	FlagDock   uint8 = 0x04
+
+	// M125a (#2586): the app_state trailer. After the count records a file
+	// may carry one version-tagged blob section —
+	//
+	//	u8 'A' u8 'S' | u8 ver(1) | u8 count | u16 reserved
+	//	per entry: u8 index | u8 appver | u16 reserved | u32 len LE | blob[len]
+	//
+	// — pairing each blob with the record its index names. The seat owns
+	// the lifecycle; the app owns the serialized format, and appver is
+	// the app's own tag round-tripped verbatim.
+	AppStateMax      = 64 * 1024
+	AppStateHdr      = 6
+	AppStateEntry    = 8
+	appStateMagic0   = 'A'
+	appStateMagic1   = 'S'
+	AppStateVersion  = 1
+
+	// FileMaxBytes is the whole-file bound including the trailer: under
+	// the share reader's 256 KiB ceiling and the snapshot bundle's entry
+	// cap, matching the guest codec's tabsV2MaxBytes.
+	FileMaxBytes = 96 * 1024
 )
 
 // Decode rejection errors. Every one wraps ErrCorrupt, so "this is not a
@@ -79,6 +100,10 @@ type Tab struct {
 	Flags uint8  // FlagPinned | FlagFrozen | FlagDock
 	Group string // up to GroupMax bytes (longer is truncated)
 	Bin   string // up to BinMax bytes (longer is truncated)
+	// M125a (#2586): the record's app_state blob — nil when the file
+	// carried none. AppStateVer is the app's own format tag.
+	AppState    []byte
+	AppStateVer uint8
 }
 
 // State is a decoded `.tabs` v2 session. A nil Active means "no active tab"
@@ -152,6 +177,42 @@ func Encode(s State) ([]byte, error) {
 		off += putFixed(buf[off:off+GroupMax], t.Group)
 		off += putFixed(buf[off:off+BinMax], t.Bin)
 	}
+	// M125a (#2586): the app_state trailer. Entries are emitted in record
+	// order while the file bound holds; a blob over AppStateMax is an
+	// Encode error, and one that only fails the FILE cap is skipped — the
+	// record still encodes, its state is refused (the guest writer names
+	// that drop on its own marker).
+	states := 0
+	for _, t := range s.Tabs {
+		if len(t.AppState) > AppStateMax {
+			return nil, fmt.Errorf("%w: app_state %d bytes (max %d)", ErrCorrupt, len(t.AppState), AppStateMax)
+		}
+		if len(t.AppState) > 0 {
+			states++
+		}
+	}
+	if states > 0 {
+		hdr := len(buf)
+		buf = append(buf, appStateMagic0, appStateMagic1, AppStateVersion, 0, 0, 0)
+		emitted := 0
+		for i, t := range s.Tabs {
+			if len(t.AppState) == 0 {
+				continue
+			}
+			if len(buf)+AppStateEntry+len(t.AppState) > FileMaxBytes {
+				continue
+			}
+			buf = append(buf, byte(i), t.AppStateVer, 0, 0,
+				byte(len(t.AppState)), byte(len(t.AppState)>>8),
+				byte(len(t.AppState)>>16), byte(len(t.AppState)>>24))
+			buf = append(buf, t.AppState...)
+			emitted++
+		}
+		buf[hdr+3] = byte(emitted)
+		if emitted == 0 {
+			buf = buf[:hdr]
+		}
+	}
 	return buf, nil
 }
 
@@ -195,6 +256,39 @@ func Decode(b []byte) (State, error) {
 		off += GroupMax
 		st.Tabs[i].Bin = readFixed(b[off : off+BinMax])
 		off += BinMax
+	}
+	// M125a (#2586): the app_state trailer. Foreign magic or a foreign
+	// version is ignored wholesale — the record region's "trailing bytes
+	// are ignored" rule extends to a section this version does not own.
+	// Inside a well-formed section, a malformed entry fails the whole
+	// decode (ErrCorrupt): the host tool is the validator, so a blob it
+	// cannot frame is a corrupt file, not a half-read.
+	t := b[off:]
+	if len(t) >= AppStateHdr &&
+		t[0] == appStateMagic0 && t[1] == appStateMagic1 && t[2] == AppStateVersion {
+		toff := AppStateHdr
+		for e := 0; e < int(t[3]); e++ {
+			if len(t) < toff+AppStateEntry {
+				return State{}, fmt.Errorf("%w: app_state entry %d truncated", ErrCorrupt, e)
+			}
+			idx := int(t[toff])
+			ver := t[toff+1]
+			ln := int(uint32(t[toff+4]) | uint32(t[toff+5])<<8 |
+				uint32(t[toff+6])<<16 | uint32(t[toff+7])<<24)
+			toff += AppStateEntry
+			if idx >= len(st.Tabs) {
+				return State{}, fmt.Errorf("%w: app_state index %d past %d records", ErrCorrupt, idx, len(st.Tabs))
+			}
+			if ln > AppStateMax {
+				return State{}, fmt.Errorf("%w: app_state %d bytes (max %d)", ErrCorrupt, ln, AppStateMax)
+			}
+			if len(t) < toff+ln {
+				return State{}, fmt.Errorf("%w: app_state entry %d body truncated", ErrCorrupt, e)
+			}
+			st.Tabs[idx].AppState = append([]byte(nil), t[toff:toff+ln]...)
+			st.Tabs[idx].AppStateVer = ver
+			toff += ln
+		}
 	}
 	return st, nil
 }

@@ -8,7 +8,7 @@
 # 3 kernel + 3×4 Ms + 1 spare). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# NINE vgate_runs share one seeded host share (`vgate_share seed`):
+# THIRTEEN vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -56,6 +56,14 @@
 #       sprays forged SetTitle frames (bare and guessed-token) at every other
 #       user window id plus an unproven challenge echo — zero may apply while
 #       its own bound requests still land.
+#   12  M125a (#2586): GOTABAPP.ELF as the state client. ctrl-shift-s makes
+#       the seat post its kind-20 ask; the app stages its blob at
+#       /host/APPSTATE.<id> and the seat stores it — SESSION.TABS's
+#       app_state trailer is asserted byte-for-byte on the share.
+#   13  M125a (#2586): the second boot. The seat restores the file run 12
+#       wrote, re-execs GOTABAPP.ELF, and the app's restore_state request
+#       hands the blob back — `gotabapp: state restored len=30` is the
+#       app's own byte-identity verdict.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -72,6 +80,7 @@
 #   bash tools/go/build-gocalc.sh    ->  .build/go/GOCALC.ELF
 #   bash tools/go/build-goterm.sh    ->  .build/go/GOTERM.ELF
 #   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF   (run 08)
+#   bash tools/go/build-tabapp.sh    ->  .build/go/GOTABAPP.ELF  (runs 12/13)
 #
 # exec-order: assert-proven -- each run ends on a marker only its script
 # prints (`rx-gotabwm-tabs-ok` / `rx-gotabwm-session-ok` / `rx-gotabwm-apps-ok`).
@@ -264,6 +273,19 @@ if not os.path.exists(src):
 shutil.copy(src, os.path.join(share, "WMRPCPROBE.ELF"))
 print("staged WMRPCPROBE.ELF into share (%d bytes)" %
       os.path.getsize(os.path.join(share, "WMRPCPROBE.ELF")))
+PY
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOTABAPP.ELF")
+if not os.path.exists(src):
+    sys.exit("GOTABAPP.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-tabapp.sh")
+shutil.copy(src, os.path.join(share, "GOTABAPP.ELF"))
+print("staged GOTABAPP.ELF into share (%d bytes)" %
+      os.path.getsize(os.path.join(share, "GOTABAPP.ELF")))
 PY
 
 vgate_run 01 -- \
@@ -1842,3 +1864,134 @@ vgate_assert 11 serial-contains 'gotabwm: rpc refuse id='
 vgate_assert 11 serial-absent 'wmrpcprobe: FAIL'
 vgate_assert 11 serial-absent '[EXC] parking:'
 vgate_assert 11 serial-absent 'exited status=139'
+
+
+# ---------------------------------------------------------------------------
+# Run 12 (M125a / #2586): save_state on the snapshot chord — the app's blob
+# lands in SESSION.TABS's app_state trailer. GOTABAPP.ELF is the protocol's
+# live client: the seat posts the kind-20 notice, the app publishes
+# `u8 appver | u32 len | blob` at /host/APPSTATE.<id>, posts the request, and
+# the seat validates, stores, deletes the staging file and republishes the
+# session. The file's trailer is asserted byte-level: `AS` magic, section ver
+# 1, one entry {index, appver=1, len=30, the demo's literal bytes}.
+
+vgate_file script-12.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-12.txt <<'EOF'
+dui focus 0
+exec GOTABAPP.ELF
+EOF
+
+vgate_file script3-12.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-state-save-ok
+EOF
+
+vgate_run 12 -- \
+    --screen '$RUN_DIR/screen-12' \
+    --via-virtio \
+    --script '$RUN_DIR/script-12.txt' \
+    --script2 '$RUN_DIR/script2-12.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-shift-s' \
+    --input-chords-after 'gotabapp: present' \
+    --script3 '$RUN_DIR/script3-12.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-gotabwm-state-save-ok' --timeout 300
+
+vgate_assert 12 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 12 serial-contains 'gotabwm: registered'
+vgate_assert 12 serial-contains 'exec: loaded GOTABAPP.ELF'
+vgate_assert 12 serial-contains 'gotabapp: declare accepted'
+# A fresh tab honestly has no stored state — the restore request is the
+# honest empty answer, never a fabricated blob.
+vgate_assert 12 serial-absent 'gotabapp: state restored'
+vgate_assert 12 serial-absent 'gotabapp: state mismatch'
+# The snapshot chord asked the bound tab; the app staged 30 bytes at appver
+# 1 and the seat stored them (and republished the session carrying them).
+vgate_assert 12 serial-contains 'gotabwm: state ask id='
+vgate_assert 12 serial-contains 'gotabwm: state save id='
+vgate_assert 12 serial-contains 'len=30 ver=1'
+vgate_assert 12 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 12 serial-absent 'gotabwm: state drop'
+# Byte-level on the share: the .tabs v2 trailer framing and the demo's
+# literal blob — byte identity is the card's claim, not a checksum.
+vgate_assert 12 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] != 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (b[0], b[2]))
+off = 6 + 69
+if len(b) < off + 6 + 8 + 30:
+    sys.exit("SESSION.TABS too short for a state trailer: %d" % len(b))
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 1:
+    sys.exit("app_state header %r" % b[off:off+6])
+ent = b[off+6:off+14]
+if ent[0] != 0 or ent[1] != 1:
+    sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
+ln = int.from_bytes(ent[4:8], "little")
+blob = b[off+14:off+14+ln]
+if blob != b"gotabapp state v1: hello strip":
+    sys.exit("blob %r is not the demo's bytes" % blob)
+print("SESSION.TABS app_state: idx=0 appver=1 len=%d blob=%r" % (ln, blob))
+PY
+vgate_assert 12 serial-contains 'rx-gotabwm-state-save-ok'
+vgate_assert 12 serial-absent '[EXC] parking:'
+vgate_assert 12 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 13 (M125a / #2586): the restore half — a FRESH boot loads the file run
+# 12 left, re-execs GOTABAPP.ELF, the app's restore_state request gets the
+# blob back byte-intact and its own callback says so.
+
+vgate_file script-13.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-13.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-13.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-state-restore-ok
+EOF
+
+vgate_run 13 -- \
+    --screen '$RUN_DIR/screen-13' \
+    --via-virtio \
+    --script '$RUN_DIR/script-13.txt' \
+    --script2 '$RUN_DIR/script2-13.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-13.txt' \
+    --script3-after 'gotabapp: state restored' \
+    --script-expect 'rx-gotabwm-state-restore-ok' --timeout 300
+
+vgate_assert 13 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 13 serial-contains 'gotabwm: registered'
+vgate_assert 13 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 13 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 13 serial-contains 'gotabwm: session exec GOTABAPP.ELF'
+vgate_assert 13 serial-contains 'gotabwm: session live n=1'
+# The seat staged the stored blob for the re-exec'd tab and the app's own
+# RestoreState verified it byte-for-byte — the full seat leg.
+vgate_assert 13 serial-contains 'gotabwm: state restore id='
+vgate_assert 13 serial-contains 'len=30 ver=1'
+vgate_assert 13 serial-contains 'gotabapp: state restored len=30'
+vgate_assert 13 serial-absent 'gotabapp: state mismatch'
+vgate_assert 13 serial-absent 'gotabwm: state drop'
+vgate_assert 13 serial-contains 'rx-gotabwm-state-restore-ok'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 serial-absent 'exited status=139'

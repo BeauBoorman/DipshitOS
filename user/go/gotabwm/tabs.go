@@ -69,6 +69,13 @@ type Tab struct {
 	// has no frozen check anywhere in its close path, so GOTABWM refuses
 	// nothing on a frozen tab either. The badge just rides the rail.
 	Frozen bool
+	// M125a (#2586): the app's serialized state — a blob the seat asked
+	// for (or the app pushed) and stores verbatim, at most vi.AppStateMax
+	// bytes, tagged with the app's own format version. It rides the Tab
+	// value like navHist does, so a reorder, a pin, or a re-exec adoption
+	// carries it for free, and a close carries it into the reopen LIFO.
+	State    []byte
+	StateVer uint8
 }
 
 // TabStrip is the in-process tab list. The zero value is empty (unsplit).
@@ -102,10 +109,16 @@ type TabStrip struct {
 }
 
 // ClosedTab is one reopen-LIFO entry: the executable and title recorded when
-// the tab closed. Zig tabwm.ClosedTab minus the window id.
+// the tab closed. Zig tabwm.ClosedTab minus the window id. M125a (#2586):
+// the entry also carries the blob the seat collected at close — ctrl-shift-t
+// then redelivers it to the re-exec'd app through restore_state.
 type ClosedTab struct {
 	Bin   string
 	Title string
+	// M125a (#2586): the state captured by the close-time save ask. Empty
+	// when the app held none or never answered.
+	State    []byte
+	StateVer uint8
 }
 
 // The tab-strip marker lines the class-B gate greps. Exported so tabs_test.go
@@ -156,6 +169,15 @@ const (
 	MarkerNavPoll    = "gotabwm: nav poll id="
 	MarkerNavBack    = "gotabwm: nav back id="
 	MarkerNavForward = "gotabwm: nav forward id="
+	// M125a (#2586): the per-app state protocol. `ask` is the seat's
+	// notice to one bound tab (snapshot/close); `save` is the app's
+	// stored answer; `restore` is the blob staged back for a re-exec'd
+	// or reopened tab; `drop` names a blob refused — oversized, malformed
+	// staging, an index outside the records, or the file cap.
+	MarkerStateAsk     = "gotabwm: state ask id="
+	MarkerStateSave    = "gotabwm: state save id="
+	MarkerStateRestore = "gotabwm: state restore id="
+	MarkerStateDrop    = "gotabwm: state drop "
 )
 
 // M79e (#1708): the nav-history bounds, taken from Zig's tabwm rather than
@@ -235,6 +257,10 @@ func guessBin(title string) string {
 		return "NOTE.ELF"
 	case "Edit":
 		return "GOEDIT.ELF"
+	case "GoTabApp":
+		// The M56d tabapp demo's declared title — the M125a spec leg's
+		// client, so its restore row must name the real binary.
+		return "GOTABAPP.ELF"
 	case "Term":
 		return "GOTERM.ELF"
 	case "RSS Reader":
@@ -314,6 +340,25 @@ func (s *TabStrip) SetTitle(id uint32, title string) bool {
 		return false
 	}
 	s.tabs[i].Title = title
+	return true
+}
+
+// SetState stores the app's serialized blob on id (M125a, #2586). An empty
+// or oversized blob CLEARS the slot rather than being stored: the seat
+// never keeps a blob it would later refuse, and an empty answer is the
+// app's own "no state". False only when id is not on the strip.
+func (s *TabStrip) SetState(id uint32, ver uint8, blob []byte) bool {
+	i := s.index(id)
+	if i < 0 {
+		return false
+	}
+	if len(blob) == 0 || len(blob) > stateMaxBytes {
+		s.tabs[i].State = nil
+		s.tabs[i].StateVer = 0
+		return true
+	}
+	s.tabs[i].State = append([]byte(nil), blob...)
+	s.tabs[i].StateVer = ver
 	return true
 }
 
@@ -488,7 +533,10 @@ func (s *TabStrip) CloseTab(id uint32) bool {
 // recordClosed pushes t onto the bounded reopen LIFO. Bounded: at most MaxTabs
 // entries are live and the oldest is overwritten (D2).
 func (s *TabStrip) recordClosed(t Tab) {
-	s.closed[s.closedCount%MaxTabs] = ClosedTab{Bin: t.Bin, Title: t.Title}
+	s.closed[s.closedCount%MaxTabs] = ClosedTab{
+		Bin: t.Bin, Title: t.Title,
+		State: t.State, StateVer: t.StateVer,
+	}
 	s.closedCount++
 	if s.closedLive < MaxTabs {
 		s.closedLive++

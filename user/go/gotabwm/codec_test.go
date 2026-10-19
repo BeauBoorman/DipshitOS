@@ -60,7 +60,7 @@ func TestSessionRoundTripTabcodec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tabcodec.Encode: %v", err)
 	}
-	got, ok := s.encodeTabsV2(1)
+	got, _, ok := s.encodeTabsV2(1)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
@@ -91,7 +91,7 @@ func TestSessionRoundTripTabcodec(t *testing.T) {
 
 func TestApplyStateRestoresTitlesPinActive(t *testing.T) {
 	s := pinnedCalcNotepad(t)
-	raw, ok := s.encodeTabsV2(7)
+	raw, _, ok := s.encodeTabsV2(7)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
@@ -136,7 +136,7 @@ func TestApplyPreservesEmptyBin(t *testing.T) {
 	if s.At(0).Bin != "" {
 		t.Fatalf("empty bin became %q (must not guessBin on restore)", s.At(0).Bin)
 	}
-	out, ok := s.encodeTabsV2(0)
+	out, _, ok := s.encodeTabsV2(0)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
@@ -170,7 +170,7 @@ func TestFrozenBadgeRoundTripsTabcodec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tabcodec.Encode: %v", err)
 	}
-	got, ok := s.encodeTabsV2(1)
+	got, _, ok := s.encodeTabsV2(1)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}
@@ -211,7 +211,7 @@ func TestFrozenBadgeRoundTripsTabcodec(t *testing.T) {
 		t.Fatalf("FrozenCount = %d want 1", n)
 	}
 	// A re-encode reproduces the same flag byte (the round-trip is lossless).
-	out, ok := restored.encodeTabsV2(0)
+	out, _, ok := restored.encodeTabsV2(0)
 	if !ok {
 		t.Fatal("re-encode")
 	}
@@ -239,7 +239,7 @@ func TestCorruptSessionFailsClosed(t *testing.T) {
 		if !errors.Is(err, tabcodec.ErrCorrupt) {
 			t.Fatalf("case %d: Decode %v, want ErrCorrupt", i, err)
 		}
-		_, _, _, _, ok := decodeTabsV2(raw)
+		_, _, _, _, _, ok := decodeTabsV2(raw)
 		if ok {
 			t.Fatalf("case %d: guest decode accepted corrupt bytes", i)
 		}

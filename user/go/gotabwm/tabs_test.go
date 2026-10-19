@@ -82,7 +82,7 @@ func TestSetTitlePreservesBinAndSession(t *testing.T) {
 		t.Fatal("SetTitle accepted an empty title")
 	}
 
-	raw, ok := live.encodeTabsV2(1)
+	raw, _, ok := live.encodeTabsV2(1)
 	if !ok {
 		t.Fatal("encodeTabsV2")
 	}

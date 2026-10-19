@@ -118,6 +118,8 @@ func (s *TabStrip) sessionRows() TabStrip {
 		out.tabs[j].Bin = t0.Bin
 		out.tabs[j].Pinned = t0.Pinned
 		out.tabs[j].Frozen = t0.Frozen
+		out.tabs[j].State = t0.State
+		out.tabs[j].StateVer = t0.StateVer
 	}
 	out.focus = -1 // set AFTER the loop: OpenTab focuses the first row
 	if has {
@@ -150,10 +152,13 @@ func writeSession() bool {
 	if live.count == 0 {
 		return false
 	}
-	raw, ok := live.encodeTabsV2(sessionSeq)
+	raw, dropped, ok := live.encodeTabsV2(sessionSeq)
 	if !ok {
 		vi.ConsoleLine("gotabwm: session write fail")
 		return false
+	}
+	for _, d := range dropped {
+		vi.ConsoleLine(MarkerStateDrop + d + " full")
 	}
 	if !writeHostFile(sessionPath, raw) {
 		vi.ConsoleLine("gotabwm: session write fail")

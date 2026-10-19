@@ -27,11 +27,24 @@ import (
 
 // Config opens/starts a tab app. Name is THIS process's own executable name
 // (the WM ack-routing needs it); Title is the tab title.
+//
+// M125a (#2586): the state hooks. The app owns the serialized format; the
+// seat owns the lifecycle. SaveState is called whenever the seat asks the
+// tab to serialize (snapshot and tab close); its bytes — at most 64 KiB —
+// are stored verbatim. RestoreState is called during Init when the seat
+// held a blob for this tab (a re-exec'd session row, a reopened close):
+// it gets the stored bytes back byte-intact plus the tag they were saved
+// under. StateVersion tags every saved envelope so a stale serialization
+// is refused by the app's own check, never silently misread.
 type Config struct {
 	Name  string
 	Title string
 	X, Y  uint32
 	W, H  uint32
+
+	SaveState    func() []byte
+	RestoreState func([]byte)
+	StateVersion uint8
 }
 
 // Action is what Dispatch decided the app should do with an event.
@@ -57,6 +70,19 @@ type TabApp struct {
 	Title    string
 	TabAware bool
 	OpenOK   bool
+
+	// M125a (#2586): the state protocol's app side. The hooks are copied
+	// from Config; the event loop calls PollStateAsk once per pass so a
+	// seat ask gets answered inside the app's own slice.
+	SaveState    func() []byte
+	RestoreState func([]byte)
+	StateVersion uint8
+	// Restored reports that Init delivered a stored blob, and
+	// RestoredVersion is the tag it was saved under — the app's check
+	// for a stale serialization (it owns the format; the seat only
+	// carried the bytes).
+	Restored        bool
+	RestoredVersion uint8
 
 	// surf is the bound M33 window surface — the shared pages the depth
 	// engine paints and the compositor reads — nil when the bind refused
@@ -96,6 +122,19 @@ func Init(cfg Config) *TabApp {
 	// reorder a peer's tab ahead of this one.
 	ta.TabAware = vi.DeclareFullscreen(uint32(win), cfg.Title, cfg.Name)
 	ta.bindSurface()
+	// M125a (#2586): a re-exec'd or reopened tab may have a stored blob
+	// waiting. Ask for it before the app starts drawing so the restore
+	// lands in the same boot slice; no blob is just "start fresh".
+	ta.SaveState = cfg.SaveState
+	ta.RestoreState = cfg.RestoreState
+	ta.StateVersion = cfg.StateVersion
+	if ta.RestoreState != nil {
+		if v, blob, ok := vi.RequestStateRestore(uint32(win), cfg.Name); ok {
+			ta.Restored = true
+			ta.RestoredVersion = v
+			ta.RestoreState(blob)
+		}
+	}
 	return ta
 }
 
@@ -267,6 +306,35 @@ func (t *TabApp) SetTabTitle(title string) bool {
 // rather than assume the user was told.
 func (t *TabApp) Notify(text string) bool {
 	return vi.Notify(uint32(t.Win), text, t.Name)
+}
+
+// PollStateAsk answers the seat's save notice when one is waiting (M125a,
+// #2586): SaveState() is staged through the rendezvous file and the
+// kind-20 request posts the handoff. Call it once per event-loop pass —
+// the same discipline as PollNav/PollSettingChanged. An app with no
+// SaveState still answers (an empty blob is "no state"), so the seat's
+// bounded collect drains deterministically instead of burning its ask
+// budget on silence. False means no ask was waiting (or the handoff was
+// refused); true means the seat stored the answer.
+func (t *TabApp) PollStateAsk() bool {
+	if !vi.PollStateAsk(uint32(t.Win)) {
+		return false
+	}
+	var blob []byte
+	if t.SaveState != nil {
+		blob = t.SaveState()
+	}
+	return vi.PostStateSave(uint32(t.Win), t.StateVersion, blob, t.Name)
+}
+
+// SaveStateNow pushes an unsolicited save: the app's own state moved, so
+// it stages the blob and posts the request without waiting for an ask.
+func (t *TabApp) SaveStateNow() bool {
+	var blob []byte
+	if t.SaveState != nil {
+		blob = t.SaveState()
+	}
+	return vi.PostStateSave(uint32(t.Win), t.StateVersion, blob, t.Name)
 }
 
 // Scale maps r from a fromW x fromH canvas into toW x toH (integer math,

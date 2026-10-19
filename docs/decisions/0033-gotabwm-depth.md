@@ -97,3 +97,41 @@ No new `GOWM`. No shm proto. No Go GPU flush. No `/dev/tty` rewrite. No
 deleting `TABWM.BIN` / `NOTEPAD.BIN` / `SH.BIN` / `FETCHS.BIN` /
 `SSH.BIN`. No touching `user/go/ttf/**` (#1369) or kernel uaccess. No
 page-table teardown card.
+
+## Amendment (M125a, #2586): the per-app `app_state` protocol
+
+**D7. Blob transport is a staged share file, not the wire.** WM_RPC frames
+are 38 bytes inside a 64-byte mailbox slot and a blob is up to 64 KiB, so
+new request kinds `save_state` (20) and `restore_state` (21) carry only
+the rendezvous. The envelope — `u8 appver | u32 len LE | blob` — is
+published crash-safe at `/host/APPSTATE.<id>` by whichever side sends the
+blob and deleted by the receiver. Consume-on-use is deliberate: a staging
+file is a handoff, never storage, so a stale blob can never be delivered
+twice or inherited by a window id reuse. The kernel's shared-region seam
+was considered first and rejected: only the registered WM may peer-map,
+and peers are read-only — it can carry app→seat but never seat→app.
+
+**D8. Apps own the format; the seat owns the lifecycle.** `appver` is the
+application's own serialization tag, stored and returned verbatim so a
+stale serialization is refused by the app's check, not the seat's. The
+seat asks (async kind-20 notice, session-token-authenticated like a
+settings notice) at exactly the lifecycle points the card pins — snapshot
+and tab close — and drains answers inside a bounded collect of `serviceRPC`
++ `Yield` rounds. A silent app costs the budget once and keeps whatever
+it last stored; the seat never wedges.
+
+**D9. `.tabs` v2 gains an `AS` trailer section**, not a new record field:
+after the count fixed records, `u8 'A' u8 'S' | u8 ver(1) | u8 count |
+u16 reserved`, then per entry `u8 index | u8 appver | u16 reserved |
+u32 len | blob`. `index` binds the blob to the file's own record, so
+nothing outside the file can misattach state to the wrong tab. A blob
+over `AppStateMax` (64 KiB), an orphan index, or a truncated entry is
+dropped BY NAME on the `state drop` marker — the record keeps its row and
+its siblings still parse. The whole file stays under 96 KiB: below the
+share reader's 256 KiB ceiling and the snapshot bundle's 128 KiB entry
+cap, so a session with blobs still loads whole and still bundles.
+
+**D10. Close re-delivers.** A closed tab's blob rides the reopen LIFO
+(`ClosedTab`); ctrl-shift-t stages it on the exec'd pid — pid-matched
+like M120b's `reexecWait` — and the declaring app adopts it onto its new
+row before its `restore_state` request hands it back.
