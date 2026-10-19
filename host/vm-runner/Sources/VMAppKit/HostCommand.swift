@@ -26,6 +26,14 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case quit
     // Machine menu.
     case stop
+    // M128b (#2606): the profile manager's four verbs — the model
+    // (HostProfilesModel) self-registers in init like the recorder/
+    // agent/settings companions, so a profile-less run receipts
+    // `disabled`/`unavailable` from the action's own enablement.
+    case profileNew = "profile-new"
+    case profileClone = "profile-clone"
+    case profileResetOverlay = "profile-reset-overlay"
+    case profileSwitch = "profile-switch"
     // View menu — M114b registers the handlers.
     case fullscreen
     case captureKeys = "capture-keys"
@@ -90,7 +98,7 @@ public struct HostCommandTrigger {
 /// of silence:
 ///
 ///     host-ui: cmd=<verb> state=<outcome>
-public final class HostCommandBus: NSObject {
+public final class HostCommandBus: NSObject, NSMenuDelegate {
     /// The `state=<...>` word of a `host-ui:` receipt.
     public enum Outcome: String, Sendable {
         /// The action ran.
@@ -162,10 +170,17 @@ public final class HostCommandBus: NSObject {
     /// the identical seam. Injectable so a test owns its profile seam.
     public let settings: HostSettingsModel
 
+    /// M128b (#2606): the profile manager model — the four `profile-*`
+    /// verbs' mint/clone/reset/switch state, self-registering on the bus
+    /// like the recorder/agent/settings so a bare `HostCommandBus()` in
+    /// a scripted `--host-cmd-after` run dispatches the identical seam.
+    /// Injectable so a test owns its profile/dir/confirm seams.
+    public let profiles: HostProfilesModel
+
     private var registrations: [HostCommand: Registration] = [:]
 
     public init(emit: ((String) -> Void)? = nil, agent: HostAgentCompanion? = nil,
-                settings: HostSettingsModel? = nil) {
+                settings: HostSettingsModel? = nil, profiles: HostProfilesModel? = nil) {
         self.emit = emit ?? {
             FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
         }
@@ -173,6 +188,8 @@ public final class HostCommandBus: NSObject {
         self.agent.emit = self.emit
         self.settings = settings ?? HostSettingsModel()
         self.settings.emit = self.emit
+        self.profiles = profiles ?? HostProfilesModel()
+        self.profiles.emit = self.emit
         super.init()
         let recorder = self.recorder
         register(.record, Registration(
@@ -205,6 +222,27 @@ public final class HostCommandBus: NSObject {
             itemState: { settings.isOpen },
             receiptDetail: { settings.receiptDetail },
             action: { settings.toggle() }))
+        // M128b (#2606): the profile manager verbs — the model's own
+        // enablement gates each (armed for clone/reset/switch, a
+        // resolvable profiles dir for new), and its receipt tail carries
+        // the post-action truth.
+        let profiles = self.profiles
+        register(.profileNew, Registration(
+            isEnabled: { profiles.canCreate },
+            receiptDetail: { profiles.receiptDetail },
+            action: { profiles.newProfile() }))
+        register(.profileClone, Registration(
+            isEnabled: { profiles.armed },
+            receiptDetail: { profiles.receiptDetail },
+            action: { profiles.cloneProfile() }))
+        register(.profileResetOverlay, Registration(
+            isEnabled: { profiles.armed },
+            receiptDetail: { profiles.receiptDetail },
+            action: { profiles.resetOverlay() }))
+        register(.profileSwitch, Registration(
+            isEnabled: { profiles.canSwitch },
+            receiptDetail: { profiles.receiptDetail },
+            action: { profiles.switchProfile() }))
         // The companion's audit poll self-arms only when a share is
         // resolvable — a shareless run never schedules it (the flags-
         // off posture, host side).
@@ -242,6 +280,33 @@ public final class HostCommandBus: NSObject {
     @objc public func dispatchItem(_ item: NSMenuItem) {
         guard let command = item.representedObject as? HostCommand else { return }
         dispatch(command)
+    }
+
+    /// M128b (#2606): a "Switch To" submenu leaf carries the sibling
+    /// bundle's path in its `identifier` — dispatch sets the model's
+    /// target first so `profile-switch` acts on the item the user chose.
+    @objc public func dispatchSwitchItem(_ item: NSMenuItem) {
+        if let path = item.identifier?.rawValue {
+            profiles.switchTarget = URL(fileURLWithPath: path, isDirectory: true)
+        }
+        dispatch(.profileSwitch)
+    }
+
+    /// M128b (#2606): the "Switch To" submenu rebuilds at every open —
+    /// one leaf per sibling `.virelaivm` bundle, each dispatching
+    /// `profile-switch` with its own path (the sibling set changes as
+    /// new/clone mint and as the armed bundle trades places).
+    @objc public func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for target in profiles.switchTargets {
+            let item = NSMenuItem(
+                title: target.deletingPathExtension().lastPathComponent,
+                action: #selector(dispatchSwitchItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = HostCommand.profileSwitch
+            item.identifier = NSUserInterfaceItemIdentifier(target.path)
+            menu.addItem(item)
+        }
     }
 
     @objc public func validateMenuItem(_ item: NSMenuItem) -> Bool {

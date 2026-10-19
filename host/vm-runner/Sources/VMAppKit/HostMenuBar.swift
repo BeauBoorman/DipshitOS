@@ -40,6 +40,24 @@ public enum HostMenuBar {
 
         let machine = menu("Machine")
         machine.addItem(action("Stop VM", .stop))
+        machine.addItem(.separator())
+        // M128b (#2606): the profile manager. New/clone mint sibling
+        // bundles next to the armed one; reset-overlay re-mints the
+        // armed bundle's overlay.asif on next boot; "Switch To" is a
+        // submenu the bus's menuNeedsUpdate repopulates per open with
+        // the sibling machines. All receipt `disabled` on a flag-run.
+        machine.addItem(action("New Machine", .profileNew))
+        machine.addItem(action("Clone This Machine", .profileClone))
+        // "Switch To" is a submenu parent — it carries the verb (so
+        // validateMenuItem greys it when no sibling exists) and the
+        // standard dispatchItem seam like every other leaf; its submenu
+        // leaves carry the per-sibling target in the item identifier.
+        let switchItem = action("Switch To", .profileSwitch)
+        let switchSub = NSMenu(title: "Switch To")
+        switchSub.delegate = bus // menuNeedsUpdate lists the siblings
+        switchItem.submenu = switchSub
+        machine.addItem(switchItem)
+        machine.addItem(action("Reset Boot Overlay…", .profileResetOverlay))
 
         let view = menu("View")
         view.addItem(action("Enter Full Screen", .fullscreen,

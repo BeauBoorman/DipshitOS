@@ -166,6 +166,8 @@ public struct VMProfile: Equatable {
         /// A write or mkdir failed (the underlying reason is carried).
         case couldNotCreate(String)
         case couldNotSave(String)
+        /// A member removal failed (the underlying reason is carried).
+        case couldNotRemove(String)
 
         public var description: String {
             switch self {
@@ -185,6 +187,8 @@ public struct VMProfile: Equatable {
                 return "could not create profile: \(s)"
             case .couldNotSave(let s):
                 return "could not save profile: \(s)"
+            case .couldNotRemove(let s):
+                return "could not remove profile member: \(s)"
             }
         }
     }
@@ -326,6 +330,56 @@ public struct VMProfile: Equatable {
         } catch {
             throw ProfileError.couldNotSave("\(error)")
         }
+    }
+
+    // MARK: - M128b (#2606): the profile-manager surgery — clone + overlay
+    // reset live at the format layer so the bundle rules (member names,
+    // manifest, fresh identity) apply identically from the menu verb and
+    // any future caller.
+
+    /// Mint a sibling bundle carrying THIS profile's config.json and a
+    /// recursive copy of its share/ — and nothing else. The clone is a NEW
+    /// machine: fresh identity (derived from `name`), fresh efi-vars/
+    /// machine-id/saved-state, NO overlay.asif (the attach point re-mints
+    /// it over the base on first boot) and NO vlfs.img (a clean test VM,
+    /// not a disk-image fork). `url` must not exist — same refusal as
+    /// `create`.
+    @discardableResult
+    public func clone(to url: URL, name: String? = nil) throws -> VMProfile {
+        let clone = try Self.create(at: url, name: name, config: config)
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: shareURL.path, isDirectory: &isDir), isDir.boolValue {
+            do {
+                for child in try fm.contentsOfDirectory(atPath: shareURL.path) {
+                    try fm.copyItem(at: shareURL.appendingPathComponent(child),
+                                    to: clone.shareURL.appendingPathComponent(child))
+                }
+            } catch {
+                // A half-cloned bundle must not survive to be adopted later —
+                // remove it and let the caller's retry mint cleanly.
+                try? fm.removeItem(at: url)
+                throw ProfileError.couldNotCreate("clone: share copy failed: \(error)")
+            }
+        }
+        return clone
+    }
+
+    /// Remove the persistent boot overlay so the next boot re-mints a fresh
+    /// ASIF layer over the read-only base (the attach point mints when
+    /// absent — the same discard --apply-update performs). Idempotent:
+    /// returns whether an overlay existed to remove. The wedged-boot safety
+    /// net — no `rm -rf`, the member URL is the format's own.
+    @discardableResult
+    public func resetOverlay() throws -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: overlayURL.path) else { return false }
+        do {
+            try fm.removeItem(at: overlayURL)
+        } catch {
+            throw ProfileError.couldNotRemove("reset-overlay: \(error)")
+        }
+        return true
     }
 
     // MARK: - machine identifier
