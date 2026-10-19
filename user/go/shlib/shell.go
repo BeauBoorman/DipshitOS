@@ -261,6 +261,19 @@ func (e *Env) Export(name string) bool {
 // List returns the table in insertion order (env/set print it).
 func (e *Env) List() []envVar { return e.vars }
 
+// Pairs renders the table as "NAME=VALUE" strings in insertion order —
+// the M125e (#2590) session-state surface: GOTERM serializes this list
+// verbatim into its saved blob and a restore Set()s each pair back. The
+// exported flag is bookkeeping nothing outside Env reads, so the wire
+// does not carry it.
+func (e *Env) Pairs() []string {
+	out := make([]string, len(e.vars))
+	for i, v := range e.vars {
+		out[i] = v.name + "=" + v.val
+	}
+	return out
+}
+
 // Job is one background child. Reaping is main-loop polling (the EL1
 // monitor's idle-path reaper shape): ReapJobs probes each live pid once
 // per shell loop tick, and fg blocks by polling between ticks — no waiter
@@ -338,6 +351,12 @@ func (s *Shell) Pwd() string {
 	}
 	return "/"
 }
+
+// Env exposes the variable table for M125e (#2590) session restore: the
+// front-end applies a serialized Pairs() list through Set — the same
+// primitive `set` uses — so a restored table is indistinguishable from
+// a typed one.
+func (s *Shell) Env() *Env { return s.env }
 
 // RunLine interprets one command line and returns (status, Action). An
 // empty or comment-only line is a no-op that leaves $? alone. The

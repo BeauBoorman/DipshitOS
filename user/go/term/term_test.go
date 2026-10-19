@@ -28,6 +28,8 @@ func TestTermMarkerShapes(t *testing.T) {
 		{markerOpenErr, "goterm: error open "},
 		{markerTtyErr, "goterm: no /dev/tty"},
 		{markerAttErr, "goterm: attach failed"},
+		{markerStateRestored, "goterm: state restored"},
+		{markerStateRefused, "goterm: state refused"},
 		{ttyPath, "/dev/tty"},
 	}
 	for _, c := range cases {
