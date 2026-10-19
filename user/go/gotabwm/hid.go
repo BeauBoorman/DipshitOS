@@ -17,6 +17,9 @@
 //	                 ctrl+shift+p)
 //	ctrl-shift-t  -> reopen the most recently closed tab (re-exec its bin)
 //	ctrl-shift-d  -> duplicate the focused tab (re-exec its bin)
+//	ctrl-shift-w  -> close the focused tab (M121b; ctrl+w stays the
+//	                 editor's kill-word)
+//	ctrl-shift-pgup/pgdn -> move the focused tab one rail cell (M121b)
 //	ctrl-shift-f  -> toggle the focused tab's frozen BADGE (M71e / #1564)
 //	ctrl-shift-v  -> split cycle none -> V -> H -> none (M79c: live mode has
 //	                 no other split entry; the choreography is demo-only)
@@ -36,7 +39,7 @@
 //
 // Markers print only after the mutation/syscall that made them true.
 // Ctrl+W is not bound (it collides with the editor — a GOSH.ELF row in the
-// registry says so).
+// registry says so); M121b's close chord rides ctrl+shift+w.
 // M79b (#1705): the rail's close-x and hover highlight live here. Hover-
 // preview stays a later card. Client-area is ignored.
 //
@@ -101,6 +104,11 @@ const (
 	hidUsageLeftBracket  uint8 = 0x2F // '['
 	hidUsageRightBracket uint8 = 0x30 // ']'
 	hidUsageTab          uint8 = 0x2B
+	// M121b (#2565): close rides ctrl+shift+w (plain ctrl+w is GOSH's
+	// kill-word); the move pair rides the editing cluster's page keys.
+	hidUsageW        uint8 = 0x1A // 'w'
+	hidUsagePageUp   uint8 = 0x4B
+	hidUsagePageDown uint8 = 0x4E
 	// M124e (#2584): the primary-paste chord is shift+insert — the card
 	// asked for ctrl+shift+v, but split-cycle owns it at this scope (M79c)
 	// and the kernel's tty path owns it at kernel-terminal scope (M73e).
@@ -230,6 +238,12 @@ func runSeatAction(action string, c chords.Chord) {
 		_ = applyReopen()
 	case "duplicate":
 		_ = applyDuplicate()
+	case "close":
+		_ = applyHidClose()
+	case "move-left":
+		_ = applyHidMove(-1)
+	case "move-right":
+		_ = applyHidMove(1)
 	case "freeze-badge":
 		_ = applyFreezeToggle()
 	case "split-cycle":
@@ -462,6 +476,37 @@ func applyDuplicate() bool {
 	}
 	vi.ConsoleLine(MarkerDuplicate + bin)
 	return true
+}
+
+// applyHidClose is the M121b (#2565) close chord: close the FOCUSED tab
+// through the same closeTabByID seam the close-x and the choreography use,
+// so `host close id=` / `tab close id=` carry exactly one shape and the
+// close lands on the reopen LIFO for ctrl+shift+t. The focused close moves
+// focus to the neighbour (M62b) and prints the focus markers itself.
+func applyHidClose() bool {
+	id, ok := tabs.Focused()
+	if !ok {
+		return false
+	}
+	return closeTabByID(id)
+}
+
+// applyHidMove is the M121b (#2565) move chord: shift the focused tab one
+// rail cell in dir through the same Reorder path the rail drag commits on
+// (applyRailReorder), so `reorder from->to`, the order dump, the session
+// write and the split re-layout are exactly one shape. An edge cell is an
+// honest no-op — no wrap, matching Zig's move_tab.
+func applyHidMove(dir int) bool {
+	id, ok := tabs.Focused()
+	if !ok {
+		return false
+	}
+	from := tabs.index(id)
+	to := from + dir
+	if to < 0 || to >= tabs.Count() {
+		return false
+	}
+	return applyRailReorder(from, to)
 }
 
 // ctrlIndex maps the USB HID number-row usages for 1..9 to rail indexes.

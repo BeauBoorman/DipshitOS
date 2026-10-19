@@ -8684,6 +8684,10 @@ enum CustomVirtioSpike {
         case "backspace": return (0, 0x2A)
         case "pageup": return (0, 0x4B)
         case "pagedown": return (0, 0x4E)
+        // M121b (#2565): the seat's tab-move chords — the ctrl-shift-<x>
+        // pattern is letters only, so the editing-cluster pair is named.
+        case "ctrl-shift-pageup": return (hidModCtrl | hidModShift, 0x4B)
+        case "ctrl-shift-pagedown": return (hidModCtrl | hidModShift, 0x4E)
         // WM2 mission-control overview (Self-hosting Lane 1, issue #707
         // card 2, port of the #971 exploration): the overview hotkey —
         // LCtrl modifier + USB HID F12 usage (0x45). The guest kind-21

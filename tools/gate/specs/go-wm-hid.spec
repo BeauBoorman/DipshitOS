@@ -72,6 +72,10 @@
 # the dead keys: GOEDIT stages an accent, shows it, and resolves it to a
 # composed letter or to literals, never dropping a key. Same two-runtime
 # boot as run 09.
+#
+# Run 16 (M121b / #2565): run 07's three-client boot driving the tab chords —
+# ctrl+shift+pageup/pagedown move the focused cell, ctrl+shift+n pins it to
+# the front, ctrl+shift+w closes it. Reopen/duplicate keep runs 04/05.
 
 # Two equal-width cells on a 1280 rail: tab 0 [0,640)=(320,10), tab 1
 # [640,1280)=(960,10). Zig's left-rail (158,70) is the wrong target.
@@ -1478,4 +1482,107 @@ for dy, bits in enumerate(rows):
     for dx in range(8):
         assert px(dx, dy) == (ink if bits & (1 << dx) else bg), "unavailable glyph mismatch"
 print("missing NOTE binary has readable unavailable reason pixels")
+PY
+
+# ---------------------------------------------------------------------------
+# Run 16 (M121b / #2565): the tab chords — move-left/right on
+# ctrl+shift+pageup/pagedown, pin on ctrl+shift+n, close on ctrl+shift+w.
+#
+# Same three-client boot as run 07: the last-declared client owns rail
+# cell 2 on arrival, so the move pair is a real two-step (2->1 then 1->2),
+# pin jumps the focused cell to the front, and ctrl+shift+w closes it --
+# pin is a partition, not a lock. Every chord lands inside the same
+# hidChordHold window run 07's pair does. Reopen and duplicate keep their
+# own boots (runs 04/05): cv-input paces one batch at 0.25 s/stroke and a
+# same-batch second re-exec chord lands before the first clone declares
+# (the run-04 transport note). The chord SPELLINGS are the card's picks
+# made against the registry, not its first proposals: ctrl+shift+p is
+# M121a's palette and plain ctrl+w is GOSH.ELF's kill-word (its app row
+# calls it "the chord the seat must never bind"), so close rides
+# ctrl+shift+w — free at every scope.
+vgate_run 16 -- \
+    --screen '$RUN_DIR/screen-16' \
+    --via-virtio \
+    --script '$RUN_DIR/script-m79f.txt' \
+    --script2 '$RUN_DIR/script2-m79f.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-shift-pageup,ctrl-shift-pagedown,ctrl-shift-n,ctrl-shift-w' \
+    --input-chords-after 'gotabwm: rail n=3' \
+    --script3 '$RUN_DIR/script3.txt' \
+    --script3-after 'wm: unregistered, shim resumed' \
+    --script-expect 'rx-gotabwm-hid-ok' --timeout 420
+
+vgate_assert 16 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 16 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 16 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 16 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 16 serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert 16 serial-contains 'gotabwm: registered'
+vgate_assert 16 serial-contains 'gotabwm: rail n=3'
+# M121b: the move pair emits the shared reorder marker, pin the pin marker,
+# close the shared host/tab close pair.
+vgate_assert 16 serial-contains 'gotabwm: reorder '
+vgate_assert 16 serial-contains 'gotabwm: pin id='
+vgate_assert 16 serial-contains 'gotabwm: host close id='
+vgate_assert 16 serial-contains 'gotabwm: tab close id='
+vgate_assert 16 serial-contains 'gotabwm: rail n=2'
+vgate_assert 16 serial-contains 'gotabwm: close'
+vgate_assert 16 serial-contains 'gotabwm OK'
+vgate_assert 16 serial-contains 'wm: unregistered, shim resumed'
+vgate_assert 16 serial-contains 'rx-gotabwm-hid-ok'
+vgate_assert 16 serial-absent '[EXC] parking:'
+vgate_assert 16 serial-absent 'exited status=139'
+vgate_assert 16 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+
+def first_after(prefix, start=0):
+    for i in range(start, len(ser)):
+        if ser[i].startswith(prefix):
+            return i
+    sys.exit("missing %s after %d" % (prefix, start))
+
+def first_match_after(rx, start):
+    for i in range(start, len(ser)):
+        m = rx.match(ser[i])
+        if m:
+            return i, m
+    sys.exit("missing /%s/ after %d" % (rx.pattern, start))
+
+rail_re = re.compile(r"^gotabwm: rail n=3 focus=(\d+)$")
+order3_re = re.compile(
+    r"^gotabwm: order ids=(\d+),(\d+),(\d+) pin=(\d),(\d),(\d) focus=(\d+)$")
+reorder_re = re.compile(r"^gotabwm: reorder (\d+)->(\d+)$")
+
+rail_i, rail_m = first_match_after(rail_re, 0)
+focus_id = rail_m.group(1)
+# No order line exists before the first chord (vf rm SESSION.TABS means no
+# restore dump), so the focused cell index is derived from the FIRST reorder
+# marker — the chord's own `reorder from->to` — not assumed to be 2.
+left_i, left_m = first_match_after(reorder_re, rail_i)
+i, j = int(left_m.group(1)), int(left_m.group(2))
+if j != i - 1 or i < 1:
+    sys.exit("move-left must be i->i-1 with i>0, got %s" % left_m.group(0))
+right_i, right_m = first_match_after(reorder_re, left_i + 1)
+if (right_m.group(1), right_m.group(2)) != (str(i - 1), str(i)):
+    sys.exit("move-right must be %d->%d, got %s" % (i - 1, i, right_m.group(0)))
+# Focus followed the moved tab back to cell i.
+back_i, back_m = first_match_after(order3_re, right_i)
+if back_m.group(7) != focus_id or list(back_m.group(1, 2, 3)).index(focus_id) != i:
+    sys.exit("after the move pair focus/order lost %s: %s" % (focus_id, back_m.group(0)))
+# Pin: the focused cell jumps to the front with its pin bit set.
+pin_i = first_after("gotabwm: pin id=" + focus_id, back_i)
+pin_o_i, pin_o = first_match_after(order3_re, pin_i)
+if pin_o.group(1) != focus_id or pin_o.group(4) != "1":
+    sys.exit("pin did not front cell %s with its bit: %s" % (focus_id, pin_o.group(0)))
+# Close: the pinned tab still closes (pin is a partition, not a lock), the
+# shared close pair names it, and the rail drops to n=2.
+host_i = first_after("gotabwm: host close id=" + focus_id, pin_i)
+close_i = first_after("gotabwm: tab close id=" + focus_id, host_i)
+rail2_i = first_after("gotabwm: rail n=2", close_i)
+if not (rail_i < left_i < right_i < pin_i < close_i < rail2_i):
+    sys.exit("chord marker chain out of order: rail@%d left@%d right@%d pin@%d close@%d n2@%d" % (
+        rail_i, left_i, right_i, pin_i, close_i, rail2_i))
+print("M121b: cell %d move %s->%s then %s->%s, pin fronted %s, close dropped to n=2" % (
+    i, left_m.group(1), left_m.group(2), right_m.group(1), right_m.group(2), focus_id))
 PY
