@@ -100,20 +100,23 @@ const (
 
 // notifyAction marks a toast whose click is a seat action, not a sender
 // focus. notifyActionNone is every ordinary notification; the crash-snap
-// offer (M125f) stages a restore, and M123a's refusal kinds run Retry /
-// Open Settings / Copy Error through refusal.go's shared dispatch.
+// offer (M125f) stages a restore, M123a's refusal kinds run Retry /
+// Open Settings / Copy Error through refusal.go's shared dispatch, and
+// M127b's drop toast opens the INBOX file its record announced.
 const (
 	notifyActionNone      uint8 = 0
 	notifyActionCrashSnap uint8 = 1
 	notifyActionRetry     uint8 = 2
 	notifyActionGrant     uint8 = 3
 	notifyActionCopy      uint8 = 4
+	notifyActionDropOpen  uint8 = 5
 )
 
 // notifyToast is one queued notification. tabID is the SENDER (the window
 // the request carried), and it is what a click focuses — not a slot index.
-// For an action toast (crashSnap) snap carries the slot name the click
-// resolves against; ordinary toasts leave it empty.
+// For an action toast snap carries the binding the click resolves against
+// (crashSnap's slot name, drop-open's announced INBOX name); ordinary
+// toasts leave it empty.
 type notifyToast struct {
 	tabID    uint32
 	text     string

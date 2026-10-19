@@ -61,6 +61,7 @@
 #
 # HOST PREREQ:
 #   bash tools/go/build-gotabwm.sh   ->  .build/go/GOTABWM.ELF
+#   bash tools/go/build-goview.sh    ->  .build/go/GOVIEW.ELF
 #   GO_BUILD_NAME=GOCOMP bash tools/go/build-go.sh user/go/compose/main.go
 
 vgate_name live-hostint "M108e #2329: standing host-integration acceptance -- all lanes + negatives (ADR 0051)"
@@ -110,6 +111,7 @@ run = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
 for name, build in (
     ("GOTABWM.ELF", "bash tools/go/build-gotabwm.sh"),
+    ("GOVIEW.ELF", "bash tools/go/build-goview.sh"),
     ("GOCOMP.ELF", "GO_BUILD_NAME=GOCOMP bash tools/go/build-go.sh user/go/compose/main.go"),
 ):
     src = os.path.join(".build", "go", name)
@@ -182,7 +184,7 @@ for off in ("off-share", "nocred-share"):
 # nocred-share deliberately omits the host-int row.
 open(os.path.join(run, "off-share", "SECRETS.TXT"), "w").write(
     "#v1\n" + "host-int\t1000\t" + KEY + "\tGOTABWM.ELF\n")
-print("staged hostint share (2 ELFs + credential + 4 refusal plants"
+print("staged hostint share (3 ELFs + credential + 4 refusal plants"
       " + 18-path drop gesture) + 2 clean shares")
 PY
 
@@ -192,7 +194,10 @@ PY
 # injects fire on the seat's armed marker; the clip burst + plants +
 # consent probe ride the clip-in apply; the final read rides clip-out.
 # The 12 s tail drains the four DROP toasts' NOTIFY_OUT emits (1/tick)
-# and the runner's 250 ms consume of them.
+# and the runner's 250 ms consume of them. M127b (V2-D4): after the last
+# DROP consumes, a pointer press on the newest toast (bottom of the
+# strip, always 692<=y<712) runs its open-drop action — mime.Open sniffs
+# /host/INBOX/D.QOI and the registry execs GOVIEW on it.
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script-seat.txt' \
@@ -221,6 +226,8 @@ vgate_run 01 -- \
     --host-drop-file '$RUN_DIR/drop-src/TAIL2.QOI' \
     --host-drop-after 'gotabwm: hostint armed' \
     --host-notify \
+    --pointer-virtio '112,702,c' \
+    --pointer-virtio-after 'gotabwm: hostint drop seq=4 name=D.QOI' \
     --script-expect 'clip: m108e-guest-copy-02' --script-expect-tail 12 --timeout 300
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
@@ -271,10 +278,14 @@ vgate_assert 01 output-contains 'host-drop: file seq=2 name=B.QOI'
 vgate_assert 01 output-contains 'host-drop: file seq=3 name=C.QOI'
 vgate_assert 01 output-contains 'host-drop: file seq=4 name=D.QOI'
 # The seat side: verified notices became the drop receipt and the
-# kind-12 toast (sender id 0 -- dismiss-only by construction).
+# kind-12 toast (sender id 0 -- the open-drop action, not a focus).
 vgate_assert 01 serial-contains 'gotabwm: hostint drop seq=1 name=A.QOI'
 vgate_assert 01 serial-contains 'gotabwm: hostint drop seq=4 name=D.QOI'
 vgate_assert 01 serial-contains 'gotabwm: notify id=0 host drop: A.QOI'
+# M127b (V2-D4): the press on the newest toast dispatched D.QOI through
+# the opens= table -- image magic named GOVIEW, the INBOX path rode argv.
+vgate_assert 01 serial-contains 'gotabwm: hostint drop-open name=D.QOI app=GOVIEW.ELF'
+vgate_assert 01 serial-contains 'gview: open id='
 # Notify-out: the drop toasts crossed back as NOTIFY_OUT records the
 # bare runner consumed as named no_bundle drops, never a claimed post.
 vgate_assert 01 serial-contains 'gotabwm: hostint notify-out seq=1'

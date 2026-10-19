@@ -130,7 +130,10 @@ PY
 # one record per tick, and the open burst rides the seq=1 consume -- the
 # file is in INBOX the moment the runner's `host-drop: file` printed, so
 # the open is never racing delivery. The 10 s tail covers the remaining
-# seat consumes.
+# seat consumes. M127b (V2-D4): after the last DROP consumes, a pointer
+# press on the newest toast (bottom of the strip, always 692<=y<712) runs
+# its open-drop action -- mime.Open sniffs /host/INBOX/DUP-2.QOI and the
+# registry execs GOVIEW on it.
 vgate_run 01 -- \
     --screen '$RUN_DIR/screen' \
     --script '$RUN_DIR/script-seat.txt' \
@@ -143,6 +146,8 @@ vgate_run 01 -- \
     --host-drop-file '$RUN_DIR/drop-src/somedir' \
     --host-drop-after 'gotabwm: hostint armed' \
     --script2 '$RUN_DIR/script-open.txt' --script2-after 'gotabwm: hostint drop seq=1 name=PHOTO.QOI' \
+    --pointer-virtio '112,702,c' \
+    --pointer-virtio-after 'gotabwm: hostint drop seq=4 name=DUP-2.QOI' \
     --script-expect 'gview: open id=' --script-expect-tail 10 --timeout 300
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
@@ -168,13 +173,16 @@ vgate_assert 01 output-contains 'host-drop: file seq=4 name=DUP-2.QOI'
 vgate_assert 01 output-contains 'host-int: refuse lane=drop reason=payload_too_large'
 vgate_assert 01 output-contains 'host-int: refuse lane=drop reason=unsupported_kind'
 # The seat side: verified notices became the drop receipt and the
-# kind-12 toast (sender id 0 -- dismiss-only by construction).
+# kind-12 toast (sender id 0 -- the open-drop action, not a focus).
 vgate_assert 01 serial-contains 'gotabwm: hostint drop seq=1 name=PHOTO.QOI'
 vgate_assert 01 serial-contains 'gotabwm: hostint drop seq=4 name=DUP-2.QOI'
 vgate_assert 01 serial-contains 'gotabwm: notify id=0 host drop: PHOTO.QOI'
 # MIME dispatch unchanged: the landed file routes to the image handler.
 vgate_assert 01 serial-contains 'gosh: open launched scheme=file target=/host/INBOX/PHOTO.QOI handler=GOVIEW.ELF'
 vgate_assert 01 serial-contains 'gview: open id='
+# M127b (V2-D4): the press on the newest toast dispatched DUP-2.QOI
+# through the opens= table -- image magic named GOVIEW, argv the path.
+vgate_assert 01 serial-contains 'gotabwm: hostint drop-open name=DUP-2.QOI app=GOVIEW.ELF'
 vgate_assert 01 serial-absent '[EXC] parking:'
 # The credential never reaches serial or runner stdout.
 vgate_assert 01 serial-absent 'dropkey0dropkey0'

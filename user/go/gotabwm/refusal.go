@@ -113,6 +113,8 @@ func refusalActionName(action uint8) string {
 		return "copy"
 	case notifyActionCrashSnap:
 		return "restore"
+	case notifyActionDropOpen:
+		return "drop-open"
 	}
 	return "none"
 }
@@ -263,6 +265,8 @@ func runNotifyAction(action uint8, payload string) {
 		refusalGrant()
 	case notifyActionCopy:
 		refusalCopy(payload)
+	case notifyActionDropOpen:
+		dropOpen(payload)
 	}
 }
 
