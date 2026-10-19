@@ -74,8 +74,10 @@
 #                                             defaults it now)
 #   bash tools/go/build-goterm.sh         ->  .build/go/GOTERM.ELF    (boot 04)
 #   bash tools/go/build-charmhello.sh     ->  .build/go/CHARMHELLO.ELF (boot 04)
-#   bash tools/go/build-files.sh          ->  .build/go/GOFILES.ELF   (boots 05/06)
+#   bash tools/go/build-files.sh          ->  .build/go/GOFILES.ELF   (boots 05/06/08)
 #   bash tools/go/build-gosound.sh        ->  .build/go/GOSOUND.ELF   (boot 07)
+#   bash tools/go/build-goedit.sh         ->  .build/go/GOEDIT.ELF    (boot 08)
+#   bash tools/go/build-goview.sh         ->  .build/go/GOVIEW.ELF    (boot 08)
 #   (the page is the pinned fixture user/go/browser/testdata/gate-page.html,
 #    staged as /host/DOGFOOD.HTML; no new fixture)
 #
@@ -150,6 +152,52 @@
 # refusal with no file: both pinned, exactly as live-sound-record does for
 # GOREC.
 #
+# M124f (#2585) adds boot 08: the cross-app data-flow journey, one boot on
+# the LIVE default seat (the demo trigger stayed removed since boot 05),
+# exercising every M124 pipe end-to-end the way a user would hit them:
+#
+#   * an EMPTY SESSION.TABS is staged on boot 07's tag asserts, so the seat
+#     restores an empty strip — no starter GOSH — and GOFILES + GOEDIT are
+#     exactly the two tabs the ctrl-shift-v split needs (SplitV refuses
+#     count!=2).
+#   * script a seeds the kernel clipboard (`clip seeded77`) before exec —
+#     GOEDIT's ctrl-v then proves the clipboard's READ direction (slots
+#     38/39, so every app here is exec'd -u0 for CAP_CLIPBOARD), and
+#     GOVIEW's 'c' later proves the typed WRITE direction
+#     (`gview: copy mime=image/png` — the M124c receipt).
+#   * ONE chords burst does the whole keyboard half while GOEDIT stays
+#     focused: ctrl-shift-v splits {GOFILES|GOEDIT} (seat-scope, focus
+#     keeps), ctrl-a selects SEL.TXT's 17 bytes (the M124e publish:
+#     `goedit: selpub` + `gotabwm: sel pub`), ctrl-v pastes the seeded
+#     clipboard over the selection, ctrl-shift-s raises the M124b shared
+#     picker seeded "SEL.TXT" — six backspaces clear it (a seventh would
+#     climb to /host), a fresh name resolves against the picker's cwd, and
+#     the save lands SAVED.TXT on the share, which GOFILES' watch feed
+#     reports (`gofiles: watch created SAVED.TXT` — the picker -> /disk ->
+#     visible-in-GOFILES leg).
+#   * ONE pointer sequence does the whole gesture half: a rail click on
+#     GOEDIT's cell pins focus (the drop hit-test resolves an overlap to
+#     the focused tab — GOFILES' live rect still spans the release point),
+#     press+held move on NOTE.TXT's row arms the M124a drag, and the
+#     release over GOEDIT's right pane drops it (`goedit: drop text/plain`
+#     + `gofiles: drag end delivered`); a rail click on GOFILES' cell then
+#     hands it the keys. NOTE: the seat's content forward does not deliver
+#     a right-button press to an SGR app (observed: only b=0/b=32 reports
+#     ever print — go-fileman's menu boot ran on the kernel desktop), so
+#     M124d is exercised through GOFILES' 'o' handler list on PIC.PNG —
+#     the same choose->launch pipe the submenu feeds — typed by
+#     --input-string after the rail click; the pick launches GOVIEW.ELF,
+#     which is also how the journey stages the image GOVIEW's 'c' then
+#     copies (--input-key 8). A run of unpressed hovers gives the boots
+#     wall-clock headroom, and the last step middle-clicks inside GOTERM's
+#     fullscreen pane delivering the published buffer (`goterm: sel-paste`
+#     -> the pasted line submits -> `goterm: line echo sel-live-ok` —
+#     M124e cross-app).
+#   * script c execs GOTERM only after `gview: copy` — an earlier declare
+#     would paint its fullscreen window over the panes mid-gesture. The run
+#     ends on `goterm: done status=0` and the cvc-snap pixel assert proves
+#     the pasted line painted real ink.
+#
 # exec-order: assert-proven -- every phase gate is anchored on guest output
 # (the seat's, an app's, or the kernel's own marker: dogfood: seat ->
 # user-el0 reaped -> gotabwm: present (the seat's own first present, reached
@@ -221,7 +269,9 @@ for name, how in (("GOTABWM.ELF", "build-gotabwm.sh"),
                   ("GOTERM.ELF", "build-goterm.sh"),
                   ("CHARMHELLO.ELF", "build-charmhello.sh"),
                   ("GOFILES.ELF", "build-files.sh"),
-                  ("GOSOUND.ELF", "build-gosound.sh")):
+                  ("GOSOUND.ELF", "build-gosound.sh"),
+                  ("GOEDIT.ELF", "build-goedit.sh"),
+                  ("GOVIEW.ELF", "build-goview.sh")):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
         sys.exit(name + " missing (expected " + src + ") - build it first: "
@@ -234,8 +284,8 @@ shutil.copy(os.path.join("user", "go", "browser", "testdata", "gate-page.html"),
 if os.path.exists(os.path.join(share, "SETTINGS.TXT")):
     sys.exit("SETTINGS.TXT already present in the share; the dogfood beat must "
              "boot with no persisted `wm`")
-print("staged GOTABWM/GOSH/NOTE/GOCALC/WEB/GOTERM/CHARMHELLO/GOFILES/GOSOUND "
-      "+ DOGFOOD.HTML from the pinned gate-page.html fixture")
+print("staged GOTABWM/GOSH/NOTE/GOCALC/WEB/GOTERM/CHARMHELLO/GOFILES/GOSOUND/"
+      "GOEDIT/GOVIEW + DOGFOOD.HTML from the pinned gate-page.html fixture")
 PY
 
 # M82d2 (#1785): boot 05's notice sender is GOFILES.ELF (its completed copy
@@ -254,6 +304,31 @@ for d in ("DIR1", "DIR2"):
 with open(os.path.join(notify, "SOURCE.TXT"), "w") as f:
     f.write("notify-policy-payload\n")
 print("staged NOTIFY/{DIR1,DIR2,SOURCE.TXT} for the M82d2 notify boots")
+PY
+
+# M124f (#2585): boot 08's FLOW tree — exactly three name-sorted files so the
+# rows the journey presses are deterministic: NOTE.TXT row 0 (the drag's
+# payload: 8 bytes so `n=` pins the splice), PIC.PNG row 1 (the Open With
+# target AND the image GOVIEW copies — the repo's 160x120 decoder fixture
+# at 420 bytes, inside the kernel clipboard's 512 bound), SEL.TXT row 2
+# (the file GOEDIT opens: its trailing newline means a primary-selection
+# paste into GOTERM's line editor SUBMITS — `goterm: line echo sel-live-ok`
+# is the end-to-end proof the bytes reached the shell).
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+flow = os.path.join(share, "FLOW")
+os.makedirs(flow, exist_ok=True)
+with open(os.path.join(flow, "NOTE.TXT"), "w") as f:
+    f.write("drag-me\n")
+with open(os.path.join(flow, "SEL.TXT"), "w") as f:
+    f.write("echo sel-live-ok\n")
+png = os.path.join("tests", "fixtures", "png", "viewer_160x120.png")
+if not os.path.exists(png):
+    sys.exit("PNG fixture missing (expected " + png + ")")
+shutil.copy(png, os.path.join(flow, "PIC.PNG"))
+print("staged FLOW/{NOTE.TXT,PIC.PNG,SEL.TXT} for the M124f journey boot")
 PY
 
 vgate_run 01 -- \
@@ -1817,4 +1892,240 @@ elif refused:
     print("record leg: host mic denied -- bounded ETIMEDOUT, no file (pass shape)")
 else:
     sys.exit("no outcome: neither a wrote receipt nor a refused marker")
+PY
+
+# Between-run cleanup for boot 08, on THIS tag's asserts: the journey wants
+# a restored-EMPTY strip (no starter GOSH) so GOFILES + GOEDIT are the only
+# two tabs the split needs — a count=0 v2 file is the same suppression
+# boots 01/02 used against M120b's re-exec.
+vgate_assert 07 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share arm?)")
+st = os.path.join(share, "SESSION.TABS")
+open(st, "wb").write(b"\x02\x00\x00\x00\x00\x00")
+print("between-run cleanup: empty SESSION.TABS for boot 08 "
+      "(restored-empty: no starter, strip starts at 0)")
+PY
+
+# ---------------------------------------------------------------------------
+# M124f (#2585): boot 08 -- the cross-app data-flow journey, one boot
+# ---------------------------------------------------------------------------
+# Phase anchors, in fire order (every anchor is a guest-printed marker):
+#
+#   dogfood: seat        script a: dui focus 0 + GOMAXPROCS + `clip seeded77`
+#                        (seeds the kernel clipboard for GOEDIT's ctrl-v) +
+#                        exec -u0 GOFILES.ELF /host/FLOW.
+#   gofiles: ready       script b: exec -u0 GOEDIT.ELF /host/FLOW/SEL.TXT —
+#                        second tab, takes focus on declare.
+#   goedit: present      --input-chords: `ctrl-shift-v,ctrl-a,ctrl-v,
+#                        ctrl-shift-s,backspace x6,S,A,V,E,D,.,T,X,T,return`.
+#                        GOEDIT stays focused through the whole burst:
+#                        split v (GOFILES left | GOEDIT right), select-all +
+#                        selpub (the M124e publish), paste the seeded 8 B
+#                        (M124c read), save-as SAVED.TXT (M124b).
+#   gotabwm: split v     --pointer-virtio: the whole gesture half —
+#                        drag NOTE.TXT onto GOEDIT's right pane (M124a);
+#                        right-click PIC.PNG -> "Open With…" -> GOVIEW.ELF
+#                        (M124d — the launched GOVIEW is the copy source);
+#                        unpressed hovers cover GOVIEW's boot + 'c' copy +
+#                        the GOTERM exec; the last step middle-clicks inside
+#                        GOTERM's fullscreen pane (M124e delivery).
+#   gview: ready         --input-string 'c' — GOVIEW just declared, so it is
+#                        focused; `gview: copy mime=image/png` is the M124c
+#                        typed write.
+#   gview: copy          script c: exec -u0 GOTERM.ELF — a declare steals
+#                        focus and paints fullscreen, so it must land only
+#                        after the copy; its tab is the middle-click target.
+#   goterm: done status=0  the run's expect AND the snapshot barrier: the
+#                        pasted line's ink is on the scanout.
+#
+# Row/cell geometry: same seat as go-drag — rail 22, hosted window starts
+# y=22, SGR row (y-22)/16+1, cell 8x16. GOFILES list rows 0/1 at y=62/78.
+# The menu anchors at the right-clicked cell (col5,row3 for a (40,78) rc):
+# plate rows 3-4, "Open With…" at row 4 (x in cols 5..17 -> 80,94), the
+# submenu at cols 18..31 row 4 (GOVIEW.ELF is the only opens=image row ->
+# 148,94).
+vgate_file script-08a.txt <<'EOF'
+dui focus 0
+set GOMAXPROCS=1
+clip seeded77
+exec -u0 GOFILES.ELF /host/FLOW
+EOF
+
+vgate_file script-08b.txt <<'EOF'
+exec -u0 GOEDIT.ELF /host/FLOW/SEL.TXT
+EOF
+
+vgate_file script-08c.txt <<'EOF'
+exec -u0 GOTERM.ELF
+EOF
+
+vgate_run 08 -- \
+    --via-virtio --cvc-snap \
+    --screen '$RUN_DIR/screen-08' \
+    --snapshot-out '$RUN_DIR/snap-08' \
+    --snapshot-after 'goterm: done status=0' \
+    --script '$RUN_DIR/script-08a.txt' \
+    --script-after 'dogfood: seat' \
+    --script2 '$RUN_DIR/script-08b.txt' \
+    --script2-after 'gofiles: ready' \
+    --input-chords 'ctrl-shift-v,ctrl-a,ctrl-v,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,S,A,V,E,D,.,T,X,T,return,ctrl-2' \
+    --input-chords-after 'goedit: present' \
+    --pointer-virtio '640,400;640,400;40,62,d;200,200;320,240;480,280;900,360,u;640,400;640,400;100,11,c;640,400;640,400;640,400;640,400;640,400;640,400;640,400;640,400,mc' \
+    --pointer-virtio-after 'gotabwm: split v' \
+    --input-string 'jo1' \
+    --input-string-after 'gotabwm: rail-click' \
+    --input-key 8 \
+    --input-key-after 'gview: ready' \
+    --script3 '$RUN_DIR/script-08c.txt' \
+    --script3-after 'gview: copy mime=image/png' \
+    --script-expect 'goterm: done status=0' --timeout 420
+
+# The LIVE default seat, restored-empty: no starter, no wm override.
+vgate_assert 08 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 08 serial-contains 'gotabwm: mode live'
+vgate_assert 08 serial-absent 'gotabwm: mode demo'
+vgate_assert 08 serial-absent 'wm: autostart tabwm'
+vgate_assert 08 serial-absent 'dogfood: gosh'
+
+# --- the seeded clipboard (script a) and the two tabs -----------------------
+vgate_assert 08 serial-contains 'clip: stored 8 bytes'
+vgate_assert 08 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 08 serial-contains 'gofiles: declare accepted'
+vgate_assert 08 serial-contains 'gofiles: list /host/FLOW n=3'
+vgate_assert 08 serial-contains 'gofiles: ready'
+vgate_assert 08 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 08 serial-contains 'goedit: read /host/FLOW/SEL.TXT n=17'
+vgate_assert 08 serial-contains 'goedit: present'
+
+# --- the chords burst: split, M124e publish, M124c read, M124b save-as ------
+vgate_assert 08 serial-contains 'gotabwm: split v'
+vgate_assert 08 serial-contains 'x=640 y=0 w=640 h=720'
+vgate_assert 08 serial-contains 'goedit: selpub n=17'
+vgate_assert 08 serial-contains 'gotabwm: sel pub id='
+vgate_assert 08 serial-contains 'goedit: paste n=8'
+vgate_assert 08 serial-contains 'goedit: pick save /host/FLOW/'
+vgate_assert 08 serial-contains 'goedit: saved /host/FLOW/'
+vgate_assert 08 serial-absent 'goedit: pick cancel'
+# The picker -> /disk -> visible-in-GOFILES leg: GOFILES' own watch feed
+# reported the new entry, and the share holds a new .TXT whose bytes are
+# the pasted buffer. The exact name is content-verified, not pinned — a
+# single dropped backspace stroke legitimately spells it differently
+# (observed SSAVED.TXT) and the pipe is the same.
+vgate_assert 08 serial-contains 'gofiles: watch created '
+vgate_assert 08 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+flow = os.path.join(share, "FLOW")
+new = [n for n in os.listdir(flow)
+       if n not in ("NOTE.TXT", "PIC.PNG", "SEL.TXT")]
+if len(new) != 1:
+    sys.exit("want exactly one new file in FLOW, got %r" % new)
+got = open(os.path.join(flow, new[0]), "rb").read()
+if got != b"seeded77":
+    sys.exit("saved %r holds %r, want the pasted seeded77" % (new[0], got))
+print("save-as verified on the share: %s == seeded77 (%d bytes)"
+      % (new[0], len(got)))
+PY
+
+# --- M124a: the drag ---------------------------------------------------------
+vgate_assert 08 serial-contains 'gofiles: drag arm NOTE.TXT text/plain len=8'
+vgate_assert 08 serial-contains 'gotabwm: drag arm id='
+vgate_assert 08 serial-contains 'gotabwm: drag over id='
+vgate_assert 08 serial-contains 'accept=1'
+vgate_assert 08 serial-contains 'gotabwm: drag drop id='
+vgate_assert 08 serial-contains ' mime=text/plain'
+vgate_assert 08 serial-contains 'goedit: drop text/plain n=8'
+vgate_assert 08 serial-contains 'gofiles: drag end delivered win='
+vgate_assert 08 serial-absent 'gotabwm: drag refuse'
+vgate_assert 08 serial-absent 'gotabwm: drag cancel'
+vgate_assert 08 serial-absent 'gofiles: drag refused'
+
+# --- M124d: Open With -> GOVIEW.ELF (the 'o' handler list) -------------------
+vgate_assert 08 serial-contains 'gofiles: open with PIC.PNG type=image candidates=1'
+vgate_assert 08 serial-contains 'gofiles: open chose PIC.PNG type=image handler=GOVIEW.ELF'
+vgate_assert 08 serial-contains 'gofiles: open launched PIC.PNG handler=GOVIEW.ELF pid='
+vgate_assert 08 serial-absent 'gofiles: open launch refused'
+vgate_assert 08 serial-contains 'gview: loaded PIC.PNG 160x120'
+vgate_assert 08 serial-contains 'gview: ready'
+
+# --- M124c: the typed write --------------------------------------------------
+vgate_assert 08 serial-contains 'gview: copy mime=image/png n=420'
+vgate_assert 08 serial-absent 'gview: copy refuse'
+
+# --- M124e: publish -> middle-click -> GOTERM consumes -----------------------
+vgate_assert 08 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 08 serial-contains 'goterm: ready'
+vgate_assert 08 serial-contains 'gotabwm: sel paste id='
+vgate_assert 08 serial-contains 'goterm: sel-paste n=17'
+vgate_assert 08 serial-contains 'goterm: line echo sel-live-ok'
+vgate_assert 08 serial-contains 'goterm: done status=0'
+# Four tabs on the one strip over the boot: GOFILES, GOEDIT, GOVIEW, GOTERM.
+vgate_assert 08 serial-count 'gotabwm: tab open id=' 4
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 serial-absent 'exited status=139'
+
+# The journey as ONE ordered chain — each marker located strictly after the
+# one before it, so no leg can pass on a stale or reordered log.
+vgate_assert 08 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+def at(sub, start=0):
+    i = ser.find(sub, start)
+    if i < 0:
+        sys.exit("missing %r (after %d)" % (sub, start))
+    return i
+i_seat = at("dogfood: seat")
+i_clip = at("clip: stored 8 bytes", i_seat)
+i_gf = at("gofiles: ready", i_clip)
+i_ge = at("goedit: read /host/FLOW/SEL.TXT n=17", i_gf)
+i_split = at("gotabwm: split v", i_ge)
+i_pub = at("gotabwm: sel pub id=", i_split)
+i_paste = at("goedit: paste n=8", i_pub)
+i_save = at("goedit: saved /host/FLOW/", i_paste)
+i_arm = at("gotabwm: drag arm id=", i_save)
+i_rcpt = at("gofiles: drag end delivered", i_arm)
+i_drop = at("goedit: drop text/plain n=8", i_rcpt)
+i_menu = at("gofiles: open with PIC.PNG", i_drop)
+i_launch = at("gofiles: open launched PIC.PNG handler=GOVIEW.ELF", i_menu)
+i_gv = at("gview: ready", i_launch)
+i_copy = at("gview: copy mime=image/png", i_gv)
+i_term = at("goterm: ready", i_copy)
+i_sp = at("goterm: sel-paste n=17", i_term)
+i_echo = at("goterm: line echo sel-live-ok", i_sp)
+i_done = at("goterm: done status=0", i_echo)
+i_watch = at("gofiles: watch created ", i_save)
+print("M124f journey chain OK: seat -> clip-seed -> gofiles -> goedit -> "
+      "split -> selpub -> paste -> saved -> drag-arm -> drop -> delivered -> "
+      "openwith -> launched -> gview -> copy -> goterm -> sel-paste -> "
+      "echo -> done (watch@%d)" % i_watch)
+PY
+
+# THE pixel proof: GOTERM's own scanout at the moment the pasted command
+# finished — the terminal's green text (the echoed line and its output)
+# painted real ink in the window's first grid rows. Same palette rule as
+# boot 03's pin: count only GREEN-dominant pixels so a painted ghost or
+# plate cannot pass by accident. BGRX raw, 1280x720.
+vgate_assert 08 snapshot 'snap-08-*.raw' <<'PY'
+import sys
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])
+green = 0
+for y in range(16, 112):
+    for x in range(0, 640):
+        r, g, b = px(x, y)
+        if g > r + 30 and g > b + 30:
+            green += 1
+print("terminal-green pixels in GOTERM's first grid rows: %d" % green)
+assert green >= 50, ("the pasted line painted no terminal ink (%d green px) "
+                     "- the sel-paste->echo chain is not on the scanout" % green)
 PY
