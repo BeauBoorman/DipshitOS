@@ -24,7 +24,8 @@ import "virelai/shlib"
 //
 //	0..3    magic  "VHI1"
 //	4       tag    u8: 0=ARMED 1=CLIP_OUT 2=CLIP_IN 3=NOTIFY_OUT 4=DROP
-//	               5=OUTBOX 6=NOTIFY_FOCUS (v2)
+//	               5=OUTBOX 6=NOTIFY_FOCUS (v2) 7=CLIP_OUT_T 8=CLIP_IN_T
+//	               (M124c typed clipboard)
 //	5       flags  u8: bit0 TRUNCATED; bits 1-7 reserved (writer sends 0)
 //	6..7    sender_id u16le — the kernel window id the record is about;
 //	        v1 wrote reserved zeros, so v1 records carry 0 here and a v1
@@ -65,12 +66,53 @@ const (
 	TagDrop        uint8 = 4 // h→g runner → seat: [name_len u8][name][size u64le]
 	TagOutbox      uint8 = 5 // g→h seat → runner: the DROP shape, reversed (v2)
 	TagNotifyFocus uint8 = 6 // h→g runner → seat: plen MUST be 0 (v2)
-	tagCount             = 7
+	// M124c (#2582): the typed clip tags. Tags 1/2 still carry raw UTF-8
+	// text — a record shape an un-upgraded reader can pin — while 7/8
+	// carry the typed envelope `u8 mime_len | mime | blob`. Dedicated
+	// tags, not an in-band marker: a text payload can never be mistaken
+	// for an envelope because the tag, not a magic prefix, names the
+	// shape (the same call ParseName already makes per file).
+	TagClipOutT uint8 = 7 // g→h seat → runner: mime_len|mime|blob
+	TagClipInT  uint8 = 8 // h→g runner → seat: mime_len|mime|blob
+	tagCount           = 9
 )
 
 // FlagTruncated is the record flags bit0: the producer cut the payload at
 // the 512 bound and said so (truncation is honest, never silent).
 const FlagTruncated uint8 = 0x01
+
+// TypedClipMaxMime bounds the typed envelope's mime field: 24, the same
+// title budget the drag arm lives inside — a type too wide for a frame
+// title is too wide for the clipboard too.
+const TypedClipMaxMime = 24
+
+// EncodeTypedClip frames a typed clip payload: `u8 mime_len | mime |
+// blob`. nil when the mime is empty or wider than the bound, or the total
+// cannot ride a record — the caller refuses rather than emit a body the
+// other end must drop.
+func EncodeTypedClip(mime string, blob []byte) []byte {
+	if len(mime) == 0 || len(mime) > TypedClipMaxMime || 1+len(mime)+len(blob) > PayloadMax {
+		return nil
+	}
+	out := make([]byte, 1+len(mime)+len(blob))
+	out[0] = byte(len(mime))
+	copy(out[1:], mime)
+	copy(out[1+len(mime):], blob)
+	return out
+}
+
+// DecodeTypedClip is the total inverse: a mime_len that cannot fit the
+// body is a bad record, not a truncated mime.
+func DecodeTypedClip(payload []byte) (mime string, blob []byte, ok bool) {
+	if len(payload) < 2 {
+		return "", nil, false
+	}
+	ml := int(payload[0])
+	if ml == 0 || ml > TypedClipMaxMime || len(payload) <= 1+ml {
+		return "", nil, false
+	}
+	return string(payload[1 : 1+ml]), payload[1+ml:], true
+}
 
 // ARMED lane_mask bits — the runner names every lane its flags enabled.
 // NOTIFY_FOCUS rides lane_notify: both directions of a lane share one
@@ -128,6 +170,10 @@ func tagStem(tag uint8) string {
 		return "OUTBOX"
 	case TagNotifyFocus:
 		return "NFOCUS"
+	case TagClipOutT:
+		return "CLIPTOUT"
+	case TagClipInT:
+		return "CLIPTIN"
 	}
 	return ""
 }
@@ -149,6 +195,10 @@ func stemTag(stem string) (uint8, bool) {
 		return TagOutbox, true
 	case "NFOCUS":
 		return TagNotifyFocus, true
+	case "CLIPTOUT":
+		return TagClipOutT, true
+	case "CLIPTIN":
+		return TagClipInT, true
 	}
 	return 0, false
 }
@@ -161,7 +211,7 @@ func LaneName(tag uint8) string {
 	switch tag {
 	case TagArmed:
 		return "dirlist"
-	case TagClipIn, TagClipOut:
+	case TagClipIn, TagClipOut, TagClipInT, TagClipOutT:
 		return "clip"
 	case TagDrop:
 		return "drop"
@@ -177,7 +227,7 @@ func LaneName(tag uint8) string {
 // one bit — clip is one lane). ARMED itself has none: 0.
 func LaneBit(tag uint8) uint8 {
 	switch tag {
-	case TagClipIn, TagClipOut:
+	case TagClipIn, TagClipOut, TagClipInT, TagClipOutT:
 		return LaneClip
 	case TagDrop:
 		return LaneDrop

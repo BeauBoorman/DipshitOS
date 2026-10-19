@@ -216,7 +216,7 @@ func (e *Engine) Poll() {
 			e.mask = rec.Payload[0]
 			e.del(name)
 			e.laneLog(e.Marker + " armed epoch=" + itoa(int64(rec.Epoch)) + " lanes=" + MaskNames(e.mask))
-		case TagClipIn, TagDrop, TagNotifyFocus:
+		case TagClipIn, TagClipInT, TagDrop, TagNotifyFocus:
 			// Seat-consumed h→g tags. The mask bit is the consent posture:
 			// a signed record for a lane the runner did not arm is a
 			// consent_denied, per the ADR's reason mapping.

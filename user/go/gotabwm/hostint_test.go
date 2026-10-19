@@ -263,6 +263,85 @@ func TestHostintClipOutBackpressuredRetries(t *testing.T) {
 	}
 }
 
+// M124c: a typed buffer crosses on the dedicated tag with the envelope —
+// and the badge takes the type suffix off the same classification.
+func TestHostintClipOutTyped(t *testing.T) {
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(9, hostint.LaneClip)
+	hostintSeatTick()
+
+	png := []byte("\x89PNG\r\n\x1a\nfakebody")
+	f.clip = png
+	hostintSeatTick()
+	var typed [][]byte
+	for name, b := range f.files {
+		if strings.HasPrefix(name, "CLIPTOUT-") {
+			if rec, ok := hostint.DecodeRecord(b); ok {
+				typed = append(typed, rec.Payload)
+			}
+		}
+	}
+	if len(typed) != 1 {
+		t.Fatalf("CLIPTOUT records = %d want 1 (files %v)", len(typed), f.files)
+	}
+	mime, blob, ok := hostint.DecodeTypedClip(typed[0])
+	if !ok || mime != "image/png" || string(blob) != string(png) {
+		t.Fatalf("typed envelope = %q %q %v", mime, blob, ok)
+	}
+	if !f.hasLog(MarkerHostintClipOutT + "seq=1 mime=image/png len=") {
+		t.Fatalf("missing typed clip-out marker: %v", f.logs)
+	}
+	if tag, _, ok := hostClipBadge(); !ok || tag != "CLIP:IMG" {
+		t.Fatalf("badge after image buffer = %q", tag)
+	}
+
+	// A uri-list badges FILE on the same rule.
+	f.clip = []byte("file:///host/NOTES.TXT")
+	hostintSeatTick()
+	if tag, _, ok := hostClipBadge(); !ok || tag != "CLIP:FILE" {
+		t.Fatalf("badge after uri-list = %q", tag)
+	}
+}
+
+// The h→g half: a verified CLIP_IN_T applies its blob through slot 38 and
+// the badge carries type + host mark. A mislabeled payload refuses
+// unsupported_kind and never touches the buffer.
+func TestHostintClipInTyped(t *testing.T) {
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(7, hostint.LaneClip)
+	hostintSeatTick()
+
+	png := []byte("\x89PNG\r\n\x1a\nfromhost")
+	f.files[hostint.RecordName(hostint.TagClipInT, 1)] = hostint.EncodeRecord(
+		f.key, hostint.TagClipInT, 0, 1, 7,
+		hostint.EncodeTypedClip("image/png", png))
+	hostintSeatTick()
+	if string(f.clip) != string(png) {
+		t.Fatalf("guest clipboard = %q", f.clip)
+	}
+	if !f.hasLog(MarkerHostintClipInT + "seq=1 mime=image/png len=") {
+		t.Fatalf("missing typed clip-in marker: %v", f.logs)
+	}
+	if tag, _, ok := hostClipBadge(); !ok || tag != "CLIP:IMG:H" {
+		t.Fatalf("badge = %q want CLIP:IMG:H", tag)
+	}
+
+	// The label must not lie about the bytes: a png-labelled text body is
+	// unsupported_kind and the buffer is untouched.
+	f.files[hostint.RecordName(hostint.TagClipInT, 2)] = hostint.EncodeRecord(
+		f.key, hostint.TagClipInT, 0, 2, 7,
+		hostint.EncodeTypedClip("image/png", []byte("not a png")))
+	hostintSeatTick()
+	if string(f.clip) != string(png) {
+		t.Fatal("mislabeled record overwrote the buffer")
+	}
+	if !f.hasLog("lane=clip reason=" + hostint.RefuseUnsupported) {
+		t.Fatalf("missing unsupported_kind: %v", f.logs)
+	}
+}
+
 func TestHostintClipOutNotText(t *testing.T) {
 	f := newHostintFixture(t, strings.Repeat("b7", 32))
 	hostintSeatInit()

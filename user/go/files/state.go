@@ -9,6 +9,7 @@ import (
 	"virelai/mime"
 	"virelai/rss/keys"
 	"virelai/vi"
+	"virelai/vsys"
 )
 
 // editMode is the model's modal state: the act prompts own the keyboard
@@ -838,6 +839,20 @@ func (m *model) yankClip(cut bool) {
 	}
 	m.emit(markerClip + verb + " " + e.NameString())
 	m.status = verb + " " + e.NameString()
+	if !cut {
+		// M124c (#2582): a copy also publishes the file's URI on the
+		// machine clipboard as text/uri-list — "copy file → paste path"
+		// — while the in-app clip keeps its own paste semantics. A cut
+		// publishes nothing: the URI would name a path about to go
+		// stale. EACCES under the seat lands on the marker like every
+		// other refused op; the local clip already succeeded.
+		n, rc := vsys.ClipboardSetTyped(vsys.ClipURIList, []byte("file://"+src))
+		if rc < 0 {
+			m.emit(markerClipSys + "rc=" + vi.Itoa64(rc))
+		} else {
+			m.emit(markerClipSys + "n=" + vi.Itoa64(int64(n)))
+		}
+	}
 }
 
 // pasteClip materializes the held file in the current directory: copy reads

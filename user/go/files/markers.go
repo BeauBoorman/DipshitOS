@@ -41,6 +41,10 @@ const (
 	markerTrashExpired  = "gofiles: trash expired "
 	markerTrashExpireNo = "gofiles: trash expiry refused "
 	markerClip          = "gofiles: clip "
+	// M124c (#2582): the machine-clipboard half of a copy — the
+	// text/uri-list publish through slot 38 (rc= names the refusal,
+	// EACCES under the seat included).
+	markerClipSys       = "gofiles: clip-sys "
 	markerPasted        = "gofiles: pasted "
 	markerPasteNo       = "gofiles: paste refused "
 	// M79k (#1720): this app is the notify adopter. The seat owns the

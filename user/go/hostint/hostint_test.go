@@ -223,6 +223,44 @@ func TestOutboxTagAndLane(t *testing.T) {
 	if got := MaskNames(LaneClip | LaneDrop | LaneNotify | LaneOutbox); got != "clip,drop,notify,outbox" {
 		t.Fatalf("MaskNames = %q", got)
 	}
+	// M124c: the typed clip tags ride the clip lane's bit + name.
+	if LaneBit(TagClipOutT) != LaneClip || LaneBit(TagClipInT) != LaneClip {
+		t.Fatal("typed clip tags must ride LaneClip")
+	}
+	if LaneName(TagClipOutT) != "clip" || LaneName(TagClipInT) != "clip" {
+		t.Fatal("typed clip refusals render lane=clip")
+	}
+}
+
+// The M124c typed envelope: `u8 mime_len | mime | blob`, bounded by the
+// record's own 512 — the mime spends payload bytes the blob then cannot.
+func TestTypedClipEnvelope(t *testing.T) {
+	enc := EncodeTypedClip("image/png", []byte("\x89PNGbody"))
+	if enc == nil {
+		t.Fatal("png envelope refused")
+	}
+	mime, blob, ok := DecodeTypedClip(enc)
+	if !ok || mime != "image/png" || string(blob) != "\x89PNGbody" {
+		t.Fatalf("roundtrip = %q %q %v", mime, blob, ok)
+	}
+	if EncodeTypedClip("", []byte("x")) != nil {
+		t.Fatal("empty mime encoded")
+	}
+	if EncodeTypedClip("this/mime-is-far-too-long", []byte("x")) != nil {
+		t.Fatal("over-bound mime encoded")
+	}
+	if EncodeTypedClip("image/png", make([]byte, PayloadMax)) != nil {
+		t.Fatal("envelope past the record bound encoded")
+	}
+	if _, _, ok := DecodeTypedClip([]byte{9, 'x'}); ok {
+		t.Fatal("short envelope decoded")
+	}
+	if _, _, ok := DecodeTypedClip([]byte{0, 'x'}); ok {
+		t.Fatal("zero mime_len decoded")
+	}
+	if _, _, ok := DecodeTypedClip(EncodeTypedClip("text/uri-list", []byte("f"))[:3]); ok {
+		t.Fatal("truncated envelope decoded")
+	}
 }
 
 // Flag bits 1-7 are reserved (the writer sends 0): the encoder refuses
@@ -253,6 +291,8 @@ func TestRecordNames(t *testing.T) {
 		{TagClipOut, 0xffffffff, "CLIPOUT-ffffffff"},
 		{TagNotifyOut, 2, "NOTIFY-00000002"},
 		{TagDrop, 10, "DROP-0000000a"},
+		{TagClipOutT, 5, "CLIPTOUT-00000005"},
+		{TagClipInT, 3, "CLIPTIN-00000003"},
 	} {
 		if got := RecordName(tc.tag, tc.seq); got != tc.want {
 			t.Fatalf("RecordName(%d,%08x) = %q want %q", tc.tag, tc.seq, got, tc.want)

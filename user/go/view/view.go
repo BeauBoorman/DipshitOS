@@ -32,6 +32,7 @@ const (
 	keyDown    = 0x51
 	keyQuitQ   = 0x14 // `q`
 	keyEscape  = 0x29
+	keyCopy    = 0x06 // `c` — M124c typed clipboard
 )
 
 // Geometry and caps, ported from view.zig: the window is sized to the image
