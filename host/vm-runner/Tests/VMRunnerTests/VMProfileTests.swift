@@ -115,6 +115,21 @@ final class VMProfileTests: XCTestCase {
                        "the machine identifier must not change across loads")
     }
 
+    /// M129a (#2610): the schema's compiled memoryMiB default is 512 —
+    /// a config.json that omits the field decodes to it, while a stored
+    /// value (a bundle minted before the bump) keeps its own number.
+    func testMemoryMiBDecodeDefault() throws {
+        XCTAssertEqual(VMProfile.Config().memoryMiB, 512)
+        let decoded = try JSONDecoder().decode(
+            VMProfile.Config.self,
+            from: Data(#"{"cpus": 2, "baseImage": "artifacts/disk.img"}"#.utf8))
+        XCTAssertEqual(decoded.memoryMiB, 512)
+        let pinned = try JSONDecoder().decode(
+            VMProfile.Config.self,
+            from: Data(#"{"cpus": 2, "memoryMiB": 256, "baseImage": "artifacts/disk.img"}"#.utf8))
+        XCTAssertEqual(pinned.memoryMiB, 256)
+    }
+
     /// Edits persist through save: a mutated config reloads identically.
     func testSavePersistsEdits() throws {
         let url = bundleURL()

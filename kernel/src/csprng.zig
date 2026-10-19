@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const spinlock = @import("spinlock.zig"); // claim 9498 follow-on: cross-core random_bytes/seed
+const userspace = @import("userspace.zig");
 
 pub const key_len: usize = 32;
 pub const nonce_len: usize = 12;
@@ -47,8 +48,11 @@ const c3: u32 = 0x6b206574;
 
 // The claim-5804 fixed user stack VA — the unseeded ASLR default (the
 // boot-time static EL0 payload's root is built before the seed, so it
-// keeps exactly this placement).
-pub const default_stack_va: u64 = 0x8000_0000;
+// keeps exactly this placement). Bound to userspace.stack_va, NOT a copy:
+// M129a (#2610) moved it above the 4 GiB blanket because VZ anchors guest
+// RAM at phys 0x7000_0000 growing upward, so a fixed VA at 0x8000_0000
+// lands on kernel-live RAM once the guest exceeds 256 MiB.
+pub const default_stack_va: u64 = userspace.stack_va;
 
 fn rotl(x: u32, n: u5) u32 {
     return (x << n) | (x >> @intCast(32 - @as(u6, n)));

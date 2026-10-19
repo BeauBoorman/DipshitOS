@@ -24,11 +24,12 @@
 # NOTE on the memory-dump form: the original design scanned this process's
 # address space for the BSS marker word on the assumption that the in-process
 # VZ guest RAM is host-mapped. That is provably false on VZ (a full
-# submap-aware walk finds no 256 MiB region; every M2_* hit is the runner's
+# submap-aware walk finds no guest-RAM region; every M2_* hit is the runner's
 # own constant array -- claim 0009). The NVRAM ladder is the working form.
 #
-# The serial channel is NOT the gate here (it is provably silent on VZ); the
-# marker channel is. Run on Apple silicon only (VZ VM).
+# The marker channel is the gate here (it brackets the boot stages even when
+# the serial channel's takeover is under test). Run on Apple silicon only
+# (VZ VM).
 #
 # Usage: bash tools/verify-marker.sh
 # Evidence saved under artifacts/: m2-marker-gate.txt (this script),

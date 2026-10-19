@@ -94,7 +94,10 @@ public struct VMProfile: Equatable {
     public struct Config: Codable, Equatable {
         /// Same bound the runner's --cpus flag enforces.
         public var cpus = 2
-        public var memoryMiB = 256
+        /// M129a (#2610): 512 MiB is the compiled schema default — a
+        /// config.json written before the bump keeps its stored value
+        /// (decodeIfPresent honors the field it carries).
+        public var memoryMiB = 512
         /// The boot base image the persistent overlay stacks on. Stored as
         /// given (typically absolute); a relative path resolves against the
         /// runner's working directory.
@@ -119,7 +122,7 @@ public struct VMProfile: Equatable {
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             cpus = try c.decodeIfPresent(Int.self, forKey: .cpus) ?? 2
-            memoryMiB = try c.decodeIfPresent(Int.self, forKey: .memoryMiB) ?? 256
+            memoryMiB = try c.decodeIfPresent(Int.self, forKey: .memoryMiB) ?? 512
             baseImage = try c.decodeIfPresent(String.self, forKey: .baseImage) ?? "artifacts/disk.img"
             updatePubkey = try c.decodeIfPresent(String.self, forKey: .updatePubkey)
             devices = try c.decodeIfPresent(Devices.self, forKey: .devices) ?? Devices()
