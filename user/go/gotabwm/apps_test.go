@@ -234,9 +234,10 @@ func TestSummarizeAppsCountsRowsAndTheHighestVersion(t *testing.T) {
 	s := SummarizeApps(parseAppsTXT(string(b)))
 	// M122c (#2572) purged the three ghost rows (GODIFF/ZC.BIN/GOSNAP — a
 	// click could only die on a usage line or a silent serial write) and
-	// M122b (#2571) added GOWELCOME, so the honest catalog is 19 rows.
-	if s.Rows != 19 {
-		t.Fatalf("rows = %d want 19 (the honest catalog)", s.Rows)
+	// M122b (#2571) added GOWELCOME; M120d (#2561) restored GOSNAP now
+	// that a bare exec opens its window — the honest catalog is 20 rows.
+	if s.Rows != 20 {
+		t.Fatalf("rows = %d want 20 (the honest catalog)", s.Rows)
 	}
 	// The receipt's headline: the manifest declares v2 rows, so a reader that
 	// ignored the tail would report v=0 and fail here.
@@ -385,6 +386,7 @@ var catalogHonesty = []struct {
 	{"GOSTORE.ELF", "window", "user/go/gostore/main.go"},
 	{"GOINFER.ELF", "window", "user/go/goinfer/view.go"},
 	{"GOREC.ELF", "window", "user/go/gorec/view.go"},
+	{"GOSNAP.ELF", "window", "user/go/gosnap/view.go"},
 	{"TABWM.BIN", "seat", ""},
 }
 

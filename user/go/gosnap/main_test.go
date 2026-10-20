@@ -254,8 +254,14 @@ func TestCtlNegativeReturnIsAnErrnoName(t *testing.T) {
 func TestUsageAndNoArgs(t *testing.T) {
 	f := &fakeEnv{}
 	f.install(t)
-	if rc := run([]string{"GOSNAP.ELF"}); rc != exitUsage {
+	// M120d: bare is the windowed face — on the host the win_open seam
+	// is -ENOSYS, so the run refuses with the open error and still
+	// prints the verbs (a serial-only caller learns the command line).
+	if rc := run([]string{"GOSNAP.ELF"}); rc != exitRefused {
 		t.Fatalf("bare rc=%d", rc)
+	}
+	if !f.has("gosnap: error open -1") {
+		t.Fatalf("missing open refusal: %v", f.logs)
 	}
 	if rc := run([]string{"GOSNAP.ELF", "frobnicate"}); rc != exitUsage {
 		t.Fatalf("bad verb rc=%d", rc)

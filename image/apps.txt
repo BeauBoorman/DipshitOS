@@ -57,3 +57,4 @@ GOSTALGIA.ELF | Gostalgia | o | dock=false | v=2 | argv=shell --root /host/GS | 
 GOSTORE.ELF | Store | i | dock=false | v=2 | caps=file,net
 GOINFER.ELF | LLM Infer | l | dock=false | v=2 | caps=file
 GOREC.ELF | Recorder | r | dock=false | v=2 | caps=file,audio
+GOSNAP.ELF | Snapshots | b | dock=false | v=2 | caps=file

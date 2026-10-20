@@ -32,10 +32,17 @@ const (
 	// The verdict line: `gotabwm: suspend ok` or `gotabwm: suspend <code>`
 	// — the ADR 0056 refusal name when the host or kernel refused.
 	MarkerSuspendVerdict = "gotabwm: suspend "
+	// M120d (#2561): the Snapshot row's report — `exec`, `focus id=`, or
+	// the refusal named.
+	MarkerPowerSnapshot = "gotabwm: power snapshot "
 )
 
-// The menu's one row. M115e's snapshot verb earns the second.
-const powerRowSuspend = "Suspend"
+// The menu's rows: Suspend is the M115d verb (first, the Enter default);
+// M120d's Snapshot row launches or focuses GOSNAP.ELF's snapshot window.
+var powerRows = [2]string{"Suspend", "Snapshot"}
+
+// gosnapBin is the binary the Snapshot row drives.
+const gosnapBin = "GOSNAP.ELF"
 
 // Button + menu geometry. The button is a square on the chrome band
 // between the Apps button and the clock panel; the menu floats above it.
@@ -43,16 +50,19 @@ const (
 	powerBtnW    = 28
 	powerBtnGap  = 4
 	powerMenuW   = 88
-	powerMenuH   = 26
+	powerRowH    = 20
 	powerMenuGap = 4
+	powerMenuH   = 2*powerRowH + 6
 )
 
 // power state. sink is the focus-stealing invisible window; 0 when none.
+// powerSel is the keyboard-highlighted row — Enter's target.
 var (
 	powerMenuOpen  bool
 	powerSink      uint32
 	powerBtnHover  bool
 	powerBtnLogged bool
+	powerSel       int
 )
 
 // powerBtnRect is the button's rect on a width x height scanout: the
@@ -95,11 +105,22 @@ func powerMenuRect(width, height int) (x, y, w, h int) {
 	return
 }
 
-// powerMenuRowAt reports whether the point lands on the (single) row —
-// the whole panel is the Suspend row.
-func powerMenuRowAt(px, py uint32, width, height int) bool {
-	x, y, w, h := powerMenuRect(width, height)
-	return w > 0 && int(px) >= x && int(px) < x+w && int(py) >= y && int(py) < y+h
+// powerMenuRowAt maps a point onto a row index, or -1 outside any row —
+// the one geometry source Draw's row rects and the pointer path share.
+func powerMenuRowAt(px, py uint32, width, height int) int {
+	x, y, w, _ := powerMenuRect(width, height)
+	if w == 0 || int(px) < x || int(px) >= x+w {
+		return -1
+	}
+	rel := int(py) - y - 3
+	if rel < 0 {
+		return -1
+	}
+	i := rel / powerRowH
+	if i < 0 || i >= len(powerRows) {
+		return -1
+	}
+	return i
 }
 
 // --- the modal sink (the launcher's pattern over the menu rect) ---------
@@ -146,6 +167,7 @@ func openPowerMenu() {
 		return
 	}
 	powerMenuOpen = true
+	powerSel = 0
 	if !acquirePowerFocus() {
 		powerSink = 0
 	}
@@ -162,8 +184,9 @@ func dismissPowerMenu() {
 }
 
 // handlePowerKey consumes the menu's keys while it is open. Esc
-// dismisses; Enter is the row's click. Every other key is swallowed by
-// the sink anyway — the return just keeps the seat's own chords quiet.
+// dismisses; Up/Down move the highlight; Enter is the highlighted row's
+// click. Every other key is swallowed by the sink anyway — the return
+// just keeps the seat's own chords quiet.
 func handlePowerKey(e vi.Event) bool {
 	if !powerMenuOpen {
 		return false
@@ -171,11 +194,30 @@ func handlePowerKey(e vi.Event) bool {
 	switch e.Arg0 {
 	case 0x29: // Escape
 		dismissPowerMenu()
+	case 0x52: // Up
+		if powerSel > 0 {
+			powerSel--
+		}
+	case 0x51: // Down
+		if powerSel < len(powerRows)-1 {
+			powerSel++
+		}
 	case 0x28: // Enter
 		dismissPowerMenu()
-		requestSuspend()
+		runPowerRow(powerSel)
 	}
 	return true
+}
+
+// runPowerRow dispatches one row — the pointer click and the Enter path
+// share it so a highlighted row and a clicked row mean the same thing.
+func runPowerRow(i int) {
+	switch i {
+	case 1:
+		requestSnapshot()
+	default:
+		requestSuspend()
+	}
 }
 
 // The vsock-ctl seam is a test seam too — host tests pin the verdict
@@ -198,6 +240,33 @@ func suspendVerdict() string {
 func requestSuspend() {
 	vi.ConsoleLine(MarkerSuspendRequest)
 	vi.ConsoleLine(MarkerSuspendVerdict + suspendVerdict())
+}
+
+// powerFocus is the tab-focus seam (the execApp / vsockCtlRequest
+// pattern): focusHosted on the guest, a recorder in tests.
+var powerFocus = focusHosted
+
+// requestSnapshot is the Snapshot row: focus the running snapshot
+// window when one is already on the strip — the manager's verbs are
+// process-wide, so a second instance is never the honest answer — else
+// exec the app. The marker names which landed.
+func requestSnapshot() {
+	for i := 0; i < tabs.Count(); i++ {
+		if t := tabs.At(i); t.Bin == gosnapBin {
+			if powerFocus(t.ID) {
+				vi.ConsoleLine(MarkerPowerSnapshot + "focus id=" + vi.Itoa64(int64(t.ID)))
+			} else {
+				vi.ConsoleLine(MarkerPowerSnapshot + "focus refused id=" + vi.Itoa64(int64(t.ID)))
+			}
+			return
+		}
+	}
+	if _, err := execApp(gosnapBin); err != nil {
+		vi.ConsoleLine(MarkerPowerSnapshot + "exec refused")
+		seatRefusalErr(err, "exec "+gosnapBin, gosnapBin)
+		return
+	}
+	vi.ConsoleLine(MarkerPowerSnapshot + "exec " + gosnapBin)
 }
 
 // --- paint --------------------------------------------------------------
@@ -225,7 +294,9 @@ func paintPowerButton(scan []byte, width, height int) int {
 	return n
 }
 
-// paintPowerMenu paints the open menu's plate and its one row.
+// paintPowerMenu paints the open menu's plate and its rows — the
+// keyboard highlight on powerSel, each row on the same geometry
+// powerMenuRowAt answers.
 func paintPowerMenu(scan []byte, width, height int) int {
 	if !powerMenuOpen {
 		return 0
@@ -243,6 +314,12 @@ func paintPowerMenu(scan []byte, width, height int) int {
 	n := seatPlate(c, plate, radiusControl, tok.Accent, tok.Surface)
 	draw.StrokeRoundedRect(c, plate, radiusControl, tok.BorderW, draw.Opaque(tok.Rule))
 	clip := plate.Inset(tok.BorderW)
-	seatText(c, clip, x+10, y+7, seatTextPx, powerRowSuspend, tok.Ink)
+	for i, row := range powerRows {
+		rr := widgets.Rect{X: x, Y: y + 3 + i*powerRowH, W: w, H: powerRowH}
+		if i == powerSel {
+			c.FillRect(rr.Inset(2), draw.Opaque(tok.Selection))
+		}
+		seatText(c, clip, x+10, rr.Y+6, seatTextPx, row, tok.Ink)
+	}
 	return n
 }

@@ -674,8 +674,9 @@ func handleWmPointer(e vi.Event) {
 	if powerMenuOpen {
 		if down {
 			dismissPowerMenu()
-			if powerMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
-				requestSuspend()
+			if r := powerMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight); r >= 0 {
+				powerSel = r
+				runPowerRow(r)
 			}
 		}
 		return

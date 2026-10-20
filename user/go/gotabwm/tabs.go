@@ -285,6 +285,11 @@ func guessBin(title string) string {
 		// restored starter tab execs "Sh" and drops by name (go-dogfood
 		// boot 06: `refusal ENOENT exec Sh`).
 		return "GOSH.ELF"
+	case "Snapshots":
+		// M120d (#2561): the snapshot manager's declared title — the
+		// PWR row focuses the tab by bin, and a restored row needs the
+		// real binary like every app above.
+		return "GOSNAP.ELF"
 	default:
 		return title
 	}

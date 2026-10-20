@@ -390,3 +390,82 @@ for needle in (b"gotabwm: crashsnap save CRASH0 ok",
     assert needle in serial, (needle, serial[-1500:])
 print("resume: crash arm completed — CRASH0 saved, GOTABAPP restarted, blob restored")
 PY
+
+# ---------------------------------------------------------------------------
+# M120d (#2561): windowed — the seat hosts a BARE GOSNAP.ELF, its tab paints,
+# and a snapshot minted AFTER the window is open (the argv verb, out of band)
+# arrives on the window's ~1 Hz re-list. Pure-VZ like crash: the run's own
+# `gosnap save` must survive validateSaveRestoreSupport, so no cv input rides
+# along — the leg needs none (monitor execs only). SNAPSHOTS still holds
+# CRASH0 from the crash leg, so the fresh window reads n=1, then n=2 when
+# the poll sees WINBASE.
+
+vgate_file win1.txt <<'EOF'
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+vgate_file win2.txt <<'EOF'
+exec GOSNAP.ELF
+EOF
+vgate_file win3.txt <<'EOF'
+exec GOSNAP.ELF save WINBASE
+EOF
+
+vgate_run windowed -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
+  --vsock --vsock-ctl --screen '$RUN_DIR/screen-win' --input \
+  --script '$RUN_DIR/win1.txt' \
+  --script2 '$RUN_DIR/win2.txt' --script2-after 'gotabwm: win focus' \
+  --script3 '$RUN_DIR/win3.txt' --script3-after 'gosnap: ready n=1' \
+  --script-expect 'gosnap: ls n=2' --timeout 300
+
+vgate_assert windowed serial-contains 'gotabwm: registered'
+vgate_assert windowed serial-contains 'gosnap: open id='
+vgate_assert windowed serial-contains 'gosnap: declare accepted'
+vgate_assert windowed serial-contains 'gosnap: present'
+vgate_assert windowed serial-contains 'gosnap: ready n=1'
+vgate_assert windowed serial-contains 'gosnap: snap name=CRASH0 bytes='
+vgate_assert windowed serial-contains 'gosnap: save WINBASE ok'
+vgate_assert windowed serial-contains 'gosnap: snap name=WINBASE bytes='
+vgate_assert windowed serial-contains 'gosnap: ls n=2'
+vgate_assert windowed serial-absent '[EXC]'
+vgate_assert windowed python <<'PY'
+import os
+from pathlib import Path
+snap = Path(os.environ["RUN_DIR"]) / "prof.virelaivm" / "share" / "SNAPSHOTS" / "WINBASE.vzsave"
+assert snap.exists() and snap.stat().st_size > 0, "WINBASE was never parked"
+print("WINBASE parked (%d bytes), listed by the window" % snap.stat().st_size)
+PY
+
+# ---------------------------------------------------------------------------
+# M120d (#2561): pwr — the PWR menu's Snapshot row, driven by the pointer the
+# way a person reaches it: press PWR -> the two-row menu -> press Snapshot.
+# The seat execs GOSNAP.ELF (no Snapshots tab is open), which opens, declares
+# and lists. cv input is legal here exactly like offer: the run never saves.
+
+vgate_file pwr1.txt <<'EOF'
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+vgate_file pwr2.txt <<'EOF'
+echo rx-gosnap-pwr-ok
+EOF
+
+vgate_run pwr -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
+  --vsock --vsock-ctl --screen '$RUN_DIR/screen-pwr' --input \
+  --script '$RUN_DIR/pwr1.txt' \
+  --pointer-virtio '338,702,c;308,675,c' \
+  --pointer-virtio-after 'gotabwm: win focus' \
+  --script2 '$RUN_DIR/pwr2.txt' --script2-after 'gosnap: ready n=' \
+  --script-expect 'rx-gosnap-pwr-ok' --timeout 300
+
+vgate_assert pwr serial-contains 'gotabwm: power open'
+vgate_assert pwr serial-contains 'gotabwm: power snapshot exec GOSNAP.ELF'
+vgate_assert pwr serial-contains 'gosnap: open id='
+vgate_assert pwr serial-contains 'gosnap: declare accepted'
+vgate_assert pwr serial-contains 'gosnap: present'
+vgate_assert pwr serial-contains 'gosnap: snap name='
+vgate_assert pwr serial-contains 'gosnap: ready n='
+vgate_assert pwr serial-contains 'rx-gosnap-pwr-ok'
+vgate_assert pwr serial-absent '[EXC]'

@@ -8,8 +8,11 @@
 // delete its own snapshots with plain /host file ops, and the consent
 // surface stays in the guest where the person is.
 //
-// Verbs:
+// Verbs — or, invoked bare, the M120d windowed face (view.go): the same
+// list in a tab window with Save/Restore/Delete controls and the same
+// two-step consent, now a click-twice arm instead of a typed `confirm`.
 //
+//	gosnap                           — the Snapshots window
 //	gosnap ls                        — the stored snapshots, name + bytes
 //	gosnap save <name>             — ctl `snapshot <name>` (idempotent by
 //	                                 refusal: an existing name answers
@@ -114,23 +117,23 @@ func ctlVerdict(verb, name string) (ok bool, code string) {
 	return false, vi.ErrnoName(r)
 }
 
-// cmdLS lists the stored snapshots: one row per `<name>.vzsave`,
-// sorted by name so the same share prints the same order twice (the
-// host's readdir order is not a contract). An absent SNAPSHOTS dir is
-// an empty list — a share that has never snapshot honestly has none —
-// not an error.
-func cmdLS() int {
+// snapRow is one stored snapshot: the name minus its .vzsave suffix and
+// the file's byte count.
+type snapRow struct {
+	name  string
+	bytes uint64
+}
+
+// snapRows is the listing both faces share — cmdLS prints it, the M120d
+// window paints it. One row per `<name>.vzsave`, sorted by name so the
+// same share reports the same order twice (the host's readdir order is
+// not a contract). The error is listDir's verbatim, ENOENT included.
+func snapRows() ([]snapRow, error) {
 	items, err := listDir(snapsCanon)
 	if err != nil {
-		if err.Error() == "ENOENT" {
-			logLine(markerPrefix + "ls n=0")
-			return exitOK
-		}
-		logLine(markerPrefix + "ls refused " + err.Error())
-		return exitRefused
+		return nil, err
 	}
-	var names []string
-	sizes := map[string]uint64{}
+	var rows []snapRow
 	for _, it := range items {
 		if it.IsDir {
 			continue
@@ -140,20 +143,42 @@ func cmdLS() int {
 		if m <= len(snapSuffix) || n[m-len(snapSuffix):] != snapSuffix {
 			continue // not a snapshot file (a stray .part, a marker)
 		}
-		names = append(names, n[:m-len(snapSuffix)])
-		sizes[n[:m-len(snapSuffix)]] = it.Size
+		rows = append(rows, snapRow{name: n[:m-len(snapSuffix)], bytes: it.Size})
 	}
 	// Insertion sort — the listing is bounded (the dir protocol's own
 	// bound), and the guest keeps no general sort in this app.
-	for i := 1; i < len(names); i++ {
-		for j := i; j > 0 && names[j-1] > names[j]; j-- {
-			names[j-1], names[j] = names[j], names[j-1]
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0 && rows[j-1].name > rows[j].name; j-- {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
 		}
 	}
-	for _, n := range names {
-		logLine(markerPrefix + "snap name=" + n + " bytes=" + vi.Itoa64(int64(sizes[n])))
+	return rows, nil
+}
+
+// logSnapRows prints the listing's marker vocabulary — one `snap name=`
+// line per row then the `ls n=` count — shared by the argv `ls` verb and
+// the window's refresh so a gate reads one shape for both faces.
+func logSnapRows(rows []snapRow) {
+	for _, r := range rows {
+		logLine(markerPrefix + "snap name=" + r.name + " bytes=" + vi.Itoa64(int64(r.bytes)))
 	}
-	logLine(markerPrefix + "ls n=" + vi.Itoa64(int64(len(names))))
+	logLine(markerPrefix + "ls n=" + vi.Itoa64(int64(len(rows))))
+}
+
+// cmdLS lists the stored snapshots. An absent SNAPSHOTS dir is an empty
+// list — a share that has never snapshot honestly has none — not an
+// error.
+func cmdLS() int {
+	rows, err := snapRows()
+	if err != nil {
+		if err.Error() == "ENOENT" {
+			logLine(markerPrefix + "ls n=0")
+			return exitOK
+		}
+		logLine(markerPrefix + "ls refused " + err.Error())
+		return exitRefused
+	}
+	logSnapRows(rows)
 	return exitOK
 }
 
@@ -244,13 +269,16 @@ func usage() int {
 	logLine("  save <name>                 snapshot the running machine onto the share")
 	logLine("  restore <name> confirm      stage <name> as the next --resume")
 	logLine("  rm <name> confirm           delete <name>")
+	logLine("  (bare)                      the Snapshots window")
 	return exitUsage
 }
 
 func run(args []string) int {
-	// argv[0] is the image name; the verb is argv[1].
+	// argv[0] is the image name; the verb is argv[1]. Bare is the windowed
+	// face (M120d): a launcher's exec opens the tab window rather than
+	// dying on this usage line.
 	if len(args) < 2 {
-		return usage()
+		return runWindowed()
 	}
 	switch args[1] {
 	case "ls":
