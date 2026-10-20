@@ -10,7 +10,7 @@
 
 | File | Lines | Role |
 |------|-------|------|
-| `kernel/src/main.zig` | 1,692 | boot sequence, init order |
+| `kernel/src/main.zig` | 2,537 | boot sequence, init order |
 | `kernel/src/alloc.zig` | — | physical page allocator |
 | `kernel/src/memmap.zig` | — | EFI memory map |
 | `kernel/src/mmu.zig` | — | EL1 page tables, TTBR0/TTBR1 |
@@ -29,6 +29,7 @@
 | `kernel/src/virtio_custom.zig` | — | custom virtio device (diag) |
 | `kernel/src/walkprobe.zig` | — | diagnostic walk probe |
 | `kernel/src/nvram_console.zig` | — | NVRAM console fallback |
+| `kernel/src/smp.zig` | — | secondary-core bring-up |
 | `build.zig` | — | Zig build system |
 | `.github/` | — | CI workflows |
 | `justfile` | — | developer quick-ref |
@@ -36,35 +37,50 @@
 **Owns:** Boot pipeline, memory model, interrupt dispatch, exception levels,
 platform init. Everything from UEFI exit to the first shell prompt.
 
-### Desktop — compositor, rendering, input, windows
+### Desktop — the Go seat, rendering, input, windows
+
+The boot default seat is the Go seat `user/go/gotabwm/` (the `wm` settings
+key's compiled default); the Zig seats remain reachable via the persisted
+fallback (`settings set wm tabwm` → `user/src/tabwm.zig`).
 
 | File | Lines | Role |
 |------|-------|------|
-| `kernel/src/driving_award.zig` | 3,617 | window manager + compositor |
+| `user/go/gotabwm/` | — | Go seat: tab host, chrome, WM_RPC server |
+| `user/go/tabapp/` | — | hosted-tab contract for Go apps |
+| `user/go/appkit/` | — | appkit widgets + controllers |
+| `user/go/draw/` | — | raster primitives (0xAARRGGBB buffers) |
+| `user/go/widgets/` | — | kit controls (scrollbar, toggle, slider) |
+| `user/go/chords/` | — | global shortcuts registry |
+| `user/go/calc/` | — | calculator app |
+| `user/go/note/` | — | notepad app |
+| `user/go/top/` | — | task manager app |
+| `user/go/files/` | — | file manager app |
+| `kernel/src/wnd_core.zig` | 1,233 | pure WM rules, shared kernel shim + EL0 WM |
 | `kernel/src/text.zig` | — | framebuffer text renderer |
 | `kernel/src/font8x8.zig` | — | 8×8 glyph table |
 | `kernel/src/road_pops.zig` | — | Road Pops tee (boot terminal) |
 | `kernel/src/input.zig` | — | HID → keycode decode |
 | `kernel/src/xhci.zig` | — | XHCI USB host controller |
 | `kernel/src/clipboard.zig` | — | kernel clipboard |
-| `user/src/lib/ui.zig` | — | UI widget toolkit |
-| `user/go/gotabwm/` | — | Go seat, manifest, launcher, and hosted tabs |
-| `user/go/calc/` | — | calculator app |
-| `user/go/note/` | — | notepad app |
-| `user/go/top/` | — | task manager app |
-| `user/go/files/` | — | file manager app |
+| `user/src/tabwm.zig` | — | Zig tabbed seat (persisted fallback) |
+| `user/src/wnd.zig` | — | EL0 WM server (Zig) |
+| `user/src/lib/ui.zig` | — | Zig UI widget toolkit |
 
-**Owns:** Screen, windows, mouse/keyboard input, UI toolkit, desktop apps.
+**Owns:** Screen, windows, mouse/keyboard input, UI toolkits, the Go seat
+and the hosted desktop apps.
 
 ### Net — network stack, TCP, DNS, DHCP
 
 | File | Lines | Role |
 |------|-------|------|
-| `kernel/src/virtio_net.zig` | 1,972 | virtio-net driver |
+| `kernel/src/virtio_net.zig` | 2,439 | virtio-net driver |
 | `kernel/src/arp.zig` | — | ARP table + requests |
 | `kernel/src/ipv4.zig` | — | IPv4 dispatch, ICMP echo |
+| `kernel/src/ipv6.zig` | — | IPv6 dispatch (ADR 0057) |
+| `kernel/src/ndp.zig` | — | neighbor discovery |
 | `kernel/src/udp.zig` | — | UDP listener table |
 | `kernel/src/tcp.zig` | — | TCP state machine |
+| `kernel/src/socket_core.zig` | — | TCP socket table |
 | `kernel/src/dhcp.zig` | — | DHCP client lifecycle |
 | `kernel/src/dns.zig` | — | DNS resolver |
 | `kernel/src/csprng.zig` | — | ChaCha20 CSPRNG |
@@ -79,12 +95,12 @@ platform init. Everything from UEFI exit to the first shell prompt.
 
 | File | Lines | Role |
 |------|-------|------|
-| `kernel/src/shell.zig` | 2,759 | interactive shell |
-| `kernel/src/monitor.zig` | 6,997 | monitor commands |
+| `kernel/src/shell.zig` | 4,641 | interactive shell |
+| `kernel/src/monitor.zig` | 9,384 | monitor commands |
 | `kernel/src/process.zig` | — | process registry |
 | `kernel/src/exec.zig` | — | ELF/flat image loader |
 | `kernel/src/elf.zig` | — | ELF parser |
-| `kernel/src/scheduler.zig` | 1,962 | task scheduler |
+| `kernel/src/scheduler.zig` | 3,783 | task scheduler |
 | `kernel/src/mailbox.zig` | — | inter-process mailbox |
 | `kernel/src/pipe.zig` | — | shell pipe buffer |
 | `kernel/src/events.zig` | — | per-process event queues |
@@ -95,56 +111,61 @@ platform init. Everything from UEFI exit to the first shell prompt.
 | `kernel/src/scrollback.zig` | — | terminal scrollback |
 | `kernel/src/tombstone.zig` | — | crash tombstones |
 | `kernel/src/serial_ring.zig` | — | serial event ring |
-| `user/src/` | all non-Desktop non-Net apps | user programs |
+| `user/src/` | all non-Desktop non-Net Zig apps | user programs |
+| `user/go/` | all non-Desktop non-Net Go dirs | Go apps + packages |
 
 **Owns:** Shell, commands, process lifecycle, IPC, event system, all
 non-Desktop/non-Net user programs.
 
-### Storage/Files — filesystem, FAT, ESP, disk image
+### Storage/Files — host file channel, file table, disk image
 
 | File | Lines | Role |
 |------|-------|------|
-| `kernel/src/fat.zig` | — | FAT32 driver |
-| `kernel/src/esp.zig` | — | ESP mount + files |
+| `kernel/src/virtio_file.zig` | 1,997 | host file channel (queue 5) |
+| `kernel/src/virtio_fs.zig` | — | virtio-fs/FUSE host share client |
+| `kernel/src/vlfs/` | — | VLFS journaled volume (ADR 0050) |
 | `kernel/src/file_table.zig` | — | per-process file handles |
+| `kernel/src/directory.zig` | — | directory table |
+| `kernel/src/fs_metadata.zig` | — | stat/metadata path |
+| `kernel/src/fat32_ro.zig` | — | read-only FAT32 (`.usb` device tree) |
 | `kernel/src/virtio_blk.zig` | — | virtio-blk driver |
+| `kernel/src/usb_msc.zig` | — | USB mass-storage (BOT + SCSI) |
 | `image/mkfat32.py` | — | FAT image builder |
 | `image/make-image.sh` | — | disk image assembly |
 | `image/apps.txt` | — | application manifest |
 
-**Owns:** Everything from the virtio-blk queue to the file descriptor table.
+**Owns:** Everything from the host file channel and the block devices to
+the file descriptor table.
 
-### VZ/Host — host runner, CI, gate scripts, tools
+### VZ/Host — host runner, CI, gate fleet, tools
 
 | File | Role |
 |------|------|
-| `host/vm-runner/Sources/*.swift` | VZ host launcher |
-| `tools/verify-live.sh` | unified gate runner |
-| `tools/gates/*.sh` | per-gate definitions |
-| `tools/lib/verify-live-common.sh` | shared gate boilerplate |
-| `tools/verify-unit-tests.sh` | unit test gate |
-| `tools/verify-bss-budget.sh` | BSS budget gate |
-| `tools/verify-glyph-raster.sh` | glyph raster gate |
-| `tools/verify-mutations.sh` | mutation gate |
-| `tools/verify-mmu-debt.sh` | MMU debt gate |
+| `host/vm-runner/` | VZ host launcher (Swift) |
+| `tools/gate/` | declarative gate fleet (SPEC.md, specs/, fleet.sh) |
+| `tools/status/` | claim + coordination tooling |
+| `tools/tests/` | host-side Python unit tests |
+| `tools/lib/` | shared gate helpers |
+| `tools/verify-*.sh` | class-A verify gates |
 | `tools/elf2bin.py` | ELF → flat image converter |
 | `tools/mkhello-elf.py` | example ELF generator |
 | `tools/decode-screen-glyphs.py` | glyph screenshot decoder |
-| `tools/ragshit/` | context engine (dev tooling) |
+| `AGENTS.md` | repo rules for agents |
 | `docs/status.md` | living status |
-| GitHub issues (label `claim`) | active-work claims |
 | `docs/testing.md` | testing policy |
 | `docs/gate-inventory.md` | gate classification |
-| `docs/roadmap.md` | milestone plan |
+| `docs/gate-fleet-inventory.md` | generated fleet snapshot |
+| `docs/decisions/` | ADRs |
 | `docs/archive/agent-concurrency-plan.md` | lane assignments (closed-arc plan, archived by #1671) |
 | `docs/TEAMS.md` | this file |
+| GitHub issues (label `claim`) | active-work claims |
 
 **Owns:** Host tooling, CI, gate infrastructure, docs (except ADRs owned
 by the relevant team).
 
 ## Shared files: the syscall table
 
-`kernel/src/syscall.zig` (3,353 lines) is touched by every team that adds
+`kernel/src/syscall.zig` (5,410 lines) is touched by every team that adds
 a new service. Convention:
 
 1. **File a GitHub issue** before you need a slot. Issue title: "Reserve
@@ -154,7 +175,7 @@ a new service. Convention:
 3. **Your team implements the handler function** (in a file you own) and
    Core plumbs it into the dispatch.
 4. **Event kinds** follow the same pattern: file an issue, Core reserves
-   the kind number in `events.zig`, your team uses it.
+   the kind number in `kernel/src/events.zig`, your team uses it.
 
 ## Cross-team dependency rule
 
@@ -175,5 +196,5 @@ before starting non-trivial work, comment progress on it, close it when
 done. The coordination gate
 (`bash tools/status/verify-issue-coordination.sh`) fails when two open
 claim issues from different branches declare overlapping file touches.
-The old `docs/claims/` + `docs/logs/` file tracker and its generated
-indexes were deleted 2026-09-03.
+The old docs/claims + docs/logs file tracker and its generated indexes
+were deleted 2026-09-03.

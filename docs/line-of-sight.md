@@ -1,12 +1,17 @@
 # Line of sight — what's workable on the current board
 
-Status: **maintained manually against GitHub** · Date: 2026-09-01 ·
-Sources: GitHub API (milestones/issues), current `origin/main` (`1346855`),
-claims 7710/9459/7599/0098/1263. This doc mirrors the GitHub board so we can pick the
-next thing without opening the browser. It is not a milestone tracker —
-`docs/status.md` owns milestone-level truth; this is the "what can I claim
-next" view. Keep the tables honest: **observed** = merged/live-gated, not
-"should land soon".
+Status: **RETIRED 2026-10-20 (card #2782)** — `docs/status.md` is the
+canonical board view; this file is no longer maintained as a claim-picker.
+It is kept as a historical record because its Z-ladder and dialect-boundary
+sections are still cited by `tools/verify-zc-corpus.sh`,
+`tools/build-zc-host.sh`, and ADR 0035. The board tables below reflect
+2026-09-01 and are stale; consult the tracker. Rows 4 and 5 of the FAT32
+pain-points table are card #2759's subject (#2759).
+
+> Original header (2026-09-01): maintained manually against GitHub; sources:
+> GitHub API (milestones/issues), `origin/main` at `1346855`, claims
+> 7710/9459/7599/0098/1263. **observed** = merged/live-gated, not "should
+> land soon".
 
 ## M34 — FAT-free storage (milestone #21)
 
@@ -38,8 +43,8 @@ not fix them, and they are wire-shape decisions already baked into fixtures.
 | 1 | **2048-byte read cap** — `fat.cat`/`read_file` honest 2048-B cap; `esp_content_max` = 2048 B (claim 6344, m4 logs) | HF1/HF2 READ-with-offset, 32 KiB reply | ✅ merged — reads are stateless streams to arbitrarily large files |
 | 2 | **2048-byte write/truncate cap** — `write_content_max` = 2048, `sys_file_truncate` ≤ 2048 (ADR 0007 slot 36; `file_table.zig` staging) | HF3 WRITE/TRUNCATE (32,763-B chunks) **at the channel** | ⚠️ **partial** — the channel is cap-free, but the userland syscall ABI (ADR 0010 slots 23–27, `file_table.zig`) still routes through FAT with the 2048 caps until HF5 re-points it. Notepad/settings/downloads still hit the old caps today |
 | 3 | **8.3 short names** — leading-dot names unrepresentable (`.recent` → `RECENT.SAV`), padded names (`"CALC    "`), case-insensitive mapping (march-m25 F5, m13 logs) | HF2 LIST serves real host names | ✅ merged — names are host-truth, case-preserving, leading-dot OK |
-| 4 | **Long filenames truncate at 31 bytes** — the merged LIST row is `[name 31][type u8][size u64le]` (40 B), inherited from ADR 0010's 31-char display name | — | ❌ **GAP** — a macOS file with a >30-char name truncates in the guest listing. Wire shape already baked into fixtures; changing it is a wire revision (additive op or version bump) |
-| 5 | **No modification timestamps** — "Timestamps 'N/A' per FAT32 short-name limitation" (march-m25 F2, claim 0434); STAT as merged is `[size u64le][type u8]` — **no mtime** | — | ❌ **GAP** — the scoping doc promised STAT = size/type/**mtime**; the landed op serves size+type only. The file manager's properties panel still shows "N/A" for dates. Needs an additive STAT bump |
+| 4 | **Long filenames truncate at 31 bytes** — the merged LIST row is `[name 31][type u8][size u64le]` (40 B), inherited from ADR 0010's 31-char display name | **card #2759** | ❌ **GAP → card #2759's subject** — a macOS file with a >30-char name truncates in the guest listing. Card #2759 retires the legacy 31-byte LIST's last consumers (v2 snapshot path or explicit 31-byte refusal by name) |
+| 5 | **No modification timestamps** — "Timestamps 'N/A' per FAT32 short-name limitation" (march-m25 F2, claim 0434); STAT as merged is `[size u64le][type u8]` — **no mtime** | **card #2759** | ❌ **GAP → card #2759's subject** — the landed op serves size+type only, so the file manager's properties panel still shows "N/A" for dates. Card #2759 appends `mtime_sec u64le` + `mtime_nsec u32le` to STAT with old/new length acceptance |
 | 6 | **Content-pool exhaustion / silent empty reads** — files listed but never content-loaded (`len=0`) when the 8192-B pool overflows → history recall no-op + clobbering (claim 6344) | HF4/HF5 (apps + user data leave the ESP window) | 🔶 open — HF4 landed (apps off the ESP); the class dies for good when HF5 moves user data out |
 | 7 | **kstack pressure from FAT staging** — 2×2048 staging + FAT buffers overflowed the 8 KiB kstack (m13 log) | HF6 (fat.zig deleted) | 🔶 open |
 | 8 | **Image-rebuild iteration loop** — ~50 apps baked into the ESP; rebuild the image to test an app | HF4 | ✅ merged — drop-`.ELF`-and-exec (PR #769, claim 7599) |
