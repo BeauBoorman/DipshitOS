@@ -2233,11 +2233,13 @@ vgate_assert 08 serial-absent 'gotabwm: drag cancel'
 vgate_assert 08 serial-absent 'gofiles: drag refused'
 
 # --- M124d: Open With -> GOVIEW.ELF (the 'o' handler list) -------------------
-# candidates=2 is the registry's truth for type=image: mime.init registers
-# GOVIEW first and GOEDIT second ("Code Editor (raw bytes)", the fallback for
-# the formats GOVIEW has no decoder for) — go-fileman run 02 pins the same
-# count for PIC.QOI. A candidates=1 pin was this spec's own bug.
-vgate_assert 08 serial-contains 'gofiles: open with PIC.PNG type=image candidates=2'
+# candidates=3 is the registry's truth for type=image: mime.init registers
+# GOVIEW first, GOEDIT second ("Code Editor (raw bytes)", the fallback for
+# the formats GOVIEW has no decoder for), and GOPAINT third (M132b #2814
+# reserved-handler row) — open_test.go pins the same count for PIC.QOI
+# ("1 Image Viewer / 2 Code Editor / 3 Paint"). Candidates=1 and =2 pins
+# were this spec's own bugs against the live registry.
+vgate_assert 08 serial-contains 'gofiles: open with PIC.PNG type=image candidates=3'
 vgate_assert 08 serial-contains 'gofiles: open chose PIC.PNG type=image handler=GOVIEW.ELF'
 vgate_assert 08 serial-contains 'gofiles: open launched PIC.PNG handler=GOVIEW.ELF pid='
 vgate_assert 08 serial-absent 'gofiles: open launch refused'
