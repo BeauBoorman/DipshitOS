@@ -1549,3 +1549,122 @@ func TestHandleWmKeyUndoChordDispatches(t *testing.T) {
 		t.Fatalf("a placeholder's ctrl-z must not exec: %v", *execs)
 	}
 }
+
+// #2703: the demo-mode cycle-focus chord parks on decode and applies only
+// after the focused app goes quiet on both legs the seat can measure —
+// the input window (lastInputTick) and the app's scheduler work
+// (cpu_ticks flat). Live mode and a sub-two-tab strip never park.
+func TestFocusCycleParkAndRelease(t *testing.T) {
+	savedTabs, savedDemo := tabs, demoMode
+	savedInput, savedSeat := lastInputTick, seatTick
+	savedPending := cyclePending
+	defer func() {
+		tabs, demoMode = savedTabs, savedDemo
+		lastInputTick, seatTick = savedInput, savedSeat
+		cyclePending = savedPending
+	}()
+	indices, restore := focusIndexRecorder()
+	defer restore()
+	cpu := uint64(100)
+	var haveProbe bool
+	savedProbe := focusedCpuTicks
+	focusedCpuTicks = func(uint32) (uint64, bool) { return cpu, haveProbe }
+	defer func() { focusedCpuTicks = savedProbe }()
+
+	open2 := func() {
+		tabs = TabStrip{}
+		if !tabs.OpenTab(3, "A") || !tabs.OpenTab(4, "B") || !tabs.FocusTab(3) {
+			t.Fatal("two-tab strip")
+		}
+	}
+
+	// Live mode: the chord applies on decode, never parks.
+	demoMode, cyclePending = false, false
+	open2()
+	if armFocusCycle(false) || cyclePending {
+		t.Fatal("live mode must not park the cycle")
+	}
+
+	// Demo mode under two tabs: the chord is a no-op press, not a park.
+	demoMode = true
+	tabs = TabStrip{}
+	if !tabs.OpenTab(3, "A") {
+		t.Fatal("OpenTab")
+	}
+	if armFocusCycle(false) || cyclePending {
+		t.Fatal("a single-tab strip must not park the cycle")
+	}
+
+	// Demo mode with a real cycle: parked, not applied, until BOTH quiet
+	// legs hold for the window.
+	seatTick = 10
+	open2()
+	if !armFocusCycle(false) || !cyclePending {
+		t.Fatal("demo mode must park the cycle")
+	}
+	if len(*indices) != 0 {
+		t.Fatalf("parked cycle applied early: %v", *indices)
+	}
+	// Input still churning (a sibling chord landed this tick): no release
+	// even though the app probe is flat.
+	haveProbe = true
+	lastInputTick = 10
+	releaseFocusCycle(11)
+	if len(*indices) != 0 {
+		t.Fatalf("cycle released inside the input window: %v", *indices)
+	}
+	// Input quiet but the app is still accruing ticks — each advance
+	// restarts the flat streak.
+	lastInputTick = 0
+	for i, c := range []uint64{101, 102, 103} {
+		cpu = c
+		releaseFocusCycle(uint64(20 + i))
+		if len(*indices) != 0 {
+			t.Fatalf("cycle released while the app was busy: %v", *indices)
+		}
+	}
+	// Flat streak + quiet input: the window counts flat samples, so the
+	// release lands on the Kth flat read.
+	for i := 0; i < focusCycleQuietTicks; i++ {
+		releaseFocusCycle(uint64(30 + i))
+	}
+	if len(*indices) != 1 {
+		t.Fatalf("quiet legs held for the window but no cycle applied: %v", *indices)
+	}
+	if cyclePending {
+		t.Fatal("applied cycle must clear the park")
+	}
+
+	// A kernel with no v2 probe leaves the input window as the only leg.
+	cyclePending, cycleCpuInit, cycleCpuQuiet = false, false, 0
+	haveProbe = false
+	open2()
+	if !armFocusCycle(true) || !cyclePending {
+		t.Fatal("demo mode must park the reverse cycle")
+	}
+	lastInputTick = 0
+	for i := 0; i < focusCycleQuietTicks; i++ {
+		releaseFocusCycle(uint64(40 + i))
+	}
+	if len(*indices) != 2 {
+		t.Fatalf("no probe must degrade to the input window alone: %v", *indices)
+	}
+
+	// A persistently busy app cannot wedge the chord: the hold bound
+	// applies the cycle anyway.
+	cyclePending, cycleCpuInit, cycleCpuQuiet = false, false, 0
+	haveProbe = true
+	open2()
+	seatTick = 50
+	if !armFocusCycle(false) {
+		t.Fatal("park for the bound")
+	}
+	lastInputTick = seatTick // input never quiets either
+	for i := uint64(0); i < focusCycleHoldMax; i++ {
+		cpu += 9
+		releaseFocusCycle(seatTick + 1 + i)
+	}
+	if len(*indices) != 3 {
+		t.Fatalf("the hold bound must still apply the cycle: %v", *indices)
+	}
+}

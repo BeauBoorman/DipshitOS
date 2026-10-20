@@ -162,6 +162,104 @@ const hidChordHold = 64
 // pointerDragHold is one `--pointer-virtio 'x,y,d;x,y,u'` (4 messages × 2.5 s).
 const pointerDragHold = 12
 
+// #2703: in demo mode the cycle-focus chord does not apply on decode — it
+// parks and releases once the focused app has gone quiet by every measure
+// the seat owns. The chord chain that provoked this (go-dogfood boot 04:
+// ctrl-shift-c, ctrl-shift-v, return, alt-tab) delivers bytes into the
+// focused app's tty that the app still has to run; the seat applied the
+// cycle the instant the chord landed, so `gotabwm: alt-tab id=` beat the
+// app's last `done` line by the drain time of the paste. The seat cannot
+// read the app's tty or its serial, so the release arms on the two things
+// it CAN measure rather than on a bigger tick count:
+//
+//	input quiet — no WM_KEY/WM_POINTER for focusCycleQuietTicks
+//	    composite ticks (lastInputTick's own count, the same quiet
+//	    window the strip-hold re-arm uses), and
+//	app quiet — the focused tab's bound pid accrues no scheduler
+//	    cpu_ticks (ADR 0047 sys_procs v2) across the same window: the
+//	    only seat-visible signal that the app is still working off
+//	    already-delivered input. A kernel that cannot answer the v2
+//	    probe leaves this leg to the input window alone.
+//
+// focusCycleHoldMax bounds the deferral so a persistently busy app can
+// never wedge the chord — the bound applying early is the honest cost of
+// a seat that cannot see the app's serial.
+const (
+	focusCycleQuietTicks = 4
+	focusCycleHoldMax    = 24
+)
+
+var (
+	cyclePending    bool   // a demo-mode cycle is parked awaiting quiet
+	cycleShift      bool   // the parked chord's reverse flag
+	cycleParkedTick uint64 // seatTick when the chord decoded (bound base)
+	cycleCpuLast    uint64 // last cpu_ticks sample from the focused pid
+	cycleCpuQuiet   int    // consecutive flat samples seen so far
+	cycleCpuInit    bool   // a first sample has seeded cycleCpuLast
+)
+
+// armFocusCycle parks the decoded cycle chord for deferred application and
+// reports whether it did. The park needs a real cycle to make — under two
+// tabs the chord is a no-op either way — and it is demo mode only: a live
+// seat never defers a user's focus change.
+func armFocusCycle(shift bool) bool {
+	if !demoMode || tabs.Count() < 2 {
+		return false
+	}
+	cyclePending = true
+	cycleShift = shift
+	cycleParkedTick = seatTick
+	cycleCpuInit, cycleCpuQuiet = false, 0
+	return true
+}
+
+// releaseFocusCycle evaluates the parked cycle once per composite tick.
+// The cycle applies only after both quiet legs hold, or unconditionally
+// at the bound — then focusByIndex re-resolves the target against the
+// strip AS IT IS, so a strip that changed under the park cycles from the
+// current focus, not from where the chord decoded.
+func releaseFocusCycle(ticks uint64) {
+	if !cyclePending {
+		return
+	}
+	if tabs.Count() < 2 {
+		cyclePending = false
+		return
+	}
+	inputQuiet := ticks >= lastInputTick && ticks-lastInputTick >= focusCycleQuietTicks
+	appQuiet := true
+	if id, ok := tabs.Focused(); ok && id < sessionIDBase {
+		if cpu, have := focusedCpuTicks(id); have {
+			if cycleCpuInit && cpu == cycleCpuLast {
+				cycleCpuQuiet++
+			} else {
+				cycleCpuQuiet = 0
+			}
+			cycleCpuLast, cycleCpuInit = cpu, true
+			appQuiet = cycleCpuQuiet >= focusCycleQuietTicks
+		}
+	}
+	if (inputQuiet && appQuiet) || ticks-cycleParkedTick >= focusCycleHoldMax {
+		cyclePending = false
+		_ = applyAltTab(cycleShift)
+	}
+}
+
+// focusedCpuTicks reads the bound owner's cumulative scheduler ticks —
+// the seat's only view of whether a hosted app is still working through
+// input the kernel already delivered. ok=false on an unbound id or an
+// unreadable/missing v2 figure; the caller treats no probe as no
+// evidence, never as busy.
+var focusedCpuTicks = func(id uint32) (uint64, bool) {
+	if id > 255 {
+		return 0, false
+	}
+	if pid := rpcBindings[id].pid; pid != 0 {
+		return procsCpuTicks(pid)
+	}
+	return 0, false
+}
+
 // prevPtrButtons is the last kind-19 flags low byte; rail click is a left
 // down edge and drag-reorder commits on the matching up edge, matching
 // Zig TABWM begin_tab_drag / end_tab_drag.
@@ -237,7 +335,12 @@ func runSeatAction(action string, c chords.Chord) {
 			openLauncher()
 		}
 	case "cycle-focus":
-		_ = applyAltTab(c.Mods&chords.ModShift != 0)
+		// #2703: demo mode parks the cycle behind the focused app's
+		// drain instead of applying it mid-burst; live mode and
+		// no-target presses apply exactly as before.
+		if !armFocusCycle(c.Mods&chords.ModShift != 0) {
+			_ = applyAltTab(c.Mods&chords.ModShift != 0)
+		}
 	case "focus-index":
 		if i, ok := ctrlIndex(c.Usage); ok {
 			_ = applyCtrlIndex(i)

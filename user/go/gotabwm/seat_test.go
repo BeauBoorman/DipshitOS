@@ -457,3 +457,34 @@ func TestLiveModeNeverChoreographs(t *testing.T) {
 		t.Fatal("demo mode must still close the countdown tab at zero")
 	}
 }
+
+// #2703: the demo run budget follows observed activity — an idle boot
+// still exits at maxTicks, activity past it re-arms the exit to
+// lastActivity + demoTeardownHold, and the cap binds a stream that never
+// quiets.
+func TestDemoTickLimit(t *testing.T) {
+	saved := lastActivityTick
+	defer func() { lastActivityTick = saved }()
+
+	lastActivityTick = 0
+	if got := demoTickLimit(maxTicks, maxTicks*2); got != maxTicks {
+		t.Fatalf("no activity must keep the base budget: %d", got)
+	}
+	// Activity while the base window is still open does nothing — the
+	// boot was never at risk.
+	lastActivityTick = 40
+	if got := demoTickLimit(maxTicks, maxTicks*2); got != maxTicks {
+		t.Fatalf("early activity must not shrink the base budget: %d", got)
+	}
+	// Activity past the window re-arms to lastActivity + the hold.
+	lastActivityTick = 118
+	if got := demoTickLimit(maxTicks, maxTicks*2); got != 118+demoTeardownHold {
+		t.Fatalf("late activity must extend the budget: %d want %d",
+			got, 118+demoTeardownHold)
+	}
+	// The cap binds a stream that never quiets.
+	lastActivityTick = 500
+	if got := demoTickLimit(maxTicks, maxTicks*2); got != maxTicks*2 {
+		t.Fatalf("a never-quiet stream must hit the cap: %d", got)
+	}
+}

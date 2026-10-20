@@ -266,6 +266,28 @@ func detectDemo() bool {
 // budget, the acceptance chain above it, and the bound still finite.
 const maxTicks = 120
 
+// demoTeardownHold is how far past the last seat-observable activity the
+// demo run budget extends (#2703). The budget was a fixed count sized
+// before the M125a seat changes; observed go-dogfood boot 04: tickLimit
+// 120 swept both tabs while script2's `dui lower 4` was still in flight —
+// the acceptance chain's tail now outlasts the pre-M125a window. Instead
+// of re-sizing the number, the budget follows what the seat can see:
+// every non-tick event (WM_KEY, WM_POINTER, window mirrors) and every
+// mailbox request the seat serves re-arms it to lastActivity +
+// demoTeardownHold, so a chain still in flight cannot be swept mid-leg
+// and a genuinely idle boot exits on the same schedule as before. The
+// cap (initial limit + maxTicks) keeps the boot bounded: a stream that
+// never quiets extends to ~2x, never forever. The hold covers the
+// observed post-activity tail — the `r` resize's mirror through
+// script2's delayed monitor commands — plus margin.
+const demoTeardownHold = 24
+
+// lastActivityTick is the composite-tick count the seat last did anything
+// externally visible at: an input/window event consumed (consumeSeatEvent)
+// or a mailbox request served (serviceRPC in the main loop). seatTick is
+// in the same units.
+var lastActivityTick uint64
+
 // pointerClickHold is how many composite ticks one `--pointer-virtio` click
 // needs at the 1 Hz kind-18 heartbeat (3 messages × 2.5 s, rounded up).
 const pointerClickHold = 8
@@ -429,10 +451,15 @@ func main() {
 	if firstBootStarted {
 		tickLimit += hostTicks
 	}
+	// #2703: the activity extension's hard bound — a stream that never
+	// quiets pushes the exit out by at most one more maxTicks.
+	tickLimitCap := tickLimit + maxTicks
 	presents, ticks := 0, 0
 	vi.ConsoleLine(MarkerServing)
 	for events := 0; !demoMode || (events < maxEvents && ticks < tickLimit); {
-		serviceRPC()
+		if served := serviceRPC(); demoMode && served > 0 {
+			lastActivityTick = uint64(ticks)
+		}
 		noteBadgeTransition()
 		if remote != nil {
 			if remote.drainInput() {
@@ -477,8 +504,14 @@ func main() {
 			bound = maxEvents
 		}
 		events += drainSeatEvents(e, vi.PollEvent, consumeSeatEvent, bound, func() bool {
-			if demoMode && ticks >= tickLimit {
-				return false
+			if demoMode {
+				// #2703: re-arm the budget on observed activity BEFORE
+				// the expiry check, so the extension the last event
+				// earned is never beaten by the tick that grants it.
+				tickLimit = demoTickLimit(tickLimit, tickLimitCap)
+				if ticks >= tickLimit {
+					return false
+				}
 			}
 			ticks++
 			if remote != nil {
@@ -564,6 +597,17 @@ func sweepHosted(close func() bool) {
 			return
 		}
 	}
+}
+
+// demoTickLimit recomputes the demo run budget for the current tick:
+// observed activity re-arms the exit to lastActivity + demoTeardownHold
+// (#2703), bounded by the cap so a stream that never quiets still cannot
+// hang the boot.
+func demoTickLimit(tickLimit, cap int) int {
+	if ext := int(lastActivityTick) + demoTeardownHold; ext > tickLimit {
+		return min(ext, cap)
+	}
+	return tickLimit
 }
 
 // seatTick is the composite tick count the last paint pass ran at, in the
@@ -682,6 +726,13 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	if launch.open && presented && launch.painted {
 		vi.ConsoleLine("gotabwm: launcher presented")
 	}
+	if demoMode {
+		// #2703: the parked focus cycle's quiet-window release runs on
+		// the composite cadence even when the strip choreography is
+		// done — a deferred chord must not outlive the demo that armed
+		// it unapplied.
+		releaseFocusCycle(ticks)
+	}
 	if stripDone || !demoMode {
 		// M79a (#1704): the auto-reorder/pin/split/close chain and the
 		// single-tab hostTicks countdown are DEMO mode only. In live mode
@@ -796,6 +847,13 @@ func consumeSeatEvent(e vi.Event) bool {
 	// bounds the boot; this only reorders within it.
 	if (e.Kind == vi.EvWmPointer || e.Kind == vi.EvWmKey) && demoMode && !stripDone {
 		stripHoldLeft = hidChordHold
+	}
+	// #2703: any non-tick event is work the seat just observed — the demo
+	// run budget re-arms on it so a still-running chain cannot be swept
+	// mid-leg (the kind-20 mirror above counts too: an app resizing is
+	// activity whether or not a key is flying).
+	if e.Kind != vi.EvCompositeTick {
+		lastActivityTick = seatTick
 	}
 	if e.Kind == vi.EvWmPointer {
 		vi.ConsoleLine(MarkerPtr)

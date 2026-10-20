@@ -353,6 +353,26 @@ var procsAlive = func(pid uint8) bool {
 	return false
 }
 
+// procsCpuTicks reads one pid's cumulative scheduler-work counter from the
+// ADR 0047 v2 snapshot (#2703's app-quiet probe: the focused tab's cpu_ticks
+// is the only seat-visible measure of work it is still doing on already-
+// delivered input). ok=false on an unreadable table, a missing pid, or a
+// kernel that answered a v1 stream — a caller that cannot probe has no
+// evidence of busyness, not proof of quiet.
+var procsCpuTicks = func(pid uint8) (uint64, bool) {
+	var rows [64]vi.ProcRow
+	n, r := vi.ProcsV2(rows[:])
+	if r < 0 {
+		return 0, false
+	}
+	for i := 0; i < n; i++ {
+		if uint8(rows[i].PID) == pid {
+			return rows[i].CpuTicks, rows[i].RowVer >= vi.ProcRowVersion2
+		}
+	}
+	return 0, false
+}
+
 // reapSessionReexec runs on the composite cadence while restores are
 // outstanding: a pid that died before declaring drops its row now, and a
 // pid still pending when the hold expires drops its row too — a declare
