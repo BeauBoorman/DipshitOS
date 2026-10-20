@@ -250,7 +250,7 @@ def serve_flintd():
         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(100):
         try:
-            s = socket.create_connection(("127.0.0.1", 4748), 0.2)
+            s = socket.create_connection(("127.0.0.1", 4750), 0.2)
             s.close()
             break
         except OSError:
