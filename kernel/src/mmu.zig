@@ -222,8 +222,11 @@ pub fn clean_dcache_range(start: u64, len: u64) void {
 
 /// Invalidate the D-cache over [start, start+len) so the CPU re-reads RAM
 /// the device just wrote (the virtio used ring). Pairs with
-/// clean_dcache_range for device-visible DMA buffers.
+/// clean_dcache_range for device-visible DMA buffers. No-op on host test
+/// processes: `dc ivac` is EL1-only (it traps at EL0 — host tests are
+/// cache-coherent anyway).
 pub fn invalidate_dcache_range(start: u64, len: u64) void {
+    if (builtin.is_test) return;
     var addr = start & ~@as(u64, 63);
     const end = start + len;
     while (addr < end) : (addr += 64) {

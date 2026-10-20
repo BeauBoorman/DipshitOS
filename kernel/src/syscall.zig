@@ -3485,15 +3485,16 @@ fn handle_audio_rec_info(args: Args, _: *exceptions.VectorFrame) u64 {
 /// input stream and a device that lacks the v1 tuple are all the audio
 /// seam's no-device refusal (ENXIO); an over-cap tuple is the caller's
 /// EINVAL; over-ring is the same "too long" name slot 43 uses; a bounded
-/// drain expiring is ETIMEDOUT; a full ring is ENOSPC; every device-level
-/// refusal is EIO.
+/// drain expiring is ETIMEDOUT, as is a ctl exchange that expired its
+/// poll budget (the mic-denied wedge — #2847); a full ring is ENOSPC;
+/// every device-level refusal is EIO.
 fn audio_rec_errno(refusal: virtio_snd.CapRefusal) ErrorCode {
     return switch (refusal) {
         .no_device, .rx_unarmed, .no_input => .enxio,
         .over_cap => .einval,
         .over_ring => .enametoolong,
         .ring_full => .enospc,
-        .drain_timeout => .etimedout,
+        .drain_timeout, .ctl_timeout => .etimedout,
         .none, .ctl_refused, .malformed, .device_refused, .epilogue => .eio,
     };
 }

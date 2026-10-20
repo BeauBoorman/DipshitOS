@@ -235,6 +235,15 @@ pub var snd_streams: u32 = 0;
 pub var snd_chmaps: u32 = 0;
 var snd_cfg_seen: bool = false;
 
+/// OBSERVED 2026-10-20 (macOS 27.2, mic-denied VZ): when the capture START
+/// exchange expires its poll budget, the host's audio backend wedges
+/// BELOW the ctl channel — every later common-config register READ parks
+/// the guest CPU inside the load (a stalled VZ trap no budget outlives;
+/// writes still post). Latched at the START timeout so every register
+/// path refuses honestly instead of hanging the boot CPU (#2847).
+pub var snd_regs_suspect: bool = false;
+var snd_status_latched: u8 = 0xff; // last status read that completed
+
 // ---------------------------------------------------------------------------
 // A2 playback state: the negotiated stream + the bounded BSS sample buffer.
 // ---------------------------------------------------------------------------
@@ -304,10 +313,15 @@ pub var beep_obs_dir: u8 = 0xff;
 pub var beep_info_status: u32 = 0xffffffff; // PCM_INFO reply status
 
 /// Current device status (device_status register, common cfg + 0x14). 0xff
-/// when the transport was never discovered.
+/// when the transport was never discovered. When the register path is
+/// suspect (a wedged device parks the CPU inside the read), the last
+/// completed read — the wedge verdict itself lives in `cap_refusal`.
 pub fn snd_status() u8 {
     if (snd_common == 0) return 0xff;
-    return vp_read8(0x14);
+    if (snd_regs_suspect) return snd_status_latched;
+    const st = vp_read8(0x14);
+    snd_status_latched = st;
+    return st;
 }
 
 /// Fresh le32 read of the device-config region (devcfg + `off`). Exposed
@@ -315,6 +329,7 @@ pub fn snd_status() u8 {
 /// BAR0 window the capability resolved inside, so the read is safe there).
 pub fn snd_read32(off: u32) u32 {
     if (snd_devcfg == 0) return 0;
+    if (snd_regs_suspect) return 0;
     return mmio.mmio_read32(snd_devcfg + off);
 }
 
@@ -332,6 +347,7 @@ pub fn snd_cfg() ?struct { jacks: u32, streams: u32, chmaps: u32 } {
 /// Arms queue 0 (control), queue 2 (stream-0 TX / playback — A2) and queue
 /// 3 (stream-0 RX / capture — M118b).
 pub fn snd_rearm() bool {
+    if (snd_regs_suspect) return false;
     snd_ready = false;
     ctrl_armed = false;
     tx_armed = false;
@@ -354,7 +370,9 @@ pub fn snd_rearm() bool {
     rx_armed = arm_queue(3, &rx_desc, &rx_avail, &rx_used, &rx_last_used, &rx_queue_notify_off);
 
     vp_write8(0x14, 1 | 2 | 8 | 4); // DRIVER_OK
-    if ((vp_read8(0x14) & 4) == 0) return false;
+    const driver_status = vp_read8(0x14);
+    snd_status_latched = driver_status;
+    if ((driver_status & 4) == 0) return false;
     // The RX queue's absence never gates playback — capture refuses by name.
     snd_ready = ctrl_armed and tx_armed;
     evidence.dump_str("VS rearm st=");
@@ -743,14 +761,11 @@ fn ctl_exchange(request: []const u8, reply_len: usize) u32 {
 
 /// PCM_INFO(0): ask the device what stream 0 is (the A1-finding workaround
 /// — the config counts read 0, so the driver must ASK). Records the reply
-/// in `beep_obs_*` and returns the status.
+/// in `beep_obs_*` and returns the status. A refused exchange keeps the
+/// LAST observed tuple — slot 91's report is the observation, not the
+/// exchange (#2847: a wedged device must not erase its own cap record).
 pub fn snd_pcm_probe() u32 {
     beep_info_status = 0xffffffff;
-    beep_obs_formats = 0;
-    beep_obs_rates = 0;
-    beep_obs_ch_min = 0;
-    beep_obs_ch_max = 0;
-    beep_obs_dir = 0xff;
     if (!ctrl_armed) return 0xffffffff;
     var req: QueryInfo = .{ .hdr = .{ .code = R_PCM_INFO }, .start_id = 0, .count = 1, .size = @sizeOf(PcmInfo) };
     const st = ctl_exchange(std.mem.asBytes(&req), @sizeOf(PcmInfo) + 4);
@@ -1248,7 +1263,8 @@ pub const CapRefusal = enum(u8) {
     over_cap, // the requested tuple is beyond S16/48kHz/mono
     over_ring, // the request exceeds the ring bound
     no_input, // stream 0 is not INPUT, or lacks the v1 tuple
-    ctl_refused, // a control exchange refused or timed out
+    ctl_refused, // a control exchange refused (transport-level failure)
+    ctl_timeout, // a control exchange expired its poll budget — the mic-denied wedge
     drain_timeout, // the bounded RX drain expired (e.g. host mic denied)
     malformed, // malformed used-ring completion
     device_refused, // the device refused a posted buffer
@@ -1260,6 +1276,13 @@ pub var cap_refusal: CapRefusal = .none;
 fn cap_set_fail(why: []const u8, refusal: CapRefusal) void {
     cap_fail = why;
     cap_refusal = refusal;
+}
+
+/// The refusal class for a dead ctl exchange: stage 3 — the used-ring
+/// poll expired its budget — is a TIMEOUT (the mic-denied wedge's name is
+/// ETIMEDOUT); every other stage is a transport refusal (EIO).
+fn ctl_refusal_class() CapRefusal {
+    return if (ctl_fail_stage == 3) .ctl_timeout else .ctl_refused;
 }
 
 /// M118c (#2481): the capture-side info struct `sys_audio_rec_info` copies
@@ -1376,6 +1399,9 @@ fn rx_post(slot: usize) void {
     mmu.clean_dcache_range(@intFromPtr(&rx_avail), @sizeOf(VirtqAvail));
     kick(rx_queue_notify_off, 3);
     cap_submitted += 1;
+    if (@import("builtin").is_test) {
+        if (test_rx_post_hook) |h| h(slot);
+    }
 }
 
 /// Consume one completed RX slot: verify the status the device wrote,
@@ -1404,6 +1430,45 @@ fn rx_consume(slot: usize, used_len: u32) u32 {
     cap_bytes += payload;
     cap_frames = @intCast(cap_bytes / cap_frame_bytes);
     return S_OK;
+}
+
+/// The bounded RX drain: consume completions into the ring until
+/// `want_bytes` land, the device stops completing (`outstanding` hits 0),
+/// or `deadline_ns` fires. The deadline is evaluated EVERY iteration —
+/// ahead of the no-completion branch — because a device that completes
+/// posted buffers continuously (OBSERVED 2026-10-20, macOS 27.2
+/// mic-denied VZ input stream: len = PcmStatus + 0 payload, reposted
+/// forever) keeps `outstanding` constant and would starve an
+/// idle-path-only check (#2847). Extracted so the host test can drive it.
+fn cap_drain(want_bytes: usize, deadline_ns: u64) void {
+    var outstanding: u32 = cap_slots;
+    var spins: usize = 0;
+    while (cap_bytes < want_bytes and outstanding > 0) : (spins += 1) {
+        mmu.invalidate_dcache_range(@intFromPtr(&rx_used), @sizeOf(VirtqUsed));
+        const expired = if (timer.freq != 0)
+            snd_stream_now() >= deadline_ns
+        else
+            spins > 400_000_000;
+        if (expired) {
+            cap_set_fail("RX drain timeout", .drain_timeout);
+            return;
+        }
+        if (rx_used.idx == rx_last_used) continue;
+        const used_elem = rx_used.ring[rx_last_used % rx_queue_size];
+        rx_last_used +%= 1;
+        outstanding -= 1;
+        cap_completed += 1;
+        if (used_elem.id % 3 != 0 or used_elem.id / 3 >= cap_slots) {
+            cap_set_fail("RX malformed completion", .malformed);
+            return;
+        }
+        const slot = used_elem.id / 3;
+        if (rx_consume(slot, used_elem.len) != S_OK) return;
+        if (cap_bytes < want_bytes) {
+            rx_post(slot);
+            outstanding += 1;
+        }
+    }
 }
 
 /// Bounded capture: negotiate the v1 tuple on stream 0, then drain the
@@ -1449,7 +1514,7 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     const info_st = snd_pcm_probe();
     cap_info_status = info_st;
     if (info_st != S_OK) {
-        cap_set_fail("PCM_INFO refused", .ctl_refused);
+        cap_set_fail("PCM_INFO refused", ctl_refusal_class());
         return info_st;
     }
     if (cap_admit_caps(beep_obs_dir, beep_obs_formats, beep_obs_rates, beep_obs_ch_min)) |why| {
@@ -1470,13 +1535,13 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     const params_st = ctl_exchange(std.mem.asBytes(&req), 4);
     cap_params_status = params_st;
     if (params_st != S_OK) {
-        cap_set_fail("SET_PARAMS refused", .ctl_refused);
+        cap_set_fail("SET_PARAMS refused", ctl_refusal_class());
         return params_st;
     }
     const prep_st = ctl_pcm_simple(R_PCM_PREPARE);
     cap_prepare_status = prep_st;
     if (prep_st != S_OK) {
-        cap_set_fail("PREPARE refused", .ctl_refused);
+        cap_set_fail("PREPARE refused", ctl_refusal_class());
         return prep_st;
     }
     // 3. START, then post the slot buffers — the device fills a posted
@@ -1490,9 +1555,11 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     const start_st = ctl_pcm_simple(R_PCM_START);
     ctl_spin_budget = 60_000_000;
     cap_start_status = start_st;
-    var outstanding: u32 = 0;
     if (start_st != S_OK) {
-        cap_set_fail("START refused", .ctl_refused);
+        cap_set_fail("START refused", ctl_refusal_class());
+        // A START that expired its budget wedged the device below the ctl
+        // channel — every later register read stalls (OBSERVED 2026-10-20).
+        if (ctl_fail_stage == 3) snd_regs_suspect = true;
         // Cleanup must not mask the primary refusal.
         const cleanup = cap_fail;
         const cleanup_refusal = cap_refusal;
@@ -1506,38 +1573,8 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
     //    is live, a spin budget otherwise — the self-test asks for ~171 ms
     //    of audio and gets seconds of slack).
     for (0..cap_slots) |s| rx_post(s);
-    outstanding = cap_slots;
     const want_bytes: usize = @as(usize, want_frames) * cap_frame_bytes;
-    const deadline_ns = snd_stream_now() + 5 * std.time.ns_per_s;
-    var spins: usize = 0;
-    while (cap_bytes < want_bytes and outstanding > 0) : (spins += 1) {
-        mmu.invalidate_dcache_range(@intFromPtr(&rx_used), @sizeOf(VirtqUsed));
-        if (rx_used.idx == rx_last_used) {
-            const expired = if (timer.freq != 0)
-                snd_stream_now() >= deadline_ns
-            else
-                spins > 400_000_000;
-            if (expired) {
-                cap_set_fail("RX drain timeout", .drain_timeout);
-                break;
-            }
-            continue;
-        }
-        const used_elem = rx_used.ring[rx_last_used % rx_queue_size];
-        rx_last_used +%= 1;
-        outstanding -= 1;
-        cap_completed += 1;
-        if (used_elem.id % 3 != 0 or used_elem.id / 3 >= cap_slots) {
-            cap_set_fail("RX malformed completion", .malformed);
-            break;
-        }
-        const slot = used_elem.id / 3;
-        if (rx_consume(slot, used_elem.len) != S_OK) break;
-        if (cap_bytes < want_bytes) {
-            rx_post(slot);
-            outstanding += 1;
-        }
-    }
+    cap_drain(want_bytes, snd_stream_now() + 5 * std.time.ns_per_s);
     const tail_st = blk: {
         // The epilogue's own refusal never masks the drain's primary one.
         const primary = cap_fail;
@@ -1565,6 +1602,12 @@ pub fn snd_capture(format: u8, rate: u8, channels: u8, want_frames: u32) u32 {
 /// NEXT user of the device.
 pub var cap_recovered: bool = false;
 fn snd_capture_recover() void {
+    // On a START-expired wedge the recovery reset's first register read
+    // never completes — recovery is itself the hang, so the refusal stands
+    // and the device stays armed for a later, healthier attempt. A
+    // drain-time wedge (START answered; the stream datapath then stopped)
+    // still rearms — the registers answer there.
+    if (snd_regs_suspect) return;
     if (cap_stop_status == 0xffffffff or cap_release_status == 0xffffffff) {
         cap_recovered = true;
         _ = snd_rearm();
@@ -1704,8 +1747,18 @@ var io_context: u8 = 0;
 // Host tests inject the same pump boundary; production always uses PCI DMA.
 pub var test_stream_io: ?playback.Io = null;
 pub var test_stream_caps: ?pcm.Capabilities = null;
+/// Host-test wall clock: when set, `snd_stream_now` reports it — the
+/// drain's deadline is wall-clock, so a test driving the drain moves
+/// time through this counter.
+pub var test_now_ns: ?u64 = null;
+/// Host-test device model: when set, `rx_post` invokes it after the
+/// kick — a fake device completing the just-posted buffer.
+pub var test_rx_post_hook: ?*const fn (slot: usize) void = null;
 
 pub fn snd_stream_now() u64 {
+    if (@import("builtin").is_test) {
+        if (test_now_ns) |t| return t;
+    }
     if (timer.freq == 0) return 0;
     return @intCast(@as(u128, timer.cntpct()) * 1_000_000_000 / timer.freq);
 }
@@ -2085,6 +2138,125 @@ test "virtio_snd: capture refuses honestly when absent or over-cap" {
     try std.testing.expectEqual(@as(u32, 0xffffffff), snd_capture(cap_format, cap_rate, cap_channels, 0));
     try std.testing.expectEqualStrings("capture request exceeds ring", cap_fail);
     try std.testing.expectEqual(CapRefusal.over_ring, cap_refusal);
+}
+
+test "virtio_snd: RX drain deadline is unconditional — continuous completions cannot starve it (#2847)" {
+    // #2847: a mic-denied VZ input stream completes every posted buffer
+    // at once — len = PcmStatus + 0 sample bytes — and the repost keeps
+    // `outstanding` constant, so an expiry check that only runs on the
+    // no-completion path starves forever. Drive that exact device: every
+    // post completes immediately, each completion costs 1 ms of wall
+    // clock, and the drain must still retire on the deadline.
+    const saved_freq = timer.freq;
+    const saved_now = test_now_ns;
+    const saved_hook = test_rx_post_hook;
+    const saved_notify = snd_notify;
+    const saved_notify_mult = snd_notify_mult;
+    const saved_rx_notify_off = rx_queue_notify_off;
+    const saved_rx_last_used = rx_last_used;
+    defer {
+        timer.freq = saved_freq;
+        test_now_ns = saved_now;
+        test_rx_post_hook = saved_hook;
+        snd_notify = saved_notify;
+        snd_notify_mult = saved_notify_mult;
+        rx_queue_notify_off = saved_rx_notify_off;
+        rx_last_used = saved_rx_last_used;
+    }
+    timer.freq = 24_000_000;
+    test_now_ns = 0;
+    test_rx_post_hook = struct {
+        fn complete(slot: usize) void {
+            // The wedge's device side: a posted period returns at once
+            // with the status word and zero sample bytes.
+            cap_bufs[slot].status.status = S_OK;
+            rx_used.ring[rx_used.idx % rx_queue_size] =
+                .{ .id = @intCast(slot * 3), .len = @sizeOf(PcmStatus) };
+            rx_used.idx +%= 1;
+            test_now_ns.? +%= std.time.ns_per_ms;
+        }
+    }.complete;
+    var notify_sink: [64]u8 align(2) = @splat(0);
+    snd_notify = @intFromPtr(&notify_sink);
+    snd_notify_mult = 1;
+    rx_queue_notify_off = 0;
+    rx_last_used = 0;
+    rx_used.idx = 0;
+    rx_avail.idx = 0;
+    cap_ring_reset();
+    cap_submitted = 0;
+    cap_completed = 0;
+    cap_frames = 0;
+    cap_bytes = 0;
+    cap_nonzero = 0;
+    cap_sum = 0x811c9dc5;
+    cap_set_fail("", .none);
+
+    for (0..cap_slots) |s| rx_post(s);
+    // 100 ms deadline, ~1 ms per completion: the drain expires mid-stream
+    // — completions never stop arriving and want_bytes never lands.
+    cap_drain(16 * 1024, 100 * std.time.ns_per_ms);
+    try std.testing.expectEqualStrings("RX drain timeout", cap_fail);
+    try std.testing.expectEqual(CapRefusal.drain_timeout, cap_refusal);
+    // Completions WERE being served — expiry fired anyway.
+    try std.testing.expect(cap_completed > cap_slots);
+    try std.testing.expectEqual(@as(u64, 0), cap_bytes);
+    cap_ring_reset();
+}
+
+test "virtio_snd: a ctl exchange that expired its poll budget names a timeout, not a refusal (#2847)" {
+    const saved_stage = ctl_fail_stage;
+    defer ctl_fail_stage = saved_stage;
+    ctl_fail_stage = 3; // the used-ring poll expired
+    try std.testing.expectEqual(CapRefusal.ctl_timeout, ctl_refusal_class());
+    ctl_fail_stage = 1; // unarmed
+    try std.testing.expectEqual(CapRefusal.ctl_refused, ctl_refusal_class());
+    ctl_fail_stage = 4; // bad used id
+    try std.testing.expectEqual(CapRefusal.ctl_refused, ctl_refusal_class());
+}
+
+test "virtio_snd: a suspect register path refuses everywhere — status latched, rearm refused, recovery skipped (#2847)" {
+    const saved_suspect = snd_regs_suspect;
+    const saved_stop = cap_stop_status;
+    const saved_release = cap_release_status;
+    const saved_recovered = cap_recovered;
+    defer {
+        snd_regs_suspect = saved_suspect;
+        cap_stop_status = saved_stop;
+        cap_release_status = saved_release;
+        cap_recovered = saved_recovered;
+    }
+    // START-expired wedge: the recovery reset would stall on the wedged
+    // device's registers — no rearm runs, cap_recovered stays false, and
+    // the register accessors refuse honestly.
+    snd_regs_suspect = true;
+    cap_stop_status = 0xffffffff;
+    cap_release_status = 0xffffffff;
+    cap_recovered = false;
+    snd_capture_recover();
+    try std.testing.expect(!cap_recovered);
+    try std.testing.expect(!snd_rearm());
+    // A live-read would stall inside the load; the suspect path must
+    // answer the latched status without touching the device.
+    snd_common = 1;
+    snd_status_latched = 0x0f;
+    try std.testing.expectEqual(@as(u8, 0x0f), snd_status());
+    snd_common = 0; // restore before the healthy rearm path below
+    snd_status_latched = 0xff;
+    snd_devcfg = 1;
+    defer snd_devcfg = 0;
+    try std.testing.expectEqual(@as(u32, 0), snd_read32(0));
+    // Drain-time wedge (registers healthy): the rearm attempts recovery —
+    // snd_common == 0 in tests, so the attempt is what cap_recovered names.
+    snd_regs_suspect = false;
+    snd_capture_recover();
+    try std.testing.expect(cap_recovered);
+    // Clean epilogue: nothing to recover.
+    cap_stop_status = S_OK;
+    cap_release_status = S_OK;
+    cap_recovered = false;
+    snd_capture_recover();
+    try std.testing.expect(!cap_recovered);
 }
 
 test "virtio_snd: cap info reports the observed INPUT verdict with the v1 tuple" {
