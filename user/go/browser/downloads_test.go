@@ -14,6 +14,7 @@ func TestWantsDownload(t *testing.T) {
 		want   bool
 	}{
 		{"/host/DLPIC.QOI", true},
+		{"/host/RDRPDF.PDF", true},
 		{"http://10.0.0.2/pic.png", true},
 		{"https://example.com/pack.zip", true},
 		{"/host/BUILD.ELF", true},

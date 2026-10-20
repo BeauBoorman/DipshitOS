@@ -112,7 +112,7 @@ func (c dlCanvas) FillRect(r widgets.Rect, rgb uint32) {
 // keep the navigation path, so .html/.txt/plain links render as before.
 func wantsDownload(resolved string) bool {
 	switch mime.Sniff(downloadName(resolved), nil) {
-	case mime.Image, mime.Audio, mime.Archive, mime.Binary:
+	case mime.Image, mime.Audio, mime.Archive, mime.Binary, mime.Document:
 		return true
 	}
 	return false
