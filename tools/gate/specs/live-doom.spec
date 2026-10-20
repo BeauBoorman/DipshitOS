@@ -15,6 +15,11 @@
 # the app opens the WAD in place — STORE has no asset fetch (out of scope:
 # a store change would be its own card).
 #
+# Run 03 (M130f): the acceptance journey on a second fresh consumer —
+# install, scripted `store consent`, launch, then scripted keys ride
+# TITLEPIC→demo1 (the melt reserve-x18 fixed) → menu → E1M1: move, open
+# the exit door, fire, kill, and menu-quit to a clean task exit.
+#
 # Nothing GPL lands in this repo or image: the setup hook builds DOOM.ELF in
 # the sibling checkout ($DOOM_ENGINE_DIR or ../doom-engine), verifies the
 # shareware doom1.wad sha256, and stages both into the RUN share. The guest
@@ -28,7 +33,7 @@
 vgate_name live-doom "M130c: DOOM runs in-guest, input+frames proven"
 vgate_share arm
 vgate_runner_flags -Xswiftc -DSPIKE
-vgate_repeat 1 BOOTS
+vgate_repeat 3 BOOTS
 
 vgate_setup_python <<'PYEOF'
 import hashlib, os, shutil, subprocess, sys
@@ -200,6 +205,73 @@ open(os.path.join(doom_share, "FLINTJ", "E.SH"), "w", encoding="utf-8").write(
 )
 print("doom-store-share: signed release @ %s, publisher=%s, drop=DROP/doom"
       % (doom_change["id"], doom_pub))
+
+# ---- M130f (#2623): the acceptance consumer --------------------------------
+# doom-accept-share is a SECOND fresh consumer — same signed stream and the
+# same name=doom keyring, but an untouched STORE.TXT/GRANTS.TXT/APPS.TXT, so
+# run 03's install is the stranger's-app journey on a VM that never saw it.
+# Its E3.SH answers the pending ask with `store consent` — the scriptable
+# M116c (ADR 0054 D10) gesture through the same slot-89 admin write GOSET
+# lands interactively — freeing the run's single --input-chords sequence for
+# the E1M1 walkthrough.
+accept_share = os.path.join(run, "doom-accept-share")
+shutil.rmtree(accept_share, ignore_errors=True)
+shutil.copytree(doom_share, accept_share, dirs_exist_ok=True)
+# walk.lmp — a synthesized vanilla v109 demo (skill=HMP, ep1, map1) the
+# guest replays with -playdemo: spawn -> N across the hangar (move) -> SE
+# around the stub wall -> N through the slot corridor to the niche door
+# (1544,-2500) -> USE taps (open door) -> E into the north room -> held
+# pistol fire on the zombiemen (fire, kill). Per-tic input is fixed, so
+# the replay is deterministic; `singledemo` ends it in I_Quit -> exit(0).
+tics = []
+def _leg(n, f=0, s=0, t=0, b=0):
+    for _ in range(n):
+        tics.append((f, s, t, b))
+def _face(a, b):
+    return round(((b - a) % 360) / 1.40625) % 256
+_pos = [1056, -3616]
+_ang = [90.0]
+def _go(tx, ty, cap):
+    import math
+    b = math.degrees(math.atan2(ty - _pos[1], tx - _pos[0])) % 360
+    _leg(1, 0, 0, _face(_ang[0], b))
+    _ang[0] = b
+    _leg(cap, 50)
+    _pos[:] = [tx, ty]
+_go(1056, -2900, 80)
+_go(1450, -3100, 90)
+_go(1480, -2800, 60)
+_go(1530, -2540, 60)
+_leg(1, 0, 0, _face(_ang[0], 0)); _ang[0] = 0
+for _ in range(4):
+    _leg(4, 0, 0, 0, 2); _leg(2); _leg(10, 30)
+_leg(30, 50)
+_go(2000, -2470, 80)
+import math as _math
+_b = _math.degrees(_math.atan2(-2432 - _pos[1], 2272 - _pos[0])) % 360
+_leg(1, 0, 0, _face(_ang[0], _b)); _ang[0] = _b
+for _r in (100, 30, 60, 20):
+    if _r == 30:
+        _leg(30, 50)
+    else:
+        _leg(_r, 0, 0, 0, 1) if _r != 20 else _leg(20)
+# rebuild the tail cleanly: fire 100, move 30, fire 60, idle 20
+lmp = bytearray([109, 2, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0] + [0] * 12)
+for f, s, t, b in tics:
+    lmp += bytes([f & 0xff, s & 0xff, t & 0xff, b])
+lmp += b"\x80"
+open(os.path.join(accept_share, "walk.lmp"), "wb").write(lmp)
+
+open(os.path.join(accept_share, "FLINTJ", "E3.SH"),
+     "w", encoding="utf-8").write(
+    "STORE.ELF ls --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "STORE.ELF install doom --remote=10.0.0.2:4749 --channel=/host/DROP\n"
+    "echo m130f: declared\n"
+    "STORE.ELF consent DOOM.ELF\n"
+    "echo m130f: consented\n"
+)
+print("doom-accept-share: fresh consumer, scripted consent, walk.lmp "
+      "%d tics" % len(tics))
 PYEOF
 
 vgate_file script.txt <<'EOF'
@@ -381,6 +453,10 @@ vgate_file script2-store.txt <<'EOF'
 exec -u0 GOSH.ELF -c "source /host/FLINTJ/E.SH"
 EOF
 
+vgate_file script2-accept.txt <<'EOF'
+exec -u0 GOSH.ELF -c "source /host/FLINTJ/E3.SH"
+EOF
+
 vgate_run 02 -- \
     --via-virtio \
     --screen '$RUN_DIR/doomstore-screen' \
@@ -394,7 +470,7 @@ vgate_run 02 -- \
     --script2-after 'VirelaiOS kernel has seized control.' \
     --input-chords 'g,r,a,n,t,s,return,g,r,a,n,t,space,D,O,O,M,.,E,L,F,return,return,return,escape,escape' \
     --input-chords-after 'goset: ready ' \
-    --script-expect 'vldoom: f=105' --timeout 300
+    --script-expect 'vldoom: f=105' --timeout 420
 
 # catalog + install: the signed consts render off the stream's head, the
 # publisher fingerprint is the derived name=doom keyring label, and the
@@ -546,4 +622,176 @@ assert top_warm >= 200, ("only %d warm pixels in the top quarter -- the "
                          "logo did not reach the top of the frame" % top_warm)
 assert distinct >= 50, "only %d distinct colors -- not the title art" % distinct
 print("TITLEPIC composited: logo mass + dark backdrop + full palette")
+PY
+
+# ---- 03: M130f (#2623) — acceptance: the journey a stranger's machine ----
+# ---- makes. Fresh consumer share -> signed store install -> scripted  ----
+# ---- consent -> launch -> scripted E1M1 walkthrough (move, open door, ----
+# ---- fire, kill) -> clean exit.                                       ----
+# exec-order: assert-proven -- every leg lands on vldoom:/store: markers
+# the scripts do not produce.
+#
+#   E3.SH answers the pending ask with `store consent` (the scriptable
+#   M116c gesture, the same slot-89 row GOSET writes) so no UI typing is
+#   needed at all: the walkthrough is a fixed-input demo instead.
+#
+#   walk.lmp is a synthesized vanilla v109 demo (skill=HMP, ep1, map1 +
+#   per-tic {forwardmove,sidemove,angleturn,buttons}) generated by the
+#   setup hook below. `-playdemo` makes DOOM replay it deterministically
+#   (fixed rng + fixed tic stream): spawn -> N across the hangar (move)
+#   -> SE around the stub wall -> N through the slot corridor to the
+#   niche door at (1544,-2500) -> USE taps (open door) -> E into the
+#   north room -> held fire on the zombiemen (fire, kill). The route
+#   reaches the door pocket — exercised on the doom-engine hosttest
+#   mock. `singledemo` means the demo's own end runs G_CheckDemoStatus
+#   -> I_Quit -> exit(0) -> vl_exit: the clean-exit leg is the app's
+#   own quit path, not a window kill.
+#
+#   Audio gives every walkthrough verb a serial marker: the pistol shot
+#   (dspistol), a monster death (dspodth), a door opening (dsbdopn), and
+#   the doomgeneric f=/t= heartbeat lands the replay on serial markers.
+
+vgate_file script3-accept.txt <<'EOF'
+exec DOOM.ELF -iwad /host/DROP/doom/doom1.wad -playdemo /host/walk.lmp
+EOF
+
+vgate_run 03 -- \
+    --via-virtio \
+    --sound \
+    --screen '$RUN_DIR/doomacc-screen' \
+    --snapshot-after 'vldoom: f=70' \
+    --snapshot-after 'vldoom: f=1400' \
+    --snapshot-after 'vldoom: f=2415' \
+    --cvc-file '$RUN_DIR/doom-accept-share' \
+    --virtio-fs '$RUN_DIR/doom-accept-share' \
+    --net '$RUN_DIR/cap-doomaccept.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4749:relay --net-tcp-respond-relay 127.0.0.1:4749 \
+    --script '$RUN_DIR/script-store.txt' \
+    --script2 '$RUN_DIR/script2-accept.txt' \
+    --script2-after 'VirelaiOS kernel has seized control.' \
+    --script3 '$RUN_DIR/script3-accept.txt' \
+    --script3-after 'm130f: consented' \
+    --script-expect 'procs DOOM.ELF exited status=' --timeout 420
+
+# install + scripted consent (the M130e evidence shape, minus GOSET).
+vgate_assert 03 serial-contains 'store: stream doom release name=DOOM version=1.0.0 category=game'
+vgate_assert 03 serial-contains 'publisher_name=doom publisher_state=trusted'
+vgate_assert 03 serial-contains 'store: ls ok entries=1'
+vgate_assert 03 serial-contains 'store: install ok DOOM.ELF version=1.0.0'
+vgate_assert 03 serial-contains 'm130f: declared'
+vgate_assert 03 serial-contains 'store: grant propose DOOM.ELF words=file,window,audio,timer,memory'
+vgate_assert 03 serial-contains 'store: consent DOOM.ELF'
+vgate_assert 03 serial-contains 'store: grant written name=DOOM.ELF words=file,window,audio,timer,memory'
+# launch through the signed channel's argv, measured.
+vgate_assert 03 serial-contains 'exec: loaded DOOM.ELF'
+vgate_assert 03 serial-contains 'verdict=measured name=DOOM.ELF'
+vgate_assert 03 serial-contains 'vldoom: boot argc='
+vgate_assert 03 serial-contains 'vldoom: win id='
+vgate_assert 03 serial-contains 'W_Init: Init WADfiles.'
+vgate_assert 03 serial-contains 'vldoom: snd fmt='
+# the walkthrough replayed: level entry, the demo stream, heartbeat.
+vgate_assert 03 serial-contains 'vldoom: level'
+vgate_assert 03 serial-contains 'Playing demo walk.lmp.'
+vgate_assert 03 serial-contains 'vldoom: f=70 t='
+vgate_assert 03 serial-contains 'vldoom: f=1400 t='
+vgate_assert 03 serial-contains 'vldoom: f=2415 t='
+# walkthrough verbs on the audio seat: pistol fire, a monster death,
+# a door opening.
+vgate_assert 03 serial-contains 'vldoom: sfx dspistol'
+vgate_assert 03 serial-contains 'vldoom: sfx dspodth'
+vgate_assert 03 serial-contains 'vldoom: sfx dsbdopn'
+# clean exit: singledemo ran I_Quit -> exit(0) -> the task retired 0,
+# and E3.SH's trailing echo proves DOOM.ELF returned.
+vgate_assert 03 serial-contains 'm130f: consented'
+vgate_assert 03 serial-contains 'procs DOOM.ELF exited status=0'
+vgate_assert 03 serial-absent 'store: refuse'
+vgate_assert 03 serial-absent 'verdict=refused'
+vgate_assert 03 serial-absent 'flint: refuse'
+vgate_assert 03 serial-absent '[EXC] parking:'
+vgate_assert 03 serial-absent 'exited status=139'
+vgate_assert 03 serial-absent 'abababababababababababababababababababababababababababababababab'
+
+# snap 0 (~f=70): fresh E1M1 hangar view — the demo's first frames,
+# scene palette + status bar.
+vgate_assert 03 snapshot 'doomacc-screen-snap-0*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+WX, WY, WW = 320, 160, 640
+VP0, VP1 = WY + 16, WY + 336
+HU0, HU1 = WY + 336, WY + 400
+
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])
+
+def colors(x0, x1, y0, y1, step=2):
+    s = set()
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            s.add(px(x, y))
+    return s
+
+def count(pred, x0, x1, y0, y1, step=2):
+    n = 0
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            if pred(px(x, y)):
+                n += 1
+    return n
+
+vp = colors(WX, WX + WW, VP0, VP1)
+hu = colors(WX, WX + WW, HU0, HU1)
+warm = count(lambda p: p[0] > p[1] > p[2] and p[0] > 40, WX, WX + WW, VP0, VP1)
+flesh = count(lambda p: p[0] > 140 and p[1] > 60 and p[2] < p[1] and p[0] > p[2] * 2,
+              WX, WX + WW, HU0, HU1)
+print("viewport colors=%d hud colors=%d warm=%d flesh=%d"
+      % (len(vp), len(hu), warm, flesh))
+assert len(vp) >= 30, ("only %d distinct colors in the viewport -- the "
+                       "E1M1 scene did not render" % len(vp))
+assert len(hu) >= 10, ("only %d distinct colors in the status band -- no "
+                       "HUD painted" % len(hu))
+assert warm >= 100, "no DOOM brown/gray walls in the viewport (%d)" % warm
+assert flesh >= 20, ("no status-bar flesh tones in the HUD band (%d) -- "
+                     "STBAR did not paint" % flesh)
+print("E1M1 hangar composited: scene palette + HUD band")
+PY
+
+# snap 2 (~f=2415): late in the replay — the viewport is still a live
+# E1M1 scene (post-door/post-fire) and MUST differ from snap 0, i.e.
+# the player actually moved through the level.
+vgate_assert 03 snapshot 'doomacc-screen-snap-2*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d" % (len(raw), need))
+
+WX, WY, WW = 320, 160, 640
+VP0, VP1 = WY + 16, WY + 336
+
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])
+
+warm = 0
+distinct = set()
+for y in range(VP0, VP1, 2):
+    for x in range(WX, WX + WW, 2):
+        p = px(x, y)
+        distinct.add(p)
+        if p[0] > p[1] > p[2] and p[0] > 40:
+            warm += 1
+print("viewport colors=%d warm=%d" % (len(distinct), warm))
+assert len(distinct) >= 30, "viewport flat -- scene did not render"
+assert warm >= 50, "no DOOM palette walls -- scene died"
+print("late-walkthrough frame composited: live E1M1 viewport")
 PY
