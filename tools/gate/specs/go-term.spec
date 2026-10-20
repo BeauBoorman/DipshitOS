@@ -28,8 +28,15 @@
 # host/vm-runner main.swift), which is why the lines are cd forms typed
 # over --input-chords.
 #
+# M149b (#2807) adds leg 02: OSC-8 hyperlinks — a sourced script paints an
+# https and an ftp link, SGR mouse reports over ?1000/?1006 resolve the
+# clicks against the app's own cell mirror, ftp refuses by name and https
+# opens through mime.Open -> WEB.ELF; `term-profile` applies a seeded named
+# profile into SETTINGS.TXT.
+#
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goterm.sh   ->  .build/go/GOTERM.ELF
+#   bash tools/go/build-web.sh browser  ->  .build/go/WEB.ELF  (leg 02)
 #
 # exec-order: assert-proven -- the run ends on `rx-goterm-ok`, which only the
 # script prints, and the stage gate that forwards the close waits on the app's
@@ -189,3 +196,117 @@ print("order ok: ready@%d prompt@%d cd/data@%d status=%d "
       (ready_i, prompt_i, line1_i, st1, line2_i, st2, prompt2_i,
        restart_i, close_i, rx_i))
 PY
+
+# --- M149b (#2807): OSC-8 link -> click -> WEB.ELF, and named profiles ----
+# GOTERM owns OSC-8 inside its own write/read seams: the kernel emulator
+# consumes `ESC]8;params;URI ST` whole, so the app mirrors link cells on the
+# write path (injecting SGR 4/24 around the span) and extracts the kernel's
+# SGR mouse reports (?1000/?1006 armed at session start) on the read path.
+# The link text is painted by a SOURCED script (grid-only output, no klog)
+# so its row is deterministic after `clear`: `webdoc` paints grid row 0
+# cols 0-5, `ftplink` row 1 cols 0-6. Leg 02 seats NO WM: under zig TABWM
+# every content-area pointer sample dies in handle_pointer's sidebar gate
+# (it never calls wmctl_content_ptr), so terminal mouse reports are
+# impossible there — the kernel shim's pointer_tick -> content_pointer_pass
+# is the path that reports. Declare is then refused honestly and the plain
+# user window paints at GOTERM's declared 64,48,640,400 (the same shape
+# live-term-depth run 01 proves): client top_y = 64, 8x16 cells, so
+# (92,88) hits ftplink's cell (x=4,y=2) and (84,72) hits webdoc's
+# (x=3,y=1).
+# Click order matters: the ftp refusal spawns nothing, so it clicks first;
+# the https click spawns WEB.ELF over GOTERM's region, so it must be the
+# LAST pointer step (the sequence is one burst). Each click REPEATS: the
+# cv-input drain (poll_input) consumes the whole used ring in one pass, so
+# a down+up pair decoded between two pointer_ticks collapses the release
+# edge — observed as a lone press with no report pair. A collapsed attempt
+# leaves the press latched at the same cell, so the next repetition's
+# release pairs and resolves (self-healing); WEB isn't a bound terminal,
+# so its over-window never shields GOTERM's cells from later attempts.
+# `term-profile dusk` merges the seeded profile into SETTINGS.TXT through
+# the crash-safe publish (share-checked) before the click burst.
+
+vgate_file linkboot.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOTERM.ELF
+EOF
+
+vgate_file linkclose.txt <<'EOF'
+dui close 2
+echo rx-goterm-link-ok
+EOF
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "WEB.ELF")
+if not os.path.exists(src):
+    sys.exit("WEB.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-web.sh browser")
+shutil.copy(src, os.path.join(share, "WEB.ELF"))
+print("staged WEB.ELF into share (%d bytes)" % os.path.getsize(src))
+# The OSC-8 fixture: `clear` makes the painted rows deterministic, then two
+# printf links — https at grid row 0, ftp at row 1 (params field empty; ST
+# is ESC-\\ inside the single quotes).
+with open(os.path.join(share, "LINK.SH"), "w") as fh:
+    fh.write("clear\n")
+    fh.write("printf '\\e]8;;https://example.com/\\e\\\\webdoc\\e]8;;\\e\\\\\\n'\n")
+    fh.write("printf '\\e]8;;ftp://example.com/\\e\\\\ftplink\\e]8;;\\e\\\\\\n'\n")
+# A named profile: colours only — no font_size — so the click geometry
+# (8x16 cells) survives its application.
+with open(os.path.join(share, "GOTERM-PROFILES.TXT"), "w") as fh:
+    fh.write("# M149b gate fixture\n")
+    fh.write("dusk.theme = custom\n")
+    fh.write("dusk.palette_fg = e0e6ed\n")
+    fh.write("dusk.palette_bg = 0b1020\n")
+    fh.write("dusk.palette_accent = 7aa2f7\n")
+print("seeded LINK.SH + GOTERM-PROFILES.TXT")
+PY
+
+vgate_run 02 -- --display --input \
+    --screen '$RUN_DIR/screen-link' \
+    --via-virtio \
+    --script '$RUN_DIR/linkboot.txt' \
+    --input-string $'source LINK.SH\nterm-profile dusk\necho LINKED\n' \
+    --input-string-after 'goterm: prompt' \
+    --pointer-virtio '92,88,c;92,88,c;92,88,c;84,72,c;84,72,c;84,72,c' \
+    --pointer-virtio-after 'goterm: line echo LINKED' \
+    --script3 '$RUN_DIR/linkclose.txt' \
+    --script3-after 'web: ready' \
+    --script-expect 'rx-goterm-link-ok' --timeout 300
+
+vgate_assert 02 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 02 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 02 serial-contains 'goterm: attached'
+vgate_assert 02 serial-contains 'goterm: ready'
+vgate_assert 02 serial-contains 'goterm: prompt'
+# The sourced line + the front-end profile command + the barrier echo all
+# submitted through the editor; the click sequence fired only after the
+# last one (pointer-virtio-after pins the choreography).
+vgate_assert 02 serial-contains 'goterm: line source LINK.SH'
+vgate_assert 02 serial-contains 'goterm: done status=0'
+vgate_assert 02 serial-contains 'goterm: profile dusk'
+vgate_assert 02 serial-contains 'goterm: line echo LINKED'
+# The ftp scheme is refused BY NAME — the marker carries it, and no app
+# spawned for it (the serial would carry a second WEB load otherwise).
+vgate_assert 02 serial-contains 'goterm: link refused scheme=ftp target=ftp://example.com/'
+# The https click opened the link through mime.Open -> WEB.ELF. mime.Open
+# spawns the handler itself (no monitor `exec`, so no `exec: loaded` klog) —
+# the serial proof is WEB's window open owned by GOTERM's pid, then WEB
+# taking the argv target far enough to try (and name) DNS — the same
+# observed refusal go-sh's `open` leg asserts.
+vgate_assert 02 serial-contains 'goterm: link open scheme=https target=https://example.com/ handler=WEB.ELF pid='
+vgate_assert 02 serial-contains 'open: id=3 owner=2 rect=40,28 512x384'
+vgate_assert 02 serial-contains 'web: url https://example.com/'
+vgate_assert 02 serial-contains 'web: error dns'
+vgate_assert 02 serial-contains 'web: ready'
+vgate_assert 02 serial-contains 'goterm: close'
+vgate_assert 02 serial-contains 'goterm OK'
+vgate_assert 02 serial-contains 'rx-goterm-link-ok'
+vgate_assert 02 serial-absent '[EXC] parking:'
+vgate_assert 02 serial-absent 'exited status=139'
+# The profile merge landed on the share through the crash-safe publish:
+# the chosen keys and the term_profile record, no orphan temp beside it.
+vgate_assert 02 share-contains SETTINGS.TXT 'theme=custom'
+vgate_assert 02 share-contains SETTINGS.TXT 'palette_bg=0b1020'
+vgate_assert 02 share-contains SETTINGS.TXT 'term_profile=dusk'
