@@ -1,4 +1,5 @@
-// The M142a app shell. Layout inside the window's canvas:
+// The M142a app shell, extended by M142b (#2790) with the CSV + session
+// state half. Layout inside the window's canvas:
 //
 //	+----------------------------------------------------------+
 //	| [A1]  [edit line — the focused cell's raw text]          |  y 20..44
@@ -6,19 +7,32 @@
 //	| | A  B  C ...        header (col letters)              | |
 //	| | row-major cells, virtualized — the M137b table       | |  y 48..
 //	| +------------------------------------------------------+ |
-//	| status: focus, display, fill count                     |  bottom 20
+//	| status: focus, selection, display, fill count          |  bottom 20
 //	+----------------------------------------------------------+
 //
 // Keys. Grid focused: arrows/Home/End/PgUp/PgDn move the cell cursor (the
-// TableController's own vocabulary), typing any printable character seeds
-// the edit line with it (replace semantics, the sheet convention), Enter
-// or Tab opens the edit line on the cell's existing text, Delete and
-// Backspace clear the cell. Edit line focused: the TextField edits,
-// Enter/Tab commit and return to the grid, Escape cancels. Committing
-// writes the cell, re-evaluates, and prints the markers the go-sheet gate
-// reads: `gosheet: set|clear` for the edited cell, `gosheet: recalc` for
-// every other cell whose display changed, and `gosheet: cycle` naming the
-// cells on a discovered cycle.
+// TableController's own vocabulary); a shifted move anchors the selection
+// mark at the cell it left, ctrl-shift-m toggles a latched mark, ctrl-a
+// selects the sheet's used bounding box, Escape drops the mark. Typing any
+// printable character seeds the edit line with it (replace semantics, the
+// sheet convention), Enter or Tab opens the edit line on the cell's
+// existing text, Delete and Backspace clear the cell.
+//
+// The M142b chords: ctrl-c serializes the marked range (or the cursor
+// cell) as RFC 4180 CSV of the displayed values onto the text/csv
+// clipboard lane — a body over the kernel's 512-byte bound refuses with
+// `clip-too-large`; ctrl-v pastes clipboard text through the same codec,
+// filling cells from the cursor; ctrl-o / ctrl-s raise the shared
+// FilePicker for CSV import/export (export writes the used box's display
+// values, never the raw formulas).
+//
+// Edit line focused: the TextField edits, Enter/Tab commit and return to
+// the grid, Escape cancels. Committing writes the cell, re-evaluates, and
+// prints the markers the go-sheet gate reads: `gosheet: set|clear` for the
+// edited cell, `gosheet: recalc` for every other cell whose display
+// changed, and `gosheet: cycle` naming the cells on a discovered cycle.
+// Batch fills (import, paste, restore) print their own summary marker plus
+// capped recalc lines for dependents outside the written region.
 package main
 
 import (
@@ -27,12 +41,14 @@ import (
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/vsys"
 	"virelai/widgets"
 )
 
 const (
-	appName  = "GOSHEET.ELF"
-	appTitle = "Sheet"
+	appName      = "GOSHEET.ELF"
+	declareTitle = "GOSHEET.ELF" // the seat records the bin from this
+	appTitle     = "Sheet"       // rail label after declare
 
 	winX, winY = 64, 48
 	natW, natH = 672, 420
@@ -49,6 +65,18 @@ const (
 	headerH  = 22
 	fieldMax = 128
 
+	// HID usage IDs for the ctrl chords (letters' usages are sequential).
+	usageA = 0x04
+	usageC = 0x06
+	usageM = 0x10
+	usageO = 0x12
+	usageS = 0x16
+	usageV = 0x19
+
+	// recalcShow bounds the per-op recalc markers so a batch fill cannot
+	// flood serial; the tail counts what was not printed.
+	recalcShow = 16
+
 	markerOpen    = "gosheet: open id="
 	markerDecl    = "gosheet: declare accepted"
 	markerDeclNo  = "gosheet: declare refused"
@@ -58,6 +86,14 @@ const (
 	markerRecalc  = "gosheet: recalc "
 	markerCycle   = "gosheet: cycle "
 	markerFull    = "gosheet: full"
+	markerMark    = "gosheet: mark "
+	markerSel     = "gosheet: sel "
+	markerCopy    = "gosheet: copy "
+	markerPaste   = "gosheet: paste "
+	markerPick    = "gosheet: pick "
+	markerImport  = "gosheet: import "
+	markerExport  = "gosheet: export "
+	markerState   = "gosheet: state "
 	markerClose   = "gosheet: close"
 	markerOK      = "gosheet OK"
 )
@@ -66,14 +102,26 @@ const (
 // the same headroom the appkit demo reserves.
 var argvHeadroom [0x1000]byte
 
+// clipBuf is the paste staging buffer at the kernel's clipboard bound.
+var clipBuf [vsys.ClipKernelMax]byte
+
 type app struct {
 	ta        *tabapp.TabApp
 	sheet     *Sheet
 	field     appkit.TextField
 	table     *widgets.Table
 	ctl       *appkit.TableController
+	pick      appkit.FilePicker
 	editing   bool
 	lastCycle string
+	// mark+markOn is the M142b selection: when latched, the marked range is
+	// mark..cursor — what ctrl-c copies and the status line names.
+	mark   cellRef
+	markOn bool
+	// pend/pendBad hold a restore blob between RestoreState (inside
+	// tabapp.Init, before the table exists) and applyRestored.
+	pend    *sheetState
+	pendBad bool
 }
 
 func loadGuestTheme() {
@@ -86,19 +134,35 @@ func loadGuestTheme() {
 
 func main() {
 	loadGuestTheme()
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: winX, Y: winY, W: natW, H: natH})
+	a := &app{sheet: newSheet()}
+	ta := tabapp.Init(tabapp.Config{
+		Name:         appName,
+		Title:        declareTitle,
+		X:            winX,
+		Y:            winY,
+		W:            natW,
+		H:            natH,
+		StateVersion: stateFmtVer,
+		SaveState:    a.saveState,
+		RestoreState: a.noteState,
+	})
 	if ta == nil {
 		vi.ConsoleLine("gosheet: error open")
 		vi.Exit(1)
 	}
+	a.ta = ta
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)))
 	if ta.TabAware {
 		vi.ConsoleLine(markerDecl)
+		// The rail label is the friendly name; the recorded bin stays the
+		// executable the declare carried (so ctrl-shift-t re-execs it).
+		if !ta.SetTabTitle(appTitle) {
+			_ = vi.WinSetTitle(ta.Win, appTitle)
+		}
 	} else {
 		vi.ConsoleLine(markerDeclNo)
 	}
 
-	a := &app{ta: ta, sheet: newSheet()}
 	a.field = appkit.NewTextField(widgets.Rect{}, fieldMax)
 	cols := make([]widgets.TableColumn, NumCols)
 	for i := range cols {
@@ -112,6 +176,15 @@ func main() {
 	a.ctl = appkit.NewTableController(a.table)
 	a.ctl.OnActivate = func(_, _ int) bool { a.beginEdit(); return true }
 
+	a.applyRestored()
+	// A restored blob wins the session's argv — the re-exec runs the bare
+	// bin, so the file lives only in the blob (the gopaint contract).
+	if a.pend == nil && !a.pendBad {
+		if args := vi.Args(); len(args) > 1 {
+			a.importPath(args[1])
+		}
+	}
+
 	loop := appkit.NewLoop(a.ta, a.draw, a.handle)
 	if loop.SubscribeSetting("theme", func(value string) bool {
 		return theme.Set(value)
@@ -124,11 +197,215 @@ func main() {
 		vi.ConsoleLine(markerOK)
 		a.ta.CloseAndExit(status)
 	}
-	loop.Run()
+	// The save_state ask is mailbox traffic, not an input event (the gomine
+	// idiom) — but it must answer after every delivered key: answering while
+	// key-downs still sit in the queue would snapshot the pre-navigation
+	// cursor (the seat posts its ask on ctrl-shift-w while the close-time
+	// input burst is still draining). Answer only on an empty queue.
+	loop.RunWith(func() (vi.Event, int64, bool) {
+		ev, r, ok := vi.PollEventRaw()
+		if !ok {
+			a.ta.PollStateAsk()
+		}
+		return ev, r, ok
+	}, vi.Sleep)
 }
 
 // sel is the grid cursor as a cell address.
 func (a *app) sel() cellRef { return refAt(a.table.Col, a.table.Row) }
+
+// selSpan is the closed selection rect: the latched mark normalized
+// against the cursor, or the cursor alone when no mark is live.
+func (a *app) selSpan() (lo, hi cellRef) {
+	cur := a.sel()
+	if !a.markOn {
+		return cur, cur
+	}
+	return cellRef{
+		col: min(a.mark.col, cur.col),
+		row: min(a.mark.row, cur.row),
+	}, cellRef{
+		col: max(a.mark.col, cur.col),
+		row: max(a.mark.row, cur.row),
+	}
+}
+
+// toggleMark is ctrl-shift-m: latch the mark at the cursor, or drop it.
+func (a *app) toggleMark() {
+	if a.markOn {
+		a.markOn = false
+		vi.ConsoleLine(markerMark + "off")
+		return
+	}
+	a.mark = a.sel()
+	a.markOn = true
+	vi.ConsoleLine(markerMark + a.mark.String())
+}
+
+// selectUsed is ctrl-a: the used bounding box — mark at its top-left,
+// cursor at its bottom-right. An empty sheet selects the cursor cell.
+func (a *app) selectUsed() {
+	lo, hi, ok := a.sheet.usedBBox()
+	if !ok {
+		a.markOn = false
+		vi.ConsoleLine(markerSel + a.sel().String())
+		return
+	}
+	a.mark, a.markOn = lo, true
+	a.ctl.FocusCell(hi.row, hi.col)
+	vi.ConsoleLine(markerSel + lo.String() + ":" + hi.String())
+	a.syncBar()
+}
+
+// copySel writes the selected range to the text/csv lane. Over the 512-byte
+// kernel bound the copy refuses whole with the card's named reason.
+func (a *app) copySel() {
+	lo, hi := a.selSpan()
+	body := writeCSV(a.sheet.csvRows(lo, hi))
+	if len(body) > vsys.ClipKernelMax {
+		vi.ConsoleLine(markerCopy + "clip-too-large")
+		return
+	}
+	n, rc := vsys.ClipboardSetTyped(vsys.ClipCSV, body)
+	if rc < 0 {
+		vi.ConsoleLine(markerCopy + "rc=" + vi.Itoa64(rc))
+		return
+	}
+	vi.ConsoleLine(markerCopy + lo.String() + ":" + hi.String() +
+		" n=" + vi.Itoa64(int64(n)))
+}
+
+// pasteClip reads the clipboard as text — the classification never lies
+// about the bytes: CSV, plain text, URI lists and markup all parse through
+// the same RFC 4180 lane; images and octets refuse by name. Fields fill
+// from the cursor; a field that lands outside the grid or on a full store
+// counts clipped, never half-written.
+func (a *app) pasteClip() {
+	mime, n, rc := vsys.ClipboardGetTyped(clipBuf[:])
+	if rc < 0 {
+		vi.ConsoleLine(markerPaste + "rc=" + vi.Itoa64(rc))
+		return
+	}
+	if n == 0 {
+		vi.ConsoleLine(markerPaste + "empty")
+		return
+	}
+	switch mime {
+	case vsys.ClipText, vsys.ClipCSV, vsys.ClipURIList, vsys.ClipHTML:
+	default:
+		vi.ConsoleLine(markerPaste + mime)
+		return
+	}
+	rows := parseCSV(clipBuf[:n])
+	at := a.sel()
+	set, clipped, w := 0, 0, 0
+	for r, row := range rows {
+		if len(row) > w {
+			w = len(row)
+		}
+		for c, f := range row {
+			if !a.sheet.setQuiet(refAt(at.col+c, at.row+r), f) {
+				clipped++
+				continue
+			}
+			set++
+		}
+	}
+	changed := a.sheet.recalc()
+	line := markerPaste + "n=" + vi.Itoa64(int64(set))
+	if clipped > 0 {
+		line += " clipped=" + vi.Itoa64(int64(clipped))
+	}
+	vi.ConsoleLine(line)
+	// The pasted region becomes the selection — a follow-up ctrl-c copies
+	// exactly what landed.
+	a.mark, a.markOn = at, true
+	a.ctl.FocusCell(at.row+len(rows)-1, at.col+w-1)
+	vi.ConsoleLine(markerSel + at.String() + ":" + a.sel().String())
+	a.reportOutside(changed, at, a.sel())
+	a.syncBar()
+}
+
+// openPick raises the shared FilePicker for CSV open/save.
+func (a *app) openPick(kind appkit.PickerKind) {
+	a.pick = appkit.NewFilePicker(kind, "/host")
+	if kind == appkit.PickOpen {
+		vi.ConsoleLine(markerPick + "open")
+	} else {
+		vi.ConsoleLine(markerPick + "save")
+	}
+}
+
+// pickDone consumes the picker's Result once it closes.
+func (a *app) pickDone() {
+	res, kind := a.pick.Result, a.pick.Kind
+	if res == "cancel" {
+		vi.ConsoleLine(markerPick + "cancel")
+		return
+	}
+	if kind == appkit.PickSave {
+		vi.ConsoleLine(markerPick + "save " + res)
+		a.exportPath(res)
+		return
+	}
+	vi.ConsoleLine(markerPick + "open " + res)
+	a.importPath(res)
+}
+
+// importPath replaces the sheet with a parsed CSV body. The whole file is
+// refused before a single cell lands when it cannot fit the grid or the
+// store bound — a partial import is never a sheet.
+func (a *app) importPath(path string) bool {
+	b, rc := vi.ReadFileAll(path, vi.MaxFileBytes)
+	if rc < 0 {
+		vi.ConsoleLine(markerImport + "refused read")
+		return false
+	}
+	rows := parseCSV(b)
+	w, n := 0, 0
+	for _, row := range rows {
+		if len(row) > w {
+			w = len(row)
+		}
+		for _, f := range row {
+			if f != "" {
+				n++
+			}
+		}
+	}
+	if len(rows) > NumRows || w > NumCols || n > MaxCells {
+		vi.ConsoleLine(markerImport + "refused too-large")
+		return false
+	}
+	ns := newSheet()
+	for r, row := range rows {
+		for c, f := range row {
+			ns.setQuiet(refAt(c, r), f)
+		}
+	}
+	ns.recalc()
+	a.sheet = ns
+	a.markOn = false
+	a.lastCycle = ""
+	vi.ConsoleLine(markerImport + path + " cells=" +
+		vi.Itoa64(int64(ns.filled())) + " rows=" + vi.Itoa64(int64(len(rows))))
+	a.syncBar()
+	return true
+}
+
+// exportPath writes the used box's display values through the codec.
+func (a *app) exportPath(path string) bool {
+	var body []byte
+	if lo, hi, ok := a.sheet.usedBBox(); ok {
+		body = writeCSV(a.sheet.csvRows(lo, hi))
+	}
+	if rc := vi.WriteFileSafe(path, body); rc != 0 {
+		vi.ConsoleLine(markerExport + "refused rc=" + vi.Itoa64(rc))
+		return false
+	}
+	vi.ConsoleLine(markerExport + path + " n=" + vi.Itoa64(int64(len(body))))
+	return true
+}
 
 // draw repaints the whole frame; the table only ever paints its visible
 // window, so a full repaint is the cheap honest path.
@@ -145,11 +422,18 @@ func (a *app) draw() {
 	a.field.Draw(c)
 	a.table.Draw(c)
 	widgets.DrawText(c, widgets.Rect{X: pad, Y: h - statusH, W: w - 2*pad, H: statusH}, a.status(), draw.Opaque(th.Muted))
+	if a.pick.Open {
+		a.pick.Draw(c)
+	}
 }
 
 func (a *app) status() string {
 	sel := a.sel()
 	s := sel.String()
+	if a.markOn {
+		lo, hi := a.selSpan()
+		s += "  sel " + lo.String() + ":" + hi.String()
+	}
 	if d := a.sheet.display(sel); d != "" {
 		s += " -> " + d
 	}
@@ -212,11 +496,27 @@ func (a *app) commit() {
 // than the edited cell itself), then the cycle marker when the cycle set
 // moved.
 func (a *app) report(changed []cellRef, sel cellRef) {
+	a.reportOutside(changed, sel, sel)
+}
+
+// reportOutside is report for a batch fill: cells inside the written region
+// are announced by the batch marker itself, and the dependents' list is
+// capped so a full-sheet import cannot flood serial.
+func (a *app) reportOutside(changed []cellRef, lo, hi cellRef) {
+	shown, extra := 0, 0
 	for _, r := range changed {
-		if r == sel {
+		if r.col >= lo.col && r.col <= hi.col && r.row >= lo.row && r.row <= hi.row {
+			continue
+		}
+		if shown >= recalcShow {
+			extra++
 			continue
 		}
 		vi.ConsoleLine(markerRecalc + r.String() + " -> " + a.sheet.display(r))
+		shown++
+	}
+	if extra > 0 {
+		vi.ConsoleLine(markerRecalc + "+" + vi.Itoa64(int64(extra)) + " more")
 	}
 	cyc := ""
 	for _, r := range a.sheet.cycleRefs() {
@@ -234,6 +534,21 @@ func (a *app) report(changed []cellRef, sel cellRef) {
 }
 
 func (a *app) handle(ev vi.Event) bool {
+	if a.pick.Open {
+		switch ev.Kind {
+		case vi.EvKeyDown:
+			if _, done := a.pick.HandleKey(ev); done {
+				a.pickDone()
+			}
+			return true
+		case vi.EvMouseDown:
+			if _, done := a.pick.HandleMouse(int(ev.Arg0), int(ev.Arg1), true); done {
+				a.pickDone()
+			}
+			return true
+		}
+		return true
+	}
 	switch ev.Kind {
 	case vi.EvKeyDown:
 		k, ok := appkit.NormalizeKey(ev)
@@ -243,6 +558,17 @@ func (a *app) handle(ev vi.Event) bool {
 		return a.key(k)
 	case vi.EvMouseDown:
 		return a.click(int(ev.Arg0), int(ev.Arg1))
+	}
+	return false
+}
+
+// navKey reports whether k is one of the cursor-move keys shift can extend
+// a selection over.
+func navKey(k appkit.Key) bool {
+	switch k.Named() {
+	case appkit.NamedLeft, appkit.NamedRight, appkit.NamedUp, appkit.NamedDown,
+		appkit.NamedHome, appkit.NamedEnd, appkit.NamedPageUp, appkit.NamedPageDown:
+		return true
 	}
 	return false
 }
@@ -259,10 +585,51 @@ func (a *app) key(k appkit.Key) bool {
 		}
 		return a.field.OnKey(k)
 	}
+	if k.Ctrl && !navKey(k) {
+		switch k.Usage {
+		case usageA:
+			if !k.Shift {
+				a.selectUsed()
+				return true
+			}
+		case usageC:
+			if !k.Shift {
+				a.copySel()
+				return true
+			}
+		case usageV:
+			if !k.Shift {
+				a.pasteClip()
+				return true
+			}
+		case usageO:
+			if !k.Shift {
+				a.openPick(appkit.PickOpen)
+				return true
+			}
+		case usageS:
+			if !k.Shift {
+				a.openPick(appkit.PickSave)
+				return true
+			}
+		case usageM:
+			if k.Shift {
+				a.toggleMark()
+				return true
+			}
+		}
+		return false
+	}
 	switch k.Named() {
 	case appkit.NamedEnter, appkit.NamedTab:
 		a.beginEdit()
 		return true
+	case appkit.NamedEscape:
+		if a.markOn {
+			a.toggleMark()
+			return true
+		}
+		return false
 	case appkit.NamedDelete, appkit.NamedBackspace:
 		sel := a.sel()
 		if a.sheet.raw(sel) == "" {
@@ -272,6 +639,12 @@ func (a *app) key(k appkit.Key) bool {
 		vi.ConsoleLine(markerClear + sel.String())
 		a.report(changed, sel)
 		return true
+	}
+	// A shifted move anchors the mark at the cell it left — the keyboard's
+	// own selection-extend gesture.
+	if k.Shift && !a.markOn && navKey(k) {
+		a.mark, a.markOn = a.sel(), true
+		vi.ConsoleLine(markerMark + a.mark.String())
 	}
 	if !k.Ctrl && !k.Alt && k.Rune != 0 {
 		a.startEditWith(k.Rune)
@@ -296,6 +669,8 @@ func (a *app) click(x, y int) bool {
 			a.commit()
 		}
 		if a.ctl.OnClick(x, y) {
+			// A fresh click re-anchors selection to the hit cell.
+			a.markOn = false
 			a.syncBar()
 			return true
 		}

@@ -222,17 +222,27 @@ func (s *Sheet) display(r cellRef) string {
 // the returned refs are every address whose display changed, sorted
 // row-major.
 func (s *Sheet) set(r cellRef, raw string) (changed []cellRef, ok bool) {
-	if !r.inBounds() {
+	prev := s.display(r) // the pre-edit display, for honest change reporting
+	if !s.setQuiet(r, raw) {
 		return nil, false
+	}
+	return s.recalcEdited(r, prev), true
+}
+
+// setQuiet is set without the recalc — the batch paths (CSV import, paste,
+// state restore) fill a region first, then re-evaluate the sheet once.
+// The same refusals apply: out-of-bounds or a capped store.
+func (s *Sheet) setQuiet(r cellRef, raw string) bool {
+	if !r.inBounds() {
+		return false
 	}
 	raw = strings.TrimSpace(raw)
-	prev := s.display(r) // the pre-edit display, for honest change reporting
 	if raw == "" {
 		delete(s.cells, r)
-		return s.recalc(), true
+		return true
 	}
 	if _, exists := s.cells[r]; !exists && len(s.cells) >= MaxCells {
-		return nil, false
+		return false
 	}
 	c := &cell{raw: raw}
 	if raw[0] == '=' {
@@ -245,7 +255,18 @@ func (s *Sheet) set(r cellRef, raw string) (changed []cellRef, ok bool) {
 		c.val = literalVal(raw)
 	}
 	s.cells[r] = c
-	return s.recalcEdited(r, prev), true
+	return true
+}
+
+// sortedRefs lists the filled addresses row-major — the state blob's
+// deterministic cell order.
+func (s *Sheet) sortedRefs() []cellRef {
+	var out []cellRef
+	for r := range s.cells {
+		out = append(out, r)
+	}
+	sortRefs(out)
+	return out
 }
 
 // literalVal classifies non-formula text: a number when the whole trimmed
