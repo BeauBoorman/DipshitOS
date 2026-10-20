@@ -57,4 +57,4 @@ GOMINE.ELF | Mines | j | dock=false | v=2 | caps=window,audio
 GOSOL.ELF | Solitaire | q | dock=false | v=2 | caps=window,audio
 GOEMOJI.ELF | Emoji | : | dock=false | v=2 | caps=window
 GOIRC.ELF | IRC | / | dock=false | v=2 | caps=file,window,net
-GOVAULT.ELF | Vault | $ | dock=false | v=2 | caps=file,window,timer
+GOVAULT.ELF | Vault | $ | dock=false | v=2 | caps=file,window,timer | selection=primary

@@ -258,10 +258,11 @@ func TestSummarizeAppsCountsRowsAndTheHighestVersion(t *testing.T) {
 	if s.Caps == 0 || s.Opens == 0 {
 		t.Fatalf("caps/opens rows = %d/%d: the v2 tail is not being read", s.Caps, s.Opens)
 	}
-	// M124e (#2584): GOEDIT and GOTERM are the two selection=primary rows —
-	// pinned like argv so a third opt-in is a deliberate edit here too.
-	if s.Sel != 2 {
-		t.Fatalf("selection=primary rows = %d want 2 (GOEDIT + GOTERM)", s.Sel)
+	// M124e (#2584): GOEDIT, GOTERM and GOVAULT (M148a #2804 — the vault's
+	// copy publishes the seat selection) are the three selection=primary
+	// rows — pinned like argv so a fourth opt-in is a deliberate edit here.
+	if s.Sel != 3 {
+		t.Fatalf("selection=primary rows = %d want 3 (GOEDIT + GOTERM + GOVAULT)", s.Sel)
 	}
 }
 

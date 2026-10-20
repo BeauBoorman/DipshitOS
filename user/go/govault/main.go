@@ -1,0 +1,930 @@
+// Command govault is GOVAULT.ELF — M148a (issue #2804): the secrets store gets
+// a face. One unlock-gated vault file (GVLT framing, PBKDF2-HMAC-SHA256 ->
+// AES-256-GCM, written through vi.WriteFileSafe so a crash keeps the old
+// file), a masked passphrase field, a per-entry reveal, a copy that expires,
+// and an idle lock. The codec lives in vault.go, the pure session model in
+// model.go; this file owns the seat, the drawing, the timers and the serial
+// markers.
+//
+// The clipboard, precisely: the KERNEL buffer (slots 38/39) admits only the
+// seat and CAP_CLIPBOARD — no EL0 grant path exists (ADR 0054, `caps` are
+// spawn-time kernel properties). The buffer an app can reach is the seat's
+// primary selection (M124e): copy is a kind-27 publish, the "still holds it"
+// check is a kind-28 pull, and clearing is a second publish of a cleared
+// sentinel — the selection has no empty publish (kind-27 refuses len 0), so
+// expiry overwrites. The manifest opt-in is `selection=primary`; under a seat
+// that refuses (no opt-in, no seat) the copy reports its named refusal and
+// nothing is armed.
+//
+// Secrets discipline: entry fields stay in []byte end to end so lock() can
+// zero them; the passphrase buffer is zeroed on every outcome; the clipboard
+// compare runs against a sha256 tag, never a kept plaintext; and no serial
+// marker ever carries a name, a secret, a note or a passphrase — the
+// marker vocabulary below is the whole observable surface.
+//
+// Every marker is printed only AFTER the call it names returned, so a gate
+// asserting one can only pass when the work actually ran.
+package main
+
+import (
+	"strings"
+	"unicode/utf8"
+
+	"virelai/appkit"
+	"virelai/draw"
+	"virelai/tabapp"
+	"virelai/theme"
+	"virelai/vi"
+	"virelai/vsys"
+	"virelai/webrender/font"
+	"virelai/widgets"
+)
+
+const (
+	appName  = "GOVAULT.ELF"
+	appTitle = "Vault"
+	natW     = 512
+	natH     = 384
+	natX     = 32
+	natY     = 32
+
+	// vaultPath is the app-owned file on the share — the /host/<APP> dir the
+	// other file-cap apps use. It is deliberately NOT a secret-class path
+	// (ADR 0024 D8): the body is sealed, so WriteFileSafe's path~ temp
+	// window exposes ciphertext, never plaintext.
+	vaultPath = "/host/GOVAULT/VAULT.BIN"
+
+	// clearBytes is the expiry overwrite. kind-27 refuses an empty publish,
+	// so "cleared" is a bounded, non-secret sentinel the user can see.
+	clearBytes = "[cleared]"
+)
+
+// Marker vocabulary. n= and rc= are the only payloads — counts and kernel
+// codes, never secret material.
+const (
+	markerOpen      = "govault: open id="
+	markerDeclare   = "govault: declare accepted"
+	markerDeclRef   = "govault: declare refused"
+	markerPresent   = "govault: present"
+	markerNew       = "govault: new vault"
+	markerLocked    = "govault: locked"
+	markerBad       = "govault: bad file"
+	markerLoadErr   = "govault: load error rc="
+	markerIters     = "govault: iterations "
+	markerUnlocked  = "govault: unlocked n="
+	markerUnlockBad = "govault: unlock failed"
+	markerMismatch  = "govault: passphrase mismatch"
+	markerAdded     = "govault: added"
+	markerRefused   = "govault: refused "
+	markerSaved     = "govault: saved"
+	markerSaveErr   = "govault: save refused rc="
+	markerRevealed  = "govault: revealed"
+	markerHidden    = "govault: hidden"
+	markerCopied    = "govault: copied"
+	markerCopyErr   = "govault: copy refused"
+	markerExpired   = "govault: clip expired"
+	markerKept      = "govault: clip kept"
+	markerClipRef   = "govault: clip expire refused"
+	markerIdle      = "govault: locked idle"
+	markerClose     = "govault: close"
+	markerOK        = "govault OK"
+	markerExiting   = "govault: exiting "
+)
+
+// Seams — the vi/vsys calls that cross the raw syscall gateway degrade to
+// -ENOSYS off the guest, so host tests drive these (the vi.SelPublish seam is
+// the same discipline as wmsel's selFileWrite vars).
+var (
+	nowFn       = vsys.Nanotime
+	timerSetFn  = vsys.TimerSet
+	timerCancel = vsys.TimerCancel
+	randFill    = func(b []byte) bool {
+		n, err := vi.Random(b)
+		return err == nil && n == len(b)
+	}
+	selPublish = vi.SelPublish
+	selPull    = vi.RequestSelPaste
+	readAll    = vi.ReadFileAll
+	writeSafe  = vi.WriteFileSafe
+	fileOpen   = vi.FileOpen
+	fileClose  = func(h int64) { vi.FileClose(uint32(h)) }
+	notifyFn   = func(ta *tabapp.TabApp, text string) bool { return ta.Notify(text) }
+)
+
+// field is one input row. buf holds UTF-8; masked fields paint one '*' per
+// rune. Kept as bytes so clear() can zero secret input — a string field
+// could never be wiped.
+type field struct {
+	label  string
+	buf    []byte
+	max    int
+	masked bool
+}
+
+func newField(label string, max int, masked bool) field {
+	return field{label: label, max: max, masked: masked}
+}
+
+// insert appends one rune whole; the bound refuses rather than truncating
+// mid-encoding.
+func (f *field) insert(r rune) bool {
+	var enc [utf8.UTFMax]byte
+	n := utf8.EncodeRune(enc[:], r)
+	if len(f.buf)+n > f.max {
+		return false
+	}
+	f.buf = append(f.buf, enc[:n]...)
+	return true
+}
+
+// backspace removes the last rune whole and zeroes its bytes.
+func (f *field) backspace() bool {
+	if len(f.buf) == 0 {
+		return false
+	}
+	_, n := utf8.DecodeLastRune(f.buf)
+	zero(f.buf[len(f.buf)-n:])
+	f.buf = f.buf[:len(f.buf)-n]
+	return true
+}
+
+// clear zeroes and empties the buffer.
+func (f *field) clear() {
+	zero(f.buf)
+	f.buf = f.buf[:0]
+}
+
+// shown is what the field paints: the text, or one bullet per rune.
+func (f *field) shown() string {
+	if !f.masked {
+		return string(f.buf)
+	}
+	n := utf8.RuneCount(f.buf)
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = '*'
+	}
+	return string(out)
+}
+
+// app is the session: the seat client, the model, the loaded file, the field
+// buffers per face, and the last status line (never secret material).
+type app struct {
+	ta *tabapp.TabApp
+	m  model
+
+	path string
+	file []byte
+
+	pass  field // masked passphrase (locked + new)
+	conf  field // masked confirm (new only)
+	focus int   // field index inside the current face
+	add   [3]field
+
+	status string
+	quit   bool
+}
+
+// marker keys, not the HIDs (the kernel decodes arg1 to the codepoint; arg0
+// is the usage for arrows and escape).
+const (
+	modCtrl = uint16(0x0002)
+
+	hidEsc  = 0x29
+	hidUp   = 0x52
+	hidDown = 0x51
+	hidTab  = 0x2b
+
+	codeBackspace = 0x08
+	codeDelete    = 0x7f
+	codeReturn    = 0x0d
+	codeNewline   = 0x0a
+	codeTab       = 0x09
+	keyCtrlL      = 0x0c // ctrl-l arrives as the control code
+	keyL          = 0x6c
+)
+
+func loadGuestTheme() {
+	b, r := readAll("/host/SETTINGS.TXT", 2048)
+	if r < 0 || b == nil {
+		return
+	}
+	_ = theme.ApplySettings(b)
+}
+
+func main() {
+	loadGuestTheme()
+	a := &app{
+		path: vaultPath,
+		pass: newField("passphrase", 64, true),
+		conf: newField("confirm", 64, true),
+	}
+	a.add[0] = newField("name", maxName, false)
+	a.add[1] = newField("secret", maxSecret, true)
+	a.add[2] = newField("note", maxNote, false)
+
+	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: natX, Y: natY, W: natW, H: natH})
+	if ta == nil {
+		vi.ConsoleLine(markerOpen + "-1")
+		vi.Exit(1)
+	}
+	a.ta = ta
+	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)))
+	if ta.TabAware {
+		vi.ConsoleLine(markerDeclare)
+	} else {
+		vi.ConsoleLine(markerDeclRef)
+	}
+
+	a.load()
+
+	loop := appkit.NewLoop(a.ta, a.draw, a.handle)
+	loop.ShouldQuit = func() (int, bool) { return 0, a.quit }
+	loop.OnInitialPresent = func() {
+		vi.ConsoleLine(markerPresent)
+	}
+	loop.OnExit = func(status int) {
+		a.m.lock()
+		a.pass.clear()
+		a.conf.clear()
+		vi.ConsoleLine(markerClose)
+		vi.ConsoleLine(markerOK)
+		vi.ConsoleLine(markerExiting + vi.Itoa64(int64(status)))
+		a.ta.CloseAndExit(status)
+	}
+	loop.Run()
+}
+
+// load reads the vault file once and picks the opening face. The bytes stay
+// for the unlock attempts — an unlock needs them anyway, so there is no
+// re-read between faces (and a file changed under the app is the next
+// process's problem, not this boot's).
+func (a *app) load() {
+	data, rc := readAll(a.path, maxFile+1)
+	if rc < 0 {
+		if rc == -int64(vi.ErrENOENT) {
+			a.m.scr = scrNew
+			vi.ConsoleLine(markerNew)
+			return
+		}
+		a.m.scr = scrBadFile
+		vi.ConsoleLine(markerLoadErr + vi.Itoa64(rc))
+		return
+	}
+	if _, _, _, _, err := parseHeader(data); err != nil {
+		a.m.scr = scrBadFile
+		vi.ConsoleLine(markerBad)
+		return
+	}
+	a.file = data
+	a.m.scr = scrLocked
+	vi.ConsoleLine(markerLocked)
+}
+
+// rearm drives the one app timer from the model's deadline pair. Called
+// after every event that can change a deadline, so the physical timer always
+// counts toward the earliest live one.
+func (a *app) rearm() {
+	d := a.m.dl.nextDelay(nowFn())
+	if d == 0 {
+		if a.m.armed != 0 {
+			a.m.armed = 0
+			timerCancel()
+		}
+		return
+	}
+	a.m.armed = d
+	timerSetFn(d)
+}
+
+// handle routes one event. Timer events are the deadline driver; every
+// other event is activity while the vault is unlocked.
+func (a *app) handle(ev vi.Event) bool {
+	if ev.Kind == vi.EvTimer {
+		return a.onTimer()
+	}
+	if a.m.scr == scrList || a.m.scr == scrAdd {
+		a.m.dl.activity(nowFn())
+		defer a.rearm()
+	}
+	if ev.Kind != vi.EvKeyDown {
+		return false
+	}
+	switch a.m.scr {
+	case scrNew:
+		return a.keyNew(ev)
+	case scrLocked:
+		return a.keyLocked(ev)
+	case scrBadFile:
+		if ev.Arg0 == hidEsc {
+			a.quit = true
+		}
+		return false
+	case scrList:
+		return a.keyList(ev)
+	case scrAdd:
+		return a.keyAdd(ev)
+	}
+	return false
+}
+
+// onTimer runs whichever deadlines fired. Order is clip-then-idle so an
+// expiry that lands on the same tick as the lock still clears the shared
+// buffer before the session material is wiped.
+func (a *app) onTimer() bool {
+	now := nowFn()
+	idle, clip := a.m.dl.expired(now)
+	changed := false
+	if clip {
+		a.expireClip()
+		changed = true
+	}
+	if idle {
+		a.lockSession(true)
+		changed = true
+	}
+	a.rearm()
+	return changed
+}
+
+// expireClip is the 30-second lease end: pull the buffer, apply the
+// compare-before-clear rule, and say exactly what happened. A failed pull
+// still clears — the alternative is a secret stranded in a buffer we could
+// not read, and clobbering a stranger's one stale copy is the smaller harm.
+func (a *app) expireClip() {
+	a.m.dl.stopClip()
+	buf, ok := a.pullSel()
+	kept := ok && !a.m.ctag.holds(buf)
+	zero(buf)
+	a.m.ctag.wipe()
+	if kept {
+		vi.ConsoleLine(markerKept)
+		a.status = "clipboard changed hands — kept"
+		return
+	}
+	if a.publishSel([]byte(clearBytes)) {
+		vi.ConsoleLine(markerExpired)
+		a.status = "clipboard cleared"
+		notifyFn(a.ta, "clipboard cleared")
+		return
+	}
+	vi.ConsoleLine(markerClipRef)
+	a.status = "clipboard clear refused"
+}
+
+// publishSel is SelPublish with one restage-and-repost. A bound request
+// whose ack never lands (#2260's documented lost-ack/full-ring hazard —
+// observed on leg 02: the seat stored len=6, the ack never matched, the
+// challenge-resend then met a staging file the first serve had already
+// consumed and refused `missing`) is retried through the same call —
+// which restages the envelope — so the re-sent request has its payload
+// back. A stored-then-retried publish is an idempotent overwrite of the
+// same buffer with the same bytes.
+func (a *app) publishSel(text []byte) bool {
+	if selPublish(uint32(a.ta.Win), text, appName) {
+		return true
+	}
+	return selPublish(uint32(a.ta.Win), text, appName)
+}
+
+// pullSel is RequestSelPaste with one retry — the pull's ack rides the same
+// lossy ring, and a false here feeds the compare-before-clear rule's
+// clear-anyway arm, so one retry buys back the honest read.
+func (a *app) pullSel() ([]byte, bool) {
+	if buf, ok := selPull(uint32(a.ta.Win), appName); ok {
+		return buf, true
+	}
+	return selPull(uint32(a.ta.Win), appName)
+}
+
+// lockSession wipes the session and returns to the locked face. The clip
+// deadline is deliberately untouched — the shared buffer still holds the
+// plaintext we put there and the lease still runs.
+func (a *app) lockSession(idle bool) {
+	a.m.lock()
+	a.pass.clear()
+	a.conf.clear()
+	a.focus = 0
+	a.add[0].clear()
+	a.add[1].clear()
+	a.add[2].clear()
+	if idle {
+		vi.ConsoleLine(markerIdle)
+		a.status = "locked after 5 idle minutes"
+		notifyFn(a.ta, "vault locked")
+	} else {
+		vi.ConsoleLine(markerLocked)
+		a.status = "locked"
+	}
+}
+
+// save reseals the session under the SAME salt and iteration count the
+// unlock proved, with a fresh nonce per publish, through WriteFileSafe — a
+// crash keeps the old file, never a half-written one.
+func (a *app) save() bool {
+	nonce := make([]byte, nonceLen)
+	if !randFill(nonce) {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
+		return false
+	}
+	file, err := sealWithKey(a.m.key, a.m.salt, nonce, a.m.iters, a.m.entries)
+	if err != nil {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		return false
+	}
+	defer zero(file)
+	if rc := writeSafe(a.path, file); rc < 0 {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(rc))
+		return false
+	}
+	// The published frame is also the bytes a same-session unlock opens:
+	// on the create path nothing ever read the file off disk, so without
+	// this a lock->unlock pair meets parseHeader(nil) -> bad file. It is
+	// the sealed text — ciphertext is not secret material to shed.
+	a.file = append(a.file[:0], file...)
+	vi.ConsoleLine(markerSaved)
+	return true
+}
+
+// --- the faces -------------------------------------------------------------
+
+func (a *app) fields() []*field {
+	if a.m.scr == scrNew {
+		return []*field{&a.pass, &a.conf}
+	}
+	return []*field{&a.pass}
+}
+
+// keyField feeds one key to the field list of a passphrase face: printable
+// text inserts, backspace/delete erase, tab/return either advance the focus
+// or run submit (the last field). Escape is the caller's business.
+func (a *app) keyField(ev vi.Event, submit func()) bool {
+	fs := a.fields()
+	f := fs[a.focus]
+	switch ev.Arg0 {
+	case hidUp:
+		if a.focus > 0 {
+			a.focus--
+			return true
+		}
+	case hidDown, hidTab:
+		if a.focus < len(fs)-1 {
+			a.focus++
+			return true
+		}
+	}
+	if ev.Arg1 == codeTab {
+		if a.focus < len(fs)-1 {
+			a.focus++
+			return true
+		}
+	}
+	if ev.Arg1 == codeBackspace || ev.Arg1 == codeDelete {
+		return f.backspace()
+	}
+	if ev.Arg1 == codeReturn || ev.Arg1 == codeNewline {
+		if a.focus < len(fs)-1 {
+			a.focus++
+			return true
+		}
+		submit()
+		return true
+	}
+	if r, ok := printable(ev); ok {
+		return f.insert(r)
+	}
+	return false
+}
+
+func (a *app) keyNew(ev vi.Event) bool {
+	if ev.Arg0 == hidEsc {
+		a.quit = true
+		return false
+	}
+	return a.keyField(ev, a.create)
+}
+
+func (a *app) keyLocked(ev vi.Event) bool {
+	if ev.Arg0 == hidEsc {
+		a.quit = true
+		return false
+	}
+	return a.keyField(ev, a.unlock)
+}
+
+// unlock is the locked face's submit: open the stored file under the typed
+// passphrase. The refusal is exactly one line — wrong passphrase and a
+// tampered seal are the same answer by design.
+func (a *app) unlock() {
+	pass := append([]byte(nil), a.pass.buf...)
+	defer zero(pass)
+	entries, key, salt, iters, err := open(pass, a.file)
+	a.pass.clear()
+	if err == errBadFile {
+		a.m.scr = scrBadFile
+		vi.ConsoleLine(markerBad)
+		return
+	}
+	if err != nil {
+		vi.ConsoleLine(markerUnlockBad)
+		a.status = "unlock failed"
+		return
+	}
+	a.m.unlocked(entries, key, salt, iters, nowFn())
+	a.rearm()
+	a.status = ""
+	vi.ConsoleLine(markerUnlocked + vi.Itoa64(int64(len(entries))))
+}
+
+// create is the new-vault submit: a matching pair, the measured iteration
+// count (~1 s of PBKDF2 on this VM, recorded in the header), CSPRNG salt and
+// nonce, sealed and published.
+func (a *app) create() {
+	if !equalBytes(a.pass.buf, a.conf.buf) || len(a.pass.buf) == 0 {
+		a.pass.clear()
+		a.conf.clear()
+		a.focus = 0
+		vi.ConsoleLine(markerMismatch)
+		a.status = "passphrases do not match"
+		return
+	}
+	pass := append([]byte(nil), a.pass.buf...)
+	defer zero(pass)
+	a.pass.clear()
+	a.conf.clear()
+
+	salt := make([]byte, saltLen)
+	nonce := make([]byte, nonceLen)
+	if !randFill(salt) || !randFill(nonce) {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
+		return
+	}
+	// The measurement is one calibration derive; calibrateIterations scales
+	// it to about a second and clamps it honest.
+	start := nowFn()
+	probe, err := deriveKey(pass, salt, calibrateIters)
+	iters := calibrateIterations(nowFn() - start)
+	zero(probe)
+	if err != nil {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		return
+	}
+	key, err := deriveKey(pass, salt, iters)
+	if err != nil {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		return
+	}
+	if !ensureDirs(a.path) {
+		// ensureDirs already printed the refusal with its rc.
+		zero(key)
+		return
+	}
+	a.m.unlocked(nil, key, salt, iters, nowFn())
+	vi.ConsoleLine(markerIters + vi.Itoa64(int64(iters)))
+	if !a.save() {
+		// The session exists but the file did not publish: the honest face
+		// is still the unlocked list — the save marker says the disk side.
+		a.rearm()
+		vi.ConsoleLine(markerUnlocked + vi.Itoa64(0))
+		return
+	}
+	a.rearm()
+	vi.ConsoleLine(markerUnlocked + vi.Itoa64(0))
+}
+
+// ensureDirs creates the /host/<APP> directory chain — the same EEXIST-is-a-
+// pass triple the recorder uses, and the same mount-root skip: segs[1] is
+// the mount itself ("/host"), which answers the mkdir triple with EINVAL,
+// not EEXIST — it is never "created". The file-cap app's WriteFileSafe
+// reports the open error on the write either way; this only makes the
+// common case land.
+func ensureDirs(filePath string) bool {
+	segs := strings.Split(filePath, "/")
+	dir := ""
+	for i := 1; i < len(segs)-1; i++ {
+		dir += "/" + segs[i]
+		if i == 1 {
+			continue
+		}
+		h, rc := fileOpen(dir, vi.ModeWrite|vi.ModeCreate|vi.ModeDir)
+		if rc >= 0 {
+			fileClose(h)
+		} else if rc != int64(vi.ErrFileExists) {
+			vi.ConsoleLine(markerSaveErr + vi.Itoa64(rc) + " " + dir)
+			return false
+		}
+	}
+	return true
+}
+
+func (a *app) keyList(ev vi.Event) bool {
+	if ev.Flags&modCtrl != 0 && (ev.Arg1 == keyCtrlL || ev.Arg1 == keyL) {
+		a.lockSession(false)
+		a.rearm()
+		return true
+	}
+	switch ev.Arg0 {
+	case hidEsc:
+		// Escape on the unlocked face LOCKS — the safe direction. Quit lives
+		// one screen deeper, on the locked face.
+		a.lockSession(false)
+		a.rearm()
+		return true
+	case hidUp:
+		return a.m.move(-1)
+	case hidDown:
+		return a.m.move(1)
+	}
+	switch ev.Arg1 {
+	case 'r', codeReturn, codeNewline:
+		if a.m.toggleReveal() {
+			if a.m.revealed(a.m.sel) {
+				vi.ConsoleLine(markerRevealed)
+			} else {
+				vi.ConsoleLine(markerHidden)
+			}
+			return true
+		}
+	case 'c':
+		a.copy()
+		return true
+	case 'a':
+		a.m.scr = scrAdd
+		a.focus = 0
+		a.status = ""
+		return true
+	}
+	return false
+}
+
+// copy publishes the selected secret to the seat's primary selection and
+// arms the 30-second lease. The refusal is the seat's answer — a missing
+// selection=primary opt-in or no seat — named, never assumed.
+func (a *app) copy() {
+	if a.m.sel < 0 || a.m.sel >= len(a.m.entries) {
+		return
+	}
+	secret := a.m.entries[a.m.sel].secret
+	if !a.publishSel(secret) {
+		vi.ConsoleLine(markerCopyErr)
+		a.status = "copy refused"
+		return
+	}
+	a.m.ctag = setClipTag(secret)
+	a.m.dl.armClip(nowFn())
+	a.rearm()
+	vi.ConsoleLine(markerCopied)
+	a.status = "copied — clears in 30 s"
+	notifyFn(a.ta, "copied; clears 30s")
+}
+
+func (a *app) keyAdd(ev vi.Event) bool {
+	fs := []*field{&a.add[0], &a.add[1], &a.add[2]}
+	f := fs[a.focus]
+	switch ev.Arg0 {
+	case hidEsc:
+		a.add[0].clear()
+		a.add[1].clear()
+		a.add[2].clear()
+		a.m.scr = scrList
+		a.status = "add cancelled"
+		return true
+	case hidUp:
+		if a.focus > 0 {
+			a.focus--
+			return true
+		}
+	case hidDown, hidTab:
+		if a.focus < len(fs)-1 {
+			a.focus++
+			return true
+		}
+	}
+	if ev.Arg1 == codeTab {
+		if a.focus < len(fs)-1 {
+			a.focus++
+			return true
+		}
+	}
+	if ev.Arg1 == codeBackspace || ev.Arg1 == codeDelete {
+		return f.backspace()
+	}
+	if ev.Arg1 == codeReturn || ev.Arg1 == codeNewline {
+		if a.focus < len(fs)-1 {
+			a.focus++
+			return true
+		}
+		a.commitAdd()
+		return true
+	}
+	if r, ok := printable(ev); ok {
+		return f.insert(r)
+	}
+	return false
+}
+
+// commitAdd stores the three fields as an entry and publishes the vault. The
+// field buffers are cleared (zeroed) either way — the session copy is the
+// entry's own clone.
+func (a *app) commitAdd() {
+	ok := a.m.addEntry(a.add[0].buf, a.add[1].buf, a.add[2].buf)
+	a.add[0].clear()
+	a.add[1].clear()
+	a.add[2].clear()
+	a.focus = 0
+	if !ok {
+		vi.ConsoleLine(markerRefused + "empty name")
+		a.status = "name required"
+		return
+	}
+	vi.ConsoleLine(markerAdded)
+	a.save()
+	a.m.scr = scrList
+	a.status = ""
+}
+
+// printable maps a key event to its text rune — the same arg1 contract the
+// notepad documents (Unicode codepoint, ASCII printable + Latin-1 up).
+func printable(ev vi.Event) (rune, bool) {
+	if ev.Kind != vi.EvKeyDown || ev.Flags&modCtrl != 0 {
+		return 0, false
+	}
+	if (ev.Arg1 >= 0x20 && ev.Arg1 < 0x7f || ev.Arg1 >= 0xa0) &&
+		ev.Arg1 <= utf8.MaxRune &&
+		(ev.Arg1 < 0xd800 || ev.Arg1 > 0xdfff) {
+		return rune(ev.Arg1), true
+	}
+	return 0, false
+}
+
+// --- drawing ---------------------------------------------------------------
+
+const (
+	chromeH = 24
+	fieldH  = 18
+	rowH    = 14
+	pad     = 12
+)
+
+func (a *app) fill(cv widgets.Canvas, x, y, w, h int, rgb uint32) {
+	if cv == nil || w <= 0 || h <= 0 {
+		return
+	}
+	cv.FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
+}
+
+// text paints a string in the 8x8 face, one lit run per glyph row — NOTE's
+// raster discipline (the webrender font package without its layout weight).
+func (a *app) text(cv widgets.Canvas, x, y int, s string, rgb uint32) {
+	cx := x
+	for _, ch := range s {
+		g := font.Glyph8(ch)
+		for row := 0; row < 8; row++ {
+			bits := g[row]
+			col := 0
+			for col < 8 {
+				if bits&(1<<uint(col)) == 0 {
+					col++
+					continue
+				}
+				run := 1
+				for col+run < 8 && bits&(1<<uint(col+run)) != 0 {
+					run++
+				}
+				a.fill(cv, cx+col, y+row, run, 1, rgb)
+				col += run
+			}
+		}
+		cx += font.Advance(1)
+	}
+}
+
+func (a *app) draw() {
+	cv := a.ta.Canvas()
+	if cv == nil {
+		return
+	}
+	tok := theme.Current
+	w, h := int(a.ta.W), int(a.ta.H)
+	if w <= 0 || h <= 0 {
+		w, h = natW, natH
+	}
+	a.fill(cv, 0, 0, w, chromeH, tok.Surface)
+	a.fill(cv, 0, chromeH, w, h-chromeH, tok.Bg)
+
+	state := "LOCKED"
+	if a.m.scr == scrList || a.m.scr == scrAdd {
+		state = "OPEN"
+	}
+	a.text(cv, pad, 8, appTitle+"   "+state, tok.Ink)
+	a.fill(cv, 0, chromeH-1, w, 1, tok.Rule)
+
+	switch a.m.scr {
+	case scrNew:
+		a.drawNew(cv, w, h)
+	case scrLocked:
+		a.drawLocked(cv, w, h)
+	case scrBadFile:
+		a.drawBadFile(cv, w, h)
+	case scrList:
+		a.drawList(cv, w, h)
+	case scrAdd:
+		a.drawAdd(cv, w, h)
+	}
+
+	if a.status != "" {
+		a.text(cv, pad, h-16, a.status, tok.InkMuted)
+	}
+}
+
+// fieldRow paints one labeled input row: label, a plated line of the
+// shown() text, and a caret tick on the focused field.
+func (a *app) fieldRow(cv widgets.Canvas, y int, f *field, focused bool) {
+	tok := theme.Current
+	a.text(cv, pad, y+5, f.label, tok.Muted)
+	fx := pad + 96
+	fw := int(a.ta.W) - fx - pad
+	if fw < 40 {
+		fw = 40
+	}
+	face := tok.Surface
+	if focused {
+		face = tok.BtnIdle
+	}
+	a.fill(cv, fx, y, fw, fieldH, face)
+	a.fill(cv, fx, y+fieldH-1, fw, 1, tok.Border)
+	a.text(cv, fx+4, y+5, f.shown(), tok.Ink)
+	if focused {
+		caretX := fx + 4 + font.Advance(1)*utf8.RuneCount(f.buf)
+		a.fill(cv, caretX, y+4, 2, fieldH-8, tok.Accent)
+	}
+}
+
+func (a *app) drawNew(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "No vault yet — choose a passphrase", tok.Text)
+	a.fieldRow(cv, chromeH+44, &a.pass, a.focus == 0)
+	a.fieldRow(cv, chromeH+44+fieldH+10, &a.conf, a.focus == 1)
+	a.text(cv, pad, h-32, "tab next · ⏎ create · esc quit", tok.Muted)
+}
+
+func (a *app) drawLocked(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "Vault is locked", tok.Text)
+	a.fieldRow(cv, chromeH+44, &a.pass, true)
+	a.text(cv, pad, h-32, "⏎ unlock · esc quit", tok.Muted)
+}
+
+func (a *app) drawBadFile(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "vault: bad file", tok.Text)
+	a.text(cv, pad, chromeH+36, "the file is not a GVLT vault", tok.Muted)
+	a.text(cv, pad, h-32, "esc quit", tok.Muted)
+}
+
+// drawList paints the entry rows. A hidden secret is a FIXED bullet width —
+// the length of a secret is information too — and only the revealed row's
+// own bytes are painted.
+func (a *app) drawList(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	if len(a.m.entries) == 0 {
+		a.text(cv, pad, chromeH+16, "Vault is empty", tok.Muted)
+	}
+	y := chromeH + 8
+	for i := range a.m.entries {
+		if y+rowH > h-40 {
+			break
+		}
+		if i == a.m.sel {
+			a.fill(cv, 0, y, w, rowH, tok.Surface)
+			a.fill(cv, 0, y, 3, rowH, tok.Accent)
+		}
+		e := &a.m.entries[i]
+		name := string(e.name)
+		if len(name) > 20 {
+			name = name[:20]
+		}
+		a.text(cv, pad, y+3, name, tok.Text)
+		secret := "********"
+		if a.m.revealed(i) {
+			secret = string(e.secret)
+		}
+		a.text(cv, pad+176, y+3, secret, tok.Muted)
+		note := string(e.note)
+		if len(note) > 24 {
+			note = note[:24]
+		}
+		a.text(cv, pad+304, y+3, note, tok.InkMuted)
+		y += rowH
+	}
+	a.text(cv, pad, h-32, "a add · r reveal · c copy · ctrl-l lock · esc lock", tok.Muted)
+}
+
+func (a *app) drawAdd(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "New entry", tok.Text)
+	a.fieldRow(cv, chromeH+44, &a.add[0], a.focus == 0)
+	a.fieldRow(cv, chromeH+44+fieldH+10, &a.add[1], a.focus == 1)
+	a.fieldRow(cv, chromeH+44+2*(fieldH+10), &a.add[2], a.focus == 2)
+	a.text(cv, pad, h-32, "tab next · ⏎ store · esc cancel", tok.Muted)
+}
