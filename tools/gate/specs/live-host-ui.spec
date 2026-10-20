@@ -74,9 +74,27 @@
 # --host-capture-keys arming flag), the inspector's send-serial
 # injection, and the one-chord capture pair. The same bus's lane
 # suspend/resume leg lives in live-hostint run 04 (M114c, #2456).
+#
+# Run 10 is M139e's (#2783) acceptance journey: one runner process, two
+# profiles — vm 1 (j1) rides --net + a staged agentd share and an
+# agentctl 'input' session types into the focused GOEDIT pane then
+# re-shoots the framebuffer (the M139b verb pair end to end), while
+# vm 2 (ws2, opened by the new-window verb on vm 1's own bus) suspends
+# on ITS bus and its serial shows no agent effect. Both sessions end on
+# their own receipts — vm=2 suspend+stopped, vm=1 stop. REPEAT
+# SEMANTICS: vgate_repeat 3 is the card's K=3 — every leg re-runs, so
+# each iteration is one full journey; python asserts read their own
+# run's out file via VG_TAG and profile state surviving an iteration
+# (saved-state, snapshots, audit receipts) is overwritten, never
+# accumulated-into, on the next.
+#
+# HOST PREREQ (run 10 only — the journey's staged share):
+#   bash tools/go/build-agentd.sh  -> .build/go/AGENTD.ELF
+#   bash tools/go/build-gotabwm.sh -> .build/go/GOTABWM.ELF
+#   bash tools/go/build-goedit.sh  -> .build/go/GOEDIT.ELF
 
-vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562 + M122d #2573: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts, one-chord capture, postmortem auto-open + CAPTURES routing + shortcuts cheat-sheet"
-vgate_repeat 1 BOOTS
+vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562 + M122d #2573 + M139a #2779 + M139e #2783: HostCommand bus — host-ui: receipts, one-chord capture, postmortem, multi-VM + agent ui.input journey K=3"
+vgate_repeat 3 BOOTS
 
 vgate_file script.txt <<'EOF'
 echo host-ui-idle
@@ -133,6 +151,57 @@ cfg2["baseImage"] = ws2base
 json.dump(cfg2, open(os.path.join(ws2, "config.json"), "w"), indent=2, sort_keys=True)
 os.makedirs(os.path.join(ws2, "share"), exist_ok=True)
 print("ws2 profile minted; private base copy staged")
+
+# Run 10's first machine (M139e #2783): j1's bundle is minted like
+# m120c's, then its share is staged with the M109/M139b agentd posture —
+# the ELFs, the devin keyring declaring `input`, the agent-hmac receipt
+# key, the audit lane, and wm=none so the seat is exec'd on script (the
+# go-agentd run-15 choreography, on a save-capable virtio-fs share
+# instead of the SPIKE cvc device). One honest difference: the
+# agent-hmac row is uid-scoped, NOT app-bound — `OWNERS.TXT` populates
+# the trust table only at the queue-5 (custom-virtio) arming point, so
+# under virtio-fs `system_owned_key` can never hold and an app-bound
+# secret refuses `no-credential` (observed). The key file the agentctl
+# stream reads lands at $RUN_DIR/devin.key (never argv).
+j1 = os.path.join(run, "j1.virelaivm")
+r = subprocess.run([runner, "--profile", j1, "--profile-init"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit("j1 profile mint refused: " + r.stdout + r.stderr)
+j1base = os.path.join(run, "j1-base.img")
+shutil.copy(os.path.join("artifacts", "disk.img"), j1base)
+cfg3 = json.load(open(os.path.join(j1, "config.json")))
+cfg3["baseImage"] = j1base
+cfg3.setdefault("devices", {})["share"] = False
+json.dump(cfg3, open(os.path.join(j1, "config.json"), "w"), indent=2, sort_keys=True)
+
+sys.path.insert(0, os.path.join("tools", "agentctl"))
+import agentctl
+j1share = os.path.join(j1, "share")
+os.makedirs(j1share, exist_ok=True)
+for name, cmd in (
+    ("AGENTD.ELF", "bash tools/go/build-agentd.sh"),
+    ("GOTABWM.ELF", "bash tools/go/build-gotabwm.sh"),
+    ("GOEDIT.ELF", "bash tools/go/build-goedit.sh"),
+):
+    src = os.path.join(".build", "go", name)
+    if not os.path.isfile(src):
+        sys.exit(name + " missing (expected " + src + ") — build it first: " + cmd)
+    shutil.copy(src, os.path.join(j1share, name))
+open(os.path.join(j1share, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
+devin_pub = agentctl.ed_public_key(bytes.fromhex("0a" * 32)).hex()
+open(os.path.join(j1share, "AGENTS.TXT"), "w").write(
+    "#v1\nagent=devin key=%s caps=file,process,window,term,input\n" % devin_pub)
+open(os.path.join(j1share, "SECRETS.TXT"), "w").write(
+    "#v1\nagent-hmac\t1000\t" + "a5" * 32 + "\n")
+open(os.path.join(j1share, "OWNERS.TXT"), "w").write(
+    "#v1\nAGENTD.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n")
+os.makedirs(os.path.join(j1share, "AGENT", "AUDIT"), exist_ok=True)
+ed = os.path.join(j1share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+open(os.path.join(ed, "SEED.TXT"), "wb").write(b"seed-line\n")
+open(os.path.join(run, "devin.key"), "w").write("devin " + "0a" * 32 + "\n")
+print("j1 profile minted; agentd share staged (seat exec'd on script)")
 PY
 
 vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
@@ -238,7 +307,7 @@ vgate_assert 05 output-contains 'host-ui: cmd=record-stop vm=1 state=performed r
 # only read "performed" would pass on a zero-byte MP4.
 vgate_assert 05 python <<'PY'
 import os, re
-out = open(os.path.join(os.environ["RUN_DIR"], "run-05.out"), "rb").read().decode("utf-8", "replace")
+out = open(os.path.join(os.environ["RUN_DIR"], "run-" + os.environ["VG_TAG"] + ".out"), "rb").read().decode("utf-8", "replace")
 m = re.search(r"host-ui: cmd=record-stop vm=1 state=performed recording=off frames=(\d+) bytes=(\d+)", out)
 if not m:
     raise SystemExit("record-stop receipt with frames=/bytes= not found in runner output")
@@ -352,10 +421,16 @@ PY
 # vm 1's bus; VM 2 boots in-session and its own prompt fires the
 # `vm2:`-bound suspend on ITS bus — the receipt's `vm=2` and the saved
 # state.vzsave prove the verb acted on the sibling, not the primary.
-# Recording starts on VM 1 only (vm=1 receipt; no vm=2 record line), a
-# second `new-window` of the open bundle receipts the named
-# `profile_in_use` refusal, and VM 1 keeps printing until its own
-# script-expect ends the run — the process exit drains whatever is left.
+# Recording starts on VM 1 only (vm=1 receipt; no vm=2 record line).
+# The duplicate `new-window@ws2` fires on the SAME first-prompt marker,
+# one trigger after the open: the minted session is registered before
+# the second dispatch runs, so the refusal is deterministic — a later
+# marker would race vm 2's own suspend (observed pre-fix: at cap-stop
+# the sibling had already stopped, the dedup missed, and a third
+# session tried to boot the still-held bundle → VZ start error AND a
+# truncated serial.log). VM 1 keeps printing until its own
+# script-expect ends the run — the process exit drains whatever is
+# left.
 vgate_file script9.txt <<'EOF'
 echo cap-start
 EOF
@@ -372,9 +447,9 @@ vgate_run 09 -- --profile '$RUN_DIR/m120c.virelaivm' \
     --script '$RUN_DIR/script9.txt' \
     --script2 '$RUN_DIR/script9b.txt' --script2-after 'cap-start' --script2-delay 20 \
     --host-cmd-after 'virelai> :new-window@$RUN_DIR/ws2.virelaivm' \
+    --host-cmd-after 'virelai> :new-window@$RUN_DIR/ws2.virelaivm' \
     --host-cmd-after 'cap-start:record-start' \
     --host-cmd-after 'vm2:virelai> :suspend' \
-    --host-cmd-after 'cap-stop:new-window@$RUN_DIR/ws2.virelaivm' \
     --host-cmd-after 'cap-stop:record-stop' \
     --script-expect 'vm1-done' --timeout 150
 
@@ -388,7 +463,7 @@ vgate_assert 09 output-contains 'vm=2: stopped'
 vgate_assert 09 python <<'PY'
 import os, re, sys
 run = os.environ["RUN_DIR"]
-out = open(os.path.join(run, "run-09.out"), "rb").read().decode("utf-8", "replace")
+out = open(os.path.join(run, "run-" + os.environ["VG_TAG"] + ".out"), "rb").read().decode("utf-8", "replace")
 if re.search(r"host-ui: cmd=record-start vm=2 ", out):
     sys.exit("a recording started on vm 2 — record must stay per-session")
 # VM 2's suspend preceded VM 1's final SUCCESS — VM 1 kept printing
@@ -452,12 +527,96 @@ PY
 vgate_assert 08 python <<'PY'
 import glob, os, shutil, sys
 run = os.environ["RUN_DIR"]
+tag = os.environ["VG_TAG"]
 if glob.glob(os.path.join(run, "screen8-hostui-*")):
     sys.exit("screenshot leaked outside CAPTURES into the run dir")
 # Lift the capture like run 05 does — the teardown's keep-file copy
-# reads $RUN_DIR/<basename>, and the share dies with the temp dir.
+# reads $RUN_DIR/<basename>, and the share dies with the temp dir. The
+# lifted name is tag-prefixed: under vgate_repeat 3 an earlier
+# iteration's lift would otherwise match the leak glob above and
+# false-red the next pass.
 caps = glob.glob(os.path.join(run, "capshare8", "CAPTURES", "*"))
 for f in caps:
-    shutil.copy(f, os.path.join(run, os.path.basename(f)))
+    shutil.copy(f, os.path.join(run, tag + "-" + os.path.basename(f)))
 print("no run-dir leak; lifted %d CAPTURES file(s)" % len(caps))
+PY
+
+# Run 10 is M139e's (#2783) acceptance journey — the arc's two halves in
+# ONE process: vm 1's first prompt opens ws2 through the new-window verb
+# on vm 1's own bus (M139a), and on vm 1 the staged j1 share brings the
+# seat up on script so agentctl's `input` journey (M139b) drives an
+# AGENTD session over --net — ui.windows polls until script3's GOEDIT
+# registers, ui.input types 'hi' + a click into the focused Edit pane,
+# and the following ui.screenshot sees the repaint (pixels-changed is
+# the card's "shows the typed text"). Vm 2's own prompt suspends it on
+# ITS bus (vm=2 receipts; its saved-state/state.vzsave is the real
+# stop), its serial never shows an agent effect, and the session's end
+# marker stops vm 1 on ITS bus — the verdict's re-read path (#1024) sees
+# the transcript already landed, so the run greens rc 0 with both
+# machines' own stop receipts in the out file.
+vgate_file script10.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOTABWM.ELF
+EOF
+
+vgate_file script10b.txt <<'EOF'
+exec AGENTD.ELF --allow-exec
+EOF
+
+vgate_file script10c.txt <<'EOF'
+dui focus 0
+exec GOEDIT.ELF
+EOF
+
+vgate_run 10 -- --profile '$RUN_DIR/j1.virelaivm' \
+    --overlay-base '$RUN_DIR/j1-base.img' \
+    --virtio-fs '$RUN_DIR/j1.virelaivm/share' \
+    --screen '$RUN_DIR/screen10' \
+    --net '$RUN_DIR/cap10.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=input' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/devin.key' \
+    --net-tcp-connect-after 'agentd: listen 4747' \
+    --script '$RUN_DIR/script10.txt' \
+    --script2 '$RUN_DIR/script10b.txt' --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script10c.txt' --script3-after 'verb=ui.windows' \
+    --host-cmd-after 'virelai> :new-window@$RUN_DIR/ws2.virelaivm' \
+    --host-cmd-after 'vm2:virelai> :suspend' \
+    --host-cmd-after 'agentd: session end reason=client_close:stop' \
+    --script-expect 'agentd: session end reason=client_close' --timeout 300
+
+vgate_assert 10 serial-contains 'agentd: auth ok agent=devin'
+vgate_assert 10 serial-contains 'verb=ui.windows ok'
+vgate_assert 10 serial-contains 'verb=ui.input ok'
+vgate_assert 10 serial-contains 'verb=ui.screenshot ok'
+vgate_assert 10 serial-contains 'gotabwm: agent-input'
+vgate_assert 10 serial-contains 'agentd: session end reason=client_close'
+vgate_assert 10 output-contains 'AGENTCTL: PASS input'
+vgate_assert 10 output-contains 'NET-TCP-STREAM: probe exited status=0'
+vgate_assert 10 output-contains 'host-ui: cmd=new-window vm=1 state=performed opened=2'
+vgate_assert 10 output-contains 'host-ui: cmd=suspend vm=2 state=performed'
+vgate_assert 10 output-contains 'host-ui: cmd=stop vm=1 state=performed'
+vgate_assert 10 output-contains 'vm-stop: state=0'
+vgate_assert 10 output-contains 'vm=2: stopped'
+# The agent session rode vm 1 only: vm 2's own serial log shows its own
+# boot and prompt, and not one agentd/ui.input/agent-input byte — the
+# "no effect" half of the card. Its suspend is real: state.vzsave is
+# non-empty, like run 09's check.
+vgate_assert 10 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+ser = os.path.join(run, "ws2.virelaivm", "run", "serial.log")
+text = open(ser, "rb").read().decode("utf-8", "replace")
+if "virelai> " not in text:
+    sys.exit("vm 2 never reached the guest shell")
+for needle in ("agentd", "agent-input", "ui.input", "ui.screenshot"):
+    if needle in text:
+        sys.exit("vm 2 serial shows agent traffic: %r" % needle)
+state = os.path.join(run, "ws2.virelaivm", "saved-state", "state.vzsave")
+if not os.path.isfile(state) or os.path.getsize(state) == 0:
+    sys.exit("vm 2 suspend left no saved-state/state.vzsave")
+print("journey leg: vm2 serial clean (no agent effect), state.vzsave green")
 PY

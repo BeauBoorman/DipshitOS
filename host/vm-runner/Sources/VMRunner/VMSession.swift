@@ -79,6 +79,16 @@ final class VMSession {
     /// The armed --host-cmd-after list (each session keeps its own copy —
     /// a marker in THIS serial stream fires on THIS session's bus).
     var triggers: [HostCommandTrigger] = []
+    /// M139e (#2783): a secondary's trigger copy arms on its FIRST
+    /// sessionPoll, not inside boot() — a `new-window` dispatch reaches
+    /// boot() while fireHostCmdTriggers still holds its inout modify
+    /// access on the shared hostCmdTriggers list, so reading the global
+    /// in that stack is a dynamic exclusivity violation (observed:
+    /// live-host-ui run 09, rc=134). The first poll runs after the
+    /// dispatch returns — ahead of any serial marker landing — and the
+    /// copy still carries each trigger's already-fired state, so an
+    /// unbound trigger spent on vm 1 stays spent here.
+    var triggersArmed = false
     var lastText = ""
     var vmDidStart = false
     var suspendStopInFlight = false
@@ -347,7 +357,6 @@ final class VMSessionRegistry {
         s.runner = runner
         s.vmDelegate = delegate
 
-        s.triggers = hostCmdTriggers
         s.suspendCtl = SuspendCtl(vm: runner.vm, queue: runner.queue,
                                 savedStateDir: p.savedStateURL, unsupported: unsupported)
         s.suspendCtl?.onFinish = { [weak self, weak s] in
@@ -716,6 +725,10 @@ final class VMSessionRegistry {
         if let url = s.serialURL,
            let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
             s.lastText = text
+        }
+        if !s.triggersArmed {
+            s.triggers = hostCmdTriggers
+            s.triggersArmed = true
         }
         fireHostCmdTriggers(&s.triggers, on: bus(for: s), session: s.id, text: s.lastText)
         if let vm = s.runner?.vm, s.vmDidStart,
