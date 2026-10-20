@@ -286,6 +286,11 @@ func guessBin(title string) string {
 		// restored starter tab execs "Sh" and drops by name (go-dogfood
 		// boot 06: `refusal ENOENT exec Sh`).
 		return "GOSH.ELF"
+	case "Clock":
+		// M144b (#2795): GOCLOCK's declared title — the session-restore
+		// leg re-execs the recorded row, so "Clock" must name the real
+		// binary (`refusal ENOENT exec Clock`, go-clock run 05).
+		return "GOCLOCK.ELF"
 	case "Vault":
 		// M148a (#2804): GOVAULT's declared title — without the row the
 		// recorded bin is "Vault", the APPS.TXT selection=primary lookup

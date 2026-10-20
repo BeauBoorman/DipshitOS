@@ -190,3 +190,75 @@ func parseHHMM(v int) (h, m int, ok bool) {
 	}
 	return h, m, true
 }
+
+// --- persisted alarm ---------------------------------------------------------
+//
+// M144b (#2795): the armed daily alarm survives the app. ONE record —
+// `gocal1 <at> <hhmm>` — rides both carriers: the app's own share file
+// (crash-safe through vi.WriteFileSafe) and the seat's save_state blob.
+// `at` is the armed instant as a wall-clock epoch so a start after the
+// deadline can tell "still ahead" from "came due while we were off";
+// `hhmm` is the civil field the user typed — the marker and the face
+// speak it.
+
+// alarmMagic versions the record: a blob or file whose framing does not
+// match is refused whole, never guessed at.
+const alarmMagic = "gocal1 "
+
+// hhmmString renders h:m as the typed four-digit field.
+func hhmmString(h, m int) string {
+	return two(int64(h)) + two(int64(m))
+}
+
+// encodeAlarm renders the persisted record.
+func encodeAlarm(at int64, hhmm int) []byte {
+	h, m, ok := parseHHMM(hhmm)
+	if !ok || at < 0 {
+		return nil
+	}
+	return []byte(alarmMagic + itoa(at) + " " + hhmmString(h, m))
+}
+
+// decodeAlarm is the total inverse: anything that is not exactly
+// `gocal1 <digits> <HHMM>` refuses (ok=false) rather than trusting a
+// torn or foreign record.
+func decodeAlarm(b []byte) (at int64, hhmm int, ok bool) {
+	s := string(b)
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		s = s[:len(s)-1]
+	}
+	if len(s) <= len(alarmMagic) || s[:len(alarmMagic)] != alarmMagic {
+		return 0, 0, false
+	}
+	rest := s[len(alarmMagic):]
+	sp := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == ' ' {
+			sp = i
+			break
+		}
+	}
+	if sp <= 0 || sp+5 != len(rest) {
+		return 0, 0, false
+	}
+	atStr, hmStr := rest[:sp], rest[sp+1:]
+	for i := 0; i < len(atStr); i++ {
+		if atStr[i] < '0' || atStr[i] > '9' {
+			return 0, 0, false
+		}
+	}
+	for i := 0; i < len(atStr); i++ {
+		at = at*10 + int64(atStr[i]-'0')
+	}
+	v := 0
+	for i := 0; i < 4; i++ {
+		if hmStr[i] < '0' || hmStr[i] > '9' {
+			return 0, 0, false
+		}
+		v = v*10 + int(hmStr[i]-'0')
+	}
+	if _, _, ok = parseHHMM(v); !ok {
+		return 0, 0, false
+	}
+	return at, v, true
+}

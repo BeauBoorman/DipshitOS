@@ -64,6 +64,13 @@ const (
 	markerAArm     = "goclock: alarm armed "
 	markerACancel  = "goclock: alarm cancel"
 	markerARefuse  = "goclock: alarm refused"
+	markerARestore = "goclock: alarm restored "
+	markerASaved   = "goclock: alarm saved"
+	markerASaveBad = "goclock: alarm save failed rc="
+	markerAFileBad = "goclock: alarm file bad"
+	markerStRest   = "goclock: state restored"
+	markerStRefuse = "goclock: state refused"
+	markerStPosted = "goclock: state posted"
 	markerDFull    = "goclock: deadline full"
 	markerClose    = "goclock: close"
 	markerOK       = "goclock OK"
@@ -78,6 +85,11 @@ const (
 	// faceDeadline is the 1 Hz repaint entry — a Quiet deadline, so the
 	// second hand's cadence never raises a toast or a `fired` marker.
 	faceDeadline = "face"
+
+	// alarmPath is the persisted record's share file. The save_state blob
+	// carries the same bytes; the file is the always-current half — it is
+	// rewritten on every arm/cancel while the blob is a snapshot capture.
+	alarmPath = "/host/GOCLOCK.ALARM"
 )
 
 // The tab ids are their own block: iota is the const-spec INDEX inside its
@@ -139,12 +151,28 @@ type app struct {
 	now  func() int64
 	nano func() int64
 
+	// restored latches the one-shot restore pass: the kind-21 request runs
+	// once inside the event loop, not from tabapp.Init (see the Config).
+	restored bool
+	// alarmHHMM is the civil field the armed daily alarm was typed as —
+	// the sched deadline knows only the epoch; the record needs both.
+	alarmHHMM int
+
 	buttons      [2]widgets.Button
 	paintedEpoch int64
 	ktArmed      bool
 }
 
 func (a *app) entryFor(tab int) *DigitEntry { return &a.entry[tab-tabTimer] }
+
+// The persisted-record seams — vi.WriteFileSafe/ReadFileAll/FileDelete cross
+// the raw syscall gateway on the guest and degrade off it, so the vars are
+// the host-test surface (the appstate.go / session.go pattern).
+var (
+	alarmFileWrite = vi.WriteFileSafe
+	alarmFileRead  = vi.ReadFileAll
+	alarmFileDel   = vi.FileDelete
+)
 
 func loadGuestTheme() {
 	b, r := vi.ReadFileAll("/host/SETTINGS.TXT", 2048)
@@ -162,7 +190,18 @@ func main() {
 	a.entry[tabTimer-tabTimer] = NewDigitEntry(timerEntryDigits)
 	a.entry[tabAlarm-tabTimer] = NewDigitEntry(4)
 
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH})
+	ta := tabapp.Init(tabapp.Config{
+		Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH,
+		// M144b (#2795): the armed alarm rides the seat's save/restore
+		// channel — SaveState answers the snapshot/close asks and the
+		// unsolicited push. RestoreState is deliberately NOT hooked: the
+		// kind-21 request is a blocking mailbox round-trip, and a resize
+		// queued while it waits can only be Dispatched after it returns —
+		// so the request runs once inside the loop after the first event
+		// drain instead (applyPersistedAlarm).
+		StateVersion: 1,
+		SaveState:    a.saveBlob,
+	})
 	if ta == nil {
 		vi.ConsoleLine("goclock: open failed")
 		vi.Exit(1)
@@ -220,6 +259,19 @@ func main() {
 		if a.pollSettings() {
 			a.dirty = true
 		}
+		// The restore request must precede the save poll on the first
+		// pass: a session-restore boot's seat asks the re-exec'd app for
+		// state, and an empty answer (nothing armed yet) closes the
+		// exchange — the kind-21 request that follows is refused
+		// (go-clock run 05: `state save len=0` then `rpc refuse kind=21`).
+		if !a.restored {
+			a.restored = true
+			a.applyPersistedAlarm()
+		}
+		// The seat's save ask is mailbox traffic, not an input event —
+		// answer it once per pass so a snapshot/close ask is serviced
+		// inside this app's own slice.
+		ta.PollStateAsk()
 		if a.dirty {
 			a.dirty = false
 			a.paint()
@@ -430,6 +482,8 @@ func (a *app) armAlarm() bool {
 		return false
 	}
 	vi.ConsoleLine(markerAArm + two(int64(h)) + ":" + two(int64(m)))
+	a.alarmHHMM = h*100 + m
+	a.persistAlarm(at, a.alarmHHMM)
 	a.armTimer()
 	return true
 }
@@ -448,9 +502,124 @@ func (a *app) cancelTab() bool {
 		vi.ConsoleLine(markerTCancel)
 	} else {
 		vi.ConsoleLine(markerACancel)
+		a.alarmHHMM = 0
+		a.unpersistAlarm()
 	}
 	a.armTimer()
 	return true
+}
+
+// --- alarm persistence (M144b, #2795) ------------------------------------------
+//
+// The armed daily alarm survives the app through two carriers that share one
+// record (`gocal1 <at> <hhmm>`, model.go):
+//
+//   - the share file at alarmPath, rewritten crash-safe on every arm and
+//     deleted on cancel — it is the always-current half and survives any
+//     reboot the share survives;
+//   - the seat's save_state/restore_state blob (SESSION.TABS trailer),
+//     pushed on arm/cancel and answered on the snapshot/close asks — it is
+//     a capture of whatever was stored when the seat asked.
+//
+// At start the file wins when both decode: it tracks mutations the snapshot
+// predates. A record whose `at` is already past fires once immediately,
+// marked late — that is what "the alarm came due while the machine was
+// suspended or rebooted" looks like from the app's side. The daily repeater
+// re-arms at the next future occurrence, so the late fire never costs the
+// user tomorrow's alarm.
+
+// saveBlob is the tabapp.SaveState hook: the current record, or nil when no
+// alarm is armed (an empty answer is "no state", never a fabricated one).
+func (a *app) saveBlob() []byte {
+	for _, d := range a.sched.ds {
+		if d.ID == "alarm" {
+			return encodeAlarm(d.At, a.alarmHHMM)
+		}
+	}
+	return nil
+}
+
+// persistAlarm publishes the armed record through both carriers — the file
+// first (the durable half), then the unsolicited state push so the seat's
+// stored blob is already current if a crash lands before the next ask.
+func (a *app) persistAlarm(at int64, hhmm int) {
+	b := encodeAlarm(at, hhmm)
+	if b == nil {
+		return
+	}
+	if rc := alarmFileWrite(alarmPath, b); rc != 0 {
+		vi.ConsoleLine(markerASaveBad + vi.Itoa64(rc))
+		return
+	}
+	vi.ConsoleLine(markerASaved)
+	if a.ta != nil && a.ta.SaveStateNow() {
+		vi.ConsoleLine(markerStPosted)
+	}
+}
+
+// unpersistAlarm clears both carriers: the file goes away and the pushed
+// empty blob erases the seat's stored record, so a cancelled alarm cannot
+// be revived by a later restore.
+func (a *app) unpersistAlarm() {
+	if rc := alarmFileDel(alarmPath); rc != 0 && rc != vi.ErrFileNotFound {
+		vi.ConsoleLine(markerASaveBad + vi.Itoa64(rc))
+	}
+	if a.ta != nil && a.ta.SaveStateNow() {
+		vi.ConsoleLine(markerStPosted)
+	}
+}
+
+// applyPersistedAlarm runs once inside the event loop, after the first
+// event drain: the seat's pane rect can only be Dispatched once the loop
+// runs, so the kind-21 request (a blocking mailbox round-trip) waits for
+// that first drain rather than sitting in Init ahead of it. The blob is
+// consume-on-use, so asking later loses nothing. Marker order is evidence
+// order: the channel verdict prints before the arm, the arm before any
+// late fire.
+func (a *app) applyPersistedAlarm() {
+	var at int64
+	var hhmmi int
+	found := false
+	if ver, blob, ok := vi.RequestStateRestore(uint32(a.ta.Win), appName); ok {
+		if bat, bhhmm, bok := decodeAlarm(blob); bok && ver == 1 {
+			vi.ConsoleLine(markerStRest)
+			at, hhmmi, found = bat, bhhmm, true
+		} else {
+			vi.ConsoleLine(markerStRefuse)
+		}
+	}
+	// The file is fresher-or-equal to any snapshot capture: it is rewritten
+	// on every mutation, so when both decode the file's record stands.
+	if raw, r := alarmFileRead(alarmPath, 128); r >= 0 {
+		if fat, fhhmm, fok := decodeAlarm(raw); fok {
+			at, hhmmi, found = fat, fhhmm, true
+		} else {
+			vi.ConsoleLine(markerAFileBad)
+		}
+	}
+	if !found {
+		return
+	}
+	h, m, _ := parseHHMM(hhmmi)
+	vi.ConsoleLine(markerARestore + two(int64(h)) + ":" + two(int64(m)))
+	if !a.sched.Add(Deadline{ID: "alarm", At: at, Repeat: 86400}) {
+		vi.ConsoleLine(markerDFull)
+		return
+	}
+	a.alarmHHMM = hhmmi
+	// A deadline that came due while the app was off fires once now, marked
+	// late — the repeat re-arm lands on the next future occurrence, exactly
+	// the catch-up sched.Fire already performs.
+	for _, d := range a.sched.Fire(a.now()) {
+		if d.Quiet {
+			continue
+		}
+		vi.ConsoleLine(markerFired + d.ID + " late")
+		if !a.ta.Notify(d.ID + " done") {
+			vi.ConsoleLine(markerNotifyNo + d.ID)
+		}
+	}
+	a.dirty = true
 }
 
 // remaining is the armed deadline's seconds-to-go, -1 when unarmed.

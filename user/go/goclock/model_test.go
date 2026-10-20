@@ -155,3 +155,37 @@ func TestAlarmAt(t *testing.T) {
 		t.Fatalf("alarmAt 17:00 in UTC+05:30 = %d, want %d", got, now+84600)
 	}
 }
+
+// The persisted record is `gocal1 <at> <hhmm>` — the armed epoch plus the
+// civil field. Round-trips byte-exact; a staged `write` line lands the same.
+func TestAlarmRecordRoundTrip(t *testing.T) {
+	b := encodeAlarm(1792497600, 2359)
+	if string(b) != "gocal1 1792497600 2359" {
+		t.Fatalf("encodeAlarm = %q, want the gocal1 record", b)
+	}
+	at, hhmm, ok := decodeAlarm(b)
+	if !ok || at != 1792497600 || hhmm != 2359 {
+		t.Fatalf("decodeAlarm = %d,%d,%v", at, hhmm, ok)
+	}
+	// A trailing newline (a hand-staged or edited file) still decodes.
+	if at, hhmm, ok = decodeAlarm([]byte("gocal1 1 0000\n")); !ok || at != 1 || hhmm != 0 {
+		t.Fatalf("decodeAlarm trailing-newline = %d,%d,%v", at, hhmm, ok)
+	}
+}
+
+// Anything that is not exactly the gocal1 record refuses whole — a torn
+// write, a foreign blob, a bad civil field are all "no state".
+func TestAlarmRecordRefusals(t *testing.T) {
+	for _, s := range []string{
+		"", "gocal1", "gocal2 1 2359", "gocal1 1", "gocal1 1 235",
+		"gocal1 1 23590", "gocal1 x 2359", "gocal1 1 2460", "gocal1 -1 2359",
+		" gocal1 1 2359", "gocal1 1 2359 extra",
+	} {
+		if _, _, ok := decodeAlarm([]byte(s)); ok {
+			t.Fatalf("decodeAlarm(%q) = ok, want refused", s)
+		}
+	}
+	if encodeAlarm(-1, 2359) != nil || encodeAlarm(1, 2460) != nil {
+		t.Fatal("encodeAlarm must refuse a negative at or a bad HHMM")
+	}
+}
