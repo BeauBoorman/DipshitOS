@@ -73,6 +73,11 @@ type termState struct {
 	pairs    []string
 	savedAlt bool
 	scroll   []byte
+
+	// M149b (#2807): the OSC-8 link tracker on the write path and the
+	// SGR mouse-report filter on the read path (links.go).
+	lt *linkTracker
+	mi *mouseFilter
 }
 
 // capture is the tee on the tty write path: every byte the kernel paints

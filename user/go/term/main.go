@@ -161,6 +161,14 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 	sh := shlib.NewShell(hst, hist)
 	policy := loadRestartPolicy()
 
+	// M149b (#2807): arm the OSC-8 machinery — the link tracker on the
+	// write path, the report filter on the read path, and xterm mouse
+	// reporting through the kernel emulator (M73i): press/release edges
+	// over the bound window arrive as SGR reports on this tty's input.
+	ts.lt = newLinkTracker()
+	ts.mi = newMouseFilter()
+	writeTTY(ts, fd, []byte(mouseEnable))
+
 	// M98h: the tab title follows the cwd — one tracker for the window's
 	// whole life (a shell restart keeps the seat, and the title it last
 	// sent). Sync after each startup contract and after every submitted
@@ -234,6 +242,13 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 			if closeRequested(line) {
 				vi.ConsoleLine(markerDone + "0")
 				shutdown(ta, fd, 0)
+				return
+			}
+			// M149b: `term-profile` is a front-end line command like
+			// `exit --close` — answered here, never handed to the engine.
+			if pname, plist, ok := profileCmd(line); ok {
+				handleProfileCmd(ts, ta, fd, editor, pname, plist)
+				vi.ConsoleLine(markerDone + "0")
 				return
 			}
 			st, act := sh.RunLine(line)
@@ -342,7 +357,19 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 				if n == 1 && readBuf[0] == '?' {
 					hintsSession(ta, ts, fd, editor)
 				} else {
-					handle(editor.Feed(readBuf[:n]))
+					// M149b: SGR mouse reports are not editor input —
+					// strip them; a press+release on one link cell opens it.
+					clean, reps := ts.mi.extract(readBuf[:n])
+					for _, r := range reps {
+						if cx, cy, ok := ts.mi.clickCell(r); ok {
+							if uri, found := ts.lt.linkAt(cx, cy, rowsVisible(ta.H)); found {
+								openLink(ts, ta, fd, editor, hst, uri)
+							}
+						}
+					}
+					if len(clean) > 0 {
+						handle(editor.Feed(clean))
+					}
 				}
 			}
 			for editor.Pending() {
@@ -497,6 +524,12 @@ func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
 }
 
 func writeTTY(ts *termState, fd uint32, b []byte) {
+	// M149b (#2807): the OSC-8 filter injects the underline rendition
+	// around link spans and mirrors the kernel's link cells; the capture
+	// ring records what was actually written (the transformed stream).
+	if ts != nil && ts.lt != nil {
+		b = ts.lt.filter(b)
+	}
 	for len(b) > 0 {
 		n := len(b)
 		if n > ttyWriteMax {
