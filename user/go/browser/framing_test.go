@@ -14,7 +14,7 @@ func TestRequestAuthorityAndIdentityFraming(t *testing.T) {
 		t.Fatal("URL rejected")
 	}
 	got := formatPageRequest(u, "a=b")
-	want := "GET /a?x=1 HTTP/1.0\r\nHost: example.com:8443\r\nUser-Agent: VirelaiOS/1.0\r\nCookie: a=b\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n"
+	want := "GET /a?x=1 HTTP/1.1\r\nHost: example.com:8443\r\nUser-Agent: VirelaiOS/1.0\r\nCookie: a=b\r\nConnection: keep-alive\r\nAccept-Encoding: gzip\r\n\r\n"
 	if got != want {
 		t.Fatalf("request=%q want=%q", got, want)
 	}
@@ -29,8 +29,11 @@ func TestBoundedRecordedHTTPFrames(t *testing.T) {
 	}{
 		{"length", "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nabc", ""},
 		{"EOF", "HTTP/1.1 200 OK\n\nabc", ""},
-		{"chunked", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "http-framing-unsupported"},
-		{"gzip", "HTTP/1.0 200 OK\r\nContent-Encoding: gzip\r\n\r\n", "http-framing-unsupported"},
+		{"chunked", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "chunked-malformed"},
+		{"gzip", "HTTP/1.0 200 OK\r\nContent-Encoding: gzip\r\n\r\n", "gzip-malformed"},
+		{"te nonchunked", "HTTP/1.1 200 OK\r\nTransfer-Encoding: deflate\r\n\r\n", "http-framing-unsupported"},
+		{"ce br", "HTTP/1.0 200 OK\r\nContent-Encoding: br\r\n\r\n", "http-framing-unsupported"},
+		{"te+cl", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n", "http-framing-invalid"},
 		{"length conflict", "HTTP/1.0 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n", "http-framing-invalid"},
 		{"bogus length", "HTTP/1.0 200 OK\r\nContent-Length: -1\r\n\r\n", "http-framing-invalid"},
 		{"short", "HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nabc", "http-premature-eof"},
@@ -131,7 +134,12 @@ func TestMainResponseUsesOnlyDeclaredBodyLength(t *testing.T) {
 		tStart: vi.Nanos(), tNav0: vi.Nanos(),
 		loadBuf: []byte("HTTP/1.0 200 OK\r\nContent-Length: " + itoa(len(body)) +
 			"\r\n\r\n" + body + "<p>undeclared tail</p>")}
-	a.finishResponse(false)
+	frame := parseResponseFrame(a.loadBuf)
+	decoded, _, failure := responseBody(frame, a.loadBuf, 256*1024, true)
+	if failure != "" {
+		t.Fatalf("responseBody: %q", failure)
+	}
+	a.finishResponse(false, frame.head, decoded, false)
 	if string(a.lastBody) != body {
 		t.Fatalf("undeclared bytes reached the page: %q", a.lastBody)
 	}

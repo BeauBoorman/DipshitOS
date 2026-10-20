@@ -231,10 +231,11 @@ func TestLoadCompletesOnContentLength(t *testing.T) {
 	}
 }
 
-// Transfer-Encoding: chunked is not decoded by this browser: it is refused
-// as a defined error, never silently treated as the body.
-func TestLoadStepRefusesChunked(t *testing.T) {
-	body := "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+// Transfer-Encoding: chunked is decoded by this browser (M135b): a valid
+// stream renders, and a malformed one is refused by name — never silently
+// treated as the body.
+func TestLoadStepDecodesChunked(t *testing.T) {
+	body := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
 	f := &fakeTCP{ready: []int64{3, 2}, recv: []int64{int64(len(body))}}
 	defer f.install()()
 	a := &app{hist: newHistory()}
@@ -245,10 +246,32 @@ func TestLoadStepRefusesChunked(t *testing.T) {
 		a.loadStep()
 	}
 	if a.loading {
-		t.Fatal("an unsupported transfer coding must end the load")
+		t.Fatal("a complete chunked stream must end the load")
 	}
-	if a.errKind != "http-framing-unsupported" {
-		t.Fatalf("errKind = %q want http-framing-unsupported", a.errKind)
+	if a.errKind != "" {
+		t.Fatalf("errKind = %q want the decoded page", a.errKind)
+	}
+	if string(a.lastBody) != "hello" {
+		t.Fatalf("decoded body = %q want hello", a.lastBody)
+	}
+}
+
+func TestLoadStepRefusesMalformedChunked(t *testing.T) {
+	body := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
+	f := &fakeTCP{ready: []int64{3, 2}, recv: []int64{int64(len(body))}}
+	defer f.install()()
+	a := &app{hist: newHistory()}
+	copy(a.chunk[:], body)
+	u, _ := webrender.ParseHTTPURL("http://10.0.0.2/")
+	a.startHTTP(u)
+	for i := 0; i < 8 && a.loading; i++ {
+		a.loadStep()
+	}
+	if a.loading {
+		t.Fatal("a malformed chunked stream must end the load")
+	}
+	if a.errKind != "chunked-malformed" {
+		t.Fatalf("errKind = %q want chunked-malformed", a.errKind)
 	}
 }
 
@@ -267,7 +290,7 @@ func TestResponseNeed(t *testing.T) {
 		{"duplicate", "HTTP/1.0 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc", -2, true},
 		{"empty", "HTTP/1.0 200 OK\r\nContent-Length:\r\n\r\nabc", -2, true},
 		{"nondigit", "HTTP/1.0 200 OK\r\nContent-Length: 3x\r\n\r\nabc", -2, true},
-		{"chunked", "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nabc", -2, true},
+		{"chunked", "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nabc", -1, true},
 		{"over cap", "HTTP/1.0 200 OK\r\nContent-Length: 99999999\r\n\r\n", -2, true},
 	}
 	for _, c := range cases {

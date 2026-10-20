@@ -17,9 +17,9 @@ package main
 // verdicts the Zig fetch used.
 
 import (
-	"bytes"
 	"strings"
 
+	"virelai/httpc"
 	"virelai/settings"
 	"virelai/vi"
 )
@@ -82,18 +82,11 @@ func dialPlain(host string, port uint16) (connStream, error) {
 }
 
 func requestString(host string, port uint16, path string) string {
-	if path == "" {
-		path = legacyDefaultPath
-	}
 	hostHeader := host
 	if port != legacyDefaultPort {
 		hostHeader = host + ":" + portString(port)
 	}
-	return "GET " + path + " HTTP/1.0\r\n" +
-		"Host: " + hostHeader + "\r\n" +
-		"User-Agent: VirelaiOS/1.0\r\n" +
-		"Accept-Encoding: identity\r\n" +
-		"Connection: close\r\n\r\n"
+	return httpc.GetRequest(hostHeader, path, "")
 }
 
 // errorName renders a vi/vsys error through its own Error() string (the
@@ -105,146 +98,33 @@ func errorName(err error) string {
 	return err.Error()
 }
 
-// responseStream frames one HTTP/1.0 response: the head through the bare
-// CRLFCRLF, then the body. Content-Length (when present) bounds the body;
-// otherwise the peer's FIN delimits it. The head is capped at headerLimit.
+// responseStream is the M135b reader over httpc: one response per call —
+// head through the terminator, then the body framed by Content-Length,
+// chunked, or the peer's FIN, content-decoded (gzip) into body. reusable
+// is the exchange's keep-alive verdict for the caller's conn pool.
 type responseStream struct {
-	s      connReader
-	head   []byte
-	status int
-	length int
-	body   []byte
-	buf    [readChunk]byte
+	head     []byte
+	parsed   httpc.Head
+	body     []byte
+	reusable bool
+}
+
+var fetchPolicy = httpc.Policy{
+	MaxHead:   headerLimit,
+	MaxLine:   1024,
+	MaxFields: 64,
+	Cap:       vi.MaxFileBytes,
+	WireSlack: 64 * 1024,
 }
 
 func newResponseStream(s connReader) (*responseStream, error) {
-	r := &responseStream{s: s}
-	raw := make([]byte, 0, readChunk)
-	for {
-		n, err := s.Read(r.buf[:])
-		if n > 0 {
-			raw = append(raw, r.buf[:n]...)
-			if i := bytes.Index(raw, []byte("\r\n\r\n")); i >= 0 {
-				end := i + 4
-				r.head = append([]byte(nil), raw[:end]...)
-				r.body = append([]byte(nil), raw[end:]...)
-				status, length, perr := parseResponseHead(r.head)
-				if perr != nil {
-					return nil, perr
-				}
-				r.status, r.length = status, length
-				if r.length >= 0 && len(r.body) > r.length {
-					r.body = r.body[:r.length]
-				}
-				return r, nil
-			}
-		}
-		if len(raw) >= headerLimit {
-			return nil, errStr("response headers exceed 1024 bytes")
-		}
-		if err != nil || n == 0 {
-			return nil, errStr("malformed response: no header terminator")
-		}
+	r := &responseStream{}
+	head, h, body, _, reusable, err := httpc.ReadResponse(s, fetchPolicy)
+	if err != "" {
+		return nil, errStr(err)
 	}
-}
-
-func parseResponseHead(head []byte) (status int, length int, err error) {
-	status = -1
-	length = -1
-	end := bytes.IndexByte(head, '\n')
-	if end < 0 {
-		return 0, 0, errStr("malformed status line")
-	}
-	line := strings.TrimSuffix(string(head[:end]), "\r")
-	fields := strings.Fields(line)
-	if len(fields) < 2 || !strings.HasPrefix(fields[0], "HTTP/") {
-		return 0, 0, errStr("malformed status line")
-	}
-	status = 0
-	digits := 0
-	for i := 0; i < len(fields[1]); i++ {
-		c := fields[1][i]
-		if c < '0' || c > '9' || digits == 3 || status > 999 {
-			return 0, 0, errStr("malformed status code")
-		}
-		status = status*10 + int(c-'0')
-		digits++
-	}
-	if digits != 3 || status < 100 {
-		return 0, 0, errStr("malformed status code")
-	}
-	for _, h := range strings.Split(string(head), "\r\n")[1:] {
-		i := strings.IndexByte(h, ':')
-		if i < 0 {
-			continue
-		}
-		name := strings.TrimSpace(h[:i])
-		v := strings.TrimSpace(h[i+1:])
-		switch {
-		// M97f (#2106): the cleartext path enforces the same framing
-		// contract browser/framing.go declares — a peer insisting on
-		// chunked or compressed transfer is refused, never misparsed.
-		case strings.EqualFold(name, "transfer-encoding"):
-			return 0, 0, errStr("http-framing-unsupported")
-		case strings.EqualFold(name, "content-encoding"):
-			if !strings.EqualFold(v, "identity") {
-				return 0, 0, errStr("http-framing-unsupported")
-			}
-		case strings.EqualFold(name, "content-length"):
-			// A second Content-Length — matching or not — is a framing
-			// desync; there is no "last wins" rule here.
-			if length >= 0 || v == "" {
-				return 0, 0, errStr("http-framing-invalid")
-			}
-			n := 0
-			for j := 0; j < len(v); j++ {
-				c := v[j]
-				if c < '0' || c > '9' || n > (1<<31-1)/10 {
-					return 0, 0, errStr("malformed content-length")
-				}
-				n = n*10 + int(c-'0')
-			}
-			length = n
-		}
-	}
-	return status, length, nil
-}
-
-// readBody drains the response body into r.body, bounded by Content-Length
-// when present and by vi.MaxFileBytes (the guest's file-cap, as the browser
-// and RSS fetchers use) otherwise. This consumer is a console fetch and a
-// one-shot download, not a streaming proxy.
-func (r *responseStream) readBody() error {
-	for {
-		if r.length >= 0 && len(r.body) >= r.length {
-			r.body = r.body[:r.length]
-			return nil
-		}
-		if len(r.body) >= vi.MaxFileBytes {
-			return errStr("response body exceeds the 256 KiB cap")
-		}
-		n, err := r.s.Read(r.buf[:])
-		if n > 0 {
-			chunk := r.buf[:n]
-			if r.length >= 0 && len(r.body)+len(chunk) > r.length {
-				chunk = chunk[:r.length-len(r.body)]
-			}
-			if len(r.body)+len(chunk) > vi.MaxFileBytes {
-				chunk = chunk[:vi.MaxFileBytes-len(r.body)]
-			}
-			r.body = append(r.body, chunk...)
-		}
-		if r.length >= 0 && len(r.body) >= r.length {
-			r.body = r.body[:r.length]
-			return nil
-		}
-		if err != nil || n == 0 {
-			if r.length >= 0 {
-				return errStr("response ended before content-length")
-			}
-			return nil
-		}
-	}
+	r.head, r.parsed, r.body, r.reusable = head, h, body, reusable
+	return r, nil
 }
 
 type legacyArgs struct {
@@ -403,6 +283,50 @@ func runLegacyCLI(args []string) {
 	runPlain(req, a.download, a.dest)
 }
 
+// maxFetchRedirects bounds the redirect chain one invocation follows —
+// the same honesty the browser's maxRedirects applies, so a redirect loop
+// terminates as the last response, never a hang.
+const maxFetchRedirects = 5
+
+// isRedirectStatus mirrors the browser's followed-redirect subset.
+func isRedirectStatus(code int) bool {
+	return code == 301 || code == 302 || code == 303 || code == 307 || code == 308
+}
+
+// resolveFetchRedirect turns a Location value into the next cleartext
+// request: absolute http:// IP-literal URLs, root-relative paths, and
+// plain relative paths resolve; every other shape (https, a hostname,
+// garbage) is not a fetchable target and yields ok=false.
+func resolveFetchRedirect(cur clearRequest, location string) (clearRequest, bool) {
+	loc := strings.TrimSpace(location)
+	if loc == "" {
+		return clearRequest{}, false
+	}
+	if strings.HasPrefix(strings.ToLower(loc), "http://") {
+		return planClear(loc)
+	}
+	if strings.Contains(loc, "://") {
+		return clearRequest{}, false
+	}
+	next := clearRequest{host: cur.host, ip: cur.ip, port: cur.port}
+	if strings.HasPrefix(loc, "/") {
+		next.path = loc
+		return next, true
+	}
+	// Relative: resolve against the current path's directory.
+	dir := cur.path
+	if i := strings.LastIndexByte(dir, '/'); i >= 0 {
+		dir = dir[:i+1]
+	} else {
+		dir = "/"
+	}
+	if strings.HasPrefix(dir, "/") && !strings.Contains(loc, "\r") && !strings.Contains(loc, "\n") {
+		next.path = dir + loc
+		return next, true
+	}
+	return clearRequest{}, false
+}
+
 func runPlain(req clearRequest, download bool, dest string) {
 	prefix := "fetch"
 	if download {
@@ -412,35 +336,62 @@ func runPlain(req clearRequest, download bool, dest string) {
 	if !download {
 		preflightClear(req)
 	}
-	s, err := dialPlain(req.host, req.port)
-	if err != nil {
-		vi.ConsoleLine(prefix + ": connect failed " + errorName(err))
-		vi.Exit(exitConnect)
-	}
-	vi.ConsoleLine(prefix + ": connected")
-	if _, err := s.Write([]byte(requestString(req.host, req.port, req.path))); err != nil {
-		vi.ConsoleLine(prefix + ": send failed " + errorName(err))
-		_ = s.Close()
-		vi.Exit(exitSend)
-	}
-	vi.ConsoleLine(prefix + ": request sent")
-	rs, err := newResponseStream(s)
-	if err != nil {
-		vi.ConsoleLine(prefix + ": response failed " + err.Error())
-		_ = s.Close()
-		vi.Exit(exitSend)
-	}
-	if download {
-		vi.ConsoleLine("download: status " + vi.Itoa64(int64(rs.status)))
-		vi.ConsoleLine("download: saving to file")
-	}
-	if err := rs.readBody(); err != nil {
-		vi.ConsoleLine(prefix + ": body failed " + err.Error())
-		_ = s.Close()
-		vi.Exit(exitSend)
+	var s connStream
+	open := false
+	cur := req
+	var rs *responseStream
+	// The redirect loop: each hop reuses the live connection when the
+	// origin is unchanged (keep-alive), else it closes and re-dials.
+	for hops := 0; ; {
+		if !open {
+			var err error
+			s, err = dialPlain(cur.host, cur.port)
+			if err != nil {
+				vi.ConsoleLine(prefix + ": connect failed " + errorName(err))
+				vi.Exit(exitConnect)
+			}
+			vi.ConsoleLine(prefix + ": connected")
+			open = true
+		}
+		if _, err := s.Write([]byte(requestString(cur.host, cur.port, cur.path))); err != nil {
+			vi.ConsoleLine(prefix + ": send failed " + errorName(err))
+			_ = s.Close()
+			vi.Exit(exitSend)
+		}
+		vi.ConsoleLine(prefix + ": request sent")
+		var err error
+		rs, err = newResponseStream(s)
+		if err != nil {
+			vi.ConsoleLine(prefix + ": response failed " + err.Error())
+			_ = s.Close()
+			vi.Exit(exitSend)
+		}
+		loc := ""
+		if isRedirectStatus(rs.parsed.Status) {
+			loc = httpc.LocationHeader(rs.head)
+		}
+		next, follow := clearRequest{}, false
+		if loc != "" {
+			next, follow = resolveFetchRedirect(cur, loc)
+		}
+		if !follow || hops >= maxFetchRedirects {
+			break
+		}
+		hops++
+		vi.ConsoleLine(prefix + ": redirect " + vi.Itoa64(int64(hops)) + " " + loc)
+		if !rs.reusable || next.host != cur.host || next.port != cur.port {
+			_ = s.Close()
+			open = false
+			if !download && (next.host != cur.host || next.port != cur.port) {
+				preflightClear(next)
+			}
+		}
+		cur = next
 	}
 	_ = s.Close()
 	if download {
+		vi.ConsoleLine("download: status " + vi.Itoa64(int64(rs.parsed.Status)))
+		vi.ConsoleLine("download: saving to file")
 		// WriteFileSafe: temp -> write-all -> fsync -> publish. A failed
 		// save leaves no partial DOWNLOAD.OUT (absent, not garbage).
 		if rc := vi.WriteFileSafe(dest, rs.body); rc < 0 {

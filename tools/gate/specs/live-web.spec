@@ -2969,3 +2969,138 @@ vgate_assert 49 serial-absent 'web: hints row ctrl+shift+c '
 vgate_assert 49 serial-contains 'web: hints close'
 vgate_assert 49 serial-contains 'web: quit'
 vgate_assert 49 serial-absent '[EXC] parking:'
+
+# --- boots 50-53 (M135b #2764): HTTP/1.1 wire honesty ---------------------
+# The :packet responder streams canned responses, paced one segment per
+# guest ACK: a chunked page, a gzip page, a corrupt gzip body (refused by
+# name), and a keep-alive pair (page + linked stylesheet, one connection).
+vgate_setup_python <<'PY'
+import gzip, os
+rd = os.environ["RUN_DIR"]
+body = b"Hello from VirelaiOS Host!\n"
+
+def chunked(data, n=7):
+    out = b""
+    while data:
+        out += ("%x\r\n" % min(n, len(data))).encode() + data[:n] + b"\r\n"
+        data = data[n:]
+    return out + b"0\r\nX-Trailer: skipped\r\n\r\n"
+
+open(os.path.join(rd, "page-chunked.bin"), "wb").write(
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunked(body))
+gz = gzip.compress(body, mtime=0)
+open(os.path.join(rd, "page-gzip.bin"), "wb").write(
+    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " +
+    str(len(gz)).encode() + b"\r\n\r\n" + gz)
+bad = bytearray(gz); bad[len(bad) - 5] ^= 0xff  # corrupt the CRC32 field
+open(os.path.join(rd, "page-gzip-bad.bin"), "wb").write(
+    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " +
+    str(len(bad)).encode() + b"\r\n\r\n" + bytes(bad))
+page = (b'<html><head><link rel="stylesheet" href="/ka.css"></head>'
+        b'<body><h1>keep-alive</h1><p>two requests, one connection</p></body></html>')
+css = b"body { background-color: #7fdbff; }"
+open(os.path.join(rd, "page-keepalive.bin"), "wb").write(
+    b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(page)).encode() + b"\r\n\r\n" + page +
+    b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(css)).encode() + b"\r\n\r\n" + css)
+print("M135b: staged chunked/gzip/corrupt-gzip/keep-alive payloads")
+PY
+
+# --- boot 50: a chunked page decodes and renders --------------------------
+vgate_run 50 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-50' \
+    --net '$RUN_DIR/cap50.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:packet' --net-tcp-respond-payload '$RUN_DIR/page-chunked.bin' \
+    --script '$RUN_DIR/script-fetch.txt' \
+    --snapshot-after "web: settled" --snapshot-after "web: repaint" \
+    --script-expect "web: ready" --timeout 120
+
+vgate_assert 50 serial-contains 'web: url http://10.0.0.2/'
+vgate_assert 50 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 50 serial-contains 'web: parse nodes='
+vgate_assert 50 serial-contains 'web: settled'
+vgate_assert 50 serial-contains 'web: repaint items='
+vgate_assert 50 serial-contains 'web: ready'
+vgate_assert 50 serial-absent 'web: error'
+vgate_assert 50 serial-absent '[EXC] parking:'
+vgate_assert 50 snapshot 'snap-50-*.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'fetch'])
+PY
+
+# --- boot 51: a gzip page inflates and renders ----------------------------
+vgate_run 51 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-51' \
+    --net '$RUN_DIR/cap51.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:packet' --net-tcp-respond-payload '$RUN_DIR/page-gzip.bin' \
+    --script '$RUN_DIR/script-fetch.txt' \
+    --snapshot-after "web: settled" --snapshot-after "web: repaint" \
+    --script-expect "web: ready" --timeout 120
+
+vgate_assert 51 serial-contains 'web: url http://10.0.0.2/'
+vgate_assert 51 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 51 serial-contains 'web: parse nodes='
+vgate_assert 51 serial-contains 'web: settled'
+vgate_assert 51 serial-contains 'web: repaint items='
+vgate_assert 51 serial-contains 'web: ready'
+vgate_assert 51 serial-absent 'web: error'
+vgate_assert 51 serial-absent '[EXC] parking:'
+vgate_assert 51 snapshot 'snap-51-*.raw' <<'PY'
+import subprocess, sys
+subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.argv[1], 'fetch'])
+PY
+
+# --- boot 52: a corrupt gzip body refuses by name --------------------------
+vgate_run 52 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-52' \
+    --net '$RUN_DIR/cap52.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:packet' --net-tcp-respond-payload '$RUN_DIR/page-gzip-bad.bin' \
+    --script '$RUN_DIR/script-fetch.txt' \
+    --script-expect "web: ready" --timeout 120
+
+vgate_assert 52 serial-contains 'web: url http://10.0.0.2/'
+vgate_assert 52 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 52 serial-contains 'web: error gzip-crc'
+vgate_assert 52 serial-contains 'web: ready'
+vgate_assert 52 serial-absent '[EXC] parking:'
+
+# --- boot 53: keep-alive — page + linked CSS, exactly one connection ------
+vgate_run 53 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-53' \
+    --net '$RUN_DIR/cap53.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:packet' --net-tcp-respond-payload '$RUN_DIR/page-keepalive.bin' \
+    --script '$RUN_DIR/script-fetch.txt' \
+    --script-expect "web: ready" --timeout 120
+
+vgate_assert 53 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 53 serial-contains 'web: fetch 10.0.0.2/ka.css'
+vgate_assert 53 serial-contains 'web: settled'
+vgate_assert 53 serial-contains 'web: ready'
+vgate_assert 53 serial-absent 'web: error'
+vgate_assert 53 serial-absent '[EXC] parking:'
+vgate_assert 53 python <<'PY'
+import os, sys
+run = open(os.path.join(os.environ["RUN_DIR"], "run-53.out"), errors="replace").read()
+n = run.count("answered the guest's SYN")
+if n != 1:
+    sys.exit("FAIL: keep-alive leg accepted %d connections, want 1" % n)
+print("live-web 53: 1 accepted connection served page + stylesheet")
+PY
+vgate_assert 53 snapshot 'snap-53-*.raw' <<'PY'
+import sys
+# The linked stylesheet paints the page background #7fdbff: the CSS fetch
+# really arrived and applied, on the same connection as the page.
+data = open(sys.argv[1], "rb").read()
+w = 1280
+def px(x, y):
+    k = (y * w + x) * 4
+    return (data[k + 2], data[k + 1], data[k])
+hits = sum(1 for yy in range(120, 300, 20) for xx in range(60, 540, 20)
+           if px(xx, yy) == (0x7f, 0xdb, 0xff))
+if hits < 60:
+    sys.exit("FAIL: stylesheet background absent (hits=%d)" % hits)
+print("live-web 53: linked CSS applied (%d samples)" % hits)
+PY

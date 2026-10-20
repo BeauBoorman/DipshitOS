@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 
+	"virelai/httpc"
 	"virelai/webrender"
 	"virelai/webstyle"
 )
@@ -12,16 +13,21 @@ const maxHTTPLine = 4096
 const maxHTTPFields = 128
 const maxPageRequests = 25
 
+// responseFrame is the parsed head of one response: where the wire body
+// starts, the declared framing (Content-Length / chunked / close-
+// delimited / no-body), the content coding, and the connection policy —
+// all delegated to the shared httpc grammar (M135b).
 type responseFrame struct {
 	head, err string
 	offset    int
-	need      int // -1 means EOF framing
+	parsed    httpc.Head
+	need      int // Content-Length; -1 means chunked or EOF framing
 	complete  bool
 }
 
 func parseResponseFrame(raw []byte) responseFrame {
-	head, _, complete := webrender.SplitHTTPResponse(raw)
-	if !complete {
+	i := httpc.HeadEnd(raw)
+	if i < 0 {
 		if len(raw) > maxHTTPHeaders {
 			return responseFrame{err: "http-header-limit", complete: true}
 		}
@@ -32,90 +38,32 @@ func parseResponseFrame(raw []byte) responseFrame {
 		}
 		return responseFrame{}
 	}
-	f := responseFrame{head: head, offset: len(head), need: -1, complete: true}
-	if len(head) > maxHTTPHeaders {
+	f := responseFrame{head: string(raw[:i]), offset: i, need: -1, complete: true}
+	if i > maxHTTPHeaders {
 		f.err = "http-header-limit"
 		return f
 	}
-	lines := strings.Split(strings.TrimRight(head, "\r\n"), "\n")
-	if len(lines) == 0 || len(lines[0]) > maxHTTPLine ||
-		!(strings.HasPrefix(lines[0], "HTTP/1.0 ") || strings.HasPrefix(lines[0], "HTTP/1.1 ")) ||
-		webrender.HTTPStatus(head) < 100 || !validStatusLine(strings.TrimSuffix(lines[0], "\r")) {
-		f.err = "http-framing-invalid"
+	h, perr := httpc.ParseHead(raw[:i], maxHTTPLine, maxHTTPFields)
+	if perr != "" {
+		f.err = perr
 		return f
 	}
-	if len(lines)-1 > maxHTTPFields {
-		f.err = "http-header-limit"
-		return f
-	}
-	for _, rawLine := range lines[1:] {
-		line := strings.TrimSuffix(rawLine, "\r")
-		i := strings.IndexByte(line, ':')
-		if i <= 0 || len(line) > maxHTTPLine || strings.ContainsAny(line, "\x00\r") ||
-			!validFieldName(line[:i]) {
-			f.err = "http-framing-invalid"
-			return f
-		}
-		name, value := strings.ToLower(line[:i]), strings.TrimSpace(line[i+1:])
-		switch name {
-		case "transfer-encoding":
-			f.err = "http-framing-unsupported"
-			return f
-		case "content-encoding":
-			if !strings.EqualFold(value, "identity") {
-				f.err = "http-framing-unsupported"
-				return f
-			}
-		case "content-length":
-			if f.need >= 0 || value == "" {
-				f.err = "http-framing-invalid"
-				return f
-			}
-			n := 0
-			for _, c := range value {
-				if c < '0' || c > '9' || n > (int(^uint(0)>>1)-int(c-'0'))/10 {
-					f.err = "http-framing-invalid"
-					return f
-				}
-				n = n*10 + int(c-'0')
-			}
-			f.need = n
-		}
-	}
+	f.parsed = h
+	f.need = h.Length
 	return f
 }
 
-func validStatusLine(line string) bool {
-	if len(line) < 12 {
-		return false
-	}
-	for _, c := range line {
-		if c < 0x20 || c == 0x7f {
-			return false
-		}
-	}
-	return line[9] >= '0' && line[9] <= '9' && line[10] >= '0' && line[10] <= '9' &&
-		line[11] >= '0' && line[11] <= '9' && (len(line) == 12 || line[12] == ' ')
-}
-
-func validFieldName(name string) bool {
-	for _, c := range name {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
-			strings.ContainsRune("!#$%&'*+-.^_`|~", c)) {
-			return false
-		}
-	}
-	return name != ""
-}
-
 func formatPageRequest(u webrender.URL, cookie string) string {
-	if strings.ContainsAny(cookie, "\x00\r\n") || len(cookie)+8 > maxHTTPLine {
-		cookie = "" // an edited ledger cannot inject a request header
+	if len(cookie)+8 > maxHTTPLine {
+		cookie = "" // an edited ledger cannot grow past the line bound
 	}
-	head := strings.TrimSuffix(webrender.FormatGetRequestWithCookies(urlAuthority(u), u.Path, cookie), "\r\n")
-	return head + "Connection: close\r\nAccept-Encoding: identity\r\n\r\n"
+	return httpc.GetRequest(urlAuthority(u), u.Path, cookie)
 }
 
+// responseBody turns the buffered wire bytes into the decoded body once
+// the message is complete: Content-Length bounded, chunked (trailers
+// skipped), or close-delimited, then content-decoded (gzip through
+// flate). The named refusals are httpc's shared grammar.
 func responseBody(f responseFrame, raw []byte, capn int, eof bool) ([]byte, bool, string) {
 	if f.err != "" {
 		return nil, false, f.err
@@ -126,26 +74,44 @@ func responseBody(f responseFrame, raw []byte, capn int, eof bool) ([]byte, bool
 		}
 		return nil, false, ""
 	}
-	body := raw[f.offset:]
-	if f.need >= 0 {
-		if f.need > capn && len(body) >= capn {
-			return body[:capn], true, ""
+	wire := raw[f.offset:]
+	var src []byte
+	switch {
+	case f.parsed.NoBody:
+		return []byte{}, false, ""
+	case f.parsed.Chunked:
+		var dec httpc.Chunked
+		dec.Feed(wire, &src, capn)
+		if dec.Err != "" {
+			return nil, false, dec.Err
 		}
-		if len(body) >= f.need {
-			return body[:f.need], false, ""
+		if !dec.Done {
+			if eof {
+				return nil, false, httpc.ChunkedMalformed
+			}
+			return nil, false, ""
 		}
-		if eof {
-			return nil, false, "http-premature-eof"
+	case f.need >= 0:
+		if !f.parsed.Gzip && f.need > capn && len(wire) >= capn {
+			return wire[:capn], true, ""
 		}
-		return nil, false, ""
+		if len(wire) < f.need {
+			if eof {
+				return nil, false, "http-premature-eof"
+			}
+			return nil, false, ""
+		}
+		src = wire[:f.need]
+	default: // close-delimited
+		if !eof {
+			if len(wire) > capn {
+				return wire[:capn], true, ""
+			}
+			return nil, false, ""
+		}
+		src = wire
 	}
-	if len(body) > capn {
-		return body[:capn], true, ""
-	}
-	if eof {
-		return body, false, ""
-	}
-	return nil, false, ""
+	return httpc.Decode(f.parsed, src, capn)
 }
 
 // responseNeed retains the pre-existing host-test framing contract. Production

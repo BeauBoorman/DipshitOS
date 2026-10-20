@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"virelai/appkit"
+	"virelai/httpc"
 	"virelai/settings"
 
 	"virelai/vi"
@@ -227,6 +228,12 @@ type app struct {
 	settled  bool
 	loading  bool
 	lastBody []byte
+	// M135b: the keep-alive slot — at most one idle conn, parked on the
+	// origin that produced it; loadPooled/loadReused track the conn the
+	// in-flight stepped load arrived on.
+	idle       *pooledConn
+	loadPooled *pooledConn
+	loadReused bool
 
 	// Budget instrumentation. The numbers are printed with the first frame
 	// and asserted by the gate; the budgets themselves are stated below.
@@ -248,8 +255,14 @@ type app struct {
 	// arrives: loadNeed >= 0 is the Content-Length body size, -1 means
 	// close-delimited (the peer's FIN ends the body), -2 means unsupported
 	// framing (chunked, duplicate/bogus Content-Length, over the byte cap).
-	loadFramed       bool
-	loadNeed         int
+	loadFramed bool
+	loadNeed   int
+	// loadEOF marks a peer FIN already seen on the in-flight load (a
+	// complete response on a dead conn is complete, never reusable).
+	// chunkDec/loadDecoded are the stepped incremental chunked decode.
+	loadEOF          bool
+	chunkDec         *httpc.Chunked
+	loadDecoded      []byte
 	chunk            [1024]byte
 	loadConn         *vi.Conn
 	pageEnd          int64
@@ -810,17 +823,27 @@ func sendAll(b []byte) bool {
 	return true
 }
 
-// startHTTP connects, sends the GET, and arms the stepped read.
+// startHTTP acquires the origin's connection (the pooled keep-alive one
+// when it matches), sends the GET, and arms the stepped read. A stale
+// pooled conn — peer closed it while idle — earns one fresh-dial retry.
 func (a *app) startHTTP(u webrender.URL) {
-	conn, kind := a.connectPage(u)
+	p, reused, kind := a.acquireConn(u)
 	if kind != "" {
 		a.offlineOr(kind)
 		return
 	}
-	a.loadConn = conn
+	a.loadConn = p.conn
+	a.loadPooled = p
+	a.loadReused = reused
 	req := formatPageRequest(u, a.cookieHeaderFor(u.Host, u.Path))
 	if !sendAll([]byte(req)) {
-		a.closeLoad()
+		a.loadConn = nil
+		a.dropConn(p)
+		a.loadPooled = nil
+		if reused {
+			a.startHTTP(u)
+			return
+		}
 		a.offlineOr("tcp")
 		return
 	}
@@ -828,6 +851,9 @@ func (a *app) startHTTP(u webrender.URL) {
 	a.loadBuf = a.loadBuf[:0]
 	a.loadFramed = false
 	a.loadNeed = 0
+	a.loadEOF = false
+	a.chunkDec = nil
+	a.loadDecoded = a.loadDecoded[:0]
 	a.loading = true
 	a.loadEnd = a.stageEnd(5_000_000_000)
 	a.loadIdle = a.loadEnd
@@ -840,15 +866,14 @@ func (a *app) startHTTP(u webrender.URL) {
 // kernel allows one TCP socket per process.
 func (a *app) startHTTPS(u webrender.URL) {
 	a.loadURL = u
-	raw, truncated, kind := a.fetchNetwork(u, webstyle.MaxHTMLBytes, true)
+	head, body, truncated, kind := a.fetchNetwork(u, webstyle.MaxHTMLBytes, true)
 	if kind != "" {
 		a.finishError(kind, a.target, a.loadFrom)
 		return
 	}
 	a.htmlTruncated = truncated
-	a.loadBuf = raw
 	a.loading = false
-	a.finishResponse(true)
+	a.finishResponse(true, head, body, truncated)
 }
 
 // bodyLen is the response body bytes buffered so far (0 before the header
@@ -915,13 +940,15 @@ func (a *app) loadStep() {
 		return
 	}
 	if n > 0 {
-		if len(a.loadBuf)+n > webstyle.MaxHTMLBytes+maxHTTPHeaders {
+		if len(a.loadBuf)+n > webstyle.MaxHTMLBytes+maxHTTPHeaders+64*1024 {
 			a.endFail("http-body-limit")
 			return
 		}
 		a.loadBuf = append(a.loadBuf, a.chunk[:n]...)
 		a.loadIdle = a.stageEnd(5_000_000_000)
-	} else if mask&1 == 0 {
+	} else if mask&1 != 0 {
+		a.loadEOF = true // readable with a drained recv is the peer's FIN
+	} else {
 		// No bytes and no FIN: the read is idle, so the deadline applies.
 		if vi.Nanos() >= a.loadEnd {
 			a.endOffline("timeout")
@@ -935,6 +962,22 @@ func (a *app) loadStep() {
 	switch {
 	case a.loadFramed && a.frameInfo.err != "":
 		a.endFail(a.frameInfo.err)
+	case a.loadFramed && a.frameInfo.parsed.NoBody:
+		a.completeLoad()
+	case a.loadFramed && a.frameInfo.parsed.Chunked:
+		if a.chunkDec == nil {
+			a.chunkDec = &httpc.Chunked{}
+		}
+		wire := a.loadBuf[a.frameInfo.offset:]
+		a.chunkDec.Feed(wire[a.chunkDec.Fed:], &a.loadDecoded, webstyle.MaxHTMLBytes)
+		switch {
+		case a.chunkDec.Err != "":
+			a.endFail(a.chunkDec.Err)
+		case a.chunkDec.Done:
+			a.completeLoad()
+		case n == 0: // a FIN mid-stream is a malformed chunked body
+			a.endFail(httpc.ChunkedMalformed)
+		}
 	case a.loadFramed && a.loadNeed >= 0:
 		if a.bodyLen() >= webstyle.MaxHTMLBytes && a.loadNeed > webstyle.MaxHTMLBytes {
 			a.htmlTruncated = true
@@ -950,6 +993,16 @@ func (a *app) loadStep() {
 		}
 	case n == 0:
 		if len(a.loadBuf) == 0 {
+			if a.loadReused {
+				// A conn parked idle whose peer closed it: one fresh-dial
+				// retry before declaring the target unreachable.
+				a.loadReused = false
+				a.loading = false
+				a.closeLoad()
+				a.loadPooled = nil
+				a.startHTTP(a.loadURL)
+				return
+			}
 			// The peer closed without answering: not an empty page, and not
 			// a truncated one either — take the offline fallback if there is one.
 			a.endOffline("tcp")
@@ -965,21 +1018,31 @@ func (a *app) loadStep() {
 }
 
 // completeLoad turns a finished response into a page, a redirect step, or an
-// error page.
+// error page. A keep-alive-eligible exchange parks its conn in the idle
+// slot for the next same-origin request; anything else tears down.
 func (a *app) completeLoad() {
-	a.closeLoad()
-	a.finishResponse(false)
-}
-
-func (a *app) finishResponse(viaTLS bool) {
-	a.loading = false
-	frame := parseResponseFrame(a.loadBuf)
+	frame := a.frameInfo
 	body, truncated, failure := responseBody(frame, a.loadBuf, webstyle.MaxHTMLBytes, true)
 	if failure != "" {
+		a.closeLoad()
+		a.loadPooled = nil
+		a.loading = false
 		a.finishError(failure, a.target, a.loadFrom)
 		return
 	}
-	head := frame.head
+	if a.loadPooled != nil && frame.parsed.KeepAlive() && !a.loadEOF {
+		a.idle = a.loadPooled
+		a.loadPooled = nil
+		a.loadConn = nil
+	} else {
+		a.closeLoad()
+		a.loadPooled = nil
+	}
+	a.finishResponse(false, frame.head, body, truncated)
+}
+
+func (a *app) finishResponse(viaTLS bool, head string, body []byte, truncated bool) {
+	a.loading = false
 	a.htmlTruncated = a.htmlTruncated || truncated
 	code := webrender.HTTPStatus(head)
 	if isPageRedirect(code) {
@@ -1901,8 +1964,9 @@ func errorMessage(kind, target string) string {
 		return "The certificate chain has no trusted root."
 	case "http-framing-unsupported":
 		return "Transfer or content coding is not supported; identity framing is required."
-	case "http-framing-invalid", "http-premature-eof":
-		return "The response framing is invalid or ended prematurely."
+	case "http-framing-invalid", "http-premature-eof", "chunked-malformed",
+		"gzip-crc", "gzip-too-large", "gzip-malformed":
+		return "The response framing is invalid, the chunked stream malformed, or the gzip body failed its check."
 	case "http-header-limit", "http-body-limit", "network-request-limit":
 		return "The response or request count exceeded the declared page budget."
 	case "redirect-downgrade":
