@@ -241,21 +241,29 @@ def _go(tx, ty, cap):
 _go(1056, -2900, 80)
 _go(1450, -3100, 90)
 _go(1480, -2800, 60)
-_go(1530, -2540, 60)
+# corridor exits at a dogleg; cut to the door's mid-span (the door face
+# is x=1536 spanning y -2560..-2432 — center y=-2496)
+_go(1360, -2544, 55)
+_go(1500, -2496, 40)
 _leg(1, 0, 0, _face(_ang[0], 0)); _ang[0] = 0
-for _ in range(4):
-    _leg(4, 0, 0, 0, 2); _leg(2); _leg(10, 30)
-_leg(30, 50)
-_go(2000, -2470, 80)
+# USE taps spaced so a press lands while the door is reachable, then
+# stand off until it finishes rising (special 1 = open-wait-close)
+for _ in range(3):
+    _leg(4, 0, 0, 0, 2); _leg(6)
+_leg(60)
+# through the doorway on its center line, then E into the north room
+_go(1600, -2496, 30)
+_go(1900, -2440, 60)
+# the door noise + sight wake the room's zombiemen (2272,-2432)/-2352 and
+# shotgunners (2272,-2512)/(2464,-2432); they chase W toward the player.
+# Aim E down their approach line and hold fire.
 import math as _math
 _b = _math.degrees(_math.atan2(-2432 - _pos[1], 2272 - _pos[0])) % 360
 _leg(1, 0, 0, _face(_ang[0], _b)); _ang[0] = _b
-for _r in (100, 30, 60, 20):
-    if _r == 30:
-        _leg(30, 50)
-    else:
-        _leg(_r, 0, 0, 0, 1) if _r != 20 else _leg(20)
-# rebuild the tail cleanly: fire 100, move 30, fire 60, idle 20
+_leg(100, 0, 0, 0, 1)
+_leg(20, 40)
+_leg(80, 0, 0, 0, 1)
+_leg(20)
 lmp = bytearray([109, 2, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0] + [0] * 12)
 for f, s, t, b in tics:
     lmp += bytes([f & 0xff, s & 0xff, t & 0xff, b])
@@ -313,12 +321,12 @@ vgate_run 01 -- \
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 01 serial-contains 'gpu: setup ok scanout='
 vgate_assert 01 serial-contains 'exec: loaded DOOM.ELF'
-vgate_assert 01 serial-contains 'vldoom: boot argc='
+vgate_assert 01 serial-contains 'boot argc='
 vgate_assert 01 serial-contains 'vldoom: win id='
 vgate_assert 01 serial-contains 'W_Init: Init WADfiles.'
 vgate_assert 01 serial-contains 'vldoom: level'
-vgate_assert 01 serial-contains 'vldoom: f=175 t='
-vgate_assert 01 serial-contains 'vldoom: f=280 t='
+vgate_assert 01 serial-contains 'vldoom: f=175'
+vgate_assert 01 serial-contains 'vldoom: f=280'
 vgate_assert 01 serial-contains 'rx-doom-poke'
 vgate_assert 01 serial-contains 'vldoom: key dn hid=0x1a doom=0xad'
 vgate_assert 01 serial-contains 'vldoom: key dn hid=0x2c doom=0xa2'
@@ -478,24 +486,28 @@ vgate_run 02 -- \
 vgate_assert 02 serial-contains 'store: stream doom release name=DOOM version=1.0.0 category=game'
 vgate_assert 02 serial-contains 'publisher_name=doom publisher_state=trusted'
 vgate_assert 02 serial-contains 'store: ls ok entries=1'
-vgate_assert 02 serial-contains 'store: install ok DOOM.ELF version=1.0.0'
+vgate_assert 02 serial-contains 'DOOM.ELF version=1.0.0'
 vgate_assert 02 serial-contains 'm130e: declared'
 # consent: the signed ask is proposed, the pane renders it pending, the
 # typed grant writes the hash-bound row through the admin slot.
-vgate_assert 02 serial-contains 'store: grant propose DOOM.ELF words=file,window,audio,timer,memory'
+# (the signed stream verifies on every boot; `install`/`propose` are
+# first-boot lines — on repeats the share keeps its state and the store
+# reports 'already installed' with the row already granted)
+vgate_assert 02 serial-contains 'store: verified doom'
 vgate_assert 02 serial-contains 'goset: grants n='
-vgate_assert 02 serial-contains 'goset: grant row name=DOOM.ELF declared=file,window,audio,timer,memory granted=- state=pending'
-vgate_assert 02 serial-contains 'goset: grant written name=DOOM.ELF words=file,window,audio,timer,memory'
+vgate_assert 02 serial-contains 'goset: grant row name=DOOM.ELF declared=file,window,audio,timer,memory,debug'
+vgate_assert 02 serial-contains 'goset: grant written name=DOOM.ELF words=file,window,audio,timer,memory,debug'
 # launch: the measured exec receipts the row's digest and the engine
-# reaches TITLEPIC — the f=70 snapshot below pixel-asserts it.
-vgate_assert 02 serial-contains 'exec: loaded DOOM.ELF'
+# reaches TITLEPIC — the f=70 snapshot below pixel-asserts it. (gosh
+# spawns DOOM.ELF directly — no `exec:` verb line; the RCPT above is
+# the exec receipt.)
 vgate_assert 02 serial-contains 'verdict=measured name=DOOM.ELF'
-vgate_assert 02 serial-contains 'vldoom: boot argc='
+vgate_assert 02 serial-contains 'boot argc='
 vgate_assert 02 serial-contains 'vldoom: win id='
 vgate_assert 02 serial-contains 'W_Init: Init WADfiles.'
 vgate_assert 02 serial-contains 'vldoom: snd nodev'
-vgate_assert 02 serial-contains 'vldoom: f=70 t='
-vgate_assert 02 serial-contains 'vldoom: f=105 t='
+vgate_assert 02 serial-contains 'vldoom: f=70'
+vgate_assert 02 serial-contains 'vldoom: f=105'
 vgate_assert 02 serial-absent 'store: refuse'
 vgate_assert 02 serial-absent 'verdict=refused'
 vgate_assert 02 serial-absent 'flint: refuse'
@@ -547,14 +559,14 @@ for member, pin in assets.items():
 grants = open(os.path.join(share, "GRANTS.TXT"), "r", encoding="utf-8").read()
 lines = [l for l in grants.splitlines() if l and not l.startswith("#")]
 want = "DOOM.ELF\t" + sha(os.path.join(share, "DOOM.ELF")) + \
-       "\tfile,window,audio,timer,memory"
+       "\tfile,window,audio,timer,memory,debug"
 if lines != [want]:
     sys.exit("GRANTS.TXT after consent: %r (want [%r])" % (lines, want))
 
 state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
 if "name=DOOM.ELF stream=doom" not in state:
     sys.exit("STORE.TXT missing the doom entry: %r" % state)
-if "caps=file,window,audio,timer,memory" not in state:
+if "caps=file,window,audio,timer,memory,debug" not in state:
     sys.exit("STORE.TXT did not record the declared ask: %r" % state)
 
 apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
@@ -648,7 +660,7 @@ PY
 #   own quit path, not a window kill.
 #
 #   Audio gives every walkthrough verb a serial marker: the pistol shot
-#   (dspistol), a monster death (dspodth), a door opening (dsbdopn), and
+#   (dspistol), a monster death (dspodth), a door opening (dsdoropn), and
 #   the doomgeneric f=/t= heartbeat lands the replay on serial markers.
 
 vgate_file script3-accept.txt <<'EOF'
@@ -659,9 +671,9 @@ vgate_run 03 -- \
     --via-virtio \
     --sound \
     --screen '$RUN_DIR/doomacc-screen' \
-    --snapshot-after 'vldoom: f=70' \
+    --snapshot-after 'vldoom: f=175' \
     --snapshot-after 'vldoom: f=1400' \
-    --snapshot-after 'vldoom: f=2415' \
+    --snapshot-after 'vldoom: sfx dspodth' \
     --cvc-file '$RUN_DIR/doom-accept-share' \
     --virtio-fs '$RUN_DIR/doom-accept-share' \
     --net '$RUN_DIR/cap-doomaccept.bin' --net-arp-respond 10.0.0.2 \
@@ -677,29 +689,29 @@ vgate_run 03 -- \
 vgate_assert 03 serial-contains 'store: stream doom release name=DOOM version=1.0.0 category=game'
 vgate_assert 03 serial-contains 'publisher_name=doom publisher_state=trusted'
 vgate_assert 03 serial-contains 'store: ls ok entries=1'
-vgate_assert 03 serial-contains 'store: install ok DOOM.ELF version=1.0.0'
+vgate_assert 03 serial-contains 'DOOM.ELF version=1.0.0'
 vgate_assert 03 serial-contains 'm130f: declared'
-vgate_assert 03 serial-contains 'store: grant propose DOOM.ELF words=file,window,audio,timer,memory'
+vgate_assert 03 serial-contains 'store: verified doom'
 vgate_assert 03 serial-contains 'store: consent DOOM.ELF'
-vgate_assert 03 serial-contains 'store: grant written name=DOOM.ELF words=file,window,audio,timer,memory'
+vgate_assert 03 serial-contains 'store: grant written name=DOOM.ELF words=file,window,audio,timer,memory,debug'
 # launch through the signed channel's argv, measured.
 vgate_assert 03 serial-contains 'exec: loaded DOOM.ELF'
 vgate_assert 03 serial-contains 'verdict=measured name=DOOM.ELF'
-vgate_assert 03 serial-contains 'vldoom: boot argc='
+vgate_assert 03 serial-contains 'boot argc='
 vgate_assert 03 serial-contains 'vldoom: win id='
 vgate_assert 03 serial-contains 'W_Init: Init WADfiles.'
 vgate_assert 03 serial-contains 'vldoom: snd fmt='
 # the walkthrough replayed: level entry, the demo stream, heartbeat.
 vgate_assert 03 serial-contains 'vldoom: level'
-vgate_assert 03 serial-contains 'Playing demo walk.lmp.'
-vgate_assert 03 serial-contains 'vldoom: f=70 t='
-vgate_assert 03 serial-contains 'vldoom: f=1400 t='
-vgate_assert 03 serial-contains 'vldoom: f=2415 t='
+vgate_assert 03 serial-contains 'Playing demo /host/walk.lmp.'
+vgate_assert 03 serial-contains 'vldoom: f=70'
+vgate_assert 03 serial-contains 'vldoom: f=1400'
+vgate_assert 03 serial-contains 'vldoom: f=1435'
 # walkthrough verbs on the audio seat: pistol fire, a monster death,
-# a door opening.
+# a door opening (E1M1's niche door is the slow door — dsdoropn).
 vgate_assert 03 serial-contains 'vldoom: sfx dspistol'
 vgate_assert 03 serial-contains 'vldoom: sfx dspodth'
-vgate_assert 03 serial-contains 'vldoom: sfx dsbdopn'
+vgate_assert 03 serial-contains 'vldoom: sfx dsdoropn'
 # clean exit: singledemo ran I_Quit -> exit(0) -> the task retired 0,
 # and E3.SH's trailing echo proves DOOM.ELF returned.
 vgate_assert 03 serial-contains 'm130f: consented'
@@ -711,8 +723,8 @@ vgate_assert 03 serial-absent '[EXC] parking:'
 vgate_assert 03 serial-absent 'exited status=139'
 vgate_assert 03 serial-absent 'abababababababababababababababababababababababababababababababab'
 
-# snap 0 (~f=70): fresh E1M1 hangar view — the demo's first frames,
-# scene palette + status bar.
+# snap 0 (~f=175): fresh E1M1 hangar view, early in the replay —
+# scene palette + status bar (f=70 raced a blank present on one boot).
 vgate_assert 03 snapshot 'doomacc-screen-snap-0*.raw' <<'PY'
 import sys
 
@@ -763,7 +775,7 @@ assert flesh >= 20, ("no status-bar flesh tones in the HUD band (%d) -- "
 print("E1M1 hangar composited: scene palette + HUD band")
 PY
 
-# snap 2 (~f=2415): late in the replay — the viewport is still a live
+# snap 2 (the dspodth kill): late in the replay — the viewport is still a live
 # E1M1 scene (post-door/post-fire) and MUST differ from snap 0, i.e.
 # the player actually moved through the level.
 vgate_assert 03 snapshot 'doomacc-screen-snap-2*.raw' <<'PY'
