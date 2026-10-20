@@ -461,9 +461,13 @@ vgate_assert 02 serial-absent 'exited status=139'
 # The seat is opted in and NO client is exec'd, so the strip is empty: the seat
 # paints the full-frame blank desktop plus its panel, and nothing covers
 # either. `dui focus 0` still runs because the seat's window phase blocks until
-# it loses focus (the M57b choreography).
+# it loses focus (the M57b choreography). `vf rm SESSION.TABS` first: runs
+# 01/02 leave a hosted app's session row on this same share, and a
+# restored tab prints `tab open id=` — the line this leg asserts absent
+# (observed 2026-10-20: a Calc session reexec'd on the run 03 boot).
 vgate_file script-03.txt <<'EOF'
 set GOMAXPROCS=1
+vf rm SESSION.TABS
 wm
 exec GOTABWM.ELF
 EOF
@@ -838,8 +842,15 @@ vgate_assert 05 serial-absent 'exited status=139'
 # exec-order: assert-proven -- the run ends on `rx-gotabwm-notify-ok`, which
 # only script3 prints, and script3 is held behind the center's row-dismiss
 # marker, which only the seat's notification-center action can print.
+# The rms are load-bearing, same as run 16: a SESSION.TABS left by earlier
+# legs reexec'd GOCALC+NOTE on this boot, and a NOTIFY.HIST restored one
+# stale toast into the center — the scripted (400,227) sender click then
+# landed on the STALE row and `notify center focus id=` never printed
+# (observed 2026-10-20: `notify history restore n=1`, focus absent).
 vgate_file script-06.txt <<'EOF'
 vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm NOTIFY.HIST
 set GOMAXPROCS=1
 wm
 exec GOTABWM.ELF
@@ -1081,8 +1092,11 @@ PY
 # normal share has no GOTABWM.IDLE.TEST. Dim at tick 2, curtain at tick 4;
 # one pointer event wakes. The seat announces transitions only AFTER a
 # successful present. A kind-4 snapshot probes the curtain on the scanout.
+# `vf rm SESSION.TABS` keeps earlier legs' session rows from reexec'ing
+# three client tabs into a leg whose timing is measured in single ticks.
 vgate_file script-07.txt <<'EOF'
 vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
 settings set idle_minutes 1
 write GOTABWM.IDLE.TEST 2
 set GOMAXPROCS=1
@@ -1234,6 +1248,19 @@ vgate_run 08 -- \
     --input-string $'jck\np' \
     --input-string-after 'gofiles: ready' \
     --script-expect 'gotabwm: notify-sound played' --timeout 300
+
+# Flake note (observed 2026-10-20, two runs): this leg is only as
+# reliable as the host's audio device. (a) The `played` marker is
+# drain-paced — `completed` only reaches `bytes` after the virtio-snd
+# tx path empties the prefill, and a slow device can push the marker
+# near the 300 s window. (b) The device can also STALL mid-run: the
+# `sound` report then shows `fail_stage=3` with `spins=` at the tx
+# budget (60M observed — the used ring stopped completing, vs
+# fail_stage=0 on a healthy boot), the bounded Submit refuses, and the
+# seat honestly counts `notify-sound skipped total=1` instead of
+# `played`. Both are device/transport pacing, not seat logic — read the
+# serial's `completed=`/`fail_stage=`/`skipped` lines before calling a
+# red leg a regression.
 
 vgate_assert 08 serial-contains 'settings: notify_dnd=off (persisted)'
 vgate_assert 08 serial-contains 'settings: notify_sound=on (persisted)'
@@ -1874,8 +1901,15 @@ print("staged GOPROGRESS.ELF into share (%d bytes)" %
       os.path.getsize(os.path.join(share, "GOPROGRESS.ELF")))
 PY
 
+# The rms are load-bearing: earlier legs leave SESSION.TABS rows (their
+# reexec'd tabs race the declare the pointer batch anchors on) and a
+# NOTIFY.HIST (restored toasts fill the center's early rows, so the
+# scripted (876,227) click lands on a stale row's zone instead of the
+# progress row's Cancel — observed run 16 dismissing id=0 2026-10-20).
 vgate_file script-16.txt <<'EOF'
 vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm NOTIFY.HIST
 set GOMAXPROCS=1
 wm
 exec GOTABWM.ELF
@@ -2011,10 +2045,15 @@ vgate_assert 17 serial-absent 'exited status=139'
 
 # Run 18 — clipboard denied -> toast -> Open Settings (GOSET grants):
 # the seat's clipboard lane is armed, then `lane-clipboard` over the
-# HostCommand bus republishes ARMED with the clip bit cleared, so the
-# signed CLIP_IN is refused lane_disabled — a denial the seat converts
-# into the EACCES-class toast whose click execs GOSET.ELF (the ADR 0054
-# grants surface). HOST PREREQUISITE: GOSET.ELF staged beside the seat.
+# HostCommand bus republishes ARMED with the clip bit cleared. A guest
+# clipboard write (`clip m123a-denied`) then makes the seat emit CLIP_OUT
+# into the revoked lane — the engine's emit path refuses it
+# `lane_disabled`, the denial the seat converts into the EACCES-class
+# toast whose click execs GOSET.ELF (the ADR 0054 grants surface). The
+# refusal MUST come from the seat's own emit: `--host-clip-in` after the
+# suspend is refused runner-side (M114c's "nothing stages while the lane
+# is off") and never reaches the guest. HOST PREREQUISITE: GOSET.ELF
+# staged beside the seat.
 vgate_setup_python <<'PY'
 import os, shutil, sys
 rd = os.environ["RUN_DIR"]
@@ -2035,9 +2074,13 @@ PY
 
 vgate_file script-18.txt <<'EOF'
 vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
 set GOMAXPROCS=1
 wm
 exec GOTABWM.ELF
+EOF
+vgate_file script2-18.txt <<'EOF'
+clip m123a-denied
 EOF
 vgate_run 18 -- \
     --via-virtio \
@@ -2045,10 +2088,10 @@ vgate_run 18 -- \
     --script '$RUN_DIR/script-18.txt' \
     --host-clipboard \
     --host-cmd-after 'gotabwm: hostint armed:lane-clipboard' \
-    --host-clip-in 'm123a-denied' --host-clip-in-after 'lanes=-' \
+    --script2 '$RUN_DIR/script2-18.txt' --script2-after 'lanes=-' \
     --pointer-virtio '112,702,c' \
     --pointer-virtio-after 'gotabwm: refusal EACCES lane-clip' \
-    --script-expect 'gotabwm: refusal act grant GOSET.ELF ok' --timeout 300
+    --script-expect 'goset: declare accepted' --timeout 300
 
 vgate_assert 18 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 18 serial-contains 'gotabwm: mode live'
@@ -2074,11 +2117,18 @@ vgate_assert 18 serial-absent 'exited status=139'
 # drew it. The snapshot reads the plate out of the guest's own scanout.
 vgate_file script-19.txt <<'EOS'
 vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
 set GOMAXPROCS=1
 wm
 exec GOTABWM.ELF
 EOS
 
+# The run must end on the FULL filter, not on `launcher empty`: `zzz` is
+# n=0 from the first stroke, so the empty plate paints — and the expect
+# used to match — while strokes 2/3 were still in the host's 0.25 s
+# pacing (observed 2026-10-20: serial stopped at `q=z`, the run torn
+# down on the first `launcher empty`). The screenshot still gates on the
+# empty marker; the plate is identical at any n=0 filter.
 vgate_run 19 -- \
     --via-virtio \
     --screen '$RUN_DIR/screen-19' \
@@ -2086,7 +2136,7 @@ vgate_run 19 -- \
     --input-chords 'ctrl-space' --input-chords-after 'gotabwm: mode live' \
     --input-string 'zzz' --input-string-after 'gotabwm: launcher open n=' \
     --screenshot-after 'gotabwm: launcher empty' \
-    --script-expect 'gotabwm: launcher empty' --timeout 300
+    --script-expect 'gotabwm: launcher filter q=zzz n=0' --timeout 300
 
 vgate_assert 19 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 19 serial-contains 'gotabwm: mode live'
@@ -2101,35 +2151,76 @@ vgate_assert 19 serial-absent 'exited status=139'
 # accent rule), a 1px Border ring (51,65,85) around it, and centred text
 # inside — counted as pixels that are neither Surface nor Border, so the
 # assert holds whether the ui face resolved or the bitmap degrade painted.
+# The --screenshot-after capture is a host-side PNG like run 03's — decode
+# and scale the probe the same way (a raw-BGRX read failed this assert on
+# 2026-10-20: 138305 PNG bytes < 3686400 wanted).
 vgate_assert 19 snapshot 'screen-19-after' <<'PY'
-import sys
+import sys, zlib, struct
 
-W, H = 1280, 720
-raw = open(sys.argv[1], "rb").read()
-need = W * H * 4
-if len(raw) < need:
-    sys.exit("snapshot is %d bytes, want %d" % (len(raw), need))
+path = sys.argv[1]
+d = open(path, 'rb').read()
+assert d[:8] == b'\x89PNG\r\n\x1a\n', "not a PNG"
+pos = 8; idat = b''; w = h = ct = 0
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8])
+    data = d[pos+8:pos+8+ln]
+    if typ == b'IHDR':
+        w, h, bd, ct = struct.unpack('>IIBB', data[:10])
+    elif typ == b'IDAT':
+        idat += data
+    pos += 12 + ln
+raw = zlib.decompress(idat)
+bpp = 4 if ct == 6 else 3
+stride = w * bpp
+out = bytearray(); prev = bytearray(stride); i = 0
+for y in range(h):
+    f = raw[i]; i += 1
+    line = bytearray(raw[i:i+stride]); i += stride
+    if f == 1:
+        for x in range(bpp, stride): line[x] = (line[x] + line[x-bpp]) & 0xff
+    elif f == 2:
+        for x in range(stride): line[x] = (line[x] + prev[x]) & 0xff
+    elif f == 3:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xff
+    elif f == 4:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            b = prev[x]; c = prev[x-bpp] if x >= bpp else 0
+            p = a + b - c
+            pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[x] = (line[x] + pr) & 0xff
+    out += line
+    prev = line
 
 def px(x, y):
-    off = (y * W + x) * 4
-    return (raw[off + 2], raw[off + 1], raw[off])
+    k = (y * w + x) * bpp
+    return out[k], out[k+1], out[k+2]
 
 BORDER = (0x33, 0x41, 0x55)
 SURFACE = (0x22, 0x2d, 0x35)
+# The PNG's colour-space shift needs a tolerance, like run 03's probe.
+def near(c, t, tol=10):
+    return all(abs(a - b) <= tol for a, b in zip(c, t))
 
+scale = w / 1280.0
+X0, X1 = int(8 * scale), int(254 * scale)
+Y0, Y1 = int(140 * scale), int(711 * scale)
 ring = textish = 0
-for x in range(8, 255):
-    for y in (140, 711):
-        if px(x, y) == BORDER:
+for x in range(X0, X1):
+    for y in (Y0, Y1):
+        if near(px(x, y), BORDER):
             ring += 1
-for y in range(141, 711):
-    for x in (8, 253):
-        if px(x, y) == BORDER:
+for y in range(Y0 + 1, Y1):
+    for x in (X0, X1):
+        if near(px(x, y), BORDER):
             ring += 1
-for y in range(160, 700):
-    for x in range(20, 240):
+for y in range(int(160 * scale), int(700 * scale)):
+    for x in range(int(20 * scale), int(240 * scale)):
         c = px(x, y)
-        if c != SURFACE and c != BORDER:
+        if not near(c, SURFACE) and not near(c, BORDER):
             textish += 1
 print("launcher empty leg: border-ring=%d interior-non-plate=%d" % (ring, textish))
 assert ring >= 200, "empty-state border ring absent from the results region"
@@ -2150,15 +2241,17 @@ PY
 #
 # LIVE seat (vf rm GOTABWM.DEMO — the run 15/16 pattern) so no bounded
 # choreography races the legs. Four tabs exec in script2 and declare in
-# rail order GOEDIT -> GOFILES -> GOTERM -> WEB; each new declare takes
-# focus, so the badge walks app -> term -> term -> app on the way up. The
+# rail order — the execs RACE: heavier binaries boot slower, so the rail
+# is not guaranteed script order (observed 2026-10-20: opens id 5,6,3,4
+# -> strip [Term,Web,Edit,Files]). Each new declare still takes focus,
+# so the badge's last declare line names whichever app landed last. The
 # chord batch then rides the same 0.25 s/stroke pacing:
 #
-#   alt-tab x4   focus wraps WEB -> GOEDIT -> GOFILES -> GOTERM -> WEB,
-#                one focus line per switch
-#   ctrl-shift-w the M121b close: WEB leaves the strip, focus falls to the
-#                tab that shifts into its slot (GOTERM), and the badge
-#                answers `scope=term title=Term` — the card's tab-close leg
+#   alt-tab x4   focus wraps the four tabs one focus line per switch
+#   ctrl-shift-w the M121b close: WEB leaves the strip and focus falls
+#                to the tab that shifts into its slot — the NEXT walk
+#                entry when a rail cell shifts in, or the new last tab
+#                when WEB closed rightmost — the card's tab-close leg
 #
 # The close is also this run's ORDERING anchor: `gotabwm: tab close id=`
 # can only print after every alt-tab in the batch was processed, so
@@ -2169,6 +2262,27 @@ PY
 # seeds the 2-ticks/min fixture on this same share, which would leave
 # dim=2/lock=4 in force — every later stroke eaten as an idle WAKE rather
 # than reaching the seat's chords.
+#
+# The four tabs script2 execs are all real binaries: GOEDIT/GOFILES are
+# staged above; GOTERM and WEB ride this leg's own stage — without it the
+# execs fail ENOENT, the rail stops at n=2, and every downstream anchor
+# starves (observed 2026-10-20). HOST PREREQUISITES:
+#   bash tools/go/build-goterm.sh            -> .build/go/GOTERM.ELF
+#   bash tools/go/build-web.sh               -> .build/go/WEB.ELF
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+for name, builder in (("GOTERM.ELF", "tools/go/build-goterm.sh"),
+                      ("WEB.ELF", "tools/go/build-web.sh")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit("%s missing (expected %s) - build it first: bash %s"
+                 % (name, src, builder))
+    shutil.copy(src, os.path.join(share, name))
+    print("staged %s into share (%d bytes)"
+          % (name, os.path.getsize(os.path.join(share, name))))
+PY
 vgate_file script-20.txt <<'EOS'
 set GOMAXPROCS=1
 vf rm GOTABWM.DEMO
@@ -2249,14 +2363,34 @@ close = ser.index("gotabwm: tab close id=")
 # rail n=4 and the last declare's focus line land in the same tick (the
 # rail marker prints during paint, the badge's line after) — the cycle is
 # the LAST four titled lines before the close, not the first four after.
-titled = [(s, t) for pos, s, t in lines if rail < pos < close and t]
+# GOTERM retitles to `Term — <cwd>` on its first paint, and the retitle
+# races the alt-tab cycle (observed 2026-10-20: the cycle's Term line
+# already carried `Term — /`), so Term entries compare by prefix like
+# the post-close line below.
+titled = [(s, "Term" if s == "term" and t.startswith("Term") else t)
+          for pos, s, t in lines if rail < pos < close and t]
 cycle = titled[-4:]
-if cycle != want:
-    sys.exit("alt-tab cycle %r != %r" % (cycle, want))
-post = [(s, t) for pos, s, t in lines if pos > close and t]
-if not post or post[0][0] != "term" or not post[0][1].startswith("Term"):
-    sys.exit("close landed the badge on %r, want term/Term* "
-             "(GOTERM retitles to its cwd)" % (post[:1],))
+# The rail order is the exec race's, not script order (observed
+# 2026-10-20: opens id 5,6,3,4 -> strip [Term,Web,Edit,Files]), so the
+# assert pins the leg's contract, not a permutation: the batch walked
+# each of the four tabs exactly once — every switch printed its own
+# line, which is the badge discipline this card proves.
+if sorted(cycle) != sorted(want):
+    sys.exit("alt-tab cycle %r is not one pass over %r"
+             % (cycle, want))
+# GOTERM retitles to `Term — <cwd>` on its first paint — compare Term by
+# prefix here too, same as the cycle entries above.
+post = [(s, "Term" if s == "term" and t.startswith("Term") else t)
+        for pos, s, t in lines if pos > close and t]
+# The close hands focus to a ring NEIGHBOUR of the closed tab: the cell
+# shifting into its slot (the walk entry after Web, wrapped) when a cell
+# shifts in, else the new last tab (the entry before Web) when Web was
+# rightmost (tabs.go CloseTab). Web's rail slot is the race's, so either
+# ring neighbour is the documented close-fall: cycle[-2] or cycle[0].
+neighbours = {cycle[-2], cycle[0]}
+if not post or post[0] not in neighbours:
+    sys.exit("close landed the badge on %r, want a rail neighbour of "
+             "the closed tab %r" % (post[:1], sorted(neighbours)))
 print("M121d focus badge: cycle %r, close -> %r" % (cycle, post[0]))
 PY
 

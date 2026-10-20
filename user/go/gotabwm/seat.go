@@ -149,6 +149,16 @@ func idleAdvance(ticks uint64) {
 	if idleAfter == 0 || ticks < lastInputTick {
 		return
 	}
+	// A wake still owed its presented frame cannot be regressed by
+	// heartbeats counted while the paint was deferred (#2730): the drain
+	// may consume newer ticks after the input that anchors to seatTick,
+	// so elapsed would cross a threshold against the still-covered frame
+	// and the wake marker would never print (observed go-wm-seat run 07:
+	// ptr -> tick -> tick -> "idle dim"). The ramp resumes from the wake
+	// frame itself — idlePresentedFrame re-anchors lastInputTick there.
+	if idleWakePending {
+		return
+	}
 	elapsed := ticks - lastInputTick
 	switch {
 	case elapsed >= 2*idleAfter:
@@ -173,8 +183,12 @@ func idleInput(ticks uint64) bool {
 	return true
 }
 
-// Never announce a visual state before the scanout containing it was flushed.
-func idlePresentedFrame(presented bool) {
+// Never announce a visual state before the scanout containing it was
+// flushed. The wake's own frame is also the re-arm point: input anchors
+// lastInputTick to the heartbeat count its drain position consumed, which
+// a deferred batch leaves behind — counting quiet time from the frame the
+// user actually sees keeps a deep queue from re-dimming instantly.
+func idlePresentedFrame(presented bool, ticks uint64) {
 	if !presented {
 		return
 	}
@@ -187,6 +201,7 @@ func idlePresentedFrame(presented bool) {
 		case idleActive:
 			if idleWakePending {
 				vi.ConsoleLine(MarkerIdleWake)
+				lastInputTick = ticks
 			}
 		}
 		idlePresented = idleState
@@ -770,7 +785,7 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	if line, once := dragGhostPaintMarker(ghostPainted > 0, presented); once {
 		vi.ConsoleLine(line)
 	}
-	idlePresentedFrame(presented)
+	idlePresentedFrame(presented, ticks)
 	// M102e (#2169): a published GPU frame earns its `presented` marker only
 	// now — after the ordinary present actually flushed it to the scanout.
 	gpu3dPresented(presented)

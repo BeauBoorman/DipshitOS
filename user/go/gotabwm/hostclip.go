@@ -82,9 +82,21 @@ func fnv1a(b []byte) uint64 {
 // change. The first observation after adoption reports the buffer as it
 // stands — arming a lane syncs the current state, it does not pretend the
 // buffer was empty.
+// hostClipLaneHeld latches once an adopted mask carries the clip bit: a
+// lane the runner REVOKED keeps polling so the emit's lane_disabled
+// refusal names the posture once per change — the documented re-ARMED
+// contract — while a lane never consented stays off the diff path,
+// silent like the flags-off steady state.
+var hostClipLaneHeld bool
+
 func hostclipPoll() {
 	eng := hostintEngine
-	if eng == nil || !eng.Armed() || eng.LaneMask()&hostint.LaneClip == 0 {
+	if eng == nil || !eng.Armed() {
+		return
+	}
+	if eng.LaneMask()&hostint.LaneClip != 0 {
+		hostClipLaneHeld = true
+	} else if !hostClipLaneHeld {
 		return
 	}
 	n, rc := hostClipGet(hostClipBuf)

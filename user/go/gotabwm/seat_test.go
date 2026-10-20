@@ -67,7 +67,7 @@ func TestIdleThresholdsAndInputWake(t *testing.T) {
 	if idleState != idleDim {
 		t.Fatal("failed to dim at the first threshold")
 	}
-	idlePresentedFrame(true)
+	idlePresentedFrame(true, 2)
 	idleAdvance(3)
 	if idleState != idleDim {
 		t.Fatal("left dim before the lock threshold")
@@ -76,13 +76,13 @@ func TestIdleThresholdsAndInputWake(t *testing.T) {
 	if idleState != idleCurtain {
 		t.Fatal("failed to curtain at twice the threshold")
 	}
-	idlePresentedFrame(true)
+	idlePresentedFrame(true, 4)
 	seatTick = 4
 	if consumeSeatEvent(vi.Event{Kind: vi.EvWmKey, Arg0: 0}) || idleState != idleActive {
 		// consumeSeatEvent returns false for input, including the waking edge.
 		t.Fatal("keyboard wake failed")
 	}
-	idlePresentedFrame(true)
+	idlePresentedFrame(true, 4)
 	if idleWakePending || lastInputTick != 4 {
 		t.Fatalf("wake pending=%v last=%d", idleWakePending, lastInputTick)
 	}
@@ -97,6 +97,50 @@ func TestIdleThresholdsAndInputWake(t *testing.T) {
 	seatTick = 6
 	if consumeSeatEvent(vi.Event{Kind: vi.EvWmPointer}) || idleState != idleActive || lastInputTick != 6 {
 		t.Fatal("pointer wake failed")
+	}
+}
+
+// #2730 regression (observed go-wm-seat run 07): input anchors lastInputTick
+// to the consumed heartbeat of its drain position, but the deferred
+// composite counts newer heartbeats BEFORE the owed paint runs — a batch
+// reaching the dim threshold regressed the still-covered frame, the wake
+// marker never printed, and the seat re-locked instead of waking.
+func TestIdleWakeSurvivesDeferredCompositeBatch(t *testing.T) {
+	savedAfter, savedLast := idleAfter, lastInputTick
+	savedState, savedPresented, savedWake := idleState, idlePresented, idleWakePending
+	savedTick := seatTick
+	defer func() {
+		idleAfter, lastInputTick = savedAfter, savedLast
+		idleState, idlePresented, idleWakePending = savedState, savedPresented, savedWake
+		seatTick = savedTick
+	}()
+	configureIdle(settings.File{Rows: []settings.Setting{{Key: "idle_minutes", Val: "1"}}, State: settings.StateOK}, 2)
+	idleAdvance(4)
+	if idleState != idleCurtain {
+		t.Fatal("failed to curtain at twice the threshold")
+	}
+	idlePresentedFrame(true, 4)
+	seatTick = 4
+	// The waking edge: the pointer drains while a heartbeat is still
+	// queued, so the anchor is the consumed count (4), not the pending one.
+	if consumeSeatEvent(vi.Event{Kind: vi.EvWmPointer}) || idleState != idleActive || !idleWakePending {
+		t.Fatal("pointer wake failed")
+	}
+	// The drain then accounts two heartbeats before the deferred composite
+	// pays the owed paint — elapsed 2 would dim without the pending-wake hold.
+	idleAdvance(6)
+	if idleState != idleActive {
+		t.Fatal("the batched tick regressed the wake to dim")
+	}
+	// The wake's own frame presents the marker and re-arms the ramp from it.
+	idlePresentedFrame(true, 6)
+	if idleWakePending || lastInputTick != 6 {
+		t.Fatalf("wake pending=%v last=%d, want announced+re-anchored at 6",
+			idleWakePending, lastInputTick)
+	}
+	idleAdvance(8)
+	if idleState != idleDim {
+		t.Fatal("the quiet ramp did not resume from the wake frame")
 	}
 }
 

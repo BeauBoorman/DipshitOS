@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"virelai/hostint"
@@ -218,6 +219,32 @@ func TestSeatLaneRefusalMapsConsentToGrant(t *testing.T) {
 	}
 	if notifyQueue[1].action != notifyActionCopy {
 		t.Fatalf("payload toast action = %d want copy", notifyQueue[1].action)
+	}
+}
+
+// go-wm-seat run 18 (observed 2026-10-20): the engine's io.Log captured
+// hostintLog's VALUE at hostintSeatInit, so armRefusalLaneWatch — wired
+// after init in the seat's start path — wrapped a var the engine no
+// longer called. `refuse lane=clip reason=lane_disabled` printed on
+// serial but never dispatched: no toast, no grant, the leg timed out.
+// The Log seam now calls the var indirectly, so an engine refusal after
+// the watch arms must reach the toast path.
+func TestEngineRefusalReachesArmedLaneWatch(t *testing.T) {
+	newHostintFixture(t, strings.Repeat("b7", 32))
+	resetNotify(t)
+	resetRefusal(t)
+	hostintSeatInit()
+	if hostintEngine == nil {
+		t.Fatal("credential present but engine nil")
+	}
+	armRefusalLaneWatch()
+	hostintEngine.RefuseLane(hostint.TagClipOut, hostint.RefuseLaneDisabled)
+	if n := notifyCount(); n != 1 {
+		t.Fatalf("notifyCount = %d want the lane_disabled toast", n)
+	}
+	toast := notifyQueue[0]
+	if toast.action != notifyActionGrant || toast.text != "EACCES lane-clip" {
+		t.Fatalf("toast = %+v want grant/EACCES lane-clip", toast)
 	}
 }
 

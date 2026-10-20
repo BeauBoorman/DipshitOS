@@ -85,7 +85,12 @@ func hostintSeatInit() {
 		Read:   hostintReadFile,
 		Write:  hostintWriteFile,
 		Delete: hostintDeleteFile,
-		Log:    hostintLog,
+		// Indirection, not the value: armRefusalLaneWatch re-binds
+		// hostintLog AFTER this init, and a captured function value would
+		// bypass the watch — the engine's own `refuse lane=` lines would
+		// print but never dispatch the seat's refusal toast (observed
+		// go-wm-seat run 18: refuse logged, EACCES never raised).
+		Log: func(s string) { hostintLog(s) },
 	}, hostintMarkerPrefix)
 	hostintEngine.Consume = hostintConsume
 	hostClipBuf = make([]byte, clipKernelMax)

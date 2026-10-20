@@ -45,6 +45,7 @@ func newHostintFixture(t *testing.T, key string) *hostintFixture {
 		hostintEngine = prevEng
 		hostClipBuf = prevBuf
 		hostClipSeen, hostClipHash, hostClipLen, hostClipSourceHost = false, 0, 0, false
+		hostClipLaneHeld = false
 	})
 
 	hostintSecretGet = func(name string, out []byte) int {
