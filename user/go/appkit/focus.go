@@ -42,6 +42,12 @@ func (k Key) Named() NamedKey {
 		return NamedDown
 	case 0x52:
 		return NamedUp
+	case 0x4b:
+		return NamedPageUp
+	case 0x4e:
+		return NamedPageDown
+	case 0x43:
+		return NamedF10
 	}
 	return NamedNone
 }
@@ -62,6 +68,9 @@ const (
 	NamedLeft
 	NamedDown
 	NamedUp
+	NamedPageUp
+	NamedPageDown
+	NamedF10
 )
 
 // NormalizeKey converts one guest key event. Arg0 remains the source of HID

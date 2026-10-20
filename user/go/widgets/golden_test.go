@@ -88,7 +88,18 @@ func checkGolden(t *testing.T, name string, c *draw.BufferCanvas) {
 // guest reads through draw.ReadFont("/host/INTER.TTF").
 func uiFace(t *testing.T) *ttf.Face {
 	t.Helper()
-	data, err := os.ReadFile("../../../image/fonts/Inter-Regular.ttf")
+	return loadFace(t, "../../../image/fonts/Inter-Regular.ttf")
+}
+
+// iconFace loads the chrome glyph face — the guest's CHROME.TTF.
+func iconFace(t *testing.T) *ttf.Face {
+	t.Helper()
+	return loadFace(t, "../../../image/fonts/VirelaiChrome-Regular.ttf")
+}
+
+func loadFace(t *testing.T, path string) *ttf.Face {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +171,37 @@ func TestWidgetFaceGoldens(t *testing.T) {
 			(&widgets.Slider{R: rect(84, 40, 130, 20), Max: 100, Value: 65, Pressed: true}).Draw(c)
 			(&widgets.Slider{R: rect(84, 70, 130, 20), Max: 100, Value: 20, Focused: true}).Draw(c)
 			(&widgets.Slider{R: rect(84, 100, 130, 20), Max: 100, Value: 60, Disabled: true}).Draw(c)
+		}},
+		{"tree", 200, 136, func(c *draw.BufferCanvas) {
+			icon := iconFace(t)
+			rows := []widgets.TreeRow{
+				{Label: "system", HasKids: true, Expanded: true},
+				{Label: "kernel", Depth: 1},
+				{Label: "services", Depth: 1, HasKids: true},
+				{Label: "apps", HasKids: true},
+			}
+			(&widgets.Tree{R: rect(4, 4, 92, 100), Rows: rows, RowH: 24, Sel: 1,
+				Fg: fg, Bg: th.ChromeBg, Face: face, IconFace: icon}).Draw(c)
+			(&widgets.Tree{R: rect(104, 4, 92, 100), Rows: rows, RowH: 24, Sel: 2,
+				Focused: true, Fg: fg, Bg: th.ChromeBg, Face: face, IconFace: icon}).Draw(c)
+			// nil-face degrade: ">" / "v" affordances, bitmap labels.
+			(&widgets.Tree{R: rect(4, 108, 192, 24), Rows: rows[:2], RowH: 24, Sel: 0,
+				Fg: fg, Bg: th.ChromeBg}).Draw(c)
+		}},
+		{"table", 220, 148, func(c *draw.BufferCanvas) {
+			cols := []widgets.TableColumn{
+				{Title: "Name", W: 64}, {Title: "Kind", W: 56}, {Title: "State", W: 72},
+			}
+			cell := func(r, col int) string {
+				return []string{"alpha", "beta", "gamma", "delta"}[r%4] +
+					[]string{"-a", "-b", "-c"}[col]
+			}
+			(&widgets.Table{R: rect(4, 4, 212, 100), Cols: cols, Rows: 12,
+				Cell: cell, Row: 1, Col: 2, Focused: true,
+				Fg: fg, Bg: th.Surface, Face: face}).Draw(c)
+			// nil-face degrade.
+			(&widgets.Table{R: rect(4, 112, 212, 34), Cols: cols[:2], Rows: 2,
+				Cell: cell, Row: 0, Col: 0, Fg: fg, Bg: th.Surface}).Draw(c)
 		}},
 		{"emptystate", 220, 204, func(c *draw.BufferCanvas) {
 			// The M123b plate with the ui face, then the bitmap degrade.
