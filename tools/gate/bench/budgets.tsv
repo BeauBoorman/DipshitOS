@@ -34,6 +34,17 @@
 # 2110), c1/c2 x4. smp-scale-c4's observed max (51.7M, 1.55x) already
 # fits its x2, unchanged.
 #
+# wm-present-latency re-pinned on #2490 (same host, 2026-10-20): #2729's
+# per-report cv-input fan (a correctness fix -- the batched press landed
+# off the drag rows) made burst input->present latency drain-bound:
+# lat_max sat ~1.01s while the tick-sampled fan delivered at heartbeat
+# cadence, and now rides the seat's event-queue drain behind merged
+# heartbeats (~2.0s under the scripted 8-step burst). Bisected over 6
+# commits -- 69de0d15/05835e7c/39fec697 lat_max ~= 1.01s, 7bdab656/HEAD
+# ~= 2.0s; cadence row unmoved. New baseline is the best observed sample;
+# the idle-queue interactive path fans immediately, so the bound being
+# contracted remains the burst-absorption shape the leg measures.
+#
 id	cmp	budget	baseline	margin	ref
 boot-shell	<=	4	1	x4	#2485
 gosh-cmd-ls	<=	0.05	0.01	+400%	#2485
@@ -41,7 +52,7 @@ gosh-cmd-echo	<=	0.05	0.01	+400%	#2485
 hf-read	>=	2110	8442	-75%	#2485; spread re-measured on #2486
 pcm-drain	<=	8192	4096	x2	#2485
 wm-present-cadence	<=	2554	1277	x2	#2485
-wm-present-latency	<=	1532847	1021898	+50%	#2485
+wm-present-latency	<=	4004596	2002298	x2	#2490; re-pinned post-#2729 per-report input fan
 smp-scale-c1	<=	270622052	67655513	x4	#2485; spread re-measured on #2486
 smp-scale-c2	<=	105399764	26349941	x4	#2485; spread re-measured on #2486
 smp-scale-c4	<=	66754980	33377490	x2	#2485
