@@ -12,6 +12,8 @@
 
 package tls
 
+import "virelai/ed25519"
+
 // record layer bounds (RFC 8446 §5.2: length MUST NOT exceed 2^14 + 256).
 const (
 	recordHeaderLen  = 5
@@ -66,9 +68,11 @@ const (
 	sigRsaPkcs1Sha256       = 0x0401
 	sigRsaPkcs1Sha384       = 0x0501
 	sigRsaPkcs1Sha512       = 0x0601
+	sigEd25519              = 0x0807
 )
 
-// offeredSigAlgs is the ClientHello signature_algorithms list.
+// offeredSigAlgs is the ClientHello signature_algorithms list — the same
+// set the Zig client offers (user/src/lib/tls/handshake.zig), Ed25519 last.
 var offeredSigAlgs = []uint16{
 	sigEcdsaSecp256r1Sha256,
 	sigEcdsaSecp384r1Sha384,
@@ -78,20 +82,11 @@ var offeredSigAlgs = []uint16{
 	sigRsaPkcs1Sha256,
 	sigRsaPkcs1Sha384,
 	sigRsaPkcs1Sha512,
+	sigEd25519,
 }
 
 // serverCVContext is the RFC 8446 §4.4.3 context string a server signs.
 const serverCVContext = "TLS 1.3, server CertificateVerify"
-
-// transport is the byte-stream the client drives (the vi.Conn seam in the
-// guest; net.Conn in host tests).
-type transport interface {
-	// read returns at least one byte or an error; (0, nil) is EOF.
-	read(p []byte) (int, error)
-	// write writes all of p or returns an error.
-	write(p []byte) (int, error)
-	close() error
-}
 
 // tlsState is the handshake state machine's shape: application data is
 // reachable only from stateConnected.
@@ -108,6 +103,9 @@ const (
 	stateConnected
 	stateFailed
 	stateClosed
+	// stateServerFlightSent: the server half's "whole flight is on the
+	// wire, waiting on the client Finished" state (M135a).
+	stateServerFlightSent
 )
 
 func (s tlsState) allowsApplicationData() bool { return s == stateConnected }
@@ -137,9 +135,12 @@ func recordNonce(iv *[12]byte, seq uint64) [12]byte {
 	return n
 }
 
-// client is the TLS 1.3 client over a transport.
+// client is the TLS 1.3 client over a transport. The record layer and its
+// state live in the embedded session (session.go) — shared verbatim with
+// the server half.
 type client struct {
-	t      transport
+	session
+
 	host   string // SNI and hostname verification name
 	now    int64
 	rand   func(p []byte) error
@@ -148,34 +149,6 @@ type client struct {
 	// vendored default (the guest's pinned root).
 	store *trustStore
 
-	state      tlsState
-	transcript sha256Digest
-
-	hsBuf [maxHandshakeMsg]byte
-	hsLen int
-
-	// plainBuf is the decrypted-record scratch; pending holds the unread
-	// tail of a record whose application data exceeded the caller's buffer.
-	plainBuf [maxPlaintext]byte
-	pending  []byte
-
-	// Separate AES contexts per direction: the round keys are key-specific,
-	// and the client's and server's traffic keys differ.
-	readCipher  *aes128
-	writeCipher *aes128
-
-	readKeys       trafficKeys
-	writeKeys      trafficKeys
-	readSeq        uint64
-	writeSeq       uint64
-	readEncrypted  bool
-	writeKeysReady bool
-
-	// handshake secrets kept for the application-key derivation
-	handshakeSecret   [32]byte
-	clientFinishedKey [32]byte
-	serverFinishedKey [32]byte
-
 	// captured chain (leaf copied out of hsBuf, which is compacted)
 	leafDER           []byte
 	intermediates     [][]byte
@@ -183,147 +156,16 @@ type client struct {
 
 	// negotiated
 	lastValidation validationResult
+
+	// corruptFinished flips a bit in the client's Finished MAC — the
+	// host-test seam for the server's bad-Finished negative leg.
+	corruptFinished bool
 }
 
 func newClient(t transport, host string, now int64, rand func(p []byte) error, verify bool) *client {
-	return &client{t: t, host: host, now: now, rand: rand, verify: verify}
-}
-
-// sendRecord frames one record. Before write keys exist the ClientHello goes
-// out as a plaintext handshake record; after, the outer type is always
-// application_data and the payload is the AEAD-protected inner record.
-func (c *client) sendRecord(payload []byte, inner byte) error {
-	if !c.writeKeysReady {
-		buf := make([]byte, recordHeaderLen+len(payload))
-		buf[0] = ctHandshake
-		buf[1] = 0x03
-		buf[2] = 0x03
-		buf[3] = byte(len(payload) >> 8)
-		buf[4] = byte(len(payload))
-		copy(buf[recordHeaderLen:], payload)
-		_, err := c.t.write(buf)
-		return err
-	}
-	innerBuf := make([]byte, len(payload)+1)
-	copy(innerBuf, payload)
-	innerBuf[len(payload)] = inner
-
-	ctLen := len(innerBuf) + 16
-	out := make([]byte, recordHeaderLen+ctLen)
-	out[0] = ctApplicationData
-	out[1] = 0x03
-	out[2] = 0x03
-	out[3] = byte(ctLen >> 8)
-	out[4] = byte(ctLen)
-	nonce := recordNonce(&c.writeKeys.iv, c.writeSeq)
-	// The 5-byte record header is the AAD (RFC 8446 §5.2).
-	if err := gcmSeal(c.writeCipher, out[recordHeaderLen:], innerBuf, out[:recordHeaderLen], nonce[:]); err != nil {
-		return err
-	}
-	c.writeSeq++
-	_, werr := c.t.write(out)
-	return werr
-}
-
-// readRecord reads and decrypts one record into c.plainBuf. A
-// change_cipher_spec is consumed and reported as length 0.
-func (c *client) readRecord() (int, byte, error) {
-	var hdr [recordHeaderLen]byte
-	if err := c.readAll(hdr[:]); err != nil {
-		return 0, 0, err
-	}
-	ct := hdr[0]
-	l := int(hdr[3])<<8 | int(hdr[4])
-	if l > maxCiphertext {
-		return 0, 0, errRecordTooLarge
-	}
-	rec := make([]byte, recordHeaderLen+l)
-	copy(rec, hdr[:])
-	if err := c.readAll(rec[recordHeaderLen:]); err != nil {
-		return 0, 0, err
-	}
-
-	if ct == ctChangeCipherSpec {
-		return 0, ctChangeCipherSpec, nil
-	}
-	if ct == ctAlert {
-		if c.readEncrypted {
-			// Alerts are AEAD-protected once keys are installed; an
-			// unauthenticable alert is still an alert (fail closed).
-			var innerType byte
-			if _, err := c.openRecord(rec, &innerType); err != nil {
-				return 0, 0, ErrAlertReceived
-			}
-			c.readSeq++
-		}
-		return 0, 0, ErrAlertReceived
-	}
-	if !c.readEncrypted {
-		copy(c.plainBuf[:l], rec[recordHeaderLen:recordHeaderLen+l])
-		return l, ct, nil
-	}
-	var innerType byte
-	pt, err := c.openRecord(rec, &innerType)
-	if err != nil {
-		return 0, 0, ErrRecordDecryptFailed // AEAD failure: fail closed
-	}
-	c.readSeq++
-	copy(c.plainBuf[:len(pt)], pt)
-	return len(pt), innerType, nil
-}
-
-// openRecord decrypts an AEAD record: TLSInnerPlaintext = content || type ||
-// zeros, the type is the last non-zero byte.
-func (c *client) openRecord(rec []byte, innerType *byte) ([]byte, error) {
-	if len(rec) < recordHeaderLen+1+16 {
-		return nil, errTruncatedRecord
-	}
-	declared := int(rec[3])<<8 | int(rec[4])
-	if declared != len(rec)-recordHeaderLen {
-		return nil, errTruncatedRecord
-	}
-	if rec[0] != ctApplicationData {
-		return nil, errInnerTypeBad
-	}
-	ctLen := declared - 16
-	nonce := recordNonce(&c.readKeys.iv, c.readSeq)
-	pt := make([]byte, ctLen)
-	// The AEAD input is the full ciphertext||tag; the 5-byte header is the AAD.
-	if err := gcmOpen(c.readCipher, pt, rec[recordHeaderLen:recordHeaderLen+declared], rec[:recordHeaderLen], nonce[:]); err != nil {
-		return nil, err
-	}
-	end := ctLen
-	for end > 0 && pt[end-1] == 0 {
-		end--
-	}
-	if end == 0 {
-		return nil, errInnerTypeMissing
-	}
-	t := pt[end-1]
-	switch t {
-	case ctHandshake, ctApplicationData, ctAlert, ctChangeCipherSpec:
-	default:
-		return nil, errInnerTypeBad
-	}
-	*innerType = t
-	return pt[:end-1], nil
-}
-
-// readAll fills p (the transport may return short reads — the vi.Conn seam
-// caps at one 192-byte kernel segment).
-func (c *client) readAll(p []byte) error {
-	off := 0
-	for off < len(p) {
-		n, err := c.t.read(p[off:])
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return errTransport
-		}
-		off += n
-	}
-	return nil
+	c := &client{host: host, now: now, rand: rand, verify: verify}
+	c.t = t
+	return c
 }
 
 // handshake runs ClientHello through the client Finished.
@@ -362,7 +204,9 @@ func (c *client) handshake() error {
 		if inner == ctApplicationData || inner == ctHandshake {
 			// Decrypted handshake bytes (application_data is the AEAD outer
 			// type once keys are installed).
-			if err := c.feedHandshake(c.plainBuf[:n], priv); err != nil {
+			if err := c.feedHandshake(c.plainBuf[:n], func(t byte, m []byte) error {
+				return c.processMessage(t, m, priv)
+			}); err != nil {
 				return err
 			}
 			if c.state == stateReceivedFinished {
@@ -527,38 +371,23 @@ func (w *byteWriter) reserve16() int {
 	return at
 }
 
+func (w *byteWriter) reserve24() int {
+	at := w.len
+	w.u24(0)
+	return at
+}
+
+func (w *byteWriter) patch24(at int) {
+	n := w.len - at - 3
+	w.buf[at] = byte(n >> 16)
+	w.buf[at+1] = byte(n >> 8)
+	w.buf[at+2] = byte(n)
+}
+
 func (w *byteWriter) patch16(at int) {
 	n := w.len - at - 2
 	w.buf[at] = byte(n >> 8)
 	w.buf[at+1] = byte(n)
-}
-
-// feedHandshake appends decrypted bytes and processes every complete message.
-func (c *client) feedHandshake(chunk []byte, priv [32]byte) error {
-	if c.hsLen+len(chunk) > len(c.hsBuf) {
-		return errHandshakeTooLarge
-	}
-	copy(c.hsBuf[c.hsLen:], chunk)
-	c.hsLen += len(chunk)
-
-	off := 0
-	for c.hsLen-off >= 4 {
-		msgType := c.hsBuf[off]
-		total := 4 + (int(c.hsBuf[off+1])<<16 | int(c.hsBuf[off+2])<<8 | int(c.hsBuf[off+3]))
-		if c.hsLen-off < total {
-			break
-		}
-		msg := c.hsBuf[off : off+total]
-		if err := c.processMessage(msgType, msg, priv); err != nil {
-			return err
-		}
-		off += total
-	}
-	if off > 0 {
-		copy(c.hsBuf[:], c.hsBuf[off:c.hsLen])
-		c.hsLen -= off
-	}
-	return nil
 }
 
 func (c *client) processMessage(msgType byte, msg []byte, priv [32]byte) error {
@@ -846,6 +675,15 @@ func (c *client) verifyCertificateVerify(scheme uint16, sig []byte) bool {
 			return false
 		}
 		return verifyRsaPkcs1(leaf.key.rsaModulus, leaf.key.rsaExponent, hashSHA512, blob, sig)
+	case sigEd25519:
+		if leaf.key.kind != keyEd25519 || len(leaf.key.point) != 32 || len(sig) != 64 {
+			return false
+		}
+		var sigB [64]byte
+		var pkB [32]byte
+		copy(sigB[:], sig)
+		copy(pkB[:], leaf.key.point)
+		return ed25519.EdVerify(sigB, blob, pkB)
 	}
 	return false
 }
@@ -963,6 +801,9 @@ func (c *client) finishHandshake() error {
 
 	th := c.transcript.sum()
 	expect := hmacSha256(c.clientFinishedKey[:], th[:])
+	if c.corruptFinished {
+		expect[0] ^= 0xff // test seam: the server must answer decrypt_error
+	}
 	fin := make([]byte, 4+32)
 	fin[0] = hsFinished
 	fin[1] = 0
@@ -992,80 +833,4 @@ func (c *client) finishHandshake() error {
 	c.writeSeq = 0
 	c.state = stateConnected
 	return nil
-}
-
-// write sends application data (one AEAD record; callers chunk).
-func (c *client) write(data []byte) error {
-	if !c.state.allowsApplicationData() {
-		return ErrNotConnected
-	}
-	if len(data) > maxPlaintext {
-		return errRecordTooLarge
-	}
-	return c.sendRecord(data, ctApplicationData)
-}
-
-// read returns application data, absorbing post-handshake handshake messages
-// (NewSessionTicket and friends) transparently. A record larger than out
-// keeps its unread tail in c.pending for the next read.
-func (c *client) read(out []byte) (int, error) {
-	if !c.state.allowsApplicationData() {
-		return 0, ErrNotConnected
-	}
-	for {
-		if len(c.pending) > 0 {
-			if len(out) == 0 {
-				return 0, nil
-			}
-			take := len(c.pending)
-			if take > len(out) {
-				take = len(out)
-			}
-			copy(out, c.pending[:take])
-			c.pending = c.pending[take:]
-			if len(c.pending) == 0 {
-				c.pending = nil
-			}
-			return take, nil
-		}
-		n, inner, err := c.readRecord()
-		if err != nil {
-			return 0, err
-		}
-		switch inner {
-		case ctChangeCipherSpec:
-			continue
-		case ctApplicationData:
-			if len(out) == 0 {
-				return 0, nil
-			}
-			take := n
-			if take > len(out) {
-				take = len(out)
-			}
-			copy(out, c.plainBuf[:take])
-			if take < n {
-				rest := make([]byte, n-take)
-				copy(rest, c.plainBuf[take:n])
-				c.pending = rest
-			}
-			return take, nil
-		case ctHandshake:
-			continue
-		case ctAlert:
-			if n == 2 && c.plainBuf[1] == 0 {
-				return 0, errStreamClosed // authenticated close_notify
-			}
-			return 0, ErrAlertReceived
-		}
-	}
-}
-
-// close sends a close_notify alert and closes the transport.
-func (c *client) close() error {
-	if c.state == stateConnected {
-		_ = c.sendRecord([]byte{1, 0}, ctAlert) // close_notify
-	}
-	c.state = stateClosed
-	return c.t.close()
 }

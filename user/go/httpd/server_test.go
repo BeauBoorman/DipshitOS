@@ -296,11 +296,28 @@ func TestAtoiPort(t *testing.T) {
 	}
 }
 
-func TestListenPortDefaults(t *testing.T) {
-	if got := listenPort(nil); got != defaultPort {
-		t.Errorf("listenPort(nil) = %d", got)
+func TestParseArgsDefaults(t *testing.T) {
+	cfg := parseArgs(nil)
+	if cfg.port != defaultPort || cfg.tls {
+		t.Errorf("parseArgs(nil) = %+v", cfg)
 	}
-	if got := listenPort([]string{"--x", "9090"}); got != 9090 {
-		t.Errorf("listenPort = %d, want 9090", got)
+	if got := parseArgs([]string{"--x", "9090"}); got.port != 9090 || got.tls {
+		t.Errorf("parseArgs(--x 9090) = %+v", got)
+	}
+}
+
+func TestParseArgsTLS(t *testing.T) {
+	cfg := parseArgs([]string{"GOHTTPD.ELF", "--tls", "/host/T.CRT", "/host/T.KEY"})
+	if !cfg.tls || cfg.certPath != "/host/T.CRT" || cfg.seedPath != "/host/T.KEY" || cfg.port != defaultTLSPort {
+		t.Errorf("tls parse = %+v", cfg)
+	}
+	cfg = parseArgs([]string{"--tls", "c", "k", "9443"})
+	if !cfg.tls || cfg.port != 9443 {
+		t.Errorf("tls explicit port = %+v", cfg)
+	}
+	// A --tls without its two operands is refused, not half-read.
+	cfg = parseArgs([]string{"--tls", "only-cert"})
+	if cfg.tls {
+		t.Errorf("incomplete --tls parsed as tls: %+v", cfg)
 	}
 }

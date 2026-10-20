@@ -6,6 +6,8 @@
 
 package tls
 
+import "virelai/ed25519"
+
 const maxPath = 8
 
 // validationResult mirrors user/src/lib/tls/validate.zig's Result enum.
@@ -65,13 +67,13 @@ func (r validationResult) String() string {
 }
 
 // sigAlgAllowed reports whether TLS 1.3 permits the algorithm for
-// certificates. Ed25519 is classified but not verifiable in this client, so
-// it is excluded here (fail closed with a specific code, not a signature
-// mystery).
+// certificates and this client can verify it. Ed25519 joined the verifiable
+// set with the M135a server half (the same `virelai/ed25519` leaf signs the
+// server's CertificateVerify).
 func sigAlgAllowed(alg sigAlg) bool {
 	switch alg {
 	case sigAlgRSAPKCS1SHA256, sigAlgRSAPKCS1SHA384, sigAlgRSAPKCS1SHA512,
-		sigAlgRSAPSS, sigAlgECDSASHA256, sigAlgECDSASHA384:
+		sigAlgRSAPSS, sigAlgECDSASHA256, sigAlgECDSASHA384, sigAlgEd25519:
 		return true
 	}
 	return false
@@ -93,6 +95,15 @@ func verifyCertSignature(c, issuer *cert) bool {
 		return issuer.key.kind == keyRSA && verifyRsaPss(issuer.key.rsaModulus, issuer.key.rsaExponent, hashSHA256, c.tbs, c.signature)
 	case sigAlgECDSASHA256, sigAlgECDSASHA384:
 		return verifyECDSACert(c, issuer)
+	case sigAlgEd25519:
+		if issuer.key.kind != keyEd25519 || len(issuer.key.point) != 32 || len(c.signature) != 64 {
+			return false
+		}
+		var sig [64]byte
+		var pk [32]byte
+		copy(sig[:], c.signature)
+		copy(pk[:], issuer.key.point)
+		return ed25519.EdVerify(sig, c.tbs, pk)
 	}
 	return false
 }

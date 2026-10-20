@@ -37,6 +37,13 @@ var (
 	errKeyShareRejected  = errors.New("tls: x25519 produced the all-zero shared secret")
 	ErrEntropyFailed     = errors.New("tls: entropy source failed")
 
+	// Server half (M135a).
+	errProtocolVersion   = errors.New("tls: client does not offer TLS 1.3")
+	errNoSigAlgs         = errors.New("tls: no usable signature_algorithms (need ed25519)")
+	errServerNoCert      = errors.New("tls: server config carries no certificate")
+	errServerBadCert     = errors.New("tls: server certificate did not parse")
+	errServerKeyMismatch = errors.New("tls: server seed does not match the leaf's Ed25519 key")
+
 	// Chain validation (ErrChainValidationFailed wraps the specific Result).
 	ErrChainValidationFailed = errors.New("tls: certificate chain validation failed")
 	ErrNoTrustAnchor         = errors.New("tls: trust anchor missing or bad")

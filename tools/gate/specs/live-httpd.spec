@@ -10,6 +10,10 @@
 #   02 two clients on one listener without a restart
 #   03 keep-alive: three requests on ONE connection (GET, GET 404, HEAD)
 #   04 refusal surface: traversal 404, POST 405, garbage 400
+#   05 HTTPS: --tls on 8443, host TLS 1.3 client over the
+#      --net-tcp-connect-stream relay, cert DER + body checked (M135a)
+#   06 negative: a TLS 1.2-only client gets the protocol_version alert
+#      in the serial log
 #
 # The kernel's child_limit=2 bounds simultaneous children and every
 # --net-tcp-connect client fires on its own dispatch queue at the same
@@ -85,6 +89,100 @@ HELLO WORLD
 
 EOF
 
+# run 05/06: the TLS-over-stdio client. ssl.MemoryBIO drives TLS 1.3 over the
+# runner's byte relay; stderr is the evidence channel (into the run log).
+# argv: CERT_DER_PATH [tls12]
+vgate_file tlscli.py <<'EOF'
+#!/usr/bin/env python3
+import os, ssl, sys
+
+cert_path = sys.argv[1]
+tls12 = len(sys.argv) > 2 and sys.argv[2] == "tls12"
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+if tls12:
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+else:
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+
+inbio = ssl.MemoryBIO()
+outbio = ssl.MemoryBIO()
+so = ctx.wrap_bio(inbio, outbio, server_side=False)
+
+def flush():
+    while True:
+        b = outbio.read()
+        if not b:
+            return
+        os.write(1, b)
+
+# Handshake loop: flush outgoing BIO, feed incoming stdin. An SSLError means
+# the peer's alert arrived — print it for the log and stop.
+ok = False
+while True:
+    try:
+        so.do_handshake()
+        ok = True
+        break
+    except ssl.SSLWantReadError:
+        flush()
+        block = os.read(0, 65536)
+        if not block:
+            break
+        inbio.write(block)
+    except ssl.SSLWantWriteError:
+        flush()
+    except ssl.SSLError as e:
+        sys.stderr.write("TLSCLI: handshake ssl error %r\n" % (e,))
+        break
+    flush()
+
+if not ok:
+    sys.exit(0 if tls12 else 2)
+
+peer = so.getpeercert(binary_form=True)
+want = open(cert_path, "rb").read()
+sys.stderr.write("TLSCLI: handshake ok, peer cert %d bytes, fixture match=%s\n"
+                 % (len(peer or b""), peer == want))
+so.write(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+flush()
+body = b""
+while True:
+    try:
+        d = so.read(4096)
+        if not d:
+            break
+        body += d
+    except ssl.SSLWantReadError:
+        pass
+    except ssl.SSLError as e:
+        sys.stderr.write("TLSCLI: read err %r\n" % (e,))
+        break
+    block = os.read(0, 65536)
+    if not block:
+        break
+    inbio.write(block)
+sys.stderr.write("TLSCLI: body=%r\n" % body)
+if b"VirelaiOS" not in body:
+    sys.exit(3)
+sys.exit(0)
+EOF
+
+vgate_file script-tls.txt <<'EOF'
+exec GOHTTPD.ELF --tls /host/TLS.CRT /host/TLS.SEED 8443
+echo tls-launched
+EOF
+
+vgate_file script-tls-kill.txt <<'EOF'
+procs
+kill GOHTTPD.ELF
+echo tls-killed
+EOF
+
 vgate_setup_python <<'PY'
 import os, shutil, sys
 
@@ -102,6 +200,34 @@ print("live-httpd: staged GOHTTPD.ELF (%d bytes)" % os.path.getsize(dst))
 with open(os.path.join(share, "HTTPD.TXT"), "w") as f:
     f.write("VIRELAI-HTTPD-FIXTURE-01\n")
 print("live-httpd: staged HTTPD.TXT fixture")
+
+# The TLS legs' credential: the env-gated host generator writes TLS.CRT
+# (DER, self-signed Ed25519, CA:TRUE + serverAuth + SANs for 10.0.0.1 /
+# virelai-https.local) and TLS.SEED (raw 32-byte Ed25519 seed) into the
+# share.
+env = dict(os.environ)
+env["HTTPD_TLS_GEN_FIXTURE"] = "1"
+env["HTTPD_TLS_FIXTURE_DIR"] = share
+import subprocess
+repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+r = subprocess.run(["go", "-C", "user/go", "test", "-run", "TestGenTLSFixture",
+                    "-v", "./httpd/"], cwd=repo, env=env,
+                   capture_output=True, text=True)
+sys.stderr.write(r.stdout[-800:] + r.stderr[-800:])
+if r.returncode != 0:
+    sys.exit("fixture generator failed")
+for name in ("TLS.CRT", "TLS.SEED"):
+    p = os.path.join(share, name)
+    if not os.path.exists(p):
+        sys.exit("fixture missing " + p)
+print("live-httpd: generated TLS.CRT + TLS.SEED in share")
+
+# The stream client verifies the peer's DER against the same fixture; the
+# share path varies ($VG_SHARE), so it reads a RUN_DIR copy.
+shutil.copy(os.path.join(share, "TLS.CRT"), os.path.join(run, "TLS.CRT"))
+
+import stat
+os.chmod(os.path.join(run, "tlscli.py"), 0o755)
 PY
 
 # ---- 01: passive open (the kept M71l leg) --------------------------------
@@ -212,3 +338,53 @@ if "/host/" in ser:
     sys.exit("a share-root path leaked into the serial log")
 print("traversal refused 404, POST 405, garbage 400")
 PY
+
+# ---- 05: HTTPS -- GOHTTPD --tls on 8443, host TLS 1.3 client (M135a) ------
+vgate_run 05 -- --net '$RUN_DIR/cap5.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect '10.0.0.1:8443' \
+    --net-tcp-connect-stream '$RUN_DIR/tlscli.py' \
+    --net-tcp-connect-stream-arg '$RUN_DIR/TLS.CRT' \
+    --net-tcp-connect-after 'httpd: listening on port 8443' \
+    --script '$RUN_DIR/script-tls.txt' \
+    --script2 '$RUN_DIR/script-tls-kill.txt' --script2-after 'httpd: closed' --script2-delay 3 \
+    --script-expect 'tls-killed' --timeout 90
+
+vgate_assert 05 serial-contains 'httpd: listening on port 8443'
+vgate_assert 05 serial-contains 'httpd: accepted'
+vgate_assert 05 serial-contains 'httpd: request /'
+vgate_assert 05 serial-contains 'httpd: served'
+vgate_assert 05 serial-absent 'httpd: tls alert'
+vgate_assert 05 serial-absent 'httpd: tls error'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 python <<'PY'
+import os, sys
+out = open(os.path.join(os.environ["RUN_DIR"], "run-05.out"), errors="replace").read()
+if "fixture match=True" not in out:
+    sys.exit("peer cert did not equal the staged TLS.CRT")
+if "TLSCLI: handshake ok" not in out:
+    sys.exit("host TLS 1.3 client did not complete the handshake")
+if "VirelaiOS" not in out:
+    sys.exit("HTTPS body missing the index page")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+if "httpd: tls alert" in ser or "httpd: tls error" in ser:
+    sys.exit("a TLS alert/error reached serial")
+print("HTTPS leg: host TLS 1.3 client over the relay, cert + body verified")
+PY
+
+# ---- 06: TLS 1.2-only client -> protocol_version alert --------------------
+vgate_run 06 -- --net '$RUN_DIR/cap6.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect '10.0.0.1:8443' \
+    --net-tcp-connect-stream '$RUN_DIR/tlscli.py' \
+    --net-tcp-connect-stream-arg '$RUN_DIR/TLS.CRT' \
+    --net-tcp-connect-stream-arg 'tls12' \
+    --net-tcp-connect-after 'httpd: listening on port 8443' \
+    --script '$RUN_DIR/script-tls.txt' \
+    --script2 '$RUN_DIR/script-tls-kill.txt' --script2-after 'httpd: closed' --script2-delay 3 \
+    --script-expect 'tls-killed' --timeout 90
+
+vgate_assert 06 serial-contains 'httpd: listening on port 8443'
+vgate_assert 06 serial-contains 'httpd: accepted'
+vgate_assert 06 serial-contains 'httpd: tls alert protocol_version'
+vgate_assert 06 serial-contains 'httpd: closed'
+vgate_assert 06 serial-absent 'httpd: served'
+vgate_assert 06 serial-absent '[EXC] parking:'

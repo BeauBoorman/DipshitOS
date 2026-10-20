@@ -90,11 +90,74 @@ func (t *viTransport) write(p []byte) (int, error) {
 
 func (t *viTransport) close() error { return t.conn.Close() }
 
-// TLSConn is an established TLS 1.3 connection.
+// connTransport adapts an accepted per-handle vi.Conn (a SocketListen
+// child's Recv/Send/ReadyMask, kernel socket-core queues — never the legacy
+// raw slots the client dial path uses) to the session's byte-stream
+// transport. Recv is blocking-with-poll inside the kernel budget; the
+// deadline arms vi's per-recv bound and ErrPeerGone maps to the stream's
+// close spelling.
+type connTransport struct {
+	conn       *vi.Conn
+	deadlineAt int64
+}
+
+func (t *connTransport) checkDeadline() error {
+	if t.deadlineAt > 0 && vi.Nanos() >= t.deadlineAt {
+		return errStreamTimeout
+	}
+	return nil
+}
+
+func (t *connTransport) setDeadline(deadline int64) {
+	t.deadlineAt = deadline
+	if deadline <= 0 {
+		t.conn.SetRecvDeadline(0)
+		return
+	}
+	t.conn.SetRecvDeadline(deadline - vi.Nanos())
+}
+
+func (t *connTransport) read(p []byte) (int, error) {
+	if err := t.checkDeadline(); err != nil {
+		return 0, err
+	}
+	n, err := t.conn.Recv(p)
+	if err == vi.ErrPeerGone {
+		return 0, errStreamClosed
+	}
+	if err != nil && err.Error() == "ETIMEDOUT" {
+		return 0, errStreamTimeout
+	}
+	if n == 0 && err == nil {
+		return 0, errTransport
+	}
+	return n, err
+}
+
+func (t *connTransport) write(p []byte) (int, error) {
+	if err := t.checkDeadline(); err != nil {
+		return 0, err
+	}
+	n, err := t.conn.Send(p)
+	if err != nil {
+		return n, err
+	}
+	if n != len(p) {
+		return n, errTransport
+	}
+	return n, nil
+}
+
+func (t *connTransport) close() error { return t.conn.Close() }
+
+// TLSConn is an established TLS 1.3 connection — the outbound half via
+// Dial/Handshake, the accepted half via Server.
 type TLSConn struct {
-	cl   *client
+	sess *session // the shared record layer both halves drive
+	cl   *client  // non-nil on the client side only (LastValidation)
 	conn *vi.Conn
-	t    *viTransport
+	t    *viTransport   // client transport (stream deadline)
+	rt   *connTransport // server transport (recv deadline)
 }
 
 // Dial connects to addr:port and handshakes. serverName is what goes into
@@ -146,6 +209,7 @@ func Handshake(conn *vi.Conn, serverName string, deadline int64) (*TLSConn, erro
 	t.st.deadlineAt = handshakeDeadline(deadline, vi.Nanos())
 	c := &TLSConn{conn: conn, t: t}
 	c.cl = newClient(t, serverName, vi.Time(), viRandom, true)
+	c.sess = &c.cl.session
 	if err := t.st.checkDeadline(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -156,6 +220,38 @@ func Handshake(conn *vi.Conn, serverName string, deadline int64) (*TLSConn, erro
 	}
 	t.st.deadlineAt = 0
 	return c, nil
+}
+
+// Server takes ownership of an ACCEPTED socket — a vi.SocketListen child —
+// and runs the TLS 1.3 server half (M135a): ServerHello (X25519,
+// TLS_AES_128_GCM_SHA256 only), EncryptedExtensions, Certificate,
+// Ed25519 CertificateVerify, Finished, then the client Finished check and
+// the application keys. Every failure path sends a named alert (plaintext
+// before the write keys exist, AEAD-protected after) and closes the
+// socket; ServerAlertName extracts the name for logging. The kernel bounds
+// the accept itself, so an idle handshake parks inside Recv's own budget —
+// cfg.HandshakeNs (default DefaultHandshakeNs) caps the whole exchange.
+func Server(conn *vi.Conn, cfg ServerConfig) (*TLSConn, error) {
+	if conn == nil {
+		return nil, errTransport
+	}
+	if err := cfg.check(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	rt := &connTransport{conn: conn}
+	budget := cfg.HandshakeNs
+	if budget <= 0 {
+		budget = DefaultHandshakeNs
+	}
+	rt.setDeadline(vi.Nanos() + budget)
+	s := newServer(rt, cfg, viRandom)
+	if err := s.handshake(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	rt.setDeadline(0)
+	return &TLSConn{sess: &s.session, conn: conn, rt: rt}, nil
 }
 
 // viRandom fills p from the kernel CSPRNG (slot 72 getrandom, 256 bytes per
@@ -178,13 +274,23 @@ func viRandom(p []byte) error {
 	return nil
 }
 
+// checkDeadline applies the armed stream deadline on whichever transport
+// seam this connection rides (client stream stash or server Conn).
+func (c *TLSConn) checkDeadline() error {
+	switch {
+	case c.t != nil:
+		return c.t.st.checkDeadline()
+	case c.rt != nil:
+		return c.rt.checkDeadline()
+	}
+	return nil
+}
+
 // Write sends data as one or more AEAD records (chunked to the 2^14 record
 // limit), advancing only by confirmed sends.
 func (c *TLSConn) Write(p []byte) (int, error) {
-	if c.t != nil {
-		if err := c.t.st.checkDeadline(); err != nil {
-			return 0, err
-		}
+	if err := c.checkDeadline(); err != nil {
+		return 0, err
 	}
 	sent := 0
 	for sent < len(p) {
@@ -192,7 +298,7 @@ func (c *TLSConn) Write(p []byte) (int, error) {
 		if take > maxPlaintext {
 			take = maxPlaintext
 		}
-		if err := c.cl.write(p[sent : sent+take]); err != nil {
+		if err := c.sess.write(p[sent : sent+take]); err != nil {
 			return sent, err
 		}
 		sent += take
@@ -202,19 +308,23 @@ func (c *TLSConn) Write(p []byte) (int, error) {
 
 // Read returns application data.
 func (c *TLSConn) Read(p []byte) (int, error) {
-	if c.t != nil {
-		if err := c.t.st.checkDeadline(); err != nil {
-			return 0, err
-		}
+	if err := c.checkDeadline(); err != nil {
+		return 0, err
 	}
-	return c.cl.read(p)
+	return c.sess.read(p)
 }
 
 // SetDeadline bounds all subsequent stream reads/writes, including buffered
 // plaintext and progress. It never changes certificate validity or trust.
 func (c *TLSConn) SetDeadline(deadline int64) {
-	if c != nil && c.t != nil {
+	if c == nil {
+		return
+	}
+	if c.t != nil {
 		c.t.st.deadlineAt = deadline
+	}
+	if c.rt != nil {
+		c.rt.setDeadline(deadline)
 	}
 }
 
@@ -225,7 +335,13 @@ func IsTimeout(err error) bool { return err == errStreamTimeout }
 func IsPeerClosed(err error) bool { return err == errStreamClosed }
 
 // Close sends close_notify and tears the TCP connection down.
-func (c *TLSConn) Close() error { return c.cl.close() }
+func (c *TLSConn) Close() error { return c.sess.close() }
 
 // LastValidation reports the chain-validation verdict for troubleshooting.
-func (c *TLSConn) LastValidation() validationResult { return c.cl.lastValidation }
+// Accepted (server-side) connections validate nothing — they answer valid.
+func (c *TLSConn) LastValidation() validationResult {
+	if c.cl == nil {
+		return resultValid
+	}
+	return c.cl.lastValidation
+}

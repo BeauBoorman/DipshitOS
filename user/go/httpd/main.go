@@ -14,12 +14,15 @@
 package main
 
 import (
+	"virelai/tls"
 	"virelai/vi"
 )
 
 const (
-	appName     = "GOHTTPD.ELF"
-	defaultPort = 8080
+	appName         = "GOHTTPD.ELF"
+	defaultPort     = 8080
+	defaultTLSPort  = 8443
+	maxCertDERBytes = 4096
 )
 
 const (
@@ -31,6 +34,9 @@ const (
 	markerClosed    = "httpd: closed"
 	markerBye       = "httpd: bye"
 	markerFailed    = "httpd: listen failed"
+	markerTLSBadCfg = "httpd: tls config "
+	markerTLSAlert  = "httpd: tls alert "
+	markerTLSError  = "httpd: tls error "
 )
 
 // maxPinnedBytes caps one published file. The share is the host's, so the
@@ -40,30 +46,58 @@ const maxPinnedBytes = 256 * 1024
 // -------------------------------------------------------------------------
 
 func main() {
-	port := listenPort(vi.Args())
+	args := vi.Args()
+	cfg := parseArgs(args)
 	vi.ConsoleLine(markerStarting)
 
-	ln, err := vi.SocketListen(port)
+	var tlsCfg *tls.ServerConfig
+	if cfg.tls {
+		c := loadTLSConfig(cfg.certPath, cfg.seedPath)
+		if c == nil {
+			vi.ConsoleLine(markerTLSBadCfg + "load")
+			vi.Exit(1)
+		}
+		tlsCfg = c
+	}
+
+	ln, err := vi.SocketListen(cfg.port)
 	if err != nil {
 		vi.ConsoleLine(markerFailed)
 		vi.Exit(1)
 	}
-	vi.ConsoleLine(markerListening + vi.Itoa64(int64(port)))
+	vi.ConsoleLine(markerListening + vi.Itoa64(int64(cfg.port)))
 
 	// The accept loop hands every ESTABLISHED child its own Conn; the
 	// listener itself stays live, so session close IS the relisten. The
 	// kernel's child_limit=2 bounds pending children — a third
 	// simultaneous SYN is honestly refused, not queued. An idle listener
 	// lets the bounded AcceptConn expire and the daemon exits cleanly;
-	// a kernel kill interrupts the same wait the same way.
+	// a kernel kill interrupts the same wait the same way. In TLS mode the
+	// handshake happens here: a refused client is answered by its named
+	// alert and the listener moves on.
 	for {
 		child, err := ln.AcceptConn()
 		if err != nil {
 			break
 		}
 		vi.ConsoleLine(markerAccepted)
-		serveConn(child)
-		_ = child.Close()
+		if tlsCfg != nil {
+			tc, terr := tls.Server(child, *tlsCfg)
+			if terr != nil {
+				if name, ok := tls.ServerAlertName(terr); ok {
+					vi.ConsoleLine(markerTLSAlert + name)
+				} else {
+					vi.ConsoleLine(markerTLSError + terr.Error())
+				}
+				vi.ConsoleLine(markerClosed)
+				continue
+			}
+			serveConn(tc)
+			_ = tc.Close()
+		} else {
+			serveConn(viStream{child})
+			_ = child.Close()
+		}
 		vi.ConsoleLine(markerClosed)
 	}
 	_ = ln.Close()
@@ -71,13 +105,26 @@ func main() {
 	vi.Exit(0)
 }
 
+// connStream is the byte stream serveConn answers on: a plaintext child
+// Conn, or an established TLSConn — same read/write shape either way.
+type connStream interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+}
+
+// viStream adapts the per-handle child Conn to connStream (Recv/Send).
+type viStream struct{ c *vi.Conn }
+
+func (s viStream) Read(p []byte) (int, error)  { return s.c.Recv(p) }
+func (s viStream) Write(p []byte) (int, error) { return s.c.Send(p) }
+
 // serveConn runs one connection's request loop: split each complete request
 // head off the buffered stream (pipelined bytes stay for the next turn),
 // answer, and continue while the resolved Connection semantics say
 // keep-alive. A parse failure is answered 400 and closed; a 405 likewise
 // closes (the request's body extent is unknowable, so the stream cannot be
 // trusted to resync). Read failures end the session, never the daemon.
-func serveConn(c *vi.Conn) {
+func serveConn(c connStream) {
 	buf := make([]byte, 0, maxRequestBytes)
 	chunk := make([]byte, vi.TCPPayloadMax)
 	for {
@@ -87,7 +134,7 @@ func serveConn(c *vi.Conn) {
 				answerAndClose(c, badRequest())
 				return
 			}
-			n, err := c.Recv(chunk)
+			n, err := c.Read(chunk)
 			if err != nil {
 				return
 			}
@@ -109,7 +156,7 @@ func serveConn(c *vi.Conn) {
 		// a method whose body we never read) close regardless of the
 		// client's keep-alive ask; a 404 keeps the connection.
 		keepAlive := !req.wantClose() && resp.Status != 405
-		if _, err := c.Send(formatResponse(resp, req.Method == "HEAD", keepAlive)); err != nil {
+		if _, err := c.Write(formatResponse(resp, req.Method == "HEAD", keepAlive)); err != nil {
 			return
 		}
 		vi.ConsoleLine(markerServed)
@@ -120,9 +167,57 @@ func serveConn(c *vi.Conn) {
 }
 
 // answerAndClose emits one terminal response with Connection: close.
-func answerAndClose(c *vi.Conn, resp response) {
-	_, _ = c.Send(formatResponse(resp, false, false))
+func answerAndClose(c connStream, resp response) {
+	_, _ = c.Write(formatResponse(resp, false, false))
 	vi.ConsoleLine(markerServed)
+}
+
+// config is the parsed argv: plaintext on defaultPort, or --tls <cert>
+// <seed> on defaultTLSPort (both loadable share files).
+type config struct {
+	port     uint16
+	tls      bool
+	certPath string
+	seedPath string
+}
+
+func parseArgs(args []string) config {
+	cfg := config{port: defaultPort}
+	explicitPort := false
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--tls" {
+			if i+2 >= len(args) {
+				cfg.tls = false
+				break
+			}
+			cfg.tls = true
+			cfg.certPath = args[i+1]
+			cfg.seedPath = args[i+2]
+			i += 2
+			continue
+		}
+		if p, ok := atoiPort(args[i]); ok {
+			cfg.port = p
+			explicitPort = true
+		}
+	}
+	if cfg.tls && !explicitPort {
+		cfg.port = defaultTLSPort
+	}
+	return cfg
+}
+
+// loadTLSConfig reads the DER certificate and 32-byte Ed25519 seed from the
+// share. A missing/mis-shaped file is a nil config — main logs and exits.
+func loadTLSConfig(certPath, seedPath string) *tls.ServerConfig {
+	certDER := readWholeFile(certPath, maxCertDERBytes)
+	seedBytes := readWholeFile(seedPath, 64)
+	if len(certDER) == 0 || len(seedBytes) != 32 {
+		return nil
+	}
+	var seed [32]byte
+	copy(seed[:], seedBytes)
+	return &tls.ServerConfig{Chain: [][]byte{certDER}, Ed25519Seed: seed}
 }
 
 // readWholeFile reads up to max bytes of a share file, or nil if it cannot
@@ -150,16 +245,6 @@ func readWholeFile(path string, max int) []byte {
 		}
 	}
 	return out
-}
-
-// listenPort takes the first argv entry that parses as a port, else the default.
-func listenPort(args []string) uint16 {
-	for _, a := range args {
-		if p, ok := atoiPort(a); ok {
-			return p
-		}
-	}
-	return defaultPort
 }
 
 func atoiPort(s string) (uint16, bool) {
