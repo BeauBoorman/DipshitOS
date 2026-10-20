@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"virelai/flate"
 	"virelai/webstyle"
 )
 
@@ -242,8 +243,8 @@ func TestPNGInflateIntegrity(t *testing.T) {
 	for name, compressed := range map[string][]byte{
 		"adler":         badAdler,
 		"second-stream": append(append([]byte(nil), stream...), stream...),
-		"excess-output": zlibStore(make([]byte, (7*4+1)*5+1)),
-		"short-output":  zlibStore(make([]byte, (7*4+1)*5-1)),
+		"excess-output": flate.ZlibStore(make([]byte, (7*4+1)*5+1)),
+		"short-output":  flate.ZlibStore(make([]byte, (7*4+1)*5-1)),
 	} {
 		t.Run(name, func(t *testing.T) {
 			data := append(append(append([]byte(nil), valid[:33]...), pngChunk("IDAT", compressed)...), pngChunk("IEND", nil)...)

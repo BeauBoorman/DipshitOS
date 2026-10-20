@@ -2,9 +2,9 @@ package gitread
 
 import (
 	"bytes"
-	"compress/zlib"
 	"crypto/sha1"
 	"testing"
+	"virelai/flate"
 )
 
 func TestSHA1MatchesStdlib(t *testing.T) {
@@ -36,45 +36,6 @@ func TestHexRoundTrip(t *testing.T) {
 	}
 	if _, ok := HexDecode("zz"); ok {
 		t.Fatal("bad hex accepted")
-	}
-}
-
-func TestInflateMatchesStdlibZlib(t *testing.T) {
-	payloads := [][]byte{
-		[]byte("hello, git\n"),
-		bytes.Repeat([]byte("The quick brown fox. "), 40),
-		[]byte{0, 1, 2, 3, 255},
-	}
-	for _, p := range payloads {
-		var buf bytes.Buffer
-		w := zlib.NewWriter(&buf)
-		if _, err := w.Write(p); err != nil {
-			t.Fatal(err)
-		}
-		if err := w.Close(); err != nil {
-			t.Fatal(err)
-		}
-		out := make([]byte, len(p)+8)
-		n, consumed, err := inflateZlib(buf.Bytes(), out)
-		if err != nil {
-			t.Fatalf("inflate %q: %v", p, err)
-		}
-		if n != len(p) || !bytes.Equal(out[:n], p) {
-			t.Fatalf("got %q want %q", out[:n], p)
-		}
-		if consumed != buf.Len() {
-			t.Fatalf("consumed %d want %d", consumed, buf.Len())
-		}
-	}
-}
-
-func TestZlibStoreRoundTrip(t *testing.T) {
-	p := []byte("hello, git\n")
-	z := zlibStore(p)
-	out := make([]byte, len(p)+4)
-	n, _, err := inflateZlib(z, out)
-	if err != nil || n != len(p) || !bytes.Equal(out[:n], p) {
-		t.Fatalf("store roundtrip n=%d err=%v got=%q", n, err, out[:n])
 	}
 }
 
@@ -152,7 +113,7 @@ func TestParsePackThinExternalBase(t *testing.T) {
 	base.ID = HashObject(ObjBlob, base.Data)
 	target := []byte("hello, git!\n")
 	d := encodeDelta(base.Data, target)
-	z := zlibStore(d)
+	z := flate.ZlibStore(d)
 	var body []byte
 	body = append(body, encodePackHdr(ObjRefDelta, len(d))...)
 	body = append(body, base.ID[:]...)
@@ -200,14 +161,14 @@ func TestParsePackThinInPackBase(t *testing.T) {
 	base.ID = HashObject(ObjBlob, base.Data)
 	target := []byte("hello, git!\n")
 	d := encodeDelta(base.Data, target)
-	z := zlibStore(d)
+	z := flate.ZlibStore(d)
 	var body []byte
 	// delta first, base second — forces the pass-ordering path.
 	body = append(body, encodePackHdr(ObjRefDelta, len(d))...)
 	body = append(body, base.ID[:]...)
 	body = append(body, z...)
 	body = append(body, encodePackHdr(ObjBlob, len(base.Data))...)
-	body = append(body, zlibStore(base.Data)...)
+	body = append(body, flate.ZlibStore(base.Data)...)
 	hdr := make([]byte, 12)
 	copy(hdr, "PACK")
 	putBE32(hdr[4:], 2)
@@ -256,7 +217,7 @@ func TestLooseObjectInflates(t *testing.T) {
 	o.ID = HashObject(ObjBlob, o.Data)
 	z := LooseBytes(o)
 	out := make([]byte, 64)
-	n, _, err := inflateZlib(z, out)
+	n, _, err := flate.InflateZlib(out, z)
 	if err != nil {
 		t.Fatal(err)
 	}

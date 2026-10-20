@@ -89,6 +89,7 @@ excluded virelai/gsport/tty guest_enosys: TestReadReturnsNormalizedBytes needs t
 excluded virelai/edit guest_enosys: TestFileMtimeHost calls os.Chtimes (not implemented on the guest channel)
 excluded virelai/goset host_env: settings panel tests assert no /host/SETTINGS.TXT exists (the gate stages one for wm=none)
 excluded virelai/pdf dep_unsupported: needs compress/zlib (M107b table does not stage it)
+excluded virelai/flate dep_unsupported: host reference tests need compress/zlib+compress/flate
 excluded virelai/calc dep_unsupported: golden_test needs image/png
 excluded virelai/draw dep_unsupported: golden_test needs image/png
 excluded virelai/gotabwm dep_unsupported: golden tests need image/png
@@ -100,7 +101,7 @@ excluded virelai/r3d/internal dep_unsupported: needs crypto/fips140 closure
 excluded virelai/rfb dep_unsupported: needs crypto + image/draw
 excluded virelai/sshlib dep_unsupported: needs crypto/hmac+fips140 closure
 excluded virelai/shlib dep_unsupported: needs crypto/hmac+fips140 closure
-excluded virelai/git/gitread dep_unsupported: needs compress/zlib+crypto
+excluded virelai/git/gitread dep_unsupported: needs crypto+os/exec
 excluded virelai/appkit dep_unsupported: golden tests need image/png+crypto
 excluded virelai/ttf dep_unsupported: golden tests need image/png+crypto
 excluded virelai/webrender dep_unsupported: golden tests need image/png+crypto

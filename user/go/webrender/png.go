@@ -1,6 +1,9 @@
 package webrender
 
-import "virelai/webstyle"
+import (
+	"virelai/flate"
+	"virelai/webstyle"
+)
 
 const maxPNGScanlines = 1_049_600
 const maxPNGChunks = 256
@@ -151,7 +154,7 @@ func pngPixels(w, h int, typ byte, channels int, palette, transparency, compress
 		return nil, errPNGLimit
 	}
 	rows := make([]byte, n)
-	written, consumed, err := inflateZlib(compressed, rows)
+	written, consumed, err := flate.InflateZlib(rows, compressed)
 	if err != nil || written != n || consumed != len(compressed) {
 		return nil, errPNGInvalid
 	}

@@ -6,6 +6,8 @@ package gitread
 // host `git status` in the checkout will look dirty; fsck/log are the
 // #1337 evidence.
 
+import "virelai/flate"
+
 // HasPrefix reports whether b starts with the bytes of p. Shared by the
 // reader (commit/tree sniffing) and GOTGIT's transport (smart.go).
 func HasPrefix(b []byte, p string) bool {
@@ -59,7 +61,7 @@ func LooseBytes(o GitObj) []byte {
 	raw := make([]byte, len(hdr)+len(o.Data))
 	copy(raw, hdr)
 	copy(raw[len(hdr):], o.Data)
-	return zlibStore(raw)
+	return flate.ZlibStore(raw)
 }
 
 type TreeEnt struct {

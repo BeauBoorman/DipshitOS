@@ -7,6 +7,7 @@ package gitread
 import (
 	"sort"
 	"strings"
+	"virelai/flate"
 )
 
 // Repo is one opened repository.
@@ -117,15 +118,15 @@ func (r *Repo) Get(id [20]byte) (GitObj, bool) {
 
 // parseLoose inflates a loose object file ("<type> <size>\0<data>") and
 // verifies it hashes back to id. The out buffer grows 4K -> 64K -> 256K:
-// inflateZlib cannot silently truncate (the Adler-32 check fails on a short
-// buffer), so a size-class retry is safe.
+// flate.InflateZlib cannot silently truncate (the Adler-32 check fails on a
+// short buffer), so a size-class retry is safe.
 func parseLoose(raw []byte, id [20]byte) (GitObj, bool) {
 	var out []byte
 	var n, consumed int
 	var err error
 	for _, size := range []int{4096, 64 * 1024, 256 * 1024} {
 		buf := make([]byte, size)
-		n, consumed, err = inflateZlib(raw, buf)
+		n, consumed, err = flate.InflateZlib(buf, raw)
 		if err == nil {
 			out = buf[:n]
 			break

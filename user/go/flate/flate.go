@@ -1,15 +1,20 @@
-package webrender
-
-// Attributed copy of user/go/git/gitread/flate.go at source revision
-// 27f6acf0e6b93e74124b68c03691af6e5fb45354 (repository LICENSE).
-// Original SHA-256: 226a8a7736604deb01c175b16c7e7dbed3f7d9e6146fcece4555f8d8fe4d5a38.
+// Package flate is the one freestanding RFC 1951 DEFLATE + RFC 1950 zlib
+// inflater for the guest userland (M136a). It is the hardened
+// webrender/png_inflate.go reader promoted to a shared home — itself an
+// attributed copy of user/go/git/gitread/flate.go at source revision
+// 27f6acf0e6b93e74124b68c03691af6e5fb45354 (repository LICENSE). Original
+// SHA-256: 226a8a7736604deb01c175b16c7e7dbed3f7d9e6146fcece4555f8d8fe4d5a38.
 // M93e adds invalid/oversubscribed-tree and missing-end-code checks; the
 // original reader is unchanged. No external decoder code is adopted.
-
-// Freestanding RFC 1951 DEFLATE + RFC 1950 zlib inflater, ported from
-// user/src/lib/flate.zig. compress/zlib pulls fmt/os on this GOOS, so the
-// guest cannot import it. inflateZlib reports input bytes consumed so a
-// packfile of concatenated zlib streams can be walked.
+//
+// compress/zlib pulls fmt/os on this GOOS, so the guest cannot import it.
+// The package is a straight port of user/src/lib/flate.zig with no
+// dependencies, so host and guest share it.
+//
+// pdf/flate.go stays separate on purpose: it is a metered, streaming
+// decoder embedded in the PDF engine's charge accounting and persistent
+// decoder slots, not a copy of this one-shot reader.
+package flate
 
 type inflateErr string
 
@@ -187,15 +192,15 @@ func adler32(data []byte) uint32 {
 	return s2<<16 | s1
 }
 
-// inflateZlib decompresses one RFC 1950 stream at the start of in into out.
-// It returns the decompressed length and how many input bytes the stream
-// occupied (header + deflate + Adler-32), so the caller can step to the next
-// concatenated object in a packfile.
-func inflateZlib(in, out []byte) (int, int, error) {
-	if len(in) < 6 {
+// InflateZlib decompresses one RFC 1950 zlib stream at the start of src
+// into dst. It returns the decompressed length and how many input bytes
+// the stream occupied (header + deflate + Adler-32), so the caller can
+// step to the next concatenated object in a packfile.
+func InflateZlib(dst, src []byte) (n, consumed int, err error) {
+	if len(src) < 6 {
 		return 0, 0, errCorruptFlate
 	}
-	cmf, flg := in[0], in[1]
+	cmf, flg := src[0], src[1]
 	if cmf&0x0f != 8 || (cmf>>4) > 7 {
 		return 0, 0, errInvalidZlib
 	}
@@ -205,8 +210,8 @@ func inflateZlib(in, out []byte) (int, int, error) {
 	if flg&0x20 != 0 {
 		return 0, 0, errInvalidZlib
 	}
-	r := bitReader{bytes: in[2:]}
-	n, err := inflateDeflate(&r, out)
+	r := bitReader{bytes: src[2:]}
+	n, err = inflateDeflate(&r, dst)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -219,11 +224,24 @@ func inflateZlib(in, out []byte) (int, int, error) {
 		}
 		adler = adler<<8 | b
 	}
-	if adler32(out[:n]) != adler {
+	if adler32(dst[:n]) != adler {
 		return 0, 0, errAdler
 	}
-	consumed := 2 + r.bytePos
-	return n, consumed, nil
+	return n, 2 + r.bytePos, nil
+}
+
+// Inflate decompresses one raw RFC 1951 DEFLATE stream at the start of src
+// into dst. consumed is the stream's extent in whole bytes — a trailing
+// partial byte counts as consumed — so a caller can step to whatever
+// follows the stream (e.g. a gzip member's CRC32+ISIZE trailer).
+func Inflate(dst, src []byte) (n, consumed int, err error) {
+	r := bitReader{bytes: src}
+	n, err = inflateDeflate(&r, dst)
+	if err != nil {
+		return 0, 0, err
+	}
+	r.alignToByte()
+	return n, r.bytePos, nil
 }
 
 func inflateDeflate(r *bitReader, out []byte) (int, error) {
@@ -462,9 +480,9 @@ func decodeBlock(r *bitReader, lit, dist *huffmanTree, out []byte, outPos *int) 
 	}
 }
 
-// zlibStore wraps data in a valid zlib stream using only uncompressed
+// ZlibStore wraps data in a valid zlib stream using only uncompressed
 // DEFLATE blocks. Git loose objects accept this; it avoids a compressor.
-func zlibStore(data []byte) []byte {
+func ZlibStore(data []byte) []byte {
 	const maxChunk = 65535
 	nchunk := 1
 	if len(data) > 0 {

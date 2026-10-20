@@ -4,6 +4,8 @@ package gitread
 // SHA-1 trailer. Delta resolution is required — a pack with no delta would
 // not exercise the path the #1337 fixture exists to prove.
 
+import "virelai/flate"
+
 type packErr string
 
 func (e packErr) Error() string { return string(e) }
@@ -186,7 +188,7 @@ func readOne(b []byte, absOff int) (rawObj, int, error) {
 		return rawObj{}, 0, errPackType
 	}
 	out := make([]byte, size)
-	n, consumed, err := inflateZlib(rest, out)
+	n, consumed, err := flate.InflateZlib(out, rest)
 	if err != nil {
 		return rawObj{}, 0, err
 	}
@@ -516,7 +518,7 @@ func PackObjects(objs []GitObj, deltaFrom []int, ofsDelta []bool) []byte {
 		if deltaFrom != nil && i < len(deltaFrom) && deltaFrom[i] >= 0 {
 			base := objs[deltaFrom[i]]
 			d := encodeDelta(base.Data, o.Data)
-			z := zlibStore(d)
+			z := flate.ZlibStore(d)
 			useOfs := ofsDelta != nil && i < len(ofsDelta) && ofsDelta[i]
 			if useOfs {
 				back := offs[i] - offs[deltaFrom[i]]
@@ -533,7 +535,7 @@ func PackObjects(objs []GitObj, deltaFrom []int, ofsDelta []bool) []byte {
 			body = append(body, z...)
 			continue
 		}
-		z := zlibStore(o.Data)
+		z := flate.ZlibStore(o.Data)
 		body = append(body, encodePackHdr(o.Type, len(o.Data))...)
 		body = append(body, z...)
 	}
