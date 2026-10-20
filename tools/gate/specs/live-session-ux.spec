@@ -32,11 +32,14 @@
 #           end-to-end proof), then the bus `rollback-update` verb swaps
 #           .prev back — iteration k+1's st sees version=dev again.
 #
-# KNOWN-OPEN LEG: on this host the bus `apply-update` verb receipts
-# `performed`/`applied version=m120f-b` yet the private base is NOT
-# swapped (file-level check + the next boot's version=dev both show it;
-# staged legs therefore also leave the booted kernel unchanged). The
-# asserts pin the honest behavior; the fix belongs to #2560's files.
+# FIXED LEG (was KNOWN-OPEN): the bus `apply-update` verb receipted
+# `performed`/`applied version=m120f-b` yet the private base was never
+# swapped — the harness prepends its own --overlay-base before the
+# leg's (tools/lib/gate-run.sh GATE_RUNNER_ARGS), the runner's flag
+# loop resolves repeats LAST-wins, and the model read the FIRST match,
+# so the swap landed on the shared artifacts/disk.img instead of the
+# leg's base. Fixed in HostMachineModel (#2560's files); the file-level
+# and next-boot asserts below pin the honest behavior.
 #
 # The transport split mirrors live-persistence: save-capable legs ride
 # --virtio-fs (a custom-virtio share cannot be saved), update legs ride

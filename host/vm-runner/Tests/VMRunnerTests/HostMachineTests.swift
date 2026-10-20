@@ -283,6 +283,43 @@ final class HostMachineTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: base), "old-base")
     }
 
+    /// The gate harness prepends its own --overlay-base before the leg's
+    /// (tools/lib/gate-run.sh GATE_RUNNER_ARGS), and the runner's flag
+    /// loop resolves a repeated flag LAST-wins — the boot attaches the
+    /// leg's base. The model must resolve the same occurrence: the
+    /// first-match read this regressed from swapped the harness default
+    /// while the booted base stayed untouched (the receipt still read
+    /// `applied`).
+    func testApplyUpdateResolvesLastOverlayBaseFlag() throws {
+        let sink = Sink()
+        let bus = makeBus(sink)
+        let model = bus.machine
+        let dir = tempDir()
+        let share = dir.appendingPathComponent("share", isDirectory: true)
+        try FileManager.default.createDirectory(at: share, withIntermediateDirectories: true)
+        let harnessBase = dir.appendingPathComponent("harness.img")
+        let legBase = dir.appendingPathComponent("base.img")
+        try Data("harness-base".utf8).write(to: harnessBase)
+        try Data("old-base".utf8).write(to: legBase)
+        try stageUpdate(in: share, version: "m120c-dup")
+        model.arguments = ["VMRunner",
+                           "--overlay-base", harnessBase.path,
+                           "--virtio-fs", share.path,
+                           "--overlay-base", legBase.path,
+                           "--update-key", pubHex]
+        XCTAssertEqual(model.resolvedBaseImage()?.path, legBase.path)
+        XCTAssertTrue(model.canApplyUpdate)
+        XCTAssertEqual(bus.dispatch(.applyUpdate), .performed)
+        XCTAssertEqual(sink.lines.last,
+                       "host-ui: cmd=apply-update state=performed staged=0 version=m120c-dup")
+        // The swap lands on the leg's base — the harness default is
+        // never the target.
+        XCTAssertEqual(try String(contentsOf: legBase), "new-base")
+        XCTAssertEqual(try String(contentsOf: harnessBase), "harness-base")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("base.img.prev").path))
+    }
+
     func testApplyUpdateRefusesByName() throws {
         let sink = Sink()
         let bus = makeBus(sink)

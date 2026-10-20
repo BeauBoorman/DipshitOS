@@ -137,9 +137,15 @@ public final class HostMachineModel {
         return p
     }
 
+    /// Last occurrence wins — the runner's flag loop overwrites the
+    /// slot per hit, so a repeated flag resolves to its LAST value (the
+    /// gate harness prepends its own --overlay-base before the leg's,
+    /// and the boot attaches the leg's). Resolving the FIRST instead
+    /// makes the apply-update swap land on the harness's default base —
+    /// the receipt reads `applied` while the booted base never changed.
     private func argvValue(_ flag: String) -> String? {
         let args = arguments ?? CommandLine.arguments
-        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        guard let i = args.lastIndex(of: flag), i + 1 < args.count else { return nil }
         return args[i + 1]
     }
 
