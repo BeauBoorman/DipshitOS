@@ -65,6 +65,7 @@ const (
 	fmtQOI
 	fmtPNG
 	fmtJPEG
+	fmtGIF
 )
 
 func (f format) tag() string {
@@ -75,6 +76,8 @@ func (f format) tag() string {
 		return "PNG"
 	case fmtJPEG:
 		return "JPEG"
+	case fmtGIF:
+		return "GIF"
 	}
 	return "???"
 }
@@ -92,6 +95,8 @@ func formatFromPath(path string) format {
 		return fmtPNG
 	case "jpg", "jpeg":
 		return fmtJPEG
+	case "gif":
+		return fmtGIF
 	}
 	return fmtUnknown
 }
@@ -237,8 +242,9 @@ func stepZoom(idx int, dir zoomDir) int {
 // headerDims reads the image geometry out of the head, before any decode.
 // QOI carries it at offsets 4/8; PNG's IHDR at 16/20; JPEG carries it in the
 // first Start Of Frame segment, found by walking the marker chain inside a
-// bounded head (readHead's 4 KiB). This is why a file this viewer cannot
-// decode still opens a correctly sized window.
+// bounded head (readHead's 4 KiB); GIF's logical screen descriptor sits at
+// offsets 6/8, little-endian. This is why a file this viewer cannot decode
+// still opens a correctly sized window.
 func headerDims(head []byte) (iw, ih uint32, ok bool) {
 	if len(head) < 24 {
 		return 0, 0, false
@@ -255,6 +261,11 @@ func headerDims(head []byte) (iw, ih uint32, ok bool) {
 	}
 	if head[0] == 0xff && head[1] == 0xd8 {
 		return jpegHeaderDims(head)
+	}
+	if v := string(head[0:6]); v == "GIF87a" || v == "GIF89a" {
+		if w, h := le16(head[6:]), le16(head[8:]); w > 0 && h > 0 {
+			return w, h, true
+		}
 	}
 	return 0, 0, false
 }
@@ -340,11 +351,18 @@ func formatOfHeader(head []byte) format {
 	if len(head) >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff {
 		return fmtJPEG
 	}
+	if len(head) >= 6 && (string(head[0:6]) == "GIF87a" || string(head[0:6]) == "GIF89a") {
+		return fmtGIF
+	}
 	return fmtUnknown
 }
 
 func be32(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func le16(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8
 }
 
 // u32s formats a dimension for a marker. It is local rather than vi.Itoa64

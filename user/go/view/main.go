@@ -247,8 +247,14 @@ func (a *app) load(path string) {
 	a.img = im
 	a.iw, a.ih = uint32(im.Width), uint32(im.Height)
 	a.st = loadOkay
-	vi.ConsoleLine(markerLoaded + a.name + " " + u32s(a.iw) + "x" + u32s(a.ih) + " " +
-		a.fm.tag() + " bytes=" + vi.Itoa64(int64(len(data))))
+	line := markerLoaded + a.name + " " + u32s(a.iw) + "x" + u32s(a.ih) + " " +
+		a.fm.tag() + " bytes=" + vi.Itoa64(int64(len(data)))
+	if im.Frames > 0 {
+		// A container that carries more than one image (M136c: GIF renders
+		// frame 1) reports its count in the same receipt.
+		line += " frames=" + vi.Itoa64(int64(im.Frames))
+	}
+	vi.ConsoleLine(line)
 }
 
 // readImage reads at most fileMax bytes. The loop is ours rather than
@@ -475,6 +481,8 @@ func (a *app) copy() {
 		mime = vsys.ClipQOI
 	case fmtJPEG:
 		mime = vsys.ClipJPEG
+	case fmtGIF:
+		mime = vsys.ClipGIF
 	default:
 		refuse("type")
 		return

@@ -11,6 +11,7 @@ const (
 	qoiFixture  = "../../../tests/fixtures/qoi/viewer_160x120.qoi"
 	pngFixture  = "../../../tests/fixtures/png/viewer_160x120.png"
 	jpegFixture = "../webrender/testdata/jpeg/viewer_160x120.jpg"
+	gifFixture  = "../webrender/testdata/gif/viewer_160x120.gif"
 )
 
 func readFixture(t *testing.T, path string) []byte {
@@ -33,7 +34,8 @@ func TestFormatFromPath(t *testing.T) {
 		{"/host/tEST.pNg", fmtPNG},
 		{"/host/TEST.JPG", fmtJPEG},
 		{"/host/test.jpeg", fmtJPEG},
-		{"/host/TEST.GIF", fmtUnknown},
+		{"/host/TEST.GIF", fmtGIF},
+		{"/host/test.gif", fmtGIF},
 		{"/host/no-extension", fmtUnknown},
 		{".hidden", fmtUnknown},
 	}
@@ -190,7 +192,7 @@ func TestApplyDeltaClampsSignedSteps(t *testing.T) {
 // assert the SAME window size — including the PNG boot, which this viewer
 // cannot decode on the guest.
 func TestHeaderSizeFromRealFixtures(t *testing.T) {
-	for _, path := range []string{qoiFixture, pngFixture, jpegFixture} {
+	for _, path := range []string{qoiFixture, pngFixture, jpegFixture, gifFixture} {
 		data := readFixture(t, path)
 		head := data
 		if len(head) > headMax {
@@ -224,6 +226,9 @@ func TestFormatOfHeaderIgnoresExtension(t *testing.T) {
 	}
 	if got := formatOfHeader(readFixture(t, jpegFixture)); got != fmtJPEG {
 		t.Errorf("JPEG fixture sniffed as %s", got.tag())
+	}
+	if got := formatOfHeader(readFixture(t, gifFixture)); got != fmtGIF {
+		t.Errorf("GIF fixture sniffed as %s", got.tag())
 	}
 	if got := formatOfHeader([]byte("qoif")); got != fmtQOI {
 		t.Errorf("short QOI magic sniffed as %s", got.tag())

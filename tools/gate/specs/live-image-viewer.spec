@@ -2,7 +2,7 @@
 # (#1567) onto GOVIEW.ELF, the Go successor to Zig VIEW.BIN (deleted with
 # user/src/view.zig in the same card).
 #
-# Five boots, all on the shim compositor (this spec stages no GOTABWM.ELF, so
+# Seven boots, all on the shim compositor (this spec stages no GOTABWM.ELF, so
 # `wm: autostart` falls back and the viewer honestly reports
 # `gview: not-tab-aware (shim or WND desktop)`; the seat's own hosting of the
 # same declare is go-wm-seat run 04):
@@ -30,6 +30,14 @@
 #            flipped to SOF2 (progressive) in setup. The sniff still sizes
 #            the window off SOF2, then the decoder refuses by name
 #            (`gview: unsupported JPEG`) and the viewer exits cleanly.
+#   GIF   -- M136c (#2769): the bounded first-frame decoder
+#            (webrender/gif.go). The fixture is a stdlib-encoded static
+#            file; the logical-screen-descriptor sniff sizes the window
+#            before the decode, and the receipt carries frames=1.
+#   GIFANIM
+#         -- the skip-and-count leg: a three-frame stdlib-encoded file.
+#            Frame 1 renders like the static leg and the receipt prints
+#            frames=3 — later frames are counted, never decoded.
 #   NOPE  -- the other error surface, and the default window when there is no
 #            header at all: `gview: open err`, 320x240, still exits cleanly on
 #            `q`.
@@ -66,7 +74,11 @@ assert pos > 0, "baseline fixture lost its SOF0 marker"
 prog = bytearray(jpg)
 prog[pos + 1] = 0xc2
 open(os.path.join(share, "JPROG.JPG"), "wb").write(bytes(prog))
-print("staged GOVIEW.ELF + TEST.QOI/PNG/JPG (%d bytes) + JPROG.JPG" % len(jpg))
+shutil.copy("user/go/webrender/testdata/gif/viewer_160x120.gif",
+            os.path.join(share, "TEST.GIF"))
+shutil.copy("user/go/webrender/testdata/gif/anim3_160x120.gif",
+            os.path.join(share, "ANIM.GIF"))
+print("staged GOVIEW.ELF + TEST.QOI/PNG/JPG/GIF + JPROG.JPG + ANIM.GIF")
 PYEOF
 
 vgate_file script-qoi.txt <<'EOF'
@@ -83,6 +95,14 @@ EOF
 
 vgate_file script-jprog.txt <<'EOF'
 exec GOVIEW.ELF /host/JPROG.JPG
+EOF
+
+vgate_file script-gif.txt <<'EOF'
+exec GOVIEW.ELF /host/TEST.GIF
+EOF
+
+vgate_file script-gifanim.txt <<'EOF'
+exec GOVIEW.ELF /host/ANIM.GIF
 EOF
 
 vgate_file script-missing.txt <<'EOF'
@@ -198,6 +218,55 @@ ser = open(os.environ["VG_SER"], errors="replace").read()
 # The sniff sizes the window off SOF2 even though the decode will refuse.
 assert re.search(r"gview: open id=[0-9]+ 328x264", ser), \
     "the progressive boot did not size its window from the SOF header"
+PY
+
+# --- Boot GIF: a static file decodes in guest, window sized off the LSD. --
+vgate_run GIF -- \
+    --display --screen '$RUN_DIR/gpu-screen-gif' \
+    --via-virtio \
+    --script '$RUN_DIR/script-gif.txt' --script-after "virelai> " \
+    --input-chords "q" --input-chords-after "gview: ready" \
+    --script-expect "user-exec exited status=43" --timeout 150
+
+vgate_assert GIF serial-contains "exec: loaded GOVIEW.ELF"
+vgate_assert GIF serial-contains "gview: loaded TEST.GIF 160x120 GIF bytes=7752 frames=1"
+vgate_assert GIF serial-absent "gview: unsupported"
+vgate_assert GIF serial-contains "gview: ready"
+vgate_assert GIF serial-contains "gview: quit"
+vgate_assert GIF serial-contains "user-exec exited status=43"
+vgate_assert GIF serial-absent "[EXC] parking:"
+vgate_assert GIF python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Sized from the GIF logical screen descriptor: the sniff does not need a
+# decoder.
+assert re.search(r"gview: open id=[0-9]+ 328x264", ser), \
+    "the GIF boot did not size its window from the logical screen header"
+PY
+
+# --- Boot GIFANIM: frame 1 renders; later frames are counted, not decoded.
+vgate_run GIFANIM -- \
+    --display --screen '$RUN_DIR/gpu-screen-gifanim' \
+    --via-virtio \
+    --script '$RUN_DIR/script-gifanim.txt' --script-after "virelai> " \
+    --input-chords "q" --input-chords-after "gview: ready" \
+    --script-expect "user-exec exited status=43" --timeout 150
+
+vgate_assert GIFANIM serial-contains "exec: loaded GOVIEW.ELF"
+vgate_assert GIFANIM serial-contains "gview: loaded ANIM.GIF 160x120 GIF bytes=23271 frames=3"
+vgate_assert GIFANIM serial-absent "gview: unsupported"
+vgate_assert GIFANIM serial-contains "gview: ready"
+vgate_assert GIFANIM serial-contains "gview: quit"
+vgate_assert GIFANIM serial-contains "user-exec exited status=43"
+vgate_assert GIFANIM serial-absent "[EXC] parking:"
+vgate_assert GIFANIM python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Same LSD sniff as the static leg, and the frame count is the whole file's,
+# not just the decoded first frame's.
+assert re.search(r"gview: open id=[0-9]+ 328x264", ser), \
+    "the animated boot did not size its window from the logical screen header"
+assert "frames=3" in ser, "animated GIF did not report its frame count"
 PY
 
 # --- Boot NOPE: the other error surface, and the default window. ----------

@@ -258,6 +258,7 @@ func TestSVGImagesAndRefusals(t *testing.T) {
 		{"resource", `<svg width="8" height="4"><image href="file.png"/></svg>`, "image-svg-external-resource"},
 		{"style", `<svg width="8" height="4" style="fill:red"></svg>`, "image-svg-unsupported-feature"},
 		{"jpeg", "\xff\xd8\xff\xe0not decoded", "image-invalid: jpeg"},
+		{"gif", "GIF89a\x08\x00\x08\x00\x00\x00\x00not decoded", "image-invalid: gif"},
 	}
 	fonts, _ := referenceFonts(t)
 	for _, tc := range cases {
