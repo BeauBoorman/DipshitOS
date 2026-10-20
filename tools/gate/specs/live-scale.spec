@@ -7,6 +7,10 @@
 # carve-out is exec's first wall at 64 (live-m16-resources owns that
 # refusal's exact count). No --script-expect (full window).
 # Mirrors tools/verify-live-scale.sh (claim 5795 + C3 claim 0339 + #1426).
+# M133c (#2757): the leg closes on `resources` so the same boot reports
+# every bounded pool the capacity table audits — tasks/procs/windows/
+# tables occupancy plus the per-process events/mbox/fds/timers/tcp
+# bounds — and the assert pins the line the doc cites.
 
 vgate_name live-scale "ten live programs at the pool budget on VZ"
 vgate_share seed
@@ -28,6 +32,7 @@ procs
 addrspaces
 exec USER.BIN
 exec USER.BIN
+resources
 echo rx-scale-ok
 EOF
 
@@ -88,5 +93,22 @@ if not (0 < used < 512):
 last = [l for l in lines if re.search(r"procs: id=[0-9]+ name=COUNTER.BIN", l)]
 if not last or "state=running" not in last[-1]:
     sys.exit("FAIL: counter not running at the end")
+# M133c: the closing `resources` audit — live task/proc occupancy plus
+# the per-process bounded-pool line the capacity table cites. USER.BIN
+# is a 2-tick transient (sleep then status=43): how many of its tasks
+# still hold pool slots at the read is phase-dependent — the run
+# re-measured under M133c read tasks=4 (kernel trio + the parked
+# COUNTER.BIN) while proc reap lagged task reap (procs=12, ten
+# mid-teardown USER.BIN descriptors still counted). Pin the floor and
+# the launched-count ceiling, never a point value.
+m = re.search(r"resources: tasks=(\d+)/64 zombies=\d+", ser)
+if not m or not (4 <= int(m.group(1)) <= 3 + loads + 1):
+    sys.exit("FAIL: tasks occupancy out of range (4..%d expected)" % (3 + loads + 1))
+if not re.search(r"resources: procs=\d+/64", ser):
+    sys.exit("FAIL: no procs occupancy line")
+if not re.search(r"resources: windows=\d+/13", ser):
+    sys.exit("FAIL: no windows occupancy line")
+if "resources: events=64 mbox=32 fds=8 timers=1 tcp=1" not in ser:
+    sys.exit("FAIL: per-process bound line absent")
 print("scale rows + capacity + tables ok (%d rows, tables=%d)" % (len(rows), used))
 PY
