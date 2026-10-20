@@ -392,6 +392,7 @@ func TestLiveModeNeverChoreographs(t *testing.T) {
 	savedDone := stripDone
 	savedHold := stripHoldLeft
 	savedCount := hostTicksLeft
+	savedLaunch := launch
 	defer func() {
 		tabs = savedTabs
 		demoMode = savedDemo
@@ -401,6 +402,9 @@ func TestLiveModeNeverChoreographs(t *testing.T) {
 		stripDone = savedDone
 		stripHoldLeft = savedHold
 		hostTicksLeft = savedCount
+		// syncSeatChrome names the host's failed WinOpen in launch.err
+		// every live tick; hand the launcher state back (#2545).
+		launch = savedLaunch
 	}()
 
 	scan := make([]byte, vi.ScanoutWidth*vi.ScanoutHeight*4)

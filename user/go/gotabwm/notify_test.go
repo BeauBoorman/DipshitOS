@@ -594,9 +594,13 @@ func TestSeatTickTracksCompositeTick(t *testing.T) {
 	resetNotify(t)
 	savedTabs, savedDemo := tabs, demoMode
 	savedDone, savedCount := stripDone, hostTicksLeft
+	savedLaunch := launch
 	t.Cleanup(func() {
 		tabs, demoMode = savedTabs, savedDemo
 		stripDone, hostTicksLeft = savedDone, savedCount
+		// syncSeatChrome names the host's failed WinOpen in launch.err
+		// every live tick; hand the launcher state back (#2545).
+		launch = savedLaunch
 	})
 	demoMode = false
 	tabs = TabStrip{}

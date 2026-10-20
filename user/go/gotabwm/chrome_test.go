@@ -23,6 +23,11 @@ func TestGodMenuButtonPaintAndHitAgree(t *testing.T) {
 	defer saveSeatState()()
 	for _, n := range []int{0, 1, 4} {
 		tabs = TabStrip{}
+		// #2545: the button paints "Apps" in Danger when launch.err is
+		// set — a state earlier host tests legitimately leave behind
+		// (compositeTick's syncSeatChrome WinOpen cannot succeed off-guest).
+		// The test asserts the no-error face, so it must own that input.
+		launch = launcherState{}
 		for i := 0; i < n; i++ {
 			tabs.OpenTab(uint32(i+3), "App")
 		}
