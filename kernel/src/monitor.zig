@@ -4916,6 +4916,22 @@ fn cmd_smp(m: *Monitor, args: []const []const u8) ExecError {
     // on a remote (targeted) ring, and how many of those nudged a parked
     // target with the RESCHEDULE SGI.
     m.console.puts(std.fmt.bufPrint(&buf, "smp: wakes={d} local={d} remote={d} nudges={d}\n", .{ scheduler.wake_local + scheduler.wake_remote, scheduler.wake_local, scheduler.wake_remote, scheduler.wake_nudges }) catch return .not_implemented);
+    // M133b (#2756): per-task tick attribution + aging state. The
+    // scheduler charges each core tick to that core's `current`; the
+    // `run=` delta between two `smp` reads is the task's measured share
+    // of the window, and `decay=`/`skip=` show the aging penalty the
+    // claim scan applies. The hog-share leg diffs these rows.
+    var i: usize = 0;
+    while (i < scheduler.max_tasks) : (i += 1) {
+        const info = scheduler.task_info(i) orelse continue;
+        const run_name: []const u8 = if (process.find_by_task(i)) |pid|
+            if (process.info(pid)) |pinfo| pinfo.name else info.name
+        else
+            info.name;
+        m.console.puts(std.fmt.bufPrint(&buf, "smp: run task={d} name={s} ticks={d} decay={d} skip={d}\n", .{
+            i, run_name, info.run_ticks, info.age_penalty, info.age_skip,
+        }) catch return .not_implemented);
+    }
     return .none;
 }
 

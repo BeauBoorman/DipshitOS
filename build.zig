@@ -427,6 +427,40 @@ pub fn build(b: *std.Build) void {
     }
 
     // ------------------------------------------------------------------
+    // Guest: the scheduler-aging pair (M133b, issue #2756) — SCHEDHOG.BIN
+    // (a pure CPU spin that burns every slice and converges to the
+    // age_max penalty) and SCHEDINT.BIN (a burn/sleep interactive whose
+    // committed block resets its decay and whose `hb=` lines pace the
+    // leg's measurement window). Both pinned to core 1 by the
+    // live-sched-ring hog leg (`exec -c1`), so the measured shares are
+    // contention on ONE core's ring.
+    // ------------------------------------------------------------------
+    const sched_aging = [_]struct { src: []const u8, bin: []const u8, tag: []const u8 }{
+        .{ .src = "user/src/schedhog.zig", .bin = "SCHEDHOG.BIN", .tag = "hog" },
+        .{ .src = "user/src/schedint.zig", .bin = "SCHEDINT.BIN", .tag = "int" },
+    };
+    for (sched_aging) |h| {
+        const prog = b.addExecutable(.{
+            .name = b.fmt("user-sched-{s}", .{h.tag}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(h.src),
+                .target = kernel_target,
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        prog.linker_script = b.path("user/linker-segmented.ld");
+        const prog_step = b.step(b.fmt("sched-{s}", .{h.tag}), b.fmt("Build the scheduler-aging {s} program (zig-out/bin/{s}; class A tooling, no VM)", .{ h.tag, h.bin }));
+        const prog_elf2bin = b.addSystemCommand(&.{ "python3", "tools/elf2bin.py", "--segments" });
+        prog_elf2bin.addFileArg(prog.getEmittedBin());
+        const prog_bin = prog_elf2bin.addOutputFileArg(h.bin);
+        prog_elf2bin.has_side_effects = true;
+        prog_elf2bin.stdio = .inherit;
+        prog_step.dependOn(&prog_elf2bin.step);
+        const install_prog = b.addInstallFileWithDir(prog_bin, .bin, h.bin);
+        b.getInstallStep().dependOn(&install_prog.step);
+    }
+
+    // ------------------------------------------------------------------
     // Guest: fifth ESP user program (milestone five, card N6 — claim
     // 1384) — the UDP syscall proof UDP.BIN. Same freestanding target,
     // linker script, elf2bin conversion, and ESP embedding as USER.BIN /

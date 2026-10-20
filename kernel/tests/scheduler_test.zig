@@ -1933,6 +1933,158 @@ test "scheduler: seating 3 runtimes × 4 Ms leaves headroom then fills (#1442)" 
     try std.testing.expect(register_worker(0) == null);
 }
 
+// ---------------------------------------------------------------------------
+// M133b (#2756): scheduler aging — decay arithmetic + starvation bound
+// ---------------------------------------------------------------------------
+
+test "scheduler: M133b aging — a burned slice accrues decay, capped at age_max; a yield does not" {
+    _ = init();
+    const user = register_user(0x2222, 0).?;
+    start();
+    // Drive the user task into `current` and charge it timer preemptions.
+    _ = scheduler.ready_rings[0].remove(user); // registered ready on ring 0
+    scheduler.current[0] = user;
+    scheduler.tasks[user].state = .running;
+    var k: u8 = 0;
+    while (k < scheduler.age_max + 2) : (k += 1) {
+        timer_switch_context(scheduler.tasks[user].sp, 0x3004, spsr_el0t_irqs, 0);
+        const want: u8 = @intCast(@min(@as(usize, k) + 1, @as(usize, scheduler.age_max)));
+        try std.testing.expectEqual(want, scheduler.tasks[user].age_penalty);
+        // age_skip is charged to the penalty but may already have drained
+        // once inside the switch's own claim scan (a lone-task ring's
+        // fallback re-picks the outgoing task) — the skip arithmetic is
+        // pinned by the ring_claim tests below, not here.
+        try std.testing.expect(scheduler.tasks[user].age_skip <= want);
+        // Re-arm the user as the outgoing task for the next charge without
+        // going through the claim (which would drain the skip).
+        _ = scheduler.ready_rings[0].remove(user);
+        scheduler.current[0] = user;
+        scheduler.tasks[user].state = .running;
+    }
+    try std.testing.expectEqual(scheduler.age_max, scheduler.tasks[user].age_penalty);
+    try std.testing.expect(scheduler.tasks[user].age_skip <= scheduler.age_max);
+    check_ready_membership();
+}
+
+test "scheduler: M133b aging — cooperative rotations leave decay at zero" {
+    _ = init();
+    _ = register_worker(0x1111).?;
+    const user = register_user(0x2222, 0).?;
+    start();
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        // A cooperative yield + the plain save/claim/stage path — neither
+        // is a burned timer slice, so nothing may age.
+        try std.testing.expect(yield_current());
+        switch_context(0x1000 + @as(u64, i), 0x1000 + @as(u64, i), spsr_el1h_irqs, 0);
+    }
+    for (scheduler.tasks) |task| {
+        try std.testing.expectEqual(@as(u8, 0), task.age_penalty);
+        try std.testing.expectEqual(@as(u8, 0), task.age_skip);
+    }
+    _ = user;
+    check_ready_membership();
+}
+
+test "scheduler: M133b aging — a decayed task loses picks until its skip drains" {
+    _ = init();
+    const a = spawn("hog", 0x3000, spsr_el1h_irqs, &exec_kstack_pool[0], 0, 0).?;
+    const b = spawn("mate", 0x4000, spsr_el1h_irqs, &exec_kstack_pool[1], 0, 0).?;
+    // a is a two-slice decayed task: it must lose exactly age_skip picks
+    // to its un-decayed queue-mates, then win.
+    scheduler.tasks[a].age_penalty = 2;
+    scheduler.tasks[a].age_skip = 2;
+    // Scan order after slot 0: a(1), b(2), idle(63). The idle reaper is
+    // itself a queue-mate at decay 0 here — keep the assertions on the
+    // first three picks before it can rotate in.
+    try std.testing.expectEqual(@as(?usize, b), ring_claim(0, 0)); // a skipped (2->1)
+    try std.testing.expectEqual(@as(u8, 1), scheduler.tasks[a].age_skip);
+    scheduler.ready_rings[0].push(b); // the claimed mate re-readies
+    try std.testing.expectEqual(@as(?usize, b), ring_claim(0, 0)); // a skipped again (1->0)
+    try std.testing.expectEqual(@as(u8, 0), scheduler.tasks[a].age_skip);
+    scheduler.ready_rings[0].push(b);
+    try std.testing.expectEqual(@as(?usize, a), ring_claim(0, 0)); // eligible now — wins
+    // The claim only removes the task; the stage would flip it running —
+    // a .ready task off every ring trips the membership invariant.
+    scheduler.current[0] = a;
+    scheduler.tasks[a].state = .running;
+    check_ready_membership();
+}
+
+test "scheduler: M133b aging — the all-decayed scan falls back to the least-decayed candidate" {
+    _ = init();
+    const a = spawn("hog", 0x3000, spsr_el1h_irqs, &exec_kstack_pool[0], 0, 0).?;
+    const b = spawn("hog2", 0x4000, spsr_el1h_irqs, &exec_kstack_pool[1], 0, 0).?;
+    scheduler.tasks[a].age_skip = 2;
+    scheduler.tasks[b].age_skip = 3;
+    scheduler.tasks[idle_id].age_skip = 3;
+    // Every candidate is decayed: the claim still returns a pick (the
+    // starvation guard) — the least-decayed one after this scan's drains.
+    try std.testing.expectEqual(@as(?usize, a), ring_claim(0, 0));
+    try std.testing.expectEqual(@as(u8, 1), scheduler.tasks[a].age_skip);
+    try std.testing.expectEqual(@as(u8, 2), scheduler.tasks[b].age_skip);
+    try std.testing.expectEqual(@as(u8, 2), scheduler.tasks[idle_id].age_skip);
+    scheduler.current[0] = a;
+    scheduler.tasks[a].state = .running;
+    scheduler.tasks[b].age_skip = 0;
+    scheduler.tasks[idle_id].age_skip = 0;
+    check_ready_membership();
+}
+
+test "scheduler: M133b aging — a capped hog is re-selected within the stated bound" {
+    _ = init();
+    const hog = spawn("hog", 0x3000, spsr_el1h_irqs, &exec_kstack_pool[0], 0, 0).?;
+    const m1 = spawn("mate1", 0x4000, spsr_el1h_irqs, &exec_kstack_pool[1], 0, 0).?;
+    const m2 = spawn("mate2", 0x5000, spsr_el1h_irqs, &exec_kstack_pool[2], 0, 0).?;
+    scheduler.tasks[hog].age_penalty = scheduler.age_max;
+    scheduler.tasks[hog].age_skip = scheduler.age_max;
+    // The bound the code comment states: a ready task wins within
+    // age_max * max_tasks + 1 claims. Tighten it for this shape: the hog
+    // drains one skip per scan that passes over it, so it must be picked
+    // within age_max + (ring population) claims — the claim loop below
+    // fails long before the loose bound is in question.
+    var picks: usize = 0;
+    var hog_seen = false;
+    var c: usize = 0;
+    while (c < scheduler.age_max + max_tasks) : (c += 1) {
+        const claimed = ring_claim(0, 0) orelse break;
+        picks += 1;
+        if (claimed == hog) {
+            hog_seen = true;
+            break;
+        }
+        scheduler.ready_rings[0].push(claimed); // the mate re-readies
+        if (claimed != m1 and claimed != m2 and claimed != hog) break; // idle won a turn — population still contended
+    }
+    try std.testing.expect(hog_seen);
+    try std.testing.expect(picks <= scheduler.age_max + max_tasks + 1);
+    scheduler.current[0] = hog;
+    scheduler.tasks[hog].state = .running;
+    check_ready_membership();
+}
+
+test "scheduler: M133b aging — a committed block resets the decay" {
+    _ = init();
+    const user = register_user(0x2222, 0).?;
+    start();
+    try std.testing.expect(yield_current()); // shell -> user
+    try std.testing.expectEqual(user, current_id());
+    scheduler.tasks[user].age_penalty = 3;
+    scheduler.tasks[user].age_skip = 3;
+    try std.testing.expect(sleep_current(2));
+    try std.testing.expectEqual(@as(u8, 0), scheduler.tasks[user].age_penalty);
+    try std.testing.expectEqual(@as(u8, 0), scheduler.tasks[user].age_skip);
+    try std.testing.expect(is_blocked(user));
+    // The wake does not re-charge anything: the task re-enters ready at
+    // full priority.
+    on_tick();
+    on_tick();
+    try std.testing.expect(!is_blocked(user));
+    try std.testing.expectEqual(@as(u8, 0), scheduler.tasks[user].age_penalty);
+    try std.testing.expectEqual(@as(u8, 0), scheduler.tasks[user].age_skip);
+    check_ready_membership();
+}
+
 // NOTE: there is deliberately no source-level "is it wired?" guard test here.
 // The obvious one (embedding `../src/scheduler.zig` and grepping for the two
 // call sites) does not compile — `@embedFile` cannot reach outside the test

@@ -342,6 +342,25 @@ const Task = struct {
     /// wake path patches its saved frame x0 (0 = real wake, the ETIMEDOUT
     /// errno on expiry) and clears its futex-table seat.
     futex_waiting: bool = false,
+    /// M133b (#2756): scheduler aging — full-slice decay count, capped at
+    /// `age_max`. A task preempted by the timer (it burned its whole
+    /// slice) gains one penalty; blocking (sys_sleep / sys_wait /
+    /// sys_wait_event / sys_futex / join) resets it — "recovers on
+    /// block". Only the relationship to queue-mates matters: every
+    /// always-running task converges to `age_max`, where selection is
+    /// round-robin again.
+    age_penalty: u8 = 0,
+    /// M133b (#2756): selection passes this task still loses. Charged to
+    /// `age_penalty` on each timer preemption; decremented once per claim
+    /// scan that passes over the task (single-owner claim ordering keeps
+    /// the decrement atomic — ring_claim holds every ring lock). A task
+    /// with age_skip > 0 is a candidate only through the fallback pick.
+    age_skip: u8 = 0,
+    /// M133b (#2756): scheduler ticks this task held the CPU — charged to
+    /// the core's `current` in `tick()` before any switch, so the counter
+    /// is the honest per-task share attribution the `smp` monitor rows
+    /// report (independent of the lossy per-process cpu_usage charge).
+    run_ticks: u64 = 0,
     /// M97g (#2079): spawn provenance for the WM seat gate. `spawned_by` is
     /// the pid of the process whose task allocated this task; `null` means
     /// the spawn ran on a kernel task (boot autostart, monitor `exec`,
@@ -361,6 +380,46 @@ var next_join_token: u64 = max_tasks;
 /// #1978: first process-exit beat, also the late-thread publication guard.
 /// sched_lock protects this scheduler-owned state; process.zig stays unchanged.
 var process_exit_tick: [process.max_processes]?u64 = @splat(null);
+
+/// M133b (#2756): the aging cap — the most selection passes a decayed
+/// task loses per run. Small and fixed: with `age_max` queue-mates
+/// always ready, a capped task still wins every `age_max + 1`-th scan in
+/// the worst cyclic position, and the fallback pick (below) makes "every
+/// candidate decayed" resolve in one scan rather than parking. The cap
+/// is sized for the 1 Hz tick: scans run ~1/s per core plus one per
+/// committed block, so a capped hog loses ~`age_max` picks per burned
+/// slice — enough separation that a burn/block queue-mate's fresh
+/// priority is measurable in its `run_ticks` share (live-sched-ring's
+/// hog leg proves the decayed share under a bound).
+/// Starvation guarantee: a ready task is never skipped indefinitely —
+/// its `age_skip` is at most `age_max`, drains by one on every claim
+/// scan that passes over it, and a claim always returns a candidate
+/// whenever the merged view is non-empty (the least-decayed candidate
+/// wins the all-decayed fallback). A ready task is therefore selected
+/// within `age_max * max_tasks + 1` claims even when every queue-mate
+/// stays at penalty 0 forever.
+pub const age_max: u8 = 5;
+
+/// M133b (#2756): the task that was just timer-preempted burned its
+/// whole slice — age it (penalty +1 to the cap, skip recharged to the
+/// penalty). Called only from `timer_switch_context`: the cooperative
+/// yield and IRQ-exit wake paths run `switch_context` directly and do
+/// NOT count as a burned slice, and the parked-secondary claim path has
+/// no outgoing task to charge.
+fn note_full_slice(c: usize) void {
+    if (task_count == 0) return;
+    const cur = current[c];
+    if (tasks[cur].age_penalty < age_max) tasks[cur].age_penalty += 1;
+    tasks[cur].age_skip = tasks[cur].age_penalty;
+}
+
+/// M133b (#2756): a committed block recovers the task's priority — the
+/// sleep/wait/futex/event/join paths call this where they mark the TCB
+/// `.blocked` (the rollback paths restore the snapshot they saved first).
+fn note_blocked(id: usize) void {
+    tasks[id].age_penalty = 0;
+    tasks[id].age_skip = 0;
+}
 
 /// Four full fixed-pool sweeps at the 1 s scheduler cadence. A diagnostic
 /// fires only AFTER 64 ticks, never as a timeout or a change to wait semantics.
@@ -1752,7 +1811,15 @@ fn ready_user_for(c: usize) bool {
 /// never leave their ring (issue #857). The scan is cyclic: members at
 /// or before `after` are reached only at the wrap (the old scan's
 /// re-pick of the preempted task itself).
-fn merged_next(c: usize, after: usize) ?MergedPick {
+///
+/// M133b (#2756): `aged` selects the aging-aware claim scan — a candidate
+/// with `age_skip > 0` is passed over and its skip drained by one (the
+/// charge for a burned slice), and the least-decayed skipped candidate
+/// is remembered so an all-decayed scan still returns a pick. `aged ==
+/// false` is the pure peek `next_runnable_for` uses: it answers "what
+/// would round-robin pick" without mutating anything, because a skipped
+/// task is still runnable.
+fn merged_next(c: usize, after: usize, aged: bool) ?MergedPick {
     const user_ready = ready_user_for(c);
     // All rings, n <= max_cores * max_tasks: collect + insertion sort by
     // slot. Rings of offline cores are always empty, so they contribute
@@ -1778,15 +1845,24 @@ fn merged_next(c: usize, after: usize) ?MergedPick {
     }
     var begin: usize = 0;
     while (begin < n and merged[begin].id <= after) begin += 1;
+    // M133b (#2756): the least-decayed skipped candidate, so an
+    // all-decayed scan still returns a candidate instead of stalling the
+    // core — the starvation guard the `age_max` comment bounds.
+    var fallback: ?MergedPick = null;
     var s: usize = 0;
     while (s < n) : (s += 1) {
         const cand = merged[(begin + s) % n];
         if (cand.from != c and !steal_eligible(c, cand.id)) continue;
         if (!frame_claimable(c, cand.id)) continue;
         if (user_ready and tasks[cand.id].demo_worker) continue;
+        if (aged and tasks[cand.id].age_skip > 0) {
+            tasks[cand.id].age_skip -%= 1;
+            if (fallback == null or tasks[cand.id].age_skip < tasks[fallback.?.id].age_skip) fallback = cand;
+            continue;
+        }
         return cand;
     }
-    return null;
+    return fallback;
 }
 
 /// The rotation pick on core `c` (claim): the slot-merged successor,
@@ -1795,7 +1871,7 @@ fn merged_next(c: usize, after: usize) ?MergedPick {
 /// push the merged view is never empty (the preempted task itself is
 /// reached at the wrap, preserving the old lone-task self-rotation).
 pub fn ring_claim(c: usize, after: usize) ?usize {
-    const p = merged_next(c, after) orelse return null;
+    const p = merged_next(c, after, true) orelse return null;
     _ = ready_rings[p.from].remove(p.id);
     if (p.from != c) {
         // Issue #857 evidence: core c migrated a ready task off another
@@ -1824,7 +1900,7 @@ pub fn ring_claim(c: usize, after: usize) ?usize {
 /// core `cid` after slot `after`, WITHOUT claiming it.
 pub fn next_runnable_for(after: usize, cid: usize) ?usize {
     if (task_count == 0) return null;
-    const p = merged_next(cid, after) orelse return null;
+    const p = merged_next(cid, after, false) orelse return null;
     return p.id;
 }
 
@@ -2071,8 +2147,11 @@ pub fn sleep_current(ticks: u64) bool {
     // current and off-ring by construction — the remove is defensive for
     // the manual-`current` host-test paths). It wakes onto its home ring.
     _ = ring_remove_anywhere(sleeping);
+    const old_pen = tasks[sleeping].age_penalty;
+    const old_skip = tasks[sleeping].age_skip;
     tasks[sleeping].state = .blocked;
     tasks[sleeping].wakeup_tick = deadline;
+    note_blocked(sleeping); // M133b: a committed block recovers priority
     sched_lock_release();
     if (!claim_and_stage(c, sleeping)) {
         // A secondary core with no eligible successor parks on its WFE
@@ -2083,6 +2162,8 @@ pub fn sleep_current(ticks: u64) bool {
         sched_lock_acquire();
         tasks[sleeping].state = .ready;
         tasks[sleeping].wakeup_tick = 0;
+        tasks[sleeping].age_penalty = old_pen;
+        tasks[sleeping].age_skip = old_skip;
         tasks[sleeping].saves -%= 1;
         sched_lock_release();
         return false;
@@ -2126,8 +2207,11 @@ pub fn wait_current(target_pid: usize) bool {
     save_tls(waiting);
     tasks[waiting].saves += 1;
     _ = ring_remove_anywhere(waiting); // defensive (current is off-ring)
+    const old_pen = tasks[waiting].age_penalty;
+    const old_skip = tasks[waiting].age_skip;
     tasks[waiting].state = .blocked;
     tasks[waiting].wait_pid = target_pid;
+    note_blocked(waiting); // M133b
     sched_lock_release();
     if (!claim_and_stage(c, waiting)) {
         // A secondary core with no eligible successor parks on its WFE
@@ -2138,6 +2222,8 @@ pub fn wait_current(target_pid: usize) bool {
         sched_lock_acquire();
         tasks[waiting].state = .ready;
         tasks[waiting].wait_pid = null;
+        tasks[waiting].age_penalty = old_pen;
+        tasks[waiting].age_skip = old_skip;
         tasks[waiting].saves -%= 1;
         sched_lock_release();
         return false;
@@ -2278,9 +2364,12 @@ pub fn join_thread(pid: usize, token: u64) ?u64 {
     tasks[caller].spsr = pc.spsr;
     tasks[caller].sp_el0 = exceptions.resume_sp_el0[c];
     save_tls(caller);
+    const old_pen = tasks[caller].age_penalty;
+    const old_skip = tasks[caller].age_skip;
     tasks[caller].wait_thread = true;
     tasks[caller].state = .blocked;
     tasks[id].joiner = caller;
+    note_blocked(caller); // M133b
     _ = ring_remove_anywhere(caller);
     sched_lock_release();
     if (!claim_and_stage(c, caller)) {
@@ -2289,6 +2378,8 @@ pub fn join_thread(pid: usize, token: u64) ?u64 {
         tasks[id].joiner = null;
         tasks[caller].wait_thread = false;
         tasks[caller].state = .running;
+        tasks[caller].age_penalty = old_pen;
+        tasks[caller].age_skip = old_skip;
         sched_lock_release();
         return null;
     }
@@ -2358,8 +2449,11 @@ pub fn futex_wait_current(
     save_tls(waiting);
     tasks[waiting].saves += 1;
     _ = ring_remove_anywhere(waiting);
+    const old_pen = tasks[waiting].age_penalty;
+    const old_skip = tasks[waiting].age_skip;
     tasks[waiting].state = .blocked;
     tasks[waiting].wakeup_tick = deadline_tick;
+    note_blocked(waiting); // M133b
     sched_lock_release();
     if (!claim_and_stage(c, waiting)) {
         if (stage_secondary_park(c)) return .blocked;
@@ -2369,6 +2463,8 @@ pub fn futex_wait_current(
         tasks[waiting].state = .ready;
         tasks[waiting].futex_waiting = false;
         tasks[waiting].wakeup_tick = 0;
+        tasks[waiting].age_penalty = old_pen;
+        tasks[waiting].age_skip = old_skip;
         tasks[waiting].saves -%= 1;
         futex_entry_clear(entry);
         sched_lock_release();
@@ -2418,6 +2514,9 @@ pub fn wait_event_current(pid: usize) bool {
     // targets address 0 (EFAULT) and every blocking GUI event loop dies.
     const saved_frame: *const exceptions.VectorFrame = @ptrFromInt(exceptions.resume_frame[c]);
     tasks[waiting].wait_event_buf = exceptions.frame_read(saved_frame, 0);
+    const old_pen = tasks[waiting].age_penalty;
+    const old_skip = tasks[waiting].age_skip;
+    note_blocked(waiting); // M133b
     sched_lock_release();
     if (!claim_and_stage(c, waiting)) {
         // A secondary core with no eligible successor parks on its WFE
@@ -2427,6 +2526,8 @@ pub fn wait_event_current(pid: usize) bool {
         tasks[waiting].state = .ready;
         tasks[waiting].wait_event_pid = null;
         tasks[waiting].wait_event_buf = 0;
+        tasks[waiting].age_penalty = old_pen;
+        tasks[waiting].age_skip = old_skip;
         tasks[waiting].saves -%= 1;
         sched_lock_release();
         return false;
@@ -3121,6 +3222,9 @@ pub fn tick() void {
     if (!scheduling_active()) return;
     const c = smp.core_id(); // per-core staging
     smp.core_ticks[c] +%= 1;
+    // M133b (#2756): per-task share attribution — the tick's holder
+    // burned the whole slice whether or not a rotation runs below.
+    tasks[current[c]].run_ticks +%= 1;
     // Service-domain locks (claim 9498 follow-on): on_tick's registry
     // work (app timers, WM pacing, CPU-limit arming) mutates EV + kernel
     // state — its canonical subset. try_take NEVER spins (a same-core
@@ -3246,6 +3350,8 @@ pub fn tick() void {
 /// timer-preemption witness inherited from claim 8215.
 pub fn timer_switch_context(frame_sp: u64, elr: u64, spsr: u64, sp_el0: u64) void {
     if ((spsr & 0xf) == spsr_el0t_irqs) user_timer_preemptions +%= 1;
+    // M133b (#2756): the outgoing task burned its whole slice — age it.
+    note_full_slice(smp.core_id());
     switch_context(frame_sp, elr, spsr, sp_el0);
 }
 
@@ -3682,6 +3788,11 @@ pub const TaskInfo = struct {
     /// May a secondary core steal this task off ring 0 (claim 9498)? False
     /// for a task pinned to CORE 0 (`exec -c0`, claim 907) and the shell.
     secondary_ok: bool,
+    /// M133b (#2756): scheduler ticks this task held the CPU.
+    run_ticks: u64,
+    /// M133b (#2756): full-slice decay count and remaining skipped picks.
+    age_penalty: u8,
+    age_skip: u8,
 };
 
 pub const Stats = struct {
@@ -3718,6 +3829,9 @@ pub fn task_info(id: usize) ?TaskInfo {
         .advances = tasks[id].advances,
         .pin_core = tasks[id].pin_core,
         .secondary_ok = tasks[id].secondary_ok,
+        .run_ticks = tasks[id].run_ticks,
+        .age_penalty = tasks[id].age_penalty,
+        .age_skip = tasks[id].age_skip,
     };
 }
 
