@@ -40,6 +40,7 @@
 //! command.
 
 const std = @import("std");
+const builtin = @import("builtin");
 pub const memmap = @import("memmap.zig");
 const spinlock = @import("spinlock.zig"); // claim 9498: cross-core alloc/free (user tasks on any core)
 
@@ -361,7 +362,33 @@ pub fn init(view: memmap.MapView, exclusions: []const Exclusion) bool {
     return state.init(view, exclusions);
 }
 
+/// M133a (#2755): single-shot fault injection, TEST BUILDS ONLY. Arm with
+/// `inject_fail_nth(k)` and the k-th subsequent `alloc_pages` call (1-based,
+/// counting every call while armed) returns null exactly as if the pool
+/// were empty, then the hook disarms. The release kernel carries `u0`
+/// fields — no injector exists in the shipped image.
+var inject_remaining: if (builtin.is_test) u64 else u0 = 0;
+
+/// Arm the injector: the `n`-th subsequent alloc_pages call fails once.
+/// `n == 0` disarms. A no-op outside test builds.
+pub fn inject_fail_nth(n: u64) void {
+    if (comptime !builtin.is_test) return;
+    inject_remaining = n;
+}
+
+/// Calls remaining until the armed injection trips (0 = disarmed).
+pub fn inject_remaining_calls() u64 {
+    if (comptime !builtin.is_test) return 0;
+    return inject_remaining;
+}
+
 pub fn alloc_pages(n: u64) ?u64 {
+    if (comptime builtin.is_test) {
+        if (inject_remaining > 0) {
+            inject_remaining -= 1;
+            if (inject_remaining == 0) return null;
+        }
+    }
     const daif = pool_lock.lock();
     defer pool_lock.unlock(daif);
     return state.alloc_pages(n);

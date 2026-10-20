@@ -2348,3 +2348,32 @@ test "process: static segment receipt survives real backing release and recycle"
     try std.testing.expectEqualDeep(RuntimeReceipt{}, processes[recycled].runtime_usage);
     try std.testing.expect(runtime_receipt(recycled) == null);
 }
+
+var m133a_pool: [64 * 4096]u8 align(4096) = undefined;
+
+test "process: M133a — injected overflow-block alloc failure refuses the record, pool untouched" {
+    defer alloc.inject_fail_nth(0);
+    // The pool backs a HOST buffer — record_dynamic_page dereferences the
+    // overflow block's PA (@ptrFromInt), so a fake 0x100000 base segfaults.
+    const descriptors = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = @intFromPtr(&m133a_pool), .virtual_start = 0, .number_of_pages = 64, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&descriptors), @sizeOf(memmap.MemoryDescriptor), descriptors.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+    init();
+    const id = create("P", .{}, .{ .text_phys = 0x1000, .text_pages = 1 }, .{}).?;
+    try std.testing.expect(bind(id, 2)); // running — a live receipt exists
+    // Fill the inline record table so the next record needs an overflow
+    // block page — the module's only alloc site.
+    for (0..max_dynamic_pages) |i| try std.testing.expect(record_dynamic_page(id, 0x200000 + i * 4096));
+    const free_before = alloc.stats().free_pages;
+    alloc.inject_fail_nth(1);
+    try std.testing.expect(!record_dynamic_page(id, 0x900000));
+    // The refusal is accounted on the receipt (the count the fault path
+    // reads to name the kill) and no page was taken.
+    try std.testing.expectEqual(@as(usize, 1), runtime_receipt(id).?.record_failures);
+    try std.testing.expectEqual(free_before, alloc.stats().free_pages);
+    // Disarmed, the overflow block allocates and the record lands.
+    try std.testing.expect(record_dynamic_page(id, 0x900000));
+    try std.testing.expectEqual(free_before - 1, alloc.stats().free_pages);
+}

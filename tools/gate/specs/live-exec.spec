@@ -17,6 +17,12 @@
 # still prints it (K<M is the finding, SPAWN-FAIL names the refusal) —
 # it never silently passes.
 #
+# Run 05 is the M133a (#2755) named-OOM leg: EL0EXEC.BIN oom modes
+# exhaust a 6-page memory rlimit twice — the MAP_POPULATE refusal names
+# ENOMEM, the demand-fault refusal reaps the caller with the status-140
+# receipt — then USER.BIN finishing 43 proves the scheduler is not
+# wedged.
+#
 # exec-order: assert-proven -- each boot's --script-expect is the LAST
 # leg's verdict marker, which only that leg's driver prints.
 #
@@ -300,3 +306,37 @@ if fails:
     sys.exit(1)
 print("the third child's ELF satisfies every loader rule the kernel enforces")
 PY
+
+# Run 05 — M133a (#2755): named OOM. EL0EXEC.BIN's new `oom` modes set a 6-page
+# memory rlimit (sys_setrlimit type 0) and exhaust it twice: refuse
+# mode's MAP_POPULATE mmaps answer ENOMEM by name (the child prints
+# `oom: enomem ok` and exits 0); reap mode's 7th demand-fault charge is
+# refused and the kernel reaps the caller with the mem-limit receipt
+# (`EL0EXEC.BIN exited status=140` on serial). USER.BIN finishing 43
+# afterward proves the scheduler is not wedged — other processes keep
+# running.
+vgate_file m05a.txt <<'EOF'
+exec EL0EXEC.BIN oom
+EOF
+
+vgate_file m05b.txt <<'EOF'
+exec EL0EXEC.BIN oom reap
+EOF
+
+vgate_file m05c.txt <<'EOF'
+exec USER.BIN
+EOF
+
+vgate_run 05 -- --script '$RUN_DIR/m05a.txt' \
+    --script2 '$RUN_DIR/m05b.txt' --script2-after 'oom: enomem ok' \
+    --script3 '$RUN_DIR/m05c.txt' --script3-after 'EL0EXEC.BIN exited status=140' \
+    --script-expect 'exited status=43' --timeout 120
+
+vgate_assert 05 serial-contains 'oom: enomem ok'
+vgate_assert 05 serial-contains 'EL0EXEC.BIN exited status=140'
+vgate_assert 05 serial-contains 'user: hello from the ESP'
+vgate_assert 05 serial-contains 'exited status=43'
+vgate_assert 05 serial-absent 'oom: setrlimit failed'
+vgate_assert 05 serial-absent 'oom: mmap unexpected'
+vgate_assert 05 serial-absent 'oom: reap-miss'
+vgate_assert 05 serial-absent '[EXC] parking:'

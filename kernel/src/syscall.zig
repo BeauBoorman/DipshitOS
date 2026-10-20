@@ -3615,8 +3615,10 @@ fn handle_vsock_ctl(args: Args, _: *exceptions.VectorFrame) u64 {
 /// an empty/over-long path, `argc > 8`, or a loader refusal (no disk,
 /// bad image, oversize, no args room); `EFAULT` for a bad path or argv
 /// pointer; `ENOENT` when the file is absent; `ENOSPC` when a capacity
-/// gate refuses (pool, page allocator, page-table carve-out, process
-/// registry). B1 adds the opt-in stream request described in ADR 0007:
+/// gate refuses (pool, page-table carve-out, process registry); `ENOMEM`
+/// when the physical allocator cannot back the image (M133a #2755 —
+/// `out_of_memory` names memory, not a full table). B1 adds the opt-in
+/// stream request described in ADR 0007:
 /// bit 63 in argc, request pointer in x4, exact request size in x5.
 pub const exec_stream_flag: u64 = @as(u64, 1) << 63;
 
@@ -3683,7 +3685,10 @@ fn handle_exec(args: Args, _: *exceptions.VectorFrame) u64 {
         // bad argument, not a kernel condition.
         .bad_elf, .unsupported_arch, .no_pt_load, .too_many_segments, .segment_too_large, .image_truncated => error_result(.einval),
         .not_found => error_result(.enoent),
-        .pool_full, .out_of_memory, .table_full, .process_full => error_result(.enospc),
+        // M133a (#2755): physical-page exhaustion is ENOMEM — distinct
+        // from the capacity tables, which stay ENOSPC.
+        .out_of_memory => error_result(.enomem),
+        .pool_full, .table_full, .process_full => error_result(.enospc),
         // M113c (#2419): a named grant row's sha256 did not match this
         // image — the refusal receipt names it, the caller sees EACCES.
         .grant_stale => error_result(.eacces),

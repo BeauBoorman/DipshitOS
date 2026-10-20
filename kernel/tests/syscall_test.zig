@@ -7657,3 +7657,69 @@ test "syscall: the M113c word mask receipts audit denials and enforces EACCES at
     try std.testing.expectEqual(error_result(.eacces), dispatch(sys_tcp_connect, .{ 0x0a000002, 0, 0, 0, 0, 0 }, &frame));
     try std.testing.expect(std.mem.indexOf(u8, receipt_scratch[0..receipt_len], "verdict=refused:net_denied") != null);
 }
+
+test "M133a: sys_exec out_of_memory folds to ENOMEM at the syscall seam" {
+    userspace.init();
+    init(test_writer);
+    defer alloc.inject_fail_nth(0);
+    defer virtio_file.set_test_share(null);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+    scheduler.start();
+    try std.testing.expect(scheduler.yield_current());
+    // A real pool + a loadable image, so the loader reaches the allocator.
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 256, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+    var img = @as([40]u8, @splat(@as(u8, 0)));
+    @memcpy(img[0..4], "DSK1");
+    std.mem.writeInt(u32, img[4..8], 0, .little);
+    std.mem.writeInt(u64, img[8..16], 24, .little); // entry_off
+    std.mem.writeInt(u64, img[16..24], 40, .little); // image_size
+    const files = [_]virtio_file.TestFile{.{ .name = "OOMTEST.BIN", .data = img[0..] }};
+    virtio_file.set_test_share(&files);
+    var path = "OOMTEST.BIN".*;
+    set_user_regions(.{ .base = 0, .len = 0 }, .{ .base = @intFromPtr(&path), .len = path.len });
+    var frame = fresh_frame();
+    // The loader's first physical allocation (the text page) fails once —
+    // ENOMEM now, where the old fold answered ENOSPC.
+    alloc.inject_fail_nth(1);
+    try std.testing.expectEqual(error_result(.enomem), dispatch(sys_exec, .{ @intFromPtr(&path), path.len, 0, 0, 0, 0 }, &frame));
+}
+
+test "M133a: sys_mmap MAP_POPULATE injected alloc failure unwinds to ENOMEM" {
+    const f = try reclaimFixture(8);
+    defer alloc.inject_fail_nth(0);
+    var frame = fresh_frame();
+    const va: u64 = 0x6000_0000;
+    // inject(2): page 0 populates, page 1's alloc fails — the loop unwinds
+    // the whole reservation (leaves, page records, region row) and names
+    // ENOMEM. The free count is the leak detector.
+    alloc.inject_fail_nth(2);
+    try std.testing.expectEqual(error_result(.enomem), dispatch(sys_mmap, .{ va, 3 * 4096, 3, 0x8022, 0, 0 }, &frame));
+    try std.testing.expect(process.find_mmap_region(f.pid, va) == null);
+    try std.testing.expect(!mmu.leaf_el0_visible(f.root, va));
+    try std.testing.expectEqual(@as(u64, 8), alloc.stats().free_pages);
+    _ = process.on_task_exit(f.task, 0);
+    try std.testing.expect(process.release_pages_on_reap(f.task));
+}
+
+test "M133a: shared-surface owner create injected alloc failure unwinds to ENOMEM" {
+    const f = try reclaimFixture(8);
+    defer alloc.inject_fail_nth(0);
+    var frame = fresh_frame();
+    const va: u64 = 0x6000_0000;
+    // M33_MAP_SHARED owner create: the contiguous surface alloc is the
+    // only physical allocation. inject(1) fails it after the region row
+    // and descriptor exist — the unwind drops both, named ENOMEM.
+    alloc.inject_fail_nth(1);
+    try std.testing.expectEqual(error_result(.enomem), dispatch(sys_mmap, .{ va, 2 * 4096, 3, 0x10022, 0, 0 }, &frame));
+    try std.testing.expect(shared_region.find_owner(f.pid, va) == null);
+    try std.testing.expect(process.find_mmap_region(f.pid, va) == null);
+    try std.testing.expectEqual(@as(u64, 8), alloc.stats().free_pages);
+    _ = process.on_task_exit(f.task, 0);
+    try std.testing.expect(process.release_pages_on_reap(f.task));
+}

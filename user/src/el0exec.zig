@@ -27,13 +27,28 @@ pub const enoent_bad_marker: []const u8 = "el0-exec: enoent unexpected\n";
 pub const fuzz_done_marker: []const u8 = "fuzz: done\n";
 pub const fuzz_caller_ok_marker: []const u8 = "fuzz: caller-not-moved ok\n";
 pub const fuzz_violation_tag: []const u8 = "fuzz: VIOLATION";
+pub const oom_enomem_marker: []const u8 = "oom: enomem ok\n";
+pub const oom_rlimit_fail_marker: []const u8 = "oom: setrlimit failed\n";
+pub const oom_mmap_fail_marker: []const u8 = "oom: mmap unexpected\n";
+pub const oom_reap_miss_marker: []const u8 = "oom: reap-miss\n";
 
 const sys_write: u64 = 1;
 const sys_exit: u64 = 3;
 const sys_wait: u64 = 8;
 const sys_exec: u64 = 28;
+const sys_setrlimit: u64 = 54;
+const sys_mmap: u64 = 63;
 const sys_munmap: u64 = 64;
 const enoent: i64 = -6;
+const enomem: i64 = -10;
+
+// M133a (#2755): the `oom` mode's ceiling — refuse mode's populated page
+// count, reap mode's lazy-touch bound.
+const rlimit_mem_pages: u64 = 0; // setrlimit type 0 = memory pages
+const oom_page_limit: u64 = 6;
+const prot_rw: u64 = 3;
+const map_anon_private: u64 = 0x22; // MAP_ANONYMOUS|MAP_PRIVATE
+const map_populate: u64 = 0x8000;
 
 const slot_count: u64 = 128;
 const past_namespace: u64 = 64;
@@ -85,6 +100,18 @@ fn svc1(num: u64, a0: u64) i64 {
         : [res] "={x0}" (res),
         : [num] "{x8}" (num),
           [a0] "{x0}" (a0),
+        : .{ .memory = true });
+    return res;
+}
+
+fn svc2(num: u64, a0: u64, a1: u64) i64 {
+    if (builtin.os.tag != .freestanding) return 0;
+    var res: i64 = undefined;
+    asm volatile ("svc #0"
+        : [res] "={x0}" (res),
+        : [num] "{x8}" (num),
+          [a0] "{x0}" (a0),
+          [a1] "{x1}" (a1),
         : .{ .memory = true });
     return res;
 }
@@ -381,10 +408,64 @@ fn run_fuzz(argc: u64, argv_va: u64) noreturn {
     exit(if (violations == 0) 0 else 1);
 }
 
+fn oom_arm_limit() void {
+    if (svc2(sys_setrlimit, rlimit_mem_pages, oom_page_limit) != 0) {
+        write(oom_rlimit_fail_marker);
+        exit(1);
+    }
+}
+
+/// M133a (#2755): refuse mode — `exec EL0EXEC.BIN oom`. Populate one page
+/// at a time past the 6-page rlimit ceiling; the record charge refused at
+/// the limit makes the mmap answer ENOMEM by name.
+fn oom_refuse() noreturn {
+    oom_arm_limit();
+    var i: u64 = 0;
+    while (i < 2 * oom_page_limit) : (i += 1) {
+        const r = svc4(sys_mmap, 0, 4096, prot_rw, map_anon_private | map_populate);
+        if (r == enomem) {
+            write(oom_enomem_marker);
+            exit(0);
+        }
+        if (r <= 0) {
+            write(oom_mmap_fail_marker);
+            exit(1);
+        }
+    }
+    write(oom_mmap_fail_marker); // no refusal inside 2x the limit — wrong verdict
+    exit(1);
+}
+
+/// M133a (#2755): reap mode — `exec EL0EXEC.BIN oom reap`. One lazy
+/// reservation past the ceiling, then a byte stored per page; the 7th
+/// page's demand-fault charge is refused and the kernel reaps this caller
+/// with the mem-limit receipt (status 140 on serial). A return from the
+/// last store means the reap never came.
+fn oom_reap() noreturn {
+    oom_arm_limit();
+    const r = svc4(sys_mmap, 0, 2 * oom_page_limit * 4096, prot_rw, map_anon_private);
+    if (r <= 0) {
+        write(oom_mmap_fail_marker);
+        exit(1);
+    }
+    const base: u64 = @intCast(r);
+    var i: u64 = 0;
+    while (i < 2 * oom_page_limit) : (i += 1) {
+        const p: *volatile u8 = @ptrFromInt(base + i * 4096);
+        p.* = 0x5a;
+    }
+    write(oom_reap_miss_marker);
+    exit(2);
+}
+
 export fn _start(argc: u64, argv_va: u64) callconv(.c) noreturn {
     if (argc >= 1 and argv_va != 0) {
         const first = arg_slot(argv_va, 0);
         if (eql(first, "fuzz")) run_fuzz(argc, argv_va);
+        if (eql(first, "oom")) {
+            if (argc >= 2 and eql(arg_slot(argv_va, 1), "reap")) oom_reap();
+            oom_refuse();
+        }
     }
     run();
 }
@@ -425,6 +506,10 @@ test "el0exec: marker shapes are pinned (live-gate grep targets)" {
     try std.testing.expectEqualStrings("fuzz: done\n", fuzz_done_marker);
     try std.testing.expectEqualStrings("fuzz: caller-not-moved ok\n", fuzz_caller_ok_marker);
     try std.testing.expectEqualStrings("fuzz: VIOLATION", fuzz_violation_tag);
+    try std.testing.expectEqualStrings("oom: enomem ok\n", oom_enomem_marker);
+    try std.testing.expectEqualStrings("oom: setrlimit failed\n", oom_rlimit_fail_marker);
+    try std.testing.expectEqualStrings("oom: mmap unexpected\n", oom_mmap_fail_marker);
+    try std.testing.expectEqualStrings("oom: reap-miss\n", oom_reap_miss_marker);
 }
 
 test "el0exec: roster seeds match the host fuzz module" {

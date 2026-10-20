@@ -607,3 +607,41 @@ test "alloc: ref_page and unref_page lifecycle" {
     try std.testing.expect(unref_page(pa));
     try std.testing.expectEqual(@as(u64, 10), stats().free_pages);
 }
+
+test "alloc: M133a — inject_fail_nth fails exactly the Nth call, then disarms" {
+    defer alloc.inject_fail_nth(0);
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 8, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(init(view, &.{}));
+
+    // n=1: the very next call fails, consuming no page; the one after lands.
+    alloc.inject_fail_nth(1);
+    try std.testing.expectEqual(@as(u64, 1), alloc.inject_remaining_calls());
+    try std.testing.expect(alloc_pages(1) == null);
+    try std.testing.expectEqual(@as(u64, 0), alloc.inject_remaining_calls());
+    try std.testing.expectEqual(@as(u64, 8), stats().free_pages);
+    const first = alloc_pages(1).?;
+    defer _ = free_pages(first, 1);
+
+    // n=3: calls 1 and 2 succeed, call 3 is refused, call 4 succeeds.
+    alloc.inject_fail_nth(3);
+    const a = alloc_pages(1).?;
+    defer _ = free_pages(a, 1);
+    const b = alloc_pages(1).?;
+    defer _ = free_pages(b, 1);
+    try std.testing.expect(alloc_pages(1) == null);
+    try std.testing.expectEqual(@as(u64, 0), alloc.inject_remaining_calls());
+    const c = alloc_pages(1).?;
+    defer _ = free_pages(c, 1);
+    try std.testing.expectEqual(@as(u64, 4), stats().free_pages);
+
+    // n=0 disarms a still-armed hook.
+    alloc.inject_fail_nth(2);
+    alloc.inject_fail_nth(0);
+    const d = alloc_pages(1).?;
+    defer _ = free_pages(d, 1);
+    const e = alloc_pages(1).?;
+    defer _ = free_pages(e, 1);
+}

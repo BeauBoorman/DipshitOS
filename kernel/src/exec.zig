@@ -2847,3 +2847,135 @@ test "exec: argv block is a read-only leaf — uaccess reads it, writes fault, p
     try std.testing.expectEqual(uaccess.Outcome.fault, uaccess.copy_out(proc_a.text_phys + block_off, "12345678", 8));
     try std.testing.expectEqual(uaccess.Outcome.ok, uaccess.copy_out(proc_a.stack_phys, "12345678", 8));
 }
+
+// ---------------------------------------------------------------------------
+// M133a (#2755): named OOM — the physical-allocator injection hook fails the
+// Nth `alloc.alloc_pages` call, and every loader path must answer
+// `out_of_memory` with a leak-free unwind, never a wedge or a leak.
+// ---------------------------------------------------------------------------
+
+/// A minimal DSK3 segmented image: 16 bytes text + 16 bytes data file
+/// (data_mem_size 32 — a real writable segment, so the flat path takes the
+/// data allocation site).
+fn dsk3_segments() [dsk3_header_size + 32]u8 {
+    var img = @as([dsk3_header_size + 32]u8, @splat(@as(u8, 0)));
+    std.mem.writeInt(u32, img[0..4], dsk3_magic, .little);
+    std.mem.writeInt(u32, img[4..8], 0, .little);
+    std.mem.writeInt(u64, img[8..16], dsk3_header_size, .little); // entry = text start
+    std.mem.writeInt(u64, img[16..24], dsk3_header_size + 16 + 16, .little); // image_size
+    std.mem.writeInt(u64, img[24..32], 16, .little); // text_size
+    std.mem.writeInt(u64, img[32..40], 16, .little); // data_file_size
+    std.mem.writeInt(u64, img[40..48], 32, .little); // data_mem_size
+    return img;
+}
+
+/// Two-segment gap-layout static ELF: seg0 R+X at `base` (maps the whole
+/// file), seg1 RW at `base + 0x100000` — the per-segment alloc loop's
+/// mid-iteration failure fixture.
+fn test_gap2_image(base: u64) [640]u8 {
+    var img = @as([640]u8, @splat(@as(u8, 0)));
+    @memcpy(img[0..4], "\x7fELF");
+    img[4] = 2; // ELF64
+    img[5] = 1; // little endian
+    img[6] = 1;
+    std.mem.writeInt(u16, img[16..18], 2, .little); // ET_EXEC
+    std.mem.writeInt(u16, img[18..20], 183, .little); // AArch64
+    std.mem.writeInt(u32, img[20..24], 1, .little);
+    std.mem.writeInt(u64, img[24..32], base + 256, .little); // e_entry (seg0 file bytes)
+    std.mem.writeInt(u64, img[32..40], 64, .little); // e_phoff
+    std.mem.writeInt(u16, img[52..54], 64, .little); // e_ehsize
+    std.mem.writeInt(u16, img[54..56], 56, .little); // e_phentsize
+    std.mem.writeInt(u16, img[56..58], 2, .little); // e_phnum
+    // phdr0: PT_LOAD R+X @ base — file bytes [0, 384) (past e_entry) over
+    // a 4 KiB memsz. The file ranges must be disjoint AND ordered.
+    std.mem.writeInt(u32, img[64..68], 1, .little); // PT_LOAD
+    std.mem.writeInt(u32, img[68..72], 5, .little); // R+X
+    std.mem.writeInt(u64, img[72..80], 0, .little); // p_offset
+    std.mem.writeInt(u64, img[80..88], base, .little); // p_vaddr
+    std.mem.writeInt(u64, img[96..104], 384, .little); // p_filesz
+    std.mem.writeInt(u64, img[104..112], 4096, .little); // p_memsz
+    std.mem.writeInt(u64, img[112..120], 4096, .little); // p_align
+    // phdr1: PT_LOAD RW @ base + 0x100000 (a page-aligned gap — the
+    // writable LAST segment the gap contract demands).
+    std.mem.writeInt(u32, img[120..124], 1, .little); // PT_LOAD
+    std.mem.writeInt(u32, img[124..128], 6, .little); // R+W
+    std.mem.writeInt(u64, img[128..136], 384, .little); // p_offset
+    std.mem.writeInt(u64, img[136..144], base + 0x100000, .little); // p_vaddr
+    std.mem.writeInt(u64, img[152..160], 256, .little); // p_filesz
+    std.mem.writeInt(u64, img[160..168], 4096, .little); // p_memsz
+    std.mem.writeInt(u64, img[168..176], 4096, .little); // p_align
+    return img;
+}
+
+/// Sweep the injection counter across an exec attempt: arming `n` must
+/// refuse the load `out_of_memory` with every earlier allocation returned
+/// — the free count is the leak detector. `sites` is the number of
+/// `alloc.alloc_pages` calls a successful load makes on this path.
+fn expect_injected_oom(name: []const u8, sites: u64) !void {
+    var n: u64 = 1;
+    while (n <= sites) : (n += 1) {
+        const free_before = alloc.stats().free_pages;
+        alloc.inject_fail_nth(n);
+        try std.testing.expectEqual(ExecResult.out_of_memory, exec_file(name, &.{}));
+        try std.testing.expectEqual(@as(u64, 0), alloc.inject_remaining_calls());
+        try std.testing.expectEqual(free_before, alloc.stats().free_pages);
+    }
+}
+
+test "exec: M133a — injected failure names out_of_memory at every flat-path site" {
+    defer virtio_file.set_test_share(null);
+    defer test_share_n = 0;
+    defer alloc.inject_fail_nth(0);
+    arm_allocator();
+    _ = scheduler.init();
+    test_share_n = 0;
+    const img = dsk1("USER!", 24, 24 + 5);
+    test_seed("USER.BIN", img[0 .. 24 + 5]);
+    // DSK1 (no data segment): text, user stack, kernel stack — 3 sites.
+    try expect_injected_oom("USER.BIN", 3);
+}
+
+test "exec: M133a — injected failure names out_of_memory at every DSK3 site" {
+    defer virtio_file.set_test_share(null);
+    defer test_share_n = 0;
+    defer alloc.inject_fail_nth(0);
+    arm_allocator();
+    _ = scheduler.init();
+    test_share_n = 0;
+    const img = dsk3_segments();
+    test_seed("SEG.BIN", img[0..]);
+    // DSK3 with a writable segment: text, data, user stack, kernel stack.
+    try expect_injected_oom("SEG.BIN", 4);
+}
+
+test "exec: M133a — injected failure names out_of_memory across the gap-ELF segment loop" {
+    defer virtio_file.set_test_share(null);
+    defer test_share_n = 0;
+    defer mmu.reset();
+    defer alloc.inject_fail_nth(0);
+    arm_allocator();
+    _ = scheduler.init();
+    test_share_n = 0;
+    const image = test_gap2_image(0x0080_0000);
+    test_seed("GAP.ELF", image[0..]);
+    // seg0, seg1 (the loop's second iteration — its unwind must return
+    // seg0's pages), user stack, kernel stack — 4 sites.
+    try expect_injected_oom("GAP.ELF", 4);
+}
+
+test "exec: M133a — injected failure names out_of_memory at every dynamic-ELF site" {
+    defer virtio_file.set_test_share(null);
+    defer test_share_n = 0;
+    defer mmu.reset();
+    defer alloc.inject_fail_nth(0);
+    arm_allocator();
+    _ = scheduler.init();
+    test_share_n = 0;
+    const image = test_dynamic_image(userspace.text_va, true);
+    const interpreter = test_dynamic_image(0x0080_0000, false);
+    test_seed("DYNAMIC.ELF", image[0..]);
+    test_seed("LD.SO", interpreter[0..]);
+    // scratch, text, interp text, library aperture, user stack, kernel
+    // stack — 6 sites (single-segment program + interpreter).
+    try expect_injected_oom("DYNAMIC.ELF", 6);
+}
