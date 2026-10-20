@@ -76,8 +76,10 @@
 #   bash tools/go/build-charmhello.sh     ->  .build/go/CHARMHELLO.ELF (boot 04)
 #   bash tools/go/build-files.sh          ->  .build/go/GOFILES.ELF   (boots 05/06/08)
 #   bash tools/go/build-gosound.sh        ->  .build/go/GOSOUND.ELF   (boot 07)
-#   bash tools/go/build-goedit.sh         ->  .build/go/GOEDIT.ELF    (boot 08)
+#   bash tools/go/build-goedit.sh         ->  .build/go/GOEDIT.ELF    (boots 08/09)
 #   bash tools/go/build-goview.sh         ->  .build/go/GOVIEW.ELF    (boot 08)
+#   bash tools/go/build-goset.sh          ->  .build/go/GOSET.ELF     (boot 09)
+#   bash tools/go/build-goterm.sh already covers boot 09's terminal tab.
 #   (the page is the pinned fixture user/go/browser/testdata/gate-page.html,
 #    staged as /host/DOGFOOD.HTML; no new fixture)
 #
@@ -204,6 +206,19 @@
 # boot 06's refusal toast, boot 07's `gosound: rec refused ENXIO`) and
 # the named non-failure classes are documented in the helper.
 #
+# M121f (#2569) adds boot 09: the M121 arc's acceptance -- a keyboard-only
+# daily-driver journey on the LIVE default seat (the demo trigger stayed
+# removed since boot 04's between-run cleanup, and a tag-08 assert below
+# empties SESSION.TABS so the strip starts restored-empty). NO pointer
+# phase is armed at all: the run carries no --pointer-virtio, and the
+# serial is pinned free of the pointer-produced markers (rail-click, the
+# tty drag-select pair, the drag/drop family). One chord batch walks the
+# surfaces the way a user drives them -- a typed run -> the '?' hint
+# overlay -> ctrl+z undo -> the move pair -> pin -> palette exec ->
+# close -> reopen -- and the M121d badge's transition lines plus its
+# panel pixels pin the focus tracking. Choreography in the boot-09
+# block at the end.
+#
 # exec-order: assert-proven -- every phase gate is anchored on guest output
 # (the seat's, an app's, or the kernel's own marker: dogfood: seat ->
 # user-el0 reaped -> gotabwm: present (the seat's own first present, reached
@@ -213,6 +228,11 @@
 # charmhello: ready are all program markers), and the run ends on
 # `charmhello: repainted` — a marker only charmhello prints after
 # ActionResized, so a program that never ran still fails the run.
+# Boot 09's shape is the same: script phases anchor on dogfood: seat /
+# goterm: ready / gotabwm: rail n=3 (both async declares must have landed
+# for the rail to reach three), the chord batch releases on
+# `goedit: present`, and the script-owned rx echo ends the run only after
+# every load-bearing assert has program output to read.
 
 vgate_name go-dogfood "issue #1528 M69a: the DEFAULT Go seat hosts the daily-driver beat (GOSH+NOTE, then GOCALC+WEB) with ordered guest-printed dogfood: markers"
 vgate_share seed
@@ -277,7 +297,8 @@ for name, how in (("GOTABWM.ELF", "build-gotabwm.sh"),
                   ("GOFILES.ELF", "build-files.sh"),
                   ("GOSOUND.ELF", "build-gosound.sh"),
                   ("GOEDIT.ELF", "build-goedit.sh"),
-                  ("GOVIEW.ELF", "build-goview.sh")):
+                  ("GOVIEW.ELF", "build-goview.sh"),
+                  ("GOSET.ELF", "build-goset.sh")):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
         sys.exit(name + " missing (expected " + src + ") - build it first: "
@@ -291,7 +312,7 @@ if os.path.exists(os.path.join(share, "SETTINGS.TXT")):
     sys.exit("SETTINGS.TXT already present in the share; the dogfood beat must "
              "boot with no persisted `wm`")
 print("staged GOTABWM/GOSH/NOTE/GOCALC/WEB/GOTERM/CHARMHELLO/GOFILES/GOSOUND/"
-      "GOEDIT/GOVIEW + DOGFOOD.HTML from the pinned gate-page.html fixture")
+      "GOEDIT/GOVIEW/GOSET + DOGFOOD.HTML from the pinned gate-page.html fixture")
 PY
 
 # M82d2 (#1785): boot 05's notice sender is GOFILES.ELF (its completed copy
@@ -336,6 +357,10 @@ vgate_file refusal-pair.py <<'EOF'
 # Self-paired (the line IS the UI marker's serial receipt):
 #   - `gotabwm: refusal*` -- the toast's own marker
 #   - `<app>: banner*` / `<app>: empty` -- the banner/empty-state markers
+#   - `goedit: state restored` -- the re-exec'd editor's restored tab is
+#     the visible surface its missing-file rc=-6 read reports on (boot 09:
+#     the reopened GOEDIT restores its buffer instead of re-showing the
+#     empty plate, so `empty` never pairs its second read)
 #   - `gosound: * refused` / `gosound: rec write refused rc=` -- GOSOUND parks
 #     its refused state in-window (stRefused; "Empty and refused park in the
 #     window", user/go/sound/main.go), so the marker reports a visible state
@@ -364,7 +389,7 @@ EXEMPT = ("init: refuse missing-init", "gotabwm: rpc refuse",
           "gotabwm: sel refuse", "cap: refuse",
           "gofiles: clip-sys rc=")
 SEAT_UI = ("gotabwm: refusal", "gotabwm: notify paint", "gotabwm: notify held")
-APP_UI = (": banner", ": empty")
+APP_UI = (": banner", ": empty", "goedit: state restored")
 PREFIX = re.compile(r"^([a-z0-9]+):")
 
 
@@ -2292,4 +2317,377 @@ for y in range(16, 112):
 print("terminal-green pixels in GOTERM's first grid rows: %d" % green)
 assert green >= 50, ("the pasted line painted no terminal ink (%d green px) "
                      "- the sel-paste->echo chain is not on the scanout" % green)
+PY
+
+# Boot 09 wants boot 08's own start state: a restored-empty strip. The
+# M124f journey ends its boot with {GOFILES,GOEDIT,GOVIEW,GOTERM} written
+# to SESSION.TABS, and an M120b restore of those rows would re-exec four
+# clients before the first phase -- so the same tag-level cleanup boot 07
+# ran for boot 08 runs here for boot 09.
+vgate_assert 08 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share arm?)")
+open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x02\x00\x00\x00\x00\x00")
+print("between-run cleanup: empty SESSION.TABS for boot 09 "
+      "(restored-empty: no starter, strip starts at 0)")
+PY
+
+# ---------------------------------------------------------------------------
+# M121f (#2569): boot 09 -- the keyboard-only daily-driver journey, one boot
+# ---------------------------------------------------------------------------
+# The arc's acceptance: every surface the M121 cards landed, driven the way a
+# user drives it -- by keyboard alone. No pointer phase is armed at all
+# (there is no --pointer-virtio on this run), and the serial is pinned free
+# of the pointer-produced markers so a pointer path could not have leaked
+# in to help a leg pass.
+#
+# Phase anchors, in fire order (every anchor is a guest-printed marker):
+#
+#   dogfood: seat        script a: `dui focus 0` hands focus off the seat's
+#                        startup probe, GOMAXPROCS=1 like every app in this
+#                        spec, exec GOTERM.ELF -- first tab, takes focus
+#                        (badge -> term).
+#   goterm: ready        script b: exec GOEDIT.ELF -- second tab, last
+#                        declare, so the editor holds focus when the batch
+#                        fires.
+#   goedit: present      --input-chords: the whole journey in ONE batch on
+#                        the documented keystroke-release marker (the
+#                        editor's first frame is on the scanout, so it is
+#                        already in its event loop). The order inside the
+#                        batch is load-bearing, spelled out leg by leg:
+#
+#     x y z          a typed run into the scratch buffer -> `goedit: dirty`
+#     ?              M121c: the app's own '?' opens the registry-fed hint
+#                    overlay -> `goedit: hints n=27` + the `hints row` dump
+#     down x6        nav strokes the modal consumes -- dwell so the kind-4
+#                    snapshot armed on `hints n=` streams a frame while
+#                    the plate is still up
+#     escape         -> `goedit: hints close`
+#     ctrl-z         M121e: `gotabwm: undo id=` routes to the focused tab
+#                    and the buffer's ring answers `goedit: undo n=0`
+#     ctrl-shift-pageup / pagedown
+#                    M121b move pair on the 2-cell rail: GE steps left
+#                    then back right -> `gotabwm: reorder <from>-><to>`
+#     ctrl-shift-n   M121b pin: `gotabwm: pin id=<n> on`, the pinned cell
+#                    jumps to the strip front
+#     ctrl-shift-p s e t t return
+#                    M121a palette: `palette open n=`, the seat modal's
+#                    own sink (badge -> seat), subsequence filter `q=sett`
+#                    narrows to a Settings row, return execs it ->
+#                    `palette exec GOSET.ELF` + `palette dismiss` (the
+#                    palette's catalog is tabs/recents/settings/help/
+#                    chords -- a settings pick is the deterministic exec
+#                    row, go-wm-seat run 15's exact leg)
+#     ctrl-shift-w   M121b close of the STILL-FOCUSED tab: GOSET's exec
+#                    is in flight but its declare cannot have landed
+#                    (0.25 s/stroke vs a >=1 s measured-boot declare), so
+#                    the close provably hits GOEDIT -> `host close id=` +
+#                    `tab close id=` + `close`, focus falls to GOTERM
+#                    (badge -> term)
+#     ctrl-shift-t   M121b reopen: `gotabwm: reopen GOEDIT.ELF` pops the
+#                    LIFO the close just pushed; the re-exec declares
+#                    after the batch ends
+#
+#   goedit: state restored  script c: the run's echo. The re-exec'd
+#                        editor's own restore receipt is the journey's
+#                        last link -- it can only print after the reopen
+#                        round-tripped bin -> re-exec -> declare ->
+#                        restore_answer. `gotabwm: rail n=3` was tried
+#                        first and is NOT a usable anchor: markRail
+#                        dedupes on (n,focus) and the seat's composite
+#                        paints starve behind the chord backlog, so the
+#                        three-tab state never earned a print (observed
+#                        first run: n=3 unprinted while tabs=3 stood).
+#
+# Why nothing follows an exec/reopen chord inside the batch: cv-input
+# paces one batch at a fixed 0.25 s/stroke (the go-wm-hid run-16 note),
+# and a re-exec'd or exec'd app declares seconds later -- any chord that
+# needed the NEW focus would land on the OLD one. Every leg after the
+# palette's `return` is therefore a seat-scope chord acting on the
+# pre-declare focus, which is exactly what makes the close target
+# provable instead of racy.
+vgate_file script-09a.txt <<'EOF'
+dui focus 0
+set GOMAXPROCS=1
+exec GOTERM.ELF
+EOF
+
+vgate_file script-09b.txt <<'EOF'
+exec GOEDIT.ELF
+EOF
+
+vgate_file script-09c.txt <<'EOF'
+dui
+echo rx-m121f-ok
+EOF
+
+vgate_run 09 -- \
+    --via-virtio --cvc-snap \
+    --screen '$RUN_DIR/screen-09' \
+    --snapshot-out '$RUN_DIR/snap-09' \
+    --snapshot-after 'gotabwm: palette open n=' \
+    --snapshot-after 'goedit: state restored' \
+    --script '$RUN_DIR/script-09a.txt' \
+    --script-after 'dogfood: seat' \
+    --script2 '$RUN_DIR/script-09b.txt' \
+    --script2-after 'goterm: ready' \
+    --input-chords 'x,y,z,?,down,down,down,down,down,down,escape,ctrl-z,ctrl-shift-pageup,ctrl-shift-pagedown,ctrl-shift-n,ctrl-shift-p,s,e,t,t,return,ctrl-shift-w,ctrl-shift-t' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script-09c.txt' \
+    --script3-after 'goedit: state restored' \
+    --script-expect 'rx-m121f-ok' --timeout 420
+
+# The LIVE default seat, restored-empty: no starter GOSH, no demo
+# choreography, no persisted wm row (the whole point of this spec).
+vgate_assert 09 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 09 serial-contains 'gotabwm: mode live'
+vgate_assert 09 serial-absent 'gotabwm: mode demo'
+vgate_assert 09 serial-absent 'dogfood: gosh'
+
+# --- the two exec'd tabs ---------------------------------------------------
+vgate_assert 09 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 09 serial-contains 'goterm: declare accepted'
+vgate_assert 09 serial-contains 'goterm: ready'
+vgate_assert 09 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 09 serial-contains 'goedit: declare accepted'
+vgate_assert 09 serial-contains 'goedit: present'
+vgate_assert 09 serial-contains 'gotabwm: rail n=2'
+
+# --- the typed run: the seat saw the keys, the buffer went dirty ----------
+vgate_assert 09 serial-contains 'gotabwm: key'
+vgate_assert 09 serial-contains 'goedit: dirty'
+
+# --- M121c leg: '?' opens the registry-fed overlay; Esc closes it ---------
+# n= is the live registry's own row count for GOEDIT (the app's rows plus
+# the seat's globals -- 33 at this revision); the two rows below are the
+# journey's own chords made visible -- the palette's summon and the undo
+# dispatch.
+vgate_assert 09 serial-contains 'goedit: hints n=33'
+vgate_assert 09 serial-contains 'goedit: hints row ctrl+shift+p summon the command palette'
+vgate_assert 09 serial-contains 'goedit: hints row ctrl+z dispatch undo'
+vgate_assert 09 serial-contains 'goedit: hints close'
+
+# --- M121e leg: ctrl+z routed to the focused tab; the ring reverted -------
+vgate_assert 09 serial-contains 'gotabwm: undo id='
+vgate_assert 09 serial-contains 'goedit: undo n=0'
+vgate_assert 09 serial-absent 'goedit: undo none'
+# The revert's own paint: the buffer returned to the startup-empty state,
+# so the M123b plate marker fired a second time.
+vgate_assert 09 serial-contains 'goedit: empty '
+
+# --- M121b legs: move pair, pin, close, reopen -----------------------------
+vgate_assert 09 serial-count 'gotabwm: reorder ' 2
+vgate_assert 09 serial-contains 'gotabwm: pin id='
+vgate_assert 09 serial-contains 'gotabwm: host close id='
+vgate_assert 09 serial-contains 'gotabwm: tab close id='
+vgate_assert 09 serial-contains 'gotabwm: close'
+vgate_assert 09 serial-contains 'gotabwm: reopen GOEDIT.ELF'
+vgate_assert 09 serial-absent 'gotabwm: reopen missing '
+
+# --- M121a leg: palette open -> subsequence filter -> exec ----------------
+vgate_assert 09 serial-contains 'gotabwm: palette open n='
+vgate_assert 09 serial-contains 'gotabwm: palette filter q=sett n='
+vgate_assert 09 serial-contains 'gotabwm: palette exec GOSET.ELF'
+vgate_assert 09 serial-contains 'gotabwm: palette dismiss'
+vgate_assert 09 serial-absent 'gotabwm: palette missing '
+vgate_assert 09 serial-absent 'gotabwm: palette empty'
+# A seat-spawned exec prints no `exec: loaded` (that is the monitor
+# command's line); the measured-boot receipt is the kernel-side record.
+vgate_assert 09 serial-contains 'verdict=measured name=GOSET.ELF'
+vgate_assert 09 serial-contains 'goset: declare accepted'
+vgate_assert 09 serial-contains 'goset: open id='
+
+# --- the landing: both async declares made their own receipts -------------
+# GOSET's declare/ready/open lines are its hosted proof; the reopened
+# GOEDIT's `state restored` is the reopen's -- it can only print on the
+# LIFO's re-exec path, never on a fresh exec.
+vgate_assert 09 serial-contains 'goset: ready '
+vgate_assert 09 serial-contains 'goset: present'
+vgate_assert 09 serial-contains 'goedit: state restored'
+vgate_assert 09 serial-count 'goedit: declare accepted' 2
+# Four tab opens over the boot: GOTERM, GOEDIT, the palette's GOSET, and
+# the re-exec'd GOEDIT the reopen raised.
+vgate_assert 09 serial-count 'gotabwm: tab open id=' 4
+vgate_assert 09 serial-contains 'gotabwm: live steady tabs='
+vgate_assert 09 serial-contains 'rx-m121f-ok'
+
+# --- M121d leg: the badge's transition lines -------------------------------
+vgate_assert 09 serial-contains 'gotabwm: focus scope=seat'
+vgate_assert 09 serial-contains 'gotabwm: focus scope=term title=Term'
+vgate_assert 09 serial-contains 'gotabwm: focus scope=app title=Edit'
+
+# --- zero-pointer proof -----------------------------------------------------
+# No pointer phase was armed, and none of the pointer-produced markers
+# exist: the rail-click, the tty drag-select pair, and the drag/drop
+# family are all pointer-only paths (boot 04 and boot 08 carry them).
+vgate_assert 09 serial-absent 'gotabwm: rail-click'
+vgate_assert 09 serial-absent 'dui: term sel'
+vgate_assert 09 serial-absent 'gotabwm: drag'
+
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
+
+# M123e (#2579): no serial-only refusals in this boot -- every `rc=-<n>` /
+# `refuse[d]` line pairs with a UI-surface marker (rules in refusal-pair.py).
+vgate_assert 09 python <<'PY'
+import os
+exec(compile(open(os.path.join(os.environ["RUN_DIR"], "refusal-pair.py")).read(),
+             "refusal-pair.py", "exec"))
+PY
+
+# The journey as ONE ordered chain -- each marker located strictly after
+# the one before it, so no leg can pass on a stale or reordered log.
+vgate_assert 09 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+def at(sub, start=0):
+    i = ser.find(sub, start)
+    if i < 0:
+        sys.exit("missing %r (after %d)" % (sub, start))
+    return i
+i_seat = at("dogfood: seat")
+i_term = at("goterm: ready", i_seat)
+i_edit = at("goedit: present", i_term)
+i_dirty = at("goedit: dirty", i_edit)
+i_hints = at("goedit: hints n=", i_dirty)
+i_hclose = at("goedit: hints close", i_hints)
+i_uroute = at("gotabwm: undo id=", i_hclose)
+i_undo = at("goedit: undo n=0", i_uroute)
+i_move = at("gotabwm: reorder ", i_undo)
+i_pin = at("gotabwm: pin id=", i_move)
+i_popen = at("gotabwm: palette open n=", i_pin)
+i_pfilter = at("gotabwm: palette filter q=sett n=", i_popen)
+i_pexec = at("gotabwm: palette exec GOSET.ELF", i_pfilter)
+i_close = at("gotabwm: tab close id=", i_pexec)
+i_reopen = at("gotabwm: reopen GOEDIT.ELF", i_close)
+i_gset = at("goset: declare accepted", i_pexec)
+i_edit2 = at("goedit: declare accepted", i_reopen)
+i_rest = at("goedit: state restored", i_edit2)
+i_ok = at("rx-m121f-ok", i_rest)
+print("M121f journey chain OK: seat -> goterm -> goedit -> dirty -> "
+      "hints -> hints-close -> undo-route -> undo -> reorder -> pin -> "
+      "palette -> filter -> exec -> close -> reopen -> state-restored "
+      "(goset declare@%d, edit redeclare@%d)" % (i_gset, i_edit2))
+PY
+
+# The M121d badge's serial order, as an ordered subsequence (extra lines
+# are legal -- GOTERM's retitle can re-report, and the two trailing
+# declares race): boot seat -> GOTERM's declare (term) -> GOEDIT's
+# declare (app) -> the palette's seat-modal sink -> back to Edit on
+# dismiss -> the close landing on term -> both exec'd apps reach the
+# badge, in either order.
+vgate_assert 09 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = [(m.start(), m.group(1), (m.group(2) or "").strip())
+         for m in re.finditer(
+             r"(?m)^gotabwm: focus scope=(\w+)(?: title=(.*))?$", ser)]
+popen = ser.index("gotabwm: palette open n=")
+close = ser.index("gotabwm: tab close id=")
+
+def match(chain, seq, label):
+    i = 0
+    for want_s, want_t in chain:
+        while i < len(seq) and not (seq[i][1] == want_s
+                                    and seq[i][2].startswith(want_t)):
+            i += 1
+        if i >= len(seq):
+            sys.exit("badge walk: no %r in %s (lines seen: %r)"
+                     % ((want_s, want_t), label, seq))
+        i += 1
+
+# The whole-run walk, as an ordered subsequence: boot seat -> TERM's
+# declare -> Edit's declare -> palette's seat modal -> dismiss back to
+# Edit -> the exec'd Settings declare -> a term landing (the close's
+# fallback) -> the reopened Edit. GOTERM's retitle may re-report and the
+# trailing declares race, so extras are tolerated, not listed.
+match([("seat", ""), ("term", "Term"), ("app", "Edit"),
+       ("seat", ""), ("app", "Edit"), ("app", "Settings"),
+       ("term", "Term"), ("app", "Edit")],
+      lines, "journey")
+print("M121d badge walk OK: seat -> Term -> Edit -> seat(palette) -> "
+      "Edit -> Settings -> Term -> Edit")
+PY
+
+# ---------------------------------------------------------------------------
+# The pixel legs -- two kind-4 raws: the palette's plate and the badge's
+# own rect. The '?' overlay's pixel leg was cut after two observed misses:
+# the host's marker->capture latency outlives the overlay's ~1.75 s open
+# window at this log size (the PNG lands post-Esc on the editor's own
+# dark field, which is inside the Surface tolerance) -- and the overlay's
+# `hints row` dump is BY DESIGN its painted content ("the serial-readable
+# copy of the plate"), so the serial pins carry this leg's proof.
+# ---------------------------------------------------------------------------
+
+# snap-09-0.raw: the palette's plate -- the launcher's second face paints
+# the left strip (x 0..264, full height): Surface fill, the Accent edge
+# rule (observed at x~252 under the seat's padding, not a pinned column),
+# and field/row ink.
+vgate_assert 09 snapshot 'snap-09-0.raw' <<'PY'
+import sys
+from collections import Counter
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot is %d bytes, want %d" % (len(raw), W * H * 4))
+def px(x, y):
+    o = (y * W + x) * 4
+    return (raw[o + 2], raw[o + 1], raw[o])
+modal = Counter(); accent = ink = total = 0
+for y in range(30, 700):
+    for x in range(4, 258):
+        r, g, b = px(x, y)
+        total += 1
+        modal[(r, g, b)] += 1
+        if min(r, g, b) >= 150:
+            ink += 1
+        if abs(r - 0x3b) <= 48 and abs(g - 0x82) <= 48 and abs(b - 0xf6) <= 48:
+            accent += 1
+best, best_n = modal.most_common(1)[0]
+dist = max(abs(best[0] - 0x22), abs(best[1] - 0x2d), abs(best[2] - 0x35))
+print("palette strip %d px: modal=#%02x%02x%02x n=%d ink=%d accent=%d"
+      % (total, best[0], best[1], best[2], best_n, ink, accent))
+assert dist <= 4, ("the palette strip is not Surface-filled (modal "
+    "#%02x%02x%02x) -- the plate did not paint" % (best[0], best[1], best[2]))
+assert best_n >= total // 2, "palette strip not covered by its plate"
+assert accent >= 100, "no Accent edge rule / field ring on the palette (%d)" % accent
+assert ink >= 100, "no field/row ink inside the palette (%d)" % ink
+PY
+
+# snap-09-1.raw: the M121d badge's own rect after the reopen's restore --
+# the same tokens the go-wm-seat run-20 check pins: the ChromeBg panel,
+# the Accent scope chip/rule and Ink title text, BGRX-decoded here.
+vgate_assert 09 snapshot 'snap-09-1.raw' <<'PY'
+import sys
+from collections import Counter
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot is %d bytes, want %d" % (len(raw), W * H * 4))
+def px(x, y):
+    o = (y * W + x) * 4
+    return (raw[o + 2], raw[o + 1], raw[o])
+x0, y0, pw, ph = 1124 - 4 - 216, 720 - 8 - 20, 216, 20
+modal = Counter(); accent = ink = total = 0
+for y in range(y0, y0 + ph):
+    for x in range(x0, x0 + pw):
+        r, g, b = px(x, y)
+        total += 1
+        modal[(r, g, b)] += 1
+        if min(r, g, b) >= 150:
+            ink += 1
+        if abs(r - 0x3b) <= 32 and abs(g - 0x82) <= 32 and abs(b - 0xf6) <= 32:
+            accent += 1
+best, best_n = modal.most_common(1)[0]
+dist = max(abs(best[0] - 0x11), abs(best[1] - 0x17), abs(best[2] - 0x1c))
+print("badge rect %dx%d (%d px): modal=#%02x%02x%02x n=%d accent=%d ink=%d"
+      % (pw, ph, total, best[0], best[1], best[2], best_n, accent, ink))
+assert dist <= 4, ("the badge rect is not the seat's ChromeBg (modal "
+    "#%02x%02x%02x) -- the panel was not painted"
+    % (best[0], best[1], best[2]))
+assert best_n >= 3000, "the badge panel does not cover its rect"
+assert accent > ph, "no scope chip / seat rule on the badge"
+assert ink >= 20, "no title text on the badge"
 PY
