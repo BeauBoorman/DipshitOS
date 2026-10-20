@@ -70,6 +70,12 @@ const (
 	// honest line.
 	MarkerModeDemo   = "gotabwm: mode demo"
 	MarkerModeLive   = "gotabwm: mode live"
+	// The mailbox is live from the loop's first serviceRPC — the arming
+	// marker for a guest exec that must not declare into an unserved seat
+	// (the startup probe's bounded waits can outlast the client's 8-tick
+	// ack budget; observed t3 'not-tab-aware' with the serve landing after
+	// the client had already timed out).
+	MarkerServing = "gotabwm: serving"
 	MarkerLiveSteady = "gotabwm: live steady "
 	// M69a (issue #1528): the dogfood beat's own two markers, owned by
 	// go-dogfood.spec. MarkerDogfoodSeat is the DEFAULT seat announcing it owns
@@ -424,6 +430,7 @@ func main() {
 		tickLimit += hostTicks
 	}
 	presents, ticks := 0, 0
+	vi.ConsoleLine(MarkerServing)
 	for events := 0; !demoMode || (events < maxEvents && ticks < tickLimit); {
 		serviceRPC()
 		noteBadgeTransition()

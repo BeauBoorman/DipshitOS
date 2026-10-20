@@ -772,6 +772,10 @@ fn sbReadByte(ctx: *anyopaque) ?u8 {
     const sc: *ScrollbackCtx = @ptrCast(@alignCast(ctx));
     return sc.inner.readByte();
 }
+fn sbPushByte(ctx: *anyopaque, b: u8) bool {
+    const sc: *ScrollbackCtx = @ptrCast(@alignCast(ctx));
+    return sc.inner.pushByte(b);
+}
 
 /// M18 T1: the scrollback wrapper's vtable is built at runtime into BSS,
 /// NOT a const table — a const table holds link-time absolute function
@@ -788,6 +792,7 @@ fn ensure_scrollback_vtable() *const console.Console.VTable {
             .write = sbWrite,
             .flush = sbFlush,
             .readByte = sbReadByte,
+            .pushByte = sbPushByte,
         };
         scrollback_vtable_ready = true;
     }

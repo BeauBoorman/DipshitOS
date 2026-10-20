@@ -3145,6 +3145,12 @@ fn handle_tty_attach(args: Args, _: *exceptions.VectorFrame) u64 {
     const t = terminal.get(th) orelse return error_result(.einval);
     switch (args[0]) {
         0 => {
+            // The serial handover (GOSH's `monitor` builtin): input the
+            // session pumped but never consumed returns to the console RX,
+            // so the monitor — the front-end this detach hands the console
+            // back to — reads the type-ahead instead of the dead session
+            // taking it. Net detaches close the listener instead.
+            if (t.front_end == .serial) _ = terminal.pushBackRuntimeInput(t);
             if (t.front_end == .net) tcp.reset(); // close the listener/session
             t.detach();
             return 0;

@@ -2432,6 +2432,7 @@ const M15Console = struct {
                 .write = writeFn,
                 .flush = flushFn,
                 .readByte = readByteFn,
+                .pushByte = pushByteFn,
             };
             vtable_ready = true;
         }
@@ -2486,6 +2487,14 @@ const M15Console = struct {
         virtio_custom.console_tee_flush_partial();
         if (console_kind == .virtio) return virtio_console.virtio_read_byte();
         return null;
+    }
+
+    /// Input pushback for the serial front-end's detach handover: requeue a
+    /// byte the dead session pumped but never read. virtio only — the
+    /// UART fallback has no RX path to requeue onto.
+    fn pushByteFn(_: *anyopaque, b: u8) bool {
+        if (console_kind != .virtio) return false;
+        return virtio_console.rx_pushback(b);
     }
 
     fn to_console(self: *Self) console.Console {

@@ -204,11 +204,20 @@ vgate_file script-t1c.txt <<'EOF'
 echo ux-t1-done
 EOF
 
+# The NOTE exec arms on 'gotabwm: serving' — the live loop's first
+# serviceRPC — never on 'gotabwm: win focus': the focus probe sits inside
+# runWindowPhase, ahead of the mailbox serving, so a declare launched there
+# can out-wait its 8-tick ack budget while the seat is still mid-probe
+# (observed t3 flake: 'not-tab-aware' + a late 'session write n=1'). The
+# done-echo arms on 'note: ready' — the app's own post-declare marker —
+# for the same reason: the write lands inside the SERVE, before the reply
+# reaches NOTE, so an earlier arming could end the run while the ack-bound
+# 'note: tab-aware' print was still tick-parked.
 vgate_run t1 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
   --overlay-base '$RUN_DIR/base.img' --screen '$RUN_DIR/screen-t1' \
   --script '$RUN_DIR/script-t1.txt' \
-  --script2 '$RUN_DIR/script-t1b.txt' --script2-after 'gotabwm: win focus' \
-  --script3 '$RUN_DIR/script-t1c.txt' --script3-after 'gotabwm: session write n=1' \
+  --script2 '$RUN_DIR/script-t1b.txt' --script2-after 'gotabwm: serving' \
+  --script3 '$RUN_DIR/script-t1c.txt' --script3-after 'note: ready' \
   --host-cmd-after 'virelai> :apply-update' \
   --script-expect 'ux-t1-done' --timeout 180
 vgate_assert t1 serial-contains 'exec: loaded GOTABWM.ELF'
@@ -220,6 +229,15 @@ vgate_assert t1 output-contains 'host-ui: cmd=apply-update state=disabled staged
 vgate_assert t1 serial-absent '[EXC]'
 vgate_assert t1 python <<'PY'
 import os, sys
+# WINDOWS.SAV hygiene FIRST: the kernel's own window restore (M21 W11)
+# reopens every window left open at save time as an owner=99 shadow, so a
+# leg that ends with windows up starves the NEXT boot's seat of user slots
+# (t3/u2 observed: 'win open failed -5'). Wipe it before the asserts so
+# even a failing leg leaves a clean window space for the next boot; the
+# seat's own SESSION.TABS restore is this journey's restore path.
+_wsav = os.path.join(os.environ["RUN_DIR"], "prof.virelaivm", "share", "WINDOWS.SAV")
+if os.path.exists(_wsav):
+    os.remove(_wsav)
 p = os.path.join(os.environ["RUN_DIR"], "prof.virelaivm", "share", "SESSION.TABS")
 try:
     b = open(p, "rb").read()
@@ -257,7 +275,7 @@ vgate_run u1 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --script3 '$RUN_DIR/script-u1c.txt' --script3-after 'gosnap: ready n=' \
   --script-expect 'gosnap: save UX-1 ok' --script-expect-tail 6 --timeout 300
 vgate_assert u1 serial-contains 'gotabwm: session load n=1 mode=restore'
-vgate_assert u1 serial-contains 'gotabwm: session titles=Notepad pin=0 active=0'
+vgate_assert u1 serial-contains 'gotabwm: session titles='
 vgate_assert u1 serial-contains 'gotabwm: session reexec n=1'
 vgate_assert u1 serial-contains 'gotabwm: session exec NOTE.ELF'
 vgate_assert u1 serial-contains 'gotabwm: session live n=1'
@@ -275,6 +293,9 @@ import os, re, sys
 from pathlib import Path
 run = Path(os.environ["RUN_DIR"])
 ser = (Path(os.environ["VG_SER"])).read_bytes()
+_wsav = run / "prof.virelaivm" / "share" / "WINDOWS.SAV"
+if _wsav.exists():
+    _wsav.unlink()
 # The M120b bound: the re-exec'd row's window is a REAL kernel id (< the
 # 0x100 placeholder base), adopted in place by the app's own declare.
 ids = [int(m.group(1)) for m in
@@ -284,6 +305,10 @@ if not ids:
 bad = [i for i in ids if i >= 0x100]
 if bad:
     sys.exit("restored row kept placeholder ids %r (want < 0x100)" % bad)
+# The recorded title is the LIVE one: 'Notepad' when the strip wrote before
+# the rename's mutation flushed, 'notes.txt' when it landed — both honest.
+if not re.search(rb"session titles=(Notepad|notes\.txt) pin=0 active=0", ser):
+    sys.exit("titles row not '(Notepad|notes.txt) pin=0 active=0'")
 snap = run / "prof.virelaivm" / "share" / "SNAPSHOTS" / "UX-1.vzsave"
 assert snap.exists() and snap.stat().st_size > 0, "UX-1 never parked"
 print("u1: live ids %s; UX-1 parked (%d bytes)" % (ids, snap.stat().st_size))
@@ -484,7 +509,8 @@ if h(os.path.join(run, "base.img")) != want:
 shutil.rmtree(applied)
 for p in (os.path.join(share, "UPDATE"),
           os.path.join(run, "base.img.prev"),
-          os.path.join(share, "SESSION.TABS")):
+          os.path.join(share, "SESSION.TABS"),
+          os.path.join(share, "WINDOWS.SAV")):
     if os.path.isdir(p):
         shutil.rmtree(p)
     elif os.path.exists(p):
@@ -510,8 +536,8 @@ EOF
 vgate_run t2 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
   --overlay-base '$RUN_DIR/base.img' --screen '$RUN_DIR/screen-t2' \
   --script '$RUN_DIR/script-t2.txt' \
-  --script2 '$RUN_DIR/script-t2b.txt' --script2-after 'gotabwm: win focus' \
-  --script3 '$RUN_DIR/script-t2c.txt' --script3-after 'gotabwm: session write n=1' \
+  --script2 '$RUN_DIR/script-t2b.txt' --script2-after 'gotabwm: serving' \
+  --script3 '$RUN_DIR/script-t2c.txt' --script3-after 'note: ready' \
   --host-cmd-after 'virelai> :apply-update' \
   --script-expect 'ux-t2-done' --timeout 180
 vgate_assert t2 serial-contains 'gotabwm: session write n=1'
@@ -520,6 +546,9 @@ vgate_assert t2 output-contains 'host-ui: cmd=apply-update state=disabled staged
 vgate_assert t2 serial-absent '[EXC]'
 vgate_assert t2 python <<'PY'
 import os, sys
+_wsav = os.path.join(os.environ["RUN_DIR"], "prof.virelaivm", "share", "WINDOWS.SAV")
+if os.path.exists(_wsav):
+    os.remove(_wsav)
 b = open(os.path.join(os.environ["RUN_DIR"], "prof.virelaivm", "share",
                       "SESSION.TABS"), "rb").read()
 assert b[0] == 2 and b[2] == 1 and b[51:75].split(b"\x00",1)[0] == b"NOTE.ELF", \
@@ -560,6 +589,9 @@ import os, re, sys
 from pathlib import Path
 run = Path(os.environ["RUN_DIR"])
 ser = (Path(os.environ["VG_SER"])).read_bytes()
+_wsav = run / "prof.virelaivm" / "share" / "WINDOWS.SAV"
+if _wsav.exists():
+    _wsav.unlink()
 ids = [int(m.group(1)) for m in
        re.finditer(rb"gotabwm: tab open id=(\d+)", ser)]
 assert ids and all(i < 0x100 for i in ids), "live ids under 0x100: %r" % ids
@@ -716,7 +748,8 @@ if h(os.path.join(run, "base.img")) != open(os.path.join(run, "base.sha")).read(
 shutil.rmtree(os.path.join(share, "UPDATE.APPLIED"))
 for p in (os.path.join(share, "UPDATE"),
           os.path.join(run, "base.img.prev"),
-          os.path.join(share, "SESSION.TABS")):
+          os.path.join(share, "SESSION.TABS"),
+          os.path.join(share, "WINDOWS.SAV")):
     if os.path.isdir(p):
         shutil.rmtree(p)
     elif os.path.exists(p):
@@ -741,7 +774,7 @@ EOF
 vgate_run t3 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.virelaivm/share' \
   --overlay-base '$RUN_DIR/base.img' --screen '$RUN_DIR/screen-t3' \
   --script '$RUN_DIR/script-t3.txt' \
-  --script2 '$RUN_DIR/script-t3b.txt' --script2-after 'gotabwm: win focus' \
+  --script2 '$RUN_DIR/script-t3b.txt' --script2-after 'gotabwm: serving' \
   --script3 '$RUN_DIR/script-t3c.txt' --script3-after 'gotabwm: session write n=1' \
   --host-cmd-after 'virelai> :apply-update' \
   --script-expect 'ux-t3-done' --timeout 180
@@ -751,6 +784,9 @@ vgate_assert t3 output-contains 'host-ui: cmd=apply-update state=disabled staged
 vgate_assert t3 serial-absent '[EXC]'
 vgate_assert t3 python <<'PY'
 import os, sys
+_wsav = os.path.join(os.environ["RUN_DIR"], "prof.virelaivm", "share", "WINDOWS.SAV")
+if os.path.exists(_wsav):
+    os.remove(_wsav)
 b = open(os.path.join(os.environ["RUN_DIR"], "prof.virelaivm", "share",
                       "SESSION.TABS"), "rb").read()
 assert b[0] == 2 and b[2] == 1 and b[51:75].split(b"\x00",1)[0] == b"NOTE.ELF"
@@ -790,6 +826,9 @@ import os, re, sys
 from pathlib import Path
 run = Path(os.environ["RUN_DIR"])
 ser = (Path(os.environ["VG_SER"])).read_bytes()
+_wsav = run / "prof.virelaivm" / "share" / "WINDOWS.SAV"
+if _wsav.exists():
+    _wsav.unlink()
 ids = [int(m.group(1)) for m in
        re.finditer(rb"gotabwm: tab open id=(\d+)", ser)]
 assert ids and all(i < 0x100 for i in ids), "live ids under 0x100: %r" % ids

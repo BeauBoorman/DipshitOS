@@ -27,6 +27,7 @@ const mmu = @import("mmu.zig");
 const pci = @import("pci.zig");
 const evidence = @import("evidence.zig");
 const spinlock = @import("spinlock.zig");
+const klog = @import("klog.zig");
 
 // Claim 0020: TX-transition matrix phases. Each option is default off; a
 // default build is byte-identical. A diagnostic build enables exactly ONE
@@ -160,6 +161,14 @@ var virtio_rx_fifo: [512]u8 = undefined;
 var virtio_rx_fifo_head: usize = 0;
 var virtio_rx_fifo_len: usize = 0;
 var virtio_rx_armed: bool = false;
+// Handed-back front-end input: bytes a detaching serial front-end pumped
+// but never consumed return here (sys_tty_attach selector 0), read BEFORE
+// the device FIFO so the monitor sees the type-ahead before newer host
+// arrivals. Plain guest RAM, so the lane rides the suspend image like the
+// rings it fronts.
+var virtio_rx_inject: [256]u8 = undefined;
+var virtio_rx_inject_head: usize = 0;
+var virtio_rx_inject_len: usize = 0;
 
 fn vp_read8(off: u32) u8 {
     return mmio.mmio_read8(vp_common + off);
@@ -787,6 +796,14 @@ fn rx_fifo_pop() u8 {
 /// pre-exit-captured VAs — the transport is reachable since claim 1517.
 pub fn virtio_read_byte() ?u8 {
     if (!virtio_rx_armed) return null;
+    // Handed-back front-end input first: it is older than anything the
+    // device has delivered since.
+    if (virtio_rx_inject_len > 0) {
+        const b = virtio_rx_inject[virtio_rx_inject_head];
+        virtio_rx_inject_head = (virtio_rx_inject_head + 1) % virtio_rx_inject.len;
+        virtio_rx_inject_len -= 1;
+        return b;
+    }
     // Drain bytes already received on an earlier poll first.
     if (virtio_rx_fifo_len > 0) return rx_fifo_pop();
     // Poll the used ring (device-written RAM; invalidate its line first).
@@ -824,6 +841,25 @@ pub fn virtio_read_byte() ?u8 {
 /// instead of parking).
 pub fn rx_armed() bool {
     return virtio_rx_armed;
+}
+
+/// Queue a byte for a FUTURE `virtio_read_byte` — the serial front-end's
+/// detach path returns the input its dying session pumped but never read.
+/// Returns false (byte refused) when unarmed or the inject lane is full;
+/// the caller then keeps its usual drop accounting. Never blocks.
+var rx_pushback_refused_reported = false;
+
+pub fn rx_pushback(b: u8) bool {
+    if (!virtio_rx_armed or virtio_rx_inject_len >= virtio_rx_inject.len) {
+        if (!rx_pushback_refused_reported) {
+            rx_pushback_refused_reported = true;
+            klog.line(if (virtio_rx_armed) "pushback: refused (inject full)\n" else "pushback: refused (unarmed)\n");
+        }
+        return false;
+    }
+    virtio_rx_inject[(virtio_rx_inject_head + virtio_rx_inject_len) % virtio_rx_inject.len] = b;
+    virtio_rx_inject_len += 1;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

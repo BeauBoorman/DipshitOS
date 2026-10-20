@@ -377,11 +377,29 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 	}
 
 	var readBuf [64]byte
+	// The serial front-end reads ONE byte per FileRead: a chunk read parks
+	// the bytes after a submit in the editor's pending hold, and a `monitor`
+	// exit would take that type-ahead down with the dying session instead of
+	// handing it to the kernel monitor that owns the console next. The
+	// kernel-side half of the handover (the detach's input pushback) only
+	// sees bytes still in the terminal, so the tail must never be pulled
+	// into userspace ahead of its submit.
+	var serialByte [1]byte
+	serial := ta == nil && auth == nil
 	for {
 		auth.Step()
-		n, _ := vi.FileRead(fd, readBuf[:])
+		var n int
+		if serial {
+			n, _ = vi.FileRead(fd, serialByte[:])
+		} else {
+			n, _ = vi.FileRead(fd, readBuf[:])
+		}
 		if n > 0 {
-			handle(editor.Feed(readBuf[:n]))
+			if serial {
+				handle(editor.Feed(serialByte[:n]))
+			} else {
+				handle(editor.Feed(readBuf[:n]))
+			}
 		}
 		for editor.Pending() {
 			handle(editor.Feed(nil))

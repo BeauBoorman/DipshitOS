@@ -105,12 +105,20 @@ pub const State = struct {
         return self.base.readByte();
     }
 
+    fn pushByteFn(ctx: *anyopaque, b: u8) bool {
+        const self: *State = @ptrCast(@alignCast(ctx));
+        // The tee reads its base when the keyboard source is dry, so handed
+        // back serial input requeues on the base's own lane.
+        return self.base.pushByte(b);
+    }
+
     fn ensure_vtable(self: *State) *const console.Console.VTable {
         if (!self.vtable_ready) {
             self.vtable_storage = .{
                 .write = writeFn,
                 .flush = flushFn,
                 .readByte = readByteFn,
+                .pushByte = pushByteFn,
             };
             self.vtable_ready = true;
         }

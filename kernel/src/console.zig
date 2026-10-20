@@ -45,6 +45,11 @@ pub const Console = struct {
         /// (the milestone-two uart, until the VZ serial gate proves a
         /// device) returns null always. Never blocks, never allocates.
         readByte: *const fn (ctx: *anyopaque) ?u8,
+        /// Optional input pushback: transports that can requeue a byte for a
+        /// future readByte implement it (the serial front-end's detach path
+        /// returns input its dying session pumped but never read). Null =
+        /// the transport cannot take input back; the byte drops.
+        pushByte: ?*const fn (ctx: *anyopaque, b: u8) bool = null,
     };
 
     pub fn write(self: Console, bytes: []const u8) void {
@@ -61,6 +66,13 @@ pub const Console = struct {
     /// instead of spinning.
     pub fn readByte(self: Console) ?u8 {
         return self.vtable.readByte(self.ctx);
+    }
+
+    /// Requeue one input byte for a future readByte; false when the
+    /// transport cannot take input back.
+    pub fn pushByte(self: Console, b: u8) bool {
+        const f = self.vtable.pushByte orelse return false;
+        return f(self.ctx, b);
     }
 
     pub fn putc(self: Console, byte: u8) void {
@@ -153,6 +165,7 @@ pub fn MockConsole(comptime capacity: usize) type {
             .write = writeFn,
             .flush = flushFn,
             .readByte = readByteFn,
+            .pushByte = pushByteFn,
         };
 
         // Output capture (existing).
@@ -172,6 +185,11 @@ pub fn MockConsole(comptime capacity: usize) type {
         input_len: usize = 0,
         input_pos: usize = 0,
         input_overflowed: bool = false,
+        // Pushed-back input (pushByte): a separate lane read BEFORE the fed
+        // queue, matching the serial lane's inject-first ordering — fed
+        // bytes model host input that arrives after the handback.
+        inject: [64]u8 = undefined,
+        inject_len: usize = 0,
 
         pub fn console(self: *Self) Console {
             return .{ .ctx = self, .vtable = &vtable };
@@ -203,6 +221,7 @@ pub fn MockConsole(comptime capacity: usize) type {
             self.input_len = 0;
             self.input_pos = 0;
             self.input_overflowed = false;
+            self.inject_len = 0;
         }
 
         fn writeFn(ctx: *anyopaque, bytes: []const u8) void {
@@ -225,10 +244,24 @@ pub fn MockConsole(comptime capacity: usize) type {
 
         fn readByteFn(ctx: *anyopaque) ?u8 {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.inject_len > 0) {
+                const byte = self.inject[0];
+                std.mem.copyForwards(u8, self.inject[0 .. self.inject_len - 1], self.inject[1..self.inject_len]);
+                self.inject_len -= 1;
+                return byte;
+            }
             if (self.input_pos >= self.input_len) return null;
             const byte = self.input[self.input_pos];
             self.input_pos += 1;
             return byte;
+        }
+
+        fn pushByteFn(ctx: *anyopaque, b: u8) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.inject_len >= self.inject.len) return false;
+            self.inject[self.inject_len] = b;
+            self.inject_len += 1;
+            return true;
         }
     };
 }

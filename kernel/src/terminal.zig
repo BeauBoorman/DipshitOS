@@ -3371,6 +3371,21 @@ pub const Terminal = struct {
         return true;
     }
 
+    /// Return the unread `in` bytes to a console's RX path, oldest first —
+    /// the serial-detach handover: input the owner pumped but never consumed
+    /// belongs to the front-end this detach hands the console back to, not
+    /// the dying session. Stops at the first byte the transport refuses.
+    /// Returns bytes moved.
+    pub fn pushBackInput(self: *Terminal, con: console.Console) usize {
+        var moved: usize = 0;
+        var b: [1]u8 = undefined;
+        while (self.readInput(&b) == 1) {
+            if (!con.pushByte(b[0])) break;
+            moved += 1;
+        }
+        return moved;
+    }
+
     /// Detach whatever front-end is attached (no-op when none).
     pub fn detach(self: *Terminal) void {
         self.attached = false;
@@ -4360,6 +4375,20 @@ pub fn pumpRuntimeOutput() usize {
     return pumpOutput(con);
 }
 
+/// Return `t`'s unread input to the runtime console's RX — the sys_tty_attach
+/// selector-0 half of `pumpRuntimeInput` (bytes pumped in come back out at
+/// the handover). A no-op before `setRuntimeConsole`.
+pub fn pushBackRuntimeInput(t: *Terminal) usize {
+    const con = runtime_console orelse {
+        klog.line("pushback: no runtime console\n");
+        return 0;
+    };
+    const moved = t.pushBackInput(con);
+    var dbuf: [48]u8 = undefined;
+    klog.line(std.fmt.bufPrint(&dbuf, "pushback: moved {d} fe={s}\n", .{ moved, @tagName(t.front_end) }) catch "pushback: moved ?\n");
+    return moved;
+}
+
 // ---------------------------------------------------------------------------
 // Tests (pure; no hardware)
 // ---------------------------------------------------------------------------
@@ -4520,6 +4549,39 @@ test "terminal: serial pump round-trips console input/output through an attached
     mock.feed("x");
     try std.testing.expectEqual(@as(usize, 0), pumpInput(con));
     try std.testing.expectEqual(@as(usize, 0), pumpOutput(con));
+    for (&terminals) |*tt| tt.reset();
+}
+
+test "terminal: serial detach returns unread input to the console in order" {
+    for (&terminals) |*t| t.reset();
+    var mock = console.MockConsole(256){};
+    const con = mock.console();
+
+    const h = create(5) orelse return error.TestUnexpectedResult;
+    const t = get(h).?;
+    try std.testing.expect(t.attach(.serial));
+
+    // The owner pumps a burst but consumes only its head — the M120f
+    // handover shape: `monitor\r` read, the probe tail still queued.
+    mock.feed("monitor\recho tail\r");
+    try std.testing.expectEqual(@as(usize, 18), pumpInput(con));
+    var head: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 8), t.readInput(&head));
+    try std.testing.expectEqualStrings("monitor\r", head[0..8]);
+
+    // The detach handover: the unread tail requeues on the console RX,
+    // oldest first, ahead of newer host input that arrives afterwards.
+    try std.testing.expectEqual(@as(usize, 10), t.pushBackInput(con));
+    t.detach();
+    mock.feed("late");
+    var back: [16]u8 = undefined;
+    var got: usize = 0;
+    while (con.readByte()) |b| {
+        back[got] = b;
+        got += 1;
+    }
+    try std.testing.expectEqualStrings("echo tail\rlate", back[0..got]);
+    try std.testing.expectEqual(@as(usize, 0), t.pendingInput());
     for (&terminals) |*tt| tt.reset();
 }
 
