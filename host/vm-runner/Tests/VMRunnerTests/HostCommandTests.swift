@@ -119,11 +119,11 @@ final class HostCommandTests: XCTestCase {
         XCTAssertEqual(sink.lines, ["host-ui: cmd=screenshot state=failed"])
     }
 
-    func testMenuBarIsTheFiveMenusOfBusActions() throws {
+    func testMenuBarIsTheSixMenusOfBusActions() throws {
         let bus = HostCommandBus()
         let bar = HostMenuBar.build(bus: bus)
         XCTAssertEqual(bar.items.compactMap { $0.submenu?.title },
-                       ["VirelaiOS", "Machine", "View", "Integration", "Debug"])
+                       ["VirelaiOS", "Machine", "View", "Integration", "Debug", "Help"])
         for top in bar.items {
             for entry in top.submenu?.items ?? [] where !entry.isSeparatorItem {
                 XCTAssertTrue(entry.target === bus, "\(entry.title) must dispatch on the bus")
@@ -135,6 +135,12 @@ final class HostCommandTests: XCTestCase {
         XCTAssertEqual(quit.keyEquivalent, "q")
         XCTAssertEqual(quit.keyEquivalentModifierMask, .command)
         XCTAssertEqual(quit.representedObject as? HostCommand, .quit)
+        // M122d (#2573): Help → Keyboard Shortcuts rides the ⌘/ chord
+        // onto the `shortcuts` verb like every other leaf.
+        let sheet = try XCTUnwrap(item(bar, "Keyboard Shortcuts", in: "Help"))
+        XCTAssertEqual(sheet.keyEquivalent, "/")
+        XCTAssertEqual(sheet.keyEquivalentModifierMask, .command)
+        XCTAssertEqual(sheet.representedObject as? HostCommand, .shortcuts)
     }
 
     func testMenuValidationMirrorsRegistration() throws {
@@ -170,6 +176,63 @@ final class HostCommandTests: XCTestCase {
         bus.dispatchItem(stop)
         XCTAssertEqual(stops, 1)
         XCTAssertEqual(sink.lines, ["host-ui: cmd=stop state=performed"])
+    }
+
+    // MARK: M122d (#2573) — the ⌘/ cheat sheet.
+
+    /// `shortcuts` is a self-registered companion verb: a bare bus
+    /// receipts `performed` with the open state + row count, and the
+    /// menu item's checkmark mirrors the model's isOpen.
+    func testShortcutsVerbReceiptsAndFlipsOpen() throws {
+        let sink = Sink()
+        let bus = makeBus(sink)
+        XCTAssertTrue(bus.isRegistered(.shortcuts), "shortcuts must self-register on the bus")
+        XCTAssertEqual(bus.dispatch(.shortcuts), .performed)
+        XCTAssertTrue(bus.shortcuts.isOpen)
+        XCTAssertEqual(bus.dispatch(.shortcuts), .performed)
+        XCTAssertFalse(bus.shortcuts.isOpen)
+        XCTAssertEqual(sink.lines, [
+            "host-ui: cmd=shortcuts state=performed open=1 chords=8",
+            "host-ui: cmd=shortcuts state=performed open=0 chords=8",
+        ])
+        // The checkmark is the model's own state — the Help item
+        // validates on while the sheet is up.
+        let bar = HostMenuBar.build(bus: bus)
+        let sheet = try XCTUnwrap(item(bar, "Keyboard Shortcuts", in: "Help"))
+        bus.shortcuts.isOpen = true
+        XCTAssertTrue(bus.validateMenuItem(sheet))
+        XCTAssertEqual(sheet.state, .on)
+    }
+
+    /// The cheat sheet's rows are GENERATED from the menu's command
+    /// table: every chorded leaf, in menu order, so the sheet can
+    /// never advertise a chord the menus do not know.
+    func testShortcutRowsAreTheMenuTableChords() {
+        let rows = HostShortcutsModel().rows
+        XCTAssertEqual(rows.count, HostMenuBar.chords.count)
+        XCTAssertEqual(rows.map { ($0.title, $0.chord, $0.command) }.map { "\($0.0)|\($0.1)|\($0.2.rawValue)" }, [
+            "Machine Settings…|⌘,|settings",
+            "Quit VirelaiOS|⌘Q|quit",
+            "Enter Full Screen|⌃⌘F|fullscreen",
+            "Capture System Keys|⌥⌘K|capture-keys",
+            "Inspector|⌥⌘I|inspector",
+            "Take Screenshot|⇧⌘5|screenshot",
+            "Record Window|⇧⌘6|record",
+            "Keyboard Shortcuts|⌘/|shortcuts",
+        ])
+    }
+
+    /// The sheet's view is the model's projection — one grid row per
+    /// model row, title + chord glyphs, nothing hand-kept.
+    func testShortcutsViewRendersTheModelRows() {
+        let model = HostShortcutsModel()
+        let view = HostShortcutsView(model: model)
+        XCTAssertEqual(view.titleText, "Keyboard Shortcuts")
+        XCTAssertEqual(view.rowCount, model.rows.count)
+        for (i, row) in model.rows.enumerated() {
+            XCTAssertEqual(view.rowTitle(i), row.title)
+            XCTAssertEqual(view.rowChord(i), row.chord)
+        }
     }
 
     func testSessionCommandsRouteThroughTheBus() {

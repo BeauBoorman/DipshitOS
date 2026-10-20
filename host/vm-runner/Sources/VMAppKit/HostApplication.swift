@@ -71,6 +71,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// HostSettingsModel.
     private var settingsPanel: NSPanel?
     private var settingsView: HostSettingsView?
+    /// M122d (#2573): the ⌘/ cheat-sheet panel — built lazily when the
+    /// `shortcuts` verb first opens it, a projection of the bus's
+    /// HostShortcutsModel (the settings panel's precedent).
+    private var shortcutsPanel: NSPanel?
+    private var shortcutsView: HostShortcutsView?
     /// M114b (#2455): the attached machine view, when it is one — the
     /// `capture-keys` verb toggles its `capturesSystemKeys`.
     private weak var captureTarget: HostKeyCapturing?
@@ -117,6 +122,34 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// freeze/resume choke), present only when the companion is armed.
     public static let agentToolbarItem = NSToolbarItem.Identifier("virelai.agent")
     private weak var agentPill: NSButton?
+    /// M122d (#2573): the expanded toolbar — each item a bus surface
+    /// like the menu leaf it mirrors (tap → dispatch, grey ← the verb's
+    /// own isEnabled). The lanes pill is the one multi-verb item: its
+    /// dropdown carries every lane toggle (the Integration menu's
+    /// toolbar twin).
+    public static let inspectorToolbarItem = NSToolbarItem.Identifier("virelai.inspector")
+    public static let screenshotToolbarItem = NSToolbarItem.Identifier("virelai.screenshot")
+    public static let recordToolbarItem = NSToolbarItem.Identifier("virelai.record")
+    public static let sendFileToolbarItem = NSToolbarItem.Identifier("virelai.send-file")
+    public static let lanesToolbarItem = NSToolbarItem.Identifier("virelai.lanes")
+    private weak var inspectorPill: NSButton?
+    private weak var screenshotPill: NSButton?
+    private weak var recordPill: NSButton?
+    private weak var sendFilePill: NSButton?
+    private weak var lanesPill: NSButton?
+    /// The verb each single-verb toolbar item dispatches — the lanes
+    /// and agent pills are the only items not in this table (one
+    /// carries a menu of verbs; the other keeps its M127e enablement).
+    private static let toolbarCommands: [NSToolbarItem.Identifier: HostCommand] = [
+        inspectorToolbarItem: .inspector,
+        screenshotToolbarItem: .screenshot,
+        recordToolbarItem: .record,
+        sendFileToolbarItem: .sendFile,
+        captureKeysToolbarItem: .captureKeys,
+    ]
+    /// The lane verbs the lanes pill's dropdown carries — the
+    /// Integration menu's toggle set (send-file has its own item).
+    public static let laneVerbs: [HostCommand] = [.laneClipboard, .laneDrop, .laneNotify, .laneAgent]
     /// M128c (#2607): a document-open landing on a live session — the
     /// boot shape was fixed at launch, so a `.virelaivm` click while this
     /// window exists is a second machine and is refused by name, never
@@ -295,6 +328,11 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         // --host-cmd-after), the panel follows; closing the panel
         // flips it back through windowWillClose.
         commandBus.settings.onChange = { [weak self] in self?.syncSettings() }
+        // M122d (#2573): the ⌘/ sheet mirrors the bus's shortcuts
+        // model — isOpen flips under the verb (the Help chord or a
+        // headless --host-cmd-after …:shortcuts), the panel follows;
+        // closing the panel flips it back through windowWillClose.
+        commandBus.shortcuts.onChange = { [weak self] in self?.syncShortcuts() }
         // M128b (#2606): the profile manager's session seams — the
         // confirm gate reads the live lifecycle state, asks through a
         // real NSAlert, and a confirmed switch ends this session (the
@@ -460,6 +498,39 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         settingsView?.reload()
     }
 
+    /// M122d (#2573): the ⌘/ cheat sheet's seams — the model's open
+    /// state and the panel's on-screen truth — the class-A reads
+    /// instead of poking AppKit (the settings panel's precedent).
+    public var shortcutsVisible: Bool { commandBus.shortcuts.isOpen }
+    public var shortcutsPanelVisible: Bool { shortcutsPanel?.isVisible ?? false }
+
+    /// Model → panel: the panel's visibility mirrors `isOpen` (built on
+    /// first open), and the view repaints on every model change. The
+    /// session's ⌘/ and a headless `--host-cmd-after …:shortcuts` land
+    /// the identical model flip.
+    private func syncShortcuts() {
+        let model = commandBus.shortcuts
+        if model.isOpen, shortcutsPanel == nil {
+            let view = HostShortcutsView(model: model)
+            let panel = NSPanel(contentRect: view.frame,
+                                styleMask: [.titled, .closable],
+                                backing: .buffered, defer: false)
+            panel.title = "Keyboard Shortcuts"
+            panel.contentView = view
+            panel.isReleasedWhenClosed = false
+            panel.delegate = self
+            shortcutsPanel = panel
+            shortcutsView = view
+        }
+        if model.isOpen {
+            shortcutsPanel?.center()
+            shortcutsPanel?.makeKeyAndOrderFront(nil)
+        } else {
+            shortcutsPanel?.orderOut(nil)
+        }
+        shortcutsView?.reload()
+    }
+
     /// Model → pane: the drawer's hidden flag mirrors `isOpen`, and an
     /// open gets a real share of the window (260pt, halved on a small
     /// one). Called on every model change — ingest batches included —
@@ -475,6 +546,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             }
         }
         drawer.reload()
+        // M122d (#2573): the toolbar pill's pressed state mirrors the
+        // drawer — one model, two surfaces.
+        inspectorPill?.state = open ? .on : .off
     }
 
     /// The badge + pill mirror the live `capturesSystemKeys` property —
@@ -491,6 +565,10 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         let recorder = commandBus.recorder
         recordBadge.isHidden = !recorder.isRecording
         recordBadgeLabel.stringValue = "● REC \(recorder.remaining)s"
+        // M122d (#2573): the toolbar pill mirrors the take — pressed
+        // and red while the recorder runs.
+        recordPill?.state = recorder.isRecording ? .on : .off
+        recordPill?.bezelColor = recorder.isRecording ? .systemRed : nil
     }
 
     /// M120c (#2560): the banner's seams — the class-A reads instead of
@@ -552,14 +630,20 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         commandBus.dispatch(.captureKeys)
     }
 
-    // MARK: NSToolbarDelegate — the pill is the only item for now.
+    // MARK: NSToolbarDelegate — every item is a bus surface.
 
     public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        var ids: [NSToolbarItem.Identifier] = [.flexibleSpace, HostApplication.captureKeysToolbarItem]
+        // M122d (#2573): the machine/debug actions sit left, the status
+        // pills right of the spring — every one dispatches its verb.
+        var ids: [NSToolbarItem.Identifier] = [
+            Self.inspectorToolbarItem, Self.screenshotToolbarItem,
+            Self.recordToolbarItem, Self.sendFileToolbarItem,
+            .flexibleSpace, Self.lanesToolbarItem, Self.captureKeysToolbarItem,
+        ]
         // The AGENT pill exists only where a companion can be armed —
         // an agentless run keeps the flags-off posture (no chrome for
         // a lane that can never carry traffic).
-        if commandBus.agent.companionArmed { ids.append(HostApplication.agentToolbarItem) }
+        if commandBus.agent.companionArmed { ids.append(Self.agentToolbarItem) }
         return ids
     }
 
@@ -567,10 +651,20 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         toolbarDefaultItemIdentifiers(toolbar)
     }
 
+    /// Title/SF-symbol/tooltip for each single-verb item — the lanes
+    /// and agent pills build themselves (multi-verb menu, live model
+    /// title) instead of reading this table.
+    private static let toolbarSpecs: [NSToolbarItem.Identifier: (title: String, symbol: String, tip: String)] = [
+        inspectorToolbarItem: ("Inspector", "sidebar.bottom", "Toggle the inspector drawer (⌥⌘I)"),
+        screenshotToolbarItem: ("Screenshot", "camera", "Save a screenshot to the share's CAPTURES (⇧⌘5)"),
+        recordToolbarItem: ("Record", "record.circle", "Record the window to an MP4 in CAPTURES (⇧⌘6)"),
+        sendFileToolbarItem: ("Send File", "paperplane", "Send files to the guest's INBOX"),
+    ]
+
     public func toolbar(_ toolbar: NSToolbar,
                         itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
                         willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
-        if itemIdentifier == HostApplication.agentToolbarItem {
+        if itemIdentifier == Self.agentToolbarItem {
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             let pill = NSButton(title: commandBus.agent.pillText, target: self,
                                 action: #selector(agentPillTapped(_:)))
@@ -583,22 +677,139 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             item.label = "Agent"
             item.paletteLabel = "Agent Channel"
             item.toolTip = "AGENTD sessions + HMAC-verified audit receipts — click freezes/resumes the agent channel"
+            item.target = self // validateToolbarItem's seam
             agentPill = pill
             return item
         }
-        guard itemIdentifier == HostApplication.captureKeysToolbarItem else { return nil }
+        if itemIdentifier == Self.captureKeysToolbarItem {
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            let pill = NSButton(title: "Capture Keys", target: self,
+                                action: #selector(captureKeysPillTapped(_:)))
+            pill.bezelStyle = .rounded
+            pill.setButtonType(.toggle)
+            pill.state = (captureTarget?.capturesSystemKeys ?? false) ? .on : .off
+            pill.isEnabled = commandBus.isEnabled(.captureKeys)
+            item.view = pill
+            item.label = "Keys"
+            item.paletteLabel = "Capture System Keys"
+            item.toolTip = "Send system key chords to the VM (⌥⌘K)"
+            item.target = self // validateToolbarItem's seam
+            captureKeysPill = pill
+            return item
+        }
+        if itemIdentifier == Self.lanesToolbarItem {
+            // M122d (#2573): the lanes pill — a status label + a tap that
+            // drops the lane menu (lanesMenu()). The count and the
+            // enablement are the bus's own registration/state reads.
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            let pill = NSButton(title: lanesPillText, target: self,
+                                action: #selector(lanesPillTapped(_:)))
+            pill.bezelStyle = .rounded
+            pill.font = .systemFont(ofSize: 12, weight: .semibold)
+            pill.image = NSImage(systemSymbolName: "switch.2", accessibilityDescription: "Lanes")
+            pill.imagePosition = .imageLeading
+            pill.isEnabled = lanesArmed
+            item.view = pill
+            item.label = "Lanes"
+            item.paletteLabel = "Integration Lanes"
+            item.toolTip = "Lane toggles — clipboard, file drop, notifications, agent channel"
+            item.target = self // validateToolbarItem's seam
+            lanesPill = pill
+            return item
+        }
+        guard let command = Self.toolbarCommands[itemIdentifier],
+              let spec = Self.toolbarSpecs[itemIdentifier] else { return nil }
+        // M122d (#2573): a single-verb item — the button's identifier
+        // carries the verb's wire name so one selector dispatches them
+        // all; the verb's own isEnabled greys it at creation and
+        // validateToolbarItem keeps it honest after.
         let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-        let pill = NSButton(title: "Capture Keys", target: self,
-                            action: #selector(captureKeysPillTapped(_:)))
+        let pill = NSButton(title: spec.title, target: self,
+                            action: #selector(commandPillTapped(_:)))
         pill.bezelStyle = .rounded
-        pill.setButtonType(.toggle)
-        pill.state = (captureTarget?.capturesSystemKeys ?? false) ? .on : .off
+        if command == .inspector || command == .record { pill.setButtonType(.toggle) }
+        pill.image = NSImage(systemSymbolName: spec.symbol, accessibilityDescription: spec.title)
+        pill.imagePosition = .imageLeading
+        pill.identifier = NSUserInterfaceItemIdentifier(command.rawValue)
+        pill.isEnabled = commandBus.isEnabled(command)
         item.view = pill
-        item.label = "Keys"
-        item.paletteLabel = "Capture System Keys"
-        item.toolTip = "Send system key chords to the VM (⌥⌘K)"
-        captureKeysPill = pill
+        item.label = spec.title
+        item.paletteLabel = spec.title
+        item.toolTip = spec.tip
+        item.target = self // validateToolbarItem's seam
+        switch command {
+        case .inspector:
+            pill.state = inspector.isOpen ? .on : .off
+            inspectorPill = pill
+        case .screenshot: screenshotPill = pill
+        case .record:
+            pill.state = commandBus.recorder.isRecording ? .on : .off
+            recordPill = pill
+        case .sendFile: sendFilePill = pill
+        default: break
+        }
         return item
+    }
+
+    /// Every single-verb toolbar pill's tap — the button's identifier
+    /// carries the verb's wire name, so the one selector serves them
+    /// all and the dispatch is the bus's like every other surface.
+    @objc private func commandPillTapped(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue,
+              let command = HostCommand(rawValue: raw) else { return }
+        commandBus.dispatch(command)
+    }
+
+    /// One lane's arm truth: the three Integration toggles count when
+    /// the runner registers them (each lane wires its verb as it
+    /// starts); `lane-agent` self-registers on every bus, so it counts
+    /// only while a channel actually exists — an unarmed run does not
+    /// pretend an agent lane.
+    private func laneArmed(_ command: HostCommand) -> Bool {
+        if command == .laneAgent { return commandBus.agent.channelArmed }
+        return commandBus.isRegistered(command)
+    }
+
+    /// The lanes pill's arm truth: any lane the run actually has — an
+    /// unarmed run greys the pill (the menu item's own precedent).
+    public var lanesArmed: Bool {
+        Self.laneVerbs.contains { laneArmed($0) }
+    }
+
+    /// The pill's title — "Lanes n/N" flowing-of-armed, the same truth
+    /// the Integration checkmarks show (`state(_:)` is the identical
+    /// itemState read).
+    public var lanesPillText: String {
+        let armed = Self.laneVerbs.filter { laneArmed($0) }
+        let on = armed.filter { commandBus.state($0) }.count
+        return "Lanes \(on)/\(armed.count)"
+    }
+
+    /// The pill's dropdown — every lane verb as a bus item, so the
+    /// checkmarks and the greying are validateMenuItem's standard
+    /// projection (no second lane-state table to keep honest).
+    public func lanesMenu() -> NSMenu {
+        let menu = NSMenu(title: "Lanes")
+        for (title, command) in [("Clipboard", HostCommand.laneClipboard),
+                                 ("File Drop", .laneDrop),
+                                 ("Notifications", .laneNotify),
+                                 ("Agent Channel", .laneAgent)] {
+            let item = NSMenuItem(title: title,
+                                  action: #selector(HostCommandBus.dispatchItem(_:)),
+                                  keyEquivalent: "")
+            item.target = commandBus
+            item.representedObject = command
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    /// A tap drops the lane menu under the pill — each leaf dispatches
+    /// its verb through the bus like its Integration-menu twin.
+    @objc private func lanesPillTapped(_ sender: NSButton) {
+        let menu = lanesMenu()
+        guard let first = menu.items.first else { return }
+        menu.popUp(positioning: first, at: NSPoint(x: 0, y: -6), in: sender)
     }
 
     public func attach(_ view: NSView) {
@@ -685,11 +896,21 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
 
     /// M128a (#2605): closing the settings panel is the verb's other
     /// edge — the model's isOpen flips back so the menu checkmark and
-    /// the `open=` receipt stay honest.
+    /// the `open=` receipt stay honest. M122d (#2573): same edge for
+    /// the ⌘/ sheet.
     public func windowWillClose(_ notification: Notification) {
         if notification.object as? NSWindow === settingsPanel {
             commandBus.settings.isOpen = false
+        } else if notification.object as? NSWindow === shortcutsPanel {
+            commandBus.shortcuts.isOpen = false
         }
+    }
+
+    /// M122d (#2573): toolbar items re-validate on every window update
+    /// pass — a lane arming or a take starting mid-run repaints the
+    /// pills without a timer (validateToolbarItem is the projection).
+    public func windowDidUpdate(_ notification: Notification) {
+        window.toolbar?.visibleItems?.forEach { $0.validate() }
     }
 
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -740,5 +961,45 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         }
         withExtendedLifetime((host, sources)) { NSApplication.shared.run() }
         exit(1)
+    }
+}
+
+/// M122d (#2573): the toolbar's enablement is the bus's — a verb whose
+/// dispatch would receipt `disabled`/`unavailable` greys its item
+/// (validateMenuItem's toolbar twin), and toggle visuals refresh here
+/// so the pills mirror live model state between window updates.
+extension HostApplication: NSToolbarItemValidation {
+    public func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        let pill = item.view as? NSButton
+        switch item.itemIdentifier {
+        case Self.lanesToolbarItem:
+            let enabled = lanesArmed
+            pill?.isEnabled = enabled
+            pill?.title = lanesPillText
+            return enabled
+        case Self.agentToolbarItem:
+            // M127e: the tap pauses/resumes — meaningful only while the
+            // channel exists (the pill's own creation rule).
+            let enabled = commandBus.agent.channelArmed
+            pill?.isEnabled = enabled
+            return enabled
+        default:
+            guard let command = Self.toolbarCommands[item.itemIdentifier] else { return true }
+            let enabled = commandBus.isEnabled(command)
+            pill?.isEnabled = enabled
+            switch command {
+            case .inspector:
+                pill?.state = inspector.isOpen ? .on : .off
+            case .record:
+                let on = commandBus.recorder.isRecording
+                pill?.state = on ? .on : .off
+                pill?.bezelColor = on ? .systemRed : nil
+            case .captureKeys:
+                pill?.state = (captureTarget?.capturesSystemKeys ?? false) ? .on : .off
+            default:
+                break
+            }
+            return enabled
+        }
     }
 }

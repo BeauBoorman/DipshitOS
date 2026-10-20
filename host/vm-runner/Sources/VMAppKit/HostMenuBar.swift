@@ -5,100 +5,130 @@ import AppKit
 /// `representedObject` and dispatches through `dispatchItem`; validation
 /// asks the bus, so a verb with no registered handler renders disabled
 /// until its card wires it (later cards add verbs, not menus).
+///
+/// M122d (#2573): `menus` below is now the declarative command table —
+/// the bar is one projection of it and the ⌘/ cheat-sheet's chord rows
+/// (`HostShortcutsModel.rows` via `chords`) are the other, so a chord
+/// added to a menu appears in the sheet without a second list to keep
+/// honest.
 public enum HostMenuBar {
+    /// One leaf of the command table: a title, its verb, and its chord
+    /// (`key == ""` = no chord). `hasSubmenu` marks the one leaf whose
+    /// submenu the bus repopulates per open ("Switch To" — the sibling
+    /// machine list lives in the registration, not the table).
+    public struct Item {
+        public let title: String
+        public let command: HostCommand
+        public let key: String
+        public let modifiers: NSEvent.ModifierFlags
+        public let hasSubmenu: Bool
+
+        public init(_ title: String, _ command: HostCommand,
+                    key: String = "",
+                    modifiers: NSEvent.ModifierFlags = .command,
+                    hasSubmenu: Bool = false) {
+            self.title = title
+            self.command = command
+            self.key = key
+            self.modifiers = modifiers
+            self.hasSubmenu = hasSubmenu
+        }
+
+        /// The glyphs the cheat sheet renders — ⌃⌥⇧⌘ order (Apple's
+        /// canonical), the key uppercased like the menu shows it.
+        public var chordDisplay: String {
+            var s = ""
+            if modifiers.contains(.control) { s += "⌃" }
+            if modifiers.contains(.option) { s += "⌥" }
+            if modifiers.contains(.shift) { s += "⇧" }
+            if modifiers.contains(.command) { s += "⌘" }
+            return s + key.uppercased()
+        }
+    }
+
+    /// The command table: menu title → sections (each inner array is
+    /// one run of leaves; sections join with separators). Order is the
+    /// bar's order.
+    public static let menus: [(title: String, sections: [[Item]])] = [
+        ("VirelaiOS", [
+            [Item("About VirelaiOS", .about)],
+            // M128a (#2605): ⌘, — the machine settings panel. The verb
+            // receipts `disabled` until a profile is armed, so the item
+            // greys on a flag-run (the bus's enablement is the menu's).
+            [Item("Machine Settings…", .settings, key: ",")],
+            [Item("Quit VirelaiOS", .quit, key: "q")],
+        ]),
+        ("Machine", [
+            [Item("Stop VM", .stop)],
+            // M120c (#2560): the persistence lifecycle — each item greys
+            // live on the machine model's posture.
+            [Item("Suspend", .suspend), Item("Snapshot", .snapshot)],
+            [Item("Apply OS Update", .applyUpdate), Item("Roll Back OS Update", .rollbackUpdate)],
+            [Item("Reveal Share in Finder", .revealShare)],
+            // M128b (#2606): the profile manager. "Switch To" is a
+            // submenu parent — it carries the verb (so validateMenuItem
+            // greys it when no sibling exists) and the standard
+            // dispatchItem seam like every other leaf; its submenu
+            // leaves carry the per-sibling target in the item
+            // identifier (the bus's menuNeedsUpdate fills it).
+            [Item("New Machine", .profileNew), Item("Clone This Machine", .profileClone),
+             Item("Switch To", .profileSwitch, hasSubmenu: true),
+             Item("Reset Boot Overlay…", .profileResetOverlay)],
+        ]),
+        ("View", [
+            [Item("Enter Full Screen", .fullscreen, key: "f", modifiers: [.control, .command])],
+            [Item("Capture System Keys", .captureKeys, key: "k", modifiers: [.option, .command])],
+        ]),
+        ("Integration", [
+            [Item("Clipboard", .laneClipboard), Item("File Drop", .laneDrop),
+             Item("Notifications", .laneNotify), Item("Agent Channel", .laneAgent)],
+            [Item("Send File to INBOX…", .sendFile)],
+        ]),
+        ("Debug", [
+            [Item("Inspector", .inspector, key: "i", modifiers: [.option, .command])],
+            [Item("Take Screenshot", .screenshot, key: "5", modifiers: [.shift, .command]),
+             Item("Record Window", .record, key: "6", modifiers: [.shift, .command])],
+        ]),
+        ("Help", [
+            // M122d (#2573): the ⌘/ cheat sheet — its rows are this
+            // table's chorded leaves, so it can never list a chord the
+            // menus do not know.
+            [Item("Keyboard Shortcuts", .shortcuts, key: "/")],
+        ]),
+    ]
+
+    /// The leaves that carry a chord, in menu order — the cheat sheet's
+    /// row source.
+    public static var chords: [Item] {
+        menus.flatMap { $0.sections.flatMap { $0 } }.filter { !$0.key.isEmpty }
+    }
+
     public static func build(bus: HostCommandBus) -> NSMenu {
         let bar = NSMenu()
-
-        func menu(_ title: String) -> NSMenu {
-            let item = NSMenuItem()
+        for (title, sections) in menus {
+            let top = NSMenuItem()
             let sub = NSMenu(title: title)
-            item.submenu = sub
-            bar.addItem(item)
-            return sub
+            top.submenu = sub
+            bar.addItem(top)
+            for (i, section) in sections.enumerated() {
+                if i > 0 { sub.addItem(.separator()) }
+                for leaf in section {
+                    let item = NSMenuItem(
+                        title: leaf.title,
+                        action: #selector(HostCommandBus.dispatchItem(_:)),
+                        keyEquivalent: leaf.key)
+                    item.target = bus
+                    item.representedObject = leaf.command
+                    if !leaf.key.isEmpty { item.keyEquivalentModifierMask = leaf.modifiers }
+                    if leaf.hasSubmenu {
+                        let child = NSMenu(title: leaf.title)
+                        child.delegate = bus // menuNeedsUpdate lists the siblings
+                        item.submenu = child
+                    }
+                    sub.addItem(item)
+                }
+            }
         }
-        func action(_ title: String, _ command: HostCommand,
-                    key: String = "",
-                    modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
-            let item = NSMenuItem(title: title,
-                                  action: #selector(HostCommandBus.dispatchItem(_:)),
-                                  keyEquivalent: key)
-            item.target = bus
-            item.representedObject = command
-            if !key.isEmpty { item.keyEquivalentModifierMask = modifiers }
-            return item
-        }
-
-        let app = menu("VirelaiOS")
-        app.addItem(action("About VirelaiOS", .about))
-        app.addItem(.separator())
-        // M128a (#2605): ⌘, — the machine settings panel. The verb
-        // receipts `disabled` until a profile is armed, so the item
-        // greys on a flag-run (the bus's enablement is the menu's).
-        app.addItem(action("Machine Settings…", .settings, key: ","))
-        app.addItem(.separator())
-        app.addItem(action("Quit VirelaiOS", .quit, key: "q"))
-
-        let machine = menu("Machine")
-        machine.addItem(action("Stop VM", .stop))
-        machine.addItem(.separator())
-        // M120c (#2560): the persistence lifecycle. Suspend saves the
-        // machine state into the profile's saved-state/ and stops the
-        // run (--resume continues it); Snapshot parks a menu-<stamp>
-        // .vzsave on the armed share for GOSNAP to restore; the update
-        // pair runs the M115f verify+swap/rollback on the base image;
-        // Reveal Share opens the armed share in Finder. Each item greys
-        // live on the machine model's posture — the bus's enablement is
-        // the menu's.
-        machine.addItem(action("Suspend", .suspend))
-        machine.addItem(action("Snapshot", .snapshot))
-        machine.addItem(.separator())
-        machine.addItem(action("Apply OS Update", .applyUpdate))
-        machine.addItem(action("Roll Back OS Update", .rollbackUpdate))
-        machine.addItem(.separator())
-        machine.addItem(action("Reveal Share in Finder", .revealShare))
-        machine.addItem(.separator())
-        // M128b (#2606): the profile manager. New/clone mint sibling
-        // bundles next to the armed one; reset-overlay re-mints the
-        // armed bundle's overlay.asif on next boot; "Switch To" is a
-        // submenu the bus's menuNeedsUpdate repopulates per open with
-        // the sibling machines. All receipt `disabled` on a flag-run.
-        machine.addItem(action("New Machine", .profileNew))
-        machine.addItem(action("Clone This Machine", .profileClone))
-        // "Switch To" is a submenu parent — it carries the verb (so
-        // validateMenuItem greys it when no sibling exists) and the
-        // standard dispatchItem seam like every other leaf; its submenu
-        // leaves carry the per-sibling target in the item identifier.
-        let switchItem = action("Switch To", .profileSwitch)
-        let switchSub = NSMenu(title: "Switch To")
-        switchSub.delegate = bus // menuNeedsUpdate lists the siblings
-        switchItem.submenu = switchSub
-        machine.addItem(switchItem)
-        machine.addItem(action("Reset Boot Overlay…", .profileResetOverlay))
-
-        let view = menu("View")
-        view.addItem(action("Enter Full Screen", .fullscreen,
-                          key: "f", modifiers: [.control, .command]))
-        view.addItem(.separator())
-        view.addItem(action("Capture System Keys", .captureKeys,
-                          key: "k", modifiers: [.option, .command]))
-
-        let integration = menu("Integration")
-        integration.addItem(action("Clipboard", .laneClipboard))
-        integration.addItem(action("File Drop", .laneDrop))
-        integration.addItem(action("Notifications", .laneNotify))
-        integration.addItem(action("Agent Channel", .laneAgent))
-        integration.addItem(.separator())
-        integration.addItem(action("Send File to INBOX…", .sendFile))
-
-        let debug = menu("Debug")
-        debug.addItem(action("Inspector", .inspector,
-                             key: "i", modifiers: [.option, .command]))
-        debug.addItem(.separator())
-        debug.addItem(action("Take Screenshot", .screenshot,
-                             key: "5", modifiers: [.shift, .command]))
-        debug.addItem(action("Record Window", .record,
-                             key: "6", modifiers: [.shift, .command]))
-
         return bar
     }
 }

@@ -62,6 +62,11 @@
 # <share>/CAPTURES/ — ⌘⇧5's destination — and the dispatch's
 # saved=/file= tail is the saved-badge truth a window would mirror.
 #
+# Run 01 also fires M122d's (#2573) `shortcuts` verb — the ⌘/
+# cheat-sheet companion self-registers on the bus, so the scripted run
+# receipts the open flip and the chord-row count generated from the
+# menu's command table.
+#
 # M114f (#2459) acceptance: taken together the five runs are the
 # full-window journey — bus dispatch (screenshot, clean stop), the
 # viewport verbs (fullscreen, capture-keys on/off, the
@@ -69,7 +74,7 @@
 # injection, and the one-chord capture pair. The same bus's lane
 # suspend/resume leg lives in live-hostint run 04 (M114c, #2456).
 
-vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts, one-chord capture, postmortem auto-open + CAPTURES routing"
+vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562 + M122d #2573: HostCommand bus — --host-cmd-after/--host-capture-keys/--host-serial-send, host-ui: receipts, one-chord capture, postmortem auto-open + CAPTURES routing + shortcuts cheat-sheet"
 vgate_repeat 1 BOOTS
 
 vgate_file script.txt <<'EOF'
@@ -125,6 +130,7 @@ vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
     --host-cmd-after 'VirelaiOS kernel has seized control.:apply-update' \
     --host-cmd-after 'VirelaiOS kernel has seized control.:rollback-update' \
     --host-cmd-after 'VirelaiOS kernel has seized control.:reveal-share' \
+    --host-cmd-after 'VirelaiOS kernel has seized control.:shortcuts' \
     --script-expect 'host-ui-idle' --timeout 90
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
@@ -141,6 +147,10 @@ vgate_assert 01 output-contains 'host-ui: cmd=snapshot state=disabled'
 vgate_assert 01 output-contains 'host-ui: cmd=apply-update state=disabled'
 vgate_assert 01 output-contains 'host-ui: cmd=rollback-update state=disabled'
 vgate_assert 01 output-contains 'host-ui: cmd=reveal-share state=disabled'
+# M122d (#2573): the ⌘/ cheat-sheet verb is a self-registered companion
+# — always armed, so its receipt carries the open flip and the row
+# count generated from the menu's command table.
+vgate_assert 01 output-contains 'host-ui: cmd=shortcuts state=performed open=1 chords=8'
 vgate_assert 01 output-contains 'framebuffer screenshot saved'
 vgate_assert 01 snapshot 'screen-hostui-*' <<'PY'
 import sys

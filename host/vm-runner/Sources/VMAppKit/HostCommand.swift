@@ -80,6 +80,12 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case record
     case recordStart = "record-start"
     case recordStop = "record-stop"
+    // Help menu — M122d (#2573): the ⌘/ cheat-sheet verb. The bus's
+    // `shortcuts` companion (HostShortcutsModel) self-registers in init
+    // like the recorder/agent, so a bare `HostCommandBus()` in a
+    // scripted `--host-cmd-after` run dispatches the identical seam and
+    // receipts `performed open=N chords=N`.
+    case shortcuts
 }
 
 /// One armed `--host-cmd-after <marker>:<verb>` instance. The verb is the
@@ -208,6 +214,12 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
     /// Injectable so a test owns its seams.
     public let machine: HostMachineModel
 
+    /// M122d (#2573): the ⌘/ cheat-sheet model — the `shortcuts` verb's
+    /// open state and the sheet's chord rows, generated from the menu
+    /// bar's command table so the two can never drift. Self-registering
+    /// on the bus like the recorder/agent companions.
+    public let shortcuts = HostShortcutsModel()
+
     private var registrations: [HostCommand: Registration] = [:]
 
     public init(emit: ((String) -> Void)? = nil, agent: HostAgentCompanion? = nil,
@@ -310,6 +322,14 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
             isEnabled: { machine.canRevealShare },
             receiptDetail: { machine.revealShareDetail },
             action: { machine.revealShare() }))
+        // M122d (#2573): ⌘/ — always armed (the sheet is generated from
+        // the static command table, so there is nothing a run can lack);
+        // the receipt tail carries the open state + row count.
+        let shortcuts = self.shortcuts
+        register(.shortcuts, Registration(
+            itemState: { shortcuts.isOpen },
+            receiptDetail: { shortcuts.receiptDetail },
+            action: { shortcuts.toggle() }))
         // The companion's audit poll self-arms only when a share is
         // resolvable — a shareless run never schedules it (the flags-
         // off posture, host side).
@@ -326,6 +346,14 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
 
     public func isEnabled(_ command: HostCommand) -> Bool {
         registrations[command]?.isEnabled() ?? false
+    }
+
+    /// The toggle truth menu validation shows as a checkmark —
+    /// `itemState()` on the registration, false when unregistered.
+    /// M122d (#2573): toolbar surfaces (the lanes pill's "N on" count)
+    /// read the identical state.
+    public func state(_ command: HostCommand) -> Bool {
+        registrations[command]?.itemState() ?? false
     }
 
     @discardableResult

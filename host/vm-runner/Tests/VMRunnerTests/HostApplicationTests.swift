@@ -115,4 +115,127 @@ final class HostApplicationTests: XCTestCase {
         XCTAssertEqual(host.lastRefusalReason, "not a .virelaivm bundle")
         XCTAssertEqual(host.refusedOpens.count, 2)
     }
+
+    // MARK: M122d (#2573) — the toolbar's bus surfaces + the ⌘/ sheet.
+
+    private func toolbarItem(_ host: HostApplication,
+                             _ id: NSToolbarItem.Identifier) -> NSToolbarItem? {
+        host.toolbar(host.window.toolbar!, itemForItemIdentifier: id,
+                     willBeInsertedIntoToolbar: true)
+    }
+
+    /// The default set carries the card's items — the machine/debug
+    /// actions left of the spring, the status pills right; the AGENT
+    /// pill stays conditional on its companion being armed.
+    func testToolbarDefaultSetCarriesTheCardItems() {
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        let ids = host.toolbarDefaultItemIdentifiers(host.window.toolbar!)
+        XCTAssertEqual(ids, [
+            HostApplication.inspectorToolbarItem, HostApplication.screenshotToolbarItem,
+            HostApplication.recordToolbarItem, HostApplication.sendFileToolbarItem,
+            .flexibleSpace, HostApplication.lanesToolbarItem,
+            HostApplication.captureKeysToolbarItem,
+        ])
+        XCTAssertEqual(ids, host.toolbarAllowedItemIdentifiers(host.window.toolbar!))
+    }
+
+    /// Each single-verb item is a bus surface: the button's identifier
+    /// carries the verb's wire name, the item's target is the window's
+    /// validation seam, and enablement is the bus's own — a verb with
+    /// no registration greys before any tap.
+    func testToolbarItemsAreBusSurfaces() throws {
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        var lines: [String] = []
+        host.commandBus.emit = { lines.append($0) }
+        let expected: [(NSToolbarItem.Identifier, HostCommand, Bool)] = [
+            (HostApplication.inspectorToolbarItem, .inspector, true),   // the session registers it
+            (HostApplication.screenshotToolbarItem, .screenshot, false),// runner-side, absent here
+            (HostApplication.recordToolbarItem, .record, false),        // no view + no share
+            (HostApplication.sendFileToolbarItem, .sendFile, false),    // no drop lane
+        ]
+        for (id, command, enabled) in expected {
+            let item = try XCTUnwrap(toolbarItem(host, id), "\(id.rawValue) must build")
+            XCTAssertTrue(item.target === host, "\(id.rawValue) must validate on the window")
+            let pill = try XCTUnwrap(item.view as? NSButton)
+            XCTAssertTrue(pill.target === host)
+            XCTAssertEqual(HostCommand(rawValue: pill.identifier!.rawValue), command,
+                           "\(id.rawValue) must carry its verb's wire name")
+            XCTAssertEqual(pill.isEnabled, enabled, "\(id.rawValue) enablement is the bus's")
+        }
+        // A click on an enabled item is a dispatch — the inspector pill
+        // lands the identical receipt the menu's ⌥⌘I does, and the
+        // pill's pressed state mirrors the drawer it opened.
+        let item = try XCTUnwrap(toolbarItem(host, HostApplication.inspectorToolbarItem))
+        let pill = try XCTUnwrap(item.view as? NSButton)
+        pill.performClick(nil)
+        XCTAssertTrue(host.inspectorVisible)
+        XCTAssertTrue(host.validateToolbarItem(item))
+        XCTAssertEqual(pill.state, .on)
+        XCTAssertEqual(lines, ["host-ui: cmd=inspector state=performed open=1 tail=0 saw=0"])
+    }
+
+    /// The lanes pill greys while the run has no lane, arms on the
+    /// first registered lane verb, and counts flowing-of-armed — while
+    /// its dropdown leaves are bus items whose checkmark and greying
+    /// are validateMenuItem's own projection.
+    func testLanesPillArmsOnRegisteredLaneVerbs() throws {
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        var lines: [String] = []
+        host.commandBus.emit = { lines.append($0) }
+        let item = try XCTUnwrap(toolbarItem(host, HostApplication.lanesToolbarItem))
+        let pill = try XCTUnwrap(item.view as? NSButton)
+        // No lanes in a bare session — the pill is honest chrome about
+        // nothing, so it greys (lane-agent's self-registration does not
+        // pretend a channel that is not armed).
+        XCTAssertFalse(host.lanesArmed)
+        XCTAssertEqual(host.lanesPillText, "Lanes 0/0")
+        XCTAssertFalse(host.validateToolbarItem(item))
+        XCTAssertFalse(pill.isEnabled)
+        // The dropdown always names the lane set — each leaf a bus
+        // item carrying its verb.
+        let menu = host.lanesMenu()
+        XCTAssertEqual(menu.items.map(\.title), ["Clipboard", "File Drop", "Notifications", "Agent Channel"])
+        XCTAssertEqual(menu.items.compactMap { $0.representedObject as? HostCommand },
+                       HostApplication.laneVerbs)
+        for leaf in menu.items {
+            XCTAssertTrue(leaf.target === host.commandBus)
+            XCTAssertEqual(leaf.action, #selector(HostCommandBus.dispatchItem(_:)))
+        }
+        // A lane registering is what arms the pill — the runner's own
+        // registration shape.
+        var laneOn = true
+        host.commandBus.register(.laneClipboard, HostCommandBus.Registration(
+            itemState: { laneOn },
+            action: { laneOn.toggle(); return .performed }))
+        XCTAssertTrue(host.lanesArmed)
+        XCTAssertEqual(host.lanesPillText, "Lanes 1/1")
+        XCTAssertTrue(host.validateToolbarItem(item))
+        XCTAssertTrue(pill.isEnabled)
+        XCTAssertEqual(pill.title, "Lanes 1/1")
+        // A leaf's dispatch is the bus's, and the checkmark is the
+        // lane's live state — suspending drops the flowing count.
+        host.commandBus.dispatchItem(menu.items[0])
+        XCTAssertEqual(host.lanesPillText, "Lanes 0/1")
+        XCTAssertEqual(lines, ["host-ui: cmd=lane-clipboard state=performed"])
+        XCTAssertTrue(host.commandBus.validateMenuItem(menu.items[0]))
+        XCTAssertEqual(menu.items[0].state, .off)
+    }
+
+    /// The ⌘/ verb is a session verb too — the model's isOpen is the
+    /// sheet's truth, and a second dispatch closes it (the settings
+    /// panel's precedent, headless-legible).
+    func testShortcutsSheetMirrorsTheModel() {
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        var lines: [String] = []
+        host.commandBus.emit = { lines.append($0) }
+        XCTAssertFalse(host.shortcutsVisible)
+        XCTAssertEqual(host.commandBus.dispatch(.shortcuts), .performed)
+        XCTAssertTrue(host.shortcutsVisible)
+        XCTAssertEqual(host.commandBus.dispatch(.shortcuts), .performed)
+        XCTAssertFalse(host.shortcutsVisible)
+        XCTAssertEqual(lines, [
+            "host-ui: cmd=shortcuts state=performed open=1 chords=8",
+            "host-ui: cmd=shortcuts state=performed open=0 chords=8",
+        ])
+    }
 }
