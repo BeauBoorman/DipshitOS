@@ -2135,3 +2135,203 @@ print("launcher empty leg: border-ring=%d interior-non-plate=%d" % (ring, textis
 assert ring >= 200, "empty-state border ring absent from the results region"
 assert textish >= 200, "no empty-state text inside the plate"
 PY
+
+# --- M121d (#2567) run 20: the chrome focus indicator ------------------------
+#
+# The badge panel rides the bottom chrome band flush-left of the clock: the
+# focused tab's title plus a chord-scope chip — "app" (the app's own
+# KEY_DOWN scope), "term" (a tty-bound front-end the kernel's terminal
+# chrome chords answer on), or "seat" (a seat modal holding the input sink,
+# or no focused tab). One `gotabwm: focus` line prints per badge-state
+# transition at the moment the seat's focus state moves — the `tab focus
+# id=` discipline — so a rapid cycle names every switch even when several
+# land inside one composite tick; the painted truth is the snapshot
+# assert's job.
+#
+# LIVE seat (vf rm GOTABWM.DEMO — the run 15/16 pattern) so no bounded
+# choreography races the legs. Four tabs exec in script2 and declare in
+# rail order GOEDIT -> GOFILES -> GOTERM -> WEB; each new declare takes
+# focus, so the badge walks app -> term -> term -> app on the way up. The
+# chord batch then rides the same 0.25 s/stroke pacing:
+#
+#   alt-tab x4   focus wraps WEB -> GOEDIT -> GOFILES -> GOTERM -> WEB,
+#                one focus line per switch
+#   ctrl-shift-w the M121b close: WEB leaves the strip, focus falls to the
+#                tab that shifts into its slot (GOTERM), and the badge
+#                answers `scope=term title=Term` — the card's tab-close leg
+#
+# The close is also this run's ORDERING anchor: `gotabwm: tab close id=`
+# can only print after every alt-tab in the batch was processed, so
+# script3's anchor can never outrun the cycle.
+#
+# The `vf rm GOTABWM.IDLE.TEST` + `settings set idle_minutes 120` pair is
+# load-bearing exactly as in run 15: run 07 persists idle_minutes=1 and
+# seeds the 2-ticks/min fixture on this same share, which would leave
+# dim=2/lock=4 in force — every later stroke eaten as an idle WAKE rather
+# than reaching the seat's chords.
+vgate_file script-20.txt <<'EOS'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm GOTABWM.IDLE.TEST
+settings set idle_minutes 120
+wm
+exec GOTABWM.ELF
+EOS
+
+vgate_file script2-20.txt <<'EOS'
+dui focus 0
+exec GOEDIT.ELF
+exec GOFILES.ELF
+exec GOTERM.ELF
+exec WEB.ELF
+EOS
+
+vgate_file script3-20.txt <<'EOS'
+wm
+dui
+echo rx-gotabwm-focus-ok
+EOS
+
+vgate_run 20 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-20' \
+    --script '$RUN_DIR/script-20.txt' \
+    --script2 '$RUN_DIR/script2-20.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'alt-tab,alt-tab,alt-tab,alt-tab,ctrl-shift-w' \
+    --input-chords-after 'gotabwm: rail n=4' \
+    --screenshot-after 'gotabwm: focus scope=term title=Term' \
+    --script3 '$RUN_DIR/script3-20.txt' \
+    --script3-after 'gotabwm: tab close id=' \
+    --script-expect 'rx-gotabwm-focus-ok' --timeout 300
+
+vgate_assert 20 serial-contains 'settings: idle_minutes=120 (persisted)'
+vgate_assert 20 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 20 serial-contains 'gotabwm: mode live'
+vgate_assert 20 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 20 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 20 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 20 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 20 serial-contains 'goedit: declare accepted'
+vgate_assert 20 serial-contains 'gofiles: declare accepted'
+vgate_assert 20 serial-contains 'goterm: declare accepted'
+vgate_assert 20 serial-contains 'gotabwm: rail n=4'
+# The declares themselves walked the badge — seat at boot, then each new
+# declare's title+scope — and the alt-tab cycle then printed the same
+# four in rail order again. scope=seat's boot line opens the count.
+vgate_assert 20 serial-contains 'gotabwm: focus scope=seat'
+vgate_assert 20 serial-contains 'gotabwm: focus scope=app title=Edit'
+vgate_assert 20 serial-contains 'gotabwm: focus scope=term title=Files'
+vgate_assert 20 serial-contains 'gotabwm: focus scope=term title=Term'
+vgate_assert 20 serial-contains 'gotabwm: focus scope=app title=Web'
+vgate_assert 20 serial-contains 'gotabwm: tab close id='
+vgate_assert 20 serial-contains 'rx-gotabwm-focus-ok'
+vgate_assert 20 serial-absent '[EXC] parking:'
+vgate_assert 20 serial-absent 'exited status=139'
+
+# The cycle, in order: the four titled focus lines after `rail n=4` are
+# the alt-tab switches — one line per switch at decision time, so the
+# batch draining inside one tick still names all four — and the titled
+# line after `tab close id=` is the close's focus landing. Declares are
+# NOT required to each print (one RPC drain can serve several declares;
+# the badge's transition reporter then names the batch's last state —
+# the cycle is the leg's per-switch proof).
+vgate_assert 20 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+want = [("app", "Edit"), ("term", "Files"), ("term", "Term"), ("app", "Web")]
+lines = [(m.start(), m.group(1), (m.group(2) or "").strip())
+         for m in re.finditer(
+             r"(?m)^gotabwm: focus scope=(\w+)(?: title=(.*))?$", ser)]
+rail = ser.index("gotabwm: rail n=4")
+close = ser.index("gotabwm: tab close id=")
+# rail n=4 and the last declare's focus line land in the same tick (the
+# rail marker prints during paint, the badge's line after) — the cycle is
+# the LAST four titled lines before the close, not the first four after.
+titled = [(s, t) for pos, s, t in lines if rail < pos < close and t]
+cycle = titled[-4:]
+if cycle != want:
+    sys.exit("alt-tab cycle %r != %r" % (cycle, want))
+post = [(s, t) for pos, s, t in lines if pos > close and t]
+if not post or post[0][0] != "term" or not post[0][1].startswith("Term"):
+    sys.exit("close landed the badge on %r, want term/Term* "
+             "(GOTERM retitles to its cwd)" % (post[:1],))
+print("M121d focus badge: cycle %r, close -> %r" % (cycle, post[0]))
+PY
+
+# THE pixel assert: the badge's own rect on the captured frame — the
+# --screenshot-after PNG is the run 03 decode (colour-space tolerant):
+# the ChromeBg panel, accent (the scope chip + the seat rule) and ink text
+# inside focusRect = (clock x) - 4 - 216 .. (clock x) - 4.
+vgate_assert 20 snapshot 'screen-20-after' <<'PY'
+import sys, zlib, struct
+from collections import Counter
+path = sys.argv[1]
+d = open(path, 'rb').read()
+assert d[:8] == b'\x89PNG\r\n\x1a\n', "not a PNG"
+pos = 8; idat = b''; w = h = ct = 0
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8])
+    data = d[pos+8:pos+8+ln]
+    if typ == b'IHDR':
+        w, h, bd, ct = struct.unpack('>IIBB', data[:10])
+    elif typ == b'IDAT':
+        idat += data
+    pos += 12 + ln
+raw = zlib.decompress(idat)
+bpp = 4 if ct == 6 else 3
+stride = w * bpp
+out = bytearray(); prev = bytearray(stride); i = 0
+for y in range(h):
+    f = raw[i]; i += 1
+    line = bytearray(raw[i:i+stride]); i += stride
+    if f == 1:
+        for x in range(bpp, stride): line[x] = (line[x] + line[x-bpp]) & 0xff
+    elif f == 2:
+        for x in range(stride): line[x] = (line[x] + prev[x]) & 0xff
+    elif f == 3:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xff
+    elif f == 4:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            b = prev[x]; c = prev[x-bpp] if x >= bpp else 0
+            p = a + b - c
+            pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[x] = (line[x] + pr) & 0xff
+    out += line
+    prev = line
+
+def px(x, y):
+    k = (y * w + x) * bpp
+    return out[k], out[k+1], out[k+2]
+
+scale = w / 1280.0
+x0, y0, pw, ph = 1124 - 4 - 216, 720 - 8 - 20, 216, 20
+chrome_bg = (0x11, 0x17, 0x1c)
+modal = Counter(); accent = ink = total = 0
+for y in range(int(y0 * scale), int((y0 + ph) * scale)):
+    for x in range(int(x0 * scale), int((x0 + pw) * scale)):
+        r, g, b = px(x, y)
+        total += 1
+        modal[(r, g, b)] += 1
+        if min(r, g, b) >= 150:
+            ink += 1
+        if abs(r - 0x3b) <= 32 and abs(g - 0x82) <= 32 and abs(b - 0xf6) <= 32:
+            accent += 1
+best, best_n = modal.most_common(1)[0]
+dist = max(abs(best[0]-chrome_bg[0]), abs(best[1]-chrome_bg[1]),
+           abs(best[2]-chrome_bg[2]))
+print("badge rect %dx%d (%d px): modal=#%02x%02x%02x n=%d accent=%d ink=%d"
+      % (int(pw*scale), int(ph*scale), total,
+         best[0], best[1], best[2], best_n, accent, ink))
+assert dist <= 4, ("the badge rect is not the seat's ChromeBg (modal "
+                   "#%02x%02x%02x) — the panel was not painted"
+                   % (best[0], best[1], best[2]))
+assert best_n >= 4000, "the badge panel does not cover its rect"
+assert accent > int(ph * scale), "no scope chip / seat rule on the badge"
+assert ink >= 20, "no title text on the badge"
+PY

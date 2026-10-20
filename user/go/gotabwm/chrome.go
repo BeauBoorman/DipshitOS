@@ -47,6 +47,9 @@ const (
 	// M71e (#1564): the empty-strip start surface, painted by the seat (D2:
 	// seat chrome, never DESKTOP.BIN).
 	MarkerStartSurface = "gotabwm: start-surface"
+	// M121d (#2567): the focus indicator's transition line, printed once
+	// per badge-state change after the frame carrying it was presented.
+	MarkerFocus = "gotabwm: focus "
 )
 
 // clockEpochPath is the session launcher's wall-time file: the host's LOCAL
@@ -89,6 +92,9 @@ func chromeTick(scan []byte, ticks uint64) {
 	face := clockNow(ticks)
 	text := formatClock(face.h, face.m, face.s)
 	_ = paintChrome(scan, vi.ScanoutWidth, vi.ScanoutHeight, text)
+	// M121d (#2567): the focus indicator repaints on the same cadence —
+	// every focus change, blur and tab close lands on this tick's frame.
+	_ = paintFocusBadge(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	_ = paintGodMenuButton(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	// M115d (#2463): the PWR button sits on the same band, right of Apps.
 	_ = paintPowerButton(scan, vi.ScanoutWidth, vi.ScanoutHeight)
@@ -338,6 +344,209 @@ func chromeStatusText() string {
 		return "NOTIFY!"
 	}
 	return statusText
+}
+
+// --- M121d (#2567): the focus indicator ------------------------------------
+//
+// The chrome's answer to "where do keystrokes go": a second panel on the
+// same bottom band, flush left of the clock, carrying the focused tab's
+// title and a chord-scope chip. The scope is the chords registry's
+// dispatch-point class the tab declares: an app tab's own KEY_DOWN scope
+// ("app"), a tty-bound front-end whose kernel chrome chords answer on its
+// window ("term", the kernel-terminal scope), or the seat's own chords
+// when no tab is focused or a seat modal (launcher/palette, power menu)
+// holds the input sink ("seat"). The panel repaints on the same tick
+// cadence as the clock, so focus changes, blurs and tab closes land on
+// the next presented frame; the transition marker prints only after a
+// frame carrying the new state was presented (the notify discipline).
+const (
+	FocusW   = 216
+	focusGap = 4 // seam between the indicator and the clock plate
+)
+
+// focusBadgeView is what the panel currently claims: the focused tab's
+// title and the scope chip beside it.
+type focusBadgeView struct {
+	title string
+	scope string
+}
+
+// badgeReported is the last state the transition line named — the marker
+// prints once per change, at the moment the seat's focus state moved, the
+// same discipline `gotabwm: tab focus id=` follows (the next tick's paint
+// then carries it; a switch that never survives to a presented frame
+// still names the transition it caused).
+var badgeReported focusBadgeView
+
+// focusRect is the indicator's rect: the clock panel's band, against its
+// left edge with a focusGap seam. It gives up (the zero rect) when the
+// band cannot hold it — reaching under the power button, past the left
+// inset, or up into the rail — the same give-up rule godMenuRect obeys.
+func focusRect(width, height int) (x, y, w, h int) {
+	cx, cy, cw, _ := chromeRect(width, height)
+	if cw == 0 {
+		return 0, 0, 0, 0
+	}
+	x, y, w, h = cx-focusGap-FocusW, cy, FocusW, ChromeH
+	if y < RailHeight {
+		return 0, 0, 0, 0
+	}
+	// The left bound is the left chrome row's nominal span — notify
+	// column, Apps, PWR — whether or not each button itself fit on this
+	// scanout: a crowded band refuses the panel rather than painting it
+	// under a slot a button gave up on.
+	if x < notifyInset+NotifyW+chromeInset+godMenuW+powerBtnGap+powerBtnW+focusGap {
+		return 0, 0, 0, 0
+	}
+	return
+}
+
+// asciiUpperEq reports whether s, uppercased as ASCII, equals want —
+// strings.ToUpper pulls the unicode case tables into the guest image
+// (apps.go's asciiContainsFold documents the wall), so the fold is by
+// hand over bytes the caller already knows are 7-bit names.
+func asciiUpperEq(s, want string) bool {
+	if len(s) != len(want) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// terminalFrontEndBin reports whether bin names an executable that
+// attaches its window as a tty front-end — the class the registry calls
+// kernel-terminal, whose chrome chords the KERNEL serves while the
+// window is focused. The seat has no query for a window's tty binding
+// (win_query carries no kind field), so the class rides the recorded
+// executable name: the bins observed calling vi.TtyAttachWindow (2026-10
+// grep: term, files, sh, help, gitui, rss, imgcat, btmath, charmhello,
+// pulse; gsport's ABI for GOSTALGIA). Compare on the stem so a bare
+// declared title ("imgcat", the guessBin default arm) classifies like
+// the canonical "IMGCAT.ELF".
+func terminalFrontEndBin(bin string) bool {
+	stem := bin
+	if n := len(stem); n > 4 && asciiUpperEq(stem[n-4:], ".ELF") {
+		stem = stem[:n-4]
+	}
+	for _, t := range [...]string{
+		"GOTERM", "GOFILES", "GOSH", "GOHELP", "GOGITUI", "RSS",
+		"IMGCAT", "BTMATH", "CHARMHELLO", "PULSE", "GOSTALGIA",
+	} {
+		if asciiUpperEq(stem, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// seatModalFocus reports whether a seat-owned modal currently holds the
+// input sink — the launcher/palette strip or the power menu. While one
+// does, keystrokes dispatch at seat scope no matter which tab the rail
+// calls focused.
+func seatModalFocus() bool {
+	return (launch.open && launch.sink != 0) ||
+		(powerMenuOpen && powerSink != 0)
+}
+
+// focusBadgeState is the indicator's current claim, read from live state:
+// the focused tab's title plus its scope class; the seat's own scope when
+// a modal holds the sink or no tab is focused. Pure over package state —
+// host tests pin every branch without a guest.
+func focusBadgeState() focusBadgeView {
+	if seatModalFocus() {
+		return focusBadgeView{scope: "seat"}
+	}
+	id, ok := tabs.Focused()
+	if !ok {
+		return focusBadgeView{scope: "seat"}
+	}
+	t := tabs.At(tabs.index(id))
+	scope := "app"
+	if terminalFrontEndBin(t.Bin) {
+		scope = "term"
+	}
+	return focusBadgeView{title: t.Title, scope: scope}
+}
+
+// focusChipText is the scope chip's painted label.
+func focusChipText(scope string) string {
+	switch scope {
+	case "term":
+		return "TERM"
+	case "seat":
+		return "SEAT"
+	}
+	return "APP"
+}
+
+// focusBadgeLine is the serial line one transition prints: the scope plus
+// the tab's title — absent on the seat scope, which has no tab to name.
+func focusBadgeLine(v focusBadgeView) string {
+	if v.scope == "seat" {
+		return MarkerFocus + "scope=seat"
+	}
+	return MarkerFocus + "scope=" + v.scope + " title=" + v.title
+}
+
+// noteBadgeTransition is the indicator's transition reporter: when the
+// badge's claim changed since the last line, print the new one. Called
+// wherever the seat's focus state can move — after an input event (the
+// chords, rail clicks), after an RPC pass (declares/attaches take focus),
+// and once per composite tick (choreography, session restores, sink
+// releases) — so rapid focus cycles name every switch, not only the ones
+// that outlived a whole tick.
+func noteBadgeTransition() {
+	v := focusBadgeState()
+	if v == badgeReported {
+		return
+	}
+	badgeReported = v
+	vi.ConsoleLine(focusBadgeLine(v))
+}
+
+// paintFocusBadge paints the indicator panel and returns the pixel count
+// written. Pure over the caller's scanout — the host test pins the
+// tokens, the chip and the title run.
+func paintFocusBadge(scan []byte, width, height int) int {
+	x, y, w, h := focusRect(width, height)
+	if w <= 0 || h <= 0 || len(scan)/4/width < y+h {
+		return 0
+	}
+	c := seatCanvas(scan, width, height)
+	if c == nil {
+		return 0
+	}
+	v := focusBadgeState()
+	tok := theme.Current
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	written := seatPlate(c, plate, radiusControl, tok.Accent, tok.ChromeBg)
+	draw.StrokeRoundedRect(c, plate, radiusControl, tok.BorderW, draw.Opaque(tok.Rule))
+	clip := plate.Inset(tok.BorderW)
+	// The scope chip anchors right: an Accent plate with the panel's own
+	// bg as its ink, sized to the label the state names.
+	chip := focusChipText(v.scope)
+	cw := seatTextWidth(chip, seatSmallPx) + 8
+	chipR := widgets.Rect{X: x + w - chromePad - cw, Y: y + 3, W: cw, H: h - 6}
+	draw.FillRoundedRect(c, chipR, radiusControl, draw.Opaque(tok.Accent))
+	seatText(c, clip, chipR.X+4, y+chromePad, seatSmallPx, chip, tok.ChromeBg)
+	// The title's clip stops short of the chip so a long title truncates
+	// at the seam instead of under the badge.
+	label := v.title
+	if v.scope == "seat" {
+		label = statusText
+	}
+	titleClip := widgets.Rect{X: clip.X, Y: clip.Y, W: chipR.X - chromePad - clip.X, H: clip.H}
+	tx, ty := chromeTextOrigin(x, y)
+	seatText(c, titleClip, tx, ty, seatTextPx, label, tok.Ink)
+	return written
 }
 
 // --- M71e (#1564): the empty-strip start surface ---------------------------

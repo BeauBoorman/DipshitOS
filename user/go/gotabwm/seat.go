@@ -426,6 +426,7 @@ func main() {
 	presents, ticks := 0, 0
 	for events := 0; !demoMode || (events < maxEvents && ticks < tickLimit); {
 		serviceRPC()
+		noteBadgeTransition()
 		if remote != nil {
 			if remote.drainInput() {
 				remote = nil
@@ -655,6 +656,9 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	if line, once := notifyCenterPaintMarker(centerPainted > 0, presented); once {
 		vi.ConsoleLine(line)
 	}
+	// M121d (#2567): the focus indicator's transition line — catches every
+	// state the input/RPC paths did not (choreography closes, restores).
+	noteBadgeTransition()
 	if line, once := dragGhostPaintMarker(ghostPainted > 0, presented); once {
 		vi.ConsoleLine(line)
 	}
@@ -777,6 +781,7 @@ func consumeSeatEvent(e vi.Event) bool {
 			return false
 		}
 		handleWmPointer(e)
+		noteBadgeTransition()
 		return false
 	}
 	if e.Kind == vi.EvWmKey {
@@ -785,6 +790,7 @@ func consumeSeatEvent(e vi.Event) bool {
 			return false
 		}
 		handleWmKey(e)
+		noteBadgeTransition()
 		// M107e (#2322): poll the host-integration lane on the input path,
 		// not only at the ~1 Hz composite tick — a host clipboard item the
 		// user pastes with ctrl-v would otherwise sit unapplied for up to a

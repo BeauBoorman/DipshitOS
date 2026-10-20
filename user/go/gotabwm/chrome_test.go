@@ -433,3 +433,258 @@ func TestPaintChromeRefusesDegenerateScanouts(t *testing.T) {
 func asUint32(scan []byte) []uint32 {
 	return unsafe.Slice((*uint32)(unsafe.Pointer(&scan[0])), len(scan)/4)
 }
+
+// --- M121d (#2567): the focus indicator ------------------------------------
+
+// saveBadgeState restores the badge's transition latch — the tests move
+// the reported state deliberately.
+func saveBadgeState() func() {
+	b := badgeReported
+	return func() { badgeReported = b }
+}
+
+func TestFocusRect(t *testing.T) {
+	x, y, w, h := focusRect(1280, 720)
+	cx, cy, _, _ := chromeRect(1280, 720)
+	if w != FocusW || h != ChromeH {
+		t.Fatalf("focusRect size = %dx%d want %dx%d", w, h, FocusW, ChromeH)
+	}
+	if x+w+focusGap != cx || y != cy {
+		t.Fatalf("focusRect %d,%d %dx%d not flush-left of the clock at %d,%d", x, y, w, h, cx, cy)
+	}
+	if x < 0 || y < 0 || x+w > 1280 || y+h > 720 {
+		t.Fatalf("focusRect %d,%d %dx%d escapes the scanout", x, y, w, h)
+	}
+	px, _, pw, _ := powerBtnRect(1280, 720)
+	if x < px+pw {
+		t.Fatalf("focusRect x=%d reaches into the power button (ends %d)", x, px+pw)
+	}
+	// The panel still fits when the band has room between the power
+	// button and the clock; on a crowded or tiny band it gives up.
+	if x, y, w, h := focusRect(800, 200); w != FocusW || h != ChromeH || x+w+focusGap != 644 {
+		t.Errorf("800x200 focusRect = %d,%d %dx%d want 424,192 %dx%d", x, y, w, h, FocusW, ChromeH)
+	}
+	if x, y, w, h := focusRect(500, 100); w != 0 || h != 0 || x != 0 || y != 0 {
+		t.Errorf("crowded band focusRect = %d,%d %dx%d want zero", x, y, w, h)
+	}
+	if x, y, w, h := focusRect(10, 10); w != 0 || h != 0 || x != 0 || y != 0 {
+		t.Errorf("tiny scanout focusRect = %d,%d %dx%d want zero", x, y, w, h)
+	}
+}
+
+// terminalFrontEndBin is the seat's only window-tty knowledge: the table
+// names the bins observed calling vi.TtyAttachWindow, on the stem so a
+// bare declared title classifies like the canonical ELF name.
+func TestTerminalFrontEndBin(t *testing.T) {
+	term := []string{
+		"GOTERM.ELF", "GOFILES.ELF", "GOSH.ELF", "GOHELP.ELF", "GOGITUI.ELF",
+		"RSS.ELF", "IMGCAT.ELF", "imgcat", "BTMATH.ELF", "CHARMHELLO.ELF",
+		"PULSE.ELF", "GOSTALGIA.ELF",
+	}
+	for _, b := range term {
+		if !terminalFrontEndBin(b) {
+			t.Errorf("terminalFrontEndBin(%q) = false, want term", b)
+		}
+	}
+	app := []string{"GOEDIT.ELF", "WEB.ELF", "GOCALC.ELF", "NOTE.ELF", "GOVIEW.ELF", "Edit", "", "GOTABWM.ELF"}
+	for _, b := range app {
+		if terminalFrontEndBin(b) {
+			t.Errorf("terminalFrontEndBin(%q) = true, want app", b)
+		}
+	}
+}
+
+func TestFocusBadgeStateTransitions(t *testing.T) {
+	defer saveSeatState()()
+	// Empty strip: the seat's own chords answer.
+	tabs = TabStrip{}
+	if v := focusBadgeState(); v.scope != "seat" || v.title != "" {
+		t.Fatalf("empty strip = %+v want scope=seat", v)
+	}
+	// An app tab: its own KEY_DOWN scope answers.
+	if !tabs.OpenTab(10, "Edit") {
+		t.Fatal("OpenTab Edit")
+	}
+	if v := focusBadgeState(); v.scope != "app" || v.title != "Edit" {
+		t.Fatalf("Edit focused = %+v want app/Edit", v)
+	}
+	// A tty-bound tab: the kernel's terminal chrome chords answer too.
+	if !tabs.OpenTab(11, "Term") || !tabs.FocusTab(11) {
+		t.Fatal("OpenTab/FocusTab Term")
+	}
+	if v := focusBadgeState(); v.scope != "term" || v.title != "Term" {
+		t.Fatalf("Term focused = %+v want term/Term", v)
+	}
+	// A seat modal holding the input sink overrides the rail's focus.
+	launch.open, launch.sink = true, 42
+	if v := focusBadgeState(); v.scope != "seat" {
+		t.Fatalf("launcher sink = %+v want seat", v)
+	}
+	launch.open, launch.sink = false, 0
+	powerMenuOpen, powerSink = true, 43
+	if v := focusBadgeState(); v.scope != "seat" {
+		t.Fatalf("power sink = %+v want seat", v)
+	}
+	powerMenuOpen, powerSink = false, 0
+	// Back to the focused tab, then closing it re-focuses the neighbour.
+	if v := focusBadgeState(); v.scope != "term" || v.title != "Term" {
+		t.Fatalf("sink released = %+v want term/Term", v)
+	}
+	if !tabs.CloseTab(11) {
+		t.Fatal("CloseTab Term")
+	}
+	if v := focusBadgeState(); v.scope != "app" || v.title != "Edit" {
+		t.Fatalf("after close = %+v want app/Edit", v)
+	}
+	if !tabs.CloseTab(10) {
+		t.Fatal("CloseTab Edit")
+	}
+	if v := focusBadgeState(); v.scope != "seat" {
+		t.Fatalf("last close = %+v want seat", v)
+	}
+}
+
+func TestFocusBadgeMarkerTransitions(t *testing.T) {
+	defer saveSeatState()()
+	defer saveBadgeState()()
+	badgeReported = focusBadgeView{}
+	if MarkerFocus != "gotabwm: focus " {
+		t.Fatalf("MarkerFocus = %q", MarkerFocus)
+	}
+	if l := focusBadgeLine(focusBadgeView{scope: "seat"}); l != "gotabwm: focus scope=seat" {
+		t.Fatalf("seat line = %q", l)
+	}
+	if l := focusBadgeLine(focusBadgeView{title: "Edit", scope: "app"}); l != "gotabwm: focus scope=app title=Edit" {
+		t.Fatalf("app line = %q", l)
+	}
+	// The transition reports at the state change, deduped on the last
+	// reported claim — rapid cycles each earn a line even when no paint
+	// ran between them. The reported latch is what the serial line names.
+	tabs = TabStrip{}
+	if !tabs.OpenTab(10, "Edit") {
+		t.Fatal("OpenTab")
+	}
+	noteBadgeTransition()
+	if badgeReported != (focusBadgeView{title: "Edit", scope: "app"}) {
+		t.Fatalf("first transition = %+v", badgeReported)
+	}
+	if !tabs.OpenTab(11, "Term") || !tabs.FocusTab(11) {
+		t.Fatal("FocusTab Term")
+	}
+	noteBadgeTransition()
+	if badgeReported != (focusBadgeView{title: "Term", scope: "term"}) {
+		t.Fatalf("term transition = %+v", badgeReported)
+	}
+	noteBadgeTransition()
+	if badgeReported != (focusBadgeView{title: "Term", scope: "term"}) {
+		t.Fatal("steady state reprinted")
+	}
+	if !tabs.CloseTab(11) || !tabs.CloseTab(10) {
+		t.Fatal("CloseTab")
+	}
+	noteBadgeTransition()
+	if badgeReported != (focusBadgeView{scope: "seat"}) {
+		t.Fatalf("close-to-seat = %+v", badgeReported)
+	}
+}
+
+func TestPaintFocusBadgeUsesTokens(t *testing.T) {
+	defer saveSeatState()()
+	defer saveBadgeState()()
+	const w, h = 1280, 720
+	scan := make([]byte, w*h*4)
+	tok := theme.Current
+	for i := 0; i < len(scan)/4; i++ {
+		asUint32(scan)[i] = theme.Light.Success
+	}
+	tabs = TabStrip{}
+	if !tabs.OpenTab(10, "Edit") {
+		t.Fatal("OpenTab")
+	}
+	if paintFocusBadge(scan, w, h) == 0 {
+		t.Fatal("paintFocusBadge painted nothing")
+	}
+	pix := asUint32(scan)
+	x, y, pw, ph := focusRect(w, h)
+	var panel, accent, ink int
+	for row := 0; row < h; row++ {
+		for col := 0; col < w; col++ {
+			v := pix[row*w+col]
+			inRect := col >= x && col < x+pw && row >= y && row < y+ph
+			if !inRect {
+				if v != theme.Light.Success {
+					t.Fatalf("paintFocusBadge wrote outside the panel at %d,%d", col, row)
+				}
+				continue
+			}
+			switch v & 0xffffff {
+			case tok.ChromeBg:
+				panel++
+			case tok.Accent:
+				accent++
+			case tok.Ink:
+				ink++
+			}
+		}
+	}
+	if panel == 0 {
+		t.Fatal("panel is not ChromeBg")
+	}
+	// The accent carries both the 2px seat rule and the scope chip — far
+	// more than the rule alone paints on a 20px plate.
+	if accent <= 2*ph {
+		t.Fatalf("accent pixels = %d, want the chip plus the rule", accent)
+	}
+	if ink == 0 {
+		t.Fatal("title has no Ink pixels")
+	}
+	if n := paintFocusBadge(nil, 0, 0); n != 0 {
+		t.Errorf("degenerate scanout painted %d pixels", n)
+	}
+}
+
+// The raster pin: the badge on the fonted registry carrying an app tab,
+// and on the bitmap degrade carrying a tty-bound tab — one golden per
+// text path and scope class.
+func paintGoldenBadge(t *testing.T) []byte {
+	t.Helper()
+	scan := make([]byte, vi.ScanoutWidth*vi.ScanoutHeight*4)
+	if paintFocusBadge(scan, vi.ScanoutWidth, vi.ScanoutHeight) == 0 {
+		t.Fatal("paintFocusBadge wrote nothing")
+	}
+	x, y, w, h := focusRect(vi.ScanoutWidth, vi.ScanoutHeight)
+	out := make([]byte, w*h*4)
+	for row := 0; row < h; row++ {
+		src := ((y + row) * vi.ScanoutWidth + x) * 4
+		copy(out[row*w*4:], scan[src:src+w*4])
+	}
+	return out
+}
+
+func TestFocusBadgeGolden(t *testing.T) {
+	defer saveSeatState()()
+	defer saveBadgeState()()
+	tok := theme.Current
+	theme.Current = theme.Dark
+	t.Cleanup(func() { theme.Current = tok })
+	stubSeatRegistry(t, seatRegistryFromRepo(t))
+	tabs = TabStrip{}
+	if !tabs.OpenTab(10, "Edit") {
+		t.Fatal("OpenTab")
+	}
+	checkSeatGolden(t, "seat-focus-badge", paintGoldenBadge(t), FocusW, ChromeH)
+}
+
+func TestFocusBadgeGoldenDegrade(t *testing.T) {
+	defer saveSeatState()()
+	defer saveBadgeState()()
+	tok := theme.Current
+	theme.Current = theme.Dark
+	t.Cleanup(func() { theme.Current = tok })
+	stubSeatRegistry(t, nil)
+	tabs = TabStrip{}
+	if !tabs.OpenTab(10, "Term") {
+		t.Fatal("OpenTab")
+	}
+	checkSeatGolden(t, "seat-focus-badge-degrade", paintGoldenBadge(t), FocusW, ChromeH)
+}
