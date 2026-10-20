@@ -2233,7 +2233,11 @@ vgate_assert 08 serial-absent 'gotabwm: drag cancel'
 vgate_assert 08 serial-absent 'gofiles: drag refused'
 
 # --- M124d: Open With -> GOVIEW.ELF (the 'o' handler list) -------------------
-vgate_assert 08 serial-contains 'gofiles: open with PIC.PNG type=image candidates=1'
+# candidates=2 is the registry's truth for type=image: mime.init registers
+# GOVIEW first and GOEDIT second ("Code Editor (raw bytes)", the fallback for
+# the formats GOVIEW has no decoder for) — go-fileman run 02 pins the same
+# count for PIC.QOI. A candidates=1 pin was this spec's own bug.
+vgate_assert 08 serial-contains 'gofiles: open with PIC.PNG type=image candidates=2'
 vgate_assert 08 serial-contains 'gofiles: open chose PIC.PNG type=image handler=GOVIEW.ELF'
 vgate_assert 08 serial-contains 'gofiles: open launched PIC.PNG handler=GOVIEW.ELF pid='
 vgate_assert 08 serial-absent 'gofiles: open launch refused'
@@ -2270,14 +2274,29 @@ i_seat = at("dogfood: seat")
 i_clip = at("clip: stored 8 bytes", i_seat)
 i_gf = at("gofiles: ready", i_clip)
 i_ge = at("goedit: read /host/FLOW/SEL.TXT n=17", i_gf)
-i_split = at("gotabwm: split v", i_ge)
-i_pub = at("gotabwm: sel pub id=", i_split)
-i_paste = at("goedit: paste n=8", i_pub)
+i_present = at("goedit: present", i_ge)
+i_split = at("gotabwm: split v", i_present)
+# App-vs-seat serial positions are NOT contract-pinned: each side drains
+# its own queue on its own M, so whichever is faster wins the byte race
+# (the M121e rule -- "the seat's mirror is processed after delivery";
+# on a loaded host `drag arm` was observed ahead of `saved`). What IS
+# pinned: goedit's chord answers queue in batch order (selpub -> paste ->
+# saved), the seat's `sel pub` RPC cannot predate the batch that sent it,
+# and the pointer script is phase-armed on `split v` so every drag/rail
+# marker follows it in the seat's own stream order.
+i_selpub = at("goedit: selpub n=17", i_present)
+i_paste = at("goedit: paste n=8", i_selpub)
 i_save = at("goedit: saved /host/FLOW/", i_paste)
-i_arm = at("gotabwm: drag arm id=", i_save)
-i_rcpt = at("gofiles: drag end delivered", i_arm)
-i_drop = at("goedit: drop text/plain n=8", i_rcpt)
-i_menu = at("gofiles: open with PIC.PNG", i_drop)
+i_pub = at("gotabwm: sel pub id=", i_present)
+i_arm = at("gotabwm: drag arm id=", i_split)
+i_ddrop = at("gotabwm: drag drop id=", i_arm)
+i_rclick = at("gotabwm: rail-click", i_ddrop)
+# The drop's Seq=0 notice posts BEFORE the seat's `drag drop` marker and
+# the source's Seq=1 receipt posts AFTER it (drag.go), so goedit's answer
+# anchors on the arm and gofiles' receipt anchors on the drop marker.
+i_drop = at("goedit: drop text/plain n=8", i_arm)
+i_rcpt = at("gofiles: drag end delivered", i_ddrop)
+i_menu = at("gofiles: open with PIC.PNG", i_rclick)
 i_launch = at("gofiles: open launched PIC.PNG handler=GOVIEW.ELF", i_menu)
 i_gv = at("gview: ready", i_launch)
 i_copy = at("gview: copy mime=image/png", i_gv)
@@ -2287,9 +2306,10 @@ i_echo = at("goterm: line echo sel-live-ok", i_sp)
 i_done = at("goterm: done status=0", i_echo)
 i_watch = at("gofiles: watch created ", i_save)
 print("M124f journey chain OK: seat -> clip-seed -> gofiles -> goedit -> "
-      "split -> selpub -> paste -> saved -> drag-arm -> drop -> delivered -> "
-      "openwith -> launched -> gview -> copy -> goterm -> sel-paste -> "
-      "echo -> done (watch@%d)" % i_watch)
+      "split | app lane: selpub -> paste -> saved | seat lane: sel-pub "
+      "-> drag-arm -> drop -> rail-click | goedit drop@%d gofiles "
+      "delivered@%d | openwith -> launched -> gview -> copy -> goterm -> "
+      "sel-paste -> echo -> done (watch@%d)" % (i_drop, i_rcpt, i_watch))
 PY
 
 # THE pixel proof: GOTERM's own scanout at the moment the pasted command
@@ -2427,7 +2447,7 @@ vgate_run 09 -- \
     --via-virtio --cvc-snap \
     --screen '$RUN_DIR/screen-09' \
     --snapshot-out '$RUN_DIR/snap-09' \
-    --snapshot-after 'gotabwm: palette open n=' \
+    --snapshot-after 'gotabwm: launcher presented' \
     --snapshot-after 'goedit: state restored' \
     --script '$RUN_DIR/script-09a.txt' \
     --script-after 'dogfood: seat' \
@@ -2437,7 +2457,7 @@ vgate_run 09 -- \
     --input-chords-after 'goedit: present' \
     --script3 '$RUN_DIR/script-09c.txt' \
     --script3-after 'goedit: state restored' \
-    --script-expect 'rx-m121f-ok' --timeout 420
+    --script-expect 'rx-m121f-ok' --script-expect-tail 90 --timeout 420
 
 # The LIVE default seat, restored-empty: no starter GOSH, no demo
 # choreography, no persisted wm row (the whole point of this spec).
@@ -2482,7 +2502,12 @@ vgate_assert 09 serial-count 'gotabwm: reorder ' 2
 vgate_assert 09 serial-contains 'gotabwm: pin id='
 vgate_assert 09 serial-contains 'gotabwm: host close id='
 vgate_assert 09 serial-contains 'gotabwm: tab close id='
-vgate_assert 09 serial-contains 'gotabwm: close'
+# The app-side half of the same close: the WIN_CLOSE the seam delivers is
+# observed and the editor exits by its own receipt. `gotabwm: close` is
+# NOT pinnable here -- that marker is the seat's bounded-loop exit line,
+# and this boot's seat is live mode (mode demo absent above), whose loop
+# never ends before the runner's hard vm.stop.
+vgate_assert 09 serial-contains 'goedit: close'
 vgate_assert 09 serial-contains 'gotabwm: reopen GOEDIT.ELF'
 vgate_assert 09 serial-absent 'gotabwm: reopen missing '
 
@@ -2491,6 +2516,10 @@ vgate_assert 09 serial-contains 'gotabwm: palette open n='
 vgate_assert 09 serial-contains 'gotabwm: palette filter q=sett n='
 vgate_assert 09 serial-contains 'gotabwm: palette exec GOSET.ELF'
 vgate_assert 09 serial-contains 'gotabwm: palette dismiss'
+# The plate's presented-frame receipt — the snapshot arm above keys on
+# this line, never on the open marker: a frame carrying the plate exists
+# on the scanout only after a composite actually presented it.
+vgate_assert 09 serial-contains 'gotabwm: launcher presented'
 vgate_assert 09 serial-absent 'gotabwm: palette missing '
 vgate_assert 09 serial-absent 'gotabwm: palette empty'
 # A seat-spawned exec prints no `exec: loaded` (that is the monitor
@@ -2510,6 +2539,9 @@ vgate_assert 09 serial-count 'goedit: declare accepted' 2
 # Four tab opens over the boot: GOTERM, GOEDIT, the palette's GOSET, and
 # the re-exec'd GOEDIT the reopen raised.
 vgate_assert 09 serial-count 'gotabwm: tab open id=' 4
+# The live-persistence proof needs >120 consumed heartbeats; a fast
+# journey can reach rx-m121f-ok in ~70, so the 90 s expect tail holds the
+# boot long enough to cross the demo bound deterministically.
 vgate_assert 09 serial-contains 'gotabwm: live steady tabs='
 vgate_assert 09 serial-contains 'rx-m121f-ok'
 
@@ -2553,9 +2585,18 @@ i_edit = at("goedit: present", i_term)
 i_dirty = at("goedit: dirty", i_edit)
 i_hints = at("goedit: hints n=", i_dirty)
 i_hclose = at("goedit: hints close", i_hints)
-i_uroute = at("gotabwm: undo id=", i_hclose)
-i_undo = at("goedit: undo n=0", i_uroute)
-i_move = at("gotabwm: reorder ", i_undo)
+# The undo leg pins route AND effect, never their serial order: the kernel
+# delivers the ctrl-z KEY_DOWN straight to the focused app (goedit's own
+# binding reverts the ring) while the seat's `undo id=` names the route when
+# it drains its own event queue — under an input burst that is millions of
+# scheduler-runs after the app's answer (applyUndo's own contract; go-wm-hid
+# run 17 pins the same "not pinned" rule). What IS ordered: app-side the
+# revert follows the escape that closed hints (one input queue), and
+# seat-side the route precedes the move chord (one event queue). The route
+# therefore anchors on the batch's own fire point, not on an app marker.
+i_undo = at("goedit: undo n=0", i_hclose)
+i_uroute = at("gotabwm: undo id=", i_edit)
+i_move = at("gotabwm: reorder ", i_uroute)
 i_pin = at("gotabwm: pin id=", i_move)
 i_popen = at("gotabwm: palette open n=", i_pin)
 i_pfilter = at("gotabwm: palette filter q=sett n=", i_popen)
@@ -2567,17 +2608,19 @@ i_edit2 = at("goedit: declare accepted", i_reopen)
 i_rest = at("goedit: state restored", i_edit2)
 i_ok = at("rx-m121f-ok", i_rest)
 print("M121f journey chain OK: seat -> goterm -> goedit -> dirty -> "
-      "hints -> hints-close -> undo-route -> undo -> reorder -> pin -> "
-      "palette -> filter -> exec -> close -> reopen -> state-restored "
-      "(goset declare@%d, edit redeclare@%d)" % (i_gset, i_edit2))
+      "hints -> hints-close -> undo(effect@%d) + undo-route@%d -> reorder -> "
+      "pin -> palette -> filter -> exec -> close -> reopen -> state-restored "
+      "(goset declare@%d, edit redeclare@%d)"
+      % (i_undo, i_uroute, i_gset, i_edit2))
 PY
 
 # The M121d badge's serial order, as an ordered subsequence (extra lines
 # are legal -- GOTERM's retitle can re-report, and the two trailing
 # declares race): boot seat -> GOTERM's declare (term) -> GOEDIT's
 # declare (app) -> the palette's seat-modal sink -> back to Edit on
-# dismiss -> the close landing on term -> both exec'd apps reach the
-# badge, in either order.
+# dismiss -> the close landing on term -> the reopened Edit. GOSET's
+# Settings badge is pinned only after the palette exec -- a declare's
+# arrival against seat-processed chords is a race both directions.
 vgate_assert 09 python <<'PY'
 import os, re, sys
 ser = open(os.environ["VG_SER"], errors="replace").read()
@@ -2600,15 +2643,23 @@ def match(chain, seq, label):
 
 # The whole-run walk, as an ordered subsequence: boot seat -> TERM's
 # declare -> Edit's declare -> palette's seat modal -> dismiss back to
-# Edit -> the exec'd Settings declare -> a term landing (the close's
-# fallback) -> the reopened Edit. GOTERM's retitle may re-report and the
-# trailing declares race, so extras are tolerated, not listed.
+# Edit -> the close's term landing -> the reopened Edit. Settings is NOT
+# in the spine: GOSET's exec is in flight while the seat chews the
+# close+reopen chords, and its declare badge lands wherever its boot
+# finishes -- before the close's term under a starved seat (the authored
+# order), after the reopen's Edit on a fast drain (both observed). What
+# IS pinned: the exec cannot declare before the seat fired it.
 match([("seat", ""), ("term", "Term"), ("app", "Edit"),
-       ("seat", ""), ("app", "Edit"), ("app", "Settings"),
-       ("term", "Term"), ("app", "Edit")],
+       ("seat", ""), ("app", "Edit"), ("term", "Term"),
+       ("app", "Edit")],
       lines, "journey")
+pexec = ser.index("gotabwm: palette exec GOSET.ELF")
+if not any(s == "app" and t.startswith("Settings") and p > pexec
+           for p, s, t in lines):
+    sys.exit("badge walk: no app/Settings badge after the palette exec "
+             "(lines seen: %r)" % lines)
 print("M121d badge walk OK: seat -> Term -> Edit -> seat(palette) -> "
-      "Edit -> Settings -> Term -> Edit")
+      "Edit -> Term(close) -> Edit(reopen); Settings badge unpinned")
 PY
 
 # ---------------------------------------------------------------------------
