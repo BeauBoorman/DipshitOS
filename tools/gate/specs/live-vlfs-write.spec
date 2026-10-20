@@ -11,8 +11,11 @@
 # assert is a recomputed expectation, not a pattern match. B then fills the
 # device: `vf write` past capacity must stop with the named `no_space`
 # refusal, and the earlier files still read back byte-exact after it.
+# Leg C (M134c #2761): a corrupted image is refused by name at mount —
+# `vlfs: mount refused check=inode_checksum` — and the boot continues
+# share-only (/disk verbs answer not_mounted, the monitor keeps running).
 # What this proves: commit ordering + fsync barrier + persistence across a
-# remount at completed-request granularity, plus two named refusals. What
+# remount at completed-request granularity, plus three named refusals. What
 # it does NOT prove: crash-ordered replay (M100e's kill gate owns that).
 
 vgate_name live-vlfs-write "M100d (#2309) class-B: journaled write->flush->readback->remount on VZ"
@@ -34,6 +37,21 @@ for line in Path("kernel/src/vlfs/testdata/empty-16m.regions").read_text().split
 assert img is not None and len(img) == 16 * 1024 * 1024
 Path(os.environ["RUN_DIR"], "vlfs.img").write_bytes(bytes(img))
 print("vlfs.img rebuilt from golden regions")
+
+# Leg C image: the committed inode-checksum fixture — the mount check
+# refuses it by name (kernel/src/vlfs/testdata/gen-corrupt.py regenerates).
+img = None
+for line in Path("kernel/src/vlfs/testdata/corrupt-inode-checksum.regions").read_text().splitlines():
+    if not line or line.startswith("#") or line == "vlfs-regions 1":
+        continue
+    if line.startswith("bytes "):
+        img = bytearray(int(line[6:]))
+        continue
+    off, hexs = line.split(" ", 1)
+    img[int(off):int(off) + len(hexs) // 2] = bytes.fromhex(hexs)
+assert img is not None and len(img) == 16 * 1024 * 1024
+Path(os.environ["RUN_DIR"], "corrupt.img").write_bytes(bytes(img))
+print("corrupt.img rebuilt from the inode-checksum fixture")
 PY
 
 vgate_file script-A.txt <<'EOF'
@@ -145,3 +163,19 @@ if not re.search(r"vf: cat ok bytes=\d+ rts=\d+ cksum=0x[0-9a-f]{4}", ser):
     sys.exit("FAIL: FILL.BIN readback line absent")
 print("run B: remounted bytes match run A; no_space after %s bytes" % m.group(1))
 PY
+
+# --- leg C: mount-time check refuses a corrupt image by name (M134c) ------
+vgate_file script-C.txt <<'EOF'
+vf ls /disk
+vf cat /disk/GATE.TXT
+echo vlfs-corrupt-refusal-done
+EOF
+
+vgate_run C -- --data-disk '$RUN_DIR/corrupt.img' --script '$RUN_DIR/script-C.txt' --script-expect 'vlfs-corrupt-refusal-done' --timeout 90
+
+vgate_assert C output-contains 'data-disk: ENABLED'
+vgate_assert C serial-contains 'vlfs: mount refused check=inode_checksum'
+vgate_assert C serial-absent 'vlfs: mounted /disk'
+vgate_assert C serial-contains 'vf ls: disk:/: not_mounted'
+vgate_assert C serial-contains 'vf cat: disk:GATE.TXT: not_mounted'
+vgate_assert C serial-absent '[EXC] parking:'

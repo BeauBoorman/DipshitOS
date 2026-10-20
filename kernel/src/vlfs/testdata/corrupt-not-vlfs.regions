@@ -1,0 +1,4 @@
+vlfs-regions 1
+# corrupt: fully zeroed image — no VLFS magic
+# expect: not_vlfs
+bytes 16777216

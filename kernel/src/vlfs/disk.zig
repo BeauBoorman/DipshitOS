@@ -49,6 +49,13 @@ pub var last_replayed: u32 = 0;
 var block_scratch: [vlfs.block_len]u8 align(64) = undefined;
 var compose_scratch: [vlfs.block_len]u8 align(64) = undefined;
 
+/// The mount check's working state (≈55 KiB of bitmaps, journal overlay,
+/// and a chain work block — M134c #2761). Live only inside attach().
+var check_state: vlfs.CheckState = undefined;
+/// `check=<name>` formatting for last_refusal — a check-phase refusal is
+/// named separately from a mount-structure refusal on the serial line.
+var refusal_buf: [96]u8 = undefined;
+
 /// Contained-open file handles minted by the fs_metadata backend (op 2).
 /// Plain slot-23 opens on `/disk` stay stateless in file_table and never
 /// land here. v1 bound: 8, matching the per-process handle table.
@@ -69,16 +76,22 @@ fn now() u64 {
     return timer.wall_epoch() orelse 0;
 }
 
-/// Attach and mount a VLFS volume. Returns true on success; on refusal the
-/// named reason is in `last_refusal` and the previous mount (if any) is
-/// gone — detach-before-attach keeps a stale mount from surviving a failed
-/// remount.
+/// Attach and mount a VLFS volume through the mount-time check (M134c
+/// #2761): a corrupt image is refused by name before any write reaches it.
+/// Returns true on success; on refusal the named reason is in
+/// `last_refusal` — `check=<name>` when the fsck pass failed, the plain
+/// refusal name for mount-structure failures — and the previous mount (if
+/// any) is gone: detach-before-attach keeps a stale mount from surviving a
+/// failed remount.
 pub fn attach(src: vlfs.SectorSource) bool {
     active = null;
     for (&contained_files) |*f| f.* = .{};
     last_replayed = 0;
-    const vol = vlfs.mount(src, &block_scratch) catch |err| {
-        last_refusal = vlfs.refusalName(err);
+    const vol = vlfs.mountChecked(src, &block_scratch, &check_state) catch |err| {
+        last_refusal = if (check_state.check_error != null)
+            std.fmt.bufPrint(&refusal_buf, "check={s}", .{vlfs.refusalName(err)}) catch "check=io_error"
+        else
+            vlfs.refusalName(err);
         return false;
     };
     epoch_ctr += 1;

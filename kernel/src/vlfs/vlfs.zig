@@ -22,6 +22,14 @@
 //! check on the read path fails the operation — `bad_inode`, `bad_dirent`,
 //! `bad_extent`, `extent_chain_corrupt` — never a hang, never invented
 //! bytes.
+//!
+//! **The mount-time check (M134c #2761).** `mountChecked` runs a bounded
+//! fsck — inode checksums/kinds vs the ibitmap, extent bounds/overlap/
+//! coverage, bbitmap consistency — against the journal's as-replayed
+//! overlay BEFORE any write, so a corrupt volume is refused by name having
+//! received no byte. Dirent and tree checks stay lazy on the read path;
+//! the host `--check` (tools/go/vlfs) owns the offline deep scan. `mount`
+//! is the unchecked form kept for the write-path tests.
 
 const std = @import("std");
 
@@ -51,6 +59,15 @@ pub const max_extent_blocks: u32 = 4;
 pub const extents_per_block: u32 = (block_len - 12) / 8; // 510
 pub const root_inode: u32 = 1;
 
+/// Volume blocks at the 1 GiB ceiling — the check's refs bitmap bound.
+pub const max_volume_blocks: u32 = max_volume_bytes / block_len; // 262144
+/// Bits of the block bitmap one bbitmap block carries (32768).
+pub const bits_per_map_block: u32 = 8 * block_len;
+/// The journal-region ceiling (the D3 sizing formula's clamp); also the
+/// bound on payload blocks across all live transactions — the mount
+/// check's overlay table is sized by it.
+pub const max_journal_blocks: u32 = 2048;
+
 pub const kind_free: u8 = 0;
 pub const kind_file: u8 = 1;
 pub const kind_dir: u8 = 2;
@@ -75,6 +92,17 @@ pub const Error = error{
     /// journal_unreplayed — committed transactions wait for replay but the
     /// source cannot write (the read path never serves pre-commit state).
     JournalUnreplayed,
+    /// inode_checksum — an itable slot's trailing FNV-1a fails (mount check).
+    InodeChecksum,
+    /// extent_out_of_range — an extent escapes the data region, or an
+    /// inode's coverage falls short of its size (mount check).
+    ExtentOutOfRange,
+    /// extent_overlap — two inodes claim the same block, or an extent
+    /// claims an extent-chain block (mount check).
+    ExtentOverlap,
+    /// bitmap_inconsistent — the ibitmap/bbitmap disagree with the inode
+    /// records and extent references (mount check).
+    BitmapInconsistent,
     /// not_mounted — no attached volume (file_table maps this to ENOENT).
     NotMounted,
     /// The path component does not exist.
@@ -131,6 +159,10 @@ pub fn refusalName(err: Error) []const u8 {
         error.VolumeTooSmall => "volume_too_small",
         error.VolumeTooLarge => "volume_too_large",
         error.JournalUnreplayed => "journal_unreplayed",
+        error.InodeChecksum => "inode_checksum",
+        error.ExtentOutOfRange => "extent_out_of_range",
+        error.ExtentOverlap => "extent_overlap",
+        error.BitmapInconsistent => "bitmap_inconsistent",
         error.NotMounted => "not_mounted",
         error.NotFound => "not_found",
         error.NotDir => "not_directory",
@@ -474,26 +506,76 @@ pub fn fnv32Continue(h: u32, bytes: []const u8) u32 {
     return hash;
 }
 
+/// One journal-overlay entry: a committed transaction's payload block at
+/// journal block `src` lands on home block `dest` at replay.
+const DestRef = struct { dest: u32, src: u32 };
+
+/// The mount-time check's working state (≈55 KiB BSS): the journal
+/// overlay, the referenced-block bitmap, the inode-liveness copy, a second
+/// work block for extent chains, and the check-phase refusal for the
+/// `check=<name>` verdict line. One per mount — disk.zig owns the live
+/// instance; tests carry their own.
+pub const CheckState = struct {
+    /// dest→journal-block pairs for every payload block of every committed
+    /// transaction at the journal head, in journal order — the fsck
+    /// overlay (ADR D5's in-memory replay, literal). Latest writer wins:
+    /// checkRead scans from the tail.
+    dests: [max_journal_blocks]DestRef = undefined,
+    dest_count: u32 = 0,
+    /// One bit per volume block: "some inode's extents claim this data
+    /// block" — the overlap oracle and the bbitmap's cross-check.
+    refs: [max_volume_blocks / 8]u8 = undefined,
+    /// One bit per inode copied out of the on-disk ibitmap.
+    ib_used: [max_inodes / 8]u8 = undefined,
+    /// The check's second work block: extent-chain blocks are read here
+    /// while the caller's scratch holds the itable/bbitmap block under
+    /// iteration.
+    chain: [block_len]u8 align(64) = undefined,
+    /// Set by mountChecked when the refusal came from the check phase —
+    /// attach() renders those as `check=<name>`.
+    check_error: ?Error = null,
+};
+
 /// Scan the journal from the region start. Returns the count of fully valid
 /// committed transactions found at the head (the `expected` sequence starts
-/// at journal_applied + 1 and each record must carry it).
-fn scanJournal(src: SectorSource, sb: Superblock, scratch: *[block_len]u8) Error!u32 {
+/// at journal_applied + 1 and each record must carry it). With a CheckState
+/// it also records each transaction's dest→journal-block pairs — the mount
+/// check's as-replayed overlay.
+fn journalWalk(src: SectorSource, sb: Superblock, scratch: *[block_len]u8, st: ?*CheckState) Error!u32 {
     var live: u32 = 0;
     var pos = sb.journal_first;
     var expected = sb.journal_applied + 1;
     var probe = sb;
     while (pos < sb.journal_first + sb.journal_blocks) {
         probe.journal_applied = expected - 1;
-        switch (try checkJournalRecord(src, probe, pos, scratch)) {
-            .valid => |n| {
-                live += 1;
-                expected += 1;
-                pos += n + 2;
-            },
+        const n = switch (try checkJournalRecord(src, probe, pos, scratch)) {
+            .valid => |n| n,
             .torn => break,
+        };
+        if (st) |s| {
+            // Re-read DESC for the dest table (scratch holds COMMIT).
+            if (!src.readBlock(pos, scratch)) return error.Io;
+            for (0..n) |i| {
+                if (s.dest_count >= max_journal_blocks) return error.BadJournal;
+                s.dests[s.dest_count] = .{
+                    .dest = rd32(scratch, jd_entries + 8 * @as(usize, @intCast(i))),
+                    .src = pos + 1 + @as(u32, @intCast(i)),
+                };
+                s.dest_count += 1;
+            }
         }
+        live += 1;
+        expected += 1;
+        pos += n + 2;
     }
     return live;
+}
+
+/// Scan the journal from the region start. Returns the count of fully valid
+/// committed transactions found at the head (the `expected` sequence starts
+/// at journal_applied + 1 and each record must carry it).
+fn scanJournal(src: SectorSource, sb: Superblock, scratch: *[block_len]u8) Error!u32 {
+    return journalWalk(src, sb, scratch, null);
 }
 
 /// Replay the live journal transactions (ADR D5): each committed payload
@@ -566,12 +648,9 @@ pub fn writeSuperblockSector(sector: *[sector_len]u8, s: Superblock) void {
     std.mem.writeInt(u32, sector[sb_cksum..][0..4], fnv32(sector[0..sb_cksum]), .little);
 }
 
-/// Mount: validate both superblocks, keep the highest-seq valid copy, bound
-/// the volume against the device size, then scan the journal. A clean or
-/// torn-empty journal mounts directly; committed transactions replay when
-/// the source is writable and refuse the mount (`journal_unreplayed`) when
-/// it is not — reads never serve a half-checkpointed state.
-pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
+/// Validate both superblocks and keep the highest-seq valid copy — the
+/// shared head of mount()/mountChecked().
+fn selectSuperblock(src: SectorSource) Error!Superblock {
     var best: ?Superblock = null;
     var first_bad: ?Error = null;
     var saw_magic = false;
@@ -590,11 +669,39 @@ pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
             },
         }
     }
-    var sb = best orelse return if (saw_magic) (first_bad orelse error.BadSuperblock) else error.NotVlfs;
+    return best orelse if (saw_magic) (first_bad orelse error.BadSuperblock) else error.NotVlfs;
+}
+
+/// Mount: validate both superblocks, keep the highest-seq valid copy, bound
+/// the volume against the device size, then scan the journal. A clean or
+/// torn-empty journal mounts directly; committed transactions replay when
+/// the source is writable and refuse the mount (`journal_unreplayed`) when
+/// it is not — reads never serve a half-checkpointed state. This is the
+/// unchecked form kept for the write-path tests; the attach path mounts
+/// through `mountChecked`.
+pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
+    return mountChecked(src, scratch, null);
+}
+
+/// Mount with the D5 fsck contract applied (M134c #2761): after the journal
+/// scan builds the dest overlay, a bounded structural check evaluates the
+/// as-replayed state BEFORE any write, so a corrupt volume is refused by
+/// name having received no byte — replay proceeds only for a volume that
+/// checks clean. A check failure sets `st.check_error`; attach() renders
+/// the verdict as `check=<name>`.
+pub fn mountChecked(src: SectorSource, scratch: *[block_len]u8, st: ?*CheckState) Error!Volume {
+    if (st) |s| s.* = .{};
+    var sb = try selectSuperblock(src);
     if (src.total_sectors != 0 and sb.volume_bytes > src.total_sectors * sector_len)
         return error.GeometryMismatch;
 
-    const live = try scanJournal(src, sb, scratch);
+    const live = try journalWalk(src, sb, scratch, st);
+    if (st) |s| {
+        checkVolume(src, sb, s, scratch) catch |err| {
+            s.check_error = err;
+            return err;
+        };
+    }
     if (live > 0) {
         if (!src.writable()) return error.JournalUnreplayed;
         try replayJournal(src, &sb, live, scratch);
@@ -622,6 +729,153 @@ pub fn mount(src: SectorSource, scratch: *[block_len]u8) Error!Volume {
 }
 
 // ---------------------------------------------------------------------------
+// The mount-time check (M134c #2761) — ADR 0050 D5's fsck contract, bounded
+// to inode checksums/kinds, extent integrity, and bitmap consistency; all
+// evaluated through the journal overlay, the same as-replayed state the
+// host `--check` computes in memory. Dirent/tree checks stay out of the
+// mount path: the read path refuses those lazily (bad_dirent family) and
+// offline fsck owns the deep scan.
+// ---------------------------------------------------------------------------
+
+/// Bit i of a bitmap (LSB-first per byte — the D3 bitmap order).
+fn bitmapBit(map: []const u8, i: u32) bool {
+    return map[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0;
+}
+
+/// Read block `blk` as the journal overlay reports it: a committed payload
+/// dest redirects to its journal block (latest writer wins — dests are in
+/// journal order, so scan from the tail). Everything else reads home.
+fn checkRead(st: *CheckState, src: SectorSource, blk: u32, out: *[block_len]u8) bool {
+    var i = st.dest_count;
+    while (i > 0) {
+        i -= 1;
+        if (st.dests[i].dest == blk) return src.readBlock(st.dests[i].src, out);
+    }
+    return src.readBlock(blk, out);
+}
+
+/// Set block `b`'s reference bit; an already-set bit is extent_overlap.
+fn refMark(st: *CheckState, b: u32) Error!void {
+    if (bitmapBit(&st.refs, b)) return error.ExtentOverlap;
+    st.refs[b / 8] |= @as(u8, 1) << @intCast(b % 8);
+}
+
+/// Mark one extent's blocks in refs; out-of-data-range is
+/// extent_out_of_range, an already-claimed block is extent_overlap.
+/// Returns the extent's block count.
+fn markExtent(st: *CheckState, sb: Superblock, first: u32, count: u32) Error!u64 {
+    if (first < sb.data_first or count == 0 or @as(u64, first) + count > sb.volume_blocks)
+        return error.ExtentOutOfRange;
+    var b = first;
+    while (b < first + count) : (b += 1) try refMark(st, b);
+    return count;
+}
+
+/// Walk one live inode's inline extents and its extent-block chain,
+/// marking every claimed data block in refs and returning the file's
+/// covered block count. Chain blocks themselves count as references, so a
+/// data extent claiming one — or a second inode's chain — is overlap.
+fn checkExtents(src: SectorSource, sb: Superblock, st: *CheckState, rec: *const [inode_len]u8) Error!u64 {
+    var covered: u64 = 0;
+    const next: usize = @min(@as(usize, rd16(rec, in_nextents)), inline_extents);
+    for (0..next) |e| {
+        covered += try markExtent(st, sb, rd32(rec, in_extents + e * 8), rd32(rec, in_extents + e * 8 + 4));
+    }
+    var chain = rd32(rec, in_next_ext);
+    var depth: u32 = 0;
+    while (chain != 0) {
+        if (depth >= max_extent_blocks) return error.ExtentOverflow;
+        depth += 1;
+        if (chain < sb.data_first or chain >= sb.volume_blocks) return error.ExtentOutOfRange;
+        try refMark(st, chain);
+        if (!checkRead(st, src, chain, &st.chain)) return error.Io;
+        if (rd32(&st.chain, xb_magic) != magic_extent or
+            rd32(&st.chain, xb_cksum) != fnv32(st.chain[0..xb_cksum]) or
+            rd16(&st.chain, xb_resv) != 0) return error.ExtentChainCorrupt;
+        const cnt = rd16(&st.chain, xb_count);
+        if (cnt > extents_per_block) return error.ExtentChainCorrupt;
+        for (0..cnt) |e| {
+            covered += try markExtent(st, sb, rd32(&st.chain, xb_extents + e * 8), rd32(&st.chain, xb_extents + e * 8 + 4));
+        }
+        chain = rd32(&st.chain, xb_next);
+    }
+    return covered;
+}
+
+/// The bounded structural check: inode checksums/kinds against the ibitmap,
+/// every extent inside the data region and non-overlapping with coverage
+/// to size, then the bbitmap explained by exactly one reference (leaks and
+/// unmarked use both refuse). Reads go through checkRead, so the verdict
+/// is the as-replayed verdict.
+fn checkVolume(src: SectorSource, sb: Superblock, st: *CheckState, scratch: *[block_len]u8) Error!void {
+    // The ibitmap copies out once — the inode passes consult it by bit.
+    const ib_bytes: usize = (sb.inode_count + 7) / 8;
+    if (!checkRead(st, src, sb.ibitmap_first, scratch)) return error.Io;
+    @memcpy(st.ib_used[0..ib_bytes], scratch[0..ib_bytes]);
+
+    // Inode table: checksum and kind on every slot, then the ibitmap
+    // cross-check — a set bit on a free slot or a live slot unmarked is
+    // bitmap_inconsistent (inode 0 is exempt: it is pre-allocated free).
+    var root_kind: u8 = kind_free;
+    var i: u32 = 0;
+    while (i < sb.inode_count) : (i += 1) {
+        if (i % inodes_per_block == 0) {
+            if (!checkRead(st, src, sb.itable_first + i / inodes_per_block, scratch)) return error.Io;
+        }
+        const rec = scratch[(i % inodes_per_block) * inode_len ..][0..inode_len];
+        if (rd32(rec, in_cksum) != fnv32(rec[0..in_cksum])) return error.InodeChecksum;
+        const kind = rec[in_kind];
+        if (kind != kind_free and kind != kind_file and kind != kind_dir) return error.BadInode;
+        if (i == root_inode) root_kind = kind;
+        const used = bitmapBit(&st.ib_used, i);
+        if (i != 0 and used and kind == kind_free) return error.BitmapInconsistent;
+        if (!used and kind != kind_free) return error.BitmapInconsistent;
+    }
+    if (!bitmapBit(&st.ib_used, 0)) return error.BitmapInconsistent;
+    if (root_kind != kind_dir) return error.BadInode;
+
+    // Extents: bounds, cross-inode overlap, and coverage ≥ ⌈size/4096⌉.
+    // A checksum-failed slot already refused above; skip it here rather
+    // than walk extents nobody validated.
+    @memset(st.refs[0 .. (sb.volume_blocks + 7) / 8], 0);
+    i = 0;
+    while (i < sb.inode_count) : (i += 1) {
+        if (i % inodes_per_block == 0) {
+            if (!checkRead(st, src, sb.itable_first + i / inodes_per_block, scratch)) return error.Io;
+        }
+        const raw = scratch[(i % inodes_per_block) * inode_len ..][0..inode_len];
+        if (!bitmapBit(&st.ib_used, i) or raw[in_kind] == kind_free) continue;
+        if (rd32(raw, in_cksum) != fnv32(raw[0..in_cksum])) continue;
+        var rec: [inode_len]u8 = undefined;
+        @memcpy(&rec, raw);
+        const covered = try checkExtents(src, sb, st, &rec);
+        const need = (@as(u64, rd32(&rec, in_size)) + block_len - 1) / block_len;
+        if (covered < need) return error.ExtentOutOfRange;
+    }
+
+    // bbitmap: every structural block marked; every data-region bit
+    // explained by exactly one reference. The map spans bbitmap_blocks
+    // blocks — reload the covering map block only when the bit index
+    // crosses bits_per_map_block.
+    var bb_idx: u32 = std.math.maxInt(u32);
+    var b: u32 = 0;
+    while (b < sb.volume_blocks) : (b += 1) {
+        const idx = b / bits_per_map_block;
+        if (idx != bb_idx) {
+            bb_idx = idx;
+            if (!checkRead(st, src, sb.bbitmap_first + idx, scratch)) return error.Io;
+        }
+        const marked = bitmapBit(scratch, b % bits_per_map_block);
+        const referenced = bitmapBit(&st.refs, b);
+        if (b < sb.data_first) {
+            if (!marked) return error.BitmapInconsistent;
+        } else if (marked != referenced) {
+            return error.BitmapInconsistent;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inodes (128-B records in the itable; slot i = inode i)
 // ---------------------------------------------------------------------------
 
@@ -638,6 +892,7 @@ pub const in_cksum: usize = 124;
 pub const xb_magic: usize = 0;
 pub const xb_next: usize = 4;
 pub const xb_count: usize = 8;
+pub const xb_resv: usize = 10;
 pub const xb_extents: usize = 12;
 pub const xb_cksum: usize = block_len - 4;
 
@@ -1236,6 +1491,106 @@ test "vlfs: mount replays a committed transaction; read-only refuses" {
         .next_txn_seq = vol2.next_txn_seq,
         .slot = vol2.sb_slot,
     }, &test_scratch));
+}
+
+// ---------------------------------------------------------------------------
+// M134c (#2761): the corrupt corpus — committed fixtures whose `# expect:`
+// line is the host `--check` verdict on the same bytes (regenerate with
+// testdata/gen-corrupt.py). mountChecked must reach the same verdict;
+// `clean` means the image mounts.
+// ---------------------------------------------------------------------------
+
+const corpus_names = [_][]const u8{
+    "corrupt-not-vlfs.regions",
+    "corrupt-bad-superblock.regions",
+    "corrupt-unsupported-version.regions",
+    "corrupt-geometry-mismatch.regions",
+    "corrupt-inode-checksum.regions",
+    "corrupt-bad-inode-kind.regions",
+    "corrupt-extent-out-of-range.regions",
+    "corrupt-extent-coverage.regions",
+    "corrupt-extent-overlap.regions",
+    "corrupt-extent-chain-corrupt.regions",
+    "corrupt-extent-overflow.regions",
+    "corrupt-bitmap-leak.regions",
+    "corrupt-bitmap-unmarked.regions",
+    "corrupt-ibitmap-free.regions",
+    "corrupt-ibitmap-clear.regions",
+    "corrupt-journal-torn.regions",
+    "corrupt-journal-overlay.regions",
+    "corrupt-journal-with-cksum.regions",
+};
+
+const CorpusCase = struct { name: []const u8, expect: []const u8, regions: []const u8 };
+
+const corpus = blk: {
+    @setEvalBranchQuota(100_000);
+    var cases: [corpus_names.len]CorpusCase = undefined;
+    for (corpus_names, 0..) |name, i| {
+        const regions = @embedFile("testdata/" ++ name);
+        var expect: []const u8 = "";
+        var it = std.mem.splitScalar(u8, regions, '\n');
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "# expect: ")) {
+                expect = line["# expect: ".len..];
+                break;
+            }
+        }
+        cases[i] = .{ .name = name, .expect = expect, .regions = regions };
+    }
+    break :blk cases;
+};
+
+/// Mount-phase refusal names — a verdict outside this set is a check-phase
+/// verdict, so `check_error` must be set (attach renders it `check=<name>`).
+fn mountPhaseVerdict(name: []const u8) bool {
+    const mount_phase = [_][]const u8{
+        "io_error",            "not_vlfs",           "bad_superblock",
+        "unsupported_version", "geometry_mismatch",  "volume_too_small",
+        "volume_too_large",    "journal_unreplayed",
+    };
+    for (mount_phase) |m| {
+        if (std.mem.eql(u8, name, m)) return true;
+    }
+    return false;
+}
+
+test "vlfs check: corrupt corpus verdicts match --check, refused before any write" {
+    var st: CheckState = undefined;
+    for (corpus) |case| {
+        try buildImage(case.regions, &image_buf);
+        var disk = MemDisk{ .img = &image_buf };
+        const vol = mountChecked(disk.rw(), &test_scratch, &st) catch |err| {
+            try std.testing.expectEqualStrings(case.expect, refusalName(err));
+            // The check refused before any write: a corrupt image received
+            // no byte — replay waits for a clean verdict (the
+            // journal-with-cksum fixture pins this with a pending txn).
+            try std.testing.expectEqual(@as(u32, 0), disk.writes);
+            try std.testing.expectEqual(mountPhaseVerdict(case.expect) == false, st.check_error != null);
+            continue;
+        };
+        try std.testing.expectEqualStrings("clean", case.expect);
+        _ = vol;
+    }
+}
+
+test "vlfs check: committed txn overlay repairs the verdict; read-only still refuses replay" {
+    // corrupt-journal-overlay.regions carries a home-state
+    // bitmap_inconsistent that only the committed transaction repairs —
+    // the check sees the as-replayed overlay (clean), then replay lands it.
+    try buildImage(@embedFile("testdata/corrupt-journal-overlay.regions"), &image_buf);
+    var disk = MemDisk{ .img = &image_buf };
+    var st: CheckState = undefined;
+    const vol = try mountChecked(disk.rw(), &test_scratch, &st);
+    try std.testing.expectEqual(@as(u32, 1), vol.replayed);
+    try std.testing.expect(disk.writes > 0);
+
+    // The same image on a read-only source: the overlay checks clean but
+    // replay cannot run, so the operational refusal stands.
+    try buildImage(@embedFile("testdata/corrupt-journal-overlay.regions"), &image_buf);
+    var ro = MemDisk{ .img = &image_buf };
+    var st2: CheckState = undefined;
+    try std.testing.expectError(error.JournalUnreplayed, mountChecked(ro.ro(), &test_scratch, &st2));
 }
 
 test "vlfs: torn journal tail is discarded, mount still succeeds" {
