@@ -114,6 +114,12 @@ set GREET=hello-vars
 echo V=$GREET > /host/GOSHVARS.TXT
 echo shrunk-body > /host/GOOSHSHRINK.TXT
 echo first-appended >> /host/GOSHVARS.TXT
+cat <<HDOC > /host/GOSHHDOC.TXT
+expanded $GREET
+HDOC
+cat <<'QT' >> /host/GOSHHDOC.TXT
+literal $GREET
+QT
 echo alpha-beta | grep alpha > /host/GOSHPIPE.TXT
 exec GOSH.ELF -c "exit 7"
 echo rc=$? > /host/GOSHRC.TXT
@@ -144,6 +150,8 @@ for name, build in (
         sys.exit(name + " missing (expected " + src + ") - build it first: " + build)
     shutil.copy(src, os.path.join(share, name))
 shutil.copy(os.path.join(rd, "STARTUP.SH"), os.path.join(share, "STARTUP.SH"))
+# M138a (#2775): the unterminated-heredoc script the run-06 -c child sources.
+shutil.copy(os.path.join(rd, "GOSHUNTERM.SH"), os.path.join(share, "GOSHUNTERM.SH"))
 # M81e2 (#1787): seed the shrink target LONG, so STARTUP.SH's
 # `echo shrunk-body > /host/GOOSHSHRINK.TXT` is a replace that SHRINKS. An
 # in-place writer that opens without truncating leaves the tail of this body
@@ -234,6 +242,12 @@ vgate_assert 01 serial-absent 'exited status=139'
 # `>>` appended AFTER the `>` redirect above, so the file is the redirect's
 # body plus one appended line -- an append that replaced instead would read
 # back as just `first-appended`.
+# M138a (#2775): the two heredoc bodies above land byte-equal — the first
+# expands $GREET the way any unquoted <<WORD body does, the second keeps
+# $GREET literal because 'QT' was a quoted delimiter. An expander that ran
+# on the quoted body (or skipped the unquoted one) flips a byte and fails.
+vgate_assert 01 serial-contains 'gosh: line cat <<HDOC > /host/GOSHHDOC.TXT'
+vgate_assert 01 share-equals GOSHHDOC.TXT $'expanded hello-vars\nliteral $GREET\n'
 vgate_assert 01 share-equals GOSHVARS.TXT $'V=hello-vars\nfirst-appended\n'
 vgate_assert 01 share-equals GOSHPIPE.TXT $'alpha-beta\n'
 vgate_assert 01 share-equals GOSHRC.TXT $'rc=7\n'
@@ -344,6 +358,39 @@ vgate_assert 04 serial-contains 'rx-gosh-open-unknown-ok'
 vgate_assert 04 serial-absent 'gosh: open launched'
 vgate_assert 04 serial-absent '[EXC] parking:'
 vgate_assert 04 serial-absent 'exited status=139'
+
+# --- M138a (#2775): a heredoc with no body is a named refusal ------------
+# The kernel monitor itself collects `<<` bodies (kernel/src/shell.zig), so
+# an unterminated case typed as `exec GOSH.ELF -c "cat <<DONE"` would be
+# eaten by the MONITOR's own heredoc reader and never reach GOSH. The
+# refusal is therefore produced by a sourced script on the share — the
+# file ends mid-body, which is exactly `gosh: heredoc: unterminated <DONE>`:
+# never a silent empty stdin, never a mis-parsed `<` redirect.
+vgate_file GOSHUNTERM.SH <<'EOF'
+cat <<DONE
+this body never ends
+EOF
+
+vgate_file heredoc-unterm.txt <<'EOF'
+exec GOSH.ELF -c "source /host/GOSHUNTERM.SH"
+EOF
+
+vgate_file finish-heredoc-unterm.txt <<'EOF'
+echo rx-gosh-heredoc-unterm-ok
+EOF
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-heredoc-unterm' \
+    --via-virtio \
+    --script '$RUN_DIR/heredoc-unterm.txt' \
+    --script2 '$RUN_DIR/finish-heredoc-unterm.txt' \
+    --script2-after 'gosh: heredoc: unterminated <DONE>' \
+    --script-expect 'rx-gosh-heredoc-unterm-ok' --timeout 240
+
+vgate_assert 06 serial-contains 'gosh: heredoc: unterminated <DONE>'
+vgate_assert 06 serial-contains 'rx-gosh-heredoc-unterm-ok'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'exited status=139'
 
 # --- M83c (#1776): date under a SECOND zone -------------------------------
 # `date` formats the epoch in the `timezone` row's fixed offset and labels

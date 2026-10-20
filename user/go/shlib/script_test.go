@@ -812,3 +812,314 @@ func TestEngineScriptEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Heredocs (M138a, issue #2775)
+// ---------------------------------------------------------------------------
+
+// hdBodies drives the collector the way a line source does: Feed every
+// following line and require all declared delimiters to close.
+func hdBodies(t *testing.T, line string, feed ...string) [][]byte {
+	t.Helper()
+	r, err := NewHeredocReader(line)
+	if err != nil {
+		t.Fatalf("NewHeredocReader(%q): %v", line, err)
+	}
+	for _, ln := range feed {
+		r.Feed(ln)
+	}
+	if r.Waiting() {
+		t.Fatalf("still waiting on <%s> after %q", r.Delim(), feed)
+	}
+	return r.Bodies()
+}
+
+func TestScanHeredocs(t *testing.T) {
+	specs, err := scanHeredocs("cat <<EOF")
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("specs = %+v err=%v", specs, err)
+	}
+	if specs[0].delim != "EOF" || !specs[0].expand || specs[0].stripTabs {
+		t.Fatalf("plain spec = %+v", specs[0])
+	}
+	if specs[0].at != 4 || specs[0].end != 9 {
+		t.Fatalf("site = %d..%d, want 4..9", specs[0].at, specs[0].end)
+	}
+	for _, c := range []struct {
+		line          string
+		delim         string
+		expand, strip bool
+	}{
+		{"cat <<'E'", "E", false, false},
+		{"cat <<\"E\"", "E", false, false},
+		{"cat <<-E", "E", true, true},
+		{"cat <<-'E'", "E", false, true},
+		{"cat <<- 'E'", "E", false, true},
+		{"cat a<<E b", "E", true, false},
+		{"cat <<E\\OF", "EOF", false, false}, // \-escape quotes the delimiter
+		{"cat <<'E'x", "Ex", false, false},   // adjacent segments concatenate
+	} {
+		specs, err := scanHeredocs(c.line)
+		if err != nil || len(specs) != 1 {
+			t.Fatalf("%q: specs = %+v err=%v", c.line, specs, err)
+		}
+		if specs[0].delim != c.delim || specs[0].expand != c.expand || specs[0].stripTabs != c.strip {
+			t.Fatalf("%q: spec = %+v, want delim=%q expand=%v strip=%v",
+				c.line, specs[0], c.delim, c.expand, c.strip)
+		}
+	}
+	// Several heredocs on one line, in declaration order — `;` is still
+	// text here, so this scan is the quote-aware one, not the tokenizer.
+	specs, err = scanHeredocs("cat <<A; cat <<'B'")
+	if err != nil || len(specs) != 2 {
+		t.Fatalf("two-per-line: %+v err=%v", specs, err)
+	}
+	if specs[0].delim != "A" || !specs[0].expand || specs[1].delim != "B" || specs[1].expand {
+		t.Fatalf("pair = %+v", specs)
+	}
+	// A quoted `<<`, an escaped `<`, a comment, and a `$(...)` interior.
+	for _, line := range []string{`echo '<<x'`, `echo "<<x"`, `cat \<<E`} {
+		if specs, err := scanHeredocs(line); err != nil || len(specs) != 0 {
+			t.Fatalf("%q declared: %+v err=%v", line, specs, err)
+		}
+	}
+	specs, _ = scanHeredocs("cat <<E # <<F is comment")
+	if len(specs) != 1 || specs[0].delim != "E" {
+		t.Fatalf("comment did not end the scan: %+v", specs)
+	}
+	specs, _ = scanHeredocs("echo $(cat <<IN)")
+	if len(specs) != 1 || specs[0].delim != "IN" {
+		t.Fatalf("subst interior not scanned: %+v", specs)
+	}
+	// ...but a `<<` inside arithmetic is a shift, not a heredoc.
+	if specs, _ := scanHeredocs("echo $((1<<4)) x"); len(specs) != 0 {
+		t.Fatalf("arithmetic shift declared: %+v", specs)
+	}
+	// The named refusals: here-strings by name, a bare << wants its word,
+	// and unbalanced quoting reports the tokenizer's own errors.
+	if _, err := scanHeredocs("cat <<<x"); err == nil ||
+		!strings.Contains(err.Error(), "here-strings") {
+		t.Fatalf("<<< err = %v", err)
+	}
+	if _, err := scanHeredocs("cat <<"); err == nil ||
+		!strings.Contains(err.Error(), "delimiter word") {
+		t.Fatalf("bare << err = %v", err)
+	}
+	if _, err := scanHeredocs("cat <<'E"); err == nil ||
+		!strings.Contains(err.Error(), "unterminated") {
+		t.Fatalf("unterminated quote err = %v", err)
+	}
+}
+
+func TestHeredocReader(t *testing.T) {
+	r, err := NewHeredocReader("cat <<A; cat <<B")
+	if err != nil || !r.Waiting() || r.Delim() != "A" {
+		t.Fatalf("reader = %+v err=%v", r, err)
+	}
+	r.Feed("a1")
+	r.Feed("")
+	r.Feed("A") // blank lines are body content
+	if !r.Waiting() || r.Delim() != "B" {
+		t.Fatalf("after A: waiting=%v delim=%q", r.Waiting(), r.Delim())
+	}
+	r.Feed("b1")
+	r.Feed("B")
+	if r.Waiting() {
+		t.Fatal("still waiting after B")
+	}
+	got := r.Bodies()
+	if len(got) != 2 || string(got[0]) != "a1\n\n" || string(got[1]) != "b1\n" {
+		t.Fatalf("bodies = %q", got)
+	}
+	// `<<-` strips leading tabs on body lines and tolerates them on the
+	// terminator; a plain `<<` demands the delimiter byte-exact.
+	r, _ = NewHeredocReader("cat <<-E")
+	r.Feed("\t\tone")
+	r.Feed("\ttwo")
+	r.Feed("\tE")
+	if r.Waiting() || string(r.Bodies()[0]) != "one\ntwo\n" {
+		t.Fatalf("strip bodies = %q waiting=%v", r.Bodies(), r.Waiting())
+	}
+	r, _ = NewHeredocReader("cat <<E")
+	r.Feed("\tE") // indented terminator is body text for <<, not a close
+	r.Feed("E")
+	if r.Waiting() || string(r.Bodies()[0]) != "\tE\n" {
+		t.Fatalf("exact bodies = %q waiting=%v", r.Bodies(), r.Waiting())
+	}
+}
+
+// runB is session's run for a line carrying collected heredoc bodies.
+func runB(sh *Shell, line string, bodies [][]byte) int {
+	st, _ := sh.RunLineBodies(line, bodies)
+	return st
+}
+
+func TestEngineHeredocExpand(t *testing.T) {
+	h := newFakeHost()
+	run, sh := session(h)
+	run("set V=hi")
+	h.out = nil
+	line := "cat <<EOF"
+	st := runB(sh, line, hdBodies(t, line,
+		"got $V", "rc=$?", "sub=$(echo IN)", "arith=$((2+3))", "EOF"))
+	if st != 0 {
+		t.Fatalf("heredoc status = %d", st)
+	}
+	if got := h.outString(); got != "got hi\nrc=0\nsub=IN\narith=5\n" {
+		t.Fatalf("body = %q", got)
+	}
+	// ${NAME} and escapes: \$ and \\ are literal, \x stays.
+	h.out = nil
+	st = runB(sh, line, hdBodies(t, line, "b=${V}!", `esc\$V`, `back\\slash`, "EOF"))
+	if got := h.outString(); got != "b=hi!\nesc$V\nback\\slash\n" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestEngineHeredocQuoted(t *testing.T) {
+	h := newFakeHost()
+	run, sh := session(h)
+	run("set V=hi")
+	h.out = nil
+	for _, decl := range []string{"cat <<'E'", "cat <<\"E\""} {
+		if st := runB(sh, decl, hdBodies(t, decl, "lit $V $(x)", "E")); st != 0 {
+			t.Fatalf("%s status = %d", decl, st)
+		}
+	}
+	if got := h.outString(); got != "lit $V $(x)\nlit $V $(x)\n" {
+		t.Fatalf("quoted bodies = %q", got)
+	}
+}
+
+func TestEngineHeredocStripTabs(t *testing.T) {
+	h := newFakeHost()
+	_, sh := session(h)
+	line := "cat <<-E"
+	st := runB(sh, line, hdBodies(t, line, "\tone", "\t\ttwo", "\tE"))
+	if st != 0 {
+		t.Fatalf("status = %d", st)
+	}
+	if got := h.outString(); got != "one\ntwo\n" {
+		t.Fatalf("stripped body = %q", got)
+	}
+}
+
+func TestEngineHeredocMultiple(t *testing.T) {
+	h := newFakeHost()
+	_, sh := session(h)
+	line := "cat <<A; cat <<B"
+	st := runB(sh, line, hdBodies(t, line, "a1", "A", "b1", "B"))
+	if st != 0 {
+		t.Fatalf("status = %d", st)
+	}
+	if got := h.outString(); got != "a1\nb1\n" {
+		t.Fatalf("outputs = %q", got)
+	}
+}
+
+func TestEngineHeredocWritesFile(t *testing.T) {
+	h := newFakeHost()
+	run, sh := session(h)
+	run("set GREET=hello-vars")
+	h.out = nil
+	line := "cat <<HDOC > /host/HOUT.TXT"
+	if st := runB(sh, line, hdBodies(t, line,
+		"expanded $GREET", "HDOC")); st != 0 {
+		t.Fatalf("status = %d", st)
+	}
+	line = "cat <<'QT' >> /host/HOUT.TXT"
+	if st := runB(sh, line, hdBodies(t, line,
+		"literal $GREET", "QT")); st != 0 {
+		t.Fatalf("quoted status = %d", st)
+	}
+	if got := string(h.files["/host/HOUT.TXT"]); got != "expanded hello-vars\nliteral $GREET\n" {
+		t.Fatalf("file = %q", got)
+	}
+}
+
+func TestEngineHeredocInSource(t *testing.T) {
+	h := newFakeHost()
+	h.files["HD.SH"] = []byte("set V=fromfile\ncat <<EOF\nfile says $V\nEOF\n")
+	run, _ := session(h)
+	if st := run("source HD.SH"); st != 0 {
+		t.Fatalf("source status = %d", st)
+	}
+	if got := h.outString(); got != "file says fromfile\n" {
+		t.Fatalf("output = %q", got)
+	}
+}
+
+func TestEngineHeredocUnterminated(t *testing.T) {
+	h := newFakeHost()
+	// A script that ends mid-body refuses with the delimiter's name.
+	h.files["HD.SH"] = []byte("cat <<DONE\nnever closed\n")
+	run, _ := session(h)
+	if st := run("source HD.SH"); st != 1 {
+		t.Fatalf("status = %d, want 1", st)
+	}
+	if got := h.outString(); !strings.Contains(got, "gosh: heredoc: unterminated <DONE>") {
+		t.Fatalf("output = %q", got)
+	}
+	// The headless/RunLine path (no line source) refuses the same way.
+	h.out = nil
+	if st := run("cat <<DONE"); st != 1 {
+		t.Fatalf("RunLine status = %d", st)
+	}
+	if got := h.outString(); !strings.Contains(got, "gosh: heredoc: unterminated <DONE>") {
+		t.Fatalf("RunLine output = %q", got)
+	}
+}
+
+func TestEngineHerestringRefused(t *testing.T) {
+	h := newFakeHost()
+	run, _ := session(h)
+	if st := run("cat <<<x"); st != 1 {
+		t.Fatalf("<<< status = %d", st)
+	}
+	if got := h.outString(); !strings.Contains(got, "here-strings") {
+		t.Fatalf("<<< output = %q", got)
+	}
+	h.out = nil
+	if st := run("cat <<"); st != 1 {
+		t.Fatalf("bare << status = %d", st)
+	}
+	if got := h.outString(); !strings.Contains(got, "delimiter word") {
+		t.Fatalf("bare << output = %q", got)
+	}
+}
+
+// A heredoc inside a construct body is bound once — the rewrite — and
+// still found on every re-run, expanding against each iteration's vars.
+func TestEngineHeredocInLoopBody(t *testing.T) {
+	h := newFakeHost()
+	_, sh := session(h)
+	line := "for n in a b; do cat <<EOF; done"
+	st := runB(sh, line, hdBodies(t, line, "n=$n", "EOF"))
+	if st != 0 {
+		t.Fatalf("status = %d", st)
+	}
+	if got := h.outString(); got != "n=a\nn=b\n" {
+		t.Fatalf("loop bodies = %q", got)
+	}
+	// `if` bodies find their heredoc too.
+	h.out = nil
+	line = "if true; then cat <<EOF; fi"
+	st = runB(sh, line, hdBodies(t, line, "inside", "EOF"))
+	if st != 0 || h.outString() != "inside\n" {
+		t.Fatalf("if body: st=%d out=%q", st, h.outString())
+	}
+}
+
+// read prefers a bound stdin — a heredoc supplies it like `< file` does.
+func TestEngineHeredocFeedsRead(t *testing.T) {
+	h := newFakeHost()
+	_, sh := session(h)
+	line := "read X <<E"
+	if st := runB(sh, line, hdBodies(t, line, "first", "second", "E")); st != 0 {
+		t.Fatalf("read status = %d", st)
+	}
+	runB(sh, "echo GOT=$X", nil)
+	if got := h.outString(); got != "GOT=first\n" {
+		t.Fatalf("read output = %q", got)
+	}
+}

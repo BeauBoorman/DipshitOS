@@ -292,10 +292,25 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 	}
 
 	// The startup contract (M49 SD2): STARTUP.SH, then PROFILE.SH, silent
-	// when either is missing, every line through the same engine.
-	for _, ln := range startupLines() {
+	// when either is missing, every line through the same engine. A `<<`
+	// line pulls the file's own following lines as its heredoc body
+	// (M138a) — the same collection runSource does for `source`.
+	lines := startupLines()
+	for i := 0; i < len(lines); i++ {
+		ln := lines[i]
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
 		vi.ConsoleLine(markerLine + ln)
-		_, act := sh.RunLine(ln)
+		var bodies [][]byte
+		if r, err := shlib.NewHeredocReader(ln); err == nil && r.Waiting() {
+			for r.Waiting() && i+1 < len(lines) {
+				i++
+				r.Feed(lines[i])
+			}
+			bodies = r.Bodies()
+		}
+		_, act := sh.RunLineBodies(ln, bodies)
 		if act != shlib.ActionContinue {
 			leave(ta, fd, sh, act)
 		}
@@ -318,10 +333,31 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 	// after its first line would leave the rest typed but never run. The
 	// var declaration lets the EvSubmit branch recurse for type-ahead.
 	var handle func([]byte, shlib.EditEvent)
+	// M138a heredoc collection: a submitted line declaring `<<WORD` parks
+	// here while each subsequent submitted line joins the body, with a `> `
+	// continuation prompt, until the delimiter line arrives.
+	var hdR *shlib.HeredocReader
+	var hdLine string
 	submit := func(line string) {
-		vi.ConsoleLine(markerLine + line)
-		shlib.SaveHistory(hst, hist, line, sink)
-		_, act := sh.RunLine(line)
+		var bodies [][]byte
+		if hdR != nil {
+			hdR.Feed(line)
+			if hdR.Waiting() {
+				writeTTY(fd, []byte("> "))
+				return
+			}
+			line, bodies = hdLine, hdR.Bodies()
+			hdR = nil
+		} else {
+			vi.ConsoleLine(markerLine + line)
+			shlib.SaveHistory(hst, hist, line, sink)
+			if r, err := shlib.NewHeredocReader(line); err == nil && r.Waiting() {
+				hdR, hdLine = r, line
+				writeTTY(fd, []byte("> "))
+				return
+			}
+		}
+		_, act := sh.RunLineBodies(line, bodies)
 		if act != shlib.ActionContinue {
 			leave(ta, fd, sh, act)
 		}
@@ -372,7 +408,9 @@ func runSession(fd uint32, ta *tabapp.TabApp, auth *shlib.NetAuth) {
 		case shlib.EvEOF:
 			shutdown(ta, fd, 0)
 		case shlib.EvCancel:
-			// The editor already painted ^C and the fresh prompt.
+			// The editor already painted ^C and the fresh prompt; a
+			// pending heredoc collection is abandoned with the line.
+			hdR = nil
 		}
 	}
 
@@ -499,7 +537,9 @@ func loadPrompt() string {
 }
 
 // startupLines reads the startup contract files (CRLF-aware, bounded,
-// silent when missing) and returns their non-empty lines in order.
+// silent when missing) and returns their lines in order. Blank lines ride
+// along — a heredoc body may legitimately hold one (M138a) — and the
+// caller skips the ones that are not collected as bodies.
 func startupLines() []string {
 	var out []string
 	for _, path := range []string{startupPath, profilePath} {
@@ -509,10 +549,7 @@ func startupLines() []string {
 		}
 		body := strings.ReplaceAll(string(b), "\r\n", "\n")
 		for _, line := range strings.Split(body, "\n") {
-			line = strings.TrimRight(line, "\r")
-			if strings.TrimSpace(line) != "" {
-				out = append(out, line)
-			}
+			out = append(out, strings.TrimRight(line, "\r"))
 		}
 	}
 	return out

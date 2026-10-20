@@ -331,6 +331,10 @@ type Shell struct {
 	loopCont  bool
 	dirstack  []string          // M98d pushd/popd stack, canonical paths, top at end
 	aliases   map[string]string // M98b alias table; nil until first define
+	// M138a: collected heredoc bodies, keyed by the marked path the
+	// `<<WORD` rewrite produces; hdSeq makes each key unique.
+	hdBodies map[string]hdBody
+	hdSeq    int
 }
 
 // NewShell wires a fresh interpreter; hist may be shared with the editor.
@@ -370,29 +374,39 @@ func (s *Shell) Env() *Env { return s.env }
 // timed for the \D prompt escape (M98h); an empty line leaves both the last
 // duration and $? untouched, the way a bare Enter leaves $? alone.
 func (s *Shell) RunLine(line string) (int, Action) {
+	return s.RunLineBodies(line, nil)
+}
+
+// RunLineBodies is RunLine with the line's heredoc bodies already
+// collected by the caller's line source (M138a): the front-end drives
+// HeredocReader over continuation lines, a script reader feeds the file's
+// next lines, and a caller with neither gets the named unterminated
+// refusal for any `<<` the line declares.
+func (s *Shell) RunLineBodies(line string, bodies [][]byte) (int, Action) {
 	stripped := stripEscMarks(line)
 	if trimSpace(stripped) == "" {
-		return s.runLine(stripped, 0)
+		return s.runLineBodies(stripped, bodies, 0)
 	}
 	start := timeMono()
-	st, act := s.runLine(stripped, 0)
+	st, act := s.runLineBodies(stripped, bodies, 0)
 	s.lastDurNs = timeMono() - start
 	return st, act
 }
 
-// stripEscMarks removes the tokenizer's literal-byte sentinel from a raw
-// line. escMark only ever means "this byte was quoted" within one parse, so
-// a byte arriving from a file, a sourced script, or a program's captured
-// output must not be able to make the expander treat what follows as
-// literal. Byte-wise rather than rune-wise: an invalid UTF-8 byte is passed
-// through instead of being folded to U+FFFD.
+// stripEscMarks removes the parser sentinels from a raw line. escMark
+// only ever means "this byte was quoted" within one parse, so a byte
+// arriving from a file, a sourced script, or a program's captured output
+// must not be able to make the expander treat what follows as literal;
+// hdMark (M138a) gets the same strip so outside text cannot forge a
+// heredoc body reference. Byte-wise rather than rune-wise: an invalid
+// UTF-8 byte is passed through instead of being folded to U+FFFD.
 func stripEscMarks(line string) string {
-	if strings.IndexByte(line, escMark) < 0 {
+	if strings.IndexByte(line, escMark) < 0 && strings.IndexByte(line, hdMark) < 0 {
 		return line
 	}
 	out := make([]byte, 0, len(line))
 	for i := 0; i < len(line); i++ {
-		if line[i] != escMark {
+		if line[i] != escMark && line[i] != hdMark {
 			out = append(out, line[i])
 		}
 	}
@@ -832,12 +846,24 @@ func (s *Shell) runSource(path string, depth int) (int, Action) {
 		return 1, ActionContinue
 	}
 	body := strings.ReplaceAll(string(b), "\r\n", "\n")
-	for _, ln := range strings.Split(body, "\n") {
-		ln = strings.TrimRight(ln, "\r")
+	lines := strings.Split(body, "\n")
+	for i := 0; i < len(lines); i++ {
+		ln := strings.TrimRight(lines[i], "\r")
 		if strings.TrimSpace(ln) == "" {
 			continue
 		}
-		st, act := s.runLine(stripEscMarks(ln), depth+1)
+		ln = stripEscMarks(ln)
+		// A `<<` line pulls the file's own following lines as its body;
+		// an end of file mid-collection is the named unterminated refusal.
+		var bodies [][]byte
+		if r, rerr := NewHeredocReader(ln); rerr == nil && r.Waiting() {
+			for r.Waiting() && i+1 < len(lines) {
+				i++
+				r.Feed(strings.TrimRight(lines[i], "\r"))
+			}
+			bodies = r.Bodies()
+		}
+		st, act := s.runLineBodies(ln, bodies, depth+1)
 		if act != ActionContinue {
 			return st, act
 		}
@@ -885,7 +911,7 @@ func (s *Shell) runSingle(p *plan, depth int) (int, Action) {
 	args := p.left[1:]
 	var stdin []byte
 	if p.in != nil {
-		b, ok := s.readInput(p.in.path)
+		b, ok := s.stdinFor(p.in)
 		if !ok {
 			return 1, ActionContinue
 		}
@@ -1002,7 +1028,7 @@ func (s *Shell) runPipeline(p *plan) (int, Action) {
 	}
 	var stdin []byte
 	if p.in != nil {
-		b, ok := s.readInput(p.in.path)
+		b, ok := s.stdinFor(p.in)
 		if !ok {
 			return 1, ActionContinue
 		}

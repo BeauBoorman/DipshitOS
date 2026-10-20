@@ -113,12 +113,12 @@ func TestStartupLinesFrom(t *testing.T) {
 		name, body string
 		want       []string
 	}{
-		{"empty", "", nil},
-		{"blank only", "\n   \n\t\n", nil},
+		{"empty", "", []string{""}},
+		{"blank lines kept", "\n   \n\t\n", []string{"", "   ", "\t", ""}},
 		{
-			"CRLF folded, blanks dropped, order kept",
+			"CRLF folded, blanks kept for heredoc bodies, order kept",
 			"echo one\r\n\r\n  \necho two\r\necho three",
-			[]string{"echo one", "echo two", "echo three"},
+			[]string{"echo one", "", "  ", "echo two", "echo three"},
 		},
 		{
 			"lone CR terminated lines are trimmed",
@@ -128,7 +128,7 @@ func TestStartupLinesFrom(t *testing.T) {
 		{
 			"content whitespace is preserved (the engine parses it)",
 			" echo  padded \n",
-			[]string{" echo  padded "},
+			[]string{" echo  padded ", ""},
 		},
 	}
 	for _, c := range cases {

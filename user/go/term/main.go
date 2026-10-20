@@ -197,8 +197,23 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 		if ts.restored && session == 0 {
 			vi.ConsoleLine(ts.restoredMarker(ts.applyEnv(sh, hst)))
 		}
-		for _, ln := range startupLines() {
-			_, act := sh.RunLine(ln)
+		// A `<<` line pulls the file's own following lines as its heredoc
+		// body (M138a) — the same collection runSource does for `source`.
+		lines := startupLines()
+		for i := 0; i < len(lines); i++ {
+			ln := lines[i]
+			if strings.TrimSpace(ln) == "" {
+				continue
+			}
+			var bodies [][]byte
+			if r, err := shlib.NewHeredocReader(ln); err == nil && r.Waiting() {
+				for r.Waiting() && i+1 < len(lines) {
+					i++
+					r.Feed(lines[i])
+				}
+				bodies = r.Bodies()
+			}
+			_, act := sh.RunLineBodies(ln, bodies)
 			if act != shlib.ActionContinue {
 				leave(ta, fd, sh, act)
 			}
@@ -235,23 +250,44 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 		// feeding until the editor has nothing left: the kernel's input queue
 		// can deliver several whole lines in a single read.
 		var handle func([]byte, shlib.EditEvent)
+		// M138a heredoc collection: a submitted line declaring `<<WORD`
+		// parks here while each subsequent submitted line joins the body,
+		// with a `> ` continuation prompt, until the delimiter line.
+		var hdR *shlib.HeredocReader
+		var hdLine string
 		submit := func(line string) {
 			eofPending = false
-			vi.ConsoleLine(markerLine + line)
-			shlib.SaveHistory(hst, hist, line, sink)
-			if closeRequested(line) {
-				vi.ConsoleLine(markerDone + "0")
-				shutdown(ta, fd, 0)
-				return
+			var bodies [][]byte
+			if hdR != nil {
+				hdR.Feed(line)
+				if hdR.Waiting() {
+					writeTTY(ts, fd, []byte("> "))
+					return
+				}
+				line, bodies = hdLine, hdR.Bodies()
+				hdR = nil
+			} else {
+				vi.ConsoleLine(markerLine + line)
+				shlib.SaveHistory(hst, hist, line, sink)
+				if closeRequested(line) {
+					vi.ConsoleLine(markerDone + "0")
+					shutdown(ta, fd, 0)
+					return
+				}
+				// M149b: `term-profile` is a front-end line command like
+				// `exit --close` — answered here, never handed to the engine.
+				if pname, plist, ok := profileCmd(line); ok {
+					handleProfileCmd(ts, ta, fd, editor, pname, plist)
+					vi.ConsoleLine(markerDone + "0")
+					return
+				}
+				if r, err := shlib.NewHeredocReader(line); err == nil && r.Waiting() {
+					hdR, hdLine = r, line
+					writeTTY(ts, fd, []byte("> "))
+					return
+				}
 			}
-			// M149b: `term-profile` is a front-end line command like
-			// `exit --close` — answered here, never handed to the engine.
-			if pname, plist, ok := profileCmd(line); ok {
-				handleProfileCmd(ts, ta, fd, editor, pname, plist)
-				vi.ConsoleLine(markerDone + "0")
-				return
-			}
-			st, act := sh.RunLine(line)
+			st, act := sh.RunLineBodies(line, bodies)
 			// Only AFTER the engine answered: the gate sequences on this,
 			// so it can never claim an execution that did not happen.
 			vi.ConsoleLine(markerDone + vi.Itoa64(int64(st)))
@@ -319,7 +355,9 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 				writeTTY(ts, fd, editor.Repaint())
 			case shlib.EvCancel:
 				eofPending = false
-				// The editor already painted ^C and the fresh prompt.
+				// The editor already painted ^C and the fresh prompt; a
+				// pending heredoc collection is abandoned with the line.
+				hdR = nil
 			}
 		}
 		// M124e (#2584): the seat's primary-selection delivery pastes into
@@ -611,7 +649,7 @@ func loadPrompt() string {
 }
 
 // startupLines reads the startup contract files (CRLF-aware, bounded,
-// silent when missing) and returns their non-empty lines in order.
+// silent when missing) and returns their lines in order.
 func startupLines() []string {
 	var out []string
 	for _, path := range []string{startupPath, profilePath} {
@@ -625,15 +663,14 @@ func startupLines() []string {
 }
 
 // startupLinesFrom is startupLines' pure parsing half (host-testable):
-// CRLF and CR are folded to LF, blank lines dropped, order kept.
+// CRLF and CR are folded to LF, order kept. Blank lines ride along — a
+// heredoc body may legitimately hold one (M138a) — and the caller skips
+// the ones that are not collected as bodies.
 func startupLinesFrom(body string) []string {
 	var out []string
 	body = strings.ReplaceAll(body, "\r\n", "\n")
 	for _, line := range strings.Split(body, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) != "" {
-			out = append(out, line)
-		}
+		out = append(out, strings.TrimRight(line, "\r"))
 	}
 	return out
 }

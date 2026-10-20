@@ -27,11 +27,13 @@ const (
 	tokAppend
 	tokIn
 	tokAmp
+	tokHeredoc
 )
 
 type token struct {
-	kind tokKind
-	text string
+	kind      tokKind
+	text      string
+	stripTabs bool // tokHeredoc: `<<-` strips leading tabs
 }
 
 // tokenize splits a raw line into words and operator tokens. Quoting follows
@@ -61,8 +63,26 @@ func tokenize(line string) ([]token, error) {
 				i++
 			}
 		case c == '<':
-			toks = append(toks, token{kind: tokIn})
-			i++
+			if i+1 < len(line) && line[i+1] == '<' {
+				// runLineBodies rewrites a declared heredoc to a marked
+				// `<` before this stage, so a `<<` surviving to the
+				// tokenizer is one whose body was never collected (an
+				// alias splice, a $(...) inner line) — parsePlan refuses
+				// it by name rather than mis-parse it as two redirects.
+				if i+2 < len(line) && line[i+2] == '<' {
+					return nil, errors.New("gosh: here-strings (<<<) are not supported")
+				}
+				t := token{kind: tokHeredoc}
+				if i+2 < len(line) && line[i+2] == '-' {
+					t.stripTabs = true
+					i++
+				}
+				toks = append(toks, t)
+				i += 2
+			} else {
+				toks = append(toks, token{kind: tokIn})
+				i++
+			}
 		case c == '&':
 			toks = append(toks, token{kind: tokAmp})
 			i++
@@ -285,6 +305,19 @@ func parsePlan(toks []token, env *Env, status int, globFn globFunc) (*plan, erro
 			}
 			p.in = &redirection{path: expand(toks[i+1], env, status)}
 			i += 2
+		case tokHeredoc:
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			if i+1 >= len(toks) || toks[i+1].kind != tokWord {
+				return nil, errors.New("gosh: << needs a delimiter word")
+			}
+			// Only reachable for a `<<` that arrived after the collect
+			// step — an alias splice or a substitution's inner line. The
+			// body it declares can never be read here, so name the refusal
+			// rather than treat it as a file redirect.
+			return nil, errors.New("gosh: heredoc: unterminated <" +
+				stripEscMarks(toks[i+1].text) + ">")
 		case tokAmp:
 			if i != len(toks)-1 {
 				return nil, errors.New("gosh: & must end the line")
