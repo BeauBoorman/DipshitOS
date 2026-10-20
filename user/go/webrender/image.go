@@ -9,8 +9,8 @@ import (
 	"virelai/webstyle"
 )
 
-// In-guest image decoding: bounded, owned PNG/QOI and ADR 0041 SVG.
-// There are no external decoder dependencies or filesystem/network calls.
+// In-guest image decoding: bounded, owned PNG/QOI/baseline-JPEG and ADR 0041
+// SVG. There are no external decoder dependencies or filesystem/network calls.
 
 // Image is a decoded raster in the same 32-bpp word layout the surfaces use:
 // one 0xAARRGGBB word per pixel, row-major.
@@ -43,9 +43,9 @@ const (
 // ErrImageUnsupported is returned for a format this decoder does not handle.
 var ErrImageUnsupported = errors.New("image-unsupported")
 
-// DecodeImage decodes a PNG, QOI or ADR 0041 SVG. Any other format, a truncated file,
-// or an image past the caps returns an error — the caller then falls back to
-// the placeholder box rather than rendering nothing.
+// DecodeImage decodes a PNG, QOI, baseline JPEG or ADR 0041 SVG. Any other
+// format, a truncated file, or an image past the caps returns an error — the
+// caller then falls back to the placeholder box rather than rendering nothing.
 func DecodeImage(data []byte) (*Image, error) {
 	if len(data) > maxImageBytes {
 		return nil, imageError("image-limit: source bytes")
@@ -57,6 +57,8 @@ func DecodeImage(data []byte) (*Image, error) {
 	switch {
 	case len(data) >= 8 && bytes.Equal(data[:8], pngMagic):
 		return decodePNG(data)
+	case len(data) >= 2 && data[0] == 0xff && data[1] == 0xd8:
+		return decodeJPEG(data)
 	case len(data) >= 4 && string(data[:4]) == "qoif":
 		return decodeQOI(data)
 	case len(xml) > 0 && xml[0] == '<':

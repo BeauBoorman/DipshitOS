@@ -64,6 +64,7 @@ const (
 	fmtUnknown format = iota
 	fmtQOI
 	fmtPNG
+	fmtJPEG
 )
 
 func (f format) tag() string {
@@ -72,6 +73,8 @@ func (f format) tag() string {
 		return "QOI"
 	case fmtPNG:
 		return "PNG"
+	case fmtJPEG:
+		return "JPEG"
 	}
 	return "???"
 }
@@ -87,6 +90,8 @@ func formatFromPath(path string) format {
 		return fmtQOI
 	case "png":
 		return fmtPNG
+	case "jpg", "jpeg":
+		return fmtJPEG
 	}
 	return fmtUnknown
 }
@@ -229,9 +234,11 @@ func stepZoom(idx int, dir zoomDir) int {
 	return zoomDefaultIdx
 }
 
-// headerDims reads the image geometry out of the first 24 bytes, before any
-// decode. QOI carries it at offsets 4/8; PNG's IHDR at 16/20. This is why a
-// file this viewer cannot decode still opens a correctly sized window.
+// headerDims reads the image geometry out of the head, before any decode.
+// QOI carries it at offsets 4/8; PNG's IHDR at 16/20; JPEG carries it in the
+// first Start Of Frame segment, found by walking the marker chain inside a
+// bounded head (readHead's 4 KiB). This is why a file this viewer cannot
+// decode still opens a correctly sized window.
 func headerDims(head []byte) (iw, ih uint32, ok bool) {
 	if len(head) < 24 {
 		return 0, 0, false
@@ -245,6 +252,54 @@ func headerDims(head []byte) (iw, ih uint32, ok bool) {
 		if w, h := be32(head[16:20]), be32(head[20:24]); w > 0 && h > 0 {
 			return w, h, true
 		}
+	}
+	if head[0] == 0xff && head[1] == 0xd8 {
+		return jpegHeaderDims(head)
+	}
+	return 0, 0, false
+}
+
+// jpegHeaderDims walks the JPEG marker chain inside head looking for the
+// first Start Of Frame segment, whose body is
+// prec(1) height(2) width(2) ncomp(1)…. Every SOF variant shares that
+// layout, so a progressive file the decoder will refuse still sizes its
+// window. The scan is bounded by len(head) — a deeper SOF simply yields the
+// default window.
+func jpegHeaderDims(head []byte) (iw, ih uint32, ok bool) {
+	pos := 2
+	for pos+4 <= len(head) {
+		for pos+2 < len(head) && head[pos] == 0xff && head[pos+1] == 0xff {
+			pos++ // fill bytes before a marker
+		}
+		if pos+4 > len(head) || head[pos] != 0xff {
+			return 0, 0, false
+		}
+		m := head[pos+1]
+		switch {
+		case m == 0x00, m == 0xd9:
+			return 0, 0, false // stuffed byte or EOI before a frame
+		case m == 0x01, m >= 0xd0 && m <= 0xd8:
+			pos += 2 // standalone markers (TEM/RST/SOI) carry no length
+			continue
+		case m == 0xda:
+			return 0, 0, false // SOS: entropy data follows, no frame seen
+		}
+		n := int(head[pos+2])<<8 | int(head[pos+3])
+		if n < 2 {
+			return 0, 0, false
+		}
+		if m >= 0xc0 && m <= 0xcf && m != 0xc4 && m != 0xc8 && m != 0xcc {
+			if n < 8 || pos+4+5 > len(head) {
+				return 0, 0, false
+			}
+			h := uint32(head[pos+5])<<8 | uint32(head[pos+6])
+			w := uint32(head[pos+7])<<8 | uint32(head[pos+8])
+			if w > 0 && h > 0 {
+				return w, h, true
+			}
+			return 0, 0, false
+		}
+		pos += 2 + n
 	}
 	return 0, 0, false
 }
@@ -281,6 +336,9 @@ func formatOfHeader(head []byte) format {
 	}
 	if len(head) >= 8 && string(head[0:8]) == "\x89PNG\r\n\x1a\n" {
 		return fmtPNG
+	}
+	if len(head) >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff {
+		return fmtJPEG
 	}
 	return fmtUnknown
 }

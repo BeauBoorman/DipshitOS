@@ -181,17 +181,31 @@ func argPath() string {
 	return args[1]
 }
 
-// readHead peeks the first 24 bytes (QOI's 14-byte header, PNG's IHDR) without
-// decoding. Best-effort: an unreadable file simply yields no dimensions.
+// readHead peeks the head of the file without decoding. QOI's 14-byte header
+// and PNG's IHDR live in the first 24 bytes; JPEG's SOF sits behind APPn/DQT
+// segments, so the read runs deeper — still trivially inside the 512 KiB
+// file cap. Best-effort: an unreadable file simply yields no dimensions.
+const headMax = 4096
+
 func readHead(path string) []byte {
 	h, r := vi.FileOpen(path, vi.ModeRead)
 	if r < 0 {
 		return nil
 	}
 	defer vi.FileClose(uint32(h))
-	buf := make([]byte, 24)
-	n, rr := vi.FileRead(uint32(h), buf)
-	if rr < 0 || n <= 0 {
+	buf := make([]byte, headMax)
+	n := 0
+	for n < headMax {
+		got, rr := vi.FileRead(uint32(h), buf[n:])
+		if rr < 0 {
+			return nil
+		}
+		n += got
+		if got == 0 {
+			break
+		}
+	}
+	if n == 0 {
 		return nil
 	}
 	return buf[:n]
@@ -459,6 +473,8 @@ func (a *app) copy() {
 		mime = vsys.ClipPNG
 	case fmtQOI:
 		mime = vsys.ClipQOI
+	case fmtJPEG:
+		mime = vsys.ClipJPEG
 	default:
 		refuse("type")
 		return

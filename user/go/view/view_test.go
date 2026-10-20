@@ -8,8 +8,9 @@ import (
 // The fixtures the live-image-viewer gate stages into the share. The viewer's
 // window sizing is asserted through them, so the tests read the same bytes.
 const (
-	qoiFixture = "../../../tests/fixtures/qoi/viewer_160x120.qoi"
-	pngFixture = "../../../tests/fixtures/png/viewer_160x120.png"
+	qoiFixture  = "../../../tests/fixtures/qoi/viewer_160x120.qoi"
+	pngFixture  = "../../../tests/fixtures/png/viewer_160x120.png"
+	jpegFixture = "../webrender/testdata/jpeg/viewer_160x120.jpg"
 )
 
 func readFixture(t *testing.T, path string) []byte {
@@ -30,6 +31,8 @@ func TestFormatFromPath(t *testing.T) {
 		{"/host/TEST.qoi", fmtQOI},
 		{"/host/TEST.PNG", fmtPNG},
 		{"/host/tEST.pNg", fmtPNG},
+		{"/host/TEST.JPG", fmtJPEG},
+		{"/host/test.jpeg", fmtJPEG},
 		{"/host/TEST.GIF", fmtUnknown},
 		{"/host/no-extension", fmtUnknown},
 		{".hidden", fmtUnknown},
@@ -187,11 +190,11 @@ func TestApplyDeltaClampsSignedSteps(t *testing.T) {
 // assert the SAME window size — including the PNG boot, which this viewer
 // cannot decode on the guest.
 func TestHeaderSizeFromRealFixtures(t *testing.T) {
-	for _, path := range []string{qoiFixture, pngFixture} {
+	for _, path := range []string{qoiFixture, pngFixture, jpegFixture} {
 		data := readFixture(t, path)
 		head := data
-		if len(head) > 24 {
-			head = head[:24]
+		if len(head) > headMax {
+			head = head[:headMax]
 		}
 		iw, ih, ok := headerDims(head)
 		if !ok {
@@ -219,11 +222,63 @@ func TestFormatOfHeaderIgnoresExtension(t *testing.T) {
 	if got := formatOfHeader(readFixture(t, pngFixture)); got != fmtPNG {
 		t.Errorf("PNG fixture sniffed as %s", got.tag())
 	}
+	if got := formatOfHeader(readFixture(t, jpegFixture)); got != fmtJPEG {
+		t.Errorf("JPEG fixture sniffed as %s", got.tag())
+	}
 	if got := formatOfHeader([]byte("qoif")); got != fmtQOI {
 		t.Errorf("short QOI magic sniffed as %s", got.tag())
 	}
 	if got := formatOfHeader([]byte{0x89, 'P', 'N'}); got != fmtUnknown {
 		t.Errorf("truncated magic sniffed as %s", got.tag())
+	}
+}
+
+// TestJPEGHeaderDims walks a hand-built segment chain the way the gate's
+// progressive leg needs: APPn and table segments are skipped on their
+// lengths, the first SOF's dims answer the sniff — whatever SOF marker
+// carries them — and a scan start or a truncated chain yields no dims.
+func TestJPEGHeaderDims(t *testing.T) {
+	var b []byte
+	seg := func(m byte, body []byte) {
+		b = append(b, 0xff, m, byte((len(body)+2)>>8), byte(len(body)+2))
+		b = append(b, body...)
+	}
+	sof := func(m byte, w, h int) {
+		seg(m, []byte{8, byte(h >> 8), byte(h), byte(w >> 8), byte(w), 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1})
+	}
+	mk := func(build func()) []byte {
+		b = []byte{0xff, 0xd8}
+		build()
+		return b
+	}
+
+	good := mk(func() {
+		seg(0xe0, []byte("JFIF\x00\x01\x02\x00\x01")) // APP0
+		seg(0xdb, make([]byte, 65))                   // DQT
+		seg(0xfe, []byte("a comment"))                // COM
+		sof(0xc0, 160, 120)                           // SOF0
+	})
+	if w, h, ok := jpegHeaderDims(good); !ok || w != 160 || h != 120 {
+		t.Fatalf("jpegHeaderDims = %dx%d %v, want 160x120", w, h, ok)
+	}
+	// A progressive frame (SOF2) still sizes the window.
+	prog := mk(func() { sof(0xc2, 640, 480) })
+	if w, h, ok := jpegHeaderDims(prog); !ok || w != 640 || h != 480 {
+		t.Fatalf("SOF2 dims = %dx%d %v, want 640x480", w, h, ok)
+	}
+	// SOS before any SOF yields no dims.
+	if _, _, ok := jpegHeaderDims(mk(func() { seg(0xda, []byte{1, 1, 0, 0, 63, 0}) })); ok {
+		t.Fatal("SOS-first chain must not size")
+	}
+	// A chain truncated inside the SOF dims yields no dims (a tail
+	// truncation past them still answers — the sniff is best-effort).
+	if _, _, ok := jpegHeaderDims(good[:len(good)-12]); ok {
+		t.Fatal("truncated SOF dims must not size")
+	}
+	// The viewer's real fixture.
+	data := readFixture(t, jpegFixture)
+	if w, h, ok := jpegHeaderDims(data); !ok || w != 160 || h != 120 {
+		t.Fatalf("fixture dims = %dx%d %v, want 160x120", w, h, ok)
 	}
 }
 

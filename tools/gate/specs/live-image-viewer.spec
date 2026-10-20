@@ -2,7 +2,7 @@
 # (#1567) onto GOVIEW.ELF, the Go successor to Zig VIEW.BIN (deleted with
 # user/src/view.zig in the same card).
 #
-# Three boots, all on the shim compositor (this spec stages no GOTABWM.ELF, so
+# Five boots, all on the shim compositor (this spec stages no GOTABWM.ELF, so
 # `wm: autostart` falls back and the viewer honestly reports
 # `gview: not-tab-aware (shim or WND desktop)`; the seat's own hosting of the
 # same declare is go-wm-seat run 04):
@@ -23,6 +23,13 @@
 #            loads the fixture; the assertions below pin that success and
 #            still prove the IHDR sniff sizes the window BEFORE the decode
 #            (the `open` marker precedes `loaded` in the serial).
+#   JPEG  -- M136b (#2768): the bounded baseline decoder (webrender/jpeg.go).
+#            The fixture is a stdlib-encoded baseline 4:2:0 file; the SOF0
+#            sniff sizes the window before the decode.
+#   JPROG -- the named refusal: the same fixture with its SOF0 marker byte
+#            flipped to SOF2 (progressive) in setup. The sniff still sizes
+#            the window off SOF2, then the decoder refuses by name
+#            (`gview: unsupported JPEG`) and the viewer exits cleanly.
 #   NOPE  -- the other error surface, and the default window when there is no
 #            header at all: `gview: open err`, 320x240, still exits cleanly on
 #            `q`.
@@ -49,10 +56,17 @@ if not os.path.exists(src):
 shutil.copy(src, os.path.join(share, "GOVIEW.ELF"))
 shutil.copy("tests/fixtures/qoi/viewer_160x120.qoi", os.path.join(share, "TEST.QOI"))
 shutil.copy("tests/fixtures/png/viewer_160x120.png", os.path.join(share, "TEST.PNG"))
-print("staged GOVIEW.ELF (%d bytes) + TEST.QOI (%d bytes) + TEST.PNG (%d bytes)" % (
-    os.path.getsize(os.path.join(share, "GOVIEW.ELF")),
-    os.path.getsize(os.path.join(share, "TEST.QOI")),
-    os.path.getsize(os.path.join(share, "TEST.PNG"))))
+shutil.copy("user/go/webrender/testdata/jpeg/viewer_160x120.jpg",
+            os.path.join(share, "TEST.JPG"))
+# JPROG: the same file with the SOF0 marker byte flipped to SOF2 — a
+# progressive refusal built from our own fixture, no external JPEG needed.
+jpg = open("user/go/webrender/testdata/jpeg/viewer_160x120.jpg", "rb").read()
+pos = jpg.find(b"\xff\xc0")
+assert pos > 0, "baseline fixture lost its SOF0 marker"
+prog = bytearray(jpg)
+prog[pos + 1] = 0xc2
+open(os.path.join(share, "JPROG.JPG"), "wb").write(bytes(prog))
+print("staged GOVIEW.ELF + TEST.QOI/PNG/JPG (%d bytes) + JPROG.JPG" % len(jpg))
 PYEOF
 
 vgate_file script-qoi.txt <<'EOF'
@@ -61,6 +75,14 @@ EOF
 
 vgate_file script-png.txt <<'EOF'
 exec GOVIEW.ELF /host/TEST.PNG
+EOF
+
+vgate_file script-jpeg.txt <<'EOF'
+exec GOVIEW.ELF /host/TEST.JPG
+EOF
+
+vgate_file script-jprog.txt <<'EOF'
+exec GOVIEW.ELF /host/JPROG.JPG
 EOF
 
 vgate_file script-missing.txt <<'EOF'
@@ -130,6 +152,52 @@ ser = open(os.environ["VG_SER"], errors="replace").read()
 # Still sized from the PNG IHDR: the header sniff does not need a decoder.
 assert re.search(r"gview: open id=[0-9]+ 328x264", ser), \
     "the PNG boot did not size its window from the IHDR header"
+PY
+
+# --- Boot JPEG: baseline decodes in guest, window sized off the SOF0. -----
+vgate_run JPEG -- \
+    --display --screen '$RUN_DIR/gpu-screen-jpeg' \
+    --via-virtio \
+    --script '$RUN_DIR/script-jpeg.txt' --script-after "virelai> " \
+    --input-chords "q" --input-chords-after "gview: ready" \
+    --script-expect "user-exec exited status=43" --timeout 150
+
+vgate_assert JPEG serial-contains "exec: loaded GOVIEW.ELF"
+vgate_assert JPEG serial-contains "gview: loaded TEST.JPG 160x120 JPEG bytes=1987"
+vgate_assert JPEG serial-absent "gview: unsupported"
+vgate_assert JPEG serial-contains "gview: ready"
+vgate_assert JPEG serial-contains "gview: quit"
+vgate_assert JPEG serial-contains "user-exec exited status=43"
+vgate_assert JPEG serial-absent "[EXC] parking:"
+vgate_assert JPEG python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Sized from the JPEG SOF0: the marker-chain sniff does not need a decoder.
+assert re.search(r"gview: open id=[0-9]+ 328x264", ser), \
+    "the JPEG boot did not size its window from the SOF0 header"
+PY
+
+# --- Boot JPROG: the named refusal — progressive refuses, cleanly. --------
+vgate_run JPROG -- \
+    --display --screen '$RUN_DIR/gpu-screen-jprog' \
+    --via-virtio \
+    --script '$RUN_DIR/script-jprog.txt' --script-after "virelai> " \
+    --input-chords "q" --input-chords-after "gview: ready" \
+    --script-expect "user-exec exited status=43" --timeout 150
+
+vgate_assert JPROG serial-contains "exec: loaded GOVIEW.ELF"
+vgate_assert JPROG serial-contains "gview: unsupported JPEG"
+vgate_assert JPROG serial-absent "gview: loaded "
+vgate_assert JPROG serial-contains "gview: ready"
+vgate_assert JPROG serial-contains "gview: quit"
+vgate_assert JPROG serial-contains "user-exec exited status=43"
+vgate_assert JPROG serial-absent "[EXC] parking:"
+vgate_assert JPROG python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# The sniff sizes the window off SOF2 even though the decode will refuse.
+assert re.search(r"gview: open id=[0-9]+ 328x264", ser), \
+    "the progressive boot did not size its window from the SOF header"
 PY
 
 # --- Boot NOPE: the other error surface, and the default window. ----------
