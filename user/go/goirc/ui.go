@@ -231,6 +231,12 @@ func (u *uiApp) onEvent(e Event) {
 		}
 	case EvJoined, EvRejoined, EvJoinFail, EvNames:
 		u.addBuf(e.Channel)
+		if e.Kind == EvJoined || e.Kind == EvRejoined {
+			// Push the channel set on every join so a close-time LIFO
+			// capture carries it even when the seat's save ask lands
+			// late (the M147c reopen leg depends on the stored chans).
+			u.saveNow()
+		}
 	}
 	u.dirty = true
 }
@@ -347,13 +353,17 @@ func (u *uiApp) scrollRows() int {
 
 func (u *uiApp) scrollBy(d int) {
 	name := u.focusedBuf()
-	v := u.scroll[name] + d
+	old := u.scroll[name]
+	v := old + d
 	if v < 0 {
 		v = 0
 	}
 	u.scroll[name] = v
 	u.scrollClamp(name)
 	u.dirty = true
+	if u.scroll[name] != old {
+		u.saveNow()
+	}
 }
 
 // moveFocus steps the rail selection by d (wrapping), like the up/down
@@ -431,6 +441,7 @@ func (u *uiApp) handleEvent(ev vi.Event) {
 			ch := u.pendMention
 			u.pendMention = ""
 			u.focusName(ch)
+			u.saveNow()
 		}
 	case vi.EvWinBlur:
 		u.winFocus = false
@@ -482,7 +493,7 @@ func (u *uiApp) consentAnswer() {
 // saveNow posts an unsolicited save after a material mutation (the M125f
 // discipline: a crash between asks must still find the blob).
 func (u *uiApp) saveNow() {
-	if u.ta.SaveStateNow() {
+	if u.ta != nil && u.ta.SaveStateNow() {
 		vi.ConsoleLine("goirc: state saved")
 	}
 }
@@ -510,6 +521,7 @@ func (u *uiApp) applyRestored() {
 	u.cfg.Host = u.st.host
 	u.cfg.Port = u.st.port
 	u.cfg.TLS = u.st.tls
+	u.cfg.ServerName = u.st.sni
 	if u.st.nick != "" {
 		u.cfg.Nick = u.st.nick
 	}
@@ -742,8 +754,12 @@ func runUI(o options) {
 	u.input.OnSubmit = func(s string) { u.input.Clear(); u.submit(s) }
 	u.input.OnCancel = func() { u.input.Clear() }
 	ta := tabapp.Init(tabapp.Config{
-		Name:         appName,
-		Title:        "IRC",
+		Name: appName,
+		// The declare title is the executable's own name: GOTABWM's
+		// guessBin default arm records the title verbatim, and the
+		// seat's reopen LIFO re-execs it bare — argv lives only in the
+		// save_state blob (the GOPAINT declare-title discipline).
+		Title:        appName,
 		X:            64,
 		Y:            48,
 		W:            uiNatW,
@@ -760,9 +776,20 @@ func runUI(o options) {
 	vi.ConsoleLine("goirc: open id=" + vi.Itoa64(int64(ta.Win)))
 	if ta.TabAware {
 		vi.ConsoleLine("goirc: declare accepted")
+		// The rail label is the friendly name; the recorded bin stays the
+		// executable the declare carried.
+		if !ta.SetTabTitle("IRC") {
+			_ = vi.WinSetTitle(ta.Win, "IRC")
+		}
 	} else {
 		vi.ConsoleLine("goirc: declare refused")
 	}
 	u.applyRestored()
+	// A bare exec with no staged blob has no host/nick to dial: the same
+	// usage + exit the malformed-argv path gives, minus the argv walk.
+	if u.cfg.Host == "" || u.cfg.Nick == "" {
+		usage()
+		u.ta.CloseAndExit(exitUsage)
+	}
 	u.run()
 }

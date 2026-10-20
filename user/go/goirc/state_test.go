@@ -21,7 +21,8 @@ func testUI() *uiApp {
 	return &uiApp{
 		cfg: Config{
 			Host: "irc.example.net", Port: 6697, TLS: true,
-			Nick: "gate", Channels: []string{"#goirc", "#other"},
+			ServerName: "leaf.example.com",
+			Nick:       "gate", Channels: []string{"#goirc", "#other"},
 		},
 		bufs:   []string{"", "#goirc", "#other"},
 		focus:  2,
@@ -38,6 +39,9 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 	if st.host != "irc.example.net" || st.port != 6697 || !st.tls {
 		t.Fatalf("server fields: %+v", st)
+	}
+	if st.sni != "leaf.example.com" {
+		t.Fatalf("sni: %q", st.sni)
 	}
 	if st.nick != "gate" || st.focus != "#other" {
 		t.Fatalf("nick/focus: %+v", st)
@@ -155,6 +159,9 @@ func TestApplyRestored(t *testing.T) {
 	fresh.applyRestored()
 	if fresh.cfg.Host != "irc.example.net" || fresh.cfg.Port != 6697 || !fresh.cfg.TLS {
 		t.Fatalf("cfg: %+v", fresh.cfg)
+	}
+	if fresh.cfg.ServerName != "leaf.example.com" {
+		t.Fatalf("restored sni: %q", fresh.cfg.ServerName)
 	}
 	if len(fresh.cfg.Channels) != 2 || fresh.cfg.Channels[0] != "#goirc" {
 		t.Fatalf("channels: %v", fresh.cfg.Channels)

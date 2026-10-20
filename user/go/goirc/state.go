@@ -7,14 +7,17 @@ package main
 // the focused buffer, the live nick, and the plaintext-consent answer —
 // a restored tab re-asks nothing the user already answered.
 //
-// v1 layout (all integers little-endian, term/state.go's convention):
+// v2 layout (all integers little-endian, term/state.go's convention):
 //
-//	u8  format (=1)      the app's own staleness tag — the seat stores
+//	u8  format (=2)      the app's own staleness tag — the seat stores
 //	u8  flags            and returns StateVersion verbatim, so the blob
 //	     bit0: tls          also tags itself
 //	     bit1: consent
 //	u16 hostLen | host
 //	u16 port
+//	u16 sniLen  | sni      TLS verify/SNI name ("" = host); a bare reexec
+//	                        has no argv, so --sni must ride the blob or the
+//	                        restored dial validates against the IP
 //	u16 nickLen | nick
 //	u16 focusLen| focus     "" = the server buffer
 //	u16 nChans  | nChans x
@@ -25,7 +28,7 @@ package main
 // marker is `goirc: state refused`, never a half-applied session.
 
 const (
-	ircStateVersion uint8 = 1
+	ircStateVersion uint8 = 2
 
 	stateHostMax  = 255
 	stateNickMax  = 64
@@ -53,6 +56,7 @@ type ircState struct {
 	restored bool
 	host     string
 	port     uint16
+	sni      string
 	tls      bool
 	consent  bool
 	nick     string
@@ -85,10 +89,16 @@ func (s *ircState) encode(u *uiApp) []byte {
 		flags |= 2
 	}
 	out := make([]byte, 0, 64)
+	sni := u.cfg.ServerName
+	if len(sni) > stateHostMax {
+		sni = sni[:stateHostMax]
+	}
 	out = append(out, ircStateVersion, flags)
 	out = appendU16(out, uint16(len(host)))
 	out = append(out, host...)
 	out = appendU16(out, u.cfg.Port)
+	out = appendU16(out, uint16(len(sni)))
+	out = append(out, sni...)
 	out = appendU16(out, uint16(len(nick)))
 	out = append(out, nick...)
 	out = appendU16(out, uint16(len(focus)))
@@ -123,12 +133,13 @@ func (s *ircState) decode(b []byte) bool {
 	var d struct {
 		host  string
 		port  uint16
+		sni   string
 		flags byte
 		nick  string
 		focus string
 		chans []stateChan
 	}
-	if len(b) < 12 || b[0] != ircStateVersion {
+	if len(b) < 14 || b[0] != ircStateVersion {
 		return false
 	}
 	d.flags = b[1]
@@ -159,6 +170,9 @@ func (s *ircState) decode(b []byte) bool {
 		return false
 	}
 	d.port = uint16(p)
+	if d.sni, ok = str(stateHostMax); !ok {
+		return false
+	}
 	if d.nick, ok = str(stateNickMax); !ok {
 		return false
 	}
@@ -204,7 +218,7 @@ func (s *ircState) decode(b []byte) bool {
 		}
 	}
 	s.restored = true
-	s.host, s.port = d.host, d.port
+	s.host, s.port, s.sni = d.host, d.port, d.sni
 	s.tls = d.flags&1 != 0
 	s.consent = d.flags&2 != 0
 	s.nick, s.focus = d.nick, d.focus

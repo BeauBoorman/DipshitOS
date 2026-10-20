@@ -341,6 +341,15 @@ func main() {
 	args := cliArgs(vi.Args())
 	o, ok := parseArgs(args)
 	if !ok {
+		// A bare exec is the seat's reopen/crash re-exec shape (the LIFO
+		// carries only the recorded bin — no argv can ride it). The
+		// session's host/nick/channels live in the save_state blob, so a
+		// zero-arg launch falls into the UI: a staged blob resumes it,
+		// and runUI itself prints usage + exits when none arrives.
+		if len(args) == 0 {
+			runUI(o)
+			vi.Exit(exitError) // runUI exits via CloseAndExit; unreachable
+		}
 		usage()
 		vi.Exit(exitUsage)
 	}
