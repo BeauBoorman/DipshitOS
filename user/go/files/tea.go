@@ -63,6 +63,8 @@ func toTea(ev keys.Event) tea.KeyPressMsg {
 		return tea.KeyPressMsg(tea.Key{Code: tea.KeyPgDown})
 	case keys.KeyTab:
 		return tea.KeyPressMsg(tea.Key{Code: '\t'})
+	case keys.KeyCtrlZ:
+		return tea.KeyPressMsg(tea.Key{Code: 0x1a})
 	default:
 		return tea.KeyPressMsg(tea.Key{Code: 3}) // Ctrl-C
 	}
@@ -98,6 +100,8 @@ func fromTea(k tea.KeyPressMsg) keys.Event {
 		return keys.Event{Key: keys.KeyTab}
 	case 3:
 		return keys.Event{Key: keys.KeyCtrlC}
+	case 0x1a:
+		return keys.Event{Key: keys.KeyCtrlZ}
 	}
 	if k.Text != "" {
 		r := []rune(k.Text)

@@ -28,6 +28,13 @@
 //	                 /host/SNAPSHOT.BUNDLE; snapshot.go)
 //	ctrl-shift-[  -> nav back for the FOCUSED tab (M79e)
 //	ctrl-shift-]  -> nav forward (M79e)
+//	ctrl-z        -> undo dispatch (M121e): a focused tab answers through
+//	                 its own app-scope binding — the KEY_DOWN still reaches
+//	                 it per ADR 0009, the seat routes and never swallows —
+//	                 and the strip-focused press is the seat's own undo,
+//	                 the reopen LIFO. A tty front-end keeps the keystroke's
+//	                 own meaning (GOSH's suspend convention): the seat only
+//	                 ever names where the chord was routed.
 //	rail click    -> top strip, equal-width cells, same TASKBAR+FocusTab
 //	rail drag     -> press/release over different cells → existing Reorder()
 //	rail close-x  -> the cell's rightmost railCloseW px: close that tab (M79b)
@@ -78,6 +85,11 @@ const (
 	MarkerReopenMissing    = "gotabwm: reopen missing "
 	MarkerDuplicateMissing = "gotabwm: duplicate missing "
 
+	// M121e (#2568): the undo dispatch's route line — `id=<n>` when the
+	// chord routed to a live focused tab, `seat` when the strip owned it
+	// and the seat's own undo (the reopen LIFO) answered.
+	MarkerUndo = "gotabwm: undo "
+
 	// M82c (#1770): the registry's guest-side markers. The summary line
 	// follows `registered`; the refusal names the checker's error sentence;
 	// `fixture accepted` is the loud failure (the checker passing a table
@@ -109,6 +121,9 @@ const (
 	hidUsageW        uint8 = 0x1A // 'w'
 	hidUsagePageUp   uint8 = 0x4B
 	hidUsagePageDown uint8 = 0x4E
+	// M121e (#2568): the undo chord — plain ctrl, the bare-keystroke
+	// spelling every surface's own binding already answers.
+	hidUsageZ uint8 = 0x1D // 'z'
 	// M124e (#2584): the primary-paste chord is shift+insert — the card
 	// asked for ctrl+shift+v, but split-cycle owns it at this scope (M79c)
 	// and the kernel's tty path owns it at kernel-terminal scope (M73e).
@@ -262,6 +277,8 @@ func runSeatAction(action string, c chords.Chord) {
 	case "sel-paste":
 		// M124e (#2584): shift+insert — the primary-paste chord.
 		applySelPasteChord()
+	case "undo":
+		_ = applyUndo()
 	}
 }
 
@@ -475,6 +492,28 @@ func applyDuplicate() bool {
 		return false
 	}
 	vi.ConsoleLine(MarkerDuplicate + bin)
+	return true
+}
+
+// applyUndo is the M121e (#2568) undo dispatch: the seat owns ctrl+z at
+// seat scope and routes it — a focused LIVE tab's own app-scope binding
+// answers the KEY_DOWN the kernel already delivered (GOEDIT's buffer
+// undo, GOFILES's trash restore, a shell's own ctrl+z meaning), and the
+// marker names the route, never the revert — the revert is the app's own
+// marker or silence. With no tab focused the strip owns undo: the seat's
+// own answer is the reopen LIFO (applyReopen prints its own marker, and
+// an empty LIFO stays the honest silent no-op). A session placeholder
+// row is not a live client — nothing routes and nothing reopens.
+func applyUndo() bool {
+	id, ok := tabs.Focused()
+	if !ok {
+		vi.ConsoleLine(MarkerUndo + "seat")
+		return applyReopen()
+	}
+	if id >= sessionIDBase {
+		return false
+	}
+	vi.ConsoleLine(MarkerUndo + "id=" + vi.Itoa64(int64(id)))
 	return true
 }
 

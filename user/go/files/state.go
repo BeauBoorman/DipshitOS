@@ -657,6 +657,12 @@ func (m *model) handleKey(ev keys.Event) {
 		m.goUp()
 	case keys.KeyCtrlC:
 		m.quit = true
+	case keys.KeyCtrlZ:
+		// M121e (#2568): the seat's ctrl+z chord reaches this tty-bound
+		// tab as the 0x1a control byte; it is the `u` key's own path —
+		// restore the newest trashed entry. Called on the model receiver
+		// (Update's copy) so the marker/status survive the value write-back.
+		m.restoreLatest()
 	case keys.KeyTab:
 		m.toggleView()
 	case keys.KeyRune:
@@ -1226,6 +1232,8 @@ func keyLabel(ev keys.Event) string {
 		return "tab"
 	case keys.KeyCtrlC:
 		return "ctrl-c"
+	case keys.KeyCtrlZ:
+		return "ctrl-z"
 	default:
 		return "none"
 	}

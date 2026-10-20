@@ -1348,6 +1348,7 @@ func TestHidUsagesMatchRegistry(t *testing.T) {
 		"snapshot-bundle": hidUsageS,
 		"freeze-badge":    hidUsageF, "split-cycle": hidUsageV,
 		"nav-back": hidUsageLeftBracket, "nav-forward": hidUsageRightBracket,
+		"undo": hidUsageZ,
 	} {
 		if rowUsage(action) != usage {
 			t.Errorf("registry action %q usage drifted from the local constant %#x", action, usage)
@@ -1443,7 +1444,7 @@ func TestChordSummaryCounts(t *testing.T) {
 		}
 	}
 	got := chordSummary(len(chords.Global), seat, kernel, app)
-	want := "gotabwm: chords n=56 seat=28 kernel=12 app=16"
+	want := "gotabwm: chords n=59 seat=29 kernel=12 app=18"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
 	}
@@ -1497,5 +1498,54 @@ func TestGodMenuGestureNeverForwardsContent(t *testing.T) {
 		if (action == "header") != launch.open {
 			t.Fatalf("%s open=%v", action, launch.open)
 		}
+	}
+}
+
+// M121e (#2568): the undo chord's seat-side routing — a strip-focused
+// press is the seat's own undo (the reopen LIFO, one exec), a focused
+// live tab's press ROUTES to the tab's own binding (no exec, no pop —
+// the revert is the app's business), and a session placeholder is an
+// honest no-op. The route marker is gate-pinned; the host test owns the
+// state consequences.
+func TestHandleWmKeyUndoChordDispatches(t *testing.T) {
+	defer saveSeatState()()
+	saved := tabs
+	defer func() { tabs = saved }()
+
+	// Strip focus: the seat's own undo pops the reopen LIFO.
+	tabs = TabStrip{}
+	if !tabs.OpenTab(3, "Calc") || !tabs.CloseTab(3) {
+		t.Fatal("seed the reopen ring")
+	}
+	execs, restore := execRecorder()
+	defer restore()
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(*execs) != 1 || (*execs)[0] != "GOCALC.ELF" {
+		t.Fatalf("strip-focused ctrl-z must reopen the last closed tab, got %v", *execs)
+	}
+	// Drained ring: an honest no-op, not a second exec.
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(*execs) != 1 {
+		t.Fatalf("empty ring must not exec again: %v", *execs)
+	}
+
+	// Focused live tab: the chord routes — nothing execs, nothing pops.
+	tabs = TabStrip{}
+	if !tabs.OpenTab(4, "Edit") || !tabs.FocusTab(4) {
+		t.Fatal("OpenTab/FocusTab")
+	}
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(*execs) != 1 {
+		t.Fatalf("a focused tab's ctrl-z must not exec: %v", *execs)
+	}
+
+	// A focused session placeholder is not a live client: silent no-op.
+	tabs = TabStrip{}
+	if !tabs.OpenTab(sessionIDBase+1, "Ghost") || !tabs.FocusTab(sessionIDBase+1) {
+		t.Fatal("placeholder OpenTab/FocusTab")
+	}
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(*execs) != 1 {
+		t.Fatalf("a placeholder's ctrl-z must not exec: %v", *execs)
 	}
 }

@@ -120,6 +120,15 @@ var Global = Table{
 		"move the focused tab one rail cell left", "#2565 (M121b)", false},
 	{Chord{ModCtrl | ModShift, UsagePageDown}, "seat", ScopeSeat, "move-right",
 		"move the focused tab one rail cell right", "#2565 (M121b)", false},
+	// M121e (#2568): the undo chord. The seat row owns the chord's dispatch:
+	// a focused tab answers it through its own app-scope binding (the raw
+	// KEY_DOWN reaches it per ADR 0009 — the seat routes, never swallows),
+	// and the strip-focused case is the seat's own undo (reopen the last
+	// closed tab). A tty-bound front-end keeps the keystroke's own meaning
+	// — GOSH's suspend convention is not an undo the seat may take.
+	{Chord{ModCtrl, UsageZ}, "seat", ScopeSeat, "undo",
+		"dispatch undo to the focused tab — with the strip focused, " +
+			"reopen the last closed tab", "#2568 (M121e)", false},
 
 	// --- apps: each app's own chords, live while that app is focused
 	// (ADR 0009 KEY_DOWN). GOSH's are the shlib line editor's
@@ -149,6 +158,13 @@ var Global = Table{
 		"reverse-i-search through command history", "#1450 (M68b)", false},
 	{Chord{ModCtrl, UsageS}, "GOEDIT.ELF", AppScope("GOEDIT.ELF"), "",
 		"publish the buffer (save)", "#1563-era (M58)", false},
+	// M121e (#2568): the undo chord's app answers — the focused tab's own
+	// binding is what the seat row routes to. GOEDIT undoes its newest
+	// buffer op, GOFILES restores the newest trashed entry.
+	{Chord{ModCtrl, UsageZ}, "GOEDIT.ELF", AppScope("GOEDIT.ELF"), "",
+		"undo the newest buffer op", "#2568 (M121e)", false},
+	{Chord{ModCtrl, UsageZ}, "GOFILES.ELF", AppScope("GOFILES.ELF"), "",
+		"restore the newest trashed entry", "#2568 (M121e)", false},
 	{Chord{ModCtrl, UsageF}, "GOEDIT.ELF", AppScope("GOEDIT.ELF"), "",
 		"open the find bar", "#1485-era (M20 U3)", false},
 	{Chord{ModCtrl, UsageG}, "GOEDIT.ELF", AppScope("GOEDIT.ELF"), "",

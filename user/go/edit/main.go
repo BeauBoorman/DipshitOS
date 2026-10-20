@@ -583,6 +583,13 @@ func main() {
 			e.markStage()
 			e.emitStatus()
 		},
+		// M121e (#2568): the undo hook — the seat's ctrl+z routes to this
+		// tab, Dispatch classifies it ActionUndo, and the buffer's own op
+		// ring answers (the same revert the old in-app binding ran).
+		HandleUndo: func() bool {
+			e.undo()
+			return true
+		},
 	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
@@ -657,6 +664,17 @@ func main() {
 			ta.Present()
 			e.bannerFlush()
 			e.emitStatus()
+		case tabapp.ActionUndo:
+			// M121e: the seat's ctrl+z routed here — the same repaint
+			// discipline as a handled key.
+			if ta.Undo() {
+				e.draw()
+				ta.Present()
+				e.bannerFlush()
+				e.markStage()
+				e.emitStatus()
+				e.hintsFlush()
+			}
 		case tabapp.ActionNone:
 			if e.handle(ev) {
 				e.draw()
@@ -862,13 +880,12 @@ func (e *editor) handleKey(ev vi.Event) bool {
 		return e.diagsKey(ev)
 	}
 	// #2199 chords, all on the usage column via chord() so the shifted
-	// spellings stay distinct: ctrl-z undoes, ctrl-shift-z and ctrl-y redo,
-	// ctrl-x/c/v are the clipboard, ctrl-a selects all, and ctrl-shift-m is
-	// the mark — the gate-drivable selection gesture.
-	if chord(ev, 'z', false) {
-		e.undo()
-		return true
-	}
+	// spellings stay distinct: ctrl-shift-z and ctrl-y redo, ctrl-x/c/v
+	// are the clipboard, ctrl-a selects all, and ctrl-shift-m is the mark —
+	// the gate-drivable selection gesture. M121e moved ctrl-z out of this
+	// list: tabapp.Dispatch classifies it ActionUndo ahead of handle() and
+	// the HandleUndo hook runs e.undo() — one seat-owned chord, no second
+	// app binding to double-fire.
 	if chord(ev, 'z', true) || chord(ev, 'y', false) {
 		e.redo()
 		return true

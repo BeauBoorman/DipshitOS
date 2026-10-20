@@ -132,15 +132,15 @@ func TestChordHintsKeys(t *testing.T) {
 // registry spelling, and the footer — the exact strings a tty-bound app
 // paints.
 func TestChordHintsLines(t *testing.T) {
-	h := NewChordHints("GOFILES.ELF", chords.ScopeKernelTerminal)
+	h := NewChordHints("GOCALC.ELF", chords.ScopeKernelTerminal)
 	lines := h.Lines(80)
-	if lines[0] != "chord hints — GOFILES.ELF" {
+	if lines[0] != "chord hints — GOCALC.ELF" {
 		t.Fatalf("title line = %q", lines[0])
 	}
 	var sawHead, sawNote, sawKernelRow bool
 	for _, l := range lines {
 		switch {
-		case l == "this app — GOFILES.ELF":
+		case l == "this app — GOCALC.ELF":
 			sawHead = true
 		case l == "    (none registered)":
 			sawNote = true

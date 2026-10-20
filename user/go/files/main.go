@@ -215,6 +215,15 @@ func main() {
 				vi.ConsoleLine(markerDragEnd + "cancelled")
 			}
 		},
+		// M121e (#2568): the undo hook — the tab-facing undo answer the
+		// seat's ctrl+z names in its `undo id=` route. On this tty-bound
+		// surface the chord itself arrives as the 0x1a control byte and
+		// the model's KeyCtrlZ case calls the same restoreLatest — one
+		// undo entry, no second binding.
+		HandleUndo: func() bool {
+			m.restoreLatest()
+			return true
+		},
 	})
 	if ta == nil {
 		vi.ConsoleLine("gofiles: error open -1")

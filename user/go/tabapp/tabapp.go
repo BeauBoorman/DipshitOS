@@ -66,6 +66,14 @@ type Config struct {
 	// nil when the staged envelope was absent (a transport failure the
 	// app is told about, never a silently-empty paste).
 	SelPaste func(text []byte)
+
+	// M121e (#2568): the undo hook. The seat's ctrl+z chord routes to the
+	// focused tab, whose own KEY_DOWN arrives here unchanged (ADR 0009) —
+	// Dispatch classifies it as ActionUndo and the app's loop calls Undo(),
+	// which runs this hook. A nil hook is the documented no-op default:
+	// the chord is still consumed, nothing is reverted. True means the
+	// hook ran an undo step — the caller repaints on it.
+	HandleUndo func() bool
 }
 
 // DragOffer is one delivered drop (M124a): the mime both sides agreed
@@ -90,6 +98,10 @@ const (
 	ActionResized
 	// ActionClosed: clean up and exit.
 	ActionClosed
+	// ActionUndo: M121e (#2568) — a ctrl+z KEY_DOWN arrived; the app calls
+	// Undo() and repaints when it returns true. The event is consumed:
+	// it never falls through to the app's own key handling.
+	ActionUndo
 )
 
 // Rect is a layout rectangle in canvas coordinates.
@@ -127,6 +139,9 @@ type TabApp struct {
 	// M124e (#2584): the primary-selection sink, copied from Config.
 	SelPaste func(text []byte)
 
+	// M121e (#2568): the undo hook, copied from Config.
+	HandleUndo func() bool
+
 	// surf is the bound M33 window surface — the shared pages the depth
 	// engine paints and the compositor reads — nil when the bind refused
 	// and this app is on the degrade path. buf is surf viewed at the
@@ -142,6 +157,10 @@ type TabApp struct {
 // call draw.WindowCanvas makes. Tests substitute a page-sized slice and
 // verify bind + review without a kernel.
 var mmapWindowSurface = vi.MmapWindowSurface
+
+// usageZ is the USB HID keyboard usage for 'z' — the M121e undo chord's
+// key half (the chords registry's UsageZ pinned the same 0x1D).
+const usageZ uint8 = 0x1D
 
 // Init opens the window and declares tab-awareness. It returns nil when
 // win_open fails (the caller prints and exits).
@@ -175,6 +194,7 @@ func Init(cfg Config) *TabApp {
 	ta.DropTarget = cfg.DropTarget
 	ta.DragEnd = cfg.DragEnd
 	ta.SelPaste = cfg.SelPaste
+	ta.HandleUndo = cfg.HandleUndo
 	if ta.RestoreState != nil {
 		if v, blob, ok := vi.RequestStateRestore(uint32(win), cfg.Name); ok {
 			ta.Restored = true
@@ -295,6 +315,14 @@ func (t *TabApp) Dispatch(ev vi.Event) Action {
 	switch ev.Kind {
 	case vi.EvWinClose:
 		return ActionClosed
+	case vi.EvKeyDown:
+		// M121e (#2568): plain ctrl+z is the seat-owned undo chord — the
+		// registry's seat row routes it to the focused tab and this is the
+		// tab's own answer. Shifted/alted spellings are NOT it (ctrl-shift-z
+		// stays the app's redo, per its own binding).
+		if ev.Flags&vi.ModCtrl != 0 && ev.Flags&(vi.ModShift|vi.ModAlt) == 0 && uint8(ev.Arg0) == usageZ {
+			return ActionUndo
+		}
 	case vi.EvWinResize:
 		t.W = ev.Arg0
 		t.H = ev.Arg1
@@ -330,6 +358,16 @@ func (t *TabApp) Close() {
 func (t *TabApp) CloseAndExit(status int) {
 	t.Close()
 	vi.Exit(status)
+}
+
+// Undo runs the app's M121e undo hook — Dispatch's ActionUndo case calls
+// it. A nil hook is the no-op default (the chord was still consumed);
+// false means nothing was reverted so the caller skips the repaint.
+func (t *TabApp) Undo() bool {
+	if t.HandleUndo == nil {
+		return false
+	}
+	return t.HandleUndo()
 }
 
 // DeclareNav tells the WM this tab navigated to path (the browser-history

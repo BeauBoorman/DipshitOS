@@ -182,3 +182,27 @@ func TestCanvasDegradesWhenBindRefused(t *testing.T) {
 		t.Fatalf("manual TabApp canvas = %#v want FillerCanvas degrade", manual.Canvas())
 	}
 }
+
+// M121e (#2568): Dispatch classifies plain ctrl+z as ActionUndo — the
+// seat's chord routed to this tab — while shifted/alted spellings stay
+// the app's own keys (ctrl-shift-z is redo territory).
+func TestDispatchUndoChord(t *testing.T) {
+	ta := &TabApp{Win: 1, W: 100, H: 100}
+	if a := ta.Dispatch(vi.Event{Kind: vi.EvKeyDown, Flags: vi.ModCtrl, Arg0: 0x1d}); a != ActionUndo {
+		t.Fatalf("ctrl+z dispatch = %v want ActionUndo", a)
+	}
+	for _, f := range []uint16{vi.ModCtrl | vi.ModShift, vi.ModCtrl | vi.ModAlt, 0, vi.ModShift} {
+		if a := ta.Dispatch(vi.Event{Kind: vi.EvKeyDown, Flags: f, Arg0: 0x1d}); a != ActionNone {
+			t.Fatalf("z with flags %#x dispatch = %v want ActionNone", f, a)
+		}
+	}
+	// The hook is the no-op default: a consumed chord, nothing reverted.
+	if ta.Undo() {
+		t.Fatal("nil HandleUndo must no-op")
+	}
+	ran := 0
+	ta.HandleUndo = func() bool { ran++; return true }
+	if !ta.Undo() || ran != 1 {
+		t.Fatalf("HandleUndo must run once and report, ran=%d", ran)
+	}
+}

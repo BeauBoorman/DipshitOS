@@ -26,6 +26,10 @@ const (
 	KeyPageDown
 	KeyTab
 	KeyCtrlC
+	// M121e (#2568): ctrl+z (0x1a) — the seat's undo chord as a tty byte.
+	// tty-bound front-ends see the chord as this control byte, never as a
+	// window KEY_DOWN; an app that does not bind it ignores it as before.
+	KeyCtrlZ
 )
 
 // Event is one decoded key. Rune is set only for KeyRune.
@@ -77,6 +81,8 @@ func Decode(b []byte) (Event, int) {
 		return Event{Key: KeyTab}, 1
 	case c == 0x03:
 		return Event{Key: KeyCtrlC}, 1
+	case c == 0x1a:
+		return Event{Key: KeyCtrlZ}, 1
 	case c < 0x20:
 		// Other control bytes are ignored, never inserted as text.
 		return Event{Key: KeyNone}, 1

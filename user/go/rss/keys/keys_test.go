@@ -65,3 +65,12 @@ func TestDecodeEmptyAndControl(t *testing.T) {
 		t.Fatalf("ctrl-a = %+v n=%d (must be ignored, not inserted)", ev, n)
 	}
 }
+
+// M121e (#2568): ctrl+z (0x1a) decodes to KeyCtrlZ — the tty spelling of
+// the seat's undo chord.
+func TestDecodeCtrlZ(t *testing.T) {
+	ev, n := Decode([]byte{0x1a, 'x'})
+	if n != 1 || ev.Key != KeyCtrlZ {
+		t.Fatalf("Decode(0x1a) = (%+v, %d) want (KeyCtrlZ, 1)", ev, n)
+	}
+}

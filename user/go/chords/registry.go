@@ -73,6 +73,7 @@ const (
 	UsageV            uint8 = 0x19
 	UsageW            uint8 = 0x1A
 	UsageY            uint8 = 0x1C
+	UsageZ            uint8 = 0x1D
 	UsageDigit1       uint8 = 0x1E // digits 1..9 are 0x1E..0x26
 	UsageLeftBracket  uint8 = 0x2F
 	UsageRightBracket uint8 = 0x30

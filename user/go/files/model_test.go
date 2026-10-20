@@ -501,3 +501,24 @@ func TestNotifyToastIsConsumeOnUse(t *testing.T) {
 		t.Fatalf("the adopter's message %q exceeds the 24-byte notify budget", "copied KNOWN.TXT")
 	}
 }
+
+// M121e (#2568): in the listing the seat's ctrl+z chord arrives as the
+// 0x1a control byte and lands on the same trash restore as the `u` key.
+// On the host the restore is honestly refused (no trash log), but the
+// refusal marker proves the chord ran the undo path rather than no-op'ing.
+func TestCtrlZRunsTrashRestore(t *testing.T) {
+	var m model
+	m.handleKey(keys.Event{Key: keys.KeyCtrlZ})
+	if m.status != "restore refused" {
+		t.Fatalf("ctrl+z status = %q, want the trash restore's honest refusal", m.status)
+	}
+	found := false
+	for _, l := range m.drain() {
+		if strings.HasPrefix(l, markerRestoreNo) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ctrl+z emitted no %q marker", markerRestoreNo)
+	}
+}
