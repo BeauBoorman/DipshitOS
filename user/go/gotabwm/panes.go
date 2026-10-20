@@ -44,10 +44,30 @@ const (
 	panesTagLeaf       = 0x00
 	panesTagVert       = 'v'
 	panesTagHoriz      = 'h'
+
+	// panesVerSpaces (M137c #2773): the multi-space sidecar. A v2 blob
+	// carries every space — name, own preorder tree, and which space is
+	// live — because the .tabs group field names a record's space but
+	// cannot carry an EMPTY space or the live-space choice when the file
+	// records no active row:
+	//
+	//	'P' 'N' 0x02 | u8 nspaces | u8 current |
+	//	per space: u8 nameLen | name[nameLen] | u16 blobLen | blob
+	//
+	// Each blob is a complete v1 body (magic+ver+walk) so decodePanes
+	// reuses the frozen v1 walk verbatim; blobLen 0 = the space keeps no
+	// tree. A v1 file is still read — its single tree applies to the
+	// current space, which for an all-""-groups session is space "1".
+	panesVerSpaces byte = 2
 )
 
-// panesMaxBytes bounds one read: 3-byte header + 15 nodes * 5 bytes.
-const panesMaxBytes = 3 + treeMaxNodes*5
+// panesMaxBytes bounds one v1 read: 3-byte header + 15 nodes * 5 bytes.
+// panesMaxBytesV2 bounds the multi-space read: 5-byte header + per space
+// (1 nameLen + 12 name + 2 len + one v1 blob).
+const (
+	panesMaxBytes   = 3 + treeMaxNodes*5
+	panesMaxBytesV2 = 5 + MaxSpaces*(1+tabsV2GroupMax+2+panesMaxBytes)
+)
 
 // panesDelete is the file-delete seam for dropping a stale sidecar
 // (unsplit). A var like writeHostFile so host tests observe it.
@@ -200,11 +220,119 @@ func (s *TabStrip) decodePanes(b []byte) bool {
 	return true
 }
 
+// encodePanesSpaces serializes the space table as the v2 sidecar. Every
+// live space emits an entry — even one with no tree — so a restored boot
+// learns the space NAMES the records alone could not carry (an empty
+// space has no records) plus which space was live.
+func encodePanesSpaces() []byte {
+	out := make([]byte, 0, panesMaxBytesV2)
+	out = append(out, panesMagic0, panesMagic1, panesVerSpaces,
+		byte(spaceN), byte(spaceCur))
+	for si := 0; si < spaceN; si++ {
+		name := spaces[si].Name
+		if len(name) > tabsV2GroupMax {
+			name = name[:tabsV2GroupMax]
+		}
+		out = append(out, byte(len(name)))
+		out = append(out, name...)
+		// encodePanes fails closed to len 0 when the space has no tree —
+		// an empty blob is "unsplit shape", not a partial tree.
+		blob, _ := stripOf(si).encodePanes()
+		out = append(out, byte(len(blob)), byte(len(blob)>>8))
+		out = append(out, blob...)
+	}
+	return out
+}
+
+// decodePanesSpaces applies a v2 sidecar to the just-restored space
+// table (applySpacesV2 already distributed records). Fail-closed: any
+// malformed byte refuses the whole blob — partial trees never land.
+// Entry order resolves through entryIndexes so `current` names a sidecar
+// entry, not a raw array slot (the table's order can differ when the
+// sidecar recorded an empty space the records never named).
+func decodePanesSpaces(b []byte) bool {
+	if len(b) < 5 || b[0] != panesMagic0 || b[1] != panesMagic1 ||
+		b[2] != panesVerSpaces {
+		return false
+	}
+	ns := int(b[3])
+	cur := int(b[4])
+	if ns < 1 || ns > MaxSpaces || cur >= ns {
+		return false
+	}
+	pos := 5
+	var entryIndexes [MaxSpaces]int
+	leaves := 0
+	for e := 0; e < ns; e++ {
+		if pos+1 > len(b) {
+			return false
+		}
+		nameLen := int(b[pos])
+		pos++
+		if nameLen > tabsV2GroupMax || pos+nameLen+2 > len(b) {
+			return false
+		}
+		name := string(b[pos : pos+nameLen])
+		pos += nameLen
+		blen := int(b[pos]) | int(b[pos+1])<<8
+		pos += 2
+		if blen > panesMaxBytes || pos+blen > len(b) {
+			return false
+		}
+		if name == "" {
+			return false
+		}
+		si := spaceIndexByName(name)
+		if si < 0 {
+			if spaceN >= MaxSpaces {
+				return false
+			}
+			si = spaceN
+			spaces[si].Name = name
+			spaceN++
+		}
+		entryIndexes[e] = si
+		if blen > 0 {
+			if !stripOf(si).decodePanes(b[pos : pos+blen]) {
+				return false
+			}
+			leaves += stripOf(si).leafCount()
+		}
+		pos += blen
+	}
+	if pos != len(b) {
+		return false
+	}
+	// Reconcile the live space through the entry map; park the decode's
+	// default before the adopt.
+	if si := entryIndexes[cur]; si != spaceCur {
+		spaces[spaceCur].Strip = tabs
+		spaceCur = si
+		tabs = spaces[si].Strip
+	}
+	vi.ConsoleLine(MarkerPanesLoad + vi.Itoa64(int64(leaves)) +
+		" spaces=" + vi.Itoa64(int64(spaceN)))
+	return true
+}
+
 // writePanesFile publishes the sidecar — or deletes it when the tree
 // is gone, so a restored session cannot pick up a stale split. Part of
 // the session write path: writeSession calls it after the .tabs blob
-// lands, so the pair publishes together.
+// lands, so the pair publishes together. M137c: with more than one
+// space the v2 frame always writes — the space names + live index are
+// session truth even when no space carries a tree.
 func writePanesFile() {
+	if spaceN > 1 {
+		if writeHostFile(panesPath, encodePanesSpaces()) {
+			leaves := 0
+			for si := 0; si < spaceN; si++ {
+				leaves += stripOf(si).leafCount()
+			}
+			vi.ConsoleLine(MarkerPanesWrite + vi.Itoa64(int64(leaves)) +
+				" spaces=" + vi.Itoa64(int64(spaceN)))
+		}
+		return
+	}
 	if tabs.treeN == 0 {
 		if panesDelete(panesPath) == 0 {
 			// A deleted sidecar is itself a state change worth one line —
@@ -222,16 +350,27 @@ func writePanesFile() {
 	}
 }
 
-// loadPanesFile reads the sidecar onto the just-restored strip. Absent
+// loadPanesFile reads the sidecar onto the just-restored strip(s). Absent
 // is the unsplit shape (silent); corrupt refuses whole with a marker.
-// Called from loadSession AFTER applyTabsV2 so leaf indexes resolve
-// against the restored rows.
+// Called from loadSession AFTER applySpacesV2 so leaf indexes resolve
+// against the restored rows. A v1 blob applies to the live strip as
+// before; a v2 blob distributes per space and reconciles which is live.
 func loadPanesFile() {
-	b, r := readSessionFile(panesPath, panesMaxBytes+1)
+	b, r := readSessionFile(panesPath, panesMaxBytesV2+1)
 	if r < 0 || b == nil {
 		return
 	}
-	if len(b) > panesMaxBytes || !tabs.decodePanes(b) {
+	if len(b) < 3 || b[0] != panesMagic0 || b[1] != panesMagic1 {
+		vi.ConsoleLine(MarkerPanesBad)
+		return
+	}
+	if b[2] == panesVerSpaces {
+		if len(b) > panesMaxBytesV2 || !decodePanesSpaces(b) {
+			vi.ConsoleLine(MarkerPanesBad)
+		}
+		return
+	}
+	if len(b) > panesMaxBytes || b[2] != panesVer || !tabs.decodePanes(b) {
 		vi.ConsoleLine(MarkerPanesBad)
 		return
 	}

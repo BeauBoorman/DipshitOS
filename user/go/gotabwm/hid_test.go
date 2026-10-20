@@ -973,6 +973,7 @@ func rectRecorder() (*[]rectCall, func()) {
 // existing hid_test.go pattern.
 func saveSeatState() func() {
 	ts, pl := tabs, launch
+	sp, sn, sc := spaces, spaceN, spaceCur
 	pb, cd, rd, rh, sd := prevPtrButtons, contentDown, railDragFrom, railHover, sashDragging
 	rc, gh := railCloseHover, godButtonHover
 	mg := menuGesture
@@ -982,6 +983,7 @@ func saveSeatState() func() {
 	sf := seatFonts
 	return func() {
 		tabs, launch = ts, pl
+		spaces, spaceN, spaceCur = sp, sn, sc
 		prevPtrButtons, contentDown, railDragFrom, railHover, sashDragging = pb, cd, rd, rh, sd
 		railCloseHover, godButtonHover = rc, gh
 		menuGesture = mg
@@ -1459,13 +1461,17 @@ func TestChordSummaryCounts(t *testing.T) {
 // focused app's kind-1 KEY_DOWN arrives per ADR 0009 whatever the seat
 // does. A reserved chord therefore FORWARDS — the row claims the spelling
 // without eating the keystroke — so R4–R6 land in the table now and
-// M137a/M137c land only their handlers. This test pins the no-op half so
-// a later "consume" refactor cannot land silently.
+// M137a/M137c landed their handlers: the pane-focus rows stay no-ops on
+// a split-free strip, space-prev clamps at the first space, space-next
+// creates + switches to space "2" (seat-local — never an exec), and
+// summon-emoji execs GOEMOJI.ELF by name. The registry pins stay; the
+// state assertions now name the implemented behavior.
 func TestReservedChordsForwardAsNoOps(t *testing.T) {
 	defer saveSeatState()()
 	stubLauncherWindows(t)
 	savedTabs := tabs
 	defer func() { tabs = savedTabs }()
+	resetSpaces()
 	tabs = TabStrip{}
 	if !tabs.OpenTab(3, "A") || !tabs.OpenTab(4, "B") {
 		t.Fatal("OpenTab")
@@ -1498,8 +1504,10 @@ func TestReservedChordsForwardAsNoOps(t *testing.T) {
 		}
 		handleWmKey(e)
 	}
-	if len(*execs) != 0 {
-		t.Fatalf("reserved chords reached the exec seam: %v — a no-op must not exec", *execs)
+	// The only chord that may reach exec is summon-emoji — by name,
+	// exactly once.
+	if len(*execs) != 1 || (*execs)[0] != "GOEMOJI.ELF" {
+		t.Fatalf("summon-emoji must exec GOEMOJI.ELF once: %v", *execs)
 	}
 	if len(*indices) != 0 {
 		t.Fatalf("reserved chords moved rail focus: %v", *indices)
@@ -1507,11 +1515,16 @@ func TestReservedChordsForwardAsNoOps(t *testing.T) {
 	if launch.open {
 		t.Fatal("a reserved chord opened the launcher")
 	}
-	if id, ok := tabs.Focused(); !ok || id != 4 {
-		t.Fatalf("reserved chords mutated focus to %v", id)
+	// space-next created + switched: the two seeded tabs sit dormant on
+	// space "1"; the live strip is the new empty space "2".
+	if spaceN != 2 || spaceCur != 1 || spaces[1].Name != "2" {
+		t.Fatalf("space-next: spaceN=%d spaceCur=%d name=%q", spaceN, spaceCur, spaces[1].Name)
 	}
-	if tabs.Count() != 2 {
-		t.Fatalf("reserved chords mutated the strip: %d tabs want 2", tabs.Count())
+	if tabs.Count() != 0 {
+		t.Fatalf("space-next must land on an empty strip: %d tabs", tabs.Count())
+	}
+	if spaces[0].Strip.Count() != 2 {
+		t.Fatalf("the parked strip lost tabs: %d", spaces[0].Strip.Count())
 	}
 }
 

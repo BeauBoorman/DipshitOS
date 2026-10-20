@@ -68,14 +68,14 @@ const (
 	// actually ticked PAST the demo ceiling (maxTicks) -- carrying the tab
 	// count so the persistence proof and the "tab still open" fact are one
 	// honest line.
-	MarkerModeDemo   = "gotabwm: mode demo"
-	MarkerModeLive   = "gotabwm: mode live"
+	MarkerModeDemo = "gotabwm: mode demo"
+	MarkerModeLive = "gotabwm: mode live"
 	// The mailbox is live from the loop's first serviceRPC — the arming
 	// marker for a guest exec that must not declare into an unserved seat
 	// (the startup probe's bounded waits can outlast the client's 8-tick
 	// ack budget; observed t3 'not-tab-aware' with the serve landing after
 	// the client had already timed out).
-	MarkerServing = "gotabwm: serving"
+	MarkerServing    = "gotabwm: serving"
 	MarkerLiveSteady = "gotabwm: live steady "
 	// M69a (issue #1528): the dogfood beat's own two markers, owned by
 	// go-dogfood.spec. MarkerDogfoodSeat is the DEFAULT seat announcing it owns
@@ -1053,6 +1053,7 @@ func paintBlank(scan []byte, rgb uint32) int {
 var (
 	lastRailN     int
 	lastRailFocus uint32
+	lastRailSpace int
 	railMarked    bool
 )
 
@@ -1062,11 +1063,14 @@ func markRail() {
 		return
 	}
 	f, _ := tabs.Focused()
-	if railMarked && n == lastRailN && f == lastRailFocus {
+	if railMarked && n == lastRailN && f == lastRailFocus &&
+		spaceCur == lastRailSpace {
 		return
 	}
 	railMarked = true
 	lastRailN = n
 	lastRailFocus = f
-	vi.ConsoleLine(MarkerRail + "n=" + vi.Itoa64(int64(n)) + " focus=" + vi.Itoa64(int64(f)))
+	lastRailSpace = spaceCur
+	vi.ConsoleLine(MarkerRail + "n=" + vi.Itoa64(int64(n)) + " focus=" +
+		vi.Itoa64(int64(f)) + " space=" + spaces[spaceCur].Name)
 }

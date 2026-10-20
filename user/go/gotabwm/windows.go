@@ -357,7 +357,8 @@ func launcherWindowEvent(e vi.Event) {
 				" status=" + vi.Itoa64(int64(status)))
 			crashSave()
 		}
-		_ = tabs.CloseTab(id)
+		// M137c: the dying window may belong to a dormant space.
+		_ = closeTabAcrossSpaces(id)
 		if crashed {
 			// The restart runs on the next composite tick, off this
 			// event's teardown path — the just-saved machine image and

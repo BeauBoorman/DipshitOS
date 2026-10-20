@@ -64,6 +64,10 @@ const (
 	palSetting
 	palHelp
 	palChord
+	// palSpace (M137c #2773): "move the focused tab to space <name>" —
+	// one row per dormant space plus the next unnamed slot while the
+	// table has room. arg carries the space name; id the tab's window id.
+	palSpace
 )
 
 // paletteEntry is one result row. label is the painted text and the primary
@@ -139,6 +143,7 @@ func paletteSources() []paletteEntry {
 			id:     t.ID,
 		})
 	}
+	out = appendSpaceRows(out)
 	out = appendRecentRows(out)
 	out = appendSettingsRows(out)
 	out = appendHelpRows(out)
@@ -155,6 +160,43 @@ func paletteSources() []paletteEntry {
 			e.detail = r.Chord.String() + " · seat"
 		}
 		out = append(out, e)
+	}
+	return out
+}
+
+// appendSpaceRows offers the M137c move: the focused tab can travel to
+// each dormant space, and to the next unnamed slot while the table has
+// room (the palette's own space-create path). An empty strip or a
+// single-space desktop with all four slots used yields no rows.
+func appendSpaceRows(out []paletteEntry) []paletteEntry {
+	fid, ok := tabs.Focused()
+	if !ok {
+		return out
+	}
+	title := tabs.At(tabs.focus).Title
+	for si := 0; si < spaceN; si++ {
+		if si == spaceCur {
+			continue
+		}
+		out = append(out, paletteEntry{
+			kind:   palSpace,
+			label:  "Move " + title + " to space " + spaces[si].Name,
+			alt:    "space " + spaces[si].Name,
+			detail: "space " + spaces[si].Name,
+			id:     fid,
+			arg:    spaces[si].Name,
+		})
+	}
+	if spaceN < MaxSpaces {
+		name := spaces[spaceN].Name
+		out = append(out, paletteEntry{
+			kind:   palSpace,
+			label:  "Move " + title + " to new space " + name,
+			alt:    "space " + name,
+			detail: "space " + name,
+			id:     fid,
+			arg:    name,
+		})
 	}
 	return out
 }
@@ -341,6 +383,16 @@ func paletteExecSelected() {
 			return
 		}
 		vi.ConsoleLine(MarkerPaletteFocus + vi.Itoa64(int64(e.id)))
+	case palSpace:
+		// Like palChord: the row closes the palette first — the moved
+		// tab's window hides on the desktop, not under the modal strip.
+		launch.launching = true
+		if releaseLauncherFocus(false) {
+			finishLauncher()
+		}
+		vi.ConsoleLine(MarkerPaletteRun + "move-to-space " + e.arg)
+		_ = applySpaceMove(e.id, e.arg)
+		return
 	case palChord:
 		// A seat row dispatches its own action with the palette already
 		// closed so a result like "launcher" or "pin" acts on the desktop,

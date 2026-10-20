@@ -147,12 +147,14 @@ func noteSessionMutation() bool {
 // claims a session, and every reader already treats absent as defaults.
 // M79g: this is also the choreography's pin-stay snapshot (seat.go case 2)
 // and the write-through target of every user mutation.
+// M137c (#2773): every space's rows encode, group-named — the active field
+// names the live space's focused record.
 func writeSession() bool {
-	live := tabs.sessionRows()
-	if live.count == 0 {
+	recs, active, ok := sessionRecordsV2()
+	if !ok {
 		return false
 	}
-	raw, dropped, ok := live.encodeTabsV2(sessionSeq)
+	raw, dropped, ok := encodeRecordsV2(sessionSeq, recs, active)
 	if !ok {
 		vi.ConsoleLine("gotabwm: session write fail")
 		return false
@@ -166,7 +168,10 @@ func writeSession() bool {
 	}
 	sessionDirty = false
 	sessionSeq++
-	vi.ConsoleLine(MarkerSessionWrite + vi.Itoa64(int64(live.count)))
+	vi.ConsoleLine(MarkerSessionWrite + vi.Itoa64(int64(len(recs))))
+	if spaceN > 1 {
+		vi.ConsoleLine(MarkerSessionSpaces + "n=" + vi.Itoa64(int64(spaceN)))
+	}
 	// M137a: the pane tree rides beside the records — published or
 	// cleared at the same point so the pair never disagrees.
 	writePanesFile()
@@ -175,15 +180,17 @@ func writeSession() bool {
 
 // restoreSessionBytes keeps the missing/corrupt/present decisions testable on
 // the host. A missing file is distinct from an invalid or valid empty session:
-// only missing can request the first-boot workspace.
+// only missing can request the first-boot workspace. M137c: the decode
+// distributes records by group across spaces; *strip lands the live space.
 func restoreSessionBytes(strip *TabStrip, b []byte, readResult int64) (uint16, sessionLoadState) {
 	if readResult < 0 || b == nil {
 		return 0, sessionMissing
 	}
-	seq, ok := strip.applyTabsV2(b)
+	seq, ok := applySpacesV2(b)
 	if !ok {
 		return 0, sessionCorrupt
 	}
+	*strip = tabs
 	return seq, sessionRestored
 }
 
@@ -224,8 +231,16 @@ func loadSession() sessionLoadState {
 	// path (a strip that came from disk, not from declares), titles and
 	// the freeze count are the round-trip proof, and the order/layout
 	// dumps still show the placeholder strip exactly as read back.
-	vi.ConsoleLine(MarkerSessionLoad + vi.Itoa64(int64(tabs.Count())) + " mode=restore")
+	loadN := 0
+	for si := 0; si < spaceN; si++ {
+		loadN += stripOf(si).Count()
+	}
+	vi.ConsoleLine(MarkerSessionLoad + vi.Itoa64(int64(loadN)) + " mode=restore")
 	vi.ConsoleLine(MarkerSessionTitles + sessionEcho)
+	if spaceN > 1 {
+		vi.ConsoleLine(MarkerSessionSpaces + "n=" + vi.Itoa64(int64(spaceN)) +
+			" cur=" + spaces[spaceCur].Name)
+	}
 	// M71e (#1564): how many restored tabs came back carrying the frozen
 	// badge — the observable that the flag survived the round-trip. A
 	// separate line, not a field on the titles line above: that line's exact
@@ -253,14 +268,17 @@ const sessionReexecHold = hostTicks
 // reexecWait pairs an exec'd pid with the placeholder row that pid is
 // re-inhabiting. The declare path matches on ReplyTo (the client's own
 // pid — the same identity the RPC binding checks), never on title: a
-// retitled row would never match its own record.
+// retitled row would never match its own record. M137c: the space index
+// rides along so adoption lands on the right strip — placeholder ids are
+// unique across the whole file.
 type reexecWait struct {
-	pid uint8
-	id  uint32 // the placeholder window id the row still carries
+	pid   uint8
+	space uint8
+	id    uint32 // the placeholder window id the row still carries
 }
 
 var (
-	reexecPending [MaxTabs]reexecWait
+	reexecPending [MaxSpaces * MaxTabs]reexecWait
 	reexecN       int
 	reexecHold    int
 	// sessionEcho is the file's titles/pin/active echo, captured at load
@@ -274,41 +292,46 @@ var (
 // placeholder id, so this is the local strip removal, not the WM close
 // seam — and a dropped row's bin still lands in the reopen LIFO, so
 // ctrl-shift-t can retry an app the pool refused.
-func dropRestoredRow(t0 Tab, why string) {
+func dropRestoredRow(si int, t0 Tab, why string) {
 	name := t0.Title
 	if name == "" {
 		name = t0.Bin
 	}
 	vi.ConsoleLine(MarkerSessionDrop + name + " " + why)
-	_ = tabs.CloseTab(t0.ID)
+	_ = stripOf(si).CloseTab(t0.ID)
 }
 
-// reexecSession turns the just-restored placeholder strip into live tabs:
-// every backed row's bin is exec'd (the `.tabs` v2 row cap is the seat's
-// tab limit, and the kernel's task pool refuses what cannot fit — a refused
-// exec drops its row by name, which IS the pool bound). Each issued exec
-// leaves the row pending for its pid's declare. Returns the execs issued.
+// reexecSession turns the just-restored placeholder strips into live tabs:
+// every space's backed row's bin is exec'd (the `.tabs` v2 row cap is the
+// seat's tab limit, and the kernel's task pool refuses what cannot fit —
+// a refused exec drops its row by name, which IS the pool bound). Each
+// issued exec leaves the row pending for its pid's declare. Returns the
+// execs issued.
 func reexecSession() int {
-	var rows [MaxTabs]Tab
-	n := tabs.Count()
-	copy(rows[:], tabs.tabs[:n])
 	issued := 0
-	for i := 0; i < n; i++ {
-		t0 := rows[i]
-		if t0.Bin == "" {
-			dropRestoredRow(t0, "unbacked")
-			continue
+	for si := 0; si < spaceN; si++ {
+		s := stripOf(si)
+		var rows [MaxTabs]Tab
+		n := s.Count()
+		copy(rows[:], s.tabs[:n])
+		for i := 0; i < n; i++ {
+			t0 := rows[i]
+			if t0.Bin == "" {
+				dropRestoredRow(si, t0, "unbacked")
+				continue
+			}
+			pid, err := execApp(t0.Bin)
+			if err != nil || pid <= 0 || pid > 255 {
+				seatRefusalErr(err, "exec "+t0.Bin, t0.Bin)
+				dropRestoredRow(si, t0, "exec")
+				continue
+			}
+			vi.ConsoleLine(MarkerSessionExec + t0.Bin)
+			reexecPending[reexecN] = reexecWait{
+				pid: uint8(pid), space: uint8(si), id: t0.ID}
+			reexecN++
+			issued++
 		}
-		pid, err := execApp(t0.Bin)
-		if err != nil || pid <= 0 || pid > 255 {
-			seatRefusalErr(err, "exec "+t0.Bin, t0.Bin)
-			dropRestoredRow(t0, "exec")
-			continue
-		}
-		vi.ConsoleLine(MarkerSessionExec + t0.Bin)
-		reexecPending[reexecN] = reexecWait{pid: uint8(pid), id: t0.ID}
-		reexecN++
-		issued++
 	}
 	if reexecN > 0 {
 		reexecHold = sessionReexecHold
@@ -321,24 +344,30 @@ func reexecSession() int {
 // row keeps its recorded position, title, pin, frozen and focus — only the
 // dead placeholder id is swapped for the real window id. Returns the strip
 // index, or -1 when the pid is not a pending restore (a dropped row's late
-// declare joins as an ordinary new tab).
+// declare joins as an ordinary new tab). M137c: a dormant space's adopted
+// window hides at once — it must not composite over the live space.
 func adoptReexec(pid uint8, id uint32) int {
 	for i := 0; i < reexecN; i++ {
 		if reexecPending[i].pid != pid {
 			continue
 		}
 		phid := reexecPending[i].id
+		si := int(reexecPending[i].space)
 		reexecPending[i] = reexecPending[reexecN-1]
 		reexecPending[reexecN-1] = reexecWait{}
 		reexecN--
-		idx := tabs.index(phid)
+		s := stripOf(si)
+		idx := s.index(phid)
 		if idx < 0 {
 			return -1
 		}
-		tabs.tabs[idx].ID = id
+		s.tabs[idx].ID = id
 		// M137a: a pane leaf named by the dead placeholder id follows
 		// the swap to the live window id.
-		tabs.retreeID(phid, id)
+		s.retreeID(phid, id)
+		if si != spaceCur {
+			wmctlSetVisible(id, false)
+		}
 		return idx
 	}
 	return -1
@@ -393,8 +422,9 @@ func reapSessionReexec() {
 			i++
 			continue
 		}
-		if idx := tabs.index(reexecPending[i].id); idx >= 0 {
-			dropRestoredRow(tabs.At(idx), "dead")
+		s := stripOf(int(reexecPending[i].space))
+		if idx := s.index(reexecPending[i].id); idx >= 0 {
+			dropRestoredRow(int(reexecPending[i].space), s.At(idx), "dead")
 		}
 		reexecPending[i] = reexecPending[reexecN-1]
 		reexecPending[reexecN-1] = reexecWait{}
@@ -404,8 +434,10 @@ func reapSessionReexec() {
 		reexecHold--
 		if reexecHold == 0 {
 			for reexecN > 0 {
-				if idx := tabs.index(reexecPending[reexecN-1].id); idx >= 0 {
-					dropRestoredRow(tabs.At(idx), "late")
+				si := int(reexecPending[reexecN-1].space)
+				s := stripOf(si)
+				if idx := s.index(reexecPending[reexecN-1].id); idx >= 0 {
+					dropRestoredRow(si, s.At(idx), "late")
 				}
 				reexecN--
 			}
@@ -443,9 +475,12 @@ func finishReexec() {
 		}
 	}
 	live := 0
-	for i := 0; i < tabs.Count(); i++ {
-		if tabs.At(i).ID < sessionIDBase {
-			live++
+	for si := 0; si < spaceN; si++ {
+		s := stripOf(si)
+		for i := 0; i < s.Count(); i++ {
+			if s.At(i).ID < sessionIDBase {
+				live++
+			}
 		}
 	}
 	if fid != 0 {
@@ -457,6 +492,15 @@ func finishReexec() {
 		}
 	}
 	vi.ConsoleLine(MarkerSessionLive + vi.Itoa64(int64(live)))
+	// M137c: a dormant space's adopted windows must leave the composite —
+	// adoption already hides each one, this sweep is the belt for any row
+	// that slipped past it (an id reused, an early declare).
+	for si := 0; si < spaceN; si++ {
+		if si == spaceCur {
+			continue
+		}
+		spaceSetVisible(&spaces[si].Strip, false)
+	}
 	// M137a: a restored tree applies its pane rects to the adopted
 	// windows once the placeholder swap has settled — the sidecar's
 	// layout is real geometry, not just a LAYOUT.txt shape.

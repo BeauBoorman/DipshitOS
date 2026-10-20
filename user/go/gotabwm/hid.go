@@ -431,6 +431,18 @@ func runSeatAction(action string, c chords.Chord) {
 		_ = applyPaneFocus(0, -1)
 	case "pane-focus-down":
 		_ = applyPaneFocus(0, 1)
+	case "space-prev":
+		// M137c (#2773, ADR 0007 R5): ctrl+alt+PgUp clamps at space "1".
+		_ = applySpaceSwitch(-1)
+	case "space-next":
+		// PageDown at the last space opens the next slot — the keyboard's
+		// only space-create path.
+		_ = applySpaceSwitch(1)
+	case "summon-emoji":
+		// M137c (#2773, ADR 0007 R6): ctrl+shift+E focuses GOEMOJI's tab
+		// wherever it lives, else execs it by name — an absent target
+		// lands in the ordinary named-refusal lane.
+		_ = applySummonEmoji()
 	case "snapshot-bundle":
 		// M81g (#1767): the snapshot arm. It is a chord rather than a
 		// timer on purpose — the card rules out scheduled snapshots, and

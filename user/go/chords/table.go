@@ -149,14 +149,14 @@ var Global = Table{
 		"focus the pane below the focused pane (reserved; M137a implements)",
 		"#2752 (M132a)", false},
 	{Chord{ModCtrl | ModAlt, UsagePageUp}, "seat", ScopeSeat, "space-prev",
-		"switch to the previous space (reserved; M137c implements)",
+		"switch to the previous space",
 		"#2752 (M132a)", false},
 	{Chord{ModCtrl | ModAlt, UsagePageDown}, "seat", ScopeSeat, "space-next",
-		"switch to the next space (reserved; M137c implements)",
+		"switch to the next space (creates it at the end)",
 		"#2752 (M132a)", false},
 	{Chord{ModCtrl | ModShift, UsageE}, "seat", ScopeSeat, "summon-emoji",
-		"summon the emoji picker — launch GOEMOJI.ELF by name (reserved; " +
-			"M137c implements, M146a ships the target)",
+		"summon the emoji picker — launch GOEMOJI.ELF by name " +
+			"(M146a ships the target)",
 		"#2752 (M132a)", false},
 
 	// --- apps: each app's own chords, live while that app is focused

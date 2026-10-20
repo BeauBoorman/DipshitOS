@@ -520,7 +520,8 @@ func applyRPC(req vi.WmRpc) bool {
 		// same bounded save ask first so its blob reaches the reopen LIFO.
 		askStateSave(id, "detach")
 		collectStateAsks()
-		closed := tabs.CloseTab(id)
+		// M137c: the detaching window may belong to a dormant space.
+		closed := closeTabAcrossSpaces(id)
 		syncHostedFromStrip()
 		vi.ConsoleLine(MarkerRpcDetach + vi.Itoa64(int64(id)))
 		if closed {

@@ -267,6 +267,27 @@ func WmctlWinClose(id uint32) int64 {
 	return syscall2(SlotWmctl, uintptr(WmctlWinCloseCmd), uintptr(id))
 }
 
+// WmctlSetStateCmd is slot-65 subcommand 4 (M32 WMS5 Gate 2, ADR 0007): the
+// window-state channel. a1 = window id (0xFFFFFFFF = a GLOBAL kernel-
+// workspace switch), a2 = state bits: bits 0-1 visibility (0 hide, 1 show,
+// 2/3 unchanged), bits 8-15 kernel workspace (0-2, 0xff = unchanged), bit
+// 16 toggles always-on-top.
+const WmctlSetStateCmd uint64 = 4
+
+// WmctlSetVisible hides or shows user window id through the WM seam. The
+// workspace bits MUST carry 0xff ("unchanged") — a bare visibility call
+// reads as workspace 0 and would drag the window onto kernel workspace 0
+// along with the hide. M137c (#2773) uses this for spaces: a dormant
+// space's windows stay live but leave the composite.
+// Returns 0, or -EINVAL/-EACCES/-ENOSYS.
+func WmctlSetVisible(id uint32, visible bool) int64 {
+	var bits uintptr = 0xff00
+	if visible {
+		bits |= 1
+	}
+	return syscall3(SlotWmctl, uintptr(WmctlSetStateCmd), uintptr(id), bits)
+}
+
 // WmctlTaskbarClickCmd is slot-65 subcommand 12: the WM asks the kernel for
 // the taskbar-click decision on window id — the kernel's own focus+raise
 // primitive, so the owner receives the real WIN_FOCUS event.

@@ -545,10 +545,17 @@ func (s *TabStrip) CloseTab(id uint32) bool {
 	if li := s.leafOf(id); li >= 0 {
 		s.removeLeaf(li)
 	}
+	s.fixupAfterDetach(i)
+	return true
+}
+
+// fixupAfterDetach repairs focus and the tree after row i was spliced
+// out — the shared tail of CloseTab and detachTabAt.
+func (s *TabStrip) fixupAfterDetach(i int) {
 	if s.count == 0 {
 		s.focus = 0
 		s.treeN = 0
-		return true
+		return
 	}
 	if s.focus > i {
 		s.focus--
@@ -558,7 +565,28 @@ func (s *TabStrip) CloseTab(id uint32) bool {
 	if s.count < 2 {
 		s.treeN = 0
 	}
-	return true
+}
+
+// detachTabAt splices row i out WITHOUT the lifecycle wakes CloseTab
+// runs — no reopen-LIFO record, no notify/RPC/nav cleanup: the window
+// stays alive, just parked on another space (M137c #2773's move). Its
+// pane leaf dies here like a close's would; the destination strip
+// re-tiles its own shape. Returns the removed Tab (all fields ride).
+func (s *TabStrip) detachTabAt(i int) (Tab, bool) {
+	if i < 0 || i >= s.count {
+		return Tab{}, false
+	}
+	t0 := s.tabs[i]
+	for j := i; j+1 < s.count; j++ {
+		s.tabs[j] = s.tabs[j+1]
+	}
+	s.tabs[s.count-1] = Tab{}
+	s.count--
+	if li := s.leafOf(t0.ID); li >= 0 {
+		s.removeLeaf(li)
+	}
+	s.fixupAfterDetach(i)
+	return t0, true
 }
 
 // recordClosed pushes t onto the bounded reopen LIFO. Bounded: at most MaxTabs
@@ -1216,6 +1244,20 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover, clos
 			closeIcon, _ := icons.Codepoint("window-close")
 			seatGlyph(c, zone, closeIcon, ink, "x",
 				x+w-railCloseW+railCloseInset, (stripH-8)/2)
+			written++
+		}
+	}
+	// M137c (#2773): the rail's space name — painted only when more than
+	// one space exists (a single-space desktop has nothing to
+	// distinguish). Right-aligned, muted ink, small face.
+	if spaceN > 1 {
+		name := spaces[spaceCur].Name
+		tw := seatTextWidth(name, seatSmallPx)
+		x := width - tw - 4
+		if x >= 0 {
+			clip := widgets.Rect{X: 0, Y: 0, W: width, H: stripH}
+			seatText(c, clip, x, (stripH-seatSmallPx)/2, seatSmallPx,
+				name, railCloseRGB())
 			written++
 		}
 	}

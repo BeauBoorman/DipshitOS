@@ -8,7 +8,7 @@
 # #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# TWENTY-ONE vgate_runs share one seeded host share (`vgate_share seed`):
+# TWENTY-THREE vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -93,6 +93,15 @@
 #   19  M125g (#2592): the restart. A fresh boot decodes the file the kill
 #       left behind, re-execs all three rows, and each app's restore marker
 #       reports its own state back — cwd/env/scroll, url, caret/rings.
+#   22  M137c (#2773): spaces. LIVE mode, GOCALC+NOTE on space "1";
+#       ctrl-alt-pagedown CREATES space "2", the launcher lands GOEDIT on
+#       it, the palette's move-to-space row carries a tab across,
+#       ctrl-shift-e summons GOEMOJI (absent -> named refusal), and the
+#       snapshot chord captures both spaces — the .tabs group field and
+#       the SESSION.PANES v2 frame asserted on the share.
+#   23  M137c (#2773): the restore. A fresh boot stages SNAPSHOT.RESTORE,
+#       the bundle rehydrates the two-space session + sidecar, and a
+#       switch chord round-trips the restored table — every space intact.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -2799,3 +2808,151 @@ if "split=v" not in raw or "split=h" not in raw:
     sys.exit("restored layout lost the split kinds")
 print("restored layout rows: %s" % rows)
 PY
+
+# ---------------------------------------------------------------------------
+# Run 22 (M137c / #2773): spaces — named tab groups. LIVE mode: GOCALC+NOTE
+# declare onto space "1". ctrl-alt-pagedown CREATES + lands on space "2"
+# (the seat prints `space new name=2` and `space switch 1->2`, and hides
+# space 1's windows through wmctl_set_state); the launcher execs GOEDIT
+# onto space 2; the palette's palSpace row moves the focused space-1 tab
+# over; ctrl-shift-e summons GOEMOJI.ELF — absent, so the seat's named
+# exec refusal prints; ctrl-shift-s snapshots. On the share, SESSION.TABS
+# records carry group names "1"/"2" and SESSION.PANES is the v2 frame
+# holding both space names + the live index.
+
+vgate_file script-22.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-22.txt <<'EOF'
+dui focus 0
+exec GOCALC.ELF
+exec NOTE.ELF
+EOF
+
+vgate_file script3-22.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-spaces-ok
+EOF
+
+vgate_run 22 -- \
+    --screen '$RUN_DIR/screen-22' \
+    --script '$RUN_DIR/script-22.txt' \
+    --script2 '$RUN_DIR/script2-22.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-alt-pagedown,ctrl-space,e,d,i,t,return,ctrl-alt-pageup,ctrl-shift-p,m,o,v,e,space,t,o,return,ctrl-shift-e,ctrl-shift-s' \
+    --input-chords-after 'gotabwm: rail n=2' \
+    --script3 '$RUN_DIR/script3-22.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-gotabwm-spaces-ok' --timeout 300
+
+vgate_assert 22 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 22 serial-contains 'gotabwm: registered'
+# PageDown created + switched; the rail's marker names the live space.
+vgate_assert 22 serial-contains 'gotabwm: space new name=2'
+vgate_assert 22 serial-contains 'gotabwm: space switch 1->2'
+vgate_assert 22 serial-contains 'gotabwm: space switch 2->1'
+vgate_assert 22 serial-contains ' space=2'
+vgate_assert 22 serial-contains ' space=1'
+# GOEDIT landed on space 2; the palette move carried a tab across.
+vgate_assert 22 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 22 serial-contains 'gotabwm: palette run move-to-space 2'
+vgate_assert 22 serial-contains 'gotabwm: space move id='
+# The summon chord: the absent app's named refusal, not silence.
+vgate_assert 22 serial-contains 'gotabwm: refusal ENOENT exec GOEMOJI.ELF'
+# Both spaces persist: group-named records + the v2 sidecar frame.
+vgate_assert 22 serial-contains 'gotabwm: session write n=3'
+vgate_assert 22 serial-contains 'gotabwm: session spaces n=2'
+vgate_assert 22 serial-contains 'gotabwm: panes write n=0 spaces=2'
+vgate_assert 22 serial-contains 'gotabwm: snapshot saved'
+vgate_assert 22 serial-contains 'rx-gotabwm-spaces-ok'
+vgate_assert 22 serial-absent 'gotabwm: panes bad'
+vgate_assert 22 serial-absent 'gotabwm: session bad'
+vgate_assert 22 serial-absent '[EXC] parking:'
+vgate_assert 22 serial-absent 'exited status=139'
+vgate_assert 22 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+raw = open(os.path.join(share, "SESSION.TABS"), "rb").read()
+if not raw or raw[0] != 2:
+    sys.exit("SESSION.TABS ver=%r" % (raw[:1]))
+count = raw[2]
+recs, off = [], 6
+for i in range(count):
+    title = raw[off:off+32].split(b"\0", 1)[0]
+    group = raw[off+33:off+45].split(b"\0", 1)[0]
+    recs.append((title, group))
+    off += 69
+groups = sorted(set(g for _, g in recs))
+if groups != [b"1", b"2"]:
+    sys.exit("record groups %r want {1,2}" % groups)
+if len(recs) != 3:
+    sys.exit("records=%d want 3" % len(recs))
+blob = open(os.path.join(share, "SESSION.PANES"), "rb").read()
+if blob[:5] != b"PN\x02\x02\x01":
+    sys.exit("SESSION.PANES v2 header %r" % blob[:5])
+if b"\x011\x00\x00" not in blob or b"\x012\x00\x00" not in blob:
+    sys.exit("sidecar must carry both space names: %r" % blob)
+print("records: %s | sidecar %dB" % (recs, len(blob)))
+PY
+
+
+# ---------------------------------------------------------------------------
+# Run 23 (M137c / #2773): the snapshot restore. The bundle run 22 took
+# carries the two-space session + the v2 sidecar; a fresh boot stages
+# SNAPSHOT.RESTORE, rehydrates both files, and the seat decodes every
+# space (`session spaces n=2 cur=1`), re-execs all three rows, and a
+# switch chord round-trips the restored table.
+
+vgate_file script-23.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf open SNAPSHOT.RESTORE
+vf write 0 1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script3-23.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-spaces-restore-ok
+EOF
+
+vgate_run 23 -- \
+    --screen '$RUN_DIR/screen-23' \
+    --script '$RUN_DIR/script-23.txt' \
+    --input-chords 'ctrl-alt-pagedown,ctrl-alt-pageup' \
+    --input-chords-after 'gotabwm: session live n=3' \
+    --script3 '$RUN_DIR/script3-23.txt' \
+    --script3-after 'gotabwm: space switch 2->1' \
+    --script-expect 'rx-gotabwm-spaces-restore-ok' --timeout 300
+
+vgate_assert 23 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 23 serial-contains 'gotabwm: snapshot restore'
+vgate_assert 23 serial-contains 'gotabwm: session load n=3 mode=restore'
+vgate_assert 23 serial-contains 'gotabwm: session spaces n=2 cur=1'
+vgate_assert 23 serial-contains 'gotabwm: panes load n=0 spaces=2'
+vgate_assert 23 serial-contains 'gotabwm: session reexec n=3'
+vgate_assert 23 serial-contains 'gotabwm: session live n=3'
+vgate_assert 23 serial-contains 'gotabwm: rail n=3'
+vgate_assert 23 serial-contains ' space=1'
+# The restored table still switches: 1->2 lands on the empty space, 2->1
+# returns to the three restored rows.
+vgate_assert 23 serial-contains 'gotabwm: space switch 1->2'
+vgate_assert 23 serial-contains 'gotabwm: space switch 2->1'
+vgate_assert 23 serial-contains 'rx-gotabwm-spaces-restore-ok'
+vgate_assert 23 serial-absent 'gotabwm: panes bad'
+vgate_assert 23 serial-absent 'gotabwm: session bad'
+vgate_assert 23 serial-absent '[EXC] parking:'
+vgate_assert 23 serial-absent 'exited status=139'

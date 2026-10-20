@@ -184,3 +184,48 @@ synthesized into `consumeSeatEvent` — the seat's own input path — so
 seat chords, chrome hit-tests, and the kernel content-pointer forward
 behave exactly as for hardware input. No new syscall: R1's rule that
 the wave rides existing seams holds.
+
+## Amendment (card #2773): spaces are seat-side named groups
+
+**D16. A space is a `TabStrip` plus its pane tree, owned by the seat —
+never a kernel workspace.** `workspace_max` is 3 and the card wants up
+to 4 groups, so the grouping lives in `spaces.go`: `MaxSpaces` named
+slots (`"1".."4"` by default), `tabs` IS the live space's strip, and a
+switch parks the outgoing strip into its slot, adopts the dormant one,
+and swaps per-window visibility through the seat-only
+`wmctl_set_state` visibility bits (`vi.WmctlSetVisible` — bits 8-15
+pinned at `0xff` so a hide/show never reads as a kernel-workspace
+move). `ctrl+alt+PgUp` clamps at the first space; `ctrl+alt+PgDn` at
+the last space CREATES the next slot — the keyboard's only
+space-create path. Dormant windows keep running (input simply cannot
+reach them while hidden); a dormant window's detach or death still
+closes its row via `closeTabAcrossSpaces` so the session never
+re-execs what the user killed.
+
+**D17. The record's reserved `group` field carries the space name.**
+`.tabs` v2 stays frozen byte-for-byte — the 12-byte group field it
+always reserved now holds the space name, `""` naming the default
+space "1". The whole space table encodes as one record list in slot
+order with `active` naming the live space's focused record; a group
+list longer than `MaxSpaces` fails the file closed. `SESSION.PANES`
+grows a v2 frame (`PN` 0x02 + nspaces + current + per-space
+`name + v1 blob`) so every space's tree — and an EMPTY space's bare
+existence — round-trips the snapshot bundle's `EntryPanes` restore.
+A v1 sidecar still reads: its single tree lands on the live space.
+
+**D18. The rail names the live space; the palette moves tabs between
+them.** `paintRail` draws the current space's name at the rail's right
+edge once more than one space exists (a single-space desktop draws
+nothing — the name distinguishes spaces, it is not chrome for its own
+sake), and the `rail n=` marker line carries `space=<name>` so the
+gate reads the same truth. The palette gains a `palSpace` row kind —
+"Move <focused tab> to [new] space <name>" — dispatching to
+`applySpaceMove`: the tab travels wholesale (bin, pin, frozen, nav,
+app_state), its window hides, and its pane leaf stays behind for the
+destination to re-tile.
+
+**D19. `ctrl+shift+E` summons GOEMOJI.ELF by name** (the ADR 0007 R6
+row): a hosted emoji tab focuses wherever it lives — dormant spaces
+switch to it — and an absent target execs `GOEMOJI.ELF`, whose ENOENT
+lands in the seat's ordinary named-refusal lane (`refusal ENOENT exec
+GOEMOJI.ELF`) until card #2799 ships the picker.

@@ -36,11 +36,11 @@ const (
 
 	// M125a (#2586): the app_state section's framing constants and the
 	// per-app blob bound (the card's 64 KiB).
-	stateMaxBytes              = 64 * 1024
-	tabsV2AppStateHdr          = 6 // 'A','S', ver, count, rsvd16
-	tabsV2AppStateEntry        = 8 // index, appver, rsvd16, len32
-	tabsV2AppStateMagic0       = 'A'
-	tabsV2AppStateMagic1       = 'S'
+	stateMaxBytes               = 64 * 1024
+	tabsV2AppStateHdr           = 6 // 'A','S', ver, count, rsvd16
+	tabsV2AppStateEntry         = 8 // index, appver, rsvd16, len32
+	tabsV2AppStateMagic0        = 'A'
+	tabsV2AppStateMagic1        = 'S'
 	tabsV2AppStateVersion uint8 = 1
 
 	// tabsV2MaxBytes is the WHOLE file bound — header, records and the
@@ -82,27 +82,66 @@ func (s *TabStrip) encodeTabsV2(seq uint16) (raw []byte, dropped []string, ok bo
 	if n > MaxTabs {
 		return nil, nil, false
 	}
+	recs := make([]tabsV2Record, n)
+	for i := 0; i < n; i++ {
+		recs[i] = recordOf(s.tabs[i])
+	}
+	active := -1
+	if n > 0 && s.focus >= 0 && s.focus < n {
+		active = s.focus
+	}
+	return encodeRecordsV2(seq, recs, active)
+}
+
+// recordOf is the tab -> record projection shared by the single-strip and
+// the M137c multi-space encoders. Group stays empty here: the space name
+// is the session layer's field, not the tab's.
+func recordOf(t Tab) tabsV2Record {
+	return tabsV2Record{
+		Title: t.Title, Bin: t.Bin,
+		Pinned: t.Pinned, Frozen: t.Frozen,
+		State: t.State, StateVer: t.StateVer,
+	}
+}
+
+// encodeRecordsV2 writes the frozen `.tabs` v2 layout for an arbitrary
+// record list — M137c (#2773) feeds it the concatenation of every space's
+// session rows, each record's 12-byte group field naming its space. The
+// single-strip encoder above is the Group="" degenerate case; active is
+// the record's index in the file (-1 = no active). The count field is a
+// u8, so MaxSpaces*MaxTabs = 64 records still fit one header.
+func encodeRecordsV2(seq uint16, recs []tabsV2Record, active int) (raw []byte, dropped []string, ok bool) {
+	n := len(recs)
+	if n > 255 {
+		return nil, nil, false
+	}
 	buf := make([]byte, 0, tabsV2HeaderBytes+n*tabsV2RecordBytes)
 	buf = append(buf, make([]byte, tabsV2HeaderBytes)...)
 	buf[0] = tabsV2Version
-	if n > 0 && s.focus >= 0 && s.focus < n {
-		buf[1] = byte(s.focus + 1)
+	if active >= 0 && active < n {
+		buf[1] = byte(active + 1)
 	}
 	buf[2] = byte(n)
 	buf[3] = byte(seq & 0xff)
 	buf[4] = byte((seq >> 8) & 0xff)
 	for i := 0; i < n; i++ {
-		t0 := s.tabs[i]
 		rec := make([]byte, tabsV2RecordBytes)
-		putFixed(rec[:tabsV2TitleMax], t0.Title)
-		rec[tabsV2TitleMax] = tabFlags(t0)
-		putFixed(rec[tabsV2TitleMax+1:tabsV2TitleMax+1+tabsV2GroupMax], "")
-		putFixed(rec[tabsV2TitleMax+1+tabsV2GroupMax:], t0.Bin)
+		putFixed(rec[:tabsV2TitleMax], recs[i].Title)
+		var flags uint8
+		if recs[i].Pinned {
+			flags |= FlagPinned
+		}
+		if recs[i].Frozen {
+			flags |= FlagFrozen
+		}
+		rec[tabsV2TitleMax] = flags
+		putFixed(rec[tabsV2TitleMax+1:tabsV2TitleMax+1+tabsV2GroupMax], recs[i].Group)
+		putFixed(rec[tabsV2TitleMax+1+tabsV2GroupMax:], recs[i].Bin)
 		buf = append(buf, rec...)
 	}
 	states := 0
 	for i := 0; i < n; i++ {
-		if len(s.tabs[i].State) > 0 {
+		if len(recs[i].State) > 0 {
 			states++
 		}
 	}
@@ -112,7 +151,7 @@ func (s *TabStrip) encodeTabsV2(seq uint16) (raw []byte, dropped []string, ok bo
 			tabsV2AppStateVersion, 0, 0, 0)
 		emitted := 0
 		for i := 0; i < n; i++ {
-			st := s.tabs[i].State
+			st := recs[i].State
 			if len(st) == 0 {
 				continue
 			}
@@ -120,12 +159,12 @@ func (s *TabStrip) encodeTabsV2(seq uint16) (raw []byte, dropped []string, ok bo
 			// check here is the FILE cap — the blob that overflows the
 			// file is the one dropped, named by its row's title.
 			if len(buf)+tabsV2AppStateEntry+len(st) > tabsV2MaxBytes {
-				dropped = append(dropped, s.tabs[i].Title)
+				dropped = append(dropped, recs[i].Title)
 				continue
 			}
 			ent := make([]byte, tabsV2AppStateEntry)
 			ent[0] = byte(i)
-			ent[1] = s.tabs[i].StateVer
+			ent[1] = recs[i].StateVer
 			putU32LE(ent[4:], uint32(len(st)))
 			buf = append(buf, ent...)
 			buf = append(buf, st...)
@@ -147,6 +186,10 @@ type tabsV2Record struct {
 	// M71e (#1564): the frozen badge round-trips too. The codec already
 	// defines bit 0x02; GOTABWM dropped it on both encode and decode.
 	Frozen bool
+	// M137c (#2773): the space name — the 12-byte group field the frozen
+	// layout always carried, now used for what it was reserved for. ""
+	// means the default first space.
+	Group string
 	// M125a (#2586): the app_state blob paired with this record, nil
 	// when the file carried none.
 	State    []byte
@@ -184,7 +227,11 @@ func decodeTabsV2(b []byte) (seq uint16, recs []tabsV2Record, active int, hasAct
 		recs[i].Pinned = b[off]&FlagPinned != 0
 		recs[i].Frozen = b[off]&FlagFrozen != 0
 		off++
-		off += tabsV2GroupMax // group unused
+		// M137c (#2773): the 12-byte group field names the record's
+		// space. Old files carry zeros here — readFixed returns "" and
+		// the record lands on the default first space.
+		recs[i].Group = readFixed(b[off : off+tabsV2GroupMax])
+		off += tabsV2GroupMax
 		recs[i].Bin = readFixed(b[off : off+tabsV2BinMax])
 		off += tabsV2BinMax
 	}
