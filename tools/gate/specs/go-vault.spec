@@ -1,8 +1,19 @@
-# go-vault.spec -- M148a (issue #2804): GOVAULT.ELF class-B gate. A
-# PBKDF2+AES-256-GCM vault file under the Go seat: create the vault through
-# the masked pair, add an entry, reveal it, copy the secret onto the seat's
-# primary selection, watch the 30 s lease expire, lock, unlock, quit. Two
-# tamper legs and a wrong-pass leg pin the named refusals.
+# go-vault.spec -- M148a (issue #2804) + M148b (issue #2805): GOVAULT.ELF
+# class-B gate, run K=3. A PBKDF2+AES-256-GCM vault file under the Go seat:
+# create through the masked pair, add an entry, reveal it, copy the secret
+# onto the seat's primary selection, watch the 30 s lease expire, lock,
+# unlock, quit. Two tamper legs and a wrong-pass leg pin the named refusals.
+# The M148b acceptance leg (run 06) stores, locks, unlocks, reveals, copies,
+# expires, then opens the Receipts face and pins its rows in order — on the
+# serial listing AND on the vault's own receipts file in the share.
+#
+# REPEAT SEMANTICS: vgate_repeat 3 re-runs EVERY leg, and the armed share
+# persists across iterations — so each leg must be iteration-safe. Run 01
+# deletes VAULT.BIN so the create face returns; run 02 re-clones it to
+# VAULT.REF so the tamper legs (04/05) can restore a valid vault before
+# mangling it; run 06 deletes VAULT.BIN and recreates it self-contained.
+# RECEIPTS.TXT is never reset — the accumulating audit file IS the K=3
+# evidence (the receipts view's n= grows 11, 22, 33).
 #
 # The clipboard story, for whoever audits the asserts: the KERNEL clipboard
 # (slots 38/39) is seat/CAP_CLIPBOARD only, so the app's copy surface is the
@@ -21,14 +32,18 @@
 #   bash tools/go/build-govault.sh  ->  .build/go/GOVAULT.ELF
 #   bash tools/go/build-gotabwm.sh  ->  .build/go/GOTABWM.ELF
 
-vgate_name go-vault "M148a #2804: PBKDF2/AES-GCM vault — masked unlock, entry store, per-entry reveal, copy-with-expiry on the seat selection, idle lock, named refusals"
+vgate_name go-vault "M148a #2804 + M148b #2805: PBKDF2/AES-GCM vault — masked unlock, entry store, per-entry reveal, copy-with-expiry on the seat selection, idle lock, named refusals, receipts file + Receipts view; K=3"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
+vgate_repeat 3
 
+# Every iteration must find no vault on the share, so the app boots into the
+# create face again — 'govault: new vault' is the chords gate.
 vgate_file script-01.txt <<'EOF'
 set GOMAXPROCS=1
 vf rm GOTABWM.DEMO
 vf rm SESSION.TABS
+vf rm GOVAULT/VAULT.BIN
 wm
 exec GOTABWM.ELF
 EOF
@@ -39,11 +54,16 @@ exec GOVAULT.ELF
 EOF
 
 # Create the vault (two masked fields), add wifi/s3cr3t/home, reveal, copy,
-# ctrl-l lock, unlock, esc lock, esc quit.
+# ctrl-l lock, unlock, esc lock, esc quit. The pristine clone is seeded here
+# (run 02's script is the earliest leg where VAULT.BIN exists on the share)
+# so the tamper legs can restore it — `vf clone` refuses a live target, so
+# REF is removed and re-taken every iteration.
 vgate_file script-02.txt <<'EOF'
 set GOMAXPROCS=1
 vf rm GOTABWM.DEMO
 vf rm SESSION.TABS
+vf rm GOVAULT/VAULT.REF
+vf clone GOVAULT/VAULT.BIN GOVAULT/VAULT.REF
 wm
 exec GOTABWM.ELF
 EOF
@@ -71,8 +91,12 @@ dui focus 0
 exec GOVAULT.ELF
 EOF
 
-# Tamper legs need no seat: the refusals live in the load/unlock path.
+# Tamper legs need no seat: the refusals live in the load/unlock path. Each
+# first restores a VALID vault — iteration n's VAULT.BIN was left mangled by
+# iteration n-1's run 05 — then mangles it the leg's own way.
 vgate_file script-04.txt <<'EOF'
+vf rm GOVAULT/VAULT.BIN
+vf clone GOVAULT/VAULT.REF GOVAULT/VAULT.BIN
 vf open GOVAULT/VAULT.BIN
 vf truncate 0 61
 vf close 0
@@ -80,6 +104,8 @@ exec GOVAULT.ELF
 EOF
 
 vgate_file script-05.txt <<'EOF'
+vf rm GOVAULT/VAULT.BIN
+vf clone GOVAULT/VAULT.REF GOVAULT/VAULT.BIN
 vf open GOVAULT/VAULT.BIN
 vf write 0 4
 vf close 0
@@ -278,3 +304,121 @@ vgate_assert 05 serial-absent 'govault: unlocked'
 vgate_assert 05 serial-contains 'govault OK'
 vgate_assert 05 serial-absent '[EXC] parking:'
 vgate_assert 05 serial-absent 'exited status=139'
+
+# --- run 06: acceptance — the receipts face lists the journey in order ------
+# Self-contained (M148b): the vault is deleted and recreated inside this leg,
+# so it runs identically on every iteration. The journey is store, lock,
+# unlock, reveal, copy, expire — then the Receipts face. The 'v' chord rides
+# --input-string (printable-only) gated on 'govault: clip expired', so the
+# receipts listing lands after the lease fire exactly as the card orders it;
+# the run ends on 'govault: receipts end', which the app prints only after
+# every row marker, so the assert sees the whole listing.
+vgate_file script-06.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm GOVAULT/VAULT.BIN
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-06.txt <<'EOF'
+dui focus 0
+exec GOVAULT.ELF
+EOF
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/vault-screen-06' \
+    --via-virtio \
+    --script '$RUN_DIR/script-06.txt' \
+    --script2 '$RUN_DIR/script2-06.txt' \
+    --script2-after 'gotabwm: registered' \
+    --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return,a,b,a,n,k,tab,h,u,n,t,e,r,3,tab,s,a,v,i,n,g,s,return,ctrl-l,h,u,n,t,e,r,2,return,r,c' \
+    --input-chords-after 'govault: new vault' \
+    --input-string 'v' \
+    --input-string-after 'govault: clip expired' \
+    --script-expect 'govault: receipts end' --timeout 240
+
+vgate_assert 06 serial-contains 'gotabwm: registered'
+vgate_assert 06 serial-contains 'exec: loaded GOVAULT.ELF'
+vgate_assert 06 serial-contains 'govault: new vault'
+vgate_assert 06 serial-contains 'govault: iterations '
+vgate_assert 06 serial-contains 'govault: saved'
+vgate_assert 06 serial-contains 'govault: unlocked n=0'
+vgate_assert 06 serial-contains 'govault: added'
+vgate_assert 06 serial-contains 'govault: locked'
+vgate_assert 06 serial-contains 'govault: unlocked n=1'
+vgate_assert 06 serial-contains 'govault: revealed'
+vgate_assert 06 serial-contains 'govault: copied'
+vgate_assert 06 serial-contains 'govault: clip expired'
+vgate_assert 06 serial-contains 'govault: receipts end'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'exited status=139'
+# The Receipts face on serial: a contiguous i=0..n-1 listing matching the
+# count line, ending on the journey's own rows — unlock, reveal, copy — in
+# append order.
+vgate_assert 06 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], "rb").read().decode("utf-8", "replace")
+rows = re.findall(r"govault: rcpt i=(\d+) (\S+)", ser)
+m = re.search(r"govault: receipts n=(\d+)", ser)
+if not m or not rows:
+    raise SystemExit("no receipts listing on serial")
+n = int(m.group(1))
+if len(rows) != n or [int(i) for i, _ in rows] != list(range(n)):
+    raise SystemExit("receipt listing incomplete/disordered: %d rows "
+                     "vs n=%d: %s" % (len(rows), n, rows))
+tail = [a for _, a in rows[-3:]]
+if tail != ["unlock", "reveal", "copy"]:
+    raise SystemExit("receipt tail %s — want the journey's "
+                     "unlock,reveal,copy in order" % tail)
+print("Receipts face listed n=%d rows, contiguous, tail=unlock,reveal,copy" % n)
+PY
+# The vault's own receipts file on the share (share-contains also lifts the
+# file into the evidence artifacts): the stored entry's name lands on its
+# reveal and copy rows.
+vgate_assert 06 share-contains GOVAULT/RECEIPTS.TXT 'reveal bank'
+vgate_assert 06 share-contains GOVAULT/RECEIPTS.TXT 'copy bank'
+# Every row is "<epoch> <action> <name>", the tail is the leg's journey in
+# order, the names are the stored entry's — and no secret material ever
+# lands in it.
+vgate_assert 06 python <<'PY'
+import os, re
+share = os.environ["VG_SHARE"]
+data = open(os.path.join(share, "GOVAULT", "RECEIPTS.TXT"), "rb").read().decode("utf-8", "replace")
+rows = []
+for ln in data.split("\n"):
+    if not ln:
+        continue
+    m = re.match(r"(\d+) (\S+) (.*)$", ln)
+    if not m:
+        raise SystemExit("corrupt receipt row: %r" % ln)
+    rows.append((int(m.group(1)), m.group(2), m.group(3)))
+acts = [a for _, a, _ in rows]
+if acts[-3:] != ["unlock", "reveal", "copy"]:
+    raise SystemExit("RECEIPTS.TXT tail = %s, want unlock,reveal,copy" % acts[-3:])
+for action in ("unlock", "reveal", "copy", "unlock-failed"):
+    if action not in acts:
+        raise SystemExit("no %s receipt in the file" % action)
+if rows[-2][2] != "bank" or rows[-1][2] != "bank":
+    raise SystemExit("tail names = %r/%r, want the stored entry 'bank'"
+                     % (rows[-2][2], rows[-1][2]))
+for secret in ("hunter2", "hunter3", "s3cr3t"):
+    if secret in data:
+        raise SystemExit("SECRET material in the receipts file: %r" % secret)
+print("RECEIPTS.TXT: %d rows, ordered tail unlock,reveal,copy(bank), no secrets" % len(rows))
+PY
+# The copy landed on the seat's selection (7-byte "hunter3" publish), and the
+# expiry overwrite wrote the 9-byte [cleared] sentinel after the compare pull.
+vgate_assert 06 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], "rb").read().decode("utf-8", "replace")
+lens = [int(m.group(1))
+        for m in re.finditer(r"gotabwm: sel pub id=\d+ len=(\d+)", ser)]
+if len(lens) < 2 or lens[0] != 7 or 9 not in lens[1:]:
+    raise SystemExit("selection publishes len=%s, want 7 then 9 "
+                     "(the [cleared] overwrite)" % lens)
+if "gotabwm: sel pull id=" not in ser:
+    raise SystemExit("the expiry's compare pull is missing its seat receipt")
+print("selection: copy len=7, expiry overwrite len=9, compare pull seen")
+PY

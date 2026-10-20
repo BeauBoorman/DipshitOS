@@ -131,6 +131,9 @@ const (
 	scrList
 	// scrAdd is the add-entry face: name, masked secret, note.
 	scrAdd
+	// scrReceipts is the receipts face: the vault's own receipts file
+	// listed back, read-only (M148b).
+	scrReceipts
 )
 
 // model is the unlockable state — the part of the app a host test needs to
@@ -149,6 +152,11 @@ type model struct {
 	sel     int
 	shown   map[int]bool // per-entry reveal
 
+	// rcpts is the loaded receipts view (M148b): metadata rows, never
+	// secret material. It is cleared on lock anyway — the view reloads
+	// from the file on entry, so a locked vault holds no stale copy.
+	rcpts []receipt
+
 	dl    deadlines
 	ctag  clipTag
 	armed uint64 // ticks the physical timer was last armed for — test seam
@@ -164,8 +172,9 @@ func (m *model) lock() {
 	m.key = nil
 	m.shown = nil
 	m.sel = 0
+	m.rcpts = nil
 	m.dl.stopIdle()
-	if m.scr == scrList || m.scr == scrAdd {
+	if m.scr == scrList || m.scr == scrAdd || m.scr == scrReceipts {
 		m.scr = scrLocked
 	}
 }

@@ -1,8 +1,10 @@
-// Command govault is GOVAULT.ELF — M148a (issue #2804): the secrets store gets
-// a face. One unlock-gated vault file (GVLT framing, PBKDF2-HMAC-SHA256 ->
-// AES-256-GCM, written through vi.WriteFileSafe so a crash keeps the old
-// file), a masked passphrase field, a per-entry reveal, a copy that expires,
-// and an idle lock. The codec lives in vault.go, the pure session model in
+// Command govault is GOVAULT.ELF — M148a (issue #2804), receipts M148b
+// (#2805): the secrets store gets a face. One unlock-gated vault file (GVLT
+// framing, PBKDF2-HMAC-SHA256 -> AES-256-GCM, written through
+// vi.WriteFileSafe so a crash keeps the old file), a masked passphrase
+// field, a per-entry reveal, a copy that expires, an idle lock, and a
+// plaintext receipts file with its own read-only face. The codec lives in
+// vault.go, the receipt row codec in receipts.go, the pure session model in
 // model.go; this file owns the seat, the drawing, the timers and the serial
 // markers.
 //
@@ -31,6 +33,7 @@ import (
 	"unicode/utf8"
 
 	"virelai/appkit"
+	"virelai/clockfmt"
 	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/theme"
@@ -53,6 +56,16 @@ const (
 	// (ADR 0024 D8): the body is sealed, so WriteFileSafe's path~ temp
 	// window exposes ciphertext, never plaintext.
 	vaultPath = "/host/GOVAULT/VAULT.BIN"
+
+	// receiptPath is the vault's own receipts file (M148b): plaintext rows
+	// of time, action and entry name — never secret material, and never
+	// inside the seal (a failed unlock holds no key to write with).
+	receiptPath = "/host/GOVAULT/RECEIPTS.TXT"
+
+	// maxReceipts bounds the view's read. Rows are ~30–60 bytes, so the cap
+	// is a thousand-odd receipts — a file past it shows its oldest rows,
+	// which is the honest end of a log that outgrew its window.
+	maxReceipts = 64 << 10
 
 	// clearBytes is the expiry overwrite. kind-27 refuses an empty publish,
 	// so "cleared" is a bounded, non-secret sentinel the user can see.
@@ -86,6 +99,10 @@ const (
 	markerKept      = "govault: clip kept"
 	markerClipRef   = "govault: clip expire refused"
 	markerIdle      = "govault: locked idle"
+	markerRcpts     = "govault: receipts n="
+	markerRcpt      = "govault: rcpt i="
+	markerRcptsEnd  = "govault: receipts end"
+	markerRcptRef   = "govault: receipt refused rc="
 	markerClose     = "govault: close"
 	markerOK        = "govault OK"
 	markerExiting   = "govault: exiting "
@@ -106,9 +123,13 @@ var (
 	selPull    = vi.RequestSelPaste
 	readAll    = vi.ReadFileAll
 	writeSafe  = vi.WriteFileSafe
-	fileOpen   = vi.FileOpen
-	fileClose  = func(h int64) { vi.FileClose(uint32(h)) }
-	notifyFn   = func(ta *tabapp.TabApp, text string) bool { return ta.Notify(text) }
+	timeFn     = vi.Time
+	rcptAppend = func(path string, b []byte) int64 {
+		return vi.WriteFilePublish(path, b, true)
+	}
+	fileOpen  = vi.FileOpen
+	fileClose = func(h int64) { vi.FileClose(uint32(h)) }
+	notifyFn  = func(ta *tabapp.TabApp, text string) bool { return ta.Notify(text) }
 )
 
 // field is one input row. buf holds UTF-8; masked fields paint one '*' per
@@ -303,7 +324,7 @@ func (a *app) handle(ev vi.Event) bool {
 	if ev.Kind == vi.EvTimer {
 		return a.onTimer()
 	}
-	if a.m.scr == scrList || a.m.scr == scrAdd {
+	if a.m.scr == scrList || a.m.scr == scrAdd || a.m.scr == scrReceipts {
 		a.m.dl.activity(nowFn())
 		defer a.rearm()
 	}
@@ -324,6 +345,8 @@ func (a *app) handle(ev vi.Event) bool {
 		return a.keyList(ev)
 	case scrAdd:
 		return a.keyAdd(ev)
+	case scrReceipts:
+		return a.keyReceipts(ev)
 	}
 	return false
 }
@@ -526,11 +549,13 @@ func (a *app) unlock() {
 		return
 	}
 	if err != nil {
+		a.receipt(actUnlockFail, nil)
 		vi.ConsoleLine(markerUnlockBad)
 		a.status = "unlock failed"
 		return
 	}
 	a.m.unlocked(entries, key, salt, iters, nowFn())
+	a.receipt(actUnlock, nil)
 	a.rearm()
 	a.status = ""
 	vi.ConsoleLine(markerUnlocked + vi.Itoa64(int64(len(entries))))
@@ -639,6 +664,7 @@ func (a *app) keyList(ev vi.Event) bool {
 	case 'r', codeReturn, codeNewline:
 		if a.m.toggleReveal() {
 			if a.m.revealed(a.m.sel) {
+				a.receipt(actReveal, a.m.entries[a.m.sel].name)
 				vi.ConsoleLine(markerRevealed)
 			} else {
 				vi.ConsoleLine(markerHidden)
@@ -647,6 +673,9 @@ func (a *app) keyList(ev vi.Event) bool {
 		}
 	case 'c':
 		a.copy()
+		return true
+	case 'v':
+		a.openReceipts()
 		return true
 	case 'a':
 		a.m.scr = scrAdd
@@ -673,6 +702,7 @@ func (a *app) copy() {
 	a.m.ctag = setClipTag(secret)
 	a.m.dl.armClip(nowFn())
 	a.rearm()
+	a.receipt(actCopy, a.m.entries[a.m.sel].name)
 	vi.ConsoleLine(markerCopied)
 	a.status = "copied — clears in 30 s"
 	notifyFn(a.ta, "copied; clears 30s")
@@ -741,6 +771,62 @@ func (a *app) commitAdd() {
 	a.save()
 	a.m.scr = scrList
 	a.status = ""
+}
+
+// receipt appends one row to the vault's own receipts file: time, action,
+// entry name — never secret material (M148b). The write is a real append,
+// not a rewrite — the file is a log, and WriteFilePublish's append arm never
+// truncates it. The /host/GOVAULT directory already exists at every receipt
+// site (a vault file lives there, or create() just made it), so no mkdir
+// pass runs here — a refused append names itself by kernel code, and the
+// action it records still stands: the audit trail is a witness, not a gate.
+func (a *app) receipt(action string, name []byte) {
+	line := receiptLine(timeFn(), action, string(name))
+	if rc := rcptAppend(receiptPath, line); rc < 0 {
+		vi.ConsoleLine(markerRcptRef + vi.Itoa64(rc))
+		a.status = "receipt refused"
+	}
+}
+
+// openReceipts loads the receipts file and moves to the Receipts face. An
+// absent file is an empty view, not an error — a vault that was never
+// unlocked has honestly earned no receipts. The serial listing mirrors what
+// the face draws (index + action per row, never a name); `receipts end`
+// prints LAST so a gate that ends the run on it still sees every row.
+func (a *app) openReceipts() {
+	data, rc := readAll(receiptPath, maxReceipts)
+	if rc < 0 && rc != -int64(vi.ErrENOENT) {
+		vi.ConsoleLine(markerRcptRef + vi.Itoa64(rc))
+		a.status = "receipts refused"
+		return
+	}
+	rows := parseReceipts(data)
+	a.m.rcpts = rows
+	a.m.scr = scrReceipts
+	a.status = ""
+	vi.ConsoleLine(markerRcpts + vi.Itoa64(int64(len(rows))))
+	for i := range rows {
+		vi.ConsoleLine(markerRcpt + vi.Itoa64(int64(i)) + " " + rows[i].action)
+	}
+	vi.ConsoleLine(markerRcptsEnd)
+}
+
+func (a *app) keyReceipts(ev vi.Event) bool {
+	if ev.Flags&modCtrl != 0 && (ev.Arg1 == keyCtrlL || ev.Arg1 == keyL) {
+		a.lockSession(false)
+		a.rearm()
+		return true
+	}
+	switch ev.Arg0 {
+	case hidEsc:
+		a.m.scr = scrList
+		return true
+	}
+	if ev.Arg1 == 'v' {
+		a.m.scr = scrList
+		return true
+	}
+	return false
 }
 
 // printable maps a key event to its text rune — the same arg1 contract the
@@ -813,7 +899,7 @@ func (a *app) draw() {
 	a.fill(cv, 0, chromeH, w, h-chromeH, tok.Bg)
 
 	state := "LOCKED"
-	if a.m.scr == scrList || a.m.scr == scrAdd {
+	if a.m.scr == scrList || a.m.scr == scrAdd || a.m.scr == scrReceipts {
 		state = "OPEN"
 	}
 	a.text(cv, pad, 8, appTitle+"   "+state, tok.Ink)
@@ -830,6 +916,8 @@ func (a *app) draw() {
 		a.drawList(cv, w, h)
 	case scrAdd:
 		a.drawAdd(cv, w, h)
+	case scrReceipts:
+		a.drawReceipts(cv, w, h)
 	}
 
 	if a.status != "" {
@@ -917,7 +1005,43 @@ func (a *app) drawList(cv widgets.Canvas, w, h int) {
 		a.text(cv, pad+304, y+3, note, tok.InkMuted)
 		y += rowH
 	}
-	a.text(cv, pad, h-32, "a add · r reveal · c copy · ctrl-l lock · esc lock", tok.Muted)
+	a.text(cv, pad, h-32, "a add · r reveal · c copy · v receipts · ctrl-l lock · esc lock", tok.Muted)
+}
+
+// drawReceipts lists the loaded receipts — the newest rows at the bottom,
+// tail-windowed to fit the face (a log's freshest rows are the ones a
+// reviewer is reaching for). A corrupt row is shown verbatim: hiding it
+// would pretend the file never carried it.
+func (a *app) drawReceipts(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "Receipts", tok.Text)
+	rows := a.m.rcpts
+	if len(rows) == 0 {
+		a.text(cv, pad, chromeH+36, "no receipts yet", tok.Muted)
+	}
+	fit := (h - 40 - (chromeH + 8)) / rowH
+	start := 0
+	if fit > 0 && len(rows) > fit {
+		start = len(rows) - fit
+	}
+	y := chromeH + 8
+	for i := start; i < len(rows); i++ {
+		r := &rows[i]
+		if !r.ok {
+			a.text(cv, pad, y+3, r.raw, tok.Muted)
+			y += rowH
+			continue
+		}
+		a.text(cv, pad, y+3, clockfmt.Format(r.epoch, clockfmt.UTC), tok.Muted)
+		a.text(cv, pad+204, y+3, r.action, tok.Text)
+		name := r.name
+		if len(name) > 24 {
+			name = name[:24]
+		}
+		a.text(cv, pad+292, y+3, name, tok.InkMuted)
+		y += rowH
+	}
+	a.text(cv, pad, h-32, "v back · ctrl-l lock · esc back", tok.Muted)
 }
 
 func (a *app) drawAdd(cv widgets.Canvas, w, h int) {
