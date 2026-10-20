@@ -204,16 +204,29 @@ PY
 # SGR mouse reports (?1000/?1006 armed at session start) on the read path.
 # The link text is painted by a SOURCED script (grid-only output, no klog)
 # so its row is deterministic after `clear`: `webdoc` paints grid row 0
-# cols 0-5, `ftplink` row 1 cols 0-6 — the GOTERM rect is the declared
-# 64,48,640,400 (the leg-01 shape), client origin 64,64 at 8x16 cells, so
-# (92,88) hits ftplink's cell (x=4,y=2) and (84,72) hits webdoc's (x=3,y=1).
+# cols 0-5, `ftplink` row 1 cols 0-6. Leg 02 seats NO WM: under zig TABWM
+# every content-area pointer sample dies in handle_pointer's sidebar gate
+# (it never calls wmctl_content_ptr), so terminal mouse reports are
+# impossible there — the kernel shim's pointer_tick -> content_pointer_pass
+# is the path that reports. Declare is then refused honestly and the plain
+# user window paints at GOTERM's declared 64,48,640,400 (the same shape
+# live-term-depth run 01 proves): client top_y = 64, 8x16 cells, so
+# (92,88) hits ftplink's cell (x=4,y=2) and (84,72) hits webdoc's
+# (x=3,y=1).
 # Click order matters: the ftp refusal spawns nothing, so it clicks first;
-# the https click spawns WEB.ELF at 40,28,512,384 — overlapping GOTERM's
-# region — so it must be the LAST pointer step (the sequence is one burst).
+# the https click spawns WEB.ELF over GOTERM's region, so it must be the
+# LAST pointer step (the sequence is one burst). Each click REPEATS: the
+# cv-input drain (poll_input) consumes the whole used ring in one pass, so
+# a down+up pair decoded between two pointer_ticks collapses the release
+# edge — observed as a lone press with no report pair. A collapsed attempt
+# leaves the press latched at the same cell, so the next repetition's
+# release pairs and resolves (self-healing); WEB isn't a bound terminal,
+# so its over-window never shields GOTERM's cells from later attempts.
 # `term-profile dusk` merges the seeded profile into SETTINGS.TXT through
 # the crash-safe publish (share-checked) before the click burst.
 
-vgate_file linkexec.txt <<'EOF'
+vgate_file linkboot.txt <<'EOF'
+set GOMAXPROCS=1
 exec GOTERM.ELF
 EOF
 
@@ -250,19 +263,17 @@ with open(os.path.join(share, "GOTERM-PROFILES.TXT"), "w") as fh:
 print("seeded LINK.SH + GOTERM-PROFILES.TXT")
 PY
 
-vgate_run 02 -- \
+vgate_run 02 -- --display --input \
     --screen '$RUN_DIR/screen-link' \
     --via-virtio \
-    --script '$RUN_DIR/script.txt' \
-    --script2 '$RUN_DIR/linkexec.txt' \
-    --script2-after 'tabwm: sidebar-rendered' \
+    --script '$RUN_DIR/linkboot.txt' \
     --input-string $'source LINK.SH\nterm-profile dusk\necho LINKED\n' \
     --input-string-after 'goterm: prompt' \
-    --pointer-virtio '92,88,c;84,72,c' \
+    --pointer-virtio '92,88,c;92,88,c;92,88,c;84,72,c;84,72,c;84,72,c' \
     --pointer-virtio-after 'goterm: line echo LINKED' \
     --script3 '$RUN_DIR/linkclose.txt' \
     --script3-after 'web: ready' \
-    --script-expect 'rx-goterm-link-ok' --timeout 240
+    --script-expect 'rx-goterm-link-ok' --timeout 300
 
 vgate_assert 02 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 02 serial-contains 'exec: loaded GOTERM.ELF'
@@ -279,11 +290,13 @@ vgate_assert 02 serial-contains 'goterm: line echo LINKED'
 # The ftp scheme is refused BY NAME — the marker carries it, and no app
 # spawned for it (the serial would carry a second WEB load otherwise).
 vgate_assert 02 serial-contains 'goterm: link refused scheme=ftp target=ftp://example.com/'
-# The https click opened the link through mime.Open -> WEB.ELF, and WEB
-# itself took the argv target far enough to try (and name) DNS — the same
+# The https click opened the link through mime.Open -> WEB.ELF. mime.Open
+# spawns the handler itself (no monitor `exec`, so no `exec: loaded` klog) —
+# the serial proof is WEB's window open owned by GOTERM's pid, then WEB
+# taking the argv target far enough to try (and name) DNS — the same
 # observed refusal go-sh's `open` leg asserts.
 vgate_assert 02 serial-contains 'goterm: link open scheme=https target=https://example.com/ handler=WEB.ELF pid='
-vgate_assert 02 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 02 serial-contains 'open: id=3 owner=2 rect=40,28 512x384'
 vgate_assert 02 serial-contains 'web: url https://example.com/'
 vgate_assert 02 serial-contains 'web: error dns'
 vgate_assert 02 serial-contains 'web: ready'

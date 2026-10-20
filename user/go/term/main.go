@@ -364,6 +364,10 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 						if cx, cy, ok := ts.mi.clickCell(r); ok {
 							if uri, found := ts.lt.linkAt(cx, cy, rowsVisible(ta.H)); found {
 								openLink(ts, ta, fd, editor, hst, uri)
+							} else {
+								vi.ConsoleLine("goterm: link miss cell=" +
+									vi.Itoa64(int64(cx)) + "," +
+									vi.Itoa64(int64(cy)))
 							}
 						}
 					}
