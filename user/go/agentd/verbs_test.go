@@ -45,6 +45,8 @@ func seamScope(t *testing.T) {
 		func() { winHideFn = winHideSave },
 		func() { wmWindowsFn = wmSave },
 		func() { scanoutFn = scanoutSave },
+		func() { agentInputKeyFn = agentKeySave },
+		func() { agentInputPtrFn = agentPtrSave },
 		func() { agentWindow = -1 },
 		func() { secretGetFn = secretSave },
 		func() { principalFn = principalSave },
@@ -79,6 +81,8 @@ var (
 	winHideSave   = winHideFn
 	wmSave        = wmWindowsFn
 	scanoutSave   = scanoutFn
+	agentKeySave  = agentInputKeyFn
+	agentPtrSave  = agentInputPtrFn
 	secretSave    = secretGetFn
 	principalSave = principalFn
 	randomSave    = randomFn
@@ -264,7 +268,7 @@ func testSess(allowExec bool, chunks *[][]byte, caps ...string) *sessionCtx {
 	return s
 }
 
-var allCaps = []string{"file", "process", "window", "term"}
+var allCaps = []string{"file", "process", "window", "term", "input"}
 
 // --- NAME validator -------------------------------------------------------------
 
@@ -701,6 +705,248 @@ func hasLine(logs []string, prefix string) bool {
 	return false
 }
 
+// --- ui.input ------------------------------------------------------------------
+
+// inputSpy captures the events the verb pushes through the kind-29
+// client seams and scripts each ack.
+type inputSpy struct {
+	keys []struct {
+		win         uint32
+		mods, usage uint8
+	}
+	ptrs []struct {
+		win     uint32
+		buttons uint8
+		x, y    uint16
+	}
+	refuse string // ack title on applied=0
+	bare   bool   // applied=0 with NO refusal name (legacy seat)
+	silent bool   // never answer
+}
+
+func (s *inputSpy) install() {
+	agentInputKeyFn = func(win uint32, mods, usage uint8, self string) (vi.WmRpc, bool) {
+		s.keys = append(s.keys, struct {
+			win         uint32
+			mods, usage uint8
+		}{win, mods, usage})
+		if s.silent {
+			return vi.WmRpc{}, false
+		}
+		var rep vi.WmRpc
+		if s.refuse != "" {
+			copy(rep.Title[:], s.refuse)
+		} else if !s.bare {
+			rep.Applied = 1
+		}
+		return rep, true
+	}
+	agentInputPtrFn = func(win uint32, buttons uint8, x, y uint16, self string) (vi.WmRpc, bool) {
+		s.ptrs = append(s.ptrs, struct {
+			win     uint32
+			buttons uint8
+			x, y    uint16
+		}{win, buttons, x, y})
+		if s.silent {
+			return vi.WmRpc{}, false
+		}
+		var rep vi.WmRpc
+		if s.refuse != "" {
+			copy(rep.Title[:], s.refuse)
+		} else if !s.bare {
+			rep.Applied = 1
+		}
+		return rep, true
+	}
+}
+
+func TestUIInput(t *testing.T) {
+	seamScope(t)
+	spy := &inputSpy{}
+	k := &fakeKernel{
+		seatPid: 3,
+		wmRows: []vi.WmWindowRow{
+			{Index: 0, ID: 100, Title: "Edit", Focused: true},
+			{Index: 1, ID: 101, Title: "Notes"},
+		},
+	}
+	k.install()
+	spy.install()
+
+	// The green path: a key press and a pointer sample ride their own
+	// frames against the daemon's bound window.
+	res, code := verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[`+
+			`{"type":"key","usage":11,"mods":1},`+
+			`{"type":"ptr","x":300,"y":200,"buttons":1}]}`))
+	if code != "" || res != `{"sent":2}` {
+		t.Fatalf("ui.input = %q code %q", res, code)
+	}
+	if len(spy.keys) != 1 || spy.keys[0].win != 7 ||
+		spy.keys[0].usage != 11 || spy.keys[0].mods != 1 {
+		t.Fatalf("key event = %+v", spy.keys)
+	}
+	if len(spy.ptrs) != 1 || spy.ptrs[0].win != 7 ||
+		spy.ptrs[0].buttons != 1 || spy.ptrs[0].x != 300 || spy.ptrs[0].y != 200 {
+		t.Fatalf("ptr event = %+v", spy.ptrs)
+	}
+
+	// win names the FOCUSED strip index — anything else is the seat's
+	// own refusal name, by name.
+	for _, line := range []string{
+		`{"id":1,"verb":"ui.input","win":1,"events":[{"type":"key","usage":4}]}`,
+		`{"id":1,"verb":"ui.input","win":9,"events":[{"type":"key","usage":4}]}`,
+	} {
+		if _, code = verbUIInput(mustReq(t, line)); code != vi.AgentInputNoFocus {
+			t.Fatalf("%s: code = %q want %q", line, code, vi.AgentInputNoFocus)
+		}
+	}
+	if len(spy.keys) != 1 {
+		t.Fatal("a non-focused win still pushed events")
+	}
+	k.wmRows = []vi.WmWindowRow{{Index: 0, ID: 100, Title: "Edit"}}
+	if _, code = verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != vi.AgentInputNoFocus {
+		t.Fatalf("empty focus code = %q", code)
+	}
+	k.wmRows = []vi.WmWindowRow{
+		{Index: 0, ID: 100, Title: "Edit", Focused: true},
+		{Index: 1, ID: 101, Title: "Notes"},
+	}
+
+	// Refuse before touching: the bound and every malformed shape fail
+	// BEFORE the first frame — the spy count never moves.
+	spy.keys, spy.ptrs = nil, nil
+	var over strings.Builder
+	over.WriteString(`{"id":1,"verb":"ui.input","win":0,"events":[`)
+	for i := 0; i <= inputEventsMax; i++ {
+		if i > 0 {
+			over.WriteByte(',')
+		}
+		over.WriteString(`{"type":"key","usage":4}`)
+	}
+	over.WriteString(`]}`)
+	for _, tc := range []struct{ line, want string }{
+		{over.String(), "too_large"},
+		{`{"id":1,"verb":"ui.input","win":0}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":"x"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[4]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key"}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":256}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4,"x":1}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4,"bogus":1}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"ptr","x":1}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"ptr","x":1,"y":2,"usage":4}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"ptr","x":65536,"y":0}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"wheel"}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4},{"bogus":1}]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":"0","events":[]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","events":[]}`, "bad_request"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[],"extra":1}`, "bad_request"},
+	} {
+		if _, code = dispatch(mustReq(t, tc.line), testSess(true, nil, allCaps...)); code != tc.want {
+			t.Fatalf("%s: code = %q want %q", tc.line, code, tc.want)
+		}
+		if len(spy.keys)+len(spy.ptrs) != 0 {
+			t.Fatalf("%s pushed events before refusing", tc.line)
+		}
+	}
+
+	// 64 events exactly is inside the bound — all sent, all applied.
+	spy.keys, spy.ptrs = nil, nil
+	var exact strings.Builder
+	exact.WriteString(`{"id":1,"verb":"ui.input","win":0,"events":[`)
+	for i := 0; i < inputEventsMax; i++ {
+		if i > 0 {
+			exact.WriteByte(',')
+		}
+		exact.WriteString(`{"type":"key","usage":4}`)
+	}
+	exact.WriteString(`]}`)
+	res, code = verbUIInput(mustReq(t, exact.String()))
+	if code != "" || res != `{"sent":64}` || len(spy.keys) != 64 {
+		t.Fatalf("64-event batch = %q code %q sent %d", res, code, len(spy.keys))
+	}
+
+	// The seat's refusal names surface verbatim; a bare applied=0 with
+	// no name is a legacy seat = seat_unsupported.
+	for _, tc := range []struct{ refuse, want string }{
+		{vi.AgentInputDenied, vi.AgentInputDenied},
+		{vi.AgentInputNoFocus, vi.AgentInputNoFocus},
+		{"unknown_name", "seat_unsupported"},
+	} {
+		spy.refuse = tc.refuse
+		if _, code = verbUIInput(mustReq(t,
+			`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != tc.want {
+			t.Fatalf("refuse %q: code = %q want %q", tc.refuse, code, tc.want)
+		}
+	}
+	spy.refuse = ""
+	spy.bare = true // a bare applied=0 ack: the legacy seat's only answer
+	if _, code = verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != "seat_unsupported" {
+		t.Fatalf("bare refusal code = %q", code)
+	}
+	spy.bare = false
+
+	// A silent seat is seat_timeout; no seat is seat_absent.
+	spy.silent = true
+	if _, code = verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != "seat_timeout" {
+		t.Fatalf("silent code = %q", code)
+	}
+	spy.silent = false
+	k.seatPid = 0
+	spy.keys = nil
+	if _, code = verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != "seat_absent" {
+		t.Fatalf("no-seat code = %q", code)
+	}
+	if len(spy.keys) != 0 {
+		t.Fatal("seat_absent pushed events")
+	}
+	k.seatPid = 3
+	k.wmErr = vi.ErrSeatUnsupported
+	if _, code = verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != "seat_unsupported" {
+		t.Fatalf("zig-seat code = %q", code)
+	}
+	k.wmErr = vi.ErrSeatSilent
+	if _, code = verbUIInput(mustReq(t,
+		`{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`)); code != "seat_timeout" {
+		t.Fatalf("silent-strip code = %q", code)
+	}
+	k.wmErr = nil
+}
+
+// The missing-scope refusal: cap_required:input, before the request
+// touches a seam, and it is the INPUT cap — window alone is not enough.
+func TestUIInputScope(t *testing.T) {
+	seamScope(t)
+	spy := &inputSpy{}
+	k := &fakeKernel{seatPid: 3,
+		wmRows: []vi.WmWindowRow{{Index: 0, ID: 100, Focused: true}}}
+	k.install()
+	spy.install()
+	line := `{"id":1,"verb":"ui.input","win":0,"events":[{"type":"key","usage":4}]}`
+	for _, caps := range [][]string{{}, {"window"}, {"file", "process", "term"}} {
+		_, code := dispatch(mustReq(t, line), testSess(true, nil, caps...))
+		if code != "cap_required:input" {
+			t.Fatalf("caps %v: code = %q want cap_required:input", caps, code)
+		}
+	}
+	if len(spy.keys)+len(spy.ptrs) != 0 {
+		t.Fatal("cap_required pushed events")
+	}
+	// The event bytes never land in the receipt — win and the count do.
+	req := mustReq(t, line)
+	args := auditArgs(req, `{"sent":1}`, "")
+	if !strings.Contains(args, `"win":0`) || !strings.Contains(args, `"events":1`) {
+		t.Fatalf("audit args = %q", args)
+	}
+}
+
 // --- dispatch coverage ------------------------------------------------------------
 
 // Every D4 code lands at least once through dispatch — AC2's table.
@@ -796,6 +1042,7 @@ func TestCapGate(t *testing.T) {
 		{`{"id":1,"verb":"fs.write","path":"F.TXT","data_b64":"eA=="}`, "file"},
 		{`{"id":1,"verb":"ui.windows"}`, "window"},
 		{`{"id":1,"verb":"ui.screenshot"}`, "window"},
+		{`{"id":1,"verb":"ui.input","win":0,"events":[]}`, "input"},
 		{`{"id":1,"verb":"gosh.run","cmd":"echo hi"}`, "term"},
 	} {
 		// Missing cap refuses by name — even with well-formed args.

@@ -29,7 +29,7 @@ const (
 var capVocabulary = map[string]bool{
 	"file": true, "window": true, "audio": true, "timer": true,
 	"memory": true, "process": true, "debug": true, "net": true,
-	"term": true,
+	"term": true, "input": true, // M139b: input drives the focused pane
 }
 
 // agentRow is one listed credential: the claimed id, the Ed25519 public

@@ -86,9 +86,14 @@ two small exported helpers in `shlib`, one gate spec, docs rows.
 
 ### Non-goals (explicit)
 
-- **No remote desktop or input injection.** No pointer or key events, no
+- ~~**No remote desktop or input injection.** No pointer or key events, no
   focus or raise, no pixels or screenshots. `ui.windows` is read-only. RFB
-  (ADR 0037) remains the pixel path.
+  (ADR 0037) remains the pixel path.~~ **Amended (card #2780, #2780):** an
+  authenticated session holding the `input` cap may inject key and
+  pointer events into the focused pane through `ui.input` (D3/D5b), and
+  `ui.screenshot` (added in M109b) reads the framebuffer. Still absent:
+  focus or raise verbs, multi-client, and any unauthenticated injection —
+  the seat accepts kind-29 frames only from a bound `AGENTD.ELF`.
 - **No in-OS native agent.** No model, planner or agent loop runs in the
   guest. That is a separate future spec.
 - **No Linux-compat layer.** No ELF personality, syscall translation or
@@ -246,6 +251,7 @@ the first byte is alphanumeric, and it is never `.` or `..`. It resolves to
 | `fs.read` | `path`: NAME | `{"path":S,"size":N,"data_b64":S}`. The whole file, ≤ 4096 bytes. |
 | `fs.write` | `path`: NAME, `data_b64`: base64 of ≤ 4096 bytes | `{"path":S,"size":N}`. Create or replace, atomic through `vi.WriteFileSafe`. |
 | `ui.windows` | none | `{"seat":"gotabwm"\|"none","focused":I\|null,"windows":[{"index":I,"id":N,"title":S,"focused":B,"pinned":B,"frozen":B}]}` |
+| `ui.input` | `win`: int ≥ 0; `events`: array of ≤ 64 flat objects | `{"sent":N}` (card #2780; requires the `input` cap, D5b) |
 | `gosh.run` | `cmd`: string; `timeout_ms`: int 1..30000, default 10000 | `{"exit_status":N,"stdout_b64":S,"truncated":B}` |
 
 Verb semantics that are binding:
@@ -265,6 +271,21 @@ Verb semantics that are binding:
   strip's focus. The first call against a registered seat opens the
   daemon's bind window and walks the ownership challenge, so it costs two
   extra round trips once per daemon lifetime.
+- **`ui.input`** (card #2780, #2780; ADR 0007 R2's kind 29) injects HID events
+  into the focused pane — see D5b for the wire. `win` is the strip index
+  the request believes is focused, the same integer `ui.windows` reports
+  as `focused`; a mismatch — or no focus at all — refuses
+  `agent_input_no_focus`, the seat's own refusal name. Each `events`
+  element is one flat object: `{"type":"key","usage":N,"mods":N?}` is a
+  key press (HID usage 0..255, ADR 0009 modifier bits, `mods` default 0);
+  `{"type":"ptr","x":N,"y":N,"buttons":N?}` is an absolute pointer sample
+  (`x`/`y` 0..65535, `buttons` default 0). Unknown keys, an unknown
+  `type`, missing required fields and out-of-range values are
+  `bad_request`; more than 64 elements is `too_large`. The whole batch
+  validates before the first frame goes out — a malformed element N never
+  causes events 1..N−1 to fire. `{"sent":N}` counts the events the seat
+  applied; the first refusal stops the batch and is the response. No
+  seat at all is `seat_absent` — the same anchor `ui.screenshot` uses.
 - **`gosh.run`**:
   1. `cmd` must be 1–192 bytes of printable ASCII (0x20–0x7e), or the
      request fails with `too_large` (length) or `cmd_rejected` (bytes).
@@ -320,6 +341,7 @@ Only codes marked *fatal* close it.
 | `spawn_failed` | `vi.Exec` of `GOSH.ELF` failed | no |
 | `timed_out` | `gosh.run` budget exhausted; the child was killed | no |
 | `seat_unsupported` / `seat_timeout` | see `ui.windows` | no |
+| `agent_input_denied` / `agent_input_no_focus` | kind-29 ack refused, name quoted verbatim (card #2780) | no |
 | `io_error` | any other negative kernel result (`message` carries `vi.ErrnoName`) | no |
 | `auth_required` / `auth_failed` / `auth_timeout` | D2 | **yes** |
 | `line_too_long` | a line exceeds its limit (bytes discarded unparsed) | **yes** |
@@ -365,6 +387,48 @@ first, and that is the contract).
 - **Not changed:** the Zig seats and the kernel. Zig TABWM answers unknown
   kinds `applied=0`, which becomes `seat_unsupported`. The 38-byte frame
   layout and the bind invariants are untouched.
+
+## D5b. Agent input: WM_RPC kind 29 `agent_input` (card #2780, #2780)
+
+`ui.input` rides ADR 0007 R2's reserved kind through the same M97g-F2
+bind `ui.windows` uses — `id` is the daemon's own (hidden) bind window,
+`x/y/w/h` are the auth union. One event per request: the packed event is
+the only payload, carried in `title` because the auth union owns
+`x/y/w/h`:
+
+- `title[0]` is the event class: `'k'` = key, `'p'` = pointer.
+- Key: `title[1]` = modifier flags (ADR 0009 `Mod*` bits), `title[2]` =
+  HID usage.
+- Pointer: `title[1]` = button bits, `title[2..3]` = x little-endian,
+  `title[4..5]` = y little-endian.
+
+**Admission is the seat's.** The seat's kind-29 handler (#2771,
+`gotabwm/agentinput.go`) requires the bound `reply_to` pid's proc name
+to be exactly `AGENTD.ELF`, decodes the event, and checks that a live
+pane holds focus. An admitted event enters the same `consumeSeatEvent`
+dispatch a hardware event takes — seat-chord keys still belong to the
+seat, everything else reaches the focused app.
+
+**Ack:** `kind=29|0x80`, `Pad=Bound`, auth union quoting the bound token.
+`Applied=1` means dispatched. A refusal answers `Applied=0` with the
+name on the title — `agent_input_denied` (wrong principal or malformed
+event) or `agent_input_no_focus` (no live focused pane). The verb
+surfaces the name verbatim as its refusal code; a bare `Applied=0` with
+no name — a seat without a kind-29 handler — is `seat_unsupported`, and
+no answer inside the budget is `seat_timeout`.
+
+**Client:** `vi.WmAgentInputKey`/`vi.WmAgentInputPtr` in
+`user/go/vi/wminject.go`, built on `wmRequest`'s bind/ack machinery like
+`WmWindows`. The `input` cap (ADR 0052 D3 vocabulary) gates the verb —
+distinct from `window`, so a read-only observer never gains the drive.
+
+**Audit:** every `ui.input` dispatch — applied or refused — leaves the
+usual M109c receipt carrying `win` and the event count, never the event
+bytes.
+
+**Not changed:** the Zig seats, the kernel, the event classes apps
+receive (`EvWmKey`/`EvWmPointer` inside `consumeSeatEvent`), and the
+bind invariants.
 
 ## D6. Markers and the never-logged contract
 
@@ -528,6 +592,7 @@ reopened it and ruled on two points, both implemented here:
 | `fs.write` | `HELLO.TXT` (payload sentinel) → `share-equals` | 4097 bytes → `too_large`; `"data_b64":"@@"` → `bad_request`; `../X` → `path_rejected`; share root unchanged |
 | `gosh.run` | `echo hello` → `hello\n`, 0; `cat NOPE.TXT` → `ok:true`, status ≠ 0; `cat /host/SECRETS.TXT` → `ok:true`, status ≠ 0, stdout lacks key (ceiling evidence) | `echo a > X`, `echo a #c`, `echo a &`, `echo 'a`, `"echo a\nls"` → `cmd_rejected`; 193 bytes → `too_large`; `timeout_ms:0` / `30001` → `bad_request`; `sleep 5` + `timeout_ms:1000` → `timed_out` + `agentd: reap`; run 05 → `verb_disabled` |
 | `ui.windows` | `gotabwm`, ≥ 1 `Calc` row, one focused; run 05 `none` | extra key → `bad_request`; `seat_unsupported`/`seat_timeout` class A |
+| `ui.input` (run 15) | `{"type":"key","usage":0x0B/0x0C}` + a `ptr` press/release → `{"sent":4}`, typed text repaints the next `ui.screenshot` | `win` ≠ focused → `agent_input_no_focus`; 65 events → `too_large`; malformed/missing fields → `bad_request`; `window`-only cap → `cap_required:input` (run 09) |
 | framing | — | `{` → `bad_json`; `{"verb":"proc.list"}` → `bad_request`; `{"id":1,"verb":"nope"}` → `unknown_verb`; duplicate `id` → `bad_request`; nested `{"a":{}}` → `bad_request`; `null` → `bad_request`; 8193 bytes → `line_too_long` (fatal, last) |
 
 The harness prints one `AGENTCTL: ok <step>` or `AGENTCTL: FAIL <step>
@@ -574,8 +639,9 @@ The harness prints one `AGENTCTL: ok <step>` or `AGENTCTL: FAIL <step>
 - **E4 — Richer surface.** Sandbox subdirectories, list, delete, ranged
   reads, streaming output, stdin, stderr capture, a cwd, concurrent jobs.
 - **E5 — UI depth.** Full window geometry and z-order for non-tab windows,
-  then any input or focus verbs (that is the remote-desktop line, and it
-  needs its own threat model).
+  and focus/raise verbs (that is the remote-desktop line, and it needs
+  its own threat model). The focused-pane input half landed in card #2780
+  (#2780, D5b) — geometry and focus control stay here.
 - **E6 — Transport hardening.** Session encryption (ChaCha20-Poly1305,
   M47), Ed25519 client keys, multiple clients (needs multi-connection TCP),
   and a declarative INIT service row that is disabled by default.

@@ -15,28 +15,30 @@ import (
 // use). They are package vars so a test can swap one without touching the
 // others.
 var (
-	procsFn      = func(dst []vi.ProcRow) (int, int64) { return vi.Procs(dst) }
-	readFileFn   = vi.ReadFileAll
-	writeFileFn  = vi.WriteFileSafe
-	deleteFileFn = vi.FileDelete
-	dirListFn    = vi.DirList
-	execFn       = vi.Exec
-	waitFn       = vi.WaitBudget
-	killFn       = vi.Kill
-	probeFn      = vi.Probe
-	seatPidFn    = vi.WmctlSeatPid
-	winOpenFn    = vi.WinOpen
-	winHideFn    = vi.WinSetVisible
-	wmWindowsFn  = vi.WmWindows
-	scanoutFn    = vi.ScanoutRead
-	secretGetFn  = shlib.StoreGet
-	principalFn  = vi.Principal
-	randomFn     = vi.Random
-	argsFn       = vi.Args
-	listenFn     = vi.Listen
-	consoleFn    = vi.ConsoleLine
-	sleepFn      = vi.Sleep
-	exitFn       = vi.Exit
+	procsFn         = func(dst []vi.ProcRow) (int, int64) { return vi.Procs(dst) }
+	readFileFn      = vi.ReadFileAll
+	writeFileFn     = vi.WriteFileSafe
+	deleteFileFn    = vi.FileDelete
+	dirListFn       = vi.DirList
+	execFn          = vi.Exec
+	waitFn          = vi.WaitBudget
+	killFn          = vi.Kill
+	probeFn         = vi.Probe
+	seatPidFn       = vi.WmctlSeatPid
+	winOpenFn       = vi.WinOpen
+	winHideFn       = vi.WinSetVisible
+	wmWindowsFn     = vi.WmWindows
+	scanoutFn       = vi.ScanoutRead
+	agentInputKeyFn = vi.WmAgentInputKey
+	agentInputPtrFn = vi.WmAgentInputPtr
+	secretGetFn     = shlib.StoreGet
+	principalFn     = vi.Principal
+	randomFn        = vi.Random
+	argsFn          = vi.Args
+	listenFn        = vi.Listen
+	consoleFn       = vi.ConsoleLine
+	sleepFn         = vi.Sleep
+	exitFn          = vi.Exit
 )
 
 const (
@@ -95,9 +97,12 @@ type sessionCtx struct {
 }
 
 // verbCap is the fixed verb->cap table (ADR 0052 D3): proc verbs take
-// `process`, fs takes `file`, the ui pair takes `window`, and gosh.run
-// takes `term` (AND-ed with --allow-exec inside the verb — the daemon
-// flag is the operator's kill switch, the cap is the per-agent grant).
+// `process`, fs takes `file`, ui.windows/ui.screenshot take `window`,
+// ui.input takes `input` — a DISTINCT grant, because an observer that
+// may only read the desktop must not get to drive it (M139b) — and
+// gosh.run takes `term` (AND-ed with --allow-exec inside the verb — the
+// daemon flag is the operator's kill switch, the cap is the per-agent
+// grant).
 var verbCap = map[string]string{
 	"proc.list":     "process",
 	"proc.get":      "process",
@@ -105,13 +110,14 @@ var verbCap = map[string]string{
 	"fs.write":      "file",
 	"ui.windows":    "window",
 	"ui.screenshot": "window",
+	"ui.input":      "input",
 	"gosh.run":      "term",
 }
 
 // allVerbs is the D3 verb set in declaration order, for the ready line.
 var allVerbs = []string{
 	"proc.list", "proc.get", "fs.read", "fs.write",
-	"ui.windows", "ui.screenshot", "gosh.run",
+	"ui.windows", "ui.screenshot", "ui.input", "gosh.run",
 }
 
 // advertisedVerbs is the session's resolved grant set: a verb appears
@@ -176,6 +182,11 @@ func dispatch(req *request, sess *sessionCtx) (string, string) {
 			return "", "bad_request"
 		}
 		return verbUIScreenshot(sess)
+	case "ui.input":
+		if !req.hasArgs("win", "events") {
+			return "", "bad_request"
+		}
+		return verbUIInput(req)
 	case "gosh.run":
 		if !req.hasArgs("cmd", "timeout_ms") {
 			return "", "bad_request"
@@ -547,6 +558,192 @@ func verbUIScreenshot(sess *sessionCtx) (string, string) {
 	sb.WriteString(vi.Itoa64(thumbW * thumbH * 2))
 	sb.WriteByte('}')
 	return sb.String(), ""
+}
+
+// --- ui.input -------------------------------------------------------------------
+
+// M139b (#2780): ui.input {win, events} injects input into the focused
+// pane over WM_RPC kind 29 (ADR 0007 R2). The daemon's parts:
+//
+//   - `win` is the strip index the request believes is focused — the same
+//     integer ui.windows reports as `focused`. The verb re-queries the
+//     strip and refuses agent_input_no_focus when it doesn't match; the
+//     seat re-checks focus at dispatch anyway, so a race between the two
+//     still lands the seat's own no_focus refusal verbatim.
+//   - `events` is a bounded batch (<= inputEventsMax) of flat objects:
+//     {"type":"key","usage":N,"mods":N?} for a key press, or
+//     {"type":"ptr","x":N,"y":N,"buttons":N?} for an absolute pointer
+//     sample. mods/buttons default to 0.
+//   - One event rides one kind-29 request — the R2 frame carries a
+//     single packed title — so the batch is sent sequentially and the
+//     first refusal stops it.
+//   - The seat's refusal name is the verdict: agent_input_denied and
+//     agent_input_no_focus surface verbatim; a bare applied=0 (a legacy
+//     seat with no kind-29 handler) is seat_unsupported.
+//
+// Refuse before touching: the whole batch validates BEFORE the first
+// kind-29 frame goes out — a malformed event N never causes events
+// 1..N-1 to fire.
+
+const inputEventsMax = 64 // D3: at most 64 events per call
+
+// inputEvent is one validated batch element.
+type inputEvent struct {
+	ptr   bool   // false = key press; true = absolute pointer sample
+	bits  uint8  // mods (key) / buttons (ptr)
+	usage uint8  // key: HID usage
+	x, y  uint16 // ptr: framebuffer coordinates
+}
+
+// parseInputEvent validates one events[] element against its per-type
+// field set; every value must be a flat integer (or "type", a string).
+// Member order carries no meaning — "type" is resolved before the rest.
+func parseInputEvent(v jval) (ev inputEvent, ok bool) {
+	if v.kind != jObj {
+		return ev, false
+	}
+	seen := map[string]bool{}
+	typeFound := false
+	for _, m := range v.membs {
+		if seen[m.key] {
+			return ev, false // a duplicated member is malformed
+		}
+		seen[m.key] = true
+		if m.key == "type" {
+			if m.val.kind != jStr {
+				return ev, false
+			}
+			switch m.val.str {
+			case "key":
+				ev.ptr = false
+			case "ptr":
+				ev.ptr = true
+			default:
+				return ev, false
+			}
+			typeFound = true
+		}
+	}
+	if !typeFound {
+		return ev, false
+	}
+	for _, m := range v.membs {
+		if m.key == "type" {
+			continue
+		}
+		if m.val.kind != jNum {
+			return ev, false
+		}
+		n, ok2 := flatInt(m.val.str)
+		if !ok2 {
+			return ev, false
+		}
+		switch m.key {
+		case "usage":
+			if ev.ptr || n > 0xff {
+				return ev, false
+			}
+			ev.usage = uint8(n)
+		case "mods":
+			if ev.ptr || n > 0xff {
+				return ev, false
+			}
+			ev.bits = uint8(n)
+		case "buttons":
+			if !ev.ptr || n > 0xff {
+				return ev, false
+			}
+			ev.bits = uint8(n)
+		case "x":
+			if !ev.ptr || n > 0xffff {
+				return ev, false
+			}
+			ev.x = uint16(n)
+		case "y":
+			if !ev.ptr || n > 0xffff {
+				return ev, false
+			}
+			ev.y = uint16(n)
+		default:
+			return ev, false // an unknown member is malformed
+		}
+	}
+	if !ev.ptr {
+		return ev, seen["usage"]
+	}
+	return ev, seen["x"] && seen["y"]
+}
+
+// verbUIInput answers ui.input. Seat absence is the named refusal first
+// (same anchor as ui.screenshot), then the strip's focus answers `win`,
+// then each event rides its own bound kind-29 frame in order.
+func verbUIInput(req *request) (string, string) {
+	win, present, ok := req.argInt("win", 0, intMax)
+	if !present || !ok {
+		return "", "bad_request"
+	}
+	elems, present, ok := req.argArray("events")
+	if !present || !ok {
+		return "", "bad_request"
+	}
+	if len(elems) > inputEventsMax {
+		return "", "too_large"
+	}
+	evs := make([]inputEvent, len(elems))
+	for i, e := range elems {
+		if evs[i], ok = parseInputEvent(e); !ok {
+			return "", "bad_request"
+		}
+	}
+	if seatPidFn() <= 0 {
+		return "", "seat_absent"
+	}
+	if agentWindow < 0 {
+		id, raw := winOpenFn(0, 0, 128, 64)
+		if id < 0 || raw < 0 {
+			return "", "seat_unsupported"
+		}
+		_ = winHideFn(id, false)
+		agentWindow = id
+	}
+	rows, err := wmWindowsFn(uint32(agentWindow), appName)
+	if err != nil {
+		if err == vi.ErrSeatUnsupported {
+			return "", "seat_unsupported"
+		}
+		return "", "seat_timeout"
+	}
+	focused := -1
+	for i := range rows {
+		if rows[i].Focused {
+			focused = rows[i].Index
+		}
+	}
+	if focused < 0 || int64(focused) != win {
+		return "", vi.AgentInputNoFocus
+	}
+	sent := 0
+	for _, e := range evs {
+		var rep vi.WmRpc
+		var answered bool
+		if e.ptr {
+			rep, answered = agentInputPtrFn(uint32(agentWindow), e.bits, e.x, e.y, appName)
+		} else {
+			rep, answered = agentInputKeyFn(uint32(agentWindow), e.bits, e.usage, appName)
+		}
+		if !answered {
+			return "", "seat_timeout"
+		}
+		if rep.Applied == 0 {
+			switch rep.TitleString() {
+			case vi.AgentInputDenied, vi.AgentInputNoFocus:
+				return "", rep.TitleString()
+			}
+			return "", "seat_unsupported"
+		}
+		sent++
+	}
+	return `{"sent":` + vi.Itoa64(int64(sent)) + `}`, ""
 }
 
 // --- gosh.run -------------------------------------------------------------------

@@ -700,6 +700,124 @@ def journey_noexec(s, cred):
     ]
 
 
+def journey_input(s, cred):
+    """M139b (#2780): ui.input types into the focused GOEDIT pane and a
+    following ui.screenshot observes the repaint; then the named
+    refusals. The gate execs GOEDIT only after the first ui.windows
+    request (go-agentd.spec run 15), exactly like journey_full's Calc.
+    """
+    edit_index = []
+    pixels_a = []
+
+    def handshake():
+        verbs = s.connect(cred[0], cred[1])
+        for v in ("ui.windows", "ui.screenshot", "ui.input"):
+            if v not in verbs:
+                raise Fail("missing advertised verb " + v)
+        if "input" not in s.caps:
+            raise Fail("missing declared cap input")
+
+    def ui_windows():
+        deadline = time.monotonic() + UI_WAIT
+        last = "empty window list"
+        while True:
+            try:
+                res = s.call("ui.windows")
+            except Refused as r:
+                res = None
+                last = "refused " + r.code
+            if res is not None:
+                if res.get("seat") != "gotabwm":
+                    raise Fail("seat is not gotabwm")
+                rows = res.get("windows")
+                if isinstance(rows, list):
+                    edit = [r for r in rows if r.get("title") == "Edit"]
+                    focused = [r for r in rows if r.get("focused") is True]
+                    if (edit and len(focused) == 1
+                            and focused[0].get("index")
+                            == edit[0].get("index")):
+                        edit_index.append(edit[0]["index"])
+                        break
+                last = "no focused Edit row"
+            if time.monotonic() >= deadline:
+                raise Fail("ui.windows never showed a focused Edit row: " + last)
+            time.sleep(1)
+
+    def screenshot(tag):
+        deadline = time.monotonic() + 30
+        while True:
+            res = s.call("ui.screenshot")
+            pix = stream_bytes(res)
+            if len(pix) != 160 * 90 * 2:
+                raise Fail("screenshot stream reassembled %d bytes" % len(pix))
+            if not any(pix):
+                if time.monotonic() >= deadline:
+                    raise Fail(tag + ": screenshot stayed all-zero")
+                time.sleep(1)
+                continue
+            return pix
+
+    def shot_a():
+        pixels_a.append(screenshot("a"))
+
+    def ui_input_type():
+        # 'h','i' (HID usages 0x0B/0x0C) plus a click press+release at
+        # (300,200) — one bounded batch, one kind-29 frame per event.
+        res = s.call("ui.input", win=edit_index[0], events=[
+            {"type": "key", "usage": 0x0B},
+            {"type": "key", "usage": 0x0C},
+            {"type": "ptr", "x": 300, "y": 200, "buttons": 1},
+            {"type": "ptr", "x": 300, "y": 200, "buttons": 0},
+        ])
+        if res.get("sent") != 4:
+            raise Fail("ui.input sent %r of 4 events" % res.get("sent"))
+
+    def shot_b():
+        # GOEDIT repaints on the first insert (status `*` + glyphs): the
+        # next screenshot must differ from shot a. Poll past the seat's
+        # paint latency.
+        deadline = time.monotonic() + 30
+        while True:
+            pix = screenshot("b")
+            if pix != pixels_a[0]:
+                return
+            if time.monotonic() >= deadline:
+                raise Fail("typed input never repainted the screenshot")
+            time.sleep(1)
+
+    def ui_input_reds():
+        # The seat's refusal name for a non-focused target, verbatim.
+        expect_refused(
+            lambda: s.call("ui.input", win=99, events=[
+                {"type": "key", "usage": 4}]),
+            "agent_input_no_focus")
+        expect_refused(
+            lambda: s.call("ui.input", win=edit_index[0], events=[
+                {"type": "key", "usage": 4}] * 65),
+            "too_large")
+        for events in (
+            [{"type": "key"}],                    # usage missing
+            [5],                                  # element not an object
+            [{"type": "wheel"}],                  # unknown event class
+            [{"type": "ptr", "x": 1}],            # y missing
+            [{"type": "key", "usage": 4, "x": 1}],  # key-only extra
+        ):
+            expect_refused(
+                lambda e=events: s.call(
+                    "ui.input", win=edit_index[0], events=e),
+                "bad_request")
+        expect_refused(lambda: s.call("ui.input", events=[]), "bad_request")
+
+    return [
+        ("handshake", handshake),
+        ("ui.windows", ui_windows),
+        ("ui.screenshot-a", shot_a),
+        ("ui.input", ui_input_type),
+        ("ui.screenshot-b", shot_b),
+        ("ui.input-reds", ui_input_reds),
+    ]
+
+
 def journey_capsneg(s, cred):
     """An agent whose row declares only `process` gets cap_required for
     every other verb — the per-verb cap-absent negative."""
@@ -721,6 +839,8 @@ def journey_capsneg(s, cred):
             ("fs.write", {"path": "X", "data_b64": b64e(b"x")}, "file"),
             ("ui.windows", {}, "window"),
             ("ui.screenshot", {}, "window"),
+            ("ui.input", {"win": 0, "events": [{"type": "key", "usage": 4}]},
+             "input"),
             ("gosh.run", {"cmd": "echo hi"}, "term"),
         ):
             expect_refused(
@@ -778,6 +898,7 @@ JOURNEYS = {
     "mute": journey_mute,
     "noexec": journey_noexec,
     "capsneg": journey_capsneg,
+    "input": journey_input,
     "revoked": journey_revoked,
     "unknown": journey_unknown,
 }

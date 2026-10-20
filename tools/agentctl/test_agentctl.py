@@ -90,7 +90,8 @@ class FakeWire:
 
 # agent_id -> (seed, caps, revoked). The sim's AGENTS.TXT.
 KEYRING = {
-    "devin": (DEVIN[1], ["file", "process", "window", "term"], False),
+    "devin": (DEVIN[1], ["file", "process", "window", "term", "input"],
+              False),
     "viewer": (VIEWER[1], ["process"], False),
     "bobby": (BOBBY[1], ["file"], True),
 }
@@ -99,6 +100,7 @@ VERB_CAP = {
     "proc.list": "process", "proc.get": "process",
     "fs.read": "file", "fs.write": "file",
     "ui.windows": "window", "ui.screenshot": "window",
+    "ui.input": "input",
     "gosh.run": "term",
 }
 
@@ -119,6 +121,7 @@ class SimDaemon:
         self.row = None
         self.caps = []
         self.hello_written = False
+        self.edited = 0  # events injected: perturbs the screenshot bytes
         w.push({
             "proto": "virelai-agent/2",
             "auth": "ed25519",
@@ -211,6 +214,7 @@ class SimDaemon:
         allowed = {"proc.list": (), "proc.get": ("pid",),
                    "fs.read": ("path",), "fs.write": ("path", "data_b64"),
                    "ui.windows": (), "ui.screenshot": (),
+                   "ui.input": ("win", "events"),
                    "gosh.run": ("cmd", "timeout_ms")}[verb]
         if any(k not in allowed for k in extra):
             self.err(rid, "bad_request")
@@ -281,17 +285,68 @@ class SimDaemon:
         if not self.seat:
             self.ok(rid, {"seat": "none", "focused": None, "windows": []})
             return
-        self.ok(rid, {"seat": "gotabwm", "focused": 0, "windows": [
-            {"index": 0, "id": 3, "title": "Calc", "focused": True,
+        # The Calc row journey_full waits for, plus a focused Edit row
+        # journey_input drives.
+        self.ok(rid, {"seat": "gotabwm", "focused": 1, "windows": [
+            {"index": 0, "id": 3, "title": "Calc", "focused": False,
+             "pinned": False, "frozen": False},
+            {"index": 1, "id": 4, "title": "Edit", "focused": True,
              "pinned": False, "frozen": False}]})
 
     def v_ui_screenshot(self, rid, obj):
         if not self.seat:
             self.err(rid, "seat_absent")
             return
-        self.stream(rid, bytes((i % 251 + 1) for i in range(160 * 90 * 2)))
+        self.stream(rid, bytes(((i + self.edited) % 251 + 1)
+                               for i in range(160 * 90 * 2)))
         self.ok(rid, {"w": 160, "h": 90, "format": "rgb565le",
                       "bytes": 160 * 90 * 2})
+
+    def v_ui_input(self, rid, obj):
+        # D3/D4 mirror of the real verb: flat int win, events a bounded
+        # list of typed flat objects; the focused strip index answers win.
+        win, events = obj.get("win"), obj.get("events")
+        if (not isinstance(win, int) or isinstance(win, bool) or win < 0
+                or not isinstance(events, list)):
+            self.err(rid, "bad_request")
+            return
+        if len(events) > 64:
+            self.err(rid, "too_large")
+            return
+        ok = True
+        for e in events:
+            if not isinstance(e, dict) or len(set(e)) != len(e):
+                ok = False
+                break
+            t = e.get("type")
+            fields = {k for k in e if k != "type"}
+            if t == "key":
+                ok = fields <= {"usage", "mods"} and "usage" in fields
+            elif t == "ptr":
+                ok = fields <= {"x", "y", "buttons"} and \
+                    {"x", "y"} <= fields
+            else:
+                ok = False
+            if not ok:
+                break
+            for k, v in e.items():
+                if k == "type":
+                    continue
+                hi = 0xFFFF if k in ("x", "y") else 0xFF
+                if (not isinstance(v, int) or isinstance(v, bool)
+                        or v < 0 or v > hi):
+                    ok = False
+                    break
+            if not ok:
+                break
+        if not ok:
+            self.err(rid, "bad_request")
+            return
+        if win != 1:  # the focused row's index (v_ui_windows above)
+            self.err(rid, "agent_input_no_focus")
+            return
+        self.edited += len(events)
+        self.ok(rid, {"sent": len(events)})
 
     def v_gosh_run(self, rid, obj):
         if not self.allow_exec:
@@ -351,8 +406,14 @@ def parse_flat(line):
         return "bad_request", None
     fields = {}
     for k, val in pairs:
-        if isinstance(val, tuple) or isinstance(val, list) or val is None:
+        if isinstance(val, tuple) or val is None:
             return "bad_request", None
+        if isinstance(val, list):
+            # ui.input's events[]: elements decode as ("__obj__", pairs)
+            # tuples — normalize to plain dicts for the verb mirror.
+            val = [dict(e[1]) if (isinstance(e, tuple)
+                                 and e[0] == "__obj__") else e
+                   for e in val]
         if isinstance(val, float):
             return "bad_request", None
         if isinstance(val, int) and not isinstance(val, bool) and (
@@ -508,8 +569,8 @@ class TestJourneys(unittest.TestCase):
 
     def test_journey_names(self):
         self.assertEqual(sorted(agentctl.JOURNEYS),
-                         ["badsig", "capsneg", "full", "mute", "noexec",
-                          "preauth", "revoked", "unknown"])
+                         ["badsig", "capsneg", "full", "input", "mute",
+                          "noexec", "preauth", "revoked", "unknown"])
         self.assertTrue(agentctl.VANISH.issubset(agentctl.JOURNEYS))
         for name in agentctl.JOURNEYS:
             s, _ = connect_sim()
@@ -549,6 +610,10 @@ class TestJourneys(unittest.TestCase):
 
     def test_mute(self):
         fails = self.run_journey("mute", mute=True)
+        self.assertEqual(fails, [])
+
+    def test_input(self):
+        fails = self.run_journey("input")
         self.assertEqual(fails, [])
 
     def test_full_fails_when_calc_missing(self):

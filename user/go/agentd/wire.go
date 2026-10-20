@@ -116,11 +116,14 @@ func indexByte(b []byte, c byte) int {
 // --- the flat-grammar reader ------------------------------------------------
 
 // Field kinds under the flat grammar (D1): a value may only be a string,
-// an unsigned integer no larger than 2^31-1, or a boolean.
+// an unsigned integer no larger than 2^31-1, or a boolean. M139b adds
+// fArr for ui.input's events — the only verb that admits an array; the
+// elements still must be flat objects and are validated per-verb.
 const (
 	fStr = iota
 	fInt
 	fBool
+	fArr
 )
 
 const (
@@ -142,6 +145,7 @@ type jval struct {
 	kind  int
 	str   string    // jStr: decoded; jNum/jTrue/jFalse/jNull: literal text
 	membs []jmember // jObj only
+	items []jval    // jArr only
 }
 
 // intMax is the flat grammar's integer bound (2^31 - 1).
@@ -243,21 +247,23 @@ func parseObject(b []byte, depth int) (jval, []byte, bool) {
 }
 
 func parseArray(b []byte, depth int) (jval, []byte, bool) {
+	v := jval{kind: jArr}
 	b = skipWS(b)
 	if len(b) > 0 && b[0] == ']' {
-		return jval{kind: jArr}, b[1:], true
+		return v, b[1:], true
 	}
 	for {
-		_, rest, ok := parseValueDepth(b, depth)
+		item, rest, ok := parseValueDepth(b, depth)
 		if !ok {
 			return jval{}, b, false
 		}
+		v.items = append(v.items, item)
 		b = skipWS(rest)
 		if len(b) == 0 {
 			return jval{}, b, false
 		}
 		if b[0] == ']' {
-			return jval{kind: jArr}, b[1:], true
+			return v, b[1:], true
 		}
 		if b[0] != ',' {
 			return jval{}, b, false
@@ -449,9 +455,10 @@ func parseLine(line []byte) (jval, string) {
 
 // fieldView is the flat-field projection of one request object.
 type fieldView struct {
-	kind int    // fStr / fInt / fBool
+	kind int    // fStr / fInt / fBool / fArr
 	str  string // fStr
 	num  int64  // fInt
+	arr  []jval // fArr
 }
 
 // request is a validated flat request: the parsed fields plus the id and
@@ -465,15 +472,18 @@ type request struct {
 }
 
 // fieldKind classifies a parsed value into the flat grammar, or -1 when it
-// is outside it (nested object, array, null, or a number that is not a
+// is outside it (nested object, null, or a number that is not a
 // plain unsigned integer within the bound — a mistyped value, which is
-// bad_request either way).
+// bad_request either way). An array projects as fArr so ui.input can
+// carry its events; every other verb's arg getter refuses it as mistyped.
 func fieldKind(v jval) int {
 	switch v.kind {
 	case jStr:
 		return fStr
 	case jTrue, jFalse:
 		return fBool
+	case jArr:
+		return fArr
 	case jNum:
 		if n, ok := flatInt(v.str); ok {
 			_ = n
@@ -521,6 +531,8 @@ func validateRequest(v jval) (*request, string) {
 			req.fields[m.key] = fieldView{kind: fInt, num: n}
 		case fBool:
 			req.fields[m.key] = fieldView{kind: fBool}
+		case fArr:
+			req.fields[m.key] = fieldView{kind: fArr, arr: m.val.items}
 		default:
 			return req, "bad_request"
 		}
@@ -588,6 +600,20 @@ func (r *request) argStr(name string) (v string, present, ok bool) {
 		return "", true, false
 	}
 	return f.str, true, true
+}
+
+// argArray returns an array argument's raw elements. present/ok mirror
+// argInt; ok is false when the value is not an array. Element shape is
+// the verb's own check — the grammar only guarantees the parse tree.
+func (r *request) argArray(name string) (v []jval, present, ok bool) {
+	f, ok := r.fields[name]
+	if !ok {
+		return nil, false, true
+	}
+	if f.kind != fArr {
+		return nil, true, false
+	}
+	return f.arr, true, true
 }
 
 // --- the writer --------------------------------------------------------------

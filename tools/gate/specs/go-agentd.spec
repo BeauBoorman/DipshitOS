@@ -19,7 +19,10 @@
 # Runs 12-14 are the new ADR 0052 D1 postures: no AGENTS.TXT
 # (no-keyring), an unparseable keyring (keyring-malformed), and no
 # AGENT/AUDIT lane (no-audit). Every run asserts the never-logged
-# sentinels.
+# sentinels. Run 15 is M139b (#2780): the `input` journey — ui.input
+# types "hi" and clicks into the focused GOEDIT pane over WM_RPC
+# kind 29, the next ui.screenshot sees the repaint, and the named
+# refusals (agent_input_no_focus, too_large, bad_request) land.
 #
 # The agent credentials are three pinned Ed25519 seeds; each reaches its
 # harness through $RUN_DIR/<agent>.key (agent id + seed hex, never argv)
@@ -59,6 +62,7 @@
 #   bash tools/go/build-gosh.sh    -> .build/go/GOSH.ELF
 #   bash tools/go/build-gotabwm.sh -> .build/go/GOTABWM.ELF
 #   bash tools/go/build-gocalc.sh  -> .build/go/GOCALC.ELF
+#   bash tools/go/build-goedit.sh  -> .build/go/GOEDIT.ELF
 
 vgate_name go-agentd "M109b #2398: AGENTD.ELF v2 - Ed25519 identity, declared caps, bounded verbs"
 vgate_share seed
@@ -73,6 +77,11 @@ EOF
 vgate_file script-calc.txt <<'EOF'
 dui focus 0
 exec GOCALC.ELF
+EOF
+
+vgate_file script-edit.txt <<'EOF'
+dui focus 0
+exec GOEDIT.ELF
 EOF
 
 vgate_file script-agentd.txt <<'EOF'
@@ -104,6 +113,7 @@ for name, cmd in (
     ("GOSH.ELF", "bash tools/go/build-gosh.sh"),
     ("GOTABWM.ELF", "bash tools/go/build-gotabwm.sh"),
     ("GOCALC.ELF", "bash tools/go/build-gocalc.sh"),
+    ("GOEDIT.ELF", "bash tools/go/build-goedit.sh"),
 ):
     src = os.path.join(".build", "go", name)
     if not os.path.isfile(src):
@@ -118,7 +128,7 @@ PUBS = {a: agentctl.ed_public_key(bytes.fromhex(s)).hex()
         for a, s in SEEDS.items()}
 agents_txt = (
     "#v1\n"
-    "agent=devin key=%s caps=file,process,window,term\n" % PUBS["devin"]
+    "agent=devin key=%s caps=file,process,window,term,input\n" % PUBS["devin"]
     + "agent=viewer key=%s caps=process\n" % PUBS["viewer"]
     + "agent=bobby key=%s caps=file\n" % PUBS["bobby"]
     + "revoked=%s\n" % PUBS["bobby"]
@@ -140,6 +150,12 @@ agent_dir = os.path.join(share, "AGENT")
 os.makedirs(agent_dir, exist_ok=True)
 os.makedirs(os.path.join(agent_dir, "AUDIT"), exist_ok=True)
 os.makedirs(os.path.join(agent_dir, "SUB"), exist_ok=True)
+# M139b run 15: GOEDIT's defaultPath is /host/EDIT/SEED.TXT — the typed
+# text splices into the buffer but is never saved, so the share file
+# stays at its staged bytes.
+ed = os.path.join(share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+open(os.path.join(ed, "SEED.TXT"), "wb").write(b"seed-line\n")
 open(os.path.join(agent_dir, "SEED.TXT"), "wb").write(agentctl.SEED_BYTES)
 open(os.path.join(agent_dir, "BIG.BIN"), "wb").write(b"\x00" * 4097)
 open(os.path.join(agent_dir, "SUB", "DEEP.TXT"), "wb").write(agentctl.DEEP_BYTES)
@@ -474,6 +490,7 @@ vgate_assert 09 serial-contains 'verb=fs.read code=cap_required'
 vgate_assert 09 serial-contains 'verb=fs.write code=cap_required'
 vgate_assert 09 serial-contains 'verb=ui.windows code=cap_required'
 vgate_assert 09 serial-contains 'verb=ui.screenshot code=cap_required'
+vgate_assert 09 serial-contains 'verb=ui.input code=cap_required'
 vgate_assert 09 serial-contains 'verb=gosh.run code=cap_required'
 vgate_assert 09 output-contains 'AGENTCTL: PASS capsneg'
 vgate_assert 09 output-contains 'NET-TCP-STREAM: probe exited status=0'
@@ -506,6 +523,7 @@ for need in (
     ("viewer", "fs.write", "cap_required:file"),
     ("viewer", "ui.windows", "cap_required:window"),
     ("viewer", "ui.screenshot", "cap_required:window"),
+    ("viewer", "ui.input", "cap_required:input"),
     ("viewer", "gosh.run", "cap_required:term"),
     ("viewer", "session", "client_close"),
 ):
@@ -649,3 +667,74 @@ vgate_assert 14 serial-absent 'agentd: listen 4747'
 vgate_assert 14 serial-absent 'agentd: req id='
 vgate_assert 14 serial-absent '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a'
 vgate_assert 14 serial-absent '[EXC] parking:'
+
+# ---- 15: M139b — ui.input drives the focused pane ------------------------------
+# devin now declares `input` (AGENTS.TXT above). GOEDIT execs after the
+# first ui.windows request — the task-pool staging run 01 uses — and the
+# input journey types "hi" plus a click into the focused Edit pane over
+# kind-29, then re-shoots the framebuffer: the repaint (the status row's
+# dirty `*` and the inserted glyphs) IS the pixels-changed proof. The
+# reds assert the seat's refusal name verbatim (agent_input_no_focus for
+# a non-focused win), the 64-event bound (too_large), and the malformed
+# shapes (bad_request).
+vgate_run 15 -- \
+    --screen '$RUN_DIR/screen-15' \
+    --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=input' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/devin.key' \
+    --net-tcp-connect-after 'agentd: listen 4747' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-agentd.txt' --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script-edit.txt' --script3-after 'verb=ui.windows' \
+    --script-expect 'agentd: session end reason=client_close' \
+    --script-expect-tail 4 --timeout 300
+
+vgate_assert 15 serial-contains 'agentd: auth ok agent=devin'
+vgate_assert 15 serial-contains 'verb=ui.windows ok'
+vgate_assert 15 serial-contains 'verb=ui.input ok'
+vgate_assert 15 serial-contains 'verb=ui.screenshot ok'
+vgate_assert 15 serial-contains 'code=agent_input_no_focus'
+vgate_assert 15 serial-contains 'code=too_large'
+vgate_assert 15 serial-contains 'code=bad_request'
+vgate_assert 15 serial-contains 'gotabwm: agent-input'
+vgate_assert 15 serial-contains 'gotabwm: rpc bind id='
+vgate_assert 15 serial-contains 'goedit: present'
+vgate_assert 15 serial-contains 'goedit: dirty'
+vgate_assert 15 output-contains 'AGENTCTL: PASS input'
+vgate_assert 15 output-contains 'NET-TCP-STREAM: probe exited status=0'
+vgate_assert 15 serial-absent '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a'
+vgate_assert 15 serial-absent '[EXC] parking:'
+
+# M139b: the ui.input dispatches are receipted — the applied batch AND
+# the named refusals — and the receipts carry win/events only, never the
+# event bytes.
+vgate_assert 15 python <<'PY2'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir) if n.startswith("RCPT-"))
+if not names:
+    sys.exit("FAIL: no receipts in AGENT/AUDIT")
+KEY = b"a5" * 32
+seen = set()
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read().split(b"\n")
+    if len(body) != 3 or body[1] != hmac.new(KEY, body[0], hashlib.sha256).hexdigest().encode():
+        sys.exit("FAIL: receipt %s malformed or MAC-bad" % n)
+    r = json.loads(body[0])
+    seen.add((r.get("agent"), r.get("verb"), r.get("result")))
+    if r.get("verb") == "ui.input" and b"usage" in body[0]:
+        sys.exit("FAIL: receipt %s logged event bytes" % n)
+for need in (
+    ("devin", "ui.input", "ok"),
+    ("devin", "ui.input", "agent_input_no_focus"),
+    ("devin", "ui.input", "too_large"),
+):
+    if need not in seen:
+        sys.exit("FAIL: no %r receipt; saw %r" % (need, sorted(seen)))
+print("run-15 audit ok: %d receipts incl. ui.input" % len(names))
+PY2
