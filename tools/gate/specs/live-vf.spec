@@ -398,3 +398,184 @@ if len(rw) != want_size or cksum(rw) != want_cksum:
     sys.exit(1)
 print("HF7-TREE: PASS -- edit duplicated nothing; untouched siblings intact")
 PY
+
+# --- M134a (#2759): STAT carries mtime; the legacy 31-byte LIST loses
+#     its last kernel consumers -------------------------------------------
+
+vgate_file m134stat.zig <<'EOF'
+// M134a probe: reads /host/pinned-mtime.txt through the metadata syscall
+// (slot 79 op 0 — the stat record's mtime sits at offset 48) and lists
+// /host/long through the v2 directory ABI (slot 27) so a 40-byte host
+// name's survival is observed at EL0, not host-side.
+fn svc6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) i64 {
+    var res: i64 = undefined;
+    asm volatile ("svc #0"
+        : [res] "={x0}" (res),
+        : [num] "{x8}" (num),
+          [a0] "{x0}" (a0),
+          [a1] "{x1}" (a1),
+          [a2] "{x2}" (a2),
+          [a3] "{x3}" (a3),
+          [a4] "{x4}" (a4),
+          [a5] "{x5}" (a5),
+        : .{ .memory = true });
+    return res;
+}
+
+fn puts(s: []const u8) void {
+    _ = svc6(1, 1, @intFromPtr(s.ptr), s.len, 0, 0, 0);
+}
+
+fn pnum(v: u64) void {
+    var buf: [20]u8 = undefined;
+    var i: usize = 20;
+    var x = v;
+    while (true) {
+        i -= 1;
+        buf[i] = @intCast('0' + x % 10);
+        x /= 10;
+        if (x == 0) break;
+    }
+    puts(buf[i..]);
+}
+
+fn u64le(b: []const u8) u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) v |= @as(u64, b[i]) << @intCast(8 * i);
+    return v;
+}
+
+var wire: [96]u8 align(8) = @splat(0);
+var page: [16 + 16 * 272]u8 align(8) = @splat(0);
+
+export fn _start() void {
+    const rc = svc6(79, 0, @intFromPtr("/host"), 5, @intFromPtr("pinned-mtime.txt"), 16, @intFromPtr(&wire));
+    puts("m134-stat rc=");
+    if (rc < 0) {
+        pnum(@bitCast(-rc));
+        puts(" mtime_sec=?\n");
+    } else {
+        puts("0 mtime_sec=");
+        pnum(u64le(wire[48..56]));
+        puts("\n");
+    }
+    const tok = svc6(27, @intFromPtr("/host/long"), 10, 0, (@as(u64, 1) << 63) | 1, 0, 0);
+    if (tok > 0) {
+        var off: u64 = 0;
+        while (true) {
+            const n = svc6(27, @as(u64, @bitCast(tok)), off, @intFromPtr(&page), (@as(u64, 1) << 63) | 2, 16, 0);
+            if (n <= 0) break;
+            const next = u64le(page[0..8]);
+            const last = page[12] == 1;
+            const count: usize = page[8];
+            var at: usize = 16;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const nlen = @as(usize, page[at + 264]) | (@as(usize, page[at + 265]) << 8);
+                puts("m134-name ");
+                if (nlen <= 256) puts(page[at .. at + nlen]);
+                puts("\n");
+                at += 272;
+            }
+            if (last) break;
+            off = next;
+        }
+        _ = svc6(27, @as(u64, @bitCast(tok)), 0, 0, (@as(u64, 1) << 63) | 3, 0, 0);
+    } else {
+        puts("m134-dirv2-open-failed\n");
+    }
+    _ = svc6(3, 0, 0, 0, 0, 0, 0);
+    unreachable;
+}
+EOF
+
+# exec-order: assert-proven -- `vf ls long`/`vf cat` precede the exec;
+# every assert after it reads output only M134.ELF produces (m134-stat,
+# m134-name), so a probe that never ran fails the leg, never passes it.
+vgate_file script-m134.txt <<'EOF'
+vf ls
+vf cat pinned-mtime.txt
+vf ls long
+exec M134.ELF
+echo rx-m134
+EOF
+
+vgate_setup_python <<'PY'
+import os, subprocess, sys
+
+run_dir = os.environ["RUN_DIR"]
+share = os.path.join(run_dir, "share")
+
+# A pinned mtime the guest-side stat can check byte-for-byte.
+pinned = os.path.join(share, "pinned-mtime.txt")
+with open(pinned, "w") as f:
+    f.write("pinned\n")
+os.utime(pinned, ns=(1_700_000_123_000_000_000, 1_700_000_123_000_000_000))
+
+# A 40-byte host name the legacy 31-byte LIST row could never carry; it
+# lives in its own directory so `vf ls` on the root still answers.
+os.makedirs(os.path.join(share, "long"), exist_ok=True)
+with open(os.path.join(share, "long", "a-very-long-host-file-name-123456789.txt"), "w") as f:
+    f.write("long\n")
+
+# Build the stat/dirV2 probe ELF onto the share. Raw-ELF exec requires the
+# last PT_LOAD writable (kernel/src/elf.zig), so constants fold into the RX
+# segment and .data/.bss take their own page (the live-user-fs b2.ld shape).
+m134_src = os.path.join(run_dir, "m134stat.zig")
+m134_dst = os.path.join(share, "M134.ELF")
+linker = os.path.join(run_dir, "m134.ld")
+with open(linker, "w") as f:
+    f.write("""ENTRY(_start)
+SECTIONS {
+  . = 0x00400000;
+  .text : ALIGN(16) { *(.text .text.*) *(.rodata .rodata.*) }
+  . = ALIGN(4096) + 4096;
+  .data : ALIGN(16) { *(.data .data.*) }
+  .bss : ALIGN(16) { *(.bss .bss.*) }
+  /DISCARD/ : { *(.note.*) *(.eh_frame .eh_frame_hdr) *(.ARM.exidx*) }
+}
+""")
+res = subprocess.run([
+    "zig", "build-exe", "-target", "aarch64-freestanding-none",
+    "-O", "ReleaseSafe", "-fentry=_start", "-fno-PIE",
+    "-fsingle-threaded", "-T", linker, m134_src,
+    f"-femit-bin={m134_dst}"
+], capture_output=True, text=True)
+if res.returncode != 0:
+    print(f"zig build-exe failed: {res.stderr}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+# --- Run: mtime + long-name legs ---
+
+vgate_run mtime -- --script '$RUN_DIR/script-m134.txt' --script-after "tasks user-el0 exited status=7" --timeout 90
+vgate_allow_rc mtime 0 1
+vgate_assert mtime serial-contains "m134-stat rc=0 mtime_sec=1700000123"
+vgate_assert mtime serial-contains "m134-name a-very-long-host-file-name-123456789.txt"
+vgate_assert mtime serial-contains "vf ls: long: host file-channel error"
+vgate_assert mtime serial-contains "vf: cat ok"
+vgate_assert mtime serial-contains "rx-m134"
+vgate_assert mtime output-contains "VF-FILE: STAT pinned-mtime.txt → file size=7 mtime=1700000123"
+# Arm the old-shape STAT switch for the next leg (test-only marker).
+vgate_assert mtime python <<'PY'
+import os
+share = os.path.join(os.environ["RUN_DIR"], "share")
+with open(os.path.join(share, ".vf-stat-v1"), "w") as f:
+    f.write("pin STAT replies to the 9-byte pre-mtime shape\n")
+PY
+
+# --- Run: old-shape peer still lists/reads/stats, mtime absent ---
+
+vgate_run oldshape -- --script '$RUN_DIR/script-m134.txt' --script-after "tasks user-el0 exited status=7" --timeout 90
+vgate_allow_rc oldshape 0 1
+vgate_assert oldshape serial-contains "m134-stat rc=0 mtime_sec=0"
+vgate_assert oldshape serial-contains "m134-name a-very-long-host-file-name-123456789.txt"
+vgate_assert oldshape serial-contains "vf: cat ok"
+vgate_assert oldshape serial-contains "rx-m134"
+vgate_assert oldshape output-contains "VF-FILE: STAT pinned-mtime.txt → file size=7 (v1 shape)"
+vgate_assert oldshape python <<'PY'
+import os
+share = os.path.join(os.environ["RUN_DIR"], "share")
+os.remove(os.path.join(share, ".vf-stat-v1"))
+PY

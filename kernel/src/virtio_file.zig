@@ -68,8 +68,10 @@ const directory = @import("directory.zig");
 pub const metadata = @import("fs_metadata.zig");
 pub const MetadataRoot = virtio_fs.Root;
 
-/// The legacy custom channel has neither honest attrs nor pinned lookups.
-/// It explicitly refuses B3; never fall back to its path STAT/READ.
+/// The legacy custom channel has neither pinned lookups nor object
+/// identity, so B3 keeps refusing through it (ops == null). M134a (#2759)
+/// admits the one honest answer the channel CAN give — file_table's op-0
+/// path stat rides the channel's own STAT (mtime on a v2 reply).
 pub fn metadata_backend(root: *MetadataRoot) metadata.Backend {
     if (virtio_fs.available()) return virtio_fs.contained_backend(root);
     return .{ .context = root, .root_path = root.path, .ops = null };
@@ -238,6 +240,11 @@ fn read_le_u16(bytes: []const u8, off: usize) u16 {
     return @as(u16, bytes[off]) | (@as(u16, bytes[off + 1]) << 8);
 }
 
+fn read_le_u32(bytes: []const u8, off: usize) u32 {
+    return @as(u32, bytes[off]) | (@as(u32, bytes[off + 1]) << 8) |
+        (@as(u32, bytes[off + 2]) << 16) | (@as(u32, bytes[off + 3]) << 24);
+}
+
 fn read_le_u64(bytes: []const u8, off: usize) u64 {
     var v: u64 = 0;
     var i: usize = 0;
@@ -364,6 +371,10 @@ pub const TestFile = struct {
     /// normal failure this models (M70c-K, issue #1504: the streamed load
     /// must refuse rather than map a half-filled segment).
     stat_size: ?u64 = null,
+    /// M134a: a seeded mtime (STAT reports it as a v2-shape reply —
+    /// `has_mtime` set). Absent = the old-shape peer.
+    mtime_sec: ?u64 = null,
+    mtime_nsec: u32 = 0,
 };
 /// A caller-owned static table (never a stack literal: the slice must
 /// outlive the setter). `null` restores hardware mode; an empty slice
@@ -644,10 +655,19 @@ pub const ListResult = struct {
     status: u8 = st_host_error,
 };
 
+/// M134a (#2759): `list()`'s page of v2 snapshot rows — the callers'
+/// DirEntry shape stays (name[31]), so a host name that cannot fit is an
+/// explicit st_path_limit refusal by name, never silent truncation.
+var vf_list_scratch: directory.Snapshot = undefined;
+
 /// LIST a directory on the host share. `path` empty = the share root.
 /// Returns the reply status; rows land in `out`. Test override: serve
 /// the in-memory share table (flat root — every seeded name is a file
 /// at the root; nested paths return st_not_found).
+/// M134a (#2759): the legacy 31-byte LIST op has no kernel consumers
+/// left — every caller now rides the v2 snapshot protocol (VirtioFS's
+/// lossless readdir or the channel's dir_open/page/close). A host name
+/// past this row's 31 bytes is refused by name (st_path_limit).
 pub fn list(raw_path: []const u8, out: *ListResult) u8 {
     const path = clean_path(raw_path);
     out.* = .{};
@@ -658,10 +678,13 @@ pub fn list(raw_path: []const u8, out: *ListResult) u8 {
         const files = test_share orelse return st_host_error;
         for (files) |f| {
             if (out.count >= list_max_entries) break;
+            if (f.name.len > 31) {
+                out.status = st_path_limit;
+                return st_path_limit;
+            }
             var e = DirEntry{};
-            const nlen = @min(f.name.len, e.name.len);
-            @memcpy(e.name[0..nlen], f.name[0..nlen]);
-            e.name_len = nlen;
+            @memcpy(e.name[0..f.name.len], f.name);
+            e.name_len = f.name.len;
             e.type = if (f.is_dir) dir_type_dir else dir_type_file;
             e.size = if (f.is_dir) 0 else f.data.len;
             out.entries[out.count] = e;
@@ -670,18 +693,27 @@ pub fn list(raw_path: []const u8, out: *ListResult) u8 {
         out.status = st_ok;
         return st_ok;
     }
-    if (prefer_fuse()) {
-        const status = virtio_fs.list(path, @ptrCast(out.entries[0..]), &out.count);
-        out.status = status;
-        return status;
-    }
-    const n = exchange(op_list, 0, path, &vf_reply_buf) orelse return st_host_error;
-    const rep = decode_reply(vf_reply_buf[0..n]);
-    out.status = rep.status;
-    if (rep.status != st_ok) return rep.status;
-    var off: usize = 0;
-    while (off + entry_row_len <= rep.data.len and out.count < list_max_entries) : (off += entry_row_len) {
-        out.entries[out.count] = decode_entry_row(rep.data[off .. off + entry_row_len]);
+    const saved = vf_lock.lock();
+    defer vf_lock.unlock(saved);
+    const status = if (prefer_fuse())
+        virtio_fs.snapshot(path, &vf_list_scratch)
+    else
+        snapshot_exchange_seq(path, &vf_list_scratch);
+    out.status = status;
+    if (status != st_ok) return status;
+    for (vf_list_scratch.entries[0..vf_list_scratch.count]) |entry| {
+        if (out.count >= list_max_entries) break;
+        if (entry.name_len > 31) {
+            out.status = st_path_limit;
+            return st_path_limit;
+        }
+        var e = DirEntry{};
+        const nlen: usize = entry.name_len;
+        @memcpy(e.name[0..nlen], entry.name[0..nlen]);
+        e.name_len = nlen;
+        e.type = if (entry.is_dir != 0) dir_type_dir else dir_type_file;
+        e.size = entry.size;
+        out.entries[out.count] = e;
         out.count += 1;
     }
     return st_ok;
@@ -754,6 +786,13 @@ pub fn snapshot(raw_path: []const u8, out: *directory.Snapshot) u8 {
     if (virtio_fs.available()) return virtio_fs.snapshot(path, out);
     const saved = vf_lock.lock();
     defer vf_lock.unlock(saved);
+    return snapshot_exchange_seq(path, out);
+}
+
+/// The legacy channel's dir_open/page/close snapshot sequence; the
+/// caller holds `vf_lock` (snapshot() above; list() reuses it so the
+/// 31-byte LIST wire op keeps no kernel consumer).
+fn snapshot_exchange_seq(path: []const u8, out: *directory.Snapshot) u8 {
     const opened = snapshot_exchange(op_dir_open, path) orelse return st_host_error;
     if (opened.status != st_ok) return opened.status;
     if (opened.data.len != 8) return st_host_error;
@@ -806,11 +845,41 @@ test "B2: legacy backend v2 rows and EOF decode losslessly and fail closed" {
     try std.testing.expectEqual(st_host_error, decode_snapshot_page(bytes, 0, &snapshot_rows));
 }
 
-/// STAT a path: size, type. Returns the reply status.
+/// M134a (#2759): STAT reply data lengths — v1 is [size u64le][type u8]
+/// (9 B); v2 appends [mtime_sec u64le][mtime_nsec u32le] (21 B total).
+/// An old-shape reply decodes with `has_mtime == false`: the named
+/// "mtime absent", never a fabricated timestamp.
+pub const stat_data_v1_len: usize = 9;
+pub const stat_data_v2_len: usize = 21;
+
+/// Decode STAT reply data into `out`: both the 9-byte pre-mtime shape
+/// and the 21-byte M134a shape are accepted; a short or mid-length reply
+/// still yields size/type and reports mtime absent.
+pub fn decode_stat_reply(data: []const u8, out: *StatResult) void {
+    if (data.len >= stat_data_v1_len) {
+        out.size = read_le_u64(data, 0);
+        out.is_dir = data[8] == dir_type_dir;
+    }
+    if (data.len >= stat_data_v2_len) {
+        out.mtime_sec = read_le_u64(data, 9);
+        out.mtime_nsec = read_le_u32(data, 17);
+        out.has_mtime = true;
+    }
+}
+
+/// STAT a path: size, type, and — on a v2 reply — the host file's mtime.
+/// Returns the reply status.
 pub const StatResult = struct {
     status: u8 = st_host_error,
     size: u64 = 0,
     is_dir: bool = false,
+    /// M134a: the host file's modification time (epoch seconds +
+    /// nanoseconds) when the reply carries the v2 shape. `has_mtime`
+    /// names the absent case — the old 9-byte reply shape or a backend
+    /// fast path that carries no timestamps.
+    mtime_sec: u64 = 0,
+    mtime_nsec: u32 = 0,
+    has_mtime: bool = false,
 };
 
 pub fn stat(raw_path: []const u8, out: *StatResult) u8 {
@@ -825,6 +894,9 @@ pub fn stat(raw_path: []const u8, out: *StatResult) u8 {
                 out.status = st_ok;
                 out.size = if (f.is_dir) 0 else (f.stat_size orelse f.data.len);
                 out.is_dir = f.is_dir;
+                out.mtime_sec = f.mtime_sec orelse 0;
+                out.mtime_nsec = f.mtime_nsec;
+                out.has_mtime = f.mtime_sec != null;
                 return st_ok;
             }
         }
@@ -844,10 +916,7 @@ pub fn stat(raw_path: []const u8, out: *StatResult) u8 {
     const rep = decode_reply(vf_reply_buf[0..n]);
     out.status = rep.status;
     if (rep.status != st_ok) return rep.status;
-    if (rep.data.len >= 9) {
-        out.size = read_le_u64(rep.data, 0);
-        out.is_dir = rep.data[8] == dir_type_dir;
-    }
+    decode_stat_reply(rep.data, out);
     return st_ok;
 }
 
@@ -1994,4 +2063,59 @@ test "virtio_file: #2495 — a timed-out mutation parks once and never resubmits
     try testing.expectEqual(@as(u32, 1), vf_park_count);
     try testing.expectEqual(@as(u32, 0), vf_resubmit_count);
     try testing.expectEqual(@as(u16, 1), virtio_custom.parked_count);
+}
+
+test "M134a: STAT reply decode accepts the old and new lengths" {
+    var out: StatResult = .{};
+    // Old shape — [size][type], mtime absent and named.
+    var v1: [stat_data_v1_len]u8 = @splat(0);
+    write_le_u64(&v1, 0, 4096);
+    v1[8] = dir_type_dir;
+    decode_stat_reply(&v1, &out);
+    try testing.expectEqual(@as(u64, 4096), out.size);
+    try testing.expect(out.is_dir);
+    try testing.expect(!out.has_mtime);
+
+    // New shape — [size][type][mtime_sec][mtime_nsec].
+    out = .{};
+    var v2: [stat_data_v2_len]u8 = @splat(0);
+    write_le_u64(&v2, 0, 7);
+    v2[8] = dir_type_file;
+    write_le_u64(&v2, 9, 1_700_000_123);
+    v2[17] = 0xB1;
+    v2[18] = 0x68;
+    v2[19] = 0xDE;
+    v2[20] = 0x3A; // 987_654_321
+    decode_stat_reply(&v2, &out);
+    try testing.expectEqual(@as(u64, 7), out.size);
+    try testing.expect(!out.is_dir);
+    try testing.expect(out.has_mtime);
+    try testing.expectEqual(@as(u64, 1_700_000_123), out.mtime_sec);
+    try testing.expectEqual(@as(u32, 987_654_321), out.mtime_nsec);
+
+    // Mid-length (neither old nor new) still yields size/type with
+    // mtime absent.
+    out = .{};
+    var mid: [12]u8 = @splat(0);
+    write_le_u64(&mid, 0, 3);
+    mid[8] = dir_type_file;
+    decode_stat_reply(&mid, &out);
+    try testing.expectEqual(@as(u64, 3), out.size);
+    try testing.expect(!out.has_mtime);
+}
+
+test "M134a: list refuses a >31-byte name by name, never truncates" {
+    var long_name: [40]u8 = @splat('x');
+    const files = [_]TestFile{
+        .{ .name = "short.txt", .data = "s" },
+        .{ .name = long_name[0..], .data = "x" },
+    };
+    set_test_share(&files);
+    defer set_test_share(null);
+    var res: ListResult = .{};
+    try testing.expectEqual(st_path_limit, list("", &res));
+    try testing.expectEqual(st_path_limit, res.status);
+    // Names that fit the row still list — only the overlong one refuses.
+    try testing.expectEqual(@as(usize, 1), res.count);
+    try testing.expectEqualStrings("short.txt", res.entries[0].name[0..res.entries[0].name_len]);
 }

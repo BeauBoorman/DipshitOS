@@ -475,4 +475,35 @@ final class VFWireTests: XCTestCase {
         XCTAssertEqual(h2, handles[0], "freed slot must be reused")
         _ = table.close(h2)
     }
+
+    /// M134a — STAT encoding carries mtime_sec/mtime_nsec in the 21-byte
+    /// shape and round-trips through the decoder.
+    func testStatEncodeWithMtime() {
+        let d = VFWire.encodeStatData(size: 7, isDir: false, mtimeSec: 1_700_000_123, mtimeNsec: 987_654_321, includeMtime: true)
+        XCTAssertEqual(d.count, VFWire.statDataLen)
+        let dec = VFWire.decodeStatData(d)
+        XCTAssertEqual(dec?.size, 7)
+        XCTAssertEqual(dec?.isDir, false)
+        XCTAssertEqual(dec?.mtimeSec, 1_700_000_123)
+        XCTAssertEqual(dec?.mtimeNsec, 987_654_321)
+    }
+
+    /// M134a — the old-shape encoding stays 9 bytes and an old peer's
+    /// decoder sees mtime absent (named), not fabricated.
+    func testStatEncodeWithoutMtimeOldPeerDecode() {
+        let d = VFWire.encodeStatData(size: 4096, isDir: true, mtimeSec: 0, mtimeNsec: 0, includeMtime: false)
+        XCTAssertEqual(d.count, VFWire.statBaseDataLen)
+        let dec = VFWire.decodeStatData(d)
+        XCTAssertEqual(dec?.size, 4096)
+        XCTAssertEqual(dec?.isDir, true)
+        XCTAssertNil(dec?.mtimeSec)
+        XCTAssertNil(dec?.mtimeNsec)
+        // A mid-length reply (neither shape) still yields size/type with
+        // mtime absent — the same tolerance the guest decoder has.
+        let mid = VFWire.decodeStatData(Array(d[0..<9]) + [1, 2, 3])
+        XCTAssertEqual(mid?.size, 4096)
+        XCTAssertNil(mid?.mtimeSec)
+        // Shorter than the base record decodes to nil.
+        XCTAssertNil(VFWire.decodeStatData([1, 2, 3]))
+    }
 }

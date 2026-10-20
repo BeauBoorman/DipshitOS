@@ -2168,7 +2168,7 @@ fn handle_fs_metadata(args: Args, _: *exceptions.VectorFrame) u64 {
     const result: i64 = switch (args[0]) {
         meta.stat_op, meta.identity_op => blk: {
             var value: meta.Wire = undefined;
-            const rc = file_table.metadata_at(pid, root_path, path, &value);
+            const rc = file_table.metadata_at(pid, root_path, path, args[0] == meta.identity_op, &value);
             if (rc < 0) break :blk rc;
             const bytes = if (args[0] == meta.identity_op) std.mem.asBytes(&value.identity) else std.mem.asBytes(&value);
             if (uaccess.copy_out(args[5], bytes, bytes.len) != .ok) return error_result(.efault);

@@ -217,6 +217,33 @@ pub const WireTime = extern struct {
     nanoseconds: u32,
     reserved: u32 = 0,
 };
+
+/// M134a (#2759): the /host path-stat's filesystem word over the legacy
+/// file channel — nonzero per the wire contract, stable for the armed
+/// share's lifetime (one boot). The high bit keeps it out of VirtioFS's
+/// mount-generation counter space forever.
+pub const legacy_share_epoch: u64 = 0x8000_0000_0000_0001;
+
+/// M134a (#2759): the honest /host stat record the legacy file channel
+/// can produce — a path stat synthesized from the channel's own STAT
+/// reply. `inode` 0 names the channel's absent object identity (never
+/// a fabricated id); `atime`/`ctime` are absent on this channel and read
+/// as zero, like `.disk`'s honest no-atime. `host_mode` is a statement
+/// of shape (a regular file or a directory), not a policy claim; uid/gid
+/// are unknown.
+pub fn wireFromHostStat(size: u64, is_dir: bool, mtime_sec: u64, mtime_nsec: u32, has_mtime: bool) Wire {
+    return .{
+        .kind = if (is_dir) .directory else .file,
+        .identity = .{ .filesystem = legacy_share_epoch, .inode = 0 },
+        .size = size,
+        .atime = .{ .seconds = 0, .nanoseconds = 0 },
+        .mtime = .{ .seconds = @bitCast(if (has_mtime) mtime_sec else @as(u64, 0)), .nanoseconds = if (has_mtime) mtime_nsec else 0 },
+        .ctime = .{ .seconds = 0, .nanoseconds = 0 },
+        .host_mode = if (is_dir) 0o040755 else 0o100644,
+        .host_uid = 0,
+        .host_gid = 0,
+    };
+}
 /// Host attributes are facts, never guest ownership/capabilities.
 pub const Wire = extern struct {
     version: u32 = 1,

@@ -22,6 +22,14 @@ import Virtualization
 var fileHandleTable = FileHandleTable()
 var directoryTable = DirectoryTable()
 
+/// M134a (#2759) test-only switch: a `.vf-stat-v1` marker file at the
+/// share root (or `VIRELAI_VF_STAT_V1` in the environment) pins STAT
+/// replies to the pre-mtime 9-byte shape — the old-peer leg.
+func vfStatLegacyShape(root: URL) -> Bool {
+    if ProcessInfo.processInfo.environment["VIRELAI_VF_STAT_V1"] != nil { return true }
+    return FileManager.default.fileExists(atPath: root.appendingPathComponent(".vf-stat-v1").path)
+}
+
 #if SPIKE
 
 @available(macOS 27.0, *)
@@ -186,12 +194,13 @@ extension CustomVirtioSpikeDeviceDelegate {
             return
         }
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-        var data: [UInt8] = []
-        var s = size
-        for _ in 0..<8 { data.append(UInt8(s & 0xff)); s >>= 8 }
-        data.append(isDir.boolValue ? VFWire.dirTypeDir : VFWire.dirTypeFile)
+        let ti = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let sec = UInt64(max(0, ti))
+        let nsec = UInt32(max(0, min(999_999_999, (ti - floor(ti)) * 1_000_000_000)))
+        let includeMtime = !vfStatLegacyShape(root: root)
+        let data = VFWire.encodeStatData(size: size, isDir: isDir.boolValue, mtimeSec: sec, mtimeNsec: nsec, includeMtime: includeMtime)
         writeFileReply(element: element, status: VFWire.stOk, data: data)
-        print("VF-FILE: STAT \(path) → \(isDir.boolValue ? "dir" : "file") size=\(size)")
+        print("VF-FILE: STAT \(path) → \(isDir.boolValue ? "dir" : "file") size=\(size)\(includeMtime ? " mtime=\(sec)" : " (v1 shape)")")
     }
 
     /// READ at an explicit offset (stateless): open, seek, read a chunk

@@ -70,6 +70,54 @@ public enum VFWire {
     public static let listMaxEntries = 128
     public static let entryRowLen = 40 // [name 31][type u8][size u64le]
     public static let readOffsetLen = 8
+    // M134a (#2759): STAT reply data — v1 is [size u64le][type u8] (9 B);
+    // v2 appends [mtime_sec u64le][mtime_nsec u32le] (21 B total).
+    public static let statBaseDataLen = 9
+    public static let statDataLen = 21
+
+    /// STAT reply data, both shapes. `mtimeSec == nil` names the absent
+    /// case — a pre-M134a 9-byte reply or a deliberately old-shaped peer.
+    public struct StatData {
+        public let size: UInt64
+        public let isDir: Bool
+        public let mtimeSec: UInt64?
+        public let mtimeNsec: UInt32?
+    }
+
+    /// Encode STAT reply data; `includeMtime` selects the v2 (21-byte)
+    /// shape, `false` the pre-M134a 9-byte shape an old guest expects.
+    public static func encodeStatData(size: UInt64, isDir: Bool, mtimeSec: UInt64, mtimeNsec: UInt32, includeMtime: Bool) -> [UInt8] {
+        var out: [UInt8] = []
+        var s = size
+        for _ in 0..<8 { out.append(UInt8(s & 0xff)); s >>= 8 }
+        out.append(isDir ? dirTypeDir : dirTypeFile)
+        if includeMtime {
+            var sec = mtimeSec
+            for _ in 0..<8 { out.append(UInt8(sec & 0xff)); sec >>= 8 }
+            var ns = mtimeNsec
+            for _ in 0..<4 { out.append(UInt8(ns & 0xff)); ns >>= 8 }
+        }
+        return out
+    }
+
+    /// Decode STAT reply data, accepting the old (>=9) and new (>=21)
+    /// lengths — the same tolerance the guest's decode_stat_reply has.
+    /// nil when the data is shorter than the base record.
+    public static func decodeStatData(_ data: [UInt8]) -> StatData? {
+        guard data.count >= statBaseDataLen else { return nil }
+        var size: UInt64 = 0
+        for i in 0..<8 { size |= UInt64(data[i]) << (8 * i) }
+        var mtime: (UInt64, UInt32)? = nil
+        if data.count >= statDataLen {
+            var sec: UInt64 = 0
+            for i in 0..<8 { sec |= UInt64(data[9 + i]) << (8 * i) }
+            var ns: UInt32 = 0
+            for i in 0..<4 { ns |= UInt32(data[17 + i]) << (8 * i) }
+            mtime = (sec, ns)
+        }
+        return StatData(size: size, isDir: data[8] == dirTypeDir,
+                        mtimeSec: mtime?.0, mtimeNsec: mtime?.1)
+    }
     // HF3 scalar field lengths + the handle-table cap (parity with the
     // kernel's file_table.zig — max_handles_per_process = 8).
     public static let handleLen = 2

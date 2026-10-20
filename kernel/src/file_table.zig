@@ -759,7 +759,7 @@ fn join_metadata(root: []const u8, relative: []const u8, out: []u8) metadata.Err
     return out[0..len];
 }
 
-pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, out: *metadata.Wire) i64 {
+pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, identity_only: bool, out: *metadata.Wire) i64 {
     if (pid >= process.max_processes) return -1;
     const disk_root = disk_metadata_root(root_bytes) catch |err| return metadata_errno(err);
     const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
@@ -773,7 +773,28 @@ pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, out: 
     }
     var root = virtio_file.MetadataRoot{ .path = root_path };
     var auth = MetadataAuth{ .pid = pid, .root = root_path };
-    const value = metadata.stat(virtio_file.metadata_backend(&root), auth.authorizer(), relative) catch |err| return metadata_errno(err);
+    const backend = virtio_file.metadata_backend(&root);
+    if (backend.ops == null) {
+        // M134a (#2759): the legacy channel cannot pin a B3 object, but
+        // op 0's path stat is honest without one — /host answers through
+        // the channel's own STAT. identity.filesystem names the share's
+        // mount lifetime; inode 0 names the channel's absent object
+        // identity (never fabricated). op 1 keeps refusing: a zero-inode
+        // identity is no identity.
+        if (identity_only) return -4;
+        if (!virtio_file.available()) return -4;
+        MetadataAuth.check(&auth, relative, .metadata) catch |err| return metadata_errno(err);
+        var st = virtio_file.StatResult{};
+        const status = virtio_file.stat(joined, &st);
+        if (status != virtio_file.st_ok) return switch (status) {
+            virtio_file.st_not_found => -6,
+            virtio_file.st_path_limit => -8,
+            else => -1,
+        };
+        out.* = metadata.wireFromHostStat(st.size, st.is_dir, st.mtime_sec, st.mtime_nsec, st.has_mtime);
+        return 0;
+    }
+    const value = metadata.stat(backend, auth.authorizer(), relative) catch |err| return metadata_errno(err);
     out.* = metadata.Wire.from(value);
     return 0;
 }
@@ -2252,7 +2273,12 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
     // M34 HF4: LIST the share through the file channel; the vf row shape
     // (name / size / is_dir) maps 1:1 onto the frozen 40-byte DirEntry.
     var lr = virtio_file.ListResult{};
-    if (virtio_file.list(subpath, &lr) != virtio_file.st_ok) return -6;
+    const lst = virtio_file.list(subpath, &lr);
+    // M134a (#2759): LIST's last consumer rides the v2 snapshot path —
+    // a >31-byte host name refuses by name (st_path_limit); the frozen
+    // 40-byte row cannot carry it, so ENAMETOOLONG is the honest answer,
+    // never a silently truncated name.
+    if (lst != virtio_file.st_ok) return if (lst == virtio_file.st_path_limit) -8 else -6;
     const take = @min(lr.count, out_entries.len);
     var i: usize = 0;
     while (i < take) : (i += 1) {
@@ -3456,7 +3482,7 @@ test "file_table: absent VLFS volume refuses /disk by name, share-only" {
     try std.testing.expectEqual(@as(i64, -6), dir_open(0, "/disk"));
     var wire: metadata.Wire = undefined;
     // The slot-79 surface mirrors the host channel's own dead-backend answer.
-    try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", &wire));
+    try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", false, &wire));
     try std.testing.expectEqual(@as(i64, -4), pin_open(0, "/disk", ""));
     // The share still works (host-availability governs its own refusal).
     try std.testing.expectEqual(@as(i64, -6), open(0, "test.txt", MODE_READ)); // no host channel in tests
@@ -3523,12 +3549,12 @@ test "file_table: mounted VLFS serves open/read/stat/readdir on /disk" {
 
     // Slot 79: stat/identity through the real ContainedOps backend.
     var wire: metadata.Wire = undefined;
-    try std.testing.expectEqual(@as(i64, 0), metadata_at(0, "/disk", "APPLE.TXT", &wire));
+    try std.testing.expectEqual(@as(i64, 0), metadata_at(0, "/disk", "APPLE.TXT", false, &wire));
     try std.testing.expectEqual(metadata.Kind.file, wire.kind);
     try std.testing.expectEqual(@as(u64, 4113), wire.size);
-    try std.testing.expectEqual(@as(i64, 0), metadata_at(0, "/disk/DOCS", "DEEP", &wire));
+    try std.testing.expectEqual(@as(i64, 0), metadata_at(0, "/disk/DOCS", "DEEP", false, &wire));
     try std.testing.expectEqual(metadata.Kind.directory, wire.kind);
-    try std.testing.expectEqual(@as(i64, -6), metadata_at(0, "/disk", "NOPE.TXT", &wire));
+    try std.testing.expectEqual(@as(i64, -6), metadata_at(0, "/disk", "NOPE.TXT", false, &wire));
 
     // Contained open: read streams through the backend handle; write denies.
     const cfd = contained_open(0, "/disk", "CHAINED.BIN", false);
@@ -3586,7 +3612,7 @@ test "file_table: /disk refusals are names, not crashes" {
     try std.testing.expectEqualStrings("not_vlfs", vlfs_disk.last_refusal.?);
     try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/APPLE.TXT", MODE_READ));
     var wire: metadata.Wire = undefined;
-    try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", &wire));
+    try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", false, &wire));
 }
 
 // TEMP REPRO — writable mount + selftest's exact mkdir/open sequence.
