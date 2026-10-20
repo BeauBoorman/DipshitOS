@@ -145,8 +145,50 @@ func stubExecInner(t *testing.T, wait func(int64, int64) (int64, error), probe f
 	return killed
 }
 
+// TestExecSlowChildGetsRunBudget is the #2522 pin: a pid confirmed
+// Running when the appear budget expires gets the work-scaled run
+// budget, not a kill — the ~21 s fresh-share clone must not die at 15 s.
+func TestExecSlowChildGetsRunBudget(t *testing.T) {
+	var budgets []int64
+	killed := stubExecInner(t,
+		func(_ int64, budget int64) (int64, error) {
+			budgets = append(budgets, budget)
+			if len(budgets) == 1 {
+				return -1, vi.ErrWaitGone
+			}
+			return 0, nil
+		},
+		func(int64) (int64, int) { return -1, vi.ProbeRunning })
+	st, err := execFn("FLINT.ELF", "clone")
+	if err != nil || st != 0 {
+		t.Fatalf("execFn = (%d, %v), want (0, nil)", st, err)
+	}
+	if len(budgets) != 2 || budgets[0] != execAppearNs || budgets[1] != execRunNs {
+		t.Fatalf("wait budgets = %v, want [%d %d]", budgets, execAppearNs, execRunNs)
+	}
+	if len(*killed) != 0 {
+		t.Fatalf("kill called on a slow-but-running child: %v", *killed)
+	}
+}
+
+func TestExecExpiredProbeExitedReturnsStatus(t *testing.T) {
+	// A child that exits between WaitBudget's last poll and the
+	// phase-check probe reports its recorded status, not ErrWaitGone.
+	waits := 0
+	killed := stubExecInner(t,
+		func(int64, int64) (int64, error) { waits++; return -1, vi.ErrWaitGone },
+		func(int64) (int64, int) { return 7, vi.ProbeExited })
+	st, err := execFn("FLINT.ELF", "clone")
+	if err != nil || st != 7 {
+		t.Fatalf("execFn = (%d, %v), want (7, nil)", st, err)
+	}
+	if waits != 1 || len(*killed) != 0 {
+		t.Fatalf("waits=%d killed=%v, want waits=1 killed=[]", waits, *killed)
+	}
+}
+
 func TestExecKillOnWaitTimeout(t *testing.T) {
-	// A child that outlives execWaitNs is armed for kill and drained:
+	// A child that outlives BOTH budgets is armed for kill and drained:
 	// the orphan cannot leak a task-pool slot into the retry's spawn
 	// (#2402's timed-out FLINT clone starving attempt 2 into newosproc).
 	probes := 0
@@ -174,6 +216,8 @@ func TestExecKillOnWaitTimeout(t *testing.T) {
 func TestExecKillDrainsAbsentPid(t *testing.T) {
 	// The never-registered pid burns the budget the same way; Kill on it
 	// refuses EINVAL (ignored) and the drain exits on the first Absent.
+	// The phase-check probe after the appear budget is the first of the
+	// two observed probes; the drain's own first Absent is the second.
 	probes := 0
 	stubExecInner(t,
 		func(int64, int64) (int64, error) { return -1, vi.ErrWaitGone },
@@ -184,8 +228,8 @@ func TestExecKillDrainsAbsentPid(t *testing.T) {
 	if _, err := execFn("FLINT.ELF", "pull"); !errors.Is(err, vi.ErrWaitGone) {
 		t.Fatalf("execFn err = %v, want ErrWaitGone", err)
 	}
-	if probes != 1 {
-		t.Fatalf("drain probes = %d, want 1", probes)
+	if probes != 2 {
+		t.Fatalf("probes = %d, want 2 (phase check + drain)", probes)
 	}
 }
 

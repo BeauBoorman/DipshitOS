@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"strings"
 
 	"virelai/sshlib"
@@ -16,13 +17,51 @@ import (
 // three runtimes at worst, and the child's `flint:` lines still reach the
 // console for evidence — the named refusal prints, STORE just cannot
 // re-read it, so a nonzero exit maps to sync_failed.
-// execWaitNs bounds one child wait. The default Wait budget is 120 s —
-// far longer than a foreground FLINT verb ever runs — and a spawned pid
-// that the reclamation race loses ("wait failed" — the pid never enters
-// the registry) would burn the entire budget into ErrWaitGone; two of
-// those outrun a 180 s gate run before a refusal can print. Fifteen
-// seconds is generous for the verbs store spawns.
-const execWaitNs = int64(15) * int64(1e9)
+// The wait is TWO bounds, not one, because ErrWaitGone conflates two
+// different children (#2522):
+//
+//   - execAppearNs bounds the spawn race: a pid the task-pool
+//     reclamation loses never enters the registry ("wait failed"), and
+//     WaitBudget polls it Absent until the deadline — the budget is the
+//     only thing keeping two lost spawns from outrunning a 180 s gate
+//     run before a refusal can print. A pid that never appears in 15 s
+//     is not coming.
+//   - execRunNs bounds a child CONFIRMED running in the registry — a
+//     real wait on real work. It is derived from the protocol's payload
+//     bound, not a wall-clock guess: every verb STORE spawns is
+//     history-shaped. clone/pull fetch+verify the stream in
+//     ceil(MaxChanges/flintReadPage) wire round-trips with one signature
+//     check per Change; `verify --all --trusted` runs the same check
+//     locally. execOverheadNs covers runtime spawn + dial + hello/auth
+//     + open — the dominant term observed: the #2522 fresh-share clone
+//     of a 4-Change stream lands `clone ok` ~21 s after exec on loaded
+//     AND quiet hosts (multi-second relay round-trips), while the old
+//     15 s bound killed it mid-flight and the orphan's slots starved
+//     the retry into newosproc.
+const execAppearNs = int64(15) * int64(1e9)
+
+const (
+	// flintReadPage mirrors flint's defaultReadLimit (remote.go): wire
+	// reads page 256 Changes, so the protocol-bounded history fetch is
+	// ceil(4096/256) = 16 round-trips.
+	flintReadPage = 256
+	// execOverheadNs is the fixed cost — Go runtime spawn, dial, and the
+	// hello/auth/open round — at ~1.5x the observed ~21 s quiet-host
+	// clone of a 4-Change stream.
+	execOverheadNs = int64(30) * int64(1e9)
+	// execPerPageNs bounds one `read` page round-trip through the
+	// runner's relay (observed stalls run seconds per connection).
+	execPerPageNs = int64(5) * int64(1e9)
+	// execPerChangeNs bounds one Change's parse + keyring check +
+	// Ed25519 verify on the guest.
+	execPerChangeNs = int64(5) * int64(1e6)
+	// execRunNs = 30 s + 16*5 s + 4096*5 ms = ~130 s: a ceiling, not a
+	// prediction, and it stretches as a stream's history grows toward
+	// MaxChanges rather than expiring mid-clone.
+	execRunNs = execOverheadNs +
+		int64((MaxChanges+flintReadPage-1)/flintReadPage)*execPerPageNs +
+		int64(MaxChanges)*execPerChangeNs
+)
 
 // killDrainTicks bounds the probe drain after a timed-out child is
 // killed. sys_kill only ARMS the exit — it fires at the child's next
@@ -47,9 +86,26 @@ var execFn = func(name string, args ...string) (int64, error) {
 	if err != nil {
 		return -1, err
 	}
-	status, err := waitBudgetFn(pid, execWaitNs)
+	status, err := waitBudgetFn(pid, execAppearNs)
 	if err == nil {
 		return status, nil
+	}
+	if errors.Is(err, vi.ErrWaitGone) {
+		// Expiry with a live registry row is a slow child doing real
+		// work, not the spawn race — concede only after the work-scaled
+		// run budget. ProbeExited means the child left between
+		// WaitBudget's last poll and now; Absent means the spawn was
+		// lost (or a sub-tick vanish — the same kill+drain+retry path).
+		st, state := probeFn(pid)
+		switch state {
+		case vi.ProbeExited:
+			return st, nil
+		case vi.ProbeRunning:
+			status, err = waitBudgetFn(pid, execRunNs)
+			if err == nil {
+				return status, nil
+			}
+		}
 	}
 	// ErrWaitGone with a live child leaves an orphan holding task-pool
 	// slots — observed on #2402's ~21 s FLINT clone: the timed-out verb
