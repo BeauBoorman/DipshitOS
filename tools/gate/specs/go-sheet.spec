@@ -37,6 +37,19 @@
 #           re-execs — `gosheet: state restored` reports cells=2 and the
 #           saved cursor+scroll.
 #
+# M142c (issue #2791) acceptance — run 07 is the card's journey, and
+# vgate_repeat 3 runs EVERY leg three times: type cells (a number, a
+# formula that recalcs, a comma-bearing string the codec must quote),
+# ctrl-s exports through the picker as ACC.CSV, GOEDIT.ELF reopens the
+# file (`goedit: read` is the receipt), and a host-side byte-compare
+# proves ACC.CSV is the host-computed CSV verbatim.
+#
+# REPEAT SEMANTICS: the armed share persists across iterations, so each
+# leg must be iteration-safe (the go-vault convention). Runs 01-04 keep
+# their state in the per-boot guest — nothing carries. Runs 05 and 07
+# `vf rm` their export target before exec so a stale file cannot pass the
+# byte-compare; run 06 already resets SESSION.TABS/GOTABWM.DEMO.
+#
 # The clipboard legs need CAP_CLIPBOARD: `exec -u0` is the capable path —
 # an exec'd app under the tabbed seat runs uid_user without caps (the
 # go-edit.spec run-06 convention). The FilePicker and save_state need no
@@ -45,14 +58,16 @@
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-gosheet.sh   ->  .build/go/GOSHEET.ELF
 #   bash tools/go/build-gotabwm.sh   ->  .build/go/GOTABWM.ELF  (run 06)
+#   bash tools/go/build-goedit.sh    ->  .build/go/GOEDIT.ELF   (run 07)
 #
 # exec-order: assert-proven -- each run ends on an rx- marker only its script
 # prints, and the stage gates forward on the app's own `gosheet:` markers; a
 # program that never ran cannot pass.
 
-vgate_name go-sheet "issue #2789 M142a: a Go spreadsheet recalculates a SUM on edit and refuses a cycle with #CYCLE, probed on pixels"
+vgate_name go-sheet "issues #2789/#2790/#2791 M142: a Go spreadsheet recalculates a SUM on edit, refuses a cycle with #CYCLE, round-trips RFC 4180 CSV through the picker + text/csv clipboard + save_state, and lands the K=3 edit/export/reopen-in-GOEDIT acceptance"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
+vgate_repeat 3
 
 vgate_file script.txt <<'EOF'
 exec GOSHEET.ELF
@@ -80,8 +95,14 @@ if not os.path.exists(seat):
     sys.exit("GOTABWM.ELF missing (expected " + seat + ") - build it first: "
              "bash tools/go/build-gotabwm.sh")
 shutil.copy(seat, os.path.join(share, "GOTABWM.ELF"))
-# Keep the seat's autostart OFF: runs 01-05 assert the bare shim's fixed
-# (64,48) window geometry and 'declare refused', and run 06 execs
+# Run 07 (M142c #2791) reopens the exported CSV in the editor.
+ed = os.path.join(".build", "go", "GOEDIT.ELF")
+if not os.path.exists(ed):
+    sys.exit("GOEDIT.ELF missing (expected " + ed + ") - build it first: "
+             "bash tools/go/build-goedit.sh")
+shutil.copy(ed, os.path.join(share, "GOEDIT.ELF"))
+# Keep the seat's autostart OFF: runs 01-05 and 07 assert the bare shim's
+# fixed (64,48) window geometry and 'declare refused', and run 06 execs
 # GOTABWM.ELF explicitly after `wm` switches the mode (the go-paint.spec
 # runs 02/03 convention).
 with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
@@ -97,7 +118,7 @@ big = b"".join(b",".join(("f%d%d" % (r, c)).encode()
                          for c in range(8)) + b"\r\n" for r in range(32))
 with open(os.path.join(share, "BIG.CSV"), "wb") as f:
     f.write(big)
-print("staged GOSHEET/GOTABWM + wm=none + SMALL.CSV (%d) BIG.CSV (%d)"
+print("staged GOSHEET/GOTABWM/GOEDIT + wm=none + SMALL.CSV (%d) BIG.CSV (%d)"
       % (len(small), len(big)))
 PY
 
@@ -473,6 +494,7 @@ PY
 # ctrl-s exports through the picker; the host-side byte-compare proves
 # OUT.CSV is BIG.CSV verbatim — the CRLF-framed round trip.
 vgate_file script-05.txt <<'EOF'
+vf rm OUT.CSV
 exec -u0 GOSHEET.ELF /host/BIG.CSV
 EOF
 
@@ -584,4 +606,89 @@ cells, top, sx = int(m.group(1)), int(m.group(3)), int(m.group(4))
 if cells != 2 or not m.group(2).startswith(b"DX") or top == 0 or sx == 0:
     sys.exit("restored marker %r fails: want cells=2 sel=DX* top>0 sx>0" % m.group(0))
 print("restored: cells=2 sel=%s top=%d sx=%d" % (m.group(2).decode(), top, sx))
+PY
+
+# --- M142c (issue #2791): the acceptance journey -----------------------------
+# run 07: edit -> export -> reopen in GOEDIT -> host byte-compare, every
+# iteration of the spec's K=3. The typed sheet is chosen so the expected
+# body exercises the codec's three write-side paths in 25 bytes:
+#   A1 <- '7'        (a number: display "7")
+#   B1 <- '=a1+a1'   (a formula: exports the DISPLAYED 14, never the raw
+#                     expression — '+' rides shift+= like run 06)
+#   C1 <- 'hi,there' (a comma-bearing string: writeCSV must quote it —
+#                     `comma` is the chord-table spelling for the literal
+#                     ',', which is the chord list's own separator)
+#   A2 <- 'done'     (a second row: the used box pads B2:C2 to empty
+#                     fields — 'done,,')
+# Expected ACC.CSV: '7,14,"hi,there"\r\ndone,,\r\n' (25 bytes).
+#
+# `vf rm ACC.CSV` keeps each iteration honest — a leftover export from the
+# previous iteration cannot mask a leg that never wrote. script2 execs
+# GOEDIT.ELF only after `gosheet: export ` lands (the file is sealed by
+# WriteFileSafe's temp+rename before the marker prints); GOEDIT's own
+# `goedit: read /host/ACC.CSV n=25` is the reopen receipt, and the python
+# assert byte-compares the share file against the host-computed CSV. The
+# run needs no CAP_CLIPBOARD — the picker path is grant-free — so a plain
+# `exec` is the honest spelling.
+vgate_file script-07.txt <<'EOF'
+vf rm ACC.CSV
+exec GOSHEET.ELF
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+exec GOEDIT.ELF /host/ACC.CSV
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+echo rx-gosheet-07
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --script '$RUN_DIR/script-07.txt' \
+    --input-chords '7,return,right,=,a,1,+,a,1,return,right,h,i,comma,t,h,e,r,e,return,left,left,down,d,o,n,e,return,ctrl-s' \
+    --input-chords-after 'gosheet: present' \
+    --input-string 'ACC.CSV
+' \
+    --input-string-after 'gosheet: pick save' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'gosheet: export ' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'goedit: read /host/ACC.CSV' \
+    --script-expect 'rx-gosheet-07' --timeout 300
+
+vgate_assert 07 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 07 serial-contains 'exec: loaded GOSHEET.ELF'
+vgate_assert 07 serial-contains 'gosheet: declare refused'
+vgate_assert 07 serial-contains 'gosheet: present'
+vgate_assert 07 serial-contains "gosheet: set A1 := '7' -> 7"
+vgate_assert 07 serial-contains "gosheet: set B1 := '=a1+a1' -> 14"
+vgate_assert 07 serial-contains "gosheet: set C1 := 'hi,there' -> hi,there"
+vgate_assert 07 serial-contains "gosheet: set A2 := 'done' -> done"
+vgate_assert 07 serial-contains 'gosheet: pick save'
+vgate_assert 07 serial-contains 'gosheet: pick save /host/ACC.CSV'
+vgate_assert 07 serial-contains 'gosheet: export /host/ACC.CSV n=25'
+vgate_assert 07 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 07 serial-contains 'goedit: declare refused'
+vgate_assert 07 serial-contains 'goedit: read /host/ACC.CSV n=25'
+vgate_assert 07 serial-contains 'goedit: present'
+vgate_assert 07 serial-contains 'rx-gosheet-07'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+
+# The acceptance compare: the armed share's ACC.CSV must be the
+# host-computed RFC 4180 body verbatim — formula cell as its displayed 14,
+# the comma string quoted, the used box's trailing holes as empty fields.
+# A stale file, a raw-formula export, or an unquoted comma all fail here.
+vgate_assert 07 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+want = b'7,14,"hi,there"\r\ndone,,\r\n'
+path = os.path.join(share, "ACC.CSV")
+got = open(path, "rb").read()
+if got != want:
+    sys.exit("ACC.CSV MISMATCH: got %d bytes %r, want %d bytes %r"
+             % (len(got), got, len(want), want))
+print("ACC.CSV is the host-computed CSV verbatim (%d bytes)" % len(got))
 PY
