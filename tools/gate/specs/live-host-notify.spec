@@ -204,7 +204,7 @@ vgate_assert 01 serial-absent '[EXC] parking:'
 # "most recent" to answer. The bare runner's click path is the same one
 # didReceive takes: emit a signed NOTIFY_FOCUS{sender} (NFOCUS-00000001)
 # which the seat verifies and turns into a real focus.
-vgate_assert 01 output-contains 'host-ui: cmd=notify-click state=performed'
+vgate_assert 01 output-contains 'host-ui: cmd=notify-click vm=1 state=performed'
 vgate_assert 01 output-contains 'host-notify: click-focus id='
 vgate_assert 01 serial-contains 'gotabwm: hostint notify-focus seq=1 id='
 vgate_assert 01 serial-contains 'gotabwm: tab focus id='

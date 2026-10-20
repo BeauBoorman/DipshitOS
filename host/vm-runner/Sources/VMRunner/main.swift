@@ -782,6 +782,10 @@ var cvcFileEnabled: Bool { cvcFileShareDir != nil }
 // pasteboard; pasteboard changeCount bumps become CLIP_IN records the
 // seat applies). OFF by default: no lane flag means no HOSTINT/ is ever
 // created and no pasteboard is ever read (D7 byte-silence).
+// M139a (#2779): the five host-integration endpoints are per-SESSION
+// state on the primary VMSession — these names keep their hundreds of
+// single-VM call sites but the storage lives on the session object the
+// registry owns (a secondary session's endpoints are its own fields).
 var hostClipboardFlag = false
 // `--host-pasteboard <name>` retargets the lane to NSPasteboard(name:) —
 // the gate/test hook so a run never clobbers the operator's .general
@@ -797,7 +801,10 @@ var hostClipInFired = false
 // M124c: a typed inject — file bytes + a negotiated mime.
 var hostClipInFile: String?
 var hostClipInMime: String?
-var hostClipboard: HostClipboard?
+var hostClipboard: HostClipboard? {
+    get { primarySession.clipboard }
+    set { primarySession.clipboard = newValue }
+}
 // M108c (#2326, ADR 0051 D4): `--host-drop` arms the file-drop lane — the
 // display view registers .fileURL, dropped files land in <share>/INBOX/
 // (≤64 MiB/file, ≤16/gesture) and each gets a signed DROP notice the seat
@@ -808,12 +815,18 @@ var hostDropFlag = false
 var hostDropFiles: [String] = []
 var hostDropAfter: String?
 var hostDropFired = false
-var hostDrop: HostDrop?
+var hostDrop: HostDrop? {
+    get { primarySession.drop }
+    set { primarySession.drop = newValue }
+}
 // M108d (#2328, ADR 0051 D5): `--host-notify` arms the notify-out lane —
 // seat toasts arrive as signed NOTIFY_OUT records and post as macOS
 // banners under the session bundle (bare runner: `no_bundle` drops).
 var hostNotifyFlag = false
-var hostNotify: HostNotify?
+var hostNotify: HostNotify? {
+    get { primarySession.notify }
+    set { primarySession.notify = newValue }
+}
 // M127d (#2602, ADR 0051 V2-D5): `--host-outbox` arms the export lane —
 // the seat signs OUTBOX records for REQ-marked payloads under
 // <share>/OUTBOX/ and the runner moves them to `--host-outbox-dir`
@@ -822,7 +835,10 @@ var hostNotify: HostNotify?
 // not a window gesture.
 var hostOutboxFlag = false
 var hostOutboxDir: String?
-var hostOutbox: HostOutbox?
+var hostOutbox: HostOutbox? {
+    get { primarySession.outbox }
+    set { primarySession.outbox = newValue }
+}
 // M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
 // headless mirror of the HostCommand bus every menu item dispatches on
 // (index thesis 1: AppKit is never driven by synthesized clicks; the bus
@@ -847,7 +863,10 @@ var hostSerialSend: String?
 // The shared lane session (ADR 0051 D2): ONE credential, ONE epoch, ONE
 // ARMED record naming every live lane — the seat adopts (epoch, mask), so
 // per-lane epochs would refuse each other stale_epoch forever.
-var hostIntSession: HostIntSession?
+var hostIntSession: HostIntSession? {
+    get { primarySession.hostInt }
+    set { primarySession.hostInt = newValue }
+}
 // Claim 0680: `--cvc-console-file <path>` captures every queue-1 guest log
 // line to a structured file (the structured console). When the file is set,
 // the host also answers the guest's "cvconsole-ready" line with a kind-3
@@ -4080,13 +4099,25 @@ let vmDelegate = VMRunnerDelegate()
 let runner = Runner(configuration: config)
 runner.vm.delegate = vmDelegate
 if hostSessionMode {
-    hostApplication = HostApplication(serialLog: serialLogPath, inspector: inspector)
+    // M139a (#2779): the menu bar's verbs route through the session
+    // router — one process-global bar acts on the key window's bus once
+    // a second window exists.
+    hostApplication = HostApplication(serialLog: serialLogPath, inspector: inspector,
+                                      menuTarget: VMSessionRegistry.shared.router)
     hostApplication?.onStop = { reason, code in stopHostSession(reason, code: code) }
 }
 // M114a (#2454): the bus every UI action dispatches through — the session
 // window's own instance when it exists, a windowless one otherwise, so
 // --host-cmd-after dispatches verbs down the identical seam the menus use.
 let commandBus = hostApplication?.commandBus ?? HostCommandBus()
+// M139a (#2779): the straight-line boot IS session 1 — adopted here so
+// the registry's dedup (`profile_in_use`), the `vm=1` receipts and the
+// fleet drain at exit cover it exactly like a `new-window` session.
+let primarySession = VMSessionRegistry.shared.adoptPrimary(
+    commandBus: commandBus, runner: runner, delegate: vmDelegate,
+    serialURL: serialURL, profile: activeProfile)
+primarySession.hostApp = hostApplication
+primarySession.window = hostApplication?.window
 // M128c (#2607): a document-launched session carries no `--profile` in
 // argv — the models' argv resolution would leave them unarmed. Arm them
 // on the clicked bundle so ⌘, and the Machine-menu verbs act on the
@@ -4753,6 +4784,10 @@ func setupDisplayWindow() {
     }
     machineView = view
     machineWindow = window
+    // M139a: the router's window lookup covers the evidence window too —
+    // a menu action lands on the session whose window is key.
+    primarySession.view = view
+    primarySession.window = window
     // M114b (#2455): --host-capture-keys rides the bus — one dispatch once
     // the view exists, so startup capture lands in the same host-ui:
     // receipt as ⌥⌘K / the toolbar pill / a --host-cmd-after trigger.
@@ -5485,11 +5520,10 @@ func noteVMEnd(_ state: VZVirtualMachine.State) {
 // of a synthesized click (index thesis 1). Each trigger fires once; the
 // dispatch itself writes the `host-ui:` receipt.
 func fireHostCmdsIfMarker(_ text: String) {
-    for i in hostCmdTriggers.indices {
-        guard !hostCmdTriggers[i].fired, text.contains(hostCmdTriggers[i].marker) else { continue }
-        hostCmdTriggers[i].fired = true
-        commandBus.dispatch(hostCmdTriggers[i].command)
-    }
+    // M139a: the shared per-session fire — the primary's list and bus.
+    // A `vm<k>:`-bound trigger fires only on session k's own scan; the
+    // `new-window@<path>` operand is staged by the shared body.
+    fireHostCmdTriggers(&hostCmdTriggers, on: commandBus, session: 1, text: text)
 }
 
 // Claim 0680 (issue #523 item 3 capstone): marker-driven snapshot requests.
@@ -5573,6 +5607,9 @@ func teeStopIsRequested() -> Bool {
 /// No-op when no tee is running (evidence mode — VZ writes the log
 /// directly).
 func drainTeeBeforeExit(_ context: String, timeout: TimeInterval = 3.0) {
+    // M139a: a run never exits with a sibling VM still flying — every
+    // exit path drains the session fleet first (bounded).
+    VMSessionRegistry.shared.shutdownAllAndWait()
     guard teeRunning else { return }
     requestTeeStop()
     if teeGroup.wait(timeout: .now() + timeout) == .timedOut {

@@ -74,6 +74,11 @@ public enum HostMenuBar {
             [Item("New Machine", .profileNew), Item("Clone This Machine", .profileClone),
              Item("Switch To", .profileSwitch, hasSubmenu: true),
              Item("Reset Boot Overlay…", .profileResetOverlay)],
+            // M139a (#2779): one process, N windows — the submenu lists
+            // the sibling bundles a new session could boot (open ones
+            // drop out; the registry's profile_in_use refusal is the
+            // same seam headlessly).
+            [Item("New Window for Profile", .newWindow, hasSubmenu: true)],
         ]),
         ("View", [
             [Item("Enter Full Screen", .fullscreen, key: "f", modifiers: [.control, .command])],
@@ -103,7 +108,14 @@ public enum HostMenuBar {
         menus.flatMap { $0.sections.flatMap { $0 } }.filter { !$0.key.isEmpty }
     }
 
-    public static func build(bus: HostCommandBus) -> NSMenu {
+    /// M139a (#2779): `target` may differ from `bus` — the multi-window
+    /// runner passes a router that forwards every dispatch/validation to
+    /// the key window's session bus, so one process-global menu bar acts
+    /// on whichever machine is frontmost. nil = the bus itself (the
+    /// single-window shape).
+    public static func build(bus: HostCommandBus, target: NSObject? = nil) -> NSMenu {
+        let resolved = target ?? bus
+        let menuDelegate = (resolved as? NSMenuDelegate) ?? bus
         let bar = NSMenu()
         for (title, sections) in menus {
             let top = NSMenuItem()
@@ -117,12 +129,16 @@ public enum HostMenuBar {
                         title: leaf.title,
                         action: #selector(HostCommandBus.dispatchItem(_:)),
                         keyEquivalent: leaf.key)
-                    item.target = bus
+                    item.target = resolved
                     item.representedObject = leaf.command
                     if !leaf.key.isEmpty { item.keyEquivalentModifierMask = leaf.modifiers }
                     if leaf.hasSubmenu {
                         let child = NSMenu(title: leaf.title)
-                        child.delegate = bus // menuNeedsUpdate lists the siblings
+                        child.delegate = menuDelegate // menuNeedsUpdate lists the siblings
+                        // M139a: the verb's wire name tags the submenu so
+                        // the bus's menuNeedsUpdate knows which sibling
+                        // list to fill (Switch To vs New Window).
+                        child.identifier = NSUserInterfaceItemIdentifier(leaf.command.rawValue)
                         item.submenu = child
                     }
                     sub.addItem(item)

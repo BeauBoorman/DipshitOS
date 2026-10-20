@@ -84,6 +84,16 @@ public final class HostProfilesModel {
     /// it per item (the item identifier carries the path); a test sets
     /// it directly.
     public var switchTarget: URL?
+    /// M139a (#2779): the bundle `new-window` opens — the "New Window for
+    /// Profile" submenu leaf sets it from its identifier; a
+    /// `--host-cmd-after <marker>:new-window@<path>` trigger sets it from
+    /// the spec's `@` operand before dispatching.
+    public var newWindowTarget: URL?
+    /// M139a: the session registry's already-open check, injected by the
+    /// runner — the "New Window for Profile" submenu drops bundles that
+    /// are already live in a window (the dispatch's `profile_in_use`
+    /// refusal is the same seam headlessly).
+    public var sessionOpenCheck: ((URL) -> Bool)?
 
     public init() {}
 
@@ -125,6 +135,20 @@ public final class HostProfilesModel {
     }
 
     public var canSwitch: Bool { armed && !switchTargets.isEmpty }
+
+    /// M139a (#2779): the "New Window for Profile" leaf set — the sibling
+    /// bundles minus any a live session already has open. Without an
+    /// injected sessionOpenCheck every sibling lists (the dispatch still
+    /// refuses a duplicate by name).
+    public var windowTargets: [URL] {
+        let open = sessionOpenCheck ?? { _ in false }
+        return switchTargets.filter { !open($0.standardizedFileURL) }
+    }
+
+    /// The submenu parent's enablement: grey when every sibling is
+    /// already open (or none exists) — there is nothing a new window
+    /// could boot.
+    public var canOpenWindow: Bool { !windowTargets.isEmpty }
 
     // MARK: The verbs.
 

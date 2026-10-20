@@ -169,7 +169,8 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         alert.runModal()
     }
 
-    public init(serialLog: String, inspector: HostInspector = HostInspector(), presentWindow: Bool = true) {
+    public init(serialLog: String, inspector: HostInspector = HostInspector(),
+                presentWindow: Bool = true, menuTarget: NSObject? = nil) {
         self.serialLog = serialLog
         self.inspector = inspector
         // M114b (#2455): the window is resizable + fullscreen-capable now;
@@ -188,7 +189,10 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         if presentWindow {
             app.setActivationPolicy(.regular)
             app.delegate = self
-            app.mainMenu = HostMenuBar.build(bus: commandBus)
+            // M139a (#2779): with a menu router injected the bar's verbs
+            // land on the key window's session bus; without one the
+            // single-window shape dispatches on this session's bus.
+            app.mainMenu = HostMenuBar.build(bus: commandBus, target: menuTarget)
             // M128c (#2607): a document-launched session already finished
             // launching — the odoc harvest in main.swift had to run the
             // launch sequence for the AppleEvent to dispatch. Re-finishing

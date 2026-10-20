@@ -46,6 +46,14 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case profileClone = "profile-clone"
     case profileResetOverlay = "profile-reset-overlay"
     case profileSwitch = "profile-switch"
+    // M139a (#2779): "New Window for Profile…" — opens a sibling
+    // `.virelaivm` in a second session window inside this process. The
+    // submenu leaf carries the target bundle in its identifier (the
+    // Switch To precedent); `--host-cmd-after` passes it as
+    // `<marker>:new-window@<path>`. One profile boots once — a second
+    // open of an already-live bundle receipts the named
+    // `profile_in_use` refusal.
+    case newWindow = "new-window"
     // View menu — M114b registers the handlers.
     case fullscreen
     case captureKeys = "capture-keys"
@@ -91,19 +99,51 @@ public enum HostCommand: String, CaseIterable, Sendable {
 /// One armed `--host-cmd-after <marker>:<verb>` instance. The verb is the
 /// suffix after the LAST colon, so serial markers may carry colons of
 /// their own (the `--host-write-after` precedent: guest markers do).
+///
+/// M139a (#2779): two optional qualifiers ride the same spec.
+/// `<verb>@<argument>` carries the dispatch's operand — `new-window`
+/// takes the target `.virelaivm` path (the menu leaf's identifier is the
+/// AppKit twin). A `vm<k>:` prefix on the marker binds the trigger to
+/// session <k> — it fires only when the marker appears in THAT session's
+/// serial stream and dispatches on that session's bus; an unbound
+/// trigger fires on whichever session's serial first shows the marker.
 public struct HostCommandTrigger {
     public let marker: String
     public let command: HostCommand
+    /// The `@`-suffix operand (`new-window`'s bundle path), nil when the
+    /// spec carried none.
+    public let argument: String?
+    /// The `vm<k>:` session binding, nil = first session whose serial
+    /// shows the marker.
+    public let session: Int?
     public var fired = false
 
     public init?(_ spec: String) {
-        guard let colon = spec.lastIndex(of: ":"),
-              let command = HostCommand(rawValue: String(spec[spec.index(after: colon)...]))
-        else { return nil }
-        let marker = String(spec[spec.startIndex..<colon])
+        guard let colon = spec.lastIndex(of: ":") else { return nil }
+        var verbText = String(spec[spec.index(after: colon)...])
+        var argument: String? = nil
+        if let at = verbText.firstIndex(of: "@") {
+            argument = String(verbText[verbText.index(after: at)...])
+            verbText = String(verbText[..<at])
+        }
+        guard let command = HostCommand(rawValue: verbText) else { return nil }
+        var head = spec[spec.startIndex..<colon]
+        var session: Int? = nil
+        // `vm<digits>:` — the session binding. A marker that merely
+        // starts with "vm" but is not vm<digits>: stays whole.
+        if head.hasPrefix("vm"), let bound = head.firstIndex(of: ":"), bound != head.startIndex {
+            let digits = head[head.index(head.startIndex, offsetBy: 2)..<bound]
+            if let n = Int(digits), n >= 1 {
+                session = n
+                head = head[head.index(after: bound)...]
+            }
+        }
+        let marker = String(head)
         guard !marker.isEmpty else { return nil }
         self.marker = marker
         self.command = command
+        self.argument = argument
+        self.session = session
     }
 }
 
@@ -162,6 +202,14 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
     /// stdout, the `host-clip:`/`host-drop:` line precedent — and tests
     /// capture it.
     public var emit: (String) -> Void
+
+    /// M139a (#2779): the session this bus belongs to — `vm=<n>` in the
+    /// receipt. The runner binds 1 on the primary session's bus and each
+    /// opened window's id on its own; a bare `HostCommandBus()` (tests,
+    /// pre-session probes) emits the session-less M114a form:
+    ///
+    ///     host-ui: cmd=<verb> vm=<n> state=<outcome>
+    public var sessionID: Int?
 
     /// M114e (#2458): the bounded MP4 recorder every bus carries — the
     /// one verb family whose handler needs nothing the runner owns: the
@@ -366,7 +414,8 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
         } else {
             outcome = .unavailable
         }
-        emit("host-ui: cmd=\(command.rawValue) state=\(outcome.rawValue)\(detail.map { " \($0)" } ?? "")")
+        let vm = sessionID.map { " vm=\($0)" } ?? ""
+        emit("host-ui: cmd=\(command.rawValue)\(vm) state=\(outcome.rawValue)\(detail.map { " \($0)" } ?? "")")
         return outcome
     }
 
@@ -387,18 +436,34 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
         dispatch(.profileSwitch)
     }
 
+    /// M139a (#2779): a "New Window for Profile" submenu leaf — the same
+    /// identifier-carries-the-path shape, dispatched as `new-window`.
+    @objc public func dispatchNewWindowItem(_ item: NSMenuItem) {
+        if let path = item.identifier?.rawValue {
+            profiles.newWindowTarget = URL(fileURLWithPath: path, isDirectory: true)
+        }
+        dispatch(.newWindow)
+    }
+
     /// M128b (#2606): the "Switch To" submenu rebuilds at every open —
     /// one leaf per sibling `.virelaivm` bundle, each dispatching
     /// `profile-switch` with its own path (the sibling set changes as
     /// new/clone mint and as the armed bundle trades places).
+    /// M139a: the "New Window for Profile" submenu is the same shape —
+    /// the submenu's identifier (its verb's wire name, set by
+    /// HostMenuBar.build) picks the target list; already-open bundles
+    /// drop out of the new-window list.
     @objc public func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        for target in profiles.switchTargets {
+        let forNewWindow = menu.identifier?.rawValue == HostCommand.newWindow.rawValue
+        let targets = forNewWindow ? profiles.windowTargets : profiles.switchTargets
+        for target in targets {
             let item = NSMenuItem(
                 title: target.deletingPathExtension().lastPathComponent,
-                action: #selector(dispatchSwitchItem(_:)), keyEquivalent: "")
+                action: forNewWindow ? #selector(dispatchNewWindowItem(_:)) : #selector(dispatchSwitchItem(_:)),
+                keyEquivalent: "")
             item.target = self
-            item.representedObject = HostCommand.profileSwitch
+            item.representedObject = forNewWindow ? HostCommand.newWindow : HostCommand.profileSwitch
             item.identifier = NSUserInterfaceItemIdentifier(target.path)
             menu.addItem(item)
         }

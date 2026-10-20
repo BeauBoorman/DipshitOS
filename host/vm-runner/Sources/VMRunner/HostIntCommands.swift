@@ -29,37 +29,60 @@ import VMAppKit
 // opens an NSOpenPanel instead.
 enum HostIntCommands {
 
+    /// M139a (#2779): the session that owns a lane — resolved by identity
+    /// through the registry so a secondary session's lanes register on
+    /// its own bus and toggle its own HostInt mask. A lane no session
+    /// owns (a bare test lane) keeps the global posture, unchanged.
+    private static func owner(_ lane: AnyObject) -> VMSession? {
+        VMSessionRegistry.shared.session(owning: lane)
+    }
+    private static func bus(of session: VMSession?) -> HostCommandBus {
+        session.map { VMSessionRegistry.shared.bus(for: $0) } ?? commandBus
+    }
+    private static func hostInt(of session: VMSession?) -> HostIntSession? {
+        session?.hostInt ?? hostIntSession
+    }
+    private static func dropLane(of session: VMSession?) -> HostDrop? {
+        session?.drop ?? hostDrop
+    }
+
     static func registerLane(_ lane: HostClipboard) {
-        commandBus.register(.laneClipboard, HostCommandBus.Registration(
-            itemState: { hostIntSession?.isSuspended(HostInt.laneClip) == false },
-            action: { toggle(HostInt.laneClip) }))
+        let s = owner(lane)
+        let int = hostInt(of: s)
+        bus(of: s).register(.laneClipboard, HostCommandBus.Registration(
+            itemState: { int?.isSuspended(HostInt.laneClip) == false },
+            action: { toggle(HostInt.laneClip, in: s) }))
     }
 
     static func registerLane(_ lane: HostDrop) {
-        commandBus.register(.laneDrop, HostCommandBus.Registration(
-            itemState: { hostIntSession?.isSuspended(HostInt.laneDrop) == false },
-            action: { toggle(HostInt.laneDrop) }))
+        let s = owner(lane)
+        let int = hostInt(of: s)
+        bus(of: s).register(.laneDrop, HostCommandBus.Registration(
+            itemState: { int?.isSuspended(HostInt.laneDrop) == false },
+            action: { toggle(HostInt.laneDrop, in: s) }))
         // A suspended drop lane greys the menu item AND refuses the
         // dispatch — `state=disabled` is the receipt; the lane_disabled
         // vocabulary line comes from drop()'s own suspended check on the
         // paths that DO reach it (drag, the --host-drop-after marker).
-        commandBus.register(.sendFile, HostCommandBus.Registration(
-            isEnabled: { hostDrop != nil && hostIntSession?.isSuspended(HostInt.laneDrop) == false },
-            action: { sendFile() }))
+        bus(of: s).register(.sendFile, HostCommandBus.Registration(
+            isEnabled: { dropLane(of: s) != nil && int?.isSuspended(HostInt.laneDrop) == false },
+            action: { sendFile(in: s) }))
     }
 
     static func registerLane(_ lane: HostNotify) {
-        commandBus.register(.laneNotify, HostCommandBus.Registration(
-            itemState: { hostIntSession?.isSuspended(HostInt.laneNotify) == false },
-            action: { toggle(HostInt.laneNotify) }))
+        let s = owner(lane)
+        let int = hostInt(of: s)
+        bus(of: s).register(.laneNotify, HostCommandBus.Registration(
+            itemState: { int?.isSuspended(HostInt.laneNotify) == false },
+            action: { toggle(HostInt.laneNotify, in: s) }))
     }
 
     /// The toggle: republish ARMED with the bit cleared (suspend) or set
     /// (resume) under the same epoch. The republish is the whole action —
     /// the seat's next poll adopts the new mask and its emit/consume
     /// postures follow it.
-    private static func toggle(_ bit: UInt8) -> HostCommandBus.Outcome {
-        guard let session = hostIntSession else { return .unavailable }
+    private static func toggle(_ bit: UInt8, in s: VMSession? = nil) -> HostCommandBus.Outcome {
+        guard let session = hostInt(of: s) else { return .unavailable }
         return session.setSuspended(bit, !session.isSuspended(bit)) ? .performed : .failed
     }
 
@@ -68,8 +91,8 @@ enum HostIntCommands {
     /// --host-drop-after marker fired, the list is otherwise inert — this
     /// is what a --host-cmd-after leg sends); a bundled session picks
     /// through an NSOpenPanel.
-    private static func sendFile() -> HostCommandBus.Outcome {
-        guard let drop = hostDrop else { return .unavailable }
+    private static func sendFile(in s: VMSession? = nil) -> HostCommandBus.Outcome {
+        guard let drop = dropLane(of: s) else { return .unavailable }
         if !hostDropFiles.isEmpty {
             let urls = hostDropFiles.map { URL(fileURLWithPath: $0) }
             FileHandle.standardOutput.write(Data("host-drop: send files=\(urls.count)\n".utf8))

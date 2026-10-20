@@ -1,6 +1,7 @@
 import Foundation
 import VSCtl
 import Virtualization
+import VMProfile
 
 // MARK: - VSockCtl — the M115b (#2461, ADR 0056) control-channel endpoint
 //
@@ -216,36 +217,44 @@ final class VSockCtlListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
     /// samples the armed profile/share at request time.
     private let profileInfo: () -> ProfileSummary
 
-    init(key: Data,
+    /// M139a (#2779): the per-session inputs the snapshot/restore drivers
+    /// and the `profile-info` answer used to read from main.swift's
+    /// globals — packaged so a secondary VMSession arms its own ctl
+    /// endpoint with ITS machine, share and saved-state dir.
+    struct Context {
+        let vm: VZVirtualMachine
+        let queue: DispatchQueue
+        let shareDirs: [URL]
+        let savedStateDir: URL?
+        let unsupported: String?
+        let overlayBasePath: String?
+        let profile: VMProfile?
+    }
+
+    init(key: Data, context: Context,
          suspendHandler: (() -> SuspendVerdict)? = nil,
          onSuspendAccepted: (() -> Void)? = nil) {
         self.key = key
         self.suspendHandler = suspendHandler
         self.onSuspendAccepted = onSuspendAccepted
         // M115e (#2464): the snapshot/restore drivers are constructed
-        // here rather than handed in — VMRunner/main.swift's arming call
-        // site is under a sibling claim (#2465) this cycle, so the glue
-        // reads the runner's already-armed module state instead of a new
-        // call-site argument. Same inputs the suspend wiring computes:
-        // the armed share dirs (either host file channel), the profile's
-        // saved-state dir, and the device set's save/restore verdict.
-        let shareDirs = [cvcFileShareDir, virtioFSShareDir].compactMap { $0 }
-            .map { URL(fileURLWithPath: $0, isDirectory: true) }
-        var unsupported: String? = nil
-        do { try config.validateSaveRestoreSupport() } catch {
-            unsupported = "\(error as NSError)"
-        }
-        let snapCtl = SnapshotCtl(vm: runner.vm, queue: runner.queue,
-                                shareDir: shareDirs.first,
-                                unsupported: unsupported)
-        let rstCtl = RestoreCtl(shareDir: shareDirs.first,
-                              savedStateDir: activeProfile?.savedStateURL)
+        // here rather than handed in — the context carries the same
+        // inputs the suspend wiring computes: the session's armed share
+        // dirs, its profile's saved-state dir, and its device set's
+        // save/restore verdict.
+        let snapCtl = SnapshotCtl(vm: context.vm, queue: context.queue,
+                                shareDir: context.shareDirs.first,
+                                unsupported: context.unsupported)
+        let rstCtl = RestoreCtl(shareDir: context.shareDirs.first,
+                              savedStateDir: context.savedStateDir)
         snapshotCtl = snapCtl
         restoreCtl = rstCtl
         // M128d (#2608): which machine the guest is. Read-only, so a run
         // without a profile answers "-" fields rather than refusing —
         // the snapshot count still reports from whatever share is armed.
-        let infoShare = shareDirs.first
+        let infoShare = context.shareDirs.first
+        let overlayBasePath = context.overlayBasePath
+        let profileName = context.profile?.name
         profileInfo = {
             let baseName = overlayBasePath
                 .map { URL(fileURLWithPath: $0).lastPathComponent } ?? "-"
@@ -265,11 +274,33 @@ final class VSockCtlListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
                     snaps += 1
                 }
             }
-            return ProfileSummary(profile: activeProfile?.name ?? "-",
+            return ProfileSummary(profile: profileName ?? "-",
                                   base: baseName, rollback: rollback,
                                   snapshots: snaps)
         }
         print("VSOCK-CTL: snapshot=\(snapCtl.armState) restore=\(rstCtl.armState)")
+    }
+
+    /// The primary session's call-site shape (M115e): the context is
+    /// computed from the runner's armed globals, unchanged.
+    convenience init(key: Data,
+         suspendHandler: (() -> SuspendVerdict)? = nil,
+         onSuspendAccepted: (() -> Void)? = nil) {
+        let shareDirs = [cvcFileShareDir, virtioFSShareDir].compactMap { $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        var unsupported: String? = nil
+        do { try config.validateSaveRestoreSupport() } catch {
+            unsupported = "\(error as NSError)"
+        }
+        self.init(key: key,
+                  context: Context(vm: runner.vm, queue: runner.queue,
+                                   shareDirs: shareDirs,
+                                   savedStateDir: activeProfile?.savedStateURL,
+                                   unsupported: unsupported,
+                                   overlayBasePath: overlayBasePath,
+                                   profile: activeProfile),
+                  suspendHandler: suspendHandler,
+                  onSuspendAccepted: onSuspendAccepted)
     }
 
     func listener(_ listener: VZVirtioSocketListener,
@@ -365,6 +396,11 @@ final class SuspendCtl {
         return verdict
     }
 
+    /// M139a (#2779): the post-reply tail's override — a secondary
+    /// session installs a hook that stops ITS VM instead of the whole
+    /// run (nil keeps the primary's process-finish behavior).
+    var onFinish: (() -> Void)?
+
     /// The post-reply tail: the ok line is on the wire (the guest will
     /// read it on restore), so the run ends through the runner's own
     /// finish path. `suspendStopInFlight` tells scriptPoll the coming
@@ -372,8 +408,12 @@ final class SuspendCtl {
     func finish() {
         queue.async {
             print("VSOCK-CTL: suspend stopping")
-            suspendStopInFlight = true
-            VMRunner.finish(success: true)
+            if let onFinish = self.onFinish {
+                onFinish()
+            } else {
+                suspendStopInFlight = true
+                VMRunner.finish(success: true)
+            }
         }
     }
 }

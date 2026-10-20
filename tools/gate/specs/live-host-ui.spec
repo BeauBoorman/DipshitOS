@@ -3,8 +3,9 @@
 # dispatches a menu verb through the same bus the AppKit menu items dispatch
 # on, once the marker appears in the serial stream — the window is never
 # driven by synthesized clicks (index thesis 1); the bus is the testable
-# seam. Every dispatch writes one `host-ui: cmd=<verb> state=<...>` receipt
-# on runner stdout; a toggle verb appends its live post-action state
+# seam. Every dispatch writes one `host-ui: cmd=<verb> vm=<n> state=<...>`
+# receipt on runner stdout — `vm=<n>` names the session the verb landed on
+# (M139a #2779); a toggle verb appends its live post-action state
 # (`capture=on|off`) to the receipt.
 #
 # Run 01 fires `screenshot` — the same --screen framebuffer capture
@@ -117,6 +118,21 @@ cfg["baseImage"] = base            # --overlay-base wins anyway; keeps the bundl
 cfg.setdefault("devices", {})["share"] = False
 json.dump(cfg, open(cfg_path, "w"), indent=2, sort_keys=True)
 print("m120c profile minted; private base copy staged; devices.share=false")
+
+# Run 09's second machine (M139a #2779): ws2 gets its own bundle + base
+# copy — the session attaches <bundle>/share over virtio-fs itself.
+ws2 = os.path.join(run, "ws2.virelaivm")
+r = subprocess.run([runner, "--profile", ws2, "--profile-init"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit("ws2 profile mint refused: " + r.stdout + r.stderr)
+ws2base = os.path.join(run, "ws2-base.img")
+shutil.copy(os.path.join("artifacts", "disk.img"), ws2base)
+cfg2 = json.load(open(os.path.join(ws2, "config.json")))
+cfg2["baseImage"] = ws2base
+json.dump(cfg2, open(os.path.join(ws2, "config.json"), "w"), indent=2, sort_keys=True)
+os.makedirs(os.path.join(ws2, "share"), exist_ok=True)
+print("ws2 profile minted; private base copy staged")
 PY
 
 vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
@@ -134,23 +150,23 @@ vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
     --script-expect 'host-ui-idle' --timeout 90
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
-vgate_assert 01 output-contains 'host-ui: cmd=screenshot state=performed'
-vgate_assert 01 output-contains 'host-ui: cmd=fullscreen state=performed'
-vgate_assert 01 output-contains 'host-ui: cmd=capture-keys state=performed capture=on'
-vgate_assert 01 output-contains 'host-ui: cmd=capture-keys state=performed capture=off'
-vgate_assert 01 output-contains 'host-ui: cmd=send-file state=unavailable'
+vgate_assert 01 output-contains 'host-ui: cmd=screenshot vm=1 state=performed'
+vgate_assert 01 output-contains 'host-ui: cmd=fullscreen vm=1 state=performed'
+vgate_assert 01 output-contains 'host-ui: cmd=capture-keys vm=1 state=performed capture=on'
+vgate_assert 01 output-contains 'host-ui: cmd=capture-keys vm=1 state=performed capture=off'
+vgate_assert 01 output-contains 'host-ui: cmd=send-file vm=1 state=unavailable'
 # M120c (#2560): on a posture-less flag run every lifecycle verb is
 # disabled — no saved-state dir (no profile), no share, nothing staged,
 # no .prev. Enablement is the receipt, not silence.
-vgate_assert 01 output-contains 'host-ui: cmd=suspend state=disabled'
-vgate_assert 01 output-contains 'host-ui: cmd=snapshot state=disabled'
-vgate_assert 01 output-contains 'host-ui: cmd=apply-update state=disabled'
-vgate_assert 01 output-contains 'host-ui: cmd=rollback-update state=disabled'
-vgate_assert 01 output-contains 'host-ui: cmd=reveal-share state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=suspend vm=1 state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=snapshot vm=1 state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=apply-update vm=1 state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=rollback-update vm=1 state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=reveal-share vm=1 state=disabled'
 # M122d (#2573): the ⌘/ cheat-sheet verb is a self-registered companion
 # — always armed, so its receipt carries the open flip and the row
 # count generated from the menu's command table.
-vgate_assert 01 output-contains 'host-ui: cmd=shortcuts state=performed open=1 chords=8'
+vgate_assert 01 output-contains 'host-ui: cmd=shortcuts vm=1 state=performed open=1 chords=8'
 vgate_assert 01 output-contains 'framebuffer screenshot saved'
 vgate_assert 01 snapshot 'screen-hostui-*' <<'PY'
 import sys
@@ -166,7 +182,7 @@ vgate_run 02 -- --script '$RUN_DIR/script.txt' \
     --script-expect 'host-ui-idle' --timeout 90
 vgate_allow_rc 02 1
 
-vgate_assert 02 output-contains 'host-ui: cmd=stop state=performed'
+vgate_assert 02 output-contains 'host-ui: cmd=stop vm=1 state=performed'
 vgate_assert 02 output-contains 'VM ended before the expected transcript'
 
 vgate_run 03 -- --screen '$RUN_DIR/screen3' --script '$RUN_DIR/script.txt' \
@@ -175,8 +191,8 @@ vgate_run 03 -- --screen '$RUN_DIR/screen3' --script '$RUN_DIR/script.txt' \
     --script-expect 'host-ui-idle' --timeout 90
 
 vgate_assert 03 output-contains 'host-capture-keys: ENABLED'
-vgate_assert 03 output-contains 'host-ui: cmd=capture-keys state=performed capture=on'
-vgate_assert 03 output-contains 'host-ui: cmd=capture-keys state=performed capture=off'
+vgate_assert 03 output-contains 'host-ui: cmd=capture-keys vm=1 state=performed capture=on'
+vgate_assert 03 output-contains 'host-ui: cmd=capture-keys vm=1 state=performed capture=off'
 
 # Run 04 is M114d's (#2457): the send-serial verb writes the armed
 # --host-serial-send line into the console pipe — the same path --script
@@ -194,9 +210,9 @@ vgate_run 04 -- --script '$RUN_DIR/script.txt' \
     --host-cmd-after 'inspector-ping:inspector' \
     --script-expect 'host-ui-idle' --timeout 90
 
-vgate_assert 04 output-contains 'host-ui: cmd=send-serial state=performed sent=1'
+vgate_assert 04 output-contains 'host-ui: cmd=send-serial vm=1 state=performed sent=1'
 vgate_assert 04 serial-contains 'inspector-ping'
-vgate_assert 04 output-contains 'host-ui: cmd=inspector state=performed open=1'
+vgate_assert 04 output-contains 'host-ui: cmd=inspector vm=1 state=performed open=1'
 vgate_assert 04 output-contains 'saw=1'
 
 # Run 05: the M114e capture leg. `cap-start` both fires record-start on
@@ -215,15 +231,15 @@ vgate_run 05 -- --screen '$RUN_DIR/capshare/CAPTURES/rec' \
     --host-cmd-after 'cap-stop:record-stop' \
     --script-expect 'cap-stop' --timeout 90
 
-vgate_assert 05 output-contains 'host-ui: cmd=screenshot state=performed'
-vgate_assert 05 output-contains 'host-ui: cmd=record-start state=performed recording=on'
-vgate_assert 05 output-contains 'host-ui: cmd=record-stop state=performed recording=off frames='
+vgate_assert 05 output-contains 'host-ui: cmd=screenshot vm=1 state=performed'
+vgate_assert 05 output-contains 'host-ui: cmd=record-start vm=1 state=performed recording=on'
+vgate_assert 05 output-contains 'host-ui: cmd=record-stop vm=1 state=performed recording=off frames='
 # The receipt's frames=/bytes= are the writer's actuals — a gate that
 # only read "performed" would pass on a zero-byte MP4.
 vgate_assert 05 python <<'PY'
 import os, re
 out = open(os.path.join(os.environ["RUN_DIR"], "run-05.out"), "rb").read().decode("utf-8", "replace")
-m = re.search(r"host-ui: cmd=record-stop state=performed recording=off frames=(\d+) bytes=(\d+)", out)
+m = re.search(r"host-ui: cmd=record-stop vm=1 state=performed recording=off frames=(\d+) bytes=(\d+)", out)
 if not m:
     raise SystemExit("record-stop receipt with frames=/bytes= not found in runner output")
 frames, size = int(m.group(1)), int(m.group(2))
@@ -289,10 +305,10 @@ vgate_run 06 -- --profile '$RUN_DIR/m120c.virelaivm' \
     --host-cmd-after 'virelai> :reveal-share' \
     --script-expect 'host-ui-idle' --timeout 120
 
-vgate_assert 06 output-contains 'host-ui: cmd=snapshot state=performed'
-vgate_assert 06 output-contains 'host-ui: cmd=reveal-share state=performed'
-vgate_assert 06 output-contains 'host-ui: cmd=apply-update state=disabled'
-vgate_assert 06 output-contains 'host-ui: cmd=rollback-update state=disabled'
+vgate_assert 06 output-contains 'host-ui: cmd=snapshot vm=1 state=performed'
+vgate_assert 06 output-contains 'host-ui: cmd=reveal-share vm=1 state=performed'
+vgate_assert 06 output-contains 'host-ui: cmd=apply-update vm=1 state=disabled'
+vgate_assert 06 output-contains 'host-ui: cmd=rollback-update vm=1 state=disabled'
 # The performed snapshot is a file, not a receipt word — a
 # menu-<stamp>.vzsave under the armed share's SNAPSHOTS/, non-empty.
 vgate_assert 06 python <<'PY'
@@ -320,7 +336,7 @@ vgate_run 07 -- --profile '$RUN_DIR/m120c.virelaivm' \
     --host-cmd-after 'virelai> :suspend' \
     --script-expect 'host-ui-idle' --timeout 120
 
-vgate_assert 07 output-contains 'host-ui: cmd=suspend state=performed'
+vgate_assert 07 output-contains 'host-ui: cmd=suspend vm=1 state=performed'
 vgate_assert 07 output-contains 'VSOCK-CTL: suspend saved state.vzsave'
 vgate_assert 07 python <<'PY'
 import os, sys
@@ -329,6 +345,68 @@ state = os.path.join(os.environ["RUN_DIR"], "m120c.virelaivm",
 if not os.path.isfile(state) or os.path.getsize(state) == 0:
     sys.exit("suspend left no non-empty saved-state/state.vzsave")
 print("suspended state saved: %d bytes" % os.path.getsize(state))
+PY
+
+# Run 09 is M139a's (#2779) multi-VM leg: one process, two profiles, two
+# windows. `virelai> ` on VM 1's serial dispatches `new-window@ws2` on
+# vm 1's bus; VM 2 boots in-session and its own prompt fires the
+# `vm2:`-bound suspend on ITS bus — the receipt's `vm=2` and the saved
+# state.vzsave prove the verb acted on the sibling, not the primary.
+# Recording starts on VM 1 only (vm=1 receipt; no vm=2 record line), a
+# second `new-window` of the open bundle receipts the named
+# `profile_in_use` refusal, and VM 1 keeps printing until its own
+# script-expect ends the run — the process exit drains whatever is left.
+vgate_file script9.txt <<'EOF'
+echo cap-start
+EOF
+
+vgate_file script9b.txt <<'EOF'
+echo cap-stop
+echo vm1-done
+EOF
+
+vgate_run 09 -- --profile '$RUN_DIR/m120c.virelaivm' \
+    --overlay-base '$RUN_DIR/m120c-base.img' \
+    --virtio-fs '$RUN_DIR/m120c.virelaivm/share' \
+    --screen '$RUN_DIR/screen9' \
+    --script '$RUN_DIR/script9.txt' \
+    --script2 '$RUN_DIR/script9b.txt' --script2-after 'cap-start' --script2-delay 20 \
+    --host-cmd-after 'virelai> :new-window@$RUN_DIR/ws2.virelaivm' \
+    --host-cmd-after 'cap-start:record-start' \
+    --host-cmd-after 'vm2:virelai> :suspend' \
+    --host-cmd-after 'cap-stop:new-window@$RUN_DIR/ws2.virelaivm' \
+    --host-cmd-after 'cap-stop:record-stop' \
+    --script-expect 'vm1-done' --timeout 150
+
+vgate_assert 09 output-contains 'host-ui: cmd=new-window vm=1 state=performed opened=2'
+vgate_assert 09 output-contains 'host-ui: cmd=record-start vm=1 state=performed recording=on'
+vgate_assert 09 output-contains 'host-ui: cmd=suspend vm=2 state=performed'
+vgate_assert 09 output-contains 'host-ui: cmd=new-window vm=1 state=disabled reason=profile_in_use'
+vgate_assert 09 output-contains 'host-ui: cmd=record-stop vm=1 state=performed recording=off'
+vgate_assert 09 output-contains 'vm=2: stopped'
+# Recording was VM 1's only — no take ever started on vm 2's bus.
+vgate_assert 09 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-09.out"), "rb").read().decode("utf-8", "replace")
+if re.search(r"host-ui: cmd=record-start vm=2 ", out):
+    sys.exit("a recording started on vm 2 — record must stay per-session")
+# VM 2's suspend preceded VM 1's final SUCCESS — VM 1 kept printing
+# while the sibling suspended and stopped.
+sus = out.find("host-ui: cmd=suspend vm=2 state=performed")
+fin = out.find("SUCCESS: expected transcript")
+if sus < 0 or fin < 0 or sus > fin:
+    sys.exit("suspend/success ordering wrong: suspend@%d success@%d" % (sus, fin))
+# VM 2 really booted: its own serial reached the guest shell.
+ser = os.path.join(run, "ws2.virelaivm", "run", "serial.log")
+text = open(ser, "rb").read().decode("utf-8", "replace")
+if "virelai> " not in text:
+    sys.exit("vm 2 never reached the guest shell")
+# And really suspended: state.vzsave exists, non-empty.
+state = os.path.join(run, "ws2.virelaivm", "saved-state", "state.vzsave")
+if not os.path.isfile(state) or os.path.getsize(state) == 0:
+    sys.exit("vm 2 suspend left no saved-state/state.vzsave")
+print("two-VM leg: suspend before vm1 SUCCESS; ws2 serial + state.vzsave green")
 PY
 
 # Run 08 is M120e's (#2562) forced-failure leg: `shutdown` in the script
@@ -353,7 +431,7 @@ vgate_run 08 -- --screen '$RUN_DIR/screen8' --virtio-fs '$RUN_DIR/capshare8' \
 vgate_allow_rc 08 1
 
 vgate_assert 08 serial-echo shutdown
-vgate_assert 08 output-contains 'host-ui: cmd=screenshot state=performed saved=1 file=screen8-hostui-1.png'
+vgate_assert 08 output-contains 'host-ui: cmd=screenshot vm=1 state=performed saved=1 file=screen8-hostui-1.png'
 vgate_assert 08 output-contains 'host-cap: saved '
 vgate_assert 08 output-contains 'host-inspector: postmortem ending=stopped'
 vgate_assert 08 output-contains 'open=1'

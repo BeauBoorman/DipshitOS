@@ -173,8 +173,8 @@ vgate_assert 01 serial-count 'lanes=outbox' 2
 vgate_assert 01 serial-contains 'lanes=-'
 # The bus verbs the lane registered itself: reveal-export disabled with
 # nothing landed, both lane toggles performed.
-vgate_assert 01 output-contains 'host-ui: cmd=reveal-export state=disabled'
-vgate_assert 01 output-contains 'host-ui: cmd=lane-outbox state=performed'
+vgate_assert 01 output-contains 'host-ui: cmd=reveal-export vm=1 state=disabled'
+vgate_assert 01 output-contains 'host-ui: cmd=lane-outbox vm=1 state=performed'
 # Both exports staged; the suspended one waited for the resumed mask.
 vgate_assert 01 serial-contains 'gosh: export staged name=HELLO.TXT'
 vgate_assert 01 serial-contains 'gosh: export staged name=SUSP.TXT'
@@ -196,9 +196,9 @@ out = open(os.path.join(run, "run-01.out"), errors="replace").read()
 ser = open(os.environ["VG_SER"], errors="replace").read()
 share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
 # Both toggles performed (suspend + resume), the reveal probe disabled.
-if out.count("host-ui: cmd=lane-outbox state=performed") != 2:
+if out.count("host-ui: cmd=lane-outbox vm=1 state=performed") != 2:
     sys.exit("FAIL: lane-outbox receipts = %d, want 2"
-             % out.count("host-ui: cmd=lane-outbox state=performed"))
+             % out.count("host-ui: cmd=lane-outbox vm=1 state=performed"))
 # Exactly two landings -- the two GOSH exports -- named on the lane line.
 landings = re.findall(r"host-outbox: file seq=\d+ name=(\S+) size=", out)
 if sorted(landings) != ["HELLO.TXT", "SUSP.TXT"]:

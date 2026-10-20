@@ -225,7 +225,7 @@ vgate_assert t1 serial-contains 'gotabwm: registered'
 vgate_assert t1 serial-contains 'exec: loaded NOTE.ELF'
 vgate_assert t1 serial-contains 'note: tab-aware (full-viewport)'
 vgate_assert t1 serial-contains 'gotabwm: session write n=1'
-vgate_assert t1 output-contains 'host-ui: cmd=apply-update state=disabled staged=0'
+vgate_assert t1 output-contains 'host-ui: cmd=apply-update vm=1 state=disabled staged=0'
 vgate_assert t1 serial-absent '[EXC]'
 vgate_assert t1 python <<'PY'
 import os, sys
@@ -336,9 +336,9 @@ vgate_run s1 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --host-cmd-after 'ux-s1-park:suspend' \
   --script-expect '__UX_S1_SUSPENDED__' --timeout 300
 vgate_assert s1 serial-contains 'gosh: attached'
-vgate_assert s1 output-contains 'host-ui: cmd=snapshot state=performed'
+vgate_assert s1 output-contains 'host-ui: cmd=snapshot vm=1 state=performed'
 vgate_assert s1 output-contains 'host-machine: snapshot saved menu-'
-vgate_assert s1 output-contains 'host-ui: cmd=suspend state=performed'
+vgate_assert s1 output-contains 'host-ui: cmd=suspend vm=1 state=performed'
 vgate_assert s1 output-contains 'host-machine: suspend saved; run stopping'
 vgate_assert s1 output-contains 'VSOCK-CTL: suspend saved state.vzsave'
 vgate_assert s1 serial-absent '[EXC]'
@@ -405,7 +405,7 @@ vgate_run f1 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --script-expect '__UX_F1_NEVER__' --timeout 90
 vgate_allow_rc f1 1
 vgate_assert f1 serial-echo shutdown
-vgate_assert f1 output-contains 'host-ui: cmd=screenshot state=performed saved=1 file=screen-f1-hostui-1.png'
+vgate_assert f1 output-contains 'host-ui: cmd=screenshot vm=1 state=performed saved=1 file=screen-f1-hostui-1.png'
 vgate_assert f1 output-contains 'host-cap: saved '
 vgate_assert f1 output-contains 'host-inspector: postmortem ending=stopped'
 vgate_assert f1 output-contains 'open=1'
@@ -441,7 +441,7 @@ vgate_assert st1 serial-contains 'version=dev'
 vgate_assert st1 serial-contains 'update: inputs KERNEL.BIN sha256='
 vgate_assert st1 serial-contains 'update: staged ok version=m120f-b'
 vgate_assert st1 serial-contains 'update: exit rc=0'
-vgate_assert st1 output-contains 'host-ui: cmd=apply-update state=performed'
+vgate_assert st1 output-contains 'host-ui: cmd=apply-update vm=1 state=performed'
 vgate_assert st1 output-contains 'host-machine: applied version=m120f-b image=OS.IMG'
 vgate_assert st1 python <<'PY'
 import os, sys
@@ -487,7 +487,7 @@ vgate_run g1 -- --profile '$RUN_DIR/prof.virelaivm' --cvc-file '$RUN_DIR/prof.vi
   --script-expect 'ux-g1-done' --timeout 180
 vgate_assert g1 serial-contains 'version=m120f-b'
 vgate_assert g1 serial-absent 'version=dev'
-vgate_assert g1 output-contains 'host-ui: cmd=rollback-update state=performed'
+vgate_assert g1 output-contains 'host-ui: cmd=rollback-update vm=1 state=performed'
 vgate_assert g1 output-contains 'host-machine: rollback restored sha256='
 vgate_assert g1 serial-absent '[EXC]'
 vgate_assert g1 python <<'PY'
@@ -542,7 +542,7 @@ vgate_run t2 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --script-expect 'ux-t2-done' --timeout 180
 vgate_assert t2 serial-contains 'gotabwm: session write n=1'
 vgate_assert t2 serial-contains 'note: tab-aware (full-viewport)'
-vgate_assert t2 output-contains 'host-ui: cmd=apply-update state=disabled staged=0'
+vgate_assert t2 output-contains 'host-ui: cmd=apply-update vm=1 state=disabled staged=0'
 vgate_assert t2 serial-absent '[EXC]'
 vgate_assert t2 python <<'PY'
 import os, sys
@@ -618,9 +618,9 @@ vgate_run s2 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --host-cmd-after 'ux-s2-park:suspend' \
   --script-expect '__UX_S2_SUSPENDED__' --timeout 300
 vgate_assert s2 serial-contains 'gosh: attached'
-vgate_assert s2 output-contains 'host-ui: cmd=snapshot state=performed'
+vgate_assert s2 output-contains 'host-ui: cmd=snapshot vm=1 state=performed'
 vgate_assert s2 output-contains 'host-machine: snapshot saved menu-'
-vgate_assert s2 output-contains 'host-ui: cmd=suspend state=performed'
+vgate_assert s2 output-contains 'host-ui: cmd=suspend vm=1 state=performed'
 vgate_assert s2 output-contains 'host-machine: suspend saved; run stopping'
 vgate_assert s2 output-contains 'VSOCK-CTL: suspend saved state.vzsave'
 vgate_assert s2 serial-absent '[EXC]'
@@ -675,7 +675,7 @@ vgate_run f2 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --script-expect '__UX_F2_NEVER__' --timeout 90
 vgate_allow_rc f2 1
 vgate_assert f2 serial-echo shutdown
-vgate_assert f2 output-contains 'host-ui: cmd=screenshot state=performed saved=1 file=screen-f2-hostui-1.png'
+vgate_assert f2 output-contains 'host-ui: cmd=screenshot vm=1 state=performed saved=1 file=screen-f2-hostui-1.png'
 vgate_assert f2 output-contains 'host-cap: saved '
 vgate_assert f2 output-contains 'host-inspector: postmortem ending=stopped'
 vgate_assert f2 output-contains 'open=1'
@@ -703,7 +703,7 @@ vgate_assert st2 serial-contains 'owners: OWNERS.TXT loaded'
 vgate_assert st2 serial-contains 'version=dev'
 vgate_assert st2 serial-contains 'update: staged ok version=m120f-b'
 vgate_assert st2 serial-contains 'update: exit rc=0'
-vgate_assert st2 output-contains 'host-ui: cmd=apply-update state=performed'
+vgate_assert st2 output-contains 'host-ui: cmd=apply-update vm=1 state=performed'
 vgate_assert st2 output-contains 'host-machine: applied version=m120f-b image=OS.IMG'
 vgate_assert st2 python <<'PY'
 import os, sys
@@ -735,7 +735,7 @@ vgate_run g2 -- --profile '$RUN_DIR/prof.virelaivm' --cvc-file '$RUN_DIR/prof.vi
   --script-expect 'ux-g2-done' --timeout 180
 vgate_assert g2 serial-contains 'version=m120f-b'
 vgate_assert g2 serial-absent 'version=dev'
-vgate_assert g2 output-contains 'host-ui: cmd=rollback-update state=performed'
+vgate_assert g2 output-contains 'host-ui: cmd=rollback-update vm=1 state=performed'
 vgate_assert g2 output-contains 'host-machine: rollback restored sha256='
 vgate_assert g2 serial-absent '[EXC]'
 vgate_assert g2 python <<'PY'
@@ -780,7 +780,7 @@ vgate_run t3 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --script-expect 'ux-t3-done' --timeout 180
 vgate_assert t3 serial-contains 'gotabwm: session write n=1'
 vgate_assert t3 serial-contains 'note: tab-aware (full-viewport)'
-vgate_assert t3 output-contains 'host-ui: cmd=apply-update state=disabled staged=0'
+vgate_assert t3 output-contains 'host-ui: cmd=apply-update vm=1 state=disabled staged=0'
 vgate_assert t3 serial-absent '[EXC]'
 vgate_assert t3 python <<'PY'
 import os, sys
@@ -855,9 +855,9 @@ vgate_run s3 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --host-cmd-after 'ux-s3-park:suspend' \
   --script-expect '__UX_S3_SUSPENDED__' --timeout 300
 vgate_assert s3 serial-contains 'gosh: attached'
-vgate_assert s3 output-contains 'host-ui: cmd=snapshot state=performed'
+vgate_assert s3 output-contains 'host-ui: cmd=snapshot vm=1 state=performed'
 vgate_assert s3 output-contains 'host-machine: snapshot saved menu-'
-vgate_assert s3 output-contains 'host-ui: cmd=suspend state=performed'
+vgate_assert s3 output-contains 'host-ui: cmd=suspend vm=1 state=performed'
 vgate_assert s3 output-contains 'host-machine: suspend saved; run stopping'
 vgate_assert s3 output-contains 'VSOCK-CTL: suspend saved state.vzsave'
 vgate_assert s3 serial-absent '[EXC]'
@@ -912,7 +912,7 @@ vgate_run f3 -- --profile '$RUN_DIR/prof.virelaivm' --virtio-fs '$RUN_DIR/prof.v
   --script-expect '__UX_F3_NEVER__' --timeout 90
 vgate_allow_rc f3 1
 vgate_assert f3 serial-echo shutdown
-vgate_assert f3 output-contains 'host-ui: cmd=screenshot state=performed saved=1 file=screen-f3-hostui-1.png'
+vgate_assert f3 output-contains 'host-ui: cmd=screenshot vm=1 state=performed saved=1 file=screen-f3-hostui-1.png'
 vgate_assert f3 output-contains 'host-cap: saved '
 vgate_assert f3 output-contains 'host-inspector: postmortem ending=stopped'
 vgate_assert f3 output-contains 'open=1'
@@ -940,7 +940,7 @@ vgate_assert st3 serial-contains 'owners: OWNERS.TXT loaded'
 vgate_assert st3 serial-contains 'version=dev'
 vgate_assert st3 serial-contains 'update: staged ok version=m120f-b'
 vgate_assert st3 serial-contains 'update: exit rc=0'
-vgate_assert st3 output-contains 'host-ui: cmd=apply-update state=performed'
+vgate_assert st3 output-contains 'host-ui: cmd=apply-update vm=1 state=performed'
 vgate_assert st3 output-contains 'host-machine: applied version=m120f-b image=OS.IMG'
 vgate_assert st3 python <<'PY'
 import os, sys
@@ -972,7 +972,7 @@ vgate_run g3 -- --profile '$RUN_DIR/prof.virelaivm' --cvc-file '$RUN_DIR/prof.vi
   --script-expect 'ux-g3-done' --timeout 180
 vgate_assert g3 serial-contains 'version=m120f-b'
 vgate_assert g3 serial-absent 'version=dev'
-vgate_assert g3 output-contains 'host-ui: cmd=rollback-update state=performed'
+vgate_assert g3 output-contains 'host-ui: cmd=rollback-update vm=1 state=performed'
 vgate_assert g3 output-contains 'host-machine: rollback restored sha256='
 vgate_assert g3 serial-absent '[EXC]'
 vgate_assert g3 python <<'PY'

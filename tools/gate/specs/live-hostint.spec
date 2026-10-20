@@ -599,10 +599,10 @@ vgate_assert 04 serial-count 'lanes=clip,drop,notify' 2
 # The bus receipts: two toggles each (suspend + resume) performing, the
 # send-file refused while the drop lane was suspended and performed after
 # resume.
-vgate_assert 04 output-contains 'host-ui: cmd=lane-clipboard state=performed'
-vgate_assert 04 output-contains 'host-ui: cmd=lane-drop state=performed'
-vgate_assert 04 output-contains 'host-ui: cmd=send-file state=disabled'
-vgate_assert 04 output-contains 'host-ui: cmd=send-file state=performed'
+vgate_assert 04 output-contains 'host-ui: cmd=lane-clipboard vm=1 state=performed'
+vgate_assert 04 output-contains 'host-ui: cmd=lane-drop vm=1 state=performed'
+vgate_assert 04 output-contains 'host-ui: cmd=send-file vm=1 state=disabled'
+vgate_assert 04 output-contains 'host-ui: cmd=send-file vm=1 state=performed'
 # Suspended lanes refuse lane_disabled (the ADR 0051 vocabulary, both
 # directions): the marker-fired clip-in inject refused at the lane's
 # entry; the marker-fired drop gesture refused the same way.
@@ -632,7 +632,7 @@ def idx(s):
     i = out.find(s)
     if i < 0: sys.exit("FAIL: missing " + s)
     return i
-susp = idx("host-ui: cmd=lane-drop state=performed")
+susp = idx("host-ui: cmd=lane-drop vm=1 state=performed")
 refuse = idx("host-int: refuse lane=drop reason=lane_disabled")
 land = idx("host-drop: file seq=1 name=SENDME.QOI")
 if not (susp < refuse < land):
@@ -733,7 +733,7 @@ vgate_assert 05 output-contains 'host-notify: dropped reason=no_bundle seq=2 n=2
 # M127c click-through: the bus verb emitted NFOCUS-00000001 against the
 # sender, the seat verified it and ran focusHosted — the same seam the
 # bundled banner's didReceive takes.
-vgate_assert 05 output-contains 'host-ui: cmd=notify-click state=performed'
+vgate_assert 05 output-contains 'host-ui: cmd=notify-click vm=1 state=performed'
 vgate_assert 05 output-contains 'host-notify: click-focus id='
 vgate_assert 05 serial-contains 'gotabwm: hostint notify-focus seq=1 id='
 vgate_assert 05 serial-contains 'gotabwm: tab focus id='
@@ -758,8 +758,8 @@ vgate_assert 05 output-contains 'host-agent: session open agent=-'
 vgate_assert 05 output-contains 'host-agent: session close agent=devin'
 vgate_assert 05 output-contains 'host-agent: lane paused pid='
 vgate_assert 05 output-contains 'host-agent: lane resumed pid='
-vgate_assert 05 output-contains 'host-ui: cmd=lane-agent state=performed paused=1'
-vgate_assert 05 output-contains 'host-ui: cmd=lane-agent state=performed paused=0'
+vgate_assert 05 output-contains 'host-ui: cmd=lane-agent vm=1 state=performed paused=1'
+vgate_assert 05 output-contains 'host-ui: cmd=lane-agent vm=1 state=performed paused=0'
 # The seat's own agentwatch mirror read the same lane.
 vgate_assert 05 serial-contains 'gotabwm: agent watch'
 vgate_assert 05 serial-contains 'gotabwm: agent session open agent=-'
