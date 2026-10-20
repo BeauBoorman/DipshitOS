@@ -420,7 +420,7 @@ func paintNotifyCenter(scan []byte, width, height int) int {
 				written += seatFill(c, widgets.Rect{X: bar.X, Y: bar.Y,
 					W: bar.W * entry.pct / 100, H: bar.H}, tok.Accent)
 			} else {
-				off, seg := notifyProgressSweep(seatTick, bar.W)
+				off, seg := notifyProgressSweep(compositeClock, bar.W)
 				written += seatFill(c, widgets.Rect{X: bar.X + off, Y: bar.Y,
 					W: seg, H: bar.H}, tok.Accent)
 			}

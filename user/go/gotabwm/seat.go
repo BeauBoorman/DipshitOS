@@ -297,6 +297,20 @@ const pointerClickHold = 8
 // from spinning forever.
 const maxEvents = 500
 
+// drainPaintStride bounds how many events may be consumed while a
+// composite is owed before the drain pays the paint mid-burst (#2730):
+// a queued heartbeat's repaint is deferred behind the input it would
+// otherwise delay, but a stream that never empties still earns a present
+// per stride rather than starving the scanout until the bound trips.
+const drainPaintStride = 32
+
+// drainServiceStride bounds how many events may pass between mailbox
+// services inside one drain: a WM_RPC's bounded-poll ack window
+// (wmMailWaitTicks) cannot outlast a deep queue otherwise — observed on
+// go-dogfood boot 08: `gofiles: drag refused seat` while the seat chewed
+// a 6-deep tick backlog with the DragBegin un-served in its mailbox.
+const drainServiceStride = 8
+
 func main() {
 	// 1. Register the seat (slot 65 cmd 1). ENXIO here means the compositor
 	//    is not armed; EACCES means a seat is already taken.
@@ -455,11 +469,50 @@ func main() {
 	// quiets pushes the exit out by at most one more maxTicks.
 	tickLimitCap := tickLimit + maxTicks
 	presents, ticks := 0, 0
-	vi.ConsoleLine(MarkerServing)
-	for events := 0; !demoMode || (events < maxEvents && ticks < tickLimit); {
+	// #2730: a consumed heartbeat's PAINT is deferred past whatever input
+	// queued behind it — drainSeatEvents accounts each tick through onTick
+	// and calls flushComposite when the queue empties, when an owed paint
+	// has already waited drainPaintStride events, or on the stop edge.
+	// pendingComposite is the owed flag; one composite pass serves however
+	// many heartbeats accumulated, so interleaved repaints can no longer
+	// lag the queue seconds behind a scripted burst.
+	pendingComposite, liveSteadyMarked := false, false
+	flushComposite := func() {
+		if !pendingComposite {
+			return
+		}
+		pendingComposite = false
+		if remote != nil {
+			remote.frameMu.Lock()
+		}
+		before := presents
+		compositeTick(scan, uint64(ticks), &presents)
+		if remote != nil {
+			if presents > before {
+				remote.presented++
+			}
+			remote.frameMu.Unlock()
+		}
+		if !demoMode && ticks > maxTicks && !liveSteadyMarked {
+			// The live-persistence proof: printed only once the loop has
+			// ACTUALLY ticked past the demo ceiling, carrying how many
+			// tabs are still open (live mode auto-closes nothing). A
+			// merged batch can step over maxTicks+1, so the latch —
+			// not an equality probe — is the once-only.
+			liveSteadyMarked = true
+			vi.ConsoleLine(MarkerLiveSteady + "tabs=" + vi.Itoa64(int64(tabs.Count())))
+		}
+	}
+	// The mailbox gets the same mid-drain cadence as the paint: a deep
+	// queue must not park a WM_RPC past its bounded-poll ack window.
+	serviceMailbox := func() {
 		if served := serviceRPC(); demoMode && served > 0 {
 			lastActivityTick = uint64(ticks)
 		}
+	}
+	vi.ConsoleLine(MarkerServing)
+	for events := 0; !demoMode || (events < maxEvents && ticks < tickLimit); {
+		serviceMailbox()
 		noteBadgeTransition()
 		if remote != nil {
 			if remote.drainInput() {
@@ -496,14 +549,17 @@ func main() {
 		// poll. A virtio chord can enqueue several WM_KEY/POINTER events while
 		// the seat is between ticks; processing only one leaves focus-dependent
 		// input behind the heartbeat and makes the next chord race the prior
-		// focus transition. Each tick still gets its own composite/present pass.
+		// focus transition. #2730: a queued heartbeat no longer costs an
+		// immediate composite — onTick accounts it (and still stops the drain
+		// at the demo bound) while flushComposite pays the owed paint once,
+		// after the input that queued behind it.
 		bound := maxEvents - events
 		if !demoMode {
 			// Live mode has no run budget; the per-burst drain bound stays so
 			// a flood still cannot starve the composite loop.
 			bound = maxEvents
 		}
-		events += drainSeatEvents(e, vi.PollEvent, consumeSeatEvent, bound, func() bool {
+		events += drainSeatEvents(e, vi.PollEvent, consumeSeatEvent, bound, serviceMailbox, func() bool {
 			if demoMode {
 				// #2703: re-arm the budget on observed activity BEFORE
 				// the expiry check, so the extension the last event
@@ -514,25 +570,21 @@ func main() {
 				}
 			}
 			ticks++
-			if remote != nil {
-				remote.frameMu.Lock()
-			}
-			before := presents
-			compositeTick(scan, uint64(ticks), &presents)
-			if remote != nil {
-				if presents > before {
-					remote.presented++
-				}
-				remote.frameMu.Unlock()
-			}
-			if !demoMode && ticks == maxTicks+1 {
-				// The live-persistence proof: printed only once the loop has
-				// ACTUALLY ticked past the demo ceiling, carrying how many
-				// tabs are still open (live mode auto-closes nothing).
-				vi.ConsoleLine(MarkerLiveSteady + "tabs=" + vi.Itoa64(int64(tabs.Count())))
-			}
+			// seatTick follows the last CONSUMED heartbeat, not the last
+			// painted one: notifyPush anchors a toast's born/expiry to it
+			// at RPC time, and a mid-drain service can now run while a
+			// paint is still owed — anchoring to the stale painted tick
+			// let a deep batch expire a fresh toast on its first
+			// notifyTick (observed boot 05: dismiss without paint).
+			seatTick = uint64(ticks)
+			// One marker per consumed heartbeat, at its arrival position:
+			// the gate's serial-count pins heartbeats, not composites —
+			// a deferred batch still names each of them. The marker now
+			// precedes the paint it earned rather than riding inside it.
+			vi.ConsoleLine(MarkerTick)
+			pendingComposite = true
 			return !demoMode || ticks < tickLimit
-		})
+		}, flushComposite)
 	}
 	// M73z (#1638): the budget can expire with a tab still open — a late
 	// declare's single-tab countdown (hostTicks) needs 16 MORE ticks and
@@ -610,21 +662,26 @@ func demoTickLimit(tickLimit, cap int) int {
 	return tickLimit
 }
 
-// seatTick is the composite tick count the last paint pass ran at, in the
-// same units compositeTick's `ticks`. The main loop keeps its own counter as
-// a local; this is the package-visible copy the WM_RPC arms need, because
-// applyRPC runs between ticks (serviceRPC is called before the event poll)
-// and a toast born "now" has to know which tick now is. Set only by
-// compositeTick, so it always names a tick that actually painted.
+// seatTick is the last consumed heartbeat — #2730: a composite pass is
+// deferred behind the input that queued with it, so consumers anchoring to
+// "now" (activity re-arm, idle) need the consumed count, not the painted
+// one. compositeClock counts actual compositeTick passes and is the clock
+// toast TTL/notify sweep anchor to: a toast lives NotifyTicks-1 PAINTS, and
+// under a coalesced drain heartbeats no longer equal paints (observed boot
+// 05: a fresh toast born on a stale painted tick expired on its first
+// notifyTick — dismiss without paint).
 var seatTick uint64
+var compositeClock uint64
 
 // compositeTick performs one bounded compositor pass after a COMPOSITE_TICK
 // event. Keeping it separate lets the event drain preserve each tick's paint,
 // present, and host-lifecycle ordering while still consuming a complete input
 // burst in one queue pass.
 func compositeTick(scan []byte, ticks uint64, presents *int) {
+	compositeClock++
 	seatTick = ticks
-	vi.ConsoleLine(MarkerTick)
+	// MarkerTick is printed by the drain's onTick accounting (#2730): one
+	// marker per consumed heartbeat, whether or not this pass runs.
 	idleAdvance(ticks)
 	// M120b (#2559): pending session re-execs reap on the tick cadence —
 	// a pid that died before its declare, or outlived the declare window,
@@ -671,11 +728,11 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	// reason a toast exists. Expiry runs first so a toast that has run out
 	// is never painted for one more frame, and so the dismiss marker lands
 	// in the same tick the pixels stop changing.
-	notifyTick(ticks)
+	notifyTick(compositeClock)
 	// M125f (#2591): a crash receipt's deferred re-exec runs here — off
 	// the teardown event and clear of crashSave's whole-VM save.
 	crashRestartTick()
-	painted := paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, ticks)
+	painted := paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, compositeClock)
 	centerPainted := paintNotifyCenter(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	// M124a (#2580): the drag ghost paints over every other chrome layer
 	// — the gesture owns the frame while the button is held — and under
@@ -788,20 +845,61 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 }
 
 // drainSeatEvents consumes the first event and every event already queued
-// behind it, preserving kernel arrival order. The bound prevents a producer
-// that never stops from starving the composite loop. RPCs are serviced by the
-// caller before the first poll; they have a separate mailbox and therefore no
-// jointly observable arrival order with the kernel event queue.
-func drainSeatEvents(first vi.Event, poll func() (vi.Event, bool), consume func(vi.Event) bool, bound int, onTick func() bool) (events int) {
+// behind it, preserving kernel arrival order. Non-tick events are handled in
+// place; a COMPOSITE_TICK is accounted immediately through onTick (false
+// still stops the drain) but the PAINT it owes is deferred to flush —
+// invoked once when the queue empties or the bound trips, early when an owed
+// paint has already waited drainPaintStride events, and once on the stop
+// edge so the heartbeat that reached the demo bound still lands its frame
+// (#2730: interleaved repaint work is what lagged the seat seconds behind a
+// scripted burst — a tick queued ahead of input is worthless as a frame and
+// worse as a delay). service runs mid-drain every drainServiceStride events
+// so the mailbox's bounded-poll ack windows hold while the queue is deep;
+// RPCs have a separate mailbox and therefore no jointly observable arrival
+// order with the kernel event queue.
+func drainSeatEvents(first vi.Event, poll func() (vi.Event, bool), consume func(vi.Event) bool, bound int, service func(), onTick func() bool, flush func()) (events int) {
 	if bound < 1 {
 		return 0
 	}
+	// heldDebt counts events consumed since a paint became owed (the owed
+	// tick opens the window); sinceService paces the mailbox probe. Both
+	// reset when their work is paid. flush is invoked only while a tick
+	// event was consumed since the last flush — the callee still decides
+	// whether the paint is owed (the demo bound refuses before owing).
+	heldDebt, sinceService := 0, 0
+	payPaint := func() {
+		if heldDebt == 0 {
+			return
+		}
+		heldDebt = 0
+		if flush != nil {
+			flush()
+		}
+	}
 	consumeEvent := func(e vi.Event) bool {
 		events++
-		if !consume(e) || onTick == nil {
+		sinceService++
+		if service != nil && sinceService >= drainServiceStride {
+			sinceService = 0
+			service()
+		}
+		if !consume(e) {
+			if heldDebt > 0 {
+				heldDebt++
+				if heldDebt >= drainPaintStride {
+					payPaint()
+				}
+			}
 			return true
 		}
-		return onTick()
+		if heldDebt == 0 {
+			heldDebt = 1
+		}
+		if onTick != nil && !onTick() {
+			payPaint()
+			return false
+		}
+		return true
 	}
 	if !consumeEvent(first) {
 		return events
@@ -812,9 +910,10 @@ func drainSeatEvents(first vi.Event, poll func() (vi.Event, bool), consume func(
 			break
 		}
 		if !consumeEvent(e) {
-			break
+			return events
 		}
 	}
+	payPaint()
 	return events
 }
 

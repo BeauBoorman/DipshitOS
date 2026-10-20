@@ -595,7 +595,7 @@ func applyRPC(req vi.WmRpc) bool {
 		if text == "" || tabs.index(id) < 0 {
 			return false
 		}
-		text, _, dropped := notifyPush(id, text, seatTick)
+		text, _, dropped := notifyPush(id, text, compositeClock)
 		// M82d2 (#1785): under do-not-disturb the notice is in the center's
 		// history and nothing else — no toast was queued, so there is no
 		// drop to report and no `notify id=` to claim. The ack is applied

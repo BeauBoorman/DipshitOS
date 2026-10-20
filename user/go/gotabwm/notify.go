@@ -250,8 +250,10 @@ func clearNotify(id uint32) int {
 // expires`.
 //
 // The lifetime is NotifyTicks-1 PAINTS, not NotifyTicks, and the difference
-// is not cosmetic: the WM_RPC is applied between ticks, so `born` is
-// seatTick — the last tick that actually painted — and the entry's first
+// is not cosmetic: the WM_RPC is applied between paints, so `born` is
+// seatTick — the last consumed heartbeat (#2730: composites are deferred
+// inside a drain, so seatTick tracks consumption, not the paint pass) —
+// and the entry's first
 // paint is the tick AFTER it was queued. An entry born at T is therefore on
 // screen for ticks T+1 .. T+NotifyTicks-1 (7 paints, ~7s at the 1Hz tick,
 // not 8) and is gone on T+NotifyTicks.

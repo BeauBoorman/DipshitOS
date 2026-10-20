@@ -182,12 +182,14 @@ pub fn reset(pid: usize) void {
 /// half full AND already holds an unconsumed tick, another heartbeat adds
 /// no information — merge its damage mask (arg1) into the pending tick and
 /// refresh its present sequence (arg0) instead of enqueuing. Below the
-/// floor every tick queues normally (the pinned wm_server behavior — the
-/// seat expects one pending event per push when it is keeping up). Without
-/// this a stalled consumer accrues a tick per second until the queue is
-/// all heartbeats and drop-oldest evicts the real input behind them —
-/// observed on go-dogfood boot 08: the seat's stall let ticks evict the
-/// pointer burst's head (the press that armed the drag never arrived).
+/// floor every tick still queues as its own event: the seat's consumed-tick
+/// count is its heartbeat clock (demo budgets, idle timing), and the seat
+/// now coalesces the PAINTS drain-side (#2730) without losing the count —
+/// merging here would under-report heartbeats to any consumer that fell
+/// behind. Without the floor merge a stalled consumer accrues a tick per
+/// second until the queue is all heartbeats and drop-oldest evicts the
+/// real input behind them (observed on go-dogfood boot 08: the stall let
+/// ticks evict the pointer burst's head).
 const tick_merge_floor: usize = max_events / 2;
 
 pub fn push(pid: usize, ev_in: Event) void {
@@ -202,6 +204,15 @@ pub fn push(pid: usize, ev_in: Event) void {
                 storage[pid][s].arg0 = ev.arg0;
                 storage[pid][s].arg1 |= ev.arg1;
                 pushed_counts[pid] +%= 1;
+                // The hook still fires: a blocked sys_wait_event caller
+                // only parks after seeing an empty queue, so a task that
+                // lost the park-vs-push race (the wake scan ran before
+                // wait_event_pid was set) is owed every later push —
+                // merged or not — or a run of merged heartbeats would
+                // sleep it forever with a tick pending.
+                if (on_event_pushed) |hook| {
+                    hook(pid);
+                }
                 return;
             }
         }
@@ -383,6 +394,50 @@ test "events: process isolation and lifecycle reset" {
     push(0, .{ .kind = KEY_DOWN, .flags = 0, .seq = 0, .arg0 = 0x05, .arg1 = 'b' });
     const e0 = pop(0).?;
     try std.testing.expectEqual(@as(u32, 1), e0.seq);
+}
+
+test "events: COMPOSITE_TICK merges only past the half-full floor and still wakes" {
+    init();
+    var wakes: usize = 0;
+    const Hook = struct {
+        var n: *usize = undefined;
+        fn fired(_: usize) void {
+            n.* += 1;
+        }
+    };
+    Hook.n = &wakes;
+    on_event_pushed = Hook.fired;
+    defer on_event_pushed = null;
+
+    // Below the floor every tick queues as its own event — the seat's
+    // consumed-tick count is its heartbeat clock, so sub-floor heartbeats
+    // must stay countable one-for-one.
+    push(0, .{ .kind = COMPOSITE_TICK, .flags = 0, .seq = 0, .arg0 = 9, .arg1 = 0 });
+    push(0, .{ .kind = COMPOSITE_TICK, .flags = 0, .seq = 0, .arg0 = 10, .arg1 = 0 });
+    try std.testing.expectEqual(@as(usize, 2), pending(0));
+    _ = pop(0).?;
+    _ = pop(0).?;
+
+    // At the floor a pending tick absorbs the push: damage OR-ed, present
+    // sequence refreshed — and the push still fires the wake hook (a
+    // parked task that lost the wake-scan race is owed every push,
+    // merged or not).
+    var i: u32 = 0;
+    while (i < tick_merge_floor) : (i += 1) {
+        push(0, .{ .kind = KEY_DOWN, .flags = 0, .seq = 0, .arg0 = i, .arg1 = 'a' });
+    }
+    push(0, .{ .kind = COMPOSITE_TICK, .flags = 0, .seq = 0, .arg0 = 10, .arg1 = 0x2 });
+    push(0, .{ .kind = COMPOSITE_TICK, .flags = 0, .seq = 0, .arg0 = 11, .arg1 = 0x5 });
+    try std.testing.expectEqual(tick_merge_floor + 1, pending(0));
+    try std.testing.expectEqual(@as(usize, tick_merge_floor + 4), wakes);
+    while (pending(0) > 1) {
+        _ = pop(0).?;
+    }
+    const tick = pop(0).?;
+    try std.testing.expectEqual(COMPOSITE_TICK, tick.kind);
+    try std.testing.expectEqual(@as(u32, 11), tick.arg0);
+    try std.testing.expectEqual(@as(u32, 0x7), tick.arg1);
+    try std.testing.expect(pop(0) == null);
 }
 
 test "events: out-of-range PIDs and invalid kinds are defensive no-ops" {

@@ -80,7 +80,7 @@ func hostdropApply(rec hostint.Record) string {
 	// sanitized name — the click can never be retargeted at a file the
 	// record did not announce. The binding lands on the center row too,
 	// so a DND-held notice stays actionable there.
-	_, _, dropped := notifyPushAction(0, text, seatTick, notifyActionDropOpen, name)
+	_, _, dropped := notifyPushAction(0, text, compositeClock, notifyActionDropOpen, name)
 	if dropped {
 		hostintLog(MarkerNotifyDrop + vi.Itoa64(int64(notifyDropped)))
 	}

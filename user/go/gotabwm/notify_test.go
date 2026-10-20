@@ -557,11 +557,12 @@ func TestToastSurvivesTheRestOfTheTick(t *testing.T) {
 	launch = launcherState{}
 	launch.open = true
 	launch.filtered = []int{0}
-	notifyPush(4, "copied KNOWN.TXT", 3)
+	compositeClock = 3
+	notifyPush(4, "copied KNOWN.TXT", compositeClock)
 
 	scan := make([]byte, vi.ScanoutWidth*vi.ScanoutHeight*4)
 	presents := 0
-	compositeTick(scan, 4, &presents) // born at seatTick 3, painted at tick 4
+	compositeTick(scan, 4, &presents) // born at composite 3, painted at 4
 
 	x, y, pw, ph := notifyRect(vi.ScanoutWidth, vi.ScanoutHeight, 0, 1)
 	pix := asUint32(scan)

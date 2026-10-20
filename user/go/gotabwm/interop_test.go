@@ -345,6 +345,7 @@ func TestApplyRpcNotify(t *testing.T) {
 		t.Fatal("OpenTab")
 	}
 	seatTick = 7
+	compositeClock = 7
 
 	if !applyRPC(navRPC(vi.WmRpcKindNotify, 4, "copied KNOWN.TXT")) {
 		t.Fatal("a notify from a known tab must be applied")
@@ -356,11 +357,13 @@ func TestApplyRpcNotify(t *testing.T) {
 	if e.tabID != 4 || e.text != "copied KNOWN.TXT" {
 		t.Fatalf("queued entry = id %d %q", e.tabID, e.text)
 	}
-	// Born at the tick the seat last painted, so the lifetime is measured
-	// from a tick that actually happened.
-	if e.born != seatTick || e.expires != seatTick+NotifyTicks {
+	// Born at the composite pass the seat last ran, so the lifetime is
+	// measured in paints that actually happened (#2730: composites are
+	// deferred behind input inside a drain — heartbeat count is not the
+	// paint clock).
+	if e.born != compositeClock || e.expires != compositeClock+NotifyTicks {
 		t.Fatalf("entry lifetime = [%d,%d) want [%d,%d)",
-			e.born, e.expires, seatTick, seatTick+NotifyTicks)
+			e.born, e.expires, compositeClock, compositeClock+NotifyTicks)
 	}
 	if applyRPC(navRPC(vi.WmRpcKindNotify, 99, "ghost")) {
 		t.Error("a notify from an UNKNOWN tab must be refused (applied=0)")

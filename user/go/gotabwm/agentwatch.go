@@ -214,7 +214,7 @@ func agentApply(name string) bool {
 	if ms := agentMilestone(verb, []byte(args), result); ms != "" {
 		agentLogFn(MarkerAgentMilestone + ms)
 		if agentCaughtUp {
-			text, _, dropped := agentToastFn(0, "agent: "+ms+" ok", seatTick)
+			text, _, dropped := agentToastFn(0, "agent: "+ms+" ok", compositeClock)
 			if dropped {
 				agentLogFn(MarkerNotifyDrop + vi.Itoa64(int64(notifyDropped)))
 			}

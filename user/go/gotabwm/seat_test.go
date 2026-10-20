@@ -247,7 +247,7 @@ func TestDrainSeatEventsConsumesWholeBurstInArrivalOrder(t *testing.T) {
 		queue = queue[1:]
 		return e, true
 	}
-	if n := drainSeatEvents(vi.Event{Kind: vi.EvWmKey, Arg0: 1}, poll, consume, 10, onTick); n != 3 {
+	if n := drainSeatEvents(vi.Event{Kind: vi.EvWmKey, Arg0: 1}, poll, consume, 10, nil, onTick, nil); n != 3 {
 		t.Fatalf("drained %d events, want 3", n)
 	}
 	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
@@ -270,11 +270,121 @@ func TestDrainSeatEventsStopsAtTickLimit(t *testing.T) {
 	}
 	consume := func(e vi.Event) bool { return e.Kind == vi.EvCompositeTick }
 	onTick := func() bool { return false }
-	if n := drainSeatEvents(vi.Event{Kind: vi.EvCompositeTick}, poll, consume, 10, onTick); n != 1 {
+	flushes := 0
+	flush := func() { flushes++ }
+	if n := drainSeatEvents(vi.Event{Kind: vi.EvCompositeTick}, poll, consume, 10, nil, onTick, flush); n != 1 {
 		t.Fatalf("drained %d events after tick-limit refusal, want 1", n)
 	}
 	if len(queue) != 1 {
 		t.Fatalf("queue changed after tick-limit refusal: %d events remain", len(queue))
+	}
+	// The stop edge still offers the owed paint once — the live closure
+	// decides whether the refused heartbeat actually owed a frame.
+	if flushes != 1 {
+		t.Fatalf("flushes on the stop edge = %d, want 1", flushes)
+	}
+}
+
+// #2730: the composite a heartbeat owes is deferred behind the input that
+// queued behind it — one flush pays however many ticks the batch held, and
+// it lands after every queued event, not at the tick's own position.
+func TestDrainSeatEventsDefersPaintBehindQueuedInput(t *testing.T) {
+	queue := []vi.Event{
+		{Kind: vi.EvWmKey, Arg0: 2},
+		{Kind: vi.EvCompositeTick},
+		{Kind: vi.EvWmKey, Arg0: 3},
+		{Kind: vi.EvCompositeTick},
+	}
+	var order []string
+	poll := func() (vi.Event, bool) {
+		if len(queue) == 0 {
+			return vi.Event{}, false
+		}
+		e := queue[0]
+		queue = queue[1:]
+		return e, true
+	}
+	consume := func(e vi.Event) bool {
+		if e.Kind == vi.EvCompositeTick {
+			return true
+		}
+		order = append(order, "key"+vi.Itoa64(int64(e.Arg0)))
+		return false
+	}
+	onTick := func() bool {
+		order = append(order, "tick")
+		return true
+	}
+	flush := func() { order = append(order, "flush") }
+	first := vi.Event{Kind: vi.EvWmKey, Arg0: 1}
+	if n := drainSeatEvents(first, poll, consume, 10, nil, onTick, flush); n != 5 {
+		t.Fatalf("drained %d events, want 5", n)
+	}
+	want := []string{"key1", "key2", "tick", "key3", "tick", "flush"}
+	if len(order) != len(want) {
+		t.Fatalf("drain order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("drain order = %v, want %v", order, want)
+		}
+	}
+}
+
+// #2730: a paint owed behind a stream that never quiets is paid once per
+// drainPaintStride events — the input keeps its lead, the scanout keeps a
+// bounded cadence, and no gratuitous flush runs at the drain's tail.
+func TestDrainSeatEventsPaysOwedPaintAtStride(t *testing.T) {
+	queue := make([]vi.Event, 0, drainPaintStride+4)
+	for i := 0; i < drainPaintStride+4; i++ {
+		queue = append(queue, vi.Event{Kind: vi.EvWmKey, Arg0: uint32(i)})
+	}
+	poll := func() (vi.Event, bool) {
+		if len(queue) == 0 {
+			return vi.Event{}, false
+		}
+		e := queue[0]
+		queue = queue[1:]
+		return e, true
+	}
+	consume := func(e vi.Event) bool { return e.Kind == vi.EvCompositeTick }
+	onTick := func() bool { return true }
+	flushes := 0
+	flush := func() { flushes++ }
+	n := drainSeatEvents(vi.Event{Kind: vi.EvCompositeTick}, poll, consume, maxEvents, nil, onTick, flush)
+	if n != drainPaintStride+5 {
+		t.Fatalf("drained %d events, want %d", n, drainPaintStride+5)
+	}
+	if flushes != 1 {
+		t.Fatalf("owed-paint flushes = %d, want 1 (one mid-drain pay, nothing owed at the tail)", flushes)
+	}
+}
+
+// #2730: the mailbox is serviced every drainServiceStride events inside the
+// drain — a deep queue cannot park a WM_RPC past its bounded-poll window.
+func TestDrainSeatEventsServicesMailboxAtStride(t *testing.T) {
+	const nkeys = 21
+	queue := make([]vi.Event, 0, nkeys)
+	for i := 0; i < nkeys; i++ {
+		queue = append(queue, vi.Event{Kind: vi.EvWmKey, Arg0: uint32(i)})
+	}
+	poll := func() (vi.Event, bool) {
+		if len(queue) == 0 {
+			return vi.Event{}, false
+		}
+		e := queue[0]
+		queue = queue[1:]
+		return e, true
+	}
+	consume := func(e vi.Event) bool { return e.Kind == vi.EvCompositeTick }
+	services := 0
+	service := func() { services++ }
+	if n := drainSeatEvents(vi.Event{Kind: vi.EvWmKey, Arg0: 0}, poll, consume, maxEvents, service, nil, nil); n != nkeys+1 {
+		t.Fatalf("drained %d events, want %d", n, nkeys+1)
+	}
+	// 22 events at stride 8: probes at event 8 and 16.
+	if want := (nkeys + 1) / drainServiceStride; services != want {
+		t.Fatalf("mid-drain services = %d, want %d", services, want)
 	}
 }
 

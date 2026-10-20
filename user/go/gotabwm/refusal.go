@@ -172,7 +172,7 @@ func seatRefusalName(name, ctx, payload string) {
 	}
 push:
 	text := refusalText(name, ctx)
-	notifyPushAction(0, text, seatTick, action, payload)
+	notifyPushAction(0, text, compositeClock, action, payload)
 	vi.ConsoleLine(MarkerRefusal + name + " " + ctx +
 		" act=" + refusalActionName(action))
 }
