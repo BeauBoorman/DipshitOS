@@ -64,6 +64,7 @@ const (
 	markerAgent      = "top: tab=agent"
 	markerGPU        = "top: tab=gpu"
 	markerTrust      = "top: tab=trust"
+	markerMounts     = "top: tab=mounts"
 	markerRefreshed  = "top: refreshed ok"
 	markerKill       = "top: kill pid="
 	markerCount      = "top: procs n="
@@ -114,6 +115,7 @@ const (
 	pageAgent
 	pageGPU
 	pageTrust
+	pageMounts
 )
 
 // Native layout (top.zig's native_* rects, so GOTOP opens where TOP opened).
@@ -129,12 +131,15 @@ var (
 	natAgent = widgets.Rect{X: 226, Y: 6, W: 34, H: 20}
 	natGPU   = widgets.Rect{X: 264, Y: 6, W: 28, H: 20}
 	natTrust = widgets.Rect{X: 296, Y: 6, W: 34, H: 20}
+	// M134b (#2760): the mounts tab squeezes the filter plate once more —
+	// one toolbar line holds it.
+	natMounts = widgets.Rect{X: 334, Y: 6, W: 30, H: 20}
 	// The filter field sits near where Zig TOP.BIN's native_filter_input
 	// sat — its "Filter:" label to the left — and the summary line ends
 	// the row.
-	natFilterLabel = widgets.Rect{X: 334, Y: 6, W: 40, H: 20}
-	natFilter      = widgets.Rect{X: 378, Y: 6, W: 46, H: 20}
-	natSummary     = widgets.Rect{X: 428, Y: 6, W: 78, H: 20}
+	natFilterLabel = widgets.Rect{X: 368, Y: 6, W: 40, H: 20}
+	natFilter      = widgets.Rect{X: 412, Y: 6, W: 42, H: 20}
+	natSummary     = widgets.Rect{X: 458, Y: 6, W: 48, H: 20}
 	natHeader      = widgets.Rect{X: 6, Y: 52, W: 500, H: 16}
 	natList        = widgets.Rect{X: 6, Y: 70, W: 500, H: 256}
 	natFoot        = widgets.Rect{X: 6, Y: 330, W: 500, H: 18}
@@ -151,6 +156,7 @@ type app struct {
 	ag   *AgentView
 	gpu  *GPUView
 	tr   *TrustView
+	mnt  *MountView
 	pg   page
 	auto bool
 
@@ -169,6 +175,7 @@ type app struct {
 	agentBtn   widgets.Button
 	gpuBtn     widgets.Button
 	trustBtn   widgets.Button
+	mntBtn     widgets.Button
 	summary    widgets.Text
 	header     widgets.Text
 	foot       widgets.Text
@@ -216,6 +223,7 @@ func main() {
 		ag:  NewAgentView(),
 		gpu: NewGPUView(),
 		tr:  NewTrustView(),
+		mnt: NewMountView(),
 		pg:  pageProcs,
 	}
 	a.bindFilter()
@@ -285,6 +293,9 @@ func (a *app) refreshAll(rows, announce bool) {
 	}
 	if a.pg == pageTrust {
 		a.refreshTrust()
+	}
+	if a.pg == pageMounts {
+		a.refreshMounts()
 	}
 	running, exited, _ := a.tab.Counts()
 	vi.ConsoleLine(markerCount + vi.Itoa64(int64(n)) +
@@ -388,6 +399,7 @@ func (a *app) layout() {
 	a.agentBtn = widgets.Button{R: scaleR(natAgent), Label: "Agent"}
 	a.gpuBtn = widgets.Button{R: scaleR(natGPU), Label: "GPU"}
 	a.trustBtn = widgets.Button{R: scaleR(natTrust), Label: "Trust"}
+	a.mntBtn = widgets.Button{R: scaleR(natMounts), Label: "Mnt"}
 	switch a.pg {
 	case pageProcs:
 		a.procsBtn.Face = t.Accent
@@ -404,6 +416,9 @@ func (a *app) layout() {
 	case pageTrust:
 		a.trustBtn.Face = t.Accent
 		a.trustBtn.LabelRGB = t.OnAccent
+	case pageMounts:
+		a.mntBtn.Face = t.Accent
+		a.mntBtn.LabelRGB = t.OnAccent
 	}
 
 	a.summary = widgets.Text{R: scaleR(natSummary), Label: a.status, Fg: t.Muted, Bg: t.Bg}
@@ -427,6 +442,9 @@ func (a *app) layout() {
 		sel = -1
 	case pageTrust:
 		items = a.tr.Lines()
+		sel = -1
+	case pageMounts:
+		items = a.mnt.Lines()
 		sel = -1
 	}
 	a.list = widgets.List{
@@ -490,9 +508,11 @@ func (a *app) footLine() string {
 	case pageGPU:
 		return "p procs   n net   g agent   t trust   r refresh   a auto"
 	case pageTrust:
-		return "p procs   n net   g agent   c gpu   r refresh   a auto"
+		return "p procs   n net   g agent   c gpu   m mounts   r refresh   a auto"
+	case pageMounts:
+		return "p procs   n net   g agent   c gpu   t trust   r refresh   a auto"
 	}
-	return "k kill   r refresh   a auto   n net   g agent   c gpu   t trust   / filter   1-6 sort"
+	return "k kill   r refresh   a auto   n net   g agent   c gpu   t trust   m mnt   / filter   1-6 sort"
 }
 
 func (a *app) draw() {
@@ -505,6 +525,7 @@ func (a *app) draw() {
 	a.agentBtn.Draw(cv)
 	a.gpuBtn.Draw(cv)
 	a.trustBtn.Draw(cv)
+	a.mntBtn.Draw(cv)
 	a.refreshBtn.Draw(cv)
 	a.killBtn.Draw(cv)
 	a.autoBtn.Draw(cv)
@@ -538,6 +559,9 @@ func (a *app) setPage(p page) bool {
 	case pageTrust:
 		vi.ConsoleLine(markerTrust)
 		a.refreshTrust()
+	case pageMounts:
+		vi.ConsoleLine(markerMounts)
+		a.refreshMounts()
 	default:
 		vi.ConsoleLine(markerProcs)
 	}
@@ -565,6 +589,21 @@ func (a *app) refreshAgent() {
 func (a *app) refreshGPU() {
 	a.gpu.Refresh()
 	vi.ConsoleLine(a.gpu.Marker())
+}
+
+// refreshMounts re-enumerates the kernel mount table and prints the
+// serial evidence: the count line, then one bounded marker per row —
+// name, state, kind, flags — the same row-dump discipline printRows uses.
+func (a *app) refreshMounts() {
+	a.mnt.Refresh()
+	vi.ConsoleLine(a.mnt.Marker())
+	for i := 0; i < rowMarkerMax; i++ {
+		line, ok := a.mnt.RowMarker(i)
+		if !ok {
+			break
+		}
+		vi.ConsoleLine(line)
+	}
 }
 
 // refreshTrust resamples the trust posture against the SAME process
@@ -754,6 +793,8 @@ func (a *app) handleKey(ev vi.Event) bool {
 		return a.setPage(pageGPU)
 	case 't', 'T':
 		return a.setPage(pageTrust)
+	case 'm', 'M':
+		return a.setPage(pageMounts)
 	case '/', 'f', 'F':
 		if a.pg == pageProcs {
 			return a.openFilter()
@@ -821,6 +862,9 @@ func (a *app) handleClick(x, y int) bool {
 	}
 	if a.trustBtn.HitTest(x, y) {
 		return a.setPage(pageTrust)
+	}
+	if a.mntBtn.HitTest(x, y) {
+		return a.setPage(pageMounts)
 	}
 	if a.refreshBtn.HitTest(x, y) {
 		a.refreshAll(true, true)

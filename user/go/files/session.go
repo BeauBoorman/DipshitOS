@@ -26,7 +26,7 @@
 // rather than fail (a bigger sel than today's listing just means the
 // directory shrank). A saved cwd that no longer exists walks up to the
 // nearest existing parent — the volumes root is the floor, because it is
-// synthetic and always lists.
+// the mount table and always lists.
 package main
 
 import "virelai/vi"
@@ -49,7 +49,7 @@ type filesState struct {
 }
 
 // stateDirProbe is the restore path's existence check — vi.DirList on the
-// guest, a stub in host tests (the same seam shape as diskMounted).
+// guest, a stub in host tests (the same seam shape as mountRows).
 var stateDirProbe = func(path string) int64 {
 	var scratch [1]vi.DirEntry
 	_, rc := vi.DirList(path, scratch[:])
@@ -112,8 +112,8 @@ func decodeState(b []byte) (filesState, bool) {
 
 // resolveStatePath walks a saved cwd up to the nearest directory that
 // actually lists — the card's "missing cwd falls back" rule. Mount roots
-// stop at the synthetic volumes list (above a mount root is "/", never
-// the other volume), which is also the floor when nothing lists at all.
+// stop at the volumes list (above a mount root is "/", never another
+// volume), which is also the floor when nothing lists at all.
 // fell reports that resolved != saved.
 func resolveStatePath(saved string) (resolved string, fell bool) {
 	p := saved
@@ -121,7 +121,7 @@ func resolveStatePath(saved string) (resolved string, fell bool) {
 		if stateDirProbe(p) >= 0 {
 			return p, p != saved
 		}
-		if p == rootPath || p == diskRoot {
+		if isMountRoot(p) {
 			break
 		}
 		next := parentPath(p)

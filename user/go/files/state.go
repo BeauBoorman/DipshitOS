@@ -241,10 +241,13 @@ func (m *model) refresh() {
 	if rc < 0 {
 		m.n, m.sel = 0, 0
 		m.status = "list err"
-		// An ENOENT under /disk is the kernel's `not_mounted` (ADR 0050
-		// D6) — name it so an absent data disk never reads as corruption.
-		if volumeOf(m.path) == volDisk && !diskMounted() {
-			m.status = "disk: not mounted"
+		// M134b (#2760): ENXIO under a mount row is the kernel's named
+		// `not_mounted` — name it so an absent volume never reads as
+		// corruption.
+		if err := vi.MountErr(rc); vi.IsNotMounted(err) {
+			if vol := volumeOf(m.path); vol != "" {
+				m.status = vol + ": not mounted"
+			}
 		}
 		m.emit(markerListErr + vi.Itoa64(rc))
 		m.watcher.Adopt(vi.DirSnapshot{OK: false})
@@ -274,27 +277,58 @@ func (m *model) refresh() {
 	m.loadPreview()
 }
 
-// refreshVolumes lists the synthetic volumes root (M100f #2311): the two
-// mount names in the same wire-entry shape a real listing carries, so the
-// whole render/selection machinery applies unchanged. The disk row's mount
-// state is named every list — the kernel's refusal for an absent mount is
-// `not_mounted` (ADR 0050 D6), and the marker carries it verbatim.
+// refreshVolumes lists the volumes root — the kernel's mount table
+// (M134b #2760): sys_dir_list("/") returns one row per mount, carrying the
+// live state and kind in the wire row's reserved bytes, so the whole
+// render/selection machinery applies unchanged. Every row's state is
+// named each list — a mounted volume carries its rw/ro posture, an absent
+// one the `not_mounted` name (ADR 0050 D6).
 func (m *model) refreshVolumes() {
-	m.entries[0] = volEntry(volHost)
-	m.entries[1] = volEntry(volDisk)
-	m.n = 2
-	m.clampSel()
-	// The feed never watches the synthetic root; adopt an empty baseline so
-	// the next real listing's first poll is primed, not diffed against this.
-	m.watcher.Adopt(vi.DirSnapshot{OK: false})
-	m.emit(markerList + m.path + " n=" + vi.Itoa64(2))
-	for i := 0; i < m.n; i++ {
-		m.emit(markerEntry + m.entries[i].NameString() + " dir size=0")
+	mounts, rc := mountRows()
+	if rc < 0 {
+		m.n, m.sel = 0, 0
+		m.status = "list err"
+		m.emit(markerListErr + vi.Itoa64(rc))
+		m.watcher.Adopt(vi.DirSnapshot{OK: false})
+		m.loadPreview()
+		return
 	}
-	if diskMounted() {
-		m.emit(markerVolDiskMounted)
-	} else {
-		m.emit(markerVolDiskAbsent)
+	m.n = 0
+	for _, mt := range mounts {
+		if m.n == len(m.entries) {
+			break
+		}
+		var e vi.DirEntry
+		copy(e.Name[:], mt.Name)
+		if mt.Dir {
+			e.IsDir = 1
+		}
+		e.Reserved[0] = mt.State
+		e.Reserved[1] = mt.Kind
+		if mt.ReadOnly {
+			e.Reserved[2] = vi.MountFlagReadOnly
+		}
+		m.entries[m.n] = e
+		m.n++
+	}
+	m.clampSel()
+	// The feed never watches the mount-table root; adopt an empty baseline
+	// so the next real listing's first poll is primed, not diffed against
+	// this.
+	m.watcher.Adopt(vi.DirSnapshot{OK: false})
+	m.emit(markerList + m.path + " n=" + vi.Itoa64(int64(m.n)))
+	for i := 0; i < m.n; i++ {
+		mt := vi.MountFromEntry(m.entries[i])
+		kind := "file"
+		if mt.Dir {
+			kind = "dir"
+		}
+		m.emit(markerEntry + mt.Name + " " + kind + " size=0")
+		line := markerVol + mt.Name + " " + mt.StateName()
+		if mt.Mounted() {
+			line += " " + mt.AccessName()
+		}
+		m.emit(line)
 	}
 	m.status = "listed"
 	m.loadPreview()
@@ -311,16 +345,24 @@ func (m *model) loadPreview() {
 	}
 	e := m.entries[m.sel]
 	name := e.NameString()
+	if m.path == volsPath {
+		// A mount-table row: the row's reserved bytes carry the live state
+		// (M134b) — `not_mounted` and the kind name read straight off the
+		// kernel's answer, no probe.
+		mt := vi.MountFromEntry(e)
+		m.previewOf = name
+		switch {
+		case !mt.Dir:
+			m.preview = "block device — not browsable\n(" + mt.KindName() + ", " + mt.AccessName() + ")"
+		case !mt.Mounted():
+			m.preview = "volume — " + mt.StateName() + "\n(boot with --data-disk to attach " + name + ")"
+		default:
+			m.preview = "volume — " + mt.StateName() + " " + mt.AccessName() + "\n(enter to browse)"
+		}
+		return
+	}
 	if e.Dir() {
 		m.previewOf = name
-		if m.path == volsPath {
-			if name == volDisk && !diskMounted() {
-				m.preview = "volume — not mounted\n(boot with --data-disk to attach it)"
-			} else {
-				m.preview = "volume — enter to browse"
-			}
-			return
-		}
 		m.preview = "(directory — enter to open)"
 		return
 	}
@@ -359,7 +401,7 @@ func (m *model) loadPreview() {
 // the NEXT poll — the feed is advisory, never a lossless log.
 func (m *model) watchStep() int {
 	if m.path == volsPath {
-		return -1 // the synthetic root has no feed — the mount set is boot-fixed
+		return -1 // the mount-table root has no feed — the mount set is boot-fixed
 	}
 	first := !m.watchArmed
 	m.watchArmed = true
@@ -433,7 +475,7 @@ func (m *model) openSel() {
 		return
 	}
 	if m.path == volsPath {
-		m.enterVolume(e.NameString())
+		m.enterVolume(e)
 		return
 	}
 	if e.Dir() {
@@ -451,18 +493,25 @@ func (m *model) openSel() {
 	m.openFile()
 }
 
-// enterVolume descends from the volumes root into a mount name. /host is
-// always there; /disk refuses by name when the boot attached no data disk —
-// the refusal is the kernel's `not_mounted` (ADR 0050 D6), carried into the
-// marker and the status line.
-func (m *model) enterVolume(name string) {
-	target := "/" + name
-	if name == volDisk && !diskMounted() {
-		m.emit(markerVolRefused + name + " not_mounted")
-		m.status = "disk: not mounted"
+// enterVolume descends from the volumes root into a mount-table row. The
+// row's own state byte says whether the volume is live: a not-mounted row
+// refuses by name — the kernel's `not_mounted` (M134b #2760, ADR 0050 D6)
+// carried into the marker and the status line — and the block-device row
+// is never a directory.
+func (m *model) enterVolume(e vi.DirEntry) {
+	mt := vi.MountFromEntry(e)
+	name := mt.Name
+	switch {
+	case !mt.Mounted():
+		m.emit(markerVolRefused + name + " " + mt.StateName())
+		m.status = name + ": not mounted"
+		return
+	case !mt.Dir:
+		m.emit(markerVolRefused + name + " " + mt.KindName())
+		m.status = name + ": not a directory"
 		return
 	}
-	m.path = target
+	m.path = "/" + name
 	m.sel = 0
 	m.emit(markerCd + m.path)
 	m.refresh()
@@ -474,8 +523,8 @@ func (m *model) goUp() {
 		m.status = "at volumes root"
 		return
 	}
-	if m.path == rootPath || m.path == diskRoot {
-		// Above a mount root is the volumes list, not the other volume —
+	if isMountRoot(m.path) {
+		// Above a mount root is the volumes list, not another volume —
 		// parentPath cannot know that (it owns share paths only).
 		m.path = volsPath
 		m.sel = 0
@@ -762,8 +811,9 @@ func (m *model) closeHints() {
 	m.emit(markerHints + "close")
 }
 
-// showVolumes is the `v` chord: jump straight to the synthetic volumes root
-// (M100f #2311) — the same view Backspace/`h` reaches from a mount root.
+// showVolumes is the `v` chord: jump straight to the volumes root —
+// the kernel's mount table (M134b #2760), the same view Backspace/`h`
+// reaches from a mount root.
 func (m *model) showVolumes() {
 	if m.path == volsPath {
 		return
@@ -828,7 +878,7 @@ func (m *model) cycleSort() {
 	m.loadPreview()
 }
 
-// atVolumes guards the mutating ops: the volumes root is a synthetic list,
+// atVolumes guards the mutating ops: the volumes root is the mount table,
 // so there is nothing to rename, trash, hold or write into — each op names
 // that rather than sending the kernel a path it could never honor.
 func (m *model) atVolumes() bool {

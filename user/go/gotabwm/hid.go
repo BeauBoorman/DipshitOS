@@ -245,6 +245,58 @@ func releaseFocusCycle(ticks uint64) {
 	}
 }
 
+var (
+	snapPending    bool   // a snapshot-bundle ask is parked awaiting quiet
+	snapParkedTick uint64 // seatTick when the chord decoded (bound base)
+	snapCpuLast    uint64 // last cpu_ticks sample from the focused pid
+	snapCpuQuiet   int    // consecutive flat samples seen so far
+	snapCpuInit    bool   // a first sample has seeded snapCpuLast
+)
+
+// armSnapshotAsk parks the snapshot-bundle chord's state ask for deferred
+// application. The ask must wait for input quiet on BOTH legs — the seat's
+// own event drain AND the focused app's cpu — because cs-s lands in the
+// same input burst as the keystrokes it is meant to capture: posted
+// synchronously it can reach an app whose kernel-queued keys have not
+// drained yet, and the app answers with pre-chord state (go-fileman
+// run 07/08 observed view=0 sort=0 saved under queued tab/s). Unlike
+// the focus cycle this deferral applies live too — a state capture under
+// in-flight input is wrong for a real user's chord, not only the demo's.
+func armSnapshotAsk() bool {
+	if snapPending {
+		return true
+	}
+	snapPending = true
+	snapParkedTick = seatTick
+	snapCpuInit, snapCpuQuiet = false, 0
+	return true
+}
+
+// releaseSnapshotAsk evaluates the parked ask once per composite tick —
+// same quiet contract as releaseFocusCycle, unconditionally at the bound.
+func releaseSnapshotAsk(ticks uint64) {
+	if !snapPending {
+		return
+	}
+	inputQuiet := ticks >= lastInputTick && ticks-lastInputTick >= focusCycleQuietTicks
+	appQuiet := true
+	if id, ok := tabs.Focused(); ok && id < sessionIDBase {
+		if cpu, have := focusedCpuTicks(id); have {
+			if snapCpuInit && cpu == snapCpuLast {
+				snapCpuQuiet++
+			} else {
+				snapCpuQuiet = 0
+			}
+			snapCpuLast, snapCpuInit = cpu, true
+			appQuiet = snapCpuQuiet >= focusCycleQuietTicks
+		}
+	}
+	if (inputQuiet && appQuiet) || ticks-snapParkedTick >= focusCycleHoldMax {
+		snapPending = false
+		_ = saveSnapshot()
+	}
+}
+
 // focusedCpuTicks reads the bound owner's cumulative scheduler ticks —
 // the seat's only view of whether a hosted app is still working through
 // input the kernel already delivered. ok=false on an unbound id or an
@@ -384,8 +436,10 @@ func runSeatAction(action string, c chords.Chord) {
 		// timer on purpose — the card rules out scheduled snapshots, and
 		// a bundle taken because time passed is a bundle nobody chose.
 		// The chord's DEFINITION moved into the registry (a seat row);
-		// this is what the row does.
-		_ = saveSnapshot()
+		// this is what the row does. The ask itself parks until input
+		// quiet so keystrokes still in flight when cs-s decodes land in
+		// the captured state, not after it.
+		_ = armSnapshotAsk()
 	case "nav-back":
 		_ = applyNavStep(true)
 	case "nav-forward":

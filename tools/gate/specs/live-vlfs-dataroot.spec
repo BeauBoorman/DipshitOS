@@ -10,9 +10,11 @@
 # shared across runs, which is what makes run C's remount leg real):
 #
 #   A — DEFAULT BOOT, no --data-disk and no data_root row. GOFILES's `v`
-#       volumes list must name both mount names, mark the disk row
-#       `not_mounted` (the kernel's refusal name), and refuse the enter by
-#       name — no phantom directory, no silent /host.
+#       volumes list is the kernel's mount table (M134b #2760): one row per
+#       mount — host, disk, usb, usb1..usb4 — each row naming its live
+#       state. The disk row marks `not_mounted` (the kernel's refusal
+#       name), and the enter refuses by name — no phantom directory, no
+#       silent /host.
 #
 #   B — OPT-IN + MOUNTED. `settings set data_root disk` persists the row,
 #       then GOSELF runs under the tabwm seat (its `disk` case writes,
@@ -174,9 +176,16 @@ vgate_run A -- --screen '$RUN_DIR/screen-a' --input --via-virtio \
 # evidence for the absent disk is the missing mount marker.
 vgate_assert A serial-absent 'vlfs: mounted /disk'
 vgate_assert A serial-absent 'data_root'
-vgate_assert A serial-contains 'gofiles: list / n=2'
+# M134b (#2760): the volumes root enumerates the kernel mount table — all
+# seven rows, each naming its live state; absent rows say not_mounted.
+vgate_assert A serial-contains 'gofiles: list / n=7'
 vgate_assert A serial-contains 'gofiles: entry host dir'
 vgate_assert A serial-contains 'gofiles: entry disk dir'
+vgate_assert A serial-contains 'gofiles: entry usb file'
+vgate_assert A serial-contains 'gofiles: entry usb4 dir'
+vgate_assert A serial-contains 'gofiles: volume host mounted rw'
+vgate_assert A serial-contains 'gofiles: volume usb not_mounted'
+vgate_assert A serial-contains 'gofiles: volume usb1 not_mounted'
 vgate_assert A serial-contains 'gofiles: volume disk not_mounted'
 vgate_assert A serial-contains 'gofiles: volume refused disk not_mounted'
 vgate_assert A serial-contains 'gofiles: close'
@@ -247,9 +256,12 @@ vgate_assert C output-contains 'data-disk: ENABLED'
 vgate_assert C serial-contains 'vlfs: mounted /disk'
 # The remount leg: run B's GOSH-HISTORY.TXT is still the exact body.
 vgate_assert C serial-contains 'vf: cat ok bytes=19'
-# The volumes view on a mounted boot, and the copy landing.
-vgate_assert C serial-contains 'gofiles: list / n=2'
-vgate_assert C serial-contains 'gofiles: volume disk mounted'
+# The volumes view on a mounted boot, and the copy landing. M134b (#2760):
+# the row names `mounted rw` — the table's live state and flag bytes.
+vgate_assert C serial-contains 'gofiles: list / n=7'
+vgate_assert C serial-contains 'gofiles: volume disk mounted rw'
+vgate_assert C serial-contains 'gofiles: volume host mounted rw'
+vgate_assert C serial-contains 'gofiles: volume usb not_mounted'
 vgate_assert C serial-contains 'gofiles: cd /disk'
 vgate_assert C serial-contains 'gofiles: list /disk'
 vgate_assert C serial-contains 'gofiles: entry SELFTEST dir'

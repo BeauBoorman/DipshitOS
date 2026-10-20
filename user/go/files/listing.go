@@ -19,27 +19,24 @@ const (
 	rootPath  = "/host"
 	knownName = "KNOWN.TXT"
 
-	// M100f (#2311, ADR 0050 D6): the synthetic volumes root sits above the
-	// two mount names — the kernel never sees "/" as a path here because the
-	// model lists the volume rows itself. `/disk` exists on a boot only when
-	// a named data disk attached and its superblock validated.
+	// M134b (#2760): the volumes root is the kernel's mount table now —
+	// sys_dir_list("/") enumerates one row per mount (host, disk, usb,
+	// usb1..usb4) and the model lists those kernel rows, never a fabricated
+	// pair. `/disk` stays opt-in: its row names `not_mounted` when the boot
+	// attached no named data disk (ADR 0050 D6).
 	volsPath = "/"
 	diskRoot = "/disk"
 	volHost  = "host"
 	volDisk  = "disk"
 )
 
-// diskMounted is the /disk mount probe: one dirlist of the VLFS root answers
-// the kernel's not_mounted ENOENT when the boot attached no named data disk
-// (ADR 0050 D6). A var so host tests pin both legs; on a host build the
-// syscall is -ENOSYS, which reads as unmounted — the honest default.
-var diskMounted = func() bool {
-	var scratch [1]vi.DirEntry
-	_, rc := vi.DirList(diskRoot, scratch[:])
-	return rc >= 0
-}
+// mountRows is the kernel mount-table listing (M134b #2760): vi.Mounts on
+// the guest, a stub in host tests. On a host build the syscall is -ENOSYS,
+// which refreshVolumes reports as a plain list error.
+var mountRows = vi.Mounts
 
-// volEntry fabricates one volumes-root row (both volumes are directories).
+// volEntry fabricates one volumes-root row (a directory — used by tests to
+// seed the model without a kernel).
 func volEntry(name string) vi.DirEntry {
 	var e vi.DirEntry
 	copy(e.Name[:], name)
@@ -47,14 +44,39 @@ func volEntry(name string) vi.DirEntry {
 	return e
 }
 
-// volumeOf names the volume a path lives under ("" when neither — never the
+// isMountName names a kernel mount-table row: the share, the data volume,
+// the raw block device, and the MBR FAT32 slots usb1..usb9 (the kernel
+// itself accepts only 1..4 — the wider set keeps a stale row honest).
+func isMountName(name string) bool {
+	switch name {
+	case volHost, volDisk, "usb":
+		return true
+	}
+	return len(name) == 4 && name[0:3] == "usb" && name[3] >= '1' && name[3] <= '9'
+}
+
+// isMountRoot reports whether path IS a mount row itself ("/disk",
+// "/usb1") — one component under "/" naming a volume.
+func isMountRoot(path string) bool {
+	return len(path) > 1 && path[0] == '/' &&
+		strings.IndexByte(path[1:], '/') < 0 && isMountName(path[1:])
+}
+
+// volumeOf names the volume a path lives under ("" when none — never the
 // case for a path this app navigates to).
 func volumeOf(path string) string {
-	switch {
-	case path == diskRoot || strings.HasPrefix(path, diskRoot+"/"):
-		return volDisk
-	case path == rootPath || strings.HasPrefix(path, rootPath+"/"):
-		return volHost
+	if len(path) > 1 && path[0] == '/' {
+		rest := path[1:]
+		slash := strings.IndexByte(rest, '/')
+		if slash < 0 {
+			if isMountName(rest) {
+				return rest
+			}
+			return ""
+		}
+		if isMountName(rest[:slash]) {
+			return rest[:slash]
+		}
 	}
 	return ""
 }

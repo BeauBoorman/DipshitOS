@@ -70,7 +70,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, and opens with the right-click menu"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, and lists the kernel mount table"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1146,12 +1146,14 @@ for _ in range(h):
     out += row
     prev = row
 
-# Warn-ink (255,200,80) text in the status band: the banner strip's row.
+# The banner takeover paints the status row in colWarn (255,96,96) — the
+# strip's own ink, not the idle status line's amber. ±48: the glyphs are
+# thin antialiased strokes, so the shoulders blend toward the dark field.
 warn = 0
 for y in range(768, 800):
     for x in range(64, 1088):
         k = (y * w + x) * bpp
-        if max(abs(out[k] - 255), abs(out[k+1] - 200), abs(out[k+2] - 80)) <= 24:
+        if max(abs(out[k] - 255), abs(out[k+1] - 96), abs(out[k+2] - 96)) <= 48:
             warn += 1
 print("fileman banner leg: warn-ink pixels=%d" % warn)
 assert warn >= 20, "banner text absent from the status band"
@@ -1255,12 +1257,62 @@ vgate_run 14 -- \
     --script-expect 'gofiles OK' --timeout 240
 
 vgate_assert 14 serial-contains 'gofiles: ready'
-vgate_assert 14 serial-contains 'gofiles: hints n=36'
+vgate_assert 14 serial-contains 'gofiles: hints n=42'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+p summon the command palette'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+c copy the terminal selection'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+k clear the terminal scrollback'
 vgate_assert 14 serial-contains 'gofiles: hints close'
-vgate_assert 14 serial-contains 'gofiles: key q'
+# 'q' is the quitting key — onKey returns before the `key` marker can
+# print, so the marker is unobservable by construction; `gofiles OK`
+# asserts the clean exit itself.
 vgate_assert 14 serial-contains 'gofiles OK'
 vgate_assert 14 serial-absent '[EXC] parking:'
 vgate_assert 14 serial-absent 'exited status=139'
+
+# --- M134b (#2760) run 15: the volumes root is the kernel mount table ---
+# `v` enumerates sys_dir_list("/") — one row per mount: host, disk, usb,
+# usb1..usb4 — each row's reserved bytes carrying the live state, kind and
+# read-only flag. With no --data-disk and no MSC, every absent row names
+# `not_mounted`; entering the disk row and a usbN slot refuses by name.
+vgate_file script-15.txt <<'EOFM'
+exec GOFILES.ELF /host/FM
+EOFM
+
+vgate_file script2-15.txt <<'EOFM'
+echo rx-go-fileman-mounts-ok
+EOFM
+
+# v -> the mount-table root; j lands on the disk row (row 1) whose enter
+# refuses not_mounted; j,j reaches usb1 (row 3) — same named refusal; q out.
+vgate_run 15 -- \
+    --screen '$RUN_DIR/fileman-screen-15' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-15.txt' \
+    --input-chords 'v,j,return,j,j,return,q' \
+    --input-chords-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-15.txt' \
+    --script2-after 'gofiles: close' \
+    --script-expect 'rx-go-fileman-mounts-ok' --timeout 240
+
+vgate_assert 15 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 15 serial-contains 'gofiles: cd /'
+vgate_assert 15 serial-contains 'gofiles: list / n=7'
+vgate_assert 15 serial-contains 'gofiles: entry host dir'
+vgate_assert 15 serial-contains 'gofiles: entry disk dir'
+vgate_assert 15 serial-contains 'gofiles: entry usb file'
+vgate_assert 15 serial-contains 'gofiles: entry usb1 dir'
+vgate_assert 15 serial-contains 'gofiles: entry usb4 dir'
+# Every row names its live state — the share mounted rw, the absent
+# volumes not_mounted by name (no probing a second channel).
+vgate_assert 15 serial-contains 'gofiles: volume host mounted rw'
+vgate_assert 15 serial-contains 'gofiles: volume disk not_mounted'
+vgate_assert 15 serial-contains 'gofiles: volume usb not_mounted'
+vgate_assert 15 serial-contains 'gofiles: volume usb4 not_mounted'
+# Opening an absent row refuses BY NAME, twice — a VLFS slot and a FAT32
+# slot answer with the same word the mount table carries.
+vgate_assert 15 serial-contains 'gofiles: volume refused disk not_mounted'
+vgate_assert 15 serial-contains 'gofiles: volume refused usb1 not_mounted'
+vgate_assert 15 serial-contains 'gofiles: close'
+vgate_assert 15 serial-contains 'gofiles OK'
+vgate_assert 15 serial-absent '[EXC] parking:'
+vgate_assert 15 serial-absent 'exited status=139'

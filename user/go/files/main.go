@@ -318,23 +318,9 @@ func main() {
 
 	var in [64]byte
 	for {
-		// M125c (#2588): the seat's save_state ask is mailbox traffic,
-		// not an input event — answer it once per pass so a snapshot or
-		// tab-close ask is serviced before the window dies. The marker
-		// prints only on an acked handoff — "the seat stored the blob" —
-		// never on silence or a refused post.
 		// M124a-2: seat drag frames for this window — the DragEnd receipt
 		// or cancel lands here, one poll per loop turn like StateAsk.
 		ta.PollDrag()
-
-		if ta.PollStateAsk() {
-			vi.ConsoleLine(markerStateSave + m.path +
-				" sel=" + vi.Itoa64(int64(m.sel)) +
-				" top=" + vi.Itoa64(int64(m.top)) +
-				" view=" + vi.Itoa64(int64(m.view)) +
-				" sort=" + vi.Itoa64(int64(m.sort)) +
-				" len=" + vi.Itoa64(int64(len(m.encodeState()))))
-		}
 
 		// Keys and mouse reports: the tty read is non-blocking (0 when
 		// the queue is empty).
@@ -376,6 +362,23 @@ func main() {
 					" h=" + vi.Itoa64(int64(rows)))
 				vi.ConsoleLine(markerRepaint)
 			}
+		}
+
+		// M125c (#2588): the seat's save_state ask is mailbox traffic,
+		// not an input event — answer it once per pass so a snapshot or
+		// tab-close ask is serviced before the window dies. The marker
+		// prints only on an acked handoff — "the seat stored the blob" —
+		// never on silence or a refused post. The ask polls AFTER the
+		// input drains: the seat writes the user's keys to the tty before
+		// queuing the ask, so a save answers the state those keys
+		// produced, not the stale pre-key frame.
+		if ta.PollStateAsk() {
+			vi.ConsoleLine(markerStateSave + m.path +
+				" sel=" + vi.Itoa64(int64(m.sel)) +
+				" top=" + vi.Itoa64(int64(m.top)) +
+				" view=" + vi.Itoa64(int64(m.view)) +
+				" sort=" + vi.Itoa64(int64(m.sort)) +
+				" len=" + vi.Itoa64(int64(len(m.encodeState()))))
 		}
 
 		// M79e (#1708): a directory change is a navigation, so tell the

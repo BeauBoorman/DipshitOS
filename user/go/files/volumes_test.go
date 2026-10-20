@@ -1,25 +1,41 @@
 package main
 
-// volumes_test.go — M100f (#2311): the synthetic volumes root. Host tests
-// pin the listing markers, the mount probe's both legs, the named enter
+// volumes_test.go — M134b (#2760): the volumes root reads the kernel's
+// mount table. Host tests stub the mountRows seam with wire-shaped rows
+// and pin the listing markers, the live state names, the named enter
 // refusal, and the mutating-op guards; the real /disk listings are the
 // live-vlfs-dataroot class-B's job.
 
 import (
 	"strings"
 	"testing"
+
+	"virelai/vi"
 )
 
-// stubMounted pins the /disk probe for one test and restores it.
-func stubMounted(t *testing.T, mounted bool) {
+// stubMounts pins the kernel mount-table listing for one test and
+// restores it: the share, the (optionally mounted) data volume, the raw
+// block device, and one FAT32 slot — the rows the kernel enumerates at "/".
+func stubMounts(t *testing.T, diskMounted bool) {
 	t.Helper()
-	saved := diskMounted
-	diskMounted = func() bool { return mounted }
-	t.Cleanup(func() { diskMounted = saved })
+	saved := mountRows
+	diskState := uint8(vi.MountNotMounted)
+	if diskMounted {
+		diskState = vi.MountMounted
+	}
+	mountRows = func() ([]vi.Mount, int64) {
+		return []vi.Mount{
+			{Name: volHost, Dir: true, State: vi.MountMounted, Kind: vi.MountKindShare},
+			{Name: volDisk, Dir: true, State: diskState, Kind: vi.MountKindVLFS},
+			{Name: "usb", Dir: false, State: vi.MountNotMounted, Kind: vi.MountKindBlock, ReadOnly: true},
+			{Name: "usb1", Dir: true, State: vi.MountNotMounted, Kind: vi.MountKindFAT32, ReadOnly: true},
+		}, 0
+	}
+	t.Cleanup(func() { mountRows = saved })
 }
 
-func TestVolumesRootListsBothVolumesAndNamesMountState(t *testing.T) {
-	stubMounted(t, false)
+func TestVolumesRootListsKernelRowsAndNamesMountState(t *testing.T) {
+	stubMounts(t, false)
 	m := testModel()
 	m.path = "/host"
 	m.goUp()
@@ -29,9 +45,12 @@ func TestVolumesRootListsBothVolumesAndNamesMountState(t *testing.T) {
 	got := pendingJoined(&m)
 	for _, want := range []string{
 		markerCd + "/",
-		markerList + "/ n=2",
+		markerList + "/ n=4",
 		markerEntry + "host dir",
 		markerEntry + "disk dir",
+		markerEntry + "usb1 dir",
+		markerVol + "host mounted rw",
+		markerVol + "usb not_mounted",
 		markerVolDiskAbsent,
 	} {
 		if !strings.Contains(got, want) {
@@ -41,15 +60,22 @@ func TestVolumesRootListsBothVolumesAndNamesMountState(t *testing.T) {
 	if strings.Contains(got, markerVolDiskMounted) {
 		t.Fatal("an absent disk reported mounted")
 	}
-	// The mount names are the rows, and they are directories.
+	// The kernel rows are the listing, in the table's order; the block
+	// device row is not a directory, so its label carries no slash.
 	labs := labelsOf(m.entries[:], m.n)
-	if len(labs) != 2 || labs[0] != "host/" || labs[1] != "disk/" {
-		t.Fatalf("volume rows = %#v", labs)
+	want := []string{"host/", "disk/", "usb", "usb1/"}
+	if len(labs) != len(want) {
+		t.Fatalf("volume rows = %#v, want %#v", labs, want)
+	}
+	for i := range want {
+		if labs[i] != want[i] {
+			t.Fatalf("volume rows = %#v, want %#v", labs, want)
+		}
 	}
 }
 
 func TestVolumesEnterDiskRefusesByNameWhenUnmounted(t *testing.T) {
-	stubMounted(t, false)
+	stubMounts(t, false)
 	m := testModel()
 	m.showVolumes()
 	m.sel = 1 // disk row
@@ -66,7 +92,7 @@ func TestVolumesEnterDiskRefusesByNameWhenUnmounted(t *testing.T) {
 }
 
 func TestVolumesEnterDiskMountedAndBack(t *testing.T) {
-	stubMounted(t, true)
+	stubMounts(t, true)
 	m := testModel()
 	m.showVolumes()
 	if got := pendingJoined(&m); !strings.Contains(got, markerVolDiskMounted) {
@@ -89,8 +115,22 @@ func TestVolumesEnterDiskMountedAndBack(t *testing.T) {
 	}
 }
 
+func TestVolumesEnterUsbBlockRefusesByName(t *testing.T) {
+	stubMounts(t, false)
+	m := testModel()
+	m.showVolumes()
+	m.sel = 2 // the raw block row — not_mounted refuses by name
+	m.openSel()
+	if m.path != volsPath {
+		t.Fatalf("entering an absent /usb moved to %q", m.path)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerVolRefused+"usb not_mounted") {
+		t.Fatalf("block-row refusal marker missing: %q", got)
+	}
+}
+
 func TestVolumesRootRefusesTheMutatingOps(t *testing.T) {
-	stubMounted(t, false)
+	stubMounts(t, false)
 	m := testModel()
 	m.showVolumes()
 	m.drain()

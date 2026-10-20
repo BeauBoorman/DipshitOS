@@ -122,11 +122,17 @@ func TestResolveStatePathFallsBackToParent(t *testing.T) {
 	if got != "/host" || !fell {
 		t.Fatalf("dead branch must resolve to /host, got %q", got)
 	}
-	// Nothing lists at all: the synthetic volumes root is the floor.
+	// Nothing lists at all: the volumes root is the floor.
 	live = map[string]bool{}
 	got, fell = resolveStatePath("/host/GONE/GONE")
 	if got != volsPath || !fell {
 		t.Fatalf("bottoming out must land on %q, got %q", volsPath, got)
+	}
+	// A saved usb path with no device lands on the same floor — the mount
+	// root stops the walk, never falls through to "/host".
+	got, fell = resolveStatePath("/usb1/DOCS")
+	if got != volsPath || !fell {
+		t.Fatalf("absent usb1 must land on %q, got %q", volsPath, got)
 	}
 	// The volumes root itself never probes.
 	got, fell = resolveStatePath(volsPath)
@@ -149,8 +155,8 @@ func TestApplyStateClampsToListing(t *testing.T) {
 	}
 }
 
-// The volumes root's fixed order is synthetic — applyState must not
-// re-sort it (host stays first, disk second).
+// The volumes root's fixed order is the mount table's — applyState must
+// not re-sort it (host stays first, disk second).
 func TestApplyStateKeepsVolumesOrder(t *testing.T) {
 	m := testModel()
 	m.path = volsPath

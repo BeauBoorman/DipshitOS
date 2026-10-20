@@ -289,12 +289,13 @@ func usbCanonDir(dir string) bool {
 // usbDirList serves the legacy 16-row window for a USB canonical path
 // (canon "/usb1/x" is the kernel's "usb1/x"). A full window is refused:
 // 16 rows is a bound the kernel clamps to, not a proof the directory has
-// 16 entries.
+// 16 entries. An absent volume names `not_mounted` (M134b) — MountErr
+// keeps the kernel's ENXIO under its refused-by-name word.
 func usbDirList(dir string) ([]DirItem, error) {
 	var entries [MaxDirEntries]DirEntry
 	n, rc := DirList(dir[1:], entries[:])
 	if rc < 0 {
-		return nil, errno(-rc)
+		return nil, MountErr(rc)
 	}
 	if n >= MaxDirEntries {
 		return nil, ErrTreeLimit

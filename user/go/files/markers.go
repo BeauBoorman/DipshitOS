@@ -110,9 +110,11 @@ const (
 	markerExportNo = "gofiles: export refused "
 
 	// M100f (#2311): the volumes root. The listing reuses markerList /
-	// markerEntry on the synthetic path "/", and the disk row's mount state
-	// is named every list (`not_mounted` is the kernel's own refusal name,
-	// ADR 0050 D6). `volume refused` is the enter attempt on an absent /disk.
+	// markerEntry on "/", and every mount-table row's state is named each
+	// list (`not_mounted` is the kernel's own refusal name, ADR 0050 D6 —
+	// M134b #2760 makes the rows the kernel's, not fabricated ones).
+	// `volume refused` is the enter attempt on an absent or unbrowsable row.
+	markerVol            = "gofiles: volume "
 	markerVolDiskMounted = "gofiles: volume disk mounted"
 	markerVolDiskAbsent  = "gofiles: volume disk not_mounted"
 	markerVolRefused     = "gofiles: volume refused "

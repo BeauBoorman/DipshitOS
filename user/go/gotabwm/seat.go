@@ -798,6 +798,10 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	if launch.open && presented && launch.painted {
 		vi.ConsoleLine("gotabwm: launcher presented")
 	}
+	// The parked snapshot ask runs on the composite cadence in both modes —
+	// a deferred cs-s must not outlive the run that armed it, and a live
+	// seat owes the user the same capture-after-quiet ordering.
+	releaseSnapshotAsk(ticks)
 	if demoMode {
 		// #2703: the parked focus cycle's quiet-window release runs on
 		// the composite cadence even when the strip choreography is

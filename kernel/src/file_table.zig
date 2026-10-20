@@ -56,6 +56,10 @@ pub const metadata = @import("fs_metadata.zig");
 // after its `virelai-vlfs` GET_ID match.
 const vlfs = @import("vlfs/vlfs.zig");
 const vlfs_disk = @import("vlfs/disk.zig");
+// M134b (issue #2760): the one mount table behind `/` — `dir_list("/")`
+// enumerates its rows, and a path resolved onto an absent row answers
+// ENXIO, which userland names `not_mounted`.
+const mount_table = @import("mount_table.zig");
 const klog = @import("klog.zig");
 
 pub const max_handles_per_process: usize = 8;
@@ -1496,7 +1500,11 @@ pub fn hf_handle_errno(st: u8) i64 {
 /// everything structural is EINVAL.
 fn disk_errno(err: vlfs.Error) i64 {
     const rc: i64 = switch (err) {
-        error.NotMounted, error.NotFound, error.Io => -6,
+        // M134b (#2760): an absent VLFS mount is the `disk` row's
+        // `not_mounted` answer — ENXIO, named distinctly from a path that
+        // does not exist on a mounted volume.
+        error.NotMounted => -9,
+        error.NotFound, error.Io => -6,
         error.ReadOnly => -7,
         error.NameTooLong => -8,
         error.Exists => -9,
@@ -1578,13 +1586,14 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
     if (fsScopedDenied(pid, parsed.partition, parsed.path[0..parsed.parsed_len()], fsOpenWant(flags))) return -7;
 
     // M43 U3 (issue #1034): the `.usb` raw block device. READ-ONLY: any
-    // write-ish flag is EINVAL; no device or no capacity is ENOENT. The
+    // write-ish flag is EINVAL; M134b (#2760) names no device / unreadable
+    // capacity ENXIO — the mount-table row's `not_mounted` answer. The
     // handle's size is the disk's byte length (clamped to the frozen u32
     // ABI); reads are sequential 512-byte sectors at the cursor.
     if (parsed.partition == .usb) {
         if ((flags & (MODE_WRITE | MODE_CREATE | MODE_APPEND | MODE_DIR)) != 0) return -1;
-        const cap = usb_msc.capacity() orelse return -6;
-        if (cap.block_len != usb_msc.block_len) return -6; // only 512-B sectors
+        const cap = usb_msc.capacity() orelse return -9;
+        if (cap.block_len != usb_msc.block_len) return -9; // only 512-B sectors
         const sectors: u64 = @as(u64, cap.last_lba) + 1;
         const bytes: u64 = sectors * cap.block_len;
         handles[pid][slot] = .{
@@ -1602,25 +1611,24 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
 
     // M70f F1 (issue #1458): a READ-ONLY file inside MBR partition N's FAT32
     // volume. The error split is deliberate and part of the surface:
-    //   -6 ENOENT — no device, no such partition, no such file;
-    //   -1 EINVAL — the partition exists but is not a readable FAT32 volume,
-    //                the path is the volume root (a directory), a path
-    //                component that is a file, or an unusable chain.
+    //   -9 ENXIO  — no device, no such partition, no volume behind the slot:
+    //               the mount-table row's `not_mounted` answer (M134b);
+    //   -6 ENOENT — the volume mounted but the name is absent;
+    //   -1 EINVAL — a partition that lies about its own geometry, the volume
+    //               root (a directory), a path component that is a file,
+    //               or an unusable chain.
     // Nothing here writes: every mutating flag is refused before a single
     // sector is read.
     if (parsed.partition == .usb_fat) {
         if ((flags & (MODE_WRITE | MODE_CREATE | MODE_APPEND | MODE_DIR)) != 0) return -1;
-        const cap = usb_msc.capacity() orelse return -6;
-        if (cap.block_len != usb_msc.block_len) return -6; // only 512-B sectors
+        const cap = usb_msc.capacity() orelse return -9;
+        if (cap.block_len != usb_msc.block_len) return -9; // only 512-B sectors
         const src = usb_msc.source();
-        const row = fat32_ro.partitionAt(src, parsed.usb_index) catch return -6;
+        const row = fat32_ro.partitionAt(src, parsed.usb_index) catch return -9;
         // A partition that claims sectors the device does not have is not a
         // volume this guest may read from.
         if (@as(u64, row.start_lba) + row.sectors > @as(u64, cap.last_lba) + 1) return -1;
-        const vol = fat32_ro.mount(src, row.start_lba, row.sectors) catch |err| switch (err) {
-            error.NotFat32, error.BadBpb => return -1,
-            else => return -6,
-        };
+        const vol = fat32_ro.mount(src, row.start_lba, row.sectors) catch return -9;
         const subpath = parsed.path[0..parsed.parsed_len()];
         if (subpath.len == 0) return -1; // the volume root is a directory
         var e: fat32_ro.Entry = undefined;
@@ -1733,7 +1741,9 @@ pub fn open(pid: u64, path_bytes: []const u8, flags: u32) i64 {
     // `.tty` before parse_path; every path here is `.host`.
     if (!hostAllowed(pid, parsed.path[0..parsed.parsed_len()], trustWant(flags))) return -7; // EACCES
 
-    if (!virtio_file.available()) return -6; // ENOENT (no host file channel)
+    // M134b (#2760): no host file channel is the `host` row's
+    // `not_mounted` answer — ENXIO, not a missing share path.
+    if (!virtio_file.available()) return -9;
 
     const subpath = parsed.path[0..parsed.parsed_len()];
 
@@ -2079,7 +2089,7 @@ pub fn dir_open(pid: u64, path_bytes: []const u8) i64 {
     if (!directory.valid_path(path, directory.depth_max)) return -8;
     if (fsScopedDenied(pid, parsed.partition, path, .read)) return -7;
     if (parsed.partition == .host and !hostAllowed(pid, path, .list)) return -7;
-    if (parsed.partition == .disk and !vlfs_disk.mounted()) return -6;
+    if (parsed.partition == .disk and !vlfs_disk.mounted()) return -9;
     if (!ensure_handles()) return -10;
     defer release_empty_handles();
     if (resource_count(pid) >= max_handles_per_process) return -5;
@@ -2181,11 +2191,46 @@ pub fn dir_close(pid: u64, token: u64) i64 {
     return 0;
 }
 
+/// M134b (#2760): `/` is the mount table root — the enumerable volumes
+/// namespace. A path of nothing but slashes enumerates one `DirEntry` row
+/// per `mount_table` row: `is_dir` marks the directory-rooted kinds (the
+/// `.block` row is a byte stream) and `reserved` carries
+/// `{state, kind, flags}` — the `not_mounted` and read-only names ride the
+/// existing 40-byte row, no new syscall or wire op.
+fn mountsRootPath(path_bytes: []const u8) bool {
+    if (path_bytes.len == 0) return false;
+    for (path_bytes) |c| {
+        if (c != '/') return false;
+    }
+    return true;
+}
+
 /// Enumerate directory entries at `path_bytes` into `out_entries`.
 /// Returns number of entries written (>= 0), or negative error code.
 pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
     if (pid >= process.max_processes) return -1;
     if (out_entries.len == 0) return 0;
+
+    // M134b: the volumes root enumerates the mount table itself — the rows
+    // are kernel namespace truth, never share content, so the fs= scope
+    // and the host-share gate do not apply here.
+    if (mountsRootPath(path_bytes)) {
+        var n: usize = 0;
+        for (mount_table.rows) |row| {
+            if (n == out_entries.len) break;
+            var de = DirEntry{};
+            @memcpy(de.name[0..row.name.len], row.name);
+            de.is_dir = if (mount_table.browsable(row)) 1 else 0;
+            de.reserved = .{
+                @backingInt(mount_table.state(row)),
+                @backingInt(row.kind),
+                mount_table.flags(row),
+            };
+            out_entries[n] = de;
+            n += 1;
+        }
+        return @intCast(n);
+    }
 
     const parsed = if (path_bytes.len == 0)
         ParsedPath{ .partition = .host, .path = @as([max_path_len]u8, @splat(@as(u8, 0))), .path_len = 0 }
@@ -2198,23 +2243,28 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
     // M50 TS2 (ADR 0024 D4): the host-share ownership/mode gate for listing.
     if (parsed.partition == .host and !hostAllowed(pid, parsed.path[0..parsed.path_len], .list)) return -7; // EACCES
 
+    // M134b (#2760): `/usb` is a block device row, never a directory — an
+    // absent device names `not_mounted` (ENXIO) rather than ENOENT.
+    if (parsed.partition == .usb) {
+        if (!mount_table.mounted(mount_table.rows[mount_table.row_usb])) return -9;
+        return -1;
+    }
+
     // M70f F1 (issue #1458): listing a `.usb_fat` path reads the FAT32
     // directory chain, one sector at a time, straight into the caller's rows.
     // Names longer than the frozen 40-byte `DirEntry` row's 31 bytes are
     // truncated here (`usb ls` prints them whole); a file path is EINVAL,
-    // an absent one ENOENT.
+    // an absent volume's path names `not_mounted` (ENXIO) — the row the
+    // mount table carries for it.
     if (parsed.partition == .usb_fat) {
-        const cap = usb_msc.capacity() orelse return -6;
-        if (cap.block_len != usb_msc.block_len) return -6;
+        const cap = usb_msc.capacity() orelse return -9;
+        if (cap.block_len != usb_msc.block_len) return -9;
         const src = usb_msc.source();
-        const row = fat32_ro.partitionAt(src, parsed.usb_index) catch return -6;
+        const row = fat32_ro.partitionAt(src, parsed.usb_index) catch return -9;
         // The same end-of-device guard `open` applies: a partition table may
         // not send this guest past the disk it was handed.
         if (@as(u64, row.start_lba) + row.sectors > @as(u64, cap.last_lba) + 1) return -1;
-        const vol = fat32_ro.mount(src, row.start_lba, row.sectors) catch |err| switch (err) {
-            error.NotFat32, error.BadBpb => return -1,
-            else => return -6,
-        };
+        const vol = fat32_ro.mount(src, row.start_lba, row.sectors) catch return -9;
         var dir: fat32_ro.Entry = undefined;
         fat32_ro.lookup(src, vol, parsed.path[0..parsed.parsed_len()], &dir) catch |err| switch (err) {
             error.NotFound, error.Io => return -6,
@@ -2266,7 +2316,8 @@ pub fn dir_list(pid: u64, path_bytes: []const u8, out_entries: []DirEntry) i64 {
         return @intCast(n);
     }
 
-    if (!virtio_file.available()) return -6;
+    // M134b (#2760): an absent host channel is `not_mounted` (ENXIO).
+    if (!virtio_file.available()) return -9;
 
     const subpath = parsed.path[0..parsed.path_len];
 
@@ -2634,7 +2685,7 @@ test "B1: endpoint exhaustion rolls back and native resources remain bounded at 
     for (handles[1][0..7], 0..) |_, idx| handles[1][idx] = .{ .in_use = true, .flags = MODE_READ };
     try std.testing.expectEqual(@as(i64, -5), open(1, "OTHER", MODE_READ));
     try std.testing.expectEqual(@as(i64, 0), stream_close(1, stream_base));
-    try std.testing.expectEqual(@as(i64, -6), open(1, "OTHER", MODE_READ)); // room, no backend
+    try std.testing.expectEqual(@as(i64, -9), open(1, "OTHER", MODE_READ)); // room, host not_mounted (M134b)
     reset_process(0);
     reset_process(1);
 }
@@ -3078,11 +3129,54 @@ test "file_table: the usb volume is read-only and absent without a device" {
     try std.testing.expectEqual(@as(i64, -1), open(0, "usb", MODE_WRITE));
     try std.testing.expectEqual(@as(i64, -1), open(0, "usb", MODE_READ | MODE_CREATE));
     try std.testing.expectEqual(@as(i64, -1), open(0, "usb", MODE_READ | MODE_DIR | MODE_WRITE | MODE_CREATE));
-    // A read-open with no MSC enumerated is an honest ENOENT (the host has
-    // no USB device table populated).
-    try std.testing.expectEqual(@as(i64, -6), open(0, "usb", MODE_READ));
+    // A read-open with no MSC enumerated names `not_mounted` (M134b —
+    // ENXIO, the mount-table row's answer), as does a host path with no
+    // file channel.
+    try std.testing.expectEqual(@as(i64, -9), open(0, "usb", MODE_READ));
     // A host handle still opens exactly as before (regression guard).
-    try std.testing.expectEqual(@as(i64, -6), open(0, "hello.txt", MODE_READ)); // no host channel on the host
+    try std.testing.expectEqual(@as(i64, -9), open(0, "hello.txt", MODE_READ)); // no host channel on the host
+}
+
+test "file_table: / enumerates the one mount table's rows" {
+    init();
+    vlfs_disk.detach();
+    defer vlfs_disk.detach();
+    // No host channel, no VLFS device, no MSC on the test host — every row
+    // reports `not_mounted`, and the reserved triple still names kind+ro.
+    var rows: [16]DirEntry = undefined;
+    const n = dir_list(0, "/", rows[0..]);
+    try std.testing.expectEqual(@as(i64, @intCast(mount_table.rows.len)), n);
+    const want = [_][]const u8{ "host", "disk", "usb", "usb1", "usb2", "usb3", "usb4" };
+    for (want, 0..) |name, i| {
+        const nl = std.mem.indexOfScalar(u8, &rows[i].name, 0) orelse rows[i].name.len;
+        try std.testing.expectEqualStrings(name, rows[i].name[0..nl]);
+        try std.testing.expectEqual(@backingInt(mount_table.State.not_mounted), rows[i].reserved[0]);
+    }
+    // The browsable kinds are directory-rooted; `.block` is a byte stream.
+    try std.testing.expectEqual(@as(u8, 1), rows[0].is_dir);
+    try std.testing.expectEqual(@as(u8, 0), rows[2].is_dir);
+    try std.testing.expectEqual(@as(u8, mount_table.flag_read_only), rows[2].reserved[2]);
+    try std.testing.expectEqual(@as(u8, 0), rows[0].reserved[2]); // host is read-write
+    try std.testing.expectEqual(@backingInt(mount_table.Kind.vlfs), rows[1].reserved[1]);
+    try std.testing.expectEqual(@backingInt(mount_table.Kind.fat32), rows[3].reserved[1]);
+    // "//" enumerates the same table; a zero window lists none and a short
+    // one truncates — the table is boot-fixed at seven rows.
+    try std.testing.expectEqual(n, dir_list(0, "//", rows[0..]));
+    var two: [2]DirEntry = undefined;
+    try std.testing.expectEqual(@as(i64, 2), dir_list(0, "/", two[0..]));
+    try std.testing.expectEqual(@as(i64, 0), dir_list(0, "/", two[0..0]));
+
+    // Arm the fixtures and re-enumerate: the live state rides the rows.
+    const files = [_]virtio_file.TestFile{.{ .name = "A", .data = "x" }};
+    virtio_file.set_test_share(&files);
+    defer virtio_file.set_test_share(null);
+    defer vlfs_disk.detach();
+    try vlfs_build(vlfs_populated_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
+    try std.testing.expectEqual(@as(i64, @intCast(mount_table.rows.len)), dir_list(0, "/", rows[0..]));
+    try std.testing.expectEqual(@backingInt(mount_table.State.mounted), rows[0].reserved[0]);
+    try std.testing.expectEqual(@backingInt(mount_table.State.mounted), rows[1].reserved[0]);
+    try std.testing.expectEqual(@backingInt(mount_table.State.not_mounted), rows[3].reserved[0]);
 }
 
 test "file_table: M70f volume paths route to .usb_fat and refuse the impossible" {
@@ -3132,13 +3226,13 @@ test "file_table: M70f volume handles are read-only and honest with no device" {
     try std.testing.expectEqual(@as(i64, -1), open(0, "usb1/PROBE.TXT", MODE_WRITE));
     try std.testing.expectEqual(@as(i64, -1), open(0, "usb1/PROBE.TXT", MODE_READ | MODE_CREATE));
     try std.testing.expectEqual(@as(i64, -1), open(0, "usb1/PROBE.TXT", MODE_READ | MODE_APPEND));
-    // With no MSC enumerated every volume path is an honest ENOENT — including
-    // the root, which is not a byte stream in any case.
-    try std.testing.expectEqual(@as(i64, -6), open(0, "usb1", MODE_READ));
-    try std.testing.expectEqual(@as(i64, -6), open(0, "usb1/PROBE.TXT", MODE_READ));
+    // With no MSC enumerated every volume path names `not_mounted` (M134b —
+    // ENXIO), including the root, which is not a byte stream in any case.
+    try std.testing.expectEqual(@as(i64, -9), open(0, "usb1", MODE_READ));
+    try std.testing.expectEqual(@as(i64, -9), open(0, "usb1/PROBE.TXT", MODE_READ));
     var rows: [4]DirEntry = undefined;
-    try std.testing.expectEqual(@as(i64, -6), dir_list(0, "usb1", rows[0..]));
-    try std.testing.expectEqual(@as(i64, -6), dir_list(0, "usb1/DOCS", rows[0..]));
+    try std.testing.expectEqual(@as(i64, -9), dir_list(0, "usb1", rows[0..]));
+    try std.testing.expectEqual(@as(i64, -9), dir_list(0, "usb1/DOCS", rows[0..]));
     // A volume is never mode-governed, and never mutable through this table:
     // the subpath must not leak into the host channel.
     try std.testing.expectEqual(@as(i64, -7), set_mode(0, "usb1/PROBE.TXT", 0o600));
@@ -3475,17 +3569,18 @@ test "file_table: absent VLFS volume refuses /disk by name, share-only" {
     init();
     vlfs_disk.detach();
     defer vlfs_disk.detach();
-    // Every /disk surface is an honest ENOENT/ENOSYS — nothing else suffers.
-    try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/APPLE.TXT", MODE_READ));
+    // Every /disk surface names `not_mounted` (ENXIO) or ENOSYS — nothing
+    // else suffers.
+    try std.testing.expectEqual(@as(i64, -9), open(0, "/disk/APPLE.TXT", MODE_READ));
     var rows: [4]DirEntry = undefined;
-    try std.testing.expectEqual(@as(i64, -6), dir_list(0, "/disk", rows[0..]));
-    try std.testing.expectEqual(@as(i64, -6), dir_open(0, "/disk"));
+    try std.testing.expectEqual(@as(i64, -9), dir_list(0, "/disk", rows[0..]));
+    try std.testing.expectEqual(@as(i64, -9), dir_open(0, "/disk"));
     var wire: metadata.Wire = undefined;
     // The slot-79 surface mirrors the host channel's own dead-backend answer.
     try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", false, &wire));
     try std.testing.expectEqual(@as(i64, -4), pin_open(0, "/disk", ""));
     // The share still works (host-availability governs its own refusal).
-    try std.testing.expectEqual(@as(i64, -6), open(0, "test.txt", MODE_READ)); // no host channel in tests
+    try std.testing.expectEqual(@as(i64, -9), open(0, "test.txt", MODE_READ)); // no host channel in tests
     try std.testing.expectEqual(Partition.host, parse_path("diskette.txt").?.partition);
 }
 
@@ -3606,11 +3701,11 @@ test "file_table: /disk refusals are names, not crashes" {
     init();
     defer vlfs_disk.detach();
     // A zeroed device attaches as a refusal: mount fails by name and every
-    // path still answers ENOENT rather than serving phantom bytes.
+    // path names `not_mounted` rather than serving phantom bytes.
     @memset(&vlfs_test_img, 0);
     try std.testing.expect(!vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
     try std.testing.expectEqualStrings("not_vlfs", vlfs_disk.last_refusal.?);
-    try std.testing.expectEqual(@as(i64, -6), open(0, "/disk/APPLE.TXT", MODE_READ));
+    try std.testing.expectEqual(@as(i64, -9), open(0, "/disk/APPLE.TXT", MODE_READ));
     var wire: metadata.Wire = undefined;
     try std.testing.expectEqual(@as(i64, -4), metadata_at(0, "/disk", "APPLE.TXT", false, &wire));
 }

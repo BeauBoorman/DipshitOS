@@ -695,6 +695,10 @@ pub fn list(raw_path: []const u8, out: *ListResult) u8 {
     }
     const saved = vf_lock.lock();
     defer vf_lock.unlock(saved);
+    // The module-global scratch must start empty: snapshot_exchange_seq
+    // uses out.count as the page offset, so a stale count would page past
+    // the new snapshot's rows and serve the previous listing.
+    vf_list_scratch.count = 0;
     const status = if (prefer_fuse())
         virtio_fs.snapshot(path, &vf_list_scratch)
     else
