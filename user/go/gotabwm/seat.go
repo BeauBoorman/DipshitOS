@@ -775,6 +775,21 @@ func consumeSeatEvent(e vi.Event) bool {
 	// #2236 defect #13: the same mirror's x|y arg feeds the compose-N
 	// blit for handoff surfaces.
 	surfaceNoteMirror(e)
+	// #2703: live input re-arms the demo strip hold. hidChordHold's job is
+	// to keep the two-tab choreography's destructive steps (swap→pin→
+	// split→closePinnedFirst/closeHosted) behind in-flight scripted input;
+	// a fixed one-shot countdown cannot — the chain's own events burn it —
+	// and a close that lands mid-chain parks the seat loop in the
+	// close's state-ask drain while still-queued keystrokes decode to
+	// whatever is left focused (observed go-dogfood boot 04: `return` +
+	// `alt-tab` decoded to charmhello after GOTERM's close). Re-arming
+	// matches the single-tab path's contract (`hostTicksLeft = hostTicks`
+	// on user actions): the demo yields while the user is acting, and
+	// resumes once input is quiet for hidChordHold ticks. maxTicks still
+	// bounds the boot; this only reorders within it.
+	if (e.Kind == vi.EvWmPointer || e.Kind == vi.EvWmKey) && demoMode && !stripDone {
+		stripHoldLeft = hidChordHold
+	}
 	if e.Kind == vi.EvWmPointer {
 		vi.ConsoleLine(MarkerPtr)
 		if idleInput(seatTick) {

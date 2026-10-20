@@ -1040,8 +1040,16 @@ pub fn decode_keyboard_report(rep: []const u8) void {
                 });
             }
         }
-    } else {
-        // Terminal / console route (existing behavior)
+    } else if (!driving_award.wm_owns_input) {
+        // Terminal / console route (existing behavior — gated on
+        // !wm_owns_input like every other kernel-side key consumer in
+        // this decode: while a WM owns input the raw stream is THE WM's
+        // (kind-21 fan above), so bytes typed during the owned-but-
+        // unfocused window — e.g. the seat's launcher before it grabs
+        // focus — must not also land in the console line-editor FIFO.
+        // Observed go-dogfood boot 04 (#2703): the Enter-summon's first
+        // strokes leaked 'te' into `virelai>` and the next forwarded
+        // script ran as 'teexec CHARMHELLO.ELF').
         for (keys) |k| {
             if (k == 0) continue;
             var held = false;
@@ -1451,6 +1459,45 @@ test "input: WMS8 Gate 5 — the drained geometry chords fan out but the kernel 
 
     // Cleanup: WM mode restored (the raw fan-out stays available).
     driving_award.wm_owns_input = false;
+}
+
+test "input: a WM-owned key stream does not also feed the console FIFO (#2703)" {
+    _ = driving_award.focus(0); // no focused window: the console route
+    fifo_count = 0;
+    fifo_head = 0;
+    events = 0;
+    kb_held = @as([6]u8, @splat(@as(u8, 0)));
+    var key_calls: usize = 0;
+    const capture = struct {
+        var calls: *usize = undefined;
+        fn hook(u: u8, f: u16) void {
+            _ = u;
+            _ = f;
+            calls.* += 1;
+        }
+    };
+    capture.calls = &key_calls;
+    // Owned-but-unfocused: a launcher summons while the WM holds input and
+    // no window is focused. The kind-21 fan still gets every edge…
+    driving_award.wm_owns_input = true;
+    driving_award.wm_key_hook = capture.hook;
+    defer {
+        driving_award.wm_owns_input = false;
+        driving_award.wm_key_hook = null;
+    }
+    decode_keyboard_report(&[_]u8{ 0, 0, 0x17, 0, 0, 0, 0, 0 }); // 't' down
+    decode_keyboard_report(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }); // release
+    try std.testing.expectEqual(@as(usize, 1), key_calls);
+    // …but the byte must NOT also queue for the console line editor —
+    // observed boot 04: a leaked prefix ran the next script as 'teexec'.
+    try std.testing.expectEqual(@as(usize, 0), fifo_count);
+    // Shim mode (no WM): the identical stroke still reaches the console.
+    driving_award.wm_owns_input = false;
+    driving_award.wm_key_hook = null;
+    decode_keyboard_report(&[_]u8{ 0, 0, 0x17, 0, 0, 0, 0, 0 });
+    decode_keyboard_report(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(usize, 1), fifo_count);
+    try std.testing.expectEqual(@as(u8, 't'), pop_byte().?);
 }
 
 test "input: keyboard report decode pushes a ctrl chord and an arrow sequence" {

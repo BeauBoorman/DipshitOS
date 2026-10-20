@@ -588,8 +588,9 @@ var inputKeyAfter: String?
 // char, shift for uppercase, `\n` = Enter) into the VZVirtualMachineView
 // after `--input-string-after <marker>` (default: the shell's first
 // `virelai> ` prompt — typing before the idle loop starts drops keystrokes,
-// the interrupt-IN ring buffers one report). This types a real command into
-// Road Pops.
+// the interrupt-IN ring buffers one report). The marker watch runs to
+// max(40 s, --timeout) — a deep marker needs a session timeout that
+// covers it (#2703). This types a real command into Road Pops.
 var inputString: String?
 var inputStringAfter: String?
 // Milestone eight card U2 (claim 1809): the scripted CHORD surface for the
@@ -6054,6 +6055,17 @@ func reportKeyboardKeyState(_ view: VZVirtualMachineView, label: String) {
     }
 }
 
+// Marker-watch deadline policy for the scripted-input injectors
+// (--input-key, --input-string): M73z (#1638) + #2703 — a gate may anchor
+// input on a marker deep into a long run (boot 04's `gotabwm: alt-tab
+// id=4` lands ~200 s in; its `gotabwm: tab close id=` lands ~160 s in),
+// and a marker can never arrive after --timeout, so the session timeout
+// is the honest ceiling. The 40 s floor keeps short-timeout sessions on
+// the original window.
+func inputMarkerWaitSeconds(sessionTimeout: TimeInterval) -> TimeInterval {
+    max(40, sessionTimeout)
+}
+
 // Milestone seven card I2 (claim 4116): synthesize ONE host key event into
 // the VZVirtualMachineView after the marker appears. VZ has no programmatic
 // keyboard-injection API — VZUSBKeyboardConfiguration is driven only by a
@@ -6071,7 +6083,7 @@ func startKeyInject() {
         // script-wait fix — a gate may anchor this key on a marker deep
         // into a long run (boot 04's `gotabwm: alt-tab id=4` lands ~200 s
         // in), and a marker can never arrive after --timeout.
-        let waitSeconds = max(40, timeout)
+        let waitSeconds = inputMarkerWaitSeconds(sessionTimeout: timeout)
         let waitDeadline = Date().addingTimeInterval(waitSeconds)
         var sent = false
         while Date() < waitDeadline {
@@ -6762,7 +6774,15 @@ func startKeyStringInject() {
     let q = DispatchQueue(label: "virelaios.keyseq")
     q.async {
         let marker = inputStringAfter ?? "virelai> "
-        let waitDeadline = Date().addingTimeInterval(40)
+        // #2703: timeout-aware deadline, the same M73z (#1638) fix
+        // startKeyInject already carries — a gate may anchor the string on a
+        // marker deep into a long run (go-dogfood boot 04's
+        // `gotabwm: tab close id=` lands ~160 s in, after the demo's
+        // auto-close and the state-ask drain on silent apps), and a marker
+        // can never arrive after --timeout. The 40 s floor keeps every
+        // short-timeout session's window unchanged.
+        let waitSeconds = inputMarkerWaitSeconds(sessionTimeout: timeout)
+        let waitDeadline = Date().addingTimeInterval(waitSeconds)
         var sent = false
         while Date() < waitDeadline {
             if let log = try? String(contentsOf: serialURL, encoding: .utf8), log.contains(marker) {
@@ -6857,7 +6877,7 @@ func startKeyStringInject() {
             Thread.sleep(forTimeInterval: 0.1)
         }
         if !sent {
-            FileHandle.standardError.write(Data("ERROR: guest did not emit key-seq marker '\(marker)' within 40s; string not typed\n".utf8))
+            FileHandle.standardError.write(Data("ERROR: guest did not emit key-seq marker '\(marker)' within \(Int(waitSeconds))s; string not typed\n".utf8))
         }
     }
 }
