@@ -142,6 +142,28 @@ final class DirectoryTests: XCTestCase {
         }
     }
 
+    /// #2853: repeated open/page/close sequences on one table must each
+    /// serve their own directory — slot recycling across different paths
+    /// (root -> child -> deeper -> root), never a stale or wedged session.
+    func testSequentialReuseAcrossPaths() throws {
+        try withRoot { root in
+            try FileManager.default.createDirectory(at: root.appendingPathComponent("a/b"), withIntermediateDirectories: true)
+            try Data("r".utf8).write(to: root.appendingPathComponent("r.txt"))
+            try Data("c".utf8).write(to: root.appendingPathComponent("a/c.txt"))
+            try Data("d".utf8).write(to: root.appendingPathComponent("a/b/d.txt"))
+            let table = DirectoryTable()
+            for (path, want) in [("", ["a", "r.txt"]), ("a", ["b", "c.txt"]), ("a/b", ["d.txt"]), ("", ["a", "r.txt"])] {
+                let (status, token) = table.open(root: root, path: path)
+                XCTAssertEqual(status, VFWire.stOk)
+                let (pst, page) = table.page(request(token, offset: 0))
+                XCTAssertEqual(pst, VFWire.stOk)
+                XCTAssertEqual(names(page), want)
+                XCTAssertEqual(page[12], 1) // single-page end
+                XCTAssertEqual(table.close(token).0, VFWire.stOk)
+            }
+        }
+    }
+
     func testMissingNonDirectoryAndSymlinkEscape() throws {
         try withRoot { root in
             let table = DirectoryTable()

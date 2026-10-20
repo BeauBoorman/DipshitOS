@@ -57,6 +57,7 @@ vgate_file script-mutate.txt <<'EOF'
 vf ls
 vf cat big.bin
 vf ls sub
+vf ls repo/lib
 vf cat sub/hello.txt
 vf mkdir hf3
 vf open hf3/new.bin
@@ -68,6 +69,7 @@ vf write 1 4
 vf fsync 1
 vf close 1
 vf close 0
+vf ls
 echo rx-vf3-mutate
 EOF
 
@@ -190,6 +192,17 @@ vgate_assert mutate serial-contains "vf: cat big.bin size=100000"
 vgate_assert mutate serial-contains "vf: cat ok bytes=100000 rts="
 vgate_assert mutate serial-contains "cksum=0xd986"
 vgate_assert mutate serial-contains "sub/"
+# #2853: repeated dir_open/page/close sequences on one share — the second
+# and later listings must serve THEIR directory's rows, not an error or a
+# stale snapshot. The wedge signature is a non-ok reply surfaced as
+# "host file-channel error"; row checks pin sub/ (second sequence, fewer
+# rows than the root's multi-page listing) and repo/lib (depth 2, third
+# sequence), and the final `vf ls` proves reuse after interleaved
+# OPEN/WRITE/FSYNC/RENAME/CLOSE handle traffic.
+vgate_assert mutate serial-contains "hello.txt  10"
+vgate_assert mutate serial-contains "small0.bin"
+vgate_assert mutate serial-exact "sub/ 0" 2
+vgate_assert mutate serial-absent "host file-channel error"
 vgate_assert mutate serial-contains "vf: cat ok bytes=10 rts=1 cksum=0x249d"
 vgate_assert mutate serial-absent "vf: probe 32k FAILED"
 vgate_assert mutate serial-exact "vf: open hf3/new.bin h=0" 1

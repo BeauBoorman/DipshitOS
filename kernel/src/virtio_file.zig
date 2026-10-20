@@ -797,6 +797,11 @@ pub fn snapshot(raw_path: []const u8, out: *directory.Snapshot) u8 {
 /// caller holds `vf_lock` (snapshot() above; list() reuses it so the
 /// 31-byte LIST wire op keeps no kernel consumer).
 fn snapshot_exchange_seq(path: []const u8, out: *directory.Snapshot) u8 {
+    // A fresh host session always pages from row 0 — the sequence OWNS
+    // the reset, the same way virtio_fs.snapshot owns `out.count = 0`
+    // (#2853: list() forgot it once and the second listing paged at the
+    // first's row count — host stHostError or silently wrong rows).
+    out.count = 0;
     const opened = snapshot_exchange(op_dir_open, path) orelse return st_host_error;
     if (opened.status != st_ok) return opened.status;
     if (opened.data.len != 8) return st_host_error;
@@ -2122,4 +2127,34 @@ test "M134a: list refuses a >31-byte name by name, never truncates" {
     // Names that fit the row still list — only the overlong one refuses.
     try testing.expectEqual(@as(usize, 1), res.count);
     try testing.expectEqualStrings("short.txt", res.entries[0].name[0..res.entries[0].name_len]);
+}
+
+test "virtio_file: #2853 — every snapshot sequence starts paging at row 0" {
+    // The wedge: list() reused vf_list_scratch without resetting .count,
+    // so a second dir_open/page/close sequence issued dir_page at the
+    // FIRST listing's row count — the host's offset>rows.count refusal
+    // surfaced as "host file-channel error" and wedged every later LIST
+    // (agentd's second dirExists refused no-audit on it). The sequence
+    // now owns the reset: hand both callers a dirty snapshot, run one
+    // dir_open exchange each, and assert the leftovers are gone.
+    const head = arm_test_transport();
+    defer disarm_test_transport();
+    const r = &virtio_custom.cv_rings[virtio_custom.file_qidx];
+    // A host that answers every staged exchange "not found" (no data).
+    vf_reply_buf[0] = st_not_found;
+    write_le_u16(&vf_reply_buf, 1, 0);
+
+    vf_list_scratch.count = 7; // a previous listing's leftovers
+    var res: ListResult = .{};
+    r.used.ring[0] = .{ .id = head, .len = reply_hdr_len };
+    r.used.idx = 1;
+    try testing.expectEqual(st_not_found, list("MISSING", &res));
+    try testing.expectEqual(@as(usize, 0), vf_list_scratch.count);
+
+    var dirty = directory.Snapshot{};
+    dirty.count = 7;
+    r.used.ring[1] = .{ .id = head, .len = reply_hdr_len };
+    r.used.idx = 2;
+    try testing.expectEqual(st_not_found, snapshot_exchange_seq("MISSING", &dirty));
+    try testing.expectEqual(@as(usize, 0), dirty.count);
 }
