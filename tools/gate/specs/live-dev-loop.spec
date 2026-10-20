@@ -1,27 +1,44 @@
-# live-dev-loop.spec -- M107f (issue #2323) class-B: the STANDING dev-loop
-# acceptance gate. One scripted pass over the whole in-guest story, every
-# chain marker observed: `flint init` on a staged base program -> add +
-# commit -> a scripted workspace edit (gosh cat) -> GOBUILD.ELF fails with a
-# positioned `gobuild: diag` (ERRORS.TXT, checked host-side) -> scripted fix
-# -> rebuild -> the guest-built product runs -> `flint status`/`diff` review
-# -> second commit -> `flint push` over the hermetic --net relay to host
-# flintd -> python assert: stream byte-verbatim, `flint verify --all`, every
-# Change authored by the guest's agent-sign key. The heavyweight capstone
-# (every source byte through a GOEDIT paste lane) is live-godiff-loop; this
-# is the cheap standing form — scripted edits, no seat, three boots.
+# live-dev-loop.spec -- M107f (issue #2323) + M138d (issue #2778) class-B:
+# the STANDING dev-loop acceptance gate, K=3 via vgate_repeat. One scripted
+# pass per boot over the whole in-guest story, every chain marker observed
+# on all three iterations: `flint init` on a staged base program -> add +
+# commit -> a heredoc script scaffolds main.go (M138a gosh `<<`) ->
+# GOBUILD.ELF fails with a positioned `gobuild: diag` (ERRORS.TXT, checked
+# host-side) -> GOEDIT opens the file, ctrl-n jumps the diagnostic to its
+# line:col, ctrl-b checks the bracket match (plus the `match none`
+# refusal), and ctrl-s save prints the format named refusal and publishes
+# -> a scripted fix -> rebuild -> the guest-built product runs -> `flint
+# status`/`diff` review -> second commit -> `flint blame` names the new
+# change -> `flint push` over the hermetic --net relay to host flintd ->
+# python assert: stream byte-verbatim, `flint verify --all`, every Change
+# authored by the guest's agent-sign key. The heavyweight capstone (every
+# source byte through a GOEDIT paste lane) is live-godiff-loop; this is the
+# cheap standing form — scripted edits, no seat, three boots per iteration.
+#
+# REPEAT SEMANTICS (M138d): the armed share persists across iterations, so
+# the spec keeps ONE workspace on ONE stream and replays real history.
+# J1 restores the base sources, then init lands 'init ok' on iteration 1
+# and 'flint: refuse ws_exists' later (the DEVLOOP-INIT-FRESH/-EXISTS
+# branches) — the base restore makes each iteration's first commit a real
+# revert-to-base change, so run 03's push APPENDS two changes per
+# iteration to the server's stream 'main' (a second `create` of stream
+# "main" is the stream_exists refusal a fresh-store model hits). The
+# run-03 python pins the stream's even growing Change count, the head,
+# and blame's attribution of AnswerPlusOne to that head.
 #
 # HOST PREREQS:
 #   bash tools/go/build-gosh.sh    -> .build/go/GOSH.ELF
 #   bash tools/go/build-flint.sh   -> .build/go/FLINT.ELF
 #   bash tools/go/build-gobuild.sh -> .build/go/GOBUILD.ELF
 #   bash tools/go/build-gotool.sh  -> .build/go/GOCMD{COMPILE,LINK}.ELF
+#   bash tools/go/build-goedit.sh  -> .build/go/GOEDIT.ELF
 #   bash tools/go/stage-selfhost.sh -> .build/go/selfhost/{GOIMPORT.CFG,
 #                                      GOPKGS.TXT,GPKG_*.a}
 #   ../flint-server + ../flint-client checkouts (see live-flint-loop.spec)
-# exec-order: assert-proven -- run 01 ends on `gobuild: FAIL` (a marker only
-# the driver prints), run 02 on the J2-DONE echo a sequential gosh `source`
-# reaches only after the staged-set review, run 03 on `flint: push up to
-# date` after the second commit + both pushes.
+# exec-order: assert-proven -- run 01 ends on `goedit: saved ` (a marker
+# only the editor prints after the last chord), run 02 on the J2-DONE echo
+# a sequential gosh `source` reaches only after the staged-set review, run
+# 03 on `flint: push up to date` after the second commit + both pushes.
 # Transports: run 01 rides the armed cv channel like every console gate;
 # run 02 mounts --virtio-fs because the link's ~15 MiB of archive reads
 # faulted once on pure cv (live-godiff-loop's note), and run 03 needs it
@@ -31,10 +48,10 @@
 # edits are visible to run 02's virtio-fs reads. wm=none keeps the seat's
 # EL0 slots for the toolchain children (live-goedit-diags run 02's wall).
 
-vgate_name live-dev-loop "issue #2323 M107f: standing dev-loop gate — init, edit, diagnose, fix, build, run, commit, push, host-verified"
+vgate_name live-dev-loop "issue #2323 M107f + #2778 M138d: standing dev-loop gate — init, heredoc scaffold, GOEDIT diag-jump/bracket/save, fix, build, run, commit, blame, push, host-verified — K=3"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
-vgate_repeat 1 BOOTS
+vgate_repeat 3 BOOTS
 
 # ---- monitor scripts ----------------------------------------------------------
 # GOBUILD is always exec'd BY THE MONITOR (script2/script3 legs gated on the
@@ -50,6 +67,14 @@ EOF
 
 vgate_file script-01b.txt <<'EOF'
 exec GOBUILD.ELF /host/LOOP -o /host/LOOPAPP.ELF
+EOF
+
+# GOEDIT is the third stage, monitor-exec'd once the build's FAIL is on the
+# wire (its ERRORS.TXT is what ctrl-n reads). It runs under the kernel's
+# bare shim — wm=none, no seat — the go-edit run-13 shape, so the chords
+# reach its window over --via-virtio without spending a seat's EL0 slots.
+vgate_file script-01c.txt <<'EOF'
+exec GOEDIT.ELF /host/LOOP/main.go
 EOF
 
 vgate_file script-02.txt <<'EOF'
@@ -83,7 +108,7 @@ os.makedirs(share, exist_ok=True)
 #    GOIMPORT.CFG + GOPKGS.TXT + GPKG_*.a layout live-gobuild/live-godiff-loop
 #    stage — the driver's resolution is the shipped pkg-table policy, not a
 #    spec-local mirror).
-for name in ("GOSH.ELF", "FLINT.ELF", "GOBUILD.ELF",
+for name in ("GOSH.ELF", "FLINT.ELF", "GOBUILD.ELF", "GOEDIT.ELF",
              "GOCMDCOMPILE.ELF", "GOCMDLINK.ELF"):
     src = os.path.join(".build", "go", name)
     if not os.path.isfile(src):
@@ -117,11 +142,16 @@ open(os.path.join(share, "SECRETS.TXT"), "w").write(
 open(os.path.join(share, "OWNERS.TXT"), "w").write(
     "#v1\nFLINT.ELF\t644\t0\t-\n")
 
-# 4. The workspace (what `flint init` tracks) and the staged payloads the
-#    scripted edits cat into place. The base is a working two-package
-#    program; main-v2 calls a helper.AnswerPlusOne that does not exist yet
-#    (a compile child reports the positioned diag — the diagnose leg is the
-#    real toolchain, not a graph-stage refusal); helper-v2 adds it.
+# 4. The workspace (what `flint init` tracks), the BASE/ copies J1 cats
+#    back at the top of every iteration (the M138d repeat reset — a wiped
+#    store alone is not enough; the sources must revert too or iteration
+#    n's "base" commit would record the v2 edit), and the staged payload
+#    J2A cats into place. The base is a working two-package program; the
+#    heredoc in J1 scaffolds the v2 main.go itself — unformatted
+#    (`func  main( )`) so the ctrl-s leg's format-vs-refusal both mean
+#    something — calling a helper.AnswerPlusOne that does not exist yet
+#    (a compile child reports the positioned diag — the diagnose leg is
+#    the real toolchain, not a graph-stage refusal); helper-v2 adds it.
 def w(rel, body):
     p = os.path.join(share, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -132,27 +162,24 @@ def w(rel, body):
 # atomic on the console (observed: the two-operand form split "devloop:
 # answer" from "43" around an `smp: steal` line). strconv also makes the
 # program prove a STAGED std import resolves, not only local packages.
-w("LOOP/main.go",
-  "package main\n"
+BASE_MAIN = ("package main\n"
   "import \"helper\"\n"
   "import \"strconv\"\n"
   "func main() {\n"
   "\tprintln(\"devloop: answer=\" + strconv.Itoa(helper.Answer()-1))\n"
   "}\n")
-w("LOOP/helper/helper.go",
-  "package helper\n"
+BASE_HELPER = ("package helper\n"
   "func Answer() int { return 42 }\n")
-w("STAGE/main-v2.go",
-  "package main\n"
-  "import \"helper\"\n"
-  "import \"strconv\"\n"
-  "func main() {\n"
-  "\tprintln(\"devloop: answer=\" + strconv.Itoa(helper.AnswerPlusOne()))\n"
-  "}\n")
+w("LOOP/main.go", BASE_MAIN)
+w("LOOP/helper/helper.go", BASE_HELPER)
+w("BASE/main.go", BASE_MAIN)
+w("BASE/helper.go", BASE_HELPER)
 w("STAGE/helper-v2.go",
   "package helper\n"
   "func Answer() int { return 42 }\n"
   "func AnswerPlusOne() int { return Answer() + 1 }\n")
+# One stream named main accumulates the whole K=3 history (see J1.SH).
+
 
 # 5. The guest-side journey scripts (gosh `source` keeps each line's
 #    external run sequential — the go-flint pattern). cat/echo/sleep are
@@ -173,12 +200,37 @@ w("STAGE/helper-v2.go",
 #    refuses nothing_to_commit, second push prints "up to date", reads
 #    duplicate) — serial-contains asserts are presence checks.
 open(os.path.join(share, "J1.SH"), "w").write(
-    "FLINT.ELF init --name=devloop --src=/host/LOOP\n"
+    # The M138d iteration reset: restore the base sources before init so
+    # every boot's first commit is a real (revert-to-base) change. On
+    # iteration 1 the cats rewrite the same bytes — a no-op write the
+    # share absorbs either way.
+    "cat /host/BASE/main.go > /host/LOOP/main.go\n"
+    "cat /host/BASE/helper.go > /host/LOOP/helper/helper.go\n"
+    # M138d repeat model: ONE workspace, ONE stream, real history. Iter1's
+    # init lands 'init ok'; later iterations' 'flint: refuse ws_exists'
+    # takes the resume branch — the workspace the arc tracks is already
+    # there, and the base restore above turns each iteration's first
+    # commit into a real (revert-to-base) change, never nothing_to_commit.
+    # This is also what keeps run 03's push green: the single stream named
+    # main APPENDS two changes per iteration on the server — a second
+    # `create` of stream "main" is the stream_exists refusal the
+    # fresh-store-per-iteration design hit.
+    "FLINT.ELF init --name=devloop --src=/host/LOOP && echo DEVLOOP-INIT-FRESH || echo DEVLOOP-INIT-EXISTS\n"
     "FLINT.ELF add /host/LOOP\n"
     "FLINT.ELF commit -m \"devloop: base\"\n"
-    # The scripted edit: valid syntax, one undefined selector. `&&` so the
-    # marker exists only when the write landed.
-    "cat /host/STAGE/main-v2.go > /host/LOOP/main.go && echo DEVLOOP-EDIT\n")
+    # The M138a scaffold: a sourced heredoc (runSource collects the body
+    # from the file's own next lines — the monitor's heredoc reader never
+    # sees it) writes the v2 main.go — valid syntax, unformatted
+    # (`func  main( )`), one undefined selector. `&&` so the marker
+    # exists only when the write landed.
+    "cat <<V2 > /host/LOOP/main.go && echo DEVLOOP-EDIT\n"
+    "package main\n"
+    "import \"helper\"\n"
+    "import \"strconv\"\n"
+    "func  main( ) {\n"
+    "\tprintln(\"devloop: answer=\" + strconv.Itoa(helper.AnswerPlusOne()))\n"
+    "}\n"
+    "V2\n")
 open(os.path.join(share, "J2A.SH"), "w").write(
     "cat /host/STAGE/helper-v2.go > /host/LOOP/helper/helper.go && echo DEVLOOP-FIXED\n")
 open(os.path.join(share, "J2B.SH"), "w").write(
@@ -197,6 +249,11 @@ open(os.path.join(share, "J2B.SH"), "w").write(
     "echo J2-DONE\n")
 open(os.path.join(share, "J3.SH"), "w").write(
     "FLINT.ELF commit -m \"devloop: AnswerPlusOne lands\" || sleep 1 ; FLINT.ELF commit -m \"devloop: AnswerPlusOne lands\"\n"
+    # M138d: `flint blame` attributes each working-tree line through its
+    # covering Atom to the newest touching Change — the AnswerPlusOne
+    # decl's line must name the commit this boot just made (the run-03
+    # python reads the id back off the stream head).
+    "FLINT.ELF blame /host/LOOP/helper/helper.go || sleep 1 ; FLINT.ELF blame /host/LOOP/helper/helper.go\n"
     # Commit->push is the observed drop boundary; the push->push spacing is
     # also what flint-loop's relay socket teardown needs.
     "sleep 1\n"
@@ -261,19 +318,33 @@ print("dev-loop staged: %d toolchain files, ws=LOOP, flintd up pid=%d"
       % (n_arch, flintd_proc.pid))
 PY
 
-# ---- 01: init -> base commit -> scripted edit -> build fails (diagnose) ------
-# The dev's first act after init is the base commit; the v2 edit then breaks
-# the build the way real work does — a selector that does not exist yet.
+# ---- 01: init -> base commit -> heredoc scaffold -> build fails -> GOEDIT ----
+# The dev's first act after init is the base commit; the heredoc scaffold
+# then breaks the build the way real work does — a selector that does not
+# exist yet — and GOEDIT's session on the broken file is the M138d leg:
+# ctrl-n loads the build's own ERRORS.TXT and jumps the first diagnostic
+# to its line:col, ctrl-b round-trips the line-end `)` to its `(` and the
+# `{`-less `home` answers `match none`, and ctrl-s answers the shipped
+# build's named format refusal before publishing the buffer verbatim.
 vgate_run 01 -- \
+    --screen '$RUN_DIR/screen-01' \
+    --via-virtio \
     --script '$RUN_DIR/script-01.txt' \
     --script2 '$RUN_DIR/script-01b.txt' --script2-after 'procs GOSH.ELF exited status=0' \
-    --script-expect 'gobuild: FAIL' --script-expect-tail 4 --timeout 240
+    --script3 '$RUN_DIR/script-01c.txt' --script3-after 'gobuild: FAIL' \
+    --input-chords 'ctrl-n,end,left,ctrl-b,ctrl-b,home,ctrl-b,ctrl-s' \
+    --input-chords-after 'goedit: present' \
+    --script-expect 'goedit: saved ' --script-expect-tail 4 --timeout 300
 
 vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
-vgate_assert 01 serial-contains 'flint: init ok ws=devloop stream=main'
-vgate_assert 01 serial-contains 'flint: add files=2 new=2 modified=0 deleted=0 unchanged=0'
+# Iteration 1 prints 'flint: init ok ws=devloop stream=main' and takes the
+# FRESH branch; later iterations hit 'flint: refuse ws_exists' and take
+# EXISTS — 'DEVLOOP-INIT' is the marker both paths share. The ws is proven
+# downstream either way (add sees its 2 files, the commit lands).
+vgate_assert 01 serial-contains 'DEVLOOP-INIT'
+vgate_assert 01 serial-contains 'flint: add files=2'
 vgate_assert 01 serial-contains 'flint: commit ok id='
-vgate_assert 01 serial-contains ' ops=2 parent=none'
+vgate_assert 01 serial-contains ' ops=2 parent='
 vgate_assert 01 serial-contains 'DEVLOOP-EDIT'
 # The diagnose leg: helper compiled clean, main's child failed, and the
 # driver's positioned diag names the undefined selector.
@@ -284,6 +355,24 @@ vgate_assert 01 serial-contains 'undefined: helper.AnswerPlusOne'
 vgate_assert 01 serial-contains 'gobuild: diag gobuild:0:0: compile main: GOCMDCOMPILE.ELF exited status 2'
 vgate_assert 01 serial-contains 'gobuild: FAIL'
 vgate_assert 01 serial-absent 'gobuild: build OK'
+# The M138d editor leg on the just-failed build's own ERRORS.TXT: the list
+# loads, ctrl-n jumps the first row to its line:col (the helper.AnswerPlusOne
+# selector on line 5), the status stamp carries the M138b err= count, and
+# the bracket chord round-trips `)`->`(`->`)` before `home` parks on a
+# non-bracket for the named `match none`. Ctrl-S then takes the shipped
+# build's named format refusal and still publishes — the python assert
+# checks the landed bytes against whichever path the binary took.
+vgate_assert 01 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 01 serial-contains 'goedit: read /host/LOOP/main.go n='
+vgate_assert 01 serial-contains 'goedit: present'
+vgate_assert 01 serial-contains 'goedit: errors n='
+vgate_assert 01 serial-contains 'goedit: errors jump line=5 col='
+vgate_assert 01 serial-contains 'goedit: status line=5/'
+vgate_assert 01 serial-contains ' err=1/'
+vgate_assert 01 serial-count 'goedit: match jump off=' 2
+vgate_assert 01 serial-contains 'goedit: match none'
+vgate_assert 01 serial-contains 'edit: format unavailable (go/format not guest-safe)'
+vgate_assert 01 serial-contains 'goedit: saved /host/LOOP/main.go'
 vgate_assert 01 serial-absent '[EXC] parking:'
 vgate_assert 01 serial-absent 'exited status=139'
 vgate_assert 01 serial-absent 'cannot allocate memory'
@@ -291,6 +380,29 @@ vgate_assert 01 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b3269197
 # The diagnostics artifact the diagnose step publishes (M107a's fixed path).
 vgate_assert 01 share-contains 'LOOP/.BUILD/ERRORS.TXT' 'main.go:5:'
 vgate_assert 01 share-contains 'LOOP/.BUILD/ERRORS.TXT' 'undefined: helper.AnswerPlusOne'
+
+# The ctrl-s leg's landed bytes decide which path the save took and require
+# the matching one (live-goedit-diags run 05's shape): the named refusal
+# leaves the heredoc scaffold verbatim, a real go/format leaves canonical
+# output — anything else fails. Either way run 02's fix+build is unmoved.
+vgate_assert 01 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+share = os.environ["VG_SHARE"]
+got = open(os.path.join(share, "LOOP", "main.go"), "rb").read()
+seed = ("package main\nimport \"helper\"\nimport \"strconv\"\n"
+        "func  main( ) {\n"
+        "\tprintln(\"devloop: answer=\" + strconv.Itoa(helper.AnswerPlusOne()))\n"
+        "}\n").encode()
+if "edit: format unavailable" in ser:
+    assert got == seed, "refusal path must publish verbatim: %r" % got
+    print("format unavailable: verbatim scaffold verified (%d bytes)" % len(got))
+else:
+    assert "goedit: format n=" in ser, "no refusal and no format receipt — which path ran?"
+    assert b"func main()" in got and got != seed, \
+        "format path must publish gofmt output: %r" % got
+    print("format-on-save verified: %d bytes" % len(got))
+PY
 
 # ---- 02: fix -> rebuild -> run -> staged-set review ---------------------------
 vgate_run 02 -- \
@@ -360,6 +472,12 @@ vgate_run 03 -- \
 vgate_assert 03 serial-contains 'flint: commit ok id='
 vgate_assert 03 serial-contains ' ops=2 parent='
 vgate_assert 03 serial-absent ' ops=2 parent=none'
+# M138d: `flint blame` names the new change — the AnswerPlusOne decl's line
+# is attributed to this boot's fix commit (author8 d75a9801 = the guest's
+# RFC 8032 TEST 1 key) and the python below reads the change-id back off
+# the stream head so the attribution is to the NEW change, not any commit.
+vgate_assert 03 serial-contains 'flint: blame '
+vgate_assert 03 serial-contains ' d75a9801 func AnswerPlusOne() int { return Answer() + 1 }'
 vgate_assert 03 serial-contains 'flint: push ok stream=main changes=2'
 vgate_assert 03 serial-contains 'flint: push up to date'
 vgate_assert 03 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
@@ -371,7 +489,8 @@ import glob, json, os, subprocess, sys
 
 run = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
-out = open(os.path.join(run, "run-03.out"), errors="replace").read()
+out = open(os.path.join(run, "run-" + os.environ["VG_TAG"] + ".out"),
+           errors="replace").read()
 for leaked in (
     "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
     "ab" * 32,
@@ -392,8 +511,21 @@ remote_raw = open(remote_log, "rb").read()
 if local_raw != remote_raw:
     sys.exit("pushed stream log is not byte-verbatim")
 lines = local_raw.decode("utf-8").splitlines()
-if len(lines) != 2:
-    sys.exit("expected 2 Changes on the stream, got %d" % len(lines))
+# K=3 (M138d): the stream accumulates — each iteration appends a base-revert
+# and a fix Change, so the log holds an even count that grows by 2.
+if len(lines) < 2 or len(lines) % 2 != 0:
+    sys.exit("expected an even Change count >= 2 on the stream, got %d" % len(lines))
+
+# `flint blame` names the NEW change: the AnswerPlusOne line's change-id
+# must be this boot's stream head (the fix commit just pushed), not the
+# base commit an older-decl line attributes to.
+head_id = json.loads(lines[-1])["id"]
+ser = open(os.environ["VG_SER"], errors="replace").read()
+blamed = [l for l in ser.splitlines()
+          if l.startswith("flint: blame ") and "AnswerPlusOne" in l]
+if not blamed or not any(l.split()[2] == head_id for l in blamed):
+    sys.exit("blame did not attribute AnswerPlusOne to the head change "
+             + head_id + ": " + repr(blamed))
 
 # Every Change must be authored by the guest's agent-sign key — the RFC
 # 8032 TEST 1 public key paired to the seed SECRETS.TXT bound to FLINT.ELF.
@@ -418,8 +550,12 @@ res = subprocess.run(
 if res.returncode != 0:
     sys.exit("host flint verify --all rc=%d: %s%s" % (res.returncode, res.stdout, res.stderr))
 verified = [l for l in res.stdout.splitlines() if l.endswith("sig: verified")]
-if len(verified) != 2:
-    sys.exit("expected 2 'sig: verified' lines from host verify, got %r" % res.stdout)
+# K=3 (M138d): the server holds the ONE accumulating stream — verify --all
+# signs off on every Change the byte-verbatim log carries, not just this
+# iteration's pair.
+if len(verified) != len(lines):
+    sys.exit("expected %d 'sig: verified' lines from host verify, got %r"
+             % (len(lines), res.stdout))
 rec = json.load(open(os.path.join(run, "devloopd-store", "streams", stream_id + ".json")))
 if rec.get("head") != json.loads(lines[-1]).get("id"):
     sys.exit("server stream head %r != last pushed change %r"
