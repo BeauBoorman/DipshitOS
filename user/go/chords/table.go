@@ -129,6 +129,35 @@ var Global = Table{
 	{Chord{ModCtrl, UsageZ}, "seat", ScopeSeat, "undo",
 		"dispatch undo to the focused tab — with the strip focused, " +
 			"reopen the last closed tab", "#2568 (M121e)", false},
+	// M132a (#2752): the M132 wave's RESERVED seat chords — ADR 0007's
+	// "M132 wave reservations" rows R4–R6, landed ahead of their handlers
+	// so no other lane can bind the spellings. A row whose action has no
+	// runSeatAction case is an honest no-op: the seat routes, never
+	// swallows, and the focused app's KEY_DOWN is unaffected (ADR 0009 —
+	// pinned by hid_test's TestReservedChordsForwardAsNoOps). The named
+	// consumer lands the handler; the row is the claim.
+	{Chord{ModCtrl | ModAlt, UsageLeft}, "seat", ScopeSeat, "pane-focus-left",
+		"focus the pane left of the focused pane (reserved; M137a implements)",
+		"#2752 (M132a)", false},
+	{Chord{ModCtrl | ModAlt, UsageRight}, "seat", ScopeSeat, "pane-focus-right",
+		"focus the pane right of the focused pane (reserved; M137a implements)",
+		"#2752 (M132a)", false},
+	{Chord{ModCtrl | ModAlt, UsageUp}, "seat", ScopeSeat, "pane-focus-up",
+		"focus the pane above the focused pane (reserved; M137a implements)",
+		"#2752 (M132a)", false},
+	{Chord{ModCtrl | ModAlt, UsageDown}, "seat", ScopeSeat, "pane-focus-down",
+		"focus the pane below the focused pane (reserved; M137a implements)",
+		"#2752 (M132a)", false},
+	{Chord{ModCtrl | ModAlt, UsagePageUp}, "seat", ScopeSeat, "space-prev",
+		"switch to the previous space (reserved; M137c implements)",
+		"#2752 (M132a)", false},
+	{Chord{ModCtrl | ModAlt, UsagePageDown}, "seat", ScopeSeat, "space-next",
+		"switch to the next space (reserved; M137c implements)",
+		"#2752 (M132a)", false},
+	{Chord{ModCtrl | ModShift, UsageE}, "seat", ScopeSeat, "summon-emoji",
+		"summon the emoji picker — launch GOEMOJI.ELF by name (reserved; " +
+			"M137c implements, M146a ships the target)",
+		"#2752 (M132a)", false},
 
 	// --- apps: each app's own chords, live while that app is focused
 	// (ADR 0009 KEY_DOWN). GOSH's are the shlib line editor's

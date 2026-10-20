@@ -1444,9 +1444,74 @@ func TestChordSummaryCounts(t *testing.T) {
 		}
 	}
 	got := chordSummary(len(chords.Global), seat, kernel, app)
-	want := "gotabwm: chords n=59 seat=29 kernel=12 app=18"
+	// M132a (#2752): n=59→66, seat=29→36 — the wave's seven reserved seat
+	// rows (R4–R6) landed ahead of their handlers.
+	want := "gotabwm: chords n=66 seat=36 kernel=12 app=18"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
+	}
+}
+
+// M132a (#2752): the card's swallow check, answered. OBSERVED: the seat's
+// dispatch is the registry walk into runSeatAction, and an action with no
+// case is an honest no-op — no exec, no focus move, no strip mutation.
+// Kind-21 WM_KEY is a fan-out to the seat, never the delivery path: the
+// focused app's kind-1 KEY_DOWN arrives per ADR 0009 whatever the seat
+// does. A reserved chord therefore FORWARDS — the row claims the spelling
+// without eating the keystroke — so R4–R6 land in the table now and
+// M137a/M137c land only their handlers. This test pins the no-op half so
+// a later "consume" refactor cannot land silently.
+func TestReservedChordsForwardAsNoOps(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+	if !tabs.OpenTab(3, "A") || !tabs.OpenTab(4, "B") {
+		t.Fatal("OpenTab")
+	}
+	if !tabs.FocusTab(4) {
+		t.Fatal("FocusTab")
+	}
+	execs, restoreExec := execRecorder()
+	defer restoreExec()
+	indices, restoreFocus := focusIndexRecorder()
+	defer restoreFocus()
+
+	reserved := []struct {
+		flags  uint16
+		usage  uint8
+		action string
+	}{
+		{vi.ModCtrl | vi.ModAlt, chords.UsageLeft, "pane-focus-left"},
+		{vi.ModCtrl | vi.ModAlt, chords.UsageRight, "pane-focus-right"},
+		{vi.ModCtrl | vi.ModAlt, chords.UsageUp, "pane-focus-up"},
+		{vi.ModCtrl | vi.ModAlt, chords.UsageDown, "pane-focus-down"},
+		{vi.ModCtrl | vi.ModAlt, chords.UsagePageUp, "space-prev"},
+		{vi.ModCtrl | vi.ModAlt, chords.UsagePageDown, "space-next"},
+		{vi.ModCtrl | vi.ModShift, chords.UsageE, "summon-emoji"},
+	}
+	for _, r := range reserved {
+		e := vi.Event{Kind: vi.EvWmKey, Flags: r.flags, Arg0: uint32(r.usage)}
+		if c := chordEvent(e); seatChords[c] != r.action {
+			t.Fatalf("seatChords[%s] = %q want %q — the row IS the reservation", c, seatChords[c], r.action)
+		}
+		handleWmKey(e)
+	}
+	if len(*execs) != 0 {
+		t.Fatalf("reserved chords reached the exec seam: %v — a no-op must not exec", *execs)
+	}
+	if len(*indices) != 0 {
+		t.Fatalf("reserved chords moved rail focus: %v", *indices)
+	}
+	if launch.open {
+		t.Fatal("a reserved chord opened the launcher")
+	}
+	if id, ok := tabs.Focused(); !ok || id != 4 {
+		t.Fatalf("reserved chords mutated focus to %v", id)
+	}
+	if tabs.Count() != 2 {
+		t.Fatalf("reserved chords mutated the strip: %d tabs want 2", tabs.Count())
 	}
 }
 

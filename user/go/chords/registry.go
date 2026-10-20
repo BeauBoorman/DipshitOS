@@ -86,6 +86,7 @@ const (
 	UsagePageUp       uint8 = 0x4B
 	UsageEnd          uint8 = 0x4D
 	UsagePageDown     uint8 = 0x4E
+	UsageRight        uint8 = 0x4F
 	UsageLeft         uint8 = 0x50
 	UsageDown         uint8 = 0x51
 	UsageUp           uint8 = 0x52
@@ -149,6 +150,8 @@ func usageName(u uint8) string {
 		return "end"
 	case UsagePageDown:
 		return "pagedown"
+	case UsageRight:
+		return "right"
 	case UsageLeft:
 		return "left"
 	case UsageDown:

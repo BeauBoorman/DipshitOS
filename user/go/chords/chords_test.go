@@ -184,7 +184,9 @@ func TestCoexistenceRowsDocumented(t *testing.T) {
 }
 
 // TestSeatRowsAreTheSeatSurface: the seat's rows are exactly the chords
-// hid.go dispatches — the full named set, plus the nine digit rows.
+// hid.go dispatches — the full named set, plus the nine digit rows, plus
+// M132a's seven reserved rows (R4–R6: registered ahead of their handlers,
+// honest no-ops until the named consumer lands its case).
 func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 	wantActions := map[string]int{
 		"launcher": 1, "start-surface": 1, "cycle-focus": 4, "focus-index": 9,
@@ -192,6 +194,10 @@ func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 		"freeze-badge": 1, "split-cycle": 1, "nav-back": 1, "nav-forward": 1,
 		"sel-paste": 1, "close": 1, "move-left": 1, "move-right": 1,
 		"undo": 1,
+		// M132a (#2752): the wave's reserved seat chords.
+		"pane-focus-left": 1, "pane-focus-right": 1, "pane-focus-up": 1,
+		"pane-focus-down": 1, "space-prev": 1, "space-next": 1,
+		"summon-emoji": 1,
 	}
 	got := map[string]int{}
 	for _, r := range Global.SeatRows() {
@@ -231,5 +237,31 @@ func TestM121bTabChordPicks(t *testing.T) {
 	// kill-word, and a seat row would eat the editor's key.
 	if _, bound := got[Chord{ModCtrl, UsageW}]; bound {
 		t.Error("ctrl+w must stay unbound at the seat (GOSH.ELF kill-word)")
+	}
+}
+
+// TestM132aReservedChordPicks pins the wave reservation table's R4–R6
+// spellings (ADR 0007 "M132 wave reservations"): the seat claims these
+// chords now so no other lane binds them, and their actions are the
+// names the consumer cards (M137a/M137c) implement. The collision half
+// is TestGlobalValidates — the rows exist because they pass it.
+func TestM132aReservedChordPicks(t *testing.T) {
+	want := map[Chord]string{
+		{ModCtrl | ModAlt, UsageLeft}:     "pane-focus-left",
+		{ModCtrl | ModAlt, UsageRight}:    "pane-focus-right",
+		{ModCtrl | ModAlt, UsageUp}:       "pane-focus-up",
+		{ModCtrl | ModAlt, UsageDown}:     "pane-focus-down",
+		{ModCtrl | ModAlt, UsagePageUp}:   "space-prev",
+		{ModCtrl | ModAlt, UsagePageDown}: "space-next",
+		{ModCtrl | ModShift, UsageE}:      "summon-emoji",
+	}
+	got := map[Chord]string{}
+	for _, r := range Global.SeatRows() {
+		got[r.Chord] = r.Action
+	}
+	for c, action := range want {
+		if got[c] != action {
+			t.Errorf("reserved seat chord %s: action %q want %q", c, got[c], action)
+		}
 	}
 }
