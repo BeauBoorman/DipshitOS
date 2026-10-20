@@ -466,8 +466,8 @@ PY
 # exactly the two files the decision turns on (PIC.QOI, SONG.OGG; the first is
 # selected on arrival). The batch is two chords long:
 #
-#   o           the Open-with… list on PIC.QOI (two candidates: GOVIEW, then
-#               GOEDIT on the raw bytes)
+#   o           the Open-with… list on PIC.QOI (three candidates: GOVIEW,
+#               GOEDIT on the raw bytes, then M132b's reserved GOPAINT)
 #   1           take the FIRST entry of that list → GOVIEW.ELF on PIC.QOI
 #
 # Two chords, and the launch is the last one. vi.Exec blocks while the kernel
@@ -489,7 +489,7 @@ vgate_run 02 -- \
     --input-chords 'o,1' \
     --input-chords-after 'gofiles: ready' \
     --script2 '$RUN_DIR/script4.txt' \
-    --script2-after 'gofiles: open with PIC.QOI type=image candidates=2' \
+    --script2-after 'gofiles: open with PIC.QOI type=image candidates=3' \
     --script3 '$RUN_DIR/script5.txt' \
     --script3-after 'gofiles: open launched PIC.QOI handler=GOVIEW.ELF pid=' \
     --script-expect 'rx-go-fileman-open-ok' --timeout 240
@@ -500,9 +500,10 @@ vgate_assert 02 serial-contains 'gofiles: list /host/FM2 n=2'
 vgate_assert 02 serial-contains 'gofiles: entry PIC.QOI file'
 vgate_assert 02 serial-contains 'gofiles: entry SONG.OGG file'
 
-# Open with…: the candidate list is real (both registered image handlers) and
-# the digit took the first entry of it.
-vgate_assert 02 serial-contains 'gofiles: open with PIC.QOI type=image candidates=2'
+# Open with…: the candidate list is real (all three registered image
+# handlers — GOVIEW, the GOEDIT raw-bytes fallback, and M132b's GOPAINT
+# reservation) and the digit took the first entry of it.
+vgate_assert 02 serial-contains 'gofiles: open with PIC.QOI type=image candidates=3'
 vgate_assert 02 serial-contains 'gofiles: open chose PIC.QOI type=image handler=GOVIEW.ELF'
 
 # The dispatch: the DECISION (model) and the OUTCOME (after vi.Exec returned).
@@ -898,14 +899,15 @@ vgate_assert 10 serial-contains 'gofiles: list /host/FM9 n=1'
 vgate_assert 10 serial-contains 'gofiles: entry NOTES.TXT file'
 
 # The right-press arrived as SGR button 2 and armed the menu on the row.
-# (M123d run 13 appends a third opens=text row — MISSING.ELF — so apps= and
-# candidates= count it; the clicked row is unchanged.)
+# (M123d run 13 appends a third opens=text row — MISSING.ELF — and M132b's
+# GOSHEET reservation adds a fourth, so apps= and candidates= count them;
+# the clicked row is unchanged — GOEDIT sits second regardless.)
 vgate_assert 10 serial-contains 'gofiles: mouse b=2'
-vgate_assert 10 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=3'
+vgate_assert 10 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=4'
 
 # The submenu: the opens=text manifest rows, and the descent named the
 # candidate count.
-vgate_assert 10 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=3'
+vgate_assert 10 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=4'
 
 # The pick and the launch: decision marker, outcome marker, and GOEDIT's
 # own report that it read the file the menu named.
@@ -1195,18 +1197,19 @@ PY
 
 # The gesture is pointer + chords: the right-press arms the menu on
 # NOTES.TXT's row (40,88 = list row 0, the run 10 geometry), then the
-# keyboard walks it — down to "Open With…", right descends, two downs land
-# on the third row (MISSING.ELF, appended last), return commits the exec,
-# and escape dismisses the refusal banner once it stands. Driving the
-# submenu by keys instead of a third pixel click keeps the leg honest
-# about WHAT it proves: the refusal, not the plate geometry.
+# keyboard walks it — down to "Open With…", right descends, three downs
+# land on the last row (MISSING.ELF — M132b's GOSHEET reservation sits a
+# row above it), return commits the exec, and escape dismisses the
+# refusal banner once it stands. Driving the submenu by keys instead of
+# a third pixel click keeps the leg honest about WHAT it proves: the
+# refusal, not the plate geometry.
 vgate_run 13 -- \
     --screen '$RUN_DIR/fileman-execrefusal-screen' \
     --input --via-virtio \
     --script '$RUN_DIR/script-13.txt' \
     --pointer-virtio '40,88,rc' \
     --pointer-virtio-after 'gofiles: ready' \
-    --input-chords 'down,right,down,down,return,escape' \
+    --input-chords 'down,right,down,down,down,return,escape' \
     --input-chords-after 'gofiles: menu NOTES.TXT mime=text/plain' \
     --script2 '$RUN_DIR/script2-13.txt' \
     --script2-after 'gofiles: banner act dismiss' \
@@ -1215,9 +1218,10 @@ vgate_run 13 -- \
 vgate_assert 13 serial-contains 'exec: loaded GOFILES.ELF'
 vgate_assert 13 serial-contains 'gofiles: list /host/FMX n=1'
 vgate_assert 13 serial-contains 'gofiles: mouse b=2'
-# Three opens=text rows now: NOTE.ELF, GOEDIT.ELF and the staged MISSING.ELF.
-vgate_assert 13 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=3'
-vgate_assert 13 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=3'
+# Four opens=text rows now: NOTE.ELF, GOEDIT.ELF, M132b's GOSHEET
+# reservation, and the staged MISSING.ELF.
+vgate_assert 13 serial-contains 'gofiles: menu NOTES.TXT mime=text/plain apps=4'
+vgate_assert 13 serial-contains 'gofiles: menu openwith NOTES.TXT mime=text/plain candidates=4'
 vgate_assert 13 serial-contains 'gofiles: open chose NOTES.TXT type=text handler=MISSING.ELF'
 vgate_assert 13 serial-contains 'gofiles: open launch refused NOTES.TXT handler=MISSING.ELF'
 vgate_assert 13 serial-contains 'gofiles: banner exec MISSING.ELF refused:'

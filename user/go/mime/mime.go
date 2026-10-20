@@ -40,6 +40,10 @@ const (
 	Audio
 	Archive
 	Binary
+	// M132b (#2753): documents — PDF today — are their own family so a
+	// reader app can claim `opens=document` without pretending the bytes
+	// are text. Magic beats the name here too: %PDF- at offset 0.
+	Document
 )
 
 // String is the type's table name — the word markers and receipts carry.
@@ -55,6 +59,8 @@ func (id ID) String() string {
 		return "archive"
 	case Binary:
 		return "binary"
+	case Document:
+		return "document"
 	default:
 		return "unknown"
 	}
@@ -106,6 +112,10 @@ var magic = []magicRule{
 	{id: Audio, magic: "fLaC"},
 	{id: Audio, magic: "ID3"},
 
+	// Documents. "%PDF-" is five bytes of signature, not a word prose
+	// starts with, so the rule needs no second half.
+	{id: Document, magic: "%PDF-"},
+
 	// Archives.
 	{id: Archive, magic: "PK\x03\x04"}, // zip
 	{id: Archive, magic: "\x1f\x8b"},   // gzip
@@ -125,7 +135,9 @@ var exts = map[string]ID{
 	"zig": Text, "c": Text, "h": Text, "py": Text, "rs": Text,
 	// image
 	"qoi": Image, "png": Image, "jpg": Image, "jpeg": Image, "gif": Image,
-	"bmp": Image, "webp": Image,
+	"bmp": Image, "webp": Image, "svg": Image,
+	// document
+	"pdf": Document,
 	// audio
 	"wav": Audio, "mp3": Audio, "ogg": Audio, "flac": Audio,
 	// archive
@@ -512,8 +524,9 @@ func hexValue(c byte) (byte, bool) {
 }
 
 // sharePath joins relative targets to cwd, rejects traversal, and returns a
-// canonical path the kernel's file ABI accepts. The only local partitions
-// retained here are the host share and the read-only USB volumes.
+// canonical path the kernel's file ABI accepts. The local partitions
+// retained here are the host share, the VLFS data volume (/disk — M132b
+// #2753, owner decision 2026-10-20), and the read-only USB volumes.
 func sharePath(target, cwd string) (string, bool) {
 	if target == "" || strings.IndexByte(target, 0) >= 0 {
 		return "", false
@@ -546,6 +559,9 @@ func sharePath(target, cwd string) (string, bool) {
 		parts = parts[1:]
 	} else if len(parts) > 0 && usbRoot(parts[0]) {
 		prefix = "/" + strings.ToLower(parts[0])
+		parts = parts[1:]
+	} else if len(parts) > 0 && strings.EqualFold(parts[0], "disk") {
+		prefix = "/disk"
 		parts = parts[1:]
 	}
 	path := prefix
@@ -580,9 +596,18 @@ func baseName(path string) string {
 // reading the raw bytes is the honest fallback then. GOSOUND.ELF (M99c)
 // opens audio and takes the path in argv[1]. Types with no registration —
 // Archive, Binary — refuse by name.
+//
+// M132b (#2753) registers the wave's reserved handlers: GOREADER is the
+// Document default, GOSHEET a second Text candidate, GOPAINT a third
+// Image one (its binary ships through the store; the registration is the
+// reservation, per R9/R12 of index #2734). Order matters — the first
+// registration stays the default, so the new names change no dispatch.
 func init() {
 	Register(Image, "GOVIEW.ELF", "Image Viewer")
 	Register(Text, "GOEDIT.ELF", "Code Editor")
 	Register(Image, "GOEDIT.ELF", "Code Editor (raw bytes)")
 	Register(Audio, "GOSOUND.ELF", "Sound Player")
+	Register(Document, "GOREADER.ELF", "Reader")
+	Register(Text, "GOSHEET.ELF", "Sheet")
+	Register(Image, "GOPAINT.ELF", "Paint")
 }

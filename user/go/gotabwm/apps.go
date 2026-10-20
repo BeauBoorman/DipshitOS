@@ -45,7 +45,11 @@ type AppEntry struct {
 }
 
 const (
-	appsMax      = 24
+	// appsMax is the catalog's row bound — the manifest's reserved rows
+	// (M132b #2753) decode alongside the shipped ones, and a cap under
+	// the file's real row count silently drops the tail exactly like a
+	// buffer truncation.
+	appsMax      = 32
 	appsMaxBytes = 4096
 	appsPath     = "/host/APPS.TXT"
 

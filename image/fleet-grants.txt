@@ -61,3 +61,13 @@ GOSNAP.ELF	-	file,memory,process,debug	not audited — M115e landed after the M1
 GOREC.ELF	-	file,audio,memory,process,debug	not audited — M118d landed after the M113f run; declared caps=file,audio + the observed Go-runtime ambient set (debug,memory,process); surface File*/WriteFileSafe + AudioCapQuery/AudioCapture
 ZC.BIN	file,debug	file,memory,process,debug	declared caps=file,memory,process; the audit's bare invocation never reached a compile
 TABWM.BIN	window	window,memory,process,debug	fallback seat: the no-seat shim left it a one-word app; its call surface is sys_exec + sys_mmap + sys_wmctl + sys_write (user/src/tabwm.zig)
+GOASSIST.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOSHEET.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOREADER.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOCLOCK.ELF	-	window,timer,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOMINE.ELF	-	window,audio,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOSOL.ELF	-	window,audio,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOEMOJI.ELF	-	window,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOIRC.ELF	-	file,window,memory,process,debug,net	declared: M132 reservation, binary not yet shipped
+GOVAULT.ELF	-	file,window,timer,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOPAINT.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped

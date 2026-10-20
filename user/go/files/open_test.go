@@ -127,12 +127,13 @@ func TestOpenWithListsCandidatesAndChooses(t *testing.T) {
 		t.Fatalf("`o` must arm the list, mode=%d", m.mode)
 	}
 	got := pendingJoined(&m)
-	if !strings.Contains(got, markerOpenWith+"PIC.QOI type=image candidates=2") {
+	if !strings.Contains(got, markerOpenWith+"PIC.QOI type=image candidates=3") {
 		t.Fatalf("candidate marker = %q", got)
 	}
-	// The list IS the menu: both registered image handlers, numbered.
+	// The list IS the menu: all three registered image handlers, numbered —
+	// GOVIEW, GOEDIT's raw-byte fallback, and M132b's GOPAINT reservation.
 	line := m.openWithLine()
-	for _, want := range []string{"open with PIC.QOI (image)", "1 Image Viewer", "2 Code Editor"} {
+	for _, want := range []string{"open with PIC.QOI (image)", "1 Image Viewer", "2 Code Editor", "3 Paint"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("status line %q missing %q", line, want)
 		}
@@ -181,8 +182,8 @@ func TestOpenWithRefusesATypeWithNoCandidates(t *testing.T) {
 	}
 }
 
-// A digit outside the list is refused, not clamped: pressing 9 with two
-// candidates must not silently open the second one.
+// A digit outside the list is refused, not clamped: pressing 9 with three
+// candidates must not silently open the third one.
 func TestOpenWithRejectsAnUnlistedDigit(t *testing.T) {
 	withHead(t, qoiHead)
 	m := testModel(entry("PIC.QOI", false))

@@ -32,6 +32,9 @@ const (
 	ClipText    = "text/plain"
 	ClipURIList = "text/uri-list"
 	ClipHTML    = "text/html"
+	// M132b (#2753): a CSV body is a text/plain refinement — same UTF-8
+	// shape rule, a name GOSHEET's paste lane can declare honestly.
+	ClipCSV     = "text/csv"
 	ClipPNG     = "image/png"
 	ClipQOI     = "image/qoi"
 	ClipGIF     = "image/gif"
@@ -108,7 +111,7 @@ func ClipSpellingOK(mime string) bool {
 // nothing).
 func ClipShapeOK(mime string, blob []byte) bool {
 	switch mime {
-	case ClipText:
+	case ClipText, ClipCSV:
 		return utf8.Valid(blob)
 	case ClipURIList:
 		return utf8.Valid(blob) && clipURIListShape(blob)

@@ -1,43 +1,34 @@
 # VirelaiOS app manifest, schema v2 (M82a #1768). Shipping EL0 apps only; the
-# Go seat's daily set is docked. TABWM.BIN is the Zig fallback (ADR 0034), not
-# a default dock target.
+# Go seat's daily set is docked. TABWM.BIN is the Zig fallback (ADR 0034).
 #
 #   NAME | Display Name | icon | dock=true | v=2 | argv= | caps= | opens=
 #
-# Fields 1-4 are the v1 shape every reader already parses. The trailing
-# key=value fields are ADDITIVE: order-insensitive, unknown keys ignored, and a
-# v1 reader that stops at field 4 is not wrong. No `v=` means v1 and no
-# trailing fields.
-#   v=     the row's schema version; only a v2 row is asked for the rest. A
-#          row with a tail MUST carry all four positional fields: field 4 is
-#          the dock flag in every reader (v1 included), so an undocked v2 row
-#          writes `dock=false` rather than leaving the field empty.
-#   argv=  fixed arguments after the binary, space separated (the kernel's
-#          exec takes at most 8, so 8 is the ceiling here too). v1: none.
+# Fields 1-4 are the v1 shape every reader parses. Trailing key=value fields
+# are ADDITIVE: order-insensitive, unknown keys ignored; a v1 reader that
+# stops at field 4 is not wrong. No `v=` means v1, no trailing fields.
+#   v=     schema version; only a v2 row is asked for the rest. A tailed row
+#          MUST carry all four positional fields — field 4 is the dock flag
+#          in every reader, so an undocked v2 row writes `dock=false`.
+#   argv=  fixed arguments after the binary, space separated, at most 8 (the
+#          kernel's exec bound). v1: none.
 #   caps=  declared capabilities, comma separated: file window audio timer
-#          memory process debug net term. The first seven are the WASM import
-#          contract's Cap names (user/src/wasm.zig) so one word means one thing
-#          across manifests. DECLARATIVE: nothing grants or gates power from
-#          this field, by card.
+#          memory process debug net term — the first seven are the WASM
+#          import contract's Cap names (user/src/wasm.zig). DECLARATIVE:
+#          nothing grants or gates power from this field.
 #   opens= what the app can be handed: an M81b mime type (text image audio
-#          archive binary) or a URL scheme (http https; M81c #1763 dispatches
-#          those). Naming a type is not a second opinion about a file.
-#          M124a (#2580) extends the vocabulary with full type/subtype
-#          spellings (text/plain, image/png) — a bare family word accepts
-#          any subtype under it on the seat's drag hit-test, a subtype
-#          spelling accepts only itself. GOEDIT's opens=text already takes
-#          text/plain and GOVIEW's opens=image already takes image/png, so
-#          no row needed a new word for the seat leg.
-#   selection=  M124e (#2584): `primary` opts the app into the seat-owned
-#          primary selection — publish on select, deliver on middle-click
-#          or shift+insert. Unlike caps= this is a REAL gate: a row without
-#          it publishes nothing and is never delivered to.
+#          archive binary document), a URL scheme (http https; M81c #1763),
+#          or an M124a (#2580) type/subtype spelling (text/plain, image/png).
+#          A bare family word takes any subtype on the drag hit-test; a
+#          subtype spelling takes only itself.
+#   selection=  M124e (#2584): `primary` opts into the seat's primary
+#          selection — publish on select, deliver on middle-click or
+#          shift+insert. A REAL gate: no word, no publish, no delivery.
 #
-# BUDGET: every reader buffers 4096 B — sexiburger.manifest_buf_max, which
-# wnd.zig's god_menu_manifest_max, tabwm.zig's overlay_manifest_max and the Go
-# seat's appsMaxBytes all carry — and a file at or over that is truncated at
-# the last whole line, silently dropping the tail rows from a seat's menu. A
-# host test in user/src/lib/sexiburger.zig pins this file under it.
+# BUDGET: every reader buffers 4096 B (sexiburger.manifest_buf_max — carried
+# by wnd.zig, tabwm.zig and the Go seat's appsMaxBytes). A file at or over
+# that is truncated at the last whole line, silently dropping tail rows.
+# sexiburger's host test pins this file under it. A not-yet-shipped row
+# refuses "Binary not staged".
 GOCALC.ELF | 64-bit Calc | c | dock=true
 NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text
 GOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary | selection=primary
@@ -58,3 +49,12 @@ GOSTORE.ELF | Store | i | dock=false | v=2 | caps=file,net
 GOINFER.ELF | LLM Infer | l | dock=false | v=2 | caps=file
 GOREC.ELF | Recorder | r | dock=false | v=2 | caps=file,audio
 GOSNAP.ELF | Snapshots | b | dock=false | v=2 | caps=file
+GOASSIST.ELF | Assistant | y | dock=false | v=2 | caps=file,window
+GOSHEET.ELF | Sheet | x | dock=false | v=2 | caps=file,window | opens=text
+GOREADER.ELF | Reader | d | dock=false | v=2 | caps=file,window | opens=document
+GOCLOCK.ELF | Clock | k | dock=false | v=2 | caps=window,timer
+GOMINE.ELF | Mines | j | dock=false | v=2 | caps=window,audio
+GOSOL.ELF | Solitaire | q | dock=false | v=2 | caps=window,audio
+GOEMOJI.ELF | Emoji | : | dock=false | v=2 | caps=window
+GOIRC.ELF | IRC | / | dock=false | v=2 | caps=file,window,net
+GOVAULT.ELF | Vault | $ | dock=false | v=2 | caps=file,window,timer

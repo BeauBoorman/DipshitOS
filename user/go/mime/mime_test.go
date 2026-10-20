@@ -36,6 +36,7 @@ func TestMagicBeatsTheExtension(t *testing.T) {
 		{"DATA.BIN", []byte("\x7fELF\x02\x01\x01"), Binary},
 		{"SEED.TXT", []byte("PK\x03\x04rest"), Archive},
 		{"SEED.TXT", []byte("\x1f\x8b\x08rest"), Archive},
+		{"SEED.TXT", []byte("%PDF-1.4\n"), Document},
 		// The two-part rules: RIFF is the container, the form type at +8 says
 		// which. A subtype without the container in front is not a signature.
 		{"SOUND.TXT", []byte("RIFF\x00\x00\x00\x00WAVEfmt "), Audio},
@@ -85,6 +86,8 @@ func TestExtensionIsTheFallback(t *testing.T) {
 		{"SONG.WAV", Audio},
 		{"BUNDLE.ZIP", Archive},
 		{"GUEST.BIN", Binary},
+		{"ICON.SVG", Image},
+		{"PAPER.PDF", Document},
 		// Case is the caller's accident, not the file's identity.
 		{"Seed.Txt", Text},
 		{"PHOTO.QOI", Image},
@@ -193,20 +196,29 @@ func TestHeadBytesCoversEveryMagicRule(t *testing.T) {
 func TestHandlersAreTheRegisteredOnes(t *testing.T) {
 	withRegistry(t, func() {
 		img := Handlers(Image)
-		if len(img) != 2 {
-			t.Fatalf("image handlers = %d (%v), want 2 (GOVIEW + the raw-byte fallback)", len(img), img)
+		if len(img) != 3 {
+			t.Fatalf("image handlers = %d (%v), want 3 (GOVIEW + the raw-byte fallback + GOPAINT)", len(img), img)
 		}
-		if img[0].Bin != "GOVIEW.ELF" || img[1].Bin != "GOEDIT.ELF" {
-			t.Errorf("image candidate order = %s, %s; want GOVIEW.ELF, GOEDIT.ELF", img[0].Bin, img[1].Bin)
+		if img[0].Bin != "GOVIEW.ELF" || img[1].Bin != "GOEDIT.ELF" || img[2].Bin != "GOPAINT.ELF" {
+			t.Errorf("image candidate order = %s, %s, %s; want GOVIEW.ELF, GOEDIT.ELF, GOPAINT.ELF",
+				img[0].Bin, img[1].Bin, img[2].Bin)
 		}
 		if h, ok := Default(Image); !ok || h.Bin != "GOVIEW.ELF" {
 			t.Errorf("Default(Image) = %+v, %v; want GOVIEW.ELF", h, ok)
+		}
+		txt := Handlers(Text)
+		if len(txt) != 2 || txt[0].Bin != "GOEDIT.ELF" || txt[1].Bin != "GOSHEET.ELF" {
+			t.Errorf("text handlers = %v; want GOEDIT.ELF then GOSHEET.ELF", txt)
 		}
 		if h, ok := Default(Text); !ok || h.Bin != "GOEDIT.ELF" {
 			t.Errorf("Default(Text) = %+v, %v; want GOEDIT.ELF", h, ok)
 		}
 		if h, ok := Default(Audio); !ok || h.Bin != "GOSOUND.ELF" {
 			t.Errorf("Default(Audio) = %+v, %v; want GOSOUND.ELF", h, ok)
+		}
+		// M132b (#2753): the reserved Document default.
+		if h, ok := Default(Document); !ok || h.Bin != "GOREADER.ELF" {
+			t.Errorf("Default(Document) = %+v, %v; want GOREADER.ELF", h, ok)
 		}
 		// The refusal half: a type nothing opens is a fact the caller needs.
 		for _, id := range []ID{Archive, Binary, Unknown} {
@@ -254,6 +266,7 @@ func TestIDNamesAreTheMarkerVocabulary(t *testing.T) {
 	want := map[ID]string{
 		Unknown: "unknown", Text: "text", Image: "image",
 		Audio: "audio", Archive: "archive", Binary: "binary",
+		Document: "document",
 	}
 	for id, s := range want {
 		if got := id.String(); got != s {

@@ -370,10 +370,9 @@ import os, sys
 share = os.environ["VG_SHARE"]
 text = open(os.path.join(share, "APPS.TXT"), encoding="utf-8").read()
 rows = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
-if len(rows) != 19:
-    sys.exit("manifest has %d rows, want 19 (M99c/M110c/M111c grew it; the "
-             "M122c ghost-app purge removed GODIFF/ZC.BIN/GOSNAP, M122b "
-             "added GOWELCOME)" % len(rows))
+if len(rows) != 29:
+    sys.exit("manifest has %d rows, want 29 (M132b #2753 appended the nine "
+             "M140-M148 reservation rows; dock stays 8)" % len(rows))
 dock = 0
 v2 = 0
 for ln in rows:
@@ -1446,3 +1445,59 @@ suffix = os.environ.get("VIRELAI_GATE_SUFFIX", "")
 shutil.copyfile(os.environ["VG_SER"], out / ("editor" + suffix + ".log"))
 print("guest read on relaunch; independent host receipt and editor comparisons match")
 PY
+
+# --- M132b (#2753) run 21: a reserved manifest row refuses its launch by name
+#
+# APPS.TXT now carries the nine M140-M148 reservation rows; their binaries
+# ship with the app cards. The launcher decodes all 29 rows (the decode
+# receipt and the open count name it), and a click on a row whose binary
+# the share lacks is a NAMED refusal, not a silent death — the same shape
+# go-wm-seat run 17 pins for a deleted binary. GOCLOCK.ELF is staged
+# between boots so the availability probe admits the row at open, then
+# `vf rm` removes it behind the 'launcher open' marker — the click execs
+# into ENOENT and prints the seat's missing-binary marker.
+vgate_assert 20 python <<'PY'
+import os, shutil
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+src = os.path.join(share, "GOCALC.ELF")
+dst = os.path.join(share, "GOCLOCK.ELF")
+shutil.copyfile(src, dst)
+print("M132b: staged GOCLOCK.ELF (%d bytes) for the reserved-row refusal leg"
+      % os.path.getsize(dst))
+PY
+
+vgate_file script-21.txt <<'EOF'
+echo rx-m132b-ready
+EOF
+
+vgate_file script2-21.txt <<'EOF'
+vf rm GOCLOCK.ELF
+EOF
+
+vgate_run 21 -- \
+    --screen '$RUN_DIR/screen-21' --via-virtio \
+    --script '$RUN_DIR/script-21.txt' \
+    --script-after 'gotabwm: mode live' \
+    --input-chords 'ctrl-space,g,o,c,l,o,c,k,return' \
+    --input-chords-after 'gotabwm: present' \
+    --script2 '$RUN_DIR/script2-21.txt' \
+    --script2-after 'gotabwm: launcher open n=' \
+    --script-expect 'gotabwm: launcher missing GOCLOCK.ELF' --timeout 300
+
+vgate_assert 21 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 21 serial-contains 'gotabwm: mode live'
+# The live decode: all 29 manifest rows — shipped and reserved — are in
+# the seat's catalog, schema v2, 8 docked (the host-side APPS.TXT check
+# on boot 01 pins the file half).
+vgate_assert 21 serial-contains 'gotabwm: apps decode n=29 v=2 schema=2'
+vgate_assert 21 serial-contains 'gotabwm: launcher open n=29'
+vgate_assert 21 serial-contains 'gotabwm: launcher filter q=goclock n=1'
+# The named refusal: the reserved row's exec was attempted and refused by
+# name — the launcher's existing missing-binary marker plus the refusal
+# toast's errno line.
+vgate_assert 21 serial-contains 'gotabwm: launcher missing GOCLOCK.ELF'
+vgate_assert 21 serial-contains 'gotabwm: refusal ENOENT exec GOCLOCK.ELF act=retry'
+vgate_assert 21 serial-absent 'exec: loaded GOCLOCK.ELF'
+vgate_assert 21 serial-absent 'gotabwm: launcher exec GOCLOCK.ELF'
+vgate_assert 21 serial-absent '[EXC] parking:'
+vgate_assert 21 serial-absent 'exited status=139'

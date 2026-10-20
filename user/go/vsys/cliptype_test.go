@@ -31,6 +31,7 @@ func TestClipboardClassify(t *testing.T) {
 		{[]byte("plain < prose"), ClipText},
 		{[]byte("/host/NOTES.TXT"), ClipText},        // a bare path is text, not a URI
 		{[]byte("see file:///a for details"), ClipText}, // URI inside prose is prose
+		{[]byte("a,b\n1,2\n"), ClipText}, // csv bytes classify as plain text (M132b: no shape detection)
 		{[]byte("\n\n"), ClipText},
 		{[]byte{0xff, 0xfe, 'n'}, ClipOctet},
 		{[]byte{0x89, 'P', 'N', 'G'}, ClipOctet}, // near-magic is not magic
@@ -46,7 +47,7 @@ func TestClipboardClassify(t *testing.T) {
 // inside ClipMimeMax.
 func TestClipSpellingOK(t *testing.T) {
 	for _, ok := range []string{
-		"text/plain", "text/uri-list", "text/html", "image/png",
+		"text/plain", "text/uri-list", "text/html", "text/csv", "image/png",
 		"application/octet-stream", "image/svg+xml",
 	} {
 		if !ClipSpellingOK(ok) {
@@ -83,6 +84,12 @@ func TestClipShapeOK(t *testing.T) {
 	}
 	if ClipShapeOK(ClipURIList, []byte("file:///a is nice")) {
 		t.Fatal("prose with a URI token accepted as uri-list")
+	}
+	if !ClipShapeOK(ClipCSV, []byte("a,b\n1,2\n")) {
+		t.Fatal("csv body refused as text/csv")
+	}
+	if ClipShapeOK(ClipCSV, png) {
+		t.Fatal("png bytes accepted as text/csv")
 	}
 	if !ClipShapeOK(ClipHTML, []byte("<html><body>x</body></html>")) {
 		t.Fatal("html shape refused")

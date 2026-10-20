@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"virelai/vi"
 )
 
 func TestParseAppsTXTSkipsCommentsAndCaps(t *testing.T) {
@@ -235,9 +237,10 @@ func TestSummarizeAppsCountsRowsAndTheHighestVersion(t *testing.T) {
 	// M122c (#2572) purged the three ghost rows (GODIFF/ZC.BIN/GOSNAP — a
 	// click could only die on a usage line or a silent serial write) and
 	// M122b (#2571) added GOWELCOME; M120d (#2561) restored GOSNAP now
-	// that a bare exec opens its window — the honest catalog is 20 rows.
-	if s.Rows != 20 {
-		t.Fatalf("rows = %d want 20 (the honest catalog)", s.Rows)
+	// that a bare exec opens its window; M132b (#2753) appended the nine
+	// M140–M148 reservation rows — the honest catalog is 29 rows.
+	if s.Rows != 29 {
+		t.Fatalf("rows = %d want 29 (the honest catalog)", s.Rows)
 	}
 	// The receipt's headline: the manifest declares v2 rows, so a reader that
 	// ignored the tail would report v=0 and fail here.
@@ -357,15 +360,18 @@ func TestManifestCapsAreTheDeclaredVocabulary(t *testing.T) {
 
 // catalogHonesty is the gateable claim about every row a person can see in
 // the launcher: a click either opens a window ("window" — the proof file
-// named here must carry a window-open call) or is a seat-reserved name the
-// launcher refuses with a named reason ("seat"). A row absent from this
-// table fails the test — the catalog may not offer a launch that dies on a
-// usage line, and there is no bound terminal wrapper in the exec ABI to
-// launder one through (a spawned process's console writes go to serial,
-// never to a window's tty).
+// named here must carry a window-open call), is a seat-reserved name the
+// launcher refuses with a named reason ("seat"), or is an M132b reserved
+// row whose binary is not shipped yet ("reserved" — the launcher's own
+// availability probe names "Binary not staged", a placeholder refusal
+// rather than a launch that dies). A row absent from this table fails the
+// test — the catalog may not offer a launch that dies on a usage line, and
+// there is no bound terminal wrapper in the exec ABI to launder one
+// through (a spawned process's console writes go to serial, never to a
+// window's tty).
 var catalogHonesty = []struct {
 	bin   string
-	kind  string // "window" | "seat"
+	kind  string // "window" | "seat" | "reserved"
 	proof string // "window" rows: repo-relative file that opens the window
 }{
 	{"GOCALC.ELF", "window", "user/go/calc/main.go"},
@@ -388,6 +394,17 @@ var catalogHonesty = []struct {
 	{"GOREC.ELF", "window", "user/go/gorec/view.go"},
 	{"GOSNAP.ELF", "window", "user/go/gosnap/view.go"},
 	{"TABWM.BIN", "seat", ""},
+	// M132b (#2753): the M140–M148 reservation rows. Each app card lands
+	// its binary and moves its entry up to "window" with a proof file.
+	{"GOASSIST.ELF", "reserved", ""},
+	{"GOSHEET.ELF", "reserved", ""},
+	{"GOREADER.ELF", "reserved", ""},
+	{"GOCLOCK.ELF", "reserved", ""},
+	{"GOMINE.ELF", "reserved", ""},
+	{"GOSOL.ELF", "reserved", ""},
+	{"GOEMOJI.ELF", "reserved", ""},
+	{"GOIRC.ELF", "reserved", ""},
+	{"GOVAULT.ELF", "reserved", ""},
 }
 
 // windowMarkers are the calls that open (or bind) a window in this tree:
@@ -402,6 +419,13 @@ var windowMarkers = []string{
 }
 
 func TestManifestHonestyRowsOpenAWindowOrAreSeatBound(t *testing.T) {
+	// The reserved rows' probe must answer "not staged": stub the file
+	// seam to ENOENT so the pin holds on a host that has no /host share
+	// rather than depending on the ambient filesystem's accidents.
+	savedOpen := openFile
+	openFile = func(string, uint32) (int64, int64) { return -1, -vi.ErrENOENT }
+	defer func() { openFile = savedOpen }()
+
 	b, err := os.ReadFile("../../../image/apps.txt")
 	if err != nil {
 		t.Fatalf("read image/apps.txt: %v", err)
@@ -430,6 +454,15 @@ func TestManifestHonestyRowsOpenAWindowOrAreSeatBound(t *testing.T) {
 			// staging probe, so the row is never a silent death.
 			if reason := appUnavailable(e); reason == "" {
 				t.Fatalf("seat row %s is launchable", e.Bin)
+			}
+		case "reserved":
+			// An M132b reserved row: its binary is not shipped, so the
+			// probe names the refusal ("Binary not staged") — the visible
+			// placeholder the reservation table promises, never a launch
+			// that dies silently.
+			if reason := appUnavailable(e); reason == "" {
+				t.Fatalf("reserved row %s is launchable — move its entry "+
+					"to \"window\" with a proof file when the app lands", e.Bin)
 			}
 		case "window":
 			src, err := os.ReadFile("../../../" + r.proof)

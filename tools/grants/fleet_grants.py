@@ -58,6 +58,10 @@ SERVICE_FLEET = [
     "GOSSHD.ELF", "GOBUILD.ELF", "FLINT.ELF", "STORE.ELF",
     "AGENTD.ELF", "INIT.ELF", "GOHELLO.ELF", "GOSSH.ELF",
     "GOSNAP.ELF", "GODIFF.ELF", "ZC.BIN",
+    # M132b (#2753): GOPAINT.ELF is store-delivered and self-registers its
+    # apps.txt row at install, so it has no manifest row — but grants are
+    # name-bound, not manifest-bound, so its reservation row lives here.
+    "GOPAINT.ELF",
 ]
 
 

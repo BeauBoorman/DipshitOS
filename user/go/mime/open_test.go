@@ -98,6 +98,22 @@ func TestOpenRefusesBadTargetsAndSchemesByName(t *testing.T) {
 	}
 }
 
+// M132b (#2753): /disk is a first-class local volume, canonicalized like
+// /host and /usbN rather than refused as a foreign path.
+func TestOpenRetainsTheDiskVolume(t *testing.T) {
+	var readPath string
+	_, err := Open("/disk/DOCS/PAPER.PDF", "/", func(path string, _ int) ([]byte, error) {
+		readPath = path
+		return []byte("%PDF-1.4\n"), nil
+	})
+	if err != nil {
+		t.Fatalf("Open(/disk/...) returned error: %v", err)
+	}
+	if readPath != "/disk/DOCS/PAPER.PDF" {
+		t.Fatalf("read path = %q, want the /disk volume retained", readPath)
+	}
+}
+
 func TestOpenDistinguishesUnreadableFiles(t *testing.T) {
 	_, err := Open("/host/README.TXT", "/", func(string, int) ([]byte, error) {
 		return nil, errors.New("EACCES")
