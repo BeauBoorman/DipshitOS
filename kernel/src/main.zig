@@ -1905,6 +1905,21 @@ fn cv_input_dispatch(rep: []const u8) void {
 /// the `input` ptr-* counters — with no USB device attached at all.
 fn cv_pointer_dispatch(rep: []const u8) void {
     input.decode_pointer_report(rep);
+    // M124f follow-up (boot-08 drag flake): fan the JUST-DECODED report to
+    // a registered WM per report, not per idle pass. poll_input drains the
+    // whole used ring in one pass, so the pointer_tick state sample could
+    // only ever see the last write of a batch — a press batched with its
+    // first held-move fanned the move's coordinates as the down edge and
+    // the gesture died unarmed. wm_fan_pointer dedups (mapped-pixel state
+    // unchanged = no fan), so a repeat report costs nothing and the tick's
+    // own sampling fan below it stays a harmless no-op. Keyboard parity:
+    // decode_keyboard_report has fanned per report (wm_key_hook) all along.
+    // The decoded state — not the raw rep — is what fans, so the report can
+    // never drift from what decode consumed.
+    if (driving_award.wm_owns_input) {
+        const st = input.pointer_state();
+        if (st.valid) driving_award.wm_fan_pointer(st.x, st.y, st.buttons);
+    }
 }
 
 /// Drive the spike device: init (probe + negotiate + DRIVER_OK + both

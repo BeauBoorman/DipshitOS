@@ -342,6 +342,43 @@ pub var migrated_skips: u64 = 0;
 /// no WM — the hook style of `events.on_event_pushed`). Callback gets the
 /// mapped fb pixels + the raw HID button byte; the WM edge-detects.
 pub var wm_pointer_hook: ?*const fn (x: u32, y: u32, buttons: u8) void = null;
+/// The last pointer state already fanned to the WM, in the hook's pixel
+/// space. Shared by BOTH fan entry points — the per-report decode fan
+/// (main.zig's cv_pointer_dispatch) and pointer_tick's state-sampling fan
+/// — so a report one delivered is never repeated by the other.
+var wm_fan_valid: bool = false;
+var wm_fan_x: u32 = 0;
+var wm_fan_y: u32 = 0;
+var wm_fan_buttons: u8 = 0;
+
+/// Fan ONE absolute-pointer state to the registered WM's kind-19 stream,
+/// deduped against the last fanned state (mapped-pixel space — the hook's
+/// coordinate contract — so identical reports and same-pixel logicals both
+/// collapse, exactly like the tick sampler's moved/btn_changed check).
+///
+/// Two callers, one record: cv_pointer_dispatch calls this PER DECODED
+/// REPORT — the used-ring pump can complete several reports in one idle
+/// pass, and the tick's state sampling collapsed them to the last write
+/// (observed on go-dogfood boot 08: a press batched with its first
+/// held-move presented the MOVE's coordinates as the down edge — the app
+/// saw a press off its list rows, the drag never armed, and the arm
+/// markers never printed) — while pointer_tick calls it with the sampled
+/// state, covering the USB path's one-report-per-pass decode and any
+/// caller that bypassed the per-report fan. The keyboard seam has always
+/// fanned per report (decode_keyboard_report -> wm_key_hook); this makes
+/// the pointer seam symmetric.
+pub fn wm_fan_pointer(x: u16, y: u16, buttons: u8) void {
+    if (!wm_owns_input) return;
+    const nx = map_pointer_axis(x, virtio_gpu.fb_width);
+    const ny = map_pointer_axis(y, virtio_gpu.fb_height);
+    if (wm_fan_valid and nx == wm_fan_x and ny == wm_fan_y and
+        buttons == wm_fan_buttons) return;
+    wm_fan_valid = true;
+    wm_fan_x = nx;
+    wm_fan_y = ny;
+    wm_fan_buttons = buttons;
+    if (wm_pointer_hook) |hook| hook(nx, ny, buttons);
+}
 /// The window-registry mirror fan-out (set by wm_server at REGISTER time;
 /// null when no WM). Callback gets the id + full rect + state; wm_server
 /// packs kind 20 WM_WINDOW. Called from the user-window mutation points.
@@ -1235,6 +1272,7 @@ pub fn arm() void {
     cursor_old_damage = null;
     cursor_new_damage = null;
     prev_ptr_buttons = 0;
+    wm_fan_valid = false;
     resize_id = null;
     // M52 card 3 (#1240): a fresh registry holds no drag — the Arc4 #237
     // capture is process-scoped BSS and must not survive a re-arm (a stuck
@@ -3663,10 +3701,11 @@ pub fn pointer_tick(st: input.PointerState, click: ?input.Click) ?u8 {
         if (wm_owns_input) {
             // Deliver the sample when the pointer state CHANGED — motion OR
             // a button edge (a release with no motion must still be seen).
-            const btn_changed = st.buttons != prev_ptr_buttons;
-            if (moved or btn_changed) {
-                if (wm_pointer_hook) |hook| hook(nx, ny, st.buttons);
-            }
+            // wm_fan_pointer owns the dedup (shared with the per-report
+            // decode fan): the tick is now only the residual fan for
+            // reports that never saw decode (the USB path still samples
+            // here; a cv report decode already fanned is a no-op repeat).
+            wm_fan_pointer(st.x, st.y, st.buttons);
             prev_ptr_buttons = st.buttons;
             return null; // no kernel geometry decision while the WM owns input
         }

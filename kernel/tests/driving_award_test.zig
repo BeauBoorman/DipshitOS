@@ -1430,6 +1430,56 @@ test "driving_award: WMS5 input ownership gates kernel geometry consumption (iss
     _ = user_close(3);
 }
 
+test "driving_award: wm_fan_pointer fans every distinct report — a pump-pass batch cannot collapse the button edges" {
+    arm();
+    // The boot-08 drag flake's regression shape: poll_input drains the
+    // whole used ring in one idle pass, so a press and its first
+    // held-move decoded back-to-back. The OLD path sampled pointer_state
+    // once at pointer_tick — the batch collapsed to its last write and
+    // the down edge presented the MOVE's coordinates (or vanished), so
+    // the app never saw a press on the dragged row and no drag armed.
+    // cv_pointer_dispatch now calls wm_fan_pointer per decoded report:
+    // each distinct state reaches the WM, in order.
+    driving_award.wm_owns_input = true;
+    driving_award.wm_pointer_hook = wms5_ptr_capture;
+    wms5_ptr_calls = 0;
+
+    // move -> down at the same point: the press is an edge, both fan.
+    driving_award.wm_fan_pointer(1024, 2822, 0x00);
+    try std.testing.expectEqual(@as(usize, 1), wms5_ptr_calls);
+    driving_award.wm_fan_pointer(1024, 2822, 0x01);
+    try std.testing.expectEqual(@as(usize, 2), wms5_ptr_calls);
+    try std.testing.expectEqual(@as(u8, 0x01), wms5_ptr_btn);
+    try std.testing.expectEqual(map_pointer_axis(1024, virtio_gpu.fb_width), wms5_ptr_x);
+
+    // An identical repeat collapses (the dedup the tick used to provide).
+    driving_award.wm_fan_pointer(1024, 2822, 0x01);
+    try std.testing.expectEqual(@as(usize, 2), wms5_ptr_calls);
+
+    // The held move and the in-place release both fan — a batched
+    // down/move/up sequence can no longer collapse to its last write.
+    driving_award.wm_fan_pointer(5120, 9102, 0x01);
+    try std.testing.expectEqual(@as(usize, 3), wms5_ptr_calls);
+    try std.testing.expectEqual(map_pointer_axis(5120, virtio_gpu.fb_width), wms5_ptr_x);
+    driving_award.wm_fan_pointer(5120, 9102, 0x00);
+    try std.testing.expectEqual(@as(usize, 4), wms5_ptr_calls);
+    try std.testing.expectEqual(@as(u8, 0x00), wms5_ptr_btn);
+
+    // pointer_tick re-sampling an already-fanned state is a no-op (the
+    // shared dedup record), and a state that bypassed decode still fans.
+    _ = pointer_tick(.{ .x = 5120, .y = 9102, .buttons = 0x00, .valid = true }, null);
+    try std.testing.expectEqual(@as(usize, 4), wms5_ptr_calls);
+    _ = pointer_tick(.{ .x = 16384, .y = 18204, .buttons = 0x00, .valid = true }, null);
+    try std.testing.expectEqual(@as(usize, 5), wms5_ptr_calls);
+
+    // Shim mode never fans.
+    driving_award.wm_owns_input = false;
+    driving_award.wm_fan_pointer(100, 100, 0x01);
+    try std.testing.expectEqual(@as(usize, 5), wms5_ptr_calls);
+
+    driving_award.wm_pointer_hook = null;
+}
+
 test "driving_award: user_open bounds and the eight slots fill the registry" {
     arm();
     // Invalid geometry: zero size, past the scanout cap, off-scanout.

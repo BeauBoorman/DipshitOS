@@ -177,10 +177,35 @@ pub fn reset(pid: usize) void {
 /// Push an event into process `pid`'s event FIFO.
 /// If `event.seq` is 0, stamps with the process's monotonic `next_seq`.
 /// If full, applies drop-oldest discipline and increments dropped counter.
+///
+/// COMPOSITE_TICK coalesces under backlog: while the queue is at least
+/// half full AND already holds an unconsumed tick, another heartbeat adds
+/// no information — merge its damage mask (arg1) into the pending tick and
+/// refresh its present sequence (arg0) instead of enqueuing. Below the
+/// floor every tick queues normally (the pinned wm_server behavior — the
+/// seat expects one pending event per push when it is keeping up). Without
+/// this a stalled consumer accrues a tick per second until the queue is
+/// all heartbeats and drop-oldest evicts the real input behind them —
+/// observed on go-dogfood boot 08: the seat's stall let ticks evict the
+/// pointer burst's head (the press that armed the drag never arrived).
+const tick_merge_floor: usize = max_events / 2;
+
 pub fn push(pid: usize, ev_in: Event) void {
     if (!in_range(pid) or ev_in.kind == 0) return;
 
     var ev = ev_in;
+    if (ev.kind == COMPOSITE_TICK and count[pid] >= tick_merge_floor) {
+        var i: usize = 0;
+        while (i < count[pid]) : (i += 1) {
+            const s = (head[pid] + i) % max_events;
+            if (storage[pid][s].kind == COMPOSITE_TICK) {
+                storage[pid][s].arg0 = ev.arg0;
+                storage[pid][s].arg1 |= ev.arg1;
+                pushed_counts[pid] +%= 1;
+                return;
+            }
+        }
+    }
     if (ev.seq == 0) {
         ev.seq = next_seq[pid];
         next_seq[pid] +%= 1;
