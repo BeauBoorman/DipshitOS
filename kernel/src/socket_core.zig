@@ -11,8 +11,11 @@
 //! transport callback once; true means accepted by that transport, not delivered.
 //! Borrowed bytes are valid only during the callback. Failed TX preserves the slot.
 //! Clean FIN drains queued input before EOF; reset/timeout discard input.
-//! Terminal children (including failed half-opens, obtainable through accept)
-//! stay charged until close/death. close is immediate local reclamation, not a
+//! Terminal children (including timed-out half-opens, obtainable through
+//! accept) stay charged until close/death; a peer RST that arrives before
+//! accept tears a never-accepted listener child down outright — the slot
+//! frees immediately rather than charging a zombie against child_limit
+//! (M135c #2765). close is immediate local reclamation, not a
 //! promise that FIN/RST reached a peer; shutdown initiates bounded graceful FIN.
 //! The single independently addressed refusal slot drops/counts overflow.
 //! TCP options are parsed and skipped — MSS is honored, malformed option
@@ -212,6 +215,12 @@ pub const Counters = struct {
     dropped_options: u64 = 0,
     /// M99h (#2186): segments the reassembly window has held, ever.
     ooo_held: u64 = 0,
+    /// M135c (#2765): the named listen saturation — a SYN refused
+    /// because its listener was already charging `child_limit`
+    /// children. A subset of `capacity_refused` (the refusal wire shape
+    /// is the same RST+ACK); the table-full and terminal-child refusals
+    /// stay out of it.
+    listen_saturated: u64 = 0,
 };
 
 pub const Core = struct {
@@ -504,6 +513,23 @@ pub const Core = struct {
         };
         for (&self.children) |*entry| if (entry.*) |*c| {
             if (same(c.local, p.local) and same(c.remote, p.remote)) {
+                // M135c (#2765): an in-sequence RST tears a never-accepted
+                // listener child down on the spot — no handle ever
+                // escaped the table, so charging a terminal slot would
+                // just leak the child bound. A legacy listener's
+                // ALREADY-ESTABLISHED child keeps the terminal verdict
+                // (the slot-30 shim's drain arm reads it); a half-open
+                // one was never observable through the shim either.
+                // Active-open connections and accepted children keep the
+                // terminal outcome — an owner holds (or can claim) their
+                // handle and reads .reset.
+                if (!c.accepted and c.parent != no_parent and c.state != .terminal and
+                    (p.flags & wire.flag_rst) != 0 and p.seq == c.rcv_nxt and
+                    (c.state == .half_open or !self.listenerAt(c.parent).?.legacy))
+                {
+                    entry.* = null;
+                    return;
+                }
                 self.received(c, p);
                 return;
             }
@@ -518,11 +544,16 @@ pub const Core = struct {
             return;
         }
         // Per-listener child bound — B6's two-client cap, per listener now.
+        // M135c (#2765): saturation is the named refusal — counted here
+        // and still answered with the refusal slot's RST+ACK (the card's
+        // pick: answer, never silently drop — a dropped SYN looks like a
+        // dead host to the peer's retransmission timer).
         var siblings: usize = 0;
         for (self.children) |entry| if (entry) |c| {
             if (c.parent == parent) siblings += 1;
         };
         if (siblings >= child_limit) {
+            self.counters.listen_saturated +%= 1;
             self.refuse(p);
             return;
         }

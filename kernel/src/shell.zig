@@ -3986,7 +3986,11 @@ fn park_body(mon: *monitor.Monitor) callconv(.c) void {
             }
             if (diag_diff) |d| {
                 var cbuf: [384]u8 = undefined;
-                const cline = std.fmt.bufPrint(&cbuf, "net: sock-diag malformed={d} foreign={d} dup={d} rxfull={d} capref={d} refdrop={d} txref={d} retx={d} timedout={d} badopt={d} ooo={d} txpollt={d} rm1={d}\n", .{ d.c.malformed, d.c.foreign, d.c.duplicates, d.c.rx_full, d.c.capacity_refused, d.c.refusal_dropped, d.c.tx_refused, d.c.retransmitted, d.c.timed_out, d.c.dropped_options, d.c.ooo_held, d.tpt, d.rm1 }) catch "";
+                // M135c (#2765): the appended lbound/lsat fields name the
+                // per-listener child bound and count saturation refusals
+                // (the append-only convention keeps existing substring
+                // assertions green).
+                const cline = std.fmt.bufPrint(&cbuf, "net: sock-diag malformed={d} foreign={d} dup={d} rxfull={d} capref={d} refdrop={d} txref={d} retx={d} timedout={d} badopt={d} ooo={d} txpollt={d} rm1={d} lbound={d} lsat={d}\n", .{ d.c.malformed, d.c.foreign, d.c.duplicates, d.c.rx_full, d.c.capacity_refused, d.c.refusal_dropped, d.c.tx_refused, d.c.retransmitted, d.c.timed_out, d.c.dropped_options, d.c.ooo_held, d.tpt, d.rm1, virtio_net.native_socket.core.child_limit, d.c.listen_saturated }) catch "";
                 mon.console.puts(cline);
                 if (d.probe) |p| {
                     var pbuf: [256]u8 = undefined;
