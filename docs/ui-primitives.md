@@ -138,7 +138,7 @@ typo never invents a third palette.
   full-viewport tabs: **no per-window title bar exists at all** — the
   seat's rail is the tab identity, not a title bar. The kernel's 16px
   `wnd_core.title_bar_h` band is a different artifact: the `wnd` path's
-  own chrome, pinned by `live-wnd4-chrome`/`live-chrome`, and it stays
+  own chrome, pinned by `live-chrome`, and it stays
   the kernel's business — while a registered seat owns the user layer the
   kernel skips its blit entirely (`driving_award.zig:4839-4893`,
   `wm_owns_user_layer`). This arc needs no kernel work; restyling the
@@ -527,7 +527,7 @@ with **client fill unchanged** as the explicit constraint.
 
 | # | App | Opens via | Paints today | Class / M104f step | Controls consumed | Pinning specs |
 |---|-----|-----------|--------------|--------------------|-------------------|---------------|
-| 0 | `appkit/demo` (GODIALOG) | `vi.WinOpen` | `draw.WindowCanvas` — AA today | **reference** — already on the engine; M104d's control showcase | all four (showcase) | `live-wnd4-chrome`, appkit composite goldens |
+| 0 | `appkit/demo` (GODIALOG) | `vi.WinOpen` | `draw.WindowCanvas` — AA today | **reference** — already on the engine; M104d's control showcase | all four (showcase) | `live-chrome`, appkit composite goldens |
 | 1 | `calc` | `tabapp.Init` | `draw.FillerCanvas` + widgets | swap binding → `WindowCanvas` | — | `go-calc` |
 | 2 | `top` | `tabapp.Init` | `draw.FillerCanvas` + widgets | swap binding | scrollbar (proc list) | `go-top`, `live-tabstrip`, `live-wm4-paint`, `live-tokens` |
 | 3 | `fetch` | `tabapp.Init` | `draw.FillerCanvas` + widgets | swap binding | — | `go-fetch-https`, `live-fetch` |

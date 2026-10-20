@@ -282,10 +282,10 @@ under `C` with no workflow noticing). The rules that came out of it:
   `--check` does not require it to match, because that made every spec PR
   conflict on the same generated table.
   (Reachability, observed 2026-09-29: 101 of the 249
-  `tools/gate/specs/*.spec` files contain non-ASCII; **9** of their
+  `tools/gate/specs/*.spec` files contain non-ASCII; **8** of their
   first-line headers do — `go-wm-hid`, `go-wm-tabs`, `live-desktop`,
   `live-desktop-typing`, `live-devcons`, `live-m21-persist-title-orphan`,
-  `live-user-fs`, `live-wm1`, `live-wnd5-gate2-policy`. The drift that
+  `live-user-fs`, `live-wm1`. The drift that
   motivated the rule was narrower: of the headers present then, only
   `live-m21-persist-title-orphan` (em dash) crossed its truncation
   boundary, which is why exactly one row differed.)
