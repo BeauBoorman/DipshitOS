@@ -9,7 +9,11 @@
 # Run 03 then reads the clean build's empty ERRORS.TXT off the persisted
 # share: `errors none` — the card's clear-on-success. Run 04: a save after
 # the build makes the list `errors stale` — the saved-since refusal through
-# slot-79 mtimes.
+# slot-79 mtimes. Run 05 (M138b #2776): a seeded one-row ERRORS.TXT in its
+# own EDFMT workspace — ctrl-n jumps to the exact column (status err=1/1),
+# and ctrl-s runs format-on-save, which on the shipped build prints the
+# named refusal and publishes verbatim (the python assert checks the bytes
+# against whichever path the binary took).
 #
 # Its own spec, not a go-edit leg, for the same reason live-gobuild stands
 # alone: the toolchain staging (fork `go list -export -deps` + archives) is
@@ -22,7 +26,8 @@
 #   bash tools/go/build-gotool.sh  -> .build/go/GOCMD*.ELF
 # exec-order: assert-proven -- run 01 ends on `goedit: errors end`, printed
 # only after the last chord; run 02 on `build OK`; 03 on `errors none`; 04
-# on `errors stale`. A program that never ran cannot pass. SPEC.md.
+# on `errors stale`; 05's close script is stage-gated on `goedit: saved `.
+# A program that never ran cannot pass. SPEC.md.
 
 vgate_name live-goedit-diags "issue #2320 M107c: GOEDIT navigates ERRORS.TXT file:line:col diagnostics on VZ"
 # seed-virtiofs, not seed: the stale check stats through the slot-79
@@ -139,12 +144,31 @@ with open(os.path.join(share, "GOIMPORT.CFG"), "w") as f:
 print("staged %d std archives (%.2f MiB) + GOIMPORT.CFG" % (len(cfg) - 1, total / 1048576.0))
 
 # Stale products must not let a broken run go green.
-for stale in ("EDBAD/.BUILD", "EDSTALE/.BUILD", "EDBAD/EDBAD.ELF"):
+for stale in ("EDBAD/.BUILD", "EDSTALE/.BUILD", "EDBAD/EDBAD.ELF",
+              "EDFMT/.BUILD"):
     p = os.path.join(share, stale)
     if os.path.isdir(p):
         shutil.rmtree(p)
     elif os.path.exists(p):
         os.remove(p)
+PY
+
+# --- the M138b (#2776) jump+save workspace ----------------------------------
+# Run 05's own package: an unformatted main.go plus a hand-written
+# .BUILD/ERRORS.TXT — no build needed, the seeded list carries one
+# positioned diag (line 2, col 13 = the ')' in the unformatted signature).
+# ERRORS.TXT is written AFTER main.go so the mtime order reads as a fresh
+# build, never `stale`.
+vgate_setup_python <<'PY'
+import os
+share = os.path.join(os.environ["RUN_DIR"], "share")
+d = os.path.join(share, "EDFMT", ".BUILD")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(share, "EDFMT", "main.go"), "w") as f:
+    f.write("package main\nfunc  main( ) { println(1) }\n")
+with open(os.path.join(d, "ERRORS.TXT"), "w") as f:
+    f.write("/host/EDFMT/main.go:2:13: gofmt would rewrite this file\n")
+print("staged EDFMT workspace")
 PY
 
 # --- run 01: broken build -> populate -> jump -> step -> cross-file ---------
@@ -317,3 +341,70 @@ vgate_assert 04 serial-contains 'goedit: saved /host/EDSTALE/main.go'
 vgate_assert 04 serial-contains 'goedit: errors stale'
 vgate_assert 04 serial-absent '[EXC] parking:'
 vgate_assert 04 serial-absent 'exited status=139'
+
+# --- M138b (#2776) run 05: exact-column jump + format-or-refusal save ------
+# The seeded EDFMT list carries one positioned diag; ctrl-n (the editor's
+# own next-diagnostic chord — GOEDIT's keymap, not the registry's) loads
+# and jumps straight to line 2 col 13 — the ')' in the unformatted
+# signature — and the status line carries the new `err=1/1` count with the
+# landing column. Ctrl-S then runs format-on-save: the probe-measured
+# build has no go/format (the image would exceed exec_program_max), so
+# the save prints the card's named refusal and publishes the buffer
+# verbatim — the python assert checks the bytes against whichever path
+# the binary actually took, so the leg stays honest if a future cap bump
+# ships the `editfmt` build.
+vgate_file script2-05.txt <<'EOF'
+exec GOEDIT.ELF /host/EDFMT/main.go
+EOF
+
+vgate_file script3-05.txt <<'EOF'
+dui close 2
+echo rx-edfmt-ok
+EOF
+
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-05.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-n,ctrl-s' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-05.txt' \
+    --script3-after 'goedit: saved ' \
+    --script-expect 'rx-edfmt-ok' --timeout 300
+
+vgate_assert 05 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 05 serial-contains 'goedit: read /host/EDFMT/main.go n=42'
+vgate_assert 05 serial-contains 'goedit: errors n=1'
+# The jump lands on the diagnostic's exact column: ')' at 2:13.
+vgate_assert 05 serial-contains 'goedit: errors jump line=2 col=13'
+# The buffer counts the trailing newline's empty tail as a third line, so
+# the landing status reads 2/3, not 2/2.
+vgate_assert 05 serial-contains 'goedit: status line=2/3 col=13 err=1/1'
+# The shipped probe verdict: go/format is not guest-safe on image size, so
+# Ctrl-S names the refusal and still publishes.
+vgate_assert 05 serial-contains 'edit: format unavailable (go/format not guest-safe)'
+vgate_assert 05 serial-contains 'goedit: saved /host/EDFMT/main.go n=42'
+vgate_assert 05 serial-contains 'rx-edfmt-ok'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'exited status=139'
+
+# The bytes on the share decide which path the save took and require the
+# matching one: the refusal leaves the seed verbatim, a real go/format
+# leaves the gofmt output — anything else fails.
+vgate_assert 05 python <<'PY'
+import os
+ser = open(os.environ["VG_SER"], errors="replace").read()
+share = os.environ["VG_SHARE"]
+got = open(os.path.join(share, "EDFMT", "main.go"), "rb").read()
+seed = b"package main\nfunc  main( ) { println(1) }\n"
+fmt = b"package main\n\nfunc main() { println(1) }\n"
+if "edit: format unavailable" in ser:
+    assert got == seed, "refusal path must publish verbatim: %r" % got
+    print("format unavailable: verbatim save verified (%d bytes)" % len(got))
+else:
+    assert "goedit: format n=" in ser, "no refusal and no format receipt — which path ran?"
+    assert got == fmt, "format path must publish gofmt output: %r" % got
+    print("format-on-save verified: %d bytes" % len(got))
+PY

@@ -96,6 +96,29 @@
 // (the file was saved after the list's build — mtime compared through the
 // slot-79 stat op), `no-position`, `end`, `miss lines=` and `rc=`.
 //
+// M138b (#2776) lands the code-session surface the daily loop misses:
+//
+//   - bracket matching for ()[]{}. A caret on a bracket highlights its
+//     match (the teal under-text cell) and Ctrl-B jumps to it; a .go
+//     buffer's scan skips string, rune-literal and comment spans, so a
+//     bracket inside `"{("` is not a bracket at all. `match jump off=` is
+//     the landing receipt, `match none` the refusal. The chord is
+//     GOEDIT's own keymap entry — the registry table keeps only the
+//     documented rows, so the '?' overlay's count is unchanged.
+//   - diagnostics polish. A jump lands on the row's exact column (the
+//     compiler's 1-based byte column, clamped into the line), the
+//     next/prev chords stay Ctrl-N/Ctrl-P from this file's keymap, and
+//     the status line carries `err=I/N` while a list is loaded.
+//   - format-on-save, with the card's probe verdict landed. go/format
+//     links under GOOS=virelai but the image comes out over
+//     exec_program_max (format.go's header has the numbers), so the
+//     shipped build prints the card's named refusal on a .go save —
+//     `edit: format unavailable (go/format not guest-safe)` — and
+//     `-tags editfmt` is the opt-in seam for a future cap bump. The
+//     contract is pinned either way: an applied format is one undoable
+//     op, a parse error leaves the buffer alone, prints `format error
+//     <diag>` and raises the error strip, and the publish still writes.
+//
 // What this is NOT: EDIT.BIN's feature list. No syntax highlighting, no
 // multi-file buffers or tabs, no LSP, no auto-indent — follow-on cards own
 // all of those.
@@ -199,6 +222,15 @@ const (
 	markerSelPaste = "goedit: sel-paste "
 	markerRepl     = "goedit: replace '"
 	markerReplAll  = "goedit: replace-all '"
+
+	// M138b (#2776): bracket matching and format-on-save. `match jump
+	// off=` is a landing, `match none` the caret-not-on-a-bracket (or
+	// unmatched) refusal. `format n=` is the applied (or already-clean)
+	// receipt carrying the formatted length; `format error <diag>` is a
+	// refused parse — the buffer is left alone and the error strip shows
+	// the diagnostic. The probe-failed refusal lives in format.go.
+	markerMatch  = "goedit: match "
+	markerFormat = "goedit: format "
 
 	// M123d (#2578): the shared in-app error banner. `banner` is the raise
 	// — the failure text the strip shows — printed only after the frame
@@ -307,6 +339,9 @@ const (
 	colCaret = uint32(0xffd75f)
 	colDim   = uint32(0x8b98a8)
 	colSel   = uint32(0x2c4459)
+	// M138b: the matching bracket's under-text tint — a teal that stays
+	// clear of the caret's amber and the selection's blue.
+	colMatch = uint32(0x3fbf9f)
 )
 
 // inputMode is which surface owns the keyboard: the document, the find bar,
@@ -916,6 +951,12 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if chord(ev, 'v', false) {
 		e.paste()
 		return true
+	}
+	// M138b (#2776): Ctrl-B jumps to the match of the bracket under the
+	// caret — unshifted, free in both tab seats (checked against tabwm and
+	// gotabwm like Ctrl-R above).
+	if chord(ev, 'b', false) {
+		return e.jumpMatch()
 	}
 	// M124b: Ctrl-O opens through the shared picker; Ctrl-Shift-S is the
 	// save-as. The save-as check must precede isSave, whose isChord does
@@ -1615,13 +1656,24 @@ func (e *editor) selPaste(b []byte) {
 // --- status line ----------------------------------------------------------
 
 // statusText is the chrome row's right-aligned status AND the serial
-// marker's body: `line=L/T col=C [sel=N] [*]` — one rule, two readers.
+// marker's body: `line=L/T col=C [sel=N] [err=I/N] [*]` — one rule, two
+// readers.
 func (e *editor) statusText() string {
 	line, col := caretLineCol(e.buf, e.cur)
 	s := "line=" + vi.Itoa64(int64(line)) + "/" + vi.Itoa64(int64(countLines(e.buf))) +
 		" col=" + vi.Itoa64(int64(col))
 	if lo, hi, ok := e.selRange(); ok {
 		s += " sel=" + vi.Itoa64(int64(hi-lo))
+	}
+	// M138b: the diagnostics count rides the status line while a list is
+	// loaded — `err=N` before a landing, `err=I/N` once jumpDiag selected
+	// a row (diagsSel is also the last-jumped index).
+	if len(e.diags) > 0 {
+		s += " err="
+		if e.diagsSel >= 0 {
+			s += vi.Itoa64(int64(e.diagsSel+1)) + "/"
+		}
+		s += vi.Itoa64(int64(len(e.diags)))
 	}
 	if e.dirty {
 		s += " *"
@@ -1796,6 +1848,11 @@ func (e *editor) markDirty() {
 // only place this app writes) and the false return is what the callers use to
 // decide whether they may report a clean exit.
 func (e *editor) save() bool {
+	// M138b: format-on-save — a .go buffer is formatted before the publish
+	// (a format error leaves it alone and shows the diagnostic); a build
+	// without go/format prints the named refusal. Either way the write
+	// below still decides the save.
+	e.formatGo()
 	if rc := e.ensureLease(); rc < 0 {
 		vi.ConsoleLine(markerSaveErr + e.path + " " + vi.Itoa64(rc))
 		e.raiseBanner("save " + e.path + " refused rc=" + vi.Itoa64(rc))
@@ -1966,6 +2023,9 @@ func (e *editor) draw() {
 	inDoc := pre != "" && e.mode == modeEdit
 
 	slo, shi, selOn := e.selRange()
+	// M138b: the caret bracket's match cell — one scan per paint, and only
+	// while the caret sits on a bracket (matchCell refuses otherwise).
+	mOff, mOK := e.matchCell()
 	y := chromeH + 4
 	line, start := 0, 0
 	caretRow, caretCol := -1, 0
@@ -2001,6 +2061,12 @@ func (e *editor) draw() {
 			if c0 >= 0 {
 				e.fill(textOrigin+c0*adv, y, (c1-c0)*adv, 8, colSel)
 			}
+		}
+		// The match paints under this row's text too, the selection's own
+		// trick: the bracket's cell, teal, so the pair reads at a glance.
+		if mOK && mOff >= start && mOff < i {
+			mc := utf8.RuneCount(e.buf[start:mOff])
+			e.fill(textOrigin+mc*adv, y, adv, 8, colMatch)
 		}
 		onCaret := e.cur >= start && e.cur <= i
 		if inDoc && onCaret {

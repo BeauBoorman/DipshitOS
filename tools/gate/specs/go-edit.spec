@@ -40,6 +40,9 @@
 #   08 replace -- Ctrl-R's two-field bar: Return replaces the match find
 #      lands on (hit=N/M), a find after it reports the remaining total, and
 #      Ctrl-A replaces all in one op whose n= equals that total.
+#   M138b (#2776) adds run 13: bracket matching — caret on `{`, the `}`
+#      match under-painted teal (pixel probe on the captured frame), and
+#      Ctrl-B jumping caret->match->caret->`match none` on a non-bracket.
 #
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goedit.sh   ->  .build/go/GOEDIT.ELF
@@ -89,9 +92,11 @@ with open(lease_seed, "wb") as f:
     f.write(b"lease-seed\n")
 # #2199: the second-pass runs' own targets — an undo/redo drill, a clipboard
 # drill, and a three-match replace document, each seeded so the saved-bytes
-# assert is an exact host-side compare.
+# assert is an exact host-side compare. M138b adds the bracket-match
+# drill's one-liner: `{` at offset 0, its `}` at offset 7.
 for name, body in [("UNDO.TXT", b"ab\n"), ("CLIP.TXT", b"clipthis"),
-                   ("REPL.TXT", b"one two one\ntwo one\n")]:
+                   ("REPL.TXT", b"one two one\ntwo one\n"),
+                   ("BKT.TXT", b"{abcdef}")]:
     with open(os.path.join(ed, name), "wb") as f:
         f.write(body)
 print("staged GOEDIT.ELF into share (%d bytes) and %s (%d bytes)" %
@@ -510,6 +515,13 @@ dui close 2
 echo rx-goedit-refuse-ok
 EOF
 
+# The expect is the app's own `goedit: close`, not the script's echo: the
+# WM's close dispatch to a running app is asynchronous (observed ~1 s of
+# serial between `dui close: closed=2` and the marker on healthy legs), so
+# an expect on rx-goedit-refuse-ok tears the VM down ~1.5 s after the echo
+# and the close marker can lose that race — the leg then fails on an
+# assert the code satisfied. Waiting on the marker itself bounds the wait
+# by the run timeout instead of by delivery latency.
 vgate_run 07 -- \
     --screen '$RUN_DIR/screen-07' \
     --via-virtio \
@@ -520,7 +532,7 @@ vgate_run 07 -- \
     --input-chords-after 'goedit: present' \
     --script3 '$RUN_DIR/script3-07.txt' \
     --script3-after 'goedit: paste rc=' \
-    --script-expect 'rx-goedit-refuse-ok' --timeout 240
+    --script-expect 'goedit: close' --timeout 240
 
 vgate_assert 07 serial-contains 'clip: stored 8 bytes'
 vgate_assert 07 serial-contains 'goedit: cut rc=-7'
@@ -660,24 +672,33 @@ if os.path.exists(fresh):
     sys.exit("EDIT/FRESH.TXT must not exist - the leg renders the empty buffer")
 PY
 
-vgate_file script2-10.txt <<'EOS'
+# The leg boots with NO seat: under the registered tabwm seat the kernel
+# skips blitting migrated (surface-backed) windows and only a
+# surface-composing seat (gotabwm) carries them to the scanout — the app's
+# document area would composite black and the pixel assert could never
+# pass. Under the bare shim the kernel composites every window itself, so
+# the streamed scanout really carries the painted plate.
+vgate_file script-10.txt <<'EOS'
 exec GOEDIT.ELF /host/EDIT/FRESH.TXT
 EOS
 
+# The echo IS the snapshot trigger and the run's expect — no close verb:
+# the window must still be up (and its plate composited) when the kind-4
+# stream reads gpu_fb. script3's 5 s settle gives the shim's composite the
+# frame before the marker fires.
 vgate_file script3-10.txt <<'EOS'
-dui close 2
 echo rx-goedit-empty-ok
 EOS
 
 vgate_run 10 -- \
     --screen '$RUN_DIR/screen-10' \
     --via-virtio \
-    --script '$RUN_DIR/script.txt' \
-    --script2 '$RUN_DIR/script2-10.txt' \
-    --script2-after 'tabwm: sidebar-rendered' \
-    --screenshot-after 'goedit: empty /host/EDIT/FRESH.TXT' \
+    --snapshot-out '$RUN_DIR/snap-10' \
+    --script '$RUN_DIR/script-10.txt' \
+    --snapshot-after 'rx-goedit-empty-ok' \
     --script3 '$RUN_DIR/script3-10.txt' \
     --script3-after 'goedit: empty /host/EDIT/FRESH.TXT' \
+    --script3-delay 5 \
     --script-expect 'rx-goedit-empty-ok' --timeout 240
 
 vgate_assert 10 serial-contains 'exec: loaded GOEDIT.ELF'
@@ -691,68 +712,41 @@ vgate_assert 10 serial-absent 'goedit: banner '
 vgate_assert 10 serial-absent '[EXC] parking:'
 vgate_assert 10 serial-absent 'exited status=139'
 
-# The scanout, 2x capture: the GOEDIT window's client area sits inside
-# x=64..1088, y=96..832; the empty-state plate is the dark Surface fill
-# (34,45,53) over the page background (24,32,38) — tens of thousands of
-# pixels when the plate paints, none when a blank document does not.
-vgate_assert 10 snapshot 'screen-10-after' <<'PY'
-import struct, sys, zlib
+# The guest's own composite, streamed raw: --snapshot-after rides the
+# kind-4 channel, so the probe reads the real 1280x720 BGRX scanout — no
+# host screen-capture permission in the path. The empty-state plate is
+# the dark Surface fill (34,45,53) the EmptyState widget paints over the
+# page background (24,32,38) across the client area — hundreds of
+# thousands of pixels in one wide, tall region when the plate paints,
+# none when a blank document does not.
+vgate_assert 10 snapshot 'snap-10-*.raw' <<'PY'
+import sys
 
-d = open(sys.argv[1], "rb").read()
-assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
-pos = 8
-idat = b""
-w = h = ct = 0
-while pos < len(d):
-    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
-    chunk = d[pos + 8:pos + 8 + n]
-    if typ == b"IHDR":
-        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
-        assert depth == 8
-    elif typ == b"IDAT":
-        idat += chunk
-    pos += 12 + n
-bpp = 4 if ct == 6 else 3
-raw = zlib.decompress(idat)
-stride = w * bpp
-out = bytearray()
-prev = bytearray(stride)
-i = 0
-for _ in range(h):
-    filt = raw[i]
-    i += 1
-    row = bytearray(raw[i:i + stride])
-    i += stride
-    if filt == 1:
-        for x in range(bpp, stride):
-            row[x] = (row[x] + row[x - bpp]) & 0xff
-    elif filt == 2:
-        for x in range(stride):
-            row[x] = (row[x] + prev[x]) & 0xff
-    elif filt == 3:
-        for x in range(stride):
-            left = row[x - bpp] if x >= bpp else 0
-            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
-    elif filt == 4:
-        for x in range(stride):
-            left = row[x - bpp] if x >= bpp else 0
-            up = prev[x]
-            up_left = prev[x - bpp] if x >= bpp else 0
-            p = left + up - up_left
-            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
-            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
-            row[x] = (row[x] + pred) & 0xff
-    out += row
-    prev = row
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
 
 plate = 0
-for y in range(200, 700):
-    for x in range(80, 1050):
-        k = (y * w + x) * bpp
-        if max(abs(out[k] - 34), abs(out[k+1] - 45), abs(out[k+2] - 53)) <= 12:
+xs = []
+ys = []
+for y in range(H):
+    base = y * W * 4
+    for x in range(W):
+        k = base + x * 4
+        if max(abs(raw[k + 2] - 34), abs(raw[k + 1] - 45), abs(raw[k] - 53)) <= 12:
             plate += 1
-print("goedit empty leg: surface-plate pixels=%d" % plate)
-assert plate >= 20000, "empty-state plate absent from the document area"
+            xs.append(x)
+            ys.append(y)
+n = plate
+assert n >= 80000, "empty-state plate absent from the document area (%d px)" % n
+bw = max(xs) - min(xs) + 1
+bh = max(ys) - min(ys) + 1
+assert bw >= 300 and bh >= 200, \
+    "plate pixels are scattered accents, not one plate (%dx%d)" % (bw, bh)
+print("goedit empty leg: surface-plate pixels=%d bbox=%dx%d" % (n, bw, bh))
 PY
 
 # --- M123d (#2578) run 11: the shared error banner --------------------------
@@ -853,9 +847,10 @@ vgate_run 12 -- \
     --script-expect 'rx-goedit-hints-ok' --timeout 240
 
 vgate_assert 12 serial-contains 'goedit: present'
-# The app's three rows + every seat row; NO kernel-terminal rows — this
+# The app's four rows (ctrl+s/z/f/g — the undo row is M121e's) + every
+# seat row (29 in the shipped table) = 33; NO kernel-terminal rows — this
 # window is not a tty front-end, so those chords do not answer here.
-vgate_assert 12 serial-contains 'goedit: hints n=27'
+vgate_assert 12 serial-contains 'goedit: hints n=33'
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+s publish the buffer (save)'
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+f '
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+g '
@@ -866,3 +861,97 @@ vgate_assert 12 serial-contains 'goedit: close'
 vgate_assert 12 serial-contains 'rx-goedit-hints-ok'
 vgate_assert 12 serial-absent '[EXC] parking:'
 vgate_assert 12 serial-absent 'exited status=139'
+
+# --- M138b (#2776) run 13: bracket match highlight + jump ------------------
+# On "{abcdef}": `home` parks the caret on the `{` at offset 0 — the frame
+# that status line stamps carries the `}` at offset 7 under-painted teal
+# (colMatch, the pixel probe below). Ctrl-B jumps to it (`match jump
+# off=7`, status col=8), a second Ctrl-B jumps back (off=0), a caret parked
+# on 'a' answers the `match none` refusal, and the trailing `home` restores
+# the probe frame (caret on `{`, `}` teal) so it is the one resident on the
+# scanout when the snapshot fires.
+# The leg boots with NO seat: under the registered tabwm seat the kernel
+# skips blitting migrated (surface-backed) windows and only a
+# surface-composing seat (gotabwm) carries them to the scanout — the
+# document's pixels would never reach gpu_fb. Under the bare shim the
+# kernel composites every window itself, so the teal cell is really there
+# to stream.
+vgate_file script-13.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/BKT.TXT
+EOF
+
+# The echo IS the snapshot trigger and the run's expect — no close verb:
+# the window must still be up showing the probe frame when the kind-4
+# stream reads gpu_fb.
+vgate_file script3-13.txt <<'EOF'
+echo rx-goedit-match-ok
+EOF
+
+vgate_run 13 -- \
+    --screen '$RUN_DIR/screen-13' \
+    --via-virtio \
+    --snapshot-out '$RUN_DIR/snap-13' \
+    --script '$RUN_DIR/script-13.txt' \
+    --input-chords 'home,ctrl-b,ctrl-b,right,ctrl-b,home' \
+    --input-chords-after 'goedit: present' \
+    --snapshot-after 'rx-goedit-match-ok' \
+    --script3 '$RUN_DIR/script3-13.txt' \
+    --script3-after 'goedit: match none' \
+    --script3-delay 5 \
+    --script-expect 'rx-goedit-match-ok' --timeout 240
+
+vgate_assert 13 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 13 serial-contains 'goedit: read /host/EDIT/BKT.TXT n=8'
+vgate_assert 13 serial-contains 'goedit: present'
+vgate_assert 13 serial-contains 'goedit: match jump off=7'
+vgate_assert 13 serial-contains 'goedit: status line=1/1 col=8'
+vgate_assert 13 serial-contains 'goedit: match jump off=0'
+vgate_assert 13 serial-contains 'goedit: match none'
+vgate_assert 13 serial-contains 'rx-goedit-match-ok'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 serial-absent 'exited status=139'
+
+# The pixel probe reads the guest's own composite: --snapshot-after rides
+# the kind-4 channel, so the evidence is the real 1280x720 BGRX scanout —
+# no host screen-capture permission in the path. The probe does not trust
+# window geometry — the teal set must be one tight 8x8-ish cell, and the
+# caret's amber block (2x8) must sit exactly 7 cells (56 px) to its left
+# on the same row.
+vgate_assert 13 snapshot 'snap-13-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+teal = []
+amber = []
+for y in range(H):
+    base = y * W * 4
+    for x in range(W):
+        k = base + x * 4
+        b, g, r = raw[k], raw[k + 1], raw[k + 2]
+        if max(abs(r - 0x3f), abs(g - 0xbf), abs(b - 0x9f)) <= 12:
+            teal.append((x, y))
+        elif max(abs(r - 0xff), abs(g - 0xd7), abs(b - 0x5f)) <= 24:
+            amber.append((x, y))
+n = len(teal)
+assert n > 0, "no colMatch-teal pixels on the scanout — the match was not highlighted"
+xs = [p[0] for p in teal]
+ys = [p[1] for p in teal]
+x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+bw, bh = x1 - x0 + 1, y1 - y0 + 1
+assert n >= 24, "teal highlight is a speckle, not a cell fill (%d px)" % n
+assert bw <= 24 and bh <= 16, \
+    "teal is not one cell (%dx%d)" % (bw, bh)
+# The caret block paints 7 cells left of the match on the same row —
+# `{` under the caret, `}` the match — so amber must sit in that band.
+band = [p for p in amber if x0 - 62 <= p[0] <= x0 - 50 and y0 - 2 <= p[1] <= y1 + 2]
+assert len(band) >= 8, \
+    "no amber caret block 7 cells left of the match cell (%d px in the band)" % len(band)
+print("goedit bracket leg: teal px=%d cell=(%d..%d,%d..%d) %dx%d, caret px=%d"
+      % (n, x0, x1, y0, y1, bw, bh, len(band)))
+PY
