@@ -27,6 +27,13 @@
 //	goirc: sasl ok|fail                goirc: error <err>
 //	goirc: quit                        goirc: closed
 //
+// The --ui front-end adds (same prefix, same grep discipline):
+//
+//	goirc: open id=<n>                 goirc: declare accepted|refused
+//	goirc: consent ask|yes|no          goirc: toast|toast-refused <chan>
+//	goirc: focus <buf>                 goirc: blur
+//	goirc: state restored|refused|saved
+//
 // Exit: 0 clean quit/--max-ms, 1 usage, 2 session error (fatal refusals
 // and exhausted retries alike — the marker line names which).
 package main
@@ -53,11 +60,12 @@ type options struct {
 	maxMs    int64
 	haveHost bool
 	haveNick bool
+	ui       bool // M147b: --ui runs the tabapp front-end
 }
 
 func usage() {
 	vi.ConsoleLine("usage: GOIRC.ELF --host H --nick N [--port P] [--join '#a,#b']")
-	vi.ConsoleLine("                  [--tls [--sni NAME]] [--sasl acct:pass] [--plain]")
+	vi.ConsoleLine("                  [--tls [--sni NAME]] [--sasl acct:pass] [--plain] [--ui]")
 	vi.ConsoleLine("                  [--retries N] [--backoff-ms N] [--idle-ms N] [--pong-ms N] [--max-ms N]")
 	vi.ConsoleLine("       GOIRC.ELF <host> <nick> [#chan ...]")
 }
@@ -189,6 +197,8 @@ func parseArgs(args []string) (options, bool) {
 			o.cfg.SASL = &SASLConfig{Account: acct, Password: pass}
 		case "--plain":
 			o.cfg.AllowPlain = true
+		case "--ui":
+			o.ui = true
 		case "--retries":
 			n, ok := num()
 			if !ok {
@@ -251,47 +261,52 @@ func parseArgs(args []string) (options, bool) {
 	return o, o.haveHost && o.haveNick && o.cfg.Nick != "" && o.cfg.Host != ""
 }
 
-// consoleSink renders each Event as its one-line marker. Channel "" (the
-// server/status buffer) prints as '*'.
+// consoleSink renders each Event as its one-line marker — the console
+// driver's sink. The UI drains its event queue through the same logEvent
+// so both modes emit an identical marker stream.
 func consoleSink(cfg Config) func(Event) {
-	return func(e Event) {
-		switch e.Kind {
-		case EvState:
-			switch e.State {
-			case StateDialing:
-				scheme := "plain"
-				if cfg.TLS {
-					scheme = "tls"
-				}
-				vi.ConsoleLine("goirc: dial " + cfg.Host + " " + vsys.Itoa64(int64(cfg.Port)) + " " + scheme)
-			case StateClosed:
-				vi.ConsoleLine("goirc: closed")
+	return func(e Event) { logEvent(cfg, e) }
+}
+
+// logEvent prints e's marker line. Channel "" (the server/status buffer)
+// prints as '*'.
+func logEvent(cfg Config, e Event) {
+	switch e.Kind {
+	case EvState:
+		switch e.State {
+		case StateDialing:
+			scheme := "plain"
+			if cfg.TLS {
+				scheme = "tls"
 			}
-		case EvEntry:
-			printEntry(e.Entry)
-		case EvRegistered:
-			vi.ConsoleLine("goirc: registered nick=" + e.Nick)
-		case EvJoined:
-			vi.ConsoleLine("goirc: join " + e.Channel)
-		case EvRejoined:
-			vi.ConsoleLine("goirc: rejoin " + e.Channel)
-		case EvJoinFail:
-			vi.ConsoleLine("goirc: join-fail " + e.Channel + " " + e.Reason)
-		case EvNames:
-			vi.ConsoleLine("goirc: names " + e.Channel + " " + vsys.Itoa64(int64(len(e.Names))))
-		case EvNickInUse:
-			vi.ConsoleLine("goirc: nick-in-use " + e.Nick)
-		case EvSASLResult:
-			vi.ConsoleLine("goirc: sasl " + e.Text)
-		case EvDrop:
-			vi.ConsoleLine("goirc: drop " + errText(e.Err))
-		case EvBackoff:
-			vi.ConsoleLine("goirc: backoff " + vsys.Itoa64(e.BackoffNs/1e6))
-		case EvQuit:
-			vi.ConsoleLine("goirc: quit")
-		case EvError:
-			vi.ConsoleLine("goirc: error " + firstNonEmpty(errText(e.Err), e.Text))
+			vi.ConsoleLine("goirc: dial " + cfg.Host + " " + vsys.Itoa64(int64(cfg.Port)) + " " + scheme)
+		case StateClosed:
+			vi.ConsoleLine("goirc: closed")
 		}
+	case EvEntry:
+		printEntry(e.Entry)
+	case EvRegistered:
+		vi.ConsoleLine("goirc: registered nick=" + e.Nick)
+	case EvJoined:
+		vi.ConsoleLine("goirc: join " + e.Channel)
+	case EvRejoined:
+		vi.ConsoleLine("goirc: rejoin " + e.Channel)
+	case EvJoinFail:
+		vi.ConsoleLine("goirc: join-fail " + e.Channel + " " + e.Reason)
+	case EvNames:
+		vi.ConsoleLine("goirc: names " + e.Channel + " " + vsys.Itoa64(int64(len(e.Names))))
+	case EvNickInUse:
+		vi.ConsoleLine("goirc: nick-in-use " + e.Nick)
+	case EvSASLResult:
+		vi.ConsoleLine("goirc: sasl " + e.Text)
+	case EvDrop:
+		vi.ConsoleLine("goirc: drop " + errText(e.Err))
+	case EvBackoff:
+		vi.ConsoleLine("goirc: backoff " + vsys.Itoa64(e.BackoffNs/1e6))
+	case EvQuit:
+		vi.ConsoleLine("goirc: quit")
+	case EvError:
+		vi.ConsoleLine("goirc: error " + firstNonEmpty(errText(e.Err), e.Text))
 	}
 }
 
@@ -328,6 +343,15 @@ func main() {
 	if !ok {
 		usage()
 		vi.Exit(exitUsage)
+	}
+
+	// M147b: --ui runs the tabapp front-end (channel rail, scrollback,
+	// input line, mention toasts, the plaintext consent dialog and
+	// save_state); the console driver stays the default so the existing
+	// gate legs and the shell's exec verb are unchanged.
+	if o.ui {
+		runUI(o)
+		vi.Exit(exitError) // runUI exits via CloseAndExit; unreachable
 	}
 
 	c := NewClient(o.cfg, dialGuest(o.cfg), consoleSink(o.cfg))
