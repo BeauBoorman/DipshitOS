@@ -1,4 +1,4 @@
-package main
+package infer
 
 // The forward engine: one decode step per position, every matmul and the
 // logits softmax on the GPU compute path — DEQUANT produces f16 weights,
@@ -35,8 +35,8 @@ type ioOff struct {
 
 // engine owns a live session plus its scratch buffers.
 type engine struct {
-	s    dev
-	m    *model
+	s    Dev
+	m    *Model
 	w16  uint64 // f16 dequant scratch (weight-class)
 	io   uint64 // the shared I/O buffer
 	off  ioOff
@@ -51,7 +51,7 @@ type engine struct {
 }
 
 // layout computes the io partition for cfg. Returns total bytes.
-func (m *model) layout(lmRs int) ioOff {
+func (m *Model) layout(lmRs int) ioOff {
 	dh := m.headDim()
 	c := m.cfg
 	var o ioOff
@@ -84,7 +84,7 @@ func (m *model) layout(lmRs int) ioOff {
 
 // newEngine allocates scratch on the session. The model's weight buffers
 // are already sealed.
-func newEngine(s dev, m *model) (*engine, error) {
+func newEngine(s Dev, m *Model) (*engine, error) {
 	// w16 must hold the largest single dequanted tensor: w13 [2H, D] or an
 	// lm_head slice, whichever is bigger.
 	big := uint64(0)

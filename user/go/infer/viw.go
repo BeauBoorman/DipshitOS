@@ -1,4 +1,4 @@
-package main
+package infer
 
 // The VIW container — VirelaiOS Inference Weights (M111c, issue #2410).
 //
@@ -20,7 +20,7 @@ package main
 //	12   4   dir_count   (directory entries)
 //	16   4   flags       (0)
 //	20   44  reserved    (0)
-//	64   ..  header block: `key value\n` lines (see viwHeader)
+//	64   ..  header block: `key value\n` lines (see Header)
 //	..   ..  tokenizer blob: u32 kind, then kind-specific sections
 //	..   ..  dir_count × 96B entries
 //	..   ..  payloads, in directory order
@@ -77,11 +77,11 @@ const (
 	viwFmtF32    byte = 4
 )
 
-// viwHeader is the text header — the architecture description the forward
+// Header is the text header — the architecture description the forward
 // pass runs against plus the licence receipt the card demands. The block
 // is `key value` lines, one per field; unknown keys refuse (a stale reader
 // must not silently skip a field a newer writer needed).
-type viwHeader struct {
+type Header struct {
 	Arch      string // "llama" — the only v1 family
 	Dim       int
 	Hidden    int
@@ -96,11 +96,11 @@ type viwHeader struct {
 	Tie       bool // lm_head shares embed
 	BOS       int
 	EOS       int
-	Model     viwModel
+	Model     ModelInfo
 }
 
-// viwModel is the licence receipt the owner-approval gate pins.
-type viwModel struct {
+// ModelInfo is the licence receipt the owner-approval gate pins.
+type ModelInfo struct {
 	ID             string
 	License        string
 	Source         string
@@ -172,7 +172,7 @@ func payloadLen(fmtb byte, n, groups uint64) uint64 {
 // viwImage is a parsed container: header + tokenizer blob + directory.
 // Payloads are NOT held — the loader routes each span as it streams past.
 type viwImage struct {
-	Header viwHeader
+	Header Header
 	Tok    []byte
 	Dir    []viwTensor
 }
@@ -284,13 +284,13 @@ func readVIWHead(r io.Reader) (*viwImage, error) {
 // staging converter share it, so the bytes a test produces are the bytes
 // the loader consumes.
 type viwWrite struct {
-	header viwHeader
+	header Header
 	tok    []byte
 	dir    []viwTensor
 	pay    [][]byte
 }
 
-func newViwWrite(h viwHeader, tok []byte) *viwWrite {
+func newViwWrite(h Header, tok []byte) *viwWrite {
 	return &viwWrite{header: h, tok: tok}
 }
 
@@ -342,8 +342,8 @@ func (w *viwWrite) marshal() []byte {
 
 // parseHeader reads the `key value` block — one field per line, unknown
 // keys refused so a stale reader never silently drops a required field.
-func parseHeader(b []byte) (viwHeader, error) {
-	var h viwHeader
+func parseHeader(b []byte) (Header, error) {
+	var h Header
 	intf := func(v string) (int, error) { return strconv.Atoi(v) }
 	for _, ln := range strings.Split(string(b), "\n") {
 		if ln == "" {
@@ -413,7 +413,7 @@ func parseHeader(b []byte) (viwHeader, error) {
 
 // emit writes the header block in a fixed key order — the byte-identical
 // twin of what parseHeader reads (deterministic images hash cleanly).
-func (h viwHeader) emit() []byte {
+func (h Header) emit() []byte {
 	var sb strings.Builder
 	put := func(k, v string) {
 		sb.WriteString(k)

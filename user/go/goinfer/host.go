@@ -11,6 +11,7 @@ import (
 	"strconv"
 
 	"virelai/gpu3d"
+	"virelai/infer"
 	"virelai/vi"
 )
 
@@ -27,7 +28,7 @@ type host interface {
 	OpenRead(path string) (io.ReadCloser, error)
 	// OpenComp takes the compute session (slot 90); ENXIO maps to
 	// gpu3d.ErrComputeNoDevice, which journeys answer "unsupported".
-	OpenComp() (dev, error)
+	OpenComp() (infer.Dev, error)
 	// Nanos is the monotonic clock for tok/s evidence.
 	Nanos() int64
 	// SelfMemBytes is this process's owned resident footprint (the proc
@@ -86,7 +87,7 @@ func (guestHost) OpenRead(path string) (io.ReadCloser, error) {
 	return &guestFile{h: uint32(h)}, nil
 }
 
-func (guestHost) OpenComp() (dev, error) { return gpu3d.OpenCompute() }
+func (guestHost) OpenComp() (infer.Dev, error) { return gpu3d.OpenCompute() }
 
 func (guestHost) Nanos() int64 { return vi.Nanos() }
 

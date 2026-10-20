@@ -1,4 +1,4 @@
-package main
+package infer
 
 // Tokenizers: the stub's byte-level table and a dependency-free GPT-2-style
 // byte-level BPE for real models (the SmolLM2 family ships exactly this —
@@ -13,9 +13,9 @@ import (
 	"strings"
 )
 
-// tokenizer is the encode/decode seam. Encode is prompt-side; Decode turns
+// Tokenizer is the encode/decode seam. Encode is prompt-side; Decode turns
 // generated ids back into bytes.
-type tokenizer interface {
+type Tokenizer interface {
 	Encode(s string) []int
 	Decode(ids []int) string
 	// Specials used by the sampler.
@@ -47,7 +47,7 @@ type tokBlob struct {
 }
 
 // parseTokenizer builds the tokenizer the blob names.
-func parseTokenizer(b []byte) (tokenizer, error) {
+func parseTokenizer(b []byte) (Tokenizer, error) {
 	var tb tokBlob
 	if len(b) < 12 {
 		return nil, errors.New("viw: short tokenizer blob")

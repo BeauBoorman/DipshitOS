@@ -1,4 +1,4 @@
-package main
+package infer
 
 // The model image: a parsed VIW directory plus where every tensor landed.
 // The guest has a sequential-only file seam, so loading is ONE pass over
@@ -18,9 +18,9 @@ import (
 	"virelai/gpu3d"
 )
 
-// dev is the compute-session seam the engine drives — *gpu3d.ComputeSession
+// Dev is the compute-session seam the engine drives — *gpu3d.ComputeSession
 // satisfies it on the guest; tests substitute a kernel-emulating fake.
-type dev interface {
+type Dev interface {
 	AllocBuffer(size uint32, weight bool) (uint64, error)
 	FreeBuffer(buf uint64) error
 	SealBuffer(buf uint64) error
@@ -78,13 +78,16 @@ type layerW struct {
 	w2       devTensor
 }
 
-// model is a loaded image: config, CPU-side tensors, device tensors and
-// the weight buffers that own them.
-type model struct {
-	cfg       viwHeader
-	tok       tokenizer
-	embed     []byte // guest-resident payload [packed|scales|zeros]
-	embedN    uint64 // V·D elements
+// Model is a loaded image: config, CPU-side tensors, device tensors and
+// the weight buffers that own them. The session the weights were sealed
+// onto is held for Generate and Close; the caller still owns its Close.
+type Model struct {
+	cfg       Header
+	tok       Tokenizer
+	s         Dev     // the load-time compute session
+	eng       *engine // scratch, lazily allocated by the first Generate
+	embed     []byte  // guest-resident payload [packed|scales|zeros]
+	embedN    uint64  // V·D elements
 	embedGrp  uint32
 	finalNorm []float32
 	finalRaw  *[]byte // load-time accumulator
@@ -95,25 +98,25 @@ type model struct {
 }
 
 // headDim is the per-head attention width.
-func (m *model) headDim() int { return m.cfg.Dim / m.cfg.Heads }
+func (m *Model) headDim() int { return m.cfg.Dim / m.cfg.Heads }
 
 // qkvDim is the fused q|k|v row width.
-func (m *model) qkvDim() int {
+func (m *Model) qkvDim() int {
 	dh := m.headDim()
 	return (m.cfg.Heads + 2*m.cfg.KVHeads) * dh
 }
 
 // freeBuffers releases the weight buffers (sealed or not); called on load
 // failure and on Close before the session ends.
-func (m *model) freeBuffers(s dev) {
+func (m *Model) freeBuffers() {
 	for _, h := range m.wbufs {
-		_ = s.FreeBuffer(h)
+		_ = m.s.FreeBuffer(h)
 	}
 	m.wbufs = nil
 }
 
 // checkArch refuses anything outside the v1 llama-family envelope.
-func (m *model) checkArch() error {
+func (m *Model) checkArch() error {
 	c := m.cfg
 	if c.Arch != "llama" {
 		return fmt.Errorf("viw arch %q", c.Arch)
@@ -163,8 +166,8 @@ func layerIndex(name string) int {
 // weight-pack buffers that are sealed as the pass completes. stageBytes
 // bounds the read chunk (a WRITE's own staging is smaller; chunking is
 // the client's problem, the kernel's is the 4 MiB window).
-func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error) {
-	m := &model{cfg: im.Header}
+func loadModel(im *viwImage, r io.Reader, s Dev, stageBytes int) (*Model, error) {
+	m := &Model{cfg: im.Header, s: s}
 	if err := m.checkArch(); err != nil {
 		return nil, err
 	}
@@ -205,7 +208,7 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 	for i := range pack {
 		h, err := s.AllocBuffer(pack[i], gpu3d.BufWeight)
 		if err != nil {
-			m.freeBuffers(s)
+			m.freeBuffers()
 			return nil, fmt.Errorf("weight buffer %d: %w", i, err)
 		}
 		m.wbufs[i] = h
@@ -225,7 +228,7 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 				n = left
 			}
 			if _, err := io.ReadFull(r, scratch[:n]); err != nil {
-				m.freeBuffers(s)
+				m.freeBuffers()
 				return nil, fmt.Errorf("tensor %s: %w", t.Name, err)
 			}
 			if dst != nil {
@@ -233,7 +236,7 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 			} else {
 				dt := plan[t.Name]
 				if err := s.Write(dt.buf, uint64(dt.pOff)+(t.PayLen-left), scratch[:n]); err != nil {
-					m.freeBuffers(s)
+					m.freeBuffers()
 					return nil, fmt.Errorf("tensor %s upload: %w", t.Name, err)
 				}
 			}
@@ -269,14 +272,14 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 	// and the guest staging share is released (ADR D4).
 	for _, h := range m.wbufs {
 		if err := s.SealBuffer(h); err != nil {
-			m.freeBuffers(s)
+			m.freeBuffers()
 			return nil, fmt.Errorf("seal: %w", err)
 		}
 	}
 
 	// Materialize CPU-side tensors.
 	if m.embedRaw == nil {
-		m.freeBuffers(s)
+		m.freeBuffers()
 		return nil, errors.New("viw: no embed tensor")
 	}
 	m.embed = *m.embedRaw
@@ -287,7 +290,7 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 		}
 	}
 	if m.embedGrp == 0 || uint64(m.cfg.Dim)%uint64(m.embedGrp) != 0 {
-		m.freeBuffers(s)
+		m.freeBuffers()
 		return nil, errors.New("viw: embed group must divide dim (row-sliced by lm_head)")
 	}
 	if m.finalRaw != nil {
@@ -295,21 +298,21 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 		m.finalRaw = nil
 	}
 	if len(m.finalNorm) != m.cfg.Dim {
-		m.freeBuffers(s)
+		m.freeBuffers()
 		return nil, errors.New("viw: final_norm missing or wrong size")
 	}
 	for li := range m.layers {
 		lw := &m.layers[li]
 		if lw.attnRaw == nil || lw.ffnRaw == nil || lw.wqkv.buf == 0 ||
 			lw.wo.buf == 0 || lw.w13.buf == 0 || lw.w2.buf == 0 {
-			m.freeBuffers(s)
+			m.freeBuffers()
 			return nil, fmt.Errorf("viw: layer %d incomplete", li)
 		}
 		lw.attnNorm = bytesToF32(*lw.attnRaw)
 		lw.ffnNorm = bytesToF32(*lw.ffnRaw)
 		lw.attnRaw, lw.ffnRaw = nil, nil
 		if len(lw.attnNorm) != m.cfg.Dim || len(lw.ffnNorm) != m.cfg.Dim {
-			m.freeBuffers(s)
+			m.freeBuffers()
 			return nil, fmt.Errorf("viw: layer %d norm wrong size", li)
 		}
 	}
@@ -319,7 +322,7 @@ func loadModel(im *viwImage, r io.Reader, s dev, stageBytes int) (*model, error)
 // tensorDest decides a payload's destination: a guest-side accumulator
 // (norms, embed) or nil — device weight. Accumulators are preallocated to
 // the payload length so the streamed append never doubles past its size.
-func (m *model) tensorDest(t viwTensor) *[]byte {
+func (m *Model) tensorDest(t viwTensor) *[]byte {
 	switch t.Name {
 	case tEmbed:
 		b := make([]byte, 0, t.PayLen)
@@ -396,18 +399,18 @@ const (
 	stubKVHeads = 4
 	stubVocab   = 256
 	stubSeq     = 256 // ≥ the fixed model prompt so a stub-staged model run fits
-	stubGroup   = 32 // weight quantization group
+	stubGroup   = 32  // weight quantization group
 )
 
-// synthStub builds a VIW image in memory: small dims, byte-level
+// SynthStub builds a VIW image in memory: small dims, byte-level
 // tokenizer, and PRNG weights quantized with the same encoder the
 // converter uses. The loader then runs the production path end to end —
 // the only thing "stub" about it is where the bytes came from.
-// synthStub is the production stub image: the amplitudes are tuned so the
+// SynthStub is the production stub image: the amplitudes are tuned so the
 // hidden state is weight-driven rather than embedding-dominated — a real
 // greedy decode then produces a VARIED (still fully deterministic) token
 // stream, which is what the leg pins.
-func synthStub() []byte { return synthStubAmps(0.05, 0.2) }
+func SynthStub() []byte { return synthStubAmps(0.05, 0.2) }
 
 func synthStubAmps(ea, wa float32) []byte {
 	const (
@@ -437,12 +440,12 @@ func synthStubAmps(ea, wa float32) []byte {
 		return b
 	}
 
-	h := viwHeader{
+	h := Header{
 		Arch: "llama", Dim: dim, Hidden: hid, Layers: L,
 		Heads: qh, KVHeads: kvh, Vocab: V, SeqCap: S,
 		Rope: "half", RopeTheta: 10000, RmsEps: 1e-5,
 		Tie: true, BOS: 1, EOS: 2,
-		Model: viwModel{
+		Model: ModelInfo{
 			ID: "goinfer-stub", License: "VirelaiOS (synthetic)",
 			Source: "in-image PRNG", Seed: stubSeed,
 		},

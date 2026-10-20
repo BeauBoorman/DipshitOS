@@ -1,0 +1,9 @@
+goinfer: stub run k=1 ids=196,99,196,196,196,196,196,196,99,133,99,99,99,99,99,133 answer="\xc4c\xc4\xc4\xc4\xc4\xc4\xc4c\x85ccccc\x85" submits=1776
+goinfer: stub run k=2 ids=196,99,196,196,196,196,196,196,99,133,99,99,99,99,99,133 answer="\xc4c\xc4\xc4\xc4\xc4\xc4\xc4c\x85ccccc\x85" submits=1776
+goinfer: stub run k=3 ids=196,99,196,196,196,196,196,196,99,133,99,99,99,99,99,133 answer="\xc4c\xc4\xc4\xc4\xc4\xc4\xc4c\x85ccccc\x85" submits=1776
+goinfer: stub run k=4 ids=196,99,196,196,196,196,196,196,99,133,99,99,99,99,99,133 answer="\xc4c\xc4\xc4\xc4\xc4\xc4\xc4c\x85ccccc\x85" submits=1776
+goinfer: stub run k=5 ids=196,99,196,196,196,196,196,196,99,133,99,99,99,99,99,133 answer="\xc4c\xc4\xc4\xc4\xc4\xc4\xc4c\x85ccccc\x85" submits=1776
+goinfer: stub consistent K=5
+goinfer: stub answer "\xc4c\xc4\xc4\xc4\xc4\xc4\xc4c\x85ccccc\x85"
+goinfer OK
+goinfer: done

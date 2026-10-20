@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"virelai/gpu3d"
+	"virelai/infer"
+	"virelai/vi"
 )
 
 // fakeHost is the platform seam's test double: console lines recorded,
@@ -16,7 +18,7 @@ type fakeHost struct {
 	console []string
 	files   map[string][]byte
 	dirs    map[string]bool
-	devs    []*fakeDev
+	devs    []*infer.FakeDev
 	openErr error
 	now     int64
 }
@@ -51,11 +53,11 @@ func (f *fakeHost) OpenRead(p string) (io.ReadCloser, error) {
 	return rcReader{bytes.NewReader(b)}, nil
 }
 
-func (f *fakeHost) OpenComp() (dev, error) {
+func (f *fakeHost) OpenComp() (infer.Dev, error) {
 	if f.openErr != nil {
 		return nil, f.openErr
 	}
-	d := newFakeDev()
+	d := infer.NewFakeDev()
 	f.devs = append(f.devs, d)
 	return d, nil
 }
@@ -78,125 +80,6 @@ func (f *fakeHost) hasConsole(sub string) bool {
 	return false
 }
 
-// --- VIW container --------------------------------------------------------
-
-func TestViwRoundTrip(t *testing.T) {
-	h := viwHeader{Arch: "llama", Dim: 8, Hidden: 16, Layers: 1,
-		Heads: 2, KVHeads: 2, Vocab: 32, SeqCap: 16,
-		Rope: "half", RopeTheta: 10000, RmsEps: 1e-5,
-		Tie: true, BOS: 1, EOS: 2,
-		Model: viwModel{ID: "x", License: "MIT"}}
-	w := newViwWrite(h, []byte(`{"kind":"bytes"}`))
-	pay := quantU4Asym([]float32{1, 2, 3, 4, 5, 6, 7, 8}, 32)
-	w.add("w", viwFmtU4Asym, 32, [2]uint32{2, 4}, pay)
-	w.add("n", viwFmtF32, 0, [2]uint32{8, 0}, make([]byte, 32))
-	img := w.marshal()
-
-	r := bytes.NewReader(img)
-	im, err := readVIWHead(r)
-	if err != nil {
-		t.Fatalf("readVIWHead: %v", err)
-	}
-	if im.Header.Dim != 8 || len(im.Dir) != 2 {
-		t.Fatalf("dir parse: %+v", im.Header)
-	}
-	if im.Dir[0].Name != "w" || im.Dir[0].Group != 32 || im.Dir[0].Dims[1] != 4 {
-		t.Fatalf("dir[0]: %+v", im.Dir[0])
-	}
-	// Payload must begin right where the directory says it does.
-	got := make([]byte, len(pay))
-	if _, err := io.ReadFull(r, got); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, pay) {
-		t.Fatal("payload bytes not in dir order at payload_off")
-	}
-}
-
-func TestViwRefusesBadMagicAndMisorderedPayload(t *testing.T) {
-	img := synthStub()
-	img[0] = 'X'
-	if _, err := readVIWHead(bytes.NewReader(img)); err == nil {
-		t.Fatal("bad magic accepted")
-	}
-}
-
-// --- quantizer ------------------------------------------------------------
-
-func TestQuantU4AsymRoundTripsWithinScale(t *testing.T) {
-	vals := []float32{0.1, -0.5, 0.33, 0.9, -0.02, 0.77, 0.41, -0.88}
-	pay := quantU4Asym(vals, 32)
-	out := make([]float32, len(vals))
-	dequantU4(pay, uint64(len(vals)), 32, 0, uint64(len(vals)), out)
-	for i, v := range out {
-		if d := v - vals[i]; d < -0.2 || d > 0.2 {
-			t.Fatalf("dequant[%d]=%v vs %v", i, v, vals[i])
-		}
-	}
-}
-
-// --- tokenizers ------------------------------------------------------------
-
-func TestBytesTokRoundTrip(t *testing.T) {
-	tk, err := parseTokenizer(tokEmitBytes(0, 2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids := tk.Encode("abc")
-	if len(ids) != 3 || ids[0] != 'a' {
-		t.Fatalf("encode: %v", ids)
-	}
-	if tk.Decode(ids) != "abc" {
-		t.Fatal("decode")
-	}
-}
-
-func TestBPEMergesByRank(t *testing.T) {
-	// A miniature vocab: atoms a,b,c plus merges ab then abc.
-	vocab := []string{"a", "b", "c", "ab", "abc"}
-	merges := [][2]uint32{{0, 1}, {3, 2}}
-	tk, err := parseTokenizer(tokEmitBPE(vocab, merges, 0, 4))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids := tk.Encode("abc")
-	if len(ids) != 1 || ids[0] != 4 {
-		t.Fatalf("encode abc -> %v, want [4]", ids)
-	}
-	// "abd" merges ab but d is unvocab'd in this fixture — dropped, not fatal.
-	if got := tk.Encode("abd"); len(got) != 1 || got[0] != 3 {
-		t.Fatalf("encode abd -> %v", got)
-	}
-	if tk.Decode([]int{4}) != "abc" {
-		t.Fatal("decode")
-	}
-}
-
-func TestBPESpecialsPassThrough(t *testing.T) {
-	sp := "<" + "|im_end|>"
-	tk, err := parseTokenizer(tokEmitBPE([]string{"A", sp}, nil, 0, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids := tk.Encode(sp)
-	if len(ids) != 1 || ids[0] != 1 {
-		t.Fatalf("special id: %v", ids)
-	}
-}
-
-func TestPreTokenizeBasic(t *testing.T) {
-	got := preTokenize("hello world 42!")
-	want := []string{"hello", " world", " 4", "2", "!"}
-	if len(got) != len(want) {
-		t.Fatalf("preTokenize %q -> %v", "hello world 42!", got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("piece %d: %q want %q (%v)", i, got[i], want[i], got)
-		}
-	}
-}
-
 // --- the stub model on the emulated kernels ---------------------------------
 
 func TestStubRunsDeterministicAndCoversKernels(t *testing.T) {
@@ -211,8 +94,8 @@ func TestStubRunsDeterministicAndCoversKernels(t *testing.T) {
 		t.Fatalf("sessions = %d want 1", len(h.devs))
 	}
 	d := h.devs[0]
-	for _, k := range []uint32{kernelGEMM, kernelSoftmax, kernelDequant} {
-		if d.submits[k] == 0 {
+	for _, k := range []uint32{vi.GpuKernelGEMM, vi.GpuKernelSoftmax, vi.GpuKernelDequant} {
+		if d.Submits[k] == 0 {
 			t.Fatalf("kernel %d never ran", k)
 		}
 	}
@@ -274,7 +157,7 @@ func TestModelJourneyRunsStagedVIW(t *testing.T) {
 	h := newFakeHost()
 	// Stage a stub image at the model path — the model journey only cares
 	// that a real file arrived through the share.
-	h.files[modelPath] = synthStub()
+	h.files[modelPath] = infer.SynthStub()
 	if err := run(h, []string{"model"}); err != nil {
 		t.Fatalf("model run: %v", err)
 	}

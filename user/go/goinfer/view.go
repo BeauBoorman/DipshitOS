@@ -20,6 +20,7 @@ import (
 	"io"
 
 	uidraw "virelai/draw"
+	"virelai/infer"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
@@ -55,13 +56,13 @@ func (w *viewHost) ConsoleLine(s string) {
 	w.v.repaint()
 }
 
-func (w *viewHost) MkdirShare(p string) error              { return w.inner.MkdirShare(p) }
+func (w *viewHost) MkdirShare(p string) error               { return w.inner.MkdirShare(p) }
 func (w *viewHost) WriteShareFile(p string, b []byte) error { return w.inner.WriteShareFile(p, b) }
-func (w *viewHost) FileExists(p string) bool               { return w.inner.FileExists(p) }
+func (w *viewHost) FileExists(p string) bool                { return w.inner.FileExists(p) }
 func (w *viewHost) OpenRead(p string) (io.ReadCloser, error) {
 	return w.inner.OpenRead(p)
 }
-func (w *viewHost) OpenComp() (dev, error) {
+func (w *viewHost) OpenComp() (infer.Dev, error) {
 	d, err := w.inner.OpenComp()
 	if err == nil {
 		w.opened = true

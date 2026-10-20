@@ -3,7 +3,9 @@ package main
 // GOINFER — the M111c (issue #2410) guest LLM inference app on the M111b
 // GPU compute path (ADR 0053). Every matmul and the vocab softmax ride
 // sys_gpucomp; norms, RoPE, residuals and sampling stay on the CPU — the
-// same split the ADR pins.
+// same split the ADR pins. Since M140a (#2784) the engine — VIW loader,
+// tokenizer, forward pass, greedy decode — is virelai/infer; this file is
+// the CLI over it.
 //
 // Journeys (the seat exec's argv):
 //
@@ -35,6 +37,7 @@ import (
 	"strings"
 
 	"virelai/gpu3d"
+	"virelai/infer"
 	"virelai/vi"
 )
 
@@ -137,7 +140,7 @@ type app struct {
 
 // openComp wraps the seam so every journey names the unsupported case the
 // same way — ENXIO/ENOSYS is a device absence, not a failure.
-func (a *app) openComp() (dev, error) {
+func (a *app) openComp() (infer.Dev, error) {
 	return a.h.OpenComp()
 }
 
@@ -148,33 +151,19 @@ func (a *app) openComp() (dev, error) {
 // per-run: OpenCompute maps a fixed-VA window that Close does not unmap
 // — a process can open exactly one session, which is also the realistic
 // resident-app pattern.)
-func (a *app) runOnce(s dev, src io.Reader) (ids []int, st gpu3d.ComputeStatsBlock, m *model, err error) {
-	im, err := readVIWHead(src)
+func (a *app) runOnce(s infer.Dev, src io.Reader) (ids []int, st gpu3d.ComputeStatsBlock, m *infer.Model, err error) {
+	m, err = infer.Load(src, s, stageBytes)
 	if err != nil {
 		return nil, st, nil, err
 	}
-	m, err = loadModel(im, src, s, stageBytes)
-	if err != nil {
-		return nil, st, nil, err
-	}
-	defer m.freeBuffers(s)
-	eng, err := newEngine(s, m)
-	if err != nil {
-		return nil, st, nil, err
-	}
-	defer eng.free()
-	tok, err := parseTokenizer(im.Tok)
-	if err != nil {
-		return nil, st, nil, err
-	}
-	m.tok = tok
+	defer m.Close()
 	prompt := stubPrompt
 	maxNew := stubMaxNew
-	if im.Header.Model.Seed == 0 {
+	if m.Header().Model.Seed == 0 {
 		prompt = modelPrompt
 		maxNew = modelMaxNew
 	}
-	ids, err = eng.generate(tok.Encode(prompt), maxNew)
+	ids, err = m.Generate(m.Tokenizer().Encode(prompt), maxNew, nil)
 	if err != nil {
 		return nil, st, nil, err
 	}
@@ -199,7 +188,7 @@ func (a *app) jStub() error {
 		return err
 	}
 	defer s.Close()
-	img := synthStub()
+	img := infer.SynthStub()
 	var first string
 	var firstIds string
 	var prev gpu3d.ComputeStatsBlock
@@ -212,7 +201,7 @@ func (a *app) jStub() error {
 		// Stats accumulate per session; the per-run count is the delta.
 		delta := st.Submits - prev.Submits
 		prev = st
-		ans := m.tok.Decode(ids)
+		ans := m.Tokenizer().Decode(ids)
 		a.rec.row("stub", "run", is(k), "ids="+idlist(ids),
 			"submits="+is(int(delta)), "completed="+is(int(st.Completed)))
 		a.h.ConsoleLine("goinfer: stub run k=" + is(k) +
@@ -261,39 +250,24 @@ func (a *app) jModel(path string) error {
 	sum := sha256.New()
 	tr := io.TeeReader(src, sum)
 	t0 := a.h.Nanos()
-	im, err := readVIWHead(tr)
+	m, err := infer.Load(tr, s, stageBytes)
 	if err != nil {
 		a.rec.row("model", "run", errName(err))
 		return fmt.Errorf("model run: %w", err)
 	}
-	m, err := loadModel(im, tr, s, stageBytes)
-	if err != nil {
-		a.rec.row("model", "run", errName(err))
-		return fmt.Errorf("model run: %w", err)
-	}
-	defer m.freeBuffers(s)
-	eng, err := newEngine(s, m)
-	if err != nil {
-		a.rec.row("model", "run", errName(err))
-		return fmt.Errorf("model run: %w", err)
-	}
-	defer eng.free()
-	tok, err := parseTokenizer(im.Tok)
-	if err != nil {
-		a.rec.row("model", "run", errName(err))
-		return fmt.Errorf("model run: %w", err)
-	}
-	m.tok = tok
+	defer m.Close()
+	tok := m.Tokenizer()
 	sha := hex.EncodeToString(sum.Sum(nil))
 	loadMs := (a.h.Nanos() - t0) / 1e6
 	resident := a.h.SelfMemBytes()
 
-	rec := m.cfg.Model
-	a.rec.row("model", "loaded", "params="+is(int(m.params)),
-		"vocab="+is(m.cfg.Vocab), "layers="+is(m.cfg.Layers),
+	hdr := m.Header()
+	rec := hdr.Model
+	a.rec.row("model", "loaded", "params="+is(int(m.Params())),
+		"vocab="+is(hdr.Vocab), "layers="+is(hdr.Layers),
 		"load_ms="+is(int(loadMs)))
-	a.h.ConsoleLine("goinfer: loaded params=" + is(int(m.params)) +
-		" vocab=" + is(m.cfg.Vocab) + " load_ms=" + is(int(loadMs)))
+	a.h.ConsoleLine("goinfer: loaded params=" + is(int(m.Params())) +
+		" vocab=" + is(hdr.Vocab) + " load_ms=" + is(int(loadMs)))
 	a.h.ConsoleLine("goinfer: licence=" + rec.License +
 		" model=" + rec.ID + " sha=" + sha +
 		" resident=" + strconv.FormatUint(resident, 10))
@@ -308,7 +282,7 @@ func (a *app) jModel(path string) error {
 	var prev gpu3d.ComputeStatsBlock
 	for k := 1; k <= modelK; k++ {
 		d0 := a.h.Nanos()
-		ids, err := eng.generate(prompt, modelMaxNew)
+		ids, err := m.Generate(prompt, modelMaxNew, nil)
 		if err != nil {
 			a.rec.row("model", "run", is(k), errName(err))
 			return fmt.Errorf("model run %d: %w", k, err)
@@ -324,7 +298,7 @@ func (a *app) jModel(path string) error {
 		}
 		delta := st.Submits - prev.Submits
 		prev = st
-		ans := m.tok.Decode(ids)
+		ans := tok.Decode(ids)
 		a.rec.row("model", "run", is(k), "ids="+idlist(ids),
 			"toks="+is(len(ids)), "tokps="+tokps,
 			"submits="+is(int(delta)),
