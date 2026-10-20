@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIdentical(t *testing.T) {
 	text, differ, _ := Diff("a\nb\n", "a\nb\n", 3)
@@ -102,5 +105,93 @@ func TestCliArgs(t *testing.T) {
 	}
 	if got := cliArgs([]string{"a", "b"}); len(got) != 2 {
 		t.Fatalf("bare args mangled: %v", got)
+	}
+}
+
+func stripANSI(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b {
+			for i < len(s) && s[i] != 'm' && s[i] != 'H' && s[i] != 'J' && s[i] != 'l' && s[i] != 'h' {
+				i++
+			}
+			continue
+		}
+		b = append(b, s[i])
+	}
+	return string(b)
+}
+
+func TestRenderUnifiedColors(t *testing.T) {
+	a := splitLines("alpha\nbeta\ngamma\n")
+	b := splitLines("alpha\nBETA\ngamma\n")
+	hs := hunks(lcsOps(a, b), 3)
+	f := renderUnified("A", "B", a, b, hs, 0, 24)
+	if !strings.Contains(f, colHunk+"@@ -1,3 +1,3 @@") {
+		t.Fatalf("missing blue hunk header: %q", f)
+	}
+	if !strings.Contains(f, colMinus+"-beta") || !strings.Contains(f, colPlus+"+BETA") {
+		t.Fatalf("missing colored change lines: %q", f)
+	}
+	if !strings.Contains(f, framePrologue) || !strings.Contains(f, "GODIFF A | B") {
+		t.Fatalf("missing prologue/header: %q", f)
+	}
+}
+
+func TestRenderSideBySideAligns(t *testing.T) {
+	a := splitLines("alpha\nbeta\ngamma\n")
+	b := splitLines("alpha\nBETA\nGAMMA\n")
+	hs := hunks(lcsOps(a, b), 3)
+	f := renderSideBySide("A", "B", a, b, hs, 0, 24, 80)
+	rows := strings.Split(stripANSI(f), "\n")
+	var pair string
+	for _, r := range rows {
+		if strings.Contains(r, "beta") {
+			pair = r
+		}
+	}
+	if pair == "" {
+		t.Fatalf("no paired row: %q", f)
+	}
+	if !strings.Contains(pair, "BETA") || !strings.Contains(pair, " | ") {
+		t.Fatalf("paired row not aligned: %q", pair)
+	}
+	if !strings.Contains(f, colMinus+"beta") || !strings.Contains(f, colPlus+"BETA") {
+		t.Fatalf("paired colors missing: %q", f)
+	}
+	// Unequal run: left cell must blank-pad, not shift the separator.
+	a2 := splitLines("x\n1\n2\ny\n")
+	b2 := splitLines("x\nZ\ny\n")
+	hs2 := hunks(lcsOps(a2, b2), 1)
+	f2 := renderSideBySide("A", "B", a2, b2, hs2, 0, 24, 40)
+	plain := stripANSI(f2)
+	var sepCols []int
+	for _, r := range strings.Split(plain, "\n") {
+		if strings.HasPrefix(r, " GODIFF ") {
+			continue
+		}
+		if i := strings.Index(r, " | "); i >= 0 {
+			sepCols = append(sepCols, i)
+		}
+	}
+	for _, c := range sepCols[1:] {
+		if c != sepCols[0] {
+			t.Fatalf("unaligned separators %v: %q", sepCols, plain)
+		}
+	}
+	if !strings.Contains(f2, "1") && !strings.Contains(f2, "2") {
+		t.Fatalf("deleted rows missing: %q", f2)
+	}
+}
+
+func TestFitCell(t *testing.T) {
+	if got := fitCell("abcdef", 4); got != "abc…" {
+		t.Fatalf("clip: %q", got)
+	}
+	if got := fitCell("ab", 5); got != "ab   " {
+		t.Fatalf("pad: %q", got)
+	}
+	if got := fitCell("ab€cd", 4); got != "ab€…" {
+		t.Fatalf("rune clip: %q", got)
 	}
 }

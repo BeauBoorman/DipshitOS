@@ -56,6 +56,10 @@ func run(args []string) int {
 		return runErr(cmdCommit(activeFS, storeRoot, defaultUUIDGen, args[1:]))
 	case "log":
 		return runErr(cmdLog(activeFS, storeRoot, args[1:]))
+	case "blame":
+		return runErr(cmdBlame(activeFS, storeRoot, args[1:]))
+	case "tag":
+		return runErr(cmdTag(activeFS, storeRoot, defaultUUIDGen, args[1:]))
 	case "verify":
 		return cmdVerify(activeFS, storeRoot, args[1:])
 	case "fork":

@@ -183,6 +183,14 @@
 # refuses `grant_stale` at exec — until the pane's re-consent binds the
 # widened set.
 #
+# Runs 26-27 (M138c #2777): history surface on a dedicated `hist-share` —
+# the clean-share two-workspace shape (base on main, fork feature, X:=10 on
+# feature, Y:=20 on main, merge back). Run 26 builds the DAG and exercises
+# `flint blame` (per-line change-id + author attribution through the atom
+# table), `flint log --graph` (ASCII lanes over parent+merged edges), and
+# `flint tag` create/list. Run 27 re-boots the SAME share so `tag -l`
+# proves TAGS.jsonl persisted, then `tag -d` empties it.
+#
 # Run 25 (M113f #2422): the acceptance chain — ONE app taken end to end
 # in ONE boot on a pristine copy of the caps-share staging (runs 22-24
 # mutate that share). The guest script installs caprel (the signed
@@ -557,6 +565,55 @@ open(os.path.join(run, "clean-share", "FLINTJ", "07.SH"), "w", encoding="utf-8")
 )
 
 stage_merge_share(os.path.join(run, "conflict-share"), "08.SH", "09.SH", "10.SH", edit_x_conflict)
+
+# Runs 26-27 (M138c #2777): hist-share — blame, log --graph, and tags.
+# Same two-workspace fork+merge shape as clean-share: base on main, fork
+# feature, X:=10 on feature, Y:=20 on main, merge -> the DAG carries one
+# fork lane and one merge edge. Run 26 builds history and exercises the
+# new verbs; run 27 re-boots the SAME share so `tag -l` proves the tag
+# file survived (and blame/graph re-render over the persisted store).
+hist_share = os.path.join(run, "hist-share")
+for sub in ("SRCA", "SRCB", "FLINTJ"):
+    os.makedirs(os.path.join(hist_share, sub), exist_ok=True)
+for name in ("FLINT.ELF", "GOSH.ELF"):
+    shutil.copy(os.path.join(".build", "go", name), os.path.join(hist_share, name))
+open(os.path.join(hist_share, "SECRETS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nagent-sign\t1000\t" + SEED_HEX + "\tFLINT.ELF\n"
+)
+open(os.path.join(hist_share, "OWNERS.TXT"), "w", encoding="utf-8").write(
+    "#v1\nFLINT.ELF\t644\t0\t-\n"
+)
+open(os.path.join(hist_share, "SRCA", "calc.go"), "w", encoding="utf-8").write(base_calc)
+open(os.path.join(hist_share, "SRCB", "calc.go"), "w", encoding="utf-8").write(base_calc)
+open(os.path.join(hist_share, "FLINTJ", "edit-b.go"), "w", encoding="utf-8").write(edit_x_feat)
+open(os.path.join(hist_share, "FLINTJ", "edit-a.go"), "w", encoding="utf-8").write(edit_y_main)
+open(os.path.join(hist_share, "FLINTJ", "26.SH"), "w", encoding="utf-8").write(
+    "FLINT.ELF init --name=a --src=/host/SRCA\n"
+    "FLINT.ELF add /host/SRCA\n"
+    "FLINT.ELF commit -m base\n"
+    "FLINT.ELF fork main feature\n"
+    "FLINT.ELF init --name=b --src=/host/SRCB --stream=feature\n"
+    "cat /host/FLINTJ/edit-b.go > /host/SRCB/calc.go\n"
+    "FLINT.ELF add /host/SRCB\n"
+    "FLINT.ELF commit --ws=b -m feat\n"
+    "cat /host/FLINTJ/edit-a.go > /host/SRCA/calc.go\n"
+    "FLINT.ELF add /host/SRCA\n"
+    "FLINT.ELF commit -m main\n"
+    "FLINT.ELF merge feature\n"
+    "FLINT.ELF tag --ws=a v1\n"
+    "FLINT.ELF tag -l\n"
+    "FLINT.ELF log --graph --stream=main\n"
+    "FLINT.ELF blame --ws=a /host/SRCA/calc.go\n"
+    "echo M138C-1-DONE\n"
+)
+open(os.path.join(hist_share, "FLINTJ", "27.SH"), "w", encoding="utf-8").write(
+    "FLINT.ELF tag -l\n"
+    "FLINT.ELF log --graph --stream=main\n"
+    "FLINT.ELF blame --ws=a /host/SRCA/calc.go\n"
+    "FLINT.ELF tag -d v1\n"
+    "FLINT.ELF tag -l\n"
+    "echo M138C-2-DONE\n"
+)
 open(os.path.join(run, "conflict-share", "FLINTJ", "10.SH"), "w", encoding="utf-8").write(
     "cat /host/FLINTJ/edit-a.go > /host/SRCA/calc.go\n"
     "FLINT.ELF add /host/SRCA\n"
@@ -2700,4 +2757,77 @@ if not p or p[1] != "caprel" or p[2] != author:
              % (p, author))
 print("run-25 verified: declare -> consent -> measured exec -> audit "
       "receipt -> viewer, one app, one boot")
+PY
+
+# ---- 26-27: M138c (#2777) — blame, log --graph, tags -----------------------
+# A self-contained fork+merge history on its own share: base on main,
+# feature fork (X:=10), main edit (Y:=20), merge back. Run 26 builds the
+# DAG and exercises the new verbs end to end; run 27 re-boots the SAME
+# share so `tag -l` proves TAGS.jsonl persisted and the history verbs
+# re-render over the store bytes alone.
+vgate_file script-26.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/26.SH"
+EOF
+
+vgate_file script-27.txt <<'EOF'
+exec GOSH.ELF -c "source /host/FLINTJ/27.SH"
+EOF
+
+vgate_run 26 -- \
+    --cvc-file '$RUN_DIR/hist-share' \
+    --virtio-fs '$RUN_DIR/hist-share' \
+    --script '$RUN_DIR/script-26.txt' \
+    --script-expect 'M138C-1-DONE' --script-expect-tail 3 --timeout 240
+
+vgate_assert 26 serial-contains 'flint: commit ok id='
+vgate_assert 26 serial-contains 'flint: fork ok stream=feature head='
+vgate_assert 26 serial-contains 'flint: merge ok conflicts=0'
+# tag: create prints ok, list resolves the stream name.
+vgate_assert 26 serial-contains 'flint: tag ok v1 '
+vgate_assert 26 serial-contains 'flint: tag v1 '
+vgate_assert 26 serial-contains ' main'
+vgate_assert 26 serial-contains 'flint: tags 1'
+# graph: the merge node opens the feature lane (`|\`), the fold lands on
+# base (`|/`), and the tagged head annotates.
+vgate_assert 26 serial-contains 'flint: graph * '
+vgate_assert 26 serial-contains 'flint: graph |\'
+vgate_assert 26 serial-contains 'flint: graph |/'
+vgate_assert 26 serial-contains '(tag: v1)'
+vgate_assert 26 serial-contains 'flint: graph *'
+# blame: per-line `flint: blame <id> <author8> <text>` — the merge change
+# touched atom X and the main commit touched atom Y.
+vgate_assert 26 serial-contains 'flint: blame '
+vgate_assert 26 serial-contains ' d75a9801 func X() int {'
+vgate_assert 26 serial-contains ' d75a9801 func Y() int {'
+vgate_assert 26 serial-contains 'flint: blame - - package calc'
+vgate_assert 26 serial-absent 'flint: refuse'
+vgate_assert 26 serial-absent '[EXC] parking:'
+vgate_assert 26 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+
+vgate_run 27 -- \
+    --cvc-file '$RUN_DIR/hist-share' \
+    --virtio-fs '$RUN_DIR/hist-share' \
+    --script '$RUN_DIR/script-27.txt' \
+    --script-expect 'M138C-2-DONE' --script-expect-tail 3 --timeout 240
+
+# The reboot leg: v1 survived the restart on the same share, graph and
+# blame re-render identically, and -d removes it for real.
+vgate_assert 27 serial-contains 'flint: tag v1 '
+vgate_assert 27 serial-contains 'flint: tags 1'
+vgate_assert 27 serial-contains 'flint: graph |\'
+vgate_assert 27 serial-contains 'flint: graph |/'
+vgate_assert 27 serial-contains ' d75a9801 func X() int {'
+vgate_assert 27 serial-contains 'flint: tag rm v1'
+vgate_assert 27 serial-contains 'flint: tags 0'
+vgate_assert 27 serial-absent 'flint: refuse'
+vgate_assert 27 serial-absent '[EXC] parking:'
+vgate_assert 27 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 27 python <<'PY'
+import json, os, sys
+share = os.path.join(os.environ["RUN_DIR"], "hist-share")
+p = os.path.join(share, "FLINT", "TAGS.jsonl")
+rows = [json.loads(l) for l in open(p) if l.strip()]
+if rows != []:
+    sys.exit("TAGS.jsonl should be empty after tag -d v1: %r" % rows)
+print("run-27 verified: tag persisted across the reboot, -d emptied TAGS.jsonl")
 PY

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -139,23 +140,52 @@ func firstMessageLine(msg string) string {
 	return strings.TrimSuffix(msg, "\r")
 }
 
-// cmdLog implements `flint log [--stream=<name>] [--ws=<name>]`.
+// cmdLog implements `flint log [--stream=<name>] [--ws=<name>] [--graph]
+// [--all]`. `--graph` renders the Change DAG as ASCII lanes (M138c #2777);
+// `--all` seeds the walk at every stream head instead of the resolved one.
 func cmdLog(fs FS, root string, args []string) error {
 	var streamFlag, wsFlag string
+	graph, all := false, false
 	for _, a := range args {
 		switch {
 		case strings.HasPrefix(a, "--stream="):
 			streamFlag = a[len("--stream="):]
 		case strings.HasPrefix(a, "--ws="):
 			wsFlag = a[len("--ws="):]
+		case a == "--graph":
+			graph = true
+		case a == "--all":
+			all = true
 		default:
 			return refuse("usage", "")
 		}
+	}
+	if all && streamFlag != "" {
+		return refuse("usage", "")
 	}
 
 	idx, err := LoadStoreIndex(fs, root)
 	if err != nil {
 		return err
+	}
+
+	if all {
+		ids := make([]string, 0, len(idx.StreamsByID))
+		for id := range idx.StreamsByID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		var seeds []string
+		for _, id := range ids {
+			st, _, err := LoadStream(fs, root, id)
+			if err != nil {
+				return err
+			}
+			if st.Head != nil && *st.Head != "" {
+				seeds = append(seeds, *st.Head)
+			}
+		}
+		return logGraph(fs, root, idx, seeds)
 	}
 
 	var streamID string
@@ -173,9 +203,16 @@ func cmdLog(fs FS, root string, args []string) error {
 		streamID = ws.Stream
 	}
 
-	_, changes, err := LoadStream(fs, root, streamID)
+	st, changes, err := LoadStream(fs, root, streamID)
 	if err != nil {
 		return err
+	}
+	if graph {
+		var seeds []string
+		if st.Head != nil && *st.Head != "" {
+			seeds = append(seeds, *st.Head)
+		}
+		return logGraph(fs, root, idx, seeds)
 	}
 
 	const logCap = 64

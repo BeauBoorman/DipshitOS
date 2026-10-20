@@ -3,7 +3,13 @@
 # the guest on VZ: FLINT.ELF init, every source byte entered through GOEDIT
 # editor sessions, GOBUILD.ELF compiles the guest's own toolchain output,
 # the guest-built product runs and diffs, and in-guest FLINT add/diff/
-# commit/push lands the history on flintd. The host then verifies the
+# commit/push lands the history on flintd.
+#
+# Run 09 (M138c #2777): the guest-built GODIFF.ELF's `-i` viewer opens
+# under the seat, an 's' chord toggles the side-by-side mode, and a
+# scanout probe pins the aligned-hunk signature: on every painted row
+# that carries both change colors, the red removal cell sits strictly
+# left of the green addition cell. The host then verifies the
 # pushed stream byte-for-byte, `flint verify --all`, and pins every
 # Change's author key to the guest's agent-sign key.
 #
@@ -97,6 +103,10 @@ EOF
 
 vgate_file script-buildrun.txt <<'EOF'
 exec GOSH.ELF -c "source /host/BUILD.SH"
+EOF
+
+vgate_file script-side.txt <<'EOF'
+exec GODIFF.ELF -i /host/DA.TXT /host/DB.TXT
 EOF
 
 vgate_file script-push.txt <<'EOF'
@@ -346,7 +356,7 @@ print("godiff-loop staged: %d chunks across %d authoring runs, feeder "
       "pid=%d, flintd up" % (n_chunks, len(feeds), feed_proc.pid))
 PY
 
-# ---- 01: flint init + GOEDIT authors diff.go (9 chunks, ~500 B each) -------
+# ---- 01: flint init + GOEDIT authors diff.go (18 chunks, ~500 B each) ------
 # init runs before the seat so the workspace exists when the editor opens
 # it; the init exec and seat exec are independent tasks.
 vgate_run 01 -- \
@@ -355,15 +365,15 @@ vgate_run 01 -- \
     --script2 '$RUN_DIR/script-open-diff.txt' --script2-after 'gotabwm: hostint armed' \
     --host-clipboard --host-pasteboard 'virelai-gate-godiff' \
     --via-virtio \
-    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
+    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
     --input-chords-after 'gotabwm: hostint clip-in seq=1' \
     --script-expect 'goedit: saved /host/GODIFF/diff.go' --script-expect-tail 4 \
     --timeout 300
 
 vgate_assert 01 serial-contains 'flint: init ok ws=godiff stream=main'
 vgate_assert 01 serial-contains 'goedit: present'
-vgate_assert 01 serial-count 'gotabwm: hostint clip-in seq=' 9
-vgate_assert 01 serial-count 'goedit: paste n=' 9
+vgate_assert 01 serial-count 'gotabwm: hostint clip-in seq=' 18
+vgate_assert 01 serial-count 'goedit: paste n=' 18
 vgate_assert 01 serial-contains 'goedit: saved /host/GODIFF/diff.go'
 vgate_assert 01 serial-absent '[EXC] parking:'
 # The workspace file must be byte-identical to the canonical source — the
@@ -380,20 +390,20 @@ if got != want:
 print("run-01: diff.go authored byte-identical through GOEDIT pastes")
 PY
 
-# ---- 02: GOEDIT authors main.go (5 chunks) -----------------------------------
+# ---- 02: GOEDIT authors main.go (13 chunks) ----------------------------------
 vgate_run 02 -- \
     --screen '$RUN_DIR/screen-02' \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-open-main.txt' --script2-after 'gotabwm: hostint armed' \
     --host-clipboard --host-pasteboard 'virelai-gate-godiff' \
     --via-virtio \
-    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
+    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
     --input-chords-after 'gotabwm: hostint clip-in seq=1' \
     --script-expect 'goedit: saved /host/GODIFF/main.go' --script-expect-tail 4 \
     --timeout 240
 
-vgate_assert 02 serial-count 'gotabwm: hostint clip-in seq=' 5
-vgate_assert 02 serial-count 'goedit: paste n=' 5
+vgate_assert 02 serial-count 'gotabwm: hostint clip-in seq=' 13
+vgate_assert 02 serial-count 'goedit: paste n=' 13
 vgate_assert 02 serial-contains 'goedit: saved /host/GODIFF/main.go'
 vgate_assert 02 serial-absent '[EXC] parking:'
 vgate_assert 02 python <<'PY'
@@ -454,19 +464,19 @@ vgate_assert 04 serial-contains 'flint: commit ok id='
 vgate_assert 04 serial-absent '[EXC] parking:'
 vgate_assert 04 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
 
-# ---- 05: GOEDIT appends the test tail (the fixup edit, 1 chunk) --------------
+# ---- 05: GOEDIT appends the test tail (the fixup edit, 6 chunks) -------------
 vgate_run 05 -- \
     --screen '$RUN_DIR/screen-05' \
     --script '$RUN_DIR/script-seat.txt' \
     --script2 '$RUN_DIR/script-open-test.txt' --script2-after 'gotabwm: hostint armed' \
     --host-clipboard --host-pasteboard 'virelai-gate-godiff' \
     --via-virtio \
-    --input-chords 'ctrl-v,f5,f5,ctrl-s' \
+    --input-chords 'ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,f5,f5,ctrl-v,f5,f5,ctrl-s' \
     --input-chords-after 'gotabwm: hostint clip-in seq=1' \
     --script-expect 'goedit: saved /host/GODIFF/diff_test.go' --script-expect-tail 4 \
     --timeout 240
 
-vgate_assert 05 serial-count 'goedit: paste n=' 1
+vgate_assert 05 serial-count 'goedit: paste n=' 6
 vgate_assert 05 serial-contains 'goedit: saved /host/GODIFF/diff_test.go'
 vgate_assert 05 serial-absent '[EXC] parking:'
 vgate_assert 05 python <<'PY'
@@ -584,4 +594,122 @@ if rec.get("head") != json.loads(lines[-1]).get("id"):
              % (rec.get("head"), lines[-1]))
 print("run-08: 2 guest-signed Changes byte-verbatim, all authors = guest "
       "agent-sign key, host verify sig:verified x2, head rolled")
+PY
+
+# ---- 09: M138c (#2777) — `-i` viewer + 's' toggles side-by-side -----------
+# The product of run 06 is already on the share (state persists across
+# boots): the seat comes up first, then the app opens its window, an 's'
+# chord flips unified -> side-by-side, and the post-repaint scanout is the
+# pixel proof of aligned hunks — red cells strictly left of green cells on
+# every row that carries both.
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-side.txt' --script2-after 'gotabwm: hostint armed' \
+    --input-chords 's' \
+    --input-chords-after 'godiff: ready' \
+    --screenshot-after 'godiff: repainted' \
+    --script-expect 'godiff: repainted' --script-expect-tail 4 --timeout 300
+
+vgate_assert 09 serial-contains 'exec: loaded GODIFF.ELF'
+vgate_assert 09 serial-contains 'godiff: open id='
+vgate_assert 09 serial-contains 'godiff: attached'
+vgate_assert 09 serial-contains 'godiff: painted'
+vgate_assert 09 serial-contains 'godiff: ready'
+vgate_assert 09 serial-contains 'godiff: key s'
+vgate_assert 09 serial-contains 'godiff: view side-by-side'
+vgate_assert 09 serial-contains 'godiff: repainted'
+vgate_assert 09 serial-absent 'godiff: error'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
+# The pixel probe: side-by-side paints each change row as red-removal on
+# the left cell and green-addition on the right cell, so every scanline
+# carrying BOTH colors must show all its red strictly left of all its
+# green; the unified view this run toggled AWAY from never produces a
+# two-color row. At least one qualifying row must exist (the -beta/+BETA
+# pair in DA.TXT/DB.TXT).
+vgate_assert 09 snapshot 'screen-09-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8, "unexpected PNG depth"
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+assert (w, h) == (2560, 1440), "wanted 2560x1440 scanout, got %dx%d" % (w, h)
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            row[x] = (row[x] + ((left + up) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            row[x] = (row[x] + (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)) & 0xff
+    out += row
+    prev = row
+
+def is_red(r, g, b):
+    return r > 170 and g < 110 and b < 110
+
+def is_green(r, g, b):
+    return g > 150 and r < 120 and b < 120
+
+paired = 0
+red_total = green_total = 0
+for y in range(h):
+    rmin = rmax = gmin = gmax = -1
+    for x in range(w):
+        k = (y * w + x) * bpp
+        r, g, b = out[k], out[k + 1], out[k + 2]
+        if is_red(r, g, b):
+            red_total += 1
+            if rmin < 0:
+                rmin = x
+            rmax = x
+        if is_green(r, g, b):
+            green_total += 1
+            if gmin < 0:
+                gmin = x
+            gmax = x
+    if rmin >= 0 and gmin >= 0:
+        if rmax >= gmin:
+            sys.exit("row %d: red x<=%d overlaps green x>=%d - not side-by-side"
+                     % (y, rmax, gmin))
+        paired += 1
+print("godiff side-by-side scanout: paired rows=%d red=%d green=%d"
+      % (paired, red_total, green_total))
+assert paired >= 1, "no row carries red-left-of-green - unified view leaked?"
+assert red_total >= 20 and green_total >= 20, "change colors absent"
 PY

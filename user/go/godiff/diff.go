@@ -189,3 +189,165 @@ func Diff(srcA, srcB string, ctx int) (text string, differ bool, tooBig bool) {
 	}
 	return sb.String(), true, false
 }
+
+// ---- interactive viewer renderers (M138c #2777) ---------------------------
+//
+// The `-i` mode repaints one full frame per key into a bound /dev/tty, so
+// each renderer returns a COMPLETE frame: alt-screen prologue, clear+home,
+// the header row, then `rows` content rows starting at `scroll`. The SGR
+// set is gitui render.go's hand-rolled palette — the same colors the
+// history surface already uses (magenta identity, blue hunk headers, red
+// removals, green additions, truecolour ink).
+
+const (
+	colReset  = "\x1b[0m"
+	colHeader = "\x1b[1;95m"             // bold magenta: app identity
+	colInk    = "\x1b[38;2;230;230;230m" // truecolour white: context lines
+	colDim    = "\x1b[38;2;130;130;130m" // truecolour gray: separator, help
+	colPlus   = "\x1b[92m"               // green: added lines
+	colMinus  = "\x1b[1;91m"             // red: removed lines
+	colHunk   = "\x1b[94m"               // blue: hunk headers
+)
+
+const framePrologue = "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"
+
+// fitCell clips s to w display cells (rune-aware; a clipped cell ends in
+// '…') and pads short content with spaces so columns stay aligned.
+func fitCell(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	runes := 0
+	for range s {
+		runes++
+	}
+	var b strings.Builder
+	if runes > w {
+		n := 0
+		for _, r := range s {
+			if n == w-1 {
+				break
+			}
+			b.WriteRune(r)
+			n++
+		}
+		b.WriteRune('…')
+		n++
+		for n < w {
+			b.WriteByte(' ')
+			n++
+		}
+		return b.String()
+	}
+	b.WriteString(s)
+	for runes < w {
+		b.WriteByte(' ')
+		runes++
+	}
+	return b.String()
+}
+
+// viewHeader is the row-0 identity strip, identical across views.
+func viewHeader(nameA, nameB string) string {
+	return colHeader + " GODIFF " + nameA + " | " + nameB +
+		"    s toggle · j/k scroll · q quit" + colReset
+}
+
+// renderUnified lays out the classic single-column hunk view with the
+// palette colors: ' ' ink, '-' red, '+' green, '@@' blue.
+func renderUnified(nameA, nameB string, a, b []srcline, hs []hunk, scroll, rows int) string {
+	var lines []string
+	for _, h := range hs {
+		lines = append(lines, colHunk+"@@ -"+rng(h.aPos, h.aCnt)+" +"+rng(h.bPos, h.bCnt)+" @@"+colReset)
+		for _, o := range h.ops {
+			var l srcline
+			col := colInk
+			switch o.kind {
+			case '+':
+				l = b[o.b]
+				col = colPlus
+			case '-':
+				l = a[o.a]
+				col = colMinus
+			default:
+				l = a[o.a]
+			}
+			lines = append(lines, col+string(o.kind)+l.text+colReset)
+		}
+	}
+	return frame(nameA, nameB, lines, scroll, rows)
+}
+
+// renderSideBySide lays out the aligned two-column view: context rows
+// repeat on both sides in ink, a change run pairs '-' rows on the left
+// (red) with '+' rows on the right (green), and the shorter side pads
+// with blanks so every hunk row stays aligned.
+func renderSideBySide(nameA, nameB string, a, b []srcline, hs []hunk, scroll, rows, cols int) string {
+	cellW := (cols - 3) / 2
+	if cellW < 8 {
+		cellW = 8
+	}
+	sep := colDim + " | " + colReset
+	var lines []string
+	for _, h := range hs {
+		lines = append(lines, colHunk+"@@ -"+rng(h.aPos, h.aCnt)+" +"+rng(h.bPos, h.bCnt)+" @@"+colReset)
+		for i := 0; i < len(h.ops); {
+			o := h.ops[i]
+			if o.kind == ' ' {
+				t := fitCell(a[o.a].text, cellW)
+				lines = append(lines, colInk+t+sep+t+colReset)
+				i++
+				continue
+			}
+			// gather the change run: '-' ops then '+' ops
+			var dels, adds []op
+			for i < len(h.ops) && h.ops[i].kind == '-' {
+				dels = append(dels, h.ops[i])
+				i++
+			}
+			for i < len(h.ops) && h.ops[i].kind == '+' {
+				adds = append(adds, h.ops[i])
+				i++
+			}
+			n := len(dels)
+			if len(adds) > n {
+				n = len(adds)
+			}
+			for k := 0; k < n; k++ {
+				lc, rc := strings.Repeat(" ", cellW), strings.Repeat(" ", cellW)
+				lcol, rcol := colReset, colReset
+				if k < len(dels) {
+					lc = fitCell(a[dels[k].a].text, cellW)
+					lcol = colMinus
+				}
+				if k < len(adds) {
+					rc = fitCell(b[adds[k].b].text, cellW)
+					rcol = colPlus
+				}
+				lines = append(lines, lcol+lc+colReset+sep+rcol+rc+colReset)
+			}
+		}
+	}
+	return frame(nameA, nameB, lines, scroll, rows)
+}
+
+// frame joins the header + the scrolled window of content lines into one
+// repaintable screen.
+func frame(nameA, nameB string, lines []string, scroll, rows int) string {
+	var sb strings.Builder
+	sb.WriteString(framePrologue)
+	sb.WriteString(viewHeader(nameA, nameB))
+	sb.WriteByte('\n')
+	if scroll > len(lines) {
+		scroll = len(lines)
+	}
+	end := scroll + rows
+	if end > len(lines) {
+		end = len(lines)
+	}
+	for _, l := range lines[scroll:end] {
+		sb.WriteString(l)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
