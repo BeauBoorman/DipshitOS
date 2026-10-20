@@ -134,6 +134,126 @@ test "socket core: two children, third refusal uses its own address and counts o
     try c.close(7, listener);
     try t.expectEqual(@as(usize, 0), c.liveChildren());
 }
+test "socket core: the named child bound saturates by name — lsat counts, RST answers, accept is WouldBlock" {
+    var c: core.Core = .{};
+    const listener = try init(&c);
+    var cap: Capture = .{};
+    // Two half-open children charge the bound; nothing is established,
+    // so accept has nothing to hand out — the seam's eagain row.
+    var frame = Frame.init(remote, 10, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    frame = Frame.init(other, 20, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, core.child_limit), c.liveChildren());
+    try t.expectError(error.WouldBlock, c.accept(7, listener));
+    cap.drain(&c); // flush the two SYN-ACKs so the refusal is last
+    // The N+1th SYN is the named refusal: lsat counts it, the refusal
+    // slot answers RST+ACK to the third peer's own address, and no
+    // child was minted.
+    const third: core.Endpoint = .{ .ip = .{ 10, 0, 0, 9 }, .port = 6000 };
+    frame = Frame.init(third, 30, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.listen_saturated);
+    try t.expectEqual(@as(u64, 1), c.counters.capacity_refused);
+    try t.expectEqual(@as(usize, core.child_limit), c.liveChildren());
+    cap.drain(&c);
+    try t.expectEqualDeep(third, cap.endpoint);
+    try t.expectEqual(@as(u8, wire.flag_rst | wire.flag_ack), cap.bytes[13]);
+    // The bound stays named and measured on repeat overflow.
+    frame = Frame.init(third, 40, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 2), c.counters.listen_saturated);
+    try c.close(7, listener);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+}
+test "socket core: RST mid-accept frees the slot outright — no zombie against the bound" {
+    var c: core.Core = .{};
+    const listener = try init(&c);
+    var cap: Capture = .{};
+    // SYN -> SYN-ACK: a half-open child is charged one slot.
+    var frame = Frame.init(remote, 10, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    cap.drain(&c);
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    // The peer's RST at rcv_nxt (instead of the handshake ACK) tears the
+    // never-accepted child down: the slot frees, accept is WouldBlock,
+    // and the bound admits two fresh children afterwards — nothing
+    // leaked.
+    frame = Frame.init(remote, 11, 101, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+    try t.expectError(error.WouldBlock, c.accept(7, listener));
+    frame = Frame.init(remote, 40, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    frame = Frame.init(other, 50, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, core.child_limit), c.liveChildren());
+    // An established-but-never-accepted child frees the same way — the
+    // handle never escaped the table.
+    try c.close(7, listener);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+    _ = try init(&c);
+    frame = Frame.init(remote, 60, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    cap.drain(&c);
+    frame = Frame.init(remote, 61, 101, wire.flag_ack, "");
+    try frame.inject(&c, 0); // handshake completes: established, unaccepted
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    frame = Frame.init(remote, 61, 101, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+    try t.expectError(error.WouldBlock, c.accept(7, c.listener.?.handle));
+}
+test "socket core: RST teardown keeps the accepted/active-open/legacy terminal contracts" {
+    var c: core.Core = .{};
+    _ = try init(&c);
+    var cap: Capture = .{};
+    const h = try establish(&c, &cap, remote, 0); // established + accepted
+    // A wrong-sequence RST is a duplicate, not a teardown.
+    var frame = Frame.init(remote, 99, 101, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.duplicates);
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    // In-sequence RST on an ACCEPTED child: terminal .reset, still
+    // charged until close — the owner holds the handle.
+    frame = Frame.init(remote, 11, 101, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expect((try c.ready(7, h)).terminal);
+    try t.expectEqual(core.Outcome.reset, try c.status(7, h));
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    try c.close(7, h);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+    // An active-open connection holds its handle the same way.
+    const opened = try c.open(8, .{ .ip = .{ 10, 0, 0, 1 }, .port = 8000 }, .{ .ip = .{ 10, 0, 0, 2 }, .port = 9000 }, peer_mac, 0, 700);
+    cap.drain(&c);
+    frame = Frame.initTo(.{ .ip = .{ 10, 0, 0, 1 }, .port = 8000 }, .{ .ip = .{ 10, 0, 0, 2 }, .port = 9000 }, 0, 701, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    try t.expectEqual(core.Outcome.reset, try c.status(8, opened));
+    try c.close(8, opened);
+    // A legacy listener's ESTABLISHED unaccepted child keeps the
+    // terminal verdict the slot-30 drain arm reads; only its half-open
+    // children free outright.
+    const legacy = try init(&c);
+    try c.markLegacy(7, legacy);
+    frame = Frame.init(remote, 60, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    cap.drain(&c);
+    frame = Frame.init(remote, 61, 101, wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    frame = Frame.init(remote, 61, 101, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 1), c.liveChildren());
+    const dead = try c.accept(7, legacy);
+    try t.expectEqual(core.Outcome.reset, try c.status(7, dead));
+    try c.close(7, dead);
+    frame = Frame.init(remote, 70, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    frame = Frame.init(remote, 71, 101, wire.flag_rst | wire.flag_ack, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+    try c.close(7, legacy);
+}
 test "socket core: partial reads, the honest window and exact sequence prevent duplicate delivery" {
     var c: core.Core = .{};
     _ = try init(&c);

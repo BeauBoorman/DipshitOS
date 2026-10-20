@@ -13,6 +13,7 @@ const udp = @import("udp.zig");
 const csprng = @import("csprng.zig");
 const ipv6 = @import("ipv6.zig"); // M117c (#2475): the v6 TCP claim + legacyOpen6
 const grant = @import("grant.zig"); // M117e (#2477): the net-scope check at the open ops
+const klog = @import("klog.zig"); // M135c (#2765): the listen-saturated serial marker
 pub var sockets: core.Core = .{};
 /// M97e-F5 (#2104): the DNS transaction's client port is a FRESH
 /// ephemeral draw per query (the IANA dynamic range 49152..65535) — a
@@ -52,12 +53,24 @@ pub fn now() u64 {
 /// table consumed it (its own parse/counts — the singleton never sees it).
 /// Registered the first time the table is polled; the kernel-internal
 /// singleton is untouched until then.
+/// M135c (#2765): one serial marker per saturating SYN — the counter
+/// diff names the event, the port names the saturated listener, the
+/// bound names itself. klog is a polled-uart write, safe inside the RX
+/// drain's domain hold.
+fn noteSaturated(before: u64, port: u16) void {
+    if (sockets.counters.listen_saturated == before) return;
+    var buf: [80]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "net: listen-saturated port={d} bound={d}\n", .{ port, core.child_limit }) catch "net: listen-saturated\n";
+    klog.line(line);
+}
 fn claimTcpFrame(frame: []const u8) bool {
     if (frame.len < core.wire.frame_min or frame[12] != 8 or frame[13] != 0 or
         frame[14] != 0x45 or frame[23] != core.wire.protocol_tcp) return false;
     const port = std.mem.readInt(u16, frame[36..38], .big);
     if (!sockets.tableOwns(port)) return false;
+    const saturated = sockets.counters.listen_saturated;
     sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
+    noteSaturated(saturated, port);
     return true;
 }
 /// M117c (#2475): the v6 half of `claimTcpFrame` — `ipv6.zig`'s terminal
@@ -72,7 +85,9 @@ fn claimTcp6Frame(frame: []const u8) bool {
     if (!ipv6.is_owned(&dst)) return false; // not ours — foreign, not a drop
     const port = std.mem.readInt(u16, frame[14 + ipv6.ipv6_hdr_len + 2 ..][0..2], .big);
     if (!sockets.tableOwns(port)) return false;
+    const saturated = sockets.counters.listen_saturated;
     sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
+    noteSaturated(saturated, port);
     return true;
 }
 pub fn registerTableRx() void {

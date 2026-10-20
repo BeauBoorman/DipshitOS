@@ -11,7 +11,24 @@
 # runs -- document if a host's NAT drops instead of RSTing).
 
 vgate_name live-net-tcp "RFC 793 lifecycle + timeout + NAT observation on VZ"
+# M135c (#2765): the share arms seed + SPIKE so runs E/F stage GOHTTPD.ELF
+# (and GONETSTAT.ELF for the slot-drain evidence) — runs A-D are unchanged.
+vgate_share seed
+vgate_runner_flags -Xswiftc -DSPIKE
 vgate_fmt boot/src/*.zig kernel/src/*.zig build.zig
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+os.makedirs(share, exist_ok=True)
+for elf, hint in (("GOHTTPD.ELF", "tools/go/build-gohttpd.sh"),
+                  ("GONETSTAT.ELF", "tools/go/build-netdiag.sh")):
+    src = os.path.join(".build", "go", elf)
+    if not os.path.exists(src):
+        sys.exit("%s missing (expected %s) - build it first: bash %s" % (elf, src, hint))
+    shutil.copy(src, os.path.join(share, elf))
+    print("live-net-tcp: staged %s" % elf)
+PY
 
 vgate_file a1.txt <<'EOF'
 net ip 10.0.0.1
@@ -255,4 +272,122 @@ for i, f in enumerate(tcpf):
     assert chk(ps + seg) == 0, ("tcp checksum", i)
 assert tcpf[2][47] == 0x10 and tcpf[2][54:59] == bytes([1, 2, 3, 4, 5]), "data"
 print("tcp D options-mode lifecycle + guest-side walk ok")
+PY
+
+# ---- Runs E/F (M135c #2765): the named listen bound -------------------
+# E: N+1=3 simultaneous host connects against GOHTTPD's handle listener —
+# child_limit=2 admit two children, the third SYN gets the named RST
+# refusal; the kernel prints the 'listen-saturated' marker and the
+# sock-diag row carries lbound/lsat; GONETSTAT's sock diff shows the
+# children draining back to listener-only after close.
+# F: a stream client whose probe exits nonzero sends RST right after the
+# handshake — mid-accept — and the unaccepted child frees its slot
+# instead of charging a zombie (the conn-diag tombstone is the receipt).
+
+vgate_file e1.txt <<'EOF'
+net ip 10.0.0.1
+exec GONETSTAT.ELF
+exec GOHTTPD.ELF
+EOF
+
+vgate_file e2.txt <<'EOF'
+procs
+kill GOHTTPD.ELF
+echo m135c-sat-done
+EOF
+
+vgate_file f1.txt <<'EOF'
+net ip 10.0.0.1
+exec GONETSTAT.ELF
+exec GOHTTPD.ELF
+EOF
+
+vgate_file f2.txt <<'EOF'
+procs
+echo m135c-rst-done
+EOF
+
+vgate_file req-a.txt <<'EOF'
+GET / HTTP/1.1
+Connection: close
+
+EOF
+
+vgate_file req-b.txt <<'EOF'
+GET /B HTTP/1.1
+Connection: close
+
+EOF
+
+vgate_file req-c.txt <<'EOF'
+GET /C HTTP/1.1
+Connection: close
+
+EOF
+
+vgate_run E -- --net '$RUN_DIR/e-cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/req-a.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/req-b.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/req-c.txt' \
+    --net-tcp-connect-after 'httpd: listening on port 8080' \
+    --script '$RUN_DIR/e1.txt' \
+    --script2 '$RUN_DIR/e2.txt' --script2-after 'httpd: listening on port 8080' --script2-delay 25 \
+    --script-expect 'm135c-sat-done' --timeout 150
+
+vgate_assert E serial-contains 'httpd: listening on port 8080'
+vgate_assert E serial-contains 'net: listen-saturated port=8080 bound=2'
+vgate_assert E serial-contains 'lbound=2 lsat=1'
+vgate_assert E serial-contains 'netstat: '
+vgate_assert E serial-contains 'kill: GOHTTPD.ELF armed'
+vgate_assert E output-contains 'NET-TCP-CONNECT: the guest refused the connection (RST)'
+vgate_assert E serial-absent '[EXC] parking:'
+vgate_assert E python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+for marker, want in (("httpd: accepted", 2), ("httpd: closed", 2)):
+    n = ser.count(marker)
+    if n != want:
+        sys.exit("FAIL: %r appeared %d times, want %d" % (marker, n, want))
+out = open(os.path.join(os.environ["RUN_DIR"], "run-E.out"), errors="replace").read()
+if out.count("the guest refused the connection (RST)") != 1:
+    sys.exit("FAIL: refusal count %d, want exactly 1" % out.count("the guest refused the connection (RST)"))
+# Slot drain: the LAST netstat sock row shows the listener alone —
+# every accepted child released its table slot on close.
+sock_lines = [l for l in ser.splitlines() if "netstat: sock " in l]
+if not sock_lines:
+    sys.exit("FAIL: no netstat sock rows at all")
+last = sock_lines[-1]
+if "listen 10.0.0.1:8080" not in last or " tcp " in last:
+    sys.exit("FAIL: final sock row is not listener-only: %r" % last)
+print("saturation: 2 accepted, 1 named refusal, slots drained to listener-only")
+PY
+
+vgate_run F -- --net '$RUN_DIR/f-cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect '10.0.0.1:8080' \
+    --net-tcp-connect-stream /bin/false \
+    --net-tcp-connect-after 'httpd: listening on port 8080' \
+    --script '$RUN_DIR/f1.txt' \
+    --script2 '$RUN_DIR/f2.txt' --script2-after 'httpd: bye' --script2-delay 2 \
+    --script-expect 'm135c-rst-done' --timeout 150
+
+vgate_assert F serial-contains 'httpd: listening on port 8080'
+vgate_assert F output-contains 'NET-TCP-STREAM: the viewer died; sent RST'
+vgate_assert F serial-contains 'net: conn-diag'
+vgate_assert F serial-contains 'lport=8080'
+vgate_assert F serial-contains 'httpd: bye'
+vgate_assert F serial-absent '[EXC] parking:'
+vgate_assert F python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# The RST'd child never leaked: no conn row survives the teardown, the
+# conn-diag tombstone recorded it, and saturation never fired on a leg
+# with no overflow.
+sock_lines = [l for l in ser.splitlines() if "netstat: sock " in l]
+if sock_lines and " tcp " in sock_lines[-1]:
+    sys.exit("FAIL: a conn row survived the RST teardown: %r" % sock_lines[-1])
+if ser.count("httpd: accepted") > 1:
+    sys.exit("FAIL: accepted count %d" % ser.count("httpd: accepted"))
+if "net: listen-saturated" in ser:
+    sys.exit("FAIL: saturation counted on a leg with no overflow")
+print("rst mid-accept: slot freed, listener kept serving, no leak")
 PY
