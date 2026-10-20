@@ -167,6 +167,9 @@ func writeSession() bool {
 	sessionDirty = false
 	sessionSeq++
 	vi.ConsoleLine(MarkerSessionWrite + vi.Itoa64(int64(live.count)))
+	// M137a: the pane tree rides beside the records — published or
+	// cleared at the same point so the pair never disagrees.
+	writePanesFile()
 	return true
 }
 
@@ -207,6 +210,9 @@ func loadSession() sessionLoadState {
 	if tabs.Count() == 0 {
 		return state
 	}
+	// M137a: the sidecar decodes against the restored rows (leaf record
+	// index -> tabs[i]) before any re-exec or adoption renames the ids.
+	loadPanesFile()
 	// Placeholder ids (sessionIDBase+) are not kernel windows. Leave
 	// hostedApp=0 so a later Wmctl* cannot aim at 0x100+i until adoption
 	// swaps in a real id. stripDone skips the live choreography that
@@ -330,6 +336,9 @@ func adoptReexec(pid uint8, id uint32) int {
 			return -1
 		}
 		tabs.tabs[idx].ID = id
+		// M137a: a pane leaf named by the dead placeholder id follows
+		// the swap to the live window id.
+		tabs.retreeID(phid, id)
 		return idx
 	}
 	return -1
@@ -448,6 +457,12 @@ func finishReexec() {
 		}
 	}
 	vi.ConsoleLine(MarkerSessionLive + vi.Itoa64(int64(live)))
+	// M137a: a restored tree applies its pane rects to the adopted
+	// windows once the placeholder swap has settled — the sidecar's
+	// layout is real geometry, not just a LAYOUT.txt shape.
+	if tabs.treeN != 0 {
+		_ = applyTreeRects()
+	}
 	dumpOrder()
 	_ = writeLayoutFile()
 }

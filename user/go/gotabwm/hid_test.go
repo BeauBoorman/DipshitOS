@@ -1091,7 +1091,7 @@ func TestSashDragPointerPath(t *testing.T) {
 	if !sashDragging || contentDown {
 		t.Fatal("armed motion must stay armed and content-free")
 	}
-	if tabs.sash != 0 {
+	if tabs.tree[0].sash != 0 {
 		t.Fatal("motion must not move the divider (release-edge commit only)")
 	}
 	// Release at x=800 commits: the gutter pair goes out and the sash sticks.
@@ -1099,8 +1099,8 @@ func TestSashDragPointerPath(t *testing.T) {
 	if sashDragging {
 		t.Fatal("release must disarm")
 	}
-	if tabs.sash != 800 {
-		t.Fatalf("sash = %d want 800", tabs.sash)
+	if tabs.tree[0].sash != 800 {
+		t.Fatalf("sash = %d want 800", tabs.tree[0].sash)
 	}
 	// Left pane at the origin: 1 call. Right pane off-origin: the
 	// two-step shrink-then-move, 2 calls.
@@ -1135,7 +1135,7 @@ func TestSashReleaseOnArmedPositionIsNoop(t *testing.T) {
 		t.Fatal("divider down must arm")
 	}
 	handleWmPointer(ptrEvent(640, 100, 0))
-	if sashDragging || tabs.sash != 0 {
+	if sashDragging || tabs.tree[0].sash != 0 {
 		t.Fatal("same-position release must disarm without storing")
 	}
 	if len(*calls) != 0 {

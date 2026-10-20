@@ -140,6 +140,18 @@ func main() {
 		vi.ConsoleLine("wmrpcprobe: bad-token refused")
 	}
 
+	// M137a (#2771, ADR 0007 R2): kind 29 is AGENTD-only. This sender is
+	// bound and honest — the refusal must be agent_input_denied, not an
+	// auth refusal: the session token is real, the principal is not.
+	var agentTitle [vi.WmRpcTitleMax]byte
+	agentTitle[0] = 'k' // key event, usage 0x28 (enter)
+	agentTitle[2] = 0x28
+	if vi.WmMailRequest(29, uint32(id), 0, 0, 0, 0,
+		string(agentTitle[:]), selfName) {
+		fail("agent_input applied from a non-AGENTD sender")
+	}
+	vi.ConsoleLine("wmrpcprobe: agent-input refused")
+
 	vi.ConsoleLine("wmrpcprobe: auth probe ok")
 	vi.Exit(0)
 }

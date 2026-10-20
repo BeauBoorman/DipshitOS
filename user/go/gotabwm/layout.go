@@ -20,34 +20,25 @@ func layoutBin(t Tab) string {
 }
 
 // layoutFileBody is the LAYOUT.txt payload for s. Empty strip yields nil
-// (do not write an empty file over a good dump). Split is only settable at
-// n==2; otherwise every tab reports the full viewport (headless fallback).
+// (do not write an empty file over a good dump). M137a: one rect per
+// PANE — a tab with a leaf carries its computed rect and its parent
+// split kind; a tab the tree does not hold (opened after the layout, or
+// dissolved by an unsplit) reports the headless full-viewport fallback
+// with split=none, exactly the shape every pre-tree dump already wrote.
 func layoutFileBody(s *TabStrip, scanW, scanH uint32) []byte {
 	n := s.Count()
 	if n == 0 {
 		return nil
 	}
-	kind := s.Split()
 	full := FullRect(scanW, scanH)
-	ra, rb := full, full
-	two := false
-	if n == 2 {
-		a, b, ok := s.PaneRects(scanW, scanH)
-		if ok {
-			ra, rb, two = a, b, true
-		}
-	}
 	fid, has := s.Focused()
 	out := make([]byte, 0, n*96)
 	for i := 0; i < n; i++ {
 		t := s.At(i)
-		r := full
-		if two {
-			if i == 0 {
-				r = ra
-			} else {
-				r = rb
-			}
+		r, placed := s.rectOf(t.ID, scanW, scanH)
+		kind := s.paneParentKind(t.ID)
+		if !placed {
+			r, kind = full, SplitNone
 		}
 		line := layoutLine(t.ID, layoutBin(t), r, has && t.ID == fid, kind)
 		out = append(out, line...)

@@ -135,3 +135,52 @@ cap, so a session with blobs still loads whole and still bundles.
 (`ClosedTab`); ctrl-shift-t stages it on the exec'd pid — pid-matched
 like M120b's `reexecWait` — and the declaring app adopts it onto its new
 row before its `restore_state` request hands it back.
+
+## Amendment (card #2771): the split is a tree
+
+**D11. A tab's viewport divides recursively.** The M62c two-pane model —
+one `SplitKind` plus one sash — is the depth-1 case of a fixed-pool
+binary tree (`tree.go`): internal nodes split their rect `v`/`h` at a
+sash position, leaves host one strip tab each, and `SplitRectsSash` is
+one node's math. Depth 3 (three nested splits) and 8 panes are the
+bounds; both are enforced at mutation so no reachable shape is
+untileable. Pane minimum 160×120 holds inside every node rect, not just
+the scanout.
+
+**D12. Panes follow tabs, not slots.** A leaf names its hosted tab by
+window id and `relinkLeaves` re-binds leaf order to strip position after
+a reorder or pin — the pane the app lives in travels with it, exactly the
+M79c reorder contract generalized. A close splices the leaf out (the
+sibling subtree rises into the dead node's slot); a re-exec adoption
+remaps the placeholder id to the live window id.
+
+**D13. `ctrl+alt+arrows` move focus between panes by rect geometry**
+(the ADR 0007 R4 rows #2752 reserved): candidates are leaves whose
+centre is strictly in the asked direction, ranked by perpendicular-axis
+overlap then distance, and the winner rides the same `focusByIndex` path
+a rail click takes. `ctrl+shift+v` keeps its cycle on the FOCUSED pane:
+none → v → h → none, where the "state" is the focused leaf's parent
+kind; the depth-1 two-tab case reproduces M79c byte-for-byte.
+
+**D14. The tree persists in a sidecar, never in `.tabs` v2.** The record
+format is frozen (tabcodec parity is a gate), so `/host/SESSION.PANES`
+carries the tree: `PN` + ver byte, then preorder tags — `v`/`h` + u32 LE
+sash for an internal node, `0` + u8 record index for a leaf. Leaf indexes
+name SESSION.TABS record positions, the only key the two files share.
+Corrupt or truncated blobs refuse whole (`panes bad`); unsplit deletes
+the file. The snapshot bundle carries it as a third entry
+(`snapshot.EntryPanes`), so a restore on a fresh share rehydrates the
+layout — the same seam the settings and session entries already ride.
+
+**D15. WM_RPC kind 29 `agent_input` is AGENTD-only.** R2's reserved
+frame carries ONE HID event in the title field (`k`+mods+usage for a
+key, `p`+buttons+x+y for a pointer; x/y/w/h hold the auth union and are
+not payload). Admission is gateRPC's bound binding (the ownership grant)
+plus a proc-table name check for `AGENTD.ELF`; a wrong or malformed
+sender is `agent_input_denied`, a strip with no live focused pane is
+`agent_input_no_focus`, and both names ride the refused ack's title so
+the client reads which refusal landed. The admitted event is
+synthesized into `consumeSeatEvent` — the seat's own input path — so
+seat chords, chrome hit-tests, and the kernel content-pointer forward
+behave exactly as for hardware input. No new syscall: R1's rule that
+the wave rides existing seams holds.

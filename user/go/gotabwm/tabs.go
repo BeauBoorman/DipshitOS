@@ -83,17 +83,18 @@ type TabStrip struct {
 	tabs  [MaxTabs]Tab
 	count int
 	focus int // index into tabs[0:count]; ignored when count == 0
-	split SplitKind
-	// M79c (#1706): the drag-set divider position in scanout px. 0 means
-	// unset: the split tiles edge-to-edge at the midpoint exactly as
-	// SplitRects always did. A set sash carries a SashWidth gutter centred
-	// on it (the visible divider — the seat paints no content-area chrome,
-	// so the gap is background showing between the two client rects).
-	// Stored, not derived: PaneRects/layoutFileBody read it, so the sash
-	// survives relayout and lands in LAYOUT.txt's x=/w= fields (no new
-	// field: ADR 0033 pins that line format). Reset by setSplit, Unsplit,
-	// and any close that drops the strip below two tabs.
-	sash int
+	// M137a (#2771): the pane tree. tree[0] is the root when treeN > 0;
+	// internal nodes split their rect by kind (v | h) at sash, leaves
+	// host one strip tab each. The M62c/M79c model — one kind plus one
+	// divider — is the depth-1 case: the root node's kind IS Split()'s
+	// answer and the root node's sash IS the dragged divider. Depth 3
+	// and 8 panes are the ADR 0033 amendment's bounds. A set sash keeps
+	// its SashWidth gutter centred on it (the visible divider — the
+	// seat paints no content-area chrome, so the gap is background
+	// showing between client rects); sashes are absolute scanout px so
+	// they survive relayout and land in LAYOUT.txt's x=/w= fields.
+	tree  [treeMaxNodes]paneNode
+	treeN int
 	// M71d (#1563, M48 BT1): the bounded reopen LIFO. closed is a fixed
 	// array and closedCount is monotonic, exactly like Zig tabwm.closed_count,
 	// so the ring is BSS/fixed with no heap catalog of every close (D2).
@@ -539,10 +540,14 @@ func (s *TabStrip) CloseTab(id uint32) bool {
 	}
 	s.tabs[s.count-1] = Tab{}
 	s.count--
+	// M137a: the closed tab's leaf dies with it; the sibling subtree
+	// rises into the dead pane's slot.
+	if li := s.leafOf(id); li >= 0 {
+		s.removeLeaf(li)
+	}
 	if s.count == 0 {
 		s.focus = 0
-		s.split = SplitNone
-		s.sash = 0
+		s.treeN = 0
 		return true
 	}
 	if s.focus > i {
@@ -551,8 +556,7 @@ func (s *TabStrip) CloseTab(id uint32) bool {
 		s.focus = s.count - 1
 	}
 	if s.count < 2 {
-		s.split = SplitNone
-		s.sash = 0
+		s.treeN = 0
 	}
 	return true
 }
@@ -691,6 +695,9 @@ func (s *TabStrip) Reorder(from, to int) bool {
 	if has {
 		s.focus = s.index(fid)
 	}
+	// M137a: leaves rebind to the new positions so the pane follows
+	// the tab, not the old slot.
+	s.relinkLeaves()
 	return true
 }
 
@@ -722,6 +729,7 @@ func (s *TabStrip) normalizePinned() {
 	if has {
 		s.focus = s.index(fid)
 	}
+	s.relinkLeaves()
 }
 
 // orderLine is the rail report: ids and pin bits in strip order, plus
@@ -782,31 +790,43 @@ func FullRect(scanW, scanH uint32) Rect {
 	return Rect{X: 0, Y: 0, W: scanW, H: scanH}
 }
 
-// Split reports the current two-pane kind.
-func (s *TabStrip) Split() SplitKind { return s.split }
-
-// SplitH splits two already-open tabs top/bottom. Refused unless count==2.
-func (s *TabStrip) SplitH() bool { return s.setSplit(SplitHoriz) }
-
-// SplitV splits two already-open tabs left/right. Refused unless count==2.
-func (s *TabStrip) SplitV() bool { return s.setSplit(SplitVert) }
-
-func (s *TabStrip) setSplit(k SplitKind) bool {
-	if s.count != 2 || k == SplitNone {
-		return false
+// Split reports the root pane kind (SplitNone when no tree stands).
+// The M62c callers read it as "the whole strip's split"; with a tree,
+// it is the TOP split's direction.
+func (s *TabStrip) Split() SplitKind {
+	if s.treeN == 0 {
+		return SplitNone
 	}
-	s.split = k
-	s.sash = 0
-	return true
+	return s.tree[0].kind
 }
 
-// Unsplit restores the unsplit (full-viewport) kind. False when already none.
+// scanoutW/scanoutH mirror vi.ScanoutWidth/ScanoutHeight so this file
+// (a pure state machine) keeps no syscall-package import for a pair of
+// compile-time constants. The pane floor is pinned on 1280x720.
+const (
+	scanoutW = 1280
+	scanoutH = 720
+)
+
+// SplitH retargets the focused pane's split to top/bottom — the M62c
+// kind-set semantics: already-H is a true no-op, V rotates the parent,
+// unsplit splits. (SplitPane is the pure-nest half the chord rides.)
+func (s *TabStrip) SplitH() bool {
+	return s.ensurePaneSplit(SplitHoriz, uint32(scanoutW), uint32(scanoutH))
+}
+
+// SplitV retargets the focused pane's split to left/right.
+func (s *TabStrip) SplitV() bool {
+	return s.ensurePaneSplit(SplitVert, uint32(scanoutW), uint32(scanoutH))
+}
+
+// Unsplit dissolves the whole tree — every pane back to the
+// full-viewport stack. False when no tree stands.
 func (s *TabStrip) Unsplit() bool {
-	if s.split == SplitNone {
+	if s.treeN == 0 {
 		return false
 	}
-	s.split = SplitNone
-	s.sash = 0
+	s.treeN = 0
 	return true
 }
 
@@ -837,13 +857,14 @@ func SplitRects(kind SplitKind, scanW, scanH uint32) (Rect, Rect, bool) {
 	return Rect{}, Rect{}, false
 }
 
-// PaneRects returns the two pane rects for the current split, or false
-// when the strip is not two tabs.
+// PaneRects returns the two pane rects of a depth-1 tree — the M62c
+// pair. False when no tree stands or the root's children are not both
+// leaves.
 func (s *TabStrip) PaneRects(scanW, scanH uint32) (Rect, Rect, bool) {
-	if s.count != 2 {
+	if s.treeN == 0 || s.tree[0].kind == SplitNone {
 		return Rect{}, Rect{}, false
 	}
-	return SplitRectsSash(s.split, scanW, scanH, s.sash)
+	return splitRectIn(s.tree[0].kind, FullRect(scanW, scanH), s.tree[0].sash)
 }
 
 // SashWidth is the M79c (#1706) divider width in scanout px: the gutter the
@@ -930,39 +951,88 @@ func SplitRectsSash(kind SplitKind, scanW, scanH uint32, sash int) (Rect, Rect, 
 	return Rect{}, Rect{}, false
 }
 
-// sashCenter is the strip's effective divider centre in scanout px for the
-// current split: the stored sash, or the midpoint when unset. -1 when there
-// is no split to divide.
+// sashCenter is the ROOT node's effective divider centre in scanout px:
+// the stored sash, or the rect's midpoint when unset. -1 when the tree
+// has no root split to divide.
 func (s *TabStrip) sashCenter(scanW, scanH uint32) int {
-	switch s.split {
-	case SplitVert:
-		if s.sash > 0 {
-			return clampSash(s.split, s.sash, scanW, scanH)
-		}
-		return int(scanW) / 2
-	case SplitHoriz:
-		if s.sash > 0 {
-			return clampSash(s.split, s.sash, scanW, scanH)
-		}
-		return int(scanH) / 2
-	default:
+	if s.treeN == 0 || s.tree[0].kind == SplitNone {
 		return -1
 	}
+	return s.nodeSashCenter(0, scanW, scanH)
 }
 
-// SetSash stores a drag-set divider centre. Refused unless the strip is two
-// tabs in a split, and a no-op (false) when the clamped position equals the
-// current centre — a release where the press landed must not relayout or
-// mark. No syscalls: the seat applies the rects after a true change.
+// nodeSashCenter is node i's effective divider centre: the stored sash
+// clamped inside its rect, or the midpoint when unset. -1 for leaves.
+func (s *TabStrip) nodeSashCenter(i int, scanW, scanH uint32) int {
+	node := s.tree[i]
+	r := s.nodeRect(i, scanW, scanH)
+	if r.W == 0 || r.H == 0 {
+		return -1
+	}
+	if node.sash > 0 {
+		// Re-clamp inside the CURRENT rect (it may have moved under a
+		// re-layout above this node).
+		lo, hi := sashBounds(node.kind, r)
+		c := node.sash
+		if lo <= hi {
+			if c < lo {
+				c = lo
+			}
+			if c > hi {
+				c = hi
+			}
+		}
+		return c
+	}
+	if node.kind == SplitVert {
+		return int(r.X) + int(r.W)/2
+	}
+	return int(r.Y) + int(r.H)/2
+}
+
+// sashBounds is one node's divider range inside rect r.
+func sashBounds(kind SplitKind, r Rect) (int, int) {
+	half := SashWidth / 2
+	if kind == SplitVert {
+		return int(r.X) + int(PaneMinW) + half,
+			int(r.X) + int(r.W) - int(PaneMinW) - half
+	}
+	return int(r.Y) + int(PaneMinH) + half,
+		int(r.Y) + int(r.H) - int(PaneMinH) - half
+}
+
+// SetSash stores a drag-set divider centre on the ROOT node — the M79c
+// shape, now the depth-1 case of SetSashNode. A no-op (false) when the
+// clamped position equals the current centre, and refused when the root
+// is not a split.
 func (s *TabStrip) SetSash(pos int, scanW, scanH uint32) bool {
-	if s.count != 2 || (s.split != SplitVert && s.split != SplitHoriz) {
+	return s.SetSashNode(0, pos, scanW, scanH)
+}
+
+// SetSashNode stores a drag-set centre on internal node i, clamped
+// inside its own rect so both children keep the pane floor plus the
+// SashWidth gutter. Refused for a leaf/out-of-range i or a release on
+// the armed position.
+func (s *TabStrip) SetSashNode(i, pos int, scanW, scanH uint32) bool {
+	if i < 0 || i >= s.treeN || s.tree[i].kind == SplitNone {
 		return false
 	}
-	c := clampSash(s.split, pos, scanW, scanH)
-	if c <= 0 || c == s.sashCenter(scanW, scanH) {
+	r := s.nodeRect(i, scanW, scanH)
+	lo, hi := sashBounds(s.tree[i].kind, r)
+	if hi < lo {
 		return false
 	}
-	s.sash = c
+	c := pos
+	if c < lo {
+		c = lo
+	}
+	if c > hi {
+		c = hi
+	}
+	if c == s.nodeSashCenter(i, scanW, scanH) {
+		return false
+	}
+	s.tree[i].sash = c
 	return true
 }
 

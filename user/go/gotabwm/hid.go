@@ -281,13 +281,16 @@ var (
 	// godButtonHover rides the same samples for the god-menu button's
 	// §2.3 hover face.
 	godButtonHover bool
-	// sashDragging is the M79c (#1706) sash latch: a pointer-down on the
-	// split divider arms it, the matching release commits the drag at the
-	// release x/y, and motion while armed is swallowed (chrome, never
-	// content — same discipline as contentDown/rail, inverted). It is
-	// disjoint from railDragFrom: a sash down returns before
-	// beginRailDrag, so endRailDrag can never also reorder.
+	// sashDragging is the M79c (#1706) sash latch, generalized by M137a
+	// (#2771) to any internal tree node: a pointer-down on a divider
+	// arms it and records WHICH node's gutter was hit (sashDragNode),
+	// the matching release commits the drag at the release x/y against
+	// that node's own kind, and motion while armed is swallowed
+	// (chrome, never content — same discipline as contentDown/rail,
+	// inverted). It is disjoint from railDragFrom: a sash down returns
+	// before beginRailDrag, so endRailDrag can never also reorder.
 	sashDragging bool
+	sashDragNode int
 	menuGesture  bool // survives dismissal/exec until every button is up
 )
 
@@ -366,6 +369,16 @@ func runSeatAction(action string, c chords.Chord) {
 		_ = applyFreezeToggle()
 	case "split-cycle":
 		_ = applySplitCycle()
+	case "pane-focus-left":
+		// M137a (#2771, ADR 0007 R4): ctrl+alt+arrows move focus between
+		// panes by rect geometry — the seat chord rows #2752 reserved.
+		_ = applyPaneFocus(-1, 0)
+	case "pane-focus-right":
+		_ = applyPaneFocus(1, 0)
+	case "pane-focus-up":
+		_ = applyPaneFocus(0, -1)
+	case "pane-focus-down":
+		_ = applyPaneFocus(0, 1)
 	case "snapshot-bundle":
 		// M81g (#1767): the snapshot arm. It is a chord rather than a
 		// timer on purpose — the card rules out scheduled snapshots, and
@@ -882,11 +895,11 @@ func handleWmPointer(e vi.Event) {
 		// the divider zone are disjoint by construction (sashZoneAt),
 		// so the order against beginRailDrag below cannot matter — but
 		// the armed latch must be set before any of those run.
-		if sashZoneAt(px, py, tabs.Split(),
-			tabs.sashCenter(uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight)),
-			vi.ScanoutWidth, vi.ScanoutHeight) {
+		if ni, _, ok := tabs.sashHitAt(px, py,
+			uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight)); ok {
 			railDragFrom = -1
 			sashDragging = true
+			sashDragNode = ni
 			return
 		}
 		beginRailDrag(px, py)
@@ -913,10 +926,11 @@ func handleWmPointer(e vi.Event) {
 		if sashDragging {
 			sashDragging = false
 			pos := int(px)
-			if tabs.Split() == SplitHoriz {
+			if ni := sashDragNode; ni >= 0 && ni < tabs.treeN &&
+				tabs.tree[ni].kind == SplitHoriz {
 				pos = int(py)
 			}
-			_ = applySashDrag(pos)
+			_ = applySashDrag(sashDragNode, pos)
 			return
 		}
 		_ = endRailDrag(px, py)
@@ -1115,20 +1129,15 @@ func applyRailReorder(from, to int) bool {
 	vi.ConsoleLine(MarkerReorder + vi.Itoa64(int64(from)) + "->" + vi.Itoa64(int64(to)))
 	dumpOrder()
 	noteSessionMutation()
-	if tabs.Split() == SplitNone || tabs.Count() != 2 {
+	// M137a: a reorder under a standing tree re-proposes every pane —
+	// leaves are id-keyed, so the pane follows the tab, not the slot.
+	if tabs.treeN == 0 {
 		return true
 	}
-	ra, rb, ok := tabs.PaneRects(uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight))
-	if !ok {
+	if !applyTreeRects() {
 		return false
 	}
-	a, b := tabs.At(0), tabs.At(1)
-	if !applyRect(a.ID, ra) || !applyRect(b.ID, rb) {
-		return false
-	}
-	kind := tabs.Split()
-	dumpTab(a, ra, kind)
-	dumpTab(b, rb, kind)
+	dumpPanes()
 	_ = writeLayoutFile()
 	return true
 }

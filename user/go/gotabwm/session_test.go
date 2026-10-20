@@ -475,6 +475,9 @@ func reexecEnv(t *testing.T, raw []byte, execErr map[string]bool) (*[]string, ma
 		configureHostedChrome, procsAlive = savedChrome, savedProcs
 	})
 	readSessionFile = func(path string, max int) ([]byte, int64) {
+		if path == panesPath {
+			return nil, -1 // no sidecar seeded: the unsplit shape
+		}
 		if path != sessionPath {
 			t.Fatalf("session read path = %q want %q", path, sessionPath)
 		}

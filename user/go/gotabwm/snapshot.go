@@ -166,6 +166,13 @@ func captureBundle() ([]byte, int, int, bool) {
 	if b, rc := snapRead(sessionPath, tabsV2MaxBytes+1); rc >= 0 && b != nil && len(b) <= tabsV2MaxBytes {
 		entries = append(entries, snapshot.Entry{Name: snapshot.EntrySession, Body: b})
 	}
+	// M137a (#2771): the pane-tree sidecar rides the bundle too, so a
+	// restore on a fresh share still rehydrates the split layout. Absent
+	// is the unsplit shape, exactly like the session file's own missing
+	// rule.
+	if b, rc := snapRead(panesPath, panesMaxBytes+1); rc >= 0 && b != nil && len(b) <= panesMaxBytes {
+		entries = append(entries, snapshot.Entry{Name: snapshot.EntryPanes, Body: b})
+	}
 	docs := captureDocs()
 	for _, d := range docs {
 		entries = append(entries, d)
@@ -331,6 +338,17 @@ func restoreSnapshot() bool {
 			snapLog(MarkerSnapshotFail + "session=" + vi.Itoa64(w))
 			return false
 		}
+	}
+	if b, found := bundle.Get(snapshot.EntryPanes); found {
+		if w := snapWrite(panesPath, b); w != 0 {
+			snapLog(MarkerSnapshotFail + "panes=" + vi.Itoa64(w))
+			return false
+		}
+	} else if panesDelete(panesPath) == 0 {
+		// A bundle with no sidecar restores the unsplit shape: a stale
+		// SESSION.PANES on this share must not survive a bundle that
+		// never carried one.
+		snapLog(MarkerPanesWrite + "0")
 	}
 	docs := bundle.Docs()
 	if len(docs) > 0 {

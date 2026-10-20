@@ -373,6 +373,17 @@ func serviceRPC() int {
 				served++
 				continue
 			}
+			// Kind 29 (agent_input, ADR 0007 R2, M137a) binds like every
+			// other request too — the bound window's ownership proof IS
+			// the grant half of the admission check — then the AGENTD
+			// principal check runs inside serveAgentInput. It answers
+			// its own ack so the refusal name rides the title even on
+			// applied=0.
+			if req.Kind == wmKindAgentInput {
+				serveAgentInput(req, auth)
+				served++
+				continue
+			}
 		}
 		applied := false
 		if apply {

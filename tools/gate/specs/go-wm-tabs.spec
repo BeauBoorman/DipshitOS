@@ -8,7 +8,7 @@
 # #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# NINETEEN vgate_runs share one seeded host share (`vgate_share seed`):
+# TWENTY-ONE vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -55,7 +55,10 @@
 #       in-guest attacker. The probe binds its own window honestly, then
 #       sprays forged SetTitle frames (bare and guessed-token) at every other
 #       user window id plus an unproven challenge echo — zero may apply while
-#       its own bound requests still land.
+#       its own bound requests still land. M137a (#2771): the same probe
+#       then sends a BOUND kind-29 agent_input — the session token is
+#       real but the principal is not AGENTD, so the seat answers
+#       agent_input_denied (R2).
 #   12  M125a (#2586): GOTABAPP.ELF as the state client. ctrl-shift-s makes
 #       the seat post its kind-20 ask; the app stages its blob at
 #       /host/APPSTATE.<id> and the seat stores it — SESSION.TABS's
@@ -1930,6 +1933,10 @@ vgate_assert 11 serial-contains 'wmrpcprobe: title ok'
 vgate_assert 11 serial-contains 'wmrpcprobe: foreign applied=0 refused='
 vgate_assert 11 serial-contains 'wmrpcprobe: echo refused id='
 vgate_assert 11 serial-contains 'wmrpcprobe: bad-token refused'
+# M137a: the bound kind-29 from a non-AGENTD principal is refused by
+# name — applied=0 reaches the probe AND the R2 marker prints.
+vgate_assert 11 serial-contains 'gotabwm: agent_input_denied'
+vgate_assert 11 serial-contains 'wmrpcprobe: agent-input refused'
 vgate_assert 11 serial-contains 'wmrpcprobe: auth probe ok'
 vgate_assert 11 serial-contains 'gotabwm: rpc refuse id='
 vgate_assert 11 serial-absent 'wmrpcprobe: FAIL'
@@ -2647,3 +2654,148 @@ PY
 vgate_assert 19 serial-contains 'rx-m125g-back-ok'
 vgate_assert 19 serial-absent '[EXC] parking:'
 vgate_assert 19 serial-absent 'exited status=139'
+
+
+# ---------------------------------------------------------------------------
+# Run 20 (M137a / #2771): the split is a tree. LIVE mode (no demo
+# choreography): GOCALC+NOTE+GOEDIT. Two ctrl-shift-v presses reach three
+# panes — the first splits the focused pane (depth-1 M62c), the second
+# nests H inside it. ctrl+alt+arrows move pane focus by rect geometry;
+# ctrl-shift-s takes the snapshot bundle; the sidecar SESSION.PANES is
+# asserted on the share alongside LAYOUT.txt's three rects.
+
+vgate_file script-20.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-20.txt <<'EOF'
+dui focus 0
+exec GOCALC.ELF
+exec NOTE.ELF
+exec GOEDIT.ELF
+EOF
+
+vgate_file script3-20.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-tree-ok
+EOF
+
+vgate_run 20 -- \
+    --screen '$RUN_DIR/screen-20' \
+    --script '$RUN_DIR/script-20.txt' \
+    --script2 '$RUN_DIR/script2-20.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-shift-v,ctrl-shift-v,ctrl-alt-right,ctrl-alt-left,ctrl-alt-down,ctrl-shift-s' \
+    --input-chords-after 'gotabwm: rail n=3' \
+    --script3 '$RUN_DIR/script3-20.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-gotabwm-tree-ok' --timeout 300
+
+vgate_assert 20 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 20 serial-contains 'gotabwm: registered'
+vgate_assert 20 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 20 serial-contains 'gotabwm: rail n=3'
+# Two presses, three panes: the focused pane split V, then nested H.
+vgate_assert 20 serial-contains 'gotabwm: split v'
+vgate_assert 20 serial-contains 'gotabwm: split h'
+vgate_assert 20 serial-contains 'x=0 y=0 w=640 h=360'
+vgate_assert 20 serial-contains 'x=0 y=360 w=640 h=360'
+vgate_assert 20 serial-contains 'x=640 y=0 w=640 h=720'
+# The directional chords moved pane focus by geometry.
+vgate_assert 20 serial-contains 'gotabwm: tab focus id='
+# The tree persisted beside the session, and the bundle carries it.
+vgate_assert 20 serial-contains 'gotabwm: panes write n=3'
+vgate_assert 20 serial-contains 'gotabwm: session write n=3'
+vgate_assert 20 serial-contains 'gotabwm: snapshot saved'
+vgate_assert 20 serial-contains 'rx-gotabwm-tree-ok'
+vgate_assert 20 serial-absent 'gotabwm: panes bad'
+vgate_assert 20 serial-absent '[EXC] parking:'
+vgate_assert 20 serial-absent 'exited status=139'
+vgate_assert 20 python <<'PY'
+import os, re, sys
+share = os.environ["VG_SHARE"]
+# The sidecar is binary: PN\x01 then preorder tags. Magic + a v and an
+# h tag is the whole structural assert a byte-level read needs.
+blob = open(os.path.join(share, "SESSION.PANES"), "rb").read()
+if blob[:3] != b"PN\x01":
+    sys.exit("SESSION.PANES magic %r" % blob[:3])
+if b"v" not in blob[3:] or b"h" not in blob[3:]:
+    sys.exit("sidecar must carry both split kinds: %r" % blob)
+# LAYOUT.txt: three panes, focused one marked, kinds recorded.
+raw = open(os.path.join(share, "SELFTEST", "LAYOUT.txt"), "rb").read()
+lines = raw.decode("utf-8").splitlines()
+rows = [l for l in lines if l.startswith("tab=")]
+if len(rows) != 3:
+    sys.exit("layout rows=%d want 3" % len(rows))
+if "split=v" not in raw.decode() or "split=h" not in raw.decode():
+    sys.exit("layout must name both split kinds")
+if "focus=1" not in raw.decode():
+    sys.exit("no focused pane recorded")
+print("panes sidecar %dB, layout rows: %s" % (len(blob), rows))
+PY
+
+# ---------------------------------------------------------------------------
+# Run 21 (M137a / #2771): the snapshot restore round-trip. The bundle run
+# 20 took carries SESSION.TABS + the panes sidecar; a fresh boot stages
+# SNAPSHOT.RESTORE, rehydrates both files, and the seat decodes the tree
+# (panes load n=3) and re-execs the rows. LAYOUT.txt then holds the same
+# three pane rects — the layout survived the snapshot and the restore.
+
+vgate_file script-21.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf open SNAPSHOT.RESTORE
+vf write 0 1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script3-21.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-tree-restore-ok
+EOF
+
+vgate_run 21 -- \
+    --screen '$RUN_DIR/screen-21' \
+    --script '$RUN_DIR/script-21.txt' \
+    --script3 '$RUN_DIR/script3-21.txt' \
+    --script3-after 'gotabwm: snapshot restore' \
+    --script-expect 'rx-gotabwm-tree-restore-ok' --timeout 300
+
+vgate_assert 21 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 21 serial-contains 'gotabwm: snapshot restore'
+vgate_assert 21 serial-contains 'gotabwm: session load n=3 mode=restore'
+vgate_assert 21 serial-contains 'gotabwm: panes load n=3'
+vgate_assert 21 serial-contains 'gotabwm: session reexec n=3'
+vgate_assert 21 serial-contains 'gotabwm: session live n=3'
+vgate_assert 21 serial-contains 'rx-gotabwm-tree-restore-ok'
+vgate_assert 21 serial-absent 'gotabwm: panes bad'
+vgate_assert 21 serial-absent '[EXC] parking:'
+vgate_assert 21 serial-absent 'exited status=139'
+vgate_assert 21 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+raw = open(os.path.join(share, "SELFTEST", "LAYOUT.txt"), "rb").read().decode("utf-8")
+rows = [l for l in raw.splitlines() if l.startswith("tab=")]
+if len(rows) != 3:
+    sys.exit("restored layout rows=%d want 3" % len(rows))
+# The same three rects run 20 computed must land verbatim.
+for frag in ("x=0 y=0 w=640 h=360", "x=0 y=360 w=640 h=360",
+             "x=640 y=0 w=640 h=720"):
+    if frag not in raw:
+        sys.exit("restored layout missing pane " + frag)
+if "split=v" not in raw or "split=h" not in raw:
+    sys.exit("restored layout lost the split kinds")
+print("restored layout rows: %s" % rows)
+PY

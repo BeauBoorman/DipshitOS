@@ -64,8 +64,12 @@ const (
 	// carries. The names are the contract between this package and the
 	// consumer's share-path mapping, not paths: a bundle never names a share
 	// path, so a bundle cannot be replayed somewhere it does not belong.
+	// EntryPanes is the M137a (#2771) session sidecar: the pane-tree blob
+	// the seat keeps beside SESSION.TABS, carried so a restore on a fresh
+	// share still rehydrates the split layout.
 	EntrySettings = "settings"
 	EntrySession  = "session"
+	EntryPanes    = "panes"
 
 	// DocsPrefix namespaces the documents selection. A docs entry is
 	// DocsPrefix + the file name, so the share root the caller maps it onto
@@ -325,7 +329,7 @@ func Parse(b []byte) (Bundle, bool, string) {
 // whole — is what keeps a restore from silently dropping state.
 func KnownEntry(name string) bool {
 	switch name {
-	case EntrySettings, EntrySession:
+	case EntrySettings, EntrySession, EntryPanes:
 		return true
 	}
 	if len(name) > len(DocsPrefix) && name[:len(DocsPrefix)] == DocsPrefix {
