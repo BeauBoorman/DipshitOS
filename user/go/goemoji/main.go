@@ -5,6 +5,13 @@
 // grid, the kernel compose pairs, or the kaomoji dozen — and a status
 // line naming the selection and the pick contract.
 //
+// M152c (issue #2917) adds the shelf: on the Emoji tab an empty query
+// shows the pinned favorites row above the recents row (the last picks),
+// and F10 pins or unpins the focused cell. Both lists ride save_state v2
+// through the seat's snapshot; a fresh summon still starts empty — the
+// named limitation is that close-on-pick drops the instance, so recents
+// accumulate only in stay mode and across a seat restore.
+//
 // Every marker below is printed only AFTER its syscall returned (or, for
 // paint, after Present), so the go-emoji VZ gate's asserts can only pass
 // if the app actually ran.
@@ -42,6 +49,10 @@ const (
 	markerClose    = "goemoji: close"
 	markerOK       = "goemoji OK"
 	markerOpenErr  = "goemoji: error open "
+	markerFavs     = "goemoji: favs "
+	markerRecents  = "goemoji: recents "
+	markerSaved    = "goemoji: state saved len="
+	markerRestored = "goemoji: state restored "
 
 	queryMax = 64
 )
@@ -89,6 +100,9 @@ type app struct {
 	chain *ttf.Chain
 	field appkit.TextField
 
+	favs    []int // glyph indices, pin order (M152c)
+	recents []int // glyph indices, most recent first
+
 	sel       int // index into matches
 	matches   []int
 	scrollTop int
@@ -112,9 +126,14 @@ func main() {
 	// lands once the app and its search field are built below.
 	var restored []byte
 	var restoredOK bool
+	// The declared title doubles as the seat's session-row bin: guessBin
+	// maps titles to binaries and "Emoji" has no row (that table is
+	// #2870's), so declaring the real name keeps a restored row's re-exec
+	// able to find — and grant — GOEMOJI.ELF. The retitle below puts the
+	// friendly label back on the rail.
 	ta := tabapp.Init(tabapp.Config{
-		Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH,
-		StateVersion: 1,
+		Name: appName, Title: appName, X: 32, Y: 32, W: natW, H: natH,
+		StateVersion: stateVerShelf,
 		RestoreState: func(b []byte) {
 			restored, restoredOK = b, true
 		},
@@ -126,6 +145,7 @@ func main() {
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)))
 	if ta.TabAware {
 		vi.ConsoleLine(markerDeclare)
+		_ = ta.SetTabTitle(appTitle)
 	} else {
 		vi.ConsoleLine(markerRefused)
 	}
@@ -142,7 +162,7 @@ func main() {
 
 	ta.SaveState = a.saveState
 	if restoredOK {
-		a.restoreState(restored)
+		a.restoreState(restored, ta.RestoredVersion)
 	}
 	a.refilter()
 
@@ -155,10 +175,21 @@ func main() {
 		ta.CloseAndExit(status)
 	}
 	_ = loop.SubscribeSetting("theme", func(value string) bool { return theme.Set(value) })
-	loop.Run()
+	// The save_state ask is mailbox traffic, not an input event: answer it
+	// once per pass (the gomine shape) so the seat's snapshot and tab-close
+	// collects always get this tab's blob.
+	loop.RunWith(func() (vi.Event, int64, bool) {
+		if a.ta.PollStateAsk() {
+			vi.ConsoleLine(markerSaved + vi.Itoa64(int64(len(a.saveState()))))
+		}
+		return vi.PollEventRaw()
+	}, vi.Sleep)
 }
 
-// --- state (M125a): the stay-open flag and live query ride the tab state --
+// --- state (M125a + M152c): the flags, the shelf, and the live query ride
+// the tab state. The envelope's appver tags the layout: v2 inserts the
+// favorites and recents cp lists between the flag byte and the query tail;
+// a v1 blob (`tab | stay | query`) still decodes with an empty shelf. ---
 
 func (a *app) saveState() []byte {
 	var tab, stay byte = '0', '0'
@@ -168,10 +199,13 @@ func (a *app) saveState() []byte {
 	if a.stay {
 		stay = '1'
 	}
-	return []byte(string([]byte{tab, stay}) + a.field.Value())
+	out := []byte{tab, stay}
+	out = shelfEncode(out, a.favs)
+	out = shelfEncode(out, a.recents)
+	return append(out, a.field.Value()...)
 }
 
-func (a *app) restoreState(b []byte) {
+func (a *app) restoreState(b []byte, ver uint8) {
 	if len(b) < 2 {
 		return
 	}
@@ -179,8 +213,36 @@ func (a *app) restoreState(b []byte) {
 		a.tab = int(b[0] - '0')
 	}
 	a.stay = b[1] == '1'
-	a.field.SetValue(string(b[2:]))
+	if ver < stateVerShelf {
+		// v1: the rest of the blob was the query verbatim.
+		a.field.SetValue(string(b[2:]))
+		a.refilter()
+		vi.ConsoleLine(markerRestored + "ver=1")
+		return
+	}
+	// v2: a list whose declared count overruns the blob applies nothing —
+	// the flags already landed, the shelf stays empty, and the query is
+	// left unset rather than half-parsed.
+	favs, off, ok := shelfDecode(b, 2)
+	if !ok {
+		return
+	}
+	recents, off, ok := shelfDecode(b, off)
+	if !ok {
+		return
+	}
+	a.favs = favs
+	a.recents = recents
+	a.field.SetValue(string(b[off:]))
 	a.refilter()
+	vi.ConsoleLine(markerRestored + "favs=" + vi.Itoa64(int64(len(a.favs))) +
+		" recents=" + vi.Itoa64(int64(len(a.recents))))
+	if len(a.favs) > 0 {
+		vi.ConsoleLine(markerFavs + tagsOf(a.favs))
+	}
+	if len(a.recents) > 0 {
+		vi.ConsoleLine(markerRecents + tagsOf(a.recents))
+	}
 }
 
 // --- model ----------------------------------------------------------------
@@ -217,10 +279,21 @@ func composeName(c Compose) string {
 func (a *app) refilter() {
 	q := a.field.Value()
 	a.matches = filter(q, a.count(), a.candidate)
+	if a.tab == tabEmoji && q == "" {
+		a.matches = shelfView(a.favs, a.recents, a.matches)
+	}
 	if a.sel >= len(a.matches) {
 		a.sel = len(a.matches) - 1
 	}
 	if a.sel < 0 {
+		a.sel = 0
+	}
+	// A shelf pad is never a landing spot — the grid tail always supplies
+	// a real cell after one.
+	for a.sel+1 < len(a.matches) && a.matches[a.sel] == cellPad {
+		a.sel++
+	}
+	if a.sel < len(a.matches) && a.matches[a.sel] == cellPad {
 		a.sel = 0
 	}
 	a.scrollTop = 0
@@ -235,6 +308,9 @@ func (a *app) pickText() (text, desc string, ok bool) {
 		return "", "", false
 	}
 	i := a.matches[a.sel]
+	if i < 0 {
+		return "", "", false // a shelf pad cell carries no pick
+	}
 	switch a.tab {
 	case tabCompose:
 		c := compose[i]
@@ -261,6 +337,9 @@ func (a *app) pick() bool {
 	}
 	vi.ConsoleLine(markerPick + desc)
 	vi.ConsoleLine(markerClip + vi.Itoa64(int64(n)))
+	if a.tab == tabEmoji {
+		a.noteRecent(a.matches[a.sel])
+	}
 	if !a.stay {
 		a.quitCode = 0
 		a.quit = true
@@ -319,6 +398,8 @@ func (a *app) key(ev vi.Event) bool {
 	case appkit.NamedUp, appkit.NamedDown, appkit.NamedLeft, appkit.NamedRight:
 		d := navDelta(a.tab, k.Named())
 		return a.moveSel(d)
+	case appkit.NamedF10:
+		return a.toggleFav()
 	}
 	if a.field.OnKey(k) {
 		a.sel = 0
@@ -352,15 +433,26 @@ func (a *app) moveSel(d int) bool {
 	if len(a.matches) == 0 {
 		return false
 	}
-	next := a.sel + d
-	if next < 0 {
-		next = 0
-	}
-	if next >= len(a.matches) {
-		next = len(a.matches) - 1
-	}
-	if next == a.sel {
-		return false
+	// Step by d — ±1 along a row, ±gridCols between rows — then keep going
+	// in the same direction while the landing cell is a shelf pad: pads
+	// sit at section tails, so column steps stay column-aligned and row
+	// steps walk past a pad block to the next real row.
+	next := a.sel
+	for {
+		n := next + d
+		if n < 0 {
+			n = 0
+		}
+		if n >= len(a.matches) {
+			n = len(a.matches) - 1
+		}
+		if n == next {
+			return false
+		}
+		next = n
+		if a.matches[next] != cellPad {
+			break
+		}
 	}
 	a.sel = next
 	a.ensureVisible()
@@ -436,6 +528,9 @@ func (a *app) click(x, y int, left bool) bool {
 	}
 	// Content.
 	for pos := a.scrollTop; pos < len(a.matches) && pos < a.scrollTop+a.visibleRows(); pos++ {
+		if a.matches[pos] == cellPad {
+			continue
+		}
 		var r widgets.Rect
 		if a.tab == tabEmoji {
 			r = a.cellRect(pos)
@@ -512,6 +607,9 @@ func (a *app) drawGrid(cv widgets.Canvas, tok theme.Tokens) {
 		end = len(a.matches)
 	}
 	for pos := a.scrollTop; pos < end; pos++ {
+		if a.matches[pos] == cellPad {
+			continue // a shelf pad stays window fill — the section break
+		}
 		g := glyphs[a.matches[pos]]
 		cell := a.cellRect(pos)
 		if pos == a.sel {
@@ -591,6 +689,9 @@ func (a *app) drawStatus(cv widgets.Canvas, tok theme.Tokens) {
 	line := ""
 	if ok {
 		line = desc + "  -  Enter copies"
+		if a.tab == tabEmoji {
+			line += "  F10 pins"
+		}
 	} else {
 		line = "no match"
 	}

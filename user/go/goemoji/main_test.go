@@ -99,7 +99,7 @@ func TestStateRoundTrip(t *testing.T) {
 	b := a.saveState()
 
 	c := newApp()
-	c.restoreState(b)
+	c.restoreState(b, stateVerShelf)
 	if c.tab != tabKaomoji || !c.stay || c.field.Value() != "fire" {
 		t.Fatalf("restore = tab %d stay %v q %q", c.tab, c.stay, c.field.Value())
 	}
@@ -117,9 +117,9 @@ func TestStateRoundTrip(t *testing.T) {
 
 func TestRestoreGarbage(t *testing.T) {
 	c := newApp()
-	c.restoreState(nil)
-	c.restoreState([]byte{9})
-	c.restoreState([]byte{'x', 'y', 'z'})
+	c.restoreState(nil, stateVerShelf)
+	c.restoreState([]byte{9}, stateVerShelf)
+	c.restoreState([]byte{'x', 'y', 'z'}, stateVerShelf)
 	if c.tab != tabEmoji || c.stay {
 		t.Fatalf("garbage state changed the defaults: tab %d stay %v", c.tab, c.stay)
 	}

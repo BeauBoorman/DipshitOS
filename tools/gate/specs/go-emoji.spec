@@ -51,14 +51,22 @@
 # GOEMOJI, 'fire' picks the glyph, the picker quits and focus returns to
 # GOEDIT, and a paste shows the glyph's ink on the scanout.
 #
+# M152c (issue #2917) — runs 05/06 are the shelf pair: run 05 picks two
+# emoji in stay mode (recents accumulate inside the instance — the card's
+# named limitation is that close-on-pick drops them), pins the first as a
+# favorite, and ctrl-shift-s has the seat collect the v2 blob into
+# SESSION.TABS; run 06 is the restore boot, where the re-exec'd picker's
+# own restored markers read the favorite and the recents row back.
+#
 # REPEAT SEMANTICS: the armed share persists across iterations, so each
 # leg must be iteration-safe. Runs 02/03 are bare-shim legs that write no
-# share state. Runs 01/04 exec a live seat, and the seat persists
+# share state. Runs 01/04/05 exec a live seat, and the seat persists
 # SESSION.TABS/SESSION.PANES on every tab attach/detach — each boot's
 # script re-rm's both so a prior iteration's strip cannot restore extra
-# tabs over the journey.
+# tabs over the journey. Run 05 re-rm's them too (it makes run 06's) and
+# run 06 is the consumer — it must not rm.
 
-vgate_name go-emoji "issue #2799+#2800: GOEMOJI.ELF picks a covered glyph by fuzzy name; the pick lands text/plain on the typed clipboard; K=3 chord-summon/pick/paste acceptance journey"
+vgate_name go-emoji "issue #2799+#2800+#2917: GOEMOJI.ELF picks a covered glyph by fuzzy name; the pick lands text/plain on the typed clipboard; K=3 chord-summon/pick/paste acceptance journey; recents/favorites shelf survives the seat snapshot"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -496,3 +504,114 @@ if found == 0:
 print("pixel probe: %d exact '?' cell(s) in editor ink on the page "
       "background" % found)
 PY
+
+# --- run 05 (M152c, issue #2917): the shelf save leg ---------------------
+# `exec -u0` for both: the seat's own caps are inert here, but the picker's
+# picks must be real kernel clipboard writes. The pointer click toggles
+# 'stay' on the full-viewport surface (native {424,8,80,22} scales to
+# canvas {1060,15,200,41}; the click at (1120,45) sits inside it and below
+# the 22 px rail), so 'fire\n' picks A and 'heart\n' picks B without
+# closing — the recents marker then reads B A ('U+2764 U+1F525', newest
+# first). 'right' lands the focus on A's recents cell, 'f10' pins it
+# ('goemoji: favs U+1F525'), and 'ctrl-shift-s' posts the seat's state
+# ask — the app's PollStateAsk answers with the v2 blob, which the seat
+# stores on the row and republishes into SESSION.TABS.
+vgate_file script-05.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+wm
+exec -u0 GOTABWM.ELF
+EOF
+
+vgate_file script2-05.txt <<'EOF'
+exec -u0 GOEMOJI.ELF
+EOF
+
+vgate_file script3-05.txt <<'EOF'
+echo rx-goemoji-05
+EOF
+
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' --via-virtio \
+    --script '$RUN_DIR/script-05.txt' \
+    --script2 '$RUN_DIR/script2-05.txt' \
+    --script2-after 'gotabwm: present' \
+    --pointer-virtio '1120,45,d;1120,45,u' \
+    --pointer-virtio-after 'goemoji: present' \
+    --input-string $'fire\nheart\n' \
+    --input-string-after 'goemoji: stay on' \
+    --input-chords 'right,f10,ctrl-shift-s' \
+    --input-chords-after 'goemoji: recents U+2764 U+1F525' \
+    --script3 '$RUN_DIR/script3-05.txt' \
+    --script3-after 'gotabwm: snapshot saved bytes=' \
+    --script-expect 'rx-goemoji-05' --timeout 300
+
+vgate_assert 05 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 05 serial-contains 'gotabwm: mode live'
+vgate_assert 05 serial-contains 'gotabwm: present'
+vgate_assert 05 serial-contains 'exec: loaded GOEMOJI.ELF'
+vgate_assert 05 serial-contains 'goemoji: open id='
+vgate_assert 05 serial-contains 'goemoji: declare accepted'
+vgate_assert 05 serial-contains 'goemoji: present'
+vgate_assert 05 serial-contains 'goemoji: stay on'
+vgate_assert 05 serial-contains 'goemoji: filter q=fire n=1'
+vgate_assert 05 serial-contains 'goemoji: pick U+1F525 fire'
+vgate_assert 05 serial-contains 'goemoji: clip text/plain n=4'
+vgate_assert 05 serial-contains 'goemoji: filter q=heart n=1'
+vgate_assert 05 serial-contains 'goemoji: pick U+2764 heart'
+vgate_assert 05 serial-contains 'goemoji: clip text/plain n=3'
+# The card's read: two stay-mode picks land most-recent-first — B A.
+vgate_assert 05 serial-contains 'goemoji: recents U+1F525'
+vgate_assert 05 serial-contains 'goemoji: recents U+2764 U+1F525'
+# The pin: 'right,f10' focused A's recents cell and pinned it.
+vgate_assert 05 serial-contains 'goemoji: favs U+1F525'
+# The save: the seat asked, the app answered with the v2 blob, the file
+# carries it.
+vgate_assert 05 serial-contains 'gotabwm: state ask id='
+vgate_assert 05 serial-contains 'goemoji: state saved len='
+vgate_assert 05 serial-contains 'gotabwm: state save id='
+vgate_assert 05 serial-contains 'gotabwm: snapshot saved bytes='
+vgate_assert 05 serial-contains 'rx-goemoji-05'
+vgate_assert 05 serial-absent 'goemoji: clip refuse'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'exited status=139'
+
+# --- run 06 (M152c): the restore boot -------------------------------------
+# SESSION.TABS on the armed share still names GOEMOJI with the v2 blob, so
+# this boot's seat restore IS the leg: loadSession re-execs the row, the
+# picker's RestoreState decodes it (ver=2), and the app prints the same
+# favs/recents lines the save leg ended on — the favorite and the recents
+# row made it across. No rm's: the session file is the payload.
+vgate_file script-06.txt <<'EOF'
+exec -u0 GOTABWM.ELF
+EOF
+
+vgate_file script2-06.txt <<'EOF'
+echo rx-goemoji-06
+EOF
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' --via-virtio \
+    --script '$RUN_DIR/script-06.txt' \
+    --script2 '$RUN_DIR/script2-06.txt' \
+    --script2-after 'goemoji: present' \
+    --script-expect 'rx-goemoji-06' --timeout 300
+
+vgate_assert 06 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 06 serial-contains 'gotabwm: mode live'
+vgate_assert 06 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 06 serial-contains 'gotabwm: session reexec n=1'
+# The recorded bin is the real name — the app declares GOEMOJI.ELF as its
+# title so the row re-execs a binary the grants table knows.
+vgate_assert 06 serial-contains 'gotabwm: session exec GOEMOJI.ELF'
+vgate_assert 06 serial-contains 'gotabwm: state restore id='
+vgate_assert 06 serial-contains 'goemoji: open id='
+vgate_assert 06 serial-contains 'goemoji: declare accepted'
+vgate_assert 06 serial-contains 'goemoji: state restored favs=1 recents=2'
+vgate_assert 06 serial-contains 'goemoji: favs U+1F525'
+vgate_assert 06 serial-contains 'goemoji: recents U+2764 U+1F525'
+vgate_assert 06 serial-contains 'goemoji: present'
+vgate_assert 06 serial-contains 'rx-goemoji-06'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'exited status=139'
