@@ -38,7 +38,7 @@ GOSH.ELF	file,memory,process,debug	file,memory,process,debug,term	declared caps=
 GOHELP.ELF	window,memory,process,debug	file,window,memory,process,debug,term	surface: ReadFileAll for help topics + TtyAttach for the tty pane (user/go/help)
 GOWELCOME.ELF	-	file,window,memory,process,debug	surface: ReadFileAll for the SETTINGS.TXT theme load + Exec for the one-click launchers (user/go/welcome); new app, not yet audited
 GOTOP.ELF	file,window,memory,process,debug	file,window,memory,process,debug,net	surface: NetStats* pane — slot 62 sys_net_stats is net-grouped (user/go/top)
-GOSET.ELF	window,memory,process,debug	file,window,memory,process,debug	declared caps=file; the settings-write path was not exercised in the audit window
+GOSET.ELF	window,memory,process,debug	file,window,audio,memory,process,debug	declared caps=file; surface: the audio_volume row applies through slot 44 — vi.AudioVolume (user/go/goset)
 GODIFF.ELF	memory,process,debug	file,memory,process,debug	declared caps=file; a diff tool reads both inputs
 GOVIEW.ELF	window,memory,process,debug	file,window,memory,process,debug	opens=image handler contract; no image was handed in the audit window
 GOSOUND.ELF	window,memory,process,debug	file,window,audio,memory,process,debug	declared caps=file,window,audio + opens=audio; playback was not exercised
