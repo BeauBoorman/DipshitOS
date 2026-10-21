@@ -44,10 +44,24 @@
 # prints 'manifest=ok faces=9' and the Kaomoji tab's chain paint resolves
 # through the real ui cascade — the same path kaomoji_test.go pins on the
 # host. 'manifest=missing' would degrade the chain to the bitmap face.
+#
+# M146b (issue #2800) acceptance — run 04 is the card's journey, and
+# vgate_repeat 3 replays EVERY leg three times (the go-sheet/go-irc
+# convention): GOEDIT focused under a capable seat, ctrl+shift+E summons
+# GOEMOJI, 'fire' picks the glyph, the picker quits and focus returns to
+# GOEDIT, and a paste shows the glyph's ink on the scanout.
+#
+# REPEAT SEMANTICS: the armed share persists across iterations, so each
+# leg must be iteration-safe. Runs 02/03 are bare-shim legs that write no
+# share state. Runs 01/04 exec a live seat, and the seat persists
+# SESSION.TABS/SESSION.PANES on every tab attach/detach — each boot's
+# script re-rm's both so a prior iteration's strip cannot restore extra
+# tabs over the journey.
 
-vgate_name go-emoji "issue #2799: GOEMOJI.ELF picks a covered glyph by fuzzy name; the pick lands text/plain on the typed clipboard"
+vgate_name go-emoji "issue #2799+#2800: GOEMOJI.ELF picks a covered glyph by fuzzy name; the pick lands text/plain on the typed clipboard; K=3 chord-summon/pick/paste acceptance journey"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
+vgate_repeat 3 BOOTS
 
 # --- run 01: menu launch -> search -> pick -> refusal pin -----------------
 # The seat is exec'd from the monitor (wm=none keeps autostart off — run 02
@@ -57,6 +71,8 @@ vgate_runner_flags -Xswiftc -DSPIKE
 # the pick prints 'clip refuse rc=-7' and stays open; `clip` then proves
 # the kernel buffer was never written.
 vgate_file script-01.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
 wm
 exec GOTABWM.ELF
 EOF
@@ -319,3 +335,164 @@ vgate_assert 03 serial-contains 'goedit: paste n=4'
 vgate_assert 03 serial-contains 'rx-goemoji-03'
 vgate_assert 03 serial-absent '[EXC] parking:'
 vgate_assert 03 serial-absent 'exited status=139'
+
+# --- run 04 (M146b, issue #2800): the acceptance journey ------------------
+# GOEDIT holds focus under a live seat, ctrl+shift+E summons GOEMOJI, a
+# 'fire' search picks the glyph, the picker quits on the pick and focus
+# returns to GOEDIT, and a paste puts the glyph on the scanout.
+#
+# CAPS: slots 38/39 refuse uid_user callers (M97g — run 01 pins that
+# refusal), so the pick+paste endpoints both need CAP_CLIPBOARD. sys_exec
+# preserves the caller's principal (kernel/syscall.zig handle_exec), so a
+# monitor `exec -u0` GOTABWM.ELF makes the SEAT uid_system — and the
+# summon chord's execApp then spawns GOEMOJI with the same caps. GOEDIT is
+# exec'd -u0 likewise. That is the only arrangement where pick->paste can
+# carry real bytes under the seat.
+#
+# script2 anchors on 'gotabwm: present' — the seat's first composite frame,
+# once per boot — not 'mode live': the window-teardown churn between 'mode
+# live' and 'serving' can drop an early declare ('goedit: declare refused'
+# observed, run 04-01), which leaves no pane for the sel-paste to target.
+#
+# Chord-batch budget (one --input-chords per run, the runner's fixed
+# surface): 'ctrl-a' selects the staged G.TXT glyph while GOEDIT is
+# focused — publishSel hands it to the seat's primary buffer ('selpub n=4'
+# + 'sel pub id=', the M124e lane the uid_user posture reserves). Then
+# 'ctrl-shift-e' runs applySummonEmoji -> execApp GOEMOJI.ELF (a live tab
+# of that name would be focused instead), a down-stroke dwell covers the
+# exec+declare+present (~6 s at the 0.25 s/stroke cv-input cadence — arrows
+# are harmless no-ops in either app), 'fire' refilters to the one glyph and
+# 'return' picks: 'clip text/plain n=4' lands the real write, the picker
+# quits (stay off) and the seat refocuses GOEDIT.
+#
+# The paste itself is the seat-mediated M124e primary delivery — a
+# middle-click inside GOEDIT's pane resolves the target by GEOMETRY
+# (dragTargetAt), immune to the focus-handoff timing a key chord would
+# ride. 'sel paste id=' + 'goedit: sel-paste n=4' splices the same four
+# bytes at the caret. script3's `clip` then reads the kernel buffer back —
+# 'clip: <fire>' byte-verified by the python assert — so BOTH halves are
+# proven: the pick's write really landed, and the paste's glyph really
+# painted (the kind-4 probe scans for the 8x8 '?' fallback art in colText
+# ink, the pattern nothing else on the scanout draws).
+vgate_file script-04.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+wm
+exec -u0 GOTABWM.ELF
+EOF
+
+vgate_file script2-04.txt <<'EOF'
+exec -u0 GOEDIT.ELF /host/G.TXT
+EOF
+
+vgate_file script3-04.txt <<'EOF'
+clip
+echo rx-goemoji-04
+EOF
+
+vgate_setup_python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+# G.TXT is the glyph-bearing file GOEDIT opens and select-all publishes —
+# the same four UTF-8 bytes the 'fire' pick writes to the kernel buffer,
+# so the sel-paste lands "the glyph" the journey picked.
+with open(os.path.join(share, "G.TXT"), "wb") as f:
+    f.write("\U0001F525".encode("utf-8"))
+print("staged G.TXT (fire glyph, 4 bytes)")
+PY
+
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen-04' --via-virtio \
+    --cvc-snap --snapshot-out '$RUN_DIR/snap-04' \
+    --script '$RUN_DIR/script-04.txt' \
+    --script2 '$RUN_DIR/script2-04.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-chords 'ctrl-a,ctrl-shift-e,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,down,f,i,r,e,return' \
+    --input-chords-after 'goedit: present' \
+    --pointer-virtio '640,400;640,400;640,400,mc' \
+    --pointer-virtio-after 'goemoji OK' \
+    --script3 '$RUN_DIR/script3-04.txt' \
+    --script3-after 'goedit: sel-paste n=4' \
+    --script3-delay 8 \
+    --snapshot-after 'rx-goemoji-04' \
+    --script-expect 'rx-goemoji-04' --timeout 300
+
+vgate_assert 04 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 04 serial-contains 'gotabwm: mode live'
+vgate_assert 04 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 04 serial-contains 'goedit: read /host/G.TXT n=4'
+vgate_assert 04 serial-contains 'goedit: present'
+# GOEDIT focused when the batch fired: ctrl-a select-all published the
+# glyph to the seat's primary buffer (the proof the chord went to the app).
+vgate_assert 04 serial-contains 'goedit: selpub n=4'
+vgate_assert 04 serial-contains 'gotabwm: sel pub id='
+# The summon: GOEMOJI only exists because ctrl+shift+E exec'd it — nothing
+# else in the run can produce these markers (a seat 'tab focus' alone
+# would still lack 'open id=' and 'present').
+vgate_assert 04 serial-contains 'goemoji: open id='
+vgate_assert 04 serial-contains 'goemoji: declare accepted'
+vgate_assert 04 serial-contains 'goemoji: present'
+vgate_assert 04 serial-contains 'goemoji: filter q=fire n=1'
+vgate_assert 04 serial-contains 'goemoji: pick U+1F525 fire'
+vgate_assert 04 serial-contains 'goemoji: clip text/plain n=4'
+vgate_assert 04 serial-contains 'goemoji: close'
+vgate_assert 04 serial-contains 'goemoji OK'
+# Focus back on the editor and the seat-delivered paste.
+vgate_assert 04 serial-contains 'gotabwm: sel paste id='
+vgate_assert 04 serial-contains 'goedit: sel-paste n=4'
+vgate_assert 04 serial-contains 'rx-goemoji-04'
+vgate_assert 04 serial-absent 'goemoji: clip refuse'
+vgate_assert 04 serial-absent 'gotabwm: sel refuse'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent 'exited status=139'
+
+# The kernel buffer really holds the picked glyph — the read direction of
+# the same clipboard the pick wrote (the run-02 shrug idiom).
+vgate_assert 04 python <<'PY'
+import os, sys
+raw = open(os.environ["VG_SER"], "rb").read()
+want = "clip: \U0001F525\n".encode("utf-8")
+if want not in raw:
+    sys.exit("kernel clipboard did not read back the picked fire glyph")
+print("clipboard read-back verified on the host: %r" % want)
+PY
+
+# The pasted glyph's '?' fallback art (webrender/font Glyph8: unknown runes
+# fall back to '?') as 8x8 cells in colText ink on colPageBg — the pattern
+# the empty-state plate and seat chrome never draw. Lit cells must be ink
+# and unlit cells page background, so a partial lookalike cannot pass.
+vgate_assert 04 snapshot 'snap-04-*.raw' <<'PY'
+import sys
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+INK = (0xe6, 0xed, 0xf3)   # goedit colText
+BG  = (0x18, 0x20, 0x26)   # goedit colPageBg
+ROWS = [0x1e, 0x33, 0x30, 0x18, 0x0c, 0x00, 0x0c, 0x00]  # Glyph8('?')
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])
+found = 0
+for y in range(0, H - 8):
+    for x in range(0, W - 8):
+        ok = True
+        for gy in range(8):
+            bits = ROWS[gy]
+            for gx in range(8):
+                want = INK if bits & (1 << gx) else BG
+                if px(x + gx, y + gy) != want:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            found += 1
+if found == 0:
+    sys.exit("no '?' fallback cell found — the pasted glyph is not on "
+             "the scanout")
+print("pixel probe: %d exact '?' cell(s) in editor ink on the page "
+      "background" % found)
+PY
