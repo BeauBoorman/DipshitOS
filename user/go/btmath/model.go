@@ -26,12 +26,17 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/progress"
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
 	"virelai/vi"
@@ -98,12 +103,35 @@ var mirror io.Writer
 
 type tickMsg time.Time
 
+// keyMap is the footer help.Model's binding set: the same key.Binding
+// values Update matches against, so the rendered help can never drift from
+// the keys that actually work.
+type keyMap struct {
+	submit key.Binding
+	skip   key.Binding
+	quit   key.Binding
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		submit: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "submit")),
+		skip:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "skip")),
+		quit:   key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	}
+}
+
+func (k keyMap) ShortHelp() []key.Binding  { return []key.Binding{k.submit, k.skip, k.quit} }
+func (k keyMap) FullHelp() [][]key.Binding { return [][]key.Binding{k.ShortHelp()} }
+
 type model struct {
 	total, round int
 	a, b, answer int
 	op           byte
 
-	input     string
+	input     textinput.Model
+	bar       progress.Model
+	helpView  help.Model
+	keys      keyMap
 	score     int
 	streak    int
 	correct   int
@@ -128,8 +156,34 @@ type model struct {
 	quit bool
 }
 
+// digitsOnly is the textinput's contract: every generated question answers
+// to a nonnegative integer (subtraction rounds are built a >= b, and the
+// times/divide tier is all-positive), so a non-digit keystroke is refused —
+// Update rolls the input back when this flags Err.
+var errDigitsOnly = errors.New("digits only")
+
+func digitsOnly(s string) error {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return errDigitsOnly
+		}
+	}
+	return nil
+}
+
 func newModel(seed int64, rounds int) model {
-	m := model{total: rounds, round: 1, started: time.Now(), seed: seed, rngState: seed}
+	ti := textinput.New()
+	ti.Prompt = "> "
+	ti.CharLimit = 9
+	ti.Validate = digitsOnly
+	ti.Focus()
+	m := model{
+		total: rounds, round: 1, started: time.Now(), seed: seed, rngState: seed,
+		input:    ti,
+		bar:      progress.New(progress.WithWidth(24)),
+		helpView: help.New(),
+		keys:     newKeyMap(),
+	}
 	m.next()
 	return m
 }
@@ -138,7 +192,8 @@ func newModel(seed int64, rounds int) model {
 func (m *model) next() {
 	m.rngState = (m.rngState*6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
 	s := m.rngState
-	m.input, m.feedback, m.answered = "", "", false
+	m.input.Reset()
+	m.feedback, m.answered = "", false
 
 	lvl := (m.round + 1) / 2
 	if lvl > 3 {
@@ -211,13 +266,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ks := msg.String()
 		note(markerKey + ks)
 
-		switch ks {
-		case "ctrl+c", "q":
+		switch {
+		case key.Matches(msg, m.keys.quit):
 			m.quit = true
 			m.done = true
 			m.record("quit")
 			return m, tea.Quit
-		case "enter":
+		case key.Matches(msg, m.keys.submit):
 			if m.answered {
 				m.round++
 				if m.round > m.total {
@@ -232,27 +287,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.evaluate()
 			m.record("submit")
 			return m, nil
-		case "backspace":
-			if n := len(m.input); n > 0 {
-				m.input = m.input[:n-1]
-			}
-			m.record("backspace")
-			return m, nil
-		case "s":
-			if !m.answered {
-				m.answered, m.feedback = true, "Skipped."
-				m.streak, m.incorrect = 0, m.incorrect+1
-			}
+		case key.Matches(msg, m.keys.skip) && !m.answered:
+			m.answered, m.feedback = true, "Skipped."
+			m.streak, m.incorrect = 0, m.incorrect+1
 			m.record("skip")
 			return m, nil
 		}
 
-		if t := msg.Key().Text; t != "" && !m.answered {
-			for _, r := range t {
-				if len(m.input) < 9 && (r >= '0' && r <= '9' || (r == '-' && len(m.input) == 0)) {
-					m.input += string(r)
-				}
+		if !m.answered {
+			// Everything else is the textinput's: digits insert, editing
+			// keys edit. A Validate-flagged candidate is rolled back —
+			// the input refuses non-digits, not merely their submission.
+			prev := m.input.Value()
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			if m.input.Err != nil {
+				m.input.SetValue(prev)
 			}
+			return m, cmd
 		}
 	}
 	return m, nil
@@ -268,14 +320,15 @@ func (m *model) record(label string) {
 }
 
 func (m *model) evaluate() {
-	n, err := strconv.Atoi(strings.TrimSpace(m.input))
+	s := strings.TrimSpace(m.input.Value())
+	n, err := strconv.Atoi(s)
 	switch {
-	case m.input == "":
+	case s == "":
 		m.feedback = "Type a number first."
 		return
 	case err != nil:
 		m.feedback = "Numbers only."
-		m.input = ""
+		m.input.Reset()
 		return
 	case n == m.answer:
 		m.streak++
@@ -302,7 +355,8 @@ func (m model) View() tea.View {
 	b.WriteString(col("Bubble Math", cTitle) + col("  (Bubble Tea on VirelaiOS)", cDim) + "\r\n")
 	b.WriteString(col(fmt.Sprintf("Round %d of %d", m.round, m.total), "1") + "   " + col("Tier "+m.tierName(), cTier) + "\r\n")
 	b.WriteString(col(fmt.Sprintf("Score %d   Streak %d   Correct %d   Wrong %d",
-		m.score, m.streak, m.correct, m.incorrect), cScore) + "\r\n\r\n")
+		m.score, m.streak, m.correct, m.incorrect), cScore) + "\r\n")
+	b.WriteString(m.bar.ViewAs(float64(m.correct+m.incorrect)/float64(m.total)) + "\r\n\r\n")
 
 	if m.done {
 		b.WriteString(col(fmt.Sprintf("Session over. Final score %d.", m.score), "1;33") + "\r\n")
@@ -316,13 +370,13 @@ func (m model) View() tea.View {
 			b.WriteString("   " + col(m.feedback, code) + "\r\n\r\n")
 			b.WriteString("   " + col("press Enter for the next question", cDim) + "\r\n")
 		} else {
-			b.WriteString(col("> ", cPrompt) + col(m.input, cInput) + col("_", cPrompt) + "\r\n")
+			b.WriteString(m.input.View() + "\r\n")
 			if m.feedback != "" {
 				b.WriteString("   " + col(m.feedback, cHint) + "\r\n")
 			}
 		}
 	}
-	b.WriteString("\r\n" + col("? help   s skip   q quit", cDim) + "\r\n")
+	b.WriteString("\r\n" + m.helpView.View(m.keys) + "\r\n")
 
 	return tea.NewView(b.String())
 }

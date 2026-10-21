@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/colorprofile"
 
 	"virelai/tabapp"
@@ -212,6 +213,12 @@ func runSelfTest(m model, saved bool) int {
 		{"record-written", "SESSION.TXT", "written", saved},
 	}
 
+	// The clipboard check is the guest-side proof for the atotto/clipboard
+	// virelai backend: the final score round-trips through the kernel's
+	// shared 512-byte seat clipboard via WriteAll/ReadAll.
+	clipGot, clipOK := clipboardRoundTrip(m.score)
+	checks = append(checks, check{"clipboard", clipGot, "65", clipOK && clipGot == "65"})
+
 	failed := 0
 	note("btmath: selftest begin checks=" + strconv.Itoa(len(checks)))
 	for _, c := range checks {
@@ -233,4 +240,19 @@ func runSelfTest(m model, saved bool) int {
 		return 1
 	}
 	return 0
+}
+
+// clipboardRoundTrip proves the atotto/clipboard virelai backend end-to-end:
+// the final score goes out through WriteAll and comes back through ReadAll
+// unchanged. The guest owns the verdict — the gate only reads the marker.
+func clipboardRoundTrip(score int) (string, bool) {
+	want := strconv.Itoa(score)
+	if err := clipboard.WriteAll(want); err != nil {
+		return "write-failed", false
+	}
+	got, err := clipboard.ReadAll()
+	if err != nil {
+		return "read-failed", false
+	}
+	return got, got == want
 }
