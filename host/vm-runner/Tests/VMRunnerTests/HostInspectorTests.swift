@@ -158,7 +158,11 @@ final class HostInspectorTests: XCTestCase {
         model.noteStop(card)
         model.isOpen = false // the operator closed the drawer
         model.noteStop(card) // the next poll tick re-observes the same end
-        XCTAssertEqual(lines, ["host-inspector: postmortem ending=stopped state=0 open=1"])
+        // The POSTMORTEM receipt emits once — M157b's `host-inspector:
+        // trace` receipts ride the same stream on each isOpen flip and
+        // are a different receipt family.
+        XCTAssertEqual(lines.filter { $0.hasPrefix("host-inspector: postmortem") },
+                       ["host-inspector: postmortem ending=stopped state=0 open=1"])
         XCTAssertFalse(model.isOpen, "a repeat note does not re-open the drawer")
         XCTAssertEqual(model.postmortem, card)
     }
@@ -188,6 +192,77 @@ final class HostInspectorTests: XCTestCase {
         model.isOpen = true
         model.ingest(serialText: "x\n")
         XCTAssertEqual(model.receiptDetail, "open=1 tail=1 saw=0")
+    }
+
+    // MARK: - the tracer feed (M157b #2935)
+
+    /// The same ingest that feeds the tail feeds the tracer — no
+    /// runner hook of its own.
+    func testIngestFeedsTheTracerRing() {
+        let model = HostInspector()
+        model.ingest(serialText: """
+            boot ok
+            [strace 7] sys_file_open(path="/host/TRACE.IN", len=14, flags=READ) = 0
+            [strace 7] sys_secret_get(<redacted>)
+            [strace junk
+            gosh: prompt
+            """ + "\n")
+        XCTAssertEqual(model.lines.count, 5) // the tail keeps every line
+        XCTAssertEqual(model.tracer.rows.count, 2)
+        XCTAssertEqual(model.tracer.malformedCount, 1)
+        XCTAssertEqual(model.tracer.rows[0].syscall, "sys_file_open")
+        XCTAssertEqual(model.tracer.rows[1].arguments, "<redacted>")
+    }
+
+    /// The `inspector` verb's flip of `isOpen` is also the trace
+    /// receipt's moment: `host-inspector: trace rows=<n> filter=<f>`
+    /// on the model's emit stream.
+    func testInspectorVerbEmitsTheTraceReceipt() {
+        let model = HostInspector()
+        var emitted: [String] = []
+        model.emit = { emitted.append($0) }
+        model.ingest(serialText: """
+            [strace 7] sys_ping_poll() = 0
+            [strace 7] sys_file_close(fd=0) = 0
+            """ + "\n")
+        let host = HostApplication(serialLog: "/fixture/serial.log", inspector: model, presentWindow: false)
+        XCTAssertEqual(host.commandBus.dispatch(.inspector), .performed)
+        XCTAssertEqual(emitted, ["host-inspector: trace rows=2 filter=-"])
+        model.tracer.pidFilterText = "7"
+        XCTAssertEqual(host.commandBus.dispatch(.inspector), .performed)
+        XCTAssertEqual(emitted.last, "host-inspector: trace rows=2 filter=pid:7")
+    }
+
+    /// The Trace tab projects the tracer: rows render in the serial
+    /// envelope, the filters narrow them, Pause flips its title.
+    func testTraceTabProjectsTheTracerModel() {
+        let model = HostInspector()
+        let bus = HostCommandBus { _ in }
+        let view = HostInspectorView(model: model, bus: bus)
+        XCTAssertEqual(view.selectedTab, .serial)
+        model.ingest(serialText: """
+            [strace 7] sys_file_open(path="/x", len=2, flags=READ) = 0
+            [strace 9] sys_exit(status=0) = <no-return>
+            """ + "\n")
+        view.selectTab(.trace)
+        XCTAssertEqual(view.selectedTab, .trace)
+        XCTAssertEqual(view.renderedTraceText, """
+            #1 [strace 7] sys_file_open(path="/x", len=2, flags=READ) = 0
+            #2 [strace 9] sys_exit(status=0) = <no-return>
+            """)
+        XCTAssertEqual(view.traceStatsText, "rows=2 dropped=0 malformed=0 skipped=0")
+        model.tracer.syscallFilter = "exit"
+        view.reload()
+        XCTAssertEqual(view.renderedTraceText, "#2 [strace 9] sys_exit(status=0) = <no-return>")
+        model.tracer.paused = true
+        view.reload()
+        XCTAssertEqual(view.tracePausedTitle, "Resume")
+        model.tracer.paused = false
+        view.reload()
+        XCTAssertEqual(view.tracePausedTitle, "Pause")
+        view.selectTab(.serial)
+        XCTAssertEqual(view.selectedTab, .serial)
+        XCTAssertEqual(view.renderedTailText, model.filteredLines.joined(separator: "\n"))
     }
 
     // MARK: - the session window binding

@@ -23,8 +23,17 @@ public final class HostInspector {
     /// counts the evictions in `droppedCount`.
     public let capacity: Int
 
+    /// M157b (#2935): the ADR 0043 tracer — a sibling ring fed by the
+    /// same ingest: every complete serial line the tail keeps also goes
+    /// through the tracer's `[strace …]` parse. It needs no runner hook
+    /// of its own — the feed is already this model's.
+    public let tracer = HostTracer()
+
     public init(capacity: Int = 2000) {
         self.capacity = max(1, capacity)
+        // A tracer mutation (new rows, a filter edit, pause/clear)
+        // repaints on the model's existing cadence.
+        tracer.onChange = { [weak self] in self?.onChange?() }
     }
 
     // MARK: Serial tail — the bounded ring buffer + search/filter.
@@ -69,10 +78,12 @@ public final class HostInspector {
         for line in fresh[fresh.startIndex..<nl].split(separator: "\n", omittingEmptySubsequences: false) {
             var line = line
             if line.hasSuffix("\r") { line.removeLast() }
-            lines.append(String(line))
+            let text = String(line)
+            lines.append(text)
             ingestedCount += 1
             sawAny = true
-            scanHostIntLine(String(line))
+            scanHostIntLine(text)
+            tracer.ingest(line: text)
         }
         if lines.count > capacity {
             lines.removeFirst(lines.count - capacity)
@@ -174,9 +185,10 @@ public final class HostInspector {
     public private(set) var postmortem: PostmortemCard?
 
     /// M120e (#2562): the receipt sink — the `host-inspector: postmortem`
-    /// line a live leg greps, on the same stdout stream the bus's
-    /// `host-ui:` receipts and the models' `host-*:` lines share (the
-    /// HostMachineModel emit precedent).
+    /// and (M157b #2935) `host-inspector: trace` lines a live leg greps,
+    /// on the same stdout stream the bus's `host-ui:` receipts and the
+    /// models' `host-*:` lines share (the HostMachineModel emit
+    /// precedent).
     public var emit: (String) -> Void = {
         FileHandle.standardOutput.write(Data(($0 + "\n").utf8))
     }
@@ -198,7 +210,15 @@ public final class HostInspector {
     /// Open/closed — the `inspector` verb toggles it in every mode: the
     /// session's registration also slides the real split pane; headless
     /// it is still honest model state a gate can read in the receipt.
-    public var isOpen = false { didSet { changed() } }
+    /// The flip is the verb's only model action, so it is also the M157b
+    /// (#2935) trace receipt's moment: `host-inspector: trace rows=<n>
+    /// filter=<f>` on the same stream the postmortem receipt rides.
+    public var isOpen = false {
+        didSet {
+            emit("host-inspector: trace rows=\(tracer.rows.count) filter=\(tracer.filterSummary)")
+            changed()
+        }
+    }
 
     /// The `inspector` verb's receipt tail: `open=N tail=N saw=N` — the
     /// drawer's live state, not just that an action ran (the M114b
