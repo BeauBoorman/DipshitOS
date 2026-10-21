@@ -41,9 +41,12 @@ var (
 var (
 	chatStart = "<" + "|im_start|>"
 	chatEnd   = "<" + "|im_end|>"
-	chatSys   = chatStart + "system\nYou are a helpful assistant." +
-		chatEnd + "\n"
+	chatSys   = chatStart + "system\n" + sysPromptDefault + chatEnd + "\n"
 )
+
+// sysPromptDefault is the persona a conversation carries without a preset
+// — the @@system turn's text replaces it when one heads the transcript.
+const sysPromptDefault = "You are a helpful assistant."
 
 // engine owns the compute session and loaded model for the app's life.
 // stub selects SynthStub instead of the staged VIW.
@@ -94,10 +97,18 @@ func (e *engine) prompt(c *conversation) []int {
 	tok := e.model.Tokenizer()
 	cap4 := e.model.Header().SeqCap - maxNew
 	var sb strings.Builder
+	// A leading @@system turn (a chosen preset) is the persona; it is
+	// outside the droppable window — the oldest exchange always falls
+	// first.
+	sys := chatSys
 	turns := c.turns
+	if len(turns) > 0 && turns[0].role == roleSystem {
+		sys = chatStart + "system\n" + turns[0].text + chatEnd + "\n"
+		turns = turns[1:]
+	}
 	for {
 		sb.Reset()
-		sb.WriteString(chatSys)
+		sb.WriteString(sys)
 		for _, t := range turns {
 			sb.WriteString(chatStart + t.role + "\n" + t.text + chatEnd + "\n")
 		}

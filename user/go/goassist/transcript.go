@@ -11,10 +11,10 @@ import "strings"
 type rlineKind uint8
 
 const (
-	rlUser rlineKind = iota // "you>" prefixed prompt lines
-	rlModel                 // assistant prose
-	rlCode                  // inside a ``` fence
-	rlMeta                  // status/note lines ("(cancelled)", refusals)
+	rlUser  rlineKind = iota // "you>" prefixed prompt lines
+	rlModel                  // assistant prose
+	rlCode                   // inside a ``` fence
+	rlMeta                   // status/note lines ("(cancelled)", refusals)
 )
 
 // rline is one wrapped display line.
@@ -50,6 +50,10 @@ func renderConv(c *conversation, px int, m measurer) []rline {
 			prefix = "you> "
 		case roleMeta:
 			kind = rlMeta
+		case roleSystem:
+			// The chosen preset heads the transcript — visible, muted.
+			kind = rlMeta
+			prefix = "persona> "
 		}
 		code := false
 		for _, ln := range strings.Split(t.text, "\n") {

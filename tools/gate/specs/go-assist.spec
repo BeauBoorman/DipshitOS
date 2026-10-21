@@ -28,15 +28,23 @@
 #       app bare (mode=restore), the staged blob re-opens the same
 #       C0001, and a typed follow-up commits a second turn pair into
 #       the same conversation file.
+#   07  (M152f #2920, stub) a typed "hi" opens C0001, F2 renames it to
+#       "Trip plan" (codec v2 header — the C#### name stays), then the
+#       snapshot chord saves SESSION.TABS with the title in the blob.
+#   08  (M152f #2920) the restore boot's marker names the title; then
+#       tab/delete/tab/return runs the confirm dialog to Yes and the
+#       file is gone from the share.
 #
 # The armed share persists across iterations, so per-leg python tails
-# keep each iteration honest: legs 01-04 clear ASSIST/*.CHAT after
-# their asserts (a fresh store => every sending leg sees C0001 and the
-# pinned decodes stay deterministic), leg 03's tail un-stages the VIW
+# keep each iteration honest: legs 01-04 and leg 06 clear ASSIST/*.CHAT
+# after their asserts (a fresh store => every sending leg sees C0001 and
+# the pinned decodes stay deterministic), leg 03's tail un-stages the VIW
 # and leg 04's tail re-stages it so leg 04's weights-absent boot is
-# honest every iteration while legs 05/06 ride the real model.
+# honest every iteration while legs 05/06 ride the real model. Leg 08's
+# own delete leaves the store empty again.
 # script-seat.txt's `vf rm`s keep a leftover SESSION.TABS from
-# restoring into legs 01-05's boots; leg 06 alone must find it.
+# restoring into legs 01-05's and 07's boots; legs 06 and 08 alone must
+# find it.
 #
 # Legs 02/03 use the `stub` persona (SynthStub) so the stream is
 # deterministic without staged weights; leg 04 covers the absent-weight
@@ -53,7 +61,7 @@
 # OPTIONAL (else the journey legs prove the named refusal):
 #   artifacts/goinfer/SMOLLM2.VIW -- python3 tools/goinfer/convert-smollm2.py
 
-vgate_name go-assist "M140b #2785 + M140c #2786: GOASSIST.ELF under GOTABWM — seat GPU-compute probe, streamed stub answer + conversation file, crash-restart restore, weights-absent named refusal, K=3 journey: real SmolLM2 question + snapshot + session-restore + same-conversation follow-up"
+vgate_name go-assist "M140b #2785 + M140c #2786 + M152f #2920: GOASSIST.ELF under GOTABWM — seat GPU-compute probe, streamed stub answer + conversation file, crash-restart restore, weights-absent named refusal, K=3 journey: real SmolLM2 question + snapshot + session-restore + same-conversation follow-up; v2 legs: stub rename C0001 -> 'Trip plan' + snapshot, restore boot shows the title, delete with confirm removes the file"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -561,4 +569,119 @@ for want in ("what is the capital of france", "what about spain"):
 print("restore leg: same conv %s, %d streamed follow-up tokens, 4 turns intact"
       % (name, ntoks))
 print("observed ids: " + m2.group(2))
+PY
+# Iteration hygiene, tail-hook: the M152f legs want a fresh store so leg
+# 07's send lands in C0001. Declared after this leg's asserts so the checks
+# above still see the share exactly as the leg left it.
+vgate_assert 06 python <<'PY'
+import glob, os
+n = 0
+for f in glob.glob(os.path.join(os.environ["VG_SHARE"], "ASSIST", "*.CHAT")):
+    os.remove(f)
+    n += 1
+print("conversation store cleared for leg 07 (%d file(s))" % n)
+PY
+
+# --- leg 07 (M152f #2920): rename C0001 -> "Trip plan", then snapshot -----
+# The stub leg keeps this deterministic on any host: "hi" + Return opens
+# C0001 and streams its answer, `tab` moves focus onto the sidebar, `f2`
+# raises the rename prompt, the chords type the title, and Return lands
+# it — the file's codec-v2 header carries it from there on. The queued
+# snapshot chord then saves SESSION.TABS + SNAPSHOT.BUNDLE with the blob's
+# title aboard, exactly like leg 05's commit-quiet ask.
+vgate_file script-rx8.txt <<'EOF'
+echo rx-assist-8-ok
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --gpu3d-metal --via-virtio \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-stub.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --input-chords 'h,i,return,tab,f2,T,r,i,p,space,p,l,a,n,return,ctrl-shift-s' \
+    --input-chords-after 'goassist: present' \
+    --script-expect 'gotabwm: snapshot saved bytes=' --timeout 300
+
+vgate_assert 07 serial-contains 'goassist: open id='
+vgate_assert 07 serial-contains 'goassist: declare accepted'
+vgate_assert 07 serial-contains 'goassist: present'
+vgate_assert 07 serial-contains 'goassist: conv new C0001'
+vgate_assert 07 serial-contains 'goassist: send conv=C0001'
+vgate_assert 07 serial-contains 'goassist: committed conv=C0001'
+vgate_assert 07 serial-contains 'goassist: renamed conv=C0001 title=Trip plan'
+vgate_assert 07 serial-contains 'gotabwm: state ask id='
+vgate_assert 07 serial-contains 'gotabwm: state save id='
+vgate_assert 07 serial-contains 'gotabwm: snapshot saved bytes='
+vgate_assert 07 serial-absent 'goassist: rename refused'
+vgate_assert 07 serial-absent 'goassist: error'
+vgate_assert 07 serial-absent 'goassist: cancelled'
+vgate_assert 07 serial-absent 'gpu3d: timeout'
+vgate_assert 07 serial-absent '[EXC] parking:'
+# The conversation file IS the rename evidence: codec v2, the title line
+# ahead of the user turn, and the C#### name unmoved.
+vgate_assert 07 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+body = open(os.path.join(share, "ASSIST", "C0001.CHAT"),
+            "rb").read().decode("utf-8", "replace")
+for want in ("GOASSIST-CHAT v2\n@@title Trip plan\n",
+             "@@user\nhi\n", "@@assistant\n"):
+    if want not in body:
+        sys.exit("renamed conv file missing %r\n%s" % (want, body))
+print("C0001.CHAT carries @@title Trip plan")
+PY
+# The blob carries the title too — the card's contract — and the rename
+# committed before the snapshot arm answered (order like leg 05's).
+vgate_assert 07 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+r = ser.find("goassist: renamed conv=C0001 title=Trip plan")
+s = ser.find("gotabwm: snapshot saved")
+if r < 0 or s < 0 or s < r:
+    sys.exit("rename must commit before the snapshot saves")
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b"Trip plan" not in b:
+    sys.exit("the session blob did not carry the title")
+print("snapshot landed after the rename; the blob carries 'Trip plan'")
+PY
+
+# --- leg 08 (M152f #2920): the restore boot shows the title; delete --------
+# SESSION.TABS re-execs GOASSIST.ELF bare (mode=restore) like leg 06; the
+# blob re-opens C0001 and the restored marker names the title the file
+# carries. Then `tab` focuses the sidebar, `delete` raises the confirm
+# (focus starts on No), `tab` moves to Yes, `return` confirms — the python
+# tail checks the file is gone.
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
+    --gpu3d-metal --via-virtio \
+    --script '$RUN_DIR/script-seat6.txt' \
+    --input-chords 'tab,delete,tab,return' \
+    --input-chords-after 'goassist: present' \
+    --script3 '$RUN_DIR/script-rx8.txt' \
+    --script3-after 'goassist: conv deleted C0001' \
+    --script-expect 'rx-assist-8-ok' --timeout 300
+
+vgate_assert 08 serial-contains 'gotabwm: mode live'
+vgate_assert 08 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 08 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 08 serial-contains 'gotabwm: session exec GOASSIST.ELF'
+vgate_assert 08 serial-contains 'goassist: open id='
+vgate_assert 08 serial-contains 'goassist: declare accepted'
+vgate_assert 08 serial-contains 'goassist: state restored conv=C0001'
+vgate_assert 08 serial-contains 'title=Trip plan'
+vgate_assert 08 serial-contains 'goassist: conv deleted C0001'
+vgate_assert 08 serial-contains 'rx-assist-8-ok'
+vgate_assert 08 serial-absent 'goassist: state refused'
+vgate_assert 08 serial-absent 'goassist: state mismatch'
+vgate_assert 08 serial-absent 'goassist: error'
+vgate_assert 08 serial-absent '[EXC] parking:'
+# Delete-with-confirm evidence: the transcript file is gone from the
+# armed share — exactly the check the card names.
+vgate_assert 08 python <<'PY'
+import os, sys
+path = os.path.join(os.environ["VG_SHARE"], "ASSIST", "C0001.CHAT")
+if os.path.exists(path):
+    sys.exit("the confirmed delete left %s on the share" % path)
+print("delete-with-confirm removed ASSIST/C0001.CHAT")
 PY

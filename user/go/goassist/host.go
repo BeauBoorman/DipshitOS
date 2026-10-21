@@ -32,6 +32,9 @@ type host interface {
 	// ListDir names a directory's entries (non-recursive; "." order is
 	// the store's own sort upstream).
 	ListDir(dir string) ([]string, error)
+	// DeleteFile removes a store file (vi.FileDelete); a file already
+	// gone is success.
+	DeleteFile(path string) error
 	// OpenComp takes the compute session (slot 90); ENXIO maps to
 	// gpu3d.ErrComputeNoDevice.
 	OpenComp() (infer.Dev, error)
@@ -139,6 +142,13 @@ func (guestHost) ListDir(dir string) ([]string, error) {
 		names = append(names, entries[i].NameString())
 	}
 	return names, nil
+}
+
+func (guestHost) DeleteFile(path string) error {
+	if rc := vi.FileDelete(path); rc < 0 && rc != vi.ErrFileNotFound {
+		return errors.New("delete " + strconv.FormatInt(rc, 10))
+	}
+	return nil
 }
 
 func (guestHost) OpenComp() (infer.Dev, error) { return gpu3d.OpenCompute() }
