@@ -107,6 +107,20 @@ type TabStrip struct {
 	closed      [MaxTabs]ClosedTab
 	closedCount int
 	closedLive  int
+	// M151a (#2912): pane posture. zoomTab is the leaf currently zoomed
+	// to the full viewport while its siblings park hidden — transient
+	// seat state, never written to SESSION.PANES; every tree mutation
+	// clears it (the seat restores the parked rects first). mru is the
+	// bounded most-recently-used focus ring (mruMax ids): fixupAfterDetach
+	// and the unsplit paths draw the next focus from it, so a close or a
+	// pane dissolve lands on the most recent SURVIVOR instead of the
+	// rail-index neighbour. lastFocusRestore names the id the last fixup
+	// picked from the ring (0 = the neighbour fallback ran) so the seat
+	// can mark the restore.
+	zoomTab          uint32
+	mru              [mruMax]uint32
+	mruN             int
+	lastFocusRestore uint32
 }
 
 // ClosedTab is one reopen-LIFO entry: the executable and title recorded when
@@ -179,7 +193,19 @@ const (
 	MarkerStateSave    = "gotabwm: state save id="
 	MarkerStateRestore = "gotabwm: state restore id="
 	MarkerStateDrop    = "gotabwm: state drop "
+	// M151a (#2912): pane posture. `zoom on`/`zoom off` bracket a
+	// transient full-viewport leaf; `pane drop` is a rail drag released
+	// over a leaf's client rect (id, leaf node index); `focus restore`
+	// names the MRU survivor a close or unsplit lands on and which op
+	// asked (why=close|unsplit).
+	MarkerZoomOn       = "gotabwm: zoom on id="
+	MarkerZoomOff      = "gotabwm: zoom off"
+	MarkerPaneDrop     = "gotabwm: pane drop "
+	MarkerFocusRestore = "gotabwm: focus restore "
 )
+
+// mruMax is the M151a focus-ring bound — the card's eight ids.
+const mruMax = 8
 
 // M79e (#1708): the nav-history bounds, taken from Zig's tabwm rather than
 // invented. navHistMax is `hist_max`; navPathMax is `hist_path_max`, which
@@ -368,6 +394,7 @@ func (s *TabStrip) OpenTab(id uint32, title string) bool {
 	s.tabs[s.count] = Tab{ID: id, Title: title, Bin: guessBin(title)}
 	if s.count == 0 {
 		s.focus = 0
+		s.mruNote(id)
 	}
 	s.count++
 	return true
@@ -526,10 +553,11 @@ func (s *TabStrip) NavDepth(id uint32) int {
 	return s.tabs[i].navCount
 }
 
-// CloseTab removes id. If it was focused, focus moves to the neighbour
-// that occupies its slot after the shift (or the new last tab). Closing
-// the last tab leaves the strip empty with no focus. Returns whether id
-// was present.
+// CloseTab removes id. If it was focused, focus moves to the most recent
+// SURVIVING tab on the MRU ring (M151a), falling back to the neighbour
+// that occupies its slot after the shift (or the new last tab) only when
+// the ring has nothing live. Closing the last tab leaves the strip empty
+// with no focus. Returns whether id was present.
 func (s *TabStrip) CloseTab(id uint32) bool {
 	i := s.index(id)
 	if i < 0 {
@@ -562,22 +590,34 @@ func (s *TabStrip) CloseTab(id uint32) bool {
 	if li := s.leafOf(id); li >= 0 {
 		s.removeLeaf(li)
 	}
+	s.mruDrop(id)
 	s.fixupAfterDetach(i)
 	return true
 }
 
 // fixupAfterDetach repairs focus and the tree after row i was spliced
-// out — the shared tail of CloseTab and detachTabAt.
+// out — the shared tail of CloseTab and detachTabAt. When the removed
+// row was focused, the most recent surviving tab on the MRU ring takes
+// focus (M151a); the rail-index neighbour rule is only the fallback for
+// an empty ring, and lastFocusRestore records which pick landed.
 func (s *TabStrip) fixupAfterDetach(i int) {
+	s.lastFocusRestore = 0
 	if s.count == 0 {
 		s.focus = 0
 		s.treeN = 0
 		return
 	}
+	removedFocused := s.focus == i
 	if s.focus > i {
 		s.focus--
 	} else if s.focus >= s.count {
 		s.focus = s.count - 1
+	}
+	if removedFocused {
+		if id, ok := s.mruTop(); ok {
+			s.focus = s.index(id)
+			s.lastFocusRestore = id
+		}
 	}
 	if s.count < 2 {
 		s.treeN = 0
@@ -602,6 +642,7 @@ func (s *TabStrip) detachTabAt(i int) (Tab, bool) {
 	if li := s.leafOf(t0.ID); li >= 0 {
 		s.removeLeaf(li)
 	}
+	s.mruDrop(t0.ID)
 	s.fixupAfterDetach(i)
 	return t0, true
 }
@@ -661,13 +702,77 @@ func (s *TabStrip) DuplicateFocused() (string, bool) {
 }
 
 // FocusTab makes id the focused tab. Returns false when id is not open.
+// Every focus change feeds the M151a MRU ring through here.
 func (s *TabStrip) FocusTab(id uint32) bool {
 	i := s.index(id)
 	if i < 0 {
 		return false
 	}
 	s.focus = i
+	s.mruNote(id)
 	return true
+}
+
+// --- M151a (#2912): the MRU focus ring --------------------------------------
+//
+// mru records focus order, most-recent-first, bounded at mruMax ids. A
+// re-focus moves its id to the front (no duplicates); a close or a detach
+// drops its id so the ring holds survivors only, and a re-exec adoption
+// remaps the placeholder id like retreeID does for leaves.
+
+// mruNote moves id to the ring's front, evicting the oldest at the bound.
+func (s *TabStrip) mruNote(id uint32) {
+	if id == 0 {
+		return
+	}
+	s.mruDrop(id)
+	if s.mruN == mruMax {
+		s.mruN--
+	}
+	copy(s.mru[1:s.mruN+1], s.mru[:s.mruN])
+	s.mru[0] = id
+	s.mruN++
+}
+
+// mruDrop removes id from the ring.
+func (s *TabStrip) mruDrop(id uint32) {
+	for i := 0; i < s.mruN; i++ {
+		if s.mru[i] == id {
+			copy(s.mru[i:s.mruN-1], s.mru[i+1:s.mruN])
+			s.mruN--
+			s.mru[s.mruN] = 0
+			return
+		}
+	}
+}
+
+// mruRemap retargets a ring entry across an id swap (re-exec adoption).
+func (s *TabStrip) mruRemap(old, new uint32) {
+	for i := 0; i < s.mruN; i++ {
+		if s.mru[i] == old {
+			s.mru[i] = new
+		}
+	}
+}
+
+// mruTop is the most recent ring id still on the strip — the focus-
+// restore target. False when the ring holds no survivor.
+func (s *TabStrip) mruTop() (uint32, bool) {
+	for i := 0; i < s.mruN; i++ {
+		if s.index(s.mru[i]) >= 0 {
+			return s.mru[i], true
+		}
+	}
+	return 0, false
+}
+
+// takeFocusRestore reports (and clears) the id the last fixupAfterDetach
+// drew from the ring; false when the rail-index fallback ran. The seat
+// prints `focus restore` only for a ring pick.
+func (s *TabStrip) takeFocusRestore() (uint32, bool) {
+	id := s.lastFocusRestore
+	s.lastFocusRestore = 0
+	return id, id != 0
 }
 
 // NextID is the window id cycle would move to (wrap). One tab returns
@@ -866,11 +971,13 @@ func (s *TabStrip) SplitV() bool {
 }
 
 // Unsplit dissolves the whole tree — every pane back to the
-// full-viewport stack. False when no tree stands.
+// full-viewport stack. False when no tree stands. A dissolve is a tree
+// mutation: any standing zoom clears (M151a).
 func (s *TabStrip) Unsplit() bool {
 	if s.treeN == 0 {
 		return false
 	}
+	s.zoomTab = 0 // M151a
 	s.treeN = 0
 	return true
 }
@@ -1077,6 +1184,7 @@ func (s *TabStrip) SetSashNode(i, pos int, scanW, scanH uint32) bool {
 	if c == s.nodeSashCenter(i, scanW, scanH) {
 		return false
 	}
+	s.zoomTab = 0 // M151a: a sash move re-lays the tree; zoom restores
 	s.tree[i].sash = c
 	return true
 }

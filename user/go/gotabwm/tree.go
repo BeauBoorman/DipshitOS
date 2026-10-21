@@ -200,11 +200,13 @@ func (s *TabStrip) parentOf(i int) int {
 
 // removeLeaf splices leaf i out: its parent's other subtree rises into
 // the parent's slot, or the tree empties when i is the root. Returns
-// false when i is not a leaf.
+// false when i is not a leaf. A leaf death is a tree mutation — any
+// standing zoom clears (M151a; the seat's close path restores first).
 func (s *TabStrip) removeLeaf(i int) bool {
 	if i < 0 || i >= s.treeN || s.tree[i].kind != SplitNone {
 		return false
 	}
+	s.zoomTab = 0 // M151a
 	p := s.parentOf(i)
 	if p < 0 {
 		s.treeN = 0
@@ -222,11 +224,16 @@ func (s *TabStrip) removeLeaf(i int) bool {
 }
 
 // retreeID swaps a leaf's hosted id (the re-exec adoption seam: the
-// placeholder id dies and the live window id lands).
+// placeholder id dies and the live window id lands). The MRU ring and a
+// standing zoom name ids too — they remap along (M151a).
 func (s *TabStrip) retreeID(old, new uint32) {
 	if i := s.leafOf(old); i >= 0 {
 		s.tree[i].tab = new
 	}
+	if s.zoomTab == old {
+		s.zoomTab = new
+	}
+	s.mruRemap(old, new)
 }
 
 // relinkLeaves re-binds leaves to strip POSITIONS in tree order — the
@@ -238,6 +245,7 @@ func (s *TabStrip) relinkLeaves() {
 	if s.treeN == 0 {
 		return
 	}
+	s.zoomTab = 0 // M151a: re-binding panes restores a standing zoom
 	i := 0
 	var walk func(ni int)
 	walk = func(ni int) {
@@ -462,6 +470,7 @@ func (s *TabStrip) SplitPane(kind SplitKind, scanW, scanH uint32) bool {
 		if _, _, ok := splitRectIn(kind, FullRect(scanW, scanH), 0); !ok {
 			return false
 		}
+		s.zoomTab = 0 // M151a
 		root := s.allocNode()
 		ta, tb := s.allocNode(), s.allocNode()
 		if root < 0 || ta < 0 || tb < 0 {
@@ -495,6 +504,7 @@ func (s *TabStrip) SplitPane(kind SplitKind, scanW, scanH uint32) bool {
 	if _, _, ok := splitRectIn(kind, r, 0); !ok {
 		return false
 	}
+	s.zoomTab = 0 // M151a: any tree mutation restores a standing zoom
 	return s.splitLeaf(leaf, kind, b)
 }
 
@@ -543,6 +553,7 @@ func (s *TabStrip) RotatePane(scanW, scanH uint32) bool {
 	if _, _, ok := splitRectIn(next, s.nodeRect(p, scanW, scanH), 0); !ok {
 		return false
 	}
+	s.zoomTab = 0 // M151a: a rotated layout restores a standing zoom
 	s.tree[p].kind = next
 	// The divider centre lives on the split axis; a rotated node starts
 	// back at the midpoint rather than re-clamping a stale x into a y.
@@ -568,6 +579,7 @@ func (s *TabStrip) UnsplitPane() bool {
 		return false
 	}
 	if s.tree[p].kind == SplitHoriz || s.tree[p].kind == SplitVert {
+		s.zoomTab = 0 // M151a
 		s.collapseAt(p, fid)
 		return true
 	}
@@ -626,6 +638,83 @@ func (s *TabStrip) FocusedPaneKind() SplitKind {
 		return s.tree[p].kind
 	}
 	return SplitNone
+}
+
+// leafHitAt is the M151a drop hit-test: the leaf NODE INDEX whose client
+// rect holds (px,py), or false off every pane. The chrome guards are
+// sashHitAt's — the rail owns y < RailHeight and the bottom 22 px are
+// never pane territory; the sash gutter lands in no rect, so a divider
+// release is not a drop.
+func (s *TabStrip) leafHitAt(px, py uint32, scanW, scanH uint32) (int, bool) {
+	if s.treeN == 0 {
+		return 0, false
+	}
+	if py < uint32(RailHeight) || int(py)+22 > int(scanH) || int(px) >= int(scanW) {
+		return 0, false
+	}
+	hit := -1
+	var walk func(i int, r Rect) bool
+	walk = func(i int, r Rect) bool {
+		n := s.tree[i]
+		if n.kind == SplitNone {
+			if n.tab != 0 && int(px) >= int(r.X) && int(px) < int(r.X+r.W) &&
+				int(py) >= int(r.Y) && int(py) < int(r.Y+r.H) {
+				hit = i
+				return true
+			}
+			return false
+		}
+		ra, rb, ok := splitRectIn(n.kind, r, n.sash)
+		if !ok {
+			return false
+		}
+		return walk(int(n.a), ra) || walk(int(n.b), rb)
+	}
+	walk(0, FullRect(scanW, scanH))
+	if hit < 0 {
+		return 0, false
+	}
+	return hit, true
+}
+
+// paneDrop seats tab id on leaf li (M151a): an id that already holds a
+// leaf swaps with the target's host; an unplaced id takes the leaf and
+// the displaced host goes back to the unplaced stack. False on a bad
+// index, a non-leaf, a same-leaf release, or a tab not on the strip.
+func (s *TabStrip) paneDrop(id uint32, li int) bool {
+	if li < 0 || li >= s.treeN || s.tree[li].kind != SplitNone {
+		return false
+	}
+	if s.index(id) < 0 {
+		return false
+	}
+	if src := s.leafOf(id); src >= 0 {
+		if src == li {
+			return false
+		}
+		s.tree[src].tab, s.tree[li].tab = s.tree[li].tab, id
+		s.zoomTab = 0 // M151a: a drop mutates the tree; zoom restores
+		return true
+	}
+	s.tree[li].tab = id
+	s.zoomTab = 0 // M151a
+	return true
+}
+
+// ZoomFocused marks the focused leaf zoomed — it renders the full
+// viewport while its sibling leaves park hidden (M151a). Refused when
+// nothing is focused, the focused tab holds no leaf, fewer than two
+// panes stand (nothing to park), or a zoom is already up.
+func (s *TabStrip) ZoomFocused() bool {
+	fid, ok := s.Focused()
+	if !ok || s.zoomTab != 0 {
+		return false
+	}
+	if s.leafOf(fid) < 0 || s.leafCount() < 2 {
+		return false
+	}
+	s.zoomTab = fid
+	return true
 }
 
 // paneFocusMove moves focus to the nearest pane in direction dx/dy

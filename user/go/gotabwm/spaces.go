@@ -133,6 +133,9 @@ func spaceSwitchTo(dst int) bool {
 	if dst < 0 || dst >= spaceN || dst == spaceCur {
 		return false
 	}
+	// M151a: a space switch re-lays the desktop — a standing zoom on
+	// the outgoing strip restores before it parks.
+	restorePaneZoom()
 	old := spaceCur
 	spaces[old].Strip = tabs
 	spaceCur = dst
@@ -145,6 +148,7 @@ func spaceSwitchTo(dst int) bool {
 			hostedApp = fid
 			vi.ConsoleLine(MarkerTabFocus + vi.Itoa64(int64(fid)))
 			vi.ConsoleLine(MarkerHostFocus + vi.Itoa64(int64(fid)))
+			tabs.mruNote(fid) // M151a: the landing focus is a focus
 		}
 	}
 	vi.ConsoleLine(MarkerSpaceSwitch + spaces[old].Name + "->" + spaces[dst].Name)
@@ -183,6 +187,9 @@ func applySpaceMove(id uint32, name string) bool {
 	if i < 0 {
 		return false
 	}
+	// M151a: a move detaches a leaf from the live tree — a standing
+	// zoom restores first.
+	restorePaneZoom()
 	si := spaceIndexByName(name)
 	if si == spaceCur {
 		return false
@@ -210,6 +217,7 @@ func applySpaceMove(id uint32, name string) bool {
 		dst.normalizePinned()
 	}
 	dst.focus = dst.index(id)
+	dst.mruNote(id) // M151a: the moved tab is the destination's most recent
 	if id < sessionIDBase {
 		wmctlSetVisible(id, false)
 	}

@@ -311,8 +311,10 @@ func TestHandleWmKeyMoveAndCloseChords(t *testing.T) {
 		t.Fatalf("plain ctrl+w closed %v — it is the editor's chord", closed)
 	}
 	// ctrl+shift+w closes the focused tab: the WM close fires once with id 3,
-	// the strip drops to two tabs, and focus hands off to the neighbour that
-	// took its slot (M62b), so exactly one raise runs.
+	// the strip drops to two tabs, and focus hands off to the most recent
+	// SURVIVING tab on the MRU ring (M151a) — the focus order here is
+	// 3,5,...,3 so 5 is the survivor (the rail neighbour would say 4),
+	// so exactly one raise runs.
 	key(hidUsageW)
 	if len(closed) != 1 || closed[0] != 3 {
 		t.Fatalf("close chord closed %v want [3]", closed)
@@ -320,11 +322,11 @@ func TestHandleWmKeyMoveAndCloseChords(t *testing.T) {
 	if tabs.Count() != 2 || tabs.At(0).ID != 4 || tabs.At(1).ID != 5 {
 		t.Fatalf("strip after close: ids=%d,%d want 4,5", tabs.At(0).ID, tabs.At(1).ID)
 	}
-	if id, _ := tabs.Focused(); id != 4 {
-		t.Fatalf("focus after the focused close = %d want 4", id)
+	if id, _ := tabs.Focused(); id != 5 {
+		t.Fatalf("focus after the focused close = %d want 5 (MRU survivor)", id)
 	}
-	if len(raises) != 1 || raises[0] != 4 {
-		t.Fatalf("focused close raised %v want [4]", raises)
+	if len(raises) != 1 || raises[0] != 5 {
+		t.Fatalf("focused close raised %v want [5]", raises)
 	}
 	// The closed tab landed on the reopen LIFO — ctrl+shift+t's source.
 	if c, ok := tabs.RecentlyClosed(0); !ok || c.Bin != "A" {

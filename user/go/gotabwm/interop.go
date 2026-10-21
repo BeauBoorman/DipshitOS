@@ -733,6 +733,9 @@ func closeTabByID(id uint32) bool {
 	if id == 0 {
 		return false
 	}
+	// M151a: a close under a standing zoom restores the tree first —
+	// the parked panes show before the close's own re-layout.
+	restorePaneZoom()
 	fid, focused := tabs.Focused()
 	wasFocused := focused && fid == id
 	// M125a (#2586): the closing tab gets its one-shot save ask before the
@@ -771,6 +774,12 @@ func closeTabByID(id uint32) bool {
 			if focusRaise(nid) == 0 {
 				vi.ConsoleLine(MarkerTabFocus + vi.Itoa64(int64(nid)))
 				vi.ConsoleLine(MarkerHostFocus + vi.Itoa64(int64(nid)))
+				// M151a: the pick came off the MRU ring — name it so
+				// the gate can tell it from the rail-index fallback.
+				if rid, ok := tabs.takeFocusRestore(); ok && rid == nid {
+					vi.ConsoleLine(MarkerFocusRestore + "id=" +
+						vi.Itoa64(int64(nid)) + " why=close")
+				}
 			}
 		}
 	} else {

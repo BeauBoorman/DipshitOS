@@ -8,7 +8,7 @@
 # #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# TWENTY-THREE vgate_runs share one seeded host share (`vgate_share seed`):
+# TWENTY-FOUR vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -102,6 +102,14 @@
 #   23  M137c (#2773): the restore. A fresh boot stages SNAPSHOT.RESTORE,
 #       the bundle rehydrates the two-space session + sidecar, and a
 #       switch chord round-trips the restored table — every space intact.
+#   24  M151a (#2912): pane posture. LIVE mode, GOCALC+NOTE. The split
+#       chord, then the palette's "Zoom pane" row: the LAYOUT dump shows
+#       the focused leaf full-viewport and a `dui` registry dump (the
+#       scanout probe) shows the kernel's real rect + the parked
+#       sibling's visible=0 while zoomed. "Restore panes" then a rail
+#       drag released over the other pane's client rect — `pane drop` —
+#       and a close-x on the focused cell: `focus restore ... why=close`
+#       names the MRU survivor. The run ends on the seat's own marker.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -2956,3 +2964,168 @@ vgate_assert 23 serial-absent 'gotabwm: panes bad'
 vgate_assert 23 serial-absent 'gotabwm: session bad'
 vgate_assert 23 serial-absent '[EXC] parking:'
 vgate_assert 23 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 24 (M151a / #2912): pane posture — zoom, rail drag into a pane, MRU
+# focus restore. LIVE mode (the DEMO trigger is removed), GOCALC+NOTE like
+# run 01's pair.
+#
+# Chord/pointer choreography (each stage waits on the previous leg's own
+# marker):
+#   ctrl-shift-v            split the focused pane (last declarer takes the
+#                           left leaf, the other tab the right)
+#   palette "Zoom pane"     the focused leaf goes full-viewport, the sibling
+#                           parks hidden — the script3 `dui` dump lands
+#                           INSIDE the zoom window (it fires on `zoom on`
+#                           and the ~4 s of restore-palette keystrokes
+#                           hold the posture open), so the kernel registry
+#                           is the scanout probe: zoomed rect 0,0,1280,720
+#                           and the parked user window visible=0.
+#   palette "Restore panes" the tree re-lands (`zoom off`)
+#   two rail drags onto the right pane — cell1's tab drops (swap), then
+#                           cell0's (now the left leaf after the first
+#                           swap) drops back: exactly two `pane drop`
+#                           markers, ending in the original placement
+#   click cell1's body      re-focuses it (feeds the MRU ring)
+#   click cell1's close-x   a focused close: `focus restore id= why=close`
+#                           names the most recent survivor
+# The run ends on the seat's `focus restore` marker — the last leg's own
+# evidence, so no script-supplied tail can outrun it.
+vgate_file script-24.txt <<'EOF2'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+wm
+exec GOTABWM.ELF
+EOF2
+
+vgate_file script2-24.txt <<'EOF2'
+dui focus 0
+exec GOCALC.ELF
+exec NOTE.ELF
+EOF2
+
+# script3 is the mid-zoom probe, not the tail: `dui` lands while the
+# palette's restore strokes are still draining.
+vgate_file script3-24.txt <<'EOF2'
+dui
+EOF2
+
+vgate_run 24 -- \
+    --screen '$RUN_DIR/screen-24' \
+    --via-virtio \
+    --script '$RUN_DIR/script-24.txt' \
+    --script2 '$RUN_DIR/script2-24.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-shift-v,ctrl-shift-p,z,o,o,m,space,p,a,n,e,return,ctrl-shift-p,r,e,s,t,o,r,e,space,p,a,n,e,s,return' \
+    --input-chords-after 'gotabwm: rail n=2' \
+    --script3 '$RUN_DIR/script3-24.txt' \
+    --script3-after 'gotabwm: zoom on id=' \
+    --pointer-virtio '960,8,d;1000,400,u;100,8,d;1000,400,u;700,8,c;1270,8,c' \
+    --pointer-virtio-after 'gotabwm: zoom off' \
+    --script-expect 'gotabwm: focus restore' --timeout 300
+
+vgate_assert 24 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 24 serial-contains 'gotabwm: registered'
+vgate_assert 24 serial-contains 'gotabwm: mode live'
+vgate_assert 24 serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert 24 serial-contains 'exec: loaded NOTE.ELF'
+vgate_assert 24 serial-contains 'gotabwm: rail n=2'
+vgate_assert 24 serial-contains 'gotabwm: split v'
+# The palette rows dispatched and the posture markers printed.
+vgate_assert 24 serial-contains 'gotabwm: palette run zoom-pane'
+vgate_assert 24 serial-contains 'gotabwm: zoom on id='
+vgate_assert 24 serial-contains 'gotabwm: palette run restore-panes'
+vgate_assert 24 serial-contains 'gotabwm: zoom off'
+# The drop and the MRU focus restore.
+vgate_assert 24 serial-contains 'gotabwm: pane drop id='
+vgate_assert 24 serial-contains ' leaf='
+vgate_assert 24 serial-contains 'gotabwm: tab close id='
+vgate_assert 24 serial-contains 'gotabwm: focus restore id='
+vgate_assert 24 serial-contains ' why=close'
+vgate_assert 24 serial-absent 'gotabwm: panes bad'
+vgate_assert 24 serial-absent '[EXC] parking:'
+vgate_assert 24 serial-absent 'exited status=139'
+# Zoom ordering + the zoomed LAYOUT dump: the layout lines between
+# `zoom on` and `zoom off` show the zoomed tab at the full viewport with
+# focus=1 (the dump names the applied rect, not the tree's).
+vgate_assert 24 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+zi = ser.find("gotabwm: zoom on id=")
+zo = ser.find("gotabwm: zoom off")
+pd = ser.find("gotabwm: pane drop")
+fr = ser.find("gotabwm: focus restore")
+if not (0 <= zi < zo < pd < fr):
+    sys.exit("leg order wrong: zoom_on=%d zoom_off=%d drop=%d restore=%d"
+             % (zi, zo, pd, fr))
+m = re.search(r"gotabwm: zoom on id=(\d+)", ser)
+zid = m.group(1)
+lay = re.search(r"gotabwm: layout tab=%s .*w=1280 h=720.*focus=1" % zid,
+                ser[zi:zo])
+if not lay:
+    sys.exit("no zoomed full-viewport layout line for tab %s" % zid)
+# The sibling's own pane rect still dumps (parked, not resized).
+other = re.findall(r"gotabwm: layout tab=(\d+) .*w=640 h=720", ser[zi:zo])
+if not other or zid in other:
+    sys.exit("no parked sibling at its pane rect: %s" % other)
+print("zoom on id=%s: layout %s ; parked %s" % (zid, lay.group(0), other))
+PY
+# The scanout probe: script3's `dui` ran inside the zoom window, so the
+# kernel registry shows the zoomed user window at the full scanout and
+# the parked sibling hidden — between `zoom on` and `zoom off` in serial.
+vgate_assert 24 python <<'PY'
+import os, re, sys
+lines = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+zi = next(i for i, l in enumerate(lines) if "gotabwm: zoom on id=" in l)
+zo = next(i for i, l in enumerate(lines) if "gotabwm: zoom off" in l)
+seg = lines[zi:zo]
+rows = [l for l in seg if l.startswith("dui[") and " user " in l]
+if not any("rect=0,0,1280,720" in r and "visible=1" in r for r in rows):
+    sys.exit("no user window at the full scanout inside the zoom: %s" % rows)
+if not any("visible=0" in r for r in rows):
+    sys.exit("no parked (hidden) user window inside the zoom: %s" % rows)
+print("dui probe inside zoom: %s" % rows)
+PY
+# The drop recorded the leaf and the close's restore names the survivor:
+# parse the two client ids, the closed id, and the restored id — the
+# survivor must be the OTHER live window (with two tabs it is also the
+# rail neighbour; the MRU-vs-neighbour discrimination is the class-A
+# test's job).
+vgate_assert 24 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+ids = set()
+for pat in (r"gocalc: open id=(\d+)", r"note: open id=(\d+)"):
+    m = re.search(pat, ser)
+    if not m:
+        sys.exit("missing app open marker %s" % pat)
+    ids.add(int(m.group(1)))
+dm = re.findall(r"gotabwm: pane drop id=(\d+) leaf=(\d+)", ser)
+if not dm:
+    sys.exit("no pane drop marker")
+if any(int(i) not in ids for i, _ in dm):
+    sys.exit("pane drop named a non-client id: %s" % dm)
+cm = re.search(r"gotabwm: tab close id=(\d+)", ser)
+fm = re.search(r"gotabwm: focus restore id=(\d+) why=close", ser)
+if not cm or not fm:
+    sys.exit("missing close/restore markers")
+closed, restored = int(cm.group(1)), int(fm.group(1))
+if closed not in ids or restored not in ids or closed == restored:
+    sys.exit("close=%d restore=%d ids=%s" % (closed, restored, ids))
+print("drops=%s close=%d focus restore -> %d" % (dm, closed, restored))
+PY
+# The drop persisted through the write-through hook: a session write
+# follows it, and the tree is still live (panes sidecar re-written).
+vgate_assert 24 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+i_drop = ser.find("gotabwm: pane drop")
+i_write = ser.find("gotabwm: session write", i_drop)
+if i_drop < 0 or i_write < 0:
+    sys.exit("drop=%d write=%d — the drop must persist" % (i_drop, i_write))
+print("pane drop at %d persisted by write at %d" % (i_drop, i_write))
+PY

@@ -763,6 +763,7 @@ func applyHidPin() bool {
 	if !ok {
 		return false
 	}
+	restorePaneZoom() // M151a: pin re-partitions + relinks leaves
 	if !tabs.Pin(id) {
 		return false
 	}
@@ -1178,10 +1179,19 @@ func endRailDrag(px, py uint32) bool {
 		return false
 	}
 	to, ok := railCellAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight)
-	if !ok {
-		return false
+	if ok {
+		return applyRailReorder(from, to)
 	}
-	return applyRailReorder(from, to)
+	// M151a: a release off the rail is a pane drop when it lands on a
+	// leaf's client rect — swap or displace, then persist. Anywhere
+	// else stays the no-op it always was.
+	if from < tabs.Count() {
+		if li, ok := tabs.leafHitAt(px, py,
+			uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight)); ok {
+			return applyPaneDrop(tabs.At(from).ID, li)
+		}
+	}
+	return false
 }
 
 // applyRailReorder is Zig TABWM reorder_tab: Reorder() then the existing
@@ -1194,6 +1204,7 @@ func endRailDrag(px, py uint32) bool {
 // would silently swap which app is on the left — worse than the relayout.
 // The dumps are the record; no extra marker.
 func applyRailReorder(from, to int) bool {
+	restorePaneZoom() // M151a: a reorder re-lays the tree; zoom restores
 	if !tabs.Reorder(from, to) {
 		return false
 	}

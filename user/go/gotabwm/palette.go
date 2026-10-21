@@ -68,6 +68,10 @@ const (
 	// one row per dormant space plus the next unnamed slot while the
 	// table has room. arg carries the space name; id the tab's window id.
 	palSpace
+	// palPane (M151a #2912): pane posture rows — "Zoom pane" while the
+	// focused tab holds a leaf and nothing is zoomed, "Restore panes"
+	// while one is. action names which apply runs.
+	palPane
 )
 
 // paletteEntry is one result row. label is the painted text and the primary
@@ -144,6 +148,7 @@ func paletteSources() []paletteEntry {
 		})
 	}
 	out = appendSpaceRows(out)
+	out = appendPaneRows(out)
 	out = appendRecentRows(out)
 	out = appendSettingsRows(out)
 	out = appendHelpRows(out)
@@ -199,6 +204,33 @@ func appendSpaceRows(out []paletteEntry) []paletteEntry {
 		})
 	}
 	return out
+}
+
+// appendPaneRows offers the M151a posture rows: "Zoom pane" while the
+// focused tab holds a leaf in a multi-pane tree and nothing is zoomed,
+// "Restore panes" while a zoom stands. Neither row exists when it would
+// be a dead verb — the palette never offers a command that refuses.
+func appendPaneRows(out []paletteEntry) []paletteEntry {
+	if tabs.zoomTab != 0 {
+		return append(out, paletteEntry{
+			kind:   palPane,
+			label:  "Restore panes",
+			alt:    "unzoom",
+			detail: "seat · panes",
+			action: "restore-panes",
+		})
+	}
+	fid, ok := tabs.Focused()
+	if !ok || tabs.leafOf(fid) < 0 || tabs.leafCount() < 2 {
+		return out
+	}
+	return append(out, paletteEntry{
+		kind:   palPane,
+		label:  "Zoom pane",
+		alt:    "zoom",
+		detail: "seat · panes",
+		action: "zoom-pane",
+	})
 }
 
 // appendRecentRows decodes the vi recent log's bounded tail
@@ -407,6 +439,21 @@ func paletteExecSelected() {
 			runSeatAction(e.action, e.chord)
 		} else {
 			paletteExec("GOSET.ELF")
+		}
+		return
+	case palPane:
+		// M151a: like palChord — the row closes the palette first so the
+		// posture acts on the desktop, not under the modal strip.
+		launch.launching = true
+		if releaseLauncherFocus(false) {
+			finishLauncher()
+		}
+		vi.ConsoleLine(MarkerPaletteRun + e.action)
+		switch e.action {
+		case "zoom-pane":
+			_ = applyPaneZoom()
+		case "restore-panes":
+			_ = applyPaneUnzoom()
 		}
 		return
 	case palRecent:

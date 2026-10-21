@@ -45,7 +45,12 @@ func dumpPanes() {
 		t := tabs.At(i)
 		r, placed := tabs.rectOf(t.ID, scanW, scanH)
 		kind := tabs.paneParentKind(t.ID)
-		if !placed {
+		if t.ID == tabs.zoomTab {
+			// M151a: the dump names the applied rect — under a zoom
+			// the zoomed leaf's window IS the full viewport while the
+			// tree still records its pane.
+			r = full
+		} else if !placed {
 			r, kind = full, SplitNone
 		}
 		dumpTab(t, r, kind)
@@ -53,6 +58,7 @@ func dumpPanes() {
 }
 
 func applySplit(kind SplitKind) bool {
+	restorePaneZoom() // M151a: a split re-lays the tree; zoom restores first
 	if !tabs.SplitPane(kind, uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight)) {
 		return false
 	}
@@ -69,6 +75,7 @@ func applySplit(kind SplitKind) bool {
 }
 
 func applyUnsplit() bool {
+	restorePaneZoom() // M151a
 	_ = tabs.Unsplit()
 	full := FullRect(uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight))
 	n := tabs.Count()
@@ -81,6 +88,9 @@ func applyUnsplit() bool {
 	}
 	vi.ConsoleLine(MarkerUnsplit)
 	_ = writeLayoutFile()
+	// M151a: a dissolve re-anchors focus on the most recent surviving
+	// tab — the ring's pick, not wherever the collapse left it.
+	_ = focusRecent("unsplit")
 	noteSessionMutation()
 	return true
 }
@@ -90,6 +100,7 @@ func applyUnsplit() bool {
 // without clearing the rest of the tree. The dissolved sibling's tab
 // returns to full-viewport with a real WIN_RESIZE.
 func applyPaneUnsplit() bool {
+	restorePaneZoom() // M151a
 	// Capture the sibling leaves before the collapse: their tabs get
 	// the full-viewport rect re-applied.
 	scanW, scanH := uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight)
@@ -136,6 +147,9 @@ func applyPaneUnsplit() bool {
 	vi.ConsoleLine(MarkerUnsplit)
 	dumpPanes()
 	_ = writeLayoutFile()
+	// M151a: a dissolve re-anchors focus on the most recent surviving
+	// tab — the ring's pick, not wherever the collapse left it.
+	_ = focusRecent("unsplit")
 	noteSessionMutation()
 	return true
 }
@@ -144,6 +158,7 @@ func applyPaneUnsplit() bool {
 // parent. The marker is the split marker for the NEW kind — the pane
 // pair is split h now, not rotated in place.
 func applyPaneRotate() bool {
+	restorePaneZoom() // M151a
 	old := tabs.FocusedPaneKind()
 	if old == SplitNone {
 		return false
@@ -183,6 +198,7 @@ func applyRect(id uint32, r Rect) bool {
 // the sash is stored, marked, dumped, and persisted only after the calls
 // returned.
 func applySashDrag(ni, pos int) bool {
+	restorePaneZoom() // M151a: a sash move re-lays the tree; zoom restores
 	if ni < 0 || ni >= tabs.treeN || tabs.tree[ni].kind == SplitNone {
 		return false
 	}
@@ -248,6 +264,7 @@ func applySplitCycle() bool {
 // focusByIndex path a rail click or alt-tab takes, so the focus/raise
 // markers and the kernel focus event keep exactly one shape.
 func applyPaneFocus(dx, dy int) bool {
+	restorePaneZoom() // M151a: a pane-focus move restores the tree first
 	id, ok := tabs.paneFocusMove(dx, dy, uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight))
 	if !ok {
 		return false
