@@ -39,15 +39,35 @@ func main() {
 		vi.ConsoleLine("godialog: open failed")
 		vi.Exit(1)
 	}
-	c, err := draw.WindowCanvas(id, w, h)
+	// M137d (#2774): bind a scanout-sized surface like tabapp.bindSurface —
+	// bind_window_surface takes the first bind for the window, and reflow
+	// refuses any resize the bound pages would not cover, so a 512x448 bind
+	// made the seat's pane-rect proposals fail silently (observed: a split
+	// holding this window landed without a single marker). Covering the
+	// scanout makes this window resizable and pane-able like every tabapp
+	// client; the canvas is still viewed at the native 512x448.
+	b, berr := vi.MmapWindowSurface(id, vi.ScanoutFbBytes)
+	if berr != nil {
+		vi.ConsoleLine("godialog: surface failed")
+		vi.WinClose(id)
+		vi.Exit(2)
+	}
+	c, err := draw.BytesCanvas(b, w, h)
 	if err != nil {
 		vi.ConsoleLine("godialog: surface failed")
 		vi.WinClose(id)
 		vi.Exit(2)
 	}
-	// A tab attachment keeps the requested native geometry: the window's
-	// bound surface must not be resized independently of its mapped bytes.
-	_ = vi.WmMailRequest(vi.WmRpcKindAttachTab, uint32(id), 0, 0, 0, 0, "Dialog", "GODIALOG.ELF")
+	// M137d (#2774): DeclareFullscreen, not raw AttachTab — an attach tab is
+	// hosted chrome only: the seat's rect proposals are refused (a split
+	// holding it lands silently) and no KEY_DOWN ever reaches the window, so
+	// the journey's menu/table drive was impossible. Declared, this is a
+	// first-class tab like every tabapp client — focusable, tileable.
+	_ = vi.DeclareFullscreen(uint32(id), "Dialog", "GODIALOG.ELF")
+	// Raise after declaring so the seat's focus lands here by request, not
+	// by open-order luck — OpenTab never steals focus and the journey needs
+	// this window keyboard-focused no matter which slot it opened in.
+	_ = vi.WmMailRequest(vi.WmRpcKindRaise, uint32(id), 0, 0, 0, 0, "Dialog", "GODIALOG.ELF")
 	d := appkit.NewPrompt("Open file", "Enter a path to open")
 	d.Input = "notes.txt"
 	ui, err := draw.ReadFont("/host/INTER.TTF", 500000)
@@ -116,7 +136,10 @@ func main() {
 		}
 	}
 	tableCtl := appkit.NewTableController(table)
-	tableCtl.OnActivate = func(r, col int) bool { return true }
+	tableCtl.OnActivate = func(r, col int) bool {
+		vi.ConsoleLine("godemo: table activate r=" + num(r) + " c=" + num(col))
+		return true
+	}
 
 	ring := appkit.NewFocusRing(treeCtl, tableCtl)
 	ring.Focus(0)
@@ -130,10 +153,12 @@ func main() {
 		Menus: []appkit.Menu{
 			{Title: "&File", Items: []appkit.MenuItem{
 				{Label: "&Open…", Action: func() bool {
+					vi.ConsoleLine("godemo: menu open")
 					d.Open = true
 					return true
 				}},
 				{Label: "&Quit", Shortcut: "Ctrl+Q", Action: func() bool {
+					vi.ConsoleLine("godemo: menu quit")
 					running = false
 					return true
 				}},
@@ -143,8 +168,14 @@ func main() {
 				{Label: "&Paste", Disabled: true},
 			}},
 			{Title: "&View", Items: []appkit.MenuItem{
-				{Label: "&Expand All", Action: func() bool { return treeCtl.ExpandAll() }},
-				{Label: "&Collapse All", Action: func() bool { return treeCtl.CollapseAll() }},
+				{Label: "&Expand All", Action: func() bool {
+					vi.ConsoleLine("godemo: menu expand-all")
+					return treeCtl.ExpandAll()
+				}},
+				{Label: "&Collapse All", Action: func() bool {
+					vi.ConsoleLine("godemo: menu collapse-all")
+					return treeCtl.CollapseAll()
+				}},
 			}},
 		},
 	}

@@ -480,6 +480,12 @@ var screenshotPath: String?
 // a no-op without `--screen` (validated at parse time).
 var screenshotAfter: String?
 var screenshotAfterCaptured = false
+// M137d (#2774): seconds to wait after the --screenshot-after marker
+// before grabbing the framebuffer. The marker prints when the guest flips
+// the state; the composited frame lags by a frame or two, so an instant
+// capture can land mid-transition (observed: the space-2 grab still held
+// space-1 pixels). Zero preserves the historical capture-on-marker.
+var screenshotAfterDelay: Double = 0
 // M81f (#1766): `--host-write <relpath>` + `--host-write-content <text>` +
 // `--host-write-after <marker>` — one marker-anchored macOS-side share
 // mutation: when <marker> appears in the serial log, write <text> (+ newline)
@@ -1373,6 +1379,12 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--screenshot-after", idx + 1 < arguments.count {
         screenshotAfter = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--screenshot-after-delay", idx + 1 < arguments.count {
+        guard let s = Double(arguments[idx + 1]), s >= 0 else {
+            fail("--screenshot-after-delay requires a non-negative seconds value, got '\(arguments[idx + 1])'.")
+        }
+        screenshotAfterDelay = s
         idx += 2
     } else if arg == "--host-write", idx + 1 < arguments.count {
         hostWritePath = arguments[idx + 1]
@@ -5394,7 +5406,13 @@ func captureScreenshotIfDue() {
 func captureScreenshotIfMarker(_ text: String) {
     if let marker = screenshotAfter, !screenshotAfterCaptured, text.contains(marker) {
         screenshotAfterCaptured = true
-        captureScreenshotMarker("after")
+        if screenshotAfterDelay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + screenshotAfterDelay) {
+                captureScreenshotMarker("after")
+            }
+        } else {
+            captureScreenshotMarker("after")
+        }
     }
 }
 
@@ -6245,6 +6263,16 @@ func macChord(_ token: String) -> (UInt16, NSEvent.ModifierFlags, String)? {
     case "ctrl-shift-tab": return (0x30, [.control, .shift], "\t")
     // M80k (#1727): the terminal's full-RIS chord (macOS path; 'r' = 0x0F).
     case "ctrl-shift-alt-r": return (0x0F, [.control, .shift, .option], "r")
+    // M137a/c (#2771/#2773, ADR 0007 R4/R5): the seat's pane-focus arrows
+    // and space-switch paging. The ctrl-/ctrl-shift- prefix patterns are
+    // letters only, so the nav-cluster chords are named outright, same gap
+    // ctrl-shift-alt-r fills.
+    case "ctrl-alt-up": return (0x7E, [.control, .option], "\u{F700}")
+    case "ctrl-alt-down": return (0x7D, [.control, .option], "\u{F701}")
+    case "ctrl-alt-left": return (0x7B, [.control, .option], "\u{F702}")
+    case "ctrl-alt-right": return (0x7C, [.control, .option], "\u{F703}")
+    case "ctrl-alt-pageup": return (0x74, [.control, .option], "\u{F72C}")
+    case "ctrl-alt-pagedown": return (0x79, [.control, .option], "\u{F72D}")
     case "up": return (0x7E, [], "\u{F700}")
     case "down": return (0x7D, [], "\u{F701}")
     case "left": return (0x7B, [], "\u{F702}")
@@ -8794,9 +8822,12 @@ enum CustomVirtioSpike {
         case "f6": return (0, 0x40)
         case "f7": return (0, 0x41)
         case "f8": return (0, 0x42)
-        case "f9": return (0, 0x43)
-        case "f10": return (0, 0x44)
-        case "f11": return (0, 0x46)
+        case "f9": return (0, 0x42)
+        // M137d (#2774): f10/f11 were off-by-one (0x44/0x46) — USB HID
+        // usages run F1=0x3A .. F12=0x45, so F10 is 0x43 (what the guest
+        // keymap and appkit's Named() decode) and F11 is 0x44.
+        case "f10": return (0, 0x43)
+        case "f11": return (0, 0x44)
         case "f12": return (0, 0x45)
         case "up": return (0, 0x52)
         case "down": return (0, 0x51)
@@ -8819,6 +8850,14 @@ enum CustomVirtioSpike {
         // pattern is letters only, so the editing-cluster pair is named.
         case "ctrl-shift-pageup": return (hidModCtrl | hidModShift, 0x4B)
         case "ctrl-shift-pagedown": return (hidModCtrl | hidModShift, 0x4E)
+        // M137a/c (#2771/#2773, ADR 0007 R4/R5): pane-focus arrows and
+        // space-switch paging — named outright for the same reason.
+        case "ctrl-alt-up": return (hidModCtrl | hidModAlt, 0x52)
+        case "ctrl-alt-down": return (hidModCtrl | hidModAlt, 0x51)
+        case "ctrl-alt-left": return (hidModCtrl | hidModAlt, 0x50)
+        case "ctrl-alt-right": return (hidModCtrl | hidModAlt, 0x4F)
+        case "ctrl-alt-pageup": return (hidModCtrl | hidModAlt, 0x4B)
+        case "ctrl-alt-pagedown": return (hidModCtrl | hidModAlt, 0x4E)
         // WM2 mission-control overview (Self-hosting Lane 1, issue #707
         // card 2, port of the #971 exploration): the overview hotkey —
         // LCtrl modifier + USB HID F12 usage (0x45). The guest kind-21

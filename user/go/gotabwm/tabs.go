@@ -296,6 +296,12 @@ func guessBin(title string) string {
 		// recorded bin is "Vault", the APPS.TXT selection=primary lookup
 		// misses, and every sel_publish refuses by cap.
 		return "GOVAULT.ELF"
+	case "Dialog":
+		// M137d (#2774): the appkit demo's AttachTab title — the wire
+		// carries the title, never GODIALOG.ELF, so a restored row would
+		// exec "Dialog" and drop by name (observed: `refusal ENOENT exec
+		// Dialog` on the journey spec's restore leg).
+		return "GODIALOG.ELF"
 	case "Snapshots":
 		// M120d (#2561): the snapshot manager's declared title — the
 		// PWR row focuses the tab by bin, and a restored row needs the
