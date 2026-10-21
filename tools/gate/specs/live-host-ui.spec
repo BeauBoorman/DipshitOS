@@ -99,6 +99,17 @@
 # set, so the `vm2:`-bound `close@vm=2` on vm 2's own prompt runs the
 # save path: state.vzsave lands and the sibling stops while the primary
 # runs on to its own expect.
+#
+# Run 12 is M157e's (#2938) acceptance: the arc's surfaces in one
+# journey. The m120c primary plus a dedicated tr2 sibling both receipt
+# their profile titles; --host-serial-send arms `strace exec
+# HELLO.ELF` — the live-strace form, with the mkhello fixture staged on
+# the primary's share — and the send-serial verb injects it on vm 1's
+# first prompt so the tracer rows the HostTracer ring parses off the
+# same serial feed precede the inspector verb's flip, whose
+# `host-inspector: trace rows=<n>` receipt must name n > 0. tr2 carries
+# closeAction=suspend like cv2, so `close@vm=2` on vm 2's own prompt
+# saves (or names the Code=2 refusal) while the primary runs on.
 
 vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562 + M122d #2573 + M139a #2779 + M139e #2783: HostCommand bus — host-ui: receipts, one-chord capture, postmortem, multi-VM + agent ui.input journey K=3"
 vgate_repeat 3 BOOTS
@@ -227,6 +238,36 @@ cfgcv["closeAction"] = "suspend"
 json.dump(cfgcv, open(os.path.join(cv2, "config.json"), "w"), indent=2, sort_keys=True)
 os.makedirs(os.path.join(cv2, "share"), exist_ok=True)
 print("cv2 profile minted; closeAction=suspend")
+
+# Run 12's sibling (M157e #2938): tr2 carries closeAction=suspend on the
+# same device set as cv2 — a dedicated bundle, so the close leg's
+# saved-state is this run's own evidence, never a file run 11's close
+# may have left.
+tr2 = os.path.join(run, "tr2.virelaivm")
+r = subprocess.run([runner, "--profile", tr2, "--profile-init"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit("tr2 profile mint refused: " + r.stdout + r.stderr)
+tr2base = os.path.join(run, "tr2-base.img")
+shutil.copy(os.path.join("artifacts", "disk.img"), tr2base)
+cfgt = json.load(open(os.path.join(tr2, "config.json")))
+cfgt["baseImage"] = tr2base
+cfgt["closeAction"] = "suspend"
+json.dump(cfgt, open(os.path.join(tr2, "config.json"), "w"), indent=2, sort_keys=True)
+os.makedirs(os.path.join(tr2, "share"), exist_ok=True)
+print("tr2 profile minted; closeAction=suspend")
+
+# Run 12's tracer leg: `strace exec HELLO.ELF` resolves through the
+# host-file channel, so the mkhello fixture lands on the primary's
+# share — the same file the seeded shares carry.
+m120c_share = os.path.join(run, "m120c.virelaivm", "share")
+os.makedirs(m120c_share, exist_ok=True)
+r = subprocess.run(["python3", os.path.join("tools", "mkhello-elf.py"),
+                    os.path.join(m120c_share, "HELLO.ELF")],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit("HELLO.ELF mint refused: " + r.stdout + r.stderr)
+print("HELLO.ELF staged on the m120c share")
 PY
 
 vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
@@ -731,4 +772,82 @@ elif "host-ui: close vm=2 action=suspend result=refused code=2" in out:
     print("close=suspend refused code=2 (the named Code=2 fallback)")
 else:
     sys.exit("no host-ui: close vm=2 verdict line in the out file")
+PY
+
+# Run 12 is M157e's (#2938): the whole M157 arc in one journey, under
+# the spec's inherited K=3. On vm 1's first prompt two triggers fire in
+# order — `new-window@tr2` boots the sibling, and `send-serial` writes
+# the armed `strace exec HELLO.ELF` into the console pipe (run 04's
+# injection seam; HELLO.ELF was staged on the primary's share in setup).
+# The guest's own strace arm produces the `[strace <pid>] sys_*` rows
+# the HostTracer ring parses off the same serial feed, so the
+# `inspector` verb — fired on the traced program's exit record, after
+# the rows provably landed — receipts `host-inspector: trace rows=<n>`
+# with n > 0. tr2's own prompt then fires `close@vm=2` on ITS bus:
+# closeAction=suspend runs the save path and the sibling stops while
+# the primary prints to its own expect. The run's K=3 semantics are run
+# 10's: each iteration re-mints nothing, but every leg re-runs and the
+# python asserts read their own run's out file via VG_TAG.
+vgate_file script12.txt <<'INNER'
+echo tr-boot
+INNER
+
+vgate_file script12b.txt <<'INNER'
+echo vm1-done
+INNER
+
+vgate_run 12 -- --profile '$RUN_DIR/m120c.virelaivm' \
+    --overlay-base '$RUN_DIR/m120c-base.img' \
+    --virtio-fs '$RUN_DIR/m120c.virelaivm/share' \
+    --host-serial-send 'strace exec HELLO.ELF' \
+    --script '$RUN_DIR/script12.txt' \
+    --script2 '$RUN_DIR/script12b.txt' --script2-after 'tr-boot' --script2-delay 30 \
+    --host-cmd-after 'virelai> :new-window@$RUN_DIR/tr2.virelaivm' \
+    --host-cmd-after 'virelai> :send-serial' \
+    --host-cmd-after 'tasks user-exec exited status=42:inspector' \
+    --host-cmd-after 'vm2:virelai> :close@vm=2' \
+    --script-expect 'vm1-done' --timeout 150
+
+vgate_assert 12 output-contains 'host-ui: cmd=new-window vm=1 state=performed opened=2'
+vgate_assert 12 output-contains 'host-ui: cmd=send-serial vm=1 state=performed sent=1'
+vgate_assert 12 output-contains 'host-ui: cmd=inspector vm=1 state=performed open=1'
+vgate_assert 12 output-contains 'saw=1'
+vgate_assert 12 output-contains 'host-ui: cmd=close vm=2 state=performed target=2 action=suspend'
+vgate_assert 12 output-contains 'vm=2: stopped'
+# The injected line really ran: the shell echo wraps it, the arm
+# receipts, and the traced program's write + exit land on serial — the
+# same records the host-side ring parsed into rows.
+vgate_assert 12 serial-contains 'strace exec HELLO.ELF'
+vgate_assert 12 serial-contains 'strace: armed'
+vgate_assert 12 serial-contains '] sys_write('
+vgate_assert 12 serial-contains '] sys_exit('
+vgate_assert 12 serial-contains 'elf: hello from HELLO.ELF'
+vgate_assert 12 serial-contains 'tasks user-exec exited status=42'
+# Titles on both buses, a positive trace-rows receipt, and the close
+# verdict — the card's three legs in one check. `saw=1` already proved
+# the injection echoed; the rows bound is the M157b ring's count, not a
+# replayed serial grep.
+vgate_assert 12 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-" + os.environ["VG_TAG"] + ".out"), "rb").read().decode("utf-8", "replace")
+for needle in ("host-ui: window vm=1 title=VirelaiOS \u2014 m120c",
+               "host-ui: window vm=2 title=VirelaiOS \u2014 tr2 (vm 2)"):
+    if needle not in out:
+        sys.exit("window line missing: %r" % needle)
+m = re.search(r"host-inspector: trace rows=(\d+) filter=", out)
+if not m:
+    sys.exit("no host-inspector: trace receipt in the out file")
+if int(m.group(1)) < 1:
+    sys.exit("host-inspector: trace rows=%s — the ring saw no [strace] rows" % m.group(1))
+state = os.path.join(run, "tr2.virelaivm", "saved-state", "state.vzsave")
+if "host-ui: close vm=2 action=suspend result=saved" in out:
+    if not os.path.isfile(state) or os.path.getsize(state) == 0:
+        sys.exit("close=suspend reported saved but saved-state/state.vzsave is absent or empty")
+    print("close=suspend saved: state.vzsave %d bytes" % os.path.getsize(state))
+elif "host-ui: close vm=2 action=suspend result=refused code=2" in out:
+    print("close=suspend refused code=2 (the named Code=2 fallback)")
+else:
+    sys.exit("no host-ui: close vm=2 verdict line in the out file")
+print("titles, trace rows=%s>0, close verdict: PASS" % m.group(1))
 PY
