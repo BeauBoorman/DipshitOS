@@ -1337,7 +1337,7 @@ func TestServerEncryptedIllegalTransitions(t *testing.T) {
 			chanReq(7, ReqExec, true, func(w *Writer) { w.StrS("x") })}, true, nil},
 		{"channel req unknown want-reply", [][]byte{
 			open(ChanSession, 32768),
-			chanReq(ServerChanID, "pty-req", true, nil)}, false, func(t *testing.T, c *scriptedClient, out [][]byte) {
+			chanReq(ServerChanID, "x11-req", true, nil)}, false, func(t *testing.T, c *scriptedClient, out [][]byte) {
 			if len(out) != 1 || out[0][0] != MsgChannelFail {
 				t.Fatalf("out = %x", out)
 			}
@@ -1345,11 +1345,12 @@ func TestServerEncryptedIllegalTransitions(t *testing.T) {
 		{"exec trailing garbage", [][]byte{
 			open(ChanSession, 32768),
 			chanReq(ServerChanID, ReqExec, true, func(w *Writer) { w.StrS("x"); w.Byte(0) })}, true, nil},
-		{"channel data unhandled (observed)", [][]byte{
+		{"channel data queued, no reply", [][]byte{
 			open(ChanSession, 32768),
 			chanData(ServerChanID, "stdin")}, false, func(t *testing.T, c *scriptedClient, out [][]byte) {
-			// Observed: client→server CHANNEL_DATA has no dispatch case —
-			// logged "unhandled message", no response, no failure.
+			// Client→server CHANNEL_DATA is queued behind Drain (the
+			// interactive-session drain API, #2960) — the wire answer is
+			// silence until half the advertised window is consumed.
 			if len(out) != 0 {
 				t.Fatalf("out = %x", out)
 			}
@@ -1409,5 +1410,307 @@ func TestServerEncryptedIllegalTransitions(t *testing.T) {
 	}
 	if !srv.Closed() {
 		t.Fatal("server did not close after exec")
+	}
+}
+
+// --- interactive session (#2960) ---------------------------------------------
+
+// The session channel's request/response matrix and its drain/write API:
+// pty-req once, shell gated on the pty, window-change decoded, inbound
+// CHANNEL_DATA windowed and drained, outbound Write sealed to the remote
+// window, CloseSession exactly once.
+
+func ptyReq(term string, cols, rows, pxw, pxh uint32, modes []byte, want bool) []byte {
+	return chanReq(ServerChanID, ReqPty, want, func(w *Writer) {
+		w.StrS(term)
+		w.U32(cols)
+		w.U32(rows)
+		w.U32(pxw)
+		w.U32(pxh)
+		w.Str(modes)
+	})
+}
+
+func shellReq(want bool) []byte { return chanReq(ServerChanID, ReqShell, want, nil) }
+
+func winChange(cols, rows, pxw, pxh uint32) []byte {
+	return chanReq(ServerChanID, ReqWindowChange, false, func(w *Writer) {
+		w.U32(cols)
+		w.U32(rows)
+		w.U32(pxw)
+		w.U32(pxh)
+	})
+}
+
+func chanOpenSized(sender, window, maxPkt uint32) []byte {
+	var w Writer
+	w.Byte(MsgChannelOpen)
+	w.StrS(ChanSession)
+	w.U32(sender)
+	w.U32(window)
+	w.U32(maxPkt)
+	return w.B
+}
+
+func chanDataRaw(body []byte) []byte {
+	var w Writer
+	w.Byte(MsgChannelData)
+	w.U32(ServerChanID)
+	w.Str(body)
+	return w.B
+}
+
+func winAdjust(add uint32) []byte {
+	var w Writer
+	w.Byte(MsgChannelWindow)
+	w.U32(ServerChanID)
+	w.U32(add)
+	return w.B
+}
+
+func chanEOF() []byte {
+	var w Writer
+	w.Byte(MsgChannelEOF)
+	w.U32(ServerChanID)
+	return w.B
+}
+
+// collectData concatenates the string payloads of CHANNEL_DATA packets;
+// every packet in the batch must be CHANNEL_DATA for our channel (id 0).
+func collectData(t *testing.T, pkts [][]byte) []byte {
+	t.Helper()
+	var buf []byte
+	for _, p := range pkts {
+		r := Reader{B: p}
+		b, _ := r.Byte()
+		recip, _ := r.U32()
+		d, ok := r.Str()
+		if b != MsgChannelData || !ok || recip != 0 {
+			t.Fatalf("packet = %x", p)
+		}
+		buf = append(buf, d...)
+	}
+	return buf
+}
+
+// sessionClient drives a fresh server through channel open + pty-req +
+// shell, asserting each wire answer, and returns the scripted peer.
+func sessionClient(t *testing.T, srv *Server, window, maxPkt uint32) *scriptedClient {
+	t.Helper()
+	c := kexedClient(t, srv)
+	feed := func(p []byte) [][]byte { return c.feedEnc(srv.Feed(c.packet(p))) }
+	if out := feed(chanOpenSized(0, window, maxPkt)); len(out) != 1 || out[0][0] != MsgChannelConfirm {
+		t.Fatalf("open = %x", out)
+	}
+	modes := []byte{0x80, 0, 0, 0, 1, 0}
+	if out := feed(ptyReq("xterm-256color", 132, 43, 1056, 690, modes, true)); len(out) != 1 || out[0][0] != MsgChannelOK {
+		t.Fatalf("pty-req = %x", out)
+	}
+	if out := feed(shellReq(true)); len(out) != 1 || out[0][0] != MsgChannelOK {
+		t.Fatalf("shell = %x", out)
+	}
+	return c
+}
+
+func TestServerSessionRequestRules(t *testing.T) {
+	srv := NewServer(serverCfg(t))
+	c := kexedClient(t, srv)
+	feed := func(p []byte) [][]byte { return c.feedEnc(srv.Feed(c.packet(p))) }
+	feed(chanOpenSized(0, LocalWindow, LocalMaxPacket))
+
+	// shell without a pty → CHANNEL_FAILURE.
+	if out := feed(shellReq(true)); len(out) != 1 || out[0][0] != MsgChannelFail {
+		t.Fatalf("shell/no-pty = %x", out)
+	}
+
+	// pty-req parses TERM, cols, rows, pixel size and the raw modes
+	// stream; the pre-session pin is flipped: it now answers success.
+	modes := []byte{0x80, 0, 0, 0, 1, 0}
+	if out := feed(ptyReq("xterm-256color", 132, 43, 1056, 690, modes, true)); len(out) != 1 || out[0][0] != MsgChannelOK {
+		t.Fatalf("pty-req = %x", out)
+	}
+	pty, ok := srv.PtyGranted()
+	if !ok || pty.Term != "xterm-256color" || pty.Cols != 132 || pty.Rows != 43 ||
+		pty.PxW != 1056 || pty.PxH != 690 || !bytes.Equal(pty.Modes, modes) {
+		t.Fatalf("pty = %+v ok=%v", pty, ok)
+	}
+
+	// A repeated pty-req is refused.
+	if out := feed(ptyReq("vt100", 80, 24, 0, 0, nil, true)); len(out) != 1 || out[0][0] != MsgChannelFail {
+		t.Fatalf("second pty-req = %x", out)
+	}
+
+	// shell after the pty enters session mode.
+	if out := feed(shellReq(true)); len(out) != 1 || out[0][0] != MsgChannelOK {
+		t.Fatalf("shell = %x", out)
+	}
+	if !srv.Session() {
+		t.Fatal("session not live after shell")
+	}
+
+	// A second shell, an exec after shell, and a pty-req after shell are
+	// all refused — and none of it kills the transport.
+	for _, tc := range []struct {
+		name string
+		p    []byte
+	}{
+		{"second shell", shellReq(true)},
+		{"exec after shell", chanReq(ServerChanID, ReqExec, true, func(w *Writer) { w.StrS("echo x") })},
+		{"pty after shell", ptyReq("vt100", 80, 24, 0, 0, nil, true)},
+	} {
+		if out := feed(tc.p); len(out) != 1 || out[0][0] != MsgChannelFail {
+			t.Fatalf("%s = %x", tc.name, out)
+		}
+	}
+	if srv.Failed() {
+		t.Fatal("refusals failed the transport")
+	}
+}
+
+func TestServerSessionInputEvents(t *testing.T) {
+	srv := NewServer(serverCfg(t))
+	c := sessionClient(t, srv, LocalWindow, LocalMaxPacket)
+	feed := func(p []byte) [][]byte { return c.feedEnc(srv.Feed(c.packet(p))) }
+
+	// window-change decodes into an InResize event; the wire stays silent.
+	if out := feed(winChange(200, 60, 1600, 960)); len(out) != 0 {
+		t.Fatalf("window-change reply = %x", out)
+	}
+	evs := srv.Drain()
+	if len(evs) != 1 || evs[0].Kind != InResize || evs[0].Cols != 200 || evs[0].Rows != 60 ||
+		evs[0].PxW != 1600 || evs[0].PxH != 960 {
+		t.Fatalf("resize drain = %+v", evs)
+	}
+	if evs := srv.Drain(); len(evs) != 0 {
+		t.Fatalf("second drain = %+v", evs)
+	}
+
+	// CHANNEL_DATA lands as an InData event; the wire stays silent.
+	if out := feed(chanDataRaw([]byte("ls -la\r"))); len(out) != 0 {
+		t.Fatalf("data reply = %x", out)
+	}
+	evs = srv.Drain()
+	if len(evs) != 1 || evs[0].Kind != InData || string(evs[0].Data) != "ls -la\r" {
+		t.Fatalf("data drain = %+v", evs)
+	}
+
+	// Client EOF is surfaced through Drain — the transport stays up so
+	// the app can finish and CloseSession itself.
+	if out := feed(chanEOF()); len(out) != 0 {
+		t.Fatalf("eof reply = %x", out)
+	}
+	if srv.Closed() || srv.Failed() {
+		t.Fatal("client eof closed the transport")
+	}
+	evs = srv.Drain()
+	if len(evs) != 1 || evs[0].Kind != InEOF {
+		t.Fatalf("eof drain = %+v", evs)
+	}
+}
+
+func TestServerSessionInboundWindow(t *testing.T) {
+	srv := NewServer(serverCfg(t))
+	c := sessionClient(t, srv, LocalWindow, LocalMaxPacket)
+	feed := func(p []byte) [][]byte { return c.feedEnc(srv.Feed(c.packet(p))) }
+	half := int(LocalWindow / 2)
+
+	// Consumed data alone produces no wire output. A single packet is
+	// capped at PktMaxTotal, so the half-window arrives as two frames.
+	if out := feed(chanDataRaw(bytes.Repeat([]byte{'a'}, half/2))); len(out) != 0 {
+		t.Fatalf("data reply = %x", out)
+	}
+	if out := feed(chanDataRaw(bytes.Repeat([]byte{'a'}, half/2))); len(out) != 0 {
+		t.Fatalf("data reply 2 = %x", out)
+	}
+	// Draining at the half-window emits exactly one WINDOW_ADJUST for the
+	// consumed credit.
+	evs := srv.Drain()
+	if len(evs) != 2 || evs[0].Kind != InData || evs[1].Kind != InData {
+		t.Fatalf("drain = %+v", evs)
+	}
+	out := c.feedEnc(srv.Take())
+	if len(out) != 1 || out[0][0] != MsgChannelWindow {
+		t.Fatalf("adjust = %x", out)
+	}
+	r := Reader{B: out[0]}
+	_, _ = r.Byte()
+	recip, _ := r.U32()
+	add, _ := r.U32()
+	if recip != 0 || add != uint32(half) {
+		t.Fatalf("adjust recip=%d add=%d", recip, add)
+	}
+
+	// Another half consumed earns another adjust — paced by the drain.
+	feed(chanDataRaw(bytes.Repeat([]byte{'b'}, half/2)))
+	feed(chanDataRaw(bytes.Repeat([]byte{'b'}, half/2)))
+	srv.Drain()
+	if out := c.feedEnc(srv.Take()); len(out) != 1 || out[0][0] != MsgChannelWindow {
+		t.Fatalf("second adjust = %x", out)
+	}
+	// Sub-half consumption: the drain emits nothing.
+	feed(chanDataRaw(bytes.Repeat([]byte{'c'}, 1024)))
+	srv.Drain()
+	if out := srv.Take(); len(out) != 0 {
+		t.Fatalf("sub-half adjust emitted %d bytes", len(out))
+	}
+
+	// A client that outruns the advertised window fails the transport
+	// closed — the input queue is bounded by LocalWindow.
+	srv2 := NewServer(serverCfg(t))
+	c2 := sessionClient(t, srv2, LocalWindow, LocalMaxPacket)
+	feed2 := func(p []byte) { c2.feedEnc(srv2.Feed(c2.packet(p))) }
+	for i := 0; i < 3; i++ {
+		feed2(chanDataRaw(bytes.Repeat([]byte{0x78}, 33000)))
+	}
+	feed2(chanDataRaw(bytes.Repeat([]byte{0x78}, 33000)))
+	if !srv2.Failed() {
+		t.Fatal("past-window data accepted")
+	}
+}
+
+func TestServerSessionWriteAndClose(t *testing.T) {
+	// 100 KiB against a 32 KiB remote window: exactly 32 KiB seals, the
+	// rest resumes after WINDOW_ADJUST, every byte is delivered.
+	srv := NewServer(serverCfg(t))
+	c := sessionClient(t, srv, 32768, 32768)
+	feed := func(p []byte) [][]byte { return c.feedEnc(srv.Feed(c.packet(p))) }
+
+	body := make([]byte, 100<<10)
+	for i := range body {
+		body[i] = byte(i)
+	}
+	var received []byte
+	received = append(received, collectData(t, c.feedEnc(srv.Write(body)))...)
+	if len(received) != 32768 {
+		t.Fatalf("first flush = %d want 32768", len(received))
+	}
+	received = append(received, collectData(t, feed(winAdjust(32768)))...)
+	if len(received) != 65536 {
+		t.Fatalf("after first adjust = %d want 65536", len(received))
+	}
+	received = append(received, collectData(t, feed(winAdjust(36864)))...)
+	if !bytes.Equal(received, body) {
+		t.Fatalf("delivered %d want %d", len(received), len(body))
+	}
+
+	// CloseSession emits exit-status, EOF and CLOSE exactly once.
+	pkts := c.feedEnc(srv.CloseSession(7))
+	if len(pkts) != 3 || pkts[0][0] != MsgChannelReq || pkts[1][0] != MsgChannelEOF || pkts[2][0] != MsgChannelClose {
+		t.Fatalf("close = %x", pkts)
+	}
+	r := Reader{B: pkts[0]}
+	_, _ = r.Byte()
+	recip, _ := r.U32()
+	req, _ := r.StrUTF8()
+	want, _ := r.BoolVal()
+	st, _ := r.U32()
+	if recip != 0 || req != ReqExitStatus || want || st != 7 {
+		t.Fatalf("exit-status recip=%d req=%q want=%v st=%d", recip, req, want, st)
+	}
+	if !srv.Closed() {
+		t.Fatal("server not closed after CloseSession")
+	}
+	if out := srv.CloseSession(0); len(out) != 0 {
+		t.Fatal("second CloseSession emitted packets")
 	}
 }

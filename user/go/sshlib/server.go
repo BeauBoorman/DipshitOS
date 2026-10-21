@@ -1,6 +1,9 @@
 // SSH-2 server state machine (M70g G1, #1491): the ADR 0025 D2 profile with
 // the roles reversed. Feed is a pure byte-stream step — production wraps it
 // over vi.Conn; host tests drive a scripted client against it with no VM.
+// The channel layer also serves one interactive session (#2960): pty-req +
+// shell enter session mode, inbound CHANNEL_DATA is queued for the app
+// behind Drain, and Write/CloseSession give the app a windowed outbound.
 
 package sshlib
 
@@ -35,18 +38,21 @@ const (
 	MsgChannelOK       byte = 99
 	MsgChannelFail     byte = 100
 
-	AlgoEd25519   = "ssh-ed25519"
-	KexCurve      = "curve25519-sha256"
-	KexCurveAlias = "curve25519-sha256@libssh.org"
-	CipherOpenSSH = "chacha20-poly1305@openssh.com"
-	CompNone      = "none"
-	SvcUserauth   = "ssh-userauth"
-	SvcConnection = "ssh-connection"
-	MethodNone    = "none"
-	MethodPubKey  = "publickey"
-	ChanSession   = "session"
-	ReqExec       = "exec"
-	ReqExitStatus = "exit-status"
+	AlgoEd25519     = "ssh-ed25519"
+	KexCurve        = "curve25519-sha256"
+	KexCurveAlias   = "curve25519-sha256@libssh.org"
+	CipherOpenSSH   = "chacha20-poly1305@openssh.com"
+	CompNone        = "none"
+	SvcUserauth     = "ssh-userauth"
+	SvcConnection   = "ssh-connection"
+	MethodNone      = "none"
+	MethodPubKey    = "publickey"
+	ChanSession     = "session"
+	ReqExec         = "exec"
+	ReqPty          = "pty-req"
+	ReqShell        = "shell"
+	ReqWindowChange = "window-change"
+	ReqExitStatus   = "exit-status"
 
 	IdentLine = "SSH-2.0-VirelaiOS_1.0"
 
@@ -77,6 +83,32 @@ type AuthKey struct {
 // fixed marker.
 type ExecFunc func(cmd string) (stdout []byte, status uint32, err error)
 
+// Pty is the terminal a pty-req granted (RFC 4254 §6.2): TERM, character
+// and pixel geometry, and the raw RFC 4250 §4.5 encoded modes stream.
+type Pty struct {
+	Term       string
+	Cols, Rows uint32
+	PxW, PxH   uint32
+	Modes      []byte
+}
+
+// InKind names the Drain event kinds an interactive session queues.
+type InKind byte
+
+const (
+	InData   InKind = iota + 1 // CHANNEL_DATA bytes (InEvent.Data)
+	InResize                   // window-change (InEvent.Cols/Rows/PxW/PxH)
+	InEOF                      // client CHANNEL_EOF — half-close of stdin
+)
+
+// InEvent is one client→app event on the session channel, in wire order.
+type InEvent struct {
+	Kind       InKind
+	Data       []byte
+	Cols, Rows uint32
+	PxW, PxH   uint32
+}
+
 // EntropyFunc fills b with random bytes.
 type EntropyFunc func(b []byte) error
 
@@ -92,26 +124,36 @@ type ServerConfig struct {
 }
 
 type Server struct {
-	cfg        ServerConfig
-	HostPub    [32]byte
-	phase      phase
-	input      []byte
-	out        []byte
-	banners    int
-	clientVer  string
-	iC, iS     []byte
-	qC, qS     []byte
-	sessionID  []byte
-	sendCipher *Cipher
-	recvCipher *Cipher
-	sendSeq    uint64
-	recvSeq    uint64
-	clientChan uint32
-	remoteWin  uint32
-	remoteMax  uint32
-	execRan    bool
-	closed     bool
-	failed     bool
+	cfg         ServerConfig
+	HostPub     [32]byte
+	phase       phase
+	input       []byte
+	out         []byte
+	banners     int
+	clientVer   string
+	iC, iS      []byte
+	qC, qS      []byte
+	sessionID   []byte
+	sendCipher  *Cipher
+	recvCipher  *Cipher
+	sendSeq     uint64
+	recvSeq     uint64
+	clientChan  uint32
+	remoteWin   uint32
+	remoteMax   uint32
+	localWin    uint32
+	winConsumed uint32
+	execRan     bool
+	chanOpen    bool
+	pty         Pty
+	ptyGranted  bool
+	session     bool
+	inQ         []InEvent
+	outQ        []byte
+	clientEOF   bool
+	closeSent   bool
+	closed      bool
+	failed      bool
 }
 
 func NewServer(cfg ServerConfig) *Server {
@@ -456,15 +498,28 @@ func (s *Server) handleEncrypted(payload []byte) {
 		s.handleChannelOpen(payload)
 	case MsgChannelReq:
 		s.handleChannelReq(payload)
+	case MsgChannelData:
+		s.handleChannelData(payload)
 	case MsgChannelWindow:
 		r := Reader{B: payload}
 		_, _ = r.Byte()
 		_, _ = r.U32()
 		if add, ok := r.U32(); ok {
-			s.remoteWin += add
+			if s.remoteWin+add < s.remoteWin {
+				s.remoteWin = ^uint32(0)
+			} else {
+				s.remoteWin += add
+			}
+			s.flushChannel()
 		}
-	case MsgChannelEOF, MsgChannelClose:
-		s.cfg.Log("channel eof/close from client")
+	case MsgChannelEOF:
+		s.handleChannelEOF(payload)
+	case MsgChannelClose:
+		s.cfg.Log("channel close from client")
+		if s.chanOpen && !s.closeSent {
+			s.sendPacket(s.channelHeader(MsgChannelClose))
+			s.closeSent = true
+		}
 		s.phase = phaseClosed
 	default:
 		s.cfg.Log("unhandled message")
@@ -606,6 +661,9 @@ func (s *Server) handleChannelOpen(payload []byte) {
 	s.clientChan = sender
 	s.remoteWin = window
 	s.remoteMax = maxPkt
+	s.localWin = LocalWindow
+	s.winConsumed = 0
+	s.chanOpen = true
 	var w Writer
 	w.Byte(MsgChannelConfirm)
 	w.U32(sender)
@@ -626,48 +684,179 @@ func (s *Server) handleChannelReq(payload []byte) {
 		s.fail("malformed channel request")
 		return
 	}
-	if req == ReqExec {
-		cmd, ok := r.StrUTF8()
-		if !ok || r.Remaining() != 0 {
-			s.fail("malformed exec request")
-			return
+	switch req {
+	case ReqExec:
+		s.handleExecReq(&r, want)
+	case ReqPty:
+		s.handlePtyReq(&r, want)
+	case ReqShell:
+		s.handleShellReq(&r, want)
+	case ReqWindowChange:
+		s.handleWindowChange(&r, want)
+	default:
+		s.refuseReq(want)
+		s.cfg.Log("channel request refused")
+	}
+}
+
+func (s *Server) handleExecReq(r *Reader, want bool) {
+	cmd, ok := r.StrUTF8()
+	if !ok || r.Remaining() != 0 {
+		s.fail("malformed exec request")
+		return
+	}
+	if s.session {
+		s.refuseReq(want)
+		s.cfg.Log("exec refused: session owns the channel")
+		return
+	}
+	if s.execRan {
+		s.fail("second exec request")
+		return
+	}
+	s.execRan = true
+	s.acceptReq(want)
+	s.cfg.Log("exec " + cmd)
+	stdout := []byte(nil)
+	status := uint32(1)
+	if s.cfg.Run != nil {
+		out, st, err := s.cfg.Run(cmd)
+		if err == nil {
+			stdout = out
+			status = st
 		}
-		if s.execRan {
-			s.fail("second exec request")
-			return
-		}
-		s.execRan = true
-		if want {
-			var w Writer
-			w.Byte(MsgChannelOK)
-			w.U32(s.clientChan)
-			s.sendPacket(w.B)
-		}
-		s.cfg.Log("exec " + cmd)
-		stdout := []byte(nil)
-		status := uint32(1)
-		if s.cfg.Run != nil {
-			out, st, err := s.cfg.Run(cmd)
-			if err == nil {
-				stdout = out
-				status = st
-			}
-		}
-		s.sendChannelData(stdout)
-		s.sendExitStatus(status)
-		s.sendPacket(s.channelHeader(MsgChannelEOF))
-		s.sendPacket(s.channelHeader(MsgChannelClose))
-		s.cfg.Log("exec done")
+	}
+	s.sendChannelData(stdout)
+	s.sendExitStatus(status)
+	s.sendPacket(s.channelHeader(MsgChannelEOF))
+	s.sendPacket(s.channelHeader(MsgChannelClose))
+	s.closeSent = true
+	s.cfg.Log("exec done")
+	s.phase = phaseClosed
+}
+
+// handlePtyReq parses RFC 4254 §6.2: TERM, cols, rows, pixel geometry and
+// the raw terminal-modes stream. Granted once, before shell.
+func (s *Server) handlePtyReq(r *Reader, want bool) {
+	term, ok := r.StrUTF8()
+	cols, ok1 := r.U32()
+	rows, ok2 := r.U32()
+	pxw, ok3 := r.U32()
+	pxh, ok4 := r.U32()
+	modes, ok5 := r.Str()
+	if !ok || !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || r.Remaining() != 0 {
+		s.fail("malformed pty-req")
+		return
+	}
+	if s.ptyGranted || s.session || s.execRan {
+		s.refuseReq(want)
+		s.cfg.Log("pty-req refused: already granted or session started")
+		return
+	}
+	s.pty = Pty{
+		Term: term, Cols: cols, Rows: rows, PxW: pxw, PxH: pxh,
+		Modes: append([]byte(nil), modes...),
+	}
+	s.ptyGranted = true
+	s.acceptReq(want)
+	s.cfg.Log("pty-req granted")
+}
+
+// handleShellReq grants the interactive session only on top of a pty —
+// there is no shell channel without one (§6.5 carries no extra fields).
+func (s *Server) handleShellReq(r *Reader, want bool) {
+	if r.Remaining() != 0 {
+		s.fail("malformed shell request")
+		return
+	}
+	if s.session || !s.ptyGranted {
+		s.refuseReq(want)
+		s.cfg.Log("shell refused: no pty or session already live")
+		return
+	}
+	s.session = true
+	s.acceptReq(want)
+	s.cfg.Log("shell granted; session live")
+}
+
+// handleWindowChange parses RFC 4254 §6.7 into an InResize event. It is a
+// notification — the wire answer is silence even when want_reply is set.
+func (s *Server) handleWindowChange(r *Reader, want bool) {
+	cols, ok1 := r.U32()
+	rows, ok2 := r.U32()
+	pxw, ok3 := r.U32()
+	pxh, ok4 := r.U32()
+	if !ok1 || !ok2 || !ok3 || !ok4 || r.Remaining() != 0 {
+		s.fail("malformed window-change")
+		return
+	}
+	if !s.ptyGranted {
+		s.refuseReq(want)
+		s.cfg.Log("window-change refused: no pty")
+		return
+	}
+	s.inQ = append(s.inQ, InEvent{Kind: InResize, Cols: cols, Rows: rows, PxW: pxw, PxH: pxh})
+}
+
+// handleChannelData queues client→app bytes (§5.2): the advertised local
+// window is a hard bound on the input queue — a peer that overruns it
+// fails the transport. Window credit is returned by Drain: the app says
+// it consumed the bytes, so the queue stays bounded by LocalWindow.
+func (s *Server) handleChannelData(payload []byte) {
+	r := Reader{B: payload}
+	_, _ = r.Byte()
+	recip, ok1 := r.U32()
+	data, ok2 := r.Str()
+	if !ok1 || !ok2 || r.Remaining() != 0 || recip != ServerChanID || !s.chanOpen {
+		s.fail("malformed channel data")
+		return
+	}
+	if uint32(len(data)) > s.localWin {
+		s.fail("channel data past advertised window")
+		return
+	}
+	s.localWin -= uint32(len(data))
+	s.winConsumed += uint32(len(data))
+	if len(data) > 0 {
+		s.inQ = append(s.inQ, InEvent{Kind: InData, Data: append([]byte(nil), data...)})
+	}
+}
+
+// handleChannelEOF surfaces the client's half-close to the app. Before any
+// channel exists the legacy close-the-transport behavior stands.
+func (s *Server) handleChannelEOF(payload []byte) {
+	r := Reader{B: payload}
+	_, _ = r.Byte()
+	recip, _ := r.U32()
+	s.cfg.Log("channel eof from client")
+	if !s.chanOpen || recip != ServerChanID {
 		s.phase = phaseClosed
 		return
 	}
-	if want {
-		var w Writer
-		w.Byte(MsgChannelFail)
-		w.U32(s.clientChan)
-		s.sendPacket(w.B)
+	if !s.clientEOF {
+		s.clientEOF = true
+		s.inQ = append(s.inQ, InEvent{Kind: InEOF})
 	}
-	s.cfg.Log("channel request refused")
+}
+
+func (s *Server) acceptReq(want bool) {
+	if !want {
+		return
+	}
+	var w Writer
+	w.Byte(MsgChannelOK)
+	w.U32(s.clientChan)
+	s.sendPacket(w.B)
+}
+
+func (s *Server) refuseReq(want bool) {
+	if !want {
+		return
+	}
+	var w Writer
+	w.Byte(MsgChannelFail)
+	w.U32(s.clientChan)
+	s.sendPacket(w.B)
 }
 
 func (s *Server) channelHeader(kind byte) []byte {
@@ -677,9 +866,90 @@ func (s *Server) channelHeader(kind byte) []byte {
 	return w.B
 }
 
+// Session reports whether a shell request entered session mode.
+func (s *Server) Session() bool { return s.session }
+
+// PtyGranted returns the terminal the client's pty-req negotiated, if one
+// ran — the app's geometry and TERM for the session (#2960).
+func (s *Server) PtyGranted() (Pty, bool) { return s.pty, s.ptyGranted }
+
+// Drain pops every queued client→app event — CHANNEL_DATA bytes,
+// window-change resizes, the client's EOF — in wire order. The next Drain
+// returns only what arrived since. Draining is also what returns window
+// credit: once half the advertised window has been consumed a
+// WINDOW_ADJUST is emitted into the pending output (Take / the next Feed
+// return carries it to the wire).
+func (s *Server) Drain() []InEvent {
+	ev := s.inQ
+	s.inQ = nil
+	if s.winConsumed >= LocalWindow/2 {
+		var w Writer
+		w.Byte(MsgChannelWindow)
+		w.U32(s.clientChan)
+		w.U32(s.winConsumed)
+		s.sendPacket(w.B)
+		s.localWin += s.winConsumed
+		s.winConsumed = 0
+	}
+	return ev
+}
+
+// Write queues p as CHANNEL_DATA for the session and seals what the remote
+// window and the peer's max packet allow right now, returning the fresh
+// wire bytes (plus anything else already pending). The rest stays queued —
+// the Feed that takes the WINDOW_ADJUST covering it emits it; nothing is
+// dropped while the channel lives.
+func (s *Server) Write(p []byte) []byte {
+	if s.Closed() || !s.chanOpen {
+		return nil
+	}
+	s.outQ = append(s.outQ, p...)
+	s.flushChannel()
+	return s.Take()
+}
+
+// CloseSession emits exit-status, EOF and CLOSE exactly once and closes
+// the transport — the connection serves one channel. Queued output that
+// the remote window has not yet admitted is flushed as far as it goes;
+// a tail the window still refuses is logged, never silently counted.
+func (s *Server) CloseSession(status uint32) []byte {
+	if s.closeSent || !s.chanOpen {
+		return nil
+	}
+	s.closeSent = true
+	s.flushChannel()
+	if len(s.outQ) > 0 {
+		s.cfg.Log("close: window-blocked tail dropped")
+		s.outQ = nil
+	}
+	s.sendExitStatus(status)
+	s.sendPacket(s.channelHeader(MsgChannelEOF))
+	s.sendPacket(s.channelHeader(MsgChannelClose))
+	s.cfg.Log("session closed")
+	s.phase = phaseClosed
+	return s.Take()
+}
+
+// Take returns and clears sealed wire bytes the app produced outside Feed
+// — a WINDOW_ADJUST earned by Drain, for example.
+func (s *Server) Take() []byte {
+	out := s.out
+	s.out = nil
+	return out
+}
+
+// sendChannelData is the exec path's pre-Write outbound: it queues through
+// the same window accounting so CHANNEL_DATA never exceeds remoteWin.
 func (s *Server) sendChannelData(data []byte) {
-	off := 0
-	for off < len(data) {
+	s.outQ = append(s.outQ, data...)
+	s.flushChannel()
+	s.outQ = nil // exec closes anyway; a blocked tail is the pre-#2960 drop
+}
+
+// flushChannel seals queued CHANNEL_DATA up to what the remote window and
+// the peer's max packet allow; the remainder waits for WINDOW_ADJUST.
+func (s *Server) flushChannel() {
+	for len(s.outQ) > 0 {
 		room := int(s.remoteWin)
 		if int(s.remoteMax) < room {
 			room = int(s.remoteMax)
@@ -687,19 +957,19 @@ func (s *Server) sendChannelData(data []byte) {
 		if room > 32768 {
 			room = 32768
 		}
-		if room > len(data)-off {
-			room = len(data) - off
+		if room > len(s.outQ) {
+			room = len(s.outQ)
 		}
 		if room <= 0 {
-			break
+			return
 		}
 		var w Writer
 		w.Byte(MsgChannelData)
 		w.U32(s.clientChan)
-		w.Str(data[off : off+room])
+		w.Str(s.outQ[:room])
 		s.sendPacket(w.B)
 		s.remoteWin -= uint32(room)
-		off += room
+		s.outQ = s.outQ[room:]
 	}
 }
 
