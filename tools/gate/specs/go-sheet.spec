@@ -44,6 +44,18 @@
 # file (`goedit: read` is the receipt), and a host-side byte-compare
 # proves ACC.CSV is the host-computed CSV verbatim.
 #
+# M152a (issue #2915) — the GOSHEET v2 legs. NOTE: the menu bar moved the
+# grid down 28px (edit strip 20->48, table 48->76), so every pixel probe's
+# glyph-zone origin moved 124+20r -> 152+20r scanout.
+#   run 08  fill/undo/format leg (GOTABWM): B1=0.5, A1=1 A2=2, mark+extend
+#           to A10, F10 -> Edit -> Fill series fills A3..A10 (A10 reads
+#           '10' on serial + the fill marker); the seat's ctrl+z pops the
+#           undo step and the cells empty again; F10 -> Format -> Percent
+#           shows B1 as '50%'; ctrl-shift-s snapshots the v2 blob.
+#   run 09  second boot: the seat restores SESSION.TABS, re-execs
+#           GOSHEET.ELF, and the v2 blob restores cells=3 + fmts=1 — the
+#           pixel probe decodes '50%' (not '0.5') back off the grid.
+#
 # REPEAT SEMANTICS: the armed share persists across iterations, so each
 # leg must be iteration-safe (the go-vault convention). Runs 01-04 keep
 # their state in the per-boot guest — nothing carries. Runs 05 and 07
@@ -157,13 +169,14 @@ vgate_assert 01 serial-absent '[EXC] parking:'
 vgate_assert 01 serial-absent 'exited status=139'
 
 # The pixel probe. Geometry (canvas coords; scanout adds the 64,48 window
-# origin): the table plate is {8,48,656,344}; inside the 1px border the
-# 22px header band leaves the body at {9,70,654,321}, rowH=20 paints row r
-# at y=70+20r, and column c (64px wide) at x=9+64c while ScrollTop/ScrollX
-# stay 0 — all probed cells sit inside the untouched top-left window. Cell
-# text is drawGlyphRun: plate inset 2, the 8-row glyph band centred in the
-# 16px inner height, 8px advance — so cell (r,c)'s glyph zone starts at
-# (9+64c+2, 70+20r+6) canvas = (75+64c, 124+20r) scanout. Each character
+# origin): M152a moved the grid down one menu-bar row — the table plate is
+# now {8,76,656,316}; inside the 1px border the 22px header band leaves
+# the body at {9,98,654,315}, rowH=20 paints row r at y=98+20r, and column
+# c (64px wide) at x=9+64c while ScrollTop/ScrollX stay 0 — all probed
+# cells sit inside the untouched top-left window. Cell text is
+# drawGlyphRun: plate inset 2, the 8-row glyph band centred in the 16px
+# inner height, 8px advance — so cell (r,c)'s glyph zone starts at
+# (9+64c+2, 98+20r+6) canvas = (75+64c, 152+20r) scanout. Each character
 # decodes by matching its 8x8 lit-mask against Font8x8 read from the repo.
 vgate_assert 01 snapshot 'snap-01-*.raw' <<'PY'
 import re, sys
@@ -189,7 +202,7 @@ if len(font) != 95:
 
 def cell_origin(row, col):
     # scanout origin of cell (row,col)'s glyph zone; see the spec comment.
-    return (75 + 64 * col, 124 + 20 * row)
+    return (75 + 64 * col, 152 + 20 * row)
 
 def cell_bg(x0, y0):
     # The cell interior is a uniform fill (Surface, or Selection for the
@@ -276,7 +289,7 @@ if len(font) != 95:
     sys.exit("font table parse found %d glyphs, want 95" % len(font))
 
 def decode_cell(row, col, limit=8):
-    x0, gy = 75 + 64 * col, 124 + 20 * row
+    x0, gy = 75 + 64 * col, 152 + 20 * row
     bg = px(x0 + 29, gy - 2)
     out = []
     for i in range(limit):
@@ -374,7 +387,7 @@ if len(font) != 95:
     sys.exit("font table parse found %d glyphs, want 95" % len(font))
 
 def decode_cell(row, col, limit=8):
-    x0, gy = 75 + 64 * col, 124 + 20 * row
+    x0, gy = 75 + 64 * col, 152 + 20 * row
     bg = px(x0 + 29, gy - 2)
     out = []
     for i in range(limit):
@@ -459,7 +472,7 @@ if len(font) != 95:
     sys.exit("font table parse found %d glyphs, want 95" % len(font))
 
 def decode_cell(row, col, limit=8):
-    x0, gy = 75 + 64 * col, 124 + 20 * row
+    x0, gy = 75 + 64 * col, 152 + 20 * row
     bg = px(x0 + 29, gy - 2)
     out = []
     for i in range(limit):
@@ -691,4 +704,215 @@ if got != want:
     sys.exit("ACC.CSV MISMATCH: got %d bytes %r, want %d bytes %r"
              % (len(got), got, len(want), want))
 print("ACC.CSV is the host-computed CSV verbatim (%d bytes)" % len(got))
+PY
+
+# --- M152a (issue #2915): fill series, seat undo, column formats ----------
+# run 08: the interactive half under the Go seat (ctrl+z and the snapshot
+# chord are both seat-owned). B1 gets 0.5 first so the percent format has
+# a value to render; then A1=1, A2=2, the mark latches at A1 and 9 downs
+# extend the selection to A10. The menu bar drives the rest by its own
+# vocabulary: F10 engages on the Edit title, down opens the menu, down
+# down reaches Fill series, return fires — A3..A10 fill 3..10 (the
+# per-cell set lines announce them). ctrl-z is the seat's undo route: the
+# ring pops the fill step and A3..A10 empty again. Then the cursor walks
+# home to B1, F10 -> Format -> Percent repaints B1 as '50%', and
+# ctrl-shift-s asks the tab for its v2 blob and publishes the bundle.
+# The end-of-run snapshot decodes the post-gesture frame: A1='1', A2='2',
+# A10 empty (undo), B1='50%' (the live percent column).
+vgate_file script-08.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-08.txt <<'EOF'
+dui focus 0
+exec GOSHEET.ELF
+EOF
+
+vgate_file script3-08.txt <<'EOF'
+echo rx-gosheet-08
+EOF
+
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-08' \
+    --script '$RUN_DIR/script-08.txt' \
+    --script2 '$RUN_DIR/script2-08.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'right,.,5,return,left,1,return,down,2,return,up,ctrl-shift-m,down,down,down,down,down,down,down,down,down,f10,down,down,down,return,ctrl-z,escape,home,up,up,up,up,up,up,up,up,up,right,f10,right,down,down,down,down,return,ctrl-shift-s' \
+    --input-chords-after 'gosheet: present' \
+    --script3 '$RUN_DIR/script3-08.txt' \
+    --script3-after 'gotabwm: snapshot saved ' \
+    --script3-delay 20 \
+    --snapshot-after 'rx-gosheet-08' \
+    --script-expect 'rx-gosheet-08' --timeout 300
+
+vgate_assert 08 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 08 serial-contains 'exec: loaded GOSHEET.ELF'
+vgate_assert 08 serial-contains 'gosheet: declare accepted'
+vgate_assert 08 serial-contains "gosheet: set B1 := '.5' -> 0.5"
+vgate_assert 08 serial-contains "gosheet: set A1 := '1' -> 1"
+vgate_assert 08 serial-contains "gosheet: set A2 := '2' -> 2"
+vgate_assert 08 serial-contains 'gosheet: mark A1'
+# The fill announces its span and the written cells; A10 must read 10.
+vgate_assert 08 serial-contains 'gosheet: fill series A1:A10 n=8'
+vgate_assert 08 serial-contains "gosheet: set A10 := '10' -> 10"
+# One ctrl+z pops exactly the fill step; the emptied cells announce clear.
+vgate_assert 08 serial-contains 'gosheet: undo cells=8 fmts=0'
+vgate_assert 08 serial-contains 'gosheet: clear A10'
+vgate_assert 08 serial-contains 'gosheet: fmt percent cols=B'
+# The snapshot leg: the seat's ask, the app's v2 answer, the bundle.
+vgate_assert 08 serial-contains 'gotabwm: state ask id='
+vgate_assert 08 serial-contains 'gosheet: state saved n='
+vgate_assert 08 serial-contains 'gotabwm: state save id='
+vgate_assert 08 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 08 serial-contains 'rx-gosheet-08'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 serial-absent 'exited status=139'
+
+# Under the seat the pane is the full scanout (window origin 0,0), so the
+# glyph-zone origins are the canvas coords verbatim: x=11+64c, y=104+20r
+# (the same table plate at {8,76,...} as run 01, minus the 64,48 offset).
+vgate_assert 08 snapshot 'snap-08-*.raw' <<'PY'
+import re, sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot is %d bytes, want %d" % (len(raw), W * H * 4))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    b, g, r = raw[off], raw[off + 1], raw[off + 2]
+    return (r, g, b)
+
+font = []
+src = open("user/go/webrender/font/font8x8.go").read()
+for m in re.finditer(r"\{((?:0x[0-9a-fA-F]{2},\s*){7}0x[0-9a-fA-F]{2})\}", src):
+    font.append(tuple(int(b, 16) for b in m.group(1).split(",")))
+if len(font) != 95:
+    sys.exit("font table parse found %d glyphs, want 95" % len(font))
+
+def decode_cell(row, col, limit=8):
+    x0, gy = 11 + 64 * col, 104 + 20 * row
+    bg = px(x0 + 29, gy - 2)
+    out = []
+    for i in range(limit):
+        mask = []
+        for dy in range(8):
+            bits = 0
+            for dx in range(8):
+                if px(x0 + i * 8 + dx, gy + dy) != bg:
+                    bits |= 1 << dx
+            mask.append(bits)
+        if not any(mask):
+            break
+        try:
+            out.append(chr(0x20 + font.index(tuple(mask))))
+        except ValueError:
+            sys.exit("cell %d,%d char %d: mask %r matches no glyph"
+                     % (row, col, i, mask))
+    return "".join(out)
+
+want = {(0, 0): "1", (1, 0): "2", (9, 0): "", (0, 1): "50%"}
+for (row, col), text in sorted(want.items()):
+    got = decode_cell(row, col)
+    if got != text:
+        sys.exit("cell r%d c%d decodes %r, want %r" % (row, col, got, text))
+    print("cell r%d c%d = %r" % (row, col, got))
+PY
+
+# --- run 09: the second boot restores values AND formats ------------------
+# A fresh boot on the share run 08 left: the seat loads SESSION.TABS,
+# re-execs GOSHEET.ELF, and the v2 blob restores the three cells (A1=1,
+# A2=2, B1=0.5 — A3..A10 stayed undone) plus column B's percent format.
+# The restored marker names the counts; the snapshot decodes '50%' back
+# off the pixels — a format that did not round-trip would show '0.5'.
+vgate_file script-09.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script3-09.txt <<'EOF'
+echo rx-gosheet-09
+EOF
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-09' \
+    --script '$RUN_DIR/script-09.txt' \
+    --script3 '$RUN_DIR/script3-09.txt' \
+    --script3-after 'gosheet: state restored ' \
+    --script3-delay 20 \
+    --snapshot-after 'rx-gosheet-09' \
+    --script-expect 'rx-gosheet-09' --timeout 300
+
+vgate_assert 09 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 09 serial-contains 'gotabwm: registered'
+vgate_assert 09 serial-contains 'gotabwm: session load n=1'
+vgate_assert 09 serial-contains 'gotabwm: session exec GOSHEET.ELF'
+vgate_assert 09 serial-contains 'gosheet: declare accepted'
+vgate_assert 09 serial-contains 'gotabwm: state restore id='
+vgate_assert 09 serial-contains 'gosheet: state restored cells=3 sel=B1'
+vgate_assert 09 serial-contains 'fmts=1'
+vgate_assert 09 serial-contains 'rx-gosheet-09'
+vgate_assert 09 serial-absent 'gosheet: state stale'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
+
+# Same full-viewport geometry as run 08: values restored (A1='1', A2='2',
+# A10 empty) and column B back at percent — '50%', not '0.5'.
+vgate_assert 09 snapshot 'snap-09-*.raw' <<'PY'
+import re, sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot is %d bytes, want %d" % (len(raw), W * H * 4))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    b, g, r = raw[off], raw[off + 1], raw[off + 2]
+    return (r, g, b)
+
+font = []
+src = open("user/go/webrender/font/font8x8.go").read()
+for m in re.finditer(r"\{((?:0x[0-9a-fA-F]{2},\s*){7}0x[0-9a-fA-F]{2})\}", src):
+    font.append(tuple(int(b, 16) for b in m.group(1).split(",")))
+if len(font) != 95:
+    sys.exit("font table parse found %d glyphs, want 95" % len(font))
+
+def decode_cell(row, col, limit=8):
+    x0, gy = 11 + 64 * col, 104 + 20 * row
+    bg = px(x0 + 29, gy - 2)
+    out = []
+    for i in range(limit):
+        mask = []
+        for dy in range(8):
+            bits = 0
+            for dx in range(8):
+                if px(x0 + i * 8 + dx, gy + dy) != bg:
+                    bits |= 1 << dx
+            mask.append(bits)
+        if not any(mask):
+            break
+        try:
+            out.append(chr(0x20 + font.index(tuple(mask))))
+        except ValueError:
+            sys.exit("cell %d,%d char %d: mask %r matches no glyph"
+                     % (row, col, i, mask))
+    return "".join(out)
+
+want = {(0, 0): "1", (1, 0): "2", (9, 0): "", (0, 1): "50%"}
+for (row, col), text in sorted(want.items()):
+    got = decode_cell(row, col)
+    if got != text:
+        sys.exit("cell r%d c%d decodes %r, want %r" % (row, col, got, text))
+    print("cell r%d c%d = %r" % (row, col, got))
 PY

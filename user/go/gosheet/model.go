@@ -191,10 +191,12 @@ type cell struct {
 // Sheet is the sparse store. Filled cells live in a map keyed by address;
 // the grid itself never materializes. cyc is the last recalc's discovered
 // cycle membership — cells ON a cycle, a subset of those displaying
-// #CYCLE (dependents merely propagate the error).
+// #CYCLE (dependents merely propagate the error). cfmt is the M152a
+// per-column display format — display-only, it never touches a value.
 type Sheet struct {
 	cells map[cellRef]*cell
 	cyc   map[cellRef]bool
+	cfmt  [NumCols]colFmt
 }
 
 func newSheet() *Sheet { return &Sheet{cells: map[cellRef]*cell{}} }

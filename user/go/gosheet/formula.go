@@ -3,10 +3,12 @@
 //	expr    := term (('+' | '-') term)*
 //	term    := factor (('*' | '/') factor)*
 //	factor  := '-' factor | '+' factor | primary
-//	primary := number | ref | func '(' args ')' | '(' expr ')'
+//	primary := number | ref | errlit | func '(' args ')' | '(' expr ')'
 //	args    := arg (',' arg)*
 //	arg     := ref ':' ref | expr
 //	func    := SUM | AVG | MIN | MAX | COUNT | ABS | ROUND   (case-insensitive)
+//	ref     := '$'? col '$'? row                        (M152a: $ anchors an axis)
+//	errlit  := '#PARSE' | '#REF' | '#DIV/0' | '#CYCLE'  (M152a: fill's OOB answer)
 //
 // Ranges exist only as function arguments: a bare '=A1:B2' is #PARSE, and
 // ABS/ROUND take expressions only (a range there is #PARSE too). '[' and
@@ -14,6 +16,14 @@
 // injected-chord vocabulary (and the input path's own history, cf.
 // go-calc.spec's HID table) cannot spell '(' or ')'. SUM[A1:A2] is the
 // canonical gate spelling of SUM(A1:A2).
+//
+// M152a (#2915): '$' anchors a reference axis for the fill engine — $A1
+// holds the column, A$1 the row, $A$1 both. Anchoring is fill metadata:
+// the evaluator resolves an anchored ref exactly like a bare one. The
+// error literals exist so a fill that shifts a reference off the grid can
+// spell the result ('=A1+#REF' propagates #REF the way a dead ref would);
+// nobody can type them into an interesting expression that was not already
+// broken.
 package main
 
 import "strconv"
@@ -30,6 +40,14 @@ const (
 	opDiv
 	opFunc
 	opRange // only legal as a function argument
+	opErr   // an error literal — fill's answer to a shifted-off-grid ref
+)
+
+// absCol/absRow mark a reference's anchored axes (the '$' halves); a ref
+// node's abs carries both bits, a range node's abs/abs2 one per endpoint.
+const (
+	absCol byte = 1
+	absRow byte = 2
 )
 
 type fnKind uint8
@@ -54,6 +72,9 @@ type node struct {
 	fn   fnKind
 	a, b *node
 	args []*node
+	abs  byte    // opRef: anchored axes; opRange: ref's axes
+	abs2 byte    // opRange: ref2's axes
+	err  errCode // opErr: the literal's code
 }
 
 // Token kinds for the lexer.
@@ -71,13 +92,16 @@ const (
 	tMinus
 	tStar
 	tSlash
+	tErr
 )
 
 type tok struct {
 	kind byte
 	num  float64
 	ref  cellRef
-	txt  string // identifier text (uppercased) for tIdent
+	txt  string  // identifier text (uppercased) for tIdent
+	abs  byte    // anchored axes for tRef
+	err  errCode // the code for tErr
 }
 
 // lex splits the formula body into tokens. '[' and ']' spell '(' and ')'.
@@ -99,28 +123,52 @@ func lex(s string) []tok {
 			}
 			out = append(out, tok{kind: tNum, num: f})
 			i = j
-		case isAlpha(c):
+		case isAlpha(c) || c == '$':
 			j := i
+			var abs byte
+			if s[j] == '$' {
+				abs = absCol
+				j++
+			}
+			w0 := j
 			for j < len(s) && isAlpha(s[j]) {
 				j++
 			}
-			word := s[i:j]
-			k := j
-			for k < len(s) && isDigit(s[k]) {
-				k++
+			word := s[w0:j]
+			if j < len(s) && s[j] == '$' {
+				abs |= absRow
+				j++
 			}
-			if k > j {
-				r, _ := parseRef(s[i:k])
-				out = append(out, tok{kind: tRef, ref: r})
-				i = k
-			} else {
+			d0 := j
+			for j < len(s) && isDigit(s[j]) {
+				j++
+			}
+			if j > d0 && len(word) > 0 {
+				r, _ := parseRef(word + s[d0:j])
+				out = append(out, tok{kind: tRef, ref: r, abs: abs})
+			} else if len(word) > 0 && abs == 0 {
 				up := []byte(word)
 				for p := range up {
 					up[p] = upper(up[p])
 				}
 				out = append(out, tok{kind: tIdent, txt: string(up)})
-				i = j
+			} else {
+				// A '$' that never completed a ref ($A, A$, $1) —
+				// there is no ident spelling with an anchor.
+				return append(out, tok{kind: tBad})
 			}
+			i = j
+		case c == '#':
+			j := i + 1
+			for j < len(s) && (isAlpha(s[j]) || isDigit(s[j]) || s[j] == '/') {
+				j++
+			}
+			if e, ok := errByName(s[i:j]); ok {
+				out = append(out, tok{kind: tErr, err: e})
+				i = j
+				continue
+			}
+			return append(out, tok{kind: tBad})
 		default:
 			i++
 			var k byte
@@ -148,6 +196,27 @@ func lex(s string) []tok {
 		}
 	}
 	return append(out, tok{kind: tEnd})
+}
+
+// errByName resolves an error literal's text, case-folded like every
+// other formula spelling. The names are the errCode display strings.
+func errByName(s string) (errCode, bool) {
+	for _, e := range []errCode{errParse, errRef, errDiv0, errCycle} {
+		name := e.String()
+		if len(s) == len(name) {
+			ok := true
+			for i := 0; i < len(s); i++ {
+				if upper(s[i]) != name[i] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return e, true
+			}
+		}
+	}
+	return errNone, false
 }
 
 var fnNames = map[string]fnKind{
@@ -229,7 +298,10 @@ func (p *parser) primary() *node {
 	case tNum:
 		return &node{op: opNum, num: p.next().num}
 	case tRef:
-		return &node{op: opRef, ref: p.next().ref}
+		t := p.next()
+		return &node{op: opRef, ref: t.ref, abs: t.abs}
+	case tErr:
+		return &node{op: opErr, err: p.next().err}
 	case tLP:
 		p.i++
 		n := p.expr()
@@ -258,14 +330,14 @@ func (p *parser) call(fn fnKind) *node {
 	n := &node{op: opFunc, fn: fn}
 	for {
 		if p.peek() == tRef && p.toks[p.i+1].kind == tColon && p.toks[p.i+2].kind == tRef {
-			from := p.next().ref
+			from := p.next()
 			p.i++ // ':'
-			to := p.next().ref
+			to := p.next()
 			if fn == fnAbs || fn == fnRound {
 				p.fail = true
 				return nil
 			}
-			n.args = append(n.args, &node{op: opRange, ref: from, ref2: to})
+			n.args = append(n.args, &node{op: opRange, ref: from.ref, abs: from.abs, ref2: to.ref, abs2: to.abs})
 		} else {
 			a := p.expr()
 			if a == nil {

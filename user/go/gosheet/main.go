@@ -1,11 +1,13 @@
 // The M142a app shell, extended by M142b (#2790) with the CSV + session
-// state half. Layout inside the window's canvas:
+// state half and by M152a (#2915) with the menu bar, fills, undo and
+// column formats. Layout inside the window's canvas:
 //
 //	+----------------------------------------------------------+
-//	| [A1]  [edit line — the focused cell's raw text]          |  y 20..44
+//	| Edit  Format                  the M137b menu bar         |  y 20..44
+//	| [A1]  [edit line — the focused cell's raw text]          |  y 48..72
 //	| +------------------------------------------------------+ |
 //	| | A  B  C ...        header (col letters)              | |
-//	| | row-major cells, virtualized — the M137b table       | |  y 48..
+//	| | row-major cells, virtualized — the M137b table       | |  y 76..
 //	| +------------------------------------------------------+ |
 //	| status: focus, selection, display, fill count          |  bottom 20
 //	+----------------------------------------------------------+
@@ -16,7 +18,8 @@
 // selects the sheet's used bounding box, Escape drops the mark. Typing any
 // printable character seeds the edit line with it (replace semantics, the
 // sheet convention), Enter or Tab opens the edit line on the cell's
-// existing text, Delete and Backspace clear the cell.
+// existing text, Delete and Backspace clear the cell. F10 or Alt engages
+// the menu bar, which owns the keyboard until it disengages.
 //
 // The M142b chords: ctrl-c serializes the marked range (or the cursor
 // cell) as RFC 4180 CSV of the displayed values onto the text/csv
@@ -26,13 +29,23 @@
 // FilePicker for CSV import/export (export writes the used box's display
 // values, never the raw formulas).
 //
+// The M152a surface: Edit ▸ Fill down/right/series fills the selection
+// (numbers continue as a series, anything else copies; formulas shift
+// their relative references); Format ▸ General/Integer/Fixed 2/Percent
+// sets the display format of every column the selection spans — display
+// only, so CSV export still writes raw values. Every mutating gesture
+// pushes one record onto the 32-step undo ring; the seat's ctrl+z (the
+// M121e route) pops it — the appkit Loop consumes ActionUndo itself, so
+// the poll wrapper answers the chord ahead of it.
+//
 // Edit line focused: the TextField edits, Enter/Tab commit and return to
 // the grid, Escape cancels. Committing writes the cell, re-evaluates, and
 // prints the markers the go-sheet gate reads: `gosheet: set|clear` for the
 // edited cell, `gosheet: recalc` for every other cell whose display
 // changed, and `gosheet: cycle` naming the cells on a discovered cycle.
-// Batch fills (import, paste, restore) print their own summary marker plus
-// capped recalc lines for dependents outside the written region.
+// Batch fills (import, paste, fill, undo, restore) print their own
+// summary marker plus capped set/clear/recalc lines for the touched
+// cells and the dependents outside the written region.
 package main
 
 import (
@@ -54,10 +67,12 @@ const (
 	natW, natH = 672, 420
 
 	pad     = 8
-	stripY  = 20 // below the kernel's 16px title band on the shim path
+	menuY   = 20 // below the kernel's 16px title band on the shim path
+	menuH   = 24
+	stripY  = 48
 	nameW   = 56
 	fieldH  = 24
-	tableY  = 48
+	tableY  = 76
 	statusH = 20
 
 	colW     = 64
@@ -72,6 +87,10 @@ const (
 	usageO = 0x12
 	usageS = 0x16
 	usageV = 0x19
+	// usageZ is the M121e seat undo chord — tabapp pins the same 0x1D in
+	// its Dispatch classifier; the poll wrapper matches it here because
+	// the appkit Loop consumes ActionUndo without surfacing it.
+	usageZ = 0x1D
 
 	// recalcShow bounds the per-op recalc markers so a batch fill cannot
 	// flood serial; the tail counts what was not printed.
@@ -94,6 +113,9 @@ const (
 	markerImport  = "gosheet: import "
 	markerExport  = "gosheet: export "
 	markerState   = "gosheet: state "
+	markerFill    = "gosheet: fill "
+	markerFmt     = "gosheet: fmt "
+	markerUndo    = "gosheet: undo "
 	markerClose   = "gosheet: close"
 	markerOK      = "gosheet OK"
 )
@@ -111,9 +133,12 @@ type app struct {
 	field     appkit.TextField
 	table     *widgets.Table
 	ctl       *appkit.TableController
+	bar       appkit.MenuBar
 	pick      appkit.FilePicker
 	editing   bool
 	lastCycle string
+	// ring is the M152a undo history: 32 steps of pre-gesture diffs.
+	ring undoRing
 	// mark+markOn is the M142b selection: when latched, the marked range is
 	// mark..cursor — what ctrl-c copies and the status line names.
 	mark   cellRef
@@ -145,6 +170,10 @@ func main() {
 		StateVersion: stateFmtVer,
 		SaveState:    a.saveState,
 		RestoreState: a.noteState,
+		// M152a: the seat's ctrl+z routes to this tab through the M121e
+		// hook — Dispatch classifies it ActionUndo, and the poll wrapper
+		// calls Undo() ahead of the kit loop's own Dispatch.
+		HandleUndo: a.undo,
 	})
 	if ta == nil {
 		vi.ConsoleLine("gosheet: error open")
@@ -172,9 +201,26 @@ func main() {
 		Cols: cols, Rows: NumRows, RowH: rowH, HeaderH: headerH,
 		Row: 0, Col: 0, Focused: true,
 	}
-	a.table.Cell = func(r, c int) string { return a.sheet.display(refAt(c, r)) }
+	a.table.Cell = func(r, c int) string { return a.sheet.show(refAt(c, r)) }
 	a.ctl = appkit.NewTableController(a.table)
 	a.ctl.OnActivate = func(_, _ int) bool { a.beginEdit(); return true }
+
+	// M152a: the menu bar. Every item's Action mutates through the same
+	// paths the chords use, so the undo ring sees menu gestures as one
+	// step each; the bar's rect is laid out per frame in draw().
+	a.bar.Menus = []appkit.Menu{
+		{Title: "&Edit", Items: []appkit.MenuItem{
+			{Label: "Fill &down", Action: func() bool { a.fill(fillDown); return true }},
+			{Label: "Fill &right", Action: func() bool { a.fill(fillRight); return true }},
+			{Label: "Fill &series", Action: func() bool { a.fill(fillSeries); return true }},
+		}},
+		{Title: "&Format", Items: []appkit.MenuItem{
+			{Label: "&General", Action: func() bool { a.formatCols(fmtGeneral); return true }},
+			{Label: "&Integer", Action: func() bool { a.formatCols(fmtInt); return true }},
+			{Label: "&Fixed 2", Action: func() bool { a.formatCols(fmtFixed2); return true }},
+			{Label: "&Percent", Action: func() bool { a.formatCols(fmtPct); return true }},
+		}},
+	}
 
 	a.applyRestored()
 	// A restored blob wins the session's argv — the re-exec runs the bare
@@ -202,10 +248,19 @@ func main() {
 	// key-downs still sit in the queue would snapshot the pre-navigation
 	// cursor (the seat posts its ask on ctrl-shift-w while the close-time
 	// input burst is still draining). Answer only on an empty queue.
+	//
+	// The undo chord gets the same early service: the kit loop's Dispatch
+	// consumes ActionUndo without a Handle call, so the seat's ctrl+z is
+	// answered here — the hook repaints itself when a step reverts.
 	loop.RunWith(func() (vi.Event, int64, bool) {
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			a.ta.PollStateAsk()
+			return ev, r, ok
+		}
+		if isUndoChord(ev) && a.ta.Undo() {
+			a.draw()
+			a.ta.Present()
 		}
 		return ev, r, ok
 	}, vi.Sleep)
@@ -298,6 +353,15 @@ func (a *app) pasteClip() {
 	}
 	rows := parseCSV(clipBuf[:n])
 	at := a.sel()
+	// The undo record: every target's pre-paste raw (refused writes drop
+	// out of the recorded step because their raw never moved).
+	var before []cellDiff
+	for r, row := range rows {
+		for c := range row {
+			ref := refAt(at.col+c, at.row+r)
+			before = append(before, cellDiff{r: ref, raw: a.sheet.raw(ref)})
+		}
+	}
 	set, clipped, w := 0, 0, 0
 	for r, row := range rows {
 		if len(row) > w {
@@ -312,6 +376,7 @@ func (a *app) pasteClip() {
 		}
 	}
 	changed := a.sheet.recalc()
+	a.commitUndo(before, nil)
 	line := markerPaste + "n=" + vi.Itoa64(int64(set))
 	if clipped > 0 {
 		line += " clipped=" + vi.Itoa64(int64(clipped))
@@ -324,6 +389,90 @@ func (a *app) pasteClip() {
 	vi.ConsoleLine(markerSel + at.String() + ":" + a.sel().String())
 	a.reportOutside(changed, at, a.sel())
 	a.syncBar()
+}
+
+// isUndoChord is the seat's ctrl+z as tabapp.Dispatch classifies it:
+// plain Ctrl+Z, no shift or alt. The appkit Loop never surfaces
+// ActionUndo, so the poll wrapper recognizes the chord itself.
+func isUndoChord(ev vi.Event) bool {
+	return ev.Kind == vi.EvKeyDown &&
+		ev.Flags&vi.ModCtrl != 0 &&
+		ev.Flags&(vi.ModShift|vi.ModAlt) == 0 &&
+		uint8(ev.Arg0) == usageZ
+}
+
+// fill is the Edit ▸ Fill * action: snapshot the selection's raws for
+// the undo record, write the fill through the quiet path, re-evaluate
+// once, then announce the batch — the summary marker the gate reads,
+// per-cell set/clear lines capped like every batch, and recalc lines
+// for dependents outside the filled span.
+func (a *app) fill(kind fillKind) {
+	lo, hi := a.selSpan()
+	var before []cellDiff
+	for r := lo.row; r <= hi.row; r++ {
+		for c := lo.col; c <= hi.col; c++ {
+			ref := refAt(c, r)
+			before = append(before, cellDiff{r: ref, raw: a.sheet.raw(ref)})
+		}
+	}
+	written, clipped := fillRange(a.sheet, lo, hi, kind)
+	changed := a.sheet.recalc()
+	a.commitUndo(before, nil)
+	line := markerFill + kind.String() + " " + lo.String() + ":" + hi.String() +
+		" n=" + itoaDec(len(written))
+	if clipped > 0 {
+		line += " clipped=" + itoaDec(clipped)
+	}
+	vi.ConsoleLine(line)
+	a.announce(before)
+	a.reportOutside(changed, lo, hi)
+	a.syncBar()
+}
+
+// announce prints set/clear lines for every cell whose raw the gesture
+// changed, capped at recalcShow — the batch marker's per-cell detail.
+func (a *app) announce(before []cellDiff) {
+	shown, extra := 0, 0
+	for _, d := range before {
+		now := a.sheet.raw(d.r)
+		if now == d.raw {
+			continue
+		}
+		if shown >= recalcShow {
+			extra++
+			continue
+		}
+		if now == "" {
+			vi.ConsoleLine(markerClear + d.r.String())
+		} else {
+			vi.ConsoleLine(markerSet + d.r.String() + " := '" + now +
+				"' -> " + a.sheet.display(d.r))
+		}
+		shown++
+	}
+	if extra > 0 {
+		vi.ConsoleLine(markerSet + "+" + itoaDec(extra) + " more")
+	}
+}
+
+// formatCols is the Format ▸ * action: one display-format apply over
+// every column the selection spans, recorded as a single undo step.
+// Display-only — no recalc, nothing repaints but the affected cells.
+func (a *app) formatCols(f colFmt) {
+	lo, hi := a.selSpan()
+	var before []fmtDiff
+	for c := lo.col; c <= hi.col; c++ {
+		before = append(before, fmtDiff{col: c, fmt: a.sheet.cfmt[c]})
+	}
+	for _, d := range before {
+		a.sheet.cfmt[d.col] = f
+	}
+	a.commitUndo(nil, before)
+	line := markerFmt + fmtName(f) + " cols=" + colName(lo.col)
+	if hi.col != lo.col {
+		line += ":" + colName(hi.col)
+	}
+	vi.ConsoleLine(line)
 }
 
 // openPick raises the shared FilePicker for CSV open/save.
@@ -384,7 +533,26 @@ func (a *app) importPath(path string) bool {
 		}
 	}
 	ns.recalc()
+	// The undo record for a wholesale replace: every address either
+	// sheet fills (the union) restores the old raw, and the column
+	// formats roll back — a fresh sheet is all-general.
+	var before []cellDiff
+	for r := range a.sheet.cells {
+		before = append(before, cellDiff{r: r, raw: a.sheet.cells[r].raw})
+	}
+	for r := range ns.cells {
+		if _, was := a.sheet.cells[r]; !was {
+			before = append(before, cellDiff{r: r})
+		}
+	}
+	var fbefore []fmtDiff
+	for c, f := range a.sheet.cfmt {
+		if f != fmtGeneral {
+			fbefore = append(fbefore, fmtDiff{col: c, fmt: f})
+		}
+	}
 	a.sheet = ns
+	a.commitUndo(before, fbefore)
 	a.markOn = false
 	a.lastCycle = ""
 	vi.ConsoleLine(markerImport + path + " cells=" +
@@ -415,6 +583,7 @@ func (a *app) draw() {
 	th := theme.Current
 	c.FillRect(widgets.Rect{W: w, H: h}, draw.Opaque(th.Bg))
 
+	a.bar.R = widgets.Rect{X: 0, Y: menuY, W: w, H: menuH}
 	a.field.R = widgets.Rect{X: pad + nameW, Y: stripY - 2, W: w - 2*pad - nameW, H: fieldH + 4}
 	a.table.R = widgets.Rect{X: pad, Y: tableY, W: w - 2*pad, H: h - tableY - statusH - pad}
 
@@ -422,6 +591,9 @@ func (a *app) draw() {
 	a.field.Draw(c)
 	a.table.Draw(c)
 	widgets.DrawText(c, widgets.Rect{X: pad, Y: h - statusH, W: w - 2*pad, H: statusH}, a.status(), draw.Opaque(th.Muted))
+	// The bar paints above the sheet but under the modal picker — an open
+	// popover reads over the grid, and a modal owns the whole frame.
+	a.bar.Draw(c)
 	if a.pick.Open {
 		a.pick.Draw(c)
 	}
@@ -434,7 +606,7 @@ func (a *app) status() string {
 		lo, hi := a.selSpan()
 		s += "  sel " + lo.String() + ":" + hi.String()
 	}
-	if d := a.sheet.display(sel); d != "" {
+	if d := a.sheet.show(sel); d != "" {
 		s += " -> " + d
 	}
 	s += "  cells " + vi.Itoa64(int64(a.sheet.filled())) + "/" + vi.Itoa64(MaxCells)
@@ -475,6 +647,7 @@ func (a *app) cancelEdit() {
 func (a *app) commit() {
 	sel := a.sel()
 	raw := a.field.Value()
+	before := a.sheet.raw(sel)
 	changed, ok := a.sheet.set(sel, raw)
 	a.editing = false
 	a.field.Focused = false
@@ -483,6 +656,7 @@ func (a *app) commit() {
 		vi.ConsoleLine(markerFull)
 		return
 	}
+	a.commitUndo([]cellDiff{{r: sel, raw: before}}, nil)
 	if raw == "" {
 		vi.ConsoleLine(markerClear + sel.String())
 	} else {
@@ -585,6 +759,11 @@ func (a *app) key(k appkit.Key) bool {
 		}
 		return a.field.OnKey(k)
 	}
+	// The menu bar: inactive it answers F10/Alt/Alt-mnemonic and passes
+	// everything else through; active it owns the keyboard outright.
+	if a.bar.OnKey(k) {
+		return true
+	}
 	if k.Ctrl && !navKey(k) {
 		switch k.Usage {
 		case usageA:
@@ -632,10 +811,12 @@ func (a *app) key(k appkit.Key) bool {
 		return false
 	case appkit.NamedDelete, appkit.NamedBackspace:
 		sel := a.sel()
-		if a.sheet.raw(sel) == "" {
+		before := a.sheet.raw(sel)
+		if before == "" {
 			return false
 		}
 		changed, _ := a.sheet.set(sel, "")
+		a.commitUndo([]cellDiff{{r: sel, raw: before}}, nil)
 		vi.ConsoleLine(markerClear + sel.String())
 		a.report(changed, sel)
 		return true
@@ -658,6 +839,15 @@ func (a *app) key(k appkit.Key) bool {
 }
 
 func (a *app) click(x, y int) bool {
+	// The bar and its open popover come first; a click anywhere while a
+	// menu is up just disengages it (the kit's own convention).
+	if a.bar.HitTest(x, y) || a.bar.Active {
+		if a.editing {
+			a.commit()
+		}
+		a.bar.OnClick(x, y)
+		return true
+	}
 	if a.field.HitTest(x, y) {
 		if !a.editing {
 			a.beginEdit()

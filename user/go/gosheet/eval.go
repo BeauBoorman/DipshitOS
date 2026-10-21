@@ -99,6 +99,8 @@ func (e *evaluator) expr(n *node) value {
 		}
 	case opFunc:
 		return e.call(n)
+	case opErr:
+		return errVal(n.err)
 	}
 	return errVal(errParse)
 }

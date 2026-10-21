@@ -9,20 +9,32 @@
 //	u16 ncells                    — then ncells runs of:
 //	  u8 col | u8 row | u16 len | len raw bytes   (raw is the literal or
 //	  '=formula' text; values are never serialized — recalc regenerates them)
+//	u8  nfmts                     — v2 only: then nfmts runs of
+//	  u8 col | u8 fmt             — the non-general column formats (M152a)
+//
+// M152a (#2915) bumps the envelope to v2: the format trailer appends to
+// the v1 layout untouched, and the decoder still accepts v1 blobs — a
+// session serialized before this card lands restores cells and view with
+// every column general.
 package main
 
 import (
 	"virelai/vi"
 )
 
-const stateFmtVer = 1
+const (
+	stateFmtVer = 2
+	stateVer1   = 1 // the M142b envelope — still decodable
+)
 
-// sheetState is the decoded save payload: populated raws plus the view.
+// sheetState is the decoded save payload: populated raws, the view, and
+// the column formats (all-general when the blob predates v2).
 type sheetState struct {
 	raws map[cellRef]string
 	cur  cellRef
 	top  int
 	sx   int
+	fmts [NumCols]colFmt
 }
 
 // encodeState serializes the sheet + view. The seat's 64KiB bound is the
@@ -44,15 +56,33 @@ func (a *app) encodeState() []byte {
 		out = putU16(out, uint16(len(raw)))
 		out = append(out, raw...)
 	}
+	// v2 trailer: the non-general column formats, column order.
+	n := 0
+	for _, f := range a.sheet.cfmt {
+		if f != fmtGeneral {
+			n++
+		}
+	}
+	if len(out)+1+2*n > vi.AppStateMax {
+		return nil
+	}
+	out = append(out, byte(n))
+	for c, f := range a.sheet.cfmt {
+		if f != fmtGeneral {
+			out = append(out, byte(c), byte(f))
+		}
+	}
 	return out
 }
 
 // decodeState refuses stale/short/trailing/duplicate or out-of-bounds
-// state wholesale — a corrupt blob never half-loads a sheet.
+// state wholesale — a corrupt blob never half-loads a sheet. v1 blobs
+// end after the cell runs; v2 adds the format trailer.
 func decodeState(b []byte) (*sheetState, bool) {
-	if len(b) < 9 || b[0] != stateFmtVer {
+	if len(b) < 9 || (b[0] != stateVer1 && b[0] != stateFmtVer) {
 		return nil, false
 	}
+	ver := b[0]
 	st := &sheetState{
 		raws: map[cellRef]string{},
 		cur:  refAt(int(b[1]), int(b[2])),
@@ -76,6 +106,26 @@ func decodeState(b []byte) (*sheetState, bool) {
 		}
 		st.raws[r] = string(b[o : o+ln])
 		o += ln
+	}
+	if ver == stateFmtVer {
+		if len(b)-o < 1 {
+			return nil, false
+		}
+		nf := int(b[o])
+		o++
+		var seen [NumCols]bool
+		for i := 0; i < nf; i++ {
+			if len(b)-o < 2 {
+				return nil, false
+			}
+			c, f := int(b[o]), colFmt(b[o+1])
+			o += 2
+			if c >= NumCols || f > fmtPct || seen[c] {
+				return nil, false
+			}
+			seen[c] = true
+			st.fmts[c] = f
+		}
 	}
 	if o != len(b) || len(st.raws) > MaxCells || !st.cur.inBounds() {
 		return nil, false
@@ -111,6 +161,7 @@ func (a *app) applyRestored() {
 	for r, raw := range st.raws {
 		a.sheet.setQuiet(r, raw)
 	}
+	a.sheet.cfmt = st.fmts
 	a.sheet.recalc()
 	a.ctl.FocusCell(st.cur.row, st.cur.col)
 	a.table.ScrollTop = st.top
@@ -120,7 +171,8 @@ func (a *app) applyRestored() {
 	vi.ConsoleLine(markerState + "restored cells=" +
 		vi.Itoa64(int64(a.sheet.filled())) + " sel=" + a.sel().String() +
 		" top=" + vi.Itoa64(int64(a.table.ScrollTop)) +
-		" sx=" + vi.Itoa64(int64(a.table.ScrollX)))
+		" sx=" + vi.Itoa64(int64(a.table.ScrollX)) +
+		" fmts=" + vi.Itoa64(int64(a.sheet.fmtCount())))
 	a.syncBar()
 }
 
