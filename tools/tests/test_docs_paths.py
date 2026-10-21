@@ -1,9 +1,14 @@
-"""Every backticked repo path in docs/TEAMS.md must exist (M139d, #2782).
+"""Every backticked repo path in the docs below must exist (M139d, #2782;
+M157d #2937 added docs/app-authoring.md and the gate-spec check).
 
-TEAMS.md is the ownership map agents use to stay out of each other's way;
-a row naming a deleted file silently routes claims at ghosts. This test
-extracts backticked tokens that look like repo paths and asserts each one
-resolves — directories, files, and glob patterns alike.
+TEAMS.md is the ownership map agents use to stay out of each other's way —
+a row naming a deleted file silently routes claims at ghosts — and the
+authoring guide's adopter links rot the same way, so both docs are held to
+the same rule. This test extracts backticked tokens that look like repo
+paths and asserts each one resolves — directories, files, and glob
+patterns alike — and separately resolves every cited
+tools/gate/specs/*.spec, whether the spec path rode a backtick or only a
+markdown link target.
 """
 import re
 import unittest
@@ -12,21 +17,29 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DOCS = ["docs/TEAMS.md"]
+DOCS = ["docs/TEAMS.md", "docs/app-authoring.md"]
 
 BACKTICK = re.compile(r"`([^`\n]+)`")
 # A token is a repo-path candidate when it contains a '/', a glob '*',
-# or ends in a file extension (bare `build.zig`, `AGENTS.md`). Prose
-# identifiers (`claim`, `implemented_count`, `.usb`) and placeholders
-# (`<purpose>`) are not candidates.
-EXT = re.compile(r"^[^/]+\.[A-Za-z0-9]{1,8}$")
+# or ends in a lowercase file extension (bare `build.zig`, `AGENTS.md`).
+# A leading '/' names a guest-absolute path (/host/..., /dev/tty), never
+# a repo-relative one, and a bare name's extension is lowercase only:
+# uppercase tails are guest artifacts (.ELF binaries, APPS.TXT, REMOTE
+# JSON), not repo files. Prose identifiers (`claim`, `implemented_count`,
+# `.usb`) and placeholders (`<purpose>`) are not candidates either.
+EXT = re.compile(r"^[^/]+\.[a-z0-9]{1,8}$")
 EXTENSIONLESS = {"justfile", "Justfile", "Makefile", "Dockerfile",
                  "LICENSE", "NOTICE", "AGENTS"}
 NOT_PATH_CHARS = set("<>()\"'=$:;[]{}|&")
+# A cited gate spec is a tools/gate/specs/*.spec mention anywhere on the
+# line — backticked prose or a markdown link target alike.
+SPEC_REF = re.compile(r"tools/gate/specs/[A-Za-z0-9._-]+\.spec")
 
 
 def is_path_candidate(word):
-    if not word or any(c in word for c in NOT_PATH_CHARS):
+    if not word or word.startswith("/"):
+        return False
+    if any(c in word for c in NOT_PATH_CHARS):
         return False
     return "/" in word or "*" in word or EXT.match(word) or word in EXTENSIONLESS
 
@@ -58,6 +71,19 @@ class TestDocsPaths(unittest.TestCase):
         self.assertEqual(
             [], failures,
             "backticked repo paths that do not exist:\n  " + "\n  ".join(failures),
+        )
+
+    def test_cited_gate_specs_exist(self):
+        failures = []
+        for doc in DOCS:
+            lines = (ROOT / doc).read_text().splitlines()
+            for lineno, line in enumerate(lines, 1):
+                for ref in SPEC_REF.findall(line):
+                    if not (ROOT / ref).exists():
+                        failures.append(f"{doc}:{lineno}: {ref!r} does not exist")
+        self.assertEqual(
+            [], failures,
+            "cited gate specs that do not exist:\n  " + "\n  ".join(failures),
         )
 
 
