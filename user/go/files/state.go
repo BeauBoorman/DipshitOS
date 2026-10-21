@@ -37,6 +37,7 @@ const (
 	modeOpenWith // M81b (#1762): the Open-with… candidate list owns the digits
 	modeContext  // M124d (#2583): the right-click menu owns keys until dismissed
 	modeHints    // M121c (#2566): the '?' chord-hint overlay owns the frame
+	modeQuickLook // M149a (#2806): the spacebar preview pane owns the frame
 )
 
 // titleBarPx is the window title band the client area sits below: the
@@ -127,6 +128,11 @@ type model struct {
 	// kernel terminal chrome (a tty-bound window answers those too),
 	// rendered ANSI inside this app's own frame.
 	hints appkit.ChordHints
+
+	// M149a (#2806): the spacebar QuickLook pane (quick.go). Armed by ' '
+	// on the selection, dismissed by space/Esc or a pointer press; the
+	// listing underneath is never touched.
+	ql quickLook
 }
 
 // hintsBin names this app's registry scope — the untagged twin of
@@ -563,6 +569,12 @@ func (m *model) handleClick(x, y int) {
 		}
 		return
 	}
+	if m.mode == modeQuickLook {
+		// M149a (#2806): a press anywhere dismisses the pane — it floats
+		// over the list like macOS's, never selects underneath itself.
+		m.closeQuickLook()
+		return
+	}
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() {
 		return
 	}
@@ -668,6 +680,10 @@ func (m *model) handleKey(ev keys.Event) {
 		m.hintsKey(ev)
 		return
 	}
+	if m.mode == modeQuickLook {
+		m.qlKey(ev)
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		switch ev.Key {
 		case keys.KeyRune:
@@ -746,6 +762,8 @@ func (m *model) handleKey(ev keys.Event) {
 			m.yankClip(true)
 		case 'p':
 			m.pasteClip()
+		case ' ':
+			m.openQuickLook()
 		case 'o':
 			m.startOpenWith()
 		case 'e':

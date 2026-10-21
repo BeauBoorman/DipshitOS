@@ -142,6 +142,11 @@ func (m *model) handleRightClick(x, y int) {
 	if m.banner.Open {
 		return
 	}
+	if m.mode == modeQuickLook {
+		// M149a (#2806): any press dismisses the pane, left or right.
+		m.closeQuickLook()
+		return
+	}
 	col, row := x-1, y-1
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() ||
 		col >= m.listCols() {

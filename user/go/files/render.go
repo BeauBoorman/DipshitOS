@@ -61,6 +61,9 @@ func (m model) render() string {
 	if m.mode == modeHints {
 		return m.renderHints()
 	}
+	if m.mode == modeQuickLook {
+		return m.renderQuickLook()
+	}
 	lines := m.renderLines()
 	frame := framePrologue + strings.Join(lines, "\n")
 	if m.mode == modeContext {
@@ -102,6 +105,62 @@ func (m model) renderHints() string {
 	}
 	lines = append(lines, colDim+" "+foot+colReset)
 	return framePrologue + strings.Join(lines, "\n")
+}
+
+// renderQuickLook is the M149a (#2806) pane's frame: a title row, a facts
+// row, then the arm's body — blank rows under an image arm (the kernel's
+// image cells replace them), the first qlTextLines under a text arm, the
+// type/size/mtime rows under the card. The sixel itself is appended AFTER
+// the grid text behind a CUP to the pane's origin cell: the image's tiles
+// land on the blank band the frame just painted, so every repaint
+// re-places the thumbnail the ED prologue erased.
+func (m model) renderQuickLook() string {
+	lines := make([]string, 0, m.rows)
+	lines = append(lines,
+		colPath+"  quicklook: "+clipVis(m.ql.name, m.cols-14)+colReset)
+	lines = append(lines,
+		colHead+"  "+clipVis(m.qlSubtitle(), m.cols-4)+colReset)
+	body := m.bodyRows()
+	switch m.ql.kind {
+	case qlText:
+		for i := 0; i < body; i++ {
+			idx := m.ql.scroll + i
+			if idx >= len(m.ql.lines) {
+				lines = append(lines, strings.Repeat(" ", m.cols))
+				continue
+			}
+			row := clipVis(m.ql.lines[idx], m.cols-1)
+			lines = append(lines, colPrev+" "+row+colReset+
+				strings.Repeat(" ", m.cols-1-visLen(row)))
+		}
+	case qlCard:
+		rows := m.qlCardRows()
+		for i := 0; i < body; i++ {
+			if i >= len(rows) {
+				lines = append(lines, strings.Repeat(" ", m.cols))
+				continue
+			}
+			row := clipVis(rows[i], m.cols-1)
+			lines = append(lines, colPrev+" "+row+colReset+
+				strings.Repeat(" ", m.cols-1-visLen(row)))
+		}
+	default:
+		// qlImage: the body is a blank band — the sixel's tiles cover it.
+		for i := 0; i < body; i++ {
+			lines = append(lines, strings.Repeat(" ", m.cols))
+		}
+	}
+	lines = append(lines, m.statusLine())
+	lines = append(lines, colDim+" "+
+		clipVis("space/esc close · j/k scroll", m.cols-2)+colReset)
+	frame := framePrologue + strings.Join(lines, "\n")
+	if m.ql.kind == qlImage && len(m.ql.sixel) > 0 {
+		var b strings.Builder
+		row, col := m.qlOrigin()
+		cup(&b, row, col)
+		frame += b.String() + string(m.ql.sixel)
+	}
+	return frame
 }
 
 // renderCtxMenu is the M124d (#2583) overlay: after the full grid repaint
@@ -202,7 +261,7 @@ func (m model) renderLines() []string {
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · o open with · e export · v volumes · tab view · s sort · backspace up · r rename · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("j/k move · enter open · space look · o open with · e export · v volumes · tab view · s sort · backspace up · r rename · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }

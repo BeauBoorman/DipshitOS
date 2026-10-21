@@ -70,7 +70,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, and lists the kernel mount table"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, and spacebar-QuickLooks image and text"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1237,7 +1237,8 @@ vgate_assert 13 serial-absent 'exited status=139'
 # A bare '?' rune opens the registry-fed overlay inside GOFILES's own ANSI
 # frame; Esc hands the keyboard back to the list. n= is the row count:
 # no GOFILES app rows + the seat's globals + the kernel terminal chrome
-# (a tty-bound window answers those chords too). The `hints row` lines are
+# (a tty-bound window answers those chords too) — 49 rows as of
+# M132b's manifest/mime/clipboard additions. The `hints row` lines are
 # the serial-readable copy of the plate, pinned against the shipped table.
 vgate_file script-14.txt <<'EOFX'
 exec GOFILES.ELF /host/FM
@@ -1257,7 +1258,7 @@ vgate_run 14 -- \
     --script-expect 'gofiles OK' --timeout 240
 
 vgate_assert 14 serial-contains 'gofiles: ready'
-vgate_assert 14 serial-contains 'gofiles: hints n=42'
+vgate_assert 14 serial-contains 'gofiles: hints n=49'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+p summon the command palette'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+c copy the terminal selection'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+k clear the terminal scrollback'
@@ -1316,3 +1317,259 @@ vgate_assert 15 serial-contains 'gofiles: close'
 vgate_assert 15 serial-contains 'gofiles OK'
 vgate_assert 15 serial-absent '[EXC] parking:'
 vgate_assert 15 serial-absent 'exited status=139'
+
+# --- M149a (#2806) runs 16/17: the spacebar QuickLook pane --------------
+# Space on the selection takes over the frame with a mime-sniffed pane:
+# a decodable image paints through the terminal's sixel image layer
+# (webrender.DecodeImage + the kernel's image cells), a text file shows
+# its first 40 lines in the preview accent, and space or Esc hands the
+# frame back. FMQ holds one of each so one boot proves both: LOOK.QOI
+# sorts first (name asc — no nav needed), `j` lands on WORDS.TXT, and the
+# second chord closes the pane so the run also reads `quicklook close`.
+# The screenshot barriers on the kind marker — the pane stands until the
+# next chord repaints, the same margin M123d's banner leg holds.
+vgate_file script-16.txt <<'EOFQ'
+exec GOFILES.ELF /host/FMQ
+EOFQ
+
+vgate_file script2-16.txt <<'EOFQ'
+dui close 2
+echo rx-go-fileman-quicklook-ok
+EOFQ
+
+vgate_file script-17.txt <<'EOFQ'
+exec GOFILES.ELF /host/FMQ
+EOFQ
+
+vgate_file script2-17.txt <<'EOFQ'
+dui close 2
+echo rx-go-fileman-quicklook-text-ok
+EOFQ
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fmq = os.path.join(share, "FMQ")
+os.makedirs(fmq, exist_ok=True)
+# A real 16x16 QOI in quadrant colours — header, QOI_OP_RGB per pixel, the
+# 8-byte end marker (the FM2 shape). The pane scales it to a 64x64 thumb:
+# 8x4 cells of the 8x16 rung, so the scanout holds whole pixel quadrants.
+W = H = 16
+quads = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+qoi = bytearray(b"qoif") + (W).to_bytes(4, "big") + (H).to_bytes(4, "big") + bytes([4, 0])
+for y in range(H):
+    for x in range(W):
+        r, g, b = quads[(y >= H // 2) * 2 + (x >= W // 2)]
+        qoi += bytes([0xfe, r, g, b])
+qoi += bytes([0, 0, 0, 0, 0, 0, 0, 1])
+with open(os.path.join(fmq, "LOOK.QOI"), "wb") as f:
+    f.write(bytes(qoi))
+with open(os.path.join(fmq, "WORDS.TXT"), "w") as f:
+    for i in range(1, 46):
+        f.write("quicklook-line-%02d\n" % i)
+print("staged FMQ: LOOK.QOI 16x16 quadrants, WORDS.TXT 45 lines")
+PY
+
+# Run 16: space on the image (sel=0) opens the sixel arm; escape closes.
+vgate_run 16 -- \
+    --screen '$RUN_DIR/fileman-quicklook-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-16.txt' \
+    --input-chords 'space,escape' \
+    --input-chords-after 'gofiles: ready' \
+    --screenshot-after 'gofiles: quicklook LOOK.QOI kind=image' \
+    --script2 '$RUN_DIR/script2-16.txt' \
+    --script2-after 'gofiles: quicklook close' \
+    --script-expect 'rx-go-fileman-quicklook-ok' --timeout 240
+
+vgate_assert 16 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 16 serial-contains 'gofiles: list /host/FMQ n=2'
+vgate_assert 16 serial-contains 'gofiles: entry LOOK.QOI file'
+vgate_assert 16 serial-contains 'gofiles: entry WORDS.TXT file'
+# The DECISION marker names the arm and the decoded dims the pane scaled.
+vgate_assert 16 serial-contains 'gofiles: quicklook LOOK.QOI kind=image 16x16 thumb=64x64'
+# Esc closed the pane; the window then tore down through dui close.
+vgate_assert 16 serial-contains 'gofiles: quicklook close'
+vgate_assert 16 serial-contains 'gofiles: close'
+vgate_assert 16 serial-contains 'gofiles OK'
+vgate_assert 16 serial-contains 'rx-go-fileman-quicklook-ok'
+vgate_assert 16 serial-absent '[EXC] parking:'
+vgate_assert 16 serial-absent 'exited status=139'
+
+# The scanout: 2x capture, client x=64..1088 y=96..832, cell 16x32 px. The
+# 64x64 thumb lands centred in the body band: tile cells 28..35 x rows
+# 9..12 -> x=512..640, y=384..512 of the capture. Each source quadrant is
+# a 32x32 logical block -> 64x64 capture px of flat image ink. Interiors
+# dodge the tile edges; the palette's percent round-trip is inside ~2, so
+# a 48 max-channel tolerance covers the capture path's colour shift.
+vgate_assert 16 snapshot 'fileman-quicklook-screen-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
+            row[x] = (row[x] + pred) & 0xff
+    out += row
+    prev = row
+
+# The capture path's colour shift is hue-preserving but NOT channel-small:
+# a pure (255,0,0) quadrant is observed ~(234,51,35) and (0,255,0) as
+# ~(117,251,76) — over 100 on some channels (measured). Dominance survives
+# the shift where absolute RGB does not, so each quadrant asserts its own
+# channel ordering instead of a fixture colour.
+def count(x0, x1, y0, y1, pred):
+    n = 0
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            k = (y * w + x) * bpp
+            if pred(out[k], out[k + 1], out[k + 2]):
+                n += 1
+    return n
+
+red = count(520, 568, 392, 440,
+            lambda r, g, b: r >= 150 and r >= g + 60 and r >= b + 60)
+green = count(584, 632, 392, 440,
+              lambda r, g, b: g >= 150 and g >= r + 60 and g >= b + 60)
+blue = count(520, 568, 456, 504,
+             lambda r, g, b: b >= 150 and b >= r + 60 and b >= g + 60)
+yellow = count(584, 632, 456, 504,
+               lambda r, g, b: r >= 150 and g >= 150 and r >= b + 60 and g >= b + 60)
+print("quicklook scanout: red=%d green=%d blue=%d yellow=%d" %
+      (red, green, blue, yellow))
+assert red >= 1000, "image top-left quadrant ink absent from the pane"
+assert green >= 1000, "image top-right quadrant ink absent from the pane"
+assert blue >= 1000, "image bottom-left quadrant ink absent from the pane"
+assert yellow >= 1000, "image bottom-right quadrant ink absent from the pane"
+PY
+
+# Run 17: j lands on WORDS.TXT, space opens the 40-line text arm, the
+# second space closes it — Esc's sibling binding.
+vgate_run 17 -- \
+    --screen '$RUN_DIR/fileman-quicklook-text' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-17.txt' \
+    --input-chords 'j,space,space' \
+    --input-chords-after 'gofiles: ready' \
+    --screenshot-after 'gofiles: quicklook WORDS.TXT kind=text' \
+    --script2 '$RUN_DIR/script2-17.txt' \
+    --script2-after 'gofiles: quicklook close' \
+    --script-expect 'rx-go-fileman-quicklook-text-ok' --timeout 240
+
+vgate_assert 17 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 17 serial-contains 'gofiles: list /host/FMQ n=2'
+# The j really landed on the text file (the list preview re-read it).
+vgate_assert 17 serial-contains 'gofiles: view WORDS.TXT bytes='
+# 45 seeded lines cap at the pane's 40 — the count IS the bound's proof.
+vgate_assert 17 serial-contains 'gofiles: quicklook WORDS.TXT kind=text lines=40'
+# The second space closed the pane; the window then tore down.
+vgate_assert 17 serial-contains 'gofiles: quicklook close'
+vgate_assert 17 serial-contains 'gofiles: close'
+vgate_assert 17 serial-contains 'gofiles OK'
+vgate_assert 17 serial-contains 'rx-go-fileman-quicklook-text-ok'
+vgate_assert 17 serial-absent '[EXC] parking:'
+vgate_assert 17 serial-absent 'exited status=139'
+
+# The scanout: the text arm paints its lines in the preview accent
+# (122,162,255) across the body band — rows 2..20 -> y=160..736 of the
+# capture, inside the client rect. The count needs only line ink, the
+# same tolerance the run-01 preview probe carries.
+vgate_assert 17 snapshot 'fileman-quicklook-text-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
+            row[x] = (row[x] + pred) & 0xff
+    out += row
+    prev = row
+
+accent = 0
+for y in range(160, 736):
+    for x in range(64, 1088):
+        k = (y * w + x) * bpp
+        if max(abs(out[k] - 122), abs(out[k+1] - 162),
+               abs(out[k+2] - 255)) <= 40:
+            accent += 1
+print("quicklook text leg: accent pixels=%d" % accent)
+assert accent >= 100, "text-arm ink absent from the pane's body band"
+PY

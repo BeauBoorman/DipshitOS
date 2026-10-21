@@ -151,6 +151,15 @@ const (
 	markerDragNo  = "gofiles: drag refused "
 	markerDragEnd = "gofiles: drag end "
 
+	// M149a (#2806): the spacebar QuickLook pane. `quicklook <name>
+	// kind=…` is the open receipt — it states which arm the sniff chose
+	// (kind=image carries the decoded and thumbnail dims, kind=text the
+	// line count, kind=card the type word), so a gate never reads
+	// "opened" without reading WHAT opened. `quicklook close` is the
+	// dismiss. Both ride pending like every other frame marker.
+	markerQuick      = "gofiles: quicklook "
+	markerQuickClose = "gofiles: quicklook close"
+
 	// The view/sort chords' own markers.
 	markerViewMode = "gofiles: viewmode "
 	markerSort     = "gofiles: sort "
