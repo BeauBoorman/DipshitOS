@@ -632,6 +632,16 @@ func (a *app) refreshTrust() {
 		}
 		vi.ConsoleLine(line)
 	}
+	for i := 0; i < rowMarkerMax; i++ {
+		line, ok := a.tr.DenialMarker(i)
+		if !ok {
+			break
+		}
+		vi.ConsoleLine(line)
+	}
+	// The denials summary prints last: it is the block's terminator, so a
+	// gate waiting on it knows every entry marker has already landed.
+	vi.ConsoleLine(a.tr.DenialsMarker())
 }
 
 // toggleAuto arms or disarms the 1 Hz app timer (slot 40/41).

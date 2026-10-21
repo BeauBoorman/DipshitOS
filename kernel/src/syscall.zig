@@ -579,6 +579,8 @@ var udp_recv_from_scratch: [udp.recv_from_max]u8 = undefined;
 /// M113c (#2419): the slot-89 staging — one grants line (`name<TAB>
 /// sha|*<TAB>words`) marshaled per call in either direction.
 var grant_admin_scratch: [grant.line_max]u8 = undefined;
+/// M161a: op 2's marshal buffer — the header plus a whole ring's receipts.
+var denial_read_scratch: [8 + grant.denial_ring_len * measure.receipt_max]u8 = undefined;
 /// Milestone 12 (claim 7483): fixed BSS scratch for TCP send payload.
 var tcp_send_staging: [tcp.payload_max]u8 = undefined;
 /// Milestone 14 (claim 0169): fixed BSS scratch for the clipboard (set
@@ -2446,20 +2448,11 @@ fn handle_secret_get(args: Args, _: *exceptions.VectorFrame) u64 {
 /// mode) or the actual denial (enforce). The `name=` and `sha256=` are
 /// the caller's recorded image and its exec measurement — the receipt
 /// names WHO was denied, not what it asked for (the `word=` field does
-/// that).
+/// that). M161a routes every word denial through grant.emit_denial so
+/// the receipt also lands in the EL0-readable ring (slot 89 op 2).
 fn emit_word_denial(pid: usize, bit: u5) void {
-    var digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
-    var name: []const u8 = "";
-    if (process.grant_state(pid)) |gs| digest = gs.digest;
-    if (process.info(pid)) |pinfo| name = pinfo.name;
     const wname = grant.wordName(bit);
-    var verdict_buf: [40]u8 = undefined;
-    const verdict = std.fmt.bufPrint(&verdict_buf, "{s}:{s}_denied", .{
-        if (grant.enforceMode()) "refused" else "audit", wname,
-    }) catch return;
-    var line: [measure.receipt_max]u8 = undefined;
-    const n = measure.receipt_line(&line, .exec, &digest, verdict, name, wname);
-    klog.line(line[0..n]);
+    grant.emit_denial(pid, wname, wname);
 }
 
 /// D7/D11: slot 89 admits the registered WM seat (the user's gesture
@@ -2497,6 +2490,12 @@ fn grant_row_names_caller(pid: usize, row_name: []const u8) bool {
 ///     `ENOSPC` when the bounded table is full (never eviction), `ENXIO`
 ///     with no host channel, `EIO` when the persist fails — the table
 ///     rolls back so it never diverges from the refused write.
+///   - op 2 DENIAL_READ (M161a #2982, wave-3 W1): `cursor` in `index`,
+///     `ptr`/`len` the caller's buffer. Writes the next cursor as 8
+///     little-endian bytes, then whole newline-terminated receipt lines
+///     from the kernel's 32-entry denial ring — every sequence > cursor,
+///     as many as fit — and returns the byte count. `EINVAL` when `len`
+///     cannot hold the header plus one receipt-max line.
 ///
 /// The gate runs BEFORE any argument is touched: the registered WM seat
 /// or `CAP_PROC_ADMIN`, and never the app the row names.
@@ -2524,6 +2523,13 @@ fn handle_grant_admin(args: Args, _: *exceptions.VectorFrame) u64 {
                 .enxio => error_result(.enxio),
                 .eio => error_result(.eio),
             };
+        },
+        2 => {
+            if (args[3] < 8 + measure.receipt_max) return error_result(.einval);
+            const cap: usize = @intCast(@min(args[3], denial_read_scratch.len));
+            const n = grant.denial_read(args[1], denial_read_scratch[0..cap]);
+            if (uaccess.copy_out(args[2], denial_read_scratch[0..n], n) != .ok) return error_result(.efault);
+            return @intCast(n);
         },
         else => return error_result(.einval),
     }

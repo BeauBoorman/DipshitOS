@@ -627,17 +627,39 @@ PY
 # publisher fingerprint derived off the FLINT stream replica — plus the
 # kernel's RCPT.TXT receipts verbatim. The kernel's own serial receipts
 # (`audit:*_denied name=...`) are the cross-proof that the rendered
-# denied-word set is the real posture. The run ends on the last receipt
-# marker — all of it program output (assert-proven).
+# denied-word set is the real posture.
+#
+# Issue #2982 extends the leg: slot 89 op 2 drains the kernel's
+# denial-receipt ring at EL0, so the trust tab now also renders the
+# OBSERVED denials — `top: trust denial app=<n> verdict=<v> word=<w>`
+# per (app, verdict, word) group, then the `top: trust denials n=<k>
+# dropped=<d>` summary. The python assert pairs every rendered entry
+# with the kernel's own `<v>:<w>_denied name=<n>` serial receipt — the
+# same boot, the same denial.
+#
+# The ring is 32 entries deep and TABWM.BIN receipts audit:file_denied
+# on a steady cadence (observed: ~800 while the fixture apps run), so
+# receipts emitted early are evicted before GOTOP reads. script7a
+# therefore execs GOTOP WITH the fixture apps and script7b — gated on
+# `top: ready`, when the boot's flood has subsided — re-execs them
+# (GRANTD first so its debug_denied lands ahead of CONFINE's
+# net_denied). `ta` types `t` to render the trust tab and `a` to arm the
+# 1 Hz auto-refresh, which re-drains the ring and reprints the marker
+# block every tick. The run's expect is CONFINE's own rendered denial:
+# it cannot match until a refresh has observed a FRESH receipt inside
+# the ring window, and the --expect-tail holds the boot for GRANTD's
+# (earlier-receipted) entry and the summary to land too.
 vgate_file script7a.txt <<'EOS'
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec CONFINE.BIN
 exec GRANTD.BIN
+exec -u0 GOTOP.ELF
 EOS
 
 vgate_file script7b.txt <<'EOS'
-exec -u0 GOTOP.ELF
+exec GRANTD.BIN
+exec CONFINE.BIN
 EOS
 
 vgate_run 07 -- \
@@ -649,10 +671,11 @@ vgate_run 07 -- \
     --script2 '$RUN_DIR/script7a.txt' \
     --script2-after 'tabwm: sidebar-rendered' \
     --script3 '$RUN_DIR/script7b.txt' \
-    --script3-after 'procs GRANTD.BIN exited status=18' \
-    --input-string 't' \
+    --script3-after 'top: ready' \
+    --input-string 'ta' \
     --input-string-after 'top: ready' \
-    --script-expect 'top: trust rcpt RCPT stage=kernel' --timeout 180
+    --script-expect 'top: trust denial app=CONFINE.BIN verdict=audit word=net' \
+    --script-expect-tail 5 --timeout 180
 
 vgate_assert 07 serial-contains 'exec: loaded CONFINE.BIN'
 vgate_assert 07 serial-contains 'exec: loaded GRANTD.BIN'
@@ -663,6 +686,10 @@ vgate_assert 07 serial-contains 'top: trust n='
 vgate_assert 07 serial-contains 'top: trust app name=CONFINE.BIN'
 vgate_assert 07 serial-contains 'top: trust app name=GRANTD.BIN'
 vgate_assert 07 serial-contains 'top: trust rcpt RCPT stage=kernel'
+vgate_assert 07 serial-contains 'top: trust denial app=CONFINE.BIN verdict=audit word=net'
+vgate_assert 07 serial-contains 'top: trust denial app=GRANTD.BIN verdict=audit word=debug'
+vgate_assert 07 serial-contains 'top: trust denials n='
+vgate_assert 07 serial-absent 'top: trust denials err='
 vgate_assert 07 serial-absent 'top: trust table=err='
 vgate_assert 07 serial-absent '[EXC] parking:'
 
@@ -740,8 +767,38 @@ if "audit:debug_denied name=GRANTD.BIN" not in ser:
     sys.exit("FAIL: kernel never receipted GRANTD.BIN's debug denial")
 if "name=GRANTD.BIN word=net" in ser:
     sys.exit("FAIL: GRANTD.BIN's granted word receipted a denial")
+
+# The observed-denial leg (#2982): every rendered `top: trust denial`
+# entry must pair with the kernel's own serial receipt for the same
+# boot — the op-2 ring is evidence, not a prediction. The summary's
+# count must cover at least the two receipted denials above.
+denials = []
+for l in lines:
+    m = re.match(r"top: trust denial app=(\S+) verdict=(\S+) word=(\S+)",
+                 l.strip())
+    if m:
+        denials.append(m.groups())
+if not denials:
+    sys.exit("FAIL: no `top: trust denial` markers — the op-2 drain "
+             "never reached the trust tab")
+for app, verdict, word in denials:
+    want = "%s:%s_denied name=%s" % (verdict, word, app)
+    if want not in ser:
+        sys.exit("FAIL: rendered denial %s:%s_denied app=%s has no "
+                 "kernel receipt (%r not on serial)"
+                 % (verdict, word, app, want))
+pairs = set((a, w) for a, v, w in denials)
+if ("CONFINE.BIN", "net") not in pairs:
+    sys.exit("FAIL: CONFINE.BIN's receipted net denial not rendered")
+if ("GRANTD.BIN", "debug") not in pairs:
+    sys.exit("FAIL: GRANTD.BIN's receipted debug denial not rendered")
+m = re.search(r"top: trust denials n=(\d+) dropped=(\d+)", ser)
+if not m or int(m.group(1)) < 2:
+    sys.exit("FAIL: denials summary missing or under-counted: %r"
+             % (m.group(0) if m else None,))
 print("gotop trust ok: confined granted=file denied(+net), "
-      "granted pin=match pub derived, kernel receipts agree")
+      "granted pin=match pub derived, kernel receipts agree, "
+      "%d observed-denial entries cross-proven" % len(denials))
 PY
 
 

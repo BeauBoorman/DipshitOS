@@ -52,10 +52,20 @@ func fakeTrustShare(t *testing.T, files map[string][]byte, meas map[string]strin
 		return ok
 	}
 	trustRowsFn = func() ([]vi.GrantRow, int64) { return rows, rowsErr }
+	pD := trustDenialsFn
+	trustDenialsFn = func(uint64) ([]string, uint64, uint64, int64) { return nil, 0, 0, 0 }
 	t.Cleanup(func() {
-		trustReadFn, trustListFn, trustMeasFn, trustExistsFn, trustRowsFn =
-			pR, pL, pM, pE, pRows
+		trustReadFn, trustListFn, trustMeasFn, trustExistsFn, trustRowsFn, trustDenialsFn =
+			pR, pL, pM, pE, pRows, pD
 	})
+}
+
+// fakeTrustDenials stages the op-2 ring drain for one test: the verbatim
+// receipt lines, the evicted-before-oldest gap, or the refusal errno.
+func fakeTrustDenials(lines []string, dropped uint64, err int64) {
+	trustDenialsFn = func(uint64) ([]string, uint64, uint64, int64) {
+		return lines, 0, dropped, err
+	}
 }
 
 const (
@@ -329,5 +339,83 @@ func TestTrustReceiptGrammar(t *testing.T) {
 	}
 	if rcpts[1].Word != "debug" {
 		t.Fatalf("rcpt1 = %+v", rcpts[1])
+	}
+}
+
+// TestTrustObservedDenials is the M161a (#2982) core: the ring's drained
+// receipts render per app as (verdict, word, count) beside the computed
+// would_deny set, and the serial markers pair each rendered entry with
+// the kernel's own receipt — a receipt for a process no longer listed
+// still earns a marker, never silently dropped.
+func TestTrustObservedDenials(t *testing.T) {
+	fakeTrustShare(t, trustFixtureShare(), map[string]string{}, nil, 0)
+	fakeTrustDenials([]string{
+		"RCPT stage=exec sha256=99 verdict=audit:net_denied name=CONFINE.BIN word=net",
+		"RCPT stage=exec sha256=99 verdict=audit:net_denied name=CONFINE.BIN word=net",
+		"RCPT stage=exec sha256=aa verdict=refused:debug_denied name=GRANTD.BIN word=debug",
+		"RCPT stage=exec sha256=bb verdict=audit:fs_path_denied name=GONE.BIN word=file",
+		"RCPT stage=exec sha256=cc verdict=measured name=CONFINE.BIN", // not a denial — skipped
+	}, 7, 0)
+	v := NewTrustView()
+	v.Refresh([]string{"CONFINE.BIN", "GRANTD.BIN"})
+	byName := map[string]trustApp{}
+	for _, a := range v.apps {
+		byName[a.Name] = a
+	}
+	if byName["CONFINE.BIN"].Denials != "audit:net x2" {
+		t.Fatalf("confine denials = %q", byName["CONFINE.BIN"].Denials)
+	}
+	if byName["GRANTD.BIN"].Denials != "refused:debug x1" {
+		t.Fatalf("grantd denials = %q", byName["GRANTD.BIN"].Denials)
+	}
+	if !strings.Contains(v.DenialsMarker(), "top: trust denials n=4 dropped=7") {
+		t.Fatalf("denials marker = %q", v.DenialsMarker())
+	}
+	// Four drained denials -> three groups (CONFINE.BIN's pair counts
+	// once); GONE.BIN is unlisted yet still marked.
+	var marks []string
+	for i := 0; ; i++ {
+		m, ok := v.DenialMarker(i)
+		if !ok {
+			break
+		}
+		marks = append(marks, m)
+	}
+	if len(marks) != 3 {
+		t.Fatalf("denial markers %v", marks)
+	}
+	if marks[0] != "top: trust denial app=CONFINE.BIN verdict=audit word=net" ||
+		marks[1] != "top: trust denial app=GRANTD.BIN verdict=refused word=debug" ||
+		marks[2] != "top: trust denial app=GONE.BIN verdict=audit word=fs_path" {
+		t.Fatalf("denial markers %v", marks)
+	}
+}
+
+// TestTrustDenialsUnreadable pins the honesty rule for the ring: a
+// refused op-2 read renders denials=? per app and an err= marker — never
+// an empty list dressed as "no denials".
+func TestTrustDenialsUnreadable(t *testing.T) {
+	fakeTrustShare(t, trustFixtureShare(), map[string]string{}, nil, 0)
+	fakeTrustDenials(nil, 0, -vi.ErrEACCES)
+	v := NewTrustView()
+	v.Refresh([]string{"CONFINE.BIN"})
+	if v.apps[0].Denials != "?" {
+		t.Fatalf("denials = %q, want ?", v.apps[0].Denials)
+	}
+	if !strings.Contains(v.DenialsMarker(), "top: trust denials err=EACCES") {
+		t.Fatalf("denials marker = %q", v.DenialsMarker())
+	}
+	if _, ok := v.DenialMarker(0); ok {
+		t.Fatal("denial marker served on a refused read")
+	}
+	lines := v.Lines()
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "denials=?") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no denials=? line in %v", lines)
 	}
 }

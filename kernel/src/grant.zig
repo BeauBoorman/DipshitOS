@@ -418,6 +418,9 @@ pub fn init() void {
     user_count = 0;
     overlong_names = 0;
     mode = .audit;
+    denial_oldest = 0;
+    denial_count = 0;
+    denial_next = 1;
 }
 
 /// Visible-row count (poisoned rows count — they occupy a slot).
@@ -1348,7 +1351,11 @@ fn emit_fs_denial(pid: usize, verdict: FsVerdict) void {
     emit_denial(pid, qname, "file");
 }
 
-fn emit_denial(pid: usize, qname: []const u8, word: []const u8) void {
+/// M161a (#2982): the denial receipt — one shape for every denial class
+/// (the word gates' `<word>_denied` and the scope checks' qualifier
+/// names), published to serial AND copied into the EL0-readable ring
+/// below. Pub so the syscall-seam word gate (emit_word_denial) shares it.
+pub fn emit_denial(pid: usize, qname: []const u8, word: []const u8) void {
     var digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
     var name: []const u8 = "";
     if (process.grant_state(pid)) |gs| digest = gs.digest;
@@ -1359,7 +1366,77 @@ fn emit_denial(pid: usize, qname: []const u8, word: []const u8) void {
     }) catch return;
     var line: [measure.receipt_max]u8 = undefined;
     const n = measure.receipt_line(&line, .exec, &digest, vtext, name, word);
+    denial_record(line[0..n]);
     klog.line(line[0..n]);
+}
+
+// ---------------------------------------------------------------------------
+// M161a (#2982, ADR 0007 wave-3 W1): the denial-receipt ring — slot 89
+// op 2's read surface. Every emit_denial receipt lands in a fixed
+// 32-entry BSS ring carrying a boot-monotonic sequence number; a full
+// ring drops the oldest entry. No allocation, and the serial line is
+// unchanged — the ring is a second copy, never the channel.
+// ---------------------------------------------------------------------------
+
+/// The ring's bound — "recent denials", not a boot-long ledger.
+pub const denial_ring_len: usize = 32;
+
+const DenialEntry = struct {
+    seq: u64 = 0,
+    len: usize = 0,
+    text: [measure.receipt_max]u8 = undefined,
+};
+
+var denial_ring: [denial_ring_len]DenialEntry = undefined;
+/// Ring index of the oldest live entry; entries walk oldest → newest.
+var denial_oldest: usize = 0;
+var denial_count: usize = 0;
+/// The next sequence number issued — the ring's newest seq is
+/// `denial_next - 1` (0 once nothing has receipted this boot).
+var denial_next: u64 = 1;
+
+fn denial_record(line: []const u8) void {
+    const n = @min(line.len, measure.receipt_max);
+    const idx = if (denial_count < denial_ring_len) blk: {
+        const i = (denial_oldest + denial_count) % denial_ring_len;
+        denial_count += 1;
+        break :blk i;
+    } else blk: {
+        const i = denial_oldest;
+        denial_oldest = (denial_oldest + 1) % denial_ring_len;
+        break :blk i;
+    };
+    const e = &denial_ring[idx];
+    e.seq = denial_next;
+    denial_next += 1;
+    e.len = n;
+    @memcpy(e.text[0..n], line[0..n]);
+}
+
+/// Slot-89 op 2's marshal: `out` receives `[next u64le]` then whole
+/// newline-terminated receipts — every ring entry with sequence >
+/// `cursor`, in sequence order, as many as `out` fits. Copies stop at the
+/// first entry that does not fit so the copied prefix is contiguous:
+/// `next` is its last sequence (`cursor` itself when nothing qualified),
+/// and the caller's `next - cursor - lines` is exactly the count the
+/// ring dropped between the cursor and the first returned receipt.
+/// Returns the byte count written (8 when nothing qualified); `out` must
+/// hold the header (the syscall seam refuses `len < 8 + receipt_max`).
+pub fn denial_read(cursor: u64, out: []u8) usize {
+    if (out.len < 8) return 0;
+    var n: usize = 8;
+    var next = cursor;
+    var i: usize = 0;
+    while (i < denial_count) : (i += 1) {
+        const e = &denial_ring[(denial_oldest + i) % denial_ring_len];
+        if (e.seq <= cursor) continue;
+        if (out.len - n < e.len) break;
+        @memcpy(out[n..][0..e.len], e.text[0..e.len]);
+        n += e.len;
+        next = e.seq;
+    }
+    std.mem.writeInt(u64, out[0..8], next, .little);
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -1933,4 +2010,76 @@ test "grant: fsScopeEval allows under a prefix, refuses off-list and ro writes (
     try std.testing.expectEqual(FsVerdict.write, fsScopeEval(&layered, "/host/OTHER/x", .write));
     // The unconstrained fast path.
     try std.testing.expectEqual(FsVerdict.allow, fsScopeEval(&Scope{}, "/host/anything", .write));
+}
+
+// M161a (#2982): the denial ring + op-2 marshal — order, wrap/drop, the
+// cursor window, and the contiguous-prefix fit rule.
+
+test "grant: denial ring keeps order and the cursor resumes past consumed receipts" {
+    init();
+    denial_record("RCPT stage=exec sha256=aa verdict=audit:net_denied name=A.BIN word=net\n");
+    denial_record("RCPT stage=exec sha256=bb verdict=audit:debug_denied name=B.BIN word=debug\n");
+    denial_record("RCPT stage=exec sha256=cc verdict=refused:file_denied name=C.BIN word=file\n");
+
+    var out: [8 + denial_ring_len * measure.receipt_max]u8 = undefined;
+    // cursor 0 drains all three in sequence order; next = the newest seq.
+    const n1 = denial_read(0, &out);
+    try std.testing.expect(std.mem.eql(u8, out[0..8], &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, out[8..n1], "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out[8..n1], "name=A.BIN").? < std.mem.indexOf(u8, out[8..n1], "name=C.BIN").?);
+    // cursor 2 resumes at seq 3 only.
+    const n2 = denial_read(2, &out);
+    try std.testing.expect(std.mem.eql(u8, out[0..8], &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqualStrings("RCPT stage=exec sha256=cc verdict=refused:file_denied name=C.BIN word=file\n", out[8..n2]);
+    // cursor at the newest seq: header only, cursor untouched.
+    const n3 = denial_read(3, &out);
+    try std.testing.expectEqual(@as(usize, 8), n3);
+    try std.testing.expect(std.mem.eql(u8, out[0..8], &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }));
+}
+
+test "grant: a full denial ring drops the oldest and the gap is derivable" {
+    init();
+    var i: usize = 0;
+    while (i < denial_ring_len + 8) : (i += 1) {
+        var line: [64]u8 = undefined;
+        const l = std.fmt.bufPrint(&line, "RCPT verdict=audit:net_denied seq={d}\n", .{i}) catch unreachable;
+        denial_record(l);
+    }
+    try std.testing.expectEqual(denial_ring_len, denial_count);
+    // Seqs 1..8 were evicted; the ring holds 9..40.
+    var out: [8 + denial_ring_len * measure.receipt_max]u8 = undefined;
+    const n = denial_read(0, &out);
+    try std.testing.expect(std.mem.eql(u8, out[0..8], &[_]u8{ 40, 0, 0, 0, 0, 0, 0, 0 }));
+    const lines = std.mem.count(u8, out[8..n], "\n");
+    try std.testing.expectEqual(denial_ring_len, lines);
+    // The first surviving receipt is seq 9 — oldest dropped first.
+    try std.testing.expect(std.mem.startsWith(u8, out[8..n], "RCPT verdict=audit:net_denied seq=8\n"));
+    // next - cursor - lines = 40 - 0 - 32 = 8 — the dropped count.
+    try std.testing.expectEqual(@as(u64, 8), std.mem.readInt(u64, out[0..8], .little) - @as(u64, lines));
+    // A mid-ring cursor reads strictly newer entries.
+    const n2 = denial_read(38, &out);
+    try std.testing.expect(std.mem.startsWith(u8, out[8..n2], "RCPT verdict=audit:net_denied seq=38\n"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out[8..n2], "\n"));
+}
+
+test "grant: denial_read stops at a whole receipt — partial fits never split a line" {
+    init();
+    denial_record("RCPT verdict=audit:net_denied name=A.BIN\n"); // 41 bytes
+    denial_record("RCPT verdict=audit:debug_denied name=B.BIN\n"); // 43 bytes
+    // Room for the header + the first line only: the second is left
+    // whole for the next read, and next marks the contiguous prefix.
+    var out: [8 + 41]u8 = undefined;
+    const n = denial_read(0, &out);
+    try std.testing.expectEqual(@as(usize, 8 + 41), n);
+    try std.testing.expect(std.mem.eql(u8, out[0..8], &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqualStrings("RCPT verdict=audit:net_denied name=A.BIN\n", out[8..n]);
+    // Resuming at next serves the receipt that did not fit.
+    var out2: [8 + 2 * measure.receipt_max]u8 = undefined;
+    const n2 = denial_read(1, &out2);
+    try std.testing.expect(std.mem.eql(u8, out2[0..8], &[_]u8{ 2, 0, 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqualStrings("RCPT verdict=audit:debug_denied name=B.BIN\n", out2[8..n2]);
+    // Under the header bound the marshal refuses to write at all (the
+    // syscall seam answers EINVAL before reaching here).
+    var tiny: [7]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), denial_read(0, &tiny));
 }

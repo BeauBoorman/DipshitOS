@@ -1,6 +1,7 @@
 package vi
 
 import (
+	"encoding/binary"
 	"strings"
 	"unsafe"
 )
@@ -21,13 +22,19 @@ import (
 //     insert-or-update by name, persist GRANTS.TXT through the kernel
 //     channel. ENOSPC at the bounded table, ENXIO with no host channel,
 //     EIO rolls the table back.
+//   - op 2 DENIAL_READ (issue #2982, wave-3 W1): the kernel's denial
+//     receipts readable at EL0 — a 32-entry ring of the verbatim RCPT
+//     lines emit_denial publishes to serial. The buffer gets [next
+//     cursor u64le] then whole newline-terminated receipts with
+//     sequence > cursor, as many as fit; EINVAL below 8 + receipt_max.
 //
 // Off the guest every call degrades to -ENOSYS like the rest of the SDK;
 // the host tests ride the syscallHook seam (grant_test.go).
 
 const (
-	grantAdminRead  uint64 = 0
-	grantAdminWrite uint64 = 1
+	grantAdminRead    uint64 = 0
+	grantAdminWrite   uint64 = 1
+	grantAdminDenials uint64 = 2
 )
 
 // GrantNameMax and GrantLineMax mirror kernel grant.name_max/line_max —
@@ -199,4 +206,47 @@ func GrantRows() ([]GrantRow, int64) {
 		}
 		rows = append(rows, r)
 	}
+}
+
+// GrantReceiptMax mirrors kernel measure.receipt_max — the longest
+// receipt line the denial ring can hold, and the kernel's EINVAL bound
+// for an op-2 buffer is 8 + this. GrantDenialsBuf drains the whole
+// 32-entry ring in one call.
+const (
+	GrantReceiptMax = 176
+	GrantDenialsBuf = 8 + 32*GrantReceiptMax
+)
+
+// GrantDenials drains the kernel's denial-receipt ring (slot 89 op 2):
+// every receipt the kernel published for a word or scope denial this
+// boot whose sequence is newer than cursor. lines are the verbatim RCPT
+// lines (newline stripped); next is the cursor the next call should
+// pass — the newest sequence actually returned, so a partial drain
+// resumes mid-ring rather than skipping. dropped is the sequence gap
+// the ring evicted between cursor and the first returned receipt
+// (next - cursor - len(lines)); a caller that keeps pace sees 0.
+// rc is the kernel errno — -EACCES for a caller outside the seat /
+// CAP_PROC_ADMIN gate (lines nil, so a refused caller reads "unknown",
+// never "no denials").
+func GrantDenials(cursor uint64) (lines []string, next uint64, dropped uint64, rc int64) {
+	var buf [GrantDenialsBuf]byte
+	r := svc4(SlotGrantAdmin, uintptr(grantAdminDenials), uintptr(cursor),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if r < 0 {
+		return nil, cursor, 0, r
+	}
+	n := int(r)
+	if n < 8 || n > len(buf) {
+		return nil, cursor, 0, -ErrEINVAL
+	}
+	next = binary.LittleEndian.Uint64(buf[:8])
+	for _, l := range strings.Split(string(buf[8:n]), "\n") {
+		if l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if gap := int64(next) - int64(cursor) - int64(len(lines)); gap > 0 {
+		dropped = uint64(gap)
+	}
+	return lines, next, dropped, 0
 }

@@ -25,11 +25,13 @@
 //     rendered verbatim (the chain lines today; the parser
 //     carries the full stage=exec grammar so refused:/audit:
 //     verdicts render the day exec receipts persist there).
-//     Per app, denied=<csv> shows the baseline words its grant
-//     does not cover — the calls that WOULD receipt
-//     audit:<word>_denied — because the kernel's denial
-//     receipts are serial-only (klog) and have no EL0 read
-//     surface. That gap is named here, not papered over.
+//   - denials    — the kernel's denial-receipt ring, read through
+//     slot 89 op 2 (#2982): every audit:/refused: receipt emit_denial
+//     published this boot, verbatim. Per app, denials= groups them by
+//     (verdict, word) with a count; would_deny=<csv> stays the
+//     COMPUTED set — baseline words the grant does not cover — and
+//     denials= is what the kernel actually receipted. A refused read
+//     renders denials=?, never an empty list.
 //
 // The marker vocabulary is TOP's own (`top: trust ...`) for the same
 // reason every other tab's is: the gate asserts the serial lines, and a
@@ -68,11 +70,12 @@ const (
 // trustSeams: the syscall-adjacent reads as package vars so host tests
 // stage a share without the kernel (the discipline every other tab keeps).
 var (
-	trustRowsFn   = func() ([]vi.GrantRow, int64) { return vi.GrantRows() }
-	trustReadFn   = vi.ReadFileAll
-	trustListFn   = vi.ListDirAt
-	trustMeasFn   = measureShareFile
-	trustExistsFn = vi.FileExists
+	trustRowsFn    = func() ([]vi.GrantRow, int64) { return vi.GrantRows() }
+	trustDenialsFn = func(c uint64) ([]string, uint64, uint64, int64) { return vi.GrantDenials(c) }
+	trustReadFn    = vi.ReadFileAll
+	trustListFn    = vi.ListDirAt
+	trustMeasFn    = measureShareFile
+	trustExistsFn  = vi.FileExists
 )
 
 // trustApp is one process's rendered posture.
@@ -82,6 +85,7 @@ type trustApp struct {
 	Declared  string // canonical csv, "-" when nothing declared
 	Granted   string // row words, "baseline", or "?" when the table refused
 	Denied    string // baseline words the grant does not cover, "-"
+	Denials   string // observed ring receipts: "audit:net x2", "-", or "?"
 	SHA       string // measured raw-file sha256 hex, "-" when unmeasured
 	Pin       string // the row's sha256 pin, "*" wildcard, "-" no row
 	Verdict   string // match|stale|wild|none — measured vs pin
@@ -101,10 +105,13 @@ type trustRcpt struct {
 
 // TrustView is the trust tab's state.
 type TrustView struct {
-	apps      []trustApp
-	rcpts     []trustRcpt
-	tableErr  int64 // the slot-89 errno, 0 when the rows were served
-	refreshed bool
+	apps          []trustApp
+	rcpts         []trustRcpt
+	denials       []trustRcpt // the op-2 ring's receipts this refresh
+	denialDropped uint64      // receipts the ring evicted unread
+	denialsErr    int64       // the op-2 errno, 0 when the ring was served
+	tableErr      int64       // the slot-89 errno, 0 when the rows were served
+	refreshed     bool
 }
 
 // NewTrustView builds an empty view.
@@ -125,6 +132,21 @@ func (v *TrustView) Refresh(names []string) {
 		v.tableErr = rc
 	}
 	v.rcpts = parseReceipts(readTrust(trustRcptPath))
+
+	// The observed-denial drain: cursor 0 each refresh re-reads the whole
+	// 32-entry ring ("recent denials" is the ring's bound, not a growing
+	// ledger), so `dropped` is the count evicted before the oldest
+	// surviving receipt. A refused read is kept as denialsErr — the tab
+	// says the surface is unreadable rather than painting an empty ring.
+	v.denials = v.denials[:0]
+	v.denialsErr = 0
+	v.denialDropped = 0
+	if dlines, _, dropped, drc := trustDenialsFn(0); drc < 0 {
+		v.denialsErr = drc
+	} else {
+		v.denialDropped = dropped
+		v.denials = parseReceipts([]byte(strings.Join(dlines, "\n")))
+	}
 
 	// Publisher fingerprints resolve once per refresh and only for streams
 	// STORE.TXT actually names — a replica is scanned lazily, on demand.
@@ -161,6 +183,7 @@ func (v *TrustView) Refresh(names []string) {
 		if denied := deniedWords(a.Granted); denied != "" {
 			a.Denied = denied
 		}
+		a.Denials = v.denialsText(name)
 		if imageOnShare(name) {
 			a.SHA = trustMeasFn(name)
 		}
@@ -560,6 +583,99 @@ func (v *TrustView) rcptsFor(name string) []trustRcpt {
 	return out
 }
 
+// --- observed denials (slot 89 op 2) ---------------------------------------
+
+// trustDenial is one aggregated observed-denial entry: the verdict
+// prefix (audit|refused) and the denied word — for a scope denial the
+// qualifier the verdict itself carries (`audit:fs_path_denied` counts
+// as word fs_path, word=file) — plus how many of this refresh's drained
+// receipts grouped into it.
+type trustDenial struct {
+	Verdict string
+	Word    string
+	Count   int
+}
+
+// denialOf decodes a receipt's `<audit|refused>:<w>_denied` verdict into
+// the (verdict, word) pair — the marker's two fields — so each rendered
+// entry pairs back to the serial line `<v>:<w>_denied name=<app>`.
+// Anything else in the stream (a `measured` receipt is never in the
+// ring, but the decode stays fail-closed) is skipped, not half-shown.
+func denialOf(r trustRcpt) (string, string, bool) {
+	p, w, ok := strings.Cut(r.Verdict, ":")
+	if !ok || (p != "audit" && p != "refused") {
+		return "", "", false
+	}
+	if !strings.HasSuffix(w, "_denied") {
+		return "", "", false
+	}
+	return p, strings.TrimSuffix(w, "_denied"), true
+}
+
+// denialGroups aggregates the drained receipts by their name= field in
+// receipt order — every drained receipt is represented even when the
+// process is no longer listed.
+func (v *TrustView) denialGroups() []struct {
+	name string
+	d    trustDenial
+} {
+	type key struct{ name, verdict, word string }
+	var order []key
+	agg := map[key]*trustDenial{}
+	for _, r := range v.denials {
+		pv, w, ok := denialOf(r)
+		if !ok || r.Name == "" {
+			continue
+		}
+		k := key{r.Name, pv, w}
+		if e, ok := agg[k]; ok {
+			e.Count++
+			continue
+		}
+		agg[k] = &trustDenial{Verdict: pv, Word: w, Count: 1}
+		order = append(order, k)
+	}
+	var out []struct {
+		name string
+		d    trustDenial
+	}
+	for _, k := range order {
+		out = append(out, struct {
+			name string
+			d    trustDenial
+		}{k.name, *agg[k]})
+	}
+	return out
+}
+
+// denialsFor aggregates the drained receipts naming name.
+func (v *TrustView) denialsFor(name string) []trustDenial {
+	var out []trustDenial
+	for _, g := range v.denialGroups() {
+		if procKey(g.name, name) {
+			out = append(out, g.d)
+		}
+	}
+	return out
+}
+
+// denialsText is the app's denials= cell: "?" when the ring read was
+// refused (unknown, never an empty list), "-" when the kernel receipted
+// nothing for this app, else the grouped `audit:word xN` list.
+func (v *TrustView) denialsText(name string) string {
+	if v.denialsErr != 0 {
+		return "?"
+	}
+	var parts []string
+	for _, d := range v.denialsFor(name) {
+		parts = append(parts, d.Verdict+":"+d.Word+" x"+vi.Itoa64(int64(d.Count)))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ", ")
+}
+
 // --- render + markers -------------------------------------------------------
 
 // Lines is the tab's text: a summary line, one posture block per app, then
@@ -582,8 +698,9 @@ func (v *TrustView) Lines() []string {
 			"== "+padRight(clip(a.Name, 16), 16)+" uid="+padRight(a.UID, 4)+" "+a.State,
 			"   declared="+padRight(clip(a.Declared, 20), 20)+
 				" granted="+clip(a.Granted, 28),
-			"   denied="+padRight(clip(a.Denied, 30), 30)+
+			"   would_deny="+padRight(clip(a.Denied, 20), 20)+
 				" pin="+clip(a.Pin, 12),
+			"   denials="+clip(a.Denials, 60),
 			"   sha256="+a.SHA,
 			"   publisher="+a.Publisher+"  stream="+orDashT(a.Stream),
 		)
@@ -670,4 +787,34 @@ func (v *TrustView) RcptMarker(i int) (string, bool) {
 		return "", false
 	}
 	return "top: trust rcpt " + v.rcpts[i].Line, true
+}
+
+// DenialsMarker is the observed-denial summary — how many receipts the
+// op-2 drain carried that decode as denials, and how many the ring
+// evicted before them. err= names the refusal rather than claiming an
+// empty ring.
+func (v *TrustView) DenialsMarker() string {
+	if v.denialsErr != 0 {
+		return "top: trust denials err=" + vi.ErrnoName(v.denialsErr)
+	}
+	var n int
+	for _, g := range v.denialGroups() {
+		n += g.d.Count
+	}
+	return "top: trust denials n=" + vi.Itoa64(int64(n)) +
+		" dropped=" + vi.Itoa64(int64(v.denialDropped))
+}
+
+// DenialMarker is one aggregated observed-denial entry — the gate pairs
+// it with the kernel's own `<verdict>:<word>_denied name=<app>` serial
+// receipt.
+func (v *TrustView) DenialMarker(i int) (string, bool) {
+	groups := v.denialGroups()
+	if i < 0 || i >= len(groups) {
+		return "", false
+	}
+	g := groups[i]
+	return "top: trust denial app=" + g.name +
+		" verdict=" + g.d.Verdict +
+		" word=" + g.d.Word, true
 }

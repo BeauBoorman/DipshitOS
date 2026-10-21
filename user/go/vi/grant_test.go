@@ -1,6 +1,8 @@
 package vi
 
 import (
+	"encoding/binary"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -137,5 +139,65 @@ func TestGrantWordsSubset(t *testing.T) {
 	}
 	if !GrantWordsSubset(nil, b) {
 		t.Fatal("empty ⊆ anything")
+	}
+}
+
+// TestGrantDenialsDispatchesSlot89Op2 pins the op-2 wire: cursor in a1,
+// buffer in a2/a3, and the [next u64le][receipts] frame decoded back —
+// including the drop gap when the ring wrapped past the cursor.
+func TestGrantDenialsDispatchesSlot89Op2(t *testing.T) {
+	payload := "RCPT stage=exec sha256=aa verdict=audit:net_denied name=CONFINE.BIN word=net\n" +
+		"RCPT stage=exec sha256=bb verdict=audit:debug_denied name=GRANTD.BIN word=debug\n"
+	var gotOp, gotCursor uintptr
+	installHook(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		gotOp, gotCursor = a0, a1
+		if a3 < 8+GrantReceiptMax {
+			return -ErrEINVAL
+		}
+		b := unsafe.Slice((*byte)(unsafe.Pointer(a2)), a3)
+		binary.LittleEndian.PutUint64(b[:8], 44) // newest returned seq
+		copy(b[8:], payload)
+		return int64(8 + len(payload))
+	})
+	// cursor 40, two lines returned ending at seq 44: seqs 41-42 fell
+	// out of the ring before the read — dropped = 44 - 40 - 2.
+	lines, next, dropped, rc := GrantDenials(40)
+	if rc != 0 {
+		t.Fatalf("GrantDenials rc=%d", rc)
+	}
+	if gotOp != 2 || gotCursor != 40 {
+		t.Fatalf("op=%d cursor=%d, want 2/40", gotOp, gotCursor)
+	}
+	if next != 44 || dropped != 2 {
+		t.Fatalf("next=%d dropped=%d, want 44/2", next, dropped)
+	}
+	if len(lines) != 2 ||
+		!strings.Contains(lines[0], "audit:net_denied name=CONFINE.BIN") ||
+		!strings.Contains(lines[1], "audit:debug_denied name=GRANTD.BIN") {
+		t.Fatalf("lines %v", lines)
+	}
+}
+
+// TestGrantDenialsNoNewReceipts: the header-only answer — next is the
+// caller's own cursor back, no lines, no gap.
+func TestGrantDenialsNoNewReceipts(t *testing.T) {
+	installHook(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
+		binary.LittleEndian.PutUint64(
+			unsafe.Slice((*byte)(unsafe.Pointer(a2)), a3)[:8], uint64(a1))
+		return 8
+	})
+	lines, next, dropped, rc := GrantDenials(7)
+	if rc != 0 || next != 7 || dropped != 0 || len(lines) != 0 {
+		t.Fatalf("lines=%v next=%d dropped=%d rc=%d", lines, next, dropped, rc)
+	}
+}
+
+// TestGrantDenialsRefusedStaysUnknown pins the honesty rule: EACCES is
+// handed back, lines nil — a refused caller must never read as "none".
+func TestGrantDenialsRefusedStaysUnknown(t *testing.T) {
+	installHook(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 { return -ErrEACCES })
+	lines, _, _, rc := GrantDenials(0)
+	if rc != -ErrEACCES || lines != nil {
+		t.Fatalf("lines=%v rc=%d", lines, rc)
 	}
 }
