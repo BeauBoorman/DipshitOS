@@ -435,7 +435,7 @@ func TestClipPasteRefusals(t *testing.T) {
 	if got := pendingJoined(&m); !strings.Contains(got, markerPasteNo+"KNOWN.TXT exists") {
 		t.Fatalf("paste-over-self must refuse: %q", got)
 	}
-	if m.clip == "" {
+	if len(m.clipSet) == 0 {
 		t.Fatal("a refused paste must keep the clip held")
 	}
 }

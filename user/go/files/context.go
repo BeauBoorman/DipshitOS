@@ -147,6 +147,12 @@ func (m *model) handleRightClick(x, y int) {
 		m.closeQuickLook()
 		return
 	}
+	if m.mode == modeProps {
+		// M155a (#2929): the properties card dismisses on a right press
+		// exactly as on a left — no menu may open over it.
+		m.closeProps()
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		// #2894: a right press sheds the armed confirm too — it must not
 		// open the menu over a pending delete.

@@ -38,6 +38,7 @@ const (
 	modeContext   // M124d (#2583): the right-click menu owns keys until dismissed
 	modeHints     // M121c (#2566): the '?' chord-hint overlay owns the frame
 	modeQuickLook // M149a (#2806): the spacebar preview pane owns the frame
+	modeProps     // M155a (#2929): the 'i' properties card owns the frame
 )
 
 // titleBarPx is the window title band the client area sits below: the
@@ -63,8 +64,27 @@ type model struct {
 	// the name the prompt actually showed.
 	delName string
 
-	clip    string // absolute source path held by c/x
-	clipCut bool   // x (move) vs c (copy)
+	clipSet []string // absolute source paths queued by c/x (one or a marked set)
+	clipCut bool     // x (move) vs c (copy)
+
+	// M155b (#2930): the marked set — names bound to marksDir (the
+	// directory they were made in; a cd hides the set, marking elsewhere
+	// starts fresh). Transient: never serialized into the session blob.
+	marks    map[string]struct{}
+	marksDir string
+
+	// delSet is the batch delete the armed confirm holds (names under the
+	// dir the prompt was raised in); empty for the single-file prompt.
+	delSet []string
+
+	// M155b: the queued batch main steps one item per loop pass. prog is
+	// its seat-visible progress row (kind 22 via appkit.Progress.Report);
+	// winID is the window the row reports for — set by main, 0 in host
+	// tests where the post refuses before the mailbox.
+	batch   batchOp
+	batchOn bool
+	prog    appkit.Progress
+	winID   uint32
 
 	preview    string // preview pane body
 	previewOf  string // name the preview shows (pane header)
@@ -138,6 +158,10 @@ type model struct {
 	// on the selection, dismissed by space/Esc or a pointer press; the
 	// listing underneath is never touched.
 	ql quickLook
+
+	// M155a (#2929): the 'i' properties card (props.go). Armed by 'i' on
+	// the selection, dismissed by Esc/`i` or a pointer press.
+	props props
 }
 
 // hintsBin names this app's registry scope — the untagged twin of
@@ -268,6 +292,7 @@ func (m *model) refresh() {
 	m.n = n
 	sortEntries(m.entries[:], m.n, m.sort)
 	m.clampSel()
+	m.pruneMarks()
 	m.watcher.Adopt(vi.DirSnapshot{OK: true, Rows: append([]vi.DirEntry(nil), m.entries[:m.n]...)})
 	m.emit(markerList + m.path + " n=" + vi.Itoa64(int64(m.n)))
 	for i := 0; i < m.n; i++ {
@@ -580,6 +605,12 @@ func (m *model) handleClick(x, y int) {
 		m.closeQuickLook()
 		return
 	}
+	if m.mode == modeProps {
+		// M155a (#2929): same rule as the QuickLook pane — a press
+		// dismisses the card, never acts on the list underneath it.
+		m.closeProps()
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		// #2894: a press while the confirm is armed is acting on the
 		// list, not answering — shed the prompt. The press is swallowed
@@ -696,6 +727,10 @@ func (m *model) handleKey(ev keys.Event) {
 		m.qlKey(ev)
 		return
 	}
+	if m.mode == modeProps {
+		m.propsKey(ev)
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		// #2894: the prompt answers y/Y only — every other key sheds it
 		// instead of being swallowed, so a stray 'd' cannot hold the
@@ -779,6 +814,12 @@ func (m *model) handleKey(ev keys.Event) {
 			m.pasteClip()
 		case ' ':
 			m.openQuickLook()
+		case 'i':
+			m.openProps()
+		case 'm':
+			m.toggleMark()
+		case 'M':
+			m.clearMarks()
 		case 'o':
 			m.startOpenWith()
 		case 'e':
@@ -1111,10 +1152,21 @@ func (m *model) replaceRename() {
 	m.status = "renamed " + to
 }
 
-// startDelete arms the confirm step for a file; directories are refused
-// honestly (ADR 0007 has no rmdir slot, so EASY delete would fail anyway).
+// startDelete arms the confirm step for a file — or, with marks present
+// (M155b #2930), ONE confirm for the whole set: the prompt asks once and
+// names the count, and 'y' queues the delete batch. Directories are
+// refused honestly (ADR 0007 has no rmdir slot, so EASY delete would fail
+// anyway) — the set cannot contain one because marks refuse them first.
 func (m *model) startDelete() {
 	if m.atVolumes() {
+		return
+	}
+	if set := m.markedSet(); len(set) > 0 {
+		m.mode = modeConfirmDelete
+		m.delName = ""
+		m.delSet = set
+		m.emit(markerDeleteArm + "n=" + vi.Itoa64(int64(len(set))))
+		m.status = "delete " + vi.Itoa64(int64(len(set))) + " marked? y/n"
 		return
 	}
 	e, ok := m.selEntry()
@@ -1142,12 +1194,31 @@ func (m *model) cancelDelete(cause string) {
 		return
 	}
 	m.mode = modeNormal
-	m.emit(markerDeleteCancel + m.delName + " " + cause)
+	if len(m.delSet) > 0 {
+		m.emit(markerDeleteCancel + "n=" + vi.Itoa64(int64(len(m.delSet))) + " " + cause)
+		m.delSet = nil
+	} else {
+		m.emit(markerDeleteCancel + m.delName + " " + cause)
+	}
 	m.delName = ""
 	m.status = "delete cancelled"
 }
 
 func (m *model) doDelete() {
+	if len(m.delSet) > 0 {
+		// M155b (#2930): the 'y' answered the set's one confirm — queue
+		// the delete batch, stepped like every other batch. A batch still
+		// running is named rather than queued behind itself.
+		items := m.delSet
+		m.delSet, m.delName = nil, ""
+		m.mode = modeNormal
+		if m.batchOn {
+			m.status = "delete: a batch is running"
+			return
+		}
+		m.startBatch(batchDelete, items, m.path)
+		return
+	}
 	name := m.delName
 	m.delName = ""
 	m.mode = modeNormal
@@ -1195,9 +1266,37 @@ func (m *model) restoreLatest() {
 	m.emit(markerRestored + name + " trash=" + id)
 }
 
-// yankClip holds the selected file for a later paste (c = copy, x = move).
+// yankClip holds the selected file — or the whole marked set (M155b
+// #2930) — for a later paste (c = copy, x = move). The set is queued in
+// listing order so the batch's progress sequence reads the way the list
+// did. A copy also publishes the sources' URIs on the machine clipboard
+// (one file:// line each); a cut publishes nothing.
 func (m *model) yankClip(cut bool) {
 	if m.atVolumes() {
+		return
+	}
+	verb := "copy"
+	if cut {
+		verb = "cut"
+	}
+	if names := m.markedSet(); len(names) > 0 {
+		var set []string
+		for _, name := range names {
+			src, ok := joinPath(m.path, name)
+			if !ok {
+				m.emit(markerClip + verb + " refused " + name + " path")
+				m.status = "clip: path too long"
+				return
+			}
+			set = append(set, src)
+		}
+		m.clipSet = set
+		m.clipCut = cut
+		m.emit(markerClip + verb + " set n=" + vi.Itoa64(int64(len(set))))
+		m.status = verb + " " + vi.Itoa64(int64(len(set))) + " marked"
+		if !cut {
+			m.publishClipURIs(set)
+		}
 		return
 	}
 	e, ok := m.selEntry()
@@ -1215,12 +1314,8 @@ func (m *model) yankClip(cut bool) {
 		m.status = "clip: path too long"
 		return
 	}
-	m.clip = src
+	m.clipSet = []string{src}
 	m.clipCut = cut
-	verb := "copy"
-	if cut {
-		verb = "cut"
-	}
 	m.emit(markerClip + verb + " " + e.NameString())
 	m.status = verb + " " + e.NameString()
 	if !cut {
@@ -1230,20 +1325,16 @@ func (m *model) yankClip(cut bool) {
 		// publishes nothing: the URI would name a path about to go
 		// stale. EACCES under the seat lands on the marker like every
 		// other refused op; the local clip already succeeded.
-		n, rc := vsys.ClipboardSetTyped(vsys.ClipURIList, []byte("file://"+src))
-		if rc < 0 {
-			m.emit(markerClipSys + "rc=" + vi.Itoa64(rc))
-		} else {
-			m.emit(markerClipSys + "n=" + vi.Itoa64(int64(n)))
-		}
+		m.publishClipURIs([]string{src})
 	}
 }
 
-// pasteClip materializes the held file in the current directory: copy reads
-// the bytes and safe-writes them, move renames. An existing target is
-// refused — a paste never overwrites.
+// pasteClip materializes the held file(s) in the current directory: copy
+// reads the bytes and safe-writes them, move renames. An existing target
+// is refused — a paste never overwrites. A queued SET (M155b #2930)
+// hands off to the batch planner, which steps the items one per frame.
 func (m *model) pasteClip() {
-	if m.clip == "" {
+	if len(m.clipSet) == 0 {
 		m.emit(markerPasteNo + "empty clip")
 		m.status = "paste: nothing held"
 		return
@@ -1251,8 +1342,13 @@ func (m *model) pasteClip() {
 	if m.atVolumes() {
 		return
 	}
-	name := baseName(m.clip)
-	if m.clipCut && volumeOf(m.clip) != volumeOf(m.path) {
+	if len(m.clipSet) > 1 {
+		m.startPasteBatch()
+		return
+	}
+	src := m.clipSet[0]
+	name := baseName(src)
+	if m.clipCut && volumeOf(src) != volumeOf(m.path) {
 		// A rename is same-volume only by ABI (ADR 0050 D6: pin_rename
 		// refuses a cross-partition pair), so a held move cannot land off
 		// its own volume — copy (c) crosses volumes; move (x) does not.
@@ -1266,7 +1362,7 @@ func (m *model) pasteClip() {
 		return
 	}
 	if m.clipCut {
-		rc := pasteMove(m.path, m.clip)
+		rc := pasteMove(m.path, src)
 		if rc < 0 {
 			m.emit(markerPasteNo + name + " rc=" + vi.Itoa64(rc))
 			m.status = refusalStatus("paste", rc)
@@ -1275,12 +1371,12 @@ func (m *model) pasteClip() {
 		m.emit(markerPasted + name)
 		m.status = "moved " + name
 		m.notifyToast("moved " + name)
-		m.clip = ""
+		m.clipSet = nil
 		m.refresh()
 		m.status = "moved " + name
 		return
 	}
-	data, rc := readCapped(m.clip, maxPasteBytes)
+	data, rc := readCapped(src, maxPasteBytes)
 	if rc < 0 {
 		m.emit(markerPasteNo + name + " rc=" + vi.Itoa64(rc))
 		m.status = "paste refused"
@@ -1291,7 +1387,7 @@ func (m *model) pasteClip() {
 		m.status = "paste: file too large"
 		return
 	}
-	rc = pasteCopy(m.path, m.clip, data)
+	rc = pasteCopy(m.path, src, data)
 	if rc < 0 {
 		m.emit(markerPasteNo + name + " rc=" + vi.Itoa64(rc))
 		m.status = refusalStatus("paste", rc)

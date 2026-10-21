@@ -143,10 +143,10 @@ func TestVolumesRootRefusesTheMutatingOps(t *testing.T) {
 		t.Fatal("delete armed on a volume row")
 	}
 	m.yankClip(false)
-	if m.clip != "" {
-		t.Fatalf("a volume row was clipped: %q", m.clip)
+	if len(m.clipSet) != 0 {
+		t.Fatalf("a volume row was clipped: %v", m.clipSet)
 	}
-	m.clip = "/host/FM/X.TXT"
+	m.clipSet = []string{"/host/FM/X.TXT"}
 	m.pasteClip()
 	if m.status != "volumes: browse only" {
 		t.Fatalf("paste into volumes status = %q", m.status)
@@ -160,13 +160,13 @@ func TestVolumesRootRefusesTheMutatingOps(t *testing.T) {
 func TestCrossVolumeMoveRefusedByName(t *testing.T) {
 	m := testModel(entry("KNOWN.TXT", false))
 	m.path = "/host/FM"
-	m.clip = "/disk/SEL/PHOTO.TXT"
+	m.clipSet = []string{"/disk/SEL/PHOTO.TXT"}
 	m.clipCut = true
 	m.pasteClip()
 	if got := pendingJoined(&m); !strings.Contains(got, markerPasteNo+"PHOTO.TXT cross-volume") {
 		t.Fatalf("cross-volume move refusal missing: %q", got)
 	}
-	if m.clip == "" {
+	if len(m.clipSet) == 0 {
 		t.Fatal("a refused move dropped the held clip")
 	}
 }

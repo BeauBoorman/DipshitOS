@@ -278,6 +278,7 @@ func main() {
 		fellBack = fell
 	}
 	m = newModel(start, cols, rows)
+	m.winID = uint32(ta.Win) // M155b: the batch's kind-22 progress row reports for this window
 	switch {
 	case ta.Restored && ta.RestoredVersion == stateFmtVer && restoredOK:
 		m.applyState(restored)
@@ -391,6 +392,21 @@ func main() {
 			declared = m.path
 		}
 
+		// M155b (#2930): an armed batch steps one item per pass — each
+		// item gets its own frame and marker flush, so the seat's
+		// progress row and the status counter visibly advance ("watch it
+		// happen"). progress=true keeps the pass out of the idle branch:
+		// a mid-batch watchStep would diff against the pre-batch baseline
+		// and misreport the batch's own writes as feed events. Keys drain
+		// it eagerly inside feed(); this is the fallback for batches
+		// armed off the key path.
+		if m.batchOn {
+			if !stepBatch(&m, fd, ta) {
+				shutdown(ta, fd, 4)
+			}
+			progress = true
+		}
+
 		if !progress {
 			idlePasses++
 			// M81f (#1766): poll the change feed on the quiet cadence.
@@ -490,6 +506,9 @@ func feed(m *model, fd uint32, chunk []byte, ta *tabapp.TabApp) bool {
 			if !onMouse(m, fd, b, x, y, released, ta) {
 				return false
 			}
+			if !drainBatch(m, fd, ta) {
+				return false
+			}
 			continue
 		}
 		ev, used := keys.Decode(kbuf)
@@ -501,6 +520,41 @@ func feed(m *model, fd uint32, chunk []byte, ta *tabapp.TabApp) bool {
 			continue
 		}
 		if !onKey(m, fd, ev, ta) {
+			return false
+		}
+		// M155b (#2930): a key that armed a batch runs it to completion
+		// NOW, one item per painted frame, before the next queued key can
+		// interleave with it. A burst chunk (the gate's paced chords can
+		// arrive several per read) must not let 'backspace' or 'q'
+		// overtake items still queued — observed on the first run-19 leg,
+		// where one FileRead swallowed the gesture's tail and the armed
+		// batch stepped only once before 'q' quit.
+		if !drainBatch(m, fd, ta) {
+			return false
+		}
+	}
+	return true
+}
+
+// stepBatch runs ONE queued batch item with the post-paint marker barrier
+// every other app receipt uses — one item, one frame, one flush.
+func stepBatch(m *model, fd uint32, ta *tabapp.TabApp) bool {
+	m.batchStep()
+	if !paint(fd, *m) {
+		return false
+	}
+	vi.Sleep(1)
+	flush(m, ta)
+	vi.ConsoleLine(markerRepaint)
+	return true
+}
+
+// drainBatch runs an armed batch to its end (done or first-failure stop)
+// — called after every decoded input event so queued keys can never
+// interleave with a half-run batch.
+func drainBatch(m *model, fd uint32, ta *tabapp.TabApp) bool {
+	for m.batchOn {
+		if !stepBatch(m, fd, ta) {
 			return false
 		}
 	}

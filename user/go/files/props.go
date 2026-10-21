@@ -1,0 +1,236 @@
+// M155a (issue #2929): the `i` properties card — "what is this file and
+// where does it live" in one key. The card is the QuickLook pane's sibling:
+// a full-frame modal over the listing, Esc closes it, and every fact on it
+// is either the row's own data, the M134a slot-79 stat wire (the mtime —
+// meta_guest.go/meta_host.go own the platform half), a 512-byte mime.Sniff,
+// or the kernel mount-table row the path's volume names (M134b). Facts the
+// wires do not carry — created time, size on disk, volume free space — get
+// a named "not available" row with its reason, never an invented value.
+//
+// The model stays pure: openProps decides and marks, render.go owns the
+// frame, and every syscall is behind the same host-stubbed seams
+// (readHead, statMtime, mountRows) the rest of the app uses.
+package main
+
+import (
+	"virelai/clockfmt"
+	"virelai/mime"
+	"virelai/rss/keys"
+	"virelai/vi"
+)
+
+// propsHeadBytes is the card's sniff window — deeper than the mime
+// table's own HeadBytes peek so the text heuristic reads a real prefix,
+// still a bound so a large file costs nothing extra here.
+const propsHeadBytes = 512
+
+// props is the open card's whole state. name/path/kind identify the row;
+// size is the wire size; mimeID is the sniff word on files ("" on rows
+// with no bytes to sniff); mtOK/mtSec carry the M134a stat's mtime; the
+// vol* fields are the mount-table row the path lives on (volOK=false
+// when the path names no mounted row the table lists).
+type props struct {
+	name    string
+	path    string
+	kind    string // "file", "directory", "volume"
+	size    uint64
+	mimeID  string
+	mtOK    bool
+	mtSec   int64
+	vol     string
+	volKind string
+	volSt   string
+	volAcc  string // "rw"/"ro" when the row is mounted, "" otherwise
+	volOK   bool
+}
+
+// openProps is the `i` chord: build the card for the cursor row and take
+// the frame. No selection is a status line, like every other
+// nothing-selected op.
+func (m *model) openProps() {
+	e, ok := m.selEntry()
+	if !ok {
+		m.status = "props: nothing selected"
+		return
+	}
+	p := props{name: e.NameString(), size: uint64(e.Size)}
+	switch {
+	case m.path == volsPath:
+		p.kind = "volume"
+	case e.Dir():
+		p.kind = "directory"
+	default:
+		p.kind = "file"
+	}
+	path, ok := joinPath(m.path, p.name)
+	if !ok {
+		m.status = "props: path too long"
+		return
+	}
+	p.path = path
+	if p.kind == "volume" {
+		// A mount-table row IS the volume fact: the reserved bytes carry
+		// the live state/kind/ro flag (M134b) — no second call.
+		mt := vi.MountFromEntry(e)
+		p.vol, p.volKind, p.volSt = mt.Name, mt.KindName(), mt.StateName()
+		if mt.Mounted() {
+			p.volAcc = mt.AccessName()
+		}
+		p.volOK = true
+	} else {
+		if p.kind == "file" {
+			data, rc := readHead(path, propsHeadBytes)
+			var head []byte
+			if rc >= 0 {
+				head = data
+			}
+			p.mimeID = mime.Sniff(p.name, head).String()
+		}
+		// The path's volume is its first component; the mount-table row
+		// it names carries kind/state/ro. A row that names no volume
+		// (never the case for a path this app navigates to) stays volOK
+		// false and the card says "—", honestly.
+		if v := volumeOf(path); v != "" {
+			if mounts, rc := mountRows(); rc >= 0 {
+				for i := range mounts {
+					if mounts[i].Name == v {
+						mt := mounts[i]
+						p.vol, p.volKind, p.volSt =
+							mt.Name, mt.KindName(), mt.StateName()
+						if mt.Mounted() {
+							p.volAcc = mt.AccessName()
+						}
+						p.volOK = true
+						break
+					}
+				}
+			}
+		}
+	}
+	// mtime from the M134a stat — a /host path only; absent reads as "—"
+	// on the card and mtime=none on the marker, never a fabricated stamp.
+	if ns, ok := statMtime(path); ok {
+		p.mtOK = true
+		p.mtSec = ns / 1e9
+	}
+	m.props = p
+	m.mode = modeProps
+	mtWord, mimeWord, volWord := "none", "none", "none"
+	if p.mtOK {
+		mtWord = vi.Itoa64(p.mtSec)
+	}
+	if p.mimeID != "" {
+		mimeWord = p.mimeID
+	}
+	if p.volOK {
+		volWord = p.vol
+	}
+	m.emit(markerProps + p.path + " mtime=" + mtWord +
+		" mime=" + mimeWord + " vol=" + volWord)
+	m.status = "props " + p.name
+}
+
+// closeProps dismisses the card — Esc (the card's own key), Backspace, a
+// second `i`, or a pointer press — restoring the list frame underneath.
+// The close marker rides pending like the open's.
+func (m *model) closeProps() {
+	if m.mode != modeProps {
+		return
+	}
+	m.mode = modeNormal
+	m.props = props{}
+	m.emit(markerPropsClose)
+	m.status = "listed"
+}
+
+// propsKey is the modeProps keyboard contract: the card is a read-only
+// surface, so the only keys are the closes, `i` again, and Ctrl-C —
+// every other key is swallowed while the card owns the frame.
+func (m *model) propsKey(ev keys.Event) {
+	switch ev.Key {
+	case keys.KeyEsc, keys.KeyBackspace:
+		m.closeProps()
+	case keys.KeyCtrlC:
+		m.quit = true
+	case keys.KeyRune:
+		if ev.Rune == 'i' {
+			m.closeProps()
+		}
+	}
+}
+
+// propsRows is the card's body: name, full path, kind, size (bytes and
+// human), the mtime as UTC ISO-8601, the sniff word, the volume row —
+// then the three named "not available" rows, each with the reason the
+// wires cannot answer it.
+func (m model) propsRows() []string {
+	p := m.props
+	size, mod, mimeWord, vol := "—", "—", "—", "—"
+	if p.kind == "file" {
+		size = vi.Itoa64(int64(p.size)) + " bytes (" + humanSize(p.size) + ")"
+	}
+	if p.mtOK {
+		mod = isoUTC(p.mtSec)
+	}
+	if p.mimeID != "" {
+		mimeWord = p.mimeID
+	}
+	if p.volOK {
+		vol = p.vol + " · " + p.volKind + " · " + p.volSt
+		if p.volAcc != "" {
+			vol += " · " + p.volAcc
+		}
+	}
+	return []string{
+		"  name      " + p.name,
+		"  path      " + p.path,
+		"  kind      " + p.kind,
+		"  size      " + size,
+		"  modified  " + mod,
+		"  mime      " + mimeWord,
+		"  volume    " + vol,
+		"  created   not available — not on the stat wire",
+		"  on disk   not available — not on the stat wire",
+		"  vol free  not available — not on the mount wire",
+	}
+}
+
+// isoUTC renders an epoch second as strict UTC ISO-8601 — the card's
+// "when" column, the same civil breakdown clockfmt owns, without the
+// zone label (Z says it).
+func isoUTC(sec int64) string {
+	c := clockfmt.At(sec, clockfmt.UTC)
+	return padN(c.Year, 4) + "-" + padN(c.Month, 2) + "-" + padN(c.Day, 2) +
+		"T" + padN(c.Hour, 2) + ":" + padN(c.Minute, 2) + ":" +
+		padN(c.Second, 2) + "Z"
+}
+
+func padN(v, w int) string {
+	s := vi.Itoa64(int64(v))
+	for len(s) < w {
+		s = "0" + s
+	}
+	return s
+}
+
+// humanSize is the card's second size word: bytes as a bounded
+// binary-magnitude string (KiB/MiB/GiB/TiB), one truncated decimal under
+// 10, whole otherwise — "512 B", "1.5 KiB", "12 MiB".
+func humanSize(n uint64) string {
+	if n < 1024 {
+		return vi.Itoa64(int64(n)) + " B"
+	}
+	suffix := []string{"KiB", "MiB", "GiB", "TiB"}
+	i := 0
+	for i < len(suffix)-1 && n>>(10*(i+2)) >= 1 {
+		i++
+	}
+	shift := uint(10 * (i + 1))
+	whole := n >> shift
+	if whole < 10 {
+		tenths := (n * 10) >> shift
+		return vi.Itoa64(int64(tenths/10)) + "." +
+			vi.Itoa64(int64(tenths%10)) + " " + suffix[i]
+	}
+	return vi.Itoa64(int64(whole)) + " " + suffix[i]
+}
