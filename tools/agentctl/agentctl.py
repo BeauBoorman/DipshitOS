@@ -731,12 +731,14 @@ def journey_input(s, cred):
                     raise Fail("seat is not gotabwm")
                 rows = res.get("windows")
                 if isinstance(rows, list):
-                    edit = [r for r in rows if r.get("title") == "Edit"]
+                    # #2865: the strip may carry SESSION.TABS-restored
+                    # Edits ahead of this boot's fresh one — the predicate
+                    # is "the focused row is an Edit" (the pane ui.input
+                    # types into), never "the first Edit row is focused".
                     focused = [r for r in rows if r.get("focused") is True]
-                    if (edit and len(focused) == 1
-                            and focused[0].get("index")
-                            == edit[0].get("index")):
-                        edit_index.append(edit[0]["index"])
+                    if (len(focused) == 1
+                            and focused[0].get("title") == "Edit"):
+                        edit_index.append(focused[0]["index"])
                         break
                 last = "no focused Edit row"
             if time.monotonic() >= deadline:

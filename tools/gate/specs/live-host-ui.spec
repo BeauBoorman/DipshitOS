@@ -553,7 +553,9 @@ PY
 # stop), its serial never shows an agent effect, and the session's end
 # marker stops vm 1 on ITS bus — the verdict's re-read path (#1024) sees
 # the transcript already landed, so the run greens rc 0 with both
-# machines' own stop receipts in the out file.
+# machines' own stop receipts in the out file. A tail assert (#2865)
+# holds the share's WINDOWS.SAV record count non-increasing across the
+# K=3 — restored phantoms never re-persist.
 vgate_file script10.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
@@ -619,4 +621,41 @@ state = os.path.join(run, "ws2.virelaivm", "saved-state", "state.vzsave")
 if not os.path.isfile(state) or os.path.getsize(state) == 0:
     sys.exit("vm 2 suspend left no saved-state/state.vzsave")
 print("journey leg: vm2 serial clean (no agent effect), state.vzsave green")
+PY
+
+# #2865: WINDOWS.SAV must not accumulate phantom records across the K=3
+# boots. j1's share rides --virtio-fs (runner-armed, not harness-armed —
+# the per-boot WINDOWS.SAV reset does not apply), which is exactly why
+# run 10 found the leak: restored phantoms were re-serialized, so the
+# file went 0 -> 4 -> 8 records and the third boot's opens hit ENOSPC.
+# Post-fix the file describes LIVE windows only — its record count is
+# bounded by the eight user slots, and the ENOSPC signature
+# (`win open failed`) never appears. The record ids+titles are dumped
+# into the check output and the file itself lifted as evidence.
+vgate_assert 10 serial-absent 'win open failed'
+vgate_assert 10 python <<'PY'
+import os, shutil, sys
+run = os.environ["RUN_DIR"]
+sav = os.path.join(run, "j1.virelaivm", "share", "WINDOWS.SAV")
+if not os.path.isfile(sav):
+    sys.exit("no WINDOWS.SAV on the j1 share — the persist tick never wrote")
+size = os.path.getsize(sav)
+if size % 32 != 0:
+    sys.exit("WINDOWS.SAV size %d is not a whole record count" % size)
+count = size // 32
+if count < 1:
+    sys.exit("WINDOWS.SAV is empty — no live windows persisted this boot")
+# Post-fix every record names a LIVE user window: the eight slots bound
+# the file, so a larger count is only reachable through re-persisted
+# phantoms (the pre-fix leak accumulated past the live set).
+if count > 8:
+    sys.exit("WINDOWS.SAV holds %d records — more than the 8 user slots (#2865)" % count)
+with open(sav, "rb") as f:
+    data = f.read()
+for i in range(count):
+    rec = data[i * 32:(i + 1) * 32]
+    title = rec[20:32].split(b"\0", 1)[0].decode("ascii", "replace")
+    print("  rec %d: id=%d flags=%02x ws=%d title=%r" % (i, rec[0], rec[1], rec[2], title))
+shutil.copy(sav, os.path.join(run, "winsav-" + os.environ["VG_TAG"] + ".sav"))
+print("WINDOWS.SAV: %d record(s), within the live-slot bound" % count)
 PY

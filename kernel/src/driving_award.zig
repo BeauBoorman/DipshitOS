@@ -228,6 +228,16 @@ pub const Window = struct {
     /// `close_owner` — a real teardown semantic instead of a window that
     /// leaks until reboot.
     owner: ?usize = null,
+    /// #2865: a WINDOWS.SAV replay — `restore_state` recreated this user
+    /// window from the previous boot's records under the sentinel owner,
+    /// so no live process will ever fill or close it. A phantom is a live
+    /// window in every respect except persistence: `serialize_state`
+    /// skips it (the save file describes LIVE windows — re-serializing a
+    /// replay would stack its record on top of the app's fresh windows
+    /// every boot until all eight slots were ghosts, the observed leak)
+    /// and a real `user_open` evicts the bottom-most one before reporting
+    /// `.full`.
+    phantom: bool = false,
     /// Arc4 #239: animated window fade-in. 0=none (fully opaque),
     /// 1=fade-in active. The paint path applies per-pixel alpha
     /// blending during the fade frames.
@@ -1658,76 +1668,100 @@ pub fn user_open(x: u32, y: u32, w: u32, h: u32, owner: usize) UserOpenResult {
     if (w == 0 or h == 0 or w > user_win_max_w or h > user_win_max_h) return .invalid;
     if (x >= virtio_gpu.fb_width or y >= virtio_gpu.fb_height) return .invalid;
     if (w > virtio_gpu.fb_width - x or h > virtio_gpu.fb_height - y) return .invalid;
-    var i: usize = 0;
-    while (i < user_windows_max) : (i += 1) {
-        const id = user_window_id_base + @as(u8, @intCast(i));
-        var used = false;
-        var j: usize = 0;
-        while (j < win_count) : (j += 1) {
-            if (windows[j].id == id) {
-                used = true;
-                break;
+    // #2865: a restored WINDOWS.SAV phantom holds a real slot under the
+    // sentinel owner but is never re-persisted — a live open evicts the
+    // bottom-most one and rescans once before the eight slots are
+    // honestly full. `.full` now means eight LIVE user windows.
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        var i: usize = 0;
+        while (i < user_windows_max) : (i += 1) {
+            const id = user_window_id_base + @as(u8, @intCast(i));
+            var used = false;
+            var j: usize = 0;
+            while (j < win_count) : (j += 1) {
+                if (windows[j].id == id) {
+                    used = true;
+                    break;
+                }
             }
-        }
-        if (used) continue;
-        const nbytes = kbuf_bytes(w, h);
-        const npages = kbuf_pages_for(nbytes);
-        const pa = alloc.alloc_pages(npages) orelse return .nomem;
-        // Host tests cannot dereference pool phys: the CPU-visible bytes
-        // live in the test arena (bump allocator — freed implicitly by
-        // the per-test reset in arm()). On device this branch is out.
-        var test_ptr: ?[*]u8 = null;
-        if (builtin.is_test) {
-            const backing = test_arena.fba.allocator().alloc(u8, nbytes) catch {
-                _ = alloc.free_pages(pa, npages);
-                return .nomem;
+            if (used) continue;
+            const nbytes = kbuf_bytes(w, h);
+            const npages = kbuf_pages_for(nbytes);
+            const pa = alloc.alloc_pages(npages) orelse return .nomem;
+            // Host tests cannot dereference pool phys: the CPU-visible bytes
+            // live in the test arena (bump allocator — freed implicitly by
+            // the per-test reset in arm()). On device this branch is out.
+            var test_ptr: ?[*]u8 = null;
+            if (builtin.is_test) {
+                const backing = test_arena.fba.allocator().alloc(u8, nbytes) catch {
+                    _ = alloc.free_pages(pa, npages);
+                    return .nomem;
+                };
+                test_ptr = backing.ptr;
+            }
+            // The buffer starts cleared (the old BSS semantic — a fresh window
+            // reads back zeros). Host tests cannot dereference pool phys, so
+            // the CPU-visible bytes live in the test allocation instead.
+            if (builtin.is_test) {
+                @memset(test_ptr.?[0..nbytes], 0);
+            } else {
+                @memset(@as([*]u8, @ptrFromInt(pa))[0..nbytes], 0);
+            }
+            windows[win_count] = .{
+                .id = id,
+                .title = "user",
+                .x = x,
+                .y = y,
+                .w = w,
+                .h = h,
+                .kind = .user,
+                .visible = true,
+                .dirty = true,
+                .owner = owner,
+                .fade_phase = 1, // Arc4 #239: start fade-in
+                .fade_tick = 0,
+                .workspace = current_workspace, // Arc4 #241: assign to current workspace
+                .kbuf_pa = pa,
+                .kbuf_pages = npages,
+                .kbuf_test = test_ptr,
             };
-            test_ptr = backing.ptr;
+            win_count += 1;
+            // Issue #990 (claim #997): the open-attribution marker — the
+            // WM2 gate's overview counted a PHANTOM third window (n=3 vs the
+            // pinned n=2) with exec forwarded exactly once; this line names
+            // every kernel-side open (id/owner/rect) so the serial log can
+            // attribute it. One line per real open, klog-gated (silent in
+            // host tests / pre-boot).
+            {
+                var kbuf: [80]u8 = undefined;
+                const s = std.fmt.bufPrint(&kbuf, "open: id={d} owner={d} rect={d},{d} {d}x{d} ws={d}\n", .{ id, owner, x, y, w, h, current_workspace }) catch "open: ?\n";
+                klog.line(s);
+            }
+            _ = focus(id);
+            // M32 WMS5: the registered WM must see the new window to hit-test it.
+            wm_mirror(id);
+            return .{ .opened = id };
         }
-        // The buffer starts cleared (the old BSS semantic — a fresh window
-        // reads back zeros). Host tests cannot dereference pool phys, so
-        // the CPU-visible bytes live in the test allocation instead.
-        if (builtin.is_test) {
-            @memset(test_ptr.?[0..nbytes], 0);
-        } else {
-            @memset(@as([*]u8, @ptrFromInt(pa))[0..nbytes], 0);
-        }
-        windows[win_count] = .{
-            .id = id,
-            .title = "user",
-            .x = x,
-            .y = y,
-            .w = w,
-            .h = h,
-            .kind = .user,
-            .visible = true,
-            .dirty = true,
-            .owner = owner,
-            .fade_phase = 1, // Arc4 #239: start fade-in
-            .fade_tick = 0,
-            .workspace = current_workspace, // Arc4 #241: assign to current workspace
-            .kbuf_pa = pa,
-            .kbuf_pages = npages,
-            .kbuf_test = test_ptr,
-        };
-        win_count += 1;
-        // Issue #990 (claim #997): the open-attribution marker — the
-        // WM2 gate's overview counted a PHANTOM third window (n=3 vs the
-        // pinned n=2) with exec forwarded exactly once; this line names
-        // every kernel-side open (id/owner/rect) so the serial log can
-        // attribute it. One line per real open, klog-gated (silent in
-        // host tests / pre-boot).
-        {
-            var kbuf: [80]u8 = undefined;
-            const s = std.fmt.bufPrint(&kbuf, "open: id={d} owner={d} rect={d},{d} {d}x{d} ws={d}\n", .{ id, owner, x, y, w, h, current_workspace }) catch "open: ?\n";
-            klog.line(s);
-        }
-        _ = focus(id);
-        // M32 WMS5: the registered WM must see the new window to hit-test it.
-        wm_mirror(id);
-        return .{ .opened = id };
+        if (!reap_phantom()) break;
     }
     return .full;
+}
+
+/// #2865: evict the bottom-most restored phantom (a WINDOWS.SAV replay —
+/// no live owner, never re-serialized) so a real `user_open` can take its
+/// slot. Runs through `remove_user_at` like every release path: the pool
+/// buffer frees, the owner and the WM each get their one notification.
+/// Returns false when the registry holds no phantom.
+fn reap_phantom() bool {
+    var i: usize = 0;
+    while (i < win_count) : (i += 1) {
+        if (windows[i].kind == .user and windows[i].phantom) {
+            remove_user_at(i);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// M97b-F3 (#2111): the bind-time invariant "a surface-backed window's rect
@@ -3182,7 +3216,12 @@ pub fn serialize_state(buf: []u8) usize {
     var wi: usize = 0;
     while (wi < win_count and off + persist_record_bytes <= buf.len) : (wi += 1) {
         const w = &windows[wi];
-        if (w.kind != .user) continue;
+        // #2865: a phantom is a replay of a record this file already
+        // carried — writing it again would grow the file every boot (the
+        // app's fresh windows record themselves) until the eight slots
+        // were all ghosts and sys_win_open refused ENOSPC. The file
+        // describes LIVE windows only.
+        if (w.kind != .user or w.phantom) continue;
         var flags: u8 = 0;
         if (w.minimized) flags |= 0x01;
         if (w.maximized) flags |= 0x02;
@@ -3239,6 +3278,9 @@ pub fn restore_state(buf: []const u8, owner: usize) usize {
         w.always_on_top = (flags & 0x04) != 0;
         w.workspace = ws;
         w.owner = owner;
+        // #2865: mark the replay so serialize_state never re-persists it
+        // and a slot-hungry live open can evict it.
+        w.phantom = true;
         var tlen: usize = 0;
         while (tlen < 12 and buf[off + 20 + tlen] != 0) : (tlen += 1) {}
         if (tlen > 0) {
@@ -6337,4 +6379,79 @@ test "wm content forward: dormant with no seat; chrome never begins selection (#
     try std.testing.expect(!term_sel_dragging);
     const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
     try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel") == null);
+}
+
+test "persist: a WINDOWS.SAV replay is never re-serialized (#2865)" {
+    // Boot 1: two live windows serialize to two records.
+    arm();
+    _ = switch (user_open(32, 32, 320, 240, 7)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = switch (user_open(96, 96, 320, 240, 8)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    var buf: [persist_max_bytes]u8 = undefined;
+    const saved = serialize_state(&buf);
+    try std.testing.expectEqual(2 * persist_record_bytes, saved);
+
+    // Boot 2: the replay lands as phantoms — live windows in every
+    // respect except persistence. The app's fresh windows open
+    // alongside, and the serialized set is the LIVE windows only: the
+    // file cannot grow across boots (the pre-fix 4 -> 8 -> ENOSPC leak).
+    arm();
+    try std.testing.expectEqual(2, restore_state(buf[0..saved], 99));
+    var wi: usize = 0;
+    while (wi < win_count) : (wi += 1) {
+        if (windows[wi].kind == .user) try std.testing.expect(windows[wi].phantom);
+    }
+    try std.testing.expectEqual(0, serialize_state(&buf));
+    _ = switch (user_open(32, 32, 320, 240, 7)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = switch (user_open(96, 96, 320, 240, 8)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(saved, serialize_state(&buf));
+}
+
+test "persist: a live open evicts a phantom before reporting .full (#2865)" {
+    // Boot 1: eight live windows serialize to a full record set.
+    arm();
+    var i: usize = 0;
+    while (i < user_windows_max) : (i += 1) {
+        _ = switch (user_open(64, 48, 320, 240, 7)) {
+            .opened => |id| id,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    var buf: [persist_max_bytes]u8 = undefined;
+    const saved = serialize_state(&buf);
+    try std.testing.expectEqual(user_windows_max * persist_record_bytes, saved);
+
+    // Boot 2: eight phantoms hold every slot — the pre-fix boot died
+    // here (sys_win_open -> ENOSPC). Each live open must evict a ghost.
+    arm();
+    try std.testing.expectEqual(user_windows_max, restore_state(buf[0..saved], 99));
+    i = 0;
+    while (i < user_windows_max) : (i += 1) {
+        _ = switch (user_open(64, 48, 320, 240, 7)) {
+            .opened => |id| id,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    // Every phantom was evicted — all eight slots are live again, and
+    // the serialized set is exactly those eight live windows.
+    var phantoms: usize = 0;
+    var wi: usize = 0;
+    while (wi < win_count) : (wi += 1) {
+        if (windows[wi].kind == .user and windows[wi].phantom) phantoms += 1;
+    }
+    try std.testing.expectEqual(0, phantoms);
+    try std.testing.expectEqual(user_windows_max * persist_record_bytes, serialize_state(&buf));
+    // Eight LIVE windows is still honestly .full.
+    try std.testing.expectEqual(UserOpenResult.full, user_open(64, 48, 320, 240, 7));
 }

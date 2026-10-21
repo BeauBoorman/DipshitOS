@@ -4261,10 +4261,23 @@ var have_last_saved_windows: bool = false;
 fn save_windows() void {
     var buf: [driving_award.persist_max_bytes]u8 = undefined;
     const n = driving_award.serialize_state(&buf);
-    if (n == 0) return;
     if (have_last_saved_windows and last_saved_windows_len == n and std.mem.eql(u8, last_saved_windows[0..n], buf[0..n])) return;
     // M34 HF6 (issue #740): WINDOWS.SAV lives on the host share.
     // M50 TS2 (ADR 0024 D4): the kernel-actor gate (secret paths deny).
+    // #2865: an empty live set is persisted TOO — restored phantoms are
+    // never re-serialized, so a stale file would otherwise replay the
+    // same dead rows every boot forever (a fixed-point leak, not
+    // accumulation but the same ghost). Delete it; absent is already the
+    // goal state.
+    if (n == 0) {
+        if (trust.check(trust.kernel_actor(), .host, "WINDOWS.SAV", .delete) != .allow) return;
+        const dst = virtio_file.delete("WINDOWS.SAV");
+        if (dst == virtio_file.st_ok or dst == virtio_file.st_not_found) {
+            last_saved_windows_len = 0;
+            have_last_saved_windows = true;
+        }
+        return;
+    }
     if (trust.check(trust.kernel_actor(), .host, "WINDOWS.SAV", .write) != .allow) return;
     if (virtio_file.write_whole("WINDOWS.SAV", buf[0..n]) == virtio_file.st_ok) {
         @memcpy(last_saved_windows[0..n], buf[0..n]);
