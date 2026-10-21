@@ -34,6 +34,11 @@
 //	goirc: focus <buf>                 goirc: blur
 //	goirc: state restored|refused|saved
 //
+// M152e (#2919) adds:
+//
+//	goirc: hl add|del|full             goirc: log on|off <chan>
+//	goirc: log write <path>            goirc: log write-fail <chan> <err>
+//
 // Exit: 0 clean quit/--max-ms, 1 usage, 2 session error (fatal refusals
 // and exhausted retries alike — the marker line names which).
 package main

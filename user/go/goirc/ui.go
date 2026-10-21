@@ -19,6 +19,11 @@ package main
 //     scroll offset, the focused buffer, and the consent bit ride the
 //     M125a envelope (state.go). The seat owns the lifecycle; PollStateAsk
 //     answers snapshot/close asks and SaveStateNow posts on mutation.
+//
+// M152e (#2919) adds /hl highlight rules (a hit fires the same toast
+// and accent bar a nick mention does; the words ride the blob at v3)
+// and /log per-channel logs (bounded whole-file rewrites to
+// /host/GOIRC/, see log.go).
 
 import (
 	"strings"
@@ -75,6 +80,11 @@ type uiApp struct {
 	quit        bool
 	dirty       bool // a repaint is owed
 	st          *ircState
+	// M152e (#2919): /hl rules ride the blob; logs maps an armed channel
+	// to its retained log lines (log.go), logH is the file seam.
+	hl   []string
+	logs map[string]*chanLog
+	logH logHost
 	// localLog holds status lines written before the client exists (the
 	// consent window): spliced into the server ring when Run starts.
 	localLog *Backlog
@@ -218,9 +228,14 @@ func (u *uiApp) onEvent(e Event) {
 	case EvEntry:
 		u.addBuf(e.Entry.Channel)
 		en := e.Entry
+		if en.Channel != "" {
+			u.logAdd(en)
+		}
 		if en.Kind == EntryMsg && en.Channel != "" && u.cli != nil {
 			nick := u.cli.Nick()
-			if en.From != nick && mentionMatch(en.Text, nick) {
+			// A nick mention or an armed /hl word both fire the toast —
+			// the same ping path, the word is just another matcher.
+			if en.From != nick && (mentionMatch(en.Text, nick) || u.hlHit(en.Text)) {
 				u.pendMention = en.Channel
 				if u.ta != nil && u.ta.Notify(toastText(en.From, en.Channel)) {
 					vi.ConsoleLine("goirc: toast " + en.Channel)
@@ -318,6 +333,10 @@ func (u *uiApp) submit(line string) {
 			_ = u.cli.Quit(rest) // EvQuit prints 'goirc: quit'
 		}
 		u.quit = true
+	case "/hl":
+		u.hlVerb(rest)
+	case "/log":
+		u.logVerb(rest)
 	default:
 		u.status("unknown command " + verb)
 	}
@@ -539,6 +558,8 @@ func (u *uiApp) applyRestored() {
 	if u.st.focus != "" {
 		u.focusName(u.st.focus)
 	}
+	// M152e: the /hl rules ride the blob too.
+	u.hl = append([]string{}, u.st.rules...)
 }
 
 // --- paint -----------------------------------------------------------------
@@ -639,7 +660,7 @@ func (u *uiApp) draw() {
 			fg = tok.Muted
 			text = "= " + en.Text
 		}
-		if en.Kind == EntryMsg && mynick != "" && mentionMatch(en.Text, mynick) {
+		if en.Kind == EntryMsg && ((mynick != "" && mentionMatch(en.Text, mynick)) || u.hlHit(en.Text)) {
 			cv.FillRect(widgets.Rect{X: railW, Y: y, W: 3, H: rowH}, uidraw.Opaque(tok.Accent))
 		}
 		widgets.DrawText(cv, row.Inset(2), text, uidraw.Opaque(fg))
@@ -733,6 +754,9 @@ func (u *uiApp) run() {
 			u.dirty = false
 		}
 	}
+	// Quit close-out: every armed log's pending lines publish before the
+	// client goes down — the card's "on part or quit" flush.
+	u.flushAllLogs()
 	if u.cli != nil {
 		_ = u.cli.Close()
 	}
@@ -749,6 +773,8 @@ func runUI(o options) {
 		bufs:     []string{""},
 		scroll:   map[string]int{},
 		st:       &ircState{},
+		logs:     map[string]*chanLog{},
+		logH:     guestLogHost{},
 		localLog: NewBacklog(BacklogCap),
 	}
 	u.input.OnSubmit = func(s string) { u.input.Clear(); u.submit(s) }

@@ -7,9 +7,9 @@ package main
 // the focused buffer, the live nick, and the plaintext-consent answer —
 // a restored tab re-asks nothing the user already answered.
 //
-// v2 layout (all integers little-endian, term/state.go's convention):
+// v3 layout (all integers little-endian, term/state.go's convention):
 //
-//	u8  format (=2)      the app's own staleness tag — the seat stores
+//	u8  format (=3)      the app's own staleness tag — the seat stores
 //	u8  flags            and returns StateVersion verbatim, so the blob
 //	     bit0: tls          also tags itself
 //	     bit1: consent
@@ -22,13 +22,18 @@ package main
 //	u16 focusLen| focus     "" = the server buffer
 //	u16 nChans  | nChans x
 //	     { u16 nameLen | name | u32 scrollUp }
+//	u16 nRules  | nRules x  v3 only (M152e #2919): the /hl highlight
+//	     { u16 wordLen | word }   words — "rules ride the blob"
 //
 // Every bound is hard and every declared length is checked: a stale,
 // short, over-declared or trailing-garbage blob is refused WHOLE — the
-// marker is `goirc: state refused`, never a half-applied session.
+// marker is `goirc: state refused`, never a half-applied session. A v2
+// blob still decodes (it predates the rules section — rules decode
+// empty); v1 and future formats refuse.
 
 const (
-	ircStateVersion uint8 = 2
+	ircStateVersion uint8 = 3 // current format; 2 is the M147b legacy
+	ircStateMinVer  uint8 = 2 // oldest blob decode still accepts
 
 	stateHostMax  = 255
 	stateNickMax  = 64
@@ -62,6 +67,7 @@ type ircState struct {
 	nick     string
 	focus    string
 	chans    []stateChan
+	rules    []string // M152e: /hl words (v3 section)
 }
 
 // encode serializes the live session — Config.SaveState's body.
@@ -124,6 +130,19 @@ func (s *ircState) encode(u *uiApp) []byte {
 		out = append(out, name...)
 		out = appendU32(out, uint32(sc))
 	}
+	// v3: the /hl rule set. hlMax bounds the count, hlWordMax the bytes.
+	rules := u.hl
+	if len(rules) > hlMax {
+		rules = rules[:hlMax]
+	}
+	out = appendU16(out, uint16(len(rules)))
+	for _, w := range rules {
+		if len(w) > hlWordMax {
+			w = w[:hlWordMax]
+		}
+		out = appendU16(out, uint16(len(w)))
+		out = append(out, w...)
+	}
 	return out
 }
 
@@ -138,10 +157,12 @@ func (s *ircState) decode(b []byte) bool {
 		nick  string
 		focus string
 		chans []stateChan
+		rules []string
 	}
-	if len(b) < 14 || b[0] != ircStateVersion {
+	if len(b) < 14 || b[0] < ircStateMinVer || b[0] > ircStateVersion {
 		return false
 	}
+	ver := b[0]
 	d.flags = b[1]
 	off := 2
 	u16 := func() (int, bool) {
@@ -202,6 +223,22 @@ func (s *ircState) decode(b []byte) bool {
 		}
 		d.chans = append(d.chans, stateChan{name: name, scroll: sc})
 	}
+	if ver >= 3 {
+		// v3's trailing section: the /hl words. The count bound is the
+		// rule bound itself; a word must be non-empty and under the byte
+		// bound, so a forged blob cannot smuggle an unarmed rule shape.
+		nr, ok := u16()
+		if !ok || nr > hlMax {
+			return false
+		}
+		for i := 0; i < nr; i++ {
+			w, ok := str(hlWordMax)
+			if !ok || w == "" {
+				return false
+			}
+			d.rules = append(d.rules, w)
+		}
+	}
 	if off != len(b) {
 		return false
 	}
@@ -223,5 +260,6 @@ func (s *ircState) decode(b []byte) bool {
 	s.consent = d.flags&2 != 0
 	s.nick, s.focus = d.nick, d.focus
 	s.chans = d.chans
+	s.rules = d.rules
 	return true
 }

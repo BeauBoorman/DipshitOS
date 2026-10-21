@@ -1,7 +1,8 @@
 # go-irc.spec -- M147a #2801 + M147b #2802 + M147c #2803: GOIRC.ELF
 # protocol core vs a host Python fixture IRCd over the --net-tcp-respond
 # relay; runs 04-08 drive the --ui tabapp front-end under a live GOTABWM
-# seat.
+# seat. M152e #2919 adds run 09: /hl highlight rules firing the mention
+# toast + the bounded per-channel log file's 32-line flush on the share.
 #
 # Run 01 is the M147a card leg: register (NICK/USER -> 001), JOIN #goirc,
 # receive a PRIVMSG, hard-drop, watch the client back off, re-register
@@ -53,7 +54,7 @@
 # asserts. Run 07's TLS leg wraps the same pinned leaf.example.com
 # chain go-fetch-https serves (user/src/lib/tls/vectors/fx).
 
-vgate_name go-irc "M147a+b+c #2801/#2802/#2803: GOIRC.ELF core (register/join/recv/drop/reconnect, consent refusal, 433) + UI legs (mention toast click-through, consent dialog) + K=3 journey (TLS first, consent-stored plaintext, toast, snapshot, restore)"
+vgate_name go-irc "M147a+b+c #2801/#2802/#2803: GOIRC.ELF core (register/join/recv/drop/reconnect, consent refusal, 433) + UI legs (mention toast click-through, consent dialog) + K=3 journey (TLS first, consent-stored plaintext, toast, snapshot, restore) + M152e #2919 run 09 (/hl toast, /log share file tail)"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -239,7 +240,7 @@ def pump(conn, idx, nick, buf, on_join, hold=20, first_only=False,
 # plaintext, the reopen's re-dial) plus slack for stray conns the relay
 # layer opens but never registers.
 conns = {"rejoin": 6, "nickuse": 3, "mention": 3, "once": 3,
-         "journey": 24}[mode]
+         "logs": 3, "journey": 24}[mode]
 
 if mode == "journey":
     import threading
@@ -395,6 +396,30 @@ for idx in range(conns):
             pump(conn, idx, nick, buf, lambda ch: None, hold=45)
         conn.close()
         log("c%d close" % idx)
+    elif mode == "logs":
+        # M152e (#2919) run 09: the client joins, types '/hl add
+        # virelai' + '/log on' + a channel 'hi'. That first client
+        # PRIVMSG is the go signal — nothing the slash verbs do reaches
+        # the wire — so the fixture answers it with the armed word's
+        # line (no nick in it: the toast can only be the rule's) and a
+        # 40-line flood; 42 logged lines cross the 32-line flush, and
+        # the python assert reads the tail on the share.
+        nick, buf = register(conn, idx)
+        if not nick:
+            conn.close()
+            continue
+        fired = [False]
+        def on_pv():
+            if fired[0]:
+                return
+            fired[0] = True
+            send(conn, ":alice!u@h PRIVMSG #goirc :release virelai today")
+            for i in range(40):
+                send(conn, ":alice!u@h PRIVMSG #goirc :flood-%02d line" % (i + 1))
+        pump(conn, idx, nick, buf, lambda ch: None, hold=60,
+             on_privmsg=on_pv)
+        conn.close()
+        log("c%d close" % idx)
 
 srv.close()
 log("fixture done")
@@ -411,7 +436,7 @@ if not os.path.exists(chain) or not os.path.exists(irckey):
 procs = []
 for mode, port in (("rejoin", 26667), ("nickuse", 26668),
                    ("mention", 26669), ("once", 26670),
-                   ("journey", 26671)):
+                   ("journey", 26671), ("logs", 26672)):
     subprocess.run(["sh", "-c", "lsof -ti tcp:%d | xargs kill -9" % port],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     logpath = os.path.join(run, "ircd-%d.log" % port)
@@ -936,7 +961,9 @@ if len(blobs) != 2:
     sys.exit("expected 2 app_state blobs, got %d" % len(blobs))
 
 def ircstate(b):
-    if b[0] != 2:
+    # v2 is the M147b layout; v3 (M152e #2919) appends the /hl rule set —
+    # a u16 count of u16-prefixed words after the chan records.
+    if b[0] not in (2, 3):
         sys.exit("ircState ver %d" % b[0])
     o = 2
     def u16():
@@ -954,8 +981,14 @@ def ircstate(b):
     chans = {}
     for _ in range(u16()):
         chans[s()] = struct.unpack("<I", b[o:o+4])[0]; o += 4
+    rules = []
+    if b[0] >= 3:
+        for _ in range(u16()):
+            rules.append(s())
+    if o != len(b):
+        sys.exit("trailing blob bytes %d" % (len(b) - o))
     return dict(flags=b[1], host=host, port=port, sni=sni, nick=nick,
-                focus=focus, chans=chans)
+                focus=focus, chans=chans, rules=rules)
 
 states = [ircstate(b) for _, _, b in blobs]
 # One port carries both transports — discriminate by the flags word
@@ -1054,4 +1087,126 @@ if tls < 2 * it:
     missing.append("tls wraps %d < 2*iteration %d" % (tls, it))
 if missing:
     sys.exit("journey fixture missing: %r\n%s" % (missing, log))
+PY
+
+# --- M152e (#2919) run 09: /hl toast + the /log file's share tail --------
+#
+# One boot: the seat, then GOIRC --ui --plain joins #goirc. The single
+# --input-string batch types the leg's three lines — the rule
+# ('/hl add virelai'), the arm ('/log on' on the focused #goirc), and a
+# channel 'hi' that is the fixture's go signal (the slash verbs emit no
+# wire traffic, so the flood can't arrive before the rule is armed).
+# The fixture answers 'hi' with a virelai line — carrying NO 'gate'
+# word, so 'goirc: toast #goirc' can only be the rule's — and a 40-line
+# flood: 42 backlog lines against the 32-line flush cadence, so
+# /host/GOIRC/10-0-0-2-GOIRC.LOG holds lines 1-32 and the python assert
+# finds flood-30 as the tail.
+#
+# exec-order: assert-proven -- the run ends on 'flood-40', a marker the
+# fixture's wire traffic makes only GOIRC print; every assert reads
+# output a non-running program cannot produce (the toast chain, the
+# fixture transcript, the share file).
+vgate_file script-09.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm NOTIFY.HIST
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-09.txt <<'EOF'
+dui focus 0
+exec GOIRC.ELF --ui --host=10.0.0.2 --port=6672 --nick=gate --join '#goirc' --plain
+EOF
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio \
+    --net '$RUN_DIR/cap09.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:6672:relay --net-tcp-respond-relay 127.0.0.1:26672 \
+    --script '$RUN_DIR/script-09.txt' \
+    --script2 '$RUN_DIR/script2-09.txt' --script2-after 'gotabwm: win focus' \
+    --input-string $'/hl add virelai\n/log on\nhi\n' \
+    --input-string-after 'goirc: join #goirc' \
+    --script-expect 'goirc: msg #goirc alice flood-40 line' --timeout 300
+
+vgate_assert 09 serial-contains 'gotabwm: mode live'
+vgate_assert 09 serial-contains 'exec: loaded GOIRC.ELF'
+vgate_assert 09 serial-contains 'goirc: join #goirc'
+vgate_assert 09 serial-contains 'goirc: line /hl add virelai'
+vgate_assert 09 serial-contains 'goirc: hl add virelai'
+vgate_assert 09 serial-contains 'goirc: line /log on'
+vgate_assert 09 serial-contains 'goirc: log on #goirc'
+vgate_assert 09 serial-contains 'goirc: line hi'
+vgate_assert 09 serial-contains 'goirc: msg #goirc alice release virelai today'
+vgate_assert 09 serial-contains 'goirc: toast #goirc'
+vgate_assert 09 serial-absent 'goirc: toast-refused'
+vgate_assert 09 serial-contains 'goirc: msg #goirc alice flood-40 line'
+vgate_assert 09 serial-contains 'goirc: log write /host/GOIRC/10-0-0-2-GOIRC.LOG'
+vgate_assert 09 serial-absent 'goirc: log write-fail'
+vgate_assert 09 serial-absent 'goirc: error'
+vgate_assert 09 serial-absent '[EXC] parking:'
+# Order: the verbs must land before the wire 'hi' (the flood's trigger),
+# the toast before the flood's tail, the publish before the run ends.
+vgate_assert 09 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+pos = 0
+for m in ["goirc: hl add virelai", "goirc: log on #goirc",
+          "goirc: line hi", "goirc: toast #goirc",
+          "goirc: log write /host/GOIRC/10-0-0-2-GOIRC.LOG",
+          "goirc: msg #goirc alice flood-40 line"]:
+    i = ser.find(m, pos)
+    if i < 0:
+        sys.exit("marker %r missing after pos %d" % (m, pos))
+    pos = i + len(m)
+PY
+# Fixture transcript: registration, the JOIN, the typed 'hi' that
+# triggered the flood, and both halves of the answer on the wire.
+vgate_assert 09 python <<'PY'
+import os, sys
+tag = os.environ["VG_TAG"]
+it = int(tag.rsplit("-", 1)[-1]) if "-" in tag else 1
+log = open(os.path.join(os.environ["RUN_DIR"], "ircd-26672.log")).read()
+need = ["c0 open", "c0 rx NICK gate", "c0 rx USER", "c0 rx JOIN #goirc",
+        "c0 rx PRIVMSG #goirc :hi",
+        "tx :alice!u@h PRIVMSG #goirc :release virelai today",
+        "tx :alice!u@h PRIVMSG #goirc :flood-01 line",
+        "tx :alice!u@h PRIVMSG #goirc :flood-40 line"]
+missing = [n for n in need if n not in log]
+joins = sum(1 for l in log.splitlines() if "rx JOIN #goirc" in l)
+if joins < it:
+    missing.append("joins %d < iteration %d" % (joins, it))
+if missing:
+    sys.exit("logs fixture missing: %r\n%s" % (missing, log))
+PY
+# The share file: the whole-file rewrite holds the first 32 logged
+# lines — '<gate> hi', the virelai ping, flood-01..flood-30 — under the
+# 64 KiB cap, flood-30 the tail the card names.
+vgate_assert 09 python <<'PY'
+import os, sys
+share = os.environ["VG_SHARE"]
+p = os.path.join(share, "GOIRC", "10-0-0-2-GOIRC.LOG")
+if not os.path.exists(p):
+    have = sorted(os.listdir(share)) if os.path.isdir(share) else "no share"
+    sys.exit("log file missing at %s (share holds %r)" % (p, have))
+body = open(p, "rb").read()
+if len(body) > 64 * 1024:
+    sys.exit("log over the 64 KiB cap: %d" % len(body))
+lines = body.decode("utf-8", "replace").splitlines()
+if lines[:2] != ["<gate> hi", "<alice> release virelai today"]:
+    sys.exit("log head %r" % (lines[:3],))
+if len(lines) != 32:
+    sys.exit("flush cadence: %d lines on disk, want 32: %r"
+             % (len(lines), lines[-4:]))
+if lines[-1] != "<alice> flood-30 line":
+    sys.exit("tail %r want flood-30" % (lines[-1],))
+for i in range(30):
+    want = "<alice> flood-%02d line" % (i + 1)
+    if want not in lines:
+        sys.exit("missing %r in %r" % (want, lines))
+print("run09 log: %d lines, %d bytes, tail %r" % (len(lines), len(body), lines[-1]))
 PY
