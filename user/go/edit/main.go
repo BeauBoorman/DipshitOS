@@ -141,6 +141,13 @@
 //     (`minimap line=N`), the same landing a goto bar Return produces —
 //     the document body still takes no other mouse input.
 //
+// M153b (#2922): a picker save-as whose name ends in .pdf exports the
+// buffer as a paginated fixed-pitch document through virelai/pdfwrite
+// (export.go owns the wrap/page/footer rules and the named refusals). The
+// export is a snapshot artifact: the session's path, the buffer and its
+// dirty flag all stay with the text file, so no `saved` marker prints for
+// the PDF and the lease never moves.
+//
 // Every marker below is printed only AFTER its syscall returned, so the
 // go-edit VZ gate's asserts can only pass if the app actually ran.
 package main
@@ -208,6 +215,13 @@ const (
 	markerPickOpen   = "goedit: pick open "
 	markerPickSave   = "goedit: pick save "
 	markerPickCancel = "goedit: pick cancel"
+
+	// M153b (#2922): the .pdf save-as export's receipts — `export pdf
+	// <path> pages=<n> bytes=<n>` after a published document, `export
+	// refused <why>` for the named refusals (`pages=<n>` over the writer's
+	// bound, the writer's own error names, `rc=` on a failed publish).
+	markerExport        = "edit: export pdf "
+	markerExportRefused = "edit: export refused "
 
 	// M107c (#2320): the build-error list's receipts. One prefix carries
 	// every shape: `n=` (rows loaded), `sel=` (panel selection), `jump
@@ -800,6 +814,13 @@ var bufRead = func(p string, max int) ([]byte, int64) {
 	return vi.ReadFileAll(p, max)
 }
 
+// M153b (#2922): the export publish seam — vi.WriteFileSafe in the guest,
+// substituted in host tests so the written PDF is inspectable (the same
+// shape bufRead takes for the read).
+var bufWrite = func(p string, b []byte) int64 {
+	return vi.WriteFileSafe(p, b)
+}
+
 func (e *editor) load() {
 	b, rc := bufRead(e.path, maxBuffer)
 	if rc < 0 {
@@ -1195,8 +1216,14 @@ func (e *editor) pickerKey(ev vi.Event) bool {
 		return true
 	}
 	if save {
-		e.path = res
 		vi.ConsoleLine(markerPickSave + res)
+		// M153b: a .pdf name is an export, not a save-as — the session's
+		// path and the buffer's dirty state stay with the text file.
+		if exportPath(res) {
+			e.exportPDF(res)
+			return true
+		}
+		e.path = res
 		e.save()
 		return true
 	}

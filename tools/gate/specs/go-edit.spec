@@ -1215,3 +1215,86 @@ assert bw >= 200 and bh >= 150, \
 print("goedit theme leg post-switch: light page px=%d bbox=%dx%d "
       "(dark-page remainder=%d)" % (light, bw, bh, dark_page))
 PY
+
+# --- M153b (#2922) run 16: a .pdf save-as name exports the buffer --------
+# The seed is two short lines; Ctrl-Shift-S pretypes the basename, eleven
+# backspaces clear it, EXPORT.PDF goes in, and the picker's save landing is
+# an export — `edit: export pdf <path> pages=1 bytes=`, never a `saved`
+# line at the PDF path. The follow-up Ctrl-S then publishes the buffer to
+# the ORIGINAL path with the seed's exact byte count: the export moved
+# neither the session path nor the dirty flag.
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+ed = os.path.join(share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+with open(os.path.join(ed, "PDFSEED.TXT"), "wb") as f:
+    f.write(b"export seed\nline two\n")
+PY
+
+vgate_file script2-16.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/PDFSEED.TXT
+EOF
+
+vgate_file script3-16.txt <<'EOF'
+dui close 2
+echo rx-goedit-pdf-ok
+EOF
+
+vgate_run 16 -- \
+    --screen '$RUN_DIR/screen-16' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-16.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,E,X,P,O,R,T,.,P,D,F,return,ctrl-s' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-16.txt' \
+    --script3-after 'goedit: saved ' \
+    --script-expect 'rx-goedit-pdf-ok' --timeout 240
+
+vgate_assert 16 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 16 serial-contains 'goedit: read /host/EDIT/PDFSEED.TXT n=21'
+vgate_assert 16 serial-contains 'goedit: present'
+vgate_assert 16 serial-contains 'goedit: pick save /host/EDIT/EXPORT.PDF'
+vgate_assert 16 serial-contains 'edit: export pdf /host/EDIT/EXPORT.PDF pages=1 bytes='
+# The session stayed on the text file: path, buffer and dirty unmoved.
+vgate_assert 16 serial-contains 'goedit: saved /host/EDIT/PDFSEED.TXT n=21'
+vgate_assert 16 serial-absent 'goedit: saved /host/EDIT/EXPORT.PDF'
+vgate_assert 16 serial-absent 'edit: export refused'
+vgate_assert 16 serial-contains 'rx-goedit-pdf-ok'
+vgate_assert 16 serial-absent '[EXC] parking:'
+vgate_assert 16 serial-absent 'exited status=139'
+
+# The load-bearing assert: the share's EXPORT.PDF is a real PDF — the
+# %PDF-1. header, a classic xref whose in-use offsets each land on their
+# "N 0 obj" header, and the page tree's /Count is the export's one page.
+vgate_assert 16 python <<'PY'
+import os, re
+share = os.environ["VG_SHARE"]
+path = os.path.join(share, "EDIT", "EXPORT.PDF")
+data = open(path, "rb").read()
+if not data.startswith(b"%PDF-1."):
+    raise SystemExit("bad header: %r" % data[:16])
+m = re.search(rb"startxref\s*(\d+)\s*%%EOF", data)
+if not m:
+    raise SystemExit("no startxref")
+xref = int(m[1])
+if not data[xref:xref + 4] == b"xref":
+    raise SystemExit("startxref does not land on xref (%d)" % xref)
+sec = data[xref:].split(b"\n", 2)
+n = int(sec[1].split()[1])
+lines = sec[2].split(b"\n")[:n]
+for i, line in enumerate(lines):
+    off, gen, flag = line.split()
+    if flag == b"f":
+        continue
+    off = int(off)
+    want = ("%d 0 obj" % i).encode()
+    if data[off:off + len(want)] != want:
+        raise SystemExit("xref offset %d -> %r, want %r" % (i, data[off:off + 16], want))
+m = re.search(rb"/Type /Pages[^>]*?/Count (\d+)", data)
+if not m or int(m[1]) != 1:
+    raise SystemExit("page count %r" % (m[1] if m else None))
+print("EXPORT.PDF verified: %d bytes, %d xref objects, pages=1" % (len(data), n))
+PY
