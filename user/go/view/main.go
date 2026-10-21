@@ -66,6 +66,10 @@ const (
 	markerCopy       = "gview: copy "
 	markerCopyRefuse = "gview: copy refused "
 
+	// M162a (#2975): the frame stepper's receipt — `frame <i>/<n> delay=<ms>
+	// sum=<fnv>` — printed on load for frame 1 and on every step.
+	markerFrame = "gview: frame "
+
 	markerOK = "goview OK"
 )
 
@@ -93,6 +97,11 @@ type app struct {
 
 	img    *webrender.Image
 	iw, ih uint32
+
+	// The animation behind a decoded GIF (M162a): every composited frame
+	// and the index being shown. nil on every other format.
+	anim  *webrender.GIFAnimation
+	frame int
 
 	zoomIdx        int
 	ox, oy         uint32
@@ -226,7 +235,7 @@ func (a *app) load(path string) {
 		a.st = st
 		return
 	}
-	im, err := webrender.DecodeImage(data)
+	im, anim, err := decodeForView(data)
 	if err != nil {
 		// "This format has no guest decoder" is a different fact from "these
 		// bytes are broken", and the app is the only place that can tell them
@@ -246,15 +255,39 @@ func (a *app) load(path string) {
 	}
 	a.img = im
 	a.iw, a.ih = uint32(im.Width), uint32(im.Height)
+	a.anim, a.frame = anim, 0
 	a.st = loadOkay
 	line := markerLoaded + a.name + " " + u32s(a.iw) + "x" + u32s(a.ih) + " " +
 		a.fm.tag() + " bytes=" + vi.Itoa64(int64(len(data)))
 	if im.Frames > 0 {
-		// A container that carries more than one image (M136c: GIF renders
-		// frame 1) reports its count in the same receipt.
+		// A container that carries more than one image reports its count in
+		// the same receipt; a bound that stopped the GIF walk names itself.
 		line += " frames=" + vi.Itoa64(int64(im.Frames))
 	}
+	if anim != nil && anim.Truncated != "" {
+		line += " truncated=" + anim.Truncated
+	}
 	vi.ConsoleLine(line)
+	a.announceFrame()
+}
+
+// decodeForView routes a GIF through webrender.DecodeGIFFrames — the
+// stepper's frame list — and everything else through DecodeImage. The
+// returned Image is the shown frame: the first composite for a GIF, the
+// whole decode otherwise. anim is nil on every non-GIF format.
+func decodeForView(data []byte) (im *webrender.Image, anim *webrender.GIFAnimation, err error) {
+	if formatOfHeader(data) == fmtGIF {
+		anim, err = webrender.DecodeGIFFrames(data, webrender.GIFLimits{})
+		if err != nil {
+			return nil, nil, err
+		}
+		return &webrender.Image{
+			Width: anim.Width, Height: anim.Height,
+			Pix: anim.Frames[0].Pix, Frames: len(anim.Frames),
+		}, anim, nil
+	}
+	im, err = webrender.DecodeImage(data)
+	return im, nil, err
 }
 
 // readImage reads at most fileMax bytes. The loop is ours rather than
@@ -318,7 +351,7 @@ func (a *app) applyDrop(offer tabapp.DragOffer) bool {
 		vi.ConsoleLine(markerDrop + "no-payload")
 		return false
 	}
-	im, err := webrender.DecodeImage(data)
+	im, anim, err := decodeForView(data)
 	if err != nil {
 		if errors.Is(err, webrender.ErrImageUnsupported) {
 			tag := formatOfHeader(data).tag()
@@ -337,6 +370,7 @@ func (a *app) applyDrop(offer tabapp.DragOffer) bool {
 	}
 	a.img = im
 	a.iw, a.ih = uint32(im.Width), uint32(im.Height)
+	a.anim, a.frame = anim, 0
 	a.fm = formatOfHeader(data)
 	a.name = "drop:" + offer.Mime
 	a.st = loadOkay
@@ -345,6 +379,7 @@ func (a *app) applyDrop(offer tabapp.DragOffer) bool {
 	a.ox, a.oy = 0, 0
 	vi.ConsoleLine(markerDrop + offer.Mime + " " + u32s(a.iw) + "x" + u32s(a.ih) +
 		" bytes=" + vi.Itoa64(int64(len(data))))
+	a.announceFrame()
 	return true
 }
 
@@ -366,6 +401,34 @@ func (a *app) reportLoad() {
 		}
 		vi.ConsoleLine(markerUnsupported + tag)
 	}
+}
+
+// stepFrame is the M162a frame stepper: `.` forward, `,` back, wrapping.
+// The shown image becomes the frame's own composite — every frame is the
+// logical screen, so pan and zoom keep meaning. A single-frame GIF (or no
+// GIF at all) makes the keys inert.
+func (a *app) stepFrame(dir int) bool {
+	if a.anim == nil || len(a.anim.Frames) < 2 {
+		return false
+	}
+	a.frame = stepFrameIdx(a.frame, dir, len(a.anim.Frames))
+	f := &a.anim.Frames[a.frame]
+	a.img = &webrender.Image{Width: a.anim.Width, Height: a.anim.Height, Pix: f.Pix}
+	a.announceFrame()
+	return true
+}
+
+// announceFrame prints the stepper's receipt: the 1-based index, the
+// frame's delay in milliseconds (the GCE carries centiseconds), and the
+// FNV-1a of the composited pixels.
+func (a *app) announceFrame() {
+	if a.anim == nil {
+		return
+	}
+	f := &a.anim.Frames[a.frame]
+	vi.ConsoleLine(markerFrame + vi.Itoa64(int64(a.frame+1)) + "/" +
+		vi.Itoa64(int64(len(a.anim.Frames))) + " delay=" +
+		vi.Itoa64(int64(f.Delay*10)) + " sum=" + hex64(frameSum(f.Pix)))
 }
 
 func (a *app) zoom() uint32 { return zoomTable[a.zoomIdx] }
@@ -430,6 +493,10 @@ func (a *app) handle(ev vi.Event) bool {
 			return a.panBy(0, -1)
 		case keyDown:
 			return a.panBy(0, 1)
+		case keyFrameNext:
+			return a.stepFrame(1)
+		case keyFramePrev:
+			return a.stepFrame(-1)
 		case keyCopy:
 			a.copy()
 			return false
@@ -709,6 +776,11 @@ func (a *app) drawStatus(s *canvasSurface, vp viewport) {
 	barY := int(vp.Y + vp.H)
 	s.Fill(0, barY, int(a.ta.W), statusH, theme.Current.Surface)
 	text := u32s(a.zoom()) + "%  +/- zoom  0 reset  arrows/drag pan"
+	if a.anim != nil && len(a.anim.Frames) > 1 {
+		f := &a.anim.Frames[a.frame]
+		text += "  ./, frame " + u32s(uint32(a.frame+1)) + "/" +
+			u32s(uint32(len(a.anim.Frames))) + " - " + u32s(uint32(f.Delay*10)) + " ms"
+	}
 	if a.st != loadOkay {
 		text = loadSummary(a.st, a.name)
 	}

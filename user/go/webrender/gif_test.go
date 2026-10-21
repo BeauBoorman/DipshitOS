@@ -8,6 +8,7 @@ import (
 	"image/gif"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -35,7 +36,9 @@ type gifVecFrame struct {
 	pix         []byte // w*h palette indices
 	pal         []byte // local color table as RGB triples, nil = use the GCT
 	interlace   bool
-	transparent int // -1 = no graphic control extension
+	transparent int // -1 = the GCE's transparency flag stays clear
+	disposal    int // GCE disposal method (packed bits 2–4)
+	delay       int // GCE delay in centiseconds
 	lit         int // 0 = derive the literal width from the palette size
 }
 
@@ -110,6 +113,17 @@ func gifPatternInv(w, h, colors int) []byte {
 	idx := gifPattern(w, h, colors)
 	for i := range idx {
 		idx[i] = byte(colors - 1 - int(idx[i]))
+	}
+	return idx
+}
+
+// gifPatternOff rotates the pattern's indices by off — a third distinct
+// animation frame (pattern, inverted, shifted) so the GOVIEW gate's three
+// composited frames all hash differently.
+func gifPatternOff(w, h, colors, off int) []byte {
+	idx := gifPattern(w, h, colors)
+	for i := range idx {
+		idx[i] = byte((int(idx[i]) + off) % colors)
 	}
 	return idx
 }
@@ -223,9 +237,15 @@ func gifEncode(v gifVector) []byte {
 	b = append(b, 0, 0) // background index, aspect
 	b = append(b, v.gct...)
 	for _, f := range v.frames {
-		if f.transparent >= 0 {
+		if f.transparent >= 0 || f.disposal > 0 || f.delay > 0 {
+			packed := byte(f.disposal&7) << 2
+			tr := byte(0)
+			if f.transparent >= 0 {
+				packed |= gifGCETransparent
+				tr = byte(f.transparent)
+			}
 			b = append(b, gifExtIntroducer, gifExtGraphicControl, 4,
-				gifGCETransparent, 0, 0, byte(f.transparent), 0)
+				packed, byte(f.delay), byte(f.delay>>8), tr, 0)
 		}
 		b = append(b, gifImageDesc)
 		u16(f.left)
@@ -291,7 +311,7 @@ func gifVectorBytes(v gifVector) []byte {
 			Image: []*image.Paletted{
 				mk(gifPattern(v.w, v.h, 16)),
 				mk(gifPatternInv(v.w, v.h, 16)),
-				mk(gifPattern(v.w, v.h, 16)),
+				mk(gifPatternOff(v.w, v.h, 16, 5)),
 			},
 			Delay: []int{10, 10, 10},
 		}
@@ -587,6 +607,376 @@ func FuzzGIF(f *testing.F) {
 			t.Fatal("decoder cap violated")
 		}
 	})
+}
+
+// gifWithLoop splices a NETSCAPE2.0 application extension carrying the
+// given iteration count in right after the global color table — where real
+// encoders put it.
+func gifWithLoop(t testing.TB, data []byte, loop int) []byte {
+	t.Helper()
+	pos := 13
+	if data[10]&0x80 != 0 {
+		pos += 3 * (1 << (1 + uint(data[10]&7)))
+	}
+	ext := append([]byte{0x21, 0xff, 0x0b}, "NETSCAPE2.0"...)
+	ext = append(ext, 3, 1, byte(loop), byte(loop>>8), 0)
+	out := append([]byte(nil), data[:pos]...)
+	out = append(out, ext...)
+	out = append(out, data[pos:]...)
+	return out
+}
+
+// gifSolid is one full palette index repeated across w*h — the compositing
+// vectors are solid blocks so a disposal's effect is a pixel read, not a
+// diff.
+func gifSolid(w, h, c int) []byte {
+	b := make([]byte, w*h)
+	for i := range b {
+		b[i] = byte(c)
+	}
+	return b
+}
+
+// gifFrameAt reads one composited pixel out of a decoded frame.
+func gifFrameAt(t testing.TB, a *GIFAnimation, fi, x, y int) uint32 {
+	t.Helper()
+	if fi >= len(a.Frames) {
+		t.Fatalf("no frame %d (have %d)", fi, len(a.Frames))
+	}
+	return a.Frames[fi].Pix[y*a.Width+x]
+}
+
+// gifPalWord is the 0xAARRGGBB word the decoder produces for palette
+// entry i of gifPal(n) — the tests name expected colors by index.
+func gifPalWord(i int) uint32 {
+	p := gifPal(1 << uint(gifLitWidth(i+1)))
+	return 0xff000000 | uint32(p[3*i])<<16 | uint32(p[3*i+1])<<8 | uint32(p[3*i+2])
+}
+
+// TestGIFFramesCompositesAnim3: the corpus animation decodes to three
+// screen-sized composited frames — the third equal to the first, the second
+// inverted — and DecodeImage still answers with only the first frame.
+func TestGIFFramesCompositesAnim3(t *testing.T) {
+	data := gifVectorBytes(gifVectors[6]) // anim3-89a
+	a, err := DecodeGIFFrames(data, GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Width != 32 || a.Height != 24 || len(a.Frames) != 3 {
+		t.Fatalf("anim = %dx%d %d frames, want 32x24 x3", a.Width, a.Height, len(a.Frames))
+	}
+	if a.Truncated != "" || a.Loops != -1 {
+		t.Fatalf("truncated=%q loops=%d, want clean/no-extension", a.Truncated, a.Loops)
+	}
+	if !slices.Equal(a.Frames[0].Pix, a.Frames[2].Pix) {
+		t.Fatal("anim3 frames 1 and 3 are the same vector and must composite identically")
+	}
+	if slices.Equal(a.Frames[0].Pix, a.Frames[1].Pix) {
+		t.Fatal("anim3 frame 2 is the inverted pattern and must differ")
+	}
+	// Full-screen frames: the first composite is exactly what the
+	// first-frame decoder returns.
+	im, err := decodeGIF(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if im.Width != a.Width || !slices.Equal(im.Pix, a.Frames[0].Pix) {
+		t.Fatal("composite frame 1 must equal the first-frame decode")
+	}
+	if im2, err := DecodeImage(data); err != nil || im2.Frames != 3 || im2.Width != 32 {
+		t.Fatalf("DecodeImage must be unchanged: im=%v err=%v", im2, err)
+	}
+}
+
+// TestGIFFramesDisposal pins each disposal mode on hand-built vectors over
+// an 8x8 screen whose background index (LSD byte 11, zero here) resolves to
+// palette entry 0: 0/1 keep the canvas, 2 restores the background, 3
+// restores the pre-frame canvas.
+func TestGIFFramesDisposal(t *testing.T) {
+	c1, c2, c3, cbg := gifPalWord(1), gifPalWord(2), gifPalWord(3), gifPalWord(0)
+	mk := func(l, tp, w, h, c, disp int) gifVecFrame {
+		f := gifVec(l, tp, w, h, gifSolid(w, h, c))
+		f.disposal = disp
+		return f
+	}
+	type check struct {
+		fi, x, y int
+		want     uint32
+	}
+	cases := []struct {
+		name   string
+		frames []gifVecFrame
+		nf     int
+		checks []check
+	}{
+		{"keep-0", []gifVecFrame{
+			mk(0, 0, 8, 8, 1, 0),
+			mk(2, 2, 4, 4, 2, 0),
+		}, 2, []check{
+			{1, 0, 0, c1}, {1, 3, 3, c2}, {1, 5, 5, c2}, {1, 7, 7, c1},
+		}},
+		{"keep-1", []gifVecFrame{
+			mk(0, 0, 8, 8, 1, 0),
+			mk(2, 2, 4, 4, 2, 1),
+		}, 2, []check{
+			{1, 0, 0, c1}, {1, 3, 3, c2}, {1, 7, 7, c1},
+		}},
+		{"background-2", []gifVecFrame{
+			mk(0, 0, 8, 8, 1, 0),
+			mk(2, 2, 4, 4, 2, gifDisposeBack),
+			mk(0, 0, 2, 2, 3, 0),
+		}, 3, []check{
+			{2, 0, 0, c3},  // frame 3's own block
+			{2, 3, 3, cbg}, // frame 2's rect restored to the background
+			{2, 7, 7, c1},
+		}},
+		{"previous-3", []gifVecFrame{
+			mk(0, 0, 8, 8, 1, 0),
+			mk(2, 2, 4, 4, 2, gifDisposePrev),
+			mk(6, 6, 2, 2, 3, 0),
+		}, 3, []check{
+			{2, 3, 3, c1}, // restored to the pre-frame canvas
+			{2, 6, 6, c3},
+			{2, 0, 0, c1},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := DecodeGIFFrames(gifEncode(gifVector{
+				ver: '9', w: 8, h: 8, gct: gifPal(4), frames: tc.frames,
+			}), GIFLimits{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(a.Frames) != tc.nf {
+				t.Fatalf("frames=%d, want %d", len(a.Frames), tc.nf)
+			}
+			for _, c := range tc.checks {
+				if got := gifFrameAt(t, a, c.fi, c.x, c.y); got != c.want {
+					t.Fatalf("frame %d (%d,%d) = %#08x, want %#08x", c.fi+1, c.x, c.y, got, c.want)
+				}
+			}
+		})
+	}
+}
+
+// TestGIFFramesTransparency: a transparent index never overwrites the
+// canvas — over keep it shows the previous frame, over disposal 2 it shows
+// the restored background, over 3 the restored previous, and a restore whose
+// background index IS the frame's transparent index lands transparent.
+func TestGIFFramesTransparency(t *testing.T) {
+	c1, c2, c3, cbg := gifPalWord(1), gifPalWord(2), gifPalWord(3), gifPalWord(0)
+	// hole: a 4x4 block of index 2 with index-3 holes at (0,0) and (1,1).
+	hole := func() []byte {
+		p := gifSolid(4, 4, 2)
+		p[0], p[5] = 3, 3
+		return p
+	}
+	mk := func(disp, trans int) gifVecFrame {
+		f := gifVec(2, 2, 4, 4, hole())
+		f.disposal = disp
+		f.transparent = trans
+		return f
+	}
+	full := gifVec(0, 0, 8, 8, gifSolid(8, 8, 1))
+	last := gifVec(6, 6, 2, 2, gifSolid(2, 2, 3))
+
+	// Keep: the holes show frame 1 through.
+	a, err := DecodeGIFFrames(gifEncode(gifVector{
+		ver: '9', w: 8, h: 8, gct: gifPal(4), frames: []gifVecFrame{full, mk(0, 3)},
+	}), GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gifFrameAt(t, a, 1, 2, 2); got != c1 {
+		t.Fatalf("keep hole = %#08x, want frame 1's %#08x", got, c1)
+	}
+	if got := gifFrameAt(t, a, 1, 4, 4); got != c2 {
+		t.Fatalf("keep body = %#08x, want %#08x", got, c2)
+	}
+
+	// Disposal 2: the rect — holes included — restores to the background
+	// before frame 3 draws.
+	a, err = DecodeGIFFrames(gifEncode(gifVector{
+		ver: '9', w: 8, h: 8, gct: gifPal(4), frames: []gifVecFrame{full, mk(gifDisposeBack, 3), last},
+	}), GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gifFrameAt(t, a, 2, 2, 2); got != cbg {
+		t.Fatalf("disposal-2 hole = %#08x, want background %#08x", got, cbg)
+	}
+	if got := gifFrameAt(t, a, 2, 4, 4); got != cbg {
+		t.Fatalf("disposal-2 body = %#08x, want background %#08x", got, cbg)
+	}
+	if got := gifFrameAt(t, a, 2, 6, 6); got != c3 {
+		t.Fatalf("disposal-2 last block = %#08x, want %#08x", got, c3)
+	}
+
+	// Disposal 3: the rect restores to the pre-frame canvas — holes or not.
+	a, err = DecodeGIFFrames(gifEncode(gifVector{
+		ver: '9', w: 8, h: 8, gct: gifPal(4), frames: []gifVecFrame{full, mk(gifDisposePrev, 3), last},
+	}), GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gifFrameAt(t, a, 2, 2, 2); got != c1 {
+		t.Fatalf("disposal-3 hole = %#08x, want frame 1's %#08x", got, c1)
+	}
+
+	// A restore-to-background where the background index IS the disposed
+	// frame's transparent index lands transparent, not the palette color.
+	a, err = DecodeGIFFrames(gifEncode(gifVector{
+		ver: '9', w: 8, h: 8, gct: gifPal(4), frames: []gifVecFrame{full, mk(gifDisposeBack, 0), last},
+	}), GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gifFrameAt(t, a, 2, 4, 4); got != 0 {
+		t.Fatalf("transparent-bg restore = %#08x, want transparent", got)
+	}
+}
+
+// TestGIFFramesDelayAndLoop: each frame's GCE delay lands in centiseconds,
+// and the NETSCAPE2.0 application block carries the loop count — absent is
+// -1, zero is loop-forever, n is n iterations.
+func TestGIFFramesDelayAndLoop(t *testing.T) {
+	mk := func(c, delay int) gifVecFrame {
+		f := gifVec(0, 0, 4, 4, gifSolid(4, 4, c))
+		f.delay = delay
+		return f
+	}
+	data := gifEncode(gifVector{ver: '9', w: 4, h: 4, gct: gifPal(4), frames: []gifVecFrame{
+		mk(1, 10), mk(2, 250), mk(3, 0),
+	}})
+	a, err := DecodeGIFFrames(data, GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Frames) != 3 || a.Frames[0].Delay != 10 || a.Frames[1].Delay != 250 || a.Frames[2].Delay != 0 {
+		t.Fatalf("delays = [%d %d %d], want [10 250 0]",
+			a.Frames[0].Delay, a.Frames[1].Delay, a.Frames[2].Delay)
+	}
+	if a.Loops != -1 {
+		t.Fatalf("loops=%d without a NETSCAPE block, want -1", a.Loops)
+	}
+	for _, loop := range []int{0, 1, 7} {
+		a, err = DecodeGIFFrames(gifWithLoop(t, data, loop), GIFLimits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Loops != loop {
+			t.Fatalf("NETSCAPE count %d decoded as %d", loop, a.Loops)
+		}
+	}
+	// The stdlib-encoded fixture carries the real thing: anim3_160x120 is
+	// gif.EncodeAll output with 10cs delays.
+	a, err = DecodeGIFFrames(gifVectorBytes(gifVectors[8]), GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Frames) != 3 || a.Frames[0].Delay != 10 || a.Frames[1].Delay != 10 || a.Frames[2].Delay != 10 {
+		t.Fatalf("anim3_160x120 delays = %v", []int{a.Frames[0].Delay, a.Frames[1].Delay, a.Frames[2].Delay})
+	}
+}
+
+// TestGIFFramesBounds: the walk stops at the frame bound and at the summed
+// composited-pixel bound, naming the bound it hit and returning the frames
+// already composited.
+func TestGIFFramesBounds(t *testing.T) {
+	many := gifVector{ver: '9', w: 2, h: 2, gct: gifPal(4)}
+	for i := 0; i < 70; i++ {
+		many.frames = append(many.frames, gifVec(0, 0, 2, 2, gifSolid(2, 2, i%4)))
+	}
+	data := gifEncode(many)
+	a, err := DecodeGIFFrames(data, GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Frames) != gifFramesMax || a.Truncated != "frames" {
+		t.Fatalf("default bound: frames=%d truncated=%q, want %d/frames",
+			len(a.Frames), a.Truncated, gifFramesMax)
+	}
+	if gifFramesMax != 64 || gifPixelsFactor != 4 {
+		t.Fatalf("bounds drifted from the card: %d frames, %dx pixels", gifFramesMax, gifPixelsFactor)
+	}
+	if a, err = DecodeGIFFrames(data, GIFLimits{MaxFrames: 3}); err != nil ||
+		len(a.Frames) != 3 || a.Truncated != "frames" {
+		t.Fatalf("MaxFrames=3: frames=%d truncated=%q err=%v", len(a.Frames), a.Truncated, err)
+	}
+	// 2x2 frames: each composite is 4 pixels; a 19-pixel budget lets four
+	// land and refuses the fifth.
+	if a, err = DecodeGIFFrames(data, GIFLimits{MaxPixels: 19}); err != nil ||
+		len(a.Frames) != 4 || a.Truncated != "pixels" {
+		t.Fatalf("MaxPixels=19: frames=%d truncated=%q err=%v", len(a.Frames), a.Truncated, err)
+	}
+	// The default pixel bound is 4x the single-image cap: seventeen 256x256
+	// frames (65536 px each) fit sixteen, not seventeen — under the frame
+	// bound, so pixels trips.
+	big := gifVector{ver: '9', w: 256, h: 256, gct: gifPal(4)}
+	for i := 0; i < 17; i++ {
+		big.frames = append(big.frames, gifVec(0, 0, 256, 256, gifSolid(256, 256, i%4)))
+	}
+	a, err = DecodeGIFFrames(gifEncode(big), GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Frames) != 16 || a.Truncated != "pixels" {
+		t.Fatalf("default pixel bound: frames=%d truncated=%q, want 16/pixels",
+			len(a.Frames), a.Truncated)
+	}
+}
+
+// TestGIFFramesTruncation shares decodeGIF's tolerance: a tail that breaks
+// after at least one frame returns the composited frames so far with
+// Truncated naming why — "corrupt" for a broken stream, "unsupported" for a
+// later frame's out-of-range literal width.
+func TestGIFFramesTruncation(t *testing.T) {
+	anim := gifVectorBytes(gifVectors[6]) // anim3-89a
+	a, err := DecodeGIFFrames(anim[:len(anim)-30], GIFLimits{})
+	if err != nil || a == nil || len(a.Frames) < 1 || a.Truncated == "" {
+		t.Fatalf("truncated tail: anim=%v err=%v", a, err)
+	}
+	// An out-of-range literal width on a LATER frame stops the walk with
+	// the frames so far — the first frame's identical refusal stays a hard
+	// gifUnsupported error.
+	f0, f1 := gifVec(0, 0, 4, 4, gifSolid(4, 4, 1)), gifVec(0, 0, 4, 4, gifSolid(4, 4, 2))
+	f1.lit = 9
+	data := gifEncode(gifVector{ver: '9', w: 4, h: 4, gct: gifPal(4), frames: []gifVecFrame{f0, f1}})
+	a, err = DecodeGIFFrames(data, GIFLimits{})
+	if err != nil || len(a.Frames) != 1 || a.Truncated != "unsupported" {
+		t.Fatalf("bad litwidth on frame 2: anim=%+v err=%v", a, err)
+	}
+	f0.lit = 9
+	data = gifEncode(gifVector{ver: '9', w: 4, h: 4, gct: gifPal(4), frames: []gifVecFrame{f0, f1}})
+	if a, err = DecodeGIFFrames(data, GIFLimits{}); err == nil || a != nil ||
+		!errors.Is(err, ErrImageUnsupported) {
+		t.Fatalf("bad litwidth on frame 1: anim=%v err=%v, want gifUnsupported", a, err)
+	}
+}
+
+// TestGIFFramesSubrectCanvas: a sub-rectangle frame composites onto the
+// logical screen — the area outside it stays transparent, the frame's own
+// pixels land offset — while decodeGIF still returns the bare frame rect.
+func TestGIFFramesSubrectCanvas(t *testing.T) {
+	data := gifVectorBytes(gifVectors[5]) // subrect-89a: 24x16 at (10,6) on 64x48
+	a, err := DecodeGIFFrames(data, GIFLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Width != 64 || a.Height != 48 || len(a.Frames) != 1 {
+		t.Fatalf("anim = %dx%d %d frames, want 64x48 x1", a.Width, a.Height, len(a.Frames))
+	}
+	if got := gifFrameAt(t, a, 0, 0, 0); got != 0 {
+		t.Fatalf("outside the frame rect = %#08x, want transparent", got)
+	}
+	im, err := decodeGIF(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gifFrameAt(t, a, 0, 10, 6); got != im.At(0, 0) {
+		t.Fatalf("frame rect origin = %#08x, want decodeGIF's first pixel %#08x", got, im.At(0, 0))
+	}
 }
 
 // TestGIFHeaderSniff keeps GOVIEW's logical-screen read honest: the dims

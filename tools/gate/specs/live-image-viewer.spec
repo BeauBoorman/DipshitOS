@@ -25,7 +25,11 @@
 # path (GOFILES mime dispatch is M132b's row, covered by M143b); GOVIEW
 # sniffs no SVG header, so it opens the 320x240 default window and its
 # receipt honestly tags `???` while the decoded 64x64 still proves the
-# raster.
+# raster. Issue #2975 made the GIF leg animated: TEST.GIF is the
+# three-frame anim3_160x120.gif, and `--input-string '..'` (the run's
+# second input channel — --input-chords is spent on the `q`) presses the
+# frame stepper twice so the serial carries `gview: frame 1/3`, `2/3`,
+# `3/3` with three distinct pixel sums.
 #
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goview.sh   ->  .build/go/GOVIEW.ELF
@@ -52,7 +56,7 @@ shutil.copy(src, os.path.join(share, "GOVIEW.ELF"))
 shutil.copy("tests/fixtures/png/viewer_160x120.png", os.path.join(share, "TEST.PNG"))
 shutil.copy("user/go/webrender/testdata/jpeg/viewer_160x120.jpg",
             os.path.join(share, "TEST.JPG"))
-shutil.copy("user/go/webrender/testdata/gif/viewer_160x120.gif",
+shutil.copy("user/go/webrender/testdata/gif/anim3_160x120.gif",
             os.path.join(share, "TEST.GIF"))
 shutil.copy("tests/fixtures/svg/acceptance/rect.svg", os.path.join(share, "TEST.SVG"))
 shutil.copy("tests/fixtures/qoi/viewer_160x120.qoi", os.path.join(share, "TEST.QOI"))
@@ -64,7 +68,7 @@ assert pos > 0, "baseline fixture lost its SOF0 marker"
 prog = bytearray(jpg)
 prog[pos + 1] = 0xc2
 open(os.path.join(share, "JPROG.JPG"), "wb").write(bytes(prog))
-print("staged GOVIEW.ELF + TEST.PNG/JPG/GIF/SVG/QOI + JPROG.JPG")
+print("staged GOVIEW.ELF + TEST.PNG/JPG/GIF/SVG/QOI + JPROG.JPG (GIF leg is the three-frame anim3)")
 PYEOF
 
 # The sequence per leg: `exec ... &`, a bounded ~5-tick `fg` dwell (the
@@ -121,6 +125,7 @@ vgate_run 01 -- \
     --snapshot-after 'snap-qoi' \
     --script '$RUN_DIR/script-wm.txt' --script-after "virelai> " \
     --script2 '$RUN_DIR/script.txt' --script2-after "wnd: registered" \
+    --input-string '..' --input-string-after "gview: loaded TEST.GIF" \
     --input-chords "q" --input-chords-after "gview: unsupported JPEG" \
     --script-expect "user-exec exited status=43" --timeout 240
 
@@ -131,7 +136,7 @@ vgate_assert 01 serial-count "exec: loaded GOVIEW.ELF" 6
 # The size markers — filename, decoded geometry, format tag, byte count.
 vgate_assert 01 serial-contains "gview: loaded TEST.PNG 160x120 PNG bytes=420"
 vgate_assert 01 serial-contains "gview: loaded TEST.JPG 160x120 JPEG bytes=1987"
-vgate_assert 01 serial-contains "gview: loaded TEST.GIF 160x120 GIF bytes=7752 frames=1"
+vgate_assert 01 serial-contains "gview: loaded TEST.GIF 160x120 GIF bytes=23271 frames=3"
 vgate_assert 01 serial-contains "gview: loaded TEST.SVG 64x64 ??? bytes=287"
 vgate_assert 01 serial-contains "gview: loaded TEST.QOI 160x120 QOI bytes=340"
 # Every snap marker echoed this boot — a snap file can then never be a
@@ -141,6 +146,15 @@ vgate_assert 01 serial-contains "snap-jpg"
 vgate_assert 01 serial-contains "snap-gif"
 vgate_assert 01 serial-contains "snap-svg"
 vgate_assert 01 serial-contains "snap-qoi"
+# The frame stepper (issue #2975): `--input-string '..'` types two `.` key
+# presses into the focused GIF viewer right after its loaded receipt — the
+# second input channel, since --input-chords is spent on JPROG's `q`. Frame
+# 1's receipt prints at load; the two presses walk it to 3/3. The GIF leg's
+# pixel probe below still passes whichever frame the snap catches: all
+# three are the same dense pattern family.
+vgate_assert 01 serial-contains "gview: frame 1/3 delay=100 sum="
+vgate_assert 01 serial-contains "gview: frame 2/3 delay=100 sum="
+vgate_assert 01 serial-contains "gview: frame 3/3 delay=100 sum="
 # The named refusal, then the viewer's own quit.
 vgate_assert 01 serial-contains "gview: unsupported JPEG"
 vgate_assert 01 serial-contains "gview: quit"
@@ -168,7 +182,13 @@ if len(re.findall(r"gview: open id=\d+ 328x264", ser)) != 5:
     sys.exit("expected five 328x264 opens (PNG/JPG/GIF/QOI/JPROG)")
 if len(re.findall(r"gview: open id=\d+ 320x240", ser)) != 1:
     sys.exit("expected one 320x240 default open (SVG)")
-print("sequence, refusals, exits and window sizes all pinned")
+# The stepper's three receipts must carry three DISTINCT pixel sums —
+# anim3's frames differ per frame, so an equal pair means a step repainted
+# stale pixels.
+sums = re.findall(r"gview: frame (\d+)/3 delay=100 sum=([0-9a-f]+)", ser)
+if [i for i, _ in sums] != ["1", "2", "3"] or len({s for _, s in sums}) != 3:
+    sys.exit("frame receipts wrong: %r" % (sums,))
+print("sequence, refusals, exits, window sizes and frame sums all pinned")
 PY
 
 # --- the probes' anchor --------------------------------------------------

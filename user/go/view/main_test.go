@@ -135,3 +135,82 @@ func TestFileCapBeatsTheSharedReaderCap(t *testing.T) {
 		t.Errorf("pixelsMax = %d, want VIEW.BIN's 131072-pixel cap", pixelsMax)
 	}
 }
+
+// gifAnimFixture is the live gate's animated GIF: three distinct 160x120
+// frames at 10 cs each.
+const gifAnimFixture = "../webrender/testdata/gif/anim3_160x120.gif"
+
+// TestDecodeForViewRoutesGIF is the M162a entry point's own check: a GIF
+// decodes through DecodeGIFFrames so the stepper has every composited frame
+// (shown frame 1, screen-sized), while the other formats still go through
+// DecodeImage with no animation attached.
+func TestDecodeForViewRoutesGIF(t *testing.T) {
+	im, anim, err := decodeForView(readFixture(t, gifAnimFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anim == nil || len(anim.Frames) != 3 {
+		t.Fatalf("anim = %v frames, want 3", anim)
+	}
+	if im.Width != anim.Width || im.Height != anim.Height || im.Frames != 3 {
+		t.Fatalf("shown = %dx%d frames=%d, want %dx%d x3", im.Width, im.Height, im.Frames, anim.Width, anim.Height)
+	}
+	sums := map[uint64]int{}
+	for i := range anim.Frames {
+		sums[frameSum(anim.Frames[i].Pix)] = i
+		if anim.Frames[i].Delay != 10 {
+			t.Fatalf("frame %d delay = %d cs, want 10", i+1, anim.Frames[i].Delay)
+		}
+	}
+	if len(sums) != 3 {
+		t.Fatal("anim3_160x120 must composite to three distinct frames")
+	}
+	im, anim, err = decodeForView(readFixture(t, qoiFixture))
+	if err != nil || anim != nil {
+		t.Fatalf("QOI: im=%v anim=%v err=%v, want decoded/no-anim", im, anim, err)
+	}
+}
+
+// TestStepFrameIdxWraps pins the stepper's wrap both ways.
+func TestStepFrameIdxWraps(t *testing.T) {
+	for _, c := range []struct{ cur, dir, n, want int }{
+		{0, 1, 3, 1}, {1, 1, 3, 2}, {2, 1, 3, 0},
+		{0, -1, 3, 2}, {2, -1, 3, 1},
+		{0, 1, 1, 0}, {0, -1, 1, 0},
+		{5, 1, 0, 0},
+	} {
+		if got := stepFrameIdx(c.cur, c.dir, c.n); got != c.want {
+			t.Errorf("stepFrameIdx(%d,%d,%d) = %d, want %d", c.cur, c.dir, c.n, got, c.want)
+		}
+	}
+}
+
+// TestStepFrameShowsTheCompositedFrame: stepping replaces the shown image
+// with the frame's own screen-sized composite, wrapping both directions,
+// and the keys are inert without an animation.
+func TestStepFrameShowsTheCompositedFrame(t *testing.T) {
+	im, anim, err := decodeForView(readFixture(t, gifAnimFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app{img: im, anim: anim}
+	if !a.stepFrame(1) || a.frame != 1 || len(a.img.Pix) != 160*120 {
+		t.Fatal("'.' did not land on frame 2")
+	}
+	if &a.img.Pix[0] != &a.anim.Frames[1].Pix[0] {
+		t.Fatal("the shown image must BE frame 2's composite")
+	}
+	if !a.stepFrame(1) || a.frame != 2 {
+		t.Fatal("'.' did not land on frame 3")
+	}
+	if !a.stepFrame(1) || a.frame != 0 {
+		t.Fatal("'.' at the last frame must wrap to frame 1")
+	}
+	if !a.stepFrame(-1) || a.frame != 2 {
+		t.Fatal("',' at frame 1 must wrap to the last frame")
+	}
+	a.anim = nil
+	if a.stepFrame(1) {
+		t.Fatal("a still image must not step")
+	}
+}

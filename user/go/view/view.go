@@ -33,6 +33,11 @@ const (
 	keyQuitQ   = 0x14 // `q`
 	keyEscape  = 0x29
 	keyCopy    = 0x06 // `c` — M124c typed clipboard
+
+	// The frame stepper (issue #2975): `.` steps forward, `,` steps back,
+	// both wrapping. App-local — neither usage is bound in gotabwm.
+	keyFrameNext = 0x37 // `.`
+	keyFramePrev = 0x36 // `,`
 )
 
 // Geometry and caps, ported from view.zig: the window is sized to the image
@@ -220,6 +225,44 @@ const (
 	zoomOut
 	zoomReset
 )
+
+// stepFrameIdx is the stepper's wrap: one step forward or back through n
+// frames, wrapping both ends. dir is ±1.
+func stepFrameIdx(cur, dir, n int) int {
+	if n < 1 {
+		return 0
+	}
+	return (cur + dir%n + n) % n
+}
+
+// frameSum is the FNV-1a-64 over one composited frame's words — the frame
+// marker's evidence that a distinct image painted.
+func frameSum(pix []uint32) uint64 {
+	h := uint64(14695981039346656037)
+	for _, p := range pix {
+		h ^= uint64(byte(p))
+		h *= 1099511628211
+		h ^= uint64(byte(p >> 8))
+		h *= 1099511628211
+		h ^= uint64(byte(p >> 16))
+		h *= 1099511628211
+		h ^= uint64(p >> 24)
+		h *= 1099511628211
+	}
+	return h
+}
+
+// hex64 renders a 64-bit sum as 16 lowercase hex digits — vi has no hex
+// printer and this file stays import-free so the host tests run it.
+func hex64(v uint64) string {
+	const digits = "0123456789abcdef"
+	var b [16]byte
+	for i := 15; i >= 0; i-- {
+		b[i] = digits[v&0xf]
+		v >>= 4
+	}
+	return string(b[:])
+}
 
 // stepZoom is view.zig's step_zoom, with the same clamping at both ends of the
 // table.
