@@ -15,6 +15,7 @@
 package main
 
 import (
+	"virelai/draw"
 	"virelai/icons"
 	"virelai/theme"
 	"virelai/widgets"
@@ -44,6 +45,19 @@ const (
 const (
 	railCloseW     = 16
 	railCloseInset = 2
+)
+
+// M151b (#2913): the space switcher's pill geometry. One pill per space,
+// right-aligned in the rail with a railPillMarginR edge margin and
+// railPillGap between pills; each pill wraps its name in railPillPadX of
+// horizontal padding inside a stripH-2*railPillInsetY plate. spacePillRects
+// owns the whole computation so paintRail and hid.go's spacePillAt hit-test
+// can never disagree.
+const (
+	railPillInsetY  = 3
+	railPillPadX    = 4
+	railPillGap     = 4
+	railPillMarginR = 4
 )
 
 // Tab is one strip entry. ID is the kernel window id the client declared.
@@ -1372,19 +1386,64 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover, clos
 			written++
 		}
 	}
-	// M137c (#2773): the rail's space name — painted only when more than
-	// one space exists (a single-space desktop has nothing to
-	// distinguish). Right-aligned, muted ink, small face.
-	if spaceN > 1 {
-		name := spaces[spaceCur].Name
-		tw := seatTextWidth(name, seatSmallPx)
-		x := width - tw - 4
-		if x >= 0 {
-			clip := widgets.Rect{X: 0, Y: 0, W: width, H: stripH}
-			seatText(c, clip, x, (stripH-seatSmallPx)/2, seatSmallPx,
-				name, railCloseRGB())
+	// M151b (#2913): the rail's space switcher — one pill per live space,
+	// painted only while spaceN > 1 (a single-space desktop has nothing
+	// to pick, and the empty-strip early return above means the rail —
+	// and its pills — never paint without tabs). Painted LAST so the
+	// pills sit over the cells they overlap: the hit test must agree —
+	// hid.go's spacePillAt shares spacePillRects. The live space carries
+	// the Accent plate + ChromeBg ink (the focus-chip language); dormant
+	// spaces take the trough's own Bg fill so they read as recessed
+	// picks, not rail cells, with muted ink.
+	if pills, pn := spacePillRects(width, stripH); pn > 0 {
+		clip := widgets.Rect{X: 0, Y: 0, W: width, H: stripH}
+		for si := 0; si < pn; si++ {
+			r := pills[si]
+			fill, ink := railGapRGB(), railCloseRGB()
+			if si == spaceCur {
+				fill, ink = tok.Accent, tok.ChromeBg
+			}
+			draw.FillRoundedRect(c, r, radiusControl, draw.Opaque(fill))
+			written += seatArea(c, r)
+			name := spaces[si].Name
+			tw := seatTextWidth(name, seatSmallPx)
+			seatText(c, clip, r.X+(r.W-tw)/2, r.Y+(r.H-seatSmallPx)/2,
+				seatSmallPx, name, ink)
 			written++
 		}
 	}
 	return written
+}
+
+// spacePillRects computes the painted pill rects — spaceN pills,
+// right-aligned, live-space order (space "1" leftmost). Shared by
+// paintRail and spacePillAt so the click target can never disagree with
+// the paint. Nothing while spaceN <= 1; pills that would cross the
+// rail's left edge are truncated at it (a full-width rail of tabs plus
+// four long names is the only way to reach that, and the clamp keeps
+// the hit test honest there).
+func spacePillRects(width, stripH int) ([MaxSpaces]widgets.Rect, int) {
+	var rects [MaxSpaces]widgets.Rect
+	if spaceN <= 1 || width <= 0 || stripH <= 0 {
+		return rects, 0
+	}
+	h := stripH - 2*railPillInsetY
+	if h <= 0 {
+		return rects, 0
+	}
+	x := width - railPillMarginR
+	for si := spaceN - 1; si >= 0; si-- {
+		w := seatTextWidth(spaces[si].Name, seatSmallPx) + 2*railPillPadX
+		x -= w
+		if x < 0 {
+			w += x
+			x = 0
+		}
+		if w <= 0 {
+			break
+		}
+		rects[si] = widgets.Rect{X: x, Y: railPillInsetY, W: w, H: h}
+		x -= railPillGap
+	}
+	return rects, spaceN
 }

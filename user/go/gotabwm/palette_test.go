@@ -373,3 +373,87 @@ func TestPaletteHexDecode(t *testing.T) {
 		}
 	}
 }
+
+// M151b (#2913): "Switch to space N" rows sit beside the move rows — one
+// per dormant space, none for the live one, and none needing a focused
+// tab. Enter on one runs spaceSwitchTo with the palette already closed.
+func TestPaletteSwitchSpaceRows(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	resetSpaces()
+	tabs = TabStrip{}
+	tabs.OpenTab(3, "Calc")
+	tabs.FocusTab(3)
+	spaceEnsure("2")
+	spaceEnsure("3")
+	_, restoreVis := visRecorder()
+	defer restoreVis()
+
+	launch = launcherState{}
+	openPalette()
+	var switches, moves int
+	for _, e := range launch.results {
+		switch e.kind {
+		case palSwitch:
+			switches++
+			if e.label != "Switch to space "+e.arg {
+				t.Fatalf("row label %q arg %q", e.label, e.arg)
+			}
+		case palSpace:
+			moves++
+		}
+	}
+	// The two dormant spaces get a switch row each; the live space has
+	// none. The move rows are untouched: 2 dormant + the next-slot
+	// "Move ... to new space 4" create row.
+	if switches != 2 || moves != 3 {
+		t.Fatalf("catalog: switches=%d moves=%d want 2/3", switches, moves)
+	}
+	launch.filter = "switch to space 3"
+	launch.refresh()
+	e, ok := launch.selectedPalette()
+	if !ok || e.kind != palSwitch || e.arg != "3" {
+		t.Fatalf("'switch to space 3' selected %+v ok=%v", e, ok)
+	}
+	paletteExecSelected()
+	if launch.open {
+		t.Fatal("a switch pick must close the palette")
+	}
+	if spaceCur != 2 {
+		t.Fatalf("switch landed cur=%d want 2 (space %q)", spaceCur, spaces[2].Name)
+	}
+	if tabs.Count() != 0 {
+		t.Fatal("space 3's strip must be the empty live strip")
+	}
+	if spaces[0].Strip.Count() != 1 || spaces[0].Strip.At(0).ID != 3 {
+		t.Fatal("space 1's strip did not park")
+	}
+}
+
+// M151b (#2913): the switch rows exist on an EMPTY strip too — a switch
+// needs no focused tab, so the rows are the keyboard's only jump while
+// the live space holds nothing to move.
+func TestPaletteSwitchRowsOnEmptyStrip(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	resetSpaces()
+	tabs = TabStrip{}
+	spaceEnsure("2")
+
+	launch = launcherState{}
+	openPalette()
+	var switches, moves int
+	for _, e := range launch.results {
+		switch e.kind {
+		case palSwitch:
+			switches++
+		case palSpace:
+			moves++
+		}
+	}
+	if switches != 1 || moves != 0 {
+		t.Fatalf("empty strip: switches=%d moves=%d want 1/0", switches, moves)
+	}
+}

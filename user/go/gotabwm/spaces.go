@@ -34,9 +34,12 @@ const MaxSpaces = 4
 // `workspace` — the kernel's workspace_id is a different axis (and
 // MarkerFirstBootWorkspace already owns that token).
 const (
-	MarkerSpaceNew      = "gotabwm: space new name="
-	MarkerSpaceSwitch   = "gotabwm: space switch "
-	MarkerSpaceMove     = "gotabwm: space move "
+	MarkerSpaceNew    = "gotabwm: space new name="
+	MarkerSpaceSwitch = "gotabwm: space switch "
+	MarkerSpaceMove   = "gotabwm: space move "
+	// M151b (#2913): the rail pill's click marker — the pointer gesture's
+	// own record, printed before the switch marker the call runs.
+	MarkerSpacePick     = "gotabwm: space pick "
 	MarkerSessionSpaces = "gotabwm: session spaces "
 )
 
@@ -154,6 +157,18 @@ func spaceSwitchTo(dst int) bool {
 	vi.ConsoleLine(MarkerSpaceSwitch + spaces[old].Name + "->" + spaces[dst].Name)
 	noteSessionMutation()
 	return true
+}
+
+// applySpacePick is the M151b rail-pill dispatch: a pointer click on a
+// space's pill. The pick marker names the gesture itself — it prints on
+// every pill hit, even a click on the live space (whose switch refuses
+// and stays silent); the existing switch marker then names the outcome.
+func applySpacePick(si int) bool {
+	if si < 0 || si >= spaceN {
+		return false
+	}
+	vi.ConsoleLine(MarkerSpacePick + spaces[si].Name)
+	return spaceSwitchTo(si)
 }
 
 // applySpaceSwitch is the ctrl+alt+PageUp/PageDown dispatch. PageDown at

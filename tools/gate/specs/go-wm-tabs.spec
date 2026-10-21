@@ -8,7 +8,7 @@
 # #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# TWENTY-FOUR vgate_runs share one seeded host share (`vgate_share seed`):
+# TWENTY-FIVE vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -110,6 +110,12 @@
 #       drag released over the other pane's client rect — `pane drop` —
 #       and a close-x on the focused cell: `focus restore ... why=close`
 #       names the MRU survivor. The run ends on the seat's own marker.
+#   25  M151b (#2913): the visible space switcher. LIVE mode, GOCALC+NOTE
+#       on space "1"; the chord creates spaces 2+3, GOEDIT lands on 3,
+#       the palette's "Switch to space 3" row carries the desktop over,
+#       and a `--pointer-virtio` click on pill "1" prints `space pick 1`
+#       before `space switch 3->1`. A marker-keyed screen capture is the
+#       scanout probe: three pills, the live one on the Accent plate.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -3128,4 +3134,210 @@ i_write = ser.find("gotabwm: session write", i_drop)
 if i_drop < 0 or i_write < 0:
     sys.exit("drop=%d write=%d — the drop must persist" % (i_drop, i_write))
 print("pane drop at %d persisted by write at %d" % (i_drop, i_write))
+PY
+
+# ---------------------------------------------------------------------------
+# Run 25 (M151b / #2913): the visible space switcher — rail pills and the
+# palette's "Switch to space N" rows. LIVE mode (the DEMO trigger is
+# removed), GOCALC+NOTE like run 01's pair.
+#
+# One input-chords burst and one pointer burst are all the harness offers,
+# so the legs run palette-first and the third client is moved, not exec'd
+# (a launcher "edit" pick is not deterministic on this share — run 22's
+# GOEDIT leg is the casualty). The chord stream creates spaces 2 and 3
+# (each PageDown creates + lands), pages back to space 1, moves the
+# focused tab to space 3 through the M137c move row, then runs "Switch to
+# space 3". The pointer leg waits on the palette's own switch marker, so
+# the click lands on space 3's painted rail: pill "1" is the leftmost of
+# the right-aligned strip (8px bitmap metrics on this share — no
+# FONTS.TXT — so pills are 16 px wide ending 4 px short of the edge:
+# [1220,1236)x[3,19)); the click at 1228,11 prints `space pick 1` then
+# `space switch 3->1`.
+#
+# script3 rides the pick marker; its rx echo keys the screenshot — many
+# ticks sit between the last switch and the grab (the run-05 idiom), so
+# the frame is the settled space-1 rail with pill "1" on the Accent plate.
+vgate_file script-25.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-25.txt <<'EOF'
+dui focus 0
+exec GOCALC.ELF
+exec NOTE.ELF
+EOF
+
+vgate_file script3-25.txt <<'EOF'
+wm
+dui
+echo rx-gotabwm-space-switcher-ok
+EOF
+
+vgate_run 25 -- \
+    --screen '$RUN_DIR/screen-25' \
+    --screenshot-after 'rx-gotabwm-space-switcher-ok' \
+    --script '$RUN_DIR/script-25.txt' \
+    --script2 '$RUN_DIR/script2-25.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-alt-pagedown,ctrl-alt-pagedown,ctrl-alt-pageup,ctrl-alt-pageup,ctrl-shift-p,m,o,v,e,space,3,return,ctrl-shift-p,s,w,i,t,c,h,space,t,o,space,3,return' \
+    --input-chords-after 'gotabwm: rail n=2' \
+    --pointer-virtio '1228,11,c' \
+    --pointer-virtio-after 'gotabwm: space switch 1->3' \
+    --script3 '$RUN_DIR/script3-25.txt' \
+    --script3-after 'gotabwm: space pick 1' \
+    --script-expect 'rx-gotabwm-space-switcher-ok' --timeout 300
+
+vgate_assert 25 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 25 serial-contains 'gotabwm: registered'
+vgate_assert 25 serial-contains 'gotabwm: mode live'
+vgate_assert 25 serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert 25 serial-contains 'exec: loaded NOTE.ELF'
+vgate_assert 25 serial-contains 'gotabwm: rail n=2'
+# The chord's two PageDowns created and landed on each new space.
+vgate_assert 25 serial-contains 'gotabwm: space new name=2'
+vgate_assert 25 serial-contains 'gotabwm: space new name=3'
+vgate_assert 25 serial-contains 'gotabwm: space switch 1->2'
+vgate_assert 25 serial-contains 'gotabwm: space switch 2->3'
+vgate_assert 25 serial-contains 'gotabwm: space switch 2->1'
+# The move row parked a tab on space 3; the switch row carried the desktop.
+vgate_assert 25 serial-contains 'gotabwm: palette run move-to-space 3'
+vgate_assert 25 serial-contains 'gotabwm: space move id='
+vgate_assert 25 serial-contains 'gotabwm: palette run switch-to-space 3'
+vgate_assert 25 serial-contains 'gotabwm: space switch 1->3'
+# The rail marker names the live space on both ends of the run.
+vgate_assert 25 serial-contains ' space=3'
+vgate_assert 25 serial-contains ' space=1'
+# The pill click: the pick marker, then the switch back to space 1.
+vgate_assert 25 serial-contains 'gotabwm: space pick 1'
+vgate_assert 25 serial-contains 'gotabwm: space switch 3->1'
+vgate_assert 25 serial-contains 'gotabwm: session spaces n=3'
+vgate_assert 25 serial-contains 'rx-gotabwm-space-switcher-ok'
+vgate_assert 25 serial-absent 'gotabwm: panes bad'
+vgate_assert 25 serial-absent 'gotabwm: session bad'
+vgate_assert 25 serial-absent '[EXC] parking:'
+vgate_assert 25 serial-absent 'exited status=139'
+# Ordering: the pick gesture precedes the switch it ran, and both precede
+# the rx echo that keys the capture.
+vgate_assert 25 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+i_pick = ser.find("gotabwm: space pick 1")
+i_sw = ser.find("gotabwm: space switch 3->1")
+i_rx = ser.find("rx-gotabwm-space-switcher-ok")
+if not (0 <= i_pick < i_sw < i_rx):
+    sys.exit("leg order wrong: pick=%d switch=%d rx=%d" % (i_pick, i_sw, i_rx))
+print("space pick 1 -> space switch 3->1 -> rx: ordered")
+PY
+# The `dui` dump after the pick shows space 3's window hidden — the pill's
+# switch ran the real wmctl_set_state path, not just a marker. Scoped to
+# the full-viewport tab rows (the seat's own small sink/chrome windows are
+# user-kind too): Calc shown on space 1, the moved Note parked on space 3.
+vgate_assert 25 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+i_pick = ser.find("gotabwm: space pick 1")
+rows = [l for l in ser[i_pick:].splitlines()
+        if l.startswith("dui[") and " user " in l
+        and "rect=0,0,1280,720" in l]
+hidden = [l for l in rows if "visible=0" in l]
+shown = [l for l in rows if "visible=1" in l]
+if len(hidden) != 1 or len(shown) != 1:
+    sys.exit("post-pick dui tab rows: %s" % rows)
+print("post-pick dui: 1 parked tab hidden, 1 shown")
+PY
+# The scanout probe: three pills at the rail's right edge on the settled
+# post-switch frame — the live space "1" on the Accent plate (blue-
+# dominant, the capture's channel shift), the dormant pair recessed in
+# Bg with the inter-pill gap showing the cell behind. Counts over each
+# rect, not point samples, so the name glyphs can't poison the read.
+vgate_assert 25 snapshot 'screen-25-after*' <<'PY'
+import sys, zlib, struct
+path = sys.argv[1]
+d = open(path, "rb").read()
+if d[:8] != b"\x89PNG\r\n\x1a\n":
+    sys.exit("not a PNG")
+pos = 8; idat = b""; w = h = ct = 0
+while pos < len(d):
+    ln, typ = struct.unpack(">I4s", d[pos:pos+8])
+    data = d[pos+8:pos+8+ln]
+    if typ == b"IHDR":
+        w, h, bd, ct = struct.unpack(">IIBB", data[:10])
+    elif typ == b"IDAT":
+        idat += data
+    pos += 12 + ln
+raw = zlib.decompress(idat)
+bpp = 4 if ct == 6 else 3
+stride = w * bpp
+out = bytearray(); prev = bytearray(stride); i = 0
+for y in range(h):
+    f = raw[i]; i += 1
+    line = bytearray(raw[i:i+stride]); i += stride
+    if f == 1:
+        for x in range(bpp, stride): line[x] = (line[x] + line[x-bpp]) & 0xff
+    elif f == 2:
+        for x in range(stride): line[x] = (line[x] + prev[x]) & 0xff
+    elif f == 3:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xff
+    elif f == 4:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            b = prev[x]; c = prev[x-bpp]
+            p = a + b - c
+            pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[x] = (line[x] + pr) & 0xff
+    out += line
+    prev = line
+def px(x, y):
+    k = (y * w + x) * bpp
+    return out[k], out[k+1], out[k+2]
+def near(rgb, token, tol=4):
+    return all(abs(a - b) <= tol for a, b in zip(rgb, token))
+def blue(rgb):
+    r, g, b = rgb
+    return b > 150 and b > r + 40 and b > g + 40
+BG = (0x18, 0x20, 0x26)
+scale = w / 1280.0
+def rect(x0, x1, y0, y1):
+    return [(x, y) for y in range(int(y0*scale), int(y1*scale))
+            for x in range(int(x0*scale), int(x1*scale))]
+# Live pill "1" [1220,1236)x[3,19): mostly Accent plate (the bitmap '1'
+# glyph costs a few px), plus at least two ChromeBg-dark glyph strokes.
+r1 = rect(1221, 1235, 4, 18)
+if sum(1 for p in r1 if blue(px(*p))) < 150:
+    sys.exit("live pill shows %d accent px — no Accent plate" %
+             sum(1 for p in r1 if blue(px(*p))))
+if sum(1 for p in r1 if max(px(*p)) < 0x60) < 2:
+    sys.exit("live pill shows no name glyph")
+# Dormant pills "2" [1240,1256) and "3" [1260,1276): recessed plates over
+# the Selection cell. The capture path crushes the dark channels (Bg
+# 0x182026 reads ~(8,9,37) — measured on this run's evidence file), so the
+# plate is asserted as a dark non-cell family and the name's muted-ink
+# glyph strokes prove a pill — not a bare gap — sits there.
+def darkish(rgb):
+    return rgb[2] < 80 and rgb[0] < 40 and rgb[1] < 45
+def muted_ink(rgb):
+    r, g, b = rgb
+    return r > 100 and g > 110 and b > 140
+for tag, (x0, x1) in (("2", (1241, 1255)), ("3", (1261, 1275))):
+    rr = rect(x0, x1, 4, 18)
+    if sum(1 for p in rr if darkish(px(*p))) < 100:
+        sys.exit("dormant pill %s shows no recessed plate" % tag)
+    if sum(1 for p in rr if muted_ink(px(*p))) < 2:
+        sys.exit("dormant pill %s shows no name glyph" % tag)
+# The 4 px inter-pill gap shows the cell behind (Selection — space 1's
+# focused tab fills the rail), not pill fill: three plates, not a bar.
+gap = px(int(1238 * scale), int(11 * scale))
+if darkish(gap) or blue(gap):
+    sys.exit("inter-pill gap %r looks like pill fill" % (gap,))
+print("pill strip: live accent plate + glyph, dormant recessed+glyph, gap shows cell")
 PY

@@ -186,3 +186,59 @@ func TestRailCompositeGoldenDegrade(t *testing.T) {
 	scan := paintGoldenRail(t, goldenStrip(t), 0, 3)
 	checkSeatGolden(t, "seat-rail-degrade", scan, vi.ScanoutWidth, RailHeight)
 }
+
+// withSpaces pins the space table for one golden paint: resetSpaces gives
+// the default "1".."4" names, then the caller's counts land, and cleanup
+// puts the single-space table back for the next test.
+func withSpaces(t *testing.T, n, cur int) {
+	t.Helper()
+	savedSpaces, savedN, savedCur := spaces, spaceN, spaceCur
+	resetSpaces()
+	spaceN, spaceCur = n, cur
+	t.Cleanup(func() { spaces, spaceN, spaceCur = savedSpaces, savedN, savedCur })
+}
+
+// M151b (#2913): the space switcher on the same composite strip — one
+// pill per live space at the rail's right edge, the current space on the
+// Accent plate, dormant spaces recessed in the trough's Bg fill. Two
+// spaces is the smallest switcher; the single-space seat-rail golden
+// above stays byte-identical (spaceN==1 paints no pills).
+func TestRailCompositeGoldenSpaces2(t *testing.T) {
+	tok := theme.Current
+	theme.Current = theme.Dark
+	t.Cleanup(func() { theme.Current = tok })
+
+	withSpaces(t, 2, 0)
+	stubSeatRegistry(t, seatRegistryFromRepo(t))
+	scan := paintGoldenRail(t, goldenStrip(t), -1, -1)
+	checkSeatGolden(t, "seat-rail-spaces2", scan, vi.ScanoutWidth, RailHeight)
+}
+
+// The full MaxSpaces strip, with the highlight on a middle pill so the
+// golden proves the current-space treatment is positional, not an edge
+// case.
+func TestRailCompositeGoldenSpaces4(t *testing.T) {
+	tok := theme.Current
+	theme.Current = theme.Dark
+	t.Cleanup(func() { theme.Current = tok })
+
+	withSpaces(t, 4, 2)
+	stubSeatRegistry(t, seatRegistryFromRepo(t))
+	scan := paintGoldenRail(t, goldenStrip(t), -1, -1)
+	checkSeatGolden(t, "seat-rail-spaces4", scan, vi.ScanoutWidth, RailHeight)
+}
+
+// The §3.4 degrade twin: no manifest, so the pills' names and geometry
+// come from the 8px bitmap face — the same measurements the class-B
+// gate's seeded share (no FONTS.TXT) drives the --pointer-virtio click
+// from.
+func TestRailCompositeGoldenSpaces4Degrade(t *testing.T) {
+	tok := theme.Current
+	theme.Current = theme.Dark
+	t.Cleanup(func() { theme.Current = tok })
+
+	withSpaces(t, 4, 2)
+	stubSeatRegistry(t, nil)
+	scan := paintGoldenRail(t, goldenStrip(t), -1, -1)
+	checkSeatGolden(t, "seat-rail-spaces4-degrade", scan, vi.ScanoutWidth, RailHeight)
+}

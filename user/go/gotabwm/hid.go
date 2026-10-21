@@ -954,6 +954,19 @@ func handleWmPointer(e vi.Event) {
 		// reaches content (hit-test honesty). The rest of the cell keeps
 		// the click/drag behaviour below, byte for byte.
 		updateRailHover(px, py, false)
+		// M151b (#2913): a space pill is its own click target — the pills
+		// paint last, over the cells (and the last cell's close zone) at
+		// the rail's right edge, so what is on top is what the click
+		// finds. The press is consumed whole: the pick's marker names
+		// the gesture, the shared switch path runs, and no rail drag
+		// arms (a release on a pill is still rail territory for an
+		// already-armed drag — a dropped tab reorders, it does not
+		// jump spaces; that arc is out of scope).
+		if si, ok := spacePillAt(px, py, vi.ScanoutWidth, RailHeight); ok {
+			railDragFrom = -1
+			applySpacePick(si)
+			return
+		}
 		if i, ok := railCloseZoneAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight); ok {
 			railDragFrom = -1
 			applyRailClose(i)
@@ -1139,6 +1152,27 @@ func railCellAt(px, py uint32, width, n, stripH int) (int, bool) {
 		i = n - 1
 	}
 	return i, true
+}
+
+// spacePillAt is the M151b (#2913) pill-strip hit test: the space index
+// whose painted pill contains (px, py), or false. spacePillRects owns the
+// geometry — the same function paintRail calls — so the target can never
+// disagree with what is on the scanout. The strip must be showing: an
+// empty rail paints nothing (paintRail's early return), so a press in the
+// phantom pill zone is content, not a pick.
+func spacePillAt(px, py uint32, width, stripH int) (int, bool) {
+	if tabs.Count() == 0 {
+		return 0, false
+	}
+	pills, n := spacePillRects(width, stripH)
+	for i := 0; i < n; i++ {
+		r := pills[i]
+		if int(px) >= r.X && int(px) < r.X+r.W &&
+			int(py) >= r.Y && int(py) < r.Y+r.H {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 func applyRailClick(px, py uint32) bool {

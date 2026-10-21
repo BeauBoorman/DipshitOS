@@ -5,7 +5,11 @@ package main
 // chord's focus-vs-exec split, and the session/sidecar round-trips that
 // make a snapshot restore bring back every space.
 
-import "testing"
+import (
+	"testing"
+
+	"virelai/vi"
+)
 
 // visRecorder stubs the wmctl_set_state seam so host tests see the
 // hide/show calls a space switch issues.
@@ -374,5 +378,127 @@ func TestRailMarkerCarriesSpaceName(t *testing.T) {
 	markRail()
 	if lastRailSpace != 1 {
 		t.Fatalf("markRail space dedup: %d", lastRailSpace)
+	}
+}
+
+// M151b (#2913): the pill strip's hit test mirrors the paint — both share
+// spacePillRects, so the pinned geometry IS the contract: pills right-
+// aligned in live-space order, per-pill containment with the gaps,
+// below-band and left-of-strip misses, and the two refusal shapes (a
+// single-space desktop paints no pills; an empty strip paints no rail).
+func TestSpacePillAtMirrorsPaint(t *testing.T) {
+	defer saveSeatState()()
+	resetSpaces()
+	tabs = TabStrip{}
+	if !tabs.OpenTab(3, "A") || !tabs.OpenTab(4, "B") {
+		t.Fatal("OpenTab")
+	}
+	if _, ok := spacePillAt(1279, 11, 1280, 22); ok {
+		t.Fatal("a single-space rail has no pill targets")
+	}
+	spaceEnsure("2")
+	spaceEnsure("3")
+	pills, n := spacePillRects(1280, 22)
+	if n != 3 {
+		t.Fatalf("pills=%d want 3", n)
+	}
+	// Live-space order left to right, all inside the rail's right edge.
+	if !(pills[0].X < pills[1].X && pills[1].X < pills[2].X) {
+		t.Fatalf("pill order drifts: %v", pills)
+	}
+	if pills[2].X+pills[2].W > 1280 || pills[0].X < 0 {
+		t.Fatalf("pills escape the rail: %v", pills)
+	}
+	for si := 0; si < n; si++ {
+		r := pills[si]
+		if got, ok := spacePillAt(uint32(r.X+r.W/2), uint32(r.Y+r.H/2), 1280, 22); !ok || got != si {
+			t.Fatalf("pill %d centre hit got=%d ok=%v", si, got, ok)
+		}
+	}
+	// The inter-pill gap, the rows outside the pill band, and the
+	// trough left of the strip are all non-targets.
+	if _, ok := spacePillAt(uint32(pills[0].X+pills[0].W+1), 11, 1280, 22); ok {
+		t.Fatal("the inter-pill gap must miss")
+	}
+	if _, ok := spacePillAt(uint32(pills[1].X+2), uint32(pills[1].Y-1), 1280, 22); ok {
+		t.Fatal("above the pill band must miss")
+	}
+	if _, ok := spacePillAt(uint32(pills[0].X-1), 11, 1280, 22); ok {
+		t.Fatal("left of the pill strip must miss")
+	}
+	// An empty live strip paints no rail (paintRail's early return), so
+	// the pill zone is not a target either — honesty with the scanout.
+	tabs = TabStrip{}
+	if _, ok := spacePillAt(uint32(pills[1].X+2), 11, 1280, 22); ok {
+		t.Fatal("an empty strip has no pills to hit")
+	}
+}
+
+// M151b (#2913): a pointer press on a dormant space's pill runs the same
+// switch the chord runs — the parked strip, the visibility flips, the
+// landed focus — and wins over the close zone it overlaps. A press on the
+// LIVE space's pill is the consumed no-op: the pick marker prints (the
+// gesture happened), the switch refuses. No rail drag arms either way.
+func TestHandleWmPointerSpacePillSwitches(t *testing.T) {
+	defer saveSeatState()()
+	resetSpaces()
+	tabs = TabStrip{}
+	prevPtrButtons = 0
+	railDragFrom = -1
+	hostedApp = 0
+	if !tabs.OpenTab(3, "Calc") || !tabs.OpenTab(4, "Edit") || !tabs.FocusTab(4) {
+		t.Fatal("seed")
+	}
+	spaceEnsure("2")
+	spaces[1].Strip = TabStrip{}
+	if !spaces[1].Strip.OpenTab(9, "Term") {
+		t.Fatal("seed space 2")
+	}
+	vis, restoreVis := visRecorder()
+	defer restoreVis()
+	closed := []uint32{}
+	prevClose := closeWin
+	closeWin = func(id uint32) int64 { closed = append(closed, id); return 0 }
+	defer func() { closeWin = prevClose }()
+
+	pills, n := spacePillRects(vi.ScanoutWidth, RailHeight)
+	if n != 2 {
+		t.Fatalf("pills=%d want 2", n)
+	}
+	// Pill 2's centre sits inside the last cell's close zone at this
+	// geometry (the pill ends 4 px short of the edge) — the overlap is
+	// the point: the pill wins because it is painted on top.
+	cx := uint32(pills[1].X + pills[1].W/2)
+	cy := uint32(pills[1].Y + pills[1].H/2)
+	handleWmPointer(ptrEvent(cx, cy, hidBtnLeft))
+	if railDragFrom != -1 {
+		t.Fatalf("a pill press armed a rail drag: %d", railDragFrom)
+	}
+	handleWmPointer(ptrEvent(cx, cy, 0))
+	if spaceCur != 1 || tabs.Count() != 1 || tabs.At(0).ID != 9 {
+		t.Fatalf("pill click: cur=%d live n=%d", spaceCur, tabs.Count())
+	}
+	if spaces[0].Strip.Count() != 2 {
+		t.Fatal("the outgoing strip did not park")
+	}
+	if len(*vis) != 3 || (*vis)[0] != [2]uint32{3, 0} || (*vis)[1] != [2]uint32{4, 0} ||
+		(*vis)[2] != [2]uint32{9, 1} {
+		t.Fatalf("switch visibility calls: %v", *vis)
+	}
+	if len(closed) != 0 {
+		t.Fatalf("the pill's close-zone overlap closed %v", closed)
+	}
+	if id, _ := tabs.Focused(); id != 9 {
+		t.Fatalf("landed focus %d want the space's recorded focus 9", id)
+	}
+	// The live space's own pill: the press is still consumed (no drag,
+	// no close, no content forward) and the switch refuses — cur holds.
+	handleWmPointer(ptrEvent(cx, cy, hidBtnLeft))
+	handleWmPointer(ptrEvent(cx, cy, 0))
+	if spaceCur != 1 {
+		t.Fatalf("live-pill click switched to %d", spaceCur)
+	}
+	if railDragFrom != -1 || len(closed) != 0 {
+		t.Fatalf("live-pill click leaked: drag=%d closed=%v", railDragFrom, closed)
 	}
 }

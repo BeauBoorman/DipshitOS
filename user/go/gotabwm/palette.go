@@ -72,6 +72,10 @@ const (
 	// focused tab holds a leaf and nothing is zoomed, "Restore panes"
 	// while one is. action names which apply runs.
 	palPane
+	// palSwitch (M151b #2913): "Switch to space <name>" — one row per
+	// dormant space, the rail pill's keyboard path. arg carries the
+	// space name; no tab id (a switch needs no focused tab).
+	palSwitch
 )
 
 // paletteEntry is one result row. label is the painted text and the primary
@@ -148,6 +152,7 @@ func paletteSources() []paletteEntry {
 		})
 	}
 	out = appendSpaceRows(out)
+	out = appendSpaceSwitchRows(out)
 	out = appendPaneRows(out)
 	out = appendRecentRows(out)
 	out = appendSettingsRows(out)
@@ -201,6 +206,27 @@ func appendSpaceRows(out []paletteEntry) []paletteEntry {
 			detail: "space " + name,
 			id:     fid,
 			arg:    name,
+		})
+	}
+	return out
+}
+
+// appendSpaceSwitchRows offers the M151b direct jump: "Switch to space
+// <name>", one row per dormant space — the rail pill's keyboard path.
+// Unlike the move rows this needs no focused tab (an empty strip still
+// switches), and the live space gets no row — switching to it would
+// refuse, and the palette never offers a dead verb.
+func appendSpaceSwitchRows(out []paletteEntry) []paletteEntry {
+	for si := 0; si < spaceN; si++ {
+		if si == spaceCur {
+			continue
+		}
+		out = append(out, paletteEntry{
+			kind:   palSwitch,
+			label:  "Switch to space " + spaces[si].Name,
+			alt:    "space " + spaces[si].Name,
+			detail: "space " + spaces[si].Name,
+			arg:    spaces[si].Name,
 		})
 	}
 	return out
@@ -424,6 +450,16 @@ func paletteExecSelected() {
 		}
 		vi.ConsoleLine(MarkerPaletteRun + "move-to-space " + e.arg)
 		_ = applySpaceMove(e.id, e.arg)
+		return
+	case palSwitch:
+		// M151b: like palSpace — the row closes the palette first; the
+		// switch re-lays the whole desktop, not under the modal strip.
+		launch.launching = true
+		if releaseLauncherFocus(false) {
+			finishLauncher()
+		}
+		vi.ConsoleLine(MarkerPaletteRun + "switch-to-space " + e.arg)
+		_ = spaceSwitchTo(spaceIndexByName(e.arg))
 		return
 	case palChord:
 		// A seat row dispatches its own action with the palette already
