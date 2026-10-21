@@ -163,6 +163,13 @@ func (e *DigitEntry) String() string { return string(e.digits) }
 // what the field holds rather than a second check.
 const timerEntryDigits = 5
 
+// timerPresets is the preset row (M152b, #2916): one digit key picks an
+// index and arms that many seconds immediately — 1, 3, 5, 10 or 25
+// minutes. The custom-seconds entry survives behind 'e'.
+var timerPresets = [5]int64{60, 180, 300, 600, 1500}
+
+var timerPresetLabels = [5]string{"1m", "3m", "5m", "10m", "25m"}
+
 // --- alarm -------------------------------------------------------------------
 
 // alarmAt computes the next epoch at which the civil time in zone z reads
@@ -191,37 +198,187 @@ func parseHHMM(v int) (h, m int, ok bool) {
 	return h, m, true
 }
 
-// --- persisted alarm ---------------------------------------------------------
+// --- alarms ------------------------------------------------------------------
 //
-// M144b (#2795): the armed daily alarm survives the app. ONE record —
-// `gocal1 <at> <hhmm>` — rides both carriers: the app's own share file
-// (crash-safe through vi.WriteFileSafe) and the seat's save_state blob.
+// M152b (#2916): the tab is a list, not a single daily slot — up to
+// MaxAlarms entries, each once or daily, each armed or switched off. The
+// cap leaves the multiplexer's remaining slot for the countdown timer
+// (face + timer + seven alarms = MaxDeadlines).
+const MaxAlarms = 7
+
+// dailyRepeat is the re-arm floor for a daily alarm: 86400 keeps a fire
+// from ever ringing twice inside one day.
+const dailyRepeat = 86400
+
+// Alarm is one row of the Alarm tab.
+//
+//	At       wall-clock epoch of the next occurrence (the armed instant).
+//	HHMM     the civil field the user typed — the face and the markers
+//	         speak it.
+//	Daily    re-arms every 86400 s; false is one-shot.
+//	Enabled  false keeps the row but drops the deadline (the toggle).
+type Alarm struct {
+	At      int64
+	HHMM    int
+	Daily   bool
+	Enabled bool
+}
+
+// alarmIndex parses the deadline id of list row i ("alarm<i>") back into
+// i — false for any other id (the timer's, the face's).
+func alarmIndex(id string) (int, bool) {
+	if len(id) <= 5 || id[:5] != "alarm" {
+		return 0, false
+	}
+	n := 0
+	for i := 5; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(id[i]-'0')
+	}
+	return n, true
+}
+
+// --- persisted alarms --------------------------------------------------------
+//
+// M144b (#2795) persisted the ONE armed daily alarm as `gocal1 <at>
+// <hhmm>` on both carriers — the app's crash-safe share file and the
+// seat's save_state blob. M152b (#2916) extends the record to the whole
+// list: `gocal2 <n>` followed by n triples of `<at> <hhmm> <flags>`,
+// where flags is `d` (daily) or `o` (once) plus `+` (enabled) or `-`
+// (switched off):
+//
+//	gocal2 2 1792502700 0645 d+ 1792522800 1920 o-
+//
 // `at` is the armed instant as a wall-clock epoch so a start after the
 // deadline can tell "still ahead" from "came due while we were off";
-// `hhmm` is the civil field the user typed — the marker and the face
-// speak it.
+// `hhmm` is the civil field the user typed. A `gocal1` record still
+// reads — it decodes as the single daily enabled alarm it always was.
 
 // alarmMagic versions the record: a blob or file whose framing does not
 // match is refused whole, never guessed at.
 const alarmMagic = "gocal1 "
+
+const alarmListMagic = "gocal2 "
 
 // hhmmString renders h:m as the typed four-digit field.
 func hhmmString(h, m int) string {
 	return two(int64(h)) + two(int64(m))
 }
 
-// encodeAlarm renders the persisted record.
-func encodeAlarm(at int64, hhmm int) []byte {
-	h, m, ok := parseHHMM(hhmm)
-	if !ok || at < 0 {
+// encodeAlarms renders the gocal2 list. A list past MaxAlarms is refused
+// — the bound is the contract, never truncated silently.
+func encodeAlarms(list []Alarm) []byte {
+	if len(list) > MaxAlarms {
 		return nil
 	}
-	return []byte(alarmMagic + itoa(at) + " " + hhmmString(h, m))
+	s := alarmListMagic + itoa(int64(len(list)))
+	for _, al := range list {
+		h, m, ok := parseHHMM(al.HHMM)
+		if !ok || al.At < 0 {
+			return nil
+		}
+		f := "o"
+		if al.Daily {
+			f = "d"
+		}
+		if al.Enabled {
+			f += "+"
+		} else {
+			f += "-"
+		}
+		s += " " + itoa(al.At) + " " + hhmmString(h, m) + " " + f
+	}
+	return []byte(s)
 }
 
-// decodeAlarm is the total inverse: anything that is not exactly
-// `gocal1 <digits> <HHMM>` refuses (ok=false) rather than trusting a
-// torn or foreign record.
+// decodeAlarms reads either framing: the gocal2 list, or the gocal1
+// single-record it supersedes (which decodes as one daily enabled
+// alarm). Anything else refuses whole — torn writes and foreign blobs
+// are "no state", never a guess.
+func decodeAlarms(b []byte) ([]Alarm, bool) {
+	s := string(b)
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		s = s[:len(s)-1]
+	}
+	if len(s) > len(alarmListMagic) && s[:len(alarmListMagic)] == alarmListMagic {
+		return decodeGocal2(s[len(alarmListMagic):])
+	}
+	if at, hhmm, ok := decodeAlarm([]byte(s)); ok {
+		return []Alarm{{At: at, HHMM: hhmm, Daily: true, Enabled: true}}, true
+	}
+	return nil, false
+}
+
+// decodeGocal2 parses `<n> <at> <hhmm> <flags>…`: n decimal triples,
+// each a non-negative epoch, a valid HHMM field and the two-letter
+// flag pair. A count that does not match the token count — or n past
+// MaxAlarms — is a foreign record and refuses.
+func decodeGocal2(rest string) ([]Alarm, bool) {
+	var toks []string
+	start := 0
+	for i := 0; i <= len(rest); i++ {
+		if i == len(rest) || rest[i] == ' ' {
+			toks = append(toks, rest[start:i])
+			start = i + 1
+		}
+	}
+	n, ok := atoiField(toks[0])
+	if !ok || n > int64(MaxAlarms) || len(toks) != 1+3*int(n) {
+		return nil, false
+	}
+	list := make([]Alarm, 0, n)
+	for i := 0; i < int(n); i++ {
+		at, ok1 := atoiField(toks[1+3*i])
+		hhmm, ok2 := atoiField(toks[2+3*i])
+		f := toks[3+3*i]
+		if !ok1 || !ok2 || len(f) != 2 {
+			return nil, false
+		}
+		if _, _, ok3 := parseHHMM(int(hhmm)); !ok3 {
+			return nil, false
+		}
+		var al Alarm
+		switch f[0] {
+		case 'd':
+			al.Daily = true
+		case 'o':
+		default:
+			return nil, false
+		}
+		switch f[1] {
+		case '+':
+			al.Enabled = true
+		case '-':
+		default:
+			return nil, false
+		}
+		al.At, al.HHMM = at, int(hhmm)
+		list = append(list, al)
+	}
+	return list, true
+}
+
+// atoiField is the strict unsigned-decimal parse the records want:
+// non-empty, all digits, no sign.
+func atoiField(s string) (int64, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	var v int64
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		v = v*10 + int64(s[i]-'0')
+	}
+	return v, true
+}
+
+// decodeAlarm is the total inverse of the gocal1 record: anything that
+// is not exactly `gocal1 <digits> <HHMM>` refuses (ok=false) rather than
+// trusting a torn or foreign record.
 func decodeAlarm(b []byte) (at int64, hhmm int, ok bool) {
 	s := string(b)
 	if len(b) > 0 && b[len(b)-1] == '\n' {

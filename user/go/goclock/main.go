@@ -1,6 +1,9 @@
 // Command goclock is GOCLOCK.ELF — M144a (#2794): the Clock app, four tabs
 // (World, Stopwatch, Timer, Alarm) full-viewport inside the Go tabbed
-// desktop via user/go/tabapp.
+// desktop via user/go/tabapp. M152b (#2916): the Alarm tab is a list of
+// up to seven alarms (each once or daily, each toggled on/off) and the
+// Timer tab carries a preset row — one digit key arms 1/3/5/10/25
+// minutes immediately.
 //
 // Time source split: the faces and every deadline compare in wall-clock
 // seconds (vi.Now's epoch, formatted by clockfmt) while the stopwatch
@@ -8,15 +11,17 @@
 // calendar, never a measurement.
 //
 // ONE scheduler (sched.go) multiplexes every deadline — the world face's
-// 1 Hz repaint, the countdown, the daily alarm — onto the process's
+// 1 Hz repaint, the countdown, the alarm rows — onto the process's
 // single kernel app timer (sys_timer_set / EvTimer kind 9, re-armed after
 // each fire: the kernel timer is one-shot). A fired user deadline raises
-// a seat toast through vi.Notify and prints `goclock: fired <id>`; an
-// alarm repeats daily at most.
+// a seat toast through vi.Notify and prints `goclock: fired <id>`; a
+// daily alarm re-arms 86400 s out, a once alarm switches its row off.
 //
 // Input: Left/Right/Tab or a strip click switches tabs; Space/'s' and 'r'
-// drive the stopwatch; digits + Return arm and 'x' cancels on the Timer
-// and Alarm tabs.
+// drive the stopwatch; on the Timer tab digits 1–5 arm presets, 'e'
+// opens the custom-seconds entry and 'x' cancels; on the Alarm tab four
+// digits + Return add a daily alarm ('o' a once), Up/Down pick a row,
+// Space toggles it and 'x' deletes it.
 //
 // Every marker is printed only AFTER the call it reports returned, so the
 // go-clock VZ gate's asserts cannot pass on an app that did not do the
@@ -62,7 +67,9 @@ const (
 	markerTCancel  = "goclock: timer cancel"
 	markerTRefuse  = "goclock: timer refused"
 	markerAArm     = "goclock: alarm armed "
-	markerACancel  = "goclock: alarm cancel"
+	markerADel     = "goclock: alarm deleted "
+	markerAToggle  = "goclock: alarm toggled "
+	markerAFull    = "goclock: alarm full"
 	markerARefuse  = "goclock: alarm refused"
 	markerARestore = "goclock: alarm restored "
 	markerASaved   = "goclock: alarm saved"
@@ -81,14 +88,17 @@ const (
 	keyTab    = 0x2b
 	keyRight  = 0x4f
 	keyLeft   = 0x50
+	keyDown   = 0x51
+	keyUp     = 0x52
 
 	// faceDeadline is the 1 Hz repaint entry — a Quiet deadline, so the
 	// second hand's cadence never raises a toast or a `fired` marker.
 	faceDeadline = "face"
 
-	// alarmPath is the persisted record's share file. The save_state blob
+	// alarmPath is the persisted list's share file. The save_state blob
 	// carries the same bytes; the file is the always-current half — it is
-	// rewritten on every arm/cancel while the blob is a snapshot capture.
+	// rewritten on every list mutation while the blob is a snapshot
+	// capture.
 	alarmPath = "/host/GOCLOCK.ALARM"
 )
 
@@ -125,6 +135,19 @@ func worldRowR(i int) widgets.Rect {
 	return widgets.Rect{X: 16, Y: 56 + i*20, W: 608, H: 18}
 }
 
+// presetR returns the i-th preset button on the Timer tab — five cells
+// share the typed-field row's band while the picker (not the editor) is
+// showing.
+func presetR(i int) widgets.Rect {
+	return widgets.Rect{X: 16 + i*122, Y: 104, W: 116, H: 24}
+}
+
+// alarmRowR returns the i-th Alarm list row's plate: seven rows fit the
+// band under the buttons.
+func alarmRowR(i int) widgets.Rect {
+	return widgets.Rect{X: 16, Y: 200 + i*18, W: 608, H: 16}
+}
+
 func stripCell(i int) widgets.Rect {
 	return widgets.Rect{X: stripR.X + i*stripR.W/tabCount, Y: stripR.Y, W: stripR.W / tabCount, H: stripR.H}
 }
@@ -154,13 +177,19 @@ type app struct {
 	// restored latches the one-shot restore pass: the kind-21 request runs
 	// once inside the event loop, not from tabapp.Init (see the Config).
 	restored bool
-	// alarmHHMM is the civil field the armed daily alarm was typed as —
-	// the sched deadline knows only the epoch; the record needs both.
-	alarmHHMM int
 
-	buttons      [2]widgets.Button
-	paintedEpoch int64
-	ktArmed      bool
+	// alarms is the Alarm tab's row list (≤ MaxAlarms); alarmSel is the
+	// picked row (-1 while the list is empty). timerEdit selects the
+	// Timer tab's input surface: false is the preset row, true the
+	// custom-seconds entry.
+	alarms    []Alarm
+	alarmSel  int
+	timerEdit bool
+
+	buttons       [2]widgets.Button
+	presetButtons [5]widgets.Button
+	paintedEpoch  int64
+	ktArmed       bool
 }
 
 func (a *app) entryFor(tab int) *DigitEntry { return &a.entry[tab-tabTimer] }
@@ -306,17 +335,23 @@ func (a *app) armTimer() {
 }
 
 // onTimer is the EvTimer fan-out: fire the due deadlines (marker + toast
-// for the user-facing ones), then repaint and re-arm.
+// for the user-facing ones), then repaint and re-arm. A fired once-alarm
+// switches its row off and the mutation is persisted like any other.
 func (a *app) onTimer() {
 	now := a.now()
+	firedOff := false
 	for _, d := range a.sched.Fire(now) {
 		if d.Quiet {
 			continue
 		}
 		vi.ConsoleLine(markerFired + d.ID)
+		firedOff = a.markFiredAlarm(d.ID) || firedOff
 		if !a.ta.Notify(d.ID + " done") {
 			vi.ConsoleLine(markerNotifyNo + d.ID)
 		}
+	}
+	if firedOff {
+		a.persistAlarms()
 	}
 	a.armTimer()
 	a.dirty = true
@@ -352,8 +387,26 @@ func (a *app) key(ev vi.Event) bool {
 		return a.setTab((a.tab + tabCount - 1) % tabCount)
 	case keyRight, keyTab:
 		return a.setTab((a.tab + 1) % tabCount)
+	case keyUp:
+		if a.tab == tabAlarm && a.alarmSel > 0 {
+			a.alarmSel--
+			return true
+		}
+		return false
+	case keyDown:
+		if a.tab == tabAlarm && a.alarmSel < len(a.alarms)-1 {
+			a.alarmSel++
+			return true
+		}
+		return false
+	case keyEscape:
+		if a.tab == tabTimer && a.timerEdit {
+			a.timerEdit = false
+			return true
+		}
+		return false
 	case keyBacksp:
-		if a.tab >= tabTimer {
+		if a.tab == tabAlarm || (a.tab == tabTimer && a.timerEdit) {
 			return a.entryFor(a.tab).Backspace()
 		}
 		return false
@@ -362,7 +415,7 @@ func (a *app) key(ev vi.Event) bool {
 		case tabTimer:
 			return a.armCountdown()
 		case tabAlarm:
-			return a.armAlarm()
+			return a.addAlarm(true)
 		}
 		return false
 	}
@@ -383,13 +436,42 @@ func (a *app) key(ev vi.Event) bool {
 			vi.ConsoleLine(markerSwReset)
 			return true
 		}
-	case tabTimer, tabAlarm:
-		if ch >= '0' && ch <= '9' {
-			return a.entryFor(a.tab).Digit(int(ch - '0'))
+	case tabTimer:
+		if a.timerEdit {
+			if ch >= '0' && ch <= '9' {
+				return a.entryFor(tabTimer).Digit(int(ch - '0'))
+			}
+		} else {
+			if ch >= '1' && ch <= '5' {
+				return a.armPreset(int(ch - '1'))
+			}
+			// A digit outside the preset row opens the editor with it —
+			// typing "90" never needed a mode key first.
+			if ch == '0' || (ch >= '6' && ch <= '9') {
+				a.timerEdit = true
+				a.entryFor(tabTimer).Digit(int(ch - '0'))
+				return true
+			}
+			if ch == 'e' || ch == 'E' {
+				a.timerEdit = true
+				return true
+			}
 		}
 		switch ch {
 		case 'x', 'X':
 			return a.cancelTab()
+		}
+	case tabAlarm:
+		if ch >= '0' && ch <= '9' {
+			return a.entryFor(tabAlarm).Digit(int(ch - '0'))
+		}
+		switch ch {
+		case 'o', 'O':
+			return a.addAlarm(false)
+		case 'x', 'X':
+			return a.deleteAlarm()
+		case ' ', 't', 'T':
+			return a.toggleAlarm()
 		}
 	}
 	return false
@@ -421,6 +503,13 @@ func (a *app) click(x, y int) bool {
 			return true
 		}
 	case tabTimer:
+		if !a.timerEdit {
+			for i := 0; i < len(timerPresets); i++ {
+				if a.presetButtons[i].HitTest(x, y) {
+					return a.armPreset(i)
+				}
+			}
+		}
 		if a.buttons[0].HitTest(x, y) {
 			return a.armCountdown()
 		}
@@ -428,11 +517,17 @@ func (a *app) click(x, y int) bool {
 			return a.cancelTab()
 		}
 	case tabAlarm:
+		for i := range a.alarms {
+			if alarmRowR(i).Contains(x, y) {
+				a.alarmSel = i
+				return true
+			}
+		}
 		if a.buttons[0].HitTest(x, y) {
-			return a.armAlarm()
+			return a.addAlarm(true)
 		}
 		if a.buttons[1].HitTest(x, y) {
-			return a.cancelTab()
+			return a.addAlarm(false)
 		}
 	}
 	return false
@@ -456,8 +551,20 @@ func (a *app) armCountdown() bool {
 		vi.ConsoleLine(markerTRefuse)
 		return false
 	}
-	secs := int64(e.Value())
-	if !a.sched.Add(Deadline{ID: "timer", At: now + secs}) {
+	return a.armTimerSecs(int64(e.Value()))
+}
+
+// armPreset arms the countdown from the preset row — one key, no entry.
+func (a *app) armPreset(i int) bool {
+	if i < 0 || i >= len(timerPresets) || a.now() < 0 {
+		vi.ConsoleLine(markerTRefuse)
+		return false
+	}
+	return a.armTimerSecs(timerPresets[i])
+}
+
+func (a *app) armTimerSecs(secs int64) bool {
+	if !a.sched.Add(Deadline{ID: "timer", At: a.now() + secs}) {
 		vi.ConsoleLine(markerDFull)
 		return false
 	}
@@ -466,7 +573,27 @@ func (a *app) armCountdown() bool {
 	return true
 }
 
-func (a *app) armAlarm() bool {
+// --- alarm list (M152b, #2916) ------------------------------------------------
+//
+// The Alarm tab is a bounded row list: four digits + Return adds a daily
+// alarm, 'o' adds a once, Up/Down (or a row click) picks a row, Space/'t'
+// toggles it between armed and off, 'x' deletes it. Deadline ids are the
+// row index ("alarm3"); every mutation re-syncs the scheduler from the
+// list so index shifts can never strand a deadline under the wrong id.
+
+// alarmMode renders the record's repeat field for the markers.
+func alarmMode(daily bool) string {
+	if daily {
+		return "daily"
+	}
+	return "once"
+}
+
+// alarmID is the deadline id of row i.
+func alarmID(i int) string { return "alarm" + itoa(int64(i)) }
+
+// addAlarm appends the typed HHMM as a new armed row.
+func (a *app) addAlarm(daily bool) bool {
 	e := a.entryFor(tabAlarm)
 	h, m, ok := parseHHMM(e.Value())
 	now := a.now()
@@ -474,95 +601,151 @@ func (a *app) armAlarm() bool {
 		vi.ConsoleLine(markerARefuse)
 		return false
 	}
-	at := alarmAt(now, a.local, h, m)
-	// Repeats daily at most: 86400 is the floor for a re-armed alarm, so a
-	// fire can never wake the user twice inside one day.
-	if !a.sched.Add(Deadline{ID: "alarm", At: at, Repeat: 86400}) {
-		vi.ConsoleLine(markerDFull)
+	if len(a.alarms) >= MaxAlarms {
+		vi.ConsoleLine(markerAFull)
 		return false
 	}
-	vi.ConsoleLine(markerAArm + two(int64(h)) + ":" + two(int64(m)))
-	a.alarmHHMM = h*100 + m
-	a.persistAlarm(at, a.alarmHHMM)
+	a.alarms = append(a.alarms, Alarm{
+		At:      alarmAt(now, a.local, h, m),
+		HHMM:    e.Value(),
+		Daily:   daily,
+		Enabled: true,
+	})
+	a.alarmSel = len(a.alarms) - 1
+	e.Clear()
+	vi.ConsoleLine(markerAArm + two(int64(h)) + ":" + two(int64(m)) + " " + alarmMode(daily))
+	a.syncAlarms()
+	a.persistAlarms()
 	a.armTimer()
+	return true
+}
+
+// deleteAlarm removes the picked row, deadline included.
+func (a *app) deleteAlarm() bool {
+	if a.alarmSel < 0 || a.alarmSel >= len(a.alarms) {
+		return false
+	}
+	h, m, _ := parseHHMM(a.alarms[a.alarmSel].HHMM)
+	a.alarms = append(a.alarms[:a.alarmSel], a.alarms[a.alarmSel+1:]...)
+	if a.alarmSel >= len(a.alarms) {
+		a.alarmSel = len(a.alarms) - 1
+	}
+	vi.ConsoleLine(markerADel + two(int64(h)) + ":" + two(int64(m)))
+	a.syncAlarms()
+	a.persistAlarms()
+	a.armTimer()
+	return true
+}
+
+// toggleAlarm switches the picked row between armed and off. A row
+// re-enabled after its instant passed is re-anchored to the next
+// occurrence — the toggle is a fresh arm, not a catch-up (restore's
+// late-fire path is the only one that lets a stored `at` stand).
+func (a *app) toggleAlarm() bool {
+	if a.alarmSel < 0 || a.alarmSel >= len(a.alarms) {
+		return false
+	}
+	al := &a.alarms[a.alarmSel]
+	h, m, _ := parseHHMM(al.HHMM)
+	al.Enabled = !al.Enabled
+	state := "off"
+	if al.Enabled {
+		state = "on"
+		al.At = alarmAt(a.now(), a.local, h, m)
+	}
+	vi.ConsoleLine(markerAToggle + two(int64(h)) + ":" + two(int64(m)) + " " + state)
+	a.syncAlarms()
+	a.persistAlarms()
+	a.armTimer()
+	return true
+}
+
+// syncAlarms rebuilds the alarm deadlines from the list: every alarm id
+// is cancelled first, then each enabled row is re-added under its index
+// id (daily rows with the 86400 re-arm floor).
+func (a *app) syncAlarms() {
+	for i := 0; i < MaxAlarms; i++ {
+		a.sched.Cancel(alarmID(i))
+	}
+	for i, al := range a.alarms {
+		if !al.Enabled {
+			continue
+		}
+		var rep int64
+		if al.Daily {
+			rep = dailyRepeat
+		}
+		if !a.sched.Add(Deadline{ID: alarmID(i), At: al.At, Repeat: rep}) {
+			vi.ConsoleLine(markerDFull)
+		}
+	}
+}
+
+// markFiredAlarm flips a fired once-alarm's row off — the deadline is
+// already gone (one-shots never re-arm) so only the record and the
+// persisted list change. Returns true when a row was switched off.
+func (a *app) markFiredAlarm(id string) bool {
+	i, ok := alarmIndex(id)
+	if !ok || i >= len(a.alarms) || a.alarms[i].Daily || !a.alarms[i].Enabled {
+		return false
+	}
+	a.alarms[i].Enabled = false
 	return true
 }
 
 func (a *app) cancelTab() bool {
-	var id string
-	if a.tab == tabTimer {
-		id = "timer"
-	} else if a.tab == tabAlarm {
-		id = "alarm"
-	}
-	if id == "" || !a.sched.Cancel(id) {
+	if a.tab != tabTimer || !a.sched.Cancel("timer") {
 		return false
 	}
-	if a.tab == tabTimer {
-		vi.ConsoleLine(markerTCancel)
-	} else {
-		vi.ConsoleLine(markerACancel)
-		a.alarmHHMM = 0
-		a.unpersistAlarm()
-	}
+	vi.ConsoleLine(markerTCancel)
 	a.armTimer()
 	return true
 }
 
-// --- alarm persistence (M144b, #2795) ------------------------------------------
+// --- alarm persistence (M144b #2795, list format M152b #2916) ------------------
 //
-// The armed daily alarm survives the app through two carriers that share one
-// record (`gocal1 <at> <hhmm>`, model.go):
+// The alarm list survives the app through two carriers that share one
+// record (`gocal2`, model.go — `gocal1` still reads):
 //
-//   - the share file at alarmPath, rewritten crash-safe on every arm and
-//     deleted on cancel — it is the always-current half and survives any
-//     reboot the share survives;
+//   - the share file at alarmPath, rewritten crash-safe on every list
+//     mutation and deleted when the last row goes — it is the
+//     always-current half and survives any reboot the share survives;
 //   - the seat's save_state/restore_state blob (SESSION.TABS trailer),
-//     pushed on arm/cancel and answered on the snapshot/close asks — it is
-//     a capture of whatever was stored when the seat asked.
+//     pushed on every mutation and answered on the snapshot/close asks —
+//     it is a capture of whatever was stored when the seat asked.
 //
 // At start the file wins when both decode: it tracks mutations the snapshot
-// predates. A record whose `at` is already past fires once immediately,
-// marked late — that is what "the alarm came due while the machine was
-// suspended or rebooted" looks like from the app's side. The daily repeater
-// re-arms at the next future occurrence, so the late fire never costs the
-// user tomorrow's alarm.
+// predates. An enabled record whose `at` is already past fires once
+// immediately, marked late — that is what "the alarm came due while the
+// machine was suspended or rebooted" looks like from the app's side. The
+// daily repeater re-arms at the next future occurrence, so the late fire
+// never costs the user tomorrow's alarm; a late once-alarm fires once and
+// lands back on the list switched off.
 
-// saveBlob is the tabapp.SaveState hook: the current record, or nil when no
-// alarm is armed (an empty answer is "no state", never a fabricated one).
+// saveBlob is the tabapp.SaveState hook: the current list, or nil when it
+// is empty (an empty answer is "no state", never a fabricated one).
 func (a *app) saveBlob() []byte {
-	for _, d := range a.sched.ds {
-		if d.ID == "alarm" {
-			return encodeAlarm(d.At, a.alarmHHMM)
+	if len(a.alarms) == 0 {
+		return nil
+	}
+	return encodeAlarms(a.alarms)
+}
+
+// persistAlarms publishes the list through both carriers — the file
+// first (the durable half), then the unsolicited state push so the
+// seat's stored blob is already current if a crash lands before the
+// next ask. An empty list erases both sides.
+func (a *app) persistAlarms() {
+	if len(a.alarms) == 0 {
+		if rc := alarmFileDel(alarmPath); rc != 0 && rc != vi.ErrFileNotFound {
+			vi.ConsoleLine(markerASaveBad + vi.Itoa64(rc))
 		}
-	}
-	return nil
-}
-
-// persistAlarm publishes the armed record through both carriers — the file
-// first (the durable half), then the unsolicited state push so the seat's
-// stored blob is already current if a crash lands before the next ask.
-func (a *app) persistAlarm(at int64, hhmm int) {
-	b := encodeAlarm(at, hhmm)
-	if b == nil {
-		return
-	}
-	if rc := alarmFileWrite(alarmPath, b); rc != 0 {
-		vi.ConsoleLine(markerASaveBad + vi.Itoa64(rc))
-		return
-	}
-	vi.ConsoleLine(markerASaved)
-	if a.ta != nil && a.ta.SaveStateNow() {
-		vi.ConsoleLine(markerStPosted)
-	}
-}
-
-// unpersistAlarm clears both carriers: the file goes away and the pushed
-// empty blob erases the seat's stored record, so a cancelled alarm cannot
-// be revived by a later restore.
-func (a *app) unpersistAlarm() {
-	if rc := alarmFileDel(alarmPath); rc != 0 && rc != vi.ErrFileNotFound {
-		vi.ConsoleLine(markerASaveBad + vi.Itoa64(rc))
+	} else if b := encodeAlarms(a.alarms); b != nil {
+		if rc := alarmFileWrite(alarmPath, b); rc != 0 {
+			vi.ConsoleLine(markerASaveBad + vi.Itoa64(rc))
+		} else {
+			vi.ConsoleLine(markerASaved)
+		}
 	}
 	if a.ta != nil && a.ta.SaveStateNow() {
 		vi.ConsoleLine(markerStPosted)
@@ -577,22 +760,21 @@ func (a *app) unpersistAlarm() {
 // order: the channel verdict prints before the arm, the arm before any
 // late fire.
 func (a *app) applyPersistedAlarm() {
-	var at int64
-	var hhmmi int
+	var list []Alarm
 	found := false
 	if ver, blob, ok := vi.RequestStateRestore(uint32(a.ta.Win), appName); ok {
-		if bat, bhhmm, bok := decodeAlarm(blob); bok && ver == 1 {
+		if bl, bok := decodeAlarms(blob); bok && ver == 1 {
 			vi.ConsoleLine(markerStRest)
-			at, hhmmi, found = bat, bhhmm, true
+			list, found = bl, true
 		} else {
 			vi.ConsoleLine(markerStRefuse)
 		}
 	}
 	// The file is fresher-or-equal to any snapshot capture: it is rewritten
-	// on every mutation, so when both decode the file's record stands.
-	if raw, r := alarmFileRead(alarmPath, 128); r >= 0 {
-		if fat, fhhmm, fok := decodeAlarm(raw); fok {
-			at, hhmmi, found = fat, fhhmm, true
+	// on every mutation, so when both decode the file's list stands.
+	if raw, r := alarmFileRead(alarmPath, 256); r >= 0 {
+		if fl, fok := decodeAlarms(raw); fok {
+			list, found = fl, true
 		} else {
 			vi.ConsoleLine(markerAFileBad)
 		}
@@ -600,24 +782,35 @@ func (a *app) applyPersistedAlarm() {
 	if !found {
 		return
 	}
-	h, m, _ := parseHHMM(hhmmi)
-	vi.ConsoleLine(markerARestore + two(int64(h)) + ":" + two(int64(m)))
-	if !a.sched.Add(Deadline{ID: "alarm", At: at, Repeat: 86400}) {
-		vi.ConsoleLine(markerDFull)
-		return
+	a.alarms = list
+	a.alarmSel = len(list) - 1
+	for _, al := range a.alarms {
+		h, m, _ := parseHHMM(al.HHMM)
+		state := ""
+		if !al.Enabled {
+			state = " off"
+		}
+		vi.ConsoleLine(markerARestore + two(int64(h)) + ":" + two(int64(m)) + " " + alarmMode(al.Daily) + state)
 	}
-	a.alarmHHMM = hhmmi
+	a.syncAlarms()
+	a.armTimer()
 	// A deadline that came due while the app was off fires once now, marked
-	// late — the repeat re-arm lands on the next future occurrence, exactly
-	// the catch-up sched.Fire already performs.
+	// late — the daily repeater's re-arm lands on the next future
+	// occurrence, exactly the catch-up sched.Fire already performs; a once
+	// alarm that fires here lands back on the list switched off.
+	firedOff := false
 	for _, d := range a.sched.Fire(a.now()) {
 		if d.Quiet {
 			continue
 		}
 		vi.ConsoleLine(markerFired + d.ID + " late")
+		firedOff = a.markFiredAlarm(d.ID) || firedOff
 		if !a.ta.Notify(d.ID + " done") {
 			vi.ConsoleLine(markerNotifyNo + d.ID)
 		}
+	}
+	if firedOff {
+		a.persistAlarms()
 	}
 	a.dirty = true
 }
@@ -739,24 +932,47 @@ func (a *app) paintTimer(cv widgets.Canvas) {
 	disp := "timer"
 	if r := a.remaining("timer"); r >= 0 {
 		disp = itoa(r) + "s left"
-	} else if !e.Empty() {
+	} else if a.timerEdit && !e.Empty() {
 		disp = e.String() + "s"
 	}
 	drawText(cv, displayR, disp, th.Ink, th.Surface)
-	drawText(cv, entryR, "seconds: "+e.String(), th.Ink, th.Surface)
-	drawText(cv, hintR, "digits seconds - return arms - x cancels", th.InkMuted, th.Surface)
+	hint := "1-5 preset min - e custom seconds - x cancels"
+	if a.timerEdit {
+		drawText(cv, entryR, "seconds: "+e.String(), th.Ink, th.Surface)
+		hint = "digits seconds - return arms - esc presets"
+	} else {
+		for i := 0; i < len(timerPresets); i++ {
+			a.presetButtons[i] = widgets.Button{R: presetR(i), Label: timerPresetLabels[i]}
+			a.presetButtons[i].Draw(cv)
+		}
+	}
+	drawText(cv, hintR, hint, th.InkMuted, th.Surface)
 	a.buttons[0] = widgets.Button{R: btnR0, Label: "Arm"}
 	a.buttons[1] = widgets.Button{R: btnR1, Label: "Cancel"}
 	a.buttons[0].Draw(cv)
 	a.buttons[1].Draw(cv)
 }
 
+// nextAlarmRemaining is the seconds-to-go of the earliest enabled row;
+// ok is false when nothing is armed (a past-due row counts as armed —
+// it is about to fire).
+func (a *app) nextAlarmRemaining() (int64, bool) {
+	best := int64(0)
+	found := false
+	for _, al := range a.alarms {
+		if al.Enabled && (!found || al.At < best) {
+			best, found = al.At, true
+		}
+	}
+	return best - a.now(), found
+}
+
 func (a *app) paintAlarm(cv widgets.Canvas) {
 	th := theme.Current
 	e := a.entryFor(tabAlarm)
-	disp := "alarm"
-	if r := a.remaining("alarm"); r >= 0 {
-		disp = "in " + FormatElapsed(r*1_000_000_000)
+	disp := "alarms"
+	if r, ok := a.nextAlarmRemaining(); ok {
+		disp = "next in " + FormatElapsed(r*1_000_000_000)
 	} else if s := e.String(); len(s) > 2 {
 		disp = s[:len(s)-2] + ":" + s[len(s)-2:]
 	} else {
@@ -764,11 +980,29 @@ func (a *app) paintAlarm(cv widgets.Canvas) {
 	}
 	drawText(cv, displayR, disp, th.Ink, th.Surface)
 	drawText(cv, entryR, "HHMM: "+e.String(), th.Ink, th.Surface)
-	drawText(cv, hintR, "4 digits HHMM - return arms daily - x cancels", th.InkMuted, th.Surface)
-	a.buttons[0] = widgets.Button{R: btnR0, Label: "Arm"}
-	a.buttons[1] = widgets.Button{R: btnR1, Label: "Cancel"}
+	drawText(cv, hintR, "4 digits - return daily - o once - up/dn pick - spc toggles - x del", th.InkMuted, th.Surface)
+	a.buttons[0] = widgets.Button{R: btnR0, Label: "Daily"}
+	a.buttons[1] = widgets.Button{R: btnR1, Label: "Once"}
 	a.buttons[0].Draw(cv)
 	a.buttons[1].Draw(cv)
+	for i, al := range a.alarms {
+		h, m, _ := parseHHMM(al.HHMM)
+		state := "on"
+		fg := th.Ink
+		if !al.Enabled {
+			state = "off"
+			fg = th.InkMuted
+		}
+		label := two(int64(h)) + ":" + two(int64(m)) + "  " + alarmMode(al.Daily) + "  " + state
+		bg := th.Surface
+		if i == a.alarmSel {
+			bg = th.Selection
+			if al.Enabled {
+				fg = th.Text
+			}
+		}
+		drawText(cv, alarmRowR(i), label, fg, bg)
+	}
 }
 
 func (a *app) shutdown(status int) {

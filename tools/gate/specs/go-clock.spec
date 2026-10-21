@@ -1,15 +1,16 @@
-# go-clock.spec -- GOCLOCK.ELF (M144a #2794 + M144b #2795) class-B gate:
-# the four-tab clock app (World / Stopwatch / Timer / Alarm) hosted by the
-# live Go seat, with every app deadline multiplexed onto the process's ONE
-# kernel app timer (sys_timer_set / EvTimer kind 9, kernel/src/app_timers.zig),
-# and the armed daily alarm persisting through the seat's save_state blob
-# and its own crash-safe share file.
+# go-clock.spec -- GOCLOCK.ELF (M144a #2794 + M144b #2795 + M152b #2916)
+# class-B gate: the four-tab clock app (World / Stopwatch / Timer / Alarm)
+# hosted by the live Go seat, with every app deadline multiplexed onto the
+# process's ONE kernel app timer (sys_timer_set / EvTimer kind 9,
+# kernel/src/app_timers.zig), and the alarm list persisting through the
+# seat's save_state blob and its own crash-safe share file.
 #
 # user/go/goclock is a tabapp client: init -> declare (kind-8 WM_RPC) ->
 # present -> accept injected keystrokes. Its scheduler (sched.go) arms the
 # kernel timer for the earliest pending deadline and fans each TIMER event
 # out to every due entry; a fired user deadline raises a seat toast
-# (vi.Notify, WM_RPC kind 12) and prints `goclock: fired <id>`.
+# (vi.Notify, WM_RPC kind 12) and prints `goclock: fired <id>` (alarm
+# deadline ids are the row index: alarm0..alarm6).
 #
 # Legs:
 #   run 01  the World tab as PIXELS. The seat hosts the app fullscreen —
@@ -53,7 +54,17 @@
 #   run 06  M144b reboot leg: a hand-staged stale record (`write
 #           GOCLOCK.ALARM gocal1 1 2359`, the monitor's own share write)
 #           re-arms from the file at exec and the overdue deadline fires
-#           once at start, marked late (`goclock: fired alarm late`).
+#           once at start, marked late (`goclock: fired alarm0 late`) —
+#           also the gocal1-still-reads leg.
+#   run 07  M152b arm leg: chords add a daily 06:45 and a once 19:20 row
+#           on the Alarm tab, preset key '1' arms the 60 s countdown on
+#           the Timer tab (`goclock: timer armed 60` -> `goclock: fired
+#           timer`), and ctrl-shift-s snapshots the gocal2 list into
+#           SESSION.TABS + the share file.
+#   run 08  M152b restore leg: a fresh boot's session restore re-execs
+#           GOCLOCK — both rows come back (`goclock: alarm restored
+#           HH:MM daily|once`), the daily one armed to ring again. Tail
+#           cleanup leaves the share empty for the next iteration.
 #
 # HOST PREREQUISITES (the gate fails honestly when missing):
 #   bash tools/go/build-goclock.sh  ->  .build/go/GOCLOCK.ELF
@@ -63,7 +74,7 @@
 # exec-order: assert-proven -- each run ends on a marker only its own
 # stage chain can produce.
 
-vgate_name go-clock "issue #2794 M144a + #2795 M144b: GOCLOCK.ELF — world clock, stopwatch, timer, alarm->toast over one multiplexed kernel timer; alarm persists through save_state + its own share file, late-fire on start"
+vgate_name go-clock "issue #2794 M144a + #2795 M144b + #2916 M152b: GOCLOCK.ELF — world clock, stopwatch, timer, alarm->toast over one multiplexed kernel timer; the gocal2 alarm list (up to 7, once/daily, toggled) persists through save_state + its own share file, gocal1 still reads, late-fire on start"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -310,8 +321,10 @@ print("world face: %d/%d rows glyph-exact at epoch ~%d (%s); row0=%r row1=%r"
 PY
 
 # --- run 02: countdown -> seat toast -> click-through ---------------------
-# Arm a 3-second timer on the Timer tab, blur the app with dui cycle so the
-# click's focus change is a real transition, then press the painted toast.
+# Arm a 3-second timer on the Timer tab ('e' opens the custom-seconds
+# entry — a bare '3' would arm the 3-minute preset), blur the app with
+# dui cycle so the click's focus change is a real transition, then press
+# the painted toast.
 # The click gates on `timer done` — the app's own `notify id=` line: it is
 # printed after the toast is already queued (hit-test scans the queue, not
 # the pixels), and unlike `notify paint id=` it can never match a seat-side
@@ -335,7 +348,7 @@ vgate_run 02 -- \
     --script '$RUN_DIR/script-02.txt' \
     --script2 '$RUN_DIR/script2-02.txt' \
     --script2-after 'gotabwm: mode live' \
-    --input-chords 'right,right,3,return' \
+    --input-chords 'right,right,e,3,return' \
     --input-chords-after 'goclock: painted epoch=' \
     --script3 '$RUN_DIR/script3-02.txt' \
     --script3-after 'goclock: timer armed 3' \
@@ -433,9 +446,10 @@ echo rx-goclock-ok
 EOF
 
 # 'q' is the app's own quit key (Escape is not a gate chord); the run ends
-# on the rx marker after goclock's clean-exit pair prints. 'x' cancels the
-# armed alarm first — with M144b persistence an armed-at-exit alarm would
-# leak a GOCLOCK.ALARM file and an armed state blob into run 04's boot.
+# on the rx marker after goclock's clean-exit pair prints. 'x' deletes the
+# picked alarm row first — with M144b persistence an armed-at-exit alarm
+# would leak a GOCLOCK.ALARM file and an armed state blob into run 04's
+# boot.
 vgate_run 03 -- \
     --screen '$RUN_DIR/screen-03' \
     --via-virtio \
@@ -453,8 +467,8 @@ vgate_assert 03 serial-contains 'goclock: tab stopwatch'
 vgate_assert 03 serial-contains 'goclock: stopwatch start'
 vgate_assert 03 serial-contains 'goclock: tab timer'
 vgate_assert 03 serial-contains 'goclock: tab alarm'
-vgate_assert 03 serial-contains 'goclock: alarm armed 23:59'
-vgate_assert 03 serial-contains 'goclock: alarm cancel'
+vgate_assert 03 serial-contains 'goclock: alarm armed 23:59 daily'
+vgate_assert 03 serial-contains 'goclock: alarm deleted 23:59'
 vgate_assert 03 serial-contains 'goclock: close'
 vgate_assert 03 serial-contains 'goclock OK'
 vgate_assert 03 serial-contains 'rx-goclock-ok'
@@ -496,11 +510,11 @@ vgate_run 04 -- \
 vgate_assert 04 serial-contains 'exec: loaded GOCLOCK.ELF'
 vgate_assert 04 serial-contains 'goclock: declare accepted'
 vgate_assert 04 serial-contains 'goclock: tab alarm'
-vgate_assert 04 serial-contains 'goclock: alarm armed 23:59'
+vgate_assert 04 serial-contains 'goclock: alarm armed 23:59 daily'
 # The record landed crash-safe on the share...
 vgate_assert 04 serial-contains 'goclock: alarm saved'
-vgate_assert 04 share-contains 'GOCLOCK.ALARM' 'gocal1 '
-vgate_assert 04 share-contains 'GOCLOCK.ALARM' ' 2359'
+vgate_assert 04 share-contains 'GOCLOCK.ALARM' 'gocal2 '
+vgate_assert 04 share-contains 'GOCLOCK.ALARM' ' 2359 d+'
 # ...and the unsolicited push kept the seat's stored blob current.
 vgate_assert 04 serial-contains 'goclock: state posted'
 # The snapshot chord asked the bound tab, stored its answer on the tab's
@@ -517,7 +531,7 @@ vgate_assert 04 serial-absent '[EXC] parking:'
 vgate_assert 04 serial-absent 'exited status=139'
 
 # Byte-level on the share (the go-wm-tabs run-12 idiom): the .tabs v2
-# trailer framing and the record — exactly one row's blob IS the gocal1
+# trailer framing and the record — exactly one row's blob IS the gocal2
 # line, byte identity being the card's claim. The row count is not pinned:
 # an earlier leg's unclosed tab can leave a sibling row in the session.
 vgate_assert 04 python <<'PY'
@@ -538,10 +552,10 @@ for i in range(asc):
     ln = int.from_bytes(ent[4:8], "little")
     blob = b[pos:pos+ln]
     pos += ln
-    if re.fullmatch(rb"gocal1 [0-9]+ 2359", blob):
+    if re.fullmatch(rb"gocal2 1 [0-9]+ 2359 d\+", blob):
         hits.append((ent[0], ent[1], blob))
 if len(hits) != 1 or hits[0][1] != 1:
-    sys.exit("want exactly one appver=1 gocal1 blob, found %r" % hits)
+    sys.exit("want exactly one appver=1 gocal2 blob, found %r" % hits)
 print("SESSION.TABS app_state: idx=%d appver=%d blob=%r" % hits[0])
 PY
 
@@ -599,12 +613,12 @@ vgate_assert 05 serial-absent 'exited status=139'
 vgate_assert 05 python <<'PY'
 import os, re, sys
 ser = open(os.environ["VG_SER"], errors="replace").read()
-fires = re.findall(r"^goclock: fired alarm( late)?$", ser, re.M)
+fires = re.findall(r"^goclock: fired alarm\d+( late)?$", ser, re.M)
 n = len(fires)
 if n != 1:
     sys.exit("goclock alarm fired %d times after restore, want exactly 1" % n)
-restored = re.search(r"^goclock: alarm restored 23:59$", ser, re.M)
-fired = re.search(r"^goclock: fired alarm( late)?$", ser, re.M)
+restored = re.search(r"^goclock: alarm restored 23:59", ser, re.M)
+fired = re.search(r"^goclock: fired alarm\d+( late)?$", ser, re.M)
 if not (restored and fired and restored.start() < fired.start()):
     sys.exit("arm/restore must precede the fire")
 print("restore leg: alarm restored 23:59, fired once after the clock step")
@@ -643,7 +657,7 @@ vgate_run 06 -- \
     --script2 '$RUN_DIR/script2-06.txt' \
     --script2-after 'write: ok' \
     --script3 '$RUN_DIR/script3-06.txt' \
-    --script3-after 'goclock: fired alarm late' \
+    --script3-after 'goclock: fired alarm' \
     --script-expect 'rx-goclock-late-ok' --timeout 300
 
 vgate_assert 06 serial-contains 'write: ok (persisted '
@@ -651,14 +665,14 @@ vgate_assert 06 serial-contains 'exec: loaded GOCLOCK.ELF'
 vgate_assert 06 serial-contains 'goclock: declare accepted'
 # Re-armed from the file, then fired once on start — marked late.
 vgate_assert 06 serial-contains 'goclock: alarm restored 23:59'
-vgate_assert 06 serial-contains 'goclock: fired alarm late'
+vgate_assert 06 serial-contains 'goclock: fired alarm0 late'
 vgate_assert 06 python <<'PY'
 import os, re, sys
 ser = open(os.environ["VG_SER"], errors="replace").read()
-if re.search(r"^goclock: fired alarm$", ser, re.M):
+if re.search(r"^goclock: fired alarm\d+$", ser, re.M):
     sys.exit("a plain fire printed — the reboot catch-up must be marked late")
-restored = re.findall(r"^goclock: alarm restored 23:59$", ser, re.M)
-late = re.findall(r"^goclock: fired alarm late$", ser, re.M)
+restored = re.findall(r"^goclock: alarm restored 23:59", ser, re.M)
+late = re.findall(r"^goclock: fired alarm\d+ late$", ser, re.M)
 if len(restored) < 1:
     sys.exit("no instance re-armed from the staged record")
 if len(late) != len(restored):
@@ -672,3 +686,138 @@ vgate_assert 06 serial-absent 'goclock: alarm file bad'
 vgate_assert 06 serial-absent 'goclock: deadline full'
 vgate_assert 06 serial-absent '[EXC] parking:'
 vgate_assert 06 serial-absent 'exited status=139'
+
+# --- run 07 (M152b): two alarms + preset timer -> gocal2 -> snapshot -----
+# Chords switch to the Alarm tab and add two rows — 06:45 daily via
+# Return, 19:20 once via 'o' — then 'left' reaches the Timer tab and '1'
+# arms the 1-minute preset, so `goclock: fired timer` lands inside the
+# leg. ctrl-shift-s (same batch — the state ask is answered while the
+# countdown runs) snapshots the gocal2 list for run 08's restore boot.
+# The alarm times are fixed HHMM fields: an armed row whose instant fell
+# inside the leg's own ~4-minute window would fire early, so the asserts
+# below only pin the arm markers, never the absence of a fire.
+vgate_file script-07.txt <<'EOF'
+echo rx-goclock-07-boot
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+exec GOCLOCK.ELF
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+echo rx-goclock-v2-armed
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --script '$RUN_DIR/script-07.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'gotabwm: mode live' \
+    --input-chords 'right,right,right,0,6,4,5,return,1,9,2,0,o,left,1,ctrl-shift-s' \
+    --input-chords-after 'goclock: painted epoch=' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'goclock: fired timer' \
+    --script-expect 'rx-goclock-v2-armed' --timeout 300
+
+vgate_assert 07 serial-contains 'exec: loaded GOCLOCK.ELF'
+vgate_assert 07 serial-contains 'goclock: declare accepted'
+vgate_assert 07 serial-contains 'goclock: tab alarm'
+# Two rows side by side: the daily wake-up and the one-off reminder.
+vgate_assert 07 serial-contains 'goclock: alarm armed 06:45 daily'
+vgate_assert 07 serial-contains 'goclock: alarm armed 19:20 once'
+# Every mutation republished the gocal2 list through both carriers.
+vgate_assert 07 serial-contains 'goclock: alarm saved'
+vgate_assert 07 serial-contains 'goclock: state posted'
+vgate_assert 07 share-contains 'GOCLOCK.ALARM' 'gocal2 2 '
+vgate_assert 07 share-contains 'GOCLOCK.ALARM' ' 0645 d+'
+vgate_assert 07 share-contains 'GOCLOCK.ALARM' ' 1920 o+'
+# One key armed the 1-minute preset and it fired its marker, exactly once.
+vgate_assert 07 serial-contains 'goclock: tab timer'
+vgate_assert 07 serial-contains 'goclock: timer armed 60'
+vgate_assert 07 serial-exact 'goclock: fired timer' 1
+# The snapshot chord captured the session with the blob aboard.
+vgate_assert 07 serial-contains 'gotabwm: state ask id='
+vgate_assert 07 serial-contains 'gotabwm: state save id='
+vgate_assert 07 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 07 serial-contains 'rx-goclock-v2-armed'
+vgate_assert 07 serial-absent 'goclock: alarm refused'
+vgate_assert 07 serial-absent 'goclock: alarm full'
+vgate_assert 07 serial-absent 'goclock: deadline full'
+vgate_assert 07 serial-absent 'goclock: timer refused'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+
+# Byte-level on the share, same idiom as run 04: exactly one SESSION.TABS
+# app_state blob IS the two-row gocal2 line — the daily row flags 'd+',
+# the once row 'o+'.
+vgate_assert 07 python <<'PY'
+import os, re, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] < 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (b[0], b[2]))
+off = 6 + 69 * b[2]
+if len(b) < off + 6 + 8:
+    sys.exit("SESSION.TABS too short for a state trailer: %d" % len(b))
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] < 1:
+    sys.exit("app_state header %r" % b[off:off+6])
+asc = b[off+3]
+pos = off + 6 + 8 * asc
+hits = []
+for i in range(asc):
+    ent = b[off+6+8*i:off+14+8*i]
+    ln = int.from_bytes(ent[4:8], "little")
+    blob = b[pos:pos+ln]
+    pos += ln
+    if re.fullmatch(rb"gocal2 2 [0-9]+ 0645 d\+ [0-9]+ 1920 o\+", blob):
+        hits.append((ent[0], ent[1], blob))
+if len(hits) != 1 or hits[0][1] != 1:
+    sys.exit("want exactly one appver=1 two-row gocal2 blob, found %r" % hits)
+print("SESSION.TABS app_state: idx=%d appver=%d blob=%r" % hits[0])
+PY
+
+# --- run 08 (M152b): restore boot — both rows armed, the daily re-armed ---
+# A fresh boot's session load mode=restore re-execs GOCLOCK; restore_state
+# hands the gocal2 blob back (the share file agrees — file wins on a tie)
+# and each row re-arms under its index id: `alarm restored HH:MM daily`
+# for the repeater, `alarm restored HH:MM once` for the one-shot. No
+# timer comes back — a countdown is a deadline, not a record. Tail
+# cleanup leaves the share empty of clock state for the next iteration.
+vgate_file script-08.txt <<'EOF'
+echo rx-goclock-08-boot
+EOF
+
+vgate_file script3-08.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+vf rm GOCLOCK.ALARM
+echo rx-goclock-v2-restored
+EOF
+
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
+    --via-virtio \
+    --script '$RUN_DIR/script-08.txt' \
+    --script3 '$RUN_DIR/script3-08.txt' \
+    --script3-after 'goclock: alarm restored 19:20' \
+    --script-expect 'rx-goclock-v2-restored' --timeout 300
+
+vgate_assert 08 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 08 serial-contains 'gotabwm: mode live'
+vgate_assert 08 serial-contains 'gotabwm: session load n='
+vgate_assert 08 serial-contains ' mode=restore'
+vgate_assert 08 serial-contains 'gotabwm: session reexec n='
+vgate_assert 08 serial-contains 'gotabwm: session exec GOCLOCK.ELF'
+vgate_assert 08 serial-contains 'goclock: declare accepted'
+# The stored blob came back through restore_state...
+vgate_assert 08 serial-contains 'goclock: state restored'
+# ...and both rows re-armed: the daily one armed to ring again tomorrow.
+vgate_assert 08 serial-contains 'goclock: alarm restored 06:45 daily'
+vgate_assert 08 serial-contains 'goclock: alarm restored 19:20 once'
+vgate_assert 08 serial-contains 'rx-goclock-v2-restored'
+vgate_assert 08 serial-absent 'goclock: state refused'
+vgate_assert 08 serial-absent 'goclock: alarm file bad'
+vgate_assert 08 serial-absent 'goclock: deadline full'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 serial-absent 'exited status=139'

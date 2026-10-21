@@ -156,36 +156,72 @@ func TestAlarmAt(t *testing.T) {
 	}
 }
 
-// The persisted record is `gocal1 <at> <hhmm>` — the armed epoch plus the
-// civil field. Round-trips byte-exact; a staged `write` line lands the same.
-func TestAlarmRecordRoundTrip(t *testing.T) {
-	b := encodeAlarm(1792497600, 2359)
-	if string(b) != "gocal1 1792497600 2359" {
-		t.Fatalf("encodeAlarm = %q, want the gocal1 record", b)
+// The gocal2 list record: `gocal2 <n>` plus n `<at> <hhmm> <flags>`
+// triples (d|o for daily/once, +|- for enabled/off). Round-trips
+// byte-exact.
+func TestAlarmListRoundTrip(t *testing.T) {
+	list := []Alarm{
+		{At: 1792497600, HHMM: 2359, Daily: true, Enabled: true},
+		{At: 1792500000, HHMM: 645, Daily: false, Enabled: true},
+		{At: 1792510000, HHMM: 1920, Daily: true, Enabled: false},
 	}
-	at, hhmm, ok := decodeAlarm(b)
-	if !ok || at != 1792497600 || hhmm != 2359 {
-		t.Fatalf("decodeAlarm = %d,%d,%v", at, hhmm, ok)
+	b := encodeAlarms(list)
+	want := "gocal2 3 1792497600 2359 d+ 1792500000 0645 o+ 1792510000 1920 d-"
+	if string(b) != want {
+		t.Fatalf("encodeAlarms = %q, want %q", b, want)
+	}
+	got, ok := decodeAlarms(b)
+	if !ok || len(got) != len(list) {
+		t.Fatalf("decodeAlarms = %v,%v", got, ok)
+	}
+	for i := range list {
+		if got[i] != list[i] {
+			t.Fatalf("row %d = %+v, want %+v", i, got[i], list[i])
+		}
 	}
 	// A trailing newline (a hand-staged or edited file) still decodes.
-	if at, hhmm, ok = decodeAlarm([]byte("gocal1 1 0000\n")); !ok || at != 1 || hhmm != 0 {
-		t.Fatalf("decodeAlarm trailing-newline = %d,%d,%v", at, hhmm, ok)
+	if got, ok = decodeAlarms([]byte(want + "\n")); !ok || len(got) != 3 {
+		t.Fatalf("decodeAlarms trailing-newline = %v,%v", got, ok)
 	}
 }
 
-// Anything that is not exactly the gocal1 record refuses whole — a torn
-// write, a foreign blob, a bad civil field are all "no state".
+// gocal1 still reads: the single-record format decodes as the one daily
+// enabled alarm it always was — the M144b file a v1 app last wrote.
+func TestGocal1StillReads(t *testing.T) {
+	got, ok := decodeAlarms([]byte("gocal1 1792497600 2359"))
+	if !ok || len(got) != 1 {
+		t.Fatalf("decodeAlarms gocal1 = %v,%v", got, ok)
+	}
+	al := got[0]
+	if al.At != 1792497600 || al.HHMM != 2359 || !al.Daily || !al.Enabled {
+		t.Fatalf("gocal1 decodes %+v, want armed daily 23:59", al)
+	}
+}
+
+// Anything that is not exactly the gocal1 record or the gocal2 list
+// refuses whole — a torn write, a foreign blob, a bad civil field or a
+// count that lies are all "no state".
 func TestAlarmRecordRefusals(t *testing.T) {
 	for _, s := range []string{
-		"", "gocal1", "gocal2 1 2359", "gocal1 1", "gocal1 1 235",
+		"", "gocal1", "gocal1 1", "gocal1 1 235",
 		"gocal1 1 23590", "gocal1 x 2359", "gocal1 1 2460", "gocal1 -1 2359",
-		" gocal1 1 2359", "gocal1 1 2359 extra",
+		" gocal1 1 2359", "gocal1 1 2359 extra", "gocal2",
+		"gocal2 x", "gocal2 1", "gocal2 1 1 2359",
+		"gocal2 1 1 2359 d+ extra", "gocal2 2 1 2359 d+",
+		"gocal2 8 1 0000 d+ 1 0000 d+ 1 0000 d+ 1 0000 d+ 1 0000 d+ 1 0000 d+ 1 0000 d+ 1 0000 d+",
+		"gocal2 1 x 2359 d+", "gocal2 1 1 2460 d+", "gocal2 1 -1 2359 d+",
+		"gocal2 1 1 2359 dd", "gocal2 1 1 2359 dx", "gocal2 1 1 2359 x+",
+		"gocal2  1 1 2359 d+", "gocal2 1  1 2359 d+",
 	} {
-		if _, _, ok := decodeAlarm([]byte(s)); ok {
-			t.Fatalf("decodeAlarm(%q) = ok, want refused", s)
+		if _, ok := decodeAlarms([]byte(s)); ok {
+			t.Fatalf("decodeAlarms(%q) = ok, want refused", s)
 		}
 	}
-	if encodeAlarm(-1, 2359) != nil || encodeAlarm(1, 2460) != nil {
-		t.Fatal("encodeAlarm must refuse a negative at or a bad HHMM")
+	if encodeAlarms(make([]Alarm, MaxAlarms+1)) != nil {
+		t.Fatal("encodeAlarms must refuse a list past MaxAlarms")
+	}
+	if encodeAlarms([]Alarm{{At: -1, HHMM: 2359}}) != nil ||
+		encodeAlarms([]Alarm{{At: 1, HHMM: 2460}}) != nil {
+		t.Fatal("encodeAlarms must refuse a negative at or a bad HHMM")
 	}
 }

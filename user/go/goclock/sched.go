@@ -14,9 +14,10 @@ package main
 // the bound are host-testable. Deadlines compare in wall-clock seconds
 // (vi.Now's clock): the app's caller passes the current epoch.
 
-// MaxDeadlines is the multiplexer's bound: eight entries ride the one
-// kernel timer (the card's "up to 8 deadlines").
-const MaxDeadlines = 8
+// MaxDeadlines is the multiplexer's bound: nine entries ride the one
+// kernel timer — the face cadence, one countdown, and up to MaxAlarms
+// (7) alarm rows (M152b, #2916).
+const MaxDeadlines = 9
 
 // Deadline is one scheduled firing.
 //

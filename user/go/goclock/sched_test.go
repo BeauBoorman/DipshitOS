@@ -113,6 +113,41 @@ func TestSchedBound(t *testing.T) {
 	}
 }
 
+// M152b (#2916): the card's full house — the face cadence, the countdown
+// and MaxAlarms daily rows all fit; the deadline past that is refused.
+func TestSchedSevenAlarmsPlusTimer(t *testing.T) {
+	var s Sched
+	s.Add(Deadline{ID: faceDeadline, At: 1, Repeat: 1, Quiet: true})
+	s.Add(Deadline{ID: "timer", At: 60})
+	for i := 0; i < MaxAlarms; i++ {
+		if !s.Add(Deadline{ID: alarmID(i), At: 100, Repeat: dailyRepeat}) {
+			t.Fatalf("alarm #%d refused under the bound", i)
+		}
+	}
+	if s.Len() != MaxDeadlines {
+		t.Fatalf("Len = %d, want %d (face + timer + %d alarms)",
+			s.Len(), MaxDeadlines, MaxAlarms)
+	}
+	if s.Add(Deadline{ID: "overflow", At: 0}) {
+		t.Fatal("the deadline past face + timer + seven alarms must be refused")
+	}
+	// And the daily re-arm floor: after a fire each row lands exactly one
+	// day out, never sooner.
+	fired := s.Fire(100) // face + timer + all seven alarms are due
+	if len(fired) != MaxAlarms+2 {
+		t.Fatalf("Fire(100) fired %d, want %d", len(fired), MaxAlarms+2)
+	}
+	for _, d := range s.ds {
+		if i, ok := alarmIndex(d.ID); ok {
+			if d.At != 100+dailyRepeat {
+				t.Fatalf("alarm%d re-armed at %d, want %d", i, d.At, 100+dailyRepeat)
+			}
+		} else if d.ID == "timer" {
+			t.Fatal("the one-shot timer must not re-arm")
+		}
+	}
+}
+
 // ArmDelay answers for the earliest deadline only.
 func TestSchedArmDelay(t *testing.T) {
 	var s Sched
