@@ -467,6 +467,7 @@ var errMessages = map[string]string{
 	"verb_disabled":    "verb is not enabled on this daemon",
 	"spawn_failed":     "could not start the command",
 	"timed_out":        "command exceeded its time budget",
+	"rate_limited":     "request exceeds its per-session rate bound",
 	"seat_unsupported": "the window seat cannot answer this query",
 	"seat_absent":      "no window seat is running",
 	"seat_timeout":     "the window seat did not answer in time",

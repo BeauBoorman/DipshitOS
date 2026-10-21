@@ -1084,23 +1084,24 @@ func TestUIScreenshot(t *testing.T) {
 	k := &fakeKernel{seatPid: 0}
 	k.install()
 	sess := testSess(true, nil, "window")
+	bare := mustReq(t, `{"id":1,"verb":"ui.screenshot"}`)
 
 	// No seat is the card's named refusal, before any scanout call.
-	if _, code := verbUIScreenshot(sess); code != "seat_absent" {
+	if _, code := verbUIScreenshot(bare, sess); code != "seat_absent" {
 		t.Fatalf("no-seat code = %q", code)
 	}
 	k.seatPid = 3
 	// An unarmed framebuffer is the same verdict (nothing to see).
 	k.scanoutRc = -vi.ErrENXIO
-	if _, code := verbUIScreenshot(sess); code != "seat_absent" {
+	if _, code := verbUIScreenshot(bare, sess); code != "seat_absent" {
 		t.Fatalf("ENXIO code = %q", code)
 	}
 	k.scanoutRc = -vi.ErrENOSYS
-	if _, code := verbUIScreenshot(sess); code != "seat_unsupported" {
+	if _, code := verbUIScreenshot(bare, sess); code != "seat_unsupported" {
 		t.Fatalf("ENOSYS code = %q", code)
 	}
 	k.scanoutRc = -vi.ErrENOMEM
-	if _, code := verbUIScreenshot(sess); code != "io_error:ENOMEM" {
+	if _, code := verbUIScreenshot(bare, sess); code != "io_error:ENOMEM" {
 		t.Fatalf("ENOMEM code = %q", code)
 	}
 	// A live seat: paint pixel (sx,sy) = (B,G,R) by source coords and
@@ -1119,7 +1120,7 @@ func TestUIScreenshot(t *testing.T) {
 	}
 	var chunks [][]byte
 	sess.emit = func(b []byte) { chunks = append(chunks, append([]byte(nil), b...)) }
-	res, code := verbUIScreenshot(sess)
+	res, code := verbUIScreenshot(bare, sess)
 	want := `{"w":160,"h":90,"format":"rgb565le","bytes":28800}`
 	if code != "" || res != want {
 		t.Fatalf("ui.screenshot = %q code %q", res, code)
@@ -1139,5 +1140,170 @@ func TestUIScreenshot(t *testing.T) {
 	want16 := uint16(0xf8>>3)<<11 | uint16(8>>2)<<5 | uint16(0>>3)
 	if got != want16 {
 		t.Fatalf("pixel (1,0) = %04x want %04x", got, want16)
+	}
+	// scale=8 names the same default thumbnail path.
+	res, code = verbUIScreenshot(mustReq(t,
+		`{"id":1,"verb":"ui.screenshot","scale":8}`), sess)
+	if code != "" || res != want {
+		t.Fatalf("scale=8 = %q code %q", res, code)
+	}
+}
+
+// TestUIScreenshotFull covers card #2977's scale=1: the 12-row slot-88
+// band plan, the shared RGB565 conversion, the scale refusals, and the
+// per-session rate bound.
+func TestUIScreenshotFull(t *testing.T) {
+	seamScope(t)
+	nanosSave := nanosFn
+	t.Cleanup(func() { nanosFn = nanosSave })
+	var clock int64 = 1e9
+	nanosFn = func() int64 { return clock }
+	k := &fakeKernel{seatPid: 3}
+	k.install()
+	var bands int
+	var expectY uint32 // the next scale=1 band's y — wraps per capture
+	k.scanout = func(x, y, w, h uint32, buf []byte) int64 {
+		// Band planning: full-width reads under the slot's per-call
+		// byte bound; scale=1 takes 12-row bands marching the frame in
+		// order, the thumbnail path takes its single sampled rows.
+		if x != 0 || w != uint32(vi.ScanoutWidth) || (h != 1 && h != fullShotRows) {
+			t.Fatalf("band = x%d y%d w%d h%d", x, y, w, h)
+		}
+		if int64(len(buf)) > vi.ScanoutReadMax {
+			t.Fatalf("band buf = %d over %d", len(buf), vi.ScanoutReadMax)
+		}
+		if h == fullShotRows {
+			if y != expectY {
+				t.Fatalf("band read y=%d want %d", y, expectY)
+			}
+			expectY = (y + fullShotRows) % uint32(vi.ScanoutHeight)
+			bands++
+		}
+		for row := uint32(0); row < h; row++ {
+			for col := uint32(0); col < w; col++ {
+				i := (row*w + col) * 4
+				buf[i] = byte((y + row) % 256)            // B <- source row
+				buf[i+1] = byte(col % 256)                // G <- source col
+				buf[i+2] = byte((col/256 + y + row) % 64) // R varies slowly
+				buf[i+3] = 0
+			}
+		}
+		return int64(len(buf))
+	}
+	var chunks [][]byte
+	sess := testSess(true, &chunks, "window")
+	full := mustReq(t, `{"id":1,"verb":"ui.screenshot","scale":1}`)
+
+	res, code := verbUIScreenshot(full, sess)
+	want := `{"w":1280,"h":720,"format":"rgb565le","bytes":1843200}`
+	if code != "" || res != want {
+		t.Fatalf("scale=1 = %q code %q", res, code)
+	}
+	if bands != vi.ScanoutHeight/fullShotRows {
+		t.Fatalf("bands = %d want %d", bands, vi.ScanoutHeight/fullShotRows)
+	}
+	var merged []byte
+	for _, c := range chunks {
+		if len(c) > streamChunk {
+			t.Fatalf("chunk %d bytes over bound", len(c))
+		}
+		merged = append(merged, c...)
+	}
+	if len(merged) != vi.ScanoutWidth*vi.ScanoutHeight*2 {
+		t.Fatalf("streamed %d bytes want %d", len(merged), vi.ScanoutWidth*vi.ScanoutHeight*2)
+	}
+	// Source pixel (300, 17): B = 17, G = 44, R = (1+17)%64 = 18.
+	off := (17*vi.ScanoutWidth + 300) * 2
+	got := uint16(merged[off]) | uint16(merged[off+1])<<8
+	want16 := uint16(18>>3)<<11 | uint16(44>>2)<<5 | uint16(17>>3)
+	if got != want16 {
+		t.Fatalf("pixel (300,17) = %04x want %04x", got, want16)
+	}
+
+	// The full frame downsamples to the thumbnail path's answer: output
+	// (tx,ty) at scale 8 samples source (tx*8, ty*8) — the same pixel,
+	// so the two RGB565 streams agree exactly.
+	chunks = nil
+	res, code = verbUIScreenshot(mustReq(t, `{"id":2,"verb":"ui.screenshot"}`), sess)
+	if code != "" {
+		t.Fatalf("thumbnail after scale=1 code = %q", code)
+	}
+	var thumb []byte
+	for _, c := range chunks {
+		thumb = append(thumb, c...)
+	}
+	stride := vi.ScanoutWidth / thumbW
+	for ty := 0; ty < thumbH; ty++ {
+		for tx := 0; tx < thumbW; tx++ {
+			sx, sy := tx*stride, ty*(vi.ScanoutHeight/thumbH)
+			fo := (sy*vi.ScanoutWidth + sx) * 2
+			to := (ty*thumbW + tx) * 2
+			if merged[fo] != thumb[to] || merged[fo+1] != thumb[to+1] {
+				t.Fatalf("downsample drift at (%d,%d)", tx, ty)
+			}
+		}
+	}
+
+	// The rate bound: a second scale=1 inside 2 s refuses by name with
+	// no scanout call; the bound lapses and the next capture runs.
+	bands = 0
+	if _, code = verbUIScreenshot(full, sess); code != "rate_limited" {
+		t.Fatalf("inside-bound code = %q", code)
+	}
+	if bands != 0 {
+		t.Fatal("rate_limited still read the scanout")
+	}
+	// A refused request consumed no further budget: the bound still
+	// lapses on the original clock, and thumbnails are never bound.
+	clock += fullShotMinNs - 1
+	if _, code = verbUIScreenshot(full, sess); code != "rate_limited" {
+		t.Fatalf("bound-edge-1 code = %q", code)
+	}
+	clock++
+	res, code = verbUIScreenshot(full, sess)
+	if code != "" || res != want {
+		t.Fatalf("post-bound scale=1 = %q code %q", res, code)
+	}
+
+	// The scale refusals: other values are bad_request, before any
+	// scanout call, and refuse without arming a fresh session's bound.
+	for _, line := range []string{
+		`{"id":3,"verb":"ui.screenshot","scale":0}`,
+		`{"id":3,"verb":"ui.screenshot","scale":2}`,
+		`{"id":3,"verb":"ui.screenshot","scale":4}`,
+		`{"id":3,"verb":"ui.screenshot","scale":"1"}`,
+		`{"id":3,"verb":"ui.screenshot","bogus":1}`,
+	} {
+		if _, code = dispatch(mustReq(t, line), sess); code != "bad_request" {
+			t.Fatalf("%s: code = %q want bad_request", line, code)
+		}
+	}
+	fresh := testSess(true, nil, "window")
+	bands = 0
+	for _, line := range []string{
+		`{"id":4,"verb":"ui.screenshot","scale":4}`,
+		`{"id":4,"verb":"ui.screenshot","scale":0}`,
+	} {
+		if _, code = dispatch(mustReq(t, line), fresh); code != "bad_request" {
+			t.Fatalf("fresh %s: code = %q", line, code)
+		}
+	}
+	if _, code = verbUIScreenshot(full, fresh); code != "" {
+		t.Fatalf("scale=1 after refused scales code = %q", code)
+	}
+	if bands == 0 {
+		t.Fatal("scale=1 never read the scanout")
+	}
+
+	// A no-seat refusal consumes no budget either: seat_absent on a
+	// fresh session, then the first scale=1 succeeds right away.
+	k.seatPid = 0
+	fresh2 := testSess(true, nil, "window")
+	if _, code = verbUIScreenshot(full, fresh2); code != "seat_absent" {
+		t.Fatalf("no-seat scale=1 code = %q", code)
+	}
+	k.seatPid = 3
+	if _, code = verbUIScreenshot(full, fresh2); code != "" {
+		t.Fatalf("scale=1 after seat_absent code = %q", code)
 	}
 }

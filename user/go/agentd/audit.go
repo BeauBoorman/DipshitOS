@@ -300,6 +300,9 @@ func auditArgs(req *request, result, code string) string {
 	if ms, present, ok := req.argInt("timeout_ms", 1, timeoutMaxMs); present && ok {
 		num("timeout_ms", ms)
 	}
+	if sc, present, ok := req.argInt("scale", 1, intMax); present && ok {
+		num("scale", sc)
+	}
 	// ui.input (M139b): the target pane and the batch size, never the
 	// event bytes themselves — a receipt names what was asked, not the
 	// keys pressed.

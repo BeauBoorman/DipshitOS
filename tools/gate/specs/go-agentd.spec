@@ -22,7 +22,10 @@
 # sentinels. Run 15 is M139b (#2780): the `input` journey — ui.input
 # types "hi" and clicks into the focused GOEDIT pane over WM_RPC
 # kind 29, the next ui.screenshot sees the repaint, and the named
-# refusals (agent_input_no_focus, too_large, bad_request) land.
+# refusals (agent_input_no_focus, too_large, bad_request) land. Run 16
+# is #2977: ui.screenshot scale=1 streams the full 1280x720 RGB565 frame
+# through slot-88 12-row bands under a per-session 2 s rate bound, and
+# the spec's python diffs it downsampled against the scale=8 capture.
 #
 # The agent credentials are three pinned Ed25519 seeds; each reaches its
 # harness through $RUN_DIR/<agent>.key (agent id + seed hex, never argv)
@@ -738,3 +741,71 @@ for need in (
         sys.exit("FAIL: no %r receipt; saw %r" % (need, sorted(seen)))
 print("run-15 audit ok: %d receipts incl. ui.input" % len(names))
 PY2
+
+# ---- 16: ui.screenshot scale=1 — the full-resolution read (#2977) --------------
+# Card #2977 (ADR 0044 D3 amendment): ui.screenshot takes an optional
+# `scale` — 8 is the 160x90 thumbnail (default, unbound), 1 is the whole
+# 1280x720 frame read in 12-row slot-88 bands and streamed through the
+# chunk path (1,843,200 bytes). A second scale=1 inside the per-session
+# 2 s bound is rate_limited; every other scale is bad_request. The
+# journey saves both frames into $RUN_DIR and the python leg downsamples
+# the full frame at the thumbnail's own sampling grid and diffs it
+# against the same run's scale=8 capture within a small per-channel
+# tolerance. GOCALC stages on the first ui.windows marker, as in run 01.
+vgate_run 16 -- \
+    --screen '$RUN_DIR/screen-16' \
+    --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=shot' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/devin.key' \
+    --net-tcp-connect-stream-arg '--shot-dir=$RUN_DIR' \
+    --net-tcp-connect-after 'agentd: listen 4747' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-agentd.txt' --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script-calc.txt' --script3-after 'verb=ui.windows' \
+    --script-expect 'agentd: session end reason=client_close' \
+    --script-expect-tail 4 --timeout 300
+
+vgate_assert 16 serial-contains 'agentd: auth ok agent=devin'
+vgate_assert 16 serial-contains 'verb=ui.windows ok'
+vgate_assert 16 serial-contains 'verb=ui.screenshot ok'
+vgate_assert 16 serial-contains 'verb=ui.screenshot code=rate_limited'
+vgate_assert 16 serial-contains 'verb=ui.screenshot code=bad_request'
+vgate_assert 16 output-contains 'AGENTCTL: ok shot-full'
+vgate_assert 16 output-contains 'AGENTCTL: ok shot-rate'
+vgate_assert 16 output-contains 'AGENTCTL: PASS shot'
+vgate_assert 16 output-contains 'NET-TCP-STREAM: probe exited status=0'
+vgate_assert 16 serial-absent '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a'
+vgate_assert 16 serial-absent '[EXC] parking:'
+
+# The full frame downsampled at the thumbnail's 8:1 grid must match the
+# same run's scale=8 capture — same source pixels, same conversion — to
+# within a small per-channel tolerance (a repaint may land between the
+# two reads). At most 5% of thumbnail pixels may drift.
+vgate_assert 16 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+full = open(os.path.join(run, "shot-full.rgb565"), "rb").read()
+thumb = open(os.path.join(run, "shot-thumb.rgb565"), "rb").read()
+W, H, TW, TH = 1280, 720, 160, 90
+if len(full) != W * H * 2:
+    sys.exit("FAIL: full frame is %d bytes" % len(full))
+if len(thumb) != TW * TH * 2:
+    sys.exit("FAIL: thumb frame is %d bytes" % len(thumb))
+drift = 0
+for ty in range(TH):
+    for tx in range(TW):
+        fo = (ty * 8 * W + tx * 8) * 2
+        to = (ty * TW + tx) * 2
+        fv = full[fo] | full[fo + 1] << 8
+        tv = thumb[to] | thumb[to + 1] << 8
+        if abs(((fv >> 11) & 31) - ((tv >> 11) & 31)) > 1 \
+                or abs(((fv >> 5) & 63) - ((tv >> 5) & 63)) > 1 \
+                or abs((fv & 31) - (tv & 31)) > 1:
+            drift += 1
+if drift > TW * TH // 20:
+    sys.exit("FAIL: downsample drifted on %d px" % drift)
+print("run-16 frame ok: %d B streamed, %d px drift" % (len(full), drift))
+PY

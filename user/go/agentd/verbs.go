@@ -87,13 +87,15 @@ const (
 // sessionCtx is what one authenticated connection resolved: the claimed
 // agent id, the caps its keyring row declared (ADR 0052 D3 — resolved
 // once at auth, never re-read mid-session), the daemon's --allow-exec
-// kill switch, and the stream writer bounded-output verbs emit chunk
-// lines through.
+// kill switch, the stream writer bounded-output verbs emit chunk lines
+// through, and the next instant a full-resolution ui.screenshot may run
+// (the per-session rate bound, D3 amendment).
 type sessionCtx struct {
-	agentID   string
-	caps      map[string]bool
-	allowExec bool
-	emit      func(chunk []byte)
+	agentID        string
+	caps           map[string]bool
+	allowExec      bool
+	emit           func(chunk []byte)
+	nextFullShotNs int64
 }
 
 // verbCap is the fixed verb->cap table (ADR 0052 D3): proc verbs take
@@ -178,10 +180,10 @@ func dispatch(req *request, sess *sessionCtx) (string, string) {
 		}
 		return verbUIWindows()
 	case "ui.screenshot":
-		if !req.hasArgs() {
+		if !req.hasArgs("scale") {
 			return "", "bad_request"
 		}
-		return verbUIScreenshot(sess)
+		return verbUIScreenshot(req, sess)
 	case "ui.input":
 		if !req.hasArgs("win", "events") {
 			return "", "bad_request"
@@ -497,15 +499,31 @@ func jbool(b bool) string {
 
 // --- ui.screenshot ---------------------------------------------------------
 
-// The screenshot is a bounded RGB565 thumbnail of the scanout, read
+// The screenshot is a bounded RGB565 little-endian read of the scanout
 // through slot 88 (vi.ScanoutRead — the kernel's bounded read-only copy
-// of the framebuffer; the writable bind stays seat-only). thumbW x
-// thumbH keeps the 1280x720 frame's exact 16:9 at an 8:1 stride, so one
-// sampled row band per output row suffices and the payload is fixed at
-// thumbW*thumbH*2 = 28,800 bytes before chunking.
+// of the framebuffer; the writable bind stays seat-only). The default
+// scale 8 is the thumbW x thumbH thumbnail: it keeps the 1280x720
+// frame's exact 16:9 at an 8:1 stride, so one sampled row band per
+// output row suffices and the payload is fixed at thumbW*thumbH*2 =
+// 28,800 bytes before chunking.
+//
+// Card #2977 (ADR 0044 D3 amendment): an optional `scale` argument —
+// 8 is the thumbnail, 1 is the full 1280x720 frame. scale=1 reads the
+// scanout in fullShotRows-row bands (the largest band one slot-88 call
+// serves inside ScanoutReadMax, and 720 is a multiple of it), converts
+// each band and streams it through the same emit path — 60 bands,
+// 1,843,200 bytes. A full-resolution read is rate-bound to one per
+// fullShotMinNs per session; a second request inside the bound answers
+// rate_limited. Any other scale value is bad_request.
 const (
 	thumbW = 160
 	thumbH = 90
+	// fullShotRows is the scale=1 band height: 12 rows of 1280*4 =
+	// 61,440 bytes fit ScanoutReadMax (64 KiB); 13 rows would not.
+	fullShotRows = 12
+	// fullShotMinNs is the per-session bound on scale=1 captures: one
+	// full-resolution read per 2 s.
+	fullShotMinNs = int64(2) * 1e9
 )
 
 // verbUIScreenshot answers ui.screenshot. The seat is the semantic
@@ -513,9 +531,24 @@ const (
 // with no registered seat refuses seat_absent by name before touching
 // the scanout (the card's named-refusal bar). Pixels arrive as stream
 // chunks through sess.emit; the result carries only the shape.
-func verbUIScreenshot(sess *sessionCtx) (string, string) {
+func verbUIScreenshot(req *request, sess *sessionCtx) (string, string) {
+	scale, present, ok := req.argInt("scale", 1, intMax)
+	if present && (!ok || (scale != 1 && scale != 8)) {
+		return "", "bad_request"
+	}
+	if !present {
+		scale = 8
+	}
+	if scale == 1 && nanosFn() < sess.nextFullShotNs {
+		// The bound refuses before the seat query — a rate-limited
+		// request pays no syscall and consumes no further budget.
+		return "", "rate_limited"
+	}
 	if seatPidFn() <= 0 {
 		return "", "seat_absent"
+	}
+	if scale == 1 {
+		return verbUIScreenshotFull(sess)
 	}
 	var row [vi.ScanoutWidth * vi.ScanoutBPP]byte
 	out := make([]byte, 0, thumbW*thumbH*2)
@@ -524,21 +557,67 @@ func verbUIScreenshot(sess *sessionCtx) (string, string) {
 		sy := uint32(ty * (vi.ScanoutHeight / thumbH))
 		r := scanoutFn(0, sy, uint32(vi.ScanoutWidth), 1, row[:])
 		if r < 0 {
-			switch vi.ErrnoName(r) {
-			case "ENXIO":
-				return "", "seat_absent" // no armed framebuffer: nothing to see
-			case "ENOSYS":
-				return "", "seat_unsupported"
-			}
-			return ioErr(r)
+			return shotErr(r)
 		}
 		for tx := 0; tx < thumbW; tx++ {
 			px := row[tx*stride*vi.ScanoutBPP:]
-			// B8G8R8X8 little-endian -> RGB565 little-endian.
-			v := uint16(px[2]>>3)<<11 | uint16(px[1]>>2)<<5 | uint16(px[0]>>3)
-			out = append(out, byte(v), byte(v>>8))
+			out = append565(out, px)
 		}
 	}
+	emitChunks(sess, out)
+	return shotResult(thumbW, thumbH), ""
+}
+
+// verbUIScreenshotFull is the scale=1 path: the whole frame in
+// fullShotRows-row bands, each converted to RGB565 and streamed as it
+// lands — the running payload stays at one band, never the full 1.8 MB.
+// The first landed band arms the session's rate bound: a request refused
+// on the read itself consumed no budget, so ENXIO still answers
+// seat_absent without rate-limiting the retry.
+func verbUIScreenshotFull(sess *sessionCtx) (string, string) {
+	var band [fullShotRows * vi.ScanoutWidth * vi.ScanoutBPP]byte
+	out := make([]byte, 0, fullShotRows*vi.ScanoutWidth*2)
+	armed := false
+	for y := uint32(0); y < vi.ScanoutHeight; y += fullShotRows {
+		r := scanoutFn(0, y, uint32(vi.ScanoutWidth), fullShotRows, band[:])
+		if r < 0 {
+			return shotErr(r)
+		}
+		if !armed {
+			sess.nextFullShotNs = nanosFn() + fullShotMinNs
+			armed = true
+		}
+		for px := 0; px < fullShotRows*vi.ScanoutWidth; px++ {
+			out = append565(out, band[px*vi.ScanoutBPP:])
+		}
+		emitChunks(sess, out)
+		out = out[:0]
+	}
+	return shotResult(vi.ScanoutWidth, vi.ScanoutHeight), ""
+}
+
+// append565 converts one B8G8R8X8 little-endian pixel to RGB565
+// little-endian — the single conversion both scales share.
+func append565(out []byte, px []byte) []byte {
+	v := uint16(px[2]>>3)<<11 | uint16(px[1]>>2)<<5 | uint16(px[0]>>3)
+	return append(out, byte(v), byte(v>>8))
+}
+
+// shotErr maps a scanout_read result onto the verb's named refusals: an
+// unarmed framebuffer reads the same as no seat (nothing to see).
+func shotErr(r int64) (string, string) {
+	switch vi.ErrnoName(r) {
+	case "ENXIO":
+		return "", "seat_absent"
+	case "ENOSYS":
+		return "", "seat_unsupported"
+	}
+	return ioErr(r)
+}
+
+// emitChunks streams out through sess.emit in streamChunk pieces — the
+// shared tail of every bounded-output verb.
+func emitChunks(sess *sessionCtx, out []byte) {
 	for len(out) > 0 {
 		n := streamChunk
 		if len(out) < n {
@@ -549,15 +628,20 @@ func verbUIScreenshot(sess *sessionCtx) (string, string) {
 		}
 		out = out[n:]
 	}
+}
+
+// shotResult renders the ui.screenshot result object: the frame's shape
+// and its RGB565 little-endian byte count.
+func shotResult(w, h int) string {
 	var sb strings.Builder
 	sb.WriteString(`{"w":`)
-	sb.WriteString(vi.Itoa64(thumbW))
+	sb.WriteString(vi.Itoa64(int64(w)))
 	sb.WriteString(`,"h":`)
-	sb.WriteString(vi.Itoa64(thumbH))
+	sb.WriteString(vi.Itoa64(int64(h)))
 	sb.WriteString(`,"format":"rgb565le","bytes":`)
-	sb.WriteString(vi.Itoa64(thumbW * thumbH * 2))
+	sb.WriteString(vi.Itoa64(int64(w * h * 2)))
 	sb.WriteByte('}')
-	return sb.String(), ""
+	return sb.String()
 }
 
 // --- ui.input -------------------------------------------------------------------
@@ -826,16 +910,7 @@ func verbGoshRun(req *request, sess *sessionCtx) (string, string) {
 	// file only when the child exits, so chunking-after-reap is the
 	// honest streaming shape this pipe can offer.
 	streamed := len(out)
-	for len(out) > 0 {
-		n := streamChunk
-		if len(out) < n {
-			n = len(out)
-		}
-		if sess.emit != nil {
-			sess.emit(out[:n])
-		}
-		out = out[n:]
-	}
+	emitChunks(sess, out)
 	var sb strings.Builder
 	sb.WriteString(`{"exit_status":`)
 	sb.WriteString(vi.Itoa64(st))

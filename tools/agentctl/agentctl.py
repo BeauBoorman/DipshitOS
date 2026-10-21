@@ -23,6 +23,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import select
 import sys
 import time
@@ -370,6 +371,40 @@ def stream_bytes(res):
     return b"".join(res.get("stream") or [])
 
 
+def wait_for_app(s, title, timeout=UI_WAIT):
+    """Poll ui.windows until a row titled TITLE registers and exactly one
+    row is focused; returns the focused strip index. The gate stages the
+    app only after the first ui.windows request (the task-pool staging in
+    go-agentd.spec run 01), so the poll IS the trigger.
+    """
+    deadline = time.monotonic() + timeout
+    last = "empty window list"
+    while True:
+        try:
+            res = s.call("ui.windows")
+        except Refused as r:
+            res = None
+            last = "refused " + r.code
+        if res is not None:
+            if res.get("seat") != "gotabwm":
+                raise Fail("seat is not gotabwm")
+            rows = res.get("windows")
+            if isinstance(rows, list) and any(
+                r.get("title") == title for r in rows
+            ):
+                focused = [r for r in rows if r.get("focused") is True]
+                if len(focused) == 1 and res.get("focused") == focused[
+                    0
+                ].get("index"):
+                    return focused[0]["index"]
+            last = "no focused %s row" % title
+        if time.monotonic() >= deadline:
+            raise Fail(
+                "ui.windows never showed a focused %s row: %s" % (title, last)
+            )
+        time.sleep(1)
+
+
 # ---- the journeys ------------------------------------------------------------
 
 
@@ -534,30 +569,7 @@ def journey_full(s, cred):
         # request (the task pool cannot seat four Go runtimes at once —
         # see go-agentd.spec run 01). Poll until the Calc row and the
         # single-focus invariant land.
-        deadline = time.monotonic() + UI_WAIT
-        last = "empty window list"
-        while True:
-            try:
-                res = s.call("ui.windows")
-            except Refused as r:
-                res = None
-                last = "refused " + r.code
-            if res is not None:
-                if res.get("seat") != "gotabwm":
-                    raise Fail("seat is not gotabwm")
-                rows = res.get("windows")
-                if isinstance(rows, list) and any(
-                    r.get("title") == "Calc" for r in rows
-                ):
-                    focused = [r for r in rows if r.get("focused") is True]
-                    if len(focused) == 1 and res.get("focused") == focused[
-                        0
-                    ].get("index"):
-                        break
-                last = "no focused Calc row"
-            if time.monotonic() >= deadline:
-                raise Fail("ui.windows never showed a focused Calc row: " + last)
-            time.sleep(1)
+        wait_for_app(s, "Calc")
         expect_refused(lambda: s.call("ui.windows", x=1), "bad_request")
 
     def ui_screenshot():
@@ -820,6 +832,99 @@ def journey_input(s, cred):
     ]
 
 
+def journey_shot(s, cred, shot_dir=None):
+    """Card #2977: ui.screenshot scale=1 — the full 1280x720 RGB565 frame
+    read in slot-88 bands and streamed through the chunk path, its scale
+    refusals, and the per-session 2 s rate bound. The run's scale=8
+    thumbnail and full frame land as raw files in SHOT_DIR so the spec's
+    python leg can diff the downsampled full frame against the thumbnail.
+    GOCALC stages on the first ui.windows marker exactly like run 01.
+    """
+
+    def handshake():
+        if not shot_dir:
+            raise Fail("the shot journey needs --shot-dir")
+        verbs = s.connect(cred[0], cred[1])
+        if "ui.screenshot" not in verbs:
+            raise Fail("ui.screenshot is not advertised")
+        if "window" not in s.caps:
+            raise Fail("missing declared cap window")
+
+    def ui_windows():
+        wait_for_app(s, "Calc")
+
+    def shot_scale_reds():
+        # Every scale value outside {1,8} is bad_request — including a
+        # mistyped one — and none of them consume the rate bound (the
+        # green scale=1 in shot-full proves the budget was never armed).
+        for bad in (4, 0, 9, "1"):
+            expect_refused(
+                lambda b=bad: s.call("ui.screenshot", scale=b), "bad_request"
+            )
+        expect_refused(
+            lambda: s.call("ui.screenshot", bogus=1), "bad_request"
+        )
+
+    def shot_thumb():
+        # The default scale IS 8. Poll past the same all-zero transient
+        # the full journey documents, then save the reassembled frame.
+        deadline = time.monotonic() + 30
+        while True:
+            res = s.call("ui.screenshot")
+            if res.get("w") != 160 or res.get("h") != 90:
+                raise Fail("thumbnail shape is not 160x90")
+            if res.get("format") != "rgb565le" or res.get("bytes") != 160 * 90 * 2:
+                raise Fail("thumbnail format/byte count drifted")
+            pix = stream_bytes(res)
+            if len(pix) != 160 * 90 * 2:
+                raise Fail("thumbnail stream reassembled %d bytes" % len(pix))
+            if any(pix):
+                break
+            if time.monotonic() >= deadline:
+                raise Fail("thumbnail stayed all-zero on a live seat")
+            time.sleep(1)
+        with open(os.path.join(shot_dir, "shot-thumb.rgb565"), "wb") as f:
+            f.write(pix)
+
+    def shot_full():
+        res = s.call("ui.screenshot", scale=1)
+        if res.get("w") != 1280 or res.get("h") != 720:
+            raise Fail("full-resolution shape is not 1280x720")
+        if res.get("format") != "rgb565le" or res.get("bytes") != 1280 * 720 * 2:
+            raise Fail("full-resolution format/byte count drifted")
+        if len(res.get("stream") or []) < 2:
+            raise Fail("the full frame did not arrive in multiple chunks")
+        pix = stream_bytes(res)
+        if len(pix) != 1280 * 720 * 2:
+            raise Fail("full stream reassembled %d bytes" % len(pix))
+        if not any(pix):
+            raise Fail("full frame stayed all-zero on a live seat")
+        with open(os.path.join(shot_dir, "shot-full.rgb565"), "wb") as f:
+            f.write(pix)
+
+    def shot_rate():
+        # One full-resolution read per session per 2 s: the immediate
+        # retry refuses by name while a thumbnail still serves. No
+        # post-lapse re-shot here — a second full frame would push the
+        # session past the runner's 4 MiB per-connection RX bound (the
+        # lapse is the class-A clock test instead).
+        expect_refused(
+            lambda: s.call("ui.screenshot", scale=1), "rate_limited"
+        )
+        res = s.call("ui.screenshot", scale=8)
+        if res.get("w") != 160 or len(stream_bytes(res)) != 160 * 90 * 2:
+            raise Fail("the bound reached into the thumbnail path")
+
+    return [
+        ("handshake", handshake),
+        ("ui.windows", ui_windows),
+        ("shot-scale-reds", shot_scale_reds),
+        ("shot-thumb", shot_thumb),
+        ("shot-full", shot_full),
+        ("shot-rate", shot_rate),
+    ]
+
+
 def journey_capsneg(s, cred):
     """An agent whose row declares only `process` gets cap_required for
     every other verb — the per-verb cap-absent negative."""
@@ -901,6 +1006,7 @@ JOURNEYS = {
     "noexec": journey_noexec,
     "capsneg": journey_capsneg,
     "input": journey_input,
+    "shot": journey_shot,
     "revoked": journey_revoked,
     "unknown": journey_unknown,
 }
@@ -964,7 +1070,10 @@ def harness(args):
     wr = sys.stdout.buffer
     s = Session(rd, wr)
     try:
-        steps = JOURNEYS[args.journey](s, cred)
+        if args.journey == "shot":
+            steps = journey_shot(s, cred, args.shot_dir)
+        else:
+            steps = JOURNEYS[args.journey](s, cred)
         rc = run_steps(args.journey, steps)
         if rc == 0 and args.journey in VANISH:
             return 1  # refused client vanishes abruptly -> runner RST
@@ -989,6 +1098,9 @@ def main(argv=None):
     h = sub.add_parser("harness")
     h.add_argument("--journey", required=True, choices=sorted(JOURNEYS))
     h.add_argument("--key-file", required=True)
+    h.add_argument("--shot-dir",
+                   help="the shot journey's evidence directory "
+                        "(raw RGB565 frames land here)")
     args = p.parse_args(argv)
     if args.selftest:
         ed_selftest()

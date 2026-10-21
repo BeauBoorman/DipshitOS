@@ -252,6 +252,7 @@ the first byte is alphanumeric, and it is never `.` or `..`. It resolves to
 | `fs.write` | `path`: NAME, `data_b64`: base64 of ≤ 4096 bytes | `{"path":S,"size":N}`. Create or replace, atomic through `vi.WriteFileSafe`. |
 | `ui.windows` | none | `{"seat":"gotabwm"\|"none","focused":I\|null,"windows":[{"index":I,"id":N,"title":S,"focused":B,"pinned":B,"frozen":B}]}` |
 | `ui.input` | `win`: int ≥ 0; `events`: array of ≤ 64 flat objects | `{"sent":N}` (card #2780; requires the `input` cap, D5b) |
+| `ui.screenshot` | `scale`: int 1\|8, default 8 (card #2977) | `{"w":W,"h":H,"format":"rgb565le","bytes":N}` — the scanout's RGB565 little-endian pixels arrive as stream chunks ahead of the result |
 | `gosh.run` | `cmd`: string; `timeout_ms`: int 1..30000, default 10000 | `{"exit_status":N,"stdout_b64":S,"truncated":B}` |
 
 Verb semantics that are binding:
@@ -286,6 +287,22 @@ Verb semantics that are binding:
   causes events 1..N−1 to fire. `{"sent":N}` counts the events the seat
   applied; the first refusal stops the batch and is the response. No
   seat at all is `seat_absent` — the same anchor `ui.screenshot` uses.
+- **`ui.screenshot`** (card #2977; requires the `window` cap) reads the
+  desktop through slot 88 `sys_scanout_read` — the bounded read-only
+  scanout copy; the writable bind stays seat-only. `scale` selects the
+  output: `8` (the default) is the 160x90 thumbnail — one sampled row per
+  output row at an 8:1 stride — and `1` is the full 1280x720 frame, read
+  in 12-row bands (the largest band one slot-88 call serves under its
+  64 KiB bound; 720 = 60 bands) and converted to RGB565 little-endian.
+  Both scales stream through the same chunk path: 28,800 bytes for the
+  thumbnail, 1,843,200 for the full frame. Any other `scale` value — or
+  a mistyped one — is `bad_request`; an unknown key stays `bad_request`
+  (D1). No seat is `seat_absent`; an unarmed framebuffer (`ENXIO`) is the
+  same verdict; `ENOSYS` is `seat_unsupported`. A `scale=1` request is
+  rate-bound to one capture per 2 s per session: a second request inside
+  the bound is `rate_limited` — refused before any seat or scanout
+  syscall — while `scale=8` is never bound. A refused request consumes no
+  budget; the bound arms on the first landed band.
 - **`gosh.run`**:
   1. `cmd` must be 1–192 bytes of printable ASCII (0x20–0x7e), or the
      request fails with `too_large` (length) or `cmd_rejected` (bytes).
@@ -341,6 +358,7 @@ Only codes marked *fatal* close it.
 | `spawn_failed` | `vi.Exec` of `GOSH.ELF` failed | no |
 | `timed_out` | `gosh.run` budget exhausted; the child was killed | no |
 | `seat_unsupported` / `seat_timeout` | see `ui.windows` | no |
+| `rate_limited` | a `ui.screenshot` `scale=1` inside the per-session 2 s bound | no |
 | `agent_input_denied` / `agent_input_no_focus` | kind-29 ack refused, name quoted verbatim (card #2780) | no |
 | `io_error` | any other negative kernel result (`message` carries `vi.ErrnoName`) | no |
 | `auth_required` / `auth_failed` / `auth_timeout` | D2 | **yes** |
@@ -582,6 +600,25 @@ reopened it and ruled on two points, both implemented here:
    the spec now, pinned in `shlib/agentline_observed_test.go` and in the
    D3 capture bullet.
 
+#### Amendment (card #2977, full-resolution screenshot)
+
+`ui.screenshot` gains the optional `scale` argument (1|8, default 8 —
+D3's table row and binding bullet above). `scale=1` answers with the
+whole 1280x720 frame as 1,843,200 RGB565 little-endian bytes: the verb
+reads the scanout in 12-row bands — the largest read slot 88 serves
+under `ScanoutReadMax` — converts each band, and streams it through the
+existing `sess.emit` chunk path, so the resident payload stays at one
+band. The bound is per session: one full-resolution capture per 2 s,
+refused `rate_limited` by name before any syscall; `scale=8` keeps no
+bound and the `window` cap is unchanged. The result's `format` stays
+`"rgb565le"` at both scales — the card's `"rgb565"` and the landed
+token name the same little-endian packing; one name serves both. Run 16
+of `go-agentd` is the class-B evidence: `scale=1` streams the full frame
+with Calc on screen, the refusal set lands by name, and the spec's
+python downsamples the capture at the thumbnail's own 8:1 grid and diffs
+it against the same run's `scale=8` frame within a small per-channel
+tolerance.
+
 ### Per-verb red/green matrix (run 01 unless noted)
 
 | Verb | Green | Red |
@@ -592,6 +629,7 @@ reopened it and ruled on two points, both implemented here:
 | `fs.write` | `HELLO.TXT` (payload sentinel) → `share-equals` | 4097 bytes → `too_large`; `"data_b64":"@@"` → `bad_request`; `../X` → `path_rejected`; share root unchanged |
 | `gosh.run` | `echo hello` → `hello\n`, 0; `cat NOPE.TXT` → `ok:true`, status ≠ 0; `cat /host/SECRETS.TXT` → `ok:true`, status ≠ 0, stdout lacks key (ceiling evidence) | `echo a > X`, `echo a #c`, `echo a &`, `echo 'a`, `"echo a\nls"` → `cmd_rejected`; 193 bytes → `too_large`; `timeout_ms:0` / `30001` → `bad_request`; `sleep 5` + `timeout_ms:1000` → `timed_out` + `agentd: reap`; run 05 → `verb_disabled` |
 | `ui.windows` | `gotabwm`, ≥ 1 `Calc` row, one focused; run 05 `none` | extra key → `bad_request`; `seat_unsupported`/`seat_timeout` class A |
+| `ui.screenshot` (runs 01/15/16) | default/`scale:8` → 160x90 `rgb565le` 28,800 B; `scale:1` → 1280x720, 1,843,200 B, downsamples to the same run's thumbnail within tolerance | `scale` ∉ {1,8} or mistyped → `bad_request`; second `scale:1` inside 2 s → `rate_limited`; bound lapse → captures again; no seat → `seat_absent` (run 05) |
 | `ui.input` (run 15) | `{"type":"key","usage":0x0B/0x0C}` + a `ptr` press/release → `{"sent":4}`, typed text repaints the next `ui.screenshot` | `win` ≠ focused → `agent_input_no_focus`; 65 events → `too_large`; malformed/missing fields → `bad_request`; `window`-only cap → `cap_required:input` (run 09) |
 | framing | — | `{` → `bad_json`; `{"verb":"proc.list"}` → `bad_request`; `{"id":1,"verb":"nope"}` → `unknown_verb`; duplicate `id` → `bad_request`; nested `{"a":{}}` → `bad_request`; `null` → `bad_request`; 8193 bytes → `line_too_long` (fatal, last) |
 

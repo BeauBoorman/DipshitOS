@@ -10,6 +10,8 @@ import base64
 import json
 import os
 import sys
+import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -122,6 +124,7 @@ class SimDaemon:
         self.caps = []
         self.hello_written = False
         self.edited = 0  # events injected: perturbs the screenshot bytes
+        self.next_full = 0.0  # the session's scale=1 rate bound (mono)
         w.push({
             "proto": "virelai-agent/2",
             "auth": "ed25519",
@@ -213,7 +216,7 @@ class SimDaemon:
         extra = [k for k in obj if k not in ("id", "verb")]
         allowed = {"proc.list": (), "proc.get": ("pid",),
                    "fs.read": ("path",), "fs.write": ("path", "data_b64"),
-                   "ui.windows": (), "ui.screenshot": (),
+                   "ui.windows": (), "ui.screenshot": ("scale",),
                    "ui.input": ("win", "events"),
                    "gosh.run": ("cmd", "timeout_ms")}[verb]
         if any(k not in allowed for k in extra):
@@ -294,8 +297,25 @@ class SimDaemon:
              "pinned": False, "frozen": False}]})
 
     def v_ui_screenshot(self, rid, obj):
+        # #2977 mirror: `scale` is 1|8 (default 8); a second scale=1
+        # inside 2 s is rate_limited — refused before the seat check.
+        scale = obj.get("scale", 8)
+        if not isinstance(scale, int) or isinstance(scale, bool) \
+                or scale not in (1, 8):
+            self.err(rid, "bad_request")
+            return
+        if scale == 1 and time.monotonic() < self.next_full:
+            self.err(rid, "rate_limited")
+            return
         if not self.seat:
             self.err(rid, "seat_absent")
+            return
+        if scale == 1:
+            self.next_full = time.monotonic() + 2.0
+            self.stream(rid, bytes(((i + self.edited) % 251 + 1)
+                                   for i in range(1280 * 720 * 2)))
+            self.ok(rid, {"w": 1280, "h": 720, "format": "rgb565le",
+                          "bytes": 1280 * 720 * 2})
             return
         self.stream(rid, bytes(((i + self.edited) % 251 + 1)
                                for i in range(160 * 90 * 2)))
@@ -558,7 +578,11 @@ class TestHandshake(unittest.TestCase):
 class TestJourneys(unittest.TestCase):
     def run_journey(self, name, cred=DEVIN, **simkw):
         s, w = connect_sim(**simkw)
-        steps = agentctl.JOURNEYS[name](s, cred)
+        if name == "shot":
+            steps = agentctl.JOURNEYS[name](
+                s, cred, tempfile.mkdtemp())
+        else:
+            steps = agentctl.JOURNEYS[name](s, cred)
         fails = []
         for step_name, fn in steps:
             try:
@@ -570,7 +594,8 @@ class TestJourneys(unittest.TestCase):
     def test_journey_names(self):
         self.assertEqual(sorted(agentctl.JOURNEYS),
                          ["badsig", "capsneg", "full", "input", "mute",
-                          "noexec", "preauth", "revoked", "unknown"])
+                          "noexec", "preauth", "revoked", "shot",
+                          "unknown"])
         self.assertTrue(agentctl.VANISH.issubset(agentctl.JOURNEYS))
         for name in agentctl.JOURNEYS:
             s, _ = connect_sim()
@@ -615,6 +640,25 @@ class TestJourneys(unittest.TestCase):
     def test_input(self):
         fails = self.run_journey("input")
         self.assertEqual(fails, [])
+
+    def test_shot(self):
+        # scale=1 streams the full frame, the scale/refusal matrix holds,
+        # the 2 s bound bites and lapses, and both evidence files land.
+        with tempfile.TemporaryDirectory() as d:
+            s, w = connect_sim()
+            fails = []
+            for step_name, fn in agentctl.journey_shot(s, DEVIN, d):
+                try:
+                    fn()
+                except Exception as e:
+                    fails.append("%s: %r" % (step_name, e))
+            self.assertEqual(fails, [])
+            with open(os.path.join(d, "shot-full.rgb565"), "rb") as f:
+                full = f.read()
+            with open(os.path.join(d, "shot-thumb.rgb565"), "rb") as f:
+                thumb = f.read()
+            self.assertEqual(len(full), 1280 * 720 * 2)
+            self.assertEqual(len(thumb), 160 * 90 * 2)
 
     def test_full_fails_when_calc_missing(self):
         s, w = connect_sim()
