@@ -7,6 +7,8 @@
 - Amended: 2026-10-04 (A2 / #1916 — no GPL-family tools; CoreGraphics
   replaces Poppler as the outside reference; owner decision
   [recorded](https://github.com/drawmeanelephant/VirelaiOS/pull/1970))
+- Amended: 2026-10-21 (A3 / #2921 — the bounded `user/go/pdfwrite`
+  writer; owner decision recorded on card #2921)
 - Related: [ADR 0030](0030-go-is-el0.md) D2/D3,
   [ADR 0041](0041-svg-raster.md) §§4–7, ADRs 0007/0024/0026.
 
@@ -832,3 +834,40 @@ paths (`tools/pdf-proof/*`, `tests/fixtures/pdf/acceptance/*`,
 invocation, pin and record, freezes the CoreGraphics references, and
 runs the full gate. No engine file changes. Earlier Poppler records stay
 in git history only. §8's acceptance condition for #1916 is unchanged.
+
+## Amendment (A3 / #2921, 2026-10-21) — the bounded writer
+
+§1's "no ... generator" exclusion is lifted for exactly one package:
+`user/go/pdfwrite` writes documents inside this same closed subset, so
+the OS's own reader is the writer's verifier. Everything the writer
+emits is producible only within the §3 allowlist; anything else is a
+named refusal, never a silent approximation. Every §3, §5 and §6 rule
+is unchanged; the writer is a producer of the subset, not a widening of it.
+
+### A3.1 — The written subset
+
+- US Letter pages only (`[0 0 612 792]`, 816×1,056 px at 96 dpi), at
+  most 64 per document, under the reader's 256.
+- `%PDF-1.4`, a classic `0 N` xref table, trailer `Root`/`Info`, and an
+  Info dictionary carrying Title, Producer and a guest-clock
+  CreationDate.
+- One uncolored Type 3 font whose CharProcs are font8x8 glyph
+  rectangles (`re`, fill only), subset to the codes actually shown;
+  bytes outside 0x20–0x7E draw as `?`.
+- DeviceRGB and DeviceGray 8-bit image XObjects.
+- Content and image streams are FlateDecode streams produced by the
+  writer's own fixed-Huffman plus bounded-LZ77 deflate encoder inside
+  `pdfwrite`; `user/go/flate` remains read-only.
+- Document bounds are the reader's own ceilings: ≤4 MiB output,
+  ≤16 MiB expanded streams, and the 8,192 normalized-command page
+  budget accounted before any bytes are returned. Refusals are named:
+  `page_too_large`, `too_many_pages`, `output_over_budget`,
+  `bad_raster`.
+
+### A3.2 — Still out
+
+A viewer, an editor, forms/annotations, a print pipeline, font
+embedding of any kind (base-14, TrueType, CID), strokes, transparency,
+PDF/A, encryption, A4 and non-ASCII text all stay out. The writer does
+not change the reader, the engine lock, or any consumer; the consumers
+are separately claimed cards.
