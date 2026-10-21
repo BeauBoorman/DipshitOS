@@ -476,28 +476,60 @@ final class VFWireTests: XCTestCase {
         _ = table.close(h2)
     }
 
-    /// M134a — STAT encoding carries mtime_sec/mtime_nsec in the 21-byte
-    /// shape and round-trips through the decoder.
-    func testStatEncodeWithMtime() {
-        let d = VFWire.encodeStatData(size: 7, isDir: false, mtimeSec: 1_700_000_123, mtimeNsec: 987_654_321, includeMtime: true)
+    /// M134a + M160a (#2981) — STAT encoding emits the full 53-byte v3
+    /// shape (mtime, ctime, birth, allocated) and round-trips through
+    /// the decoder.
+    func testStatEncodeV3RoundTrip() {
+        let d = VFWire.encodeStatData(size: 7, isDir: false,
+                                      mtimeSec: 1_700_000_123, mtimeNsec: 987_654_321,
+                                      ctimeSec: 1_700_000_200, ctimeNsec: 111_222_333,
+                                      birthSec: 1_600_000_000, birthNsec: 444_555_666,
+                                      allocBytes: 8192, includeMtime: true)
         XCTAssertEqual(d.count, VFWire.statDataLen)
         let dec = VFWire.decodeStatData(d)
         XCTAssertEqual(dec?.size, 7)
         XCTAssertEqual(dec?.isDir, false)
         XCTAssertEqual(dec?.mtimeSec, 1_700_000_123)
         XCTAssertEqual(dec?.mtimeNsec, 987_654_321)
+        XCTAssertEqual(dec?.ctimeSec, 1_700_000_200)
+        XCTAssertEqual(dec?.ctimeNsec, 111_222_333)
+        XCTAssertEqual(dec?.birthSec, 1_600_000_000)
+        XCTAssertEqual(dec?.birthNsec, 444_555_666)
+        XCTAssertEqual(dec?.allocBytes, 8192)
+
+        // Mid-v3 lengths decode only the groups that fully arrived —
+        // the same tolerance the guest decoder has.
+        let mid = VFWire.decodeStatData(Array(d[0..<VFWire.statV3CtimeLen]))
+        XCTAssertEqual(mid?.ctimeSec, 1_700_000_200)
+        XCTAssertNil(mid?.birthSec)
+        XCTAssertNil(mid?.allocBytes)
+        let mid2 = VFWire.decodeStatData(Array(d[0..<VFWire.statV3BirthLen]))
+        XCTAssertEqual(mid2?.birthSec, 1_600_000_000)
+        XCTAssertNil(mid2?.allocBytes)
+        // A v2-shape reply flags every v3 group absent.
+        let v2 = VFWire.decodeStatData(Array(d[0..<VFWire.statV2DataLen]))
+        XCTAssertEqual(v2?.mtimeSec, 1_700_000_123)
+        XCTAssertNil(v2?.ctimeSec)
+        XCTAssertNil(v2?.birthSec)
+        XCTAssertNil(v2?.allocBytes)
     }
 
     /// M134a — the old-shape encoding stays 9 bytes and an old peer's
     /// decoder sees mtime absent (named), not fabricated.
     func testStatEncodeWithoutMtimeOldPeerDecode() {
-        let d = VFWire.encodeStatData(size: 4096, isDir: true, mtimeSec: 0, mtimeNsec: 0, includeMtime: false)
+        let d = VFWire.encodeStatData(size: 4096, isDir: true,
+                                      mtimeSec: 0, mtimeNsec: 0,
+                                      ctimeSec: 0, ctimeNsec: 0,
+                                      birthSec: 0, birthNsec: 0,
+                                      allocBytes: 0, includeMtime: false)
         XCTAssertEqual(d.count, VFWire.statBaseDataLen)
         let dec = VFWire.decodeStatData(d)
         XCTAssertEqual(dec?.size, 4096)
         XCTAssertEqual(dec?.isDir, true)
         XCTAssertNil(dec?.mtimeSec)
         XCTAssertNil(dec?.mtimeNsec)
+        XCTAssertNil(dec?.ctimeSec)
+        XCTAssertNil(dec?.allocBytes)
         // A mid-length reply (neither shape) still yields size/type with
         // mtime absent — the same tolerance the guest decoder has.
         let mid = VFWire.decodeStatData(Array(d[0..<9]) + [1, 2, 3])
@@ -505,5 +537,22 @@ final class VFWireTests: XCTestCase {
         XCTAssertNil(mid?.mtimeSec)
         // Shorter than the base record decodes to nil.
         XCTAssertNil(VFWire.decodeStatData([1, 2, 3]))
+    }
+
+    /// M160a (#2981) — STATFS: the 28-byte record round-trips and a short
+    /// reply refuses rather than half-filling fields.
+    func testStatfsEncodeRoundTrip() {
+        XCTAssertEqual(VFWire.opStatfs, 0x11)
+        XCTAssertGreaterThan(VFWire.opStatfs, VFWire.opReplace)
+        let d = VFWire.encodeStatfsData(total: 100_000, free: 60_000, avail: 50_000, blockSize: 4096)
+        XCTAssertEqual(d.count, VFWire.statfsDataLen)
+        let dec = VFWire.decodeStatfsData(d)
+        XCTAssertEqual(dec?.total, 100_000)
+        XCTAssertEqual(dec?.free, 60_000)
+        XCTAssertEqual(dec?.avail, 50_000)
+        XCTAssertEqual(dec?.blockSize, 4096)
+        // A short record decodes to nil — never a half-filled fact.
+        XCTAssertNil(VFWire.decodeStatfsData(Array(d[0..<VFWire.statfsDataLen - 1])))
+        XCTAssertNil(VFWire.decodeStatfsData([]))
     }
 }

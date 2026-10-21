@@ -795,7 +795,7 @@ pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, ident
             virtio_file.st_path_limit => -8,
             else => -1,
         };
-        out.* = metadata.wireFromHostStat(st.size, st.is_dir, st.mtime_sec, st.mtime_nsec, st.has_mtime);
+        out.* = virtio_file.wireFromHostStat(st);
         return 0;
     }
     const value = metadata.stat(backend, auth.authorizer(), relative) catch |err| return metadata_errno(err);

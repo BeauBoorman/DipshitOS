@@ -89,6 +89,8 @@ extension CustomVirtioSpikeDeviceDelegate {
             serveRead(payload, element: element)
         case VFWire.opStat:
             serveStat(payload, element: element)
+        case VFWire.opStatfs:
+            serveStatfs(payload, element: element)
         case VFWire.opOpen:
             serveOpen(payload, flags: flags, element: element)
         case VFWire.opClose:
@@ -176,7 +178,15 @@ extension CustomVirtioSpikeDeviceDelegate {
         print("VF-FILE: LIST \(path.isEmpty ? "/" : path) → \(sorted.count) entr\(sorted.count == 1 ? "y" : "ies") (\(rows.count / VFWire.entryRowLen) rows)")
     }
 
-    /// STAT: size + type for the resolved path.
+    /// Whole-second + nanosecond conversion of a host timespec (clamped
+    /// to the wire's range — a pre-epoch or absurd host clock can never
+    /// wrap into a fabricated timestamp).
+    private func tsSec(_ ts: timespec) -> UInt64 { UInt64(max(0, ts.tv_sec)) }
+    private func tsNsec(_ ts: timespec) -> UInt32 { UInt32(max(0, min(999_999_999, ts.tv_nsec))) }
+
+    /// STAT: size + type + timestamps for the resolved path. M160a
+    /// (#2981) emits the v3 shape — the change/birth times and allocated
+    /// size come from stat(2), the same truth `ls -l` reports.
     private func serveStat(_ payload: [UInt8], element: VZVirtioQueueElement) {
         guard let root = shareRootURL(), let path = String(bytes: payload, encoding: .utf8),
               let url = VFWire.resolveSubpath(root: root, path: path) else {
@@ -189,18 +199,47 @@ extension CustomVirtioSpikeDeviceDelegate {
             writeFileReply(element: element, status: VFWire.stNotFound, data: [])
             return
         }
-        guard let attrs = try? fm.attributesOfItem(atPath: url.path) else {
+        // NB: `stat` resolves to the FUNCTION only unqualified —
+        // `Darwin.stat(...)` binds to the struct's init().
+        var sb = stat()
+        guard stat(url.path, &sb) == 0 else {
             writeFileReply(element: element, status: VFWire.stHostError, data: [])
             return
         }
-        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-        let ti = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        let sec = UInt64(max(0, ti))
-        let nsec = UInt32(max(0, min(999_999_999, (ti - floor(ti)) * 1_000_000_000)))
+        let size = UInt64(max(0, sb.st_size))
+        let msec = tsSec(sb.st_mtimespec)
+        let csec = tsSec(sb.st_ctimespec)
         let includeMtime = !vfStatLegacyShape(root: root)
-        let data = VFWire.encodeStatData(size: size, isDir: isDir.boolValue, mtimeSec: sec, mtimeNsec: nsec, includeMtime: includeMtime)
+        let data = VFWire.encodeStatData(size: size, isDir: isDir.boolValue,
+                                         mtimeSec: msec, mtimeNsec: tsNsec(sb.st_mtimespec),
+                                         ctimeSec: csec, ctimeNsec: tsNsec(sb.st_ctimespec),
+                                         birthSec: tsSec(sb.st_birthtimespec), birthNsec: tsNsec(sb.st_birthtimespec),
+                                         allocBytes: UInt64(max(0, sb.st_blocks)) * 512,
+                                         includeMtime: includeMtime)
         writeFileReply(element: element, status: VFWire.stOk, data: data)
-        print("VF-FILE: STAT \(path) → \(isDir.boolValue ? "dir" : "file") size=\(size)\(includeMtime ? " mtime=\(sec)" : " (v1 shape)")")
+        print("VF-FILE: STAT \(path) → \(isDir.boolValue ? "dir" : "file") size=\(size)\(includeMtime ? " mtime=\(msec) ctime=\(csec)" : " (v1 shape)")")
+    }
+
+    /// M160a (#2981) STATFS: statfs(2) on the share root — the free-space
+    /// truth. The payload path resolves through the same share-root
+    /// defense as STAT before the filesystem is asked anything.
+    private func serveStatfs(_ payload: [UInt8], element: VZVirtioQueueElement) {
+        guard let root = shareRootURL(), let path = String(bytes: payload, encoding: .utf8),
+              VFWire.resolveSubpath(root: root, path: path) != nil else {
+            writeFileReply(element: element, status: VFWire.stHostError, data: [])
+            return
+        }
+        // NB: `statfs` resolves to the FUNCTION only unqualified —
+        // `Darwin.statfs(...)` binds to the struct's init().
+        var sb = statfs()
+        guard statfs(root.path, &sb) == 0 else {
+            writeFileReply(element: element, status: VFWire.stHostError, data: [])
+            return
+        }
+        let data = VFWire.encodeStatfsData(total: sb.f_blocks, free: sb.f_bfree,
+                                           avail: sb.f_bavail, blockSize: sb.f_bsize)
+        writeFileReply(element: element, status: VFWire.stOk, data: data)
+        print("VF-FILE: STATFS \(path.isEmpty ? "/" : path) → total=\(sb.f_blocks) free=\(sb.f_bfree) avail=\(sb.f_bavail) bsize=\(sb.f_bsize)")
     }
 
     /// READ at an explicit offset (stateless): open, seek, read a chunk

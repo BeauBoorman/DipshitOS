@@ -22,7 +22,8 @@
 //! (0x0c, HF7 issue #741) is path-based COW dedup: the host clones the
 //! source with APFS clonefile semantics (clonefile(2) for files,
 //! copyfile(3) COPYFILE_CLONE for trees) — N worktrees of one repo share
-//! blocks until a worktree actually edits a file. Reply status: 0 ok,
+//! blocks until a worktree actually edits a file. STATFS (0x11, M160a
+//! #2981) is the share root's free-space truth. Reply status: 0 ok,
 //! 1 not found, 2 is a directory, 3 truncated (reply exceeded the guest's
 //! buffer), 4 host error, 5 exists (create/rename/clone target
 //! collision), 6 handle error (host table full or bad handle).
@@ -131,6 +132,11 @@ pub const op_dir_close: u8 = 0x0f;
 // B4 (#1871): separate opcode, not an ignored flags bit on legacy RENAME.
 // An older host refuses this before any filesystem mutation.
 pub const op_replace: u8 = 0x10;
+// M160a (#2981): STATFS — the share root's free-space truth. Additive,
+// the same non-breaking rule: an old host answers the unknown op with
+// status 4, and the kernel maps that to the NAMED `.unsupported`,
+// never a number.
+pub const op_statfs: u8 = 0x11;
 
 pub const st_ok: u8 = 0;
 pub const st_not_found: u8 = 1;
@@ -225,6 +231,15 @@ comptime {
 fn write_le_u16(out: []u8, off: usize, v: u16) void {
     out[off] = @truncate(v);
     out[off + 1] = @truncate(v >> 8);
+}
+
+fn write_le_u32(out: []u8, off: usize, v: u32) void {
+    var x = v;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        out[off + i] = @truncate(x);
+        x >>= 8;
+    }
 }
 
 fn write_le_u64(out: []u8, off: usize, v: u64) void {
@@ -504,7 +519,7 @@ fn park_sinks() void {
 /// rename/mkdir/delete/clone/truncate/fsync keep the honest failure).
 fn resubmit_safe(op: u8) bool {
     return switch (op) {
-        op_probe, op_list, op_read, op_stat, op_dir_page => true,
+        op_probe, op_list, op_read, op_stat, op_statfs, op_dir_page => true,
         else => false,
     };
 }
@@ -856,14 +871,23 @@ test "B2: legacy backend v2 rows and EOF decode losslessly and fail closed" {
 
 /// M134a (#2759): STAT reply data lengths — v1 is [size u64le][type u8]
 /// (9 B); v2 appends [mtime_sec u64le][mtime_nsec u32le] (21 B total).
-/// An old-shape reply decodes with `has_mtime == false`: the named
-/// "mtime absent", never a fabricated timestamp.
+/// M160a (#2981): v3 appends [ctime_sec u64le][ctime_nsec u32le]
+/// [birth_sec u64le][birth_nsec u32le][alloc_bytes u64le] (53 B total).
+/// An old-shape reply decodes with the `has_*` flags false: the named
+/// "absent", never a fabricated timestamp or size.
 pub const stat_data_v1_len: usize = 9;
 pub const stat_data_v2_len: usize = 21;
+/// M160a: per-group end offsets inside the v3 extension — a mid-v3 reply
+/// decodes only the field groups that fully arrived, the same tolerance
+/// the v1/v2 steps have always had.
+pub const stat_data_v3_ctime_len: usize = 33;
+pub const stat_data_v3_birth_len: usize = 45;
+pub const stat_data_v3_len: usize = 53;
 
-/// Decode STAT reply data into `out`: both the 9-byte pre-mtime shape
-/// and the 21-byte M134a shape are accepted; a short or mid-length reply
-/// still yields size/type and reports mtime absent.
+/// Decode STAT reply data into `out`: the 9-byte pre-mtime shape, the
+/// 21-byte M134a shape and the 53-byte M160a shape are accepted; a short
+/// or mid-length reply still yields the groups that arrived and flags
+/// the rest absent.
 pub fn decode_stat_reply(data: []const u8, out: *StatResult) void {
     if (data.len >= stat_data_v1_len) {
         out.size = read_le_u64(data, 0);
@@ -874,9 +898,24 @@ pub fn decode_stat_reply(data: []const u8, out: *StatResult) void {
         out.mtime_nsec = read_le_u32(data, 17);
         out.has_mtime = true;
     }
+    if (data.len >= stat_data_v3_ctime_len) {
+        out.ctime_sec = read_le_u64(data, 21);
+        out.ctime_nsec = read_le_u32(data, 29);
+        out.has_ctime = true;
+    }
+    if (data.len >= stat_data_v3_birth_len) {
+        out.birth_sec = read_le_u64(data, 33);
+        out.birth_nsec = read_le_u32(data, 41);
+        out.has_birth = true;
+    }
+    if (data.len >= stat_data_v3_len) {
+        out.alloc_bytes = read_le_u64(data, 45);
+        out.has_alloc = true;
+    }
 }
 
-/// STAT a path: size, type, and — on a v2 reply — the host file's mtime.
+/// STAT a path: size, type, and — on a v2 reply — the host file's mtime,
+/// on a v3 reply also its change time, birth time and allocated size.
 /// Returns the reply status.
 pub const StatResult = struct {
     status: u8 = st_host_error,
@@ -889,6 +928,18 @@ pub const StatResult = struct {
     mtime_sec: u64 = 0,
     mtime_nsec: u32 = 0,
     has_mtime: bool = false,
+    /// M160a (#2981): change time, birth time and allocated bytes on a
+    /// v3 reply. Each `has_*` flag names the absent case — a v1/v2 or
+    /// mid-v3 reply never zero-fills a fact. Birth and alloc have no
+    /// reader until M160b; they live on this decoded value for it.
+    ctime_sec: u64 = 0,
+    ctime_nsec: u32 = 0,
+    has_ctime: bool = false,
+    birth_sec: u64 = 0,
+    birth_nsec: u32 = 0,
+    has_birth: bool = false,
+    alloc_bytes: u64 = 0,
+    has_alloc: bool = false,
 };
 
 pub fn stat(raw_path: []const u8, out: *StatResult) u8 {
@@ -927,6 +978,84 @@ pub fn stat(raw_path: []const u8, out: *StatResult) u8 {
     if (rep.status != st_ok) return rep.status;
     decode_stat_reply(rep.data, out);
     return st_ok;
+}
+
+/// M160a (#2981): the named STATFS outcome — the wire status never
+/// escapes as a number.
+pub const StatfsStatus = enum {
+    /// The host answered with the full 28-byte record.
+    ok,
+    /// The host does not serve op 0x11 — an old host's status-4 refusal
+    /// of the unknown op, or any other non-ok status. M160b's slot-37
+    /// row names the EINVAL itself.
+    unsupported,
+    /// The exchange never completed (transport failure/timeout), or an
+    /// ok-status reply too short to hold the record.
+    failed,
+};
+
+/// STATFS reply data: [total u64le][free u64le][avail u64le]
+/// [block_size u32le] — 28 bytes; the counts are in `block_size` units.
+pub const statfs_data_len: usize = 28;
+
+pub const StatfsResult = struct {
+    /// Block counts for the share root, in units of `block_size`.
+    total: u64 = 0,
+    free: u64 = 0,
+    avail: u64 = 0,
+    block_size: u32 = 0,
+};
+
+/// Decode STATFS reply data into `out`; false when the reply is shorter
+/// than the 28-byte record — the fields stay absent, never half-filled.
+pub fn decode_statfs_data(data: []const u8, out: *StatfsResult) bool {
+    if (data.len < statfs_data_len) return false;
+    out.total = read_le_u64(data, 0);
+    out.free = read_le_u64(data, 8);
+    out.avail = read_le_u64(data, 16);
+    out.block_size = read_le_u32(data, 24);
+    return true;
+}
+
+/// STATFS the share root. The request carries a path payload like STAT —
+/// the host resolves it with the same share-root defense and stats the
+/// root itself. The FUSE backend and the in-memory test share have no
+/// free-space source, so they answer the named `.unsupported` — as does
+/// an old host's status-4 refusal of an op it does not know.
+pub fn statfs(raw_path: []const u8, out: *StatfsResult) StatfsStatus {
+    const path = clean_path(raw_path);
+    out.* = .{};
+    if (!available()) return .unsupported;
+    if (builtin.is_test and test_share != null) return .unsupported;
+    if (prefer_fuse()) return .unsupported;
+    const n = exchange(op_statfs, 0, path, &vf_reply_buf) orelse return .failed;
+    const rep = decode_reply(vf_reply_buf[0..n]);
+    if (rep.status != st_ok) return .unsupported;
+    if (!decode_statfs_data(rep.data, out)) return .failed;
+    return .ok;
+}
+
+/// M134a (#2759), M160a (#2981): the honest /host stat record this
+/// channel can produce — synthesized from the channel's own decoded
+/// STAT reply. `inode` 0 names the channel's absent object identity
+/// (never a fabricated id); `atime` is absent on this channel and reads
+/// as zero, like `.disk`'s honest no-atime; `ctime` fills when the v3
+/// reply carries it (birth and allocated bytes stay on the decoded
+/// record for M160b — Wire has no fields for them). `host_mode` is a
+/// statement of shape (a regular file or a directory), not a policy
+/// claim; uid/gid are unknown.
+pub fn wireFromHostStat(st: StatResult) metadata.Wire {
+    return .{
+        .kind = if (st.is_dir) .directory else .file,
+        .identity = .{ .filesystem = metadata.legacy_share_epoch, .inode = 0 },
+        .size = st.size,
+        .atime = .{ .seconds = 0, .nanoseconds = 0 },
+        .mtime = .{ .seconds = @bitCast(if (st.has_mtime) st.mtime_sec else @as(u64, 0)), .nanoseconds = if (st.has_mtime) st.mtime_nsec else 0 },
+        .ctime = .{ .seconds = @bitCast(if (st.has_ctime) st.ctime_sec else @as(u64, 0)), .nanoseconds = if (st.has_ctime) st.ctime_nsec else 0 },
+        .host_mode = if (st.is_dir) 0o040755 else 0o100644,
+        .host_uid = 0,
+        .host_gid = 0,
+    };
 }
 
 /// READ a file at `offset`. Returns the reply status; on ok the data
@@ -2111,6 +2240,117 @@ test "M134a: STAT reply decode accepts the old and new lengths" {
     decode_stat_reply(&mid, &out);
     try testing.expectEqual(@as(u64, 3), out.size);
     try testing.expect(!out.has_mtime);
+}
+
+test "M160a (#2981): STAT v3 decode — ctime/birth/alloc carry has_* flags" {
+    var out: StatResult = .{};
+    var v3: [stat_data_v3_len]u8 = @splat(0);
+    write_le_u64(&v3, 0, 7);
+    v3[8] = dir_type_file;
+    write_le_u64(&v3, 9, 1_700_000_123);
+    write_le_u32(&v3, 17, 987_654_321);
+    write_le_u64(&v3, 21, 1_700_000_200); // ctime_sec
+    write_le_u32(&v3, 29, 111_222_333); // ctime_nsec
+    write_le_u64(&v3, 33, 1_600_000_000); // birth_sec
+    write_le_u32(&v3, 41, 444_555_666); // birth_nsec
+    write_le_u64(&v3, 45, 8192); // alloc_bytes
+    decode_stat_reply(&v3, &out);
+    try testing.expectEqual(@as(u64, 7), out.size);
+    try testing.expect(!out.is_dir);
+    try testing.expect(out.has_mtime);
+    try testing.expect(out.has_ctime);
+    try testing.expect(out.has_birth);
+    try testing.expect(out.has_alloc);
+    try testing.expectEqual(@as(u64, 1_700_000_200), out.ctime_sec);
+    try testing.expectEqual(@as(u32, 111_222_333), out.ctime_nsec);
+    try testing.expectEqual(@as(u64, 1_600_000_000), out.birth_sec);
+    try testing.expectEqual(@as(u32, 444_555_666), out.birth_nsec);
+    try testing.expectEqual(@as(u64, 8192), out.alloc_bytes);
+
+    // Mid-v3 replies decode only the groups that fully arrived — the
+    // same tolerance the v1/v2 steps have.
+    out = .{};
+    decode_stat_reply(v3[0..stat_data_v3_ctime_len], &out);
+    try testing.expect(out.has_mtime and out.has_ctime);
+    try testing.expect(!out.has_birth and !out.has_alloc);
+    out = .{};
+    decode_stat_reply(v3[0..stat_data_v3_birth_len], &out);
+    try testing.expect(out.has_ctime and out.has_birth);
+    try testing.expect(!out.has_alloc);
+    // A v2 reply flags every v3 group absent.
+    out = .{};
+    decode_stat_reply(v3[0..stat_data_v2_len], &out);
+    try testing.expect(out.has_mtime);
+    try testing.expect(!out.has_ctime and !out.has_birth and !out.has_alloc);
+}
+
+test "M160a (#2981): wireFromHostStat fills Wire.ctime only when present" {
+    var st = StatResult{ .size = 7, .mtime_sec = 1_700_000_123, .has_mtime = true };
+    var w = wireFromHostStat(st);
+    try testing.expectEqual(@as(i64, 0), w.ctime.seconds);
+    try testing.expectEqual(@as(u32, 0), w.ctime.nanoseconds);
+    st.ctime_sec = 1_700_000_200;
+    st.ctime_nsec = 111_222_333;
+    st.has_ctime = true;
+    w = wireFromHostStat(st);
+    try testing.expectEqual(@as(i64, 1_700_000_200), w.ctime.seconds);
+    try testing.expectEqual(@as(u32, 111_222_333), w.ctime.nanoseconds);
+    try testing.expectEqual(@as(i64, 1_700_000_123), w.mtime.seconds);
+    try testing.expectEqual(metadata.legacy_share_epoch, w.identity.filesystem);
+    try testing.expectEqual(@as(u64, 0), w.identity.inode);
+}
+
+test "M160a (#2981): STATFS — 28-byte decode, status 4 is the named unsupported" {
+    try testing.expectEqual(@as(u8, 0x11), op_statfs);
+    var fs: StatfsResult = .{};
+    var data: [statfs_data_len]u8 = @splat(0);
+    write_le_u64(&data, 0, 100_000);
+    write_le_u64(&data, 8, 60_000);
+    write_le_u64(&data, 16, 50_000);
+    write_le_u32(&data, 24, 4096);
+    try testing.expect(decode_statfs_data(&data, &fs));
+    try testing.expectEqual(@as(u64, 100_000), fs.total);
+    try testing.expectEqual(@as(u64, 60_000), fs.free);
+    try testing.expectEqual(@as(u64, 50_000), fs.avail);
+    try testing.expectEqual(@as(u32, 4096), fs.block_size);
+    // A short record refuses — no half-filled fields escape.
+    fs = .{};
+    try testing.expect(!decode_statfs_data(data[0 .. statfs_data_len - 1], &fs));
+    try testing.expectEqual(@as(u64, 0), fs.total);
+
+    // The in-memory share has no free-space source: named unsupported.
+    const fixture = [_]TestFile{.{ .name = "F.TXT", .data = "x" }};
+    set_test_share(&fixture);
+    try testing.expectEqual(StatfsStatus.unsupported, statfs("F.TXT", &fs));
+    set_test_share(null);
+
+    // An old host answers the unknown op 0x11 with status 4 — through the
+    // real exchange path that reads as `.unsupported`, never the number 4.
+    const head = arm_test_transport();
+    defer disarm_test_transport();
+    const r = &virtio_custom.cv_rings[virtio_custom.file_qidx];
+    r.used.ring[0] = .{ .id = head, .len = reply_hdr_len };
+    r.used.idx = 1;
+    vf_reply_buf[0] = st_host_error;
+    write_le_u16(&vf_reply_buf, 1, 0);
+    try testing.expectEqual(StatfsStatus.unsupported, statfs("", &fs));
+
+    // The new host's ok reply decodes the full record.
+    r.used.ring[1] = .{ .id = head, .len = reply_hdr_len + statfs_data_len };
+    r.used.idx = 2;
+    vf_reply_buf[0] = st_ok;
+    write_le_u16(&vf_reply_buf, 1, statfs_data_len);
+    @memcpy(vf_reply_buf[reply_hdr_len..][0..statfs_data_len], &data);
+    try testing.expectEqual(StatfsStatus.ok, statfs("", &fs));
+    try testing.expectEqual(@as(u64, 100_000), fs.total);
+    try testing.expectEqual(@as(u32, 4096), fs.block_size);
+
+    // An ok status on a too-short record is a host failure, not ok.
+    r.used.ring[2] = .{ .id = head, .len = reply_hdr_len + 4 };
+    r.used.idx = 3;
+    vf_reply_buf[0] = st_ok;
+    write_le_u16(&vf_reply_buf, 1, 4);
+    try testing.expectEqual(StatfsStatus.failed, statfs("", &fs));
 }
 
 test "M134a: list refuses a >31-byte name by name, never truncates" {

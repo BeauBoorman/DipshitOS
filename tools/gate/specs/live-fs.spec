@@ -82,8 +82,9 @@ PY
 # --- M134d (#2762): the storage acceptance journey -------------------------
 #
 # One probe ELF answers both EL0 surfaces the card names: the pinned host
-# mtime (the slot-79 op-0 stat record — mtime_sec rides wire offset 48,
-# the M134a v2 STAT) and the kernel mount table (the slot-27
+# mtime and ctime (the slot-79 op-0 stat record — mtime_sec rides wire
+# offset 48, the M134a v2 STAT; ctime_sec offset 64, filled from the
+# M160a v3 STAT) and the kernel mount table (the slot-27
 # dir_list("/") rows — the reserved triple {state, kind, flags} decoded
 # to the M134b names). It prints m134d-done last, so --script-expect on
 # that marker is the graded run end: the VM stops only after every
@@ -91,9 +92,10 @@ PY
 
 vgate_file m134d.zig <<'EOF'
 // M134d probe: stat /host/pinned-mtime.txt through the metadata syscall
-// (slot 79 op 0; the v2 record carries mtime at offset 48) and enumerate
-// the mount table through sys_dir_list("/") (slot 27; 40-byte rows whose
-// reserved triple is {state, kind, flags}). Prints m134d-done last.
+// (slot 79 op 0; the record carries mtime at offset 48, ctime at 64) and
+// enumerate the mount table through sys_dir_list("/") (slot 27; 40-byte
+// rows whose reserved triple is {state, kind, flags}). Prints
+// m134d-done last.
 fn svc6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) i64 {
     var res: i64 = undefined;
     asm volatile ("svc #0"
@@ -176,10 +178,12 @@ export fn _start() void {
     puts("m134d-stat rc=");
     if (rc < 0) {
         pnum(@bitCast(-rc));
-        puts(" mtime_sec=?\n");
+        puts(" mtime_sec=? ctime_sec=?\n");
     } else {
         puts("0 mtime_sec=");
         pnum(u64le(wire[48..56]));
+        puts(" ctime_sec=");
+        pnum(u64le(wire[64..72]));
         puts("\n");
     }
     const n = svc6(27, @intFromPtr("/"), 1, @intFromPtr(&mrows), 16, 0, 0);
@@ -319,6 +323,22 @@ vgate_assert absent serial-contains 'm134d-done'
 vgate_assert absent serial-absent 'vlfs: mounted /disk'
 vgate_assert absent serial-absent '[EXC] parking:'
 vgate_assert absent output-contains 'VF-FILE: STAT pinned-mtime.txt → file size=7 mtime=1700000123'
+# M160a (#2981): the stat record's ctime_sec equals the staged file's
+# host st_ctime, read after the run — nothing mutates it between the
+# setup python's stage and this check, so the equality is exact.
+vgate_assert absent python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], "rb").read()
+m = re.search(rb"m134d-stat rc=0 mtime_sec=\d+ ctime_sec=(\d+)", ser)
+if not m:
+    sys.exit("FAIL: no m134d-stat ctime_sec on serial")
+guest = int(m.group(1))
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+host = os.stat(os.path.join(share, "pinned-mtime.txt")).st_ctime_ns // 1_000_000_000
+if guest != host:
+    sys.exit("FAIL: guest ctime_sec=%d != host st_ctime=%d" % (guest, host))
+print("m134d ctime_sec=%d == host st_ctime" % guest)
+PY
 
 # --- leg mounted: /disk opted in — journaled write, read-back, FLUSH -------
 vgate_run mounted -- --data-disk '$RUN_DIR/vlfs.img' --script '$RUN_DIR/script-mounted.txt' --script-expect 'm134d-done' --timeout 90

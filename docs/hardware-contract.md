@@ -155,7 +155,8 @@ Read-only ops:
 | VF_PROBE `0x00` | (empty) | the RAW 32,768-byte pattern `pattern[i]=(i&0xff)^((i>>8)&0xff)` — **no frame** (transport-only; the op tells the guest what the reply means) |
 | LIST `0x01` | path (empty = root) | 40-byte rows `[name 31][type u8][size u64le]`, ≤128 rows, sorted by name |
 | READ `0x02` | `[path][u64le offset]` | ≤ 32,765 data bytes (the 3-byte frame leaves 32,765 of the 32 KiB reply cap) |
-| STAT `0x03` | path | `[size u64le][type u8]` |
+| STAT `0x03` | path | `[size u64le][type u8]`; v2 appends `[mtime_sec u64le][mtime_nsec u32le]` (21 B), v3 appends `[ctime_sec u64le][ctime_nsec u32le][birth_sec u64le][birth_nsec u32le][alloc_bytes u64le]` (53 B); a shorter reply's absent groups are flagged absent, never zero-filled |
+| STATFS `0x11` | path (share root) | `[total u64le][free u64le][avail u64le][block_size u32le]` (28 B; counts in `block_size` units). Additive — an old host answers status `4`, the guest's named "statfs unsupported" |
 
 Mutation ops (HF3, issue #737 — **additive** 0x04..0x0b, so old hosts
 answer them with status `4` and old guests never send them: no version

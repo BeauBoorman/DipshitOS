@@ -43,6 +43,10 @@ public enum VFWire {
     public static let opDirClose: UInt8 = 0x0f
     // B4: old hosts refuse this unknown opcode before touching either path.
     public static let opReplace: UInt8 = 0x10
+    // M160a (#2981): STATFS — the share root's free-space truth, additive
+    // under the same rule: an old host answers the unknown op with status
+    // 4, which the guest reads as the named "unsupported".
+    public static let opStatfs: UInt8 = 0x11
 
     // Reply statuses
     public static let stOk: UInt8 = 0
@@ -72,51 +76,127 @@ public enum VFWire {
     public static let readOffsetLen = 8
     // M134a (#2759): STAT reply data — v1 is [size u64le][type u8] (9 B);
     // v2 appends [mtime_sec u64le][mtime_nsec u32le] (21 B total).
+    // M160a (#2981): v3 appends [ctime_sec u64le][ctime_nsec u32le]
+    // [birth_sec u64le][birth_nsec u32le][alloc_bytes u64le] (53 B total).
+    // The per-group end offsets let a mid-v3 reply decode only the groups
+    // that fully arrived — absent fields are nil, never zero-filled facts.
     public static let statBaseDataLen = 9
-    public static let statDataLen = 21
+    public static let statV2DataLen = 21
+    public static let statV3CtimeLen = 33
+    public static let statV3BirthLen = 45
+    public static let statDataLen = 53
 
-    /// STAT reply data, both shapes. `mtimeSec == nil` names the absent
-    /// case — a pre-M134a 9-byte reply or a deliberately old-shaped peer.
+    /// STAT reply data, all three shapes. A nil field names the absent
+    /// case — a shorter reply shape or a deliberately old-shaped peer.
     public struct StatData {
         public let size: UInt64
         public let isDir: Bool
         public let mtimeSec: UInt64?
         public let mtimeNsec: UInt32?
+        public let ctimeSec: UInt64?
+        public let ctimeNsec: UInt32?
+        public let birthSec: UInt64?
+        public let birthNsec: UInt32?
+        public let allocBytes: UInt64?
     }
 
-    /// Encode STAT reply data; `includeMtime` selects the v2 (21-byte)
-    /// shape, `false` the pre-M134a 9-byte shape an old guest expects.
-    public static func encodeStatData(size: UInt64, isDir: Bool, mtimeSec: UInt64, mtimeNsec: UInt32, includeMtime: Bool) -> [UInt8] {
+    /// Encode STAT reply data. `includeMtime` false emits the pre-M134a
+    /// 9-byte shape an old guest expects; true emits the full M160a v3
+    /// shape (53 bytes — mtime, ctime, birth, allocated).
+    public static func encodeStatData(size: UInt64, isDir: Bool,
+                                      mtimeSec: UInt64, mtimeNsec: UInt32,
+                                      ctimeSec: UInt64, ctimeNsec: UInt32,
+                                      birthSec: UInt64, birthNsec: UInt32,
+                                      allocBytes: UInt64, includeMtime: Bool) -> [UInt8] {
         var out: [UInt8] = []
         var s = size
         for _ in 0..<8 { out.append(UInt8(s & 0xff)); s >>= 8 }
         out.append(isDir ? dirTypeDir : dirTypeFile)
         if includeMtime {
-            var sec = mtimeSec
-            for _ in 0..<8 { out.append(UInt8(sec & 0xff)); sec >>= 8 }
-            var ns = mtimeNsec
-            for _ in 0..<4 { out.append(UInt8(ns & 0xff)); ns >>= 8 }
+            // v3 is v2's [mtime_sec u64le][mtime_nsec u32le] followed by
+            // the same [sec u64le][nsec u32le] pair for ctime and birth,
+            // then [alloc_bytes u64le] — 32 extension bytes, 53 total.
+            for (sec, nsec) in [(mtimeSec, mtimeNsec), (ctimeSec, ctimeNsec), (birthSec, birthNsec)] {
+                var s = sec
+                for _ in 0..<8 { out.append(UInt8(s & 0xff)); s >>= 8 }
+                var n = nsec
+                for _ in 0..<4 { out.append(UInt8(n & 0xff)); n >>= 8 }
+            }
+            var a = allocBytes
+            for _ in 0..<8 { out.append(UInt8(a & 0xff)); a >>= 8 }
         }
         return out
     }
 
-    /// Decode STAT reply data, accepting the old (>=9) and new (>=21)
-    /// lengths — the same tolerance the guest's decode_stat_reply has.
-    /// nil when the data is shorter than the base record.
+    /// Decode STAT reply data, accepting the v1 (>=9), v2 (>=21) and v3
+    /// (>=53, with per-group mid-length tolerance) lengths — the same
+    /// tolerance the guest's decode_stat_reply has. nil when the data is
+    /// shorter than the base record.
     public static func decodeStatData(_ data: [UInt8]) -> StatData? {
         guard data.count >= statBaseDataLen else { return nil }
         var size: UInt64 = 0
         for i in 0..<8 { size |= UInt64(data[i]) << (8 * i) }
-        var mtime: (UInt64, UInt32)? = nil
-        if data.count >= statDataLen {
-            var sec: UInt64 = 0
-            for i in 0..<8 { sec |= UInt64(data[9 + i]) << (8 * i) }
-            var ns: UInt32 = 0
-            for i in 0..<4 { ns |= UInt32(data[17 + i]) << (8 * i) }
-            mtime = (sec, ns)
+        func u64le(_ off: Int) -> UInt64 {
+            var v: UInt64 = 0
+            for i in 0..<8 { v |= UInt64(data[off + i]) << (8 * i) }
+            return v
         }
+        func u32le(_ off: Int) -> UInt32 {
+            var v: UInt32 = 0
+            for i in 0..<4 { v |= UInt32(data[off + i]) << (8 * i) }
+            return v
+        }
+        var mtime: (UInt64, UInt32)? = nil
+        if data.count >= statV2DataLen { mtime = (u64le(9), u32le(17)) }
+        var ctime: (UInt64, UInt32)? = nil
+        if data.count >= statV3CtimeLen { ctime = (u64le(21), u32le(29)) }
+        var birth: (UInt64, UInt32)? = nil
+        if data.count >= statV3BirthLen { birth = (u64le(33), u32le(41)) }
+        var alloc: UInt64? = nil
+        if data.count >= statDataLen { alloc = u64le(45) }
         return StatData(size: size, isDir: data[8] == dirTypeDir,
-                        mtimeSec: mtime?.0, mtimeNsec: mtime?.1)
+                        mtimeSec: mtime?.0, mtimeNsec: mtime?.1,
+                        ctimeSec: ctime?.0, ctimeNsec: ctime?.1,
+                        birthSec: birth?.0, birthNsec: birth?.1,
+                        allocBytes: alloc)
+    }
+
+    /// M160a (#2981): STATFS reply data — [total u64le][free u64le]
+    /// [avail u64le][block_size u32le], 28 bytes; the counts are in
+    /// `blockSize` units (statvfs semantics: blocks × bsize = bytes).
+    public static let statfsDataLen = 28
+
+    public struct StatfsData {
+        public let total: UInt64
+        public let free: UInt64
+        public let avail: UInt64
+        public let blockSize: UInt32
+    }
+
+    public static func encodeStatfsData(total: UInt64, free: UInt64, avail: UInt64, blockSize: UInt32) -> [UInt8] {
+        var out: [UInt8] = []
+        for v in [total, free, avail] {
+            var x = v
+            for _ in 0..<8 { out.append(UInt8(x & 0xff)); x >>= 8 }
+        }
+        var b = blockSize
+        for _ in 0..<4 { out.append(UInt8(b & 0xff)); b >>= 8 }
+        return out
+    }
+
+    /// nil when the data is shorter than the 28-byte record — the fields
+    /// stay absent, never half-filled (mirrors the guest's
+    /// decode_statfs_data).
+    public static func decodeStatfsData(_ data: [UInt8]) -> StatfsData? {
+        guard data.count >= statfsDataLen else { return nil }
+        func u64le(_ off: Int) -> UInt64 {
+            var v: UInt64 = 0
+            for i in 0..<8 { v |= UInt64(data[off + i]) << (8 * i) }
+            return v
+        }
+        var bsize: UInt32 = 0
+        for i in 0..<4 { bsize |= UInt32(data[24 + i]) << (8 * i) }
+        return StatfsData(total: u64le(0), free: u64le(8), avail: u64le(16), blockSize: bsize)
     }
     // HF3 scalar field lengths + the handle-table cap (parity with the
     // kernel's file_table.zig — max_handles_per_process = 8).
