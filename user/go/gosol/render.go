@@ -9,6 +9,7 @@
 package main
 
 import (
+	"virelai/draw"
 	"virelai/theme"
 	"virelai/webrender/font"
 	"virelai/widgets"
@@ -35,11 +36,15 @@ var suitBmp = [4][7]byte{
 }
 
 // fill is the one paint entry point: a clamped rect on the bound canvas.
+// The palette is 24-bit theme-token style; the bound BufferCanvas is an
+// ARGB compositor, so every colour goes out Opaque (the M145c fix — a
+// 0x00RRGGBB token blended nothing: the whole table stayed the surface's
+// zero pages, observed black in the go-games VM legs).
 func (b *board) fill(c widgets.Canvas, r widgets.Rect, rgb uint32) {
 	if r.Empty() || r.X < 0 || r.Y < 0 {
 		return
 	}
-	c.FillRect(r, rgb)
+	c.FillRect(r, draw.Opaque(rgb))
 }
 
 // text paints a string in the 8x8 face at scale 1 — the same glyph-run
@@ -103,8 +108,8 @@ func cardInk(c Card) uint32 {
 // carries the card's name.
 func (b *board) card(cvs widgets.Canvas, c Card, x, y int) {
 	r := widgets.Rect{X: x, Y: y, W: cardW, H: cardH}
-	cvs.FillRoundedRect(r, 5, cardFace)
-	cvs.StrokeRoundedRect(r, 5, 1, cardEdge)
+	cvs.FillRoundedRect(r, 5, draw.Opaque(cardFace))
+	cvs.StrokeRoundedRect(r, 5, 1, draw.Opaque(cardEdge))
 	ink := cardInk(c)
 	b.text(cvs, x+4, y+3, c.rankText(), ink)
 	b.suit(cvs, x+4, y+13, c.Suit, ink)
@@ -118,16 +123,16 @@ func (b *board) card(cvs widgets.Canvas, c Card, x, y int) {
 func (b *board) back(cvs widgets.Canvas, x, y int) {
 	r := widgets.Rect{X: x, Y: y, W: cardW, H: cardH}
 	tok := theme.Current
-	cvs.FillRoundedRect(r, 5, tok.Accent)
-	cvs.StrokeRoundedRect(r, 5, 1, cardEdge)
-	cvs.StrokeRoundedRect(r.Inset(4), 3, 1, tok.OnAccent)
+	cvs.FillRoundedRect(r, 5, draw.Opaque(tok.Accent))
+	cvs.StrokeRoundedRect(r, 5, 1, draw.Opaque(cardEdge))
+	cvs.StrokeRoundedRect(r.Inset(4), 3, 1, draw.Opaque(tok.OnAccent))
 }
 
 // slot paints an empty pile's outline — a frame on the felt, nothing more.
 func (b *board) slot(cvs widgets.Canvas, r widgets.Rect) {
 	tok := theme.Current
-	cvs.FillRoundedRect(r, 5, tok.Surface)
-	cvs.StrokeRoundedRect(r, 5, 1, tok.Border)
+	cvs.FillRoundedRect(r, 5, draw.Opaque(tok.Surface))
+	cvs.StrokeRoundedRect(r, 5, 1, draw.Opaque(tok.Border))
 }
 
 // skip reports whether (l, idx) is inside the dragged run — those cards
