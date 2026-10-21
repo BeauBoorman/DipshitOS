@@ -1,4 +1,5 @@
-# go-reader.spec -- M143a (issue #2792) + M143b (issue #2793) class-B gate:
+# go-reader.spec -- M143a (issue #2792) + M143b (issue #2793) + M153c
+# (issue #2923) class-B gate:
 # GOREADER.ELF, the Document mime's registered handler, opens a corpus-
 # authored PDF on VZ, and the three open chains that route documents to it
 # and images to GOVIEW all land end to end.
@@ -16,6 +17,17 @@
 # Run 02 is the refusal leg: STROKE.PDF is the M89 corpus's pinned
 # unsupported-stroke negative; the engine's UnsupportedStroke must reach
 # the console AND the window (Danger-ink probe on the snapshot).
+#
+# Run 04 (M153c) is the v2 leg: one boot execs GOREADER on PAGES.PDF, 'end'
+# lands page 3 (absolute — immune to a carried-over position row), 'b'
+# bookmarks it, 's'+return saves a byte copy through the picker (the app's
+# seeded PAGES-COPY.PDF name), and 'q' quits, which flush-writes
+# /host/GOREADER.POS. script2 re-execs the same document: the row's
+# page/zoom/bookmarks restore and the 'goreader: pos page=3 bm=3' marker is
+# the reopen's proof. The python assert compares the copy's SHA-256 to the
+# source's AND removes both GOREADER.POS and the copy, because the armed
+# share persists across the vgate_repeat boots — position memory must not
+# bleed into the next iteration's run 01.
 #
 # Run 03 (M143b) is the K=3 acceptance journey: one boot walks all three
 # open chains, and vgate_repeat 3 replays the whole spec so every leg is
@@ -454,4 +466,87 @@ rows = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
 assert any("WEB-DL-RDRPDF.PDF" in r for r in rows), "no ledger row for the download"
 print("go-reader 03 chain ok (web->goreader->gofiles->goreader->gofiles->goview "
       "ordering, share file %dB == source, ledger row)" % len(got))
+PY
+
+# --- run 04 (M153c #2923): bookmarks, position memory, save a copy --------
+# script files
+vgate_file script-v2.txt <<'EOF'
+exec GOREADER.ELF /host/READER/PAGES.PDF
+EOF
+
+vgate_file script-v2-reopen.txt <<'EOF'
+exec GOREADER.ELF /host/READER/PAGES.PDF
+EOF
+
+vgate_file script2-v2.txt <<'EOF'
+echo rx-reader-v2-ok
+EOF
+
+# One chord batch drives the whole first lifetime: end -> page 3 (absolute
+# landing, so a position row left by run 01 cannot skew it), b -> bookmark,
+# s -> picker with the seeded PAGES-COPY.PDF name, return -> the picker's
+# save verb, q -> quit (the close-write publishes GOREADER.POS). script2
+# re-execs the same document once the quit marker lands; its 'pos page=3'
+# restore marker fires script3's rx- end marker.
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen-04' \
+    --via-virtio \
+    --script '$RUN_DIR/script-v2.txt' \
+    --input-chords 'end,b,s,return,q' \
+    --input-chords-after 'goreader: ready' \
+    --script2 '$RUN_DIR/script-v2-reopen.txt' \
+    --script2-after 'goreader: quit' \
+    --script3 '$RUN_DIR/script2-v2.txt' \
+    --script3-after 'goreader: pos page=3' \
+    --script-expect 'rx-reader-v2-ok' --timeout 240
+
+vgate_assert 04 serial-contains 'exec: loaded GOREADER.ELF'
+vgate_assert 04 serial-contains 'goreader: loaded PAGES.PDF pages=3'
+vgate_assert 04 serial-contains 'goreader: page 3/3'
+vgate_assert 04 serial-contains 'goreader: bookmark on page=3 n=1'
+vgate_assert 04 serial-contains 'goreader: save pick'
+vgate_assert 04 serial-contains 'goreader: save /host/READER/PAGES-COPY.PDF bytes='
+vgate_assert 04 serial-contains 'goreader: quit'
+vgate_assert 04 serial-contains 'goreader: pos saved n='
+# The reopen: position + the bookmark list ride back out of GOREADER.POS.
+vgate_assert 04 serial-contains 'goreader: pos page=3'
+vgate_assert 04 serial-contains ' bm=3'
+vgate_assert 04 serial-contains 'rx-reader-v2-ok'
+vgate_assert 04 serial-absent 'goreader: refuse'
+vgate_assert 04 serial-absent 'goreader: save rc='
+vgate_assert 04 serial-absent 'goreader: pos rc='
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent 'exited status=139'
+
+# Share-side proof, then the reset that keeps vgate_repeat deterministic:
+# the copy is byte-identical (SHA-256) and the POS row names page 2
+# (0-based) with bookmark [2] under the document's path+size+sha8 key; then
+# both artifacts are removed so iteration n+1's run 01 opens PAGES.PDF cold.
+vgate_assert 04 python <<'PY'
+import hashlib, os
+share = os.environ["VG_SHARE"]
+src = os.path.join(share, "READER", "PAGES.PDF")
+copy = os.path.join(share, "READER", "PAGES-COPY.PDF")
+pos = os.path.join(share, "GOREADER.POS")
+assert os.path.exists(copy), "save-a-copy never landed"
+hsrc = hashlib.sha256(open(src, "rb").read()).hexdigest()
+assert hashlib.sha256(open(copy, "rb").read()).hexdigest() == hsrc, \
+    "copy bytes differ from source"
+rows = [l for l in open(pos, errors="replace").read().splitlines()
+        if l and not l.startswith("#")]
+assert rows, "GOREADER.POS has no rows"
+hexpath = "/host/READER/PAGES.PDF".encode().hex()
+sha8 = hashlib.sha256(open(src, "rb").read(4096)).hexdigest()[:16]
+match = [r for r in rows if r.endswith("\t" + hexpath)]
+assert match, "no GOREADER.POS row for PAGES.PDF"
+f = match[0].split("\t")
+assert len(f) == 7, "row shape %r" % match[0]
+assert f[0] == str(os.path.getsize(src)), "size key %r" % f[0]
+assert f[1] == sha8, "sha8 key %r want %s" % (f[1], sha8)
+assert f[2] == "2", "stored page %r (want 0-based 2)" % f[2]
+assert "2" in f[5].split(","), "bookmark missing from %r" % f[5]
+os.unlink(pos)
+os.unlink(copy)
+print("goreader v2: copy sha256=%s identical; pos row page=2 bm=2; "
+      "share reset for next iteration" % hsrc[:16])
 PY

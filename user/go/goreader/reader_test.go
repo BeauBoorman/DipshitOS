@@ -144,17 +144,187 @@ func TestBlendRect(t *testing.T) {
 }
 
 func TestStateCodec(t *testing.T) {
-	b := encodeState("/host/READER/PAGES.PDF", 1, 150, true)
-	path, page, zoom, fit, ok := decodeState(b)
+	b := encodeState("/host/READER/PAGES.PDF", 1, 150, true, []int{0, 2})
+	path, page, zoom, fit, bmk, ok := decodeState(b)
 	if !ok || path != "/host/READER/PAGES.PDF" || page != 1 || zoom != 150 || !fit {
 		t.Fatalf("roundtrip = %q %d %d %v %v", path, page, zoom, fit, ok)
 	}
-	// A blob from a different appver is refused, never misread.
+	if len(bmk) != 2 || bmk[0] != 0 || bmk[1] != 2 {
+		t.Fatalf("blob bookmarks = %v", bmk)
+	}
+	// A blob from a different appver is refused, never misread — including
+	// v1, which has no bookmark tail and is one byte short anyway.
 	b[0] = 9
-	if _, _, _, _, ok = decodeState(b); ok {
+	if _, _, _, _, _, ok = decodeState(b); ok {
 		t.Fatal("stale version accepted")
 	}
-	if _, _, _, _, ok = decodeState([]byte{1, 0}); ok {
+	if _, _, _, _, _, ok = decodeState([]byte{1, 0}); ok {
 		t.Fatal("truncated blob accepted")
+	}
+	// A bookmark count past the tail's real bytes is refused, not overrun.
+	b = encodeState("/host/A.PDF", 0, 100, false, nil)
+	b[len(b)-1] = 4
+	if _, _, _, _, _, ok = decodeState(b); ok {
+		t.Fatal("overclaimed bookmark tail accepted")
+	}
+}
+
+func TestBookmarkSet(t *testing.T) {
+	var s []int
+	var marked, changed bool
+	// Adds land sorted; a second toggle on the same page removes it.
+	s, marked, changed = bmToggle(s, 4)
+	if !marked || !changed || len(s) != 1 || s[0] != 4 {
+		t.Fatal("first add")
+	}
+	s, marked, changed = bmToggle(s, 1)
+	if !marked || !changed || s[0] != 1 || s[1] != 4 {
+		t.Fatalf("sorted insert = %v", s)
+	}
+	s, marked, changed = bmToggle(s, 4)
+	if marked || !changed || len(s) != 1 || s[0] != 1 {
+		t.Fatal("toggle off")
+	}
+	// The 16-mark bound refuses the seventeenth add, by name.
+	s = nil
+	for i := 0; i < posMaxBookmarks; i++ {
+		s, marked, changed = bmToggle(s, i)
+		if !marked || !changed {
+			t.Fatalf("add %d refused early", i)
+		}
+	}
+	if _, _, changed = bmToggle(s, 99); changed {
+		t.Fatal("full set accepted an add")
+	}
+	// ...but a removal from the full set still lands.
+	s, marked, changed = bmToggle(s, 3)
+	if marked || !changed || len(s) != posMaxBookmarks-1 {
+		t.Fatal("full set refused a removal")
+	}
+}
+
+func TestBookmarkJump(t *testing.T) {
+	s := []int{2, 5, 9}
+	// Next steps forward through the set and wraps at the tail.
+	for cur, want := range map[int]int{0: 2, 2: 5, 8: 9, 9: 2, 20: 2} {
+		if got, ok := bmNext(s, cur); !ok || got != want {
+			t.Fatalf("bmNext(%d) = %d,%v want %d", cur, got, ok, want)
+		}
+	}
+	for cur, want := range map[int]int{0: 9, 2: 9, 6: 5, 9: 5} {
+		if got, ok := bmPrev(s, cur); !ok || got != want {
+			t.Fatalf("bmPrev(%d) = %d,%v want %d", cur, got, ok, want)
+		}
+	}
+	if _, ok := bmNext(nil, 0); ok {
+		t.Fatal("empty set jumped")
+	}
+	if bmList(s) != "3,6,10" || bmList(nil) != "-" {
+		t.Fatalf("bmList = %q", bmList(s))
+	}
+}
+
+func TestPosCodec(t *testing.T) {
+	mk := func(path string, data string) posEntry {
+		return posKey(path, []byte(data))
+	}
+	a := mk("/host/A.PDF", "aaaa")
+	c := mk("/host/C.PDF", "cccc")
+	a.page, a.zoom, a.fit, a.bmk = 2, 150, false, []int{0, 2}
+	c.page, c.zoom, c.fit = 0, 100, true
+
+	ents := decodePosFile(encodePosFile([]posEntry{a, c}))
+	if len(ents) != 2 {
+		t.Fatalf("roundtrip = %d entries", len(ents))
+	}
+	got := ents[0]
+	if got.path != a.path || got.size != a.size || got.sha != a.sha ||
+		got.page != 2 || got.zoom != 150 || got.fit ||
+		len(got.bmk) != 2 || got.bmk[1] != 2 {
+		t.Fatalf("row = %+v", got)
+	}
+	if !ents[1].fit {
+		t.Fatal("fit flag lost")
+	}
+
+	// The key is path+size+head-sha: same path, different bytes misses.
+	moved := mk("/host/A.PDF", "different-bytes!")
+	if posFind(ents, moved) >= 0 {
+		t.Fatal("changed content matched the old key")
+	}
+	grown := mk("/host/A.PDF", "aaaa+")
+	if posFind(ents, grown) >= 0 {
+		t.Fatal("changed size matched the old key")
+	}
+	if posFind(ents, a) < 0 {
+		t.Fatal("same document missed its key")
+	}
+}
+
+func TestPosEvictionAndUpsert(t *testing.T) {
+	var ents []posEntry
+	for i := 0; i < posMaxEntries+3; i++ {
+		name := "/host/D" + string(rune('A'+i/26)) + string(rune('A'+i%26)) + ".PDF"
+		e := posKey(name, []byte(name))
+		e.page = i
+		ents = posUpsert(ents, e)
+	}
+	if len(ents) != posMaxEntries {
+		t.Fatalf("cap = %d", len(ents))
+	}
+	// Most-recent first: the last three writes lead, the oldest are gone.
+	if ents[0].page != posMaxEntries+2 || ents[1].page != posMaxEntries+1 {
+		t.Fatalf("front = %d,%d", ents[0].page, ents[1].page)
+	}
+	// Re-touching a middle row moves it to the front and drops its twin.
+	k := posKey(ents[10].path, []byte(ents[10].path))
+	moved := ents[10]
+	moved.page = 7
+	ents = posUpsert(ents, moved)
+	if ents[0].page != 7 || posFind(ents, k) != 0 {
+		t.Fatal("re-touch did not move to front")
+	}
+	seen := 0
+	for _, e := range ents {
+		if e.path == moved.path {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatal("stale same-path row survived")
+	}
+}
+
+func TestPosFileRobust(t *testing.T) {
+	good := encodePosFile([]posEntry{posKey("/host/A.PDF", []byte("a"))})
+	var bad []byte
+	bad = append(bad, "# comment\n\n"...)
+	bad = append(bad, "1\t2\t3\n"...)                // short row
+	bad = append(bad, "x\ty\tz\tz\tz\tz\tz\n"...)    // unparsable
+	bad = append(bad, "9\tzz\t0\t100\t0\t\tzz\n"...) // bad hex fields
+	bad = append(bad, good...)
+	if ents := decodePosFile(bad); len(ents) != 1 {
+		t.Fatalf("malformed rows survived = %d", len(ents))
+	}
+	if got := decodePosFile(nil); len(got) != 0 {
+		t.Fatal("empty file produced rows")
+	}
+}
+
+func TestCopyName(t *testing.T) {
+	if got := copyName("PAGES.PDF"); got != "PAGES-COPY.PDF" {
+		t.Fatalf("copyName = %q", got)
+	}
+	if got := copyName("notes.pdf"); got != "notes-COPY.PDF" {
+		t.Fatalf("copyName lower = %q", got)
+	}
+	if got := copyName("PLAIN"); got != "PLAIN-COPY" {
+		t.Fatalf("copyName bare = %q", got)
+	}
+	if got := dirname("/host/READER/PAGES.PDF"); got != "/host/READER" {
+		t.Fatalf("dirname = %q", got)
+	}
+	if got := dirname("BARE.PDF"); got != "/host" {
+		t.Fatalf("dirname bare = %q", got)
 	}
 }

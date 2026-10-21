@@ -15,6 +15,7 @@
 package main
 
 import (
+	"virelai/appkit"
 	"virelai/draw"
 	"virelai/find"
 	"virelai/pdf"
@@ -46,6 +47,11 @@ const (
 	markerStateSaved  = "goreader: state saved n="
 	markerStateStale  = "goreader: state stale"
 	markerRestored    = "goreader: restored "
+	markerPos         = "goreader: pos "
+	markerPosSaved    = "goreader: pos saved n="
+	markerPosErr      = "goreader: pos rc="
+	markerBookmark    = "goreader: bookmark "
+	markerSave        = "goreader: save "
 	markerPresent     = "goreader: present"
 	markerReady       = "goreader: ready"
 	markerQuit        = "goreader: quit"
@@ -126,9 +132,20 @@ type app struct {
 	hitIdx     int
 	hadHit     bool // a hit was jumped to — repeats step from it
 	modeFind   bool
-	pend       *pendState // decoded save_state blob, applied post-load
+	pick       appkit.FilePicker // save-a-copy modal; .Open gates key routing
+	bmk        []int             // sorted bookmarked page indexes (≤16)
+	pend       *pendState        // decoded save_state blob, applied post-load
 	pendBad    bool
 	pendingLog []string // markers flushed after the repaint they report
+
+	// Position memory: key is this document's (path,size,sha8) identity,
+	// posEnt the GOREADER.POS row it matched at open (nil on a miss), and
+	// posDirty/posAt the debounce: a page/zoom/bookmark change is written
+	// after posDebounceNs of quiet and unconditionally on close.
+	key      posEntry
+	posEnt   *posEntry
+	posDirty bool
+	posAt    uint64
 }
 
 // pendState is the decoded save_state blob waiting for the load it
@@ -139,6 +156,7 @@ type pendState struct {
 	page int
 	zoom int
 	fit  bool
+	bmk  []int
 }
 
 func now() uint64 { return uint64(vi.Nanos()) }
@@ -210,6 +228,11 @@ func (a *app) load(path string) {
 	a.pg.page = 0
 	a.texts = extractPages(data)
 	a.st = loadOkay
+	// Position memory: the document's identity is known only now that its
+	// bytes are. The POS row it matches (if any) waits for applyPos — a
+	// seat-restore blob still wins over the file.
+	a.key = posKey(a.path, data)
+	a.posEnt = posLookup(a.key)
 	vi.ConsoleLine(markerLoaded + a.name + " pages=" + vi.Itoa64(int64(a.pg.pages)) +
 		" " + vi.Itoa64(int64(a.pw)) + "x" + vi.Itoa64(int64(a.ph)) +
 		" bytes=" + vi.Itoa64(int64(len(data))))
@@ -267,6 +290,7 @@ func (a *app) goPage(i int) {
 	if a.renderPage(a.pg.page) {
 		a.pendingLog = append(a.pendingLog,
 			markerPage+vi.Itoa64(int64(a.pg.page+1))+"/"+vi.Itoa64(int64(a.pg.pages)))
+		a.markPos()
 	}
 }
 
@@ -286,6 +310,7 @@ func (a *app) setZoom(idx int, fit bool) {
 		dw, _ := displayedSize(uint32(a.pw), uint32(a.ph), a.zoom())
 		a.ox = clampU32(a.ox, panMax(uint32(a.pw), dw, vp.W))
 		a.oy = clampU32(a.oy, a.maxOY())
+		a.markPos()
 		if fit {
 			a.pendingLog = append(a.pendingLog, markerFit+u32s(a.zoom())+"%")
 		} else {
@@ -324,6 +349,7 @@ func (a *app) jumpHit(i int) {
 		a.pg.page = h.page
 		a.ox, a.oy = 0, 0
 		a.renderPage(h.page)
+		a.markPos()
 	}
 	if h.page < len(a.texts) {
 		rs := mergeHitRects(a.texts[h.page].glyphs, h.start, h.end)
@@ -377,7 +403,7 @@ func (a *app) runFind(dir int) {
 // ---------------------------------------------------------------------------
 
 func (a *app) saveState() []byte {
-	b := encodeState(a.path, a.pg.page, int(a.zoom()), a.fit)
+	b := encodeState(a.path, a.pg.page, int(a.zoom()), a.fit, a.bmk)
 	vi.ConsoleLine(markerStateSaved + vi.Itoa64(int64(len(b))))
 	return b
 }
@@ -386,20 +412,20 @@ func (a *app) saveState() []byte {
 // loads: it only decodes and stashes; the blob's path wins over argv (a
 // session re-exec runs the bare bin).
 func (a *app) noteState(b []byte) {
-	path, page, zoom, fit, ok := decodeState(b)
+	path, page, zoom, fit, bmk, ok := decodeState(b)
 	if !ok {
 		a.pendBad = true
 		return
 	}
-	a.pend = &pendState{path: path, page: page, zoom: zoom, fit: fit}
+	a.pend = &pendState{path: path, page: page, zoom: zoom, fit: fit, bmk: bmk}
 	if path != "" {
 		a.path = path
 		a.name = basename(path)
 	}
 }
 
-// applyRestored runs right after load: page and zoom land on the document
-// the blob described, clamped to what actually opened.
+// applyRestored runs right after load: page, zoom and bookmarks land on the
+// document the blob described, clamped to what actually opened.
 func (a *app) applyRestored() {
 	if a.pendBad {
 		vi.ConsoleLine(markerStateStale)
@@ -424,11 +450,167 @@ func (a *app) applyRestored() {
 		}
 	}
 	a.zoomIdx = idx
+	a.bmk = append(a.bmk, a.pend.bmk...)
 	if a.pend.page > 0 {
 		a.goPage(a.pend.page)
 	}
+	a.markPos()
 	vi.ConsoleLine(markerRestored + "page=" + vi.Itoa64(int64(a.pg.page+1)) +
-		" z=" + vi.Itoa64(int64(a.zoom())))
+		" z=" + vi.Itoa64(int64(a.zoom())) +
+		" bm=" + bmList(a.bmk))
+}
+
+// ---------------------------------------------------------------------------
+// Position memory + bookmarks + save a copy (M153c, issue #2923)
+// ---------------------------------------------------------------------------
+
+// markPos arms the debounce: the position file is written on close and
+// after posDebounceNs without a position-affecting change.
+func (a *app) markPos() {
+	if a.st != loadOkay {
+		return
+	}
+	a.posDirty = true
+	a.posAt = now()
+}
+
+// posLookup reads /host/GOREADER.POS and returns the row this document's
+// key matches — nil on a miss, a corrupt row set, or an absent file.
+func posLookup(key posEntry) *posEntry {
+	b, rc := vi.ReadFileAll(posPath, posFileMax)
+	if rc < 0 {
+		return nil
+	}
+	ents := decodePosFile(b)
+	if i := posFind(ents, key); i >= 0 {
+		e := ents[i]
+		return &e
+	}
+	return nil
+}
+
+// applyPos runs after load when no seat blob claimed the restore: the POS
+// row's page (nearest-table zoom, fit) and bookmarks land on the document.
+func (a *app) applyPos() {
+	if a.pend != nil || a.st != loadOkay || a.posEnt == nil {
+		return
+	}
+	e := a.posEnt
+	a.fit = e.fit
+	idx := zoomDefaultIdx
+	if !e.fit {
+		best := 1 << 30
+		for i, t := range zoomTable {
+			d := int(t) - e.zoom
+			if d < 0 {
+				d = -d
+			}
+			if d < best {
+				best, idx = d, i
+			}
+		}
+	}
+	a.zoomIdx = idx
+	a.bmk = append(a.bmk, e.bmk...)
+	if e.page > 0 {
+		a.goPage(e.page)
+	}
+	a.markPos()
+	vi.ConsoleLine(markerPos + "page=" + vi.Itoa64(int64(a.pg.page+1)) +
+		" z=" + vi.Itoa64(int64(a.zoom())) + " bm=" + bmList(a.bmk))
+}
+
+// flushPos rewrites the position file with this document's row most-recent
+// first, LRU-evicting past posMaxEntries. WriteFileSafe's temp+rename keeps
+// a crash between open and publish from leaving a torn file.
+func (a *app) flushPos() {
+	if a.st != loadOkay || !a.posDirty {
+		return
+	}
+	a.posDirty = false
+	var ents []posEntry
+	if b, rc := vi.ReadFileAll(posPath, posFileMax); rc >= 0 {
+		ents = decodePosFile(b)
+	}
+	e := a.key
+	e.page, e.zoom, e.fit, e.bmk = a.pg.page, int(a.zoom()), a.fit, a.bmk
+	merged := posUpsert(ents, e)
+	if rc := vi.WriteFileSafe(posPath, encodePosFile(merged)); rc < 0 {
+		a.posDirty = true // stay armed; the next quiet pass retries
+		vi.ConsoleLine(markerPosErr + vi.Itoa64(rc))
+		return
+	}
+	vi.ConsoleLine(markerPosSaved + vi.Itoa64(int64(len(merged))))
+}
+
+// toggleBookmark adds or clears the current page's mark — a full set
+// refuses the add by name.
+func (a *app) toggleBookmark() {
+	if a.st != loadOkay {
+		return
+	}
+	ns, marked, changed := bmToggle(a.bmk, a.pg.page)
+	if !changed {
+		a.pendingLog = append(a.pendingLog,
+			markerBookmark+"full n="+u32s(uint32(len(a.bmk))))
+		return
+	}
+	a.bmk = ns
+	verb := "off"
+	if marked {
+		verb = "on"
+	}
+	a.pendingLog = append(a.pendingLog,
+		markerBookmark+verb+" page="+u32s(uint32(a.pg.page+1))+
+			" n="+u32s(uint32(len(a.bmk))))
+	a.markPos()
+}
+
+// jumpBookmark lands on the next (dir>0) or previous (dir<0) marked page,
+// wrapping at the ends of the set.
+func (a *app) jumpBookmark(dir int) bool {
+	if a.st != loadOkay {
+		return false
+	}
+	t, ok := bmNext(a.bmk, a.pg.page)
+	if dir < 0 {
+		t, ok = bmPrev(a.bmk, a.pg.page)
+	}
+	if !ok {
+		a.pendingLog = append(a.pendingLog, markerBookmark+"none")
+		return true
+	}
+	a.pendingLog = append(a.pendingLog,
+		markerBookmark+"jump page="+u32s(uint32(t+1)))
+	a.goPage(t)
+	return true
+}
+
+// openSaveCopy raises the shared save picker seeded with the document's
+// -COPY name; the result writes a byte copy of the open PDF.
+func (a *app) openSaveCopy() {
+	if a.st != loadOkay {
+		return
+	}
+	a.pick = appkit.NewFilePicker(appkit.PickSave, dirname(a.path))
+	a.pick.Input = copyName(a.name)
+	a.pendingLog = append(a.pendingLog, markerSave+"pick")
+}
+
+// finishPick consumes the picker's result: a path publishes a byte copy of
+// the document (crash-safe temp+rename like every app save); "cancel" or an
+// empty result is the modal's own receipt.
+func (a *app) finishPick() {
+	res := a.pick.Result
+	if res == "" || res == "cancel" {
+		vi.ConsoleLine(markerSave + "cancel")
+		return
+	}
+	if rc := vi.WriteFileSafe(res, a.data); rc < 0 {
+		vi.ConsoleLine(markerSave + "rc=" + vi.Itoa64(rc))
+		return
+	}
+	vi.ConsoleLine(markerSave + res + " bytes=" + vi.Itoa64(int64(len(a.data))))
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +666,7 @@ func (a *app) scrollTick(down bool) {
 			a.oy = clampU32(a.oy, a.maxOY())
 			a.pendingLog = append(a.pendingLog,
 				markerPage+vi.Itoa64(int64(np+1))+"/"+vi.Itoa64(int64(a.pg.pages)))
+			a.markPos()
 		}
 		return
 	}
@@ -494,6 +677,14 @@ func (a *app) scrollTick(down bool) {
 func (a *app) handle(ev vi.Event) bool {
 	switch ev.Kind {
 	case vi.EvKeyDown:
+		if a.pick.Open {
+			// The save picker is modal — every key is its own until it
+			// closes; done means Result is ready (path or "cancel").
+			if _, done := a.pick.HandleKey(ev); done {
+				a.finishPick()
+			}
+			return true
+		}
 		if a.modeFind {
 			return a.findKey(ev)
 		}
@@ -565,8 +756,19 @@ func (a *app) handle(ev vi.Event) bool {
 			}
 			a.ox = nx
 			return true
+		case keyMark:
+			a.toggleBookmark()
+			return true
+		case keyBmPrev:
+			return a.jumpBookmark(-1)
+		case keyBmNext:
+			return a.jumpBookmark(1)
+		case keySaveAs:
+			a.openSaveCopy()
+			return true
 		case keyQuitQ, keyEscape:
 			vi.ConsoleLine(markerQuit)
+			a.flushPos()
 			a.ta.CloseAndExit(exitQuit)
 		}
 	case evScroll:
@@ -615,6 +817,9 @@ func (a *app) draw() {
 	a.drawStatus(surf)
 	if a.modeFind {
 		a.drawFindBar(surf)
+	}
+	if a.pick.Open {
+		a.pick.Draw(cv)
 	}
 }
 
@@ -674,7 +879,13 @@ func (a *app) drawStatus(s *canvasSurface) {
 		if len(a.hits) > 0 {
 			text += "   HIT " + u32s(uint32(a.hitIdx+1)) + "/" + u32s(uint32(len(a.hits)))
 		}
-		text += "   ^F FIND  N/N HIT  F FIT  +/- ZOOM  Q QUIT"
+		if len(a.bmk) > 0 {
+			text += "   BMK " + u32s(uint32(len(a.bmk)))
+			if bmHas(a.bmk, a.pg.page) {
+				text += "*"
+			}
+		}
+		text += "   ^F FIND  N/N HIT  F FIT  +/- ZOOM  B MARK  S SAVE  Q QUIT"
 	case loadRefused:
 		text = "REFUSED: " + a.refuse
 	case loadFailedOpen:
@@ -767,15 +978,22 @@ func (a *app) eventLoop() {
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
+				a.flushPos()
 				vi.ConsoleLine(markerWinClose)
 				vi.ConsoleLine(markerOK)
 				a.ta.CloseAndExit(exitQuit)
 			}
 			vi.Sleep(1)
+			// Debounced position write: quiet for posDebounceNs after the
+			// last page/zoom/bookmark change.
+			if a.posDirty && now()-a.posAt >= posDebounceNs {
+				a.flushPos()
+			}
 			continue
 		}
 		switch a.ta.Dispatch(ev) {
 		case tabapp.ActionClosed:
+			a.flushPos()
 			vi.ConsoleLine(markerWinClose)
 			vi.ConsoleLine(markerOK)
 			a.ta.CloseAndExit(exitQuit)
@@ -840,6 +1058,7 @@ func main() {
 			vi.ConsoleLine(markerRefuse + a.refuse)
 		}
 	}
+	a.applyPos()
 	a.applyRestored()
 	a.pushTitle()
 	a.repaint()
