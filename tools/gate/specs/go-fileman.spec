@@ -65,12 +65,20 @@
 # out of the opens=text submenu — the same decision/outcome marker pair
 # every open leg carries, plus GOEDIT's own read of the file it was handed.
 #
+# M155c (#2931) adds run 20: bounded content search. `/` prompts for a
+# substring over the cwd's subtree (depth 4, 256 files, 1 MiB a file,
+# 64 hits), mime.Sniff keeps binaries out of the scan, and the markers
+# carry the accounting: `files: search hits= scanned= skipped=` plus one
+# `search hit <path>:<line>` per collected hit. A second leg inside a
+# folder whose every file is binary answers `files: search refused
+# binary` instead of an empty set.
+#
 # exec-order: assert-proven -- each run ends on its own `rx-go-fileman-*`
 # marker, which only its closing script prints, and that script waits on the
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, and batch-moves and batch-deletes a marked set"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1647,6 +1655,7 @@ exec GOFILES.ELF /host/FMB
 EOFB
 
 vgate_file script2-19.txt <<'EOFB'
+dui close 2
 echo rx-go-fileman-batch-ok
 EOFB
 
@@ -1668,13 +1677,15 @@ PY
 # A1..A3, x queues the set, k k k back to INTO, return descends, p runs
 # the batch (one item per pass between strokes). backspace returns to FMB
 # where B1/B2 remain; j m j m marks them, d asks once with the count, y
-# commits, q quits. The batch steps all land inside the fixed 0.25 s
-# stroke cadence — each item is one loop pass, a few ms.
+# commits. The batch steps all land inside the fixed 0.25 s stroke
+# cadence — each item is one loop pass, a few ms. Teardown is script2's
+# dui close, not a trailing 'q': an in-flight quit raced the rx echo and
+# flaked the leg (observed 2026-10-21, M155c fixup).
 vgate_run 19 -- \
     --screen '$RUN_DIR/fileman-batch-screen' \
     --input --via-virtio \
     --script '$RUN_DIR/script-19.txt' \
-    --input-chords 'j,m,j,m,j,m,x,k,k,k,return,p,backspace,j,m,j,m,d,y,q' \
+    --input-chords 'j,m,j,m,j,m,x,k,k,k,return,p,backspace,j,m,j,m,d,y' \
     --input-chords-after 'gofiles: ready' \
     --script2 '$RUN_DIR/script2-19.txt' \
     --script2-after 'files: batch done n=2' \
@@ -1748,3 +1759,83 @@ for name in ("B1.TXT", "B2.TXT"):
         name + " survived the delete batch"
 print("FMB verified: A1..A3 moved into INTO byte-exact, B1/B2 trashed")
 PY
+
+# --- M155c (#2931) run 20: bounded content search ------------------------
+# FMS holds the whole decision in one tree: NOTE.TXT and DEEP/INVOICE.TXT
+# each carry "invoice" on line 2 (the top-level hit scans before the
+# descent — the walk does files first, then subdirs in listed order), and
+# BINALL/ is a folder whose every file Sniff puts out of candidacy
+# (ELF magic -> binary, qoif magic -> image), so the second leg's search
+# there answers the named refusal. One boot proves both halves: the
+# counting marker and the file:line hit markers, then the refusal.
+vgate_file script-20.txt <<'EOFS'
+exec GOFILES.ELF /host/FMS
+EOFS
+
+vgate_file script2-20.txt <<'EOFS'
+dui close 2
+echo rx-go-fileman-search-ok
+EOFS
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fms = os.path.join(share, "FMS")
+os.makedirs(os.path.join(fms, "DEEP"), exist_ok=True)
+os.makedirs(os.path.join(fms, "BINALL"), exist_ok=True)
+with open(os.path.join(fms, "NOTE.TXT"), "w") as f:
+    f.write("plain\ninvoice for march\nend\n")
+with open(os.path.join(fms, "DEEP", "INVOICE.TXT"), "w") as f:
+    f.write("nested\nsecond invoice line\n")
+# BINALL: only files Sniff keeps out of the scan — ELF magic answers
+# binary, qoif magic image. Nothing decodable is required; the sniff
+# reads the magic, never the payload.
+with open(os.path.join(fms, "BINALL", "APP.ELF"), "wb") as f:
+    f.write(b"\x7fELF\x02\x01\x01\x00" + bytes(56))
+with open(os.path.join(fms, "BINALL", "PIC.QOI"), "wb") as f:
+    f.write(b"qoif\x00\x00\x00\x04\x00\x00\x00\x04\x04\x00")
+print("staged FMS: NOTE.TXT + DEEP/INVOICE.TXT hits, BINALL binary-only")
+PY
+
+# Chords: `/` prompts, "invoice" + return runs the walk (hits=2
+# scanned=2 skipped=2 — BINALL's pair is sniffed out before DEEP's hit),
+# escape closes the results frame, return descends into BINALL (sel=0,
+# dirs sort first), and the same prompt + needle there answers the named
+# refusal. The walk is synchronous inside the Enter keystroke — a
+# handful of queue-5 round trips well inside the 0.25 s stroke cadence.
+# Teardown is script2's dui close, not a trailing 'q': an in-flight
+# quit races the rx echo (the same flake shape run 19 took).
+vgate_run 20 -- \
+    --screen '$RUN_DIR/fileman-search-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-20.txt' \
+    --input-chords '/,i,n,v,o,i,c,e,return,escape,return,/,i,n,v,o,i,c,e,return' \
+    --input-chords-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-20.txt' \
+    --script2-after 'files: search refused binary' \
+    --script-expect 'gofiles OK' --timeout 240
+
+vgate_assert 20 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 20 serial-contains 'gofiles: list /host/FMS n=3'
+
+# The walk's accounting: NOTE.TXT and DEEP/INVOICE.TXT scanned, BINALL's
+# pair sniffed out — every count named.
+vgate_assert 20 serial-contains 'files: search hits=2 scanned=2 skipped=2'
+# One hit marker per collected hit, naming the file and the line.
+vgate_assert 20 serial-contains 'files: search hit /host/FMS/NOTE.TXT:2'
+vgate_assert 20 serial-contains 'files: search hit /host/FMS/DEEP/INVOICE.TXT:2'
+vgate_assert 20 serial-contains 'files: search close'
+
+# The second leg: the cursor enters BINALL and the all-binary folder
+# answers the named refusal — no result set, no hits marker.
+vgate_assert 20 serial-contains 'gofiles: cd /host/FMS/BINALL'
+vgate_assert 20 serial-contains 'gofiles: list /host/FMS/BINALL n=2'
+vgate_assert 20 serial-contains 'files: search refused binary'
+
+vgate_assert 20 serial-contains 'gofiles: close'
+vgate_assert 20 serial-contains 'gofiles OK'
+vgate_assert 20 serial-contains 'rx-go-fileman-search-ok'
+vgate_assert 20 serial-absent 'files: search refused root'
+vgate_assert 20 serial-absent 'files: search hits=0'
+vgate_assert 20 serial-absent '[EXC] parking:'
+vgate_assert 20 serial-absent 'exited status=139'

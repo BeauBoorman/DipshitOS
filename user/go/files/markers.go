@@ -201,6 +201,24 @@ const (
 	markerBatchNo     = "files: batch refused "
 	markerBatchProgNo = "files: batch progress refused"
 
+	// M155c (#2931): the '/' bounded content search — the `files:`
+	// spelling M155a opened. `search hits=<n> scanned=<n> skipped=<n>`
+	// is the walk's receipt: hits the result set holds, scanned the
+	// files that were read and searched, skipped the files Sniff put
+	// out of candidacy (binaries, images, audio, archives, documents)
+	// plus the unreadable — the optional ` truncated=<bound>` names the
+	// bound that stopped the walk (depth/files/read/hits). One `search
+	// hit <path>:<line>` line per collected hit names the file and
+	// line, so a gate never reads a count without the rows behind it.
+	// `search refused` is the named no-answer: `binary` when every
+	// file was a skip, `root` when a mount-root search could not hold
+	// its bounds (a partial answer to "everything" is a lie). `search
+	// close` is the results frame's dismiss.
+	markerSearch      = "files: search "
+	markerSearchHit   = "files: search hit "
+	markerSearchNo    = "files: search refused "
+	markerSearchClose = "files: search close"
+
 	// The view/sort chords' own markers.
 	markerViewMode = "gofiles: viewmode "
 	markerSort     = "gofiles: sort "

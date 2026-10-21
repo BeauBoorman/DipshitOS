@@ -39,6 +39,10 @@ const (
 	modeHints     // M121c (#2566): the '?' chord-hint overlay owns the frame
 	modeQuickLook // M149a (#2806): the spacebar preview pane owns the frame
 	modeProps     // M155a (#2929): the 'i' properties card owns the frame
+	// M155c (#2931): the '/' content search — the prompt owns the status
+	// row like the rename prompt's, the results frame owns the grid.
+	modeSearchInput
+	modeSearchHits
 )
 
 // titleBarPx is the window title band the client area sits below: the
@@ -162,6 +166,11 @@ type model struct {
 	// M155a (#2929): the 'i' properties card (props.go). Armed by 'i' on
 	// the selection, dismissed by Esc/`i` or a pointer press.
 	props props
+
+	// M155c (#2931): the '/' bounded content search (search.go). The
+	// prompt rides the status row; the results frame shows the walk's
+	// hit set and its accounting.
+	search search
 }
 
 // hintsBin names this app's registry scope — the untagged twin of
@@ -611,6 +620,20 @@ func (m *model) handleClick(x, y int) {
 		m.closeProps()
 		return
 	}
+	if m.mode == modeSearchHits {
+		// M155c (#2931): same modal rule — a press dismisses the
+		// results frame, never selects a row underneath it.
+		m.closeSearch()
+		return
+	}
+	if m.mode == modeSearchInput {
+		// The prompt's press rule is the armed confirm's: the click was
+		// acting on the list, not answering, so it sheds the prompt.
+		m.mode = modeNormal
+		m.input = ""
+		m.status = "search cancelled"
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		// #2894: a press while the confirm is armed is acting on the
 		// list, not answering — shed the prompt. The press is swallowed
@@ -731,6 +754,14 @@ func (m *model) handleKey(ev keys.Event) {
 		m.propsKey(ev)
 		return
 	}
+	if m.mode == modeSearchInput {
+		m.searchKey(ev)
+		return
+	}
+	if m.mode == modeSearchHits {
+		m.hitsKey(ev)
+		return
+	}
 	if m.mode == modeConfirmDelete {
 		// #2894: the prompt answers y/Y only — every other key sheds it
 		// instead of being swallowed, so a stray 'd' cannot hold the
@@ -820,6 +851,8 @@ func (m *model) handleKey(ev keys.Event) {
 			m.toggleMark()
 		case 'M':
 			m.clearMarks()
+		case '/':
+			m.startSearch()
 		case 'o':
 			m.startOpenWith()
 		case 'e':

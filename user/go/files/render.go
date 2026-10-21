@@ -67,6 +67,9 @@ func (m model) render() string {
 	if m.mode == modeProps {
 		return m.renderProps()
 	}
+	if m.mode == modeSearchHits {
+		return m.renderSearch()
+	}
 	lines := m.renderLines()
 	frame := framePrologue + strings.Join(lines, "\n")
 	if m.mode == modeContext {
@@ -192,6 +195,65 @@ func (m model) renderProps() string {
 	return framePrologue + strings.Join(lines, "\n")
 }
 
+// renderSearch is the M155c (#2931) results frame — the props card's
+// shape: a title row naming the needle, an accounting subtitle (the
+// counts the marker carries, plus the bound that stopped the walk),
+// then one `rel:line: snippet` row per hit with the cursor's selection,
+// and a `truncated at <bound>` row when the walk stopped early — the
+// partial set's honest label. Zero hits on a completed walk gets the
+// named empty row, never a bare frame.
+func (m model) renderSearch() string {
+	s := m.search
+	lines := make([]string, 0, m.rows)
+	lines = append(lines,
+		colPath+"  search: "+clipVis(s.pat, m.cols-12)+colReset)
+	sub := vi.Itoa64(int64(len(s.hits))) + " hits · " +
+		vi.Itoa64(int64(s.scanned)) + " scanned · " +
+		vi.Itoa64(int64(s.skipped)) + " skipped"
+	if s.trunc != "" {
+		sub += " · truncated at " + s.trunc
+	}
+	lines = append(lines, colHead+"  "+clipVis(sub, m.cols-4)+colReset)
+	// tail is the grid slot the truncation row lands on: right after the
+	// last hit, or under the "(no hits)" line on an empty set.
+	tail := len(s.hits)
+	if tail == 0 {
+		tail = 1
+	}
+	for i := 0; i < m.bodyRows(); i++ {
+		idx := s.top + i
+		if idx >= len(s.hits) {
+			if len(s.hits) == 0 && i == 0 {
+				lines = append(lines, colDim+"  (no hits)"+colReset)
+				continue
+			}
+			if idx == tail && s.trunc != "" {
+				row := "truncated at " + s.trunc
+				lines = append(lines, colWarn+"  "+row+
+					strings.Repeat(" ", max(0, m.cols-2-visLen(row)))+colReset)
+				continue
+			}
+			lines = append(lines, strings.Repeat(" ", m.cols))
+			continue
+		}
+		h := s.hits[idx]
+		row := h.rel + ":" + vi.Itoa64(int64(h.line)) + ": " + h.snippet
+		if idx == s.sel {
+			label := clipVis(row, m.cols-2)
+			lines = append(lines, colSel+"> "+label+
+				strings.Repeat(" ", max(0, m.cols-2-visLen(label)))+colReset)
+			continue
+		}
+		label := clipVis("  "+row, m.cols)
+		lines = append(lines, colPrev+label+colReset+
+			strings.Repeat(" ", max(0, m.cols-visLen(label))))
+	}
+	lines = append(lines, m.statusLine())
+	lines = append(lines, colDim+" "+
+		clipVis("enter open · n/N hit · esc close", m.cols-2)+colReset)
+	return framePrologue + strings.Join(lines, "\n")
+}
+
 // renderCtxMenu is the M124d (#2583) overlay: after the full grid repaint
 // each plate row is painted in place by CUP — the menu floats over the
 // frame it was opened on without splicing styled line strings. Rows are
@@ -290,7 +352,7 @@ func (m model) renderLines() []string {
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · space look · i props · o open with · e export · v volumes · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("j/k move · enter open · / search · space look · i props · o open with · e export · v volumes · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }
@@ -373,6 +435,8 @@ func (m model) statusLine() string {
 		return colWarn + " " + m.status + colReset
 	case modeOpenWith:
 		return colWarn + " " + m.openWithLine() + colReset
+	case modeSearchInput:
+		return colWarn + " search for: " + m.input + "_" + colReset
 	}
 	line := " " + m.status
 	// M155b (#2930): the status line counts the marked set while it is
