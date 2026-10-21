@@ -73,12 +73,23 @@
 # folder whose every file is binary answers `files: search refused
 # binary` instead of an empty set.
 #
+# M155d (#2932) adds runs d1-d3: the manage journey, K=3 — the M155a-c
+# verbs composed in a single boot, run three times on three identical
+# staged trees. Each FMD<k> holds INTO/ plus M1..M3.TXT (M2 pinned at
+# epoch 1700000000 and carrying the seeded `zephyr` token on line 2):
+# `i` answers M2's properties, `m` marks the three files, `x` cuts, the
+# app descends into INTO/ and `p` runs the move one item per pass; still
+# in the destination, `/` walks it for the token and Enter opens the
+# single hit through the mime open path (GOEDIT.ELF comes up as the
+# third window). Three identical tagged runs is the acceptance itself:
+# the journey either passes unchanged on every boot or it is not done.
+#
 # exec-order: assert-proven -- each run ends on its own `rx-go-fileman-*`
 # marker, which only its closing script prints, and that script waits on the
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1839,3 +1850,281 @@ vgate_assert 20 serial-absent 'files: search refused root'
 vgate_assert 20 serial-absent 'files: search hits=0'
 vgate_assert 20 serial-absent '[EXC] parking:'
 vgate_assert 20 serial-absent 'exited status=139'
+
+# --- M155d (#2932) runs d1-d3: the manage journey, K=3 -----------------
+# Card 4 of 4: the three M155 verbs working together, three times. The
+# runs are identical down to the chord string — only the staged root
+# (FMD1/FMD2/FMD3) changes, so each boot proves the journey on a fresh,
+# untouched tree while the earlier runs' mutations stay visible on the
+# share.
+#
+# One chord burst does the whole journey (the rows are INTO then M1..M3,
+# dirs first):
+#   j j            cursor onto M2.TXT
+#   i, escape      props card -> 'files: props .../M2.TXT mtime=1700000000
+#                  mime=text vol=host', then 'files: props close'
+#   k              back to M1.TXT
+#   m j m j m      marks M1..M3 — 'files: mark <n> n=1..3'
+#   x              'gofiles: clip cut set n=3'
+#   k k k, return  INTO -> 'gofiles: cd /host/FMD<k>/INTO' + empty
+#   p              batch move: 'files: batch move 1/3..3/3' + 'done n=3'
+#   / z e p h y r, return   search the destination for the token:
+#                  'files: search hits=1 scanned=3 skipped=0' +
+#                  'files: search hit /host/FMD<k>/INTO/M2.TXT:2'
+#   return         openHit: 'gofiles: open file M2.TXT ... handler=
+#                  GOEDIT.ELF' + 'open launched'; GOEDIT's own
+#                  'goedit: present' is the third reporter — the file
+#                  the search named really opened.
+# Teardown is run 03's shape: script2 waits on 'goedit: present', then
+# closes the editor and the manager — no trailing 'q' to race the echo.
+vgate_file script-d1.txt <<'EOFD'
+exec GOFILES.ELF /host/FMD1
+EOFD
+
+vgate_file script-d2.txt <<'EOFD'
+exec GOFILES.ELF /host/FMD2
+EOFD
+
+vgate_file script-d3.txt <<'EOFD'
+exec GOFILES.ELF /host/FMD3
+EOFD
+
+vgate_file script2-journey.txt <<'EOFD'
+dui close 3
+dui close 2
+echo rx-go-fileman-journey-ok
+EOFD
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+for tag in ("FMD1", "FMD2", "FMD3"):
+    root = os.path.join(share, tag)
+    os.makedirs(os.path.join(root, "INTO"), exist_ok=True)
+    for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
+        body = "journey-" + name.lower() + "\n"
+        if name == "M2.TXT":
+            body += "zephyr march anchor\nend\n"
+        with open(os.path.join(root, name), "w") as f:
+            f.write(body)
+    # Pinned mtime: the props marker's mtime= must equal this staged
+    # epoch — the same stat-wire discipline run 18 pins on FMP.
+    os.utime(os.path.join(root, "M2.TXT"), (1700000000, 1700000000))
+print("staged FMD1/FMD2/FMD3: INTO/ empty, M2 mtime=1700000000 + zephyr")
+PY
+
+vgate_run d1 -- \
+    --screen '$RUN_DIR/fileman-d1-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-d1.txt' \
+    --input-chords 'j,j,i,escape,k,m,j,m,j,m,x,k,k,k,return,p,/,z,e,p,h,y,r,return,return' \
+    --input-chords-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-journey.txt' \
+    --script2-after 'goedit: present' \
+    --script-expect 'gofiles OK' --timeout 240
+
+vgate_assert d1 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert d1 serial-contains 'gofiles: list /host/FMD1 n=4'
+vgate_assert d1 serial-contains 'gofiles: entry INTO dir'
+
+# The props leg: the staged epoch second rides the stat wire through.
+vgate_assert d1 serial-contains 'files: props /host/FMD1/M2.TXT mtime=1700000000 mime=text vol=host'
+vgate_assert d1 serial-contains 'files: props close'
+
+# The move leg: three marks, one cut, one batch into the destination.
+vgate_assert d1 serial-contains 'files: mark M1.TXT n=1'
+vgate_assert d1 serial-contains 'files: mark M2.TXT n=2'
+vgate_assert d1 serial-contains 'files: mark M3.TXT n=3'
+vgate_assert d1 serial-contains 'gofiles: clip cut set n=3'
+vgate_assert d1 serial-contains 'gofiles: cd /host/FMD1/INTO'
+vgate_assert d1 serial-contains 'gofiles: empty /host/FMD1/INTO'
+vgate_assert d1 serial-contains 'files: batch start move n=3'
+vgate_assert d1 serial-contains 'gofiles: pasted M1.TXT'
+vgate_assert d1 serial-contains 'files: batch move 1/3 M1.TXT'
+vgate_assert d1 serial-contains 'files: batch move 2/3 M2.TXT'
+vgate_assert d1 serial-contains 'files: batch move 3/3 M3.TXT'
+vgate_assert d1 serial-contains 'files: batch done n=3'
+vgate_assert d1 serial-count 'files: batch progress refused' 1
+vgate_assert d1 serial-contains 'gofiles: list /host/FMD1/INTO n=3'
+
+# The search leg: the destination subtree answers one hit and Enter
+# dispatches it — GOEDIT's open/read/present is the third reporter.
+vgate_assert d1 serial-contains 'files: search hits=1 scanned=3 skipped=0'
+vgate_assert d1 serial-contains 'files: search hit /host/FMD1/INTO/M2.TXT:2'
+vgate_assert d1 serial-contains 'gofiles: open file M2.TXT type=text handler=GOEDIT.ELF'
+vgate_assert d1 serial-contains 'gofiles: open launched M2.TXT handler=GOEDIT.ELF pid='
+vgate_assert d1 serial-contains 'goedit: open id='
+vgate_assert d1 serial-contains 'goedit: read /host/FMD1/INTO/M2.TXT n='
+vgate_assert d1 serial-contains 'goedit: present'
+
+vgate_assert d1 serial-contains 'dui close: closed=3'
+vgate_assert d1 serial-contains 'dui close: closed=2'
+vgate_assert d1 serial-contains 'gofiles: close'
+vgate_assert d1 serial-contains 'gofiles OK'
+vgate_assert d1 serial-contains 'rx-go-fileman-journey-ok'
+vgate_assert d1 serial-absent 'files: batch stop'
+vgate_assert d1 serial-absent 'files: batch refused'
+vgate_assert d1 serial-absent 'files: search refused'
+vgate_assert d1 serial-absent 'gofiles: open refused M2.TXT'
+vgate_assert d1 serial-absent '[EXC] parking:'
+vgate_assert d1 serial-absent 'exited status=139'
+
+# The share-side proof: all three bodies at the destination byte-exact
+# and gone from the source — the filesystem saw what the markers claim.
+vgate_assert d1 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+root = os.path.join(share, "FMD1")
+into = os.path.join(root, "INTO")
+for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
+    dst = os.path.join(into, name)
+    assert os.path.isfile(dst), name + " missing at the destination"
+    body = open(dst).read()
+    want = "journey-" + name.lower() + "\n"
+    if name == "M2.TXT":
+        want += "zephyr march anchor\nend\n"
+    assert body == want, name + " body = " + repr(body)
+    assert not os.path.exists(os.path.join(root, name)), \
+        name + " still at the source after a move batch"
+print("FMD1 verified: M1..M3 moved into INTO byte-exact")
+PY
+
+vgate_run d2 -- \
+    --screen '$RUN_DIR/fileman-d2-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-d2.txt' \
+    --input-chords 'j,j,i,escape,k,m,j,m,j,m,x,k,k,k,return,p,/,z,e,p,h,y,r,return,return' \
+    --input-chords-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-journey.txt' \
+    --script2-after 'goedit: present' \
+    --script-expect 'gofiles OK' --timeout 240
+
+vgate_assert d2 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert d2 serial-contains 'gofiles: list /host/FMD2 n=4'
+vgate_assert d2 serial-contains 'gofiles: entry INTO dir'
+
+vgate_assert d2 serial-contains 'files: props /host/FMD2/M2.TXT mtime=1700000000 mime=text vol=host'
+vgate_assert d2 serial-contains 'files: props close'
+
+vgate_assert d2 serial-contains 'files: mark M1.TXT n=1'
+vgate_assert d2 serial-contains 'files: mark M2.TXT n=2'
+vgate_assert d2 serial-contains 'files: mark M3.TXT n=3'
+vgate_assert d2 serial-contains 'gofiles: clip cut set n=3'
+vgate_assert d2 serial-contains 'gofiles: cd /host/FMD2/INTO'
+vgate_assert d2 serial-contains 'gofiles: empty /host/FMD2/INTO'
+vgate_assert d2 serial-contains 'files: batch start move n=3'
+vgate_assert d2 serial-contains 'gofiles: pasted M1.TXT'
+vgate_assert d2 serial-contains 'files: batch move 1/3 M1.TXT'
+vgate_assert d2 serial-contains 'files: batch move 2/3 M2.TXT'
+vgate_assert d2 serial-contains 'files: batch move 3/3 M3.TXT'
+vgate_assert d2 serial-contains 'files: batch done n=3'
+vgate_assert d2 serial-count 'files: batch progress refused' 1
+vgate_assert d2 serial-contains 'gofiles: list /host/FMD2/INTO n=3'
+
+vgate_assert d2 serial-contains 'files: search hits=1 scanned=3 skipped=0'
+vgate_assert d2 serial-contains 'files: search hit /host/FMD2/INTO/M2.TXT:2'
+vgate_assert d2 serial-contains 'gofiles: open file M2.TXT type=text handler=GOEDIT.ELF'
+vgate_assert d2 serial-contains 'gofiles: open launched M2.TXT handler=GOEDIT.ELF pid='
+vgate_assert d2 serial-contains 'goedit: open id='
+vgate_assert d2 serial-contains 'goedit: read /host/FMD2/INTO/M2.TXT n='
+vgate_assert d2 serial-contains 'goedit: present'
+
+vgate_assert d2 serial-contains 'dui close: closed=3'
+vgate_assert d2 serial-contains 'dui close: closed=2'
+vgate_assert d2 serial-contains 'gofiles: close'
+vgate_assert d2 serial-contains 'gofiles OK'
+vgate_assert d2 serial-contains 'rx-go-fileman-journey-ok'
+vgate_assert d2 serial-absent 'files: batch stop'
+vgate_assert d2 serial-absent 'files: batch refused'
+vgate_assert d2 serial-absent 'files: search refused'
+vgate_assert d2 serial-absent 'gofiles: open refused M2.TXT'
+vgate_assert d2 serial-absent '[EXC] parking:'
+vgate_assert d2 serial-absent 'exited status=139'
+
+vgate_assert d2 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+root = os.path.join(share, "FMD2")
+into = os.path.join(root, "INTO")
+for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
+    dst = os.path.join(into, name)
+    assert os.path.isfile(dst), name + " missing at the destination"
+    body = open(dst).read()
+    want = "journey-" + name.lower() + "\n"
+    if name == "M2.TXT":
+        want += "zephyr march anchor\nend\n"
+    assert body == want, name + " body = " + repr(body)
+    assert not os.path.exists(os.path.join(root, name)), \
+        name + " still at the source after a move batch"
+print("FMD2 verified: M1..M3 moved into INTO byte-exact")
+PY
+
+vgate_run d3 -- \
+    --screen '$RUN_DIR/fileman-d3-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-d3.txt' \
+    --input-chords 'j,j,i,escape,k,m,j,m,j,m,x,k,k,k,return,p,/,z,e,p,h,y,r,return,return' \
+    --input-chords-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-journey.txt' \
+    --script2-after 'goedit: present' \
+    --script-expect 'gofiles OK' --timeout 240
+
+vgate_assert d3 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert d3 serial-contains 'gofiles: list /host/FMD3 n=4'
+vgate_assert d3 serial-contains 'gofiles: entry INTO dir'
+
+vgate_assert d3 serial-contains 'files: props /host/FMD3/M2.TXT mtime=1700000000 mime=text vol=host'
+vgate_assert d3 serial-contains 'files: props close'
+
+vgate_assert d3 serial-contains 'files: mark M1.TXT n=1'
+vgate_assert d3 serial-contains 'files: mark M2.TXT n=2'
+vgate_assert d3 serial-contains 'files: mark M3.TXT n=3'
+vgate_assert d3 serial-contains 'gofiles: clip cut set n=3'
+vgate_assert d3 serial-contains 'gofiles: cd /host/FMD3/INTO'
+vgate_assert d3 serial-contains 'gofiles: empty /host/FMD3/INTO'
+vgate_assert d3 serial-contains 'files: batch start move n=3'
+vgate_assert d3 serial-contains 'gofiles: pasted M1.TXT'
+vgate_assert d3 serial-contains 'files: batch move 1/3 M1.TXT'
+vgate_assert d3 serial-contains 'files: batch move 2/3 M2.TXT'
+vgate_assert d3 serial-contains 'files: batch move 3/3 M3.TXT'
+vgate_assert d3 serial-contains 'files: batch done n=3'
+vgate_assert d3 serial-count 'files: batch progress refused' 1
+vgate_assert d3 serial-contains 'gofiles: list /host/FMD3/INTO n=3'
+
+vgate_assert d3 serial-contains 'files: search hits=1 scanned=3 skipped=0'
+vgate_assert d3 serial-contains 'files: search hit /host/FMD3/INTO/M2.TXT:2'
+vgate_assert d3 serial-contains 'gofiles: open file M2.TXT type=text handler=GOEDIT.ELF'
+vgate_assert d3 serial-contains 'gofiles: open launched M2.TXT handler=GOEDIT.ELF pid='
+vgate_assert d3 serial-contains 'goedit: open id='
+vgate_assert d3 serial-contains 'goedit: read /host/FMD3/INTO/M2.TXT n='
+vgate_assert d3 serial-contains 'goedit: present'
+
+vgate_assert d3 serial-contains 'dui close: closed=3'
+vgate_assert d3 serial-contains 'dui close: closed=2'
+vgate_assert d3 serial-contains 'gofiles: close'
+vgate_assert d3 serial-contains 'gofiles OK'
+vgate_assert d3 serial-contains 'rx-go-fileman-journey-ok'
+vgate_assert d3 serial-absent 'files: batch stop'
+vgate_assert d3 serial-absent 'files: batch refused'
+vgate_assert d3 serial-absent 'files: search refused'
+vgate_assert d3 serial-absent 'gofiles: open refused M2.TXT'
+vgate_assert d3 serial-absent '[EXC] parking:'
+vgate_assert d3 serial-absent 'exited status=139'
+
+vgate_assert d3 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+root = os.path.join(share, "FMD3")
+into = os.path.join(root, "INTO")
+for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
+    dst = os.path.join(into, name)
+    assert os.path.isfile(dst), name + " missing at the destination"
+    body = open(dst).read()
+    want = "journey-" + name.lower() + "\n"
+    if name == "M2.TXT":
+        want += "zephyr march anchor\nend\n"
+    assert body == want, name + " body = " + repr(body)
+    assert not os.path.exists(os.path.join(root, name)), \
+        name + " still at the source after a move batch"
+print("FMD3 verified: M1..M3 moved into INTO byte-exact")
+PY
