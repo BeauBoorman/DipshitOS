@@ -60,7 +60,7 @@ func TestDeadlineMultiplex(t *testing.T) {
 		t.Fatalf("clip arm = %d ticks, want 30 (the earlier deadline)", got)
 	}
 	// At t=131 the clip fired, the idle did not.
-	idle, clip := d.expired(131 * tickNs)
+	idle, clip, _ := d.expired(131 * tickNs)
 	if !clip || idle {
 		t.Fatalf("expired(131s) = idle:%v clip:%v, want clip only", idle, clip)
 	}
@@ -84,7 +84,7 @@ func TestDeadlineCeiling(t *testing.T) {
 	if got := d.nextDelay(0); got != 2 {
 		t.Fatalf("1.5s must arm 2 ticks (ceiling), got %d", got)
 	}
-	if idle, _ := d.expired(1 * tickNs); idle {
+	if idle, _, _ := d.expired(1 * tickNs); idle {
 		t.Fatal("fired early — the ceiling rule exists to prevent this")
 	}
 	// An overdue deadline arms 1 tick (fire now) rather than 0 or negative.
@@ -237,7 +237,7 @@ func TestEnsureDirsSkipsMountRoot(t *testing.T) {
 func TestAddEntryClones(t *testing.T) {
 	m := &model{}
 	name, secret, note := []byte("n"), []byte("s"), []byte("t")
-	if !m.addEntry(name, secret, note) {
+	if !m.addEntry(name, secret, note, nil) {
 		t.Fatal("addEntry refused a valid entry")
 	}
 	zero(name)
@@ -246,7 +246,7 @@ func TestAddEntryClones(t *testing.T) {
 	if string(m.entries[0].secret) != "s" {
 		t.Fatal("the stored entry must not alias the field buffer")
 	}
-	if m.addEntry(nil, []byte("s"), nil) {
+	if m.addEntry(nil, []byte("s"), nil, nil) {
 		t.Fatal("a nameless entry must refuse")
 	}
 	if m.sel != 0 {

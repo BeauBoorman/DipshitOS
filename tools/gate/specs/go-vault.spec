@@ -1,11 +1,16 @@
-# go-vault.spec -- M148a (issue #2804) + M148b (issue #2805): GOVAULT.ELF
-# class-B gate, run K=3. A PBKDF2+AES-256-GCM vault file under the Go seat:
-# create through the masked pair, add an entry, reveal it, copy the secret
-# onto the seat's primary selection, watch the 30 s lease expire, lock,
-# unlock, quit. Two tamper legs and a wrong-pass leg pin the named refusals.
-# The M148b acceptance leg (run 06) stores, locks, unlocks, reveals, copies,
-# expires, then opens the Receipts face and pins its rows in order — on the
-# serial listing AND on the vault's own receipts file in the share.
+# go-vault.spec -- M148a (issue #2804) + M148b (issue #2805) + M156c (#2933):
+# GOVAULT.ELF class-B gate, run K=3. A PBKDF2+AES-256-GCM vault file under
+# the Go seat: create through the masked pair, add an entry, reveal it, copy
+# the secret onto the seat's primary selection, watch the 30 s lease expire,
+# lock, unlock, quit. Two tamper legs and a wrong-pass leg pin the named
+# refusals. The M148b acceptance leg (run 06) stores, locks, unlocks,
+# reveals, copies, expires, then opens the Receipts face and pins its rows
+# in order — on the serial listing AND on the vault's own receipts file in
+# the share. M156c (run 07) is the bundle arc end to end — picker save,
+# GVLX under its own passphrase, a fresh vault, picker open, the no-clobber
+# merge — plus the M125a save_state hook and the TOTP probe (hmac/sha1 in
+# class-A; guest clock within ±30 s of host, and the displayed six-digit
+# code glyph-matched against a host-computed TOTP).
 #
 # REPEAT SEMANTICS: vgate_repeat 3 re-runs EVERY leg, and the armed share
 # persists across iterations — so each leg must be iteration-safe. Run 01
@@ -150,7 +155,7 @@ vgate_run 01 -- \
     --script '$RUN_DIR/script-01.txt' \
     --script2 '$RUN_DIR/script2-01.txt' \
     --script2-after 'gotabwm: registered' \
-    --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return,a,w,i,f,i,tab,s,3,c,r,3,t,tab,h,o,m,e,return,r,c,ctrl-l,h,u,n,t,e,r,2,return,escape,escape' \
+    --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return,a,w,i,f,i,tab,s,3,c,r,3,t,tab,h,o,m,e,return,return,r,c,ctrl-l,h,u,n,t,e,r,2,return,escape,escape' \
     --input-chords-after 'govault: new vault' \
     --script-expect 'govault: exiting 0' --timeout 240
 
@@ -194,15 +199,15 @@ path = os.path.join(share, "GOVAULT", "VAULT.BIN")
 b = open(path, "rb").read()
 if b[:4] != b"GVLT":
     raise SystemExit("vault magic = %r, want GVLT" % b[:4])
-if int.from_bytes(b[4:8], "little") != 1:
-    raise SystemExit("vault version = %d, want 1"
+if int.from_bytes(b[4:8], "little") != 2:
+    raise SystemExit("vault version = %d, want 2 (the field-added frame)"
                      % int.from_bytes(b[4:8], "little"))
 iters = int.from_bytes(b[8:12], "little")
 if not (100_000 <= iters <= 4_000_000):
     raise SystemExit("recorded iters = %d, outside calibration clamps" % iters)
 if b"s3cr3t" in b or b"wifi" in b or b"hunter2" in b:
     raise SystemExit("PLAINTEXT secret material in the sealed file")
-print("VAULT.BIN: GVLT v1, iters=%d recorded, body sealed (%d bytes)"
+print("VAULT.BIN: GVLT v2, iters=%d recorded, body sealed (%d bytes)"
       % (iters, len(b)))
 PY
 
@@ -333,7 +338,7 @@ vgate_run 06 -- \
     --script '$RUN_DIR/script-06.txt' \
     --script2 '$RUN_DIR/script2-06.txt' \
     --script2-after 'gotabwm: registered' \
-    --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return,a,b,a,n,k,tab,h,u,n,t,e,r,3,tab,s,a,v,i,n,g,s,return,ctrl-l,h,u,n,t,e,r,2,return,r,c' \
+    --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return,a,b,a,n,k,tab,h,u,n,t,e,r,3,tab,s,a,v,i,n,g,s,return,return,ctrl-l,h,u,n,t,e,r,2,return,r,c' \
     --input-chords-after 'govault: new vault' \
     --input-string 'v' \
     --input-string-after 'govault: clip expired' \
@@ -421,4 +426,242 @@ if len(lens) < 2 or lens[0] != 7 or 9 not in lens[1:]:
 if "gotabwm: sel pull id=" not in ser:
     raise SystemExit("the expiry's compare pull is missing its seat receipt")
 print("selection: copy len=7, expiry overwrite len=9, compare pull seen")
+PY
+
+# --- run 07 (M156c / #2933): export -> fresh vault -> import, one boot ------
+# Two app sessions share the leg. Session A opens the vault run 06 left
+# (bank/hunter3, passphrase hunter2 — 'govault: locked' is its gate),
+# adds 'mail' (with the RFC 6238 seed GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ,
+# the base32 text of the ASCII key "12345678901234567890") and 'pad', and
+# exports the three entries to GOVAULT/EXPORT.GVLX under its own passphrase
+# 'xport1'. script3 then deletes the vault and re-execs the app: session B's
+# 'govault: new vault' is the unique marker the second input phase gates on
+# (A never prints it — it unlocked). B creates a FRESH vault (pass fresh9),
+# picks the bundle, types its passphrase, and the merge lands added=3.
+# B then reveals row 0 (bank -> 'hunter3' painted), copies it (seat
+# 'sel pub len=7'), answers the seat's ctrl-shift-s state ask
+# ('govault: state saved' + the blob in SESSION.TABS), and locks.
+# Iteration-safe: script-07 re-primes the share the same way every pass —
+# EXPORT.GVLX is removed so the write target is fresh, and VAULT.BIN is
+# always run 06's one-entry vault of THIS iteration.
+vgate_file script-07.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm GOVAULT/EXPORT.GVLX
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+dui focus 0
+exec GOVAULT.ELF
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+vf rm GOVAULT/VAULT.BIN
+dui focus 0
+exec GOVAULT.ELF
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/vault-screen-07' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-07' \
+    --snapshot-after 'govault: import added=3 skipped=0' \
+    --snapshot-after 'govault: revealed' \
+    --snapshot-after 'govault: copied' \
+    --snapshot-after 'govault: state saved' \
+    --snapshot-after 'gotabwm: snapshot saved' \
+    --script '$RUN_DIR/script-07.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'gotabwm: registered' \
+    --input-string $'hunter2\namail\nletmein\nwork\nGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\napad\nabcd\nside\n\neEXPORT.GVLX\nxport1\nxport1\n' \
+    --input-string-after 'govault: locked' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'govault: export n=3' \
+    --input-chords 'f,r,e,s,h,9,return,f,r,e,s,h,9,return,i,E,X,P,O,R,T,.,G,V,L,X,return,x,p,o,r,t,1,return,up,up,r,c,ctrl-shift-s' \
+    --input-chords-after 'govault: new vault' \
+    --script-expect 'gotabwm: snapshot saved' --timeout 300
+
+vgate_assert 07 serial-contains 'gotabwm: registered'
+vgate_assert 07 serial-contains 'exec: loaded GOVAULT.ELF'
+vgate_assert 07 serial-contains 'govault: locked'
+vgate_assert 07 serial-contains 'govault: unlocked n=1'
+vgate_assert 07 serial-contains 'govault: added'
+vgate_assert 07 serial-contains 'govault: pick save /host/GOVAULT/EXPORT.GVLX'
+vgate_assert 07 serial-contains 'govault: export n=3 bytes='
+# Session B: a fresh vault face, the import merge, the republish, reveal.
+vgate_assert 07 serial-contains 'govault: new vault'
+vgate_assert 07 serial-contains 'govault: iterations '
+vgate_assert 07 serial-contains 'govault: unlocked n=0'
+vgate_assert 07 serial-contains 'govault: pick open /host/GOVAULT/EXPORT.GVLX'
+vgate_assert 07 serial-contains 'govault: import added=3 skipped=0'
+vgate_assert 07 serial-contains 'govault: revealed'
+vgate_assert 07 serial-contains 'govault: copied'
+# The save_state hook answered the seat's snapshot chord — the blob is the
+# vault's path, nothing secret.
+vgate_assert 07 serial-contains 'gotabwm: state ask id='
+vgate_assert 07 serial-contains 'govault: state saved'
+vgate_assert 07 serial-contains 'gotabwm: state save id='
+vgate_assert 07 serial-contains 'len=23 ver=1'
+vgate_assert 07 serial-contains 'gotabwm: snapshot saved'
+# No secret material ever reaches serial — secrets, the seed and both
+# passphrases stay off the wire.
+vgate_assert 07 serial-absent 'hunter3'
+vgate_assert 07 serial-absent 'letmein'
+vgate_assert 07 serial-absent 'GEZDGNBVGY3TQOJQ'
+vgate_assert 07 serial-absent 'xport1'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+# The TOTP probe's guest leg: the wall clock the codes are computed
+# against, within ±30 s of the host clock at verdict time.
+vgate_assert 07 python <<'PY'
+import os, re, sys, time
+ser = open(os.environ["VG_SER"], "rb").read().decode("utf-8", "replace")
+marks = re.findall(r"govault: clock epoch=(\d+)", ser)
+if not marks:
+    sys.exit("no govault clock marker — the probe's guest leg is missing")
+guest = int(marks[-1])
+skew = abs(guest - int(time.time()))
+if skew > 30:
+    sys.exit("guest clock epoch=%d vs host %d — skew %ds exceeds ±30s"
+             % (guest, int(time.time()), skew))
+print("clock probe: guest epoch=%d host=%d skew=%ds" % (guest, int(time.time()), skew))
+PY
+# The bundle on the share: GVLX framing, v2, sealed body — no plaintext.
+vgate_assert 07 python <<'PY'
+import os
+share = os.environ["VG_SHARE"]
+b = open(os.path.join(share, "GOVAULT", "EXPORT.GVLX"), "rb").read()
+if b[:4] != b"GVLX":
+    raise SystemExit("bundle magic = %r, want GVLX" % b[:4])
+if int.from_bytes(b[4:8], "little") != 2:
+    raise SystemExit("bundle version = %d, want 2" % int.from_bytes(b[4:8], "little"))
+iters = int.from_bytes(b[8:12], "little")
+if not (100_000 <= iters <= 4_000_000):
+    raise SystemExit("bundle iters = %d, outside calibration clamps" % iters)
+for pt in (b"mail", b"bank", b"pad", b"letmein", b"hunter3", b"abcd",
+           b"GEZDGNBVGY3TQOJQ"):
+    if pt in b:
+        raise SystemExit("PLAINTEXT entry material in the bundle: %r" % pt)
+print("EXPORT.GVLX: GVLX v2, iters=%d, body sealed (%d bytes)" % (iters, len(b)))
+PY
+# The merge's audit rows and the state blob on the share.
+vgate_assert 07 share-contains GOVAULT/RECEIPTS.TXT 'import added=3 skipped=0'
+vgate_assert 07 share-contains SESSION.TABS '/host/GOVAULT/VAULT.BIN'
+# The displayed half: the revealed row paints 'hunter3' (the secret that
+# round-tripped the bundle), and the mail row's six-digit code equals the
+# host's own stdlib-hmac TOTP for the run's timestamp — the card's probe.
+vgate_assert 07 snapshot 'snap-07-*.raw' <<'PY'
+import os, re, sys, glob as _glob
+import hmac as _hmac, hashlib as _hl, struct as _st
+
+W, H = 1280, 720
+need = W * H * 4
+snaps = sorted(_glob.glob(os.path.join(os.path.dirname(sys.argv[1]),
+                                       "snap-07-*.raw")),
+               key=os.path.getmtime)
+frames = [(os.path.basename(p), open(p, "rb").read())
+          for p in snaps if os.path.getsize(p) >= need]
+if not frames:
+    sys.exit("no complete snapshot in %s" % snaps)
+
+# The 8x8 face — same table the widget kit links (go-clock's assert lift):
+# 95 glyphs, 8 rows of 1 byte, bit 0 the leftmost pixel.
+src = open("user/go/webrender/font/font8x8.go").read()
+rows = re.findall(r"\{(0x[0-9a-fA-F]{2}(?:,\s*0x[0-9a-fA-F]{2}){7})\}", src)
+if len(rows) != 95:
+    sys.exit("font8x8.go: %d glyph rows, want 95" % len(rows))
+GB = {}
+for i, r in enumerate(rows):
+    vals = [int(v, 16) for v in r.split(",") if v.strip()]
+    mask = 0
+    for y in range(8):
+        for x in range(8):
+            mask = (mask << 1) | ((vals[y] >> x) & 1)
+    GB[0x20 + i] = mask
+
+def px(raw, x, y):
+    off = (y * W + x) * 4
+    return raw[off + 2], raw[off + 1], raw[off]
+
+def decode_cell(raw, x0, y0):
+    lums = [0.30 * px(raw, x0 + k % 8, y0 + k // 8)[0] +
+            0.55 * px(raw, x0 + k % 8, y0 + k // 8)[1] +
+            0.15 * px(raw, x0 + k % 8, y0 + k // 8)[2] for k in range(64)]
+    lo, hi = min(lums), max(lums)
+    if hi - lo < 20:
+        return " "
+    mid = (lo + hi) / 2
+    mask = 0
+    for v in lums:
+        mask = (mask << 1) | (v >= mid)
+    best, bs = 32, 999
+    for cp, gm in GB.items():
+        d = bin(mask ^ gm).count("1")
+        if d < bs:
+            bs, best = d, cp
+    return chr(best)
+
+def decode_at(raw, x0, y0, n):
+    return "".join(decode_cell(raw, x0 + j * 8, y0) for j in range(n))
+
+# Host-side TOTP for the bundle seed (python stdlib hmac — the card's own
+# cross-check): every epoch inside the run's plausible paint window is an
+# acceptable displayed code.
+ser_hits = sorted(_glob.glob(os.path.join(os.path.dirname(sys.argv[1]),
+                                          "vm-serial-07-*.log")),
+                  key=os.path.getmtime)
+if not ser_hits:
+    sys.exit("no serial log for leg 07 in %s" % os.path.dirname(sys.argv[1]))
+ser = open(ser_hits[-1], errors="replace").read()
+cm = re.findall(r"govault: clock epoch=(\d+)", ser)
+if not cm:
+    sys.exit("no clock marker beside the snapshot")
+centre = int(cm[-1])
+seed = b"12345678901234567890"
+codes = set()
+for e in range(centre - 45, centre + 125):
+    c = _st.pack(">Q", e // 30)
+    d = _hmac.new(seed, c, _hl.sha1).digest()
+    o = d[-1] & 0x0F
+    v = (_st.unpack(">I", d[o:o + 4])[0] & 0x7FFFFFFF) % 1000000
+    codes.add("%06d" % v)
+
+# Rows live at canvas (12, 35+14i) for names, (188, +) secrets, (300, +)
+# the code — but the pane origin is the seat's, so find it: anchor on the
+# entry names over a bounded origin grid, then read the row's fields at
+# the same origin. A frame that carries neither face fails closed.
+def find_origin(raw):
+    for oy in range(0, 160, 1):
+        for ox in range(0, 128, 4):
+            if decode_at(raw, ox + 12, oy + 35, 4) != "bank":
+                continue
+            if decode_at(raw, ox + 12, oy + 49, 4) == "mail":
+                return ox, oy
+    return None
+
+verdict = None
+for name, raw in frames:
+    org = find_origin(raw)
+    if org is None:
+        continue
+    ox, oy = org
+    revealed = decode_at(raw, ox + 188, oy + 35, 7)
+    if revealed != "hunter3":
+        verdict = "revealed cell %r, want 'hunter3'" % revealed
+        continue
+    shown = decode_at(raw, ox + 300, oy + 49, 6)
+    if shown not in codes:
+        verdict = "totp cell %r not in %d host-computed codes" % (shown, len(codes))
+        continue
+    left = decode_at(raw, ox + 300 + 7 * 8, oy + 49, 3)
+    m = re.match(r"(\d+)s\s*$", left)
+    if not m or not (0 < int(m.group(1)) <= 30):
+        verdict = "countdown cell %r is not Ns" % left
+        continue
+    print("snapshot %s: revealed 'hunter3', totp %s in host window, "
+          "countdown %s (origin %d,%d)" % (name, shown, left, ox, oy))
+    sys.exit(0)
+sys.exit(verdict or "no capture carried the list face (revealed row + totp)")
 PY

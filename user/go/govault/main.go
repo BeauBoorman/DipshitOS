@@ -1,12 +1,17 @@
 // Command govault is GOVAULT.ELF — M148a (issue #2804), receipts M148b
-// (#2805): the secrets store gets a face. One unlock-gated vault file (GVLT
-// framing, PBKDF2-HMAC-SHA256 -> AES-256-GCM, written through
-// vi.WriteFileSafe so a crash keeps the old file), a masked passphrase
-// field, a per-entry reveal, a copy that expires, an idle lock, and a
-// plaintext receipts file with its own read-only face. The codec lives in
-// vault.go, the receipt row codec in receipts.go, the pure session model in
-// model.go; this file owns the seat, the drawing, the timers and the serial
-// markers.
+// (#2805), M156c (#2933): the secrets store gets a face, a bundle format and
+// a state hook. One unlock-gated vault file (GVLT framing, PBKDF2-HMAC-SHA256
+// -> AES-256-GCM, written through vi.WriteFileSafe so a crash keeps the old
+// file), a masked passphrase field, a per-entry reveal, a copy that expires,
+// an idle lock, and a plaintext receipts file with its own read-only face.
+// M156c adds: GVLX export/import bundles (same frame, distinct magic, their
+// own passphrase) through the shared picker, a merge that never overwrites,
+// the M125a save_state blob (the vault's path — nothing secret), and a TOTP
+// column for entries carrying an otpauth seed behind the hmac/sha1 + clock
+// probe. The codec lives in vault.go, the receipt row codec in receipts.go,
+// the TOTP math and seed intake in totp.go, the state blob codec in
+// state.go, the pure session model in model.go; this file owns the seat,
+// the drawing, the timers and the serial markers.
 //
 // The clipboard, precisely: the KERNEL buffer (slots 38/39) admits only the
 // seat and CAP_CLIPBOARD — no EL0 grant path exists (ADR 0054, `caps` are
@@ -75,38 +80,57 @@ const (
 // Marker vocabulary. n= and rc= are the only payloads — counts and kernel
 // codes, never secret material.
 const (
-	markerOpen      = "govault: open id="
-	markerDeclare   = "govault: declare accepted"
-	markerDeclRef   = "govault: declare refused"
-	markerPresent   = "govault: present"
-	markerNew       = "govault: new vault"
-	markerLocked    = "govault: locked"
-	markerBad       = "govault: bad file"
-	markerLoadErr   = "govault: load error rc="
-	markerIters     = "govault: iterations "
-	markerUnlocked  = "govault: unlocked n="
-	markerUnlockBad = "govault: unlock failed"
-	markerMismatch  = "govault: passphrase mismatch"
-	markerAdded     = "govault: added"
-	markerRefused   = "govault: refused "
-	markerSaved     = "govault: saved"
-	markerSaveErr   = "govault: save refused rc="
-	markerRevealed  = "govault: revealed"
-	markerHidden    = "govault: hidden"
-	markerCopied    = "govault: copied"
-	markerCopyErr   = "govault: copy refused"
-	markerExpired   = "govault: clip expired"
-	markerKept      = "govault: clip kept"
-	markerClipRef   = "govault: clip expire refused"
-	markerIdle      = "govault: locked idle"
-	markerRcpts     = "govault: receipts n="
-	markerRcpt      = "govault: rcpt i="
-	markerRcptsEnd  = "govault: receipts end"
-	markerRcptRef   = "govault: receipt refused rc="
-	markerClose     = "govault: close"
-	markerOK        = "govault OK"
-	markerExiting   = "govault: exiting "
+	markerOpen       = "govault: open id="
+	markerDeclare    = "govault: declare accepted"
+	markerDeclRef    = "govault: declare refused"
+	markerPresent    = "govault: present"
+	markerNew        = "govault: new vault"
+	markerLocked     = "govault: locked"
+	markerBad        = "govault: bad file"
+	markerLoadErr    = "govault: load error rc="
+	markerIters      = "govault: iterations "
+	markerUnlocked   = "govault: unlocked n="
+	markerUnlockBad  = "govault: unlock failed"
+	markerMismatch   = "govault: passphrase mismatch"
+	markerAdded      = "govault: added"
+	markerRefused    = "govault: refused "
+	markerSaved      = "govault: saved"
+	markerSaveErr    = "govault: save refused rc="
+	markerRevealed   = "govault: revealed"
+	markerHidden     = "govault: hidden"
+	markerCopied     = "govault: copied"
+	markerCopyErr    = "govault: copy refused"
+	markerExpired    = "govault: clip expired"
+	markerKept       = "govault: clip kept"
+	markerClipRef    = "govault: clip expire refused"
+	markerIdle       = "govault: locked idle"
+	markerRcpts      = "govault: receipts n="
+	markerRcpt       = "govault: rcpt i="
+	markerRcptsEnd   = "govault: receipts end"
+	markerRcptRef    = "govault: receipt refused rc="
+	markerPickOpen   = "govault: pick open "
+	markerPickSave   = "govault: pick save "
+	markerPickCancel = "govault: pick cancel"
+	markerExport     = "govault: export n="
+	markerExportErr  = "govault: export refused rc="
+	markerImport     = "govault: import "
+	markerImportBad  = "govault: import bad file"
+	markerImportErr  = "govault: import refused rc="
+	markerClock      = "govault: clock epoch="
+	markerStateSave  = "govault: state saved"
+	markerStateRest  = "govault: state restored"
+	markerClose      = "govault: close"
+	markerOK         = "govault OK"
+	markerExiting    = "govault: exiting "
 )
+
+// The TOTP clock marker is the card's probe leg: the guest wall clock the
+// codes are computed against, printed at the moments a code could be on
+// screen (unlock, import, reveal) so the host can read skew off the last
+// line. Epoch seconds are not secret material.
+func (a *app) clockMarker() {
+	vi.ConsoleLine(markerClock + vi.Itoa64(timeFn()))
+}
 
 // Seams — the vi/vsys calls that cross the raw syscall gateway degrade to
 // -ENOSYS off the guest, so host tests drive these (the vi.SelPublish seam is
@@ -189,7 +213,8 @@ func (f *field) shown() string {
 }
 
 // app is the session: the seat client, the model, the loaded file, the field
-// buffers per face, and the last status line (never secret material).
+// buffers per face, the open picker (modal over the list face), and the last
+// status line (never secret material).
 type app struct {
 	ta *tabapp.TabApp
 	m  model
@@ -197,10 +222,14 @@ type app struct {
 	path string
 	file []byte
 
-	pass  field // masked passphrase (locked + new)
-	conf  field // masked confirm (new only)
+	pass  field // masked passphrase (locked + new + export + import)
+	conf  field // masked confirm (new + export)
 	focus int   // field index inside the current face
-	add   [3]field
+	add   [4]field
+
+	pick     appkit.FilePicker
+	picking  bool   // the picker plate owns input while open
+	pickPath string // the path the picker resolved — export target or import source
 
 	status string
 	quit   bool
@@ -243,8 +272,19 @@ func main() {
 	a.add[0] = newField("name", maxName, false)
 	a.add[1] = newField("secret", maxSecret, true)
 	a.add[2] = newField("note", maxNote, false)
+	a.add[3] = newField("totp", maxTotp, true)
 
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: natX, Y: natY, W: natW, H: natH})
+	ta := tabapp.Init(tabapp.Config{
+		Name:         appName,
+		Title:        appTitle,
+		X:            natX,
+		Y:            natY,
+		W:            natW,
+		H:            natH,
+		SaveState:    a.saveBlob,
+		RestoreState: a.applyState,
+		StateVersion: stateVersion,
+	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpen + "-1")
 		vi.Exit(1)
@@ -255,6 +295,12 @@ func main() {
 		vi.ConsoleLine(markerDeclare)
 	} else {
 		vi.ConsoleLine(markerDeclRef)
+	}
+	// A restored blob is the seat handing back the vault's path — the
+	// session itself still starts locked; the marker is the proof the
+	// handoff happened at all.
+	if ta.Restored {
+		vi.ConsoleLine(markerStateRest)
 	}
 
 	a.load()
@@ -273,7 +319,19 @@ func main() {
 		vi.ConsoleLine(markerExiting + vi.Itoa64(int64(status)))
 		a.ta.CloseAndExit(status)
 	}
-	loop.Run()
+	// The seat's save_state ask is mailbox traffic, not an input event:
+	// answer it once per pass before polling, the same discipline the
+	// other hooked apps keep.
+	loop.RunWith(func() (vi.Event, int64, bool) {
+		if a.ta.PollStateAsk() {
+			vi.ConsoleLine(markerStateSave)
+			// The clock probe reads its LAST marker: the state ask lands
+			// moments before the seat's snapshot write and teardown, so
+			// this is the marker closest to the host's verdict time.
+			a.clockMarker()
+		}
+		return vi.PollEventRaw()
+	}, vi.Sleep)
 }
 
 // load reads the vault file once and picks the opening face. The bytes stay
@@ -292,7 +350,7 @@ func (a *app) load() {
 		vi.ConsoleLine(markerLoadErr + vi.Itoa64(rc))
 		return
 	}
-	if _, _, _, _, err := parseHeader(data); err != nil {
+	if _, _, _, _, _, err := parseHeader(data, fileMagic); err != nil {
 		a.m.scr = scrBadFile
 		vi.ConsoleLine(markerBad)
 		return
@@ -302,11 +360,19 @@ func (a *app) load() {
 	vi.ConsoleLine(markerLocked)
 }
 
-// rearm drives the one app timer from the model's deadline pair. Called
+// rearm drives the one app timer from the model's deadline triple. Called
 // after every event that can change a deadline, so the physical timer always
-// counts toward the earliest live one.
+// counts toward the earliest live one. The TOTP repaint tick arms here too:
+// live while the list face shows a seeded row, disarmed the moment lock or
+// a face change takes it off screen.
 func (a *app) rearm() {
-	d := a.m.dl.nextDelay(nowFn())
+	now := nowFn()
+	if a.m.scr == scrList && a.m.hasTotp() {
+		a.m.dl.armTick(now)
+	} else {
+		a.m.dl.stopTick()
+	}
+	d := a.m.dl.nextDelay(now)
 	if d == 0 {
 		if a.m.armed != 0 {
 			a.m.armed = 0
@@ -324,12 +390,18 @@ func (a *app) handle(ev vi.Event) bool {
 	if ev.Kind == vi.EvTimer {
 		return a.onTimer()
 	}
-	if a.m.scr == scrList || a.m.scr == scrAdd || a.m.scr == scrReceipts {
+	if a.m.scr == scrList || a.m.scr == scrAdd || a.m.scr == scrReceipts ||
+		a.m.scr == scrExport || a.m.scr == scrImport {
 		a.m.dl.activity(nowFn())
 		defer a.rearm()
 	}
 	if ev.Kind != vi.EvKeyDown {
 		return false
+	}
+	// The picker is a modal over the unlocked list: it owns every key while
+	// open, and its Result lands the export/import passphrase faces.
+	if a.picking {
+		return a.pickerKey(ev)
 	}
 	switch a.m.scr {
 	case scrNew:
@@ -347,6 +419,10 @@ func (a *app) handle(ev vi.Event) bool {
 		return a.keyAdd(ev)
 	case scrReceipts:
 		return a.keyReceipts(ev)
+	case scrExport:
+		return a.keyExport(ev)
+	case scrImport:
+		return a.keyImport(ev)
 	}
 	return false
 }
@@ -356,7 +432,7 @@ func (a *app) handle(ev vi.Event) bool {
 // buffer before the session material is wiped.
 func (a *app) onTimer() bool {
 	now := nowFn()
-	idle, clip := a.m.dl.expired(now)
+	idle, clip, tick := a.m.dl.expired(now)
 	changed := false
 	if clip {
 		a.expireClip()
@@ -364,6 +440,11 @@ func (a *app) onTimer() bool {
 	}
 	if idle {
 		a.lockSession(true)
+		changed = true
+	}
+	if tick {
+		// The countdown's periodic repaint: re-arm happens in rearm below
+		// — the tick stays live only while a totp row is on the list face.
 		changed = true
 	}
 	a.rearm()
@@ -431,6 +512,9 @@ func (a *app) lockSession(idle bool) {
 	a.add[0].clear()
 	a.add[1].clear()
 	a.add[2].clear()
+	a.add[3].clear()
+	a.picking = false // a lock closes the picker with the faces under it
+	a.pick.Open = false
 	if idle {
 		vi.ConsoleLine(markerIdle)
 		a.status = "locked after 5 idle minutes"
@@ -450,7 +534,7 @@ func (a *app) save() bool {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
 		return false
 	}
-	file, err := sealWithKey(a.m.key, a.m.salt, nonce, a.m.iters, a.m.entries)
+	file, err := sealWithKey(fileMagic, fileVersion, a.m.key, a.m.salt, nonce, a.m.iters, a.m.entries)
 	if err != nil {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return false
@@ -472,7 +556,7 @@ func (a *app) save() bool {
 // --- the faces -------------------------------------------------------------
 
 func (a *app) fields() []*field {
-	if a.m.scr == scrNew {
+	if a.m.scr == scrNew || a.m.scr == scrExport {
 		return []*field{&a.pass, &a.conf}
 	}
 	return []*field{&a.pass}
@@ -559,6 +643,9 @@ func (a *app) unlock() {
 	a.rearm()
 	a.status = ""
 	vi.ConsoleLine(markerUnlocked + vi.Itoa64(int64(len(entries))))
+	if a.m.hasTotp() {
+		a.clockMarker()
+	}
 }
 
 // create is the new-vault submit: a matching pair, the measured iteration
@@ -666,6 +753,7 @@ func (a *app) keyList(ev vi.Event) bool {
 			if a.m.revealed(a.m.sel) {
 				a.receipt(actReveal, a.m.entries[a.m.sel].name)
 				vi.ConsoleLine(markerRevealed)
+				a.clockMarker()
 			} else {
 				vi.ConsoleLine(markerHidden)
 			}
@@ -682,8 +770,187 @@ func (a *app) keyList(ev vi.Event) bool {
 		a.focus = 0
 		a.status = ""
 		return true
+	case 'e':
+		a.openPick(appkit.PickSave)
+		return true
+	case 'i':
+		a.openPick(appkit.PickOpen)
+		return true
 	}
 	return false
+}
+
+// openPick raises the shared file picker over the list face — save mode for
+// the GVLX export, open mode for the bundle import. The start directory is
+// the vault's own /host/GOVAULT dir.
+func (a *app) openPick(kind appkit.PickerKind) {
+	dir := dirOf(a.path)
+	if dir == "" {
+		dir = "/host"
+	}
+	a.pick = appkit.NewFilePicker(kind, dir)
+	a.picking = true
+	a.status = ""
+}
+
+// pickerKey routes one key to the open picker and lands its Result: a save
+// pick moves to the export passphrase face, an open pick to the import one,
+// and a cancel hands the keyboard back to the list. The picked path is a
+// marker receipt like GOEDIT's — a path is not secret material.
+func (a *app) pickerKey(ev vi.Event) bool {
+	if _, done := a.pick.HandleKey(ev); !done {
+		return true
+	}
+	res := a.pick.Result
+	a.picking = false
+	if res == "cancel" {
+		vi.ConsoleLine(markerPickCancel)
+		return true
+	}
+	a.pickPath = res
+	a.pass.clear()
+	a.conf.clear()
+	a.focus = 0
+	if a.pick.Kind == appkit.PickSave {
+		vi.ConsoleLine(markerPickSave + res)
+		a.m.scr = scrExport
+	} else {
+		vi.ConsoleLine(markerPickOpen + res)
+		a.m.scr = scrImport
+	}
+	return true
+}
+
+// dirOf strips a path's last segment; the share root is the floor (the same
+// rule the picker keeps internally).
+func dirOf(path string) string {
+	i := strings.LastIndexByte(path, '/')
+	if i <= len("/host") {
+		return "/host"
+	}
+	return path[:i]
+}
+
+// --- the bundle faces (M156c) -------------------------------------------------
+
+func (a *app) keyExport(ev vi.Event) bool {
+	if ev.Arg0 == hidEsc {
+		a.pass.clear()
+		a.conf.clear()
+		a.m.scr = scrList
+		a.status = "export cancelled"
+		return true
+	}
+	return a.keyField(ev, a.exportBundle)
+}
+
+func (a *app) keyImport(ev vi.Event) bool {
+	if ev.Arg0 == hidEsc {
+		a.pass.clear()
+		a.m.scr = scrList
+		a.status = "import cancelled"
+		return true
+	}
+	return a.keyField(ev, a.importBundle)
+}
+
+// exportBundle seals the session under the bundle passphrase — its own salt,
+// nonce and calibrated iteration count, never the vault's key — and writes
+// the GVLX frame through WriteFileSafe at the picked path. Marker per the
+// card: 'govault: export n=<entries> bytes=<n>'.
+func (a *app) exportBundle() {
+	if !equalBytes(a.pass.buf, a.conf.buf) || len(a.pass.buf) == 0 {
+		a.pass.clear()
+		a.conf.clear()
+		a.focus = 0
+		vi.ConsoleLine(markerMismatch)
+		a.status = "passphrases do not match"
+		return
+	}
+	pass := append([]byte(nil), a.pass.buf...)
+	a.pass.clear()
+	a.conf.clear()
+	defer zero(pass)
+
+	salt := make([]byte, saltLen)
+	nonce := make([]byte, nonceLen)
+	if !randFill(salt) || !randFill(nonce) {
+		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
+		return
+	}
+	start := nowFn()
+	probe, err := deriveKey(pass, salt, calibrateIters)
+	iters := calibrateIterations(nowFn() - start)
+	zero(probe)
+	if err != nil {
+		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		return
+	}
+	key, err := deriveKey(pass, salt, iters)
+	if err != nil {
+		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		return
+	}
+	bundle, err := sealWithKey(exportMagic, fileVersion, key, salt, nonce, iters, a.m.entries)
+	zero(key)
+	if err != nil {
+		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		return
+	}
+	if rc := writeSafe(a.pickPath, bundle); rc < 0 {
+		zero(bundle)
+		vi.ConsoleLine(markerExportErr + vi.Itoa64(rc))
+		a.status = "export refused"
+		return
+	}
+	a.receipt(actExport, nil)
+	vi.ConsoleLine(markerExport + vi.Itoa64(int64(len(a.m.entries))) +
+		" bytes=" + vi.Itoa64(int64(len(bundle))))
+	zero(bundle)
+	a.m.scr = scrList
+	a.status = "exported " + vi.Itoa64(int64(len(a.m.entries))) + " entries"
+}
+
+// importBundle opens the picked GVLX under its own passphrase and merges it
+// into the session: new names append, a name the vault already holds keeps
+// the vault's copy and counts skipped — nothing is silently overwritten. The
+// bundle's derived key is used for the open and then dropped: the vault's
+// own key stays the session's.
+func (a *app) importBundle() {
+	pass := append([]byte(nil), a.pass.buf...)
+	a.pass.clear()
+	defer zero(pass)
+
+	data, rc := readAll(a.pickPath, maxFile+1)
+	if rc < 0 {
+		vi.ConsoleLine(markerImportErr + vi.Itoa64(rc))
+		a.status = "import refused"
+		return
+	}
+	entries, key, _, _, err := openExport(pass, data)
+	zero(key)
+	if err == errBadFile {
+		vi.ConsoleLine(markerImportBad)
+		a.status = "import: not a GVLX bundle"
+		return
+	}
+	if err != nil {
+		vi.ConsoleLine(markerImportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
+		a.status = "import: unlock failed"
+		return
+	}
+	added, skipped := a.m.mergeEntries(entries)
+	zeroEntries(entries)
+	a.receipt(actImport, []byte("added="+vi.Itoa64(int64(added))+" skipped="+vi.Itoa64(int64(skipped))))
+	a.save()
+	vi.ConsoleLine(markerImport + "added=" + vi.Itoa64(int64(added)) +
+		" skipped=" + vi.Itoa64(int64(skipped)))
+	if a.m.hasTotp() {
+		a.clockMarker()
+	}
+	a.m.scr = scrList
+	a.status = "imported " + vi.Itoa64(int64(added)) + ", skipped " +
+		vi.Itoa64(int64(skipped))
 }
 
 // copy publishes the selected secret to the seat's primary selection and
@@ -709,13 +976,14 @@ func (a *app) copy() {
 }
 
 func (a *app) keyAdd(ev vi.Event) bool {
-	fs := []*field{&a.add[0], &a.add[1], &a.add[2]}
+	fs := []*field{&a.add[0], &a.add[1], &a.add[2], &a.add[3]}
 	f := fs[a.focus]
 	switch ev.Arg0 {
 	case hidEsc:
 		a.add[0].clear()
 		a.add[1].clear()
 		a.add[2].clear()
+		a.add[3].clear()
 		a.m.scr = scrList
 		a.status = "add cancelled"
 		return true
@@ -753,14 +1021,34 @@ func (a *app) keyAdd(ev vi.Event) bool {
 	return false
 }
 
-// commitAdd stores the three fields as an entry and publishes the vault. The
+// commitAdd stores the four fields as an entry and publishes the vault. The
 // field buffers are cleared (zeroed) either way — the session copy is the
-// entry's own clone.
+// entry's own clone. A non-empty totp field must parse: the refusal names
+// itself and keeps the entry unstored, so a mistyped seed never lands half
+// in the vault.
 func (a *app) commitAdd() {
-	ok := a.m.addEntry(a.add[0].buf, a.add[1].buf, a.add[2].buf)
+	var totp []byte
+	if len(a.add[3].buf) > 0 {
+		t, ok := parseOTPSecret(a.add[3].buf)
+		if !ok {
+			a.add[0].clear()
+			a.add[1].clear()
+			a.add[2].clear()
+			a.add[3].clear()
+			a.focus = 0
+			vi.ConsoleLine(markerRefused + "bad totp")
+			a.status = "totp: not a base32 seed"
+			a.m.scr = scrList
+			return
+		}
+		totp = t
+	}
+	ok := a.m.addEntry(a.add[0].buf, a.add[1].buf, a.add[2].buf, totp)
+	zero(totp)
 	a.add[0].clear()
 	a.add[1].clear()
 	a.add[2].clear()
+	a.add[3].clear()
 	a.focus = 0
 	if !ok {
 		vi.ConsoleLine(markerRefused + "empty name")
@@ -827,6 +1115,26 @@ func (a *app) keyReceipts(ev vi.Event) bool {
 		return true
 	}
 	return false
+}
+
+// --- save_state (M125a, hooked M156c) -----------------------------------------
+
+// saveBlob is the Config.SaveState hook: the open vault's path and nothing
+// else. Never a passphrase, key, entry or revealed secret — the blob is a
+// convenience pointer, and a restored vault starts locked because the path
+// is all it learned.
+func (a *app) saveBlob() []byte {
+	return encodeState(a.path)
+}
+
+// applyState is the Config.RestoreState hook: the seat hands back the stored
+// path; a sane share path becomes the vault this boot opens. load() runs
+// after Init, so the restored path feeds the same face selection a fresh
+// boot gets — locked when the file exists.
+func (a *app) applyState(blob []byte) {
+	if path, ok := decodeState(blob); ok {
+		a.path = path
+	}
 }
 
 // printable maps a key event to its text rune — the same arg1 contract the
@@ -918,6 +1226,16 @@ func (a *app) draw() {
 		a.drawAdd(cv, w, h)
 	case scrReceipts:
 		a.drawReceipts(cv, w, h)
+	case scrExport:
+		a.drawExport(cv, w, h)
+	case scrImport:
+		a.drawImport(cv, w, h)
+	}
+
+	// The picker is a modal plate over the list face — painted last, the
+	// same overlay rule GOEDIT keeps.
+	if a.picking {
+		a.pick.Draw(cv)
 	}
 
 	if a.status != "" {
@@ -998,14 +1316,37 @@ func (a *app) drawList(cv widgets.Canvas, w, h int) {
 			secret = string(e.secret)
 		}
 		a.text(cv, pad+176, y+3, secret, tok.Muted)
-		note := string(e.note)
-		if len(note) > 24 {
-			note = note[:24]
+		// M156c: a seeded entry shows its live six-digit code and the
+		// seconds left in the step — the code is a render of the seed, not
+		// the stored text, so a stale frame can never show a dead code.
+		if len(e.totp) > 0 {
+			code := "------ --s"
+			if key, ok := decodeSeed(e.totp); ok {
+				if v, ok := totpAt(key, timeFn(), 6); ok {
+					code = sixDigits(v) + " " + vi.Itoa64(int64(totpLeft(timeFn()))) + "s"
+				}
+				zero(key)
+			}
+			a.text(cv, pad+288, y+3, code, tok.Accent)
 		}
-		a.text(cv, pad+304, y+3, note, tok.InkMuted)
+		note := string(e.note)
+		if len(note) > 14 {
+			note = note[:14]
+		}
+		a.text(cv, pad+376, y+3, note, tok.InkMuted)
 		y += rowH
 	}
-	a.text(cv, pad, h-32, "a add · r reveal · c copy · v receipts · ctrl-l lock · esc lock", tok.Muted)
+	a.text(cv, pad, h-32, "a add · r reveal · c copy · e export · i import · v receipts · ctrl-l lock", tok.Muted)
+}
+
+// sixDigits renders a TOTP value as its zero-padded six-digit string.
+func sixDigits(v uint32) string {
+	var b [6]byte
+	for i := 5; i >= 0; i-- {
+		b[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(b[:])
 }
 
 // drawReceipts lists the loaded receipts — the newest rows at the bottom,
@@ -1050,5 +1391,27 @@ func (a *app) drawAdd(cv widgets.Canvas, w, h int) {
 	a.fieldRow(cv, chromeH+44, &a.add[0], a.focus == 0)
 	a.fieldRow(cv, chromeH+44+fieldH+10, &a.add[1], a.focus == 1)
 	a.fieldRow(cv, chromeH+44+2*(fieldH+10), &a.add[2], a.focus == 2)
+	a.fieldRow(cv, chromeH+44+3*(fieldH+10), &a.add[3], a.focus == 3)
+	a.text(cv, pad, chromeH+44+3*(fieldH+10)+fieldH+8, "totp: base32 seed or otpauth:// URI (optional)", tok.Muted)
 	a.text(cv, pad, h-32, "tab next · ⏎ store · esc cancel", tok.Muted)
+}
+
+// drawExport is the bundle-passphrase face after a save pick: two masked
+// fields guard the GVLX write, same shape as the create pair.
+func (a *app) drawExport(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "Export vault to "+a.pickPath, tok.Text)
+	a.text(cv, pad, chromeH+36, "bundle passphrase (separate from the vault's)", tok.Muted)
+	a.fieldRow(cv, chromeH+64, &a.pass, a.focus == 0)
+	a.fieldRow(cv, chromeH+64+fieldH+10, &a.conf, a.focus == 1)
+	a.text(cv, pad, h-32, "tab next · ⏎ export · esc cancel", tok.Muted)
+}
+
+// drawImport is the bundle-passphrase face after an open pick: one masked
+// field, then the merge.
+func (a *app) drawImport(cv widgets.Canvas, w, h int) {
+	tok := theme.Current
+	a.text(cv, pad, chromeH+16, "Import bundle "+a.pickPath, tok.Text)
+	a.fieldRow(cv, chromeH+64, &a.pass, true)
+	a.text(cv, pad, h-32, "⏎ import · esc cancel", tok.Muted)
 }

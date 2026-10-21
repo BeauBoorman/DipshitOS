@@ -2,7 +2,7 @@
 // drive every deadline and refusal deterministically. main.go wires this to
 // the seat, the clipboard and the one app timer.
 //
-// Two deadlines share the process's single app timer (slot 40, one armed
+// Three deadlines share the process's single app timer (slot 40, one armed
 // timer per process, re-arm replaces):
 //
 //	idle  — the vault locks itself after idleLockNs of no input. Any
@@ -11,6 +11,10 @@
 //	clip  — a copied secret is cleared clipLiveNs after the copy, but only
 //	        when the clipboard still holds it (the compare rule — a later
 //	        copy by someone else is theirs, not ours to wipe).
+//	tick  — M156c (#2933): a once-a-second repaint while the list face has
+//	        a live TOTP row, so the seconds countdown stays honest. It is
+//	        the only deadline that re-arms itself on fire, and it arms only
+//	        while an unlocked vault actually carries a seed.
 //
 // The clip deadline SURVIVES lock: the kernel clipboard is a shared buffer,
 // and locking the vault must not strand a plaintext copy of a secret in it.
@@ -31,11 +35,12 @@ const (
 	maxDelayTicks = 3600
 )
 
-// deadlines tracks the two app-timer consumers in absolute Nanotime; 0 means
-// disarmed.
+// deadlines tracks the three app-timer consumers in absolute Nanotime; 0
+// means disarmed.
 type deadlines struct {
 	idleDue int64
 	clipDue int64
+	tickDue int64
 }
 
 // activity slides the idle deadline — called on every non-timer event while
@@ -45,12 +50,21 @@ func (d *deadlines) activity(now int64) { d.idleDue = now + idleLockNs }
 // armClip starts the 30-second clipboard lease.
 func (d *deadlines) armClip(now int64) { d.clipDue = now + clipLiveNs }
 
+// armTick schedules the next one-second repaint for the TOTP countdown.
+// Unlike the other two it is periodic: the timer handler re-arms it each
+// fire while a totp row is on screen.
+func (d *deadlines) armTick(now int64) { d.tickDue = now + tickNs }
+
 // stopIdle disarms the idle deadline (the vault is already locked — nothing
 // to time out).
 func (d *deadlines) stopIdle() { d.idleDue = 0 }
 
 // stopClip clears the clip deadline (it fired, or a new copy replaced it).
 func (d *deadlines) stopClip() { d.clipDue = 0 }
+
+// stopTick disarms the repaint tick — no totp row is on screen, or the vault
+// locked.
+func (d *deadlines) stopTick() { d.tickDue = 0 }
 
 // nextDelay is the ticks to arm the physical timer for: the ceiling of the
 // earliest live deadline in whole ticks, 0 when nothing is armed. Ceiling
@@ -63,6 +77,9 @@ func (d *deadlines) nextDelay(now int64) uint64 {
 	}
 	if d.clipDue > 0 && (best == 0 || d.clipDue < best) {
 		best = d.clipDue
+	}
+	if d.tickDue > 0 && (best == 0 || d.tickDue < best) {
+		best = d.tickDue
 	}
 	if best == 0 {
 		return 0
@@ -79,8 +96,10 @@ func (d *deadlines) nextDelay(now int64) uint64 {
 }
 
 // expired reports which deadlines fired by now.
-func (d *deadlines) expired(now int64) (idle, clip bool) {
-	return d.idleDue > 0 && now >= d.idleDue, d.clipDue > 0 && now >= d.clipDue
+func (d *deadlines) expired(now int64) (idle, clip, tick bool) {
+	return d.idleDue > 0 && now >= d.idleDue,
+		d.clipDue > 0 && now >= d.clipDue,
+		d.tickDue > 0 && now >= d.tickDue
 }
 
 // clipTag is the compare token for the expiry rule: sha256 of the copied
@@ -134,6 +153,13 @@ const (
 	// scrReceipts is the receipts face: the vault's own receipts file
 	// listed back, read-only (M148b).
 	scrReceipts
+	// scrExport is the bundle-passphrase face (M156c): the picked save
+	// path is already chosen; two masked fields guard the GVLX write.
+	scrExport
+	// scrImport is the bundle-passphrase face for an open pick: one masked
+	// field, then the merge. Both sit past the picker so the unlock face
+	// never carries a bundle passphrase.
+	scrImport
 )
 
 // model is the unlockable state — the part of the app a host test needs to
@@ -174,7 +200,9 @@ func (m *model) lock() {
 	m.sel = 0
 	m.rcpts = nil
 	m.dl.stopIdle()
-	if m.scr == scrList || m.scr == scrAdd || m.scr == scrReceipts {
+	m.dl.stopTick()
+	if m.scr == scrList || m.scr == scrAdd || m.scr == scrReceipts ||
+		m.scr == scrExport || m.scr == scrImport {
 		m.scr = scrLocked
 	}
 }
@@ -227,10 +255,12 @@ func (m *model) move(delta int) bool {
 
 // addEntry appends a bounded entry. The name is required — an entry you
 // cannot name is an entry you cannot find. Copies are taken so the caller's
-// field buffers can be cleared without aliasing session material.
-func (m *model) addEntry(name, secret, note []byte) bool {
+// field buffers can be cleared without aliasing session material. totp is
+// the canonical base32 seed parseOTPSecret produced — never validated here,
+// the intake face owns that refusal.
+func (m *model) addEntry(name, secret, note, totp []byte) bool {
 	if len(name) == 0 || len(name) > maxName || len(secret) > maxSecret ||
-		len(note) > maxNote || len(m.entries) >= maxEntries {
+		len(note) > maxNote || len(totp) > maxTotp || len(m.entries) >= maxEntries {
 		return false
 	}
 	e := entry{
@@ -240,7 +270,48 @@ func (m *model) addEntry(name, secret, note []byte) bool {
 	if len(note) > 0 {
 		e.note = append([]byte(nil), note...)
 	}
+	if len(totp) > 0 {
+		e.totp = append([]byte(nil), totp...)
+	}
 	m.entries = append(m.entries, e)
 	m.sel = len(m.entries) - 1
 	return true
+}
+
+// mergeEntries folds an imported bundle into the session under the card's
+// no-clobber rule: a name the vault already holds keeps the vault's copy and
+// the imported row is counted skipped — nothing is silently overwritten.
+// Callers zero the source slice afterwards; the fields merge keeps are
+// cloned, so wiping the import copy strands nothing live.
+func (m *model) mergeEntries(imported []entry) (added, skipped int) {
+	for _, e := range imported {
+		dup := false
+		for i := range m.entries {
+			if equalBytes(m.entries[i].name, e.name) {
+				dup = true
+				break
+			}
+		}
+		if dup || len(e.name) == 0 {
+			skipped++
+			continue
+		}
+		if !m.addEntry(e.name, e.secret, e.note, e.totp) {
+			skipped++
+			continue
+		}
+		added++
+	}
+	return added, skipped
+}
+
+// hasTotp reports whether any entry carries a seed — the repaint tick's arm
+// condition and the draw path's column decision share this one answer.
+func (m *model) hasTotp() bool {
+	for i := range m.entries {
+		if len(m.entries[i].totp) > 0 {
+			return true
+		}
+	}
+	return false
 }

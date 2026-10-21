@@ -1,10 +1,12 @@
 // vault.go — M148a (issue #2804): the GOVAULT file codec, pure of vi/vsys so
-// the host tests can pin every refusal by name.
+// the host tests can pin every refusal by name. M156c (#2933): the frame is
+// versioned — v2 adds the per-entry otpauth base32 field, v1 still reads —
+// and the same frame carries the GVLX export bundle under a distinct magic.
 //
 // The file is one versioned frame:
 //
-//	offset  0   magic "GVLT"                 4
-//	offset  4   version (u32 LE)             4   — 1
+//	offset  0   magic "GVLT"                 4   — "GVLX" for an export bundle
+//	offset  4   version (u32 LE)             4   — 1 or 2
 //	offset  8   iterations (u32 LE)          4   — recorded at create time
 //	offset 12   salt_len (u16 LE) + salt     2+16
 //	offset 30   nonce_len (u16 LE) + nonce   2+12 — 44-byte header total
@@ -19,7 +21,12 @@
 //
 //	count (u32 LE)
 //	per entry: name_len (u16 LE) + name, secret_len (u16 LE) + secret,
-//	           note_len (u16 LE) + note
+//	           note_len (u16 LE) + note,
+//	           version 2 adds: totp_len (u16 LE) + totp (the otpauth base32
+//	           secret text, never a rendered code)
+//
+// A v1 body simply ends after the note field per entry — its rows decode
+// with an empty totp. New writes are always v2.
 //
 // Refusal vocabulary is deliberately two names wide (the named-refusal rule a
 // secrets app lives under):
@@ -48,7 +55,9 @@ import (
 
 const (
 	fileMagic   = "GVLT"
-	fileVersion = 1
+	exportMagic = "GVLX" // the export bundle: same frame, distinct magic
+	fileVersion = 2
+	minVersion  = 1 // v1 frames still read (no totp field per entry)
 
 	saltLen  = 16
 	nonceLen = 12 // cipher.NewGCM's standard nonce size
@@ -67,6 +76,7 @@ const (
 	maxName    = 48
 	maxSecret  = 256
 	maxNote    = 512
+	maxTotp    = 128 // a base32 seed is ~16–52 chars; the bound is generous
 
 	// Iteration calibration. measureIterations is one measurement's cost;
 	// the recorded count is scaled so the real derive lands near one second,
@@ -82,12 +92,15 @@ var (
 	errUnlock  = errors.New("vault: unlock failed")
 )
 
-// entry is one stored row. name and note are user metadata; secret is the
-// material. All three are []byte so a lock can zero them in place.
+// entry is one stored row. name and note are user metadata; secret and totp
+// are the material (totp holds the otpauth base32 seed — it is a shared
+// secret, not the code it renders). All are []byte so a lock can zero them
+// in place.
 type entry struct {
 	name   []byte
 	secret []byte
 	note   []byte
+	totp   []byte
 }
 
 // deriveKey runs the recorded KDF. The passphrase crosses into the stdlib as
@@ -98,10 +111,12 @@ func deriveKey(passphrase []byte, salt []byte, iters uint32) ([]byte, error) {
 }
 
 // sealWithKey produces the whole vault file: header + AES-256-GCM sealed
-// body under an already-derived session key. The plaintext body is zeroed
-// before return; the key stays the caller's to zero.
-func sealWithKey(key, salt, nonce []byte, iters uint32, entries []entry) ([]byte, error) {
-	body := encodeBody(entries)
+// body under an already-derived session key. magic selects the frame's
+// audience — fileMagic for the vault itself, exportMagic for a GVLX bundle —
+// and ver the body layout written (always fileVersion today). The plaintext
+// body is zeroed before return; the key stays the caller's to zero.
+func sealWithKey(magic string, ver uint32, key, salt, nonce []byte, iters uint32, entries []entry) ([]byte, error) {
+	body := encodeBody(entries, ver)
 	defer zero(body)
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -112,8 +127,8 @@ func sealWithKey(key, salt, nonce []byte, iters uint32, entries []entry) ([]byte
 		return nil, err
 	}
 	out := make([]byte, 0, headerLen+len(body)+gcmTag)
-	out = append(out, fileMagic...)
-	out = appendU32(out, fileVersion)
+	out = append(out, magic...)
+	out = appendU32(out, ver)
 	out = appendU32(out, iters)
 	out = appendU16(out, uint16(len(salt)))
 	out = append(out, salt...)
@@ -122,15 +137,28 @@ func sealWithKey(key, salt, nonce []byte, iters uint32, entries []entry) ([]byte
 	return gcm.Seal(out, nonce, body, nil), nil
 }
 
-// open parses the frame, derives the key and unseals the body, returning the
-// session material the unlocked app holds: the entries, the derived key
-// (retained so a save re-seals without a second passphrase prompt), and the
-// salt+iteration header the unlock proved. The three refusal outcomes are
-// exactly errUnlock (wrong passphrase or tampered ciphertext — by design
-// indistinguishable) and errBadFile. The recovered plaintext is zeroed
-// before return; the caller owns key/salt zeroing on lock.
+// open parses a GVLT frame; openExport parses a GVLX bundle. Same codec,
+// different magic — a bundle is never a vault and a vault is never a
+// bundle, so a file handed to the wrong door names errBadFile before a
+// passphrase is spent.
 func open(passphrase, file []byte) (entries []entry, key, salt []byte, iters uint32, err error) {
-	salt, nonce, body, iters, err := parseHeader(file)
+	return openFrame(fileMagic, passphrase, file)
+}
+
+func openExport(passphrase, file []byte) (entries []entry, key, salt []byte, iters uint32, err error) {
+	return openFrame(exportMagic, passphrase, file)
+}
+
+// openFrame parses the frame, derives the key and unseals the body,
+// returning the session material the unlocked app holds: the entries, the
+// derived key (retained so a save re-seals without a second passphrase
+// prompt), and the salt+iteration header the unlock proved. The three
+// refusal outcomes are exactly errUnlock (wrong passphrase or tampered
+// ciphertext — by design indistinguishable) and errBadFile. The recovered
+// plaintext is zeroed before return; the caller owns key/salt zeroing on
+// lock.
+func openFrame(magic string, passphrase, file []byte) (entries []entry, key, salt []byte, iters uint32, err error) {
+	salt, nonce, body, ver, iters, err := parseHeader(file, magic)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -152,7 +180,7 @@ func open(passphrase, file []byte) (entries []entry, key, salt []byte, iters uin
 		return nil, nil, nil, 0, errUnlock
 	}
 	defer zero(plain)
-	entries, err = decodeBody(plain)
+	entries, err = decodeBody(plain, ver)
 	if err != nil {
 		zero(key)
 		return nil, nil, nil, 0, err
@@ -160,31 +188,33 @@ func open(passphrase, file []byte) (entries []entry, key, salt []byte, iters uin
 	return entries, key, salt, iters, nil
 }
 
-// parseHeader validates the frame and returns its fields. The body slice
+// parseHeader validates the frame and returns its fields — the version too,
+// so the body decode knows which field set to expect. The body slice
 // aliases the file — callers must not retain it past the GCM open.
-func parseHeader(file []byte) (salt, nonce, body []byte, iters uint32, err error) {
+func parseHeader(file []byte, magic string) (salt, nonce, body []byte, ver, iters uint32, err error) {
 	if len(file) < headerLen || len(file) > maxFile {
-		return nil, nil, nil, 0, errBadFile
+		return nil, nil, nil, 0, 0, errBadFile
 	}
-	if string(file[:4]) != fileMagic {
-		return nil, nil, nil, 0, errBadFile
+	if string(file[:4]) != magic {
+		return nil, nil, nil, 0, 0, errBadFile
 	}
-	if getU32(file, 4) != fileVersion {
-		return nil, nil, nil, 0, errBadFile
+	ver = getU32(file, 4)
+	if ver < minVersion || ver > fileVersion {
+		return nil, nil, nil, 0, 0, errBadFile
 	}
 	iters = getU32(file, 8)
 	if iters == 0 {
-		return nil, nil, nil, 0, errBadFile
+		return nil, nil, nil, 0, 0, errBadFile
 	}
 	sl := int(getU16(file, 12))
 	if sl < 8 || 14+sl > len(file) {
-		return nil, nil, nil, 0, errBadFile
+		return nil, nil, nil, 0, 0, errBadFile
 	}
 	salt = file[14 : 14+sl]
 	nl := int(getU16(file, 14+sl))
 	base := 14 + sl + 2
 	if nl != nonceLen || base+nl > len(file) {
-		return nil, nil, nil, 0, errBadFile
+		return nil, nil, nil, 0, 0, errBadFile
 	}
 	nonce = file[base : base+nl]
 	body = file[base+nl:]
@@ -192,17 +222,22 @@ func parseHeader(file []byte) (salt, nonce, body []byte, iters uint32, err error
 	// truncated file. Both are structural, so they join the bad-file name
 	// rather than spending a passphrase on them.
 	if len(body) < gcmTag+1 {
-		return nil, nil, nil, 0, errBadFile
+		return nil, nil, nil, 0, 0, errBadFile
 	}
-	return salt, nonce, body, iters, nil
+	return salt, nonce, body, ver, iters, nil
 }
 
-// encodeBody serializes the entry list. Counts and lengths are bounded by the
-// package constants; a caller that keeps entries inside them cannot fail.
-func encodeBody(entries []entry) []byte {
+// encodeBody serializes the entry list at the given format version — v2
+// appends the per-entry totp field, v1 writes the original three-field row.
+// Counts and lengths are bounded by the package constants; a caller that
+// keeps entries inside them cannot fail.
+func encodeBody(entries []entry, ver uint32) []byte {
 	n := 4
 	for _, e := range entries {
 		n += 6 + len(e.name) + len(e.secret) + len(e.note)
+		if ver >= 2 {
+			n += 2 + len(e.totp)
+		}
 	}
 	out := make([]byte, 0, n)
 	out = appendU32(out, uint32(len(entries)))
@@ -213,16 +248,21 @@ func encodeBody(entries []entry) []byte {
 		out = append(out, e.secret...)
 		out = appendU16(out, uint16(len(e.note)))
 		out = append(out, e.note...)
+		if ver >= 2 {
+			out = appendU16(out, uint16(len(e.totp)))
+			out = append(out, e.totp...)
+		}
 	}
 	return out
 }
 
-// decodeBody reverses encodeBody with bounds checked at every step: a length
-// field is read only after the bytes it claims are proven present, so a
-// corrupt body names errBadFile instead of panicking or overrunning. Fields
-// are COPIED out — the caller zeroes the plaintext buffer on return, and an
-// aliased entry would be a zeroed entry.
-func decodeBody(b []byte) ([]entry, error) {
+// decodeBody reverses encodeBody for the frame's version — a v1 body ends
+// each row at the note field, a v2 body adds the bounded totp field. Bounds
+// are checked at every step: a length field is read only after the bytes it
+// claims are proven present, so a corrupt body names errBadFile instead of
+// panicking or overrunning. Fields are COPIED out — the caller zeroes the
+// plaintext buffer on return, and an aliased entry would be a zeroed entry.
+func decodeBody(b []byte, ver uint32) ([]entry, error) {
 	if len(b) < 4 {
 		return nil, errBadFile
 	}
@@ -263,6 +303,11 @@ func decodeBody(b []byte) ([]entry, error) {
 		if e.note, ok = field(maxNote); !ok {
 			return nil, errBadFile
 		}
+		if ver >= 2 {
+			if e.totp, ok = field(maxTotp); !ok {
+				return nil, errBadFile
+			}
+		}
 		entries = append(entries, e)
 	}
 	if p != len(b) {
@@ -300,11 +345,13 @@ func zero(b []byte) {
 }
 
 // zeroEntries clears every field of every entry — the lock path's wipe.
+// The totp seed is a shared secret too: it is wiped with the rest.
 func zeroEntries(entries []entry) {
 	for i := range entries {
 		zero(entries[i].name)
 		zero(entries[i].secret)
 		zero(entries[i].note)
+		zero(entries[i].totp)
 	}
 }
 

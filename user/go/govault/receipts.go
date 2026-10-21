@@ -23,12 +23,18 @@ import (
 	"strings"
 )
 
-// Action vocabulary — the four receiptable events the card names.
+// Action vocabulary — the receiptable events: the M148b four, plus the
+// M156c bundle arc. Export and import are vault-level rows — an export moves
+// every secret out under a second passphrase and an import folds a bundle
+// in; both are exactly what the audit file is for. Import's name field
+// carries the merge counts (added=N skipped=M), never an entry's name.
 const (
 	actUnlock      = "unlock"
 	actUnlockFail  = "unlock-failed"
 	actReveal      = "reveal"
 	actCopy        = "copy"
+	actExport      = "export"
+	actImport      = "import"
 	rcptCorruptRow = "corrupt" // serial marker for a row that did not parse
 )
 

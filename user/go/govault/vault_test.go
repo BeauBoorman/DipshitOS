@@ -32,7 +32,7 @@ func sealTest(t *testing.T, pass []byte, entries []entry) []byte {
 		t.Fatalf("deriveKey: %v", err)
 	}
 	defer zero(key)
-	file, err := sealWithKey(key, testSalt, testNonce, testIters, entries)
+	file, err := sealWithKey(fileMagic, fileVersion, key, testSalt, testNonce, testIters, entries)
 	if err != nil {
 		t.Fatalf("sealWithKey: %v", err)
 	}
@@ -156,23 +156,23 @@ func TestBadFileRefusals(t *testing.T) {
 
 // The decode bounds are the refusal lines a hostile body hits.
 func TestBodyBounds(t *testing.T) {
-	if _, err := decodeBody(nil); !errors.Is(err, errBadFile) {
+	if _, err := decodeBody(nil, fileVersion); !errors.Is(err, errBadFile) {
 		t.Fatalf("empty body: %v", err)
 	}
 	over := appendU32(nil, maxEntries+1)
-	if _, err := decodeBody(over); !errors.Is(err, errBadFile) {
+	if _, err := decodeBody(over, fileVersion); !errors.Is(err, errBadFile) {
 		t.Fatalf("over-count body: %v", err)
 	}
 	// count=1 then a name_len that overruns the buffer.
 	lie := appendU32(nil, 1)
 	lie = appendU16(lie, 40)
 	lie = append(lie, 1, 2, 3)
-	if _, err := decodeBody(lie); !errors.Is(err, errBadFile) {
+	if _, err := decodeBody(lie, fileVersion); !errors.Is(err, errBadFile) {
 		t.Fatalf("overrun name_len: %v", err)
 	}
 	// A valid body plus one trailing byte is still a lie.
-	good := encodeBody(testEntries())
-	if _, err := decodeBody(append(good, 0)); !errors.Is(err, errBadFile) {
+	good := encodeBody(testEntries(), fileVersion)
+	if _, err := decodeBody(append(good, 0), fileVersion); !errors.Is(err, errBadFile) {
 		t.Fatalf("trailing byte: %v", err)
 	}
 }
