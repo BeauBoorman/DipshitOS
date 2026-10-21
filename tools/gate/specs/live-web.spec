@@ -23,13 +23,18 @@
 # 45-47 (M126f #2598): the K=3 acceptance journey — one boot per iteration of
 # browse -> bookmark -> find -> zoom -> download -> open in viewer, three
 # independent VMs on the shared armed share.
+# 54-56 (M135d #2766): the K=3 net acceptance journey — one boot per
+# iteration: GOHTTPD --tls serves a page to a host TLS 1.3 client over the
+# byte relay, WEB pulls a gzip page plus two linked stylesheets off the host
+# packet responder on ONE keep-alive connection, and a third simultaneous
+# SYN past the plain listener's child bound draws the named refusal.
 # v6 (M117f #2478, ADR 0057): vi.Dial v6 connect+GET to the hermetic
 # responder; WEB.ELF's named v6-literal URL refusal beside it — no v6 URL
 # grammar or TLS-over-v6 responder exists yet. No public-internet access,
 # scripts or POST; owner authorized the fixed three-pixel shim-border
 # composition; font markers are live-web-ttf's. Prereqs: build-web.sh
 # browser WEB and browser WEB --gate, fetch GOFETCH --gate,
-# build-goview.sh, build-files.sh.
+# build-goview.sh, build-files.sh, build-gohttpd.sh.
 
 vgate_name live-web "WEB: bounded CSS browser, exact M93 presentation, DNS/SNI/GET navigation and fail-closed TLS"
 vgate_share seed
@@ -3103,4 +3108,650 @@ hits = sum(1 for yy in range(120, 300, 20) for xx in range(60, 540, 20)
 if hits < 60:
     sys.exit("FAIL: stylesheet background absent (hits=%d)" % hits)
 print("live-web 53: linked CSS applied (%d samples)" % hits)
+PY
+
+# --- boots 54-56 (M135d #2766): the net acceptance journey, K=3 ---------
+# One boot per iteration — three independent VMs running the same journey:
+#
+#   1. GOHTTPD --tls /host/TLS.CRT /host/TLS.SEED 8443 answers a host TLS
+#      1.3 client driven over the runner's byte relay (the live-httpd run
+#      05 shape): handshake completes, the peer DER equals the staged
+#      fixture, and the index page body comes back.
+#   2. WEB fetches a GZIP page plus its two linked stylesheets off a real
+#      keep-alive responder behind :relay — three requests down ONE
+#      connection (the responder's receipt log counts one accept, three
+#      requests; the runner prints 'answered the guest's SYN' once), both
+#      stylesheets reaching the scanout.
+#   3. Three more host SYNs land on the PLAIN listener (8080) at the same
+#      marker; child_limit=2 admits two children and the third draws the
+#      named refusal 'net: listen-saturated port=8080 bound=2' + RST —
+#      the M135c (#2765) surface, run E's shape.
+#
+# The leg-2 responder is a real request-driven HTTP/1.1 server, not the
+# :packet blob: packet mode streams its payload once per connection and
+# never answers a second request on it, which cannot prove keep-alive.
+#
+# Two listeners keep the journey deterministic: --net-tcp-connect-after is
+# one marker for every declared client, so the saturation trio shares its
+# dispatch with the TLS client — aimed at 8443 the TLS SYN could lose the
+# bound race and flake leg 1; separate ports cannot starve each other.
+#
+# The TLS listener execs FIRST for a subtler reason: the kernel's slot-0
+# listener is the ipv4 fast path's `sockets.listener`, and that path feeds
+# `sockets.receive` directly — past `claimTcpFrame`'s `noteSaturated`, so a
+# saturated slot-0 port counts lsat but never prints the named marker
+# (observed 2026-10-20: 'lbound=2 lsat=1' rows with no 'net:
+# listen-saturated' line). The plain 8080 listener sits in
+# extra_listeners, where every saturating SYN is named.
+# script2 forwards only once 'httpd: listening on port 8443' prints, so
+# both legs' targets exist before any client can fire; the runs end on
+# script3's echo gated on 'web: ready', which postdates every handshake
+# and refusal marker by seconds. GOHTTPD.ELF, TLS.CRT and TLS.SEED are
+# staged by the setup hook below (the same env-gated fixture generator
+# live-httpd uses).
+
+vgate_file m135d-a.txt <<'EOF'
+settings set font_size medium
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOHTTPD.ELF --tls /host/TLS.CRT /host/TLS.SEED 8443
+EOF
+
+vgate_file m135d-b.txt <<'EOF'
+exec GOHTTPD.ELF
+exec WEB.ELF http://10.0.0.2/
+EOF
+
+vgate_file m135d-c.txt <<'EOF'
+echo m135d-accept-done
+EOF
+
+# Saturation trio payloads: one GET each, explicit close.
+vgate_file m135d-req-a.txt <<'EOF'
+GET / HTTP/1.1
+Connection: close
+
+EOF
+
+vgate_file m135d-req-b.txt <<'EOF'
+GET /B HTTP/1.1
+Connection: close
+
+EOF
+
+vgate_file m135d-req-c.txt <<'EOF'
+GET /C HTTP/1.1
+Connection: close
+
+EOF
+
+# The TLS-over-stdio client, verbatim from live-httpd: ssl.MemoryBIO drives
+# TLS 1.3 over the runner's byte relay; stderr is the evidence channel
+# (into the run log). argv: CERT_DER_PATH [tls12]
+vgate_file tlscli.py <<'EOF'
+#!/usr/bin/env python3
+import os, ssl, sys
+
+cert_path = sys.argv[1]
+tls12 = len(sys.argv) > 2 and sys.argv[2] == "tls12"
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+if tls12:
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+else:
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+
+inbio = ssl.MemoryBIO()
+outbio = ssl.MemoryBIO()
+so = ctx.wrap_bio(inbio, outbio, server_side=False)
+
+def flush():
+    while True:
+        b = outbio.read()
+        if not b:
+            return
+        os.write(1, b)
+
+# Handshake loop: flush outgoing BIO, feed incoming stdin. An SSLError means
+# the peer's alert arrived — print it for the log and stop.
+ok = False
+while True:
+    try:
+        so.do_handshake()
+        ok = True
+        break
+    except ssl.SSLWantReadError:
+        flush()
+        block = os.read(0, 65536)
+        if not block:
+            break
+        inbio.write(block)
+    except ssl.SSLWantWriteError:
+        flush()
+    except ssl.SSLError as e:
+        sys.stderr.write("TLSCLI: handshake ssl error %r\n" % (e,))
+        break
+    flush()
+
+if not ok:
+    sys.exit(0 if tls12 else 2)
+
+peer = so.getpeercert(binary_form=True)
+want = open(cert_path, "rb").read()
+sys.stderr.write("TLSCLI: handshake ok, peer cert %d bytes, fixture match=%s\n"
+                 % (len(peer or b""), peer == want))
+so.write(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+flush()
+body = b""
+while True:
+    try:
+        d = so.read(4096)
+        if not d:
+            break
+        body += d
+    except ssl.SSLWantReadError:
+        pass
+    except ssl.SSLError as e:
+        sys.stderr.write("TLSCLI: read err %r\n" % (e,))
+        break
+    block = os.read(0, 65536)
+    if not block:
+        break
+    inbio.write(block)
+sys.stderr.write("TLSCLI: body=%r\n" % body)
+if b"VirelaiOS" not in body:
+    sys.exit(3)
+sys.exit(0)
+EOF
+
+# Leg 2's responder: a minimal keep-alive HTTP/1.1 server the runner
+# reaches through :relay. It never parses beyond the request line and
+# never closes on its own; every accept and request appends a receipt
+# line the gate counts afterward (one accept, three requests = the whole
+# page load rode one connection).
+vgate_file m135d_httpd.py <<'EOF'
+#!/usr/bin/env python3
+import gzip, os, socket, sys, threading
+
+out_path, port = sys.argv[1], int(sys.argv[2])
+out = open(out_path, "a", buffering=1)
+
+page = (b'<html><head><link rel="stylesheet" href="/ka-a.css">'
+        b'<link rel="stylesheet" href="/ka-b.css"></head>'
+        b'<body><h1>gzip keep-alive journey</h1>'
+        b'<p>three fetches, one connection</p></body></html>')
+routes = {
+    "/": (b"Content-Encoding: gzip\r\n", gzip.compress(page, mtime=0)),
+    "/ka-a.css": (b"", b"body { background-color: #7fdbff; }"),
+    "/ka-b.css": (b"", b"h1 { background-color: #b58900; }"),
+}
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(4)
+out.write("m135d-httpd ready\n")
+
+next_id = [0]
+def serve(c, cid):
+    buf = b""
+    while True:
+        try:
+            data = c.recv(65536)
+        except OSError:
+            return
+        if not data:
+            return
+        buf += data
+        while b"\r\n\r\n" in buf:
+            head, buf = buf.split(b"\r\n\r\n", 1)
+            reqline = head.split(b"\r\n", 1)[0].decode("latin1")
+            path = reqline.split(" ")[1] if " " in reqline else "/"
+            extra, body = routes.get(path, (b"", b"not found"))
+            status = b"200 OK" if path in routes else b"404 Not Found"
+            c.sendall(b"HTTP/1.1 " + status + b"\r\n" + extra +
+                      b"Content-Length: " + str(len(body)).encode() +
+                      b"\r\n\r\n" + body)
+            out.write("conn=%d req=%s\n" % (cid, reqline))
+            if b"connection: close" in head.lower():
+                return
+
+while True:
+    try:
+        c, _ = srv.accept()
+    except OSError:
+        break
+    cid = next_id[0]; next_id[0] += 1
+    out.write("accept conn=%d\n" % cid)
+    threading.Thread(target=serve, args=(c, cid), daemon=True).start()
+EOF
+
+vgate_setup_python <<'PY'
+# Boots 54-56 (M135d #2766): GOHTTPD.ELF plus the --tls credential pair the
+# legs serve, and leg 2's keep-alive responder bound to loopback (the
+# runner relays 10.0.0.2:80 to it). The credential comes from the same
+# env-gated host generator live-httpd runs; hooks execute with the repo
+# root as cwd (every hook's relative paths already assume it).
+import os, shutil, subprocess, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+src = os.path.join(".build", "go", "GOHTTPD.ELF")
+if not os.path.exists(src):
+    sys.exit("GOHTTPD.ELF missing (expected " + src + ") - build it first: "
+             "bash tools/go/build-gohttpd.sh")
+shutil.copy(src, os.path.join(share, "GOHTTPD.ELF"))
+print("live-web 54-56: staged GOHTTPD.ELF (%d bytes)" % os.path.getsize(src))
+
+env = dict(os.environ)
+env["HTTPD_TLS_GEN_FIXTURE"] = "1"
+env["HTTPD_TLS_FIXTURE_DIR"] = share
+r = subprocess.run(["go", "-C", "user/go", "test", "-run", "TestGenTLSFixture",
+                    "-v", "./httpd/"], cwd=os.getcwd(), env=env,
+                   capture_output=True, text=True)
+sys.stderr.write(r.stdout[-800:] + r.stderr[-800:])
+if r.returncode != 0:
+    sys.exit("live-web 54-56: TLS fixture generator failed")
+for name in ("TLS.CRT", "TLS.SEED"):
+    if not os.path.exists(os.path.join(share, name)):
+        sys.exit("live-web 54-56: fixture missing " + name)
+# The stream client verifies the peer DER against the same fixture; the
+# share path varies ($VG_SHARE), so it reads a RUN_DIR copy.
+shutil.copy(os.path.join(share, "TLS.CRT"), os.path.join(rd, "TLS.CRT"))
+os.chmod(os.path.join(rd, "tlscli.py"), 0o755)
+os.chmod(os.path.join(rd, "m135d_httpd.py"), 0o755)
+print("live-web 54-56: generated TLS.CRT + TLS.SEED; tlscli.py armed")
+
+receipt = os.path.join(rd, "m135d-httpd.log")
+watch = os.path.join("user", "go", "browser", "peer_watch.py")
+httpd = os.path.join(rd, "m135d_httpd.py")
+proc = subprocess.Popen([sys.executable, watch, str(os.getppid()),
+                         sys.executable, httpd, receipt, "24601"],
+                        stdout=open(os.path.join(rd, "m135d-httpd.err"), "wb"),
+                        stderr=subprocess.STDOUT, start_new_session=True)
+print("live-web 54-56: keep-alive responder pid=%d on 127.0.0.1:24601" % proc.pid)
+PY
+
+vgate_run 54 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-54' \
+    --net '$RUN_DIR/cap54.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:relay' --net-tcp-respond-relay 127.0.0.1:24601 \
+    --net-tcp-connect '10.0.0.1:8443' \
+    --net-tcp-connect-stream '$RUN_DIR/tlscli.py' \
+    --net-tcp-connect-stream-arg '$RUN_DIR/TLS.CRT' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-a.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-b.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-c.txt' \
+    --net-tcp-connect-after 'httpd: listening on port 8080' \
+    --script '$RUN_DIR/m135d-a.txt' \
+    --script2 '$RUN_DIR/m135d-b.txt' --script2-after 'httpd: listening on port 8443' \
+    --script3 '$RUN_DIR/m135d-c.txt' --script3-after 'web: ready' --script3-delay 3 \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'm135d-accept-done' --timeout 180
+
+vgate_assert 54 serial-contains 'net ip: ip=10.0.0.1'
+vgate_assert 54 serial-contains 'settings: font_size=medium'
+vgate_assert 54 serial-contains 'httpd: listening on port 8443'
+vgate_assert 54 serial-contains 'httpd: listening on port 8080'
+vgate_assert 54 serial-contains 'net: listen-saturated port=8080 bound=2'
+vgate_assert 54 serial-contains 'lbound=2 lsat=1'
+vgate_assert 54 serial-contains 'web: url http://10.0.0.2/'
+vgate_assert 54 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 54 serial-contains 'web: fetch 10.0.0.2/ka-a.css'
+vgate_assert 54 serial-contains 'web: fetch 10.0.0.2/ka-b.css'
+vgate_assert 54 serial-contains 'web: settled'
+vgate_assert 54 serial-contains 'web: ready'
+vgate_assert 54 serial-contains 'm135d-accept-done'
+vgate_assert 54 serial-absent 'web: error'
+vgate_assert 54 serial-absent 'web: offline '
+vgate_assert 54 serial-absent 'web: read-timeout'
+vgate_assert 54 serial-absent 'web: diagnostic '
+vgate_assert 54 serial-absent 'httpd: tls alert'
+vgate_assert 54 serial-absent 'httpd: tls error'
+vgate_assert 54 serial-absent 'httpd: error'
+vgate_assert 54 serial-absent '[EXC] parking:'
+vgate_assert 54 output-contains 'NET-TCP-CONNECT: the guest refused the connection (RST)'
+vgate_assert 54 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+out = open(os.path.join(os.environ["RUN_DIR"], "run-54.out"), errors="replace").read()
+# Leg 1: the host TLS 1.3 client completed the handshake against the
+# guest's own stack, matched the peer DER to the staged fixture, and read
+# the index page body back over the record layer.
+for m in ("TLSCLI: handshake ok", "fixture match=True"):
+    if m not in out:
+        sys.exit("FAIL: TLS leg missing %r" % m)
+if "VirelaiOS" not in out:
+    sys.exit("FAIL: TLS leg body missing the index page")
+# Leg 3: exactly one refused SYN against the plain listener — the named
+# saturation. Three sessions ran in total: the TLS one plus the two the
+# bound admitted; the third trio member never became a session.
+n = out.count("the guest refused the connection (RST)")
+if n != 1:
+    sys.exit("FAIL: refusals %d, want exactly 1" % n)
+for marker, want in (("httpd: accepted", 3), ("httpd: served", 3),
+                     ("httpd: closed", 3)):
+    got = ser.count(marker)
+    if got != want:
+        sys.exit("FAIL: %r appeared %d times, want %d" % (marker, got, want))
+# Leg 2: one TCP connection carried the gzip page and both stylesheets —
+# counted twice: once at the runner's SYN-ACK and once in the responder's
+# own receipt (one accept, three request lines, in order).
+n = out.count("answered the guest's SYN")
+if n != 1:
+    sys.exit("FAIL: responder accepted %d connections, want 1" % n)
+receipt = [l for l in open(os.path.join(os.environ["RUN_DIR"],
+           "m135d-httpd.log"), errors="replace").read().splitlines() if l]
+# The responder is one process for the whole spec run — this leg's traffic
+# is the LAST three request lines, and they must all ride one connection
+# (a mid-leg retry would split them across conn ids).
+reqs = [l for l in receipt if " req=" in l][-3:]
+want = ["GET / HTTP/1.1", "GET /ka-a.css HTTP/1.1", "GET /ka-b.css HTTP/1.1"]
+if [r.split("req=", 1)[1] for r in reqs] != want:
+    sys.exit("FAIL: leg receipt %r, want %r" % (reqs, want))
+conns = {r.split(" ", 1)[0] for r in reqs}
+if len(conns) != 1:
+    sys.exit("FAIL: leg rode %d connections, want 1" % len(conns))
+print("live-web 54: TLS serve ok; 3 requests on 1 connection; 1 named saturation")
+PY
+vgate_assert 54 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "httpd: listening on port 8443",
+    "httpd: listening on port 8080",
+    "web: fetch 10.0.0.2/",
+    "web: fetch 10.0.0.2/ka-a.css",
+    "web: fetch 10.0.0.2/ka-b.css",
+    "web: settled",
+    "web: ready",
+    "m135d-accept-done",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    if at < 0:
+        sys.exit("FAIL: missing or out of order: " + marker)
+    pos = at + 1
+print("live-web 54: journey ordering ok (listeners -> fetch x3 -> ready -> done)")
+PY
+vgate_assert 54 snapshot 'snap-54-*.raw' <<'PY'
+import sys
+# Both stylesheets applied: css_a paints the page background #7fdbff,
+# css_b paints the h1 band #b58900 — the second subresource really arrived
+# and rendered, not just fetched.
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+bg = band = 0
+for yy in range(92, 380):
+    for xx in range(40, 552, 2):
+        c = px(xx, yy)
+        if c == (0x7f, 0xdb, 0xff):
+            bg += 1
+        elif c == (0xb5, 0x89, 0x00):
+            band += 1
+assert bg > 2000, "page background absent (bg=%d)" % bg
+assert band > 30, "h1 band absent (band=%d)" % band
+print("live-web 54: both stylesheets on the scanout (bg=%d band=%d)" % (bg, band))
+PY
+
+vgate_run 55 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-55' \
+    --net '$RUN_DIR/cap55.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:relay' --net-tcp-respond-relay 127.0.0.1:24601 \
+    --net-tcp-connect '10.0.0.1:8443' \
+    --net-tcp-connect-stream '$RUN_DIR/tlscli.py' \
+    --net-tcp-connect-stream-arg '$RUN_DIR/TLS.CRT' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-a.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-b.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-c.txt' \
+    --net-tcp-connect-after 'httpd: listening on port 8080' \
+    --script '$RUN_DIR/m135d-a.txt' \
+    --script2 '$RUN_DIR/m135d-b.txt' --script2-after 'httpd: listening on port 8443' \
+    --script3 '$RUN_DIR/m135d-c.txt' --script3-after 'web: ready' --script3-delay 3 \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'm135d-accept-done' --timeout 180
+
+vgate_assert 55 serial-contains 'net ip: ip=10.0.0.1'
+vgate_assert 55 serial-contains 'settings: font_size=medium'
+vgate_assert 55 serial-contains 'httpd: listening on port 8443'
+vgate_assert 55 serial-contains 'httpd: listening on port 8080'
+vgate_assert 55 serial-contains 'net: listen-saturated port=8080 bound=2'
+vgate_assert 55 serial-contains 'lbound=2 lsat=1'
+vgate_assert 55 serial-contains 'web: url http://10.0.0.2/'
+vgate_assert 55 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 55 serial-contains 'web: fetch 10.0.0.2/ka-a.css'
+vgate_assert 55 serial-contains 'web: fetch 10.0.0.2/ka-b.css'
+vgate_assert 55 serial-contains 'web: settled'
+vgate_assert 55 serial-contains 'web: ready'
+vgate_assert 55 serial-contains 'm135d-accept-done'
+vgate_assert 55 serial-absent 'web: error'
+vgate_assert 55 serial-absent 'web: offline '
+vgate_assert 55 serial-absent 'web: read-timeout'
+vgate_assert 55 serial-absent 'web: diagnostic '
+vgate_assert 55 serial-absent 'httpd: tls alert'
+vgate_assert 55 serial-absent 'httpd: tls error'
+vgate_assert 55 serial-absent 'httpd: error'
+vgate_assert 55 serial-absent '[EXC] parking:'
+vgate_assert 55 output-contains 'NET-TCP-CONNECT: the guest refused the connection (RST)'
+vgate_assert 55 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+out = open(os.path.join(os.environ["RUN_DIR"], "run-55.out"), errors="replace").read()
+# Leg 1: the host TLS 1.3 client completed the handshake against the
+# guest's own stack, matched the peer DER to the staged fixture, and read
+# the index page body back over the record layer.
+for m in ("TLSCLI: handshake ok", "fixture match=True"):
+    if m not in out:
+        sys.exit("FAIL: TLS leg missing %r" % m)
+if "VirelaiOS" not in out:
+    sys.exit("FAIL: TLS leg body missing the index page")
+# Leg 3: exactly one refused SYN against the plain listener — the named
+# saturation. Three sessions ran in total: the TLS one plus the two the
+# bound admitted; the third trio member never became a session.
+n = out.count("the guest refused the connection (RST)")
+if n != 1:
+    sys.exit("FAIL: refusals %d, want exactly 1" % n)
+for marker, want in (("httpd: accepted", 3), ("httpd: served", 3),
+                     ("httpd: closed", 3)):
+    got = ser.count(marker)
+    if got != want:
+        sys.exit("FAIL: %r appeared %d times, want %d" % (marker, got, want))
+# Leg 2: one TCP connection carried the gzip page and both stylesheets —
+# counted twice: once at the runner's SYN-ACK and once in the responder's
+# own receipt (one accept, three request lines, in order).
+n = out.count("answered the guest's SYN")
+if n != 1:
+    sys.exit("FAIL: responder accepted %d connections, want 1" % n)
+receipt = [l for l in open(os.path.join(os.environ["RUN_DIR"],
+           "m135d-httpd.log"), errors="replace").read().splitlines() if l]
+# The responder is one process for the whole spec run — this leg's traffic
+# is the LAST three request lines, and they must all ride one connection
+# (a mid-leg retry would split them across conn ids).
+reqs = [l for l in receipt if " req=" in l][-3:]
+want = ["GET / HTTP/1.1", "GET /ka-a.css HTTP/1.1", "GET /ka-b.css HTTP/1.1"]
+if [r.split("req=", 1)[1] for r in reqs] != want:
+    sys.exit("FAIL: leg receipt %r, want %r" % (reqs, want))
+conns = {r.split(" ", 1)[0] for r in reqs}
+if len(conns) != 1:
+    sys.exit("FAIL: leg rode %d connections, want 1" % len(conns))
+print("live-web 55: TLS serve ok; 3 requests on 1 connection; 1 named saturation")
+PY
+vgate_assert 55 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "httpd: listening on port 8443",
+    "httpd: listening on port 8080",
+    "web: fetch 10.0.0.2/",
+    "web: fetch 10.0.0.2/ka-a.css",
+    "web: fetch 10.0.0.2/ka-b.css",
+    "web: settled",
+    "web: ready",
+    "m135d-accept-done",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    if at < 0:
+        sys.exit("FAIL: missing or out of order: " + marker)
+    pos = at + 1
+print("live-web 55: journey ordering ok (listeners -> fetch x3 -> ready -> done)")
+PY
+vgate_assert 55 snapshot 'snap-55-*.raw' <<'PY'
+import sys
+# Both stylesheets applied: css_a paints the page background #7fdbff,
+# css_b paints the h1 band #b58900 — the second subresource really arrived
+# and rendered, not just fetched.
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+bg = band = 0
+for yy in range(92, 380):
+    for xx in range(40, 552, 2):
+        c = px(xx, yy)
+        if c == (0x7f, 0xdb, 0xff):
+            bg += 1
+        elif c == (0xb5, 0x89, 0x00):
+            band += 1
+assert bg > 2000, "page background absent (bg=%d)" % bg
+assert band > 30, "h1 band absent (band=%d)" % band
+print("live-web 55: both stylesheets on the scanout (bg=%d band=%d)" % (bg, band))
+PY
+
+vgate_run 56 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-56' \
+    --net '$RUN_DIR/cap56.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond '10.0.0.2:80:relay' --net-tcp-respond-relay 127.0.0.1:24601 \
+    --net-tcp-connect '10.0.0.1:8443' \
+    --net-tcp-connect-stream '$RUN_DIR/tlscli.py' \
+    --net-tcp-connect-stream-arg '$RUN_DIR/TLS.CRT' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-a.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-b.txt' \
+    --net-tcp-connect '10.0.0.1:8080:$RUN_DIR/m135d-req-c.txt' \
+    --net-tcp-connect-after 'httpd: listening on port 8080' \
+    --script '$RUN_DIR/m135d-a.txt' \
+    --script2 '$RUN_DIR/m135d-b.txt' --script2-after 'httpd: listening on port 8443' \
+    --script3 '$RUN_DIR/m135d-c.txt' --script3-after 'web: ready' --script3-delay 3 \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'm135d-accept-done' --timeout 180
+
+vgate_assert 56 serial-contains 'net ip: ip=10.0.0.1'
+vgate_assert 56 serial-contains 'settings: font_size=medium'
+vgate_assert 56 serial-contains 'httpd: listening on port 8443'
+vgate_assert 56 serial-contains 'httpd: listening on port 8080'
+vgate_assert 56 serial-contains 'net: listen-saturated port=8080 bound=2'
+vgate_assert 56 serial-contains 'lbound=2 lsat=1'
+vgate_assert 56 serial-contains 'web: url http://10.0.0.2/'
+vgate_assert 56 serial-contains 'web: fetch 10.0.0.2/'
+vgate_assert 56 serial-contains 'web: fetch 10.0.0.2/ka-a.css'
+vgate_assert 56 serial-contains 'web: fetch 10.0.0.2/ka-b.css'
+vgate_assert 56 serial-contains 'web: settled'
+vgate_assert 56 serial-contains 'web: ready'
+vgate_assert 56 serial-contains 'm135d-accept-done'
+vgate_assert 56 serial-absent 'web: error'
+vgate_assert 56 serial-absent 'web: offline '
+vgate_assert 56 serial-absent 'web: read-timeout'
+vgate_assert 56 serial-absent 'web: diagnostic '
+vgate_assert 56 serial-absent 'httpd: tls alert'
+vgate_assert 56 serial-absent 'httpd: tls error'
+vgate_assert 56 serial-absent 'httpd: error'
+vgate_assert 56 serial-absent '[EXC] parking:'
+vgate_assert 56 output-contains 'NET-TCP-CONNECT: the guest refused the connection (RST)'
+vgate_assert 56 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+out = open(os.path.join(os.environ["RUN_DIR"], "run-56.out"), errors="replace").read()
+# Leg 1: the host TLS 1.3 client completed the handshake against the
+# guest's own stack, matched the peer DER to the staged fixture, and read
+# the index page body back over the record layer.
+for m in ("TLSCLI: handshake ok", "fixture match=True"):
+    if m not in out:
+        sys.exit("FAIL: TLS leg missing %r" % m)
+if "VirelaiOS" not in out:
+    sys.exit("FAIL: TLS leg body missing the index page")
+# Leg 3: exactly one refused SYN against the plain listener — the named
+# saturation. Three sessions ran in total: the TLS one plus the two the
+# bound admitted; the third trio member never became a session.
+n = out.count("the guest refused the connection (RST)")
+if n != 1:
+    sys.exit("FAIL: refusals %d, want exactly 1" % n)
+for marker, want in (("httpd: accepted", 3), ("httpd: served", 3),
+                     ("httpd: closed", 3)):
+    got = ser.count(marker)
+    if got != want:
+        sys.exit("FAIL: %r appeared %d times, want %d" % (marker, got, want))
+# Leg 2: one TCP connection carried the gzip page and both stylesheets —
+# counted twice: once at the runner's SYN-ACK and once in the responder's
+# own receipt (one accept, three request lines, in order).
+n = out.count("answered the guest's SYN")
+if n != 1:
+    sys.exit("FAIL: responder accepted %d connections, want 1" % n)
+receipt = [l for l in open(os.path.join(os.environ["RUN_DIR"],
+           "m135d-httpd.log"), errors="replace").read().splitlines() if l]
+# The responder is one process for the whole spec run — this leg's traffic
+# is the LAST three request lines, and they must all ride one connection
+# (a mid-leg retry would split them across conn ids).
+reqs = [l for l in receipt if " req=" in l][-3:]
+want = ["GET / HTTP/1.1", "GET /ka-a.css HTTP/1.1", "GET /ka-b.css HTTP/1.1"]
+if [r.split("req=", 1)[1] for r in reqs] != want:
+    sys.exit("FAIL: leg receipt %r, want %r" % (reqs, want))
+conns = {r.split(" ", 1)[0] for r in reqs}
+if len(conns) != 1:
+    sys.exit("FAIL: leg rode %d connections, want 1" % len(conns))
+print("live-web 56: TLS serve ok; 3 requests on 1 connection; 1 named saturation")
+PY
+vgate_assert 56 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+order = [
+    "httpd: listening on port 8443",
+    "httpd: listening on port 8080",
+    "web: fetch 10.0.0.2/",
+    "web: fetch 10.0.0.2/ka-a.css",
+    "web: fetch 10.0.0.2/ka-b.css",
+    "web: settled",
+    "web: ready",
+    "m135d-accept-done",
+]
+pos = 0
+for marker in order:
+    at = ser.find(marker, pos)
+    if at < 0:
+        sys.exit("FAIL: missing or out of order: " + marker)
+    pos = at + 1
+print("live-web 56: journey ordering ok (listeners -> fetch x3 -> ready -> done)")
+PY
+vgate_assert 56 snapshot 'snap-56-*.raw' <<'PY'
+import sys
+# Both stylesheets applied: css_a paints the page background #7fdbff,
+# css_b paints the h1 band #b58900 — the second subresource really arrived
+# and rendered, not just fetched.
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+bg = band = 0
+for yy in range(92, 380):
+    for xx in range(40, 552, 2):
+        c = px(xx, yy)
+        if c == (0x7f, 0xdb, 0xff):
+            bg += 1
+        elif c == (0xb5, 0x89, 0x00):
+            band += 1
+assert bg > 2000, "page background absent (bg=%d)" % bg
+assert band > 30, "h1 band absent (band=%d)" % band
+print("live-web 56: both stylesheets on the scanout (bg=%d band=%d)" % (bg, band))
 PY
