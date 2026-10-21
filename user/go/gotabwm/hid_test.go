@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1535,7 +1536,7 @@ func TestGodMenuGestureNeverForwardsContent(t *testing.T) {
 	oldPtr, oldExec := forwardContentPointer, execApp
 	defer func() { forwardContentPointer, execApp = oldPtr, oldExec }()
 	forwards := 0
-	forwardContentPointer = func(uint32, uint32, uint8) int64 {
+	forwardContentPointer = func(uint32, uint32, uint8, uint8) int64 {
 		forwards++
 		return 0
 	}
@@ -1576,6 +1577,45 @@ func TestGodMenuGestureNeverForwardsContent(t *testing.T) {
 		if (action == "header") != launch.open {
 			t.Fatalf("%s open=%v", action, launch.open)
 		}
+	}
+}
+
+// #2896: the kernel stamps each kind-19 sample with the modifier byte held
+// at ITS decode (arg1); the seat's whole job on the content forward is to
+// echo it back uninterpreted so the kernel judges the press on capture-time
+// — not drain-time — modifiers.
+func TestContentForwardEchoesModifierStamp(t *testing.T) {
+	defer saveSeatState()()
+	resetNotify(t)
+	oldPtr := forwardContentPointer
+	defer func() { forwardContentPointer = oldPtr }()
+	type sample struct {
+		x, y uint32
+		b, m uint8
+	}
+	var got []sample
+	forwardContentPointer = func(x, y uint32, b, m uint8) int64 {
+		got = append(got, sample{x, y, b, m})
+		return 0
+	}
+	tabs = TabStrip{}
+	if !tabs.OpenTab(4, "Edit") {
+		t.Fatal("OpenTab")
+	}
+	prevPtrButtons, contentDown, railDragFrom = 0, false, -1
+	launch = launcherState{}
+
+	// A press captured with Shift held (arg1 = 0x22 — the HID L/R-shift
+	// bits the kernel stamps) forwards the stamp untouched, and the
+	// unmodified release forwards zero.
+	press := ptrEvent(400, 300, hidBtnLeft)
+	press.Arg1 = 0x22
+	handleWmPointer(press)
+	handleWmPointer(ptrEvent(400, 300, 0))
+
+	want := []sample{{400, 300, hidBtnLeft, 0x22}, {400, 300, 0, 0}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("forwarded samples %v want %v", got, want)
 	}
 }
 

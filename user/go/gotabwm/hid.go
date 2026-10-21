@@ -823,6 +823,11 @@ func handleWmPointer(e vi.Event) {
 	px := e.Arg0 & 0xffff
 	py := e.Arg0 >> 16
 	btn := uint8(e.Flags & 0xff)
+	// #2896: arg1 is the kernel's capture-time modifier stamp on THIS
+	// sample — echoed back through the content forward so the kernel
+	// judges the press on what was held when it was captured, not on a
+	// drain-time read a concurrent chord burst may have changed.
+	mods := uint8(e.Arg1)
 	down := pointerDownEdge(btn, prevPtrButtons)
 	up := pointerUpEdge(btn, prevPtrButtons)
 	// M124e (#2584): the middle-button's own down edge — the primary-paste
@@ -977,7 +982,7 @@ func handleWmPointer(e vi.Event) {
 			// kernel derives press/release edges from this serialized
 			// stream itself; consumed chrome is never forwarded.
 			contentDown = true
-			forwardContentPointer(px, py, btn)
+			forwardContentPointer(px, py, btn, mods)
 		}
 		return
 	}
@@ -1001,7 +1006,7 @@ func handleWmPointer(e vi.Event) {
 		}
 		_ = endRailDrag(px, py)
 		if contentDown {
-			forwardContentPointer(px, py, btn)
+			forwardContentPointer(px, py, btn, mods)
 			contentDown = false
 		}
 		return
@@ -1035,7 +1040,7 @@ func handleWmPointer(e vi.Event) {
 			// is the seat's.
 			applySelPasteAt(px, py)
 		}
-		forwardContentPointer(px, py, btn)
+		forwardContentPointer(px, py, btn, mods)
 	}
 }
 

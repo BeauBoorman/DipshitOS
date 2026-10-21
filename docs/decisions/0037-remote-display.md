@@ -50,7 +50,9 @@ Linux VM are named in §"Blocked steps" and stay CI-verified.
 
 ### S2. Input: the seat drains kinds 19/21; synthesis is in-process
 
-- `EvWmPointer = 19`: `arg0 = x|(y<<16)`, `flags` low byte = buttons
+- `EvWmPointer = 19`: `arg0 = x|(y<<16)`, `flags` low byte = buttons,
+  `arg1` = capture-time HID modifier byte (#2896; synthesized events
+  forward 0)
   (`user/go/vi/wmseat.go:60-62`).
 - `EvWmKey = 21`: `arg0` = HID usage, `flags` = ADR 0009 key flags
   (`user/go/vi/wmseat.go:65-67`).

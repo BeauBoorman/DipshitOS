@@ -350,8 +350,10 @@ pub var user_blits: u64 = 0;
 pub var migrated_skips: u64 = 0;
 /// The raw-pointer fan-out (set by wm_server at REGISTER time; null when
 /// no WM — the hook style of `events.on_event_pushed`). Callback gets the
-/// mapped fb pixels + the raw HID button byte; the WM edge-detects.
-pub var wm_pointer_hook: ?*const fn (x: u32, y: u32, buttons: u8) void = null;
+/// mapped fb pixels + the raw HID button byte + the keyboard modifier
+/// byte live at the sample's decode (the capture-time snapshot the seat
+/// echoes back through slot-65 cmd 15 — #2896); the WM edge-detects.
+pub var wm_pointer_hook: ?*const fn (x: u32, y: u32, buttons: u8, mods: u8) void = null;
 /// The last pointer state already fanned to the WM, in the hook's pixel
 /// space. Shared by BOTH fan entry points — the per-report decode fan
 /// (main.zig's cv_pointer_dispatch) and pointer_tick's state-sampling fan
@@ -387,7 +389,11 @@ pub fn wm_fan_pointer(x: u16, y: u16, buttons: u8) void {
     wm_fan_x = nx;
     wm_fan_y = ny;
     wm_fan_buttons = buttons;
-    if (wm_pointer_hook) |hook| hook(nx, ny, buttons);
+    // #2896: stamp the modifier byte HERE — at the sample's own decode —
+    // not where the seat later consumes it. The seat's queue trails a
+    // concurrent chord burst, so a live kb_mods read at forward time can
+    // disagree with what was held when this sample was captured.
+    if (wm_pointer_hook) |hook| hook(nx, ny, buttons, input.report().kb_mods);
 }
 /// The window-registry mirror fan-out (set by wm_server at REGISTER time;
 /// null when no WM). Callback gets the id + full rect + state; wm_server
@@ -553,8 +559,13 @@ pub fn terminalHitAt(px: u32, py: u32) ?TermHit {
 /// #2869: this answers the REPORT half only. The selection half asks the
 /// armed SET: `?1002`/`?1003` own the whole gesture; `?1000` alone leaves
 /// the drag to selection (content_pointer_pass).
-fn mouseOwnsAt(px: u32, py: u32) bool {
-    if ((input.report().kb_mods & 0x22) != 0) return false; // L/R shift held
+/// #2896: `mods` is the modifier byte of the SAMPLE BEING JUDGED, not a
+/// live read — the raw path passes report().kb_mods (synchronous, so live
+/// IS capture), the seat-forwarded path passes the snapshot stamped on the
+/// kind-19 event at fan time (drain-time reads misattributed a concurrent
+/// chord's Shift to an older press — go-dogfood boot 08's stolen drag).
+fn mouseOwnsAt(px: u32, py: u32, mods: u8) bool {
+    if ((mods & 0x22) != 0) return false; // L/R shift held
     const mh = terminalHitAt(px, py) orelse return false;
     const s = terminal.screenForWindow(mh.win_id) orelse return false;
     return s.mouse_1000 or s.mouse_1002 or s.mouse_1003;
@@ -3596,8 +3607,9 @@ fn content_pointer_pass(
     left_released: bool,
     right_released: bool,
     press_handled: bool,
+    mods: u8,
 ) void {
-    const owns = mouseOwnsAt(nx, ny);
+    const owns = mouseOwnsAt(nx, ny, mods);
     var motion_owned = false;
     if (owns) {
         if (terminalHitAt(nx, ny)) |mh| {
@@ -3809,7 +3821,12 @@ fn deliver_window_pointer(
 /// #2878 (Gap 2): the forwarded sample now ALSO delivers window pointer
 /// events to the hit user window — under the seat this is a hosted app's
 /// whole pointer input.
-pub fn wm_content_pointer(x: u32, y: u32, buttons: u8) void {
+/// #2896: `mods` is the sample's own modifier snapshot — stamped on the
+/// kind-19 event at the kernel's fan (decode) time and echoed back by the
+/// seat, so the report-vs-selection judgment and the delivered flags both
+/// reflect what was held AT CAPTURE, never the drain-time kb_mods a
+/// concurrent chord burst may have since changed.
+pub fn wm_content_pointer(x: u32, y: u32, buttons: u8, mods: u8) void {
     if (!wm_owns_input) return;
     const prev_buttons = wm_fwd_prev_buttons;
     const cur_left = (buttons & 0x01) != 0;
@@ -3831,9 +3848,10 @@ pub fn wm_content_pointer(x: u32, y: u32, buttons: u8) void {
         (prev_left and !cur_left),
         (prev_right and !cur_right),
         false, // the seat consumed chrome; no local press latch applies
+        mods,
     );
     const flags = mouse_buttons_to_flags(buttons) |
-        input.hid_modifiers_to_flags(input.report().kb_mods);
+        input.hid_modifiers_to_flags(mods);
     deliver_window_pointer(
         x,
         y,
@@ -3929,7 +3947,7 @@ pub fn pointer_tick(st: input.PointerState, click: ?input.Click) ?u8 {
         if (input.take_press()) |p| {
             const px = map_pointer_axis(p.x, virtio_gpu.fb_width);
             const py = map_pointer_axis(p.y, virtio_gpu.fb_height);
-            if (mouseOwnsAt(px, py)) {
+            if (mouseOwnsAt(px, py, input.report().kb_mods)) {
                 // The latched press belongs to the app: consume it, suppress
                 // the stale-cursor begin below, let the report path deliver.
                 // #2869: `?1000` alone also latches the pending cell — the
@@ -3978,6 +3996,7 @@ pub fn pointer_tick(st: input.PointerState, click: ?input.Click) ?u8 {
             left_released,
             right_released,
             press_handled,
+            input.report().kb_mods,
         );
 
         // Step 5/6/7: drag + close + minimize handling on MOUSE_DOWN (left only).
@@ -6450,12 +6469,12 @@ test "wm content forward: a seat-forwarded drag runs local selection (#1688)" {
     try std.testing.expect(terminal.get(h).?.attachWindow(id));
     // Press at (68,70): inside the client area (top_y = 48+16 = 64) —
     // row 0, col 0. The seat-derived press edge must latch a drag...
-    wm_content_pointer(68, 70, 0x01);
+    wm_content_pointer(68, 70, 0x01, 0);
     try std.testing.expect(term_sel_dragging);
     // ...a held sample at (700,140) — row 4, col 79 — extends...
-    wm_content_pointer(700, 140, 0x01);
+    wm_content_pointer(700, 140, 0x01, 0);
     // ...and the release edge closes it, end marker printed.
-    wm_content_pointer(700, 140, 0x00);
+    wm_content_pointer(700, 140, 0x00, 0);
     try std.testing.expect(!term_sel_dragging);
     const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
     try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel begin") != null);
@@ -6478,9 +6497,9 @@ test "wm content forward: dormant with no seat; chrome never begins selection (#
     try std.testing.expect(terminal.get(h).?.attachWindow(id));
     // (a) no seat: the identical drag is fully dormant — WMS5's state.
     wm_owns_input = false;
-    wm_content_pointer(68, 70, 0x01);
-    wm_content_pointer(700, 140, 0x01);
-    wm_content_pointer(700, 140, 0x00);
+    wm_content_pointer(68, 70, 0x01, 0);
+    wm_content_pointer(700, 140, 0x01, 0);
+    wm_content_pointer(700, 140, 0x00, 0);
     try std.testing.expect(!term_sel_dragging);
     // (b) seat on: chrome coordinates are never content — the title band
     // (terminalHitAt skips below top_y) and points outside the window.
@@ -6492,10 +6511,10 @@ test "wm content forward: dormant with no seat; chrome never begins selection (#
         wm_fwd_prev_y = 0;
         term_sel_dragging = false;
     }
-    wm_content_pointer(100, 50, 0x01); // title band (48..63)
-    wm_content_pointer(100, 50, 0x00);
-    wm_content_pointer(10, 10, 0x01); // outside the window (dock corner)
-    wm_content_pointer(10, 10, 0x00);
+    wm_content_pointer(100, 50, 0x01, 0); // title band (48..63)
+    wm_content_pointer(100, 50, 0x00, 0);
+    wm_content_pointer(10, 10, 0x01, 0); // outside the window (dock corner)
+    wm_content_pointer(10, 10, 0x00, 0);
     try std.testing.expect(!term_sel_dragging);
     const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
     try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel") == null);
@@ -6539,8 +6558,8 @@ test "wm content forward: ?1000 reports the click, a drag still selects (#2869)"
 
     // A click at (68,70) — cell (0,0) -> SGR x=1 y=1 — reports both edges
     // and stays purely the app's: no selection, no pending left behind.
-    wm_content_pointer(68, 70, 0x01);
-    wm_content_pointer(68, 70, 0x00);
+    wm_content_pointer(68, 70, 0x01, 0);
+    wm_content_pointer(68, 70, 0x00, 0);
     try std.testing.expect(!term_sel_dragging);
     try std.testing.expect(!term_sel_pending);
     var buf: [128]u8 = undefined;
@@ -6552,10 +6571,10 @@ test "wm content forward: ?1000 reports the click, a drag still selects (#2869)"
     // A drag: press (same cell), held move to (700,140), release. The
     // press reported, the pending cell promoted on the move, the release
     // still reported — and the selection ran begin/extend/end.
-    wm_content_pointer(68, 70, 0x01);
-    wm_content_pointer(700, 140, 0x01);
+    wm_content_pointer(68, 70, 0x01, 0);
+    wm_content_pointer(700, 140, 0x01, 0);
     try std.testing.expect(term_sel_dragging);
-    wm_content_pointer(700, 140, 0x00);
+    wm_content_pointer(700, 140, 0x00, 0);
     try std.testing.expect(!term_sel_dragging);
     const drag_n = terminal.windowTerminal(id).?.readInput(&buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..drag_n], "\x1b[<0;1;1M") != null);
@@ -6600,9 +6619,9 @@ test "wm content forward: ?1002 keeps the whole gesture (#2869)" {
 
     // Button-motion is subscribed: the identical drag reports press, drag
     // (b=32 at the cursor cell) and release, and selection never engages.
-    wm_content_pointer(68, 70, 0x01);
-    wm_content_pointer(700, 140, 0x01);
-    wm_content_pointer(700, 140, 0x00);
+    wm_content_pointer(68, 70, 0x01, 0);
+    wm_content_pointer(700, 140, 0x01, 0);
+    wm_content_pointer(700, 140, 0x00, 0);
     try std.testing.expect(!term_sel_dragging);
     try std.testing.expect(!term_sel_pending);
     var buf: [256]u8 = undefined;
@@ -6612,6 +6631,104 @@ test "wm content forward: ?1002 keeps the whole gesture (#2869)" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[<32;80;5m") != null);
     const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
     try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel") == null);
+}
+
+test "wm content forward: the press is judged on the sample's own modifiers, not drain-time kb_mods (#2896)" {
+    arm();
+    input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    wm_fwd_prev_buttons = 0;
+    wm_fwd_prev_x = 0;
+    wm_fwd_prev_y = 0;
+    term_sel_dragging = false;
+    term_sel_pending = false;
+    wm_owns_input = true;
+    defer {
+        wm_owns_input = false;
+        wm_fwd_prev_buttons = 0;
+        wm_fwd_prev_x = 0;
+        wm_fwd_prev_y = 0;
+        term_sel_dragging = false;
+        term_sel_pending = false;
+        input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    }
+    wm_fwd_test_log_len = 0;
+    klog.line_hook = wm_fwd_test_capture;
+    defer klog.line_hook = null;
+    const id = switch (user_open(64, 48, 640, 400, 9)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    defer _ = user_close(id);
+    const h = terminal.create(null).?;
+    defer terminal.release(h);
+    defer terminal.detachWindow(id);
+    try std.testing.expect(terminal.get(h).?.attachWindow(id));
+    const scr = terminal.screenForWindow(id).?;
+    scr.mouse_1002 = true;
+    scr.mouse_1006 = true;
+
+    // The defect's exact shape: the press was captured unmodified, but the
+    // seat's queue trailed a concurrent chord burst, so at seat-DRAIN time
+    // kb_mods holds Shift. Judged on the sample's own snapshot (mods=0)
+    // the press still reports to the app; the live read it replaced stole
+    // the gesture into `dui: term sel` and the ?1002 drag never armed.
+    input.decode_keyboard_report(&.{ 0x02, 0, 0, 0, 0, 0, 0, 0 }); // LShift held NOW
+    wm_content_pointer(68, 70, 0x01, 0x00); // captured before the chord
+    try std.testing.expect(!term_sel_dragging);
+    try std.testing.expect(!term_sel_pending);
+    var buf: [128]u8 = undefined;
+    const press_n = terminal.windowTerminal(id).?.readInput(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..press_n], "\x1b[<0;1;1M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wm_fwd_test_log[0..wm_fwd_test_log_len], "dui: term sel") == null);
+    wm_content_pointer(68, 70, 0x00, 0x00);
+    input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 }); // chord over
+
+    // The contract's other half (#2869): a press captured WITH Shift still
+    // takes the escape even though Shift is physically up by drain — the
+    // snapshot overrides the subscription the same way the raw path's live
+    // read does.
+    wm_content_pointer(68, 70, 0x01, 0x02);
+    try std.testing.expect(term_sel_dragging);
+    wm_content_pointer(700, 140, 0x01, 0x02);
+    wm_content_pointer(700, 140, 0x00, 0x02);
+    try std.testing.expect(!term_sel_dragging);
+    const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
+    try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel begin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel end") != null);
+}
+
+test "wm content forward: delivered window flags carry the sample's snapshot too (#2896)" {
+    arm();
+    input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    wm_fwd_prev_buttons = 0;
+    wm_fwd_prev_x = 0;
+    wm_fwd_prev_y = 0;
+    wm_owns_input = true;
+    defer {
+        wm_owns_input = false;
+        wm_fwd_prev_buttons = 0;
+        wm_fwd_prev_x = 0;
+        wm_fwd_prev_y = 0;
+    }
+    const id = switch (user_open(64, 48, 640, 400, 9)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    defer _ = user_close(id);
+    while (events.pop(9) != null) {}
+
+    // Live Shift is NOT held; the forwarded snapshot says it was at
+    // capture — the MOUSE_DOWN/MOUSE_UP the hit app receives must carry
+    // the same modifiers the judgment used, not a drain-time read.
+    wm_content_pointer(100, 100, 0x01, 0x02);
+    wm_content_pointer(100, 100, 0x00, 0x02);
+    var saw_shift_down = false;
+    while (events.pop(9)) |ev| {
+        if (ev.kind == events.MOUSE_DOWN) {
+            saw_shift_down = ev.flags & events.MOD_SHIFT != 0;
+        }
+    }
+    try std.testing.expect(saw_shift_down);
 }
 
 test "pointer_tick: MOUSE_UP carries the released button's flag bit (#2878)" {
@@ -6677,9 +6794,9 @@ test "wm content forward: the seat delivers pointer events to the hit window (#2
     // A seat-forwarded press+move+release inside the window's content:
     // the hosted app's whole pointer input — before #2878 nothing was
     // pushed at all (keys+lifecycle only).
-    wm_content_pointer(100, 100, 0x01);
-    wm_content_pointer(120, 120, 0x01);
-    wm_content_pointer(120, 120, 0x00);
+    wm_content_pointer(100, 100, 0x01, 0);
+    wm_content_pointer(120, 120, 0x01, 0);
+    wm_content_pointer(120, 120, 0x00, 0);
 
     var kinds: [8]u16 = @splat(0);
     var flags: [8]u16 = @splat(0);
@@ -6706,8 +6823,8 @@ test "wm content forward: the seat delivers pointer events to the hit window (#2
 
     // The same stream stays dormant with no seat registered.
     wm_owns_input = false;
-    wm_content_pointer(100, 100, 0x01);
-    wm_content_pointer(100, 100, 0x00);
+    wm_content_pointer(100, 100, 0x01, 0);
+    wm_content_pointer(100, 100, 0x00, 0);
     try std.testing.expect(events.pop(9) == null);
 }
 

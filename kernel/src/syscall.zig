@@ -4912,11 +4912,15 @@ fn handle_wmctl(args: Args, _: *exceptions.VectorFrame) u64 {
             // local path — terminal text selection + mouse-tracking
             // reports. Edges derive from the serialized stream in
             // driving_award; consumed chrome never arrives here.
+            // #2896: a2 = the modifier byte the kernel stamped on the
+            // kind-19 event at fan time — the sample's own modifier
+            // context, echoed back so the report-vs-selection judgment
+            // uses capture-time (not drain-time) modifiers.
             if (!wm_server.registered()) return error_result(.enosys);
             if (wm_server.registered_pid() != pid) return error_result(.eacces);
             const fwd_x: u32 = @as(u16, @truncate(args[1]));
             const fwd_y: u32 = @truncate(args[1] >> 16);
-            driving_award.wm_content_pointer(fwd_x, fwd_y, @truncate(args[2]));
+            driving_award.wm_content_pointer(fwd_x, fwd_y, @truncate(args[2]), @truncate(args[3]));
             return 0;
         },
         wm_server.wmctl_set_window => {

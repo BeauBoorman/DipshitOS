@@ -164,7 +164,7 @@ it (the render server already separates policy from blit).
 - 2026-09-23 — issue #1688: **additive WMCTL subcommand 15** (seat-gated like
   every other subcommand; no existing opcode or arg layout changes — and the
   number is the very one the note above left free).
-  `CONTENT_PTR` (`wmctl(cmd=15, x|(y<<16), buttons, 0, 0, 0)`) relays one
+  `CONTENT_PTR` (`wmctl(cmd=15, x|(y<<16), buttons, mods, 0, 0)`) relays one
   pointer sample from the registered seat into the kernel's LOCAL content
   path — terminal text selection (M49 SD5) and mouse-tracking reports (M73i)
   — the decision block WMS5 made dormant under a seat by returning from
@@ -175,6 +175,12 @@ it (the render server already separates policy from blit).
   coordinates. Backs the M73z acceptance card #1638: without this forward,
   `dui: term sel end` can never print in a seated boot and the >256 B
   Ctrl+Shift+V paste chain is unreachable there.
+- 2026-10-21 — issue #2896: **additive a2 on subcommand 15** — the HID
+  modifier byte the kernel stamped on the sample's kind-19 event (`arg1`)
+  at decode time, echoed back untouched. The report-vs-selection judgment
+  (`mouseOwnsAt`) and the delivered event flags now use the modifiers held
+  AT CAPTURE; a drain-time `kb_mods` read misattributed a concurrent chord
+  burst's Shift to an older queued press (go-dogfood boot 08's stolen drag).
 
 ## Open issues (left to implementing claims)
 

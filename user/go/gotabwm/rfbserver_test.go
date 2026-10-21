@@ -419,11 +419,11 @@ func TestRFBPeerDeathMidContentDragReleasesCapture(t *testing.T) {
 	launch = launcherState{}
 	type sample struct {
 		x, y uint32
-		b    uint8
+		b, m uint8
 	}
 	var got []sample
-	forwardContentPointer = func(x, y uint32, b uint8) int64 {
-		got = append(got, sample{x, y, b})
+	forwardContentPointer = func(x, y uint32, b, m uint8) int64 {
+		got = append(got, sample{x, y, b, m})
 		return 0
 	}
 
@@ -436,7 +436,7 @@ func TestRFBPeerDeathMidContentDragReleasesCapture(t *testing.T) {
 	if !s.drainInput() {
 		t.Fatal("dead session not retired after its queue drained")
 	}
-	want := []sample{{300, 400, 1}, {340, 420, 1}, {340, 420, 0}}
+	want := []sample{{300, 400, 1, 0}, {340, 420, 1, 0}, {340, 420, 0, 0}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("content samples %v want %v", got, want)
 	}

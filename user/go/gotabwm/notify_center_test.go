@@ -153,7 +153,7 @@ func TestNotifyCenterMotionDoesNotReachContent(t *testing.T) {
 	contentDown = false
 	launch = launcherState{}
 	forwarded := 0
-	forwardContentPointer = func(uint32, uint32, uint8) int64 {
+	forwardContentPointer = func(uint32, uint32, uint8, uint8) int64 {
 		forwarded++
 		return 0
 	}

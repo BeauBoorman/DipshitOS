@@ -1325,6 +1325,7 @@ var wms5_ptr_calls: usize = 0;
 var wms5_ptr_x: u32 = 0;
 var wms5_ptr_y: u32 = 0;
 var wms5_ptr_btn: u8 = 0;
+var wms5_ptr_mods: u8 = 0;
 
 fn wms5_mirror_capture(id: u8, x: u32, y: u32, w: u32, h: u32, visible: bool, focused: bool, workspace: u8, unsaved: bool, released: bool) void {
     _ = workspace;
@@ -1340,11 +1341,12 @@ fn wms5_mirror_capture(id: u8, x: u32, y: u32, w: u32, h: u32, visible: bool, fo
     wms5_last_rel = released;
 }
 
-fn wms5_ptr_capture(x: u32, y: u32, buttons: u8) void {
+fn wms5_ptr_capture(x: u32, y: u32, buttons: u8, mods: u8) void {
     wms5_ptr_calls += 1;
     wms5_ptr_x = x;
     wms5_ptr_y = y;
     wms5_ptr_btn = buttons;
+    wms5_ptr_mods = mods;
 }
 
 test "driving_award: WMS5 registry mirrors fire on window mutations (issue #625)" {
@@ -1472,10 +1474,18 @@ test "driving_award: wm_fan_pointer fans every distinct report — a pump-pass b
     _ = pointer_tick(.{ .x = 16384, .y = 18204, .buttons = 0x00, .valid = true }, null);
     try std.testing.expectEqual(@as(usize, 5), wms5_ptr_calls);
 
+    // #2896: the fan stamps the modifier byte live at the sample's own
+    // decode — the snapshot the seat echoes back on the cmd-15 forward.
+    input.decode_keyboard_report(&.{ 0x02, 0, 0, 0, 0, 0, 0, 0 }); // LShift
+    driving_award.wm_fan_pointer(6000, 9102, 0x00);
+    try std.testing.expectEqual(@as(usize, 6), wms5_ptr_calls);
+    try std.testing.expectEqual(@as(u8, 0x02), wms5_ptr_mods);
+    input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+
     // Shim mode never fans.
     driving_award.wm_owns_input = false;
     driving_award.wm_fan_pointer(100, 100, 0x01);
-    try std.testing.expectEqual(@as(usize, 5), wms5_ptr_calls);
+    try std.testing.expectEqual(@as(usize, 6), wms5_ptr_calls);
 
     driving_award.wm_pointer_hook = null;
 }

@@ -68,7 +68,7 @@ milestone 32's WMS1):
 | 7 | `WIN_BLUR` | Window lost focus | Window ID (`2..3`) | Newly focused window ID | 0 |
 | 8 | `WIN_CLOSE` | Close requested | Window ID (`2..3`) | 0 | 0 |
 | 18 | `COMPOSITE_TICK` | Composite/present cadence tick, delivered ONLY to the registered WM server's process queue (ADR 0015 D3). | Present sequence (monotonic, wraps at 2³²) | 0 (reserved) | 0 |
-| 19 | `WM_POINTER` | Raw absolute-pointer sample, delivered ONLY to the registered WM server (M32 WMS5, issue #625). | X \| (Y << 16) in framebuffer pixels (top-left origin) | 0 (reserved) | Low byte = the raw HID button byte (0x01 left, 0x02 right, 0x04 middle) |
+| 19 | `WM_POINTER` | Raw absolute-pointer sample, delivered ONLY to the registered WM server (M32 WMS5, issue #625). | X \| (Y << 16) in framebuffer pixels (top-left origin) | Raw HID keyboard modifier byte live at the sample's decode (#2896; was reserved 0 — the capture-time snapshot the seat echoes back on the WMCTL cmd-15 forward) | Low byte = the raw HID button byte (0x01 left, 0x02 right, 0x04 middle) |
 | 20 | `WM_WINDOW` | Window-registry mirror — one kernel window row fanned out so the registered WM can hit-test (M32 WMS5, issue #625). | X \| (Y << 16) | W \| (H << 16) | Low byte = window id; bit 8 = visible; bit 9 = focused; bits 10–11 = workspace |
 | 21 | `WM_KEY` | Raw keyboard sample, delivered ONLY to the registered WM server on key-DOWN edges (M32 WMS5 Gate 2, issue #625, claim 4278). | HID usage (or decoded key byte) | 0 (reserved) | ADR 0009 modifier bits (`MOD_SHIFT`/`MOD_CTRL`/`MOD_ALT`) |
 

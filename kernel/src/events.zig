@@ -69,10 +69,15 @@ pub const COMPOSITE_TICK: u16 = 18;
 /// the registered WM — the input-seam handover. `arg0` = x|(y<<16) in
 /// framebuffer pixels (top-left origin), `flags` low byte = the raw HID
 /// button byte (0x01 = left, 0x02 = right, 0x04 = middle — the same bits
-/// the XHCI pointer report carries). Routing-restricted like kind 18:
-/// pushed ONLY to the registered WM's queue, once per shell-idle pass when
-/// the pointer state changed; never generated in shim mode. The WM — not
-/// the kernel — hit-tests and decides geometry from this stream.
+/// the XHCI pointer report carries), `arg1` = the raw HID keyboard
+/// modifier byte live at the sample's decode (#2896: the capture-time
+/// snapshot the seat echoes back on the slot-65 cmd-15 forward, so the
+/// kernel judges the sample on what was held at capture, not on a
+/// drain-time read a concurrent chord burst may have changed).
+/// Routing-restricted like kind 18: pushed ONLY to the registered WM's
+/// queue, once per shell-idle pass when the pointer state changed; never
+/// generated in shim mode. The WM — not the kernel — hit-tests and
+/// decides geometry from this stream.
 pub const WM_POINTER: u16 = 19;
 
 /// M32 WMS5 (issue #625, claim 9849): a registry MIRROR push for the

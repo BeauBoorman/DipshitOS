@@ -806,10 +806,14 @@ var set_state_count: u64 = 0;
 
 /// Fan ONE raw absolute-pointer sample to the registered WM (the input
 /// handover): kind 19, `arg0` = x|(y<<16) in fb pixels, `flags` low byte =
-/// the raw HID button byte. No-op when no WM is registered (shim mode —
-/// the kernel's own pointer_tick keeps consuming geometry exactly as
-/// before; zero regression). Caller maps HID logicals to pixels first.
-pub fn fan_pointer(x: u32, y: u32, buttons: u8) void {
+/// the raw HID button byte, `arg1` = the keyboard modifier byte live at
+/// the sample's decode (#2896 — the capture-time snapshot the seat echoes
+/// back through slot-65 cmd 15, so a queued sample is judged on what was
+/// held when it was captured, not on drain-time kb_mods). No-op when no
+/// WM is registered (shim mode — the kernel's own pointer_tick keeps
+/// consuming geometry exactly as before; zero regression). Caller maps
+/// HID logicals to pixels first.
+pub fn fan_pointer(x: u32, y: u32, buttons: u8, mods: u8) void {
     const pid = wm_pid orelse return;
     if (seat_dead(pid)) return; // M52 card 2: never route to a dead pid
     note_input(); // M53 card 1 (#1247): the left edge of the latency sample
@@ -819,7 +823,7 @@ pub fn fan_pointer(x: u32, y: u32, buttons: u8) void {
         .flags = buttons,
         .seq = 0,
         .arg0 = x | (y << 16),
-        .arg1 = 0,
+        .arg1 = mods,
     });
 }
 
@@ -994,7 +998,7 @@ test "wm_server: WMS5 raw-pointer and window-mirror fan-out is WM-only (kind 19/
     events.on_event_pushed = null;
 
     // No WM: fan-outs are no-ops (nothing is generated, nothing changes).
-    fan_pointer(100, 200, 0x01);
+    fan_pointer(100, 200, 0x01, 0);
     fan_window(2, 10, 20, 30, 40, true, true, 0, false, false);
     fan_key(0x17, events.MOD_CTRL); // Gate 2: Ctrl+T usage
     try std.testing.expectEqual(@as(u64, 0), info().pointer_fan_count);
@@ -1003,7 +1007,7 @@ test "wm_server: WMS5 raw-pointer and window-mirror fan-out is WM-only (kind 19/
 
     // Register pid 3: the fan-outs deliver kind 19/20/21 ONLY to the WM.
     try std.testing.expect(register(3));
-    fan_pointer(100, 200, 0x01);
+    fan_pointer(100, 200, 0x01, 0x02);
     fan_window(2, 10, 20, 30, 40, true, true, 0, false, false);
     fan_key(0x17, events.MOD_CTRL); // Gate 2: Ctrl+T usage
     try std.testing.expectEqual(@as(u64, 1), info().pointer_fan_count);
@@ -1014,6 +1018,7 @@ test "wm_server: WMS5 raw-pointer and window-mirror fan-out is WM-only (kind 19/
     try std.testing.expectEqual(events.WM_POINTER, p.kind);
     try std.testing.expectEqual(@as(u16, 0x01), p.flags); // button byte
     try std.testing.expectEqual(@as(u32, 100 | (200 << 16)), p.arg0); // x|(y<<16)
+    try std.testing.expectEqual(@as(u32, 0x02), p.arg1); // capture-time modifier byte (#2896)
 
     const w = events.pop(3).?;
     try std.testing.expectEqual(events.WM_WINDOW, w.kind);
@@ -1044,7 +1049,7 @@ test "wm_server: WMS5 raw-pointer and window-mirror fan-out is WM-only (kind 19/
     }
     // Teardown: fan-outs stop again (and the flag is clean for later tests).
     try std.testing.expect(unregister(3));
-    fan_pointer(100, 200, 0x01);
+    fan_pointer(100, 200, 0x01, 0);
     fan_key(0x17, events.MOD_CTRL);
     try std.testing.expectEqual(@as(u64, 1), info().pointer_fan_count); // unchanged
     try std.testing.expectEqual(@as(u64, 1), info().key_fan_count); // unchanged
@@ -1341,7 +1346,7 @@ test "wm_server: M53 frame observability — cadence + both latency halves from 
     // An input sample 10 ms later, answered 30 ms after that: the WM's half of
     // the latency — how long the sample waited for the WM's own present.
     test_clock_ns += 10_000_000;
-    fan_pointer(1, 2, 0);
+    fan_pointer(1, 2, 0, 0);
     test_clock_ns += 30_000_000;
     try std.testing.expect(request_present());
     try std.testing.expectEqual(@as(u64, 1), info().lat_count);
@@ -1464,7 +1469,7 @@ test "wm_server: a dead seat routes nothing — no tick, no fan-out (M52 card 2,
 
     // Baseline: a LIVE seat takes the tick and all three fans.
     on_tick();
-    fan_pointer(1, 2, 0);
+    fan_pointer(1, 2, 0, 0);
     fan_window(2, 3, 4, 5, 6, true, true, 0, false, false);
     fan_key(0x17, events.MOD_CTRL);
     try std.testing.expectEqual(@as(usize, 4), events.pending(seat));
@@ -1482,7 +1487,7 @@ test "wm_server: a dead seat routes nothing — no tick, no fan-out (M52 card 2,
     const win0 = info().window_mirror_count;
     const key0 = info().key_fan_count;
     on_tick();
-    fan_pointer(9, 9, 1);
+    fan_pointer(9, 9, 1, 0);
     fan_window(2, 9, 9, 9, 9, true, false, 0, false, true);
     fan_key(0x04, events.MOD_SHIFT);
     // Nothing was routed to the dead pid, and no counter claimed a delivery.

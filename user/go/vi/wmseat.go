@@ -27,7 +27,10 @@ const (
 	// additive, changelog 2026-09-23): forward one CONTENT pointer sample
 	// into the kernel's local path (terminal text selection + mouse-
 	// tracking reports). a0 = x|(y<<16), a1 = button mask (bit0 left,
-	// bit1 right); the kernel derives press/release edges from the
+	// bit1 right), a2 = the modifier byte the kernel stamped on the
+	// sample's kind-19 event (#2896 — echoed back untouched so the
+	// report-vs-selection judgment uses capture-time, not drain-time,
+	// modifiers). The kernel derives press/release edges from the
 	// seat-serialized stream itself. Chrome the seat consumed (start
 	// surface, rail, launcher) is never forwarded.
 	WmctlContentPtrCmd uint64 = 15
@@ -67,7 +70,10 @@ const EvCompositeTick uint16 = 18
 // the kernel pushes them ONLY to the registered WM, never in shim mode.
 const (
 	// EvWmPointer is kind 19: raw absolute pointer. arg0 = x|(y<<16) in
-	// framebuffer pixels, flags low byte = HID button byte (0x01 left).
+	// framebuffer pixels, flags low byte = HID button byte (0x01 left),
+	// arg1 = the HID keyboard modifier byte live at the kernel's decode
+	// of this sample (#2896 — the capture-time snapshot the seat echoes
+	// back through WmctlContentPtr; opaque to the seat itself).
 	EvWmPointer uint16 = 19
 	// EvWmWindow is kind 20: a window-registry mirror (id / rect / focus).
 	EvWmWindow uint16 = 20
@@ -101,10 +107,13 @@ func WmctlSeatPid() int64 { return svc1(SlotWmctl, uintptr(WmctlSeatPidCmd)) }
 // path WMS5 made dormant under a seat. The seat calls it for every pointer
 // event that is not launcher or rail chrome; press/release edges derive from
 // this serialized stream itself, so the kernel cannot tell it from the raw
-// path. Host-safe: degrades to -ENOSYS off the guest like the rest of the SDK.
-func WmctlContentPtr(x, y uint32, buttons uint8) int64 {
+// path. `mods` is the kind-19 event's own modifier stamp (arg1), passed
+// through uninterpreted — the kernel judges the sample with the modifiers
+// held at capture, never a drain-time read (#2896). Host-safe: degrades to
+// -ENOSYS off the guest like the rest of the SDK.
+func WmctlContentPtr(x, y uint32, buttons, mods uint8) int64 {
 	return syscall6(SlotWmctl, uintptr(WmctlContentPtrCmd),
-		uintptr(uint32(x)|(y<<16)), uintptr(buttons), 0, 0, 0)
+		uintptr(uint32(x)|(y<<16)), uintptr(buttons), uintptr(mods), 0, 0)
 }
 
 // MmapScanout maps the virtio-gpu framebuffer WRITABLE into the registered
