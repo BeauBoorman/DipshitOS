@@ -2808,3 +2808,56 @@ amendment does not take: had the check found hid.go eating unhandled
 actions, R4–R6 would have stayed unbound here and card #2771/card #2773 would add
 `user/go/chords/*` to their own `Touches`, landing each row with its
 handler, strictly in sequence.
+
+## Amendment (2026-10-21, card #2973 — wave-3 reservations)
+
+Wave 3 runs parallel agents over disjoint `Touches`; the only shared
+surfaces are the syscall op tables, the file-channel opcodes, the STAT
+reply shape, the WM_RPC kind space, the settings cap, and the
+grant/mime registries. This amendment is the ONE reservation table
+every wave-3 card cites — a row here is the claim, so no consumer edits
+an ABI document while another lane is active. Reservations are cheap;
+overlaps are not: a slot block or a WM_RPC kind costs this one
+amendment, a mid-wave collision costs a stalled lane. Rows W1–W11 are
+verbatim from card #2973, with the card's milestone names resolved to
+their filed issue numbers — the docs watermark admits card refs only.
+
+| # | Surface | Reservation | Implemented by |
+|---|---|---|---|
+| W1 | Slot 89 op 2 | `denial_read(cursor, buf, len)`: copies the kernel denial receipts with sequence > `cursor` (a ring of at most 32 receipts); returns bytes copied, next cursor in the first 8 bytes. Same gate as ops 0/1. Slots 94–97 stay unallocated, R1's reason carried forward | card #2982 (landed at `c1c7b15a` ahead of this amendment; the row stands as the surface's record) |
+| W2 | Slot 37 argument | `volume` = mount-table row index (0 host, 1 disk, 2 usb, 3–6 usb1–usb4). Returns free bytes; `ENOENT` row not mounted; `EINVAL` out of range or a row with no free-space source (the read-only usb rows). The frozen row stays; the stale "0 = DATA, 1 = ESP" text is superseded | card #2990 |
+| W3 | File-channel op 0x11 | `STATFS`: reply `[total u64][free u64][avail u64][block_size u32]` (28 B) for the share root. An old host answers status 4, and slot 37 answers `EINVAL` for host by name | card #2981 |
+| W4 | STAT reply v3 | v2 (21 B) + `[ctime_sec u64][ctime_nsec u32][birth_sec u64][birth_nsec u32][alloc_bytes u64]` = 53 B. v1 and v2 still decode; absent fields are flagged absent, never zero-filled facts | card #2981 |
+| W5 | Slot 79 op 15 | `facts`: path-relative like op 0; a fixed 32-byte record `{version u32, flags u32 (has_birth, has_alloc), birth_sec i64, birth_nsec u32, pad u32, alloc_bytes u64}`. Filling `Wire.ctime` from W4 is not an ABI change | card #2990 |
+| W6 | WM_RPC kind 30 | `win_geometry`, AGENTD → seat, on the frozen 38-byte frame: op 0 query (rect, space, pane), op 1 move to space, op 2 split sash (10–90 %). AGENTD.ELF principal only, as kind 29; refusals `win_geometry_denied`, `win_geometry_no_window`, `win_geometry_bad_op` | card #2985 |
+| W7 | Settings keys + cap | `a11y.contrast` {off, high}, `a11y.reduce_motion` {off, on}, `a11y.text_scale` {100, 125, 150}, accepted but not seeded. Kernel `max_entries` and Go `MaxKeys` 20 → 24; `MaxBody` stays 2048 unless card #2983 measures the full union over it | card #2983 |
+| W8 | Grant rows | GOSET.ELF `+audio`. No `timer` row: D2 chose the GIF frame stepper, so neither GOVIEW.ELF nor WEB.ELF needs one | card #2984 |
+| W9 | Mime | No mime change this wave. D5 keeps the audio, BMP and WebP rows (they are true), so the mime-update card is not filed. No additions either: GOFILES' tar browsing (card #2993) routes by extension inside GOFILES, not through a mime row | card #2993 |
+| W10 | `kernel/src/syscall.zig` | Editors this wave: card #2982 (landed), then card #2990. No other wave-3 card edits it | — |
+| W11 | Slot 75 | Consumer note: the GOOS=virelai runtime fault path (`:1409-1439`). Not an orphan | — |
+
+**R1's reason, carried forward.** W1 rides slot 89 op 2 rather than a
+new slot 94 (D1), so slots 94–97 stay unallocated for the reason the
+card #2752 amendment recorded: nothing in wave 3 needs a new syscall —
+every reserved surface above rides an existing seam (slot 89's op
+switch, slot 37's argument, the file-channel opcode space, the STAT
+reply's versioned append, slot 79's op family, the WM_RPC kind
+registry, the settings table, grants and mime). A slot is claimed by
+the amendment that names its caller, never in advance.
+
+**W6's frame.** Kind 30 is the R3 spare, unspent and now claimed. It
+rides the frozen 38-byte `WmRpc` mailbox frame — the reservation is the
+kind number, the direction (AGENTD → seat), and the sender rule, not a
+new envelope: the seat accepts a `win_geometry` frame only from the
+AGENTD.ELF principal and refuses by name (`win_geometry_denied`,
+`win_geometry_no_window`, `win_geometry_bad_op`).
+
+Owner decisions the table applies (2026-10-21): D1 (slot 89 op 2, not
+slot 94), D2 (GIF frame stepper only; sub-second app timers held), D5
+(no mime change), D6 (settings cap 20 → 24), D8 (grant rows land in
+card #2984, after card #2939).
+
+No chord rows are reserved. GOEDIT's tab and fold keys and GOFILES' new
+keys are app-local and must be keys gotabwm leaves unbound, checked
+against `user/go/chords/table.go` the way M107c did
+(`user/go/edit/main.go:318-320`).
