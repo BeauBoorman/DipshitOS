@@ -1,0 +1,17 @@
+# trend pass fixture history: every id stays inside half the named
+# margin — no DRIFTING, no over-budget. `edge` sits past half-margin on
+# two of the last three values: the flag needs ALL three, so it stays
+# clean (headroom 50, half 25 -> only values > 75 count; 80, 60, 80 has
+# one inside).
+date	rev	host	id	value	budget	verdict
+2026-10-18T00:00:00Z	aaaaaaa	devhost	up-lat	100	200	ok
+2026-10-19T00:00:00Z	aaaaaab	devhost	up-lat	140	200	ok
+2026-10-20T00:00:00Z	aaaaaac	devhost	up-lat	145	200	ok
+2026-10-21T00:00:00Z	aaaaaad	devhost	up-lat	148	200	ok
+2026-10-18T00:00:00Z	aaaaaaa	devhost	down-rate	1000	500	ok
+2026-10-19T00:00:00Z	aaaaaab	devhost	down-rate	800	500	ok
+2026-10-20T00:00:00Z	aaaaaac	devhost	down-rate	790	500	ok
+2026-10-21T00:00:00Z	aaaaaad	devhost	down-rate	780	500	ok
+2026-10-19T00:00:00Z	aaaaaab	devhost	edge	80	100	ok
+2026-10-20T00:00:00Z	aaaaaac	devhost	edge	60	100	ok
+2026-10-21T00:00:00Z	aaaaaad	devhost	edge	80	100	ok

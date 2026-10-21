@@ -1,0 +1,4 @@
+# trend fail fixture corpus: the ids drifting.history.tsv measures.
+id	leg	op	shape	metric	unit	instrument
+creep-lat	demo-leg	latency op	a demo shape	demo: metric=	us	demo instrument
+sag-rate	demo-leg	rate op	a demo shape	demo: rate=	KiB/s	demo instrument

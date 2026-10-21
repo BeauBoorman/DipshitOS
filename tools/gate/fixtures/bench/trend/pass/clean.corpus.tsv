@@ -1,0 +1,5 @@
+# trend pass fixture corpus: the ids clean.history.tsv measures.
+id	leg	op	shape	metric	unit	instrument
+up-lat	demo-leg	latency op	a demo shape	demo: metric=	us	demo instrument
+down-rate	demo-leg	rate op	a demo shape	demo: rate=	KiB/s	demo instrument
+edge	demo-leg	boundary op	a demo shape	demo: b=	ticks	demo instrument

@@ -1,0 +1,17 @@
+# trend fail fixture history: both ids drift past half the named margin
+# toward their budgets over the last three values. creep-lat (<= bound,
+# headroom 100, half 50): 160/175/210 all exceed 150, and the last row
+# is a recorded breach -> DRIFTING + OVER-BUDGET. sag-rate (>= bound,
+# headroom 500, half 250): 720/700/690 all fall under 750 with no breach
+# recorded -> DRIFTING alone (the creep flag fires before the budget).
+date	rev	host	id	value	budget	verdict
+2026-10-17T00:00:00Z	bbbbbbb	devhost	creep-lat	100	200	ok
+2026-10-18T00:00:00Z	bbbbbbb	devhost	creep-lat	120	200	ok
+2026-10-19T00:00:00Z	bbbbbbc	devhost	creep-lat	160	200	ok
+2026-10-20T00:00:00Z	bbbbbbd	devhost	creep-lat	175	200	ok
+2026-10-21T00:00:00Z	bbbbbbe	devhost	creep-lat	210	200	breach
+2026-10-17T00:00:00Z	bbbbbbb	devhost	sag-rate	950	500	ok
+2026-10-18T00:00:00Z	bbbbbbb	devhost	sag-rate	800	500	ok
+2026-10-19T00:00:00Z	bbbbbbc	devhost	sag-rate	720	500	ok
+2026-10-20T00:00:00Z	bbbbbbd	devhost	sag-rate	700	500	ok
+2026-10-21T00:00:00Z	bbbbbbe	devhost	sag-rate	690	500	ok

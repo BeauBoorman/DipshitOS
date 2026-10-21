@@ -1,0 +1,5 @@
+# trend pass fixture budgets: valid rows (budget = baseline x margin).
+id	cmp	budget	baseline	margin	ref
+up-lat	<=	200	100	x2	#1
+down-rate	>=	500	1000	-50%	issue:2
+edge	<=	100	50	x2	gate:demo

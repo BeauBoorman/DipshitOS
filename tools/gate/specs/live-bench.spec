@@ -7,6 +7,12 @@
 # check runs once per leg, on the direction-aware best of K attempt
 # samples or the single attempt's value).
 #
+# TREND HISTORY (#2936): benchlib.check() — the single verdict choke
+# point — also appends one row per verdict-bearing measurement to
+# artifacts/bench/history.tsv (date, rev, host, id, value, budget,
+# verdict; gitignored — per-host evidence, never the contract), and the
+# final leg prints the `bench-check.py --trend` regression table.
+#
 # RETRY / SAMPLE POLICY (the card's call): a MEASUREMENT is never
 # retried — a measured value is a sample, recorded in a receipt, never
 # re-drawn for luck. Legs with an OBSERVED instability run K=3 attempts
@@ -188,7 +194,9 @@ def check(row_id, observed):
         sys.exit("bench: no budget row for %s in %s" % (row_id, bpath))
     budget = float(b["budget"])
     ok = observed <= budget if b["cmp"] == "<=" else observed >= budget
-    receipt(row_id, observed, "ok" if ok else "breach")
+    verdict = "ok" if ok else "breach"
+    receipt(row_id, observed, verdict)
+    bench_check.append_history(row_id, observed, b["budget"], verdict)
     if not ok:
         sys.exit("bench: BREACH id=%s observed=%s budget=%s%s "
                  "(baseline=%s margin=%s ref=%s) — a measurement is never "
@@ -230,6 +238,23 @@ def leg_verdict(row_id, samples):
           % (row_id, [int(v) for v in samples], best, cmp_,
              "min" if cmp_ == "<=" else "max"))
     check(row_id, float(best))
+
+
+def trend(last=10):
+    """The end-of-run regression table (#2936): bench-check.py --trend
+    over artifacts/bench/history.tsv, joined against the SAME corpus and
+    budgets this run enforced (the LIVE_BENCH_* overrides included — a
+    sabotaged-budgets run trends against the sabotage). Informational:
+    a DRIFTING/OVER-BUDGET flag is the warning, never the failure — a
+    breach already failed where it measured."""
+    corpus_p = os.environ.get("LIVE_BENCH_CORPUS") or os.path.join(
+        "tools", "gate", "bench", "corpus.tsv")
+    budgets_p = os.environ.get("LIVE_BENCH_BUDGETS") or os.path.join(
+        "tools", "gate", "bench", "budgets.tsv")
+    rc = bench_check.print_trend(bench_check.DEFAULT_HISTORY,
+                                 budgets_p, corpus_p, last)
+    if rc != 0:
+        sys.exit("bench: trend table could not print (rc=%d)" % rc)
 PY
 
 vgate_setup_python <<'PY'
@@ -749,4 +774,15 @@ v = benchlib.measure("seat-mbox-burst", ser)
 if v is None:
     sys.exit("bench: no `mburst: accepted=` line — the burst never reported")
 benchlib.check("seat-mbox-burst", v)
+PY
+
+# --- trend table (#2936) -----------------------------------------------------
+# The last assert on the last leg: every measurement of the run is in
+# artifacts/bench/history.tsv by now, so print the regression table over
+# it. Informational — flags warn; they never fail the run.
+vgate_assert mburst python <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+benchlib.trend()
 PY
