@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"virelai/webrender/qoi"
 )
 
 // gateGesture replays the go-paint spec's run-01 scripted pointer set on the
@@ -76,6 +78,97 @@ func TestGateVectors(t *testing.T) {
 	}
 	if len(enc) != 6042 {
 		t.Fatalf("saved n=%d, want 6042", len(enc))
+	}
+}
+
+// storeGesture replays the run-04 store-leg draw on the pure doc core —
+// the gesture set the signed-install boot scripts: color 9, a two-segment
+// brush L, one line, one rect. The spec's commit n=/sum= and the saved
+// file's sha256 pin to these values, so a drift in either half fails
+// class-A before the gate ever boots.
+func storeGesture(t *testing.T) *doc {
+	t.Helper()
+	d := newDoc(640, 480)
+
+	// brush, color 9, size 4: L-stroke (40,40)->(160,40)->(160,140), the
+	// down/move/up events the pointer sequence delivers.
+	tx := d.begin()
+	tx.segment(pt{40, 40}, pt{40, 40}, 2, palette[9])
+	tx.segment(pt{40, 40}, pt{160, 40}, 2, palette[9])
+	tx.segment(pt{160, 40}, pt{160, 140}, 2, palette[9])
+	tx.segment(pt{160, 140}, pt{160, 140}, 2, palette[9])
+	d.commit(tx)
+	if tx.touches() != 1110 || fnv16(d.sum()) != "2403da426d2b6a71" {
+		t.Fatalf("commit brush n=%d sum=%s", tx.touches(), fnv16(d.sum()))
+	}
+
+	// line: (240,40)->(320,120)
+	tx = d.begin()
+	tx.segment(pt{240, 40}, pt{320, 120}, 2, palette[9])
+	d.commit(tx)
+	if tx.touches() != 413 || fnv16(d.sum()) != "a6b92d65c02c3d9b" {
+		t.Fatalf("commit line n=%d sum=%s", tx.touches(), fnv16(d.sum()))
+	}
+
+	// rect: (300,200)->(460,320) outline, weight 1
+	tx = d.begin()
+	tx.rectOutline(rectFrom(pt{300, 200}, pt{460, 320}), 1, palette[9])
+	d.commit(tx)
+	if tx.touches() != 560 || fnv16(d.sum()) != "e9449dcb31e7c11b" {
+		t.Fatalf("commit rect n=%d sum=%s", tx.touches(), fnv16(d.sum()))
+	}
+	return d
+}
+
+// TestStoreVectors pins the M141b round-trip: the run-04 draw's per-commit
+// digests, the saved PSTORE.QOI bytes, then the run-05 reopen+edit — the
+// reopened doc decodes to the same canvas sum, the color-11 fill inside the
+// rect lands its own count and digest, and the re-saved file hashes its
+// edited bytes.
+func TestStoreVectors(t *testing.T) {
+	d := storeGesture(t)
+	const v1Sum = "e9449dcb31e7c11b"
+	if got := fnv16(d.sum()); got != v1Sum {
+		t.Fatalf("run-04 canvas sum = %s, want %s", got, v1Sum)
+	}
+	enc := EncodeQOI(d.pix, d.w, d.h)
+	sum := fmt.Sprintf("%x", sha256.Sum256(enc))
+	if sum != "66cbfbcefc44ef6bd9c2ecdc00d3f50e6895503df260761cc60862a80d98744a" {
+		t.Fatalf("PSTORE.QOI sha256 = %s", sum)
+	}
+	if len(enc) != 6190 {
+		t.Fatalf("PSTORE.QOI n=%d, want 6190", len(enc))
+	}
+
+	// Run 05: the reopened file decodes to the same canvas, then a
+	// color-11 fill inside the rect at (380,240) edits it.
+	w, h, pix, err := qoi.Decode(enc, docMaxW, docMaxPx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w != 640 || h != 480 {
+		t.Fatalf("reopen dims %dx%d", w, h)
+	}
+	d2 := docFrom(w, h, pix)
+	if got := fnv16(d2.sum()); got != v1Sum {
+		t.Fatalf("reopened canvas sum = %s, want %s", got, v1Sum)
+	}
+	tx := d2.begin()
+	if n := tx.fill(380, 240, palette[11]); n != 18921 {
+		t.Fatalf("run-05 fill n=%d, want 18921", n)
+	}
+	d2.commit(tx)
+	const v2Sum = "c80c07f96fb2d329"
+	if got := fnv16(d2.sum()); got != v2Sum {
+		t.Fatalf("run-05 canvas sum = %s, want %s", got, v2Sum)
+	}
+	enc2 := EncodeQOI(d2.pix, d2.w, d2.h)
+	sum2 := fmt.Sprintf("%x", sha256.Sum256(enc2))
+	if sum2 != "416c5327f2456c708b4aeb8cc37b9c7dc567c7721aab0a4d9fb397bebc7fbefc" {
+		t.Fatalf("PSTORE.QOI (edited) sha256 = %s", sum2)
+	}
+	if len(enc2) != 6193 {
+		t.Fatalf("PSTORE.QOI (edited) n=%d, want 6193", len(enc2))
 	}
 }
 
