@@ -901,12 +901,13 @@ pub fn try_handle_page_fault(esr: u64, far: u64) bool {
     svclock.kernel.acquire();
     defer svclock.kernel.release();
 
-    const pid = if (process.find_by_task(scheduler.current_id())) |p|
-        p
-    else if (process.current()) |p|
-        p
-    else
-        return false;
+    // #2873: the FAULTING task's process — `process.current()` is the
+    // LAST-CREATED descriptor, not the running task's (the #2758 setrlimit
+    // misresolution class). An EL0 task with no process binding is inside
+    // an exec/teardown window: falling back would charge and map pages
+    // into an unrelated fresh process's root, then "resume" into the same
+    // unmapped access. No bound process means the fault is undeliverable.
+    const pid = process.find_by_task(scheduler.current_id()) orelse return false;
     const pinfo = process.info(pid) orelse return false;
     const root = pinfo.root_phys;
     if (root == 0) return false;
@@ -1065,12 +1066,11 @@ pub fn populate_user_page(pid: usize, root: u64, va: u64, for_write: bool) bool 
 /// the copy primitives keep their off-guest contract.
 pub fn ensure_user_write_pages(address: u64, len: usize) bool {
     if (comptime builtin.is_test) return true;
-    const pid = if (process.find_by_task(scheduler.current_id())) |p|
-        p
-    else if (process.current()) |p|
-        p
-    else
-        return false;
+    // #2873: the CALLING task's process only — never the last-created
+    // descriptor. An unbound caller owns no uaccess regions, so refusing
+    // (EFAULT) is the honest answer; the fallback populated a stranger's
+    // root with the copy destination.
+    const pid = process.find_by_task(scheduler.current_id()) orelse return false;
     const inf = process.info(pid) orelse return false;
     const root = inf.root_phys;
     if (root == 0) return false;
@@ -2092,6 +2092,10 @@ test "exceptions: try_handle_page_fault demand zero-fill and COW splitting" {
         .stack_len = 8192,
     }, .{}).?;
     _ = process.bind(pid, 2);
+    // #2873: fault resolution keys off the RUNNING task — bind made task 2
+    // this process's executor, so mark it current on the test core.
+    scheduler.current[0] = 2;
+    defer scheduler.current[0] = 0;
 
     // Register an anonymous mmap region
     const mmap_va: u64 = 0x0000_0000_1000_0000;
@@ -2151,6 +2155,10 @@ test "exceptions: a COW fault on an unrecorded page is delivered, not promoted (
         .stack_len = 8192,
     }, .{}).?;
     _ = process.bind(pid, 2);
+    // #2873: fault resolution keys off the RUNNING task — task 2 is bound
+    // to this process, so mark it current on the test core.
+    scheduler.current[0] = 2;
+    defer scheduler.current[0] = 0;
 
     const esr_perm_write: u64 = (0x24 << 26) | (1 << 6) | 0xf;
 
@@ -2290,4 +2298,60 @@ test "exceptions: ensure_user_write_pages is a no-op on host test binaries (issu
     // go-selftest intake case reads a host-seeded fixture into a page EL0 has
     // never written and requires the exact bytes back).
     try std.testing.expect(ensure_user_write_pages(0x1000, 4096));
+}
+
+test "exceptions: a fault charges the RUNNING task's process, never the last-created (issue #2873)" {
+    mmu.reset();
+    alloc.reset_refcounts();
+    process.init();
+    defer scheduler.current[0] = 0;
+
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 64, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+
+    // A is bound to the task that will fault; B is created AFTER A, so
+    // `process.current()` names B — the descriptor the pre-#2873 fallback
+    // would have charged.
+    const root_a = mmu.build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const pid_a = process.create("TEST_2873_A", .{}, .{
+        .root_phys = root_a,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    _ = process.bind(pid_a, 2);
+    const root_b = mmu.build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const pid_b = process.create("TEST_2873_B", .{}, .{
+        .root_phys = root_b,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    _ = process.bind(pid_b, 3);
+    try std.testing.expectEqual(pid_b, process.current().?);
+
+    const mmap_va: u64 = 0x0000_0000_1000_0000;
+    const esr_demand: u64 = (0x24 << 26) | 0x7; // EL0 data abort, L3 translation fault
+
+    // A's task takes a demand fault on A's region: the page lands in A's
+    // root — the NON-last-created process — and B's root stays untouched.
+    scheduler.current[0] = 2;
+    try std.testing.expect(process.add_mmap_region(pid_a, mmap_va, 4096, 3, 0x22));
+    try std.testing.expect(try_handle_page_fault(esr_demand, mmap_va + 64));
+    try std.testing.expect(mmu.get_user_leaf(root_a, mmap_va) != null);
+    try std.testing.expect(mmu.get_user_leaf(root_b, mmap_va) == null);
+
+    // A task with NO bound process (the exec/teardown window) gets a
+    // refusal: pre-#2873 the fallback resolved to B's descriptor and would
+    // have mapped + charged B's root for a fault B never took.
+    scheduler.current[0] = 7;
+    const tail_va: u64 = 0x0000_0000_1000_1000;
+    try std.testing.expect(process.add_mmap_region(pid_b, tail_va, 4096, 3, 0x22));
+    try std.testing.expect(!try_handle_page_fault(esr_demand, tail_va + 64));
+    try std.testing.expect(mmu.get_user_leaf(root_b, tail_va) == null);
 }
