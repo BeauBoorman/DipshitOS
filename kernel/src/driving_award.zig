@@ -508,6 +508,13 @@ pub var prev_ptr_buttons: u8 = 0;
 /// inside a terminal window's client area).
 var term_sel_dragging: bool = false;
 
+/// #2869: under `?1000` alone the press reported to the app but the mode
+/// never subscribed to the drag — the press cell is latched here and the
+/// first held-motion sample promotes it to a real selection, so a plain
+/// click stays purely the app's while a drag selects.
+var term_sel_pending: bool = false;
+var term_sel_pending_hit: TermHit = .{ .win_id = 0, .line = 0, .col = 0, .row = 0 };
+
 /// M49 SD5 (#1132): the terminal window under the pointer and the grid cell
 /// (absolute line + column) it maps to, or null. Searches topmost first.
 /// M73l: pub — the geometry gate calls it directly.
@@ -543,6 +550,9 @@ pub fn terminalHitAt(px: u32, py: u32) ?TermHit {
 /// the press latch and the cursor can disagree for one tick, and a per-tick
 /// "did I just report?" flag cannot arbitrate between them. Shift — or
 /// modes off — always leaves the pointer local (selection stays exact).
+/// #2869: this answers the REPORT half only. The selection half asks the
+/// armed SET: `?1002`/`?1003` own the whole gesture; `?1000` alone leaves
+/// the drag to selection (content_pointer_pass).
 fn mouseOwnsAt(px: u32, py: u32) bool {
     if ((input.report().kb_mods & 0x22) != 0) return false; // L/R shift held
     const mh = terminalHitAt(px, py) orelse return false;
@@ -3567,6 +3577,14 @@ pub fn mouse_buttons_to_flags(buttons: u8) u16 {
 // mouseOwnsAt arbitrates at the sample's own coordinates exactly as the
 // local path always has; the selection guards lost only their redundant
 // `!mouseOwnsAt` conjunct, which the else makes implicit.
+// #2869: ownership is per mode-set, not per mode-presence. `?1002`/`?1003`
+// subscribed to the drag itself, so they own the whole gesture end to end
+// (Shift still overrides inside mouseOwnsAt). `?1000` alone subscribed to
+// press/release/wheel edges only — those still report to the app — but
+// `.drag`/`.motion` report NOTHING under it (the terminal.mouseReports
+// truth table), so a plain drag was never the app's event and belongs to
+// local selection: the press latches a pending cell and the first
+// held-motion sample promotes it, keeping a click purely the app's.
 fn content_pointer_pass(
     nx: u32,
     ny: u32,
@@ -3579,9 +3597,12 @@ fn content_pointer_pass(
     right_released: bool,
     press_handled: bool,
 ) void {
-    if (mouseOwnsAt(nx, ny)) {
+    const owns = mouseOwnsAt(nx, ny);
+    var motion_owned = false;
+    if (owns) {
         if (terminalHitAt(nx, ny)) |mh| {
             if (terminal.screenForWindow(mh.win_id)) |mscr| {
+                motion_owned = mscr.mouse_1002 or mscr.mouse_1003;
                 if (terminal.windowTerminal(mh.win_id)) |mtt| {
                     var kind: ?terminal.MouseKind = null;
                     var btn: u8 = 0;
@@ -3649,9 +3670,41 @@ fn content_pointer_pass(
                 }
             }
         }
-        if (left_released and term_sel_dragging) {
+    }
+    if (owns and !motion_owned) {
+        // `?1000` alone: edges reported above; selection defers past the
+        // click. Promotion runs before the latch so the press sample's own
+        // `moved` cannot promote it — only a later held move does.
+        if (term_sel_pending and cur_left and moved) {
+            if (terminal.screenForWindow(term_sel_pending_hit.win_id)) |scr| {
+                scr.beginSelection(term_sel_pending_hit.line, term_sel_pending_hit.col);
+                term_sel_dragging = true;
+                klog.line("dui: term sel begin\n");
+            }
+            term_sel_pending = false;
+        }
+        if (left_pressed and !press_handled) {
+            term_sel_pending = false;
+            if (terminalHitAt(nx, ny)) |hit| {
+                term_sel_pending = true;
+                term_sel_pending_hit = hit;
+            }
+        }
+        if (cur_left and term_sel_dragging) {
+            if (terminalHitAt(nx, ny)) |hit| {
+                if (terminal.screenForWindow(hit.win_id)) |scr| {
+                    scr.extendSelection(hit.line, hit.col);
+                }
+            }
+        }
+    }
+    if (left_released) {
+        term_sel_pending = false;
+        if (term_sel_dragging) {
             // Land the final endpoint on the release position, then close
             // the selection (the gate's copy chord waits for this line).
+            // Runs under ownership too: a selection that latched keeps its
+            // own release, wherever it lands.
             if (terminalHitAt(nx, ny)) |hit| {
                 if (terminal.screenForWindow(hit.win_id)) |scr| {
                     scr.extendSelection(hit.line, hit.col);
@@ -3786,7 +3839,19 @@ pub fn pointer_tick(st: input.PointerState, click: ?input.Click) ?u8 {
             if (mouseOwnsAt(px, py)) {
                 // The latched press belongs to the app: consume it, suppress
                 // the stale-cursor begin below, let the report path deliver.
+                // #2869: `?1000` alone also latches the pending cell — the
+                // press reported, but a following held move promotes it to
+                // a selection (a click never does).
                 press_handled = true;
+                term_sel_pending = false;
+                if (terminalHitAt(px, py)) |hit| {
+                    if (terminal.screenForWindow(hit.win_id)) |scr| {
+                        if (!scr.mouse_1002 and !scr.mouse_1003) {
+                            term_sel_pending = true;
+                            term_sel_pending_hit = hit;
+                        }
+                    }
+                }
             } else if (terminalHitAt(px, py)) |hit| {
                 if (terminal.screenForWindow(hit.win_id)) |scr| {
                     scr.beginSelection(hit.line, hit.col);
@@ -6377,6 +6442,119 @@ test "wm content forward: dormant with no seat; chrome never begins selection (#
     wm_content_pointer(10, 10, 0x01); // outside the window (dock corner)
     wm_content_pointer(10, 10, 0x00);
     try std.testing.expect(!term_sel_dragging);
+    const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
+    try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel") == null);
+}
+
+test "wm content forward: ?1000 reports the click, a drag still selects (#2869)" {
+    arm();
+    // Keyboard modifiers and the forwarded-sample history are module
+    // globals — a predecessor test's leftovers (e.g. a still-held Shift)
+    // release mouse ownership to the local path before the test starts.
+    input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    wm_fwd_prev_buttons = 0;
+    wm_fwd_prev_x = 0;
+    wm_fwd_prev_y = 0;
+    term_sel_dragging = false;
+    term_sel_pending = false;
+    wm_owns_input = true;
+    defer {
+        wm_owns_input = false;
+        wm_fwd_prev_buttons = 0;
+        wm_fwd_prev_x = 0;
+        wm_fwd_prev_y = 0;
+        term_sel_dragging = false;
+        term_sel_pending = false;
+    }
+    wm_fwd_test_log_len = 0;
+    klog.line_hook = wm_fwd_test_capture;
+    defer klog.line_hook = null;
+    const id = switch (user_open(64, 48, 640, 400, 9)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    defer _ = user_close(id);
+    const h = terminal.create(null).?;
+    defer terminal.release(h);
+    defer terminal.detachWindow(id);
+    try std.testing.expect(terminal.get(h).?.attachWindow(id));
+    const scr = terminal.screenForWindow(id).?;
+    scr.mouse_1000 = true;
+    scr.mouse_1006 = true;
+
+    // A click at (68,70) — cell (0,0) -> SGR x=1 y=1 — reports both edges
+    // and stays purely the app's: no selection, no pending left behind.
+    wm_content_pointer(68, 70, 0x01);
+    wm_content_pointer(68, 70, 0x00);
+    try std.testing.expect(!term_sel_dragging);
+    try std.testing.expect(!term_sel_pending);
+    var buf: [128]u8 = undefined;
+    const click_n = terminal.windowTerminal(id).?.readInput(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..click_n], "\x1b[<0;1;1M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..click_n], "\x1b[<32;1;1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wm_fwd_test_log[0..wm_fwd_test_log_len], "dui: term sel") == null);
+
+    // A drag: press (same cell), held move to (700,140), release. The
+    // press reported, the pending cell promoted on the move, the release
+    // still reported — and the selection ran begin/extend/end.
+    wm_content_pointer(68, 70, 0x01);
+    wm_content_pointer(700, 140, 0x01);
+    try std.testing.expect(term_sel_dragging);
+    wm_content_pointer(700, 140, 0x00);
+    try std.testing.expect(!term_sel_dragging);
+    const drag_n = terminal.windowTerminal(id).?.readInput(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..drag_n], "\x1b[<0;1;1M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..drag_n], "\x1b[<32;80;5m") != null);
+    const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
+    try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel begin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel end") != null);
+}
+
+test "wm content forward: ?1002 keeps the whole gesture (#2869)" {
+    arm();
+    input.decode_keyboard_report(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    wm_fwd_prev_buttons = 0;
+    wm_fwd_prev_x = 0;
+    wm_fwd_prev_y = 0;
+    term_sel_dragging = false;
+    term_sel_pending = false;
+    wm_owns_input = true;
+    defer {
+        wm_owns_input = false;
+        wm_fwd_prev_buttons = 0;
+        wm_fwd_prev_x = 0;
+        wm_fwd_prev_y = 0;
+        term_sel_dragging = false;
+        term_sel_pending = false;
+    }
+    wm_fwd_test_log_len = 0;
+    klog.line_hook = wm_fwd_test_capture;
+    defer klog.line_hook = null;
+    const id = switch (user_open(64, 48, 640, 400, 9)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    defer _ = user_close(id);
+    const h = terminal.create(null).?;
+    defer terminal.release(h);
+    defer terminal.detachWindow(id);
+    try std.testing.expect(terminal.get(h).?.attachWindow(id));
+    const scr = terminal.screenForWindow(id).?;
+    scr.mouse_1002 = true;
+    scr.mouse_1006 = true;
+
+    // Button-motion is subscribed: the identical drag reports press, drag
+    // (b=32 at the cursor cell) and release, and selection never engages.
+    wm_content_pointer(68, 70, 0x01);
+    wm_content_pointer(700, 140, 0x01);
+    wm_content_pointer(700, 140, 0x00);
+    try std.testing.expect(!term_sel_dragging);
+    try std.testing.expect(!term_sel_pending);
+    var buf: [256]u8 = undefined;
+    const n = terminal.windowTerminal(id).?.readInput(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[<0;1;1M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[<32;80;5M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[<32;80;5m") != null);
     const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
     try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel") == null);
 }

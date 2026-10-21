@@ -1539,6 +1539,8 @@ test "input: keyboard report decode pushes key-down bytes with shift" {
     // Key released: no new key-down, no new byte.
     decode_keyboard_report(&[_]u8{ 0x02, 0, 0, 0, 0, 0, 0, 0 });
     try std.testing.expectEqual(@as(usize, 0), fifo_count);
+    // Lift the held shift too — kb_mods is shared global state.
+    decode_keyboard_report(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
 }
 
 test "input: a held key does not re-fire (no repeat on unchanged report)" {
@@ -1999,6 +2001,9 @@ test "input: a hygiene chord is consumed before the tty queue — the app never 
     try std.testing.expectEqual(@as(usize, 0), scr.lineCount() - 1);
     try std.testing.expect(std.mem.indexOf(u8, scr.line(0), "row") == null);
 
+    // The RIS chord left ctrl+shift+alt held — release it so the next
+    // test in the binary does not inherit pressed modifiers.
+    decode_keyboard_report(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }); // release
     _ = driving_award.user_close(win_id);
     for (&terminal.terminals) |*t2| t2.reset();
 }
