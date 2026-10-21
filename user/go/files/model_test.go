@@ -340,6 +340,76 @@ func TestDeleteConfirmAndDirRefusal(t *testing.T) {
 	}
 }
 
+func TestDeleteModalShedsUnrelatedKeys(t *testing.T) {
+	// #2894: the armed prompt used to swallow every later key with no
+	// serial trace — a stray 'd' plus a much-later stray 'y' deleted
+	// silently. The arm and the shed both mark now, and the first key
+	// that is not an answer disarms the prompt without dispatching
+	// underneath it.
+	m := testModel(entry("SUB", true), entry("KNOWN.TXT", false))
+	m.handleKey(keys.Event{Key: keys.KeyDown})
+	m.handleKey(runeKey('d'))
+	if m.mode != modeConfirmDelete {
+		t.Fatalf("'d' must arm the confirm, mode=%d", m.mode)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerDeleteArm+"KNOWN.TXT") {
+		t.Fatalf("arm marker missing: %q", got)
+	}
+
+	// A key that is not an answer sheds the modal and is swallowed: the
+	// selection must not move on the key that cancelled.
+	m.handleKey(runeKey('j'))
+	if m.mode != modeNormal || m.sel != 1 {
+		t.Fatalf("stray 'j' must shed without dispatch: mode=%d sel=%d", m.mode, m.sel)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerDeleteCancel+"KNOWN.TXT key=j") {
+		t.Fatalf("shed marker missing: %q", got)
+	}
+
+	// The keyboard is live again — and the #2894 silent-delete shape
+	// (a stray 'd', unrelated runes, then a stray 'y') deletes nothing.
+	m.handleKey(runeKey('d'))
+	m.handleKey(runeKey('7'))
+	m.handleKey(runeKey('7'))
+	m.handleKey(runeKey('y'))
+	if m.mode != modeNormal {
+		t.Fatalf("unrelated keys must leave the modal disarmed, mode=%d", m.mode)
+	}
+	if got := pendingJoined(&m); strings.Contains(got, markerDeleted) ||
+		strings.Contains(got, markerDeleteNo) {
+		t.Fatalf("a shed confirm must not delete on a later 'y': %q", got)
+	}
+
+	// A left press sheds it too — and never selects underneath the prompt.
+	m.handleKey(runeKey('d'))
+	m.handleClick(1, 3) // row 0's cell — would move sel to 0 if dispatched
+	if m.mode != modeNormal || m.sel != 1 {
+		t.Fatalf("press must shed without selecting: mode=%d sel=%d", m.mode, m.sel)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerDeleteCancel+"KNOWN.TXT key=press") {
+		t.Fatalf("press shed marker missing: %q", got)
+	}
+
+	// A right press sheds rather than arming the context menu over a
+	// pending delete.
+	m.handleKey(runeKey('d'))
+	m.handleRightClick(1, 3)
+	if m.mode != modeNormal {
+		t.Fatalf("right press must shed, mode=%d", m.mode)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerDeleteCancel+"KNOWN.TXT key=rpress") {
+		t.Fatalf("rpress shed marker missing: %q", got)
+	}
+
+	// The scripted leg still stands: 'd','y' answers and reaches the
+	// syscall (ENOSYS on the host => refused marker).
+	m.handleKey(runeKey('d'))
+	m.handleKey(runeKey('y'))
+	if got := pendingJoined(&m); !strings.Contains(got, markerDeleteNo) {
+		t.Fatalf("'d','y' must still reach the delete: %q", got)
+	}
+}
+
 func TestClipPasteRefusals(t *testing.T) {
 	// Paste with an empty clip: named refusal, no syscall.
 	m := testModel(entry("SUB", true), entry("KNOWN.TXT", false))

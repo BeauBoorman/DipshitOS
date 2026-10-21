@@ -35,10 +35,17 @@ const (
 	markerMouse   = "gofiles: mouse b="
 	markerResized = "gofiles: resized "
 
-	markerRenamed       = "gofiles: renamed "
-	markerRenameNo      = "gofiles: rename refused "
-	markerDeleted       = "gofiles: deleted "
-	markerDeleteNo      = "gofiles: delete refused "
+	markerRenamed  = "gofiles: renamed "
+	markerRenameNo = "gofiles: rename refused "
+	markerDeleted  = "gofiles: deleted "
+	markerDeleteNo = "gofiles: delete refused "
+	// #2894: the confirm's own receipts. `delete arm` names the file the
+	// prompt was raised on; `delete cancelled` names it again plus what
+	// shed the modal (`key=` the first non-answer key, a pointer press,
+	// or a stale selection under a refresh). An armed prompt that was
+	// never answered used to leave no serial trace at all.
+	markerDeleteArm     = "gofiles: delete arm "
+	markerDeleteCancel  = "gofiles: delete cancelled "
 	markerRestored      = "gofiles: restored "
 	markerRestoreNo     = "gofiles: restore refused "
 	markerTrashExpired  = "gofiles: trash expired "

@@ -147,6 +147,12 @@ func (m *model) handleRightClick(x, y int) {
 		m.closeQuickLook()
 		return
 	}
+	if m.mode == modeConfirmDelete {
+		// #2894: a right press sheds the armed confirm too — it must not
+		// open the menu over a pending delete.
+		m.cancelDelete("key=rpress")
+		return
+	}
 	col, row := x-1, y-1
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() ||
 		col >= m.listCols() {

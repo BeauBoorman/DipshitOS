@@ -575,6 +575,7 @@ vgate_run 04 -- \
     --script3-after 'gofiles: restored NOTE.TXT trash=' \
     --script-expect 'rx-go-fileman-trash-ok' --timeout 240
 
+vgate_assert 04 serial-contains 'gofiles: delete arm NOTE.TXT'
 vgate_assert 04 serial-contains 'gofiles: deleted NOTE.TXT trash='
 vgate_assert 04 serial-contains 'gofiles: restored NOTE.TXT trash='
 vgate_assert 04 serial-contains 'gofiles: list /host/FM4 n=1'
@@ -650,6 +651,7 @@ vgate_assert 06 serial-contains 'gofiles: list /host/FM6 n=1'
 vgate_assert 06 serial-contains 'gofiles: entry NOTE.TXT file'
 
 # The refusal: the confirmed delete reports the lease row (-ErrEAGAIN = -11).
+vgate_assert 06 serial-contains 'gofiles: delete arm NOTE.TXT'
 vgate_assert 06 serial-contains 'gofiles: delete refused NOTE.TXT rc=-11'
 vgate_assert 06 serial-contains 'rx-go-fileman-lease-ok'
 # Nothing may be trashed behind the refusal, and nothing may be restored.

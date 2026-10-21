@@ -34,9 +34,9 @@ const (
 	modeNormal editMode = iota
 	modeRename
 	modeConfirmDelete
-	modeOpenWith // M81b (#1762): the Open-with… candidate list owns the digits
-	modeContext  // M124d (#2583): the right-click menu owns keys until dismissed
-	modeHints    // M121c (#2566): the '?' chord-hint overlay owns the frame
+	modeOpenWith  // M81b (#1762): the Open-with… candidate list owns the digits
+	modeContext   // M124d (#2583): the right-click menu owns keys until dismissed
+	modeHints     // M121c (#2566): the '?' chord-hint overlay owns the frame
 	modeQuickLook // M149a (#2806): the spacebar preview pane owns the frame
 )
 
@@ -57,6 +57,11 @@ type model struct {
 
 	mode  editMode
 	input string // rename buffer (starts empty: type the new name)
+	// delName is the file the armed delete-confirm names (#2894): the
+	// selection can shift under the prompt (a watch-event refresh
+	// re-sorts or re-clamps sel), so the 'y' answer is checked against
+	// the name the prompt actually showed.
+	delName string
 
 	clip    string // absolute source path held by c/x
 	clipCut bool   // x (move) vs c (copy)
@@ -575,6 +580,13 @@ func (m *model) handleClick(x, y int) {
 		m.closeQuickLook()
 		return
 	}
+	if m.mode == modeConfirmDelete {
+		// #2894: a press while the confirm is armed is acting on the
+		// list, not answering — shed the prompt. The press is swallowed
+		// like every other overlay's dismiss, never a selection under it.
+		m.cancelDelete("key=press")
+		return
+	}
 	if col < 0 || col >= m.cols || row < 2 || row >= 2+m.bodyRows() {
 		return
 	}
@@ -685,20 +697,23 @@ func (m *model) handleKey(ev keys.Event) {
 		return
 	}
 	if m.mode == modeConfirmDelete {
+		// #2894: the prompt answers y/Y only — every other key sheds it
+		// instead of being swallowed, so a stray 'd' cannot hold the
+		// keyboard hostage until a much-later stray 'y' commits. The
+		// shedding key is consumed (the same dismiss-and-swallow rule
+		// the context menu's off-plate press uses): a key that was never
+		// meant as an answer must not also act on the list.
 		switch ev.Key {
 		case keys.KeyRune:
-			switch ev.Rune {
-			case 'y', 'Y':
+			if ev.Rune == 'y' || ev.Rune == 'Y' {
 				m.doDelete()
-			case 'n', 'N':
-				m.mode = modeNormal
-				m.status = "delete cancelled"
+			} else {
+				m.cancelDelete("key=" + keyLabel(ev))
 			}
-		case keys.KeyEsc:
-			m.mode = modeNormal
-			m.status = "delete cancelled"
 		case keys.KeyCtrlC:
 			m.quit = true
+		default:
+			m.cancelDelete("key=" + keyLabel(ev))
 		}
 		return
 	}
@@ -1113,17 +1128,41 @@ func (m *model) startDelete() {
 		return
 	}
 	m.mode = modeConfirmDelete
-	m.status = "delete " + e.NameString() + "? y/n"
+	m.delName = e.NameString()
+	m.emit(markerDeleteArm + m.delName)
+	m.status = "delete " + m.delName + "? y/n"
+}
+
+// cancelDelete sheds the armed confirm without deleting: n/Esc, the
+// first key that is not an answer, or a pointer press. The marker names
+// the file the prompt held and what shed it — the arm/cancel pair is
+// the serial receipt an armed-but-silent prompt never left (#2894).
+func (m *model) cancelDelete(cause string) {
+	if m.mode != modeConfirmDelete {
+		return
+	}
+	m.mode = modeNormal
+	m.emit(markerDeleteCancel + m.delName + " " + cause)
+	m.delName = ""
+	m.status = "delete cancelled"
 }
 
 func (m *model) doDelete() {
-	e, ok := m.selEntry()
+	name := m.delName
+	m.delName = ""
 	m.mode = modeNormal
+	e, ok := m.selEntry()
 	if !ok {
 		m.status = "delete: nothing selected"
 		return
 	}
-	name := e.NameString()
+	if e.NameString() != name {
+		// The listing shifted under the armed prompt — the 'y' answered
+		// a different file's name, so the answer expired with it.
+		m.emit(markerDeleteCancel + name + " key=stale")
+		m.status = "delete cancelled"
+		return
+	}
 	id, rc := deleteEntry(m.path, name)
 	if rc < 0 {
 		m.emit(markerDeleteNo + name + " rc=" + vi.Itoa64(rc))
