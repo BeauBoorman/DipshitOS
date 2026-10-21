@@ -49,10 +49,14 @@ exec GOTABWM.ELF
 EOF
 
 # The second app's exec rides script3 so it is issued only after
-# `gofiles: ready` — i.e. after GOFILES' window has opened. The seat
-# assigns panes in window-open order, so an unsequenced pair races (the
-# first gate run put GOVIEW on the left); this staging pins GOFILES to
-# tab 0 / the left pane deterministically.
+# `gofiles: ready` — i.e. after GOFILES' window has opened; an
+# unsequenced pair races (the first gate run put GOVIEW on the left),
+# so this staging pins GOFILES to tab 0 deterministically. M137a
+# (#2846) re-contracted pane assignment — the focused tab takes child A
+# (the left/top pane) and the next unplaced tab takes B, where the
+# pre-M137a seat assigned panes in window-open order — so the chord
+# batch leads with ctrl-1 to focus GOFILES before the split. GOFILES
+# lands on the left under BOTH contracts (it is also strip index 0).
 vgate_file script2-01.txt <<'EOF'
 dui focus 0
 exec GOFILES.ELF /host/DRAG
@@ -124,7 +128,7 @@ vgate_run 01 -- \
     --script '$RUN_DIR/script-01.txt' \
     --script2 '$RUN_DIR/script2-01.txt' \
     --script2-after 'gotabwm: win focus' \
-    --input-chords 'ctrl-shift-v' \
+    --input-chords 'ctrl-1,ctrl-shift-v' \
     --input-chords-after 'gotabwm: rail n=2' \
     --pointer-virtio '40,62,d;200,200;320,240;480,280;900,360,u' \
     --pointer-virtio-after 'gotabwm: split v' \
@@ -175,8 +179,12 @@ vgate_assert 01 serial-absent 'goedit: drop no-payload'
 vgate_assert 01 serial-absent '[EXC] parking:'
 vgate_assert 01 serial-absent 'exited status=139'
 
-# The ordering is the proof: arm -> over/drop -> target splice -> source
-# receipt, all on one serial.
+# The ordering is the proof, but only where drag.go pins one: the seat's
+# own markers order arm -> drop in its stream; the drop's Seq=0 target
+# notice posts BEFORE the `drag drop` marker and the source's Seq=1
+# receipt posts AFTER it, while each app drains its own queue on its own
+# M — splice vs receipt is a byte race, not a contract (the M121e rule;
+# same anchoring as go-dogfood boot 08).
 vgate_assert 01 python <<'PY'
 import os, sys
 ser = open(os.environ["VG_SER"], errors="replace").read().splitlines()
@@ -190,7 +198,7 @@ src = first("gofiles: drag arm NOTE.TXT")
 drop = first("gotabwm: drag drop id=")
 splice = first("goedit: drop text/plain")
 receipt = first("gofiles: drag end delivered")
-if not (arm < drop < splice < receipt):
+if not (arm < drop and arm < splice and drop < receipt):
     sys.exit("order arm@%d drop@%d splice@%d receipt@%d (src@%d)" % (
         arm, drop, splice, receipt, src))
 print("drag ordering: seat-arm@%d src-arm@%d seat-drop@%d splice@%d receipt@%d"
@@ -207,7 +215,7 @@ vgate_run 02 -- \
     --script '$RUN_DIR/script-02.txt' \
     --script2 '$RUN_DIR/script2-02.txt' \
     --script2-after 'gotabwm: win focus' \
-    --input-chords 'ctrl-shift-v' \
+    --input-chords 'ctrl-1,ctrl-shift-v' \
     --input-chords-after 'gotabwm: rail n=2' \
     --pointer-virtio '40,78,d;200,200;320,240;480,280;900,360,u' \
     --pointer-virtio-after 'gotabwm: split v' \
