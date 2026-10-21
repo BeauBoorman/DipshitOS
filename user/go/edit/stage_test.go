@@ -35,7 +35,7 @@ func deDown(usage uint8, shift bool) vi.Event {
 }
 
 func deEditor(text string) *editor {
-	e := &editor{buf: []byte(text), cur: len(text)}
+	e := &editor{doc: doc{buf: []byte(text), cur: len(text)}}
 	e.stage.SetLayout(layout.DE)
 	return e
 }

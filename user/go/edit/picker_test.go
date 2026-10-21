@@ -12,7 +12,7 @@ import (
 )
 
 func TestCtrlOOpensTheSharedPicker(t *testing.T) {
-	e := &editor{path: "/host/EDIT/SEED.TXT"}
+	e := &editor{doc: doc{path: "/host/EDIT/SEED.TXT"}}
 	e.handleKey(usDown(0x12, modCtrl, 'o'))
 	if e.mode != modePicker || !e.pick.Open {
 		t.Fatalf("ctrl-o did not open the picker: mode=%d open=%v", e.mode, e.pick.Open)
@@ -26,7 +26,7 @@ func TestCtrlOOpensTheSharedPicker(t *testing.T) {
 }
 
 func TestPickerCancelHandsBackTheKeyboard(t *testing.T) {
-	e := &editor{path: "/host/EDIT/SEED.TXT"}
+	e := &editor{doc: doc{path: "/host/EDIT/SEED.TXT"}}
 	e.handleKey(usDown(0x12, modCtrl, 'o'))
 	if !e.handleKey(usDown(0x29, 0, 0x1b)) {
 		t.Fatal("escape not consumed")
@@ -49,7 +49,7 @@ func TestPickerOpenResultLoadsThePickedPath(t *testing.T) {
 		return []byte("picked-bytes"), int64(len("picked-bytes"))
 	}
 	t.Cleanup(func() { bufRead = old })
-	e := &editor{path: "/host/EDIT/SEED.TXT"}
+	e := &editor{doc: doc{path: "/host/EDIT/SEED.TXT"}}
 	e.handleKey(usDown(0x12, modCtrl, 'o'))
 	// A typed path resolves straight through — no listing is needed for the
 	// host leg (the share is a guest resource).
@@ -69,7 +69,7 @@ func TestPickerOpenResultLoadsThePickedPath(t *testing.T) {
 }
 
 func TestPickerSaveAsRepublishesAtThePickedPath(t *testing.T) {
-	e := &editor{path: "/host/EDIT/SEED.TXT"}
+	e := &editor{doc: doc{path: "/host/EDIT/SEED.TXT"}}
 	e.handleKey(usDown(0x16, modCtrl|vi.ModShift, 'S'))
 	if e.mode != modePicker || e.pick.Kind != appkit.PickSave {
 		t.Fatalf("ctrl-shift-s: mode=%d kind=%d", e.mode, e.pick.Kind)
@@ -86,7 +86,7 @@ func TestPickerSaveAsRepublishesAtThePickedPath(t *testing.T) {
 }
 
 func TestPickerOpenOnDirtyAsksFirst(t *testing.T) {
-	e := &editor{path: "/host/EDIT/SEED.TXT", dirty: true}
+	e := &editor{doc: doc{path: "/host/EDIT/SEED.TXT", dirty: true}}
 	e.handleKey(usDown(0x12, modCtrl, 'o'))
 	if e.mode != modeDialog {
 		t.Fatalf("dirty open did not guard: mode=%d", e.mode)
@@ -108,7 +108,7 @@ func TestPickerOpenOnDirtyAsksFirst(t *testing.T) {
 // The picker and the bars never mix: a Ctrl-F under an open picker feeds the
 // picker, it does not open the find bar.
 func TestPickerOwnsTheKeyboardWhileOpen(t *testing.T) {
-	e := &editor{path: "/host/EDIT/SEED.TXT"}
+	e := &editor{doc: doc{path: "/host/EDIT/SEED.TXT"}}
 	e.handleKey(usDown(0x12, modCtrl, 'o'))
 	e.handleKey(usDown(0x09, modCtrl, 'f')) // ctrl-f
 	if e.mode != modePicker {

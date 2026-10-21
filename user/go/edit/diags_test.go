@@ -84,7 +84,7 @@ func TestErrorsPathWalksUp(t *testing.T) {
 	fakeDiagFiles(t,
 		map[string]bool{"/host/BAD/.BUILD/ERRORS.TXT": true},
 		nil, nil)
-	e := &editor{path: "/host/BAD/helper/bad.go"}
+	e := &editor{doc: doc{path: "/host/BAD/helper/bad.go"}}
 	if got := e.errorsPath(); got != "/host/BAD/.BUILD/ERRORS.TXT" {
 		t.Fatalf("errorsPath = %q, want the parent build dir", got)
 	}
@@ -97,7 +97,7 @@ func TestErrorsPathWalksUp(t *testing.T) {
 func TestLoadErrorsNoneAndStale(t *testing.T) {
 	// No .BUILD anywhere: the named refusal is `none`.
 	fakeDiagFiles(t, map[string]bool{}, nil, nil)
-	e := &editor{path: "/host/SEED.TXT", buf: []byte("x")}
+	e := &editor{doc: doc{path: "/host/SEED.TXT", buf: []byte("x")}}
 	e.loadErrors()
 	if e.diags != nil {
 		t.Fatal("none must leave the list empty")
@@ -109,7 +109,7 @@ func TestLoadErrorsNoneAndStale(t *testing.T) {
 		map[string]bool{errs: true},
 		map[string][]byte{errs: []byte("/host/BAD/main.go:3:8: boom\n")},
 		map[string]int64{errs: 100, "/host/BAD/main.go": 200})
-	e = &editor{path: "/host/BAD/main.go"}
+	e = &editor{doc: doc{path: "/host/BAD/main.go"}}
 	e.loadErrors()
 	if e.diags != nil {
 		t.Fatal("a saved-since file must refuse the stale list")
@@ -201,21 +201,32 @@ func TestJumpDiagCrossFile(t *testing.T) {
 	}
 }
 
-func TestJumpDiagCrossFileDirtyRefuses(t *testing.T) {
+// M166a (#2979): the dirty refusal is gone — the ring holds the dirty
+// buffer while the jump opens the diagnostic's file in a new one. `full`
+// answers only when the ring has no room (ring_test pins that).
+func TestJumpDiagCrossFileDirtyOpensABuffer(t *testing.T) {
 	errs := "/host/BAD/.BUILD/ERRORS.TXT"
 	fakeDiagFiles(t,
 		map[string]bool{errs: true},
 		map[string][]byte{errs: []byte("/host/BAD/helper/bad.go:2:1: boom\n")},
-		map[string]int64{errs: 200, "/host/BAD/helper/bad.go": 100})
+		map[string]int64{errs: 200, "/host/BAD/main.go": 100})
+	fakeBufferFile(t, map[string][]byte{
+		"/host/BAD/helper/bad.go": []byte("package helper\nfunc Broken() {}\n"),
+	})
 	e := usEditor("package main\n")
 	e.path = "/host/BAD/main.go"
 	e.dirty = true
+	e.docs = []doc{e.doc}
 	e.loadErrors()
 	e.jumpDiag(0)
-	if e.path != "/host/BAD/main.go" {
-		t.Fatal("dirty buffer must refuse the cross-file jump")
+	if e.path != "/host/BAD/helper/bad.go" {
+		t.Fatalf("dirty buffer must not block the jump: %q", e.path)
+	}
+	if len(e.docs) != 2 || e.docs[0].path != "/host/BAD/main.go" || !e.docs[0].dirty {
+		t.Fatalf("the dirty buffer must stay parked: %+v", e.docs)
 	}
 }
+
 
 func TestJumpDiagStaleTargetRefuses(t *testing.T) {
 	errs := "/host/BAD/.BUILD/ERRORS.TXT"
@@ -293,8 +304,9 @@ func TestErrMarkerShapes(t *testing.T) {
 	if markerErrs != "goedit: errors " {
 		t.Fatalf("markerErrs = %q", markerErrs)
 	}
-	// Every refusal shape the gate greps rides the one prefix.
-	for _, s := range []string{"none", "stale", "dirty", "no-position", "end"} {
+	// Every refusal shape the gate greps rides the one prefix. M166a: the
+	// dirty refusal is gone — `full` names a ring with no room.
+	for _, s := range []string{"none", "stale", "full", "no-position", "end"} {
 		if strings.Contains(markerErrs, s) {
 			t.Fatalf("refusal %q must not sit inside the prefix", s)
 		}

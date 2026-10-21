@@ -120,8 +120,8 @@
 //     <diag>` and raises the error strip, and the publish still writes.
 //
 // What this is NOT: EDIT.BIN's feature list. No syntax highlighting, no
-// multi-file buffers or tabs, no LSP, no auto-indent — follow-on cards own
-// all of those.
+// tab strip or split view over the M166a buffer ring, no LSP, no
+// auto-indent — follow-on cards own all of those.
 //
 // M149c (#2808) lands the last daily-driver surface the card list named:
 //
@@ -293,6 +293,15 @@ const (
 	markerMiniOn       = "goedit: minimap on"
 	markerMinimap      = "goedit: minimap line="
 
+	// M166a (#2979): the buffer ring's receipts. `buffer switch i=K/N
+	// path=` prints on every user-visible activation — a paged switch, an
+	// open that lands in a new buffer, a pick that reuses an open one, and
+	// the buffer a close leaves standing. `buffer full n=` refuses a fifth
+	// open; `buffer last` refuses the close that would empty the ring.
+	markerBufSwitch = "goedit: buffer switch i="
+	markerBufFull   = "goedit: buffer full n="
+	markerBufLast   = "goedit: buffer last"
+
 	// modCtrl is the ADR 0009 Ctrl modifier bit; every chord below tests it.
 	modCtrl = uint16(0x0002)
 	// keyS/keyF/keyG are the LOWERCASE Unicode codepoints. kernel/src/input.zig
@@ -323,6 +332,21 @@ const (
 	keyCtrlN = 0x0e
 	keyP     = 0x70
 	keyCtrlP = 0x10
+	// M166a (#2979): the buffer ring's chords. Ctrl-Shift-O opens into a
+	// NEW buffer (Ctrl-O keeps its replace-the-active-buffer meaning);
+	// Ctrl-W closes the active buffer — free at GOEDIT's scope: the seat
+	// row deliberately never binds ctrl+w (GOSH's kill-word rule), and the
+	// window close stays the seat's Ctrl-Shift-W. Ctrl-PageUp/PageDown
+	// page the ring — free outright: the seats own the ctrl-shift and
+	// ctrl-alt spellings only, and only while they own input.
+	keyW     = 0x77
+	keyCtrlW = 0x17
+	keyO     = 0x6f
+	keyCtrlO = 0x0f
+	// usagePageUp/usagePageDown are the HID usages the buffer-paging
+	// chords match on (the usage column survives every arg1 encoding).
+	usagePageUp   = 0x4b
+	usagePageDown = 0x4e
 	// backspace/delete/return/escape codepoints (the kernel sends the
 	// codepoint in arg1).
 	codeBackspace = 0x08
@@ -459,39 +483,32 @@ func (e *editor) drawText(x, y int, text string, rgb uint32) {
 	}
 }
 
-// editor is the whole app state: the path, the byte buffer, the caret, and the
-// dirty flag.
+// editor is the whole app state: the embedded doc is the ACTIVE buffer
+// (ring.go owns the ring); the rest is the session chrome — the bars, the
+// picker, the banner, the hint overlay — that sits above whichever buffer
+// is live.
 type editor struct {
-	ta    *tabapp.TabApp
-	path  string
-	buf   []byte
-	dirty bool
+	ta *tabapp.TabApp
+	// M166a (#2979): doc is the ACTIVE buffer — path, bytes, caret,
+	// selection, dirty flag, history, lease, disk fingerprints and the
+	// find/goto histories, all promoted so the pre-ring code addresses it
+	// unchanged. docs is the ring (at most bufMax entries); docs[active]
+	// is the parked snapshot syncDocs refreshes — docList() is the walk
+	// that always sees the live doc.
+	doc
+	docs   []doc
+	active int
 	// rec, when set, receives every fill instead of the window canvas. It is
 	// nil in the guest; host tests set it to observe the frame geometry.
 	rec func(x, y, w, h int, rgb uint32)
-	// emptyShown is the M123b marker latch: `goedit: empty` prints once per
-	// transition into an empty buffer, from the paint that drew the plate.
-	emptyShown bool
 
-	// M20 U3: cur is the caret as a byte offset into buf, clamped on every use
-	// so a buffer that shrank under it cannot index out of range; mode says
-	// which bar owns the keyboard; bar holds that bar's typed text; bar2 is
-	// the replace bar's second field (the replacement) with bar2At its focus.
-	cur    int
+	// M20 U3: mode says which bar owns the keyboard; bar holds that bar's
+	// typed text; bar2 is the replace bar's second field (the replacement)
+	// with bar2At its focus. status dedupes emitStatus.
 	mode   inputMode
 	bar    []byte
 	bar2   []byte
 	bar2At bool
-
-	// #2199: the selection and the bounded history. sel is the selection's
-	// anchor byte offset, live only while selSet; markOn is the ctrl-shift-m
-	// mark — plain nav extends while it is set, which is how the gate drives
-	// a selection the runner's chord table cannot spell (shift+arrow is not
-	// a token). hist is the bounded op ring; status dedupes emitStatus.
-	sel    int
-	selSet bool
-	markOn bool
-	hist   history
 	status string
 
 	// M83e (#1778): the dead-key stage. It sits in front of whichever surface
@@ -500,12 +517,6 @@ type editor struct {
 	// printed, so the marker is an edge like markDirty.
 	stage  layout.Stage
 	marked layout.Accent
-
-	// M81d (#1764): the advisory write lease taken at open and held for the
-	// session, so a file manager cannot delete or overwrite the file out
-	// from under the editing session. nil when the open-time acquire was
-	// refused (another writer holds it live) — every save then retries.
-	lease *vi.FileLease
 
 	// M107c (#2320): the loaded build-error list. diagsPath is the
 	// ERRORS.TXT it came from and diagsMtime that file's stamp at load —
@@ -518,29 +529,24 @@ type editor struct {
 	diagsSel   int
 	diagsArg   string
 
-	// M125b (#2587): the session-state fields. base is the file content the
-	// session opened on — the undo ring's anchor: replaying the ring onto
-	// base rebuilds an unsaved buffer at restore (it aliases the load-time
-	// slice and is never mutated, so it costs nothing to keep). diskLen/
-	// diskHash fingerprint the file as last seen on the share (load or
-	// save) — the stale-blob check. findHist/gotoHist are the bounded
-	// find/goto history, newest last. pend is the decoded blob waiting for
-	// load() to produce the buffer it applies against; pendBad marks a
-	// blob that failed to decode.
-	base     []byte
-	diskLen  int
-	diskHash uint64
-	findHist [][]byte
-	gotoHist []int
-	pend     *editState
-	pendBad  bool
+	// M125b (#2587): the session-state fields. pend is the decoded blob —
+	// M166a: one record per open buffer, active first — waiting for
+	// load() to produce the buffer record 0 applies against; pendBad
+	// marks a blob that failed to decode.
+	pend    []*editState
+	pendBad bool
 
 	// M124b (#2581): the shared picker and the discard-confirm dialog.
 	// pickOpenAsk marks that the open dialog's Yes answer means "now open
-	// the picker" — the only flow that can destroy unsaved bytes.
+	// the picker" — the replace flow is the only one that can destroy
+	// unsaved bytes. M166a: pickNewBuf marks a Ctrl-Shift-O pick (it lands
+	// in a NEW buffer, so it never needs the guard); closeAsk marks the
+	// Ctrl-W close confirm.
 	pick        appkit.FilePicker
 	dlg         appkit.Dialog
 	pickOpenAsk bool
+	pickNewBuf  bool
+	closeAsk    bool
 
 	// M123d (#2578): the shared error banner — the inline strip across the
 	// top of the document band for open/save failures (banner.go owns the
@@ -640,7 +646,7 @@ func main() {
 	// restore_answer fires the RestoreState hook INSIDE it, so the blob
 	// decodes into the app's own state before the buffer even loads. The
 	// decoded path wins over argv: a session re-exec runs the bare bin.
-	e := &editor{path: path, diagsArg: diagPath, minimap: minimap}
+	e := &editor{doc: doc{path: path}, diagsArg: diagPath, minimap: minimap}
 	ta := tabapp.Init(tabapp.Config{
 		Name:  appName,
 		Title: appTitle,
@@ -700,6 +706,10 @@ func main() {
 		vi.ConsoleLine(markerThemeSub)
 	}
 
+	// M166a: the boot buffer is ring slot 0 — materialize the ring after
+	// noteState had its say on the path, then load. applyRestored appends
+	// whatever buffers the blob's other records restore.
+	e.docs = []doc{e.doc}
 	e.load()
 	// The blob applies to the loaded buffer — staleness, ring replay and
 	// caret/selection all land here, before the layout/lease/draw pass.
@@ -765,7 +775,7 @@ func main() {
 		}
 		switch ta.Dispatch(ev) {
 		case tabapp.ActionClosed:
-			e.releaseLease()
+			e.releaseAllLeases()
 			vi.ConsoleLine(markerClose)
 			vi.ConsoleLine(markerOK)
 			ta.CloseAndExit(0)
@@ -798,7 +808,7 @@ func main() {
 	}
 	// The event loop broke on a poll error — the same exit discipline as the
 	// clean paths, so a lease is not left standing on a dead session.
-	e.releaseLease()
+	e.releaseAllLeases()
 }
 
 // load reads the fixture into the buffer. A missing file is not fatal: the
@@ -1050,12 +1060,31 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	}
 	// M124b: Ctrl-O opens through the shared picker; Ctrl-Shift-S is the
 	// save-as. The save-as check must precede isSave, whose isChord does
-	// not read the Shift flag.
+	// not read the Shift flag. M166a adds the ring's chords: Ctrl-Shift-O
+	// opens the pick into a NEW buffer (the pick landing never discards,
+	// so no guard), Ctrl-W closes the active buffer, and Ctrl-PageUp/
+	// PageDown page the ring — matched on usage + ctrl, shift-insensitive:
+	// a shifted press is still a page chord, and the runner's HID table
+	// has no bare ctrl-page* token to gate with anyway.
+	if chord(ev, 'o', true) {
+		return e.startPickBuf()
+	}
 	if chord(ev, 'o', false) {
 		return e.startPick(false)
 	}
 	if chord(ev, 's', true) {
 		return e.startPick(true)
+	}
+	if chord(ev, 'w', false) {
+		return e.closeBufAsk()
+	}
+	if ev.Flags&modCtrl != 0 && ev.Flags&vi.ModAlt == 0 {
+		switch ev.Arg0 {
+		case usagePageDown:
+			return e.switchBuf(1)
+		case usagePageUp:
+			return e.switchBuf(-1)
+		}
 	}
 	if isSave(ev) {
 		// A failed Ctrl-S leaves the app alive and the buffer dirty: the
@@ -1199,6 +1228,15 @@ func (e *editor) openPick(save bool) {
 	e.mode = modePicker
 }
 
+// startPickBuf is Ctrl-Shift-O (M166a): the pick lands in a NEW buffer, so
+// the dirty buffer it was summoned over keeps its bytes — no guard, no
+// save-as face, straight to the picker.
+func (e *editor) startPickBuf() bool {
+	e.openPick(false)
+	e.pickNewBuf = true
+	return true
+}
+
 // pickerKey routes one key to the open picker and lands its Result: an open
 // re-loads the buffer at the picked path (the session's lease moves with the
 // path), a save-as republishes under the picked name, and cancel just hands
@@ -1212,6 +1250,7 @@ func (e *editor) pickerKey(ev vi.Event) bool {
 	res := e.pick.Result
 	e.mode = modeEdit
 	if res == "cancel" {
+		e.pickNewBuf = false // a cancelled new-buffer pick forgets its flag
 		vi.ConsoleLine(markerPickCancel)
 		return true
 	}
@@ -1227,11 +1266,20 @@ func (e *editor) pickerKey(ev vi.Event) bool {
 		e.save()
 		return true
 	}
-	// Open: the lease belongs to the OLD path — release it first so the new
-	// file's session starts with the same acquire the boot path does.
+	// Open: M166a's new-buffer pick lands through the ring — an open path
+	// switches to its buffer, a fresh one gets a doc of its own (openBuf
+	// reports a full ring and the buffer stays as it was). The replace
+	// pick keeps its old shape: the lease belongs to the OLD path —
+	// release it first so the new file's session starts with the same
+	// acquire the boot path does.
+	vi.ConsoleLine(markerPickOpen + res)
+	if e.pickNewBuf {
+		e.pickNewBuf = false
+		e.openBuf(res)
+		return true
+	}
 	e.releaseLease()
 	e.path = res
-	vi.ConsoleLine(markerPickOpen + res)
 	e.load()
 	e.dirty = false
 	e.selSet, e.markOn = false, false
@@ -1269,8 +1317,9 @@ func (e *editor) hintsFlush() {
 	e.hintsEmit = 0
 }
 
-// dialogKey routes the discard-confirm: Yes continues into the picker the
-// guard was raised for; anything else (No, Escape) returns to the buffer.
+// dialogKey routes the discard-confirms: Yes continues into whatever the
+// guard was raised for — the picker's replace-open or Ctrl-W's close;
+// anything else (No, Escape) returns to the buffer.
 func (e *editor) dialogKey(ev vi.Event) bool {
 	_, done := e.dlg.HandleKey(ev)
 	if !done {
@@ -1278,10 +1327,15 @@ func (e *editor) dialogKey(ev vi.Event) bool {
 	}
 	yes := e.dlg.Result == "Yes"
 	openAsk := e.pickOpenAsk
+	closeAsk := e.closeAsk
 	e.pickOpenAsk = false
+	e.closeAsk = false
 	e.mode = modeEdit
 	if yes && openAsk {
 		e.openPick(false)
+	}
+	if yes && closeAsk {
+		e.closeDoc()
 	}
 	return true
 }
@@ -1429,12 +1483,35 @@ func (e *editor) runGoto() {
 // ActionClosed arm with no write at all). The markers come in the Zig client's
 // order - the save reports first, then the dialog response, then the clean
 // close - so the gate's stage marker keeps meaning the bytes are on the share.
+// saveAllDirty is the Save choice's publish pass (M166a): every dirty
+// buffer in ring order, through the active doc's save path so each one
+// takes its lease, writes and reports like a Ctrl-S. False when any save
+// failed — the caller keeps the non-zero exit.
+func (e *editor) saveAllDirty() bool {
+	published := true
+	e.syncDocs()
+	for i := 0; i < len(e.docs); i++ {
+		if !e.docs[i].dirty {
+			continue
+		}
+		e.activateDoc(i)
+		if !e.save() {
+			published = false
+		}
+		e.syncDocs()
+	}
+	return published
+}
+
 func (e *editor) unsavedExit(ev vi.Event) {
 	published := true
 	if ev.Arg0 == 0 {
-		published = e.save()
+		// M166a: the Save choice publishes every dirty buffer in ring
+		// order; a failed publish keeps the non-zero exit and its error
+		// marker, exactly as it did for the one buffer.
+		published = e.saveAllDirty()
 	}
-	e.releaseLease()
+	e.releaseAllLeases()
 	vi.ConsoleLine(markerUnsaved)
 	vi.ConsoleLine(markerClose)
 	if !published {
@@ -1966,45 +2043,9 @@ func (e *editor) save() bool {
 	return true
 }
 
-// ensureLease acquires or refreshes this editor's advisory write lease
-// (M81d #1764). The open-time call takes the lease for the session; every
-// save re-stamps it first, so a session longer than vi.LeaseExpirySeconds
-// renews instead of fighting its own record. A refusal (-ErrEAGAIN: another
-// writer holds the lease live) is the caller's sign to report and back off;
-// a lease that was taken over meanwhile drops the stale handle so the next
-// save retries from scratch.
-func (e *editor) ensureLease() int64 {
-	if e.lease == nil {
-		l, rc := vi.AcquireFileLease(e.path, appName)
-		if rc < 0 {
-			return rc
-		}
-		e.lease = l
-		vi.ConsoleLine(markerLeaseOK + vi.Itoa64(int64(l.PID)))
-		return 0
-	}
-	if rc := e.lease.Refresh(); rc < 0 {
-		e.lease = nil
-		return rc
-	}
-	return 0
-}
-
-// releaseLease drops the session's lease at every exit path. A lease that
-// was taken over meanwhile belongs to the new holder and Release refuses to
-// delete it — the marker says which happened, because the gates read these
-// lines.
-func (e *editor) releaseLease() {
-	if e.lease == nil {
-		return
-	}
-	if rc := e.lease.Release(); rc >= 0 {
-		vi.ConsoleLine(markerLeaseRel)
-	} else {
-		vi.ConsoleLine(markerLeaseRel + " rc=" + vi.Itoa64(rc))
-	}
-	e.lease = nil
-}
+// The lease pair lives in ring.go with the ring: ensureLease/releaseLease
+// operate on the active doc, ensureLeaseOf/releaseLeaseOf on any doc, and
+// releaseAllLeases is the exit path for the whole ring.
 
 // findMarker is the find bar's serial result, in the Zig app's exact shape:
 // the ordinal is 1-based among all matches.
@@ -2105,13 +2146,15 @@ func (e *editor) draw() {
 	tok := theme.Current
 	e.fill(0, 0, w, chromeH, tok.ChromeBg)
 	e.fill(0, chromeH, w, h-chromeH, tok.Bg)
-	e.drawText(textOrigin, 8, "Edit  "+e.path, tok.Ink)
 
 	adv := font.Advance(1)
 	// #2199: the status line shares the chrome row, right-aligned — the same
-	// string emitStatus publishes on the serial console.
+	// string emitStatus publishes on the serial console. M166a: the buffer
+	// row takes the old `Edit  <path>` text's place, sized against it.
 	status := e.statusText()
-	if sw := utf8.RuneCountInString(status) * adv; sw < w-textOrigin {
+	sw := utf8.RuneCountInString(status) * adv
+	e.drawBufRow(w, sw)
+	if sw < w-textOrigin {
 		e.drawText(w-textOrigin-sw, 8, status, tok.InkMuted)
 	}
 	// M83e: a staged accent belongs to the surface that owns the keyboard, so

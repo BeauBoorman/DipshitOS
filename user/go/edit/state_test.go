@@ -16,7 +16,7 @@ import (
 // buffer and base aliased, disk fingerprint recorded, caret at the end.
 func stateEditor(text string) *editor {
 	b := []byte(text)
-	e := &editor{path: "/host/EDIT/X.TXT", buf: b, base: b, cur: len(b)}
+	e := &editor{doc: doc{path: "/host/EDIT/X.TXT", buf: b, base: b, cur: len(b)}}
 	e.diskLen = len(b)
 	e.diskHash = fnv1a64(b)
 	return e
@@ -35,7 +35,7 @@ func fileState(t *testing.T, file []byte, ok bool, blob []byte) *editor {
 		}
 		return file, 0
 	}
-	e := &editor{path: "/host/EDIT/X.TXT"}
+	e := &editor{doc: doc{path: "/host/EDIT/X.TXT"}}
 	e.noteState(blob)
 	e.load()
 	e.applyRestored()
@@ -53,11 +53,11 @@ func saveEdit(e *editor, pos int, old, ins string) {
 
 func decodeOK(t *testing.T, b []byte) *editState {
 	t.Helper()
-	st := decodeState(b)
-	if st == nil {
+	sts := decodeState(b)
+	if sts == nil || len(sts) == 0 {
 		t.Fatal("decodeState refused a freshly encoded blob")
 	}
-	return st
+	return sts[0]
 }
 
 func TestStateRoundTrip(t *testing.T) {
@@ -250,7 +250,7 @@ func TestStateDecodeTorn(t *testing.T) {
 	st := decodeOK(t, b)
 	st.bufHash ^= 1
 	e := stateEditor("alpha\n")
-	e.pend = st
+	e.pend = []*editState{st}
 	e.applyRestored()
 	if e.dirty || string(e.buf) != "alpha\n" {
 		t.Fatal("a mismatched buffer hash applied anyway")

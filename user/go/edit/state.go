@@ -32,11 +32,17 @@ package main
 import "virelai/vi"
 
 const (
-	// stateFmtVer is this serialization's own version — the first byte of
-	// the blob. stateAppVer is the envelope appver the seat stores; both
-	// are GOEDIT-owned (the seat never interprets either).
-	stateFmtVer = 1
-	stateAppVer = 1
+	// stateFmtVer is the per-record serialization's own version — the
+	// first byte of each record. stateFmtVer2 is the OUTER blob's version:
+	// M166a (#2979) wraps one record per open buffer (u8 ver, u8 count,
+	// then u32-len-prefixed records), so the envelope doubles as the ring.
+	// stateAppVer is the envelope appver the seat stores; it stays 1 — a
+	// format-1 blob still decodes (as one record) and the seat's
+	// RestoredVersion check must not refuse it. All are GOEDIT-owned (the
+	// seat never interprets any of them).
+	stateFmtVer  = 1
+	stateFmtVer2 = 2
+	stateAppVer  = 1
 
 	// findHistCap/gotoHistCap bound the find/goto history — the newest
 	// entries are the ones a user would miss.
@@ -260,9 +266,10 @@ func (d *dec) decOp() editOp {
 	return o
 }
 
-// decodeState parses the blob. nil means the envelope arrived torn or with a
-// foreign fmtVer — the caller's degrade is a plain open.
-func decodeState(b []byte) *editState {
+// decodeRecord parses one v1 record — a whole format-1 blob, or one
+// u32-prefixed member of a format-2 blob. nil means it arrived torn or
+// with a foreign fmtVer — the caller's degrade is a plain open.
+func decodeRecord(b []byte) *editState {
 	d := &dec{b: b}
 	if d.u8() != stateFmtVer {
 		return nil
@@ -317,50 +324,90 @@ func decodeState(b []byte) *editState {
 	return st
 }
 
+// decodeState parses the session blob into its records. A format-1 blob is
+// one record; a format-2 blob is u8 ver + u8 count + count u32-len-prefixed
+// records, active buffer first. nil means the envelope arrived torn or
+// with a foreign version — the caller's degrade is a plain open.
+func decodeState(b []byte) []*editState {
+	if len(b) == 0 {
+		return nil
+	}
+	if b[0] == stateFmtVer {
+		st := decodeRecord(b)
+		if st == nil {
+			return nil
+		}
+		return []*editState{st}
+	}
+	if b[0] != stateFmtVer2 {
+		return nil
+	}
+	d := &dec{b: b}
+	d.u8() // the outer version
+	n := d.u8()
+	var out []*editState
+	for i := 0; i < n && !d.bad; i++ {
+		l := d.u32()
+		rec := d.take(l)
+		if rec == nil {
+			return nil
+		}
+		st := decodeRecord(rec)
+		if st == nil {
+			return nil
+		}
+		out = append(out, st)
+	}
+	if d.bad || len(out) != n {
+		return nil
+	}
+	return out
+}
+
 // --- the app's half of the lifecycle ----------------------------------------
 
-// collectState snapshots the editor into an editState. hasBase is decided
-// here: a dirty buffer whose file was saved mid-session needs the load-time
-// bytes carried, because the file on the share is no longer the ring's
-// anchor.
-func (e *editor) collectState() *editState {
+// collectState snapshots the doc into an editState. hasBase is decided
+// here: a dirty buffer whose file was saved mid-session needs the
+// load-time bytes carried, because the file on the share is no longer the
+// ring's anchor.
+func (d *doc) collectState() *editState {
 	st := &editState{
-		dirty:    e.dirty,
-		selSet:   e.selSet,
-		cur:      e.cur,
-		sel:      e.sel,
-		path:     e.path,
-		bufLen:   len(e.buf),
-		bufHash:  fnv1a64(e.buf),
-		diskLen:  e.diskLen,
-		diskHash: e.diskHash,
-		baseLen:  len(e.base),
-		baseHash: fnv1a64(e.base),
-		dropped:  e.hist.dropped,
-		undo:     e.hist.undo,
-		redo:     e.hist.redo,
-		finds:    e.findHist,
-		gotos:    e.gotoHist,
+		dirty:    d.dirty,
+		selSet:   d.selSet,
+		cur:      d.cur,
+		sel:      d.sel,
+		path:     d.path,
+		bufLen:   len(d.buf),
+		bufHash:  fnv1a64(d.buf),
+		diskLen:  d.diskLen,
+		diskHash: d.diskHash,
+		baseLen:  len(d.base),
+		baseHash: fnv1a64(d.base),
+		dropped:  d.hist.dropped,
+		undo:     d.hist.undo,
+		redo:     d.hist.redo,
+		finds:    d.findHist,
+		gotos:    d.gotoHist,
 	}
 	if st.dirty && (st.baseLen != st.diskLen || st.baseHash != st.diskHash) {
 		st.hasBase = true
-		st.base = e.base
+		st.base = d.base
 	}
 	return st
 }
 
-// saveState is the tabapp.SaveState hook — the seat's ask lands once per
-// loop pass and gets this blob staged. Truncation is oldest-first: the redo
-// head always, the undo head only while clean (a replayed dirty ring must
-// stay whole). What still will not fit — or a ring histCap already evicted
-// from — degrades to the shell, which restores the file and nothing else.
-func (e *editor) saveState() []byte {
-	st := e.collectState()
+// shrinkRecord is saveState's per-record budget pass: the same oldest-first
+// truncation the v1 blob ran (redo head always, undo head only while clean),
+// the same shell degrade when a dirty ring cannot fit intact, and the same
+// shell-side history trim — only the budget changed, from the whole
+// envelope to whatever the outer blob still has. nil means even a shell
+// record will not fit: the record is dropped, never an oversized answer.
+func shrinkRecord(st *editState, budget int) []byte {
 	if st.dirty && st.dropped != 0 {
 		st.shell = true
 	}
 	b := st.encode()
-	for len(b) > stateCapBytes && !st.shell {
+	for len(b) > budget && !st.shell {
 		switch {
 		case len(st.redo) > 0:
 			st.redo = st.redo[1:]
@@ -376,10 +423,7 @@ func (e *editor) saveState() []byte {
 		st.base, st.undo, st.redo, st.dropped = nil, nil, nil, 0
 		st.cur, st.sel = 0, 0
 		b = st.encode()
-		// The shell is bounded too: an absurd path plus full histories can
-		// still exceed the cap. Histories trim oldest-first; a path that
-		// alone will not fit stores nothing — never an oversized answer.
-		for len(b) > stateCapBytes {
+		for len(b) > budget {
 			switch {
 			case len(st.finds) > 0:
 				st.finds = st.finds[1:]
@@ -394,37 +438,155 @@ func (e *editor) saveState() []byte {
 	return b
 }
 
+// saveState is the tabapp.SaveState hook — the seat's ask lands once per
+// loop pass and gets this blob staged. M166a (#2979): format 2 — one record
+// per open buffer, the ACTIVE buffer's record first, then the rest in ring
+// order. Each record is a full v1 record while the remaining budget fits
+// it, else the shell degrade; a record even a shell cannot fit is dropped
+// from the blob, never an oversized answer.
+func (e *editor) saveState() []byte {
+	docs := e.docList()
+	var recs [][]byte
+	used := 2 // the outer ver + count
+	emit := func(i int) {
+		st := docs[i].collectState()
+		if b := shrinkRecord(st, stateCapBytes-used-4); b != nil {
+			recs = append(recs, b)
+			used += 4 + len(b)
+		}
+	}
+	emit(e.active)
+	for i := range docs {
+		if i != e.active {
+			emit(i)
+		}
+	}
+	w := &enc{}
+	w.u8(stateFmtVer2)
+	w.u8(len(recs))
+	for _, b := range recs {
+		w.u32(len(b))
+		w.bytes(b)
+	}
+	return w.out
+}
+
 // noteState is the tabapp.RestoreState hook, run inside Init before the
 // first paint — before the buffer exists. It only decodes and stashes:
-// the path applies immediately so load() opens the blob's file (a re-exec'd
-// GOEDIT gets no argv at all), the rest waits in pend for the buffer.
+// record 0's path applies immediately so load() opens the blob's file (a
+// re-exec'd GOEDIT gets no argv at all), the rest waits in pend for the
+// buffer.
 func (e *editor) noteState(b []byte) {
-	st := decodeState(b)
-	if st == nil {
+	sts := decodeState(b)
+	if sts == nil {
 		e.pendBad = true
 		return
 	}
-	e.pend = st
-	if st.path != "" {
-		e.path = st.path
+	e.pend = sts
+	if len(sts) > 0 && sts[0].path != "" {
+		e.path = sts[0].path
 	}
 }
 
-// applyRestored runs right after load(): the file just read IS the blob's
-// staleness witness. A mismatch — the file changed or went missing since
-// the snapshot — degrades to the plain open load() already produced, which
-// is the card's stale-blob rule. A dirty blob then replays its ring onto
-// the base (the file itself when never saved, the carried bytes otherwise)
-// and the buffer-hash check is the last word on splice integrity.
+// applyRecord lands one decoded record on a doc whose buf/base/disk
+// fingerprint are already loaded — the load just performed IS the blob's
+// staleness witness. Returns "" on a full apply, "shell" for a shell
+// record (the path+caret degrade), else the stale reason name: a file that
+// changed or went missing under the blob degrades to the plain open, and a
+// dirty record replays its ring onto the base — the buffer-hash check the
+// last word on splice integrity.
+func applyRecord(d *doc, st *editState) string {
+	if st.shell {
+		return "shell"
+	}
+	if len(d.buf) != st.diskLen || fnv1a64(d.buf) != st.diskHash {
+		return "file"
+	}
+	if st.dirty {
+		if st.dropped != 0 {
+			return "ring"
+		}
+		base := d.buf
+		if st.hasBase {
+			if len(st.base) != st.baseLen || fnv1a64(st.base) != st.baseHash {
+				return "base"
+			}
+			base = st.base
+		}
+		buf := base
+		for _, o := range st.undo {
+			buf = applySplices(buf, o.sp, false)
+		}
+		if len(buf) != st.bufLen || fnv1a64(buf) != st.bufHash {
+			return "buf"
+		}
+		d.buf = buf
+		d.dirty = true
+	}
+	d.cur = st.cur
+	if d.cur < 0 {
+		d.cur = 0
+	}
+	if d.cur > len(d.buf) {
+		d.cur = len(d.buf)
+	}
+	if st.selSet {
+		d.sel = st.sel
+		if d.sel < 0 {
+			d.sel = 0
+		}
+		if d.sel > len(d.buf) {
+			d.sel = len(d.buf)
+		}
+		d.selSet = true
+	}
+	d.hist.undo = st.undo
+	d.hist.redo = st.redo
+	d.hist.open = false
+	d.hist.dropped = st.dropped
+	d.findHist = st.finds
+	d.gotoHist = st.gotos
+	return ""
+}
+
+// restoreDoc reads one extra record's file and applies the record to the
+// doc value it returns — the non-active half of a format-2 restore. The
+// degrade shapes match the active doc's: a missing file is the create path
+// (empty buffer at the path), a changed file opens its live bytes clean —
+// both count as shells in the marker because no record state rode back.
+func (e *editor) restoreDoc(d *doc, st *editState) string {
+	b, rc := bufRead(d.path, maxBuffer)
+	if rc < 0 {
+		d.buf, d.base, d.diskLen, d.diskHash = nil, nil, 0, fnv1a64(nil)
+		return "shell"
+	}
+	d.buf, d.base, d.diskLen, d.diskHash = b, b, len(b), fnv1a64(b)
+	d.cur = len(b)
+	out := applyRecord(d, st)
+	if out == "file" || out == "shell" {
+		return "shell" // a plain open either way — the file or the shell record
+	}
+	if out != "" {
+		return out // ring/base/buf degrades keep the loaded buffer
+	}
+	return ""
+}
+
+// applyRestored runs right after load(): the file just read IS record 0's
+// staleness witness, applied to the active doc exactly as the v1 restore
+// did. The format-2 records after it restore as the ring's other buffers —
+// each opens its file and takes its own lease — and the marker keeps its
+// v1 prefix with ` bufs=<n> shell=<m>` appended (m counts the buffers that
+// came back without their record state: shell records and degrades).
 func (e *editor) applyRestored() {
 	if e.pendBad {
 		e.pendBad = false
 		vi.ConsoleLine(markerState + "stale bad")
 		return
 	}
-	st := e.pend
+	sts := e.pend
 	e.pend = nil
-	if st == nil {
+	if len(sts) == 0 {
 		return
 	}
 	// The envelope's appver is the seat-visible tag; RestoredVersion is the
@@ -436,66 +598,51 @@ func (e *editor) applyRestored() {
 		vi.ConsoleLine(markerState + "stale version")
 		return
 	}
-	if st.shell {
+	e.docs = e.docList()
+	outcome := applyRecord(&e.doc, sts[0])
+	shells := 0
+	for _, st := range sts[1:] {
+		if st == nil || st.path == "" {
+			continue
+		}
+		d := doc{path: st.path}
+		if out := e.restoreDoc(&d, st); out != "" {
+			shells++
+		}
+		e.docs = append(e.docs, d)
+	}
+	if outcome == "shell" {
+		shells++
+	}
+	switch outcome {
+	case "":
+		selTag := "-"
+		if lo, hi, ok := e.selRange(); ok {
+			selTag = vi.Itoa64(int64(lo)) + ".." + vi.Itoa64(int64(hi))
+		}
+		vi.ConsoleLine(markerState + "restored cur=" + vi.Itoa64(int64(e.cur)) +
+			" sel=" + selTag +
+			" undo=" + vi.Itoa64(int64(len(e.hist.undo))) +
+			" redo=" + vi.Itoa64(int64(len(e.hist.redo))) +
+			" fh=" + vi.Itoa64(int64(len(e.findHist))) +
+			" gh=" + vi.Itoa64(int64(len(e.gotoHist))) +
+			" bufs=" + vi.Itoa64(int64(len(e.docs))) +
+			" shell=" + vi.Itoa64(int64(shells)))
+	case "shell":
 		vi.ConsoleLine(markerState + "stale ring")
-		return
+	default:
+		vi.ConsoleLine(markerState + "stale " + outcome)
 	}
-	if len(e.buf) != st.diskLen || fnv1a64(e.buf) != st.diskHash {
-		vi.ConsoleLine(markerState + "stale file")
-		return
+	// Leases: each restored buffer takes its own M81d lease for the session,
+	// the same acquire the boot path runs for the active one.
+	for i := range e.docs {
+		if i == e.active {
+			continue
+		}
+		if rc := ensureLeaseOf(&e.docs[i]); rc < 0 {
+			vi.ConsoleLine(markerLeaseHeld + vi.Itoa64(rc))
+		}
 	}
-	if st.dirty {
-		if st.dropped != 0 {
-			vi.ConsoleLine(markerState + "stale ring")
-			return
-		}
-		base := e.buf
-		if st.hasBase {
-			if len(st.base) != st.baseLen || fnv1a64(st.base) != st.baseHash {
-				vi.ConsoleLine(markerState + "stale base")
-				return
-			}
-			base = st.base
-		}
-		buf := base
-		for _, o := range st.undo {
-			buf = applySplices(buf, o.sp, false)
-		}
-		if len(buf) != st.bufLen || fnv1a64(buf) != st.bufHash {
-			vi.ConsoleLine(markerState + "stale buf")
-			return
-		}
-		e.buf = buf
-		e.dirty = true
-	}
-	e.cur = st.cur
-	e.clampCaret()
-	if st.selSet {
-		e.sel = st.sel
-		if e.sel < 0 {
-			e.sel = 0
-		}
-		if e.sel > len(e.buf) {
-			e.sel = len(e.buf)
-		}
-		e.selSet = true
-	}
-	e.hist.undo = st.undo
-	e.hist.redo = st.redo
-	e.hist.open = false
-	e.hist.dropped = st.dropped
-	e.findHist = st.finds
-	e.gotoHist = st.gotos
-	selTag := "-"
-	if lo, hi, ok := e.selRange(); ok {
-		selTag = vi.Itoa64(int64(lo)) + ".." + vi.Itoa64(int64(hi))
-	}
-	vi.ConsoleLine(markerState + "restored cur=" + vi.Itoa64(int64(e.cur)) +
-		" sel=" + selTag +
-		" undo=" + vi.Itoa64(int64(len(e.hist.undo))) +
-		" redo=" + vi.Itoa64(int64(len(e.hist.redo))) +
-		" fh=" + vi.Itoa64(int64(len(e.findHist))) +
-		" gh=" + vi.Itoa64(int64(len(e.gotoHist))))
 }
 
 // pushFind records one find-bar run's pattern — the bounded newest-last

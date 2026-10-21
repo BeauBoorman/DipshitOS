@@ -603,6 +603,18 @@ PY
 # it, a fresh name goes in, and `goedit: pick save` + the saved marker land.
 # The host assert compares PICKSAVE.TXT's bytes to the PICK2.TXT seed
 # exactly: a save that did not write the loaded buffer cannot pass.
+#
+# M166a (#2979) extends run 09 with the buffer ring's live legs, after the
+# picker legs: Ctrl-Shift-O picks PICK.TXT into buffer 2 (`pick open` +
+# `buffer switch i=2/2`), Ctrl-Shift-PageUp pages back to buffer 1
+# (`buffer switch i=1/2` — the runner's HID table spells ctrl+page only as
+# the shifted token; GOEDIT's chord is usage+ctrl, shift-insensitive, so
+# the live binding is exactly what the card names), a typed X dirties
+# buffer 1 (`goedit: dirty`), and Ctrl-W raises the close confirm whose
+# default No keeps the buffer. script3's close trigger moved from `saved`
+# to `dirty`: the saved marker fires mid-chord-stream now, while `dirty`
+# lands after the last marker-bearing leg, so `dui close 2` can never
+# arrive mid-dialog.
 vgate_setup_python <<'PY'
 import os
 share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
@@ -629,10 +641,10 @@ vgate_run 09 -- \
     --script '$RUN_DIR/script.txt' \
     --script2 '$RUN_DIR/script2-09.txt' \
     --script2-after 'tabwm: sidebar-rendered' \
-    --input-chords 'ctrl-o,P,I,C,K,2,.,T,X,T,return,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,P,I,C,K,S,A,V,E,.,T,X,T,return' \
+    --input-chords 'ctrl-o,P,I,C,K,2,.,T,X,T,return,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,P,I,C,K,S,A,V,E,.,T,X,T,return,ctrl-shift-o,P,I,C,K,.,T,X,T,return,ctrl-shift-pageup,X,ctrl-w,return' \
     --input-chords-after 'goedit: present' \
     --script3 '$RUN_DIR/script3-09.txt' \
-    --script3-after 'goedit: saved /host/EDIT/PICKSAVE.TXT' \
+    --script3-after 'goedit: dirty' \
     --script-expect 'rx-goedit-pick-ok' --timeout 240
 
 vgate_assert 09 serial-contains 'exec: loaded GOEDIT.ELF'
@@ -642,6 +654,10 @@ vgate_assert 09 serial-contains 'goedit: pick open /host/EDIT/PICK2.TXT'
 vgate_assert 09 serial-contains 'goedit: read /host/EDIT/PICK2.TXT n=9'
 vgate_assert 09 serial-contains 'goedit: pick save /host/EDIT/PICKSAVE.TXT'
 vgate_assert 09 serial-contains 'goedit: saved /host/EDIT/PICKSAVE.TXT n=9'
+vgate_assert 09 serial-contains 'goedit: pick open /host/EDIT/PICK.TXT'
+vgate_assert 09 serial-contains 'goedit: buffer switch i=2/2 path=/host/EDIT/PICK.TXT'
+vgate_assert 09 serial-contains 'goedit: buffer switch i=1/2'
+vgate_assert 09 serial-contains 'goedit: dirty'
 vgate_assert 09 serial-contains 'rx-goedit-pick-ok'
 vgate_assert 09 serial-absent 'goedit: pick cancel'
 vgate_assert 09 serial-absent '[EXC] parking:'
@@ -1298,3 +1314,56 @@ if not m or int(m[1]) != 1:
     raise SystemExit("page count %r" % (m[1] if m else None))
 print("EXPORT.PDF verified: %d bytes, %d xref objects, pages=1" % (len(data), n))
 PY
+
+# --- M166a (#2979) run 17: the four-buffer heap budget ---------------------
+# The card's memory evidence: four 256 KiB files open at once — the boot
+# buffer plus three Ctrl-Shift-O picks — while HEAP.ELF joins the published
+# samples. The live=/peak_pages= columns of `heap: sample` are the measured
+# answer to "does the ring fit"; the asserts pin the ring reaching 4/4 and
+# every file loading whole. A fifth open is never attempted here — run 09
+# and the host tests own the refusals.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+src = os.path.join(".build", "go", "HEAP.ELF")
+if not os.path.exists(src):
+    sys.exit("HEAP.ELF missing: bash tools/go/build-heap.sh")
+shutil.copy(src, os.path.join(share, "HEAP.ELF"))
+ed = os.path.join(share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+body = (b"m166a-ring-budget\n" + b"x" * (256 * 1024 - 17))
+for name in ("RG1.TXT", "RG2.TXT", "RG3.TXT", "RG4.TXT"):
+    with open(os.path.join(ed, name), "wb") as f:
+        f.write(body)
+PY
+
+vgate_file script2-17.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/RG1.TXT -heap
+EOF
+
+vgate_file script3-17.txt <<'EOF'
+exec HEAP.ELF -p GOEDIT.ELF --polls 120 --samples 14
+EOF
+
+vgate_run 17 -- \
+    --screen '$RUN_DIR/screen-17' --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-17.txt' --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'ctrl-shift-o,R,G,2,.,T,X,T,return,ctrl-shift-o,R,G,3,.,T,X,T,return,ctrl-shift-o,R,G,4,.,T,X,T,return' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-17.txt' --script3-after 'goedit: present' \
+    --script-expect 'heap: done app=GOEDIT.ELF' --timeout 240
+
+vgate_assert 17 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 17 serial-contains 'goedit: read /host/EDIT/RG1.TXT n=262144'
+vgate_assert 17 serial-contains 'goedit: read /host/EDIT/RG4.TXT n=262144'
+# The marker's <n> is the ring's size AT the switch: 2/2, 3/3, then 4/4.
+vgate_assert 17 serial-contains 'goedit: buffer switch i=2/2 path=/host/EDIT/RG2.TXT'
+vgate_assert 17 serial-contains 'goedit: buffer switch i=3/3 path=/host/EDIT/RG3.TXT'
+vgate_assert 17 serial-contains 'goedit: buffer switch i=4/4 path=/host/EDIT/RG4.TXT'
+vgate_assert 17 serial-contains 'heap: sample app=GOEDIT.ELF'
+vgate_assert 17 serial-contains 'heap: done app=GOEDIT.ELF'
+vgate_assert 17 serial-absent 'goedit: buffer full'
+vgate_assert 17 serial-absent 'goedit: save error'
+vgate_assert 17 serial-absent '[EXC] parking:'
+vgate_assert 17 serial-absent 'exited status=139'

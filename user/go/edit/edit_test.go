@@ -212,7 +212,7 @@ func TestGotoRules(t *testing.T) {
 // tail. The go-edit gate's typed characters must still land at the END of the
 // seed (load puts the caret there), so both directions are pinned.
 func TestCaretEditing(t *testing.T) {
-	e := &editor{buf: []byte("abc"), cur: 1}
+	e := &editor{doc: doc{buf: []byte("abc"), cur: 1}}
 	if !e.insert('X') {
 		t.Fatal("insert at the caret must report an edit")
 	}
@@ -258,7 +258,7 @@ func TestBarOwnsTheKeyboard(t *testing.T) {
 		return vi.Event{Kind: vi.EvKeyDown, Flags: flags, Arg1: arg1}
 	}
 	// The caret sits at the end of the document, the way load() leaves it.
-	e := &editor{buf: []byte("body"), cur: len("body")}
+	e := &editor{doc: doc{buf: []byte("body"), cur: len("body")}}
 	if !e.key(down(keyF, modCtrl)) || e.mode != modeFind {
 		t.Fatalf("ctrl-f must open the find bar (mode=%d)", e.mode)
 	}
@@ -424,7 +424,7 @@ func TestSaveUnderALiveLeaseRefuses(t *testing.T) {
 	k := installEditKernel(t, 1000)
 	k.files[vi.LeasePathFor(target)] = []byte(
 		"VLEASE1\npid=0\nts=1000\ntoken=0102030405060708\npath=" + target + "\n")
-	e := &editor{path: target, buf: []byte("XYZ")}
+	e := &editor{doc: doc{path: target, buf: []byte("XYZ")}}
 	if e.save() {
 		t.Fatal("save must refuse under a live lease")
 	}
@@ -438,7 +438,7 @@ func TestSaveUnderALiveLeaseRefuses(t *testing.T) {
 	// is not host-capturable; the code it prints is. ensureLease's refusal
 	// is exactly the number the save-error marker carries (the go-edit gate
 	// greps the full line live).
-	if rc := (&editor{path: target}).ensureLease(); rc != -vi.ErrEAGAIN {
+	if rc := (&editor{doc: doc{path: target}}).ensureLease(); rc != -vi.ErrEAGAIN {
 		t.Fatalf("ensureLease under a live lease = %d, want -ErrEAGAIN", rc)
 	}
 }
@@ -448,7 +448,7 @@ func TestSaveUnderALiveLeaseRefuses(t *testing.T) {
 func TestSavePublishesUnderTheLease(t *testing.T) {
 	const target = "/host/EDIT/SEED.TXT"
 	k := installEditKernel(t, 1000)
-	e := &editor{path: target, buf: []byte("XYZ")}
+	e := &editor{doc: doc{path: target, buf: []byte("XYZ")}}
 	if !e.save() {
 		t.Fatal("save must publish when no lease stands")
 	}

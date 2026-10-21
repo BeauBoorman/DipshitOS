@@ -20,12 +20,11 @@ import (
 //     same chords move the selection while the panel is open. A step off
 //     either end is the `end` refusal — named, never a wrap.
 //
-// A jump lands the caret on the diagnostic's line:col. A row naming a
-// different file opens that file in the ONE buffer (the card's "right
-// buffer" answer for a single-buffer editor): allowed only while the
-// buffer is clean, refused as `dirty` otherwise. Rows with no position —
-// the driver's positionless "gobuild:0:0" shape — are shown but refuse to
-// jump as `no-position`.
+// A jump lands the caret on the diagnostic's line:col. M166a (#2979): a
+// row naming a different file switches to that file's buffer or opens one
+// — the dirty single-buffer refusal is gone, `full` answers only when the
+// ring has no room. Rows with no position — the driver's positionless
+// "gobuild:0:0" shape — are shown but refuse to jump as `no-position`.
 //
 // The named refusals are the card's contract: `none` when no diagnostics
 // exist (the file is absent, or a successful build left it empty — that is
@@ -258,8 +257,10 @@ func (e *editor) stepDiag(d int) bool {
 // jumpDiag lands the caret on row i's position. Refusals are named:
 // `no-position` (a positionless row), `stale` (the target file was saved
 // after this list was built — one stat against the load-time stamp),
-// `dirty` (the row names another file and the buffer has unsaved work),
-// `miss lines=` (the line is past the buffer's end).
+// `full` (the row names another file and the buffer ring has no room —
+// M166a replaces the old single-buffer `dirty` refusal: a dirty buffer no
+// longer blocks the jump, the ring holds it), `miss lines=` (the line is
+// past the buffer's end).
 func (e *editor) jumpDiag(i int) {
 	if i < 0 || i >= len(e.diags) {
 		return
@@ -274,11 +275,15 @@ func (e *editor) jumpDiag(i int) {
 		return
 	}
 	if r.file != "" && r.file != e.path {
-		if e.dirty {
-			vi.ConsoleLine(markerErrs + "dirty")
+		e.docs = e.docList()
+		if j := e.docIndex(r.file); j >= 0 {
+			e.switchDoc(j)
+		} else if len(e.docs) >= bufMax {
+			vi.ConsoleLine(markerErrs + "full")
 			return
+		} else {
+			e.openBuf(r.file)
 		}
-		e.openFile(r.file)
 	}
 	off := lineOffset(e.buf, r.line)
 	if off < 0 {
@@ -301,20 +306,4 @@ func (e *editor) jumpDiag(i int) {
 	e.cur = off + col
 	vi.ConsoleLine(markerErrs + "jump line=" + vi.Itoa64(int64(r.line)) +
 		" col=" + vi.Itoa64(int64(r.col)))
-}
-
-// openFile swaps the buffer for a diagnostic's file — a clean buffer only;
-// the caller refuses on e.dirty first. The lease, the undo history and the
-// selection all belong to the old path and reset with it; load() and
-// ensureLease() print their own receipts.
-func (e *editor) openFile(path string) {
-	e.releaseLease()
-	e.path = path
-	e.hist = history{}
-	e.selSet, e.markOn = false, false
-	e.dirty = false
-	e.load()
-	if rc := e.ensureLease(); rc < 0 {
-		vi.ConsoleLine(markerLeaseHeld + vi.Itoa64(rc))
-	}
 }

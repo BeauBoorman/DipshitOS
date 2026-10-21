@@ -56,11 +56,11 @@ func TestFormatGoApplies(t *testing.T) {
 // no op — the ring does not grow on a no-op save.
 func TestFormatGoAlreadyClean(t *testing.T) {
 	useFmt(t)
-	doc := "package main\n\nfunc main() { println(1) }\n"
-	e := usEditor(doc)
+	src := "package main\n\nfunc main() { println(1) }\n"
+	e := usEditor(src)
 	e.path = "/host/W/main.go"
 	e.formatGo()
-	if string(e.buf) != doc {
+	if string(e.buf) != src {
 		t.Fatalf("clean buffer changed: %q", e.buf)
 	}
 	if len(e.hist.undo) != 0 {
@@ -73,11 +73,11 @@ func TestFormatGoAlreadyClean(t *testing.T) {
 // the buffer does not move.
 func TestFormatGoErrorLeavesTheBuffer(t *testing.T) {
 	useFmt(t)
-	doc := "package main\nfunc broken( {\n"
-	e := usEditor(doc)
+	src := "package main\nfunc broken( {\n"
+	e := usEditor(src)
 	e.path = "/host/W/main.go"
 	e.formatGo()
-	if string(e.buf) != doc {
+	if string(e.buf) != src {
 		t.Fatalf("an errored format touched the buffer: %q", e.buf)
 	}
 	if !e.banner.Open || !strings.Contains(e.banner.Text, "format /host/W/main.go failed:") {
@@ -107,11 +107,11 @@ func TestFormatUnavailableRefusal(t *testing.T) {
 	old := formatSource
 	formatSource = nil
 	t.Cleanup(func() { formatSource = old })
-	doc := "package main\nfunc  main(){}\n"
-	e := usEditor(doc)
+	src := "package main\nfunc  main(){}\n"
+	e := usEditor(src)
 	e.path = "/host/W/main.go"
 	e.formatGo()
-	if string(e.buf) != doc {
+	if string(e.buf) != src {
 		t.Fatalf("the refusal path touched the buffer: %q", e.buf)
 	}
 	if formatUnavailable != "edit: format unavailable (go/format not guest-safe)" {
@@ -125,7 +125,7 @@ func TestSaveFormatsGoFile(t *testing.T) {
 	useFmt(t)
 	const target = "/host/W/main.go"
 	k := installEditKernel(t, 1000)
-	e := &editor{path: target, buf: []byte("package main\nfunc  main( ) { println(1) }\n")}
+	e := &editor{doc: doc{path: target, buf: []byte("package main\nfunc  main( ) { println(1) }\n")}}
 	if !e.save() {
 		t.Fatal("save must publish")
 	}
@@ -141,13 +141,13 @@ func TestSaveFormatErrorStillPublishes(t *testing.T) {
 	useFmt(t)
 	const target = "/host/W/bad.go"
 	k := installEditKernel(t, 1000)
-	doc := "package main\nfunc broken( {\n"
-	e := &editor{path: target, buf: []byte(doc)}
+	src := "package main\nfunc broken( {\n"
+	e := &editor{doc: doc{path: target, buf: []byte(src)}}
 	if !e.save() {
 		t.Fatal("a format error must not block the save")
 	}
-	if got := string(k.files[target]); got != doc {
-		t.Fatalf("published = %q want the unformatted %q", got, doc)
+	if got := string(k.files[target]); got != src {
+		t.Fatalf("published = %q want the unformatted %q", got, src)
 	}
 	if !e.banner.Open {
 		t.Fatal("the strip must show the format diagnostic")
@@ -162,13 +162,13 @@ func TestSaveRefusalStillPublishes(t *testing.T) {
 	t.Cleanup(func() { formatSource = old })
 	const target = "/host/W/raw.go"
 	k := installEditKernel(t, 1000)
-	doc := "package main\nfunc  main(){}\n"
-	e := &editor{path: target, buf: []byte(doc)}
+	src := "package main\nfunc  main(){}\n"
+	e := &editor{doc: doc{path: target, buf: []byte(src)}}
 	if !e.save() {
 		t.Fatal("the refusal must not block the save")
 	}
-	if got := string(k.files[target]); got != doc {
-		t.Fatalf("published = %q want the verbatim %q", got, doc)
+	if got := string(k.files[target]); got != src {
+		t.Fatalf("published = %q want the verbatim %q", got, src)
 	}
 }
 

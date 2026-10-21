@@ -21,7 +21,7 @@ func usDown(usage uint8, flags uint16, arg1 uint32) vi.Event {
 }
 
 func usEditor(text string) *editor {
-	e := &editor{buf: []byte(text), cur: len(text)}
+	e := &editor{doc: doc{buf: []byte(text), cur: len(text)}}
 	e.stage.SetLayout(layout.US)
 	return e
 }

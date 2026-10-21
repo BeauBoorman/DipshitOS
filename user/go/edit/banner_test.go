@@ -72,7 +72,7 @@ func TestSaveRefusalRaisesBanner(t *testing.T) {
 	k := installEditKernel(t, 1000)
 	k.files[vi.LeasePathFor(target)] = []byte(
 		"VLEASE1\npid=0\nts=1000\ntoken=0102030405060708\npath=" + target + "\n")
-	e := &editor{path: target, buf: []byte("XYZ"), dirty: true}
+	e := &editor{doc: doc{path: target, buf: []byte("XYZ"), dirty: true}}
 	if e.save() {
 		t.Fatal("save must refuse under a live lease")
 	}
