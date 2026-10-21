@@ -6,6 +6,7 @@ import (
 	"virelai/layout"
 	"virelai/settings"
 	"virelai/tabapp"
+	"virelai/theme"
 	"virelai/vi"
 )
 
@@ -290,11 +291,11 @@ func TestDrawPaintsThePendingAccentAtTheCaret(t *testing.T) {
 		t.Fatalf("no underline under the pending cell: %+v", s.fills)
 	}
 	// "a" stays in cell 0, "b" has moved to cell 2, and cell 1 is the mark's.
-	if s.count(colText, textOrigin, textOrigin+8, row, row+8) == 0 ||
-		s.count(colText, textOrigin+16, textOrigin+24, row, row+8) == 0 {
+	if s.count(theme.Dark.Ink, textOrigin, textOrigin+8, row, row+8) == 0 ||
+		s.count(theme.Dark.Ink, textOrigin+16, textOrigin+24, row, row+8) == 0 {
 		t.Fatal("text either side of the pending accent is missing")
 	}
-	if s.count(colText, textOrigin+8, textOrigin+16, row, row+8) != 0 {
+	if s.count(theme.Dark.Ink, textOrigin+8, textOrigin+16, row, row+8) != 0 {
 		t.Fatal("text painted over the pending cell")
 	}
 	// The caret follows the mark.

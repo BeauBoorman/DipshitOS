@@ -848,9 +848,10 @@ vgate_run 12 -- \
 
 vgate_assert 12 serial-contains 'goedit: present'
 # The app's four rows (ctrl+s/z/f/g — the undo row is M121e's) + every
-# seat row (29 in the shipped table) = 33; NO kernel-terminal rows — this
-# window is not a tty front-end, so those chords do not answer here.
-vgate_assert 12 serial-contains 'goedit: hints n=33'
+# seat row (29 in the shipped table + M132a's seven reserved rows = 36)
+# = 40; NO kernel-terminal rows — this window is not a tty front-end, so
+# those chords do not answer here.
+vgate_assert 12 serial-contains 'goedit: hints n=40'
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+s publish the buffer (save)'
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+f '
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+g '
@@ -954,4 +955,263 @@ assert len(band) >= 8, \
     "no amber caret block 7 cells left of the match cell (%d px in the band)" % len(band)
 print("goedit bracket leg: teal px=%d cell=(%d..%d,%d..%d) %dx%d, caret px=%d"
       % (n, x0, x1, y0, y1, bw, bh, len(band)))
+PY
+
+# --- M149c (#2808) run 14: the -minimap column — pixels + press-to-jump ---
+# GOTABWM.ELF/GOSET.ELF stage here for run 15; MINI.TXT is 60 lines of
+# stepped widths (line 30 the widest) so the column's silhouette is not a
+# block, THEME.TXT the two-line theme leg fixture. The armed share is ONE
+# share for every leg — wm=none keeps each boot seatless now that
+# GOTABWM.ELF is staged (the go-fileman idiom): run 15 execs the seat from
+# the monitor instead of letting wm=gotabwm autostart answer every boot.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+for name in ("GOTABWM.ELF", "GOSET.ELF"):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit("%s missing (expected %s) - build it first: "
+                 "bash tools/go/build-%s.sh" % (name, src, name[:-4].lower()))
+    shutil.copy(src, os.path.join(share, name))
+ed = os.path.join(share, "EDIT")
+os.makedirs(ed, exist_ok=True)
+lines = []
+for i in range(1, 61):
+    n = 4 + (i % 6) * 6
+    if i == 30:
+        n = 40
+    lines.append(b"x" * n)
+with open(os.path.join(ed, "MINI.TXT"), "wb") as f:
+    f.write(b"\n".join(lines) + b"\n")
+with open(os.path.join(ed, "THEME.TXT"), "wb") as f:
+    f.write(b"ab\ncd")
+with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
+    f.write("#v2\nwm=none\n")
+print("staged GOTABWM.ELF, GOSET.ELF, MINI.TXT (61 lines, 1236 bytes), "
+      "THEME.TXT and SETTINGS.TXT wm=none")
+PY
+
+# The leg boots with NO seat (the run 10/13 rule: the kernel composites
+# every window itself, so the strip's pixels really reach gpu_fb). The
+# press is one --pointer-virtio click at the row for line 30 — the window
+# sits at (32,32,512,384), so guest (536,85) is window-local (504,53): x is
+# inside the 16 px column at the right edge, y = chromeH+29 maps to line
+# 30. `minimap line=30` and the status line's landing are the serial half;
+# the snapshot probe finds the gutter band, the scaled line rows and the
+# caret line's amber row.
+vgate_file script-14.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/MINI.TXT -minimap
+EOF
+
+# The echo IS the snapshot trigger and the run's expect — no close verb:
+# the window must still be up showing the post-click frame when the kind-4
+# stream reads gpu_fb (the run 10/13 shape).
+vgate_file script3-14.txt <<'EOF'
+echo rx-goedit-mini-ok
+EOF
+
+vgate_run 14 -- \
+    --screen '$RUN_DIR/screen-14' \
+    --via-virtio \
+    --snapshot-out '$RUN_DIR/snap-14' \
+    --script '$RUN_DIR/script-14.txt' \
+    --pointer-virtio '536,85,d;536,85,u' \
+    --pointer-virtio-after 'goedit: minimap on' \
+    --snapshot-after 'rx-goedit-mini-ok' \
+    --script3 '$RUN_DIR/script3-14.txt' \
+    --script3-after 'goedit: minimap line=30' \
+    --script3-delay 5 \
+    --script-expect 'rx-goedit-mini-ok' --timeout 240
+
+vgate_assert 14 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 14 serial-contains 'goedit: read /host/EDIT/MINI.TXT n=1236'
+vgate_assert 14 serial-contains 'goedit: present'
+vgate_assert 14 serial-contains 'goedit: minimap on'
+# The press at local (504,53) mapped to line 30 and landed the caret there —
+# the status line is the same string the chrome row paints.
+vgate_assert 14 serial-contains 'goedit: minimap line=30'
+vgate_assert 14 serial-contains 'goedit: status line=30/61 col=1'
+vgate_assert 14 serial-contains 'rx-goedit-mini-ok'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 serial-absent 'exited status=139'
+
+# The probe reads the guest's own composite like run 13's. The window is
+# declared at (32,32,512,384), so the column's guest rect is fixed —
+# x in [528,544), y in [56,416) — and the probe reads exactly that: a
+# colour-only hunt cannot work here, because the gutter tone sits inside
+# the dark wallpaper gradient's tolerance and the whole bottom half of
+# the desktop matches (observed: 655 k px, bbox 1256x700). Inside the
+# window's own band the strip is unambiguous: thousands of gutter px
+# spanning the full document height, hundreds of muted line-row px, and
+# the caret line's amber row (the text-area caret block is outside the
+# column's x-range by construction).
+vgate_assert 14 snapshot 'snap-14-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+def close(px, r, g, b, tol):
+    return max(abs(px[2] - r), abs(px[1] - g), abs(px[0] - b)) <= tol
+
+X0, X1, Y0, Y1 = 528, 544, 56, 416
+gut = muted = amber = 0
+gy = []
+for y in range(Y0, Y1):
+    base = y * W * 4
+    for x in range(X0, X1):
+        k = base + x * 4
+        px = raw[k:k + 3]
+        if close(px, 0x0b, 0x0e, 0x11, 8):
+            gut += 1
+            gy.append(y)
+        elif close(px, 0x94, 0xa3, 0xb8, 12):
+            muted += 1
+        elif close(px, 0xff, 0xd7, 0x5f, 24):
+            amber += 1
+assert gut >= 3000, "no gutter band inside the column region (%d px)" % gut
+span = (max(gy) - min(gy) + 1) if gy else 0
+assert span >= 300, "the gutter band does not span the document (%d px)" % span
+assert muted >= 200, "line rows did not paint inside the column (%d px)" % muted
+assert amber >= 10, "the caret line's amber row is missing (%d px)" % amber
+print("goedit minimap leg: column gutter px=%d yspan=%d, line px=%d, caret-row px=%d"
+      % (gut, span, muted, amber))
+PY
+
+# --- M149c (#2808) run 15: light/dark theme follows the settings bus -----
+# Under the Go seat the editor subscribes to `theme` at declare; GOSET is
+# the writer (the go-wm-default run 10 shape): `theme=light` typed into it
+# saves the file and publishes, the seat broadcasts to the one subscriber,
+# and GOEDIT repaints — `settings repaint key=theme value=light` prints
+# after that frame is on the scanout. snap-15-0 (fired at `goedit:
+# present`) pins the DARK frame the boot palette painted; the alt-tab puts
+# focus back on GOEDIT (GOSET took it on exec) so the following `q` lands
+# in the buffer — its dirty `*` status is the run's last marker and the
+# second snapshot's anchor, a full focus-flip later than the repaint.
+vgate_file script-15.txt <<'EOF'
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-15.txt <<'EOF'
+exec GOEDIT.ELF /host/EDIT/THEME.TXT
+EOF
+
+vgate_file script3-15.txt <<'EOF'
+exec GOSET.ELF
+EOF
+
+vgate_run 15 -- \
+    --screen '$RUN_DIR/screen-15' \
+    --via-virtio \
+    --snapshot-out '$RUN_DIR/snap-15' \
+    --script '$RUN_DIR/script-15.txt' \
+    --script2 '$RUN_DIR/script2-15.txt' \
+    --script2-after 'gotabwm: mode live' \
+    --script3 '$RUN_DIR/script3-15.txt' \
+    --script3-after 'goedit: settings subscribed key=theme' \
+    --input-string $'theme=light\n' \
+    --input-string-after 'goset: ready ' \
+    --snapshot-after 'goedit: present' \
+    --input-chords 'alt-tab' \
+    --input-chords-after 'goedit: settings repaint key=theme value=light' \
+    --input-key 12 \
+    --input-key-after 'gotabwm: alt-tab id=' \
+    --snapshot-after 'goedit: status line=2/2 col=4' \
+    --script-expect 'goedit: status line=2/2 col=4' --timeout 300
+
+vgate_assert 15 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 15 serial-contains 'gotabwm: mode live'
+vgate_assert 15 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 15 serial-contains 'goedit: declare accepted'
+# The subscription receipt is the script3 gate — the seat's own subscribe
+# line names the subscriber pid.
+vgate_assert 15 serial-contains 'goedit: settings subscribed key=theme'
+vgate_assert 15 serial-contains 'gotabwm: settings subscribe pid='
+vgate_assert 15 serial-contains 'goedit: present'
+vgate_assert 15 serial-contains 'exec: loaded GOSET.ELF'
+vgate_assert 15 serial-contains 'goset: set theme=light'
+vgate_assert 15 serial-contains 'goset: saved '
+vgate_assert 15 serial-contains 'goset: settings notified key=theme'
+# GOEDIT is the only theme subscriber in this leg.
+vgate_assert 15 serial-contains 'gotabwm: settings broadcast key=theme listeners=1'
+# The repaint receipt prints after the light frame was presented.
+vgate_assert 15 serial-contains 'goedit: settings repaint key=theme value=light'
+vgate_assert 15 serial-contains 'gotabwm: alt-tab id='
+# The typed q landed in the focused GOEDIT buffer — caret stays on line 2,
+# column moves to 4, the dirty flag joins the status.
+vgate_assert 15 serial-contains 'goedit: status line=2/2 col=4 *'
+vgate_assert 15 serial-absent '[EXC] parking:'
+vgate_assert 15 serial-absent 'exited status=139'
+# The publish is the persisted half: the file on the host share says light.
+vgate_assert 15 share-contains SETTINGS.TXT 'theme=light'
+
+# snap-15-0 is the pre-switch frame: the dark page fill (24,32,38) covers
+# the editor's document area and light-Bg pixels are essentially absent
+# (only the light-ish ink of text rows). snap-15-1 is post-repaint plus a
+# focus flip and a keystroke: the SAME probe then counts the light page
+# (241,245,249) in the tens of thousands — the delta is the feature.
+vgate_assert 15 snapshot 'snap-15-0.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+dark = light = 0
+for y in range(H):
+    base = y * W * 4
+    for x in range(W):
+        k = base + x * 4
+        b, g, r = raw[k], raw[k + 1], raw[k + 2]
+        if max(abs(r - 24), abs(g - 32), abs(b - 38)) <= 12:
+            dark += 1
+        elif max(abs(r - 241), abs(g - 245), abs(b - 249)) <= 12:
+            light += 1
+assert dark >= 30000, \
+    "the boot (dark) page did not cover the editor (%d px)" % dark
+assert light <= 20000, \
+    "light-Bg pixels before the switch: the probe cannot prove a transition (%d px)" % light
+print("goedit theme leg pre-switch: dark page px=%d, light px=%d" % (dark, light))
+PY
+
+vgate_assert 15 snapshot 'snap-15-1.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+light = dark_page = 0
+xs = []
+ys = []
+for y in range(H):
+    base = y * W * 4
+    for x in range(W):
+        k = base + x * 4
+        b, g, r = raw[k], raw[k + 1], raw[k + 2]
+        if max(abs(r - 241), abs(g - 245), abs(b - 249)) <= 12:
+            light += 1
+            xs.append(x)
+            ys.append(y)
+        elif max(abs(r - 24), abs(g - 32), abs(b - 38)) <= 12:
+            dark_page += 1
+assert light >= 50000, \
+    "the light page fill did not reach the scanout (%d px)" % light
+bw = max(xs) - min(xs) + 1
+bh = max(ys) - min(ys) + 1
+assert bw >= 200 and bh >= 150, \
+    "light pixels are scattered, not a repainted document (%dx%d)" % (bw, bh)
+print("goedit theme leg post-switch: light page px=%d bbox=%dx%d "
+      "(dark-page remainder=%d)" % (light, bw, bh, dark_page))
 PY

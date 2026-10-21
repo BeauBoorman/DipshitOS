@@ -123,10 +123,23 @@
 // multi-file buffers or tabs, no LSP, no auto-indent — follow-on cards own
 // all of those.
 //
-// The palette stays local (colChromeBg/colPageBg) rather than importing
-// webrender's theme: the full webrender package drags in layout + HTML parsing,
-// and the Go runtime's init then exceeds the kernel's sbrk region budget
-// (observed live as "runtime: cannot allocate memory" in mallocinit).
+// M149c (#2808) lands the last daily-driver surface the card list named:
+//
+//   - light/dark themes from the shared virelai/theme token table (NOT
+//     webrender's theme — the full webrender package drags in layout + HTML
+//     parsing, and the Go runtime's init then exceeds the kernel's sbrk
+//     region budget). The boot palette follows /host/SETTINGS.TXT like the
+//     other Go apps, and under a seat that hosts the settings bus the
+//     editor subscribes to the `theme` key: a GOSET publish repaints the
+//     window live (`settings repaint key=theme value=`). The caret's amber
+//     and the bracket match's teal stay constant accents in both themes —
+//     they are the M138b pixel-probe colours, not tokens.
+//   - an optional minimap: `-minimap` reserves a miniW column at the
+//     document's right edge, one pixel row per buffer line whose width
+//     scales with the line's rune count (the caret's row carries the amber
+//     accent). A press inside the column jumps the caret to that line
+//     (`minimap line=N`), the same landing a goto bar Return produces —
+//     the document body still takes no other mouse input.
 //
 // Every marker below is printed only AFTER its syscall returned, so the
 // go-edit VZ gate's asserts can only pass if the app actually ran.
@@ -143,6 +156,7 @@ import (
 	"virelai/layout"
 	"virelai/settings"
 	"virelai/tabapp"
+	"virelai/theme"
 	"virelai/vi"
 	"virelai/vsys"
 	"virelai/webrender/font"
@@ -256,6 +270,15 @@ const (
 	// The gate fixture verb's receipt (see leaseFixture).
 	markerLeaseFixture = "goedit: lease fixture "
 
+	// M149c (#2808): the settings-bus theme receipts — `subscribed` at
+	// declare (the GOCALC shape), `repaint key= value=` after the frame
+	// carrying the new palette was presented. `minimap on` is the -minimap
+	// flag's boot receipt; `minimap line=N` is a column press's landing.
+	markerThemeSub     = "goedit: settings subscribed key=theme"
+	markerThemeRepaint = "goedit: settings repaint "
+	markerMiniOn       = "goedit: minimap on"
+	markerMinimap      = "goedit: minimap line="
+
 	// modCtrl is the ADR 0009 Ctrl modifier bit; every chord below tests it.
 	modCtrl = uint16(0x0002)
 	// keyS/keyF/keyG are the LOWERCASE Unicode codepoints. kernel/src/input.zig
@@ -327,20 +350,13 @@ const (
 // come from the SDK.
 const evWinUnsaved uint16 = 17
 
-// The editor's own palette (the browser's chrome/body tones).
+// M149c: the frame's palette is the shared token table (theme.Current —
+// ChromeBg/Bg/Ink/InkMuted/Selection/Gutter/Muted). What stays local are the
+// two constant accents the M138b pixel probe pins: colCaret, the caret
+// block's amber, and colMatch, the matching bracket's teal under-text tint —
+// accents, not theme tokens, identical under light and dark.
 const (
-	colChromeBg = uint32(0x11171c)
-	colPageBg   = uint32(0x182026)
-	colInk      = uint32(0xe6edf3)
-	colText     = uint32(0xe6edf3)
-	// colCaret is the caret block and colDim the find/goto bar's label.
-	// colSel is the selection's under-text tint (#2199) — a cool tone over
-	// the page, one step darker than colPageBg so the text stays readable.
 	colCaret = uint32(0xffd75f)
-	colDim   = uint32(0x8b98a8)
-	colSel   = uint32(0x2c4459)
-	// M138b: the matching bracket's under-text tint — a teal that stays
-	// clear of the caret's amber and the selection's blue.
 	colMatch = uint32(0x3fbf9f)
 )
 
@@ -378,6 +394,11 @@ var (
 		var buf [512]byte
 		n, r := vsys.ClipboardGetInto(buf[:])
 		return buf[:n], r
+	}
+	// M149c: the settings-bus poll is a package seam too — a host test
+	// substitutes the delivered notice without a seat on the other end.
+	pollChange = func(winID uint32) (string, string, bool) {
+		return settings.PollChange(winID)
 	}
 )
 
@@ -520,6 +541,10 @@ type editor struct {
 	// scanout (the bannerFresh discipline).
 	hints     appkit.ChordHints
 	hintsEmit int // 1 = open receipt pending, 2 = close receipt pending
+
+	// M149c (#2808): the -minimap flag — the document's right-edge column
+	// of one pixel row per buffer line, and the press-to-jump arm.
+	minimap bool
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -560,10 +585,23 @@ func leaseFixture(path, mode string) bool {
 	return true
 }
 
+// loadGuestTheme applies the persisted theme at boot — the same
+// /host/SETTINGS.TXT read every themed Go app does (GOCALC's shape). A
+// missing or unreadable file leaves the Dark default standing.
+func loadGuestTheme() {
+	b, r := vi.ReadFileAll("/host/SETTINGS.TXT", 2048)
+	if r < 0 || b == nil {
+		return
+	}
+	_ = theme.ApplySettings(b)
+}
+
 func main() {
+	loadGuestTheme()
 	args := vi.Args()
 	path := defaultPath
 	diagPath := ""
+	minimap := false
 	if len(args) > 1 && len(args[1]) > 0 {
 		path = args[1]
 	}
@@ -571,6 +609,9 @@ func main() {
 		for _, a := range args[2:] {
 			if a == "-heap" {
 				heap.Publish(appName, 1)
+			}
+			if a == "-minimap" {
+				minimap = true
 			}
 			if strings.HasPrefix(a, "--lease-fixture=") {
 				leaseFixture(path, strings.TrimPrefix(a, "--lease-fixture="))
@@ -585,7 +626,7 @@ func main() {
 	// restore_answer fires the RestoreState hook INSIDE it, so the blob
 	// decodes into the app's own state before the buffer even loads. The
 	// decoded path wins over argv: a session re-exec runs the bare bin.
-	e := &editor{path: path, diagsArg: diagPath}
+	e := &editor{path: path, diagsArg: diagPath, minimap: minimap}
 	ta := tabapp.Init(tabapp.Config{
 		Name:  appName,
 		Title: appTitle,
@@ -637,6 +678,13 @@ func main() {
 	} else {
 		vi.ConsoleLine("goedit: declare refused")
 	}
+	// M149c: subscribe to the settings bus's theme key. Under a seat that
+	// hosts the bus (gotabwm) a GOSET publish reaches pollThemeChange as a
+	// kind-15 notice; under the shim or the Zig seat the request fails or
+	// is ignored and the boot palette simply stands.
+	if settings.Subscribe("theme", uint32(ta.Win), ta.Name) {
+		vi.ConsoleLine(markerThemeSub)
+	}
 
 	e.load()
 	// The blob applies to the loaded buffer — staleness, ring replay and
@@ -658,6 +706,9 @@ func main() {
 	// The first frame is on the scanout: the gate releases the injected
 	// keystrokes on this marker, so the editor is already in its event loop.
 	vi.ConsoleLine(markerPresent)
+	if e.minimap {
+		vi.ConsoleLine(markerMiniOn)
+	}
 	e.bannerFlush()
 	e.emitStatus()
 
@@ -674,6 +725,16 @@ func main() {
 		// same pass (publishSel diffs, so a quiet pass costs a compare).
 		ta.PollSelPaste()
 		e.publishSel()
+		// M149c: a published theme change repaints the frame it applies
+		// to, and its receipt prints after that frame is on the scanout —
+		// the bannerFresh discipline.
+		if key, value, applied := e.pollThemeChange(); applied {
+			e.draw()
+			ta.Present()
+			e.bannerFlush()
+			e.emitStatus()
+			vi.ConsoleLine(markerThemeRepaint + "key=" + key + " value=" + value)
+		}
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
@@ -787,6 +848,14 @@ func (e *editor) handle(ev vi.Event) bool {
 	// an outside click falls through untouched.
 	if e.banner.Open && ev.Kind == vi.EvMouseDown {
 		return e.bannerPress(int(ev.Arg0), int(ev.Arg1))
+	}
+	// M149c: a press inside the minimap column jumps the caret to that
+	// line; the rest of the document still takes no mouse input.
+	if e.minimap && ev.Kind == vi.EvMouseDown {
+		if line, ok := e.minimapHit(int(ev.Arg0), int(ev.Arg1)); ok {
+			e.minimapJump(line)
+			return true
+		}
 	}
 	return e.key(ev)
 }
@@ -2006,16 +2075,17 @@ func (e *editor) draw() {
 	if w <= 0 || h <= 0 {
 		w, h = natW, natH
 	}
-	e.fill(0, 0, w, chromeH, colChromeBg)
-	e.fill(0, chromeH, w, h-chromeH, colPageBg)
-	e.drawText(textOrigin, 8, "Edit  "+e.path, colInk)
+	tok := theme.Current
+	e.fill(0, 0, w, chromeH, tok.ChromeBg)
+	e.fill(0, chromeH, w, h-chromeH, tok.Bg)
+	e.drawText(textOrigin, 8, "Edit  "+e.path, tok.Ink)
 
 	adv := font.Advance(1)
 	// #2199: the status line shares the chrome row, right-aligned — the same
 	// string emitStatus publishes on the serial console.
 	status := e.statusText()
 	if sw := utf8.RuneCountInString(status) * adv; sw < w-textOrigin {
-		e.drawText(w-textOrigin-sw, 8, status, colDim)
+		e.drawText(w-textOrigin-sw, 8, status, tok.InkMuted)
 	}
 	// M83e: a staged accent belongs to the surface that owns the keyboard, so
 	// the document shows it only in edit mode; a bar shows it below.
@@ -2059,7 +2129,7 @@ func (e *editor) draw() {
 				c1 = c0 + 1 // a selection starting exactly on the newline
 			}
 			if c0 >= 0 {
-				e.fill(textOrigin+c0*adv, y, (c1-c0)*adv, 8, colSel)
+				e.fill(textOrigin+c0*adv, y, (c1-c0)*adv, 8, tok.Selection)
 			}
 		}
 		// The match paints under this row's text too, the selection's own
@@ -2073,11 +2143,11 @@ func (e *editor) draw() {
 			// The accent is drawn where it will land, and the text after the
 			// caret moves right one cell, as it will when the accent commits.
 			col := utf8.RuneCount(e.buf[start:e.cur])
-			e.drawText(textOrigin, y, string(e.buf[start:e.cur]), colText)
+			e.drawText(textOrigin, y, string(e.buf[start:e.cur]), tok.Ink)
 			e.drawPreedit(textOrigin+col*adv, y, pre)
-			e.drawText(textOrigin+(col+1)*adv, y, string(e.buf[e.cur:i]), colText)
+			e.drawText(textOrigin+(col+1)*adv, y, string(e.buf[e.cur:i]), tok.Ink)
 		} else if i > start {
-			e.drawText(textOrigin, y, string(e.buf[start:i]), colText)
+			e.drawText(textOrigin, y, string(e.buf[start:i]), tok.Ink)
 		}
 		// M20 U3: the caret's cell, so a find or a goto visibly MOVED it.
 		if onCaret {
@@ -2111,6 +2181,12 @@ func (e *editor) draw() {
 	if caretRow >= 0 && caretRow < maxLines {
 		e.fill(textOrigin+caretCol*adv, chromeH+4+caretRow*lineH, caretW, 8, colCaret)
 	}
+	// M149c: the minimap column paints over the document's right edge —
+	// after the text so a long line's tail cannot bleed into the strip —
+	// but under every modal surface below.
+	if e.minimap {
+		e.drawMinimap(w, h)
+	}
 	if e.mode == modeDiags {
 		e.drawDiags(w, h)
 	} else if e.mode != modeEdit && e.mode != modePicker && e.mode != modeDialog && e.mode != modeHints {
@@ -2121,14 +2197,14 @@ func (e *editor) draw() {
 			label = "Repl: "
 		}
 		barY := h - lineH - 2
-		e.drawText(textOrigin, barY, label+string(e.bar), colDim)
+		e.drawText(textOrigin, barY, label+string(e.bar), tok.InkMuted)
 		if e.mode == modeReplace {
 			// The second field follows `->`; a small block under it marks
 			// which field Tab has focused.
 			fx := textOrigin + (utf8.RuneCountInString(label)+utf8.RuneCount(e.bar))*adv
-			e.drawText(fx, barY, " -> ", colDim)
+			e.drawText(fx, barY, " -> ", tok.InkMuted)
 			fx += 4 * adv
-			e.drawText(fx, barY, string(e.bar2), colDim)
+			e.drawText(fx, barY, string(e.bar2), tok.InkMuted)
 			fx += utf8.RuneCount(e.bar2) * adv
 			if e.bar2At {
 				e.fill(fx, barY+8, adv, 1, colCaret)
@@ -2171,6 +2247,7 @@ func (e *editor) drawDiags(w, h int) {
 	if e.diagsSel < 0 || e.diagsSel >= len(e.diags) {
 		e.diagsSel = 0
 	}
+	tok := theme.Current
 	adv := font.Advance(1)
 	cols := (w - 2*textOrigin) / adv
 	barY := h - lineH - 2
@@ -2192,9 +2269,9 @@ func (e *editor) drawDiags(w, h int) {
 				text = text[:cut]
 			}
 			if i == e.diagsSel {
-				e.fill(0, y, w, lineH, colSel)
+				e.fill(0, y, w, lineH, tok.Selection)
 			}
-			e.drawText(textOrigin, y, text, colText)
+			e.drawText(textOrigin, y, text, tok.Ink)
 		}
 		y -= lineH
 	}
@@ -2202,7 +2279,7 @@ func (e *editor) drawDiags(w, h int) {
 	label := "Err " + vi.Itoa64(int64(e.diagsSel+1)) + "/" +
 		vi.Itoa64(int64(len(e.diags))) + ": " + r.file + ":" +
 		vi.Itoa64(int64(r.line)) + ":" + vi.Itoa64(int64(r.col))
-	e.drawText(textOrigin, barY, label, colDim)
+	e.drawText(textOrigin, barY, label, tok.InkMuted)
 }
 
 // drawPreedit paints a pending dead-key accent in the caret colour with an
@@ -2211,4 +2288,119 @@ func (e *editor) drawDiags(w, h int) {
 func (e *editor) drawPreedit(x, y int, mark string) {
 	e.drawText(x, y, mark, colCaret)
 	e.fill(x, y+8, font.Advance(1), 1, colCaret)
+}
+
+// --- M149c: themes + minimap -------------------------------------------------
+
+// winID is the bound window id for the settings-bus calls, or 0 before
+// tabapp.Init has run (host tests leave e.ta nil; the substituted seams
+// ignore the id anyway).
+func (e *editor) winID() uint32 {
+	if e.ta == nil {
+		return 0
+	}
+	return uint32(e.ta.Win)
+}
+
+// pollThemeChange consumes one settings-bus notice. An applied theme change
+// reports itself so the loop repaints and receipts it; a key that is not
+// `theme` or a value theme.Set refuses (amber/custom — GOEDIT ships the two
+// token tables, no more) leaves the frame and reports nothing.
+func (e *editor) pollThemeChange() (key, value string, applied bool) {
+	key, value, ok := pollChange(e.winID())
+	if !ok || key != "theme" || !theme.Set(value) {
+		return "", "", false
+	}
+	return key, value, true
+}
+
+// miniW is the minimap column's width in pixels.
+const miniW = 16
+
+// minimapHit maps a window-local press to a 1-based buffer line, or refuses
+// it: the press must land inside the column (x >= w-miniW) and in the
+// document band (chromeH <= y < h). A row below the buffer's last line
+// clamps to it — the column is a map, and the map's bottom edge is the end
+// of the file.
+func (e *editor) minimapHit(x, y int) (int, bool) {
+	w, h := natW, natH
+	if e.ta != nil {
+		if int(e.ta.W) > 0 {
+			w = int(e.ta.W)
+		}
+		if int(e.ta.H) > 0 {
+			h = int(e.ta.H)
+		}
+	}
+	if x < w-miniW || y < chromeH || y >= h {
+		return 0, false
+	}
+	line := y - chromeH + 1
+	if n := countLines(e.buf); line > n {
+		line = n
+	}
+	return line, true
+}
+
+// minimapJump parks the caret at the start of the clicked line — the same
+// landing the goto bar's Return produces, selection and mark dropped. The
+// receipt names the 1-based line so the gate can pin the mapping against
+// the status line that follows.
+func (e *editor) minimapJump(line int) {
+	off := lineOffset(e.buf, line)
+	if off < 0 {
+		off = len(e.buf)
+	}
+	e.moveCaret(off, false)
+	vi.ConsoleLine(markerMinimap + vi.Itoa64(int64(line)))
+}
+
+// drawMinimap paints the column: a Gutter band down the document's right
+// edge, and one pixel row per buffer line whose width is that line's rune
+// count scaled to the buffer's widest line — the silhouette a real minimap
+// reads as. The caret's line carries the constant amber accent instead of
+// the muted ink, so the strip also answers "where am I". Lines past the
+// band's height clip at the window edge, like the text view's own 64 rows.
+func (e *editor) drawMinimap(w, h int) {
+	tok := theme.Current
+	x := w - miniW
+	e.fill(x, chromeH, miniW, h-chromeH, tok.Gutter)
+	rows := h - chromeH
+	if rows <= 0 {
+		return
+	}
+	// Widest visible line is the scale — a single pass before the paint.
+	maxRunes := 1
+	line, start := 0, 0
+	for i := 0; i <= len(e.buf) && line < rows; i++ {
+		if i != len(e.buf) && e.buf[i] != '\n' {
+			continue
+		}
+		if n := utf8.RuneCount(e.buf[start:i]); n > maxRunes {
+			maxRunes = n
+		}
+		line++
+		start = i + 1
+	}
+	caretLine, _ := caretLineCol(e.buf, e.cur)
+	line, start = 0, 0
+	for i := 0; i <= len(e.buf) && line < rows; i++ {
+		if i != len(e.buf) && e.buf[i] != '\n' {
+			continue
+		}
+		n := utf8.RuneCount(e.buf[start:i])
+		bw := n * miniW / maxRunes
+		col := tok.Muted
+		if line+1 == caretLine {
+			col = colCaret
+			if bw < 2 {
+				bw = 2 // the accent must stay visible on a short or empty line
+			}
+		}
+		if bw > 0 {
+			e.fill(x, chromeH+line, bw, 1, col)
+		}
+		line++
+		start = i + 1
+	}
 }
