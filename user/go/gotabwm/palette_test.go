@@ -431,6 +431,329 @@ func TestPaletteSwitchSpaceRows(t *testing.T) {
 	}
 }
 
+// M165f (#2978): the palette's apps source and the file-search hand-off.
+
+// stubPaletteCatalog points readAppsFile's appsPath at a manifest while
+// delegating every other path (the recent log) to the enclosing stub.
+func stubPaletteCatalog(t *testing.T, manifest string) {
+	t.Helper()
+	old := readAppsFile
+	readAppsFile = func(path string, max int) ([]byte, int64) {
+		if path == appsPath {
+			return []byte(manifest), 0
+		}
+		return old(path, max)
+	}
+	t.Cleanup(func() { readAppsFile = old })
+}
+
+// stubPaletteStaged answers the appUnavailable probe: every binary reads
+// as staged unless it is named absent.
+func stubPaletteStaged(t *testing.T, absent ...string) {
+	t.Helper()
+	old := openFile
+	openFile = func(path string, flags uint32) (int64, int64) {
+		for _, a := range absent {
+			if path == "/host/"+a {
+				return -1, -vi.ErrENOENT
+			}
+		}
+		return 7, 0
+	}
+	t.Cleanup(func() { openFile = old })
+}
+
+// stubPaletteExec records the exec seam's calls (bin and argv).
+func stubPaletteExec(t *testing.T) (*[][2]string, func()) {
+	t.Helper()
+	var got [][2]string
+	old := execApp
+	execApp = func(bin string, args ...string) (int64, error) {
+		got = append(got, [2]string{bin, joinSpace(args)})
+		return 42, nil
+	}
+	return &got, func() { execApp = old }
+}
+
+// TestPaletteAppRowsSitBetweenTabsAndRecents: the apps source is the
+// launcher's own APPS.TXT decode — one row per entry, seated after the
+// tab rows and before the recent-file rows.
+func TestPaletteAppRowsSitBetweenTabsAndRecents(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	hexPath := ""
+	for _, c := range "/host/OLD.TXT" {
+		const hexd = "0123456789abcdef"
+		hexPath += string([]byte{hexd[c>>4], hexd[c&0xf]})
+	}
+	stubPaletteSources(t, "100|delete|0123456789abcdef|"+hexPath+"\n", nil)
+	stubPaletteCatalog(t, "GOCALC.ELF | 64-bit Calc | c\nNOTE.ELF | Text Editor | n\n")
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+	tabs.OpenTab(3, "Edit")
+
+	launch = launcherState{}
+	openPalette()
+	firstApp, lastApp, firstRecent, lastTab := -1, -1, -1, -1
+	var apps int
+	for i, e := range launch.results {
+		switch e.kind {
+		case palApp:
+			apps++
+			if firstApp < 0 {
+				firstApp = i
+			}
+			lastApp = i
+			if e.arg != e.alt || e.arg == "" {
+				t.Fatalf("app row missing its bin: %+v", e)
+			}
+		case palRecent:
+			if firstRecent < 0 {
+				firstRecent = i
+			}
+		case palTab:
+			lastTab = i
+		}
+	}
+	if apps != 2 || lastTab < 0 || firstRecent < 0 {
+		t.Fatalf("rows: apps=%d lastTab=%d firstRecent=%d", apps, lastTab, firstRecent)
+	}
+	if !(lastTab < firstApp && lastApp < firstRecent) {
+		t.Fatalf("app rows must sit after tabs and before recents: %+v", launch.results)
+	}
+}
+
+// TestPaletteEnterLaunchesTheAppRow: 'calc' ranks the manifest's Calc row
+// and Enter launches GOCALC.ELF through the exec seam, closing the strip —
+// the launcher's own dispatch.
+func TestPaletteEnterLaunchesTheAppRow(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	stubPaletteStaged(t)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	got, restore := stubPaletteExec(t)
+	defer restore()
+
+	launch = launcherState{}
+	openPalette()
+	launch.filter = "calc"
+	launch.refresh()
+	e, ok := launch.selectedPalette()
+	if !ok || e.kind != palApp || e.arg != "GOCALC.ELF" {
+		t.Fatalf("'calc' selected %+v ok=%v, want the Calc app row", e, ok)
+	}
+	paletteExecSelected()
+	if launch.open {
+		t.Fatal("an app launch must close the strip")
+	}
+	if len(*got) != 1 || (*got)[0] != [2]string{"GOCALC.ELF", ""} {
+		t.Fatalf("execs = %v, want GOCALC.ELF argv0", *got)
+	}
+}
+
+// TestPaletteAppRowCarriesArgv: a v2 row's `argv=` rides the exec exactly
+// as the launcher face rides it.
+func TestPaletteAppRowCarriesArgv(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	stubPaletteCatalog(t, "GOSH.ELF | Shell | s | dock=false | v=2 | argv=--login fast\n")
+	stubPaletteStaged(t)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	got, restore := stubPaletteExec(t)
+	defer restore()
+
+	launch = launcherState{}
+	openPalette()
+	launch.filter = "shell"
+	launch.refresh()
+	e, ok := launch.selectedPalette()
+	if !ok || e.kind != palApp {
+		t.Fatalf("'shell' selected %+v ok=%v, want the Shell app row", e, ok)
+	}
+	paletteExecSelected()
+	if len(*got) != 1 || (*got)[0] != [2]string{"GOSH.ELF", "--login fast"} {
+		t.Fatalf("execs = %v, want GOSH.ELF --login fast", *got)
+	}
+}
+
+// TestPaletteAppRowRefusalsAreNamed: the manifest's refusal contract
+// survives the palette face — a seat bin and an unstaged binary both stay
+// open and name their reason instead of execing.
+func TestPaletteAppRowRefusalsAreNamed(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	stubPaletteCatalog(t, "GOTABWM.ELF | Seat | w\nMISSING.ELF | Ghost | g\n")
+	stubPaletteStaged(t, "MISSING.ELF")
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	got, restore := stubPaletteExec(t)
+	defer restore()
+
+	launch = launcherState{}
+	openPalette()
+	for _, want := range []struct{ filter, err string }{
+		{"seat", "Seat: use settings wm"},
+		{"ghost", "Binary not staged"},
+	} {
+		launch.filter = want.filter
+		launch.refresh()
+		e, ok := launch.selectedPalette()
+		if !ok || e.kind != palApp {
+			t.Fatalf("%q selected %+v ok=%v, want an app row", want.filter, e, ok)
+		}
+		launch.err = ""
+		paletteExecSelected()
+		if launch.err != want.err {
+			t.Fatalf("%q err = %q, want %q", want.filter, launch.err, want.err)
+		}
+		if !launch.open {
+			t.Fatalf("%q: a refused app row must not close the strip", want.filter)
+		}
+	}
+	if len(*got) != 0 {
+		t.Fatalf("refused rows must not exec, got %v", *got)
+	}
+}
+
+// TestPaletteSearchRowIsTheLastRow: a non-empty query grows one synthetic
+// row — "Search files for '<q>'" — after every ranked result, and Enter
+// hands the query to GOFILES --search.
+func TestPaletteSearchRowIsTheLastRow(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	got, restore := stubPaletteExec(t)
+	defer restore()
+
+	launch = launcherState{}
+	openPalette()
+	launch.filter = "invoice"
+	launch.refresh()
+	if launch.filtered[len(launch.filtered)-1] != paletteSearchIdx {
+		t.Fatalf("last filtered row = %d, want the search sentinel", launch.filtered)
+	}
+	launch.sel = len(launch.filtered) - 1
+	e, ok := launch.selectedPalette()
+	if !ok || e.kind != palSearch || e.arg != "invoice" ||
+		e.label != "Search files for 'invoice'" {
+		t.Fatalf("search row = %+v ok=%v", e, ok)
+	}
+	paletteExecSelected()
+	if launch.open {
+		t.Fatal("the hand-off must close the strip")
+	}
+	if len(*got) != 1 || (*got)[0] != [2]string{"GOFILES.ELF", "--search invoice"} {
+		t.Fatalf("execs = %v, want GOFILES.ELF --search invoice", *got)
+	}
+}
+
+// TestPaletteSearchRowMatchesToo: the search row is the floor, not a
+// fallback — 'calc' still ranks the app row first and offers the search
+// hand-off last.
+func TestPaletteSearchRowMatchesToo(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	launch = launcherState{}
+	openPalette()
+	launch.filter = "calc"
+	launch.refresh()
+	e, ok := launch.selectedPalette()
+	if !ok || e.kind != palApp || e.arg != "GOCALC.ELF" {
+		t.Fatalf("'calc' top row = %+v ok=%v, want the Calc app row", e, ok)
+	}
+	if launch.filtered[len(launch.filtered)-1] != paletteSearchIdx {
+		t.Fatal("the search row must still close the list")
+	}
+}
+
+// TestPaletteNoSearchRowOnEmptyQuery: the synthetic row exists only while
+// a query stands — the fresh palette's catalog is the sources alone.
+func TestPaletteNoSearchRowOnEmptyQuery(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	launch = launcherState{}
+	openPalette()
+	if len(launch.filtered) != len(launch.results) {
+		t.Fatalf("filtered=%d results=%d — an empty query grew a row",
+			len(launch.filtered), len(launch.results))
+	}
+	for _, i := range launch.filtered {
+		if i == paletteSearchIdx {
+			t.Fatal("the search sentinel must not exist on an empty query")
+		}
+	}
+}
+
+// TestPaletteSearchQueryBound: the --search argument is at most 64 bytes —
+// a wider query is refused by name and the strip stays open, exactly like
+// a refused exec.
+func TestPaletteSearchQueryBound(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubPaletteSources(t, "", nil)
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+
+	got, restore := stubPaletteExec(t)
+	defer restore()
+
+	launch = launcherState{}
+	openPalette()
+	long := ""
+	for len(long) <= paletteSearchMax {
+		long += "x"
+	}
+	launch.filter = long
+	launch.refresh()
+	launch.sel = len(launch.filtered) - 1
+	e, ok := launch.selectedPalette()
+	if !ok || e.kind != palSearch {
+		t.Fatalf("long query row = %+v ok=%v, want the search row", e, ok)
+	}
+	paletteExecSelected()
+	if len(*got) != 0 {
+		t.Fatalf("a %d-byte query must not exec, got %v", len(long), *got)
+	}
+	if launch.err == "" || !launch.open {
+		t.Fatalf("refusal: err=%q open=%v", launch.err, launch.open)
+	}
+	// The boundary itself still hands off.
+	launch.filter = long[:paletteSearchMax]
+	launch.refresh()
+	launch.sel = len(launch.filtered) - 1
+	paletteExecSelected()
+	if len(*got) != 1 || (*got)[0] != [2]string{"GOFILES.ELF", "--search " + long[:paletteSearchMax]} {
+		t.Fatalf("64-byte execs = %v", *got)
+	}
+}
+
 // M151b (#2913): the switch rows exist on an EMPTY strip too — a switch
 // needs no focused tab, so the rows are the keyboard's only jump while
 // the live space holds nothing to move.

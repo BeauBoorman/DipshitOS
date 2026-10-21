@@ -9,11 +9,16 @@
 // Result sources, in catalog order:
 //
 //	open tabs    -> Enter focuses (the same focusHosted rail/alt-tab use)
+//	apps         -> the launcher's own APPS.TXT catalog; Enter launches
+//	                exactly as the launcher face would
 //	recent files -> the vi trash/recent log's paths; Enter opens in GOEDIT
 //	settings keys-> every key the panel can edit; Enter opens GOSET
 //	help topics  -> the /host/docs bundle GOHELP browses; Enter opens GOHELP
 //	chords       -> the whole chords.Global registry; Enter runs a seat
 //	                row's action, anything else opens GOSET's shortcuts view
+//
+// A non-empty filter also grows one synthetic last row — "Search files for
+// '<q>'" — that hands the query to GOFILES --search (M165f #2978).
 //
 // Ranking is the launcher's three-tier subsequence model (rankApps)
 // applied over the row's label plus one alternate match text — a chord's
@@ -38,6 +43,9 @@ const (
 	MarkerPaletteEmpty   = "gotabwm: palette empty"
 	MarkerPaletteMissing = "gotabwm: palette missing "
 	MarkerRpcPalette     = "gotabwm: rpc palette"
+	// M165f (#2978): the app-row launch and the file-search hand-off.
+	MarkerPaletteLaunch = "gotabwm: palette launch "
+	MarkerPaletteSearch = "gotabwm: palette search q="
 
 	// palettePrompt is the header text the strip carries in palette mode —
 	// the same slot launchPrompt owns in launcher mode.
@@ -76,7 +84,25 @@ const (
 	// dormant space, the rail pill's keyboard path. arg carries the
 	// space name; no tab id (a switch needs no focused tab).
 	palSwitch
+	// palApp (M165f #2978): one row per APPS.TXT entry — the same
+	// manifest the launcher's other face ranks. arg carries Bin; argv
+	// carries the row's `argv=` fixed arguments.
+	palApp
+	// palSearch (M165f #2978): "Search files for '<q>'" — a synthetic
+	// last row that exists only while the filter is non-empty and hands
+	// the query to GOFILES --search. arg carries the query.
+	palSearch
 )
+
+// paletteSearchIdx is the filtered index the palSearch row sits at: the
+// sentinel -1, distinct from every results index, mapped to launch.search
+// by paletteRow at paint and dispatch time.
+const paletteSearchIdx = -1
+
+// paletteSearchMax is the byte bound on the `--search <q>` argument
+// GOFILES is handed. The typed filter already caps at filterMax; the bound
+// is the honest refusal for a query that arrives any wider.
+const paletteSearchMax = 64
 
 // paletteEntry is one result row. label is the painted text and the primary
 // match; alt is a second match text that is never painted (a tab's bin, a
@@ -88,7 +114,8 @@ type paletteEntry struct {
 	alt    string
 	detail string
 	id     uint32       // palTab: the window id
-	arg    string       // palRecent: the file path
+	arg    string       // palRecent: the file path; palApp/palSearch: the bin/query
+	argv   []string     // palApp: the manifest row's fixed argv=
 	action string       // palChord: the seat action, "" off-seat
 	chord  chords.Chord // palChord: the row's keys
 }
@@ -154,6 +181,7 @@ func paletteSources() []paletteEntry {
 	out = appendSpaceRows(out)
 	out = appendSpaceSwitchRows(out)
 	out = appendPaneRows(out)
+	out = appendAppRows(out)
 	out = appendRecentRows(out)
 	out = appendSettingsRows(out)
 	out = appendHelpRows(out)
@@ -257,6 +285,37 @@ func appendPaneRows(out []paletteEntry) []paletteEntry {
 		detail: "seat · panes",
 		action: "zoom-pane",
 	})
+}
+
+// appendAppRows offers one row per APPS.TXT entry, ranked with everything
+// else but dispatched through the launcher's own exec path on Enter. The
+// catalog is the one the launcher already loaded when the strip crossed
+// over (launch.catalog survives until openPalette clears it); a cold
+// summon decodes once through the same readAppsFile/parseAppsTXT seam —
+// never a second parser.
+func appendAppRows(out []paletteEntry) []paletteEntry {
+	for _, e := range paletteApps() {
+		out = append(out, paletteEntry{
+			kind:   palApp,
+			label:  e.Label,
+			alt:    e.Bin,
+			detail: "app · " + e.Bin,
+			arg:    e.Bin,
+			argv:   e.Args,
+		})
+	}
+	return out
+}
+
+func paletteApps() []AppEntry {
+	if launch.catalog != nil {
+		return launch.catalog
+	}
+	body, r := readAppsFile(appsPath, appsMaxBytes)
+	if r < 0 || body == nil {
+		return nil
+	}
+	return parseAppsTXT(string(body))
 }
 
 // appendRecentRows decodes the vi recent log's bounded tail
@@ -398,17 +457,26 @@ func rankPalette(catalog []paletteEntry, q string) []int {
 	return append(append(prefix, sub...), fuzzy...)
 }
 
+// paletteRow resolves a filtered index to its row: the paletteSearchIdx
+// sentinel maps to the synthetic search row, anything else is a results
+// index. Paint and dispatch share it.
+func (l *launcherState) paletteRow(i int) (paletteEntry, bool) {
+	if i == paletteSearchIdx {
+		return l.search, l.filter != ""
+	}
+	if i < 0 || i >= len(l.results) {
+		return paletteEntry{}, false
+	}
+	return l.results[i], true
+}
+
 // selectedPalette is selected()'s palette-mode twin: the ranked row, not
 // the manifest row.
 func (l *launcherState) selectedPalette() (paletteEntry, bool) {
 	if l.sel < 0 || l.sel >= len(l.filtered) {
 		return paletteEntry{}, false
 	}
-	i := l.filtered[l.sel]
-	if i < 0 || i >= len(l.results) {
-		return paletteEntry{}, false
-	}
-	return l.results[i], true
+	return l.paletteRow(l.filtered[l.sel])
 }
 
 func emitPaletteFilter() {
@@ -492,6 +560,21 @@ func paletteExecSelected() {
 			_ = applyPaneUnzoom()
 		}
 		return
+	case palApp:
+		// Enter launches as the launcher does: the manifest row's own
+		// refusal contract first (seat bins, unstaged binaries), then the
+		// exec with the row's fixed argv=.
+		if reason := appUnavailable(AppEntry{Bin: e.arg}); reason != "" {
+			launch.err = reason
+			return
+		}
+		if !paletteExecApp(e) {
+			return
+		}
+	case palSearch:
+		if !paletteExecSearch(e.arg) {
+			return
+		}
 	case palRecent:
 		if !paletteExecArgv("GOEDIT.ELF", e.arg) {
 			return
@@ -533,5 +616,42 @@ func paletteExecArgv(bin, arg string) bool {
 		return false
 	}
 	vi.ConsoleLine(MarkerPaletteExec + bin + " argv=" + arg)
+	return true
+}
+
+// paletteExecApp launches a manifest row through the same execApp seam the
+// launcher's Enter takes — the bin plus the row's fixed argv=. The marker
+// is the launcher's own shape: the bin, and the argv when the row declared
+// one.
+func paletteExecApp(e paletteEntry) bool {
+	if _, err := execApp(e.arg, e.argv...); err != nil {
+		vi.ConsoleLine(MarkerPaletteMissing + e.arg)
+		launch.err = "Launch failed: " + e.arg
+		seatRefusalErr(err, "exec "+e.arg, e.arg)
+		return false
+	}
+	if len(e.argv) > 0 {
+		vi.ConsoleLine(MarkerPaletteLaunch + e.arg + " argv=" + joinSpace(e.argv))
+	} else {
+		vi.ConsoleLine(MarkerPaletteLaunch + e.arg)
+	}
+	return true
+}
+
+// paletteExecSearch hands the query to GOFILES --search. The argument
+// bound is paletteSearchMax bytes — a wider query refuses by name in the
+// error line and the strip stays open, exactly like a refused exec.
+func paletteExecSearch(q string) bool {
+	if len(q) > paletteSearchMax {
+		launch.err = "Search query too long (64 B max)"
+		return false
+	}
+	if _, err := execApp(gofilesBin, "--search", q); err != nil {
+		vi.ConsoleLine(MarkerPaletteMissing + gofilesBin)
+		launch.err = "Launch failed: " + gofilesBin
+		seatRefusalErr(err, "exec "+gofilesBin, gofilesBin)
+		return false
+	}
+	vi.ConsoleLine(MarkerPaletteSearch + q)
 	return true
 }

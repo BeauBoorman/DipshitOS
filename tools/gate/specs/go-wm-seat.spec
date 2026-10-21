@@ -1780,16 +1780,28 @@ vgate_assert 14 serial-absent 'exited status=139'
 #
 # LIVE seat (vf rm GOTABWM.DEMO — the run 05/09 pattern) so no bounded
 # choreography races the legs. GOEDIT hosts first: it is the tab the
-# 'edit' leg focuses. Both legs ride ONE chord batch at the fixed
+# 'edit' leg focuses. All four legs ride ONE chord batch at the fixed
 # 0.25 s/stroke pacing:
 #
 #   ctrl-shift-p,e,d,i,t,return   'edit' -> the Edit tab row -> focus it
 #   ctrl-shift-p,s,e,t,t,return   'sett' -> a Settings row -> exec GOSET
+#   ctrl-shift-p,c,a,l,c,return   'calc' -> the 64-bit Calc app row -> exec
+#                                 GOCALC.ELF (M165f #2978: the palette's
+#                                 apps source)
+#   ctrl-shift-p,i,n,v,o,i,c,e,down*,return
+#                                 'invoice' -> the always-last "Search
+#                                 files" row -> GOFILES.ELF --search
+#                                 invoice (the same card's file-search
+#                                 hand-off)
+#
+# The down* run saturates the selection on the synthetic last row: 'down'
+# clamps at len(filtered)-1, so any count past the fuzzy-match count lands
+# the same row — pinning a literal count would rot on catalog growth.
 #
 # Leg order is deliberate: the focus leg needs only the already-hosted
-# Edit tab, and 'goset: declare accepted' — script3's anchor — can only
-# land AFTER 'palette exec GOSET.ELF' (the exec precedes the declare), so
-# the run's end gate can never outrun either leg.
+# Edit tab, and 'gofiles: declare accepted' — script3's anchor — can only
+# land AFTER 'palette search q=invoice' (the exec precedes the declare),
+# so the run's end gate can never outrun any leg.
 #
 # The `vf rm GOTABWM.IDLE.TEST` + `settings set idle_minutes 120` pair is
 # load-bearing: run 07 persists idle_minutes=1 and seeds the 2-ticks/min
@@ -1819,16 +1831,20 @@ dui
 echo rx-gotabwm-palette-ok
 EOF
 
+# 32 `down` strokes comfortably exceed 'invoice''s fuzzy-match count
+# without depending on it (see the leg note above).
+palette15_downs=$(printf 'down,%.0s' $(seq 1 32))
+
 vgate_run 15 -- \
     --via-virtio \
     --screen '$RUN_DIR/screen-15' \
     --script '$RUN_DIR/script-15.txt' \
     --script2 '$RUN_DIR/script2-15.txt' \
     --script2-after 'gotabwm: win focus' \
-    --input-chords 'ctrl-shift-p,e,d,i,t,return,ctrl-shift-p,s,e,t,t,return' \
+    --input-chords "ctrl-shift-p,e,d,i,t,return,ctrl-shift-p,s,e,t,t,return,ctrl-shift-p,c,a,l,c,return,ctrl-shift-p,i,n,v,o,i,c,e,${palette15_downs}return" \
     --input-chords-after 'goedit: declare accepted' \
     --script3 '$RUN_DIR/script3-15.txt' \
-    --script3-after 'goset: declare accepted' \
+    --script3-after 'gofiles: declare accepted' \
     --script-expect 'rx-gotabwm-palette-ok' --timeout 300
 
 vgate_assert 15 serial-contains 'settings: idle_minutes=120 (persisted)'
@@ -1843,15 +1859,36 @@ vgate_assert 15 serial-contains 'gotabwm: palette open n='
 vgate_assert 15 serial-contains 'gotabwm: palette filter q=edit n='
 vgate_assert 15 serial-contains 'gotabwm: palette focus id='
 vgate_assert 15 serial-contains 'gotabwm: palette dismiss'
-# Leg 2: 'sett' ranks a Settings row first and execs GOSET, which then
-# declares for real over WM_RPC — the launch is hosted, not just exec'd.
-# A seat-spawned exec does not print 'exec: loaded' (that is the monitor
-# command's line); its kernel-side record is the measured-boot receipt.
+# Leg 2: 'sett' ranks the manifest's "Settings" app row first (the M165f
+# apps source sits before the settings keys in catalog order) and Enter
+# launches GOSET through the launcher's own exec path — the launch marker,
+# not the settings-row exec marker. GOSET then declares for real over
+# WM_RPC — the launch is hosted, not just exec'd. A seat-spawned exec does
+# not print 'exec: loaded' (that is the monitor command's line); its
+# kernel-side record is the measured-boot receipt.
 vgate_assert 15 serial-contains 'gotabwm: palette filter q=sett n='
-vgate_assert 15 serial-contains 'gotabwm: palette exec GOSET.ELF'
+vgate_assert 15 serial-contains 'gotabwm: palette launch GOSET.ELF'
 vgate_assert 15 serial-contains 'verdict=measured name=GOSET.ELF'
 vgate_assert 15 serial-contains 'goset: declare accepted'
 vgate_assert 15 serial-contains 'gotabwm: rail n=2'
+# Leg 3 (M165f #2978): 'calc' ranks the manifest's 64-bit Calc row first —
+# no Calc tab exists yet — and Enter launches GOCALC.ELF through the
+# launcher's own exec path, which then hosts and declares for real.
+vgate_assert 15 serial-contains 'gotabwm: palette filter q=calc n='
+vgate_assert 15 serial-contains 'gotabwm: palette launch GOCALC.ELF'
+vgate_assert 15 serial-contains 'verdict=measured name=GOCALC.ELF'
+vgate_assert 15 serial-contains 'gocalc: declare accepted'
+vgate_assert 15 serial-contains 'gotabwm: rail n=3'
+# Leg 4: 'invoice' matches nothing well enough to matter — the synthetic
+# "Search files for 'invoice'" row is the selection after the saturating
+# downs — and Enter hands the query to GOFILES --search. A seat-spawned
+# exec prints no `exec: loaded`; the kernel-side record is the
+# measured-boot receipt, and GOFILES's own declare is the hosted proof.
+vgate_assert 15 serial-contains 'gotabwm: palette filter q=invoice n='
+vgate_assert 15 serial-contains 'gotabwm: palette search q=invoice'
+vgate_assert 15 serial-contains 'verdict=measured name=GOFILES.ELF'
+vgate_assert 15 serial-contains 'gofiles: declare accepted'
+vgate_assert 15 serial-contains 'gotabwm: rail n=4'
 vgate_assert 15 serial-contains 'rx-gotabwm-palette-ok'
 vgate_assert 15 serial-absent '[EXC] parking:'
 vgate_assert 15 serial-absent 'exited status=139'
@@ -1985,13 +2022,21 @@ PY
 # The seat's refusal sites post a notify toast with a per-errno action
 # (user/go/gotabwm/refusal.go); serial markers stay exactly as they were.
 #
-# Run 17 — missing binary -> toast -> Retry: APPS.TXT carries one Ghost
-# row for MISSING.ELF, which IS staged so the launcher's availability
+# Run 17 — missing binary -> toast -> Retry: the launcher needs a one-row
+# Ghost manifest for MISSING.ELF, which IS staged so the availability
 # probe admits it. script2 then `vf rm`s the binary behind the
 # 'launcher open' marker and the pointer batch (anchored on the first
 # presented launcher frame, one tick later — the rm lands well inside
 # that window) clicks the row: exec -> ENOENT -> refusal toast -> a
 # second click runs Retry, which execs again and reports ENOENT.
+#
+# The one-row manifest is staged as GHOSTAPPS.TXT and swapped in by the
+# boot script's `vf mv` pair — writing APPS.TXT directly here would
+# collapse the shared manifest for EVERY run (M165f #2978's run-15 legs
+# need the real catalog; observed 2026-10-21: the overwrite made the
+# palette's apps source read a one-row manifest and 'calc' dispatched a
+# chord row). The swap persists, so run 19's `launcher open n=1` still
+# reads the Ghost catalog exactly as before.
 vgate_setup_python <<'PY'
 import os, shutil, sys
 rd = os.environ["RUN_DIR"]
@@ -2000,15 +2045,18 @@ src = os.path.join(".build", "go", "GOCALC.ELF")
 if not os.path.isfile(src):
     sys.exit("GOCALC.ELF missing - build it first: bash tools/go/build-gocalc.sh")
 shutil.copy(src, os.path.join(share, "MISSING.ELF"))
-# One-row manifest so the Ghost row is unambiguously the click target.
-open(os.path.join(share, "APPS.TXT"), "w").write(
+# One-row manifest so the Ghost row is unambiguously the click target;
+# swapped into place by script-17's `vf mv` (see the note above).
+open(os.path.join(share, "GHOSTAPPS.TXT"), "w").write(
     "# v2 test manifest for the M123a missing-binary leg\n"
     "MISSING.ELF | Ghost | g | dock=true\n")
-print("staged MISSING.ELF + one-row APPS.TXT")
+print("staged MISSING.ELF + one-row GHOSTAPPS.TXT")
 PY
 
 vgate_file script-17.txt <<'EOF'
 vf rm GOTABWM.DEMO
+vf mv APPS.TXT APPSREAL.TXT
+vf mv GHOSTAPPS.TXT APPS.TXT
 set GOMAXPROCS=1
 wm
 exec GOTABWM.ELF

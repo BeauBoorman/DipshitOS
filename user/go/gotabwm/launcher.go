@@ -90,6 +90,11 @@ type launcherState struct {
 	prior      uint32
 	painted    bool
 	emptyShown bool // M123b: the `empty` marker printed for the current frame
+	// M165f (#2978): the palette's synthetic "Search files for '<q>'"
+	// row. Not a results entry — refresh rebuilds it on each filter
+	// change and filtered carries the paletteSearchIdx sentinel for it,
+	// always last.
+	search paletteEntry
 	width      int
 	height     int
 	launching  bool
@@ -169,6 +174,17 @@ func (l *launcherState) refresh() {
 	l.painted = false
 	if l.palette {
 		l.filtered = rankPalette(l.results, l.filter)
+		if l.filter != "" {
+			// M165f: a non-empty query always offers the file-search
+			// hand-off, ranked last — ranking itself is unchanged.
+			l.search = paletteEntry{
+				kind:   palSearch,
+				label:  "Search files for '" + l.filter + "'",
+				detail: "files · " + gofilesBin + " --search",
+				arg:    l.filter,
+			}
+			l.filtered = append(l.filtered, paletteSearchIdx)
+		}
 	} else {
 		l.filtered = rankApps(l.catalog, l.filter)
 	}
@@ -655,13 +671,13 @@ func paintLauncher(scan []byte, width, height int) int {
 		}
 		ci := launch.filtered[i]
 		if launch.palette {
-			if ci < 0 || ci >= len(launch.results) {
+			e, ok := launch.paletteRow(ci)
+			if !ok {
 				continue
 			}
 			row := widgets.Rect{X: x, Y: y, W: w, H: rh}
 			paintLauncherRow(c, row, i == launch.sel)
 			written += seatArea(c, row)
-			e := launch.results[ci]
 			seatText(c, row, x+6, y+3, seatTextPx, launchText(e.label, 29), tok.Ink)
 			seatText(c, row, x+6, y+13, seatSmallPx, launchText(e.detail, 29), tok.Muted)
 			continue
