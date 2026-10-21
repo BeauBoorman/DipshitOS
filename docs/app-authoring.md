@@ -151,9 +151,9 @@ Run the builder before a live gate:
 bash tools/go/build-myapp.sh
 ```
 
-The guest has no libc or POSIX. Prefer the `virelai/vi`, `virelai/tabapp`,
-`virelai/appkit`, and `virelai/widgets` packages already in this tree over
-host-only standard-library assumptions.
+The guest has no libc or POSIX. Prefer the in-tree packages under
+[`user/go`](../user/go) — vi, tabapp, appkit, widgets — over host-only
+standard-library assumptions.
 
 ## 5. Add one declarative gate
 
@@ -228,7 +228,12 @@ the comment header at the top of `image/apps.txt`):
   vocabulary is `file window audio timer memory process debug net term`, the
   WASM import contract's Cap names.
 - `opens=` names what the app can be handed: an M81b mime type (`text image
-  audio archive binary`) or a URL scheme (`http https`).
+  audio archive binary document`), a URL scheme (`http https`), or an
+  M124a subtype spelling — text/plain, image/png — where a bare family
+  word takes any subtype on the drag hit-test and a subtype spelling
+  takes only itself (chapter 18). A fourth trailing key,
+  `selection=primary`, opts the app into the seat's primary selection
+  (chapter 22).
 - Every launcher-visible row must open a window (M122c, #2572): a bare
   launch that can only print usage to the serial console dies silently —
   `TestManifestHonestyRowsOpenAWindowOrAreSeatBound` fails the row. A
@@ -310,9 +315,10 @@ only).
 
 Adding the row is how you claim the chord. `chords.Table.Validate()` refuses
 two owners of one chord at one dispatch point with the named
-`ErrChordConflict` sentence, so a conflict fails `go test ./chords/...` and
-the seat's fail-closed prologue (the deliberate fixture is seeded through
-`/host/GOTABWM.CHORDCONFLICT` and refused) rather than surprising a person.
+`ErrChordConflict` sentence, so a conflict fails the `user/go/chords` host
+tests and trips the seat's fail-closed prologue (the deliberate fixture is
+seeded through `/host/GOTABWM.CHORDCONFLICT` and refused) rather than
+surprising a person.
 GOSET's shortcuts view (its own registered chord, `ctrl+shift+h`) renders the
 whole table — look there before you claim anything. The seam is pinned by
 [`go-wm-hid`](../tools/gate/specs/go-wm-hid.spec) (the registry walk, the
@@ -428,7 +434,7 @@ FLINT.ELF push --remote=<host>:4748 --stream=main
 ```
 
 `push` creates the stream on the remote when needed and sends the unsent
-suffix of the raw Change log; it writes `REMOTE.json` so later rounds
+suffix of the raw Change log; it writes `<ws>/REMOTE.json` so later rounds
 are a bare `flint push`. On the host, against the served store:
 
 ```sh
@@ -436,7 +442,7 @@ flint verify --all --store <store-dir>
 ```
 
 Each pushed line lands verbatim, so a byte-compare of the last line of
-the guest's `FLINT/streams/<id>.jsonl` against the server's
+the guest's `/host/FLINT/streams/<id>.jsonl` against the server's
 `streams/<id>.jsonl` plus `flint verify` proves the signature chain end
 to end.
 
@@ -460,7 +466,7 @@ verified byte-for-byte and cryptographically on the host — is pinned by
 [`live-godiff-loop`](../tools/gate/specs/live-godiff-loop.spec).
 
 Two share-transport facts matter for `flint push` specifically: FLINT's
-store index resolves `--stream=<name>` by listing `FLINT/streams/`, and
+store index resolves `--stream=<name>` by listing `/host/FLINT/streams/`, and
 the legacy cv channel's frozen directory rows truncate names at 31
 bytes — a `<uuid>.json` record is 41, so on a cv-only share the push
 refuses `stream_missing`. Mount the share with `--virtio-fs` (the paged
@@ -471,3 +477,607 @@ Before opening a PR, run the focused host tests, the app's class-B gate,
 `bash tools/status/verify-issue-coordination.sh`, and the relevant portable
 checks. The canonical gate policy is in [`docs/testing.md`](testing.md); the
 canonical milestone state is in [`docs/status.md`](status.md).
+
+## 13. The `?` overlay: chord hints (M121c, #2566)
+
+A user who presses `?` in a hints-aware app gets a modal plate listing
+every chord that answers while the app is focused — the app's own scope
+first, then the seat scopes the caller names — rendered out of the live
+registry, never a hard-coded sheet. `appkit.ChordHints`
+([`user/go/appkit/hints.go`](../user/go/appkit/hints.go)) is the same
+shape as the file picker: a pure state machine with `Draw` for canvas
+apps and `Lines` for VT grids. The registry is the chapter-9 table, so an
+app that declared its chords honestly gets its help plate for free.
+
+GOEDIT's arm is the whole contract — a plain `?` in the edit modes, while
+the find bar keeps `?` as a literal
+([`user/go/edit/main.go:987`](../user/go/edit/main.go)):
+
+```go
+if (e.mode == modeEdit || e.mode == modeDiags) && ev.Arg1 == '?' &&
+    ev.Flags&(modCtrl|vi.ModAlt) == 0 {
+    e.hints = appkit.NewChordHints(appName)
+    e.mode = modeHints
+    e.hintsEmit = 1
+    return true
+}
+```
+
+`NewChordHints` takes the binary name so the app scope resolves against
+the registry, and the emitted receipt (`goedit: hints n=40`) is the row
+count on the painted frame. Open the overlay as a mode — modals own the
+keyboard while they stand — not as a floating widget beside the app's
+own input. The seam is pinned by
+[`go-dogfood`](../tools/gate/specs/go-dogfood.spec) boot 09: the M121f
+acceptance drives `?`, dumps the `hints row` lines, and asserts the plate
+in pixels.
+
+Bounds: rows are read at open, so a chord the app handles outside the
+registry never appears on its own plate; and a VT app renders `Lines`
+itself (GOFILES's truecolour grid, GOTERM's alternate screen).
+
+## 14. Undo is a seat chord (M121e, #2568)
+
+Plain `ctrl+z` belongs to the seat, not the app. The registry's seat row
+routes it to the focused tab, the KEY_DOWN arrives unchanged (ADR 0009),
+and `TabApp.Dispatch` classifies it as `ActionUndo` — consumed, never
+delivered to the app's own key handling. The app answers through one hook
+([`user/go/tabapp/tabapp.go:70`](../user/go/tabapp/tabapp.go)):
+
+```go
+// M121e (#2568): the undo hook. The seat's ctrl+z chord routes to the
+// focused tab, whose own KEY_DOWN arrives here unchanged (ADR 0009) —
+// Dispatch classifies it as ActionUndo and the app's loop calls Undo(),
+// which runs this hook. A nil hook is the documented no-op default:
+// the chord is still consumed, nothing is reverted. True means the
+// hook ran an undo step — the caller repaints on it.
+HandleUndo func() bool
+```
+
+GOEDIT wires its buffer's op ring
+([`user/go/edit/main.go:685`](../user/go/edit/main.go)):
+
+```go
+HandleUndo: func() bool {
+    e.undo()
+    return true
+},
+```
+
+Return true only when a step was reverted — the loop repaints on it. A
+nil hook is the documented no-op: the chord is still consumed, so never
+shadow it with a second in-app binding. Shifted spellings are not the
+seat chord — `ctrl-shift-z` stays the app's own redo. The seam is pinned
+by [`go-edit`](../tools/gate/specs/go-edit.spec) run 05 (`goedit: undo
+n=` three deep, `undo none` at the floor, the post-undo buffer verified
+on the host) and by [`go-dogfood`](../tools/gate/specs/go-dogfood.spec)
+boot 09 (`gotabwm: undo id=` routes, the buffer answers `undo n=0`).
+
+## 15. Empty surfaces are a widget (M123b, #2576)
+
+A zero-content surface is still a surface. `widgets.EmptyState`
+([`user/go/widgets/empty.go`](../user/go/widgets/empty.go)) is the shared
+presenter: a Surface plate ringed in Border carrying an optional icon
+row, a headline, and chord-hint lines, centred in the rect the content
+would have filled. GOFILES's empty list, WEB's start viewport, GOEDIT's
+empty buffer, and the launcher's zero-match all run the same model, so a
+user never meets a bare rect.
+
+Canvas apps `Draw` it; a VT surface renders the same content through
+`Lines` — GOFILES's row model is the text half
+([`user/go/files/render.go:364`](../user/go/files/render.go)):
+
+```go
+func (m model) emptyListRows(w, body int) []string {
+    return widgets.EmptyState{
+        Icon:     "Ø",
+        Headline: "This folder is empty",
+        Hints:    []string{"p paste · backspace up", "v volumes · q quit"},
+    }.Lines(w, body)
+}
+```
+
+The hints should name chords that still answer on the empty surface —
+paste, climb, quit — not ones that need a selection. The seam is pinned
+by [`go-dogfood`](../tools/gate/specs/go-dogfood.spec): its per-boot
+refusal-pairing audit counts a `: empty` plate as a named non-failure
+surface and fails a boot whose only evidence of a refusal is on the
+serial.
+
+## 16. Progress the user can cancel (M123c, #2577)
+
+`appkit.Progress` ([`user/go/appkit/progress.go`](../user/go/appkit/progress.go))
+is a pure determinate-or-indeterminate bar: `Set`/`Advance`/`Tick`
+mutate, `Draw` paints through the canvas contract, and `Phase` steps the
+sweep once per repaint cadence. Its `Op` field is the seat half: a
+nonzero op posts the bar's state to a notifications-center row over
+WM_RPC kind 22, and the user's Cancel comes back on
+`vi.PollProgressCancel` — poll it once per loop pass and route the
+returned op to the matching bar, which is why the op is the app's own
+handle rather than a widget index.
+
+WEB's download is the forcing adopter
+([`user/go/browser/downloads.go:177`](../user/go/browser/downloads.go)):
+
+```go
+d.prog = appkit.NewProgress(widgets.Rect{}, len(body))
+d.prog.Op = downloadOp
+d.prog.Label = name
+d.prog.ShowValue = true
+```
+
+— and its loop posts `vi.NotifyProgress` when the percent crosses a
+tenth (`:295`). A zero `Op` is the widget-only bar that never reaches
+the seat: legal, silent. The end-to-end wire — bound window, report,
+Cancel, the app's kind-23 receipt — is driven by GOPROGRESS.ELF
+([`user/go/goprogress/main.go`](../user/go/goprogress/main.go)) and
+pinned by [`go-wm-seat`](../tools/gate/specs/go-wm-seat.spec) run 16.
+
+## 17. Fail inside the frame: the error banner (M123d, #2578)
+
+The in-app counterpart of the seat's refusal toast. `appkit.ErrorBanner`
+([`user/go/appkit/banner.go`](../user/go/appkit/banner.go)) is a
+non-modal strip the app's own frame paints — the failure text, a Copy
+Error button, and contextual action buttons (Replace and Cancel for a
+rename conflict) — stealing keys and clicks only while open and never
+drawing outside its rect. The state machine is pure:
+`HandleKey`/`HandleMouse` set `Choice` and the app acts on the result;
+VT apps drive the same machine through `Activate`/`Dismiss`/`Cycle` and
+render `Line(cols)` — GOFILES maps its keys onto it exactly so.
+
+The banner never syscalls: Copy Error hands back a `BannerCopy` choice
+and the app runs its own clipboard seam — GOFILES's resolution is the
+shape ([`user/go/files/state.go:1136`](../user/go/files/state.go)):
+
+```go
+case choice == appkit.BannerCopy:
+    n, rc := vsys.ClipboardSetTyped(vsys.ClipText, []byte(m.banner.Text))
+```
+
+An action choice is an app vocabulary word (`replace`, `cancel`), not a
+banner enum: the banner reports, the app decides. The seam is pinned by
+[`go-dogfood`](../tools/gate/specs/go-dogfood.spec) — the same per-boot
+audit counts `<app>: banner` and `<app>: banner act` as the honest
+surfaces a serial-only refusal must not substitute for.
+
+## 18. Drag a payload between apps (M124a, #2580)
+
+A real pointer drag — press, held move, release over another tab — moves
+bytes between apps through the seat. Three hooks on `tabapp.Config`
+([`user/go/tabapp/tabapp.go:57`](../user/go/tabapp/tabapp.go)):
+
+```go
+DragSource func() (mime string, blob []byte, ok bool)
+DropTarget func(offer DragOffer)
+DragEnd    func(delivered bool, peer uint32)
+```
+
+The source arm: the gesture calls `ta.BeginDrag()`, the seat asks
+`DragSource` for the (mime, blob) pair, stages the blob at the window's
+rendezvous path, and posts kind-24 with the mime in the frame title.
+From there the seat owns the ghost, the hit-test, and the `opens=`
+admission — the target's manifest row is the gate, so a drop lands only
+where the mime is acceptable. `DropTarget` receives a `DragOffer`: the
+agreed mime, the source window id, and the payload consumed from the
+target's own rendezvous path — a nil `Blob` is a transport failure the
+app is told about, never a silently-empty payload. `DragEnd` is the
+source's outcome notice (`delivered=true` with the peer, or false on a
+cancel); `ta.CancelDrag()` is the app-side Esc. Service the asynchronous
+frames with `ta.PollDrag()` once per loop pass, the same discipline as
+`PollStateAsk`.
+
+The honesty rule is the clipboard's: the declared mime must describe the
+bytes. GOFILES's `fileMime`
+([`user/go/files/drag.go:60`](../user/go/files/drag.go)) names a row by
+its sniffed family refined to the subtype the in-tree decoders read, and
+unknown bytes answer application/octet-stream.
+
+The seam is pinned by [`go-drag`](../tools/gate/specs/go-drag.spec) —
+GOFILES drags a file onto GOEDIT (text/plain splice) and GOVIEW
+(image/png decode) through the live seat — and by
+[`go-dogfood`](../tools/gate/specs/go-dogfood.spec), whose boot leg arms
+a drag with a real press+move and asserts `"goedit: drop text/plain"`
+plus the source's `gofiles: drag end delivered` receipt.
+
+## 19. One file picker for every app (M124b, #2581)
+
+No app grows its own path prompt. `appkit.FilePicker`
+([`user/go/appkit/filepicker.go`](../user/go/appkit/filepicker.go)) is
+the shared modal: one state machine covering open and save (`PickOpen`
+and `PickSave` — the same list, a different verb and `Result` meaning),
+painted with `Draw` on a canvas or driven through its own renderer on a
+text surface.
+
+`NewFilePicker` clamps the start dir onto the share root when it is
+empty or off-share (`:101`):
+
+```go
+func NewFilePicker(kind PickerKind, dir string) FilePicker {
+```
+
+The listing is three things in one scroll: the current directory (a `..`
+climb row, subdirectories, files), the vi recent log's newest distinct
+paths, and /host/TRASH's pending items — Enter on a trash row restores
+it in place rather than picking it, and `PickerRow.Kind` names which
+activation a row takes. `Tab` walks focus from the list across the
+buttons so the keyboard reaches Cancel; `Activate` descends a directory,
+picks a file, restores a trashed path, or takes the typed `Input`
+resolved against `Dir`.
+
+Adopters: GOEDIT and WEB `Draw` it
+([`user/go/edit/main.go:1224`](../user/go/edit/main.go),
+[`user/go/browser/saveas.go:33`](../user/go/browser/saveas.go)), GOSHEET
+imports and exports through it
+([`user/go/gosheet/main.go:480`](../user/go/gosheet/main.go)), GOREADER
+saves a byte copy through it
+([`user/go/goreader/main.go:595`](../user/go/goreader/main.go)), and
+GOFILES's pick mode runs the same model over the bound tty —
+`exec GOFILES.ELF pick [dir]` paints the rows as ANSI and prints
+`gofiles: picked <path>` on the serial
+([`user/go/files/pick.go:1`](../user/go/files/pick.go)).
+
+The seam is pinned by [`go-fileman`](../tools/gate/specs/go-fileman.spec)
+run 09 (the pick-mode directory leg),
+[`go-reader`](../tools/gate/specs/go-reader.spec) (a document saved
+through the picker), and [`go-dogfood`](../tools/gate/specs/go-dogfood.spec)
+(a typed save name resolved against the picker's cwd, then reopened).
+
+## 20. The clipboard is typed (M124c, #2582)
+
+The kernel clipboard is still one raw byte buffer — the type is a
+reading of the bytes, not an envelope field. `vsys`
+([`user/go/vsys/cliptype.go`](../user/go/vsys/cliptype.go)) classifies on
+both paths: `ClipboardClassify` derives what a body IS (magic for
+images, shape for the text types, octet-stream for the unnameable), and
+`ClipboardSetTyped` takes the writer's DECLARED mime and refuses it when
+the bytes cannot be that thing — the same rule the drag arm pins, so a
+label and the delivered bytes can never describe different things:
+
+```go
+func ClipboardSetTyped(mime string, blob []byte) (int, int64)
+func ClipboardGetTyped(buf []byte) (mime string, n int, rc int64)
+```
+
+A reader never sees the declaration; it sees the classification of the
+bytes, so a legacy reader (the kernel paste chords, slot 39) still gets
+the blob undisturbed. The vocabulary is `ClipText`, `ClipURIList`,
+`ClipHTML`, `ClipCSV` (chapter 24), `ClipPNG`, `ClipQOI`, `ClipGIF`,
+`ClipJPEG`, `ClipBMP`, and `ClipOctet` — the honest "we cannot name
+it", never a label to reach for. Bounds are the wire's own: the blob is
+the kernel buffer's 512 bytes and a spelling is `ClipMimeMax` = 24, the
+WM_RPC title budget. Writing needs the clipboard capability — a gate
+leg's `exec -u0` is the capable path — and a refused Set is an honest
+negative rc, never a partial write.
+
+Writers: GOSHEET copies its used box as text/csv
+([`user/go/gosheet/main.go:324`](../user/go/gosheet/main.go)), GOVIEW
+declares the decoded format's image mime
+([`user/go/view/main.go:557`](../user/go/view/main.go)), GOFILES's batch
+copy stages a uri-list
+([`user/go/files/batch.go:387`](../user/go/files/batch.go)), and the
+Copy Error arms in WEB and GOFILES declare text/plain. The seam is
+pinned by [`go-dogfood`](../tools/gate/specs/go-dogfood.spec) (a
+`gview: copy mime=image/png` receipt read back through `clip`),
+[`go-sheet`](../tools/gate/specs/go-sheet.spec) runs 03/05 (a csv
+round-trip; `clip-too-large` refuses an over-bound copy), and
+[`live-host-clipboard`](../tools/gate/specs/live-host-clipboard.spec)
+(the host negotiation leg).
+
+## 21. Open With: the registry is the menu (M124d, #2583)
+
+`mime.Open` was already the shared "open this" decision — magic, then
+extension, then the text heuristic. The registry half —
+`Register`/`Handlers`/`Default` in
+[`user/go/mime/mime.go:261`](../user/go/mime/mime.go) — is data: the
+first registration for a type is the default `Open` dispatches to, and
+the rest are the candidates a menu lists:
+
+```go
+func init() {
+    Register(Image, "GOVIEW.ELF", "Image Viewer")
+    Register(Text, "GOEDIT.ELF", "Code Editor")
+    Register(Image, "GOEDIT.ELF", "Code Editor (raw bytes)")
+    Register(Audio, "GOSOUND.ELF", "Sound Player")
+    Register(Document, "GOREADER.ELF", "Reader")
+    Register(Text, "GOSHEET.ELF", "Sheet")
+    Register(Image, "GOPAINT.ELF", "Paint")
+}
+```
+
+An app joins the table by declaring `opens=` on its manifest row
+(chapter 7) and registering at init — the M132b wave reserved GOREADER
+for Document, GOSHEET as a second Text candidate, and GOPAINT as a third
+Image one, and order matters because the first registration stays the
+default. The eligibility rule is one function both sides run: GOFILES's
+context menu matches the file's `fileMime` spelling against manifest
+`opens=` rows through `opensAccepts`
+([`user/go/files/manifest.go:147`](../user/go/files/manifest.go)) — the
+same rule the seat's drop admission runs — so "Open With…"
+([`user/go/files/context.go:1`](../user/go/files/context.go)) can never
+offer an app the seat would refuse to deliver to. A bare family word
+takes any subtype; a subtype spelling takes only itself. `Register` is
+a no-op for a repeated binary, so init cannot double-list itself.
+
+The seam is pinned by [`go-fileman`](../tools/gate/specs/go-fileman.spec)
+— a right-press descends "Open With…" and launches GOEDIT, with the
+`gofiles: open with PIC.QOI type=image candidates=3` marker naming the
+candidate count — and by [`go-selftest`](../tools/gate/specs/go-selftest.spec)
+(the `mime` receipt pins the table and the default on the share).
+
+## 22. The primary selection (M124e, #2584)
+
+A second, gesture clipboard: select text and it is published;
+middle-click or shift+insert pastes it — no copy chord. Opt-in is a
+manifest word, `selection=primary` on the app's row — a real gate: no
+word, no publish, no delivery (GOEDIT and GOTERM carry it in
+[`image/apps.txt`](../image/apps.txt)).
+
+The sink is one hook on `tabapp.Config`
+([`user/go/tabapp/tabapp.go:68`](../user/go/tabapp/tabapp.go)): the seat
+stages the buffer at the window's rendezvous path and pushes a kind-28
+notice; `ta.PollSelPaste()` once per loop pass consumes it and calls
+`SelPaste` with the bytes — nil when the staged envelope was absent, a
+transport failure the app is told about rather than a silently-empty
+paste. The pull half is `ta.RequestSelPaste()`, an app's own chord
+spelling of the paste gesture: `ok=false` is the honest no-paste —
+empty buffer, no cap, or a transport refusal, all the same answer.
+GOVAULT's password arm wraps the pull with one retry against the lossy
+ring ([`user/go/govault/main.go:415`](../user/go/govault/main.go)).
+
+The seam is pinned by [`go-dogfood`](../tools/gate/specs/go-dogfood.spec)
+run 08 — publish, then a middle-click inside GOTERM's pane, receipted
+`gotabwm: sel paste id=` — and a cap-less app never gets a delivery: the
+seat refuses before the notice is posted.
+
+## 23. Save state: the seat asks, the app answers (M125, #2586)
+
+A snapshot or a close does not lose the app. Three hooks and a version
+tag on `tabapp.Config`
+([`user/go/tabapp/tabapp.go:31`](../user/go/tabapp/tabapp.go)): the app
+owns the serialized format, the seat owns the lifecycle. `SaveState`
+runs whenever the seat asks (a snapshot, a tab close); its bytes — at
+most `AppStateMax` = 64 KiB — are staged at `/host/APPSTATE.<win>` and
+stored verbatim. `RestoreState` runs inside `tabapp.Init` when the seat
+held a blob for this tab — before the app draws, so a re-exec lands in
+the same boot slice. `StateVersion` tags every saved envelope so a stale
+serialization is refused by the app's own check, never silently misread.
+
+GOFILES's wiring is the shape
+([`user/go/files/main.go:196`](../user/go/files/main.go)):
+
+```go
+StateVersion: stateFmtVer,
+SaveState:    func() []byte { return m.encodeState() },
+RestoreState: func(b []byte) {
+    restored, restoredOK = decodeState(b)
+},
+```
+
+`SaveState` closes over the live model so an ask always serializes the
+current session; `RestoreState` only decodes — the apply lands once the
+first listing exists, and `ta.RestoredVersion` is the app's own check
+against its format tag.
+
+The ask/answer is asynchronous like every seat notice:
+`ta.PollStateAsk()` once per loop pass answers a waiting ask — staging
+`SaveState()` through the rendezvous file and posting the kind-20
+request — and an app with no hook still answers, an empty blob is "no
+state", and the seat's bounded collect drains deterministically instead
+of burning its ask budget on silence. `ta.SaveStateNow()` is the
+unsolicited push for when the app's own state moved. The wire itself —
+envelope, rendezvous, refusals — is
+[`user/go/vi/wmstate.go`](../user/go/vi/wmstate.go): `EncodeAppState`
+refuses an over-bound blob, `DecodeAppState` refuses a short or
+mismatched envelope.
+
+The seam is pinned by [`go-fileman`](../tools/gate/specs/go-fileman.spec)
+(`gofiles: state save`/`state restore`/`state refused` across a session
+kill), [`go-wm-journey`](../tools/gate/specs/go-wm-journey.spec) (a
+snapshot, a hard kill, `session reexec` with the panes and spaces
+intact), and [`live-session-persistence`](../tools/gate/specs/live-session-persistence.spec).
+
+## 24. Documents are their own mime (M132b, #2753)
+
+`mime.Document` joins the type table in
+[`user/go/mime/mime.go:44`](../user/go/mime/mime.go) — PDF today — so a
+reader app claims `opens=document` without pretending the bytes are
+text. Magic beats the name here too: %PDF- at offset 0. The manifest row
+is the reservation —
+`GOREADER.ELF | Reader | d | dock=false | v=2 | caps=file,window | opens=document`
+in [`image/apps.txt:54`](../image/apps.txt) — and
+`Register(Document, "GOREADER.ELF", "Reader")` keeps dispatch's default
+(`:610`).
+
+The same card extended the clipboard vocabulary: `ClipCSV` is a
+text/plain refinement — the same UTF-8 shape rule with a name a sheet
+declares honestly ([`user/go/vsys/cliptype.go:33`](../user/go/vsys/cliptype.go)).
+GOSHEET's copy arm declares it
+([`user/go/gosheet/main.go:324`](../user/go/gosheet/main.go)) and its
+paste arm reads the classified mime (`:339`), so csv between apps is
+typed bytes on the chapter-20 wire, not a convention.
+
+The seam is pinned by [`go-reader`](../tools/gate/specs/go-reader.spec) —
+three chains route a PDF to the handler: WEB downloads it as
+`type=document` rather than navigating, GOFILES opens
+`DOC.PDF type=document handler=GOREADER.ELF`, and the completion plate
+dispatches `mime.Open` — and by
+[`go-sheet`](../tools/gate/specs/go-sheet.spec) run 03 (the text/csv
+lane read back through `clip`).
+
+## 25. Mounts and mtime are real rows (M134a/b, #2759/#2760)
+
+`/host`, `/disk`, and `/usbN` are rows in one kernel mount table
+([`kernel/src/mount_table.zig`](../kernel/src/mount_table.zig)), not
+ad-hoc prefixes. `sys_dir_list("/")` enumerates it — one `DirEntry` per
+row, the Reserved triple carrying state, kind, and flags — so
+`vi.Mounts()` ([`user/go/vi/mounts.go:114`](../user/go/vi/mounts.go))
+hands the app every volume's name, live state, kind, and read-only flag
+in one call, and `vi.MountNamed` resolves a single row:
+
+```go
+// Mount kinds, as they ride DirEntry.Reserved[1].
+const (
+    MountKindShare uint8 = 1 // /host — the --cvc-file share
+    MountKindVLFS  uint8 = 2 // /disk — the opt-in VLFS data volume
+    MountKindBlock uint8 = 3 // /usb  — the raw MSC device, a byte stream
+    MountKindFAT32 uint8 = 4 // /usbN — MBR partition N's FAT32 volume
+)
+```
+
+A path resolved onto a not-mounted row answers ENXIO; `vi.ErrNotMounted`
+names it and `vi.MountErr`/`vi.IsNotMounted` map the raw errno.
+
+The mtime half is the slot-79 stat: fs_metadata op 0 writes the 96-byte
+`metadata.Wire` with `WireTime` at offsets 48 and 56 — seconds, then
+nanoseconds — on either file channel. GOFILES's seam is the compiled
+adopter ([`user/go/files/meta_guest.go:41`](../user/go/files/meta_guest.go)):
+`fileMtime` roots at /host, walks the share-relative rest, and reads
+`ok=false` as "the kernel could not report one" — a non-/host path, a
+refused path, or the channel's honest zero — never an invented stamp;
+the QuickLook card prints "—"
+([`user/go/files/quick.go:144`](../user/go/files/quick.go)).
+
+The seam is pinned by [`live-fs`](../tools/gate/specs/live-fs.spec): the
+m134d leg enumerates the table (`m134d-mount host mounted share rw`,
+`usb not_mounted block ro`), names the refusal
+(`vf ls: disk:/: not_mounted`), and asserts a pinned mtime through both
+channels (`m134d-stat rc=0 mtime_sec=1700000123`).
+
+## 26. Split panes are seat-owned geometry (M137a, #2771)
+
+A split is not an app feature — it is the seat's tree. GOTABWM's pane
+tree ([`user/go/gotabwm/split.go`](../user/go/gotabwm/split.go)) pushes
+every placed leaf's rect through the kernel's `wm_apply_rect` seam, so
+each pane arrives at the app as a real WIN_RESIZE, not a paint-only
+fake:
+
+```go
+func applyTreeRects() bool {
+    panes := tabs.PaneRectsAll(uint32(vi.ScanoutWidth), uint32(vi.ScanoutHeight))
+    for _, p := range panes {
+        if !applyRect(p.id, p.rect) {
+            return false
+        }
+    }
+    return true
+}
+```
+
+The app contract is therefore the chapter-1 one: `Dispatch` returns
+`ActionResized` after re-viewing the bound surface at the new stride
+([`user/go/tabapp/tabapp.go:326`](../user/go/tabapp/tabapp.go)) and the
+app's draw runs at the new canvas. An unplaced tab's window is never
+touched — it keeps the full-viewport stack. Bounds are the seat's: at
+most `MaxPanes` = 8 leaves, nested splits at most `MaxTreeDepth` = 3
+deep ([`user/go/gotabwm/tree.go:26`](../user/go/gotabwm/tree.go)), and
+the tree persists through the `SESSION.PANES` sidecar.
+
+Do not grow a second pane model inside the app to mirror the seat's,
+and do not read pane geometry off the serial markers — `gotabwm: split
+v`/`split h` are the gate's evidence lines, not an API. The seam is
+pinned by [`go-wm-journey`](../tools/gate/specs/go-wm-journey.spec):
+split v plus split h apply the pane rects (`x=0 y=0 w=640 h=360`,
+`x=0 y=360 w=640 h=360`, `x=640 y=0 w=640 h=720`), `panes write n=2`
+and `panes load n=2` round-trip them through a snapshot, and `panes
+bad` is the named failure.
+
+## 27. The kit's v2 controls: menu bar, tree, table (M137b, #2772)
+
+Three controls, one discipline: a pure model plus a controller that
+implements `Focusable`, so they drop into a `FocusRing` next to lists
+and fields and the app keeps owning its event loop.
+
+- `appkit.MenuBar`
+  ([`user/go/appkit/menubar.go`](../user/go/appkit/menubar.go)): titled
+  menus with `&` mnemonics, each dropping a popover. F10 or a bare Alt
+  engages menu mode; an open menu owns the keyboard until Escape backs
+  out one level. `MenuItem.Action` reports whether app state changed —
+  fired inside the key/click path so the loop's dirty bit repaints.
+- `appkit.TreeController`
+  ([`user/go/appkit/tree.go`](../user/go/appkit/tree.go)): an outline
+  over `widgets.Tree` — lazy children (`Lazy` plus a `Load` producer),
+  expand/collapse, arrow and type-ahead navigation, scroll-into-view.
+  `OnActivate` fires on Enter over a leaf; branches toggle.
+- `appkit.TableController`
+  ([`user/go/appkit/table.go`](../user/go/appkit/table.go)): keyboard
+  cell focus over `widgets.Table` — `Row`/`Col` are the selection, the
+  widget virtualizes rows, and the controller only moves the focus and
+  two scroll offsets, so a sheet-sized model costs nothing per
+  keystroke.
+
+GODEMO ([`user/go/appkit/demo/main.go:139`](../user/go/appkit/demo/main.go))
+is the smallest wired example — a `NewTableController` with an
+`OnActivate` receipt, a `FocusRing` over tree and table, and a `MenuBar`
+whose View menu drives `treeCtl.ExpandAll()`. GOSHEET is the forcing
+consumer at real size ([`user/go/gosheet/main.go:205`](../user/go/gosheet/main.go)):
+a 128×64 `widgets.Table` behind a `TableController`, plus a `MenuBar`
+whose item Actions call the same paths the chords use.
+
+The seam is pinned by [`go-wm-journey`](../tools/gate/specs/go-wm-journey.spec)
+— `godemo: menu expand-all` and `godemo: table activate r=2 c=1` inside
+the seat journey — and by [`go-sheet`](../tools/gate/specs/go-sheet.spec),
+where the table IS the app.
+
+## 28. Spaces: named tab groups (M137c, #2773)
+
+A space is a whole tab strip plus its split-pane tree, named and bounded
+at `MaxSpaces` = 4. One space is live — its strip IS `tabs`, so every
+mutation touches only it; dormant spaces keep their windows running but
+off the composite through the seat's own visibility bit, not kernel
+workspaces (workspace_max is a different axis, and the word on this
+surface is always "space"). The seat side is
+[`user/go/gotabwm/spaces.go`](../user/go/gotabwm/spaces.go).
+
+The app contract: there isn't one. A tab moves spaces wholesale — the
+window keeps running, input follows focus, and nothing about
+`Dispatch`, the surface, or save_state changes. The switch chords are
+seat rows: ctrl+alt+PageDown steps forward and creates the next space at
+the end (the palette's move action is the only other way a space comes
+to exist); ctrl+alt+PageUp clamps at the first. Persistence rides the
+record's 12-byte `group` field, so a v1 session file with no groups
+lands everything on space "1".
+
+What an app must not do: learn the word "workspace" — kernel
+workspace_id is a different axis — react to `gotabwm: space` markers
+(gate evidence, not an API), or assume its tab is on the visible strip
+at paint time. Paint when the loop says so; visibility is the seat's
+bookkeeping. The seam is pinned by
+[`go-wm-journey`](../tools/gate/specs/go-wm-journey.spec): `space new
+name=2`, `space move id= … to=2`, `space switch 1->2` and back, and
+`session spaces n=2` surviving snapshot and restore.
+
+## 29. Agents can drive your window: ui.input (M139b, #2780)
+
+AGENTD's `"ui.input"` verb injects real HID events into the focused
+pane — one key press or absolute pointer sample per WM_RPC kind-29
+frame ([`user/go/vi/wminject.go`](../user/go/vi/wminject.go)),
+dispatched through the same `consumeSeatEvent` path a physical event
+takes. The app's side of the contract is zero code: an injected key
+arrives as an ordinary `EvKeyDown`, a click as ordinary pointer events.
+The same honesty rule as the seat's chords applies — your app's input
+handling IS the agent surface.
+
+The verb takes `{win, events}`
+([`user/go/agentd/verbs.go:565`](../user/go/agentd/verbs.go)): `win` is
+the strip index `"ui.windows"` reports as focused — the verb re-queries
+and the seat re-checks at dispatch, so a race still lands
+`agent_input_no_focus` — and `events` is a bounded batch of at most 64
+flat objects, `{"type":"key","usage":N,"mods":N}` or
+`{"type":"ptr","x":N,"y":N,"buttons":N}`. The whole batch validates
+before the first frame goes out — a malformed event N never causes
+events 1..N-1 to fire — and the first refusal stops it.
+
+Admission is double-gated. The daemon maps `"ui.input"` to the `input`
+grant — distinct from `window`, so an observer that may only read the
+desktop cannot drive it (`:101`) — and the seat ties the request to the
+caller's bound window and requires the bound pid's name to read
+AGENTD.ELF. Refusals answer with their name — `agent_input_denied`,
+`agent_input_no_focus`, `seat_absent`, `seat_unsupported`, `too_large`,
+`bad_request` — because a bare applied=0 would collapse every refusal
+into the same "no".
+
+The seam is pinned by [`go-agentd`](../tools/gate/specs/go-agentd.spec)
+run 15 (`verb=ui.input ok`, the named refusals, and audit receipts
+including `too_large`) and by
+[`live-host-ui`](../tools/gate/specs/live-host-ui.spec) run 10 (an agent
+types and clicks into the focused pane over the host bus).
