@@ -96,6 +96,7 @@ pub const csprng = @import("csprng.zig"); // ISN generation for TCP connect
 pub const clipboard = @import("clipboard.zig"); // Milestone 14 (claim 0169): the shared kernel clipboard
 pub const pipe = @import("pipe.zig"); // M19 P1 (issue #290): the bounded pipe buffer behind slots 56/57
 pub const terminal = @import("terminal.zig"); // #1072 (ADR 0020): the terminal seam + sys_tty_attach
+pub const input = @import("input.zig"); // #3007: slot-65 cmd 23's content-key forward lands on the decode seam's own encoding
 pub const app_timers = @import("app_timers.zig"); // Milestone 14 (claim 7323): the per-process app timer facility
 pub const virtio_snd = @import("virtio_snd.zig"); // Milestone 15 (claim 7636): the virtio-snd playback path behind sys_audio_*
 pub const fbtext = @import("text.zig"); // M20-U1 (claim 5127): sys_font_size's terminal font state
@@ -4927,6 +4928,19 @@ fn handle_wmctl(args: Args, _: *exceptions.VectorFrame) u64 {
             const fwd_x: u32 = @as(u16, @truncate(args[1]));
             const fwd_y: u32 = @truncate(args[1] >> 16);
             driving_award.wm_content_pointer(fwd_x, fwd_y, @truncate(args[2]), @truncate(args[3]));
+            return 0;
+        },
+        wm_server.wmctl_content_key => {
+            // #3007: the registered seat forwards one agent-injected key
+            // press (a1 = HID usage, a2 = the press's ADR 0009 modifier
+            // flags) for the kernel's app-delivery half — kind-21 is a
+            // fan-out, so a seat-synthesized event never produced the
+            // focused owner's KEY_DOWN/KEY_UP pair (or the bound
+            // terminal's bytes) without this echo. Seat-gated like cmd
+            // 15; a press is one down+up pair, no held state.
+            if (!wm_server.registered()) return error_result(.enosys);
+            if (wm_server.registered_pid() != pid) return error_result(.eacces);
+            input.inject_content_key(@truncate(args[1]), @truncate(args[2]));
             return 0;
         },
         wm_server.wmctl_set_window => {

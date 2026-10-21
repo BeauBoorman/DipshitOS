@@ -40,6 +40,13 @@ const (
 	// observable; the fix is that clients now read the kernel's own
 	// register instead of resolving a forgeable process name.
 	WmctlSeatPidCmd uint64 = 16
+	// WmctlContentKeyCmd is slot-65 subcommand 23 (#3007): the registered
+	// seat forwards one agent-injected key press (WM_RPC kind 29 'k',
+	// ADR 0007 R2) into the kernel's app delivery — the KEY_DOWN/KEY_UP
+	// pair a real report's decode pushes to the focused owner (kind-21
+	// WM_KEY is a fan-out, never that path). a1 = HID usage, a2 = the
+	// press's ADR 0009 modifier bits.
+	WmctlContentKeyCmd uint64 = 23
 
 	// M33MapShared is the frozen seam-B flag (ADR 0016, bit 16 of the mmap
 	// flags word): a shared-anonymous mapping. The scanout bind is one.
@@ -114,6 +121,18 @@ func WmctlSeatPid() int64 { return svc1(SlotWmctl, uintptr(WmctlSeatPidCmd)) }
 func WmctlContentPtr(x, y uint32, buttons, mods uint8) int64 {
 	return syscall6(SlotWmctl, uintptr(WmctlContentPtrCmd),
 		uintptr(uint32(x)|(y<<16)), uintptr(buttons), uintptr(mods), 0, 0)
+}
+
+// WmctlContentKey forwards one agent-injected key press for the kernel's
+// app delivery — the kind-1/2 KEY_DOWN/KEY_UP pair decode pushes to the
+// focused owner for a real HID report (or the bound terminal's bytes),
+// which kind-29's seat-side dispatch can never produce on its own
+// (#3007, ADR 0007 R2). `flags` is the press's ADR 0009 modifier word,
+// passed through uninterpreted like WmctlContentPtr's mods. Host-safe:
+// degrades to -ENOSYS off the guest like the rest of the SDK.
+func WmctlContentKey(usage uint8, flags uint16) int64 {
+	return syscall6(SlotWmctl, uintptr(WmctlContentKeyCmd),
+		uintptr(usage), uintptr(flags), 0, 0, 0)
 }
 
 // MmapScanout maps the virtio-gpu framebuffer WRITABLE into the registered

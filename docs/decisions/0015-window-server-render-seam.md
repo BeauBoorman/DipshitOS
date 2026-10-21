@@ -181,6 +181,20 @@ it (the render server already separates policy from blit).
   (`mouseOwnsAt`) and the delivered event flags now use the modifiers held
   AT CAPTURE; a drain-time `kb_mods` read misattributed a concurrent chord
   burst's Shift to an older queued press (go-dogfood boot 08's stolen drag).
+- 2026-10-21 — issue #3007: **additive WMCTL subcommand 23** (seat-gated
+  like every other subcommand; no existing opcode or arg layout changes).
+  `CONTENT_KEY` (`wmctl(cmd=23, usage, flags, 0, 0, 0)`) relays one
+  agent-injected key press (WM_RPC kind 29 `agent_input` 'k', ADR 0007
+  R2) into the kernel's focused-owner delivery — the half
+  `decode_keyboard_report` performs for a real report that the
+  seat-side mirror never could: kind-21 `WM_KEY` is a fan-out, never the
+  path a kind-1 `KEY_DOWN` takes to an app. The kernel resolves the
+  focused window exactly as decode does — a kernel-terminal front-end
+  gets the encoded bytes, any other owner gets the KEY_DOWN/KEY_UP pair
+  with the codepoint in `arg1` and the press's ADR 0009 modifier word in
+  `flags`. A press is one down+up pair; no held-set or compose state is
+  touched. Backs the go-agentd run-15 fix: kind-29 keys applied at the
+  seat but never reached the app, so `goedit: dirty` could not fire.
 
 ## Open issues (left to implementing claims)
 

@@ -1078,6 +1078,64 @@ pub fn decode_keyboard_report(rep: []const u8) void {
     kb_held = keys;
 }
 
+/// #3007 (slot-65 cmd 23, wm_server.wmctl_content_key): the registered
+/// seat forwards one agent-injected key press (WM_RPC kind 29 'k', ADR
+/// 0007 R2) for the kernel's app-delivery half — the part of this decode
+/// the seat-side mirror can never reach. Kind-21 WM_KEY is a fan-out
+/// only, so a synthesized event that enters at consumeSeatEvent runs the
+/// seat's chord/hit-test work but never produces the kind-1/2 pair the
+/// focused app reads; the seat echoes the press here so the app sees
+/// exactly what a real report would have queued. `usage` is the HID
+/// usage, `flags` the press's ADR 0009 modifier bits — the same fields
+/// the wire packs and decode stamps on its pushes.
+///
+/// Delivery mirrors decode's focused-owner route: a kernel-terminal
+/// front-end gets the encoded bytes a real press types, anything else
+/// gets the KEY_DOWN/KEY_UP pair with the codepoint in arg1. A press is
+/// one down+up pair — the wire's 'k' names a press, never a held key, so
+/// no held-set or compose state is touched. The kernel-terminal chrome
+/// chords (scroll/search/copy) stay inside decode: the seat consumed
+/// chrome before it forwards, same contract wm_content_pointer carries.
+/// Dormant with no seat: returns without touching any queue.
+pub fn inject_content_key(usage: u8, flags: u16) void {
+    if (!driving_award.wm_owns_input) return;
+    // EV only — the same hold the sys_wmctl caller already arrives with,
+    // under which wm_content_pointer walks the same window table and
+    // pushes the same queue. Taking WIN here would invert the canonical
+    // order (win < ev) against that held bit.
+    const took = svclock.acquire_missing(svclock.dom_bit(.ev));
+    defer svclock.release_set(took);
+    const owner_pid = driving_award.focused_owner() orelse return;
+    const shift = (flags & app_events.MOD_SHIFT) != 0;
+    const ctrl = (flags & app_events.MOD_CTRL) != 0;
+    const alt = (flags & app_events.MOD_ALT) != 0;
+    if (terminal.windowTerminal(driving_award.focused_window_id())) |tt| {
+        var kout: [max_key_bytes]u8 = undefined;
+        const kn = hid_to_bytes(usage, shift, alt, ctrl, &kout);
+        if (kn > 0) {
+            kb_last_usage = usage;
+            kb_last_byte = kout[kn - 1];
+            _ = tt.pushInput(kout[0..kn]);
+        }
+        return;
+    }
+    const cp: u32 = if (hid_to_codepoint(usage, shift)) |ch| ch else 0;
+    app_events.push(owner_pid, .{
+        .kind = app_events.KEY_DOWN,
+        .flags = flags,
+        .seq = 0,
+        .arg0 = usage,
+        .arg1 = cp,
+    });
+    app_events.push(owner_pid, .{
+        .kind = app_events.KEY_UP,
+        .flags = flags,
+        .seq = 0,
+        .arg0 = usage,
+        .arg1 = cp,
+    });
+}
+
 /// Canonical custom-virtio kind-2 payload only: buttons, LE16 X, LE16 Y.
 /// Native USB has its own explicit decoder, never a length-based fallback.
 pub fn decode_pointer_report(rep: []const u8) void {
@@ -1876,6 +1934,64 @@ test "input: keyboard routing delivers KEY_DOWN and KEY_UP events to focused use
     try std.testing.expectEqual(@as(u32, 'A'), ev2.arg1);
 
     // Clean up window
+    _ = driving_award.user_close(win_id);
+}
+
+test "input: inject_content_key delivers the decode-path pair to the focused owner (#3007)" {
+    app_events.init();
+    driving_award.arm();
+    const res = driving_award.user_open(10, 10, 100, 100, 2);
+    try std.testing.expect(res == .opened);
+    const win_id = res.opened;
+    _ = app_events.pop(2); // Consume WIN_FOCUS
+
+    // Dormant with no registered seat: nothing queued, exactly like
+    // wm_content_pointer's early return.
+    driving_award.wm_owns_input = false;
+    inject_content_key(0x0b, 0);
+    try std.testing.expectEqual(@as(usize, 0), app_events.pending(2));
+
+    // Under a seat the press lands as the pair a real report pushes:
+    // KEY_DOWN then KEY_UP, usage in arg0, codepoint in arg1, mods in
+    // flags.
+    driving_award.wm_owns_input = true;
+    defer driving_award.wm_owns_input = false;
+    inject_content_key(0x0b, app_events.MOD_SHIFT); // 'H'
+    try std.testing.expectEqual(@as(usize, 2), app_events.pending(2));
+    const d = app_events.pop(2).?;
+    try std.testing.expectEqual(app_events.KEY_DOWN, d.kind);
+    try std.testing.expectEqual(app_events.MOD_SHIFT, d.flags);
+    try std.testing.expectEqual(@as(u32, 0x0b), d.arg0);
+    try std.testing.expectEqual(@as(u32, 'H'), d.arg1);
+    const u = app_events.pop(2).?;
+    try std.testing.expectEqual(app_events.KEY_UP, u.kind);
+    try std.testing.expectEqual(app_events.MOD_SHIFT, u.flags);
+    try std.testing.expectEqual(@as(u32, 0x0b), u.arg0);
+    try std.testing.expectEqual(@as(u32, 'H'), u.arg1);
+
+    _ = driving_award.user_close(win_id);
+}
+
+test "input: inject_content_key feeds a window-bound terminal encoded bytes, not app events (#3007)" {
+    app_events.init();
+    driving_award.arm();
+    for (&terminal.terminals) |*tt| tt.reset();
+    const res = driving_award.user_open(10, 10, 100, 100, 2);
+    try std.testing.expect(res == .opened);
+    const win_id = res.opened;
+    _ = app_events.pop(2); // Consume WIN_FOCUS
+    const th = terminal.create(2) orelse return error.TestUnexpectedResult;
+    const tt = terminal.get(th).?;
+    try std.testing.expect(tt.attachWindow(win_id));
+
+    driving_award.wm_owns_input = true;
+    defer driving_award.wm_owns_input = false;
+    inject_content_key(0x0b, 0); // 'h' — the press's bytes, no app event
+    try std.testing.expectEqual(@as(usize, 0), app_events.pending(2));
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), tt.readInput(&buf));
+    try std.testing.expectEqual(@as(u8, 'h'), buf[0]);
+
     _ = driving_award.user_close(win_id);
 }
 

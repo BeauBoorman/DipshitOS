@@ -171,6 +171,18 @@ pub const wmctl_seat_pid: u64 = 16;
 /// gpu3d_broker.zig owns the state machine, this file only names the op
 /// and counts accepted submissions.
 pub const wmctl_gpu3d: u64 = 22;
+/// #3007 (ADR 0015 additive, same changelog line as cmd 15): CONTENT_KEY —
+/// the registered seat forwards one agent-injected key press (WM_RPC
+/// kind 29 'k', ADR 0007 R2) into the kernel's app delivery — the half
+/// a real report's keyboard decode does that the seat-side
+/// consumeSeatEvent mirror never could: kind-21 WM_KEY is a fan-out,
+/// never the path a kind-1 KEY_DOWN takes to a focused app. a1 = HID
+/// usage, a2 = the press's ADR 0009 modifier bits (the kind-21 event's
+/// flags). The kernel resolves the focused window exactly as decode
+/// does — kernel-terminal front-end gets the encoded bytes, any other
+/// owner gets the KEY_DOWN/KEY_UP pair. Seat-gated like every other
+/// subcommand; no existing opcode or arg layout changes.
+pub const wmctl_content_key: u64 = 23;
 /// OVERVIEW actions (a0).
 pub const overview_enter_action: u64 = 0;
 pub const overview_exit_action: u64 = 1;

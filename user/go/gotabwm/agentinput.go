@@ -67,6 +67,15 @@ const (
 // recorder off-guest, the writeHostFile pattern).
 var agentIpcSend = vi.IpcSend
 
+// forwardContentKey is the app-delivery half a real HID report's kernel
+// decode performs before the kind-21 mirror ever reaches the seat: the
+// focused owner's KEY_DOWN/KEY_UP pair (or the bound terminal's bytes).
+// Kind-21 is a fan-out only — a seat-synthesized event has no way into
+// an app's queue without this echo, which is the slot-65 cmd-23 sibling
+// of hid.go's forwardContentPointer. The indirection lets host tests
+// observe the forward.
+var forwardContentKey = vi.WmctlContentKey
+
 var agentProcName = func(pid uint32) (name string, ok bool) {
 	var rows [64]vi.ProcRow
 	n, r := vi.Procs(rows[:])
@@ -138,6 +147,14 @@ func serveAgentInput(req vi.WmRpc, auth uint64) {
 		vi.ConsoleLine(MarkerAgentInputNoFocus)
 		agentInputAck(req, auth, false, agentRefuseNoFocus)
 		return
+	}
+	// A real report's decode pushes KEY_DOWN to the focused owner BEFORE
+	// the kind-21 mirror reaches the seat, so the app half goes first:
+	// an injected chord that moves focus must not re-route the press the
+	// old pane already owns. Pointer samples stay on the kernel's own
+	// forward inside the dispatch path (WmctlContentPtr, #1688).
+	if e.Kind == vi.EvWmKey {
+		forwardContentKey(uint8(e.Arg0), e.Flags)
 	}
 	// The event enters at the same seam a real WM_KEY/WM_POINTER takes:
 	// consumeSeatEvent marks, hit-tests, dispatches chords, and forwards

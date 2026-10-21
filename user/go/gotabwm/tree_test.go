@@ -377,3 +377,50 @@ func TestAgentInputDeliversChord(t *testing.T) {
 		t.Fatalf("pane-focus landed on %v want [1]", *indices)
 	}
 }
+
+// TestAgentInputForwardsContentKey covers #3007's missing half: a
+// kind-29 'k' event must reach the focused app too, not only the seat's
+// chord dispatch — kind-21 is a fan-out, so the seat echoes the press
+// through WmctlContentKey before consumeSeatEvent runs.
+func TestAgentInputForwardsContentKey(t *testing.T) {
+	defer saveSeatState()()
+	openTwoTabs(t)
+	savedName := agentProcName
+	t.Cleanup(func() { agentProcName = savedName })
+	agentProcName = func(pid uint32) (string, bool) {
+		return "AGENTD.ELF", true
+	}
+	savedSend := agentIpcSend
+	t.Cleanup(func() { agentIpcSend = savedSend })
+	agentIpcSend = func(pid uint32, b []byte) int64 { return int64(len(b)) }
+	type fwd struct {
+		usage uint8
+		flags uint16
+	}
+	var got []fwd
+	savedFwd := forwardContentKey
+	t.Cleanup(func() { forwardContentKey = savedFwd })
+	forwardContentKey = func(usage uint8, flags uint16) int64 {
+		got = append(got, fwd{usage, flags})
+		return 0
+	}
+	var req vi.WmRpc
+	req.Kind = wmKindAgentInput
+	req.ID = 11
+	req.ReplyTo = 42
+	req.Title[0] = agentEvKey
+	req.Title[1] = byte(vi.ModShift)
+	req.Title[2] = 0x0b // 'h'
+	serveAgentInput(req, 0)
+	if len(got) != 1 || got[0].usage != 0x0b || got[0].flags != vi.ModShift {
+		t.Fatalf("content-key forwards = %v want [{0x0b ModShift}]", got)
+	}
+	// A pointer event never rides the key forward.
+	req.Title[0] = agentEvPtr
+	req.Title[2] = 100
+	req.Title[4] = 100
+	serveAgentInput(req, 0)
+	if len(got) != 1 {
+		t.Fatalf("ptr event forwarded %d key presses want 0", len(got)-1)
+	}
+}
