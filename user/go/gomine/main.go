@@ -36,6 +36,7 @@ const (
 	markerFlag     = "gomine: flag "
 	markerChord    = "gomine: chord "
 	markerWin      = "gomine: win "
+	markerBest     = "gomine: best "
 	markerNotify   = "gomine: notify "
 	markerSaved    = "gomine: state saved len="
 	markerRestored = "gomine: state restored "
@@ -43,7 +44,7 @@ const (
 	markerOK       = "gomine OK"
 	markerOpenErr  = "gomine: error open "
 
-	saveVersion = 1
+	saveVersion = 2
 )
 
 // Classic minesweeper number colours on the Surface plate.
@@ -165,7 +166,13 @@ func main() {
 
 func (a *app) newGame(size int, seed int64) {
 	a.size = size
-	a.board = NewBoard(size, seed)
+	nb := NewBoard(size, seed)
+	// The best-times record is session state, not board state: it
+	// survives a fresh deal the same way it survives a restore.
+	if a.board != nil {
+		nb.best = a.board.best
+	}
+	a.board = nb
 	a.startedAt = 0
 	a.now = 0
 	vi.ConsoleLine(markerSeed + vi.Itoa64(seed) + " size=" + a.board.Name)
@@ -341,11 +348,13 @@ func (a *app) doChord(x, y int) bool {
 
 func (a *app) onWin() {
 	vi.ConsoleLine(markerWin + "t=" + vi.Itoa64(a.board.Elapsed()))
+	vi.ConsoleLine(markerBest + a.board.Name + "=" + vi.Itoa64(a.board.Best()))
 	if a.ta.Notify("Mines cleared") {
 		vi.ConsoleLine(markerNotify + "ok")
 	} else {
 		vi.ConsoleLine(markerNotify + "refused")
 	}
+	playWinChime()
 }
 
 // --- save_state ------------------------------------------------------------
@@ -365,6 +374,11 @@ func (a *app) restoreState(blob []byte) {
 	a.now = -1
 	vi.ConsoleLine(markerRestored + "size=" + b.Name +
 		" rev=" + vi.Itoa64(int64(b.RevealedN())))
+	for i, name := range [3]string{"beginner", "intermediate", "expert"} {
+		if v := b.BestAt(i); v > 0 {
+			vi.ConsoleLine(markerBest + name + "=" + vi.Itoa64(v))
+		}
+	}
 }
 
 // --- draw -----------------------------------------------------------------

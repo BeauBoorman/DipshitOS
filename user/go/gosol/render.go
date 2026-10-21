@@ -212,7 +212,7 @@ func (b *board) draw(cvs widgets.Canvas, w, h int) {
 	b.fill(cvs, widgets.Rect{X: 0, Y: h - statusH, W: w, H: statusH}, tok.Surface)
 	b.text(cvs, marginX, h-statusH+3,
 		"seed "+uitoa(b.g.seed)+"  draw-"+itoa(b.g.draw)+
-			"  moves "+itoa(b.g.moves)+"  [n]ew [d]raw [u]ndo", statusCl)
+			"  moves "+itoa(b.g.moves)+"  [n]ew [d]raw [u]ndo [a]uto", statusCl)
 }
 
 // uitoa is itoa's u64 sibling for the seed field.

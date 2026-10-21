@@ -133,6 +133,21 @@ func (b *board) movePtr(x, y int) eff {
 	return eff{}
 }
 
+// auto is the 'a' key's outcome as a pointer-step-shaped eff: one greedy
+// move (game.autoMove picks it), the win edge latched exactly the way the
+// drag path latches it, so a key-won table toasts, scores and chimes
+// identically to a pointer-won one.
+func (b *board) auto() eff {
+	note := b.g.autoMove()
+	if note == "" {
+		return eff{}
+	}
+	e := eff{dirty: true, note: note}
+	e.win = b.g.won && !b.winSent
+	b.winSent = b.winSent || b.g.won
+	return e
+}
+
 // up completes the gesture. A live drag resolves its drop: the destination
 // pile under the pointer is validated through canDrop, a legal drop lands
 // as one move, anything else snaps back with the refusal named. A bare

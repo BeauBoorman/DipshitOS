@@ -42,6 +42,7 @@ const (
 	markerUndo        = "gosol: undo depth="
 	markerDrawMode    = "gosol: draw-mode "
 	markerWin         = "gosol: win moves="
+	markerStats       = "gosol: stats "
 	markerNotify      = "gosol: notify win"
 	markerNotifyNo    = "gosol: notify-refused win"
 	markerStateSave   = "gosol: state save len="
@@ -51,11 +52,14 @@ const (
 )
 
 // app is the running session: the tab shell, the board (game + pointer
-// machine), and the frame counter the close path reports.
+// machine), the frame counter the close path reports, and the deal's
+// clock. startedAt is the vi.Time the current game began (or resumed at
+// restore); the loop's per-pass tick turns it into g.elapsed.
 type app struct {
-	ta       *tabapp.TabApp
-	b        board
-	presents int
+	ta        *tabapp.TabApp
+	b         board
+	presents  int
+	startedAt int64
 }
 
 // parseArgv reads --seed=N and --draw=1|3. An absent seed asks the kernel
@@ -127,7 +131,7 @@ func (a *app) paint() {
 // applyEff is the post-paint barrier for one pointer/key outcome: the
 // frame lands first, then the marker names what the frame shows. A win
 // rides the same barrier — the toast is raised after the table that shows
-// it exists.
+// it exists, the stats line and the chime follow it.
 func (a *app) applyEff(e eff) {
 	if e.dirty {
 		a.paint()
@@ -139,6 +143,8 @@ func (a *app) applyEff(e eff) {
 		} else {
 			vi.ConsoleLine(markerNotifyNo)
 		}
+		vi.ConsoleLine(markerStats + a.b.g.stats.line())
+		playWinChime()
 	}
 	if e.note != "" {
 		vi.ConsoleLine("gosol: " + e.note)
@@ -147,9 +153,21 @@ func (a *app) applyEff(e eff) {
 
 // deal replaces the table and clears the pointer machine's gesture state —
 // a new deal mid-drag cannot keep flying cards from a game that no longer
-// exists.
+// exists. The stats record carries over (streak dies with an abandoned
+// game), the clock restarts, and the undo stack stays empty.
 func (a *app) deal(seed uint64, drawN int) {
-	a.b = board{g: newGame(seed, drawN)}
+	var prev *Game
+	if a.b.g != nil {
+		prev = a.b.g
+	}
+	ng := newGame(seed, drawN)
+	if prev != nil {
+		ng.stats = prev.stats.inherit(prev.won)
+	} else {
+		ng.stats.played = 1
+	}
+	a.b = board{g: ng}
+	a.startedAt = vi.Time()
 	vi.ConsoleLine(markerDeal + uitoa(seed) + " draw=" + itoa(drawN))
 }
 
@@ -187,6 +205,10 @@ func (a *app) key(ev vi.Event) {
 		vi.ConsoleLine(markerDrawMode + itoa(d))
 	case 'u':
 		a.undo()
+	case 'a':
+		// The keyboard path to a real game: one auto-move per press —
+		// a win is reachable under the seat where the scripted legs live.
+		a.applyEff(a.b.auto())
 	}
 }
 
@@ -256,12 +278,19 @@ func main() {
 		vi.ConsoleLine(markerNotTabAware)
 	}
 
-	// A stored table beats a fresh deal: the blob carries its own seed and
-	// draw mode, so the restore applies as-is and the deal marker is only
-	// printed for a genuinely new table.
-	if ta.Restored && ta.RestoredVersion == stateFmtVer && restoredOK {
+	// A stored table beats a fresh deal: the blob carries its own seed,
+	// draw mode, clock, stats and undo history, so the restore applies
+	// as-is and the deal marker is only printed for a genuinely new
+	// table. Any version decodeState accepts applies — the codec, not the
+	// envelope tag, is the compatibility check.
+	if ta.Restored && restoredOK {
 		a.b.g = restored
+		a.b.winSent = restored.won
+		if !restored.won {
+			a.startedAt = vi.Time() - restored.elapsed
+		}
 		vi.ConsoleLine(markerRestored + itoa(restored.moves))
+		vi.ConsoleLine(markerStats + restored.stats.line())
 	} else {
 		if ta.Restored {
 			vi.ConsoleLine(markerRestoreRef + "ver=" +
@@ -278,6 +307,15 @@ func main() {
 		// answer it once per pass, marker on the acked handoff only.
 		if ta.PollStateAsk() {
 			vi.ConsoleLine(markerStateSave + itoa(len(a.b.g.encodeState())))
+		}
+		// The deal clock: elapsed runs until the win latch (a won table
+		// stops its timer, like GOMINE's). Second-granularity honesty —
+		// best-time only ever reports whole seconds.
+		if !a.b.g.won {
+			e := vi.Time() - a.startedAt
+			if e > a.b.g.elapsed {
+				a.b.g.elapsed = e
+			}
 		}
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {

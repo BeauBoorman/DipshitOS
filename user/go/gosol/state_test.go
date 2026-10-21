@@ -28,8 +28,91 @@ func TestStateRoundTrip(t *testing.T) {
 			t.Fatalf("card %d: %+v vs %+v", i, got[i], want[i])
 		}
 	}
-	if d.undoDepth() != 0 {
-		t.Fatal("a restored table carried undo history")
+	// v2: the undo stack rides the blob — the five draws left five
+	// snapshots, and the restored table undoes them in order.
+	if d.undoDepth() != 5 {
+		t.Fatalf("restored undo depth %d, want 5", d.undoDepth())
+	}
+	if !d.Undo() || d.undoDepth() != 4 {
+		t.Fatalf("undo on the restored table failed: depth=%d", d.undoDepth())
+	}
+	g.Undo()
+	got = dealShape(d)
+	want = dealShape(g)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("post-undo card %d: %+v vs %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// A v1 blob — the M145b format, nothing after the pile runs — still
+// decodes under the v2 codec: the tail fields default to a fresh record.
+func TestStateV1BlobDecodes(t *testing.T) {
+	g := newGame(41, 1)
+	for i := 0; i < 3; i++ {
+		g.drawStock()
+	}
+	v2 := g.encodeState()
+	// v1's length: the header plus each pile's (1+n) run.
+	v1Len := stateHdr
+	for _, p := range [][]Card{g.stock, g.waste, g.found[0], g.found[1],
+		g.found[2], g.found[3], g.tab[0], g.tab[1], g.tab[2], g.tab[3],
+		g.tab[4], g.tab[5], g.tab[6]} {
+		v1Len += 1 + len(p)
+	}
+	v1 := append([]byte{}, v2[:v1Len]...)
+	v1[0] = 1
+	d, ok := decodeState(v1)
+	if !ok {
+		t.Fatal("v1 blob refused")
+	}
+	if d.moves != g.moves || d.undoDepth() != 0 || d.stats != (gameStats{}) ||
+		d.elapsed != 0 || d.winCounted {
+		t.Fatalf("v1 decode carried v2 state: moves=%d depth=%d stats=%+v",
+			d.moves, d.undoDepth(), d.stats)
+	}
+	got, want := dealShape(d), dealShape(g)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("v1 card %d: %+v vs %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// The stats line and the clock ride the blob verbatim.
+func TestStateStatsRoundTrip(t *testing.T) {
+	g := newGame(5, 1)
+	g.elapsed = 93
+	g.stats = gameStats{played: 4, won: 2, streak: 2, best: 61}
+	g.winCounted = true
+	d, ok := decodeState(g.encodeState())
+	if !ok {
+		t.Fatal("stats blob refused")
+	}
+	if d.elapsed != 93 || d.stats != g.stats || !d.winCounted {
+		t.Fatalf("stats: elapsed=%d stats=%+v counted=%v",
+			d.elapsed, d.stats, d.winCounted)
+	}
+}
+
+// The undo history's own tables are held to the same deck check: a torn
+// card inside a serialized snapshot refuses the whole blob.
+func TestStateTornUndoStep(t *testing.T) {
+	g := newGame(8, 1)
+	for i := 0; i < 3; i++ {
+		g.drawStock()
+	}
+	blob := g.encodeState()
+	// Flip a rank bit in the blob's last byte — a card byte inside the
+	// final undo step's last pile run. Every rank+suit pair in a valid
+	// table appears exactly once, so any changed rank either leaves the
+	// 1..13 band (decCard refuses) or duplicates another card (the deck
+	// check refuses).
+	bad := append([]byte{}, blob...)
+	bad[len(bad)-1] ^= 0x01
+	if _, ok := decodeState(bad); ok {
+		t.Fatal("torn last undo step accepted")
 	}
 }
 

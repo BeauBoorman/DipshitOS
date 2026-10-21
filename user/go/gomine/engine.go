@@ -28,6 +28,13 @@ package main
 //	39     ..  bitsets: mine, revealed, flagged — ceil(cells/8) bytes each,
 //	           cell index = y*cols+x, bit = index&7
 //
+// M152d (issue #2918): version 2 appends the per-difficulty best times —
+// 3 × u64 seconds (beginner, intermediate, expert; 0 = no win on that
+// board yet). The record is session state like GOSOL's stats line: it
+// carries board-to-board inside the app and through the blob, so it
+// survives snapshot/restore but not a fresh launch (no `file` grant).
+// A v1 blob still decodes with the record zeroed.
+//
 // Load refuses a short buffer, a bad magic/version, a size that does not
 // match cols*rows, and counts that exceed the cell count — a stale or
 // torn blob is a fresh game, never a misread board.
@@ -51,8 +58,9 @@ const (
 	stateDead    = 3
 
 	saveMagic = "GMS1"
-	saveVer   = 1
+	saveVer   = 2
 	saveHead  = 39
+	saveBest  = 3 * 8 // the v2 tail: one u64 best time per difficulty
 )
 
 // Board is one minesweeper game. Slices are indexed y*Cols+x.
@@ -67,7 +75,8 @@ type Board struct {
 	state     int
 	revealedN int
 	flaggedN  int
-	elapsed   int64 // seconds, owned by main; saved verbatim
+	elapsed   int64     // seconds, owned by main; saved verbatim
+	best      [3]uint64 // best win seconds per size index; 0 = none
 }
 
 // NewBoard returns a board for size index s (clamped 0..2). Mines are NOT
@@ -278,6 +287,14 @@ func (b *Board) checkWin() {
 				b.flaggedN++
 			}
 		}
+		// The difficulty's best time scores only on a named preset — a
+		// restored "custom" board (sizeIndex 0 by default) must not write
+		// beginner's record.
+		if i := b.sizeIndex(); sizes[i] == b.Size {
+			if e := uint64(b.elapsed); b.elapsed >= 0 && (b.best[i] == 0 || e < b.best[i]) {
+				b.best[i] = e
+			}
+		}
 	}
 }
 
@@ -299,6 +316,15 @@ func (b *Board) Mine(x, y int) bool     { return b.mine[y*b.Cols+x] }
 func (b *Board) Adj(x, y int) int       { return int(b.adj[y*b.Cols+x]) }
 func (b *Board) SetElapsed(s int64)     { b.elapsed = s }
 func (b *Board) Elapsed() int64         { return b.elapsed }
+
+// Best is this board's own difficulty best; BestAt reads one slot.
+func (b *Board) Best() int64 { return int64(b.best[b.sizeIndex()]) }
+func (b *Board) BestAt(i int) int64 {
+	if i < 0 || i > 2 {
+		return 0
+	}
+	return int64(b.best[i])
+}
 
 // --- save_state ---------------------------------------------------------
 
@@ -336,7 +362,7 @@ func unpackBits(dst []bool, src []byte) {
 func (b *Board) Save() []byte {
 	cells := b.Cols * b.Rows
 	bs := bitsetBytes(cells)
-	out := make([]byte, saveHead+3*bs)
+	out := make([]byte, saveHead+3*bs+saveBest)
 	copy(out, saveMagic)
 	out[4] = saveVer
 	out[5] = byte(b.sizeIndex())
@@ -350,7 +376,10 @@ func (b *Board) Save() []byte {
 	putLE(out, 35, 4, uint64(b.flaggedN))
 	packBits(out[saveHead:saveHead+bs], b.mine)
 	packBits(out[saveHead+bs:saveHead+2*bs], b.revealed)
-	packBits(out[saveHead+2*bs:], b.flagged)
+	packBits(out[saveHead+2*bs:saveHead+3*bs], b.flagged)
+	for i := 0; i < 3; i++ {
+		putLE(out, saveHead+3*bs+i*8, 8, b.best[i])
+	}
 	return out
 }
 
@@ -366,9 +395,11 @@ func (b *Board) sizeIndex() int {
 // LoadSave decodes a saved blob. The second return is false for any
 // malformed or inconsistent blob — the caller starts a fresh game.
 func LoadSave(buf []byte) (*Board, bool) {
-	if len(buf) < saveHead || string(buf[:4]) != saveMagic || buf[4] != saveVer {
+	if len(buf) < saveHead || string(buf[:4]) != saveMagic ||
+		buf[4] == 0 || buf[4] > saveVer {
 		return nil, false
 	}
+	ver := buf[4]
 	cols, rows := int(getLE(buf, 6, 2)), int(getLE(buf, 8, 2))
 	mines := int(getLE(buf, 10, 4))
 	cells := cols * rows
@@ -376,7 +407,11 @@ func LoadSave(buf []byte) (*Board, bool) {
 		return nil, false
 	}
 	bs := bitsetBytes(cells)
-	if len(buf) != saveHead+3*bs {
+	want := saveHead + 3*bs
+	if ver >= 2 {
+		want += saveBest
+	}
+	if len(buf) != want {
 		return nil, false
 	}
 	b := &Board{
@@ -403,6 +438,11 @@ func LoadSave(buf []byte) (*Board, bool) {
 	b.flaggedN = int(getLE(buf, 35, 4))
 	if b.revealedN > cells || b.flaggedN > cells {
 		return nil, false
+	}
+	if ver >= 2 {
+		for i := 0; i < 3; i++ {
+			b.best[i] = getLE(buf, saveHead+3*bs+i*8, 8)
+		}
 	}
 	// Rebuild the adjacency table — it is derived state, never serialized.
 	for i := 0; i < cells; i++ {

@@ -34,9 +34,26 @@ type Game struct {
 	moves int    // committed moves, reported in the win marker
 	won   bool   // latched when all four foundations reach the king
 
+	// elapsed is the game's wall-clock seconds, owned by the app's tick
+	// the way GOMINE's is: main writes it, the blob saves it verbatim,
+	// and a restore resumes the clock instead of zeroing it. The stats
+	// line's best time reads it at the win latch.
+	elapsed int64
+
+	// stats is the session line — played/won/streak/best — carried
+	// between deals by deal() and through the blob by encodeState. It is
+	// deliberately NOT part of undo snapshots: history rewinds the
+	// table, not the record.
+	stats gameStats
+
+	// winCounted latches "this deal's win already scored". Undo can drop
+	// the win back into play and the table can re-win it, but the record
+	// counts a deal's win once — the flag rides the blob with the game.
+	winCounted bool
+
 	// hist is the undo stack: one pre-move snapshot per committed move,
-	// capped at undoCap. It lives on the game so a fresh deal or a state
-	// restore starts with empty history by construction.
+	// capped at undoCap. It rides the save_state blob so a restored game
+	// keeps its undo (a fresh deal still starts empty by construction).
 	hist []snapshot
 }
 
@@ -281,6 +298,18 @@ func (g *Game) checkWin() {
 		}
 	}
 	g.won = true
+	// The record scores a deal's win once: undo can unlatch the table's
+	// win and a later move re-latches it, but the stats only move here.
+	if !g.winCounted {
+		g.winCounted = true
+		g.stats.won++
+		g.stats.streak++
+		if g.elapsed >= 0 {
+			if e := uint64(g.elapsed); g.stats.best == 0 || e < g.stats.best {
+				g.stats.best = e
+			}
+		}
+	}
 }
 
 // pileCards exposes one pile's slice for the codec and the renderer —
