@@ -646,8 +646,12 @@ func runView(h host, stub bool) int {
 	f.mono = reg.Chain(ttf.Query{Role: "mono"})
 
 	v := &view{h: h, eng: &engine{stub: stub}, f: f, follow: true}
+	// The declare title is the executable's own name: GOTABWM's guessBin
+	// default arm records the title verbatim, and a session restore
+	// re-execs it bare (the GOIRC declare-title discipline). Declaring
+	// appTitle instead made every restore drop the row 'exec' ENOENT.
 	ta := openViewWindow(tabapp.Config{
-		Name: appName, Title: appTitle, X: 32, Y: 28, W: natW, H: natH,
+		Name: appName, Title: appName, X: 32, Y: 28, W: natW, H: natH,
 		StateVersion: stateVer,
 		SaveState:    v.saveState,
 		RestoreState: v.restoreState,
@@ -660,6 +664,11 @@ func runView(h host, stub bool) int {
 	viewConsole(markerOpen + vi.Itoa64(int64(ta.Win)))
 	if ta.TabAware {
 		viewConsole(markerDeclare)
+		// The rail label is the friendly name; the recorded bin stays the
+		// executable the declare carried.
+		if !ta.SetTabTitle(appTitle) {
+			_ = vi.WinSetTitle(ta.Win, appTitle)
+		}
 	} else {
 		viewConsole("goassist: declare refused")
 	}
