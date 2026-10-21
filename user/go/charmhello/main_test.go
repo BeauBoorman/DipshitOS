@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
+	"virelai/tabapp"
 )
 
 func TestModelTogglesFromTeaKeyPress(t *testing.T) {
@@ -21,31 +23,39 @@ func TestModelTogglesFromTeaKeyPress(t *testing.T) {
 }
 
 func TestModelQuitsFromTeaKeyPress(t *testing.T) {
-	next, _ := (model{}).Update(tea.KeyPressMsg(tea.Key{Text: "q"}))
+	next, cmd := (model{}).Update(tea.KeyPressMsg(tea.Key{Text: "q"}))
 	if !next.(model).quit {
 		t.Fatal("q did not request model shutdown")
+	}
+	if cmd == nil || cmd() != (tea.QuitMsg{}) {
+		t.Fatal("q did not return tea.Quit — the Program must end itself")
 	}
 }
 
 func TestViewCarriesBoundedAnsiSurface(t *testing.T) {
-	view := (model{}).View().Content
-	for _, want := range []string{"\x1b[?1049h", "\x1b[1;95m", "bound /dev/tty"} {
-		if !strings.Contains(view, want) {
+	v := (model{}).View()
+	for _, want := range []string{"\x1b[1;95m", "bound /dev/tty"} {
+		if !strings.Contains(v.Content, want) {
 			t.Fatalf("view missing %q", want)
 		}
+	}
+	// The renderer owns the modes now: alt-screen and ?1002/?1006 mouse
+	// reporting are View fields, not literal escapes in Content.
+	if !v.AltScreen {
+		t.Fatal("view does not request the alt screen")
+	}
+	if v.MouseMode != tea.MouseModeCellMotion {
+		t.Fatal("view does not request cell-motion mouse reporting")
 	}
 }
 
 // TestSizeMsgPinsKernelCellMath is M73j's (#1636) deliverable-4 agreement
-// pin: for the same rect, sizeMsg's cells equal the kernel's formulas —
-// cols = clamp(w/cellW, 8, 80) (terminal.zig syncWindowCols -> setCols:975)
-// and rows = (h-16)/cellH (driving_award.zig rows_visible:439, title_bar_h=16).
-// M73l (#1661): cellW=8, cellH=16 — FiraCode's advance at pixel size 13.
-// The card's prose said `rows=h/cellH`; the painted viewport does NOT include
-// the 16 px title band, so h/8 would hand a TUI two rows the grid never
-// renders — the measured kernel number is the one pinned here.
-// M80i (#1725): the pin runs at EVERY rung of the zoom ladder (7x13 / 8x16
-// / 10x21 — vi.TerminalCellForSize): the cell moved, the formulas did not.
+// pin, moved to its M168a (#2957) owner: teatty answers term.GetSize and
+// WIN_RESIZE through tabapp.CellGrid — cols = clamp(w/cellW, 8, 80)
+// (terminal.zig syncWindowCols -> setCols:975) and rows = (h-16)/cellH
+// (driving_award.zig rows_visible:439, title_bar_h=16). M73l (#1661):
+// cellW=8, cellH=16 — FiraCode's advance at pixel size 13. M80i (#1725):
+// the pin runs at EVERY rung of the zoom ladder (7x13 / 8x16 / 10x21).
 func TestSizeMsgPinsKernelCellMath(t *testing.T) {
 	rects := []struct{ w, h uint32 }{
 		{640, 400},  // charmhello's own rect: 640/8, (400-16)/16
@@ -72,10 +82,10 @@ func TestSizeMsgPinsKernelCellMath(t *testing.T) {
 	}
 	for _, r := range rungs {
 		for i, rc := range rects {
-			got := sizeMsg(rc.w, rc.h, r.cellW, r.cellH)
-			if got.Width != r.want[i][0] || got.Height != r.want[i][1] {
-				t.Errorf("sizeMsg(%d,%d,%d,%d) = %dx%d, want %dx%d (kernel formulas, %s)",
-					rc.w, rc.h, r.cellW, r.cellH, got.Width, got.Height, r.want[i][0], r.want[i][1], r.name)
+			c, rows := tabapp.CellGrid(rc.w, rc.h, r.cellW, r.cellH)
+			if c != r.want[i][0] || rows != r.want[i][1] {
+				t.Errorf("CellGrid(%d,%d,%d,%d) = %dx%d, want %dx%d (kernel formulas, %s)",
+					rc.w, rc.h, r.cellW, r.cellH, c, rows, r.want[i][0], r.want[i][1], r.name)
 			}
 		}
 	}
@@ -83,7 +93,7 @@ func TestSizeMsgPinsKernelCellMath(t *testing.T) {
 
 // TestUpdateHandlesWindowSize: the message shape Update consumes — stored
 // on the model and rendered in the View, so the serial marker and the
-// scanout both carry it.
+// scanout both carry it. The Program's own initial-size path sends it.
 func TestUpdateHandlesWindowSize(t *testing.T) {
 	next, _ := (model{}).Update(tea.WindowSizeMsg{Width: 80, Height: 48})
 	got := next.(model)
@@ -101,18 +111,41 @@ func TestUpdateHandlesWindowSize(t *testing.T) {
 // pass-all application in arrival order must end at the LAST size.
 func TestResizeConvergesToLatest(t *testing.T) {
 	m := model{}
+	m.sized = true // as the Program's initial size already landed
 	for _, ws := range []tea.WindowSizeMsg{
-		sizeMsg(640, 400, 8, 16),
-		sizeMsg(704, 448, 8, 16),
-		sizeMsg(768, 496, 8, 16),
+		{Width: 80, Height: 24},
+		{Width: 88, Height: 27},
+		{Width: 96, Height: 30},
 	} {
 		next, _ := m.Update(ws)
 		m = next.(model)
 	}
-	// M80i (#1725): the 96x60 pin was pre-M73l arithmetic ((496-16)/8 —
-	// the 8x8 cell era); the M73l cell is 16 tall, so the latest rect
-	// converges to 96x30 (the same /16 the live gates pin at 64x23).
 	if m.cols != 96 || m.rows != 30 {
 		t.Fatalf("converged size = %dx%d, want 96x30 (the latest)", m.cols, m.rows)
+	}
+}
+
+// TestMouseMarkersReconstructSGR pins the marker field math: the kernel
+// sends press as ESC[<b;x;yM and release/drag as ESC[<32+b;x;ym
+// (terminal.zig encodeMouse — bit 5 is the legacy Cb+32 convention),
+// while tea's Mouse carries X11 codes (left=1) and 0-based cells.
+func TestMouseMarkersReconstructSGR(t *testing.T) {
+	if got := mouseLine(0, 4, 2); got != "charmhello: mouse b=0 x=4 y=2" {
+		t.Fatalf("press marker = %q", got)
+	}
+	if got := mouseLine(32, 4, 2); got != "charmhello: mouse b=32 x=4 y=2" {
+		t.Fatalf("release marker = %q", got)
+	}
+	// Update must map Click(left, cell 3,1 0-based) -> b=0 x=4 y=2 and
+	// the motion-decoded release -> b=32 (ultraviolet reads the kernel's
+	// +32 as the motion bit; see Update's MouseMotionMsg case).
+	for _, msg := range []tea.Msg{
+		tea.MouseClickMsg(tea.Mouse{X: 3, Y: 1, Button: tea.MouseLeft}),
+		tea.MouseMotionMsg(tea.Mouse{X: 3, Y: 1, Button: tea.MouseLeft}),
+		tea.MouseReleaseMsg(tea.Mouse{X: 3, Y: 1, Button: tea.MouseLeft}),
+	} {
+		if _, cmd := (model{}).Update(msg); cmd != nil {
+			t.Fatalf("mouse msg %T returned a cmd — markers are synchronous", msg)
+		}
 	}
 }

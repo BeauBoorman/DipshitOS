@@ -70,15 +70,15 @@ tag_dedupe() {
 }
 
 # --- 2. overlay files (new, GOOS-gated) --------------------------------
-# gostalgia/ and gostalgia-mods/ are stage overlays: build-gostalgia.sh
-# applies them onto the pinned tree in .build/gostalgia-src, never onto
-# the fork. Copied into src/ they both fail make.bash (`go_bootstrap
-# install std` compiles them) and collide with the stage at package
-# resolution (ambiguous import: gostalgia/cmd/* found in two modules —
-# observed breaking #2634 cold and warm).
+# gostalgia/, gostalgia-mods/ and charm-mods/ are stage overlays:
+# build-gostalgia.sh / build-charmhello.sh apply them onto staged trees
+# in .build/, never onto the fork. Copied into src/ they both fail
+# make.bash (`go_bootstrap install std` compiles them) and collide with
+# the stage at package resolution (ambiguous import: gostalgia/cmd/*
+# found in two modules — observed breaking #2634 cold and warm).
 log "copying overlay files"
 ( cd "$REPO/tools/go/overlay" && find . -type f \
-    ! -path "./gostalgia/*" ! -path "./gostalgia-mods/*" | while read -r f; do
+    ! -path "./gostalgia/*" ! -path "./gostalgia-mods/*" ! -path "./charm-mods/*" | while read -r f; do
     mkdir -p "$FORK_DIR/src/$(dirname "$f")"
     cp "$f" "$FORK_DIR/src/$f"
 done )
@@ -105,10 +105,10 @@ done )
 # --- 2c. remove leaked stage overlays ------------------------------------
 # An earlier revision of the copy above mirrored gostalgia/ and
 # gostalgia-mods/ into the fork too. Those trees are never fork files —
-# only build-gostalgia.sh's stage consumes them — so an existing polluted
+# only the build scripts' stages consume them — so an existing polluted
 # fork is healed here by deleting them outright (the narrow *_virelai*
 # prune cannot reach them: the stage overlays carry other names).
-for d in gostalgia gostalgia-mods; do
+for d in gostalgia gostalgia-mods charm-mods; do
     if [ -d "$FORK_DIR/src/$d" ]; then
         rm -rf "$FORK_DIR/src/$d"
         log "removed leaked stage overlay src/$d"

@@ -60,12 +60,16 @@ vgate_assert 01 serial-contains 'VirelaiOS kernel has seized control.'
 vgate_assert 01 serial-contains 'exec: loaded CHARMHELLO.ELF'
 vgate_assert 01 serial-contains 'charmhello: open id='
 vgate_assert 01 serial-contains 'charmhello: attached'
+# M168a (#2957): the app runs a real Bubble Tea v2 Program — decoder,
+# renderer, mouse, resize and quit are the framework's, not a hand loop.
+vgate_assert 01 serial-contains 'charmhello: program'
 vgate_assert 01 serial-contains 'charmhello: painted'
 vgate_assert 01 serial-contains 'charmhello: ready'
 # M73j (#1636): the INITIAL tea.WindowSizeMsg — the first frame paints at
 # the declared rect's real cells (640x400 -> clamp(640/8)=80 cols,
 # (400-16)/16=24 rows; M73l #1661 cell_h=16), so a TUI's first frame is
-# measured, not a guess.
+# measured, not a guess. M168a: it now arrives through the Program's own
+# initial-size path (term.GetSize -> teatty), not a hand-fed Update.
 vgate_assert 01 serial-contains 'charmhello: size 80x24'
 vgate_assert 01 serial-contains 'charmhello: key space'
 vgate_assert 01 serial-contains 'charmhello: repainted'

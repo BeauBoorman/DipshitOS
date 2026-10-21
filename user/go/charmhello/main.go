@@ -1,17 +1,19 @@
 //go:build virelai || charmhello
 
-// Command charmhello is M72c's deliberately small Bubble Tea program.
-//
-// It does not run Bubble Tea's host Program loop: the Virelai port has no
-// POSIX tty or signals, and this app must take bytes from the kernel's bound
-// /dev/tty queue. It still owns a real tea.Model — Update receives HID-derived
-// key messages and View emits Bubble Tea's ANSI text into that bound tty.
+// Command charmhello runs a REAL Bubble Tea v2 Program on the bound
+// /dev/tty (#2957): teatty hands the Program a term.File over the
+// kernel's tty queue, Bubble Tea's own decoder/renderer/mouse/resize/quit
+// drive the seat window, and Update only maps messages — the app no
+// longer pumps its own loop.
 package main
 
 import (
+	"errors"
+
 	tea "charm.land/bubbletea/v2"
 
 	"virelai/tabapp"
+	"virelai/teatty"
 	"virelai/vi"
 )
 
@@ -20,8 +22,6 @@ const (
 	appTitle = "Charm Hello"
 	natW     = 640
 	natH     = 400
-
-	ttyPath = "/dev/tty"
 
 	markerOpen    = "charmhello: open id="
 	markerAttach  = "charmhello: attached"
@@ -33,41 +33,28 @@ const (
 	markerOK      = "charmhello OK"
 	markerMouse   = "charmhello: mouse b="
 	markerSize    = "charmhello: size "
+	markerProgram = "charmhello: program"
 )
-
-// M73j (#1636): the port's unit pin for tea.WindowSizeMsg — CELLS, never
-// pixels. Both numbers mirror kernel formulas for the SAME rect:
-//
-//	cols  = clamp(w/cellW, 8, 80) — terminal.zig syncWindowCols -> setCols
-//	        (the M49 SD5-effective column count the grid reflows to)
-//	rows  = (h - 16)/cellH         — driving_award.zig rows_visible, the
-//	        16 px title band (wnd_core title_bar_h) is NOT client area
-//
-// M73l (#1661): cellW/cellH mirror kernel/src/font_metrics.zig —
-// FiraCode at pixel size 13: advance 8, ascent+descent 16 (the boot
-// look). M80i (#1725): the cell is the ACTIVE zoom rung's, so the
-// callers pass vi.TerminalCell() — re-read per WIN_RESIZE, the same
-// rung the kernel's reflow just used.
-//
-// A TUI can therefore never ask for geometry the grid will not render;
-// TestSizeMsgPinsKernelCellMath pins the agreement class-A at every rung.
-func sizeMsg(w, h, cellW, cellH uint32) tea.WindowSizeMsg {
-	cols := int(w / cellW)
-	if cols < 8 {
-		cols = 8
-	}
-	if cols > 80 {
-		cols = 80
-	}
-	rows := 1 // kernel: `if (h > title) (h-title)/cellH else 1`
-	if h > 16 {
-		rows = int((h - 16) / cellH)
-	}
-	return tea.WindowSizeMsg{Width: cols, Height: rows}
-}
 
 func sizeMarker(m model) string {
 	return markerSize + vi.Itoa64(int64(m.cols)) + "x" + vi.Itoa64(int64(m.rows))
+}
+
+// paintedMsg carries the serial lines that must fire AFTER the frame a
+// message triggered is actually painted. Update returns afterPaint cmds;
+// the cmd's message lands on the NEXT eventLoop iteration — but the
+// cursed renderer is asynchronous (p.render only queues the view; the
+// 60 fps ticker flushes it), so the cmd also yields a few ticks first:
+// the marker then post-dates at least one renderer flush plus a WM
+// publish — the Program equivalent of the hand loop's
+// paint -> vi.Sleep -> ConsoleLine order.
+type paintedMsg struct{ lines []string }
+
+func afterPaint(lines ...string) tea.Cmd {
+	return func() tea.Msg {
+		vi.Sleep(4)
+		return paintedMsg{lines: lines}
+	}
 }
 
 type model struct {
@@ -76,32 +63,88 @@ type model struct {
 	quit   bool
 	cols   int
 	rows   int
+	sized  bool // the Program's initial WindowSizeMsg landed
 }
 
-// Init is intentionally command-free: Virelai feeds key bytes below.
+// Init is intentionally command-free: the Program sends the initial
+// WindowSizeMsg itself.
 func (model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// M73j (#1636): the size message arrives ONCE at startup (from the
-	// declared rect) and on every WIN_RESIZE (clamped w/h) — charm v2's
-	// documented WindowSizeMsg cadence, in cells.
-	if ws, ok := msg.(tea.WindowSizeMsg); ok {
-		m.cols, m.rows = ws.Width, ws.Height
+	switch msg := msg.(type) {
+	case paintedMsg:
+		for _, l := range msg.lines {
+			vi.ConsoleLine(l)
+		}
 		return m, nil
-	}
-	key, ok := msg.(tea.KeyPressMsg)
-	if !ok {
+
+	case tea.WindowSizeMsg:
+		m.cols, m.rows = msg.Width, msg.Height
+		if !m.sized {
+			// The Program's first size: term.GetSize's answer at the
+			// declared rect (640x400 -> 80x24 cells) — the first frame is
+			// measured, not a guess (the M73j contract, now through the
+			// framework's own initial-size path).
+			m.sized = true
+			vi.ConsoleLine(sizeMarker(m))
+			return m, afterPaint(markerPainted, markerReady)
+		}
+		// A live WIN_RESIZE (e.g. the 'r' owner-seam resize): repaint at
+		// the new cells, then the marker pair the gate choreographs.
+		return m, afterPaint(sizeMarker(m), markerRepaint)
+
+	case tea.KeyPressMsg:
+		switch msg.Key().Text {
+		case "q":
+			m.quit = true
+			return m, tea.Quit
+		case " ":
+			m.paused = !m.paused
+			return m, afterPaint(markerKey+"space", markerRepaint)
+		default:
+			m.keys++
+			if msg.Key().Text == "r" {
+				// The owner-side resize seam — sys_win_resize (slot 47)
+				// clamps + reflows and pushes WIN_RESIZE; the Program's
+				// event goroutine turns it into the WindowSizeMsg above
+				// (512x384 -> 64x23 cells), the class-B proof.
+				_ = vi.WinResize(teatty.WindowID(), 512, 384)
+			}
+			return m, afterPaint(markerKey+msg.Key().Text, markerRepaint)
+		}
+
+	case tea.MouseClickMsg:
+		// SGR b is the X11 button code MINUS one (left = 0), x/y the
+		// 1-based cells — the same fields the hand parser printed.
+		vi.ConsoleLine(mouseLine(int(msg.Button)-1, msg.X+1, msg.Y+1))
 		return m, nil
-	}
-	switch key.Key().Text {
-	case "q":
-		m.quit = true
-	case " ":
-		m.paused = !m.paused
-	default:
-		m.keys++
+
+	case tea.MouseMotionMsg:
+		// The kernel encodes SGR release/drag as b+32 (the legacy Cb+32
+		// convention; terminal.zig encodeMouse), and ultraviolet reads
+		// bit 5 as "motion", so a release surfaces HERE, not as
+		// MouseReleaseMsg. With ?1002 (never ?1003) every motion is an
+		// edge the kernel really sent; reconstruct its SGR b.
+		b := 32 + int(msg.Button) - 1
+		if msg.Button == tea.MouseNone {
+			b = 35 // free-motion encoding (unreached under ?1002)
+		}
+		vi.ConsoleLine(mouseLine(b, msg.X+1, msg.Y+1))
+		return m, nil
+
+	case tea.MouseReleaseMsg:
+		// Unreached for the kernel's encoding (see above); handled so a
+		// standards-shaped peer still prints the release marker.
+		vi.ConsoleLine(mouseLine(32+int(msg.Button)-1, msg.X+1, msg.Y+1))
+		return m, nil
 	}
 	return m, nil
+}
+
+func mouseLine(b, x, y int) string {
+	return markerMouse + vi.Itoa64(int64(b)) +
+		" x=" + vi.Itoa64(int64(x)) +
+		" y=" + vi.Itoa64(int64(y))
 }
 
 func (m model) View() tea.View {
@@ -109,126 +152,32 @@ func (m model) View() tea.View {
 	if m.paused {
 		state = "\x1b[1;93mPAUSED\x1b[0m"
 	}
-	return tea.NewView(
-		"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H" +
-			"\x1b[1;95m  VirelaiOS × Bubble Tea \x1b[0m\n\n" +
+	v := tea.NewView(
+		"\x1b[1;95m  VirelaiOS × Bubble Tea \x1b[0m\n\n" +
 			"\x1b[96m  bound /dev/tty · real tea.Model\x1b[0m\n\n" +
 			"  status: " + state + "\n" +
 			"  keys:   \x1b[1;97m" + vi.Itoa64(int64(m.keys)) + "\x1b[0m\n" +
 			"  size:   \x1b[1;97m" + vi.Itoa64(int64(m.cols)) + "x" + vi.Itoa64(int64(m.rows)) + "\x1b[0m\n\n" +
 			"\x1b[90m  space toggles · q exits\x1b[0m\n",
 	)
+	// The renderer owns the screen now: alt-screen + hidden cursor +
+	// ?1002/?1006 mouse reporting are View fields, not manual escapes
+	// (?1002 reports press/release edges like the hand loop's ?1000).
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	return v
 }
 
-func keyPress(b byte) tea.KeyPressMsg {
-	return tea.KeyPressMsg(tea.Key{Text: string([]byte{b}), Code: rune(b)})
-}
-
-// M73i (#1635): a ?1006 SGR mouse report shares the tty with keys:
-// ESC [ < b ; x ; y M|m. ms holds a possibly-mouse escape prefix; any
-// non-mouse escape (the arrow keys) flushes through the ordinary key path,
-// so every pre-existing marker stays byte-identical.
-var ms []byte
-var mouseB, mouseX, mouseY int
-
-type msAction int
-
-const (
-	msWait  msAction = iota // prefix so far is mouse-compatible; need more
-	msMouse                 // complete report in mouseB/X/Y
-	msDrop                  // not a mouse sequence: flush ms as keys
-)
-
-func msStep(b byte) msAction {
-	switch len(ms) {
-	case 0:
-		if b == 0x1b {
-			ms = append(ms, b)
-			return msWait
-		}
-		return msDrop // never reached: the caller gates on ESC/pending
-	case 1: // ESC
-		if b == '[' {
-			ms = append(ms, b)
-			return msWait
-		}
-		ms = ms[:0]
-		return msDrop
-	case 2: // ESC [
-		if b == '<' {
-			ms = append(ms, b)
-			return msWait
-		}
-		ms = ms[:0]
-		return msDrop
-	default: // ESC [ < … body
-		if (b >= '0' && b <= '9') || b == ';' {
-			if len(ms) >= 32 { // runaway: never a mouse report
-				ms = ms[:0]
-				return msDrop
-			}
-			ms = append(ms, b)
-			return msWait
-		}
-		if b == 'M' || b == 'm' {
-			ms = append(ms, b)
-			ok, btn, x, y := parseSGRMouse(ms)
-			ms = ms[:0]
-			if ok {
-				mouseB, mouseX, mouseY = btn, x, y
-				return msMouse
-			}
-			return msDrop
-		}
-		ms = ms[:0]
-		return msDrop
-	}
-}
-
-// parseSGRMouse reads ESC [ < b ; x ; y M|m — hand-rolled (no strconv):
-// the app only ever prints what the kernel sent.
-func parseSGRMouse(seq []byte) (bool, int, int, int) {
-	if len(seq) < 6 || seq[0] != 0x1b || seq[1] != '[' || seq[2] != '<' {
-		return false, 0, 0, 0
-	}
-	var vals [3]int
-	idx := 0
-	cur := 0
-	digits := false
-	for i := 3; i < len(seq); i++ {
-		b := seq[i]
-		if b >= '0' && b <= '9' {
-			cur = cur*10 + int(b-'0')
-			digits = true
-		} else if b == ';' {
-			if !digits || idx >= 2 {
-				return false, 0, 0, 0
-			}
-			vals[idx] = cur
-			idx++
-			cur = 0
-			digits = false
-		} else if b == 'M' || b == 'm' {
-			if !digits || idx != 2 {
-				return false, 0, 0, 0
-			}
-			vals[2] = cur
-			return true, vals[0], vals[1], vals[2]
-		} else {
-			return false, 0, 0, 0
-		}
-	}
-	return false, 0, 0, 0
-}
-
-func paint(fd uint32, m model) bool {
-	v := m.View()
-	n, rc := vi.FileWrite(fd, []byte(v.Content))
-	return rc >= 0 && n == len(v.Content)
-}
+// mouseEnable is the byte-exact mode pair the hand loop wrote
+// (?1000 press/release edges + ?1006 SGR); the View's MouseMode adds
+// ?1002 on top through the renderer. Belt and suspenders: the kernel's
+// emit path is mode-OR'd, so the union reports exactly what M73i proved.
+const mouseEnable = "\x1b[?1000h\x1b[?1006h"
 
 func main() {
-	ta := tabapp.Init(tabapp.Config{
+	// teatty.Open hosts the window AND binds /dev/tty to it (win_open,
+	// slot 23, slot 67 TtyWindow — the kernel's required order).
+	in, out, err := teatty.Open(tabapp.Config{
 		Name:  appName,
 		Title: appTitle,
 		X:     32,
@@ -236,142 +185,43 @@ func main() {
 		W:     natW,
 		H:     natH,
 	})
-	if ta == nil {
-		vi.ConsoleLine("charmhello: open failed")
-		vi.Exit(1)
+	if err != nil {
+		switch {
+		case errors.Is(err, teatty.ErrWindow):
+			vi.ConsoleLine("charmhello: open failed")
+			vi.Exit(1)
+		case errors.Is(err, teatty.ErrTTY):
+			vi.ConsoleLine("charmhello: no /dev/tty")
+			vi.Exit(2)
+		default:
+			vi.ConsoleLine("charmhello: attach failed")
+			vi.Exit(3)
+		}
 	}
-	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)))
-
-	h, rc := vi.FileOpen(ttyPath, vi.ModeRead|vi.ModeWrite)
-	if rc < 0 {
-		vi.ConsoleLine("charmhello: no /dev/tty")
-		ta.CloseAndExit(2)
-	}
-	fd := uint32(h)
-	if vi.TtyAttachWindow(ta.Win) != 0 {
-		vi.FileClose(fd)
-		vi.ConsoleLine("charmhello: attach failed")
-		ta.CloseAndExit(3)
-	}
+	defer teatty.Close()
+	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(teatty.WindowID())))
 	vi.ConsoleLine(markerAttach)
-	// M73i (#1635): enable xterm mouse reporting — ?1000 press/release
-	// edges, ?1006 SGR encoding. The kernel tracks the modes per screen
-	// (never painted) and reports plain pointer events over this window.
-	if _, rcw := vi.FileWrite(fd, []byte("\x1b[?1000h\x1b[?1006h")); rcw < 0 {
-		vi.ConsoleLine("charmhello: mouse enable failed")
+	// The kernel tracks tracking modes per screen; set them before the
+	// Program starts so no early pointer event is missed.
+	_, _ = out.Write([]byte(mouseEnable))
+
+	// The Program is the whole point of #2957: Bubble Tea's decoder,
+	// renderer, mouse, resize and quit handling drive the window, and
+	// the app is only a Model. TERM is pinned so colorprofile answers
+	// ANSI256 through the real IsTerminal path — the same profile the
+	// termenv shim asserts for the hand-loop apps.
+	p := tea.NewProgram(
+		model{},
+		tea.WithInput(in),
+		tea.WithOutput(out),
+		tea.WithEnvironment([]string{"TERM=xterm-256color"}),
+	)
+	vi.ConsoleLine(markerProgram)
+	if _, err := p.Run(); err != nil {
+		vi.ConsoleLine("charmhello: program error")
+		vi.Exit(4)
 	}
-
-	m := model{}
-	// M73j (#1636): the INITIAL WindowSizeMsg — the first frame paints at
-	// the declared rect's real grid (640x400 -> 80x48), not a guess.
-	// M80i: at the ACTIVE rung's cell (vi.TerminalCell).
-	cw, ch := vi.TerminalCell()
-	next, _ := m.Update(sizeMsg(ta.W, ta.H, cw, ch))
-	m = next.(model)
-	vi.ConsoleLine(sizeMarker(m))
-	if !paint(fd, m) {
-		shutdown(ta, fd, 4)
-	}
-	// A tty write marks the window dirty; yield once before the marker the
-	// VZ gate uses as its screenshot barrier, so it describes a painted frame.
-	vi.Sleep(2)
-	vi.ConsoleLine(markerPainted)
-	vi.ConsoleLine(markerReady)
-
-	// emitKey is the pre-M73i per-byte key path, unchanged: markers,
-	// repaint and quit all fire exactly as they did before mouse parsing.
-	emitKey := func(b byte) {
-		next, _ := m.Update(keyPress(b))
-		m = next.(model)
-		if m.quit {
-			shutdown(ta, fd, 0)
-		}
-		if b == 'r' {
-			// M73j (#1636): the owner-side resize seam — sys_win_resize
-			// (slot 47) clamps + reflows and pushes WIN_RESIZE; the loop's
-			// ActionResized then delivers tea.WindowSizeMsg (512x384 ->
-			// 64x23 cells) with its serial marker, the class-B proof.
-			_ = vi.WinResize(ta.Win, 512, 384)
-		}
-		if !paint(fd, m) {
-			shutdown(ta, fd, 4)
-		}
-		vi.Sleep(1)
-		if b == ' ' {
-			vi.ConsoleLine(markerKey + "space")
-		} else {
-			vi.ConsoleLine(markerKey + string([]byte{b}))
-		}
-		vi.ConsoleLine(markerRepaint)
-	}
-
-	var in [64]byte
-	for {
-		n, _ := vi.FileRead(fd, in[:])
-		if n > 0 {
-			for _, b := range in[:n] {
-				if len(ms) > 0 || b == 0x1b {
-					switch msStep(b) {
-					case msWait:
-						continue // holding a possible mouse prefix
-					case msMouse:
-						// Mouse is not a key: marker only, no repaint.
-						vi.ConsoleLine(markerMouse + vi.Itoa64(int64(mouseB)) +
-							" x=" + vi.Itoa64(int64(mouseX)) +
-							" y=" + vi.Itoa64(int64(mouseY)))
-						continue
-					}
-					// msDrop: flush the held prefix as keys, then this byte.
-					pending := ms
-					ms = nil
-					for _, pb := range pending {
-						emitKey(pb)
-					}
-				}
-				emitKey(b)
-			}
-		}
-
-		ev, result, ok := vi.PollEventRaw()
-		if !ok {
-			if result < 0 {
-				shutdown(ta, fd, 5)
-			}
-			if n <= 0 {
-				vi.Sleep(1)
-			}
-			continue
-		}
-		// M73j (#1636): tabapp.Dispatch already consumes WIN_RESIZE into
-		// ActionResized (arg0/arg1 = the clamped w/h both emit sites
-		// carry) — this used to fall through unhandled, so a resized
-		// window repainted at stale geometry forever. Size msg ->
-		// repaint -> serial marker with the NEW cells, the class-B seam.
-		switch ta.Dispatch(ev) {
-		case tabapp.ActionClosed:
-			shutdown(ta, fd, 0)
-		case tabapp.ActionResized:
-			// M80i (#1725): the rung may have moved (a `font` zoom is a
-			// winsize change for a cell-addressed app) — re-read the cell
-			// so the size msg agrees with the kernel's reflowed grid.
-			cw, ch := vi.TerminalCell()
-			next, _ := m.Update(sizeMsg(ev.Arg0, ev.Arg1, cw, ch))
-			m = next.(model)
-			if !paint(fd, m) {
-				shutdown(ta, fd, 4)
-			}
-			vi.Sleep(1)
-			vi.ConsoleLine(sizeMarker(m))
-			vi.ConsoleLine(markerRepaint)
-		}
-	}
-}
-
-func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
-	_, _ = vi.FileWrite(fd, []byte("\x1b[?1049l\x1b[?25h"))
-	_ = vi.TtyAttach(vi.TtyDetach)
-	vi.FileClose(fd)
 	vi.ConsoleLine(markerClose)
 	vi.ConsoleLine(markerOK)
-	ta.CloseAndExit(status)
+	vi.Exit(0)
 }
