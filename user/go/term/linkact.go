@@ -15,6 +15,9 @@ const (
 	markerLinkRefused    = "goterm: link refused "
 	markerProfile        = "goterm: profile "
 	markerProfileRefused = "goterm: profile refused "
+	// markerProfileFallback is restore's named marker for the absent-name
+	// case: `goterm: profile fallback <applied> saved=<saved>`.
+	markerProfileFallback = "goterm: profile fallback "
 	mouseEnable          = "\x1b[?1000h\x1b[?1006h"
 
 	// webArgBytes/webArgSlots mirror shlib's openTargetArgs contract for
@@ -111,6 +114,19 @@ func rowsVisible(winH uint32) int {
 	return int((winH - 16) / ch)
 }
 
+// profileUsage is the command's help half, appended to the bare list: the
+// font is a kernel-global setting — font_size moves EVERY terminal window,
+// there is no per-window font.
+const profileUsage = "usage: term-profile NAME|next|prev — font_size is kernel-global (every terminal window shares it)"
+
+// profileActiveName reads the settings store's record of the choice —
+// the `term_profile=<name>` row applyProfileBody writes. It is the cycle
+// base for next/prev and the star in the bare list; other writers (GOSET,
+// another window) move it too, which is why it is re-read per command.
+func profileActiveName() string {
+	return shlib.SettingFromSettings(settingsBody(), "term_profile", "")
+}
+
 // handleProfileCmd runs the `term-profile` line command. It never reaches
 // the engine — the front-end answers it the way it answers `exit --close`.
 // Applying a profile merges its keys into SETTINGS.TXT via the same
@@ -120,31 +136,38 @@ func handleProfileCmd(ts *termState, ta *tabapp.TabApp, fd uint32, editor *shlib
 	body, r := vi.ReadFileAll(profilesPath, profilesMax)
 	if r < 0 || len(body) == 0 {
 		vi.ConsoleLine(markerProfileRefused + "no file " + profilesPath)
-		linkNotice(ts, fd, editor, "goterm: no profiles ("+profilesPath+")")
+		linkNotice(ts, fd, editor, "goterm: no profiles ("+profilesPath+")\r\n"+profileUsage)
 		return
 	}
 	ps := parseProfiles(string(body))
 	if list {
-		// `term-profile` bare answers with the names in-file.
-		var names []byte
-		for i := range ps {
-			if i > 0 {
-				names = append(names, ' ')
-			}
-			names = append(names, ps[i].name...)
-		}
+		// `term-profile` bare answers with the names in-file, the active
+		// one starred.
+		cur := profileActiveName()
+		names := profileNamesMarked(ps, cur)
 		if len(names) == 0 {
-			linkNotice(ts, fd, editor, "goterm: no profiles")
+			linkNotice(ts, fd, editor, "goterm: no profiles\r\n"+profileUsage)
 			return
 		}
-		linkNotice(ts, fd, editor, "goterm: profiles: "+string(names))
-		vi.ConsoleLine(markerProfile + "list n=" + vi.Itoa64(int64(len(ps))))
+		linkNotice(ts, fd, editor, "goterm: profiles: "+names+"\r\n"+profileUsage)
+		marker := markerProfile + "list n=" + vi.Itoa64(int64(len(ps)))
+		if cur != "" {
+			marker += " active=" + cur
+		}
+		vi.ConsoleLine(marker)
 		return
 	}
 	var p *termProfile
-	for i := range ps {
-		if ps[i].name == name {
-			p = &ps[i]
+	switch name {
+	case "next":
+		p = cycleProfile(ps, profileActiveName(), 1)
+	case "prev":
+		p = cycleProfile(ps, profileActiveName(), -1)
+	default:
+		for i := range ps {
+			if ps[i].name == name {
+				p = &ps[i]
+			}
 		}
 	}
 	if p == nil {
@@ -152,20 +175,68 @@ func handleProfileCmd(ts *termState, ta *tabapp.TabApp, fd uint32, editor *shlib
 		linkNotice(ts, fd, editor, "goterm: no such profile: "+name)
 		return
 	}
-	cur, _ := vi.ReadFileAll(settingsPath, maxStartupBytes)
-	merged := applyProfileBody(string(cur), p)
-	if rc := vi.WriteFileSafe(settingsPath, []byte(merged)); rc < 0 {
-		vi.ConsoleLine(markerProfileRefused + name + " write rc=" + vi.Itoa64(rc))
+	if !applyProfileFile(ts, ta, p) {
 		linkNotice(ts, fd, editor, "goterm: profile write failed")
 		return
 	}
-	vi.ConsoleLine(markerProfile + name)
-	// The kernel applies the saved keys live; the seat publish is the
-	// same notice GOSET sends so bound subscribers (its own panel,
-	// theme readers) re-resolve — best-effort per key.
+	linkNotice(ts, fd, editor, "goterm: profile "+p.name)
+}
+
+// applyProfileFile merges p into SETTINGS.TXT through the crash-safe
+// publish, records it as the live profile for the state blob, and
+// publishes each changed key to the seat exactly as GOSET does after a
+// save — the kernel applies the saved keys live; bound subscribers (its
+// own panel, theme readers) re-resolve off the notices. The apply marker
+// prints only after the write landed.
+func applyProfileFile(ts *termState, ta *tabapp.TabApp, p *termProfile) bool {
+	cur, _ := vi.ReadFileAll(settingsPath, maxStartupBytes)
+	merged := applyProfileBody(string(cur), p)
+	if rc := vi.WriteFileSafe(settingsPath, []byte(merged)); rc < 0 {
+		vi.ConsoleLine(markerProfileRefused + p.name + " write rc=" + vi.Itoa64(rc))
+		return false
+	}
+	ts.profile = p.name
+	vi.ConsoleLine(markerProfile + p.name)
 	for _, k := range p.keys {
 		vi.PublishSettingChange(uint32(ta.Win), k, appName)
 	}
 	vi.PublishSettingChange(uint32(ta.Win), "term_profile", appName)
-	linkNotice(ts, fd, editor, "goterm: profile "+name)
+	return true
+}
+
+// applySavedProfile is restore's half of the command: applyEnv calls it
+// once (restored session 0) to put the terminal back in the profile the
+// blob named. The blob can name a profile the file no longer carries —
+// a name missing from the file falls back to the default (the file's
+// first entry) with the fallback marker naming both. No seat publish:
+// RestoreState never hands the window id down, and the seat re-seeded
+// its bus from the same file before it re-exec'd us.
+func (ts *termState) applySavedProfile(hst *termHost) {
+	saved := ts.savedProfile
+	if saved == "" {
+		return
+	}
+	var ps []termProfile
+	if body, r := vi.ReadFileAll(profilesPath, profilesMax); r >= 0 {
+		ps = parseProfiles(string(body))
+	}
+	p, fellBack := resolveRestore(ps, saved)
+	if p == nil {
+		vi.ConsoleLine(markerProfileRefused + "restore " + saved)
+		return
+	}
+	cur, _ := vi.ReadFileAll(settingsPath, maxStartupBytes)
+	merged := applyProfileBody(string(cur), p)
+	if rc := vi.WriteFileSafe(settingsPath, []byte(merged)); rc < 0 {
+		vi.ConsoleLine(markerProfileRefused + "restore " + saved + " write rc=" + vi.Itoa64(rc))
+		return
+	}
+	ts.profile = p.name
+	if fellBack {
+		vi.ConsoleLine(markerProfileFallback + p.name + " saved=" + saved)
+		writeTTY(ts, hst.fd, []byte("\r\ngoterm: profile "+p.name+" (restored; '"+saved+"' is gone — the default applies)\r\n"))
+		return
+	}
+	vi.ConsoleLine(markerProfile + p.name)
+	writeTTY(ts, hst.fd, []byte("\r\ngoterm: profile "+p.name+" (restored)\r\n"))
 }

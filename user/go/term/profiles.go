@@ -24,8 +24,10 @@
 //
 // In-terminal selection is the `term-profile` line command (the same
 // front-end intercept as `exit --close` — it never reaches the engine):
-// `term-profile` lists the file's profile names, `term-profile <name>`
-// applies one.
+// `term-profile` lists the file's profile names (the active one starred),
+// `term-profile <name>` applies one, and `term-profile next`/`prev` cycle
+// the file's order with wraparound. `next` and `prev` are therefore
+// reserved names — a profile carrying either is unreachable by name.
 package main
 
 import (
@@ -169,7 +171,9 @@ func applyProfileBody(body string, p *termProfile) string {
 }
 
 // profileCmd decodes a `term-profile` line: (list=true) a bare command,
-// (name) the profile to apply, ok=false for anything else.
+// (name) the profile to apply — "next"/"prev" ride the name slot and
+// linkact resolves them against the file's order — ok=false for anything
+// else.
 func profileCmd(line string) (name string, list, ok bool) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 || fields[0] != "term-profile" {
@@ -182,4 +186,62 @@ func profileCmd(line string) (name string, list, ok bool) {
 		return fields[1], false, true
 	}
 	return "", false, false
+}
+
+// cycleProfile resolves `next` (delta=1) / `prev` (delta=-1) in the file's
+// order, wrapping at the ends. An unset or file-absent current enters at
+// the head (next) or the tail (prev) — the cycle's entry points.
+func cycleProfile(ps []termProfile, cur string, delta int) *termProfile {
+	if len(ps) == 0 {
+		return nil
+	}
+	idx := -1
+	for i := range ps {
+		if ps[i].name == cur {
+			idx = i
+		}
+	}
+	switch {
+	case idx < 0 && delta >= 0:
+		idx = 0
+	case idx < 0:
+		idx = len(ps) - 1
+	case delta >= 0:
+		idx = (idx + 1) % len(ps)
+	default:
+		idx = (idx - 1 + len(ps)) % len(ps)
+	}
+	return &ps[idx]
+}
+
+// resolveRestore picks the profile a blob-saved name asks for: the named
+// one, else the file's head — the first profile in file order is the
+// default — with fellBack reporting which half fired. An empty file
+// resolves to nil.
+func resolveRestore(ps []termProfile, saved string) (*termProfile, bool) {
+	for i := range ps {
+		if ps[i].name == saved {
+			return &ps[i], false
+		}
+	}
+	if len(ps) == 0 {
+		return nil, false
+	}
+	return &ps[0], true
+}
+
+// profileNamesMarked renders the bare-command list: space-joined names
+// with `*` on cur — the active profile as the settings store records it.
+func profileNamesMarked(ps []termProfile, cur string) string {
+	var names []byte
+	for i := range ps {
+		if i > 0 {
+			names = append(names, ' ')
+		}
+		if ps[i].name == cur {
+			names = append(names, '*')
+		}
+		names = append(names, ps[i].name...)
+	}
+	return string(names)
 }

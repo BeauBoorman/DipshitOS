@@ -1,8 +1,8 @@
 // M125e (issue #2590): GOTERM's session state — the per-app blob the seat
 // carries through the M125a protocol (vi.EncodeAppState, AppStateMax =
-// 64 KiB). The app owns the format; GOTERM's v1 is:
+// 64 KiB). The app owns the format; v2 (card #2927) is:
 //
-//	u8  format (=1)          the app's own staleness tag — the seat
+//	u8  format (=2)          the app's own staleness tag — the seat
 //	u8  flags                stores and returns StateVersion verbatim,
 //	     bit0: alt-screen    but RestoreState runs inside tabapp.Init
 //	u16 cwdLen | cwd         before the returned TabApp can be read, so
@@ -10,6 +10,8 @@
 //	           { u16 len |
 //	             "NAME=VALUE" }
 //	u32 scLen  | scrollback
+//	u16 profLen | profile    v2 only (card #2927): the active
+//	                         term-profile name, "" when none
 //
 // The scrollback is a BYTE STREAM, not a grid: the kernel owns the tty
 // presentation buffer and exposes no readback seam, so GOTERM keeps the
@@ -24,7 +26,9 @@
 //
 // Every bound is hard and every field is length-checked: a stale, short,
 // over-declared, or trailing-garbage blob is refused WHOLE (marker
-// `goterm: state refused`), never half-applied and never crashed on.
+// `goterm: state refused`), never half-applied and never crashed on. A v1
+// blob still decodes — it predates the profile field, so the name lands
+// empty and no profile re-applies; v0 and future formats refuse.
 package main
 
 import (
@@ -36,7 +40,8 @@ import (
 )
 
 const (
-	termStateVersion uint8 = 1
+	termStateVersion uint8 = 2 // current format; 1 is the M125e legacy
+	termStateMinVer  uint8 = 1 // oldest blob decode still accepts
 	// stateCwdMax is the resolver's own path bound (shlib maxPathBytes).
 	stateCwdMax = 512
 	// Env section caps — bounded so the table can never crowd scrollback
@@ -73,6 +78,13 @@ type termState struct {
 	pairs    []string
 	savedAlt bool
 	scroll   []byte
+
+	// Card #2927: profile is the live pick (set by a successful
+	// term-profile apply and by restore); save() falls back to the
+	// settings store's term_profile row when no apply ran this process.
+	// savedProfile is the blob's decoded name — applyEnv consumes it.
+	profile      string
+	savedProfile string
 
 	// M149b (#2807): the OSC-8 link tracker on the write path and the
 	// SGR mouse-report filter on the read path (links.go).
@@ -120,6 +132,16 @@ func (ts *termState) save() []byte {
 			scroll = scroll[i+1:]
 		}
 	}
+	// The active profile is the settings store's record; the field covers
+	// a save that lands between an apply and the file write's visibility,
+	// or a guest whose SETTINGS.TXT cannot be re-read.
+	profile := shlib.SettingFromSettings(settingsBody(), "term_profile", "")
+	if profile == "" {
+		profile = ts.profile
+	}
+	if len(profile) > profileNameMax {
+		profile = profile[:profileNameMax]
+	}
 	out := make([]byte, 0, 10+len(cwd)+len(scroll))
 	out = append(out, termStateVersion, 0)
 	if ts.alt {
@@ -144,7 +166,8 @@ func (ts *termState) save() []byte {
 	out[nPos+1] = byte(nEnv >> 8)
 	out = appendU32(out, uint32(len(scroll)))
 	out = append(out, scroll...)
-	return out
+	out = appendU16(out, uint16(len(profile)))
+	return append(out, profile...)
 }
 
 // restore is Config.RestoreState's body: decode or refuse whole. The
@@ -161,6 +184,7 @@ func (ts *termState) restore(b []byte) {
 	ts.cwd = d.cwd
 	ts.savedAlt = d.alt
 	ts.scroll = d.scroll
+	ts.savedProfile = d.profile
 }
 
 // applyReplay writes the saved stream to the tty (through the capture
@@ -178,8 +202,12 @@ func (ts *termState) applyReplay(fd uint32) {
 // verifies the saved cwd still exists — a stale PWD is folded back to
 // the share root rather than poisoning later path resolution. The
 // blob's explicit cwd field wins; the env table's own PWD is the
-// fallback when the field is empty. Returns the cwd the shell holds.
+// fallback when the field is empty. The blob's profile name re-applies
+// here too (card #2927): the merge runs before the restored marker, so
+// `goterm: profile <name>` is already on serial when `state restored`
+// summarizes. Returns the cwd the shell holds.
 func (ts *termState) applyEnv(sh *shlib.Shell, hst *termHost) string {
+	defer ts.applySavedProfile(hst)
 	for _, p := range ts.pairs {
 		if eq := strings.IndexByte(p, '='); eq > 0 {
 			sh.Env().Set(p[:eq], p[eq+1:])
@@ -212,10 +240,11 @@ func (ts *termState) restoredMarker(cwd string) string {
 
 // termStateDecoded is decodeTermState's checked result.
 type termStateDecoded struct {
-	cwd    string
-	pairs  []string
-	alt    bool
-	scroll []byte
+	cwd     string
+	pairs   []string
+	alt     bool
+	scroll  []byte
+	profile string
 }
 
 func appendU16(b []byte, v uint16) []byte {
@@ -231,9 +260,10 @@ func appendU32(b []byte, v uint32) []byte {
 // no trailing bytes. Refusal is total (ok=false), never partial state.
 func decodeTermState(b []byte) (termStateDecoded, bool) {
 	var d termStateDecoded
-	if len(b) < 6 || b[0] != termStateVersion {
+	if len(b) < 6 || b[0] < termStateMinVer || b[0] > termStateVersion {
 		return d, false
 	}
+	ver := b[0]
 	d.alt = b[1]&1 != 0
 	off := 2
 	u16 := func() (int, bool) {
@@ -272,10 +302,23 @@ func decodeTermState(b []byte) (termStateDecoded, bool) {
 	sc := int(uint32(b[off]) | uint32(b[off+1])<<8 |
 		uint32(b[off+2])<<16 | uint32(b[off+3])<<24)
 	off += 4
-	if sc > stateScrollMax || len(b)-off != sc {
+	if sc > stateScrollMax || len(b)-off < sc {
 		return d, false
 	}
-	d.scroll = append([]byte(nil), b[off:]...)
+	d.scroll = append([]byte(nil), b[off:off+sc]...)
+	off += sc
+	if ver >= 2 {
+		// v2's trailing section (card #2927): the active profile name.
+		pl, ok := u16()
+		if !ok || pl > profileNameMax || len(b)-off != pl {
+			return d, false
+		}
+		d.profile = string(b[off : off+pl])
+		off += pl
+	}
+	if off != len(b) {
+		return d, false
+	}
 	return d, true
 }
 

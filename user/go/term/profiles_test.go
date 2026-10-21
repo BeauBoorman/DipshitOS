@@ -59,10 +59,73 @@ func TestProfileCmd(t *testing.T) {
 	if n, l, ok := profileCmd("term-profile dusk"); !ok || l || n != "dusk" {
 		t.Fatal("named term-profile")
 	}
+	// next/prev parse as names — linkact resolves them against the file.
+	if n, l, ok := profileCmd("term-profile next"); !ok || l || n != "next" {
+		t.Fatal("term-profile next")
+	}
+	if n, l, ok := profileCmd("term-profile prev"); !ok || l || n != "prev" {
+		t.Fatal("term-profile prev")
+	}
 	if _, _, ok := profileCmd("term-profile a b"); ok {
 		t.Fatal("extra args accepted")
 	}
 	if _, _, ok := profileCmd("exit"); ok {
 		t.Fatal("non-command accepted")
+	}
+}
+
+// next/prev walk the file's order and wrap at the ends; an unset or
+// file-absent current enters at the head (next) or tail (prev).
+func TestCycleProfile(t *testing.T) {
+	ps := []termProfile{{name: "dawn"}, {name: "dusk"}, {name: "amber"}}
+	if p := cycleProfile(ps, "dusk", 1); p == nil || p.name != "amber" {
+		t.Fatalf("next from dusk = %+v", p)
+	}
+	if p := cycleProfile(ps, "amber", 1); p == nil || p.name != "dawn" {
+		t.Fatalf("next from tail did not wrap: %+v", p)
+	}
+	if p := cycleProfile(ps, "dusk", -1); p == nil || p.name != "dawn" {
+		t.Fatalf("prev from dusk = %+v", p)
+	}
+	if p := cycleProfile(ps, "dawn", -1); p == nil || p.name != "amber" {
+		t.Fatalf("prev from head did not wrap: %+v", p)
+	}
+	// Entry points: no current, or a current the file no longer carries.
+	for _, cur := range []string{"", "ghost"} {
+		if p := cycleProfile(ps, cur, 1); p == nil || p.name != "dawn" {
+			t.Fatalf("next from %q = %+v", cur, p)
+		}
+		if p := cycleProfile(ps, cur, -1); p == nil || p.name != "amber" {
+			t.Fatalf("prev from %q = %+v", cur, p)
+		}
+	}
+	if p := cycleProfile(nil, "dusk", 1); p != nil {
+		t.Fatalf("empty file cycled to %+v", p)
+	}
+}
+
+// The blob's saved name applies when the file still has it; a name the
+// file dropped falls back to the file's head (the default).
+func TestResolveRestore(t *testing.T) {
+	ps := []termProfile{{name: "dawn"}, {name: "dusk"}}
+	if p, fb := resolveRestore(ps, "dusk"); fb || p == nil || p.name != "dusk" {
+		t.Fatalf("named restore = %+v fallback=%v", p, fb)
+	}
+	if p, fb := resolveRestore(ps, "ghost"); !fb || p == nil || p.name != "dawn" {
+		t.Fatalf("absent-name restore = %+v fallback=%v", p, fb)
+	}
+	if p, fb := resolveRestore(nil, "dusk"); fb || p != nil {
+		t.Fatalf("empty-file restore = %+v fallback=%v", p, fb)
+	}
+}
+
+// The bare list stars the active profile — and nothing when none is set.
+func TestProfileNamesMarked(t *testing.T) {
+	ps := []termProfile{{name: "dawn"}, {name: "dusk"}}
+	if got := profileNamesMarked(ps, "dusk"); got != "dawn *dusk" {
+		t.Fatalf("marked list = %q", got)
+	}
+	if got := profileNamesMarked(ps, ""); got != "dawn dusk" {
+		t.Fatalf("unset list = %q", got)
 	}
 }

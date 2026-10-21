@@ -54,6 +54,69 @@ func TestStateCodecRoundTrip(t *testing.T) {
 	}
 }
 
+// Card #2927: the blob carries the active profile's name — set by a
+// successful apply, read back on restore.
+func TestStateCodecCarriesProfile(t *testing.T) {
+	ts := newTestState()
+	ts.sh.Env().Set("PWD", "/")
+	ts.capture([]byte("prompt> "))
+	ts.profile = "dusk"
+
+	d, ok := decodeTermState(ts.save())
+	if !ok {
+		t.Fatal("decode refused a v2 blob")
+	}
+	if d.profile != "dusk" {
+		t.Fatalf("profile = %q want dusk", d.profile)
+	}
+	if ts.save()[0] != termStateVersion {
+		t.Fatal("blob did not tag itself v2")
+	}
+
+	// An unset name serializes empty.
+	d2, ok := decodeTermState(newTestState().save())
+	if !ok || d2.profile != "" {
+		t.Fatalf("empty profile = %q ok=%v", d2.profile, ok)
+	}
+}
+
+// A v1 blob (no profile section) still decodes — the name lands empty and
+// no profile re-applies.
+func TestStateDecodeV1Blob(t *testing.T) {
+	// v1 layout: fmt, flags, u16 cwd | u16 envN | u32 scLen | scroll.
+	v1 := []byte{1, 0}
+	v1 = appendU16(v1, 4)
+	v1 = append(v1, "/old"...)
+	v1 = appendU16(v1, 0)
+	v1 = appendU32(v1, 5)
+	v1 = append(v1, "tail\n"...)
+	d, ok := decodeTermState(v1)
+	if !ok {
+		t.Fatal("v1 blob refused")
+	}
+	if d.cwd != "/old" || d.profile != "" || string(d.scroll) != "tail\n" {
+		t.Fatalf("v1 decode = %+v", d)
+	}
+}
+
+// The v2 profile section is length-checked like every other field.
+func TestStateDecodeProfileBounds(t *testing.T) {
+	good := newTestState().save() // empty profile: trailing u16 0
+	// Truncated profLen (scroll tail intact, u16 cut) refuses.
+	if _, ok := decodeTermState(good[:len(good)-1]); ok {
+		t.Error("truncated profLen accepted")
+	}
+	// profLen over the name bound refuses.
+	bad := append(append([]byte(nil), good[:len(good)-2]...), 0xff, 0xff)
+	if _, ok := decodeTermState(bad); ok {
+		t.Error("over-bound profile name accepted")
+	}
+	// Trailing garbage after a complete v2 blob refuses.
+	if _, ok := decodeTermState(append(append([]byte(nil), good...), 0)); ok {
+		t.Error("trailing garbage accepted")
+	}
+}
+
 func TestStateDecodeRefusesMalformed(t *testing.T) {
 	good := newTestState().save()
 	cases := []struct {
