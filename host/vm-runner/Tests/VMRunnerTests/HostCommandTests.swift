@@ -248,4 +248,23 @@ final class HostCommandTests: XCTestCase {
         // names the state instead of repeating the stop.
         XCTAssertEqual(host.commandBus.dispatch(.stop), .disabled)
     }
+    /// M157a (#2934): `close@vm=<k>` — the verb parses like every other
+    /// `@`-operand trigger, and a bare `close` receipts the named
+    /// no_target refusal rather than guessing a window.
+    func testCloseVerbParsesAndNeedsATarget() throws {
+        let bound = try XCTUnwrap(HostCommandTrigger("vm2:virelai> :close@vm=2"))
+        XCTAssertEqual(bound.session, 2)
+        XCTAssertEqual(bound.marker, "virelai> ")
+        XCTAssertEqual(bound.command, .close)
+        XCTAssertEqual(bound.argument, "vm=2")
+        let bare = try XCTUnwrap(HostCommandTrigger("done:close@3"))
+        XCTAssertEqual(bare.command, .close)
+        XCTAssertEqual(bare.argument, "3")
+        // An unregistered bus — the verb reports unavailable like any
+        // other until the registry wires it.
+        let sink = Sink()
+        let bus = makeBus(sink)
+        XCTAssertEqual(bus.dispatch(.close), .unavailable)
+        XCTAssertEqual(sink.lines, ["host-ui: cmd=close state=unavailable"])
+    }
 }

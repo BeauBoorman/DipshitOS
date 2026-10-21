@@ -372,4 +372,28 @@ final class VMProfileTests: XCTestCase {
                        "org.virelaios.vm.weird-name")
         XCTAssertEqual(VMProfile.defaultIdentity(for: "!!!"), "org.virelaios.vm.profile")
     }
+    /// M157a (#2934): the close policy key — absent decodes to stop,
+    /// "suspend" round-trips through the bundle, and a foreign word
+    /// refuses the config load as corrupt (the manifest's own naming
+    /// rule — never a silent default).
+    func testCloseActionParsesDefaultsAndRefusesForeign() throws {
+        XCTAssertEqual(VMProfile.Config().closeAction, .stop)
+        let decoded = try JSONDecoder().decode(
+            VMProfile.Config.self,
+            from: Data(#"{"closeAction": "suspend"}"#.utf8))
+        XCTAssertEqual(decoded.closeAction, .suspend)
+        let url = bundleURL()
+        var p = try VMProfile.create(at: url)
+        XCTAssertEqual(p.config.closeAction, .stop)
+        p.config.closeAction = .suspend
+        try p.save()
+        XCTAssertEqual(try VMProfile.load(from: url).config.closeAction, .suspend)
+        try Data(#"{"cpus": 2, "memoryMiB": 256, "baseImage": "x", "closeAction": "hibernate"}"#.utf8)
+            .write(to: url.appendingPathComponent("config.json"))
+        XCTAssertThrowsError(try VMProfile.load(from: url)) { error in
+            guard case .corruptConfig = error as? VMProfile.ProfileError else {
+                return XCTFail("expected corruptConfig, got \(error)")
+            }
+        }
+    }
 }

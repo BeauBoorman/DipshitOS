@@ -15,6 +15,12 @@ import AppKit
 /// `unavailable` until its card wires it (later cards add verbs, not
 /// menus).
 public enum HostCommand: String, CaseIterable, Sendable {
+    // M157a (#2934): the host-automation close verb — `close@vm=<k>`
+    // asks the session registry to run window <k>'s close policy (the
+    // profile's closeAction), so a gate can close a window without
+    // synthesized clicks. Not a guest ABI and no menu leaf; a dispatch
+    // with no staged target receipts `disabled` + `reason=no_target`.
+    case close
     // VirelaiOS menu.
     case about
     // M128a (#2605): ⌘, toggles the machine settings panel — the bus's
@@ -210,6 +216,11 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
     ///
     ///     host-ui: cmd=<verb> vm=<n> state=<outcome>
     public var sessionID: Int?
+
+    /// M157a (#2934): the `close@vm=<k>` trigger's staged target — the
+    /// trigger fire parses the `@` operand into this slot before
+    /// dispatching (the profiles model's newWindowTarget precedent).
+    public var closeTargetVM: Int?
 
     /// M114e (#2458): the bounded MP4 recorder every bus carries — the
     /// one verb family whose handler needs nothing the runner owns: the

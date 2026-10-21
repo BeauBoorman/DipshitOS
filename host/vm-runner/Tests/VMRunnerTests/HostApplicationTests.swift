@@ -1,6 +1,7 @@
 import AppKit
 import XCTest
 import VMAppKit
+import VMProfile
 
 /// Hidden UI seams only: no VM, input posts, activation or class-C claim.
 final class HostApplicationTests: XCTestCase {
@@ -12,7 +13,7 @@ final class HostApplicationTests: XCTestCase {
         let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
         let view = GuestView()
         host.attach(view)
-        XCTAssertEqual(host.window.title, "VirelaiOS — Starting VM")
+        XCTAssertEqual(host.window.title, "VirelaiOS — default — Starting VM")
         XCTAssertTrue(view.isHidden)
         // M114d (#2457): the label now lives inside the split's guest
         // pane — find the field by its content, not its depth.
@@ -23,7 +24,7 @@ final class HostApplicationTests: XCTestCase {
         XCTAssertTrue(status.stringValue.contains("/fixture/serial.log"))
         XCTAssertFalse(status.isHidden)
         host.didStart()
-        XCTAssertEqual(host.window.title, "VirelaiOS")
+        XCTAssertEqual(host.window.title, "VirelaiOS — default")
         XCTAssertFalse(view.isHidden)
         XCTAssertTrue(status.isHidden)
         XCTAssertTrue(host.window.firstResponder === view)
@@ -31,7 +32,7 @@ final class HostApplicationTests: XCTestCase {
         host.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification))
         XCTAssertTrue(host.window.firstResponder === view)
         host.showFailure("fixture VZ refusal")
-        XCTAssertEqual(host.window.title, "VirelaiOS — VM failed")
+        XCTAssertEqual(host.window.title, "VirelaiOS — default — VM failed")
         XCTAssertTrue(view.isHidden)
         XCTAssertFalse(host.window.firstResponder === view)
         XCTAssertFalse(status.isHidden)
@@ -47,10 +48,10 @@ final class HostApplicationTests: XCTestCase {
             XCTAssertEqual(code, 0)
         }
         XCTAssertFalse(host.windowShouldClose(host.window))
-        XCTAssertEqual(host.window.title, "VirelaiOS — Stopping VM")
+        XCTAssertEqual(host.window.title, "VirelaiOS — default — Stopping VM")
         XCTAssertEqual(host.applicationShouldTerminate(NSApplication.shared), .terminateLater)
         host.didStart()
-        XCTAssertEqual(host.window.title, "VirelaiOS — Stopping VM")
+        XCTAssertEqual(host.window.title, "VirelaiOS — default — Stopping VM")
         XCTAssertEqual(stops, ["window-close"])
     }
 
@@ -133,7 +134,8 @@ final class HostApplicationTests: XCTestCase {
         XCTAssertEqual(ids, [
             HostApplication.inspectorToolbarItem, HostApplication.screenshotToolbarItem,
             HostApplication.recordToolbarItem, HostApplication.sendFileToolbarItem,
-            .flexibleSpace, HostApplication.lanesToolbarItem,
+            .flexibleSpace, HostApplication.statsToolbarItem,
+            HostApplication.lanesToolbarItem,
             HostApplication.captureKeysToolbarItem,
         ])
         XCTAssertEqual(ids, host.toolbarAllowedItemIdentifiers(host.window.toolbar!))
@@ -237,5 +239,106 @@ final class HostApplicationTests: XCTestCase {
             "host-ui: cmd=shortcuts state=performed open=1 chords=8",
             "host-ui: cmd=shortcuts state=performed open=0 chords=8",
         ])
+    }
+    // MARK: M157a (#2934) — window identity + stats line + close policy.
+
+    /// The primary window's title carries the armed profile's name (the
+    /// sibling windows' own convention); a flag run reads
+    /// "VirelaiOS — default" — the card's exact word.
+    func testWindowTitleCarriesTheProfileName() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let profile = try VMProfile.create(
+            at: dir.appendingPathComponent("ws.virelaivm", isDirectory: true))
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        host.didStart()
+        XCTAssertEqual(host.window.title, "VirelaiOS — default")
+        let named = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        named.commandBus.machine.profileURL = profile.url
+        named.didStart()
+        XCTAssertEqual(named.window.title, "VirelaiOS — ws")
+        XCTAssertEqual(named.sessionProfile?.name, "ws")
+    }
+
+    /// The stats item builds from the model — configured figures armed
+    /// from argv/profile, the state word tracking the lifecycle, and
+    /// the tooltip naming a figure the line cannot show.
+    func testStatsItemIsTheModelProjection() throws {
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        host.commandBus.machine.arguments = ["VMRunner", "--cpus", "4", "--memory-mib", "256"]
+        let item = try XCTUnwrap(host.toolbar(host.window.toolbar!,
+                                              itemForItemIdentifier: HostApplication.statsToolbarItem,
+                                              willBeInsertedIntoToolbar: true))
+        XCTAssertEqual(item.itemIdentifier, HostApplication.statsToolbarItem)
+        let field = try XCTUnwrap(item.view as? NSTextField)
+        host.didStart()
+        XCTAssertEqual(field.stringValue, "4 vCPU · 256 MiB · running · up 0m")
+        host.stop("test")
+        XCTAssertEqual(field.stringValue, "4 vCPU · 256 MiB · stopping · up 0m")
+    }
+
+    /// The default close policy is stop — the close line names it and
+    /// the session's stop still lands.
+    func testCloseDefaultsToStop() {
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        var lines: [String] = []
+        host.commandBus.emit = { lines.append($0) }
+        var stops: [String] = []
+        host.onStop = { reason, _ in stops.append(reason) }
+        XCTAssertFalse(host.windowShouldClose(host.window))
+        XCTAssertEqual(stops, ["window-close"])
+        XCTAssertEqual(lines, ["host-ui: close action=stop result=stopped"])
+    }
+
+    /// closeAction=suspend: the driver accept lands the `saved` close
+    /// line + the named message; a refusal names its code (the
+    /// custom-virtio Code=2 class through the model's argv statics) and
+    /// the VM still stops.
+    func testCloseSuspendSavedAndRefusedCode2() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var profile = try VMProfile.create(
+            at: dir.appendingPathComponent("sv.virelaivm", isDirectory: true))
+        profile.config.closeAction = .suspend
+        try profile.save()
+
+        let host = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        var lines: [String] = []
+        host.commandBus.emit = { lines.append($0) }
+        host.commandBus.machine.profileURL = profile.url
+        var calls = 0
+        host.commandBus.machine.suspendDriver = { calls += 1; return nil }
+        var stops = 0
+        host.onStop = { _, _ in stops += 1 }
+        host.requestClose(reason: "window-close")
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(stops, 1)
+        XCTAssertEqual(lines, ["host-ui: close action=suspend result=saved"])
+        XCTAssertEqual(host.closeMessage, HostMachineModel.closeSavedMessage)
+        XCTAssertEqual(host.window.subtitle, HostMachineModel.closeSavedMessage)
+        XCTAssertTrue(host.closeMessage!.contains("--resume"))
+        XCTAssertTrue(host.closeMessage!.contains("Code=12"))
+
+        // The named Code=2 refusal: the driver says `unsupported` and
+        // argv arms a custom-virtio share — the message + line name it,
+        // and the stop still lands.
+        let refused = HostApplication(serialLog: "/fixture/serial.log", presentWindow: false)
+        var lines2: [String] = []
+        refused.commandBus.emit = { lines2.append($0) }
+        refused.commandBus.machine.profileURL = profile.url
+        refused.commandBus.machine.arguments = ["VMRunner", "--cvc-file", "/x"]
+        refused.commandBus.machine.suspendDriver = { "unsupported" }
+        var stops2 = 0
+        refused.onStop = { _, _ in stops2 += 1 }
+        refused.requestClose(reason: "close-verb")
+        XCTAssertEqual(stops2, 1)
+        XCTAssertEqual(lines2, ["host-ui: close action=suspend result=refused code=2"])
+        let msg = try XCTUnwrap(refused.closeMessage)
+        XCTAssertTrue(msg.contains("code=2"))
+        XCTAssertTrue(msg.contains("--resume"))
+        XCTAssertTrue(msg.contains("Code=12"))
+        XCTAssertEqual(refused.window.subtitle, msg)
     }
 }

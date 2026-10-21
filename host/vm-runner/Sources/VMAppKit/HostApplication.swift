@@ -108,6 +108,34 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     private var updateBannerTimer: Timer?
     private let serialLog: String
 
+    /// M157a (#2934): the stats line's model — armed from the armed
+    /// profile/argv resolution (the configured shape only; the tooltip
+    /// names what the line cannot show). The state word is the
+    /// lifecycle's; startedAt lands at didStart.
+    public let stats = HostStatsModel()
+    private var statsTimer: Timer?
+    /// The last close's window message (the named refusal or the saved
+    /// leg) — shown under the title and in the stopping status; the
+    /// class-A read.
+    public private(set) var closeMessage: String?
+    /// A test's profile override — else the machine model's own
+    /// --profile/--resume/document resolution wins (the same load the
+    /// settings/profiles models make, so the window title, close policy
+    /// and stats all read the machine that is actually running).
+    public var sessionProfileOverride: VMProfile?
+    private var sessionProfileCache: (url: URL, profile: VMProfile)?
+    public var sessionProfile: VMProfile? {
+        if let p = sessionProfileOverride { return p }
+        guard let url = commandBus.machine.resolvedProfileURL() else { return nil }
+        if let c = sessionProfileCache, c.url == url { return c.profile }
+        guard let p = try? VMProfile.load(from: url) else { return nil }
+        sessionProfileCache = (url, p)
+        return p
+    }
+    /// The window-identity name — the armed profile's, or `default` on
+    /// a flag run (the card's exact word).
+    private var titleName: String { sessionProfile?.name ?? "default" }
+
     /// M128c (#2607): set by main.swift's document-launch harvest — the
     /// launch sequence already ran there so the `odoc` event could
     /// dispatch; init must not post the launch notifications twice.
@@ -132,6 +160,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public static let recordToolbarItem = NSToolbarItem.Identifier("virelai.record")
     public static let sendFileToolbarItem = NSToolbarItem.Identifier("virelai.send-file")
     public static let lanesToolbarItem = NSToolbarItem.Identifier("virelai.lanes")
+    /// M157a (#2934): the stats line's toolbar identifier — a status
+    /// item, not a verb surface.
+    public static let statsToolbarItem = NSToolbarItem.Identifier("virelai.stats")
     private weak var inspectorPill: NSButton?
     private weak var screenshotPill: NSButton?
     private weak var recordPill: NSButton?
@@ -324,6 +355,13 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
             self?.syncUpdateBanner()
         }
         syncUpdateBanner()
+        // M157a (#2934): the stats line — state transitions repaint
+        // through renderState; the timer keeps uptime moving.
+        stats.stateProvider = { [weak self] in self?.statsStateWord ?? "starting" }
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.syncStats()
+        }
+        syncStats()
         commandBus.recorder.onChange = { [weak self] in self?.refreshRecordAffordance() }
         commandBus.captures.onChange = { [weak self] in self?.syncSavedBadge() }
         commandBus.agent.onChange = { [weak self] in self?.refreshAgentAffordance() }
@@ -642,7 +680,8 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         var ids: [NSToolbarItem.Identifier] = [
             Self.inspectorToolbarItem, Self.screenshotToolbarItem,
             Self.recordToolbarItem, Self.sendFileToolbarItem,
-            .flexibleSpace, Self.lanesToolbarItem, Self.captureKeysToolbarItem,
+            .flexibleSpace, Self.statsToolbarItem, Self.lanesToolbarItem,
+            Self.captureKeysToolbarItem,
         ]
         // The AGENT pill exists only where a companion can be armed —
         // an agentless run keeps the flags-off posture (no chrome for
@@ -668,6 +707,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     public func toolbar(_ toolbar: NSToolbar,
                         itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
                         willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        if itemIdentifier == Self.statsToolbarItem {
+            return stats.makeToolbarItem(itemIdentifier)
+        }
         if itemIdentifier == Self.agentToolbarItem {
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             let pill = NSButton(title: commandBus.agent.pillText, target: self,
@@ -831,6 +873,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
 
     public func didStart() {
         lifecycle.didStart()
+        stats.startedAt = Date()
         renderState()
         focusGuest()
         reportFocus("started")
@@ -850,22 +893,87 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     private func renderState() {
         switch lifecycle.state {
         case .starting:
-            window.title = "VirelaiOS — Starting VM"
+            window.title = "VirelaiOS — \(titleName) — Starting VM"
             status.stringValue = "Starting VirelaiOS…\nSerial log: \(serialLog)"
         case .running:
-            window.title = "VirelaiOS"
+            window.title = "VirelaiOS — \(titleName)"
         case .failed(let message):
-            window.title = "VirelaiOS — VM failed"
+            window.title = "VirelaiOS — \(titleName) — VM failed"
             status.stringValue = "VirelaiOS could not run the VM.\n\(message)\nSerial log: \(serialLog)\nClose this window or choose Quit, then rerun the session command."
         case .stopping:
-            window.title = "VirelaiOS — Stopping VM"
-            status.stringValue = "Stopping VirelaiOS…"
+            window.title = "VirelaiOS — \(titleName) — Stopping VM"
+            status.stringValue = (closeMessage.map { $0 + "\n" } ?? "") + "Stopping VirelaiOS…"
         case .stopped:
             status.stringValue = "VirelaiOS stopped."
         }
         status.isHidden = lifecycle.state == .running
         guestView?.isHidden = lifecycle.state != .running
         if lifecycle.state != .running { window.makeFirstResponder(nil) }
+        syncStats()
+    }
+
+    /// M157a (#2934): the stats line — the configured half resolves
+    /// from the runner's own precedence (`--cpus`/`--memory-mib` win
+    /// over the armed profile) and is re-read on every refresh so a
+    /// late-arming profile (the document launch's profileURL land)
+    /// still projects; the live halves repaint with it.
+    private func syncStats() {
+        stats.vcpus = argvValue("--cpus").flatMap(Int.init)
+            ?? sessionProfile?.config.cpus ?? 2
+        stats.memoryMiB = argvValue("--memory-mib").flatMap(Int.init)
+            ?? sessionProfile?.config.memoryMiB ?? 512
+        stats.refreshItem()
+    }
+
+    private var statsStateWord: String {
+        switch lifecycle.state {
+        case .starting: return "starting"
+        case .running: return "running"
+        case .failed: return "failed"
+        case .stopping: return "stopping"
+        case .stopped: return "stopped"
+        }
+    }
+
+    /// The runner's own flag resolution — last occurrence wins, the
+    /// HostMachineModel rule, through the model's argv seam.
+    private func argvValue(_ flag: String) -> String? {
+        let args = commandBus.machine.arguments ?? CommandLine.arguments
+        guard let i = args.lastIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
+
+    /// M157a (#2934): the window-close policy — the armed profile's
+    /// `closeAction` (absent = stop). `suspend` rides the Machine
+    /// model's SuspendCtl driver (the identical save path its menu verb
+    /// uses); a refusal — the custom-virtio Code=2 class included — is
+    /// named in the window and in the `host-ui: close` line, and the VM
+    /// stops anyway. A saved machine continues with `--resume` (the
+    /// message names the Code=12 bound). The window's own close button
+    /// and the `close vm=<k>` verb land here alike.
+    public func requestClose(reason: String) {
+        let vm = commandBus.sessionID.map { " vm=\($0)" } ?? ""
+        switch sessionProfile?.config.closeAction ?? .stop {
+        case .suspend:
+            if let driver = commandBus.machine.suspendDriver {
+                if let wire = driver() {
+                    let code = commandBus.machine.closeRefusalCode(wire)
+                    closeMessage = HostMachineModel.closeRefusalMessage(code: code)
+                    commandBus.emit("host-ui: close\(vm) action=suspend result=refused code=\(code)")
+                } else {
+                    closeMessage = HostMachineModel.closeSavedMessage
+                    commandBus.emit("host-ui: close\(vm) action=suspend result=saved")
+                }
+            } else {
+                closeMessage = HostMachineModel.closeRefusalMessage(code: "no_state")
+                commandBus.emit("host-ui: close\(vm) action=suspend result=refused code=no_state")
+            }
+            window.subtitle = closeMessage ?? ""
+            stop(reason)
+        case .stop:
+            commandBus.emit("host-ui: close\(vm) action=stop result=stopped")
+            stop(reason)
+        }
     }
 
     private func focusGuest() {
@@ -876,6 +984,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     deinit {
         updateBannerTimer?.invalidate()
         savedBadgeTimer?.invalidate()
+        statsTimer?.invalidate()
     }
 
     private func reportFocus(_ reason: String) {
@@ -894,7 +1003,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     }
 
     public func windowShouldClose(_ sender: NSWindow) -> Bool {
-        stop("window-close")
+        requestClose(reason: "window-close")
         return false // Keep the stopping state visible until VZ completes.
     }
 

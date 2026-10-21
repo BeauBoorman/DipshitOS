@@ -415,6 +415,45 @@ public final class HostMachineModel {
 
     private func changed() { onChange?() }
 
+    // MARK: M157a (#2934) — the close policy's named messages + refusal word.
+
+    /// The named message a window shows when its `closeAction = suspend`
+    /// close is refused — the code, the stop it still runs, and the
+    /// `--resume` continuation with the M119e Code=12 bound.
+    public static func closeRefusalMessage(code: String) -> String {
+        "Suspend on close refused (code=\(code)) — this device set cannot save machine state; the VM is stopping instead. Relaunch with --resume to continue a saved machine (restore saturates at VZErrorDomain Code=12 on this host)."
+    }
+
+    /// The saved leg's window message — names the continuation path and
+    /// the same bound.
+    public static let closeSavedMessage =
+        "Suspended on close — saved into the profile's saved-state/. Relaunch with --resume to continue (restore saturates at VZErrorDomain Code=12 on this host)."
+
+    /// The close-policy refusal word — the static Code=2 class when a
+    /// custom-virtio flag armed the share (ADR 0059 D8: Code=2 is
+    /// decided statically; a boot is never needed to classify it), else
+    /// the driver's own wire code.
+    public func closeRefusalCode(_ wireCode: String) -> String {
+        if wireCode == "unsupported",
+           Self.argvArmsCustomVirtio(arguments ?? CommandLine.arguments) {
+            return "2"
+        }
+        return wireCode
+    }
+
+    static func argvArmsCustomVirtio(_ args: [String]) -> Bool {
+        args.contains { Self.customVirtioFlags.contains($0) }
+    }
+
+    /// Every flag that arms a VZCustomVirtioDevice — the
+    /// validateSaveRestoreSupport Code=2 set (the vgate_checkpoint
+    /// refusal list, ADR 0059 D1/D8).
+    static let customVirtioFlags: Set<String> = [
+        "--custom-virtio", "--cvc-echo", "--via-virtio", "--pointer-virtio",
+        "--cvc-snap", "--cvc-file", "--cvc-console-file", "--snapshot-after",
+        "--gpu3d-metal",
+    ]
+
     /// The runner's `dataFromHex`, duplicated so VMAppKit stays free of
     /// the VMRunner target (the HostSettings/HostProfiles argv-resolution
     /// precedent).
@@ -429,5 +468,103 @@ public final class HostMachineModel {
             i = j
         }
         return out
+    }
+}
+
+// MARK: - HostStatsModel — M157a (#2934): the per-window stats line
+
+/// The stats line every VM window carries: configured vCPUs, RAM, the
+/// live state word, and uptime. Configured figures ONLY — no usage
+/// metrics; a figure the line cannot show is dropped from it and named
+/// in the tooltip (the honesty rule the card sets).
+public final class HostStatsModel {
+    /// The configured vCPU count — nil until the owner arms it (the
+    /// runner knows its own VZ configuration; a test injects it).
+    public var vcpus: Int?
+    /// The configured RAM in MiB — same arming rule.
+    public var memoryMiB: Int?
+    /// The live state word — "starting"/"running"/"paused"/"stopping"/
+    /// "stopped"/"failed". The owner injects its own state read.
+    public var stateProvider: () -> String = { "starting" }
+    /// The VM-start timestamp — nil until the machine reports started,
+    /// so a not-started window shows no uptime.
+    public var startedAt: Date?
+    /// The clock — a test pins it to read a fixed uptime.
+    public var now: () -> Date = { Date() }
+
+    public init() {}
+
+    /// The line — "2 vCPU · 512 MiB · running · up 3m" with unshowable
+    /// figures dropped (and named in `tooltip`).
+    public var line: String {
+        var parts: [String] = []
+        if let vcpus { parts.append("\(vcpus) vCPU") }
+        if let memoryMiB { parts.append("\(memoryMiB) MiB") }
+        parts.append(stateProvider())
+        if let startedAt { parts.append("up \(Self.uptime(now().timeIntervalSince(startedAt)))") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// The tooltip — says the line is configured-only and names every
+    /// figure the line cannot currently show.
+    public var tooltip: String {
+        var missing: [String] = []
+        if vcpus == nil { missing.append("vCPU count") }
+        if memoryMiB == nil { missing.append("RAM") }
+        if startedAt == nil { missing.append("uptime (machine not yet started)") }
+        let head = "Configured shape — no usage metrics collected"
+        return missing.isEmpty ? head + "."
+            : head + ". Missing: " + missing.joined(separator: ", ") + "."
+    }
+
+    /// Compact uptime — "0m" under a minute, then "Nm" / "HhMm".
+    public static func uptime(_ seconds: TimeInterval) -> String {
+        let s = max(0, Int(seconds))
+        if s < 60 { return "0m" }
+        if s < 3600 { return "\(s / 60)m" }
+        return "\(s / 3600)h\(s % 3600 / 60)m"
+    }
+
+    // The live-item seams — refresh() repaints after state/uptime moves.
+    private weak var statsField: NSTextField?
+    private weak var statsItem: NSToolbarItem?
+
+    /// One toolbar item — the session toolbar (HostApplication) and a
+    /// sibling window's lone-item bar (HostStatsBar) both vend it.
+    public func makeToolbarItem(_ id: NSToolbarItem.Identifier) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: id)
+        let field = NSTextField(labelWithString: line)
+        field.font = .systemFont(ofSize: 11)
+        field.textColor = .secondaryLabelColor
+        field.toolTip = tooltip
+        item.view = field
+        item.label = "Machine"
+        item.paletteLabel = "Machine Stats"
+        item.toolTip = tooltip
+        statsField = field
+        statsItem = item
+        return item
+    }
+
+    /// Repaint the live item — cheap enough to run on a poll tick.
+    public func refreshItem() {
+        statsField?.stringValue = line
+        statsField?.toolTip = tooltip
+        statsItem?.toolTip = tooltip
+    }
+}
+
+/// A sibling window's lone-item toolbar — the stats line is the only
+/// chrome a session window gets (the menu bar stays process-global).
+public final class HostStatsBar: NSObject, NSToolbarDelegate {
+    public static let itemID = NSToolbarItem.Identifier("virelai.stats")
+    public let model: HostStatsModel
+    public init(model: HostStatsModel) { self.model = model }
+    public func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [Self.itemID] }
+    public func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [Self.itemID] }
+    public func toolbar(_ toolbar: NSToolbar,
+                        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+                        willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        itemIdentifier == Self.itemID ? model.makeToolbarItem(itemIdentifier) : nil
     }
 }

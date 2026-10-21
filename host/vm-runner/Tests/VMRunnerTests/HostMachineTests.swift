@@ -460,4 +460,56 @@ final class HostMachineTests: XCTestCase {
                        "host-ui: cmd=apply-update state=performed staged=0 version=m120c-b")
         _ = bus
     }
+    // MARK: - M157a (#2934): the stats line + the close-policy words.
+
+    /// The line carries configured figures only; a figure it cannot
+    /// show is dropped and named in the tooltip.
+    func testStatsLineConfiguredFiguresAndTooltip() {
+        let stats = HostStatsModel()
+        stats.vcpus = 2
+        stats.memoryMiB = 512
+        stats.stateProvider = { "running" }
+        XCTAssertEqual(stats.line, "2 vCPU · 512 MiB · running")
+        XCTAssertTrue(stats.tooltip.contains("uptime (machine not yet started)"))
+        stats.startedAt = Date().addingTimeInterval(-183)
+        XCTAssertEqual(stats.line, "2 vCPU · 512 MiB · running · up 3m")
+        XCTAssertEqual(stats.tooltip, "Configured shape — no usage metrics collected.")
+        // Bare model: every unshown figure is named in the tooltip.
+        let bare = HostStatsModel()
+        XCTAssertEqual(bare.line, "starting")
+        XCTAssertTrue(bare.tooltip.contains("vCPU count"))
+        XCTAssertTrue(bare.tooltip.contains("RAM"))
+        XCTAssertTrue(bare.tooltip.contains("uptime"))
+    }
+
+    func testStatsUptimeFormatting() {
+        XCTAssertEqual(HostStatsModel.uptime(5), "0m")
+        XCTAssertEqual(HostStatsModel.uptime(61), "1m")
+        XCTAssertEqual(HostStatsModel.uptime(183), "3m")
+        XCTAssertEqual(HostStatsModel.uptime(3720), "1h2m")
+    }
+
+    /// The refusal word — the static Code=2 class when argv arms a
+    /// custom-virtio share, else the driver's wire code verbatim.
+    func testCloseRefusalCodeNamesTheCustomVirtioClass() {
+        let model = HostMachineModel()
+        model.arguments = ["VMRunner", "--cvc-file", "/x"]
+        XCTAssertEqual(model.closeRefusalCode("unsupported"), "2")
+        model.arguments = ["VMRunner", "--virtio-fs", "/x"]
+        XCTAssertEqual(model.closeRefusalCode("unsupported"), "unsupported")
+        model.arguments = ["VMRunner", "--cvc-file", "/x"]
+        XCTAssertEqual(model.closeRefusalCode("busy"), "busy")
+        XCTAssertEqual(model.closeRefusalCode("save_failed"), "save_failed")
+    }
+
+    /// The named messages carry the code, the --resume continuation
+    /// and the Code=12 bound.
+    func testCloseMessagesNameTheCodeAndBound() {
+        let refused = HostMachineModel.closeRefusalMessage(code: "2")
+        XCTAssertTrue(refused.contains("code=2"))
+        XCTAssertTrue(refused.contains("--resume"))
+        XCTAssertTrue(refused.contains("Code=12"))
+        XCTAssertTrue(HostMachineModel.closeSavedMessage.contains("--resume"))
+        XCTAssertTrue(HostMachineModel.closeSavedMessage.contains("Code=12"))
+    }
 }

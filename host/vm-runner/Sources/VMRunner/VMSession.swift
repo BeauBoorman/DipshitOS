@@ -94,6 +94,16 @@ final class VMSession {
     var suspendStopInFlight = false
     /// The last new-window dispatch's receipt tail (opened=/reason=).
     var newWindowDetail: String?
+    /// M157a (#2934): the last close dispatch's receipt tail
+    /// (target=/reason=) — the cmd=close receipt's detail leg.
+    var closeDetail: String?
+    /// M157a: the stats line's model — configured halves armed at boot,
+    /// live halves self-reading. HostStatsBar keeps the toolbar alive.
+    let stats = HostStatsModel()
+    var statsBar: HostStatsBar?
+    /// M157a: the close policy's suspend driver — a test injects the
+    /// wire verdict directly; nil falls back to `suspendCtl.begin()`.
+    var closeSuspendDriver: (() -> SuspendVerdict)?
     var shotCount = 0
 
     /// Terminal state — stopped means the VM object reported .stopped/
@@ -110,6 +120,28 @@ final class VMSession {
         stopped = true
         stopping = false
     }
+
+    /// M157a (#2934): the stats line's state word — the session's own
+    /// stopping/stopped flags outrank the VZ state (a stopping window
+    /// reads "stopping" until teardown lands).
+    var statsState: String {
+        if stopped { return "stopped" }
+        if stopping { return "stopping" }
+        guard let vm = runner?.vm else { return "starting" }
+        switch vm.state {
+        case .stopped: return "stopped"
+        case .error: return "error"
+        case .starting: return "starting"
+        case .running: return "running"
+        case .pausing: return "pausing"
+        case .paused: return "paused"
+        case .resuming: return "resuming"
+        case .saving: return "saving"
+        case .restoring: return "restoring"
+        case .stopping: return "stopping"
+        @unknown default: return "starting"
+        }
+    }
 }
 
 // MARK: - SessionWindowDelegate — a secondary window's close → its session's stop
@@ -119,7 +151,9 @@ final class SessionWindowDelegate: NSObject, NSWindowDelegate {
     init(session: VMSession) { self.session = session }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if let s = session { VMSessionRegistry.shared.requestStop(s, reason: "window-close") }
+        // M157a (#2934): the close is the profile's policy, not always a
+        // stop — closeAction=suspend runs the save path first.
+        if let s = session { VMSessionRegistry.shared.requestClose(s, reason: "window-close") }
         return false // the stopping state stays visible until VZ completes
     }
 }
@@ -209,6 +243,8 @@ final class VMSessionRegistry {
         commandBus.sessionID = s.id
         router.fallback = commandBus
         installNewWindowVerb(on: commandBus, session: s)
+        installCloseVerb(on: commandBus, session: s)
+        commandBus.emit("host-ui: window vm=\(s.id) title=\(Self.windowTitle(profile: profile, sessionID: s.id))")
         return s
     }
 
@@ -300,6 +336,126 @@ final class VMSessionRegistry {
             }))
     }
 
+    // MARK: close — the host-automation verb + the window-close policy.
+
+    /// The window-identity title — the primary's carries its profile
+    /// name ("VirelaiOS — <name>", "VirelaiOS — default" without one);
+    /// a sibling adds its vm= id so two live windows never share a name.
+    static func windowTitle(profile: VMProfile?, sessionID: Int) -> String {
+        if sessionID == 1 { return "VirelaiOS — \(profile?.name ?? "default")" }
+        return "VirelaiOS — \(profile?.name ?? "session") (vm \(sessionID))"
+    }
+
+    /// The `close@vm=<k>` operand — "vm=2" or a bare id; nil on a
+    /// foreign word (the named no_target refusal, not a guess).
+    static func parseVMTarget(_ arg: String) -> Int? {
+        let digits = arg.hasPrefix("vm=") ? String(arg.dropFirst(3)) : arg
+        guard let n = Int(digits), n >= 1 else { return nil }
+        return n
+    }
+
+    /// The VZErrorDomain "Code=<n>" the device set's
+    /// validateSaveRestoreSupport verdict carries — the custom-virtio
+    /// Code=2 class — else the driver's own wire word.
+    static func saveRefusalCode(_ unsupported: String?, wire: String) -> String {
+        if let u = unsupported,
+           let r = u.range(of: "Code=([0-9]+)", options: .regularExpression) {
+            return String(u[r].dropFirst("Code=".count))
+        }
+        return wire
+    }
+
+    /// Register `close` on a session's bus — `close@vm=<k>` runs THAT
+    /// session's close policy through the registry. Staged like
+    /// newWindowTarget: the trigger fire parses the `@` operand into
+    /// bus.closeTargetVM ahead of the dispatch; a bare `close` receipts
+    /// the named no_target refusal, a dead target names no_such_vm.
+    func installCloseVerb(on bus: HostCommandBus, session: VMSession) {
+        bus.register(.close, HostCommandBus.Registration(
+            isEnabled: { [weak self, weak bus] in
+                guard let self, let bus, let t = bus.closeTargetVM else { return false }
+                return self.session(id: t).map { !$0.stopped && !$0.stopping } ?? false
+            },
+            receiptDetail: { [weak session, weak bus] in
+                guard let session, let bus else { return "none" }
+                // Still staged ⇒ the dispatch receipted disabled — name why.
+                if let t = bus.closeTargetVM { return "reason=no_such_vm target=\(t)" }
+                return session.closeDetail ?? "reason=no_target"
+            },
+            action: { [weak self, weak session, weak bus] in
+                guard let self, let session, let bus, let t = bus.closeTargetVM else {
+                    session?.closeDetail = "reason=no_target"
+                    return .failed
+                }
+                bus.closeTargetVM = nil
+                guard let target = self.session(id: t), !target.stopped, !target.stopping else {
+                    session.closeDetail = "reason=no_such_vm target=\(t)"
+                    return .disabled
+                }
+                session.closeDetail =
+                    "target=\(t) action=\((target.profile?.config.closeAction ?? .stop).rawValue)"
+                requestClose(target, reason: "close-verb")
+                return .performed
+            }))
+    }
+
+    /// M157a (#2934): the close policy — the profile's `closeAction`
+    /// (absent = stop). `suspend` drives the same SuspendCtl save path
+    /// the ctl suspend verb and the Machine menu use; a save-incapable
+    /// device set (the custom-virtio Code=2 class) is refused BY NAME,
+    /// the window shows the named message, and the VM stops anyway.
+    /// The continuation is `--resume <bundle>` — bounded at
+    /// VZErrorDomain Code=12 (M119e's named bound).
+    func requestClose(_ s: VMSession, reason: String) {
+        guard !s.stopped, !s.stopping else { return }
+        if let app = s.hostApp {
+            // The session-mode primary: the policy + named message live
+            // in HostApplication (its suspend driver is the Machine
+            // model's), and it terminates through its own lifecycle
+            // stop rather than this registry's VM-only teardown.
+            s.stopping = true
+            app.requestClose(reason: reason)
+            return
+        }
+        let bus = bus(for: s)
+        switch s.profile?.config.closeAction ?? .stop {
+        case .suspend:
+            // Driver order: a test's injected verdict, the session's
+            // own SuspendCtl (every secondary), then the Machine
+            // model's injected driver (the primary's — armed in
+            // main.swift for scripted and session runs alike).
+            let verdict: SuspendVerdict
+            if let driver = s.closeSuspendDriver {
+                verdict = driver()
+            } else if let ctl = s.suspendCtl {
+                verdict = ctl.begin()
+            } else if let wire = bus.machine.suspendDriver {
+                verdict = wire().map { SuspendVerdict.refuse($0) } ?? .accept
+            } else {
+                verdict = .refuse("no_state")
+            }
+            if verdict.accepted {
+                bus.emit("host-ui: close vm=\(s.id) action=suspend result=saved")
+                s.suspendStopInFlight = true
+                s.window?.subtitle = HostMachineModel.closeSavedMessage
+                requestStop(s, reason: "close-suspend")
+            } else {
+                let code: String
+                if let u = s.saveUnsupported, u.contains("Code=") {
+                    code = Self.saveRefusalCode(u, wire: verdict.code)
+                } else {
+                    code = bus.machine.closeRefusalCode(verdict.code)
+                }
+                bus.emit("host-ui: close vm=\(s.id) action=suspend result=refused code=\(code)")
+                s.window?.subtitle = HostMachineModel.closeRefusalMessage(code: code)
+                requestStop(s, reason: "close-refused-\(code)")
+            }
+        case .stop:
+            bus.emit("host-ui: close vm=\(s.id) action=stop result=stopped")
+            requestStop(s, reason: reason)
+        }
+    }
+
     // MARK: Opening a secondary session.
 
     /// `new-window`'s whole job: load the bundle, dedup it by name, boot
@@ -314,6 +470,12 @@ final class VMSessionRegistry {
         }
         let s = mint()
         s.profile = profile
+        // M157a (#2934): the stats line's configured half — state and
+        // uptime arm themselves (stateProvider reads live, startedAt
+        // lands at startVM).
+        s.stats.vcpus = profile.config.cpus
+        s.stats.memoryMiB = profile.config.memoryMiB
+        s.stats.stateProvider = { [weak s] in s?.statsState ?? "stopped" }
         do {
             try boot(s)
         } catch {
@@ -578,6 +740,7 @@ final class VMSessionRegistry {
             return .performed
         })
         installNewWindowVerb(on: bus, session: s)
+        installCloseVerb(on: bus, session: s)
     }
 
     // MARK: HostInt lanes — the run's lane flags, per-session endpoints.
@@ -654,7 +817,14 @@ final class VMSessionRegistry {
         let view = TraceView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
         view.virtualMachine = runner.vm
         window.contentView = view
-        window.title = "VirelaiOS — \(s.profile?.name ?? "session") (vm \(s.id))"
+        window.title = Self.windowTitle(profile: s.profile, sessionID: s.id)
+        // M157a (#2934): the stats line — the sibling's whole toolbar is
+        // the lone stats item (the menu bar stays process-global).
+        let statsBar = HostStatsBar(model: s.stats)
+        let toolbar = NSToolbar(identifier: "virelai-session-\(s.id)")
+        toolbar.delegate = statsBar
+        window.toolbar = toolbar
+        s.statsBar = statsBar
         window.acceptsMouseMovedEvents = true
         let delegate = SessionWindowDelegate(session: s)
         window.delegate = delegate
@@ -667,6 +837,9 @@ final class VMSessionRegistry {
         window.orderFrontRegardless()
         s.window = window
         s.view = view
+        // M157a (#2934): the window-identity line — every VM window says
+        // its own title on the host-ui stream once.
+        s.commandBus.emit("host-ui: window vm=\(s.id) title=\(window.title)")
         // The bus's self-registered recorder films THIS window — record
         // on vm 1 and vm 2 are independent takes on independent views.
         s.commandBus.recorder.captureView = view
@@ -731,6 +904,7 @@ final class VMSessionRegistry {
             s.triggersArmed = true
         }
         fireHostCmdTriggers(&s.triggers, on: bus(for: s), session: s.id, text: s.lastText)
+        s.stats.refreshItem()
         if let vm = s.runner?.vm, s.vmDidStart,
            vm.state == .stopped || vm.state == .error, !s.stopped, !s.stopping {
             // An unattended end — the suspend teardown marks
@@ -866,6 +1040,7 @@ extension VMSession {
                 return
             }
             self.vmDidStart = true
+            self.stats.startedAt = Date()
             print("vm=\(self.id): running")
         }
     }
@@ -887,6 +1062,11 @@ func fireHostCmdTriggers(_ triggers: inout [HostCommandTrigger],
         triggers[i].fired = true
         if t.command == .newWindow, let arg = t.argument {
             bus.profiles.newWindowTarget = URL(fileURLWithPath: arg, isDirectory: true)
+        }
+        // M157a (#2934): `close@vm=<k>` stages its target like
+        // new-window's `@` operand before the dispatch runs.
+        if t.command == .close, let arg = t.argument {
+            bus.closeTargetVM = VMSessionRegistry.parseVMTarget(arg)
         }
         bus.dispatch(t.command)
     }

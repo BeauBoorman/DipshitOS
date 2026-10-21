@@ -92,6 +92,13 @@
 #   bash tools/go/build-agentd.sh  -> .build/go/AGENTD.ELF
 #   bash tools/go/build-gotabwm.sh -> .build/go/GOTABWM.ELF
 #   bash tools/go/build-goedit.sh  -> .build/go/GOEDIT.ELF
+#
+# Run 11 is M157a's (#2934): per-VM window identity + the close policy.
+# The primary boots m120c's bundle — its `window` line names the
+# profile; cv2's bundle carries closeAction=suspend on the virtio-fs
+# set, so the `vm2:`-bound `close@vm=2` on vm 2's own prompt runs the
+# save path: state.vzsave lands and the sibling stops while the primary
+# runs on to its own expect.
 
 vgate_name live-host-ui "M114a #2454 + M114b #2455 + M114d #2457 + M114e #2458 + M120e #2562 + M122d #2573 + M139a #2779 + M139e #2783: HostCommand bus — host-ui: receipts, one-chord capture, postmortem, multi-VM + agent ui.input journey K=3"
 vgate_repeat 3 BOOTS
@@ -202,6 +209,24 @@ os.makedirs(ed, exist_ok=True)
 open(os.path.join(ed, "SEED.TXT"), "wb").write(b"seed-line\n")
 open(os.path.join(run, "devin.key"), "w").write("devin " + "0a" * 32 + "\n")
 print("j1 profile minted; agentd share staged (seat exec'd on script)")
+
+# Run 11's second machine (M157a #2934): cv2 carries closeAction=suspend
+# on the virtio-fs device set (devices.share stays ON — the session
+# attaches <bundle>/share itself, save-capable like ws2's set) so the
+# close verb's suspend leg writes saved-state/state.vzsave.
+cv2 = os.path.join(run, "cv2.virelaivm")
+r = subprocess.run([runner, "--profile", cv2, "--profile-init"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit("cv2 profile mint refused: " + r.stdout + r.stderr)
+cv2base = os.path.join(run, "cv2-base.img")
+shutil.copy(os.path.join("artifacts", "disk.img"), cv2base)
+cfgcv = json.load(open(os.path.join(cv2, "config.json")))
+cfgcv["baseImage"] = cv2base
+cfgcv["closeAction"] = "suspend"
+json.dump(cfgcv, open(os.path.join(cv2, "config.json"), "w"), indent=2, sort_keys=True)
+os.makedirs(os.path.join(cv2, "share"), exist_ok=True)
+print("cv2 profile minted; closeAction=suspend")
 PY
 
 vgate_run 01 -- --screen '$RUN_DIR/screen' --script '$RUN_DIR/script.txt' \
@@ -658,4 +683,52 @@ for i in range(count):
     print("  rec %d: id=%d flags=%02x ws=%d title=%r" % (i, rec[0], rec[1], rec[2], title))
 shutil.copy(sav, os.path.join(run, "winsav-" + os.environ["VG_TAG"] + ".sav"))
 print("WINDOWS.SAV: %d record(s), within the live-slot bound" % count)
+PY
+
+# Run 11 is M157a's (#2934): per-VM window identity + the close policy.
+# The primary's `window` line names the m120c profile; the sibling cv2
+# carries closeAction=suspend, so `close@vm=2` — fired on vm 2's OWN
+# prompt, dispatched on vm 2's OWN bus — runs the SuspendCtl save path:
+# a saved-state/state.vzsave lands and the sibling stops. The primary
+# keeps running to its own expect — runs 01-10 are unchanged.
+vgate_file script11.txt <<'INNER'
+echo cv2-boot
+INNER
+
+vgate_file script11b.txt <<'INNER'
+echo vm1-done
+INNER
+
+vgate_run 11 -- --profile '$RUN_DIR/m120c.virelaivm' \
+    --overlay-base '$RUN_DIR/m120c-base.img' \
+    --virtio-fs '$RUN_DIR/m120c.virelaivm/share' \
+    --script '$RUN_DIR/script11.txt' \
+    --script2 '$RUN_DIR/script11b.txt' --script2-after 'cv2-boot' --script2-delay 30 \
+    --host-cmd-after 'virelai> :new-window@$RUN_DIR/cv2.virelaivm' \
+    --host-cmd-after 'vm2:virelai> :close@vm=2' \
+    --script-expect 'vm1-done' --timeout 150
+
+vgate_assert 11 output-contains 'host-ui: cmd=new-window vm=1 state=performed opened=2'
+vgate_assert 11 output-contains 'host-ui: cmd=close vm=2 state=performed target=2 action=suspend'
+vgate_assert 11 output-contains 'vm=2: stopped'
+# Both window lines carry the right titles — the em dash is the titles'
+# own — and close vm=2 ends in a saved-state file OR the named Code=2
+# line (a custom-virtio set is not in this run, so saved is expected).
+vgate_assert 11 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-" + os.environ["VG_TAG"] + ".out"), "rb").read().decode("utf-8", "replace")
+for needle in ("host-ui: window vm=1 title=VirelaiOS \u2014 m120c",
+               "host-ui: window vm=2 title=VirelaiOS \u2014 cv2 (vm 2)"):
+    if needle not in out:
+        sys.exit("window line missing: %r" % needle)
+state = os.path.join(run, "cv2.virelaivm", "saved-state", "state.vzsave")
+if "host-ui: close vm=2 action=suspend result=saved" in out:
+    if not os.path.isfile(state) or os.path.getsize(state) == 0:
+        sys.exit("close=suspend reported saved but saved-state/state.vzsave is absent or empty")
+    print("close=suspend saved: state.vzsave %d bytes" % os.path.getsize(state))
+elif "host-ui: close vm=2 action=suspend result=refused code=2" in out:
+    print("close=suspend refused code=2 (the named Code=2 fallback)")
+else:
+    sys.exit("no host-ui: close vm=2 verdict line in the out file")
 PY

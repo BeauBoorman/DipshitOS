@@ -92,6 +92,16 @@ public struct VMProfile: Equatable {
 
     /// config.json — the machine shape the bundle pins.
     public struct Config: Codable, Equatable {
+        /// M157a (#2934): the window-close policy — `stop` ends the run;
+        /// `suspend` runs the M115d save path into saved-state/ so
+        /// `--resume` continues the machine. Absent means stop; a
+        /// foreign word refuses the config load as corrupt (the
+        /// manifest's own naming rule).
+        public enum CloseAction: String, Codable, Equatable {
+            case stop
+            case suspend
+        }
+
         /// Same bound the runner's --cpus flag enforces.
         public var cpus = 2
         /// M129a (#2610): 512 MiB is the compiled schema default — a
@@ -108,6 +118,8 @@ public struct VMProfile: Equatable {
         /// pin. Empty = no key configured; --apply-update then needs
         /// --update-key.
         public var updatePubkey: String?
+        /// M157a (#2934): the window-close policy — absent means stop.
+        public var closeAction = CloseAction.stop
         public var devices = Devices()
 
         public init() {}
@@ -125,6 +137,7 @@ public struct VMProfile: Equatable {
             memoryMiB = try c.decodeIfPresent(Int.self, forKey: .memoryMiB) ?? 512
             baseImage = try c.decodeIfPresent(String.self, forKey: .baseImage) ?? "artifacts/disk.img"
             updatePubkey = try c.decodeIfPresent(String.self, forKey: .updatePubkey)
+            closeAction = try c.decodeIfPresent(CloseAction.self, forKey: .closeAction) ?? .stop
             devices = try c.decodeIfPresent(Devices.self, forKey: .devices) ?? Devices()
         }
     }
