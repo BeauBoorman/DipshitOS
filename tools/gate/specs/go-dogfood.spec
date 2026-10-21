@@ -987,10 +987,11 @@ PY
 #                     not seat-gated
 #                     (input.zig:576/583), so they copy the >256 B
 #                     selection off the terminal and paste it through GOTERM's
-#                     bound tty (GOSH requests DECSET 2004 at startup, so
-#                     the paste lands bracketed \e[200~..\e[201~ and the
-#                     chord's return submits the tail — input.zig:583,
-#                     live-term-depth.spec:15) — M73e's exact chain.
+#                     bound tty (M154a/#2926: the editor requests DECSET
+#                     2004 around every line read, so the paste lands
+#                     bracketed \e[200~..\e[201~ and the chord's return
+#                     submits the whole block ONCE — input.zig:583,
+#                     live-term-depth.spec) — M73e's exact chain.
 #                     WAS BLOCKED under the seat (finding on #1629, seam
 #                     #1688): selection began only inside pointer_tick
 #                     AFTER the wm_owns_input return, and handleWmPointer
@@ -1206,9 +1207,11 @@ vgate_assert 04 serial-contains 'gotabwm: rail-click id=3'
 # sees focus=4 — the drain-race fix above.
 vgate_assert 04 serial-contains 'gotabwm: alt-tab id=4'
 vgate_assert 04 serial-contains 'tty: paste '
-# startup lines run silently (no marker), so this `clear` line can only
-# have come from the PASTE — M73e's write-back, proven.
-vgate_assert 04 serial-contains 'goterm: line clear'
+# startup lines run silently (no marker), so this submit can only have
+# come from the PASTE — M154a's one-submit wrap: the marker's head is the
+# first staged row, and the (b) block below proves every row rides inside
+# the SAME marker.
+vgate_assert 04 serial-contains 'goterm: line echo aaa'
 vgate_assert 04 serial-contains 'goterm: done status=0'
 
 # --- (d) the resize seam: new cells + repaint -------------------------------
@@ -1239,9 +1242,11 @@ vgate_assert 04 serial-absent 'exited status=139'
 #      270: the serial console cannot emit wide glyphs at all —
 #      observed serial-04: ZERO occurrences of the box rune in the
 #      whole log — so the glyph proof is (e)'s pixels, not a
-#      line-echo marker) and every staged row reached the editor
-#      (startup lines are silent, so each of these markers can only
-#      be the paste);
+#      line-echo marker). M154a (#2926) repins the submit contract:
+#      DECSET 2004 is on by default, so the region stages as ONE pending
+#      edit and the chord's return submits it once — exactly ONE
+#      `goterm: line` after the paste marker, holding every staged row
+#      (startup lines are silent, so that marker can only be the paste);
 #  (c) the tty line reads out_dropped=0 in_dropped=0 AFTER the burst
 #      (M73f-1's polarity plus M73f-2's line plus a repaint that happened);
 #  (d) charmhello's post-resize size marker is EXACTLY its M73j-pinned
@@ -1293,17 +1298,22 @@ if n <= 256:
 # floor of 270 pins that the rune bytes travelled. The serial console
 # cannot PRINT wide glyphs (observed serial-04: zero box runes in the
 # entire log), so the pixel proof of the glyphs is (e)'s snapshot.
-if n < 270:
-    sys.exit("paste lost the rune bytes (got %d, want >= 270)" % n)
-i_clear = at("goterm: line clear", i_paste)
-# Row 4's ASCII line-echo: the LAST staged row reached the editor (the
-# row-2 marker prints without its wide glyphs — serial limitation —
-# so the chain anchors on ASCII rows only).
-i_lastrow = at("goterm: line echo ccc", i_clear)
-n_lines = ser.count("goterm: line ", i_paste)
-if n_lines < 5:
-    sys.exit("only %d staged rows reached the editor (want all 5)" % n_lines)
-i_done = at("goterm: done status=0", i_lastrow)
+if n < 270 + 12:
+    sys.exit("paste lost the rune bytes (got %d, want >= 282 incl the 12 B wrap)" % n)
+# M154a (#2926): the wrapped paste is ONE pending edit until the chord's
+# return — exactly one `goterm: line` between the paste and its done, and
+# every staged row rides inside it (the row-2 marker prints without its
+# wide glyphs — serial limitation — so the row proof anchors on the ASCII
+# rows and the byte count above).
+i_line = at("goterm: line ", i_paste)
+i_done = at("goterm: done status=0", i_line)
+n_lines = ser.count("goterm: line ", i_paste, i_done)
+if n_lines != 1:
+    sys.exit("bracketed paste must be ONE submit on Enter (got %d)" % n_lines)
+seg = ser[i_line:i_done]
+for row in ("echo aaa", "clear", "echo bbb", "echo ccc"):
+    if row not in seg:
+        sys.exit("staged row %r missing from the one submit" % row)
 
 # The seat's alt-tab flipped focus to charmhello, whose `r` handler
 # printed the new grid — script2 gates on THAT marker, so its `tty`
@@ -1348,10 +1358,10 @@ if (c1, r1) != (64, 23):
 
 print("acceptance chain OK: seat@%d stage@%d present@%d close@%d "
       "launcher@%d prompt@%d ready@%d rail@%d sel@%d paste=%dB "
-      "lines=%d clear@%d lastrow@%d done@%d alt@%d rsize@%d "
+      "submits=%d line@%d done@%d alt@%d rsize@%d "
       "%s@%d lower@%d repaint@%d size %dx%d -> %dx%d"
       % (i_seat, i_stage, i_present, i_close, i_open, i_prompt,
-         i_ready, i_rail, i_sel, n, n_lines, i_clear, i_lastrow, i_done,
+         i_ready, i_rail, i_sel, n, n_lines, i_line, i_done,
          i_alttab, i_rsize, mtty.group(0).split(":")[0], i_tty,
          i_lower, i_repaint, c0, r0, c1, r1))
 PY
@@ -2331,6 +2341,11 @@ i_term = at("goterm: ready", i_copy)
 i_sp = at("goterm: sel-paste n=17", i_term)
 i_echo = at("goterm: line echo sel-live-ok", i_sp)
 i_done = at("goterm: done status=0", i_echo)
+# M154a (#2926): the M124e delivery is raw staged text, not a wrapped
+# paste — it submits once and stays exactly one submit.
+if ser.count("goterm: line ", i_sp) != 1:
+    sys.exit("sel-paste must remain ONE submit (got %d)"
+             % ser.count("goterm: line ", i_sp))
 i_watch = at("gofiles: watch created ", i_save)
 print("M124f journey chain OK: seat -> clip-seed -> gofiles -> goedit -> "
       "split | app lane: selpub -> paste -> saved | seat lane: sel-pub "

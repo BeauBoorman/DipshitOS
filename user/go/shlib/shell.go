@@ -384,6 +384,18 @@ func (s *Shell) RunLine(line string) (int, Action) {
 // refusal for any `<<` the line declares.
 func (s *Shell) RunLineBodies(line string, bodies [][]byte) (int, Action) {
 	stripped := stripEscMarks(line)
+	if strings.IndexByte(stripped, '\n') >= 0 {
+		// M154a (#2926): one submitted block carrying newlines is a
+		// script — a bracketed paste lands as one edit and submits as
+		// one block — and it runs through exactly the parser path a
+		// sourced file takes: the same split, the same blank skip, the
+		// same heredoc collection from the block's own following lines.
+		start := timeMono()
+		body := strings.ReplaceAll(stripped, "\r\n", "\n")
+		st, act := s.runScriptLines(strings.Split(body, "\n"), 0)
+		s.lastDurNs = timeMono() - start
+		return st, act
+	}
 	if trimSpace(stripped) == "" {
 		return s.runLineBodies(stripped, bodies, 0)
 	}
@@ -846,15 +858,20 @@ func (s *Shell) runSource(path string, depth int) (int, Action) {
 		return 1, ActionContinue
 	}
 	body := strings.ReplaceAll(string(b), "\r\n", "\n")
-	lines := strings.Split(body, "\n")
+	return s.runScriptLines(strings.Split(body, "\n"), depth)
+}
+
+// runScriptLines is the line loop `source FILE` and a pasted-block submit
+// share (M154a #2926): blank lines are skipped, and a `<<` line pulls the
+// script's own following lines as its body — an end of text
+// mid-collection is the named unterminated refusal.
+func (s *Shell) runScriptLines(lines []string, depth int) (int, Action) {
 	for i := 0; i < len(lines); i++ {
 		ln := strings.TrimRight(lines[i], "\r")
 		if strings.TrimSpace(ln) == "" {
 			continue
 		}
 		ln = stripEscMarks(ln)
-		// A `<<` line pulls the file's own following lines as its body;
-		// an end of file mid-collection is the named unterminated refusal.
 		var bodies [][]byte
 		if r, rerr := NewHeredocReader(ln); rerr == nil && r.Waiting() {
 			for r.Waiting() && i+1 < len(lines) {

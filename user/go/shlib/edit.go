@@ -12,6 +12,7 @@
 package shlib
 
 import (
+	"os"
 	"strings"
 	"unicode/utf8"
 )
@@ -121,6 +122,34 @@ const (
 	edGround = iota
 	edEsc
 	edCSI
+	edPaste
+)
+
+// M154a (#2926): DECSET 2004 bracketed paste, ON by default — the modern
+// terminal contract, and what the Zig editor's own paste_enable
+// (lib/tty.zig) already asked for before this port. The editor writes the
+// enable when a line read opens (Repaint, and the post-command prompt the
+// front-ends paint through PromptBytes) and the disable when the line is
+// submitted or the editor exits, so a running program never receives
+// wrapped pastes. BRACKETED_PASTE=0 in the process environment is the
+// opt-out — envp is the only channel that reaches a running program —
+// and restores the pre-card byte stream exactly: no wraps are emitted
+// and the markers keep their old `n ~` meaning.
+const (
+	pasteEnable  = "\x1b[?2004h"
+	pasteDisable = "\x1b[?2004l"
+	// pasteEndSeq is the region terminator; matched byte-at-a-time across
+	// reads, so a marker split anywhere still closes the paste.
+	pasteEndSeq = "\x1b[201~"
+	// pasteMaxBytes bounds one bracketed paste (the card's pinned 4 KiB).
+	// It sits well above the kernel's 1024 B input queue and the 512 B
+	// clipboard, so no kernel-driven paste ever reaches it — it guards
+	// the staging buffer against a paste stream that simply never ends.
+	pasteMaxBytes = 4096
+	// pasteTruncMarker is the named in-line notice appended when a paste
+	// was clipped — by the bound above or by the line's own cap — so a
+	// shortened paste is visible instead of silently losing its tail.
+	pasteTruncMarker = " [paste truncated]"
 )
 
 // Editor is the line editor for one tty session.
@@ -163,9 +192,19 @@ type Editor struct {
 	killLo   int
 	killHi   int
 	killDir  int    // killNone / killBackward / killForward
-	state    int    // edGround / edEsc / edCSI
+	state    int    // edGround / edEsc / edCSI / edPaste
 	csiParam int    // accumulated CSI parameter
 	csiGotP  bool   // saw at least one parameter digit
+	// M154a (#2926): the bracketed-paste staging buffer. Bytes between
+	// ESC[200~ and ESC[201~ accumulate here and commit as ONE edit at the
+	// terminator — embedded newlines are literal line bytes that paint as
+	// ^J markers — so a 20-line script can be reviewed before Enter runs
+	// it once. pasteMatch counts the terminator prefix matched so far (it
+	// persists across Feeds, so a split marker still closes), pasteTrunc
+	// records that the pasteMaxBytes bound clipped the tail.
+	paste      []byte
+	pasteMatch int
+	pasteTrunc bool
 	utf8Need uint8  // continuation bytes left in the current input rune
 	utf8Drop uint8  // continuation bytes left in a rune rejected at a byte cap
 	pending  []byte // unread input after a submit cut a chunk short
@@ -223,12 +262,28 @@ func (e *Editor) RefreshPrompt() {
 	e.lastLen = 0
 }
 
+// bracketed reports whether DECSET 2004 wraps are emitted and decoded:
+// on by default, off when BRACKETED_PASTE=0 is in the process envp (the
+// only channel that reaches a running program — `set`/`export` it in the
+// shell that execs the front-end). Read at each decision so an editor's
+// contract never straddles a mid-session toggle.
+func (e *Editor) bracketed() bool { return os.Getenv("BRACKETED_PASTE") != "0" }
+
 // PromptBytes is the expanded prompt, for the front-end's own post-submit
-// write. Both front-ends paint the prompt themselves after a command (M73d
-// #1628: the submit echo is a bare \r\n), so they must write the SAME bytes
-// the editor would repaint -- otherwise the fresh prompt and the first
+// write — plus the DECSET 2004 enable, since this write is what opens the
+// next line read after a command that ran with paste unwrapped. Both
+// front-ends paint the prompt themselves after a command (M73d #1628: the
+// submit echo is a bare \r\n), so they must write the SAME bytes the
+// editor would repaint -- otherwise the fresh prompt and the first
 // in-line repaint disagree and the line jitters by a prompt's width.
-func (e *Editor) PromptBytes() []byte { return e.promptOut }
+func (e *Editor) PromptBytes() []byte {
+	if e.bracketed() {
+		out := make([]byte, 0, len(pasteEnable)+len(e.promptOut))
+		out = append(out, pasteEnable...)
+		return append(out, e.promptOut...)
+	}
+	return e.promptOut
+}
 
 // SetCols tells the editor how wide the terminal grid is, so the
 // completion menu can columnate to it. A non-positive value restores the
@@ -242,10 +297,47 @@ func (e *Editor) SetCols(n int) {
 
 // Repaint renders the current state: the prompt and line from scratch.
 // It re-expands the prompt first -- this is what a front-end calls to open
-// a line, so it is the natural place to notice a `cd` from the last one.
+// a line, so it is the natural place to notice a `cd` from the last one —
+// and it opens with the DECSET 2004 enable: this is the write that starts
+// a line read.
 func (e *Editor) Repaint() []byte {
 	e.RefreshPrompt()
+	if e.bracketed() {
+		return append([]byte(pasteEnable), e.paint()...)
+	}
 	return e.paint()
+}
+
+// paintLine renders the buffer for the tty: a pasted newline is a real
+// byte in the line but must not reach the grid as a control code, so it
+// paints as the ^J marker (and \r as ^M) — the same caret notation the
+// serial console already reads. Lines without a paste carry no marker
+// and the render is the identity.
+func paintLine(buf []byte) []byte {
+	var out []byte
+	for i := 0; i < len(buf); i++ {
+		var m byte
+		switch buf[i] {
+		case '\n':
+			m = 'J'
+		case '\r':
+			m = 'M'
+		default:
+			if out != nil {
+				out = append(out, buf[i])
+			}
+			continue
+		}
+		if out == nil {
+			out = make([]byte, 0, len(buf)+8)
+			out = append(out, buf[:i]...)
+		}
+		out = append(out, '^', m)
+	}
+	if out == nil {
+		return buf
+	}
+	return out
 }
 
 // paint composes the repaint: `\r` + prompt + line, spaces over the old
@@ -254,8 +346,11 @@ func (e *Editor) paint() []byte {
 	// Cells, not bytes: the grid is rune-based and a prompt can carry colour
 	// codes and bracket-marked spans that paint nothing (M80n #1730). A
 	// byte count here would write the wrong number of tail spaces and leave
-	// the old line's last cells on screen.
-	content := VisibleWidth(string(e.promptOut)) + VisibleWidth(string(e.Bytes()))
+	// the old line's last cells on screen. The line renders through
+	// paintLine so a pasted newline's ^J marker counts its two cells.
+	line := paintLine(e.Bytes())
+	caret := paintLine(e.Bytes()[:e.Caret()])
+	content := VisibleWidth(string(e.promptOut)) + VisibleWidth(string(line))
 	tail := e.lastLen - content
 	if tail < 0 {
 		tail = 0
@@ -263,11 +358,11 @@ func (e *Editor) paint() []byte {
 	out := make([]byte, 0, content+tail+2+content)
 	out = append(out, '\r')
 	out = append(out, e.promptOut...)
-	out = append(out, e.Bytes()...)
+	out = append(out, line...)
 	out = append(out, []byte(strings.Repeat(" ", tail))...)
 	out = append(out, '\r')
 	out = append(out, e.promptOut...)
-	out = append(out, e.Bytes()[:e.Caret()]...)
+	out = append(out, caret...)
 	e.lastLen = content
 	return out
 }
@@ -312,7 +407,7 @@ func (e *Editor) Feed(chunk []byte) ([]byte, EditEvent) {
 	for i := 0; i < len(chunk); i++ {
 		b := chunk[i]
 		incomplete := false
-		if e.state != edCSI {
+		if e.state != edCSI && e.state != edPaste {
 			if dropped, ring := e.discardOverflowingRune(b, maxLineBytes-len(e.Bytes())); dropped {
 				if ring {
 					out = append(out, 0x07)
@@ -371,8 +466,21 @@ func (e *Editor) Feed(chunk []byte) ([]byte, EditEvent) {
 				e.csiParam = e.csiParam*10 + int(b-'0')
 				e.csiGotP = true
 			case b == '~':
-				w, ev = e.keyDelete()
-				e.state = edGround
+				switch {
+				case e.bracketed() && e.csiGotP && e.csiParam == 200:
+					// A DECSET-2004 paste begins: stage bytes until
+					// ESC[201~, then commit them as one edit.
+					e.state = edPaste
+					e.paste = e.paste[:0]
+					e.pasteMatch = 0
+					e.pasteTrunc = false
+				case e.bracketed() && e.csiGotP && e.csiParam == 201:
+					// A stray paste terminator is consumed, not Delete.
+					e.state = edGround
+				default:
+					w, ev = e.keyDelete()
+					e.state = edGround
+				}
 			default:
 				// A final byte: A/B/C/D/H/F are the M49 keymap.
 				switch b {
@@ -391,6 +499,8 @@ func (e *Editor) Feed(chunk []byte) ([]byte, EditEvent) {
 				}
 				e.state = edGround
 			}
+		case edPaste:
+			w, ev = e.pasteByte(b)
 		default:
 			w, ev = e.keyGround(b)
 		}
@@ -615,7 +725,8 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 			return append(out, e.paint()...), EditEvent{}
 		} else if changed {
 			line = expanded
-			out := append([]byte("\r\n"), expanded...)
+			out := append(e.submitPrefix(), '\r', '\n')
+			out = append(out, expanded...)
 			out = append(out, '\r', '\n')
 			e.Clear()
 			e.hview = -1
@@ -623,7 +734,7 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 			e.hist.Push(line)
 			return out, EditEvent{Kind: EvSubmit, Line: line}
 		}
-		out := []byte("\r\n")
+		out := append(e.submitPrefix(), '\r', '\n')
 		e.Clear()
 		e.hview = -1
 		e.lastLen = 0
@@ -668,9 +779,10 @@ func (e *Editor) keyGround(b byte) ([]byte, EditEvent) {
 		e.RefreshPrompt()
 		out := append([]byte("^C\r\n"), e.paint()...)
 		return out, EditEvent{Kind: EvCancel}
-	case 0x04: // Ctrl-D on an empty line: EOF
+	case 0x04: // Ctrl-D on an empty line: EOF — the editor exits, so the
+		// bracketed-paste contract ends with it.
 		if len(e.Bytes()) == 0 {
-			return nil, EditEvent{Kind: EvEOF}
+			return e.submitPrefix(), EditEvent{Kind: EvEOF}
 		}
 		return nil, EditEvent{}
 	case '\t':
@@ -841,7 +953,19 @@ func (e *Editor) keyEditLine() ([]byte, EditEvent) {
 	e.Clear()
 	e.hview = -1
 	e.lastLen = 0
-	return []byte("\r\n"), EditEvent{Kind: EvEdit, Line: line}
+	return append(e.submitPrefix(), '\r', '\n'), EditEvent{Kind: EvEdit, Line: line}
+}
+
+// submitPrefix opens the submit/exit echo: the DECRST half of the
+// bracketed-paste contract, written before the newline so the mode is off
+// while the submitted program owns the tty — a running program never
+// receives wrapped pastes. Nil under the opt-out, which keeps the
+// pre-card byte stream exactly.
+func (e *Editor) submitPrefix() []byte {
+	if e.bracketed() {
+		return []byte(pasteDisable)
+	}
+	return nil
 }
 
 // ins inserts ins at the cursor unless that would pass the line cap, in
@@ -849,6 +973,87 @@ func (e *Editor) keyEditLine() ([]byte, EditEvent) {
 func (e *Editor) ins(ins []byte) ([]byte, EditEvent) {
 	if len(e.Bytes())+len(ins) > maxLineBytes {
 		return []byte{0x07}, EditEvent{}
+	}
+	e.breakKill()
+	c := e.Caret()
+	e.Replace(c, c, ins)
+	e.SetCaret(c + len(ins))
+	return e.paint(), EditEvent{}
+}
+
+// pasteByte consumes one byte inside a DECSET-2004 bracketed paste
+// (edPaste). Content stages in e.paste until the ESC[201~ terminator
+// lands — the match persists across Feeds, so a marker split anywhere
+// still closes — then the whole region commits as ONE edit. A byte that
+// cannot extend the terminator (a stray ESC included) is literal content;
+// a second 200~ inside the region is literal for the same reason.
+func (e *Editor) pasteByte(b byte) ([]byte, EditEvent) {
+	if b == pasteEndSeq[e.pasteMatch] {
+		e.pasteMatch++
+		if e.pasteMatch == len(pasteEndSeq) {
+			e.pasteMatch = 0
+			e.state = edGround
+			return e.commitPaste()
+		}
+		return nil, EditEvent{}
+	}
+	if e.pasteMatch > 0 {
+		// The matched prefix was not the terminator after all: replay it
+		// as content, then re-judge this byte from the start.
+		e.pasteTake([]byte(pasteEndSeq[:e.pasteMatch]))
+		e.pasteMatch = 0
+	}
+	if b == 0x1b {
+		e.pasteMatch = 1
+		return nil, EditEvent{}
+	}
+	e.pasteTake([]byte{b})
+	return nil, EditEvent{}
+}
+
+// pasteTake appends staged paste bytes, bounded to pasteMaxBytes; the
+// overflow sets pasteTrunc so commitPaste can name the clip.
+func (e *Editor) pasteTake(b []byte) {
+	room := pasteMaxBytes - len(e.paste)
+	if len(b) > room {
+		e.pasteTrunc = true
+		b = b[:max(room, 0)]
+	}
+	e.paste = append(e.paste, b...)
+}
+
+// commitPaste inserts the finished paste at the cursor as one pending
+// edit — the point of the wrap: the 20 pasted lines are reviewable text,
+// not 20 submits. The insert stays inside the line cap: a paste clipped
+// by pasteMaxBytes or by what fits lands shortened and carries
+// pasteTruncMarker, so a truncated block is visible instead of silently
+// losing its tail.
+func (e *Editor) commitPaste() ([]byte, EditEvent) {
+	ins := e.paste
+	e.paste = nil
+	trunc := e.pasteTrunc
+	e.pasteTrunc = false
+	room := maxLineBytes - len(e.Bytes())
+	if room <= 0 {
+		return []byte{0x07}, EditEvent{}
+	}
+	if trunc || len(ins) > room {
+		take := room - len(pasteTruncMarker)
+		if take < 0 {
+			take = 0
+		}
+		if take < len(ins) {
+			ins = ins[:clipRuneBoundary(ins, take)]
+		}
+		marked := make([]byte, 0, len(ins)+len(pasteTruncMarker))
+		marked = append(marked, ins...)
+		ins = append(marked, pasteTruncMarker...)
+		if len(ins) > room {
+			ins = ins[:room]
+		}
+	}
+	if len(ins) == 0 {
+		return nil, EditEvent{}
 	}
 	e.breakKill()
 	c := e.Caret()
@@ -1064,6 +1269,19 @@ func (e *Editor) keyTranspose() ([]byte, EditEvent) {
 	e.SetCaret(end)
 	e.breakKill()
 	return e.paint(), EditEvent{}
+}
+
+// clipRuneBoundary is the largest rune boundary at or before take — the
+// clip a bounded insert needs (previousRuneBoundary steps a rune back,
+// which is right for backspace and wrong for truncation).
+func clipRuneBoundary(buf []byte, take int) int {
+	if take > len(buf) {
+		take = len(buf)
+	}
+	for take > 0 && !utf8.RuneStart(buf[take]) {
+		take--
+	}
+	return take
 }
 
 func previousRuneBoundary(buf []byte, end int) int {

@@ -101,6 +101,13 @@ with open(os.path.join(share, "BIG.SH"), "w") as f:
 fill = ["echo FILL-%03d pppp" % i for i in range(150)]
 with open(os.path.join(share, "FILL.SH"), "w") as f:
     f.write("\n".join(fill) + "\n")
+# M154a (#2926): SCRIPT2.SH is run 08's RUNNABLE 20-line script — each
+# line appends a row to PL.TXT on the share, so a monitor `cat` reads the
+# script's execution back from serial. 24 chars x 20 rows + 19 newlines
+# = 499 B: under the 512 B clipboard, over the old 256 B input queue.
+lines = ["echo L%02d >> /host/PL.TXT" % i for i in range(20)]
+with open(os.path.join(share, "SCRIPT2.SH"), "w") as f:
+    f.write("\n".join(lines) + "\n")
 PY
 
 vgate_run 01 -- --display --input --via-virtio --screen '$RUN_DIR/screen' \
@@ -155,9 +162,11 @@ PY
 # M73e (#1629): the reverse direction — Ctrl+Shift+V pastes the >256 B
 # selection back through the bound tty. The marker's byte count must
 # exceed the old 256 B queue (the raised in_capacity + DECSET 2004 wrap
-# are what make that land), and every pasted line — including the tail
-# LINE-19, which only survives if NOTHING was dropped — must reach the
-# editor and run.
+# are what make that land). M154a (#2926) repins the submit contract:
+# bracketed paste is ON by default, so the region stages as ONE pending
+# edit and the chord's return submits it once — exactly one `goterm: line`
+# after the paste marker, holding every pasted row — and `echo after`
+# still submits as its own line right behind it.
 vgate_assert 01 python <<'PY'
 import os, re
 ser = open(os.environ["VG_SER"], errors="replace").read()
@@ -168,9 +177,17 @@ assert n > 256, f"paste must exceed the old 256 B queue (got {n})"
 i_copy = ser.find("tty: copy ")
 i_paste = ser.find(m.group(0))
 assert i_copy >= 0 and i_paste > i_copy, f"paste not after copy (copy={i_copy} paste={i_paste})"
-for seg in ("goterm: line LINE-00 pppp", "goterm: line LINE-10 pppp", "goterm: line LINE-19 pppp"):
-    assert seg in ser, f"{seg} missing — paste lost bytes"
-print(f"paste OK: {n} bytes; LINE-00..LINE-19 all reached the editor")
+i_line = ser.find("goterm: line ", i_paste)
+i_done = ser.find("goterm: done status=", i_line)
+i_after = ser.find("goterm: line echo after", i_done)
+for name, i in (("submit", i_line), ("done", i_done), ("echo after", i_after)):
+    assert i >= 0, f"{name} missing after the paste"
+n_sub = ser.count("goterm: line ", i_paste, i_done)
+assert n_sub == 1, f"bracketed paste must be ONE submit on Enter (got {n_sub})"
+seg = ser[i_line:i_done]
+for i in range(20):
+    assert ("LINE-%02d pppp" % i) in seg, f"LINE-{i:02d} pppp missing from the one submit"
+print(f"bracketed paste OK: {n} bytes; 20 rows in ONE submit, echo after followed")
 PY
 
 # #1688 staged proof: stage the seat binary BETWEEN boots — run 01 (above)
@@ -922,4 +939,72 @@ assert i_read < i_echo < i_hints < i_close, (
     f"hints={i_hints} close={i_close} — '?' reached the overlay while a "
     f"child owned the tty")
 print("'?' pass-through OK: stdin byte to `read`, overlay only at the prompt")
+PY
+
+# --- M154a (#2926) run 08: bracketed paste ON by default ---------------------
+# The card's class-B proof, with NO opt-out anywhere. `cat SCRIPT2.SH`
+# paints 20 RUNNABLE lines (each appends a row to PL.TXT on the share),
+# the drag copies all 20 rows (~499 B — under the 512 B clipboard, over
+# the old 256 B input queue), and Ctrl+Shift+V lands them BRACKETED
+# because the editor now writes ?2004h with every line-read prompt. Two
+# assertions follow from that: nothing submits between the paste push and
+# the Enter chord — no `goterm: line` may appear there — and the Enter
+# produces ONE submit whose script ran all 20 lines, read back by the
+# monitor's `cat PL.TXT` (the append path makes the print serial-visible,
+# where tty output is not).
+vgate_file paste-done.txt <<'EOFX'
+cat PL.TXT
+echo rx-bracketed-paste-ok
+EOFX
+
+vgate_run 08 -- --display --input --via-virtio --screen '$RUN_DIR/screen-08' \
+    --script '$RUN_DIR/script.txt' \
+    --input-string 'cat SCRIPT2.SH'$'\n' \
+    --input-string-after 'goterm: attached' \
+    --pointer-virtio "68,84;68,84,d;696,392;696,392,u" \
+    --pointer-virtio-after 'goterm: done status=0' \
+    --input-chords "ctrl-shift-c,ctrl-shift-v,return" \
+    --input-chords-after 'dui: term sel end' \
+    --script2 '$RUN_DIR/paste-done.txt' \
+    --script2-after 'goterm: line echo L00' --script2-delay 2 \
+    --script-expect 'rx-bracketed-paste-ok' \
+    --timeout 150
+
+vgate_assert 08 serial-contains 'goterm: ready'
+vgate_assert 08 serial-contains 'goterm: attached'
+vgate_assert 08 serial-contains 'goterm: line cat SCRIPT2.SH'
+vgate_assert 08 serial-contains 'tty: copy '
+vgate_assert 08 serial-contains 'tty: paste '
+vgate_assert 08 serial-contains 'goterm: line echo L00'
+vgate_assert 08 serial-contains 'goterm: done status=0'
+vgate_assert 08 serial-contains 'rx-bracketed-paste-ok'
+vgate_assert 08 serial-absent '\[EXC\]'
+vgate_assert 08 serial-absent '[EXC] parking:'
+
+# The pin: copy = exactly the 20 script rows (499 B), the paste push = the
+# DECSET-wrapped count (499 + 12), ZERO submits between the push and the
+# Enter (one `goterm: line` in the whole window, holding all 20 lines in
+# its one marker), and the monitor's cat proves every line ran.
+vgate_assert 08 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+mc = re.search(r"tty: copy (\d+) bytes", ser)
+assert mc, "copy marker missing"
+assert int(mc.group(1)) == 499, f"copy must be the 20 script rows (got {mc.group(1)})"
+mp = re.search(r"tty: paste (\d+) bytes", ser)
+assert mp, "paste marker missing"
+assert int(mp.group(1)) == 499 + 12, (
+    f"paste must carry the DECSET wrap: 499+12 (got {mp.group(1)})")
+i_paste = ser.find(mp.group(0))
+i_line = ser.find("goterm: line ", i_paste)
+i_done = ser.find("goterm: done status=0", i_line)
+assert i_line > 0 and i_done > i_line, "no submit after the paste"
+n_sub = ser.count("goterm: line ", i_paste, i_done)
+assert n_sub == 1, f"no submit may appear until Enter; Enter yields ONE (got {n_sub})"
+seg = ser[i_line:i_done]
+for i in range(20):
+    assert ("echo L%02d" % i) in seg, f"echo L{i:02d} missing from the one submit"
+rows = re.findall(r"(?m)^L\d\d$", ser[i_done:])
+assert len(rows) == 20, f"PL.TXT holds {len(rows)} rows, want 20 — the script must run all lines"
+print(f"bracketed run OK: copy=499B paste=511B, one submit, PL.TXT has all 20 rows")
 PY

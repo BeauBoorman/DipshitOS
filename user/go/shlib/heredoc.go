@@ -238,7 +238,15 @@ type HeredocReader struct {
 
 // NewHeredocReader scans line for heredoc declarations; a refused form
 // (`<<<`, a missing delimiter, unbalanced quoting) is the scan's error.
+// A line carrying newlines is a submitted BLOCK, not one line (M154a
+// #2926): it never arms — RunLineBodies runs it as a script whose own
+// per-line readers collect any `<<` from the block's following lines,
+// the runSource path, so the front-end's continuation prompt is never
+// owed a delimiter the block already holds.
 func NewHeredocReader(line string) (*HeredocReader, error) {
+	if strings.IndexByte(line, '\n') >= 0 {
+		return &HeredocReader{}, nil
+	}
 	specs, err := scanHeredocs(line)
 	if err != nil {
 		return nil, err
