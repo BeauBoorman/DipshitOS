@@ -606,6 +606,9 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
+# STUB_RUNNER_SLEEP simulates an in-flight VM: pause before producing any
+# output so a test can signal the harness mid-run.
+[ -n "${STUB_RUNNER_SLEEP:-}" ] && sleep "$STUB_RUNNER_SLEEP"
 if [ -n "$save" ]; then
     [ -n "${STUB_VZ_LOG:-}" ] && echo save >> "$STUB_VZ_LOG"
     echo VZSTATE > "$save/state.vzsave"
@@ -849,6 +852,66 @@ refuse "--warm-strict without --from-checkpoint refuses" \
 # The strict refusal path keeps the refused attempt's output as the leg's
 # evidence — already covered by s1's output-contains assert above, which only
 # holds if run-s1.out IS the refused warm attempt.
+
+# --- run-dir teardown on signal exit ----------------------------------------
+# gate_begin mktemp's $VIRELAI_RUN_DIR_BASE/virelai-<gate>.XXXXXX and installs
+# INT/TERM traps that run gate_end and exit 128+sig, so a signal exit tears
+# down the staging dir instead of leaking it. Drive the REAL vgate.sh with
+# the stub runner sleeping in place of a VM, so the signal lands while a
+# foreground child owns the shell's wait.
+#
+# Delivery matters: an async child of this non-interactive suite inherits
+# SIGINT ignored — a disposition a shell cannot then trap (POSIX). The
+# launcher below resets it and puts vgate in its own session, so INT can be
+# delivered to the whole process group exactly like a terminal's ^C. TERM
+# goes to the harness alone — bash defers a trapped TERM until the foreground
+# child exits, so the TERM case takes up to STUB_RUNNER_SLEEP seconds.
+echo
+echo "── run-dir teardown on signal exit ──"
+
+SIG_SPEC="$TMP/sig-mini.spec"
+cat > "$SIG_SPEC" <<'SPEC'
+vgate_name sig-mini "stub-runner signal teardown check"
+vgate_file s1.txt <<'EOF'
+echo sig-line
+EOF
+vgate_run 01 -- --script '$RUN_DIR/s1.txt' --script-after 'tasks user-el0 reaped' --script-expect sig-line --timeout 120
+vgate_assert 01 serial-contains 'sig-line'
+SPEC
+
+for sig in TERM INT; do
+    VGATE_NO_BUILD=1 VZ_RUNNER_BIN="$STUB_RUNNER" STUB_RUNNER_SLEEP=6 \
+        VIRELAI_RUN_DIR_BASE="$TMP" \
+        python3 - "$MODERN_BASH" "$SIG_SPEC" > "$TMP/vgate-sig-$sig.out" 2>&1 <<'PY' &
+import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.setsid()
+os.execvpe(sys.argv[1], [sys.argv[1], "tools/gate/vgate.sh", sys.argv[2]], os.environ)
+PY
+    sig_vgpid=$!
+    # Wait for the run dir to exist AND the stub to be in-flight (inside its
+    # sleep), so the signal lands mid-run.
+    sig_dir=""
+    for _ in $(seq 40); do
+        sig_dir="$(ls -d "$TMP"/virelai-sig-mini.* 2>/dev/null | head -1)"
+        [ -n "$sig_dir" ] && pgrep -f "$STUB_RUNNER" >/dev/null 2>&1 && break
+        sleep 0.25
+    done
+    if [ "$sig" = INT ]; then
+        kill -INT -- -"$sig_vgpid" 2>/dev/null   # ^C: the whole session group
+    else
+        kill -TERM "$sig_vgpid" 2>/dev/null      # watchdog: the harness alone
+    fi
+    wait "$sig_vgpid"; sig_rc=$?
+    [ "$sig_rc" != 0 ] \
+        && ok "SIG$sig mid-run: vgate exits nonzero (rc=$sig_rc)" \
+        || bad "SIG$sig mid-run: vgate reported rc=0 — the interrupt was swallowed"
+    [ -n "$sig_dir" ] && [ ! -d "$sig_dir" ] \
+        && ok "SIG$sig mid-run: run dir removed" \
+        || bad "SIG$sig mid-run: run dir still present: ${sig_dir:-<none created>}"
+    pgrep -f "$STUB_RUNNER" >/dev/null 2>&1 && pkill -f "$STUB_RUNNER" || true
+done
+rm -f artifacts/sig-mini-*
 
 rm -rf "$RUN_DIR_LEFT" 2>/dev/null
 rm -f artifacts/warm-mini-* artifacts/refuse-*-report.txt artifacts/refuse-*-gate.txt

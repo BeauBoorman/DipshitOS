@@ -116,6 +116,7 @@ if [ ! -x "$FORK_DIR/bin/go" ]; then
 fi
 
 GOPATH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/virelai-gopath.XXXXXX")"
+trap 'rm -rf "$GOPATH_DIR"' EXIT
 mkdir -p "$GOPATH_DIR/src"
 ln -sfn "$REPO/user/go" "$GOPATH_DIR/src/virelai"
 

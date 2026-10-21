@@ -33,6 +33,10 @@
 #     call this; gates that only read the serial port can skip it.
 # gate_end:
 #   - removes RUN_DIR unless VIRELAI_KEEP_RUN=1 (post-mortem escape hatch).
+# gate_begin also installs INT/TERM traps that run gate_end and exit
+#   128+sig, so a signal aimed at the harness shell still tears down the
+#   staging dir instead of leaking it (or, for INT, being swallowed while a
+#   foreground runner holds the wait).
 #
 # Evidence policy: copy what you need back into artifacts/ BEFORE gate_end
 # using the gate's canonical names. Two concurrent instances of the SAME
@@ -80,6 +84,20 @@ gate_begin() {
     local base="${VIRELAI_RUN_DIR_BASE:-${TMPDIR:-/tmp}}"
     mkdir -p "$base"
     RUN_DIR="$(mktemp -d "$base/virelai-${GATE_NAME}.XXXXXX")"
+    # Run-dir teardown on signal exits. The caller's EXIT trap already runs
+    # gate_end on every exit bash reaches — but make it a contract: translate
+    # INT/TERM into an exit that runs gate_end first and reports the
+    # conventional 128+sig status. Caveats are bash's, not ours: a signal
+    # while a foreground runner holds the wait is deferred until the child
+    # exits (TERM) — or discarded entirely when the child exits normally
+    # (INT) — and SIGKILL is untrappable by construction, so a killed gate
+    # can still strand RUN_DIR. This covers the paths that do reach a trap:
+    # signals between commands, and Ctrl-C delivery where the runner dies of
+    # SIGINT with us. RUN_DIR is per-invocation so its lifetime is exactly
+    # this process; gate_end is idempotent — the caller's EXIT trap
+    # re-entering it is a no-op — and VIRELAI_KEEP_RUN stays honored.
+    trap 'gate_end 2>/dev/null || true; exit 130' INT
+    trap 'gate_end 2>/dev/null || true; exit 143' TERM
     # M34 HF6 (issue #740): attach the CANONICAL artifacts/disk.img as the
     # read-only overlay base — no private copy (the boot volume is never
     # written by the guest; the loader's pre-exit evidence writes land in

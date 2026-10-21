@@ -8541,7 +8541,6 @@ func beginConsoleExit(_ context: String, code: Int32, restore: Bool = false) {
 }
 
 func installSignalHandlers() {
-    guard consoleMode || hostSessionMode else { return }
     for sig: Int32 in [SIGINT, SIGTERM, SIGHUP] {
         signal(sig, SIG_IGN) // suppress default termination; the source below handles it
         let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
@@ -8550,11 +8549,30 @@ func installSignalHandlers() {
                 hostApplication?.stop("signal-\(sig)", code: 128 + sig)
                 return
             }
-            // Claim 2188: stop the VM (closes the serial pipe) and wait for
-            // the tee to flush, instead of the old fixed 0.4 s sleep that
-            // could still race the tee thread's final write. `restore:` is
-            // true — the terminal is raw while the console session runs.
-            beginConsoleExit("caught signal \(sig)", code: 128 + sig, restore: true)
+            if consoleMode {
+                // Claim 2188: stop the VM (closes the serial pipe) and wait for
+                // the tee to flush, instead of the old fixed 0.4 s sleep that
+                // could still race the tee thread's final write. `restore:` is
+                // true — the terminal is raw while the console session runs.
+                beginConsoleExit("caught signal \(sig)", code: 128 + sig, restore: true)
+                return
+            }
+            // Scripted/plain headless runs have no console teardown, but a
+            // default signal death skips atexit — leaking the throwaway ASIF
+            // overlay dir ($TMPDIR/virelai-overlay-*). Run the same teardown
+            // inline, then die BY the signal: a plain exit() would read to the
+            // harness as a clean child exit, and a gate shell holding a
+            // pending SIGINT discards it when the child exits normally — ^C
+            // would stop aborting runs.
+            restoreTerminal()
+            if let p = overlayCleanupPath,
+               ProcessInfo.processInfo.environment["VIRELAI_KEEP_OVERLAY"] == nil {
+                try? FileManager.default.removeItem(atPath: p)
+                overlayCleanupPath = nil
+            }
+            signal(sig, SIG_DFL)
+            kill(getpid(), sig)
+            exit(128 + sig) // unreachable unless the re-raise was blocked
         }
         src.resume()
         signalSources.append(src)
@@ -8620,6 +8638,7 @@ if hostSessionMode {
     // expected transcript. Milestone six card G1 (claim 6053): when the
     // gpu device is attached (`--display`/`--screenshot`), the window is
     // created here too so the scripted run can capture the framebuffer.
+    installSignalHandlers()
     setupDisplayWindow()
     startGuestOutputTee()
     startScriptInput()
@@ -8635,6 +8654,7 @@ if hostSessionMode {
     startPointerVirtioInject()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { scriptPoll() }
 } else {
+    installSignalHandlers()
     setupDisplayWindow()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { poll() }
 }

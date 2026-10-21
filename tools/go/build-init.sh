@@ -6,6 +6,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FORK_DIR="${GO_FORK_DIR:-$(dirname "$REPO")/go-virelai}"
 test -x "$FORK_DIR/bin/go" || { echo "build-init: provision the Go fork first" >&2; exit 1; }
 GOPATH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/virelai-init-gopath.XXXXXX")"
+trap 'rm -rf "$GOPATH_DIR"' EXIT
 mkdir -p "$GOPATH_DIR/src" "$REPO/.build/go"
 ln -s "$REPO/user/go" "$GOPATH_DIR/src/virelai"
 export GOROOT="$FORK_DIR" GOTOOLCHAIN=local GO111MODULE=off GOFLAGS=
