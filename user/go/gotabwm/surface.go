@@ -118,7 +118,11 @@ func surfaceNoteMirror(e vi.Event) {
 	}
 	id := uint32(e.Flags & 0xff)
 	if e.Flags&(1<<13) != 0 {
-		surfaceXY[id] = 0
+		// #2870: same staleness guard as the binding drop — a reused
+		// id's mirrored position belongs to the live successor.
+		if !deathMirrorStale(id) {
+			surfaceXY[id] = 0
+		}
 		return
 	}
 	surfaceXY[id] = e.Arg0

@@ -164,6 +164,91 @@ func TestFillBorderChromeIsValid(t *testing.T) {
 	}
 }
 
+// #2870: a released mirror carries an 8-bit id and no generation, so a
+// mirror minted for a dead window must not close a live row on the
+// reissued id — nor drop the successor's binding or zero its mirrored
+// geometry. The row's bound owner pid plus the seat's cross-owner name
+// read are the liveness proof.
+func TestStaleDeathMirrorKeepsReusedRow(t *testing.T) {
+	savedTabs, savedHosted := tabs, hostedApp
+	savedLaunch, savedButton := launch, buttonPixels
+	savedBinds, savedChalls := rpcBindings, rpcChallenges
+	savedRects, savedXY := gpu3dRects, surfaceXY
+	prevName, prevAlive, prevExit := readWindowName, procsAlive, procsExitStatus
+	defer func() {
+		tabs, hostedApp = savedTabs, savedHosted
+		launch, buttonPixels = savedLaunch, savedButton
+		rpcBindings, rpcChallenges = savedBinds, savedChalls
+		gpu3dRects, surfaceXY = savedRects, savedXY
+		readWindowName, procsAlive, procsExitStatus = prevName, prevAlive, prevExit
+	}()
+	tabs = TabStrip{}
+	launch = launcherState{}
+	buttonPixels = windowPixels{}
+	if !tabs.OpenTab(6, "Settings") {
+		t.Fatal("OpenTab")
+	}
+	rpcBindings[6] = rpcBinding{pid: 44, token: 0xbeef}
+	gpu3dRects[6] = 560 | 360<<16
+	surfaceXY[6] = 48 | 48<<16
+	procsAlive = func(pid uint8) bool { return pid == 44 }
+	procsExitStatus = func(uint8) (uint64, bool) { return 0, false }
+	mirror := vi.Event{Kind: vi.EvWmWindow, Flags: 6 | 1<<13}
+
+	// The successor's window answers at id 6 and its bound owner runs:
+	// the mirror is stale, so the row, the binding, the reopen LIFO, and
+	// the mirrored geometry all survive untouched.
+	readWindowName = func(uint8) (string, bool) { return "Settings", true }
+	launcherWindowEvent(mirror)
+	if tabs.index(6) < 0 {
+		t.Fatal("stale mirror closed the live row")
+	}
+	if rpcBindings[6].token != 0xbeef {
+		t.Fatal("stale mirror dropped the successor's binding")
+	}
+	if c, ok := tabs.ReopenLastClosed(); ok {
+		t.Fatalf("stale mirror pushed a reopen record %+v", c)
+	}
+	gpu3dNoteMirror(mirror)
+	surfaceNoteMirror(mirror)
+	if gpu3dRects[6] == 0 || surfaceXY[6] == 0 {
+		t.Fatal("stale mirror zeroed the successor's mirrored geometry")
+	}
+
+	// A live window whose bound owner is DEAD is the successor-not-yet-
+	// bound shape: the row's own window really is gone, so the mirror
+	// closes it — and the recorded bin is GOSET.ELF, not "Settings".
+	rpcBindings[6] = rpcBinding{pid: 99, token: 0xdead}
+	procsAlive = func(uint8) bool { return false }
+	launcherWindowEvent(mirror)
+	if tabs.index(6) >= 0 {
+		t.Fatal("dead-owner row survived its real mirror")
+	}
+	if rpcBindings[6].token != 0 {
+		t.Fatal("dead owner's binding was not dropped")
+	}
+	c, ok := tabs.ReopenLastClosed()
+	if !ok || c.Bin != "GOSET.ELF" {
+		t.Fatalf("reopen record = %+v ok=%v want GOSET.ELF", c, ok)
+	}
+
+	// Nothing answering at id is the ordinary death: the row closes even
+	// when its bound owner is still running (it closed the window first).
+	if !tabs.OpenTab(6, "Settings") {
+		t.Fatal("OpenTab arm 3")
+	}
+	rpcBindings[6] = rpcBinding{pid: 44, token: 0xf00d}
+	procsAlive = func(pid uint8) bool { return pid == 44 }
+	readWindowName = func(uint8) (string, bool) { return "", false }
+	launcherWindowEvent(mirror)
+	if tabs.index(6) >= 0 {
+		t.Fatal("a real death mirror left the row open")
+	}
+	if rpcBindings[6].token != 0 {
+		t.Fatal("a real death mirror kept the dead binding")
+	}
+}
+
 func TestHostedWindowGetsZeroChromeAndSeatKeepsBorder(t *testing.T) {
 	savedScratch, savedWrite := chromeScratch, writeWindowChrome
 	defer func() { chromeScratch, writeWindowChrome = savedScratch, savedWrite }()

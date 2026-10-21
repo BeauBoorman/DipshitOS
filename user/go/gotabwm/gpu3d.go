@@ -262,7 +262,12 @@ func gpu3dNoteMirror(e vi.Event) {
 	}
 	id := uint32(e.Flags & 0xff)
 	if e.Flags&(1<<13) != 0 {
-		gpu3dRects[id] = 0
+		// #2870: a stale release mirror must not zero the LIVE window's
+		// extent — the id may have been reissued to a bound successor,
+		// and a 0 reads as "no mirror yet" until the next one lands.
+		if !deathMirrorStale(id) {
+			gpu3dRects[id] = 0
+		}
 		return
 	}
 	gpu3dRects[id] = e.Arg1

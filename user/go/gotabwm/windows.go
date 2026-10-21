@@ -344,7 +344,12 @@ func launcherWindowEvent(e vi.Event) {
 	if id == launch.prior {
 		launch.prior = 0
 	}
-	if tabs.index(id) >= 0 {
+	// #2870: the mirror carries an 8-bit id and no generation, so a death
+	// mirror can drain after the kernel already reissued the id to a live
+	// window. Nothing the mirror would trigger — the row close or the
+	// binding drop — may run while the successor is provably alive.
+	stale := deathMirrorStale(id)
+	if !stale && tabs.index(id) >= 0 {
 		// M125f (#2591): a released tab the seat never closed is the
 		// kernel's teardown of a dead process. Its bound owner's exit
 		// status discriminates the crash receipt (nonzero) from a clean
@@ -367,9 +372,14 @@ func launcherWindowEvent(e vi.Event) {
 		}
 		syncHostedFromStrip()
 	}
-	// M97g-F2 (#2080): the released window's binding and pending challenge
-	// die with it, tab or not — a reused id must not inherit a dead token.
-	dropRpcBinding(id)
+	if !stale {
+		// M97g-F2 (#2080): the released window's binding and pending
+		// challenge die with it, tab or not — a reused id must not
+		// inherit a dead token. A stale mirror's "release" names a
+		// predecessor: the live binding belongs to the successor, not
+		// the dead window, so it survives untouched.
+		dropRpcBinding(id)
+	}
 	// A delayed mirror can name a reused id. Only a failed query proves
 	// the current sink is gone; ordinary sink KEY_DOWN/BLUR events drain
 	// on the same seat queue and are intentionally ignored.
@@ -379,6 +389,38 @@ func launcherWindowEvent(e vi.Event) {
 			dismissLauncher()
 		}
 	}
+}
+
+// deathMirrorStale reports whether a released registry mirror naming id is
+// STALE: it was minted for a window that left the registry, but the kernel
+// has since reissued the id to a live successor — the mirror's side effects
+// must not run against the successor's row, binding, or geometry. The
+// mirror carries no generation to disambiguate, so the seat proves life
+// with the two cross-owner facts it can read: a user window still answers
+// at id (wmctl cmd 14 — sys_win_query is owner-restricted and cannot ask),
+// and the row's bound owner pid is still running (the M97g-F2 bind proved
+// that pid owns the current window at id). Both live means the mirror names
+// a predecessor. Observed 2026-10-21 (#2870): the launcher focus sink's
+// death mirror drained ~33k serial lines after GOSET re-bound its reissued
+// id — the silent close removed GOSET's live row and the recorded entry
+// poisoned the reopen LIFO (`reopen missing Settings`).
+//
+// A live window whose bound owner is dead still counts as a real death:
+// the row's own window died with its owner and the live window is an
+// unbound successor, which binds and declares fresh. The residual race is
+// a bound owner that closes its window but keeps running while the id
+// passes to a window that never binds — that reads as live, and the row
+// survives until the successor declares or a later mirror proves it dead.
+// An unbound row cannot be told apart this way and keeps the old close.
+func deathMirrorStale(id uint32) bool {
+	if id > 255 {
+		return false
+	}
+	if _, ok := readWindowName(uint8(id)); !ok {
+		return false
+	}
+	pid := rpcBindings[id].pid
+	return pid != 0 && procsAlive(pid)
 }
 
 // runWindowPhase drives the seat's own window lifecycle end to end. It returns

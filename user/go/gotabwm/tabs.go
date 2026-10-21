@@ -307,6 +307,12 @@ func guessBin(title string) string {
 		// PWR row focuses the tab by bin, and a restored row needs the
 		// real binary like every app above.
 		return "GOSNAP.ELF"
+	case "Settings":
+		// #2870: GOSET's declared title — without the row a closed
+		// Settings tab records Bin="Settings" and every reopen ENOENTs
+		// (`reopen missing Settings` + `refusal ENOENT exec Settings`,
+		// go-dogfood boot 09).
+		return "GOSET.ELF"
 	default:
 		return title
 	}
