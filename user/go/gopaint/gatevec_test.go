@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"image/color"
+	"image/png"
 	"os"
 	"testing"
 
+	"virelai/webrender"
 	"virelai/webrender/qoi"
 )
 
@@ -78,6 +82,32 @@ func TestGateVectors(t *testing.T) {
 	}
 	if len(enc) != 6042 {
 		t.Fatalf("saved n=%d, want 6042", len(enc))
+	}
+	// The export leg (issue #2976): the PNG of the same post-undo canvas.
+	// A 640x480 doc is over webrender's decode cap (the guest cannot
+	// re-open its own export — reopen is the QOI), so the round-trip check
+	// is the BSD-3 host reference image/png; the spec's python repeats it
+	// with zlib+unfilter on the class-B side.
+	pngBytes := webrender.EncodePNG(d.pix, d.w, d.h)
+	img, err := png.Decode(bytes.NewReader(pngBytes))
+	if err != nil {
+		t.Fatalf("exported PNG does not decode: %v", err)
+	}
+	b := img.Bounds()
+	if b.Dx() != d.w || b.Dy() != d.h {
+		t.Fatalf("export dims %v, want %dx%d", b, d.w, d.h)
+	}
+	for y := 0; y < d.h; y++ {
+		for x := 0; x < d.w; x++ {
+			c := color.NRGBAModel.Convert(img.At(b.Min.X+x, b.Min.Y+y)).(color.NRGBA)
+			p := uint32(c.A)<<24 | uint32(c.R)<<16 | uint32(c.G)<<8 | uint32(c.B)
+			if p != d.pix[y*d.w+x] {
+				t.Fatalf("export pixel (%d,%d) %#08x != canvas %#08x", x, y, p, d.pix[y*d.w+x])
+			}
+		}
+	}
+	if len(pngBytes) != 7996 {
+		t.Fatalf("exported n=%d, want 7996", len(pngBytes))
 	}
 }
 

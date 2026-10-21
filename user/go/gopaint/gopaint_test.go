@@ -1,8 +1,13 @@
 package main
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 
+	"virelai/appkit"
+	"virelai/vi"
+	"virelai/webrender"
 	"virelai/webrender/qoi"
 )
 
@@ -231,6 +236,113 @@ func TestStateRoundTrip(t *testing.T) {
 		if _, ok := decodeState(bad); ok {
 			t.Fatalf("decodeState(%v) = ok", bad)
 		}
+	}
+}
+
+// The export path rules: the PNG twin keeps the directory and the stem,
+// swapping the extension with its case preserved.
+func TestExportPath(t *testing.T) {
+	for path, want := range map[string]string{
+		"/host/PAINT1.QOI":      "/host/PAINT1.PNG",
+		"/host/DROP/seed.qoi":   "/host/DROP/seed.png",
+		"/host/noext":           "/host/noext.png",
+		"X.GIF":                 "X.PNG",
+		"/host/ART.BMP":         "/host/ART.PNG",
+		"/host/mixed.Case.qoi2": "/host/mixed.Case.png",
+	} {
+		if got := exportPath(path); got != want {
+			t.Fatalf("exportPath(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// stubWrite captures the safe-write payload and the console markers the
+// export flow emits, so the class-B spec's strings are pinned here.
+func stubWrite(t *testing.T) (wrote *struct {
+	path string
+	data []byte
+}, lines *[]string) {
+	t.Helper()
+	wrote = &struct {
+		path string
+		data []byte
+	}{}
+	lines = &[]string{}
+	oldW, oldC := writeSafe, conLine
+	writeSafe = func(path string, b []byte) int64 {
+		wrote.path, wrote.data = path, b
+		return 0
+	}
+	conLine = func(s string) { *lines = append(*lines, s) }
+	t.Cleanup(func() { writeSafe, conLine = oldW, oldC })
+	return wrote, lines
+}
+
+// 'x' on a document with a file association exports the derived PNG path
+// without raising the picker; the bytes decode back to the same canvas.
+func TestExportPNGQuickPath(t *testing.T) {
+	d := newDoc(16, 12)
+	tx := d.begin()
+	tx.segment(pt{2, 2}, pt{12, 8}, 1, palette[9])
+	d.commit(tx)
+	d.path = "/host/PAINT1.QOI"
+	d.dirty = false
+
+	wrote, lines := stubWrite(t)
+	a := &app{d: d}
+	if !a.export() {
+		t.Fatal("export refused")
+	}
+	if wrote.path != "/host/PAINT1.PNG" {
+		t.Fatalf("export wrote %q", wrote.path)
+	}
+	im, err := webrender.DecodePNG(wrote.data)
+	if err != nil {
+		t.Fatalf("export is not a PNG: %v", err)
+	}
+	for i := range d.pix {
+		if im.Pix[i] != d.pix[i] {
+			t.Fatalf("exported pixel %d %#08x != canvas %#08x", i, im.Pix[i], d.pix[i])
+		}
+	}
+	want := "gopaint: exported /host/PAINT1.PNG fmt=png n=" +
+		strconv.Itoa(len(wrote.data)) + " sum=" + fnv16(d.sum())
+	if len(*lines) != 1 || (*lines)[0] != want {
+		t.Fatalf("markers %v, want %q", *lines, want)
+	}
+	// The export is a copy: the QOI association and dirty state stay.
+	if a.d.path != "/host/PAINT1.QOI" || a.d.dirty {
+		t.Fatal("export moved the document's save state")
+	}
+}
+
+// A document that never named a file raises the picker in export mode;
+// the typed name routes to exportPNG, not save.
+func TestExportPNGPickerFallback(t *testing.T) {
+	d := newDoc(8, 8)
+	wrote, lines := stubWrite(t)
+	a := &app{d: d}
+	if !a.export() {
+		t.Fatal("export refused")
+	}
+	if a.mode != modePicker || !a.pickExport || a.pick.Kind != appkit.PickSave {
+		t.Fatal("export did not raise the save picker in export mode")
+	}
+	if a.pick.Title != "Export PNG" {
+		t.Fatalf("picker title %q", a.pick.Title)
+	}
+	a.pick.Input = "FRESH.PNG"
+	a.pickerKey(vi.Event{Kind: vi.EvKeyDown, Arg0: 0x28, Arg1: '\r'})
+	if wrote.path != "/host/FRESH.PNG" {
+		t.Fatalf("picker export wrote %q", wrote.path)
+	}
+	var raised, done bool
+	for _, l := range *lines {
+		raised = raised || l == "gopaint: pick export"
+		done = done || strings.HasPrefix(l, "gopaint: exported /host/FRESH.PNG fmt=png n=")
+	}
+	if !raised || !done {
+		t.Fatalf("markers %v", *lines)
 	}
 }
 

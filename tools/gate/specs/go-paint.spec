@@ -7,9 +7,12 @@
 #       seat's content forward is terminal-only, so canvas apps under GOTABWM
 #       never see the pointer). A scripted gesture set exercises all five
 #       tools; ctrl-z twice reverts the newest two ops; ctrl-s raises the
-#       save picker, a typed name lands /host/PAINT1.QOI, and a second exec
-#       reopens it — every hop pinned by the app's own sum= digests, the
-#       pixel probe, and the file's host-verified SHA-256.
+#       save picker, a typed name lands /host/PAINT1.QOI, 'x' then exports
+#       /host/PAINT1.PNG (issue #2976 — one keyDown through --input-key),
+#       and a second exec reopens the QOI — every hop pinned by the app's
+#       own sum= digests, the pixel probe, the file's host-verified
+#       SHA-256, and a python inflate+unfilter of the PNG matching its
+#       pixels to the QOI save's sum=.
 #   02  SEAT (GOTABWM): the M124a drag — GOFILES arms PIC.QOI, the release
 #       lands on GOPAINT's split pane, the in-app confirm answers the
 #       staged payload, and the canvas becomes the image. GOPAINT has no
@@ -81,7 +84,7 @@
 #   ../flint-server checkout (or FLINT_SERVER_DIR=...) — the hook zig-builds
 #   flintd and serves the signed gopaint stream on 127.0.0.1:4859.
 
-vgate_name go-paint "M141a #2787 + M141b #2788: GOPAINT.ELF — tools/undo/QOI, drop-in, save_state, signed STORE install + round-trip K=3"
+vgate_name go-paint "M141a #2787 + M141b #2788 + #2976: GOPAINT.ELF — tools/undo/QOI, PNG export, drop-in, save_state, signed STORE install + round-trip K=3"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -189,8 +192,10 @@ vgate_run 01 -- \
     --input-chords-after 'gopaint: commit erase' \
     --input-string $'PAINT1.QOI\n' \
     --input-string-after 'gopaint: pick save' \
+    --input-key 7 \
+    --input-key-after 'gopaint: saved ' \
     --script2 '$RUN_DIR/script2-01.txt' \
-    --script2-after 'gopaint: saved ' \
+    --script2-after 'gopaint: exported ' \
     --script3 '$RUN_DIR/script3-01.txt' \
     --script3-after 'gopaint: loaded ' \
     --script-expect 'rx-go-paint-ok' --timeout 420
@@ -216,24 +221,32 @@ vgate_assert 01 serial-contains 'gopaint: commit erase n=513 sum=1736b82007e7fe8
 vgate_assert 01 serial-contains 'gopaint: undo depth=4 sum=5b5a7eeede3e7cdb probe=0xff00e436'
 vgate_assert 01 serial-contains 'gopaint: undo depth=3 sum=84b28dfa95fb6f29 probe=0xfffff1e8'
 
-# Save through the picker, then a second exec reopens the file: the reopened
-# canvas digest equals the post-undo one — "reopen gets the same pixels back".
+# Save through the picker, then 'x' exports the PNG twin next to it (the
+# key rides --input-key because the runner's stage budget has one free
+# plain-key slot, and the export needs no picker of its own), then a
+# second exec reopens the QOI: the reopened canvas digest equals the
+# post-undo one — "reopen gets the same pixels back".
 vgate_assert 01 serial-contains 'gopaint: pick save /host/PAINT1.QOI'
 vgate_assert 01 serial-contains 'gopaint: saved /host/PAINT1.QOI n=6042 sum=84b28dfa95fb6f29'
+vgate_assert 01 serial-contains 'gopaint: exported /host/PAINT1.PNG fmt=png n=7996 sum=84b28dfa95fb6f29'
 vgate_assert 01 serial-contains 'gopaint: loaded /host/PAINT1.QOI 640x480 sum=84b28dfa95fb6f29'
 vgate_assert 01 serial-contains 'rx-go-paint-ok'
 
 vgate_assert 01 serial-absent 'gopaint: open refused'
 vgate_assert 01 serial-absent 'gopaint: save refused'
+vgate_assert 01 serial-absent 'gopaint: export refused'
 vgate_assert 01 serial-absent 'gopaint: undo empty'
 vgate_assert 01 serial-absent '[EXC] parking:'
 vgate_assert 01 serial-absent 'exited status=139'
 
 # The file on the share: SHA-256 of the actual saved bytes plus a QOI decode
 # probing two pixels — the filled rect interior is green (palette 11) and the
-# probe point the undo restored is paper.
+# probe point the undo restored is paper. Then the PNG twin: IHDR/IDAT/IEND
+# framing with real CRCs, the IDAT inflated with zlib, every row un-Subbed,
+# and the reconstructed pixels' FNV-1a compared against the sum= the QOI
+# save itself printed — the export is the same canvas, byte for byte.
 vgate_assert 01 python <<'PY'
-import hashlib, os
+import hashlib, os, re, zlib
 share = os.environ["VG_SHARE"]
 data = open(os.path.join(share, "PAINT1.QOI"), "rb").read()
 sha = hashlib.sha256(data).hexdigest()
@@ -244,6 +257,53 @@ w = int.from_bytes(data[4:8], "big")
 h = int.from_bytes(data[8:12], "big")
 assert (w, h) == (640, 480), "dims %dx%d" % (w, h)
 print("PAINT1.QOI: %d bytes sha256=%s %dx%d" % (len(data), sha[:12], w, h))
+
+png = open(os.path.join(share, "PAINT1.PNG"), "rb").read()
+assert png[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+pos, idat, pw, ph, ptype = 8, None, 0, 0, -1
+while pos < len(png):
+    n = int.from_bytes(png[pos:pos+4], "big")
+    name = png[pos+4:pos+8]
+    crc = int.from_bytes(png[pos+8+n:pos+12+n], "big")
+    assert zlib.crc32(png[pos+4:pos+8+n]) & 0xffffffff == crc, "bad crc %r" % name
+    body = png[pos+8:pos+8+n]
+    if name == b"IHDR":
+        assert n == 13, "IHDR len %d" % n
+        pw = int.from_bytes(body[:4], "big")
+        ph = int.from_bytes(body[4:8], "big")
+        ptype = body[9]
+        assert body[8] == 8 and body[10:] == b"\x00\x00\x00", "IHDR %r" % body
+    elif name == b"IDAT":
+        assert idat is None, "second IDAT"
+        idat = body
+    elif name == b"IEND":
+        assert n == 0 and pos + 12 == len(png), "IEND not last"
+    pos += 12 + n
+assert (pw, ph) == (640, 480), "png dims %dx%d" % (pw, ph)
+assert ptype == 2, "opaque canvas must encode RGB, got type %d" % ptype
+assert idat, "no IDAT"
+
+ch = 3
+raw = zlib.decompress(idat)
+stride = pw * ch + 1
+assert len(raw) == stride * ph, "inflated %d != %d" % (len(raw), stride * ph)
+fnv = 0xcbf29ce484222325
+for y in range(ph):
+    row = bytearray(raw[y*stride+1:(y+1)*stride])
+    assert raw[y*stride] == 1, "row %d filter %d, want Sub" % (y, raw[y*stride])
+    for i in range(ch, len(row)):
+        row[i] = (row[i] + row[i-ch]) & 0xff
+    for x in range(pw):
+        # doc.sum() hashes the 0xAARRGGBB word little-endian: B, G, R, A.
+        for v in (row[x*3+2], row[x*3+1], row[x*3], 0xff):
+            fnv = (fnv ^ v) * 0x100000001b3 & 0xffffffffffffffff
+ser = open(os.environ["VG_SER"], "rb").read().decode("latin1", "replace")
+m = re.search(r"gopaint: saved /host/PAINT1\.QOI n=\d+ sum=([0-9a-f]{16})", ser)
+assert m, "no gopaint: saved marker"
+assert "%016x" % fnv == m.group(1), \
+    "PNG pixel sum %016x != QOI save sum %s" % (fnv, m.group(1))
+print("PAINT1.PNG: %d bytes, %dx%d type %d, Sub rows, pixel sum == QOI save %s"
+      % (len(png), pw, ph, ptype, m.group(1)))
 PY
 
 # --- run 02: the seat drop ----------------------------------------------------

@@ -1,7 +1,8 @@
 // Command gopaint is GOPAINT.ELF — the M141a paint app: a draw-v2 document
 // canvas (the doc in doc.go, never the window surface) with a brush, line,
 // rectangle, flood fill and eraser over a fixed 16-color palette at two
-// brush sizes; QOI save/open through the shared FilePicker; a drop replaces
+// brush sizes; QOI save/open through the shared FilePicker plus 'x' PNG
+// export (issue #2976); a drop replaces
 // the canvas behind a confirm dialog; and ctrl+z reverts through the undo
 // ring.
 //
@@ -78,9 +79,11 @@ const (
 	markerColor    = "gopaint: color "
 	markerCommit   = "gopaint: commit " // "<tool> n=<touched> sum=<fnv>"
 	markerUndo     = "gopaint: undo "   // "depth=N sum=<fnv> probe=<px>" / "empty"
-	markerPick     = "gopaint: pick "   // "open|save" at raise, "<verb> <path>" / "cancel" at result
+	markerPick     = "gopaint: pick "   // "open|save|export" at raise, "<verb> <path>" / "cancel" at result
 	markerSaved    = "gopaint: saved "  // "<path> n=<bytes> sum=<fnv>"
 	markerSaveErr  = "gopaint: save refused "
+	markerExported = "gopaint: exported " // "<path> fmt=png n=<bytes> sum=<fnv>"
+	markerXportErr = "gopaint: export refused "
 	markerLoaded   = "gopaint: loaded " // "<path> WxH sum=<fnv>"
 	markerOpenErr  = "gopaint: open refused "
 	markerDrop     = "gopaint: drop " // "<mime> WxH sum=<fnv>"
@@ -143,7 +146,10 @@ type app struct {
 	txn         *txn
 
 	pick appkit.FilePicker
-	dlg  appkit.Dialog
+	// pickExport marks a PickSave picker raised by Export PNG — its result
+	// routes to exportPNG, not save.
+	pickExport bool
+	dlg        appkit.Dialog
 	// dialogAsk is what the open dialog answers: "drop" replaces the
 	// canvas with the staged decode, "open" precedes the file picker.
 	dialogAsk  string
@@ -415,6 +421,68 @@ func (a *app) save(path string) bool {
 	return true
 }
 
+// export is the 'x' key: the PNG copy of the canvas. A document with a
+// file association exports next to it — the same stem with the extension
+// swapped to .png (.PNG when the old extension was uppercase); a document
+// that has never been saved or loaded raises the save picker instead, so
+// export never depends on a prior QOI save.
+func (a *app) export() bool {
+	if a.d.path == "" {
+		a.openPick(appkit.PickSave)
+		a.pick.Title = "Export PNG"
+		a.pickExport = true
+		conLine(markerPick + "export")
+		return true
+	}
+	return a.exportPNG(exportPath(a.d.path))
+}
+
+// exportPNG encodes the document as PNG and publishes it through the same
+// safe-write temp+rename path save uses. The export is a copy: the
+// document keeps its QOI association and dirty state.
+func (a *app) exportPNG(path string) bool {
+	enc := webrender.EncodePNG(a.d.pix, a.d.w, a.d.h)
+	if enc == nil {
+		conLine(markerXportErr + "encode")
+		return false
+	}
+	if rc := writeSafe(path, enc); rc != 0 {
+		conLine(markerXportErr + "rc=" + strconv.FormatInt(rc, 10))
+		return false
+	}
+	conLine(markerExported + path + " fmt=png n=" + strconv.Itoa(len(enc)) +
+		" sum=" + fnv16(a.d.sum()))
+	return true
+}
+
+// exportPath derives the PNG twin of a document path: the stem keeps its
+// directory and the extension swaps case-sensitively — PAINT1.QOI exports
+// as PAINT1.PNG, seed.qoi as seed.png.
+func exportPath(path string) string {
+	i := strings.LastIndexByte(path, '/')
+	dir, base := "", path
+	if i >= 0 {
+		dir, base = path[:i+1], path[i+1:]
+	}
+	ext := ".png"
+	if j := strings.LastIndexByte(base, '.'); j >= 0 {
+		if j+1 < len(base) {
+			upper := true
+			for k := j + 1; k < len(base); k++ {
+				if c := base[k]; c < 'A' || c > 'Z' {
+					upper = false
+					break
+				}
+			}
+			if upper {
+				ext = ".PNG"
+			}
+		}
+		base = base[:j]
+	}
+	return dir + base + ext
+}
+
 // ---------------------------------------------------------------------------
 // Drop target (M124a): decode the offer, confirm, then replace the canvas.
 // ---------------------------------------------------------------------------
@@ -509,6 +577,8 @@ func (a *app) canvasKey(ev vi.Event) bool {
 	case 'q', codeEsc:
 		conLine(markerQuit)
 		a.ta.CloseAndExit(exitQuit)
+	case 'x':
+		return a.export()
 	case 'b':
 		return a.setTool(toolBrush)
 	case 'l':
@@ -656,6 +726,7 @@ func (a *app) openPick(kind appkit.PickerKind) {
 	if kind == appkit.PickSave {
 		a.pick.Input = basename(a.d.path)
 	}
+	a.pickExport = false
 	a.mode = modePicker
 }
 
@@ -682,6 +753,12 @@ func (a *app) pickerKey(ev vi.Event) bool {
 	a.mode = modePaint
 	if res == "cancel" {
 		conLine(markerPick + "cancel")
+		return true
+	}
+	if a.pickExport {
+		a.pickExport = false
+		conLine(markerPick + "export " + res)
+		a.exportPNG(res)
 		return true
 	}
 	if save {
