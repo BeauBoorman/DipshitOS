@@ -2114,6 +2114,16 @@ PY
 #                        split v (GOFILES left | GOEDIT right), select-all +
 #                        selpub (the M124e publish), paste the seeded 8 B
 #                        (M124c read), save-as SAVED.TXT (M124b).
+#   gotabwm: split v     --input-chords leads with ctrl-1 because M137a
+#                        (#2846) re-contracted pane assignment: the
+#                        depth-1 tree gives the FOCUSED tab child A (the
+#                        left/top pane) and the next unplaced tab B —
+#                        the pre-M137a seam assigned panes in window-open
+#                        order. Focusing GOFILES first puts it left
+#                        under BOTH contracts (it is also strip index 0),
+#                        so the (40,62) press hits its list whichever
+#                        order the seat implements; ctrl-2 returns focus
+#                        to GOEDIT for the chord lane and the drop pane.
 #   gotabwm: split v     --pointer-virtio: the whole gesture half —
 #                        drag NOTE.TXT onto GOEDIT's right pane (M124a);
 #                        right-click PIC.PNG -> "Open With…" -> GOVIEW.ELF
@@ -2160,7 +2170,7 @@ vgate_run 08 -- \
     --script-after 'dogfood: seat' \
     --script2 '$RUN_DIR/script-08b.txt' \
     --script2-after 'gofiles: ready' \
-    --input-chords 'ctrl-shift-v,ctrl-a,ctrl-v,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,S,A,V,E,D,.,T,X,T,return,ctrl-2' \
+    --input-chords 'ctrl-1,ctrl-shift-v,ctrl-2,ctrl-a,ctrl-v,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,S,A,V,E,D,.,T,X,T,return,ctrl-2' \
     --input-chords-after 'goedit: present' \
     --pointer-virtio '640,400;640,400;40,62,d;200,200;320,240;480,280;900,360,u;640,400;640,400;100,11,c;640,400;640,400;640,400;640,400;640,400;640,400;640,400;640,400,mc' \
     --pointer-virtio-after 'gotabwm: split v' \
@@ -2382,7 +2392,7 @@ PY
 #
 #     x y z          a typed run into the scratch buffer -> `goedit: dirty`
 #     ?              M121c: the app's own '?' opens the registry-fed hint
-#                    overlay -> `goedit: hints n=27` + the `hints row` dump
+#                    overlay -> `goedit: hints n=40` + the `hints row` dump
 #     down x6        nav strokes the modal consumes -- dwell so the kind-4
 #                    snapshot armed on `hints n=` streams a frame while
 #                    the plate is still up
@@ -2483,10 +2493,10 @@ vgate_assert 09 serial-contains 'goedit: dirty'
 
 # --- M121c leg: '?' opens the registry-fed overlay; Esc closes it ---------
 # n= is the live registry's own row count for GOEDIT (the app's rows plus
-# the seat's globals -- 33 at this revision); the two rows below are the
+# the seat's globals -- 40 at this revision); the two rows below are the
 # journey's own chords made visible -- the palette's summon and the undo
 # dispatch.
-vgate_assert 09 serial-contains 'goedit: hints n=33'
+vgate_assert 09 serial-contains 'goedit: hints n=40'
 vgate_assert 09 serial-contains 'goedit: hints row ctrl+shift+p summon the command palette'
 vgate_assert 09 serial-contains 'goedit: hints row ctrl+z dispatch undo'
 vgate_assert 09 serial-contains 'goedit: hints close'
@@ -2677,7 +2687,13 @@ PY
 # snap-09-0.raw: the palette's plate -- the launcher's second face paints
 # the left strip (x 0..264, full height): Surface fill, the Accent edge
 # rule (observed at x~252 under the seat's padding, not a pinned column),
-# and field/row ink.
+# and field/row ink. The finished plate is TWO-TONE: the filter field and
+# row cells fill #192127 inside the Surface plate, so a completed paint
+# holds Surface under half the strip (observed 47.5% Surface + 34.2%
+# field = 81.7% palette fill across two runs -- deterministic geometry,
+# not a mid-paint capture; a mid-paint frame actually inflates Surface,
+# which is what let the old single-fill bound pass once by accident).
+# Coverage therefore counts BOTH palette fills.
 vgate_assert 09 snapshot 'snap-09-0.raw' <<'PY'
 import sys
 from collections import Counter
@@ -2688,23 +2704,26 @@ if len(raw) < W * H * 4:
 def px(x, y):
     o = (y * W + x) * 4
     return (raw[o + 2], raw[o + 1], raw[o])
-modal = Counter(); accent = ink = total = 0
+modal = Counter(); accent = ink = plate = total = 0
 for y in range(30, 700):
     for x in range(4, 258):
         r, g, b = px(x, y)
         total += 1
         modal[(r, g, b)] += 1
+        if max(abs(r - 0x22), abs(g - 0x2d), abs(b - 0x35)) <= 4 or \
+           max(abs(r - 0x19), abs(g - 0x21), abs(b - 0x27)) <= 4:
+            plate += 1
         if min(r, g, b) >= 150:
             ink += 1
         if abs(r - 0x3b) <= 48 and abs(g - 0x82) <= 48 and abs(b - 0xf6) <= 48:
             accent += 1
 best, best_n = modal.most_common(1)[0]
 dist = max(abs(best[0] - 0x22), abs(best[1] - 0x2d), abs(best[2] - 0x35))
-print("palette strip %d px: modal=#%02x%02x%02x n=%d ink=%d accent=%d"
-      % (total, best[0], best[1], best[2], best_n, ink, accent))
+print("palette strip %d px: modal=#%02x%02x%02x n=%d plate=%d ink=%d accent=%d"
+      % (total, best[0], best[1], best[2], best_n, plate, ink, accent))
 assert dist <= 4, ("the palette strip is not Surface-filled (modal "
     "#%02x%02x%02x) -- the plate did not paint" % (best[0], best[1], best[2]))
-assert best_n >= total // 2, "palette strip not covered by its plate"
+assert plate >= total // 2, "palette strip not covered by its plate"
 assert accent >= 100, "no Accent edge rule / field ring on the palette (%d)" % accent
 assert ink >= 100, "no field/row ink inside the palette (%d)" % ink
 PY
