@@ -269,6 +269,11 @@ func (a *app) saveDownloadTo(path string) bool {
 	if len(a.lastBody) == 0 || a.target == "" || !ledgerFieldOK(a.target) {
 		return false
 	}
+	// M153e (#2925): a .pdf name takes the raster leg — the laid-out
+	// document sliced to Letter pages through pdfwrite, not the body bytes.
+	if isPDFName(path) {
+		return a.savePDFTo(path)
+	}
 	if !writeFileAll(path, a.lastBody) {
 		return false
 	}

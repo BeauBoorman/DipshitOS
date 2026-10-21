@@ -23,6 +23,9 @@
 # 45-47 (M126f #2598): the K=3 acceptance journey — one boot per iteration of
 # browse -> bookmark -> find -> zoom -> download -> open in viewer, three
 # independent VMs on the shared armed share.
+# 57 (M153e #2925): the picker save with a .pdf name writes the laid-out
+# page as a raster PDF (pdfwrite Letter slices); host parses the file and
+# compares cgrender's page 1 with the scanout's page crop.
 # 54-56 (M135d #2766): the K=3 net acceptance journey — one boot per
 # iteration: GOHTTPD --tls serves a page to a host TLS 1.3 client over the
 # byte relay, WEB pulls a gzip page plus two linked stylesheets off the host
@@ -3754,4 +3757,148 @@ for yy in range(92, 380):
 assert bg > 2000, "page background absent (bg=%d)" % bg
 assert band > 30, "h1 band absent (band=%d)" % band
 print("live-web 56: both stylesheets on the scanout (bg=%d band=%d)" % (bg, band))
+PY
+# --- boot 57 (M153e #2925): save-as .pdf — the raster leg -------------------
+# The M124b picker again, but the picked name ends .pdf: the laid-out
+# document is repainted full-height off-screen, center-sampled 1280->1024,
+# sliced to Letter pages and written through pdfwrite. '?' and Esc ride the
+# same chord burst after Return so the 'web: hints close' receipt postdates
+# the restored frame; a 3 s script2 echo ('web-pdf-shot') then anchors the
+# scanout snapshot — the kind-4 capture copies the CURRENT scanout, so it
+# needs a marker behind the composite, like run 46's plate capture.
+# Host-side, a python leg parses the file and cross-checks the
+# marker's page/byte counts against it; a second renders page 1 through
+# CoreGraphics (cgrender, the ADR 0040 outside reference) and compares it
+# with the scanout's page crop inside the pinned tolerance.
+vgate_file script-pdf-shot.txt <<'EOF'
+echo web-pdf-shot
+EOF
+
+vgate_run 57 -- \
+    --screen '$RUN_DIR/screen' --via-virtio --cvc-snap \
+    --snapshot-out '$RUN_DIR/snap-57' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,W,E,B,S,A,V,E,.,P,D,F,return,?,escape' --input-chords-after 'web: ready' \
+    --script2 '$RUN_DIR/script-pdf-shot.txt' --script2-after 'web: hints close' --script2-delay 3 \
+    --snapshot-after 'web-pdf-shot' \
+    --script-expect 'web-pdf-shot' --timeout 240
+
+vgate_assert 57 serial-absent 'web: budget over'
+vgate_assert 57 serial-contains 'web: url /host/PAGE.HTML'
+vgate_assert 57 serial-contains 'web: saveas pdf /host/WEBSAVE.PDF pages='
+vgate_assert 57 serial-contains 'web: save /host/WEBSAVE.PDF'
+vgate_assert 57 serial-contains 'web: hints close'
+vgate_assert 57 serial-absent 'web: saveas pdf refused'
+vgate_assert 57 serial-absent 'web: save cancel'
+vgate_assert 57 serial-absent 'web: download failed'
+vgate_assert 57 serial-absent 'web: error'
+vgate_assert 57 serial-absent '[EXC] parking:'
+vgate_assert 57 python <<'PY'
+import os, re
+share = os.environ["VG_SHARE"]
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"web: saveas pdf /host/WEBSAVE\.PDF pages=(\d+) bytes=(\d+)", ser)
+assert m, "missing saveas marker"
+pages, nbytes = int(m.group(1)), int(m.group(2))
+data = open(os.path.join(share, "WEBSAVE.PDF"), "rb").read()
+assert data[:9] == b"%PDF-1.4\n", "bad header %r" % data[:64]
+assert len(data) == nbytes, "size %d != marker %d" % (len(data), nbytes)
+assert len(data) <= 4*1024*1024, "over the 4 MiB bound"
+assert b"/Count " + str(pages).encode() in data, "page count drifted"
+assert b"/DeviceRGB" in data and b"/FlateDecode" in data, "no raster page stream"
+assert b"/Producer (virelai web)" in data, "Info producer missing"
+# Classic xref: every recorded offset must point at its own 'N 0 obj'.
+xref = data.find(b"\nxref\n0 ") + 8
+count = int(data[xref:data.find(b"\n", xref)])
+rows = data.split(b" 00000 n \n")
+assert len(rows) >= count, "short xref table"
+off = xref + len(str(count)) + 1 + 20  # skip the free entry row
+for i in range(1, count):
+    o = int(data[off:off+10]); off += 20
+    assert data[o:o+len(str(i))+6] == (str(i) + " 0 obj").encode(), "xref %d offset %d" % (i, o)
+# The downloads ledger records the save like every other leg.
+rows = [l for l in open(os.path.join(share, "WEB-DOWNLOADS.TXT"),
+        errors="replace").read().splitlines() if l and not l.startswith("#")]
+assert any("WEBSAVE.PDF" in r for r in rows), "no ledger row"
+print("live-web 57: WEBSAVE.PDF structure ok (pages=%d bytes=%d, xref offsets, ledger row)"
+      % (pages, nbytes))
+PY
+vgate_assert 57 snapshot 'snap-57-0.raw' <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+assert len(data) == 1280*720*4, "scanout size %d" % len(data)
+def px(x, y):
+    k = (y*1280+x)*4
+    return (data[k+2], data[k+1], data[k])
+# The page crop inside the 3 px compositor frame: dark page background
+# dominant with real text ink — the restored frame, not the picker plate.
+bg = ink = 0
+for yy in range(95, 377):
+    for xx in range(43, 549):
+        c = px(xx, yy)
+        if c == (0x18, 0x20, 0x26):
+            bg += 1
+        elif min(c) > 180:
+            ink += 1
+assert bg > 20000, "page background absent (bg=%d)" % bg
+assert ink > 100, "no text ink on the page (ink=%d)" % ink
+print("live-web 57: restored page on the scanout (bg=%d ink=%d)" % (bg, ink))
+PY
+vgate_assert 57 python <<'PY'
+import os, struct, subprocess
+share = os.environ["VG_SHARE"]
+rd = os.environ["RUN_DIR"]
+# The outside reference: CoreGraphics at 96 dpi, same contract the
+# pdf-proof oracle pins (built once into ignored .build/).
+binary = ".build/pdf-proof/cgrender"
+if not os.path.exists(binary):
+    os.makedirs(".build/pdf-proof", exist_ok=True)
+    subprocess.check_call(["/usr/bin/swiftc", "-O", "-module-cache-path",
+        ".build/pdf-proof/module-cache", "tools/pdf-proof/cgrender.swift",
+        "-o", binary])
+out = os.path.join(rd, "websave-p1.bgra")
+env = {k: v for k, v in os.environ.items() if not k.startswith("DYLD_")}
+env["CG_PDF_VERBOSE"] = "1"
+r = subprocess.run([os.path.abspath(binary), os.path.join(share, "WEBSAVE.PDF"),
+                    out, "1"], env=env, capture_output=True, text=True, timeout=60)
+assert r.returncode == 0, "cgrender failed: " + r.stderr[:400]
+open(os.path.join(rd, "websave-p1.cglog"), "w").write(r.stderr)
+assert "caught exception" not in r.stderr, "oracle diagnostics: " + r.stderr[:400]
+cg = open(out, "rb").read()
+w, h, stride = struct.unpack_from("<III", cg, 4)
+assert (w, h, stride) == (816, 1056, 816), "cgrender geometry %dx%d" % (w, h)
+pix = cg[16:]
+raw = open(os.path.join(rd, "snap-57-0.raw"), "rb").read()
+assert len(raw) == 1280*720*4, "scanout size %d" % len(raw)
+def scan(x, y):
+    k = (y*1280+x)*4
+    return (raw[k+2], raw[k+1], raw[k])
+def ref(x, y):
+    k = (y*816+x)*4
+    return (pix[k+2], pix[k+1], pix[k])
+# The page crop (inside the 3 px compositor frame) shows source rows
+# [0,720); the PDF's first page shows source rows [0,1655) — the same
+# layout scaled by the rungs' center-sample rules. The region maps at
+# ~0.8 scanout px per cgrender px both ways; edge AA shifts a pixel, so
+# the bound is a per-channel tolerance plus a mismatch fraction, not
+# equality.
+mism = total = 0
+sumdiff = 0
+TOL = 48
+for cy in range(3, 285):
+    gy = int((2*cy+1) * 0.7975837)
+    for cx in range(3, 509):
+        gx = int((2*cx+1) * 0.796875)
+        a = scan(40+cx, 92+cy)
+        b = ref(gx, gy)
+        d = max(abs(a[0]-b[0]), abs(a[1]-b[1]), abs(a[2]-b[2]))
+        sumdiff += abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2])
+        total += 1
+        if d > TOL:
+            mism += 1
+frac = mism/total
+mean = sumdiff/(3*total)
+assert frac <= 0.08 and mean <= 24, "cgrender vs scanout: mism=%.4f mean=%.2f" % (frac, mean)
+print("live-web 57: cgrender page 1 vs scanout crop (mismatch %.4f%%, mean %.2f/255, tol %d)"
+      % (frac*100, mean, TOL))
 PY
