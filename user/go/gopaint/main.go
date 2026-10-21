@@ -410,7 +410,7 @@ func (a *app) load(path string) bool {
 // save encodes the document as QOI and publishes it through the safe-write
 // temp+rename path.
 func (a *app) save(path string) bool {
-	enc := EncodeQOI(a.d.pix, a.d.w, a.d.h)
+	enc := qoi.Encode(a.d.pix, a.d.w, a.d.h)
 	if rc := writeSafe(path, enc); rc != 0 {
 		conLine(markerSaveErr + "rc=" + strconv.FormatInt(rc, 10))
 		return false

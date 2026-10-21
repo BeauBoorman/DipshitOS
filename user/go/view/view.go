@@ -33,6 +33,7 @@ const (
 	keyQuitQ   = 0x14 // `q`
 	keyEscape  = 0x29
 	keyCopy    = 0x06 // `c` — M124c typed clipboard
+	keySave    = 0x16 // `s` — M162c save-as picker
 
 	// The frame stepper (issue #2975): `.` steps forward, `,` steps back,
 	// both wrapping. App-local — neither usage is bound in gotabwm.
@@ -104,6 +105,33 @@ func formatFromPath(path string) format {
 		return fmtGIF
 	}
 	return fmtUnknown
+}
+
+// saveFormat is the save-as rule (issue #2986): the extension on the chosen
+// name picks the encoder — .png or .qoi, case-insensitive like
+// formatFromPath; anything else is fmtUnknown and the save is refused by
+// name. Kept pure so the refusal table is host-testable.
+func saveFormat(path string) format {
+	i := strings.LastIndexByte(path, '.')
+	if i < 0 {
+		return fmtUnknown
+	}
+	switch strings.ToLower(path[i+1:]) {
+	case "png":
+		return fmtPNG
+	case "qoi":
+		return fmtQOI
+	}
+	return fmtUnknown
+}
+
+// dirname is everything before the last '/' — the directory a save-as picker
+// opens in. "" when the path has no separator.
+func dirname(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[:i]
+	}
+	return ""
 }
 
 // basename is view.zig's basename: everything after the last '/'.

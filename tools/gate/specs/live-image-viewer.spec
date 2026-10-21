@@ -26,10 +26,20 @@
 # sniffs no SVG header, so it opens the 320x240 default window and its
 # receipt honestly tags `???` while the decoded 64x64 still proves the
 # raster. Issue #2975 made the GIF leg animated: TEST.GIF is the
-# three-frame anim3_160x120.gif, and `--input-string '..'` (the run's
-# second input channel — --input-chords is spent on the `q`) presses the
+# three-frame anim3_160x120.gif, and `--input-string '..'` presses the
 # frame stepper twice so the serial carries `gview: frame 1/3`, `2/3`,
-# `3/3` with three distinct pixel sums.
+# `3/3` with three distinct pixel sums; the two presses now ride
+# `--input-chords '.,.'` because Issue #2986's save-as leg owns the
+# input-string channel: `$'sOUT.QOI\n'` is anchored to `snap-png` — AFTER
+# the PNG snapshot, inside the padding dwell while the PNG viewer is still
+# topmost — `s` raises GOVIEW's save picker, the typed name resolves to
+# /host/OUT.QOI, Enter writes it. The anchor matters: cv-input paces even
+# string chars per keystroke, and anchoring to `loaded` let the open picker
+# plate straddle snap-0 (observed 0/3); firing after the marker keeps the
+# probe's pixels clean. Then a SIXTH exec reopens OUT.QOI so
+# `gview: loaded` proves the bytes we wrote are the bytes we show. The `q`
+# for JPROG moved onto `--input-key` (keycode 12) because the chords
+# channel now carries the frame steps.
 #
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goview.sh   ->  .build/go/GOVIEW.ELF
@@ -92,6 +102,7 @@ exec GOVIEW.ELF /host/TEST.PNG &
 fg 1
 echo snap-png
 fg 1
+fg 1
 exec GOVIEW.ELF /host/TEST.JPG &
 fg 2
 echo snap-jpg
@@ -107,6 +118,9 @@ fg 4
 exec GOVIEW.ELF /host/TEST.QOI
 fg 1
 echo snap-qoi
+fg 1
+exec GOVIEW.ELF /host/OUT.QOI
+fg 1
 fg 1
 exec GOVIEW.ELF /host/JPROG.JPG
 EOF
@@ -125,14 +139,15 @@ vgate_run 01 -- \
     --snapshot-after 'snap-qoi' \
     --script '$RUN_DIR/script-wm.txt' --script-after "virelai> " \
     --script2 '$RUN_DIR/script.txt' --script2-after "wnd: registered" \
-    --input-string '..' --input-string-after "gview: loaded TEST.GIF" \
-    --input-chords "q" --input-chords-after "gview: unsupported JPEG" \
+    --input-string $'sOUT.QOI\n' --input-string-after "snap-png" \
+    --input-chords ".,." --input-chords-after "gview: loaded TEST.GIF" \
+    --input-key 12 --input-key-after "gview: unsupported JPEG" \
     --script-expect "user-exec exited status=43" --timeout 240
 
 vgate_assert 01 serial-contains "VirelaiOS kernel has seized control."
 vgate_assert 01 serial-contains "wnd: registered"
 vgate_assert 01 serial-contains "gview: not-tab-aware (shim or WND desktop)"
-vgate_assert 01 serial-count "exec: loaded GOVIEW.ELF" 6
+vgate_assert 01 serial-count "exec: loaded GOVIEW.ELF" 7
 # The size markers — filename, decoded geometry, format tag, byte count.
 vgate_assert 01 serial-contains "gview: loaded TEST.PNG 160x120 PNG bytes=420"
 vgate_assert 01 serial-contains "gview: loaded TEST.JPG 160x120 JPEG bytes=1987"
@@ -155,6 +170,14 @@ vgate_assert 01 serial-contains "snap-qoi"
 vgate_assert 01 serial-contains "gview: frame 1/3 delay=100 sum="
 vgate_assert 01 serial-contains "gview: frame 2/3 delay=100 sum="
 vgate_assert 01 serial-contains "gview: frame 3/3 delay=100 sum="
+# The save-as leg (issue #2986): `s` raised the picker on the PNG window,
+# the typed OUT.QOI resolved under /host, the write reported the QOI path
+# and the pixel FNV, and the sixth exec reopened it — same window size,
+# same geometry, honest QOI tag.
+vgate_assert 01 serial-contains "gview: pick save"
+vgate_assert 01 serial-contains "gview: pick save /host/OUT.QOI"
+vgate_assert 01 serial-contains "gview: saved /host/OUT.QOI fmt=qoi"
+vgate_assert 01 serial-contains "gview: loaded OUT.QOI 160x120 QOI"
 # The named refusal, then the viewer's own quit.
 vgate_assert 01 serial-contains "gview: unsupported JPEG"
 vgate_assert 01 serial-contains "gview: quit"
@@ -165,21 +188,22 @@ import os, re, sys
 ser = open(os.environ["VG_SER"], errors="replace").read()
 # The sequence itself: the five loaded receipts in the card's order and
 # nothing else loading — JPROG never reports one.
-order = ["gview: loaded TEST.%s" % n for n in ("PNG", "JPG", "GIF", "SVG", "QOI")]
+order = ["gview: loaded TEST.%s" % n for n in ("PNG", "JPG", "GIF", "SVG", "QOI")] \
+    + ["gview: loaded OUT.QOI"]
 pos = [ser.find(m) for m in order]
 if -1 in pos or pos != sorted(pos):
     sys.exit("loaded receipts missing or out of order: %r" % (pos,))
-if "gview: loaded JPROG" in ser or ser.count("gview: loaded ") != 5:
+if "gview: loaded JPROG" in ser or ser.count("gview: loaded ") != 6:
     sys.exit("loaded-receipt count wrong (JPROG must not load)")
 # Exactly one refusal, from the hostile leg, and one honest quit.
 if ser.count("gview: unsupported ") != 1:
     sys.exit("unsupported refusal count != 1")
 if ser.count("gview: quit") != 1 or ser.count("user-exec exited status=43") != 1:
     sys.exit("expected exactly one quit -> status=43 (the JPROG viewer)")
-# Window sizing: the four sniffed rasters + JPROG open 328x264; the
-# headerless SVG takes the 320x240 default.
-if len(re.findall(r"gview: open id=\d+ 328x264", ser)) != 5:
-    sys.exit("expected five 328x264 opens (PNG/JPG/GIF/QOI/JPROG)")
+# Window sizing: the four sniffed rasters + JPROG + the reopened OUT.QOI
+# open 328x264; the headerless SVG takes the 320x240 default.
+if len(re.findall(r"gview: open id=\d+ 328x264", ser)) != 6:
+    sys.exit("expected six 328x264 opens (PNG/JPG/GIF/QOI/JPROG + OUT.QOI)")
 if len(re.findall(r"gview: open id=\d+ 320x240", ser)) != 1:
     sys.exit("expected one 320x240 default open (SVG)")
 # The stepper's three receipts must carry three DISTINCT pixel sums —
@@ -189,6 +213,127 @@ sums = re.findall(r"gview: frame (\d+)/3 delay=100 sum=([0-9a-f]+)", ser)
 if [i for i, _ in sums] != ["1", "2", "3"] or len({s for _, s in sums}) != 3:
     sys.exit("frame receipts wrong: %r" % (sums,))
 print("sequence, refusals, exits, window sizes and frame sums all pinned")
+PY
+
+# --- the save-as receipt, checked against the bytes on the share --------
+# A short reference decoder for each side, no libraries: QOI's op loop
+# (with the in-tree hash — the project's dialect omits the alpha term, and
+# matching it is the point: this assert proves OUR stream round-trips OUR
+# pixels) and PNG's inflate+unfilter (the fixture is RGB type 2 and uses
+# every filter). OUT.QOI's decoded pixels must equal TEST.PNG's, and the
+# marker's sum= must be the FNV-1a-64 of those pixels — byte order
+# B,G,R,A, the same word order frameSum/feed order uses.
+vgate_assert 01 python <<'PY'
+import os, re, sys, zlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+share = os.environ["VG_SHARE"]
+
+m = re.search(r"gview: saved /host/OUT\.QOI fmt=qoi n=(\d+) sum=([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("no `gview: saved ... fmt=qoi` receipt")
+n_bytes, marker_sum = int(m.group(1)), int(m.group(2), 16)
+
+def qhash(px):
+    # qoi.go's Hash: r*3+g*5+b*7 (the alpha*11 term the reference format
+    # carries is absent in-tree — the encoder and decoder share it, so the
+    # INDEX op is consistent either way; #2986 keeps the pinned dialect).
+    return (((px >> 16) & 0xff) * 3 + ((px >> 8) & 0xff) * 5 + (px & 0xff) * 7) & 63
+
+def qoi_pixels(data):
+    assert data[:4] == b"qoif", "OUT.QOI: bad magic"
+    w = int.from_bytes(data[4:8], "big"); h = int.from_bytes(data[8:12], "big")
+    px = 0xff000000
+    index = [0] * 64
+    out = []
+    p = 14
+    while len(out) < w * h:
+        b1 = data[p]; p += 1
+        if b1 == 0xfe:                                  # QOI_OP_RGB
+            px = 0xff000000 | data[p] << 16 | data[p+1] << 8 | data[p+2]; p += 3
+        elif b1 == 0xff:                                # QOI_OP_RGBA
+            px = data[p+3] << 24 | data[p] << 16 | data[p+1] << 8 | data[p+2]; p += 4
+        elif b1 >> 6 == 0:                              # QOI_OP_INDEX
+            px = index[b1 & 63]
+        elif b1 >> 6 == 1:                              # QOI_OP_DIFF
+            dr, dg, db = ((b1 >> 4) & 3) - 2, ((b1 >> 2) & 3) - 2, (b1 & 3) - 2
+            px = (px & 0xff000000) | (((px >> 16 & 0xff) + dr) & 0xff) << 16 \
+                | (((px >> 8 & 0xff) + dg) & 0xff) << 8 | ((px & 0xff) + db) & 0xff
+        elif b1 >> 6 == 2:                              # QOI_OP_LUMA
+            b2 = data[p]; p += 1
+            vg = (b1 & 0x3f) - 32
+            dr, db = (b2 >> 4) - 8 + vg, (b2 & 0x0f) - 8 + vg
+            px = (px & 0xff000000) | (((px >> 16 & 0xff) + dr) & 0xff) << 16 \
+                | (((px >> 8 & 0xff) + vg) & 0xff) << 8 | ((px & 0xff) + db) & 0xff
+        else:                                           # QOI_OP_RUN
+            out.extend([px] * ((b1 & 0x3f) + 1))
+            index[qhash(px)] = px
+            continue
+        out.append(px)
+        index[qhash(px)] = px
+    return w, h, out
+
+def png_pixels(data):
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "TEST.PNG: bad magic"
+    pos, idat, w, h = 8, b"", 0, 0
+    while pos < len(data):
+        n = int.from_bytes(data[pos:pos+4], "big")
+        name = data[pos+4:pos+8]
+        body = data[pos+8:pos+8+n]
+        if name == b"IHDR":
+            w = int.from_bytes(body[:4], "big"); h = int.from_bytes(body[4:8], "big")
+            assert body[8:] == b"\x08\x02\x00\x00\x00", "want 8-bit RGB non-interlaced: %r" % body[8:]
+        elif name == b"IDAT":
+            idat += body
+        elif name == b"IEND":
+            break
+        pos += 12 + n
+    raw = zlib.decompress(idat)
+    stride = w * 3 + 1
+    prev = bytearray(w * 3)
+    out = []
+    for y in range(h):
+        row = bytearray(raw[y*stride+1:(y+1)*stride])
+        f = raw[y*stride]
+        for i in range(len(row)):
+            a = row[i-3] if i >= 3 else 0
+            b = prev[i]
+            c = prev[i-3] if i >= 3 else 0
+            if f == 1:    row[i] = (row[i] + a) & 0xff
+            elif f == 2:  row[i] = (row[i] + b) & 0xff
+            elif f == 3:  row[i] = (row[i] + (a + b) // 2) & 0xff
+            elif f == 4:
+                p_ = a + b - c
+                pa, pb, pc = abs(p_ - a), abs(p_ - b), abs(p_ - c)
+                pr = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                row[i] = (row[i] + pr) & 0xff
+        prev = row
+        for x in range(w):
+            out.append(0xff000000 | row[x*3] << 16 | row[x*3+1] << 8 | row[x*3+2])
+    return w, h, out
+
+def fnv1a(pix):
+    h = 0xcbf29ce484222325
+    for p in pix:
+        for v in (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff, p >> 24):
+            h = (h ^ v) * 0x100000001b3 & 0xffffffffffffffff
+    return h
+
+qpath = os.path.join(share, "OUT.QOI")
+if not os.path.exists(qpath):
+    sys.exit("OUT.QOI not on the share — the picker's write never landed")
+out = open(qpath, "rb").read()
+if len(out) != n_bytes:
+    sys.exit("OUT.QOI is %d bytes, receipt said n=%d" % (len(out), n_bytes))
+qw, qh, qpix = qoi_pixels(out)
+pw, ph, ppix = png_pixels(open(os.path.join(share, "TEST.PNG"), "rb").read())
+if (qw, qh) != (pw, ph):
+    sys.exit("OUT.QOI dims %dx%d != TEST.PNG %dx%d" % (qw, qh, pw, ph))
+if qpix != ppix:
+    bad = sum(1 for a, b in zip(qpix, ppix) if a != b)
+    sys.exit("OUT.QOI pixels differ from TEST.PNG at %d positions" % bad)
+if fnv1a(qpix) != marker_sum:
+    sys.exit("marker sum %016x != FNV of decoded pixels %016x" % (marker_sum, fnv1a(qpix)))
+print("OUT.QOI: %d bytes, %dx%d, pixels == TEST.PNG, sum=%016x verified" % (len(out), qw, qh, marker_sum))
 PY
 
 # --- the probes' anchor --------------------------------------------------

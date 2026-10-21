@@ -46,6 +46,47 @@ func TestFormatFromPath(t *testing.T) {
 	}
 }
 
+// TestSaveFormat pins the save-as extension rule (issue #2986): .png and
+// .qoi name the two encoders, case-insensitive like formatFromPath, and every
+// other ending — including the formats we can decode but not write — is
+// refused by name.
+func TestSaveFormat(t *testing.T) {
+	cases := []struct {
+		path string
+		want format
+	}{
+		{"/host/OUT.QOI", fmtQOI},
+		{"/host/out.qoi", fmtQOI},
+		{"/host/OUT.PNG", fmtPNG},
+		{"/host/out.Png", fmtPNG},
+		{"/host/OUT.GIF", fmtUnknown}, // readable, not writable
+		{"/host/OUT.JPG", fmtUnknown}, // readable, not writable
+		{"/host/OUT.BMP", fmtUnknown},
+		{"/host/OUT", fmtUnknown},
+		{".qoi", fmtQOI}, // a bare extension still names a format
+		{"/host/name.", fmtUnknown},
+	}
+	for _, c := range cases {
+		if got := saveFormat(c.path); got != c.want {
+			t.Errorf("saveFormat(%q) = %v, want %v", c.path, got.tag(), c.want.tag())
+		}
+	}
+}
+
+func TestDirname(t *testing.T) {
+	cases := map[string]string{
+		"/host/TEST.QOI":    "/host",
+		"/host/sub/a.PNG":   "/host/sub",
+		"TEST.QOI":          "",
+		"/host/TRASH/.meta": "/host/TRASH",
+	}
+	for in, want := range cases {
+		if got := dirname(in); got != want {
+			t.Errorf("dirname(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestBasename(t *testing.T) {
 	cases := map[string]string{
 		"/host/TEST.QOI":  "TEST.QOI",

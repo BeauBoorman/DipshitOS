@@ -75,7 +75,7 @@ func TestGateVectors(t *testing.T) {
 			t.Fatalf("undo %d probe = %s, want %s", i+1, got, want.probe)
 		}
 	}
-	enc := EncodeQOI(d.pix, d.w, d.h)
+	enc := qoi.Encode(d.pix, d.w, d.h)
 	sum := fmt.Sprintf("%x", sha256.Sum256(enc))
 	if sum != "7a49b337e2f459a9aabe99ee927f353c3634afa42c8ce0ab136178e19b98c3bd" {
 		t.Fatalf("saved sha256 = %s", sum)
@@ -161,7 +161,7 @@ func TestStoreVectors(t *testing.T) {
 	if got := fnv16(d.sum()); got != v1Sum {
 		t.Fatalf("run-04 canvas sum = %s, want %s", got, v1Sum)
 	}
-	enc := EncodeQOI(d.pix, d.w, d.h)
+	enc := qoi.Encode(d.pix, d.w, d.h)
 	sum := fmt.Sprintf("%x", sha256.Sum256(enc))
 	if sum != "66cbfbcefc44ef6bd9c2ecdc00d3f50e6895503df260761cc60862a80d98744a" {
 		t.Fatalf("PSTORE.QOI sha256 = %s", sum)
@@ -192,7 +192,7 @@ func TestStoreVectors(t *testing.T) {
 	if got := fnv16(d2.sum()); got != v2Sum {
 		t.Fatalf("run-05 canvas sum = %s, want %s", got, v2Sum)
 	}
-	enc2 := EncodeQOI(d2.pix, d2.w, d2.h)
+	enc2 := qoi.Encode(d2.pix, d2.w, d2.h)
 	sum2 := fmt.Sprintf("%x", sha256.Sum256(enc2))
 	if sum2 != "416c5327f2456c708b4aeb8cc37b9c7dc567c7721aab0a4d9fb397bebc7fbefc" {
 		t.Fatalf("PSTORE.QOI (edited) sha256 = %s", sum2)

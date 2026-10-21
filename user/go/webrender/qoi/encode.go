@@ -1,17 +1,16 @@
-// qoienc.go is GOPAINT's owned QOI writer (M141a): the read direction lives
-// in virelai/webrender/qoi, this is the matching encode. The op selection is
-// the format's standard ladder — run, index, diff, luma, rgb, rgba — so the
-// bytes are deterministic and every conforming decoder (ours included)
-// round-trips them. Guests do not share this file: other encoders stay out
-// of scope.
-package main
+// encode.go is the write direction of the QOI codec (issue #2986): the
+// encoder GOPAINT carried privately as qoienc.go since M141a, promoted next
+// to Decode so every guest encodes through one owned implementation —
+// GOVIEW's save-as is the second caller. The op selection is the format's
+// standard ladder — run, index, diff, luma, rgb, rgba — so the bytes are
+// deterministic, GOPAINT's saved files are unchanged by the move, and every
+// conforming decoder (ours included) round-trips them.
+package qoi
 
-import "virelai/webrender/qoi"
-
-// EncodeQOI renders w×h 0xAARRGGBB pixels as one QOI stream (channels=4,
+// Encode renders w×h 0xAARRGGBB pixels as one QOI stream (channels=4,
 // colorspace=0). The capacity hint is the encoder's worst-case bound plus
 // header and trailer; the return is the real length's prefix.
-func EncodeQOI(pix []uint32, w, h int) []byte {
+func Encode(pix []uint32, w, h int) []byte {
 	if w <= 0 || h <= 0 || len(pix) < w*h {
 		return nil
 	}
@@ -42,7 +41,7 @@ func EncodeQOI(pix []uint32, w, h int) []byte {
 			out = append(out, 0xc0|byte(run-1))
 			run = 0
 		}
-		hh := qoi.Hash(px)
+		hh := Hash(px)
 		if index[hh] == px {
 			out = append(out, byte(hh)) // QOI_OP_INDEX
 			prev = px

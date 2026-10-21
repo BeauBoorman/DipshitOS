@@ -51,7 +51,10 @@ func Decode(data []byte, maxDim, maxPixels int) (w, h int, pix []uint32, err err
 			if p+4 > len(data) {
 				return 0, 0, nil, errors.New("qoi: rgba truncated")
 			}
-			px = uint32(data[p])<<24 | uint32(data[p+1])<<16 | uint32(data[p+2])<<8 | uint32(data[p+3])
+			// Spec order is R,G,B,A — the alpha byte is the LAST of the
+			// four. (This read A,R,G,B until #2986's encoder promotion made
+			// the asymmetry round-trip-visible; every opaque fixture hid it.)
+			px = uint32(data[p+3])<<24 | uint32(data[p])<<16 | uint32(data[p+1])<<8 | uint32(data[p+2])
 			p += 4
 		case b1>>6 == 0: // QOI_OP_INDEX
 			px = index[b1&63]

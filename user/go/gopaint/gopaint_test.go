@@ -186,7 +186,7 @@ func TestQOIRoundTrip(t *testing.T) {
 	tx.fill(12, 8, palette[12])
 	d.commit(tx)
 
-	enc := EncodeQOI(d.pix, d.w, d.h)
+	enc := qoi.Encode(d.pix, d.w, d.h)
 	if len(enc) < 14 || string(enc[:4]) != "qoif" {
 		t.Fatal("encoder did not emit a qoif header")
 	}
@@ -206,8 +206,8 @@ func TestQOIRoundTrip(t *testing.T) {
 
 func TestQOIEncodeDeterministic(t *testing.T) {
 	d := newDoc(8, 8)
-	a := EncodeQOI(d.pix, d.w, d.h)
-	b := EncodeQOI(d.pix, d.w, d.h)
+	a := qoi.Encode(d.pix, d.w, d.h)
+	b := qoi.Encode(d.pix, d.w, d.h)
 	if len(a) != len(b) {
 		t.Fatal("encode not deterministic in length")
 	}

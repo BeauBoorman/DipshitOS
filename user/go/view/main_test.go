@@ -35,6 +35,9 @@ func TestMarkersAreAllGViewPrefixed(t *testing.T) {
 		"decode err":  markerDecodeErr,
 		"unsupported": markerUnsupported,
 		"drop":        markerDrop,
+		"pick":        markerPick,
+		"saved":       markerSaved,
+		"save-refuse": markerSaveRefuse,
 	}
 	for what, m := range markers {
 		if !strings.HasPrefix(m, "gview: ") {

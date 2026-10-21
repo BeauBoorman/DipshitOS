@@ -13,6 +13,7 @@ package main
 import (
 	"errors"
 
+	"virelai/appkit"
 	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/theme"
@@ -20,6 +21,7 @@ import (
 	"virelai/vsys"
 	"virelai/webrender"
 	"virelai/webrender/font"
+	"virelai/webrender/qoi"
 	"virelai/widgets"
 )
 
@@ -70,6 +72,14 @@ const (
 	// sum=<fnv>` — printed on load for frame 1 and on every step.
 	markerFrame = "gview: frame "
 
+	// M162c (#2986): the save-as legs — `pick save` at raise, `pick save
+	// <path>`/`pick cancel` at result, `saved <path> fmt=<png|qoi> n=<bytes>
+	// sum=<fnv>` on the write, `save refused <path>` when the name names no
+	// known format.
+	markerPick       = "gview: pick "
+	markerSaved      = "gview: saved "
+	markerSaveRefuse = "gview: save refused "
+
 	markerOK = "goview OK"
 )
 
@@ -102,6 +112,11 @@ type app struct {
 	// and the index being shown. nil on every other format.
 	anim  *webrender.GIFAnimation
 	frame int
+
+	// The M162c save-as modal: while pick.Open every key/mouse event is the
+	// picker's — the same FilePicker GOPAINT raises, painted over the
+	// viewer's own canvas.
+	pick appkit.FilePicker
 
 	zoomIdx        int
 	ox, oy         uint32
@@ -476,6 +491,9 @@ func (a *app) eventLoop() {
 
 // handle returns whether the screen needs repainting.
 func (a *app) handle(ev vi.Event) bool {
+	if a.pick.Open {
+		return a.pickerEvent(ev)
+	}
 	switch ev.Kind {
 	case vi.EvKeyDown:
 		switch ev.Arg0 {
@@ -500,6 +518,8 @@ func (a *app) handle(ev vi.Event) bool {
 		case keyCopy:
 			a.copy()
 			return false
+		case keySave:
+			return a.startSave()
 		case keyQuitQ, keyEscape:
 			vi.ConsoleLine(markerQuit)
 			a.ta.CloseAndExit(exitQuit)
@@ -560,6 +580,99 @@ func (a *app) copy() {
 		return
 	}
 	vi.ConsoleLine(markerCopy + "mime=" + mime + " n=" + vi.Itoa64(int64(n)))
+}
+
+// --- save-as (M162c) ----------------------------------------------------------
+
+// startSave is the 's' key: the save-as picker over the loaded image. With
+// nothing decoded there is nothing to save — refused like the copy path's
+// "empty", never a silent no-op. The input starts blank: save-as names a NEW
+// file, and a prefilled basename would only ever re-save the same name.
+func (a *app) startSave() bool {
+	if a.img == nil {
+		vi.ConsoleLine(markerSaveRefuse + "empty")
+		return false
+	}
+	dir := dirname(a.path)
+	if dir == "" {
+		dir = "/host"
+	}
+	a.pick = appkit.NewFilePicker(appkit.PickSave, dir)
+	a.pick.Title = "Save as"
+	// The plate assumes a roomy canvas; GOVIEW's window can be the 320x240
+	// default, so clamp the picker inside what the window actually got.
+	p := &a.pick
+	p.R.W = min(p.R.W, int(a.ta.W))
+	p.R.H = min(p.R.H, int(a.ta.H))
+	p.R.X = max(min(p.R.X, int(a.ta.W)-p.R.W), 0)
+	p.R.Y = max(min(p.R.Y, int(a.ta.H)-p.R.H), 0)
+	vi.ConsoleLine(markerPick + "save")
+	return true
+}
+
+// pickerEvent routes one event to the open picker — every key is the modal's
+// while it is up (arrows walk rows, chars extend Input, Enter resolves,
+// Escape cancels). The picker closing is itself a repaint, so done always
+// redraws regardless of what the state machine reported.
+func (a *app) pickerEvent(ev vi.Event) bool {
+	var changed, done bool
+	switch ev.Kind {
+	case vi.EvKeyDown:
+		changed, done = a.pick.HandleKey(ev)
+	case vi.EvMouseDown:
+		changed, done = a.pick.HandleMouse(int(ev.Arg0), int(ev.Arg1), true)
+	}
+	if done {
+		a.pickerDone()
+		return true
+	}
+	return changed
+}
+
+// pickerDone applies the picker's result: "cancel" gets the cancel receipt;
+// a path is logged, then handed to saveAs which owns the format decision.
+func (a *app) pickerDone() {
+	res := a.pick.Result
+	if res == "cancel" {
+		vi.ConsoleLine(markerPick + "cancel")
+		return
+	}
+	vi.ConsoleLine(markerPick + "save " + res)
+	a.saveAs(res)
+}
+
+// saveAs writes the shown image under the name the picker produced. For an
+// animated GIF that is the current frame's composite — a.img already holds
+// it, so no special-casing the animation here. The extension picks the
+// encoder; anything else is refused by name so a typo can never mint a file
+// that lies about its format.
+func (a *app) saveAs(path string) bool {
+	if a.img == nil {
+		vi.ConsoleLine(markerSaveRefuse + "empty")
+		return false
+	}
+	var enc []byte
+	var tag string
+	switch saveFormat(path) {
+	case fmtPNG:
+		enc, tag = webrender.EncodePNG(a.img.Pix, int(a.iw), int(a.ih)), "png"
+	case fmtQOI:
+		enc, tag = qoi.Encode(a.img.Pix, int(a.iw), int(a.ih)), "qoi"
+	default:
+		vi.ConsoleLine(markerSaveRefuse + path)
+		return false
+	}
+	if enc == nil {
+		vi.ConsoleLine(markerSaveRefuse + "encode")
+		return false
+	}
+	if rc := vi.WriteFileSafe(path, enc); rc != 0 {
+		vi.ConsoleLine(markerSaveRefuse + "rc=" + vi.Itoa64(rc))
+		return false
+	}
+	vi.ConsoleLine(markerSaved + path + " fmt=" + tag + " n=" +
+		vi.Itoa64(int64(len(enc))) + " sum=" + hex64(frameSum(a.img.Pix)))
+	return true
 }
 
 // pushTitle is VIEW.BIN's push_title: the window title carries the file, its
@@ -678,6 +791,9 @@ func (a *app) draw() {
 	}
 	a.drawTitleBand(surf, vp)
 	a.drawStatus(surf, vp)
+	if a.pick.Open {
+		a.pick.Draw(cv)
+	}
 }
 
 // drawBackdrop is VIEW.BIN's checkerboard: transparent image pixels show it
@@ -775,7 +891,7 @@ func (a *app) drawTitleBand(s *canvasSurface, vp viewport) {
 func (a *app) drawStatus(s *canvasSurface, vp viewport) {
 	barY := int(vp.Y + vp.H)
 	s.Fill(0, barY, int(a.ta.W), statusH, theme.Current.Surface)
-	text := u32s(a.zoom()) + "%  +/- zoom  0 reset  arrows/drag pan"
+	text := u32s(a.zoom()) + "%  +/- zoom  0 reset  arrows/drag pan  s save"
 	if a.anim != nil && len(a.anim.Frames) > 1 {
 		f := &a.anim.Frames[a.frame]
 		text += "  ./, frame " + u32s(uint32(a.frame+1)) + "/" +
