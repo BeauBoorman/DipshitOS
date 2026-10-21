@@ -11,15 +11,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FORK_DIR="${GO_FORK_DIR:-$(dirname "$REPO")/go-virelai}"
 NAME="${GO_BUILD_NAME:-PULSE.ELF}"
 BT_VERSION="v2.0.9"
-LG_VERSION="v1.1.0"
-# x/cellbuf must be at least v0.0.15: lipgloss v1.1.0's go.mod names a
-# pseudo-version whose x/ansi API predates bubbletea v2.0.9's v0.11.7, and MVS
-# otherwise resolves the incompatible pair (observed 2026-09-21).
-CB_VERSION="v0.0.15"
-# termenv and go-isatty need Virelai platform shims (no termios, no POSIX
-# tty): they are staged like bubbletea so the shims can be added.
-TE_VERSION="v0.16.0"
-ISATTY_VERSION="v0.0.20"
+# M168c: lipgloss v2 builds for GOOS=virelai unmodified — the v1 import
+# pulled termenv, go-isatty and x/cellbuf into the closure and needed two
+# Virelai platform shims; v2's colours are color.Color, so none of that
+# staging survives. Do not use its `compat` package: it queries
+# stdin/stdout for the background colour at package init.
+LG_VERSION="v2.0.6"
 MAX_BYTES=$((32 * 1024 * 1024)) # M72a load_max: initialized ELF bytes.
 
 log() { printf 'build-pulse: %s\n' "$*"; }
@@ -32,20 +29,8 @@ if ! grep -q "bubbletea/v2 ${BT_VERSION}" "$REPO/user/go/pulse/THIRD-PARTY.txt";
     log "FAIL: THIRD-PARTY.txt does not pin Bubble Tea ${BT_VERSION}; re-resolve and update it"
     exit 1
 fi
-if ! grep -q "lipgloss ${LG_VERSION}" "$REPO/user/go/pulse/THIRD-PARTY.txt"; then
-    log "FAIL: THIRD-PARTY.txt does not pin lipgloss ${LG_VERSION}; re-resolve and update it"
-    exit 1
-fi
-if ! grep -q "x/cellbuf ${CB_VERSION}" "$REPO/user/go/pulse/THIRD-PARTY.txt"; then
-    log "FAIL: THIRD-PARTY.txt does not pin x/cellbuf ${CB_VERSION}; re-resolve and update it"
-    exit 1
-fi
-if ! grep -q "termenv ${TE_VERSION}" "$REPO/user/go/pulse/THIRD-PARTY.txt"; then
-    log "FAIL: THIRD-PARTY.txt does not pin termenv ${TE_VERSION}; re-resolve and update it"
-    exit 1
-fi
-if ! grep -q "go-isatty ${ISATTY_VERSION}" "$REPO/user/go/pulse/THIRD-PARTY.txt"; then
-    log "FAIL: THIRD-PARTY.txt does not pin go-isatty ${ISATTY_VERSION}; re-resolve and update it"
+if ! grep -q "lipgloss/v2 ${LG_VERSION}" "$REPO/user/go/pulse/THIRD-PARTY.txt"; then
+    log "FAIL: THIRD-PARTY.txt does not pin lipgloss v2 ${LG_VERSION}; re-resolve and update it"
     exit 1
 fi
 
@@ -75,9 +60,7 @@ go 1.27
 
 require charm.land/bubbletea/v2 ${BT_VERSION}
 
-require github.com/charmbracelet/lipgloss ${LG_VERSION}
-
-require github.com/charmbracelet/x/cellbuf ${CB_VERSION}
+require charm.land/lipgloss/v2 ${LG_VERSION}
 EOF
 
 # Fetch only declared Go modules into the host module cache. The app build
@@ -85,34 +68,19 @@ EOF
 # from that cache is committed or vendored into the guest tree.
 ( cd "$WORK_DIR" && go mod download \
     "charm.land/bubbletea/v2@${BT_VERSION}" \
-    "github.com/charmbracelet/lipgloss@${LG_VERSION}" \
-    "github.com/charmbracelet/x/cellbuf@${CB_VERSION}" \
-    "github.com/muesli/termenv@${TE_VERSION}" \
-    "github.com/mattn/go-isatty@${ISATTY_VERSION}" )
+    "charm.land/lipgloss/v2@${LG_VERSION}" )
 
 BT_MOD_DIR="$(go env GOMODCACHE)/charm.land/bubbletea/v2@${BT_VERSION}"
-TE_MOD_DIR="$(go env GOMODCACHE)/github.com/muesli/termenv@${TE_VERSION}"
-ISATTY_MOD_DIR="$(go env GOMODCACHE)/github.com/mattn/go-isatty@${ISATTY_VERSION}"
 [ -f "$BT_MOD_DIR/termios_other.go" ] || {
     log "Bubble Tea ${BT_VERSION} missing from module cache at $BT_MOD_DIR"
     exit 1
 }
-[ -f "$TE_MOD_DIR/termenv_other.go" ] || {
-    log "termenv ${TE_VERSION} missing from module cache at $TE_MOD_DIR"
-    exit 1
-}
-[ -f "$ISATTY_MOD_DIR/isatty_others.go" ] || {
-    log "go-isatty ${ISATTY_VERSION} missing from module cache at $ISATTY_MOD_DIR"
-    exit 1
-}
 
-# Go intentionally refuses overlays beneath GOMODCACHE. Stage the modules
-# that need Virelai platform shims into the gitignored build area, then point
-# temporary module replacements at them: this is still a module-cache build,
-# not an in-tree vendor copy. Additive shim files (termenv, isatty) are copied
-# into the staged modules; bubbletea needs two overlay *replaces* because its
-# originals' build tags would otherwise match virelai and supply the wrong
-# implementations.
+# Go intentionally refuses overlays beneath GOMODCACHE. Stage the module
+# into the gitignored build area, then point a temporary module replacement
+# at it: this is still a module-cache build, not an in-tree vendor copy.
+# bubbletea needs two overlay *replaces* because its originals' build tags
+# would otherwise match virelai and supply the wrong implementations.
 stage_module() {
     src="$1"
     dest="$2"
@@ -133,16 +101,6 @@ stage_module() {
 
 STAGE="$REPO/.build/pulse-module"
 stage_module "$BT_MOD_DIR" "$STAGE"
-TE_STAGE="$REPO/.build/pulse-module-termenv"
-stage_module "$TE_MOD_DIR" "$TE_STAGE"
-ISATTY_STAGE="$REPO/.build/pulse-module-isatty"
-stage_module "$ISATTY_MOD_DIR" "$ISATTY_STAGE"
-
-# Virelai platform shims: the guest has no termios, no ioctl winsize, and no
-# POSIX tty to probe. termenv's own js/plan9 fallbacks are the model; the
-# profile stays ANSI256 so lipgloss keeps its colours.
-cp "$REPO/tools/go/overlay/charm/termenv_virelai.go" "$TE_STAGE/"
-cp "$REPO/tools/go/overlay/charm/isatty_virelai.go" "$ISATTY_STAGE/"
 
 OVERLAY="$REPO/.build/pulse-overlay.json"
 mkdir -p "$(dirname "$OVERLAY")" "$REPO/.build/go"
@@ -168,24 +126,14 @@ cat >>"$TEMP_MOD" <<EOF
 
 require charm.land/bubbletea/v2 ${BT_VERSION}
 
-require github.com/charmbracelet/lipgloss ${LG_VERSION}
-
-require github.com/charmbracelet/x/cellbuf ${CB_VERSION}
-
-require github.com/muesli/termenv ${TE_VERSION}
-
-require github.com/mattn/go-isatty ${ISATTY_VERSION}
+require charm.land/lipgloss/v2 ${LG_VERSION}
 
 replace charm.land/bubbletea/v2 => $STAGE
-
-replace github.com/muesli/termenv => $TE_STAGE
-
-replace github.com/mattn/go-isatty => $ISATTY_STAGE
 EOF
 trap 'rm -f "$TEMP_MOD" "$TEMP_SUM"' EXIT
 
 OUT="$REPO/.build/go/$NAME"
-log "building virelai/pulse with Bubble Tea ${BT_VERSION} + lipgloss ${LG_VERSION} -> $OUT"
+log "building virelai/pulse with Bubble Tea ${BT_VERSION} + lipgloss/v2 ${LG_VERSION} -> $OUT"
 ( cd "$REPO/user/go" &&
     GOOS=virelai GOARCH=arm64 go build -mod=mod -modfile "$TEMP_MOD" -overlay "$OVERLAY" \
         -ldflags "-s -w" -o "$OUT" ./pulse )
