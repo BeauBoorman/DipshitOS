@@ -43,10 +43,12 @@ const (
 	// idle_minutes + notify_dnd + timezone + notify_sound + audio_volume) is
 	// 19 rows, and the table must hold a file that carries all of them with
 	// one slot to spare rather than silently dropping the last row at load.
-	// M100f (#2311) adds data_root, so the union is exactly at the cap: a
-	// file carrying every known row still loads intact; the row past it is
-	// the one that drops.
-	MaxKeys = 20
+	// M100f (#2311) added data_root, and M165b (#2983) adds the three a11y.*
+	// rows, so the cap moved 20 -> 24: the Go union is 23 rows, the kernel's
+	// own accepted term_restart makes the full known union 24, and the row
+	// past the cap is the one that drops. MaxBody stays 2048 — a file
+	// carrying every known row is a few hundred bytes, pinned by test.
+	MaxKeys = 24
 	MaxKey  = 32
 	MaxVal  = 64
 	MaxBody = 2048
@@ -309,6 +311,98 @@ func ValidDataRoot(value string) bool {
 	return value == "host" || value == "disk"
 }
 
+// A11yKeys is the M165b (#2983) accessibility trio: accepted-but-unseeded
+// AND not default panel rows, like notify_sound — the kernel's table
+// stays unchanged, an absent row means the compiled default, and each row
+// materializes in the file once set. They are GOSET's access tab, not the
+// settings list: a11y.contrast is honoured by every theme.ApplySettings
+// caller, a11y.reduce_motion by the seat's toast ramp, and a11y.text_scale
+// is reserved — reserved and named, honoured by no app yet.
+var A11yKeys = []Key{
+	{Name: "a11y.contrast", Default: "off", Vocab: []string{"off", "high"}},
+	{Name: "a11y.reduce_motion", Default: "off", Vocab: []string{"off", "on"}},
+	{Name: "a11y.text_scale", Default: "100", Vocab: []string{"100", "125", "150"}},
+}
+
+// The three key names, for the seat's reads and the panel's dispatch.
+const (
+	A11yContrastKey     = "a11y.contrast"
+	A11yReduceMotionKey = "a11y.reduce_motion"
+	A11yTextScaleKey    = "a11y.text_scale"
+)
+
+// IsA11yContrastKey reports whether key is the high-contrast row.
+func IsA11yContrastKey(key string) bool { return key == A11yContrastKey }
+
+// IsA11yReduceMotionKey reports whether key is the reduced-motion row.
+func IsA11yReduceMotionKey(key string) bool { return key == A11yReduceMotionKey }
+
+// IsA11yTextScaleKey reports whether key is the reserved text-scale row.
+func IsA11yTextScaleKey(key string) bool { return key == A11yTextScaleKey }
+
+// IsA11yKey reports whether key is one of the three a11y.* rows.
+func IsA11yKey(key string) bool {
+	return IsA11yContrastKey(key) || IsA11yReduceMotionKey(key) || IsA11yTextScaleKey(key)
+}
+
+// A11yContrast parses a stored contrast value: ok is false for anything
+// but exactly `off` or `high` — a mistyped value must never paint a user
+// into a palette they did not ask for, so the caller treats it as off.
+func A11yContrast(value string) (high, ok bool) {
+	switch value {
+	case "high":
+		return true, true
+	case "off":
+		return false, true
+	}
+	return false, false
+}
+
+// A11yReduceMotion parses a stored reduce-motion value, the same on|off
+// grammar as notify_dnd. ok is false for anything else — a mistyped value
+// reads as the default (off), never a silent mode change.
+func A11yReduceMotion(value string) (on, ok bool) {
+	switch value {
+	case "on":
+		return true, true
+	case "off":
+		return false, true
+	}
+	return false, false
+}
+
+// A11yTextScale parses a stored text-scale value: exactly one of the three
+// reserved rungs. ok is false for anything else.
+func A11yTextScale(value string) (int, bool) {
+	switch value {
+	case "100":
+		return 100, true
+	case "125":
+		return 125, true
+	case "150":
+		return 150, true
+	}
+	return 0, false
+}
+
+// ValidA11y reports whether value is in the row's declared vocabulary — the
+// panel's typed-input gate, refused before it reaches the file for the same
+// reason every vocabulary row is refused there.
+func ValidA11y(key, value string) bool {
+	switch {
+	case IsA11yContrastKey(key):
+		_, ok := A11yContrast(value)
+		return ok
+	case IsA11yReduceMotionKey(key):
+		_, ok := A11yReduceMotion(value)
+		return ok
+	case IsA11yTextScaleKey(key):
+		_, ok := A11yTextScale(value)
+		return ok
+	}
+	return false
+}
+
 // ValidTimezone reports whether the value names a fixed offset clockfmt
 // parses.
 func ValidTimezone(value string) bool {
@@ -377,13 +471,13 @@ func IsPaletteKey(key string) bool {
 // Editable is the panel's write gate: a kernel-table key, one of the
 // custom-palette keys, font_size (M80i), keyboard_layout (M83d2),
 // idle_minutes (M83f), notify_dnd (M82d2), notify_sound or audio_volume
-// (M99d), timezone (M83c), or data_root (M100f).
+// (M99d), timezone (M83c), data_root (M100f), or an a11y.* row (M165b).
 // Anything else is named and dropped, never written.
 func Editable(key string) bool {
 	_, known := Known(key)
 	return known || IsPaletteKey(key) || IsFontKey(key) || IsKeyboardLayoutKey(key) ||
 		IsIdleMinutesKey(key) || IsNotifyDNDKey(key) || IsNotifySoundKey(key) ||
-		IsVolumeKey(key) || IsTimezoneKey(key) || IsDataRootKey(key)
+		IsVolumeKey(key) || IsTimezoneKey(key) || IsDataRootKey(key) || IsA11yKey(key)
 }
 
 // ValidColour is the palette value grammar, mirrored from the kernel's
@@ -453,7 +547,7 @@ func Default(key string) (string, bool) {
 			return k.Default, true
 		}
 	}
-	for _, group := range [][]Key{NotifyKeys, NotifySoundKeys, VolumeKeys, TimezoneKeys, DataRootKeys} {
+	for _, group := range [][]Key{NotifyKeys, NotifySoundKeys, VolumeKeys, TimezoneKeys, DataRootKeys, A11yKeys} {
 		for _, k := range group {
 			if k.Name == key {
 				return k.Default, true
@@ -489,6 +583,9 @@ func Vocab(key string) ([]string, bool) {
 	}
 	if !ok {
 		k, ok = findKey(DataRootKeys, key)
+	}
+	if !ok {
+		k, ok = findKey(A11yKeys, key)
 	}
 	if !ok {
 		return nil, false

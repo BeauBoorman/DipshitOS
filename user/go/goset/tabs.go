@@ -7,7 +7,8 @@ import (
 )
 
 // M122e (#2574): the tab header strip — Settings / Services / Grants /
-// Shortcuts as clickable cells over the pane. The active tab IS the view
+// Shortcuts / Profile / Access as clickable cells over the pane. The
+// active tab IS the view
 // (there is no separate highlight to apply): a click activates the cell's
 // view through OnActivate, and Left/Right while the strip is focused steps
 // the view the same way — pointer and keyboard reach the same switch.
@@ -34,10 +35,11 @@ const (
 	tabGrants
 	tabShortcuts
 	tabProfile
+	tabAccess
 	tabCount
 )
 
-var tabNames = [tabCount]string{"settings", "services", "grants", "shortcuts", "profile"}
+var tabNames = [tabCount]string{"settings", "services", "grants", "shortcuts", "profile", "access"}
 
 // cellRect is tab i's slice of the strip — the one geometry source Draw and
 // the hit test share (the widget Bounds() pattern).

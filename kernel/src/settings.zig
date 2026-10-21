@@ -94,6 +94,17 @@
 //!                                   to 100 at boot; the row only carries
 //!                                   the choice for its consumers to
 //!                                   re-apply.
+//!   a11y.contrast string (none)     "off"|"high" — the high-contrast theme
+//!                                   variant (M165b #2983). Accepted, not
+//!                                   seeded: absent = off. The kernel
+//!                                   stores it; theme.ApplySettings
+//!                                   callers interpret it.
+//!   a11y.reduce_motion string (none) "off"|"on" — the seat's toast fade
+//!                                   switch (M165b #2983). Accepted, not
+//!                                   seeded: absent = off (fades on).
+//!   a11y.text_scale string (none)   "100"|"125"|"150" — reserved and
+//!                                   named (M165b #2983). Accepted, not
+//!                                   seeded: no app honours it yet.
 
 const std = @import("std");
 // M34 HF5 (issue #739): the host-share persistence path; HF6 (issue
@@ -123,8 +134,12 @@ pub const max_val_len: usize = 64;
 // rows (palette_fg/bg/accent, font_size, keyboard_layout, idle_minutes,
 // notify_dnd, notify_sound, audio_volume, timezone) can all persist, with
 // one slot to spare — a file carrying the full union is 19 rows and must
-// load without dropping the tail.
-pub const max_entries: usize = 20;
+// load without dropping the tail. M100f (#2311) added data_root, and M165b
+// (#2983) adds the three a11y.* rows: the Go codec's union is 23 rows, and
+// with the kernel's own accepted term_restart the full known union is 24 —
+// the table holds every known row and the row past the cap is the one that
+// drops.
+pub const max_entries: usize = 24;
 
 pub const Entry = struct {
     key: [max_key_len]u8 = @as([max_key_len]u8, @splat(@as(u8, 0))),
@@ -941,7 +956,7 @@ test "settings: a full legacy table can gain the persisted layout" {
     init();
     defer init();
     try std.testing.expectEqual(@as(usize, 9), count());
-    for (0..10) |i| {
+    for (0..max_entries - 9 - 1) |i| {
         var key: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&key, "extension{d}", .{i});
         try std.testing.expectEqual(SetResult.ok, set(name, "v"));
@@ -957,6 +972,29 @@ test "settings: a full legacy table can gain the persisted layout" {
     try std.testing.expect(apply_bytes(bytes[0..len]));
     try std.testing.expectEqualStrings("de", get("keyboard_layout").?);
     try std.testing.expectEqualStrings("v", get("extension7").?);
+}
+
+test "settings: the a11y rows are accepted, unseeded, and persist once set (M165b #2983)" {
+    init();
+    defer init();
+    // A fresh table seeds none of them: the default SETTINGS.TXT stays
+    // byte-identical to a share that never heard of a11y.
+    try std.testing.expect(get("a11y.contrast") == null);
+    try std.testing.expect(get("a11y.reduce_motion") == null);
+    try std.testing.expect(get("a11y.text_scale") == null);
+    var buf: [2048]u8 = undefined;
+    var len = serialize(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..len], "a11y.") == null);
+    // Once set they round-trip like every other accepted row.
+    try std.testing.expectEqual(SetResult.ok, set("a11y.contrast", "high"));
+    try std.testing.expectEqual(SetResult.ok, set("a11y.reduce_motion", "on"));
+    try std.testing.expectEqual(SetResult.ok, set("a11y.text_scale", "125"));
+    len = serialize(&buf);
+    init();
+    try std.testing.expect(apply_bytes(buf[0..len]));
+    try std.testing.expectEqualStrings("high", get("a11y.contrast").?);
+    try std.testing.expectEqualStrings("on", get("a11y.reduce_motion").?);
+    try std.testing.expectEqualStrings("125", get("a11y.text_scale").?);
 }
 
 test "settings: save_to_share without a channel is an honest no-op (M66b #1444)" {

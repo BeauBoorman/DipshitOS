@@ -552,7 +552,7 @@ func TestOptionalRowsRespectFullTable(t *testing.T) {
 	for _, k := range KnownKeys {
 		rows = append(rows, Setting{Key: k.Name, Val: k.Default})
 	}
-	for i := 0; i < 9; i++ {
+	for i := 0; i < MaxKeys-2-len(KnownKeys); i++ {
 		rows = append(rows, Setting{Key: "extension" + string(rune('a'+i)), Val: "v"})
 	}
 	display := (File{Rows: rows, State: StateOK}).Display()
@@ -578,7 +578,7 @@ func TestOptionalRowsRespectFullTable(t *testing.T) {
 	// A table with one free slot can still be saved from GOSET after
 	// materializing keyboard_layout. Keep that contract:
 	// the idle default is implicit when there is no free kernel slot.
-	legacy := append(append([]Setting(nil), rows...), Setting{Key: "extensionj", Val: "v"})
+	legacy := append(append([]Setting(nil), rows...), Setting{Key: "extensionz", Val: "v"})
 	full := (File{Rows: legacy, State: StateOK}).Display()
 	if len(legacy) != MaxKeys-1 || len(full) != MaxKeys {
 		t.Fatalf("legacy table rows = %d, display = %d, want %d and %d", len(legacy), len(full), MaxKeys-1, MaxKeys)
@@ -918,6 +918,162 @@ func TestDataRootAcceptedUnseededCyclableAndStrict(t *testing.T) {
 		t.Fatal("a set data_root row cannot round-trip")
 	} else if v, found := Get(rows, DataRootKey); !found || v != "disk" {
 		t.Fatalf("round-trip data_root = %q found=%v", v, found)
+	}
+}
+
+// M165b (#2983): the a11y trio — accepted-but-unseeded, cyclable, strict
+// parsers, never a default panel row. Each materializes once set and
+// round-trips like audio_volume.
+func TestA11yKeysAcceptedUnseededCyclableAndStrict(t *testing.T) {
+	for _, key := range []string{A11yContrastKey, A11yReduceMotionKey, A11yTextScaleKey} {
+		if _, known := Known(key); known {
+			t.Fatalf("the kernel does not seed %s", key)
+		}
+		if !Editable(key) || !IsA11yKey(key) {
+			t.Fatalf("GOSET must be able to edit %s", key)
+		}
+		if _, found := Get((File{State: StateMissing}).Display(), key); found {
+			t.Fatalf("a default display materialized %s", key)
+		}
+	}
+	if IsA11yKey("a11y") || IsA11yKey("contrast") {
+		t.Fatal("IsA11yKey matched a non-a11y row")
+	}
+
+	// contrast: off|high, nothing else.
+	if got, ok := Default(A11yContrastKey); !ok || got != "off" {
+		t.Fatalf("Default(a11y.contrast) = (%q,%v), want (off,true)", got, ok)
+	}
+	if high, ok := A11yContrast("high"); !ok || !high {
+		t.Fatal("A11yContrast(high) refused")
+	}
+	if high, ok := A11yContrast("off"); !ok || high {
+		t.Fatal("A11yContrast(off) refused or read high")
+	}
+	for _, val := range []string{"", "on", "HIGH", "max", " high"} {
+		if _, ok := A11yContrast(val); ok {
+			t.Errorf("A11yContrast(%q) accepted", val)
+		}
+	}
+	vocab, ok := Vocab(A11yContrastKey)
+	if !ok || len(vocab) != 2 || vocab[0] != "off" || vocab[1] != "high" {
+		t.Fatalf("a11y.contrast vocab = %v ok=%v, want [off high]", vocab, ok)
+	}
+	if got := Next(vocab, "off"); got != "high" {
+		t.Fatalf("cycle off -> %q, want high", got)
+	}
+	if got := Next(vocab, "high"); got != "off" {
+		t.Fatalf("cycle high -> %q, want off", got)
+	}
+
+	// reduce_motion: off|on, the notify_dnd grammar.
+	if got, ok := Default(A11yReduceMotionKey); !ok || got != "off" {
+		t.Fatalf("Default(a11y.reduce_motion) = (%q,%v), want (off,true)", got, ok)
+	}
+	if on, ok := A11yReduceMotion("on"); !ok || !on {
+		t.Fatal("A11yReduceMotion(on) refused")
+	}
+	if on, ok := A11yReduceMotion("off"); !ok || on {
+		t.Fatal("A11yReduceMotion(off) refused or read on")
+	}
+	for _, val := range []string{"", "yes", "1", "on "} {
+		if _, ok := A11yReduceMotion(val); ok {
+			t.Errorf("A11yReduceMotion(%q) accepted", val)
+		}
+	}
+	vocab, ok = Vocab(A11yReduceMotionKey)
+	if !ok || len(vocab) != 2 || vocab[0] != "off" || vocab[1] != "on" {
+		t.Fatalf("a11y.reduce_motion vocab = %v ok=%v, want [off on]", vocab, ok)
+	}
+
+	// text_scale: the three reserved rungs.
+	if got, ok := Default(A11yTextScaleKey); !ok || got != "100" {
+		t.Fatalf("Default(a11y.text_scale) = (%q,%v), want (100,true)", got, ok)
+	}
+	for _, val := range []string{"100", "125", "150"} {
+		if _, ok := A11yTextScale(val); !ok {
+			t.Errorf("A11yTextScale(%q) refused", val)
+		}
+	}
+	for _, val := range []string{"", "0", "110", "200", "1.25", " 100"} {
+		if _, ok := A11yTextScale(val); ok {
+			t.Errorf("A11yTextScale(%q) accepted", val)
+		}
+	}
+	vocab, ok = Vocab(A11yTextScaleKey)
+	if !ok || len(vocab) != 3 || vocab[0] != "100" || vocab[2] != "150" {
+		t.Fatalf("a11y.text_scale vocab = %v ok=%v, want [100 125 150]", vocab, ok)
+	}
+	if got := Next(vocab, "100"); got != "125" {
+		t.Fatalf("cycle 100 -> %q, want 125", got)
+	}
+
+	// The panel-side validator is the typed-input gate for all three.
+	for _, bad := range []string{"a11y.contrast=on", "a11y.reduce_motion=high", "a11y.text_scale=200"} {
+		key, val, _ := strings.Cut(bad, "=")
+		if ValidA11y(key, val) {
+			t.Errorf("ValidA11y(%q) accepted", bad)
+		}
+	}
+
+	// Persisted once set: a file carrying the trio round-trips them.
+	f := File{Rows: []Setting{
+		{Key: A11yContrastKey, Val: "high"},
+		{Key: A11yReduceMotionKey, Val: "on"},
+		{Key: A11yTextScaleKey, Val: "150"},
+	}, State: StateOK}
+	for _, want := range []string{"a11y.contrast=high", "a11y.reduce_motion=on", "a11y.text_scale=150"} {
+		key, val, _ := strings.Cut(want, "=")
+		if v, ok := f.Effective(key); !ok || v != val {
+			t.Fatalf("persisted %s = %q ok=%v, want %q", key, v, ok, val)
+		}
+	}
+	if rows, ok := Parse(Render(f.Rows)); !ok {
+		t.Fatal("the a11y rows cannot round-trip")
+	} else {
+		for _, want := range []string{"a11y.contrast=high", "a11y.reduce_motion=on", "a11y.text_scale=150"} {
+			key, val, _ := strings.Cut(want, "=")
+			if v, found := Get(rows, key); !found || v != val {
+				t.Fatalf("round-trip %s = %q found=%v", key, v, found)
+			}
+		}
+	}
+}
+
+// M165b (#2983): the cap moved to 24 so a file carrying EVERY known row
+// still loads intact — and its body stays far under MaxBody (the card's
+// condition for leaving MaxBody alone). Both halves are pinned here.
+func TestFullUnionTableFitsTheCapAndTheBody(t *testing.T) {
+	var rows []Setting
+	for _, k := range KnownKeys {
+		rows = append(rows, Setting{Key: k.Name, Val: k.Default})
+	}
+	for _, group := range [][]Key{
+		PaletteKeys, FontKeys, KeyboardLayoutKeys, IdleKeys, NotifyKeys,
+		NotifySoundKeys, VolumeKeys, TimezoneKeys, DataRootKeys, A11yKeys,
+	} {
+		for _, k := range group {
+			rows = append(rows, Setting{Key: k.Name, Val: k.Default})
+		}
+	}
+	// term_restart is kernel-accepted but unknown to this codec — it is a
+	// real row a file can carry, so the union includes it.
+	rows = append(rows, Setting{Key: "term_restart", Val: "stay"})
+	if len(rows) != MaxKeys {
+		t.Fatalf("the known union is %d rows, want exactly MaxKeys %d", len(rows), MaxKeys)
+	}
+	body := Render(rows)
+	if len(body) > MaxBody {
+		t.Fatalf("the full union renders %d bytes, over MaxBody %d", len(body), MaxBody)
+	}
+	decoded, ok := Parse(body)
+	if !ok || len(decoded) != MaxKeys {
+		t.Fatalf("the union dropped a row at the new cap: rows=%d ok=%v", len(decoded), ok)
+	}
+	// And the row past the cap is the one that drops.
+	decoded, ok = Parse(append(body, []byte("overflow=v\n")...))
+	if !ok || len(decoded) != MaxKeys {
+		t.Fatalf("over-cap load = %d rows ok=%v, want the capped %d", len(decoded), ok, MaxKeys)
 	}
 }
 

@@ -44,6 +44,7 @@ package main
 
 import (
 	"virelai/draw"
+	"virelai/settings"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/widgets"
@@ -81,6 +82,11 @@ const (
 	// whether the user ever SAW it. A gate needs a marker that lands after
 	// the pixels are in the composed scanout, not after the request.
 	MarkerNotifyPaint = "gotabwm: notify paint id="
+	// MarkerNotifyFadeOff is printed for each toast queued while
+	// a11y.reduce_motion=on is in force (M165b #2983): the toast will
+	// appear and disappear without the fade ramp, and the line is the
+	// gate's evidence the switch was honoured on THIS toast.
+	MarkerNotifyFadeOff = "gotabwm: notify fade=off"
 )
 
 // Notify geometry and lifetime. NotifyW fits the full 24-byte text budget
@@ -142,6 +148,34 @@ var notifyQueue []notifyToast
 // marker reports this counter, not a per-event count.
 var notifyDropped int
 
+// notifyReduceMotion is the a11y.reduce_motion switch as the strip applies
+// it (M165b #2983): while set, the fade ramp is a no-op — toasts sit at
+// full Surface until they expire and vanish outright. It is refreshed from
+// the share inside notifyPushAction, the single choke point every queued
+// toast passes through, so a boot-time row AND a GOSET save made seconds
+// ago are both honoured on the next toast without a bus subscription.
+var notifyReduceMotion bool
+
+// notifySettingsLoad is the decode seam for the reduce-motion read — the
+// settings.Load/paletteSettings discipline: real on the guest, stubbed in
+// host tests. A missing or corrupt file reads as the default (off).
+var notifySettingsLoad = settings.Load
+
+// refreshReduceMotion re-reads the a11y.reduce_motion row. Called per
+// toast, not per tick: the read is one bounded file decode, a toast's
+// whole life is seconds, and reading it at queue time means the value in
+// force is exactly the one the user just saved.
+func refreshReduceMotion() {
+	f := notifySettingsLoad()
+	notifyReduceMotion = false
+	if f.State != settings.StateOK {
+		return
+	}
+	value, _ := f.Effective(settings.A11yReduceMotionKey)
+	on, _ := settings.A11yReduceMotion(value)
+	notifyReduceMotion = on
+}
+
 // notifyPainted guards the one-shot MarkerNotifyPaint (the chromeTick
 // one-shot discipline, for the same reason: the gate greps the transition,
 // not a per-tick flood) — per BURST, not per process: notifyQueueSet
@@ -181,6 +215,9 @@ func notifyPushAction(tabID uint32, text string, ticks uint64, action uint8, sna
 	if text == "" {
 		return "", false, false
 	}
+	// M165b (#2983): the toast's fade policy is the file's value NOW — a
+	// GOSET save from seconds ago applies to the very next toast.
+	refreshReduceMotion()
 	centerID := notifyCenterPushAction(tabID, text, action, snap)
 	if notifyDND {
 		return text, true, false
@@ -200,6 +237,11 @@ func notifyPushAction(tabID uint32, text string, ticks uint64, action uint8, sna
 		action:   action,
 		snap:     snap,
 	})
+	// The toast is queued with the ramp switched off; name it so a gate
+	// can pin "this toast honoured reduce_motion" without probing pixels.
+	if notifyReduceMotion {
+		vi.ConsoleLine(MarkerNotifyFadeOff)
+	}
 	// M108d (#2328, ADR 0051 D5): a toast that reached the strip stages its
 	// text for the notify-out lane — no-op unless an ARMED names the lane.
 	hostnotifyQueue(text)
@@ -336,10 +378,14 @@ func notifySlotOf(px, py uint32, width, height, n int) (int, bool) {
 // panel fill is at `remaining` ticks before expiry. Zero (the untouched
 // panel) above the ramp, then 1/3, 2/3, 3/3 in the final notifyFadeTicks
 // — the last step being the desktop colour, which is why a toast that has
-// run out is visually already gone one tick before it is dropped. Pure, and
-// the exact three step values are pinned by the host test.
+// run out is visually already gone one tick before it is dropped. Pure
+// except for the one honoured settings row: a11y.reduce_motion=on
+// (M165b #2983) collapses the ramp — every consumer (fill, rule, text,
+// the border mix) reads step 0, so the toast sits at full Surface/Ink
+// until expiry and vanishes outright. The exact three step values are
+// pinned by the host test, as is the reduce-motion collapse.
 func notifyRamp(remaining uint64) uint32 {
-	if remaining == 0 || remaining > uint64(notifyFadeTicks) {
+	if notifyReduceMotion || remaining == 0 || remaining > uint64(notifyFadeTicks) {
 		return 0
 	}
 	return uint32(notifyFadeTicks - remaining + 1)

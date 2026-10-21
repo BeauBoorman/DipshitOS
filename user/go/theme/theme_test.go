@@ -1,6 +1,44 @@
 package theme
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
+
+// snapshotTheme captures the composed state so a test can put it back —
+// Current alone no longer describes it (M165b): the base name and the
+// contrast switch are separate inputs to resolve().
+func snapshotTheme() (Tokens, string, bool) { return Current, baseName, contrastHigh }
+
+func restoreTheme(t Tokens, name string, high bool) {
+	baseName, contrastHigh = name, high
+	resolve()
+	if Current.Bg != t.Bg || Current.Accent != t.Accent {
+		// The saved tokens came from a caller-set Current, not the
+		// (name, contrast) composition — put it back verbatim.
+		Current = t
+	}
+}
+
+// contrastRatio is the WCAG relative-luminance ratio the card pins: the
+// high-contrast variants must sit at or above 7:1 ink-on-background.
+func contrastRatio(a, b uint32) float64 {
+	lum := func(c uint32) float64 {
+		ch := func(shift uint) float64 {
+			v := float64((c>>shift)&0xff) / 255
+			if v <= 0.03928 {
+				return v / 12.92
+			}
+			return math.Pow((v+0.055)/1.055, 2.4)
+		}
+		return 0.2126*ch(16) + 0.7152*ch(8) + 0.0722*ch(0)
+	}
+	l1, l2 := lum(a), lum(b)
+	if l1 < l2 {
+		l1, l2 = l2, l1
+	}
+	return (l1 + 0.05) / (l2 + 0.05)
+}
 
 func TestDarkMatchesZigThemeZig(t *testing.T) {
 	// Byte-identical to user/src/lib/ui/theme.zig THEME_DARK / CHROME_DARK
@@ -29,9 +67,9 @@ func TestLightMatchesZigThemeLight(t *testing.T) {
 }
 
 func TestSetAndName(t *testing.T) {
-	saved := Current
-	defer func() { Current = saved }()
-	Current = Dark
+	saved, name, high := snapshotTheme()
+	defer restoreTheme(saved, name, high)
+	restoreTheme(Dark, "dark", false)
 	if !Set("light") || Name() != "light" || Current.Bg != Light.Bg {
 		t.Fatal("Set(light) did not switch")
 	}
@@ -44,9 +82,9 @@ func TestSetAndName(t *testing.T) {
 }
 
 func TestParseAndApplySettings(t *testing.T) {
-	saved := Current
-	defer func() { Current = saved }()
-	Current = Dark
+	saved, name, high := snapshotTheme()
+	defer restoreTheme(saved, name, high)
+	restoreTheme(Dark, "dark", false)
 	if ParseSettings([]byte("#v2\nhostname=virelai\n")) != "" {
 		t.Fatal("missing theme key must be empty")
 	}
@@ -58,6 +96,77 @@ func TestParseAndApplySettings(t *testing.T) {
 	}
 	if !ApplySettings([]byte("#v2\ntheme=light\n")) || Name() != "light" {
 		t.Fatal("ApplySettings light")
+	}
+}
+
+// M165b (#2983): the high-contrast variants hold the card's floor —
+// ink/background contrast of at least 7:1 — and carry wider focus and
+// border strokes than the table they vary.
+func TestHighContrastVariantsMeetTheFloor(t *testing.T) {
+	for _, hc := range []struct {
+		name string
+		tok  Tokens
+		base Tokens
+	}{
+		{"dark", DarkHC, Dark},
+		{"light", LightHC, Light},
+	} {
+		if r := contrastRatio(hc.tok.Ink, hc.tok.Bg); r < 7 {
+			t.Errorf("%s: Ink/Bg contrast %.2f:1, want >= 7:1", hc.name, r)
+		}
+		if r := contrastRatio(hc.tok.Text, hc.tok.Bg); r < 7 {
+			t.Errorf("%s: Text/Bg contrast %.2f:1, want >= 7:1", hc.name, r)
+		}
+		if hc.tok.FocusW <= hc.base.FocusW || hc.tok.BorderW <= hc.base.BorderW {
+			t.Errorf("%s: strokes %d/%d not wider than base %d/%d",
+				hc.name, hc.tok.FocusW, hc.tok.BorderW, hc.base.FocusW, hc.base.BorderW)
+		}
+	}
+}
+
+// M165b: a11y.contrast composes with the base — it selects the variant of
+// the CURRENT table, and flipping the base afterwards keeps the switch.
+func TestContrastComposesWithTheBase(t *testing.T) {
+	saved, name, high := snapshotTheme()
+	defer restoreTheme(saved, name, high)
+	restoreTheme(Dark, "dark", false)
+
+	if ParseContrast([]byte("#v2\nhostname=virelai\n")) != "" {
+		t.Fatal("missing a11y.contrast must be empty")
+	}
+	if ParseContrast([]byte("#v2\na11y.contrast=high\n")) != "high" {
+		t.Fatal("a11y.contrast=high")
+	}
+	if ParseContrast([]byte("a11y.contrast=HIGH\n")) != "" {
+		t.Fatal("unknown contrast values must be ignored")
+	}
+	// Last row wins, like theme=.
+	if ParseContrast([]byte("a11y.contrast=high\na11y.contrast=off\n")) != "off" {
+		t.Fatal("the later contrast row must win")
+	}
+
+	// high selects the variant of the current table — dark first.
+	if !ApplySettings([]byte("#v2\na11y.contrast=high\n")) ||
+		Current.Bg != DarkHC.Bg || Contrast() != "high" || Name() != "dark" {
+		t.Fatal("contrast=high on dark did not select DarkHC")
+	}
+	// ...and the switch survives a later base change (each key honoured
+	// without clobbering the other).
+	if !ApplySettings([]byte("#v2\ntheme=light\na11y.contrast=high\n")) ||
+		Current.Bg != LightHC.Bg || Name() != "light" {
+		t.Fatal("theme=light + contrast=high did not select LightHC")
+	}
+	if !Set("dark") || Current.Bg != DarkHC.Bg {
+		t.Fatal("Set(dark) under high contrast must stay on the variant")
+	}
+	// off returns to the plain table, and an ApplySettings carrying no
+	// a11y row leaves the switch alone.
+	SetContrast(false)
+	if Current.Bg != Dark.Bg || Contrast() != "off" {
+		t.Fatal("SetContrast(false) did not return to Dark")
+	}
+	if ApplySettings([]byte("#v2\na11y.contrast=bogus\n")) {
+		t.Fatal("an unknown contrast value must be a no-op")
 	}
 }
 

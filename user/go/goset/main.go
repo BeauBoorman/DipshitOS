@@ -20,6 +20,7 @@
 //	⏎ alone      save the table as shown
 //	Esc          quit without saving
 //	services ⏎   open Services; name=on|off ⏎ safely publishes its config
+//	access ⏎     open Access (M165b #2983): the a11y.* toggles + text scale
 //	settings ⏎   return from Services without writing SETTINGS.TXT
 //
 // M73m (#1662) adds the PALETTE surface: `theme` cycles the three built-in
@@ -79,8 +80,8 @@ const (
 	markerShortcuts = "goset: shortcuts n="
 	// M122e (#2574): every view switch lands the same marker, whichever
 	// surface asked for it — a tab-strip click, the strip's Left/Right,
-	// the typed `services`/`grants`/`profile` lines, or Esc popping a
-	// sub-view.
+	// the typed `services`/`grants`/`profile`/`access` lines, or Esc
+	// popping a sub-view.
 	markerTab = "goset: tab "
 	// M128d (#2608): the machine-identity view — one ctl `profile-info`
 	// session through slot 93 answers which .virelaivm this run is, the
@@ -118,6 +119,13 @@ type panel struct {
 	// this app only ever names the verdict).
 	showProfile bool
 	prof        vi.ProfileInfo
+	// M165b (#2983): the access view — the three a11y.* rows with their
+	// effective values (file row, else compiled default), edited through
+	// the same row affordances the settings list carries. Edits land in
+	// a.disp like every other row; accessRows only mirrors what the tab
+	// shows.
+	showAccess  bool
+	accessRows  []settings.Setting
 	profVerdict string
 
 	listCtl     *listController
@@ -320,8 +328,44 @@ func (a *panel) set(key, val string) bool {
 	if key == "theme" {
 		a.ensurePaletteRows()
 	}
+	// M165b (#2983): the access tab mirrors the three a11y rows — a write
+	// through any surface (typed input, a row cycle) refreshes what the
+	// tab shows, and a contrast write previews on this window's own
+	// tokens the same live-apply `theme` gets above.
+	if settings.IsA11yKey(key) {
+		a.syncAccessRows()
+	}
+	if settings.IsA11yContrastKey(key) {
+		high, _ := settings.A11yContrast(val)
+		theme.SetContrast(high)
+	}
 	vi.ConsoleLine(markerSet + key + "=" + val)
 	return true
+}
+
+// syncAccessRows refreshes the access tab's three rows from the display
+// table: the file's value where the row exists, the compiled default
+// otherwise — the a11y rows are accepted-but-unseeded, so an absent row is
+// off/off/100 and nothing materializes until it is set.
+func (a *panel) syncAccessRows() {
+	a.accessRows = a.accessRows[:0]
+	for _, k := range settings.A11yKeys {
+		val := k.Default
+		if v, ok := settings.Get(a.disp, k.Name); ok {
+			val = v
+		}
+		a.accessRows = append(a.accessRows, settings.Setting{Key: k.Name, Val: val})
+	}
+}
+
+// activeRows is the row set the list and its affordances operate on: the
+// access tab's three rows while that view is up, the settings table
+// otherwise.
+func (a *panel) activeRows() []settings.Setting {
+	if a.showAccess {
+		return a.accessRows
+	}
+	return a.disp
 }
 
 // applyInput consumes the typed command line: `key=value` for a key the kernel
@@ -387,6 +431,16 @@ func (a *panel) applyInput() bool {
 	// what the boot will do; refuse it before it reaches the file.
 	if settings.IsDataRootKey(key) && !settings.ValidDataRoot(val) {
 		a.status = "data_root: host or disk"
+		vi.ConsoleLine(markerDiscard + line)
+		return true
+	}
+	// M165b (#2983): the a11y rows take only their declared vocabularies —
+	// a value outside them reads as the compiled default at every consumer,
+	// so a typo saved here would look like a mode nothing is in; refuse it
+	// before it reaches the file.
+	if settings.IsA11yKey(key) && !settings.ValidA11y(key, val) {
+		vocab, _ := settings.Vocab(key)
+		a.status = key + ": choose " + strings.Join(vocab, " or ")
 		vi.ConsoleLine(markerDiscard + line)
 		return true
 	}
@@ -515,10 +569,10 @@ func (a *panel) cycle(dir int) bool {
 		a.status = profReadOnly
 		return true
 	}
-	if a.sel < 0 || a.sel >= len(a.disp) {
+	if a.sel < 0 || a.sel >= len(a.activeRows()) {
 		return false
 	}
-	key := a.disp[a.sel].Key
+	key := a.activeRows()[a.sel].Key
 	vocab, ok := settings.Vocab(key)
 	if !ok || len(vocab) == 0 {
 		if settings.IsPaletteKey(key) {
@@ -530,7 +584,7 @@ func (a *panel) cycle(dir int) bool {
 		}
 		return true
 	}
-	cur := a.disp[a.sel].Val
+	cur := a.activeRows()[a.sel].Val
 	if dir < 0 {
 		return a.set(key, prevVocab(vocab, cur))
 	}
@@ -658,6 +712,9 @@ func (a *panel) key(ev vi.Event) bool {
 		case "profile":
 			a.input.Clear()
 			return a.showTab(tabProfile)
+		case "access":
+			a.input.Clear()
+			return a.showTab(tabAccess)
 		}
 		if a.showServices {
 			a.serviceInput()
@@ -737,6 +794,8 @@ func (a *panel) activeTab() int {
 		return tabShortcuts
 	case a.showProfile:
 		return tabProfile
+	case a.showAccess:
+		return tabAccess
 	default:
 		return tabSettings
 	}
@@ -750,12 +809,12 @@ func (a *panel) showTab(i int) bool {
 	a.sel, a.list.Sel, a.list.ScrollTop = 0, 0, 0
 	switch i {
 	case tabServices:
-		a.showChords, a.showServices, a.showGrants, a.showProfile = false, true, false, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile, a.showAccess = false, true, false, false, false
 		a.services.Refresh()
 		a.serviceStatus()
 		consoleLine("goset: services n=" + vi.Itoa64(int64(len(a.services.manifest.Services))))
 	case tabGrants:
-		a.showChords, a.showServices, a.showGrants, a.showProfile = false, false, true, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile, a.showAccess = false, false, true, false, false
 		a.grants.Refresh()
 		a.grantStatus()
 		consoleLine("goset: grants n=" + vi.Itoa64(int64(len(a.grants.entries))))
@@ -771,16 +830,24 @@ func (a *panel) showTab(i int) bool {
 				" granted=" + granted + " state=" + e.state())
 		}
 	case tabShortcuts:
-		a.showChords, a.showServices, a.showGrants, a.showProfile = true, false, false, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile, a.showAccess = true, false, false, false, false
 		vi.ConsoleLine(markerShortcuts + vi.Itoa64(int64(len(chords.Global))))
 		a.status = "the global shortcuts registry — one owner per chord (read-only)"
 	case tabProfile:
 		// M128d (#2608): a fresh sample on every entry — the summary is
 		// read-only, so the session cost buys honesty, never staleness.
-		a.showChords, a.showServices, a.showGrants, a.showProfile = false, false, false, true
+		a.showChords, a.showServices, a.showGrants, a.showProfile, a.showAccess = false, false, false, true, false
 		a.refreshProfile()
+	case tabAccess:
+		// M165b (#2983): the a11y surface — a toggle, a toggle and a
+		// dropdown over the file's rows (compiled defaults where absent).
+		// The rows edit through the same set/save path every other
+		// settings row takes.
+		a.showChords, a.showServices, a.showGrants, a.showProfile, a.showAccess = false, false, false, false, true
+		a.syncAccessRows()
+		a.status = "contrast and motion apply live; text scale is reserved"
 	default:
-		a.showChords, a.showServices, a.showGrants, a.showProfile = false, false, false, false
+		a.showChords, a.showServices, a.showGrants, a.showProfile, a.showAccess = false, false, false, false, false
 		a.status = "type key=value + Enter to save"
 	}
 	consoleLine(markerTab + tabNames[i])
@@ -877,6 +944,9 @@ func (a *panel) headLabel() string {
 	if a.showProfile {
 		return "Profile  " + a.prof.Name + "  (read-only)"
 	}
+	if a.showAccess {
+		return "Access  a11y.* — contrast, motion, text scale"
+	}
 	return "Settings  " + settings.Path
 }
 
@@ -901,11 +971,29 @@ func (a *panel) labels() []string {
 	if a.showProfile {
 		return a.profileLabels()
 	}
+	if a.showAccess {
+		return a.accessLabels()
+	}
 	out := make([]string, 0, len(a.disp))
 	for _, s := range a.disp {
 		line := s.Key + " = " + s.Val
 		if !settings.Editable(s.Key) {
 			line += "  (kept)"
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// accessLabels renders the M165b access tab's three rows. The text-scale
+// row is honest about its reach: reserved and named, honoured by no app
+// yet — the card's words, on the row itself.
+func (a *panel) accessLabels() []string {
+	out := make([]string, 0, len(a.accessRows))
+	for _, s := range a.accessRows {
+		line := s.Key + " = " + s.Val
+		if s.Key == settings.A11yTextScaleKey {
+			line += "  (no app honours this yet)"
 		}
 		out = append(out, line)
 	}
@@ -986,7 +1074,7 @@ func paletteHex(v uint32) string {
 // rowRect is row i's slice of the list viewport (i is the absolute index).
 func (a *panel) rowRect(i int) (widgets.Rect, bool) {
 	lr, top := a.list.R, a.list.ScrollTop
-	if i < top || i >= top+a.list.VisibleRows() || i >= len(a.disp) {
+	if i < top || i >= top+a.list.VisibleRows() || i >= len(a.activeRows()) {
 		return widgets.Rect{}, false
 	}
 	ry := lr.Y + (i-top)*a.list.RowH
@@ -997,6 +1085,9 @@ func (a *panel) rowRect(i int) (widgets.Rect, bool) {
 }
 
 // controlFor returns the affordance kind a row carries at its right edge.
+// A two-value vocabulary carrying `off` is a toggle — {on,off} and
+// {off,on} rows have always been, and M165b's {off,high} contrast row is
+// the same gesture; the non-"off" member is the on position.
 func rowControl(row settings.Setting) int {
 	if !settings.Editable(row.Key) {
 		return ctlNone
@@ -1008,11 +1099,22 @@ func rowControl(row settings.Setting) int {
 	if row.Key == settings.AudioVolumeKey {
 		return ctlSlider
 	}
-	if len(vocab) == 2 &&
-		(vocab[0] == "on" && vocab[1] == "off" || vocab[0] == "off" && vocab[1] == "on") {
+	if len(vocab) == 2 && (vocab[0] == "off" || vocab[1] == "off") {
 		return ctlToggle
 	}
 	return ctlDropdown
+}
+
+// toggleOnValue is the vocabulary member a two-position row reads as ON:
+// the non-"off" half of an {off,x} pair — "on" for the on|off rows,
+// "high" for a11y.contrast.
+func toggleOnValue(vocab []string) string {
+	for _, v := range vocab {
+		if v != "off" {
+			return v
+		}
+	}
+	return "on"
 }
 
 const (
@@ -1040,7 +1142,7 @@ func dropdownRect(rr widgets.Rect) widgets.Rect {
 
 // volumeSliderRect is the live audio row's slider geometry for drag updates.
 func (a *panel) volumeSliderRect() (widgets.Rect, bool) {
-	for i, row := range a.disp {
+	for i, row := range a.activeRows() {
 		if row.Key == settings.AudioVolumeKey {
 			if rr, ok := a.rowRect(i); ok {
 				return sliderRect(rr), true
@@ -1070,18 +1172,21 @@ func (a *panel) drawRowControls(cv widgets.RectCanvas) {
 	// shortcuts panes the list renders other tables — a settings control
 	// over a foreign row would paint (and hit-test) a lie. (M122e fixup:
 	// grants was missing here — a grants row could wear row 0's toggle;
-	// M128d's profile rows are facts, not settings vocabulary.)
+	// M128d's profile rows are facts, not settings vocabulary.) M165b's
+	// access tab is NOT foreign — its three a11y rows are settings rows
+	// and the toggles/dropdown are the view's whole point.
 	if a.showServices || a.showGrants || a.showChords || a.showProfile {
 		return
 	}
-	for i, row := range a.disp {
+	for i, row := range a.activeRows() {
 		rr, ok := a.rowRect(i)
 		if !ok {
 			continue
 		}
 		switch rowControl(row) {
 		case ctlToggle:
-			(&widgets.Toggle{R: toggleRect(rr), On: row.Val == "on", Focused: a.sel == i}).Draw(cv)
+			vocab, _ := settings.Vocab(row.Key)
+			(&widgets.Toggle{R: toggleRect(rr), On: row.Val == toggleOnValue(vocab), Focused: a.sel == i}).Draw(cv)
 		case ctlSlider:
 			v, _ := settings.AudioVolume(row.Val)
 			(&widgets.Slider{R: sliderRect(rr), Min: 0, Max: 100,
@@ -1108,7 +1213,7 @@ func (a *panel) rowControlClick(x, y int) bool {
 	if a.showServices || a.showGrants || a.showChords || a.showProfile {
 		return false
 	}
-	for i, row := range a.disp {
+	for i, row := range a.activeRows() {
 		rr, ok := a.rowRect(i)
 		if !ok {
 			continue
@@ -1119,9 +1224,10 @@ func (a *panel) rowControlClick(x, y int) bool {
 				continue
 			}
 			a.sel, a.list.Sel = i, i
-			v := "on"
-			if row.Val == "on" {
-				v = "off"
+			vocab, _ := settings.Vocab(row.Key)
+			v := vocab[0]
+			if row.Val == vocab[0] {
+				v = vocab[1]
 			}
 			return a.set(row.Key, v)
 		case ctlSlider:
@@ -1182,7 +1288,7 @@ func (a *panel) draw() {
 	a.quitBtn.Draw(cv)
 	// The dropdown popover is last: it floats over the rows below it.
 	if a.dropdown.open {
-		cur, _ := settings.Get(a.disp, a.dropdown.key)
+		cur, _ := settings.Get(a.activeRows(), a.dropdown.key)
 		a.dropdown.Draw(cv, cur)
 	}
 }

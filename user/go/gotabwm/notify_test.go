@@ -41,6 +41,13 @@ func resetNotify(t *testing.T) {
 	savedSoundSkipped := notifySoundSkipped
 	savedPlayChime := notifyPlayChime
 	savedBusValues := settingsBusValues
+	// M165b (#2983): the reduce-motion flag and its file seam reset beside
+	// the rest — inert (StateMissing, the default off) unless a test
+	// stages a file that carries the row.
+	savedReduceMotion := notifyReduceMotion
+	savedSettingsLoad := notifySettingsLoad
+	notifyReduceMotion = false
+	notifySettingsLoad = func() settings.File { return settings.File{State: settings.StateMissing} }
 	// M82d2 (#1785): the policy's three file seams degrade to ENOSYS on the
 	// host, so every case starts with inert ones (a test that cares swaps in
 	// a fake through fakeNotifyShare). M99d: the sound state resets beside
@@ -96,6 +103,8 @@ func resetNotify(t *testing.T) {
 		notifySoundSkipped = savedSoundSkipped
 		notifyPlayChime = savedPlayChime
 		settingsBusValues = savedBusValues
+		notifyReduceMotion = savedReduceMotion
+		notifySettingsLoad = savedSettingsLoad
 	})
 }
 
@@ -678,5 +687,86 @@ func TestNotifyPaintMarkerIsOneShotAndOnlyOnAPaintedPresentedTick(t *testing.T) 
 	notifyDismissByIndex(0)
 	if notifyPainted {
 		t.Fatal("clicking the last toast did not re-arm the paint marker")
+	}
+}
+
+// TestNotifyReduceMotionCollapsesTheRamp pins M165b's (#2983) seat half:
+// while the file carries a11y.reduce_motion=on the toast queues with the
+// ramp switched off — the `gotabwm: notify fade=off` marker names it —
+// sitting at full Surface/Ink until it expires outright. The value is
+// re-read per push, so a cleared or absent row restores the fade.
+func TestNotifyReduceMotionCollapsesTheRamp(t *testing.T) {
+	resetNotify(t)
+	notifySettingsLoad = func() settings.File {
+		return settings.File{State: settings.StateOK,
+			Rows: []settings.Setting{{Key: settings.A11yReduceMotionKey, Val: "on"}}}
+	}
+	if _, ok, _ := notifyPush(4, "calm", 0); !ok {
+		t.Fatal("toast refused")
+	}
+	if !notifyReduceMotion {
+		t.Fatal("the on row did not switch the ramp off")
+	}
+	// The ramp is a no-op at every remaining — including inside the
+	// window where a fading toast would already be Bg — so the toast
+	// holds full tokens until the drop.
+	for _, rem := range []uint64{0, 1, 2, 3, uint64(NotifyTicks)} {
+		if notifyRamp(rem) != 0 {
+			t.Fatalf("notifyRamp(%d) = %d under reduce_motion, want 0", rem, notifyRamp(rem))
+		}
+	}
+	if got := notifyFill(theme.Dark, 1); got != theme.Dark.Surface {
+		t.Fatalf("fade-off fill = %#x, want Surface %#x", got, theme.Dark.Surface)
+	}
+	if got := notifyRule(theme.Dark, 1); got != theme.Dark.Accent {
+		t.Fatalf("fade-off rule = %#x, want Accent %#x", got, theme.Dark.Accent)
+	}
+	if got := notifyText(theme.Dark, 1); got != theme.Dark.Ink {
+		t.Fatalf("fade-off text = %#x, want Ink %#x", got, theme.Dark.Ink)
+	}
+
+	// The value is re-read per toast: a file that no longer carries on
+	// restores the ramp on the next push, and a missing file is the
+	// compiled default too.
+	notifySettingsLoad = func() settings.File {
+		return settings.File{State: settings.StateOK,
+			Rows: []settings.Setting{{Key: settings.A11yReduceMotionKey, Val: "off"}}}
+	}
+	if _, ok, _ := notifyPush(5, "fade", 20); !ok {
+		t.Fatal("second toast refused")
+	}
+	if notifyReduceMotion {
+		t.Fatal("the off row left the ramp off")
+	}
+	if got := notifyRamp(1); got != 3 {
+		t.Fatalf("notifyRamp(1) = %d after the row cleared, want 3", got)
+	}
+	notifySettingsLoad = func() settings.File {
+		return settings.File{State: settings.StateMissing}
+	}
+	if _, ok, _ := notifyPush(6, "plain", 30); !ok {
+		t.Fatal("third toast refused")
+	}
+	if notifyReduceMotion {
+		t.Fatal("a missing file left reduce_motion on")
+	}
+	// A mistyped row reads as the default too — never a silent mode.
+	notifySettingsLoad = func() settings.File {
+		return settings.File{State: settings.StateOK,
+			Rows: []settings.Setting{{Key: settings.A11yReduceMotionKey, Val: "yes"}}}
+	}
+	if _, ok, _ := notifyPush(7, "typo", 40); !ok {
+		t.Fatal("fourth toast refused")
+	}
+	if notifyReduceMotion {
+		t.Fatal("a garbage reduce_motion value switched the ramp off")
+	}
+}
+
+// The fade-off marker is a gate-facing literal; pin the exact shape the
+// way the other seat markers are pinned.
+func TestNotifyFadeOffMarkerShape(t *testing.T) {
+	if MarkerNotifyFadeOff != "gotabwm: notify fade=off" {
+		t.Fatalf("marker = %q", MarkerNotifyFadeOff)
 	}
 }

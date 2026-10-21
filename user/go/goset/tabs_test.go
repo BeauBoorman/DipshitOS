@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"virelai/settings"
+	"virelai/theme"
 	"virelai/vi"
 	"virelai/widgets"
 )
@@ -33,8 +34,9 @@ func TestTabStripClickSwitchesViews(t *testing.T) {
 		}
 	}
 
-	// Services is cell 1 of 5 over a 544px strip — the click focuses the
-	// strip and opens the pane; the marker names the view that landed.
+	// Services is cell 1 of 6 over a 544px strip (~90px cells) — the click
+	// focuses the strip and opens the pane; the marker names the view
+	// that landed.
 	click(140, 10)
 	if !a.showServices || a.activeTab() != tabServices {
 		t.Fatal("services tab click did not open the pane")
@@ -52,14 +54,14 @@ func TestTabStripClickSwitchesViews(t *testing.T) {
 		t.Fatalf("no %q in %v", markerTab+"services", *events)
 	}
 
-	// Shortcuts is cell 3; the M128d profile view is the last cell (cell
-	// 4) — its click lands a refused session on the host (no vsock slot),
-	// which is still a view landing.
-	click(380, 10)
+	// Shortcuts is cell 3; the M128d profile view is cell 4 — its click
+	// lands a refused session on the host (no vsock slot), which is still
+	// a view landing. M165b's access view is the last cell (cell 5).
+	click(310, 10)
 	if !a.showChords || a.activeTab() != tabShortcuts {
 		t.Fatal("shortcuts tab click did not open the registry view")
 	}
-	click(500, 10)
+	click(410, 10)
 	if !a.showProfile || a.activeTab() != tabProfile {
 		t.Fatal("profile tab click did not open the summary view")
 	}
@@ -82,7 +84,7 @@ func TestTabStripKeyboardStepsViews(t *testing.T) {
 	defer g.install(t)()
 
 	a.focus.Focus(0) // the strip
-	for _, want := range []int{tabServices, tabGrants, tabShortcuts, tabProfile, tabSettings} {
+	for _, want := range []int{tabServices, tabGrants, tabShortcuts, tabProfile, tabAccess, tabSettings} {
 		if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyRight}) {
 			t.Fatalf("Right did not step the strip to %d", want)
 		}
@@ -90,8 +92,8 @@ func TestTabStripKeyboardStepsViews(t *testing.T) {
 			t.Fatalf("after Right: active tab %d, want %d", a.activeTab(), want)
 		}
 	}
-	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyLeft}) || a.activeTab() != tabProfile {
-		t.Fatal("Left did not wrap back to the profile pane")
+	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyLeft}) || a.activeTab() != tabAccess {
+		t.Fatal("Left did not wrap back to the access pane")
 	}
 }
 
@@ -336,5 +338,107 @@ func TestViewSwitchMarkerIsUniform(t *testing.T) {
 		if !found {
 			t.Fatalf("no %q in %v", w, *events)
 		}
+	}
+}
+
+// M165b (#2983): the access tab is the a11y surface — three rows with the
+// file's value or the compiled default, a toggle, a toggle and a
+// dropdown, and edits that land in the settings table like every other
+// row. The text-scale row names its own reach.
+func TestAccessTabShowsAndEditsTheA11yRows(t *testing.T) {
+	events, restore := captureConsole(t)
+	defer restore()
+	a := newStripPanel()
+	// The preview check needs a known base: pin dark + off, restore after.
+	theme.Set("dark")
+	theme.SetContrast(false)
+	defer theme.SetContrast(false)
+
+	a.showTab(tabAccess)
+	if !a.showAccess || a.activeTab() != tabAccess {
+		t.Fatal("access tab did not open")
+	}
+	found := false
+	for _, e := range *events {
+		if e == markerTab+"access" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no %q in %v", markerTab+"access", *events)
+	}
+
+	// Three rows, effective defaults while the file carries none.
+	if len(a.accessRows) != 3 || len(a.labels()) != 3 {
+		t.Fatalf("access rows = %d labels = %d, want 3", len(a.accessRows), len(a.labels()))
+	}
+	for i, want := range []string{"a11y.contrast = off", "a11y.reduce_motion = off"} {
+		if a.labels()[i] != want {
+			t.Fatalf("label[%d] = %q, want %q", i, a.labels()[i], want)
+		}
+	}
+	if a.labels()[2] != "a11y.text_scale = 100  (no app honours this yet)" {
+		t.Fatalf("text-scale label = %q", a.labels()[2])
+	}
+
+	// The affordance per row: a toggle, a toggle and a dropdown.
+	if rowControl(a.accessRows[0]) != ctlToggle {
+		t.Fatal("a11y.contrast is not a toggle")
+	}
+	if rowControl(a.accessRows[1]) != ctlToggle {
+		t.Fatal("a11y.reduce_motion is not a toggle")
+	}
+	if rowControl(a.accessRows[2]) != ctlDropdown {
+		t.Fatal("a11y.text_scale is not a dropdown")
+	}
+
+	// Cycling row 0 writes the real settings row and mirrors it back.
+	a.sel = 0
+	if !a.cycle(1) {
+		t.Fatal("contrast cycle refused")
+	}
+	if v, ok := settings.Get(a.disp, "a11y.contrast"); !ok || v != "high" {
+		t.Fatalf("disp a11y.contrast = %q ok=%v, want high", v, ok)
+	}
+	if a.accessRows[0].Val != "high" {
+		t.Fatalf("access mirror = %q, want high", a.accessRows[0].Val)
+	}
+	if theme.Current.Bg != theme.DarkHC.Bg {
+		t.Fatal("the contrast write did not preview the high-contrast table")
+	}
+
+	// The dropdown row cycles its reserved rungs through the same path.
+	a.sel = 2
+	if !a.cycle(1) || a.accessRows[2].Val != "125" {
+		t.Fatalf("text scale cycle -> %q, want 125", a.accessRows[2].Val)
+	}
+	if v, _ := settings.Get(a.disp, "a11y.text_scale"); v != "125" {
+		t.Fatalf("disp a11y.text_scale = %q, want 125", v)
+	}
+
+	// A file row beats the default when the tab opens.
+	a.showTab(tabSettings)
+	a.disp = settings.Set(a.disp, "a11y.reduce_motion", "on")
+	a.showTab(tabAccess)
+	if a.accessRows[1].Val != "on" {
+		t.Fatalf("reopen mirror = %q, want on", a.accessRows[1].Val)
+	}
+
+	// Esc pops to the Settings tab, the same as every other sub-view.
+	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyEscape}) || a.activeTab() != tabSettings {
+		t.Fatal("Esc did not pop the access tab to Settings")
+	}
+
+	// The typed line is the same switch.
+	a.input.SetValue("access")
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: '\n'})
+	if a.activeTab() != tabAccess {
+		t.Fatal("typed `access` did not open the tab")
+	}
+	// And a mistyped value is refused before it reaches the table.
+	a.input.SetValue("a11y.contrast=ludicrous")
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: '\n'})
+	if v, _ := settings.Get(a.disp, "a11y.contrast"); v == "ludicrous" {
+		t.Fatal("a refused contrast value reached the table")
 	}
 }
