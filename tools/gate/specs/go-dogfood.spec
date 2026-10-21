@@ -2108,12 +2108,13 @@ PY
 #                        exec -u0 GOFILES.ELF /host/FLOW.
 #   gofiles: ready       script b: exec -u0 GOEDIT.ELF /host/FLOW/SEL.TXT —
 #                        second tab, takes focus on declare.
-#   goedit: present      --input-chords: `ctrl-shift-v,ctrl-a,ctrl-v,
-#                        ctrl-shift-s,backspace x6,S,A,V,E,D,.,T,X,T,return`.
-#                        GOEDIT stays focused through the whole burst:
-#                        split v (GOFILES left | GOEDIT right), select-all +
-#                        selpub (the M124e publish), paste the seeded 8 B
-#                        (M124c read), save-as SAVED.TXT (M124b).
+#   goedit: present      --input-chords: `ctrl-1,ctrl-shift-v,ctrl-2 xN,
+#                        ctrl-a,ctrl-v,ctrl-shift-s,backspace x6,S,A,V,E,D,
+#                        .,T,X,T,return,ctrl-2`. GOEDIT stays focused
+#                        through the whole burst: split v (GOFILES left |
+#                        GOEDIT right), select-all + selpub (the M124e
+#                        publish), paste the seeded 8 B (M124c read),
+#                        save-as SAVED.TXT (M124b).
 #   gotabwm: split v     --input-chords leads with ctrl-1 because M137a
 #                        (#2846) re-contracted pane assignment: the
 #                        depth-1 tree gives the FOCUSED tab child A (the
@@ -2124,6 +2125,20 @@ PY
 #                        so the (40,62) press hits its list whichever
 #                        order the seat implements; ctrl-2 returns focus
 #                        to GOEDIT for the chord lane and the drop pane.
+#                        The repeated ctrl-2 run is load-bearing dwell,
+#                        not redundancy: the kernel delivers each
+#                        KEY_DOWN to the window focused AT DELIVERY, and
+#                        the seat's `host focus id=5` only lands when it
+#                        drains ctrl-2 off its own queue — which runs
+#                        ~1 s behind the 0.25 s/stroke injection under a
+#                        scripted burst on a loaded host (v5 run 1/2:
+#                        ctrl-a/ctrl-v/ctrl-shift-s all delivered to the
+#                        still-focused GOFILES, where they are unbound
+#                        no-ops; the batch's tail reached GOEDIT after
+#                        the focus landed). Every drained repeat
+#                        re-asserts focus on the same target, so the
+#                        app-bound chords that follow the dwell inject
+#                        only once `host focus id=5` has posted.
 #   gotabwm: split v     --pointer-virtio: the whole gesture half —
 #                        drag NOTE.TXT onto GOEDIT's right pane (M124a);
 #                        right-click PIC.PNG -> "Open With…" -> GOVIEW.ELF
@@ -2170,7 +2185,7 @@ vgate_run 08 -- \
     --script-after 'dogfood: seat' \
     --script2 '$RUN_DIR/script-08b.txt' \
     --script2-after 'gofiles: ready' \
-    --input-chords 'ctrl-1,ctrl-shift-v,ctrl-2,ctrl-a,ctrl-v,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,S,A,V,E,D,.,T,X,T,return,ctrl-2' \
+    --input-chords 'ctrl-1,ctrl-shift-v,ctrl-2,ctrl-2,ctrl-2,ctrl-2,ctrl-2,ctrl-2,ctrl-2,ctrl-2,ctrl-2,ctrl-a,ctrl-v,ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,S,A,V,E,D,.,T,X,T,return,ctrl-2' \
     --input-chords-after 'goedit: present' \
     --pointer-virtio '640,400;640,400;40,62,d;200,200;320,240;480,280;900,360,u;640,400;640,400;100,11,c;640,400;640,400;640,400;640,400;640,400;640,400;640,400;640,400,mc' \
     --pointer-virtio-after 'gotabwm: split v' \
@@ -2404,23 +2419,29 @@ PY
 #                    then back right -> `gotabwm: reorder <from>-><to>`
 #     ctrl-shift-n   M121b pin: `gotabwm: pin id=<n> on`, the pinned cell
 #                    jumps to the strip front
-#     ctrl-shift-p s e t t return
+#     ctrl-shift-w   M121b close of the STILL-FOCUSED tab: no exec is in
+#                    flight at this point in the batch, so the close
+#                    provably hits GOEDIT -> `host close id=` +
+#                    `tab close id=` + `close`, focus falls to GOTERM
+#                    (badge -> term)
+#     ctrl-shift-t   M121b reopen: `gotabwm: reopen GOEDIT.ELF` pops the
+#                    LIFO the close just pushed; the re-exec declares
+#                    asynchronously and steals focus whenever it lands
+#     ctrl-shift-p down x8 s e t t return
 #                    M121a palette: `palette open n=`, the seat modal's
 #                    own sink (badge -> seat), subsequence filter `q=sett`
 #                    narrows to a Settings row, return execs it ->
 #                    `palette exec GOSET.ELF` + `palette dismiss` (the
 #                    palette's catalog is tabs/recents/settings/help/
 #                    chords -- a settings pick is the deterministic exec
-#                    row, go-wm-seat run 15's exact leg)
-#     ctrl-shift-w   M121b close of the STILL-FOCUSED tab: GOSET's exec
-#                    is in flight but its declare cannot have landed
-#                    (0.25 s/stroke vs a >=1 s measured-boot declare), so
-#                    the close provably hits GOEDIT -> `host close id=` +
-#                    `tab close id=` + `close`, focus falls to GOTERM
-#                    (badge -> term)
-#     ctrl-shift-t   M121b reopen: `gotabwm: reopen GOEDIT.ELF` pops the
-#                    LIFO the close just pushed; the re-exec declares
-#                    after the batch ends
+#                    row, go-wm-seat run 15's exact leg). The down x8 is
+#                    the hints overlay's own idiom: nav strokes the
+#                    modal consumes, dwell that holds the plate open
+#                    across seat-loop present passes so `launcher
+#                    presented` and the armed snaps have a window to
+#                    land in -- without it a caught-up seat can drain
+#                    open->exec->dismiss inside one composite gap (v5f
+#                    run 1: `launcher presented` never printed).
 #
 #   goedit: state restored  script c: the run's echo. The re-exec'd
 #                        editor's own restore receipt is the journey's
@@ -2433,13 +2454,21 @@ PY
 #                        three-tab state never earned a print (observed
 #                        first run: n=3 unprinted while tabs=3 stood).
 #
-# Why nothing follows an exec/reopen chord inside the batch: cv-input
-# paces one batch at a fixed 0.25 s/stroke (the go-wm-hid run-16 note),
-# and a re-exec'd or exec'd app declares seconds later -- any chord that
-# needed the NEW focus would land on the OLD one. Every leg after the
-# palette's `return` is therefore a seat-scope chord acting on the
-# pre-declare focus, which is exactly what makes the close target
-# provable instead of racy.
+# Why close+reopen sits BEFORE the palette, and why nothing follows an
+# exec chord: the seat resolves a seat-scope chord's target against the
+# LIVE focus at drain time, and under a scripted burst the drain runs
+# seconds behind the 0.25 s/stroke injection -- so a declare can always
+# have landed (v5 runs 1+2: the post-palette ctrl-shift-w drained after
+# GOSET's declare stole focus; the seat correctly closed `tab close
+# id=6` and the LIFO answered `reopen GOSET.ELF` -- seat-correct
+# behaviour, journey-breaking order). Firing the close while no exec is
+# pending makes GOEDIT's focus unstealable; the palette legs that
+# follow are seat-scope only (the modal's own sink eats s/e/t/t/return
+# regardless of which hosted window holds kernel focus), and the batch
+# ends on the exec so no later chord can land on the wrong side of a
+# declare. The reopened GOEDIT's redeclare may still steal focus
+# mid-palette -- harmless: the palette keeps its modal sink, and the
+# only cost is unasserted stray inserts in the restored buffer.
 vgate_file script-09a.txt <<'EOF'
 dui focus 0
 set GOMAXPROCS=1
@@ -2459,17 +2488,20 @@ vgate_run 09 -- \
     --via-virtio --cvc-snap \
     --screen '$RUN_DIR/screen-09' \
     --snapshot-out '$RUN_DIR/snap-09' \
+    --snapshot-after 'gotabwm: palette open n=' \
+    --snapshot-after 'gotabwm: palette filter q=sett n=' \
     --snapshot-after 'gotabwm: launcher presented' \
     --snapshot-after 'goedit: state restored' \
+    --snapshot-after 'rx-m121f-ok' \
     --script '$RUN_DIR/script-09a.txt' \
     --script-after 'dogfood: seat' \
     --script2 '$RUN_DIR/script-09b.txt' \
     --script2-after 'goterm: ready' \
-    --input-chords 'x,y,z,?,down,down,down,down,down,down,escape,ctrl-z,ctrl-shift-pageup,ctrl-shift-pagedown,ctrl-shift-n,ctrl-shift-p,s,e,t,t,return,ctrl-shift-w,ctrl-shift-t' \
+    --input-chords 'x,y,z,?,down,down,down,down,down,down,escape,ctrl-z,ctrl-shift-pageup,ctrl-shift-pagedown,ctrl-shift-n,ctrl-shift-w,ctrl-shift-t,ctrl-shift-p,down,down,down,down,down,down,down,down,s,e,t,t,return' \
     --input-chords-after 'goedit: present' \
     --script3 '$RUN_DIR/script-09c.txt' \
     --script3-after 'goedit: state restored' \
-    --script-expect 'rx-m121f-ok' --script-expect-tail 90 --timeout 420
+    --script-expect 'rx-m121f-ok' --script-expect-tail 90 --timeout 600
 
 # The LIVE default seat, restored-empty: no starter GOSH, no demo
 # choreography, no persisted wm row (the whole point of this spec).
@@ -2553,7 +2585,10 @@ vgate_assert 09 serial-count 'goedit: declare accepted' 2
 vgate_assert 09 serial-count 'gotabwm: tab open id=' 4
 # The live-persistence proof needs >120 consumed heartbeats; a fast
 # journey can reach rx-m121f-ok in ~70, so the 90 s expect tail holds the
-# boot long enough to cross the demo bound deterministically.
+# boot long enough to cross the demo bound deterministically. The 600 s
+# timeout (was 420) buys that tail room on a starved host: v5f run 1
+# reached rx at ~330 s and the 420 s bound killed the boot ~30 ticks
+# short of the latch.
 vgate_assert 09 serial-contains 'gotabwm: live steady tabs='
 vgate_assert 09 serial-contains 'rx-m121f-ok'
 
@@ -2610,18 +2645,21 @@ i_undo = at("goedit: undo n=0", i_hclose)
 i_uroute = at("gotabwm: undo id=", i_edit)
 i_move = at("gotabwm: reorder ", i_uroute)
 i_pin = at("gotabwm: pin id=", i_move)
-i_popen = at("gotabwm: palette open n=", i_pin)
+# close+reopen fire before the palette exec so no declare can be in
+# flight to steal the close's target (see the batch comment); both are
+# seat-queue ordered, so the reopen marker follows the close's.
+i_close = at("gotabwm: tab close id=", i_pin)
+i_reopen = at("gotabwm: reopen GOEDIT.ELF", i_close)
+i_popen = at("gotabwm: palette open n=", i_reopen)
 i_pfilter = at("gotabwm: palette filter q=sett n=", i_popen)
 i_pexec = at("gotabwm: palette exec GOSET.ELF", i_pfilter)
-i_close = at("gotabwm: tab close id=", i_pexec)
-i_reopen = at("gotabwm: reopen GOEDIT.ELF", i_close)
 i_gset = at("goset: declare accepted", i_pexec)
 i_edit2 = at("goedit: declare accepted", i_reopen)
 i_rest = at("goedit: state restored", i_edit2)
 i_ok = at("rx-m121f-ok", i_rest)
 print("M121f journey chain OK: seat -> goterm -> goedit -> dirty -> "
       "hints -> hints-close -> undo(effect@%d) + undo-route@%d -> reorder -> "
-      "pin -> palette -> filter -> exec -> close -> reopen -> state-restored "
+      "pin -> close -> reopen -> palette -> filter -> exec -> state-restored "
       "(goset declare@%d, edit redeclare@%d)"
       % (i_undo, i_uroute, i_gset, i_edit2))
 PY
@@ -2629,18 +2667,20 @@ PY
 # The M121d badge's serial order, as an ordered subsequence (extra lines
 # are legal -- GOTERM's retitle can re-report, and the two trailing
 # declares race): boot seat -> GOTERM's declare (term) -> GOEDIT's
-# declare (app) -> the palette's seat-modal sink -> back to Edit on
-# dismiss -> the close landing on term -> the reopened Edit. GOSET's
-# Settings badge is pinned only after the palette exec -- a declare's
-# arrival against seat-processed chords is a race both directions.
+# declare (app) -> the close landing on term (the only other tab). The
+# reopened Edit's declare badge and the palette's seat-modal sink land
+# after their own markers in either order vs each other -- an async
+# declare against a chord drain is a race both directions. GOSET's
+# Settings badge is pinned only after the palette exec.
 vgate_assert 09 python <<'PY'
 import os, re, sys
 ser = open(os.environ["VG_SER"], errors="replace").read()
 lines = [(m.start(), m.group(1), (m.group(2) or "").strip())
          for m in re.finditer(
              r"(?m)^gotabwm: focus scope=(\w+)(?: title=(.*))?$", ser)]
+reopen = ser.index("gotabwm: reopen GOEDIT.ELF")
 popen = ser.index("gotabwm: palette open n=")
-close = ser.index("gotabwm: tab close id=")
+pexec = ser.index("gotabwm: palette exec GOSET.ELF")
 
 def match(chain, seq, label):
     i = 0
@@ -2653,25 +2693,29 @@ def match(chain, seq, label):
                      % ((want_s, want_t), label, seq))
         i += 1
 
-# The whole-run walk, as an ordered subsequence: boot seat -> TERM's
-# declare -> Edit's declare -> palette's seat modal -> dismiss back to
-# Edit -> the close's term landing -> the reopened Edit. Settings is NOT
-# in the spine: GOSET's exec is in flight while the seat chews the
-# close+reopen chords, and its declare badge lands wherever its boot
-# finishes -- before the close's term under a starved seat (the authored
-# order), after the reopen's Edit on a fast drain (both observed). What
-# IS pinned: the exec cannot declare before the seat fired it.
+# The pinned spine: boot seat -> TERM's declare -> Edit's declare ->
+# the close's term landing (Edit is the only close in the journey and
+# Term is the only other open tab when it fires). The reopen's Edit
+# badge, the palette's seat modal and GOSET's Settings badge are each
+# pinned only after the marker that causes them: an async declare's
+# badge can land before, during, or after the palette's drain.
 match([("seat", ""), ("term", "Term"), ("app", "Edit"),
-       ("seat", ""), ("app", "Edit"), ("term", "Term"),
-       ("app", "Edit")],
+       ("term", "Term")],
       lines, "journey")
-pexec = ser.index("gotabwm: palette exec GOSET.ELF")
+if not any(s == "app" and t.startswith("Edit") and p > reopen
+           for p, s, t in lines):
+    sys.exit("badge walk: no app/Edit badge after the reopen "
+             "(lines seen: %r)" % lines)
+if not any(s == "seat" and p > popen for p, s, t in lines):
+    sys.exit("badge walk: no seat badge after the palette open "
+             "(lines seen: %r)" % lines)
 if not any(s == "app" and t.startswith("Settings") and p > pexec
            for p, s, t in lines):
     sys.exit("badge walk: no app/Settings badge after the palette exec "
              "(lines seen: %r)" % lines)
-print("M121d badge walk OK: seat -> Term -> Edit -> seat(palette) -> "
-      "Edit -> Term(close) -> Edit(reopen); Settings badge unpinned")
+print("M121d badge walk OK: seat -> Term -> Edit -> Term(close); "
+      "Edit(reopen), seat(palette) and Settings pinned after their own "
+      "markers only")
 PY
 
 # ---------------------------------------------------------------------------
@@ -2684,82 +2728,125 @@ PY
 # copy of the plate"), so the serial pins carry this leg's proof.
 # ---------------------------------------------------------------------------
 
-# snap-09-0.raw: the palette's plate -- the launcher's second face paints
-# the left strip (x 0..264, full height): Surface fill, the Accent edge
-# rule (observed at x~252 under the seat's padding, not a pinned column),
-# and field/row ink. The finished plate is TWO-TONE: the filter field and
-# row cells fill #192127 inside the Surface plate, so a completed paint
-# holds Surface under half the strip (observed 47.5% Surface + 34.2%
-# field = 81.7% palette fill across two runs -- deterministic geometry,
-# not a mid-paint capture; a mid-paint frame actually inflates Surface,
-# which is what let the old single-fill bound pass once by accident).
-# Coverage therefore counts BOTH palette fills.
-vgate_assert 09 snapshot 'snap-09-0.raw' <<'PY'
-import sys
+# snap-09-{0,1,2}.raw: the palette's plate -- the launcher's second face
+# paints the left strip (x 0..264, full height): Surface fill, the Accent
+# edge rule (observed at x~252 under the seat's padding, not a pinned
+# column), and field/row ink. The finished plate is TWO-TONE: the filter
+# field and row cells fill #192127 inside the Surface plate, so a
+# completed paint holds Surface under half the strip (observed 47.5%
+# Surface + 34.2% field = 81.7% palette fill across two runs --
+# deterministic geometry, not a mid-paint capture; a mid-paint frame
+# actually inflates Surface, which is what let the old single-fill bound
+# pass once by accident). Coverage therefore counts BOTH palette fills.
+#
+# The plate proof is armed at THREE points across the open window
+# (palette open -> filter -> launcher presented) because the host's
+# marker->capture latency can outlive the palette's entire life: under a
+# seat drain burst the whole open->exec->dismiss span is ~20 serial
+# lines, so a single arm's frame can land post-dismiss and show only the
+# desktop's dark field (v5 run 1: snap was all-black with
+# `launcher presented` already printed -- the plate WAS on the scanout,
+# the stream just missed the window). The property under test is "the
+# plate painted during the open window", so ANY plate-positive raw
+# satisfies it; a raw that caught a pre-paint or post-dismiss frame is a
+# latency miss, not a verdict -- but a boot where NO armed frame ever
+# carried the plate fails honestly.
+vgate_assert 09 python <<'PY'
+import glob, os, sys
 from collections import Counter
 W, H = 1280, 720
-raw = open(sys.argv[1], "rb").read()
-if len(raw) < W * H * 4:
-    sys.exit("snapshot is %d bytes, want %d" % (len(raw), W * H * 4))
-def px(x, y):
+files = sorted(f for i in range(3)
+               for f in glob.glob(os.path.join(
+                   os.environ["RUN_DIR"], "snap-09-%d.raw" % i)))
+if not files:
+    sys.exit("no palette-armed snapshots (snap-09-{0,1,2}.raw) captured")
+def px(raw, x, y):
     o = (y * W + x) * 4
     return (raw[o + 2], raw[o + 1], raw[o])
-modal = Counter(); accent = ink = plate = total = 0
-for y in range(30, 700):
-    for x in range(4, 258):
-        r, g, b = px(x, y)
-        total += 1
-        modal[(r, g, b)] += 1
-        if max(abs(r - 0x22), abs(g - 0x2d), abs(b - 0x35)) <= 4 or \
-           max(abs(r - 0x19), abs(g - 0x21), abs(b - 0x27)) <= 4:
-            plate += 1
-        if min(r, g, b) >= 150:
-            ink += 1
-        if abs(r - 0x3b) <= 48 and abs(g - 0x82) <= 48 and abs(b - 0xf6) <= 48:
-            accent += 1
-best, best_n = modal.most_common(1)[0]
-dist = max(abs(best[0] - 0x22), abs(best[1] - 0x2d), abs(best[2] - 0x35))
-print("palette strip %d px: modal=#%02x%02x%02x n=%d plate=%d ink=%d accent=%d"
-      % (total, best[0], best[1], best[2], best_n, plate, ink, accent))
-assert dist <= 4, ("the palette strip is not Surface-filled (modal "
-    "#%02x%02x%02x) -- the plate did not paint" % (best[0], best[1], best[2]))
-assert plate >= total // 2, "palette strip not covered by its plate"
-assert accent >= 100, "no Accent edge rule / field ring on the palette (%d)" % accent
-assert ink >= 100, "no field/row ink inside the palette (%d)" % ink
+verdicts = []
+for path in files:
+    raw = open(path, "rb").read()
+    if len(raw) < W * H * 4:
+        verdicts.append((os.path.basename(path), "short raw", 0))
+        continue
+    modal = Counter(); accent = ink = plate = total = 0
+    for y in range(30, 700):
+        for x in range(4, 258):
+            r, g, b = px(raw, x, y)
+            total += 1
+            modal[(r, g, b)] += 1
+            if max(abs(r - 0x22), abs(g - 0x2d), abs(b - 0x35)) <= 4 or \
+               max(abs(r - 0x19), abs(g - 0x21), abs(b - 0x27)) <= 4:
+                plate += 1
+            if min(r, g, b) >= 150:
+                ink += 1
+            if abs(r - 0x3b) <= 48 and abs(g - 0x82) <= 48 \
+               and abs(b - 0xf6) <= 48:
+                accent += 1
+    best, best_n = modal.most_common(1)[0]
+    dist = max(abs(best[0] - 0x22), abs(best[1] - 0x2d), abs(best[2] - 0x35))
+    print("%s: palette strip %d px: modal=#%02x%02x%02x n=%d plate=%d "
+          "ink=%d accent=%d" % (os.path.basename(path), total,
+                                best[0], best[1], best[2], best_n,
+                                plate, ink, accent))
+    verdicts.append((os.path.basename(path),
+                     "painted" if (dist <= 4 and plate >= total // 2
+                                   and accent >= 100 and ink >= 100)
+                     else "not the plate", plate))
+if not any(v == "painted" for _, v, _ in verdicts):
+    sys.exit("no armed snapshot caught the painted palette plate: %r"
+             % (verdicts,))
+print("palette plate painted on the scanout in %d of %d armed frames"
+      % (sum(1 for _, v, _ in verdicts if v == "painted"), len(verdicts)))
 PY
 
-# snap-09-1.raw: the M121d badge's own rect after the reopen's restore --
-# the same tokens the go-wm-seat run-20 check pins: the ChromeBg panel,
-# the Accent scope chip/rule and Ink title text, BGRX-decoded here.
-vgate_assert 09 snapshot 'snap-09-1.raw' <<'PY'
-import sys
+# snap-09-{3,4}.raw: the M121d badge's own rect -- the same tokens the
+# go-wm-seat run-20 check pins: the ChromeBg panel, the Accent scope
+# chip/rule and Ink title text, BGRX-decoded here. Armed twice -- on the
+# reopen's `state restored` and on the run's `rx-m121f-ok` -- because the
+# marker->capture latency can land the frame before the badge's own
+# composite paints the panel (v5f run 3: `state restored` arm captured
+# an all-black rect while every serial badge leg was green). The badge
+# is persistent chrome: any painted frame proves the leg; a frame that
+# predates the panel's paint is a latency miss, not a verdict.
+vgate_assert 09 python <<'PY'
+import glob, os, sys
 from collections import Counter
 W, H = 1280, 720
-raw = open(sys.argv[1], "rb").read()
-if len(raw) < W * H * 4:
-    sys.exit("snapshot is %d bytes, want %d" % (len(raw), W * H * 4))
-def px(x, y):
+files = sorted(f for i in (3, 4)
+               for f in glob.glob(os.path.join(
+                   os.environ["RUN_DIR"], "snap-09-%d.raw" % i)))
+if not files:
+    sys.exit("no badge-armed snapshots (snap-09-{3,4}.raw) captured")
+def px(raw, x, y):
     o = (y * W + x) * 4
     return (raw[o + 2], raw[o + 1], raw[o])
 x0, y0, pw, ph = 1124 - 4 - 216, 720 - 8 - 20, 216, 20
-modal = Counter(); accent = ink = total = 0
-for y in range(y0, y0 + ph):
-    for x in range(x0, x0 + pw):
-        r, g, b = px(x, y)
-        total += 1
-        modal[(r, g, b)] += 1
-        if min(r, g, b) >= 150:
-            ink += 1
-        if abs(r - 0x3b) <= 32 and abs(g - 0x82) <= 32 and abs(b - 0xf6) <= 32:
-            accent += 1
-best, best_n = modal.most_common(1)[0]
-dist = max(abs(best[0] - 0x11), abs(best[1] - 0x17), abs(best[2] - 0x1c))
-print("badge rect %dx%d (%d px): modal=#%02x%02x%02x n=%d accent=%d ink=%d"
-      % (pw, ph, total, best[0], best[1], best[2], best_n, accent, ink))
-assert dist <= 4, ("the badge rect is not the seat's ChromeBg (modal "
-    "#%02x%02x%02x) -- the panel was not painted"
-    % (best[0], best[1], best[2]))
-assert best_n >= 3000, "the badge panel does not cover its rect"
-assert accent > ph, "no scope chip / seat rule on the badge"
-assert ink >= 20, "no title text on the badge"
+painted = []
+for path in files:
+    raw = open(path, "rb").read()
+    if len(raw) < W * H * 4:
+        continue
+    modal = Counter(); accent = ink = total = 0
+    for y in range(y0, y0 + ph):
+        for x in range(x0, x0 + pw):
+            r, g, b = px(raw, x, y)
+            total += 1
+            modal[(r, g, b)] += 1
+            if min(r, g, b) >= 150:
+                ink += 1
+            if abs(r - 0x3b) <= 32 and abs(g - 0x82) <= 32 \
+               and abs(b - 0xf6) <= 32:
+                accent += 1
+    best, best_n = modal.most_common(1)[0]
+    dist = max(abs(best[0] - 0x11), abs(best[1] - 0x17), abs(best[2] - 0x1c))
+    print("%s: badge rect %dx%d (%d px): modal=#%02x%02x%02x n=%d "
+          "accent=%d ink=%d" % (os.path.basename(path), pw, ph, total,
+                                best[0], best[1], best[2], best_n,
+                                accent, ink))
+    if dist <= 4 and best_n >= 3000 and accent > ph and ink >= 20:
+        painted.append(os.path.basename(path))
+if not painted:
+    sys.exit("no armed snapshot caught the painted badge rect")
+print("badge rect painted on the scanout in %s" % (painted,))
 PY
