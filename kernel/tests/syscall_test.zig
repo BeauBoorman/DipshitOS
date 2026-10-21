@@ -7585,6 +7585,54 @@ test "syscall: copy_in/load_u32 consult the read resolver — a refused source f
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_pipe_read, .{ @intFromPtr(&src) + 8, 8, 0, 0, 0, 0 }, &frame));
 }
 
+test "B6 #2875: the slot-0 fast path prints net: listen-saturated on the named refusal" {
+    const ns = syscall.native_socket;
+    ns.sockets = .{};
+    ns.dns = null;
+    ns.test_now = 0;
+    defer {
+        ns.sockets = .{};
+        ns.dns = null;
+        ns.test_now = 0;
+    }
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+    scheduler.start();
+    try std.testing.expect(scheduler.yield_current());
+    const saved = virtio_net.net_ops;
+    virtio_net.net_ops = test_net_ops();
+    defer virtio_net.net_ops = saved;
+    virtio_net.net_ready = true;
+    virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
+    tcp.reset();
+    defer {
+        virtio_net.net_ready = false;
+        virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
+        tcp.reset();
+    }
+    const prev_hook = syscall.klog.line_hook;
+    defer syscall.klog.line_hook = prev_hook;
+    syscall.klog.line_hook = capture_receipt;
+    var frame = fresh_frame();
+
+    // The ONLY listener lands in slot 0 — the named field ipv4.zig's fast
+    // path reads — so its SYNs take the direct receive, not the claim.
+    const listen = dispatch(80, .{ 0, 0, 8090, 0, 0, 0 }, &frame);
+    try std.testing.expect(@as(i64, @bitCast(listen)) > 0);
+    try std.testing.expectEqual(@as(u16, 8090), ns.sockets.listener.?.local.port);
+    native_inject(5000, tcp.flag_syn, 10, 0, "");
+    native_inject(5001, tcp.flag_syn, 10, 0, "");
+    try std.testing.expectEqual(@as(u64, 0), ns.sockets.counters.listen_saturated);
+    receipt_len = 0;
+    native_inject(5002, tcp.flag_syn, 10, 0, "");
+    try std.testing.expectEqual(@as(u64, 1), ns.sockets.counters.listen_saturated);
+    try std.testing.expectEqual(@as(u64, 1), ns.sockets.counters.capacity_refused);
+    try std.testing.expectEqualStrings("net: listen-saturated port=8090 bound=2\n", receipt_scratch[0..receipt_len]);
+}
+
 // ---------------------------------------------------------------------------
 // M113c (#2419, ADR 0054 Part II): the word gate at the dispatch seam
 // ---------------------------------------------------------------------------

@@ -63,14 +63,24 @@ fn noteSaturated(before: u64, port: u16) void {
     const line = std.fmt.bufPrint(&buf, "net: listen-saturated port={d} bound={d}\n", .{ port, core.child_limit }) catch "net: listen-saturated\n";
     klog.line(line);
 }
+/// #2875: the ONE table receive — every inbound path that feeds
+/// `sockets.receive` wraps it in the saturated diff so `net:
+/// listen-saturated` prints wherever the saturating SYN lands: tcp.zig's
+/// claim, ipv6's, and ipv4.zig's slot-0 fast path (which calls this
+/// directly — a direct `sockets.receive` there silently counted the
+/// refusal without the marker). Other traffic leaves the counter alone
+/// and the note is a no-op.
+pub fn receiveTcp(frame: []const u8, port: u16) void {
+    const saturated = sockets.counters.listen_saturated;
+    sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
+    noteSaturated(saturated, port);
+}
 fn claimTcpFrame(frame: []const u8) bool {
     if (frame.len < core.wire.frame_min or frame[12] != 8 or frame[13] != 0 or
         frame[14] != 0x45 or frame[23] != core.wire.protocol_tcp) return false;
     const port = std.mem.readInt(u16, frame[36..38], .big);
     if (!sockets.tableOwns(port)) return false;
-    const saturated = sockets.counters.listen_saturated;
-    sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
-    noteSaturated(saturated, port);
+    receiveTcp(frame, port);
     return true;
 }
 /// M117c (#2475): the v6 half of `claimTcpFrame` — `ipv6.zig`'s terminal
@@ -85,9 +95,7 @@ fn claimTcp6Frame(frame: []const u8) bool {
     if (!ipv6.is_owned(&dst)) return false; // not ours — foreign, not a drop
     const port = std.mem.readInt(u16, frame[14 + ipv6.ipv6_hdr_len + 2 ..][0..2], .big);
     if (!sockets.tableOwns(port)) return false;
-    const saturated = sockets.counters.listen_saturated;
-    sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
-    noteSaturated(saturated, port);
+    receiveTcp(frame, port);
     return true;
 }
 pub fn registerTableRx() void {

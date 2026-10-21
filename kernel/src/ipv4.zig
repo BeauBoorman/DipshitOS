@@ -286,7 +286,7 @@ pub fn handle_rx(frame: []const u8, own_mac: *const [6]u8, reply_buf: []u8) ?usi
         // from the drain context.
         if (native_socket.sockets.listener) |listener| {
             if (frame.len >= tcp.frame_min and std.mem.readInt(u16, frame[36..38], .big) == listener.local.port) {
-                native_socket.sockets.receive(frame, native_socket.now(), @truncate(@import("csprng.zig").random_u64())) catch unreachable;
+                native_socket.receiveTcp(frame, listener.local.port);
                 return null;
             }
         }
