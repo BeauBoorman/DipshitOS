@@ -253,6 +253,7 @@ the first byte is alphanumeric, and it is never `.` or `..`. It resolves to
 | `ui.windows` | none | `{"seat":"gotabwm"\|"none","focused":I\|null,"windows":[{"index":I,"id":N,"title":S,"focused":B,"pinned":B,"frozen":B}]}` |
 | `ui.input` | `win`: int ≥ 0; `events`: array of ≤ 64 flat objects | `{"sent":N}` (card #2780; requires the `input` cap, D5b) |
 | `ui.screenshot` | `scale`: int 1\|8, default 8 (card #2977) | `{"w":W,"h":H,"format":"rgb565le","bytes":N}` — the scanout's RGB565 little-endian pixels arrive as stream chunks ahead of the result |
+| `ui.geometry` | `win`: int ≥ 0; `op`: `"query"\|"move"\|"sash"`; `move` takes `space`: int 0-255, `sash` takes `percent`: int 0-255 (card #2985; `window` cap for `query`, `input` for the mutations, D5c) | `query` → `{"space":N,"pane":N\|null,"split":"none"\|"h"\|"v","rect":{"x":N,"y":N,"w":N,"h":N}}`; `move` → `{"space":N}`; `sash` → `{"percent":N}` |
 | `gosh.run` | `cmd`: string; `timeout_ms`: int 1..30000, default 10000 | `{"exit_status":N,"stdout_b64":S,"truncated":B}` |
 
 Verb semantics that are binding:
@@ -303,6 +304,25 @@ Verb semantics that are binding:
   the bound is `rate_limited` — refused before any seat or scanout
   syscall — while `scale=8` is never bound. A refused request consumes no
   budget; the bound arms on the first landed band.
+- **`ui.geometry`** (card #2985; ADR 0044 D5c's kind 30) arranges the
+  desktop the way the seat arranges it — see D5c for the wire. `win` is
+  the strip index `ui.windows` reports; the verb resolves it to the
+  kernel window id through the same kind-16 page query `ui.input` uses
+  for its focus check. `op` selects the op: `query` answers where the
+  window is — space index, pane index (`null` when the tab holds no
+  leaf), the parent split's kind and the applied rect; `move` carries
+  `space` and joins that space's strip (creating it at the seat's own
+  cap); `sash` carries `percent` and sets the window's parent split's
+  divider at 10–90 % of its rect. The cap rule splits by op — `query`
+  is `window`-cap observation, `move` and `sash` take `input` because
+  they drive the desktop, the M139b rule — and the per-op arg sets are
+  exclusive: a `space` or `percent` on the wrong op is `bad_request`,
+  as is any other arg. The seat's refusal names surface verbatim
+  (`win_geometry_denied`/`win_geometry_no_window`/`win_geometry_bad_op`),
+  an index no strip row holds is `win_geometry_no_window` resolved
+  daemon-side, a bare `applied=0` is `seat_unsupported`, and no seat at
+  all is `seat_absent`. Every call receipts with `win`, `op` and the
+  operand, never more.
 - **`gosh.run`**:
   1. `cmd` must be 1–192 bytes of printable ASCII (0x20–0x7e), or the
      request fails with `too_large` (length) or `cmd_rejected` (bytes).
@@ -360,6 +380,7 @@ Only codes marked *fatal* close it.
 | `seat_unsupported` / `seat_timeout` | see `ui.windows` | no |
 | `rate_limited` | a `ui.screenshot` `scale=1` inside the per-session 2 s bound | no |
 | `agent_input_denied` / `agent_input_no_focus` | kind-29 ack refused, name quoted verbatim (card #2780) | no |
+| `win_geometry_denied` / `win_geometry_no_window` / `win_geometry_bad_op` | kind-30 ack refused, name quoted verbatim; a `win` index no strip row holds is `win_geometry_no_window` resolved daemon-side (card #2985) | no |
 | `io_error` | any other negative kernel result (`message` carries `vi.ErrnoName`) | no |
 | `auth_required` / `auth_failed` / `auth_timeout` | D2 | **yes** |
 | `line_too_long` | a line exceeds its limit (bytes discarded unparsed) | **yes** |
@@ -448,6 +469,72 @@ bytes.
 receive (`EvWmKey`/`EvWmPointer` inside `consumeSeatEvent`), and the
 bind invariants.
 
+## D5c. Window geometry: WM_RPC kind 30 `win_geometry` (card #2985)
+
+`ui.geometry` rides the same M97g-F2 bind kinds 16 and 29 use — `id` is
+the daemon's own (hidden) bind window, `x/y/w/h` are the auth union. One
+op per request: the request's `title` packs the op and the target,
+because the bound `id` names the caller's window, not the window the op
+is about:
+
+- `title[0]` is the op: `0` = query, `1` = move to space, `2` = set sash.
+- `title[1..2]` is the target kernel window id, little-endian.
+- `title[3]` is the arg: the space index for `move`, the percent for
+  `sash`; unused for `query`.
+
+**Admission is the seat's**, the kind-29 check verbatim: the bound
+`reply_to` pid's proc name must be exactly `AGENTD.ELF`, else
+`win_geometry_denied`. A target id no strip row holds is
+`win_geometry_no_window`; an unknown op, an out-of-range arg (a space
+index ≥ `MaxSpaces`, a percent outside 10–90) or an op the window's
+state cannot take (a sash set on an unsplit window, a move into the
+space the window already occupies) is `win_geometry_bad_op`. Mutations
+ask only about the live strip — the same reach the palette's
+move-to-space row has.
+
+**The ops land on the seat's own paths.** `move` is `applySpaceMove`
+(the palette row): the tab keeps its whole row, its window hides
+through `sys_win_set_visible`, the space creates at the seat's cap, and
+the session mutation persists. `sash` is `applySashDrag` (the drag's
+release edge): percent maps onto the parent node's rect — for a
+vertical split `x + w*percent/100`, horizontal `y + h*percent/100` —
+then the clamped centre stores, every pane rect re-applies through slot
+65, and the sash marker, layout dump and write-through all fire. `query`
+reads the same `PaneRectsAll` the relayout pushes, across every space —
+a moved window stays addressable — and reports the full-viewport stack
+for a tab with no leaf, exactly the dump's rule.
+
+**Ack:** `kind=30|0x80`, `Pad=Bound`, auth union quoting the bound
+token. `applied=1` answers success; for `query` the reply's title
+carries the payload — `title[0]` space index, `title[1]` pane index in
+`PaneRectsAll` order (`0xFF` when the tab has no leaf), `title[2]` the
+parent split's kind byte (0 none, 1 h, 2 v), `title[3..10]` rect
+x/y/w/h uint16 little-endian. A refusal answers `applied=0` with the
+name on the title. The verb surfaces the name verbatim as its refusal
+code; a bare `applied=0` — a seat without a kind-30 handler — is
+`seat_unsupported`, and no answer inside the budget is `seat_timeout`.
+
+**Caps:** the verb's static gate is `window` (observation, like
+`ui.windows`); `move` and `sash` additionally require `input` inside the
+verb — they drive the desktop, so the M139b rule applies and the named
+refusal is `cap_required:input` before any frame goes out.
+
+**Audit:** every `ui.geometry` dispatch receipts with `win`, `op` and
+the operand (`space`/`percent`), never more.
+
+**Markers:** one seat line per request —
+`gotabwm: win_geometry op=<n> id=<win> ok|<refusal>` — plus the markers
+the apply paths already print (`gotabwm: sash`, `gotabwm: space move`,
+`gotabwm: space new`).
+
+**Client:** `vi.WmAgentGeometry` + `vi.WmGeomDecode` in
+`user/go/vi/wmgeom.go`, built on `wmRequest`'s bind/ack machinery like
+`WmAgentInputKey`. The non-AGENTD in-guest sender half of the proof is
+the `WMRPCPROBE.ELF` fixture's kind-30 leg.
+
+**Not changed:** the Zig seats, the kernel, the space/sash apply paths
+themselves, and the bind invariants.
+
 ## D6. Markers and the never-logged contract
 
 Each event writes one serial line through `vi.ConsoleLine`, printed after
@@ -466,6 +553,7 @@ agentd: reap pid=<n> status=<n>
 agentd: session end reason=client_close|<fatal code>
 agentd: refuse privileged|no-credential|no-root|argv|listen errno=<name>
 gotabwm: wq start=<i> rows=<n> count=<n>
+gotabwm: win_geometry op=<n> id=<win> ok|<refusal>      (card #2985)
 ```
 
 The key, challenge, MAC, request paths, file bytes, `cmd` text and command
@@ -631,6 +719,7 @@ tolerance.
 | `ui.windows` | `gotabwm`, ≥ 1 `Calc` row, one focused; run 05 `none` | extra key → `bad_request`; `seat_unsupported`/`seat_timeout` class A |
 | `ui.screenshot` (runs 01/15/16) | default/`scale:8` → 160x90 `rgb565le` 28,800 B; `scale:1` → 1280x720, 1,843,200 B, downsamples to the same run's thumbnail within tolerance | `scale` ∉ {1,8} or mistyped → `bad_request`; second `scale:1` inside 2 s → `rate_limited`; bound lapse → captures again; no seat → `seat_absent` (run 05) |
 | `ui.input` (run 15) | `{"type":"key","usage":0x0B/0x0C}` + a `ptr` press/release → `{"sent":4}`, typed text repaints the next `ui.screenshot` | `win` ≠ focused → `agent_input_no_focus`; 65 events → `too_large`; malformed/missing fields → `bad_request`; `window`-only cap → `cap_required:input` (run 09) |
+| `ui.geometry` (runs 17/18) | `query` rect matches the seat's `layout` line; `sash percent=30` moves the boundary the next `query` reports; `move space=1` drops the row from `ui.windows` | bad `op`/args → `bad_request`; `space` ≥ 4, same-space move, `percent` ∉ 10–90 → `win_geometry_bad_op`; absent `win` → `win_geometry_no_window`; `window`-only cap on `move`/`sash` → `cap_required:input`; non-AGENTD kind-30 → `win_geometry_denied` (wmrpcprobe) |
 | framing | — | `{` → `bad_json`; `{"verb":"proc.list"}` → `bad_request`; `{"id":1,"verb":"nope"}` → `unknown_verb`; duplicate `id` → `bad_request`; nested `{"a":{}}` → `bad_request`; `null` → `bad_request`; 8193 bytes → `line_too_long` (fatal, last) |
 
 The harness prints one `AGENTCTL: ok <step>` or `AGENTCTL: FAIL <step>

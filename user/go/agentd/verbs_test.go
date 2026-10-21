@@ -1307,3 +1307,227 @@ func TestUIScreenshotFull(t *testing.T) {
 		t.Fatalf("scale=1 after seat_absent code = %q", code)
 	}
 }
+
+// --- ui.geometry -----------------------------------------------------------------
+
+// geomSpy captures the kind-30 frames the verb pushes and scripts each
+// ack — the inputSpy shape for one request instead of a batch.
+type geomSpy struct {
+	calls []struct {
+		win, target uint32
+		op, arg     uint8
+	}
+	view   vi.WmGeomView // ack payload on applied query
+	refuse string        // ack title on applied=0
+	bare   bool          // applied=0 with NO refusal name (legacy seat)
+	silent bool          // never answer
+}
+
+func (s *geomSpy) install() {
+	agentGeomFn = func(win uint32, op uint8, target uint32, arg uint8, self string) (vi.WmRpc, bool) {
+		s.calls = append(s.calls, struct {
+			win, target uint32
+			op, arg     uint8
+		}{win, target, op, arg})
+		if s.silent {
+			return vi.WmRpc{}, false
+		}
+		var rep vi.WmRpc
+		if s.refuse != "" {
+			copy(rep.Title[:], s.refuse)
+		} else if !s.bare {
+			rep.Applied = 1
+			if op == vi.WmGeomOpQuery {
+				rep.Title[0] = s.view.Space
+				rep.Title[1] = s.view.Pane
+				rep.Title[2] = s.view.Split
+				put := func(i int, v uint16) {
+					rep.Title[i] = byte(v)
+					rep.Title[i+1] = byte(v >> 8)
+				}
+				put(3, s.view.X)
+				put(5, s.view.Y)
+				put(7, s.view.W)
+				put(9, s.view.H)
+			}
+		}
+		return rep, true
+	}
+}
+
+func TestUIGeometry(t *testing.T) {
+	seamScope(t)
+	spy := &geomSpy{view: vi.WmGeomView{
+		Space: 0, Pane: 0, Split: 2, X: 0, Y: 0, W: 640, H: 720}}
+	k := &fakeKernel{
+		seatPid: 3,
+		wmRows: []vi.WmWindowRow{
+			{Index: 0, ID: 100, Title: "Calc", Focused: true},
+			{Index: 1, ID: 101, Title: "Edit"},
+		},
+	}
+	k.install()
+	spy.install()
+	sess := testSess(true, nil, allCaps...)
+
+	// The query green path: win is the strip index, the frame carries
+	// the resolved kernel id, and the ack's payload renders the view.
+	res, code := verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":1,"op":"query"}`), sess)
+	if code != "" {
+		t.Fatalf("query code = %q", code)
+	}
+	if len(spy.calls) != 1 || spy.calls[0].win != 7 ||
+		spy.calls[0].target != 101 || spy.calls[0].op != vi.WmGeomOpQuery {
+		t.Fatalf("geom call = %+v", spy.calls)
+	}
+	want := `{"space":0,"pane":0,"split":"v","rect":{"x":0,"y":0,"w":640,"h":720}}`
+	if res != want {
+		t.Fatalf("query result = %q want %q", res, want)
+	}
+	// An unplaced pane reports null, never a fabricated index.
+	spy.view = vi.WmGeomView{Space: 0, Pane: vi.WmGeomUnplaced, Split: 0, W: 1280, H: 720}
+	res, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), sess)
+	if code != "" || res != `{"space":0,"pane":null,"split":"none","rect":{"x":0,"y":0,"w":1280,"h":720}}` {
+		t.Fatalf("unplaced query = %q code %q", res, code)
+	}
+
+	// move and sash echo their operand.
+	res, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"move","space":1}`), sess)
+	if code != "" || res != `{"space":1}` {
+		t.Fatalf("move = %q code %q", res, code)
+	}
+	if spy.calls[len(spy.calls)-1].op != vi.WmGeomOpMove ||
+		spy.calls[len(spy.calls)-1].arg != 1 {
+		t.Fatalf("move call = %+v", spy.calls[len(spy.calls)-1])
+	}
+	res, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"sash","percent":30}`), sess)
+	if code != "" || res != `{"percent":30}` {
+		t.Fatalf("sash = %q code %q", res, code)
+	}
+	if spy.calls[len(spy.calls)-1].op != vi.WmGeomOpSash ||
+		spy.calls[len(spy.calls)-1].arg != 30 {
+		t.Fatalf("sash call = %+v", spy.calls[len(spy.calls)-1])
+	}
+
+	// Refuse before touching: every malformed shape fails before a frame
+	// goes out — the spy count never moves.
+	n := len(spy.calls)
+	for _, tc := range []struct{ line, want string }{
+		{`{"id":1,"verb":"ui.geometry","op":"query"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":"0","op":"query"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"nope"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":0}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"query","space":1}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"move"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"move","percent":30}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"sash"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"sash","space":1}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"move","space":"1"}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"move","space":256}`, "bad_request"},
+		{`{"id":1,"verb":"ui.geometry","win":0,"op":"query","extra":1}`, "bad_request"},
+	} {
+		if _, code = dispatch(mustReq(t, tc.line), testSess(true, nil, allCaps...)); code != tc.want {
+			t.Fatalf("%s: code = %q want %q", tc.line, code, tc.want)
+		}
+		if len(spy.calls) != n {
+			t.Fatalf("%s sent a frame before refusing", tc.line)
+		}
+	}
+
+	// An index no strip row holds is win_geometry_no_window resolved
+	// locally; the seat's own refusal names surface verbatim; a bare
+	// applied=0 is seat_unsupported; silence is seat_timeout.
+	if _, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":9,"op":"query"}`), sess); code != vi.AgentGeomNoWindow {
+		t.Fatalf("absent index code = %q", code)
+	}
+	for _, tc := range []struct{ refuse, want string }{
+		{vi.AgentGeomDenied, vi.AgentGeomDenied},
+		{vi.AgentGeomNoWindow, vi.AgentGeomNoWindow},
+		{vi.AgentGeomBadOp, vi.AgentGeomBadOp},
+		{"unknown_name", "seat_unsupported"},
+	} {
+		spy.refuse = tc.refuse
+		if _, code = verbUIGeometry(mustReq(t,
+			`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), sess); code != tc.want {
+			t.Fatalf("refuse %q: code = %q want %q", tc.refuse, code, tc.want)
+		}
+	}
+	spy.refuse = ""
+	spy.bare = true
+	if _, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), sess); code != "seat_unsupported" {
+		t.Fatalf("bare refusal code = %q", code)
+	}
+	spy.bare = false
+	spy.silent = true
+	if _, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), sess); code != "seat_timeout" {
+		t.Fatalf("silent code = %q", code)
+	}
+	spy.silent = false
+	k.seatPid = 0
+	if _, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), sess); code != "seat_absent" {
+		t.Fatalf("no-seat code = %q", code)
+	}
+	k.seatPid = 3
+	k.wmErr = vi.ErrSeatSilent
+	if _, code = verbUIGeometry(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), sess); code != "seat_timeout" {
+		t.Fatalf("silent-strip code = %q", code)
+	}
+	k.wmErr = nil
+}
+
+// The split-cap rule: query is window-cap observation, move and sash are
+// the input drive grant — a window-only session queries and is refused
+// cap_required:input on either mutation, all before a frame goes out.
+func TestUIGeometryScope(t *testing.T) {
+	seamScope(t)
+	spy := &geomSpy{}
+	k := &fakeKernel{seatPid: 3,
+		wmRows: []vi.WmWindowRow{{Index: 0, ID: 100, Focused: true}}}
+	k.install()
+	spy.install()
+	winOnly := testSess(true, nil, "window")
+	if _, code := dispatch(mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`), winOnly); code != "" {
+		t.Fatalf("window-cap query code = %q", code)
+	}
+	for _, line := range []string{
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"move","space":1}`,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"sash","percent":30}`,
+	} {
+		_, code := dispatch(mustReq(t, line), winOnly)
+		if code != "cap_required:input" {
+			t.Fatalf("%s: code = %q want cap_required:input", line, code)
+		}
+	}
+	if len(spy.calls) != 1 {
+		t.Fatal("cap_required sent a geometry frame")
+	}
+	// A process-only session never reaches the verb at all — the static
+	// gate names window first.
+	for _, caps := range [][]string{{}, {"process"}, {"input"}} {
+		_, code := dispatch(mustReq(t,
+			`{"id":1,"verb":"ui.geometry","win":0,"op":"query"}`),
+			testSess(true, nil, caps...))
+		if code != "cap_required:window" {
+			t.Fatalf("caps %v: code = %q want cap_required:window", caps, code)
+		}
+	}
+	// The receipt names the op and its operand, never more.
+	req := mustReq(t,
+		`{"id":1,"verb":"ui.geometry","win":0,"op":"sash","percent":30}`)
+	args := auditArgs(req, `{"percent":30}`, "")
+	if !strings.Contains(args, `"win":0`) || !strings.Contains(args, `"op":"sash"`) ||
+		!strings.Contains(args, `"percent":30`) {
+		t.Fatalf("audit args = %q", args)
+	}
+}

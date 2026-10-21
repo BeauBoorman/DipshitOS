@@ -312,6 +312,17 @@ func auditArgs(req *request, result, code string) string {
 	if evs, present, ok := req.argArray("events"); present && ok {
 		num("events", int64(len(evs)))
 	}
+	// ui.geometry (card #2985): the op and its operand — win already
+	// landed above.
+	if op, present, ok := req.argStr("op"); present && ok {
+		str("op", clipStr(op, 16))
+	}
+	if sp, present, ok := req.argInt("space", 0, intMax); present && ok {
+		num("space", sp)
+	}
+	if pc, present, ok := req.argInt("percent", 0, intMax); present && ok {
+		num("percent", pc)
+	}
 	wroteSize := false
 	if body, present, ok := req.argStr("data_b64"); present && ok {
 		if data, dok := b64Decode(body); dok {

@@ -26,6 +26,12 @@
 # is #2977: ui.screenshot scale=1 streams the full 1280x720 RGB565 frame
 # through slot-88 12-row bands under a per-session 2 s rate bound, and
 # the spec's python diffs it downsampled against the scale=8 capture.
+# Run 17 is #2985: the `geom` journey — ui.geometry query over a two-pane
+# split (each answer diffed against the seat's `gotabwm: layout` lines),
+# sash percent=30, and move to space 1 over WM_RPC kind 30. Run 18 is
+# the `geom-deny` leg: watcher declares `window` only, so query serves
+# while move/sash refuse cap_required:input, and WMRPCPROBE.ELF's bound
+# kind-30 frame hears win_geometry_denied from the seat itself.
 #
 # The agent credentials are three pinned Ed25519 seeds; each reaches its
 # harness through $RUN_DIR/<agent>.key (agent id + seed hex, never argv)
@@ -72,6 +78,7 @@ vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
 vgate_file script-seat.txt <<'EOF'
+vf rm SESSION.TABS
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec GOTABWM.ELF
@@ -85,6 +92,22 @@ EOF
 vgate_file script-edit.txt <<'EOF'
 dui focus 0
 exec GOEDIT.ELF
+EOF
+
+# Run 17 needs two apps to split: both exec on the same trigger.
+vgate_file script-two.txt <<'EOF'
+dui focus 0
+exec GOCALC.ELF
+exec GOEDIT.ELF
+EOF
+
+# Run 18's deny leg: GOCALC is the query target, WMRPCPROBE is the
+# in-guest non-AGENTD sender whose bound kind-30 frame must hear
+# win_geometry_denied.
+vgate_file script-probe.txt <<'EOF'
+dui focus 0
+exec GOCALC.ELF
+exec WMRPCPROBE.ELF
 EOF
 
 vgate_file script-agentd.txt <<'EOF'
@@ -117,6 +140,7 @@ for name, cmd in (
     ("GOTABWM.ELF", "bash tools/go/build-gotabwm.sh"),
     ("GOCALC.ELF", "bash tools/go/build-gocalc.sh"),
     ("GOEDIT.ELF", "bash tools/go/build-goedit.sh"),
+    ("WMRPCPROBE.ELF", "bash tools/go/build-web.sh wmrpcprobe WMRPCPROBE"),
 ):
     src = os.path.join(".build", "go", name)
     if not os.path.isfile(src):
@@ -124,9 +148,11 @@ for name, cmd in (
     shutil.copy(src, os.path.join(share, name))
 # wm=none: the seat is exec'd explicitly (live-rfb pattern).
 open(os.path.join(share, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
-# The three pinned agents: devin holds every cap, viewer process only,
-# bobby is listed AND revoked (revocation wins over listing, ADR 0052 D1).
-SEEDS = {"devin": "0a" * 32, "viewer": "0b" * 32, "bobby": "0c" * 32}
+# The four pinned agents: devin holds every cap, viewer process only,
+# bobby is listed AND revoked (revocation wins over listing, ADR 0052 D1),
+# watcher window only (run 18's cap-split leg).
+SEEDS = {"devin": "0a" * 32, "viewer": "0b" * 32, "bobby": "0c" * 32,
+         "watcher": "0d" * 32}
 PUBS = {a: agentctl.ed_public_key(bytes.fromhex(s)).hex()
         for a, s in SEEDS.items()}
 agents_txt = (
@@ -135,6 +161,7 @@ agents_txt = (
     + "agent=viewer key=%s caps=process\n" % PUBS["viewer"]
     + "agent=bobby key=%s caps=file\n" % PUBS["bobby"]
     + "revoked=%s\n" % PUBS["bobby"]
+    + "agent=watcher key=%s caps=window\n" % PUBS["watcher"]
 )
 open(os.path.join(share, "AGENTS.TXT"), "w").write(agents_txt)
 # The pinned-vector secret (ASCII 'a5' x 32) app-bound to AGENTD.ELF and
@@ -809,3 +836,166 @@ if drift > TW * TH // 20:
     sys.exit("FAIL: downsample drifted on %d px" % drift)
 print("run-16 frame ok: %d B streamed, %d px drift" % (len(full), drift))
 PY
+
+# ---- 17: card #2985 — ui.geometry query/sash/move over kind 30 -----------------
+# devin holds window+input. GOCALC and GOEDIT exec together on the first
+# ui.windows marker; the journey splits the focused pane through
+# ui.input's ctrl+shift+v chord, queries both panes (each AGENTCTL geom
+# line is diffed against the seat's own `gotabwm: layout` below), sets
+# the sash to 30 %, and moves a window to space 1 — where ui.windows no
+# longer lists it. The reds land bad_request, win_geometry_bad_op and
+# win_geometry_no_window by name.
+vgate_run 17 -- \
+    --screen '$RUN_DIR/screen-17' \
+    --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=geom' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/devin.key' \
+    --net-tcp-connect-after 'agentd: listen 4747' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-agentd.txt' --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script-two.txt' --script3-after 'verb=ui.windows' \
+    --script-expect 'agentd: session end reason=client_close' \
+    --script-expect-tail 4 --timeout 300
+
+vgate_assert 17 serial-contains 'agentd: auth ok agent=devin'
+vgate_assert 17 serial-contains 'verb=ui.windows ok'
+vgate_assert 17 serial-contains 'verb=ui.input ok'
+vgate_assert 17 serial-contains 'verb=ui.geometry ok'
+vgate_assert 17 serial-contains 'gotabwm: win_geometry op=0 id='
+vgate_assert 17 serial-contains 'gotabwm: win_geometry op=2 id='
+vgate_assert 17 serial-contains 'gotabwm: win_geometry op=1 id='
+vgate_assert 17 serial-contains 'gotabwm: sash v from='
+vgate_assert 17 serial-contains 'gotabwm: space new name=2'
+vgate_assert 17 serial-contains 'gotabwm: space move '
+vgate_assert 17 serial-contains 'code=win_geometry_bad_op'
+vgate_assert 17 serial-contains 'code=win_geometry_no_window'
+vgate_assert 17 serial-contains 'code=bad_request'
+vgate_assert 17 output-contains 'AGENTCTL: PASS geom'
+vgate_assert 17 output-contains 'NET-TCP-STREAM: probe exited status=0'
+vgate_assert 17 serial-absent '0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a'
+vgate_assert 17 serial-absent '[EXC] parking:'
+
+# Every AGENTCTL geom line must name the rect the seat's own layout line
+# reports for the same window id — the query is the seat's geometry, not
+# a second opinion.
+vgate_assert 17 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+out = open(os.path.join(run, "run-17.out"), errors="replace").read()
+
+ser = None
+for name in ("vm-serial-17.log", "serial.log"):
+    p = os.path.join(run, name)
+    if os.path.isfile(p):
+        ser = open(p, errors="replace").read()
+        break
+if ser is None:
+    sys.exit("FAIL: no run-17 serial log in RUN_DIR")
+geom = re.findall(r"AGENTCTL: geom tab=(\d+) x=(\d+) y=(\d+) w=(\d+) h=(\d+)", out)
+if len(geom) < 4:
+    sys.exit("FAIL: too few geom lines: %r" % geom)
+for tab, x, y, w, h in geom:
+    want = ("gotabwm: layout tab=%s .*x=%s y=%s w=%s h=%s" % (tab, x, y, w, h))
+    if not re.search(want, ser):
+        sys.exit("FAIL: no layout line matching %r" % want)
+print("run-17 geometry matches the seat layout lines: %d queries" % len(geom))
+PY
+
+# The ui.geometry dispatches are receipted — the applied ops AND the
+# named refusals.
+vgate_assert 17 python <<'PY2'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir) if n.startswith("RCPT-"))
+if not names:
+    sys.exit("FAIL: no receipts in AGENT/AUDIT")
+KEY = b"a5" * 32
+seen = set()
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read().split(b"\n")
+    if len(body) != 3 or body[1] != hmac.new(KEY, body[0], hashlib.sha256).hexdigest().encode():
+        sys.exit("FAIL: receipt %s malformed or MAC-bad" % n)
+    r = json.loads(body[0])
+    seen.add((r.get("agent"), r.get("verb"), r.get("result")))
+for need in (
+    ("devin", "ui.geometry", "ok"),
+    ("devin", "ui.geometry", "win_geometry_bad_op"),
+    ("devin", "ui.geometry", "win_geometry_no_window"),
+    ("devin", "ui.geometry", "bad_request"),
+):
+    if need not in seen:
+        sys.exit("FAIL: no %r receipt; saw %r" % (need, sorted(seen)))
+print("run-17 audit ok: %d receipts incl. ui.geometry" % len(names))
+PY2
+
+# ---- 18: card #2985 — the cap split + the non-AGENTD sender --------------------
+# watcher declares `window` only: query serves (observation), move and
+# sash refuse cap_required:input (the M139b drive grant) before any
+# kind-30 frame. WMRPCPROBE.ELF is the in-guest non-AGENTD sender: its
+# bound kind-30 frame hears win_geometry_denied from the seat itself.
+vgate_run 18 -- \
+    --screen '$RUN_DIR/screen-18' \
+    --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=geom-deny' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/watcher.key' \
+    --net-tcp-connect-after 'agentd: listen 4747' \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-agentd.txt' --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script-probe.txt' --script3-after 'verb=ui.windows' \
+    --script-expect 'agentd: session end reason=client_close' \
+    --script-expect 'wmrpcprobe: auth probe ok' \
+    --script-expect-tail 4 --timeout 300
+
+vgate_assert 18 serial-contains 'agentd: auth ok agent=watcher'
+vgate_assert 18 serial-contains 'verb=ui.windows ok'
+vgate_assert 18 serial-contains 'verb=ui.geometry ok'
+vgate_assert 18 serial-count 'verb=ui.geometry code=cap_required' 2
+vgate_assert 18 serial-contains 'gotabwm: win_geometry op=0 id='
+vgate_assert 18 serial-contains 'win_geometry_denied'
+vgate_assert 18 serial-contains 'wmrpcprobe: win-geometry refused'
+vgate_assert 18 serial-contains 'wmrpcprobe: auth probe ok'
+vgate_assert 18 output-contains 'AGENTCTL: PASS geom-deny'
+vgate_assert 18 output-contains 'NET-TCP-STREAM: probe exited status=0'
+vgate_assert 18 serial-absent '0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d'
+vgate_assert 18 serial-absent '[EXC] parking:'
+
+# The watcher's dispatches are receipted too — query ok and both
+# cap_required:input refusals.
+vgate_assert 18 python <<'PY2'
+import hashlib, hmac, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = sorted(n for n in os.listdir(adir) if n.startswith("RCPT-"))
+if not names:
+    sys.exit("FAIL: no receipts in AGENT/AUDIT")
+KEY = b"a5" * 32
+seen = set()
+cap_recs = []
+for n in names:
+    body = open(os.path.join(adir, n), "rb").read().split(b"\n")
+    if len(body) != 3 or body[1] != hmac.new(KEY, body[0], hashlib.sha256).hexdigest().encode():
+        sys.exit("FAIL: receipt %s malformed or MAC-bad" % n)
+    r = json.loads(body[0])
+    seen.add((r.get("agent"), r.get("verb"), r.get("result")))
+    if (r.get("agent"), r.get("verb"), r.get("result")) == (
+            "watcher", "ui.geometry", "cap_required:input"):
+        cap_recs.append(r)
+for need in (
+    ("watcher", "ui.geometry", "ok"),
+    ("watcher", "ui.geometry", "cap_required:input"),
+):
+    if need not in seen:
+        sys.exit("FAIL: no %r receipt; saw %r" % (need, sorted(seen)))
+if len(cap_recs) != 2:
+    sys.exit("FAIL: want exactly 2 cap_required:input receipts; saw %r" % sorted(seen))
+print("run-18 audit ok: %d receipts incl. the cap split" % len(names))
+PY2

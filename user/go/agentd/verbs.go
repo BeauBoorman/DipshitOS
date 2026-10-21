@@ -31,6 +31,7 @@ var (
 	scanoutFn       = vi.ScanoutRead
 	agentInputKeyFn = vi.WmAgentInputKey
 	agentInputPtrFn = vi.WmAgentInputPtr
+	agentGeomFn     = vi.WmAgentGeometry
 	secretGetFn     = shlib.StoreGet
 	principalFn     = vi.Principal
 	randomFn        = vi.Random
@@ -104,7 +105,10 @@ type sessionCtx struct {
 // may only read the desktop must not get to drive it (M139b) — and
 // gosh.run takes `term` (AND-ed with --allow-exec inside the verb — the
 // daemon flag is the operator's kill switch, the cap is the per-agent
-// grant).
+// grant). ui.geometry (card #2985) splits the same rule BY OP: the verb
+// gate is `window` so a read-only observer can query, and the verb
+// itself refuses move/sash cap_required:input before touching the seat —
+// they drive the desktop, so they take the drive grant.
 var verbCap = map[string]string{
 	"proc.list":     "process",
 	"proc.get":      "process",
@@ -113,13 +117,14 @@ var verbCap = map[string]string{
 	"ui.windows":    "window",
 	"ui.screenshot": "window",
 	"ui.input":      "input",
+	"ui.geometry":   "window",
 	"gosh.run":      "term",
 }
 
 // allVerbs is the D3 verb set in declaration order, for the ready line.
 var allVerbs = []string{
 	"proc.list", "proc.get", "fs.read", "fs.write",
-	"ui.windows", "ui.screenshot", "ui.input", "gosh.run",
+	"ui.windows", "ui.screenshot", "ui.input", "ui.geometry", "gosh.run",
 }
 
 // advertisedVerbs is the session's resolved grant set: a verb appears
@@ -189,6 +194,11 @@ func dispatch(req *request, sess *sessionCtx) (string, string) {
 			return "", "bad_request"
 		}
 		return verbUIInput(req)
+	case "ui.geometry":
+		if !req.hasArgs("win", "op", "space", "percent") {
+			return "", "bad_request"
+		}
+		return verbUIGeometry(req, sess)
 	case "gosh.run":
 		if !req.hasArgs("cmd", "timeout_ms") {
 			return "", "bad_request"
@@ -828,6 +838,157 @@ func verbUIInput(req *request) (string, string) {
 		sent++
 	}
 	return `{"sent":` + vi.Itoa64(int64(sent)) + `}`, ""
+}
+
+// --- ui.geometry ----------------------------------------------------------------
+
+// Card #2985 (ADR 0044 D5c): ui.geometry {win, op, space?|percent?}
+// arranges the desktop the way the seat arranges it, over WM_RPC kind
+// 30. `win` is the strip index ui.windows reports; the verb resolves it
+// to the kernel window id through the same kind-16 query ui.input uses
+// for its focus check. `op` is one of:
+//
+//   - "query" — where the window is: `{"space":N,"pane":N|null,
+//     "split":"none"|"h"|"v","rect":{"x":N,"y":N,"w":N,"h":N}}`. The
+//     `window` cap serves it — same grant as ui.windows.
+//   - "move" — `space`: space index; the tab joins that space's strip
+//     (creating it at the seat's own cap). `{"space":N}`.
+//   - "sash" — `percent`: the window's parent split's divider at 10-90 %
+//     of its rect. `{"percent":N}`.
+//
+// move and sash take the `input` cap — they drive the desktop, so the
+// M139b rule applies; the refusal names cap_required:input before the
+// verb touches the seat. The seat's own refusal names surface verbatim
+// (win_geometry_denied / win_geometry_no_window / win_geometry_bad_op);
+// a bare applied=0 is seat_unsupported, silence is seat_timeout, and an
+// index no strip row holds is win_geometry_no_window resolved here.
+func verbUIGeometry(req *request, sess *sessionCtx) (string, string) {
+	win, present, ok := req.argInt("win", 0, intMax)
+	if !present || !ok {
+		return "", "bad_request"
+	}
+	op, present, ok := req.argStr("op")
+	if !present || !ok {
+		return "", "bad_request"
+	}
+	var opCode uint8
+	switch op {
+	case "query":
+		opCode = vi.WmGeomOpQuery
+	case "move":
+		opCode = vi.WmGeomOpMove
+	case "sash":
+		opCode = vi.WmGeomOpSash
+	default:
+		return "", "bad_request"
+	}
+	// The cap gate runs before the op's own args are weighed, the same
+	// order dispatch uses — a session without the drive grant learns
+	// cap_required:input, not which field was malformed.
+	if opCode != vi.WmGeomOpQuery && !sess.caps["input"] {
+		return "", "cap_required:input"
+	}
+	space, spPresent, spOK := req.argInt("space", 0, 255)
+	pct, pcPresent, pcOK := req.argInt("percent", 0, 255)
+	if !spOK || !pcOK {
+		return "", "bad_request"
+	}
+	var arg uint8
+	switch opCode {
+	case vi.WmGeomOpQuery:
+		if spPresent || pcPresent {
+			return "", "bad_request"
+		}
+	case vi.WmGeomOpMove:
+		if !spPresent || pcPresent {
+			return "", "bad_request"
+		}
+		arg = uint8(space)
+	case vi.WmGeomOpSash:
+		if !pcPresent || spPresent {
+			return "", "bad_request"
+		}
+		arg = uint8(pct)
+	}
+	if seatPidFn() <= 0 {
+		return "", "seat_absent"
+	}
+	if agentWindow < 0 {
+		id, raw := winOpenFn(0, 0, 128, 64)
+		if id < 0 || raw < 0 {
+			return "", "seat_unsupported"
+		}
+		_ = winHideFn(id, false)
+		agentWindow = id
+	}
+	rows, err := wmWindowsFn(uint32(agentWindow), appName)
+	if err != nil {
+		if err == vi.ErrSeatUnsupported {
+			return "", "seat_unsupported"
+		}
+		return "", "seat_timeout"
+	}
+	var target uint32
+	found := false
+	for i := range rows {
+		if int64(rows[i].Index) == win {
+			target = rows[i].ID
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", vi.AgentGeomNoWindow
+	}
+	rep, answered := agentGeomFn(uint32(agentWindow), opCode, target, arg, appName)
+	if !answered {
+		return "", "seat_timeout"
+	}
+	if rep.Applied == 0 {
+		switch rep.TitleString() {
+		case vi.AgentGeomDenied, vi.AgentGeomNoWindow, vi.AgentGeomBadOp:
+			return "", rep.TitleString()
+		}
+		return "", "seat_unsupported"
+	}
+	switch opCode {
+	case vi.WmGeomOpMove:
+		return `{"space":` + vi.Itoa64(int64(arg)) + `}`, ""
+	case vi.WmGeomOpSash:
+		return `{"percent":` + vi.Itoa64(int64(arg)) + `}`, ""
+	}
+	v, ok := vi.WmGeomDecode(rep)
+	if !ok {
+		return "", "seat_unsupported"
+	}
+	var sb strings.Builder
+	sb.WriteString(`{"space":`)
+	sb.WriteString(vi.Itoa64(int64(v.Space)))
+	sb.WriteString(`,"pane":`)
+	if v.Pane == vi.WmGeomUnplaced {
+		sb.WriteString("null")
+	} else {
+		sb.WriteString(vi.Itoa64(int64(v.Pane)))
+	}
+	sb.WriteString(`,"split":`)
+	switch v.Split {
+	case 1:
+		jwriteStr(&sb, "h")
+	case 2:
+		jwriteStr(&sb, "v")
+	default:
+		jwriteStr(&sb, "none")
+	}
+	sb.WriteString(`,"rect":{"x":`)
+	sb.WriteString(vi.Itoa64(int64(v.X)))
+	sb.WriteString(`,"y":`)
+	sb.WriteString(vi.Itoa64(int64(v.Y)))
+	sb.WriteString(`,"w":`)
+	sb.WriteString(vi.Itoa64(int64(v.W)))
+	sb.WriteString(`,"h":`)
+	sb.WriteString(vi.Itoa64(int64(v.H)))
+	sb.WriteString(`}}`)
+	return sb.String(), ""
 }
 
 // --- gosh.run -------------------------------------------------------------------

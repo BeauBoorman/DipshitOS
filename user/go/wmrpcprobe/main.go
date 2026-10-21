@@ -152,6 +152,18 @@ func main() {
 	}
 	vi.ConsoleLine("wmrpcprobe: agent-input refused")
 
+	// Card #2985 (ADR 0044 D5c): kind 30 is AGENTD-only the same way —
+	// a bound honest sender still hears win_geometry_denied.
+	var geomTitle [vi.WmRpcTitleMax]byte
+	geomTitle[0] = 0 // op query
+	geomTitle[1] = byte(id)
+	geomTitle[2] = byte(uint16(id) >> 8)
+	if vi.WmMailRequest(30, uint32(id), 0, 0, 0, 0,
+		string(geomTitle[:]), selfName) {
+		fail("win_geometry applied from a non-AGENTD sender")
+	}
+	vi.ConsoleLine("wmrpcprobe: win-geometry refused")
+
 	vi.ConsoleLine("wmrpcprobe: auth probe ok")
 	vi.Exit(0)
 }

@@ -384,6 +384,17 @@ func serviceRPC() int {
 				served++
 				continue
 			}
+			// Kind 30 (win_geometry, ADR 0044 D5c, card #2985) binds the
+			// same way — the bound window's ownership proof IS the grant
+			// half — then the AGENTD principal check runs inside
+			// serveAgentGeom. Its ack carries the refusal name or the
+			// query payload on the title, so it answers itself like the
+			// other agent kinds.
+			if req.Kind == wmKindAgentGeom {
+				serveAgentGeom(req, auth)
+				served++
+				continue
+			}
 		}
 		applied := false
 		if apply {

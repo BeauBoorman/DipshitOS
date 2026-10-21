@@ -998,6 +998,247 @@ def journey_unknown(s, cred):
     return [("greeting", handshake), ("unknown", refused)]
 
 
+def journey_geom(s, cred):
+    """Card #2985 (ADR 0044 D5c): ui.geometry query/sash/move over WM_RPC
+    kind 30. The gate stages GOCALC and GOEDIT together after the first
+    ui.windows request; the split itself is driven through ui.input's
+    ctrl+shift+v chord, so two panes exist to query. Every applied query
+    prints an AGENTCTL geom line the spec's python leg diffs against the
+    seat's own `gotabwm: layout` lines.
+    """
+    rows_by_index = {}
+    by_pane = []
+
+    def windows_rows():
+        res = s.call("ui.windows")
+        if res.get("seat") != "gotabwm":
+            raise Fail("seat is not gotabwm")
+        rows = res.get("windows") or []
+        rows_by_index.clear()
+        for r in rows:
+            rows_by_index[r.get("index")] = r.get("id")
+        return rows
+
+    def handshake():
+        verbs = s.connect(cred[0], cred[1])
+        for v in ("ui.windows", "ui.input", "ui.geometry"):
+            if v not in verbs:
+                raise Fail("missing advertised verb " + v)
+        for c in ("window", "input"):
+            if c not in s.caps:
+                raise Fail("missing declared cap " + c)
+
+    def ui_windows():
+        # Poll until both staged apps register and exactly one row holds
+        # focus — the predicate journey_input's own Edit wait documents.
+        # The first call can race the seat's own bring-up: a named refusal
+        # (seat_unsupported/timeout) is a keep-polling condition, not a
+        # failure — same as wait_for_app's Refused handling.
+        deadline = time.monotonic() + UI_WAIT
+        last = "empty window list"
+        while True:
+            try:
+                rows = windows_rows()
+            except Refused as r:
+                rows = []
+                last = "refused " + r.code
+            titles = {r.get("title") for r in rows}
+            focused = [r for r in rows if r.get("focused") is True]
+            if {"Calc", "Edit"} <= titles and len(focused) == 1:
+                return
+            last = "%r" % (rows or last)
+            if time.monotonic() >= deadline:
+                raise Fail("ui.windows never showed Calc+Edit: %s" % last)
+            time.sleep(1)
+
+    def geom_query(tag, index, space=None, split=None, pane=None):
+        res = s.call("ui.geometry", win=index, op="query")
+        if space is not None and res.get("space") != space:
+            raise Fail("%s: space=%r want %r" % (tag, res.get("space"), space))
+        if split is not None and res.get("split") != split:
+            raise Fail("%s: split=%r want %r" % (tag, res.get("split"), split))
+        if pane is not None and res.get("pane") != pane:
+            raise Fail("%s: pane=%r want %r" % (tag, res.get("pane"), pane))
+        rect = res.get("rect") or {}
+        note("geom tab=%s x=%s y=%s w=%s h=%s" % (
+            rows_by_index.get(index), rect.get("x"), rect.get("y"),
+            rect.get("w"), rect.get("h")))
+        return rect
+
+    def geom_query_pre():
+        # No note() here: an unplaced tab restored by the session has no
+        # layout-dump line for this rect — the spec's python diffs only
+        # notes that fresh apply paths (split/sash) always dump.
+        res = s.call("ui.geometry", win=0, op="query")
+        if (res.get("space"), res.get("split"), res.get("pane")) != (0, "none", None):
+            raise Fail("pre-split view = %r" % res)
+        if (res.get("rect") or {}) != {"x": 0, "y": 0, "w": 1280, "h": 720}:
+            raise Fail("pre-split rect = %r want the full viewport" % res)
+
+    def geom_split():
+        # ctrl+shift+v on the focused pane — the seat's split-cycle
+        # chord through the kind-29 path — makes two v-split panes.
+        focused = [r.get("index") for r in windows_rows()
+                   if r.get("focused") is True]
+        res = s.call("ui.input", win=focused[0],
+                     events=[{"type": "key", "usage": 0x19, "mods": 3}])
+        if res.get("sent") != 1:
+            raise Fail("split chord sent %r events" % res.get("sent"))
+
+    def geom_query_panes():
+        # Pane index is PaneRectsAll (tree) order, NOT strip index — and
+        # session restore may have resurrected older tabs, so neither
+        # strip index nor tab count is ours to assume. Query every row,
+        # keep the two that report a v-split leaf, and assert the pane
+        # geometry: pane 0 is the left child (x=0, w=640), pane 1 the
+        # right (x=640, w=640) of the midpoint split.
+        deadline = time.monotonic() + 30
+        by_pane = None
+        while True:
+            by_pane = {}
+            for r in windows_rows():
+                index = r.get("index")
+                res = s.call("ui.geometry", win=index, op="query")
+                if res.get("split") == "v" and res.get("space") == 0:
+                    by_pane[res.get("pane")] = (
+                        index, res.get("rect") or {})
+            if (sorted(by_pane) == [0, 1]
+                    and by_pane[0][1] == {"x": 0, "y": 0, "w": 640, "h": 720}
+                    and by_pane[1][1] == {"x": 640, "y": 0, "w": 640, "h": 720}):
+                for pane in (0, 1):
+                    index, r = by_pane[pane]
+                    note("geom tab=%s x=%s y=%s w=%s h=%s" % (
+                        rows_by_index.get(index), r.get("x"), r.get("y"),
+                        r.get("w"), r.get("h")))
+                return by_pane
+            if time.monotonic() >= deadline:
+                raise Fail("split panes never settled: %r" % (by_pane,))
+            time.sleep(1)
+
+    def geom_sash(by_pane):
+        # sash on the window sitting in pane 0 (the left child) — 30 %
+        # of the root's 1280-px rect centres the 6-px gutter at x=384:
+        # pane 0 lands at 381, pane 1 at x=387 w=893.
+        index0, index1 = by_pane[0][0], by_pane[1][0]
+        res = s.call("ui.geometry", win=index0, op="sash", percent=30)
+        if res.get("percent") != 30:
+            raise Fail("sash result = %r" % res)
+        deadline = time.monotonic() + 30
+        while True:
+            views = {}
+            for index in (index0, index1):
+                res = s.call("ui.geometry", win=index, op="query")
+                views[res.get("pane")] = res.get("rect") or {}
+            if (views.get(0) == {"x": 0, "y": 0, "w": 381, "h": 720}
+                    and views.get(1) == {"x": 387, "y": 0, "w": 893, "h": 720}):
+                for index in (index0, index1):
+                    r = s.call("ui.geometry", win=index, op="query").get("rect") or {}
+                    note("geom tab=%s x=%s y=%s w=%s h=%s" % (
+                        rows_by_index.get(index), r.get("x"), r.get("y"),
+                        r.get("w"), r.get("h")))
+                return
+            if time.monotonic() >= deadline:
+                raise Fail("sash 30 produced %r want 381|893" % (views,))
+            time.sleep(1)
+
+    def geom_move(by_pane):
+        index, _ = by_pane[1]
+        moved_id = rows_by_index.get(index)
+        res = s.call("ui.geometry", win=index, op="move", space=1)
+        if res.get("space") != 1:
+            raise Fail("move result = %r" % res)
+        rows = windows_rows()
+        if moved_id in {r.get("id") for r in rows}:
+            raise Fail("moved window still listed on space 0: %r" % rows)
+
+    def geom_reds():
+        for args, code in (
+            ({"win": 0, "op": "nope"}, "bad_request"),
+            ({"win": 0, "op": "query", "space": 1}, "bad_request"),
+            ({"win": 0, "op": "move"}, "bad_request"),
+            ({"win": 0, "op": "sash"}, "bad_request"),
+            ({"win": 0, "op": "move", "space": 9}, "win_geometry_bad_op"),
+            ({"win": 0, "op": "move", "space": 0}, "win_geometry_bad_op"),
+            ({"win": 0, "op": "sash", "percent": 5}, "win_geometry_bad_op"),
+            ({"win": 0, "op": "sash", "percent": 95}, "win_geometry_bad_op"),
+            ({"win": 99, "op": "query"}, "win_geometry_no_window"),
+            ({"win": 99, "op": "move", "space": 1}, "win_geometry_no_window"),
+        ):
+            expect_refused(lambda a=args: s.call("ui.geometry", **a), code)
+
+    return [
+        ("handshake", handshake),
+        ("ui.windows", ui_windows),
+        ("geom-query-pre", geom_query_pre),
+        ("geom-split", geom_split),
+        ("geom-query-panes",
+         lambda: by_pane.append(geom_query_panes())),
+        ("geom-sash", lambda: geom_sash(by_pane[0])),
+        ("geom-move", lambda: geom_move(by_pane[0])),
+        ("geom-reds", geom_reds),
+    ]
+
+
+def journey_geom_deny(s, cred):
+    """Card #2985: the cap split. watcher holds `window` only — query is
+    observation and serves; move and sash drive the desktop and refuse
+    cap_required:input before any kind-30 frame. The gate's wmrpcprobe
+    leg proves the seat's own AGENTD-only principal check in parallel.
+    """
+    calc = {}
+
+    def handshake():
+        verbs = s.connect(cred[0], cred[1])
+        if sorted(verbs) != ["ui.geometry", "ui.screenshot", "ui.windows"]:
+            raise Fail("window-only session advertised verbs %r" % verbs)
+        if s.caps != ["window"]:
+            raise Fail("caps did not resolve to [window]: %r" % s.caps)
+
+    def ui_windows():
+        deadline = time.monotonic() + UI_WAIT
+        while True:
+            try:
+                res = s.call("ui.windows")
+            except Refused as r:
+                res = None
+            if res is not None:
+                rows = res.get("windows") or []
+                for r in rows:
+                    if r.get("title") == "Calc":
+                        calc["index"] = r.get("index")
+                        return
+            if time.monotonic() >= deadline:
+                raise Fail("ui.windows never showed a Calc row")
+            time.sleep(1)
+
+    def geom_query_ok():
+        res = s.call("ui.geometry", win=calc["index"], op="query")
+        if res.get("space") != 0 or "rect" not in res:
+            raise Fail("window-cap query = %r" % res)
+
+    def geom_denies():
+        for op, extra in (("move", {"space": 1}), ("sash", {"percent": 30})):
+            try:
+                s.call("ui.geometry", win=calc["index"], op=op, **extra)
+                raise Fail("%s ran without the input cap" % op)
+            except Refused as r:
+                if r.code != "cap_required" or "input" not in r.message:
+                    raise Fail("%s refused %s (%s), want cap_required:input"
+                               % (op, r.code, r.message))
+        # The two identical refusals must receipt twice — the spec counts.
+
+    def geom_query_still_ok():
+        geom_query_ok()
+
+    return [
+        ("handshake", handshake),
+        ("ui.windows", ui_windows),
+        ("geom-query-ok", geom_query_ok),
+        ("geom-denies", geom_denies),
+        ("geom-query-still-ok", geom_query_still_ok),
+    ]
+
+
 JOURNEYS = {
     "full": journey_full,
     "badsig": journey_badsig,
@@ -1009,6 +1250,8 @@ JOURNEYS = {
     "shot": journey_shot,
     "revoked": journey_revoked,
     "unknown": journey_unknown,
+    "geom": journey_geom,
+    "geom-deny": journey_geom_deny,
 }
 
 # Journeys that must exit nonzero after PASS. The runner turns a nonzero
