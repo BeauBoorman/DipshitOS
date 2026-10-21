@@ -306,8 +306,13 @@ pub fn build(b: *std.Build) void {
 
     // ------------------------------------------------------------------
     // Guest: EL0EXEC.BIN (issue #1333) — class-B proof that EL0 sys_exec
-    // returns to the caller. Flat DSK1 (Zig frames on the kernel-provided
-    // EL0 stack; no writable image globals). Not a GUI app (ADR 0030).
+    // returns to the caller. Segmented DSK3 (M133d #2758 fixup): the fuzz
+    // (#1466) and oom (#2755) argv modes grew the flat image past the
+    // text-page argv-block budget — `block_off + arg_block_bytes` no
+    // longer fit the last content page, so every `exec EL0EXEC.BIN <arg>`
+    // refused `no_args_room` before reaching _start. The DSK3 argv tail
+    // lives in the writable data segment and has no such squeeze.
+    // Not a GUI app (ADR 0030).
     // ------------------------------------------------------------------
     const el0exec_prog = b.addExecutable(.{
         .name = "user-el0exec",
@@ -317,9 +322,9 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSmall,
         }),
     });
-    el0exec_prog.linker_script = b.path("user/linker.ld");
+    el0exec_prog.linker_script = b.path("user/linker-segmented.ld");
     const el0exec_step = b.step("el0exec", "Build the EL0 sys_exec caller-survival fixture (zig-out/bin/EL0EXEC.BIN; #1333)");
-    const el0exec_elf2bin = b.addSystemCommand(&.{ "python3", "tools/elf2bin.py" });
+    const el0exec_elf2bin = b.addSystemCommand(&.{ "python3", "tools/elf2bin.py", "--segments" });
     el0exec_elf2bin.addFileArg(el0exec_prog.getEmittedBin());
     const el0exec_bin = el0exec_elf2bin.addOutputFileArg("EL0EXEC.BIN");
     el0exec_elf2bin.has_side_effects = true;

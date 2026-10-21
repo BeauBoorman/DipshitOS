@@ -910,7 +910,12 @@ fn handle_enosys(_: Args, _: *exceptions.VectorFrame) u64 {
 fn handle_setrlimit(args: Args, _: *exceptions.VectorFrame) u64 {
     const rtype = args[0];
     const value = args[1];
-    const current_pid = process.current() orelse return error_result(.eacces);
+    // The caller's process, resolved like every other self-only handler —
+    // `process.current()` is the LAST-CREATED descriptor, not the calling
+    // task's process: under concurrent exec churn a self-only limit used
+    // to land on an unrelated fresh process (M133d #2758: an `oom` child
+    // armed a GOSTORM's mem_limit, which then reaped status=140).
+    const current_pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.eacces);
     if (process.setrlimit(current_pid, rtype, value)) {
         return 0;
     }

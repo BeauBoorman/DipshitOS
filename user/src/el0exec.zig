@@ -53,6 +53,13 @@ const map_populate: u64 = 0x8000;
 const slot_count: u64 = 128;
 const past_namespace: u64 = 64;
 const arg_slot_bytes: usize = 256;
+
+// The one writable image global: staging for the USER.BIN child's argv
+// block (default and fuzz paths share it — sequential use, one thread).
+// Beyond deduplicating two stack copies, it keeps a .bss page in the
+// image, which is what the segmented (DSK3) build needs for a writable
+// data segment — the argv tail packs there (M133d #2758 fixup).
+var child_arg_block: [arg_slot_bytes]u8 = @as([arg_slot_bytes]u8, @splat(@as(u8, 0)));
 const unmapped: u64 = 0x1_2000_0000;
 
 /// Same roster as `kernel/tests/fuzz_test.zig` (M70a D1).
@@ -326,9 +333,8 @@ fn spawn_phase(violations: *usize) void {
 
     const child = "USER.BIN";
     const arg = "alpha";
-    var block: [arg_slot_bytes]u8 = @as([arg_slot_bytes]u8, @splat(@as(u8, 0)));
-    @memcpy(block[0..arg.len], arg);
-    const pid = svc4(sys_exec, @intFromPtr(child.ptr), child.len, @intFromPtr(&block), 1);
+    @memcpy(child_arg_block[0..arg.len], arg);
+    const pid = svc4(sys_exec, @intFromPtr(child.ptr), child.len, @intFromPtr(&child_arg_block), 1);
     if (pid < 0) {
         write(exec_failed_marker);
         violations.* += 1;
@@ -428,7 +434,9 @@ fn oom_refuse() noreturn {
             exit(0);
         }
         if (r <= 0) {
-            write(oom_mmap_fail_marker);
+            var buf: [64]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "oom: mmap unexpected i={d} r={d}\n", .{ i, r }) catch oom_mmap_fail_marker;
+            write(line);
             exit(1);
         }
     }
@@ -481,9 +489,8 @@ fn run() noreturn {
 
     const child = "USER.BIN";
     const arg = "alpha";
-    var block: [arg_slot_bytes]u8 = @as([arg_slot_bytes]u8, @splat(@as(u8, 0)));
-    @memcpy(block[0..arg.len], arg);
-    const pid = svc4(sys_exec, @intFromPtr(child.ptr), child.len, @intFromPtr(&block), 1);
+    @memcpy(child_arg_block[0..arg.len], arg);
+    const pid = svc4(sys_exec, @intFromPtr(child.ptr), child.len, @intFromPtr(&child_arg_block), 1);
     if (pid < 0) {
         write(exec_failed_marker);
         exit(2);
