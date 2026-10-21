@@ -3724,18 +3724,98 @@ var wm_fwd_prev_buttons: u8 = 0;
 var wm_fwd_prev_x: u32 = 0;
 var wm_fwd_prev_y: u32 = 0;
 
+// #2878: the window-delivery half of one pointer sample — MOUSE_MOVE /
+// MOUSE_DOWN / MOUSE_UP / MOUSE_RIGHT_DOWN / MOUSE_RIGHT_UP to the hit
+// user window's owner, in window-local coords. One body for both input
+// environments: pointer_tick calls it on the raw stream (shim — the #9228
+// delivery, unchanged), and wm_content_pointer calls it on the seat's
+// forwarded stream — under wm_owns_input pointer_tick returns before its
+// local delivery, so this is the only pointer input a seat-hosted app
+// ever sees (previously nothing was pushed there at all: keys+lifecycle
+// only). `flags` rides move/down samples; `up_flags` carries the released
+// button's own bit — on the release sample the live button state is
+// already 0, so flags-from-buttons alone reported flags=0 on every
+// MOUSE_UP and no app could identify the released button (#2878 Gap 1:
+// gosol's BtnLeft-gated up()/drop was unreachable).
+fn deliver_window_pointer(
+    nx: u32,
+    ny: u32,
+    moved: bool,
+    left_pressed: bool,
+    left_released: bool,
+    right_pressed: bool,
+    right_released: bool,
+    flags: u16,
+    up_flags: u16,
+) void {
+    const hit_id = hit_test(nx, ny) orelse return;
+    const w = find_user_window(hit_id) orelse return;
+    const owner_pid = w.owner orelse return;
+    const local_x: u32 = if (nx >= w.x) @min(nx - w.x, w.w - 1) else 0;
+    const local_y: u32 = if (ny >= w.y) @min(ny - w.y, w.h - 1) else 0;
+    if (moved) {
+        events.push(owner_pid, .{
+            .kind = events.MOUSE_MOVE,
+            .flags = flags,
+            .seq = 0,
+            .arg0 = local_x,
+            .arg1 = local_y,
+        });
+    }
+    if (left_pressed) {
+        events.push(owner_pid, .{
+            .kind = events.MOUSE_DOWN,
+            .flags = flags,
+            .seq = 0,
+            .arg0 = local_x,
+            .arg1 = local_y,
+        });
+    }
+    if (left_released) {
+        events.push(owner_pid, .{
+            .kind = events.MOUSE_UP,
+            .flags = up_flags,
+            .seq = 0,
+            .arg0 = local_x,
+            .arg1 = local_y,
+        });
+    }
+    if (right_pressed) {
+        events.push(owner_pid, .{
+            .kind = events.MOUSE_RIGHT_DOWN,
+            .flags = flags,
+            .seq = 0,
+            .arg0 = local_x,
+            .arg1 = local_y,
+        });
+    }
+    if (right_released) {
+        events.push(owner_pid, .{
+            .kind = events.MOUSE_RIGHT_UP,
+            .flags = up_flags,
+            .seq = 0,
+            .arg0 = local_x,
+            .arg1 = local_y,
+        });
+    }
+}
+
 /// #1688 (slot-65 cmd 15, wm_server.wmctl_content_ptr): the registered
 /// seat forwarded one pointer sample for the kernel's LOCAL content path —
 /// terminal text selection and mouse-tracking reports. Chrome the seat
 /// consumed (start surface, rail, launcher) is never forwarded, so this
 /// entry only ever sees content coordinates. Dormant with no seat: kernel
 /// terminal selection stays exactly where WMS5 left it.
+/// #2878 (Gap 2): the forwarded sample now ALSO delivers window pointer
+/// events to the hit user window — under the seat this is a hosted app's
+/// whole pointer input.
 pub fn wm_content_pointer(x: u32, y: u32, buttons: u8) void {
     if (!wm_owns_input) return;
+    const prev_buttons = wm_fwd_prev_buttons;
     const cur_left = (buttons & 0x01) != 0;
     const cur_right = (buttons & 0x02) != 0;
-    const prev_left = (wm_fwd_prev_buttons & 0x01) != 0;
-    const prev_right = (wm_fwd_prev_buttons & 0x02) != 0;
+    const prev_left = (prev_buttons & 0x01) != 0;
+    const prev_right = (prev_buttons & 0x02) != 0;
     const moved = (x != wm_fwd_prev_x or y != wm_fwd_prev_y);
     wm_fwd_prev_buttons = buttons;
     wm_fwd_prev_x = x;
@@ -3751,6 +3831,19 @@ pub fn wm_content_pointer(x: u32, y: u32, buttons: u8) void {
         (prev_left and !cur_left),
         (prev_right and !cur_right),
         false, // the seat consumed chrome; no local press latch applies
+    );
+    const flags = mouse_buttons_to_flags(buttons) |
+        input.hid_modifiers_to_flags(input.report().kb_mods);
+    deliver_window_pointer(
+        x,
+        y,
+        moved,
+        (!prev_left and cur_left),
+        (prev_left and !cur_left),
+        (!prev_right and cur_right),
+        (prev_right and !cur_right),
+        flags,
+        flags | mouse_buttons_to_flags(prev_buttons & ~buttons),
     );
 }
 
@@ -4094,61 +4187,23 @@ pub fn pointer_tick(st: input.PointerState, click: ?input.Click) ?u8 {
             // Clear after the target reads or on a new sys_drag_start.
         }
 
-        // Deliver pointer events to hit user window
-        if (hit_test(cursor_x, cursor_y)) |hit_id| {
-            if (find_user_window(hit_id)) |w| {
-                if (w.owner) |owner_pid| {
-                    const local_x: u32 = if (cursor_x >= w.x) @min(cursor_x - w.x, w.w - 1) else 0;
-                    const local_y: u32 = if (cursor_y >= w.y) @min(cursor_y - w.y, w.h - 1) else 0;
-
-                    if (moved) {
-                        events.push(owner_pid, .{
-                            .kind = events.MOUSE_MOVE,
-                            .flags = all_flags,
-                            .seq = 0,
-                            .arg0 = local_x,
-                            .arg1 = local_y,
-                        });
-                    }
-                    if (left_pressed) {
-                        events.push(owner_pid, .{
-                            .kind = events.MOUSE_DOWN,
-                            .flags = all_flags,
-                            .seq = 0,
-                            .arg0 = local_x,
-                            .arg1 = local_y,
-                        });
-                    }
-                    if (left_released) {
-                        events.push(owner_pid, .{
-                            .kind = events.MOUSE_UP,
-                            .flags = all_flags,
-                            .seq = 0,
-                            .arg0 = local_x,
-                            .arg1 = local_y,
-                        });
-                    }
-                    if (right_pressed) {
-                        events.push(owner_pid, .{
-                            .kind = events.MOUSE_RIGHT_DOWN,
-                            .flags = all_flags,
-                            .seq = 0,
-                            .arg0 = local_x,
-                            .arg1 = local_y,
-                        });
-                    }
-                    if (right_released) {
-                        events.push(owner_pid, .{
-                            .kind = events.MOUSE_RIGHT_UP,
-                            .flags = all_flags,
-                            .seq = 0,
-                            .arg0 = local_x,
-                            .arg1 = local_y,
-                        });
-                    }
-                }
-            }
-        }
+        // Deliver pointer events to hit user window. #2878 (Gap 1): the up
+        // events also carry the released button's own bit — on the release
+        // sample st.buttons is already 0, so all_flags alone made every
+        // MOUSE_UP flags=0 (gosol's BtnLeft-gated up()/drop was dead code).
+        const up_flags = all_flags |
+            mouse_buttons_to_flags(prev_ptr_buttons & ~st.buttons);
+        deliver_window_pointer(
+            cursor_x,
+            cursor_y,
+            moved,
+            left_pressed,
+            left_released,
+            right_pressed,
+            right_released,
+            all_flags,
+            up_flags,
+        );
 
         prev_ptr_buttons = st.buttons;
     }
@@ -6557,6 +6612,103 @@ test "wm content forward: ?1002 keeps the whole gesture (#2869)" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "\x1b[<32;80;5m") != null);
     const cap = wm_fwd_test_log[0..wm_fwd_test_log_len];
     try std.testing.expect(std.mem.indexOf(u8, cap, "dui: term sel") == null);
+}
+
+test "pointer_tick: MOUSE_UP carries the released button's flag bit (#2878)" {
+    arm();
+    const id = switch (user_open(64, 48, 640, 400, 9)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    defer _ = user_close(id);
+    while (events.pop(9) != null) {}
+    // Logical coords (0..32767) for scanout (384,248) — inside the window.
+    _ = pointer_tick(.{ .x = 9830, .y = 11286, .buttons = 0x01, .valid = true }, null);
+    _ = pointer_tick(.{ .x = 9830, .y = 11286, .buttons = 0x00, .valid = true }, null);
+    var saw_down = false;
+    var saw_up = false;
+    while (events.pop(9)) |ev| {
+        switch (ev.kind) {
+            events.MOUSE_DOWN => {
+                saw_down = true;
+                try std.testing.expect(ev.flags & events.BTN_LEFT != 0);
+            },
+            // The release sample's live buttons are already 0; the up
+            // event still names the button that came up — the gosol
+            // up()/drop gate reads exactly this bit.
+            events.MOUSE_UP => {
+                saw_up = true;
+                try std.testing.expect(ev.flags & events.BTN_LEFT != 0);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_down);
+    try std.testing.expect(saw_up);
+    // Same contract on the right button.
+    _ = pointer_tick(.{ .x = 9830, .y = 11286, .buttons = 0x02, .valid = true }, null);
+    _ = pointer_tick(.{ .x = 9830, .y = 11286, .buttons = 0x00, .valid = true }, null);
+    var saw_rup = false;
+    while (events.pop(9)) |ev| {
+        if (ev.kind == events.MOUSE_RIGHT_UP) {
+            saw_rup = true;
+            try std.testing.expect(ev.flags & events.BTN_RIGHT != 0);
+        }
+    }
+    try std.testing.expect(saw_rup);
+}
+
+test "wm content forward: the seat delivers pointer events to the hit window (#2878)" {
+    arm();
+    wm_owns_input = true;
+    defer {
+        wm_owns_input = false;
+        wm_fwd_prev_buttons = 0;
+        wm_fwd_prev_x = 0;
+        wm_fwd_prev_y = 0;
+    }
+    const id = switch (user_open(64, 48, 640, 400, 9)) {
+        .opened => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    defer _ = user_close(id);
+    while (events.pop(9) != null) {}
+
+    // A seat-forwarded press+move+release inside the window's content:
+    // the hosted app's whole pointer input — before #2878 nothing was
+    // pushed at all (keys+lifecycle only).
+    wm_content_pointer(100, 100, 0x01);
+    wm_content_pointer(120, 120, 0x01);
+    wm_content_pointer(120, 120, 0x00);
+
+    var kinds: [8]u16 = @splat(0);
+    var flags: [8]u16 = @splat(0);
+    var args: [8]u64 = @splat(0);
+    var n: usize = 0;
+    while (events.pop(9)) |ev| {
+        if (n < kinds.len) {
+            kinds[n] = ev.kind;
+            flags[n] = ev.flags;
+            args[n] = ev.arg0 | (@as(u64, ev.arg1) << 32);
+        }
+        n += 1;
+    }
+    // press sample also reports the move into place: MOVE, DOWN, MOVE, UP.
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(events.MOUSE_MOVE, kinds[0]);
+    try std.testing.expectEqual(events.MOUSE_DOWN, kinds[1]);
+    try std.testing.expectEqual(events.MOUSE_MOVE, kinds[2]);
+    try std.testing.expectEqual(events.MOUSE_UP, kinds[3]);
+    try std.testing.expect(flags[1] & events.BTN_LEFT != 0);
+    try std.testing.expect(flags[3] & events.BTN_LEFT != 0);
+    // Window-local coords: press (100,100) - origin (64,48) = (36,52).
+    try std.testing.expectEqual(@as(u64, 36 | (52 << 32)), args[1]);
+
+    // The same stream stays dormant with no seat registered.
+    wm_owns_input = false;
+    wm_content_pointer(100, 100, 0x01);
+    wm_content_pointer(100, 100, 0x00);
+    try std.testing.expect(events.pop(9) == null);
 }
 
 test "persist: a WINDOWS.SAV replay is never re-serialized (#2865)" {
