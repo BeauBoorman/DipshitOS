@@ -5,10 +5,12 @@
 #   NAME <TAB> OBSERVED <TAB> MASK <TAB> REASON
 #
 #   NAME      the exec-recorded image name (a GRANTS.TXT row key).
-#   OBSERVED  the words the app called under the M113f audit (#2422,
-#             comment-6243607948: 29 apps, one confined `NAME<TAB>*<TAB>-`
-#             boot each, `audit:<word>_denied` receipts = calls made), or
-#             `-` when the audit could not run it.
+#   OBSERVED  the words the app called under audit — the M113f pass
+#             (#2422, comment-6243607948: 29 apps) or the M158a re-audit
+#             (#2939: the ten M132 reservations + WEB.ELF), one confined
+#             `NAME<TAB>*<TAB>-` boot each with the save path driven
+#             where it has one, `audit:<word>_denied` receipts = calls
+#             made — or `-` when the audit could not run it.
 #   MASK      the authored grant word set, in vocabulary order
 #             (file window audio timer memory process debug net term).
 #   REASON    `-` when MASK == OBSERVED; otherwise the named reason the
@@ -32,7 +34,7 @@ NOTE.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
 GOEDIT.ELF	window,memory,process,debug	file,window,memory,process,debug	opens=text,binary handler contract; no file was handed in the audit window
 GOFILES.ELF	window,memory,process,debug	file,window,memory,process,debug	declared caps=file; a file manager whose file ops were unexercised in the audit window is broken under enforce
 GOTERM.ELF	window,memory,process,debug	window,memory,process,debug,term	audit note: GOTERM never reached its term path — the window open fails first under the no-seat shim; a terminal emulator's own word is term
-WEB.ELF	window,memory,process,debug	window,memory,process,debug,net	declared caps=net + opens=http,https; no fetch was driven in the audit window
+WEB.ELF	file,window,memory,process,debug,net	file,window,memory,process,debug,net	-
 PULSE.ELF	window,memory,process,debug	file,window,timer,memory,process,debug,term	surface: FileOpen/FileRead + TtyAttach + EvTimer call sites (user/go/pulse)
 GOSH.ELF	file,memory,process,debug	file,memory,process,debug,term	declared caps=file,process,term; audited via -c only — the interactive path was not exercised
 GOHELP.ELF	window,memory,process,debug	file,window,memory,process,debug,term	surface: ReadFileAll for help topics + TtyAttach for the tty pane (user/go/help)
@@ -61,13 +63,13 @@ GOSNAP.ELF	-	file,memory,process,debug	not audited — M115e landed after the M1
 GOREC.ELF	-	file,audio,memory,process,debug	not audited — M118d landed after the M113f run; declared caps=file,audio + the observed Go-runtime ambient set (debug,memory,process); surface File*/WriteFileSafe + AudioCapQuery/AudioCapture
 ZC.BIN	file,debug	file,memory,process,debug	declared caps=file,memory,process; the audit's bare invocation never reached a compile
 TABWM.BIN	window	window,memory,process,debug	fallback seat: the no-seat shim left it a one-word app; its call surface is sys_exec + sys_mmap + sys_wmctl + sys_write (user/src/tabwm.zig)
-GOASSIST.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOSHEET.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOREADER.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOCLOCK.ELF	-	window,timer,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOMINE.ELF	-	window,audio,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOSOL.ELF	-	window,audio,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOEMOJI.ELF	-	window,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOIRC.ELF	-	file,window,memory,process,debug,net	declared: M132 reservation, binary not yet shipped
-GOVAULT.ELF	-	file,window,timer,memory,process,debug	declared: M132 reservation, binary not yet shipped
-GOPAINT.ELF	-	file,window,memory,process,debug	declared: M132 reservation, binary not yet shipped
+GOASSIST.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+GOSHEET.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+GOREADER.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+GOCLOCK.ELF	file,window,timer,memory,process,debug	file,window,timer,memory,process,debug	-
+GOMINE.ELF	file,window,audio,memory,process,debug	file,window,audio,memory,process,debug	-
+GOSOL.ELF	file,window,memory,process,debug	file,window,audio,memory,process,debug	declared caps=window,audio + surface: AudioPlay chime sites (user/go/gosol/chime.go); the #2939 audit's auto-move leg never reached a win, so audio stayed unexercised
+GOEMOJI.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+GOIRC.ELF	file,window,memory,process,debug,net	file,window,memory,process,debug,net	-
+GOVAULT.ELF	file,window,timer,memory,process,debug	file,window,timer,memory,process,debug	-
+GOPAINT.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
