@@ -38,7 +38,10 @@ const (
 //     challenge string — slot 61 (sys_win_set_title) refuses non-owners —
 //     and resends the request with the challenge echoed in the union;
 //  3. the seat reads the title back (wmctl cmd 14), mints the session token,
-//     and binds the window to the request's reply_to pid + token;
+//     and binds the window to the request's reply_to pid + token — the
+//     proof title names that pid too (#3048), so an echo claiming a pid
+//     the owner never committed to cannot bind even while the owner's
+//     title proof stands mid-handshake;
 //  4. every later frame for the window must carry the token in the union,
 //     and every ack for a bound window carries Pad=Bound + the token — a
 //     forged ack cannot satisfy the client's wait because it cannot quote
@@ -73,15 +76,22 @@ func SetWmAuth(m *WmRpc, v uint64) {
 }
 
 // WmBindChallengeTitle is the window title a window's owner sets to prove
-// ownership for challenge c: fixed 21 bytes, inside the kernel's 64-byte
-// title bound and the seat's name read-back.
-func WmBindChallengeTitle(c uint64) string {
+// ownership for challenge c, committed to the pid the echo will claim as
+// reply_to: fixed 24 bytes, inside the kernel's 64-byte title bound and
+// the seat's name read-back. The pid is part of the proof (#3048): the
+// challenge is disclosed to any requester, so an attacker can echo it —
+// but its reply_to binds only if the owner-written title names that same
+// pid, and only the owner can write the title.
+func WmBindChallengeTitle(c uint64, pid uint8) string {
 	const hexd = "0123456789abcdef"
-	var b [21]byte
+	var b [24]byte
 	copy(b[:], "wrpc:")
 	for i := 0; i < 16; i++ {
 		b[5+i] = hexd[(c>>(60-4*i))&0xf]
 	}
+	b[21] = ':'
+	b[22] = hexd[pid>>4]
+	b[23] = hexd[pid&0xf]
 	return string(b[:])
 }
 
@@ -493,7 +503,7 @@ func wmRequestGoTitle(kind uint8, id uint8, title [WmRpcTitleMax]byte, restoreTi
 		// Challenge: prove ownership through the window title, then resend
 		// the request with the challenge echoed as the auth union.
 		challenge := WmAuth(rep)
-		if challenge == 0 || bindSetTitle(int(id), WmBindChallengeTitle(challenge)) != 0 {
+		if challenge == 0 || bindSetTitle(int(id), WmBindChallengeTitle(challenge, req.ReplyTo)) != 0 {
 			return WmRpc{}, false
 		}
 		req.Seq = nextWmSeq()

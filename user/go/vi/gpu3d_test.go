@@ -268,7 +268,7 @@ func TestGpu3dExchangeBindHandshake(t *testing.T) {
 	if tok != token {
 		t.Fatalf("session token = %#x want %#x", tok, token)
 	}
-	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge) || titles[1] != "" {
+	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge, 9) || titles[1] != "" {
 		t.Fatalf("title sets = %v want [challenge, empty]", titles)
 	}
 
@@ -362,7 +362,7 @@ func TestGpu3dExchangeBoundRechallengeRebinds(t *testing.T) {
 	if wmToken(4) != token {
 		t.Fatalf("session token = %#x want rebound %#x", wmToken(4), token)
 	}
-	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge) || titles[1] != "" {
+	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge, 9) || titles[1] != "" {
 		t.Fatalf("title sets = %v want [challenge, empty]", titles)
 	}
 	if f.sleepCalls != 0 {

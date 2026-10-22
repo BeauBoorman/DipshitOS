@@ -221,7 +221,7 @@ func TestServiceRPCGatesWindowsQuery(t *testing.T) {
 
 	// 2. The owner proves the title and echoes: the echo itself is a page
 	//    request, and its bound row frames both mint the token and answer.
-	ownerTitle = vi.WmBindChallengeTitle(challenge)
+	ownerTitle = vi.WmBindChallengeTitle(challenge, 9)
 	req.Pad = vi.WmRpcPadBound
 	req.Seq = 8
 	vi.SetWmAuth(&req, challenge)

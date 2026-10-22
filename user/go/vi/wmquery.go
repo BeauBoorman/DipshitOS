@@ -148,7 +148,7 @@ func wqPage(id uint8, start int, peers WmSeat, budget *int) ([]WmWindowRow, int,
 				challenge := WmAuth(m)
 				echoes++
 				if challenge == 0 || echoes > wmBindMaxRounds ||
-					bindSetTitle(int(id), WmBindChallengeTitle(challenge)) != 0 {
+					bindSetTitle(int(id), WmBindChallengeTitle(challenge, req.ReplyTo)) != 0 {
 					return nil, 0, wqSilent
 				}
 				req.Seq = nextWmSeq()

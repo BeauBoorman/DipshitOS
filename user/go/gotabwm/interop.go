@@ -129,16 +129,21 @@ func challengeFor(id uint8) uint64 {
 
 // completeBind finishes the ownership handshake: the echoed challenge must
 // match the pending one and the window's kernel title must read as the
-// challenge string — a state only the kernel-registered owner can produce.
-// On success the window binds to the request's reply_to pid under a fresh
-// session token.
+// challenge string COMMITTED TO THIS ECHO'S reply_to — a state only the
+// kernel-registered owner can produce. The pid is part of the proof
+// (#3048): the challenge is disclosed to any requester and the mailbox is
+// any-to-any, so an attacker can echo it mid-handshake — but its
+// self-asserted reply_to binds only when the owner-written title names
+// that very pid, which the owner never writes for a pid that is not its
+// own. On success the window binds to the request's reply_to pid under a
+// fresh session token.
 func completeBind(req vi.WmRpc) bool {
 	pending := rpcChallenges[req.ID]
 	if pending == 0 || vi.WmAuth(req) != pending || req.ReplyTo == 0 {
 		return false
 	}
 	name, ok := readWindowName(req.ID)
-	if !ok || name != vi.WmBindChallengeTitle(pending) {
+	if !ok || name != vi.WmBindChallengeTitle(pending, req.ReplyTo) {
 		return false
 	}
 	token := mintAuthValue()

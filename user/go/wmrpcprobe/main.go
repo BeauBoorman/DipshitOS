@@ -43,6 +43,22 @@ func recvFrame(buf []byte) (vi.WmRpc, bool) {
 	return vi.WmRpc{}, false
 }
 
+// recvAckFor polls like recvFrame but keeps only the reply-flagged frame
+// for seq — a broadcast (settings-changed, reply_to 0) riding the same
+// mailbox must not stand in for the ack this leg is watching.
+func recvAckFor(buf []byte, seq uint8) (vi.WmRpc, bool) {
+	for i := 0; i < recvTries; i++ {
+		m, ok := recvFrame(buf)
+		if !ok {
+			return vi.WmRpc{}, false
+		}
+		if m.Kind&vi.WmRpcReplyFlag != 0 && m.Seq == seq {
+			return m, true
+		}
+	}
+	return vi.WmRpc{}, false
+}
+
 func main() {
 	buf := make([]byte, vi.MailboxMessageMax)
 	fail := func(what string) {
@@ -163,6 +179,58 @@ func main() {
 		fail("win_geometry applied from a non-AGENTD sender")
 	}
 	vi.ConsoleLine("wmrpcprobe: win-geometry refused")
+
+	// The pre-queued forged echo (#3048): the shape that used to hijack a
+	// session mid-handshake. The attacker draws a fresh challenge on its
+	// own bound window, writes the HONEST title proof for itself (it owns
+	// the window — the title is a genuine owner-made proof), then echoes
+	// the challenge claiming a foreign reply_to. The proof commits to a
+	// pid now, so the echo must be refused without consuming the
+	// challenge — provable because the honest echo that lands next still
+	// binds. Under the vulnerable seat this leg fails: the forged echo
+	// bound the foreign pid, retired the challenge, and the honest echo
+	// drew a bare refusal.
+	bare := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: uint8(id),
+		Seq: 4, ReplyTo: uint8(peers.Self)}
+	bare.SetTitle("wmrpcprobe")
+	if vi.IpcSend(peers.WM, bare.Encode()) < 0 {
+		fail("challenge send")
+	}
+	rep, ok := recvAckFor(buf, bare.Seq)
+	if !ok || rep.Pad != vi.WmRpcPadChallenge || vi.WmAuth(rep) == 0 {
+		fail("no challenge for forged-echo leg")
+	}
+	raceChallenge := vi.WmAuth(rep)
+	if r := vi.WinSetTitle(id, vi.WmBindChallengeTitle(raceChallenge, uint8(peers.Self))); r != 0 {
+		fail("proof title " + vi.Itoa64(r))
+	}
+	foreign := uint8(0xfe)
+	if foreign == uint8(peers.Self) {
+		foreign = 0xfd
+	}
+	raceEcho := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: uint8(id),
+		Seq: 5, ReplyTo: foreign, Pad: vi.WmRpcPadBound}
+	raceEcho.SetTitle("pwned")
+	vi.SetWmAuth(&raceEcho, raceChallenge)
+	if vi.IpcSend(peers.WM, raceEcho.Encode()) < 0 {
+		fail("forged echo send")
+	}
+	// The forged echo's ack went to the foreign pid's mailbox (or died on
+	// send) — refusal is proven by what it left behind: the pending
+	// challenge survives, so this honest echo binds.
+	honest := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: uint8(id),
+		Seq: 6, ReplyTo: uint8(peers.Self), Pad: vi.WmRpcPadBound}
+	honest.SetTitle("wmrpcprobe")
+	vi.SetWmAuth(&honest, raceChallenge)
+	if vi.IpcSend(peers.WM, honest.Encode()) < 0 {
+		fail("honest echo send")
+	}
+	rep, ok = recvAckFor(buf, honest.Seq)
+	if !ok || rep.Pad != vi.WmRpcPadBound || rep.Applied != 1 || vi.WmAuth(rep) == 0 {
+		fail("honest echo refused after forged echo — the hijack landed")
+	}
+	vi.ConsoleLine("wmrpcprobe: forged-echo refused id=" + vi.Itoa64(int64(id)))
+	vi.ConsoleLine("wmrpcprobe: rebind ok")
 
 	vi.ConsoleLine("wmrpcprobe: auth probe ok")
 	vi.Exit(0)

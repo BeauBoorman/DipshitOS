@@ -803,8 +803,8 @@ func TestGoSeatBindHandshake(t *testing.T) {
 			f.sent[1].Pad, WmAuth(f.sent[1]), challenge)
 	}
 	// The ownership proof title, then the title the request meant to wear.
-	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge) || titles[1] != "Mine" {
-		t.Fatalf("title sets = %v want [%q %q]", titles, WmBindChallengeTitle(challenge), "Mine")
+	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge, 9) || titles[1] != "Mine" {
+		t.Fatalf("title sets = %v want [%q %q]", titles, WmBindChallengeTitle(challenge, 9), "Mine")
 	}
 	if wmToken(4) != token {
 		t.Fatalf("session token = %#x want %#x", wmToken(4), token)
@@ -886,7 +886,7 @@ func TestGoSeatBoundRechallengeRebinds(t *testing.T) {
 		t.Fatalf("echo frame pad=%d union=%#x want challenge %#x",
 			f.sent[1].Pad, WmAuth(f.sent[1]), challenge)
 	}
-	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge) || titles[1] != "Mine" {
+	if len(titles) != 2 || titles[0] != WmBindChallengeTitle(challenge, 9) || titles[1] != "Mine" {
 		t.Fatalf("title sets = %v want [challenge, %q]", titles, "Mine")
 	}
 	if wmToken(4) != token {

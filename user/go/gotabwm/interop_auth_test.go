@@ -157,7 +157,7 @@ func TestServiceRPCBindHandshake(t *testing.T) {
 	// 3. The owner produces the kernel-visible title proof (slot 61 is
 	//    owner-restricted; the stub models what the kernel would read back)
 	//    and the echo binds pid 7 under a fresh session token.
-	ownerTitle = vi.WmBindChallengeTitle(challenge)
+	ownerTitle = vi.WmBindChallengeTitle(challenge, 7)
 	echo.ReplyTo = 7
 	echo.Seq = 3
 	acks = decodeAcks(t, serveOneWmRpc(t, echo.Encode()))
@@ -203,6 +203,78 @@ func TestServiceRPCBindHandshake(t *testing.T) {
 	}
 	if tabs.At(0).Title != "legit" {
 		t.Fatalf("bound request did not apply: title = %q", tabs.At(0).Title)
+	}
+}
+
+// #3048: the pre-queued forged echo. The challenge is disclosed to ANY
+// requester and the mailbox is any-to-any, so an attacker holding the
+// challenge can slip an echo in while the owner's title proof stands —
+// before the owner's own echo arrives. The proof title commits to the pid
+// the echo claims as reply_to, so the forged echo is refused and the
+// honest echo still binds. Before the pid entered the proof this same
+// sequence bound the attacker: the title read `wrpc:<challenge>` for any
+// reply_to, so the first echo to land won the session.
+func TestServiceRPCForgedEchoCannotStealBind(t *testing.T) {
+	savedTabs := tabs
+	defer func() { tabs = savedTabs }()
+	tabs = TabStrip{}
+	if !tabs.OpenTab(4, "x") {
+		t.Fatal("OpenTab")
+	}
+	ownerTitle := ""
+	stubAuthSeams(t, func(id uint8) (string, bool) {
+		if id != 4 || ownerTitle == "" {
+			return "", false
+		}
+		return ownerTitle, true
+	})
+
+	// 1. The owner's request draws the challenge; the attacker learns the
+	//    same value by asking for one itself (challengeFor(id) returns the
+	//    pending challenge to any requester).
+	req := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 1, ReplyTo: 7}
+	req.SetTitle("real")
+	acks := decodeAcks(t, serveOneWmRpc(t, req.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadChallenge {
+		t.Fatalf("challenge step acks = %+v", acks)
+	}
+	challenge := vi.WmAuth(acks[0])
+	if challenge == 0 {
+		t.Fatal("zero challenge")
+	}
+
+	// 2. The owner has set its title proof — committed to pid 7 — but its
+	//    echo has not landed yet. The attacker pre-queues the winning
+	//    shape: the echoed challenge with reply_to pointing at ITS pid.
+	ownerTitle = vi.WmBindChallengeTitle(challenge, 7)
+	forged := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 2, ReplyTo: 9,
+		Pad: vi.WmRpcPadBound}
+	forged.SetTitle("pwned")
+	vi.SetWmAuth(&forged, challenge)
+	acks = decodeAcks(t, serveOneWmRpc(t, forged.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadChallenge || acks[0].Applied != 0 {
+		t.Fatalf("forged echo ack = %+v want re-challenge refusal", acks)
+	}
+	if rpcBindings[4].token != 0 {
+		t.Fatalf("forged echo installed a binding: %+v", rpcBindings[4])
+	}
+	if tabs.At(0).Title != "x" {
+		t.Fatalf("forged echo applied: title = %q", tabs.At(0).Title)
+	}
+
+	// 3. The challenge is still pending — the forged echo consumed
+	//    nothing — so the owner's echo binds pid 7 under the session token.
+	echo := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 3, ReplyTo: 7,
+		Pad: vi.WmRpcPadBound}
+	echo.SetTitle("real")
+	vi.SetWmAuth(&echo, challenge)
+	acks = decodeAcks(t, serveOneWmRpc(t, echo.Encode()))
+	if len(acks) != 1 || acks[0].Pad != vi.WmRpcPadBound || acks[0].Applied != 1 {
+		t.Fatalf("honest echo after forged attempt = %+v want bound applied", acks)
+	}
+	token := vi.WmAuth(acks[0])
+	if rpcBindings[4].pid != 7 || rpcBindings[4].token != token {
+		t.Fatalf("binding = %+v want pid 7 under the ack token", rpcBindings[4])
 	}
 }
 
@@ -273,7 +345,7 @@ func TestServiceRPCReChallengesBoundIdWithNoCredentials(t *testing.T) {
 
 	// 2. The echo with the owner-only title proof rebinds under a FRESH
 	//    token — the stale binding retires — and the request applies.
-	ownerTitle = vi.WmBindChallengeTitle(challenge)
+	ownerTitle = vi.WmBindChallengeTitle(challenge, 7)
 	echo := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 2, ReplyTo: 7,
 		Pad: vi.WmRpcPadBound}
 	echo.SetTitle("real")

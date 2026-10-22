@@ -273,7 +273,7 @@ func gpu3dRequestGo(id uint8, op uint8, payload [WmRpcTitleMax]byte, peers WmSea
 		// Challenge: prove ownership through the owner-restricted window
 		// title, then resend the request with the challenge echoed.
 		challenge := WmAuth(rep)
-		if challenge == 0 || bindSetTitle(int(id), WmBindChallengeTitle(challenge)) != 0 {
+		if challenge == 0 || bindSetTitle(int(id), WmBindChallengeTitle(challenge, req.ReplyTo)) != 0 {
 			return WmRpc{}, WmRpc{}, 0, Gpu3dOutcomeRefused
 		}
 		req.Seq = nextWmSeq()

@@ -1913,6 +1913,12 @@ PY
 # challenge it was issued but cannot prove. Zero forged frames may apply,
 # and the seat's `rpc refuse`/`rpc bind` markers record both halves.
 #
+# #3048 adds the pre-queued-echo leg: a forged echo quoting the challenge
+# but claiming a reply_to the owner-written proof title does not name.
+# The proof title commits to a pid, so the forged echo is refused without
+# consuming the challenge and the honest echo that lands next still binds
+# (the third `rpc bind` below).
+#
 # Ordering: the probe execs only after `note: tab-aware`, so NOTE's own bind
 # has already landed and the spray hits at least one genuinely bound foreign
 # window.
@@ -1947,8 +1953,9 @@ vgate_assert 11 serial-contains 'gotabwm: registered'
 vgate_assert 11 serial-contains 'exec: loaded NOTE.ELF'
 vgate_assert 11 serial-contains 'note: tab-aware (full-viewport)'
 vgate_assert 11 serial-contains 'exec: loaded WMRPCPROBE.ELF'
-# Both honest clients bound (NOTE's declare, then the probe's): two binds.
-vgate_assert 11 serial-count 'gotabwm: rpc bind id=' 2
+# Both honest clients bound (NOTE's declare, then the probe's), plus the
+# probe's honest re-bind after the forged echo was starved: three binds.
+vgate_assert 11 serial-count 'gotabwm: rpc bind id=' 3
 # The honest legs still work under the authenticated protocol.
 vgate_assert 11 serial-contains 'wmrpcprobe: bound id='
 vgate_assert 11 serial-contains 'wmrpcprobe: title ok'
@@ -1960,6 +1967,10 @@ vgate_assert 11 serial-contains 'wmrpcprobe: bad-token refused'
 # name — applied=0 reaches the probe AND the R2 marker prints.
 vgate_assert 11 serial-contains 'gotabwm: agent_input_denied'
 vgate_assert 11 serial-contains 'wmrpcprobe: agent-input refused'
+# #3048: the forged echo claiming a foreign reply_to is refused while a
+# genuine owner-made proof title stands, and the honest echo still binds.
+vgate_assert 11 serial-contains 'wmrpcprobe: forged-echo refused id='
+vgate_assert 11 serial-contains 'wmrpcprobe: rebind ok'
 vgate_assert 11 serial-contains 'wmrpcprobe: auth probe ok'
 vgate_assert 11 serial-contains 'gotabwm: rpc refuse id='
 vgate_assert 11 serial-absent 'wmrpcprobe: FAIL'
