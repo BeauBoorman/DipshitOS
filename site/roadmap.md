@@ -9,6 +9,8 @@ tags: [roadmap, status]
 This page summarizes the milestone plan. The repository's
 [`docs/status.md`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/docs/status.md)
 is the canonical, always-current source; this is the readable summary.
+Issue numbers link the ledger to the tracker; gate ids name the standing
+proof (see [[evidence]] and [[live-gates]]).
 
 ## Shipped
 
@@ -113,80 +115,104 @@ is the canonical, always-current source; this is the readable summary.
 | 97 | Security audit of the trust boundaries: ~40 deduplicated findings, every Sev-A/B owned and fixed (index #2069) |
 | 98 | GOSH polish + the agent control channel: a pure-Go `shlib` engine behind GOSH/GOTERM, and `AGENTD.ELF` serving six verbs behind an HMAC challenge; ADR 0044 (indexes #2126, #2145) |
 | 99 | Go desktop/tooling depth: sound, networking, and web typography end to end (index #2178) |
+| 100 | A disk of our own: VLFS, a journaled guest filesystem on a dedicated virtio-blk image — ordered journal commits, a real fsync barrier, `mkfs.vlfs --check` host fsck, the opt-in `/disk` data root, and the standing crash gate `live-vlfs-crash` (K=5 kill-mid-write cycles); ADR 0050 (index #2302) |
+| 101 | Software arrives signed: `FLINT.ELF` speaks FLINT-SYNC/1 (`clone`/`pull`/`push`/`ls-remote`) against a pinned publisher keyring, and `STORE.ELF` `ls`/`install`/`remove`/`update`/`rollback` re-authenticates the signed release manifest atom-for-atom with a retained `.prev` rollback target (index #2303) |
 | 102 | Custom-virtio GPU 3D: an opt-in Metal render device beside the native 2D scanout (index #2160) |
 | 103 | FLINT M0, agent-native SCM: atoms, ops, signed changes, a semantic three-way merge; ADR 0049 |
 | 104 | UI depth: primitives v2, widget faces, seat chrome, composite goldens (index #2267) |
+| 105 | FLINT host client: the cross-platform Zig client, shipped in [flint-client](https://github.com/drawmeanelephant/flint-client) |
 | 106 | FLINT host server: `flintd`, the Zig FLINT-SYNC/1 server, shipped in [flint-server](https://github.com/drawmeanelephant/flint-server) |
+| 107 | The guest builds the guest: `GOBUILD.ELF` drives the in-guest `cmd/compile`/`cmd/link`, GOEDIT navigates diagnostics, `flint status`/`diff`/`commit`/`push` versions the session, and the `GODIFF.ELF` capstone was authored, compiled, run, and pushed entirely in-guest; standing gate `live-dev-loop` (index #2304) |
+| 108 | Through the glass: ADR 0051's consented host lanes — bidirectional clipboard over signed VHI1 share files, host→guest file drop into `/host/INBOX`, seat toasts crossing out to macOS banners; standing gate `live-hostint` (index #2305) |
+| 109 | Agents as first-class citizens: ADR 0052 agent identity, agentd + audit, the agent-view seat, third-party agent apps, the GOTAB seat — landed; the reference-host K=5 + owner sign-off caveat stands (index #2382) |
+| 110 | The store as an ecosystem: the release manifest *is* the catalog entry, publisher fingerprints derive from signing keys, GOSTORE browses/installs/rolls back, and a third-party publisher drill proves `key_unknown`/`key_revoked` refuse at materialization; ADR 0055 (index #2383) |
+| 111 | The Metal GPU as a bounded compute device: slot-90 `sys_gpucomp`, GEMM/SOFTMAX/DEQUANT pipelines, and GOINFER answering in-guest on the real Metal path (a 135M-parameter model, Apache-2.0); ADR 0053 (index #2384) |
+| 112 | Self-host the userspace: `GOBUILD fleet` builds the pinned fleet rows in-guest, `GOBUILD test` runs the package suite (796 tests), and `GORELEASE assemble` writes a byte-identical boot image in-guest that the host boots; `live-release` (index #2385) |
+| 113 | Trust depth: verified + measured boot, `grant`/`word`/`deny` with audit verdicts, signed `ReleaseCaps` + a GOSET consent pane, a GOTOP Trust tab; ADR 0054 (index #2386) |
+| 114 | The host app becomes a Mac app: `HostCommand` bus + menus, 16:9 resizable/fullscreen with key capture, HostInt lanes on by default, an inspector drawer, bounded MP4 recording; `live-host-ui` (index #2447) |
+| 115 | The machine keeps itself: a vsock probe, the `virelai-ctl/1` HMAC channel (ADR 0056), `.virelaivm` profile bundles, guest-driven suspend/resume, `GOSNAP.ELF` share snapshots, and guest-staged signed OS self-update with `.prev` rollback; `live-persistence` K=3 (index #2448) |
+| 116 | Trust defaults enforce: the compiled baseline grant table, the enforce flip with named `EACCES` refusals, install-time consent, and `net` `host:port` allowlists; `live-sandbox-negatives` + `live-trust-journey` (index #2449) |
+| 117 | IPv6 and a real LAN: v6 demux/SLAAC/NDP/ICMPv6, UDP/TCP v6 + `ping6`, `--net-bridged`/`--net-vmnet`, grant policy over v6 prefixes, and a bridged guest reading a real LAN httpd; ADR 0057 (index #2450) |
+| 118 | Bounded audio capture: the virtio-snd RX queue and cap table, slots 91/92 `sys_audio_rec*`, `GOREC.ELF` recording WAV, a mic meter — and a mic-denied host answers with the pinned bounded refusal, not a file (index #2451) |
+| 119 | Performance is a contract: the bench corpus + budgets, `live-bench` with its forced-breach negative, and the named bounds it characterized (see [[benchmarks]]); landed, owner sign-off owed (index #2452) |
+| 120 | The session keeps itself: persistence wiring, `SESSION.TABS` live re-exec, Machine-menu lifecycle verbs, windowed GOSNAP; `live-session-ux` K=3 (index #2548) |
+| 121 | Keyboard-first daily driver: the `Ctrl+Shift+P` palette, tab chords, a `?` hints overlay, the focus badge, cross-app `Ctrl+Z` — acceptance is a pointer-free `go-dogfood` boot, K=3 (index #2549) |
+| 122 | First-hour onboarding: incremental session builds + toolchain doctor, the GOWELCOME first-boot tour, launcher ghost-app purge, host toolbar + `⌘/` cheat-sheet, a clickable GOSET (index #2550) |
+| 123 | Visible system feedback: kernel refusals surface as actionable toasts, shared empty states, `appkit.Progress` + cancelable notify rows, `appkit.ErrorBanner` adoption (index #2551) |
+| 124 | Cross-app data flow: guest drag-and-drop over WM_RPC, a shared `appkit.FilePicker`, the typed clipboard with host negotiation, Open With, primary selection (index #2552) |
+| 125 | Session fidelity: per-app save/restore over WM_RPC + `.tabs` v2 for GOEDIT/GOFILES/WEB/GOTERM, crash → auto-snapshot + recovery toast, and a snapshot→hard-kill→restore acceptance, K=5 (index #2553) |
+| 126 | Web browser parity: history dropdown, bookmarks, find-in-page, per-tab zoom, the download flow; `live-web` K=3 (index #2554) |
+| 127 | Through the glass 2.0: drop-to-open, notify click-through, the OUTBOX export lane, an AGENTD companion; ADR 0051 v2 (index #2555) |
+| 128 | Workstation profiles: `⌘,` machine settings, a profile manager (new/clone/reset/switch), `.virelaivm` Finder documents; `live-workstation-profiles` 12/12, K=3 (index #2556) |
+| 129 | Headroom: 512 MiB compiled default + the >256 MiB boot fix, task pool 16→64 with a spawn-storm leg, and the measured capacity table (index #2557) |
+| 130 | It runs Doom — legally: ADR 0058 keeps GPL out of this repository; the engine lives in a sibling repo behind a `DG_*` shim and arrives as a signed STORE payload, and `live-doom` walks store-install → consent → `-playdemo` E1M1 → clean exit, K=3 (index #2617) |
+| 131 | Warm checkpoints: ADR 0059's boot-once-restore-per-leg semantics, the `vgate_checkpoint`/`--from-checkpoint` primitives, the `live-quickjs` pilot, and the fleet census (index #2637) |
+| 132 | Wave contracts: the ADR 0007 slot reservation table + reserved seat chords, manifest/grant/mime/clipboard rows for every new app, and HF serving extracted into `HostFileServer.swift` (index #2734) |
+| 133 | Kernel depth: named OOM, scheduler aging, the 512 MiB capacity re-audit + spawn-storm retune (index #2735) |
+| 134 | Storage depth: HF STAT mtime, an enumerable mount table with named `not_mounted`, VLFS mount-time read-only check (index #2736) |
+| 135 | Net depth: the TLS 1.3 server half (GOHTTPD serves HTTPS), HTTP/1.1 keep-alive + chunked + gzip, listen depth with named saturation (index #2737) |
+| 136 | Media decode: a shared flate inflater, bounded baseline JPEG, bounded first-frame GIF — five formats in one viewer (index #2738) |
+| 137 | Seat depth: split panes as a tree, appkit controls v2 (menu bar/tree/table), spaces — named tab groups (index #2739) |
+| 138 | Shell & dev-loop depth: shlib heredocs, GOEDIT bracket matching/diagnostics/format-on-save, `flint blame`/`graph`/`tags` + GODIFF side-by-side (index #2740) |
+| 139 | Host app, agent surface, gate fleet, docs truth: multi-VM windows, AGENTD `ui.input`, the `live-wnd*` fleet diet, TEAMS.md (index #2741) |
+| 140 | GOASSIST: the `user/go/infer` engine behind a chat app — real-model journey, snapshot, restore; `go-assist` K=3 (index #2742) |
+| 141 | GOPAINT: a paint app shipped through the STORE bundle path, K=3 (index #2743) |
+| 142 | GOSHEET: cells/formulas/grid, CSV + session state; `go-sheet` K=3 — edit, export, reopen in GOEDIT (index #2744) |
+| 143 | GOREADER: a reader app; K=3 open-chain journey (index #2745) |
+| 144 | GOCLOCK: alarms persist via `save_state` + a share file and late-fire on start (index #2746) |
+| 145 | Games: GOMINE + GOSOL — play both, snapshot mid-game, restore exactly, K=3 (index #2747) |
+| 146 | GOEMOJI: a chord-summoned picker whose selection lands on the typed clipboard; `go-emoji` K=3 (index #2748) |
+| 147 | GOIRC: an IRC client — TLS + consent journey, snapshot, restore; `go-irc` K=3 (index #2749) |
+| 148 | GOVAULT: a secrets vault whose own audit file is the receipt; K=3 (index #2750) |
+| 149 | Shipped-app polish: GOFILES spacebar QuickLook, GOTERM OSC-8 links + named profiles, GOEDIT themes + a minimap (index #2751) |
 
-Every milestone through **M104** is landed or closed — plus **M106**, which
-shipped in its own repository; M105 is the open exception between them.
-`docs/status.md` is the ledger. For a curated account of merged work from
-2026-09-01 through 2026-10-02, see the
-[[chronicle|weekly merged-PR chronicle]].
+Every milestone through **M149** is landed or closed. `docs/status.md` is
+the ledger. For a curated account of merged work from 2026-09-01 through
+2026-10-02, see the [[chronicle|weekly merged-PR chronicle]].
 
 ## Current
 
-Six arcs are open on the tracker — five active lanes, plus M96 awaiting its
-owner acceptance run:
+The ledger is nearly clean: every index through M149 is closed except the
+lanes below, which are landed-but-not-yet-signed-off rather than unbuilt.
 
-- **M100, a disk of our own** ([#2302](https://github.com/drawmeanelephant/VirelaiOS/issues/2302))
-  — ADR 0050's journaled guest filesystem (VLFS) on a dedicated virtio-blk
-  image. Landed: the RW block driver + the runner's `--data-disk` attach
-  (M100b), `mkfs.vlfs` + the kernel's `/disk` mount (M100c), and the
-  journaled write path — commits, allocation, and a real fsync barrier,
-  gated by `live-vlfs-write` (M100d, PR #2351). In flight: `fsck.vlfs` +
-  journal replay + the kill-mid-write gate (M100e, claimed) and the opt-in
-  `/disk` data root (M100f, claimed). Ahead: acceptance (M100g).
-- **M101, software arrives signed** ([#2303](https://github.com/drawmeanelephant/VirelaiOS/issues/2303))
-  — `FLINT.ELF` speaks FLINT-SYNC/1 (`clone`/`pull`/`push`/`ls-remote`) and
-  verifies a pinned publisher keyring before materializing (M101a/b); the
-  `STORE.ELF` install seam — `store ls`/`install`/`remove` over the
-  release-stream convention — is on main (M101c, PR #2355). In review:
-  update/rollback with a staged pull + crash-safe publish (M101d, PR
-  #2356). Ahead: acceptance (M101e).
-- **M105, FLINT host client** ([#2283](https://github.com/drawmeanelephant/VirelaiOS/issues/2283))
-  — the cross-platform Zig client spec is landed; the `flintd` server already
-  shipped in [flint-server](https://github.com/drawmeanelephant/flint-server)
-  (M106).
-- **M107, the guest builds the guest** ([#2304](https://github.com/drawmeanelephant/VirelaiOS/issues/2304))
-  — complete through M107e: `GOBUILD.ELF` drives the in-guest
-  `cmd/compile`/`cmd/link` through a bounded import graph (M107a/b), GOEDIT
-  navigates build diagnostics (M107c), `flint
-  status`/`diff`/`commit`/`push` versions the session (M107d, gate
-  `live-flint-loop`), and the capstone `GODIFF.ELF` — a unified context
-  diff — was authored, compiled, run, and pushed entirely in-guest (M107e,
-  PR #2353, gates `live-godiff-loop` + `go-godiff`). Ahead: acceptance
-  (M107f, claimed).
-- **M108, through the glass** ([#2305](https://github.com/drawmeanelephant/VirelaiOS/issues/2305))
-  — ADR 0051's consented host lanes are landed and gated end to end: the
-  bidirectional clipboard over signed VHI1 share files (M108b), host→guest
-  file drop into `/host/INBOX` with a seat toast + mime dispatch (M108c,
-  PR #2347, gate `live-host-drop`), and seat toasts crossing out to macOS
-  banners (M108d, PR #2350, gate `live-host-notify`). Ahead: acceptance
-  (M108e).
+- **M96, the Zig 0.17.0 toolchain port**
+  ([#2060](https://github.com/drawmeanelephant/VirelaiOS/issues/2060)) —
+  all five cards landed, including the `build.zig`/kernel/user/zc flag-day
+  port and the `@bitCast` audit; the index closes by owner hand on the K=3
+  class-A + class-B acceptance run under the pinned 0.17 SDK.
+- **M109, agents as first-class citizens**
+  ([#2382](https://github.com/drawmeanelephant/VirelaiOS/issues/2382)) —
+  landed-with-caveat: all six cards are in and the acceptance gates went
+  green on the dev host (`live-agent-loop` K=5 35/35, `go-agentd` 14/14,
+  `go-top` 8/8, `go-wm-seat` 20/20); the reference-host K=5 plus owner
+  sign-off are still owed.
+- **M119, performance as a contract**
+  ([#2452](https://github.com/drawmeanelephant/VirelaiOS/issues/2452)) —
+  landed: `live-bench` 18/18 on the dev host plus the headroom legs all
+  PASS ([[benchmarks]]). Per the re-scope, the reference-host full-fleet
+  pass + K=3 soak is an owner-run background check, not a merge gate; the
+  index closes on owner sign-off.
+- **M103, FLINT SCM M0** — all four cards landed (atoms, ops, signed
+  changes, the semantic merge; `go-flint` green); the ledger marks it
+  *landed* rather than closed.
+- **M131, warm checkpoints** ([#2637](https://github.com/drawmeanelephant/VirelaiOS/issues/2637))
+  — closed on the ledger: all four cards landed (ADR 0059, the
+  checkpoint/resume primitives, the `live-quickjs` pilot, the fleet
+  census). The ledger still carries a stale second M131 row reading
+  "Filed" from before the land; the closed row is the truth.
 
-Underneath the dev-loop lanes, the runner's TCP relay now dedups
-retransmits and paces by the guest's advertised MSS/window (PR #2352,
-issue #2349) — the lane in-guest `flint push` rides on.
+Honest-bound edges that remain regardless of milestone:
 
-M96 stays technically open on the ledger: all five cards of the Zig 0.17.0
-toolchain port are landed and the arc awaits its owner acceptance run
-(index #2060).
-
-Honest-bound edges that remain planned regardless of milestone:
-
-- **The balloon device** — not attached. Demand paging does not itself provide
-  memory reclaim.
-- **Routing beyond the NAT gateway** and any IPv6 stack; TCP RTO stays fixed
-  (no adaptive estimation), and the TCP client is single-connection.
-- **Deeper filesystem semantics on the share** — M13's B1 shipped
-  delete/rename/truncate/free and no app has produced new pressure; the
-  journaled VLFS volume now writes through real commits + an fsync barrier
-  (M100d, `live-vlfs-write`), with fsck/journal replay and the opt-in
-  `/disk` data root still open cards.
+- **The balloon device** — not attached. Demand paging does not itself
+  provide memory reclaim.
+- **The guest is an endpoint, not a router** — M117 added IPv6 and a real
+  bridged LAN (`--net-bridged` needs the vmnet entitlement), but nothing
+  forwards for other hosts, and TCP RTO stays fixed rather than adaptive.
 - **Multi-display** — the guest stays single-display. Accelerated 3D exists
-  only as the opt-in M102 custom-virtio Metal device; the default desktop is
-  2D.
+  only as the opt-in M102 custom-virtio Metal device; the default desktop
+  is 2D.
+- **GPL stays out of the repository** — even Doom rides the signed store
+  channel from its own sibling repo (M130, ADR 0058).
 
 Both former "open thread" caveats are resolved and shipped: the M8 U4
 pointer-focus proof is now class-B-headless via custom-virtio pointer
@@ -205,6 +231,8 @@ this site distinguishes landed work from observed behavior.
 ## How to read the status
 
 - **Shipped** = landed, merged, and gated.
+- **Landed / landed-with-caveat** = every card merged and the gates green on
+  the dev host, with the owner sign-off or reference-host soak still owed.
 - **In progress** = claimed on a branch, not yet merged.
 - **Planned** = sketched, with no gate yet.
 
@@ -215,7 +243,7 @@ explains the classification.
 <Aside kind="warning">
 
 **LIMITATION.** Do not read the repository's `docs/` planning prompts as
-shipped features. The planning tree is an engineering warehouse; this site is
-the public index of what actually landed.
+shipped features. The planning tree is an engineering warehouse; this site
+is the public index of what actually landed.
 
 </Aside>

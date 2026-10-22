@@ -22,22 +22,14 @@ see [[evidence]].
 
 ## Current status
 
-Milestones through **M104** are landed or closed — plus **M106** (the
-`flintd` host server, shipped in its own repo). Six arcs are open on the
-ledger — **M96** (the Zig 0.17.0 port's cards are all landed; its owner
-acceptance run is the last step), **M100** (a journaled guest filesystem on
-virtio-blk: the RW driver, the runner's `--data-disk` attach, `mkfs.vlfs`,
-the `/disk` mount, and the journaled write path are on main; fsck and the
-data-root cards are in flight), **M101** (signed software distribution:
-`FLINT.ELF`'s FLINT-SYNC/1 remote verbs, the publisher keyring, and the
-`STORE.ELF` install seam are on main; update/rollback is in review),
-**M105** (the Zig FLINT host client — `flintd` already shipped), **M107**
-(the in-guest dev loop, complete through M107e: `GODIFF.ELF` was authored,
-built, and pushed entirely in-guest; acceptance is in flight), and **M108**
-(host integration: the bidirectional clipboard, host→guest file drop, and
-seat→macOS notify-out are all on main; acceptance is open). The table
-below is the first 31 milestones; the full table through M106 is on
-[[roadmap]] and the canonical tracker is
+Milestones through **M149** are landed or closed — the ledger counts three
+remaining open items: **M96** (the Zig 0.17.0 toolchain port's cards are all
+landed; its owner acceptance run is the last step), **M109** (agents as
+first-class citizens landed with a caveat — the reference-host K-run plus
+owner sign-off are owed), and **M119** (benchmarks-as-gates landed; the
+reference-host soak is an owner-run background check). The table below is
+the first 31 milestones; the full table through M149 is on [[roadmap]] and
+the canonical tracker is
 [`docs/status.md`](https://github.com/drawmeanelephant/VirelaiOS/blob/main/docs/status.md).
 
 | Milestone | What it is | Status |
@@ -105,16 +97,18 @@ A single boot of VirelaiOS gets you, in order:
 - A window manager — **Driving Award** — compositing a terminal and a live
   clock overlay.
 - EL0 user programs, exec'd from the host share, running as real processes
-  with a syscall ABI of **88 implemented slots** (0–87 of a 128-slot table) covering IPC,
-  windows, files, events, process control, TCP, filesystem mutation,
-  clipboard, app timers, audio, pipes, fonts, ping, net-stats, anonymous
-  memory, native sockets, and the observability/pid surface.
-- Networking from raw Ethernet frames up through ARP, IPv4/ICMP, UDP, DHCP,
-  and TCP — client **and** passive-open server (`GOHTTPD.ELF` serves the
-  guest's own files over HTTP/1.1; the Zig `HTTPD.BIN` was retired in M71l)
-  — plus an RFC 1035 DNS resolver.
-- Two CPU cores: SMP scheduling with spinlocks and GICv3 inter-processor
-  interrupts.
+  with a syscall ABI of **96 implemented slots** (0–95 of a 128-slot
+  append-only table) covering IPC, windows, files, events, process control,
+  TCP, filesystem mutation, clipboard, app timers, audio in *and* out,
+  pipes, fonts, ping, net-stats, anonymous memory, native sockets, grants,
+  GPU compute, and the observability/pid surface.
+- Networking from raw Ethernet frames up through ARP, IPv4/ICMP *and* IPv6
+  (SLAAC/NDP, `ping6`), UDP, DHCP, and TCP — client **and** passive-open
+  server (`GOHTTPD.ELF` serves the guest's own files over HTTP/1.1 and
+  HTTPS; the Zig `HTTPD.BIN` was retired in M71l) — plus an RFC 1035 DNS
+  resolver and a TLS 1.3 stack that runs in both directions.
+- Two CPU cores by default (profiles go to four): SMP scheduling with
+  spinlocks and GICv3 inter-processor interrupts.
 - Dynamic executables: `CALC.ELF`/`NOTEPAD.ELF`/`FILE.ELF`/`DESKTOP.ELF`
   linked at runtime by `LD.SO` against `LIBUI.SO`/`LIBFONT.SO`, plus
   `dlopen`/`dlsym` plugin loading — zero libc anywhere.
@@ -138,15 +132,26 @@ A single boot of VirelaiOS gets you, in order:
   melody app that plays Twinkle Twinkle Little Star.
 - A disk of its own (opt-in): `--data-disk <img>` attaches a second virtio-blk
   function and the kernel mounts a `mkfs.vlfs`-formatted VLFS volume at
-  `/disk` — journaled writes commit through a real fsync barrier (M100d,
-  gate `live-vlfs-write`); `fsck.vlfs` and opt-in data-root adoption are
-  still in flight.
+  `/disk` — journaled writes commit through a real fsync barrier, `mkfs.vlfs
+  --check` is the host fsck, and the standing `live-vlfs-crash` gate hard-kills
+  the VM mid-write and byte-proves the journal's committed-prefix guarantee.
 - A bridge to the Mac (opt-in): `--host-clipboard` syncs the guest clipboard
   with a named pasteboard through HMAC-signed share files, seat-mediated and
   byte-silent when off; `--host-drop` lands host files in `/host/INBOX` with
   a seat toast and mime dispatch; `--host-notify` carries seat toasts out to
   macOS banners; `FLINT.ELF` clones/pulls/pushes signed source against
-  a host `flintd` over FLINT-SYNC/1.
+  a host `flintd` over FLINT-SYNC/1 — and `STORE.ELF`/`GOSTORE.ELF` install
+  signed third-party software with consent and rollback.
+- A machine that keeps itself: `.virelaivm` profiles, guest-initiated
+  suspend/resume, consent-gated snapshots, and a signed OS self-update with
+  `.prev` rollback — the `live-persistence` gate runs the whole chain.
+- A control surface for agents: `AGENTD.ELF` serves JSON Lines on guest TCP
+  4747 behind an HMAC challenge; the seat can run an opt-in RFB 3.8
+  framebuffer that macOS Screen Sharing drives natively.
+- An in-guest dev loop: `GOBUILD.ELF` compiles the fleet with the guest's
+  own `cmd/compile`/`cmd/link`, GOEDIT navigates the diagnostics, `flint`
+  versions the session, and `GORELEASE` assembles a boot image byte-identical
+  to the host's.
 
 ![A live VirelaiOS boot: the Go seat GOTABWM with its tab strip across the top and the Go editor NOTE.ELF hosting a document in the tab below](index.assets/screenshot.png "A live VirelaiOS boot")
 
@@ -189,6 +194,9 @@ fixtures, the serial logs are not committed.*
 - [[getting-started|Getting started]] — build it, run it, what you need.
 - [[architecture|Architecture]] — how the kernel and its subsystems fit together.
 - [[capabilities|Current capabilities]] — what actually works today, subsystem by subsystem.
+- [[desktop|The desktop]] · [[apps|The app fleet]] — the seat, the WM contract, and what ships.
+- [[go-runtime|The Go runtime]] · [[devloop|The dev loop]] · [[trust|Trust & security]] — the platform story.
+- [[machine|The machine]] — profiles, suspend, snapshots, self-update; plus [[remote]] and [[host-int]].
 - [[roadmap|Roadmap & status]] — what has landed and what comes next.
 - [[names|Project names & lore]] — what "Road Pops" and "Driving Award" mean.
 - [[evidence|Evidence & testing]] — how a claimed feature is proven to work.
