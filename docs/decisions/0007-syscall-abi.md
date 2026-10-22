@@ -2861,3 +2861,29 @@ No chord rows are reserved. GOEDIT's tab and fold keys and GOFILES' new
 keys are app-local and must be keys gotabwm leaves unbound, checked
 against `user/go/chords/table.go` the way M107c did
 (`user/go/edit/main.go:318-320`).
+
+## Amendment (2026-10-22, card #3026 — wave-4 reservations)
+
+Wave 4 runs parallel agents over disjoint `Touches`; the only shared
+surfaces are the syscall slot space, the slot-74 timeout unit, the
+event-kind flags word, the VLFS format version, the principal uid
+space, and `kernel/src/syscall.zig` itself. This amendment is the ONE
+reservation table every wave-4 card cites — a row here is the claim, so
+no consumer edits an ABI document while another lane is active.
+Reservations are cheap; overlaps are not: a slot or an event flag costs
+this one amendment, a mid-wave collision costs a stalled lane. Rows
+X1–X9 are verbatim from card #3026, with the card's milestone names
+resolved to their filed issue numbers — the docs watermark admits card
+refs only.
+
+| # | Surface | Reservation | Implemented by |
+|---|---|---|---|
+| X1 | Slot 94 | `sys_sleep_ns(ns) -> i64`: block at least `ns` nanoseconds, rounded up to the deadline granularity ADR 0060 names (1 ms, D2). `ns == 0` → `EINVAL` (slot 4's rule); `ns` above 3600 s → `EINVAL`. Ungated, like slot 4. An old kernel answers the unknown-slot error and callers fall back to slot 4 | card #3036 |
+| X2 | Slot 95 | `sys_timer_set_ns(ns) -> i64`: arm the caller's ONE app timer (the slot-40 timer: same `TIMER` kind-9 event, re-arm replaces, slot 41 cancels) for `ns` nanoseconds, with X1's rounding and bounds. Grant word `timer` (`grant.zig:182` gains 95) | card #3036 |
+| X3 | Slot 74 rounding | Op 0 `timeout_ns` rounds up to the X1 granularity, not whole ticks (supersedes `:1353-1354`). Op 74/2 accepts any `ns` and computes its deadline the same way (supersedes `:2116-2119`). No signature change | card #3036 |
+| X4 | Event kind 18 flags | Bit 0 = `damage`: a damage-driven `COMPOSITE_TICK` (arg0 present sequence, arg1 damage mask, as today). Heartbeat ticks keep flags 0 and stay 1 Hz. At most one damage tick is pending per seat. Records that arg1 has carried the damage mask since M33 SB4 (`wm_server.zig:662-668`), correcting ADR 0009:70 | card #3034 |
+| X5 | Slots 4, 40, 66 | Unchanged. A tick stays the 1 s heartbeat period; every audited tick site in ADR 0060 keeps its meaning | — |
+| X6 | VLFS `format_version` 2 | Reserved for sealed volumes (ADR 0061). v1 images keep mounting unchanged. Unsealing is a kernel boot prompt (card #3037), so no slot is reserved; 96–97 stay unallocated with R1's reason | cards #3028, #3030, #3031, #3037 |
+| X7 | Principal `uid_agent` = 2000 | Assigned at exec to the image named `AGENTD.ELF`. An EL0 spawn from a `uid_agent` parent inherits `uid_agent`; other spawns stay `uid_user` (amends `process.zig:114-116` for agent parents only). Kill gate: same uid, or `uid_user` acting on `uid_agent` (D12), or `CAP_PROC_ADMIN`. `procs` and `sys_principal` (slot 68) report 2000; receipts gain a `uid=` field | cards #3041, #3044 |
+| X8 | `kernel/src/syscall.zig` | Wave-4 editors, in order: card #3035, then card #3036, then card #3041. All of them come after card #2990 merges; #3007, which also held the file, closed 2026-10-21. No other wave-4 card edits it | — |
+| X9 | Not reserved | No WM_RPC kind for a11y (no caller; R1's reason); kinds ≥ 31 stay unallocated. No statfs slot (W2/W3 carry it). W8's "no `timer` row" (`:2834`) held while wave-3's D2 kept GIFs on the stepper; slot 95 changes that for GOVIEW. That is a grant-row edit, not ABI, so it goes to whichever card next holds the grant files (D5) | — |
