@@ -289,6 +289,22 @@ type checker struct {
 	dek     *[KeyBytes]byte
 	volID   uint64
 	authBad map[uint32]bool
+	// The write frontier of the most recent checkpointed/committed txn
+	// (ADR 0061 residual, #3112/#3124): a hard vm.stop lands inside the
+	// checkpoint copy at 512 B request granularity, so a completed
+	// {home, tag} pair can be torn in the file view even though the guest
+	// tolerates it — replay rewrites the pair or the diverged bytes are
+	// never observed. A bad_block_auth inside the frontier is the
+	// informational journal_torn, not a hard verdict; anywhere else it
+	// stays hard. frontierDests holds the txn's dests; frontierLo/Hi is
+	// the contiguous span of tag-home indices the txn journaled — the
+	// metadata home through the data-dest homes — because the checkpoint
+	// stream churns that whole span and a stranded sector of any home in
+	// it tears a covered entry the same way (hi < lo when the txn
+	// journaled no tag homes).
+	frontierDests map[uint32]bool
+	frontierLo    int
+	frontierHi    int
 }
 
 func (c *checker) fail(code, format string, args ...any) {
@@ -332,9 +348,78 @@ func (c *checker) plain(b uint32) []byte {
 	out, ok := c.sealOpen(b, stored)
 	if !ok && !c.authBad[b] {
 		c.authBad[b] = true
-		c.fail("bad_block_auth", "block %d", b)
+		if c.atFrontier(b) {
+			c.note("journal_torn", "sealed block %d pair torn at the write frontier", b)
+		} else {
+			c.fail("bad_block_auth", "block %d", b)
+		}
 	}
 	return out
+}
+
+// atFrontier reports whether block b sits at the write frontier of the
+// most recent checkpointed/committed txn: a dest of it, or a sealed block
+// whose tag entry lives in the contiguous span of tag homes the txn
+// journaled. See the checker field comment for the kill-time shape this
+// tolerates.
+func (c *checker) atFrontier(b uint32) bool {
+	if c.frontierDests[b] {
+		return true
+	}
+	if c.frontierHi < 0 || b < 2 || b >= c.g.TagFirst {
+		return false
+	}
+	idx := int((b - 2) / TagEntriesPerBlock)
+	return idx >= c.frontierLo && idx <= c.frontierHi
+}
+
+// setFrontier records the most recent txn's dest set as the write
+// frontier: the dests themselves plus the min-to-max span of tag-home
+// indices among them (a sealed dest's own tag home always rides in the
+// same txn, so the span already covers every journaled dest).
+func (c *checker) setFrontier(dests []uint32) {
+	c.frontierDests = map[uint32]bool{}
+	c.frontierLo, c.frontierHi = 1<<30, -1
+	for _, d := range dests {
+		c.frontierDests[d] = true
+		if d >= c.g.TagFirst && d < c.g.VolumeBlocks {
+			if idx := int(d - c.g.TagFirst); idx < c.frontierLo {
+				c.frontierLo = idx
+			}
+			if idx := int(d - c.g.TagFirst); idx > c.frontierHi {
+				c.frontierHi = idx
+			}
+		}
+	}
+}
+
+// headTxnDests returns the dest set of the DESC at the journal head when
+// it parses as a well-formed record — every check the scan applies except
+// the sequence number. That is the most recent txn the journal can
+// describe: the last applied one on a drained journal (stale seq), or a
+// txn torn mid-commit whose writes are still the newest on the device. A
+// DESC that fails structure/self-checksum proves nothing about the
+// frontier, so it yields no bound.
+func (c *checker) headTxnDests() ([]uint32, bool) {
+	desc := c.plainJournal(c.g.JournalFirst)
+	if binary.LittleEndian.Uint32(desc[jdMagic:]) != MagicDesc {
+		return nil, false
+	}
+	n := uint32(binary.LittleEndian.Uint16(desc[jdCount:]))
+	if n < 1 || n > MaxPayload || c.g.JournalFirst+n+2 > c.g.JournalFirst+c.g.JournalBlocks ||
+		binary.LittleEndian.Uint16(desc[jdFlags:]) != 0 ||
+		binary.LittleEndian.Uint32(desc[jdCksum:]) != fnv1a(desc[:jdCksum]) {
+		return nil, false
+	}
+	dests := make([]uint32, 0, n)
+	for i := uint32(0); i < n; i++ {
+		d := binary.LittleEndian.Uint32(desc[jdEntries+i*8:])
+		if d < c.g.JournalFirst+c.g.JournalBlocks || d >= c.g.VolumeBlocks {
+			return nil, false
+		}
+		dests = append(dests, d)
+	}
+	return dests, true
 }
 
 // plainJournal is plain() for a journal-region read: a failed AEAD open
@@ -500,6 +585,7 @@ func checkImage(img []byte, pass []byte) []finding {
 	end := c.g.JournalFirst + c.g.JournalBlocks
 	expected := sb.journalApplied + 1
 	var live int
+	var lastDests []uint32
 scan:
 	for pos < end {
 		desc := c.plainJournal(pos)
@@ -517,12 +603,14 @@ scan:
 			c.note("journal_torn", "invalid DESC at journal block %d", pos)
 			break
 		}
+		dests := make([]uint32, 0, n)
 		for i := uint32(0); i < n; i++ {
 			dest := binary.LittleEndian.Uint32(desc[jdEntries+i*8:])
 			if dest < c.g.JournalFirst+c.g.JournalBlocks || dest >= c.g.VolumeBlocks {
 				c.note("journal_torn", "DESC dest %d out of range", dest)
 				break scan
 			}
+			dests = append(dests, dest)
 		}
 		var txn []byte
 		txn = append(txn, desc[:jdEntries+8*n]...)
@@ -543,14 +631,26 @@ scan:
 			break
 		}
 		for i := uint32(0); i < n; i++ {
-			c.overlay[binary.LittleEndian.Uint32(desc[jdEntries+i*8:])] = c.plainJournal(pos + 1 + i)
+			c.overlay[dests[i]] = c.plainJournal(pos + 1 + i)
 		}
+		lastDests = dests
 		expected++
 		live++
 		pos += n + 2
 	}
 	if live > 0 {
 		c.note("journal_unreplayed", "%d committed transaction(s) pending", live)
+	}
+
+	// The write frontier is bounded by the most recent txn the journal
+	// still describes: the last live record, else the head DESC — the
+	// last applied txn on a drained journal or one torn mid-commit, whose
+	// writes are still the newest thing on the device.
+	if live == 0 {
+		lastDests, _ = c.headTxnDests()
+	}
+	if lastDests != nil {
+		c.setFrontier(lastDests)
 	}
 
 	// On a sealed volume authenticate the whole sealed span against the

@@ -1306,6 +1306,204 @@ func TestSealedUnreplayedTxn(t *testing.T) {
 	}
 }
 
+// TestSealedFrontierTear pins the kill-time residual ruled informational
+// on #3112/#3124: a hard vm.stop lands inside the checkpoint copy at 512 B
+// request granularity, so a sealed {home, tag} pair at the write frontier
+// of the most recent txn can fail AEAD open in the file view even though
+// the guest tolerates it. The frontier is bounded by the head DESC: the
+// txn's dests plus the contiguous span of tag homes it journaled. A
+// same-shape tear inside that span reports the informational journal_torn;
+// a tear anywhere else — inside an older applied txn's coverage or on a
+// random mid-image block — still flags hard bad_block_auth.
+func TestSealedFrontierTear(t *testing.T) {
+	pass := []byte("correct horse battery staple")
+	img, g := sealedImage(t, string(pass))
+	sb, err := parseSuperblock(img, 0)
+	if err != nil || sb == nil {
+		t.Fatalf("superblock: %v", err)
+	}
+	dek, err := unwrapDEK(sb, pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealSlot := func(slot uint32, pt []byte) {
+		sealSlotWrite(t, img, g, sb.volumeID, dek, slot, pt)
+	}
+
+	// One committed txn installing a file at ino 2 — the kernel-shaped
+	// post-#3104 form: the tag home covering the sealed dests rides in
+	// the same DESC. db sits in tag home idx (db-2)/146; the home also
+	// covers `covered`, a block the txn never touches.
+	const ino = 2
+	db := g.DataFirst + 1
+	covered := db + 1 // same tag home as db, not a dest
+	homeIdx := (db - 2) / TagEntriesPerBlock
+	thome := g.TagFirst + homeIdx
+	if (covered-2)/TagEntriesPerBlock != homeIdx {
+		t.Fatalf("fixture: covered %d not in db's tag home", covered)
+	}
+
+	content := []byte("frontier-tear fixture payload\n")
+	ib := sealOpenBlock(t, img, g, sb.volumeID, dek, g.IbitmapFirst)
+	ib[ino/8] |= 1 << (ino % 8)
+	bb := sealOpenBlock(t, img, g, sb.volumeID, dek, g.BbitmapFirst)
+	bb[db/8] |= 1 << (db % 8)
+	it := sealOpenBlock(t, img, g, sb.volumeID, dek, g.ItableFirst)
+	rec := it[ino*InodeBytes : (ino+1)*InodeBytes]
+	rec[inKind] = kindFile
+	binary.LittleEndian.PutUint16(rec[inNextents:], 1)
+	binary.LittleEndian.PutUint32(rec[inSize:], uint32(BlockLen))
+	binary.LittleEndian.PutUint32(rec[inExtents:], db)
+	binary.LittleEndian.PutUint32(rec[inExtents+4:], 1)
+	binary.LittleEndian.PutUint32(rec[inCksum:], fnv1a(rec[:inCksum]))
+	root := sealOpenBlock(t, img, g, sb.volumeID, dek, g.DataFirst)
+	binary.LittleEndian.PutUint32(root[deInode:], ino)
+	binary.LittleEndian.PutUint16(root[deNameLen:], 8)
+	root[deKind] = kindFile
+	copy(root[deName:], "FRONT.TXT")
+	data := make([]byte, BlockLen)
+	copy(data, content)
+
+	dests := []uint32{g.IbitmapFirst, g.BbitmapFirst, g.ItableFirst, g.DataFirst, db, thome}
+	payloads := [][]byte{ib, bb, it, root, data, nil}
+
+	// The checkpoint lands first so the tag-home payload can carry the
+	// committed entries: sealed dests get their {home, tag} pair, then the
+	// home's contents are what the journal slot and the verbatim home
+	// write both carry.
+	pos := g.JournalFirst
+	for i, d := range dests {
+		if d >= g.TagFirst {
+			continue
+		}
+		sealSlot(d, payloads[i])
+	}
+	payloads[len(dests)-1] = append([]byte(nil), block(img, thome)...)
+
+	// The committed journal record: payload slots, DESC, COMMIT (sealed
+	// slots, eager tag entries).
+	for i, p := range payloads {
+		sealSlot(pos+1+uint32(i), p)
+	}
+	desc := make([]byte, BlockLen)
+	binary.LittleEndian.PutUint32(desc[jdMagic:], MagicDesc)
+	binary.LittleEndian.PutUint64(desc[jdSeq:], 1)
+	binary.LittleEndian.PutUint16(desc[jdCount:], uint16(len(dests)))
+	for i, d := range dests {
+		binary.LittleEndian.PutUint32(desc[jdEntries+i*8:], d)
+		binary.LittleEndian.PutUint32(desc[jdEntries+i*8+4:], fnv1a(payloads[i]))
+	}
+	binary.LittleEndian.PutUint32(desc[jdCksum:], fnv1a(desc[:jdCksum]))
+	sealSlot(pos, desc)
+	txn := append([]byte(nil), desc[:jdEntries+8*len(dests)]...)
+	for _, p := range payloads {
+		txn = append(txn, p...)
+	}
+	commit := make([]byte, BlockLen)
+	binary.LittleEndian.PutUint32(commit[jcMagic:], MagicCommit)
+	binary.LittleEndian.PutUint64(commit[jcSeq:], 1)
+	binary.LittleEndian.PutUint32(commit[jcTxn:], fnv1a(txn))
+	binary.LittleEndian.PutUint32(commit[jcCksum:], fnv1a(commit[:jcCksum]))
+	sealSlot(pos+1+uint32(len(dests)), commit)
+
+	// The superblock bumps journal_applied — the drained head DESC
+	// (seq 1 != expected 2) stays in the journal.
+	for _, slot := range []uint64{0, BlockLen} {
+		b := img[slot:]
+		binary.LittleEndian.PutUint64(b[sbJournalApplied:], 1)
+		binary.LittleEndian.PutUint64(b[sbSeq:], 3+slot/BlockLen)
+		binary.LittleEndian.PutUint32(b[sbCksum:], fnv1a(b[:sbCksum]))
+	}
+
+	// Sanity: the drained image checks clean apart from the head note.
+	for _, f := range checkImage(img, pass) {
+		if !f.info {
+			t.Fatalf("drained checkpointed image has hard finding: %v", f)
+		}
+	}
+
+	// The frontier tear: a covered, non-dest block's tag entry torn —
+	// informational, never hard. A dest torn the same way is tolerated
+	// too (its pair sat in the same checkpoint window).
+	t.Run("torn_covered_block", func(t *testing.T) {
+		img2 := append([]byte(nil), img...)
+		e := tagEntry(img2, g, covered)
+		e[aeadNonceLen+3] ^= 0x01
+		var torn bool
+		for _, f := range checkImage(img2, pass) {
+			if !f.info {
+				t.Fatalf("frontier tear has hard finding: %v", f)
+			}
+			if f.code == "journal_torn" && strings.Contains(f.detail, "frontier") {
+				torn = true
+			}
+		}
+		if !torn {
+			t.Fatal("frontier tear did not report journal_torn")
+		}
+	})
+
+	// A dest itself torn mid-checkpoint: the same tolerance — the pair
+	// was inside the write frontier's window.
+	t.Run("torn_dest_block", func(t *testing.T) {
+		img2 := append([]byte(nil), img...)
+		e := tagEntry(img2, g, db)
+		e[5] ^= 0x01
+		var torn bool
+		for _, f := range checkImage(img2, pass) {
+			if !f.info {
+				t.Fatalf("frontier dest tear has hard finding: %v", f)
+			}
+			if f.code == "journal_torn" && strings.Contains(f.detail, "frontier") {
+				torn = true
+			}
+		}
+		if !torn {
+			t.Fatal("torn frontier dest did not report journal_torn")
+		}
+	})
+
+	// The bound: a same-shape tear outside the journaled span — a block
+	// whose entry lives in a tag home no recent txn touched (the older
+	// applied txn's coverage) — must still flag hard.
+	t.Run("tear_outside_frontier_hard", func(t *testing.T) {
+		img2 := append([]byte(nil), img...)
+		outside := g.DataFirst + TagEntriesPerBlock*(homeIdx+2) // 2 homes up
+		if outside >= g.TagFirst {
+			t.Skip("volume too small for an outside block")
+		}
+		e := tagEntry(img2, g, outside)
+		e[aeadNonceLen+3] ^= 0x01
+		var hard bool
+		for _, f := range checkImage(img2, pass) {
+			if f.code == "bad_block_auth" {
+				hard = true
+			}
+		}
+		if !hard {
+			t.Fatal("tear outside the frontier did not flag bad_block_auth")
+		}
+	})
+
+	// No journal at all: a fresh sealed image carries no DESC, so there is
+	// no frontier — every torn pair is hard.
+	t.Run("no_journal_everything_hard", func(t *testing.T) {
+		img2, g2 := sealedImage(t, string(pass))
+		victim := g2.DataFirst + 10
+		e := tagEntry(img2, g2, victim)
+		e[aeadNonceLen+3] ^= 0x01
+		var hard bool
+		for _, f := range checkImage(img2, pass) {
+			if f.code == "bad_block_auth" {
+				hard = true
+			}
+		}
+		if !hard {
+			t.Fatal("torn pair on a journal-less image did not flag bad_block_auth")
+		}
+	})
+}
+
 // TestSealedTornJournalSlot pins the post-FLUSH-window residual named on
 // #3043 (M172e, ADR 0061): a pre-commit kill that tears a journal slot's
 // ciphertext — or its eager tag-entry pair — leaves a journal-region
