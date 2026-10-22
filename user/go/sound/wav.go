@@ -4,8 +4,9 @@
 // slices and the guest with vi.FileRead.
 //
 // The bounds are the card's: at most maxChunks walked before `data`, the
-// `fmt ` body must be one of the three real sizes, and every refusal is a
-// NAME (WavError.Name) a marker or test can assert verbatim rather than a
+// `fmt ` body is capped at maxFmt (PCM/float still admit only the three
+// real sizes; ADPCM codecs declare extension fields), and every refusal is
+// a NAME (WavError.Name) a marker or test can assert verbatim rather than a
 // formatted sentence.
 package main
 
@@ -17,12 +18,20 @@ import "errors"
 // bytes that does not divide the frame size is not sound, it is a declared
 // size with a partial frame, and the streamer stops at the whole frames.
 type WavInfo struct {
-	Tag      uint16 // resolved: FormatPCM or FormatFloat
+	Tag      uint16 // resolved: FormatPCM, FormatFloat, FormatIMA or FormatMS
 	Channels uint16 // 1 or 2
 	Rate     uint32 // samples per second, 8000..96000
-	Bits     uint16 // per channel: 8/16/24/32 (PCM), 32 (float)
-	DataSize uint64 // declared data-chunk bytes
-	Frames   uint64 // DataSize / FrameBytes
+	Bits     uint16 // per channel: 8/16/24/32 (PCM), 32 (float), 4 (ADPCM)
+	DataSize uint64 // declared data-chunk bytes (compressed for ADPCM)
+	Frames   uint64 // DataSize / FrameBytes, or decoded samples for ADPCM
+
+	// ADPCM block geometry (FormatIMA/FormatMS only): one block of
+	// BlockAlign bytes decodes to SamplesPerBlock frames per channel.
+	// Coef is the MS ADPCM coefficient table the fmt chunk carries.
+	BlockAlign      uint16
+	SamplesPerBlock uint16
+	NCoef           int
+	Coef            [32][2]int32
 }
 
 // FrameBytes is one interleaved input frame.
@@ -32,13 +41,22 @@ func (w WavInfo) FrameBytes() int { return int(w.Channels) * int(w.Bits) / 8 }
 // its real tag in the sub-format GUID (first two bytes, little-endian).
 const (
 	FormatPCM        uint16 = 1
+	FormatMS         uint16 = 0x0002 // Microsoft ADPCM
 	FormatFloat      uint16 = 3
+	FormatIMA        uint16 = 0x0011 // IMA/DVI ADPCM
 	formatExtensible uint16 = 0xfffe
 )
 
 const (
 	// maxChunks is the card's header walk bound.
 	maxChunks = 32
+	// maxFmt bounds the `fmt ` body: ADPCM fmt chunks carry the codec's
+	// extension fields (samples-per-block, the MS coefficient table), so
+	// they run larger than the three PCM/float sizes.
+	maxFmt = 256
+	// maxBlockAlign bounds one ADPCM block — the streaming pipe holds
+	// exactly one, so this is the decode buffer's ceiling.
+	maxBlockAlign = 16384
 	// rateMin/rateMax bound the accepted input rates (8 kHz..96 kHz).
 	rateMin, rateMax = 8000, 96000
 )
@@ -63,7 +81,7 @@ func (e *WavError) Error() string {
 	return "gosound: refused " + e.Name
 }
 
-func refuse(name string) *WavError        { return &WavError{Name: name} }
+func refuse(name string) *WavError { return &WavError{Name: name} }
 func refuseN(name string, n uint64) *WavError {
 	return &WavError{Name: name, Detail: n}
 }
@@ -71,10 +89,8 @@ func refuseN(name string, n uint64) *WavError {
 // compressedTags names the format tags the refusal reports by name — the
 // card's example is 0x0055 mp3-in-wav. Unknown tags still refuse by number.
 var compressedTags = map[uint16]string{
-	0x0002: "adpcm",
 	0x0006: "alaw",
 	0x0007: "mulaw",
-	0x0011: "ima-adpcm",
 	0x0050: "mpeg",
 	0x0055: "mp3-in-wav",
 	0x00ff: "aac-in-wav",
@@ -159,10 +175,10 @@ func ParseWav(src byteSource, fileSize uint64) (WavInfo, error) {
 		off += 8
 		switch string(ch[0:4]) {
 		case "fmt ":
-			if size != 16 && size != 18 && size != 40 {
+			if size < 16 || size > maxFmt {
 				return WavInfo{}, refuseN("fmt size", size)
 			}
-			var body [40]byte
+			var body [maxFmt]byte
 			if err := readFull(src, body[:size]); err != nil {
 				return WavInfo{}, err
 			}
@@ -179,7 +195,7 @@ func ParseWav(src byteSource, fileSize uint64) (WavInfo, error) {
 				return WavInfo{}, refuse("data beyond eof")
 			}
 			info.DataSize = size
-			info.Frames = size / uint64(info.FrameBytes())
+			info.Frames = info.framesOf(size)
 			return info, nil
 		default:
 			if err := skip(src, size, scratch); err != nil {
@@ -198,9 +214,52 @@ func ParseWav(src byteSource, fileSize uint64) (WavInfo, error) {
 	return WavInfo{}, refuseN("chunks", maxChunks)
 }
 
-// parseFmt decodes one `fmt ` body into info. Only PCM and IEEE float are
-// playable here — and an extensible wrapper only when its sub-format GUID is
-// one of those two. Everything else refuses by name.
+// framesOf is the whole-frame count a declared data size holds: PCM/float
+// divide by frame bytes; ADPCM counts whole blocks times samplesPerBlock
+// plus whatever a trailing partial block decodes to.
+func (w WavInfo) framesOf(size uint64) uint64 {
+	if w.Tag == FormatIMA || w.Tag == FormatMS {
+		ba := uint64(w.BlockAlign)
+		if ba == 0 {
+			return 0
+		}
+		return size/ba*uint64(w.SamplesPerBlock) + w.partialFrames(size%ba)
+	}
+	return size / uint64(w.FrameBytes())
+}
+
+// partialFrames is the sample count a short tail block (rem < BlockAlign
+// bytes) decodes to — the same count the decoder produces, so the stream
+// byte accounting stays exact on unaligned files.
+func (w WavInfo) partialFrames(rem uint64) uint64 {
+	ch := uint64(w.Channels)
+	var n uint64
+	switch w.Tag {
+	case FormatIMA:
+		// 4-byte per-channel preamble, then 4-byte-per-channel groups of
+		// 8 samples.
+		if rem < 4*ch {
+			return 0
+		}
+		n = 1 + (rem-4*ch)/(4*ch)*8
+	case FormatMS:
+		// 7-byte per-channel header, then nibble pairs (mono: 2 samples
+		// a byte; stereo: one per channel a byte).
+		if rem < 7*ch {
+			return 0
+		}
+		n = 2 + (rem-7*ch)*2/ch
+	}
+	if n > uint64(w.SamplesPerBlock) {
+		n = uint64(w.SamplesPerBlock)
+	}
+	return n
+}
+
+// parseFmt decodes one `fmt ` body into info. PCM, IEEE float and the two
+// ADPCM codecs are playable here — and an extensible wrapper only when its
+// sub-format GUID is one of the uncompressed two. Everything else refuses
+// by name.
 func parseFmt(info *WavInfo, b []byte) error {
 	tag := le16(b[0:2])
 	if tag == formatExtensible {
@@ -208,6 +267,9 @@ func parseFmt(info *WavInfo, b []byte) error {
 		// 20, then the 16-byte sub-format GUID at 24. The PCM/float GUIDs
 		// share the fixed tail 0000-0010-8000-00aa00389b71, so the check is
 		// the two-byte tag plus that tail.
+		if len(b) < 40 {
+			return refuseN("fmt size", uint64(len(b)))
+		}
 		tag = le16(b[24:26])
 		if !guidTail(b[26:40]) {
 			return refuse("extensible subformat")
@@ -216,7 +278,18 @@ func parseFmt(info *WavInfo, b []byte) error {
 			return refuseN("extensible tag", uint64(tag))
 		}
 	}
-	if tag != FormatPCM && tag != FormatFloat {
+	switch tag {
+	case FormatPCM, FormatFloat:
+		if len(b) != 16 && len(b) != 18 && len(b) != 40 {
+			return refuseN("fmt size", uint64(len(b)))
+		}
+	case FormatIMA, FormatMS:
+		// ADPCM fmt chunks append cbSize + codec fields after the base 16;
+		// both codecs declare at least through wSamplesPerBlock (byte 20).
+		if len(b) < 20 {
+			return refuseN("fmt size", uint64(len(b)))
+		}
+	default:
 		if name, ok := compressedTags[tag]; ok {
 			return refuse("fmt tag 0x" + hex4(tag) + " " + name)
 		}
@@ -232,6 +305,9 @@ func parseFmt(info *WavInfo, b []byte) error {
 	if info.Rate < rateMin || info.Rate > rateMax {
 		return refuseN("rate", uint64(info.Rate))
 	}
+	if tag == FormatIMA || tag == FormatMS {
+		return parseADPCMFmt(info, b)
+	}
 	switch {
 	case tag == FormatPCM && (info.Bits == 8 || info.Bits == 16 ||
 		info.Bits == 24 || info.Bits == 32):
@@ -244,6 +320,56 @@ func parseFmt(info *WavInfo, b []byte) error {
 	if block := le16(b[12:14]); block != uint16(info.FrameBytes()) {
 		return refuseN("block align", uint64(block))
 	}
+	return nil
+}
+
+// parseADPCMFmt validates the codec extension fields both ADPCM flavors
+// share: bitsPerSample is always 4, the block align must hold at least one
+// block header and stay inside the decode buffer bound, and samplesPerBlock
+// may not exceed what a block can encode. The MS flavor then reads its
+// coefficient table out of the fmt body itself.
+func parseADPCMFmt(info *WavInfo, b []byte) error {
+	if info.Bits != 4 {
+		return refuseN("bits", uint64(info.Bits))
+	}
+	ch := int(info.Channels)
+	ba := int(le16(b[12:14]))
+	spb := int(le16(b[18:20]))
+	if info.Tag == FormatIMA {
+		// 4-byte preamble per channel, then whole 4-byte-per-channel
+		// nibble groups.
+		if ba < 4*ch || ba > maxBlockAlign || (ba-4*ch)%(4*ch) != 0 {
+			return refuseN("block align", uint64(ba))
+		}
+		if spb < 1 || spb > 1+(ba-4*ch)/(4*ch)*8 {
+			return refuseN("samples per block", uint64(spb))
+		}
+	} else {
+		// 7-byte header per channel; every later byte is nibble pairs.
+		if ba < 7*ch || ba > maxBlockAlign {
+			return refuseN("block align", uint64(ba))
+		}
+		if spb < 2 || spb > 2+(ba-7*ch)*2/ch {
+			return refuseN("samples per block", uint64(spb))
+		}
+		if len(b) < 22 {
+			return refuseN("fmt size", uint64(len(b)))
+		}
+		nc := int(le16(b[20:22]))
+		if nc < 1 || nc > len(info.Coef) {
+			return refuseN("adpcm coefs", uint64(nc))
+		}
+		if len(b) < 22+4*nc {
+			return refuseN("fmt size", uint64(len(b)))
+		}
+		for i := 0; i < nc; i++ {
+			info.Coef[i][0] = int32(int16(le16(b[22+4*i:])))
+			info.Coef[i][1] = int32(int16(le16(b[24+4*i:])))
+		}
+		info.NCoef = nc
+	}
+	info.BlockAlign = uint16(ba)
+	info.SamplesPerBlock = uint16(spb)
 	return nil
 }
 

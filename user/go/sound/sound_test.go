@@ -179,11 +179,11 @@ func TestParseAccepts(t *testing.T) {
 func wav18(data []byte) []byte {
 	base := wav(1, 1, 8000, 8, data)
 	var out []byte
-	out = append(out, base[:16]...)                 // RIFF/WAVE/"fmt "
-	out = append(out, 18, 0, 0, 0)                  // size = 18
+	out = append(out, base[:16]...)                    // RIFF/WAVE/"fmt "
+	out = append(out, 18, 0, 0, 0)                     // size = 18
 	out = append(out, base[fmtBodyOff:afterFmtOff]...) // the 16-byte fmt body
-	out = append(out, 0, 0)                         // cbSize = 0
-	out = append(out, base[afterFmtOff:]...)        // data chunk
+	out = append(out, 0, 0)                            // cbSize = 0
+	out = append(out, base[afterFmtOff:]...)           // data chunk
 	sz := uint32(len(out) - 8)
 	out[4], out[5], out[6], out[7] = byte(sz), byte(sz>>8), byte(sz>>16), byte(sz>>24)
 	return out
@@ -204,7 +204,7 @@ func TestParseRefuses(t *testing.T) {
 		{"rate too high", wav(1, 1, 192000, 8, pcm), "rate 192000"},
 		// The card's named example: 0x0055 is mp3-in-wav.
 		{"mp3-in-wav", wav(0x0055, 1, 8000, 8, pcm), "fmt tag 0x0055 mp3-in-wav"},
-		{"adpcm", wav(0x0002, 1, 8000, 8, pcm), "fmt tag 0x0002 adpcm"},
+		{"alaw", wav(0x0006, 1, 8000, 8, pcm), "fmt tag 0x0006 alaw"},
 		{"unknown tag", wav(0x1234, 1, 8000, 8, pcm), "fmt tag 4660"},
 		{"odd bits", wav(1, 1, 8000, 12, pcm), "bits 12"},
 		{"float16", wav(3, 1, 8000, 16, pcm), "bits 16"},
@@ -264,11 +264,11 @@ func badAlign(data []byte) []byte {
 func fmtSize(data []byte, n int) []byte {
 	full := wav(1, 1, 8000, 8, data)
 	var out []byte
-	out = append(out, full[:16]...)                      // RIFF/WAVE/"fmt "
-	out = append(out, byte(n), 0, 0, 0)                  // size n
-	out = append(out, full[fmtBodyOff:afterFmtOff]...)   // the real 16-byte body
-	out = append(out, make([]byte, max(0, n-16))...)     // pad to declared size
-	out = append(out, full[afterFmtOff:]...)             // data chunk
+	out = append(out, full[:16]...)                    // RIFF/WAVE/"fmt "
+	out = append(out, byte(n), 0, 0, 0)                // size n
+	out = append(out, full[fmtBodyOff:afterFmtOff]...) // the real 16-byte body
+	out = append(out, make([]byte, max(0, n-16))...)   // pad to declared size
+	out = append(out, full[afterFmtOff:]...)           // data chunk
 	sz := uint32(len(out) - 8)
 	out[4], out[5], out[6], out[7] = byte(sz), byte(sz>>8), byte(sz>>16), byte(sz>>24)
 	return out
@@ -283,7 +283,11 @@ func wavExtBadTail(data []byte) []byte {
 }
 
 func TestContainer(t *testing.T) {
-	cases := []struct{ name, file string; head string; want string }{
+	cases := []struct {
+		name, file string
+		head       string
+		want       string
+	}{
 		{"wav magic", "x.wav", "RIFF\x00\x00\x00\x00WAVEfmt ", "wav"},
 		{"wav by ext", "x.wav", "\x00\x01", "wav"},
 		{"ogg magic", "x.bin", "OggS", "ogg"},
@@ -304,14 +308,14 @@ func TestContainer(t *testing.T) {
 func TestOutFrames(t *testing.T) {
 	cases := []struct{ in, inR, outR, want uint64 }{
 		{0, 44100, 48000, 0},
-		{1, 44100, 48000, 2},                       // ceil(48000/44100)
-		{44100, 44100, 48000, 48000},               // one second
-		{44101, 44100, 48000, 48002},               // one frame past a second
-		{1024, 22050, 48000, 2230},                 // ceil(1024*48000/22050)
-		{48000, 48000, 48000, 48000},               // identity
-		{48000, 48000, 24000, 24000},               // 2:1 downsample
-		{3, 24000, 48000, 6},                       // golden-vector case below
-		{8000, 8000, 48000, 48000},                 // 1:6 upsample
+		{1, 44100, 48000, 2},         // ceil(48000/44100)
+		{44100, 44100, 48000, 48000}, // one second
+		{44101, 44100, 48000, 48002}, // one frame past a second
+		{1024, 22050, 48000, 2230},   // ceil(1024*48000/22050)
+		{48000, 48000, 48000, 48000}, // identity
+		{48000, 48000, 24000, 24000}, // 2:1 downsample
+		{3, 24000, 48000, 6},         // golden-vector case below
+		{8000, 8000, 48000, 48000},   // 1:6 upsample
 	}
 	for _, c := range cases {
 		if got := OutFrames(c.in, c.inR, c.outR); got != c.want {
@@ -340,7 +344,7 @@ func TestResampleGolden(t *testing.T) {
 		DataSize: uint64(len(in)), Frames: 3}
 	out := OutFmt{Fmt: fmtFloat, Rate: 48000, Channels: 2}
 	sink, buf := collect()
-	p := NewPipe(info, out, 64, 64, sink)
+	p := NewPipe(info, out, 64, 64, ResampleLinear, sink)
 	s := &sliceSrc{b: in}
 	if err := p.Play(s.src()); err != nil {
 		t.Fatal(err)
@@ -393,7 +397,7 @@ func TestDownsampleGolden(t *testing.T) {
 		DataSize: uint64(len(in)), Frames: 5}
 	out := OutFmt{Fmt: fmtFloat, Rate: 24000, Channels: 1}
 	sink, buf := collect()
-	p := NewPipe(info, out, 64, 64, sink)
+	p := NewPipe(info, out, 64, 64, ResampleLinear, sink)
 	s := &sliceSrc{b: in}
 	if err := p.Play(s.src()); err != nil {
 		t.Fatal(err)
@@ -432,7 +436,7 @@ func TestStreamExactness(t *testing.T) {
 		}
 		return nil
 	}
-	p := NewPipe(info, out, readBlock, period, sink)
+	p := NewPipe(info, out, readBlock, period, ResampleLinear, sink)
 	s := &sliceSrc{b: data}
 	if err := p.Play(s.src()); err != nil {
 		t.Fatal(err)
@@ -455,7 +459,7 @@ func TestConstantMemory(t *testing.T) {
 			DataSize: uint64(len(data)), Frames: frames}
 		var n uint64
 		p := NewPipe(info, OutFmt{Fmt: fmtFloat, Rate: 48000, Channels: 2},
-			readBlock, 4096, func(b []byte) error { n += uint64(len(b)); return nil })
+			readBlock, 4096, ResampleSinc, func(b []byte) error { n += uint64(len(b)); return nil })
 		return p, &sliceSrc{b: data}
 	}
 	// >1 MiB stereo s16.
@@ -489,7 +493,7 @@ func TestTruncatedMidStream(t *testing.T) {
 	info := WavInfo{Tag: FormatPCM, Channels: 1, Rate: 8000, Bits: 8,
 		DataSize: 4096, Frames: 4096}
 	p := NewPipe(info, OutFmt{Fmt: fmtS16, Rate: 48000, Channels: 2},
-		readBlock, 4096, func(b []byte) error { return nil })
+		readBlock, 4096, ResampleLinear, func(b []byte) error { return nil })
 	s := &sliceSrc{b: data}
 	err := p.Play(s.src())
 	var we *WavError
@@ -506,7 +510,7 @@ func TestSinkErrorStops(t *testing.T) {
 	info := WavInfo{Tag: FormatPCM, Channels: 1, Rate: 48000, Bits: 16,
 		DataSize: uint64(len(data)), Frames: 4096}
 	p := NewPipe(info, OutFmt{Fmt: fmtS16, Rate: 48000, Channels: 2},
-		readBlock, 4096, func(b []byte) error { return boom })
+		readBlock, 4096, ResampleLinear, func(b []byte) error { return boom })
 	s := &sliceSrc{b: data}
 	if err := p.Play(s.src()); err != boom {
 		t.Fatalf("got %v, want boom", err)

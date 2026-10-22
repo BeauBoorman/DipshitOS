@@ -264,6 +264,158 @@ vgate_assert wav-nodev serial-absent 'gosound: refused'
 vgate_assert wav-nodev serial-absent '[EXC] parking'
 
 # ----------------------------------------------------------------------
+# M162d (#2980) run wav-adpcm: a COMPRESSED wav on the same dispatch path.
+# GOFILES opens ADPCM.WAV — a stereo IMA ADPCM file, the tag old games and
+# recorders write — GOSOUND block-decodes it and windowed-sinc resamples
+# 22050 -> 48000. The card's bar is the wav leg's own: the seat counters
+# equal the exact post-resample byte count (the stream's evidence that
+# real decoded samples, not silence or a stub, reached the device).
+#
+# Fixture: blockAlign 2048 -> samplesPerBlock 2041, 33 whole blocks =
+# 67353 frames ~= 3.05 s; ch0 a 440 Hz sine, ch1 a 220 Hz one, amp 0.3.
+vgate_setup_python <<'PY'
+import math, os, struct
+
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+
+IMA_STEP = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+]
+IMA_IDX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
+
+def ima_nibble(st, target):
+    step = IMA_STEP[st["idx"]]
+    diff = target - st["pred"]
+    nib = 0
+    if diff < 0:
+        nib = 8
+        diff = -diff
+    if diff >= step:
+        nib |= 4
+        diff -= step
+    if diff >= step >> 1:
+        nib |= 2
+        diff -= step >> 1
+    if diff >= step >> 2:
+        nib |= 1
+    delta = step >> 3
+    if nib & 4:
+        delta += step
+    if nib & 2:
+        delta += step >> 1
+    if nib & 1:
+        delta += step >> 2
+    st["pred"] += -delta if nib & 8 else delta
+    st["pred"] = max(-32768, min(32767, st["pred"]))
+    st["idx"] = max(0, min(88, st["idx"] + IMA_IDX[nib]))
+    return nib
+
+rate, ba, nblk = 22050, 2048, 33
+spb = 1 + (ba - 8) // 8 * 8          # 2041
+nfr = nblk * spb                      # 67353
+# Per-channel source signals; blocks encode whole groups, no tail.
+l = [int(0.3 * 32767 * math.sin(2 * math.pi * 440 * i / rate)) for i in range(nfr)]
+r = [int(0.3 * 32767 * math.sin(2 * math.pi * 220 * i / rate)) for i in range(nfr)]
+
+data = bytearray()
+for b in range(nblk):
+    base = b * spb
+    data += struct.pack("<hBB", l[base], 0, 0)
+    data += struct.pack("<hBB", r[base], 0, 0)
+    st0, st1 = {"pred": l[base], "idx": 0}, {"pred": r[base], "idx": 0}
+    for g in range(255):              # 255 groups x 8 samples per channel
+        for c, st, smp in ((0, st0, l), (1, st1, r)):
+            nib = [ima_nibble(st, smp[base + 1 + g * 8 + k]) for k in range(8)]
+            for k in range(4):
+                data.append(nib[2 * k] | (nib[2 * k + 1] << 4))
+
+fmt_body = struct.pack("<HHIIHHH", 0x0011, 2, rate,
+                       rate * ba // spb, ba, 4, 2) + struct.pack("<H", spb)
+hdr = (b"RIFF" + struct.pack("<I", 4 + 8 + len(fmt_body) + 8 + len(data)) +
+       b"WAVE" + b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body +
+       b"data" + struct.pack("<I", len(data)))
+d = os.path.join(share, "SND3")
+os.makedirs(d, exist_ok=True)
+with open(os.path.join(d, "ADPCM.WAV"), "wb") as f:
+    f.write(hdr + data)
+print("staged SND3/ADPCM.WAV (%d bytes, %d frames, %d blocks, spb=%d)" %
+      (len(hdr) + len(data), nfr, nblk, spb))
+PY
+
+vgate_file adpcm-open.txt <<'EOF'
+exec GOFILES.ELF /host/SND3
+EOF
+
+# The dispatch chain is the wav leg's: GOFILES' open picks GOSOUND for
+# type=audio, the pipe decodes blocks through to `gosound: done`, and the
+# run ends on that marker — no script supplies it, the program does.
+vgate_run wav-adpcm -- --sound \
+    --screen '$RUN_DIR/adpcm-screen' \
+    --input --via-virtio \
+    --script '$RUN_DIR/adpcm-open.txt' \
+    --input-chords 'return' \
+    --input-chords-after 'gofiles: ready' \
+    --script-expect 'gosound: done ' --timeout 240
+
+vgate_assert wav-adpcm output-contains 'SOUND: virtio-snd attached'
+vgate_assert wav-adpcm serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert wav-adpcm serial-contains 'gofiles: list /host/SND3 n=1'
+vgate_assert wav-adpcm serial-contains 'gofiles: open file ADPCM.WAV type=audio handler=GOSOUND.ELF'
+vgate_assert wav-adpcm serial-contains 'gofiles: open launched ADPCM.WAV handler=GOSOUND.ELF pid='
+
+# GOSOUND's own markers: the file parsed as IMA ADPCM, the default
+# resampler reported itself, and the stream went live.
+vgate_assert wav-adpcm serial-contains 'gosound: open id='
+vgate_assert wav-adpcm serial-contains 'gosound: loaded ADPCM.WAV fmt=ima-adpcm ch=2 rate=22050 frames=67353'
+vgate_assert wav-adpcm serial-contains 'gosound: resampler=sinc'
+vgate_assert wav-adpcm serial-contains 'gosound: streaming gen='
+
+vgate_assert wav-adpcm serial-absent 'gosound: refused'
+vgate_assert wav-adpcm serial-absent 'gosound: no decoder'
+vgate_assert wav-adpcm serial-absent 'gosound: drain failed'
+vgate_assert wav-adpcm serial-absent 'gosound: stream err'
+vgate_assert wav-adpcm serial-absent 'b7: FAIL'
+vgate_assert wav-adpcm serial-absent '[EXC] parking'
+vgate_assert wav-adpcm serial-absent 'exited status=139'
+
+# The counter identity, recomputed from the fixture like the wav leg:
+# out frames = ceil(67353*48000/22050) = 146619, bytes = frames*8
+# (FLOAT stereo), and no peer runs so the mixer's peak stays 1.
+vgate_assert wav-adpcm python <<'PY'
+import os, re, sys
+
+ser = open(os.environ["VG_SER"], "rb").read().decode("latin1", errors="replace")
+m = re.search(
+    r"gosound: done accepted=(\d+) submitted=(\d+) completed=(\d+) "
+    r"underruns=(\d+) peak=(\d+) clipped=(\d+)", ser)
+if not m:
+    sys.exit("ERROR: no gosound done marker in serial")
+accepted, submitted, completed, underruns, peak, clipped = (
+    int(g) for g in m.groups())
+
+in_frames = 67353                       # 33 IMA blocks x 2041 samples
+want_frames = -(-in_frames * 48000 // 22050)   # ceil — pipe.go OutFrames
+want_bytes = want_frames * 8            # FLOAT/stereo
+if want_frames != 146619:
+    sys.exit(f"ERROR: fixture math changed: want_frames={want_frames}")
+if not (accepted == submitted == completed == want_bytes):
+    sys.exit(f"ERROR: counters accepted={accepted} submitted={submitted} "
+             f"completed={completed}, want {want_bytes} — the decoded "
+             f"stream did not reach the device whole")
+if peak != 1:
+    sys.exit(f"ERROR: peak={peak}, want 1 (no peer in this leg)")
+PY
+
+# ----------------------------------------------------------------------
 # M99z (#2194) run wav-toast: the audio end-to-end. A real WAV streams from
 # GOFILES's open-by-extension dispatch through GOSOUND while a kind-12
 # notify toast — the M99d path, GOFILES's own copy completion — fires MID-

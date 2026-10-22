@@ -2,11 +2,13 @@
 // for the `audio` mime type. Double-clicking a .wav in GOFILES lands here
 // (mime.Register in virelai/mime's init names this binary for Audio).
 //
-// The shape is the card's: RIFF/WAVE is parsed as a stream (wav.go), the
-// samples are converted and LINEARLY resampled into the mixer's negotiated
-// tuple (pipe.go — the quality bound is named, never hidden), and playback
-// is M99b's vi.AudioStream on slot 43. Memory is constant in the file's
-// size: one read block, one output period, the resampler window.
+// The shape is the card's: RIFF/WAVE is parsed as a stream (wav.go — PCM,
+// float, and since M162d the two ADPCM codecs, decoded one block at a
+// time), the samples are resampled into the mixer's negotiated tuple by a
+// 16-tap windowed sinc (sinc.go; --resampler=linear keeps the M99c lerp),
+// and playback is M99b's vi.AudioStream on slot 43. Memory is constant in
+// the file's size: one read block, one output period, the resampler
+// window.
 //
 // M118e (issue #2483) adds the record half (rec.go / recwav.go): argv verbs
 // `record <seconds> <out.wav>` and `meter [seconds]` run the kernel's ONE
@@ -75,6 +77,7 @@ const (
 	markerStreamErr   = "gosound: stream err "
 	markerLoaded      = "gosound: loaded "
 	markerOut         = "gosound: out "
+	markerResampler   = "gosound: resampler="
 	markerStreaming   = "gosound: streaming gen="
 	markerStopped     = "gosound: stopped"
 	markerDone        = "gosound: done "
@@ -123,6 +126,7 @@ type app struct {
 
 	info     WavInfo
 	out      OutFmt
+	rs       Resampler
 	inSecs   uint64 // input duration, whole seconds
 	outSecs  uint64 // resampled duration
 	position uint64 // output seconds submitted (playing position)
@@ -170,7 +174,13 @@ func main() {
 		}
 	}
 
-	path := argPath()
+	argv := vi.Args()
+	var rest []string
+	if len(argv) > 1 {
+		rest = argv[1:]
+	}
+	path, rs := parsePlayArgs(rest)
+	a.rs = rs
 	a.path = path
 	a.name = basename(path)
 
@@ -252,13 +262,27 @@ func (a *app) exit(status int) {
 	vi.Exit(status)
 }
 
-// argPath is argv[1]: the canonical share path GOFILES hands handlers.
-func argPath() string {
-	args := vi.Args()
-	if len(args) < 2 {
-		return ""
+// parsePlayArgs walks the play-mode argv: the first non-flag argument is
+// the canonical share path GOFILES hands handlers; `--resampler=sinc|linear`
+// picks the interpolation engine (sinc is the default, linear keeps the
+// M99c path for comparison).
+func parsePlayArgs(args []string) (path string, rs Resampler) {
+	rs = ResampleSinc
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(a, "--resampler="); ok {
+			switch v {
+			case "linear":
+				rs = ResampleLinear
+			case "sinc":
+				rs = ResampleSinc
+			}
+			continue
+		}
+		if path == "" {
+			path = a
+		}
 	}
-	return args[1]
+	return path, rs
 }
 
 // probe is everything before playback: sniff the container, parse the
@@ -328,12 +352,17 @@ func (a *app) probe(path string) playState {
 		return stRefused
 	}
 	a.out = out
-	p := NewPipe(info, out, readBlock, vi.AudioPeriodBytes, nil)
+	p := NewPipe(info, out, readBlock, vi.AudioPeriodBytes, a.rs, nil)
 	a.outSecs = p.ExpectedFrames() / uint64(out.Rate)
 
 	vi.ConsoleLine(markerOut + outName(out) +
 		" rate=" + vi.Itoa64(int64(out.Rate)) + " ch=" + vi.Itoa64(int64(out.Channels)) +
 		" frames=" + vi.Itoa64(int64(p.ExpectedFrames())))
+	rsName := "sinc"
+	if a.rs == ResampleLinear {
+		rsName = "linear"
+	}
+	vi.ConsoleLine(markerResampler + rsName)
 	return stLoaded
 }
 
@@ -407,7 +436,7 @@ func (a *app) play() {
 	a.submitted = 0
 	a.st = stPlaying
 
-	p := NewPipe(a.info, a.out, readBlock, vi.AudioPeriodBytes, a.submit)
+	p := NewPipe(a.info, a.out, readBlock, vi.AudioPeriodBytes, a.rs, a.submit)
 	perr := p.Play(src)
 	vi.FileClose(uint32(h))
 
@@ -820,10 +849,16 @@ func outFmt(q vi.AudioInfo) (OutFmt, bool) {
 	return o, true
 }
 
-// tagName is the input format's display name ("pcm16", "float32").
+// tagName is the input format's display name ("pcm16", "float32",
+// "ima-adpcm", "ms-adpcm").
 func tagName(w WavInfo) string {
-	if w.Tag == FormatFloat {
+	switch w.Tag {
+	case FormatFloat:
 		return "float" + itoa(uint64(w.Bits))
+	case FormatIMA:
+		return "ima-adpcm"
+	case FormatMS:
+		return "ms-adpcm"
 	}
 	return "pcm" + itoa(uint64(w.Bits))
 }
@@ -954,7 +989,11 @@ func (a *app) draw() {
 			Value: int(a.position),
 		}).Draw(cv)
 		line(5, "p/space play  s stop  q quit", theme.Current.Muted)
-		line(6, "resample: linear interp", theme.Current.Muted)
+		rsLine := "resample: sinc 16-tap"
+		if a.rs == ResampleLinear {
+			rsLine = "resample: linear interp"
+		}
+		line(6, rsLine, theme.Current.Muted)
 		// The volume row: the slot-44 stream gain as the interactive slider.
 		volY := titleBandH + 10 + 7*14
 		webrender.DrawText(s, 8, volY, "VOL", 1, false, theme.Current.Muted, body)
