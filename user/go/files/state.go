@@ -28,6 +28,9 @@ const (
 	viewSplit viewMode = iota
 	// viewList drops the preview pane; the list spans the whole grid.
 	viewList
+	// viewGrid is the M167a (#2989) thumbnail grid: cell-mosaic tiles in
+	// the list pane, the focused image's sixel in the preview pane.
+	viewGrid
 )
 
 const (
@@ -171,6 +174,26 @@ type model struct {
 	// prompt rides the status row; the results frame shows the walk's
 	// hit set and its accounting.
 	search search
+
+	// M167a (#2989): the `t` thumbnail grid (grid.go). viewUnder is the
+	// pane view `t` returns to; gridTiles is the 64-tile cache keyed by
+	// path+size+mtime (cell colours only, gridOrder its FIFO eviction);
+	// gridRef/gridQueue are the current listing's resolved tiles and the
+	// lazy-decode backlog; gridTilesEmitted gates the one-shot stats
+	// marker; gridF* is the focused tile's sixel memo — the last decoded
+	// key, its sequence, thumbnail dims, the rung it was encoded under,
+	// and the last name the focus marker printed.
+	viewUnder        viewMode
+	gridTiles        map[gridKey]*gridTile
+	gridOrder        []gridKey
+	gridRef          []*gridTile
+	gridQueue        []int
+	gridTilesEmitted bool
+	gridFKey         gridKey
+	gridFSixel       []byte
+	gridFTW, gridFTH int
+	gridFCW, gridFCH uint32
+	gridFName        string
 }
 
 // hintsBin names this app's registry scope — the untagged twin of
@@ -254,6 +277,29 @@ func (m *model) clampSel() {
 // serialized `top` field restores against, and the thing a small window
 // would otherwise lose (M125c #2588).
 func (m *model) ensureSelVisible() {
+	if m.view == viewGrid {
+		// The grid's window is tile ROWS, not entry rows: m.top stays an
+		// entry index but is always a multiple of gridCols — the first
+		// entry of the first visible tile row.
+		gc, gr := m.gridCols(), m.gridRows()
+		tr, topTr := m.sel/gc, m.top/gc
+		if tr < topTr {
+			topTr = tr
+		} else if tr >= topTr+gr {
+			topTr = tr - gr + 1
+		}
+		rows := (m.n + gc - 1) / gc
+		if rows <= gr {
+			topTr = 0
+		} else if topTr > rows-gr {
+			topTr = rows - gr
+		}
+		if topTr < 0 {
+			topTr = 0
+		}
+		m.top = topTr * gc
+		return
+	}
 	body := m.bodyRows()
 	if m.sel < m.top {
 		m.top = m.sel
@@ -319,6 +365,9 @@ func (m *model) refresh() {
 	if m.n == 0 {
 		m.emit(markerEmpty + m.path)
 	}
+	if m.view == viewGrid {
+		m.gridSync()
+	}
 	m.loadPreview()
 }
 
@@ -376,6 +425,9 @@ func (m *model) refreshVolumes() {
 		m.emit(line)
 	}
 	m.status = "listed"
+	if m.view == viewGrid {
+		m.gridSync()
+	}
 	m.loadPreview()
 }
 
@@ -383,6 +435,12 @@ func (m *model) refreshVolumes() {
 // note, files get their bytes (sanitized, capped), and every successful file
 // load emits the M58a `gofiles: view …` marker.
 func (m *model) loadPreview() {
+	if m.view == viewGrid {
+		// M167a: the selection IS the grid's focus — re-arm the sixel and
+		// name it on the serial line. Runs ahead of the early returns so a
+		// dead selection still clears the focus.
+		m.gridFocus()
+	}
 	m.preview, m.previewOf, m.previewBig = "", "", false
 	if m.sel < 0 || m.sel >= m.n {
 		m.preview = "(no selection)"
@@ -647,7 +705,9 @@ func (m *model) handleClick(x, y int) {
 	if col >= m.listCols() {
 		return // preview pane: no click action in v1
 	}
-	idx := m.top + row - 2
+	// M167a: the hit is a row index in the list views, a tile index in
+	// the grid — entryIdxAt maps both.
+	idx := m.entryIdxAt(col, row)
 	if idx < 0 || idx >= m.n {
 		return
 	}
@@ -784,6 +844,56 @@ func (m *model) handleKey(ev keys.Event) {
 		return
 	}
 
+	// M167a (#2989): inside the grid the nav keys step by TILE — the
+	// verticals by a tile row, the horizontals by a tile column. h/l take
+	// the horizontal role here, so `h` is left (not up) and `l` is right
+	// (not open) while the grid stands; Backspace still climbs, Enter
+	// still opens.
+	if m.view == viewGrid {
+		switch ev.Key {
+		case keys.KeyUp:
+			m.gridMove(-1, 0)
+		case keys.KeyDown:
+			m.gridMove(1, 0)
+		case keys.KeyLeft:
+			m.gridMove(0, -1)
+		case keys.KeyRight:
+			m.gridMove(0, 1)
+		case keys.KeyPageUp:
+			m.gridMove(-m.gridRows(), 0)
+		case keys.KeyPageDown:
+			m.gridMove(m.gridRows(), 0)
+		case keys.KeyRune:
+			switch ev.Rune {
+			case 'j':
+				m.gridMove(1, 0)
+			case 'k':
+				m.gridMove(-1, 0)
+			case 'h':
+				m.gridMove(0, -1)
+			case 'l':
+				m.gridMove(0, 1)
+			default:
+				m.gridRune(ev.Rune)
+			}
+		case keys.KeyHome:
+			m.moveTo(0)
+		case keys.KeyEnd:
+			m.moveTo(m.n - 1)
+		case keys.KeyEnter:
+			m.openSel()
+		case keys.KeyBackspace, keys.KeyEsc:
+			m.goUp()
+		case keys.KeyCtrlC:
+			m.quit = true
+		case keys.KeyCtrlZ:
+			m.restoreLatest()
+		case keys.KeyTab:
+			m.toggleView()
+		}
+		return
+	}
+
 	switch ev.Key {
 	case keys.KeyUp:
 		m.move(-1)
@@ -857,6 +967,9 @@ func (m *model) handleKey(ev keys.Event) {
 			m.startOpenWith()
 		case 'e':
 			m.exportSel()
+		case 't':
+			// M167a (#2989): the thumbnail grid toggle.
+			m.toggleGrid()
 		case '?':
 			m.openHints()
 		}
@@ -942,13 +1055,21 @@ func (m model) listCols() int {
 
 // toggleView is the Tab chord: swap the two-pane frame for a full-width
 // list. The preview still loads — selection semantics are unchanged —
-// but nothing paints it in viewList.
+// but nothing paints it in viewList. M167a: from the grid, Tab steps out
+// to the OTHER pane view — it still does something visible rather than
+// toggling a pane the grid is hiding.
 func (m *model) toggleView() {
-	if m.view == viewSplit {
+	cur := m.view
+	if cur == viewGrid {
+		cur = m.viewUnder
+		m.gridFName = "" // re-entry re-emits the focus marker
+	}
+	if cur == viewSplit {
 		m.view = viewList
 	} else {
 		m.view = viewSplit
 	}
+	m.viewUnder = m.view
 	m.emit(markerViewMode + viewNameOf(m.view))
 	m.status = "view " + viewNameOf(m.view)
 }
@@ -956,6 +1077,9 @@ func (m *model) toggleView() {
 func viewNameOf(v viewMode) string {
 	if v == viewList {
 		return "list"
+	}
+	if v == viewGrid {
+		return "grid"
 	}
 	return "split"
 }
@@ -982,6 +1106,11 @@ func (m *model) cycleSort() {
 	m.ensureSelVisible()
 	m.emit(markerSort + sortNameOf(m.sort))
 	m.status = "sort " + sortNameOf(m.sort)
+	if m.view == viewGrid {
+		// The listing's order changed — the tile table's indices no
+		// longer name the same entries, so the queue is rebuilt.
+		m.gridSync()
+	}
 	m.loadPreview()
 }
 

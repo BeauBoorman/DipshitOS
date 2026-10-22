@@ -165,7 +165,9 @@ func (m *model) handleRightClick(x, y int) {
 		m.cancelCtx()
 		return
 	}
-	idx := m.top + row - 2
+	// M167a: the hit is a row index in the list views, a tile index in
+	// the grid — entryIdxAt maps both.
+	idx := m.entryIdxAt(col, row)
 	if idx < 0 || idx >= m.n {
 		m.cancelCtx()
 		return

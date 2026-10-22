@@ -407,6 +407,18 @@ func main() {
 			progress = true
 		}
 
+		// M167a (#2989): the grid's lazy decode — at most two tiles per
+		// loop pass, each pass its own painted frame so the placeholders
+		// visibly fill in. progress=true keeps the pass out of the idle
+		// branch until the queue drains (the same cadence the batch
+		// steps on).
+		if m.view == viewGrid && m.gridPending() {
+			if !stepTiles(&m, fd, ta) {
+				shutdown(ta, fd, 4)
+			}
+			progress = true
+		}
+
 		if !progress {
 			idlePasses++
 			// M81f (#1766): poll the change feed on the quiet cadence.
@@ -558,6 +570,22 @@ func drainBatch(m *model, fd uint32, ta *tabapp.TabApp) bool {
 			return false
 		}
 	}
+	return true
+}
+
+// stepTiles runs ONE lazy-decode pass of the M167a (#2989) grid — at most
+// gridDecodePerPass tile decodes — behind the post-paint marker barrier
+// every other app receipt uses: one pass, one frame, one flush. The
+// `gofiles: grid tiles decoded=…` marker lands on the pass that drains
+// the queue, so a gate waiting on it sees the finished tile field.
+func stepTiles(m *model, fd uint32, ta *tabapp.TabApp) bool {
+	m.gridStep()
+	if !paint(fd, *m) {
+		return false
+	}
+	vi.Sleep(1)
+	flush(m, ta)
+	vi.ConsoleLine(markerRepaint)
 	return true
 }
 

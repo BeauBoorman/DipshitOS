@@ -219,6 +219,19 @@ const (
 	markerSearchNo    = "files: search refused "
 	markerSearchClose = "files: search close"
 
+	// M167a (#2989): the `t` thumbnail grid. `grid on cols= rows=` is the
+	// layout the frame holds (tile columns x tile rows); `grid tiles
+	// decoded= failed=` is the lazy pass's accounting over the current
+	// listing — decoded tiles on screen and failed decodes, emitted once
+	// when the queue drains; `grid focus <name> thumb=<w>x<h>` names the
+	// cursor tile and its sixel thumbnail dims (0x0 when the focus has
+	// no image — a non-image, a volume row, or a refused decode). `grid
+	// off` is the toggle's return receipt.
+	markerGridOn    = "gofiles: grid on "
+	markerGridOff   = "gofiles: grid off"
+	markerGridTiles = "gofiles: grid tiles "
+	markerGridFocus = "gofiles: grid focus "
+
 	// The view/sort chords' own markers.
 	markerViewMode = "gofiles: viewmode "
 	markerSort     = "gofiles: sort "

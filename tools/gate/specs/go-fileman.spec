@@ -89,7 +89,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1396,15 +1396,22 @@ PY
 # markers (`gofiles: close`/`gofiles OK`) trail `dui close 2` by one
 # window-close round trip, so expecting the echo raced the teardown and
 # flaked the two close asserts (M155a fixup, observed 2026-10-21).
+#
+# M167a (#2989) extends the same boot: `t` after the QuickLook leg opens
+# the thumbnail grid in FMQ — LOOK.QOI's tile mosaic and its focus sixel
+# in the preview pane, WORDS.TXT a muted mime-word tile. The marker
+# capture and the close script both barrier on the lazy pass's stats
+# receipt: at `grid tiles decoded=1` every tile stands resolved and the
+# frame that shows them is already painted (markers flush post-paint).
 vgate_run 16 -- \
     --screen '$RUN_DIR/fileman-quicklook-screen' \
     --input --via-virtio \
     --script '$RUN_DIR/script-16.txt' \
-    --input-chords 'space,escape' \
+    --input-chords 'space,escape,t' \
     --input-chords-after 'gofiles: ready' \
-    --screenshot-after 'gofiles: quicklook LOOK.QOI kind=image' \
+    --screenshot-after 'gofiles: grid tiles decoded=1' \
     --script2 '$RUN_DIR/script2-16.txt' \
-    --script2-after 'gofiles: quicklook close' \
+    --script2-after 'gofiles: grid tiles decoded=1' \
     --script-expect 'gofiles OK' --timeout 240
 
 vgate_assert 16 serial-contains 'exec: loaded GOFILES.ELF'
@@ -1415,6 +1422,15 @@ vgate_assert 16 serial-contains 'gofiles: entry WORDS.TXT file'
 vgate_assert 16 serial-contains 'gofiles: quicklook LOOK.QOI kind=image 16x16 thumb=64x64'
 # Esc closed the pane; the window then tore down through dui close.
 vgate_assert 16 serial-contains 'gofiles: quicklook close'
+
+# M167a: `t` opened the grid — the tile field is 2 cols x 3 rows on the
+# 64x23 frame (a (10+1)x(5+1) pitch in the 28-cell list pane), the focus
+# marker names LOOK.QOI with its QuickLook-bounds thumb, and the lazy
+# pass's accounting counts the one staged image as decoded.
+vgate_assert 16 serial-contains 'gofiles: grid on cols=2 rows=3'
+vgate_assert 16 serial-contains 'gofiles: grid focus LOOK.QOI thumb=64x64'
+vgate_assert 16 serial-contains 'gofiles: grid tiles decoded=1 failed=0'
+
 vgate_assert 16 serial-contains 'gofiles: close'
 vgate_assert 16 serial-contains 'gofiles OK'
 vgate_assert 16 serial-contains 'rx-go-fileman-quicklook-ok'
@@ -1422,11 +1438,18 @@ vgate_assert 16 serial-absent '[EXC] parking:'
 vgate_assert 16 serial-absent 'exited status=139'
 
 # The scanout: 2x capture, client x=64..1088 y=96..832, cell 16x32 px. The
-# 64x64 thumb lands centred in the body band: tile cells 28..35 x rows
-# 9..12 -> x=512..640, y=384..512 of the capture. Each source quadrant is
-# a 32x32 logical block -> 64x64 capture px of flat image ink. Interiors
-# dodge the tile edges; the palette's percent round-trip is inside ~2, so
-# a 48 max-channel tolerance covers the capture path's colour shift.
+# M167a capture is the GRID frame at `grid tiles decoded=1` — two proofs
+# in one frame:
+#  * the tile mosaic: LOOK.QOI's tile is cells cols 0..9 x rows 2..6 ->
+#    x=64..224, y=160..288. The 16x16 quadrant source lands cells 0..4
+#    left / 5..9 right, mosaic rows 0..1 top / 3..4 bottom (row 2 mixes —
+#    dodged). Each cell is one flat 16x32 capture block.
+#  * the focus sixel: the same 64x64 thumb, centred in the preview pane —
+#    cells cols 42..49 x rows 9..12 -> x=736..864, y=384..512. Same
+#    quadrant layout the QuickLook pane's assert proved; the boxes below
+#    are that assert's, relocated to the pane.
+# Interiors dodge the tile edges; dominance survives the capture path's
+# hue-preserving shift where absolute RGB does not.
 vgate_assert 16 snapshot 'fileman-quicklook-screen-after' <<'PY'
 import struct, sys, zlib
 
@@ -1491,20 +1514,39 @@ def count(x0, x1, y0, y1, pred):
                 n += 1
     return n
 
-red = count(520, 568, 392, 440,
+# The tile mosaic: LOOK.QOI's quadrant colours on LOOK.QOI's tile —
+# cells 0..4 left / 5..9 right, screen rows 2..3 top / 5..6 bottom.
+tred = count(70, 140, 168, 216,
+             lambda r, g, b: r >= 150 and r >= g + 60 and r >= b + 60)
+tgreen = count(150, 220, 168, 216,
+               lambda r, g, b: g >= 150 and g >= r + 60 and g >= b + 60)
+tblue = count(70, 140, 260, 284,
+              lambda r, g, b: b >= 150 and b >= r + 60 and b >= g + 60)
+tyellow = count(150, 220, 260, 284,
+                lambda r, g, b: r >= 150 and g >= 150 and r >= b + 60 and g >= b + 60)
+print("grid tile scanout: red=%d green=%d blue=%d yellow=%d" %
+      (tred, tgreen, tblue, tyellow))
+assert tred >= 2000, "tile top-left quadrant ink absent from the grid"
+assert tgreen >= 2000, "tile top-right quadrant ink absent from the grid"
+assert tblue >= 1000, "tile bottom-left quadrant ink absent from the grid"
+assert tyellow >= 1000, "tile bottom-right quadrant ink absent from the grid"
+
+# The focus sixel in the preview pane — the same dominance boxes the
+# QuickLook pane's assert carried, relocated to the pane's centred thumb.
+red = count(744, 792, 392, 440,
             lambda r, g, b: r >= 150 and r >= g + 60 and r >= b + 60)
-green = count(584, 632, 392, 440,
+green = count(808, 856, 392, 440,
               lambda r, g, b: g >= 150 and g >= r + 60 and g >= b + 60)
-blue = count(520, 568, 456, 504,
+blue = count(744, 792, 456, 504,
              lambda r, g, b: b >= 150 and b >= r + 60 and b >= g + 60)
-yellow = count(584, 632, 456, 504,
+yellow = count(808, 856, 456, 504,
                lambda r, g, b: r >= 150 and g >= 150 and r >= b + 60 and g >= b + 60)
-print("quicklook scanout: red=%d green=%d blue=%d yellow=%d" %
+print("grid focus sixel: red=%d green=%d blue=%d yellow=%d" %
       (red, green, blue, yellow))
-assert red >= 1000, "image top-left quadrant ink absent from the pane"
-assert green >= 1000, "image top-right quadrant ink absent from the pane"
-assert blue >= 1000, "image bottom-left quadrant ink absent from the pane"
-assert yellow >= 1000, "image bottom-right quadrant ink absent from the pane"
+assert red >= 1000, "sixel top-left quadrant ink absent from the pane"
+assert green >= 1000, "sixel top-right quadrant ink absent from the pane"
+assert blue >= 1000, "sixel bottom-left quadrant ink absent from the pane"
+assert yellow >= 1000, "sixel bottom-right quadrant ink absent from the pane"
 PY
 
 # Run 17: j lands on WORDS.TXT, space opens the 40-line text arm, the

@@ -13,8 +13,10 @@
 //	u16 pathLen LE | u8 path[pathLen]  — cwd, <= maxPath (the kernel's
 //	                      64-byte path cap keeps the whole blob ~73 B)
 //	u16 sel LE          — cursor (listing index)
-//	u16 top LE          — scroll (first visible row)
-//	u8  view            — viewMode
+//	u16 top LE          — scroll (first visible row; a tile-row index in
+//	                      the M167a grid, still first-entry units)
+//	u8  view            — viewMode (M167a added the grid value; the byte
+//	                      layout is unchanged)
 //	u8  sort            — sortMode
 //
 // Multi-byte fields are little-endian, matching the seat's envelope
@@ -101,7 +103,7 @@ func decodeState(b []byte) (filesState, bool) {
 	if st.top >= vi.MaxDirEntries {
 		st.top = vi.MaxDirEntries - 1
 	}
-	if st.view > viewList {
+	if st.view > viewGrid {
 		st.view = viewSplit
 	}
 	if st.sort >= sortModeCount {
@@ -153,5 +155,12 @@ func (m *model) applyState(st filesState) {
 	}
 	m.top = st.top
 	m.ensureSelVisible()
+	if m.view == viewGrid {
+		// M167a: a restored grid session reopens in the grid — the tile
+		// queue is rebuilt against the fresh listing (the cache, keyed by
+		// path+size+mtime, serves what still matches).
+		m.viewUnder = viewSplit
+		m.gridSync()
+	}
 	m.loadPreview()
 }

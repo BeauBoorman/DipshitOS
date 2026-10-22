@@ -75,6 +75,16 @@ func (m model) render() string {
 	if m.mode == modeContext {
 		frame += m.renderCtxMenu()
 	}
+	// M167a: the focused tile's sixel rides after the frame behind a CUP
+	// into the preview pane — the kernel's image cells replace the blank
+	// rows the frame just painted, and every repaint re-places it (the
+	// same append rule the QuickLook image arm uses).
+	if m.view == viewGrid && len(m.gridFSixel) > 0 {
+		var b strings.Builder
+		r, c, _, _ := m.gridSixelSpan()
+		cup(&b, r, c)
+		frame += b.String() + string(m.gridFSixel)
+	}
 	return frame
 }
 
@@ -342,17 +352,25 @@ func (m model) renderLines() []string {
 				colSep+"│"+colReset+
 				colHead+rhead+strings.Repeat(" ", pw-visLen(rhead))+colReset)
 
-		// Body: list rows | separator | preview rows.
+		// Body: list rows | separator | preview rows. M167a: the grid
+		// fills the list pane with its tile field and blanks the preview
+		// rows the focus sixel covers.
 		plines := strings.Split(m.preview, "\n")
 		for i := 0; i < body; i++ {
-			lines = append(lines, m.listRow(i, lw)+colSep+"│"+colReset+m.previewRow(i, plines, pw))
+			left := m.listRow(i, lw)
+			right := m.previewRow(i, plines, pw)
+			if m.view == viewGrid {
+				left = m.gridPaneRow(i, lw)
+				right = m.gridPreviewRow(i, plines, pw)
+			}
+			lines = append(lines, left+colSep+"│"+colReset+right)
 		}
 	}
 
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · / search · space look · i props · o open with · e export · v volumes · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("j/k move · enter open · / search · space look · i props · o open with · e export · t grid · v volumes · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }
