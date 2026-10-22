@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"virelai/pcm"
 	"virelai/tabapp"
 	"virelai/vi"
 )
@@ -91,85 +92,6 @@ func readyInfo() vi.AudioCapInfo {
 	}
 }
 
-// --- the pure half ---------------------------------------------------------
-
-func TestWavHeaderGolden(t *testing.T) {
-	var h [wavHeaderLen]byte
-	writeWavHeader(h[:], 192000)
-	want := append([]byte("RIFF"),
-		[]byte{0x24, 0xee, 0x02, 0x00}...) // 36 + 192000 = 192036
-	want = append(want, []byte("WAVEfmt ")...)
-	want = append(want,
-		0x10, 0, 0, 0, // fmt size 16
-		1, 0, // PCM
-		1, 0, // mono
-		0x80, 0xbb, 0, 0, // 48000
-		0x00, 0x77, 0x01, 0, // 96000 byte rate
-		2, 0, // block align
-		16, 0, // bits
-	)
-	want = append(want, []byte("data")...)
-	want = append(want, 0x00, 0xee, 0x02, 0) // 192000
-	if len(want) != wavHeaderLen {
-		t.Fatalf("golden is %d bytes, want %d", len(want), wavHeaderLen)
-	}
-	for i := range want {
-		if h[i] != want[i] {
-			t.Fatalf("header byte %d: got %02x want %02x", i, h[i], want[i])
-		}
-	}
-}
-
-func TestPcmArithmetic(t *testing.T) {
-	if pcmBytes(2) != 192000 {
-		t.Fatalf("pcmBytes(2) = %d, want 192000", pcmBytes(2))
-	}
-	if pcmFrames(pcmBytes(2)) != 96000 {
-		t.Fatalf("pcmFrames = %d, want 96000", pcmFrames(pcmBytes(2)))
-	}
-	if wavByteRate != 96000 || wavFrameBytes != 2 {
-		t.Fatal("v1 tuple geometry drifted")
-	}
-}
-
-func TestParseSeconds(t *testing.T) {
-	for s, want := range map[string]int{"1": 1, "2": 2, "30": 30} {
-		got, ok := parseSeconds(s)
-		if !ok || got != want {
-			t.Fatalf("parseSeconds(%q) = %d,%v want %d,true", s, got, ok, want)
-		}
-	}
-	for _, s := range []string{"", "0", "31", "-1", "2.5", "abc", " 2", "9999"} {
-		if _, ok := parseSeconds(s); ok {
-			t.Fatalf("parseSeconds(%q) accepted", s)
-		}
-	}
-}
-
-func TestValidOutPath(t *testing.T) {
-	for _, p := range []string{
-		"/host/GOREC/clip.wav", "/host/clip.wav", "/disk/R.wav",
-		"/host/A/B/C/d.wav",
-	} {
-		if why := validOutPath(p); why != "" {
-			t.Fatalf("validOutPath(%q) refused: %s", p, why)
-		}
-	}
-	for p, why := range map[string]string{
-		"/tmp/x.wav":                       "outside /host or /disk",
-		"/hostx/c.wav":                     "outside /host or /disk",
-		"/host/../x.wav":                   "bad segment",
-		"/host//x.wav":                     "bad segment",
-		"/host/a//b.wav":                   "bad segment",
-		"/host/":                           "bad segment",
-		"/host/" + strings.Repeat("a", 60): "over path cap",
-	} {
-		if got := validOutPath(p); got != why {
-			t.Fatalf("validOutPath(%q) = %q, want %q", p, got, why)
-		}
-	}
-}
-
 // --- the record loop -------------------------------------------------------
 
 // The happy path pins the whole evidence chain: the call-size ladder (the
@@ -199,19 +121,19 @@ func TestRunRecordsTwoSeconds(t *testing.T) {
 		t.Fatalf("writes=%v", f.writes)
 	}
 	body := f.writes[0].body
-	if len(body) != wavHeaderLen+192000 {
-		t.Fatalf("body is %d bytes, want %d", len(body), wavHeaderLen+192000)
+	if len(body) != pcm.WavHeaderLen+192000 {
+		t.Fatalf("body is %d bytes, want %d", len(body), pcm.WavHeaderLen+192000)
 	}
 	// The file image IS header+PCM: the data chunk must be the bytes the
 	// fake produced (index mod 251), proving the capture landed in place.
 	for i := 0; i < 192000; i++ {
-		if body[wavHeaderLen+i] != byte(i%251) {
+		if body[pcm.WavHeaderLen+i] != byte(i%251) {
 			t.Fatalf("PCM byte %d = %02x, want %02x", i,
-				body[wavHeaderLen+i], byte(i%251))
+				body[pcm.WavHeaderLen+i], byte(i%251))
 		}
 	}
-	var hdr [wavHeaderLen]byte
-	writeWavHeader(hdr[:], 192000)
+	var hdr [pcm.WavHeaderLen]byte
+	pcm.WriteWavHeader(hdr[:], 192000)
 	for i := range hdr {
 		if body[i] != hdr[i] {
 			t.Fatalf("header byte %d mismatch", i)

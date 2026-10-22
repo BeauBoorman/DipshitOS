@@ -1,9 +1,9 @@
-// Host corpus for the M162d (#2980) half of GOSOUND.ELF: the IMA and MS
-// ADPCM decoders against pinned vectors (each documented with the hand
+// Host corpus for the M162d (#2980) half of the pcm package: the IMA and
+// MS ADPCM decoders against pinned vectors (each documented with the hand
 // arithmetic), the flipped refusal pins, the partial-block frame counts —
-// and the windowed-sinc resampler's passband/stopband on synthetic tones,
-// its unity-rate identity, and the arg parser. No guest, no syscall.
-package main
+// and the windowed-sinc resampler's passband/stopband on synthetic tones
+// and its unity-rate identity. No guest, no syscall.
+package pcm
 
 import (
 	"errors"
@@ -487,27 +487,5 @@ func TestSincSweep(t *testing.T) {
 	linStop := toneRMS(t, 20000, 48000, 24000, ResampleLinear)
 	if sincStop > linStop/4 {
 		t.Fatalf("sinc stopband %v not well below linear alias %v", sincStop, linStop)
-	}
-}
-
-func TestParsePlayArgs(t *testing.T) {
-	cases := []struct {
-		args []string
-		path string
-		rs   Resampler
-	}{
-		{[]string{"/host/x.wav"}, "/host/x.wav", ResampleSinc},
-		{[]string{"/host/x.wav", "--resampler=linear"}, "/host/x.wav", ResampleLinear},
-		{[]string{"--resampler=linear", "/host/x.wav"}, "/host/x.wav", ResampleLinear},
-		{[]string{"--resampler=sinc", "/host/x.wav"}, "/host/x.wav", ResampleSinc},
-		// An unknown value falls back to the default, not a refusal.
-		{[]string{"--resampler=bogus", "/host/x.wav"}, "/host/x.wav", ResampleSinc},
-		{nil, "", ResampleSinc},
-	}
-	for i, c := range cases {
-		path, rs := parsePlayArgs(c.args)
-		if path != c.path || rs != c.rs {
-			t.Fatalf("case %d: got (%q,%d), want (%q,%d)", i, path, rs, c.path, c.rs)
-		}
 	}
 }

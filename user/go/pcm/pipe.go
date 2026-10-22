@@ -17,7 +17,7 @@
 // — the count of i with floor(i*inR/outR) <= in-1, i.e. every output whose
 // sampling position lands inside the input. The guest gate recomputes this
 // in Python and asserts the stream's completed bytes equal it exactly.
-package main
+package pcm
 
 import "math"
 
@@ -101,6 +101,54 @@ const (
 	fmtFloat uint8 = 19
 )
 
+// rateHzTable decodes a RATE_* code to Hz. Index = virtio-snd rate bit;
+// the kernel's snd_rate_hz only negotiates the 8k..48k span, and the seat
+// params carry the CODE verbatim regardless — this table is for the
+// resampler, which needs the real Hz.
+var rateHzTable = [...]uint32{
+	5512, 8000, 11025, 16000, 22050, 32000, 44100, 48000,
+	64000, 88200, 96000, 176400, 192000, 384000,
+}
+
+// RateHz decodes a kernel RATE_* code to samples per second (0 = unknown).
+func RateHz(code uint8) uint32 {
+	if int(code) < len(rateHzTable) {
+		return rateHzTable[code]
+	}
+	return 0
+}
+
+// OutFormat validates a negotiated device tuple into a pipeline OutFmt.
+// The seat params get the kernel's codes verbatim (the mixer refuses
+// anything that is not exactly what AudioQuery reported); the resampler
+// gets the decoded Hz.
+func OutFormat(format, rateCode, channels uint8) (OutFmt, bool) {
+	var o OutFmt
+	switch format {
+	case fmtS16, fmtS32, fmtFloat:
+		o.Fmt = format
+	default:
+		return o, false
+	}
+	hz := RateHz(rateCode)
+	if hz == 0 || channels < 1 || channels > 2 {
+		return o, false
+	}
+	o.Code, o.Rate, o.Channels = rateCode, hz, uint16(channels)
+	return o, true
+}
+
+// Name is the negotiated format's display name ("s16", "s32", "f32").
+func (o OutFmt) Name() string {
+	switch o.Fmt {
+	case fmtS16:
+		return "s16"
+	case fmtS32:
+		return "s32"
+	}
+	return "f32"
+}
+
 // put encodes one stereo f32 frame at the end of buf and returns the byte
 // count. Mono output writes the mid channel. Callers only hand a full frame
 // of room, so put never writes partial.
@@ -160,14 +208,17 @@ func putF32(b []byte, v float32) {
 	b[3] = byte(u >> 24)
 }
 
+// Sink is the device-write seam: it owns each completed output period. An
+// error from it stops the pump and propagates (the guest's stop control
+// uses it to unwind mid-stream).
+type Sink func(period []byte) error
+
 // Pipe is the bounded streaming pipeline: read a block, decode whole frames,
 // resample into the output period, hand full periods to sink. Its buffers are
 // allocated once at construction — Play allocates nothing per call.
 //
 // src supplies the file's bytes starting at the PCM data (the parser leaves
-// its source positioned there). sink owns each completed output period; an
-// error from it stops the pump and propagates (the guest's stop control uses
-// it to unwind mid-stream).
+// its source positioned there).
 type Pipe struct {
 	info WavInfo
 	out  OutFmt
@@ -202,14 +253,14 @@ type Pipe struct {
 	in       uint64
 	produced uint64
 
-	sink func(period []byte) error
+	sink Sink
 }
 
 // NewPipe builds the pipeline for one parsed header and one negotiated
 // output tuple. rblk is the read-block size; period is the output staging
 // size (vi.AudioPeriodBytes) — all buffers are allocated here and never
 // again, sized by the codec's own bounds.
-func NewPipe(info WavInfo, out OutFmt, rblk, period int, rs Resampler, sink func([]byte) error) *Pipe {
+func NewPipe(info WavInfo, out OutFmt, rblk, period int, rs Resampler, sink Sink) *Pipe {
 	p := &Pipe{
 		info:   info,
 		out:    out,
@@ -328,7 +379,7 @@ func (p *Pipe) finish() error {
 //
 // A source that ends before DataSize is a `data truncated` refusal: the
 // declared length, not the physical file, is what was promised to play.
-func (p *Pipe) Play(src byteSource) error {
+func (p *Pipe) Play(src Source) error {
 	if p.info.Tag == FormatIMA || p.info.Tag == FormatMS {
 		return p.playADPCM(src)
 	}
@@ -367,7 +418,7 @@ func (p *Pipe) Play(src byteSource) error {
 // block header that carries its own predictor state, so frames cannot be
 // picked off a byte stream the way PCM's can. Memory is still one block
 // (p.blk) plus its decoded staging (p.pcm), both allocated at NewPipe.
-func (p *Pipe) playADPCM(src byteSource) error {
+func (p *Pipe) playADPCM(src Source) error {
 	want := p.info.DataSize
 	for want > 0 {
 		n := int(p.info.BlockAlign)

@@ -2,15 +2,16 @@
 // for the `audio` mime type. Double-clicking a .wav in GOFILES lands here
 // (mime.Register in virelai/mime's init names this binary for Audio).
 //
-// The shape is the card's: RIFF/WAVE is parsed as a stream (wav.go — PCM,
-// float, and since M162d the two ADPCM codecs, decoded one block at a
+// The shape is the card's: RIFF/WAVE is parsed as a stream (virelai/pcm —
+// PCM, float, and since M162d the two ADPCM codecs, decoded one block at a
 // time), the samples are resampled into the mixer's negotiated tuple by a
-// 16-tap windowed sinc (sinc.go; --resampler=linear keeps the M99c lerp),
-// and playback is M99b's vi.AudioStream on slot 43. Memory is constant in
+// 16-tap windowed sinc (--resampler=linear keeps the M99c lerp), and
+// playback is M99b's vi.AudioStream on slot 43. Memory is constant in
 // the file's size: one read block, one output period, the resampler
 // window.
 //
-// M118e (issue #2483) adds the record half (rec.go / recwav.go): argv verbs
+// M118e (issue #2483) adds the record half (rec.go over pcm's capture
+// contract): argv verbs
 // `record <seconds> <out.wav>` and `meter [seconds]` run the kernel's ONE
 // capture stream (slot 92, v1 tuple S16/48k/mono) with a live mic meter in
 // the same window — GOREC's bounded flow adopted by the player.
@@ -24,6 +25,7 @@ import (
 	"strings"
 
 	"virelai/draw"
+	"virelai/pcm"
 	"virelai/settings"
 	"virelai/tabapp"
 	"virelai/theme"
@@ -124,9 +126,9 @@ type app struct {
 	st     playState
 	reason string // stRefused text
 
-	info     WavInfo
-	out      OutFmt
-	rs       Resampler
+	info     pcm.WavInfo
+	out      pcm.OutFmt
+	rs       pcm.Resampler
 	inSecs   uint64 // input duration, whole seconds
 	outSecs  uint64 // resampled duration
 	position uint64 // output seconds submitted (playing position)
@@ -266,15 +268,15 @@ func (a *app) exit(status int) {
 // the canonical share path GOFILES hands handlers; `--resampler=sinc|linear`
 // picks the interpolation engine (sinc is the default, linear keeps the
 // M99c path for comparison).
-func parsePlayArgs(args []string) (path string, rs Resampler) {
-	rs = ResampleSinc
+func parsePlayArgs(args []string) (path string, rs pcm.Resampler) {
+	rs = pcm.ResampleSinc
 	for _, a := range args {
 		if v, ok := strings.CutPrefix(a, "--resampler="); ok {
 			switch v {
 			case "linear":
-				rs = ResampleLinear
+				rs = pcm.ResampleLinear
 			case "sinc":
-				rs = ResampleSinc
+				rs = pcm.ResampleSinc
 			}
 			continue
 		}
@@ -303,7 +305,7 @@ func (a *app) probe(path string) playState {
 		a.reason = "unreadable " + a.name
 		return stRefused
 	}
-	if c := Container(a.name, head[:n]); c != "wav" {
+	if c := pcm.Container(a.name, head[:n]); c != "wav" {
 		vi.FileClose(uint32(h))
 		vi.ConsoleLine("gosound: " + c + ": no decoder")
 		a.reason = c + ": no decoder"
@@ -311,18 +313,18 @@ func (a *app) probe(path string) playState {
 	}
 	size := a.fileSize()
 	src := catSource(head[:n], fileReader(uint32(h)))
-	info, err := ParseWav(src, size)
+	info, err := pcm.ParseWav(src, size)
 	vi.FileClose(uint32(h))
 	if err != nil {
 		name := "unreadable"
-		if errors.Is(err, ErrNeedMore) {
+		if errors.Is(err, pcm.ErrNeedMore) {
 			name = "truncated header"
 		}
-		var we *WavError
+		var we *pcm.WavError
 		if errors.As(err, &we) {
 			name = we.Name
 			if we.Detail != 0 {
-				name += " " + itoa(we.Detail)
+				name += " " + vi.Itoa64(int64(we.Detail))
 			}
 		}
 		vi.ConsoleLine(markerRefused + name)
@@ -334,7 +336,7 @@ func (a *app) probe(path string) playState {
 
 	// `loaded` reports the FILE's parse, so a soundless boot still shows the
 	// header was read before "no audio device" closes.
-	vi.ConsoleLine(markerLoaded + a.name + " fmt=" + tagName(info) +
+	vi.ConsoleLine(markerLoaded + a.name + " fmt=" + info.TagName() +
 		" ch=" + vi.Itoa64(int64(info.Channels)) + " rate=" + vi.Itoa64(int64(info.Rate)) +
 		" frames=" + vi.Itoa64(int64(info.Frames)))
 
@@ -344,7 +346,7 @@ func (a *app) probe(path string) playState {
 	if err != nil || q.Ready == 0 {
 		return stNoDevice
 	}
-	out, ok := outFmt(q)
+	out, ok := pcm.OutFormat(q.Format, q.Rate, q.Channels)
 	if !ok {
 		vi.ConsoleLine(markerStreamErr + "out fmt=" + vi.Itoa64(int64(q.Format)) +
 			" rate=" + vi.Itoa64(int64(q.Rate)) + " ch=" + vi.Itoa64(int64(q.Channels)))
@@ -352,14 +354,14 @@ func (a *app) probe(path string) playState {
 		return stRefused
 	}
 	a.out = out
-	p := NewPipe(info, out, readBlock, vi.AudioPeriodBytes, a.rs, nil)
+	p := pcm.NewPipe(info, out, readBlock, vi.AudioPeriodBytes, a.rs, nil)
 	a.outSecs = p.ExpectedFrames() / uint64(out.Rate)
 
-	vi.ConsoleLine(markerOut + outName(out) +
+	vi.ConsoleLine(markerOut + out.Name() +
 		" rate=" + vi.Itoa64(int64(out.Rate)) + " ch=" + vi.Itoa64(int64(out.Channels)) +
 		" frames=" + vi.Itoa64(int64(p.ExpectedFrames())))
 	rsName := "sinc"
-	if a.rs == ResampleLinear {
+	if a.rs == pcm.ResampleLinear {
 		rsName = "linear"
 	}
 	vi.ConsoleLine(markerResampler + rsName)
@@ -401,7 +403,7 @@ func (a *app) play() {
 	// Re-parse to land at the data offset (the header walk is cheap and
 	// keeps replay honest — a file that changed under us is refused fresh).
 	src := fileReader(uint32(h))
-	if _, err := ParseWav(src, 0); err != nil {
+	if _, err := pcm.ParseWav(src, 0); err != nil {
 		vi.FileClose(uint32(h))
 		vi.ConsoleLine(markerRefused + "re-parse")
 		a.st = stRefused
@@ -436,7 +438,7 @@ func (a *app) play() {
 	a.submitted = 0
 	a.st = stPlaying
 
-	p := NewPipe(a.info, a.out, readBlock, vi.AudioPeriodBytes, a.rs, a.submit)
+	p := pcm.NewPipe(a.info, a.out, readBlock, vi.AudioPeriodBytes, a.rs, a.submit)
 	perr := p.Play(src)
 	vi.FileClose(uint32(h))
 
@@ -449,7 +451,7 @@ func (a *app) play() {
 	case perr != nil:
 		stream.Abort()
 		a.stream = nil
-		var we *WavError
+		var we *pcm.WavError
 		if errors.As(perr, &we) {
 			vi.ConsoleLine(markerRefused + we.Name)
 		} else {
@@ -729,17 +731,17 @@ func (a *app) quitApp() {
 }
 
 // ---------------------------------------------------------------------------
-// Sources: the adapters between vi's file handles and the parser's byteSource.
+// Sources: the adapters between vi's file handles and the parser's pcm.Source.
 
-// sysErr carries a raw negative kernel result through a byteSource's error
+// sysErr carries a raw negative kernel result through a pcm.Source's error
 // return; its text is only ever logged, never matched on.
 type sysErr int64
 
 func (e sysErr) Error() string { return "sys " + vi.Itoa64(int64(e)) }
 
-// fileReader adapts one open share handle to byteSource. A kernel short read
+// fileReader adapts one open share handle to pcm.Source. A kernel short read
 // just makes the next fill smaller; n<=0 is EOF; a refusal propagates.
-func fileReader(h uint32) byteSource {
+func fileReader(h uint32) pcm.Source {
 	return func(buf []byte) (int, error) {
 		n, r := vi.FileRead(h, buf)
 		if r < 0 {
@@ -754,7 +756,7 @@ func fileReader(h uint32) byteSource {
 
 // catSource serves the already-read sniff head first, then the rest of the
 // file — the parser sees one continuous stream and no seek is needed.
-func catSource(head []byte, rest byteSource) byteSource {
+func catSource(head []byte, rest pcm.Source) pcm.Source {
 	off := 0
 	return func(buf []byte) (int, error) {
 		if off < len(head) {
@@ -770,7 +772,7 @@ func catSource(head []byte, rest byteSource) byteSource {
 // shell-canonical form ListDirAt wants (/-rooted, /host stripped) and the
 // entry name.
 func splitDir(path string) (canon, base string) {
-	i := lastByte(path, '/')
+	i := strings.LastIndexByte(path, '/')
 	if i < 0 {
 		return "/", path
 	}
@@ -788,7 +790,7 @@ func splitDir(path string) (canon, base string) {
 }
 
 func basename(path string) string {
-	if i := lastByte(path, '/'); i >= 0 {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
 		return path[i+1:]
 	}
 	return path
@@ -814,74 +816,14 @@ func (a *app) title() string {
 	return titleOf(a.path)
 }
 
-// rateHzTable decodes a RATE_* code to Hz. Index = virtio-snd rate bit;
-// the kernel's snd_rate_hz only negotiates the 8k..48k span, and the seat
-// params carry the CODE verbatim regardless — this table is for the
-// resampler, which needs the real Hz.
-var rateHzTable = [...]uint32{
-	5512, 8000, 11025, 16000, 22050, 32000, 44100, 48000,
-	64000, 88200, 96000, 176400, 192000, 384000,
-}
-
-func rateHz(code uint8) uint32 {
-	if int(code) < len(rateHzTable) {
-		return rateHzTable[code]
-	}
-	return 0
-}
-
-// outFmt validates the negotiated tuple into the pipeline's OutFmt. The seat
-// params get the kernel's codes verbatim (the mixer refuses anything that is
-// not exactly what AudioQuery reported); the resampler gets the decoded Hz.
-func outFmt(q vi.AudioInfo) (OutFmt, bool) {
-	var o OutFmt
-	switch q.Format {
-	case vi.AudioFmtS16, vi.AudioFmtS32, vi.AudioFmtFloat:
-		o.Fmt = q.Format
-	default:
-		return o, false
-	}
-	hz := rateHz(q.Rate)
-	if hz == 0 || q.Channels < 1 || q.Channels > 2 {
-		return o, false
-	}
-	o.Code, o.Rate, o.Channels = q.Rate, hz, uint16(q.Channels)
-	return o, true
-}
-
-// tagName is the input format's display name ("pcm16", "float32",
-// "ima-adpcm", "ms-adpcm").
-func tagName(w WavInfo) string {
-	switch w.Tag {
-	case FormatFloat:
-		return "float" + itoa(uint64(w.Bits))
-	case FormatIMA:
-		return "ima-adpcm"
-	case FormatMS:
-		return "ms-adpcm"
-	}
-	return "pcm" + itoa(uint64(w.Bits))
-}
-
-// outName is the negotiated format's display name.
-func outName(o OutFmt) string {
-	switch o.Fmt {
-	case fmtS16:
-		return "s16"
-	case fmtS32:
-		return "s32"
-	}
-	return "f32"
-}
-
 // clock renders whole seconds as m:ss.
 func clock(s uint64) string {
-	m := itoa(s / 60)
+	m := vi.Itoa64(int64(s / 60))
 	sec := s % 60
 	if sec < 10 {
-		return m + ":0" + itoa(sec)
+		return m + ":0" + vi.Itoa64(int64(sec))
 	}
-	return m + ":" + itoa(sec)
+	return m + ":" + vi.Itoa64(int64(sec))
 }
 
 // ---------------------------------------------------------------------------
@@ -964,9 +906,9 @@ func (a *app) draw() {
 		// Loaded/playing/stopped/done: the track line, the position readout
 		// and a thin progress bar.
 		line(0, a.name, theme.Current.Text)
-		line(1, tagName(a.info)+" "+itoa(uint64(a.info.Channels))+"ch "+
-			itoa(uint64(a.info.Rate))+"Hz -> "+outName(a.out)+" "+
-			itoa(uint64(a.out.Rate))+"Hz", theme.Current.Muted)
+		line(1, a.info.TagName()+" "+vi.Itoa64(int64(a.info.Channels))+"ch "+
+			vi.Itoa64(int64(a.info.Rate))+"Hz -> "+a.out.Name()+" "+
+			vi.Itoa64(int64(a.out.Rate))+"Hz", theme.Current.Muted)
 		state := "playing"
 		switch a.st {
 		case stLoaded:
@@ -990,7 +932,7 @@ func (a *app) draw() {
 		}).Draw(cv)
 		line(5, "p/space play  s stop  q quit", theme.Current.Muted)
 		rsLine := "resample: sinc 16-tap"
-		if a.rs == ResampleLinear {
+		if a.rs == pcm.ResampleLinear {
 			rsLine = "resample: linear interp"
 		}
 		line(6, rsLine, theme.Current.Muted)
@@ -1041,7 +983,7 @@ func (a *app) drawRec(s webrender.Surface, cv widgets.Canvas, body webrender.Cli
 
 	line(3, "level "+vi.Itoa64(int64(a.recLevel))+"%  peak "+
 		vi.Itoa64(int64(a.recPeak))+"%", theme.Current.Text)
-	line(4, clock(uint64(a.recGot)/uint64(wavRecByteRate))+" / "+
+	line(4, clock(uint64(a.recGot)/uint64(pcm.CaptureByteRate))+" / "+
 		clock(uint64(a.recSecs)), theme.Current.Muted)
 
 	state := "recording"

@@ -14,7 +14,7 @@
 // The MS header's own quirk is worth pinning: the file stores iSamp1 then
 // iSamp2 per channel, but the OUTPUT order is iSamp2, iSamp1 — the
 // predictor treats samp1 as the most recent sample.
-package main
+package pcm
 
 // imaStep is the IMA/DVI step table (89 entries); imaIndex is the
 // nibble-indexed step-index delta.

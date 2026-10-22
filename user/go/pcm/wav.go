@@ -1,5 +1,5 @@
-// wav.go — the M99c (issue #2181) RIFF/WAVE reader, the pure half of
-// GOSOUND.ELF's input side. Nothing here touches a syscall: the parser reads
+// wav.go — the M99c (issue #2181) RIFF/WAVE reader, the parse half of the
+// pcm package's input side. Nothing here touches a syscall: the parser reads
 // through a caller-supplied byte source so the host corpus can drive it with
 // slices and the guest with vi.FileRead.
 //
@@ -8,7 +8,7 @@
 // real sizes; ADPCM codecs declare extension fields), and every refusal is
 // a NAME (WavError.Name) a marker or test can assert verbatim rather than a
 // formatted sentence.
-package main
+package pcm
 
 import "errors"
 
@@ -76,9 +76,9 @@ type WavError struct {
 
 func (e *WavError) Error() string {
 	if e.Detail != 0 {
-		return "gosound: refused " + e.Name + " " + itoa(e.Detail)
+		return "wav: refused " + e.Name + " " + itoa(e.Detail)
 	}
-	return "gosound: refused " + e.Name
+	return "wav: refused " + e.Name
 }
 
 func refuse(name string) *WavError { return &WavError{Name: name} }
@@ -99,13 +99,9 @@ var compressedTags = map[uint16]string{
 	0x2000: "ac3",
 }
 
-// byteSource is the one read seam: fill buf, return (n, err), n==0 && err==nil
-// means EOF. The guest adapts vi.FileRead; the tests adapt a slice.
-type byteSource func(buf []byte) (int, error)
-
 // readFull fills buf exactly or fails — a short read at EOF is a truncated
 // structure, and a caller error propagates.
-func readFull(src byteSource, buf []byte) error {
+func readFull(src Source, buf []byte) error {
 	got := 0
 	for got < len(buf) {
 		n, err := src(buf[got:])
@@ -123,7 +119,7 @@ func readFull(src byteSource, buf []byte) error {
 // skip discards n bytes of chunk body through the same bounded scratch; the
 // header walk never holds more than this one buffer regardless of how large a
 // skipped chunk claims to be.
-func skip(src byteSource, n uint64, scratch []byte) error {
+func skip(src Source, n uint64, scratch []byte) error {
 	for n > 0 {
 		want := uint64(len(scratch))
 		if n < want {
@@ -154,7 +150,7 @@ func skip(src byteSource, n uint64, scratch []byte) error {
 // src is left positioned at the first PCM byte: the streamer keeps reading
 // from the SAME source, which is what keeps memory constant — no rewind, no
 // second open, no buffered header.
-func ParseWav(src byteSource, fileSize uint64) (WavInfo, error) {
+func ParseWav(src Source, fileSize uint64) (WavInfo, error) {
 	var hdr [12]byte
 	if err := readFull(src, hdr[:]); err != nil {
 		return WavInfo{}, err
@@ -428,52 +424,16 @@ func Container(name string, head []byte) string {
 	return "unknown"
 }
 
-func lastByte(s string, c byte) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == c {
-			return i
-		}
+// TagName is the input format's display name ("pcm16", "float32",
+// "ima-adpcm", "ms-adpcm") — the name the `fmt=` marker reports.
+func (w WavInfo) TagName() string {
+	switch w.Tag {
+	case FormatFloat:
+		return "float" + itoa(uint64(w.Bits))
+	case FormatIMA:
+		return "ima-adpcm"
+	case FormatMS:
+		return "ms-adpcm"
 	}
-	return -1
-}
-
-func lower(s string) string {
-	b := []byte(s)
-	for i, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			b[i] = c + 32
-		}
-	}
-	return string(b)
-}
-
-func le16(b []byte) uint16 { return uint16(b[0]) | uint16(b[1])<<8 }
-
-func le32(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
-
-// hex4 renders a 16-bit tag for the refusal name (no fmt in the guest build).
-func hex4(v uint16) string {
-	const digs = "0123456789abcdef"
-	return string([]byte{
-		digs[v>>12&0xf], digs[v>>8&0xf], digs[v>>4&0xf], digs[v&0xf],
-	})
-}
-
-// itoa is the parser-local integer formatter, kept free of the vi import so
-// this file stays pure (the GOVIEW precedent: the pure half never names a
-// syscall package).
-func itoa(v uint64) string {
-	if v == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for v > 0 {
-		i--
-		buf[i] = byte('0' + v%10)
-		v /= 10
-	}
-	return string(buf[i:])
+	return "pcm" + itoa(uint64(w.Bits))
 }

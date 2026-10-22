@@ -18,7 +18,7 @@
 //
 // Bounded by construction, like the rest of M118:
 //
-//   - seconds is a positive integer capped at maxSeconds (the whole WAV
+//   - seconds is a positive integer capped at pcm.MaxRecordSeconds (the whole WAV
 //     body is one WriteFileSafe publish, so duration bounds memory);
 //   - each slot-92 call is capped at the kernel's 64 KiB ring, so N seconds
 //     is a fixed ceil(N*96000/65536)-call loop — never a stream;
@@ -37,18 +37,8 @@ import (
 	"crypto/sha256"
 	"strings"
 
+	"virelai/pcm"
 	"virelai/vi"
-)
-
-const (
-	// maxSeconds bounds the recording: the WAV body is one in-memory
-	// WriteFileSafe publish, so duration IS the memory bound — 30 s of
-	// S16/48k/mono is 2.88 MB, far inside the process map bound.
-	maxSeconds = 30
-
-	// maxPathLen leaves WriteFileSafe's one-byte "~" temp inside the
-	// kernel's 64-byte file-table path cap (vi.go WriteFileSafe).
-	maxPathLen = 63
 )
 
 // The syscall seams, as vars so host tests inject fakes (the gotabwm
@@ -95,7 +85,7 @@ func run(argv []string) int {
 // crash-safe, print the receipt. The view tees the same console lines
 // into its log, so every word is identical whichever way it was reached.
 func record(secs int, path string) int {
-	total := pcmBytes(secs)
+	total := pcm.CaptureBytes(secs)
 
 	info, err := capQuery()
 	if err != nil {
@@ -112,14 +102,14 @@ func record(secs int, path string) int {
 	// The WAV body is one allocation: header first, PCM captured in place
 	// behind it — slot 92 copies the ring out straight into the file image,
 	// so no second buffer and no copy ever exist.
-	body := make([]byte, wavHeaderLen+total)
+	body := make([]byte, pcm.WavHeaderLen+total)
 	for off := 0; off < total; {
 		want := total - off
 		if want > vi.AudioCapRingBytes {
 			want = vi.AudioCapRingBytes
 		}
 		n, cerr := capture(vi.AudioCapFormat, vi.AudioCapRate,
-			vi.AudioCapChannels, body[wavHeaderLen+off:wavHeaderLen+off+want])
+			vi.AudioCapChannels, body[pcm.WavHeaderLen+off:pcm.WavHeaderLen+off+want])
 		if cerr != nil {
 			console("gorec: refused " + cerr.Error() +
 				" at=" + vi.Itoa64(int64(off)) +
@@ -136,7 +126,7 @@ func record(secs int, path string) int {
 		off += n
 	}
 
-	writeWavHeader(body[:wavHeaderLen], total)
+	pcm.WriteWavHeader(body[:pcm.WavHeaderLen], total)
 	ensureDirs(path)
 	if rc := writeFile(path, body); rc < 0 {
 		console("gorec: write refused rc=" + vi.Itoa64(rc))
@@ -146,7 +136,7 @@ func record(secs int, path string) int {
 	sum := sha256.Sum256(body)
 	console("gorec: wrote " + path +
 		" seconds=" + vi.Itoa64(int64(secs)) +
-		" frames=" + vi.Itoa64(int64(pcmFrames(total))) +
+		" frames=" + vi.Itoa64(int64(pcm.CaptureFrames(total))) +
 		" bytes=" + vi.Itoa64(int64(total)) +
 		" sha256=" + hexLower(sum[:]))
 	return 0
@@ -158,66 +148,20 @@ func record(secs int, path string) int {
 func parseArgs(argv []string) (int, string, bool) {
 	if len(argv) != 3 {
 		console("gorec: usage: GOREC.ELF <seconds 1.." +
-			vi.Itoa64(int64(maxSeconds)) + "> <out.wav under /host or /disk>")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + "> <out.wav under /host or /disk>")
 		return 0, "", false
 	}
-	secs, ok := parseSeconds(argv[1])
+	secs, ok := pcm.ParseRecordSeconds(argv[1])
 	if !ok {
 		console("gorec: refused seconds=" + argv[1] + " (want 1.." +
-			vi.Itoa64(int64(maxSeconds)) + ")")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + ")")
 		return 0, "", false
 	}
-	if why := validOutPath(argv[2]); why != "" {
+	if why := pcm.ValidRecordPath(argv[2]); why != "" {
 		console("gorec: refused path " + why)
 		return 0, "", false
 	}
 	return secs, argv[2], true
-}
-
-// parseSeconds is the bounded atoi for the duration argument: decimal digits
-// only, in 1..maxSeconds. (No strconv — the fleet formats through vi.Itoa64.)
-func parseSeconds(s string) (int, bool) {
-	if s == "" || len(s) > 3 {
-		return 0, false
-	}
-	v := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		v = v*10 + int(c-'0')
-	}
-	if v < 1 || v > maxSeconds {
-		return 0, false
-	}
-	return v, true
-}
-
-// validOutPath enforces the card's roots: a file path under /host or /disk
-// that WriteFileSafe can publish — short enough for the "~" temp, no
-// dot/empty segments, no control bytes. Returns "" on accept, else the
-// refusal reason the marker prints.
-func validOutPath(path string) string {
-	root := strings.HasPrefix(path, "/host/") || strings.HasPrefix(path, "/disk/")
-	if !root {
-		return "outside /host or /disk"
-	}
-	if len(path) > maxPathLen {
-		return "over path cap"
-	}
-	segs := strings.Split(path, "/")
-	for _, seg := range segs[2:] { // ["", "host"|"disk", ...]
-		if seg == "" || seg == "." || seg == ".." {
-			return "bad segment"
-		}
-	}
-	for i := 0; i < len(path); i++ {
-		if path[i] < 0x20 || path[i] == 0x7f {
-			return "control byte"
-		}
-	}
-	return ""
 }
 
 // ensureDirs best-effort creates each intermediate directory below the

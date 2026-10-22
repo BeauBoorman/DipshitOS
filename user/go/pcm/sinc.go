@@ -9,7 +9,7 @@
 // cutoff depends on the rate ratio (ν = min(1, outRate/inRate) — a
 // downsample has to filter to the new Nyquist, an upsample runs full
 // band). Each row is normalized so DC gain is flat across phases.
-package main
+package pcm
 
 import "math"
 

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"strings"
 
+	"virelai/pcm"
 	"virelai/vi"
 )
 
@@ -28,6 +29,10 @@ const (
 	// v1 tuple — the meter's refresh rate and the bounded-read size, well
 	// under the kernel's 64 KiB per-call ring bound.
 	recChunkBytes = 8192
+
+	// meterDefaultSeconds is the meter mode's run with no argument — the
+	// mode is bounded by construction whether or not a window exists.
+	meterDefaultSeconds = 10
 
 	// levelPrintTicks bounds the level marker to at most one line per 12
 	// chunks (~1 s) and only when the 10% bucket moved — serial stays
@@ -101,7 +106,7 @@ func (a *app) recordMain(argv []string) int {
 	}
 	a.mode = modeRecord
 	a.name = basename(path)
-	a.recSecs, a.recTotal = secs, recPcmBytes(secs)
+	a.recSecs, a.recTotal = secs, pcm.CaptureBytes(secs)
 	recConsole(markerRec + vi.Itoa64(int64(secs)) + " out=" + path)
 
 	if !a.capInfo() {
@@ -113,8 +118,8 @@ func (a *app) recordMain(argv []string) int {
 	a.draw()
 	a.present()
 
-	body := make([]byte, wavHeaderLen+a.recTotal)
-	off, err := a.recPump(body[wavHeaderLen:], a.recTotal, markerLevel)
+	body := make([]byte, pcm.WavHeaderLen+a.recTotal)
+	off, err := a.recPump(body[pcm.WavHeaderLen:], a.recTotal, markerLevel)
 
 	rc := 1
 	switch {
@@ -141,7 +146,7 @@ func (a *app) recordMain(argv []string) int {
 		a.reason = "record failed"
 		a.st = stRefused
 	default:
-		writeWavHeader(body[:wavHeaderLen], a.recTotal)
+		pcm.WriteWavHeader(body[:pcm.WavHeaderLen], a.recTotal)
 		ensureRecDirs(path)
 		if wrc := recWrite(path, body); wrc < 0 {
 			recConsole(markerRecWrite + vi.Itoa64(wrc))
@@ -151,7 +156,7 @@ func (a *app) recordMain(argv []string) int {
 			sum := sha256.Sum256(body)
 			recConsole(markerRecWrote + path +
 				" seconds=" + vi.Itoa64(int64(secs)) +
-				" frames=" + vi.Itoa64(int64(recPcmFrames(a.recTotal))) +
+				" frames=" + vi.Itoa64(int64(pcm.CaptureFrames(a.recTotal))) +
 				" bytes=" + vi.Itoa64(int64(a.recTotal)) +
 				" peak=" + vi.Itoa64(int64(a.recPeak)) +
 				" sha256=" + recHex(sum[:]))
@@ -174,7 +179,7 @@ func (a *app) meterMain(argv []string) int {
 		return 2
 	}
 	a.mode = modeMeter
-	a.recSecs, a.recTotal = secs, recPcmBytes(secs)
+	a.recSecs, a.recTotal = secs, pcm.CaptureBytes(secs)
 	recConsole(markerMeter + vi.Itoa64(int64(secs)))
 
 	if !a.capInfo() {
@@ -255,7 +260,7 @@ func (a *app) recPump(dst []byte, total int, levelMarker string) (int, error) {
 		}
 		off += n
 		a.recGot = off
-		a.noteLevel(chunkLevel(buf[:n]), levelMarker)
+		a.noteLevel(pcm.ChunkLevel(buf[:n]), levelMarker)
 		// service() consults recStop only when a window exists — the flag
 		// check stands alone so a headless stop request still unwinds.
 		if a.service() || a.recStop {
@@ -304,16 +309,16 @@ func (a *app) park() {
 func parseRecArgs(argv []string) (int, string, bool) {
 	if len(argv) != 4 {
 		recConsole("gosound: rec usage: GOSOUND.ELF record <seconds 1.." +
-			vi.Itoa64(int64(maxRecordSeconds)) + "> <out.wav under /host or /disk>")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + "> <out.wav under /host or /disk>")
 		return 0, "", false
 	}
-	secs, ok := parseRecSeconds(argv[2])
+	secs, ok := pcm.ParseRecordSeconds(argv[2])
 	if !ok {
 		recConsole(markerRecRefused + "seconds=" + argv[2] + " (want 1.." +
-			vi.Itoa64(int64(maxRecordSeconds)) + ")")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + ")")
 		return 0, "", false
 	}
-	if why := validRecPath(argv[3]); why != "" {
+	if why := pcm.ValidRecordPath(argv[3]); why != "" {
 		recConsole(markerRecRefused + "path " + why)
 		return 0, "", false
 	}
@@ -325,16 +330,16 @@ func parseRecArgs(argv []string) (int, string, bool) {
 func parseMeterArgs(argv []string) (int, bool) {
 	if len(argv) < 2 || len(argv) > 3 {
 		recConsole("gosound: meter usage: GOSOUND.ELF meter [seconds 1.." +
-			vi.Itoa64(int64(maxRecordSeconds)) + "]")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + "]")
 		return 0, false
 	}
 	if len(argv) == 2 {
 		return meterDefaultSeconds, true
 	}
-	secs, ok := parseRecSeconds(argv[2])
+	secs, ok := pcm.ParseRecordSeconds(argv[2])
 	if !ok {
 		recConsole(markerMeterRefused + "seconds=" + argv[2] + " (want 1.." +
-			vi.Itoa64(int64(maxRecordSeconds)) + ")")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + ")")
 		return 0, false
 	}
 	return secs, true

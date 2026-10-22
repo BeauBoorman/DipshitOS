@@ -6,10 +6,12 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
 
+	"virelai/pcm"
 	"virelai/vi"
 )
 
@@ -86,92 +88,6 @@ func fillCapture(sample int16) func([]byte) (int, error) {
 			buf[i], buf[i+1] = byte(sample), byte(sample>>8)
 		}
 		return len(buf), nil
-	}
-}
-
-func TestRecSecondsBound(t *testing.T) {
-	for _, s := range []string{"1", "9", "30"} {
-		if v, ok := parseRecSeconds(s); !ok || v < 1 || v > 30 {
-			t.Fatalf("parseRecSeconds(%q) = %d,%v", s, v, ok)
-		}
-	}
-	for _, s := range []string{"", "0", "31", "100", "-1", "x", "2s", " 2"} {
-		if v, ok := parseRecSeconds(s); ok {
-			t.Fatalf("parseRecSeconds(%q) = %d,true want refuse", s, v)
-		}
-	}
-}
-
-func TestRecPathRules(t *testing.T) {
-	cases := []struct{ path, want string }{
-		{"/host/x.wav", ""},
-		{"/disk/REC/A.WAV", ""},
-		{"/tmp/x.wav", "outside /host or /disk"},
-		{"/host/", "bad segment"},
-		{"/host/a//b.wav", "bad segment"},
-		{"/host/../x.wav", "bad segment"},
-		{"/host/" + strings.Repeat("a", 60) + ".wav", "over path cap"},
-		{"/host/a\tb.wav", "control byte"},
-	}
-	for _, c := range cases {
-		if got := validRecPath(c.path); got != c.want {
-			t.Fatalf("validRecPath(%q) = %q, want %q", c.path, got, c.want)
-		}
-	}
-}
-
-// TestWavHeaderBytes is the byte-exact pin: the whole 44-byte header is
-// determined by the v1 tuple plus the data length — the same header the
-// live-sound-record gate recomputes off the share.
-func TestWavHeaderBytes(t *testing.T) {
-	var h [wavHeaderLen]byte
-	writeWavHeader(h[:], 192000)
-	want := []byte("RIFF")
-	want = append(want, 36, 238, 2, 0) // 36 + 192000
-	want = append(want, "WAVE"...)
-	want = append(want, "fmt "...)
-	want = append(want, 16, 0, 0, 0)    // fmt body size
-	want = append(want, 1, 0)           // PCM
-	want = append(want, 1, 0)           // mono
-	want = append(want, 128, 187, 0, 0) // 48000
-	want = append(want, 0, 119, 1, 0)   // 96000 byte rate
-	want = append(want, 2, 0)           // block align
-	want = append(want, 16, 0)          // bits
-	want = append(want, "data"...)
-	want = append(want, 0, 238, 2, 0) // 192000
-	if len(want) != wavHeaderLen || !equalBytes(h[:], want) {
-		t.Fatalf("header = %x, want %x", h[:], want)
-	}
-}
-
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func TestChunkLevel(t *testing.T) {
-	cases := []struct {
-		name string
-		b    []byte
-		want int
-	}{
-		{"silence", make([]byte, 2048), 0},
-		{"odd tail is not a frame", []byte{0xff}, 0},
-		{"full scale", []byte{0xff, 0x7f}, 99},
-		{"negative full scale", []byte{0x00, 0x80}, 100},
-		{"half scale", []byte{0x00, 0x40}, 50},
-	}
-	for _, c := range cases {
-		if got := chunkLevel(c.b); got != c.want {
-			t.Fatalf("%s: chunkLevel = %d, want %d", c.name, got, c.want)
-		}
 	}
 }
 
@@ -282,12 +198,12 @@ func TestRecordWritesWav(t *testing.T) {
 	if !ok {
 		t.Fatalf("no publish in %v", f.lines)
 	}
-	if len(body) != wavHeaderLen+96000 {
-		t.Fatalf("body = %d bytes, want %d", len(body), wavHeaderLen+96000)
+	if len(body) != pcm.WavHeaderLen+96000 {
+		t.Fatalf("body = %d bytes, want %d", len(body), pcm.WavHeaderLen+96000)
 	}
-	var wantHdr [wavHeaderLen]byte
-	writeWavHeader(wantHdr[:], 96000)
-	if !equalBytes(body[:wavHeaderLen], wantHdr[:]) {
+	var wantHdr [pcm.WavHeaderLen]byte
+	pcm.WriteWavHeader(wantHdr[:], 96000)
+	if !bytes.Equal(body[:pcm.WavHeaderLen], wantHdr[:]) {
 		t.Fatalf("published header disagrees with the canonical writer")
 	}
 	if !f.hasLine("gosound: rec level=50") {
@@ -396,7 +312,7 @@ func TestPumpStopHonorsUser(t *testing.T) {
 
 	a := &app{st: stEmpty}
 	a.st = stRecording
-	a.recTotal = recPcmBytes(1)
+	a.recTotal = pcm.CaptureBytes(1)
 	calls := 0
 	f.capture = func(buf []byte) (int, error) {
 		calls++

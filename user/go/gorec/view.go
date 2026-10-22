@@ -16,6 +16,7 @@ package main
 
 import (
 	uidraw "virelai/draw"
+	"virelai/pcm"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
@@ -29,7 +30,7 @@ const (
 
 	// viewSeconds is the fixed clip the Record gesture takes — short
 	// enough that the window is only briefly busy, long enough to be a
-	// real recording. The CLI form still takes any 1..maxSeconds.
+	// real recording. The CLI form still takes any 1..pcm.MaxRecordSeconds.
 	viewSeconds = 5
 
 	// viewPath is the fixed clip path the gesture publishes (overwritten
@@ -171,7 +172,7 @@ func runView() int {
 	ta := openViewWindow(tabapp.Config{Name: "GOREC.ELF", Title: viewTitle, X: 48, Y: 40, W: viewW, H: viewH})
 	if ta == nil {
 		console("gorec: window refused — headless use: GOREC.ELF <seconds 1.." +
-			vi.Itoa64(int64(maxSeconds)) + "> <out.wav under /host or /disk>")
+			vi.Itoa64(int64(pcm.MaxRecordSeconds)) + "> <out.wav under /host or /disk>")
 		return 2
 	}
 	console("gorec: view open id=" + vi.Itoa64(int64(ta.Win)))

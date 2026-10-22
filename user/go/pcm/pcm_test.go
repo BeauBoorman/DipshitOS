@@ -1,9 +1,9 @@
-// Host corpus for the M99c (#2181) WAV half of GOSOUND.ELF. These pin the
-// card's acceptance list verbatim: every supported `fmt ` shape, every named
-// refusal, the odd-padding walk, the chunk bound, the container sniff — and
-// the resampler's golden vector plus its exact output-count contract (the
-// same ceil the live gate recomputes in Python). No guest, no syscall.
-package main
+// Host corpus for the M99c (#2181) WAV half of the pcm package. These pin
+// the card's acceptance list verbatim: every supported `fmt ` shape, every
+// named refusal, the odd-padding walk, the chunk bound, the container sniff
+// — and the resampler's golden vector plus its exact output-count contract
+// (the same ceil the live gate recomputes in Python). No guest, no syscall.
+package pcm
 
 import (
 	"errors"
@@ -11,13 +11,17 @@ import (
 	"testing"
 )
 
-// sliceSrc adapts a byte slice to byteSource, one fill per call.
+// readBlock mirrors the consumer's one read buffer (GOSOUND's 16 KiB): the
+// stream exactness tests exercise the same block size the guest runs.
+const readBlock = 16 * 1024
+
+// sliceSrc adapts a byte slice to Source, one fill per call.
 type sliceSrc struct {
 	b   []byte
 	off int
 }
 
-func (s *sliceSrc) src() byteSource {
+func (s *sliceSrc) src() Source {
 	return func(buf []byte) (int, error) {
 		if s.off >= len(s.b) {
 			return 0, nil
