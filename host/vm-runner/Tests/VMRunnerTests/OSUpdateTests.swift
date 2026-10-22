@@ -200,9 +200,52 @@ final class OSUpdateTests: XCTestCase {
         // Tamper after signing.
         try Data("evil".utf8).write(to: update.appendingPathComponent("OS.IMG"))
         XCTAssertThrowsError(try OSUpdate.apply(updateDir: update, baseImage: base,
-                                              publicKey: pubData))
+                                              publicKey: pubData)) {
+            XCTAssertEqual($0 as? OSUpdate.UpdateError, .hashMismatch("OS.IMG"))
+        }
         XCTAssertEqual(try String(contentsOf: base), "old-base")
         XCTAssertNotNil(OSUpdate.stagedDir(shareDir: dir))
+        // The refused private copy is cleaned up — no <base>.next litter.
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("base.img.next").path))
+    }
+
+    /// The staged set sits in the guest-writable share, so a guest that
+    /// rewrites UPDATE/OS.IMG while apply runs must never get its bytes
+    /// installed: the private <base>.next copy is what the hash pins, so
+    /// a racing rewrite ends in a refusal or installs the signed image —
+    /// never the swapped-in bytes.
+    func testApplyNeverInstallsGuestSwapIn() throws {
+        let fm = FileManager.default
+        let signed = Data(repeating: 0xA5, count: 8 << 20)
+        let evil = Data(repeating: 0x5A, count: 8 << 20)
+        let lock = NSLock()
+        var racing = false
+        for round in 0..<8 {
+            let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let update = try stageSet(in: dir, image: signed)
+            let base = try baseImage(in: dir)
+            let imgURL = update.appendingPathComponent("OS.IMG")
+            lock.lock(); racing = true; lock.unlock()
+            let writer = Thread {
+                var toggle = false
+                while true {
+                    lock.lock(); let go = racing; lock.unlock()
+                    if !go { return }
+                    try? (toggle ? evil : signed).write(to: imgURL)
+                    toggle = !toggle
+                }
+            }
+            writer.start()
+            _ = try? OSUpdate.apply(updateDir: update, baseImage: base,
+                                    publicKey: pubData)
+            lock.lock(); racing = false; lock.unlock()
+            while writer.isExecuting { Thread.sleep(forTimeInterval: 0.001) }
+            let installed = try Data(contentsOf: base)
+            XCTAssertTrue(installed == signed || installed == Data("old-base".utf8),
+                "round \(round): base holds bytes that are neither the signed image nor the old base")
+            try fm.removeItem(at: dir)
+        }
     }
 
     func testRollbackRestoresAndSwapsForward() throws {

@@ -9,9 +9,12 @@
 //     UPDATE.SIG        64-byte Ed25519 signature over UPDATE.MF's bytes
 //
 // The runner's `--apply-update` verifies the signature against the pinned
-// key, hash-checks every manifest-named file, then swaps the base image:
-// the current base moves to <base>.prev, the staged image moves in, and a
-// profile's persistent overlay.asif is discarded — its stale sectors
+// key, hash-checks every manifest-named file, then swaps the base image.
+// The staged set sits in the share the guest writes, so the image is
+// first copied to a host-side <base>.next and THAT copy is hash-checked
+// — an in-place hash cannot bind the bytes a second read installs. Then
+// the current base moves to <base>.prev, the verified copy moves in, and
+// a profile's persistent overlay.asif is discarded — its stale sectors
 // belong to the old base and must not shadow the new one. A refused set
 // is left in place (evidence, and a later --apply-update keeps failing
 // closed on it).
@@ -258,7 +261,9 @@ public enum OSUpdate {
 
     /// Verify + swap: the staged OS.IMG becomes the base image; the old
     /// base moves to <base>.prev and a profile's persistent overlay.asif
-    /// is discarded. Returns the verified manifest.
+    /// is discarded. The image is copied out of the guest-writable share
+    /// before it is trusted: the private <base>.next copy is the file
+    /// hash-checked and swapped in. Returns the verified manifest.
     @discardableResult
     public static func apply(updateDir: URL, baseImage: URL, publicKey: Data,
                              overlay: URL? = nil) throws -> Manifest {
@@ -267,20 +272,34 @@ public enum OSUpdate {
         guard fm.fileExists(atPath: baseImage.path) else {
             throw UpdateError.noBase
         }
+        guard let image = manifest.image else {
+            throw UpdateError.manifestMalformed("no kind=image row")
+        }
         let next = sibling(baseImage, ".next")
         let prev = sibling(baseImage, ".prev")
 
         // Stage the new base beside the old (same directory => the rename
-        // is atomic on the same volume), fsync'd before the swap.
+        // is atomic on the same volume), fsync'd before the swap. The
+        // share is guest-writable, so the staged file's in-place hash
+        // above cannot bind the bytes this second read consumes — the
+        // guest can swap UPDATE/OS.IMG in between. Hash the private copy
+        // instead; only bytes matching the signed row may be installed.
         do {
             if fm.fileExists(atPath: next.path) { try fm.removeItem(at: next) }
             try fm.copyItem(at: updateDir.appendingPathComponent(imageName), to: next)
+            let copied = try sha256File(next)
+            guard UInt64(copied.count) == image.bytes, copied.hex == image.sha256 else {
+                try? fm.removeItem(at: next)
+                throw UpdateError.hashMismatch(image.name)
+            }
             let fh = try FileHandle(forWritingTo: next)
             try fh.synchronize()
             try fh.close()
             if fm.fileExists(atPath: prev.path) { try fm.removeItem(at: prev) }
             try fm.moveItem(at: baseImage, to: prev)
             try fm.moveItem(at: next, to: baseImage)
+        } catch let e as UpdateError {
+            throw e
         } catch {
             throw UpdateError.io("\(error.localizedDescription)")
         }
