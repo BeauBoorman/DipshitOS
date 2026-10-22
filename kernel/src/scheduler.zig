@@ -98,6 +98,7 @@ const virtio_file = @import("virtio_file.zig"); // Arc5 #243: tombstone write th
 pub const smp = @import("smp.zig");
 const spinlock = @import("spinlock.zig");
 const forensics = @import("forensics.zig"); // #1278: last-words recorder (inert unless `forensics on`)
+const timer = @import("timer.zig"); // M170a #3033: the deadline overlay's comparator + monotonic clock
 
 const user_stack_section = if (builtin.object_format == .elf) ".userbss" else "__DATA,__userbss";
 
@@ -282,6 +283,13 @@ const Task = struct {
     /// Claim 0635: scheduler tick count at/after which a `blocked` task
     /// wakes (`tick_count >= wakeup_tick`). Meaningful only while blocked.
     wakeup_tick: u64 = 0,
+    /// M170a #3033 (ADR 0060): absolute wake deadline in ns since boot
+    /// for a `sleep_until_ns` block (0 = not deadline-blocked). The
+    /// deadline IRQ's `deadline_wake_due` clears and wakes it; the tick's
+    /// `wake_expired` skips it entirely — it is not a tick deadline and
+    /// `wakeup_tick` stays 0 beside it. Mutually exclusive with the other
+    /// wait fields.
+    deadline_ns: u64 = 0,
     /// Card 4c (claim 9946): the process id this blocked task waits on via
     /// `sys_wait` (slot 8). Set by `wait_current`; cleared when
     /// `wake_waiters` returns the task to `ready` on the target's exit. An
@@ -1267,6 +1275,14 @@ pub fn init() usize {
     events.on_event_pushed = wake_event_waiters;
     app_timers.init();
     wm_server.init();
+    // M170a #3033: the deadline overlay resets with the pool — no stale
+    // comparator targets survive a test/boot reset, and the timer's wake
+    // hook lands here (timer stays free of a scheduler dependency).
+    deadline_count = 0;
+    probe_armed = false;
+    probe_ms = 0;
+    for (0..smp.max_cores) |c| timer.set_deadline(c, 0);
+    timer.deadline_wake_hook = deadline_wake_entry;
     tasks[0] = .{ .name = "shell", .state = .ready, .spsr = spsr_el1h_irqs, .ttbr0 = mmu.kernel_root_phys() };
     tasks[idle_id] = .{
         .name = "idle",
@@ -2175,6 +2191,253 @@ pub fn sleep_current(ticks: u64) bool {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Nanosecond deadline overlay (M170a #3033, ADR 0060 D1–D3)
+// ---------------------------------------------------------------------------
+// The 1 Hz heartbeat stays untouched; this is the second clock beside it.
+// A task blocks on an absolute monotonic deadline (the `timer.now_ns`
+// clock, CNTPCT-derived), the owning core's comparator is programmed to
+// min(next heartbeat boundary, earliest deadline), and a non-heartbeat
+// fire wakes the due set — blocked->ready, home ring, no rotation (D3).
+
+/// A pending deadline: the task blocked on it (`deadline_probe_task` for
+/// the monitor's task-less `timer probe`), the ns it is due, and the core
+/// whose comparator was armed for it (per core where the request was made).
+const DeadlineEntry = struct {
+    deadline_ns: u64 = 0,
+    task: usize = 0,
+    core: u8 = 0,
+};
+
+/// Sentinel `task` id marking the monitor `timer probe` entry — it wakes
+/// nothing; its fire only records the lateness through `timer.probe_done`.
+const deadline_probe_task: usize = max_tasks;
+
+/// The deadline set: sorted by `deadline_ns`, fixed BSS, `max_tasks`
+/// entries, no allocation. Entries are keyed by task id; the TCB's
+/// `deadline_ns` is the validity witness — a kill or wake that clears it
+/// makes the entry stale, and the next scan drops it.
+var deadline_set: [max_tasks]DeadlineEntry = @as([max_tasks]DeadlineEntry, @splat(@as(DeadlineEntry, .{})));
+var deadline_count: usize = 0;
+
+/// Monitor `timer probe` state — at most one outstanding probe.
+var probe_armed: bool = false;
+var probe_ms: u64 = 0;
+
+/// Earliest pending deadline on `core` (0 = none). The set is sorted, so
+/// the first live entry for the core is the answer; stale entries (the
+/// TCB no longer deadline-blocked) are skipped, not counted.
+fn earliest_deadline_for(core: usize) u64 {
+    for (deadline_set[0..deadline_count]) |e| {
+        if (e.core != core) continue;
+        if (e.task == deadline_probe_task) return e.deadline_ns;
+        if (e.task < max_tasks and tasks[e.task].deadline_ns == e.deadline_ns) return e.deadline_ns;
+    }
+    return 0;
+}
+
+/// Push `core`'s earliest deadline to the comparator. Callers hold
+/// sched_lock (insert/remove/wake contexts all do).
+fn publish_earliest(core: usize) void {
+    timer.set_deadline(core, earliest_deadline_for(core));
+}
+
+/// Drop entry `i`, preserving sort order. Caller holds sched_lock.
+fn deadline_drop_locked(i: usize) void {
+    std.mem.copyForwards(DeadlineEntry, deadline_set[i .. deadline_count - 1], deadline_set[i + 1 .. deadline_count]);
+    deadline_count -= 1;
+}
+
+/// Remove `task`'s entry if it has one; returns the core it was armed on.
+/// Caller holds sched_lock.
+fn deadline_remove_task_locked(task: usize) ?usize {
+    for (deadline_set[0..deadline_count], 0..) |e, i| {
+        if (e.task != task) continue;
+        const c: usize = e.core;
+        deadline_drop_locked(i);
+        return c;
+    }
+    return null;
+}
+
+/// Sorted insert (stable on equal deadlines). Re-blocks replace the
+/// task's prior entry — a task owns at most one deadline. Caller holds
+/// sched_lock.
+fn deadline_insert_locked(task: usize, core: usize, ns: u64) bool {
+    _ = deadline_remove_task_locked(task);
+    if (deadline_count >= max_tasks) return false;
+    var i = deadline_count;
+    while (i > 0 and deadline_set[i - 1].deadline_ns > ns) : (i -= 1) {
+        deadline_set[i] = deadline_set[i - 1];
+    }
+    deadline_set[i] = .{ .deadline_ns = ns, .task = task, .core = @intCast(core) };
+    deadline_count += 1;
+    return true;
+}
+
+/// ADR 0060 D2: the overlay's granularity is 1 ms — sub-ms deadlines
+/// quantize UP (the syscall-side reservations land in card #3036; the
+/// kernel primitive applies the same floor). Saturating.
+pub fn deadline_quantum_ns(ns: u64) u64 {
+    const rem = ns % 1_000_000;
+    if (rem == 0) return ns;
+    return std.math.add(u64, ns, 1_000_000 - rem) catch std.math.maxInt(u64);
+}
+
+/// Card #3033: block the calling task until the absolute monotonic
+/// `deadline_ns` (`timer.now_ns` clock), quantized up to the 1 ms
+/// deadline quantum (D2). The deadline is armed on THIS core's
+/// comparator; its fire flips the task blocked->ready onto the home ring
+/// — the same seam `sleep_current` uses — with NO forced preemption
+/// (D3): an idle parked core claims it at once (the `ipi_reschedule`
+/// seam in `tick`), a busy core reaches it at the next yield, block or
+/// heartbeat quantum, and the latency is never worse than a tick wait.
+/// Returns false (EINVAL) for the idle task, an inactive pool, or a full
+/// deadline set.
+pub fn sleep_until_ns(deadline_ns: u64) bool {
+    const c = smp.core_id(); // per-core current — the request core
+    if (!scheduling_active() or task_count == 0 or current[c] == idle_id) return false;
+    const ns = deadline_quantum_ns(deadline_ns);
+    const sleeping = current[c];
+    // Brief sched_lock: the TCB block-write + the deadline insert must be
+    // atomic against the fire path's wake scan. Released before the
+    // successor rotation (claim 881 slice 3).
+    sched_lock_acquire();
+    if (tasks[sleeping].state != .ready and tasks[sleeping].state != .running) {
+        sched_lock_release();
+        return false;
+    }
+    const pc = current_exception_pc();
+    tasks[sleeping].sp = exceptions.resume_frame[c];
+    tasks[sleeping].elr = pc.elr;
+    tasks[sleeping].spsr = pc.spsr;
+    tasks[sleeping].sp_el0 = exceptions.resume_sp_el0[c];
+    save_tls(sleeping);
+    tasks[sleeping].saves += 1;
+    _ = ring_remove_anywhere(sleeping);
+    const old_pen = tasks[sleeping].age_penalty;
+    const old_skip = tasks[sleeping].age_skip;
+    tasks[sleeping].state = .blocked;
+    tasks[sleeping].deadline_ns = ns;
+    if (!deadline_insert_locked(sleeping, c, ns)) {
+        // A full set refuses the block entirely — no half-armed state.
+        // The task is still current[c] (executing tasks are off-ring).
+        tasks[sleeping].state = .ready;
+        tasks[sleeping].deadline_ns = 0;
+        tasks[sleeping].age_penalty = old_pen;
+        tasks[sleeping].age_skip = old_skip;
+        tasks[sleeping].saves -%= 1;
+        sched_lock_release();
+        return false;
+    }
+    note_blocked(sleeping); // M133b: a committed block recovers priority
+    publish_earliest(c);
+    sched_lock_release();
+    if (!claim_and_stage(c, sleeping)) {
+        // A secondary core with no eligible successor parks on its WFE
+        // loop; the sleeping task's deadline fires on THIS core's own
+        // comparator and its wake re-claims it.
+        if (stage_secondary_park(c)) return true;
+        // No successor: roll back (the always-ready idle task makes this
+        // unreachable in a normal boot; kept as a defensive bound).
+        sched_lock_acquire();
+        tasks[sleeping].state = .ready;
+        tasks[sleeping].deadline_ns = 0;
+        _ = deadline_remove_task_locked(sleeping);
+        publish_earliest(c);
+        tasks[sleeping].age_penalty = old_pen;
+        tasks[sleeping].age_skip = old_skip;
+        tasks[sleeping].saves -%= 1;
+        sched_lock_release();
+        return false;
+    }
+    apply_pending();
+    return true;
+}
+
+/// The timer PPI deadline service, invoked through
+/// `timer.deadline_wake_hook` on the firing core with IRQs masked. Flushes
+/// this core's due set; sched_lock is a TRY — a contended hold (the
+/// preempted main-context holder) defers the wake to a ~1 ms retry
+/// (`timer.defer_deadline_retry`) instead of spinning in IRQ context.
+fn deadline_wake_entry(c: u32) void {
+    if (!sched_lock.try_lock()) {
+        sched_lock_contended +%= 1;
+        timer.defer_deadline_retry(c);
+        return;
+    }
+    sched_lock_holder = smp.core_id();
+    sched_lock_acquires +%= 1;
+    deadline_wake_due_locked(c, timer.now_ns());
+    sched_lock_release();
+}
+
+/// Due-set flush for one core's deadline fire. Entries due at `now_ns` on
+/// THIS core are consumed — a probe records its lateness through
+/// `timer.probe_done`; a task flips blocked->ready onto its home ring
+/// (the `wake_expired` flip; D3 stages no rotation from here). Stale
+/// entries drop free on any core — they only cost set space until then.
+/// Caller holds sched_lock.
+fn deadline_wake_due_locked(c: u32, now_ns: u64) void {
+    var i: usize = 0;
+    while (i < deadline_count) {
+        const e = deadline_set[i];
+        const stale = e.task != deadline_probe_task and
+            (e.task >= max_tasks or tasks[e.task].deadline_ns != e.deadline_ns or tasks[e.task].state != .blocked);
+        if (stale) {
+            deadline_drop_locked(i);
+            continue;
+        }
+        if (e.core != c or e.deadline_ns > now_ns) {
+            i += 1;
+            continue;
+        }
+        if (e.task == deadline_probe_task) {
+            probe_armed = false;
+            timer.probe_done(probe_ms, (now_ns - e.deadline_ns) / 1_000);
+        } else {
+            tasks[e.task].deadline_ns = 0;
+            tasks[e.task].state = .ready;
+            push_home_locked(e.task);
+        }
+        deadline_drop_locked(i);
+    }
+    publish_earliest(c);
+}
+
+/// Monitor `timer probe <ms>`: arm one task-less deadline on the calling
+/// core; its fire records the measured lateness, which the main-context
+/// drain prints as `timer probe ms=<n> late_us=<m>`. One outstanding
+/// probe; false on a busy probe, a full set, or an out-of-range ms.
+pub fn probe_deadline_ms(ms: u64) bool {
+    if (ms == 0 or ms > 60_000) return false;
+    const c = smp.core_id();
+    sched_lock_acquire();
+    defer sched_lock_release();
+    if (probe_armed) return false;
+    const ns = std.math.add(u64, timer.now_ns(), ms * 1_000_000) catch return false;
+    if (!deadline_insert_locked(deadline_probe_task, c, ns)) return false;
+    probe_armed = true;
+    probe_ms = ms;
+    publish_earliest(c);
+    return true;
+}
+
+/// Host-test entry: the wake half of one deadline fire on `c` at
+/// `now_ns` (the production caller is `deadline_wake_entry`, which reads
+/// the clock itself). Takes sched_lock — the context callers in tests
+/// never hold it.
+pub fn deadline_service(c: u32, now_ns: u64) void {
+    sched_lock_acquire();
+    defer sched_lock_release();
+    deadline_wake_due_locked(c, now_ns);
+}
+
+/// How many entries the set currently holds (test/monitor observability).
+pub fn deadline_set_len() usize {
+    return deadline_count;
+}
+
 /// Card 4c (claim 9946): block the calling task until the PROCESS with id
 /// `target_pid` exits, then stage its successor. The same seam as
 /// `sleep_current` — the caller's saved SVC frame stays on its kernel
@@ -2625,6 +2888,10 @@ fn wake_expired() void {
         // Card 4c / Card E5: event-blocked tasks (`sys_wait` / `sys_wait_event` —
         // no deadline) are woken by their event hooks, never by the tick clock.
         if (tasks[i].wait_pid != null or tasks[i].wait_event_pid != null or tasks[i].wait_thread) continue;
+        // #3033 (ADR 0060): a `sleep_until_ns` block is a nanosecond
+        // deadline, not a tick deadline — the deadline IRQ's own wake
+        // scan clears it; the tick clock never touches it.
+        if (tasks[i].deadline_ns != 0) continue;
         if (tasks[i].futex_waiting and tasks[i].wakeup_tick == 0) continue; // wait forever
         if (tick_count < tasks[i].wakeup_tick) continue;
         // ADR 0027 D4: an expired FUTEX deadline is a TIMED-OUT wait — the
@@ -2664,6 +2931,12 @@ fn wake_killed_task_locked(id: usize) void {
     tasks[id].wait_event_pid = null;
     tasks[id].wait_event_buf = 0;
     tasks[id].wait_thread = false;
+    // #3033: a deadline-blocked task's kill frees its comparator entry
+    // too — the cancel-on-exit half of the overlay.
+    if (tasks[id].deadline_ns != 0) {
+        tasks[id].deadline_ns = 0;
+        if (deadline_remove_task_locked(id)) |dc| publish_earliest(dc);
+    }
     for (&tasks) |*task| {
         if (task.joiner == id) task.joiner = null;
     }
@@ -3234,6 +3507,30 @@ pub fn tick() void {
     if (comptime builtin.cpu.arch != .aarch64) return;
     if (!scheduling_active()) return;
     const c = smp.core_id(); // per-core staging
+    // M170a #3033 (ADR 0060 D1/D3): a NON-heartbeat fire is not a quantum.
+    // It neither counts a tick nor rotates — the due-set wake already ran
+    // inside timer's service. The one claim it may make is a PARKED
+    // secondary's: the fire woke work this idle core can take NOW (the
+    // same seam as the RESCHEDULE SGI / tick's parked branch) — claiming
+    // parked work preempts nothing.
+    const kind = timer.fire_kind(c);
+    if (kind == .none or kind == .deadline) {
+        if (kind == .deadline and c != 0 and current[c] == idle_id) {
+            var elr: u64 = 0;
+            var spsr: u64 = 0;
+            asm volatile ("mrs %[v], elr_el1"
+                : [v] "=r" (elr),
+            );
+            asm volatile ("mrs %[v], spsr_el1"
+                : [v] "=r" (spsr),
+            );
+            park_sp[c] = exceptions.resume_frame[c];
+            park_elr[c] = elr;
+            park_spsr[c] = spsr;
+            if (claim_and_stage(c, idle_id)) apply_pending();
+        }
+        return;
+    }
     smp.core_ticks[c] +%= 1;
     // M133b (#2756): per-task share attribution — the tick's holder
     // burned the whole slice whether or not a rotation runs below.
@@ -3907,4 +4204,112 @@ pub fn is_blocked(id: usize) bool {
 pub fn terminated_status(id: usize) ?u64 {
     if (!is_terminated(id)) return null;
     return tasks[id].exit_status;
+}
+
+// M170a (#3033, ADR 0060): the deadline overlay — block/wake, ordering,
+// cancel-on-kill, and the probe. `deadline_service` is the host-testable
+// half of the fire (the comparator program lives in timer, aarch64-only).
+test "scheduler: sleep_until_ns blocks, stays blocked across ticks, wakes on its deadline" {
+    _ = init();
+    _ = register_worker(0x2000).?;
+    _ = register_user(0x3000, 0).?;
+    start();
+    try std.testing.expect(sleep_until_ns(50_000_000)); // 50 ms
+    try std.testing.expect(is_blocked(0));
+    try std.testing.expectEqual(@as(u64, 50_000_000), tasks[0].deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), deadline_count);
+    try std.testing.expectEqual(@as(u64, 50_000_000), earliest_deadline_for(0));
+    // The heartbeat clock never touches a deadline block.
+    on_tick();
+    on_tick();
+    try std.testing.expect(is_blocked(0));
+    try std.testing.expectEqual(@as(u64, 2), tick_count);
+    // Early fire wakes nothing; the due fire flips blocked -> ready.
+    deadline_service(0, 49_999_999);
+    try std.testing.expect(is_blocked(0));
+    deadline_service(0, 50_000_000);
+    try std.testing.expect(!is_blocked(0));
+    try std.testing.expectEqual(@as(u64, 0), tasks[0].deadline_ns);
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+    try std.testing.expectEqual(@as(u64, 0), earliest_deadline_for(0));
+}
+
+test "scheduler: deadline ordering — the earlier deadline wakes first" {
+    _ = init();
+    _ = register_worker(0x2000).?;
+    _ = register_user(0x3000, 0).?;
+    start();
+    try std.testing.expect(sleep_until_ns(50_000_000)); // task 0 at +50 ms
+    try std.testing.expect(is_blocked(0));
+    // A second sleeper at an earlier deadline: the set is sorted, the
+    // earliest for the core is the second insert.
+    current[0] = 1;
+    try std.testing.expect(sleep_until_ns(30_000_000)); // task 1 at +30 ms
+    try std.testing.expect(is_blocked(1));
+    try std.testing.expectEqual(@as(usize, 2), deadline_count);
+    try std.testing.expectEqual(@as(u64, 30_000_000), earliest_deadline_for(0));
+    // At 35 ms only the earlier deadline is due.
+    deadline_service(0, 35_000_000);
+    try std.testing.expect(!is_blocked(1));
+    try std.testing.expect(is_blocked(0));
+    try std.testing.expectEqual(@as(u64, 50_000_000), earliest_deadline_for(0));
+    deadline_service(0, 50_000_000);
+    try std.testing.expect(!is_blocked(0));
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+}
+
+test "scheduler: a killed deadline-blocked task frees its entry" {
+    _ = init();
+    _ = register_worker(0x2000).?;
+    _ = register_user(0x3000, 0).?;
+    start();
+    try std.testing.expect(sleep_until_ns(50_000_000));
+    try std.testing.expect(is_blocked(0));
+    try std.testing.expectEqual(@as(usize, 1), deadline_count);
+    // The kill path's force-wake must cancel the armed deadline.
+    tasks[0].kill_pending = true;
+    on_tick();
+    try std.testing.expect(!is_blocked(0));
+    try std.testing.expectEqual(@as(u64, 0), tasks[0].deadline_ns);
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+    try std.testing.expectEqual(@as(u64, 0), earliest_deadline_for(0));
+    // A later fire has nothing to wake.
+    deadline_service(0, 60_000_000);
+    try std.testing.expect(!is_blocked(0));
+}
+
+test "scheduler: sleep_until_ns guards — idle, inactive, and the 1 ms quantum" {
+    _ = init();
+    _ = register_worker(0x2000).?;
+    _ = register_user(0x3000, 0).?;
+    // Inactive pool: no block.
+    try std.testing.expect(!sleep_until_ns(50_000_000));
+    start();
+    // The idle task cannot sleep on a deadline.
+    current[0] = idle_id;
+    try std.testing.expect(!sleep_until_ns(50_000_000));
+    try std.testing.expect(!is_blocked(idle_id));
+    current[0] = 0;
+    // D2: sub-ms deadlines quantize UP to the 1 ms quantum.
+    try std.testing.expect(sleep_until_ns(12_345));
+    try std.testing.expectEqual(@as(u64, 1_000_000), tasks[0].deadline_ns);
+    try std.testing.expectEqual(@as(u64, 1_000_000), deadline_quantum_ns(12_345));
+    try std.testing.expectEqual(@as(u64, 2_000_000), deadline_quantum_ns(1_000_001));
+}
+
+test "scheduler: timer probe arms one task-less deadline and reports late_us" {
+    _ = init();
+    try std.testing.expect(!probe_armed);
+    try std.testing.expect(!probe_deadline_ms(0));
+    try std.testing.expect(!probe_deadline_ms(60_001));
+    try std.testing.expect(probe_deadline_ms(50));
+    try std.testing.expect(probe_armed);
+    try std.testing.expectEqual(@as(usize, 1), deadline_count);
+    // A second probe is refused while one is armed.
+    try std.testing.expect(!probe_deadline_ms(60));
+    // The fire consumes it and hands the result to the timer drain.
+    deadline_service(0, 50_000_500); // armed at now_ns()=0 in tests
+    try std.testing.expect(!probe_armed);
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+    try std.testing.expect(probe_deadline_ms(60));
 }

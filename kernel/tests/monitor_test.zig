@@ -1505,7 +1505,7 @@ test "monitor: timer is registered and reports the unarmed host state" {
     // with the conventional PPI default.
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{"timer"}));
     try std.testing.expectEqualStrings(
-        "timer: armed=0 gic=none dist=0x0 ppi=0x1e freq=0x0 ticks=0 irq=0 poll=0 resched_requests=0 resched_coalesced=0 resched_discharged=0 acked=0 first=0xffffffff\n",
+        "timer: armed=0 gic=none dist=0x0 ppi=0x1e freq=0x0 ticks=0 irq=0 poll=0 deadline_irqs=0 resched_requests=0 resched_coalesced=0 resched_discharged=0 acked=0 first=0xffffffff\n",
         env.mock.contents(),
     );
 }

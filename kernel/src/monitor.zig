@@ -387,7 +387,7 @@ pub fn ensure_registry() []const Command {
             .{ .name = "smp", .help = "multiprocessor topology, online CPU cores, and per-core task state", .usage = "smp", .category = .tasks_processes, .handler = cmd_smp },
             .{ .name = "type", .help = "echo stdin (the pipe source) to stdout — the right half of `a | type`", .usage = "type", .category = .system, .handler = cmd_type },
             .{ .name = "tty", .help = "terminal drop counters (ADR 0020 D1): out_dropped/in_dropped per bound tty ('tty' prints one line per terminal)", .usage = "tty", .category = .system, .handler = cmd_tty },
-            .{ .name = "timer", .help = "interrupt controller + timer status", .usage = "timer", .category = .memory_state, .handler = cmd_timer },
+            .{ .name = "timer", .help = "interrupt controller + timer status", .usage = "timer [probe <ms>]", .category = .memory_state, .handler = cmd_timer },
             .{ .name = "forensics", .help = "last-words recorder: on|off|dump|reset (off by default)", .usage = "forensics [on|off|dump|reset]", .category = .system, .max_args = 1, .handler = cmd_forensics },
             .{ .name = "tour", .help = "guided tour of the system for new users", .usage = "tour", .category = .machine_identity, .handler = cmd_welcome },
             .{ .name = "uaccess", .help = "user-memory copy diagnostics (valid, fault, recovery)", .usage = "uaccess", .category = .memory_state, .handler = cmd_uaccess },
@@ -4776,8 +4776,19 @@ fn cmd_forensics(m: *Monitor, args: []const []const u8) ExecError {
 /// Report the GIC + generic-timer state. Hardware-free: reads the discovery
 /// globals (pre-exit ACPI values) and the timer counters, so it runs
 /// unchanged in a host test process (armed=0, gic=none there).
+/// `timer probe <ms>` (M170a #3033, ADR 0060) arms one task-less kernel
+/// deadline on this core's comparator; the fire's result line
+/// (`timer probe ms=<n> late_us=<m>`) prints from the main-context drain
+/// once the deadline IRQ has been observed — never from the command.
 fn cmd_timer(m: *Monitor, args: []const []const u8) ExecError {
-    _ = args;
+    if (args.len != 0) {
+        if (!std.mem.eql(u8, args[0], "probe") or args.len != 2) return .usage;
+        const ms = std.fmt.parseInt(u64, args[1], 10) catch return .invalid_argument;
+        if (!scheduler.probe_deadline_ms(ms)) {
+            m.console.puts("timer probe refused\n");
+        }
+        return .none;
+    }
     m.console.puts("timer: armed=");
     m.console.print_u64(if (gic.armed() and timer.armed()) 1 else 0);
     m.console.puts(" gic=");
@@ -4794,6 +4805,10 @@ fn cmd_timer(m: *Monitor, args: []const []const u8) ExecError {
     m.console.print_u64(timer.irq_ticks);
     m.console.puts(" poll=");
     m.console.print_u64(timer.poll_ticks);
+    // M170a #3033 (ADR 0060): comparator fires that were NOT the heartbeat
+    // boundary — the deadline overlay's own counter (flat with no deadlines).
+    m.console.puts(" deadline_irqs=");
+    m.console.print_u64(timer.deadline_irqs);
     // WMP card 3 (#1274): the reschedule DEMAND. `requests` counts wakes that
     // became runnable while another task was executing — i.e. how often the 1 Hz
     // period tick is the only thing standing between a woken task and running;

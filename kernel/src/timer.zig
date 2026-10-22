@@ -58,6 +58,11 @@ var period_ticks: u64 = 0;
 var armed_flag: bool = false;
 var pending_heartbeat: bool = false;
 var pending_irq_report: bool = false;
+/// Comparator fires that were NOT the heartbeat boundary (M170a #3033,
+/// ADR 0060 D1): each wakes the due sleepers and advances only this
+/// counter — never `ticks`/`irq_ticks`, which the heartbeat text and 14
+/// spec files pin byte-exact.
+pub var deadline_irqs: u64 = 0;
 // Snapshots taken when the flags are set (claim 5275): with the scheduler
 // preempting the shell between ticks, the shell prints these lines from a
 // later idle loop, so the live counters at print time would overstate the
@@ -166,25 +171,169 @@ pub fn cntpct() u64 {
     return v;
 }
 
-/// Arm (or re-arm) the comparator one period from now and enable the timer.
-pub fn arm() void {
-    if (comptime builtin.cpu.arch != .aarch64) return;
+// ---------------------------------------------------------------------------
+// Deadline overlay (M170a #3033, ADR 0060 D1)
+// ---------------------------------------------------------------------------
+// The comparator is programmed to the EARLIER of the next heartbeat
+// boundary and this core's earliest pending scheduler deadline — never
+// earlier than the period edge unless a deadline says so, never later.
+// A fire that is not the period edge is a deadline IRQ: it wakes the due
+// sleepers (the same blocked->ready flip `wake_expired` performs) and
+// counts `deadline_irqs` — it must not increment `ticks`/`irq_ticks`,
+// and D3 forbids any forced rotation on it.
+
+/// What the last comparator fire on a core serviced. `scheduler.tick`
+/// reads it: only a heartbeat fire runs the quantum/accounting body — a
+/// deadline-only fire neither counts nor rotates.
+pub const FireKind = enum { none, heartbeat, deadline, both };
+
+/// Next heartbeat boundary per core, in CNTPCT ticks (0 = not yet armed
+/// on that core). Secondaries track it for their own comparator cadence;
+/// only core 0's boundary records a tick.
+var heartbeat_cval: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+/// Earliest pending deadline per core, ns since boot (0 = none). The
+/// scheduler publishes it under sched_lock via `set_deadline`.
+var deadline_ns: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+/// A deadline fire whose wake could not take sched_lock gets a bounded
+/// retry (~1 ms, CNTPCT ticks) instead of a tight refire storm on the
+/// still-due deadline. Cleared by the next `set_deadline` publish.
+var retry_cval: [4]u64 = @as([4]u64, @splat(@as(u64, 0)));
+var last_fire: [4]FireKind = @as([4]FireKind, @splat(FireKind.none));
+
+/// The scheduler's blocked->ready wake scan for due entries, registered
+/// at scheduler init — a hook keeps this module free of a scheduler
+/// dependency (the scheduler already sits above timer for `now_ns`).
+pub var deadline_wake_hook: ?*const fn (core: u32) void = null;
+
+/// Injected clock for host tests (the wm_server.zig:236 precedent):
+/// production reads CNTPCT and converts by CNTFRQ.
+pub var now_ns_hook: ?*const fn () u64 = null;
+
+/// Monotonic nanoseconds since boot: CNTPCT scaled by CNTFRQ. 0 until
+/// `init` reads the frequency — and in host tests unless `now_ns_hook`
+/// is installed.
+pub fn now_ns() u64 {
+    if (now_ns_hook) |h| return h();
+    if (freq == 0) return 0;
+    return @intCast(@as(u128, cntpct()) * 1_000_000_000 / freq);
+}
+
+/// CNTPCT ticks at or after `ns` (ceil — the comparator never arms
+/// earlier than the deadline it was given). Saturating.
+fn ns_to_ticks(ns: u64) u64 {
+    if (freq == 0) return 0;
+    const t = (@as(u128, ns) * freq + 999_999_999) / 1_000_000_000;
+    if (t > std.math.maxInt(u64)) return std.math.maxInt(u64);
+    return @intCast(t);
+}
+
+/// The comparator choice (pure — host-testable): the earlier of the
+/// heartbeat boundary and the pending deadline (`deadline_ticks == 0`
+/// means none pending). An exact tie arms the boundary; the fire then
+/// services both.
+pub fn choose_target(heartbeat_boundary: u64, deadline_ticks: u64) u64 {
+    if (deadline_ticks != 0 and deadline_ticks < heartbeat_boundary) return deadline_ticks;
+    return heartbeat_boundary;
+}
+
+/// What the last fire on `c` was classified as (.none before the first
+/// fire — `scheduler.tick` treats it as nothing-to-do).
+pub fn fire_kind(c: usize) FireKind {
+    return last_fire[c];
+}
+
+/// Program this core's comparator to `choose_target` of the stored
+/// heartbeat boundary and earliest deadline — the same instruction
+/// stream `arm` always wrote; the overlay changes WHAT value lands in
+/// CNTP_CVAL, not the mechanism (D1). A boundary already in the past is
+/// preserved (target = the boundary) so a pending/masked heartbeat fire
+/// is never silently skipped.
+fn program() void {
+    if (comptime builtin.is_test or builtin.cpu.arch != .aarch64) return;
     if (period_ticks == 0) return;
-    const cval = cntpct() + period_ticks;
-    // #1261: record that the hardware was given a deadline, and what it was.
-    // A steady `rearm` cadence with no `entry` records says the comparator
-    // fires but the exception is never taken; a `rearm` gap says the source
-    // itself stopped. The delta is what exposes a clobbered `period_ticks`.
-    forensics.note(.rearm, period_ticks);
+    const c = profile_core();
+    const now = cntpct();
+    if (heartbeat_cval[c] == 0) heartbeat_cval[c] = now + period_ticks;
+    var target = heartbeat_cval[c];
+    if (deadline_ns[c] != 0) {
+        var d = ns_to_ticks(deadline_ns[c]);
+        if (retry_cval[c] != 0 and retry_cval[c] > d) d = retry_cval[c];
+        if (d < target) target = d;
+    }
+    // #1261: record that the hardware was given a deadline, and what it
+    // was. A steady `rearm` cadence with no `entry` records says the
+    // comparator fires but the exception is never taken; a `rearm` gap
+    // says the source itself stopped. The delta is what exposes a
+    // clobbered `period_ticks`.
+    forensics.note(.rearm, target);
     asm volatile ("msr cntp_cval_el0, %[v]"
         :
-        : [v] "r" (cval),
+        : [v] "r" (target),
     );
     asm volatile ("msr cntp_ctl_el0, %[v]"
         :
         : [v] "r" (@as(u64, 1)), // enable, IMASK=0
     );
     asm volatile ("isb");
+}
+
+/// Publish this core's new earliest deadline (ns since boot, 0 = none)
+/// and reprogram the comparator when the publisher IS that core. Called
+/// by the scheduler under sched_lock after every set mutation; a remote
+/// core's comparator self-heals on its next fire (a stale armed deadline
+/// costs one early fire classified `.none`, never a wrong tick).
+pub fn set_deadline(c: usize, earliest_ns: u64) void {
+    if (deadline_ns[c] == earliest_ns) return;
+    deadline_ns[c] = earliest_ns;
+    retry_cval[c] = 0;
+    if (profile_core() == c) program();
+}
+
+/// The wake hook could not take sched_lock: hold the comparator ~1 ms
+/// out instead of refiring on the still-due deadline in a tight IRQ
+/// storm against the preempted holder.
+pub fn defer_deadline_retry(c: u32) void {
+    if (comptime builtin.is_test or builtin.cpu.arch != .aarch64) return;
+    if (freq == 0) return;
+    retry_cval[c] = cntpct() + freq / 1000;
+}
+
+/// Service one comparator fire on core `c` observed at `now_ticks`: the
+/// heartbeat boundary crossing records the tick (core 0 only) and slides
+/// the boundary forward one period; a due deadline counts
+/// `deadline_irqs` and runs the wake hook (which publishes the next
+/// earliest through `set_deadline`). Both can land on one fire. Returns
+/// what fired so the scheduler's `tick` can skip a non-heartbeat.
+fn service(c: usize, now_ticks: u64) FireKind {
+    var kind: FireKind = .none;
+    if (heartbeat_cval[c] != 0 and now_ticks >= heartbeat_cval[c]) {
+        if (c == 0) record_tick(.irq);
+        heartbeat_cval[c] = now_ticks + period_ticks;
+        kind = .heartbeat;
+    }
+    if (deadline_ns[c] != 0 and now_ticks >= ns_to_ticks(deadline_ns[c])) {
+        deadline_irqs +%= 1;
+        kind = if (kind == .heartbeat) .both else .deadline;
+        if (deadline_wake_hook) |h| h(@intCast(c));
+    }
+    last_fire[c] = kind;
+    program();
+    return kind;
+}
+
+/// Host-safe test hook (the `on_tick` precedent): run one fire's
+/// classification, counters and wake hook with an injected counter
+/// value; the comparator write stays aarch64-only inside `program`.
+pub fn fire_for_test(c: usize, now_ticks: u64) FireKind {
+    return service(c, now_ticks);
+}
+
+/// Arm (or re-arm) the comparator — the init path AND, per main.zig's
+/// dispatch, the secondary cores' fire service: classify the fire,
+/// service what is due, reprogram to the earlier of boundary/deadline.
+pub fn arm() void {
+    if (comptime builtin.cpu.arch != .aarch64) return;
+    _ = service(profile_core(), cntpct());
 }
 
 /// Grant EL0 access to the counter registers (CNTPCT_EL0, CNTFRQ_EL0,
@@ -384,11 +533,13 @@ pub fn on_tick() void {
 }
 
 /// IRQ-context tick handler (called by the kernel's irq_dispatch when the
-/// acknowledged INTID matches `ppi`). Console-free by design.
+/// acknowledged INTID matches `ppi`). Console-free by design. The fire
+/// service classifies it: a heartbeat boundary records the tick, a due
+/// deadline counts `deadline_irqs` and wakes its sleepers — the overlay's
+/// single comparator covers both reasons to fire (D1).
 pub fn handle() void {
     if (comptime builtin.cpu.arch != .aarch64) return;
-    record_tick(.irq);
-    arm();
+    _ = service(profile_core(), cntpct());
 }
 
 /// True when `intid` is this timer's PPI.
@@ -410,13 +561,31 @@ pub fn poll() void {
     );
     if (cntpct() >= cval) {
         record_tick(.poll);
-        arm();
+        // The poll consumed this fire outright — reprogram without a
+        // second classification (a due deadline still refires on its
+        // published value and is serviced by the IRQ path).
+        program();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Heartbeat (main context only — the shell idle loop)
 // ---------------------------------------------------------------------------
+
+/// Monitor `timer probe` result plumbing (M170a #3033): the deadline-IRQ
+/// wake records the armed ms and the CNTPCT-derived lateness here; the
+/// drain below prints the line in main context (no printing in IRQ).
+var probe_pending: bool = false;
+var probe_result_ms: u64 = 0;
+var probe_result_late_us: u64 = 0;
+
+/// The deadline fire consumed a probe entry: record the result for the
+/// main-context drain.
+pub fn probe_done(ms: u64, late_us: u64) void {
+    probe_result_ms = ms;
+    probe_result_late_us = late_us;
+    probe_pending = true;
+}
 
 /// Print the periodic heartbeat line if one is pending. Safe to call from
 /// the main context; never from an IRQ handler.
@@ -451,6 +620,14 @@ pub fn maybe_heartbeat(con: *console.Console) void {
         con.print_u64(heartbeat_irq);
         con.puts(" poll=");
         con.print_u64(heartbeat_poll);
+        con.puts("\n");
+    }
+    if (probe_pending) {
+        probe_pending = false;
+        con.puts("timer probe ms=");
+        con.print_u64(probe_result_ms);
+        con.puts(" late_us=");
+        con.print_u64(probe_result_late_us);
         con.puts("\n");
     }
 }
@@ -655,4 +832,156 @@ test "timer: set_wall_epoch re-anchors the clock and refuses out-of-range values
         try std.testing.expect(!set_wall_epoch(bad));
         try std.testing.expectEqual(held, boot_epoch_secs);
     }
+}
+
+// M170a (#3033, ADR 0060): deadline overlay — comparator choice, fire
+// classification, counter isolation, and the probe drain. `fire_for_test`
+// injects the counter value; `program`'s comparator write stays aarch64.
+test "timer: comparator target is min(heartbeat boundary, earliest deadline)" {
+    // No deadline pending: the heartbeat boundary stands.
+    try std.testing.expectEqual(@as(u64, 1_000), choose_target(1_000, 0));
+    // Earlier deadline pulls the comparator forward.
+    try std.testing.expectEqual(@as(u64, 400), choose_target(1_000, 400));
+    // Later deadline never delays the heartbeat.
+    try std.testing.expectEqual(@as(u64, 1_000), choose_target(1_000, 4_000));
+    // An exact tie arms the boundary; the fire services both.
+    try std.testing.expectEqual(@as(u64, 700), choose_target(700, 700));
+}
+
+test "timer: ns_to_ticks ceils and saturates" {
+    const saved_freq = freq;
+    defer freq = saved_freq;
+    freq = 24_000_000;
+    try std.testing.expectEqual(@as(u64, 0), ns_to_ticks(0));
+    try std.testing.expectEqual(@as(u64, 1_200_000), ns_to_ticks(50_000_000)); // 50 ms
+    // Sub-tick deadlines arm at the NEXT tick — never early.
+    try std.testing.expectEqual(@as(u64, 24_001), ns_to_ticks(1_000_001)); // 1 ms + 1 ns
+    freq = 100_000_000_000; // absurd frequency exercises the u64 saturator
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), ns_to_ticks(std.math.maxInt(u64)));
+    freq = 0;
+    try std.testing.expectEqual(@as(u64, 0), ns_to_ticks(1_000_000));
+}
+
+test "timer: fire classification — heartbeat vs deadline vs both vs spurious" {
+    const saved_freq = freq;
+    const saved_ticks = ticks;
+    const saved_irq = irq_ticks;
+    const saved_dl = deadline_irqs;
+    defer {
+        freq = saved_freq;
+        ticks = saved_ticks;
+        irq_ticks = saved_irq;
+        deadline_irqs = saved_dl;
+        heartbeat_cval = @splat(0);
+        deadline_ns = @splat(0);
+        retry_cval = @splat(0);
+        last_fire = @splat(.none);
+        pending_heartbeat = false;
+        pending_irq_report = false;
+        deadline_wake_hook = null;
+    }
+    freq = 1_000_000_000; // 1 tick == 1 ns, for readable deadlines
+    period_ticks = 1_000;
+    defer period_ticks = 0;
+    ticks = 0;
+    irq_ticks = 0;
+    deadline_irqs = 0;
+    heartbeat_cval = @splat(0);
+    deadline_ns = @splat(0);
+    // The arm is not itself a fire.
+    try std.testing.expectEqual(FireKind.none, fire_for_test(0, 0));
+    heartbeat_cval[0] = 1_000;
+    // A deadline armed before the boundary fires alone: no tick counted.
+    deadline_ns[0] = 400;
+    try std.testing.expectEqual(FireKind.deadline, fire_for_test(0, 400));
+    try std.testing.expectEqual(@as(u64, 1), deadline_irqs);
+    try std.testing.expectEqual(@as(u64, 0), ticks);
+    try std.testing.expectEqual(@as(u64, 0), irq_ticks);
+    try std.testing.expectEqual(FireKind.deadline, fire_kind(0));
+    // The wake consumes the entry and republishes — no hook installed in
+    // this test, so emulate the publish explicitly.
+    deadline_ns[0] = 0;
+    // The boundary still lands on schedule and records the tick.
+    try std.testing.expectEqual(FireKind.heartbeat, fire_for_test(0, 1_000));
+    try std.testing.expectEqual(@as(u64, 1), ticks);
+    try std.testing.expectEqual(@as(u64, 1), irq_ticks);
+    try std.testing.expectEqual(@as(u64, 1), deadline_irqs);
+    try std.testing.expectEqual(@as(u64, 2_000), heartbeat_cval[0]);
+    // A fire late enough to cross both counts both reasons.
+    deadline_ns[0] = 1_500;
+    try std.testing.expectEqual(FireKind.both, fire_for_test(0, 2_100));
+    try std.testing.expectEqual(@as(u64, 2), ticks);
+    try std.testing.expectEqual(@as(u64, 2), deadline_irqs);
+    deadline_ns[0] = 0;
+    // A stale armed deadline firing with nothing due is .none — never a tick.
+    try std.testing.expectEqual(FireKind.none, fire_for_test(0, 2_500));
+    try std.testing.expectEqual(@as(u64, 2), ticks);
+    try std.testing.expectEqual(@as(u64, 2), irq_ticks);
+    // A deadline beyond the boundary does not disturb either cadence.
+    deadline_ns[0] = 99_000;
+    try std.testing.expectEqual(FireKind.heartbeat, fire_for_test(0, 3_100));
+    try std.testing.expectEqual(@as(u64, 3), ticks);
+    try std.testing.expectEqual(@as(u64, 2), deadline_irqs);
+}
+
+test "timer: a burst of deadlines leaves the heartbeat counters untouched" {
+    const saved_freq = freq;
+    const saved_ticks = ticks;
+    const saved_irq = irq_ticks;
+    const saved_dl = deadline_irqs;
+    defer {
+        freq = saved_freq;
+        ticks = saved_ticks;
+        irq_ticks = saved_irq;
+        deadline_irqs = saved_dl;
+        heartbeat_cval = @splat(0);
+        deadline_ns = @splat(0);
+        last_fire = @splat(.none);
+        pending_heartbeat = false;
+        pending_irq_report = false;
+        deadline_wake_hook = null;
+    }
+    freq = 1_000_000_000;
+    period_ticks = 10_000;
+    defer period_ticks = 0;
+    ticks = 0;
+    irq_ticks = 0;
+    deadline_irqs = 0;
+    heartbeat_cval[0] = 10_000;
+    // Nine deadline fires inside one period + one heartbeat fire.
+    var wakes: u64 = 0;
+    const Hook = struct {
+        var count: *u64 = undefined;
+        fn f(_: u32) void {
+            count.* += 1;
+        }
+    };
+    Hook.count = &wakes;
+    deadline_wake_hook = &Hook.f;
+    var t: u64 = 100;
+    while (t <= 900) : (t += 100) {
+        deadline_ns[0] = t;
+        try std.testing.expectEqual(FireKind.deadline, fire_for_test(0, t));
+    }
+    deadline_ns[0] = 0;
+    try std.testing.expectEqual(@as(u64, 9), wakes);
+    try std.testing.expectEqual(@as(u64, 9), deadline_irqs);
+    try std.testing.expectEqual(@as(u64, 0), ticks);
+    try std.testing.expectEqual(@as(u64, 0), irq_ticks);
+    try std.testing.expectEqual(FireKind.heartbeat, fire_for_test(0, 10_000));
+    try std.testing.expectEqual(@as(u64, 1), ticks);
+    try std.testing.expectEqual(@as(u64, 1), irq_ticks);
+}
+
+test "timer: probe_done drains once through maybe_heartbeat" {
+    var mock = console.MockConsole(1024){};
+    var con = mock.console();
+    probe_pending = false;
+    defer probe_pending = false;
+    probe_done(50, 123);
+    maybe_heartbeat(&con);
+    try std.testing.expectEqualStrings("timer probe ms=50 late_us=123\n", mock.contents());
+    mock.reset();
+    maybe_heartbeat(&con);
+    try std.testing.expectEqual(@as(usize, 0), mock.contents().len);
 }
