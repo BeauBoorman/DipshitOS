@@ -574,6 +574,25 @@ pub fn handleMetadata(backend: Backend, auth: Authorizer, handle: u64, path: []c
     return result;
 }
 
+/// Reauthorizes a mutation riding the open contained `handle` through its
+/// recorded `path`. The plain path check alone describes whatever the name
+/// resolves to NOW, while the mutation lands on the open-time inode — a
+/// delete+recreate or rename in between would let one object's policy bless
+/// a mutation of another. The same authorized no-follow walk as open
+/// re-pins the live object and its identity must still equal the open
+/// token's; a rebound or broken name is stale, never re-resolved onto a
+/// different inode.
+pub fn reauthorizeHandle(backend: Backend, auth: Authorizer, handle: u64, path: []const u8, access: Access) Error!void {
+    const ops = try backend.contained();
+    const object = try resolve(backend, auth, path, access);
+    defer ops.release(backend.context, object);
+    const live = try checkedStat(backend, object);
+    const held = try ops.handle_stat(backend.context, handle);
+    try noSymlink(held);
+    if (held.kind != .file or !held.identity.eql(live.identity)) return error.StaleIdentity;
+    try authorizePath(auth, path, access);
+}
+
 pub fn createFile(backend: Backend, auth: Authorizer, dir: Directory, name: []const u8) Error!Created {
     var buffer: [max_relative_path]u8 = undefined;
     const ops = try backend.contained();
@@ -1058,6 +1077,32 @@ test "metadata: changed identity or kind at stat refuses instead of trusting old
     try std.testing.expectError(error.StaleIdentity, checkedStat(f.backend(), object));
     f.objects[3] = f.objects[4];
     try std.testing.expectError(error.SymlinkRejected, checkedStat(f.backend(), object));
+}
+
+test "metadata: handle reauthorization binds the resolved identity, refusing a rebound name" {
+    var f = try Fixture.init();
+    const token = try openToken(f.backend(), f.auth(), "a/b/page.md", .write);
+    // The recorded path still names the open object: the check passes.
+    try reauthorizeHandle(f.backend(), f.auth(), token, "a/b/page.md", .write);
+    // A delete+recreate rebinds the name to a new inode — the authorized
+    // path no longer describes the object the mutation would hit.
+    f.objects[4] = try decodeFuseAttr(7, &testAttr(200, 0o100644));
+    f.edges[2].child = 4;
+    try std.testing.expectError(error.StaleIdentity, reauthorizeHandle(f.backend(), f.auth(), token, "a/b/page.md", .write));
+    try std.testing.expectEqual(@as(usize, 0), f.pins);
+    // Rebound back, the same token is honored again.
+    f.edges[2].child = 3;
+    try reauthorizeHandle(f.backend(), f.auth(), token, "a/b/page.md", .write);
+    // A revoked leaf policy fails the walk, and a vanished name is an
+    // honest FileNotFound — neither reaches a mutation of the open inode.
+    f.denies = "a/b/page.md";
+    f.deny_access = .write;
+    try std.testing.expectError(error.AccessDenied, reauthorizeHandle(f.backend(), f.auth(), token, "a/b/page.md", .write));
+    f.denies = null;
+    f.deny_access = null;
+    f.edges[2].name = "gone.md";
+    try std.testing.expectError(error.FileNotFound, reauthorizeHandle(f.backend(), f.auth(), token, "a/b/page.md", .write));
+    try std.testing.expectEqual(@as(usize, 0), f.pins);
 }
 
 test "metadata: cross-filesystem lookup is an explicit containment refusal" {

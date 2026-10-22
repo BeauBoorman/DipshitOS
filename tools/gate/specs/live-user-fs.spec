@@ -610,12 +610,13 @@ vgate_assert b3-virtiofs serial-exact 'b3: directory rows=23 pages=4 long-names=
 vgate_assert b3-virtiofs serial-exact 'b3: Boris-style discovery directories=3 entries=25 cycles=0' 1
 vgate_assert b3-virtiofs serial-exact 'b3: no-follow refusals=17 root intermediate leaf dangling' 1
 vgate_assert b3-virtiofs serial-exact 'b3: watch independent mtime and size changes detected' 1
-vgate_assert b3-virtiofs serial-exact 'b3: replacement races pinned reads and mutation safe' 1
+vgate_assert b3-virtiofs serial-exact 'b3: replacement races pinned reads survive and rebound mutation refused' 1
 vgate_assert b3-virtiofs serial-exact 'b3: ownership and secret refusals=7' 1
 vgate_assert b3-virtiofs serial-exact 'b5: pin metadata own-object path-fd unsupported symlink refused' 1
 vgate_assert b3-virtiofs serial-exact 'b5: staged directories=2 files=2 exclusive EEXIST=2' 1
 vgate_assert b3-virtiofs serial-exact 'b5: Boris publish EEXIST=2 park swap remove stale-refusals=2' 1
 vgate_assert b3-virtiofs serial-exact 'b5: atomic replace preserve EEXIST replace ok slot-35 stales pins' 1
+vgate_assert b3-virtiofs serial-exact 'b5: stale-inode write truncate sync refuse a rebound name' 1
 vgate_assert b3-virtiofs serial-exact 'b5: refusals names=6 registers=7 policy=7 tokens=4' 1
 vgate_assert b3-virtiofs serial-contains 'b3: PASS checks='
 vgate_assert b3-virtiofs serial-absent 'b3: FAIL'

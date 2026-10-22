@@ -1724,7 +1724,7 @@ test "B3 EL0: nested stable identities honest rich rows and indexed fault retry"
     try std.testing.expectEqual(@as(usize, 0), B3Case.Server.transient_pins());
 }
 
-test "B3 EL0: fresh watch stamps pinned reads and writes survive leaf replacement" {
+test "B3 EL0: fresh watch stamps pinned reads survive leaf replacement and rebound writes refuse" {
     var c: B3Case = .{};
     c.start();
     defer c.stop();
@@ -1751,7 +1751,10 @@ test "B3 EL0: fresh watch stamps pinned reads and writes survive leaf replacemen
     const writer = c.call(meta.write_open_op, "/host/content", "a/b/page.md");
     try std.testing.expect(writer >= 0);
     @memcpy(c.storage.data[0..4], "edit");
-    try std.testing.expectEqual(@as(u64, 4), dispatch(25, .{ @intCast(writer), @intFromPtr(&c.storage.data), 4, 0, 0, 0 }, &c.frame));
+    // The name now resolves to a symlink, so it can no longer authorize the
+    // open inode — the contained write refuses instead of mutating the
+    // stale object under whatever the rebound name would carry.
+    try std.testing.expectEqual(error_result(.eacces), dispatch(25, .{ @intCast(writer), @intFromPtr(&c.storage.data), 4, 0, 0, 0 }, &c.frame));
     try std.testing.expectEqual(@as(i64, -7), c.call(meta.read_open_op, "/host/content", "a/b/page.md"));
     try std.testing.expectEqual(@as(u64, 0), dispatch(26, .{ @intCast(writer), 0, 0, 0, 0, 0 }, &c.frame));
     try std.testing.expectEqual(@as(usize, 0), B3Case.Server.transient_pins());
@@ -2047,6 +2050,42 @@ test "B5 EL0: guest renames and removals stale every process's pins at or under 
     // Process teardown releases its stale and live pins alike.
     file_table.reset_process(peer_pid);
     try std.testing.expectEqual(@as(i64, -2), file_table.pin_close(peer_pid, @intCast(peer_live)));
+    try std.testing.expectEqual(@as(usize, 0), S.transient_pins());
+}
+
+test "B5 EL0: contained mutations refuse a name rebound to a new inode" {
+    var c: B5Case = .{};
+    c.start();
+    defer c.stop();
+    const meta = file_table.metadata;
+    const S = B5Case.Server;
+    const a = c.pin("a");
+    try std.testing.expect(a > 0);
+    const fd = c.named(meta.create_op, a, "victim.txt", 0);
+    try std.testing.expect(fd >= 0);
+    try std.testing.expectEqual(@as(i64, 0), c.stat(fd, meta.handle_file));
+    const doomed_inode = c.storage.value.identity.inode;
+    // A delete+recreate rebinds the recorded path to a different inode.
+    try std.testing.expectEqual(@as(i64, 0), c.named(meta.remove_op, a, "victim.txt", meta.remove_file));
+    const live = c.named(meta.create_op, a, "victim.txt", 0);
+    try std.testing.expect(live >= 0);
+    try std.testing.expectEqual(@as(i64, 0), c.stat(live, meta.handle_file));
+    try std.testing.expect(c.storage.value.identity.inode != doomed_inode);
+    // The open fd's recorded path now names the new object — mutations
+    // refuse EBADF instead of hitting the stale inode under its auth.
+    @memcpy(c.storage.data[0..4], "boom");
+    try std.testing.expectEqual(error_result(.ebadf), dispatch(25, .{ @intCast(fd), @intFromPtr(&c.storage.data), 4, 0, 0, 0 }, &c.frame));
+    try std.testing.expectEqual(error_result(.ebadf), dispatch(36, .{ @intCast(fd), 2, 0, 0, 0, 0 }, &c.frame));
+    try std.testing.expectEqual(error_result(.ebadf), dispatch(77, .{ @intCast(fd), 0, 0, 0, 0, 0 }, &c.frame));
+    // The rebound name still authorizes the fd actually bound to it.
+    try std.testing.expectEqual(@as(u64, 4), dispatch(25, .{ @intCast(live), @intFromPtr(&c.storage.data), 4, 0, 0, 0 }, &c.frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(36, .{ @intCast(live), 2, 0, 0, 0, 0 }, &c.frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(77, .{ @intCast(live), 0, 0, 0, 0, 0 }, &c.frame));
+    // Close is the one operation a stale fd still takes.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(26, .{ @intCast(fd), 0, 0, 0, 0, 0 }, &c.frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(26, .{ @intCast(live), 0, 0, 0, 0, 0 }, &c.frame));
+    try std.testing.expectEqual(@as(i64, 0), c.named(meta.remove_op, a, "victim.txt", meta.remove_file));
+    try std.testing.expectEqual(@as(i64, 0), c.close(a));
     try std.testing.expectEqual(@as(usize, 0), S.transient_pins());
 }
 

@@ -1292,6 +1292,14 @@ pub const TestMetadataServer = struct {
                 releases += 1;
                 return "";
             },
+            fuse_setattr => {
+                if (extra(node)) |e| {
+                    e.size = read64(input, 16);
+                } else if (node == 5) {
+                    size = read64(input, 16);
+                }
+                return "";
+            },
             fuse_releasedir, fuse_fsync => return "",
             else => return null,
         }

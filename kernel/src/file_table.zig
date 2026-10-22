@@ -2003,8 +2003,13 @@ fn write_handle(pid: u64, h: *FileHandle, in_buf: []const u8) i64 {
     // M50 TS2 (ADR 0024 D4): the host-share ownership/mode gate for writes.
     if (h.partition == .host and !hostAllowed(pid, h.path[0..h.path_len], .write)) return -7; // EACCES
     if (h.contained) {
+        var root = virtio_file.MetadataRoot{ .path = "" };
         var auth = MetadataAuth{ .pid = pid, .root = "" };
-        MetadataAuth.check(&auth, h.path[0..h.path_len], .write) catch |err| return metadata_errno(err);
+        // The recorded path's reauthorization is honest only while it still
+        // names the open object — a delete+recreate or rename in between
+        // must refuse, not mutate the stale inode under another file's
+        // authorization.
+        metadata.reauthorizeHandle(virtio_file.metadata_backend(&root), auth.authorizer(), h.host_handle, h.path[0..h.path_len], .write) catch |err| return metadata_errno(err);
     }
 
     // M34 HF5 (issue #739): host writes ride the host handle's cursor
@@ -2486,8 +2491,13 @@ pub fn truncate(pid: u64, fd: u64, new_size: u32) i64 {
     // its own cursor to the new size, mirrored below.
     if (!h.host_handle_valid) return -7; // EACCES
     if (h.contained) {
+        var root = virtio_file.MetadataRoot{ .path = "" };
         var auth = MetadataAuth{ .pid = pid, .root = "" };
-        MetadataAuth.check(&auth, h.path[0..h.path_len], .write) catch |err| return metadata_errno(err);
+        // The recorded path's reauthorization is honest only while it still
+        // names the open object — a delete+recreate or rename in between
+        // must refuse, not mutate the stale inode under another file's
+        // authorization.
+        metadata.reauthorizeHandle(virtio_file.metadata_backend(&root), auth.authorizer(), h.host_handle, h.path[0..h.path_len], .write) catch |err| return metadata_errno(err);
     }
     const st = if (h.contained) virtio_file.contained_truncate(h.host_handle, new_size) else virtio_file.truncate(h.host_handle, new_size);
     if (st != virtio_file.st_ok) return hf_handle_errno(st);
@@ -2517,8 +2527,9 @@ pub fn sync(pid: u64, fd: u64) i64 {
     if (h.partition != .host) return 0; // no host-side state to push
     if (!h.host_handle_valid) return 0; // stateless read handle: nothing to sync
     if (h.contained) {
+        var root = virtio_file.MetadataRoot{ .path = "" };
         var auth = MetadataAuth{ .pid = pid, .root = "" };
-        MetadataAuth.check(&auth, h.path[0..h.path_len], if ((h.flags & MODE_WRITE) != 0) .write else .read) catch |err| return metadata_errno(err);
+        metadata.reauthorizeHandle(virtio_file.metadata_backend(&root), auth.authorizer(), h.host_handle, h.path[0..h.path_len], if ((h.flags & MODE_WRITE) != 0) .write else .read) catch |err| return metadata_errno(err);
         return hf_handle_errno(virtio_file.contained_sync(h.host_handle));
     }
     return hf_handle_errno(virtio_file.fsync(h.host_handle));

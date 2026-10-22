@@ -163,6 +163,24 @@ fn pinned() void {
     read(reader, "<p>v2</p>\n");
     check(handleStat(reader, meta.handle_file) == 0 and value.size == 10);
     close(reader);
+
+    checkpoint = "B5 stale-inode mutation refusal";
+    // A delete+recreate under the live pin rebinds the recorded path to a
+    // new inode; write, truncate and sync through the earlier fd must
+    // refuse rather than hit the stale object under a laundered auth.
+    createWith(out, "swapped.txt", "one\n");
+    const doomed = call(meta.write_open_op, "/host/PUB", "out/swapped.txt");
+    check(doomed >= 0);
+    check(named(meta.remove_op, out, "swapped.txt", meta.remove_file) == 0);
+    createWith(out, "swapped.txt", "two\n");
+    check(svc(36, .{ @intCast(doomed), 1, 0, 0, 0, 0 }) == -2);
+    check(svc(25, .{ @intCast(doomed), @intFromPtr("!"), 1, 0, 0, 0 }) == -2);
+    check(svc(77, .{ @intCast(doomed), 0, 0, 0, 0, 0 }) == -2);
+    close(doomed);
+    check(stat("/host/PUB", "out/swapped.txt").size == 4);
+    check(named(meta.remove_op, out, "swapped.txt", meta.remove_file) == 0);
+    say("b5: stale-inode write truncate sync refuse a rebound name\n");
+
     // A slot-35 rename stales pins at or under either name, too.
     rename("/host/PUB/out", "/host/PUB/moved");
     check(handleStat(out, meta.handle_directory) == -2);
@@ -371,7 +389,10 @@ export fn b3_main() noreturn {
     check(call(meta.stat_op, root, "a/b/page.md") == -7);
     read(reader, "edit!");
     close(reader);
-    check(svc(25, .{ @intCast(pinned_writer), @intFromPtr("safe"), 4, 0, 0, 0 }) == 4);
+    // The rebound name no longer authorizes the open inode: the contained
+    // write refuses through the swapped path rather than mutate it under
+    // whatever policy the new object carries.
+    check(svc(25, .{ @intCast(pinned_writer), @intFromPtr("safe"), 4, 0, 0, 0 }) == -7);
     close(pinned_writer);
     rename("/host/content/a", "/host/SWAPDIR");
     rename("/host/saved-a", "/host/content/a");
@@ -380,11 +401,11 @@ export fn b3_main() noreturn {
     rename("/host/content/a/b/page.md", "/host/content/a/b/saved.md");
     rename("/host/SWAPLEAF", "/host/content/a/b/page.md");
     check(call(meta.identity_op, root, "a/b/page.md") == -7);
-    read(leaf_reader, "safe!");
+    read(leaf_reader, "edit!");
     close(leaf_reader);
     rename("/host/content/a/b/page.md", "/host/SWAPLEAF");
     rename("/host/content/a/b/saved.md", "/host/content/a/b/page.md");
-    say("b3: replacement races pinned reads and mutation safe\n");
+    say("b3: replacement races pinned reads survive and rebound mutation refused\n");
 
     checkpoint = "ownership secret and ancestor policy";
     for ([_][]const u8{ "DENIED", "SECRET" }) |path| {
