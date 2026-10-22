@@ -542,7 +542,18 @@ func TestTarPropsAndPreviewInside(t *testing.T) {
 	}
 	m.handleKey(runeKey('i'))
 	got = pendingJoined(&m)
-	if !strings.Contains(got, "files: props /host/FM/SAMPLE.TAR/INNER.TXT mtime=1700000000 mime=text") {
+	if !strings.Contains(got, "files: props /host/FM/SAMPLE.TAR/INNER.TXT "+
+		"mtime=1700000000 ctime=- alloc=-") {
 		t.Fatalf("file props marker missing: %q", got)
+	}
+	// A member's facts rows name the archive header as their limit —
+	// no stat wire exists inside it.
+	for _, want := range []string{
+		"created   not available — not in the archive header",
+		"on disk   not available — not in the archive header",
+	} {
+		if !strings.Contains(m.render(), want) {
+			t.Fatalf("member facts row %q missing", want)
+		}
 	}
 }

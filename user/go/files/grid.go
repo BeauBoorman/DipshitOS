@@ -86,7 +86,7 @@ var (
 
 // gridKey is the tile cache key — path, size and mtime (the card's
 // keying). A file whose bytes changed moves to a new key; a failed tile
-// is retried only then. The mtime comes off the same statMtime seam the
+// is retried only then. The mtime comes off the same statTimes seam the
 // QuickLook card uses; a path the stat wire cannot serve keys on
 // path+size alone.
 type gridKey struct {
@@ -125,7 +125,7 @@ func (m *model) gridKeyOf(i int) (gridKey, bool) {
 		return gridKey{}, false
 	}
 	k := gridKey{path: p, size: int64(m.entries[i].Size)}
-	if ns, ok := statMtime(p); ok {
+	if ns, _, ok, _ := statTimes(p); ok {
 		k.mt, k.mtOK = ns, true
 	}
 	return k, true

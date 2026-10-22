@@ -1,18 +1,23 @@
 // M155a (issue #2929): the `i` properties card — "what is this file and
 // where does it live" in one key. The card is the QuickLook pane's sibling:
 // a full-frame modal over the listing, Esc closes it, and every fact on it
-// is either the row's own data, the M134a slot-79 stat wire (the mtime —
-// meta_guest.go/meta_host.go own the platform half), a 512-byte mime.Sniff,
-// or the kernel mount-table row the path's volume names (M134b). Facts the
-// wires do not carry — created time, size on disk, volume free space — get
-// a named "not available" row with its reason, never an invented value.
+// is either the row's own data, the M134a slot-79 stat wire (mtime and,
+// since M160c #2994, ctime — meta_guest.go/meta_host.go own the platform
+// half), a 512-byte mime.Sniff, the M160b op-15 facts wire (birth and
+// allocated bytes) or slot-37 free space, or the kernel mount-table row
+// the path's volume names (M134b). Facts the wires do not carry — a birth
+// on /disk, free space on a usb row — keep a named "not available" row
+// with its reason, never an invented value.
 //
 // The model stays pure: openProps decides and marks, render.go owns the
 // frame, and every syscall is behind the same host-stubbed seams
-// (readHead, statMtime, mountRows) the rest of the app uses.
+// (readHead, statTimes, statFacts, volFree, mountRows) the rest of the
+// app uses.
 package main
 
 import (
+	"errors"
+
 	"virelai/clockfmt"
 	"virelai/mime"
 	"virelai/rss/keys"
@@ -24,24 +29,49 @@ import (
 // still a bound so a large file costs nothing extra here.
 const propsHeadBytes = 512
 
+// statFacts is the M160b op-15 facts seam — vi.StatFacts on the guest,
+// stubbed in host tests so each absent-flag arm is pinnable without a
+// kernel.
+var statFacts = vi.StatFacts
+
+// volFree is the M160b slot-37 free-space seam — vi.VolumeFree on the
+// guest (its svc1 rides vi's own syscallHook in host tests); a var so the
+// refusal arms are pinnable too.
+var volFree = vi.VolumeFree
+
 // props is the open card's whole state. name/path/kind identify the row;
 // size is the wire size; mimeID is the sniff word on files ("" on rows
-// with no bytes to sniff); mtOK/mtSec carry the M134a stat's mtime; the
-// vol* fields are the mount-table row the path lives on (volOK=false
-// when the path names no mounted row the table lists).
+// with no bytes to sniff); mtOK/mtSec and ctOK/ctSec carry the M134a
+// stat's mtime and M160a ctime; birthOK/birthSec and allocOK/alloc carry
+// the M160b facts wire's flagged facts (birthNo/allocNo name the reason
+// when a flag is absent or the call refused); freeOK/free and freeNo are
+// the slot-37 free-space answer or its refusal; the vol* fields are the
+// mount-table row the path lives on (volOK=false when the path names no
+// mounted row the table lists).
 type props struct {
-	name    string
-	path    string
-	kind    string // "file", "directory", "volume"
-	size    uint64
-	mimeID  string
-	mtOK    bool
-	mtSec   int64
-	vol     string
-	volKind string
-	volSt   string
-	volAcc  string // "rw"/"ro" when the row is mounted, "" otherwise
-	volOK   bool
+	name     string
+	path     string
+	kind     string // "file", "directory", "volume", "pin"
+	size     uint64
+	mimeID   string
+	mtOK     bool
+	mtSec    int64
+	ctOK     bool
+	ctSec    int64
+	birthOK  bool
+	birthSec int64
+	birthNo  string
+	allocOK  bool
+	alloc    uint64
+	allocNo  string
+	freeOK   bool
+	free     uint64
+	freeNo   string
+	vol      string
+	volKind  string
+	volSt    string
+	volAcc   string // "rw"/"ro" when the row is mounted, "" otherwise
+	volOK    bool
 }
 
 // openProps is the `i` chord: build the card for the cursor row and take
@@ -62,8 +92,11 @@ func (m *model) openProps() {
 	case m.tar != nil:
 		// M167c: the card answers off the member header — class, size,
 		// the header's own mtime, a sniff of the streamed head. No stat
-		// wire exists for a path inside an archive.
+		// wire exists for a path inside an archive, so the facts rows
+		// keep their named reason rather than stat the virtual path.
 		p.kind = "file"
+		p.birthNo = "not in the archive header"
+		p.allocNo = "not in the archive header"
 		if ent, ok := m.tarEntAt(m.sel); ok {
 			p.size = ent.size
 			if ent.mt > 0 {
@@ -150,17 +183,71 @@ func (m *model) openProps() {
 			}
 		}
 	}
-	// mtime from the M134a stat — a /host path only; absent reads as "—"
-	// on the card and mtime=none on the marker, never a fabricated stamp.
-	if ns, ok := statMtime(path); ok {
+	// Free space is the slot-37 answer for the path's volume name —
+	// /host's STATFS or /disk's bitmap — or a named refusal: a usb row
+	// has no free-space source at all, an unmounted /disk answers
+	// ENOENT, an old host EINVAL.
+	if v := volumeOf(path); v != "" {
+		if n, err := volFree(v); err == nil {
+			p.freeOK = true
+			p.free = n
+		} else if errors.Is(err, vi.ErrNoVolumeRow) {
+			p.freeNo = "no free-space row"
+		} else {
+			p.freeNo = "volume refused " + err.Error()
+		}
+	} else {
+		p.freeNo = "path names no volume"
+	}
+	// mtime and ctime ride the SAME M134a slot-79 stat wire — one call,
+	// each stamp flagged on its own. Absent reads "—" on the card and
+	// mtime=none/ctime=- on the marker, never a fabricated stamp.
+	mt, ct, mtOK, ctOK := statTimes(path)
+	if mtOK {
 		p.mtOK = true
-		p.mtSec = ns / 1e9
+		p.mtSec = mt / 1e9
+	}
+	if ctOK {
+		p.ctOK = true
+		p.ctSec = ct / 1e9
+	}
+	// M160b's op-15 record carries what the stat wire cannot: the birth
+	// time and the allocated (on-disk) bytes, each presence-flagged. A
+	// refusal — a path the ABI does not root, an unmounted /disk —
+	// leaves both rows on the named errno; a tar member's reasons were
+	// named with its class, no wire exists inside the archive.
+	if m.tar == nil {
+		if f, err := statFacts(path); err != nil {
+			p.birthNo = "facts refused " + err.Error()
+			p.allocNo = p.birthNo
+		} else {
+			if f.HasBirth {
+				p.birthOK, p.birthSec = true, f.BirthSec
+			} else {
+				p.birthNo = "not on the facts wire"
+			}
+			if f.HasAlloc {
+				p.allocOK, p.alloc = true, f.Alloc
+			} else {
+				p.allocNo = "not on the facts wire"
+			}
+		}
 	}
 	m.props = p
 	m.mode = modeProps
-	mtWord, mimeWord, volWord := "none", "none", "none"
+	mtWord, ctWord, allocWord, freeWord := "none", "-", "-", "-"
+	mimeWord, volWord := "none", "none"
 	if p.mtOK {
 		mtWord = vi.Itoa64(p.mtSec)
+	}
+	if p.ctOK {
+		ctWord = vi.Itoa64(p.ctSec)
+	}
+	if p.allocOK {
+		allocWord = vi.Itoa64(int64(p.alloc))
+	}
+	if p.freeOK {
+		freeWord = vi.Itoa64(int64(p.free))
 	}
 	if p.mimeID != "" {
 		mimeWord = p.mimeID
@@ -169,6 +256,7 @@ func (m *model) openProps() {
 		volWord = p.vol
 	}
 	m.emit(markerProps + p.path + " mtime=" + mtWord +
+		" ctime=" + ctWord + " alloc=" + allocWord + " free=" + freeWord +
 		" mime=" + mimeWord + " vol=" + volWord)
 	m.status = "props " + p.name
 }
@@ -203,17 +291,34 @@ func (m *model) propsKey(ev keys.Event) {
 }
 
 // propsRows is the card's body: name, full path, kind, size (bytes and
-// human), the mtime as UTC ISO-8601, the sniff word, the volume row —
-// then the three named "not available" rows, each with the reason the
-// wires cannot answer it.
+// human), the stat wire's mtime and ctime as UTC ISO-8601, the sniff
+// word, the volume row, then the M160b facts — birth, allocated bytes,
+// the volume's free space — each a real value or its named "not
+// available" reason, never an invented one.
 func (m model) propsRows() []string {
 	p := m.props
 	size, mod, mimeWord, vol := "—", "—", "—", "—"
+	changed := "not available — not on the stat wire"
+	created := "not available — " + p.birthNo
+	disk := "not available — " + p.allocNo
+	free := "not available — " + p.freeNo
 	if p.kind == "file" {
 		size = vi.Itoa64(int64(p.size)) + " bytes (" + humanSize(p.size) + ")"
 	}
 	if p.mtOK {
 		mod = isoUTC(p.mtSec)
+	}
+	if p.ctOK {
+		changed = isoUTC(p.ctSec)
+	}
+	if p.birthOK {
+		created = isoUTC(p.birthSec)
+	}
+	if p.allocOK {
+		disk = vi.Itoa64(int64(p.alloc)) + " bytes (" + humanSize(p.alloc) + ")"
+	}
+	if p.freeOK {
+		free = vi.Itoa64(int64(p.free)) + " bytes (" + humanSize(p.free) + ")"
 	}
 	if p.mimeID != "" {
 		mimeWord = p.mimeID
@@ -230,11 +335,12 @@ func (m model) propsRows() []string {
 		"  kind      " + p.kind,
 		"  size      " + size,
 		"  modified  " + mod,
+		"  changed   " + changed,
+		"  created   " + created,
 		"  mime      " + mimeWord,
 		"  volume    " + vol,
-		"  created   not available — not on the stat wire",
-		"  on disk   not available — not on the stat wire",
-		"  vol free  not available — not on the mount wire",
+		"  on disk   " + disk,
+		"  vol free  " + free,
 	}
 }
 

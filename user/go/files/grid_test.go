@@ -32,18 +32,18 @@ func countingBacker(t *testing.T, files map[string][]byte) map[string]*int {
 	return counts
 }
 
-// statBacker pins the statMtime seam to a per-path table (absent = no
+// statBacker pins the statTimes seam to a per-path table (absent = no
 // stamp), so the cache key's mtime half is testable on the host.
 func statBacker(t *testing.T, stamps map[string]int64) {
 	t.Helper()
-	prev := statMtime
-	statMtime = func(p string) (int64, bool) {
+	prev := statTimes
+	statTimes = func(p string) (int64, int64, bool, bool) {
 		if v, ok := stamps[p]; ok {
-			return v, true
+			return v, 0, true, false
 		}
-		return 0, false
+		return 0, 0, false, false
 	}
-	t.Cleanup(func() { statMtime = prev })
+	t.Cleanup(func() { statTimes = prev })
 }
 
 func rgb(r, g, b uint32) uint32 { return 0xff000000 | r<<16 | g<<8 | b }

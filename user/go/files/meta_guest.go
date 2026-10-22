@@ -23,25 +23,30 @@ func rawsvc6(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64
 // resolve to a DIRECTORY (resolve refuses a file root with NotDirectory),
 // so the call roots at /host and walks the share-relative rest. mtime's
 // WireTime sits at wire offsets 48/56 (seconds, then nanoseconds) — the
-// fields M134a (#2759) fills for /host on either file channel.
+// fields M134a (#2759) fills for /host on either file channel — and
+// ctime's at 64/72, the change stamp M160a's v3 STAT carries.
 const (
 	slotFsMetadata   = 79
 	metaStatOp       = 0
 	metaWireBytes    = 96
 	metaMtimeSecOff  = 48
 	metaMtimeNsecOff = 56
+	metaCtimeSecOff  = 64
+	metaCtimeNsecOff = 72
 	metaRoot         = "/host"
 )
 
-// fileMtime is a share path's nanosecond mtime — the stamp the QuickLook
-// card shows. ok=false means the kernel could not report one (a non-/host
-// path the metadata ABI does not root, a refused path, or the channel's
-// honest "mtime absent" zero) — the card prints "—" rather than inventing
-// a stamp.
-func fileMtime(path string) (int64, bool) {
+// fileTimes is a share path's nanosecond mtime and ctime — the stamps the
+// QuickLook and properties cards show, read in ONE stat call because the
+// same wire carries both. Each flag reports its own stamp: ok=false means
+// the kernel could not answer at all (a non-/host path the metadata ABI
+// does not root, or a refused path), and a stamp whose fields read the
+// wire's absent zero reports false on its own — the card prints its named
+// reason rather than inventing a stamp.
+func fileTimes(path string) (mt, ct int64, mtOK, ctOK bool) {
 	rel := strings.TrimPrefix(path, metaRoot+"/")
 	if rel == path {
-		return 0, false // the metadata ABI is /host-rooted only
+		return 0, 0, false, false // the metadata ABI is /host-rooted only
 	}
 	var wire [metaWireBytes]byte
 	rc := rawsvc6(slotFsMetadata, metaStatOp,
@@ -49,12 +54,13 @@ func fileMtime(path string) (int64, bool) {
 		uintptr(unsafe.Pointer(unsafe.StringData(rel))), uintptr(len(rel)),
 		uintptr(unsafe.Pointer(&wire[0])))
 	if rc < 0 {
-		return 0, false
+		return 0, 0, false, false
 	}
-	sec := int64(binary.LittleEndian.Uint64(wire[metaMtimeSecOff:]))
-	nsec := int64(binary.LittleEndian.Uint32(wire[metaMtimeNsecOff:]))
-	if sec == 0 && nsec == 0 {
-		return 0, false // M134a's "mtime absent" reads zero — named, not shown
-	}
-	return sec*1e9 + nsec, true
+	msec := int64(binary.LittleEndian.Uint64(wire[metaMtimeSecOff:]))
+	mnsec := int64(binary.LittleEndian.Uint32(wire[metaMtimeNsecOff:]))
+	csec := int64(binary.LittleEndian.Uint64(wire[metaCtimeSecOff:]))
+	cnsec := int64(binary.LittleEndian.Uint32(wire[metaCtimeNsecOff:]))
+	// M134a's "absent reads zero" rule applies to each stamp on its own.
+	return msec*1e9 + mnsec, csec*1e9 + cnsec,
+		msec != 0 || mnsec != 0, csec != 0 || cnsec != 0
 }

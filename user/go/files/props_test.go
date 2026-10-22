@@ -8,18 +8,37 @@ import (
 	"virelai/vi"
 )
 
-// stubPropsStat pins the M134a mtime seam for one test: the fixture's
-// nanosecond stamp is the gate's staged epoch (1700000000 s).
+// stubPropsStat pins the stat seam for one test: the fixture's nanosecond
+// mtime is the gate's staged epoch (1700000000 s), its ctime a second
+// stamp (1700100000 s) so the two rows are never the same value.
 func stubPropsStat(t *testing.T, ok bool) {
 	t.Helper()
-	prev := statMtime
-	statMtime = func(string) (int64, bool) {
+	prev := statTimes
+	statTimes = func(string) (int64, int64, bool, bool) {
 		if !ok {
-			return 0, false
+			return 0, 0, false, false
 		}
-		return 1_700_000_000_000_000_000, true
+		return 1_700_000_000_000_000_000, 1_700_100_000_000_000_000, true, true
 	}
-	t.Cleanup(func() { statMtime = prev })
+	t.Cleanup(func() { statTimes = prev })
+}
+
+// stubPropsFacts pins the M160b op-15 seam: the record back, or err for
+// a refused call — each absent-flag arm is pinnable.
+func stubPropsFacts(t *testing.T, f vi.FileFacts, err error) {
+	t.Helper()
+	prev := statFacts
+	statFacts = func(string) (vi.FileFacts, error) { return f, err }
+	t.Cleanup(func() { statFacts = prev })
+}
+
+// stubVolFree pins the slot-37 seam: free bytes back, or the named
+// refusal (ErrNoVolumeRow / a kernel errno).
+func stubVolFree(t *testing.T, n uint64, err error) {
+	t.Helper()
+	prev := volFree
+	volFree = func(string) (uint64, error) { return n, err }
+	t.Cleanup(func() { volFree = prev })
 }
 
 func TestPropsFileCardMarkerAndRows(t *testing.T) {
@@ -27,6 +46,11 @@ func TestPropsFileCardMarkerAndRows(t *testing.T) {
 		"/host/FM/PROPS.TXT": []byte("props-card-body\n"),
 	})
 	stubPropsStat(t, true)
+	stubPropsFacts(t, vi.FileFacts{
+		HasBirth: true, BirthSec: 1_600_000_000,
+		HasAlloc: true, Alloc: 4096,
+	}, nil)
+	stubVolFree(t, 8<<20, nil)
 	stubMounts(t, false)
 	m := testModel(entry("PROPS.TXT", false))
 	m.handleKey(runeKey('i'))
@@ -40,6 +64,18 @@ func TestPropsFileCardMarkerAndRows(t *testing.T) {
 	if !p.mtOK || p.mtSec != 1_700_000_000 {
 		t.Fatalf("mtime = (%v,%d), want the stat wire's 1700000000", p.mtOK, p.mtSec)
 	}
+	if !p.ctOK || p.ctSec != 1_700_100_000 {
+		t.Fatalf("ctime = (%v,%d), want the stat wire's 1700100000", p.ctOK, p.ctSec)
+	}
+	if !p.birthOK || p.birthSec != 1_600_000_000 {
+		t.Fatalf("birth = (%v,%d), want the facts wire's 1600000000", p.birthOK, p.birthSec)
+	}
+	if !p.allocOK || p.alloc != 4096 {
+		t.Fatalf("alloc = (%v,%d), want the facts wire's 4096", p.allocOK, p.alloc)
+	}
+	if !p.freeOK || p.free != 8<<20 {
+		t.Fatalf("free = (%v,%d), want the slot-37 8 MiB", p.freeOK, p.free)
+	}
 	if p.mimeID != "text" {
 		t.Fatalf("mime = %q, want text", p.mimeID)
 	}
@@ -49,7 +85,8 @@ func TestPropsFileCardMarkerAndRows(t *testing.T) {
 			p.vol, p.volKind, p.volSt, p.volAcc, p.volOK)
 	}
 	if got := pendingJoined(&m); !strings.Contains(got,
-		markerProps+"/host/FM/PROPS.TXT mtime=1700000000 mime=text vol=host") {
+		markerProps+"/host/FM/PROPS.TXT mtime=1700000000 ctime=1700100000 "+
+			"alloc=4096 free=8388608 mime=text vol=host") {
 		t.Fatalf("open marker missing: %q", got)
 	}
 	// The render golden: the frame's visible lines, row by row.
@@ -62,11 +99,12 @@ func TestPropsFileCardMarkerAndRows(t *testing.T) {
 		"   kind      file",
 		"   size      19 bytes (19 B)",
 		"   modified  2023-11-14T22:13:20Z",
+		"   changed   2023-11-16T02:00:00Z",
+		"   created   2020-09-13T12:26:40Z",
 		"   mime      text",
 		"   volume    host · share · mounted · rw",
-		"   created   not available — not on the stat wire",
-		"   on disk   not available — not on the stat wire",
-		"   vol free  not available — not on the mount wire",
+		"   on disk   4096 bytes (4.0 KiB)",
+		"   vol free  8388608 bytes (8.0 MiB)",
 	}
 	for i, w := range want {
 		if i >= len(lines) || !strings.HasPrefix(strings.TrimRight(lines[i], " "), w) {
@@ -106,7 +144,7 @@ func TestPropsDirectoryAndVolumeCards(t *testing.T) {
 		t.Fatalf("a directory must not carry a sniff word: %q", m.props.mimeID)
 	}
 	if got := pendingJoined(&m); !strings.Contains(got,
-		markerProps+"/host/FM/SUB mtime=none mime=none vol=host") {
+		markerProps+"/host/FM/SUB mtime=none ctime=- alloc=- free=- mime=none vol=host") {
 		t.Fatalf("dir marker missing: %q", got)
 	}
 	frame := m.render()
@@ -132,11 +170,64 @@ func TestPropsDirectoryAndVolumeCards(t *testing.T) {
 		t.Fatalf("volume row = kind=%q vol=%q ok=%v", m.props.kind, m.props.vol, m.props.volOK)
 	}
 	if got := pendingJoined(&m); !strings.Contains(got,
-		markerProps+"/usb1 mtime=none mime=none vol=usb1") {
+		markerProps+"/usb1 mtime=none ctime=- alloc=- free=- mime=none vol=usb1") {
 		t.Fatalf("volume marker missing: %q", got)
 	}
 	if !strings.Contains(m.render(), "volume    usb1 · fat32 · not_mounted") {
 		t.Fatal("the volume card must name the row's own state words")
+	}
+}
+
+// Each facts row keeps a named reason where its wire cannot answer: an
+// absent flag is "not on the facts wire", a refused call is "facts
+// refused <errno>", a usb-row free space is "no free-space row", and a
+// kernel refusal on the volume is "volume refused <errno>".
+func TestPropsFactRowsNamedReasons(t *testing.T) {
+	fileBacker(t, map[string][]byte{"/host/FM/A.TXT": []byte("a\n")})
+	stubPropsStat(t, true)
+	stubMounts(t, false)
+	// Alloc only — the /disk shape (an inode never carries a birth).
+	stubPropsFacts(t, vi.FileFacts{HasAlloc: true, Alloc: 4096}, nil)
+	stubVolFree(t, 0, vi.ErrNoVolumeRow)
+	m := testModel(entry("A.TXT", false))
+	m.handleKey(runeKey('i'))
+	if m.mode != modeProps {
+		t.Fatal("card did not open")
+	}
+	frame := m.render()
+	for _, want := range []string{
+		"changed   2023-11-16T02:00:00Z",
+		"created   not available — not on the facts wire",
+		"on disk   4096 bytes (4.0 KiB)",
+		"vol free  not available — no free-space row",
+	} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("row %q missing from the card", want)
+		}
+	}
+	if got := pendingJoined(&m); !strings.Contains(got,
+		"ctime=1700100000 alloc=4096 free=-") {
+		t.Fatalf("marker facts wrong: %q", got)
+	}
+	// A refused facts call and a refused free space both name their
+	// errno — neither row invents a value.
+	m.handleKey(keys.Event{Key: keys.KeyEsc})
+	refused := vi.MountErr(-vi.ErrEINVAL)
+	stubPropsFacts(t, vi.FileFacts{}, refused)
+	stubVolFree(t, 0, refused)
+	m.handleKey(runeKey('i'))
+	frame = m.render()
+	for _, want := range []string{
+		"created   not available — facts refused EINVAL",
+		"on disk   not available — facts refused EINVAL",
+		"vol free  not available — volume refused EINVAL",
+	} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("row %q missing from the refused card", want)
+		}
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, "alloc=- free=-") {
+		t.Fatalf("refused marker must carry dashes: %q", got)
 	}
 }
 

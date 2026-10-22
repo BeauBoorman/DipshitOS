@@ -59,6 +59,8 @@ type quickLook struct {
 	size     uint64
 	mtOK     bool
 	mtSec    int64
+	ctOK     bool // the same stat wire's ctime — the card's "changed" row
+	ctSec    int64
 	vol      string // volume rows: the mount's state words ("mounted rw")
 
 	lines  []string // qlText: the first qlTextLines sanitized lines
@@ -75,10 +77,11 @@ type quickLook struct {
 // a var so the host tests can pin the refusal arm without a real raster.
 var decodeImage = webrender.DecodeImage
 
-// statMtime is the mtime seam (M134a #2759): the slot-79 stat op on the
-// guest (meta_guest.go), os.Stat in host builds (meta_host.go). A var so
-// the card arm is pinnable without either.
-var statMtime = fileMtime
+// statTimes is the stat seam (M134a #2759; ctime with M160c #2994): the
+// slot-79 stat op on the guest (meta_guest.go), os.Stat in host builds
+// (meta_host.go) — one call carrying mtime and ctime, each flagged. A
+// var so the card arm is pinnable without either.
+var statTimes = fileTimes
 
 // termCell is the grid rung seam — vi.TerminalCell in both builds.
 var termCell = vi.TerminalCell
@@ -160,12 +163,18 @@ func (m *model) openQuickLook() {
 			ql.kind = qlCard
 		}
 	}
-	// mtime from the M134a stat — a /host path only; absent reads as "—"
-	// on the card, never a fabricated stamp.
+	// mtime and ctime from the M134a stat — a /host path only, one wire
+	// read; absent stamps read as "—" on the card, never a fabricated
+	// stamp.
 	if ql.path != "" {
-		if ns, ok := statMtime(ql.path); ok {
+		mt, ct, mtOK, ctOK := statTimes(ql.path)
+		if mtOK {
 			ql.mtOK = true
-			ql.mtSec = ns / 1e9
+			ql.mtSec = mt / 1e9
+		}
+		if ctOK {
+			ql.ctOK = true
+			ql.ctSec = ct / 1e9
 		}
 	}
 	m.openQL(ql)
@@ -346,9 +355,9 @@ func (m model) qlSubtitle() string {
 	}
 }
 
-// qlCardRows is the card arm's body: name, type, size, mtime — and for a
-// mount-table row the kernel's own state words instead of a stat it
-// cannot serve.
+// qlCardRows is the card arm's body: name, type, size, mtime and ctime —
+// and for a mount-table row the kernel's own state words instead of a
+// stat it cannot serve.
 func (m model) qlCardRows() []string {
 	out := []string{"  " + m.ql.name}
 	if m.ql.vol != "" {
@@ -360,11 +369,14 @@ func (m model) qlCardRows() []string {
 	out = append(out,
 		"  type      "+m.ql.typeName,
 		"  size      "+vi.Itoa64(int64(m.ql.size))+" B")
-	mod := "—"
+	mod, changed := "—", "—"
 	if m.ql.mtOK {
 		mod = clockfmt.Format(m.ql.mtSec, clockfmt.UTC)
 	}
-	out = append(out, "  modified  "+mod)
+	if m.ql.ctOK {
+		changed = clockfmt.Format(m.ql.ctSec, clockfmt.UTC)
+	}
+	out = append(out, "  modified  "+mod, "  changed   "+changed)
 	return out
 }
 

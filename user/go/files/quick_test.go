@@ -120,9 +120,11 @@ func TestQuickLookImageArmSixel(t *testing.T) {
 
 func TestQuickLookCardArmTypeSizeMtime(t *testing.T) {
 	fileBacker(t, map[string][]byte{"/host/FM/SONG.OGG": append([]byte("OggS\x00\x02"), make([]byte, 58)...)})
-	prev := statMtime
-	statMtime = func(string) (int64, bool) { return 1_700_000_000_000_000_000, true }
-	t.Cleanup(func() { statMtime = prev })
+	prev := statTimes
+	statTimes = func(string) (int64, int64, bool, bool) {
+		return 1_700_000_000_000_000_000, 1_700_100_000_000_000_000, true, true
+	}
+	t.Cleanup(func() { statTimes = prev })
 	m := testModel(entry("SONG.OGG", false))
 	m.handleKey(runeKey(' '))
 	if m.mode != modeQuickLook || m.ql.kind != qlCard {
@@ -132,7 +134,11 @@ func TestQuickLookCardArmTypeSizeMtime(t *testing.T) {
 		t.Fatalf("card open marker missing: %q", got)
 	}
 	frame := m.render()
-	for _, want := range []string{"type      audio", "size      19 B", "modified  2023-11-14 22:13:20 UTC"} {
+	for _, want := range []string{
+		"type      audio", "size      19 B",
+		"modified  2023-11-14 22:13:20 UTC",
+		"changed   2023-11-16 02:00:00 UTC",
+	} {
 		if !strings.Contains(frame, want) {
 			t.Fatalf("card row %q missing from the frame", want)
 		}

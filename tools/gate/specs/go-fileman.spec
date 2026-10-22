@@ -89,7 +89,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1724,6 +1724,10 @@ PY
 # marker's mtime= — the host stages FMP/PROPS.TXT at a pinned epoch and the
 # stat wire must carry that exact second through, or the marker cannot
 # match. Esc closes; the `files: props` prefix is the card's own spelling.
+# M160c (#2994) extends the marker with the facts the v3 STAT, op-15 and
+# slot-37 wires now answer: ctime= is the host's own st_ctime, alloc= the
+# allocated bytes, free= the share's free space — the python assert reads
+# all three against the staged file since none can be pinned.
 vgate_file script-18.txt <<'EOFR'
 exec GOFILES.ELF /host/FMP
 EOFR
@@ -1760,9 +1764,26 @@ vgate_run 18 -- \
 vgate_assert 18 serial-contains 'exec: loaded GOFILES.ELF'
 vgate_assert 18 serial-contains 'gofiles: list /host/FMP n=1'
 vgate_assert 18 serial-contains 'gofiles: entry PROPS.TXT file'
-# The open receipt: the staged epoch second, the 512-byte sniff's "text",
-# and the share's mount row — the stat wire carried the host's stamp.
-vgate_assert 18 serial-contains 'files: props /host/FMP/PROPS.TXT mtime=1700000000 mime=text vol=host'
+# The open receipt: the staged epoch second, the stat wire's ctime, the
+# op-15 allocated bytes, the slot-37 free space, the 512-byte sniff's
+# "text", and the share's mount row. ctime/alloc/free cannot be pinned —
+# the python assert holds the marker's numbers against the host's own
+# stat of the staged file (ctime exactly, alloc positive, free numeric).
+vgate_assert 18 serial-contains 'files: props /host/FMP/PROPS.TXT mtime=1700000000 ctime='
+vgate_assert 18 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+st = os.stat(os.path.join(os.environ["VG_SHARE"], "FMP", "PROPS.TXT"))
+m = re.search(
+    r"files: props /host/FMP/PROPS\.TXT mtime=1700000000 "
+    r"ctime=(\d+) alloc=(\d+) free=(\d+) mime=text vol=host", ser)
+assert m, "props marker with the M160c facts not in serial"
+assert int(m.group(1)) == st.st_ctime_ns // 1_000_000_000, \
+    "ctime=" + m.group(1) + " vs host st_ctime=" + repr(st.st_ctime)
+assert int(m.group(2)) > 0, "alloc= must be the positive on-disk bytes"
+print("props facts: ctime=" + m.group(1) +
+      " alloc=" + m.group(2) + " free=" + m.group(3))
+PY
 vgate_assert 18 serial-contains 'files: props close'
 vgate_assert 18 serial-contains 'rx-go-fileman-props-ok'
 vgate_assert 18 serial-absent '[EXC] parking:'
@@ -2025,8 +2046,14 @@ for tag in ("FMD1", "FMD2", "FMD3"):
         with open(os.path.join(root, name), "w") as f:
             f.write(body)
     # Pinned mtime: the props marker's mtime= must equal this staged
-    # epoch — the same stat-wire discipline run 18 pins on FMP.
-    os.utime(os.path.join(root, "M2.TXT"), (1700000000, 1700000000))
+    # epoch — the same stat-wire discipline run 18 pins on FMP. The
+    # ctime= check reads the recorded stage-time st_ctime: the journey
+    # moves M2 afterward, and a rename bumps ctime — post-run os.stat
+    # can never see the stamp the props card did.
+    m2 = os.path.join(root, "M2.TXT")
+    os.utime(m2, (1700000000, 1700000000))
+    with open(os.path.join(os.environ["RUN_DIR"], "fmd-ctimes.txt"), "a") as f:
+        f.write(tag + " " + str(os.stat(m2).st_ctime_ns) + "\n")
 print("staged FMD1/FMD2/FMD3: INTO/ empty, M2 mtime=1700000000 + zephyr")
 PY
 
@@ -2044,8 +2071,10 @@ vgate_assert d1 serial-contains 'exec: loaded GOFILES.ELF'
 vgate_assert d1 serial-contains 'gofiles: list /host/FMD1 n=4'
 vgate_assert d1 serial-contains 'gofiles: entry INTO dir'
 
-# The props leg: the staged epoch second rides the stat wire through.
-vgate_assert d1 serial-contains 'files: props /host/FMD1/M2.TXT mtime=1700000000 mime=text vol=host'
+# The props leg: the staged epoch second rides the stat wire through;
+# the python hook below holds ctime=/alloc=/free= against the stage-time
+# record (the same M160c check run 18 owns on FMP).
+vgate_assert d1 serial-contains 'files: props /host/FMD1/M2.TXT mtime=1700000000 ctime='
 vgate_assert d1 serial-contains 'files: props close'
 
 # The move leg: three marks, one cut, one batch into the destination.
@@ -2088,8 +2117,11 @@ vgate_assert d1 serial-absent 'exited status=139'
 
 # The share-side proof: all three bodies at the destination byte-exact
 # and gone from the source — the filesystem saw what the markers claim.
+# And the props marker's M160c facts: ctime is the recorded stage-time
+# st_ctime (the move bumped it after the card read it), alloc positive,
+# free numeric.
 vgate_assert d1 python <<'PY'
-import os
+import os, re
 share = os.environ["VG_SHARE"]
 root = os.path.join(share, "FMD1")
 into = os.path.join(root, "INTO")
@@ -2103,7 +2135,19 @@ for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
     assert body == want, name + " body = " + repr(body)
     assert not os.path.exists(os.path.join(root, name)), \
         name + " still at the source after a move batch"
-print("FMD1 verified: M1..M3 moved into INTO byte-exact")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+rec = dict(l.split() for l in
+           open(os.path.join(os.environ["RUN_DIR"], "fmd-ctimes.txt")))
+m = re.search(
+    r"files: props /host/FMD1/M2\.TXT mtime=1700000000 "
+    r"ctime=(\d+) alloc=(\d+) free=(\d+) mime=text vol=host", ser)
+assert m, "props marker with the M160c facts not in serial"
+assert int(m.group(1)) == int(rec["FMD1"]) // 1_000_000_000, \
+    "ctime=" + m.group(1) + " vs staged st_ctime " + rec["FMD1"]
+assert int(m.group(2)) > 0, "alloc= must be the positive on-disk bytes"
+print("FMD1 verified: M1..M3 moved into INTO byte-exact; " +
+      "props facts ctime=" + m.group(1) +
+      " alloc=" + m.group(2) + " free=" + m.group(3))
 PY
 
 vgate_run d2 -- \
@@ -2120,7 +2164,7 @@ vgate_assert d2 serial-contains 'exec: loaded GOFILES.ELF'
 vgate_assert d2 serial-contains 'gofiles: list /host/FMD2 n=4'
 vgate_assert d2 serial-contains 'gofiles: entry INTO dir'
 
-vgate_assert d2 serial-contains 'files: props /host/FMD2/M2.TXT mtime=1700000000 mime=text vol=host'
+vgate_assert d2 serial-contains 'files: props /host/FMD2/M2.TXT mtime=1700000000 ctime='
 vgate_assert d2 serial-contains 'files: props close'
 
 vgate_assert d2 serial-contains 'files: mark M1.TXT n=1'
@@ -2159,7 +2203,7 @@ vgate_assert d2 serial-absent '[EXC] parking:'
 vgate_assert d2 serial-absent 'exited status=139'
 
 vgate_assert d2 python <<'PY'
-import os
+import os, re
 share = os.environ["VG_SHARE"]
 root = os.path.join(share, "FMD2")
 into = os.path.join(root, "INTO")
@@ -2173,7 +2217,19 @@ for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
     assert body == want, name + " body = " + repr(body)
     assert not os.path.exists(os.path.join(root, name)), \
         name + " still at the source after a move batch"
-print("FMD2 verified: M1..M3 moved into INTO byte-exact")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+rec = dict(l.split() for l in
+           open(os.path.join(os.environ["RUN_DIR"], "fmd-ctimes.txt")))
+m = re.search(
+    r"files: props /host/FMD2/M2\.TXT mtime=1700000000 "
+    r"ctime=(\d+) alloc=(\d+) free=(\d+) mime=text vol=host", ser)
+assert m, "props marker with the M160c facts not in serial"
+assert int(m.group(1)) == int(rec["FMD2"]) // 1_000_000_000, \
+    "ctime=" + m.group(1) + " vs staged st_ctime " + rec["FMD2"]
+assert int(m.group(2)) > 0, "alloc= must be the positive on-disk bytes"
+print("FMD2 verified: M1..M3 moved into INTO byte-exact; " +
+      "props facts ctime=" + m.group(1) +
+      " alloc=" + m.group(2) + " free=" + m.group(3))
 PY
 
 vgate_run d3 -- \
@@ -2190,7 +2246,7 @@ vgate_assert d3 serial-contains 'exec: loaded GOFILES.ELF'
 vgate_assert d3 serial-contains 'gofiles: list /host/FMD3 n=4'
 vgate_assert d3 serial-contains 'gofiles: entry INTO dir'
 
-vgate_assert d3 serial-contains 'files: props /host/FMD3/M2.TXT mtime=1700000000 mime=text vol=host'
+vgate_assert d3 serial-contains 'files: props /host/FMD3/M2.TXT mtime=1700000000 ctime='
 vgate_assert d3 serial-contains 'files: props close'
 
 vgate_assert d3 serial-contains 'files: mark M1.TXT n=1'
@@ -2229,7 +2285,7 @@ vgate_assert d3 serial-absent '[EXC] parking:'
 vgate_assert d3 serial-absent 'exited status=139'
 
 vgate_assert d3 python <<'PY'
-import os
+import os, re
 share = os.environ["VG_SHARE"]
 root = os.path.join(share, "FMD3")
 into = os.path.join(root, "INTO")
@@ -2243,5 +2299,17 @@ for name in ("M1.TXT", "M2.TXT", "M3.TXT"):
     assert body == want, name + " body = " + repr(body)
     assert not os.path.exists(os.path.join(root, name)), \
         name + " still at the source after a move batch"
-print("FMD3 verified: M1..M3 moved into INTO byte-exact")
+ser = open(os.environ["VG_SER"], errors="replace").read()
+rec = dict(l.split() for l in
+           open(os.path.join(os.environ["RUN_DIR"], "fmd-ctimes.txt")))
+m = re.search(
+    r"files: props /host/FMD3/M2\.TXT mtime=1700000000 "
+    r"ctime=(\d+) alloc=(\d+) free=(\d+) mime=text vol=host", ser)
+assert m, "props marker with the M160c facts not in serial"
+assert int(m.group(1)) == int(rec["FMD3"]) // 1_000_000_000, \
+    "ctime=" + m.group(1) + " vs staged st_ctime " + rec["FMD3"]
+assert int(m.group(2)) > 0, "alloc= must be the positive on-disk bytes"
+print("FMD3 verified: M1..M3 moved into INTO byte-exact; " +
+      "props facts ctime=" + m.group(1) +
+      " alloc=" + m.group(2) + " free=" + m.group(3))
 PY
