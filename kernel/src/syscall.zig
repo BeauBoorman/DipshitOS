@@ -2067,8 +2067,11 @@ fn handle_wait_event(args: Args, _: *exceptions.VectorFrame) u64 {
     const address = args[0];
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
     if (events.pending(pid) == 0) {
-        if (!scheduler.wait_event_current(pid)) return error_result(.einval);
-        return 0; // Staged next task; will restart upon wakeup
+        if (scheduler.wait_event_current(pid)) return 0; // Staged next task; will restart upon wakeup
+        // card #3034: a refusal while the queue is now nonempty is the
+        // closed park-vs-push race — the event that landed mid-commit is
+        // popped below. A still-empty queue keeps the old EINVAL refusal.
+        if (events.pending(pid) == 0) return error_result(.einval);
     }
     const ev = events.peek(pid) orelse return 0;
     const ev_bytes: *const [events.event_bytes]u8 = @ptrCast(&ev);
@@ -4921,12 +4924,16 @@ fn handle_wmctl(args: Args, _: *exceptions.VectorFrame) u64 {
             // BEFORE the fan-out hooks arm.
             if (!wm_server.seat_authorized(pid, scheduler.current_id())) return error_result(.eacces);
             _ = wm_server.register(pid);
-            // Claim 9498: the registered WM stays on CORE 0 — its
-            // COMPOSITE_TICK pacing is delivered from core 0's tick, so
-            // floating it to a secondary core would decouple the render
-            // server from the pacing clock. (User tasks default to any
-            // core; this pins the one tick-coupled process back.)
-            _ = scheduler.pin_task(scheduler.current_id(), 0);
+            // card #3034 (ADR 0007 X4): the seat floats like any unpinned
+            // user task. Claim 9498 pinned it to core 0 when the only tick
+            // was the 1 Hz heartbeat and a ring-0 wake had no mid-tick
+            // dispatch; M70b wake targeting + the RESCHEDULE SGI now land a
+            // woken seat on a parked secondary inside microseconds, which is
+            // exactly what damage-driven COMPOSITE_TICKs need — a pinned
+            // seat can only be claimed at core-0 block/yield/tick points
+            // (core 0 never takes the parked-core SGI), so it answered every
+            // damage edge a heartbeat late. The tick itself stays kernel-
+            // generated on core 0; the pin bought nothing but that stall.
             return 0;
         },
         wm_server.wmctl_seat_pid => {

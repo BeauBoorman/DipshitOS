@@ -491,17 +491,27 @@ func main() {
 	// pendingComposite is the owed flag; one composite pass serves however
 	// many heartbeats accumulated, so interleaved repaints can no longer
 	// lag the queue seconds behind a scripted burst.
-	pendingComposite, liveSteadyMarked := false, false
+	pendingComposite, pendingHeartbeat = false, false
+	liveSteadyMarked := false
 	flushComposite := func() {
 		if !pendingComposite {
 			return
 		}
+		// card #3034 (ADR 0007 X4): a damage-tick debt pays the
+		// compose+present only; a heartbeat's debt pays the full pass.
+		// A mixed debt (damage queued beside a heartbeat) is a heartbeat.
+		heartbeat := pendingHeartbeat
 		pendingComposite = false
+		pendingHeartbeat = false
 		if remote != nil {
 			remote.frameMu.Lock()
 		}
 		before := presents
-		compositeTick(scan, uint64(ticks), &presents)
+		if heartbeat {
+			compositeTick(scan, uint64(ticks), &presents)
+		} else {
+			damageCompositeTick(scan, uint64(ticks), &presents)
+		}
 		if remote != nil {
 			if presents > before {
 				remote.presented++
@@ -598,6 +608,7 @@ func main() {
 			// precedes the paint it earned rather than riding inside it.
 			vi.ConsoleLine(MarkerTick)
 			pendingComposite = true
+			pendingHeartbeat = true
 			return !demoMode || ticks < tickLimit
 		}, flushComposite)
 	}
@@ -688,10 +699,22 @@ func demoTickLimit(tickLimit, cap int) int {
 var seatTick uint64
 var compositeClock uint64
 
+// pendingComposite is the drain's owed-paint flag and pendingHeartbeat
+// records whether the debt includes a heartbeat's full bookkeeping pass.
+// Package scope because the damage edge (card #3034, ADR 0007 X4) is marked
+// inside consumeSeatEvent — deep inside drainSeatEvents — while the debt is
+// paid by the main loop's flushComposite. A heartbeat sets both through
+// onTick; a damage tick sets only pendingComposite, so the flush pays a
+// compose+present without the heartbeat accounting.
+var pendingComposite bool
+var pendingHeartbeat bool
+
 // compositeTick performs one bounded compositor pass after a COMPOSITE_TICK
-// event. Keeping it separate lets the event drain preserve each tick's paint,
-// present, and host-lifecycle ordering while still consuming a complete input
-// burst in one queue pass.
+// heartbeat. Keeping it separate lets the event drain preserve each tick's
+// paint, present, and host-lifecycle ordering while still consuming a
+// complete input burst in one queue pass. card #3034 (ADR 0007 X4): the
+// frame half lives in compositePaint — a flags-bit0 damage tick pays it
+// through damageCompositeTick without the heartbeat bookkeeping below.
 func compositeTick(scan []byte, ticks uint64, presents *int) {
 	compositeClock++
 	seatTick = ticks
@@ -704,99 +727,16 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	if reexecN > 0 {
 		reapSessionReexec()
 	}
-	if tabs.Count() == 0 {
-		_ = paintBlank(scan, blankRGB())
-		startSurfaceTick(scan)
-	}
-	// #2236 defect #13: migrated (surface-backed) client windows are the
-	// seat's compositing job — the kernel skipped their blit at tick time.
-	// Compose them UNDER the seat's chrome like the kernel layer expects:
-	// a full-viewport tab rect covers the rail band, and a record that
-	// painted on top of it would hide the strip entirely. Runs on both
-	// branches — a non-tab Attach surface is live with an empty strip.
-	composeSurfaces(scan)
-	if tabs.Count() != 0 {
-		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
-		markRail()
-	}
-	// M108b (#2325): the lane pass runs before the chrome paint so a
-	// host-sourced clipboard write this tick is already badged on the same
-	// presented frame.
-	hostintSeatTick()
-	// M109e (#2401): the agent watch runs in the same lane pass — a
-	// session receipt seen this tick is badged on the same frame.
-	agentSeatTick()
-	chromeTick(scan, ticks)
-	if launch.open {
-		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	}
-	// M115d (#2463): the power menu floats above the rail and under the
-	// toasts, matching its pointer priority (the toast hit test runs
-	// first).
-	if powerMenuOpen {
-		_ = paintPowerMenu(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	}
-	// M79k (#1720): the notify strip is the LAST thing painted before the
-	// present, so it sits above the launcher and above the clock panel. A
-	// notification fired by the app the user just launched must not be
-	// hidden by the launcher they are still typing into — that is the whole
-	// reason a toast exists. Expiry runs first so a toast that has run out
-	// is never painted for one more frame, and so the dismiss marker lands
-	// in the same tick the pixels stop changing.
+	// M79k (#1720): the toast expiry sweep is heartbeat-paced — a toast
+	// lives NotifyTicks-1 composite passes of the HEARTBEAT stream, so a
+	// damage pass renders toasts but never ages them (card #3034). Expiry
+	// runs first so a toast that has run out is never painted for one
+	// more frame, and so the dismiss marker lands in the same tick the
+	// pixels stop changing.
 	notifyTick(compositeClock)
-	// M125f (#2591): a crash receipt's deferred re-exec runs here — off
-	// the teardown event and clear of crashSave's whole-VM save.
-	crashRestartTick()
-	painted := paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, compositeClock)
-	centerPainted := paintNotifyCenter(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	// M124a (#2580): the drag ghost paints over every other chrome layer
-	// — the gesture owns the frame while the button is held — and under
-	// the idle curtain like the rest (the curtain is visual, not input).
-	ghostPainted := paintDragGhost(scan)
-	switch idleState {
-	case idleDim:
-		_ = paintIdleDim(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	case idleCurtain:
-		_ = paintIdleCurtain(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	}
-	if !demoMode {
-		syncSeatChrome(scan)
-	}
-	presented := vi.WmctlRequestPresent() == 0
-	if presented {
-		*presents++
-		if *presents == 1 {
-			vi.ConsoleLine(MarkerPresent)
-		}
-	}
-	// The paint marker follows the PRESENT, not the fill: "the toast is on
-	// the scanout" is only true once the frame carrying it has been
-	// flushed. A gate that keyed a pixel probe on `gotabwm: notify id=`
-	// would be reading a frame the seat had not presented yet.
-	if line, once := notifyPaintMarker(painted > 0 && presented); once {
-		vi.ConsoleLine(line)
-	}
-	if line, once := notifyCenterPaintMarker(centerPainted > 0, presented); once {
-		vi.ConsoleLine(line)
-	}
-	// M121d (#2567): the focus indicator's transition line — catches every
-	// state the input/RPC paths did not (choreography closes, restores).
-	noteBadgeTransition()
-	if line, once := dragGhostPaintMarker(ghostPainted > 0, presented); once {
-		vi.ConsoleLine(line)
-	}
-	idlePresentedFrame(presented, ticks)
-	// M102e (#2169): a published GPU frame earns its `presented` marker only
-	// now — after the ordinary present actually flushed it to the scanout.
-	gpu3dPresented(presented)
-	// M82d2 (#1785): AFTER the present, so the fsync'd publish never delays a
-	// frame, and BEFORE the live-mode early return below.
-	flushNotifyHistory()
+	presented := compositePaint(scan, ticks, presents)
 	if restoreWitnessMode && presented && ticks%8 == 0 {
 		vi.ConsoleLine(restoreWitnessLine())
-	}
-	if launch.open && presented && launch.painted {
-		vi.ConsoleLine("gotabwm: launcher presented")
 	}
 	// The parked snapshot ask runs on the composite cadence in both modes —
 	// a deferred cs-s must not outlive the run that armed it, and a live
@@ -863,6 +803,115 @@ func compositeTick(scan []byte, ticks uint64, presents *int) {
 	}
 }
 
+// compositePaint is the frame half of a compositor pass — compose every
+// layer (blank desktop or client surfaces under the seat's chrome, rail,
+// launcher, power menu, toasts, drag ghost, idle overlay), present it, and
+// run the per-frame publish markers and lane flushes. Both the heartbeat
+// pass (compositeTick) and the damage pass (damageCompositeTick, card
+// #3034 / ADR 0007 X4) pay it; everything heartbeat-paced lives in
+// compositeTick's own wrapper. Returns whether the scanout present
+// succeeded.
+func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
+	if tabs.Count() == 0 {
+		_ = paintBlank(scan, blankRGB())
+		startSurfaceTick(scan)
+	}
+	// #2236 defect #13: migrated (surface-backed) client windows are the
+	// seat's compositing job — the kernel skipped their blit at tick time.
+	// Compose them UNDER the seat's chrome like the kernel layer expects:
+	// a full-viewport tab rect covers the rail band, and a record that
+	// painted on top of it would hide the strip entirely. Runs on both
+	// branches — a non-tab Attach surface is live with an empty strip.
+	composeSurfaces(scan)
+	if tabs.Count() != 0 {
+		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
+		markRail()
+	}
+	// M108b (#2325): the lane pass runs before the chrome paint so a
+	// host-sourced clipboard write this tick is already badged on the same
+	// presented frame.
+	hostintSeatTick()
+	// M109e (#2401): the agent watch runs in the same lane pass — a
+	// session receipt seen this tick is badged on the same frame.
+	agentSeatTick()
+	chromeTick(scan, ticks)
+	if launch.open {
+		_ = paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	}
+	// M115d (#2463): the power menu floats above the rail and under the
+	// toasts, matching its pointer priority (the toast hit test runs
+	// first).
+	if powerMenuOpen {
+		_ = paintPowerMenu(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	}
+	// M125f (#2591): a crash receipt's deferred re-exec runs here — off
+	// the teardown event and clear of crashSave's whole-VM save.
+	crashRestartTick()
+	painted := paintNotify(scan, vi.ScanoutWidth, vi.ScanoutHeight, compositeClock)
+	centerPainted := paintNotifyCenter(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	// M124a (#2580): the drag ghost paints over every other chrome layer
+	// — the gesture owns the frame while the button is held — and under
+	// the idle curtain like the rest (the curtain is visual, not input).
+	ghostPainted := paintDragGhost(scan)
+	switch idleState {
+	case idleDim:
+		_ = paintIdleDim(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	case idleCurtain:
+		_ = paintIdleCurtain(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	}
+	if !demoMode {
+		syncSeatChrome(scan)
+	}
+	presented = vi.WmctlRequestPresent() == 0
+	if presented {
+		*presents++
+		if *presents == 1 {
+			vi.ConsoleLine(MarkerPresent)
+		}
+	}
+	// The paint marker follows the PRESENT, not the fill: "the toast is on
+	// the scanout" is only true once the frame carrying it has been
+	// flushed. A gate that keyed a pixel probe on `gotabwm: notify id=`
+	// would be reading a frame the seat had not presented yet.
+	if line, once := notifyPaintMarker(painted > 0 && presented); once {
+		vi.ConsoleLine(line)
+	}
+	if line, once := notifyCenterPaintMarker(centerPainted > 0, presented); once {
+		vi.ConsoleLine(line)
+	}
+	// M121d (#2567): the focus indicator's transition line — catches every
+	// state the input/RPC paths did not (choreography closes, restores).
+	noteBadgeTransition()
+	if line, once := dragGhostPaintMarker(ghostPainted > 0, presented); once {
+		vi.ConsoleLine(line)
+	}
+	idlePresentedFrame(presented, ticks)
+	// M102e (#2169): a published GPU frame earns its `presented` marker only
+	// now — after the ordinary present actually flushed it to the scanout.
+	gpu3dPresented(presented)
+	// M82d2 (#1785): AFTER the present, so the fsync'd publish never delays a
+	// frame, and BEFORE the live-mode early return below.
+	flushNotifyHistory()
+	if launch.open && presented && launch.painted {
+		vi.ConsoleLine("gotabwm: launcher presented")
+	}
+	return presented
+}
+
+// damageCompositeTick is the card #3034 (ADR 0007 X4) damage pass: a
+// flags-bit0 COMPOSITE_TICK pays the frame — the same compositePaint the
+// heartbeat pays — and nothing else. No MarkerTick, no seatTick advance,
+// and no tick-counted budget moves: the idle ramp, the strip
+// choreography's holds, the toast lane's NotifyTicks expiry, and the
+// parked snapshot/focus-cycle releases all keep heartbeat cadence.
+// compositeClock still counts the frame — a paint is a real composite
+// pass, and that is what keeps a toast born mid-drain anchored to the
+// frame it actually landed on.
+func damageCompositeTick(scan []byte, ticks uint64, presents *int) {
+	compositeClock++
+	_ = compositePaint(scan, ticks, presents)
+}
+
 // drainSeatEvents consumes the first event and every event already queued
 // behind it, preserving kernel arrival order. Non-tick events are handled in
 // place; a COMPOSITE_TICK is accounted immediately through onTick (false
@@ -913,6 +962,13 @@ func drainSeatEvents(first vi.Event, poll func() (vi.Event, bool), consume func(
 		}
 		if heldDebt == 0 {
 			heldDebt = 1
+		}
+		// card #3034 (ADR 0007 X4): a flags-bit0 damage tick opened the
+		// paint debt like any tick — the owed-paint path below will flush
+		// it — but it is not a heartbeat, so onTick's accounting (ticks,
+		// seatTick, MarkerTick) does not run for it.
+		if e.Kind == vi.EvCompositeTick && e.Flags&vi.WmTickDamage != 0 {
+			return true
 		}
 		if onTick != nil && !onTick() {
 			payPaint()
@@ -1007,6 +1063,13 @@ func consumeSeatEvent(e vi.Event) bool {
 			vi.Yield()
 		}
 		return false
+	}
+	// card #3034 (ADR 0007 X4): a damage tick (kind 18, flags bit 0) owes
+	// the seat a compose+present — mark the debt here, because the drain
+	// skips the heartbeat accounting that would otherwise set it. A
+	// heartbeat owes the same paint through onTick instead.
+	if e.Kind == vi.EvCompositeTick && e.Flags&vi.WmTickDamage != 0 {
+		pendingComposite = true
 	}
 	return e.Kind == vi.EvCompositeTick
 }

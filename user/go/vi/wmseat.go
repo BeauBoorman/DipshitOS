@@ -72,6 +72,16 @@ const (
 // per scheduler tick.
 const EvCompositeTick uint16 = 18
 
+// WmTickDamage is flags bit 0 on a kind-18 COMPOSITE_TICK (ADR 0007 X4,
+// card #3034): the kernel posts it when a user surface takes damage while
+// no damage tick is already pending for the seat — the backpressure edge
+// that lets a typed glyph reach the scanout without waiting up to a full
+// heartbeat. Heartbeat ticks keep flags 0 and stay 1 Hz. The seat pays a
+// damage tick a compose+present through the same drain but skips the
+// heartbeat accounting: no MarkerTick, no seatTick advance, and no
+// tick-counted budget (idle ramp, strip choreography, toast expiry) moves.
+const WmTickDamage uint16 = 0x1
+
 // WM input-seam kinds (ADR 0009 numbering, WMS5). SDK mirrors of the kernel
 // constants in kernel/src/events.zig — not a new ABI. Routing-restricted:
 // the kernel pushes them ONLY to the registered WM, never in shim mode.

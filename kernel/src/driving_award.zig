@@ -410,6 +410,13 @@ pub var wm_window_hook: ?*const fn (id: u8, x: u32, y: u32, w: u32, h: u32, visi
 /// kernel's own keyboard geometry consumers are gated behind
 /// `wm_owns_input` (shell idle), so the WM — not the kernel — decides.
 pub var wm_key_hook: ?*const fn (usage: u8, flags: u16) void = null;
+/// card #3034 (ADR 0007 X4): the user-surface damage fan-out (set by
+/// wm_server at REGISTER time; null when no WM — the hook style of the
+/// pointer/key/window seams). Fires on each user-surface damage-marking
+/// edge (`mark_damage` on a `.user` window, `user_present`); wm_server
+/// decides whether the seat is owed a kind-18 flags-bit0 damage tick —
+/// at most one pending per seat, cleared when its REQUEST_PRESENT lands.
+pub var wm_damage_hook: ?*const fn () void = null;
 /// M32 WMS4: the WM's broadcast chrome policy (SET_WINDOW with a0 = ALL).
 /// When set, every user window without its own override renders chrome
 /// from this descriptor; null = no WM chrome (shim rules — the default
@@ -1558,6 +1565,12 @@ pub fn mark_damage(id: u8, x: u32, y: u32, w: u32, h: u32) bool {
             win.damaged = true;
         }
         win.dirty = true;
+        // card #3034 (ADR 0007 X4): user-surface damage is the seat's
+        // backpressure edge — the hook decides whether a damage tick is
+        // owed (at most one pending); null = no WM = no-op.
+        if (win.kind == .user) {
+            if (wm_damage_hook) |hook| hook();
+        }
         return true;
     }
     return false;
@@ -1888,6 +1901,10 @@ pub fn user_fill(id: u8, x: u32, y: u32, w: u32, h: u32, rgb: u32) bool {
 pub fn user_present(id: u8) bool {
     const win = find_user_window(id) orelse return false;
     win.dirty = true;
+    // card #3034 (ADR 0007 X4): a whole-surface present is damage too — the
+    // same seat backpressure edge mark_damage fires (the hook bounds it to
+    // one pending tick).
+    if (wm_damage_hook) |hook| hook();
     return true;
 }
 

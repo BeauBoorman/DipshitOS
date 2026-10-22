@@ -200,6 +200,16 @@ var present_seq: u32 = 0;
 var present_count: u64 = 0;
 /// Total COMPOSITE_TICK events delivered to the registered WM.
 var tick_count: u64 = 0;
+/// card #3034 (ADR 0007 X4): at most one damage-driven COMPOSITE_TICK is
+/// pending per seat — posted by `fan_damage` when user-surface damage
+/// lands while none is outstanding, cleared when the seat's
+/// REQUEST_PRESENT lands (the consume edge), and on unregister/init so a
+/// dead or replaced seat never strands the bit.
+var damage_tick_pending: bool = false;
+/// Damage-driven ticks posted. Kept distinct from `tick_count`, which
+/// counts only the 1 Hz heartbeats feeding `tick_avg_ms` — damage ticks
+/// must not pollute the heartbeat rate the pacing gates assert.
+var damage_tick_count: u64 = 0;
 
 // --- M53 card 1 (#1247): frame observability ---------------------------------
 //
@@ -382,6 +392,8 @@ pub fn init() void {
     present_seq = 0;
     present_count = 0;
     tick_count = 0;
+    damage_tick_pending = false;
+    damage_tick_count = 0;
     // M53 card 1 (#1247): a reset is a fresh window — every rate/latency
     // accumulator starts empty (the hook itself is the test's to own).
     first_present_ns = 0;
@@ -430,6 +442,8 @@ pub fn init() void {
     driving_award.wm_window_hook = null;
     // M32 WMS5 Gate 2 (claim 4278): the keyboard fan-out hook detaches too.
     driving_award.wm_key_hook = null;
+    // card #3034: the damage fan-out detaches the same way.
+    driving_award.wm_damage_hook = null;
     // M52 card 2 (#1239): a reset is a seat release — no WM-owned capture
     // may leak into the next boot/test (the same reasoning as the hooks).
     release_wm_captures();
@@ -493,6 +507,10 @@ pub fn register(pid: usize) bool {
     // the raw key stream fans out to the WM (the shell idle's keyboard
     // geometry consumers are gated off behind `wm_owns_input`).
     driving_award.wm_key_hook = fan_key;
+    // card #3034 (ADR 0007 X4): the damage-driven present seam — a user
+    // surface taking damage wakes this seat with one pending kind-18 tick
+    // (flags bit 0) instead of waiting up to a heartbeat for on_tick.
+    driving_award.wm_damage_hook = fan_damage;
     return true;
 }
 
@@ -603,6 +621,10 @@ pub fn unregister(pid: usize) bool {
     driving_award.wm_pointer_hook = null;
     driving_award.wm_window_hook = null;
     driving_award.wm_key_hook = null;
+    // card #3034: the seat that owned a pending damage tick is gone — the
+    // bit and the hook die with it.
+    driving_award.wm_damage_hook = null;
+    damage_tick_pending = false;
     return true;
 }
 
@@ -669,6 +691,45 @@ pub fn on_tick() void {
     });
 }
 
+/// card #3034 (ADR 0007 X4): the damage-tick fan-out, installed on
+/// `driving_award.wm_damage_hook` at register — the same hook style as the
+/// pointer/key/window seams. A user surface taking damage posts ONE
+/// kind-18 tick with flags bit 0 = damage, arg0 = present sequence and
+/// arg1 = the damage mask, exactly like the heartbeat's payload — the
+/// backpressure that closes the up-to-1 s keystroke-to-glyph gap without
+/// touching the 1 Hz heartbeat. Pending-bounded: damage landing while a
+/// damage tick is still unconsumed posts nothing (the queued tick already
+/// owes the seat a full-scene compose, so a second one adds no
+/// information). Never routed to a dead seat (the same seat_dead gate as
+/// `on_tick`). The kernel layer is painted here for the same reason
+/// `on_tick` paints it: a migrated window's kernel-rendered front-end is
+/// copied into its surface pages by paint_scene, so skipping the paint
+/// would let the seat compose stale surface bytes. The mask is captured
+/// BEFORE the paint consumes it, matching `on_tick`'s ordering.
+fn fan_damage() void {
+    const pid = wm_pid orelse return;
+    if (seat_dead(pid)) return;
+    // The tick exists to wake the compositor of the user layer — until the
+    // seat has bound the scanout (wm_owns_user_layer) there is nothing for
+    // it to compose into, and the kernel's own paint still owns the damage
+    // the heartbeat consumes. This also keeps a registered-but-never-bound
+    // seat (a leaked registration in an aggregated host test) side-effect
+    // free: no mask capture, no paint, no event.
+    if (!driving_award.wm_owns_user_layer) return;
+    if (damage_tick_pending) return;
+    damage_tick_pending = true;
+    damage_tick_count +%= 1;
+    const damage_mask = driving_award.user_damage_mask();
+    _ = driving_award.paint_scene();
+    events.push(pid, .{
+        .kind = events.COMPOSITE_TICK,
+        .flags = 1, // X4 bit 0 = damage
+        .seq = 0,
+        .arg0 = present_seq,
+        .arg1 = damage_mask,
+    });
+}
+
 /// REQUEST_PRESENT (cmd 3): transfer+flush the scanout now through the G1
 /// seam and advance the present-sequence counter (the parity-cards'
 /// observability primitive) + the present count. Returns false when no WM is
@@ -678,6 +739,11 @@ pub fn on_tick() void {
 pub fn request_present() bool {
     const pid = wm_pid orelse return false;
     if (seat_dead(pid)) return false;
+    // card #3034 (X4): the present request is the consume edge of a pending
+    // damage tick — the seat answered it. Clear BEFORE the transfer so a
+    // failed present cannot strand the bit and silence every later damage
+    // edge for the rest of the seat's life.
+    damage_tick_pending = false;
     // The G1 transfer+flush is real-hardware work: exec_cmd runs `dc ivac`
     // cache-maintenance asm, which is illegal at EL0 in host test binaries
     // (and other tests in an aggregated binary may have armed the transport).
@@ -717,6 +783,9 @@ pub const WmInfo = struct {
     present_seq: u32,
     present_count: u64,
     tick_count: u64,
+    /// card #3034: damage-driven ticks posted (X4 flags-bit0 traffic; the
+    /// heartbeat `tick_count`/`tick_avg_ms` is untouched by them).
+    damage_tick_count: u64,
     set_window_count: u64,
     set_state_count: u64,
     alt_tab_apply_count: u64,
@@ -756,6 +825,7 @@ pub fn info() WmInfo {
         .present_seq = present_seq,
         .present_count = present_count,
         .tick_count = tick_count,
+        .damage_tick_count = damage_tick_count,
         .set_window_count = set_window_count,
         .set_state_count = set_state_count,
         .alt_tab_apply_count = alt_tab_apply_count,
@@ -1516,4 +1586,106 @@ test "wm_server: a dead seat routes nothing — no tick, no fan-out (M52 card 2,
     try std.testing.expect(!driving_award.wm_owns_input);
     process.init();
     try std.testing.expect(!seat_dead(seat)); // no descriptor is NOT death
+}
+
+test "wm_server: card #3034 damage tick — one pending per seat, burst-bounded, cleared on REQUEST_PRESENT" {
+    events.init();
+    process.init();
+    init();
+    events.on_event_pushed = null;
+    driving_award.arm();
+    try std.testing.expect(register(3));
+    // The M91 tests' own convention: scanout bind is the real MMU path, so
+    // host tests stand the ownership flag up directly.
+    driving_award.wm_owns_user_layer = true;
+    defer driving_award.wm_owns_user_layer = false;
+
+    const id = switch (driving_award.user_open(64, 64, 320, 200, 7)) {
+        .opened => |opened| opened,
+        else => return error.TestUnexpectedResult,
+    };
+    // The open's registry mirror is the only event so far; drain it so the
+    // assertions below count only damage traffic. The open itself sets the
+    // window dirty directly — creation is not a damage edge.
+    while (events.pop(3) != null) {}
+    try std.testing.expectEqual(@as(usize, 0), events.pending(3));
+
+    // The first damage edge posts ONE kind-18 tick with flags bit 0 set,
+    // arg0 = present sequence, arg1 = the per-surface damage mask.
+    try std.testing.expect(driving_award.mark_damage(id, 10, 10, 20, 20));
+    try std.testing.expectEqual(@as(usize, 1), events.pending(3));
+    var ev = events.pop(3).?;
+    try std.testing.expectEqual(events.COMPOSITE_TICK, ev.kind);
+    try std.testing.expectEqual(@as(u16, 1), ev.flags);
+    try std.testing.expectEqual(present_seq, ev.arg0);
+    const bit = @as(u32, 1) << @intCast(id - driving_award.user_window_id_base);
+    try std.testing.expectEqual(bit, ev.arg1 & bit);
+    try std.testing.expectEqual(@as(u64, 1), info().damage_tick_count);
+
+    // A burst of further damage while the tick is pending posts nothing —
+    // the queued tick already owes the seat a full-scene compose.
+    try std.testing.expect(driving_award.mark_damage(id, 0, 0, 5, 5));
+    try std.testing.expect(driving_award.user_present(id));
+    try std.testing.expectEqual(@as(usize, 0), events.pending(3));
+    try std.testing.expectEqual(@as(u64, 1), info().damage_tick_count);
+    try std.testing.expectEqual(@as(u64, 0), info().tick_count);
+
+    // The seat's REQUEST_PRESENT is the consume edge: the next damage edge
+    // posts a fresh damage tick carrying the ADVANCED present sequence.
+    try std.testing.expect(request_present());
+    try std.testing.expect(driving_award.user_present(id));
+    try std.testing.expectEqual(@as(usize, 1), events.pending(3));
+    ev = events.pop(3).?;
+    try std.testing.expectEqual(@as(u16, 1), ev.flags);
+    try std.testing.expectEqual(@as(u32, 1), ev.arg0);
+    try std.testing.expectEqual(@as(u64, 2), info().damage_tick_count);
+
+    // The heartbeat is unchanged: same kind, flags 0, its own counter.
+    on_tick();
+    ev = events.pop(3).?;
+    try std.testing.expectEqual(events.COMPOSITE_TICK, ev.kind);
+    try std.testing.expectEqual(@as(u16, 0), ev.flags);
+    try std.testing.expectEqual(@as(u64, 1), info().tick_count);
+
+    // Teardown for the aggregated binary: the seat, the hook, the bit.
+    try std.testing.expect(unregister(3));
+    try std.testing.expect(!driving_award.wm_owns_input);
+    try std.testing.expect(driving_award.wm_damage_hook == null);
+}
+
+test "wm_server: card #3034 damage tick is never routed to a dead seat" {
+    events.init();
+    process.init();
+    init();
+    events.on_event_pushed = null;
+    driving_award.arm();
+    const seat = process.create("WND.BIN", .{ .entry_va = 0x400000, .content_len = 1 }, .{}, .{}).?;
+    _ = process.bind(seat, 8);
+    try std.testing.expect(register(seat));
+    driving_award.wm_owns_user_layer = true;
+    defer driving_award.wm_owns_user_layer = false;
+    const id = switch (driving_award.user_open(64, 64, 320, 200, seat)) {
+        .opened => |opened| opened,
+        else => return error.TestUnexpectedResult,
+    };
+    while (events.pop(seat) != null) {}
+
+    // Live seat: damage posts the tick.
+    try std.testing.expect(driving_award.mark_damage(id, 1, 1, 4, 4));
+    try std.testing.expectEqual(@as(usize, 1), events.pending(seat));
+    try std.testing.expectEqual(@as(u64, 1), info().damage_tick_count);
+
+    // The seat dies with the tick still pending; nothing further routes,
+    // and the pending bit cannot be claimed by damage landing after death.
+    _ = process.on_task_exit(8, 0);
+    try std.testing.expect(seat_dead(seat));
+    try std.testing.expect(driving_award.mark_damage(id, 2, 2, 4, 4));
+    try std.testing.expect(driving_award.user_present(id));
+    try std.testing.expectEqual(@as(usize, 1), events.pending(seat));
+    try std.testing.expectEqual(@as(u64, 1), info().damage_tick_count);
+    // The gate refuses to ROUTE; it does not silently release the seat.
+    try std.testing.expectEqual(@as(?usize, seat), registered_pid());
+
+    try std.testing.expect(unregister(seat));
+    process.init();
 }

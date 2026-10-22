@@ -109,9 +109,11 @@ EOF
 # Boot 01, stage 3: the two-tab choreography has closed GOSH and GOSET, so
 # GOCALC.ELF is exec'd as the M59 hosted-client proof on an empty strip. The
 # save under test already happened in stage 2 and was the PANEL's, never the
-# monitor's `settings set`.
+# monitor's `settings set`. The trailing `wm` dumps the kernel's M53 rate row
+# AFTER both typed legs landed (card #3034: the typed-key latency evidence).
 vgate_file script3.txt <<'EOF'
 exec GOCALC.ELF
+wm
 EOF
 
 # M79a (#1704): the seat's bounded demo choreography (auto-close, the
@@ -406,6 +408,37 @@ if v2 == 0:
     sys.exit("no row declares v=2: this is the v1 file, not the v2 schema")
 print("share APPS.TXT: %d rows, %d docked, %d rows at v=2, %d bytes"
       % (len(rows), dock, v2, len(text.encode())))
+PY
+
+# card #3034 (ADR 0007 X4): the two typed GOSET legs are the keystroke-to-
+# glyph path — every key the kernel fans to the seat (kind 21) opens the M53
+# latency sample, and the damage-driven tick's present is what answers it.
+# The LAST `wm` row is script3's dump, taken after both legs landed; its
+# lat_max_us is the worst keystroke wait of the whole boot. 250000 us is the
+# proposed bound — the heartbeat path alone would show ~1 s.
+vgate_assert 01 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"]).read()
+rows = [l for l in ser.splitlines() if "wm: rate window_ms=" in l]
+if not rows:
+    sys.exit("no 'wm: rate' row in the serial log — the wm dump never ran")
+row = rows[-1]
+
+def field(name):
+    m = re.search(name + r"=(\d+)", row)
+    if not m:
+        sys.exit("field %s missing from: %s" % (name, row))
+    return int(m.group(1))
+
+lat_n = field("lat_n")
+lat_max_us = field("lat_max_us")
+if lat_n < 1:
+    sys.exit("no input->present latency sample recorded: %s" % row)
+if lat_max_us >= 250000:
+    sys.exit("lat_max_us=%d not under 250000 — a keystroke still waited "
+             "heartbeat-scale for its present: %s" % (lat_max_us, row))
+print("card #3034: typed-key latency lat_n=%d lat_max_us=%d (< 250000)"
+      % (lat_n, lat_max_us))
 PY
 
 # The prompt capture happens before the first-boot GOSH tab's bounded single-

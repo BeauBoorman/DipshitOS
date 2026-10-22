@@ -2497,6 +2497,19 @@ pub fn wait_event_current(pid: usize) bool {
         sched_lock_release();
         return false;
     }
+    // card #3034: close the park-vs-push window. handle_wait_event read
+    // events.pending() == 0 before sched_lock was taken; a push that landed
+    // in that gap ran its wake scan before wait_event_pid was set and found
+    // no waiter — without this recheck the task would block with an event
+    // already queued until the next push or heartbeat (observed live as a
+    // ~1 s stall on one typed-key sample). The pusher's enqueue is ordered
+    // before its wake scan's sched_lock hold, so any such event is visible
+    // to this read. Refusing lets the syscall layer fall through to the pop
+    // path, which returns the raced event (or 0 on a truly empty queue).
+    if (events.pending(pid) != 0) {
+        sched_lock_release();
+        return false;
+    }
     const pc = current_exception_pc();
     tasks[waiting].sp = exceptions.resume_frame[c];
     tasks[waiting].elr = if (pc.elr >= 4) pc.elr - 4 else pc.elr;

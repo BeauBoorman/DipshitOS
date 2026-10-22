@@ -178,6 +178,21 @@ func main() {
 			}
 		}
 		ev, rc, ok := vi.PollEventRaw()
+		if !ok && rc >= 0 && !a.showServices {
+			// card #3034 (ADR 0007 X4): an idle poll slept a whole scheduler
+			// tick, so a keystroke sat in the queue up to ~1 s before its
+			// echo ever posted damage — the seat's damage tick can only run
+			// as fast as the app feeds it. Block on the event queue instead:
+			// a pushed KEY_DOWN wakes the panel on arrival. The services
+			// view keeps the 1 s poll because its refresh is time-driven.
+			var r int64
+			ev, r = vi.WaitEvent()
+			if r > 0 {
+				ok = true
+			} else if r < 0 {
+				rc = r
+			}
+		}
 		if ok {
 			switch a.ta.Dispatch(ev) {
 			case tabapp.ActionClosed:
@@ -739,6 +754,14 @@ func (a *panel) key(ev vi.Event) bool {
 			return true
 		}
 		a.applyInput()
+		// card #3034: present the applied edit before save()'s file IO — a
+		// ~1 s stall between handler return and the loop-tail present (observed
+		// live: the keystroke's latency sample rode to the next heartbeat)
+		// leaves input→glyph latency at tick scale even though the redraw is
+		// already computed. Guarded on ta: headless key() tests have no seat.
+		if a.ta != nil {
+			a.present()
+		}
 		a.save()
 		return true
 	case keyUp, keyDown, keyHome, keyEnd:

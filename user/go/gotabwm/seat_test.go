@@ -432,6 +432,93 @@ func TestDrainSeatEventsServicesMailboxAtStride(t *testing.T) {
 	}
 }
 
+// card #3034 (ADR 0007 X4): a flags-bit0 damage tick rides the drain like
+// any tick — consume accepts it, the paint debt opens, the queue-end flush
+// still pays — but onTick (the heartbeat accounting) is never invoked for
+// it. A heartbeat queued beside it keeps its own accounting.
+func TestDrainSeatEventsDamageTickSkipsOnTick(t *testing.T) {
+	saved := pendingComposite
+	defer func() { pendingComposite = saved }()
+	pendingComposite = false
+	queue := []vi.Event{
+		{Kind: vi.EvWmKey, Arg0: 2},
+		{Kind: vi.EvCompositeTick, Flags: vi.WmTickDamage},
+		{Kind: vi.EvWmKey, Arg0: 3},
+		{Kind: vi.EvCompositeTick},
+	}
+	var order []string
+	poll := func() (vi.Event, bool) {
+		if len(queue) == 0 {
+			return vi.Event{}, false
+		}
+		e := queue[0]
+		queue = queue[1:]
+		return e, true
+	}
+	consume := func(e vi.Event) bool {
+		if e.Kind == vi.EvCompositeTick {
+			if e.Flags&vi.WmTickDamage != 0 {
+				order = append(order, "damage")
+			}
+			return true
+		}
+		order = append(order, "key"+vi.Itoa64(int64(e.Arg0)))
+		return false
+	}
+	ticks := 0
+	onTick := func() bool {
+		ticks++
+		order = append(order, "tick")
+		return true
+	}
+	flush := func() { order = append(order, "flush") }
+	if n := drainSeatEvents(vi.Event{Kind: vi.EvWmKey, Arg0: 1}, poll, consume, 10, nil, onTick, flush); n != 5 {
+		t.Fatalf("drained %d events, want 5", n)
+	}
+	want := []string{"key1", "key2", "damage", "key3", "tick", "flush"}
+	if len(order) != len(want) {
+		t.Fatalf("drain order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("drain order = %v, want %v", order, want)
+		}
+	}
+	if ticks != 1 {
+		t.Fatalf("heartbeat accountings = %d, want 1 (the damage tick skipped onTick)", ticks)
+	}
+}
+
+// card #3034 (ADR 0007 X4): consumeSeatEvent owes the composite for a
+// flags-bit0 damage tick (the drain skips the accounting that owes it for
+// heartbeats), while a flags-0 heartbeat leaves the debt to onTick.
+func TestConsumeSeatEventDamageTickOwesComposite(t *testing.T) {
+	saved := pendingComposite
+	savedBtn := prevPtrButtons
+	savedDrag := railDragFrom
+	defer func() {
+		pendingComposite = saved
+		prevPtrButtons = savedBtn
+		railDragFrom = savedDrag
+	}()
+	pendingComposite = false
+	prevPtrButtons = 0
+	railDragFrom = -1
+	if !consumeSeatEvent(vi.Event{Kind: vi.EvCompositeTick, Flags: vi.WmTickDamage}) {
+		t.Fatal("a damage tick must count as a tick")
+	}
+	if !pendingComposite {
+		t.Fatal("a damage tick must owe the composite the drain flushes")
+	}
+	pendingComposite = false
+	if !consumeSeatEvent(vi.Event{Kind: vi.EvCompositeTick}) {
+		t.Fatal("a heartbeat must count as a tick")
+	}
+	if pendingComposite {
+		t.Fatal("a heartbeat's paint is owed by the tick accounting, not consume")
+	}
+}
+
 func TestSweepHostedStopsWhenCloseFails(t *testing.T) {
 	savedTabs := tabs
 	defer func() { tabs = savedTabs }()
