@@ -111,13 +111,13 @@ exec WMRPCPROBE.ELF
 EOF
 
 vgate_file script-agentd.txt <<'EOF'
-exec AGENTD.ELF --allow-exec
+exec -u2000 AGENTD.ELF --allow-exec
 EOF
 
 vgate_file script-daemon.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec AGENTD.ELF
+exec -u2000 AGENTD.ELF
 EOF
 
 vgate_file script-u0.txt <<'EOF'
@@ -125,7 +125,7 @@ exec -u0 AGENTD.ELF
 EOF
 
 vgate_file script-posture.txt <<'EOF'
-exec AGENTD.ELF
+exec -u2000 AGENTD.ELF
 EOF
 
 vgate_setup_python <<'PY'
@@ -171,7 +171,7 @@ open(os.path.join(share, "AGENTS.TXT"), "w").write(agents_txt)
 # receipt key + the no-credential posture probe — the door key is
 # Ed25519 now.
 KEY = "a5" * 32
-secrets = "#v1\n" + "agent-hmac\t1000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF\n"
+secrets = "#v1\n" + "agent-hmac\t2000\t" + KEY + "\tAGENTD.ELF,GOTOP.ELF\n"
 open(os.path.join(share, "SECRETS.TXT"), "w").write(secrets)
 open(os.path.join(share, "OWNERS.TXT"), "w").write(
     "#v1\nAGENTD.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n"

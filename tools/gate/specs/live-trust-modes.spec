@@ -114,3 +114,133 @@ if "SECRETS.TXT\t600\t0\tsecret" not in body:
     sys.exit("FAIL: SECRETS.TXT secret class lost")
 print("trust-modes host inspection ok")
 PY
+
+# ---------------------------------------------------------------------------
+# M173d (#3045, ADR 0052 amendment): the two-principal journey. AGENTD runs
+# under uid_agent via the monitor's -u2000 admin spawn; its gosh.run child
+# inherits the principal (index D15). From inside: a uid_user file reads
+# (other-triplet), the 0600 VAULT.BIN refuses EACCES, a mutation and a
+# create outside AGENT/ refuse, a write inside the agent-owned root lands,
+# and a kill on the uid_user GOTOP refuses EACCES. Then the user side
+# (uid_user GOTOP, no CAP_PROC_ADMIN) stops AGENTD — the D12 asymmetry.
+# The kernel receipts on serial are the exec-stage RCPT lines; the uid
+# attribution leg reads the monitor's `procs` rows (uid=2000) — the RCPT
+# `uid=` field itself is #3044's format change. AGENTD's own dispatch
+# receipts land MAC'd in AGENT/AUDIT/.
+# ---------------------------------------------------------------------------
+
+vgate_file script-agent.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec -u2000 AGENTD.ELF --allow-exec
+procs
+EOF
+
+vgate_file script-gotop.txt <<'EOF'
+exec GOTOP.ELF
+EOF
+
+vgate_file script-post.txt <<'EOF'
+procs
+echo modes-agent-done
+EOF
+
+# Run 02 rides its OWN share (--cvc-file overrides the armed share for
+# that boot, the go-agentd posture-leg pattern): run 01's OWNERS.TXT and
+# SECRETS.TXT rows are the TS2 fixture and must not be disturbed.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.path.join(rd, "agent-share")
+os.makedirs(share, exist_ok=True)
+for name, cmd in (("AGENTD.ELF", "bash tools/go/build-agentd.sh"),
+                  ("GOSH.ELF", "bash tools/go/build-gosh.sh"),
+                  ("GOTOP.ELF", "bash tools/go/build-top.sh")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit(name + " missing (expected " + src + ") - build it first: " + cmd)
+    shutil.copy(src, os.path.join(share, name))
+sys.path.insert(0, os.path.join("tools", "agentctl"))
+import agentctl
+KEY = "a5" * 32
+DEVIN_SEED = "0a" * 32
+# uid_agent owns the channel key now: the daemon reads agent-hmac as
+# uid 2000, app-bound to the system-owned image.
+open(os.path.join(share, "SECRETS.TXT"), "w").write(
+    "#v1\nagent-hmac\t2000\t" + KEY + "\tAGENTD.ELF\n")
+open(os.path.join(share, "AGENTS.TXT"), "w").write(
+    "#v1\nagent=devin key="
+    + agentctl.ed_public_key(bytes.fromhex(DEVIN_SEED)).hex()
+    + " caps=file,process,term\n")
+open(os.path.join(rd, "devin.key"), "w").write(
+    "devin " + DEVIN_SEED + "\n")
+os.makedirs(os.path.join(share, "GOVAULT"), exist_ok=True)
+open(os.path.join(share, "GOVAULT", "VAULT.BIN"), "wb").write(b"vault-ciphertext\n")
+open(os.path.join(share, "USERFILE.TXT"), "w").write("boundary-user-content\n")
+os.makedirs(os.path.join(share, "AGENT", "AUDIT"), exist_ok=True)
+# OWNERS: AGENTD.ELF system-owned (the app-bound secret's M97g honesty
+# rule), AGENTS.TXT world-readable, the vault 0600 uid_user (the agent's
+# other triplet is nothing), the user file the explicit 0644 uid_user.
+open(os.path.join(share, "OWNERS.TXT"), "w").write(
+    "#v1\n"
+    "AGENTD.ELF\t644\t0\t-\n"
+    "AGENTS.TXT\t444\t0\t-\n"
+    "USERFILE.TXT\t644\t1000\t-\n"
+    "GOVAULT/VAULT.BIN\t600\t1000\t-\n"
+)
+print("boundary share staged")
+PY
+
+vgate_run 02 -- --cvc-file '$RUN_DIR/agent-share' \
+    --display --input \
+    --net '$RUN_DIR/cap.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:4747 \
+    --net-tcp-connect-stream 'tools/agentctl/agentctl.py' \
+    --net-tcp-connect-stream-arg harness \
+    --net-tcp-connect-stream-arg '--journey=boundary' \
+    --net-tcp-connect-stream-arg '--key-file=$RUN_DIR/devin.key' \
+    --net-tcp-connect-after 'agentd: listen 4747' \
+    --script '$RUN_DIR/script-agent.txt' \
+    --script2 '$RUN_DIR/script-gotop.txt' --script2-after 'agentd: listen 4747' \
+    --input-string 'k' --input-string-after 'agentd: session end reason=client_close' \
+    --script3 '$RUN_DIR/script-post.txt' --script3-after 'tasks user-exec exited status=137' \
+    --script-expect 'modes-agent-done' --script-expect-tail 8 --timeout 240
+
+# The daemon came up as the agent principal: uid_agent + caps 0.
+vgate_assert 02 serial-contains 'agentd: start exec=on'
+vgate_assert 02 serial-contains 'agentd: listen 4747'
+vgate_assert 02 serial-contains 'agentd: auth ok agent=devin'
+vgate_assert 02 serial-contains 'procs: id=1 name=AGENTD.ELF uid=2000 caps=0'
+# The kernel's exec receipts name the agent image and its child.
+vgate_assert 02 serial-contains 'RCPT stage=exec'
+vgate_assert 02 serial-contains 'verb=gosh.run ok'
+vgate_assert 02 serial-contains 'agentd: session end reason=client_close'
+vgate_assert 02 output-contains 'AGENTCTL: PASS boundary'
+# The D12 asymmetry: uid_user GOTOP stops uid_agent AGENTD without the cap.
+vgate_assert 02 serial-contains 'top: kill pid=1'
+vgate_assert 02 serial-absent 'top: kill pid=1 err='
+vgate_assert 02 serial-contains 'tasks user-exec exited status=137'
+# Post-kill procs: the agent principal's row is exited, the user's is not.
+vgate_assert 02 serial-contains 'name=AGENTD.ELF uid=2000 caps=0 state=exited'
+vgate_assert 02 serial-contains 'name=GOTOP.ELF uid=1000 caps=0 state=running'
+vgate_assert 02 serial-absent '\[EXC\]'
+vgate_assert 02 serial-absent '[EXC] parking:'
+
+# Host side: the agent's write landed inside its root, the outside-sandbox
+# write never materialized, the user file is untouched, and every dispatch
+# left a MAC'd receipt in the agent-owned audit lane.
+vgate_assert 02 python <<'PY'
+import os, sys
+share = os.path.join(os.environ["RUN_DIR"], "agent-share")
+if open(os.path.join(share, "AGENT", "WROTE.TXT"), "rb").read() != b"boundary-write":
+    sys.exit("FAIL: agent write inside AGENT/ missing or wrong")
+if os.path.exists(os.path.join(share, "OUTSIDE.TXT")):
+    sys.exit("FAIL: the outside-sandbox write materialized")
+if open(os.path.join(share, "USERFILE.TXT"), "rb").read() != b"boundary-user-content\n":
+    sys.exit("FAIL: USERFILE.TXT changed (the agent's chmod was refused)")
+adir = os.path.join(share, "AGENT", "AUDIT")
+names = [n for n in os.listdir(adir) if n.startswith("RCPT-") and not n.endswith("~")]
+if not names:
+    sys.exit("FAIL: no agentd dispatch receipts in AGENT/AUDIT")
+print("boundary host inspection ok: %d receipts, write inside only" % len(names))
+PY

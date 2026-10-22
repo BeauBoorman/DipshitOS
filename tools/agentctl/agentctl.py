@@ -1239,8 +1239,95 @@ def journey_geom_deny(s, cred):
     ]
 
 
+def journey_boundary(s, cred):
+    """M173d (#3045): the two-principal journey through gosh.run. The
+    uid_agent child reads a uid_user file (ok), reads the 0600 vault
+    (EACCES, named), mutates and writes outside the sandbox (EACCES),
+    writes inside it (ok), and cannot signal a uid_user process
+    (EACCES)."""
+    target_pid = []
+
+    def handshake():
+        verbs = s.connect(cred[0], cred[1])
+        if "gosh.run" not in verbs:
+            raise Fail("gosh.run is not advertised with --allow-exec")
+
+    def proc_list():
+        # GOTOP.ELF registers after its script2 exec — poll proc.list
+        # until it shows (bounded by the session's response timeout).
+        for _ in range(50):
+            res = s.call("proc.list")
+            rows = res.get("procs")
+            if not isinstance(rows, list):
+                raise Fail("procs is not a list")
+            names = [r.get("name") for r in rows]
+            if "AGENTD.ELF" not in names:
+                raise Fail("AGENTD.ELF running is absent from proc.list")
+            if "GOTOP.ELF" in names:
+                target_pid.append(rows[names.index("GOTOP.ELF")].get("pid"))
+                return
+            time.sleep(0.1)
+        raise Fail("GOTOP.ELF (the uid_user target) never registered")
+
+    def gosh_id():  # the child reports its own principal
+        res = s.call("gosh.run", cmd="id")
+        out = stream_bytes(res)
+        if res.get("exit_status") != 0 or b"uid=2000" not in out:
+            raise Fail("child id = %r want uid=2000" % out)
+
+    def gosh_user_read():  # uid_user 0644 file: other-triplet read, ok
+        res = s.call("gosh.run", cmd="cat /host/USERFILE.TXT")
+        out = stream_bytes(res)
+        if res.get("exit_status") != 0 or b"boundary-user-content" not in out:
+            raise Fail("user-file read = %r" % res.get("exit_status"))
+
+    def gosh_vault_read():  # uid_user 0600 vault: closed outright, named
+        res = s.call("gosh.run", cmd="cat /host/GOVAULT/VAULT.BIN")
+        out = stream_bytes(res)
+        if res.get("exit_status") == 0 or b"EACCES" not in out:
+            raise Fail("vault read = %r want EACCES" % out)
+
+    def gosh_outside_mutate():  # owner-only chmod on a user file: EACCES
+        res = s.call("gosh.run", cmd="chmod 600 /host/USERFILE.TXT")
+        out = stream_bytes(res)
+        if res.get("exit_status") == 0 or b"EACCES" not in out:
+            raise Fail("outside chmod = %r want EACCES" % out)
+
+    def gosh_outside_write():  # create at the share root: refused
+        res = s.call("gosh.run", cmd="printf x | tee /host/OUTSIDE.TXT")
+        out = stream_bytes(res)
+        if res.get("exit_status") == 0 or b"write failed" not in out:
+            raise Fail("outside write = %r want refusal" % out)
+
+    def gosh_inside_write():  # inside the agent-owned root: ok
+        res = s.call(
+            "gosh.run", cmd="printf boundary-write | tee /host/AGENT/WROTE.TXT")
+        out = stream_bytes(res)
+        if res.get("exit_status") != 0 or b"boundary-write" not in out:
+            raise Fail("sandbox write = %r" % res.get("exit_status"))
+
+    def gosh_kill_user():  # uid_agent -> uid_user kill: EACCES
+        res = s.call("gosh.run", cmd="kill %d" % target_pid[0])
+        out = stream_bytes(res)
+        if res.get("exit_status") == 0 or b"EACCES" not in out:
+            raise Fail("kill user = %r want EACCES" % out)
+
+    return [
+        ("handshake", handshake),
+        ("proc.list", proc_list),
+        ("gosh-id", gosh_id),
+        ("gosh-user-read", gosh_user_read),
+        ("gosh-vault-read", gosh_vault_read),
+        ("gosh-outside-mutate", gosh_outside_mutate),
+        ("gosh-outside-write", gosh_outside_write),
+        ("gosh-inside-write", gosh_inside_write),
+        ("gosh-kill-user", gosh_kill_user),
+    ]
+
+
 JOURNEYS = {
     "full": journey_full,
+    "boundary": journey_boundary,
     "badsig": journey_badsig,
     "preauth": journey_preauth,
     "mute": journey_mute,

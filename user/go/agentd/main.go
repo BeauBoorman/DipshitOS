@@ -43,9 +43,13 @@ func main() {
 		return
 	}
 	// Posture, in D2's order: principal, credential, sandbox root. Each
-	// refusal is one marker and exit 1, before any Listen.
+	// refusal is one marker and exit 1, before any Listen. M173d (ADR 0052
+	// amendment): the daemon runs only as uid_agent — the kernel binds that
+	// principal to the recorded AGENTD.ELF name at exec (and `exec -u2000`
+	// names it administratively); every other uid, uid_user included, is
+	// refused as privileged.
 	uid, caps, ok := principalFn()
-	if !ok || uid != vi.UidUser || caps != 0 {
+	if !ok || uid != vi.UidAgent || caps != 0 {
 		refuseExit("privileged")
 		return
 	}

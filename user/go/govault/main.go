@@ -153,6 +153,10 @@ var (
 	}
 	fileOpen  = vi.FileOpen
 	fileClose = func(h int64) { vi.FileClose(uint32(h)) }
+	// M173d (ADR 0052 amendment, index D16): the vault is 0600 — the agent
+	// principal must not even read the ciphertext. fileMode is the
+	// owner-only slot-69 chmod; the daemon owns the file it publishes.
+	fileMode = vi.FileMode
 	notifyFn  = func(ta *tabapp.TabApp, text string) bool { return ta.Notify(text) }
 )
 
@@ -358,6 +362,11 @@ func (a *app) load() {
 	a.file = data
 	a.m.scr = scrLocked
 	vi.ConsoleLine(markerLocked)
+	// D16: a vault written before the 0600 posture stays 0644 on disk —
+	// tighten it on open so the agent's other-triplet read closes. A
+	// refusal means the file is not ours; the bytes already parsed, so the
+	// errno is noise the face does not need.
+	_ = fileMode(a.path, 0o600)
 }
 
 // rearm drives the one app timer from the model's deadline triple. Called
@@ -543,6 +552,14 @@ func (a *app) save() bool {
 	if rc := writeSafe(a.path, file); rc < 0 {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(rc))
 		return false
+	}
+	// D16: the vault is private to its owner — a fresh publish lands the
+	// guest default 0644, so pull it to 0600 (the agent's other-triplet
+	// read must never reach the ciphertext). The chmod is owner-only;
+	// this process wrote the file, so the refusal cannot fire honestly —
+	// report the kernel's errno if it does.
+	if rc := fileMode(a.path, 0o600); rc < 0 {
+		vi.ConsoleLine(markerSaveErr + vi.Itoa64(rc))
 	}
 	// The published frame is also the bytes a same-session unlock opens:
 	// on the create path nothing ever read the file off disk, so without

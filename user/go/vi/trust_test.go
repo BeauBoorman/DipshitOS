@@ -27,8 +27,8 @@ func TestTrustGeometry(t *testing.T) {
 		t.Fatalf("secret bounds = %d/%d/%d want 32/64/8",
 			SecretKeyMax, SecretValMax, SecretEntriesMax)
 	}
-	if UidSystem != 0 || UidUser != 1000 {
-		t.Fatalf("uids = %d/%d want 0/1000", UidSystem, UidUser)
+	if UidSystem != 0 || UidUser != 1000 || UidAgent != 2000 {
+		t.Fatalf("uids = %d/%d/%d want 0/1000/2000", UidSystem, UidUser, UidAgent)
 	}
 }
 

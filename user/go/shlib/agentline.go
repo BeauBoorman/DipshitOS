@@ -6,7 +6,7 @@
 package shlib
 
 // CheckAgentLine reports whether cmd may run under `gosh.run`. The daemon
-// appends its own `> /host/AGENTD.OUT` capture redirect before spawning
+// appends its own `> /host/AGENT/AUDIT/AGENTD.OUT` capture redirect before spawning
 // GOSH.ELF -c, so the check's whole job is proving that the redirect lands
 // on the line the operator intended and nowhere else:
 //

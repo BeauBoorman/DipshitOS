@@ -577,7 +577,7 @@ func TestGoshRunLifecycle(t *testing.T) {
 		t.Fatalf("stream chunks = %v", chunks)
 	}
 	if len(k.execArgv) != 3 || k.execArgv[0] != "GOSH.ELF" ||
-		k.execArgv[1] != "-c" || k.execArgv[2] != "echo hello > /host/AGENTD.OUT" {
+		k.execArgv[1] != "-c" || k.execArgv[2] != "echo hello > "+outPath {
 		t.Fatalf("exec argv = %v", k.execArgv)
 	}
 	if !hasLine(logs, "agentd: spawn pid=42") || !hasLine(logs, "agentd: reap pid=42 status=0") {

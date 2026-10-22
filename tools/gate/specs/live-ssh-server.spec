@@ -115,7 +115,7 @@ vgate_file script-2.txt <<'EOF'
 set GOMAXPROCS=1
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec AGENTD.ELF
+exec -u2000 AGENTD.ELF
 exec GOSSHD.ELF
 EOF
 
@@ -147,7 +147,7 @@ open(os.path.join(share, "AGENTS.TXT"), "w").write(
 open(os.path.join(share, "SECRETS.TXT"), "w").write(
     "#v1\n"
     "ssh-host-ed25519\t1000\t9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\tGOSSHD.ELF\n"
-    "agent-hmac\t1000\t" + "a5" * 32 + "\tAGENTD.ELF\n"
+    "agent-hmac\t2000\t" + "a5" * 32 + "\tAGENTD.ELF\n"
 )
 open(os.path.join(share, "OWNERS.TXT"), "w").write(
     "#v1\n"
@@ -255,7 +255,7 @@ vgate_file script-3.txt <<'EOF'
 set GOMAXPROCS=1
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec AGENTD.ELF
+exec -u2000 AGENTD.ELF
 exec GOSSHD.ELF
 EOF
 

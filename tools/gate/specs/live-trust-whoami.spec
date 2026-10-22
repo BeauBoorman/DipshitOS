@@ -95,11 +95,12 @@ vgate_run 02 -- --screen '$RUN_DIR/screen2' \
 # The parent's own principal is unchanged (uid_user, no caps).
 vgate_assert 02 serial-contains 'uid=1000 user'
 vgate_assert 02 serial-contains 'uid=1000 user caps=0'
-# The name-bound child: AGENTD's own posture check sees uid != uid_user and
-# refuses as 'privileged' — the only uid the kernel assigns by image name is
-# uid_agent=2000 (a uid_user child would reach 'no-credential'/'no-keyring').
-vgate_assert 02 serial-contains 'agentd: refuse privileged'
-vgate_assert 02 serial-absent 'agentd: refuse no-credential'
+# The name-bound child: M173d flipped AGENTD's posture to uid_agent-only,
+# so the bound child now clears check 1 and reaches the credential probe —
+# 'no-credential' IS the binding's proof (a uid_user child would refuse
+# 'privileged', and a system principal never gets this far).
+vgate_assert 02 serial-contains 'agentd: refuse no-credential'
+vgate_assert 02 serial-absent 'agentd: refuse privileged'
 vgate_assert 02 serial-absent 'agentd: refuse no-keyring'
 vgate_assert 02 serial-contains 'whoami-bind-ok'
 vgate_assert 02 serial-absent '\[EXC\]'

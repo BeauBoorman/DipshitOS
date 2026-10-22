@@ -211,7 +211,7 @@ devin_pub = agentctl.ed_public_key(bytes.fromhex("0a" * 32)).hex()
 open(os.path.join(j1share, "AGENTS.TXT"), "w").write(
     "#v1\nagent=devin key=%s caps=file,process,window,term,input\n" % devin_pub)
 open(os.path.join(j1share, "SECRETS.TXT"), "w").write(
-    "#v1\nagent-hmac\t1000\t" + "a5" * 32 + "\n")
+    "#v1\nagent-hmac\t2000\t" + "a5" * 32 + "\nagent-hmac\t1000\t" + "a5" * 32 + "\n")
 open(os.path.join(j1share, "OWNERS.TXT"), "w").write(
     "#v1\nAGENTD.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n")
 os.makedirs(os.path.join(j1share, "AGENT", "AUDIT"), exist_ok=True)
@@ -629,7 +629,7 @@ exec GOTABWM.ELF
 EOF
 
 vgate_file script10b.txt <<'EOF'
-exec AGENTD.ELF --allow-exec
+exec -u2000 AGENTD.ELF --allow-exec
 EOF
 
 vgate_file script10c.txt <<'EOF'

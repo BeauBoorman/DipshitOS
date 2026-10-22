@@ -492,7 +492,7 @@ func posture(t *testing.T, args []string, uid, caps uint32, principalOK bool, st
 func TestPostureOrder(t *testing.T) {
 	good := postureState{cred: true, keyring: "ok", root: true, audit: true}
 	// argv is checked before any posture probe.
-	logs, status := posture(t, []string{"--bogus"}, 1000, 0, true, good)
+	logs, status := posture(t, []string{"--bogus"}, 2000, 0, true, good)
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse argv" {
 		t.Fatalf("argv refusal = %v status %d", logs, status)
 	}
@@ -500,38 +500,43 @@ func TestPostureOrder(t *testing.T) {
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse privileged" {
 		t.Fatalf("uid 0 = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 1, true, good)
+	// M173d: uid_user is refused too — only the agent principal serves.
+	logs, status = posture(t, nil, 1000, 0, true, good)
+	if status != 1 || logs[0] != "agentd: refuse privileged" {
+		t.Fatalf("uid_user = %v status %d", logs, status)
+	}
+	logs, status = posture(t, nil, 2000, 1, true, good)
 	if status != 1 || logs[0] != "agentd: refuse privileged" {
 		t.Fatalf("caps = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 0, false, good)
+	logs, status = posture(t, nil, 2000, 0, false, good)
 	if status != 1 || logs[0] != "agentd: refuse privileged" {
 		t.Fatalf("no principal = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 0, true, postureState{keyring: "ok", root: true, audit: true})
+	logs, status = posture(t, nil, 2000, 0, true, postureState{keyring: "ok", root: true, audit: true})
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse no-credential" {
 		t.Fatalf("no cred = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 0, true, postureState{cred: true, root: true, audit: true})
+	logs, status = posture(t, nil, 2000, 0, true, postureState{cred: true, root: true, audit: true})
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse no-keyring" {
 		t.Fatalf("no keyring = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 0, true,
+	logs, status = posture(t, nil, 2000, 0, true,
 		postureState{cred: true, keyring: "not a keyring", root: true, audit: true})
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse keyring-malformed" {
 		t.Fatalf("malformed keyring = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 0, true, postureState{cred: true, keyring: "ok", audit: true})
+	logs, status = posture(t, nil, 2000, 0, true, postureState{cred: true, keyring: "ok", audit: true})
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse no-root" {
 		t.Fatalf("no root = %v status %d", logs, status)
 	}
-	logs, status = posture(t, nil, 1000, 0, true, postureState{cred: true, keyring: "ok", root: true})
+	logs, status = posture(t, nil, 2000, 0, true, postureState{cred: true, keyring: "ok", root: true})
 	if status != 1 || len(logs) != 1 || logs[0] != "agentd: refuse no-audit" {
 		t.Fatalf("no audit = %v status %d", logs, status)
 	}
 	// A good posture prints the start marker and reaches listen — the
 	// fake refuses it, and the daemon reports the errno and exits.
-	logs, status = posture(t, []string{"--allow-exec"}, 1000, 0, true, good)
+	logs, status = posture(t, []string{"--allow-exec"}, 2000, 0, true, good)
 	if status != 1 || len(logs) != 2 ||
 		logs[0] != "agentd: start exec=on" ||
 		!strings.HasPrefix(logs[1], "agentd: refuse listen errno=") {

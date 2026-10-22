@@ -30,6 +30,10 @@ const (
 const (
 	UidSystem uint32 = 0
 	UidUser   uint32 = 1000
+	// UidAgent is the kernel-assigned agent principal (ADR 0052 amendment,
+	// index D15): AGENTD.ELF binds it by recorded name at exec and agent
+	// children inherit it.
+	UidAgent uint32 = 2000
 )
 
 // Principal reads the calling process's identity through slot 68. It returns

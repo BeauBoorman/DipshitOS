@@ -57,11 +57,14 @@ const (
 	sandboxDir    = "/host/AGENT"
 	sandboxPrefix = "/host/AGENT/"
 	auditDir      = "/host/AGENT/AUDIT"
-	// outPath holds one gosh.run's captured stdout, outside the sandbox
-	// on purpose (D3).
-	outPath      = "/host/AGENTD.OUT"
+	// outPath holds one gosh.run's captured stdout, off the fs.* surface on
+	// purpose (D3): it lives inside the audit lane, the sandbox's reserved
+	// first segment — agent-writable (M173d: the daemon and its children are
+	// uid_agent, and only the agent-owned roots take a write) yet never
+	// reachable through fs.*.
+	outPath      = "/host/AGENT/AUDIT/AGENTD.OUT"
 	goshBin      = "GOSH.ELF"
-	goshRedirect = " > /host/AGENTD.OUT"
+	goshRedirect = " > /host/AGENT/AUDIT/AGENTD.OUT"
 )
 
 // Bound constants from D3/D4.

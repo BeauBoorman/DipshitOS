@@ -148,7 +148,7 @@ EOF
 # M127c sender toast) come up together; GOFILES is exec'd last so its
 # declare takes focus — the paste input's target.
 vgate_file script-v2-apps.txt <<'EOF'
-exec AGENTD.ELF --allow-exec
+exec -u2000 AGENTD.ELF --allow-exec
 exec GOCALC.ELF
 exec GOFILES.ELF /host/NFY
 EOF
@@ -280,7 +280,8 @@ open(os.path.join(run, "devin.key"), "w").write("devin " + SEED + "\n")
 # (These are APPENDS — the block above owns the file's host-int row.)
 AKEY = "a5" * 32
 with open(os.path.join(share, "SECRETS.TXT"), "a") as f:
-    f.write("agent-hmac\t1000\t" + AKEY + "\tAGENTD.ELF,GOTABWM.ELF\n")
+    f.write("agent-hmac\t2000\t" + AKEY + "\tAGENTD.ELF\n")
+    f.write("agent-hmac\t1000\t" + AKEY + "\tGOTABWM.ELF\n")
 with open(os.path.join(share, "OWNERS.TXT"), "a") as f:
     f.write("AGENTD.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n")
 # The agent sandbox + the journey's fs fixture set (imported constants,
