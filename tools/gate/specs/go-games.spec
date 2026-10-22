@@ -696,3 +696,150 @@ vgate_assert 06 serial-contains 'gosol: undo depth='
 vgate_assert 06 serial-contains 'rx-games-06'
 vgate_assert 06 serial-absent '[EXC] parking:'
 vgate_assert 06 serial-absent 'exited status=139'
+
+# --- run 07 (#2940): the enforce leg — both games' saves under enforce ------
+# A run-scoped share (`--cvc-file`, the go-agentd posture-leg pattern: a
+# later --cvc-file in a run's own flags overrides the armed share for that
+# boot only) carries a GRANTS.TXT of `#v1 mode=enforce` and NO user rows,
+# so the compiled base rows decide — under #2939's table GOMINE.ELF and
+# GOSOL.ELF rows both carry `file`, so the save_ask's staged
+# /host/APPSTATE.<win> writes land from both apps. A row that still lacked
+# `file` would fail BY NAME — `refused:file_denied name=<BIN> word=file`
+# and the app's save marker simply never prints — never quietly; the
+# asserts pin that refusal's absence AND the audit receipt's absence (the
+# enforce posture), while the python hook proves the share's GRANTS.TXT
+# really carried mode=enforce.
+#
+# Choreography (run 04's seat-hosted shape, minus the pointer win and the
+# split): the setup's staged SEATWM.ELF lands renamed to GOTABWM.ELF on the
+# enforce copy — a one-time rename, not a per-boot vf mv — and wm=none
+# keeps autostart off so the boot script's `vf rm`s guarantee iteration-
+# clean state. GOMINE execs first and '2' reseeds the 16x16 intermediate
+# board (non-default); GOSOL execs second, steals focus, and 'd' + 'n'
+# give it draw-mode 3 and a fresh deal (non-default). 'ctrl-shift-s' then
+# asks every bound tab: both apps stage APPSTATE.<win> under their own
+# rows and the seat stores both blobs before the bundle write.
+
+vgate_setup_python <<'PY'
+# Declared LAST of this spec's setup hooks so the copy sees the armed
+# share's final state (SEATWM.ELF + the title aliases included), then
+# layers the enforce posture on top.
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+enf = os.path.join(os.environ["RUN_DIR"], "enf-share")
+if os.path.exists(enf):
+    shutil.rmtree(enf)
+shutil.copytree(share, enf)
+# The seat rides under its real name on the enforce copy: runs 01-06 keep
+# it staged as SEATWM.ELF so their boots never seat, but this leg wants
+# the seat every iteration with no vf mv dance to undo.
+os.replace(os.path.join(enf, "SEATWM.ELF"), os.path.join(enf, "GOTABWM.ELF"))
+open(os.path.join(enf, "GRANTS.TXT"), "w").write("#v1 mode=enforce\n")
+open(os.path.join(enf, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
+print("enf-share: %d files, GOTABWM.ELF in place, GRANTS.TXT mode=enforce"
+      % len(os.listdir(enf)))
+PY
+
+vgate_file script-07.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm NOTIFY.HIST
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+exec GOMINE.ELF 1 0
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+exec GOSOL.ELF --seed=1
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --cvc-file '$RUN_DIR/enf-share' \
+    --script '$RUN_DIR/script-07.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' --script2-after 'gotabwm: mode live' \
+    --input-string '2' --input-string-after 'gomine: present' \
+    --script3 '$RUN_DIR/script3-07.txt' --script3-after 'size=intermediate' --script3-delay 3 \
+    --input-chords 'd,n,ctrl-shift-s' --input-chords-after 'gosol: ready' \
+    --script-expect 'gotabwm: snapshot saved bytes=' --timeout 300
+
+vgate_assert 07 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 07 serial-contains 'gotabwm: mode live'
+vgate_assert 07 serial-contains 'exec: loaded GOMINE.ELF'
+vgate_assert 07 serial-contains 'gomine: declare accepted'
+vgate_assert 07 serial-contains 'gomine: seed 1 size=beginner'
+vgate_assert 07 serial-contains 'gomine: present'
+# The '2' key reseeded the intermediate board — non-default state in the
+# blob the save_ask collects.
+vgate_assert 07 serial-contains 'size=intermediate'
+vgate_assert 07 serial-contains 'exec: loaded GOSOL.ELF'
+vgate_assert 07 serial-contains 'gosol: open id='
+vgate_assert 07 serial-contains 'gosol: deal seed=1 draw=1'
+vgate_assert 07 serial-contains 'gosol: ready'
+vgate_assert 07 serial-contains 'gosol: draw-mode 3'
+vgate_assert 07 serial-count 'gosol: deal seed=' 2
+# The ask -> both apps' staged blobs -> stored -> bundle chain, end to
+# end. `gomine: state saved len=`/`gosol: state save len=` print only on
+# the acked handoff — under a missing `file` word the APPSTATE.<win>
+# write is refused EACCES and the marker never prints.
+vgate_assert 07 serial-count 'gotabwm: state ask id=' 2
+vgate_assert 07 serial-contains 'gomine: state saved len='
+vgate_assert 07 serial-contains 'gosol: state save len='
+vgate_assert 07 serial-count 'gotabwm: state save id=' 2
+vgate_assert 07 serial-contains 'gotabwm: snapshot saved bytes='
+# The enforce posture's named failures, absent by name.
+vgate_assert 07 serial-absent 'refused:file_denied name=GOMINE.ELF'
+vgate_assert 07 serial-absent 'refused:file_denied name=GOSOL.ELF'
+vgate_assert 07 serial-absent 'refused:file_denied name=GOTABWM.ELF'
+vgate_assert 07 serial-absent 'refused:'
+vgate_assert 07 serial-absent 'verdict=audit:'
+vgate_assert 07 serial-absent 'gomine: boom'
+vgate_assert 07 serial-absent 'gosol: drop bad'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+
+# The share evidence (this run's share is enf-share, not the armed one —
+# share-* asserts read the armed share, so the check is python): the
+# GRANTS.TXT the boot read really was `#v1 mode=enforce` with no user
+# rows; SESSION.TABS holds both rows with an AS trailer carrying BOTH
+# apps' blobs (the envelope bytes ride no other channel than the staged
+# APPSTATE.<win> write); SNAPSHOT.BUNDLE exists non-empty.
+vgate_assert 07 python <<'PY'
+import os, sys
+sh = os.path.join(os.environ["RUN_DIR"], "enf-share")
+g = open(os.path.join(sh, "GRANTS.TXT")).read()
+if g != "#v1 mode=enforce\n":
+    sys.exit("enforce share GRANTS.TXT is %r — not the bare enforce header"
+             % g)
+t = open(os.path.join(sh, "SESSION.TABS"), "rb").read()
+if t[0] != 2 or t[2] != 2:
+    sys.exit("SESSION.TABS header ver=%d count=%d, want ver=2 count=2"
+             % (t[0], t[2]))
+off = 6 + 69 * t[2]
+if len(t) < off + 6 + 8 * 2 or t[off:off+2] != b"AS" or t[off+2] != 1 \
+        or t[off+3] != 2:
+    sys.exit("app_state trailer %r — want AS ver=1 count=2"
+             % t[off:off+6])
+# The trailer interleaves 8-byte entries with their blobs: ent{row,
+# appver, _, _, len LE} then len bytes, per stored state.
+pos = off + 6
+lens = []
+for i in range(2):
+    ent = t[pos:pos+8]
+    ln = int.from_bytes(ent[4:8], "little")
+    pos += 8 + ln
+    lens.append(ln)
+if pos > len(t) or any(ln == 0 for ln in lens):
+    sys.exit("trailer blobs truncated or empty: lens=%r tail=%d"
+             % (lens, len(t) - pos))
+if not os.path.getsize(os.path.join(sh, "SNAPSHOT.BUNDLE")):
+    sys.exit("SNAPSHOT.BUNDLE missing or empty")
+print("enforce leg: GRANTS.TXT mode=enforce; SESSION.TABS 2 rows, AS "
+      "blobs %d+%d bytes; bundle present" % tuple(lens))
+PY

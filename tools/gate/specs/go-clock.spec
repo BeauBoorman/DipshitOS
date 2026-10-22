@@ -821,3 +821,142 @@ vgate_assert 08 serial-absent 'goclock: alarm file bad'
 vgate_assert 08 serial-absent 'goclock: deadline full'
 vgate_assert 08 serial-absent '[EXC] parking:'
 vgate_assert 08 serial-absent 'exited status=139'
+
+# --- run 09 (#2940): the enforce leg — the clock's writes land under --------
+# mode=enforce, not only under the audit default. A run-scoped share
+# (`--cvc-file`, the go-agentd posture-leg pattern: a later --cvc-file in a
+# run's own flags overrides the armed share for that boot only) carries a
+# GRANTS.TXT of `#v1 mode=enforce` and NO user rows, so the compiled base
+# rows decide — under #2939's table GOCLOCK.ELF's row carries `file`, so the
+# arm's crash-safe /host/GOCLOCK.ALARM write and the save_ask's staged
+# /host/APPSTATE.<win> write both land. A row that still lacked `file`
+# would fail BY NAME — `refused:file_denied name=GOCLOCK.ELF word=file`
+# plus the app's own `goclock: alarm save failed rc=` — never quietly; the
+# asserts pin that refusal's absence AND the audit receipt's absence (the
+# enforce posture), while the python hook proves the share's GRANTS.TXT
+# really carried mode=enforce.
+#
+# The seat execs from the monitor on a wm=none copy (no autostart) so a
+# prior iteration's SESSION.TABS cannot pre-restore a second clock before
+# the leading `vf rm`s; the boot script cleans the share first, which is
+# what makes the leg vgate_repeat-safe.
+
+vgate_setup_python <<'PY'
+# Declared LAST of this spec's setup hooks so the copy sees the armed
+# share's final state, then layers the enforce posture on top.
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+enf = os.path.join(os.environ["RUN_DIR"], "enf-share")
+if os.path.exists(enf):
+    shutil.rmtree(enf)
+shutil.copytree(share, enf)
+open(os.path.join(enf, "GRANTS.TXT"), "w").write("#v1 mode=enforce\n")
+open(os.path.join(enf, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
+print("enf-share: %d files, GRANTS.TXT mode=enforce, wm=none"
+      % len(os.listdir(enf)))
+PY
+
+vgate_file script-09.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+vf rm NOTIFY.HIST
+vf rm GOCLOCK.ALARM
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-09.txt <<'EOF'
+exec GOCLOCK.ELF
+EOF
+
+vgate_file script3-09.txt <<'EOF'
+echo rx-goclock-enf
+EOF
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio \
+    --cvc-file '$RUN_DIR/enf-share' \
+    --script '$RUN_DIR/script-09.txt' \
+    --script2 '$RUN_DIR/script2-09.txt' \
+    --script2-after 'gotabwm: mode live' \
+    --input-chords 'right,right,right,2,3,5,9,return,ctrl-shift-s' \
+    --input-chords-after 'goclock: painted epoch=' \
+    --script3 '$RUN_DIR/script3-09.txt' \
+    --script3-after 'gotabwm: snapshot saved ' \
+    --script-expect 'rx-goclock-enf' --timeout 300
+
+vgate_assert 09 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 09 serial-contains 'gotabwm: mode live'
+vgate_assert 09 serial-contains 'exec: loaded GOCLOCK.ELF'
+vgate_assert 09 serial-contains 'goclock: declare accepted'
+vgate_assert 09 serial-contains 'goclock: tab alarm'
+vgate_assert 09 serial-contains 'goclock: alarm armed 23:59 daily'
+# The arm's durable write landed: under enforce a missing `file` word
+# would refuse it BY NAME, so `alarm saved` can only print because the
+# row carried file and the write went through.
+vgate_assert 09 serial-contains 'goclock: alarm saved'
+# The unsolicited save_state push: the app staged /host/APPSTATE.<win>
+# itself (same `file` word, same receipt surface).
+vgate_assert 09 serial-contains 'goclock: state posted'
+# The snapshot chord's exchange, seat side: ask -> the app's staged
+# blob -> stored -> bundle.
+vgate_assert 09 serial-contains 'gotabwm: state ask id='
+vgate_assert 09 serial-contains 'gotabwm: state save id='
+vgate_assert 09 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 09 serial-contains 'rx-goclock-enf'
+# The enforce legs' named failures, absent by name — a write refused
+# under enforce names its binary and its word, never silently.
+vgate_assert 09 serial-absent 'refused:file_denied name=GOCLOCK.ELF'
+vgate_assert 09 serial-absent 'refused:file_denied name=GOTABWM.ELF'
+vgate_assert 09 serial-absent 'refused:'
+# Posture: nothing audit-receipted — audit only receipts denied calls,
+# so this line also proves the boot really ran under enforce's shape.
+vgate_assert 09 serial-absent 'verdict=audit:'
+vgate_assert 09 serial-absent 'goclock: alarm save failed'
+vgate_assert 09 serial-absent 'goclock: deadline full'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
+
+# The share evidence (this run's share is enf-share, not the armed one —
+# share-* asserts read the armed share, so the check is python): the
+# GRANTS.TXT the boot read really was `#v1 mode=enforce` with no user
+# rows, GOCLOCK.ALARM carries the armed row, and SESSION.TABS's AS
+# trailer carries the app's blob — proof the APPSTATE.<win> staging
+# write happened (the envelope's bytes ride no other channel).
+vgate_assert 09 python <<'PY'
+import os, re, sys
+sh = os.path.join(os.environ["RUN_DIR"], "enf-share")
+g = open(os.path.join(sh, "GRANTS.TXT")).read()
+if g != "#v1 mode=enforce\n":
+    sys.exit("enforce share GRANTS.TXT is %r — not the bare enforce header"
+             % g)
+b = open(os.path.join(sh, "GOCLOCK.ALARM"), "rb").read()
+if not re.fullmatch(rb"gocal2 1 [0-9]+ 2359 d\+\n?", b):
+    sys.exit("GOCLOCK.ALARM = %r, want one armed gocal2 row" % b)
+t = open(os.path.join(sh, "SESSION.TABS"), "rb").read()
+if t[0] != 2 or t[2] < 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (t[0], t[2]))
+off = 6 + 69 * t[2]
+if len(t) < off + 6 + 8 or t[off:off+2] != b"AS" or t[off+2] != 1 or t[off+3] < 1:
+    sys.exit("no app_state trailer: %r" % t[off:off+6])
+asc = t[off+3]
+pos = off + 6 + 8 * asc
+hits = []
+for i in range(asc):
+    ent = t[off+6+8*i:off+14+8*i]
+    ln = int.from_bytes(ent[4:8], "little")
+    blob = t[pos:pos+ln]
+    pos += ln
+    if re.fullmatch(rb"gocal2 1 [0-9]+ 2359 d\+", blob):
+        hits.append((ent[0], ent[1], blob))
+if len(hits) != 1 or hits[0][1] != 1:
+    sys.exit("want exactly one appver=1 gocal2 blob under enforce, found %r"
+             % hits)
+if not os.path.getsize(os.path.join(sh, "SNAPSHOT.BUNDLE")):
+    sys.exit("SNAPSHOT.BUNDLE missing or empty")
+print("enforce leg: GRANTS.TXT mode=enforce, GOCLOCK.ALARM row landed, "
+      "SESSION.TABS blob %r, bundle present" % hits[0][2])
+PY

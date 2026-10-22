@@ -3902,3 +3902,98 @@ assert frac <= 0.08 and mean <= 24, "cgrender vs scanout: mism=%.4f mean=%.2f" %
 print("live-web 57: cgrender page 1 vs scanout crop (mismatch %.4f%%, mean %.2f/255, tol %d)"
       % (frac*100, mean, TOL))
 PY
+
+# --- boot 58 (#2940): the enforce leg — WEB's writes land under enforce -----
+# A run-scoped share (`--cvc-file`, the go-agentd posture-leg pattern: a
+# later --cvc-file in a run's own flags overrides the armed share for that
+# boot only) carries a GRANTS.TXT of `#v1 mode=enforce` and NO user rows,
+# so the compiled base rows decide — under #2939's table WEB.ELF's row
+# carries `file`, so the picker's save-as lands WEBSAVE.HTML and the
+# bare-'s' download lands WEB-DL-PAGE.HTML (plus the ledger row). A row
+# that still lacked `file` would fail BY NAME — `refused:file_denied
+# name=WEB.ELF word=file` and `web: download failed file` — never quietly;
+# the asserts pin that refusal's absence AND the audit receipt's absence
+# (the enforce posture), while the python hook proves the share's
+# GRANTS.TXT really carried mode=enforce and both payloads are byte-exact.
+#
+# Run 45's picker choreography verbatim — ctrl-shift-s, nine backspaces
+# clearing the seeded PAGE.HTML name, the fresh name, Return — then one
+# `--input-key 1` (macOS kVK_S) fires the bare-s save only AFTER the
+# save-as marker, so the 's' can never land inside the picker's name
+# field. Run ends on the download's done marker.
+
+vgate_setup_python <<'PY'
+# Declared LAST of this spec's setup hooks so the copy sees the armed
+# share's final state (PAGE.HTML, DLPAGE.HTML, fonts, the mime-open
+# ELFs included), then layers the enforce posture on top.
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+enf = os.path.join(os.environ["RUN_DIR"], "enf-share")
+if os.path.exists(enf):
+    shutil.rmtree(enf)
+shutil.copytree(share, enf)
+open(os.path.join(enf, "GRANTS.TXT"), "w").write("#v1 mode=enforce\n")
+print("enf-share: %d files, GRANTS.TXT mode=enforce" % len(os.listdir(enf)))
+PY
+
+vgate_run 58 -- \
+    --screen '$RUN_DIR/screen' --via-virtio \
+    --cvc-file '$RUN_DIR/enf-share' \
+    --script '$RUN_DIR/script-local.txt' \
+    --input-chords 'ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,W,E,B,S,A,V,E,.,H,T,M,L,return' --input-chords-after 'web: ready' \
+    --input-key 1 --input-key-after 'web: save /host/WEBSAVE.HTML' \
+    --script-expect 'web: download done PAGE.HTML' --timeout 240
+
+vgate_assert 58 serial-absent 'web: budget over'
+vgate_assert 58 serial-contains 'web: url /host/PAGE.HTML'
+# The save-as leg: the picker returned /host/WEBSAVE.HTML, the staged
+# write committed it and the ledger path marked it — under a missing
+# `file` word the FileOpen is refused EACCES and `web: save` never
+# prints.
+vgate_assert 58 serial-contains 'web: download /host/WEBSAVE.HTML '
+vgate_assert 58 serial-contains 'web: save /host/WEBSAVE.HTML'
+# The bare-s download leg: the same staged-write path under the fixed
+# WEB-DL- name.
+vgate_assert 58 serial-contains 'web: download start PAGE.HTML bytes='
+vgate_assert 58 serial-contains 'web: download /host/WEB-DL-PAGE.HTML '
+vgate_assert 58 serial-contains 'web: download done PAGE.HTML'
+# The enforce posture's named failures, absent by name.
+vgate_assert 58 serial-absent 'refused:file_denied name=WEB.ELF'
+vgate_assert 58 serial-absent 'refused:'
+vgate_assert 58 serial-absent 'verdict=audit:'
+vgate_assert 58 serial-absent 'web: save cancel'
+vgate_assert 58 serial-absent 'web: download failed'
+vgate_assert 58 serial-absent 'web: error'
+vgate_assert 58 serial-absent '[EXC] parking:'
+vgate_assert 58 serial-absent 'exited status=139'
+
+# The share evidence (this run's share is enf-share, not the armed one —
+# share-* asserts read the armed share, so the check is python): the
+# GRANTS.TXT the boot read really was `#v1 mode=enforce` with no user
+# rows; WEBSAVE.HTML is byte-exact PAGE.HTML (the run-45 compare);
+# WEB-DL-PAGE.HTML holds the same body; the downloads ledger rows both.
+vgate_assert 58 python <<'PY'
+import os, sys
+sh = os.path.join(os.environ["RUN_DIR"], "enf-share")
+g = open(os.path.join(sh, "GRANTS.TXT")).read()
+if g != "#v1 mode=enforce\n":
+    sys.exit("enforce share GRANTS.TXT is %r — not the bare enforce header"
+             % g)
+want = open(os.path.join(sh, "PAGE.HTML"), "rb").read()
+for name in ("WEBSAVE.HTML", "WEB-DL-PAGE.HTML"):
+    p = os.path.join(sh, name)
+    if not os.path.exists(p):
+        sys.exit("%s missing on the enforce share" % name)
+    got = open(p, "rb").read()
+    if got != want:
+        sys.exit("%s is %d bytes, want the PAGE.HTML body (%d)"
+                 % (name, len(got), len(want)))
+rows = [l for l in open(os.path.join(sh, "WEB-DOWNLOADS.TXT"),
+        errors="replace").read().splitlines() if l and not l.startswith("#")]
+for name in ("WEBSAVE.HTML", "WEB-DL-PAGE.HTML"):
+    if not any(name in r for r in rows):
+        sys.exit("no ledger row for %s" % name)
+print("enforce leg: GRANTS.TXT mode=enforce; WEBSAVE.HTML + "
+      "WEB-DL-PAGE.HTML byte-exact (%d bytes), ledger rows present"
+      % len(want))
+PY

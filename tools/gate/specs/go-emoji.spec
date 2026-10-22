@@ -615,3 +615,133 @@ vgate_assert 06 serial-contains 'goemoji: present'
 vgate_assert 06 serial-contains 'rx-goemoji-06'
 vgate_assert 06 serial-absent '[EXC] parking:'
 vgate_assert 06 serial-absent 'exited status=139'
+
+# --- run 07 (#2940): the enforce leg — the picker's state write lands under -
+# mode=enforce, not only under the audit default. A run-scoped share
+# (`--cvc-file`, the go-agentd posture-leg pattern: a later --cvc-file in a
+# run's own flags overrides the armed share for that boot only) carries a
+# GRANTS.TXT of `#v1 mode=enforce` and NO user rows, so the compiled base
+# rows decide — under #2939's table GOEMOJI.ELF's row carries `file`, so
+# the save_ask's staged /host/APPSTATE.<win> write lands and the blob
+# reaches SESSION.TABS. A row that still lacked `file` would fail BY NAME
+# — `refused:file_denied name=GOEMOJI.ELF word=file`, and `goemoji: state
+# saved len=` would never print — never quietly; the asserts pin that
+# refusal's absence AND the audit receipt's absence (the enforce posture),
+# while the python hook proves the share's GRANTS.TXT really carried
+# mode=enforce.
+#
+# Run-05 shape minus the second pick and the pin: `exec -u0` for both (the
+# pick's kernel-clipboard write is a uid cap, orthogonal to grant words —
+# the `file` word still binds by image name under -u0). The pointer click
+# toggles 'stay' on the full-viewport surface, 'fire\n' picks the glyph
+# and keeps the app open, and 'ctrl-shift-s' runs the state ask. The armed
+# share's wm=none SETTINGS.TXT rides the copy, so no boot autostart, and
+# the leading `vf rm`s keep every iteration clean.
+
+vgate_setup_python <<'PY'
+# Declared LAST of this spec's setup hooks so the copy sees the armed
+# share's final state (fonts manifest + faces + G.TXT included), then
+# layers the enforce posture on top.
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+enf = os.path.join(os.environ["RUN_DIR"], "enf-share")
+if os.path.exists(enf):
+    shutil.rmtree(enf)
+shutil.copytree(share, enf)
+open(os.path.join(enf, "GRANTS.TXT"), "w").write("#v1 mode=enforce\n")
+print("enf-share: %d files, GRANTS.TXT mode=enforce" % len(os.listdir(enf)))
+PY
+
+vgate_file script-07.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+wm
+exec -u0 GOTABWM.ELF
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+exec -u0 GOEMOJI.ELF
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' --via-virtio \
+    --cvc-file '$RUN_DIR/enf-share' \
+    --script '$RUN_DIR/script-07.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'gotabwm: present' \
+    --pointer-virtio '1120,45,d;1120,45,u' \
+    --pointer-virtio-after 'goemoji: present' \
+    --input-string $'fire\n' \
+    --input-string-after 'goemoji: stay on' \
+    --input-chords 'ctrl-shift-s' \
+    --input-chords-after 'goemoji: clip text/plain n=4' \
+    --script-expect 'gotabwm: snapshot saved bytes=' --timeout 300
+
+vgate_assert 07 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 07 serial-contains 'gotabwm: mode live'
+vgate_assert 07 serial-contains 'gotabwm: present'
+vgate_assert 07 serial-contains 'exec: loaded GOEMOJI.ELF'
+vgate_assert 07 serial-contains 'goemoji: open id='
+vgate_assert 07 serial-contains 'goemoji: declare accepted'
+vgate_assert 07 serial-contains 'goemoji: present'
+vgate_assert 07 serial-contains 'goemoji: stay on'
+vgate_assert 07 serial-contains 'goemoji: filter q=fire n=1'
+vgate_assert 07 serial-contains 'goemoji: pick U+1F525 fire'
+vgate_assert 07 serial-contains 'goemoji: clip text/plain n=4'
+# The ask -> the app's staged blob -> stored -> bundle chain, end to end.
+# `goemoji: state saved len=` prints only on the acked handoff — under a
+# missing `file` word the APPSTATE.<win> write is refused EACCES and the
+# marker never prints.
+vgate_assert 07 serial-contains 'gotabwm: state ask id='
+vgate_assert 07 serial-contains 'goemoji: state saved len='
+vgate_assert 07 serial-contains 'gotabwm: state save id='
+vgate_assert 07 serial-contains 'gotabwm: snapshot saved bytes='
+# The enforce posture's named failures, absent by name.
+vgate_assert 07 serial-absent 'refused:file_denied name=GOEMOJI.ELF'
+vgate_assert 07 serial-absent 'refused:file_denied name=GOTABWM.ELF'
+vgate_assert 07 serial-absent 'refused:'
+vgate_assert 07 serial-absent 'verdict=audit:'
+vgate_assert 07 serial-absent 'goemoji: clip refuse'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+
+# The share evidence (this run's share is enf-share, not the armed one —
+# share-* asserts read the armed share, so the check is python): the
+# GRANTS.TXT the boot read really was `#v1 mode=enforce` with no user
+# rows; SESSION.TABS holds the picker's row with an AS trailer carrying
+# its blob (the envelope bytes ride no other channel than the staged
+# APPSTATE.<win> write); SNAPSHOT.BUNDLE exists non-empty.
+vgate_assert 07 python <<'PY'
+import os, sys
+sh = os.path.join(os.environ["RUN_DIR"], "enf-share")
+g = open(os.path.join(sh, "GRANTS.TXT")).read()
+if g != "#v1 mode=enforce\n":
+    sys.exit("enforce share GRANTS.TXT is %r — not the bare enforce header"
+             % g)
+t = open(os.path.join(sh, "SESSION.TABS"), "rb").read()
+if t[0] != 2 or t[2] < 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (t[0], t[2]))
+off = 6 + 69 * t[2]
+if len(t) < off + 6 + 8 or t[off:off+2] != b"AS" or t[off+2] != 1 \
+        or t[off+3] < 1:
+    sys.exit("app_state trailer %r — want AS ver=1 count>=1"
+             % t[off:off+6])
+asc = t[off+3]
+# The trailer interleaves 8-byte entries with their blobs: ent{row,
+# appver, _, _, len LE} then len bytes, per stored state.
+pos = off + 6
+lens = []
+for i in range(asc):
+    ent = t[pos:pos+8]
+    ln = int.from_bytes(ent[4:8], "little")
+    pos += 8 + ln
+    lens.append(ln)
+if pos > len(t) or not any(ln > 0 for ln in lens):
+    sys.exit("no non-empty blob in the AS trailer: lens=%r tail=%d"
+             % (lens, len(t) - pos))
+if not os.path.getsize(os.path.join(sh, "SNAPSHOT.BUNDLE")):
+    sys.exit("SNAPSHOT.BUNDLE missing or empty")
+print("enforce leg: GRANTS.TXT mode=enforce; SESSION.TABS %d row(s), AS "
+      "blobs %r; bundle present" % (t[2], lens))
+PY
