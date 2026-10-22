@@ -1788,3 +1788,61 @@ func TestFocusCycleParkAndRelease(t *testing.T) {
 		t.Fatalf("the hold bound must still apply the cycle: %v", *indices)
 	}
 }
+
+// TestFocusCycleQueuedActions is the go-wm-tabs run-04 regression: an
+// action decoded while a cycle is parked must see the POST-cycle strip,
+// so it queues behind the release — `alt-tab,ctrl-shift-f` freezes the
+// tab the cycle moves to, never the one it left.
+func TestFocusCycleQueuedActions(t *testing.T) {
+	savedTabs, savedDemo := tabs, demoMode
+	savedInput, savedSeat := lastInputTick, seatTick
+	savedPending, savedN := cyclePending, cycleQueueN
+	defer func() {
+		tabs, demoMode = savedTabs, savedDemo
+		lastInputTick, seatTick = savedInput, savedSeat
+		cyclePending, cycleQueueN = savedPending, savedN
+	}()
+
+	// focusByIndex's real body needs the wmctl seam, which has no host
+	// return here — the stub records the apply and moves focus itself.
+	prevFocus := focusByIndex
+	focusByIndex = func(i int) bool {
+		if i < 0 || i >= tabs.Count() {
+			return false
+		}
+		return tabs.FocusTab(tabs.At(i).ID)
+	}
+	defer func() { focusByIndex = prevFocus }()
+
+	demoMode = true
+	seatTick = 10
+	lastInputTick = 0
+	tabs = TabStrip{}
+	if !tabs.OpenTab(3, "A") || !tabs.OpenTab(4, "B") || !tabs.FocusTab(3) {
+		t.Fatal("two-tab strip")
+	}
+	// Dispatch the burst exactly as the event drain does: the cycle parks,
+	// the freeze queues behind it.
+	runSeatAction("cycle-focus", chords.Chord{})
+	if !cyclePending {
+		t.Fatal("demo cycle must park")
+	}
+	runSeatAction("freeze-badge", chords.Chord{})
+	if tabs.tabs[1].Frozen || tabs.tabs[0].Frozen {
+		t.Fatal("queued action must not apply mid-park")
+	}
+	// The cycle releases at the bound (no probe in this fixture), applies,
+	// then the queued freeze lands on the post-cycle focus.
+	for i := uint64(0); i < focusCycleHoldMax && cyclePending; i++ {
+		releaseFocusCycle(seatTick + 1 + i)
+	}
+	if cyclePending {
+		t.Fatal("bound release")
+	}
+	if cycleQueueN != 0 {
+		t.Fatalf("queue must drain at release: n=%d", cycleQueueN)
+	}
+	if !tabs.tabs[1].Frozen || tabs.tabs[0].Frozen {
+		t.Fatalf("freeze must land on the post-cycle tab: %+v", tabs.tabs)
+	}
+}

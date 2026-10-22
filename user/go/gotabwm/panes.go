@@ -223,11 +223,13 @@ func (s *TabStrip) decodePanes(b []byte) bool {
 // encodePanesSpaces serializes the space table as the v2 sidecar. Every
 // live space emits an entry — even one with no tree — so a restored boot
 // learns the space NAMES the records alone could not carry (an empty
-// space has no records) plus which space was live.
+// space has no records) plus which space was live. `cur` is a 1-based
+// entry ordinal, matching the SESSION.TABS v2 header's `active` field
+// convention (0 is never a space; the sidecar floor is one space).
 func encodePanesSpaces() []byte {
 	out := make([]byte, 0, panesMaxBytesV2)
 	out = append(out, panesMagic0, panesMagic1, panesVerSpaces,
-		byte(spaceN), byte(spaceCur))
+		byte(spaceN), byte(spaceCur+1))
 	for si := 0; si < spaceN; si++ {
 		name := spaces[si].Name
 		if len(name) > tabsV2GroupMax {
@@ -256,8 +258,8 @@ func decodePanesSpaces(b []byte) bool {
 		return false
 	}
 	ns := int(b[3])
-	cur := int(b[4])
-	if ns < 1 || ns > MaxSpaces || cur >= ns {
+	cur := int(b[4]) - 1 // wire value is a 1-based entry ordinal
+	if ns < 1 || ns > MaxSpaces || cur < 0 || cur >= ns {
 		return false
 	}
 	pos := 5

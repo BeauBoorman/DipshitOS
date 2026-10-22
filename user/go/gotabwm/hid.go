@@ -198,6 +198,36 @@ var (
 	cycleCpuInit    bool   // a first sample has seeded cycleCpuLast
 )
 
+// queuedSeatAction is a decoded seat action held behind a parked focus
+// cycle. A deferred cycle is the user's already-expressed intent that the
+// NEXT actions see the post-cycle strip — an action dispatched mid-park
+// would apply to the pre-cycle tab (observed go-wm-tabs run 04:
+// `alt-tab,ctrl-shift-f` froze the pinned Calc, not the NOTE the cycle
+// was parking to reach). The bounded FIFO drains at the cycle's release,
+// in decode order.
+type queuedSeatAction struct {
+	action string
+	c      chords.Chord
+}
+
+var (
+	cycleQueue  [8]queuedSeatAction
+	cycleQueueN int
+)
+
+// drainCycleQueue applies queued actions in decode order. It stops when a
+// queued action re-parks a cycle — that cycle's release resumes the queue,
+// so a burst of two cycles keeps each one's dependents behind it.
+func drainCycleQueue() {
+	for cycleQueueN > 0 && !cyclePending {
+		a := cycleQueue[0]
+		copy(cycleQueue[:], cycleQueue[1:cycleQueueN])
+		cycleQueue[cycleQueueN-1] = queuedSeatAction{}
+		cycleQueueN--
+		runSeatAction(a.action, a.c)
+	}
+}
+
 // armFocusCycle parks the decoded cycle chord for deferred application and
 // reports whether it did. The park needs a real cycle to make — under two
 // tabs the chord is a no-op either way — and it is demo mode only: a live
@@ -223,7 +253,11 @@ func releaseFocusCycle(ticks uint64) {
 		return
 	}
 	if tabs.Count() < 2 {
+		// The parked cycle became a no-op, but the actions queued
+		// behind it still apply in decode order to whatever focus
+		// remains.
 		cyclePending = false
+		drainCycleQueue()
 		return
 	}
 	inputQuiet := ticks >= lastInputTick && ticks-lastInputTick >= focusCycleQuietTicks
@@ -242,6 +276,7 @@ func releaseFocusCycle(ticks uint64) {
 	if (inputQuiet && appQuiet) || ticks-cycleParkedTick >= focusCycleHoldMax {
 		cyclePending = false
 		_ = applyAltTab(cycleShift)
+		drainCycleQueue()
 	}
 }
 
@@ -274,22 +309,46 @@ func armSnapshotAsk() bool {
 
 // releaseSnapshotAsk evaluates the parked ask once per composite tick —
 // same quiet contract as releaseFocusCycle, unconditionally at the bound.
+// The app-quiet leg sums every bound live tab's cpu, not just the focused
+// tab's: a capture is right only when NO hosted app is still working
+// through input or startup (observed go-wm-tabs run 18: the ask fired
+// while WEB was still inside its settle path, so WEB's save never landed
+// and the app-state trailer carried two entries, not three).
 func releaseSnapshotAsk(ticks uint64) {
+	// A demo strip chain in flight is itself seat-observable work: the
+	// injected burst re-arms the chain's hold to hidChordHold, and the
+	// activity-budget teardown must yield for the chain rather than sweep
+	// the strip focused-first mid-chain (observed go-wm-tabs run 04: the
+	// teardown beat the re-armed hold and the pin/close steps never ran).
+	// The cap in demoTickLimit still bounds a chain that never finishes.
+	if demoMode && stripSawTwo && !stripDone {
+		lastActivityTick = ticks
+	}
 	if !snapPending {
 		return
 	}
 	inputQuiet := ticks >= lastInputTick && ticks-lastInputTick >= focusCycleQuietTicks
-	appQuiet := true
-	if id, ok := tabs.Focused(); ok && id < sessionIDBase {
-		if cpu, have := focusedCpuTicks(id); have {
-			if snapCpuInit && cpu == snapCpuLast {
-				snapCpuQuiet++
-			} else {
-				snapCpuQuiet = 0
-			}
-			snapCpuLast, snapCpuInit = cpu, true
-			appQuiet = snapCpuQuiet >= focusCycleQuietTicks
+	var cpuSum uint64
+	haveProbe := false
+	for i := 0; i < tabs.Count(); i++ {
+		id := tabs.At(i).ID
+		if id >= sessionIDBase {
+			continue
 		}
+		if cpu, have := focusedCpuTicks(id); have {
+			cpuSum += cpu
+			haveProbe = true
+		}
+	}
+	appQuiet := true
+	if haveProbe {
+		if snapCpuInit && cpuSum == snapCpuLast {
+			snapCpuQuiet++
+		} else {
+			snapCpuQuiet = 0
+		}
+		snapCpuLast, snapCpuInit = cpuSum, true
+		appQuiet = snapCpuQuiet >= focusCycleQuietTicks
 	}
 	if (inputQuiet && appQuiet) || ticks-snapParkedTick >= focusCycleHoldMax {
 		snapPending = false
@@ -380,6 +439,15 @@ func chordEvent(e vi.Event) chords.Chord {
 // tests can swap them exactly as before. No marker here: every apply*
 // below prints its own, after the syscall that made it true.
 func runSeatAction(action string, c chords.Chord) {
+	// While a cycle is parked, later chord intents queue behind it — the
+	// deferred cycle is what the user wanted focus to reflect first. A
+	// full queue falls back to immediate dispatch (an 8-deep burst
+	// holding a parked cycle is already degenerate).
+	if cyclePending && cycleQueueN < len(cycleQueue) {
+		cycleQueue[cycleQueueN] = queuedSeatAction{action: action, c: c}
+		cycleQueueN++
+		return
+	}
 	switch action {
 	case "launcher":
 		openLauncher()

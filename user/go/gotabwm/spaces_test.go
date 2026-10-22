@@ -289,7 +289,7 @@ func TestPanesSpacesRoundTrip(t *testing.T) {
 
 	blob := encodePanesSpaces()
 	if blob[0] != panesMagic0 || blob[1] != panesMagic1 ||
-		blob[2] != panesVerSpaces || blob[3] != 3 || blob[4] != 0 {
+		blob[2] != panesVerSpaces || blob[3] != 3 || blob[4] != 1 {
 		t.Fatalf("v2 header: %v", blob[:5])
 	}
 

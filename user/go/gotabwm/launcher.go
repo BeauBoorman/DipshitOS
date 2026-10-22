@@ -418,18 +418,25 @@ func rankApps(catalog []AppEntry, q string) []int {
 		}
 		return idx
 	}
-	var prefix, sub, fuzzy []int
+	// The bin is the app's stable identity; the label is presentation.
+	// A query that hits the executable name ("edit" → GOEDIT.ELF) is a
+	// stronger intent than one that only lands inside a display word
+	// ("Text Editor" / "Code Editor" both contain it — go-wm-tabs run 22
+	// observed the catalog-order tie exec'ing NOTE for "edit").
+	var prefix, binSub, labelSub, fuzzy []int
 	for i, e := range catalog {
 		switch {
 		case asciiPrefixFold(e.Label, q):
 			prefix = append(prefix, i)
-		case asciiContainsFold(e.Label, q) || asciiContainsFold(e.Bin, q):
-			sub = append(sub, i)
+		case asciiContainsFold(e.Bin, q):
+			binSub = append(binSub, i)
+		case asciiContainsFold(e.Label, q):
+			labelSub = append(labelSub, i)
 		case asciiSubseqFold(e.Label, q) || asciiSubseqFold(joinSpace(e.Args), q):
 			fuzzy = append(fuzzy, i)
 		}
 	}
-	return append(append(prefix, sub...), fuzzy...)
+	return append(append(append(prefix, binSub...), labelSub...), fuzzy...)
 }
 
 // asciiPrefixFold is tier 1's predicate: s starts with q, A–Z folded.

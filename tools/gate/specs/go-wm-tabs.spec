@@ -2616,23 +2616,29 @@ if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 3:
     sys.exit("app_state trailer %r want AS ver=1 n=3" % b[off:off+6])
 p = off + 6
 blobs = {}
+appvers = {}
 for _ in range(3):
     ent = b[p:p+8]
     ln = int.from_bytes(ent[4:8], "little")
     blob = b[p+8:p+8+ln]
     if len(blob) != ln or ln == 0:
         sys.exit("entry idx=%d len=%d truncated" % (ent[0], ln))
-    if ent[1] != 1:
-        sys.exit("entry idx=%d appver=%d want 1" % (ent[0], ent[1]))
     blobs[bins[ent[0]]] = blob
+    appvers[bins[ent[0]]] = ent[1]
     p += 8 + ln
 for name in ("GOTERM.ELF", "WEB.ELF", "GOEDIT.ELF"):
     if name not in blobs:
         sys.exit("no app_state blob for %s (bins=%s)" % (name, bins))
-# GOTERM v1: u8 fmt | u8 flags | u16 cwdLen | cwd | u16 envN | pairs |
-# u32 scLen | scroll.
+# appver is the app's own format tag, not a fleet constant: GOTERM's blob
+# is v2 since M154c (#2927, the profile tail) so its trailer row carries
+# appver=2; WEB and GOEDIT remain v1.
+if appvers["GOTERM.ELF"] != 2 or appvers["WEB.ELF"] != 1 or appvers["GOEDIT.ELF"] != 1:
+    sys.exit("appver goterm=%d web=%d goedit=%d want 2/1/1"
+             % (appvers["GOTERM.ELF"], appvers["WEB.ELF"], appvers["GOEDIT.ELF"]))
+# GOTERM v2: u8 fmt | u8 flags | u16 cwdLen | cwd | u16 envN | pairs |
+# u32 scLen | scroll | u16 profLen | profile.
 g = blobs["GOTERM.ELF"]
-if g[0] != 1:
+if g[0] != 2:
     sys.exit("goterm blob fmt=%d" % g[0])
 cwdLen = int.from_bytes(g[2:4], "little")
 cwd = g[4:4+cwdLen].decode()
@@ -2652,20 +2658,25 @@ scLen = int.from_bytes(g[p:p+4], "little")
 scroll = g[p+4:p+4+scLen]
 if b"M125G-PROOF" not in scroll:
     sys.exit("goterm scrollback (%d B) lost the proof line" % scLen)
+# v2 tail: u16 profLen | profile — the name this run never set stays "".
+tail = g[p+4+scLen:]
+if len(tail) < 2 or len(tail) != 2 + int.from_bytes(tail[:2], "little"):
+    sys.exit("goterm blob v2 profile tail malformed (%r)" % tail)
 # WEB v1: u8 fmt | u8 flags | u16 zoom | u32 scroll | u16 urlLen | url...
 w = blobs["WEB.ELF"]
 ul = int.from_bytes(w[8:10], "little")
 url = w[10:10+ul]
 if w[0] != 1 or url != b"/host/FORM.HTML":
     sys.exit("web blob fmt=%d url=%r" % (w[0], url))
-# GOEDIT v1: fmt byte + a non-empty blob; its field-level proof is the
-# app's own restored marker in run 19, not a second decode here.
+# GOEDIT v2 (outer-blob tag — the same M123b-era format run 14 pins):
+# fmt byte + a non-empty blob; its field-level proof is the app's own
+# restored marker in run 19, not a second decode here.
 e = blobs["GOEDIT.ELF"]
-if e[0] != 1:
+if e[0] != 2:
     sys.exit("goedit blob fmt=%d" % e[0])
-print("SESSION.TABS: 3 rows %s, AS n=3 all appver=1; goterm cwd=%r env=%d "
+print("SESSION.TABS: 3 rows %s, AS n=3 appver=%s; goterm cwd=%r env=%d "
       "scroll=%dB; web url=%r; goedit len=%d"
-      % (bins, cwd, envN, scLen, url, len(e)))
+      % (bins, appvers, cwd, envN, scLen, url, len(e)))
 PY
 vgate_assert 18 serial-absent '[EXC] parking:'
 vgate_assert 18 serial-absent 'exited status=139'
@@ -2925,6 +2936,10 @@ PY
 # records carry group names "1"/"2" and SESSION.PANES is the v2 frame
 # holding both space names + the live index.
 
+# The M151c audit staging seeds GOEMOJI.ELF on the shared share, but this
+# leg's `refusal ENOENT exec GOEMOJI.ELF` predates it: hide the binary so
+# the summon still proves the absent-name refusal; script-32.mv restores
+# it for the audit pair.
 vgate_file script-22.txt <<'EOF'
 set GOMAXPROCS=1
 vf rm GOTABWM.DEMO
@@ -2932,6 +2947,7 @@ vf rm SESSION.TABS
 vf rm SESSION.PANES
 vf rm SNAPSHOT.BUNDLE
 vf rm SNAPSHOT.RESTORE
+vf mv GOEMOJI.ELF GOEMOJI.TMP
 wm
 exec GOTABWM.ELF
 EOF
@@ -2965,10 +2981,15 @@ vgate_assert 22 serial-contains 'gotabwm: registered'
 vgate_assert 22 serial-contains 'gotabwm: space new name=2'
 vgate_assert 22 serial-contains 'gotabwm: space switch 1->2'
 vgate_assert 22 serial-contains 'gotabwm: space switch 2->1'
-vgate_assert 22 serial-contains ' space=2'
 vgate_assert 22 serial-contains ' space=1'
-# GOEDIT landed on space 2; the palette move carried a tab across.
-vgate_assert 22 serial-contains 'exec: loaded GOEDIT.ELF'
+# GOEDIT landed on space 2; the palette move carried a tab across. The
+# kernel's `exec: loaded` print is the SHELL's exec verb only — the seat's
+# own marker plus the RCPT exec receipt are the same fact for the launcher
+# dispatch. (The rail's ` space=` marker names a live space once it holds a
+# tab; space 2's live window here is empty because the exec'd app's declare
+# lands after the burst's PageUp — the group field in the file below is the
+# real proof of membership.)
+vgate_assert 22 serial-contains 'gotabwm: launcher exec GOEDIT.ELF'
 vgate_assert 22 serial-contains 'gotabwm: palette run move-to-space 2'
 vgate_assert 22 serial-contains 'gotabwm: space move id='
 # The summon chord: the absent app's named refusal, not silence.
@@ -3050,10 +3071,13 @@ vgate_assert 23 serial-contains 'gotabwm: session spaces n=2 cur=1'
 vgate_assert 23 serial-contains 'gotabwm: panes load n=0 spaces=2'
 vgate_assert 23 serial-contains 'gotabwm: session reexec n=3'
 vgate_assert 23 serial-contains 'gotabwm: session live n=3'
-vgate_assert 23 serial-contains 'gotabwm: rail n=3'
+# The rail names the live strip's count: space "1" restores its two rows
+# (GOCALC + NOTE), space "2" holds the moved row — records distribute by
+# group per ADR 0033 D17.
+vgate_assert 23 serial-contains 'gotabwm: rail n=2'
 vgate_assert 23 serial-contains ' space=1'
-# The restored table still switches: 1->2 lands on the empty space, 2->1
-# returns to the three restored rows.
+# The restored table still switches: 1->2 lands on the dormant space's
+# restored row, 2->1 returns to the two live rows.
 vgate_assert 23 serial-contains 'gotabwm: space switch 1->2'
 vgate_assert 23 serial-contains 'gotabwm: space switch 2->1'
 vgate_assert 23 serial-contains 'rx-gotabwm-spaces-restore-ok'
@@ -3771,6 +3795,7 @@ vf rm SESSION.TABS
 vf rm SESSION.PANES
 vf rm SNAPSHOT.BUNDLE
 vf rm SNAPSHOT.RESTORE
+vf mv GOEMOJI.TMP GOEMOJI.ELF
 wm
 exec GOTABWM.ELF
 EOF
