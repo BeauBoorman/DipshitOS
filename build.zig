@@ -2187,6 +2187,10 @@ pub fn build(b: *std.Build) void {
         "user/src/lib/script.zig",
         "user/src/lib/netauth.zig",
         "user/src/lib/crypto.zig",
+        // REVIEW-LOW L6 (#3057): the freestanding inflator's own test
+        // blocks had no runner — registering the module makes the dynamic
+        // -header refusal checks evidence rather than prose.
+        "user/src/lib/flate.zig",
         // M71i (#1568): user/src/lib/html/{parse,layout,url}.zig are deleted
         // with DOC.BIN — the modules' 21 host tests went with them, and the
         // surviving renderer's own suites (user/go/webrender: htmlparse,

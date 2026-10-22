@@ -328,6 +328,9 @@ func inflateDeflate(r *bitReader, out []byte) (int, error) {
 				return 0, err
 			}
 			hdist++
+			if hdist > 30 {
+				return 0, errInvalidHuffman // the distance alphabet is 30 codes
+			}
 			hclen, err := r.readBits(4)
 			if err != nil {
 				return 0, err

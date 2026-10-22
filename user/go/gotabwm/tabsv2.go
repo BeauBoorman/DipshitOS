@@ -271,20 +271,24 @@ func decodeAppStates(t []byte, recs []tabsV2Record) []string {
 		if idx < len(recs) && recs[idx].Title != "" {
 			name = recs[idx].Title
 		}
-		if idx >= len(recs) {
+		// A bad entry is named and skipped — the walk steps over its
+		// declared body so the next entry still parses. Only a body the
+		// buffer does not actually hold ends the walk.
+		switch {
+		case idx >= len(recs):
 			drops = append(drops, name+" orphan")
-			return drops
-		}
-		if ln > stateMaxBytes {
+		case ln > stateMaxBytes:
 			drops = append(drops, name+" oversize")
-			return drops
-		}
-		if len(t) < off+ln {
+		case len(t) < off+ln:
 			drops = append(drops, name+" truncated")
 			return drops
+		default:
+			recs[idx].State = append([]byte(nil), t[off:off+ln]...)
+			recs[idx].StateVer = ver
 		}
-		recs[idx].State = append([]byte(nil), t[off:off+ln]...)
-		recs[idx].StateVer = ver
+		if len(t) < off+ln {
+			return drops // the skipped entry's body outruns the buffer
+		}
 		off += ln
 	}
 	return drops

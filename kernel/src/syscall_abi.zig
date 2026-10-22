@@ -222,7 +222,9 @@ pub const variants = [_]Variant{
     variant(80, 0, 7, .{ .int, .fd }),
     variant(80, 0, 8, .{ .int, .int, .ptr, .int }),
     variant(80, 0, 9, .{ .int, .fd, .ptr, .int }),
+    variant(80, 0, 10, .{ .int, .int, .int }),
     variant(80, 0, 11, .{.int}),
+    variant(80, 0, 12, .{ .int, .ptr, .int }),
 };
 
 pub fn number(comptime name_in: []const u8) u64 {

@@ -206,5 +206,7 @@ var SyscallVariants = [...]SyscallVariant{
 	{80, 0, 7, 2, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgFD}}},
 	{80, 0, 8, 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{80, 0, 9, 4, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgFD}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{80, 0, 10, 3, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}}},
 	{80, 0, 11, 1, [6]SyscallArg{{Kind: ArgInt}}},
+	{80, 0, 12, 3, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 }

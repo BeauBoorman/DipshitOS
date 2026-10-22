@@ -16,13 +16,13 @@ import (
 // stateFixture swaps the protocol's seams for a fake /host filesystem and
 // a recorded-notice outbox, restoring every touched global on cleanup.
 type stateFixture struct {
-	files    map[string][]byte
-	deleted  []string
-	notices  []vi.WmRpc
-	logs     []string
-	drains   int
-	drainFn  func() int
-	yields   int
+	files   map[string][]byte
+	deleted []string
+	notices []vi.WmRpc
+	logs    []string
+	drains  int
+	drainFn func() int
+	yields  int
 }
 
 func (f *stateFixture) install(t *testing.T) {
@@ -430,9 +430,13 @@ func TestSessionStateRoundTripDrops(t *testing.T) {
 	raw3, _, _ := s.encodeTabsV2(1)
 	hdr := tabsV2HeaderBytes + 3*tabsV2RecordBytes
 	raw3[hdr+tabsV2AppStateHdr] = 99 // A's index -> 99
-	_, _, _, _, drops3, ok := decodeTabsV2(raw3)
+	_, recs3, _, _, drops3, ok := decodeTabsV2(raw3)
 	if !ok || len(drops3) != 1 || drops3[0] != "#99 orphan" {
 		t.Fatalf("orphan drops = %v ok=%v", drops3, ok)
+	}
+	// The orphan's declared body is stepped over — C's entry still parses.
+	if !bytes.Equal(recs3[2].State, []byte("blob-c")) || recs3[2].StateVer != 9 {
+		t.Fatal("orphan entry ate its sibling's blob")
 	}
 	// Foreign magic/version: the whole section is ignored, records decode.
 	raw4, _, _ := s.encodeTabsV2(1)

@@ -114,13 +114,29 @@ pub const HuffmanTree = struct {
     symbols: [288]u16 = @as([288]u16, @splat(@as(u16, 0))),
 
     pub fn build(self: *HuffmanTree, lengths: []const u8) InflateError!void {
+        if (lengths.len > self.symbols.len) return error.InvalidHuffmanTree;
         self.bl_count = @as([16]u16, @splat(@as(u16, 0)));
         for (lengths) |len| {
             if (len > 15) return error.InvalidHuffmanTree;
             if (len > 0) self.bl_count[len] += 1;
         }
 
-        // Check if tree is valid: sum of 2^(15-len) <= 2^15
+        // Check if tree is valid: the Kraft inequality — sum of
+        // 2^(15-len) <= 2^15, counted as the code space left at each
+        // depth. An oversubscribed tree cannot decode. RFC 1951 permits
+        // only the empty distance alphabet and a single one-bit code as
+        // INCOMPLETE trees; anything else is refused here too (the same
+        // boundary the Go port at user/go/flate holds).
+        var left: i32 = 1;
+        var max_bits: usize = 0;
+        var depth: usize = 1;
+        while (depth <= 15) : (depth += 1) {
+            left = left * 2 - @as(i32, self.bl_count[depth]);
+            if (left < 0) return error.InvalidHuffmanTree;
+            if (self.bl_count[depth] != 0) max_bits = depth;
+        }
+        if (left != 0 and max_bits > 1) return error.InvalidHuffmanTree;
+
         var code: u16 = 0;
         var bits: usize = 1;
         while (bits <= 15) : (bits += 1) {
@@ -251,8 +267,10 @@ pub fn inflate(in_bytes: []const u8, out_buf: []u8, raw: bool) InflateError!usiz
 
             try decode_block(&reader, &fixed_lit_tree.?, &fixed_dist_tree.?, out_buf, &out_pos);
         } else if (btype == 0b10) { // Dynamic Huffman
-            const hlit = (try reader.read_bits(5)) + 257; // 257..286
-            const hdist = (try reader.read_bits(5)) + 1; // 1..32
+            const hlit = (try reader.read_bits(5)) + 257; // 257..288 on the wire
+            if (hlit > 286) return error.InvalidHuffmanTree; // RFC 1951 §3.2.7 caps HLIT at 286
+            const hdist = (try reader.read_bits(5)) + 1; // 1..32 on the wire
+            if (hdist > 30) return error.InvalidHuffmanTree; // the distance alphabet is 30 codes
             const hclen = (try reader.read_bits(4)) + 4; // 4..19
 
             var code_len_lens = @as([19]u8, @splat(@as(u8, 0)));
@@ -302,6 +320,9 @@ pub fn inflate(in_bytes: []const u8, out_buf: []u8, raw: bool) InflateError!usiz
             }
 
             var dyn_lit_tree = HuffmanTree{};
+            // A block whose literal tree has no end-of-block code (256)
+            // can never terminate — refuse at the header, not mid-decode.
+            if (full_lens[256] == 0) return error.InvalidHuffmanTree;
             try dyn_lit_tree.build(full_lens[0..hlit]);
 
             var dyn_dist_tree = HuffmanTree{};
@@ -421,4 +442,32 @@ test "flate: invalid zlib header and adler mismatch" {
     @memcpy(&corrupt_adler, fixture_bytes);
     corrupt_adler[corrupt_adler.len - 1] ^= 0xFF; // Corrupt trailer
     try std.testing.expectError(error.Adler32Mismatch, inflate(&corrupt_adler, &out, false));
+}
+
+test "flate: dynamic header bounds — HLIT > 286 and HDIST > 30 refuse" {
+    var out: [128]u8 = undefined;
+    // BFINAL=1, BTYPE=10 (dynamic); the field carries HLIT-257, so a
+    // wire value of 30 declares 287 literals — past the RFC's 286 cap.
+    const too_many_lits = [_]u8{0xf5};
+    try std.testing.expectError(error.InvalidHuffmanTree, inflate(&too_many_lits, &out, true));
+    // HLIT=0 (257 lits), HDIST=31 on the wire -> 32 distances.
+    const too_many_dists = [_]u8{ 0x05, 0x1f };
+    try std.testing.expectError(error.InvalidHuffmanTree, inflate(&too_many_dists, &out, true));
+}
+
+test "flate: oversubscribed code-length tree refuses" {
+    var out: [128]u8 = undefined;
+    // Dynamic block; three code-length codes (16/17/18) all length 1 —
+    // the alphabet oversubscribes the 1-bit code space.
+    const oversub = [_]u8{ 0x05, 0x00, 0x92, 0x00 };
+    try std.testing.expectError(error.InvalidHuffmanTree, inflate(&oversub, &out, true));
+}
+
+test "flate: dynamic block with no end-of-block code refuses" {
+    var out: [128]u8 = undefined;
+    // A single-code CL alphabet (symbol 18) fills all 258 declared
+    // lengths with zero — literal tree legal (empty alphabet rules do
+    // not apply to literals) but symbol 256 has no code.
+    const no_eob = [_]u8{ 0x05, 0x00, 0x80, 0xc0, 0x5f, 0x1b };
+    try std.testing.expectError(error.InvalidHuffmanTree, inflate(&no_eob, &out, true));
 }

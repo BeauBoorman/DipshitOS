@@ -510,25 +510,24 @@ func hintsSession(ta *tabapp.TabApp, ts *termState, fd uint32, editor *shlib.Edi
 				switch {
 				case c == 0x1b && i+2 < n && in[i+1] == '[':
 					// A CSI sequence: scroll on arrows/Home/End/PgUp/PgDn.
-					fin := in[i+2]
-					i += 2
-					switch fin {
-					case 'A':
+					act, used := hintsCSI(in[i:])
+					if used == 0 {
+						used = 3 // an unrecognized CSI is still skipped whole
+					}
+					i += used - 1 // the loop's i++ covers the last byte
+					switch act {
+					case hintsUp:
 						h.Move(-1)
-					case 'B':
+					case hintsDown:
 						h.Move(1)
-					case 'H':
+					case hintsTop:
 						h.Scroll = 0
-					case 'F':
+					case hintsBottom:
 						h.Scroll = len(h.Rows) - 1
-					case '~':
-						// ESC [ 5 ~ / ESC [ 6 ~ — the digit is the byte
-						// before '~' when the sequence carries one.
-						if i-1 >= 0 && i < n && i-1 > 0 && in[i-1] == '5' {
-							h.Move(-(rows - 2))
-						} else {
-							h.Move(rows - 2)
-						}
+					case hintsPageUp:
+						h.Move(-(rows - 2))
+					case hintsPageDown:
+						h.Move(rows - 2)
 					}
 				case c == 0x1b || c == '?':
 					goto hintsDone
@@ -552,6 +551,47 @@ hintsDone:
 	writeTTY(ts, fd, []byte("\x1b[?1049l"))
 	writeTTY(ts, fd, editor.Repaint())
 	vi.ConsoleLine(markerHints + "close")
+}
+
+// The hints overlay's scroll actions, decoded by hintsCSI.
+const (
+	hintsNone = iota
+	hintsUp
+	hintsDown
+	hintsTop
+	hintsBottom
+	hintsPageUp
+	hintsPageDown
+)
+
+// hintsCSI maps the CSI sequence starting at in[0] (ESC [ …) onto a
+// scroll action and returns the sequence's byte length — 0 when the
+// bytes are not a sequence the overlay knows. The sequence's final byte
+// ENDS it: ESC [ 5 ~ puts the parameter '5' at in[2] and '~' at in[3]
+// (REVIEW-LOW L8 — the first version matched the parameter byte as the
+// final, which made PgUp/PgDn dead keys).
+func hintsCSI(in []byte) (act int, used int) {
+	if len(in) < 3 || in[0] != 0x1b || in[1] != '[' {
+		return hintsNone, 0
+	}
+	switch in[2] {
+	case 'A':
+		return hintsUp, 3
+	case 'B':
+		return hintsDown, 3
+	case 'H':
+		return hintsTop, 3
+	case 'F':
+		return hintsBottom, 3
+	case '5', '6':
+		if len(in) >= 4 && in[3] == '~' {
+			if in[2] == '5' {
+				return hintsPageUp, 4
+			}
+			return hintsPageDown, 4
+		}
+	}
+	return hintsNone, 0
 }
 
 func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
