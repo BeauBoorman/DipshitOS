@@ -581,7 +581,7 @@ func (a *app) toggleSidebar() {
 	// the last mover and wins the stack back.
 	vi.WinRaise(a.win)
 	a.render()
-	vi.Sleep(10)
+	vi.SleepNs(frameSettleNs)
 	a.render()
 	a.dirty = false
 	rows := a.sideVisible()

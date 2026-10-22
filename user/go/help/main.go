@@ -32,6 +32,23 @@ const (
 	ttyPath = "/dev/tty"
 )
 
+// Wait durations in nanoseconds (ADR 0060 audit): settles use the deadline
+// overlay (vi.SleepNs, slot 94) instead of guessed scheduler ticks.
+const (
+	ms = 1_000_000
+
+	// detailSettleNs gives the screenshot at `gohelp: detail` time to
+	// capture before the gate's close script tears the window down —
+	// "hundreds of ms" per the site comment; the 50-tick form was ~50 s.
+	detailSettleNs = 300 * ms
+	// paintSettleNs is the settle between a paint and the markers the gate
+	// snapshots on.
+	paintSettleNs = 250 * ms
+	// keyRepaintSettleNs is the settle between a key-driven repaint and the
+	// `gohelp: key`/`repaint` markers.
+	keyRepaintSettleNs = 200 * ms
+)
+
 // paint writes one frame into the bound tty. A tty write marks the window
 // dirty; callers yield once before their markers so the markers describe a
 // painted frame. A two-pane frame is many KiB and sys_file_write refuses
@@ -60,7 +77,7 @@ func settle(m *model) {
 		return
 	}
 	m.detailBatch = false
-	vi.Sleep(50) // hundreds of ms: the screenshot at the detail marker finishes first
+	vi.SleepNs(detailSettleNs)
 	vi.ConsoleLine(markerSettled)
 }
 
@@ -96,7 +113,7 @@ func main() {
 	if !paint(fd, m) {
 		shutdown(ta, fd, 4)
 	}
-	vi.Sleep(2)
+	vi.SleepNs(paintSettleNs)
 	vi.ConsoleLine(markerPainted)
 	flush(&m)
 	vi.ConsoleLine(markerPresent)
@@ -138,7 +155,7 @@ func main() {
 				if !paint(fd, m) {
 					shutdown(ta, fd, 4)
 				}
-				vi.Sleep(2)
+				vi.SleepNs(paintSettleNs)
 				flush(&m)
 				vi.ConsoleLine(markerResized + vi.Itoa64(int64(cols)) +
 					" h=" + vi.Itoa64(int64(rows)))
@@ -228,7 +245,7 @@ func onKey(m *model, fd uint32, ev keys.Event) bool {
 	if !paint(fd, *m) {
 		return false
 	}
-	vi.Sleep(1)
+	vi.SleepNs(keyRepaintSettleNs)
 	flush(m)
 	vi.ConsoleLine(markerKey + keyLabel(ev))
 	vi.ConsoleLine(markerRepaint)

@@ -59,6 +59,19 @@ const (
 	markerOK      = "rss OK"
 )
 
+// Wait durations in nanoseconds (ADR 0060 audit): settles use the deadline
+// overlay (vi.SleepNs, slot 94) instead of guessed scheduler ticks.
+const (
+	ms = 1_000_000
+
+	// presentSettleNs yields after a paint so the barrier markers only
+	// describe an already-presented frame.
+	presentSettleNs = 200 * ms
+	// keyRepaintSettleNs is the settle between a key-driven repaint and the
+	// `rss: key`/`repainted` markers.
+	keyRepaintSettleNs = 100 * ms
+)
+
 // viFileIO is the production store.FileIO: every write is atomic.
 type viFileIO struct{}
 
@@ -141,7 +154,7 @@ func main() {
 	if !paint(fd, m) {
 		shutdown(ta, fd, 4)
 	}
-	vi.Sleep(2)
+	vi.SleepNs(presentSettleNs)
 	vi.ConsoleLine(markerPainted)
 	vi.ConsoleLine(markerReady)
 
@@ -156,7 +169,7 @@ func main() {
 				if !paint(fd, m) {
 					shutdown(ta, fd, 4)
 				}
-				vi.Sleep(1)
+				vi.SleepNs(keyRepaintSettleNs)
 				vi.ConsoleLine(markerKey)
 				vi.ConsoleLine(markerRepaint)
 				if quit {

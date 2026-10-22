@@ -110,6 +110,19 @@ const (
 	viewTTY      = "/dev/tty"
 )
 
+// Wait durations in nanoseconds (ADR 0060 audit): settles use the deadline
+// overlay (vi.SleepNs, slot 94) instead of guessed scheduler ticks.
+const (
+	ms = 1_000_000
+
+	// presentSettleNs yields after a tty write so the markers below only
+	// ever describe an already-presented frame (the gate's barrier rule).
+	presentSettleNs = 200 * ms
+	// keyRepaintSettleNs is the settle between a key-driven repaint and the
+	// `godiff: key`/`view`/`repainted` markers.
+	keyRepaintSettleNs = 100 * ms
+)
+
 func viewShutdown(win int, fd uint32, status int) {
 	_, _ = vi.FileWrite(fd, []byte("\x1b[?1049l\x1b[?25h"))
 	_ = vi.TtyAttach(vi.TtyDetach)
@@ -190,7 +203,7 @@ func runInteractive(pathA, pathB string, ctx int) int {
 	}
 	// A tty write marks the window dirty; yield so the markers below only
 	// ever describe an already-presented frame (the gate's barrier rule).
-	vi.Sleep(2)
+	vi.SleepNs(presentSettleNs)
 	vi.ConsoleLine("godiff: painted")
 	vi.ConsoleLine("godiff: ready")
 
@@ -210,7 +223,7 @@ func runInteractive(pathA, pathB string, ctx int) int {
 		if !paint() {
 			viewShutdown(win, fd, 4)
 		}
-		vi.Sleep(1)
+		vi.SleepNs(keyRepaintSettleNs)
 		vi.ConsoleLine("godiff: key " + string(kb))
 		if kb == 's' {
 			v := "unified"

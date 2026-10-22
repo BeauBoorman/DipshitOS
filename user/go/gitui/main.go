@@ -22,6 +22,19 @@ const (
 	ttyPath = "/dev/tty"
 )
 
+// Wait durations in nanoseconds (ADR 0060 audit): settles use the deadline
+// overlay (vi.SleepNs, slot 94) instead of guessed scheduler ticks.
+const (
+	ms = 1_000_000
+
+	// presentSettleNs yields after a tty write so the barrier markers only
+	// describe an already-presented frame (the M72c gate contract).
+	presentSettleNs = 200 * ms
+	// keyRepaintSettleNs is the settle between a key-driven repaint and the
+	// `gitui: key`/`view`/`repainted` markers.
+	keyRepaintSettleNs = 100 * ms
+)
+
 // argvPad keeps the Go sbrk heap from overlapping the kernel's argv+envp
 // block (same GOFETCH/GOTGIT fix): this app reads vi.Args().
 var argvPad [4096]byte
@@ -131,7 +144,7 @@ func main() {
 	}
 	// Yield once before the barrier markers so they describe a painted
 	// frame (M72c gate contract).
-	vi.Sleep(2)
+	vi.SleepNs(presentSettleNs)
 	vi.ConsoleLine(markerPainted)
 	vi.ConsoleLine(markerReady)
 
@@ -147,7 +160,7 @@ func main() {
 		if !paint(fd, m) {
 			shutdown(ta, fd, 4)
 		}
-		vi.Sleep(1)
+		vi.SleepNs(keyRepaintSettleNs)
 		vi.ConsoleLine(markerKey + string([]byte{b}))
 		if b == '1' || b == '2' || b == '3' {
 			vi.ConsoleLine(markerView + viewName(m.view))
@@ -157,51 +170,51 @@ func main() {
 
 	// M73i SGR mouse FSM, byte-for-byte charmhello's: ESC [ < b ; x ; y M|m
 	// shares the tty with keys; non-mouse escapes flush as keys.
-	var ms []byte
+	var mouseTail []byte
 	var mouseB, mouseX, mouseY int
 	msWait, msMouse, msDrop := 0, 1, 2
 	msStep := func(b byte) int {
-		switch len(ms) {
+		switch len(mouseTail) {
 		case 0:
 			if b == 0x1b {
-				ms = append(ms, b)
+				mouseTail = append(mouseTail, b)
 				return msWait
 			}
 			return msDrop
 		case 1:
 			if b == '[' {
-				ms = append(ms, b)
+				mouseTail = append(mouseTail, b)
 				return msWait
 			}
-			ms = ms[:0]
+			mouseTail = mouseTail[:0]
 			return msDrop
 		case 2:
 			if b == '<' {
-				ms = append(ms, b)
+				mouseTail = append(mouseTail, b)
 				return msWait
 			}
-			ms = ms[:0]
+			mouseTail = mouseTail[:0]
 			return msDrop
 		default:
 			if (b >= '0' && b <= '9') || b == ';' {
-				if len(ms) >= 32 {
-					ms = ms[:0]
+				if len(mouseTail) >= 32 {
+					mouseTail = mouseTail[:0]
 					return msDrop
 				}
-				ms = append(ms, b)
+				mouseTail = append(mouseTail, b)
 				return msWait
 			}
 			if b == 'M' || b == 'm' {
-				ms = append(ms, b)
-				ok, btn, x, y := parseSGRMouse(ms)
-				ms = ms[:0]
+				mouseTail = append(mouseTail, b)
+				ok, btn, x, y := parseSGRMouse(mouseTail)
+				mouseTail = mouseTail[:0]
 				if ok {
 					mouseB, mouseX, mouseY = btn, x, y
 					return msMouse
 				}
 				return msDrop
 			}
-			ms = ms[:0]
+			mouseTail = mouseTail[:0]
 			return msDrop
 		}
 	}
@@ -223,7 +236,7 @@ func main() {
 		if !paint(fd, m) {
 			shutdown(ta, fd, 4)
 		}
-		vi.Sleep(2)
+		vi.SleepNs(presentSettleNs)
 		vi.ConsoleLine(markerView + viewName(m.view))
 		vi.ConsoleLine(markerRepaint)
 	}
@@ -233,7 +246,7 @@ func main() {
 		n, _ := vi.FileRead(fd, in[:])
 		if n > 0 {
 			for _, b := range in[:n] {
-				if len(ms) > 0 || b == 0x1b {
+				if len(mouseTail) > 0 || b == 0x1b {
 					switch msStep(b) {
 					case msWait:
 						continue
@@ -241,8 +254,8 @@ func main() {
 						handleMouse()
 						continue
 					}
-					pending := ms
-					ms = nil
+					pending := mouseTail
+					mouseTail = nil
 					for _, pb := range pending {
 						emitKey(pb)
 					}

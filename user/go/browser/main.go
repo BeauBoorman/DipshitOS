@@ -157,6 +157,22 @@ const (
 	readDeadlineMs = 30000
 )
 
+// Wait durations in nanoseconds (ADR 0060 audit): settles use the deadline
+// overlay (vi.SleepNs, slot 94) instead of guessed scheduler ticks.
+const (
+	ms = 1_000_000
+
+	// frameSettleNs gives the compositor time to pick up a presented frame
+	// before the app presents again or prints a gate marker — the observed
+	// fix for a first present after a blocking fetch leaving the scanout on
+	// the pre-paint buffer.
+	frameSettleNs = 300 * ms
+	// readyMarkerDrainNs is the drain between the snapshot marker and the
+	// ready marker, so the framebuffer stream can finish before the run
+	// ends.
+	readyMarkerDrainNs = 300 * ms
+)
+
 // HistoryPersistence is where visits are appended (inspectable text, one
 // "unix-seconds target" row per visit, after a schema line).
 const (
@@ -504,14 +520,14 @@ func main() {
 // immediately after a long blocking fetch could leave the scanout on the
 // pre-paint buffer, while the fill accounting showed every rect accepted.
 func (a *app) settleRepaint() {
-	vi.Sleep(30)
+	vi.SleepNs(frameSettleNs)
 	a.render()
 	vi.ConsoleLine(markerRepaint + itoa(itemsOf(a)) + " fills=" + itoa(a.lastFills))
 	// The gate snapshots on `web: repaint` and *exits* on `web: ready`; the
 	// two are deliberately different lines so the framebuffer stream has
 	// time to complete before the run ends (observed live: a shared marker
 	// let the runner shut down mid-stream and the snapshot never landed).
-	vi.Sleep(5)
+	vi.SleepNs(readyMarkerDrainNs)
 	vi.ConsoleLine(markerReady)
 }
 
@@ -642,17 +658,28 @@ func (a *app) loop() {
 				vi.ConsoleLine(markerPollErr + itoa64(raw))
 				a.loggedPoll = true
 			}
-			// Poll at ~10 Hz: the browser does not need finer input
-			// latency, and quiet tasks leave the shell's idle loop (which
-			// paces the composite and services the scanout snapshot) room
-			// to run on this single-user machine.
+			// While work is in flight, keep the short poll cadence: quiet
+			// tasks leave the shell's idle loop (which paces the composite
+			// and services the scanout snapshot) room to run on this
+			// single-user machine.
 			if a.loading || a.urlEditing || a.target == "" ||
 				(a.dl != nil && a.dl.active) {
 				vi.Sleep(1)
-			} else {
-				vi.Sleep(10)
+				continue
 			}
-			continue
+			// Idle: wait on the event queue itself rather than a guessed
+			// settle (ADR 0060 audit) — a pushed event wakes the loop on
+			// arrival, so input no longer waits up to ~10 ticks between
+			// polls. The WM-mailbox polls above still run once per pass
+			// whenever an event lands; an unanswered save ask degrades per
+			// the seat's own ask budget, not as an error. A refused wait
+			// falls back to the tick sleep so the loop can never spin.
+			ev, raw = vi.WaitEvent()
+			if raw <= 0 {
+				vi.Sleep(1)
+				continue
+			}
+			ok = true
 		}
 		a.events++
 		if a.events <= 8 {
@@ -1546,7 +1573,7 @@ func (a *app) announceNavigation() {
 	// present immediately after a blocking fetch can be composited late, so a
 	// marker printed right after it would still describe the previous frame.
 	a.render()
-	vi.Sleep(10)
+	vi.SleepNs(frameSettleNs)
 	a.render()
 	a.dirty = false
 	a.navCount++
@@ -1555,7 +1582,7 @@ func (a *app) announceNavigation() {
 	// A navigation gets its own settle marker: the gate snapshots on
 	// `web: navigated` and exits on this line, so the framebuffer stream is
 	// never cut off by the run ending (same reason as markerReady).
-	vi.Sleep(5)
+	vi.SleepNs(readyMarkerDrainNs)
 	vi.ConsoleLine(markerNavReady + " n=" + itoa(a.navCount))
 }
 

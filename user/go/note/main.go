@@ -115,10 +115,15 @@ const (
 	markerOpenErr     = "note: error open "
 )
 
-// settleTicks is how long the app lets the compositor run before it declares
-// itself settled, mirroring the Zig app's sleep_ticks(2) at the same point. It
-// is the same sys_sleep row, so these are scheduler ticks in both apps.
-const settleTicks = 2
+// settleNs is how long the app lets the compositor run before it declares
+// itself settled, mirroring the Zig app's sleep_ticks(2) at the same point.
+// M170c: a named duration on the deadline overlay (vi.SleepNs) instead of a
+// ~2-tick guess.
+const (
+	ms = 1_000_000
+
+	settleNs = 250 * ms
+)
 
 // Frame geometry and the palette, both matching GOEDIT's frame so the two text
 // apps look like the same desktop.
@@ -220,7 +225,7 @@ func main() {
 	vi.ConsoleLine(markerReady)
 	// settled means the compositor has had a chance to pick that frame up, which
 	// is what the snapshot gates wait on.
-	vi.Sleep(settleTicks)
+	vi.SleepNs(settleNs)
 	vi.ConsoleLine(markerSettled)
 	vi.ConsoleLine(a.cursorMarker())
 
