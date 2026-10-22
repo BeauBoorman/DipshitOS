@@ -833,3 +833,38 @@ vgate_assert 08 serial-contains 'top: ready'
 vgate_assert 08 serial-contains 'top: profile name=prof base=base.img rollback=yes snaps=2'
 vgate_assert 08 serial-absent 'top: profile refused'
 vgate_assert 08 serial-absent '[EXC] parking:'
+
+
+# --- Run 09 (M160b #2990): the mounts tab carries real free space -----------
+#
+# `m` switches to the mounts tab; its per-row serial dump now ends in
+# `free=<bytes|->`. The host row must carry a NUMERIC free — the slot-37
+# STATFS answer, not the pre-M160b EINVAL painted as `-`.
+vgate_file script9.txt <<'EOS'
+exec GOTOP.ELF
+EOS
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen' \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script9.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --input-string 'm' \
+    --input-string-after 'top: ready' \
+    --script-expect 'top: mount host' --timeout 120
+
+vgate_assert 09 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 09 serial-contains 'top: ready'
+vgate_assert 09 serial-contains 'top: tab=mounts'
+vgate_assert 09 serial-contains 'top: mounts n='
+vgate_assert 09 serial-contains 'top: mount host'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"top: mount host state=\S+ kind=\S+ flags=\S+ free=(\d+)", ser)
+if not m:
+    sys.exit("FAIL: no numeric free= on the host mount row: %r"
+             % ([l for l in ser.splitlines() if "top: mount host" in l],))
+print("gotop mounts free=%d" % int(m.group(1)))
+PY

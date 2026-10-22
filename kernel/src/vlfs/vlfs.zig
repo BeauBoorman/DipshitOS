@@ -1183,11 +1183,89 @@ pub const Stat = struct {
     size: u32,
     mtime: u64,
     ctime: u64,
+    /// M160b (#2990): blocks the inode's extent list claims — the inline
+    /// extents, every chained entry, and the chain blocks themselves
+    /// (they are blocks the file allocated). The op-15 "allocated bytes"
+    /// fact is this count times block_len.
+    alloc_blocks: u64,
 };
 
 pub fn stat(src: SectorSource, vol: Volume, ino: u32, scratch: *[block_len]u8) Error!Stat {
     const rec = try readInode(src, vol, ino, scratch);
-    return .{ .ino = ino, .kind = rec.kind, .size = rec.size, .mtime = rec.mtime, .ctime = rec.ctime };
+    const alloc = try extentCoverage(src, vol, rec, scratch);
+    return .{ .ino = ino, .kind = rec.kind, .size = rec.size, .mtime = rec.mtime, .ctime = rec.ctime, .alloc_blocks = alloc };
+}
+
+/// M160b (#2990): the blocks one inode's extent list claims — inline
+/// extents, chained entries, and each live chain block. The walk is the
+/// read path's own bound (max_extent_blocks) with the mount check's
+/// invariants enforced on the way: an out-of-range extent or a corrupt
+/// chain block refuses rather than mis-counts.
+fn extentCoverage(src: SectorSource, vol: Volume, rec: Inode, scratch: *[block_len]u8) Error!u64 {
+    var total: u64 = 0;
+    for (rec.extents[0..rec.nextents]) |e| {
+        if (e.first < vol.data_first or e.count == 0 or
+            @as(u64, e.first) + e.count > vol.volume_blocks) return error.BadExtent;
+        total += e.count;
+    }
+    var chain = rec.next_extent_block;
+    var depth: u32 = 0;
+    while (chain != 0) {
+        if (depth >= max_extent_blocks) return error.ExtentChainCorrupt;
+        depth += 1;
+        if (chain < vol.data_first or chain >= vol.volume_blocks) return error.ExtentChainCorrupt;
+        total += 1; // the chain block itself is claimed by the file
+        if (!src.readBlock(chain, scratch)) return error.Io;
+        if (rd32(scratch, xb_magic) != magic_extent or
+            rd16(scratch, xb_resv) != 0 or
+            rd32(scratch, xb_cksum) != fnv32(scratch[0..xb_cksum])) return error.ExtentChainCorrupt;
+        const cnt = rd16(scratch, xb_count);
+        if (cnt > extents_per_block) return error.ExtentChainCorrupt;
+        for (0..cnt) |e| {
+            const first = rd32(scratch, xb_extents + e * 8);
+            const count = rd32(scratch, xb_extents + e * 8 + 4);
+            if (first < vol.data_first or count == 0 or
+                @as(u64, first) + count > vol.volume_blocks) return error.BadExtent;
+            total += count;
+        }
+        chain = rd32(scratch, xb_next);
+    }
+    return total;
+}
+
+/// M160b (#2990): the clear bits of a block-bitmap span — bit indexes
+/// [first_bit, first_bit + bits) inside `map`. The pure half of the
+/// free-space count, bounded by the caller's bit range so the map's
+/// tail-byte padding never counts as free space.
+pub fn countFreeBits(map: []const u8, first_bit: u32, bits: u32) u64 {
+    var free: u64 = 0;
+    var i: u32 = 0;
+    while (i < bits) : (i += 1) {
+        if (!bitmapBit(map, first_bit + i)) free += 1;
+    }
+    return free;
+}
+
+/// M160b (#2990): free data blocks on the volume the source carries —
+/// the chosen superblock's geometry, then the bbitmap's clear bits in
+/// [data_first, volume_blocks), one map block at a time. Read-only and
+/// never replayed: D4's boundary rule means a free-space query only ever
+/// runs when the journal is empty, so the on-disk bbitmap is already the
+/// committed truth.
+pub fn freeDataBlocks(src: SectorSource, scratch: *[block_len]u8) Error!u64 {
+    const sb = try selectSuperblock(src);
+    var free: u64 = 0;
+    var b = sb.data_first;
+    while (b < sb.volume_blocks) {
+        const idx = b / bits_per_map_block;
+        if (idx >= sb.bbitmap_blocks) return error.GeometryMismatch;
+        if (!src.readBlock(sb.bbitmap_first + idx, scratch)) return error.Io;
+        const in_map = b % bits_per_map_block;
+        const run = @min(sb.volume_blocks - b, bits_per_map_block - in_map);
+        free += countFreeBits(scratch, in_map, run);
+        b += run;
+    }
+    return free;
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1452,43 @@ test "vlfs: populated golden — lookup, read, sorted readdir, tombstone" {
 }
 
 const BlockLenLiteral: usize = 4096;
+
+test "vlfs: M160b — free-block count over the bbitmap and per-file allocated blocks" {
+    // countFreeBits is the pure half: pin it on a hand-made map — the
+    // LSB-first bit order, a mid-map window, and the empty range.
+    var map = [_]u8{ 0b0000_0101, 0xFF, 0x00, 0x80 };
+    try std.testing.expectEqual(@as(u64, 21), countFreeBits(&map, 0, 32));
+    try std.testing.expectEqual(@as(u64, 4), countFreeBits(&map, 4, 8));
+    try std.testing.expectEqual(@as(u64, 0), countFreeBits(&map, 8, 8));
+
+    try buildImage(populated_regions, &image_buf);
+    var disk = MemDisk{ .img = &image_buf };
+    const src = disk.ro();
+    const vol = try mount(src, &test_scratch);
+
+    // The device-level count agrees with an independent popcount of the
+    // fixture's bbitmap region over exactly the data range — the
+    // structural blocks are all marked and never reach the answer.
+    var want_used: u64 = 0;
+    var b: u32 = vol.data_first;
+    while (b < vol.volume_blocks) : (b += 1) {
+        const byte = image_buf[@as(usize, vol.bbitmap_first) * block_len + b / 8];
+        if (byte & (@as(u8, 1) << @intCast(b % 8)) != 0) want_used += 1;
+    }
+    const want_free = @as(u64, vol.volume_blocks - vol.data_first) - want_used;
+    const free = try freeDataBlocks(src, &test_scratch);
+    try std.testing.expectEqual(want_free, free);
+    try std.testing.expect(free > 0 and free < vol.data_blocks);
+
+    // Per-file coverage: CHAINED.BIN claims 10 data blocks plus the VXEB
+    // chain block itself (11); APPLE.TXT's 4113 bytes span two blocks.
+    const chained = try lookup(src, vol, "CHAINED.BIN", &test_scratch);
+    const cst = try stat(src, vol, chained.inode, &test_scratch);
+    try std.testing.expectEqual(@as(u64, 11), cst.alloc_blocks);
+    const apple = try lookup(src, vol, "APPLE.TXT", &test_scratch);
+    const ast = try stat(src, vol, apple.inode, &test_scratch);
+    try std.testing.expectEqual(@as(u64, 2), ast.alloc_blocks);
+}
 
 test "vlfs: torn newest superblock falls back to the older copy" {
     try buildImage(empty_regions, &image_buf);

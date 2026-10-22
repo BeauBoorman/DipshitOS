@@ -397,3 +397,80 @@ func TestListDirAtV2NotReachedOnMeta(t *testing.T) {
 		t.Fatal("the legacy protocol ran under a working slot-79")
 	}
 }
+
+// M160b (#2990): the listing decodes the slot-79 record's ctime, and
+// StatFacts round-trips the 32-byte op-15 record with its flags.
+func TestDirPageDecodesCtime(t *testing.T) {
+	k := &fakeMetaKernel{
+		pageErrAt: -1,
+		entries:   []DirItem{{Name: "A.TXT", Size: 7}},
+		mutate: func(p *dirPageWire, n int64) int64 {
+			putU64le(p.entries[0].meta[metaCtimeSecOff:], 1_700_000_999)
+			putU32(p.entries[0].meta[metaCtimeNsecOff:], 42)
+			return n
+		},
+	}
+	defer installMetaKernel(k)()
+	items, err := ListDirAt("/")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("ListDirAt = %v, %v", items, err)
+	}
+	if items[0].CtimeSec != 1_700_000_999 || items[0].CtimeNsec != 42 {
+		t.Fatalf("ctime = %d.%d", items[0].CtimeSec, items[0].CtimeNsec)
+	}
+}
+
+func TestStatFactsRoundTrip(t *testing.T) {
+	var gotRoot, gotRel string
+	defer installFactsHook(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		if num != SlotFsMetadata || a0 != metaFactsOp {
+			return -ErrENOSYS
+		}
+		gotRoot = unsafe.String((*byte)(unsafe.Pointer(a1)), int(a2))
+		gotRel = unsafe.String((*byte)(unsafe.Pointer(a3)), int(a4))
+		w := (*[factsWireLen]byte)(unsafe.Pointer(a5))
+		putU32(w[factsFlagsOff:], factHasBirth|factHasAlloc)
+		putU64le(w[factsBirthSecOff:], 1_700_000_111)
+		putU32(w[factsBirthSecOff+8:], 77)
+		putU64le(w[factsAllocOff:], 8192)
+		return 0
+	})()
+	f, err := StatFacts("/host/pinned-mtime.txt")
+	if err != nil {
+		t.Fatalf("StatFacts err = %v", err)
+	}
+	if gotRoot != "/host" || gotRel != "pinned-mtime.txt" {
+		t.Fatalf("root/rel = %q %q", gotRoot, gotRel)
+	}
+	if !f.HasBirth || f.BirthSec != 1_700_000_111 || f.BirthNsec != 77 {
+		t.Fatalf("birth = %v %d.%d", f.HasBirth, f.BirthSec, f.BirthNsec)
+	}
+	if !f.HasAlloc || f.Alloc != 8192 {
+		t.Fatalf("alloc = %v %d", f.HasAlloc, f.Alloc)
+	}
+}
+
+func TestStatFactsRefusalsAndAbsentFlags(t *testing.T) {
+	// Kernel refusal rides through as its errno.
+	defer installFactsHook(func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
+		if a1 == 0 {
+			return -ErrENOENT
+		}
+		// The all-absent record: flags clear, fields zero.
+		return 0
+	})()
+	f, err := StatFacts("/disk/M134D.TXT")
+	if err != nil || f.HasBirth || f.HasAlloc {
+		t.Fatalf("disk facts = %+v, %v", f, err)
+	}
+	if _, err := StatFacts("relative/path"); !errors.Is(err, errno(ErrEINVAL)) {
+		t.Fatalf("bad path err = %v", err)
+	}
+}
+
+// installFactsHook installs a six-argument gateway and returns a
+// niladic restore for defer (the hook type is not deferrable directly).
+func installFactsHook(fn func(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64) func() {
+	prev := SetSyscallHook6ForTest(fn)
+	return func() { SetSyscallHook6ForTest(prev) }
+}

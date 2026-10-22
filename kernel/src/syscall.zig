@@ -2162,11 +2162,14 @@ fn handle_fs_metadata(args: Args, _: *exceptions.VectorFrame) u64 {
         if (args[2] != 0 or args[3] != 0 or args[4] != 0 or args[5] != 0) return error_result(.einval);
         return @bitCast(file_table.dir_close(pid, args[1]));
     }
-    if (args[0] > meta.dir_open_op and args[0] != meta.pin_open_op) return error_result(.einval);
+    // M160b (#2990): op 15 rides the stat-shaped form — path in, a
+    // 32-byte facts record out through x5 — so it escapes both the
+    // open-only ops ceiling and the no-out-pointer check below.
+    if (args[0] > meta.dir_open_op and args[0] != meta.pin_open_op and args[0] != meta.facts_op) return error_result(.einval);
     if (args[2] == 0) return error_result(.einval);
     if (args[2] > meta.max_guest_path or args[4] > meta.max_relative_path)
         return error_result(.enametoolong);
-    if (args[0] >= meta.read_open_op and args[5] != 0) return error_result(.einval);
+    if (args[0] >= meta.read_open_op and args[0] != meta.facts_op and args[5] != 0) return error_result(.einval);
     var root: [meta.max_guest_path]u8 = undefined;
     var relative: [meta.max_relative_path]u8 = undefined;
     if (uaccess.copy_in(&root, args[1], @intCast(args[2])) != .ok) return error_result(.efault);
@@ -2179,6 +2182,14 @@ fn handle_fs_metadata(args: Args, _: *exceptions.VectorFrame) u64 {
             const rc = file_table.metadata_at(pid, root_path, path, args[0] == meta.identity_op, &value);
             if (rc < 0) break :blk rc;
             const bytes = if (args[0] == meta.identity_op) std.mem.asBytes(&value.identity) else std.mem.asBytes(&value);
+            if (uaccess.copy_out(args[5], bytes, bytes.len) != .ok) return error_result(.efault);
+            break :blk 0;
+        },
+        meta.facts_op => blk: {
+            var facts: meta.Facts = .{};
+            const rc = file_table.metadata_facts(pid, root_path, path, &facts);
+            if (rc < 0) break :blk rc;
+            const bytes = std.mem.asBytes(&facts);
             if (uaccess.copy_out(args[5], bytes, bytes.len) != .ok) return error_result(.efault);
             break :blk 0;
         },

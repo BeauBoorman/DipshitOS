@@ -203,6 +203,11 @@ pub const create_op: u64 = 11;
 pub const mkdir_op: u64 = 12;
 pub const remove_op: u64 = 13;
 pub const rename_op: u64 = 14;
+/// M160b (#2990): op 15 — per-file facts the op-0 Wire record has no
+/// fields for: birth time and allocated (on-disk) bytes. Same argument
+/// shape as stat_op: (15, root_ptr, root_len, relative_ptr,
+/// relative_len, out_ptr) with the 32-byte Facts record at out_ptr.
+pub const facts_op: u64 = 15;
 pub const handle_file: u64 = 0;
 pub const handle_directory: u64 = 1;
 pub const remove_file: u64 = 0;
@@ -252,6 +257,23 @@ pub const Wire = extern struct {
         };
     }
 };
+
+/// M160b (#2990): the op-15 wire record — 32 bytes of presence-flagged
+/// per-file facts. A set `flags` bit names a present fact; an absent
+/// fact clears its flag and leaves the field zero, never a fabricated
+/// timestamp or size.
+pub const fact_has_birth: u32 = 1;
+pub const fact_has_alloc: u32 = 2;
+
+pub const Facts = extern struct {
+    flags: u32 = 0,
+    reserved: u32 = 0,
+    birth: WireTime = .{ .seconds = 0, .nanoseconds = 0 },
+    alloc_bytes: u64 = 0,
+};
+comptime {
+    if (@sizeOf(Facts) != 32) @compileError("M160b facts wire layout changed");
+}
 
 pub const Entry = extern struct {
     name: [256]u8 = @splat(0),

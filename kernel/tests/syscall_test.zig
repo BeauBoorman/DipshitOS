@@ -2130,7 +2130,7 @@ test "B5 EL0: malformed registers faults limits and revocation refuse before bac
         .{ meta.rename_op, dir, name, dir, to, one | 1 << 33 },
         .{ meta.rename_op, dir, name, dir, to, 1 },
         .{ meta.pin_open_op, r, 13, p, 1, name },
-        .{ meta.rename_op + 1, dir, name, 1, 0, 0 },
+        .{ meta.facts_op + 1, dir, name, 1, 0, 0 },
     }) |args| try std.testing.expectEqual(error_result(.einval), dispatch(79, args, &c.frame));
     try std.testing.expectEqual(error_result(.enametoolong), dispatch(79, .{ meta.create_op, dir, name, 256, 0, 0 }, &c.frame));
     try std.testing.expectEqual(error_result(.enametoolong), dispatch(79, .{ meta.rename_op, dir, name, dir, to, 256 | 1 << 16 }, &c.frame));

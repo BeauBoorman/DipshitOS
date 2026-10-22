@@ -67,18 +67,26 @@ type dirPageWire struct {
 }
 
 // The 96-byte metadata.Wire offsets the listing needs (fs_metadata.zig's
-// field order: version u32, kind u32, identity[16], size u64, ...).
+// field order: version u32, kind u32, identity[16], size u64, atime[16],
+// mtime[16], ctime[16], ...). M160b decodes ctime: epoch seconds at 64,
+// nanoseconds at 72.
 const (
-	metaKindOff = 4
-	metaSizeOff = 24
+	metaKindOff      = 4
+	metaSizeOff      = 24
+	metaCtimeSecOff  = 64
+	metaCtimeNsecOff = 72
 )
 
-// DirItem is one listing row: the name plus the two metadata fields a
+// DirItem is one listing row: the name plus the metadata fields a
 // caller needs. The rest of the wire record stays inside the page.
+// Ctime is the change time the slot-79 record carries (the M160a v3
+// STAT); the legacy slot-27/USB listings carry none and leave it zero.
 type DirItem struct {
-	Name  string
-	IsDir bool
-	Size  uint64
+	Name      string
+	IsDir     bool
+	Size      uint64
+	CtimeSec  int64
+	CtimeNsec uint32
 }
 
 // ErrTreeLimit is the named refusal for a directory too large to list
@@ -141,9 +149,11 @@ func dirPages(token uint64) ([]DirItem, int64) {
 				return nil, -ErrEINVAL
 			}
 			items = append(items, DirItem{
-				Name:  string(e.name[:e.nameLen]),
-				IsDir: binary.LittleEndian.Uint32(e.meta[metaKindOff:]) == metaKindDir,
-				Size:  binary.LittleEndian.Uint64(e.meta[metaSizeOff:]),
+				Name:      string(e.name[:e.nameLen]),
+				IsDir:     binary.LittleEndian.Uint32(e.meta[metaKindOff:]) == metaKindDir,
+				Size:      binary.LittleEndian.Uint64(e.meta[metaSizeOff:]),
+				CtimeSec:  int64(binary.LittleEndian.Uint64(e.meta[metaCtimeSecOff:])),
+				CtimeNsec: binary.LittleEndian.Uint32(e.meta[metaCtimeNsecOff:]),
 			})
 		}
 		if page.end == 1 {
@@ -309,4 +319,66 @@ func usbDirList(dir string) ([]DirItem, error) {
 		})
 	}
 	return items, nil
+}
+
+// --- slot-79 op 15: per-file facts (M160b, issue #2990) --------------------
+//
+// The op-0 Wire record has no fields for birth time or allocated bytes;
+// op 15 carries them in a 32-byte presence-flagged record
+// (kernel/src/fs_metadata.zig Facts). /host answers from the channel's
+// decoded STAT v3, /disk from the VLFS inode (allocated blocks, never a
+// birth). An absent fact keeps its cleared flag and zero value.
+
+const metaFactsOp uintptr = 15
+
+// The 32-byte Facts record: [flags u32][reserved u32][birth_sec i64]
+// [birth_nsec u32][birth_reserved u32][alloc_bytes u64].
+const (
+	factsFlagsOff    = 0
+	factsBirthSecOff = 8
+	factsAllocOff    = 24
+	factHasBirth     = 1
+	factHasAlloc     = 2
+	factsWireLen     = 32
+)
+
+// FileFacts is the decoded op-15 record: birth time and allocated
+// (on-disk) bytes, each named present or absent.
+type FileFacts struct {
+	HasBirth  bool
+	BirthSec  int64
+	BirthNsec uint32
+	HasAlloc  bool
+	Alloc     uint64
+}
+
+// StatFacts returns the op-15 facts for path — a "/host" or "/disk"
+// rooted name split at the last '/' into the ABI's (root, relative)
+// pair. The kernel's own refusals arrive as their errno (an unmounted
+// /disk is the metadata surface's -4, a missing name ENOENT); a path
+// outside the two volume roots is EINVAL here.
+func StatFacts(path string) (FileFacts, error) {
+	var f FileFacts
+	root, rel := path, ""
+	if i := strings.LastIndexByte(path, '/'); i > 0 {
+		root, rel = path[:i], path[i+1:]
+	}
+	if root != "/host" && root != "/disk" && !strings.HasPrefix(root, "/host/") && !strings.HasPrefix(root, "/disk/") {
+		return f, errno(ErrEINVAL)
+	}
+	var wire [factsWireLen]byte
+	rc := svc6(SlotFsMetadata, metaFactsOp,
+		strPtr(root), uintptr(len(root)),
+		strPtr(rel), uintptr(len(rel)),
+		uintptr(unsafe.Pointer(&wire)))
+	if rc < 0 {
+		return f, errno(-rc)
+	}
+	flags := binary.LittleEndian.Uint32(wire[factsFlagsOff:])
+	f.HasBirth = flags&factHasBirth != 0
+	f.BirthSec = int64(binary.LittleEndian.Uint64(wire[factsBirthSecOff:]))
+	f.BirthNsec = binary.LittleEndian.Uint32(wire[factsBirthSecOff+8:])
+	f.HasAlloc = flags&factHasAlloc != 0
+	f.Alloc = binary.LittleEndian.Uint64(wire[factsAllocOff:])
+	return f, nil
 }

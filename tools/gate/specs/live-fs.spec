@@ -172,6 +172,19 @@ fn emitLine() void {
 
 var wire: [96]u8 align(8) = @splat(0);
 var mrows: [16 * 40]u8 align(8) = @splat(0);
+var facts: [32]u8 align(8) = @splat(0);
+
+// M160b: one slot-79 op-15 facts record — flags[0] birth, flags[1]
+// alloc; absent facts print `?` alongside their cleared flag.
+fn emitFacts() void {
+    const flags = @as(u32, facts[0]) | @as(u32, facts[1]) << 8 |
+        @as(u32, facts[2]) << 16 | @as(u32, facts[3]) << 24;
+    puts("alloc=");
+    if (flags & 2 != 0) pnum(u64le(facts[24..32])) else puts("?");
+    puts(" birth=");
+    if (flags & 1 != 0) pnum(u64le(facts[8..16])) else puts("?");
+    puts("\n");
+}
 
 export fn _start() void {
     const rc = svc6(79, 0, @intFromPtr("/host"), 5, @intFromPtr("pinned-mtime.txt"), 16, @intFromPtr(&wire));
@@ -215,6 +228,46 @@ export fn _start() void {
             push("\n");
             emitLine();
         }
+    }
+    // M160b: slot 37 per mount row — 0 host, 1 disk (ENOENT unmounted).
+    const hf = svc6(37, 0, 0, 0, 0, 0, 0);
+    const df = svc6(37, 1, 0, 0, 0, 0, 0);
+    puts("m134d-free host=");
+    if (hf < 0) {
+        puts("rc=-");
+        pnum(@bitCast(-hf));
+    } else {
+        pnum(@intCast(hf));
+    }
+    puts(" disk=");
+    if (df == -6) {
+        puts("ENOENT");
+    } else if (df < 0) {
+        puts("rc=-");
+        pnum(@bitCast(-df));
+    } else {
+        pnum(@intCast(df));
+    }
+    puts("\n");
+    // M160b: slot-79 op 15 — /host's STAT v3 birth+alloc, /disk's inode
+    // alloc (no birth). The staged M134D.TXT is the mounted leg's file.
+    const frc = svc6(79, 15, @intFromPtr("/host"), 5, @intFromPtr("pinned-mtime.txt"), 16, @intFromPtr(&facts));
+    puts("m134d-facts ");
+    if (frc < 0) {
+        puts("rc=-");
+        pnum(@bitCast(-frc));
+        puts("\n");
+    } else {
+        emitFacts();
+    }
+    const drc = svc6(79, 15, @intFromPtr("/disk"), 5, @intFromPtr("M134D.TXT"), 9, @intFromPtr(&facts));
+    puts("m134d-dfacts ");
+    if (drc < 0) {
+        puts("rc=-");
+        pnum(@bitCast(-drc));
+        puts("\n");
+    } else {
+        emitFacts();
     }
     puts("m134d-done\n");
     _ = svc6(3, 0, 0, 0, 0, 0, 0);
@@ -339,6 +392,34 @@ if guest != host:
     sys.exit("FAIL: guest ctime_sec=%d != host st_ctime=%d" % (guest, host))
 print("m134d ctime_sec=%d == host st_ctime" % guest)
 PY
+# M160b (#2990): slot 37 answers per row — the share's STATFS avail on
+# the host row (within 64 MiB of the host's own statvfs, read in the same
+# step) and ENOENT on the never-mounted disk row. Op 15 answers the host
+# file's birth+alloc; /disk's op-15 surface names its refusal.
+vgate_assert absent serial-contains 'm134d-free host='
+vgate_assert absent serial-contains 'disk=ENOENT'
+vgate_assert absent serial-contains 'm134d-facts alloc='
+vgate_assert absent serial-contains 'm134d-dfacts rc=-4'
+vgate_assert absent python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], "rb").read()
+m = re.search(rb"m134d-free host=(\d+) disk=ENOENT", ser)
+if not m:
+    sys.exit("FAIL: no m134d-free line on serial")
+guest = int(m.group(1))
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+v = os.statvfs(share)
+host = v.f_bavail * v.f_frsize
+if abs(guest - host) > 64 * 1024 * 1024:
+    sys.exit("FAIL: guest host free=%d not within 64 MiB of statvfs %d" % (guest, host))
+f = re.search(rb"m134d-facts alloc=(\d+) birth=(\d+)", ser)
+if not f:
+    sys.exit("FAIL: no m134d-facts birth/alloc on serial")
+if int(f.group(1)) < 7:
+    sys.exit("FAIL: host alloc=%d below the staged file's size" % int(f.group(1)))
+print("m134d free host=%d within 64 MiB of statvfs %d; facts alloc=%d birth=%d"
+      % (guest, host, int(f.group(1)), int(f.group(2))))
+PY
 
 # --- leg mounted: /disk opted in — journaled write, read-back, FLUSH -------
 vgate_run mounted -- --data-disk '$RUN_DIR/vlfs.img' --script '$RUN_DIR/script-mounted.txt' --script-expect 'm134d-done' --timeout 90
@@ -353,6 +434,28 @@ vgate_assert mounted serial-contains 'm134d-mount disk mounted vlfs rw'
 vgate_assert mounted serial-contains 'm134d-mount host mounted share rw'
 vgate_assert mounted serial-contains 'm134d-done'
 vgate_assert mounted serial-absent '[EXC] parking:'
+# M160b (#2990): the disk row answers from the mounted volume's bbitmap —
+# positive and below the 16 MiB fixture size — and op 15 reads the VLFS
+# inode's allocated blocks for the staged file (24 bytes → one block).
+vgate_assert mounted serial-contains 'm134d-free host='
+vgate_assert mounted serial-contains 'm134d-facts alloc='
+vgate_assert mounted serial-contains 'm134d-dfacts alloc='
+vgate_assert mounted python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], "rb").read()
+m = re.search(rb"m134d-free host=\d+ disk=(\d+)", ser)
+if not m:
+    sys.exit("FAIL: no numeric m134d-free disk= on serial")
+disk = int(m.group(1))
+if disk <= 0 or disk >= 16 * 1024 * 1024:
+    sys.exit("FAIL: disk free=%d outside (0, 16 MiB)" % disk)
+f = re.search(rb"m134d-dfacts alloc=(\d+) birth=", ser)
+if not f:
+    sys.exit("FAIL: no m134d-dfacts alloc= on serial")
+if int(f.group(1)) < 24:
+    sys.exit("FAIL: disk alloc=%d below the staged file's 24 bytes" % int(f.group(1)))
+print("m134d free disk=%d (< 16 MiB); dfacts alloc=%d" % (disk, int(f.group(1))))
+PY
 
 # --- leg corrupt: the M134c mount-time check refuses by name ---------------
 vgate_run corrupt -- --data-disk '$RUN_DIR/corrupt.img' --script '$RUN_DIR/script-corrupt.txt' --script-expect 'm134d-done' --timeout 90
@@ -364,3 +467,6 @@ vgate_assert corrupt serial-contains 'vf cat: disk:M134D.TXT: not_mounted'
 vgate_assert corrupt serial-contains 'm134d-mount disk not_mounted vlfs rw'
 vgate_assert corrupt serial-contains 'm134d-done'
 vgate_assert corrupt serial-absent '[EXC] parking:'
+# M160b (#2990): a refused mount is still the ENOENT row — never a number.
+vgate_assert corrupt serial-contains 'disk=ENOENT'
+vgate_assert corrupt serial-contains 'm134d-dfacts rc=-4'

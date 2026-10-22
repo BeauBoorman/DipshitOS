@@ -803,6 +803,58 @@ pub fn metadata_at(pid: u64, root_bytes: []const u8, relative: []const u8, ident
     return 0;
 }
 
+/// M160b (#2990): slot-79 op 15 — the per-file facts the op-0 Wire has no
+/// fields for, presence-flagged into the 32-byte Facts record. `/host`
+/// answers from the channel's decoded STAT v3 record (birth time and
+/// allocated bytes when the reply carries them); `/disk` answers
+/// allocated bytes from the VLFS inode's claimed blocks — it has no
+/// birth. A fact a backend cannot name stays absent: flag cleared,
+/// field zero. The FUSE backend's GETATTR carries neither fact, so its
+/// record is the all-absent one — an honest empty answer, never refuse.
+pub fn metadata_facts(pid: u64, root_bytes: []const u8, relative: []const u8, out: *metadata.Facts) i64 {
+    if (pid >= process.max_processes) return -1;
+    out.* = .{};
+    const disk_root = disk_metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    const root_path = if (disk_root) |d| d else metadata_root(root_bytes) catch |err| return metadata_errno(err);
+    var full: [max_path_len]u8 = undefined;
+    const joined = join_metadata(root_path, relative, &full) catch |err| return metadata_errno(err);
+    if (fsScopedDenied(pid, if (disk_root != null) .disk else .host, joined, .read)) return -7;
+    if (disk_root) |droot| {
+        const value = metadata.stat(vlfs_disk.backend(droot), vlfs_disk.authorizer, relative) catch |err| return metadata_errno(err);
+        const st = vlfs_disk.statInode(@intCast(value.identity.inode)) catch |err| return disk_errno(err);
+        out.flags = metadata.fact_has_alloc;
+        out.alloc_bytes = st.alloc_blocks * vlfs.block_len;
+        return 0;
+    }
+    var root = virtio_file.MetadataRoot{ .path = root_path };
+    var auth = MetadataAuth{ .pid = pid, .root = root_path };
+    const backend = virtio_file.metadata_backend(&root);
+    if (backend.ops == null) {
+        // The legacy channel answers from its own STAT, exactly like the
+        // op-0 path — the v3 reply's birth/alloc groups fill the record.
+        if (!virtio_file.available()) return -4;
+        MetadataAuth.check(&auth, relative, .metadata) catch |err| return metadata_errno(err);
+        var st = virtio_file.StatResult{};
+        const status = virtio_file.stat(joined, &st);
+        if (status != virtio_file.st_ok) return switch (status) {
+            virtio_file.st_not_found => -6,
+            virtio_file.st_path_limit => -8,
+            else => -1,
+        };
+        if (st.has_birth) {
+            out.flags |= metadata.fact_has_birth;
+            out.birth = .{ .seconds = @bitCast(st.birth_sec), .nanoseconds = st.birth_nsec };
+        }
+        if (st.has_alloc) {
+            out.flags |= metadata.fact_has_alloc;
+            out.alloc_bytes = st.alloc_bytes;
+        }
+        return 0;
+    }
+    _ = metadata.stat(backend, auth.authorizer(), relative) catch |err| return metadata_errno(err);
+    return 0;
+}
+
 /// Opens an existing pinned regular file, without create/truncate/append.
 /// The returned native fd uses slots 24/25/26, never reopens a pathname.
 pub fn contained_open(pid: u64, root_bytes: []const u8, relative: []const u8, writing: bool) i64 {
@@ -2535,14 +2587,42 @@ pub fn sync(pid: u64, fd: u64) i64 {
     return hf_handle_errno(virtio_file.fsync(h.host_handle));
 }
 
-/// Free bytes on a volume. M34 HF6 (issue #740): the ESP/DATA partitions
-/// are GONE and the host channel has no free-space op — every volume is
-/// an honest EINVAL (the frozen ABI row stays; no userland caller exists
-/// since `fstest` was deleted).
+/// One shared 4 KiB block scratch for the free-space count's superblock
+/// parse and per-map-block reads — the file ABI runs under the `.file`
+/// service-domain lock, so no caller can tear it mid-scan.
+var free_space_scratch: [vlfs.block_len]u8 align(64) = undefined;
+
+/// Free bytes on a mount-table row — slot 37's argument (M160b, #2990).
+/// Row 0 (`host`) answers the share's STATFS `avail × block_size` — an
+/// old host's refusal or a dead channel is the named EINVAL/EIO, never a
+/// number. Row 1 (`disk`) counts the mounted VLFS volume's free bbitmap
+/// bits × block_len — ENOENT when nothing is mounted. Rows 2..6 (usb)
+/// and anything out of range have no free-space source: EINVAL.
 pub fn free_space(pid: u64, volume: u32) i64 {
-    _ = volume;
     if (pid >= process.max_processes) return -1;
-    return -1; // EINVAL: no file volumes exist
+    if (volume == mount_table.row_host) {
+        var fs: virtio_file.StatfsResult = .{};
+        return switch (virtio_file.statfs("", &fs)) {
+            .ok => blk: {
+                if (fs.block_size == 0) break :blk -13;
+                const bytes = std.math.mul(u64, fs.avail, fs.block_size) catch break :blk -13;
+                if (bytes > std.math.maxInt(i64)) break :blk -13;
+                break :blk @as(i64, @intCast(bytes));
+            },
+            // The host does not serve STATFS — M160a's named refusal.
+            .unsupported => -1,
+            .failed => -13,
+        };
+    }
+    if (volume == mount_table.row_disk) {
+        if (!vlfs_disk.mounted()) return -6; // ENOENT: the row's not_mounted answer
+        const src = vlfs_disk.blkSource() orelse return -13;
+        const blocks = vlfs.freeDataBlocks(src, &free_space_scratch) catch |err| return disk_errno(err);
+        const bytes = std.math.mul(u64, blocks, vlfs.block_len) catch return -13;
+        if (bytes > std.math.maxInt(i64)) return -13;
+        return @intCast(bytes);
+    }
+    return -1; // EINVAL
 }
 
 // ---------------------------------------------------------------------------
@@ -3280,10 +3360,12 @@ test "file_table: mutating ops validate pids, paths, and volumes (claim 5801)" {
     try std.testing.expectEqual(@as(i64, -1), delete(1, "../x.txt"));
     try std.testing.expectEqual(@as(i64, -1), rename(1, "a.txt", "../b.txt"));
 
-    // Every volume is an honest EINVAL — the FAT volumes are gone (HF6)
-    // and the host channel has no free-space op.
+    // M160b (#2990): slot 37's per-row answers — the host row's channel
+    // cannot serve STATFS in tests (the named EINVAL) and the unmounted
+    // disk row is ENOENT; the usb rows stay EINVAL.
     try std.testing.expectEqual(@as(i64, -1), free_space(1, 0));
-    try std.testing.expectEqual(@as(i64, -1), free_space(1, 1));
+    try std.testing.expectEqual(@as(i64, -6), free_space(1, 1));
+    try std.testing.expectEqual(@as(i64, -1), free_space(1, 2));
 
     // Truncate on an unopened handle is EBADF.
     init();
@@ -3873,4 +3955,75 @@ test "file_table: deleting a /disk file stales its plain handles (issue #2374)" 
     try std.testing.expectEqual(@as(i64, 0), pin_close(0, @intCast(pin)));
     try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fcr)));
     try std.testing.expectEqual(@as(i64, 0), close(0, @intCast(fc)));
+}
+
+test "file_table: M160b slot 37 answers per mount row, names every refusal" {
+    init();
+    vlfs_disk.detach();
+    defer vlfs_disk.detach();
+    // Row 0 (host): the test seam cannot serve STATFS — the channel's own
+    // answer is the named EINVAL both with and without a test share.
+    try std.testing.expectEqual(@as(i64, -1), free_space(0, mount_table.row_host));
+    const files = [_]virtio_file.TestFile{.{ .name = "A.TXT", .data = "a" }};
+    virtio_file.set_test_share(&files);
+    defer virtio_file.set_test_share(null);
+    try std.testing.expectEqual(@as(i64, -1), free_space(0, mount_table.row_host));
+    // Row 1 (disk) unmounted: ENOENT. The usb rows and out-of-range: EINVAL.
+    try std.testing.expectEqual(@as(i64, -6), free_space(0, mount_table.row_disk));
+    var row: u32 = 2;
+    while (row <= 6) : (row += 1) {
+        try std.testing.expectEqual(@as(i64, -1), free_space(0, row));
+    }
+    try std.testing.expectEqual(@as(i64, -1), free_space(0, 7));
+    try std.testing.expectEqual(@as(i64, -1), free_space(0, 0xffff_ffff));
+    // The pid bound still precedes every answer.
+    try std.testing.expectEqual(@as(i64, -1), free_space(process.max_processes, 0));
+    // A mounted volume with no blk device behind it (a test-only state —
+    // attachBlk() is the only real source) fails honestly, never a number.
+    try vlfs_build(vlfs_populated_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
+    try std.testing.expectEqual(@as(i64, -13), free_space(0, mount_table.row_disk));
+}
+
+test "file_table: M160b slot-79 op 15 — facts record and its flags" {
+    init();
+    vlfs_disk.detach();
+    defer vlfs_disk.detach();
+    var facts: metadata.Facts = .{};
+
+    // /host through the legacy channel: the test share's STAT is the
+    // v1/v2 shape — no birth, no alloc. The record is the all-absent
+    // answer: flags clear, never a fabricated fact. A missing file still
+    // names ENOENT, a dead channel -4.
+    const files = [_]virtio_file.TestFile{.{ .name = "A.TXT", .data = "a" }};
+    virtio_file.set_test_share(&files);
+    defer virtio_file.set_test_share(null);
+    try std.testing.expectEqual(@as(i64, 0), metadata_facts(0, "/host", "A.TXT", &facts));
+    try std.testing.expectEqual(@as(u32, 0), facts.flags);
+    try std.testing.expectEqual(@as(i64, 0), facts.birth.seconds);
+    try std.testing.expectEqual(@as(u64, 0), facts.alloc_bytes);
+    try std.testing.expectEqual(@as(i64, -6), metadata_facts(0, "/host", "NOPE.TXT", &facts));
+    try std.testing.expectEqual(@as(i64, -4), metadata_facts(0, "/host", "A.TXT", blk: {
+        virtio_file.set_test_share(null);
+        break :blk &facts;
+    }));
+    virtio_file.set_test_share(&files);
+
+    // /disk unmounted: the backend's own not_mounted answer (-4), same as
+    // the op-0 surface. Roots outside /host and /disk refuse by name.
+    try std.testing.expectEqual(@as(i64, -4), metadata_facts(0, "/disk", "A.TXT", &facts));
+    try std.testing.expectEqual(@as(i64, -4), metadata_facts(0, "/usb", "A.TXT", &facts));
+
+    // /disk mounted: allocated bytes from the VLFS inode — APPLE.TXT's
+    // 4113 bytes claim two blocks (8192); no birth ever.
+    try vlfs_build(vlfs_populated_regions, &vlfs_test_img);
+    try std.testing.expect(vlfs_disk.attach(VlfsTestDisk.source(&vlfs_test_img)));
+    try std.testing.expectEqual(@as(i64, 0), metadata_facts(0, "/disk", "APPLE.TXT", &facts));
+    try std.testing.expectEqual(metadata.fact_has_alloc, facts.flags);
+    try std.testing.expectEqual(@as(u64, 2 * vlfs.block_len), facts.alloc_bytes);
+    // CHAINED.BIN: 10 data blocks plus the chain block itself.
+    try std.testing.expectEqual(@as(i64, 0), metadata_facts(0, "/disk", "CHAINED.BIN", &facts));
+    try std.testing.expectEqual(metadata.fact_has_alloc, facts.flags);
+    try std.testing.expectEqual(@as(u64, 11 * vlfs.block_len), facts.alloc_bytes);
+    try std.testing.expectEqual(@as(i64, -6), metadata_facts(0, "/disk", "NOPE.TXT", &facts));
 }

@@ -12,6 +12,7 @@ import "virelai/vi"
 // vi.Mounts (slot 27's "/" enumeration; no new syscall).
 type MountView struct {
 	Rows      []vi.Mount
+	Free      []int64 // parallel to Rows; -1 when the row has no answer
 	OK        bool
 	refreshed bool
 	rc        int64
@@ -20,6 +21,10 @@ type MountView struct {
 // mountRows is the deliberate injection seam — vi.Mounts on the guest, a
 // stub in host tests (the same discipline gpuSampleStats keeps).
 var mountRows = vi.Mounts
+
+// mountFree is the per-row free-space seam — vi.VolumeFree on the guest
+// (slot 37, M160b), a stub in host tests.
+var mountFree = vi.VolumeFree
 
 // NewMountView builds an empty view (safe defaults: no sample yet).
 func NewMountView() *MountView { return &MountView{} }
@@ -38,6 +43,15 @@ func (v *MountView) Refresh() {
 	v.Rows = rows
 	v.OK = true
 	v.rc = 0
+	// M160b (#2990): one slot-37 answer per row — a name with no
+	// free-space row (usb) or a refused count stays -1 and paints `-`.
+	v.Free = make([]int64, len(rows))
+	for i, m := range rows {
+		v.Free[i] = -1
+		if b, err := mountFree(m.Name); err == nil {
+			v.Free[i] = int64(b)
+		}
+	}
 }
 
 // mountErrText names a listing refusal for the error row/marker.
@@ -50,7 +64,7 @@ func mountErrText(rc int64) string {
 
 // mountRowText is one table line — the name, kind, state, and flags the
 // kernel put on the wire.
-func mountRowText(m vi.Mount) string {
+func mountRowText(m vi.Mount, free int64) string {
 	line := m.Name
 	for len(line) < 7 {
 		line += " "
@@ -64,10 +78,23 @@ func mountRowText(m vi.Mount) string {
 		line += " "
 	}
 	line += " " + m.AccessName()
+	for len(line) < 32 {
+		line += " "
+	}
+	line += " " + freeText(free)
 	if m.Kind == vi.MountKindBlock {
 		line += " (block device)"
 	}
 	return line
+}
+
+// freeText is the row's free-space answer: the byte count, or `-` for
+// a row with no answer (a usb row, an unmounted volume, a refused call).
+func freeText(free int64) string {
+	if free < 0 {
+		return "-"
+	}
+	return vi.Itoa64(free)
 }
 
 // Lines is the tab's text, one entry per row.
@@ -79,9 +106,9 @@ func (v *MountView) Lines() []string {
 		return []string{"mounts: list refused (" + mountErrText(v.rc) + ")"}
 	}
 	out := []string{"mount table   sys_dir_list(\"/\")", "",
-		"name    kind    state        flags"}
-	for _, m := range v.Rows {
-		out = append(out, mountRowText(m))
+		"name    kind    state        flags  free"}
+	for i, m := range v.Rows {
+		out = append(out, mountRowText(m, v.Free[i]))
 	}
 	return out
 }
@@ -103,5 +130,6 @@ func (v *MountView) RowMarker(i int) (string, bool) {
 	}
 	m := v.Rows[i]
 	return "top: mount " + m.Name + " state=" + m.StateName() +
-		" kind=" + m.KindName() + " flags=" + m.AccessName(), true
+		" kind=" + m.KindName() + " flags=" + m.AccessName() +
+		" free=" + freeText(v.Free[i]), true
 }

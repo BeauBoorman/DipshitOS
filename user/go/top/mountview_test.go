@@ -5,6 +5,7 @@ package main
 // go-fileman/live-vlfs-dataroot class-B's job.
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -94,5 +95,72 @@ func TestMountViewDiskMountedReadsRw(t *testing.T) {
 	v.Refresh()
 	if line, ok := v.RowMarker(1); !ok || !strings.Contains(line, "disk state=mounted kind=vlfs flags=rw") {
 		t.Fatalf("mounted disk row = %q ok=%v", line, ok)
+	}
+}
+
+// M160b (#2990): the free column carries the slot-37 answer per row;
+// a row with no answer paints `-` in the table and `free=-` on the wire.
+func stubMountFree(t *testing.T, fn func(string) (uint64, error)) {
+	t.Helper()
+	saved := mountFree
+	mountFree = fn
+	t.Cleanup(func() { mountFree = saved })
+}
+
+func TestMountViewFreeColumnAndMarker(t *testing.T) {
+	stubMountRows(t, testMounts(true), 0)
+	stubMountFree(t, func(name string) (uint64, error) {
+		switch name {
+		case "host":
+			return 12345678901, nil
+		case "disk":
+			return 8 << 20, nil
+		}
+		return 0, errors.New("no answer")
+	})
+	v := NewMountView()
+	v.Refresh()
+	if !v.OK {
+		t.Fatal("a served enumeration must be ok")
+	}
+	if line, ok := v.RowMarker(0); !ok ||
+		!strings.Contains(line, "host state=mounted") ||
+		!strings.Contains(line, "free=12345678901") {
+		t.Fatalf("host row marker = %q ok=%v", line, ok)
+	}
+	if line, ok := v.RowMarker(1); !ok ||
+		!strings.Contains(line, "disk state=mounted") ||
+		!strings.Contains(line, "free=8388608") {
+		t.Fatalf("disk row marker = %q ok=%v", line, ok)
+	}
+	if line, ok := v.RowMarker(2); !ok || !strings.Contains(line, "free=-") {
+		t.Fatalf("usb row marker = %q ok=%v", line, ok)
+	}
+	var hostLine, diskLine string
+	for _, ln := range v.Lines() {
+		if strings.HasPrefix(ln, "host ") {
+			hostLine = ln
+		}
+		if strings.HasPrefix(ln, "disk ") {
+			diskLine = ln
+		}
+	}
+	if !strings.Contains(hostLine, "12345678901") || !strings.Contains(diskLine, "8388608") {
+		t.Fatalf("free column missing: host=%q disk=%q", hostLine, diskLine)
+	}
+}
+
+func TestMountViewFreeAbsentForUnmountedDisk(t *testing.T) {
+	stubMountRows(t, testMounts(false), 0)
+	stubMountFree(t, func(name string) (uint64, error) {
+		if name == "host" {
+			return 1, nil
+		}
+		return 0, errors.New("ENOENT")
+	})
+	v := NewMountView()
+	v.Refresh()
+	if line, ok := v.RowMarker(1); !ok || !strings.Contains(line, "free=-") {
+		t.Fatalf("unmounted disk row marker = %q ok=%v", line, ok)
 	}
 }
