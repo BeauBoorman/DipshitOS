@@ -16,9 +16,23 @@
 #   05 deterministic replay (replay.img): a crafted image whose journal
 #     holds one committed-but-uncheckpointed txn installing REPLAY.TXT;
 #     run 04's assert re-crafts it per repeat so 05 always replays.
+# M172e (#3043, ADR 0061): the sealed pass + the canary.
+#   06/07 the 01/02 pair re-run on a sealed v2 image (vlfs-s.img, built by
+#     mkfs.vlfs --seal in setup): the runner types the passphrase at the
+#     unseal prompt, the same kill lands mid-stream, 07 unseals/remounts
+#     and proves the same replay contract. mkfs.vlfs --check with the
+#     passphrase must report no hard findings on the killed image.
+#   08 the 05 leg re-run sealed (replay-s.img, crafted by mkreplay.py
+#     --seal — the tool's own code built via `go build -overlay`, never
+#     hand-rolled crypto); re-crafted by run 07's assert per repeat.
+#   09/10 the canary pair: both boots write CANARY-<random> to
+#     /disk/CANARY.TXT, fsync, power off. 10's python assert scans the
+#     sealed image for the canary bytes and requires ZERO hits, then the
+#     plaintext twin vlfs-c.img for >= 1 (the scan works). "The host
+#     cannot read the disk" is the bet this leg turns into a gate.
 # A python assert runs mkfs.vlfs --check (built in setup) on the killed
 # image BEFORE its remount: only journal_torn/journal_unreplayed infos are
-# legal, and run 02/04 must then print `vlfs: replayed` when unreplayed
+# legal, and run 02/04/07 must then print `vlfs: replayed` when unreplayed
 # txns were seen. Honesty bound: stop() preserves completed requests, so
 # this proves replay + ordering at completed-request granularity, not
 # FLUSH correctness under a host power cut (that is the class-A crash-state
@@ -35,7 +49,7 @@ vgate_note "K=5 consecutive full-spec runs green is the M100g acceptance record 
 # replay seq 1 to see the file at all; the home blocks for those regions
 # carry no trace of it.
 vgate_file mkreplay.py <<'PY'
-import struct, sys
+import struct, subprocess, sys
 from pathlib import Path
 
 BLK = 4096
@@ -89,6 +103,14 @@ root[0:272] = de
 data = bytearray(BLK)
 data[:len(content)] = content
 
+# --seal: a v2 volume's bbitmap also marks the tag homes allocated (the
+# last ceil((vb-2)/147) blocks). The journaled payload must carry them
+# too — it is what the mount's replay lands.
+if sys.argv[1] == "--seal":
+    vb = len(img) // BLK
+    for b in range(vb - (vb - 2 + 146) // 147, vb):
+        bb[b // 8] |= 1 << (b % 8)
+
 payloads = {IBITMAP: bytes(ib), BBITMAP: bytes(bb), ITABLE: bytes(it),
             DATA_FIRST: bytes(root), data_blk: bytes(data)}
 dests = sorted(payloads)
@@ -110,9 +132,96 @@ struct.pack_into("<I", commit, 12, fnv(txn))
 struct.pack_into("<I", commit, BLK - 4, fnv(commit[:BLK - 4]))
 img[(JOURNAL_FIRST + 1 + len(dests)) * BLK:(JOURNAL_FIRST + 2 + len(dests)) * BLK] = commit
 
-Path(sys.argv[1]).write_bytes(bytes(img))
-print("replay.img crafted: committed-uncheckpointed txn seq=1, 5 payloads")
+if sys.argv[1] == "--seal":
+    # M172e: the same crafted image as a sealed v2 volume. The plaintext
+    # goes to a scratch file and `sealimg` — built in setup from
+    # tools/go/vlfs' own sources via `go build -overlay` — runs the tool's
+    # own seal code path over it (the ADR 0061 format, not hand-rolled
+    # crypto in this script).
+    passfile, out = sys.argv[2], sys.argv[3]
+    tmp = Path(out).with_suffix(".plain.img")
+    tmp.write_bytes(bytes(img))
+    sealimg = Path(sys.argv[0]).resolve().parent / "sealimg"
+    subprocess.check_call([str(sealimg), passfile, str(tmp), out])
+    print("replay-s.img crafted+sealed: committed-uncheckpointed txn seq=1")
+else:
+    Path(sys.argv[1]).write_bytes(bytes(img))
+    print("replay.img crafted: committed-uncheckpointed txn seq=1, 5 payloads")
 PY
+
+vgate_file sealimg.go <<'EOF'
+// sealimg — seals an EXISTING crafted plaintext image as a v2 volume.
+// The spec builds it over tools/go/vlfs with `go build -overlay`
+// replacing main.go, so every format/AEAD byte below is the tool's own
+// code path; this driver only reorders the calls (ADR 0061, M172e — the
+// sealed replay image is crafted through the tool, not hand-written).
+//
+// Usage: sealimg <pass-file> <plain.img> <sealed-out.img>
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"os"
+)
+
+func fail(v any) {
+	fmt.Fprintln(os.Stderr, "sealimg:", v)
+	os.Exit(1)
+}
+
+func main() {
+	if len(os.Args) != 4 {
+		fmt.Fprintln(os.Stderr, "usage: sealimg <pass-file> <plain.img> <sealed.img>")
+		os.Exit(2)
+	}
+	pass, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fail(err)
+	}
+	pass = bytes.TrimRight(pass, "\r\n")
+	img, err := os.ReadFile(os.Args[2])
+	if err != nil {
+		fail(err)
+	}
+	g, err := geometryFor(uint64(len(img)))
+	if err != nil {
+		fail(err)
+	}
+	g, err = sealedGeometry(g)
+	if err != nil {
+		fail(err)
+	}
+	// Carve the tag region off the end of the data region exactly as
+	// formatSealedImage does: shrink data_blocks in both superblocks
+	// (writeSealFields restamps the checksum over all of it) and mark the
+	// tag homes allocated in the bbitmap.
+	for slot := uint32(0); slot < 2; slot++ {
+		binary.LittleEndian.PutUint32(block(img, slot)[sbDataBlocks:], g.DataBlocks)
+	}
+	bb := block(img, g.BbitmapFirst)
+	for i := g.TagFirst; i < g.VolumeBlocks; i++ {
+		bitmapSet(bb, i)
+	}
+	volID := binary.LittleEndian.Uint64(block(img, 0)[sbVolumeID:])
+	p, err := newSealParams(4000) // gate iters — the passphrase is RUN_DIR-local
+	if err != nil {
+		fail(err)
+	}
+	for slot := uint32(0); slot < 2; slot++ {
+		if err := writeSealFields(block(img, slot), g, volID, &p, pass); err != nil {
+			fail(err)
+		}
+	}
+	if err := sealBlocks(img, g, volID, &p.dek); err != nil {
+		fail(err)
+	}
+	if err := os.WriteFile(os.Args[3], img, 0o644); err != nil {
+		fail(err)
+	}
+}
+EOF
 
 vgate_setup_python <<'PY'
 import os, subprocess, sys
@@ -137,6 +246,68 @@ subprocess.check_call(["python3", str(run / "mkreplay.py"), str(run / "replay.im
 # The checker under test, built once; the assert hooks invoke the binary.
 subprocess.check_call(["go", "-C", "tools/go/vlfs", "build",
                        "-o", str(run / "mkfs.vlfs"), "."])
+
+# --- M172e: sealed images, the sealer driver, and the canary --------------
+# sealimg is built over the tool's own sources via `go build -overlay`:
+# main.go is replaced by the RUN_DIR driver, so every format/AEAD byte is
+# tools/go/vlfs code.
+import json
+overlay = {"Replace": {str(Path("tools/go/vlfs/main.go").resolve()):
+                       str(run / "sealimg.go")}}
+(run / "sealimg-overlay.json").write_text(json.dumps(overlay))
+subprocess.check_call(["go", "-C", "tools/go/vlfs", "build",
+                       "-overlay", str(run / "sealimg-overlay.json"),
+                       "-o", str(run / "sealimg"), "."])
+
+(run / "pass.txt").write_text("swordfish\n")
+for name in ("vlfs-s.img", "vlfs-cs.img"):
+    subprocess.check_call([str(run / "mkfs.vlfs"), "--seal",
+                           "--passphrase-file", str(run / "pass.txt"),
+                           "-mib", "16", "-kdf-iters", "4000",
+                           str(run / name)])
+
+# The sealed replay image: same crafted txn, sealed through the tool.
+subprocess.check_call(["python3", str(run / "mkreplay.py"), "--seal",
+                       str(run / "pass.txt"), str(run / "replay-s.img")])
+out = subprocess.run([str(run / "mkfs.vlfs"), "--check",
+                      "--passphrase-file", str(run / "pass.txt"),
+                      str(run / "replay-s.img")],
+                     capture_output=True, text=True)
+if out.returncode != 0 or "journal_unreplayed" not in out.stdout:
+    sys.exit("replay-s.img fsck: rc=%d\n%s" % (out.returncode, out.stdout))
+print("replay-s.img sealed fsck:", out.stdout.strip().replace("\n", " | "))
+
+# The plaintext canary twin and the per-run canary bytes.
+img = None
+for line in Path("kernel/src/vlfs/testdata/empty-16m.regions").read_text().splitlines():
+    if not line or line.startswith("#") or line == "vlfs-regions 1":
+        continue
+    if line.startswith("bytes "):
+        img = bytearray(int(line[6:]))
+        continue
+    off, hexs = line.split(" ", 1)
+    img[int(off):int(off) + len(hexs) // 2] = bytes.fromhex(hexs)
+(run / "vlfs-c.img").write_bytes(bytes(img))
+
+import secrets
+canary = "CANARY-" + secrets.token_hex(12)
+(run / "canary.txt").write_text(canary)
+(run / "script-pass.txt").write_text("swordfish\n")
+(run / "script-ws1.txt").write_text(
+    "vf rm /disk/TAIL.BIN\n"
+    "write /disk/ANCHOR.TXT virelai vlfs crash anchor\n"
+    "vf fsync /disk\n"
+    "echo vlfs-committed-anchor-s1\n"
+    "vf write /disk/TAIL.BIN 12000000\n")
+(run / "script-canary.txt").write_text(
+    "write /disk/CANARY.TXT %s\n"
+    "vf fsync /disk\n"
+    "echo canary-plain-done\n" % canary)
+(run / "script-canary-s.txt").write_text(
+    "write /disk/CANARY.TXT %s\n"
+    "vf fsync /disk\n"
+    "echo canary-sealed-done\n" % canary)
+print("canary: %s" % canary)
 
 # fsck on the crafted image must report journal_unreplayed and NOTHING
 # hard — the as-replayed overlay is a consistent populated volume.
@@ -163,7 +334,7 @@ vf ls /disk
 echo vlfs-verify-1-done
 EOF
 
-# warm-cold: 01,02,03,04,05 (f) every leg sequences on a shared --data-disk
+# warm-cold: 01,02,03,04,05,06,07,08,09,10 (f) every leg sequences on a shared --data-disk
 #   image a sibling leg or assert built/crashed (02 verifies 01's killed
 #   vlfs.img, 04 verifies 03's, 05 replays the image 04's assert re-crafts)
 #   — the image is outside the bundle so warm isolation never carries it
@@ -436,6 +607,204 @@ echo vlfs-replay-done
 EOF
 
 vgate_run 05 -- --data-disk '$RUN_DIR/replay.img' --script '$RUN_DIR/script-r.txt' --script-expect 'vlfs-replay-done' --timeout 90
+
+# --- M172e legs: the sealed pass -------------------------------------------
+# Every sealed leg forwards two scripts: the passphrase after the unseal
+# prompt marker, then the leg script after the shell prompt (the
+# live-vlfs-blk sealed-leg shape). 'swordfish' must never reach serial.
+
+vgate_run 06 -- --data-disk '$RUN_DIR/vlfs-s.img' \
+    --script '$RUN_DIR/script-pass.txt' --script-after 'vlfs: sealed — passphrase: ' \
+    --script2 '$RUN_DIR/script-ws1.txt' --script2-after 'virelai> ' \
+    --script-expect 'vlfs-committed-anchor-s1' --script-expect-tail 1.5 --timeout 120
+
+vgate_assert 06 output-contains 'data-disk: ENABLED'
+vgate_assert 06 output-contains 'vm-stop: state='
+vgate_assert 06 serial-contains 'vlfs: sealed — unsealed'
+vgate_assert 06 serial-contains 'vlfs: mounted /disk'
+vgate_assert 06 serial-contains 'write: ok (journaled 25 bytes to disk:ANCHOR.TXT)'
+vgate_assert 06 serial-contains 'vf: fsync /disk ok (FLUSH completed)'
+vgate_assert 06 serial-echo 'vf write /disk/TAIL.BIN 12000000'
+vgate_assert 06 serial-absent 'vf: write disk:TAIL.BIN'
+vgate_assert 06 serial-absent 'swordfish'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 python <<'PY'
+import os, subprocess, sys
+run = os.environ["RUN_DIR"]
+out = subprocess.run([run + "/mkfs.vlfs", "--check",
+                      "--passphrase-file", run + "/pass.txt",
+                      run + "/vlfs-s.img"], capture_output=True, text=True)
+open(run + "/killed-s1.findings", "w").write(out.stdout)
+if out.returncode != 0:
+    sys.exit("killed vlfs-s.img has hard fsck findings:\n" + out.stdout)
+for line in out.stdout.splitlines():
+    if not (line.startswith("info: journal_") or line == "check: clean"):
+        sys.exit("unexpected fsck line on killed sealed image: " + line)
+print("killed vlfs-s.img:", out.stdout.strip().replace("\n", " | "))
+PY
+
+vgate_run 07 -- --data-disk '$RUN_DIR/vlfs-s.img' \
+    --script '$RUN_DIR/script-pass.txt' --script-after 'vlfs: sealed — passphrase: ' \
+    --script2 '$RUN_DIR/script-v1.txt' --script2-after 'virelai> ' \
+    --script-expect 'vlfs-verify-1-done' --timeout 120
+
+vgate_assert 07 output-contains 'data-disk: ENABLED'
+vgate_assert 07 serial-contains 'vlfs: sealed — unsealed'
+vgate_assert 07 serial-contains 'vlfs: mounted /disk'
+vgate_assert 07 serial-absent 'vlfs: mount refused'
+vgate_assert 07 serial-absent 'swordfish'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 python <<'PY'
+import os, re, subprocess, sys
+run, ser = os.environ["RUN_DIR"], open(os.environ["VG_SER"], errors="replace").read()
+
+def cksum(data):
+    s, carry = 0, None
+    for b in data:
+        if carry is None:
+            carry = b
+        else:
+            s += (carry << 8) | b
+            carry = None
+    if carry is not None:
+        s += carry << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+anchor = b"virelai vlfs crash anchor"
+want = "vf: cat ok bytes=25 rts=1 cksum=0x%04x" % cksum(anchor)
+if want not in ser:
+    sys.exit("FAIL: anchor not byte-exact after sealed remount (want %r)" % want)
+
+tail_total = 12000000
+m = re.search(r"vf: cat disk:TAIL\.BIN size=(\d+)", ser)
+if m is None:
+    if "vf cat: disk:TAIL.BIN: not_found" not in ser:
+        sys.exit("FAIL: TAIL.BIN neither readable nor named-refused")
+    print("TAIL.BIN absent at remount")
+else:
+    size = int(m.group(1))
+    mm = re.search(r"vf: cat ok bytes=%d rts=\d+ cksum=0x([0-9a-f]{4})" % size, ser)
+    if not mm:
+        sys.exit("FAIL: TAIL.BIN size=%d but no matching cat-ok line" % size)
+    if not (size % 32768 == 0 or size == tail_total):
+        sys.exit("FAIL: TAIL.BIN size %d is not a committed-chunk prefix" % size)
+    pat = bytes(i % 251 for i in range(size))
+    if int(mm.group(1), 16) != cksum(pat):
+        sys.exit("FAIL: TAIL.BIN cksum mismatch at size %d" % size)
+    print("TAIL.BIN committed prefix: %d bytes" % size)
+
+killed = open(run + "/killed-s1.findings").read()
+if "journal_unreplayed" in killed and "vlfs: replayed 0x" not in ser:
+    sys.exit("FAIL: killed sealed image had live txns but mount printed no replay")
+
+# Post-remount image must be fully consistent through the AEAD layer:
+# every sealed block's tag verifies and the journal is drained.
+out = subprocess.run([run + "/mkfs.vlfs", "--check",
+                      "--passphrase-file", run + "/pass.txt",
+                      run + "/vlfs-s.img"], capture_output=True, text=True)
+if out.returncode != 0 or "journal_unreplayed" in out.stdout:
+    sys.exit("post-remount sealed fsck not clean: rc=%d\n%s" % (out.returncode, out.stdout))
+print("post-remount sealed fsck:", out.stdout.strip().replace("\n", " | "))
+
+# Re-craft the sealed replay image for the next repeat cycle.
+subprocess.check_call(["python3", run + "/mkreplay.py", "--seal",
+                       run + "/pass.txt", run + "/replay-s.img"])
+PY
+
+vgate_run 08 -- --data-disk '$RUN_DIR/replay-s.img' \
+    --script '$RUN_DIR/script-pass.txt' --script-after 'vlfs: sealed — passphrase: ' \
+    --script2 '$RUN_DIR/script-r.txt' --script2-after 'virelai> ' \
+    --script-expect 'vlfs-replay-done' --timeout 120
+
+vgate_assert 08 output-contains 'data-disk: ENABLED'
+vgate_assert 08 serial-contains 'vlfs: sealed — unsealed'
+vgate_assert 08 serial-contains 'vlfs: mounted /disk'
+vgate_assert 08 serial-contains 'vlfs: replayed 0x0000000000000001 txn(s) from the journal'
+vgate_assert 08 serial-absent 'swordfish'
+vgate_assert 08 serial-absent '[EXC] parking:'
+vgate_assert 08 python <<'PY'
+import os, re, subprocess, sys
+run, ser = os.environ["RUN_DIR"], open(os.environ["VG_SER"], errors="replace").read()
+
+def cksum(data):
+    s, carry = 0, None
+    for b in data:
+        if carry is None:
+            carry = b
+        else:
+            s += (carry << 8) | b
+            carry = None
+    if carry is not None:
+        s += carry << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+content = b"replayed-by-vlfs-journal\n"
+want = "vf: cat ok bytes=%d rts=1 cksum=0x%04x" % (len(content), cksum(content))
+if want not in ser:
+    sys.exit("FAIL: REPLAY.TXT not byte-exact after sealed replay (want %r)" % want)
+
+out = subprocess.run([run + "/mkfs.vlfs", "--check",
+                      "--passphrase-file", run + "/pass.txt",
+                      run + "/replay-s.img"], capture_output=True, text=True)
+if out.returncode != 0 or "journal_unreplayed" in out.stdout:
+    sys.exit("post-replay sealed fsck not clean: rc=%d\n%s" % (out.returncode, out.stdout))
+print("post-replay sealed fsck:", out.stdout.strip().replace("\n", " | "))
+PY
+
+# --- M172e legs: the canary -------------------------------------------------
+# 09 writes CANARY-<random> to a plaintext image, 10 the same bytes to a
+# sealed one; 10's assert scans both raw images — zero hits sealed, at
+# least one plaintext (the scan is proven to work).
+
+vgate_run 09 -- --data-disk '$RUN_DIR/vlfs-c.img' --script '$RUN_DIR/script-canary.txt' --script-expect 'canary-plain-done' --timeout 90
+
+vgate_assert 09 output-contains 'data-disk: ENABLED'
+vgate_assert 09 serial-contains 'vlfs: mounted /disk'
+vgate_assert 09 serial-contains 'write: ok (journaled 31 bytes to disk:CANARY.TXT)'
+vgate_assert 09 serial-contains 'vf: fsync /disk ok (FLUSH completed)'
+vgate_assert 09 serial-absent '[EXC] parking:'
+
+vgate_run 10 -- --data-disk '$RUN_DIR/vlfs-cs.img' \
+    --script '$RUN_DIR/script-pass.txt' --script-after 'vlfs: sealed — passphrase: ' \
+    --script2 '$RUN_DIR/script-canary-s.txt' --script2-after 'virelai> ' \
+    --script-expect 'canary-sealed-done' --timeout 120
+
+vgate_assert 10 output-contains 'data-disk: ENABLED'
+vgate_assert 10 serial-contains 'vlfs: sealed — unsealed'
+vgate_assert 10 serial-contains 'vlfs: mounted /disk'
+vgate_assert 10 serial-contains 'write: ok (journaled 31 bytes to disk:CANARY.TXT)'
+vgate_assert 10 serial-contains 'vf: fsync /disk ok (FLUSH completed)'
+vgate_assert 10 serial-absent 'swordfish'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+needle = open(run + "/canary.txt", "rb").read()
+
+def hits(path):
+    img = open(path, "rb").read()
+    n, pos = 0, 0
+    while True:
+        i = img.find(needle, pos)
+        if i < 0:
+            return n
+        n += 1
+        pos = i + 1
+
+sealed = hits(run + "/vlfs-cs.img")
+if sealed != 0:
+    sys.exit("FAIL: canary found %d time(s) in sealed vlfs-cs.img — "
+             "the image is not ciphertext at rest" % sealed)
+plain = hits(run + "/vlfs-c.img")
+if plain < 1:
+    sys.exit("FAIL: canary absent from plaintext vlfs-c.img — the scan "
+             "proved nothing")
+print("canary: 0 hits in sealed image, %d in plaintext twin" % plain)
+PY
 
 vgate_assert 05 output-contains 'data-disk: ENABLED'
 vgate_assert 05 serial-contains 'vlfs: mounted /disk'

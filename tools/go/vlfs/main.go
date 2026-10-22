@@ -31,8 +31,9 @@ const usage = `mkfs.vlfs — format or check a VLFS volume image (ADR 0050 / ADR
       finding and exits non-zero on any non-informational finding.
       On a sealed volume the passphrase additionally unwraps the DEK
       and authenticates every sealed block's tag (bad_block_auth
-      reports the block number); without it only the plaintext
-      structure is verified.
+      reports the block number; a journal-region failure is the
+      informational journal_torn — a kill's torn tail, not a home
+      verdict); without it only the plaintext structure is verified.
 
   mkfs.vlfs --emit-regions <image>
       Print the .regions dump (non-zero byte runs) of a formatted image;
