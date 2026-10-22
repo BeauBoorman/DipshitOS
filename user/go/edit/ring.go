@@ -44,6 +44,11 @@ type doc struct {
 	// emptyShown is the M123b marker latch, per buffer: `goedit: empty`
 	// prints once per transition into an empty buffer.
 	emptyShown bool
+	// folds is the M166b (#2987) fold table — open-sorted brace spans
+	// whose middle lines are hidden. It parks with the buffer like the
+	// rest of the doc state and never enters the session blob (the card's
+	// out-of-scope list).
+	folds []fold
 }
 
 // bufMax bounds the ring. Four buffers cover a compile-fix loop without a

@@ -192,7 +192,7 @@ func (e *editor) jumpMatch() bool {
 		vi.ConsoleLine(markerMatch + "none")
 		return true
 	}
-	e.moveCaret(m, false)
+	e.moveCaret(m, false, "match")
 	vi.ConsoleLine(markerMatch + "jump off=" + vi.Itoa64(int64(m)))
 	return true
 }

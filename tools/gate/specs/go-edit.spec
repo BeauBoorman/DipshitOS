@@ -99,6 +99,29 @@ for name, body in [("UNDO.TXT", b"ab\n"), ("CLIP.TXT", b"clipthis"),
                    ("BKT.TXT", b"{abcdef}")]:
     with open(os.path.join(ed, name), "wb") as f:
         f.write(body)
+# M166b (#2987): the run-13 fold leg's fixture. `func f() {` opens on line
+# 5 and closes on line 10 (four hidden lines of 38-wide text so the pixel
+# probe can tell a collapsed row from a painted one); the `{` inside the
+# line-3 string is the classifyGo refusal case, and `func g() {` after it
+# proves the fold does not swallow what follows.
+fold = "\n".join([
+    "package main",
+    "",
+    'var s = "brace { not a block"',
+    "",
+    "func f() {",
+    "\t" + "a" * 38,
+    "\t" + "b" * 38,
+    "\t" + "c" * 38,
+    "\t" + "d" * 38,
+    "}",
+    "",
+    "func g() {",
+    "\tx := 1",
+    "}",
+]) + "\n"
+with open(os.path.join(ed, "FOLD.GO"), "wb") as f:
+    f.write(fold.encode())
 print("staged GOEDIT.ELF into share (%d bytes) and %s (%d bytes)" %
       (os.path.getsize(os.path.join(share, "GOEDIT.ELF")),
        seed, os.path.getsize(seed)))
@@ -904,14 +927,24 @@ vgate_file script3-13.txt <<'EOF'
 echo rx-goedit-match-ok
 EOF
 
+# M166b (#2987): the fold leg runs first, then Ctrl-W drops buffer 2 and
+# the bracket leg replays on BKT.TXT so the run still ends on the probe
+# frame. Chords: open FOLD.GO into buffer 2, `ctrl-g,3` + ctrl-k refuses
+# the string-brace (`fold none`), `ctrl-g,5` + ctrl-k folds the function
+# (`fold on line=5 hidden=4`) — snap-13-1 fires on that post-present
+# status while the following goto digits only repaint the bottom bar —
+# `ctrl-g,7` lands inside the fold and opens it (`fold off line=5
+# reason=goto`), ctrl-k refolds (caret inside -> onto the `{`), ctrl-w
+# closes the clean buffer back onto BKT.TXT, and the bracket leg replays.
 vgate_run 13 -- \
     --screen '$RUN_DIR/screen-13' \
     --via-virtio \
     --snapshot-out '$RUN_DIR/snap-13' \
     --script '$RUN_DIR/script-13.txt' \
-    --input-chords 'home,ctrl-b,ctrl-b,right,ctrl-b,home' \
+    --input-chords 'ctrl-shift-o,F,O,L,D,.,G,O,return,ctrl-g,3,return,ctrl-k,ctrl-g,5,return,ctrl-k,ctrl-g,7,return,ctrl-k,ctrl-w,home,ctrl-b,ctrl-b,right,ctrl-b,home' \
     --input-chords-after 'goedit: present' \
     --snapshot-after 'rx-goedit-match-ok' \
+    --snapshot-after 'goedit: status line=5/15 col=1 fold=1' \
     --script3 '$RUN_DIR/script3-13.txt' \
     --script3-after 'goedit: match none' \
     --script3-delay 5 \
@@ -924,6 +957,17 @@ vgate_assert 13 serial-contains 'goedit: match jump off=7'
 vgate_assert 13 serial-contains 'goedit: status line=1/1 col=8'
 vgate_assert 13 serial-contains 'goedit: match jump off=0'
 vgate_assert 13 serial-contains 'goedit: match none'
+# M166b: the fold leg — the pick opens FOLD.GO into the second buffer, the
+# string-brace refuses, the function folds twice (on, off via goto, on
+# again) and the status carries the live count.
+vgate_assert 13 serial-contains 'goedit: pick open /host/EDIT/FOLD.GO'
+vgate_assert 13 serial-contains 'goedit: read /host/EDIT/FOLD.GO n=240'
+vgate_assert 13 serial-contains 'goedit: buffer switch i=2/2 path=/host/EDIT/FOLD.GO'
+vgate_assert 13 serial-contains 'goedit: fold none'
+vgate_assert 13 serial-count 'goedit: fold on line=5 hidden=4' 2
+vgate_assert 13 serial-contains 'goedit: fold off line=5 reason=goto'
+vgate_assert 13 serial-contains 'goedit: status line=5/15 col=10 fold=1'
+vgate_assert 13 serial-contains 'goedit: buffer switch i=1/1 path=/host/EDIT/BKT.TXT'
 vgate_assert 13 serial-contains 'rx-goedit-match-ok'
 vgate_assert 13 serial-absent '[EXC] parking:'
 vgate_assert 13 serial-absent 'exited status=139'
@@ -934,7 +978,11 @@ vgate_assert 13 serial-absent 'exited status=139'
 # window geometry — the teal set must be one tight 8x8-ish cell, and the
 # caret's amber block (2x8) must sit exactly 7 cells (56 px) to its left
 # on the same row.
-vgate_assert 13 snapshot 'snap-13-*.raw' <<'PY'
+# M166b: snap-13-0 is the end-of-run bracket probe frame like before.
+# snap-13-1 is the mid-run folded frame, fired on the fold-on status —
+# the goto digits that follow only repaint the bottom bar, so the
+# document rows stay folded for the whole remaining chord window.
+vgate_assert 13 snapshot 'snap-13-0.raw' <<'PY'
 import sys
 
 W, H = 1280, 720
@@ -971,6 +1019,71 @@ assert len(band) >= 8, \
     "no amber caret block 7 cells left of the match cell (%d px in the band)" % len(band)
 print("goedit bracket leg: teal px=%d cell=(%d..%d,%d..%d) %dx%d, caret px=%d"
       % (n, x0, x1, y0, y1, bw, bh, len(band)))
+PY
+
+# M166b: snap-13-1 is the run's last frame — FOLD.GO folded. The probe
+# works the window's own rect (32,32,512,384 like run 14): the `{...}`
+# tail is the only InkMuted text in the document band, so its row is the
+# fold's row. The band 10 px under it must paint the close line — a lone
+# `}` of ink in the first cells — while the four 38-wide hidden lines
+# would ink that same band out past x=150.
+vgate_assert 13 snapshot 'snap-13-1.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+need = W * H * 4
+if len(raw) < need:
+    sys.exit("snapshot is %d bytes, want at least %d (%dx%d BGRX)"
+             % (len(raw), need, W, H))
+
+INK = (0xe6, 0xed, 0xf3)
+MUTED = (0x8b, 0x98, 0xa5)
+AMBER = (0xff, 0xd7, 0x5f)
+
+def close(px, rgb, tol):
+    return max(abs(px[2] - rgb[0]), abs(px[1] - rgb[1]),
+               abs(px[0] - rgb[2])) <= tol
+
+# The window band: x in [32,544), document rows y in [56,416).
+X0, X1, Y0, Y1 = 32, 544, 56, 416
+# The `{...}` tail is the only InkMuted text in the document band above
+# the bar row — and it sits right of the open line's text (x>80 keeps the
+# goto bar's muted label, painted at the text origin, out of the set).
+muted = []
+ink_by_row = {}
+for y in range(Y0, Y1):
+    base = y * W * 4
+    row = (y - 60) // 10
+    for x in range(X0, X1):
+        px = raw[base + x * 4: base + x * 4 + 3]
+        if close(px, MUTED, 12) and x > 80:
+            muted.append((x, y))
+        elif close(px, INK, 12):
+            ink_by_row.setdefault(row, []).append(x)
+
+assert len(muted) >= 20, \
+    "no InkMuted `{...}` tail in the document band (%d px)" % len(muted)
+fold_y = min(p[1] for p in muted)
+fold_row = (fold_y - 60) // 10
+
+under = ink_by_row.get(fold_row + 1, [])
+assert under, "the row under the fold paints nothing — where is `}`?"
+u0, u1 = min(under), max(under)
+assert u1 - u0 <= 16 and u1 < X0 + 24, \
+    "the row under the fold carries a wide line (%d..%d), not the lone `}`" \
+    % (u0, u1)
+# The caret rides the open line: amber inside the fold row's band.
+band_y0 = 60 + fold_row * 10
+amber = 0
+for y in range(band_y0, band_y0 + 8):
+    base = y * W * 4
+    for x in range(X0, X1):
+        if close(raw[base + x * 4: base + x * 4 + 3], AMBER, 24):
+            amber += 1
+assert amber >= 8, "no caret on the fold's open row (%d px)" % amber
+print("goedit fold leg: fold row=%d muted px=%d, close-row ink x=%d..%d, caret px=%d"
+      % (fold_row, len(muted), u0, u1, amber))
 PY
 
 # --- M149c (#2808) run 14: the -minimap column — pixels + press-to-jump ---

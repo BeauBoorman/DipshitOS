@@ -306,4 +306,5 @@ func (e *editor) jumpDiag(i int) {
 	e.cur = off + col
 	vi.ConsoleLine(markerErrs + "jump line=" + vi.Itoa64(int64(r.line)) +
 		" col=" + vi.Itoa64(int64(r.col)))
+	e.unfoldAt(e.cur, "diags")
 }

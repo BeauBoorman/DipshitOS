@@ -260,6 +260,13 @@ const (
 	markerMatch  = "goedit: match "
 	markerFormat = "goedit: format "
 
+	// M166b (#2987): brace folding. `fold on line= hidden=` and `fold off
+	// line=` are the toggle's receipts — the latter carries ` reason=` when
+	// a landing (goto, find, replace, match, diags, minimap, undo, redo or
+	// a plain move) opened the fold to keep the caret visible. `fold clear
+	// n=` is Ctrl-U's unfold-all, `fold none` the no-block refusal.
+	markerFold = "goedit: fold "
+
 	// M123d (#2578): the shared in-app error banner. `banner` is the raise
 	// — the failure text the strip shows — printed only after the frame
 	// that carries it is presented; `banner act` is the resolution (`copy`,
@@ -833,6 +840,7 @@ var bufWrite = func(p string, b []byte) int64 {
 
 func (e *editor) load() {
 	b, rc := bufRead(e.path, maxBuffer)
+	e.folds = nil // M166b: folds index the buffer; new bytes retire them
 	if rc < 0 {
 		e.buf = nil
 		e.cur = 0
@@ -1058,6 +1066,15 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	if chord(ev, 'b', false) {
 		return e.jumpMatch()
 	}
+	// M166b (#2987): Ctrl-K toggles the innermost brace block at the caret,
+	// Ctrl-U unfolds everything — both free in both tab seats, checked like
+	// Ctrl-R/Ctrl-B above.
+	if chord(ev, 'k', false) {
+		return e.toggleFold()
+	}
+	if chord(ev, 'u', false) {
+		return e.clearFolds()
+	}
 	// M124b: Ctrl-O opens through the shared picker; Ctrl-Shift-S is the
 	// save-as. The save-as check must precede isSave, whose isChord does
 	// not read the Shift flag. M166a adds the ring's chords: Ctrl-Shift-O
@@ -1105,22 +1122,22 @@ func (e *editor) handleKey(ev vi.Event) bool {
 		extend := ev.Flags&vi.ModShift != 0 || e.markOn
 		switch ev.Arg0 {
 		case usageLeft:
-			e.moveCaret(moveLeft(e.buf, e.cur), extend)
+			e.moveCaret(moveLeft(e.buf, e.cur), extend, "move")
 			return true
 		case usageRight:
-			e.moveCaret(moveRight(e.buf, e.cur), extend)
+			e.moveCaret(moveRight(e.buf, e.cur), extend, "move")
 			return true
 		case usageUp:
-			e.moveCaret(moveLine(e.buf, e.cur, -1), extend)
+			e.moveCaret(e.moveLineVis(e.cur, -1), extend, "move")
 			return true
 		case usageDown:
-			e.moveCaret(moveLine(e.buf, e.cur, 1), extend)
+			e.moveCaret(e.moveLineVis(e.cur, 1), extend, "move")
 			return true
 		case usageHome:
-			e.moveCaret(moveHome(e.buf, e.cur), extend)
+			e.moveCaret(moveHome(e.buf, e.cur), extend, "move")
 			return true
 		case usageEnd:
-			e.moveCaret(moveEnd(e.buf, e.cur), extend)
+			e.moveCaret(moveEnd(e.buf, e.cur), extend, "move")
 			return true
 		case usageFwdDel:
 			return e.deleteForward()
@@ -1453,6 +1470,7 @@ func (e *editor) runFind() {
 	e.sel, e.selSet, e.markOn = off+len(pat), true, false
 	e.cur = off
 	vi.ConsoleLine(findMarker(pat, ordinal, total))
+	e.unfoldAt(off, "find")
 }
 
 // runGoto runs the goto bar's Return: move the caret to 1-based line n and
@@ -1475,6 +1493,7 @@ func (e *editor) runGoto() {
 	e.selSet, e.markOn = false, false
 	e.cur = off
 	vi.ConsoleLine(gotoMarker(n, off))
+	e.unfoldAt(off, "goto")
 }
 
 // unsavedExit answers the unsaved-changes dialog: arg0 == 0 is the Save choice
@@ -1579,7 +1598,10 @@ func (e *editor) selBytes() ([]byte, bool) {
 // moveCaret lands the caret at to. With extend (a Shift modifier or the
 // ctrl-shift-m mark) the selection grows from its anchor; without it the
 // selection collapses. Either way a caret move closes an open run.
-func (e *editor) moveCaret(to int, extend bool) {
+// reason names the landing for the M166b unfold rule: a landing inside a
+// fold's hidden span opens every fold containing it (`fold off line=
+// reason=`). nav keys pass "move"; the jump paths pass their own names.
+func (e *editor) moveCaret(to int, extend bool, reason string) {
 	e.clampCaret()
 	if to < 0 {
 		to = 0
@@ -1596,6 +1618,7 @@ func (e *editor) moveCaret(to int, extend bool) {
 		e.selSet, e.markOn = false, false
 	}
 	e.cur = to
+	e.unfoldAt(to, reason)
 }
 
 // selectAll is Ctrl-A in the document: anchor at 0, caret at the end.
@@ -1626,6 +1649,7 @@ func (e *editor) toggleMark() bool {
 // joins truly consecutive keystrokes.
 func (e *editor) applyOp(o editOp, cur int) {
 	e.buf = applySplices(e.buf, o.sp, false)
+	e.shiftFolds(o.sp, false)
 	e.cur = cur
 	e.hist.push(o)
 	e.selSet, e.markOn = false, false
@@ -1642,11 +1666,13 @@ func (e *editor) undo() {
 		return
 	}
 	e.buf = applySplices(e.buf, o.sp, true)
+	e.shiftFolds(o.sp, true)
 	e.cur = o.sp[0].pos + len(o.sp[0].old)
 	e.selSet, e.markOn = false, false
 	e.markDirty()
 	vi.ConsoleLine(markerUndo + "n=" + vi.Itoa64(int64(len(e.hist.undo))) +
 		" cur=" + vi.Itoa64(int64(e.cur)))
+	e.unfoldAt(e.cur, "undo")
 }
 
 // redo reapplies the newest undone op, caret after its inserted text.
@@ -1657,6 +1683,7 @@ func (e *editor) redo() {
 		return
 	}
 	e.buf = applySplices(e.buf, o.sp, false)
+	e.shiftFolds(o.sp, false)
 	// Caret after the last splice's inserted text — in APPLIED-buffer
 	// coordinates, so shift the original pos by the earlier splices' delta.
 	shift := 0
@@ -1669,6 +1696,7 @@ func (e *editor) redo() {
 	e.markDirty()
 	vi.ConsoleLine(markerRedo + "n=" + vi.Itoa64(int64(len(e.hist.redo))) +
 		" cur=" + vi.Itoa64(int64(e.cur)))
+	e.unfoldAt(e.cur, "redo")
 }
 
 // --- clipboard ------------------------------------------------------------
@@ -1848,6 +1876,11 @@ func (e *editor) statusText() string {
 		}
 		s += vi.Itoa64(int64(len(e.diags)))
 	}
+	// M166b: the live fold count rides the status only while folds exist,
+	// so a foldless session's status text is byte-identical to before.
+	if len(e.folds) > 0 {
+		s += " fold=" + vi.Itoa64(int64(len(e.folds)))
+	}
 	if e.dirty {
 		s += " *"
 	}
@@ -1893,6 +1926,7 @@ func (e *editor) runReplace() {
 	e.applyOp(editOp{kind: opEdit, sp: []splice{{pos: off, old: old, ins: repl}}}, off+len(repl))
 	vi.ConsoleLine(markerRepl + string(pat) + "' -> '" + string(repl) + "' hit=" +
 		vi.Itoa64(int64(ordinal)) + "/" + vi.Itoa64(int64(total)))
+	e.unfoldAt(e.cur, "replace")
 }
 
 // runReplaceAll splices every match in one op — a single Ctrl-Z reverts the
@@ -1921,6 +1955,7 @@ func (e *editor) runReplaceAll() {
 	e.applyOp(editOp{kind: opEdit, sp: sp}, sp[0].pos+len(repl))
 	vi.ConsoleLine(markerReplAll + string(pat) + "' -> '" + string(repl) +
 		"' n=" + vi.Itoa64(int64(len(sp))))
+	e.unfoldAt(e.cur, "replace")
 }
 
 // insert splices one UTF-8 encoded scalar at the byte caret and marks the
@@ -2167,10 +2202,17 @@ func (e *editor) draw() {
 	// while the caret sits on a bracket (matchCell refuses otherwise).
 	mOff, mOK := e.matchCell()
 	y := chromeH + 4
+	// M166b: line is the painted (visible) row; hidden fold lines are
+	// skipped without consuming a row, so a folded block reads as its
+	// opening line plus a `{...}` tail and the close line follows it.
 	line, start := 0, 0
 	caretRow, caretCol := -1, 0
 	for i := 0; i <= len(e.buf); i++ {
 		if i != len(e.buf) && e.buf[i] != '\n' {
+			continue
+		}
+		if e.lineHidden(start) {
+			start = i + 1
 			continue
 		}
 		if line >= maxLines {
@@ -2218,6 +2260,15 @@ func (e *editor) draw() {
 			e.drawText(textOrigin+(col+1)*adv, y, string(e.buf[e.cur:i]), tok.Ink)
 		} else if i > start {
 			e.drawText(textOrigin, y, string(e.buf[start:i]), tok.Ink)
+		}
+		// M166b: a fold's opening line carries the `{...}` tail a cell past
+		// its text — muted, so it reads as an annotation, not buffer bytes.
+		if e.foldOnLine(start, i) >= 0 {
+			tx := textOrigin + (utf8.RuneCount(e.buf[start:i])+1)*adv
+			if inDoc && onCaret {
+				tx += adv // the staged accent's spare cell, same shift
+			}
+			e.drawText(tx, y, "{...}", tok.InkMuted)
 		}
 		// M20 U3: the caret's cell, so a find or a goto visibly MOVED it.
 		if onCaret {
@@ -2421,7 +2472,7 @@ func (e *editor) minimapJump(line int) {
 	if off < 0 {
 		off = len(e.buf)
 	}
-	e.moveCaret(off, false)
+	e.moveCaret(off, false, "minimap")
 	vi.ConsoleLine(markerMinimap + vi.Itoa64(int64(line)))
 }
 
