@@ -30,6 +30,15 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Agent-fleet shape: many concurrent PRs, squash merges, stacked branches.
+# The group keys on github.ref — refs/pull/<N>/merge for pull_request,
+# refs/heads/<branch> for push and workflow_dispatch — so a fresh push
+# cancels only its own lane's stale run; every other PR and branch keeps
+# running. Same pattern as docs-gate.yml.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test-macos:
     name: Build (macOS + Swift Launcher)
