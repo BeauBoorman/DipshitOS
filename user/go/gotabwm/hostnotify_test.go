@@ -263,6 +263,36 @@ func TestHostNotifyRevokedMaskClearsStaging(t *testing.T) {
 	}
 }
 
+func TestHostNotifyTooLargeDropsEntryKeepsQueue(t *testing.T) {
+	// A staged toast over the wire's 512-byte payload bound draws
+	// payload_too_large — a defect of THAT entry, not a lane posture:
+	// the poll drops the head alone and the queue behind it survives.
+	f := newNotifyFixture(t, strings.Repeat("c8", 32))
+	hostintSeatInit()
+	f.plantArmed(7, hostint.LaneNotify)
+	hostintSeatTick()
+
+	hostnotifyQueue(strings.Repeat("x", hostint.PayloadMax+1))
+	notifyPush(4, "after", seatTick)
+	if len(hostNotifyPending) != 2 {
+		t.Fatalf("pending = %v", hostNotifyPending)
+	}
+	hostintSeatTick()
+	if len(hostNotifyPending) != 1 || hostNotifyPending[0].text != "after" {
+		t.Fatalf("queue tail lost with the head: %v", hostNotifyPending)
+	}
+	if !f.hasLog("lane=notify reason=" + hostint.RefuseTooLarge) {
+		t.Fatalf("missing payload_too_large refusal: %v", f.logs)
+	}
+	// The survivor emits on the next tick, first seq — the refused entry
+	// never consumed one.
+	hostintSeatTick()
+	recs := f.notifyRecords()
+	if len(recs) != 1 || recs[0].Seq != 1 || string(recs[0].Payload) != "after" {
+		t.Fatalf("survivor emit: %+v", recs)
+	}
+}
+
 func TestHostNotifySeatToastSendsSenderZero(t *testing.T) {
 	// V2-D3: a seat-originated toast (tab id 0 — a host drop, an agent
 	// milestone, an action toast) crosses with sender 0. A click on its

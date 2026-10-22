@@ -57,7 +57,9 @@ final class HostNotify: NSObject {
     /// validly-MAC'd flood from growing memory.
     static let postedBound = 16
 
-    private let session: HostIntSession
+    /// Internal, not private: the banner router reads the epoch off it to
+    /// pick the session a banner click belongs to.
+    let session: HostIntSession
     private var laneDir: URL { session.laneDir }
     private var lastSeq: UInt32 = 0      // last consumed NOTIFY_OUT seq
     private var dropped = 0              // cumulative non-posted count
@@ -85,11 +87,19 @@ final class HostNotify: NSObject {
     /// nothing here is needed beyond the verbs.
     func start() {
         // M114c (#2456): the lane-notify bus verb, same seam as the menu.
+        // notify-click rides the OWNING session's bus too — a secondary
+        // session's verb on the global bus would dispatch the wrong
+        // lane's click path.
         HostIntCommands.registerLane(self)
-        registerVerbs(on: commandBus)
+        registerVerbs(on: HostIntCommands.bus(owning: self))
         guard bundled else { return }
+        // The center takes ONE delegate: the shared banner router, which
+        // dispatches a click to the lane that posted the banner by
+        // identifier prefix — an outbox banner's reveal-on-click stays
+        // live when this lane is armed too.
+        HostBannerRouter.shared.install(self)
         let center = UNUserNotificationCenter.current()
-        center.delegate = self
+        center.delegate = HostBannerRouter.shared
         center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             guard !granted else { return }
             DispatchQueue.main.async {
@@ -317,5 +327,84 @@ extension HostNotify: UNUserNotificationCenterDelegate {
         }
         guard let sender else { return } // not one of this lane's banners
         click(sender: sender)
+    }
+}
+
+// MARK: - HostBannerRouter — the center's single delegate
+//
+// UNUserNotificationCenter takes one delegate per process, but two lanes
+// post banners — this lane's toasts (vhi1-notify-<epoch>-<seq>) and the
+// outbox lane's export landings (vhi1-outbox-<epoch>-<seq>). Before the
+// router, whichever lane installed last owned every click: with both
+// lanes armed the notify delegate dropped outbox clicks outright, so a
+// banner's reveal-on-click was dead in the bundled config.
+//
+// The router is the seam both lanes install onto: a lane registers itself
+// at arm, and a click is dispatched by the request identifier's prefix to
+// a lane of that family whose session epoch is the one the identifier
+// names — a second session's lane can never claim the primary's banner
+// (its epoch differs), and an unmatched identifier falls back to the sole
+// lane of the family so a test-built banner still lands. Each lane keeps
+// its own delegate conformance for the click logic itself; the router
+// only picks.
+final class HostBannerRouter: NSObject {
+    static let shared = HostBannerRouter()
+
+    private let notifyLanes = NSHashTable<HostNotify>.weakObjects()
+    private let outboxLanes = NSHashTable<HostOutbox>.weakObjects()
+
+    func install(_ lane: HostNotify) { notifyLanes.add(lane) }
+    func install(_ lane: HostOutbox) { outboxLanes.add(lane) }
+
+    /// The lane a banner click belongs to — the delegate that runs it.
+    /// Internal so a test can pin the routing without a real
+    /// UNNotificationResponse (which has no public constructor).
+    func route(_ identifier: String) -> UNUserNotificationCenterDelegate? {
+        let parts = identifier.split(separator: "-")
+        guard parts.count == 4, parts[0] == "vhi1" else { return nil }
+        let epoch = UInt32(parts[2])
+        switch parts[1] {
+        case "notify":
+            return pick(notifyLanes.allObjects, epoch: epoch) { $0.session.epoch }
+        case "outbox":
+            return pick(outboxLanes.allObjects, epoch: epoch) { $0.session.epoch }
+        default:
+            return nil
+        }
+    }
+
+    /// The epoch-named lane wins; without a match the family's only lane
+    /// answers (a banner built outside the identifier grammar — a test
+    /// one — still reaches its lane).
+    private func pick<T>(_ lanes: [T], epoch: UInt32?, keyedBy key: (T) -> UInt32) -> T? {
+        if let epoch, let lane = lanes.first(where: { key($0) == epoch }) {
+            return lane
+        }
+        return lanes.count == 1 ? lanes[0] : nil
+    }
+}
+
+extension HostBannerRouter: UNUserNotificationCenterDelegate {
+    /// Both lanes' willPresent is the same answer — D5's frontmost rule —
+    /// so the router returns it directly.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner])
+    }
+
+    /// The click: route by identifier to the posting lane's own
+    /// didReceive — the notify lane's click path for vhi1-notify-…, the
+    /// outbox lane's Finder reveal for vhi1-outbox-…. An identifier from
+    /// neither family (or no surviving lane) is consumed, not fumbled.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        guard let lane = route(response.notification.request.identifier) else {
+            completionHandler()
+            return
+        }
+        lane.userNotificationCenter?(center, didReceive: response,
+                                     withCompletionHandler: completionHandler)
     }
 }

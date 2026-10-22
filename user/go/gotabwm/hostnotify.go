@@ -100,11 +100,18 @@ func hostnotifyPoll() {
 			" len=" + vi.Itoa64(int64(len(entry.text))) + " sha=" + hostint.HexDigest8(sum[:]))
 	case hostint.RefuseBackpressure:
 		// The runner has four of ours unconsumed — wait a tick.
-	default:
+	case hostint.RefuseLaneDisabled:
 		// A posture refusal (lane_disabled after a re-ARMED mask change)
 		// kills the whole staging queue: the consent that staged them is
 		// gone, so the tail goes with the head, named once.
 		hostNotifyPending = hostNotifyPending[:0]
+		eng.RefuseLane(hostint.TagNotifyOut, refusal)
+	default:
+		// A per-entry refusal — payload_too_large on an over-budget
+		// toast, io_error on the publish — condemns the head entry only.
+		// The rest of the queue is not party to it: drop the one, name
+		// the refusal, keep the tail.
+		hostNotifyPending = hostNotifyPending[1:]
 		eng.RefuseLane(hostint.TagNotifyOut, refusal)
 	}
 }

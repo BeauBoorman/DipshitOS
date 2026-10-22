@@ -84,6 +84,33 @@ func TestHostdropBadPayloadRefused(t *testing.T) {
 	}
 }
 
+// The D4 name bound holds at DECODE, not just at click dispatch: a signed
+// record announcing a name past outbox.NameMax is a malformed record, not
+// a delivery — its toast text ("host drop: <name>") would otherwise sail
+// past the strip's text budget.
+func TestHostdropOverBoundNameRefused(t *testing.T) {
+	resetNotify(t)
+	f := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	f.plantArmed(9, hostint.LaneDrop)
+	hostintSeatTick()
+	f.plantDrop(9, 1, strings.Repeat("A", 49), 10)
+	hostintSeatTick()
+	if !f.hasLog("lane=drop reason=" + hostint.RefuseBadRecord) {
+		t.Fatalf("missing bad_record refusal: %v", f.logs)
+	}
+	if len(notifyQueue) != 0 {
+		t.Fatalf("over-bound name produced a toast: %+v", notifyQueue)
+	}
+	// A name AT the bound still delivers — the refusal is the over-bound
+	// contract break, not the 48-byte name itself.
+	f.plantDrop(9, 2, strings.Repeat("B", 48), 10)
+	hostintSeatTick()
+	if !f.hasLog(MarkerHostintDrop + "seq=2 name=" + strings.Repeat("B", 48)) {
+		t.Fatalf("at-bound name refused: %v", f.logs)
+	}
+}
+
 func TestHostdropConsentDeniedWithoutLaneBit(t *testing.T) {
 	resetNotify(t)
 	f := newHostintFixture(t, strings.Repeat("b7", 32))

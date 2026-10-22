@@ -36,14 +36,17 @@ final class HostOutbox: NSObject {
     static let nameMax = 48                      // payload basename bytes (D4)
     static let outboxName = "OUTBOX"
 
-    private let session: HostIntSession
+    /// Internal, not private: the banner router reads the epoch off it
+    /// (session(owning:) covers the lane, the identifier's epoch picks
+    /// the session a click belongs to).
+    let session: HostIntSession
     private var laneDir: URL { session.laneDir }
     private let outboxDir: URL
     let destDir: URL
     private var lastSeq: UInt32 = 0      // last consumed OUTBOX seq
     private var exported = 0             // per-epoch export count
     private var ioLogged = Set<String>() // one io_error per filename
-    private var lastLanding: URL?        // the reveal target
+    private(set) var lastLanding: URL?   // the reveal target
 
     /// Banners and Finder reveals exist only under an app bundle; the
     /// bare gate runner takes the move only (the no_bundle posture the
@@ -59,42 +62,37 @@ final class HostOutbox: NSObject {
 
     /// Create <share>/OUTBOX/ — the runner owns it at arm time (the guest
     /// SDK has no mkdir, the same posture AGENT/ and INBOX/ take) — and
-    /// registers the lane's bus verbs from its own file (the V2-D7 seam:
-    /// lane-outbox toggles the ARMED bit like the M114c toggles,
-    /// reveal-export reveals the most recent landing in Finder).
+    /// registers the lane's bus verbs (the V2-D7 seam: lane-outbox toggles
+    /// the ARMED bit like the M114c toggles, reveal-export reveals the
+    /// most recent landing in Finder). Registration goes through
+    /// HostIntCommands like the other lanes, so the verbs land on the
+    /// OWNING session's bus and toggle that session's mask — never a
+    /// global's (M139a).
     @discardableResult
     func start() -> Bool {
-        commandBus.register(.laneOutbox, HostCommandBus.Registration(
-            itemState: { hostIntSession?.isSuspended(HostInt.laneOutbox) == false },
-            action: { self.toggleLane() }))
-        commandBus.register(.revealExport, HostCommandBus.Registration(
-            isEnabled: { [weak self] in self?.lastLanding != nil },
-            action: { self.revealLast() }))
+        HostIntCommands.registerLane(self)
         do {
             try FileManager.default.createDirectory(at: outboxDir, withIntermediateDirectories: true)
         } catch {
             HostInt.logRefuse(lane: "outbox", reason: .ioError)
             return false
         }
-        // The banner half is bundle-only. The delegate is shared: when
-        // the notify lane is armed it owns the center's delegate (and
-        // M127c's didReceive owns the click path); outbox installs its
-        // own only when no other lane did.
-        if bundled, hostNotify == nil {
+        // The banner half is bundle-only. The center's delegate is the
+        // shared banner router: a click is dispatched to the lane that
+        // posted the banner by identifier prefix, so arming the notify
+        // lane can never mute an export banner's reveal-on-click.
+        if bundled {
+            HostBannerRouter.shared.install(self)
             let center = UNUserNotificationCenter.current()
-            center.delegate = self
+            center.delegate = HostBannerRouter.shared
             center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
         return true
     }
 
-    private func toggleLane() -> HostCommandBus.Outcome {
-        guard let session = hostIntSession else { return .unavailable }
-        return session.setSuspended(HostInt.laneOutbox, !session.isSuspended(HostInt.laneOutbox))
-            ? .performed : .failed
-    }
-
-    private func revealLast() -> HostCommandBus.Outcome {
+    /// The reveal-export verb's action and the banner click's: reveal the
+    /// most recent landing in Finder.
+    func revealLast() -> HostCommandBus.Outcome {
         guard let landing = lastLanding else { return .disabled }
         NSWorkspace.shared.activateFileViewerSelecting([landing])
         return .performed

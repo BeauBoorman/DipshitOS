@@ -46,6 +46,14 @@ enum HostIntCommands {
         session?.drop ?? hostDrop
     }
 
+    /// The bus a lane's verbs belong on — its owning session's bus, the
+    /// global for a bare test lane. Lanes that register extra verbs of
+    /// their own (HostNotify's notify-click) resolve through here so a
+    /// secondary session's verb never lands on the primary's menu.
+    static func bus(owning lane: AnyObject) -> HostCommandBus {
+        bus(of: owner(lane))
+    }
+
     static func registerLane(_ lane: HostClipboard) {
         let s = owner(lane)
         let int = hostInt(of: s)
@@ -75,6 +83,22 @@ enum HostIntCommands {
         bus(of: s).register(.laneNotify, HostCommandBus.Registration(
             itemState: { int?.isSuspended(HostInt.laneNotify) == false },
             action: { toggle(HostInt.laneNotify, in: s) }))
+    }
+
+    /// M127d's pair: lane-outbox toggles the ARMED bit like the other
+    /// lane toggles; reveal-export reveals the registered lane's most
+    /// recent landing in Finder — the verb the export banner's click
+    /// mirrors. Both resolve through the owning session so a secondary
+    /// session's lane toggles ITS mask, not the primary's.
+    static func registerLane(_ lane: HostOutbox) {
+        let s = owner(lane)
+        let int = hostInt(of: s)
+        bus(of: s).register(.laneOutbox, HostCommandBus.Registration(
+            itemState: { int?.isSuspended(HostInt.laneOutbox) == false },
+            action: { toggle(HostInt.laneOutbox, in: s) }))
+        bus(of: s).register(.revealExport, HostCommandBus.Registration(
+            isEnabled: { [weak lane] in lane?.lastLanding != nil },
+            action: { [weak lane] in lane?.revealLast() ?? .unavailable }))
     }
 
     /// The toggle: republish ARMED with the bit cleared (suspend) or set

@@ -21,6 +21,7 @@ package main
 
 import (
 	"virelai/hostint"
+	"virelai/outbox"
 	"virelai/vi"
 )
 
@@ -30,16 +31,20 @@ const MarkerHostintDrop = "gotabwm: hostint drop "
 
 // dropPayload decodes the D4 notice payload [name_len u8][name][size
 // u64le]. ok=false is the caller's bad_record refusal — a length that does
-// not add up exactly is a malformed record, not a delivery. The name goes
-// verbatim into the serial marker line and the toast text, so it is
-// sanitized on decode (dropName): a raw control byte would split the
-// marker the class-B gate greps.
+// not add up exactly, or a name past the D4 bound (outbox.NameMax), is a
+// malformed record, not a delivery: the name the runner is allowed to
+// announce is the name it sanitized to, and a verified record that breaks
+// the contract deserves the refusal, not a toast four times the strip's
+// text budget (an over-budget toast text could not ride a NOTIFY_OUT
+// record at all). The name goes verbatim into the serial marker line and
+// the toast text, so it is sanitized on decode (dropName): a raw control
+// byte would split the marker the class-B gate greps.
 func dropPayload(p []byte) (name string, size uint64, ok bool) {
 	if len(p) < 1+1+8 {
 		return "", 0, false
 	}
 	n := int(p[0])
-	if n == 0 || len(p) != 1+n+8 {
+	if n == 0 || n > outbox.NameMax || len(p) != 1+n+8 {
 		return "", 0, false
 	}
 	for i := 7; i >= 0; i-- {
