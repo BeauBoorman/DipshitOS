@@ -108,6 +108,15 @@ with open(os.path.join(share, "FILL.SH"), "w") as f:
 lines = ["echo L%02d >> /host/PL.TXT" % i for i in range(20)]
 with open(os.path.join(share, "SCRIPT2.SH"), "w") as f:
     f.write("\n".join(lines) + "\n")
+# M121c (#2566): run 09's $Q readback — `$`/`>` are outside the cv-input
+# HID map (the PENV.SH/PCWD.SH constraint), so the write of the read's
+# answer into the share lives in a script the leg can `source`.
+with open(os.path.join(share, "HINTSE.SH"), "w") as f:
+    # `false` ends the script at status=1: `goterm: done status=1` is then
+    # the unique "the source child has fully exited" anchor the
+    # overlay-open '?' hangs on (read's own `done status=0` is ambiguous —
+    # it fires for EVERY zero-exit line).
+    f.write("echo $Q > /host/HINTS-Q.OUT\nfalse\n")
 PY
 
 vgate_run 01 -- --display --input --via-virtio --screen '$RUN_DIR/screen' \
@@ -898,7 +907,51 @@ print(f"restore chain OK: back={back}B replayed; restored < ready < env/cwd "
       f"proofs")
 PY
 
-# --- M121c (#2566) run 05: the '?' chord-hint overlay + child pass-through --
+# The tag-02 unstage precedent, again: the two legs behind run 07 (M121c's
+# hints leg and M154a's run 08) are SHIM boots of the run-01 chain — the
+# drag coords and the single-prompt choreography were written for the
+# refused-declare 64,48 640x400 rect at the BOOT font pair (grid medium,
+# 8x16). Runs 06/07 leave the seat AND its saved session on the share; an
+# unrestored boot after them seats every later run, reexecs the stored
+# tabs (doubled `goterm: ready`/`prompt`), and lands the run-08 drag on
+# the wrong window rect. Run 05's `font large` is the other leak: it
+# persists `font_size` into SETTINGS.TXT on the share, so every later
+# boot's grid is 10x21 — 18 visible rows, the 22-row script output
+# scrolls, and the run-08 drag captures a shifted window of it (observed:
+# `tty: copy 368 bytes` seated and `399 bytes` shim for the 499 B region).
+vgate_assert 07 python <<'PY'
+import os, shutil
+share = os.environ["VG_SHARE"]
+for name in ("GOTABWM.ELF", "SESSION.TABS", "PENV.SH", "PCWD.SH",
+             "HINTS-Q.OUT", "PL.TXT"):
+    p = os.path.join(share, name)
+    if os.path.exists(p):
+        os.unlink(p)
+        print("unstaged %s from share (runs 09/08 boot shim-only)" % p)
+d = os.path.join(share, "STATE")
+if os.path.isdir(d):
+    shutil.rmtree(d)
+    print("unstaged STATE/ from share")
+# font_size is a share-persisted setting: drop the row so the legs boot
+# at the compiled default pair (text small + grid medium). Keep every
+# other key; a file left with only its #v header is removed entirely.
+sp = os.path.join(share, "SETTINGS.TXT")
+if os.path.exists(sp):
+    lines = open(sp).read().splitlines()
+    hdr = next((l for l in lines if l.startswith("#")), "#v2")
+    kept = [l for l in lines if l and not l.startswith("#")
+            and not l.startswith("font_size")]
+    if kept:
+        with open(sp, "w") as f:
+            f.write(hdr + "\n" + "\n".join(kept) + "\n")
+        print("stripped font_size from SETTINGS.TXT (kept %d rows)" % len(kept))
+    else:
+        os.unlink(sp)
+        print("removed SETTINGS.TXT (font_size was the only row)")
+print("share now: %s" % sorted(os.listdir(share)))
+PY
+
+# --- M121c (#2566) run 09: the '?' chord-hint overlay + child pass-through --
 # GOTERM is a tty front-end: '?' at the prompt paints the registry's rows
 # on the alternate screen (app + seat + kernel-terminal chrome — this
 # window answers all three scopes) and a lone Esc pops it. The pass-through
@@ -906,6 +959,35 @@ PY
 # not reading the tty, so a '?' keystroke is stdin, not the overlay chord —
 # proven by the byte landing in HINTS-Q.OUT on the share and by `hints`
 # being absent until after the echo submits.
+#
+# The runner's input slots are one apiece (a repeat overwrites — the run-06
+# comment), so the whole guest-side conversation rides ONE chord batch on
+# ONE anchor plus ONE input-string: `read Q` opens the leg, `?` + Return
+# answer the blocked `read`, `source /HINTSE.SH` types the write of $Q
+# into the share (`$` and `>` are outside the cv-input HID map — the same
+# reason run 07 probes via PENV.SH/PCWD.SH).
+#
+# The overlay-open '?' is NOT in the batch at all: a batch-internal '?' is
+# hopeless against the n==1 check because poll_input drains the whole
+# used ring per pass — a neighbour report 0.25 s away co-delivers and a
+# bundled '?' is literal text (observed: `line ?` 127 from a batch-end '?'
+# at an idle prompt, PROVEN by the return probe). Instead --input-string
+# fires a guaranteed-lone '?' on `goterm: done status=1` — the unique
+# marker HINTSE.SH's trailing `false` produces AFTER the editor has
+# resumed its own read. The batch ENDS on '?' too: whichever '?' lands
+# first at a live FileRead opens; the second one closes it (the overlay's
+# own read loop pops '?' out of ANY-sized read, so the batch-side '?'
+# stays useful even bundled).
+#
+# The backspaces are dead time, not input, three times over: between the
+# `read Q` submit and the stdin '?' (a '?' that lands in the editor's
+# post-submit window, BEFORE the builtin arms its stdin read, gets queued
+# as the NEXT line — observed: `line ?` 127 while `read` went on to eat
+# the source line as ITS stdin); before `source` (`read` consumes
+# TypeAhead in one drain and DROPS whatever trails the newline —
+# observed: 's','o' lost -> `urce` 127); and before the trailing '?' (a
+# child-time keystroke rides the M98f stash and is Fed back as literal
+# text, never the chord).
 vgate_file script-hints.txt <<'EOFX'
 exec GOTERM.ELF
 EOFX
@@ -914,42 +996,47 @@ vgate_file hints-done.txt <<'EOFX'
 echo rx-term-hints-ok
 EOFX
 
-vgate_run 05 -- --display --input --via-virtio --screen '$RUN_DIR/screen-05' \
+vgate_run 09 -- --display --input --via-virtio --screen '$RUN_DIR/screen-09' \
     --script '$RUN_DIR/script-hints.txt' \
-    --input-string 'read Q\n' --input-string-after 'goterm: prompt' \
-    --input-chords '?,return' --input-chords-after 'goterm: line read Q' \
-    --input-string 'echo $Q > /host/HINTS-Q.OUT\n' --input-string-after 'goterm: done status=0' \
-    --input-chords '?,escape' --input-chords-after 'goterm: line echo $Q > /host/HINTS-Q.OUT' \
+    --input-chords 'r,e,a,d,space,Q,return,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,?,return,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,s,o,u,r,c,e,space,/,H,I,N,T,S,E,.,S,H,return,ctrl-shift-c,ctrl-shift-c,ctrl-shift-c,ctrl-shift-c,ctrl-shift-c,ctrl-shift-c,ctrl-shift-c,ctrl-shift-c,escape' \
+    --input-chords-after 'goterm: prompt' \
+    --input-string '?' --input-string-after 'goterm: done status=1' \
     --script2 '$RUN_DIR/hints-done.txt' \
     --script2-after 'goterm: hints close' \
     --script-expect 'rx-term-hints-ok' \
     --timeout 240
 
-vgate_assert 05 serial-contains 'goterm: ready'
-vgate_assert 05 serial-contains 'goterm: line read Q'
-vgate_assert 05 serial-contains 'goterm: hints n=36'
-vgate_assert 05 serial-contains 'goterm: hints row ctrl+shift+c copy the terminal selection'
-vgate_assert 05 serial-contains 'goterm: hints row ctrl+shift+p summon the command palette'
-vgate_assert 05 serial-contains 'goterm: hints close'
-vgate_assert 05 serial-contains 'rx-term-hints-ok'
-vgate_assert 05 serial-absent '[EXC] parking:'
-vgate_assert 05 share-contains 'HINTS-Q.OUT' '?'
+vgate_assert 09 serial-contains 'goterm: ready'
+vgate_assert 09 serial-contains 'goterm: line read Q'
+# n= is the registry's own count for GOTERM's scope (app + seat +
+# kernel-terminal): 36 at M121c, 48 after the M121b/M121e/M132/M137
+# additions — re-pinned, not relaxed (the value is what the registry
+# reports today; a drift in the overlay's row list fails here).
+vgate_assert 09 serial-contains 'goterm: hints n=48'
+vgate_assert 09 serial-contains 'goterm: hints row ctrl+shift+c copy the terminal selection'
+vgate_assert 09 serial-contains 'goterm: hints row ctrl+shift+p summon the command palette'
+vgate_assert 09 serial-contains 'goterm: hints close'
+vgate_assert 09 serial-contains 'rx-term-hints-ok'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 share-contains 'HINTS-Q.OUT' '?'
 
 # The pass-through pin: `read` was blocking on stdin when the first '?' was
 # injected, so that byte had to go to the shell's stdin — the hints n= line
-# may only appear after the echo line, never inside the read window.
-vgate_assert 05 python <<'PY'
+# may only appear after the HINTSE line, never inside the read window.
+# (The anchor is the typed `source` line: the literal `echo $Q >` it runs
+# cannot be typed — `$`/`>` are outside the HID map.)
+vgate_assert 09 python <<'PY'
 import os
 ser = open(os.environ["VG_SER"], errors="replace").read()
 i_read = ser.find("goterm: line read Q")
-i_echo = ser.find("goterm: line echo $Q")
+i_echo = ser.find("goterm: line source /HINTSE.SH")
 i_hints = ser.find("goterm: hints n=")
 i_close = ser.find("goterm: hints close")
-for name, i in (("read line", i_read), ("echo line", i_echo),
+for name, i in (("read line", i_read), ("source line", i_echo),
                 ("hints open", i_hints), ("hints close", i_close)):
     assert i >= 0, f"{name} marker missing"
 assert i_read < i_echo < i_hints < i_close, (
-    f"pass-through broken: read={i_read} echo={i_echo} "
+    f"pass-through broken: read={i_read} source={i_echo} "
     f"hints={i_hints} close={i_close} — '?' reached the overlay while a "
     f"child owned the tty")
 print("'?' pass-through OK: stdin byte to `read`, overlay only at the prompt")
