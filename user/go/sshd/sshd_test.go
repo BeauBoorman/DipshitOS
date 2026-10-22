@@ -190,6 +190,17 @@ func TestParseAuthKeys(t *testing.T) {
 	}
 }
 
+func TestAuthIdentity(t *testing.T) {
+	user, key := authIdentity("user=alice key=ssh-ed25519")
+	if user != "alice" || key != "ssh-ed25519" {
+		t.Fatalf("authIdentity = %q,%q", user, key)
+	}
+	user, key = authIdentity("")
+	if user != "" || key != "" {
+		t.Fatalf("empty desc = %q,%q", user, key)
+	}
+}
+
 func TestServerKexAuthExec(t *testing.T) {
 	hostSeed := mustHex32(t, rfc8032Test1Seed)
 	userSeed := mustHex32(t, "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")

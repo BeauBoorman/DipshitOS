@@ -5,6 +5,10 @@
 // a general ssh. It implements exactly the ADR 0025 D2 profile as a client:
 // version exchange, curve25519-sha256 KEX, ssh-ed25519 host-key pin,
 // chacha20-poly1305@openssh.com, publickey userauth, one session exec.
+// M168f (#2962): a pty session — `pty-req` (TERM=xterm-256color) + `shell`
+// instead of `exec`, then a `SSHKeyScript` line script drives the decrypted
+// channel stream (`after`/`send`/`resize`), CHANNEL_WINDOW_ADJUST returns
+// the window credit the client consumes.
 //
 // The client is a pure byte-stream state machine: `start()` emits the
 // identification line + KEXINIT, `feed(_:)` appends inbound TCP bytes and
@@ -24,6 +28,12 @@ public final class SSHClient {
         public var hostPublicKey: [UInt8]
         public var user: String
         public var execCommand: String
+        /// M168f (#2962): when set the channel request is `pty-req`
+        /// (TERM=xterm-256color) + `shell` instead of `exec`.
+        public var pty: (cols: UInt32, rows: UInt32)?
+        /// The parsed `--net-tcp-connect-ssh-keys` script, evaluated against
+        /// the decrypted channel stream once the shell is live.
+        public var keyScript: SSHKeyScript?
         public var cookieOverride: [UInt8]?
         public var ephemeralOverride: [UInt8]?
         public var versionLine: String
@@ -33,6 +43,8 @@ public final class SSHClient {
             hostPublicKey: [UInt8],
             user: String = "alice",
             execCommand: String = "echo VIRELAI-SSH-SERVER-OK-ARGV2",
+            pty: (cols: UInt32, rows: UInt32)? = nil,
+            keyScript: SSHKeyScript? = nil,
             cookieOverride: [UInt8]? = nil,
             ephemeralOverride: [UInt8]? = nil,
             versionLine: String = "SSH-2.0-VirelaiOS_1.0"
@@ -41,6 +53,8 @@ public final class SSHClient {
             self.hostPublicKey = hostPublicKey
             self.user = user
             self.execCommand = execCommand
+            self.pty = pty
+            self.keyScript = keyScript
             self.cookieOverride = cookieOverride
             self.ephemeralOverride = ephemeralOverride
             self.versionLine = versionLine
@@ -85,12 +99,30 @@ public final class SSHClient {
     private var authed = false
     private var channelOpen = false
     private var execSent = false
+    // M168f (#2962): the interactive-session state — the channel request
+    // currently outstanding (pty-req, then shell), the peer's window +
+    // max-packet from OPEN_CONFIRMATION, the credit we owe back via
+    // CHANNEL_WINDOW_ADJUST, CHANNEL_DATA queued while the peer's window
+    // is shut, and the key-script cursor.
+    private enum OutstandingRequest { case none, ptyReq, shell }
+    private var outstandingRequest: OutstandingRequest = .none
+    private var sessionLive = false
+    private var remoteWindow: UInt32 = 0
+    private var remoteMaxPacket: UInt32 = 0
+    private var localWindowLeft: UInt32 = SSHServer.localWindow
+    private var windowConsumed: UInt32 = 0
+    private var pendingData: [UInt8] = []
+    private var keyScript: SSHKeyScript?
+    private var scriptCursor = 0
+    private var scriptDoneLogged = false
+    private var ptyBytesLogged = false
 
     public init(config: Config) {
         self.config = config
         userKey = try! Curve25519.Signing.PrivateKey(
             rawRepresentation: Data(config.userKeySeed)
         )
+        keyScript = config.keyScript
     }
 
     public var isClosed: Bool { phase == .closed || phase == .failed }
@@ -392,7 +424,7 @@ public final class SSHClient {
         log("publickey request user=\(config.user)")
     }
 
-    private func sendChannelAndExec() {
+    private func sendChannelOpen() {
         var open = SSHWriter()
         open.byte(SSHServer.msgChannelOpen)
         open.string(SSHServer.sessionType)
@@ -415,6 +447,143 @@ public final class SSHClient {
         log("exec \(config.execCommand)")
     }
 
+    // MARK: - M168f (#2962): the scripted pty session
+
+    private static let requestPty = "pty-req"
+    private static let requestShell = "shell"
+    private static let requestWindowChange = "window-change"
+    private static let ptyTerm = "xterm-256color"
+
+    /// RFC 4254 §6.2: TERM, character/rows, pixel geometry, encoded modes.
+    static func ptyRequestPayload(recipient: UInt32, cols: UInt32, rows: UInt32) -> [UInt8] {
+        var w = SSHWriter()
+        w.byte(SSHServer.msgChannelRequest)
+        w.uint32(recipient)
+        w.string(requestPty)
+        w.bool(true)
+        w.string(ptyTerm)
+        w.uint32(cols)
+        w.uint32(rows)
+        w.uint32(0)
+        w.uint32(0)
+        w.string("")
+        return w.bytes
+    }
+
+    /// RFC 4254 §6.5: `shell` carries no request-specific fields.
+    static func shellRequestPayload(recipient: UInt32) -> [UInt8] {
+        var w = SSHWriter()
+        w.byte(SSHServer.msgChannelRequest)
+        w.uint32(recipient)
+        w.string(requestShell)
+        w.bool(true)
+        return w.bytes
+    }
+
+    /// RFC 4254 §6.7: a notification — want_reply is false by the RFC.
+    static func windowChangePayload(recipient: UInt32, cols: UInt32, rows: UInt32) -> [UInt8] {
+        var w = SSHWriter()
+        w.byte(SSHServer.msgChannelRequest)
+        w.uint32(recipient)
+        w.string(requestWindowChange)
+        w.bool(false)
+        w.uint32(cols)
+        w.uint32(rows)
+        w.uint32(0)
+        w.uint32(0)
+        return w.bytes
+    }
+
+    static func channelDataPayload(recipient: UInt32, data: [UInt8]) -> [UInt8] {
+        var w = SSHWriter()
+        w.byte(SSHServer.msgChannelData)
+        w.uint32(recipient)
+        w.string(data)
+        return w.bytes
+    }
+
+    static func windowAdjustPayload(recipient: UInt32, amount: UInt32) -> [UInt8] {
+        var w = SSHWriter()
+        w.byte(SSHServer.msgChannelWindowAdjust)
+        w.uint32(recipient)
+        w.uint32(amount)
+        return w.bytes
+    }
+
+    private func sendPtyRequest(cols: UInt32, rows: UInt32) {
+        sendPacket(Self.ptyRequestPayload(recipient: serverChannel, cols: cols, rows: rows))
+        outstandingRequest = .ptyReq
+        log("pty-req \(cols)x\(rows) term=\(Self.ptyTerm)")
+    }
+
+    // CHANNEL_DATA the script's `send` ops produce is bounded by the peer's
+    // advertised window and max-packet; a remainder waits for the peer's
+    // WINDOW_ADJUST, same contract as sshlib's flushChannel.
+    private func queueChannelData(_ data: [UInt8]) {
+        pendingData.append(contentsOf: data)
+        flushPendingData()
+    }
+
+    private func flushPendingData() {
+        let maxPacket = remoteMaxPacket == 0 ? UInt32.max : remoteMaxPacket
+        while !pendingData.isEmpty && remoteWindow > 0 {
+            let n = min(Int(remoteWindow), Int(maxPacket), pendingData.count)
+            sendPacket(Self.channelDataPayload(
+                recipient: serverChannel, data: Array(pendingData[0 ..< n])
+            ))
+            pendingData.removeFirst(n)
+            remoteWindow -= UInt32(n)
+        }
+    }
+
+    // The channel-stream match for `after <text>`: the cursor never moves
+    // back, so a later `after` waits for a fresh occurrence.
+    private func findNeedle(_ needle: [UInt8], from start: Int) -> Int? {
+        guard !needle.isEmpty, start < stdout.count else { return nil }
+        var i = start
+        while i + needle.count <= stdout.count {
+            var j = 0
+            while j < needle.count && stdout[i + j] == needle[j] { j += 1 }
+            if j == needle.count { return i + needle.count }
+            i += 1
+        }
+        return nil
+    }
+
+    // Walk the parsed key script against the decrypted channel stream: each
+    // `after` blocks until its bytes appear; `send` and `resize` emit
+    // immediately. Runs once per inbound packet while the session is live.
+    private func runScript() {
+        guard sessionLive, var script = keyScript else { return }
+        while let op = script.current {
+            switch op {
+            case .after(let needle):
+                guard let end = findNeedle(needle, from: scriptCursor) else {
+                    keyScript = script
+                    return
+                }
+                scriptCursor = end
+                script.advance()
+                log("keys: after matched at stream offset \(end)")
+            case .send(let bytes):
+                queueChannelData(bytes)
+                script.advance()
+                log("keys: sent \(bytes.count) byte(s)")
+            case .resize(let cols, let rows):
+                sendPacket(Self.windowChangePayload(
+                    recipient: serverChannel, cols: cols, rows: rows
+                ))
+                script.advance()
+                log("keys: resize \(cols)x\(rows)")
+            }
+        }
+        keyScript = script
+        if !scriptDoneLogged {
+            scriptDoneLogged = true
+            log("keys: script done")
+        }
+    }
+
     private func handleEncrypted(_ payload: [UInt8]) {
         guard let kind = payload.first else { return }
         switch kind {
@@ -431,7 +600,7 @@ public final class SSHClient {
         case SSHServer.msgUserauthSuccess:
             authed = true
             log("publickey accepted user=\(config.user) key=ssh-ed25519")
-            sendChannelAndExec()
+            sendChannelOpen()
         case SSHServer.msgChannelOpenConfirmation:
             var r = SSHReader(payload)
             _ = try? r.byte()
@@ -442,22 +611,67 @@ public final class SSHClient {
                 fail("malformed channel confirm")
                 return
             }
-            _ = try? r.uint32()
-            _ = try? r.uint32()
+            guard let win = try? r.uint32(), let maxPacket = try? r.uint32() else {
+                fail("malformed channel confirm")
+                return
+            }
+            remoteWindow = win
+            remoteMaxPacket = maxPacket
             serverChannel = sender
             channelOpen = true
             log("channel confirmed remote=\(sender)")
-            sendExec()
+            if let pty = config.pty {
+                sendPtyRequest(cols: pty.cols, rows: pty.rows)
+            } else {
+                sendExec()
+            }
         case SSHServer.msgChannelSuccess:
-            log("channel success")
+            switch outstandingRequest {
+            case .ptyReq:
+                outstandingRequest = .shell
+                sendPacket(Self.shellRequestPayload(recipient: serverChannel))
+                log("pty-req granted; shell sent")
+            case .shell:
+                outstandingRequest = .none
+                sessionLive = true
+                log("shell granted; pty session live")
+                runScript()
+            case .none:
+                log("channel success")
+            }
         case SSHServer.msgChannelFailure:
             fail("channel request failed")
+        case SSHServer.msgChannelWindowAdjust:
+            var r = SSHReader(payload)
+            _ = try? r.byte()
+            _ = try? r.uint32()
+            if let add = try? r.uint32() {
+                remoteWindow = add > UInt32.max - remoteWindow
+                    ? UInt32.max : remoteWindow + add
+                flushPendingData()
+            }
         case SSHServer.msgChannelData:
             var r = SSHReader(payload)
             _ = try? r.byte()
             _ = try? r.uint32()
             if let data = try? r.string() {
+                guard data.count <= localWindowLeft else {
+                    fail("channel data past advertised window")
+                    return
+                }
                 stdout.append(contentsOf: data)
+                localWindowLeft -= UInt32(data.count)
+                windowConsumed += UInt32(data.count)
+                // Return credit as the stream is consumed — sshlib's Drain
+                // uses the same half-window threshold.
+                if windowConsumed >= SSHServer.localWindow / 2 {
+                    sendPacket(Self.windowAdjustPayload(
+                        recipient: serverChannel, amount: windowConsumed
+                    ))
+                    localWindowLeft += windowConsumed
+                    windowConsumed = 0
+                }
+                runScript()
             }
         case SSHServer.msgChannelRequest:
             var r = SSHReader(payload)
@@ -467,14 +681,25 @@ public final class SSHClient {
             _ = try? r.bool()
             if name == SSHServer.requestExitStatus, let st = try? r.uint32() {
                 exitStatus = st
-                let text = String(decoding: stdout, as: UTF8.self)
-                    .trimmingCharacters(in: .newlines)
-                log("stdout \(text)")
+                if config.pty != nil {
+                    // The session stream is binary frames — summarize it
+                    // instead of the exec path's text dump.
+                    log("pty bytes=\(stdout.count)")
+                    ptyBytesLogged = true
+                } else {
+                    let text = String(decoding: stdout, as: UTF8.self)
+                        .trimmingCharacters(in: .newlines)
+                    log("stdout \(text)")
+                }
                 log("exit-status=\(st)")
             }
         case SSHServer.msgChannelEof:
             log("channel eof")
         case SSHServer.msgChannelClose:
+            if config.pty != nil && !ptyBytesLogged {
+                log("pty bytes=\(stdout.count)")
+                ptyBytesLogged = true
+            }
             log("channel close")
             phase = .closed
         default:
@@ -560,5 +785,121 @@ public final class SSHClient {
     private func fail(_ reason: String) {
         log("protocol failure: \(reason)")
         phase = .failed
+    }
+}
+
+// M168f (#2962): the `--net-tcp-connect-ssh-keys` line script. One op per
+// line, evaluated in order against the decrypted channel stream once the
+// pty session is live:
+//
+//   after <text>             wait until the stream carries these bytes
+//   send <escaped bytes>     emit CHANNEL_DATA (escapes: \\ \n \r \t \0 \e \xNN)
+//   resize <cols>x<rows>     emit a `window-change` channel request
+//
+// Blank lines and `#` comments are ignored. The argument is the rest of
+// the line after the verb's single separating space — `after`/`send`
+// arguments are backslash-unescaped, `resize` takes literal `<cols>x<rows>`.
+public struct SSHKeyScript: Equatable {
+    public enum Op: Equatable {
+        case after([UInt8])
+        case send([UInt8])
+        case resize(cols: UInt32, rows: UInt32)
+    }
+
+    public struct ParseError: Error, Equatable, CustomStringConvertible {
+        public let line: Int
+        public let reason: String
+        public var description: String { "line \(line): \(reason)" }
+    }
+
+    public let ops: [Op]
+    public private(set) var index = 0
+
+    public var current: Op? { index < ops.count ? ops[index] : nil }
+    public var isDone: Bool { index >= ops.count }
+
+    public mutating func advance() { index += 1 }
+
+    public init(text: String) throws {
+        var parsed: [Op] = []
+        var lineNo = 0
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            lineNo += 1
+            var line = raw.drop(while: { $0 == " " || $0 == "\t" })
+            if line.last == "\r" { line = line.dropLast() }
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            guard let sp = line.firstIndex(of: " ") else {
+                throw ParseError(line: lineNo, reason: "expected 'after|send|resize <arg>'")
+            }
+            let verb = line[..<sp]
+            let arg = line[line.index(after: sp)...]
+            switch verb {
+            case "after":
+                parsed.append(.after(try Self.unescape(arg, line: lineNo, allowEmpty: false)))
+            case "send":
+                parsed.append(.send(try Self.unescape(arg, line: lineNo, allowEmpty: false)))
+            case "resize":
+                parsed.append(try Self.resizeOp(arg, line: lineNo))
+            default:
+                throw ParseError(line: lineNo, reason: "unknown verb '\(verb)'")
+            }
+        }
+        ops = parsed
+    }
+
+    private static func unescape(
+        _ s: Substring, line: Int, allowEmpty: Bool
+    ) throws -> [UInt8] {
+        var bytes: [UInt8] = []
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            guard c == "\\" else {
+                bytes.append(contentsOf: String(c).utf8)
+                i = s.index(after: i)
+                continue
+            }
+            let e = s.index(after: i)
+            guard e < s.endIndex else {
+                throw ParseError(line: line, reason: "trailing backslash")
+            }
+            switch s[e] {
+            case "n": bytes.append(0x0a)
+            case "r": bytes.append(0x0d)
+            case "t": bytes.append(0x09)
+            case "0": bytes.append(0x00)
+            case "e": bytes.append(0x1b)
+            case "\\": bytes.append(0x5c)
+            case "x":
+                let h1 = s.index(after: e)
+                guard h1 < s.endIndex, let h2 = s.index(h1, offsetBy: 1, limitedBy: s.endIndex),
+                      h2 < s.endIndex,
+                      let v = UInt8(s[h1 ... h2], radix: 16)
+                else {
+                    throw ParseError(line: line, reason: "bad \\xNN escape")
+                }
+                bytes.append(v)
+                i = s.index(after: h2)
+                continue
+            default:
+                throw ParseError(line: line, reason: "unknown escape '\\\(s[e])'")
+            }
+            i = s.index(after: e)
+        }
+        guard allowEmpty || !bytes.isEmpty else {
+            throw ParseError(line: line, reason: "empty argument")
+        }
+        return bytes
+    }
+
+    private static func resizeOp(_ s: Substring, line: Int) throws -> Op {
+        let halves = s.split(separator: "x", omittingEmptySubsequences: false)
+        guard halves.count == 2,
+              let cols = UInt32(halves[0]), let rows = UInt32(halves[1]),
+              cols > 0, rows > 0, cols <= 65535, rows <= 65535
+        else {
+            throw ParseError(line: line, reason: "resize expects <cols>x<rows>")
+        }
+        return .resize(cols: cols, rows: rows)
     }
 }

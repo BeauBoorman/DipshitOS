@@ -95,12 +95,18 @@ func main() {
 // rather than the singleton socket. Returns nonzero when the transport
 // or the SSH machine failed.
 func serveSession(c *vi.Conn, idx int, seed [32]byte, keys []AuthKey) int {
+	var authDesc string
 	srv := newServer(serverConfig{
 		HostSeed: seed,
 		Keys:     keys,
 		Run:      func(cmd string) ([]byte, uint32, error) { return runGosh(cmd, execOutPath(idx)) },
-		Log:      logLine,
-		Entropy:  fillRandom,
+		Log: func(line string) {
+			logLine(line)
+			if d := strings.TrimPrefix(line, "publickey accepted "); d != line {
+				authDesc = d
+			}
+		},
+		Entropy: fillRandom,
 	})
 	var leftover []byte
 	rc := 0
@@ -130,11 +136,33 @@ func serveSession(c *vi.Conn, idx int, seed [32]byte, keys []AuthKey) int {
 			rc = 1
 			break
 		}
+		// A granted pty+shell hands the channel to the TUI (#2961), which
+		// owns the rest of the session on this same goroutine.
+		if srv.Session() {
+			user, key := authIdentity(authDesc)
+			rc = serveTUI(c, srv, &leftover, user, key)
+			break
+		}
 	}
 	if srv.Failed() {
 		rc = 1
 	}
 	return rc
+}
+
+// authIdentity pulls the user= and key= fields out of the accepted-
+// publickey log line — the session TUI shows who it is talking to and the
+// key type the transport pinned.
+func authIdentity(desc string) (user, key string) {
+	for _, f := range strings.Fields(desc) {
+		if u := strings.TrimPrefix(f, "user="); u != f {
+			user = u
+		}
+		if k := strings.TrimPrefix(f, "key="); k != f {
+			key = k
+		}
+	}
+	return user, key
 }
 
 // execOutPath gives each session its own GOSH stdout redirect — two

@@ -350,3 +350,161 @@ assert ssh_lo < web["first"] < ssh_hi and web["last"] > ssh_lo, (
 print("m99z-net ok: agentd listener + 2 concurrent SSH + web fetch, "
       "3 distinct 5-tuples, web window inside ssh window")
 PY
+
+# --- M168f (#2962) runs 04-06: the scripted pty session, K=3 -------------
+#
+# The runner client's `--net-tcp-connect …:ssh` leg switches from `exec` to
+# `pty-req` (TERM=xterm-256color) + `shell` when armed with
+# `--net-tcp-connect-ssh-pty 80x24`, and `--net-tcp-connect-ssh-keys` drives
+# the decrypted channel stream: GOSSHD's Bubble Tea TUI title lands, the
+# client answers `window-change` 100x30, the resized repaint carries
+# `100x30`, and `send q` exits the Program — exit-status 0, EOF, CLOSE.
+# CHANNEL_DATA is appended byte-for-byte to ssh-session-<tag>.bin in the
+# run dir; WINDOW_ADJUST returns the credit the client consumes (the TUI
+# frame count stays under the half-window mark, so none is owed here).
+#
+# The leg runs K=3 as three tagged runs — `vgate_repeat 3` would also
+# repeat runs 01-03, so tagged legs keep the card's bar at lower cost.
+vgate_file keys-tui.txt <<'EOF'
+after GOSSHD session
+resize 100x30
+after 100x30
+send q
+EOF
+
+vgate_run 04 -- --net '$RUN_DIR/cap4.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:2222:ssh \
+    --net-tcp-connect-ssh-pty 80x24 \
+    --net-tcp-connect-ssh-keys '$RUN_DIR/keys-tui.txt' \
+    --net-tcp-connect-ssh-session-file '$RUN_DIR/ssh-session-04.bin' \
+    --net-tcp-connect-after 'sshd: listen' \
+    --script '$RUN_DIR/script-1.txt' \
+    --script-expect 'sshd: bye' --timeout 120
+
+vgate_assert 04 output-contains 'NET-TCP-CONNECT-SSH: cipher self-check ok'
+vgate_assert 04 output-contains 'NET-TCP-CONNECT-SSH: ENABLED'
+vgate_assert 04 output-contains 'SSH-CLI: version received: SSH-2.0-VirelaiOS_1.0'
+vgate_assert 04 output-contains 'SSH-CLI: publickey accepted user=alice key=ssh-ed25519'
+vgate_assert 04 output-contains 'SSH-CLI: pty-req 80x24 term=xterm-256color'
+vgate_assert 04 output-contains 'SSH-CLI: shell granted; pty session live'
+vgate_assert 04 output-contains 'SSH-CLI: keys: resize 100x30'
+vgate_assert 04 output-contains 'SSH-CLI: keys: sent 1 byte(s)'
+vgate_assert 04 output-contains 'SSH-CLI: pty bytes='
+vgate_assert 04 output-contains 'SSH-CLI: exit-status=0'
+vgate_assert 04 output-contains 'NET-TCP-CONNECT-SSH: session done; sent FIN'
+vgate_assert 04 serial-contains 'sshd: listen 2222'
+vgate_assert 04 serial-contains 'sshd: kex-ok'
+vgate_assert 04 serial-contains 'sshd: auth-ok user=alice key=ssh-ed25519'
+vgate_assert 04 serial-contains 'sshd: tui start term=xterm-256color size=80x24'
+vgate_assert 04 serial-contains 'sshd: tui size 100x30'
+vgate_assert 04 serial-contains 'sshd: tui exit 0'
+vgate_assert 04 serial-contains 'sshd: bye'
+vgate_assert 04 serial-absent 'sshd: error'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 04 serial-absent '4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb'
+vgate_assert 04 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+data = open(os.path.join(run, "ssh-session-04.bin"), "rb").read()
+# Strip the ANSI paint (CSI, OSC, charset/mode singles) before the model
+# text check — the wire bytes are renderer frames, not a text log.
+text = re.sub(rb"\x1b\][^\x07]*\x07", b"", data)
+text = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", text)
+text = re.sub(rb"\x1b[()#][0-9A-Za-z]|\x1b[=>]", b"", text)
+for want in (b"GOSSHD session", b"100x30"):
+    if want not in text:
+        sys.exit("FAIL: %r not in the stripped session stream" % want)
+out = open(os.path.join(run, "run-04.out"), errors="replace").read()
+for seed in (
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+):
+    if seed in out or seed.encode() in data:
+        sys.exit("FAIL: a private seed appears in the runner or session output")
+print("ssh-tui ok: title + 100x30 in ssh-session-04.bin (%d bytes)" % len(data))
+PY
+
+vgate_run 05 -- --net '$RUN_DIR/cap5.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:2222:ssh \
+    --net-tcp-connect-ssh-pty 80x24 \
+    --net-tcp-connect-ssh-keys '$RUN_DIR/keys-tui.txt' \
+    --net-tcp-connect-ssh-session-file '$RUN_DIR/ssh-session-05.bin' \
+    --net-tcp-connect-after 'sshd: listen' \
+    --script '$RUN_DIR/script-1.txt' \
+    --script-expect 'sshd: bye' --timeout 120
+
+vgate_assert 05 output-contains 'SSH-CLI: pty-req 80x24 term=xterm-256color'
+vgate_assert 05 output-contains 'SSH-CLI: shell granted; pty session live'
+vgate_assert 05 output-contains 'SSH-CLI: keys: resize 100x30'
+vgate_assert 05 output-contains 'SSH-CLI: pty bytes='
+vgate_assert 05 output-contains 'SSH-CLI: exit-status=0'
+vgate_assert 05 serial-contains 'sshd: tui start term=xterm-256color size=80x24'
+vgate_assert 05 serial-contains 'sshd: tui size 100x30'
+vgate_assert 05 serial-contains 'sshd: tui exit 0'
+vgate_assert 05 serial-contains 'sshd: bye'
+vgate_assert 05 serial-absent 'sshd: error'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 05 serial-absent '4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb'
+vgate_assert 05 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+data = open(os.path.join(run, "ssh-session-05.bin"), "rb").read()
+text = re.sub(rb"\x1b\][^\x07]*\x07", b"", data)
+text = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", text)
+text = re.sub(rb"\x1b[()#][0-9A-Za-z]|\x1b[=>]", b"", text)
+for want in (b"GOSSHD session", b"100x30"):
+    if want not in text:
+        sys.exit("FAIL: %r not in the stripped session stream" % want)
+out = open(os.path.join(run, "run-05.out"), errors="replace").read()
+for seed in (
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+):
+    if seed in out or seed.encode() in data:
+        sys.exit("FAIL: a private seed appears in the runner or session output")
+print("ssh-tui ok: title + 100x30 in ssh-session-05.bin (%d bytes)" % len(data))
+PY
+
+vgate_run 06 -- --net '$RUN_DIR/cap6.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-connect 10.0.0.1:2222:ssh \
+    --net-tcp-connect-ssh-pty 80x24 \
+    --net-tcp-connect-ssh-keys '$RUN_DIR/keys-tui.txt' \
+    --net-tcp-connect-ssh-session-file '$RUN_DIR/ssh-session-06.bin' \
+    --net-tcp-connect-after 'sshd: listen' \
+    --script '$RUN_DIR/script-1.txt' \
+    --script-expect 'sshd: bye' --timeout 120
+
+vgate_assert 06 output-contains 'SSH-CLI: pty-req 80x24 term=xterm-256color'
+vgate_assert 06 output-contains 'SSH-CLI: shell granted; pty session live'
+vgate_assert 06 output-contains 'SSH-CLI: keys: resize 100x30'
+vgate_assert 06 output-contains 'SSH-CLI: pty bytes='
+vgate_assert 06 output-contains 'SSH-CLI: exit-status=0'
+vgate_assert 06 serial-contains 'sshd: tui start term=xterm-256color size=80x24'
+vgate_assert 06 serial-contains 'sshd: tui size 100x30'
+vgate_assert 06 serial-contains 'sshd: tui exit 0'
+vgate_assert 06 serial-contains 'sshd: bye'
+vgate_assert 06 serial-absent 'sshd: error'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'
+vgate_assert 06 serial-absent '4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb'
+vgate_assert 06 python <<'PY'
+import os, re, sys
+run = os.environ["RUN_DIR"]
+data = open(os.path.join(run, "ssh-session-06.bin"), "rb").read()
+text = re.sub(rb"\x1b\][^\x07]*\x07", b"", data)
+text = re.sub(rb"\x1b\[[0-9;?]*[ -/]*[@-~]", b"", text)
+text = re.sub(rb"\x1b[()#][0-9A-Za-z]|\x1b[=>]", b"", text)
+for want in (b"GOSSHD session", b"100x30"):
+    if want not in text:
+        sys.exit("FAIL: %r not in the stripped session stream" % want)
+out = open(os.path.join(run, "run-06.out"), errors="replace").read()
+for seed in (
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+):
+    if seed in out or seed.encode() in data:
+        sys.exit("FAIL: a private seed appears in the runner or session output")
+print("ssh-tui ok: title + 100x30 in ssh-session-06.bin (%d bytes)" % len(data))
+PY

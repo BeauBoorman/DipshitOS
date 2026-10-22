@@ -283,6 +283,9 @@
 //          [--net-tcp-connect-mac <hex>] (M50 TS4 replay: send this
 //           pre-recorded MAC line instead of computing one)
 //          [--net-tcp-connect-ssh-exec <cmd>] [--net-tcp-connect-ssh-user <name>]
+//          [--net-tcp-connect-ssh-pty <cols>x<rows>]
+//          [--net-tcp-connect-ssh-keys <file>]
+//          [--net-tcp-connect-ssh-session-file <path>]
 //          (M45 SH7, issue #1083,
 //          ADR 0020 Amendment B: the host INITIATES an inbound TCP
 //          connection TO a guest listener — the reverse of
@@ -295,7 +298,12 @@
 //          `:ssh` suffix speaks the ADR 0025 D2 profile as a client
 //          (VSSH.SSHClient) against the in-guest GOSSHD.ELF, paced one
 //          ≤192-byte segment per guest ACK. Requires --net. OFF by
-//          default: every existing gate is byte-identical.)
+//          default: every existing gate is byte-identical. M168f (#2962):
+//          --net-tcp-connect-ssh-pty switches the channel request to
+//          pty-req (TERM=xterm-256color) + shell; --net-tcp-connect-ssh-keys
+//          is a line script (`after <text>` / `send <escaped>` /
+//          `resize <c>x<r>`) evaluated against the decrypted stream; the
+//          session bytes are appended to --net-tcp-connect-ssh-session-file.)
 //         [--net-nat] (milestone five card N7, claim 4678: attach one
 //          VZVirtioNetworkDeviceConfiguration with a
 //          VZNATNetworkDeviceAttachment instead of the file-handle
@@ -1162,6 +1170,18 @@ func netTcpSrvConn(for buf: [UInt8]) -> NetTcpSrvConn {
     netTcpSrvConns[key] = conn
     return conn
 }
+// M168f (#2962): append channel-stream bytes to the ssh-session capture.
+// The file is created on first write; each later call appends.
+func netTcpAppendFile(_ path: String, _ bytes: [UInt8]) {
+    let url = URL(fileURLWithPath: path)
+    if let handle = try? FileHandle(forWritingTo: url) {
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: bytes)
+        try? handle.close()
+    } else {
+        try? Data(bytes).write(to: url)
+    }
+}
 /// Bounded admission for a fresh SYN: drop closed entries first, then
 /// refuse when the live table is full (the RST is the caller's to build).
 func netTcpSrvAdmit(_ key: String) -> Bool {
@@ -1203,6 +1223,14 @@ var netTcpConnectSSHUserSeed: [UInt8] = SSHFixtures.hex(SSHFixtures.userKeySeedH
 var netTcpConnectSSHHostPin: [UInt8] = SSHFixtures.hex(SSHFixtures.hostPublicKeyHex) ?? []
 var netTcpConnectSSHUser = "alice"
 var netTcpConnectSSHExec = "echo VIRELAI-SSH-SERVER-OK-ARGV2"
+// M168f (#2962): the scripted pty session. `netTcpConnectSSHPty` switches
+// the channel request to pty-req + shell; `netTcpConnectSSHKeys` is the
+// parsed line script each client's SSHClient walks against the decrypted
+// channel stream; `netTcpConnectSSHSessionFile` is where the CHANNEL_DATA
+// bytes land (the gate's per-run ssh-session-<tag>.bin).
+var netTcpConnectSSHPty: (cols: UInt32, rows: UInt32)?
+var netTcpConnectSSHKeys: SSHKeyScript?
+var netTcpConnectSSHSessionFile: String?
 // The hermetic RFB gate's byte-stream adapter. Unlike the payload-file
 // client this pipes a local probe's stdin/stdout through the existing
 // host->guest TCP emulation. It never binds a host port or uses --net-nat.
@@ -1242,6 +1270,9 @@ final class NetTcpClient {
     var sshClient: SSHClient?
     var sshTx: [UInt8] = []
     var sshTxOffset = 0
+    // M168f (#2962): how much of `sshClient.stdout` has already landed in
+    // the --net-tcp-connect-ssh-session-file capture.
+    var sshSessionWritten = 0
     // M99f (#2184): the guest's advertised window, refreshed on every
     // inbound segment. The guest kernel reports 0 while its one-slot RX
     // buffer holds an unconsumed segment, and the guest emits a
@@ -2145,6 +2176,38 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--net-tcp-connect-ssh-exec", idx + 1 < arguments.count {
         netTcpConnectSSHExec = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--net-tcp-connect-ssh-pty", idx + 1 < arguments.count {
+        // M168f (#2962): a scripted interactive session — pty-req
+        // (TERM=xterm-256color) + shell replace the exec request.
+        let token = arguments[idx + 1]
+        let halves = token.split(separator: "x", omittingEmptySubsequences: false)
+        guard halves.count == 2,
+              let cols = UInt32(halves[0]), let rows = UInt32(halves[1]),
+              cols > 0, rows > 0, cols <= 65535, rows <= 65535 else {
+            fail("--net-tcp-connect-ssh-pty requires <cols>x<rows>, got '\(token)'.")
+        }
+        netTcpConnectSSHPty = (cols, rows)
+        idx += 2
+    } else if arg == "--net-tcp-connect-ssh-keys", idx + 1 < arguments.count {
+        // M168f (#2962): the line script — `after <text>` /
+        // `send <escaped bytes>` / `resize <cols>x<rows>` — walked against
+        // the decrypted channel stream once the shell is live.
+        let path = arguments[idx + 1]
+        do {
+            netTcpConnectSSHKeys = try SSHKeyScript(
+                text: String(contentsOfFile: path, encoding: .utf8)
+            )
+        } catch let err as SSHKeyScript.ParseError {
+            fail("--net-tcp-connect-ssh-keys '\(path)': \(err).")
+        } catch {
+            fail("--net-tcp-connect-ssh-keys could not read '\(path)': \(error).")
+        }
+        idx += 2
+    } else if arg == "--net-tcp-connect-ssh-session-file", idx + 1 < arguments.count {
+        // M168f (#2962): CHANNEL_DATA lands here byte-for-byte — the
+        // gate's ssh-session-<tag>.bin evidence.
+        netTcpConnectSSHSessionFile = arguments[idx + 1]
         idx += 2
     } else if arg == "--net-tcp-connect-stream", idx + 1 < arguments.count {
         netTcpConnectStreamExec = arguments[idx + 1]
@@ -3145,6 +3208,14 @@ if netTcpConnectStreamExec != nil && (netTcpClients.isEmpty || netTcpClients.fir
 }
 if netTcpConnectStreamExec == nil && (!netTcpConnectStreamArgs.isEmpty || netTcpConnectIntruder) {
     fail("--net-tcp-connect-stream-arg and --net-tcp-connect-intruder require --net-tcp-connect-stream")
+}
+if netTcpConnectSSHPty != nil || netTcpConnectSSHKeys != nil || netTcpConnectSSHSessionFile != nil {
+    guard netTcpConnectSSHMode else {
+        fail("--net-tcp-connect-ssh-pty/-ssh-keys/-ssh-session-file require a :ssh --net-tcp-connect target.")
+    }
+}
+if netTcpConnectSSHKeys != nil && netTcpConnectSSHPty == nil {
+    fail("--net-tcp-connect-ssh-keys requires --net-tcp-connect-ssh-pty <cols>x<rows> (the script drives a live shell).")
 }
 if netTcpConnectSSHMode {
     guard SSHFixtures.cipherSelfCheck() else {
@@ -4470,7 +4541,11 @@ if let guestIP = netTcpConnectGuestIP, let guestPort = netTcpConnectPort {
         print("  net-tcp-connect: ENABLED additional client to \(extraIP):\(client.guestPort) (client port \(client.cliPort))")
     }
     if netTcpConnectSSHMode {
-        print("NET-TCP-CONNECT-SSH: ENABLED (M70g G1, #1491) user=\(netTcpConnectSSHUser) exec=\(netTcpConnectSSHExec.debugDescription) hostpin=\(SSHFixtures.hexString(netTcpConnectSSHHostPin))")
+        let ptyDesc = netTcpConnectSSHPty.map { " pty=\($0.cols)x\($0.rows)" } ?? ""
+        print("NET-TCP-CONNECT-SSH: ENABLED (M70g G1, #1491) user=\(netTcpConnectSSHUser) exec=\(netTcpConnectSSHExec.debugDescription) hostpin=\(SSHFixtures.hexString(netTcpConnectSSHHostPin))\(ptyDesc)")
+        if let path = netTcpConnectSSHSessionFile {
+            print("NET-TCP-CONNECT-SSH: session capture -> \(path) (M168f, #2962)")
+        }
     }
     if let path = netTcpConnectStreamExec {
         print("NET-TCP-STREAM: ENABLED (hermetic --net only) executable=\(path)")
@@ -7915,7 +7990,9 @@ extension NetTcpClient {
                         userKeySeed: netTcpConnectSSHUserSeed,
                         hostPublicKey: netTcpConnectSSHHostPin,
                         user: netTcpConnectSSHUser,
-                        execCommand: netTcpConnectSSHExec
+                        execCommand: netTcpConnectSSHExec,
+                        pty: netTcpConnectSSHPty,
+                        keyScript: netTcpConnectSSHKeys
                     )
                     let client = SSHClient(config: cfg)
                     client.logSink = { line in print("SSH-CLI: \(line)") }
@@ -8041,6 +8118,16 @@ extension NetTcpClient {
                             sshGuestDataSeen = true
                             if let client = sshClient {
                                 sshTx.append(contentsOf: client.feed(fresh))
+                                // M168f (#2962): spill CHANNEL_DATA into
+                                // the session capture as it lands.
+                                if let path = netTcpConnectSSHSessionFile,
+                                   client.stdout.count > sshSessionWritten {
+                                    netTcpAppendFile(
+                                        path,
+                                        Array(client.stdout[sshSessionWritten...])
+                                    )
+                                    sshSessionWritten = client.stdout.count
+                                }
                             }
                         }
                     }

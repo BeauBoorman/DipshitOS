@@ -44,6 +44,16 @@ final class VSSHTests: XCTestCase {
         "3531390000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d0000001d6368" +
         "6163686132302d706f6c7931333035406f70656e7373682e636f6d0000000000000000000000046e6f6e" +
         "65000000046e6f6e6500000000000000000000000000"
+    /// The deterministic server KEXINIT payload (cookie f0f1…feff) shared
+    /// by `testExchangeHashAndKDFPinned` and the M168f scripted-server
+    /// session tests.
+    static let pinnedISHex =
+        "14f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0000002e637572766532353531392d7368613235" +
+        "362c637572766532353531392d736861323536406c69627373682e6f72670000000b7373682d65643235" +
+        "3531390000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d0000001d6368" +
+        "6163686132302d706f6c7931333035406f70656e7373682e636f6d00000017686d61632d736861322d32" +
+        "35362c686d61632d7368613100000017686d61632d736861322d3235362c686d61632d73686131000000" +
+        "046e6f6e65000000046e6f6e6500000000000000000000000000"
     /// The RFC 8032 §7.1 TEST 1 host key transcript's expected H and keys.
     static let pinnedHHex =
         "15c9cacbd36588f06a5189f221597e1e4d13f2f8c1fe9951f62b85afb957136d"
@@ -186,14 +196,7 @@ final class VSSHTests: XCTestCase {
 
         // The deterministic transcript must reproduce `kex.zig`'s H from the
         // pinned inputs (I_C, I_S, RFC 7748 Q_C/Q_S/K, RFC 8032 TEST 1 host).
-        let pinnedIS = hex(
-            "14f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0000002e637572766532353531392d7368613235" +
-            "362c637572766532353531392d736861323536406c69627373682e6f72670000000b7373682d65643235" +
-            "3531390000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d0000001d6368" +
-            "6163686132302d706f6c7931333035406f70656e7373682e636f6d00000017686d61632d736861322d32" +
-            "35362c686d61632d7368613100000017686d61632d736861322d3235362c686d61632d73686131000000" +
-            "046e6f6e65000000046e6f6e6500000000000000000000000000"
-        )
+        let pinnedIS = hex(Self.pinnedISHex)
         let hPinned = SSHKDF.exchangeHash(
             vc: Array("SSH-2.0-VirelaiOS_1.0".utf8),
             vs: Array("SSH-2.0-OpenSSH_9.6".utf8),
@@ -698,5 +701,353 @@ final class VSSHTests: XCTestCase {
         }
         XCTAssertTrue(client.failed)
         XCTAssertTrue(client.events.contains { $0.contains("host key does not match pin") })
+    }
+
+    // MARK: - M168f (#2962): the scripted pty session
+
+    /// A scripted sshd good enough for the pty session: it plays the ADR
+    /// 0025 D2 profile through KEX with the client's deterministic
+    /// overrides, then grants pty-req + shell and pushes CHANNEL_DATA.
+    /// `packet` seals server→client frames (seq from 3 — NEWKEYS is
+    /// plaintext), `open` decrypts client→server frames the same way.
+    private final class PtyTestServer {
+        var s2c: SSHOpenSSHCipher!
+        var c2s: SSHOpenSSHCipher!
+        var srvSeq: UInt64 = 3
+        var cliSeq: UInt64 = 3
+        private var cliRx: [UInt8] = []
+
+        func packet(_ payload: [UInt8]) -> [UInt8] {
+            let padding = [UInt8](
+                repeating: 0x55, count: SSHPacket.paddingLen(payload.count, alignment: .aead)
+            )
+            let frame = try! SSHPacket.encode(payload: payload, pad: padding, alignment: .aead)
+            let (ct, tag) = s2c.seal(frame, seq: srvSeq)
+            srvSeq += 1
+            return ct + tag
+        }
+
+        func open(_ bytes: [UInt8]) -> [[UInt8]] {
+            cliRx.append(contentsOf: bytes)
+            var decoded: [[UInt8]] = []
+            while cliRx.count >= 4 {
+                let length = Int(c2s.decryptLength(Array(cliRx[0 ..< 4]), seq: cliSeq))
+                guard length >= 5 else { break }
+                let wire = 4 + length + SSHOpenSSHCipher.tagLength
+                guard cliRx.count >= wire else { break }
+                let ct = Array(cliRx[0 ..< 4 + length])
+                let tag = Array(cliRx[4 + length ..< wire])
+                guard let plain = c2s.open(ciphertext: ct, tag: tag, seq: cliSeq) else {
+                    return decoded
+                }
+                cliRx.removeFirst(wire)
+                cliSeq += 1
+                if let payload = try? SSHPacket.decode(plain, alignment: .aead) {
+                    decoded.append(payload)
+                }
+            }
+            return decoded
+        }
+
+        /// One server→client CHANNEL_DATA packet for `data`.
+        func channelData(_ data: [UInt8]) -> [UInt8] {
+            packet(SSHClient.channelDataPayload(recipient: 0, data: data))
+        }
+
+        /// CHANNEL_SUCCESS naming the client's channel.
+        func success() -> [UInt8] {
+            var w = SSHWriter()
+            w.byte(SSHServer.msgChannelSuccess)
+            w.uint32(0)
+            return packet(w.bytes)
+        }
+
+        /// CHANNEL_FAILURE naming the client's channel.
+        func failure() -> [UInt8] {
+            var w = SSHWriter()
+            w.byte(SSHServer.msgChannelFailure)
+            w.uint32(0)
+            return packet(w.bytes)
+        }
+
+        /// exit-status + EOF + CLOSE as one feed.
+        func closeSession(status: UInt32) -> [UInt8] {
+            var w = SSHWriter()
+            w.byte(SSHServer.msgChannelRequest)
+            w.uint32(0)
+            w.string(SSHServer.requestExitStatus)
+            w.bool(false)
+            w.uint32(status)
+            return packet(w.bytes)
+                + packet([SSHServer.msgChannelEof, 0, 0, 0, 0])
+                + packet([SSHServer.msgChannelClose, 0, 0, 0, 0])
+        }
+    }
+
+    /// One leading plaintext packet + the remaining bytes (ciphertext after
+    /// NEWKEYS). Returns (nil, bytes) when the head is not a whole frame.
+    private func splitPlainFrame(_ bytes: [UInt8]) -> ([UInt8]?, [UInt8]) {
+        guard bytes.count >= 4 else { return (nil, bytes) }
+        let length = (Int(bytes[0]) << 24) | (Int(bytes[1]) << 16)
+            | (Int(bytes[2]) << 8) | Int(bytes[3])
+        guard bytes.count >= 4 + length else { return (nil, bytes) }
+        let frame = Array(bytes[0 ..< 4 + length])
+        return (try? SSHPacket.decode(frame, alignment: .plaintext), Array(bytes[(4 + length)...]))
+    }
+
+    /// Drive `client` through version → KEX → userauth → channel-open →
+    /// verified pty-req, with every step asserted. Returns after the
+    /// client emitted pty-req; the test then grants or refuses it.
+    private func ptyHandshake(
+        script: SSHKeyScript? = nil, cols: UInt32 = 80, rows: UInt32 = 24
+    ) throws -> (client: SSHClient, srv: PtyTestServer) {
+        let client = SSHClient(config: SSHClient.Config(
+            userKeySeed: hex(SSHFixtures.userKeySeedHex),
+            hostPublicKey: hex(SSHFixtures.hostPublicKeyHex),
+            user: "alice",
+            pty: (cols: cols, rows: rows),
+            keyScript: script,
+            cookieOverride: hex("0102030405060708090a0b0c0d0e0f00"),
+            ephemeralOverride: hex(Self.aliceSecretHex)
+        ))
+        let srv = PtyTestServer()
+
+        // Client greeting: the version line + its KEXINIT (iC).
+        let greeting = client.start()
+        let (clientVersion, clientFrames) = parsePlainOutput(greeting)
+        XCTAssertEqual(clientVersion, "SSH-2.0-VirelaiOS_1.0")
+        XCTAssertEqual(clientFrames.count, 1)
+        let iC = clientFrames[0]
+
+        // Server version + pinned KEXINIT → the client's ECDH_INIT (qC).
+        let iS = hex(Self.pinnedISHex)
+        let step1 = client.feed(Array("SSH-2.0-VirelaiOS_1.0\r\n".utf8) + plainFrame(iS))
+        let (ecdhInit, step1Rest) = splitPlainFrame(step1)
+        XCTAssertTrue(step1Rest.isEmpty)
+        var er = SSHReader(try XCTUnwrap(ecdhInit))
+        XCTAssertEqual(try er.byte(), SSHServer.msgKexEcdhInit)
+        let qC = try er.string()
+        XCTAssertEqual(qC, hex(Self.alicePublicHex))
+
+        // Host-key blob + signature over the independently computed H.
+        let hostKey = try! Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data(hex(SSHFixtures.hostKeySeedHex))
+        )
+        var kSw = SSHWriter()
+        kSw.string("ssh-ed25519")
+        kSw.string(Array(hostKey.publicKey.rawRepresentation))
+        let kS = kSw.bytes
+        let qS = hex(Self.bobPublicHex)
+        let alice = try! Curve25519.KeyAgreement.PrivateKey(
+            rawRepresentation: Data(hex(Self.aliceSecretHex))
+        )
+        let shared = try! alice.sharedSecretFromKeyAgreement(
+            with: try! Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(qS))
+        )
+        let kMpint = SSHKDF.mpint(shared.withUnsafeBytes { Array($0) })
+        let h = SSHKDF.exchangeHash(
+            vc: Array("SSH-2.0-VirelaiOS_1.0".utf8),
+            vs: Array("SSH-2.0-VirelaiOS_1.0".utf8),
+            ic: iC, isI: iS, ks: kS, qc: qC, qs: qS, kMpint: kMpint
+        )
+        var sigW = SSHWriter()
+        sigW.string("ssh-ed25519")
+        sigW.string(Array(try! hostKey.signature(for: Data(h))))
+        var repW = SSHWriter()
+        repW.byte(SSHServer.msgKexEcdhReply)
+        repW.string(kS)
+        repW.string(qS)
+        repW.string(sigW.bytes)
+
+        // ECDH_REPLY + NEWKEYS → plaintext NEWKEYS + encrypted SERVICE_REQUEST.
+        let step3 = client.feed(plainFrame(repW.bytes) + plainFrame([SSHServer.msgNewKeys]))
+        let (nk, cipherStart) = splitPlainFrame(step3)
+        XCTAssertEqual(nk, [SSHServer.msgNewKeys])
+        srv.c2s = SSHOpenSSHCipher(key: SSHKDF.deriveKey(
+            length: 64, kMpint: kMpint, h: h, letter: 0x43, sessionId: h
+        ))
+        srv.s2c = SSHOpenSSHCipher(key: SSHKDF.deriveKey(
+            length: 64, kMpint: kMpint, h: h, letter: 0x44, sessionId: h
+        ))
+        var pkts = srv.open(cipherStart)
+        XCTAssertEqual(pkts.count, 1)
+        var svc = SSHReader(pkts[0])
+        XCTAssertEqual(try svc.byte(), SSHServer.msgServiceRequest)
+        XCTAssertEqual(try svc.stringUTF8(), "ssh-userauth")
+
+        var svcAccept = SSHWriter()
+        svcAccept.byte(SSHServer.msgServiceAccept)
+        svcAccept.string("ssh-userauth")
+        pkts = srv.open(client.feed(srv.packet(svcAccept.bytes)))
+        XCTAssertEqual(pkts.count, 1)
+        var ar = SSHReader(pkts[0])
+        XCTAssertEqual(try ar.byte(), SSHServer.msgUserauthRequest)
+        XCTAssertEqual(try ar.stringUTF8(), "alice")
+
+        pkts = srv.open(client.feed(srv.packet([SSHServer.msgUserauthSuccess])))
+        XCTAssertEqual(pkts.count, 1)
+        var or = SSHReader(pkts[0])
+        XCTAssertEqual(try or.byte(), SSHServer.msgChannelOpen)
+        XCTAssertEqual(try or.stringUTF8(), "session")
+        XCTAssertEqual(try or.uint32(), 0)
+        XCTAssertEqual(try or.uint32(), SSHServer.localWindow)
+        XCTAssertEqual(try or.uint32(), SSHServer.localMaxPacket)
+
+        // OPEN_CONFIRMATION → the §6.2 pty-req, every field asserted.
+        var oc = SSHWriter()
+        oc.byte(SSHServer.msgChannelOpenConfirmation)
+        oc.uint32(0)
+        oc.uint32(42)
+        oc.uint32(1 << 17)
+        oc.uint32(32768)
+        pkts = srv.open(client.feed(srv.packet(oc.bytes)))
+        XCTAssertEqual(pkts.count, 1)
+        var pr = SSHReader(pkts[0])
+        XCTAssertEqual(try pr.byte(), SSHServer.msgChannelRequest)
+        XCTAssertEqual(try pr.uint32(), 42)
+        XCTAssertEqual(try pr.stringUTF8(), "pty-req")
+        XCTAssertTrue(try pr.bool())
+        XCTAssertEqual(try pr.stringUTF8(), "xterm-256color")
+        XCTAssertEqual(try pr.uint32(), cols)
+        XCTAssertEqual(try pr.uint32(), rows)
+        XCTAssertEqual(try pr.uint32(), 0)
+        XCTAssertEqual(try pr.uint32(), 0)
+        XCTAssertEqual(try pr.string(), [])
+        XCTAssertEqual(pr.remaining, 0)
+        XCTAssertTrue(client.events.contains { $0.contains("pty-req \(cols)x\(rows)") })
+        return (client, srv)
+    }
+
+    /// CHANNEL_SUCCESS for the pty-req → the §6.5 shell request; a second
+    /// CHANNEL_SUCCESS makes the session live.
+    private func grantShell(_ client: SSHClient, _ srv: PtyTestServer) {
+        var pkts = srv.open(client.feed(srv.success()))
+        XCTAssertEqual(pkts.count, 1)
+        var sh = SSHReader(pkts[0])
+        XCTAssertEqual(try! sh.byte(), SSHServer.msgChannelRequest)
+        XCTAssertEqual(try! sh.uint32(), 42)
+        XCTAssertEqual(try! sh.stringUTF8(), "shell")
+        XCTAssertTrue(try! sh.bool())
+        XCTAssertEqual(sh.remaining, 0)
+        pkts = srv.open(client.feed(srv.success()))
+        // With an `after` op armed the client waits on the stream.
+        XCTAssertEqual(pkts.count, 0)
+        XCTAssertTrue(client.events.contains { $0.contains("shell granted; pty session live") })
+    }
+
+    func testClientPtySessionScriptedKeys() throws {
+        let script = try SSHKeyScript(
+            text: "after GOSSHD session\nresize 100x30\nafter 100x30\nsend q\n"
+        )
+        let (client, srv) = try ptyHandshake(script: script)
+        grantShell(client, srv)
+
+        // The title frame lands → the resize op emits §6.7 window-change.
+        var pkts = srv.open(client.feed(srv.channelData(
+            Array("GOSSHD session — Bubble Tea over sshlib\r\nsize 80x24\r\n".utf8)
+        )))
+        XCTAssertEqual(pkts.count, 1)
+        var wc = SSHReader(pkts[0])
+        XCTAssertEqual(try wc.byte(), SSHServer.msgChannelRequest)
+        XCTAssertEqual(try wc.uint32(), 42)
+        XCTAssertEqual(try wc.stringUTF8(), "window-change")
+        XCTAssertFalse(try wc.bool())
+        XCTAssertEqual(try wc.uint32(), 100)
+        XCTAssertEqual(try wc.uint32(), 30)
+        XCTAssertEqual(try wc.uint32(), 0)
+        XCTAssertEqual(try wc.uint32(), 0)
+        XCTAssertEqual(wc.remaining, 0)
+        XCTAssertTrue(client.events.contains { $0.contains("keys: resize 100x30") })
+
+        // The resized repaint carries `100x30` → `send q` emits CHANNEL_DATA.
+        pkts = srv.open(client.feed(srv.channelData(
+            Array("term=xterm-256color size 100x30\r\n".utf8)
+        )))
+        XCTAssertEqual(pkts.count, 1)
+        var dr = SSHReader(pkts[0])
+        XCTAssertEqual(try dr.byte(), SSHServer.msgChannelData)
+        XCTAssertEqual(try dr.uint32(), 42)
+        XCTAssertEqual(try dr.string(), Array("q".utf8))
+        XCTAssertTrue(client.events.contains { $0.contains("keys: sent 1 byte(s)") })
+        XCTAssertTrue(client.events.contains { $0.contains("keys: script done") })
+
+        // exit-status + EOF + CLOSE end the session with the pty summary.
+        _ = srv.open(client.feed(srv.closeSession(status: 0)))
+        XCTAssertTrue(client.isClosed)
+        XCTAssertEqual(client.exitStatus, 0)
+        XCTAssertTrue(client.events.contains { $0.contains("pty bytes=") })
+        XCTAssertTrue(client.events.contains { $0.contains("exit-status=0") })
+        XCTAssertFalse(client.failed)
+    }
+
+    func testClientPtyWindowAdjustAfterConsumption() throws {
+        let (client, srv) = try ptyHandshake()
+        grantShell(client, srv)
+        // 33000 bytes land under the half-window mark: no adjust yet.
+        var pkts = srv.open(client.feed(srv.channelData(
+            [UInt8](repeating: 0x41, count: 33000)
+        )))
+        XCTAssertEqual(pkts.count, 0)
+        // 34000 more crosses half the 128 KiB advertised window → the
+        // client returns all consumed credit as WINDOW_ADJUST (§5.2).
+        pkts = srv.open(client.feed(srv.channelData(
+            [UInt8](repeating: 0x42, count: 34000)
+        )))
+        XCTAssertEqual(pkts, [SSHClient.windowAdjustPayload(recipient: 42, amount: 67000)])
+        XCTAssertEqual(client.stdout.count, 67000)
+    }
+
+    func testClientPtyRefusalFails() throws {
+        let (client, srv) = try ptyHandshake()
+        _ = srv.open(client.feed(srv.failure()))
+        XCTAssertTrue(client.failed)
+        XCTAssertTrue(client.events.contains { $0.contains("channel request failed") })
+    }
+
+    func testKeyScriptParsing() throws {
+        let script = try SSHKeyScript(text: """
+            # a comment is ignored
+
+            after GOSSHD session
+            resize 100x30
+            send q
+            send \\x1b[3;4~\\r
+            """)
+        XCTAssertEqual(script.ops, [
+            .after(Array("GOSSHD session".utf8)),
+            .resize(cols: 100, rows: 30),
+            .send(Array("q".utf8)),
+            .send([0x1b] + Array("[3;4~".utf8) + [0x0d]),
+        ])
+        XCTAssertFalse(script.isDone)
+        var walked = script
+        walked.advance()
+        XCTAssertEqual(walked.current, .resize(cols: 100, rows: 30))
+        XCTAssertFalse(walked.isDone)
+    }
+
+    func testKeyScriptRejectsBadLines() throws {
+        for bad in [
+            "frobnicate x",
+            "after ",
+            "send ",
+            "send \\xzz",
+            "send \\q",
+            "send tail\\",
+            "resize 100",
+            "resize 0x24",
+            "resize 100x0",
+            "resize 80x24 extra",
+        ] {
+            XCTAssertThrowsError(try SSHKeyScript(text: bad), "line '\(bad)'") { error in
+                XCTAssertTrue(error is SSHKeyScript.ParseError)
+            }
+        }
+        let err = try XCTUnwrap({ () -> SSHKeyScript.ParseError? in
+            do { _ = try SSHKeyScript(text: "after ok\nfrobnicate") ; return nil }
+            catch let e as SSHKeyScript.ParseError { return e }
+            catch { return nil }
+        }())
+        XCTAssertEqual(err.line, 2)
     }
 }
