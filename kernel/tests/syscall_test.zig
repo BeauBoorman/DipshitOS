@@ -157,7 +157,7 @@ test "syscall: M94 trace and profile control and remaining observability stub ar
 
 test "syscall: ABI metadata covers every registered row without pointers" {
     const abi = syscall.abi;
-    try std.testing.expectEqual(@as(usize, 94), abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 96), abi.slots.len);
     for (&abi.slots, 0..) |slot, index| {
         try std.testing.expectEqual(index, slot.number);
         try std.testing.expectEqualStrings(slot.name(), entry_info(index).?.name);
@@ -179,7 +179,7 @@ test "syscall: ABI metadata covers every registered row without pointers" {
             try std.testing.expect(earlier.number != item.number or earlier.selector != item.selector or earlier.op != item.op);
         }
     }
-    try std.testing.expect(abi.lookup(94) == null); // first free slot after #2463's sys_vsock_ctl (93); 89 was ADR 0054's reservation
+    try std.testing.expect(abi.lookup(96) == null); // first free slot after card #3036's 94/95 pair; 89 was ADR 0054's reservation
     try std.testing.expectEqual(abi.ArgKind.string, abi.shape(79, .{ 0, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.fd, abi.shape(80, .{ 2, 0, 0, 0, 0, 0 }).?.args[1].kind);
     try std.testing.expectEqual(abi.ArgKind.int, abi.shape(27, .{ 0, 0, 0, 0x8000000000000002, 0, 0 }).?.args[0].kind);
@@ -215,7 +215,7 @@ test "syscall: runtime table has 128 slots and eighty-four registered rows" {
             implemented += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, 94), implemented);
+    try std.testing.expectEqual(@as(usize, 96), implemented);
     try std.testing.expectEqualStrings("sys_socket", entry_info(80).?.name);
     try std.testing.expectEqualStrings("sys_fs_metadata", entry_info(79).?.name);
     try std.testing.expectEqualStrings("sys_pipe_read", entry_info(sys_pipe_read).?.name);
@@ -312,13 +312,13 @@ test "syscall: adapter decodes x8 and x0-x5 and unknown numbers return ENOSYS" {
     // In-range slots outside the implemented set still return ENOSYS:
     // 89 is implemented (M113c #2419) — a non-process caller gets the
     // slot's own EINVAL rather than ENOSYS; 91/92 landed with M118c
-    // (#2481), so 93 is the first truly free slot.
+    // (#2481) and 94/95 with card #3036, so 96 is the first free slot.
     try std.testing.expect(exceptions.frame_write(&frame, 8, 89));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.einval), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(u64, 1), call_count(89));
 
-    try std.testing.expect(exceptions.frame_write(&frame, 8, 94));
+    try std.testing.expect(exceptions.frame_write(&frame, 8, 96));
     try std.testing.expect(handle_svc(&frame, svc_immediate));
     try std.testing.expectEqual(error_result(.enosys), exceptions.frame_read(&frame, 0));
 }
@@ -1437,7 +1437,7 @@ test "syscall: counters are monotonic and report is deterministic" {
     var con = mock.console();
     report(&con);
     try std.testing.expectEqualStrings(
-        "syscalls: slots=64 implemented=94\n" ++
+        "syscalls: slots=64 implemented=96\n" ++
             "  0 sys_ping calls=2\n" ++
             "  1 sys_write calls=0\n" ++
             "  2 sys_yield calls=0\n" ++
@@ -1532,7 +1532,9 @@ test "syscall: counters are monotonic and report is deterministic" {
             "  90 sys_gpucomp calls=0\n" ++
             "  91 sys_audio_rec_info calls=0\n" ++
             "  92 sys_audio_rec calls=0\n" ++
-            "  93 sys_vsock_ctl calls=0\n",
+            "  93 sys_vsock_ctl calls=0\n" ++
+            "  94 sys_sleep_ns calls=0\n" ++
+            "  95 sys_timer_set_ns calls=0\n",
         mock.contents(),
     );
 }
@@ -2962,7 +2964,7 @@ test "syscall: slot-65 cmd 22 GPU3D — typed descriptor boundary on the existin
 
     // Slot count/table unchanged: cmd 22 is the only new kernel entry,
     // and it rides slot 65 — the dispatch table itself did not grow.
-    try std.testing.expectEqual(@as(usize, 94), syscall.abi.slots.len);
+    try std.testing.expectEqual(@as(usize, 96), syscall.abi.slots.len);
     gpu3d_device.reset_state();
 }
 
@@ -5989,7 +5991,7 @@ test "syscall: SYS_TIME (slot 66, #1058) returns the firmware wall-clock epoch" 
     // #2398 slot 88 (sys_scanout_read); M111b #2409 slots 89 (the ADR-0054
     // reservation row) + 90 (sys_gpucomp); M118c #2481 slots 91/92
     // (sys_audio_rec_info, sys_audio_rec).
-    try std.testing.expectEqual(@as(usize, 94), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 96), syscall.implemented_count);
 
     const saved_epoch = timer.boot_epoch_secs;
     const saved_ticks = timer.ticks;
@@ -6272,7 +6274,7 @@ test "syscall: M50 TS3 gate table is explicit, bounded, and exactly the ADR 0024
         try std.testing.expect(gate.number < syscall.implemented_count);
         try std.testing.expect(entry_info(gate.number) != null);
     }
-    try std.testing.expectEqual(@as(usize, 94), syscall.implemented_count);
+    try std.testing.expectEqual(@as(usize, 96), syscall.implemented_count);
 }
 
 test "syscall: no slot can raise uid/caps (TS3 consumes caps, adds no setter)" {
@@ -6889,8 +6891,9 @@ test "syscall: sys_futex wait re-checks the user word, sleeps, wakes, and times 
     const woken_frame: *const exceptions.VectorFrame = @ptrFromInt(scheduler.tasks[2].sp);
     try std.testing.expectEqual(@as(u64, 0), exceptions.frame_read(woken_frame, 0));
 
-    // Timeout: rotate back to the user task, wait with a 1-tick deadline,
-    // tick, observe -ETIMEDOUT patched into the saved frame.
+    // Timeout: rotate back to the user task, wait with a 1 s ns deadline
+    // (card #3036: the overlay's deadline, not a tick), fire it, and
+    // observe -ETIMEDOUT patched into the saved frame.
     var spins: usize = 0;
     while (scheduler.current_id() != 2 and spins < 8) : (spins += 1) {
         try std.testing.expect(scheduler.yield_current());
@@ -6898,7 +6901,9 @@ test "syscall: sys_futex wait re-checks the user word, sleeps, wakes, and times 
     try std.testing.expectEqual(@as(usize, 2), scheduler.current_id());
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_futex, .{ 0, word_va, 0, timer.period_ns, 0, 0 }, &frame));
     try std.testing.expect(scheduler.is_blocked(2));
-    scheduler.on_tick(); // expires the deadline
+    scheduler.on_tick(); // the heartbeat clock never expires an ns deadline
+    try std.testing.expect(scheduler.is_blocked(2));
+    scheduler.deadline_service(0, timer.period_ns); // the deadline fire does
     try std.testing.expect(!scheduler.is_blocked(2));
     const timeout_frame: *const exceptions.VectorFrame = @ptrFromInt(scheduler.tasks[2].sp);
     try std.testing.expectEqual(syscall.error_result(.etimedout), exceptions.frame_read(timeout_frame, 0));
@@ -7102,7 +7107,7 @@ test "syscall B5: process exit releases retained completions and a blocked joine
     try std.testing.expectEqual(before, alloc.stats().free_pages);
 }
 
-test "syscall B5: strict futex precision refusal, phase guard and no stale timeout seat" {
+test "syscall B5: strict futex accepts any ns — overflow refuses, the deadline fire expires" {
     futex_boot_user();
     try futex_drive_to_user();
     var word: u32 = 0;
@@ -7110,14 +7115,15 @@ test "syscall B5: strict futex precision refusal, phase guard and no stale timeo
     var frame = fresh_frame();
     syscall.arm_task_regions();
     exceptions.resume_frame[0] = @intFromPtr(&frame);
-    for ([_]u64{ 1, timer.period_ns - 1, timer.period_ns + 1, std.math.maxInt(u64) }) |ns| {
-        try std.testing.expectEqual(error_result(.einval), dispatch(sys_futex, .{ 2, @intFromPtr(&word), 0, ns, 0, 0 }, &frame));
-        try std.testing.expect(!scheduler.is_blocked(2));
-    }
-    _ = dispatch(sys_futex, .{ 2, @intFromPtr(&word), 0, timer.period_ns, 0, 0 }, &frame);
-    scheduler.on_tick();
+    // card #3036 (X3): sub-second ns is a real deadline now — the old
+    // UnsupportedPrecision EINVAL is gone; a 500 ms wait parks on the
+    // overlay and the heartbeat alone never ends it.
+    _ = dispatch(sys_futex, .{ 2, @intFromPtr(&word), 0, 500_000_000, 0, 0 }, &frame);
     try std.testing.expect(scheduler.is_blocked(2));
     scheduler.on_tick();
+    try std.testing.expect(scheduler.is_blocked(2));
+    // The deadline fire does — and the seat is gone (no stale waiter).
+    scheduler.deadline_service(0, 500_000_000);
     try std.testing.expect(!scheduler.is_blocked(2));
     try std.testing.expectEqual(error_result(.etimedout), exceptions.frame_read(&frame, 0));
     try std.testing.expectEqual(@as(usize, 0), scheduler.futex_wake(process.find_by_task(2).?, @intFromPtr(&word), 6));
@@ -7236,7 +7242,9 @@ test "syscall: sys_futex ETIMEDOUT is distinct from a real wake (ADR 0027 D4)" {
     syscall.arm_task_regions();
     try std.testing.expectEqual(@as(u64, 0), dispatch(sys_futex, .{ 0, word_va, 0, timer.period_ns, 0, 0 }, &frame));
     try std.testing.expect(scheduler.is_blocked(2));
-    scheduler.on_tick();
+    scheduler.on_tick(); // the heartbeat alone no longer ends an ns wait
+    try std.testing.expect(scheduler.is_blocked(2));
+    scheduler.deadline_service(0, timer.period_ns); // the deadline fire does
     try std.testing.expect(!scheduler.is_blocked(2));
     const timeout_frame: *const exceptions.VectorFrame = @ptrFromInt(scheduler.tasks[2].sp);
     try std.testing.expectEqual(timeout_rc, exceptions.frame_read(timeout_frame, 0));
@@ -7861,4 +7869,42 @@ test "M133a: shared-surface owner create injected alloc failure unwinds to ENOME
     try std.testing.expectEqual(@as(u64, 8), alloc.stats().free_pages);
     _ = process.on_task_exit(f.task, 0);
     try std.testing.expect(process.release_pages_on_reap(f.task));
+}
+
+test "syscall: slots 94/95 — bounds, grant word, arm/cancel across kinds, overlay fire" {
+    futex_boot_user();
+    try futex_drive_to_user();
+    var frame = fresh_frame();
+    syscall.arm_task_regions();
+    exceptions.resume_frame[0] = @intFromPtr(&frame);
+    const pid = process.find_by_task(2).?;
+    // X1/X2 bounds: 0 and >3600 s are EINVAL before anything arms.
+    for ([_]u64{ 94, 95 }) |slot| {
+        try std.testing.expectEqual(error_result(.einval), dispatch(slot, .{ 0, 0, 0, 0, 0, 0 }, &frame));
+        try std.testing.expectEqual(error_result(.einval), dispatch(slot, .{ 3_600_000_000_001, 0, 0, 0, 0, 0 }, &frame));
+    }
+    // Grant map: 95 carries `timer`; 94 is ungated like slot 4.
+    try std.testing.expectEqual(syscall.grant.word_timer, syscall.grant.slot_word(95));
+    try std.testing.expectEqual(@as(u32, 0), syscall.grant.slot_word(94));
+    // Arm in ns: the store deadline + one deadline-set entry.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(95, .{ 100_000_000, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(app_timers.armed_pending(pid));
+    try std.testing.expectEqual(@as(u64, 100_000_000), app_timers.deadline_of(pid));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.deadline_set_len());
+    // Slot 41 cancels the ns arm; the entry drops with the store.
+    try std.testing.expectEqual(@as(u64, 1), dispatch(41, .{ 0, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(!app_timers.armed_pending(pid));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.deadline_set_len());
+    // A slot-40 arm replaces a pending ns arm — entry and witness clear.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(95, .{ 200_000_000, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(40, .{ 5, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), app_timers.deadline_of(pid));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.deadline_set_len());
+    // Slot 94 parks on the overlay; the deadline fire resumes it.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(94, .{ 50_000_000, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expect(scheduler.is_blocked(2));
+    scheduler.on_tick();
+    try std.testing.expect(scheduler.is_blocked(2));
+    scheduler.deadline_service(0, 50_000_000);
+    try std.testing.expect(!scheduler.is_blocked(2));
 }

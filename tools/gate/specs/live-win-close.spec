@@ -22,6 +22,6 @@ vgate_assert 01 serial-count 'win: close ok' 2
 vgate_assert 01 serial-count 'procs WINCLOSE.BIN exited status=88' 2
 vgate_assert 01 serial-count 'dui: windows=4' 1
 vgate_assert 01 serial-absent 'user user'
-vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=94'
+vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=96'
 vgate_assert 01 serial-contains '  12 sys_win_open calls=1'
 vgate_assert 01 serial-contains '  15 sys_win_close calls=1'

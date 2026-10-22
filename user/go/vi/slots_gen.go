@@ -40,6 +40,8 @@ const (
 	SlotAudioRecInfo       uintptr = 91
 	SlotAudioRec           uintptr = 92
 	SlotVsockCtl           uintptr = 93
+	SlotSleepNs            uintptr = 94
+	SlotTimerSetNs         uintptr = 95
 )
 
 type SyscallArgKind uint8
@@ -168,6 +170,8 @@ var SyscallSlots = [...]SyscallSlot{
 	{SlotAudioRecInfo, "sys_audio_rec_info", 1, [6]SyscallArg{{Kind: ArgPtr}}},
 	{SlotAudioRec, "sys_audio_rec", 5, [6]SyscallArg{{Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
 	{SlotVsockCtl, "sys_vsock_ctl", 6, [6]SyscallArg{{Kind: ArgString, LengthArg: 1, LengthMask: ^uint64(0)}, {Kind: ArgInt}, {Kind: ArgString, LengthArg: 3, LengthMask: ^uint64(0)}, {Kind: ArgInt}, {Kind: ArgPtr}, {Kind: ArgInt}}},
+	{SlotSleepNs, "sys_sleep_ns", 1, [6]SyscallArg{{Kind: ArgInt}}},
+	{SlotTimerSetNs, "sys_timer_set_ns", 1, [6]SyscallArg{{Kind: ArgInt}}},
 }
 
 var SyscallVariants = [...]SyscallVariant{

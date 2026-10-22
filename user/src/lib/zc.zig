@@ -62,6 +62,23 @@ pub fn sleep(ticks: u64) void {
     );
 }
 
+/// card #3036 (ADR 0007 X1): slot 94 — block at least `ns` nanoseconds on
+/// the deadline overlay. A pre-card-#3036 kernel answers ENOSYS (-4) and
+/// the call falls back to slot 4, rounding up to whole ticks.
+pub fn sleep_ns(ns: u64) i64 {
+    const r: i64 = asm volatile ("svc #0"
+        : [ret] "={x0}" (-> i64),
+        : [num] "{x8}" (@as(u64, 94)),
+          [ns] "{x0}" (ns),
+    );
+    if (r != -4) return r;
+    return asm volatile ("svc #0"
+        : [ret] "={x0}" (-> i64),
+        : [num] "{x8}" (@as(u64, 4)),
+          [ticks] "{x0}" ((ns + 999_999_999) / 1_000_000_000),
+    );
+}
+
 /// Z2a (issue #756): file ops take explicit ptr+len (the in-guest reg ABI is
 /// fd in x0, ptr in x1, count in x2); fds and byte counts are u64 so the
 /// dialect never needs int casts. Error returns (-errno) surface as huge u64.

@@ -104,8 +104,8 @@ func TestObserveGatewaysMarshalFrozenArguments(t *testing.T) {
 
 func generateSyscallSlots(source []byte) ([]byte, error) {
 	rows := regexp.MustCompile(`(?m)^\s*row\((\d+), "(sys_[a-z0-9_]+)", \.\{(.*?)\}\),$`).FindAllSubmatch(source, -1)
-	if len(rows) != 94 {
-		return nil, fmt.Errorf("kernel ABI has %d rows, want frozen slots 0–93", len(rows))
+	if len(rows) != 96 {
+		return nil, fmt.Errorf("kernel ABI has %d rows, want frozen slots 0–95", len(rows))
 	}
 	// These predate this generated mirror and live outside M94a's Touches.
 	existing := map[string]bool{"SlotTimeSet": true, "SlotWinSetTitle": true, "SlotWmctl": true}

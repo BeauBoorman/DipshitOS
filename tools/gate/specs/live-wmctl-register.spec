@@ -25,8 +25,8 @@ vgate_assert 01 serial-contains 'wndstub: present ok'
 vgate_assert 01 serial-contains 'tasks user-exec reaped'
 vgate_assert 01 serial-contains 'wm: unregistered, shim resumed'
 vgate_assert 01 serial-contains '65 sys_wmctl calls=2'
-# Census observed on VZ: `syscalls: slots=64 implemented=94` (kernel
+# Census observed on VZ: `syscalls: slots=64 implemented=96` (kernel
 # implemented_count; host tests pin the same line). The M32-era pin was 68.
-vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=94'
+vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=96'
 vgate_assert 01 serial-contains 'rx-wmctl-ok'
 vgate_assert 01 serial-absent '[EXC] parking:'

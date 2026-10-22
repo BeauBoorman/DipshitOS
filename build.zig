@@ -798,9 +798,12 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSmall,
         }),
     });
-    timertest_prog.linker_script = b.path("user/linker.ld");
+    // card #3036: segmented DSK3 — the jitter argv mode needs the argv
+    // block, which lives in the writable data tail there (the flat image
+    // refused `no_args_room`, the EL0EXEC.BIN precedent).
+    timertest_prog.linker_script = b.path("user/linker-segmented.ld");
     const timertest_step = b.step("timertest", "Build the twenty-third ESP user program (zig-out/bin/TIMER.BIN)");
-    const timertest_elf2bin = b.addSystemCommand(&.{ "python3", "tools/elf2bin.py" });
+    const timertest_elf2bin = b.addSystemCommand(&.{ "python3", "tools/elf2bin.py", "--segments" });
     timertest_elf2bin.addFileArg(timertest_prog.getEmittedBin());
     const timertest_bin = timertest_elf2bin.addOutputFileArg("TIMER.BIN");
     timertest_elf2bin.has_side_effects = true;

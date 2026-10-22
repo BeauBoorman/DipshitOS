@@ -267,8 +267,9 @@ fn lifecycle_or_blocking(slot: u64) bool {
     return switch (slot) {
         // Terminates the caller (the sweep would reap its own task).
         syscall.sys_exit => true,
-        // Parks/stages the caller awaiting a wake.
-        syscall.sys_sleep, syscall.sys_wait, syscall.sys_futex, syscall.sys_wait_event => true,
+        // Parks/stages the caller awaiting a wake. card #3036: slot 94
+        // (sys_sleep_ns) parks on the deadline overlay the same way.
+        syscall.sys_sleep, syscall.sys_sleep_ns, syscall.sys_wait, syscall.sys_futex, syscall.sys_wait_event => true,
         // Cooperative yield stages another task by design.
         syscall.sys_yield => true,
         // Creates or exits a task: a state change, not a refusal.

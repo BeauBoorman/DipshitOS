@@ -291,6 +291,18 @@ func Yield() { _ = syscall0(SlotYield) }
 // Sleep blocks the calling task for ticks scheduler ticks.
 func Sleep(ticks uint64) { _ = syscall1(SlotSleep, uintptr(ticks)) }
 
+// SleepNs blocks the calling task for at least ns nanoseconds (slot 94 —
+// card #3036's deadline-overlay seam). A pre-card-#3036 kernel answers
+// ENOSYS and the call falls back to slot 4, rounding up to whole ticks.
+// The raw kernel result is returned for callers that want EINVAL.
+func SleepNs(ns uint64) int64 {
+	r := syscall1(SlotSleepNs, uintptr(ns))
+	if r == -ErrENOSYS {
+		return syscall1(SlotSleep, uintptr((ns+999_999_999)/1_000_000_000))
+	}
+	return r
+}
+
 // Exit terminates the process with the given status. It routes through the
 // svc1 hook seam so a HOST test can observe the status without leaving the
 // Go runtime; the guest path is unchanged.

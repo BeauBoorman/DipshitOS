@@ -179,7 +179,7 @@ pub fn slot_word(number: u64) u32 {
         23...27, 34...37, 69, 77, 79 => word_file,
         12...22, 46, 47, 49...51, 53, 55, 58, 61, 65 => word_window,
         42...45 => word_audio,
-        40, 41 => word_timer,
+        40, 41, 95 => word_timer,
         63, 64 => word_memory,
         5...8, 28, 29, 54, 56, 57, 68, 73...75, 81...83, 87 => word_process,
         0, 1, 3 => word_debug,

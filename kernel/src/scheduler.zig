@@ -556,6 +556,13 @@ fn futex_wake_locked(pid: usize, uaddr: u64, n: usize, result: u64) usize {
         futex_entry_clear(e);
         if (tid >= max_tasks or tasks[tid].state != .blocked) continue;
         tasks[tid].state = .ready;
+        // card #3036: an early wake also disarms the waiter's ns
+        // deadline — leaving the entry would stale-scan on its fire, and
+        // a stale witness would wrongly skip the task in wake_expired.
+        if (tasks[tid].deadline_ns != 0) {
+            tasks[tid].deadline_ns = 0;
+            if (deadline_remove_task_locked(tid)) |dc| publish_earliest(dc);
+        }
         const frame: *exceptions.VectorFrame = @ptrFromInt(tasks[tid].sp);
         _ = exceptions.frame_write(frame, 0, result);
         push_home_locked(tid);
@@ -1704,6 +1711,9 @@ pub fn register_user(entry: u64, image_base: u64) ?usize {
         events.reset(proc_id);
         file_table.reset_process(proc_id);
         app_timers.reset(proc_id);
+        // card #3036: a recycled pid can still hold a stale slot-95
+        // deadline entry — drop it beside the store reset.
+        app_timer_deadline_clear(proc_id);
         _ = process.bind(proc_id, id);
     }
     const frame: *exceptions.VectorFrame = @ptrFromInt(tasks[id].sp);
@@ -2213,6 +2223,13 @@ const DeadlineEntry = struct {
 /// nothing; its fire only records the lateness through `timer.probe_done`.
 const deadline_probe_task: usize = max_tasks;
 
+/// card #3036 (ADR 0007 X2): a slot-95 app-timer arm sits in the deadline
+/// set keyed `deadline_timer_task + pid` — a sentinel range, never a real
+/// task id. The validity witness is `app_timers.deadline_of(pid)` (the
+/// store's absolute deadline), not a TCB field; its fire posts the
+/// kind-9 TIMER event instead of flipping a task.
+const deadline_timer_task: usize = max_tasks + 1;
+
 /// The deadline set: sorted by `deadline_ns`, fixed BSS, `max_tasks`
 /// entries, no allocation. Entries are keyed by task id; the TCB's
 /// `deadline_ns` is the validity witness — a kill or wake that clears it
@@ -2231,6 +2248,14 @@ fn earliest_deadline_for(core: usize) u64 {
     for (deadline_set[0..deadline_count]) |e| {
         if (e.core != core) continue;
         if (e.task == deadline_probe_task) return e.deadline_ns;
+        // card #3036: an app-timer entry is live while the store's
+        // recorded deadline still matches; cancel/re-arm/reset make it
+        // stale and it is skipped (dropped on the next fire scan).
+        if (e.task >= deadline_timer_task) {
+            const pid = e.task - deadline_timer_task;
+            if (app_timers.deadline_of(pid) == e.deadline_ns) return e.deadline_ns;
+            continue;
+        }
         if (e.task < max_tasks and tasks[e.task].deadline_ns == e.deadline_ns) return e.deadline_ns;
     }
     return 0;
@@ -2382,8 +2407,16 @@ fn deadline_wake_due_locked(c: u32, now_ns: u64) void {
     var i: usize = 0;
     while (i < deadline_count) {
         const e = deadline_set[i];
-        const stale = e.task != deadline_probe_task and
-            (e.task >= max_tasks or tasks[e.task].deadline_ns != e.deadline_ns or tasks[e.task].state != .blocked);
+        // Staleness by entry kind: a probe lives while armed; a card-#3036
+        // app-timer entry lives while the store's recorded deadline still
+        // matches (cancel/re-arm/reset drop it); a task entry lives while
+        // the TCB is still deadline-blocked on exactly this deadline.
+        const stale = if (e.task == deadline_probe_task)
+            false
+        else if (e.task >= deadline_timer_task)
+            app_timers.deadline_of(e.task - deadline_timer_task) != e.deadline_ns
+        else
+            tasks[e.task].deadline_ns != e.deadline_ns or tasks[e.task].state != .blocked;
         if (stale) {
             deadline_drop_locked(i);
             continue;
@@ -2395,9 +2428,27 @@ fn deadline_wake_due_locked(c: u32, now_ns: u64) void {
         if (e.task == deadline_probe_task) {
             probe_armed = false;
             timer.probe_done(probe_ms, (now_ns - e.deadline_ns) / 1_000);
+        } else if (e.task >= deadline_timer_task) {
+            // card #3036: a slot-95 fire posts the TIMER event into the
+            // process queue — events.push's blocked-waiter hook tolerates
+            // the sched_lock this scan holds (wake_event_waiters reentry).
+            app_timers.fire_deadline(e.task - deadline_timer_task, e.deadline_ns, now_ns);
         } else {
             tasks[e.task].deadline_ns = 0;
             tasks[e.task].state = .ready;
+            // card #3036 (X3): a futex waiter's deadline IS its wait
+            // expiry — patch -ETIMEDOUT into the saved frame and drop the
+            // seat, the wake_expired contract carried to the overlay.
+            if (tasks[e.task].futex_waiting) {
+                for (&futex_table) |*fe| {
+                    if (fe.used and fe.task == e.task) {
+                        futex_entry_clear(fe);
+                        break;
+                    }
+                }
+                const frame: *exceptions.VectorFrame = @ptrFromInt(tasks[e.task].sp);
+                _ = exceptions.frame_write(frame, 0, futex_timed_out_result);
+            }
             push_home_locked(e.task);
         }
         deadline_drop_locked(i);
@@ -2436,6 +2487,38 @@ pub fn deadline_service(c: u32, now_ns: u64) void {
 /// How many entries the set currently holds (test/monitor observability).
 pub fn deadline_set_len() usize {
     return deadline_count;
+}
+
+/// card #3036 (ADR 0007 X2, slot 95): arm process `pid`'s ONE app timer
+/// for `delay_ns` nanoseconds — the `app_timers` store records the
+/// absolute `timer.now_ns` deadline (quantized up to D2's 1 ms) beside a
+/// whole-tick backstop, and this core's comparator wakes the due entry so
+/// `fire_deadline` posts the same kind-9 TIMER event the tick path does.
+/// A full deadline set still arms the timer (the backstop fires it, late
+/// but bounded); only an out-of-range pid or an overflowing deadline
+/// refuses. The task is not blocked — the caller runs on.
+pub fn app_timer_set_ns(pid: usize, delay_ns: u64) bool {
+    const c = smp.core_id();
+    const ns = deadline_quantum_ns(delay_ns);
+    const abs = std.math.add(u64, timer.now_ns(), ns) catch return false;
+    const backstop = ns / timer.period_ns + 1;
+    sched_lock_acquire();
+    defer sched_lock_release();
+    if (!app_timers.set_ns(pid, abs, backstop)) return false;
+    _ = deadline_insert_locked(deadline_timer_task + pid, c, abs);
+    publish_earliest(c);
+    return true;
+}
+
+/// card #3036: drop process `pid`'s app-timer deadline entry when the
+/// store side disarms — the slot-40 re-arm, slot-41 cancel, and process
+/// lifecycle reset paths all call this beside `app_timers` so the
+/// comparator stops tracking a deadline that can no longer fire. Safe
+/// with no entry armed; a missed one only stale-drops on a later fire.
+pub fn app_timer_deadline_clear(pid: usize) void {
+    sched_lock_acquire();
+    defer sched_lock_release();
+    if (deadline_remove_task_locked(deadline_timer_task + pid)) |dc| publish_earliest(dc);
 }
 
 /// Card 4c (claim 9946): block the calling task until the PROCESS with id
@@ -2661,15 +2744,20 @@ pub fn join_thread(pid: usize, token: u64) ?u64 {
 /// the scheduler. Returns `.blocked` on a real park (the waker/timeout
 /// patches the saved frame's x0), `.word_changed` when the re-check failed
 /// (the caller returns EAGAIN), and `.unavailable` for an inactive
-/// scheduler, a bad task state, a full seat table, or no successor (also
-/// EAGAIN — transient; the caller re-reads).
+/// scheduler, a bad task state, a full seat table or deadline set, or no
+/// successor (also EAGAIN — transient; the caller re-reads).
+///
+/// card #3036 (ADR 0007 X3): `deadline_ns` is an absolute `timer.now_ns`
+/// expiry (0 = wait forever), quantized up to the overlay's 1 ms
+/// granularity — the deadline IRQ's wake scan reports -ETIMEDOUT, the
+/// same result the tick's `wake_expired` used to patch.
 pub const FutexWaitOutcome = enum { blocked, word_changed, unavailable };
 
 pub fn futex_wait_current(
     pid: usize,
     uaddr: u64,
     val: u32,
-    deadline_tick: u64,
+    deadline_ns: u64,
     word_matches: *const fn (uaddr: u64, val: u32) bool,
 ) FutexWaitOutcome {
     const c = smp.core_id();
@@ -2715,7 +2803,26 @@ pub fn futex_wait_current(
     const old_pen = tasks[waiting].age_penalty;
     const old_skip = tasks[waiting].age_skip;
     tasks[waiting].state = .blocked;
-    tasks[waiting].wakeup_tick = deadline_tick;
+    // card #3036: a timed wait carries an ns deadline on the overlay — the
+    // entry goes in under the same sched_lock hold as the seat so a fire
+    // can never observe one without the other.
+    const ns = deadline_quantum_ns(deadline_ns);
+    if (ns != 0) {
+        if (!deadline_insert_locked(waiting, c, ns)) {
+            // A full deadline set refuses the park like a full seat
+            // table — transient, the caller re-reads the word.
+            tasks[waiting].state = .ready;
+            tasks[waiting].futex_waiting = false;
+            tasks[waiting].age_penalty = old_pen;
+            tasks[waiting].age_skip = old_skip;
+            tasks[waiting].saves -%= 1;
+            futex_entry_clear(entry);
+            sched_lock_release();
+            return .unavailable;
+        }
+        tasks[waiting].deadline_ns = ns;
+        publish_earliest(c);
+    }
     note_blocked(waiting); // M133b
     sched_lock_release();
     if (!claim_and_stage(c, waiting)) {
@@ -2725,7 +2832,9 @@ pub fn futex_wait_current(
         sched_lock_acquire();
         tasks[waiting].state = .ready;
         tasks[waiting].futex_waiting = false;
-        tasks[waiting].wakeup_tick = 0;
+        tasks[waiting].deadline_ns = 0;
+        _ = deadline_remove_task_locked(waiting);
+        publish_earliest(c);
         tasks[waiting].age_penalty = old_pen;
         tasks[waiting].age_skip = old_skip;
         tasks[waiting].saves -%= 1;
@@ -3264,8 +3373,10 @@ fn exit_current_locked(status: u64, process_exit: bool) bool {
         @import("socket_native.zig").closeOwner(pid);
         virtio_snd.snd_stream_owner_death(pid);
         // Milestone 14 (claim 7323): a dead process's app timer is disarmed
-        // now — no stale fire can ever reach a recycled pid.
+        // now — no stale fire can ever reach a recycled pid. card #3036:
+        // its slot-95 deadline entry drops with the store.
         app_timers.reset(pid);
+        app_timer_deadline_clear(pid);
         // M32 WMS2 (issue #622): if the exited process was the registered
         // WM, unregister it NOW — pacing falls back to the shell idle shim
         // (the desktop survives a crashed WM, mirroring the close_owner
@@ -4312,4 +4423,55 @@ test "scheduler: timer probe arms one task-less deadline and reports late_us" {
     try std.testing.expect(!probe_armed);
     try std.testing.expectEqual(@as(usize, 0), deadline_count);
     try std.testing.expect(probe_deadline_ms(60));
+}
+
+test "scheduler: slot-95 app-timer deadline fires one TIMER event; cancel and staleness disarm" {
+    _ = init();
+    _ = register_worker(0x2000).?;
+    _ = register_user(0x3000, 0).?;
+    start();
+    try std.testing.expect(app_timer_set_ns(0, 50_000_000)); // 50 ms, now_ns()=0 in tests
+    try std.testing.expect(app_timers.armed_pending(0));
+    try std.testing.expectEqual(@as(usize, 1), deadline_count);
+    try std.testing.expectEqual(@as(u64, 50_000_000), earliest_deadline_for(0));
+    try std.testing.expectEqual(@as(usize, 0), events.pending(0));
+    // Early fire: nothing due; the arm survives.
+    deadline_service(0, 49_999_999);
+    try std.testing.expect(app_timers.armed_pending(0));
+    // The due fire posts the kind-9 event and frees the entry — the task
+    // pool is untouched (the caller never blocked).
+    deadline_service(0, 50_000_000);
+    try std.testing.expect(!app_timers.armed_pending(0));
+    try std.testing.expectEqual(@as(usize, 1), events.pending(0));
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+    const ev = events.peek(0).?;
+    try std.testing.expectEqual(events.TIMER, ev.kind);
+
+    // Cancel across kinds: the store side + the set entry both drop.
+    try std.testing.expect(app_timer_set_ns(0, 60_000_000));
+    _ = app_timers.cancel(0);
+    app_timer_deadline_clear(0);
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+    deadline_service(0, 70_000_000);
+    try std.testing.expectEqual(@as(usize, 1), events.pending(0));
+
+    // A store-side disarm without the entry clear leaves a stale entry;
+    // the fire scan drops it and delivers nothing.
+    try std.testing.expect(app_timer_set_ns(0, 80_000_000));
+    _ = app_timers.cancel(0);
+    try std.testing.expectEqual(@as(usize, 1), deadline_count);
+    try std.testing.expectEqual(@as(u64, 0), earliest_deadline_for(0)); // stale: not the earliest
+    deadline_service(0, 90_000_000);
+    try std.testing.expectEqual(@as(usize, 0), deadline_count);
+    try std.testing.expectEqual(@as(usize, 1), events.pending(0));
+
+    // The tick backstop: an ns arm whose deadline entry never fired still
+    // completes through the plain countdown.
+    try std.testing.expect(app_timer_set_ns(0, 1_500_000_000)); // backstop 2 ticks
+    _ = deadline_remove_task_locked(deadline_timer_task + 0); // unseated entry
+    on_tick();
+    try std.testing.expect(app_timers.armed_pending(0));
+    on_tick();
+    try std.testing.expect(!app_timers.armed_pending(0));
+    try std.testing.expectEqual(@as(usize, 2), events.pending(0));
 }

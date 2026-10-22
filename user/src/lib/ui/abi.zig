@@ -95,6 +95,11 @@ pub const sys_drag_read_num: u64 = 55;
 pub const sys_win_move_to_workspace_num: u64 = 52;
 pub const sys_win_set_unsaved_num: u64 = 53;
 pub const sys_timer_cancel_num: u64 = 41;
+/// card #3036 (ADR 0007 X1/X2): slots 94/95 — the deadline-overlay pair.
+/// sys_sleep_ns is ungated like slot 4; sys_timer_set_ns carries the
+/// `timer` grant word like slots 40/41.
+pub const sys_sleep_ns_num: u64 = 94;
+pub const sys_timer_set_ns_num: u64 = 95;
 pub const sys_udp_listen_num: u64 = 9;
 pub const sys_udp_send_num: u64 = 10;
 pub const sys_udp_recv_num: u64 = 11;
@@ -770,9 +775,46 @@ pub fn timer_set(delay_ticks: u64) i64 {
 
 /// Claim 7323 (ADR 0007 slot 41): disarm the CALLING process's app timer.
 /// Returns 1 if a pending timer was canceled, 0 if none was armed; negative
-/// error otherwise (EINVAL non-process caller).
+/// error otherwise (EINVAL non-process caller). Cancels either arm kind.
 pub fn timer_cancel() i64 {
     return syscall0(sys_timer_cancel_num);
+}
+
+/// card #3036 (ADR 0007 X2, slot 95): arm the CALLING process's ONE app
+/// timer for `ns` nanoseconds on the deadline overlay — the same kind-9
+/// TIMER event. A pre-card-#3036 kernel answers ENOSYS (-4) and the call
+/// falls back to slot 40, rounding up to whole ticks.
+pub fn timer_set_ns(ns: u64) i64 {
+    const r = syscall1(sys_timer_set_ns_num, ns);
+    if (r == -4) return timer_set((ns + 999_999_999) / 1_000_000_000);
+    return r;
+}
+
+/// card #3036: the EL0-readable counter pair (the kernel grants EL0 the
+/// generic timer registers). `nanos` is the deadline overlay's own clock,
+/// so userland lateness measurements agree with the kernel's deadlines.
+pub fn counter_ticks() u64 {
+    if (@import("builtin").os.tag != .freestanding) return 0;
+    var v: u64 = 0;
+    asm volatile ("mrs %[v], cntpct_el0"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+pub fn counter_freq() u64 {
+    if (@import("builtin").os.tag != .freestanding) return 0;
+    var v: u64 = 0;
+    asm volatile ("mrs %[v], cntfrq_el0"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+pub fn nanos() u64 {
+    const f = counter_freq();
+    if (f == 0) return 0;
+    return @intCast(@as(u128, counter_ticks()) * 1_000_000_000 / f);
 }
 
 pub fn udp_listen(port: u16) i64 {

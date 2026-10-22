@@ -39,7 +39,7 @@ vgate_assert 01 serial-contains 'dui: windows=4'
 vgate_assert 01 serial-contains 'winloop: loop ok'
 vgate_assert 01 serial-contains 'dui: windows=5'
 vgate_assert 01 serial-contains 'dui[4]: user user rect=64,64,512,384'
-vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=94'
+vgate_assert 01 serial-contains 'syscalls: slots=64 implemented=96'
 vgate_assert 01 python <<'PY'
 import os, re
 ser = open(os.environ["VG_SER"]).read()

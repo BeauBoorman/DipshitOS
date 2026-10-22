@@ -16,6 +16,9 @@ const (
 	// SlotTimerCancel is sys_timer_cancel() — disarm it: 1 when a pending
 	// timer was cancelled, 0 when none was armed.
 	SlotTimerCancel uintptr = 41
+	// SlotTimerSetNs is sys_timer_set_ns(ns) — slot 95, the
+	// deadline-overlay arm of the same single app timer (card #3036).
+	SlotTimerSetNs uintptr = 95
 )
 
 // TimerSet arms the calling process's app timer (slot 40) and returns the raw
@@ -32,4 +35,16 @@ func TimerSet(delayTicks uint64) int64 {
 // otherwise.
 func TimerCancel() int64 {
 	return syscallFn(SlotTimerCancel, 0, 0, 0, 0)
+}
+
+// TimerSetNs arms the caller's ONE app timer for ns nanoseconds (slot 95)
+// and returns the raw kernel result — the same TIMER event, re-arm
+// replaces either kind, slot 41 cancels. A pre-card-#3036 kernel answers
+// ENOSYS and the call falls back to slot 40, rounding up to whole ticks.
+func TimerSetNs(ns uint64) int64 {
+	r := syscallFn(SlotTimerSetNs, uintptr(ns), 0, 0, 0)
+	if r == -ErrENOSYS {
+		return TimerSet((ns + 999_999_999) / 1_000_000_000)
+	}
+	return r
 }

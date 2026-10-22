@@ -174,6 +174,12 @@ pub const slots = [_]Slot{
     // the caller's behalf; EL0 names a verb (and an optional name arg)
     // and gets the reply verdict back — no key ever crosses the seam.
     row(93, "sys_vsock_ctl", .{ str(1), .int, str(3), .int, .ptr, .int }),
+    // card #3036 (ADR 0007 X1/X2): the deadline-overlay pair — slot 94
+    // sleeps the caller at least `ns`, slot 95 arms the slot-40 app timer
+    // in nanoseconds. Both take one ns argument; 95 carries the `timer`
+    // grant word, 94 stays ungated.
+    row(94, "sys_sleep_ns", .{.int}),
+    row(95, "sys_timer_set_ns", .{.int}),
 };
 
 // op-dependent shapes override the base row. No pointed-to output or binary

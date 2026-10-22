@@ -308,6 +308,12 @@ pub const sys_audio_rec: u64 = 92;
 /// M115d (issue #2463, ADR 0056 D5 + ADR 0007 amendment):
 /// `sys_vsock_ctl(verb_ptr, verb_len, name_ptr, name_len, code_ptr, code_cap)` — slot 93.
 pub const sys_vsock_ctl: u64 = 93;
+/// card #3036 (ADR 0007 X1): `sys_sleep_ns(ns)` — slot 94, the
+/// deadline-overlay sibling of sys_sleep. Ungated, like slot 4.
+pub const sys_sleep_ns: u64 = 94;
+/// card #3036 (ADR 0007 X2): `sys_timer_set_ns(ns)` — slot 95, the
+/// ns-deadline arm of the slot-40 app timer. Grant word `timer`.
+pub const sys_timer_set_ns: u64 = 95;
 /// Step 2 (Issue #205): `sys_win_fill_batch(buf_ptr, buf_len)` — slot 46.
 pub const sys_win_fill_batch: u64 = 46;
 /// Arc2 W1 (claim 3589, ADR 0013 D1): `sys_win_resize(id, w, h)` — slot 47.
@@ -740,6 +746,8 @@ fn handler_for(comptime number: u64) Handler {
         sys_trace => trace.handle,
         sys_profile => sampler.handle,
         sys_memstat => memstat.handle,
+        sys_sleep_ns => handle_sleep_ns,
+        sys_timer_set_ns => handle_timer_set_ns,
         else => @compileError("ABI row has no handler"),
     };
 }
@@ -788,7 +796,7 @@ fn doms_of(number: u64) u5 {
         sys_vsock_ctl => f | k | n,
         sys_write => f,
         sys_win_open, sys_win_fill, sys_win_present, sys_win_close, sys_win_move, sys_win_raise, sys_win_get, sys_win_query, sys_win_set_visible, sys_win_fill_batch, sys_win_resize, 48, sys_win_raise_front, sys_win_lower_back, 52, sys_win_set_unsaved, sys_win_set_title, sys_drag_read, sys_font_size => w,
-        sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl => e,
+        sys_ipc_send, sys_ipc_recv, sys_poll_event, sys_wait_event, sys_timer_set, sys_timer_cancel, sys_notify, sys_wmctl, sys_timer_set_ns => e,
         sys_procs, sys_wait, sys_kill, sys_clipboard_set, sys_clipboard_get, sys_audio_info, sys_audio_play, sys_audio_volume, sys_audio_mute, sys_audio_rec_info, sys_audio_rec, sys_pipe_read, sys_pipe_write, 54, sys_mmap, sys_munmap, sys_time, sys_time_set, sys_tty_attach, sys_principal, sys_secret_get, sys_tty_net_auth, sys_getrandom, sys_thread, sys_futex, sys_exnotify, sys_profile, sys_memstat, sys_getpid, sys_scanout_read, sys_gpucomp => k,
         sys_exit => svclock.all_bits,
         else => 0,
@@ -2619,14 +2627,18 @@ fn getrandom_reseed() bool {
 // GOOS=virelai thread + futex seam (D3/D4)
 // ---------------------------------------------------------------------------
 
-/// The ns->tick conversion for a futex timeout. The scheduler tick is the
-/// 1 s timer period (ADR 0007 sys_sleep row), so any sub-second timeout
-/// rounds UP to one tick — coarse but honest, and documented in the ADR
-/// 0007 amendment. `timeout_ns == 0` waits forever (Go's semasleep(-1)).
-fn futex_deadline_tick(timeout_ns: u64) u64 {
+/// card #3036 (ADR 0007 X1): the duration bound the ns slots enforce —
+/// 3600 s, the slot-40 app-timer bound expressed in nanoseconds.
+const duration_ns_max: u64 = 3_600_000_000_000;
+
+/// card #3036 (X3): the futex timeout becomes an absolute `timer.now_ns`
+/// deadline serviced by the M170a overlay at its 1 ms granularity — no
+/// longer rounded to whole ticks; op 74/2 takes any `ns` the same way.
+/// `timeout_ns == 0` waits forever (Go's semasleep(-1)); an overflowing
+/// deadline refuses EINVAL (the old coarse_deadline contract).
+fn futex_deadline_ns(timeout_ns: u64) error{Overflow}!u64 {
     if (timeout_ns == 0) return 0;
-    const ticks = timeout_ns / timer.period_ns + @intFromBool(timeout_ns % timer.period_ns != 0);
-    return scheduler.current_tick() +| @max(ticks, 1);
+    return std.math.add(u64, timer.now_ns(), timeout_ns) catch error.Overflow;
 }
 
 /// `sys_thread(op, ...)` — slot 73 (ADR 0027 D3). Op 0 = create(entry,
@@ -2715,8 +2727,9 @@ fn handle_thread(args: Args, frame: *exceptions.VectorFrame) u64 {
 /// wake, -ETIMEDOUT when the deadline expires, -EAGAIN when the word no
 /// longer holds `val` (the Linux futex re-check semantics). Op 1 =
 /// wake(n): wake up to `n` waiters of THIS process keyed (pid, uaddr);
-/// returns the number woken. timeout_ns is nanoseconds, rounding UP to the
-/// 1 s scheduler tick; 0 waits forever.
+/// returns the number woken. timeout_ns is nanoseconds: card #3036 (X3)
+/// makes it a `timer.now_ns` deadline on the overlay, quantizing UP to
+/// the 1 ms granularity — not whole ticks; 0 waits forever.
 fn handle_futex(args: Args, frame: *exceptions.VectorFrame) u64 {
     const op = args[0];
     const uaddr = args[1];
@@ -2732,15 +2745,16 @@ fn handle_futex(args: Args, frame: *exceptions.VectorFrame) u64 {
             // runs inside futex_wait_current AFTER the seat is visible
             // (review finding 1) — this first read alone has a
             // store-then-wake lost-wake window.
-            const strict_deadline = if (op == 2)
-                @import("thread_tls.zig").coarse_deadline(scheduler.current_tick(), timeout_ns) catch
-                    return error_result(.einval)
+            // Op 2 keeps its deadline validation ahead of the word read
+            // (the strict-wait precedence); op 0's lands after EAGAIN.
+            const early_deadline = if (op == 2)
+                futex_deadline_ns(timeout_ns) catch return error_result(.einval)
             else
                 0;
             const word = uaccess.load_u32(uaddr) orelse return error_result(.efault);
             const expected: u32 = @truncate(val);
             if (word != expected) return error_result(.eagain);
-            const deadline = if (op == 2) strict_deadline else futex_deadline_tick(timeout_ns);
+            const deadline = if (op == 2) early_deadline else futex_deadline_ns(timeout_ns) catch return error_result(.einval);
             // #2093: stage the wake result slot (0) BEFORE the (pid,uaddr)
             // seat and the parked frame become visible — the wake/timeout
             // patch is the last write; handle_svc never writes a parked
@@ -3333,6 +3347,9 @@ fn handle_tty_net_auth(args: Args, _: *exceptions.VectorFrame) u64 {
 fn handle_timer_set(args: Args, _: *exceptions.VectorFrame) u64 {
     const delay = args[0];
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    // card #3036 (X2): a slot-40 arm replaces EITHER kind — drop an armed
+    // slot-95 deadline entry beside the store's own clear.
+    scheduler.app_timer_deadline_clear(pid);
     _ = app_timers.set(pid, delay);
     return 0;
 }
@@ -3340,10 +3357,44 @@ fn handle_timer_set(args: Args, _: *exceptions.VectorFrame) u64 {
 /// Milestone 14 (claim 7323): slot 41 — sys_timer_cancel()
 /// Disarm the calling process's app timer. Returns 1 if a pending timer
 /// was canceled, 0 if none was armed; EINVAL for a non-process caller.
+/// card #3036: cancels either arm kind — the deadline entry drops with
+/// the store.
 fn handle_timer_cancel(args: Args, _: *exceptions.VectorFrame) u64 {
     _ = args;
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    scheduler.app_timer_deadline_clear(pid);
     return if (app_timers.cancel(pid)) 1 else 0;
+}
+
+/// card #3036 (ADR 0007 X1): slot 94 — sys_sleep_ns(ns)
+/// Block the calling task at least `ns` nanoseconds on the deadline
+/// overlay (the 1 ms granularity ADR 0060 D2 names): sleep_until_ns parks
+/// it through the same saved-frame/staged-successor seam sys_sleep uses,
+/// so the success result is published before the park exactly like slot 4.
+/// Bounds are X1's: `ns == 0` and `ns` above 3600 s are EINVAL. Ungated;
+/// on an old kernel the unknown-slot ENOSYS sends callers back to slot 4,
+/// rounding up.
+fn handle_sleep_ns(args: Args, frame: *exceptions.VectorFrame) u64 {
+    const ns = args[0];
+    if (ns == 0 or ns > duration_ns_max) return error_result(.einval);
+    const deadline = std.math.add(u64, timer.now_ns(), ns) catch return error_result(.einval);
+    _ = exceptions.frame_write(frame, 0, 0);
+    if (!scheduler.sleep_until_ns(deadline)) return error_result(.einval);
+    return 0;
+}
+
+/// card #3036 (ADR 0007 X2): slot 95 — sys_timer_set_ns(ns)
+/// Arm the CALLING process's ONE app timer — the slot-40 timer: the same
+/// kind-9 `TIMER` event into its ADR 0009 queue, re-arm replaces either
+/// kind, slot 41 cancels — for `ns` nanoseconds through the deadline
+/// overlay. X1's bounds: `ns == 0` and `ns` above 3600 s are EINVAL;
+/// EINVAL for a non-process caller. Grant word `timer` (grant.zig).
+fn handle_timer_set_ns(args: Args, _: *exceptions.VectorFrame) u64 {
+    const ns = args[0];
+    if (ns == 0 or ns > duration_ns_max) return error_result(.einval);
+    const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
+    if (!scheduler.app_timer_set_ns(pid, ns)) return error_result(.einval);
+    return 0;
 }
 
 /// Milestone 15 (claim 7636): slot 42 — sys_audio_info(out_ptr)
