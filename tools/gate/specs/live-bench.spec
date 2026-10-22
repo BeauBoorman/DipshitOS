@@ -16,7 +16,9 @@
 # RETRY / SAMPLE POLICY (the card's call): a MEASUREMENT is never
 # retried — a measured value is a sample, recorded in a receipt, never
 # re-drawn for luck. Legs with an OBSERVED instability run K=3 attempts
-# (smp{2,4}{a,b,c}, hfread{a,b,c}); the leg's verdict checks ONE aggregate
+# (smp{2,4}{a,b,c}, hfread{a,b,c}; M170f #3040 adds key{a,b,c} — the
+# three-runtime seat leg samples K=3 per the card's best-of-K instruction,
+# not an observed flake); the leg's verdict checks ONE aggregate
 # — the direction-aware best sample (min for `<=`, max for `>=`: the
 # corpus metric is an achievable bound and each baseline was itself a
 # best-case observation; contention noise perturbs single samples, a real
@@ -43,8 +45,10 @@
 # `verdict=breach` receipt naming the row. Recorded on #2486.
 #
 # HOST PREREQUISITE (not hermetic — tools/go/README.md):
-# .build/go/{GOSH,GOSCALE,GOBIG,GOREAD}.ELF; setup stages them into the
-# seeded share and refuses when one is missing.
+# .build/go/{GOSH,GOSCALE,GOBIG,GOREAD,GOTABWM,GOSOUND,GOMBURST,GOCALC,
+# GOTOP}.ELF; setup stages them into the seeded share and refuses when
+# one is missing. TIMER.BIN rides the seeded zig-out bundle like every
+# other .BIN (card #3036's jitter mode is its M170f consumer).
 
 vgate_name live-bench "M119b: run the benchmark corpus on VZ, fail on budget breach"
 vgate_share seed
@@ -148,7 +152,8 @@ def wm_field(ser, name):
 def measure(row_id, ser):
     """Extract the corpus row's metric from a run's serial log; None when
     the instrument never reported (the starvation path)."""
-    if row_id in ("wm-present-cadence", "wm-present-latency"):
+    if row_id in ("wm-present-cadence", "wm-present-latency",
+                  "seat-key-latency"):
         field = ("present_avg_ms" if row_id == "wm-present-cadence"
                  else "lat_max_us")
         return wm_field(ser, field)
@@ -164,6 +169,7 @@ def measure(row_id, ser):
         "smp-scale-c4": r"goscale: ticks=(\d+)",
         "seat-mbox-burst": r"mburst: accepted=(\d+) of \d+ refused=\d+",
         "go-rss": r"top: row pid=\d+ name=GOCALC\.ELF .* mem=(\d+)",
+        "timer-jitter": r"timertest: jitter n=\d+ max_late_us=(\d+)",
     }
     found = re.findall(patterns[row_id], ser)
     if not found:
@@ -843,11 +849,237 @@ if v is None:
 benchlib.check("seat-mbox-burst", v)
 PY
 
+# --- run 09: timer-jitter (M170f #3040) -------------------------------------
+# TIMER.BIN's jitter argv mode (card #3036): 20 sequential 10 ms arms on
+# the deadline overlay (slot 95, ADR 0060 D2's 1 ms quantum), each blocked
+# on its TIMER event; the summary's `max_late_us` is the worst IRQ-side
+# lateness — the overlay's own number, not the heartbeat's. Single attempt
+# like every leg without an observed instability: a missing summary line
+# means the exec never ran, not a flake to retry.
+vgate_file script-jitter.txt <<'EOF'
+exec TIMER.BIN jitter 20
+EOF
+vgate_run jitter -- --script '$RUN_DIR/script-jitter.txt' \
+    --script-expect 'timertest: jitter n=20' --timeout 120
+
+vgate_assert jitter serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert jitter serial-contains 'exec: loaded TIMER.BIN'
+vgate_assert jitter serial-contains 'timertest: jitter n=20'
+vgate_assert jitter serial-absent '[EXC]'
+vgate_assert jitter python <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("timer-jitter", ser)
+if v is None:
+    sys.exit("bench: no `timertest: jitter ... max_late_us=` line — "
+             "the sweep never reported")
+benchlib.check("timer-jitter", v)
+PY
+
+# --- runs 10a-c: seat-key (M170f #3040, K=3 samples) -------------------------
+# GOTABWM + GOCALC + GOSOUND = three Go runtimes — the seat envelope's
+# proven ceiling (docs/testing.md's three-runtime bound). The runner types
+# `1,+,2,=` over the cv-input queue after `gocalc: present` (0.25 s/stroke,
+# the transport's fixed pace): each key-down is a fanned input sample
+# (wm_server.fan_key -> note_input) and the seat's REQUEST_PRESENT closes
+# it, so the `wm` row's lat_max_us is the worst keystroke-to-present of
+# the burst — card #3034's damage tick is the thing this number proves.
+# The `wm` dump rides script3 anchored on `gocalc: result 1+2=3` — a
+# marker that only exists after the burst landed — plus a settle delay so
+# the result's own repaint has presented and closed its sample. K=3
+# samples per the card's best-of-K instruction (same verdict shape as
+# hf-read: best-of-K min for a `<=` bound, no starvation tolerance — a
+# boot whose keys never land is a failure, not a flake).
+# Script layout: GOSOUND execs in script1 (its tab opens while the seat
+# comes up — or windowless if its declare lands before registration, the
+# PCM pump does not care); GOCALC execs in script2 ONLY after
+# 'gosound: streaming gen=' — so Calc is always the LAST tab to bind and
+# deterministically holds focus when the chords type. Exec'ing both in
+# one burst lost the race on-card (Sound Player bound last 1-in-3 and ate
+# the burst; 'gocalc: result' never landed).
+vgate_file script-key-seat.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+exec GOSOUND.ELF /host/SND/TONE.WAV
+EOF
+vgate_file script-key-load.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOCALC.ELF
+EOF
+vgate_file script-key-dump.txt <<'EOF'
+wm
+echo keylat-done
+EOF
+
+vgate_run keya -- --sound --screen '$RUN_DIR/keya-screen' --via-virtio \
+    --script '$RUN_DIR/script-key-seat.txt' \
+    --script2 '$RUN_DIR/script-key-load.txt' \
+    --script2-after 'gosound: streaming gen=' \
+    --input-chords '1,+,2,=' \
+    --input-chords-after 'gocalc: present' \
+    --script3 '$RUN_DIR/script-key-dump.txt' \
+    --script3-after 'gocalc: result 1+2=3' --script3-delay 2 \
+    --script-expect 'keylat-done' --timeout 240
+vgate_run keyb -- --sound --screen '$RUN_DIR/keyb-screen' --via-virtio \
+    --script '$RUN_DIR/script-key-seat.txt' \
+    --script2 '$RUN_DIR/script-key-load.txt' \
+    --script2-after 'gosound: streaming gen=' \
+    --input-chords '1,+,2,=' \
+    --input-chords-after 'gocalc: present' \
+    --script3 '$RUN_DIR/script-key-dump.txt' \
+    --script3-after 'gocalc: result 1+2=3' --script3-delay 2 \
+    --script-expect 'keylat-done' --timeout 240
+vgate_run keyc -- --sound --screen '$RUN_DIR/keyc-screen' --via-virtio \
+    --script '$RUN_DIR/script-key-seat.txt' \
+    --script2 '$RUN_DIR/script-key-load.txt' \
+    --script2-after 'gosound: streaming gen=' \
+    --input-chords '1,+,2,=' \
+    --input-chords-after 'gocalc: present' \
+    --script3 '$RUN_DIR/script-key-dump.txt' \
+    --script3-after 'gocalc: result 1+2=3' --script3-delay 2 \
+    --script-expect 'keylat-done' --timeout 240
+
+vgate_assert keya serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert keya serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert keya serial-contains 'gotabwm: holding seat'
+vgate_assert keya serial-contains 'gosound: streaming gen='
+vgate_assert keya serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert keya serial-contains 'gocalc: present'
+vgate_assert keya serial-contains 'gocalc: result 1+2=3'
+vgate_assert keya serial-contains 'keylat-done'
+vgate_assert keya serial-absent '[EXC]'
+vgate_assert keya python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# The burst must have LANDED for the measurement to mean anything: keys
+# fanned to the seat, and at least one input->present sample answered.
+rows = [l for l in ser.splitlines() if "wm: rate window_ms=" in l]
+if not rows:
+    sys.exit("bench: no `wm: rate` row — the instrument never printed")
+last = rows[-1]
+def field(name):
+    m = re.search(name + r"=(\d+)", last)
+    if not m:
+        sys.exit("bench: field %s missing from %s" % (name, last))
+    return int(m.group(1))
+if field("lat_n") < 1:
+    sys.exit("bench: no input->present latency sample was recorded")
+fan = [l for l in ser.splitlines() if "wm: ptr_fan=" in l]
+if not fan:
+    sys.exit("bench: no `wm: ptr_fan=` row — the input seam never reported")
+kf = re.search(r"key_fan=(\d+)", fan[-1])
+if not kf or int(kf.group(1)) < 4:
+    sys.exit("bench: fewer than 4 key samples fanned — the typed burst "
+             "did not land: %s" % fan[-1])
+v = benchlib.measure("seat-key-latency", ser)
+if v is None:
+    sys.exit("bench: no lat_max_us field in the wm: rate row")
+benchlib.receipt("seat-key-latency", v, "sample", run=os.environ["VG_TAG"])
+PY
+
+vgate_assert keyb serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert keyb serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert keyb serial-contains 'gotabwm: holding seat'
+vgate_assert keyb serial-contains 'gosound: streaming gen='
+vgate_assert keyb serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert keyb serial-contains 'gocalc: present'
+vgate_assert keyb serial-contains 'gocalc: result 1+2=3'
+vgate_assert keyb serial-contains 'keylat-done'
+vgate_assert keyb serial-absent '[EXC]'
+vgate_assert keyb python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+rows = [l for l in ser.splitlines() if "wm: rate window_ms=" in l]
+if not rows:
+    sys.exit("bench: no `wm: rate` row — the instrument never printed")
+last = rows[-1]
+def field(name):
+    m = re.search(name + r"=(\d+)", last)
+    if not m:
+        sys.exit("bench: field %s missing from %s" % (name, last))
+    return int(m.group(1))
+if field("lat_n") < 1:
+    sys.exit("bench: no input->present latency sample was recorded")
+fan = [l for l in ser.splitlines() if "wm: ptr_fan=" in l]
+if not fan:
+    sys.exit("bench: no `wm: ptr_fan=` row — the input seam never reported")
+kf = re.search(r"key_fan=(\d+)", fan[-1])
+if not kf or int(kf.group(1)) < 4:
+    sys.exit("bench: fewer than 4 key samples fanned — the typed burst "
+             "did not land: %s" % fan[-1])
+v = benchlib.measure("seat-key-latency", ser)
+if v is None:
+    sys.exit("bench: no lat_max_us field in the wm: rate row")
+benchlib.receipt("seat-key-latency", v, "sample", run=os.environ["VG_TAG"])
+PY
+
+vgate_assert keyc serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert keyc serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert keyc serial-contains 'gotabwm: holding seat'
+vgate_assert keyc serial-contains 'gosound: streaming gen='
+vgate_assert keyc serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert keyc serial-contains 'gocalc: present'
+vgate_assert keyc serial-contains 'gocalc: result 1+2=3'
+vgate_assert keyc serial-contains 'keylat-done'
+vgate_assert keyc serial-absent '[EXC]'
+vgate_assert keyc python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+rows = [l for l in ser.splitlines() if "wm: rate window_ms=" in l]
+if not rows:
+    sys.exit("bench: no `wm: rate` row — the instrument never printed")
+last = rows[-1]
+def field(name):
+    m = re.search(name + r"=(\d+)", last)
+    if not m:
+        sys.exit("bench: field %s missing from %s" % (name, last))
+    return int(m.group(1))
+if field("lat_n") < 1:
+    sys.exit("bench: no input->present latency sample was recorded")
+fan = [l for l in ser.splitlines() if "wm: ptr_fan=" in l]
+if not fan:
+    sys.exit("bench: no `wm: ptr_fan=` row — the input seam never reported")
+kf = re.search(r"key_fan=(\d+)", fan[-1])
+if not kf or int(kf.group(1)) < 4:
+    sys.exit("bench: fewer than 4 key samples fanned — the typed burst "
+             "did not land: %s" % fan[-1])
+v = benchlib.measure("seat-key-latency", ser)
+if v is None:
+    sys.exit("bench: no lat_max_us field in the wm: rate row")
+benchlib.receipt("seat-key-latency", v, "sample", run=os.environ["VG_TAG"])
+PY
+# Leg verdict on the c-attempt: direction-aware best (min — the bound is
+# `<=`) over every attempt's lat_max_us sample, then the budget check.
+vgate_assert keyc python <<'PY'
+import glob, os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+samples = []
+for p in sorted(glob.glob(os.path.join(os.environ["RUN_DIR"],
+                                       "vm-serial-key*.log"))):
+    v = benchlib.measure("seat-key-latency",
+                         open(p, errors="replace").read())
+    if v is not None:
+        samples.append(v)
+benchlib.leg_verdict("seat-key-latency", samples)
+PY
+
 # --- trend table (#2936) -----------------------------------------------------
 # The last assert on the last leg: every measurement of the run is in
 # artifacts/bench/history.tsv by now, so print the regression table over
 # it. Informational — flags warn; they never fail the run.
-vgate_assert mburst python <<'PY'
+vgate_assert keyc python <<'PY'
 import os, sys
 sys.path.insert(0, os.environ["RUN_DIR"])
 import benchlib

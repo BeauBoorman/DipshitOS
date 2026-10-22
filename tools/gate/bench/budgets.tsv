@@ -58,6 +58,22 @@
 # is the resident-footprint contract the capacity table cites (GOCALC
 # observed 5,984,260 B idled, post-#3032 demand-zero BSS).
 #
+# card #3040 (same host, 2026-10-22): the M170f pins.
+# wm-present-latency re-measured on the post-#3034 tree: the WND.BIN
+# burst's input->present worst-case dropped from ~2.0 s (the drain-bound
+# shape of #2490) to 702,435 us on this card's live-wm-pacing run — the
+# damage tick answers inside the burst now. Baseline is that measured
+# value; the x2 margin family is kept.
+# timer-jitter is the deadline overlay's own number (`timertest jitter 20`
+# max_late_us): four same-shape boots observed 4,696 / 4,991 / 5,501 /
+# 17,823 — the tail is the ~1 ms IRQ-side retry deferrals under
+# sched_lock contention #3036 documented. Baseline is the best observed
+# sample; the x5 margin covers the observed tail.
+# seat-key-latency (new leg): three-Go-runtime seat (GOTABWM + GOCALC +
+# GOSOUND PCM), keys over cv-input; K=3 samples 999,777 / 1,002,732 /
+# 1,003,770 — ~1.0 s, i.e. still about one tick_avg on this shape.
+# Baseline is the best observed sample; x2.
+#
 id	cmp	budget	baseline	margin	ref
 boot-shell	<=	4	1	x4	#2485
 gosh-cmd-ls	<=	0.05	0.01	+400%	#2485
@@ -67,8 +83,10 @@ app-launch-cold	<=	12	3	x4	#3042; new leg, 1 Hz floor-resolution bound
 go-rss	<=	11968520	5984260	x2	#3042; new leg, resident mem_bytes via sys_procs v2
 pcm-drain	<=	8192	4096	x2	#2485
 wm-present-cadence	<=	2554	1277	x2	#2485
-wm-present-latency	<=	4004596	2002298	x2	#2490; re-pinned post-#2729 per-report input fan
+wm-present-latency	<=	1404870	702435	x2	#3040; re-pinned post-#3034 damage tick (measured 702435 on this host)
 smp-scale-c1	<=	270622052	67655513	x4	#2485; spread re-measured on #2486
 smp-scale-c2	<=	105399764	26349941	x4	#2485; spread re-measured on #2486
 smp-scale-c4	<=	66754980	33377490	x2	#2485
 seat-mbox-burst	>=	24	32	-8	#2487; ring bound, measured post-fix on this host
+seat-key-latency	<=	1999554	999777	x2	#3040; new leg, best of K=3 on this host
+timer-jitter	<=	23480	4696	x5	#3040; new leg, best observed of four boots (tail: 17823)

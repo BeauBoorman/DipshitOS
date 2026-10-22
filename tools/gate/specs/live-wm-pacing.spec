@@ -34,9 +34,12 @@ wnd start
 EOF
 
 # Dumped after the burst has had time to land: the `wm` row carries the
-# rate window and both latency aggregates.
+# rate window and both latency aggregates, and the `timer` row carries the
+# heartbeat counters the deadline overlay shares a comparator with
+# (M170f #3040).
 vgate_file script2.txt <<'EOF'
 wm
+timer
 echo pacing-done
 EOF
 
@@ -114,6 +117,35 @@ assert present_avg_ms >= 1, "present interval unmeasurable: %s" % row
 # a per-tick drift shows up here; 800..1200 ms is a drift allowance, not a
 # target.
 assert 800 <= tick_avg_ms <= 1200, "tick_avg_ms=%d is not the 1 Hz heartbeat: %s" % (tick_avg_ms, row)
+# M170f (#3040): the overlay's side of the same pin — every recorded tick
+# still entered through the heartbeat IRQ (ADR 0060 D1: deadline fires
+# count `deadline_irqs` only, never `ticks`/`irq_ticks`). A quiet change
+# that let deadline fires count as ticks would show up as ticks>irq here
+# AND as a shortened tick_avg_ms above — the two reads are independent:
+# this one is the counter stream, that one is the seat-observed interval.
+timer_rows = [l for l in ser.splitlines() if l.startswith("timer: armed=1")]
+assert timer_rows, "no `timer: armed=1` row — the post-burst dump never printed"
+trow = timer_rows[-1]
+t_ticks = field("ticks", trow)
+t_irq = field("irq", trow)
+m = re.search(r"deadline_irqs=(\d+)", trow)
+assert m, "deadline_irqs missing from the timer row — the M170a overlay counter is gone: %s" % trow
+assert t_ticks == t_irq, (
+    "timer ticks=%d != irq=%d — ticks are being counted outside the "
+    "heartbeat IRQ (the deadline overlay must not advance them): %s"
+    % (t_ticks, t_irq, trow))
+# And the seat's own count: heartbeats DELIVERED to the registered WM over
+# the ~30 s post-`wnd: registered` window. A cadence change would move the
+# count, not just the average — `ticks=` on the `wm:` header row counts
+# kind-18 heartbeats only (damage ticks are counted separately), so a
+# quiet heartbeat change cannot hide inside it.
+wm_tick_rows = [l for l in ser.splitlines() if "wm: present_seq=" in l]
+assert wm_tick_rows, "no `wm: present_seq=` row — the seat counters never printed"
+seat_ticks = field("ticks", wm_tick_rows[-1])
+assert seat_ticks >= 20, (
+    "only %d heartbeat ticks delivered to the seat in the post-burst "
+    "window — the 1 Hz heartbeat is not reaching it: %s"
+    % (seat_ticks, wm_tick_rows[-1]))
 # Input samples were recorded AND answered: the left edge (a fanned pointer
 # sample) and the right edge (the WM's present) both happened.
 assert lat_n >= 1, "no input->present latency sample was recorded: %s" % row
