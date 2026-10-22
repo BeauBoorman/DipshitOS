@@ -39,6 +39,11 @@
 # then a restore boot that comes back in the same profile (serial markers
 # and palette pixel probes on both halves).
 #
+# M154d (#2928) adds tagged legs d1/d2/d3: the daily loop, K=3 — an OSC 52
+# "remote" copy read back by the monitor `clip`, a Ctrl+Shift+V bracketed
+# paste (one edit, one Enter submit), a Ctrl+Shift+F find over the search
+# space, and `term-profile next` under the seat with leg 03's rail probe.
+#
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goterm.sh   ->  .build/go/GOTERM.ELF
 #   bash tools/go/build-web.sh browser  ->  .build/go/WEB.ELF  (leg 02)
@@ -500,4 +505,397 @@ if max(abs(mode[i] - dark[i]) for i in range(3)) <= 8 or max(mode) <= 0xa0:
     sys.exit("terminal still paints the dark default (#%02x%02x%02x) — the "
              "restored profile's theme=light never reached the kernel" % mode)
 print("palette probe: terminal grid is light — the restored boot came back in the saved profile")
+PY
+
+# --- M154d (#2928): the daily loop, K=3 --------------------------------------
+# Three identical tagged boots, d1/d2/d3 — the terminal's daily loop end to
+# end with M154a's bracketed paste at its default (on). Each boot seats
+# GOTABWM (leg 03's recipe — the phase-3 rail probe needs a live seat) and
+# execs GOTERM, then walks the same three phases:
+#
+#   phase 1  `source DCLIP.SH` emits OSC 52 `c;<b64>` — the "remote" copy.
+#            The script's payload is three RUNNABLE lines (49 B), so the
+#            clipboard never touches a selection or a drag. script3 rides
+#            the source line's submit marker with a 1 s settle (the pump
+#            bridges Screen.clip_data into the shared clipboard off the
+#            parser path), and the monitor `clip` prints the decoded bytes
+#            back on serial — the readback the chord burst keys off, so the
+#            paste can never run ahead of the copy's landing.
+#   phase 2  ctrl-shift-v pushes the clipboard through the bound tty
+#            wrapped in DECSET 2004 — `tty: paste 61 bytes` = 49 + the 12 B
+#            bracket, the M154a default proving itself with no opt-out
+#            anywhere. ONE pending edit, ONE `goterm: line` submit on the
+#            Enter chord carrying all three rows, one `goterm: done`.
+#   phase 3  ctrl-shift-f opens the kernel search bar — read-only use: the
+#            pattern chars feed the unified history+grid space, Esc closes
+#            the bar (its keypress is captured, never queued). Each fed
+#            char klogs its live count, so the last `tty: search:` line is
+#            the full-pattern 'seek154d' count over the pasted block's
+#            painted rows. Then `term-profile dusk` / `term-profile next` —
+#            typed as chords so the cycle lands after the search — publish
+#            dusk then wrap back to day; the settings broadcast re-themes
+#            the seat's rail and leg 03's modal-pixel probe proves the
+#            repaint on the scanout.
+#
+# The entering share state is always term_profile=day/theme=light (legs
+# 03/04 leave it and every d-run ends having restored it), so the three
+# boots are identical in choreography and result — K=3 repetition
+# evidence, not three variants. The two trailing echoes are choreography:
+# `echo dfin` is the snapshot trigger (~2.5 s of chord pacing after the
+# day publish, long past the seat's repaint), `echo ddun` is the run's
+# script-expect, giving the kind-4 frame its landing window.
+vgate_file script-seatd.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+set GOMAXPROCS=1
+wm
+exec -u0 GOTABWM.ELF
+EOF
+
+vgate_file script2-d.txt <<'EOF'
+exec -u0 GOTERM.ELF
+EOF
+
+vgate_file script3-d.txt <<'EOF'
+clip
+echo rx-d-clip-seen
+EOF
+
+vgate_setup_python <<'PY'
+import base64, os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+# The phase-1 payload: three runnable lines, no trailing newline — the
+# bracketed submit below is exactly these rows. `seek154d` is the phase-3
+# search token: lowercase+digits, all chord-mappable, and it appears only
+# inside this payload (never in a typed line), so a search hit can only
+# come from the paste.
+payload = b"echo row-alpha\necho seek154d-token\necho row-omega"
+assert len(payload) == 49, len(payload)
+b64 = base64.b64encode(payload).decode()
+with open(os.path.join(share, "DCLIP.SH"), "w") as fh:
+    fh.write("printf '\\e]52;c;%s\\x07'\n" % b64)
+print("seeded DCLIP.SH: OSC 52 c; payload %d B (%d b64 chars)" %
+      (len(payload), len(b64)))
+PY
+
+vgate_run d1 -- --display --input \
+    --screen '$RUN_DIR/screen-d1' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-d1' \
+    --script '$RUN_DIR/script-seatd.txt' \
+    --script2 '$RUN_DIR/script2-d.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string 'source DCLIP.SH'$'\n' \
+    --input-string-after 'goterm: prompt' \
+    --script3 '$RUN_DIR/script3-d.txt' \
+    --script3-after 'goterm: line source DCLIP.SH' --script3-delay 1 \
+    --input-chords 'ctrl-shift-v,return,ctrl-shift-f,s,e,e,k,1,5,4,d,escape,t,e,r,m,-,p,r,o,f,i,l,e,space,d,u,s,k,return,t,e,r,m,-,p,r,o,f,i,l,e,space,n,e,x,t,return,e,c,h,o,space,d,f,i,n,return,e,c,h,o,space,d,d,u,n,return' \
+    --input-chords-after 'clip: echo row-alpha' \
+    --snapshot-after 'goterm: line echo dfin' \
+    --script-expect 'goterm: line echo ddun' --timeout 300
+
+vgate_assert d1 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert d1 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert d1 serial-contains 'gotabwm: mode live'
+vgate_assert d1 serial-contains 'gotabwm: present'
+vgate_assert d1 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert d1 serial-contains 'goterm: attached'
+vgate_assert d1 serial-contains 'goterm: prompt'
+# Phase 1: the sourced OSC 52 landed in the shared clipboard and the
+# monitor read it back (`clip: ` + the payload's first line).
+vgate_assert d1 serial-contains 'goterm: line source DCLIP.SH'
+vgate_assert d1 serial-contains 'clip: echo row-alpha'
+# Phase 2: the bracketed paste — payload + 12 B wrap in one push, one
+# submit marker leading with the pasted block's first line.
+vgate_assert d1 serial-contains 'tty: paste 61 bytes'
+vgate_assert d1 serial-contains 'goterm: line echo row-alpha'
+# Phase 3: the search fed its pattern (counts pinned in python below),
+# then the profile cycle dusk -> next -> day with the seat's re-theme
+# broadcast in between.
+vgate_assert d1 serial-contains 'tty: search: '
+vgate_assert d1 serial-contains 'goterm: profile dusk'
+vgate_assert d1 serial-contains 'goterm: profile day'
+vgate_assert d1 serial-contains 'gotabwm: settings broadcast key=theme'
+vgate_assert d1 serial-contains 'goterm: line echo dfin'
+vgate_assert d1 serial-contains 'goterm: line echo ddun'
+vgate_assert d1 serial-absent '[EXC] parking:'
+vgate_assert d1 serial-absent 'exited status=139'
+vgate_assert d1 share-contains SETTINGS.TXT 'term_profile=day'
+vgate_assert d1 share-contains SETTINGS.TXT 'theme=light'
+vgate_assert d1 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+# Phase order: clip readback -> paste push -> ONE submit -> search -> the
+# dusk/day cycle -> the two choreography echoes.
+i_clip = ser.find("clip: echo row-alpha")
+assert i_clip >= 0, "monitor clip never showed the OSC 52 payload"
+clip_seg = ser[i_clip:i_clip + 120]
+for row in ("echo row-alpha", "echo seek154d-token", "echo row-omega"):
+    assert row in clip_seg, "clip readback dropped %r: %r" % (row, clip_seg)
+
+mp = re.search(r"tty: paste (\d+) bytes", ser)
+assert mp, "paste marker missing"
+n_paste = int(mp.group(1))
+assert n_paste == 49 + 12, (
+    "paste must be the 49 B payload + the 12 B DECSET wrap (got %d) — "
+    "the wrap's presence is bracketed paste being ON at its default" % n_paste)
+i_paste = ser.find(mp.group(0))
+assert i_paste > i_clip, "paste fired before the clip readback"
+
+i_line = ser.find("goterm: line ", i_paste)
+i_done = ser.find("goterm: done status=0", i_line)
+assert i_line > i_paste and i_done > i_line, "no submit after the paste"
+n_sub = ser.count("goterm: line ", i_paste, i_done)
+assert n_sub == 1, "one edit, one submit on Enter (got %d submits)" % n_sub
+seg = ser[i_line:i_done]
+for row in ("echo row-alpha", "echo seek154d-token", "echo row-omega"):
+    assert row in seg, "%r missing from the one submit" % row
+
+# Every fed char klogs its live count; the last one carries the full
+# 'seek154d' pattern's match count over the painted block.
+i_search = ser.find("tty: search:", i_done)
+assert i_search > i_done, "the search ran before the paste submitted"
+counts = [int(x) for x in re.findall(r"tty: search: (\d+) matches", ser[i_search:])]
+assert counts, "the search bar fed no pattern"
+assert counts[-1] >= 1, "full pattern 'seek154d' found %d matches" % counts[-1]
+
+i_dusk = ser.find("goterm: profile dusk", i_search)
+assert i_dusk > i_search, "term-profile dusk missing after the search"
+i_day = ser.find("goterm: profile day", i_dusk)
+assert i_day > i_dusk, "term-profile next did not cycle dusk -> day"
+i_dfin = ser.find("goterm: line echo dfin", i_day)
+i_ddun = ser.find("goterm: line echo ddun", i_dfin)
+assert i_dfin > i_day and i_ddun > i_dfin, "tail echoes out of order"
+print("daily loop OK: clip -> paste 61B one submit -> search %d hit(s) -> dusk -> day"
+      % counts[-1])
+PY
+
+# The rail band's modal pixel is the light theme's chrome — leg 03's probe
+# verbatim. The publish's live re-theme is the only thing that lands it
+# there after the dusk detour.
+vgate_assert d1 snapshot 'snap-d1-*.raw' <<'PY'
+import sys
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot %d bytes, want %d" % (len(raw), W * H * 4))
+hist = {}
+for y in range(0, 22):
+    for x in range(0, W, 2):
+        k = (y * W + x) * 4
+        px = (raw[k + 2], raw[k + 1], raw[k])
+        hist[px] = hist.get(px, 0) + 1
+mode = max(hist, key=hist.get)
+print("rail modal pixel: #%02x%02x%02x over %d samples" %
+      (mode + (hist[mode],)))
+if max(mode) <= 0xa0:
+    sys.exit("rail band is not the light theme (#%02x%02x%02x) — the "
+             "term-profile next publish never reached the seat" % mode)
+print("palette probe: rail band is light — the profile cycle re-themed the seat")
+PY
+
+vgate_run d2 -- --display --input \
+    --screen '$RUN_DIR/screen-d2' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-d2' \
+    --script '$RUN_DIR/script-seatd.txt' \
+    --script2 '$RUN_DIR/script2-d.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string 'source DCLIP.SH'$'\n' \
+    --input-string-after 'goterm: prompt' \
+    --script3 '$RUN_DIR/script3-d.txt' \
+    --script3-after 'goterm: line source DCLIP.SH' --script3-delay 1 \
+    --input-chords 'ctrl-shift-v,return,ctrl-shift-f,s,e,e,k,1,5,4,d,escape,t,e,r,m,-,p,r,o,f,i,l,e,space,d,u,s,k,return,t,e,r,m,-,p,r,o,f,i,l,e,space,n,e,x,t,return,e,c,h,o,space,d,f,i,n,return,e,c,h,o,space,d,d,u,n,return' \
+    --input-chords-after 'clip: echo row-alpha' \
+    --snapshot-after 'goterm: line echo dfin' \
+    --script-expect 'goterm: line echo ddun' --timeout 300
+
+vgate_assert d2 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert d2 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert d2 serial-contains 'gotabwm: mode live'
+vgate_assert d2 serial-contains 'gotabwm: present'
+vgate_assert d2 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert d2 serial-contains 'goterm: attached'
+vgate_assert d2 serial-contains 'goterm: prompt'
+vgate_assert d2 serial-contains 'goterm: line source DCLIP.SH'
+vgate_assert d2 serial-contains 'clip: echo row-alpha'
+vgate_assert d2 serial-contains 'tty: paste 61 bytes'
+vgate_assert d2 serial-contains 'goterm: line echo row-alpha'
+vgate_assert d2 serial-contains 'tty: search: '
+vgate_assert d2 serial-contains 'goterm: profile dusk'
+vgate_assert d2 serial-contains 'goterm: profile day'
+vgate_assert d2 serial-contains 'gotabwm: settings broadcast key=theme'
+vgate_assert d2 serial-contains 'goterm: line echo dfin'
+vgate_assert d2 serial-contains 'goterm: line echo ddun'
+vgate_assert d2 serial-absent '[EXC] parking:'
+vgate_assert d2 serial-absent 'exited status=139'
+vgate_assert d2 share-contains SETTINGS.TXT 'term_profile=day'
+vgate_assert d2 share-contains SETTINGS.TXT 'theme=light'
+vgate_assert d2 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+i_clip = ser.find("clip: echo row-alpha")
+assert i_clip >= 0, "monitor clip never showed the OSC 52 payload"
+clip_seg = ser[i_clip:i_clip + 120]
+for row in ("echo row-alpha", "echo seek154d-token", "echo row-omega"):
+    assert row in clip_seg, "clip readback dropped %r: %r" % (row, clip_seg)
+
+mp = re.search(r"tty: paste (\d+) bytes", ser)
+assert mp, "paste marker missing"
+n_paste = int(mp.group(1))
+assert n_paste == 49 + 12, (
+    "paste must be the 49 B payload + the 12 B DECSET wrap (got %d) — "
+    "the wrap's presence is bracketed paste being ON at its default" % n_paste)
+i_paste = ser.find(mp.group(0))
+assert i_paste > i_clip, "paste fired before the clip readback"
+
+i_line = ser.find("goterm: line ", i_paste)
+i_done = ser.find("goterm: done status=0", i_line)
+assert i_line > i_paste and i_done > i_line, "no submit after the paste"
+n_sub = ser.count("goterm: line ", i_paste, i_done)
+assert n_sub == 1, "one edit, one submit on Enter (got %d submits)" % n_sub
+seg = ser[i_line:i_done]
+for row in ("echo row-alpha", "echo seek154d-token", "echo row-omega"):
+    assert row in seg, "%r missing from the one submit" % row
+
+i_search = ser.find("tty: search:", i_done)
+assert i_search > i_done, "the search ran before the paste submitted"
+counts = [int(x) for x in re.findall(r"tty: search: (\d+) matches", ser[i_search:])]
+assert counts, "the search bar fed no pattern"
+assert counts[-1] >= 1, "full pattern 'seek154d' found %d matches" % counts[-1]
+
+i_dusk = ser.find("goterm: profile dusk", i_search)
+assert i_dusk > i_search, "term-profile dusk missing after the search"
+i_day = ser.find("goterm: profile day", i_dusk)
+assert i_day > i_dusk, "term-profile next did not cycle dusk -> day"
+i_dfin = ser.find("goterm: line echo dfin", i_day)
+i_ddun = ser.find("goterm: line echo ddun", i_dfin)
+assert i_dfin > i_day and i_ddun > i_dfin, "tail echoes out of order"
+print("daily loop OK: clip -> paste 61B one submit -> search %d hit(s) -> dusk -> day"
+      % counts[-1])
+PY
+
+vgate_assert d2 snapshot 'snap-d2-*.raw' <<'PY'
+import sys
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot %d bytes, want %d" % (len(raw), W * H * 4))
+hist = {}
+for y in range(0, 22):
+    for x in range(0, W, 2):
+        k = (y * W + x) * 4
+        px = (raw[k + 2], raw[k + 1], raw[k])
+        hist[px] = hist.get(px, 0) + 1
+mode = max(hist, key=hist.get)
+print("rail modal pixel: #%02x%02x%02x over %d samples" %
+      (mode + (hist[mode],)))
+if max(mode) <= 0xa0:
+    sys.exit("rail band is not the light theme (#%02x%02x%02x) — the "
+             "term-profile next publish never reached the seat" % mode)
+print("palette probe: rail band is light — the profile cycle re-themed the seat")
+PY
+
+vgate_run d3 -- --display --input \
+    --screen '$RUN_DIR/screen-d3' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-d3' \
+    --script '$RUN_DIR/script-seatd.txt' \
+    --script2 '$RUN_DIR/script2-d.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string 'source DCLIP.SH'$'\n' \
+    --input-string-after 'goterm: prompt' \
+    --script3 '$RUN_DIR/script3-d.txt' \
+    --script3-after 'goterm: line source DCLIP.SH' --script3-delay 1 \
+    --input-chords 'ctrl-shift-v,return,ctrl-shift-f,s,e,e,k,1,5,4,d,escape,t,e,r,m,-,p,r,o,f,i,l,e,space,d,u,s,k,return,t,e,r,m,-,p,r,o,f,i,l,e,space,n,e,x,t,return,e,c,h,o,space,d,f,i,n,return,e,c,h,o,space,d,d,u,n,return' \
+    --input-chords-after 'clip: echo row-alpha' \
+    --snapshot-after 'goterm: line echo dfin' \
+    --script-expect 'goterm: line echo ddun' --timeout 300
+
+vgate_assert d3 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert d3 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert d3 serial-contains 'gotabwm: mode live'
+vgate_assert d3 serial-contains 'gotabwm: present'
+vgate_assert d3 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert d3 serial-contains 'goterm: attached'
+vgate_assert d3 serial-contains 'goterm: prompt'
+vgate_assert d3 serial-contains 'goterm: line source DCLIP.SH'
+vgate_assert d3 serial-contains 'clip: echo row-alpha'
+vgate_assert d3 serial-contains 'tty: paste 61 bytes'
+vgate_assert d3 serial-contains 'goterm: line echo row-alpha'
+vgate_assert d3 serial-contains 'tty: search: '
+vgate_assert d3 serial-contains 'goterm: profile dusk'
+vgate_assert d3 serial-contains 'goterm: profile day'
+vgate_assert d3 serial-contains 'gotabwm: settings broadcast key=theme'
+vgate_assert d3 serial-contains 'goterm: line echo dfin'
+vgate_assert d3 serial-contains 'goterm: line echo ddun'
+vgate_assert d3 serial-absent '[EXC] parking:'
+vgate_assert d3 serial-absent 'exited status=139'
+vgate_assert d3 share-contains SETTINGS.TXT 'term_profile=day'
+vgate_assert d3 share-contains SETTINGS.TXT 'theme=light'
+vgate_assert d3 python <<'PY'
+import os, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+i_clip = ser.find("clip: echo row-alpha")
+assert i_clip >= 0, "monitor clip never showed the OSC 52 payload"
+clip_seg = ser[i_clip:i_clip + 120]
+for row in ("echo row-alpha", "echo seek154d-token", "echo row-omega"):
+    assert row in clip_seg, "clip readback dropped %r: %r" % (row, clip_seg)
+
+mp = re.search(r"tty: paste (\d+) bytes", ser)
+assert mp, "paste marker missing"
+n_paste = int(mp.group(1))
+assert n_paste == 49 + 12, (
+    "paste must be the 49 B payload + the 12 B DECSET wrap (got %d) — "
+    "the wrap's presence is bracketed paste being ON at its default" % n_paste)
+i_paste = ser.find(mp.group(0))
+assert i_paste > i_clip, "paste fired before the clip readback"
+
+i_line = ser.find("goterm: line ", i_paste)
+i_done = ser.find("goterm: done status=0", i_line)
+assert i_line > i_paste and i_done > i_line, "no submit after the paste"
+n_sub = ser.count("goterm: line ", i_paste, i_done)
+assert n_sub == 1, "one edit, one submit on Enter (got %d submits)" % n_sub
+seg = ser[i_line:i_done]
+for row in ("echo row-alpha", "echo seek154d-token", "echo row-omega"):
+    assert row in seg, "%r missing from the one submit" % row
+
+i_search = ser.find("tty: search:", i_done)
+assert i_search > i_done, "the search ran before the paste submitted"
+counts = [int(x) for x in re.findall(r"tty: search: (\d+) matches", ser[i_search:])]
+assert counts, "the search bar fed no pattern"
+assert counts[-1] >= 1, "full pattern 'seek154d' found %d matches" % counts[-1]
+
+i_dusk = ser.find("goterm: profile dusk", i_search)
+assert i_dusk > i_search, "term-profile dusk missing after the search"
+i_day = ser.find("goterm: profile day", i_dusk)
+assert i_day > i_dusk, "term-profile next did not cycle dusk -> day"
+i_dfin = ser.find("goterm: line echo dfin", i_day)
+i_ddun = ser.find("goterm: line echo ddun", i_dfin)
+assert i_dfin > i_day and i_ddun > i_dfin, "tail echoes out of order"
+print("daily loop OK: clip -> paste 61B one submit -> search %d hit(s) -> dusk -> day"
+      % counts[-1])
+PY
+
+vgate_assert d3 snapshot 'snap-d3-*.raw' <<'PY'
+import sys
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot %d bytes, want %d" % (len(raw), W * H * 4))
+hist = {}
+for y in range(0, 22):
+    for x in range(0, W, 2):
+        k = (y * W + x) * 4
+        px = (raw[k + 2], raw[k + 1], raw[k])
+        hist[px] = hist.get(px, 0) + 1
+mode = max(hist, key=hist.get)
+print("rail modal pixel: #%02x%02x%02x over %d samples" %
+      (mode + (hist[mode],)))
+if max(mode) <= 0xa0:
+    sys.exit("rail band is not the light theme (#%02x%02x%02x) — the "
+             "term-profile next publish never reached the seat" % mode)
+print("palette probe: rail band is light — the profile cycle re-themed the seat")
 PY
