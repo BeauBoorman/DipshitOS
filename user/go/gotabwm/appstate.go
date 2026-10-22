@@ -37,7 +37,18 @@ var (
 	stateFileWrite   = vi.WriteFileSafe
 	stateFileDelete  = vi.FileDelete
 	stateNoticePost  = vi.IpcSend
-	stateYield       = vi.Yield
+	// stateYield is the collect round's wait: one scheduler tick, not a
+	// cooperative yield. A yield only hands the slice to a READY task on
+	// the merged ring view — since #3107 floated the seat, it can land on
+	// a secondary ring whose view holds no claimable task (apps asleep in
+	// vi.Sleep, kernel tasks not steal-eligible), so the whole round
+	// budget used to self-rotate in microseconds: the ask went out, the
+	// collect drained before any app noticed, and `snapshot saved`
+	// published ahead of every `state save` (observed go-wm-tabs runs
+	// 16/18: trailer short or absent; WEB's idle ~10-tick poll never
+	// answered inside the run). One tick per round restores the wall-
+	// clock window the protocol was always asking for.
+	stateYield = func() { vi.Sleep(1) }
 	// stateLog is the protocol's marker sink — vi.ConsoleLine on the
 	// guest, a recorder in tests (the snapLog pattern).
 	stateLog = vi.ConsoleLine
@@ -56,10 +67,13 @@ var stateServiceDrain func() int
 var stateAskPend [256]bool
 
 // stateAskRounds bounds the drain between the ask and giving up: each
-// round is one serviceRPC pass plus one cooperative yield, so the app gets
-// a real slice to notice the ask and answer. An unanswered ask is not an
-// error — the tab keeps whatever state it already stored (or none) and
-// the lifecycle point proceeds.
+// round is one serviceRPC pass plus one tick of real wait, so the app gets
+// wall-clock time to notice the ask and answer — the notice lands in a
+// mailbox nothing wakes, so the app's own poll cadence (Sleep(1) for an
+// editor/terminal, up to ~10 ticks for an idle browser) is the floor the
+// budget must cover. An unanswered ask is not an error — the tab keeps
+// whatever state it already stored (or none) and the lifecycle point
+// proceeds.
 const stateAskRounds = 24
 
 // askStateSave posts the kind-20 notice to id's bound owner and returns
