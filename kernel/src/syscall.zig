@@ -587,6 +587,17 @@ var tcp_send_staging: [tcp.payload_max]u8 = undefined;
 /// Milestone 14 (claim 0169): fixed BSS scratch for the clipboard (set
 /// staging + get read-back), marshaled per call, no allocation.
 var clipboard_staging: [clipboard.capacity]u8 = undefined;
+/// M171b (#3035): the slots-24/25 per-call file I/O bound — the channel's
+/// reply cap (`virtio_file.reply_cap`, 32 KiB) instead of the old 2048-byte
+/// stack stage, so one `sys_file_read`/`sys_file_write` moves a whole
+/// reply payload. Mirrored by `vsys.MaxFileIOBytes` (user/go/vsys/file.go);
+/// a write over the cap is ENOSPC, a read clamps.
+pub const file_io_max: usize = virtio_file.reply_cap;
+/// Per-core BSS staging for slots 24/25 — off the kernel stack (a reply-cap
+/// transfer does not fit it) and indexed by `svclock.core_id()` like
+/// `call_counts` so same-domain calls on different cores never share a
+/// buffer. Fixed BSS, no allocation.
+var file_io_staging: [svclock.cores][file_io_max]u8 = undefined;
 
 /// Initialize the writer seam, reset counters and the uaccess regions. The
 /// table remains a runtime-built BSS object; rebuilding is unnecessary once
@@ -2214,8 +2225,8 @@ fn handle_file_read(args: Args, _: *exceptions.VectorFrame) u64 {
     }
     if (count == 0) return 0;
 
-    const take_count = @min(count, 2048);
-    var read_staging: [2048]u8 = undefined;
+    const take_count = @min(count, file_io_max);
+    const read_staging = &file_io_staging[svclock.core_id()];
     const res = if (file_table.is_stream(fd))
         file_table.stream_peek(pid, fd, read_staging[0..take_count])
     else if (file_table.is_contained(pid, fd))
@@ -2244,12 +2255,12 @@ fn handle_file_write(args: Args, _: *exceptions.VectorFrame) u64 {
         return write_stream(pid, fd, buf_ptr, count);
     }
     if (fd >= file_table.max_handles_per_process) return error_result(.ebadf);
-    if (count > 2048) return error_result(.enospc);
+    if (count > file_io_max) return error_result(.enospc);
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
     if (count == 0) return 0;
 
-    var write_staging: [2048]u8 = undefined;
-    if (uaccess.copy_in(&write_staging, buf_ptr, @intCast(count)) != .ok) return error_result(.efault);
+    const write_staging = &file_io_staging[svclock.core_id()];
+    if (uaccess.copy_in(write_staging[0..count], buf_ptr, @intCast(count)) != .ok) return error_result(.efault);
 
     const res = file_table.write(pid, fd, write_staging[0..count]);
     if (res < 0) {
@@ -5453,4 +5464,67 @@ pub fn report(con: *console.Console) void {
         con.print_u64(info.calls);
         con.puts("\n");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+fn io_test_writer(_: []const u8) void {}
+
+// The handlers are called directly rather than through dispatch() —
+// observed: every build of this test that dispatched even a bare ENOSPC
+// `sys_file_write` made a downstream `driving_award` splash-hold test
+// crash in aggregate roots (an mmio write to an unarmed gpu_notify via
+// leaked armed_global/gpu_ready); direct calls stayed green across the
+// same builds. The dispatch lock/grant seam is pinned by
+// kernel/tests/syscall_test.zig.
+test "M171b (#3035): slots 24/25 move up to the reply cap — bounds, partial read at EOF, ENOSPC above it" {
+    userspace.init();
+    init(io_test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = process 0 (boot payload)
+    scheduler.start();
+    file_table.init();
+    trust.init();
+    defer trust.init();
+    var frame: exceptions.VectorFrame = @splat(0);
+    try std.testing.expect(scheduler.yield_current()); // shell -> user (task 2)
+    try std.testing.expectEqual(@as(usize, 2), scheduler.current_id());
+    // The uaccess regions this test arms point at its OWN stack — drop them
+    // on exit so a later test's copies never land in a dead frame.
+    defer set_user_regions(.{ .base = 0, .len = 0 }, .{ .base = 0, .len = 0 });
+
+    // A write over the cap is ENOSPC — checked by SIZE before any bytes are
+    // copied, so even an unmapped buffer refuses by name, never by pointer.
+    try std.testing.expectEqual(error_result(.enospc), handle_file_write(.{ 0, uaccess.diagnostic_unmapped, file_io_max + 1, 0, 0, 0 }, &frame));
+
+    // At the cap the call is ADMITTED: the 32 KiB copy_in runs and the
+    // table then refuses the unopened descriptor (EBADF), not the size.
+    var wbuf: [file_io_max]u8 = @splat(0);
+    set_user_regions(.{ .base = @intFromPtr(&wbuf), .len = wbuf.len }, .{ .base = 0, .len = 0 });
+    try std.testing.expectEqual(error_result(.ebadf), handle_file_write(.{ 0, @intFromPtr(&wbuf), file_io_max, 0, 0, 0 }, &frame));
+
+    // A read past the old 2048-byte stage returns in ONE call.
+    var big: [file_io_max + 8192]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @intCast(i % 251);
+    const files = [_]virtio_file.TestFile{.{ .name = "BIG", .data = &big }};
+    virtio_file.set_test_share(&files);
+    defer virtio_file.set_test_share(null);
+    const fd = file_table.open(0, "/host/BIG", file_table.MODE_READ);
+    try std.testing.expect(fd >= 0);
+    defer _ = file_table.close(0, @intCast(fd));
+
+    var dst: [file_io_max + 4096]u8 = undefined;
+    @memset(&dst, 0);
+    set_user_regions(.{ .base = 0, .len = 0 }, .{ .base = @intFromPtr(&dst), .len = dst.len });
+
+    // An over-cap request clamps to the reply cap — one syscall.
+    try std.testing.expectEqual(@as(u64, file_io_max), handle_file_read(.{ @intCast(fd), @intFromPtr(&dst), dst.len, 0, 0, 0 }, &frame));
+    try std.testing.expectEqualSlices(u8, big[0..file_io_max], dst[0..file_io_max]);
+    // Partial read at EOF: the remaining bytes honestly, then a clean 0.
+    try std.testing.expectEqual(@as(u64, 8192), handle_file_read(.{ @intCast(fd), @intFromPtr(&dst), dst.len, 0, 0, 0 }, &frame));
+    try std.testing.expectEqualSlices(u8, big[file_io_max..], dst[0..8192]);
+    try std.testing.expectEqual(@as(u64, 0), handle_file_read(.{ @intCast(fd), @intFromPtr(&dst), 8, 0, 0, 0 }, &frame));
 }

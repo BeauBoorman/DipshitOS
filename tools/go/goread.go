@@ -8,11 +8,12 @@
 // it". The mmap half landed with M70c-K (#1504); this is the transfer half.
 // Two facts in the tree make the useful question specific:
 //
-//   - the EL0 read surface clamps ONE sys_file_read to 2048 bytes
-//     (kernel/src/syscall.zig handle_file_read: take_count = @min(count, 2048)),
-//     while the WIRE reply cap is 32 KiB (virtio_file.reply_cap) — so a 27 MB
-//     payload is ~13,200 syscalls, not ~845;
-//   - each of those syscalls is one virtio round trip (file_table.read loops
+//   - the EL0 read surface clamps ONE sys_file_read to the channel's reply
+//     cap (kernel/src/syscall.zig file_io_max = virtio_file.reply_cap, 32 KiB —
+//     M171b raised it from the old 2048-byte stack stage), so a 27 MB payload
+//     is ~845 syscalls, not ~13,200;
+//   - each of those syscalls is one (at most two: the reply header eats 3
+//     bytes of the cap) virtio round trips (file_table.read loops
 //     virtio_file.read_chunk at the handle's cursor — "the host share is
 //     stateless").
 //
@@ -25,10 +26,11 @@
 // recomputes it on macOS from the file it staged.
 //
 // The call count is an OBSERVATION of the clamp, not an assumption:
-// ceil(bytes / 2048) is only reachable if the kernel really does move 2048
-// bytes per call, so the gate asserts it exactly. If the cap ever moves, that
-// assert fails by name — which is the point, because ADR 0035's transfer
-// arithmetic would have to be re-derived rather than inherited.
+// ceil(bytes / MaxFileIOBytes) is only reachable if the kernel really does
+// move that many bytes per call, so the gate asserts it exactly. If the cap
+// ever moves, that assert fails by name — which is the point, because
+// ADR 0035's transfer arithmetic would have to be re-derived rather than
+// inherited.
 //
 // Imports: `vsys` only, deliberately. It carries both the clock (Nanotime,
 // CNTPCT_EL0) and the os.File-shaped share API, and it costs ~0.6 KB of the

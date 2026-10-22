@@ -122,8 +122,8 @@ func TestReadFile_AccumulatesChunksUntilZero(t *testing.T) {
 func TestFile_WriteOverlimitIsENOSPC(t *testing.T) {
 	fakeKern(t, func(num uintptr, a0, a1, a2, a3 uintptr) int64 { return 1 })
 	f, _ := Open("/host/FM/OUT.TXT", ModeWrite)
-	if _, err := f.Write(make([]byte, 2049)); !errors.Is(err, error(Errno(ErrENOSPC))) {
-		t.Fatalf("Write(2049) = %v, want Errno(ENOSPC)", err)
+	if _, err := f.Write(make([]byte, MaxFileIOBytes+1)); !errors.Is(err, error(Errno(ErrENOSPC))) {
+		t.Fatalf("Write(MaxFileIOBytes+1) = %v, want Errno(ENOSPC)", err)
 	}
 }
 

@@ -1,8 +1,9 @@
 package vsys
 
-// MaxFileIOBytes is the kernel's per-call file transfer bound
-// (kernel/src/file_table.zig, mirrored by user/go/vi).
-const MaxFileIOBytes = 2048
+// MaxFileIOBytes is the kernel's per-call file transfer bound —
+// syscall.file_io_max, the file channel's 32 KiB reply cap
+// (kernel/src/syscall.zig; user/go/vi chunks independently).
+const MaxFileIOBytes = 32768
 
 // File is an os.File-shaped handle over the file channel (slots 23-27). The
 // kernel owns the handle table (8 per process); File carries the handle and
