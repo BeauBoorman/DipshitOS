@@ -41,6 +41,17 @@
 # for JPROG moved onto `--input-key` (keycode 12) because the chords
 # channel now carries the frame steps.
 #
+# Issue #3039 (M170e) adds a SEVENTH exec — the playback leg. Every
+# scripted input channel is spent above (chords on the frame steps, the
+# string on save-as, the key on JPROG's q), so play starts by argv:
+# `GOVIEW.ELF -play /host/PLAY.GIF &` opens the ten-frame 50 ms fixture
+# already playing on slot 95. Two `fg 5` dwells then cover several loops
+# before JPROG's exec ends the boot; each wrap prints `gview: play
+# frames=10 elapsed_ms=<t>` and the window assert (400–1500 ms) admits
+# one busy-core loop under D3's no-forced-preemption rule. The stepper
+# receipts stay pinned because playback advances silently — the loop
+# receipt is its evidence, not a `gview: frame` line per tick.
+#
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goview.sh   ->  .build/go/GOVIEW.ELF
 #
@@ -70,6 +81,8 @@ shutil.copy("user/go/webrender/testdata/gif/anim3_160x120.gif",
             os.path.join(share, "TEST.GIF"))
 shutil.copy("tests/fixtures/svg/acceptance/rect.svg", os.path.join(share, "TEST.SVG"))
 shutil.copy("tests/fixtures/qoi/viewer_160x120.qoi", os.path.join(share, "TEST.QOI"))
+shutil.copy("user/go/view/testdata/play10_160x120.gif",
+            os.path.join(share, "PLAY.GIF"))
 # JPROG: the same JPEG with the SOF0 marker byte flipped to SOF2 — a
 # progressive refusal built from our own fixture, no external JPEG needed.
 jpg = open("user/go/webrender/testdata/jpeg/viewer_160x120.jpg", "rb").read()
@@ -78,7 +91,8 @@ assert pos > 0, "baseline fixture lost its SOF0 marker"
 prog = bytearray(jpg)
 prog[pos + 1] = 0xc2
 open(os.path.join(share, "JPROG.JPG"), "wb").write(bytes(prog))
-print("staged GOVIEW.ELF + TEST.PNG/JPG/GIF/SVG/QOI + JPROG.JPG (GIF leg is the three-frame anim3)")
+print("staged GOVIEW.ELF + TEST.PNG/JPG/GIF/SVG/QOI + PLAY.GIF + JPROG.JPG "
+      "(GIF leg is the three-frame anim3; PLAY.GIF is ten frames at 50 ms)")
 PYEOF
 
 # The sequence per leg: `exec ... &`, a bounded ~5-tick `fg` dwell (the
@@ -122,6 +136,9 @@ fg 1
 exec GOVIEW.ELF /host/OUT.QOI
 fg 1
 fg 1
+exec GOVIEW.ELF -play /host/PLAY.GIF &
+fg 5
+fg 5
 exec GOVIEW.ELF /host/JPROG.JPG
 EOF
 
@@ -147,13 +164,14 @@ vgate_run 01 -- \
 vgate_assert 01 serial-contains "VirelaiOS kernel has seized control."
 vgate_assert 01 serial-contains "wnd: registered"
 vgate_assert 01 serial-contains "gview: not-tab-aware (shim or WND desktop)"
-vgate_assert 01 serial-count "exec: loaded GOVIEW.ELF" 7
+vgate_assert 01 serial-count "exec: loaded GOVIEW.ELF" 8
 # The size markers — filename, decoded geometry, format tag, byte count.
 vgate_assert 01 serial-contains "gview: loaded TEST.PNG 160x120 PNG bytes=420"
 vgate_assert 01 serial-contains "gview: loaded TEST.JPG 160x120 JPEG bytes=1987"
 vgate_assert 01 serial-contains "gview: loaded TEST.GIF 160x120 GIF bytes=23271 frames=3"
 vgate_assert 01 serial-contains "gview: loaded TEST.SVG 64x64 ??? bytes=287"
 vgate_assert 01 serial-contains "gview: loaded TEST.QOI 160x120 QOI bytes=340"
+vgate_assert 01 serial-contains "gview: loaded PLAY.GIF 160x120 GIF bytes=24121 frames=10"
 # Every snap marker echoed this boot — a snap file can then never be a
 # stale sibling from an earlier iteration.
 vgate_assert 01 serial-contains "snap-png"
@@ -178,6 +196,12 @@ vgate_assert 01 serial-contains "gview: pick save"
 vgate_assert 01 serial-contains "gview: pick save /host/OUT.QOI"
 vgate_assert 01 serial-contains "gview: saved /host/OUT.QOI fmt=qoi"
 vgate_assert 01 serial-contains "gview: loaded OUT.QOI 160x120 QOI"
+# The playback leg (issue #3039): the `-play` exec armed slot 95 at load,
+# so the first completed loop's receipt is already on the serial inside
+# the two `fg 5` dwells — ten 50 ms frames, so ~500 ms is expected and
+# 400–1500 admits a busy core under D3 (the exact value is the python
+# assert's job below, like the frame sums).
+vgate_assert 01 serial-contains "gview: play frames=10 elapsed_ms="
 # The named refusal, then the viewer's own quit.
 vgate_assert 01 serial-contains "gview: unsupported JPEG"
 vgate_assert 01 serial-contains "gview: quit"
@@ -189,11 +213,11 @@ ser = open(os.environ["VG_SER"], errors="replace").read()
 # The sequence itself: the five loaded receipts in the card's order and
 # nothing else loading — JPROG never reports one.
 order = ["gview: loaded TEST.%s" % n for n in ("PNG", "JPG", "GIF", "SVG", "QOI")] \
-    + ["gview: loaded OUT.QOI"]
+    + ["gview: loaded OUT.QOI", "gview: loaded PLAY.GIF"]
 pos = [ser.find(m) for m in order]
 if -1 in pos or pos != sorted(pos):
     sys.exit("loaded receipts missing or out of order: %r" % (pos,))
-if "gview: loaded JPROG" in ser or ser.count("gview: loaded ") != 6:
+if "gview: loaded JPROG" in ser or ser.count("gview: loaded ") != 7:
     sys.exit("loaded-receipt count wrong (JPROG must not load)")
 # Exactly one refusal, from the hostile leg, and one honest quit.
 if ser.count("gview: unsupported ") != 1:
@@ -201,9 +225,10 @@ if ser.count("gview: unsupported ") != 1:
 if ser.count("gview: quit") != 1 or ser.count("user-exec exited status=43") != 1:
     sys.exit("expected exactly one quit -> status=43 (the JPROG viewer)")
 # Window sizing: the four sniffed rasters + JPROG + the reopened OUT.QOI
-# open 328x264; the headerless SVG takes the 320x240 default.
-if len(re.findall(r"gview: open id=\d+ 328x264", ser)) != 6:
-    sys.exit("expected six 328x264 opens (PNG/JPG/GIF/QOI/JPROG + OUT.QOI)")
+# + the 160x120 PLAY.GIF open 328x264; the headerless SVG takes the
+# 320x240 default.
+if len(re.findall(r"gview: open id=\d+ 328x264", ser)) != 7:
+    sys.exit("expected seven 328x264 opens (PNG/JPG/GIF/QOI/JPROG + OUT.QOI + PLAY.GIF)")
 if len(re.findall(r"gview: open id=\d+ 320x240", ser)) != 1:
     sys.exit("expected one 320x240 default open (SVG)")
 # The stepper's three receipts must carry three DISTINCT pixel sums —
@@ -212,7 +237,13 @@ if len(re.findall(r"gview: open id=\d+ 320x240", ser)) != 1:
 sums = re.findall(r"gview: frame (\d+)/3 delay=100 sum=([0-9a-f]+)", ser)
 if [i for i, _ in sums] != ["1", "2", "3"] or len({s for _, s in sums}) != 3:
     sys.exit("frame receipts wrong: %r" % (sums,))
-print("sequence, refusals, exits, window sizes and frame sums all pinned")
+# The playback leg (issue #3039): one loop of ten 50 ms frames is ~500
+# ms. The 400–1500 window admits a busy core's D3 jitter but still fails
+# a tick-paced fallback (~10 s a loop) or a broken arm (no line at all).
+plays = re.findall(r"gview: play frames=10 elapsed_ms=(\d+)", ser)
+if not plays or not (400 <= int(plays[0]) <= 1500):
+    sys.exit("play elapsed_ms out of the 400-1500 window: %r" % (plays,))
+print("sequence, refusals, exits, window sizes, frame sums and play elapsed all pinned")
 PY
 
 # --- the save-as receipt, checked against the bytes on the share --------

@@ -39,7 +39,44 @@ const (
 	// both wrapping. App-local — neither usage is bound in gotabwm.
 	keyFrameNext = 0x37 // `.`
 	keyFramePrev = 0x36 // `,`
+
+	// M170e (#3039): space toggles GIF play/pause — the frame-stepper's own
+	// play key (mpv lays the same three out: `,`/`.` step, space plays).
+	// Plain space is unbound at seat scope (the registry binds only
+	// ctrl+space and the ctrl+alt page keys).
+	keyPlay = 0x2C
 )
+
+// flagPlay is the argv switch that starts playback on load — the live
+// gate's trigger, since every scripted input channel on the runner is
+// already spent (chords on the stepper presses, the string on save-as,
+// the key on JPROG's quit). Interactive play stays on space either way.
+const flagPlay = "-play"
+
+// Play pacing (M170e): the arm value for one frame is its GCE delay —
+// centiseconds — with the browser convention's 100 ms standing in when the
+// file carries a zero delay. ADR 0060's 1 ms granularity needs no clamp
+// here: every nonzero delay is already a whole 10 ms step.
+const (
+	playDelayZeroNs = 100_000_000 // 100 ms — a zero-delay frame's dwell
+
+	// While playing, the empty-queue doze ends at the next frame's
+	// deadline instead of the whole 1 s tick (a tick-long park would
+	// bury every sub-second delay). The cap keeps a long frame's dwell
+	// from starving keys or drag frames; the floor gives a just-past
+	// deadline one granule to land its TIMER event rather than spinning.
+	playIdleCapNs = 50_000_000 // 50 ms max stall for input during play
+	playIdleMinNs = 1_000_000  // 1 ms — the deadline granularity
+)
+
+// playDelayNs is the timer arm for one frame: delayCs is the frame's GCE
+// delay in centiseconds (GIFFrame.Delay), so a 5 cs fixture arms 50 ms.
+func playDelayNs(delayCs int) uint64 {
+	if delayCs <= 0 {
+		return playDelayZeroNs
+	}
+	return uint64(delayCs) * 10_000_000
+}
 
 // Geometry and caps, ported from view.zig: the window is sized to the image
 // (never past 2x, never below the minimum, never past the kernel's cap), the

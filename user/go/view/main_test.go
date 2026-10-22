@@ -38,6 +38,7 @@ func TestMarkersAreAllGViewPrefixed(t *testing.T) {
 		"pick":        markerPick,
 		"saved":       markerSaved,
 		"save-refuse": markerSaveRefuse,
+		"play":        markerPlay,
 	}
 	for what, m := range markers {
 		if !strings.HasPrefix(m, "gview: ") {
@@ -215,5 +216,153 @@ func TestStepFrameShowsTheCompositedFrame(t *testing.T) {
 	a.anim = nil
 	if a.stepFrame(1) {
 		t.Fatal("a still image must not step")
+	}
+}
+
+// play10Fixture is the live gate's playback GIF: ten distinct 160x120
+// frames at 5 cs each — one 500 ms loop.
+const play10Fixture = "testdata/play10_160x120.gif"
+
+// TestPlayDelayNsSchedule pins the arm-time table: the GCE centisecond
+// delay verbatim in ns, and the browser convention's 100 ms for a
+// zero-delay frame.
+func TestPlayDelayNsSchedule(t *testing.T) {
+	for _, c := range []struct {
+		cs   int
+		want uint64
+	}{
+		{0, 100_000_000}, {5, 50_000_000}, {10, 100_000_000}, {1, 10_000_000},
+		{250, 2_500_000_000}, {-3, 100_000_000},
+	} {
+		if got := playDelayNs(c.cs); got != c.want {
+			t.Errorf("playDelayNs(%d) = %d, want %d", c.cs, got, c.want)
+		}
+	}
+}
+
+// TestPlayFixtureIsTenFramesAt50ms keeps the committed play fixture honest:
+// the class-B leg's elapsed window (400–1500 ms for one loop) only holds
+// while the file stays ten frames at 5 cs.
+func TestPlayFixtureIsTenFramesAt50ms(t *testing.T) {
+	_, anim, err := decodeForView(readFixture(t, play10Fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anim == nil || len(anim.Frames) != 10 {
+		t.Fatalf("play fixture = %v frames, want 10", anim)
+	}
+	sums := map[uint64]int{}
+	for i := range anim.Frames {
+		sums[frameSum(anim.Frames[i].Pix)] = i
+		if anim.Frames[i].Delay != 5 {
+			t.Fatalf("frame %d delay = %d cs, want 5", i+1, anim.Frames[i].Delay)
+		}
+	}
+	if len(sums) != 10 {
+		t.Fatal("play10_160x120 must composite to ten distinct frames")
+	}
+	if anim.Loops != 0 {
+		t.Fatalf("play fixture loops = %d, want 0 (loop forever)", anim.Loops)
+	}
+}
+
+// TestPlayTicksDriveTheDelaySchedule is the card's delay-schedule test:
+// an injected timer and clock prove each TIMER event advances one frame
+// and re-arms that frame's delay, one loop prints the elapsed receipt,
+// and a pause cancels the arm and banks its stretch out of the clock.
+func TestPlayTicksDriveTheDelaySchedule(t *testing.T) {
+	var arms []uint64
+	var cancels, clock int64
+	oldArm, oldCancel, oldNow := playArm, playCancel, playNow
+	playArm = func(ns uint64) int64 { arms = append(arms, ns); return 0 }
+	playCancel = func() int64 { cancels++; return 1 }
+	playNow = func() int64 { return clock }
+	defer func() { playArm, playCancel, playNow = oldArm, oldCancel, oldNow }()
+
+	fire := func() { clock += int64(arms[len(arms)-1]) }
+
+	mkAnim := func(delays ...int) *webrender.GIFAnimation {
+		a := &webrender.GIFAnimation{Width: 2, Height: 2}
+		for _, d := range delays {
+			a.Frames = append(a.Frames, webrender.GIFFrame{Pix: make([]uint32, 4), Delay: d})
+		}
+		return a
+	}
+
+	a := &app{anim: mkAnim(10, 20, 30)} // 100/200/300 ms
+	if !a.togglePlay() || !a.playing {
+		t.Fatal("togglePlay must start playback on a multi-frame GIF")
+	}
+	if len(arms) != 1 || arms[0] != 100_000_000 {
+		t.Fatalf("first arm = %v, want [100ms]", arms)
+	}
+
+	fire()
+	if !a.playTick() || a.frame != 1 || arms[len(arms)-1] != 200_000_000 {
+		t.Fatalf("tick 1: frame=%d arms=%v", a.frame, arms)
+	}
+	fire()
+	if !a.playTick() || a.frame != 2 || arms[len(arms)-1] != 300_000_000 {
+		t.Fatalf("tick 2: frame=%d arms=%v", a.frame, arms)
+	}
+	// Wrap closes the loop: elapsed is the three delays summed, and the
+	// re-arm is frame 1's delay again.
+	fire()
+	if !a.playTick() || a.frame != 0 {
+		t.Fatalf("tick 3 did not wrap: frame=%d", a.frame)
+	}
+	if a.playLastElapsed != 600_000_000 {
+		t.Fatalf("loop elapsed = %d ns, want 600ms", a.playLastElapsed)
+	}
+	if len(arms) != 4 || arms[3] != 100_000_000 {
+		t.Fatalf("post-loop arm = %v, want […, 100ms]", arms)
+	}
+
+	// Pause mid-loop: the arm is cancelled, the stretch banks out of the
+	// clock, and a stale TIMER event is swallowed without advancing.
+	fire()
+	a.pausePlay()
+	if a.playing || cancels != 1 {
+		t.Fatalf("pause: playing=%v cancels=%d", a.playing, cancels)
+	}
+	banked := a.playAccum
+	if a.playTick() || a.frame != 0 {
+		t.Fatal("a TIMER event while paused must not advance")
+	}
+	if len(arms) != 4 {
+		t.Fatalf("a stray tick must not re-arm: arms=%v", arms)
+	}
+
+	// Resume continues the loop clock — a pause's own stretch does not
+	// count toward it. Jump the fake clock seven seconds while paused,
+	// then play out the remaining three frames: the loop's elapsed is
+	// the banked stretch plus the three delays, the pause invisible.
+	clock += 7_000_000_000
+	if !a.togglePlay() || !a.playing {
+		t.Fatal("space must resume a paused animation")
+	}
+	if len(arms) != 5 || arms[4] != 100_000_000 {
+		t.Fatalf("resume re-arm = %v, want frame 1's 100ms", arms)
+	}
+	for i := 0; i < 3; i++ {
+		fire()
+		a.playTick()
+	}
+	if a.playLastElapsed != banked+600_000_000 {
+		t.Fatalf("second loop elapsed = %d ns, want banked+600ms", a.playLastElapsed)
+	}
+}
+
+// TestTogglePlayIsInertWithoutAnimation: space must do nothing on a still
+// image or a single-frame GIF — the same inert-key rule the stepper has.
+func TestTogglePlayIsInertWithoutAnimation(t *testing.T) {
+	a := &app{}
+	if a.togglePlay() {
+		t.Fatal("space on a still image must not toggle")
+	}
+	a.anim = &webrender.GIFAnimation{Width: 1, Height: 1,
+		Frames: []webrender.GIFFrame{{Pix: make([]uint32, 1), Delay: 5}}}
+	if a.togglePlay() {
+		t.Fatal("space on a one-frame GIF must not toggle")
 	}
 }

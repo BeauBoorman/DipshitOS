@@ -72,6 +72,12 @@ const (
 	// sum=<fnv>` — printed on load for frame 1 and on every step.
 	markerFrame = "gview: frame "
 
+	// M170e (#3039): the playback receipt — `play frames=<n>
+	// elapsed_ms=<t>` — printed each time a playing GIF wraps to frame 1:
+	// n frames of one loop took t wall milliseconds of PLAYING time (a
+	// pause inside the loop does not count).
+	markerPlay = "gview: play "
+
 	// M162c (#2986): the save-as legs — `pick save` at raise, `pick save
 	// <path>`/`pick cancel` at result, `saved <path> fmt=<png|qoi> n=<bytes>
 	// sum=<fnv>` on the write, `save refused <path>` when the name names no
@@ -113,6 +119,19 @@ type app struct {
 	anim  *webrender.GIFAnimation
 	frame int
 
+	// M170e playback state: playing while the app timer is armed to post
+	// EvTimer for the current frame's delay. playFireAt is the armed
+	// deadline on the playNow clock; playStretch is when the current
+	// unpaused stretch began; playAccum is the playing time banked across
+	// pauses this loop, so elapsed_ms measures frames actually shown.
+	// playLastElapsed is the last completed loop's ns — the receipt's
+	// value, kept on the app so a host test reads it without a console.
+	playing         bool
+	playFireAt      int64
+	playStretch     int64
+	playAccum       int64
+	playLastElapsed int64
+
 	// The M162c save-as modal: while pick.Open every key/mouse event is the
 	// picker's — the same FilePicker GOPAINT raises, painted over the
 	// viewer's own canvas.
@@ -128,6 +147,16 @@ type app struct {
 
 	unsupportedTag string
 }
+
+// The playback seams (M170e): slot 95's arm, slot 41's cancel, and the EL0
+// counter the receipts measure on. Package vars so a host test injects a
+// fake timer and clock — the kernel's re-arm-replaces contract means the
+// schedule a test records IS the delay schedule the guest ran.
+var (
+	playArm    = func(ns uint64) int64 { return vsys.TimerSetNs(ns) }
+	playCancel = func() int64 { return vsys.TimerCancel() }
+	playNow    = func() int64 { return vi.Nanos() }
+)
 
 func main() {
 	path := argPath()
@@ -181,6 +210,11 @@ func main() {
 		a.load(path)
 		a.reportLoad()
 	}
+	// `-play` (flagPlay): playback starts armed on load — the live gate's
+	// way in, since no scripted input channel is free to press space.
+	if argFlag(flagPlay) {
+		a.togglePlay()
+	}
 
 	a.pushTitle()
 	a.draw()
@@ -195,14 +229,35 @@ func main() {
 }
 
 // argPath is the file to open: the first argument after the program name
-// (`exec GOVIEW.ELF /host/TEST.QOI`). Empty when nothing was passed — VIEW.BIN's
-// clean empty state.
+// (`exec GOVIEW.ELF /host/TEST.QOI`), skipping the `-play` switch when one
+// is present. Empty when nothing was passed — VIEW.BIN's clean empty state.
 func argPath() string {
 	args := vi.Args()
 	if len(args) < 2 {
 		return ""
 	}
-	return args[1]
+	for _, s := range args[1:] {
+		if s != flagPlay {
+			return s
+		}
+	}
+	return ""
+}
+
+// argFlag reports whether want is one of the argv words after the program
+// name — `exec GOVIEW.ELF -play /host/PLAY.GIF` and
+// `exec GOVIEW.ELF /host/PLAY.GIF -play` both set it.
+func argFlag(want string) bool {
+	args := vi.Args()
+	if len(args) < 2 {
+		return false
+	}
+	for _, s := range args[1:] {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // readHead peeks the head of the file without decoding. QOI's 14-byte header
@@ -383,6 +438,9 @@ func (a *app) applyDrop(offer tabapp.DragOffer) bool {
 		vi.ConsoleLine(markerDrop + "too-large")
 		return false
 	}
+	// A new image ends the old animation's loop: cancel the arm and clear
+	// the clock before the swap, so no deadline lands on the new file.
+	a.stopPlay()
 	a.img = im
 	a.iw, a.ih = uint32(im.Width), uint32(im.Height)
 	a.anim, a.frame = anim, 0
@@ -426,10 +484,86 @@ func (a *app) stepFrame(dir int) bool {
 	if a.anim == nil || len(a.anim.Frames) < 2 {
 		return false
 	}
-	a.frame = stepFrameIdx(a.frame, dir, len(a.anim.Frames))
-	f := &a.anim.Frames[a.frame]
-	a.img = &webrender.Image{Width: a.anim.Width, Height: a.anim.Height, Pix: f.Pix}
+	a.setFrame(stepFrameIdx(a.frame, dir, len(a.anim.Frames)))
 	a.announceFrame()
+	return true
+}
+
+// setFrame shows frame i's own composite without a receipt — the stepper
+// announces, playback does not (its evidence is the loop receipt; a line
+// per tick would only drown it).
+func (a *app) setFrame(i int) {
+	a.frame = i
+	f := &a.anim.Frames[i]
+	a.img = &webrender.Image{Width: a.anim.Width, Height: a.anim.Height, Pix: f.Pix}
+}
+
+// --- playback (M170e) -------------------------------------------------------
+
+// togglePlay is the space key: start playback on a multi-frame GIF, or
+// pause it. Inert — like the stepper keys — when there is no animation to
+// play. Resuming picks the current frame up with its own full delay; the
+// loop clock excludes the pause, so elapsed_ms stays a frame-time number.
+func (a *app) togglePlay() bool {
+	if a.anim == nil || len(a.anim.Frames) < 2 {
+		return false
+	}
+	if a.playing {
+		a.pausePlay()
+		return true // the status line's play/pause hint changed
+	}
+	a.playing = true
+	a.playStretch = playNow()
+	a.armPlay()
+	return true
+}
+
+// armPlay points the one app timer at the current frame's delay. Re-arming
+// replaces any pending arm (the kernel's own contract), so exactly one
+// timer is ever in flight.
+func (a *app) armPlay() {
+	d := playDelayNs(a.anim.Frames[a.frame].Delay)
+	a.playFireAt = playNow() + int64(d)
+	_ = playArm(d)
+}
+
+// pausePlay freezes playback mid-loop: the armed timer is cancelled and
+// the playing time so far is banked in playAccum, so a later resume
+// continues the loop clock instead of restarting it.
+func (a *app) pausePlay() {
+	if !a.playing {
+		return
+	}
+	a.playing = false
+	a.playAccum += playNow() - a.playStretch
+	_ = playCancel()
+}
+
+// stopPlay leaves playback entirely — the image under it went away (a
+// drop), so the loop clock resets rather than carrying into a new file.
+func (a *app) stopPlay() {
+	a.pausePlay()
+	a.playAccum = 0
+}
+
+// playTick is one TIMER event: advance a frame and re-arm with that
+// frame's delay. Wrapping to frame 1 closes a loop — the receipt prints
+// its frame count and playing-time milliseconds. A stray event while
+// paused or animationless is consumed and ignored (the single app timer
+// can only be ours, and a queued event can outlive its own cancel).
+func (a *app) playTick() bool {
+	if !a.playing || a.anim == nil || len(a.anim.Frames) < 2 {
+		return false
+	}
+	now := playNow()
+	a.setFrame(stepFrameIdx(a.frame, 1, len(a.anim.Frames)))
+	if a.frame == 0 {
+		a.playLastElapsed = a.playAccum + now - a.playStretch
+		a.playAccum, a.playStretch = 0, now
+		vi.ConsoleLine(markerPlay + "frames=" + vi.Itoa64(int64(len(a.anim.Frames))) +
+			" elapsed_ms=" + vi.Itoa64(a.playLastElapsed/1_000_000))
+	}
+	a.armPlay()
 	return true
 }
 
@@ -463,7 +597,7 @@ func (a *app) eventLoop() {
 				vi.ConsoleLine(markerOK)
 				a.ta.CloseAndExit(exitQuit)
 			}
-			vi.Sleep(1)
+			a.idleSleep()
 			continue
 		}
 		switch a.ta.Dispatch(ev) {
@@ -489,8 +623,36 @@ func (a *app) eventLoop() {
 	}
 }
 
+// idleSleep parks one empty-queue pass for the next reason to wake.
+// Paused, that's the whole scheduler tick — the pre-M170e contract. While
+// playing it is the nanosecond doze ending at the next frame's deadline:
+// event posts only wake wait_event waiters, never a sys_sleep park, so a
+// tick-long sleep would bury every sub-second delay. The cap keeps a long
+// frame's dwell from starving keys or drag frames; the floor lets a
+// just-past deadline land its TIMER event instead of spinning.
+func (a *app) idleSleep() {
+	if !a.playing {
+		vi.Sleep(1)
+		return
+	}
+	rem := a.playFireAt - playNow()
+	switch {
+	case rem > playIdleCapNs:
+		rem = playIdleCapNs
+	case rem < playIdleMinNs:
+		rem = playIdleMinNs
+	}
+	vi.SleepNs(uint64(rem))
+}
+
 // handle returns whether the screen needs repainting.
 func (a *app) handle(ev vi.Event) bool {
+	// TIMER is the app's own event, not the modal's: playback keeps
+	// advancing under the save-as picker instead of stalling on an arm
+	// nobody would re-issue.
+	if ev.Kind == vi.EvTimer {
+		return a.playTick()
+	}
 	if a.pick.Open {
 		return a.pickerEvent(ev)
 	}
@@ -515,6 +677,8 @@ func (a *app) handle(ev vi.Event) bool {
 			return a.stepFrame(1)
 		case keyFramePrev:
 			return a.stepFrame(-1)
+		case keyPlay:
+			return a.togglePlay()
 		case keyCopy:
 			a.copy()
 			return false
@@ -896,6 +1060,11 @@ func (a *app) drawStatus(s *canvasSurface, vp viewport) {
 		f := &a.anim.Frames[a.frame]
 		text += "  ./, frame " + u32s(uint32(a.frame+1)) + "/" +
 			u32s(uint32(len(a.anim.Frames))) + " - " + u32s(uint32(f.Delay*10)) + " ms"
+		if a.playing {
+			text += "  space pause"
+		} else {
+			text += "  space play"
+		}
 	}
 	if a.st != loadOkay {
 		text = loadSummary(a.st, a.name)
