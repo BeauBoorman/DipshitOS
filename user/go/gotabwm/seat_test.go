@@ -729,3 +729,32 @@ func TestDemoTickLimit(t *testing.T) {
 		t.Fatalf("a never-quiet stream must hit the cap: %d", got)
 	}
 }
+
+// The presented-rail marker: one-shot per boot, and only on a pass that
+// both painted AND presented the rail — the line a snapshot anchor may
+// read the rail on (run 10's snap-10-0 flake; claim #3116).
+func TestRailPaintMarkerFiresOnceAfterPaintedPresent(t *testing.T) {
+	savedLatch, savedTabs := railPainted, tabs
+	defer func() { railPainted, tabs = savedLatch, savedTabs }()
+
+	railPainted = false
+	tabs = TabStrip{}
+	// An empty strip paints no rail: silent even when the pass presents.
+	if line, once := railPaintMarker(false, true); once || line != "" {
+		t.Fatalf("an unpainted pass produced %q,%v", line, once)
+	}
+	if !tabs.OpenTab(3, "Calc") || !tabs.OpenTab(4, "Edit") {
+		t.Fatal("OpenTab")
+	}
+	// Painted but not presented: the rail is not on the scanout yet.
+	if _, once := railPaintMarker(true, false); once {
+		t.Fatal("an unpresented pass claimed the rail reached the scanout")
+	}
+	line, once := railPaintMarker(true, true)
+	if !once || line != "gotabwm: rail paint n=2 focus=3 space=1" {
+		t.Fatalf("rail paint marker = %q,%v", line, once)
+	}
+	if _, once := railPaintMarker(true, true); once {
+		t.Fatal("the rail paint marker is once per boot, not per tick")
+	}
+}

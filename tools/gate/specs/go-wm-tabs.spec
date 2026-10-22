@@ -1774,7 +1774,7 @@ EOF
 vgate_run 10 -- \
     --screen '$RUN_DIR/screen-10' \
     --via-virtio --cvc-snap \
-    --snapshot-after 'gotabwm: present' \
+    --snapshot-after 'gotabwm: rail paint n=2' \
     --snapshot-out '$RUN_DIR/snap-10' \
     --script '$RUN_DIR/script-10.txt' \
     --script2 '$RUN_DIR/script2-10.txt' \
@@ -1819,6 +1819,9 @@ vgate_assert 10 serial-contains 'gotabwm: session freeze n=1'
 vgate_assert 10 serial-contains 'gotabwm: order ids='
 vgate_assert 10 serial-contains 'pin=0,1'
 vgate_assert 10 serial-contains 'gotabwm: rail n=2 focus='
+# The snapshot's anchor, asserted so a marker rename fails the run with the
+# assert name rather than a silent missing snap-10-0.raw.
+vgate_assert 10 serial-contains 'gotabwm: rail paint n=2'
 vgate_assert 10 serial-contains 'gotabwm: layout file=/host/SELFTEST/LAYOUT.txt'
 # M120b (#2559): the settle is the boundary — every id the strip treated as
 # live is < 0x100, and the placeholder rows that waited on declares never
@@ -1888,10 +1891,15 @@ PY
 # stages no FONTS.TXT: the run 01 `gotabwm: fonts` assert names that
 # degrade). Cell 1's frozen badge is run 09's pin+freeze left behind.
 #
-# The snapshot rides the kind-4 channel (`--snapshot-after 'gotabwm:
-# present'`): the marker is once-guarded behind the seat's first presented
-# frame, so the scanout it streams already carries the rail. BGRX raw, so
-# the probes are exact token matches — no capture shift, no scale.
+# The snapshot rides the kind-4 channel (`--snapshot-after 'gotabwm: rail
+# paint n=2'`): the marker is once-guarded behind the first presented frame
+# that carried a PAINTED rail, so the scanout it streams already carries
+# the strip. `gotabwm: present` only proves SOME frame flushed — the guest
+# streams the scanout from an idle seam, not at marker time, so the anchor
+# must be strictly post-rail-present like the notify/drag-ghost paint
+# markers or the stream can land inside a later pass's pre-rail window
+# (snap-10-0 flake, claim #3116). BGRX raw, so the probes are exact token
+# matches — no capture shift, no scale.
 vgate_assert 10 snapshot 'snap-10-*.raw' <<'PY'
 import sys
 

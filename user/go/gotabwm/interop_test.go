@@ -30,6 +30,7 @@ func TestInteropMarkerShapes(t *testing.T) {
 		{MarkerTabFocus, "gotabwm: tab focus id="},
 		{MarkerTabClose, "gotabwm: tab close id="},
 		{MarkerRail, "gotabwm: rail "},
+		{MarkerRailPaint, "gotabwm: rail paint "},
 		{MarkerTabsEmpty, "gotabwm: tabs empty"},
 		{MarkerSplit, "gotabwm: split "},
 		{MarkerUnsplit, "gotabwm: unsplit"},

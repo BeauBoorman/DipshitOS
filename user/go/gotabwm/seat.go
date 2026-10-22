@@ -823,8 +823,9 @@ func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
 	// painted on top of it would hide the strip entirely. Runs on both
 	// branches — a non-tab Attach surface is live with an empty strip.
 	composeSurfaces(scan)
+	railPx := 0
 	if tabs.Count() != 0 {
-		_ = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
+		railPx = paintRail(scan, vi.ScanoutWidth, vi.ScanoutHeight, RailHeight, &tabs, railHover, railCloseHover)
 		markRail()
 	}
 	// M108b (#2325): the lane pass runs before the chrome paint so a
@@ -868,6 +869,15 @@ func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
 		if *presents == 1 {
 			vi.ConsoleLine(MarkerPresent)
 		}
+	}
+	// markRail's post-present twin: `gotabwm: rail n=` proves the strip
+	// painted, this marker proves a frame carrying it actually flushed —
+	// the earliest scanout a pixel probe may read the rail on. Run 10's
+	// snap-10-0 anchored on `gotabwm: present` alone could stream a pass
+	// whose rail was still a frame away (or a frame mid-repaint: the
+	// zeroed-surface compose lands before paintRail).
+	if line, once := railPaintMarker(railPx > 0, presented); once {
+		vi.ConsoleLine(line)
 	}
 	// The paint marker follows the PRESENT, not the fill: "the toast is on
 	// the scanout" is only true once the frame carrying it has been
@@ -1136,4 +1146,24 @@ func markRail() {
 	lastRailSpace = spaceCur
 	vi.ConsoleLine(MarkerRail + "n=" + vi.Itoa64(int64(n)) + " focus=" +
 		vi.Itoa64(int64(f)) + " space=" + spaces[spaceCur].Name)
+}
+
+// railPainted latches MarkerRailPaint — once per boot is the whole
+// contract: the gate wants the FIRST scanout the rail is already on, and
+// markRail above already narrates every later transition (pre-present).
+var railPainted bool
+
+// railPaintMarker returns the presented-rail marker for the first frame
+// that both painted the rail (paintRail wrote pixels) and presented it —
+// the notifyPaintMarker rule applied to the strip: a snapshot anchored on
+// this line reads a scanout the rail is already on. The n/focus/space
+// payload mirrors markRail's line so the two reads diff cleanly.
+func railPaintMarker(painted, presented bool) (string, bool) {
+	if !painted || !presented || railPainted {
+		return "", false
+	}
+	railPainted = true
+	f, _ := tabs.Focused()
+	return MarkerRailPaint + "n=" + vi.Itoa64(int64(tabs.Count())) +
+		" focus=" + vi.Itoa64(int64(f)) + " space=" + spaces[spaceCur].Name, true
 }

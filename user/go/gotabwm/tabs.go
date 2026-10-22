@@ -153,10 +153,18 @@ type ClosedTab struct {
 // The tab-strip marker lines the class-B gate greps. Exported so tabs_test.go
 // pins the exact shapes.
 const (
-	MarkerTabOpen       = "gotabwm: tab open id="
-	MarkerTabFocus      = "gotabwm: tab focus id="
-	MarkerTabClose      = "gotabwm: tab close id="
-	MarkerRail          = "gotabwm: rail "
+	MarkerTabOpen  = "gotabwm: tab open id="
+	MarkerTabFocus = "gotabwm: tab focus id="
+	MarkerTabClose = "gotabwm: tab close id="
+	MarkerRail     = "gotabwm: rail "
+	// seat.go's post-present twin: MarkerRail names a paint transition
+	// (printed before the frame flushes); this one is printed once, after
+	// the FIRST presented frame that carried a painted rail — the
+	// notifyPaintMarker rule for the strip, and the only marker a pixel
+	// probe may safely read the rail on (run 10's snap-10-0 flake: an
+	// anchor on `gotabwm: present` can stream the scanout while a later
+	// pass sits between the zeroed-surface compose and the rail repaint).
+	MarkerRailPaint     = "gotabwm: rail paint "
 	MarkerTabsEmpty     = "gotabwm: tabs empty"
 	MarkerSplit         = "gotabwm: split "
 	MarkerUnsplit       = "gotabwm: unsplit"
