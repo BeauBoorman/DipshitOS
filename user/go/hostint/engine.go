@@ -69,9 +69,19 @@ type Engine struct {
 	lastItems []vi.DirItem
 	// ioErrLatched holds lane filenames whose read already drew one io_error
 	// marker — a persistently unreadable file must not spam the log every
-	// tick. Bounded by the directory's file count.
+	// tick. Two bounds keep the table from growing with churned names:
+	// entries absent from the next successful listing are evicted (a
+	// vanished file cannot fail again — the runner deleting a seat
+	// emission between List and Read is the common churn), and the table
+	// is capped at ioErrLatchCap.
 	ioErrLatched map[string]bool
 }
+
+// ioErrLatchCap bounds the io_error latch table — the suppressor's own
+// worst case. A lane directory of healthy traffic carries a handful of
+// record files; a flood past this many failing names resets the table
+// (latchIOErr) instead of pinning one map entry per churned filename.
+const ioErrLatchCap = 64
 
 // NewEngine builds an engine for key (the host-int credential bytes) with
 // the given IO seams and marker prefix.
@@ -127,16 +137,27 @@ func (e *Engine) Poll() {
 		}
 		// A real list failure is an io_error, latched so a persistently
 		// broken channel logs once, not once a second.
-		if e.ioErrLatched == nil {
-			e.ioErrLatched = map[string]bool{}
-		}
-		if !e.ioErrLatched["<dir>"] {
-			e.ioErrLatched["<dir>"] = true
+		if e.latchIOErr("<dir>") {
 			e.refuse(0, RefuseIO)
 		}
 		return
 	}
 	delete(e.ioErrLatched, "<dir>")
+	// Evict latched names this listing no longer carries: a vanished
+	// file cannot fail again, so its suppression state is dead weight —
+	// and a reappearing name is a new failure that must report once more
+	// rather than stay silenced by a stale latch.
+	if len(e.ioErrLatched) > 0 {
+		live := make(map[string]bool, len(items))
+		for _, it := range items {
+			live[it.Name] = true
+		}
+		for name := range e.ioErrLatched {
+			if !live[name] {
+				delete(e.ioErrLatched, name)
+			}
+		}
+	}
 	e.lastItems = items
 	// Name-sorted processing gives per-tag seq order for free (STEM-%08x
 	// sorts numerically inside a stem) and ARMED before CLIPIN (A < C),
@@ -158,11 +179,7 @@ func (e *Engine) Poll() {
 		}
 		raw, rc := e.io.Read(name)
 		if rc < 0 {
-			if e.ioErrLatched == nil {
-				e.ioErrLatched = map[string]bool{}
-			}
-			if !e.ioErrLatched[name] {
-				e.ioErrLatched[name] = true
+			if e.latchIOErr(name) {
 				e.refuse(tag, RefuseIO)
 			}
 			continue // leave the file — a transient read error retries
@@ -269,6 +286,25 @@ func (e *Engine) del(name string) {
 	if e.io.Delete != nil {
 		_ = e.io.Delete(name)
 	}
+}
+
+// latchIOErr inserts name into the io_error latch and reports whether its
+// refusal should be logged — false when the name was already latched (a
+// still-failing file logs once, not once per tick). A full table resets:
+// the flood case re-logs each live failure once per sweep and re-latches,
+// bounded, rather than letting the map grow with a churn of dead names.
+func (e *Engine) latchIOErr(name string) bool {
+	if e.ioErrLatched == nil {
+		e.ioErrLatched = map[string]bool{}
+	}
+	if e.ioErrLatched[name] {
+		return false
+	}
+	if len(e.ioErrLatched) >= ioErrLatchCap {
+		clear(e.ioErrLatched)
+	}
+	e.ioErrLatched[name] = true
+	return true
 }
 
 // Outstanding counts the unconsumed lane files of one tag in the last

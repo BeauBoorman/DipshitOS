@@ -17,6 +17,7 @@ type fakeDir struct {
 	files    map[string][]byte
 	absent   bool
 	listErr  bool // a real channel failure — (nil, false), not the absent case
+	readErr  map[string]bool // listed-but-unreadable files (Read rc < 0)
 	logs     []string
 	consumed []Record
 	consumedReasons []string
@@ -37,6 +38,9 @@ func (d *fakeDir) list() ([]vi.DirItem, bool) {
 }
 
 func (d *fakeDir) read(name string) ([]byte, int64) {
+	if d.readErr[name] {
+		return nil, -vi.ErrEIO
+	}
 	b, ok := d.files[name]
 	if !ok {
 		return nil, -vi.ErrENOENT
@@ -67,6 +71,16 @@ func (d *fakeDir) hasLog(sub string) bool {
 		}
 	}
 	return false
+}
+
+func (d *fakeDir) countLog(sub string) int {
+	n := 0
+	for _, l := range d.logs {
+		if strings.Contains(l, sub) {
+			n++
+		}
+	}
+	return n
 }
 
 func (d *fakeDir) engine() *Engine {
@@ -484,5 +498,56 @@ func TestEngineAbsentDirIsSilent(t *testing.T) {
 	}
 	if len(d.logs) != 0 {
 		t.Fatalf("absent lane dir logged: %v", d.logs)
+	}
+}
+
+// A latched io_error name that leaves the listing is evicted: the latch
+// suppresses one continuous failure, not the name forever — a file that
+// reappears and fails again is a new failure and reports once more.
+func TestEngineIOErrLatchEvictsDeadNames(t *testing.T) {
+	d := &fakeDir{files: map[string][]byte{}, readErr: map[string]bool{}}
+	e := d.engine()
+	// A foreign file keeps the listing non-empty (fakeDir's nil list is
+	// a channel failure, not an empty dir).
+	d.files["KEEP.TXT"] = []byte("x")
+	d.plant(TagClipIn, 0, 1, 7, []byte("x"))
+	d.readErr["CLIPIN-00000001"] = true
+	e.Poll()
+	e.Poll() // still listed + still failing: one marker, not two
+	if got := d.countLog("reason=io_error"); got != 1 {
+		t.Fatalf("io_error count %d want 1; logs=%v", got, d.logs)
+	}
+	// The file leaves the listing (a runner-side delete, or the
+	// List/Read race settled): the latch drops its name.
+	delete(d.files, "CLIPIN-00000001")
+	e.Poll()
+	if len(e.ioErrLatched) != 0 {
+		t.Fatalf("latch held %d dead names", len(e.ioErrLatched))
+	}
+	// A same-named file that reappears unreadable is not silenced by the
+	// stale latch.
+	d.plant(TagClipIn, 0, 1, 7, []byte("x"))
+	e.Poll()
+	if got := d.countLog("reason=io_error"); got != 2 {
+		t.Fatalf("reappearing failing name did not re-report; logs=%v", d.logs)
+	}
+}
+
+// The latch table is capped: a listing full of failing names cannot grow
+// the seat's map past ioErrLatchCap, and each first failure still logs.
+func TestEngineIOErrLatchIsBounded(t *testing.T) {
+	d := &fakeDir{files: map[string][]byte{}, readErr: map[string]bool{}}
+	e := d.engine()
+	for i := uint32(1); i <= ioErrLatchCap+4; i++ {
+		name := RecordName(TagClipIn, i)
+		d.files[name] = []byte("unreadable")
+		d.readErr[name] = true
+	}
+	e.Poll()
+	if len(e.ioErrLatched) > ioErrLatchCap {
+		t.Fatalf("latch grew to %d > cap %d", len(e.ioErrLatched), ioErrLatchCap)
+	}
+	if got := d.countLog("reason=io_error"); got != ioErrLatchCap+4 {
+		t.Fatalf("first-failure markers %d want %d", got, ioErrLatchCap+4)
 	}
 }
