@@ -331,6 +331,16 @@ func guessBin(title string) string {
 		// leg re-execs the recorded row, so "Clock" must name the real
 		// binary (`refusal ENOENT exec Clock`, go-clock run 05).
 		return "GOCLOCK.ELF"
+	case "Reader":
+		// #3075: GOREADER's declared title — observed `refusal ENOENT
+		// exec Reader` on the go-wm-tabs audit restore leg (run 29).
+		return "GOREADER.ELF"
+	case "Mines":
+		// #3075: GOMINE's declared title — same audit failure as Reader.
+		return "GOMINE.ELF"
+	case "Solitaire":
+		// #3075: GOSOL's declared title — same audit failure as Reader.
+		return "GOSOL.ELF"
 	case "Vault":
 		// M148a (#2804): GOVAULT's declared title — without the row the
 		// recorded bin is "Vault", the APPS.TXT selection=primary lookup

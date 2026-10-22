@@ -8,7 +8,7 @@
 # #2611; was 16 under M65d). The GOMAXPROCS=1 path still fits
 # (GOTABWM+GOEDIT+GOTERM = 9 Ms + kernel 3; idle stays max_tasks-1).
 #
-# TWENTY-FIVE vgate_runs share one seeded host share (`vgate_share seed`):
+# THIRTY-FIVE vgate_runs share one seeded host share (`vgate_share seed`):
 #   01  GOCALC+NOTE.ELF; pin-stay writes SESSION.TABS; last unsplit writes
 #       LAYOUT.txt (closed before the serial line that names it).
 #       M79g: the choreography's closes now persist too, so the file this
@@ -116,6 +116,14 @@
 #       and a `--pointer-virtio` click on pill "1" prints `space pick 1`
 #       before `space switch 3->1`. A marker-keyed screen capture is the
 #       scanout probe: three pills, the live one on the Accent plate.
+#   26-35  M151c (#2911): the save_state fleet audit — five app pairs
+#       (Paint+Assist, Reader+Sheet, Mine+Clock, Solitaire+Emoji,
+#       Vault+IRC) each save through the kind-20 ask on ctrl-shift-s, then
+#       a fresh boot restores the table and every app's own marker
+#       reports the blob back. Run 35's report correlates all ten rows;
+#       all are expected to round-trip (the first live pass showed
+#       GOEMOJI and GOVAULT do answer — the card's gap notes were stale),
+#       and GOVAULT's absent `file` grant is named in the file column.
 #
 # Seed wm=none and exec GOTABWM.ELF like go-wm-seat. No HID. No framebuffer
 # golden. Do not overload go-wm-seat or go-wm-default. Boot 01 `reorder 0->1`
@@ -134,6 +142,16 @@
 #   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF   (run 08)
 #   bash tools/go/build-tabapp.sh    ->  .build/go/GOTABAPP.ELF  (runs 12/13)
 #   bash tools/go/build-web.sh       ->  .build/go/WEB.ELF       (runs 16/17)
+#   bash tools/go/build-gopaint.sh   ->  .build/go/GOPAINT.ELF   (M151c, 26/27)
+#   bash tools/go/build-goassist.sh  ->  .build/go/GOASSIST.ELF  (M151c, 26/27)
+#   bash tools/go/build-goreader.sh  ->  .build/go/GOREADER.ELF  (M151c, 28/29)
+#   bash tools/go/build-gosheet.sh   ->  .build/go/GOSHEET.ELF   (M151c, 28/29)
+#   bash tools/go/build-gomine.sh    ->  .build/go/GOMINE.ELF    (M151c, 30/31)
+#   bash tools/go/build-goclock.sh   ->  .build/go/GOCLOCK.ELF   (M151c, 30/31)
+#   bash tools/go/build-gosol.sh     ->  .build/go/GOSOL.ELF     (M151c, 32/33)
+#   bash tools/go/build-goemoji.sh   ->  .build/go/GOEMOJI.ELF   (M151c, 32/33)
+#   bash tools/go/build-govault.sh   ->  .build/go/GOVAULT.ELF   (M151c, 34/35)
+#   bash tools/go/build-goirc.sh     ->  .build/go/GOIRC.ELF     (M151c, 34/35)
 #
 # exec-order: assert-proven -- each run ends on a marker only its script
 # prints (`rx-gotabwm-tabs-ok` / `rx-gotabwm-session-ok` / `rx-gotabwm-apps-ok`).
@@ -383,6 +401,62 @@ with open(os.path.join(share, "PROFILE.SH"), "w") as f:
 with open(os.path.join(share, "EDIT", "M125G.TXT"), "wb") as f:
     f.write(b"m125g-session\n")
 print("staged PROFILE.SH + EDIT/M125G.TXT (run 18/19 session fixtures)")
+PY
+
+# M151c (#2911): the save_state fleet audit — runs 26-35 round-trip five app
+# pairs through the kind-20 ask/save/restore protocol. Stage every audit ELF
+# plus the two fixtures the saves read: PAINT.QOI (pair A argv) and the
+# generated 3-page AUDIT.PDF (pair B argv — GOREADER's `pages=3` marker is
+# the pin). FONTS.TXT stays OFF the share on purpose: run 25's pill pixel
+# probe is pinned to the 8px bitmap metrics, so GOEMOJI asserts its
+# 'manifest=missing' row rather than go-emoji.spec's manifest=ok.
+vgate_setup_python <<'PY'
+import os, shutil, sys
+rd = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(rd, "share")
+for name in ("GOPAINT.ELF", "GOASSIST.ELF", "GOSHEET.ELF", "GOREADER.ELF",
+             "GOCLOCK.ELF", "GOMINE.ELF", "GOSOL.ELF", "GOEMOJI.ELF",
+             "GOIRC.ELF", "GOVAULT.ELF"):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit("%s missing (expected %s) - build it first: "
+                 "bash tools/go/build-%s.sh" %
+                 (name, src, name[:-4].lower()))
+    shutil.copy(src, os.path.join(share, name))
+    print("staged %s (%d bytes)" % (name, os.path.getsize(src)))
+qoi = os.path.join("tests", "fixtures", "qoi", "viewer_160x120.qoi")
+if not os.path.exists(qoi):
+    sys.exit("QOI fixture missing (expected " + qoi + ")")
+shutil.copy(qoi, os.path.join(share, "PAINT.QOI"))
+# AUDIT.PDF: a minimal valid 3-page document (one filled rect per page) —
+# the audit only needs GOREADER to load it and count the pages. MediaBox
+# edges must be multiples of 0.75 pt (fixed-point x1e6, dim*4e6 mod 3e6
+# must be 0 — UnsupportedPageGeometry, observed live on 200x280/200x300)
+# and the stream op is `re f` — `re S` trips UnsupportedStroke (also
+# observed live on run 28).
+objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>"]
+for i in range(3):
+    objs.append("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 150 300] "
+                "/Contents %d 0 R /Resources << >> >>" % (4 + i * 2))
+    stream = b"10 10 130 280 re f\n"
+    objs.append("<< /Length %d >>\nstream\n" % len(stream)
+                + stream.decode() + "endstream")
+out = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+offsets = []
+for i, body in enumerate(objs):
+    offsets.append(len(out))
+    out += ("%d 0 obj\n" % (i + 1)).encode() + body.encode() + b"\nendobj\n"
+xref = len(out)
+out += ("xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)).encode()
+for o in offsets:
+    out += ("%010d 00000 n \n" % o).encode()
+out += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objs) + 1, xref)).encode()
+pdf = os.path.join(share, "AUDIT.PDF")
+open(pdf, "wb").write(out)
+print("staged PAINT.QOI + AUDIT.PDF (%d bytes, 3 pages)"
+      % os.path.getsize(pdf))
 PY
 
 vgate_run 01 -- \
@@ -3358,89 +3432,11 @@ if darkish(gap) or blue(gap):
     sys.exit("inter-pill gap %r looks like pill fill" % (gap,))
 print("pill strip: live accent plate + glyph, dormant recessed+glyph, gap shows cell")
 PY
-vgate_run 26 -- \
-    --screen '$RUN_DIR/screen-24' \
-    --via-virtio \
-    --script '$RUN_DIR/script-24.txt' \
-    --script2 '$RUN_DIR/script2-24.txt' \
-    --script2-after 'gotabwm: win focus' \
-    --script3 '$RUN_DIR/script3-24.txt' \
-    --script3-after 'gopaint: ready' \
-    --input-chords 'h,i,return,ctrl-shift-s' \
-    --input-chords-after 'goassist: present' \
-    --script-expect 'gotabwm: snapshot saved' --timeout 420
-
-vgate_assert 24 serial-contains 'exec: loaded GOTABWM.ELF'
-vgate_assert 24 serial-contains 'gotabwm: registered'
-vgate_assert 24 serial-contains 'exec: loaded GOPAINT.ELF'
-vgate_assert 24 serial-contains 'gopaint: loaded /host/PAINT.QOI'
-vgate_assert 24 serial-contains 'gopaint: ready'
-vgate_assert 24 serial-contains 'exec: loaded GOASSIST.ELF'
-vgate_assert 24 serial-contains 'goassist: declare accepted'
-vgate_assert 24 serial-contains 'goassist: present'
-vgate_assert 24 serial-contains 'goassist: committed conv='
-vgate_assert 24 serial-count 'gotabwm: state ask id=' 2
-vgate_assert 24 serial-count 'gotabwm: state save id=' 2
-vgate_assert 24 serial-contains 'gotabwm: snapshot saved'
-vgate_assert 24 serial-absent 'goassist: state refused'
-vgate_assert 24 serial-absent 'gopaint: state stale'
-vgate_assert 24 serial-absent 'gotabwm: state drop'
-vgate_assert 24 serial-absent '[EXC] parking:'
-vgate_assert 24 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 25 (M151c): pair A restore — the seat re-execs both recorded bins
-# (both declare their ELF names, so no alias is needed) and each app's own
-# marker reports the blob back: Assist's conv name/turns, Paint's file.
-
-vgate_file script-25.txt <<'EOF'
-set GOMAXPROCS=1
-vf rm SNAPSHOT.BUNDLE
-wm
-exec GOTABWM.ELF
-EOF
-
-vgate_file script2-25.txt <<'EOF'
-dui focus 0
-EOF
-
-vgate_file script3-25.txt <<'EOF'
-wm
-dui
-echo rx-audit-a-rest-ok
-EOF
-
-vgate_run 27 -- \
-    --screen '$RUN_DIR/screen-25' \
-    --via-virtio \
-    --script '$RUN_DIR/script-25.txt' \
-    --script2 '$RUN_DIR/script2-25.txt' \
-    --script2-after 'gotabwm: win focus' \
-    --script3 '$RUN_DIR/script3-25.txt' \
-    --script3-after 'gotabwm: session live n=2' --script3-delay 8 \
-    --script-expect 'rx-audit-a-rest-ok' --timeout 300
-
-vgate_assert 25 serial-contains 'exec: loaded GOTABWM.ELF'
-vgate_assert 25 serial-contains 'gotabwm: session load n=2 mode=restore'
-vgate_assert 25 serial-contains 'gotabwm: session reexec n=2'
-vgate_assert 25 serial-contains 'gotabwm: session exec GOPAINT.ELF'
-vgate_assert 25 serial-contains 'gotabwm: session exec GOASSIST.ELF'
-vgate_assert 25 serial-contains 'gotabwm: session live n=2'
-vgate_assert 25 serial-count 'gotabwm: state restore id=' 2
-vgate_assert 25 serial-contains 'goassist: state restored conv='
-vgate_assert 25 serial-contains ' turns='
-vgate_assert 25 serial-contains 'gopaint: state restored file=/host/PAINT.QOI'
-vgate_assert 25 serial-contains 'rx-audit-a-rest-ok'
-vgate_assert 25 serial-absent 'goassist: state refused'
-vgate_assert 25 serial-absent 'gopaint: state stale'
-vgate_assert 25 serial-absent 'gotabwm: state drop'
-vgate_assert 25 serial-absent '[EXC] parking:'
-vgate_assert 25 serial-absent 'exited status=139'
-
-# ---------------------------------------------------------------------------
-# Run 26 (M151c): pair B save — GOREADER + GOSHEET. Reader's argv path IS
-# its state (on a bare re-exec it can only reopen through the blob); the
-# sheet — last in, focused — takes the run-06 cell edit (A1=5, A2==a1+a1).
+# Run 26 (M151c): pair A save — GOPAINT + GOASSIST. Paint's argv opens the
+# staged QOI (its blob carries the path back); Assist — last in, focused —
+# takes the 'hi' turn so the blob has a conv name and a turn to report.
 
 vgate_file script-26.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3455,53 +3451,47 @@ EOF
 
 vgate_file script2-26.txt <<'EOF'
 dui focus 0
-exec GOREADER.ELF /host/AUDIT.PDF
+exec GOPAINT.ELF /host/PAINT.QOI
 EOF
 
 vgate_file script3-26.txt <<'EOF'
-exec GOSHEET.ELF
+exec GOASSIST.ELF
 EOF
 
-vgate_run 28 -- \
+vgate_run 26 -- \
     --screen '$RUN_DIR/screen-26' \
     --via-virtio \
     --script '$RUN_DIR/script-26.txt' \
     --script2 '$RUN_DIR/script2-26.txt' \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-26.txt' \
-    --script3-after 'goreader: ready' \
-    --input-chords '5,return,down,=,a,1,+,a,1,return,ctrl-shift-s' \
-    --input-chords-after 'gosheet: present' \
+    --script3-after 'gopaint: ready' \
+    --input-chords 'h,i,return,ctrl-shift-s' \
+    --input-chords-after 'goassist: present' \
     --script-expect 'gotabwm: snapshot saved' --timeout 420
 
 vgate_assert 26 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 26 serial-contains 'gotabwm: registered'
-vgate_assert 26 serial-contains 'exec: loaded GOREADER.ELF'
-vgate_assert 26 serial-contains 'goreader: loaded AUDIT.PDF pages=3'
-vgate_assert 26 serial-contains 'goreader: ready'
-vgate_assert 26 serial-contains 'exec: loaded GOSHEET.ELF'
-vgate_assert 26 serial-contains 'gosheet: declare accepted'
-vgate_assert 26 serial-contains 'gosheet: present'
-vgate_assert 26 serial-contains "gosheet: set A1 := '5' -> 5"
-vgate_assert 26 serial-contains "gosheet: set A2 := '=a1+a1' -> 10"
-vgate_assert 26 serial-contains 'goreader: state saved n='
-vgate_assert 26 serial-contains 'gosheet: state saved n='
+vgate_assert 26 serial-contains 'exec: loaded GOPAINT.ELF'
+vgate_assert 26 serial-contains 'gopaint: loaded /host/PAINT.QOI'
+vgate_assert 26 serial-contains 'gopaint: ready'
+vgate_assert 26 serial-contains 'exec: loaded GOASSIST.ELF'
+vgate_assert 26 serial-contains 'goassist: declare accepted'
+vgate_assert 26 serial-contains 'goassist: present'
+vgate_assert 26 serial-contains 'goassist: committed conv='
 vgate_assert 26 serial-count 'gotabwm: state ask id=' 2
 vgate_assert 26 serial-count 'gotabwm: state save id=' 2
 vgate_assert 26 serial-contains 'gotabwm: snapshot saved'
-vgate_assert 26 serial-absent 'gosheet: state stale'
-vgate_assert 26 serial-absent 'gosheet: state oversize'
-vgate_assert 26 serial-absent 'goreader: refuse'
+vgate_assert 26 serial-absent 'goassist: state refused'
+vgate_assert 26 serial-absent 'gopaint: state stale'
 vgate_assert 26 serial-absent 'gotabwm: state drop'
 vgate_assert 26 serial-absent '[EXC] parking:'
 vgate_assert 26 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 27 (M151c): pair B restore — the sheet row re-execs its ELF-named
-# bin; the reader row re-execs the staged "Reader" alias (its declared
-# title has no guessBin row). Reader gets NO argv on re-exec — it can only
-# reopen AUDIT.PDF because the blob carried the path, which is exactly the
-# round-trip this audit exists to observe.
+# Run 27 (M151c): pair A restore — the seat re-execs both recorded bins
+# (both declare their ELF names, so no alias is needed) and each app's own
+# marker reports the blob back: Assist's conv name/turns, Paint's file.
 
 vgate_file script-27.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3517,10 +3507,10 @@ EOF
 vgate_file script3-27.txt <<'EOF'
 wm
 dui
-echo rx-audit-b-rest-ok
+echo rx-audit-a-rest-ok
 EOF
 
-vgate_run 29 -- \
+vgate_run 27 -- \
     --screen '$RUN_DIR/screen-27' \
     --via-virtio \
     --script '$RUN_DIR/script-27.txt' \
@@ -3528,29 +3518,29 @@ vgate_run 29 -- \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-27.txt' \
     --script3-after 'gotabwm: session live n=2' --script3-delay 8 \
-    --script-expect 'rx-audit-b-rest-ok' --timeout 300
+    --script-expect 'rx-audit-a-rest-ok' --timeout 300
 
 vgate_assert 27 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 27 serial-contains 'gotabwm: session load n=2 mode=restore'
 vgate_assert 27 serial-contains 'gotabwm: session reexec n=2'
-vgate_assert 27 serial-contains 'gotabwm: session exec GOSHEET.ELF'
-vgate_assert 27 serial-contains 'gotabwm: session exec Reader'
+vgate_assert 27 serial-contains 'gotabwm: session exec GOPAINT.ELF'
+vgate_assert 27 serial-contains 'gotabwm: session exec GOASSIST.ELF'
 vgate_assert 27 serial-contains 'gotabwm: session live n=2'
 vgate_assert 27 serial-count 'gotabwm: state restore id=' 2
-vgate_assert 27 serial-contains 'goreader: loaded AUDIT.PDF'
-vgate_assert 27 serial-contains 'goreader: restored page='
-vgate_assert 27 serial-contains 'gosheet: state restored cells=2'
-vgate_assert 27 serial-contains 'rx-audit-b-rest-ok'
-vgate_assert 27 serial-absent 'gosheet: state stale'
-vgate_assert 27 serial-absent 'goreader: state stale'
+vgate_assert 27 serial-contains 'goassist: state restored conv='
+vgate_assert 27 serial-contains ' turns='
+vgate_assert 27 serial-contains 'gopaint: state restored file=/host/PAINT.QOI'
+vgate_assert 27 serial-contains 'rx-audit-a-rest-ok'
+vgate_assert 27 serial-absent 'goassist: state refused'
+vgate_assert 27 serial-absent 'gopaint: state stale'
 vgate_assert 27 serial-absent 'gotabwm: state drop'
 vgate_assert 27 serial-absent '[EXC] parking:'
 vgate_assert 27 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 28 (M151c): pair C save — GOMINE + GOCLOCK. Mines' argv sizes the
-# 16x16 intermediate board directly ('1 1': seed=1, size=1 — no '2' key
-# needed); the clock — last in, focused — takes the run-04 alarm sequence.
+# Run 28 (M151c): pair B save — GOREADER + GOSHEET. Reader's argv path IS
+# its state (on a bare re-exec it can only reopen through the blob); the
+# sheet — last in, focused — takes the run-06 cell edit (A1=5, A2==a1+a1).
 
 vgate_file script-28.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3565,52 +3555,53 @@ EOF
 
 vgate_file script2-28.txt <<'EOF'
 dui focus 0
-exec GOMINE.ELF 1 1
+exec GOREADER.ELF /host/AUDIT.PDF
 EOF
 
 vgate_file script3-28.txt <<'EOF'
-exec GOCLOCK.ELF
+exec GOSHEET.ELF
 EOF
 
-vgate_run 30 -- \
+vgate_run 28 -- \
     --screen '$RUN_DIR/screen-28' \
     --via-virtio \
     --script '$RUN_DIR/script-28.txt' \
     --script2 '$RUN_DIR/script2-28.txt' \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-28.txt' \
-    --script3-after 'gomine: present' \
-    --input-chords 'right,right,right,2,3,5,9,return,ctrl-shift-s' \
-    --input-chords-after 'goclock: painted epoch=' \
+    --script3-after 'goreader: ready' \
+    --input-chords '5,return,down,=,a,1,+,a,1,return,ctrl-shift-s' \
+    --input-chords-after 'gosheet: present' \
     --script-expect 'gotabwm: snapshot saved' --timeout 420
 
 vgate_assert 28 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 28 serial-contains 'gotabwm: registered'
-vgate_assert 28 serial-contains 'exec: loaded GOMINE.ELF'
-vgate_assert 28 serial-contains 'gomine: seed 1 size=intermediate'
-vgate_assert 28 serial-contains 'gomine: present'
-vgate_assert 28 serial-contains 'exec: loaded GOCLOCK.ELF'
-vgate_assert 28 serial-contains 'goclock: declare accepted'
-vgate_assert 28 serial-contains 'goclock: tab alarm'
-vgate_assert 28 serial-contains 'goclock: alarm armed 23:59'
-vgate_assert 28 serial-contains 'goclock: alarm saved'
-vgate_assert 28 serial-contains 'goclock: state posted'
-vgate_assert 28 serial-contains 'gomine: state saved len='
+vgate_assert 28 serial-contains 'exec: loaded GOREADER.ELF'
+vgate_assert 28 serial-contains 'goreader: loaded AUDIT.PDF pages=3'
+vgate_assert 28 serial-contains 'goreader: ready'
+vgate_assert 28 serial-contains 'exec: loaded GOSHEET.ELF'
+vgate_assert 28 serial-contains 'gosheet: declare accepted'
+vgate_assert 28 serial-contains 'gosheet: present'
+vgate_assert 28 serial-contains "gosheet: set A1 := '5' -> 5"
+vgate_assert 28 serial-contains "gosheet: set A2 := '=a1+a1' -> 10"
+vgate_assert 28 serial-contains 'goreader: state saved n='
+vgate_assert 28 serial-contains 'gosheet: state saved n='
 vgate_assert 28 serial-count 'gotabwm: state ask id=' 2
 vgate_assert 28 serial-count 'gotabwm: state save id=' 2
 vgate_assert 28 serial-contains 'gotabwm: snapshot saved'
-vgate_assert 28 serial-absent 'goclock: alarm save failed'
-vgate_assert 28 serial-absent 'gomine: boom'
+vgate_assert 28 serial-absent 'gosheet: state stale'
+vgate_assert 28 serial-absent 'gosheet: state oversize'
+vgate_assert 28 serial-absent 'goreader: refuse'
 vgate_assert 28 serial-absent 'gotabwm: state drop'
 vgate_assert 28 serial-absent '[EXC] parking:'
 vgate_assert 28 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 29 (M151c): pair C restore — `goclock: state restored` prints only
-# when the seat actually served the blob (the .ALARM file is a second,
-# independent carrier — the marker names the wire), and the armed record
-# reports the 23:59 deadline back. Mines' row re-execs the "Mines" alias
-# (no guessBin row for the title) and reports the intermediate board.
+# Run 29 (M151c): pair B restore — the sheet row re-execs its ELF-named
+# bin; the reader row re-execs GOREADER.ELF through the guessBin row for
+# its declared title. Reader gets NO argv on re-exec — it can only
+# reopen AUDIT.PDF because the blob carried the path, which is exactly the
+# round-trip this audit exists to observe.
 
 vgate_file script-29.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3626,10 +3617,10 @@ EOF
 vgate_file script3-29.txt <<'EOF'
 wm
 dui
-echo rx-audit-c-rest-ok
+echo rx-audit-b-rest-ok
 EOF
 
-vgate_run 31 -- \
+vgate_run 29 -- \
     --screen '$RUN_DIR/screen-29' \
     --via-virtio \
     --script '$RUN_DIR/script-29.txt' \
@@ -3637,32 +3628,29 @@ vgate_run 31 -- \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-29.txt' \
     --script3-after 'gotabwm: session live n=2' --script3-delay 8 \
-    --script-expect 'rx-audit-c-rest-ok' --timeout 300
+    --script-expect 'rx-audit-b-rest-ok' --timeout 300
 
 vgate_assert 29 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 29 serial-contains 'gotabwm: session load n=2 mode=restore'
 vgate_assert 29 serial-contains 'gotabwm: session reexec n=2'
-vgate_assert 29 serial-contains 'gotabwm: session exec Mines'
-vgate_assert 29 serial-contains 'gotabwm: session exec GOCLOCK.ELF'
+vgate_assert 29 serial-contains 'gotabwm: session exec GOSHEET.ELF'
+vgate_assert 29 serial-contains 'gotabwm: session exec GOREADER.ELF'
 vgate_assert 29 serial-contains 'gotabwm: session live n=2'
 vgate_assert 29 serial-count 'gotabwm: state restore id=' 2
-vgate_assert 29 serial-contains 'goclock: state restored'
-vgate_assert 29 serial-contains 'goclock: alarm restored 23:59'
-vgate_assert 29 serial-contains 'gomine: state restored size=intermediate'
-vgate_assert 29 serial-contains 'rx-audit-c-rest-ok'
-vgate_assert 29 serial-absent 'gomine: state stale'
+vgate_assert 29 serial-contains 'goreader: loaded AUDIT.PDF'
+vgate_assert 29 serial-contains 'goreader: restored page='
+vgate_assert 29 serial-contains 'gosheet: state restored cells=2'
+vgate_assert 29 serial-contains 'rx-audit-b-rest-ok'
+vgate_assert 29 serial-absent 'gosheet: state stale'
+vgate_assert 29 serial-absent 'goreader: state stale'
 vgate_assert 29 serial-absent 'gotabwm: state drop'
 vgate_assert 29 serial-absent '[EXC] parking:'
 vgate_assert 29 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 30 (M151c): pair D save — GOSOL + GOEMOJI. Solitaire's argv deals
-# seed=1 draw=3; the picker — last in, focused — takes the 'fire' query.
-# GOEMOJI is this audit's second named finding: its SaveState/RestoreState
-# closures are wired, but the appkit event loop never calls PollStateAsk —
-# the seat's ask posts and is never answered, so no blob is stored. The
-# assert set therefore expects exactly ONE save (Solitaire's), and the
-# audit row names the gap for M152c (#2917).
+# Run 30 (M151c): pair C save — GOMINE + GOCLOCK. Mines' argv sizes the
+# 16x16 intermediate board directly ('1 1': seed=1, size=1 — no '2' key
+# needed); the clock — last in, focused — takes the run-04 alarm sequence.
 
 vgate_file script-30.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3677,51 +3665,52 @@ EOF
 
 vgate_file script2-30.txt <<'EOF'
 dui focus 0
-exec GOSOL.ELF --seed=1 --draw=3
+exec GOMINE.ELF 1 1
 EOF
 
 vgate_file script3-30.txt <<'EOF'
-exec GOEMOJI.ELF
+exec GOCLOCK.ELF
 EOF
 
-vgate_run 32 -- \
+vgate_run 30 -- \
     --screen '$RUN_DIR/screen-30' \
     --via-virtio \
     --script '$RUN_DIR/script-30.txt' \
     --script2 '$RUN_DIR/script2-30.txt' \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-30.txt' \
-    --script3-after 'gosol: ready' \
-    --input-chords 'f,i,r,e,ctrl-shift-s' \
-    --input-chords-after 'goemoji: present' \
+    --script3-after 'gomine: present' \
+    --input-chords 'right,right,right,2,3,5,9,return,ctrl-shift-s' \
+    --input-chords-after 'goclock: painted epoch=' \
     --script-expect 'gotabwm: snapshot saved' --timeout 420
 
 vgate_assert 30 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 30 serial-contains 'gotabwm: registered'
-vgate_assert 30 serial-contains 'exec: loaded GOSOL.ELF'
-vgate_assert 30 serial-contains 'gosol: deal seed=1 draw=3'
-vgate_assert 30 serial-contains 'gosol: ready'
-vgate_assert 30 serial-contains 'exec: loaded GOEMOJI.ELF'
-vgate_assert 30 serial-contains 'goemoji: declare accepted'
-vgate_assert 30 serial-contains 'goemoji: fonts manifest=ok'
-vgate_assert 30 serial-contains 'goemoji: present'
-vgate_assert 30 serial-contains 'goemoji: filter q=fire n=1'
-vgate_assert 30 serial-contains 'gosol: state save len='
+vgate_assert 30 serial-contains 'exec: loaded GOMINE.ELF'
+vgate_assert 30 serial-contains 'gomine: seed 1 size=intermediate'
+vgate_assert 30 serial-contains 'gomine: present'
+vgate_assert 30 serial-contains 'exec: loaded GOCLOCK.ELF'
+vgate_assert 30 serial-contains 'goclock: declare accepted'
+vgate_assert 30 serial-contains 'goclock: tab alarm'
+vgate_assert 30 serial-contains 'goclock: alarm armed 23:59'
+vgate_assert 30 serial-contains 'goclock: alarm saved'
+vgate_assert 30 serial-contains 'goclock: state posted'
+vgate_assert 30 serial-contains 'gomine: state saved len='
 vgate_assert 30 serial-count 'gotabwm: state ask id=' 2
-vgate_assert 30 serial-count 'gotabwm: state save id=' 1
+vgate_assert 30 serial-count 'gotabwm: state save id=' 2
 vgate_assert 30 serial-contains 'gotabwm: snapshot saved'
-vgate_assert 30 serial-absent 'gosol: drop bad'
+vgate_assert 30 serial-absent 'goclock: alarm save failed'
+vgate_assert 30 serial-absent 'gomine: boom'
 vgate_assert 30 serial-absent 'gotabwm: state drop'
 vgate_assert 30 serial-absent '[EXC] parking:'
 vgate_assert 30 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 31 (M151c): pair D restore — the Solitaire row re-execs the
-# "Solitaire" alias and reports its restored move count without a re-deal
-# (`gosol: deal seed=` is absent: the table came from the blob). GOEMOJI's
-# row still re-execs and adopts — the tab comes back — but the seat never
-# stored a blob for it, so no `state restore` line names its window and no
-# 'fire' filter reprints: the wire-level evidence of the finding.
+# Run 31 (M151c): pair C restore — `goclock: state restored` prints only
+# when the seat actually served the blob (the .ALARM file is a second,
+# independent carrier — the marker names the wire), and the armed record
+# reports the 23:59 deadline back. Mines' row re-execs GOMINE.ELF through
+# the guessBin row for its declared title and reports the board back.
 
 vgate_file script-31.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3737,10 +3726,10 @@ EOF
 vgate_file script3-31.txt <<'EOF'
 wm
 dui
-echo rx-audit-d-rest-ok
+echo rx-audit-c-rest-ok
 EOF
 
-vgate_run 33 -- \
+vgate_run 31 -- \
     --screen '$RUN_DIR/screen-31' \
     --via-virtio \
     --script '$RUN_DIR/script-31.txt' \
@@ -3748,31 +3737,32 @@ vgate_run 33 -- \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-31.txt' \
     --script3-after 'gotabwm: session live n=2' --script3-delay 8 \
-    --script-expect 'rx-audit-d-rest-ok' --timeout 300
+    --script-expect 'rx-audit-c-rest-ok' --timeout 300
 
 vgate_assert 31 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 31 serial-contains 'gotabwm: session load n=2 mode=restore'
 vgate_assert 31 serial-contains 'gotabwm: session reexec n=2'
-vgate_assert 31 serial-contains 'gotabwm: session exec Solitaire'
-vgate_assert 31 serial-contains 'gotabwm: session exec Emoji'
+vgate_assert 31 serial-contains 'gotabwm: session exec GOMINE.ELF'
+vgate_assert 31 serial-contains 'gotabwm: session exec GOCLOCK.ELF'
 vgate_assert 31 serial-contains 'gotabwm: session live n=2'
-vgate_assert 31 serial-count 'gotabwm: state restore id=' 1
-vgate_assert 31 serial-contains 'gosol: restored moves='
-vgate_assert 31 serial-contains 'goemoji: open id='
-vgate_assert 31 serial-absent 'goemoji: filter q=fire'
-vgate_assert 31 serial-contains 'rx-audit-d-rest-ok'
-vgate_assert 31 serial-absent 'gosol: deal seed='
+vgate_assert 31 serial-count 'gotabwm: state restore id=' 2
+vgate_assert 31 serial-contains 'goclock: state restored'
+vgate_assert 31 serial-contains 'goclock: alarm restored 23:59'
+vgate_assert 31 serial-contains 'gomine: state restored size=intermediate'
+vgate_assert 31 serial-contains 'rx-audit-c-rest-ok'
+vgate_assert 31 serial-absent 'gomine: state stale'
 vgate_assert 31 serial-absent 'gotabwm: state drop'
 vgate_assert 31 serial-absent '[EXC] parking:'
 vgate_assert 31 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 32 (M151c): pair E save — GOVAULT + GOIRC. Vault — first in — just
-# sits bound at its create face: no hooks exist to answer the ask (the
-# card's named gap; M156c #2933 owns the app). IRC — last in, focused —
-# answers the consent gate yes ('tab,return') and dials plain to a host
-# that can never answer without a net device: `goirc: closed` is the
-# offline end-state, not a crash.
+# Run 32 (M151c): pair D save — GOSOL + GOEMOJI. Solitaire's argv deals
+# seed=1 draw=3; the picker — last in, focused — takes the 'fire' query.
+# GOEMOJI is this audit's second named finding: its SaveState/RestoreState
+# closures are wired, but the appkit event loop never calls PollStateAsk —
+# the seat's ask posts and is never answered, so no blob is stored. The
+# assert set therefore expects exactly ONE save (Solitaire's), and the
+# audit row names the gap for M152c (#2917).
 
 vgate_file script-32.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3781,58 +3771,60 @@ vf rm SESSION.TABS
 vf rm SESSION.PANES
 vf rm SNAPSHOT.BUNDLE
 vf rm SNAPSHOT.RESTORE
-vf rm GOVAULT/VAULT.BIN
 wm
 exec GOTABWM.ELF
 EOF
 
 vgate_file script2-32.txt <<'EOF'
 dui focus 0
-exec GOVAULT.ELF
+exec GOSOL.ELF --seed=1 --draw=3
 EOF
 
 vgate_file script3-32.txt <<'EOF'
-exec GOIRC.ELF --ui --host=10.0.0.2 --nick=gate --join '#goirc'
+exec GOEMOJI.ELF
 EOF
 
-vgate_run 34 -- \
+vgate_run 32 -- \
     --screen '$RUN_DIR/screen-32' \
     --via-virtio \
     --script '$RUN_DIR/script-32.txt' \
     --script2 '$RUN_DIR/script2-32.txt' \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-32.txt' \
-    --script3-after 'govault: new vault' \
-    --input-chords 'tab,return,pageup,pageup,ctrl-shift-s' \
-    --input-chords-after 'goirc: consent ask' \
+    --script3-after 'gosol: ready' \
+    --input-chords 'f,i,r,e,ctrl-shift-s' \
+    --input-chords-after 'goemoji: present' \
     --script-expect 'gotabwm: snapshot saved' --timeout 420
 
 vgate_assert 32 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 32 serial-contains 'gotabwm: registered'
-vgate_assert 32 serial-contains 'exec: loaded GOVAULT.ELF'
-vgate_assert 32 serial-contains 'govault: declare accepted'
-vgate_assert 32 serial-contains 'govault: new vault'
-vgate_assert 32 serial-contains 'exec: loaded GOIRC.ELF'
-vgate_assert 32 serial-contains 'goirc: declare accepted'
-vgate_assert 32 serial-contains 'goirc: consent ask'
-vgate_assert 32 serial-contains 'goirc: consent yes'
-vgate_assert 32 serial-contains 'goirc: state saved'
-vgate_assert 32 serial-contains 'goirc: dial 10.0.0.2 6667 plain'
+vgate_assert 32 serial-contains 'exec: loaded GOSOL.ELF'
+vgate_assert 32 serial-contains 'gosol: deal seed=1 draw=3'
+vgate_assert 32 serial-contains 'gosol: ready'
+vgate_assert 32 serial-contains 'exec: loaded GOEMOJI.ELF'
+vgate_assert 32 serial-contains 'goemoji: declare accepted'
+# The share carries no FONTS.TXT (run 25's pill probe pins the 8px bitmap
+# metrics), so the honest manifest row is 'missing' — go-emoji.spec owns
+# the manifest=ok coverage.
+vgate_assert 32 serial-contains 'goemoji: fonts manifest=missing'
+vgate_assert 32 serial-contains 'goemoji: present'
+vgate_assert 32 serial-contains 'goemoji: filter q=fire n=1'
+vgate_assert 32 serial-contains 'gosol: state save len='
 vgate_assert 32 serial-count 'gotabwm: state ask id=' 2
 vgate_assert 32 serial-count 'gotabwm: state save id=' 1
 vgate_assert 32 serial-contains 'gotabwm: snapshot saved'
-vgate_assert 32 serial-absent 'goirc: refuse plaintext'
-vgate_assert 32 serial-absent 'goirc: state refused'
+vgate_assert 32 serial-absent 'gosol: drop bad'
 vgate_assert 32 serial-absent 'gotabwm: state drop'
 vgate_assert 32 serial-absent '[EXC] parking:'
 vgate_assert 32 serial-absent 'exited status=139'
 
 # ---------------------------------------------------------------------------
-# Run 33 (M151c): pair E restore + the report. GOIRC's blob carries the
-# consent answer, so the restored tab re-dials plain WITHOUT a second ask
-# and reports `goirc: state restored`; GOVAULT re-execs clean to its create
-# face — bound, asked, never answered: the audit's named gap. The python
-# below prints the ten-row report and fails on any unexplained row.
+# Run 33 (M151c): pair D restore — the Solitaire row re-execs GOSOL.ELF
+# and reports its restored move count without a re-deal
+# (`gosol: deal seed=` is absent: the table came from the blob). GOEMOJI
+# re-execs GOEMOJI.ELF, takes its blob like the rest, and the restored
+# filter state reprints `filter q=fire` — the live pass showed the card's
+# "unserviced ask" note was stale: emoji answers and restores.
 
 vgate_file script-33.txt <<'EOF'
 set GOMAXPROCS=1
@@ -3848,10 +3840,10 @@ EOF
 vgate_file script3-33.txt <<'EOF'
 wm
 dui
-echo rx-audit-e-rest-ok
+echo rx-audit-d-rest-ok
 EOF
 
-vgate_run 35 -- \
+vgate_run 33 -- \
     --screen '$RUN_DIR/screen-33' \
     --via-virtio \
     --script '$RUN_DIR/script-33.txt' \
@@ -3859,35 +3851,147 @@ vgate_run 35 -- \
     --script2-after 'gotabwm: win focus' \
     --script3 '$RUN_DIR/script3-33.txt' \
     --script3-after 'gotabwm: session live n=2' --script3-delay 8 \
-    --script-expect 'rx-audit-e-rest-ok' --timeout 300
+    --script-expect 'rx-audit-d-rest-ok' --timeout 300
 
 vgate_assert 33 serial-contains 'exec: loaded GOTABWM.ELF'
 vgate_assert 33 serial-contains 'gotabwm: session load n=2 mode=restore'
 vgate_assert 33 serial-contains 'gotabwm: session reexec n=2'
-vgate_assert 33 serial-contains 'gotabwm: session exec GOVAULT.ELF'
-vgate_assert 33 serial-contains 'gotabwm: session exec GOIRC.ELF'
+vgate_assert 33 serial-contains 'gotabwm: session exec GOSOL.ELF'
+vgate_assert 33 serial-contains 'gotabwm: session exec GOEMOJI.ELF'
 vgate_assert 33 serial-contains 'gotabwm: session live n=2'
-# GOVAULT's row restored no blob — the kind-21 serve line names only
-# GOIRC's window.
 vgate_assert 33 serial-count 'gotabwm: state restore id=' 1
-vgate_assert 33 serial-contains 'goirc: state restored'
-vgate_assert 33 serial-contains 'goirc: dial 10.0.0.2 6667 plain'
-vgate_assert 33 serial-absent 'goirc: consent ask'
-vgate_assert 33 serial-contains 'govault: new vault'
-vgate_assert 33 serial-contains 'rx-audit-e-rest-ok'
-vgate_assert 33 serial-absent 'goirc: state refused'
+vgate_assert 33 serial-contains 'gosol: restored moves='
+vgate_assert 33 serial-contains 'goemoji: open id='
+vgate_assert 33 serial-contains 'goemoji: filter q=fire'
+vgate_assert 33 serial-contains 'rx-audit-d-rest-ok'
+vgate_assert 33 serial-absent 'gosol: deal seed='
 vgate_assert 33 serial-absent 'gotabwm: state drop'
 vgate_assert 33 serial-absent '[EXC] parking:'
 vgate_assert 33 serial-absent 'exited status=139'
 
+# ---------------------------------------------------------------------------
+# Run 34 (M151c): pair E save — GOVAULT + GOIRC. Vault — first in — just
+# sits bound at its create face: no hooks exist to answer the ask (the
+# card's named gap; M156c #2933 owns the app). IRC — last in, focused —
+# answers the consent gate yes ('tab,return') and dials plain to a host
+# that can never answer without a net device: `goirc: closed` is the
+# offline end-state, not a crash.
+
+vgate_file script-34.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+vf rm GOVAULT/VAULT.BIN
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-34.txt <<'EOF'
+dui focus 0
+exec GOVAULT.ELF
+EOF
+
+vgate_file script3-34.txt <<'EOF'
+exec GOIRC.ELF --ui --host=10.0.0.2 --nick=gate --join '#goirc'
+EOF
+
+vgate_run 34 -- \
+    --screen '$RUN_DIR/screen-34' \
+    --via-virtio \
+    --script '$RUN_DIR/script-34.txt' \
+    --script2 '$RUN_DIR/script2-34.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-34.txt' \
+    --script3-after 'govault: new vault' \
+    --input-chords 'tab,return,pageup,pageup,ctrl-shift-s' \
+    --input-chords-after 'goirc: consent ask' \
+    --script-expect 'gotabwm: snapshot saved' --timeout 420
+
+vgate_assert 34 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 34 serial-contains 'gotabwm: registered'
+vgate_assert 34 serial-contains 'exec: loaded GOVAULT.ELF'
+vgate_assert 34 serial-contains 'govault: declare accepted'
+vgate_assert 34 serial-contains 'govault: new vault'
+vgate_assert 34 serial-contains 'exec: loaded GOIRC.ELF'
+vgate_assert 34 serial-contains 'goirc: declare accepted'
+vgate_assert 34 serial-contains 'goirc: consent ask'
+vgate_assert 34 serial-contains 'goirc: consent yes'
+vgate_assert 34 serial-contains 'goirc: state saved'
+vgate_assert 34 serial-contains 'goirc: dial 10.0.0.2 6667 plain'
+vgate_assert 34 serial-count 'gotabwm: state ask id=' 2
+vgate_assert 34 serial-count 'gotabwm: state save id=' 1
+vgate_assert 34 serial-contains 'gotabwm: snapshot saved'
+vgate_assert 34 serial-absent 'goirc: refuse plaintext'
+vgate_assert 34 serial-absent 'goirc: state refused'
+vgate_assert 34 serial-absent 'gotabwm: state drop'
+vgate_assert 34 serial-absent '[EXC] parking:'
+vgate_assert 34 serial-absent 'exited status=139'
+
+# ---------------------------------------------------------------------------
+# Run 35 (M151c): pair E restore + the report. GOIRC's blob carries the
+# consent answer, so the restored tab re-dials plain WITHOUT a second ask
+# and reports `goirc: state restored`; GOVAULT re-execs clean to its create
+# face — bound, asked, never answered: the audit's named gap. The python
+# below prints the ten-row report and fails on any unexplained row.
+
+vgate_file script-35.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-35.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-35.txt <<'EOF'
+wm
+dui
+echo rx-audit-e-rest-ok
+EOF
+
+vgate_run 35 -- \
+    --screen '$RUN_DIR/screen-35' \
+    --via-virtio \
+    --script '$RUN_DIR/script-35.txt' \
+    --script2 '$RUN_DIR/script2-35.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-35.txt' \
+    --script3-after 'gotabwm: session live n=2' --script3-delay 8 \
+    --script-expect 'rx-audit-e-rest-ok' --timeout 300
+
+vgate_assert 35 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 35 serial-contains 'gotabwm: session load n=2 mode=restore'
+vgate_assert 35 serial-contains 'gotabwm: session reexec n=2'
+vgate_assert 35 serial-contains 'gotabwm: session exec GOVAULT.ELF'
+vgate_assert 35 serial-contains 'gotabwm: session exec GOIRC.ELF'
+vgate_assert 35 serial-contains 'gotabwm: session live n=2'
+# GOVAULT's row restored no blob — the kind-21 serve line names only
+# GOIRC's window.
+vgate_assert 35 serial-count 'gotabwm: state restore id=' 1
+vgate_assert 35 serial-contains 'goirc: state restored'
+vgate_assert 35 serial-contains 'goirc: dial 10.0.0.2 6667 plain'
+vgate_assert 35 serial-absent 'goirc: consent ask'
+vgate_assert 35 serial-contains 'govault: new vault'
+vgate_assert 35 serial-contains 'rx-audit-e-rest-ok'
+vgate_assert 35 serial-absent 'goirc: state refused'
+vgate_assert 35 serial-absent 'gotabwm: state drop'
+vgate_assert 35 serial-absent '[EXC] parking:'
+vgate_assert 35 serial-absent 'exited status=139'
+
 # The audit report: one row per app, correlated through the seat's window
 # ids (each app's own `open id=` names the window the ask/save/restore
-# markers reference). Runs 24-33's serials all live in RUN_DIR. The two
-# named gaps ride as expected rows — GOVAULT never had hooks (M156c), and
-# GOEMOJI's are wired but its loop never services the ask (M152c) — and a
-# hookless row that unexpectedly answers, or a hooked row that loses its
-# restore, fails the gate: a finding the card wants named, not a surprise.
-vgate_assert 33 python <<'PY'
+# markers reference). Runs 26-35's serials all live in RUN_DIR. All ten
+# apps are expected to round-trip: the first live pass corrected two
+# stale gap rows — GOEMOJI answers its ask (save=8, restored marker) and
+# GOVAULT's M156c hooks do answer (save=23); GOVAULT's remaining gap is
+# the absent `file` grant for its save stage, which the file column
+# names. A hooked row that loses its restore fails the gate.
+vgate_assert 35 python <<'PY'
 import os, re, sys
 rd = os.environ["RUN_DIR"]
 
@@ -3900,21 +4004,16 @@ def ser(tag):
 # (bin, save run, restore run, app's own restored-evidence marker, why when
 # the expectation is not restore=ok, save stage writes /host/APPSTATE.<win>)
 APPS = [
-    ("GOASSIST.ELF", "24", "25", "goassist: state restored conv=", None, True),
-    ("GOPAINT.ELF",  "24", "25", "gopaint: state restored", None, True),
-    ("GOSHEET.ELF",  "26", "27", "gosheet: state restored cells=", None, True),
-    ("GOREADER.ELF", "26", "27", "goreader: restored page=", None, True),
-    ("GOCLOCK.ELF",  "28", "29", "goclock: state restored", None, True),
-    ("GOMINE.ELF",   "28", "29", "gomine: state restored size=", None, True),
-    ("GOSOL.ELF",    "30", "31", "gosol: restored moves=", None, True),
-    ("GOEMOJI.ELF",  "30", "31", None,
-     "SaveState wired but the appkit loop never calls PollStateAsk "
-     "- the ask is posted and never answered, no blob stored "
-     "(M152c #2917 owns the app)", True),
-    ("GOIRC.ELF",    "32", "33", "goirc: state restored", None, True),
-    ("GOVAULT.ELF",  "32", "33", None,
-     "no M125a hooks (shipped pre-protocol; M156c #2933 owns the app)",
-     False),
+    ("GOASSIST.ELF", "26", "27", "goassist: state restored conv=", None, True),
+    ("GOPAINT.ELF",  "26", "27", "gopaint: state restored", None, True),
+    ("GOSHEET.ELF",  "28", "29", "gosheet: state restored cells=", None, True),
+    ("GOREADER.ELF", "28", "29", "goreader: restored page=", None, True),
+    ("GOCLOCK.ELF",  "30", "31", "goclock: state restored", None, True),
+    ("GOMINE.ELF",   "30", "31", "gomine: state restored size=", None, True),
+    ("GOSOL.ELF",    "32", "33", "gosol: restored moves=", None, True),
+    ("GOEMOJI.ELF",  "32", "33", "goemoji: state restored", None, True),
+    ("GOIRC.ELF",    "34", "35", "goirc: state restored", None, True),
+    ("GOVAULT.ELF",  "34", "35", "govault: state restored", None, False),
 ]
 
 # Read-only grant evidence: which mask lacks `file` while the app's save
@@ -3974,5 +4073,5 @@ for bin_, stag, rtag, marker, why0, stage in APPS:
                    % (bin_, save, restore))
 if bad:
     sys.exit("audit rows off expectation: %s" % "; ".join(bad))
-print("audit: ten rows - seven round-trip; GOEMOJI + GOVAULT name their gaps")
+print("audit: ten rows - all ten round-trip; GOVAULT's file grant is absent")
 PY
