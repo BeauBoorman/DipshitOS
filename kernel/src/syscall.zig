@@ -1456,7 +1456,10 @@ fn handle_udp_recv_from(args: Args, _: *exceptions.VectorFrame) u64 {
     // Stage the prefixed shape: src ip, then the stored datagram.
     udp_recv_from_scratch[0..4].* = d.src_ip;
     const take = @min(@as(usize, @intCast(max)) -| 4, d.len);
-    const total = take + 4;
+    // #3057 L1: a max of 1-3 holds less than the 4-byte ip prefix itself —
+    // clamp the copy_out to `max`, never to the prefix width (take+4 = 4
+    // would write past the caller's buffer end).
+    const total = @min(take + 4, @as(usize, @intCast(max)));
     @memcpy(udp_recv_from_scratch[4 .. 4 + take], d.bytes[0..take]);
     if (uaccess.copy_out(address, udp_recv_from_scratch[0..total], total) != .ok) return error_result(.efault);
     _ = udp.pop(@truncate(port)); // consume (the EFAULT path preserved it)
@@ -4410,6 +4413,11 @@ fn handle_mmap(args: Args, _: *exceptions.VectorFrame) u64 {
     const prot = args[2];
     const flags = args[3];
 
+    // #3057 L4: a flag bit outside the named ABI set used to sail through
+    // silently — refused EINVAL instead, before anything is resolved or
+    // registered. `map_flag_mask` names every bit slot 63 recognizes.
+    if ((flags & ~map_flag_mask) != 0) return error_result(.einval);
+
     // Issue #1163 (GOOS=virelai phase 0a): 16 MiB → 1 GiB per call — the
     // gc Go runtime's sbrk layer maps its heap growth in one call (the
     // first-target run straced a 512 MiB sysReserve). Demand-backed: only
@@ -4497,9 +4505,13 @@ fn handle_mmap(args: Args, _: *exceptions.VectorFrame) u64 {
 }
 
 /// M29 / M33 flags on `sys_mmap` (slot 63).
+const map_private: u64 = 0x02; // M29: MAP_PRIVATE
 const map_anonymous: u64 = 0x20; // M29: MAP_ANONYMOUS
 const map_populate: u64 = 0x8000; // M29: MAP_POPULATE (eager allocation)
 const m33_map_shared: u64 = 0x10000; // M33 SB1 (claim 7418): M33_MAP_SHARED (ADR 0016 seam B, frozen in ADR 0007)
+/// Every flag bit the slot-63 ABI names (#3057 L4); a call carrying any bit
+/// outside this mask is refused EINVAL at the handle_mmap entry.
+const map_flag_mask: u64 = map_private | map_anonymous | map_populate | m33_map_shared;
 /// M33 SB3 (claim 9361): when `addr` to a M33_MAP_SHARED `sys_mmap` carries
 /// this high tag, the low 8 bits name a USER WINDOW ID the caller owns, and
 /// the kernel creates + binds the shared surface AS that window's rendering

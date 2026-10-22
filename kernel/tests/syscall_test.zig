@@ -88,6 +88,7 @@ const sys_timer_cancel = syscall.sys_timer_cancel;
 const sys_timer_set = syscall.sys_timer_set;
 const sys_udp_listen = syscall.sys_udp_listen;
 const sys_udp_recv = syscall.sys_udp_recv;
+const sys_udp_recv_from = syscall.sys_udp_recv_from;
 const sys_udp_send = syscall.sys_udp_send;
 const sys_wait = syscall.sys_wait;
 const sys_wait_event = syscall.sys_wait_event;
@@ -1047,6 +1048,37 @@ test "syscall: udp send/recv — loopback round trip through the handlers" {
     try std.testing.expectEqual(error_result(.efault), dispatch(sys_udp_recv, .{ 7000, uaccess.diagnostic_unmapped, udp.datagram_max, 0, 0, 0 }, &frame));
     try std.testing.expectEqual(@as(u64, 12), dispatch(sys_udp_recv, .{ 7000, @intFromPtr(&recv_buf), udp.datagram_max, 0, 0, 0 }, &frame));
     try std.testing.expectEqualSlices(u8, payload, recv_buf[8..12]);
+}
+
+test "syscall: udp recv_from clamps the copy to a max below the ip prefix (#3057 L1)" {
+    init(test_writer);
+    virtio_net.udp.reset();
+    defer virtio_net.udp.reset();
+    virtio_net.arp.own_ip = .{ 10, 0, 0, 1 };
+    defer virtio_net.arp.own_ip = .{ 0, 0, 0, 0 };
+    virtio_net.net_ready = false; // the loopback path must NOT need a device
+    const payload = "ping";
+    var recv_buf: [16]u8 = @splat(0xaa);
+    set_user_regions(
+        .{ .base = @intFromPtr(payload.ptr), .len = payload.len },
+        .{ .base = @intFromPtr(&recv_buf), .len = recv_buf.len },
+    );
+    var frame = fresh_frame();
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_udp_listen, .{ 7000, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, payload.len), dispatch(sys_udp_send, .{ 0x0a000001, 7000, @intFromPtr(payload.ptr), payload.len, 0, 0 }, &frame));
+    // max=2 holds less than the 4-byte src ip prefix: the write is clamped
+    // to max itself (was a 4-byte over-write past the caller's buffer end).
+    try std.testing.expectEqual(@as(u64, 2), dispatch(sys_udp_recv_from, .{ 7000, @intFromPtr(&recv_buf), 2, 0, 0, 0 }, &frame));
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0 }, recv_buf[0..2]);
+    try std.testing.expectEqual(@as(u8, 0xaa), recv_buf[2]); // nothing past max
+    // A truncated datagram is still consumed — the ring is empty now.
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_udp_recv_from, .{ 7000, @intFromPtr(&recv_buf), recv_buf.len, 0, 0, 0 }, &frame));
+    // A mid-shape max still clips the datagram, not the prefix: max=6 is
+    // the full src ip + the first 2 datagram bytes (src port 7000 = 0x1b58).
+    try std.testing.expectEqual(@as(u64, payload.len), dispatch(sys_udp_send, .{ 0x0a000001, 7000, @intFromPtr(payload.ptr), payload.len, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 6), dispatch(sys_udp_recv_from, .{ 7000, @intFromPtr(&recv_buf), 6, 0, 0, 0 }, &frame));
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1, 0x1b, 0x58 }, recv_buf[0..6]);
+    try std.testing.expectEqual(@as(u8, 0xaa), recv_buf[6]);
 }
 
 test "syscall: udp send — EINVAL mapping, EFAULT, and the honest truncation" {
@@ -4379,6 +4411,26 @@ test "syscall: reclaim populated mmap mapping failure unwinds the region" {
     _ = process.on_task_exit(f.task, 0);
     try std.testing.expect(process.release_pages_on_reap(f.task));
     try std.testing.expectEqual(@as(u64, 8), alloc.stats().free_pages);
+}
+
+test "syscall: sys_mmap refuses unknown flag bits with EINVAL (#3057 L4)" {
+    const f = try reclaimFixture(8);
+    var frame = fresh_frame();
+    const va: u64 = 0x60000000;
+    // Every bit outside the named mask {PRIVATE 0x02 | ANON 0x20 | POPULATE
+    // 0x8000 | M33_MAP_SHARED 0x10000} refuses at the door — nothing is
+    // resolved or registered for it.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ va, 4096, 3, 0x22 | 0x01, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ va, 4096, 3, 0x22 | 0x40000000, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ va, 4096, 3, 0x8000_0000_0000_0000, 0, 0 }, &frame));
+    // The shared path is covered by the same door: M33_MAP_SHARED plus an
+    // unknown bit refuses before handle_mmap_shared resolves anything.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_mmap, .{ va, 4096, 3, 0x10020 | 0x04, 0, 0 }, &frame));
+    try std.testing.expect(process.find_mmap_region(f.pid, va) == null);
+    try std.testing.expect(shared_region.find_owner(f.pid, va) == null);
+    // The named bits still map — the mask admits every ABI flag.
+    try std.testing.expectEqual(va, dispatch(sys_mmap, .{ va, 4096, 3, 0x8022, 0, 0 }, &frame));
+    try std.testing.expect(process.find_mmap_region(f.pid, va) != null);
 }
 
 test "syscall: #2092 — sys_mmap refuses kernel-live and wrapping hints with EINVAL" {
