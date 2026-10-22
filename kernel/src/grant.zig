@@ -460,7 +460,14 @@ pub const Lookup = union(enum) {
     row: *const Row,
 };
 
-pub fn lookup(name: []const u8) Lookup {
+/// `scratch` receives the materialized row when the match is a compiled
+/// base row — the `.row` answer may point into it, so it must outlive
+/// the row's use. Per-call, caller-owned: the exec path (`decide`) and
+/// the scope paths (`net_open`/`fs_access`) each carry their own frame's
+/// Row, so concurrent calls on different cores can never decide against
+/// another caller's row. A user-row match instead points into
+/// `user_rows` and never touches `scratch`.
+pub fn lookup(name: []const u8, scratch: *Row) Lookup {
     if (name.len > name_max) {
         return if (overlong_names != 0) .poisoned else .none;
     }
@@ -471,8 +478,7 @@ pub fn lookup(name: []const u8) Lookup {
     // falls through to the compiled table.
     for (base_rows) |*b| {
         if (b.name.len == name.len and std.ascii.eqlIgnoreCase(b.name, name)) {
-            const r = &base_row_scratch;
-            r.* = .{
+            scratch.* = .{
                 .used = true,
                 .wildcard = b.sha256 == null,
                 .name_len = @intCast(b.name.len),
@@ -480,8 +486,8 @@ pub fn lookup(name: []const u8) Lookup {
                 .words = b.words & baseline,
                 .scope = if (b.scope) |s| s.* else .{},
             };
-            @memcpy(r.name[0..b.name.len], b.name);
-            return .{ .row = r };
+            @memcpy(scratch.name[0..b.name.len], b.name);
+            return .{ .row = scratch };
         }
     }
     return .none;
@@ -494,10 +500,6 @@ comptime {
         if (b.sha256 == null and (b.words & ~baseline) != 0) @compileError("wildcard base row may only narrow");
     }
 }
-
-/// The scratch row a base-row lookup answer points at — exec consults it
-/// synchronously inside `decide` and never holds it across a call.
-var base_row_scratch: Row = .{};
 
 /// The exec verdict (ADR 0054 D8): apply a narrowed word set, refuse
 /// `grant_stale`, or take the ambient floor. `digest` is the measured
@@ -512,7 +514,8 @@ pub const Verdict = union(enum) {
 };
 
 pub fn decide(name: []const u8, digest: ?*const [measure.digest_len]u8) Verdict {
-    return switch (lookup(name)) {
+    var scratch: Row = .{};
+    return switch (lookup(name, &scratch)) {
         .none => .ambient,
         .poisoned => .stale,
         .row => |r| blk: {
@@ -1207,8 +1210,8 @@ fn startsWithIC(hay: []const u8, prefix: []const u8) bool {
 /// exec name's prefix, so an exact miss scans for the row it could be a
 /// prefix of — a scoped row never goes unseen because the display name
 /// truncated it.
-fn lookupProcess(name: []const u8) Lookup {
-    const l = lookup(name);
+fn lookupProcess(name: []const u8, scratch: *Row) Lookup {
+    const l = lookup(name, scratch);
     switch (l) {
         .none => {},
         else => return l,
@@ -1220,8 +1223,7 @@ fn lookupProcess(name: []const u8) Lookup {
     }
     for (base_rows) |*b| {
         if (startsWithIC(b.name, name)) {
-            const r = &base_row_scratch;
-            r.* = .{
+            scratch.* = .{
                 .used = true,
                 .wildcard = b.sha256 == null,
                 .name_len = @intCast(b.name.len),
@@ -1229,8 +1231,8 @@ fn lookupProcess(name: []const u8) Lookup {
                 .words = b.words & baseline,
                 .scope = if (b.scope) |s| s.* else .{},
             };
-            @memcpy(r.name[0..b.name.len], b.name);
-            return .{ .row = r };
+            @memcpy(scratch.name[0..b.name.len], b.name);
+            return .{ .row = scratch };
         }
     }
     return .none;
@@ -1247,9 +1249,9 @@ const ScopedRow = union(enum) {
     row: *const Row,
 };
 
-fn scopedRow(pid: usize) ScopedRow {
+fn scopedRow(pid: usize, scratch: *Row) ScopedRow {
     const pinfo = process.info(pid) orelse return .none;
-    return switch (lookupProcess(pinfo.name)) {
+    return switch (lookupProcess(pinfo.name, scratch)) {
         .none => .none,
         .poisoned => .stale,
         .row => |r| blk: {
@@ -1273,7 +1275,8 @@ fn scopedRow(pid: usize) ScopedRow {
 pub fn net_open(owner: u64, dst: ScopedDst, port: u16) OpenVerdict {
     if (owner >= process.max_processes) return .allow;
     const pid: usize = @intCast(owner);
-    const verdict: OpenVerdict = switch (scopedRow(pid)) {
+    var scratch: Row = .{};
+    const verdict: OpenVerdict = switch (scopedRow(pid, &scratch)) {
         .none => .allow,
         .stale => .stale,
         .row => |r| scopeEval(&r.scope, dst, port),
@@ -1316,7 +1319,8 @@ fn pathAtOrUnder(path: []const u8, prefix: []const u8) bool {
 pub fn fs_access(owner: u64, path: []const u8, want: FsWant) FsVerdict {
     if (owner >= process.max_processes) return .allow;
     const pid: usize = @intCast(owner);
-    const verdict: FsVerdict = switch (scopedRow(pid)) {
+    var scratch: Row = .{};
+    const verdict: FsVerdict = switch (scopedRow(pid, &scratch)) {
         .none => .allow,
         .stale => .stale,
         .row => |r| fsScopeEval(&r.scope, path, want),
@@ -1708,7 +1712,8 @@ test "grant: fleet base rows cover the shipped roster (M116a #2467)" {
             try std.testing.expect(!std.mem.eql(u8, reason, "-"));
         // The compiled table carries exactly this mask — a stale
         // generated file is a test failure, not a silent divergence.
-        switch (lookup(name)) {
+        var scratch: Row = .{};
+        switch (lookup(name, &scratch)) {
             .row => |r| try std.testing.expectEqual(row_mask, r.words & baseline),
             else => return error.MissingBaseRow,
         }
@@ -1746,7 +1751,8 @@ test "grant: scope field parses, serializes, and round-trips (M117e)" {
     init();
     _ = load("#v1\nV6APP.ELF\t*\tfile,net\tv6=2001:db8:64::/64,if=nat\nLANAPP.ELF\t*\tnet\tif=bridged\nPLAIN.ELF\t*\tnet\nDASH.ELF\t*\tnet\t-\n");
     try std.testing.expectEqual(@as(usize, 4), count());
-    switch (lookup("V6APP.ELF")) {
+    var scratch: Row = .{};
+    switch (lookup("V6APP.ELF", &scratch)) {
         .row => |r| {
             try std.testing.expectEqual(@as(u8, 1), r.scope.v6_count);
             try std.testing.expectEqual(@as(u8, 64), r.scope.v6[0].len);
@@ -1754,11 +1760,11 @@ test "grant: scope field parses, serializes, and round-trips (M117e)" {
         },
         else => return error.MissingRow,
     }
-    switch (lookup("LANAPP.ELF")) {
+    switch (lookup("LANAPP.ELF", &scratch)) {
         .row => |r| try std.testing.expectEqual(if_bridged, r.scope.if_mask),
         else => return error.MissingRow,
     }
-    switch (lookup("DASH.ELF")) {
+    switch (lookup("DASH.ELF", &scratch)) {
         .row => |r| try std.testing.expect(r.scope.isEmpty()),
         else => return error.MissingRow,
     }
@@ -1772,7 +1778,7 @@ test "grant: scope field parses, serializes, and round-trips (M117e)" {
     try std.testing.expect(std.mem.indexOf(u8, text, "PLAIN.ELF\t*\tnet\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "DASH.ELF\t*\tnet\n") != null);
     try std.testing.expectEqual(LoadResult.ok, load(text));
-    switch (lookup("V6APP.ELF")) {
+    switch (lookup("V6APP.ELF", &scratch)) {
         .row => |r| try std.testing.expectEqual(@as(u8, 1), r.scope.v6_count),
         else => return error.MissingRow,
     }
@@ -1782,8 +1788,9 @@ test "grant: malformed scope poisons the row (M117e)" {
     init();
     _ = load("#v1\nBAD.ELF\t*\tnet\tif=narnia\nBADV6.ELF\t*\tnet\tv6=zzz/64\nOVER.ELF\t*\tnet\tv6=2001:db8::/64,v6=2001:db9::/64,v6=2001:dba::/64,v6=2001:dbb::/64,v6=2001:dbc::/64\n");
     const da = hexDigest(sha_a);
+    var scratch: Row = .{};
     for ([_][]const u8{ "BAD.ELF", "BADV6.ELF", "OVER.ELF" }) |n| {
-        switch (lookup(n)) {
+        switch (lookup(n, &scratch)) {
             .poisoned => {},
             else => return error.ExpectedPoison,
         }
@@ -1792,7 +1799,7 @@ test "grant: malformed scope poisons the row (M117e)" {
     // A five-field line poisons too.
     init();
     _ = load("#v1\nFIVE.ELF\t*\tnet\tif=nat\textra\n");
-    switch (lookup("FIVE.ELF")) {
+    switch (lookup("FIVE.ELF", &scratch)) {
         .poisoned => {},
         else => return error.ExpectedPoison,
     }
@@ -1805,12 +1812,13 @@ test "grant: a truncated registry name still sees a longer scoped row (M117e)" {
     _ = load("#v1\nABCDEFGHIJKLMNOPQ.ELF\t*\tnet\tif=nat\n");
     // "ABCDEFGHIJKLMNOP" is the 16-byte display bound — a longer exec
     // name truncates to it, and the prefix fallback must still bind.
-    switch (lookupProcess("ABCDEFGHIJKLMNOP")) {
+    var scratch: Row = .{};
+    switch (lookupProcess("ABCDEFGHIJKLMNOP", &scratch)) {
         .row => |r| try std.testing.expectEqual(if_nat, r.scope.if_mask),
         else => return error.MissingRow,
     }
     // An unrelated prefix does not bind.
-    switch (lookupProcess("ABCDEFGHIJKLMNOZ")) {
+    switch (lookupProcess("ABCDEFGHIJKLMNOZ", &scratch)) {
         .none => {},
         else => return error.ExpectedNone,
     }
@@ -1908,7 +1916,8 @@ test "grant: to= endpoints and fs= rules parse, serialize, and round-trip (M116d
     init();
     _ = load("#v1\nEPAPP.ELF\t*\tnet\tto=10.0.0.2:8080,to=[2001:db8::5]:443\nFSAPP.ELF\t*\tfile\tfs=/host/APPS:ro,fs=/disk/appdata:rw\nBOTH.ELF\t*\tfile,net\tif=nat,to=10.0.0.2:53,fs=/host:ro\n");
     try std.testing.expectEqual(@as(usize, 3), count());
-    switch (lookup("EPAPP.ELF")) {
+    var scratch: Row = .{};
+    switch (lookup("EPAPP.ELF", &scratch)) {
         .row => |r| {
             try std.testing.expectEqual(@as(u8, 2), r.scope.to_count);
             try std.testing.expect(r.scope.to[0] == .v4);
@@ -1919,7 +1928,7 @@ test "grant: to= endpoints and fs= rules parse, serialize, and round-trip (M116d
         },
         else => return error.MissingRow,
     }
-    switch (lookup("FSAPP.ELF")) {
+    switch (lookup("FSAPP.ELF", &scratch)) {
         .row => |r| {
             try std.testing.expectEqual(@as(u8, 2), r.scope.fs_count);
             try std.testing.expectEqualStrings("/host/APPS", r.scope.fs[0].path[0..r.scope.fs[0].path_len]);
@@ -1936,7 +1945,7 @@ test "grant: to= endpoints and fs= rules parse, serialize, and round-trip (M116d
     try std.testing.expect(std.mem.indexOf(u8, text, "FSAPP.ELF\t*\tfile\tfs=/host/APPS:ro,fs=/disk/appdata:rw\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "BOTH.ELF\t*\tfile,net\tif=nat,to=10.0.0.2:53,fs=/host:ro\n") != null);
     try std.testing.expectEqual(LoadResult.ok, load(text));
-    switch (lookup("FSAPP.ELF")) {
+    switch (lookup("FSAPP.ELF", &scratch)) {
         .row => |r| try std.testing.expectEqual(@as(u8, 2), r.scope.fs_count),
         else => return error.MissingRow,
     }
@@ -1946,8 +1955,9 @@ test "grant: malformed to=/fs= tokens poison the row (M116d)" {
     init();
     _ = load("#v1\nB1.ELF\t*\tnet\tto=10.0.0.2\nB2.ELF\t*\tnet\tto=10.0.0.2:0\nB3.ELF\t*\tnet\tto=999.0.0.2:80\nB4.ELF\t*\tnet\tto=[2001:db8::5]\nB5.ELF\t*\tfile\tfs=/etc:ro\nB6.ELF\t*\tfile\tfs=/disk/appdata\nB7.ELF\t*\tfile\tfs=/host/../x:rw\nB8.ELF\t*\tfile\tfs=/host/a:ro,fs=/host/b:ro,fs=/host/c:ro,fs=/host/d:ro,fs=/host/e:ro\nB9.ELF\t*\tnet\tto=1.2.3.4:5,to=1.2.3.4:6,to=1.2.3.4:7,to=1.2.3.4:8,to=1.2.3.4:9\n");
     const da = hexDigest(sha_a);
+    var scratch: Row = .{};
     for ([_][]const u8{ "B1.ELF", "B2.ELF", "B3.ELF", "B4.ELF", "B5.ELF", "B6.ELF", "B7.ELF", "B8.ELF", "B9.ELF" }) |n| {
-        switch (lookup(n)) {
+        switch (lookup(n, &scratch)) {
             .poisoned => {},
             else => return error.ExpectedPoison,
         }
@@ -2082,4 +2092,108 @@ test "grant: denial_read stops at a whole receipt — partial fits never split a
     // syscall seam answers EINVAL before reaching here).
     var tiny: [7]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), denial_read(0, &tiny));
+}
+
+// ---------------------------------------------------------------------------
+// Base-row materialization is per-call: the exec path (`decide`) and the
+// scope paths (`net_open`/`fs_access` via `lookupProcess`) used to share
+// one module-level scratch, so concurrent base-row resolutions on
+// different cores could decide scope/digest against another caller's row.
+// ---------------------------------------------------------------------------
+
+test "grant: interleaved base-row lookups keep per-call rows" {
+    init();
+    // Two compiled rows resolved through the two paths that shared the
+    // scratch. Row A's answer must still describe row A after row B's
+    // materialization — one shared scratch would hand A's caller B's
+    // name, words, scope and digest.
+    const a = base_rows[0];
+    const b = base_rows[1];
+    var sa: Row = .{};
+    var sb: Row = .{};
+    const ra: *const Row = switch (lookup(a.name, &sa)) {
+        .row => |r| r,
+        else => return error.MissingBaseRow,
+    };
+    const rb: *const Row = switch (lookupProcess(b.name, &sb)) {
+        .row => |r| r,
+        else => return error.MissingBaseRow,
+    };
+    try std.testing.expect(ra != rb);
+    try std.testing.expectEqualStrings(a.name, ra.name[0..ra.name_len]);
+    try std.testing.expectEqualStrings(b.name, rb.name[0..rb.name_len]);
+    try std.testing.expectEqual(a.words & baseline, ra.words);
+    try std.testing.expectEqual(b.words & baseline, rb.words);
+    // The reverse order: the scope path's answer survives an exec lookup.
+    var sc: Row = .{};
+    var sd: Row = .{};
+    const rc: *const Row = switch (lookupProcess(a.name, &sc)) {
+        .row => |r| r,
+        else => return error.MissingBaseRow,
+    };
+    const rd: *const Row = switch (lookup(b.name, &sd)) {
+        .row => |r| r,
+        else => return error.MissingBaseRow,
+    };
+    try std.testing.expect(rc != rd);
+    try std.testing.expectEqualStrings(a.name, rc.name[0..rc.name_len]);
+    try std.testing.expectEqualStrings(b.name, rd.name[0..rd.name_len]);
+}
+
+test "grant: exec and scope paths resolve base rows concurrently without cross-talk" {
+    init();
+    // The mixed-domain leg: exec-domain `decide` on one fleet row while
+    // the scope-domain `lookupProcess` + `scopeEval` resolves another —
+    // each call materializes into its own frame's Row, so neither side
+    // can ever read the other's words, scope or digest. A shared scratch
+    // would let one side's verdict ride on the other side's row.
+    const Ctx = struct {
+        row: *const BaseRow,
+        domain: enum { exec, scope },
+        iterations: usize,
+        fails: u32 = 0,
+
+        fn run(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < ctx.iterations) : (i += 1) {
+                switch (ctx.domain) {
+                    .exec => switch (decide(ctx.row.name, null)) {
+                        .apply => |w| {
+                            if (w != ctx.row.words & baseline) ctx.fails += 1;
+                        },
+                        else => ctx.fails += 1,
+                    },
+                    .scope => {
+                        var scratch: Row = .{};
+                        switch (lookupProcess(ctx.row.name, &scratch)) {
+                            .row => |r| {
+                                const verdict = scopeEval(&r.scope, .{ .v4 = .{ 10, 0, 0, 2 } }, 80);
+                                if (!std.ascii.eqlIgnoreCase(r.name[0..r.name_len], ctx.row.name) or
+                                    r.words != ctx.row.words & baseline or
+                                    (r.scope.isEmpty() and verdict != .allow)) ctx.fails += 1;
+                            },
+                            else => ctx.fails += 1,
+                        }
+                    },
+                }
+            }
+        }
+    };
+    const iterations = 20_000;
+    var exec_ctx = Ctx{ .row = &base_rows[0], .domain = .exec, .iterations = iterations };
+    var exec_ctx2 = Ctx{ .row = &base_rows[1], .domain = .exec, .iterations = iterations };
+    var scope_ctx = Ctx{ .row = &base_rows[2], .domain = .scope, .iterations = iterations };
+    var scope_ctx2 = Ctx{ .row = &base_rows[3], .domain = .scope, .iterations = iterations };
+    const t1 = try std.Thread.spawn(.{}, Ctx.run, .{&exec_ctx});
+    const t2 = try std.Thread.spawn(.{}, Ctx.run, .{&scope_ctx});
+    const t3 = try std.Thread.spawn(.{}, Ctx.run, .{&exec_ctx2});
+    const t4 = try std.Thread.spawn(.{}, Ctx.run, .{&scope_ctx2});
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+    try std.testing.expectEqual(@as(u32, 0), exec_ctx.fails);
+    try std.testing.expectEqual(@as(u32, 0), exec_ctx2.fails);
+    try std.testing.expectEqual(@as(u32, 0), scope_ctx.fails);
+    try std.testing.expectEqual(@as(u32, 0), scope_ctx2.fails);
 }
