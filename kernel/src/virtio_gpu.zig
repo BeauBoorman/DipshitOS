@@ -940,7 +940,12 @@ test "virtio_gpu: spec constants, wire shapes, and the fill are the spec shapes"
     try std.testing.expectEqual(@as(u64, 0x1 << 32 | 0x1 << 0), select_features(0x1 << 32 | 0x1 << 0 | 0x1 << 1));
     try std.testing.expectEqual(@as(u64, 0), select_features(0));
     try std.testing.expectEqual(@as(u64, 0), select_features(0x1 << 0));
-    // Unarmed transport reports honestly.
+    // Unarmed transport reports honestly. Scoped to this test: an
+    // aggregate test binary runs every imported file's tests, and a
+    // leaked gpu_ready sends later driving_award tests down the armed
+    // transport path (an mmio write to the never-mapped gpu_notify).
+    const saved_ready = gpu_ready;
+    defer gpu_ready = saved_ready;
     gpu_ready = false;
     try std.testing.expect(!gpu_display_info());
     try std.testing.expect(!gpu_create_resource());
@@ -951,6 +956,8 @@ test "virtio_gpu: spec constants, wire shapes, and the fill are the spec shapes"
 }
 
 test "virtio_gpu: fill writes the B8G8R8X8 little-endian byte order" {
+    const saved_ready = gpu_ready;
+    defer gpu_ready = saved_ready;
     gpu_ready = true;
     fill_framebuffer(0x112233); // R=0x11 G=0x22 B=0x33
     try std.testing.expectEqual(@as(u8, 0x33), gpu_fb[0]); // B first
@@ -975,6 +982,8 @@ test "virtio_gpu: display-info response parse takes pmodes[0]" {
     // The parse is gpu_display_info's body; exercise it through the real
     // fields by copying the response into gpu_resp_buf and calling the
     // executor's parse path indirectly (not_ready guard first).
+    const saved_ready = gpu_ready;
+    defer gpu_ready = saved_ready;
     gpu_ready = true;
     @memcpy(gpu_resp_buf[0..@sizeOf(RespDisplayInfo)], buf[0..@sizeOf(RespDisplayInfo)]);
     const parsed: *align(1) RespDisplayInfo = @ptrCast(@alignCast(&gpu_resp_buf));

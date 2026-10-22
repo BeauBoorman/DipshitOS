@@ -655,6 +655,8 @@ test "monitor: net reports no device honestly when the transport is absent" {
 test "monitor: screen reports no device honestly when the transport is absent" {
     var env = TestEnv.init();
     var mon = env.monitor();
+    const saved_ready = virtio_gpu.gpu_ready;
+    defer virtio_gpu.gpu_ready = saved_ready;
     virtio_gpu.gpu_ready = false;
     virtio_gpu.gpu_fail = "";
     try std.testing.expectEqual(ExecError.none, exec(&mon, &.{"screen"}));
@@ -682,6 +684,8 @@ test "monitor: screen reports no device honestly when the transport is absent" {
 test "monitor: text reports the region and refuses put/clear without the transport" {
     var env = TestEnv.init();
     var mon = env.monitor();
+    const saved_ready = virtio_gpu.gpu_ready;
+    defer virtio_gpu.gpu_ready = saved_ready;
     virtio_gpu.gpu_ready = false;
     // The report is device-independent: it names the region + cursor.
     fbtext.init();

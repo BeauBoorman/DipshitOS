@@ -720,10 +720,11 @@ vgate_assert 06 serial-contains 'goterm: line echo SCROLL-PROOF-LINE'
 vgate_assert 06 serial-absent 'goterm: state restored'
 vgate_assert 06 serial-absent 'goterm: state refused'
 # The snapshot chord asked the bound tab; GOTERM staged its blob at
-# appver 1 and the seat stored it into the session.
+# appver 2 (M154c #2927 bumped termStateVersion 1 -> 2 for the profile
+# field) and the seat stored it into the session.
 vgate_assert 06 serial-contains 'gotabwm: state ask id='
 vgate_assert 06 serial-contains 'gotabwm: state save id='
-vgate_assert 06 serial-contains 'ver=1'
+vgate_assert 06 serial-contains 'ver=2'
 vgate_assert 06 serial-contains 'gotabwm: snapshot saved '
 vgate_assert 06 serial-absent 'gotabwm: state drop'
 vgate_assert 06 serial-contains 'term-state-save-ok'
@@ -731,10 +732,11 @@ vgate_assert 06 serial-absent '\[EXC\]'
 vgate_assert 06 serial-absent '[EXC] parking:'
 
 # Byte-level on the share: the .tabs v2 `AS` trailer carries one entry —
-# appver 1, and GOTERM's v1 blob framing (u8 fmt | u8 flags | u16 cwd |
-# u16 envN | pairs | u32 scroll). The decoded fields must be exactly
-# what the session produced: cwd /STATE, three env pairs, a stream tail
-# holding the proof line.
+# appver 2, and GOTERM's v2 blob framing (u8 fmt | u8 flags | u16 cwd |
+# u16 envN | pairs | u32 scroll | u16 profLen | profile). The decoded
+# fields must be exactly what the session produced: cwd /STATE, three env
+# pairs, a stream tail holding the proof line, and an empty profile (run
+# 06 never applies one).
 vgate_assert 06 python <<'PY'
 import os, sys
 b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
@@ -744,14 +746,14 @@ off = 6 + 69
 if len(b) < off + 6 + 8 or b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 1:
     sys.exit("app_state trailer %r" % b[off:off+6])
 ent = b[off+6:off+14]
-if ent[0] != 0 or ent[1] != 1:
+if ent[0] != 0 or ent[1] != 2:
     sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
 ln = int.from_bytes(ent[4:8], "little")
 blob = b[off+14:off+14+ln]
 if len(blob) != ln:
     sys.exit("blob truncated: %d of %d" % (len(blob), ln))
-if blob[0] != 1:
-    sys.exit("goterm blob format=%d want 1" % blob[0])
+if blob[0] != 2:
+    sys.exit("goterm blob format=%d want 2" % blob[0])
 cwdLen = int.from_bytes(blob[2:4], "little")
 cwd = blob[4:4+cwdLen].decode()
 if cwd != "/STATE":
@@ -771,8 +773,20 @@ scLen = int.from_bytes(blob[p:p+4], "little")
 scroll = blob[p+4:p+4+scLen]
 if b"SCROLL-PROOF-LINE" not in scroll:
     sys.exit("scrollback lost the proof line (%d bytes)" % len(scroll))
+# v2's last field is the term-profile name — it must consume the blob
+# tail exactly, and run 06 applies no profile so it decodes empty.
+p += 4 + scLen
+if len(blob) - p < 2:
+    sys.exit("v2 blob truncated before profLen")
+profLen = int.from_bytes(blob[p:p+2], "little")
+profile = blob[p+2:p+2+profLen].decode()
+if p + 2 + profLen != len(blob):
+    sys.exit("v2 profile field leaves %d trailing bytes"
+             % (len(blob) - p - 2 - profLen))
+if profile != "":
+    sys.exit("run 06 applied no profile, want empty, got %r" % profile)
 print("SESSION.TABS GOTERM blob: cwd=%r env=%d scroll=%dB alt=%d "
-      "tail intact" % (cwd, envN, scLen, blob[1] & 1))
+      "profile=%r tail intact" % (cwd, envN, scLen, blob[1] & 1, profile))
 PY
 
 # Run 07 (M125e / #2590): the restore half — a FRESH boot loads the file
