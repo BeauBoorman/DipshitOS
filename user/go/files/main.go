@@ -169,7 +169,8 @@ func main() {
 	// mode IS appkit.FilePicker, rendered ANSI.
 	pickOn := false
 	pickArg := ""
-	for i, a := range vi.Args() {
+	arg := startArgs()
+	for i, a := range argsOf() {
 		if strings.HasPrefix(a, "--lease-fixture=") {
 			leaseFixture(strings.TrimPrefix(a, "--lease-fixture="))
 		}
@@ -261,7 +262,7 @@ func main() {
 	if pickOn {
 		start := pickArg
 		if start == "" {
-			start = startPath()
+			start = arg.dir
 		}
 		pickMain(fd, ta, start, cols, rows)
 	}
@@ -270,7 +271,7 @@ func main() {
 	// a blob saved under a different format version is refused by name,
 	// never silently misread. A saved cwd that no longer exists walks up
 	// to the nearest existing parent.
-	start := startPath()
+	start := arg.dir
 	fellBack := false
 	if ta.Restored && ta.RestoredVersion == stateFmtVer && restoredOK {
 		resolved, fell := resolveStatePath(restored.path)
@@ -294,6 +295,18 @@ func main() {
 		m.emit(markerStateRefused + "ver=" + vi.Itoa64(int64(ta.RestoredVersion)))
 	case ta.Restored:
 		m.emit(markerStateRefused + "bad blob")
+	}
+	// M167b (#2992): the palette's `--search <q>` hand-off (M165f #2978).
+	// The argv receipt names the query — or the bound that refused it —
+	// up front; the M155c walk itself runs on the start directory and its
+	// markers ride the first post-paint flush like every other receipt.
+	if arg.search {
+		if arg.searchNo != "" {
+			vi.ConsoleLine(markerSearchArg + "refused " + arg.searchNo)
+		} else {
+			vi.ConsoleLine(markerSearchArg + "q=" + arg.query)
+			m.runSearch(arg.query)
+		}
 	}
 	if !paint(fd, m) {
 		shutdown(ta, fd, 4)

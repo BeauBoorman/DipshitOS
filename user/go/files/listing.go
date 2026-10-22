@@ -250,16 +250,71 @@ func entryLess(a, b vi.DirEntry, mode sortMode) bool {
 	}
 }
 
-// startPath is the directory the manager opens at: argv[1] when the
-// launcher passed one (the gate execs `GOFILES.ELF /host/FM`), else the
-// host-share root. vi.Args() is empty on the host, so this pins to
-// rootPath there.
-func startPath() string {
-	args := vi.Args()
-	if len(args) > 1 && len(args[1]) > 0 && len(args[1]) <= maxPath {
-		return args[1]
+// argsOf is the argv seam — vi.Args on the guest (empty on the host),
+// stubbed by the host tests so the launch-line contract is pinned
+// without an exec (the mountRows pattern).
+var argsOf = vi.Args
+
+// maxSearchArg bounds the `--search <q>` argument — the palette's own
+// 64-byte cap (M165f #2978), refused by name beyond it here too.
+const maxSearchArg = 64
+
+// startArgv is the decoded launch line. Dir is the first absolute argv
+// entry (rootPath when none); search/query carry the M165f hand-off —
+// `--search <q>` or `--search=<q>` — and searchNo names a refusal
+// ("long" over the bound, "empty" when the flag carried no query).
+type startArgv struct {
+	dir      string
+	search   bool
+	query    string
+	searchNo string
+}
+
+// startArgs decodes argv: argv[0] is the program name, `pick` and the
+// fixture verbs are main's words, and a flag's value is consumed by its
+// flag — a --search query is never taken as the start directory even
+// when it starts with '/'. Only an ABSOLUTE entry within the kernel path
+// cap may name the start directory (M167b): a verb or a bare word is not
+// a path.
+func startArgs() startArgv {
+	out := startArgv{dir: rootPath}
+	args := argsOf()
+	dirSet := false
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--search":
+			out.search = true
+			if i+1 >= len(args) {
+				out.searchNo = "empty"
+				continue
+			}
+			i++
+			out.query = args[i]
+		case strings.HasPrefix(a, "--search="):
+			out.search = true
+			out.query = strings.TrimPrefix(a, "--search=")
+		case !dirSet && len(a) > 0 && a[0] == '/' && len(a) <= maxPath:
+			out.dir = a
+			dirSet = true
+		}
 	}
-	return rootPath
+	if out.search {
+		switch {
+		case len(out.query) > maxSearchArg:
+			out.query, out.searchNo = "", "long"
+		case out.query == "" && out.searchNo == "":
+			out.searchNo = "empty"
+		}
+	}
+	return out
+}
+
+// startPath is the directory the manager opens at: the first absolute
+// argv entry (the gate execs `GOFILES.ELF /host/FM`), else the host-share
+// root.
+func startPath() string {
+	return startArgs().dir
 }
 
 // sanitizePreview turns raw file bytes into display text for the preview

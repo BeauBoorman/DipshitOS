@@ -57,15 +57,27 @@ func (m *model) openProps() {
 	switch {
 	case m.path == volsPath:
 		p.kind = "volume"
+	case m.path == favsView:
+		p.kind = "pin"
 	case e.Dir():
 		p.kind = "directory"
 	default:
 		p.kind = "file"
 	}
-	path, ok := joinPath(m.path, p.name)
-	if !ok {
-		m.status = "props: path too long"
-		return
+	var path string
+	if m.path == favsView {
+		// M167b: the row's path IS the pin — the card answers for the
+		// real directory the pin names (a gone one stats nothing).
+		if m.sel < len(m.favs) {
+			path = m.favs[m.sel]
+		}
+	} else {
+		var ok bool
+		path, ok = joinPath(m.path, p.name)
+		if !ok {
+			m.status = "props: path too long"
+			return
+		}
 	}
 	p.path = path
 	if p.kind == "volume" {

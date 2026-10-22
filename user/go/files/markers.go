@@ -232,6 +232,25 @@ const (
 	markerGridTiles = "gofiles: grid tiles "
 	markerGridFocus = "gofiles: grid focus "
 
+	// M167b (#2992): pinned places and the `--search` argv hand-off.
+	// `fav add <path> n=<k>` / `fav del <path> n=<k>` are the `b` toggle's
+	// receipts (n= is the pin count after the change); `fav refused
+	// <path> <reason>` names the bound or surface — `full`/`path` on the
+	// pin rules, `volumes` on the mount-table root, `missing` when Enter
+	// tried a gone pin. `favs loaded n=<k> bad=<m>` is the store's start
+	// read (a missing FILES.FAV is `n=0 absent`, never a malformed file);
+	// `favs n=<k> missing=<m>` is the `f` listing's count line, with one
+	// `fav <path>[ missing]` row per pin naming what the row shows.
+	// `search arg q=<q>` is the M165f (#2978) palette hand-off's receipt;
+	// `search arg refused <reason>` names the argv bound (long, empty).
+	markerFav       = "gofiles: fav "
+	markerFavAdd    = "gofiles: fav add "
+	markerFavDel    = "gofiles: fav del "
+	markerFavNo     = "gofiles: fav refused "
+	markerFavs      = "gofiles: favs "
+	markerFavsLoad  = "gofiles: favs loaded "
+	markerSearchArg = "gofiles: search arg "
+
 	// The view/sort chords' own markers.
 	markerViewMode = "gofiles: viewmode "
 	markerSort     = "gofiles: sort "

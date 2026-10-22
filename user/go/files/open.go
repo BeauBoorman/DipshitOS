@@ -89,6 +89,15 @@ func (m *model) openSelPath() (string, string, bool) {
 		return "", "", false
 	}
 	name := e.NameString()
+	if m.path == favsView {
+		// M167b: a pin row's path is the pin itself — the mime/open
+		// contract then answers on the real directory (or refuses it
+		// by name) instead of a pseudo path that cannot resolve.
+		if m.sel < len(m.favs) {
+			return name, m.favs[m.sel], true
+		}
+		return name, "", false
+	}
 	p, ok := joinPath(m.path, name)
 	if !ok {
 		return name, "", false

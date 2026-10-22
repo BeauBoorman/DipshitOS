@@ -62,9 +62,15 @@ var stateDirProbe = func(path string) int64 {
 // path <= maxPath and every other field is fixed-width, so the blob can
 // never exceed ~73 bytes — far under the seat's 64 KiB cap.
 func (m model) encodeState() []byte {
-	out := make([]byte, 0, 3+len(m.path)+stateTail)
-	out = append(out, stateFmtVer, byte(len(m.path)), byte(len(m.path)>>8))
-	out = append(out, m.path...)
+	path := m.path
+	if path == favsView {
+		// M167b: the pseudo-listing is not a resumable cwd — a snapshot
+		// taken on the pins resumes at the share root, not a refused blob.
+		path = rootPath
+	}
+	out := make([]byte, 0, 3+len(path)+stateTail)
+	out = append(out, stateFmtVer, byte(len(path)), byte(len(path)>>8))
+	out = append(out, path...)
 	out = append(out,
 		byte(m.sel), byte(m.sel>>8),
 		byte(m.top), byte(m.top>>8),

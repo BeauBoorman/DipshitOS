@@ -124,6 +124,13 @@ func (m *model) startSearch() {
 		m.status = "search: volumes are browse-only"
 		return
 	}
+	if m.path == favsView {
+		// M167b: the pins are a pseudo-listing, not a tree — the walk
+		// has nothing to descend into.
+		m.emit(markerSearchNo + "favs")
+		m.status = "search: pins are browse-only"
+		return
+	}
 	m.mode = modeSearchInput
 	m.input = ""
 	m.status = "search"
@@ -163,6 +170,14 @@ func (m *model) searchKey(ev keys.Event) {
 // outcome: the results frame, or one of the named refusals. The markers
 // ride pending like every other model receipt.
 func (m *model) runSearch(pat string) {
+	// The '/' prompt refuses the mount-table root before it is reached;
+	// the M167b `--search` argv path lands here directly, so the same
+	// named refusal lives at the walk's own door too.
+	if m.path == volsPath || m.path == favsView {
+		m.emit(markerSearchNo + "root")
+		m.status = "search: volumes are browse-only"
+		return
+	}
 	s := &m.search
 	*s = search{pat: pat, root: m.path}
 	needle := make([]byte, len(pat))

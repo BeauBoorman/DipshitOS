@@ -370,7 +370,7 @@ func (m model) renderLines() []string {
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · / search · space look · i props · o open with · e export · t grid · v volumes · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("j/k move · enter open · / search · space look · i props · o open with · e export · t grid · v volumes · f pins · b pin · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }
@@ -392,7 +392,7 @@ func (m model) emptyListRows(w, body int) []string {
 // m.top maps it onto the listing (the cursor is always inside the window —
 // ensureSelVisible owns that invariant).
 func (m model) listRow(i, w int) string {
-	if m.n == 0 && m.path != volsPath {
+	if m.n == 0 && m.path != volsPath && m.path != favsView {
 		rows := m.emptyListRows(w, m.bodyRows())
 		if i >= len(rows) {
 			return strings.Repeat(" ", w)
@@ -404,9 +404,23 @@ func (m model) listRow(i, w int) string {
 	}
 	idx := m.top + i
 	if idx >= m.n {
+		if i == 0 && m.path == favsView {
+			// M167b: an empty pin list is not an empty folder — the note
+			// names the chord that fills it.
+			note := clipVis("  (no favorites — b pins the cursor's folder)", w)
+			return colDim + note + colReset +
+				strings.Repeat(" ", w-visLen(note))
+		}
 		return strings.Repeat(" ", w)
 	}
 	e := m.entries[idx]
+	// M167b: a pin whose directory is gone keeps its row but wears the
+	// missing word — dim ink, no dir slash, and Enter refuses it.
+	label := entryLabel(e)
+	missing := m.path == favsView && m.favMissing(e)
+	if missing {
+		label = e.NameString() + " (missing)"
+	}
 	// M155b (#2930): the two-cell gutter carries the cursor ('>') and the
 	// mark ('*') — ">*" is a marked selected row, " *" a marked row.
 	pre := "  "
@@ -419,13 +433,16 @@ func (m model) listRow(i, w int) string {
 		} else {
 			pre = "> "
 		}
-		label := clipVis(entryLabel(e), w-2)
+		label := clipVis(label, w-2)
 		return colSel + pre + label +
 			strings.Repeat(" ", w-2-visLen(label)) + colReset
 	}
-	vis := clipVis(pre+entryLabel(e), w)
+	vis := clipVis(pre+label, w)
 	style := colFile
-	if e.Dir() {
+	switch {
+	case missing:
+		style = colDim
+	case e.Dir():
 		style = colDir
 	}
 	return style + vis + strings.Repeat(" ", w-visLen(vis)) + colReset

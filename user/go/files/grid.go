@@ -344,6 +344,12 @@ func (m *model) gridRune(r rune) {
 		m.quit = true
 	case 'v':
 		m.showVolumes()
+	case 'f':
+		// M167b (#2992): the favorites pseudo-listing — its rows are all
+		// dirs, so the grid shows plain dir tiles for them.
+		m.showFavs()
+	case 'b':
+		m.toggleFav()
 	case 's':
 		m.cycleSort()
 	case 'r':
@@ -559,7 +565,7 @@ func mosaic(im *webrender.Image, out *[tileW * tileH]uint32) {
 // field padded to the pane width. An empty listing gets the shared
 // empty-state panel, the same presenter the list view uses.
 func (m model) gridPaneRow(i, w int) string {
-	if m.n == 0 && m.path != volsPath {
+	if m.n == 0 && m.path != volsPath && m.path != favsView {
 		rows := m.emptyListRows(w, m.bodyRows())
 		if i >= len(rows) {
 			return strings.Repeat(" ", w)

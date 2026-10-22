@@ -89,7 +89,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -202,6 +202,11 @@ os.makedirs(sub, exist_ok=True)
 inner = os.path.join(sub, "INNER.TXT")
 with open(inner, "w") as f:
     f.write("inner-file-preview\n")
+# M167b (#2992): the pin store — one live pin (FM) and one pin to a folder
+# that does not exist, so run 15's `f` leg reads favs n=2 missing=1 and
+# `b` on SUB publishes the third line.
+with open(os.path.join(share, "FILES.FAV"), "w") as f:
+    f.write("/host/FM\n/host/GONE\n")
 # M81b (#1762): the handler run 02 dispatches to, plus the two fixtures that
 # make the decision observable — an image the registry opens, and a sound file
 # that nothing on the system opens. GOVIEW.ELF is copied whole; a missing
@@ -1291,11 +1296,18 @@ vgate_assert 14 serial-contains 'gofiles OK'
 vgate_assert 14 serial-absent '[EXC] parking:'
 vgate_assert 14 serial-absent 'exited status=139'
 
-# --- M134b (#2760) run 15: the volumes root is the kernel mount table ---
+# --- M134b (#2760) + M167b (#2992) run 15: the mount table + pins -----
 # `v` enumerates sys_dir_list("/") — one row per mount: host, disk, usb,
 # usb1..usb4 — each row's reserved bytes carrying the live state, kind and
 # read-only flag. With no --data-disk and no MSC, every absent row names
 # `not_mounted`; entering the disk row and a usbN slot refuses by name.
+#
+# M167b leads the same boot with the favorites leg: the setup staged
+# FILES.FAV with one live pin (FM) and one pin to a folder that does not
+# exist (GONE). `f` lists the pins pseudo-listing (favs n=2 missing=1),
+# Enter opens the live pin's real listing, and `b` on its SUB row pins a
+# third path — the share-side share-equals then reads the published store
+# back byte-exact.
 vgate_file script-15.txt <<'EOFM'
 exec GOFILES.ELF /host/FM
 EOFM
@@ -1304,19 +1316,40 @@ vgate_file script2-15.txt <<'EOFM'
 echo rx-go-fileman-mounts-ok
 EOFM
 
-# v -> the mount-table root; j lands on the disk row (row 1) whose enter
-# refuses not_mounted; j,j reaches usb1 (row 3) — same named refusal; q out.
+# The store after `b` pins FM's SUB row: the two staged pins plus the new
+# one, in pin order, one absolute path per line.
+vgate_file fav15.expected <<'EOFM'
+/host/FM
+/host/GONE
+/host/FM/SUB
+EOFM
+
+# f -> the pins listing; return opens the live FM pin (FM/SUB is the
+# cursor's dir row); b pins it; v -> the mount-table root; j lands on the
+# disk row (row 1) whose enter refuses not_mounted; j,j reaches usb1
+# (row 3) — same named refusal; q out.
 vgate_run 15 -- \
     --screen '$RUN_DIR/fileman-screen-15' \
     --input --via-virtio \
     --script '$RUN_DIR/script-15.txt' \
-    --input-chords 'v,j,return,j,j,return,q' \
+    --input-chords 'f,return,b,v,j,return,j,j,return,q' \
     --input-chords-after 'gofiles: ready' \
     --script2 '$RUN_DIR/script2-15.txt' \
     --script2-after 'gofiles: close' \
     --script-expect 'rx-go-fileman-mounts-ok' --timeout 240
 
 vgate_assert 15 serial-contains 'exec: loaded GOFILES.ELF'
+# The M167b leg: the store read named two pins with nothing malformed, the
+# listing counted the gone one, Enter opened the live pin, and `b` added
+# the third — the share file proves the publish landed.
+vgate_assert 15 serial-contains 'gofiles: favs loaded n=2 bad=0'
+vgate_assert 15 serial-contains 'gofiles: cd (favorites)'
+vgate_assert 15 serial-contains 'gofiles: favs n=2 missing=1'
+vgate_assert 15 serial-contains 'gofiles: entry GONE missing'
+vgate_assert 15 serial-contains 'gofiles: fav /host/GONE missing'
+vgate_assert 15 serial-contains 'gofiles: cd /host/FM'
+vgate_assert 15 serial-contains 'gofiles: fav add /host/FM/SUB n=3'
+vgate_assert 15 share-equals FILES.FAV fav15.expected
 vgate_assert 15 serial-contains 'gofiles: cd /'
 vgate_assert 15 serial-contains 'gofiles: list / n=7'
 vgate_assert 15 serial-contains 'gofiles: entry host dir'

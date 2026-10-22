@@ -111,6 +111,19 @@ func (m *model) openQuickLook() {
 		}
 		m.openQL(ql)
 		return
+	case m.path == favsView:
+		// M167b: a pin row's card names the pin's real path — a gone pin
+		// says missing rather than claiming a directory.
+		ql.kind = qlCard
+		ql.typeName = "pin"
+		if m.sel < len(m.favs) {
+			ql.path = m.favs[m.sel]
+		}
+		if m.favMissing(e) {
+			ql.typeName = "pin · missing"
+		}
+		m.openQL(ql)
+		return
 	case e.Dir():
 		ql.kind = qlCard
 		ql.typeName = "directory"

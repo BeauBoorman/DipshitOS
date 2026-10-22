@@ -175,6 +175,11 @@ type model struct {
 	// hit set and its accounting.
 	search search
 
+	// M167b (#2992): pinned places (favs.go). The pin list in the user's
+	// order — the favsView pseudo-listing is never sorted, so row i IS
+	// favs[i] — and the FILES.FAV store keeps the same order.
+	favs []string
+
 	// M167a (#2989): the `t` thumbnail grid (grid.go). viewUnder is the
 	// pane view `t` returns to; gridTiles is the 64-tile cache keyed by
 	// path+size+mtime (cell colours only, gridOrder its FIFO eviction);
@@ -213,6 +218,7 @@ func newModel(path string, cols, rows int) model {
 			m.emit(markerTrashExpired + vi.Itoa64(int64(expired)))
 		}
 	}
+	m.loadFavs()
 	m.refresh()
 	return m
 }
@@ -325,6 +331,10 @@ func (m *model) ensureSelVisible() {
 func (m *model) refresh() {
 	if m.path == volsPath {
 		m.refreshVolumes()
+		return
+	}
+	if m.path == favsView {
+		m.refreshFavs()
 		return
 	}
 	n, rc := vi.DirList(m.path, m.entries[:])
@@ -464,6 +474,21 @@ func (m *model) loadPreview() {
 		}
 		return
 	}
+	if m.path == favsView {
+		// M167b: a pin row previews what it points at — the live path,
+		// or the gone pin's honest missing note.
+		m.previewOf = name
+		pin := ""
+		if m.sel < len(m.favs) {
+			pin = m.favs[m.sel]
+		}
+		if m.favMissing(e) {
+			m.preview = "pin — missing\n" + pin + "\n(the folder is gone; b unpins it)"
+		} else {
+			m.preview = "pinned folder\n" + pin + "\n(enter to open · b unpins)"
+		}
+		return
+	}
 	if e.Dir() {
 		m.previewOf = name
 		m.preview = "(directory — enter to open)"
@@ -503,8 +528,11 @@ func (m *model) loadPreview() {
 // adopts it), so a second change landing inside that window is reported on
 // the NEXT poll — the feed is advisory, never a lossless log.
 func (m *model) watchStep() int {
-	if m.path == volsPath {
-		return -1 // the mount-table root has no feed — the mount set is boot-fixed
+	if m.path == volsPath || m.path == favsView {
+		// The mount-table root has no feed (the mount set is boot-fixed)
+		// and the favorites rows are pins, not a directory — neither is
+		// a listing the feed can report on.
+		return -1
 	}
 	first := !m.watchArmed
 	m.watchArmed = true
@@ -581,6 +609,10 @@ func (m *model) openSel() {
 		m.enterVolume(e)
 		return
 	}
+	if m.path == favsView {
+		m.enterFav(e)
+		return
+	}
 	if e.Dir() {
 		child, ok := joinPath(m.path, e.NameString())
 		if !ok {
@@ -624,6 +656,15 @@ func (m *model) enterVolume(e vi.DirEntry) {
 func (m *model) goUp() {
 	if m.path == volsPath {
 		m.status = "at volumes root"
+		return
+	}
+	if m.path == favsView {
+		// Above the pseudo-listing is the share root — the pins
+		// themselves live beside it.
+		m.path = rootPath
+		m.sel = 0
+		m.emit(markerCd + m.path)
+		m.refresh()
 		return
 	}
 	if isMountRoot(m.path) {
@@ -939,6 +980,12 @@ func (m *model) handleKey(ev keys.Event) {
 			m.quit = true
 		case 'v':
 			m.showVolumes()
+		case 'f':
+			// M167b (#2992): the favorites pseudo-listing.
+			m.showFavs()
+		case 'b':
+			// M167b: pin the cursor's directory / unpin it.
+			m.toggleFav()
 		case 's':
 			m.cycleSort()
 		case 'r':
@@ -1093,7 +1140,7 @@ func (m *model) cycleSort() {
 	if e, ok := m.selEntry(); ok {
 		selName = e.NameString()
 	}
-	if m.path != volsPath {
+	if m.path != volsPath && m.path != favsView {
 		sortEntries(m.entries[:], m.n, m.sort)
 	}
 	m.sel = 0
@@ -1114,21 +1161,26 @@ func (m *model) cycleSort() {
 	m.loadPreview()
 }
 
-// atVolumes guards the mutating ops: the volumes root is the mount table,
-// so there is nothing to rename, trash, hold or write into — each op names
-// that rather than sending the kernel a path it could never honor.
-func (m *model) atVolumes() bool {
-	if m.path == volsPath {
+// atPseudo guards the mutating ops on the pseudo-listings: the volumes
+// root is the mount table and the favorites rows are pins, so there is
+// nothing to rename, trash, hold or write into — each op names the
+// surface rather than sending the kernel a path it could never honor.
+func (m *model) atPseudo() bool {
+	switch m.path {
+	case volsPath:
 		m.status = "volumes: browse only"
-		return true
+	case favsView:
+		m.status = "favorites: browse only"
+	default:
+		return false
 	}
-	return false
+	return true
 }
 
 // startRename opens the prompt with an EMPTY buffer: the typeable name is
 // the new name (the gate types `newname.txt` one chord at a time).
 func (m *model) startRename() {
-	if m.atVolumes() {
+	if m.atPseudo() {
 		return
 	}
 	if _, ok := m.selEntry(); !ok {
@@ -1320,7 +1372,7 @@ func (m *model) replaceRename() {
 // refused honestly (ADR 0007 has no rmdir slot, so EASY delete would fail
 // anyway) — the set cannot contain one because marks refuse them first.
 func (m *model) startDelete() {
-	if m.atVolumes() {
+	if m.atPseudo() {
 		return
 	}
 	if set := m.markedSet(); len(set) > 0 {
@@ -1434,7 +1486,7 @@ func (m *model) restoreLatest() {
 // did. A copy also publishes the sources' URIs on the machine clipboard
 // (one file:// line each); a cut publishes nothing.
 func (m *model) yankClip(cut bool) {
-	if m.atVolumes() {
+	if m.atPseudo() {
 		return
 	}
 	verb := "copy"
@@ -1501,7 +1553,7 @@ func (m *model) pasteClip() {
 		m.status = "paste: nothing held"
 		return
 	}
-	if m.atVolumes() {
+	if m.atPseudo() {
 		return
 	}
 	if len(m.clipSet) > 1 {
