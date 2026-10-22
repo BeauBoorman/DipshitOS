@@ -89,7 +89,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1421,7 +1421,26 @@ with open(os.path.join(fmq, "LOOK.QOI"), "wb") as f:
 with open(os.path.join(fmq, "WORDS.TXT"), "w") as f:
     for i in range(1, 46):
         f.write("quicklook-line-%02d\n" % i)
-print("staged FMQ: LOOK.QOI 16x16 quadrants, WORDS.TXT 45 lines")
+# M167c (#2993): SAMPLE.TAR rides the same boot — a ustar archive (a text
+# file, the same QOI image, one empty subdirectory) built with Python's
+# tarfile, so the run-17 leg can Enter it, QuickLook a member, hit the
+# read-only refusal, and leave. entries=3: DEEP/, INNER.TXT, PIC.QOI.
+import tarfile, io
+tf = tarfile.open(os.path.join(fmq, "SAMPLE.TAR"), "w",
+                  format=tarfile.USTAR_FORMAT)
+def tarent(name, data):
+    ti = tarfile.TarInfo(name)
+    ti.size = len(data)
+    ti.mtime = 1700000000
+    tf.addfile(ti, io.BytesIO(data))
+td = tarfile.TarInfo("DEEP")
+td.type = tarfile.DIRTYPE
+td.mtime = 1700000000
+tf.addfile(td)
+tarent("INNER.TXT", b"tar-inner-alpha\ntar-inner-beta\ntar-inner-gamma\n")
+tarent("PIC.QOI", bytes(qoi))
+tf.close()
+print("staged FMQ: LOOK.QOI 16x16 quadrants, WORDS.TXT 45 lines, SAMPLE.TAR")
 PY
 
 # Run 16: space on the image (sel=0) opens the sixel arm; escape closes.
@@ -1448,8 +1467,9 @@ vgate_run 16 -- \
     --script-expect 'gofiles OK' --timeout 240
 
 vgate_assert 16 serial-contains 'exec: loaded GOFILES.ELF'
-vgate_assert 16 serial-contains 'gofiles: list /host/FMQ n=2'
+vgate_assert 16 serial-contains 'gofiles: list /host/FMQ n=3'
 vgate_assert 16 serial-contains 'gofiles: entry LOOK.QOI file'
+vgate_assert 16 serial-contains 'gofiles: entry SAMPLE.TAR file'
 vgate_assert 16 serial-contains 'gofiles: entry WORDS.TXT file'
 # The DECISION marker names the arm and the decoded dims the pane scaled.
 vgate_assert 16 serial-contains 'gofiles: quicklook LOOK.QOI kind=image 16x16 thumb=64x64'
@@ -1582,28 +1602,50 @@ assert blue >= 1000, "sixel bottom-left quadrant ink absent from the pane"
 assert yellow >= 1000, "sixel bottom-right quadrant ink absent from the pane"
 PY
 
-# Run 17: j lands on WORDS.TXT, space opens the 40-line text arm, the
-# second space closes it — Esc's sibling binding. Same `gofiles OK`
-# teardown barrier as run 16 (the echo raced the app's exit markers).
+# Run 17: j j lands on WORDS.TXT (SAMPLE.TAR sorts between LOOK.QOI and
+# it), space opens the 40-line text arm, the second space closes it —
+# Esc's sibling binding. Same `gofiles OK` teardown barrier as run 16
+# (the echo raced the app's exit markers).
+#
+# M167c (#2993) extends the same boot: k steps back onto SAMPLE.TAR,
+# Enter scans it into a read-only virtual directory (entries=3), j +
+# space QuickLooks the text member through the same pane, d reads the
+# read-only refusal, and h at the archive root hands FMQ back — the
+# `cd /host/FMQ` marker is the closing script's anchor.
 vgate_run 17 -- \
     --screen '$RUN_DIR/fileman-quicklook-text' \
     --input --via-virtio \
     --script '$RUN_DIR/script-17.txt' \
-    --input-chords 'j,space,space' \
+    --input-chords 'j,j,space,space,k,return,j,space,space,d,h' \
     --input-chords-after 'gofiles: ready' \
     --screenshot-after 'gofiles: quicklook WORDS.TXT kind=text' \
     --script2 '$RUN_DIR/script2-17.txt' \
-    --script2-after 'gofiles: quicklook close' \
+    --script2-after 'gofiles: cd /host/FMQ' \
     --script-expect 'gofiles OK' --timeout 240
 
 vgate_assert 17 serial-contains 'exec: loaded GOFILES.ELF'
-vgate_assert 17 serial-contains 'gofiles: list /host/FMQ n=2'
+vgate_assert 17 serial-contains 'gofiles: list /host/FMQ n=3'
+vgate_assert 17 serial-contains 'gofiles: entry SAMPLE.TAR file'
 # The j really landed on the text file (the list preview re-read it).
 vgate_assert 17 serial-contains 'gofiles: view WORDS.TXT bytes='
 # 45 seeded lines cap at the pane's 40 — the count IS the bound's proof.
 vgate_assert 17 serial-contains 'gofiles: quicklook WORDS.TXT kind=text lines=40'
-# The second space closed the pane; the window then tore down.
+# The second space closed the pane.
 vgate_assert 17 serial-contains 'gofiles: quicklook close'
+
+# M167c: the archive browsed in place — open receipt with the member
+# count and stream bytes, the virtual listing's rows, a member QuickLook
+# through the same text arm, the read-only refusal on d, and the h-leave
+# back onto the real listing.
+vgate_assert 17 serial-contains 'gofiles: tar open SAMPLE.TAR entries=3'
+vgate_assert 17 serial-contains 'gofiles: list /host/FMQ/SAMPLE.TAR/ n=3'
+vgate_assert 17 serial-contains 'gofiles: entry DEEP dir'
+vgate_assert 17 serial-contains 'gofiles: entry INNER.TXT file'
+vgate_assert 17 serial-contains 'gofiles: quicklook INNER.TXT kind=text'
+vgate_assert 17 serial-contains 'gofiles: tar read-only delete'
+vgate_assert 17 serial-contains 'gofiles: tar close SAMPLE.TAR'
+vgate_assert 17 serial-contains 'gofiles: cd /host/FMQ'
+
 vgate_assert 17 serial-contains 'gofiles: close'
 vgate_assert 17 serial-contains 'gofiles OK'
 vgate_assert 17 serial-contains 'rx-go-fileman-quicklook-text-ok'

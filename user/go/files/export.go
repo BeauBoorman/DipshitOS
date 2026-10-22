@@ -19,6 +19,11 @@ var exportFn = func(path string) (string, string) {
 // volume rows are refused by name; every refusal the stage returns is a
 // lane-vocabulary word carried into the marker and the status line.
 func (m *model) exportSel() {
+	if m.tar != nil {
+		// M167c: export is extraction — the card scopes it out.
+		m.tarReadOnly("export")
+		return
+	}
 	e, ok := m.selEntry()
 	if !ok {
 		return

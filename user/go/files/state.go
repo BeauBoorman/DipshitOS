@@ -6,6 +6,8 @@
 package main
 
 import (
+	"strings"
+
 	"virelai/appkit"
 	"virelai/chords"
 	"virelai/mime"
@@ -180,6 +182,16 @@ type model struct {
 	// favs[i] — and the FILES.FAV store keeps the same order.
 	favs []string
 
+	// M167c (#2993): the open archive (tar.go) — non-nil while the
+	// listing is a tar's read-only virtual directory. tarSub is the
+	// browsed dir inside it ("" = the archive root, "DEEP/" a member
+	// dir); tarRows maps the sorted row index back to tar.ents, and each
+	// row's Reserved[0] byte carries its class (file/dir/link/
+	// unsupported/refused).
+	tar     *tarArc
+	tarSub  string
+	tarRows []int
+
 	// M167a (#2989): the `t` thumbnail grid (grid.go). viewUnder is the
 	// pane view `t` returns to; gridTiles is the 64-tile cache keyed by
 	// path+size+mtime (cell colours only, gridOrder its FIFO eviction);
@@ -337,6 +349,10 @@ func (m *model) refresh() {
 		m.refreshFavs()
 		return
 	}
+	if m.tar != nil {
+		m.refreshTar()
+		return
+	}
 	n, rc := vi.DirList(m.path, m.entries[:])
 	if rc < 0 {
 		m.n, m.sel = 0, 0
@@ -489,6 +505,10 @@ func (m *model) loadPreview() {
 		}
 		return
 	}
+	if m.tar != nil {
+		m.tarPreview(e, name)
+		return
+	}
 	if e.Dir() {
 		m.previewOf = name
 		m.preview = "(directory — enter to open)"
@@ -528,7 +548,7 @@ func (m *model) loadPreview() {
 // adopts it), so a second change landing inside that window is reported on
 // the NEXT poll — the feed is advisory, never a lossless log.
 func (m *model) watchStep() int {
-	if m.path == volsPath || m.path == favsView {
+	if m.path == volsPath || m.path == favsView || m.tar != nil {
 		// The mount-table root has no feed (the mount set is boot-fixed)
 		// and the favorites rows are pins, not a directory — neither is
 		// a listing the feed can report on.
@@ -613,6 +633,10 @@ func (m *model) openSel() {
 		m.enterFav(e)
 		return
 	}
+	if m.tar != nil {
+		m.openTarRow(e)
+		return
+	}
 	if e.Dir() {
 		child, ok := joinPath(m.path, e.NameString())
 		if !ok {
@@ -623,6 +647,12 @@ func (m *model) openSel() {
 		m.sel = 0
 		m.emit(markerCd + m.path)
 		m.refresh()
+		return
+	}
+	// M167c (#2993): a recognised archive browses in place instead of
+	// dispatching to a handler — the mime registry has no tar row.
+	if isTarName(e.NameString()) {
+		m.enterTar(e)
 		return
 	}
 	m.openFile()
@@ -654,6 +684,33 @@ func (m *model) enterVolume(e vi.DirEntry) {
 
 // goUp walks to the parent directory.
 func (m *model) goUp() {
+	if m.tar != nil {
+		if m.tarSub == "" {
+			// At the archive root `h` leaves: the real directory the
+			// browser entered from replaces the virtual listing.
+			dir := m.tar.dir
+			m.emit(markerTarClose + m.tar.name)
+			m.tar = nil
+			m.tarSub = ""
+			m.tarRows = nil
+			m.path = dir
+			m.sel = 0
+			m.emit(markerCd + m.path)
+			m.refresh()
+			return
+		}
+		sub := strings.TrimSuffix(m.tarSub, "/")
+		if i := strings.LastIndexByte(sub, '/'); i >= 0 {
+			m.tarSub = sub[:i+1]
+		} else {
+			m.tarSub = ""
+		}
+		m.path = m.tar.path + "/" + m.tarSub
+		m.sel = 0
+		m.emit(markerCd + m.path)
+		m.refresh()
+		return
+	}
 	if m.path == volsPath {
 		m.status = "at volumes root"
 		return
@@ -1085,6 +1142,9 @@ func (m *model) showVolumes() {
 	if m.path == volsPath {
 		return
 	}
+	m.tar = nil
+	m.tarSub = ""
+	m.tarRows = nil
 	m.path = volsPath
 	m.sel = 0
 	m.emit(markerCd + m.path)
@@ -1180,6 +1240,10 @@ func (m *model) atPseudo() bool {
 // startRename opens the prompt with an EMPTY buffer: the typeable name is
 // the new name (the gate types `newname.txt` one chord at a time).
 func (m *model) startRename() {
+	if m.tar != nil {
+		m.tarReadOnly("rename")
+		return
+	}
 	if m.atPseudo() {
 		return
 	}
@@ -1372,6 +1436,10 @@ func (m *model) replaceRename() {
 // refused honestly (ADR 0007 has no rmdir slot, so EASY delete would fail
 // anyway) — the set cannot contain one because marks refuse them first.
 func (m *model) startDelete() {
+	if m.tar != nil {
+		m.tarReadOnly("delete")
+		return
+	}
 	if m.atPseudo() {
 		return
 	}
@@ -1486,6 +1554,14 @@ func (m *model) restoreLatest() {
 // did. A copy also publishes the sources' URIs on the machine clipboard
 // (one file:// line each); a cut publishes nothing.
 func (m *model) yankClip(cut bool) {
+	if m.tar != nil {
+		op := "copy"
+		if cut {
+			op = "cut"
+		}
+		m.tarReadOnly(op)
+		return
+	}
 	if m.atPseudo() {
 		return
 	}
@@ -1548,6 +1624,10 @@ func (m *model) yankClip(cut bool) {
 // is refused — a paste never overwrites. A queued SET (M155b #2930)
 // hands off to the batch planner, which steps the items one per frame.
 func (m *model) pasteClip() {
+	if m.tar != nil {
+		m.tarReadOnly("paste")
+		return
+	}
 	if len(m.clipSet) == 0 {
 		m.emit(markerPasteNo + "empty clip")
 		m.status = "paste: nothing held"

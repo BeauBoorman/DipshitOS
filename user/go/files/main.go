@@ -399,7 +399,7 @@ func main() {
 		// seat. Only on a CHANGE: a re-declare of the current path is
 		// deduped seat-side anyway, and a marker per repaint would claim
 		// navigations that never happened.
-		if m.path != declared {
+		if m.path != declared && m.tar == nil {
 			ta.DeclareNav(m.path)
 			vi.ConsoleLine(markerNavDeclare + m.path)
 			declared = m.path
@@ -479,6 +479,9 @@ func navGoto(m *model, path string) bool {
 	if path == "" || path == m.path {
 		return false
 	}
+	m.tar = nil // M167c: a seat hand-off always names a real directory
+	m.tarSub = ""
+	m.tarRows = nil
 	m.path = path
 	m.sel = 0
 	m.emit(markerCd + m.path)

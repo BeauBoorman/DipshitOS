@@ -421,6 +421,23 @@ func (m model) listRow(i, w int) string {
 	if missing {
 		label = e.NameString() + " (missing)"
 	}
+	// M167c: archive rows name their class — a symlink spells its
+	// (unfollowed) target, refused and unsupported rows say so.
+	tarDim := false
+	if m.tar != nil && idx < len(m.tarRows) {
+		if ent, ok := m.tarEntAt(idx); ok {
+			switch e.Reserved[0] {
+			case tarClsLink:
+				label = e.NameString() + " -> " + ent.link
+			case tarClsRefused:
+				label = e.NameString() + " (refused)"
+				tarDim = true
+			case tarClsOther:
+				label = e.NameString() + " (unsupported)"
+				tarDim = true
+			}
+		}
+	}
 	// M155b (#2930): the two-cell gutter carries the cursor ('>') and the
 	// mark ('*') — ">*" is a marked selected row, " *" a marked row.
 	pre := "  "
@@ -440,7 +457,7 @@ func (m model) listRow(i, w int) string {
 	vis := clipVis(pre+label, w)
 	style := colFile
 	switch {
-	case missing:
+	case missing, tarDim:
 		style = colDim
 	case e.Dir():
 		style = colDir

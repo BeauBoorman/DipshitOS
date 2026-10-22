@@ -290,6 +290,12 @@ func (m *model) gridTileAt(i int) *gridTile {
 // (the tile columns and rows the frame holds) and arms the focus decode;
 // the tile queue drains on the loop's lazy passes.
 func (m *model) toggleGrid() {
+	if m.tar != nil {
+		// M167c: tiles key on real path+size+mtime — archive rows carry
+		// none of those.
+		m.tarReadOnly("grid")
+		return
+	}
 	if m.view == viewGrid {
 		m.view = m.viewUnder
 		m.gridFName = "" // re-entry re-emits the focus marker

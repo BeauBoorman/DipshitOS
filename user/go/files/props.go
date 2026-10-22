@@ -59,19 +59,50 @@ func (m *model) openProps() {
 		p.kind = "volume"
 	case m.path == favsView:
 		p.kind = "pin"
+	case m.tar != nil:
+		// M167c: the card answers off the member header — class, size,
+		// the header's own mtime, a sniff of the streamed head. No stat
+		// wire exists for a path inside an archive.
+		p.kind = "file"
+		if ent, ok := m.tarEntAt(m.sel); ok {
+			p.size = ent.size
+			if ent.mt > 0 {
+				p.mtOK = true
+				p.mtSec = ent.mt
+			}
+			switch e.Reserved[0] {
+			case tarClsDir:
+				p.kind = "directory"
+			case tarClsLink:
+				p.kind = "symlink"
+			case tarClsRefused:
+				p.kind = "refused"
+			case tarClsOther:
+				p.kind = "unsupported"
+			default:
+				head, rc := m.tar.readEnt(ent, propsHeadBytes)
+				if rc < 0 {
+					head = nil
+				}
+				p.mimeID = mime.Sniff(p.name, head).String()
+			}
+		}
 	case e.Dir():
 		p.kind = "directory"
 	default:
 		p.kind = "file"
 	}
 	var path string
-	if m.path == favsView {
+	switch {
+	case m.path == favsView:
 		// M167b: the row's path IS the pin — the card answers for the
 		// real directory the pin names (a gone one stats nothing).
 		if m.sel < len(m.favs) {
 			path = m.favs[m.sel]
 		}
-	} else {
+	case m.tar != nil:
+		path = m.path + p.name
+	default:
 		var ok bool
 		path, ok = joinPath(m.path, p.name)
 		if !ok {
@@ -90,7 +121,7 @@ func (m *model) openProps() {
 		}
 		p.volOK = true
 	} else {
-		if p.kind == "file" {
+		if p.kind == "file" && m.tar == nil {
 			data, rc := readHead(path, propsHeadBytes)
 			var head []byte
 			if rc >= 0 {

@@ -119,6 +119,12 @@ func containsFold(line, pat []byte) bool {
 // mount table, not a tree — the refusal names it rather than listing
 // rows as files.
 func (m *model) startSearch() {
+	if m.tar != nil {
+		// M167c: the walk is share paths only — inside an archive the
+		// rows are members, not files it can open.
+		m.tarReadOnly("search")
+		return
+	}
 	if m.path == volsPath {
 		m.emit(markerSearchNo + "root")
 		m.status = "search: volumes are browse-only"

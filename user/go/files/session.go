@@ -68,6 +68,11 @@ func (m model) encodeState() []byte {
 		// taken on the pins resumes at the share root, not a refused blob.
 		path = rootPath
 	}
+	if m.tar != nil {
+		// M167c: a virtual dir is not a resumable cwd either — the
+		// snapshot resumes at the directory the archive was entered from.
+		path = m.tar.dir
+	}
 	out := make([]byte, 0, 3+len(path)+stateTail)
 	out = append(out, stateFmtVer, byte(len(path)), byte(len(path)>>8))
 	out = append(out, path...)

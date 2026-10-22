@@ -127,6 +127,10 @@ func (m *model) openFile() {
 // startOpenWith arms the candidate list for the selection. Zero candidates is
 // the same refusal openFile gives, said once and in the same words.
 func (m *model) startOpenWith() {
+	if m.tar != nil {
+		m.tarReadOnly("open-with")
+		return
+	}
 	name, path, ok := m.openSelPath()
 	if !ok || path == "" {
 		m.status = "open with: path too long"

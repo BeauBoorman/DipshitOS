@@ -130,6 +130,10 @@ func (m model) favMissing(e vi.DirEntry) bool {
 // selected pin — the toggle reads the same there — and on the volumes
 // root it refuses by name: a mount table is browse-only, not a place.
 func (m *model) toggleFav() {
+	if m.tar != nil {
+		m.tarReadOnly("pin")
+		return
+	}
 	switch m.path {
 	case volsPath:
 		m.emit(markerFavNo + volsPath + " volumes")
@@ -196,6 +200,9 @@ func (m *model) showFavs() {
 		m.refresh()
 		return
 	}
+	m.tar = nil
+	m.tarSub = ""
+	m.tarRows = nil
 	m.path = favsView
 	m.sel = 0
 	m.emit(markerCd + favsView)

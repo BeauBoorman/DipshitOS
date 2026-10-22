@@ -27,6 +27,9 @@ func (m *model) dragOffer() (mt string, blob []byte, ok bool) {
 	name := e.NameString()
 	m.dragName = name
 	switch {
+	case m.tar != nil:
+		m.emit(markerDragNo + name + " tar")
+		m.status = "drag: archive rows do not carry"
 	case m.path == volsPath:
 		m.emit(markerDragNo + name + " volume")
 		m.status = "drag: volume rows do not carry"

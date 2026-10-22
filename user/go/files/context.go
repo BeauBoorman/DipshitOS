@@ -71,6 +71,10 @@ func (m *model) openCtx(col, row int) {
 	if !ok {
 		return
 	}
+	if m.tar != nil {
+		m.tarReadOnly("menu")
+		return
+	}
 	m.mode = modeContext
 	m.ctx = ctxMenu{name: e.NameString(), ax: col, ay: row}
 	switch {

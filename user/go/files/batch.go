@@ -115,6 +115,10 @@ func (m *model) isMarked(name string) bool {
 // there: the old directory's marks are dropped, because a mark the
 // gutter cannot show is a mark the user cannot see.
 func (m *model) toggleMark() {
+	if m.tar != nil {
+		m.tarReadOnly("mark")
+		return
+	}
 	if m.atPseudo() {
 		return
 	}

@@ -254,4 +254,17 @@ const (
 	// The view/sort chords' own markers.
 	markerViewMode = "gofiles: viewmode "
 	markerSort     = "gofiles: sort "
+
+	// M167c (#2993): the read-only tar browser. `tar open <name>
+	// entries=<n> bytes=<b>` is the scan's receipt — entries the member
+	// count, bytes the stream consumed; `tar refused <name> <reason>`
+	// names the bound or parse failure that refused the open (stream,
+	// entries, checksum, truncated, malformed, read, compressed,
+	// inflated, gzip); `tar read-only <op>` is the refusal every
+	// mutating or unanswerable op gives inside the archive; `tar close
+	// <name>` is `h` at the archive root handing the listing back.
+	markerTarOpen  = "gofiles: tar open "
+	markerTarNo    = "gofiles: tar refused "
+	markerTarRO    = "gofiles: tar read-only "
+	markerTarClose = "gofiles: tar close "
 )

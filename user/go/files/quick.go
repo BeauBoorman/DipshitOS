@@ -124,6 +124,12 @@ func (m *model) openQuickLook() {
 		}
 		m.openQL(ql)
 		return
+	case m.tar != nil:
+		// M167c: the member's own bytes and header mtime arm the same
+		// panes — the pane never learns the path was virtual.
+		m.qlTar(&ql, e)
+		m.openQL(ql)
+		return
 	case e.Dir():
 		ql.kind = qlCard
 		ql.typeName = "directory"
