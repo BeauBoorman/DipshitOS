@@ -213,7 +213,7 @@ func GrantRows() ([]GrantRow, int64) {
 // for an op-2 buffer is 8 + this. GrantDenialsBuf drains the whole
 // 32-entry ring in one call.
 const (
-	GrantReceiptMax = 176
+	GrantReceiptMax = 192
 	GrantDenialsBuf = 8 + 32*GrantReceiptMax
 )
 

@@ -159,3 +159,24 @@ func TestFootLineNamesTheRealKeys(t *testing.T) {
 		t.Fatal("net foot line is empty")
 	}
 }
+
+// TestAgentFilterKeyCyclesOnlyOnTheAuditTab pins the `u` chord's scope
+// (M173c #3044): it cycles the audit view's principal filter on the
+// agent page and is inert on every other tab.
+func TestAgentFilterKeyCyclesOnlyOnTheAuditTab(t *testing.T) {
+	a := &app{ag: NewAgentView(), pg: pageAgent}
+	key := vi.Event{Kind: vi.EvKeyDown, Arg1: 'u'}
+	if !a.handleKey(key) || a.ag.FilterName() != "user" {
+		t.Fatalf("u on the agent tab: filter=%q", a.ag.FilterName())
+	}
+	if !a.handleKey(key) || a.ag.FilterName() != "agent" {
+		t.Fatalf("u again: filter=%q", a.ag.FilterName())
+	}
+	if !a.handleKey(key) || a.ag.FilterName() != "all" {
+		t.Fatalf("u third: filter=%q", a.ag.FilterName())
+	}
+	a.pg = pageProcs
+	if a.handleKey(key) {
+		t.Fatal("u must be inert off the audit tab")
+	}
+}

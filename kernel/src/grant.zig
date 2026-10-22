@@ -1362,14 +1362,18 @@ fn emit_fs_denial(pid: usize, verdict: FsVerdict) void {
 pub fn emit_denial(pid: usize, qname: []const u8, word: []const u8) void {
     var digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
     var name: []const u8 = "";
+    var uid: u32 = process.uid_system;
     if (process.grant_state(pid)) |gs| digest = gs.digest;
-    if (process.info(pid)) |pinfo| name = pinfo.name;
+    if (process.info(pid)) |pinfo| {
+        name = pinfo.name;
+        uid = pinfo.uid;
+    }
     var verdict_buf: [40]u8 = undefined;
     const vtext = std.fmt.bufPrint(&verdict_buf, "{s}:{s}_denied", .{
         if (enforceMode()) "refused" else "audit", qname,
     }) catch return;
     var line: [measure.receipt_max]u8 = undefined;
-    const n = measure.receipt_line(&line, .exec, &digest, vtext, name, word);
+    const n = measure.receipt_line(&line, .exec, &digest, vtext, name, word, uid);
     denial_record(line[0..n]);
     klog.line(line[0..n]);
 }

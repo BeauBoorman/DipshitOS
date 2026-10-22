@@ -15,14 +15,19 @@
 //!
 //! Receipt format (ADR 0054 D4), one line per measurement:
 //!
-//!     RCPT stage=<word> sha256=<64-hex> verdict=<word> [name=<image>] [word=<cap>]
+//!     RCPT stage=<word> sha256=<64-hex> verdict=<word> [name=<image>] [word=<cap>] uid=<n>
 //!
 //! stage ∈ loader | kernel | exec; sha256 is the digest of the convention
 //! the stage pins (Authenticode for loader, raw file for kernel/exec);
 //! verdict is `measured`, `refused:<name>` (a D3 named refusal), or
 //! `audit:<name>` (Part II's audit-mode would-be denial). `unmeasured` is
 //! emitted when a stage's handoff validity bit is clear — a stage that was
-//! not measured must never be reported as `measured`.
+//! not measured must never be reported as `measured`. `uid` is always the
+//! last field (M173c #3044, ADR 0052 amendment): the principal the receipt
+//! records — the spawn uid for exec lines, the denied process's uid on
+//! word/scope denials, `uid_system` on the boot chain. Parsers that read
+//! fields by key are unaffected; a key-positional parser was never the
+//! contract.
 //!
 //! No libc, no POSIX, no allocation.
 
@@ -182,14 +187,16 @@ pub fn hex_digest(out: []u8, digest: *const [digest_len]u8) usize {
 }
 
 /// Format one receipt line into `out`:
-/// `RCPT stage=<stage> sha256=<64-hex> verdict=<verdict>[ name=<name>][ word=<word>]\n`
+/// `RCPT stage=<stage> sha256=<64-hex> verdict=<verdict>[ name=<name>][ word=<word>] uid=<uid>\n`
 ///
 /// Returns the byte count written (the line is newline-terminated).
 /// `verdict` is the raw verdict word — `measured`, `unmeasured`, or a
 /// `refused:`/`audit:`-prefixed refusal name — so the formatter does not
-/// need to enumerate Part II's refusal names. `out` must be at least
-/// `receipt_max` bytes (the longest line the format can produce).
-pub const receipt_max: usize = 176;
+/// need to enumerate Part II's refusal names. `uid` is the acting
+/// principal (M173c): always the last field, always present. `out` must
+/// be at least `receipt_max` bytes (the longest line the format can
+/// produce).
+pub const receipt_max: usize = 192;
 
 pub fn receipt_line(
     out: []u8,
@@ -198,6 +205,7 @@ pub fn receipt_line(
     verdict: []const u8,
     name: ?[]const u8,
     word: ?[]const u8,
+    uid: u32,
 ) usize {
     var n: usize = 0;
     n += copy_into(out[n..], "RCPT stage=");
@@ -214,6 +222,10 @@ pub fn receipt_line(
         n += copy_into(out[n..], " word=");
         n += copy_into(out[n..], v);
     }
+    n += copy_into(out[n..], " uid=");
+    var num: [10]u8 = undefined;
+    const digits = std.fmt.bufPrint(&num, "{d}", .{uid}) catch unreachable;
+    n += copy_into(out[n..], digits);
     out[n] = '\n';
     return n + 1;
 }
@@ -277,9 +289,9 @@ test "measure: FIPS 180-4 one million 'a' (streaming)" {
 test "measure: receipt line is the D4 shape" {
     const digest = try hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     var buf: [receipt_max]u8 = undefined;
-    const n = receipt_line(&buf, .loader, &digest, "measured", null, null);
+    const n = receipt_line(&buf, .loader, &digest, "measured", null, null, 0);
     try std.testing.expectEqualStrings(
-        "RCPT stage=loader sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad verdict=measured\n",
+        "RCPT stage=loader sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad verdict=measured uid=0\n",
         buf[0..n],
     );
 }
@@ -287,9 +299,19 @@ test "measure: receipt line is the D4 shape" {
 test "measure: receipt line carries the Part II name/word extras" {
     const digest = try hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     var buf: [receipt_max]u8 = undefined;
-    const n = receipt_line(&buf, .exec, &digest, "audit:word_denied", "NETCAT.ELF", "net");
+    const n = receipt_line(&buf, .exec, &digest, "audit:word_denied", "NETCAT.ELF", "net", 2000);
     try std.testing.expectEqualStrings(
-        "RCPT stage=exec sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 verdict=audit:word_denied name=NETCAT.ELF word=net\n",
+        "RCPT stage=exec sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 verdict=audit:word_denied name=NETCAT.ELF word=net uid=2000\n",
+        buf[0..n],
+    );
+}
+
+test "measure: uid is the receipt's last field and the widest uid fits" {
+    const digest = try hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    var buf: [receipt_max]u8 = undefined;
+    const n = receipt_line(&buf, .exec, &digest, "measured", null, null, 4294967295);
+    try std.testing.expectEqualStrings(
+        "RCPT stage=exec sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 verdict=measured uid=4294967295\n",
         buf[0..n],
     );
 }

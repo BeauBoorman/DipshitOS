@@ -74,6 +74,8 @@ const (
 	markerExit       = "top: exiting 43"
 	markerRefreshErr = "top: procs err="
 	markerUsage      = "top: usage"
+	// M173c (#3044): the audit tab's principal filter cycles on `u`.
+	markerAgentFilter = "top: agent filter="
 
 	// M128d (#2608): the machine-identity line — one ctl `profile-info`
 	// session through slot 93 (the kernel holds the credential). Refusals
@@ -145,8 +147,8 @@ var (
 	natFoot        = widgets.Rect{X: 6, Y: 330, W: 500, H: 18}
 	// M128d (#2608): the machine-identity line sits under the hints —
 	// which .virelaivm this run is, the base it boots, rollback, snaps.
-	natProf        = widgets.Rect{X: 6, Y: 350, W: 500, H: 18}
-	natRowH        = 16
+	natProf = widgets.Rect{X: 6, Y: 350, W: 500, H: 18}
+	natRowH = 16
 )
 
 type app struct {
@@ -504,7 +506,7 @@ func (a *app) footLine() string {
 		return "n procs   r refresh   a auto   rx/s " + vi.Itoa64(int64(a.net.RXRate)) +
 			" B   tx/s " + vi.Itoa64(int64(a.net.TXRate)) + " B"
 	case pageAgent:
-		return "p procs   n net   c gpu   t trust   r refresh   a auto   v verified ! forged ? no-key x bad"
+		return "p procs   n net   c gpu   t trust   r refresh   a auto   u principal   v verified ! forged ? no-key x bad"
 	case pageGPU:
 		return "p procs   n net   g agent   t trust   r refresh   a auto"
 	case pageTrust:
@@ -799,6 +801,14 @@ func (a *app) handleKey(ev vi.Event) bool {
 		return a.setPage(pageProcs)
 	case 'g', 'G':
 		return a.setPage(pageAgent)
+	case 'u', 'U':
+		// The audit tab's principal filter (all → user → agent); inert
+		// everywhere else.
+		if a.pg == pageAgent {
+			vi.ConsoleLine(markerAgentFilter + a.ag.CycleFilter())
+			return true
+		}
+		return false
 	case 'c', 'C':
 		return a.setPage(pageGPU)
 	case 't', 'T':

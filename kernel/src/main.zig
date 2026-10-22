@@ -131,6 +131,7 @@ const scheduler = @import("scheduler.zig"); // claim 5275: tick-driven round-rob
 const userspace = @import("userspace.zig"); // claim 8215: first EL0t task + SVC boundary
 const syscall = @import("syscall.zig"); // claim 3594: fixed syscall ABI + runtime dispatch table
 const exec = @import("exec.zig"); // milestone-three card 6: ESP exec — owns the shared rebuild_user_root (claims 2665/3693)
+const process = @import("process.zig"); // M173c (#3044): the receipt uid vocabulary (uid_system on the boot chain)
 const virtio_custom = @import("virtio_custom.zig"); // claim 0828: custom-virtio spike driver (DID 0x1082)
 const gpu3d_device = @import("gpu3d_device.zig"); // M102b1 (issue #2162): experimental GPU3D channel (DID 0x1083)
 const virtio_file = @import("virtio_file.zig"); // M34 HF1+HF2 (issues #735/#736): host file channel client (queue 5)
@@ -725,8 +726,8 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // here; the share copy lands at the file-channel arming point below.
     var rcpt: [2 * measure.receipt_max]u8 = undefined;
     var rcpt_len: usize = 0;
-    rcpt_len += measure.receipt_line(rcpt[rcpt_len..], .loader, &handoff_rec.measured_loader, if (handoff_rec.measured_ok & 1 != 0) "measured" else "unmeasured", null, null);
-    rcpt_len += measure.receipt_line(rcpt[rcpt_len..], .kernel, &handoff_rec.measured_kernel, if (handoff_rec.measured_ok & 2 != 0) "measured" else "unmeasured", null, null);
+    rcpt_len += measure.receipt_line(rcpt[rcpt_len..], .loader, &handoff_rec.measured_loader, if (handoff_rec.measured_ok & 1 != 0) "measured" else "unmeasured", null, null, process.uid_system);
+    rcpt_len += measure.receipt_line(rcpt[rcpt_len..], .kernel, &handoff_rec.measured_kernel, if (handoff_rec.measured_ok & 2 != 0) "measured" else "unmeasured", null, null, process.uid_system);
     uart_puts(rcpt[0..rcpt_len]);
     // Claim 0013: after the first TX, record whether the TX path returned
     // (bytes may still be dropped by the device; the serial log is the gate,

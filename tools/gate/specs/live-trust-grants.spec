@@ -102,6 +102,9 @@ vgate_assert 01 serial-absent 'verdict=measured name=TCP.BIN'
 # receipts can interleave inside the app's banner, so the asserts use
 # the markers that survive it.)
 vgate_assert 01 serial-contains 'verdict=measured name=CONFINE.BIN'
+# M173c (#3044): the receipt names its principal — a monitor exec is
+# uid_user, so CONFINE.BIN's measured receipt must carry uid=1000.
+vgate_assert 01 serial-contains 'verdict=measured name=CONFINE.BIN uid=1000'
 vgate_assert 01 serial-contains 'audit:net_denied name=CONFINE.BIN word=net'
 vgate_assert 01 serial-contains 'audit:debug_denied name=CONFINE.BIN word=debug'
 vgate_assert 01 serial-contains 'tcp: connected'

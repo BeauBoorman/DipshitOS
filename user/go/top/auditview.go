@@ -5,9 +5,21 @@
 // row (its allowlist is AGENTD.ELF,GOTOP.ELF) so the view can mark each
 // receipt verified, forged-or-edited, or unverifiable — and a receipt the
 // MAC cannot back is shown as untrusted, never dropped silently.
+//
+// M173c (#3044) adds the kernel's half of the trail: the M161a
+// denial-receipt ring (slot 89 op 2, the same surface the trust tab
+// drains) renders below the lane rows, one row per receipt, with a
+// PRINCIPAL column read off the receipt's `uid=` field. Lane receipts
+// are the daemon's own trail — every one is the agent principal by
+// construction (uid_agent), so their column says "agent". The `u` key
+// cycles the principal filter all → user → agent, narrowing both
+// sections at once; a refused ring read renders "?", never an empty
+// list dressed as silence.
 package main
 
 import (
+	"strings"
+
 	"virelai/shlib"
 	"virelai/vi"
 )
@@ -27,6 +39,13 @@ const (
 	agentRowMax = 64
 	// agentKeyMax bounds the secret-row read.
 	agentKeyMax = 256
+	// krcptMax caps the kernel receipts drained per refresh — the ring's
+	// own bound, so the view can never hold more than it publishes.
+	krcptMax = 32
+	// uidAgent is the agent principal (ADR 0052 amendment, M173b #3041);
+	// vi carries UidSystem/UidUser but the agent constant is M173d's —
+	// duplicated here the way shlib duplicates uidSystem.
+	uidAgent = 2000
 )
 
 // Verification marks (the D4 verified/unverified contract):
@@ -39,33 +58,64 @@ const (
 
 // agentRow is one decoded receipt for display.
 type agentRow struct {
-	agent   string
-	verb    string
-	arg     string // the bounded summary: path, cmd, event or ""
-	result  string
-	ts      int64
-	mark    byte
-	seq     string // the seq text as written (display + sort)
+	agent     string
+	verb      string
+	arg       string // the bounded summary: path, cmd, event or ""
+	result    string
+	ts        int64
+	mark      byte
+	seq       string // the seq text as written (display + sort)
+	principal string // the column class — lane rows are "agent" by construction
+	display   string
+}
+
+// krcpt is one drained kernel receipt (the M161a ring's RCPT line,
+// M173c's `uid=` tail): the denial's verdict/word/name plus the uid of
+// the process the kernel receipted — parsed by key, so a pre-`uid=`
+// line decodes with class "?" rather than failing.
+type krcpt struct {
+	verdict string
+	name    string
+	word    string
+	uid     int64
+	hasUID  bool
+	class   string // "system" | "user" | "agent" | "uid<n>" | "?"
 	display string
 }
 
+// auditFilter is the `u`-key principal filter: all rows, only the
+// human's (uid_user) receipts, or only the agent's (uid_agent + the
+// lane's own trail).
+type auditFilter int
+
+const (
+	filtAll auditFilter = iota
+	filtUser
+	filtAgent
+)
+
 // AgentView is the agent-activity tab state.
 type AgentView struct {
-	key       []byte
-	hasKey    bool
-	rows      []agentRow
-	listed    bool // the lane directory answered
-	nVerif    int
-	nBad      int
-	refreshed bool
+	key           []byte
+	hasKey        bool
+	rows          []agentRow
+	krows         []krcpt
+	listed        bool // the lane directory answered
+	nVerif        int
+	nBad          int
+	denialsErr    int64  // the op-2 errno, 0 when the ring was served
+	denialDropped uint64 // receipts the ring evicted unread
+	filter        auditFilter
+	refreshed     bool
 }
 
 // Seams: the syscall-adjacent calls as package vars so host tests can
 // stage a lane without the kernel (the same discipline agentd uses).
 var (
-	agentListFn = vi.ListDirAt
-	agentReadFn = vi.ReadFileAll
-	agentKeyFn  = shlib.StoreGet
+	agentListFn    = vi.ListDirAt
+	agentReadFn    = vi.ReadFileAll
+	agentKeyFn     = shlib.StoreGet
+	agentDenialsFn = func(c uint64) ([]string, uint64, uint64, int64) { return vi.GrantDenials(c) }
 )
 
 // NewAgentView builds an empty view.
@@ -85,6 +135,27 @@ func (v *AgentView) Refresh() {
 	} else {
 		v.key = nil
 		v.hasKey = false
+	}
+	// The kernel's half drains independently of the lane — cursor 0
+	// re-reads the whole ring ("recent denials" is the ring's bound, not
+	// a growing ledger; the trust tab's drain keeps the same contract).
+	// A refused read is kept as denialsErr — the section says the
+	// surface is unreadable rather than painting an empty ring.
+	v.krows = v.krows[:0]
+	v.denialsErr = 0
+	v.denialDropped = 0
+	if dlines, _, dropped, drc := agentDenialsFn(0); drc < 0 {
+		v.denialsErr = drc
+	} else {
+		v.denialDropped = dropped
+		for _, l := range dlines {
+			if k, ok := parseKReceipt(l); ok {
+				v.krows = append(v.krows, k)
+			}
+			if len(v.krows) >= krcptMax {
+				break
+			}
+		}
 	}
 	items, err := agentListFn(agentCanon)
 	if err != nil {
@@ -126,7 +197,7 @@ func (v *AgentView) Refresh() {
 
 // readOne decodes one receipt file and verifies it.
 func (v *AgentView) readOne(name string) agentRow {
-	row := agentRow{agent: "?", verb: "?", result: "?", mark: markMalformed}
+	row := agentRow{agent: "?", verb: "?", result: "?", mark: markMalformed, principal: "agent"}
 	b, r := agentReadFn(agentHostDir+name, receiptMax+1)
 	if r < 0 || b == nil || len(b) > receiptMax {
 		row.result = "missing"
@@ -166,9 +237,17 @@ func (v *AgentView) readOne(name string) agentRow {
 
 // agentRowLabel renders one receipt row for the list (bounded; guest-safe).
 func agentRowLabel(r agentRow) string {
-	return padRight(clip(r.agent, 8), 9) + padRight(clip(r.verb, 13), 14) +
-		padRight(clip(r.arg, 18), 19) + padRight(clip(r.result, 17), 18) +
+	return padRight(clip(r.agent, 8), 9) + padRight(clip(r.principal, 9), 10) +
+		padRight(clip(r.verb, 13), 14) + padRight(clip(r.arg, 18), 19) +
+		padRight(clip(r.result, 17), 18) +
 		string(r.mark) + " " + clockText(r.ts)
+}
+
+// krcptLabel renders one kernel receipt row: principal, then the denial
+// fields the receipt carried.
+func krcptLabel(r krcpt) string {
+	return padRight(clip(r.class, 9), 10) + padRight(clip(r.verdict, 20), 21) +
+		padRight(clip(orDashT(r.name), 16), 17) + clip(orDashT(r.word), 10)
 }
 
 // clip bounds a display field.
@@ -195,22 +274,47 @@ func clockText(ts int64) string {
 	return two(s/3600) + ":" + two((s%3600)/60) + ":" + two(s%60)
 }
 
-// Lines is the tab's text, one entry per row.
+// Lines is the tab's text, one entry per row: the lane section, then
+// the kernel receipts — both narrowed by the principal filter.
 func (v *AgentView) Lines() []string {
-	if !v.refreshed || !v.listed {
-		return []string{"agent: no audit lane (/host/AGENT/AUDIT missing)"}
+	if !v.refreshed {
+		return []string{"agent: not sampled"}
 	}
-	out := []string{
-		"audit lane  receipts=" + vi.Itoa64(int64(len(v.rows))) +
-			"  verified=" + vi.Itoa64(int64(v.nVerif)) +
-			"  bad=" + vi.Itoa64(int64(v.nBad)) +
-			"  key=" + keyText(v.hasKey),
-		"",
-		padRight("AGENT", 9) + padRight("VERB", 14) + padRight("ARG", 19) +
-			padRight("RESULT", 18) + "V TIME",
+	var out []string
+	if !v.listed {
+		out = append(out, "agent: no audit lane (/host/AGENT/AUDIT missing)")
+	} else {
+		out = append(out,
+			"audit lane  receipts="+vi.Itoa64(int64(len(v.rows)))+
+				"  verified="+vi.Itoa64(int64(v.nVerif))+
+				"  bad="+vi.Itoa64(int64(v.nBad))+
+				"  key="+keyText(v.hasKey)+
+				"  filter="+v.filter.name(),
+			"",
+			padRight("AGENT", 9)+padRight("PRINCIPAL", 10)+padRight("VERB", 14)+
+				padRight("ARG", 19)+padRight("RESULT", 18)+"V TIME",
+		)
+		for _, r := range v.rows {
+			if v.filter.admits(r.principal) {
+				out = append(out, r.display)
+			}
+		}
 	}
-	for _, r := range v.rows {
-		out = append(out, r.display)
+	out = append(out, "", "kernel receipts (denial ring):")
+	if v.denialsErr != 0 {
+		out = append(out, "  refused: "+vi.ErrnoName(v.denialsErr))
+	} else {
+		out = append(out,
+			"  drained="+vi.Itoa64(int64(len(v.krows)))+
+				" dropped="+vi.Itoa64(int64(v.denialDropped)),
+			padRight("PRINCIPAL", 10)+padRight("VERDICT", 21)+
+				padRight("NAME", 17)+"WORD",
+		)
+		for _, r := range v.krows {
+			if v.filter.admits(r.class) {
+				out = append(out, r.display)
+			}
+		}
 	}
 	return out
 }
@@ -223,22 +327,150 @@ func keyText(ok bool) string {
 }
 
 // Marker is the serial line the gate asserts: the row count, the MAC
-// verdicts, and whether the key row was served at all.
+// verdicts, whether the key row was served at all, the kernel-receipt
+// drain ("?" when the ring refused), and the principal filter in force.
 func (v *AgentView) Marker() string {
+	kr := "?"
+	if v.denialsErr == 0 {
+		kr = vi.Itoa64(int64(len(v.krows)))
+	}
 	return "top: agent n=" + vi.Itoa64(int64(len(v.rows))) +
 		" verified=" + vi.Itoa64(int64(v.nVerif)) +
 		" bad=" + vi.Itoa64(int64(v.nBad)) +
-		" key=" + keyText(v.hasKey)
+		" key=" + keyText(v.hasKey) +
+		" krcpts=" + kr +
+		" filter=" + v.filter.name()
 }
 
-// RowMarker is one row's serial line (bounded callers cap the count).
+// RowMarker is one visible row's serial line (bounded callers cap the
+// count): filtered lane rows first, then the filtered kernel receipts —
+// so a narrowing filter narrows the marker dump too.
 func (v *AgentView) RowMarker(i int) (string, bool) {
-	if i < 0 || i >= len(v.rows) {
-		return "", false
+	n := 0
+	for _, r := range v.rows {
+		if !v.filter.admits(r.principal) {
+			continue
+		}
+		if n == i {
+			return "top: agent rcpt agent=" + r.agent + " verb=" + r.verb +
+				" result=" + r.result + " mark=" + string(r.mark), true
+		}
+		n++
 	}
-	r := v.rows[i]
-	return "top: agent rcpt agent=" + r.agent + " verb=" + r.verb +
-		" result=" + r.result + " mark=" + string(r.mark), true
+	for _, r := range v.krows {
+		if !v.filter.admits(r.class) {
+			continue
+		}
+		if n == i {
+			uid := "-"
+			if r.hasUID {
+				uid = vi.Itoa64(r.uid)
+			}
+			return "top: agent krcpt uid=" + uid + " class=" + r.class +
+				" verdict=" + r.verdict + " name=" + orDashT(r.name) +
+				" word=" + orDashT(r.word), true
+		}
+		n++
+	}
+	return "", false
+}
+
+// CycleFilter advances the `u` principal filter all → user → agent → all.
+func (v *AgentView) CycleFilter() string {
+	v.filter = (v.filter + 1) % 3
+	return v.filter.name()
+}
+
+// FilterName is the filter's current word (all | user | agent).
+func (v *AgentView) FilterName() string { return v.filter.name() }
+
+func (f auditFilter) name() string {
+	switch f {
+	case filtUser:
+		return "user"
+	case filtAgent:
+		return "agent"
+	}
+	return "all"
+}
+
+// admits reports whether a row of principal class `class` survives the
+// filter. "system" and unresolvable ("?"/"uid<n>") classes render under
+// "all" only — neither filter word claims them.
+func (f auditFilter) admits(class string) bool {
+	switch f {
+	case filtUser:
+		return class == "user"
+	case filtAgent:
+		return class == "agent"
+	}
+	return true
+}
+
+// uidClass maps a receipt's uid= to its principal class: the three
+// kernel principals get their words, anything else stays numeric, and
+// a receipt with no uid= at all reads "?".
+func uidClass(uid int64, ok bool) string {
+	if !ok {
+		return "?"
+	}
+	switch uid {
+	case int64(vi.UidSystem):
+		return "system"
+	case int64(vi.UidUser):
+		return "user"
+	case uidAgent:
+		return "agent"
+	}
+	return "uid" + vi.Itoa64(uid)
+}
+
+// parseKReceipt decodes one drained RCPT line by key — the same contract
+// the format promises (fields split on spaces, read by name); a line
+// with no verdict is not a receipt and is skipped, never half-shown.
+func parseKReceipt(line string) (krcpt, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "RCPT ") {
+		return krcpt{}, false
+	}
+	r := krcpt{}
+	for _, f := range strings.Fields(line[5:]) {
+		k, val, ok := strings.Cut(f, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "verdict":
+			r.verdict = val
+		case "name":
+			r.name = val
+		case "word":
+			r.word = val
+		case "uid":
+			r.uid = fieldNum(val)
+			r.hasUID = true
+		}
+	}
+	if r.verdict == "" {
+		return krcpt{}, false
+	}
+	r.class = uidClass(r.uid, r.hasUID)
+	r.display = krcptLabel(r)
+	return r, true
+}
+
+// fieldNum parses a bare decimal field (the receipt's uid=); a non-digit
+// byte ends the number, and an empty field is 0 — the display class then
+// answers for the value, not the parse.
+func fieldNum(s string) int64 {
+	var n int64
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			break
+		}
+		n = n*10 + int64(s[i]-'0')
+	}
+	return n
 }
 
 // receiptNameOK reports whether name is RCPT-<8hex>-<8hex> (the lane's

@@ -321,6 +321,9 @@ var pending_words: u32 = grant.ambient;
 var pending_digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
 var pending_measured_ok: bool = false;
 var pending_name: []const u8 = "";
+/// M173c (#3044): the spawn principal's uid — the receipt records as whom
+/// the image runs (or would have run, on a grant_stale refusal).
+var pending_uid: u32 = process.uid_user;
 
 /// Fixed BSS chunk for the measurement pass — the streamed gap path reads
 /// segment payloads straight into mapped pages and never holds the whole
@@ -351,7 +354,7 @@ fn measure_image(name: []const u8, size: u64, out: *[measure.digest_len]u8) bool
 /// "no measurement" in the record.
 fn emit_exec_receipt(verdict: []const u8) void {
     var line: [measure.receipt_max]u8 = undefined;
-    const n = measure.receipt_line(&line, .exec, &pending_digest, verdict, pending_name, null);
+    const n = measure.receipt_line(&line, .exec, &pending_digest, verdict, pending_name, null, pending_uid);
     klog.line(line[0..n]);
 }
 
@@ -372,8 +375,9 @@ fn note_exec_grant(proc_id: usize) void {
 /// The `measured` receipt is published at the success
 /// point (`note_exec_grant`) — the receipt records a measurement that
 /// ran, not one that merely parsed.
-fn apply_exec_grant(name: []const u8, size: u64) ExecResult {
+fn apply_exec_grant(name: []const u8, size: u64, uid: u32) ExecResult {
     pending_name = name;
+    pending_uid = uid;
     pending_words = grant.ambient;
     pending_digest = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
     pending_measured_ok = measure_image(name, size, &pending_digest);
@@ -586,7 +590,7 @@ fn exec_file_impl(name: []const u8, args: []const []const u8, pin: ?usize, princ
     // pins, over the same channel bytes the loader is about to read. A
     // named row whose hash is wrong refuses by name (`grant_stale`) and
     // never falls open; no row means the ambient set (M116b).
-    if (apply_exec_grant(name, st.size) == .grant_stale) return .grant_stale;
+    if (apply_exec_grant(name, st.size, principal.uid) == .grant_stale) return .grant_stale;
 
     // M70c-K (issue #1504): a file too big for the staging buffer is no
     // longer refused outright. `exec_program_max` is a bound of the STAGED
