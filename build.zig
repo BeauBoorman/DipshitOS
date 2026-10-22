@@ -2087,6 +2087,10 @@ pub fn build(b: *std.Build) void {
     const core_test_sources = [_][]const u8{
         "user/zig/runtime.zig",
         "boot/src/efi_time.zig",
+        // M172b (issue #3030, ADR 0023): kernel ChaCha20-Poly1305 AEAD and
+        // PBKDF2-HMAC-SHA256 — RFC 8439 §2.8.2 and published PBKDF2 KATs,
+        // tampered-tag refusal (class A).
+        "kernel/src/aead.zig",
         "kernel/src/alloc.zig",
         "kernel/src/app_timers.zig",
         "kernel/src/arp.zig",
@@ -2123,6 +2127,7 @@ pub fn build(b: *std.Build) void {
         // solicited-only learning, the RA acceptance walk, the tick-seam
         // DAD/RS drive (class A).
         "kernel/src/ipv6.zig",
+        "kernel/src/kdf.zig",
         "kernel/src/lineedit.zig",
         "kernel/src/machine.zig",
         "kernel/src/mailbox.zig",
