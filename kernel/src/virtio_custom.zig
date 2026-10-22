@@ -108,6 +108,7 @@ const pci = @import("pci.zig");
 const evidence = @import("evidence.zig");
 const virtio_gpu = @import("virtio_gpu.zig");
 const spinlock = @import("spinlock.zig"); // #990 (claim #997): the console tee's TX lock
+const klog = @import("klog.zig"); // snap completion receipt (run-03 serialization anchor)
 
 const VirtqDesc = extern struct {
     addr: u64,
@@ -1525,6 +1526,17 @@ pub fn build_snap_done(chunks: u16, total: u32, cksum: u16) [16]u8 {
     return m;
 }
 
+/// The post-stream serial receipt (live-term-depth run 03's coalescing
+/// fix): one line per COMPLETED stream, printed after the done message's
+/// OK. A `--snapshot-after` or `--input-chords-after` trigger anchored on
+/// it is outside every burst window by construction — the channel is idle
+/// again the moment this line exists (the guest's `snap_pending` is a
+/// bool, so two requests drained by one poll_input still coalesce; the
+/// receipt is how a gate keeps them apart).
+pub fn build_snap_marker(n: u32, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "cvspike: snap n={d}\n", .{n}) catch "cvspike: snap\n";
+}
+
 /// Submit one pre-built message (+ optional second scatter part) on the
 /// snapshot queue and verify the host's OK ack. Returns false loudly.
 fn snap_submit(parts: []const []const u8) bool {
@@ -1600,6 +1612,13 @@ pub fn service_snapshot() void {
         return;
     }
     snap_count += 1;
+    // Completion receipt for the class-B choreography: multi-snapshot
+    // gates anchor the NEXT request (or the input burst that leads to it)
+    // on this line so no two kind-4 requests are ever in flight together —
+    // run 03's snap-03-* coalescing flake. klog is a no-op pre-boot and in
+    // host tests, so the receipt costs nothing there.
+    var marker_buf: [32]u8 = undefined;
+    klog.line(build_snap_marker(snap_count, &marker_buf));
 }
 
 /// Test-hook recording (module-level BSS — nested functions cannot capture
@@ -2086,6 +2105,14 @@ test "virtio_custom: snapshot framing builders produce the documented wire shape
     // Chunk-count arithmetic for the real scanout: ceil(3686400 / 32768).
     const total: usize = virtio_gpu.fb_size;
     try std.testing.expectEqual(@as(usize, 113), (total + snap_chunk_len - 1) / snap_chunk_len);
+}
+
+test "virtio_custom: snap completion receipt shape (run-03 serialization anchor)" {
+    // The gate anchors the next request on `cvspike: snap n=N` — pin the
+    // exact line so a rename fails the class-A build, not a live gate.
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("cvspike: snap n=1\n", build_snap_marker(1, &buf));
+    try std.testing.expectEqualStrings("cvspike: snap n=113\n", build_snap_marker(113, &buf));
 }
 
 test "virtio_custom: kind-3 console control arms and disarms the tee (claim 0680)" {

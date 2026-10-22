@@ -306,8 +306,8 @@ PY
 # --- M80k (#1727): the terminal hygiene chords -------------------------------
 # Run 03 is a third boot of the SAME shim chain (no seat, so GOTERM's window
 # is the refused-declare 64,48 640x400 rect run 01 uses). FILL.SH scrolls the
-# 128-row grid until the ring genuinely holds history, then the three chords
-# are typed in order:
+# 128-row grid until the ring genuinely holds history, then the chords are
+# typed in order:
 #   ctrl-shift-k      clear the scrollback (ED 3) + snap the view to the tail
 #   ctrl-shift-r      soft reset — styles and modes, grid intact
 #   ctrl-shift-alt-r  full RIS — the grid goes too
@@ -325,27 +325,61 @@ tty
 echo fill-chords-done
 EOF
 
+# shot.txt is snap-03-0's anchor: `goterm: done status=0` prints when
+# FILL.SH's RunLine returns, but the fill's last rows can still sit in the
+# tty pump (pend>0) and the composite that puts them on the scanout lags
+# the marker (OBSERVED: snap-03-0 anchored on `done` shipped a
+# mid-repaint frame, ink=98 < 200). The monitor echo behind a 4 s settle
+# is the live-term `shot-term-pixels` pattern — by the time it prints,
+# the filled grid is provably on the scanout.
+vgate_file shot.txt <<'EOF'
+echo shot-03-filled
+EOF
+
+# The two chord batches are serialized through the stream receipts, which
+# is the whole point of `--input-chords2`:
+#   batch1 (K+R) waits on `cvspike: snap n=1` — stream0 done — so no
+#     stroke can outrun req0's service and the fill frame is always
+#     pre-chord;
+#   batch2 (RIS) waits on `cvspike: snap n=2` — stream1 done — so the
+#     cleared-state frame can never be beaten by the RIS composite. With
+#     one batch a guest poll stall drains every stroke in ONE pass, the
+#     req1 request lands behind the RIS it was supposed to precede, and
+#     snap-03-1 ships the post-RIS grid (OBSERVED: ink=12 on a request
+#     fired inside the same burst).
 vgate_run 03 -- --display --input --via-virtio --screen '$RUN_DIR/screen' \
     --cvc-snap --snapshot-out '$RUN_DIR/snap-03' \
     --script '$RUN_DIR/script.txt' \
     --input-string 'source FILL.SH'$'\n' \
     --input-string-after 'goterm: ready' \
-    --input-chords 'ctrl-shift-k,ctrl-shift-r,ctrl-shift-alt-r' \
-    --input-chords-after 'goterm: done status=0' \
-    --snapshot-after 'goterm: done status=0' \
+    --input-chords 'ctrl-shift-k,ctrl-shift-r' \
+    --input-chords-after 'cvspike: snap n=1' \
+    --input-chords2 'ctrl-shift-alt-r' \
+    --input-chords2-after 'cvspike: snap n=2' \
+    --snapshot-after 'shot-03-filled' \
     --snapshot-after 'tty: clear' \
     --snapshot-after 'tty: reset full' \
     --script2 '$RUN_DIR/fill.txt' \
     --script2-after 'tty: reset full' \
+    --script3 '$RUN_DIR/shot.txt' \
+    --script3-after 'goterm: done status=0' --script3-delay 4 \
     --script-expect 'fill-chords-done' \
     --timeout 240
 
 vgate_assert 03 serial-contains 'goterm: ready'
 vgate_assert 03 serial-contains 'goterm: done status=0'
+vgate_assert 03 serial-contains 'shot-03-filled'
 vgate_assert 03 serial-contains 'tty: clear'
 vgate_assert 03 serial-contains 'tty: reset soft'
 vgate_assert 03 serial-contains 'tty: reset full'
 vgate_assert 03 serial-contains 'fill-chords-done'
+# The stream-completion receipts, pinned so a marker rename fails the run
+# with the assert name rather than a missing snap-03-*.raw — and n=3
+# proves the THIRD stream completed (the drain could otherwise ship a
+# short tail).
+vgate_assert 03 serial-contains 'cvspike: snap n=1'
+vgate_assert 03 serial-contains 'cvspike: snap n=2'
+vgate_assert 03 serial-contains 'cvspike: snap n=3'
 vgate_assert 03 serial-absent '\[EXC\]'
 vgate_assert 03 serial-absent '[EXC] parking:'
 
@@ -390,16 +424,25 @@ print(f"M80k chords OK: cleared {n} scrollback lines (hist={hist} used={used} "
       f"total={total} vis={vis} pend={pend}); clear < soft < RIS; guest alive after")
 PY
 
-# KNOWN SNAPSHOT-CHANNEL FLAKE (the fixup #1757 carries; OBSERVED
-# 2026-09-26 on this host): when several `--snapshot-after` requests are in flight together the
-# channel coalesces them (guest `snap_pending` is a bool; the host's
-# `pendingSnapPath` is a single slot the next stream header steals) and the
-# FIRST request's frame is dropped — this run failed exactly that way in the
-# #1725 gate runs (3 requests, 2 streams, no snap-03-0.raw). It predates
-# M80i and hits any multi-snapshot run when the guest-idle service lags;
-# runs 04/05 below sidestep it with one snapshot per boot. This run keeps
-# its three-snapshot shape: the filled/cleared/ris triple IS the M80k
-# deliverable.
+# SNAPSHOT-CHANNEL SERIALIZATION (the run-03 coalescing fix; the defect
+# #1757 documented, OBSERVED 2026-09-26 and again on the #3121 re-run):
+# when several `--snapshot-after` requests were in flight together the
+# channel coalesced them — the guest's `snap_pending` is a bool, so two
+# requests drained by one poll_input merge into ONE stream, and the host's
+# `pendingSnapPath` was a single slot the next stream header stole (3
+# requests, 2 streams, no snap-03-0.raw). The fix is three seams:
+#   * the runner parks every fired trigger while an earlier request is
+#     still armed-but-unstreamed, so at most one request ever reaches the
+#     guest undrained — the labels can no longer steal each other;
+#   * the guest prints `cvspike: snap n=N` after each COMPLETED stream —
+#     the reliable marker each state-change burst waits on;
+#   * every anchor is now post-state: `shot-03-filled` lands after the
+#     fill's composite (not `done`, which raced the repaint), `tty: clear`
+#     is post-composite by #1757's present-then-marker, and batch2's RIS
+#     cannot run until `snap n=2` — so the cleared grid exists on the
+#     scanout for the whole window req1 can fire in. A guest poll stall
+#     can still delay a request, but it can never again ship a frame of
+#     the wrong state or under the wrong name.
 #
 # The scanout, in the same run. Window client = x 64..700, y 64..448 (run
 # 01's refused-declare rect: 79 cols x 24 rows at the M73l 8x16 cell).

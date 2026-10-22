@@ -640,6 +640,15 @@ var inputStringAfter: String?
 // FILE.BIN from the desktop menu).
 var inputChords: String?
 var inputChordsAfter: String?
+// A SECOND gated chord batch (live-term-depth run 03's coalescing fix):
+// the hygiene chords need two batches so the RIS can wait on the
+// cleared-state snapshot's completion receipt (cvspike: snap n=2). A
+// single batch drains the whole sequence in one poll_input pass whenever
+// the guest stalls between polls, and a request anchored on `tty: clear`
+// then ships the post-RIS frame — the cleared state is gone by the time
+// the request can even exist.
+var inputChords2: String?
+var inputChords2After: String?
 // Milestone-eight audit follow-up (issue #117): the keyDown/keyUp spacing
 // for --input-chords. Default 3.0 s keeps every existing gate byte-identical;
 // the input-depth gate lowers it to ~0.3 s to stress the guest's
@@ -1497,6 +1506,12 @@ while idx < arguments.count {
         idx += 2
     } else if arg == "--input-chords-after", idx + 1 < arguments.count {
         inputChordsAfter = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--input-chords2", idx + 1 < arguments.count {
+        inputChords2 = arguments[idx + 1]
+        idx += 2
+    } else if arg == "--input-chords2-after", idx + 1 < arguments.count {
+        inputChords2After = arguments[idx + 1]
         idx += 2
     } else if arg == "--input-chords-delay", idx + 1 < arguments.count {
         guard let d = Double(arguments[idx + 1]), d > 0 else {
@@ -4481,6 +4496,13 @@ if let s = inputChords {
         print("  input-chords: ENABLED (milestone eight card U2, claim 1809) — typing \(s.debugDescription) into the view after \"\(inputChordsAfter ?? "userspace: el0=1")\" (keyDown + keyUp per chord: printable chars, return/up/down/left/right/home/end/delete/tab, alt-tab, ctrl-tab, ctrl-shift-tab, alt-shift-tab, ctrl-a..ctrl-z, ctrl-shift-a..ctrl-shift-z; \(inputChordsDelay) s per keystroke)")
     }
 }
+if let s = inputChords2 {
+    if viaVirtioEnabled && !chordsViaView {
+        print("  input-chords2: ENABLED — typing \(s.debugDescription) over the custom-virtio INPUT queue after \"\(inputChords2After ?? "userspace: el0=1")\"")
+    } else {
+        print("  input-chords2: ENABLED — typing \(s.debugDescription) into the view after \"\(inputChords2After ?? "userspace: el0=1")\"")
+    }
+}
 if viaVirtioEnabled {
     print("  via-virtio: ENABLED (claim 9588, issue #523 item 3) — keyboard injection rides the custom-virtio INPUT queue as HID-shaped 16-byte messages; NO NSEvent/CGEvent synthesis and no window/view required (attacks #179 synthesized-drop and #151 activation wall)")
 }
@@ -5688,17 +5710,17 @@ func fireSnapshotsIfMarker(_ text: String) {
             // (which reads the pair with a sync hop onto this same serial
             // queue) cannot observe a fired trigger whose request has not
             // been sent yet, and cannot miss one that has.
-            CustomVirtioSpike.pendingSnapPath = trigger.outPath
-            if !CustomVirtioSpike.enqueueMessageNow(
-                CustomVirtioSpike.controlMessage(CustomVirtioSpike.inputKindSnapshotReq, payload: []),
-                label: "snap-req → \(trigger.outPath)"
-            ) {
-                // The request never left the host: clear the pending path so
-                // the drain does not wait out its whole window for a stream
-                // that was never armed.
-                CustomVirtioSpike.pendingSnapPath = nil
-                FileHandle.standardError.write(Data("ERROR: CVC-SNAP-REQ: queue 3 pool empty at request time (\(trigger.outPath))\n".utf8))
-            }
+            //
+            // Run-03 coalescing fix: park the request instead of arming the
+            // slot directly. pendingSnapPath is a SINGLE slot and the guest's
+            // snap_pending is a bool: a second request sent while the first
+            // is still armed-but-unstreamed overwrites the label, and two
+            // requests drained by one guest poll_input merge into ONE stream
+            // (the live-term-depth snap-03-* misfile, observed #1725-era and
+            // again on #3121). At most one request may be armed at a time;
+            // the parked FIFO releases on the stream's header, so every
+            // request gets its own stream and its own out path.
+            CustomVirtioSpike.parkSnapshotRequest(trigger.outPath)
         }
     }
     #endif
@@ -6445,11 +6467,11 @@ func macChord(_ token: String) -> (UInt16, NSEvent.ModifierFlags, String)? {
 // per chord, mirroring the --input-string timing (one report per Road Pops
 // present cadence). This is how arrows/Ctrl chords reach the I3 keymap on
 // real hardware.
-func startChordInject() {
-    guard let csv = inputChords else { return }
+func startChordInject(csv inputCsv: String?, after inputAfter: String?) {
+    guard let csv = inputCsv else { return }
     let q = DispatchQueue(label: "virelaios.chords")
     q.async {
-        let marker = inputChordsAfter ?? "userspace: el0=1"
+        let marker = inputAfter ?? "userspace: el0=1"
         // #990 (claim #997): the marker deadline was a hardcoded 60 s — the
         // WM2 gate's choreography (loop-ok + 20 s settle) lands chord-go at
         // ~88 s, so the chords were NEVER typed ("guest did not emit
@@ -8785,7 +8807,8 @@ if hostSessionMode {
     startNativeSocketProbe()
     startKeyInject()
     startKeyStringInject()
-    startChordInject()
+    startChordInject(csv: inputChords, after: inputChordsAfter)
+    startChordInject(csv: inputChords2, after: inputChords2After)
     startPointerInject()
     startPointerVirtioInject()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { scriptPoll() }
@@ -9289,12 +9312,60 @@ enum CustomVirtioSpike {
     /// The output path of the snapshot request most recently sent — set by
     /// fireSnapshotsIfMarker, consumed by the stream's header message.
     static var pendingSnapPath: String?
+    /// Fired-but-parked request labels, FIFO (the run-03 coalescing fix —
+    /// deviceQueue only). A trigger that matches while an earlier request
+    /// is still armed-but-unstreamed waits here instead of overwriting
+    /// pendingSnapPath or coalescing guest-side into one bool-armed
+    /// stream. pumpSnapshotRequests releases the head when the stream's
+    /// header claims the slot.
+    static var parkedSnapPaths: [String] = []
+
+    /// Park one fired snapshot request and try to send. deviceQueue only.
+    static func parkSnapshotRequest(_ outPath: String) {
+        parkedSnapPaths.append(outPath)
+        if pendingSnapPath != nil {
+            // The visible half of the serialization: this request would
+            // have overwritten pendingSnapPath (or coalesced guest-side)
+            // before the fix.
+            print("CVC-SNAP-REQ: \(outPath) parked — an earlier request is still armed-but-unstreamed")
+        }
+        pumpSnapshotRequests()
+    }
+
+    /// Send the next parked request iff the armed slot is free — i.e. the
+    /// previous request's stream header already consumed pendingSnapPath.
+    /// At most one request is ever armed-but-unstreamed, so the guest's
+    /// bool snap_pending can never see two undrained requests. Called on
+    /// park, on the header's slot release, and on a send failure (which
+    /// frees the slot and tries the next parked request).
+    static func pumpSnapshotRequests() {
+        guard pendingSnapPath == nil, !parkedSnapPaths.isEmpty else { return }
+        let outPath = parkedSnapPaths.removeFirst()
+        if !parkedSnapPaths.isEmpty {
+            print("CVC-SNAP-REQ: sent \(outPath); \(parkedSnapPaths.count) request(s) still parked behind it")
+        }
+        pendingSnapPath = outPath
+        if !enqueueMessageNow(
+            controlMessage(inputKindSnapshotReq, payload: []),
+            label: "snap-req → \(outPath)"
+        ) {
+            // The request never left the host: clear the pending path so
+            // the drain does not wait out its whole window for a stream
+            // that was never armed, and give the next parked request its
+            // turn.
+            pendingSnapPath = nil
+            FileHandle.standardError.write(Data("ERROR: CVC-SNAP-REQ: queue 3 pool empty at request time (\(outPath))\n".utf8))
+            pumpSnapshotRequests()
+        }
+    }
 
     /// Issue #1788: is a kind-4 scanout stream in flight right now? Read
     /// with a sync hop onto deviceQueue, so the pair is observed the same
-    /// serial way the callbacks mutate it.
+    /// serial way the callbacks mutate it. A PARKED request counts too:
+    /// it is committed to send, so stopping the device inside its wait
+    /// would lose a frame the gate expects (the drain's contract).
     static func snapshotStreamInFlight() -> Bool {
-        deviceQueue.sync { snap != nil || pendingSnapPath != nil }
+        deviceQueue.sync { snap != nil || pendingSnapPath != nil || !parkedSnapPaths.isEmpty }
     }
 
     // ---- Claim 3141 host-push echo state (all touched only on the
@@ -9571,6 +9642,10 @@ final class CustomVirtioSpikeDeviceDelegate: NSObject, VZCustomVirtioDeviceDeleg
             // trigger assignment made in fireSnapshotsIfMarker.
             if let pending = CustomVirtioSpike.pendingSnapPath { a.outPath = pending }
             CustomVirtioSpike.pendingSnapPath = nil
+            // The armed slot just released: a request parked behind this
+            // stream may go out now (its own stream follows this one on
+            // the guest's next drain — never merged into it).
+            CustomVirtioSpike.pumpSnapshotRequests()
             CustomVirtioSpike.snap = a
             print("CVC-SNAPSHOT: header w=\(a.width) h=\(a.height) bpp=\(a.bpp) total=\(a.total) chunk=\(a.chunkLen) chunks=\(a.expectedChunks) → \(a.outPath)")
             return nil
