@@ -68,7 +68,8 @@ func (p *program) peek() (byte, bool) {
 				p.eof = true
 				break
 			}
-			if !p.e.openDecoder(p.slot, p.objects[p.at]) {
+			opened, _ := p.e.openDecoder(p.slot, p.objects[p.at], false)
+			if !opened {
 				break
 			}
 			p.open = true

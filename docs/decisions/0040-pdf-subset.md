@@ -9,6 +9,9 @@
   [recorded](https://github.com/drawmeanelephant/VirelaiOS/pull/1970))
 - Amended: 2026-10-21 (A3 / #2921 — the bounded `user/go/pdfwrite`
   writer; owner decision recorded on card #2921)
+- Amended: 2026-10-22 (A4 / #2988 — baseline `DCTDecode` admitted
+  through an adapter-installed decoder hook; owner decision recorded
+  on card #2988)
 - Related: [ADR 0030](0030-go-is-el0.md) D2/D3,
   [ADR 0041](0041-svg-raster.md) §§4–7, ADRs 0007/0024/0026.
 
@@ -273,7 +276,8 @@ unused resource/glyph or otherwise invisible content:
 | Nonrectangular/fractional/transformed-nonaxis W/W*, glyph clips, text clipping or Tr other than 0 | `UnsupportedClip` (W), `UnsupportedGlyph` (CharProc) or `UnsupportedText` (Tr); no clipped-away bypass | `clip-refusal`, `glyph-refusal`, `text-refusal` |
 | Type 1/base-14, TrueType, Type 0/CID/CFF, embedded font files, named/system encodings, BaseEncoding, vertical text, ToUnicode/shaping | `UnsupportedFont`; no substitution/font-file load | `font-refusal` |
 | Colored d0 Type 3, CharProc colors/images/text/resources, missing encoded glyph/width | `UnsupportedGlyph` or `MissingGlyph`; no blank-glyph success | `glyph-refusal` |
-| Inline BI/ID/EI, DCT/JPEG, JPX, JBIG2, CCITT, LZW, ASCII filters, filter chains, non-1 predictors | `UnsupportedImage` (inline) or `UnsupportedFilter`; no codec fallback | `image-refusal`, `filter-refusal` |
+| Inline BI/ID/EI, JPX, JBIG2, CCITT, LZW, ASCII filters, filter chains, non-1 predictors | `UnsupportedImage` (inline) or `UnsupportedFilter`; no codec fallback | `image-refusal`, `filter-refusal` |
+| DCT/JPEG on an image XObject | Baseline admitted via the A4 decoder hook: lone `/DCTDecode`, 8-bit, `/DeviceGray` or `/DeviceRGB`, no `/DecodeParms` other than the default; no hook, any chain, non-default parms, a decoder error or progressive content is `UnsupportedFilter`, a decoded dimension/raster mismatch is `MalformedStream` | `image-refusal`, `filter-refusal`, `dct` |
 | Other bit depths/colorspaces, Indexed/CMYK/ICC, masks/SMask, interpolation, nondefault Decode, arbitrary image affine placement | `UnsupportedImage`; no color/mask approximation | `image-refusal` |
 | Form/PostScript XObjects, ExtGState/gs, alpha/blend groups, soft masks, shadings/sh, patterns, color operators cs/CS/sc/SC/scn/SCN/k/K, rendering intent ri and flatness i | `UnsupportedFeature`; no recursive form or paint omission | `paint-refusal` |
 | Annotations, AcroForm/XFA, actions, JavaScript, embedded files, multimedia, optional content, marked content BMC/BDC/EMC/MP/DP, BX/EX compatibility sections | `UnsupportedFeature`; no action execution, optional layer selection or unknown-operator skipping | `interactive-refusal`, `marked-refusal` |
@@ -443,9 +447,9 @@ or managed pointers stored in mapped POD memory:
 | Vector scene storage | 1,048,576 B | Commands/Paints; prefixes reused only after completed batches |
 | Vector Workspace | 524,288 B | ADR 0041 row/subdivision scratch |
 | Resident document and source cache | 262,144 B | 8,193×16 B xref records = 131,088 B; 65,536 B source window; remaining 65,520 B for document/page/resource descriptors |
-| Streaming decode/image scratch | 262,144 B | Two decoder frames ≤65,536 B each (each includes 32,768 B DEFLATE history plus bounded Huffman/block state), staging, ≤3,072 B image row and sample indices; no decoded stream cache |
+| Streaming decode/image scratch | 262,144 B | Two decoder frames ≤65,536 B each (each includes 32,768 B DEFLATE history plus bounded Huffman/block state), staging (including the A4 compressed DCT stage, ≤ the span after both frames and the image row), ≤3,072 B image row and sample indices; no decoded stream cache |
 | PDF graphics/glyph/parse/I/O state | 524,288 B | Bounded stacks/tokens/temporary outlines, native ≤2,048 B file staging, output/receipt/hash buffers |
-| Alignment/unassigned arena margin | 524,288 B | Still charged, not an implicit second allocator |
+| Alignment/adapter-scratch and A4 margin | 524,288 B | The last 65,536 B stay adapter scratch (plan/receipt/native I/O borrow them); the lower 458,752 B stage A4's decoded DCT raster, charged `w*h*4` — over is `MemoryLimit` |
 | **Total engine arena** | **9,437,184 B** | **2,304 pages** |
 | **Runtime/collector/wrapper headroom** | **3,145,728 B** | **768 pages**, outside arena but inside page ceiling |
 | **Total per-page ceiling** | **12,582,912 B** | **3,072 pages** |
@@ -871,3 +875,58 @@ embedding of any kind (base-14, TrueType, CID), strokes, transparency,
 PDF/A, encryption, A4 and non-ASCII text all stay out. The writer does
 not change the reader, the engine lock, or any consumer; the consumers
 are separately claimed cards.
+
+## Amendment (A4 / #2988, 2026-10-22) — baseline DCTDecode via a decoder hook
+
+A4 admits baseline JPEG image streams — the scanned and photo-heavy
+documents the subset otherwise refused — without widening anything
+else. Every §3.5 row other than the DCT/JPEG cell stands: progressive
+JPEG, arithmetic-coded and 12-bit JPEG, JPX, JBIG2, CCITT, CMYK/ICC,
+filter chains and every non-image use of a DCT stream stay named
+refusals.
+
+### A4.1 — Admission
+
+An image XObject whose `/Filter` is a lone `/DCTDecode` (a bare name or
+a one-element array), with `/BitsPerComponent` 8, `/ColorSpace`
+`/DeviceGray` or `/DeviceRGB`, and no `/DecodeParms` other than the
+default (absent, null, or a one-element array wrapping null), is
+admitted through an adapter-installed hook:
+
+```go
+pdf.SetImageDecoder(func(data []byte) (w, h int, pix []uint32, err error))
+```
+
+`data` is the compressed stream staged contiguously inside the decode
+partition's unallocated span (the §5.1 streaming-decode row's staging,
+after both decoder frames and the image row). The hook returns a packed
+`0xAARRGGBB` raster or an error. It runs only for image XObjects: a
+content or glyph stream filtered with `DCTDecode` still refuses
+`UnsupportedFilter`. With no hook installed the DCTDecode refusal is
+unchanged — `UnsupportedFilter`, exactly as before.
+
+### A4.2 — Charging and failures
+
+- A compressed stream longer than the staging span is `MemoryLimit`:
+  admitted-partition overflow, like every §5 partition.
+- The decoded raster's `w*h*4` bytes are charged to the arena's A4
+  margin sub-partition (the amended §5.1 row): the engine copies the
+  hook's raster there and samples it; the hook's slice is borrowed for
+  one call and never retained. Over the sub-partition is `MemoryLimit`.
+- The decoded samples `w*h*channels` charge the §5 expanded-stream
+  counter, the same as every other codec's output.
+- A decoder error is `UnsupportedFilter`; decoded dimensions unequal
+  to the XObject's `/Width`/`/Height`, or a short raster, are
+  `MalformedStream`. Placement, clipping, expansion and work charges
+  reuse the streaming image path's rules unchanged.
+
+### A4.3 — Delta, budgets and the adapter
+
+The hook itself — the JPEG decoder — adds no code to the engine's own
+§5 delta: it is adapter code installed at startup, and the measured
+full/empty pair already prices the engine's hook plumbing, which this
+card re-measures. The 5,000 ms per-page ceiling covers hook decode
+time, which lands inside the timed Render call and is re-measured on
+the DCT fixture page. GOREADER installs `webrender.DecodeImage`, the
+owned baseline decoder; its progressive, CMYK, arithmetic and size-cap
+refusals surface to the reader as `UnsupportedFilter`.

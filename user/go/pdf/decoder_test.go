@@ -20,7 +20,7 @@ func decoderEngine(t *testing.T, data []byte, keys string) engine {
 	if e.f.Code != OK {
 		t.Fatal(e.f)
 	}
-	if !e.openDecoder(0, 1) {
+	if opened, _ := e.openDecoder(0, 1, false); !opened {
 		t.Fatal(e.f)
 	}
 	return e
@@ -89,7 +89,7 @@ func TestMalformedDeflateAndExpansion(t *testing.T) {
 		e.x = make([]xref, 8193)
 		e.dec = make([]decoder, 2)
 		e.structure()
-		if e.openDecoder(0, 1) {
+		if opened, _ := e.openDecoder(0, 1, false); opened {
 			for e.f.Code == OK {
 				if _, ok := e.decoded(0); !ok {
 					break
@@ -119,10 +119,10 @@ func TestMalformedDeflateAndExpansion(t *testing.T) {
 	}
 	e.closeDecoder(0)
 	e = decoderEngine(t, nil, "")
-	if !e.openDecoder(1, 1) || e.l.Decoders != 2 {
+	if opened, _ := e.openDecoder(1, 1, false); !opened || e.l.Decoders != 2 {
 		t.Fatal(e.f)
 	}
-	if e.openDecoder(0, 1) || e.f.Code != DecoderLimit {
+	if opened, _ := e.openDecoder(0, 1, false); opened || e.f.Code != DecoderLimit {
 		t.Fatal(e.f)
 	}
 	e.closeDecoder(1)

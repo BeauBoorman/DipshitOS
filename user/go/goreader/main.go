@@ -1046,6 +1046,16 @@ func main() {
 	// under the process memory limit.
 	a.arena = make([]byte, pdf.ArenaBytes)
 
+	// ADR 0040 A4: DCTDecode image streams decode through webrender's owned
+	// baseline JPEG decoder, staged and charged inside the page arena.
+	pdf.SetImageDecoder(func(data []byte) (w, h int, pix []uint32, err error) {
+		im, err := webrender.DecodeImage(data)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		return im.Width, im.Height, im.Pix, nil
+	})
+
 	if a.path == "" && !ta.Restored {
 		vi.ConsoleLine(markerEmpty)
 	} else {

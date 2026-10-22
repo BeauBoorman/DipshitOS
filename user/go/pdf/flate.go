@@ -26,35 +26,42 @@ type decodeHeader struct {
 	windowMax                      uint32
 }
 
-func (e *engine) openDecoder(slot, n int) bool {
+// openDecoder returns (true, false) with a live streaming decoder on slot,
+// (false, true) when the stream carries a lone DCTDecode and the caller set
+// allowDCT — the image path then routes it to the A4 hook — or (false,
+// false) with a failure set.
+func (e *engine) openDecoder(slot, n int, allowDCT bool) (bool, bool) {
 	if slot < 0 || slot >= 2 || e.l.Decoders >= 2 {
 		e.set(DecoderLimit)
-		return false
+		return false, false
 	}
 	v, start, length, stream := e.objectValue(n)
 	if !stream {
 		e.set(Malformed)
-		return false
+		return false, false
 	}
 	filter := e.get(v, "Filter")
 	raw := filter.k == kBad
 	if filter.k == kArray {
 		if filter.count != 1 {
 			e.set(UnsupportedFilter)
-			return false
+			return false, false
 		}
 		i := e.iter(filter)
 		filter = i.next().val
 	}
 	if !raw && !e.named(filter, "FlateDecode") {
+		if allowDCT && e.named(filter, "DCTDecode") {
+			return false, true
+		}
 		e.set(UnsupportedFilter)
-		return false
+		return false, false
 	}
 	par := e.get(v, "DecodeParms")
 	if par.k == kArray {
 		if par.count != 1 {
 			e.set(UnsupportedFilter)
-			return false
+			return false, false
 		}
 		i := e.iter(par)
 		par = i.next().val
@@ -62,7 +69,7 @@ func (e *engine) openDecoder(slot, n int) bool {
 	if par.k != kBad && par.k != kNull {
 		if par.k != kDict {
 			e.set(UnsupportedFilter)
-			return false
+			return false, false
 		}
 		e.allowed(par, "Predictor", UnsupportedFilter)
 		if e.integer(e.get(par, "Predictor")) != 1 {
@@ -70,10 +77,10 @@ func (e *engine) openDecoder(slot, n int) bool {
 		}
 	}
 	if e.f.Code != OK {
-		return false
+		return false, false
 	}
 	if !e.charge(Zero, uint64(unsafe.Sizeof(decodeHeader{}))) {
-		return false
+		return false, false
 	}
 	// History is readable only below written, so previous bytes need no
 	// clearing. Tables expose only their freshly built count/symbol prefixes.
@@ -90,7 +97,7 @@ func (e *engine) openDecoder(slot, n int) bool {
 	if e.f.Code != OK {
 		e.closeDecoder(slot)
 	}
-	return e.f.Code == OK
+	return e.f.Code == OK, false
 }
 func (e *engine) closeDecoder(slot int) {
 	if e.l.Decoders > 0 {

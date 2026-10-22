@@ -6,7 +6,7 @@ import (
 )
 
 func (e *engine) image(n int, m vector.Affine, clip vector.Rect, paint bool, slot int) {
-	v, _, _, stream := e.objectValue(n)
+	v, start, length, stream := e.objectValue(n)
 	if !stream || !e.named(e.get(v, "Type"), "XObject") || !e.named(e.get(v, "Subtype"), "Image") {
 		e.set(UnsupportedFeature)
 		return
@@ -74,7 +74,14 @@ func (e *engine) image(n int, m vector.Affine, clip vector.Rect, paint bool, slo
 		y0 = max(y0, clip.Y0, 0)
 		y1 = min(y1, clip.Y1, int(e.state.page.height))
 	}
-	if !e.openDecoder(slot, n) {
+	// A4: a lone DCTDecode routes to the adapter's image-decoder hook; the
+	// streaming path below still refuses it when no hook is installed.
+	opened, dct := e.openDecoder(slot, n, true)
+	if dct {
+		e.dctImage(n, v, start, length, w, h, channels, m, x0, x1, y0, y1)
+		return
+	}
+	if !opened {
 		return
 	}
 	// The row lives in the unused portion of the fixed decode partition, not

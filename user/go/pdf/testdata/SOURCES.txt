@@ -1,0 +1,7 @@
+Original VirelaiOS JPEG vector, repository LICENSE.
+
+dct-gray-32.jpg: byte-identical copy of
+user/go/webrender/testdata/jpeg/gray-32.jpg — a 32x32 grayscale baseline
+(SOF0, 8-bit, Huffman) JPEG generated from a specified pixel function by the
+in-tree jpegEncode in user/go/webrender/jpeg_test.go; no downloaded input or
+external decoder implementation. See that directory's SOURCES.txt.

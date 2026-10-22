@@ -14,9 +14,20 @@
 #     on the page-2 `ZOOKEEPER` hit and blends the accent band onto the
 #     page (`find 'ZOO' hit=1/1 page=2`), where the snapshot probe counts it.
 #
-# Run 02 is the refusal leg: STROKE.PDF is the M89 corpus's pinned
-# unsupported-stroke negative; the engine's UnsupportedStroke must reach
-# the console AND the window (Danger-ink probe on the snapshot).
+# Run 02 is the refusal leg plus the M164a (#2988) DCT leg: STROKE.PDF
+# is the M89 corpus's pinned unsupported-stroke negative; the engine's
+# UnsupportedStroke must reach the console AND the window (Danger-ink
+# probe on snap-02-0, fired by the rx- marker 15 s after the refusal —
+# the run's original capture timing). 'q' then ends that lifetime and
+# script3 execs GOREADER on DCT.PDF — the committed one-page fixture
+# (user/go/goreader/testdata/dct.pdf, 1,184 B, license in the directory's
+# SOURCES.txt) carrying one 32x32 baseline-JPEG DCTDecode image placed
+# 1:1 at page pixels (48,32)-(80,64). 'b' produces the post-repaint
+# bookmark marker that fires snap-02-1 (the prefix matches on/off so the
+# persisted pos row's restored bookmark cannot flip the trigger across
+# K iterations), and the python block compares the 128x96 page crop at
+# scanout (356,40) — window (40,24) + centered page (316,16) — with the
+# cgrender outside reference inside the spec's existing tolerance.
 #
 # Run 04 (M153c) is the v2 leg: one boot execs GOREADER on PAGES.PDF, 'end'
 # lands page 3 (absolute — immune to a carried-over position row), 'b'
@@ -106,10 +117,6 @@ vgate_file script-r.txt <<'EOF'
 exec GOREADER.ELF /host/READER/STROKE.PDF
 EOF
 
-vgate_file script2-r.txt <<'EOF'
-echo rx-reader-refuse-ok
-EOF
-
 vgate_setup_python <<'PY'
 import os, shutil, sys
 sys.path.insert(0, os.path.join(os.getcwd(), "tools", "pdf-proof"))
@@ -169,9 +176,18 @@ if not os.path.exists(neg):
     sys.exit("missing corpus negative " + neg)
 shutil.copy(neg, os.path.join(rd_dir, "STROKE.PDF"))
 
-print("staged GOREADER.ELF (%d bytes), PAGES.PDF (%d bytes), STROKE.PDF"
+# The DCT leg's input: the committed one-page baseline-JPEG fixture the
+# card pins (license recorded in its directory's SOURCES.txt).
+dct = os.path.join("user", "go", "goreader", "testdata", "dct.pdf")
+if not os.path.exists(dct):
+    sys.exit("missing committed fixture " + dct)
+shutil.copy(dct, os.path.join(rd_dir, "DCT.PDF"))
+
+print("staged GOREADER.ELF (%d bytes), PAGES.PDF (%d bytes), STROKE.PDF, "
+      "DCT.PDF (%d bytes)"
       % (os.path.getsize(os.path.join(share, "GOREADER.ELF")),
-         os.path.getsize(os.path.join(rd_dir, "PAGES.PDF"))))
+         os.path.getsize(os.path.join(rd_dir, "PAGES.PDF")),
+         os.path.getsize(os.path.join(rd_dir, "DCT.PDF"))))
 PY
 
 # --- run 01: the journey ---------------------------------------------------
@@ -233,29 +249,53 @@ if band < 40:
 print("goreader journey: accent hit band px=%d" % band)
 PY
 
-# --- run 02: the named refusal ----------------------------------------------
+# --- run 02: the DCT page, then the named refusal ----------------------------
+vgate_file script-dct.txt <<'EOF'
+exec GOREADER.ELF /host/READER/DCT.PDF
+EOF
+
+vgate_file script2-rx.txt <<'EOF'
+echo rx-reader-refuse-ok
+EOF
+
+# Snapshots fire in registration order with the proven capture timing:
+# the refusal window opens first, script2 echoes the rx- marker 15 s
+# after the refusal lands — settling the composite for snap-02-0 — and
+# 'q' after it ends that lifetime. script3 re-execs on DCT.PDF once the
+# quit marker lands (late-boot composites are warm here, where the
+# bookmark marker's post-repaint capture is reliable — on or off, the
+# prefix is iteration-stable against the persisted pos row), producing
+# snap-02-1 and the run's terminal marker.
 vgate_run 02 -- \
     --screen '$RUN_DIR/screen-02' \
     --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-02' \
     --script '$RUN_DIR/script-r.txt' \
-    --script2 '$RUN_DIR/script2-r.txt' \
-    --script2-after 'goreader: present' \
+    --script2 '$RUN_DIR/script2-rx.txt' \
+    --script2-after 'goreader: refuse UnsupportedStroke' \
     --script2-delay 15 \
     --snapshot-after 'rx-reader-refuse-ok' \
-    --script-expect 'rx-reader-refuse-ok' --timeout 240
+    --input-chords 'q' --input-chords-after 'rx-reader-refuse-ok' \
+    --script3 '$RUN_DIR/script-dct.txt' \
+    --script3-after 'goreader: quit' \
+    --input-string 'b' --input-string-after 'goreader: loaded DCT.PDF' \
+    --snapshot-after 'goreader: bookmark ' \
+    --script-expect 'goreader: bookmark ' --timeout 240
 
 vgate_assert 02 serial-contains 'exec: loaded GOREADER.ELF'
 vgate_assert 02 serial-contains 'goreader: refuse UnsupportedStroke'
-vgate_assert 02 serial-absent 'goreader: loaded '
+vgate_assert 02 serial-absent 'goreader: loaded STROKE.PDF'
 vgate_assert 02 serial-contains 'goreader: present'
 vgate_assert 02 serial-contains 'rx-reader-refuse-ok'
+vgate_assert 02 serial-contains 'goreader: quit'
+vgate_assert 02 serial-contains 'goreader: loaded DCT.PDF pages=1 128x96'
+vgate_assert 02 serial-contains 'goreader: bookmark '
 vgate_assert 02 serial-absent '[EXC] parking:'
 vgate_assert 02 serial-absent 'exited status=139'
 
 # The refusal names itself in the window: "REFUSED: UNSUPPORTEDSTROKE" is
 # drawn at 2x in theme.Danger (0xef4444) centered in the canvas. The probe
 # counts Danger-ink pixels inside the window (canvas 40..760 x, 24..584 y).
-vgate_assert 02 snapshot 'snap-02-*.raw' <<'PY'
+vgate_assert 02 snapshot 'snap-02-0.raw' <<'PY'
 import sys
 
 W, H = 1280, 720
@@ -276,6 +316,66 @@ for y in range(60, 500):
 if ink < 40:
     sys.exit("only %d Danger-ink px - the refusal did not paint its name" % ink)
 print("goreader refusal: Danger-ink px=%d" % ink)
+PY
+
+# The DCT leg's evidence: the committed fixture's page raster on the
+# scanout matches the A2 outside reference. The 128x96 page centers at
+# canvas (316,16) -> scanout (356,40); cgrender draws the same page at
+# 96 dpi and the crop compares inside the spec's existing live-web-57
+# bounds. Grayscale baseline JPEG at 1:1 has no chroma upsampling or
+# scale slack — only IDCT rounding, far inside the tolerance.
+vgate_assert 02 python <<'PY'
+import glob, os, struct, subprocess, sys
+rd = os.environ["RUN_DIR"]
+fixture = os.path.join("user", "go", "goreader", "testdata", "dct.pdf")
+if not os.path.exists(fixture):
+    sys.exit("missing committed fixture " + fixture)
+binary = ".build/pdf-proof/cgrender"
+if not os.path.exists(binary):
+    os.makedirs(".build/pdf-proof", exist_ok=True)
+    subprocess.check_call(["/usr/bin/swiftc", "-O", "-module-cache-path",
+        ".build/pdf-proof/module-cache", "tools/pdf-proof/cgrender.swift",
+        "-o", binary])
+out = os.path.join(rd, "dct-p1.bgra")
+env = {k: v for k, v in os.environ.items() if not k.startswith("DYLD_")}
+env["CG_PDF_VERBOSE"] = "1"
+r = subprocess.run([os.path.abspath(binary), fixture, out, "1"], env=env,
+                   capture_output=True, text=True, timeout=60)
+assert r.returncode == 0, "cgrender failed: " + r.stderr[:400]
+open(os.path.join(rd, "dct-p1.cglog"), "w").write(r.stderr)
+assert "caught exception" not in r.stderr, "oracle diagnostics: " + r.stderr[:400]
+cg = open(out, "rb").read()
+w, h, stride = struct.unpack_from("<III", cg, 4)
+assert (w, h, stride) == (128, 96, 128), "cgrender geometry %dx%d" % (w, h)
+pix = cg[16:]
+snaps = sorted(glob.glob(os.path.join(rd, "snap-02-1.raw")))
+assert snaps, "no DCT scanout capture"
+raw = open(max(snaps, key=os.path.getmtime), "rb").read()
+assert len(raw) == 1280 * 720 * 4, "scanout size %d" % len(raw)
+def scan(x, y):
+    k = (y * 1280 + x) * 4
+    return raw[k + 2], raw[k + 1], raw[k]
+def ref(x, y):
+    k = (y * stride + x) * 4
+    return pix[k + 2], pix[k + 1], pix[k]
+mism = total = 0
+sumdiff = 0
+TOL = 48
+for cy in range(96):
+    for cx in range(128):
+        a = scan(356 + cx, 40 + cy)
+        b = ref(cx, cy)
+        d = max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
+        sumdiff += abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
+        total += 1
+        if d > TOL:
+            mism += 1
+frac = mism / total
+mean = sumdiff / (3 * total)
+assert frac <= 0.08 and mean <= 24, \
+    "cgrender vs scanout: mism=%.4f mean=%.2f" % (frac, mean)
+print("go-reader 02: DCT.PDF page vs cgrender crop "
+      "(mismatch %.4f%%, mean %.2f/255, tol %d)" % (frac * 100, mean, TOL))
 PY
 
 # --- run 03 (M143b #2793): the K=3 open-chain journey ------------------------
