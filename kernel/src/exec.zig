@@ -287,8 +287,12 @@ pub const LoadedInfo = struct {
     /// Claim 3805 (milestone sixteen C1): the mapped DATA+bss region's byte
     /// length and page count (0 for a flat DSK1 image, which has no
     /// writable segment). The `exec` reply prints these only when non-zero.
+    /// M171a (card #3032): `data_pages` is the RESIDENT count
+    /// (`datapages=`); `data_map_pages` is the VIRTUAL mapped span
+    /// (`mappedpages=`) — equal on the eager paths.
     data_len: u64 = 0,
     data_pages: u64 = 0,
+    data_map_pages: u64 = 0,
 };
 
 /// Claim 6359 (ADR 0007 slot 28): the pid of the most recently exec'd
@@ -399,6 +403,7 @@ pub fn loaded() ?LoadedInfo {
         .stack_va = info.stack_va,
         .data_len = info.data_len,
         .data_pages = info.data_pages,
+        .data_map_pages = info.data_map_pages,
     };
 }
 
@@ -891,6 +896,9 @@ fn exec_file_impl(name: []const u8, args: []const []const u8, pin: ?usize, princ
             .data_len = @intCast(data_mem_size),
             .data_phys = data_phys,
             .data_pages = data_pages,
+            // M171a: this path still backs the whole span eagerly —
+            // resident and virtual are the same count here.
+            .data_map_pages = data_pages,
             .stack_va = rebuild.stack_va,
             .stack_len = scheduler.task_stack_size,
             .stack_phys = stack_phys,
@@ -1027,29 +1035,68 @@ fn exec_static_elf_gap(
     // are read-only rodata; the last is the writable data segment.
     var seg_phys: [elf_mod.max_segments]u64 = @splat(0);
     var seg_pages: [elf_mod.max_segments]u64 = @splat(0);
+    // M171a (card #3032): per-segment page geometry. `seg_file` is the
+    // file-backed run the loader reads into; `seg_pages` the RESIDENT
+    // total (the file run plus the argv/envp run — the only pages
+    // allocated and filled at exec); `seg_span` the VIRTUAL mapped span
+    // (page-rounded p_memsz plus argv headroom); `seg_run` the VA-page
+    // index where the second resident run begins (`== seg_span` when
+    // there is none). The pages in [seg_file, min(memsz pages, seg_run))
+    // are the demand-zero tail — `zero_*` records it for registration as
+    // an image demand region once the descriptor exists.
+    var seg_file: [elf_mod.max_segments]u64 = @splat(0);
+    var seg_span: [elf_mod.max_segments]u64 = @splat(0);
+    var seg_run: [elf_mod.max_segments]u64 = @splat(0);
+    var zero_base: [elf_mod.max_segments]u64 = @splat(0);
+    var zero_len: [elf_mod.max_segments]u64 = @splat(0);
+    var zero_prot: [elf_mod.max_segments]u64 = @splat(0);
     var allocated: usize = 0;
+    const last_seg_i = image.segment_count - 1;
     const streaming = switch (src) {
         .streamed => true,
         .staged => false,
     };
     while (allocated < image.segment_count) : (allocated += 1) {
         const seg = image.segments[allocated];
-        var pages: u64 = (seg.mem_size + alloc.page_size - 1) / alloc.page_size;
+        const file_pages: u64 = (seg.file_size + alloc.page_size - 1) / alloc.page_size;
+        const mem_pages: u64 = (seg.mem_size + alloc.page_size - 1) / alloc.page_size;
+        var pages: u64 = mem_pages;
         // M71m (#1572): the argv+envp block is 8×256 + 16×128 = 4096 bytes,
         // placed at align8(mem_size). Size this segment to cover that end
         // instead of requiring the block to fit in the image's own tail
         // slack. For a 4096-byte block the cover is one page past the
         // image: exactly 4096 bytes when mem_size is page-aligned, and
         // 8192 − r bytes past align8(mem_size) otherwise
-        // (r = mem_size mod 4096).
-        if (allocated == image.segment_count - 1 and argc > 0) {
+        // (r = mem_size mod 4096). M171a: `argv_first` is the VA page the
+        // block starts in — the run [argv_first, cover) stays RESIDENT
+        // even where it overlaps what would otherwise be the demand tail.
+        var argv_first: u64 = mem_pages;
+        if (allocated == last_seg_i and argc > 0) {
             const block_off: u64 = (seg.mem_size + 7) & ~@as(u64, 7);
             const need: u64 = block_off + arg_block_bytes + env_block_bytes;
             const cover: u64 = (need + alloc.page_size - 1) / alloc.page_size;
+            argv_first = block_off / alloc.page_size;
             if (cover > pages) pages = cover;
         }
         if (pages == 0) continue;
-        const phys = alloc.alloc_pages(pages) orelse {
+        // The resident allocation is ONE contiguous run: the file pages,
+        // then the pages the argv run contributes (the argv run's own
+        // first page may already be inside the file run, hence @max).
+        const run_page = @max(argv_first, file_pages);
+        const eager: u64 = file_pages + (pages -| run_page);
+        seg_file[allocated] = file_pages;
+        seg_span[allocated] = pages;
+        seg_run[allocated] = run_page;
+        const tail_end = @min(mem_pages, run_page);
+        if (tail_end > file_pages) {
+            zero_base[allocated] = seg.vaddr + file_pages * alloc.page_size;
+            zero_len[allocated] = (tail_end - file_pages) * alloc.page_size;
+            // W^X, mirroring the aperture permissions: text R+X, a middle
+            // rodata segment R, the last (writable) segment R+W.
+            zero_prot[allocated] = if (allocated == 0) 5 else if (allocated == last_seg_i) 3 else 1;
+        }
+        if (eager == 0) continue;
+        const phys = alloc.alloc_pages(eager) orelse {
             var j: usize = 0;
             while (j < allocated) : (j += 1) {
                 if (seg_pages[j] > 0) _ = alloc.free_pages(seg_phys[j], seg_pages[j]);
@@ -1057,7 +1104,7 @@ fn exec_static_elf_gap(
             return .out_of_memory;
         };
         seg_phys[allocated] = phys;
-        seg_pages[allocated] = pages;
+        seg_pages[allocated] = eager;
         const dst: [*]u8 = @ptrFromInt(phys);
         if (seg.file_size > 0) {
             const payload = dst[0..seg.file_size];
@@ -1076,7 +1123,15 @@ fn exec_static_elf_gap(
                 @memcpy(payload, src.staged[seg.file_offset..][0..seg.file_size]);
             }
         }
-        if (seg.mem_size > seg.file_size) @memset(dst[seg.file_size..seg.mem_size], 0);
+        // Zero only what is RESIDENT: the file run's tail past p_filesz
+        // (BSS bytes that share the last file page), and — for the last
+        // segment — the argv run's whole span (BSS bytes the block's page
+        // carries below the block; the block itself is re-zeroed at pack
+        // time). Everything between is the demand tail.
+        if (seg.mem_size > seg.file_size)
+            @memset(dst[seg.file_size..@min(seg.mem_size, file_pages * alloc.page_size)], 0);
+        if (pages > run_page)
+            @memset(dst[file_pages * alloc.page_size ..][0 .. (pages - run_page) * alloc.page_size], 0);
     }
     // `head()` is a diagnostic the `exec` reply prints: for a streamed image
     // take it from the page segment 0 was just read into, so the line reports
@@ -1115,10 +1170,19 @@ fn exec_static_elf_gap(
     const last_seg = image.segments[image.segment_count - 1];
     if (argc > 0 and image.segment_count >= 2) {
         const last_phys = seg_phys[image.segment_count - 1];
-        const last_pages = seg_pages[image.segment_count - 1];
+        const last_span = seg_span[image.segment_count - 1];
         const block_off: u64 = (last_seg.mem_size + 7) & ~@as(u64, 7);
-        if (block_off + arg_block_bytes + env_block_bytes > last_pages * alloc.page_size) return .no_args_room;
-        const block_dst: [*]u8 = @ptrFromInt(last_phys + block_off);
+        if (block_off + arg_block_bytes + env_block_bytes > last_span * alloc.page_size) return .no_args_room;
+        // M171a: the block lives in the argv run — inside the file run's
+        // own pages when block_off precedes the run boundary, else in the
+        // run's pages (which are physically contiguous right after the
+        // file run). The demand tail in between is NOT resident.
+        const run_bytes = seg_run[image.segment_count - 1] * alloc.page_size;
+        const block_dst_off: u64 = if (block_off >= run_bytes)
+            seg_file[image.segment_count - 1] * alloc.page_size + (block_off - run_bytes)
+        else
+            block_off;
+        const block_dst: [*]u8 = @ptrFromInt(last_phys + block_dst_off);
         @memset(block_dst[0..arg_block_bytes], 0);
         _ = pack_args(argv_list[0..argc], block_dst[0..arg_block_bytes]) catch {
             var j: usize = 0;
@@ -1130,7 +1194,7 @@ fn exec_static_elf_gap(
             return .arg_too_long;
         };
         argv_va = last_seg.vaddr + block_off;
-        const env_dst: [*]u8 = @ptrFromInt(last_phys + block_off + arg_block_bytes);
+        const env_dst: [*]u8 = @ptrFromInt(last_phys + block_dst_off + arg_block_bytes);
         @memset(env_dst[0..env_block_bytes], 0);
         _ = pack_env(envp_slices[0..envp_count], env_dst[0..env_block_bytes]);
     }
@@ -1140,20 +1204,37 @@ fn exec_static_elf_gap(
     // vaddr with the parser-validated permissions, plus the user stack.
     const stack_va = csprng.random_stack_va();
     userspace.set_stack_va(stack_va);
-    var aps: [1 + elf_mod.max_segments]mmu.UserAperture = undefined;
+    var aps: [2 + elf_mod.max_segments]mmu.UserAperture = undefined;
     var ap_count: usize = 0;
     for (image.segments[0..image.segment_count], 0..) |seg, i| {
-        if (seg_pages[i] == 0) continue;
-        aps[ap_count] = .{
-            .va_start = seg.vaddr,
-            .va_end = seg.vaddr + seg_pages[i] * alloc.page_size,
-            .phys = seg_phys[i],
-            // W^X (parser-enforced): only the LAST segment is writable,
-            // and a single-segment image is text-only (never writable).
-            .writable = image.segment_count > 1 and i == image.segment_count - 1,
-            .executable = i == 0,
-        };
-        ap_count += 1;
+        if (seg_span[i] == 0) continue;
+        // W^X (parser-enforced): only the LAST segment is writable,
+        // and a single-segment image is text-only (never writable).
+        const writable = image.segment_count > 1 and i == image.segment_count - 1;
+        const executable = i == 0;
+        // M171a: the RESIDENT runs only — the demand-zero tail is
+        // deliberately absent from the apertures so its first touch
+        // faults through populate_user_page.
+        if (seg_file[i] > 0) {
+            aps[ap_count] = .{
+                .va_start = seg.vaddr,
+                .va_end = seg.vaddr + seg_file[i] * alloc.page_size,
+                .phys = seg_phys[i],
+                .writable = writable,
+                .executable = executable,
+            };
+            ap_count += 1;
+        }
+        if (seg_span[i] > seg_run[i]) {
+            aps[ap_count] = .{
+                .va_start = seg.vaddr + seg_run[i] * alloc.page_size,
+                .va_end = seg.vaddr + seg_span[i] * alloc.page_size,
+                .phys = seg_phys[i] + seg_file[i] * alloc.page_size,
+                .writable = writable,
+                .executable = executable,
+            };
+            ap_count += 1;
+        }
     }
     aps[ap_count] = .{
         .va_start = stack_va,
@@ -1180,7 +1261,7 @@ fn exec_static_elf_gap(
 
     const seg0 = image.segments[0];
     const last = image.segments[image.segment_count - 1];
-    const text_len_pages = seg_pages[0] * alloc.page_size;
+    const text_len_pages = seg_span[0] * alloc.page_size;
     // Issue #1163 I1 (review pass): a single-segment GAP image is legal
     // (the parser accepts any sane declared base), and there `last ==`
     // `seg0` — aliasing the text allocation into `.data_*` would free the
@@ -1205,6 +1286,7 @@ fn exec_static_elf_gap(
             .data_len = if (has_data) last.mem_size else 0,
             .data_phys = if (has_data) seg_phys[image.segment_count - 1] else 0,
             .data_pages = if (has_data) seg_pages[image.segment_count - 1] else 0,
+            .data_map_pages = if (has_data) seg_span[image.segment_count - 1] else 0,
             .stack_va = stack_va,
             .stack_len = scheduler.task_stack_size,
             .stack_phys = stack_phys,
@@ -1215,6 +1297,7 @@ fn exec_static_elf_gap(
             .ro_phys = if (image.segment_count == 3) seg_phys[1] else 0,
             .ro_pages = if (image.segment_count == 3) seg_pages[1] else 0,
             .ro_va = if (image.segment_count == 3) image.segments[1].vaddr else 0,
+            .ro_len = if (image.segment_count == 3) image.segments[1].mem_size else 0,
             // Issue #1214 review / #1226: the packed argv+envp region's
             // end — the data aperture collision bound extends through it,
             // so the sbrk heap cannot swallow a block that starts on the
@@ -1235,6 +1318,18 @@ fn exec_static_elf_gap(
         return .process_full;
     };
 
+    // M171a (card #3032): publish the demand-zero tails BEFORE the task
+    // can run — every PT_LOAD's unbacked span, one region per segment so
+    // `max_zero_regions` suffices by construction. A refusal is a
+    // registry-invariant break, unwound like the create failure.
+    for (0..image.segment_count) |i| {
+        if (zero_len[i] == 0) continue;
+        if (!process.add_zero_region(proc_id, zero_base[i], zero_len[i], zero_prot[i])) {
+            _ = process.reap(proc_id);
+            return .process_full;
+        }
+    }
+
     mailbox.reset(proc_id);
     events.reset(proc_id);
     file_table.reset_process(proc_id);
@@ -1252,14 +1347,16 @@ fn exec_static_elf_gap(
         // stack regions were set by register_exec_user itself.
         if (image.segment_count == 3) {
             const ro = image.segments[1];
-            if (!scheduler.add_task_read_region(task_id, .{ .base = ro.vaddr, .len = seg_pages[1] * alloc.page_size })) return .pool_full;
+            // M171a: the VIRTUAL span — syscall copies into the demand
+            // tail must reach populate_user_page, not EFAULT.
+            if (!scheduler.add_task_read_region(task_id, .{ .base = ro.vaddr, .len = seg_span[1] * alloc.page_size })) return .pool_full;
         }
         // I1: data regions only for a REAL data segment — with one
         // segment the text is already covered by the task's text region,
         // and it must never appear as a copy-out write destination.
         if (has_data and last.mem_size > 0) {
-            if (!scheduler.add_task_read_region(task_id, .{ .base = last.vaddr, .len = seg_pages[image.segment_count - 1] * alloc.page_size })) return .pool_full;
-            if (!scheduler.add_task_write_region(task_id, .{ .base = last.vaddr, .len = seg_pages[image.segment_count - 1] * alloc.page_size })) return .pool_full;
+            if (!scheduler.add_task_read_region(task_id, .{ .base = last.vaddr, .len = seg_span[image.segment_count - 1] * alloc.page_size })) return .pool_full;
+            if (!scheduler.add_task_write_region(task_id, .{ .base = last.vaddr, .len = seg_span[image.segment_count - 1] * alloc.page_size })) return .pool_full;
         }
         // register_exec_user hardcodes the task text region at
         // userspace.text_va; the gap layout's declared base differs (the
@@ -1579,6 +1676,9 @@ fn exec_dynamic_elf(
             .data_len = @intCast(data_mem_size),
             .data_phys = data_phys,
             .data_pages = data_pages,
+            // M171a: this path still backs the whole span eagerly —
+            // resident and virtual are the same count here.
+            .data_map_pages = data_pages,
             .stack_va = stack_va,
             .stack_len = scheduler.task_stack_size,
             .stack_phys = stack_phys,

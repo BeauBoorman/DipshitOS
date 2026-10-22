@@ -8412,7 +8412,10 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
             for (head, 0..) |byte, i| head_value |= @as(u64, byte) << @intCast(56 - i * 8);
             var buf: [256]u8 = undefined;
             const line = if (info.data_len > 0)
-                std.fmt.bufPrint(&buf, "exec: loaded {s} size=0x{x:0>16} entry=0x{x:0>16} stack=0x{x:0>16} head=0x{x:0>16} data=0x{x:0>16} datapages={d}\n", .{ info.name, info.content_len, info.entry_va, info.stack_va, head_value, info.data_len, info.data_pages }) catch return .not_implemented
+                // M171a (card #3032): datapages is the RESIDENT count at
+                // exec, mappedpages the VIRTUAL span — the demand-zero
+                // tail counts in the second only.
+                std.fmt.bufPrint(&buf, "exec: loaded {s} size=0x{x:0>16} entry=0x{x:0>16} stack=0x{x:0>16} head=0x{x:0>16} data=0x{x:0>16} datapages={d} mappedpages={d}\n", .{ info.name, info.content_len, info.entry_va, info.stack_va, head_value, info.data_len, info.data_pages, info.data_map_pages }) catch return .not_implemented
             else
                 std.fmt.bufPrint(&buf, "exec: loaded {s} size=0x{x:0>16} entry=0x{x:0>16} stack=0x{x:0>16} head=0x{x:0>16}\n", .{ info.name, info.content_len, info.entry_va, info.stack_va, head_value }) catch return .not_implemented;
             m.console.puts(line);

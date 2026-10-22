@@ -2190,9 +2190,10 @@ fn fill_big_gap_elf(comptime contiguous: bool) void {
 }
 
 /// Page counts the loader must take for this fixture: 1 text + 768 rodata +
-/// 2 data + the argv/envp headroom page + the 192 KiB (48-page) task stack
-/// and its kernel twin.
-const big_elf_pages = 1 + (big_elf_ro_filesz / 4096) + 2 + 1 + 48 + 48;
+/// the data segment's RESIDENT runs (1 file-backed page + the argv/envp
+/// headroom page — M171a: the second image page is a demand-zero tail, not
+/// allocated at exec) + the 192 KiB (48-page) task stack and its kernel twin.
+const big_elf_pages = 1 + (big_elf_ro_filesz / 4096) + 1 + 1 + 48 + 48;
 
 test "exec: a 3 MiB gap ELF streams from the share into its mapped pages (M70c-K #1504)" {
     try arm_allocator(&big_test_ram);
@@ -2212,7 +2213,11 @@ test "exec: a 3 MiB gap ELF streams from the share into its mapped pages (M70c-K
     const pid = esp_exec.last_exec_pid().?;
     const info = process.info(pid).?;
     try std.testing.expectEqual(@as(u64, 1), info.text_pages);
-    try std.testing.expectEqual(@as(u64, 3), info.data_pages); // 2 image pages + the argv/envp headroom page
+    // M171a: resident is the file page + the argv/envp headroom page; the
+    // second image page is the demand-zero tail (mapped, not allocated).
+    try std.testing.expectEqual(@as(u64, 2), info.data_pages);
+    try std.testing.expectEqual(@as(u64, 3), info.data_map_pages);
+    try std.testing.expect(process.find_zero_region(pid, 0x70_4000) != null);
 
     // The image is BIG: every segment was really allocated (the 768-page
     // read-only segment is the only way this delta can come out right).
@@ -2407,15 +2412,17 @@ test "exec: a STAGED gap image is bounded by map_max, not by the staging buffer 
     try std.testing.expectEqual(esp_exec.ExecResult.ok, esp_exec.exec_file("GAP3.ELF", &.{}));
     const pid = esp_exec.last_exec_pid().?;
     const info = process.info(pid).?;
-    // 768 pages of writable segment + the page the argv/envp block is packed
-    // into. Middle segments are not counted in either figure.
-    try std.testing.expectEqual(@as(u64, 769), info.data_pages);
+    // M171a: the VIRTUAL span is the full 768 writable pages + the argv/envp
+    // headroom page — but RESIDENT is only the file page + that headroom
+    // page; the 767-page zero-fill tail is a demand region, not allocated.
+    try std.testing.expectEqual(@as(u64, 769), info.data_map_pages);
+    try std.testing.expectEqual(@as(u64, 2), info.data_pages);
     try std.testing.expectEqual(@as(u64, 1), info.text_pages);
-    // And every one of those pages was REALLY taken: text + the one rodata
-    // page + the 769 writable pages + the 192 KiB task stack and its kernel
-    // twin. A loader that "accepted" the image without mapping its declared
-    // tail would show a delta short by 768 pages.
-    try std.testing.expectEqual(free_before - (1 + 1 + 769 + 48 + 48), alloc.stats().free_pages);
+    try std.testing.expect(process.find_zero_region(pid, 0x40_5000) != null);
+    // And only the resident pages were REALLY taken: text + the one rodata
+    // page + the 2 resident writable pages + the 192 KiB task stack and its
+    // kernel twin. The tail costs nothing until EL0 touches it.
+    try std.testing.expectEqual(free_before - (1 + 1 + 2 + 48 + 48), alloc.stats().free_pages);
 }
 
 test "monitor: ls lists the host-share files deterministically" {

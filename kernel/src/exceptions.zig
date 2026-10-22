@@ -999,6 +999,15 @@ pub fn populate_user_page(pid: usize, root: u64, va: u64, for_write: bool) bool 
         writable = (mreg.prot & 2) != 0;
         executable = (mreg.prot & 4) != 0;
         demand = true;
+    } else if (process.find_zero_region(pid, page)) |zreg| {
+        // M171a (card #3032): an image zero-fill tail — the BSS/.noptrbss
+        // span the gap loader claimed virtually but did not back at exec.
+        // Same demand-zero semantics as an anonymous mmap region; the prot
+        // mirrors the segment's aperture permissions (W^X holds).
+        readable = (zreg.prot & 1) != 0;
+        writable = (zreg.prot & 2) != 0;
+        executable = (zreg.prot & 4) != 0;
+        demand = true;
     } else if (process.info(pid)) |inf| {
         if (inf.stack_len > 0 and page >= inf.stack_va and page < inf.stack_va + inf.stack_len) {
             readable = true;
@@ -2289,6 +2298,66 @@ test "exceptions: #2112 — populate refuses already-mapped and permission-denie
     try std.testing.expect(!populate_user_page(pid, root, x_va, false));
     try std.testing.expect(!populate_user_page(pid, root, x_va, true));
     try std.testing.expect(!mmu.leaf_el0_visible(root, x_va));
+}
+
+test "exceptions: M171a image demand-zero tails populate on first touch (card #3032)" {
+    mmu.reset();
+    alloc.reset_refcounts();
+    process.init();
+
+    const map_desc = [_]memmap.MemoryDescriptor{
+        .{ .type = .conventional_memory, .physical_start = 0x100000, .virtual_start = 0, .number_of_pages = 20, .attribute = 0 },
+    };
+    const view = memmap.MapView.init(std.mem.asBytes(&map_desc), @sizeOf(memmap.MemoryDescriptor), map_desc.len);
+    try std.testing.expect(alloc.init(view, &.{}));
+
+    const root = mmu.build_user_root(userspace.text_va, 0x1000, 64, userspace.stack_va, 0x2000, 8192).?;
+    const pid = process.create("TEST_3032", .{}, .{
+        .root_phys = root,
+        .text_va = userspace.text_va,
+        .text_len = 64,
+        .stack_va = userspace.stack_va,
+        .stack_len = 8192,
+    }, .{}).?;
+    _ = process.bind(pid, 2);
+
+    // A writable data-segment tail (BSS/.noptrbss) and a read-only rodata
+    // tail, as exec registers them.
+    const data_va: u64 = 0x0000_0000_4000_0000;
+    const ro_va: u64 = 0x0000_0000_5000_0000;
+    try std.testing.expect(process.add_zero_region(pid, data_va, 8192, 3)); // RW
+    try std.testing.expect(process.add_zero_region(pid, ro_va, 4096, 1)); // R only
+
+    // A fault inside the tail maps a zero page EL0-RW and records it on
+    // the process — the resident-accounting path footprint/mem_bytes and
+    // teardown both read. (zero_phys_page is a no-op on host tests; the
+    // zeroing runs on-guest through the same call mmap/stack faults take.)
+    try std.testing.expect(!mmu.leaf_el0_visible(root, data_va));
+    try std.testing.expect(populate_user_page(pid, root, data_va + 96, true));
+    try std.testing.expect(mmu.leaf_el0_visible(root, data_va));
+    const leaf = mmu.get_user_leaf(root, data_va).?;
+    try std.testing.expectEqual(@as(u64, 1), (leaf.* >> 6) & 3); // EL0 RW
+    try std.testing.expect(process.owns_dynamic_page(pid, leaf.* & 0x0000_ffff_ffff_f000));
+
+    // A WRITE fault against the read-only tail is a program fault to
+    // deliver, not a page to allocate; the READ fault the segment admits
+    // still populates.
+    try std.testing.expect(!populate_user_page(pid, root, ro_va, true));
+    try std.testing.expect(!mmu.leaf_el0_visible(root, ro_va));
+    try std.testing.expect(populate_user_page(pid, root, ro_va, false));
+    const ro_leaf = mmu.get_user_leaf(root, ro_va).?;
+    try std.testing.expectEqual(@as(u64, 3), (ro_leaf.* >> 6) & 3); // EL0 R only
+
+    // A VA outside every demand region (mmap, zero tail, stack) is still
+    // a fault to deliver — lazy BSS did not widen the populated set.
+    const foreign: u64 = 0x0000_0000_6000_0000;
+    try std.testing.expect(!populate_user_page(pid, root, foreign, true));
+    try std.testing.expect(!populate_user_page(pid, root, foreign, false));
+    try std.testing.expect(!mmu.leaf_el0_visible(root, foreign));
+
+    // The second tail page is an independent demand page.
+    try std.testing.expect(populate_user_page(pid, root, data_va + 4096, true));
+    try std.testing.expect(mmu.leaf_el0_visible(root, data_va + 4096));
 }
 
 test "exceptions: ensure_user_write_pages is a no-op on host test binaries (issue #1391)" {

@@ -30,7 +30,8 @@
 //!   * Bounded: p_memsz >= p_filesz per segment, non-overlapping ordered
 //!     file ranges, total INITIALIZED bytes <= `load_max`, and total MAPPED
 //!     bytes <= `map_max` (matching `exec.exec_image_max` on the file and
-//!     the loader's own RAM budget on the mapping — M72a, issue #1579).
+//!     the loader's virtual-span bound on the mapping — M72a, issue #1579;
+//!     a VIRTUAL bound since M171a/card #3032).
 //!     The FILE ranges are validated against the caller-supplied file size
 //!     — the read buffer on the staged path, the STAT size on the streamed
 //!     one (`parse_head`, M70c-K / issue #1504).
@@ -188,15 +189,21 @@ pub const load_max: usize = 32 * 1024 * 1024;
 /// check, so an oversized BSS is refused by a bound that names MEMORY rather
 /// than by `gap_too_high`.
 ///
-/// This is not a notional reservation. `exec_static_elf_gap` allocates and
-/// zeroes every mapped page before EL0 runs (`alloc_pages(ceil(memsz /
-/// page_size))`, then a fill of `[filesz..memsz]`), so this bound is a RAM
-/// budget, not an address-space courtesy. 64 MiB is 2× the 32 MiB FIPS
-/// scratch buffer: it admits the largest known Go images (a Charm-sized
-/// binary is ~37 MB of `memsz`, and `go-hello` run 11's fixture is ~48 MB)
-/// and leaves most of the measured pool for the image's own heap — `sysinfo`
-/// on VZ reports `free=0xde0b` (56,843 pages, 222.0 MiB) on a fresh boot and
-/// `free=0xb68c` (46,732 pages, 182.5 MiB) with the boot apps up.
+/// Since M171a (card #3032) this IS a notional reservation: the loader
+/// allocates and fills only the file-backed pages of each segment and
+/// registers the zero-fill tail (`memsz − align_up(filesz)`, page-rounded)
+/// as a demand region faulted in on first touch, so `Σ memsz` is a bound
+/// on VIRTUAL span, not a RAM budget. The resident side is bounded by
+/// the allocator: at exec the file-backed part keeps the
+/// `alloc_pages` → `out_of_memory` (ENOMEM) refusal, and at fault time a
+/// dry pool makes `populate_user_page` deliver the fault rather than
+/// map it — never a silent overcommit.
+/// 64 MiB stays the virtual bound: it admits the largest known Go images
+/// (a Charm-sized binary is ~37 MB of `memsz`, and `go-hello` run 11's
+/// fixture is ~48 MB) without letting one image claim an arbitrary share
+/// of the user address space — `sysinfo` on VZ reports `free=0xde0b`
+/// (56,843 pages, 222.0 MiB) on a fresh boot and `free=0xb68c` (46,732
+/// pages, 182.5 MiB) with the boot apps up.
 pub const map_max: usize = 64 * 1024 * 1024;
 /// At most three PT_LOAD segments: text + optional RO rodata + data
 /// (issue #1163 — the Go linker's R+X / R / RW layout).
@@ -881,9 +888,10 @@ test "elf: rejects out-of-range and oversized segments" {
     try testing.expectEqual(@as(usize, forty_mib), bss_image.segments[0].mem_size);
     try testing.expect(mem_total(bss_image) > load_max); // past the old bound, still legal
 
-    // ...but the mapped total is still bounded, and by its own name: this
-    // loader allocates and zeroes every mapped page, so a 1 GiB BSS cannot
-    // be a way to dodge the acceptance bound.
+    // ...but the mapped total is still bounded, and by its own name: the
+    // bound now charges the VIRTUAL span (the zero-fill tail is
+    // demand-paged, M171a), so a 1 GiB BSS cannot be a way to dodge the
+    // acceptance bound.
     var too_much = elf32_one(&@as([4]u8, @splat(@as(u8, 0))), 0x400000, 0, 0, 5);
     std.mem.writeInt(u32, too_much[72..76], @intCast(map_max + 1), .little);
     try testing.expectError(error.map_too_large, parse(&too_much));

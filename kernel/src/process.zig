@@ -193,6 +193,20 @@ pub const MmapRegion = struct {
     flags: u64 = 0,
 };
 
+/// M171a (card #3032): bound on an image's demand-zero tails — one per
+/// PT_LOAD segment, so `elf.max_segments`.
+pub const max_zero_regions: usize = 3;
+
+/// An image zero-fill tail registered by the gap ELF loader. `prot` uses
+/// the same bit layout as `MmapRegion.prot` (1=R, 2=W, 4=X): the fault
+/// path maps the page with the segment's aperture permissions verbatim,
+/// so W^X still holds (the text tail is R+X, the data tail R+W).
+pub const ZeroRegion = struct {
+    base_va: u64 = 0,
+    len: u64 = 0,
+    prot: u64 = 0,
+};
+
 /// The address space a process runs in (what its TTBR0 user root maps).
 /// Claim 0826: the process OWNS the backing pages for exec'd programs —
 /// the allocator-backed text/user-stack phys + page counts (0 counts = the
@@ -214,7 +228,15 @@ pub const AddrSpace = struct {
     /// Physical data+bss pages the process owns (allocator-backed;
     /// 0 = no data segment / static).
     data_phys: u64 = 0,
+    /// M171a (card #3032): the RESIDENT subset only — the file-backed
+    /// pages plus the argv/envp run the loader keeps eager. The
+    /// zero-fill tail is a demand region, not owned pages.
     data_pages: u64 = 0,
+    /// M171a (card #3032): the writable segment's VIRTUAL mapped page
+    /// count — page-rounded p_memsz plus any argv/envp headroom the
+    /// loader reserves past it. The exec line reports `data_pages` as
+    /// `datapages=` (resident at exec) and this as `mappedpages=`.
+    data_map_pages: u64 = 0,
     /// User VA + length of the mapped stack (EL0 RW, non-executable).
     stack_va: u64 = 0,
     stack_len: u64 = 0,
@@ -233,6 +255,11 @@ pub const AddrSpace = struct {
     /// User VA of the gap-layout rodata segment (issue #1214): recorded so
     /// `mmap_collides` can protect it like text/data/stack. 0 = none.
     ro_va: u64 = 0,
+    /// M171a (card #3032): the rodata segment's VIRTUAL byte span
+    /// (p_memsz) — the collision/snapshot span. `ro_pages` counts only
+    /// the resident file-backed pages; the zero-fill tail is a demand
+    /// region.
+    ro_len: u64 = 0,
     /// User VA one-past the gap layout's packed argv+envp region in the
     /// writable segment's reserved tail page (issue #1214 review / #1226;
     /// 0 = no block). `mmap_collides` protects the data aperture through
@@ -246,6 +273,15 @@ pub const AddrSpace = struct {
     /// M29 VM Depth: Anonymous mmap regions and dynamic page allocations
     mmap_regions: [max_mmap_regions]MmapRegion = @as([max_mmap_regions]MmapRegion, @splat(@as(MmapRegion, .{}))),
     mmap_region_count: usize = 0,
+    /// M171a (card #3032): image demand-zero tails — the page-rounded
+    /// `[align_up(filesz), segment-end)` span of each PT_LOAD the loader
+    /// claimed virtually but did not back at exec. `populate_user_page`
+    /// faults a zero page into these on first touch, exactly like an
+    /// anonymous mmap region, but they are NOT mmap regions: they cost no
+    /// `mmap_region` slot, `sys_munmap` cannot deregister them, and they
+    /// die with the descriptor like the apertures themselves.
+    zero_regions: [max_zero_regions]ZeroRegion = @as([max_zero_regions]ZeroRegion, @splat(@as(ZeroRegion, .{}))),
+    zero_region_count: usize = 0,
     mmap_next_va: u64 = mmap_default_va,
     dynamic_pages: [max_dynamic_pages]u64 = @as([max_dynamic_pages]u64, @splat(@as(u64, 0))),
     dynamic_page_count: usize = 0,
@@ -269,6 +305,7 @@ pub const AddrSpaceSpec = struct {
     data_len: u64 = 0,
     data_phys: u64 = 0,
     data_pages: u64 = 0,
+    data_map_pages: u64 = 0,
     stack_va: u64 = 0,
     stack_len: u64 = 0,
     stack_phys: u64 = 0,
@@ -278,6 +315,7 @@ pub const AddrSpaceSpec = struct {
     ro_phys: u64 = 0,
     ro_pages: u64 = 0,
     ro_va: u64 = 0,
+    ro_len: u64 = 0,
     argv_end_va: u64 = 0,
     lib_phys: u64 = 0,
     lib_pages: u64 = 0,
@@ -476,6 +514,7 @@ fn apply_spec(space: *AddrSpace, spec: AddrSpaceSpec) void {
     space.data_len = spec.data_len;
     space.data_phys = spec.data_phys;
     space.data_pages = spec.data_pages;
+    space.data_map_pages = spec.data_map_pages;
     space.stack_va = spec.stack_va;
     space.stack_len = spec.stack_len;
     space.stack_phys = spec.stack_phys;
@@ -485,6 +524,7 @@ fn apply_spec(space: *AddrSpace, spec: AddrSpaceSpec) void {
     space.ro_phys = spec.ro_phys;
     space.ro_pages = spec.ro_pages;
     space.ro_va = spec.ro_va;
+    space.ro_len = spec.ro_len;
     space.argv_end_va = spec.argv_end_va;
     space.lib_phys = spec.lib_phys;
     space.lib_pages = spec.lib_pages;
@@ -619,6 +659,43 @@ pub fn find_mmap_region(pid: usize, va: u64) ?*const MmapRegion {
     return null;
 }
 
+/// M171a (card #3032): register one image demand-zero tail — the
+/// page-rounded `[align_up(filesz), segment-end)` span of a PT_LOAD the
+/// loader claimed virtually but did not back at exec. Exec-time only,
+/// before the process runs; there is no remove path because the regions
+/// die with the descriptor like the apertures themselves.
+pub fn add_zero_region(pid: usize, va: u64, len: u64, prot: u64) bool {
+    const taken = svclock.acquire_missing(svclock.dom_bit(.kernel));
+    defer svclock.release_set(taken);
+    if (pid >= max_processes or processes[pid].state == .free) return false;
+    var space = &processes[pid].addr_space;
+    if (space.zero_region_count >= max_zero_regions) return false;
+    for (&space.zero_regions) |*r| {
+        if (r.len == 0) {
+            r.* = .{ .base_va = va, .len = len, .prot = prot };
+            space.zero_region_count += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The image demand-zero tail covering `va`, or null. Same lock contract
+/// as `find_mmap_region`: callers hold the kernel domain.
+pub fn find_zero_region(pid: usize, va: u64) ?*const ZeroRegion {
+    if (pid >= max_processes or processes[pid].state == .free) return null;
+    return zero_region_in(&processes[pid].addr_space, va);
+}
+
+fn zero_region_in(space: *const AddrSpace, va: u64) ?*const ZeroRegion {
+    for (&space.zero_regions) |*r| {
+        if (r.len > 0 and va >= r.base_va and va < r.base_va + r.len) {
+            return r;
+        }
+    }
+    return null;
+}
+
 /// The `index`-th live mmap region of `pid`, or null. ADR 0027 review
 /// (finding 2): `arm_task_regions` merges these PROCESS-scope regions into
 /// every task's uaccess view, so a mapping is visible to all of the
@@ -669,7 +746,7 @@ pub fn mmap_collides(pid: usize, va: u64, len: u64) bool {
     if (space.argv_end_va > space.data_va) data_len = @max(data_len, space.argv_end_va - space.data_va);
     const apertures = [_]struct { base: u64, len: u64 }{
         .{ .base = space.text_va, .len = aperture_span(space.text_va, space.text_len) },
-        .{ .base = space.ro_va, .len = space.ro_pages * 4096 },
+        .{ .base = space.ro_va, .len = aperture_span(space.ro_va, space.ro_len) },
         .{ .base = space.data_va, .len = data_len },
         .{ .base = space.stack_va, .len = aperture_span(space.stack_va, space.stack_len) },
     };
@@ -854,10 +931,13 @@ pub fn create_as(
     processes[id].name_len = take;
     processes[id].image = image;
     apply_spec(&processes[id].addr_space, addr_space);
-    // RW backing may include an extra argv page. Count the segment's memsz,
-    // not that loader headroom; ro_pages is already the rounded R segment.
+    // RW backing may include an extra argv page. Count each segment's
+    // VIRTUAL memsz span, not that loader headroom — M171a: with the
+    // zero-fill tails demand-paged the resident counts (text_pages,
+    // ro_pages, data_pages) are a subset, so the receipt's static span
+    // comes from the declared lengths.
     processes[id].runtime_usage.static_pages = segment_pages(addr_space.text_len) +
-        addr_space.ro_pages + segment_pages(addr_space.data_len);
+        segment_pages(addr_space.ro_len) + segment_pages(addr_space.data_len);
     processes[id].kernel_stack = kernel_stack;
     processes[id].uid = actor.uid;
     processes[id].caps = actor.caps;
@@ -917,7 +997,7 @@ pub fn memory_snapshot(id: usize) ?struct {
     result.live_pages = space.dynamic_page_count;
     result.live_regions = space.mmap_region_count;
     result.text_bytes = aperture_span(space.text_va, space.text_len);
-    result.ro_bytes = space.ro_pages * 4096;
+    result.ro_bytes = aperture_span(space.ro_va, space.ro_len);
     result.data_bytes = aperture_span(space.data_va, space.data_len);
     if (space.argv_end_va > space.data_va) result.data_bytes = @max(result.data_bytes, space.argv_end_va - space.data_va);
     result.stack_bytes = aperture_span(space.stack_va, space.stack_len);
@@ -1263,7 +1343,11 @@ pub const ProcessInfo = struct {
     data_va: u64,
     data_len: u64,
     data_phys: u64,
+    /// Resident pages of the data aperture at read time (`datapages=`).
     data_pages: u64,
+    /// Virtual mapped pages of the data aperture (`mappedpages=`) —
+    /// M171a: the demand-zero tail counts here, not in `data_pages`.
+    data_map_pages: u64 = 0,
     stack_va: u64,
     stack_len: u64,
     stack_phys: u64,
@@ -1351,7 +1435,10 @@ pub fn footprint_pages(id: usize) u64 {
         s.ro_pages + s.interp_pages + s.lib_pages +
         @as(u64, @intCast(s.dynamic_page_count)) + p.kernel_stack.pages;
     if (s.text_pages == 0) pages += segment_pages(s.text_len);
-    if (s.data_pages == 0) pages += segment_pages(s.data_len);
+    // M171a: an exec'd image whose data segment is entirely demand-zero
+    // owns no eager pages, but its span is NOT static boot backing —
+    // the static-charge fallback applies only when no zero tail claims it.
+    if (s.data_pages == 0 and zero_region_in(s, s.data_va) == null) pages += segment_pages(s.data_len);
     if (s.stack_pages == 0) pages += segment_pages(s.stack_len);
     return pages;
 }
@@ -1407,6 +1494,7 @@ pub fn info(id: usize) ?ProcessInfo {
         .data_len = p.addr_space.data_len,
         .data_phys = p.addr_space.data_phys,
         .data_pages = p.addr_space.data_pages,
+        .data_map_pages = p.addr_space.data_map_pages,
         .stack_va = p.addr_space.stack_va,
         .stack_len = p.addr_space.stack_len,
         .stack_phys = p.addr_space.stack_phys,
@@ -2319,6 +2407,7 @@ test "process: static segment receipt survives real backing release and recycle"
         .text_pages = 2,
         .ro_phys = alloc.alloc_pages(3).?,
         .ro_pages = 3,
+        .ro_len = 3 * 4096,
         .data_len = 4096,
         .data_phys = alloc.alloc_pages(2).?,
         .data_pages = 2, // one segment page plus argv headroom

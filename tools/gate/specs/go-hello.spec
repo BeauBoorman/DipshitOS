@@ -17,18 +17,22 @@
 # runs and prints the pinned lines. The in-guest memory samples (run 06/07) are
 # the ADR 0035 D6 figure: reported, not asserted, because a footprint is a
 # property of the machine.
-# Runs 11-12 (M72a, #1579): the loader's TWO bounds, on one real Go image —
-# a `gobig.go`-shaped file plus 40 MiB of `.noptrbss` (the shape
-# `crypto/internal/fips140/drbg`'s 32 MiB `entropy.ScratchBuffer` gives every
-# Charm-sized binary). That image once refused as `segment_too_large`, because
-# the single acceptance bound charged MAPPED bytes: zero-initialized bytes cost
-# no file bytes, so an image the file could not even hold was refused for
-# being big on disk. Run 11 pins the fix — the 9.1 MiB file maps 49 MiB and
-# EXECS, reading both ends of its 40 MiB tail back, with `datapages=` held to
-# the image's own headers on the host. Run 12 pins that the bound MOVED rather
-# than disappeared: the same bytes with `p_memsz` rewritten to 1 GiB are still
-# refused, by a message that names the mapped-memory bound and never says
-# "staging buffer" (the lie the old fall-through told about this exact shape).
+# Runs 11-12 (M72a, #1579; redefined M171a, card #3032): the loader's TWO
+# bounds, on one real Go image — a `gobig.go`-shaped file plus 40 MiB of
+# `.noptrbss` (the shape `crypto/internal/fips140/drbg`'s 32 MiB
+# `entropy.ScratchBuffer` gives every Charm-sized binary). That image once
+# refused as `segment_too_large`, because the single acceptance bound
+# charged MAPPED bytes: zero-initialized bytes cost no file bytes, so an
+# image the file could not even hold was refused for being big on disk.
+# Run 11 pins the fix — the 9.1 MiB file maps 48 MiB and EXECS, reading
+# both ends of its 40 MiB tail back — and, since M171a, holds the guest's
+# `mappedpages=` (VIRTUAL span) to the image's own headers while
+# `datapages=` (RESIDENT at exec) stays within the file-backed count plus
+# the argv headroom page: the tail is demand-zero, not eagerly resident.
+# Run 12 pins that the bound MOVED rather than disappeared: the same bytes
+# with `p_memsz` rewritten to 1 GiB are still refused, by a message that
+# names the mapped-memory bound and never says "staging buffer" (the lie
+# the old fall-through told about this exact shape).
 # HOST PREREQUISITE, in addition to the list below:
 # `.build/go/GOLOADBSS.ELF` (`just go-toolchain` builds it).
 # Runs 09-10 (M69e, #1532): the DAILY LOOP, and the only boots here where a
@@ -214,16 +218,49 @@ if "exec: loaded XL.ELF" in ser or "exec: loaded TRUNC.ELF" in ser:
     sys.exit("FAIL: a refused image reported a successful load")
 print("both refusals in order: XL at %d, TRUNC at %d" % (xl, tr))
 PY
+# M171a (card #3032): the streamed 8 MiB data segment is RESIDENT, its
+# zero-fill tail is NOT. `datapages=` is held to the writable segment's
+# own headers on the host: at least the file-backed pages (the streamed
+# data) and never more than that plus the argv/envp run (two pages bound).
+# `mappedpages=` reports the VIRTUAL span — the page-rounded p_memsz plus
+# any headroom the argv block needs past it.
 vgate_assert 02 python <<'PY'
-import os, re, sys
+import os, re, struct, sys
+
 ser = open(os.environ["VG_SER"], errors="replace").read()
-m = re.search(r"exec: loaded GOBIG\.ELF .*datapages=(\d+)", ser)
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+d = open(os.path.join(share, "GOBIG.ELF"), "rb").read()
+phoff = struct.unpack_from("<Q", d, 32)[0]
+phes = struct.unpack_from("<H", d, 54)[0]
+phnum = struct.unpack_from("<H", d, 56)[0]
+rw_fsz = rw_msz = None
+for i in range(phnum):
+    o = phoff + i * phes
+    t, fl, off, va, pa, fsz, msz, al = struct.unpack_from("<IIQQQQQQ", d, o)
+    if t == 1 and fl & 2:
+        rw_fsz, rw_msz = fsz, msz
+if rw_fsz is None:
+    sys.exit("FAIL: the staged GOBIG.ELF has no writable PT_LOAD segment")
+file_pages = (rw_fsz + 4095) // 4096
+mem_pages = (rw_msz + 4095) // 4096
+cover = (((rw_msz + 7) & ~7) + 4096 + 4095) // 4096
+expected_map = max(mem_pages, cover)
+m = re.search(r"exec: loaded GOBIG\.ELF .*datapages=(\d+) mappedpages=(\d+)", ser)
 if not m:
-    sys.exit("FAIL: no `exec: loaded GOBIG.ELF ... datapages=` line")
-pages = int(m.group(1))
-if pages < 2048:
-    sys.exit("FAIL: datapages=%d; an 8 MiB data segment needs >= 2048 pages" % pages)
-print("streamed 8 MiB data segment mapped: datapages=%d" % pages)
+    sys.exit("FAIL: no `exec: loaded GOBIG.ELF ... datapages= mappedpages=` line")
+data_pages, map_pages = int(m.group(1)), int(m.group(2))
+if map_pages != expected_map:
+    sys.exit("FAIL: mappedpages=%d but the image's writable segment spans %d "
+             "(memsz=%d, argv cover=%d)" % (map_pages, expected_map, rw_msz, cover))
+if data_pages < file_pages:
+    sys.exit("FAIL: datapages=%d under the file-backed count %d — the streamed "
+             "8 MiB is not resident" % (data_pages, file_pages))
+if data_pages > file_pages + 2:
+    sys.exit("FAIL: datapages=%d beyond file pages %d + argv run — the zero-fill "
+             "tail is resident at exec" % (data_pages, file_pages))
+print("streamed 8 MiB data resident, tail demand-zero: datapages=%d "
+      "(file %d + argv run) mappedpages=%d (memsz=%d, filesz=%d)"
+      % (data_pages, file_pages, map_pages, rw_msz, rw_fsz))
 PY
 
 # M70c (#1455) run 04: the transfer half of the card's "measure the honest
@@ -810,11 +847,13 @@ vgate_assert 11 serial-contains 'virelai-go loadbss OK'
 vgate_assert 11 serial-absent '[EXC] parking:'
 vgate_assert 11 serial-absent 'exited status=139'
 
-# The mapping is held to the image's own headers: the guest's `datapages=` is
-# compared with ceil(RW p_memsz / 4096) + 1 (the one extra page the gap
-# loader reserves for argv + envp), computed here from the file that was
-# staged. That is the axis the card moved - a bound on MAPPED bytes - so it
-# is asserted as a number, not as "it ran".
+# M171a (card #3032): the mapping is still held to the image's own headers,
+# but on TWO numbers now. `mappedpages=` is the VIRTUAL span — the
+# page-rounded RW p_memsz plus any argv/envp headroom (for this fixture's
+# page-aligned memsz, exactly ceil(memsz/4096) + 1). `datapages=` is the
+# RESIDENT count at exec — the file-backed pages plus the argv run (two
+# pages bound), never the 40 MiB tail: that memory now exists only once
+# the program touches it. Both are asserted as numbers, not as "it ran".
 vgate_assert 11 python <<'PY'
 import os, re, struct, sys
 
@@ -824,28 +863,38 @@ d = open(os.path.join(share, "GOLOADBSS.ELF"), "rb").read()
 phoff = struct.unpack_from("<Q", d, 32)[0]
 phes = struct.unpack_from("<H", d, 54)[0]
 phnum = struct.unpack_from("<H", d, 56)[0]
-expected = None
-rw_fsz = rw_msz = 0
+rw_fsz = rw_msz = None
 for i in range(phnum):
     o = phoff + i * phes
     t, fl, off, va, pa, fsz, msz, al = struct.unpack_from("<IIQQQQQQ", d, o)
     if t == 1 and fl & 2:
         rw_fsz, rw_msz = fsz, msz
-        expected = (msz + 4095) // 4096 + 1
-if expected is None:
+if rw_fsz is None:
     sys.exit("FAIL: the staged GOLOADBSS.ELF has no writable PT_LOAD segment")
-m = re.search(r"exec: loaded GOLOADBSS\.ELF .*datapages=(\d+)", ser)
+file_pages = (rw_fsz + 4095) // 4096
+mem_pages = (rw_msz + 4095) // 4096
+cover = (((rw_msz + 7) & ~7) + 4096 + 4095) // 4096
+expected_map = max(mem_pages, cover)
+m = re.search(r"exec: loaded GOLOADBSS\.ELF .*datapages=(\d+) mappedpages=(\d+)", ser)
 if not m:
-    sys.exit("FAIL: no `exec: loaded GOLOADBSS.ELF ... datapages=` line")
-got = int(m.group(1))
-if got != expected:
-    sys.exit("FAIL: the guest mapped %d pages but the image's writable segment declares %d "
-             "(%d B of memsz) - the mapping did not follow the headers" % (got, expected, rw_msz))
-if got < 10240:
-    sys.exit("FAIL: %d pages is under the 40 MiB the fixture's .bss needs" % got)
-print("mapped %d pages of a %d B file: RW filesz=%d memsz=%d (%.2f MiB of .bss) followed the "
-      "headers, and the program read both ends of it back"
-      % (got, len(d), rw_fsz, rw_msz, (rw_msz - rw_fsz) / 1048576.0))
+    sys.exit("FAIL: no `exec: loaded GOLOADBSS.ELF ... datapages= mappedpages=` line")
+data_pages, map_pages = int(m.group(1)), int(m.group(2))
+if map_pages != expected_map:
+    sys.exit("FAIL: the guest mapped %d pages but the image's writable segment spans %d "
+             "(%d B of memsz) - the virtual bound did not follow the headers"
+             % (map_pages, expected_map, rw_msz))
+if map_pages < 10240:
+    sys.exit("FAIL: %d mapped pages is under the 40 MiB the fixture's .bss needs" % map_pages)
+if data_pages > file_pages + 2:
+    sys.exit("FAIL: datapages=%d beyond file pages %d + argv run — the zero-fill "
+             "tail is resident at exec (mapped %d)" % (data_pages, file_pages, map_pages))
+if data_pages < file_pages:
+    sys.exit("FAIL: datapages=%d under the file-backed count %d — the streamed "
+             "image data is not resident" % (data_pages, file_pages))
+print("mapped %d virtual pages of a %d B file (RW filesz=%d memsz=%d, %.2f MiB of "
+      ".bss); resident at exec only %d — the tail faulted in on touch, and the "
+      "program read both ends of it back"
+      % (map_pages, len(d), rw_fsz, rw_msz, (rw_msz - rw_fsz) / 1048576.0, data_pages))
 PY
 
 vgate_run 12 -- --script '$RUN_DIR/script16.txt' --script-expect 'VirelaiOS AArch64 support snapshot' --timeout 300

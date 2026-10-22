@@ -45,7 +45,7 @@ re-measure commands are at the end.
 | bound | value | where |
 | --- | --- | --- |
 | exec staging | **2 MiB fixed whole-file buffer**, and there are **two** of them — `program` and `interp_program` (the PT_INTERP/LD.SO path), **4 MiB of .bss** — plus the 16 KiB header window the streamed path adds; the *staged* shapes (DSK1/DSK3/contiguous ELF/PT_INTERP) are still bounded by that buffer. Since K1 the gap-layout ELF path **streams** and is bounded instead by `exec_image_max` = 32 MiB (see the amendment) | `kernel/src/exec.zig` (`exec_program_max`, `exec_image_max`, `header_window`), `parse_dsk3` `image_size > buf.len` |
-| ELF bounds | **two, since M72a (#1579)**: `load_max` = **32 MiB of INITIALIZED bytes** (`Σ p_filesz`, what comes off the volume) and `map_max` = **64 MiB of MAPPED bytes** (`Σ p_memsz`, which this loader really allocates and zeroes — a RAM budget, not a reservation). K1 raised the single 32 MiB total from 2 MiB; the split exists because zero-initialized `.bss`/`.noptrbss` costs no file bytes, so charging it against a bound named for the file refused images the file could not even hold. ≤3 PT_LOADs | `kernel/src/elf.zig` (`load_max`, `map_max`, `max_segments`) |
+| ELF bounds | **two, since M72a (#1579)**: `load_max` = **32 MiB of INITIALIZED bytes** (`Σ p_filesz`, what comes off the volume) and `map_max` = **64 MiB of MAPPED bytes** (`Σ p_memsz` — a RAM budget when this was written; a VIRTUAL bound since card #3032, see Amendment 12). K1 raised the single 32 MiB total from 2 MiB; the split exists because zero-initialized `.bss`/`.noptrbss` costs no file bytes, so charging it against a bound named for the file refused images the file could not even hold. ≤3 PT_LOADs | `kernel/src/elf.zig` (`load_max`, `map_max`, `max_segments`) |
 | GOOS=virelai link recipe | text base 0x10000 with its end ≤0x80000 (**448 KiB** of text), rodata base 0x80000 with its end ≤0x110000, data base 0x110000 | `tools/go/build-go.sh`'s layout guard (the guard exists because a shifted layout "loads but misbehaves on target") |
 | gap vaddr bound | every gap segment's vaddr below `gap_base_max` = 0x1000_0000 | `kernel/src/elf.zig:158` |
 | page tables | fixed **512×4 KiB (2 MiB) .bss carve-out, never reclaimed** — a *total-roots* budget | `kernel/src/mmu.zig:66-71`; `tables_used()`/`tables_capacity()` at `:146` |
@@ -942,7 +942,8 @@ does not hold in this tree and the bound could therefore not simply be dropped.
 This loader *eagerly* allocates and zeroes every mapped page
 (`exec_static_elf_gap`: `alloc_pages(ceil(memsz / page_size))`, then a fill of
 `[filesz..memsz]`), so `Σ memsz` is the RAM an image takes out of the pool before
-its first instruction. A 1 GiB `.bss` accepted here would have become an
+its first instruction. *(True when written — card #3032 made the
+zero-fill tail demand-paged; see Amendment 12.)* A 1 GiB `.bss` accepted here would have become an
 `.out_of_memory` a moment later instead of a named refusal.
 
 Two bounds, each named for what it charges:
@@ -950,7 +951,7 @@ Two bounds, each named for what it charges:
 | bound | charges | value | error (`elf.zig`) | `ExecResult` |
 | --- | --- | --- | --- | --- |
 | `load_max` | `Σ p_filesz` — the bytes read off the volume | 32 MiB (unchanged) | `segment_too_large` | `image_too_large` / `staging_too_large` as before |
-| `map_max` | `Σ p_memsz` — the pages allocated and zeroed | **64 MiB** | `map_too_large` (new) | `map_too_large` (new) |
+| `map_max` | `Σ p_memsz` — the pages allocated and zeroed *(virtual span since card #3032 — Amendment 12)* | **64 MiB** | `map_too_large` (new) | `map_too_large` (new) |
 
 `load_max` is now a parser-level invariant rather than the operative bound: the
 segment file ranges are disjoint and inside the file (both still enforced), so
@@ -1106,3 +1107,40 @@ toolchain churn is a different question, owned by the fleet drivers). The
 named bound going forward is `scheduler.max_tasks` under concurrency —
 refusals are ENOSPC at spawn or a status-2 `newosproc` death, both named,
 neither a wedge.
+
+## Amendment 12 — card #3032: `map_max` is a VIRTUAL bound, and resident pages are the honest count
+
+Amendment 10's table froze `map_max` as "`Σ p_memsz` — the pages allocated
+and zeroed", a RAM budget, because the gap loader really did allocate and
+zero every mapped page before EL0 ran. That stopped being true in card
+#3032: the loader now allocates and fills only the **file-backed** part of
+each PT_LOAD (plus the argv/envp headroom in the last segment) and
+registers the page-rounded `memsz − align_up(filesz)` tail as an image
+demand-zero region — the same first-touch fault path anonymous mmap and
+the user stack already took (`populate_user_page`, the `find_zero_region`
+bookkeeping in `process.zig`). A Go image's untouched `.bss`/`.noptrbss` —
+the 32 MiB FIPS `entropy.ScratchBuffer` this ADR exists because of — now
+costs no RAM until it is written.
+
+Two consequences for the bounds this ADR owns:
+
+- **`map_max` stays, at 64 MiB, but it charges VIRTUAL span.** It is the
+  address-space bound — how much of its own map one image may claim —
+  exactly the role the "bound on MAPPED bytes" column always described,
+  now honestly named. The resident side needs no new bound in its place:
+  exec's eager part still refuses through the allocator's `out_of_memory`
+  → ENOMEM path, and at fault time a dry pool makes `populate_user_page`
+  deliver the fault rather than overcommit.
+- **Resident pages are what the capacity table counts.** The exec line
+  reports `datapages=` (resident at exec: file pages + the argv run) and
+  `mappedpages=` (the virtual span); `procs` `mem_bytes` (ADR 0047 D5's
+  `footprint_pages`) counts the resident subset — owned segment pages
+  plus demand-faulted dynamic pages — so the figures the capacity table
+  cites are pages that exist, not pages that were reserved.
+
+The gates moved with the semantics, not around them: `go-hello` run 11 now
+asserts `mappedpages` = `ceil(RW p_memsz/4096) + 1` and `datapages` ≤ the
+file-backed count plus the argv run, and the 8 MiB leg asserts the
+streamed data resident with the tail not — the same fixture, held to its
+own headers in both directions. `go-panic` and `go-wm-default` pin the
+fault path and the multi-runtime residency unchanged.

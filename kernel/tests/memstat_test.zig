@@ -33,6 +33,7 @@ test "memstat: live map/unmap counts, compact regions and retained exited receip
         .text_len = 5000,
         .ro_va = 0x800000,
         .ro_pages = 2,
+        .ro_len = 8192,
         .data_va = 0x900000,
         .data_len = 4096,
         .argv_end_va = 0x901900,
