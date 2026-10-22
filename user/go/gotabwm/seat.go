@@ -1017,6 +1017,9 @@ func consumeSeatEvent(e vi.Event) bool {
 	// #2236 defect #13: the same mirror's x|y arg feeds the compose-N
 	// blit for handoff surfaces.
 	surfaceNoteMirror(e)
+	// #3126: the mirror's focused bit tracks the kernel's focused user
+	// window — the routed-chord repair in applyUndo reads it.
+	noteKernelFocus(e)
 	// #2703: live input re-arms the demo strip hold. hidChordHold's job is
 	// to keep the two-tab choreography's destructive steps (swap→pin→
 	// split→closePinnedFirst/closeHosted) behind in-flight scripted input;

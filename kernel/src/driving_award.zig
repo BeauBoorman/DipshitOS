@@ -1402,10 +1402,10 @@ pub fn focus(id: u8) bool {
     var i: usize = 0;
     while (i < win_count) : (i += 1) {
         if (windows[i].id == id) {
+            const old_id = focused_id;
             // Card U5 (ADR 0008 D4): focus is ALWAYS VISIBLE — a focus
             // change must repaint so the ring moves.
             if (focused_id != id) {
-                const old_id = focused_id;
                 // Deliver WIN_BLUR to previously focused user window owner
                 if (find_user_window(old_id)) |old_win| {
                     if (old_win.owner) |old_owner| {
@@ -1428,8 +1428,6 @@ pub fn focus(id: u8) bool {
                         .arg1 = old_id,
                     });
                 }
-                // M32 WMS5: the old window's focused bit cleared — mirror it.
-                if (find_user_window(old_id)) |old_win| wm_mirror(old_win.id);
                 // WM4 (issue #707 card 4): a focus change flips the
                 // rest-alpha state of BOTH windows (the focused one is
                 // exempt, the unfocused one blends). When either side
@@ -1450,8 +1448,15 @@ pub fn focus(id: u8) bool {
                 _ = mark_dirty(0);
             }
             focused_id = id;
-            // M32 WMS5: focus is the WM's hit-test input — mirror the new
-            // focused window.
+            // M32 WMS5: mirror BOTH edges under the new holder — the old
+            // window's cleared bit and the new window's set bit. Mirroring
+            // the old id only after focused_id moved is what makes the
+            // cleared bit honest; stamping it earlier reported the stale
+            // pre-change bit (#3126 — a `dui focus` steal left every blur
+            // mirror claiming focused=1).
+            if (old_id != id) {
+                if (find_user_window(old_id)) |old_win| wm_mirror(old_win.id);
+            }
             wm_mirror(id);
             return true;
         }

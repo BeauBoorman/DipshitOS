@@ -984,6 +984,7 @@ func saveSeatState() func() {
 	pp := powerPixels
 	pm, ps, ph := powerMenuOpen, powerSink, powerBtnHover
 	sf := seatFonts
+	kf := kernelFocusID
 	return func() {
 		tabs, launch = ts, pl
 		spaces, spaceN, spaceCur = sp, sn, sc
@@ -994,6 +995,7 @@ func saveSeatState() func() {
 		powerPixels = pp
 		powerMenuOpen, powerSink, powerBtnHover = pm, ps, ph
 		seatFonts = sf
+		kernelFocusID = kf
 	}
 }
 
@@ -1667,6 +1669,70 @@ func TestHandleWmKeyUndoChordDispatches(t *testing.T) {
 	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
 	if len(*execs) != 1 {
 		t.Fatalf("a placeholder's ctrl-z must not exec: %v", *execs)
+	}
+}
+
+// #3126: the routed undo must repair a desynced delivery route. The kernel
+// pushes an app's KEY_DOWN to ITS focused owner — a `dui focus` steal or a
+// chrome open that outran the seat's raise leaves kernel focus off the tab
+// the seat routes to, and the decode-side press lands nowhere. The kind-20
+// mirror is the seat's only truth for kernel focus; on desync the route
+// re-raises the tab and echoes the press through the content-key seam, so
+// `undo id=` stays the route the app actually answers.
+func TestApplyUndoRepairsKernelFocusDesync(t *testing.T) {
+	defer saveSeatState()()
+	saved := tabs
+	defer func() { tabs = saved }()
+	prevRaise, prevKey := focusRaise, forwardContentKey
+	defer func() { focusRaise, forwardContentKey = prevRaise, prevKey }()
+
+	var raises []uint32
+	var keys [][2]uint16
+	focusRaise = func(id uint32) int64 {
+		raises = append(raises, id)
+		return 0
+	}
+	forwardContentKey = func(usage uint8, flags uint16) int64 {
+		keys = append(keys, [2]uint16{uint16(usage), flags})
+		return 0
+	}
+
+	tabs = TabStrip{}
+	if !tabs.OpenTab(3, "Edit") || !tabs.FocusTab(3) {
+		t.Fatal("OpenTab/FocusTab")
+	}
+
+	// The synced route: mirror says kernel focus is already the tab — no
+	// raise, no echo (the decode-side delivery did its half).
+	kernelFocusID = 3
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(raises) != 0 || len(keys) != 0 {
+		t.Fatalf("synced route must not repair: raises=%v keys=%v", raises, keys)
+	}
+
+	// The desync: focus() stole kernel focus to a non-user window — the
+	// blur mirror cleared the tracked id, no user window claims it.
+	noteKernelFocus(vi.Event{Kind: vi.EvWmWindow, Flags: 3 | (0 << 9)})
+	if kernelFocusID != 0 {
+		t.Fatalf("blur mirror must clear the tracked focus, got %d", kernelFocusID)
+	}
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(raises) != 1 || raises[0] != 3 {
+		t.Fatalf("desynced route must re-raise the tab: %v", raises)
+	}
+	if len(keys) != 1 || keys[0][0] != uint16(hidUsageZ) || keys[0][1] != vi.ModCtrl {
+		t.Fatalf("desynced route must echo ctrl-z: %v", keys)
+	}
+	if kernelFocusID != 3 {
+		t.Fatalf("repaired focus must track the raise, got %d", kernelFocusID)
+	}
+
+	// A foreign user window holding kernel focus is the same desync —
+	// mirror(focused) names the holder, the route still repairs to the tab.
+	kernelFocusID = 9
+	handleWmKey(vi.Event{Kind: vi.EvWmKey, Flags: vi.ModCtrl, Arg0: uint32(hidUsageZ)})
+	if len(raises) != 2 || raises[1] != 3 || len(keys) != 2 {
+		t.Fatalf("foreign-held focus must repair too: raises=%v keys=%v", raises, keys)
 	}
 }
 

@@ -142,6 +142,34 @@ var execApp = vi.Exec
 // host tests assert which pointer samples reach an app without a guest kernel.
 var forwardContentPointer = vi.WmctlContentPtr
 
+// kernelFocusID tracks the kernel's focused USER window from the kind-20
+// registry mirror (flags: id in the low byte, focused<<9, released<<13).
+// The kernel pushes an app's KEY_DOWN to focused_owner(), never to the
+// seat's tab model — the two are the same window while every focus change
+// goes through the seat, but an external focus() (`dui focus`, a window
+// open that outran the seat's raise) desyncs them and the decode-side
+// press lands nowhere. noteKernelFocus keeps the delivery route's ground
+// truth so a routed chord can repair the route instead of lying about it.
+var kernelFocusID uint32
+
+// noteKernelFocus folds one kind-20 mirror into kernelFocusID: a focused
+// mirror names the holder, a blur/release clears it only while it still
+// names that id (a stale mirror for a long-unfocused window must not
+// clobber the current holder).
+func noteKernelFocus(e vi.Event) {
+	if e.Kind != vi.EvWmWindow {
+		return
+	}
+	id := uint32(e.Flags & 0xff)
+	if e.Flags&(1<<9) != 0 {
+		kernelFocusID = id
+		return
+	}
+	if kernelFocusID == id {
+		kernelFocusID = 0
+	}
+}
+
 // hidChordHold is how many composite ticks the two-tab choreography waits
 // after first seeing n>=2, so a rail click (3×2.5 s), a press/release drag
 // (pointerDragHold), `--input-string` into GOEDIT, and `--input-chords`
@@ -762,6 +790,21 @@ func applyUndo() bool {
 	}
 	if id >= sessionIDBase {
 		return false
+	}
+	// #3126: the kernel pushed this press's KEY_DOWN to ITS focused owner
+	// before the kind-21 mirror reached the seat — the route the marker
+	// names only reaches the app while kernel focus sits on the routed
+	// tab. An external focus() (`dui focus 0`, a chrome open that outran
+	// the raise) desyncs the two models and the decode-side press lands
+	// nowhere: the app idles forever. Restore the delivery route and echo
+	// the press through the content-key seam (slot-65 cmd 23 — the same
+	// KEY_DOWN/KEY_UP pair the decode would have queued), so the route is
+	// what the marker says rather than a claim the wire cannot back.
+	if kernelFocusID != id {
+		if focusRaise(id) == 0 {
+			kernelFocusID = id
+			forwardContentKey(hidUsageZ, vi.ModCtrl)
+		}
 	}
 	vi.ConsoleLine(MarkerUndo + "id=" + vi.Itoa64(int64(id)))
 	return true
