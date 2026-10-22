@@ -266,7 +266,56 @@ pub fn check(actor: Actor, partition: file_table.Partition, path: []const u8, wa
     // No explicit entry (or a path too long to carry one): default policy.
     if (privileged) return .allow;
     if (!labelOwned(actor, partition, path)) return .eacces; // #2085
-    return modeVerdict(actor, defaultMode(partition, want), process.uid_user, want);
+    return modeVerdict(actor, defaultMode(partition, want), defaultOwner(partition, path), want);
+}
+
+/// M173b (#3041, ADR 0052 amendment / index D16): the default owner of an
+/// unlisted path. A path under an agent-owned ancestor defaults to
+/// `uid_agent` — the kernel-minted rows on AGENT/ and AGENT/AUDIT/ then
+/// carry their ownership down the whole subtree, so the daemon writes
+/// inside its roots as owner without spending a table row per file
+/// (the 64-entry bound only ever holds the two roots). Every other
+/// subtree keeps the `uid_user` default it always had — an authored
+/// uid_system/uid_user row changes nothing below it.
+pub fn defaultOwner(partition: file_table.Partition, path: []const u8) u32 {
+    if (partition == .host) {
+        var rest = path;
+        while (std.mem.lastIndexOfScalar(u8, rest, '/')) |i| {
+            rest = rest[0..i];
+            if (find(partition, rest)) |e| {
+                if (!e.deny and e.uid == process.uid_agent) return process.uid_agent;
+                break;
+            }
+        }
+    }
+    return process.uid_user;
+}
+
+/// M173b (#3041, ADR 0052 amendment / index D16): kernel-minted rows for
+/// the two roots AGENTD must write — the `ensure_meta_file` pattern. An
+/// existing row is forced back to `uid_agent` + `0755` (a hand-seeded
+/// line can never loosen the agent's ownership); a missing row is minted
+/// through the regular `setEntry` path. The two rows live inside the
+/// shared 64-entry bound — false only when the table cannot hold them.
+pub fn ensure_agent_roots() bool {
+    const roots = [_][]const u8{ "AGENT", "AGENT/AUDIT" };
+    for (roots) |root| {
+        if (find(.host, root)) |e| {
+            e.used = true;
+            e.deny = false;
+            e.secret = false;
+            e.uid = process.uid_agent;
+            e.mode = default_dir_mode;
+            continue;
+        }
+        const slot = freeSlot() orelse return false;
+        slot.used = true;
+        slot.deny = false;
+        slot.secret = false;
+        setEntry(slot, .host, root, default_dir_mode, process.uid_agent, false);
+        entry_count += 1;
+    }
+    return true;
 }
 
 /// ADR 0024 D10 slot 69: owner-only chmod on an existing path, or
@@ -288,14 +337,15 @@ pub fn set_mode(actor: Actor, partition: file_table.Partition, path: []const u8,
         e.mode = normalizeMode(mode);
         return .ok;
     }
-    // No entry: the effective owner is the documented default (uid_user), so
-    // only that owner or a privileged actor may mint the entry.
+    // No entry: the effective owner is the resolved default (uid_user, or
+    // uid_agent under an agent-owned ancestor — M173b), so only that owner
+    // or a privileged actor may mint the entry.
     if (check(actor, partition, path, .admin) != .allow) return .eacces;
     const slot = freeSlot() orelse return .enospc;
     slot.used = true;
     slot.deny = false;
     slot.secret = false;
-    setEntry(slot, partition, path, mode, process.uid_user, false);
+    setEntry(slot, partition, path, mode, defaultOwner(partition, path), false);
     entry_count += 1;
     return .ok;
 }
@@ -906,4 +956,62 @@ test "trust: over-long paths never falsely match a short entry" {
     @memcpy(long_buf[0..5], "a.txt");
     @memset(long_buf[5..], 'x');
     try std.testing.expectEqual(Verdict.allow, check(actor_other, .host, long_buf[0..], .read));
+}
+
+test "trust: agent roots minted as uid_agent, forced over authored rows (M173b #3041)" {
+    init();
+    try std.testing.expect(ensure_agent_roots());
+    try std.testing.expectEqual(@as(usize, 2), count());
+    const agent = Actor{ .uid = process.uid_agent, .caps = 0 };
+    // Agent owns its roots as owner; the user reads through the other triplet.
+    try std.testing.expectEqual(Verdict.allow, check(agent, .host, "AGENT", .write));
+    try std.testing.expectEqual(Verdict.allow, check(agent, .host, "AGENT/AUDIT", .list));
+    try std.testing.expectEqual(Verdict.allow, check(actor_user, .host, "AGENT", .list));
+    try std.testing.expectEqual(Verdict.eacces, check(actor_user, .host, "AGENT", .write));
+    // An authored row naming AGENT cannot loosen/steal the agent's ownership.
+    init();
+    _ = load("#v1\nAGENT\t777\t1000\t-\n");
+    try std.testing.expect(ensure_agent_roots());
+    try std.testing.expectEqual(Verdict.allow, check(agent, .host, "AGENT", .write));
+    try std.testing.expectEqual(Verdict.eacces, check(actor_user, .host, "AGENT", .write));
+    // A hand-seeded write under the audit dir stays refused for the user.
+    try std.testing.expectEqual(Verdict.eacces, check(actor_user, .host, "AGENT/AUDIT", .create));
+}
+
+test "trust: unlisted paths under an agent-owned ancestor are agent-owned (M173b #3041)" {
+    init();
+    try std.testing.expect(ensure_agent_roots());
+    const agent = Actor{ .uid = process.uid_agent, .caps = 0 };
+    // The agent creates and writes inside its roots without per-file rows.
+    try std.testing.expectEqual(Verdict.allow, check(agent, .host, "AGENT/OUT.TXT", .create));
+    try std.testing.expectEqual(Verdict.allow, check(agent, .host, "AGENT/AUDIT/RCPT-00000001", .create));
+    try std.testing.expectEqual(Verdict.allow, check(agent, .host, "AGENT/OUT.TXT", .write));
+    // The user keeps other-triplet read, never write, inside the agent's roots.
+    try std.testing.expectEqual(Verdict.allow, check(actor_user, .host, "AGENT/OUT.TXT", .read));
+    try std.testing.expectEqual(Verdict.eacces, check(actor_user, .host, "AGENT/OUT.TXT", .write));
+    try std.testing.expectEqual(Verdict.eacces, check(actor_user, .host, "AGENT/OUT.TXT", .create));
+    // Agent admin on its own subtree entry (chmod mint carries uid_agent).
+    try std.testing.expectEqual(SetResult.ok, set_mode(agent, .host, "AGENT/OUT.TXT", 0o600));
+    // Everything outside the agent roots keeps the uid_user default, unchanged.
+    try std.testing.expectEqual(Verdict.allow, check(actor_user, .host, "PLAIN.TXT", .write));
+    try std.testing.expectEqual(Verdict.eacces, check(agent, .host, "PLAIN.TXT", .write));
+    // A non-agent owned ancestor changes nothing below it (load() clears
+    // and repopulates — boot mints the agent rows AFTER the file load).
+    _ = load("#v1\nSYSROOT\t755\t0\t-\n");
+    try std.testing.expect(ensure_agent_roots());
+    try std.testing.expectEqual(process.uid_user, defaultOwner(.host, "SYSROOT/CHILD.TXT"));
+    try std.testing.expectEqual(process.uid_agent, defaultOwner(.host, "AGENT/CHILD.TXT"));
+    // The two roots are the only rows inside the 64-entry bound.
+    try std.testing.expectEqual(@as(usize, 4), count()); // 2 roots + OWNERS.TXT self + SYSROOT
+}
+
+test "trust: ensure_agent_roots respects the 64-entry bound (M173b #3041)" {
+    init();
+    var i: usize = 0;
+    while (i < max_entries) : (i += 1) {
+        var nb: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&nb, "f{d}.txt", .{i}) catch unreachable;
+        try std.testing.expectEqual(SetResult.ok, set_mode(actor_user, .host, name, 0o600));
+    }
+    try std.testing.expect(!ensure_agent_roots());
 }

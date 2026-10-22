@@ -3136,6 +3136,10 @@ test "B2: access denial at capture and page, including persisted wide keys" {
 test "file_table: M97d-F5 (#2090) — OWNERS.TXT is kernel-writable only at the file ABI" {
     init();
     trust.init();
+    // The actor for pid 0 must resolve to the uid_user default: the shared
+    // registry can hold a leftover uid_agent principal on slot 0 from an
+    // earlier test in this binary (M173b #3041).
+    process.init();
     virtio_file.set_test_share(&.{
         .{ .name = "OWNERS.TXT", .data = "#v1\n" },
         .{ .name = "OTHER.TXT", .data = "x" },

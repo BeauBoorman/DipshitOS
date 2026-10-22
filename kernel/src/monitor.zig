@@ -223,6 +223,11 @@ pub const Monitor = struct {
     machine: MachineControl,
 
     pub fn init(con: console.Console, state: SystemState, machine: MachineControl) Monitor {
+        // M173b (#3041, ADR 0052 amendment): this is the first in-module
+        // boot hook that runs after OWNERS.TXT loads — mint the kernel's
+        // uid_agent ownership rows for AGENT/ and AGENT/AUDIT/ here so the
+        // agent's roots exist before any EL0 task runs.
+        _ = trust.ensure_agent_roots();
         return .{ .console = con, .state = state, .machine = machine };
     }
 };
@@ -8381,7 +8386,7 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
             for (rest[0][2..]) |ch| {
                 if (ch < '0' or ch > '9') {
                     err_prefix(m);
-                    m.console.print_line("-u<uid>: uid must be 0 (system) or 1000 (user)");
+                    m.console.print_line("-u<uid>: uid must be 0 (system), 1000 (user) or 2000 (agent)");
                     return .invalid_argument;
                 }
                 const digit: u32 = ch - '0';
@@ -8390,7 +8395,7 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
                 // principal).
                 if (value > (0xffff_ffff - digit) / 10) {
                     err_prefix(m);
-                    m.console.print_line("-u<uid>: uid must be 0 (system) or 1000 (user)");
+                    m.console.print_line("-u<uid>: uid must be 0 (system), 1000 (user) or 2000 (agent)");
                     return .invalid_argument;
                 }
                 value = value * 10 + digit;
@@ -8399,9 +8404,11 @@ fn cmd_exec(m: *Monitor, args: []const []const u8) ExecError {
                 spawn_principal = .{ .uid = process.uid_system, .caps = process.kernel_caps };
             } else if (value == process.uid_user) {
                 spawn_principal = .{ .uid = process.uid_user, .caps = 0 };
+            } else if (value == process.uid_agent) {
+                spawn_principal = process.agent_principal;
             } else {
                 err_prefix(m);
-                m.console.print_line("-u<uid>: uid must be 0 (system) or 1000 (user)");
+                m.console.print_line("-u<uid>: uid must be 0 (system), 1000 (user) or 2000 (agent)");
                 return .invalid_argument;
             }
         } else break;

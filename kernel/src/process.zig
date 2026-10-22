@@ -79,6 +79,11 @@ pub const name_max: usize = 16;
 pub const uid_system: u32 = 0;
 /// ADR 0024 D1: every EL0 process spawned today.
 pub const uid_user: u32 = 1000;
+/// ADR 0052 amendment (card #3029, index D15): the agent principal. The
+/// kernel assigns it at exec to the image named `AGENTD.ELF`; EL0 children
+/// of a `uid_agent` process inherit it (exec preserves the principal).
+/// Spawn-time only — no syscall names it and no setuid path exists.
+pub const uid_agent: u32 = 2000;
 
 /// ADR 0024 D5: the spawn-time capability mask (no elevation syscall exists).
 /// `CAP_FS_ANY` bypasses the D3/D4 file checks; `CAP_PROC_ADMIN` permits
@@ -114,6 +119,10 @@ pub const Principal = struct {
 /// The default spawn principal (ADR 0024 D5): every EL0-initiated spawn is
 /// `uid_user` with no caps. A kernel/monitor spawn may override explicitly.
 pub const default_principal = Principal{};
+
+/// The agent spawn principal (ADR 0052 amendment): `uid_agent` with no
+/// caps — the agent only ever narrows relative to `uid_user`.
+pub const agent_principal = Principal{ .uid = uid_agent };
 
 /// Explicit process lifecycle state (claim 3848 — the process-level mirror
 /// of scheduler.State). A descriptor's state is the ONLY ownership signal:
@@ -2465,4 +2474,16 @@ test "process: M133a — injected overflow-block alloc failure refuses the recor
     // Disarmed, the overflow block allocates and the record lands.
     try std.testing.expect(record_dynamic_page(id, 0x900000));
     try std.testing.expectEqual(free_before - 1, alloc.stats().free_pages);
+}
+
+test "process: uid_agent constant + agent_principal shape (M173b #3041)" {
+    // ADR 0052 amendment / index D15: the third principal is 2000 with no caps.
+    try std.testing.expectEqual(@as(u32, 2000), uid_agent);
+    try std.testing.expectEqual(uid_agent, agent_principal.uid);
+    try std.testing.expectEqual(@as(u32, 0), agent_principal.caps);
+    // create_as accepts it like any explicit principal.
+    init();
+    const p = create_as("AGENTD.ELF", .{}, .{}, .{}, agent_principal).?;
+    try std.testing.expectEqual(uid_agent, principal(p).?.uid);
+    try std.testing.expectEqual(uid_agent, info(p).?.uid);
 }

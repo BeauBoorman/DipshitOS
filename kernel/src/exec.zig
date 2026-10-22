@@ -503,6 +503,21 @@ pub fn exec_file(name: []const u8, args: []const []const u8) ExecResult {
     return exec_file_impl(name, args, null, process.default_principal, null);
 }
 
+/// M173b (#3041, ADR 0052 amendment / index D15): the recorded image name
+/// the kernel binds the agent principal to — the same name grant rows and
+/// the M97g label binding key on, compared case-insensitively (APFS).
+pub const agent_image_name = "AGENTD.ELF";
+
+/// The principal an EL0 `sys_exec` spawns. `AGENTD.ELF` by recorded name
+/// binds `{uid_agent, 0}` no matter who asks — the binding only narrows,
+/// and the EL0 caller can never name a principal anyway. Every other
+/// image preserves the caller's principal, so a `uid_agent` parent's
+/// children inherit `uid_agent` (index D15) and caps stay 0.
+pub fn el0_spawn_principal(name: []const u8, caller: process.Principal) process.Principal {
+    if (std.ascii.eqlIgnoreCase(name, agent_image_name)) return process.agent_principal;
+    return caller;
+}
+
 /// `exec_file` with an explicit spawn principal (M50 TS1, issue #1135,
 /// ADR 0024 D2/D5). `exec` preserves the caller's uid/caps by passing them
 /// here; the EL1h monitor uses it for an administrative spawn. No EL0 path
@@ -3078,4 +3093,25 @@ test "exec: M133a — injected failure names out_of_memory at every dynamic-ELF 
     // scratch, text, interp text, library aperture, user stack, kernel
     // stack — 6 sites (single-segment program + interpreter).
     try expect_injected_oom("DYNAMIC.ELF", 6);
+}
+
+test "exec: el0_spawn_principal binds AGENTD.ELF to uid_agent, preserves all else (M173b #3041)" {
+    const user = process.default_principal;
+    const agent = process.agent_principal;
+    const sys = process.Principal{ .uid = process.uid_system, .caps = process.kernel_caps };
+    // The recorded image name binds {uid_agent,0} for any caller — narrowing only.
+    try std.testing.expectEqual(process.uid_agent, el0_spawn_principal("AGENTD.ELF", user).uid);
+    try std.testing.expectEqual(@as(u32, 0), el0_spawn_principal("AGENTD.ELF", user).caps);
+    try std.testing.expectEqual(process.uid_agent, el0_spawn_principal("AGENTD.ELF", sys).uid);
+    // Case-insensitive like the grant table's name keys (APFS share).
+    try std.testing.expectEqual(process.uid_agent, el0_spawn_principal("agentd.elf", user).uid);
+    // A uid_agent parent's child inherits uid_agent (preserve rule).
+    const p = el0_spawn_principal("GOSH.ELF", agent);
+    try std.testing.expectEqual(process.uid_agent, p.uid);
+    try std.testing.expectEqual(@as(u32, 0), p.caps);
+    // Everything else keeps the caller's principal unchanged.
+    try std.testing.expectEqual(process.uid_user, el0_spawn_principal("GOSH.ELF", user).uid);
+    try std.testing.expectEqual(process.uid_system, el0_spawn_principal("GOSH.ELF", sys).uid);
+    // A same-named file in a subdirectory does NOT bind (verbatim recorded name).
+    try std.testing.expectEqual(process.uid_user, el0_spawn_principal("SUB/AGENTD.ELF", user).uid);
 }

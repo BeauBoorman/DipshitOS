@@ -2598,7 +2598,7 @@ test "monitor: exec -u<uid> admin-spawn flag validates the principal vocabulary"
     for ([_][]const u8{ "-u1", "-u999", "-ux", "-u99999999999999999999" }) |flag| {
         env.mock.reset();
         try std.testing.expectEqual(ExecError.invalid_argument, exec(&mon, &.{ "exec", flag, "USER.BIN" }));
-        try std.testing.expectEqualStrings("error: -u<uid>: uid must be 0 (system) or 1000 (user)\n", env.mock.contents());
+        try std.testing.expectEqualStrings("error: -u<uid>: uid must be 0 (system), 1000 (user) or 2000 (agent)\n", env.mock.contents());
     }
     // An unknown leading flag stays a filename (the pre-existing -c shape).
     env.mock.reset();

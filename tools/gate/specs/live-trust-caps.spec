@@ -124,3 +124,121 @@ if after != 0:
     sys.exit("FAIL: killed uid_user counter ran %d times after the kill" % after)
 print("trust-caps same-uid kill ok: no markers after the kill")
 PY
+
+# ---------------------------------------------------------------------------
+# M173b (#3041, index D12): the agent asymmetry in the kill gate.
+# Boot 03 — a uid_agent caller cannot signal uid_user (EACCES, probe lives).
+# Boot 04 — uid_user may always stop uid_agent (allowed, status 137).
+# Boot 05 — uid_agent may signal its own principal (same-uid rule, allowed).
+# ---------------------------------------------------------------------------
+
+# Boot 03: agent -> user is EACCES.
+vgate_file script-a3.txt <<'EOF'
+exec COUNTER.BIN
+exec -u2000 GOTOP.ELF
+EOF
+
+vgate_file script-a3b.txt <<'EOF'
+procs
+syscalls
+echo caps-agent-denied
+EOF
+
+vgate_run 03 -- --display --input \
+    --script '$RUN_DIR/script-a3.txt' \
+    --script-after 'tasks user-el0 exited status=7' \
+    --script2 '$RUN_DIR/script-a3b.txt' \
+    --script2-after 'top: kill pid=1 err=-7' \
+    --input-string 'k' \
+    --input-string-after 'top: ready' \
+    --script-expect 'caps-agent-denied' \
+    --timeout 75
+
+# The agent principal GOTOP.ELF carried uid=2000 into procs; its cross-
+# principal kill of the uid_user counter was refused EACCES (-7).
+vgate_assert 03 serial-contains 'procs: id=2 name=GOTOP.ELF uid=2000 caps=0'
+vgate_assert 03 serial-contains 'top: kill pid=1 err=-7'
+vgate_assert 03 serial-contains '29 sys_kill calls=1'
+vgate_assert 03 serial-contains 'caps-agent-denied'
+vgate_assert 03 serial-absent '\[EXC\]'
+vgate_assert 03 serial-absent '[EXC] parking:'
+
+# Nothing armed: the uid_user counter kept running past the denial.
+vgate_assert 03 python <<'PY'
+import os, sys, re
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = ser.splitlines()
+denied = next((i for i, l in enumerate(lines) if "top: kill pid=1 err=-7" in l), None)
+if denied is None:
+    sys.exit("FAIL: no agent->user EACCES line")
+after = sum(1 for l in lines[denied + 1:] if "counter: alive" in l)
+if after < 1:
+    sys.exit("FAIL: uid_user target produced no markers after the denied kill")
+if not re.search(r"procs: id=1 name=COUNTER\.BIN uid=1000 caps=0 state=running", ser):
+    sys.exit("FAIL: uid_user target is not still running at the end")
+print("trust-caps agent->user EACCES ok: %d markers after denial" % after)
+PY
+
+# Boot 04: user -> agent allowed (D12). The agent principal on COUNTER.BIN
+# is minted by the monitor's -u2000 admin spawn; a uid_user GOTOP stops it.
+vgate_file script-a4.txt <<'EOF'
+exec -u2000 COUNTER.BIN
+exec GOTOP.ELF
+EOF
+
+vgate_file script-a4b.txt <<'EOF'
+procs
+syscalls
+echo caps-user-stops-agent
+EOF
+
+vgate_run 04 -- --display --input \
+    --script '$RUN_DIR/script-a4.txt' \
+    --script-after 'tasks user-el0 exited status=7' \
+    --script2 '$RUN_DIR/script-a4b.txt' \
+    --script2-after 'tasks user-exec exited status=137' \
+    --input-string 'k' \
+    --input-string-after 'top: ready' \
+    --script-expect 'caps-user-stops-agent' \
+    --timeout 75
+
+# The target carried uid=2000; the human's kill still landed (no EACCES).
+vgate_assert 04 serial-contains 'procs: id=1 name=COUNTER.BIN uid=2000 caps=0'
+vgate_assert 04 serial-contains 'procs: id=2 name=GOTOP.ELF uid=1000 caps=0'
+vgate_assert 04 serial-exact 'top: kill pid=1' 1
+vgate_assert 04 serial-absent 'top: kill pid=1 err='
+vgate_assert 04 serial-contains 'tasks user-exec exited status=137'
+vgate_assert 04 serial-contains '29 sys_kill calls=1'
+vgate_assert 04 serial-contains 'caps-user-stops-agent'
+vgate_assert 04 serial-absent '[EXC] parking:'
+
+# Boot 05: agent -> own agent child allowed (same-uid rule).
+vgate_file script-a5.txt <<'EOF'
+exec -u2000 COUNTER.BIN
+exec -u2000 GOTOP.ELF
+EOF
+
+vgate_file script-a5b.txt <<'EOF'
+procs
+syscalls
+echo caps-agent-self-ok
+EOF
+
+vgate_run 05 -- --display --input \
+    --script '$RUN_DIR/script-a5.txt' \
+    --script-after 'tasks user-el0 exited status=7' \
+    --script2 '$RUN_DIR/script-a5b.txt' \
+    --script2-after 'tasks user-exec exited status=137' \
+    --input-string 'k' \
+    --input-string-after 'top: ready' \
+    --script-expect 'caps-agent-self-ok' \
+    --timeout 75
+
+# Both rows uid=2000; same-uid kill allowed and converted to status 137.
+vgate_assert 05 serial-contains 'procs: id=1 name=COUNTER.BIN uid=2000 caps=0'
+vgate_assert 05 serial-contains 'procs: id=2 name=GOTOP.ELF uid=2000 caps=0'
+vgate_assert 05 serial-exact 'top: kill pid=1' 1
+vgate_assert 05 serial-absent 'top: kill pid=1 err='
+vgate_assert 05 serial-contains 'tasks user-exec exited status=137'
+vgate_assert 05 serial-contains 'caps-agent-self-ok'
+vgate_assert 05 serial-absent '[EXC] parking:'

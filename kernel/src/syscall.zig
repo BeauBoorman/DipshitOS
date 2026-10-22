@@ -3756,8 +3756,12 @@ fn handle_exec(args: Args, _: *exceptions.VectorFrame) u64 {
 
     // M50 TS1 (#1135, ADR 0024 D2): exec PRESERVES the caller's principal —
     // no setuid semantics, no elevation path. The spawned process inherits
-    // the caller's uid and caps.
-    const principal = process.principal(caller) orelse process.default_principal;
+    // the caller's uid and caps. M173b (#3041, ADR 0052 amendment): the one
+    // kernel-side override — the recorded image name AGENTD.ELF binds
+    // {uid_agent,0} on any EL0 spawn, and uid_agent parents' children keep
+    // inheriting through this same preserve rule.
+    const caller_principal = process.principal(caller) orelse process.default_principal;
+    const principal = esp_exec.el0_spawn_principal(path_buf[0..path_len], caller_principal);
     const res = esp_exec.exec_file_streams_as(path_buf[0..path_len], exec_args, principal, &plan);
     return switch (res) {
         .ok => blk: {
@@ -3822,8 +3826,16 @@ fn handle_kill(args: Args, _: *exceptions.VectorFrame) u64 {
         const caller_principal = process.principal(caller) orelse process.default_principal;
         const target_principal = process.principal(target_pid) orelse return error_result(.einval);
         if (caller_principal.uid != target_principal.uid) {
-            const required = gated(sys_kill) orelse process.cap_proc_admin;
-            if (!caller_principal.has(required)) return error_result(.eacces);
+            // M173b (#3041, index D12): the one asymmetry — uid_user may
+            // always signal uid_agent (the human can stop the agent);
+            // the reverse and every other cross-principal kill still
+            // requires CAP_PROC_ADMIN.
+            const user_stops_agent = caller_principal.uid == process.uid_user and
+                target_principal.uid == process.uid_agent;
+            if (!user_stops_agent) {
+                const required = gated(sys_kill) orelse process.cap_proc_admin;
+                if (!caller_principal.has(required)) return error_result(.eacces);
+            }
         }
     }
     if (info.state == .exited) return error_result(.einval);
