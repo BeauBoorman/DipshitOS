@@ -184,6 +184,40 @@ fn scenarios() !void {
     try expected(error.InvalidHandle, c.close(7, first));
     print("socket-core: ownership capacity refusal cleanup ok\n");
 
+    checkpoint = "owner bound";
+    _ = reset();
+    // Owner 7 charges listener + three active-open connections —
+    // owner_limit sockets with ZERO listener siblings, so only the
+    // owner bound (never the per-listener child bound) can refuse a
+    // wire-driven SYN.
+    var owned: [3]core.Handle = undefined;
+    for (0..3) |i| {
+        owned[i] = try c.open(7, .{ .ip = .{ 10, 0, 0, 1 }, .port = @intCast(8001 + i) }, .{ .ip = .{ 10, 0, 0, 4 }, .port = @intCast(9001 + i) }, mac, 0, 700);
+    }
+    try drain();
+    try check(c.liveChildren() == 3 and c.ownedSockets(7) == core.owner_limit);
+    // The unsaturated listener's SYN is refused by the owner bound:
+    // counted by name, answered RST+ACK at the peer's own address, no
+    // child minted.
+    try inject(other, 40, 0, wire.flag_syn, "", 0);
+    try check(c.counters.owner_saturated == 1 and c.counters.listen_saturated == 0);
+    try check(c.liveChildren() == 3);
+    try drain();
+    try check(captured_remote.port == other.port and std.mem.eql(u8, &captured_remote.ip, &other.ip));
+    try check(captured[13] == (wire.flag_rst | wire.flag_ack));
+    // A freed socket re-opens admission — to exactly the bound, never past.
+    try c.close(7, owned[0]);
+    try inject(other, 50, 0, wire.flag_syn, "", 0);
+    try check(c.liveChildren() == 3 and c.ownedSockets(7) == core.owner_limit);
+    try drain(); // the admitted child's SYN-ACK, so the refusal is last
+    try inject(remote, 60, 0, wire.flag_syn, "", 0);
+    try check(c.counters.owner_saturated == 2 and c.liveChildren() == 3);
+    try drain();
+    try check(captured[13] == (wire.flag_rst | wire.flag_ack));
+    c.closeOwner(7);
+    try check(c.liveChildren() == 0 and c.listener == null and c.refusal == null);
+    print("socket-core: owner bound refusal ok\n");
+
     checkpoint = "terminal";
     listener = reset();
     const clean = try establish(remote, listener, 0);

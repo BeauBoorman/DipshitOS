@@ -46,7 +46,10 @@ final class NativeSocketProbe {
         let seq = UInt32(frame[38]) << 24 | UInt32(frame[39]) << 16 | UInt32(frame[40]) << 8 | UInt32(frame[41])
         let ack = UInt32(frame[42]) << 24 | UInt32(frame[43]) << 16 | UInt32(frame[44]) << 8 | UInt32(frame[45])
         let total = Int(frame[16]) << 8 | Int(frame[17])
-        guard total >= 40, total + 14 <= count, frame[46] == 0x50 else {
+        // Any TCP data offset ≥ 5 is well-formed — the guest's SYN-ACK
+        // carries the 4-byte MSS option (offset 6) since M99h.
+        let dataStart = 34 + Int(frame[46] >> 4) * 4
+        guard total >= 40, frame[46] >= 0x50, dataStart <= 14 + total, total + 14 <= count else {
             print("NATIVE-PROBE: FAIL malformed TCP")
             return
         }
@@ -75,7 +78,7 @@ final class NativeSocketProbe {
             return
         }
         guard let current = acknowledgment[port], let outgoing = sequence[port] else { return }
-        let payload = Array(frame[54..<(14 + total)])
+        let payload = Array(frame[dataStart..<(14 + total)])
         if !payload.isEmpty {
             if seq != current { send(port, outgoing, current, 0x10); return }
             replies[port, default: []].append(contentsOf: payload)

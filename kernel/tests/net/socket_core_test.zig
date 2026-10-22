@@ -166,6 +166,49 @@ test "socket core: the named child bound saturates by name — lsat counts, RST 
     try c.close(7, listener);
     try t.expectEqual(@as(usize, 0), c.liveChildren());
 }
+test "socket core: the owner bound caps wire-driven children — a peer cannot push an owner over bound" {
+    var c: core.Core = .{};
+    const listener = try init(&c);
+    var cap: Capture = .{};
+    // Three active-open connections charge owner 7 to owner_limit while
+    // the listener itself has zero siblings — the per-listener bound
+    // alone cannot see this saturation.
+    const opened = [3]core.Handle{
+        try c.open(7, .{ .ip = .{ 10, 0, 0, 1 }, .port = 8001 }, .{ .ip = .{ 10, 0, 0, 4 }, .port = 9001 }, peer_mac, 0, 700),
+        try c.open(7, .{ .ip = .{ 10, 0, 0, 1 }, .port = 8002 }, .{ .ip = .{ 10, 0, 0, 4 }, .port = 9002 }, peer_mac, 0, 800),
+        try c.open(7, .{ .ip = .{ 10, 0, 0, 1 }, .port = 8003 }, .{ .ip = .{ 10, 0, 0, 4 }, .port = 9003 }, peer_mac, 0, 900),
+    };
+    try t.expectEqual(@as(usize, core.owner_limit), c.ownedSockets(7));
+    try t.expectEqual(@as(usize, 3), c.liveChildren());
+    cap.drain(&c); // flush the three outbound SYNs so the refusal is last
+    // A SYN for the unsaturated listener (siblings=0 < child_limit, one
+    // child slot still free) is refused by the owner bound — the same
+    // RST+ACK answer the per-listener bound gives, counted by name.
+    var frame = Frame.init(remote, 10, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 1), c.counters.owner_saturated);
+    try t.expectEqual(@as(u64, 0), c.counters.listen_saturated);
+    try t.expectEqual(@as(u64, 1), c.counters.capacity_refused);
+    try t.expectEqual(@as(usize, 3), c.liveChildren());
+    try t.expectEqual(@as(usize, core.owner_limit), c.ownedSockets(7));
+    cap.drain(&c);
+    try t.expectEqualDeep(remote, cap.endpoint);
+    try t.expectEqual(@as(u8, wire.flag_rst | wire.flag_ack), cap.bytes[13]);
+    // Freeing one socket re-opens admission — the next SYN charges the
+    // last slot, landing the owner exactly at the bound.
+    try c.close(7, opened[0]);
+    frame = Frame.init(other, 20, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(usize, 3), c.liveChildren());
+    try t.expectEqual(@as(usize, core.owner_limit), c.ownedSockets(7));
+    frame = Frame.init(remote, 30, 0, wire.flag_syn, "");
+    try frame.inject(&c, 0);
+    try t.expectEqual(@as(u64, 2), c.counters.owner_saturated);
+    try t.expectEqual(@as(usize, core.owner_limit), c.ownedSockets(7));
+    c.closeOwner(7);
+    try t.expectEqual(@as(usize, 0), c.liveChildren());
+    try t.expectError(error.InvalidHandle, c.accept(7, listener));
+}
 test "socket core: RST mid-accept frees the slot outright — no zombie against the bound" {
     var c: core.Core = .{};
     const listener = try init(&c);

@@ -107,6 +107,7 @@ vgate_run core -- --script '$RUN_DIR/core.txt' --script2 '$RUN_DIR/core-after.tx
 vgate_assert core serial-exact 'socket-core: injected-only done' 1
 vgate_assert core serial-contains 'procs SOCKCORE.BIN exited status=0'
 vgate_assert core serial-contains 'socket-core: ownership capacity refusal cleanup ok'
+vgate_assert core serial-contains 'socket-core: owner bound refusal ok'
 vgate_assert core serial-contains 'socket-core: partial reads FIN reset terminal charging ok'
 vgate_assert core serial-contains 'socket-core: retry ceiling unexpected SYN-ACK guards ok'
 vgate_assert core serial-contains 'socket-core: four deadline boundaries ok'
@@ -127,18 +128,20 @@ def checksum(data):
     total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
     while total >> 16: total = (total & 65535) + (total >> 16)
     return (~total) & 65535
-def packet(dst_ip, dst_port, seq, ack, flags, body=b"", window=1460):
-    header = struct.pack("!HHIIBBHHH", 8090, dst_port, seq, ack, 0x50, flags, window, 0, 0)
-    pseudo = socket.inet_aton("10.0.0.1") + socket.inet_aton(dst_ip) + struct.pack("!BBH", 0, 6, len(header) + len(body))
-    header = header[:16] + struct.pack("!H", checksum(pseudo + header + body)) + header[18:]
-    return header + body
+def packet(dst_ip, dst_port, seq, ack, flags, body=b"", window=1460, options=b""):
+    doff = (5 + (len(options) + 3) // 4) << 4
+    header = struct.pack("!HHIIBBHHH", 8090, dst_port, seq, ack, doff, flags, window, 0, 0)
+    pseudo = socket.inet_aton("10.0.0.1") + socket.inet_aton(dst_ip) + struct.pack("!BBH", 0, 6, len(header) + len(options) + len(body))
+    header = header[:16] + struct.pack("!H", checksum(pseudo + header + options + body)) + header[18:]
+    return header + options + body
 assert emitted("intake") == seed and emitted("read") == seed
-assert emitted("synack") == packet("10.0.0.2", 5000, 100, 11, 0x12)
+# The SYN-ACK advertises our MSS 1460 (M99h) — a 24-byte header.
+assert emitted("synack") == packet("10.0.0.2", 5000, 100, 11, 0x12, options=b"\x02\x04\x05\xb4")
 expected = packet("10.0.0.2", 5000, 101, 11 + len(seed), 0x10, seed)
 assert emitted("data") == expected and emitted("retransmit") == expected
 # Different IP, not just another port on the original peer host.
 assert emitted("refusal") == packet("10.0.0.9", 6000, 0, 0, 0x14, window=4096)
-assert 0 < int(re.search(r"socket-core: core\+scratch=(\d+)", ser)[1]) <= 16384
+assert 0 < int(re.search(r"socket-core: core\+scratch=(\d+)", ser)[1]) <= 24 * 1024
 assert 0 < int(re.search(r"socket-core: stack-high-water=(\d+)", ser)[1]) <= 131072
 assert int(re.search(r"socket-core: checks=(\d+)", ser)[1]) >= 50
 for slot, name in ((30, "sys_tcp_connect"), (31, "sys_tcp_send"), (32, "sys_tcp_recv"),

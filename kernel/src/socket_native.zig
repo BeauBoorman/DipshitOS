@@ -57,11 +57,19 @@ pub fn now() u64 {
 /// diff names the event, the port names the saturated listener, the
 /// bound names itself. klog is a polled-uart write, safe inside the RX
 /// drain's domain hold.
-fn noteSaturated(before: u64, port: u16) void {
-    if (sockets.counters.listen_saturated == before) return;
+fn noteSaturated(lsat_before: u64, osat_before: u64, port: u16) void {
     var buf: [80]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "net: listen-saturated port={d} bound={d}\n", .{ port, core.child_limit }) catch "net: listen-saturated\n";
-    klog.line(line);
+    if (sockets.counters.listen_saturated != lsat_before) {
+        const line = std.fmt.bufPrint(&buf, "net: listen-saturated port={d} bound={d}\n", .{ port, core.child_limit }) catch "net: listen-saturated\n";
+        klog.line(line);
+    }
+    // The owner bound names itself the same way — a SYN refused because
+    // the listener's owner was already at owner_limit, not because the
+    // listener's own child bound tripped.
+    if (sockets.counters.owner_saturated != osat_before) {
+        const line = std.fmt.bufPrint(&buf, "net: owner-saturated port={d} bound={d}\n", .{ port, core.owner_limit }) catch "net: owner-saturated\n";
+        klog.line(line);
+    }
 }
 /// #2875: the ONE table receive — every inbound path that feeds
 /// `sockets.receive` wraps it in the saturated diff so `net:
@@ -71,9 +79,10 @@ fn noteSaturated(before: u64, port: u16) void {
 /// refusal without the marker). Other traffic leaves the counter alone
 /// and the note is a no-op.
 pub fn receiveTcp(frame: []const u8, port: u16) void {
-    const saturated = sockets.counters.listen_saturated;
+    const lsat = sockets.counters.listen_saturated;
+    const osat = sockets.counters.owner_saturated;
     sockets.receive(frame, now(), @truncate(csprng.random_u64())) catch unreachable;
-    noteSaturated(saturated, port);
+    noteSaturated(lsat, osat, port);
 }
 fn claimTcpFrame(frame: []const u8) bool {
     if (frame.len < core.wire.frame_min or frame[12] != 8 or frame[13] != 0 or

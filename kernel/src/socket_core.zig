@@ -221,6 +221,12 @@ pub const Counters = struct {
     /// is the same RST+ACK); the table-full and terminal-child refusals
     /// stay out of it.
     listen_saturated: u64 = 0,
+    /// A SYN refused because the LISTENER's owner already charged
+    /// `owner_limit` sockets — the same bound listen()/open() enforce,
+    /// applied on the wire-driven path so a peer cannot push an owner
+    /// over bound. A subset of `capacity_refused`, disjoint from
+    /// `listen_saturated` (the per-listener bound is checked first).
+    owner_saturated: u64 = 0,
 };
 
 pub const Core = struct {
@@ -554,6 +560,16 @@ pub const Core = struct {
         };
         if (siblings >= child_limit) {
             self.counters.listen_saturated +%= 1;
+            self.refuse(p);
+            return;
+        }
+        // The owner bound listen()/open() enforce applies on this path
+        // too: a wire-driven child charges the LISTENER's owner, so
+        // without the same check any peer could push a capped owner over
+        // bound — and its children would eat the shared table. Same
+        // named refusal shape as the per-listener bound.
+        if (self.ownedSockets(l.owner) >= owner_limit) {
+            self.counters.owner_saturated +%= 1;
             self.refuse(p);
             return;
         }
