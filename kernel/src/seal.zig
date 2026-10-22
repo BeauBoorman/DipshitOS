@@ -20,6 +20,18 @@
 //! exception); a torn pair reads back as bad_block_auth, never wrong
 //! plaintext, and the journal replays over it the same way v1 recovers.
 //!
+//! **Journaled tag blocks (#3104).** The eager paragraph above now holds
+//! only for journal records (a record must authenticate before the
+//! transaction carrying it can replay). A home write — anything at or
+//! above `journal_end` — is a txn checkpoint write: the write path
+//! stages each sealed dest's {nonce, tag} at append time, appends the
+//! updated tag homes as payloads of the same transaction, and the
+//! checkpoint's writeBlock lands exactly the staged ciphertext. A
+//! mid-checkpoint kill therefore replays payload and tag as one pair —
+//! it can no longer leave a bad_block_auth home the replay tolerates
+//! but --check flags. A staged-miss home write falls back to the eager
+//! pair (the test seam; a crafted or pre-M172f transaction).
+//!
 //! **No allocation, no libc, no POSIX.** All buffers are fixed BSS/ctx
 //! fields; the passphrase buffer is zeroed after every attempt (D10).
 //! Every host-facing dependency — console write/read, the monotonic
@@ -72,12 +84,28 @@ pub fn unwrapDek(info: vlfs.SealInfo, volume_id: u64, pass: []const u8, dek: *[d
 // Seal — the armed volume context behind the sealed SectorSource
 // ---------------------------------------------------------------------------
 
+/// A tag entry staged for a txn's sealed dest: the {nonce, tag} the
+/// checkpoint's home write must land so the journaled tag block —
+/// appended to the same transaction — verifies it (ADR 0061, #3104).
+const StagedEntry = struct { dest: u32, nonce: [aead.nonce_len]u8, tag: [aead.tag_len]u8 };
+
 pub const Seal = struct {
     inner: vlfs.SectorSource,
     dek: [dek_len]u8 = @splat(0),
     volume_id: u64 = 0,
     volume_blocks: u32 = 0,
     tag_first: u32 = 0,
+    /// End of the journal region (= ibitmap_first): sealed writes below
+    /// it are journal records, whose tag entries update eagerly — a
+    /// record must authenticate before the transaction carrying it can
+    /// replay — while writes at/above it are txn checkpoint homes whose
+    /// entries ride in the journaled tag blocks (ADR 0061, #3104).
+    journal_end: u32 = 0,
+    /// Staged tag entries for the in-flight transaction, one per dest,
+    /// bounded by max_payload; cleared at txn boundaries and drained by
+    /// the checkpoint's writeBlock calls.
+    staged: [vlfs.max_payload]StagedEntry = undefined,
+    staged_n: u32 = 0,
     /// Block-write nonce source (kernel CSPRNG on hardware; tests inject
     /// deterministic nonces to pin vectors).
     nonceFn: *const fn (ctx: ?*anyopaque, out: *[aead.nonce_len]u8) void = undefined,
@@ -103,6 +131,7 @@ pub const Seal = struct {
         @memset(&self.raw, 0);
         @memset(&self.blkbuf, 0);
         self.tag_first = 0;
+        self.staged_n = 0;
     }
 };
 
@@ -148,6 +177,13 @@ fn sealReadBlock(ctx: ?*anyopaque, blk: u32, out: *[vlfs.block_len]u8) bool {
     return true;
 }
 
+fn stagedFind(s: *Seal, dest: u32) ?usize {
+    for (s.staged[0..s.staged_n], 0..) |*e, i| {
+        if (e.dest == dest) return i;
+    }
+    return null;
+}
+
 fn sealWriteBlock(ctx: ?*anyopaque, blk: u32, data: *const [vlfs.block_len]u8) bool {
     const s: *Seal = @ptrCast(@alignCast(ctx orelse return false));
     s.fail = error.Io;
@@ -158,7 +194,37 @@ fn sealWriteBlock(ctx: ?*anyopaque, blk: u32, data: *const [vlfs.block_len]u8) b
         }
         return true;
     }
-    // A fresh random nonce on EVERY sealed-block write — including
+    if (blk >= s.journal_end) {
+        // A txn checkpoint home: the transaction carrying this dest
+        // already committed the {nonce, tag} pair in its journaled tag
+        // blocks — land exactly that ciphertext. A re-read payload
+        // re-seals identically; a mismatch is corruption, refused by
+        // name, never written.
+        if (stagedFind(s, blk)) |idx| {
+            const e = &s.staged[idx];
+            const aad = blockAad(s.volume_id, blk);
+            var tag: [aead.tag_len]u8 = undefined;
+            aead.seal(&s.raw, &tag, data, &aad, &e.nonce, &s.dek);
+            if (!std.mem.eql(u8, &tag, &e.tag)) {
+                s.fail = error.BadBlockAuth;
+                s.auth_failures += 1;
+                return false;
+            }
+            if (!s.inner.writeBlock(blk, &s.raw)) {
+                s.fail = error.Io;
+                return false;
+            }
+            s.staged[idx] = s.staged[s.staged_n - 1];
+            s.staged_n -= 1;
+            return true;
+        }
+        // No staged entry: a non-txn home write (the test seam, a
+        // crafted or pre-M172f transaction without tag payloads) falls
+        // back to the eager pair below — consistent, just not covered
+        // by a journal commit.
+    }
+    // Journal records (below journal_end) and the eager fallback share
+    // this path: a fresh random nonce on EVERY write — including
     // rewrites of the same block (D9's never-repeat rule under one DEK).
     var nonce: [aead.nonce_len]u8 = undefined;
     s.nonceFn(s.nonceCtx, &nonce);
@@ -219,6 +285,65 @@ fn sealFlush(ctx: ?*anyopaque) bool {
     return s.inner.flush();
 }
 
+// ---------------------------------------------------------------------------
+// The sealed-txn hooks (ADR 0061, #3104): stageBlock draws the nonce a home
+// write must land and returns the tag home the pair belongs to — the write
+// path then journals that home as a payload of the same transaction.
+// applyStaged writes the staged entries living in one tag home into its
+// updated contents; injectEntry replants a journaled entry for the replay's
+// writeBlock; clearStaged drops the set at a txn boundary. Only txn
+// checkpoint homes stage — journal records keep eager entries because a
+// record must authenticate before the transaction carrying it can replay.
+// ---------------------------------------------------------------------------
+
+fn sealStageBlock(ctx: ?*anyopaque, dest: u32, contents: *const [vlfs.block_len]u8) u32 {
+    const s: *Seal = @ptrCast(@alignCast(ctx orelse return 0));
+    if (!s.sealed(dest) or dest < s.journal_end) return 0;
+    const idx = stagedFind(s, dest) orelse blk: {
+        if (s.staged_n >= s.staged.len) return 0; // unreachable: ≤ max_payload dests
+        const i = s.staged_n;
+        s.staged_n += 1;
+        break :blk i;
+    };
+    const e = &s.staged[idx];
+    e.dest = dest;
+    s.nonceFn(s.nonceCtx, &e.nonce);
+    const aad = blockAad(s.volume_id, dest);
+    aead.seal(&s.raw, &e.tag, contents, &aad, &e.nonce, &s.dek);
+    return tagHome(dest - 2, s).blk;
+}
+
+fn sealApplyStaged(ctx: ?*anyopaque, home: u32, tagblk: *[vlfs.block_len]u8) u32 {
+    const s: *Seal = @ptrCast(@alignCast(ctx orelse return 0));
+    var n: u32 = 0;
+    for (s.staged[0..s.staged_n]) |*e| {
+        const t = tagHome(e.dest - 2, s);
+        if (t.blk != home) continue;
+        @memcpy(tagblk[t.off..][0..aead.nonce_len], &e.nonce);
+        @memcpy(tagblk[t.off + aead.nonce_len ..][0..aead.tag_len], &e.tag);
+        n += 1;
+    }
+    return n;
+}
+
+fn sealInjectEntry(ctx: ?*anyopaque, dest: u32, entry: *const [vlfs.tag_entry_len]u8) void {
+    const s: *Seal = @ptrCast(@alignCast(ctx orelse return));
+    const idx = stagedFind(s, dest) orelse blk: {
+        if (s.staged_n >= s.staged.len) return; // unreachable: ≤ max_payload dests
+        const i = s.staged_n;
+        s.staged_n += 1;
+        break :blk i;
+    };
+    s.staged[idx].dest = dest;
+    @memcpy(&s.staged[idx].nonce, entry[0..aead.nonce_len]);
+    @memcpy(&s.staged[idx].tag, entry[aead.nonce_len..][0..aead.tag_len]);
+}
+
+fn sealClearStaged(ctx: ?*anyopaque) void {
+    const s: *Seal = @ptrCast(@alignCast(ctx orelse return));
+    s.staged_n = 0;
+}
+
 /// The armed seal as a SectorSource: same wire shape as the inner source,
 /// with the block hooks running AEAD over the sealed span.
 pub fn source(s: *Seal) vlfs.SectorSource {
@@ -231,6 +356,10 @@ pub fn source(s: *Seal) vlfs.SectorSource {
         .readBlockFn = sealReadBlock,
         .writeBlockFn = if (s.inner.writeFn != null) sealWriteBlock else null,
         .errFn = sealErr,
+        .stageBlockFn = sealStageBlock,
+        .applyStagedFn = sealApplyStaged,
+        .injectEntryFn = sealInjectEntry,
+        .clearStagedFn = sealClearStaged,
     };
 }
 
@@ -346,6 +475,7 @@ pub fn unseal(s: *Seal, inner: vlfs.SectorSource, sb: vlfs.Superblock, info: vlf
                 .volume_id = sb.volume_id,
                 .volume_blocks = sb.volume_blocks,
                 .tag_first = info.tag_first,
+                .journal_end = sb.ibitmap_first,
                 .nonceFn = ops.nonceFn,
                 .nonceCtx = ops.ctx,
             };
@@ -791,3 +921,295 @@ test "seal: a sealed image mounts through the source — lookup and read" {
     img[vol.data_first * vlfs.block_len + 9] ^= 1;
     try std.testing.expectError(error.BadBlockAuth, vlfs.listDir(src, vol, vlfs.root_inode, &out, &scratch));
 }
+
+// ---------------------------------------------------------------------------
+// Sealed-txn crash tests (#3104, ADR 0061 journaled tag blocks) — the write
+// path is vlfs/write.zig ops over a sealed source; the crash harness is the
+// write.zig RecDisk pattern at the inner (sector) layer.
+// ---------------------------------------------------------------------------
+
+const vlfs_write = @import("vlfs/write.zig");
+
+const Op = struct {
+    flush: bool = false,
+    lba: u64 = 0,
+    data: [vlfs.sector_len]u8 = undefined,
+};
+
+var op_log: [32768]Op = undefined;
+var op_log_n: usize = 0;
+
+/// In-memory device that logs sector writes + flushes (crashImage replays
+/// the log onto a pre-image to enumerate legal crash states).
+const RecDisk = struct {
+    img: []u8,
+    record: bool = true,
+    fn readFn(ctx: ?*anyopaque, lba: u64, out: *[vlfs.sector_len]u8) bool {
+        const d: *RecDisk = @ptrCast(@alignCast(ctx));
+        if (lba >= d.img.len / vlfs.sector_len) return false;
+        @memcpy(out, d.img[lba * vlfs.sector_len ..][0..vlfs.sector_len]);
+        return true;
+    }
+    fn writeFn(ctx: ?*anyopaque, lba: u64, data: *const [vlfs.sector_len]u8) bool {
+        const d: *RecDisk = @ptrCast(@alignCast(ctx));
+        if (lba >= d.img.len / vlfs.sector_len) return false;
+        @memcpy(d.img[lba * vlfs.sector_len ..][0..vlfs.sector_len], data);
+        if (d.record and op_log_n < op_log.len) {
+            op_log[op_log_n] = .{ .flush = false, .lba = lba, .data = data.* };
+            op_log_n += 1;
+        }
+        return true;
+    }
+    fn flushFn(ctx: ?*anyopaque) bool {
+        const d: *RecDisk = @ptrCast(@alignCast(ctx));
+        if (d.record and op_log_n < op_log.len) {
+            op_log[op_log_n] = .{ .flush = true };
+            op_log_n += 1;
+        }
+        return true;
+    }
+    fn source(d: *RecDisk) vlfs.SectorSource {
+        return .{ .ctx = d, .total_sectors = @intCast(d.img.len / vlfs.sector_len), .readFn = readFn, .writeFn = writeFn, .flushFn = flushFn };
+    }
+};
+
+/// Replay a recorded op log onto a base image: `flush_k` flushes completed
+/// (all writes before the k-th FLUSH are durable), plus the post-flush
+/// window's writes in [lo1,hi1) ∪ [lo2,hi2) — the family (empty, full,
+/// every prefix, every suffix, every singleton, every leave-one-out)
+/// enumerates without a bitmask because a sealed txn's window can exceed
+/// 64 sector writes (each append is ciphertext + tag-entry update).
+fn crashImage(base: []const u8, flush_k: usize, lo1: usize, hi1: usize, lo2: usize, hi2: usize, out: []u8) void {
+    @memcpy(out, base);
+    var seen: usize = 0;
+    var boundary: usize = 0;
+    for (op_log[0..op_log_n], 0..) |op, i| {
+        if (op.flush) {
+            seen += 1;
+            if (seen == flush_k) {
+                boundary = i + 1;
+                break;
+            }
+        }
+    }
+    for (op_log[0..boundary]) |op| {
+        if (!op.flush) {
+            const off = op.lba * vlfs.sector_len;
+            @memcpy(out[off..][0..vlfs.sector_len], &op.data);
+        }
+    }
+    var i: usize = 0;
+    for (op_log[boundary..op_log_n]) |op| {
+        if (op.flush) break;
+        if ((i >= lo1 and i < hi1) or (i >= lo2 and i < hi2)) {
+            const off = op.lba * vlfs.sector_len;
+            @memcpy(out[off..][0..vlfs.sector_len], &op.data);
+        }
+        i += 1;
+    }
+}
+
+var img_pre: [16 << 20]u8 align(64) = undefined;
+var img_crash: [16 << 20]u8 align(64) = undefined;
+var s_walk: [vlfs.block_len]u8 align(64) = undefined;
+var s_compose: [vlfs.block_len]u8 align(64) = undefined;
+
+/// Read a file's bytes on a mounted sealed volume (≤ 8 KiB fixtures).
+fn fileBytes(src: vlfs.SectorSource, vol: vlfs.Volume, ino: u32, out: []u8) vlfs.Error!usize {
+    return vlfs.read(src, vol, ino, 0, out, &s_walk);
+}
+
+test "seal: commit journals the tag homes covering a txn's sealed dests" {
+    const volume_id: u64 = 0xBEEF;
+    const pass = "txn-pass";
+    const img = &test_img;
+    var dek: [dek_len]u8 = undefined;
+    const info = formatSealedImage(img, volume_id, pass, &dek);
+    var disk = RecDisk{ .img = img, .record = false };
+    var p = FakePrompt{ .input = "txn-pass\n", .out = .empty };
+    defer p.out.deinit(std.testing.allocator);
+    var s: Seal = undefined;
+    var ops = p.ops();
+    const sb = try vlfs.selectSuperblock(disk.source());
+    try std.testing.expectEqual(Outcome.unsealed, unseal(&s, disk.source(), sb, info, &ops));
+    const src = source(&s);
+    var vol = try vlfs.mount(src, &s_walk);
+
+    const ino = try vlfs_write.create(src, &vol, vlfs.root_inode, "F.TXT", vlfs.kind_file, test_now, &s_walk, &s_compose);
+    _ = try vlfs_write.writeFile(src, &vol, ino, 0, "sealed payload", test_now, &s_walk, &s_compose);
+
+    // The last transaction's DESC (journal cursor is the region start
+    // under eager checkpointing) names a tag-home dest — the updated tag
+    // block rode in the same transaction as the payloads it covers.
+    var desc: [vlfs.block_len]u8 = undefined;
+    try std.testing.expect(src.readBlock(vol.journal_first, &desc));
+    const n = vlfs.rd16(&desc, vlfs.jd_count);
+    var saw_tag_dest = false;
+    for (0..n) |i| {
+        const dest = vlfs.rd32(&desc, vlfs.jd_entries + 8 * i);
+        if (dest >= vol.seal.?.tag_first) saw_tag_dest = true;
+    }
+    try std.testing.expect(saw_tag_dest);
+    // The checkpoint consumed every staged entry — none leaked.
+    try std.testing.expectEqual(@as(u32, 0), s.staged_n);
+    // The file's bytes read back through the landed ciphertext+tag pair.
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 14), try fileBytes(src, vol, ino, &out));
+    try std.testing.expectEqualSlices(u8, "sealed payload", out[0..14]);
+}
+
+test "seal: every legal crash state replays to pre/post and leaves no unauthenticated home" {
+    const volume_id: u64 = 0xCAFE;
+    const pass = "crash-pass";
+    const img = &test_img;
+    var dek: [dek_len]u8 = undefined;
+    const info = formatSealedImage(img, volume_id, pass, &dek);
+    var disk_a = RecDisk{ .img = img, .record = false };
+    var p = FakePrompt{ .input = "crash-pass\n", .out = .empty };
+    defer p.out.deinit(std.testing.allocator);
+    var s: Seal = undefined;
+    var ops = p.ops();
+    const sb = try vlfs.selectSuperblock(disk_a.source());
+    try std.testing.expectEqual(Outcome.unsealed, unseal(&s, disk_a.source(), sb, info, &ops));
+    const src = source(&s);
+    var vol = try vlfs.mount(src, &s_walk);
+
+    // A representative op: create + stable write, then the measured txn.
+    const ino = try vlfs_write.create(src, &vol, vlfs.root_inode, "F.TXT", vlfs.kind_file, test_now, &s_walk, &s_compose);
+    _ = try vlfs_write.writeFile(src, &vol, ino, 0, "stable base\n", test_now, &s_walk, &s_compose);
+    const pre_len = blk: {
+        var b: [64]u8 = undefined;
+        break :blk try fileBytes(src, vol, ino, &b);
+    };
+    @memcpy(&img_pre, img);
+
+    var payload: [5000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i % 97);
+    disk_a.record = true;
+    op_log_n = 0;
+    _ = try vlfs_write.writeFile(src, &vol, ino, 3000, &payload, test_now, &s_walk, &s_compose);
+    disk_a.record = false;
+    var post: [8192]u8 = undefined;
+    const post_len = try fileBytes(src, vol, ino, &post);
+
+    // The blocks a torn write can leave mismatched: the txn's dests plus
+    // every block whose tag entry shares a journaled tag home. Read the
+    // committed DESC on the completed image to enumerate them — the
+    // --check contract is that every one authenticates post-remount.
+    var dests: [vlfs.max_payload]u32 = undefined;
+    var ndests: usize = 0;
+    var thomes: [vlfs.max_payload]u32 = undefined;
+    var nthomes: usize = 0;
+    {
+        var desc: [vlfs.block_len]u8 = undefined;
+        try std.testing.expect(src.readBlock(vol.journal_first, &desc));
+        const n = vlfs.rd16(&desc, vlfs.jd_count);
+        for (0..n) |i| {
+            const d = vlfs.rd32(&desc, vlfs.jd_entries + 8 * i);
+            if (d >= vol.seal.?.tag_first) {
+                thomes[nthomes] = d;
+                nthomes += 1;
+            } else {
+                dests[ndests] = d;
+                ndests += 1;
+            }
+        }
+        try std.testing.expect(nthomes > 0);
+    }
+
+    // Flush boundaries in the measured transaction's op log.
+    var flush_idx: [16]usize = undefined;
+    var nf: usize = 0;
+    for (op_log[0..op_log_n], 0..) |op, i| {
+        if (op.flush) {
+            flush_idx[nf] = i;
+            nf += 1;
+        }
+    }
+    try std.testing.expect(nf >= 3);
+
+    var cases: usize = 0;
+    for (0..nf + 1) |k| {
+        const boundary: usize = if (k == 0) 0 else flush_idx[k - 1] + 1;
+        const limit: usize = if (k < nf) flush_idx[k] else op_log_n;
+        var window: usize = 0;
+        for (op_log[boundary..limit]) |op| {
+            if (!op.flush) window += 1;
+        }
+        // The legal family at every boundary: empty tail, full tail, and
+        // for each window index its prefix cut, suffix, singleton, and
+        // leave-one-out — O(w) cases like the v1 enumerator.
+        var c: usize = 0;
+        while (c < 2 + 4 * window) : (c += 1) {
+            var lo1: usize = 0;
+            var hi1: usize = 0;
+            var lo2: usize = 0;
+            var hi2: usize = 0;
+            if (c == 0) {
+                // empty tail
+            } else if (c == 1) {
+                hi1 = window; // full tail
+            } else {
+                const m = (c - 2) % 4;
+                const a = (c - 2) / 4;
+                switch (m) {
+                    0 => hi1 = a, // prefix
+                    1 => {
+                        lo1 = a; // suffix
+                        hi1 = window;
+                    },
+                    2 => {
+                        lo1 = a; // singleton
+                        hi1 = a + 1;
+                    },
+                    else => {
+                        hi1 = a; // leave-one-out
+                        lo2 = a + 1;
+                        hi2 = window;
+                    },
+                }
+            }
+            crashImage(&img_pre, k, lo1, hi1, lo2, hi2, &img_crash);
+            // A fresh Seal mounts the crash image — the staged set is a
+            // mount's own state, never on disk.
+            var disk_c = RecDisk{ .img = &img_crash, .record = false };
+            var sc = makeSeal(volume_id, info.tag_first + info.tag_blocks, info.tag_first, disk_c.source());
+            sc.journal_end = s.journal_end;
+            sc.dek = dek;
+            const src_c = source(&sc);
+            const vol_c = try vlfs.mount(src_c, &s_walk);
+            var out: [8192]u8 = undefined;
+            const got = try fileBytes(src_c, vol_c, ino, &out);
+            // Two legal outcomes: the pre-write bytes or the post-write
+            // bytes — never a third state.
+            if (got == post_len) {
+                try std.testing.expectEqualSlices(u8, post[0..post_len], out[0..got]);
+            } else {
+                try std.testing.expectEqual(pre_len, got);
+                try std.testing.expectEqualSlices(u8, "stable base\n", out[0..pre_len]);
+            }
+            // Every txn-dest home authenticates post-remount — a torn
+            // write can only ever be a journal record (journal_torn),
+            // never a mismatched home.
+            for (dests[0..ndests]) |d| {
+                try std.testing.expect(src_c.readBlock(d, &s_walk));
+            }
+            // And so does every block sharing a journaled tag home — the
+            // torn-tag-home blast radius a mid-checkpoint kill used to
+            // leave flagged.
+            for (thomes[0..nthomes]) |home| {
+                var b2: u32 = 2 + (home - vol.seal.?.tag_first) * vlfs.tag_entries_per_block;
+                const hi = @min(b2 + vlfs.tag_entries_per_block, vol.seal.?.tag_first);
+                while (b2 < hi) : (b2 += 1) {
+                    if (b2 >= sc.journal_end) {
+                        try std.testing.expect(src_c.readBlock(b2, &s_walk));
+                    }
+                }
+            }
+            cases += 1;
+        }
+    }
+    try std.testing.expect(cases > 200);
+}
+
+const test_now: u64 = 1_800_000_000;

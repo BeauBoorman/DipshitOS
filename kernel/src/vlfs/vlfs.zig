@@ -234,6 +234,23 @@ pub const SectorSource = struct {
     readBlockFn: ?*const fn (ctx: ?*anyopaque, blk: u32, out: *[block_len]u8) bool = null,
     writeBlockFn: ?*const fn (ctx: ?*anyopaque, blk: u32, data: *const [block_len]u8) bool = null,
     errFn: ?*const fn (ctx: ?*anyopaque) Error = null,
+    /// M172f (#3104, ADR 0061 journaled tag blocks): sealed-txn hooks —
+    /// all null on unsealed sources, so the v1 path is byte-identical.
+    /// A sealed commit carries the updated tag homes as transaction
+    /// payloads, and the checkpoint lands exactly the ciphertext the
+    /// journal committed to. `stageBlock` records the {nonce, tag} pair
+    /// a home write for `dest` must produce and returns the pair's tag
+    /// home (0 when `dest` has no tag — unsealed region or a journal
+    /// record); `applyStaged` writes every staged entry living in tag
+    /// home `home` into `tagblk` (its plaintext contents) and returns
+    /// the count; `injectEntry` stages an already-journaled entry so the
+    /// replay's writeBlock(dest) lands the committed ciphertext rather
+    /// than a fresh seal; `clearStaged` drops the staged set at a txn
+    /// boundary.
+    stageBlockFn: ?*const fn (ctx: ?*anyopaque, dest: u32, contents: *const [block_len]u8) u32 = null,
+    applyStagedFn: ?*const fn (ctx: ?*anyopaque, home: u32, tagblk: *[block_len]u8) u32 = null,
+    injectEntryFn: ?*const fn (ctx: ?*anyopaque, dest: u32, entry: *const [tag_entry_len]u8) void = null,
+    clearStagedFn: ?*const fn (ctx: ?*anyopaque) void = null,
 
     pub fn readSector(self: SectorSource, lba: u64, out: *[sector_len]u8) bool {
         if (self.total_sectors != 0 and lba >= self.total_sectors) return false;
@@ -288,6 +305,33 @@ pub const SectorSource = struct {
             if (!self.writeSector(lba, @ptrCast(data[i * sector_len ..][0..sector_len]))) return false;
         }
         return true;
+    }
+
+    /// Stage a sealed home write (ADR 0061): the {nonce, tag} pair the
+    /// checkpoint's writeBlock(dest) must land, and the tag home the
+    /// pair belongs to. 0 on unsealed dests and unsealed sources.
+    pub fn stageBlock(self: SectorSource, dest: u32, contents: *const [block_len]u8) u32 {
+        const f = self.stageBlockFn orelse return 0;
+        return f(self.ctx, dest, contents);
+    }
+
+    /// Write every staged tag entry living in tag home `home` into
+    /// `tagblk`; returns the entries applied.
+    pub fn applyStaged(self: SectorSource, home: u32, tagblk: *[block_len]u8) u32 {
+        const f = self.applyStagedFn orelse return 0;
+        return f(self.ctx, home, tagblk);
+    }
+
+    /// Stage a journaled tag entry for the next writeBlock(dest) — the
+    /// replay half: the checkpoint seals with the nonce the transaction
+    /// already committed to.
+    pub fn injectEntry(self: SectorSource, dest: u32, entry: *const [tag_entry_len]u8) void {
+        if (self.injectEntryFn) |f| f(self.ctx, dest, entry);
+    }
+
+    /// Drop the staged tag-entry set at a txn boundary.
+    pub fn clearStaged(self: SectorSource) void {
+        if (self.clearStagedFn) |f| f(self.ctx);
     }
 };
 
@@ -455,6 +499,16 @@ fn parseSealFields(sector: *const [sector_len]u8) Error!SealInfo {
 /// tag_blocks, so tag_blocks = ⌈(volume_blocks − 2)/147⌉.
 pub fn tagBlocksFor(volume_blocks: u32) u32 {
     return (volume_blocks - 2 + tag_entries_per_block) / (tag_entries_per_block + 1);
+}
+
+/// The tag home and byte offset of sealed block `b`'s entry (b in
+/// [2, tag_first)): slot b−2 packs 146 entries per tag block.
+pub fn tagHomeFor(tag_first: u32, b: u32) struct { blk: u32, off: usize } {
+    const slot = b - 2;
+    return .{
+        .blk = tag_first + slot / tag_entries_per_block,
+        .off = (slot % tag_entries_per_block) * tag_entry_len,
+    };
 }
 
 fn clamp(v: u64, lo: u64, hi: u64) u64 {
@@ -704,15 +758,28 @@ fn scanJournal(src: SectorSource, sb: Superblock, scratch: *[block_len]u8) Error
     return journalWalk(src, sb, scratch, null);
 }
 
+/// One journaled tag entry recovered from a sealed transaction's tag
+/// payload — the {nonce, tag} the replay's writeBlock(dest) must land.
+const TagEntry = struct { dest: u32, entry: [tag_entry_len]u8 };
+
 /// Replay the live journal transactions (ADR D5): each committed payload
 /// lands on its dest blocks, then FLUSH, then the ping-pong superblock
 /// update (journal_applied = last replayed seq, next_txn_seq = max), then
 /// FLUSH. Idempotent — the same bytes land on the same blocks.
+///
+/// On a sealed volume each transaction runs in two passes (ADR 0061
+/// #3104): the journaled tag homes land verbatim first and their entries
+/// are recovered, then every sealed dest's payload is written with its
+/// committed {nonce, tag} injected — the checkpoint lands exactly the
+/// ciphertext the journal carries, so payload and tag always converge as
+/// one pair. A transaction with no tag payloads (a crafted or pre-M172f
+/// record) replays through the eager fallback unchanged.
 fn replayJournal(src: SectorSource, sb: *Superblock, count: u32, scratch: *[block_len]u8) Error!void {
     _ = count;
     var pos = sb.journal_first;
     var expected = sb.journal_applied + 1;
     const end = sb.journal_first + sb.journal_blocks;
+    var entries: [max_payload]TagEntry = undefined;
     while (pos < end) {
         var probe = sb.*;
         probe.journal_applied = expected - 1;
@@ -723,10 +790,41 @@ fn replayJournal(src: SectorSource, sb: *Superblock, count: u32, scratch: *[bloc
         // Re-read DESC (scratch currently holds COMMIT).
         if (!try journalRead(src, pos, scratch)) break;
         const desc = scratch.*;
+        var entries_n: usize = 0;
+        if (sb.seal) |seal_| {
+            // Pass 1: the tag-home payloads land verbatim (plaintext
+            // region) and supply the entries pass 2 injects.
+            for (0..n) |i| {
+                const dest = rd32(&desc, jd_entries + 8 * @as(usize, @intCast(i)));
+                if (dest < seal_.tag_first) continue;
+                if (!try journalRead(src, pos + 1 + @as(u32, @intCast(i)), scratch)) break;
+                const tagblk = scratch.*;
+                for (0..n) |j| {
+                    const d2 = rd32(&desc, jd_entries + 8 * @as(usize, @intCast(j)));
+                    if (d2 >= seal_.tag_first) continue;
+                    const t = tagHomeFor(seal_.tag_first, d2);
+                    if (t.blk != dest or entries_n >= entries.len) continue;
+                    entries[entries_n] = .{ .dest = d2, .entry = tagblk[t.off..][0..tag_entry_len].* };
+                    entries_n += 1;
+                }
+                if (!src.writeBlock(dest, &tagblk)) return error.Io;
+            }
+        }
+        // Pass 2: sealed dests land with their committed {nonce, tag}
+        // injected; everything else writes verbatim as v1 always did.
         for (0..n) |i| {
             const dest = rd32(&desc, jd_entries + 8 * @as(usize, @intCast(i)));
+            if (sb.seal) |seal_| {
+                if (dest >= seal_.tag_first) continue; // landed in pass 1
+            }
             if (!try journalRead(src, pos + 1 + @as(u32, @intCast(i)), scratch)) break;
             const payload = scratch.*;
+            for (entries[0..entries_n]) |*e| {
+                if (e.dest == dest) {
+                    src.injectEntry(dest, &e.entry);
+                    break;
+                }
+            }
             if (!src.writeBlock(dest, &payload)) return error.Io;
         }
         expected += 1;

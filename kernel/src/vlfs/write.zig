@@ -86,8 +86,15 @@ pub const Txn = struct {
     walk: *Block,
     /// The block currently being composed/mutated by the caller.
     compose: *Block,
+    /// M172f (#3104, ADR 0061): the tag homes this txn's sealed dests
+    /// dirtied — commit appends each as a payload so the updated tag
+    /// block rides in the same transaction as the payloads it
+    /// authenticates.
+    thomes: [vlfs.max_payload]u32 = undefined,
+    thomes_n: u32 = 0,
 
     pub fn begin(src: vlfs.SectorSource, vol: *vlfs.Volume, walk: *Block, compose: *Block) Txn {
+        src.clearStaged(); // a stale stage from an aborted txn must not leak in
         return .{
             .src = src,
             .vol = vol,
@@ -142,6 +149,20 @@ pub const Txn = struct {
             return error.Io;
         }
         t.psums[i] = vlfs.fnv32(contents);
+        // ADR 0061 (#3104): a sealed dest's home ciphertext lands at
+        // checkpoint under the {nonce, tag} staged here; the tag home
+        // covering it joins this txn as a payload so pair and journal
+        // commit atomically. Unsealed dests and sources stage nothing.
+        const th = t.src.stageBlock(dest, contents);
+        if (th != 0) {
+            for (t.thomes[0..t.thomes_n]) |h| {
+                if (h == th) return;
+            }
+            if (t.thomes_n < t.thomes.len) {
+                t.thomes[t.thomes_n] = th;
+                t.thomes_n += 1;
+            }
+        }
     }
 
     /// D4's ordering, in one shot: DESC, COMMIT, FLUSH (the commit point),
@@ -151,6 +172,15 @@ pub const Txn = struct {
         if (t.err) |e| return e;
         if (t.n == 0) return;
         const walk = t.walk;
+        // ADR 0061 (#3104): the tag homes covering this txn's sealed
+        // dests join the commit as payloads — a mid-checkpoint kill
+        // replays payload and tag as one transaction instead of leaving
+        // a bad_block_auth home the replay has to guess at.
+        for (t.thomes[0..t.thomes_n]) |home| {
+            try t.readCurrent(home, walk);
+            _ = t.src.applyStaged(home, walk);
+            try t.append(home, walk);
+        }
         // DESC at the cursor.
         @memset(walk, 0);
         wr32(walk, vlfs.jd_magic, vlfs.magic_desc);
