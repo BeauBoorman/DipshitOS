@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -339,7 +341,7 @@ func TestGoldenPopulated(t *testing.T) {
 	if err := regionsVerify(img, string(text)); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range checkImage(img) {
+	for _, f := range checkImage(img, nil) {
 		if !f.info {
 			t.Fatalf("populated fixture fails check: %v", f)
 		}
@@ -349,7 +351,7 @@ func TestGoldenPopulated(t *testing.T) {
 // TestCheckGoldenClean asserts the committed empty image passes --check.
 func TestCheckGoldenClean(t *testing.T) {
 	img := readGolden(t, "empty-16m.regions")
-	for _, f := range checkImage(img) {
+	for _, f := range checkImage(img, nil) {
 		t.Fatalf("empty golden fails check: %v", f)
 	}
 }
@@ -370,7 +372,7 @@ func TestCheckMultiBlockBbitmap(t *testing.T) {
 	if g.BbitmapBlocks != 2 {
 		t.Fatalf("256 MiB bbitmap %d blocks, want 2", g.BbitmapBlocks)
 	}
-	for _, f := range checkImage(img) {
+	for _, f := range checkImage(img, nil) {
 		if !f.info {
 			t.Fatalf("256 MiB image fails check: %v", f)
 		}
@@ -456,7 +458,7 @@ func TestGeometryCeilItable(t *testing.T) {
 		t.Fatalf("inode %d maps to block %d >= data_first %d", last,
 			g.ItableFirst+last/InodesPerBlock, g.DataFirst)
 	}
-	for _, f := range checkImage(img) {
+	for _, f := range checkImage(img, nil) {
 		if !f.info {
 			t.Fatalf("17 MiB image fails check: %v", f)
 		}
@@ -490,7 +492,7 @@ func TestCheckDetects(t *testing.T) {
 		}, "bad_superblock", false},
 		{"bad version", func(img []byte) {
 			for _, off := range []uint64{0, BlockLen} {
-				binary.LittleEndian.PutUint32(img[off+sbVersion:], 2)
+				binary.LittleEndian.PutUint32(img[off+sbVersion:], 3)
 				// repair cksum so version is the only complaint
 				b := img[off:]
 				binary.LittleEndian.PutUint32(b[sbCksum:], fnv1a(b[:sbCksum]))
@@ -536,7 +538,7 @@ func TestCheckDetects(t *testing.T) {
 			w := newImage(t)
 			tc.mutate(w.img)
 			var got []finding
-			for _, f := range checkImage(w.img) {
+			for _, f := range checkImage(w.img, nil) {
 				if !f.info {
 					got = append(got, f)
 				}
@@ -671,7 +673,7 @@ func TestCheckDetectsStructural(t *testing.T) {
 			w := newImage(t)
 			tc.mutate(w)
 			var got []string
-			for _, f := range checkImage(w.img) {
+			for _, f := range checkImage(w.img, nil) {
 				if !f.info {
 					got = append(got, f.code)
 				}
@@ -713,7 +715,7 @@ func TestCheckJournal(t *testing.T) {
 	binary.LittleEndian.PutUint32(commit[jcCksum:], fnv1a(commit[:jcCksum]))
 
 	found := map[string]bool{}
-	for _, f := range checkImage(w.img) {
+	for _, f := range checkImage(w.img, nil) {
 		found[f.code] = true
 		if f.code == "journal_unreplayed" && !f.info {
 			t.Fatal("journal_unreplayed must be informational")
@@ -727,7 +729,7 @@ func TestCheckJournal(t *testing.T) {
 	// replayed copy must not be trusted (check still inspects cleanly).
 	binary.LittleEndian.PutUint32(commit[jcTxn:], 0xdeadbeef)
 	found = map[string]bool{}
-	for _, f := range checkImage(w.img) {
+	for _, f := range checkImage(w.img, nil) {
 		found[f.code] = true
 	}
 	if !found["journal_torn"] {
@@ -783,7 +785,7 @@ func TestCheckReplayOverlay(t *testing.T) {
 	// names a free inode and must fail.
 	copy(block(w.img, rootBlk), root)
 	hard := map[string]bool{}
-	for _, f := range checkImage(w.img) {
+	for _, f := range checkImage(w.img, nil) {
 		if !f.info {
 			hard[f.code] = true
 		}
@@ -803,7 +805,7 @@ func TestCheckReplayOverlay(t *testing.T) {
 	})
 	hard = map[string]bool{}
 	var sawUnreplayed bool
-	for _, f := range checkImage(w.img) {
+	for _, f := range checkImage(w.img, nil) {
 		if !f.info {
 			hard[f.code] = true
 		}
@@ -816,5 +818,357 @@ func TestCheckReplayOverlay(t *testing.T) {
 	}
 	if !sawUnreplayed {
 		t.Fatal("expected informational journal_unreplayed")
+	}
+}
+
+// --- sealed (v2, ADR 0061) ---------------------------------------------------
+
+func testHex(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestAEADChaCha20Block pins the RFC 8439 §2.3.2 block-function vector —
+// the same vector kernel/src/aead.zig and user/src/lib/crypto carry.
+func TestAEADChaCha20Block(t *testing.T) {
+	var key [aeadKeyLen]byte
+	for i := range key {
+		key[i] = byte(i)
+	}
+	nonce := [aeadNonceLen]byte{0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00}
+	var out [chachaBlock]byte
+	chacha20Block(&key, 1, &nonce, &out)
+	want := testHex(t,
+		"10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"+
+			"d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")
+	if !bytes.Equal(out[:], want) {
+		t.Fatal("ChaCha20 block vector mismatch")
+	}
+}
+
+// TestAEADPoly1305 pins the RFC 8439 §2.5.2 Poly1305 known-answer.
+func TestAEADPoly1305(t *testing.T) {
+	keyb := testHex(t, "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+	p := poly1305Init((*[32]byte)(keyb))
+	p.update([]byte("Cryptographic Forum Research Group"))
+	var out [16]byte
+	p.final(&out)
+	want := testHex(t, "a8061dc1305136c6c22b8baf0c0127a9")
+	if !bytes.Equal(out[:], want) {
+		t.Fatal("Poly1305 KAT mismatch")
+	}
+}
+
+// TestAEADRFC8439 pins the §2.8.2 AEAD vector plus tamper refusal.
+func TestAEADRFC8439(t *testing.T) {
+	key := (*[aeadKeyLen]byte)(testHex(t,
+		"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"))
+	nonce := (*[aeadNonceLen]byte)(testHex(t, "070000004041424344454647"))
+	aad := testHex(t, "50515253c0c1c2c3c4c5c6c7")
+	plaintext := []byte("Ladies and Gentlemen of the class of '99: If I could " +
+		"offer you only one tip for the future, sunscreen would be it.")
+	wantCT := testHex(t,
+		"d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6"+
+			"3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36"+
+			"92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc"+
+			"3ff4def08e4b7a9de576d26586cec64b6116")
+	wantTag := testHex(t, "1ae10b594f09e26a7e902ecbd0600691")
+
+	ct := make([]byte, len(plaintext))
+	var tag [aeadTagLen]byte
+	aeadSeal(ct, &tag, plaintext, aad, nonce, key)
+	if !bytes.Equal(ct, wantCT) || !bytes.Equal(tag[:], wantTag) {
+		t.Fatal("AEAD seal vector mismatch")
+	}
+	back := make([]byte, len(plaintext))
+	if !aeadOpen(back, ct, &tag, aad, nonce, key) || !bytes.Equal(back, plaintext) {
+		t.Fatal("AEAD open round trip failed")
+	}
+
+	// Tampered tag, ciphertext, or AAD is refused.
+	badTag := tag
+	badTag[0] ^= 1
+	if aeadOpen(back, ct, &badTag, aad, nonce, key) {
+		t.Fatal("tampered tag accepted")
+	}
+	badCT := append([]byte(nil), ct...)
+	badCT[3] ^= 0x80
+	if aeadOpen(back, badCT, &tag, aad, nonce, key) {
+		t.Fatal("tampered ciphertext accepted")
+	}
+	badAAD := append([]byte(nil), aad...)
+	badAAD[0] ^= 0x01
+	if aeadOpen(back, ct, &tag, badAAD, nonce, key) {
+		t.Fatal("tampered AAD accepted")
+	}
+}
+
+// TestPBKDF2Stdlib pins the published PBKDF2-HMAC-SHA256 vector against
+// the stdlib provider — the drift guard for crypto/pbkdf2.
+func TestPBKDF2Stdlib(t *testing.T) {
+	dk, err := pbkdf2Key([]byte("password"), []byte("salt"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := testHex(t, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+	if !bytes.Equal(dk, want) {
+		t.Fatal("PBKDF2-HMAC-SHA256 c=1 vector mismatch")
+	}
+	dk, err = pbkdf2Key([]byte("password"), []byte("salt"), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = testHex(t, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+	if !bytes.Equal(dk, want) {
+		t.Fatal("PBKDF2-HMAC-SHA256 c=4096 vector mismatch")
+	}
+}
+
+// sealedImage builds a v2 volume with fixed seal material (iters 1 keeps
+// the test fast; the format pins the stored count, not a minimum).
+func sealedImage(t *testing.T, pass string) ([]byte, Geometry) {
+	t.Helper()
+	img := make([]byte, goldenSize)
+	var p sealParams
+	for i := range p.dek {
+		p.dek[i] = byte(i)
+	}
+	for i := range p.salt {
+		p.salt[i] = 0xa0 + byte(i)
+	}
+	for i := range p.wrapNonce {
+		p.wrapNonce[i] = 0x50 + byte(i)
+	}
+	p.iters = 1
+	if err := formatSealedImage(img, goldenID, goldenTime, []byte(pass), p); err != nil {
+		t.Fatal(err)
+	}
+	g, err := geometryFor(goldenSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err = sealedGeometry(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return img, g
+}
+
+func hardFindings(findings []finding) []string {
+	var out []string
+	for _, f := range findings {
+		if !f.info {
+			out = append(out, f.String())
+		}
+	}
+	return out
+}
+
+// TestSealedFormat checks the v2 on-disk structure ADR 0061 pins.
+func TestSealedFormat(t *testing.T) {
+	img, g := sealedImage(t, "correct horse battery staple")
+
+	// Tag-region fixpoint: 28 blocks ending at the 16-MiB volume's end.
+	if g.TagBlocks != 28 || g.TagFirst != 4068 || g.TagFirst+g.TagBlocks != g.VolumeBlocks {
+		t.Fatalf("tag geometry first=%d blocks=%d", g.TagFirst, g.TagBlocks)
+	}
+	if g.DataFirst+g.DataBlocks != g.TagFirst {
+		t.Fatalf("data region %d+%d does not end at tag_first %d",
+			g.DataFirst, g.DataBlocks, g.TagFirst)
+	}
+
+	for _, slot := range []uint32{0, 1} {
+		sb := block(img, slot)[:SectorLen]
+		if v := binary.LittleEndian.Uint32(sb[sbVersion:]); v != Version2 {
+			t.Fatalf("slot %d version %d, want 2", slot, v)
+		}
+		if m := binary.LittleEndian.Uint32(sb[sbSealMagic:]); m != MagicSeal {
+			t.Fatalf("slot %d seal_magic %08x", slot, m)
+		}
+		if id := binary.LittleEndian.Uint32(sb[sbKdfID:]); id != KdfPbkdf2Sha256 {
+			t.Fatalf("slot %d kdf_id %d", slot, id)
+		}
+		if n := binary.LittleEndian.Uint32(sb[sbKdfIters:]); n != 1 {
+			t.Fatalf("slot %d kdf_iters %d", slot, n)
+		}
+		if tf := binary.LittleEndian.Uint32(sb[sbTagFirst:]); tf != g.TagFirst {
+			t.Fatalf("slot %d tag_first %d != %d", slot, tf, g.TagFirst)
+		}
+		if !isZero(sb[sbSealZero:sbCksum]) {
+			t.Fatalf("slot %d seal reserved bytes nonzero", slot)
+		}
+	}
+
+	// The sealed span must be ciphertext: the fresh image's journal
+	// plaintext is all zeros, but the stored block must not be.
+	if isZero(block(img, g.JournalFirst)) {
+		t.Fatal("sealed journal block is plaintext-zero")
+	}
+	// Tag-region tails are the pinned 8 zero bytes.
+	for tb := g.TagFirst; tb < g.VolumeBlocks; tb++ {
+		if !isZero(block(img, tb)[TagEntriesPerBlock*TagEntryBytes:]) {
+			t.Fatalf("tag block %d tail nonzero", tb)
+		}
+	}
+}
+
+// TestSealedRoundTrip is the acceptance round trip: --seal writes, the
+// plaintext beneath equals what the shared writer produces, --check with
+// the passphrase authenticates every tag and checks clean, and the wrong
+// passphrase fails the wrap open.
+func TestSealedRoundTrip(t *testing.T) {
+	pass := "correct horse battery staple"
+	img, g := sealedImage(t, pass)
+
+	// Structure-only mode: no passphrase verifies the v2 shape, reports
+	// nothing hard, and notes the unverified span.
+	var sawSealedNote bool
+	for _, f := range checkImage(img, nil) {
+		if !f.info {
+			t.Fatalf("sealed structure-only check has hard finding: %v", f)
+		}
+		if f.code == "sealed" {
+			sawSealedNote = true
+		}
+	}
+	if !sawSealedNote {
+		t.Fatal("expected informational sealed note without passphrase")
+	}
+
+	// Full check: every tag verified, as-replayed structure clean.
+	if got := hardFindings(checkImage(img, []byte(pass))); len(got) != 0 {
+		t.Fatalf("sealed image fails check: %v", got)
+	}
+
+	// Unseal the whole span and compare against the same writer's
+	// plaintext — the seal is exactly AEAD per block, nothing more.
+	want := make([]byte, goldenSize)
+	writeStructures(want, g, goldenID, goldenTime)
+	var dek [KeyBytes]byte
+	sb, err := parseSuperblock(img, 0)
+	if err != nil || sb == nil {
+		t.Fatalf("superblock: %v", err)
+	}
+	d, err := unwrapDEK(sb, []byte(pass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek = *d
+	for b := uint32(2); b < g.TagFirst; b++ {
+		e := tagEntry(img, g, b)
+		nonce := (*[aeadNonceLen]byte)(e[:aeadNonceLen])
+		tag := (*[aeadTagLen]byte)(e[aeadNonceLen:])
+		out := make([]byte, BlockLen)
+		if !aeadOpen(out, block(img, b), tag, blockAAD(goldenID, b), nonce, (*[aeadKeyLen]byte)(&dek)) {
+			t.Fatalf("block %d fails AEAD open", b)
+		}
+		if !bytes.Equal(out, block(want, b)) {
+			t.Fatalf("block %d plaintext differs from formatStructures", b)
+		}
+	}
+
+	// Wrong passphrase: the wrap open refuses by name.
+	var badPass bool
+	for _, f := range checkImage(img, []byte("wrong")) {
+		if f.code == "sealed_bad_passphrase" {
+			badPass = true
+		}
+	}
+	if !badPass {
+		t.Fatal("wrong passphrase did not yield sealed_bad_passphrase")
+	}
+}
+
+// TestSealedBitFlip: one flipped bit in a sealed block, its tag, or its
+// nonce must fail --check with bad_block_auth naming the block.
+func TestSealedBitFlip(t *testing.T) {
+	pass := []byte("correct horse battery staple")
+	for _, which := range []string{"ciphertext", "tag", "nonce"} {
+		t.Run(which, func(t *testing.T) {
+			img, g := sealedImage(t, string(pass))
+			victim := g.DataFirst + 10 // an unreferenced data block
+			switch which {
+			case "ciphertext":
+				block(img, victim)[137] ^= 0x01
+			case "tag":
+				e := tagEntry(img, g, victim)
+				e[aeadNonceLen+3] ^= 0x01
+			case "nonce":
+				e := tagEntry(img, g, victim)
+				e[5] ^= 0x01
+			}
+			want := fmt.Sprintf("block %d", victim)
+			var found bool
+			for _, f := range checkImage(img, pass) {
+				if f.code == "bad_block_auth" && strings.Contains(f.detail, want) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("%s flip did not produce bad_block_auth %s", which, want)
+			}
+		})
+	}
+}
+
+// TestSealedWrapTamper: a corrupt wrapped DEK is the same refusal as a
+// wrong passphrase (ADR 0061 D9).
+func TestSealedWrapTamper(t *testing.T) {
+	pass := []byte("correct horse battery staple")
+	img, _ := sealedImage(t, string(pass))
+	for _, slot := range []uint64{0, BlockLen} {
+		img[slot+sbWrappedDEK] ^= 0x01
+		b := img[slot:]
+		binary.LittleEndian.PutUint32(b[sbCksum:], fnv1a(b[:sbCksum]))
+	}
+	var found bool
+	for _, f := range checkImage(img, pass) {
+		if f.code == "sealed_bad_passphrase" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("corrupt wrap did not yield sealed_bad_passphrase")
+	}
+}
+
+// TestSealedBadSuperblock: a v2 superblock without seal_magic is
+// malformed (bad_superblock), and a torn tag_first breaks the fixpoint.
+func TestSealedBadSuperblock(t *testing.T) {
+	pass := []byte("p")
+	img, _ := sealedImage(t, string(pass))
+	for _, slot := range []uint64{0, BlockLen} {
+		binary.LittleEndian.PutUint32(img[slot+sbSealMagic:], 0)
+		b := img[slot:]
+		binary.LittleEndian.PutUint32(b[sbCksum:], fnv1a(b[:sbCksum]))
+	}
+	var found bool
+	for _, f := range checkImage(img, pass) {
+		if f.code == "bad_superblock" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("v2 without seal_magic did not yield bad_superblock")
+	}
+
+	img, _ = sealedImage(t, string(pass))
+	for _, slot := range []uint64{0, BlockLen} {
+		binary.LittleEndian.PutUint32(img[slot+sbTagFirst:], 42)
+		b := img[slot:]
+		binary.LittleEndian.PutUint32(b[sbCksum:], fnv1a(b[:sbCksum]))
+	}
+	found = false
+	for _, f := range checkImage(img, pass) {
+		if f.code == "bad_superblock" || f.code == "geometry_mismatch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("torn tag_first did not yield a structural refusal")
 	}
 }

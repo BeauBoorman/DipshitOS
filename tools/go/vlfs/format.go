@@ -44,8 +44,28 @@ const (
 	MagicCommit uint32 = 0x544D434A
 	// MagicExtent is the extent-block magic, "VXEB".
 	MagicExtent uint32 = 0x42455856
-	// Version is the only format version this tool emits or accepts.
+	// Version is the v1 format version — an unsealed volume.
 	Version uint32 = 1
+	// Version2 is the sealed format version (ADR 0061).
+	Version2 uint32 = 2
+
+	// MagicSeal is the sealed-volume mark in the v2 superblock, "SLFS".
+	// A version-2 superblock without it is malformed (bad_superblock).
+	MagicSeal uint32 = 0x53464C53
+	// KdfPbkdf2Sha256 is the only kdf_id: PBKDF2-HMAC-SHA256.
+	KdfPbkdf2Sha256 uint32 = 1
+
+	// Tag region (ADR 0061): the last region of the volume, tag_blocks
+	// plaintext blocks ending at volume_blocks. Each carries
+	// TagEntriesPerBlock {nonce, tag} pairs for the sealed span
+	// [2, tag_first): entry for sealed block b is slot b-2.
+	TagEntryBytes      = 28                             // nonce 12 B ‖ tag 16 B
+	TagEntriesPerBlock = (BlockLen - 8) / TagEntryBytes // 146
+	// KeyBytes is the DEK/KEK width; SealSaltBytes and WrapNonceBytes are
+	// the superblock wrap material widths (ADR 0061 D9).
+	KeyBytes       = aeadKeyLen
+	SealSaltBytes  = 16
+	WrapNonceBytes = aeadNonceLen
 
 	// MinVolumeBytes is ADR 0050 D7's volume floor (volume_too_small).
 	MinVolumeBytes uint64 = 16 << 20
@@ -116,8 +136,22 @@ const (
 	sbJournalApplied = 84
 	sbNextTxnSeq     = 92
 	sbMkfsTime       = 100
-	sbReserved       = 108 // 400 bytes, zero
+	sbReserved       = 108 // 400 bytes: v1 all zero; v2 consumes +108..+204
 	sbCksum          = 508
+)
+
+// v2 seal fields inside the superblock's reserved span (ADR 0061).
+const (
+	sbSealMagic  = 108 // u32 = MagicSeal
+	sbKdfID      = 112 // u32 = KdfPbkdf2Sha256
+	sbKdfIters   = 116 // u32, calibrated ~1 s at seal time
+	sbKdfSalt    = 120 // 16 B, random at seal/rewrap
+	sbWrapNonce  = 136 // 12 B, random at seal/rewrap
+	sbWrappedDEK = 148 // 32 B, DEK ciphertext under the KEK
+	sbWrapTag    = 180 // 16 B, AEAD tag of the wrap
+	sbTagFirst   = 196 // u32, first tag-region block
+	sbTagBlocks  = 200 // u32
+	sbSealZero   = 204 // zero through +508 (cksum)
 )
 
 // Inode field offsets (ADR 0050 D3; 128-byte record).
@@ -203,6 +237,11 @@ type Geometry struct {
 	DataFirst     uint32
 	DataBlocks    uint32
 	InodeCount    uint32
+	// Tag region (v2 only; both zero on v1). TagFirst is the first
+	// tag-region block; DataFirst+DataBlocks == TagFirst on a sealed
+	// volume — the tag region is carved off the end of the data region.
+	TagFirst  uint32
+	TagBlocks uint32
 }
 
 // geometryFor computes the mkfs layout for a volume of volumeBytes, which
@@ -240,6 +279,31 @@ func geometryFor(volumeBytes uint64) (Geometry, error) {
 	if g.DataBlocks == 0 {
 		return Geometry{}, errCode{"geometry_mismatch", "no data region"}
 	}
+	return g, nil
+}
+
+// tagBlocksFor solves the ADR 0061 fixpoint: the tag region holds one
+// 28-byte entry per sealed block in [2, tag_first) where
+// tag_first = volume_blocks − tag_blocks, so the count must satisfy
+// 146·tag_blocks ≥ volume_blocks − 2 − tag_blocks — i.e.
+// tag_blocks = ⌈(volume_blocks − 2)/147⌉ (28 blocks at the 16-MiB floor,
+// 1,784 at the 1-GiB cap).
+func tagBlocksFor(volumeBlocks uint32) uint32 {
+	return (volumeBlocks - 2 + TagEntriesPerBlock) / (TagEntriesPerBlock + 1)
+}
+
+// sealedGeometry carves the tag region off the end of a v1 layout: the
+// sealed span becomes [2, tag_first) and the data region shrinks by
+// tag_blocks. Fails if sealing would leave no data region.
+func sealedGeometry(g Geometry) (Geometry, error) {
+	tb := tagBlocksFor(g.VolumeBlocks)
+	if tb >= g.DataBlocks {
+		return Geometry{}, errCode{"volume_too_small",
+			fmt.Sprintf("tag region %d blocks covers data region %d", tb, g.DataBlocks)}
+	}
+	g.TagBlocks = tb
+	g.TagFirst = g.VolumeBlocks - tb
+	g.DataBlocks = g.TagFirst - g.DataFirst
 	return g, nil
 }
 

@@ -15,6 +15,11 @@ go run . -bytes 16777216 /tmp/vlfs.img          # exact size (block-aligned)
 go run . -volume-id 5eed5eed -time 1760000000   # deterministic fields
 go run . --check /tmp/vlfs.img                  # read-only structural check
 go run . --emit-regions /tmp/vlfs.img           # dump non-zero regions
+
+# sealed v2 volumes (ADR 0061)
+go run . --seal --passphrase-file pass.txt /tmp/vlfs.img
+go run . --check --passphrase-file pass.txt /tmp/vlfs.img
+echo hunter2 | go run . --check --passphrase-file - /tmp/vlfs.img
 ```
 
 `--check` is the offline half of fsck.vlfs (D5): superblock pair + geometry,
@@ -22,6 +27,18 @@ journal scan (`journal_unreplayed`/`journal_torn` are informational), inode
 checksums and kinds, extent bounds/overlap, bbitmap consistency, and a
 single-parent tree under inode 1 at depth ≤ 8 — all evaluated against the
 as-replayed state computed in memory. It never repairs.
+
+`--seal` writes a format-v2 volume: every block in the sealed span
+`[2, tag_first)` is ChaCha20-Poly1305 ciphertext under a minted DEK, with
+nonces and tags in a plaintext tag region and the DEK wrapped into the
+superblock under a PBKDF2-HMAC-SHA256 KEK (iterations calibrated to ~1 s at
+seal time, or pinned with `-kdf-iters`). The passphrase comes only from a
+file or stdin (`--passphrase-file -`), never argv. `--check` on a sealed
+image verifies the v2 structure alone without the passphrase; with it,
+`bad_block_auth` names any block whose tag fails and
+`sealed_bad_passphrase` is a failed DEK unwrap. The AEAD is an in-tree
+port (`aead.go`) pinned to the same RFC 8439 vectors as
+`kernel/src/aead.zig`; there is still no third-party module.
 
 ## Golden fixtures
 

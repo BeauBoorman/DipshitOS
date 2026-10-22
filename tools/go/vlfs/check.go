@@ -29,6 +29,7 @@ func (f finding) String() string {
 
 // superblock is the decoded +508 bytes of a superblock sector.
 type superblock struct {
+	version        uint32
 	seq            uint64
 	volumeID       uint64
 	volumeBytes    uint64
@@ -48,6 +49,15 @@ type superblock struct {
 	journalApplied uint64
 	nextTxnSeq     uint64
 	mkfsTime       uint64
+	// v2 seal span (ADR 0061); all zero on v1.
+	kdfID      uint32
+	kdfIters   uint32
+	kdfSalt    [SealSaltBytes]byte
+	wrapNonce  [WrapNonceBytes]byte
+	wrappedDEK [KeyBytes]byte
+	wrapTag    [aeadTagLen]byte
+	tagFirst   uint32
+	tagBlocks  uint32
 }
 
 // parseSuperblock validates one superblock sector. It returns (nil, nil)
@@ -61,13 +71,15 @@ func parseSuperblock(img []byte, slot uint32) (*superblock, error) {
 	if binary.LittleEndian.Uint32(b[sbMagic:]) != MagicSuper {
 		return nil, nil
 	}
-	if binary.LittleEndian.Uint32(b[sbVersion:]) != Version {
-		return nil, errCode{"unsupported_version", fmt.Sprintf("version %d", binary.LittleEndian.Uint32(b[sbVersion:]))}
+	version := binary.LittleEndian.Uint32(b[sbVersion:])
+	if version != Version && version != Version2 {
+		return nil, errCode{"unsupported_version", fmt.Sprintf("version %d", version)}
 	}
 	if binary.LittleEndian.Uint32(b[sbCksum:]) != fnv1a(b[:sbCksum]) {
 		return nil, errCode{"bad_superblock", fmt.Sprintf("slot %d checksum", slot)}
 	}
 	s := &superblock{
+		version:        version,
 		seq:            binary.LittleEndian.Uint64(b[sbSeq:]),
 		volumeID:       binary.LittleEndian.Uint64(b[sbVolumeID:]),
 		volumeBytes:    binary.LittleEndian.Uint64(b[sbVolumeBytes:]),
@@ -88,10 +100,56 @@ func parseSuperblock(img []byte, slot uint32) (*superblock, error) {
 		nextTxnSeq:     binary.LittleEndian.Uint64(b[sbNextTxnSeq:]),
 		mkfsTime:       binary.LittleEndian.Uint64(b[sbMkfsTime:]),
 	}
+	if version == Version2 {
+		s.kdfID = binary.LittleEndian.Uint32(b[sbKdfID:])
+		s.kdfIters = binary.LittleEndian.Uint32(b[sbKdfIters:])
+		copy(s.kdfSalt[:], b[sbKdfSalt:])
+		copy(s.wrapNonce[:], b[sbWrapNonce:])
+		copy(s.wrappedDEK[:], b[sbWrappedDEK:])
+		copy(s.wrapTag[:], b[sbWrapTag:])
+		s.tagFirst = binary.LittleEndian.Uint32(b[sbTagFirst:])
+		s.tagBlocks = binary.LittleEndian.Uint32(b[sbTagBlocks:])
+	}
 	if err := s.checkGeometry(); err != nil {
 		return nil, err
 	}
+	if version == Version2 {
+		if err := s.checkSeal(b); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+// checkSeal enforces the ADR 0061 v2 structure inside the reserved span:
+// the seal mark, the only kdf_id, a nonzero iteration count, the
+// tag-region fixpoint, and zeroed reserved bytes through +508. A v2
+// superblock without seal_magic is malformed (bad_superblock).
+func (s *superblock) checkSeal(b []byte) error {
+	bad := func(format string, args ...any) error {
+		return errCode{"bad_superblock", fmt.Sprintf(format, args...)}
+	}
+	if binary.LittleEndian.Uint32(b[sbSealMagic:]) != MagicSeal {
+		return bad("v2 without seal_magic")
+	}
+	if s.kdfID != KdfPbkdf2Sha256 {
+		return bad("kdf_id %d", s.kdfID)
+	}
+	if s.kdfIters == 0 {
+		return bad("kdf_iters is zero")
+	}
+	if want := tagBlocksFor(s.volumeBlocks); s.tagBlocks != want {
+		return bad("tag_blocks %d != ceil((volume_blocks-2)/%d)=%d",
+			s.tagBlocks, TagEntriesPerBlock+1, want)
+	}
+	if s.tagFirst+s.tagBlocks != s.volumeBlocks {
+		return bad("tag_first %d + tag_blocks %d != volume_blocks %d",
+			s.tagFirst, s.tagBlocks, s.volumeBlocks)
+	}
+	if !isZero(b[sbSealZero:sbCksum]) {
+		return bad("seal reserved bytes nonzero")
+	}
+	return nil
 }
 
 // checkGeometry enforces the ADR D3 layout: fixed ordering, the mkfs
@@ -135,8 +193,14 @@ func (s *superblock) checkGeometry() error {
 		s.itableBlocks != (s.inodeCount+InodesPerBlock-1)/InodesPerBlock {
 		return bad("itable placement")
 	}
-	if s.dataFirst != s.itableFirst+s.itableBlocks || s.dataFirst+s.dataBlocks != s.volumeBlocks {
-		return bad("data region %d+%d vs volume_blocks %d", s.dataFirst, s.dataBlocks, s.volumeBlocks)
+	// v1 tiles data blocks to the end of the volume; v2 ends the data
+	// region at tag_first, where the plaintext tag region begins.
+	dataEnd := s.volumeBlocks
+	if s.version == Version2 {
+		dataEnd = s.tagFirst
+	}
+	if s.dataFirst != s.itableFirst+s.itableBlocks || s.dataFirst+s.dataBlocks != dataEnd {
+		return bad("data region %d+%d vs data end %d", s.dataFirst, s.dataBlocks, dataEnd)
 	}
 	if s.nextTxnSeq == 0 {
 		return bad("next_txn_seq is zero")
@@ -158,7 +222,7 @@ func (c *checker) extentWalk(ino uint32, rec []byte) (blocks []uint32) {
 		c.referenced[b] = owner
 	}
 	one := func(first, count uint32) {
-		if first < c.g.DataFirst || count == 0 || uint64(first)+uint64(count) > uint64(c.g.VolumeBlocks) {
+		if first < c.g.DataFirst || count == 0 || uint64(first)+uint64(count) > uint64(c.dataEnd()) {
 			c.fail("extent_out_of_range", "inode %d extent %d+%d", ino, first, count)
 			return
 		}
@@ -178,7 +242,7 @@ func (c *checker) extentWalk(ino uint32, rec []byte) (blocks []uint32) {
 			c.fail("extent_overflow", "inode %d chain deeper than %d", ino, MaxExtentBlocks)
 			return
 		}
-		if chain < c.g.DataFirst || chain >= c.g.VolumeBlocks {
+		if chain < c.g.DataFirst || chain >= c.dataEnd() {
 			c.fail("extent_out_of_range", "inode %d extent block %d", ino, chain)
 			return
 		}
@@ -187,7 +251,7 @@ func (c *checker) extentWalk(ino uint32, rec []byte) (blocks []uint32) {
 			return
 		}
 		mark(chain, markChain)
-		blk := c.read(chain)
+		blk := c.plain(chain)
 		if binary.LittleEndian.Uint32(blk[xbMagic:]) != MagicExtent ||
 			binary.LittleEndian.Uint32(blk[xbCksum:]) != fnv1a(blk[:xbCksum]) ||
 			binary.LittleEndian.Uint16(blk[xbResv:]) != 0 {
@@ -219,6 +283,12 @@ type checker struct {
 	inodes     [][]byte
 	ibUsed     []bool
 	out        []finding
+	// Sealed-volume state: dek is nil on v1 and on v2 without a
+	// passphrase; volID feeds the AAD; authBad dedupes bad_block_auth
+	// findings so a repeatedly-read block reports once.
+	dek     *[KeyBytes]byte
+	volID   uint64
+	authBad map[uint32]bool
 }
 
 func (c *checker) fail(code, format string, args ...any) {
@@ -229,12 +299,71 @@ func (c *checker) note(code, format string, args ...any) {
 	c.out = append(c.out, finding{code, fmt.Sprintf(format, args...), true})
 }
 
-// read returns block b as the overlay reports it (as-replayed view).
+// read returns block b's stored bytes as the overlay reports them
+// (as-replayed view). On a sealed volume these are ciphertext for every
+// block in [2, tag_first) and plaintext elsewhere — the overlay's
+// journaled payloads are stored-form too, so the rule is uniform.
 func (c *checker) read(b uint32) []byte {
 	if o, ok := c.overlay[b]; ok {
 		return o
 	}
 	return block(c.img, b)
+}
+
+// plain returns block b's plaintext: the stored bytes on v1, on
+// plaintext regions (superblocks, tag region), and whenever no DEK was
+// unwrapped; otherwise the AEAD-opened contents of the stored sealed
+// block. A failed open is reported once per block (bad_block_auth) and
+// yields zeros — no path serves unauthenticated bytes downstream.
+func (c *checker) plain(b uint32) []byte {
+	stored := c.read(b)
+	if c.dek == nil || b < 2 || b >= c.g.TagFirst {
+		return stored
+	}
+	e := c.tagSlot(b)
+	var nonce [aeadNonceLen]byte
+	var tag [aeadTagLen]byte
+	copy(nonce[:], e[:aeadNonceLen])
+	copy(tag[:], e[aeadNonceLen:])
+	out := make([]byte, BlockLen)
+	if !aeadOpen(out, stored, &tag, blockAAD(c.volID, b), &nonce, c.dek) {
+		if !c.authBad[b] {
+			c.authBad[b] = true
+			c.fail("bad_block_auth", "block %d", b)
+		}
+		return out // zeros
+	}
+	return out
+}
+
+// tagSlot reads the {nonce, tag} slot for sealed block b through the
+// stored-byte view, so a journaled tag-block update in the overlay is
+// seen (ADR 0061: tag blocks ride inside the transaction that carries
+// their payloads).
+func (c *checker) tagSlot(b uint32) []byte {
+	slot := b - 2
+	blk := c.read(c.g.TagFirst + slot/TagEntriesPerBlock)
+	return blk[uint64(slot%TagEntriesPerBlock)*TagEntryBytes:][:TagEntryBytes]
+}
+
+// unwrapDEK derives the KEK from the passphrase and the superblock's KDF
+// fields, then AEAD-opens the wrapped DEK — a wrong passphrase and a
+// corrupt wrap are the same refusal (ADR 0061 D9/D10).
+func unwrapDEK(sb *superblock, pass []byte) (*[KeyBytes]byte, error) {
+	kek, err := pbkdf2Key(pass, sb.kdfSalt[:], sb.kdfIters)
+	if err != nil {
+		return nil, err
+	}
+	var nonce [aeadNonceLen]byte
+	var tag [aeadTagLen]byte
+	copy(nonce[:], sb.wrapNonce[:])
+	copy(tag[:], sb.wrapTag[:])
+	dek := &[KeyBytes]byte{}
+	if !aeadOpen(dek[:], sb.wrappedDEK[:], &tag, blockAAD(sb.volumeID, wrapBlockNum),
+		&nonce, (*[aeadKeyLen]byte)(kek)) {
+		return nil, errCode{"sealed_bad_passphrase", "AEAD unwrap refused"}
+	}
+	return dek, nil
 }
 
 // checkImage is the offline, read-only fsck contract of ADR 0050 D5: it
@@ -244,7 +373,14 @@ func (c *checker) read(b uint32) []byte {
 // held in the overlay: inode checksums and kinds, extent bounds and
 // overlap, bbitmap consistency, and a single-parent directory tree rooted
 // at inode 1 with depth ≤ 8.
-func checkImage(img []byte) []finding {
+//
+// On a v2 (sealed) volume the same rules apply through the AEAD layer of
+// ADR 0061: pass == nil checks the superblock/seal structure only (the
+// ciphertext cannot be read); pass != nil unwraps the DEK — a wrong
+// passphrase is sealed_bad_passphrase — and then every read of a
+// sealed-span block authenticates first, reporting bad_block_auth with
+// the block number.
+func checkImage(img []byte, pass []byte) []finding {
 	if len(img) < 2*BlockLen || len(img)%SectorLen != 0 {
 		return []finding{{"not_vlfs", fmt.Sprintf("image %d bytes", len(img)), false}}
 	}
@@ -264,18 +400,23 @@ func checkImage(img []byte) []finding {
 			sb = cand
 		}
 	}
-	c := &checker{img: img, overlay: map[uint32][]byte{}, referenced: map[uint32]uint32{}}
+	c := &checker{img: img, overlay: map[uint32][]byte{}, referenced: map[uint32]uint32{},
+		authBad: map[uint32]bool{}}
+	done := func() []finding {
+		sort.SliceStable(c.out, func(a, b int) bool { return c.out[a].code < c.out[b].code })
+		return c.out
+	}
 	if sb == nil {
 		if badCopy != nil {
 			c.fail(badCopy.(errCode).code, "%s", badCopy.(errCode).detail)
 		} else {
 			c.fail("not_vlfs", "no VLFS magic in either superblock")
 		}
-		return c.out
+		return done()
 	}
 	if sb.volumeBytes > uint64(len(img)) {
 		c.fail("geometry_mismatch", "volume_bytes %d > image %d", sb.volumeBytes, len(img))
-		return c.out
+		return done()
 	}
 	if badCopy != nil {
 		ec := badCopy.(errCode)
@@ -294,6 +435,27 @@ func checkImage(img []byte) []finding {
 		DataFirst:     sb.dataFirst,
 		DataBlocks:    sb.dataBlocks,
 		InodeCount:    sb.inodeCount,
+		TagFirst:      sb.tagFirst,
+		TagBlocks:     sb.tagBlocks,
+	}
+
+	// Sealed volume: without the passphrase only the plaintext structure
+	// can be verified. With it, unwrap the DEK and the whole check runs
+	// against authenticated plaintext.
+	if sb.version == Version2 {
+		c.volID = sb.volumeID
+		if pass == nil {
+			c.note("sealed", "v2 volume: %d sealed blocks unverified (no passphrase)",
+				sb.tagFirst-2)
+			return done()
+		}
+		dek, err := unwrapDEK(sb, pass)
+		if err != nil {
+			ec := err.(errCode)
+			c.fail(ec.code, "%s", ec.detail)
+			return done()
+		}
+		c.dek = dek
 	}
 
 	// Journal scan (ADR D5): live transactions overlay in memory, so every
@@ -306,7 +468,7 @@ func checkImage(img []byte) []finding {
 	var live int
 scan:
 	for pos < end {
-		desc := c.read(pos)
+		desc := c.plain(pos)
 		if binary.LittleEndian.Uint32(desc[jdMagic:]) != MagicDesc {
 			if !isZero(desc) {
 				c.note("journal_torn", "non-DESC content at journal block %d", pos)
@@ -331,14 +493,14 @@ scan:
 		var txn []byte
 		txn = append(txn, desc[:jdEntries+8*n]...)
 		for i := uint32(0); i < n; i++ {
-			payload := c.read(pos + 1 + i)
+			payload := c.plain(pos + 1 + i)
 			if binary.LittleEndian.Uint32(desc[jdEntries+i*8+4:]) != fnv1a(payload) {
 				c.note("journal_torn", "payload %d checksum at journal block %d", i, pos)
 				break scan
 			}
 			txn = append(txn, payload...)
 		}
-		commit := c.read(pos + 1 + n)
+		commit := c.plain(pos + 1 + n)
 		if binary.LittleEndian.Uint32(commit[jcMagic:]) != MagicCommit ||
 			binary.LittleEndian.Uint64(commit[jcSeq:]) != expected ||
 			binary.LittleEndian.Uint32(commit[jcTxn:]) != fnv1a(txn) ||
@@ -347,7 +509,7 @@ scan:
 			break
 		}
 		for i := uint32(0); i < n; i++ {
-			c.overlay[binary.LittleEndian.Uint32(desc[jdEntries+i*8:])] = c.read(pos + 1 + i)
+			c.overlay[binary.LittleEndian.Uint32(desc[jdEntries+i*8:])] = c.plain(pos + 1 + i)
 		}
 		expected++
 		live++
@@ -357,13 +519,25 @@ scan:
 		c.note("journal_unreplayed", "%d committed transaction(s) pending", live)
 	}
 
+	// On a sealed volume authenticate the whole sealed span against the
+	// as-replayed view: every block's tag is verified, referenced or not
+	// (ADR 0061 — "--check verifies every tag given the passphrase").
+	// Overlaid blocks authenticate their journaled payload against the
+	// journaled tag block; the stale home pair is dead bytes the replay
+	// owns. A failed open reports bad_block_auth by block number.
+	if c.dek != nil {
+		for b := uint32(2); b < c.g.TagFirst; b++ {
+			c.plain(b)
+		}
+	}
+
 	// Inode table: checksums and kind values on every slot, against the
 	// as-replayed inode bitmap.
-	ibitmap := c.read(c.g.IbitmapFirst)
+	ibitmap := c.plain(c.g.IbitmapFirst)
 	c.inodes = make([][]byte, c.g.InodeCount)
 	c.ibUsed = make([]bool, c.g.InodeCount)
 	for i := uint32(0); i < c.g.InodeCount; i++ {
-		blk := c.read(c.g.ItableFirst + i/InodesPerBlock)
+		blk := c.plain(c.g.ItableFirst + i/InodesPerBlock)
 		rec := blk[uint64(i%InodesPerBlock)*InodeBytes:]
 		c.inodes[i] = rec[:InodeBytes]
 		c.ibUsed[i] = bitmapGet(ibitmap, i)
@@ -408,15 +582,18 @@ scan:
 	// scan re-reads it once per bitsPerMapBlock bits, not once per bit.
 	var bbitmap []byte
 	bbIdx := ^uint32(0)
+	dataEnd := c.g.DataFirst + c.g.DataBlocks
 	for b := uint32(0); b < c.g.VolumeBlocks; b++ {
 		if idx := b / bitsPerMapBlock; idx != bbIdx {
 			bbIdx = idx
-			bbitmap = c.read(c.g.BbitmapFirst + idx)
+			bbitmap = c.plain(c.g.BbitmapFirst + idx)
 		}
 		marked := bitmapGet(bbitmap, b%bitsPerMapBlock)
 		owner, used := c.referenced[b]
 		switch {
-		case b < c.g.DataFirst:
+		case b < c.g.DataFirst || b >= dataEnd:
+			// Structural: superblocks/journal/bitmaps/itable, and on v2
+			// the tag region.
 			if !marked {
 				c.fail("bitmap_inconsistent", "structural block %d unmarked", b)
 			}
@@ -442,7 +619,7 @@ scan:
 		size := binary.LittleEndian.Uint32(rec[inSize:])
 		var dirents []byte
 		for _, b := range c.inodeBlocks(rec) {
-			dirents = append(dirents, c.read(b)...)
+			dirents = append(dirents, c.plain(b)...)
 		}
 		slots := int(uint64(size) / DirentBytes)
 		if slots > len(dirents)/DirentBytes {
@@ -502,8 +679,13 @@ scan:
 		}
 	}
 
-	sort.SliceStable(c.out, func(a, b int) bool { return c.out[a].code < c.out[b].code })
-	return c.out
+	return done()
+}
+
+// dataEnd is the first block past the data region: volume_blocks on v1,
+// tag_first on v2 — the bound file extents must stay under.
+func (c *checker) dataEnd() uint32 {
+	return c.g.DataFirst + c.g.DataBlocks
 }
 
 // inodeBlocks collects an inode's file-block sequence without marking or
@@ -512,7 +694,7 @@ scan:
 func (c *checker) inodeBlocks(rec []byte) []uint32 {
 	var out []uint32
 	one := func(first, count uint32) {
-		for b := first; b < first+count && b >= c.g.DataFirst && b < c.g.VolumeBlocks; b++ {
+		for b := first; b < first+count && b >= c.g.DataFirst && b < c.dataEnd(); b++ {
 			out = append(out, b)
 		}
 	}
@@ -523,10 +705,10 @@ func (c *checker) inodeBlocks(rec []byte) []uint32 {
 	}
 	chain := binary.LittleEndian.Uint32(rec[inNextExt:])
 	for depth := 0; chain != 0 && depth < MaxExtentBlocks; depth++ {
-		if chain < c.g.DataFirst || chain >= c.g.VolumeBlocks {
+		if chain < c.g.DataFirst || chain >= c.dataEnd() {
 			break
 		}
-		blk := c.read(chain)
+		blk := c.plain(chain)
 		if binary.LittleEndian.Uint32(blk[xbMagic:]) != MagicExtent ||
 			binary.LittleEndian.Uint32(blk[xbCksum:]) != fnv1a(blk[:xbCksum]) {
 			break
