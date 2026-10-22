@@ -98,3 +98,83 @@ if (run / "d.img").read_bytes() != (run / "d.expected.img").read_bytes():
     sys.exit("d.img differs from its pre-run bytes (probe restore leaked)")
 print("d.img byte-exact after probe")
 PY
+
+# --- M172d (#3037, ADR 0061): the sealed v2 mount -------------------------
+#
+#   03 — a sealed 16 MiB image (mkfs.vlfs --seal): the runner types the
+#     passphrase at the prompt; the volume unseals, mounts, and a write +
+#     readback cross the AEAD block layer. serial-absent 'swordfish' is
+#     the echo-suppression evidence — the passphrase never hits serial.
+#   04 — the same image, five wrong answers: the named wrong-passphrase
+#     lines count down, the fifth locks out, the mount refuses sealed,
+#     and the boot continues share-only (a shell prompt still arrives).
+#   05 — the same image, no input: the 120 s idle budget ends unsealing
+#     with the named no-passphrase line — /disk is not mounted and the
+#     boot continues share-only.
+# What this proves: the prompt's budget/timeout, DEK unwrap, per-block
+# AEAD on the live mount path, and share-only continuation — NOT the
+# crash/canary surface (M172e owns that) or the v1 journal ordering
+# (M100e). Passphrases never appear in any serial output.
+
+vgate_setup_python <<'PY'
+import os, subprocess
+from pathlib import Path
+run = Path(os.environ["RUN_DIR"])
+subprocess.check_call(["go", "-C", "tools/go/vlfs", "build", "-o", str(run / "mkfs.vlfs"), "."])
+(run / "pass.txt").write_text("swordfish\n")
+for i, name in enumerate(("sealed.img", "sealed2.img", "sealed3.img")):
+    subprocess.check_call([str(run / "mkfs.vlfs"), "--seal",
+                           "--passphrase-file", str(run / "pass.txt"),
+                           "-mib", "16", "-kdf-iters", "4000",
+                           "-volume-id", "0x5eed5eed0000030%d" % i, "-time", "1760000000",
+                           str(run / name)])
+    print("built %s (v2 sealed, kdf-iters 4000)" % name)
+(run / "script-pass.txt").write_text("swordfish\n")
+(run / "script-sealed.txt").write_text(
+    "write /disk/SEAL.TXT sealed volume writes through aead\n"
+    "vf cat /disk/SEAL.TXT\n"
+    "vf ls /disk\n"
+    "echo sealed-mount-done\n")
+(run / "script-wrong.txt").write_text(
+    "bad-pass-1\nbad-pass-2\nbad-pass-3\nbad-pass-4\nbad-pass-5\n")
+(run / "script-lockout.txt").write_text("echo sealed-lockout-done\n")
+PY
+
+vgate_run 03 -- --data-disk '$RUN_DIR/sealed.img' \
+    --script '$RUN_DIR/script-pass.txt' --script-after 'vlfs: sealed — passphrase: ' \
+    --script2 '$RUN_DIR/script-sealed.txt' --script2-after 'virelai> ' \
+    --script-expect 'sealed-mount-done' --timeout 120
+
+vgate_assert 03 output-contains 'data-disk: ENABLED'
+vgate_assert 03 serial-contains 'vlfs: sealed — unsealed'
+vgate_assert 03 serial-contains 'vlfs: mounted /disk'
+vgate_assert 03 serial-contains 'write: ok (journaled 33 bytes to disk:SEAL.TXT)'
+vgate_assert 03 serial-contains 'vf: cat ok bytes=33'
+vgate_assert 03 serial-contains 'SEAL.TXT'
+vgate_assert 03 serial-absent 'swordfish'
+vgate_assert 03 serial-absent 'vlfs: mount refused'
+vgate_assert 03 serial-absent '[EXC] parking:'
+
+vgate_run 04 -- --data-disk '$RUN_DIR/sealed2.img' \
+    --script '$RUN_DIR/script-wrong.txt' --script-after 'vlfs: sealed — passphrase: ' \
+    --script2 '$RUN_DIR/script-lockout.txt' --script2-after 'virelai> ' \
+    --script-expect 'sealed-lockout-done' --timeout 120
+
+vgate_assert 04 serial-contains 'vlfs: sealed — wrong passphrase (4 left)'
+vgate_assert 04 serial-contains 'vlfs: sealed — wrong passphrase (3 left)'
+vgate_assert 04 serial-contains 'vlfs: sealed — wrong passphrase (2 left)'
+vgate_assert 04 serial-contains 'vlfs: sealed — wrong passphrase (1 left)'
+vgate_assert 04 serial-contains 'vlfs: sealed — locked out, /disk not mounted'
+vgate_assert 04 serial-contains 'vlfs: mount refused sealed'
+vgate_assert 04 serial-absent 'vlfs: mounted /disk'
+vgate_assert 04 serial-absent 'bad-pass-1'
+vgate_assert 04 serial-absent '[EXC] parking:'
+
+vgate_run 05 -- --data-disk '$RUN_DIR/sealed3.img' --expect 'virelai> ' --timeout 240
+
+vgate_assert 05 serial-contains 'vlfs: sealed — no passphrase, /disk not mounted'
+vgate_assert 05 serial-contains 'vlfs: mount refused sealed'
+vgate_assert 05 serial-contains 'virelai> '
+vgate_assert 05 serial-absent 'vlfs: mounted /disk'
+vgate_assert 05 serial-absent 'vlfs: sealed — unsealed'
+vgate_assert 05 serial-absent '[EXC] parking:'

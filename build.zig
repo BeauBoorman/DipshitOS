@@ -2143,6 +2143,9 @@ pub fn build(b: *std.Build) void {
         "kernel/src/road_pops.zig",
         "kernel/src/scheduler.zig",
         "kernel/src/scrollback.zig",
+        // M172d (issue #3037, ADR 0061): the sealed-v2 mount layer — DEK
+        // unwrap, tag-region AEAD, prompt budget/lockout (class A).
+        "kernel/src/seal.zig",
         "kernel/src/secret.zig",
         "kernel/src/settings.zig",
         "kernel/src/shared_region.zig",

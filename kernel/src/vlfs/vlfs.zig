@@ -42,6 +42,17 @@ pub const magic_desc: u32 = 0x4353444A; // "JDSC"
 pub const magic_commit: u32 = 0x544D434A; // "JCMT"
 pub const magic_extent: u32 = 0x42455856; // "VXEB"
 pub const format_version: u32 = 1;
+/// M172d (#3037, ADR 0061): the sealed-volume format. version 2 + the
+/// "SLFS" mark in the superblock's reserved span means every block in
+/// [2, tag_first) is ChaCha20-Poly1305 ciphertext under the unwrapped DEK.
+pub const format_version_2: u32 = 2;
+pub const magic_seal: u32 = 0x53464C53; // "SLFS"
+pub const kdf_pbkdf2_sha256: u32 = 1;
+/// Tag-region entry: {nonce 12 B, tag 16 B} per sealed block; 146 per tag
+/// block with an 8-byte zero tail (ADR 0061). The entry for sealed block
+/// b (2 ≤ b < tag_first) is slot b-2.
+pub const tag_entry_len: usize = 28;
+pub const tag_entries_per_block: u32 = (block_len - 8) / tag_entry_len; // 146
 
 pub const min_volume_bytes: u64 = 16 << 20;
 pub const max_volume_bytes: u64 = 1 << 30;
@@ -146,6 +157,10 @@ pub const Error = error{
     NameTooLong,
     /// not_empty — a remove target is a directory with live dirents.
     NotEmpty,
+    /// bad_block_auth — a sealed (v2) block's AEAD tag did not verify
+    /// (ADR 0061): a torn or tampered ciphertext refuses by name, never
+    /// serves unauthenticated bytes.
+    BadBlockAuth,
 };
 
 /// The ADR D7 refusal spelling, for logs and gate evidence.
@@ -182,6 +197,7 @@ pub fn refusalName(err: Error) []const u8 {
         error.FileTooLarge => "file_too_large",
         error.NameTooLong => "name_too_long",
         error.NotEmpty => "not_empty",
+        error.BadBlockAuth => "bad_block_auth",
     };
 }
 
@@ -210,6 +226,14 @@ pub const SectorSource = struct {
     /// and a non-empty journal then refuses mount with journal_unreplayed.
     writeFn: ?*const fn (ctx: ?*anyopaque, lba: u64, data: *const [sector_len]u8) bool = null,
     flushFn: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// M172d (#3037, ADR 0061): optional BLOCK-level hooks. The AEAD unit
+    /// on a sealed volume is the 4 KiB block, not the 512 B sector, so a
+    /// sealed source overrides readBlock/writeBlock here instead of
+    /// through the sector loop. `errFn` lets the hook name its last
+    /// failure (bad_block_auth vs io_error) after a false return.
+    readBlockFn: ?*const fn (ctx: ?*anyopaque, blk: u32, out: *[block_len]u8) bool = null,
+    writeBlockFn: ?*const fn (ctx: ?*anyopaque, blk: u32, data: *const [block_len]u8) bool = null,
+    errFn: ?*const fn (ctx: ?*anyopaque) Error = null,
 
     pub fn readSector(self: SectorSource, lba: u64, out: *[sector_len]u8) bool {
         if (self.total_sectors != 0 and lba >= self.total_sectors) return false;
@@ -233,8 +257,18 @@ pub const SectorSource = struct {
         return self.writeFn != null and self.flushFn != null;
     }
 
+    /// The named reason for the last failed block op — `io_error` on a
+    /// source without a richer answer (the unsealed common case).
+    pub fn blockError(self: SectorSource) Error {
+        if (self.errFn) |f| return f(self.ctx);
+        return error.Io;
+    }
+
     /// One 4 KiB VLFS block is 8 sector reads; a sector failure fails it.
+    /// A source with a block-level hook (sealed volumes, ADR 0061)
+    /// dispatches there instead.
     pub fn readBlock(self: SectorSource, blk: u32, out: *[block_len]u8) bool {
+        if (self.readBlockFn) |f| return f(self.ctx, blk, out);
         for (0..sectors_per_block) |i| {
             var sector: [sector_len]u8 = undefined;
             const lba = @as(u64, blk) * sectors_per_block + i;
@@ -245,7 +279,10 @@ pub const SectorSource = struct {
     }
 
     /// One 4 KiB VLFS block is 8 sector writes; a sector failure fails it.
+    /// A source with a block-level hook (sealed volumes, ADR 0061)
+    /// dispatches there instead.
     pub fn writeBlock(self: SectorSource, blk: u32, data: *const [block_len]u8) bool {
+        if (self.writeBlockFn) |f| return f(self.ctx, blk, data);
         for (0..sectors_per_block) |i| {
             const lba = @as(u64, blk) * sectors_per_block + i;
             if (!self.writeSector(lba, @ptrCast(data[i * sector_len ..][0..sector_len]))) return false;
@@ -281,6 +318,33 @@ const sb_next_txn_seq: usize = 92;
 const sb_mkfs_time: usize = 100;
 const sb_cksum: usize = 508;
 
+// v2 seal fields inside the superblock's reserved span (ADR 0061; the v1
+// span is all-zero, so seal_magic is the discriminator).
+pub const sb_seal_magic: usize = 108; // u32 = magic_seal
+pub const sb_kdf_id: usize = 112; // u32 = kdf_pbkdf2_sha256
+pub const sb_kdf_iters: usize = 116; // u32, calibrated ~1 s at seal time
+pub const sb_kdf_salt: usize = 120; // 16 B, random at seal/rewrap
+pub const sb_wrap_nonce: usize = 136; // 12 B, random at seal/rewrap
+pub const sb_wrapped_dek: usize = 148; // 32 B, DEK ciphertext under the KEK
+pub const sb_wrap_tag: usize = 180; // 16 B, AEAD tag of the wrap
+pub const sb_tag_first: usize = 196; // u32, first tag-region block
+pub const sb_tag_blocks: usize = 200; // u32
+pub const sb_seal_zero: usize = 204; // zero through +508 (cksum)
+
+/// The v2 superblock's seal span (+108..+204, ADR 0061): the passphrase
+/// wrap material plus the tag-region geometry. Present only when
+/// version == format_version_2; `seal.zig` consumes it to unwrap the DEK
+/// and bound the sealed span [2, tag_first).
+pub const SealInfo = struct {
+    kdf_iters: u32,
+    salt: [16]u8,
+    wrap_nonce: [12]u8,
+    wrapped_dek: [32]u8,
+    wrap_tag: [16]u8,
+    tag_first: u32,
+    tag_blocks: u32,
+};
+
 /// The chosen superblock: geometry plus the journal cursor state.
 pub const Superblock = struct {
     seq: u64,
@@ -303,6 +367,8 @@ pub const Superblock = struct {
     /// Which physical slot (0 or 1) this copy was read from — the ping-pong
     /// update lands on the other one.
     slot: u8,
+    /// The v2 seal span (ADR 0061); null on a v1 superblock.
+    seal: ?SealInfo,
 };
 
 pub fn rd16(b: []const u8, off: usize) u16 {
@@ -329,9 +395,11 @@ const SbResult = union(enum) {
 /// rather than trusted.
 fn parseSuperblock(sector: *const [sector_len]u8, slot: u8) SbResult {
     if (rd32(sector, sb_magic) != magic_super) return .empty;
-    if (rd32(sector, sb_version) != format_version) return .{ .bad = error.UnsupportedVersion };
+    const version = rd32(sector, sb_version);
+    if (version != format_version and version != format_version_2)
+        return .{ .bad = error.UnsupportedVersion };
     if (rd32(sector, sb_cksum) != fnv32(sector[0..sb_cksum])) return .{ .bad = error.BadSuperblock };
-    const s = Superblock{
+    var s = Superblock{
         .seq = rd64(sector, sb_seq),
         .volume_id = rd64(sector, sb_volume_id),
         .volume_bytes = rd64(sector, sb_volume_bytes),
@@ -350,9 +418,43 @@ fn parseSuperblock(sector: *const [sector_len]u8, slot: u8) SbResult {
         .journal_applied = rd64(sector, sb_journal_applied),
         .next_txn_seq = rd64(sector, sb_next_txn_seq),
         .slot = slot,
+        .seal = null,
     };
+    if (version == format_version_2) {
+        s.seal = parseSealFields(sector) catch |err| return .{ .bad = err };
+    }
     if (geometryError(s, sector)) |err| return .{ .bad = err };
     return .{ .ok = s };
+}
+
+/// Parse and validate the v2 seal span (ADR 0061). A version-2 superblock
+/// without the SLFS mark is malformed by definition; a KDF other than
+/// PBKDF2-HMAC-SHA256 or a zero iteration count is equally malformed.
+fn parseSealFields(sector: *const [sector_len]u8) Error!SealInfo {
+    if (rd32(sector, sb_seal_magic) != magic_seal) return error.BadSuperblock;
+    if (rd32(sector, sb_kdf_id) != kdf_pbkdf2_sha256) return error.BadSuperblock;
+    const info = SealInfo{
+        .kdf_iters = rd32(sector, sb_kdf_iters),
+        .salt = sector[sb_kdf_salt..][0..16].*,
+        .wrap_nonce = sector[sb_wrap_nonce..][0..12].*,
+        .wrapped_dek = sector[sb_wrapped_dek..][0..32].*,
+        .wrap_tag = sector[sb_wrap_tag..][0..16].*,
+        .tag_first = rd32(sector, sb_tag_first),
+        .tag_blocks = rd32(sector, sb_tag_blocks),
+    };
+    if (info.kdf_iters == 0) return error.BadSuperblock;
+    // The reserved tail of the seal span is zero by format.
+    for (sector[sb_seal_zero..sb_cksum]) |c| {
+        if (c != 0) return error.BadSuperblock;
+    }
+    return info;
+}
+
+/// The ADR 0061 fixpoint the tag region satisfies: one 28-byte entry per
+/// sealed block in [2, tag_first) where tag_first = volume_blocks −
+/// tag_blocks, so tag_blocks = ⌈(volume_blocks − 2)/147⌉.
+pub fn tagBlocksFor(volume_blocks: u32) u32 {
+    return (volume_blocks - 2 + tag_entries_per_block) / (tag_entries_per_block + 1);
 }
 
 fn clamp(v: u64, lo: u64, hi: u64) u64 {
@@ -377,9 +479,19 @@ fn geometryError(s: Superblock, sector: *const [sector_len]u8) ?Error {
     if (s.itable_first != s.bbitmap_first + s.bbitmap_blocks or
         s.itable_blocks != (s.inode_count + inodes_per_block - 1) / inodes_per_block)
         return error.GeometryMismatch;
-    if (s.data_first != s.itable_first + s.itable_blocks or
-        @as(u64, s.data_first) + s.data_blocks != s.volume_blocks)
+    if (s.data_first != s.itable_first + s.itable_blocks) return error.GeometryMismatch;
+    if (s.seal) |seal_| {
+        // v2 (ADR 0061): the data region ends at tag_first and the tag
+        // region carries it out to volume_blocks — the fixpoint
+        // 146·tag_blocks ≥ volume_blocks − 2 − tag_blocks is part of the
+        // layout, not a hint.
+        if (@as(u64, s.data_first) + s.data_blocks != seal_.tag_first or
+            @as(u64, seal_.tag_first) + seal_.tag_blocks != s.volume_blocks or
+            seal_.tag_blocks != tagBlocksFor(s.volume_blocks))
+            return error.GeometryMismatch;
+    } else if (@as(u64, s.data_first) + s.data_blocks != s.volume_blocks) {
         return error.GeometryMismatch;
+    }
     if (s.next_txn_seq == 0) return error.GeometryMismatch;
     return null;
 }
@@ -419,6 +531,10 @@ pub const Volume = struct {
     next_txn_seq: u64,
     /// The physical superblock slot the volume was read from (0/1).
     sb_slot: u8,
+    /// The v2 seal span when mounted through a sealed source (ADR 0061);
+    /// carried so the ping-pong update re-stamps version 2 and the wrap
+    /// fields instead of reverting to a v1 superblock.
+    seal: ?SealInfo,
     /// M100d: the write path's forward-only bbitmap scan cursor (in-memory
     /// only, never on disk) — the next data block to probe for a free bit.
     alloc_hint: u32,
@@ -450,6 +566,7 @@ pub fn volumeSuperblock(vol: Volume, slot: u8) Superblock {
         .journal_applied = vol.journal_applied,
         .next_txn_seq = vol.next_txn_seq,
         .slot = slot,
+        .seal = vol.seal,
     };
 }
 
@@ -461,9 +578,18 @@ const JournalStep = union(enum) {
     torn,
 };
 
+/// A failed block read inside a journal scan is torn — not an I/O error —
+/// when the source names it bad_block_auth: per ADR 0061 a record whose
+/// AEAD open fails truncates the journal exactly like a checksum failure.
+fn journalRead(src: SectorSource, blk: u32, scratch: *[block_len]u8) Error!bool {
+    if (src.readBlock(blk, scratch)) return true;
+    if (src.blockError() == error.BadBlockAuth) return false;
+    return error.Io;
+}
+
 fn checkJournalRecord(src: SectorSource, sb: Superblock, pos: u32, scratch: *[block_len]u8) Error!JournalStep {
     const end = sb.journal_first + sb.journal_blocks;
-    if (!src.readBlock(pos, scratch)) return error.Io;
+    if (!try journalRead(src, pos, scratch)) return .torn;
     if (rd32(scratch, jd_magic) != magic_desc) {
         // An all-zero block is the clean end of an empty region.
         for (scratch) |c| {
@@ -483,11 +609,11 @@ fn checkJournalRecord(src: SectorSource, sb: Superblock, pos: u32, scratch: *[bl
     for (0..n) |i| {
         const dest = rd32(&desc, jd_entries + 8 * @as(usize, @intCast(i)));
         if (dest < sb.journal_first + sb.journal_blocks or dest >= sb.volume_blocks) return .torn;
-        if (!src.readBlock(pos + 1 + @as(u32, @intCast(i)), scratch)) return error.Io;
+        if (!try journalRead(src, pos + 1 + @as(u32, @intCast(i)), scratch)) return .torn;
         if (rd32(&desc, jd_entries + 8 * @as(usize, @intCast(i)) + 4) != fnv32(scratch)) return .torn;
         txn_hash = fnv32Continue(txn_hash, scratch);
     }
-    if (!src.readBlock(pos + 1 + n, scratch)) return error.Io;
+    if (!try journalRead(src, pos + 1 + n, scratch)) return .torn;
     if (rd32(scratch, jc_magic) != magic_commit) return .torn;
     if (rd64(scratch, jc_seq) != sb.journal_applied + 1) return .torn;
     if (rd32(scratch, jc_txn) != txn_hash) return .torn;
@@ -554,7 +680,7 @@ fn journalWalk(src: SectorSource, sb: Superblock, scratch: *[block_len]u8, st: ?
         };
         if (st) |s| {
             // Re-read DESC for the dest table (scratch holds COMMIT).
-            if (!src.readBlock(pos, scratch)) return error.Io;
+            if (!try journalRead(src, pos, scratch)) break;
             for (0..n) |i| {
                 if (s.dest_count >= max_journal_blocks) return error.BadJournal;
                 s.dests[s.dest_count] = .{
@@ -595,11 +721,11 @@ fn replayJournal(src: SectorSource, sb: *Superblock, count: u32, scratch: *[bloc
             .torn => break,
         };
         // Re-read DESC (scratch currently holds COMMIT).
-        if (!src.readBlock(pos, scratch)) return error.Io;
+        if (!try journalRead(src, pos, scratch)) break;
         const desc = scratch.*;
         for (0..n) |i| {
             const dest = rd32(&desc, jd_entries + 8 * @as(usize, @intCast(i)));
-            if (!src.readBlock(pos + 1 + @as(u32, @intCast(i)), scratch)) return error.Io;
+            if (!try journalRead(src, pos + 1 + @as(u32, @intCast(i)), scratch)) break;
             const payload = scratch.*;
             if (!src.writeBlock(dest, &payload)) return error.Io;
         }
@@ -625,7 +751,7 @@ fn replayJournal(src: SectorSource, sb: *Superblock, count: u32, scratch: *[bloc
 pub fn writeSuperblockSector(sector: *[sector_len]u8, s: Superblock) void {
     @memset(sector, 0);
     std.mem.writeInt(u32, sector[sb_magic..][0..4], magic_super, .little);
-    std.mem.writeInt(u32, sector[sb_version..][0..4], format_version, .little);
+    std.mem.writeInt(u32, sector[sb_version..][0..4], if (s.seal != null) format_version_2 else format_version, .little);
     std.mem.writeInt(u64, sector[sb_seq..][0..8], s.seq, .little);
     std.mem.writeInt(u64, sector[sb_volume_id..][0..8], s.volume_id, .little);
     std.mem.writeInt(u64, sector[sb_volume_bytes..][0..8], s.volume_bytes, .little);
@@ -645,12 +771,26 @@ pub fn writeSuperblockSector(sector: *[sector_len]u8, s: Superblock) void {
     std.mem.writeInt(u64, sector[sb_journal_applied..][0..8], s.journal_applied, .little);
     std.mem.writeInt(u64, sector[sb_next_txn_seq..][0..8], s.next_txn_seq, .little);
     std.mem.writeInt(u64, sector[sb_mkfs_time..][0..8], 0, .little);
+    // ADR 0061: a sealed volume's ping-pong update re-stamps the seal span —
+    // reverting to v1 here would wedge the next mount (geometry mismatch).
+    if (s.seal) |seal_| {
+        std.mem.writeInt(u32, sector[sb_seal_magic..][0..4], magic_seal, .little);
+        std.mem.writeInt(u32, sector[sb_kdf_id..][0..4], kdf_pbkdf2_sha256, .little);
+        std.mem.writeInt(u32, sector[sb_kdf_iters..][0..4], seal_.kdf_iters, .little);
+        @memcpy(sector[sb_kdf_salt..][0..16], &seal_.salt);
+        @memcpy(sector[sb_wrap_nonce..][0..12], &seal_.wrap_nonce);
+        @memcpy(sector[sb_wrapped_dek..][0..32], &seal_.wrapped_dek);
+        @memcpy(sector[sb_wrap_tag..][0..16], &seal_.wrap_tag);
+        std.mem.writeInt(u32, sector[sb_tag_first..][0..4], seal_.tag_first, .little);
+        std.mem.writeInt(u32, sector[sb_tag_blocks..][0..4], seal_.tag_blocks, .little);
+    }
     std.mem.writeInt(u32, sector[sb_cksum..][0..4], fnv32(sector[0..sb_cksum]), .little);
 }
 
 /// Validate both superblocks and keep the highest-seq valid copy — the
-/// shared head of mount()/mountChecked().
-fn selectSuperblock(src: SectorSource) Error!Superblock {
+/// shared head of mount()/mountChecked(). Pub for the M172d probe: the
+/// sealed-mount path reads the chosen copy's seal span before the prompt.
+pub fn selectSuperblock(src: SectorSource) Error!Superblock {
     var best: ?Superblock = null;
     var first_bad: ?Error = null;
     var saw_magic = false;
@@ -723,6 +863,7 @@ pub fn mountChecked(src: SectorSource, scratch: *[block_len]u8, st: ?*CheckState
         .journal_applied = sb.journal_applied,
         .next_txn_seq = sb.next_txn_seq,
         .sb_slot = sb.slot,
+        .seal = sb.seal,
         .alloc_hint = sb.data_first,
         .replayed = live,
     };
@@ -764,7 +905,10 @@ fn refMark(st: *CheckState, b: u32) Error!void {
 /// extent_out_of_range, an already-claimed block is extent_overlap.
 /// Returns the extent's block count.
 fn markExtent(st: *CheckState, sb: Superblock, first: u32, count: u32) Error!u64 {
-    if (first < sb.data_first or count == 0 or @as(u64, first) + count > sb.volume_blocks)
+    // The data region ends at data_first+data_blocks — on v2 that is
+    // tag_first, keeping extents out of the plaintext tag region (on v1
+    // it is volume_blocks, so the bound is unchanged).
+    if (first < sb.data_first or count == 0 or @as(u64, first) + count > @as(u64, sb.data_first) + sb.data_blocks)
         return error.ExtentOutOfRange;
     var b = first;
     while (b < first + count) : (b += 1) try refMark(st, b);
@@ -786,9 +930,9 @@ fn checkExtents(src: SectorSource, sb: Superblock, st: *CheckState, rec: *const 
     while (chain != 0) {
         if (depth >= max_extent_blocks) return error.ExtentOverflow;
         depth += 1;
-        if (chain < sb.data_first or chain >= sb.volume_blocks) return error.ExtentOutOfRange;
+        if (chain < sb.data_first or chain >= sb.data_first + sb.data_blocks) return error.ExtentOutOfRange;
         try refMark(st, chain);
-        if (!checkRead(st, src, chain, &st.chain)) return error.Io;
+        if (!checkRead(st, src, chain, &st.chain)) return src.blockError();
         if (rd32(&st.chain, xb_magic) != magic_extent or
             rd32(&st.chain, xb_cksum) != fnv32(st.chain[0..xb_cksum]) or
             rd16(&st.chain, xb_resv) != 0) return error.ExtentChainCorrupt;
@@ -810,7 +954,7 @@ fn checkExtents(src: SectorSource, sb: Superblock, st: *CheckState, rec: *const 
 fn checkVolume(src: SectorSource, sb: Superblock, st: *CheckState, scratch: *[block_len]u8) Error!void {
     // The ibitmap copies out once — the inode passes consult it by bit.
     const ib_bytes: usize = (sb.inode_count + 7) / 8;
-    if (!checkRead(st, src, sb.ibitmap_first, scratch)) return error.Io;
+    if (!checkRead(st, src, sb.ibitmap_first, scratch)) return src.blockError();
     @memcpy(st.ib_used[0..ib_bytes], scratch[0..ib_bytes]);
 
     // Inode table: checksum and kind on every slot, then the ibitmap
@@ -820,7 +964,7 @@ fn checkVolume(src: SectorSource, sb: Superblock, st: *CheckState, scratch: *[bl
     var i: u32 = 0;
     while (i < sb.inode_count) : (i += 1) {
         if (i % inodes_per_block == 0) {
-            if (!checkRead(st, src, sb.itable_first + i / inodes_per_block, scratch)) return error.Io;
+            if (!checkRead(st, src, sb.itable_first + i / inodes_per_block, scratch)) return src.blockError();
         }
         const rec = scratch[(i % inodes_per_block) * inode_len ..][0..inode_len];
         if (rd32(rec, in_cksum) != fnv32(rec[0..in_cksum])) return error.InodeChecksum;
@@ -841,7 +985,7 @@ fn checkVolume(src: SectorSource, sb: Superblock, st: *CheckState, scratch: *[bl
     i = 0;
     while (i < sb.inode_count) : (i += 1) {
         if (i % inodes_per_block == 0) {
-            if (!checkRead(st, src, sb.itable_first + i / inodes_per_block, scratch)) return error.Io;
+            if (!checkRead(st, src, sb.itable_first + i / inodes_per_block, scratch)) return src.blockError();
         }
         const raw = scratch[(i % inodes_per_block) * inode_len ..][0..inode_len];
         if (!bitmapBit(&st.ib_used, i) or raw[in_kind] == kind_free) continue;
@@ -859,15 +1003,19 @@ fn checkVolume(src: SectorSource, sb: Superblock, st: *CheckState, scratch: *[bl
     // crosses bits_per_map_block.
     var bb_idx: u32 = std.math.maxInt(u32);
     var b: u32 = 0;
+    // Structural blocks below data_first must be marked; on v2 the
+    // plaintext tag region [tag_first, volume_blocks) is structural too —
+    // mkfs allocates it and no extent may claim it (ADR 0061).
+    const structural_hi = if (sb.seal) |seal_| seal_.tag_first else sb.volume_blocks;
     while (b < sb.volume_blocks) : (b += 1) {
         const idx = b / bits_per_map_block;
         if (idx != bb_idx) {
             bb_idx = idx;
-            if (!checkRead(st, src, sb.bbitmap_first + idx, scratch)) return error.Io;
+            if (!checkRead(st, src, sb.bbitmap_first + idx, scratch)) return src.blockError();
         }
         const marked = bitmapBit(scratch, b % bits_per_map_block);
         const referenced = bitmapBit(&st.refs, b);
-        if (b < sb.data_first) {
+        if (b < sb.data_first or b >= structural_hi) {
             if (!marked) return error.BitmapInconsistent;
         } else if (marked != referenced) {
             return error.BitmapInconsistent;
@@ -923,7 +1071,7 @@ pub fn readInode(src: SectorSource, vol: Volume, ino: u32, scratch: *[block_len]
     // overruns itable_blocks must not read inode records out of the data
     // region (geometryError now requires the ceil count).
     if (blk >= vol.itable_first + vol.itable_blocks) return error.BadInode;
-    if (!src.readBlock(blk, scratch)) return error.Io;
+    if (!src.readBlock(blk, scratch)) return src.blockError();
     const rec = scratch[(ino % inodes_per_block) * inode_len ..][0..inode_len];
     return parseInode(rec);
 }
@@ -955,18 +1103,19 @@ fn parseInode(rec: *const [inode_len]u8) Error!Inode {
 /// `null` means the file's extent list does not cover the offset — the
 /// caller turns that into bad_extent.
 pub fn fileBlock(src: SectorSource, vol: Volume, ino: Inode, fblock: u32, scratch: *[block_len]u8) Error!?u32 {
+    const data_end = @as(u64, vol.data_first) + vol.data_blocks;
     var base: u64 = 0;
     for (ino.extents[0..ino.nextents]) |e| {
         if (e.first < vol.data_first or e.count == 0 or
-            @as(u64, e.first) + e.count > vol.volume_blocks) return error.BadExtent;
+            @as(u64, e.first) + e.count > data_end) return error.BadExtent;
         if (fblock >= base and fblock < base + e.count) return e.first + @as(u32, @intCast(fblock - base));
         base += e.count;
     }
     var chain = ino.next_extent_block;
     for (0..max_extent_blocks) |_| {
         if (chain == 0) break;
-        if (chain < vol.data_first or chain >= vol.volume_blocks) return error.ExtentChainCorrupt;
-        if (!src.readBlock(chain, scratch)) return error.Io;
+        if (chain < vol.data_first or @as(u64, chain) >= data_end) return error.ExtentChainCorrupt;
+        if (!src.readBlock(chain, scratch)) return src.blockError();
         const blk = scratch.*;
         if (rd32(&blk, xb_magic) != magic_extent or rd16(&blk, xb_count) > extents_per_block or
             rd32(&blk, xb_cksum) != fnv32(blk[0..xb_cksum])) return error.ExtentChainCorrupt;
@@ -975,7 +1124,7 @@ pub fn fileBlock(src: SectorSource, vol: Volume, ino: Inode, fblock: u32, scratc
             const first = rd32(&blk, xb_extents + e * 8);
             const n = rd32(&blk, xb_extents + e * 8 + 4);
             if (first < vol.data_first or n == 0 or
-                @as(u64, first) + n > vol.volume_blocks) return error.BadExtent;
+                @as(u64, first) + n > data_end) return error.BadExtent;
             if (fblock >= base and fblock < base + n) return first + @as(u32, @intCast(fblock - base));
             base += n;
         }
@@ -1002,7 +1151,7 @@ fn readExtentBytes(src: SectorSource, vol: Volume, rec: Inode, offset: u64, out:
         const fblock: u32 = @intCast(pos / block_len);
         const blk = (try fileBlock(src, vol, rec, fblock, scratch)) orelse return error.BadExtent;
         if (!src.readBlock(blk, scratch)) {
-            return if (done == 0) error.Io else done;
+            return if (done == 0) src.blockError() else done;
         }
         const data = scratch.*;
         const boff: usize = @intCast(pos % block_len);
@@ -1078,7 +1227,7 @@ pub const DirIter = struct {
             self.abs_slot += 1;
             const disk = (try fileBlock(self.src, self.vol, self.dir, fblock, self.scratch)) orelse
                 return error.BadExtent;
-            if (!self.src.readBlock(disk, self.scratch)) return error.Io;
+            if (!self.src.readBlock(disk, self.scratch)) return self.src.blockError();
             const blk = self.scratch.*;
             const row = blk[slot * dirent_len ..][0..dirent_len];
             const e = try parseDirent(row);
@@ -1202,10 +1351,11 @@ pub fn stat(src: SectorSource, vol: Volume, ino: u32, scratch: *[block_len]u8) E
 /// invariants enforced on the way: an out-of-range extent or a corrupt
 /// chain block refuses rather than mis-counts.
 fn extentCoverage(src: SectorSource, vol: Volume, rec: Inode, scratch: *[block_len]u8) Error!u64 {
+    const data_end = @as(u64, vol.data_first) + vol.data_blocks;
     var total: u64 = 0;
     for (rec.extents[0..rec.nextents]) |e| {
         if (e.first < vol.data_first or e.count == 0 or
-            @as(u64, e.first) + e.count > vol.volume_blocks) return error.BadExtent;
+            @as(u64, e.first) + e.count > data_end) return error.BadExtent;
         total += e.count;
     }
     var chain = rec.next_extent_block;
@@ -1213,9 +1363,9 @@ fn extentCoverage(src: SectorSource, vol: Volume, rec: Inode, scratch: *[block_l
     while (chain != 0) {
         if (depth >= max_extent_blocks) return error.ExtentChainCorrupt;
         depth += 1;
-        if (chain < vol.data_first or chain >= vol.volume_blocks) return error.ExtentChainCorrupt;
+        if (chain < vol.data_first or @as(u64, chain) >= data_end) return error.ExtentChainCorrupt;
         total += 1; // the chain block itself is claimed by the file
-        if (!src.readBlock(chain, scratch)) return error.Io;
+        if (!src.readBlock(chain, scratch)) return src.blockError();
         if (rd32(scratch, xb_magic) != magic_extent or
             rd16(scratch, xb_resv) != 0 or
             rd32(scratch, xb_cksum) != fnv32(scratch[0..xb_cksum])) return error.ExtentChainCorrupt;
@@ -1254,14 +1404,17 @@ pub fn countFreeBits(map: []const u8, first_bit: u32, bits: u32) u64 {
 /// committed truth.
 pub fn freeDataBlocks(src: SectorSource, scratch: *[block_len]u8) Error!u64 {
     const sb = try selectSuperblock(src);
+    // The free-block count covers the data region only — on v2 the tag
+    // region's (allocated) bits are structural, never free space.
+    const data_end = sb.data_first + sb.data_blocks;
     var free: u64 = 0;
     var b = sb.data_first;
-    while (b < sb.volume_blocks) {
+    while (b < data_end) {
         const idx = b / bits_per_map_block;
         if (idx >= sb.bbitmap_blocks) return error.GeometryMismatch;
-        if (!src.readBlock(sb.bbitmap_first + idx, scratch)) return error.Io;
+        if (!src.readBlock(sb.bbitmap_first + idx, scratch)) return src.blockError();
         const in_map = b % bits_per_map_block;
-        const run = @min(sb.volume_blocks - b, bits_per_map_block - in_map);
+        const run = @min(data_end - b, bits_per_map_block - in_map);
         free += countFreeBits(scratch, in_map, run);
         b += run;
     }
@@ -1605,6 +1758,7 @@ test "vlfs: mount replays a committed transaction; read-only refuses" {
         .journal_applied = vol2.journal_applied,
         .next_txn_seq = vol2.next_txn_seq,
         .slot = vol2.sb_slot,
+        .seal = null,
     }, &test_scratch));
 }
 
@@ -1756,6 +1910,7 @@ test "vlfs: truncated itable_blocks geometry refuses mount; readInode bounds the
         .journal_applied = 0,
         .next_txn_seq = 1,
         .slot = 0,
+        .seal = null,
     };
     var blk: [block_len]u8 = @splat(0);
     writeSuperblockSector(blk[0..sector_len], prefix);

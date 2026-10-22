@@ -1,8 +1,8 @@
 vlfs-regions 1
-# corrupt: version 2 superblocks, checksums resealed
+# corrupt: version 3 superblocks, checksums resealed
 # expect: unsupported_version
 bytes 16777216
-0 564c465302
+0 564c465303
 8 02
 16 ed5eed5eed5eed5e
 27 01
@@ -21,8 +21,8 @@ bytes 16777216
 81 01
 92 01
 101 78e768
-508 d8356e4b
-4096 564c465302
+508 f11b5be6
+4096 564c465303
 4104 01
 4112 ed5eed5eed5eed5e
 4123 01
@@ -41,7 +41,7 @@ bytes 16777216
 4177 01
 4188 01
 4197 78e768
-4604 cfaea73a
+4604 4642337c
 2105344 03
 2109440 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1f
 2113660 751550dd02

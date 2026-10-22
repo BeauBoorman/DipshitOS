@@ -48,6 +48,7 @@ const virtio_net = @import("virtio_net.zig");
 const virtio_blk = @import("virtio_blk.zig");
 const vlfs = @import("vlfs/vlfs.zig"); // issue #2381: the boot probe reads the superblock's journal geometry
 const vlfs_disk = @import("vlfs/disk.zig"); // M100d (#2309): mount the data disk
+const seal = @import("seal.zig"); // M172d (#3037): sealed-v2 mount prompt + AEAD layer
 // Milestone six card G1 (claim 6053): virtio-gpu transport + framebuffer
 // (the runner's VZVirtioGraphicsDeviceConfiguration under `--display` /
 // `--screenshot`) — the graphics keystone. Pre-exit discovery, post-MMU
@@ -949,8 +950,20 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
             // M100d (issue #2309, ADR 0050 D1/D6): mount the data disk at
             // /disk. A refusal is named on the serial line and the boot
             // continues share-only — the mount is an enhancement, never a
-            // requirement.
-            if (vlfs_disk.attachBlk()) {
+            // requirement. M172d (#3037, ADR 0061): a sealed v2 volume
+            // prompts for its passphrase on the console first — the
+            // prompt's reads are echo-suppressed and the passphrase buffer
+            // is zeroed (seal.zig owns the budget/timeout policy).
+            const seal_ops = seal.PromptOps{
+                .writeFn = sealPromptWrite,
+                .readByteFn = sealPromptRead,
+                .armedFn = sealPromptArmed,
+                .nowFn = sealPromptNow,
+                .hz = timer.freq,
+                .nonceFn = sealPromptNonce,
+                .rngReadyFn = sealPromptReady,
+            };
+            if (vlfs_disk.attachBlk(&seal_ops)) {
                 uart_puts("vlfs: mounted /disk\n");
                 // M100e (#2310): D5 replay evidence — a killed boot left
                 // committed transactions in the journal and mount landed
@@ -1569,6 +1582,34 @@ fn uart_putc(byte: u8) void {
 /// waited out itself), read it back and verify, then restore the original
 /// contents + FLUSH so the probe leaves the image untouched. The serial
 /// line records every step's named refusal instead of hiding it.
+// M172d (#3037, ADR 0061): the console/entropy/clock surface for the
+// sealed-volume unseal prompt. Input comes from the virtio console RX
+// queue — the same polled byte path the shell uses — and is never echoed.
+fn sealPromptWrite(_: ?*anyopaque, bytes: []const u8) void {
+    uart_puts(bytes);
+}
+
+fn sealPromptRead(_: ?*anyopaque) ?u8 {
+    if (console_kind != .virtio) return null;
+    return virtio_console.virtio_read_byte();
+}
+
+fn sealPromptArmed(_: ?*anyopaque) bool {
+    return console_kind == .virtio and virtio_console.rx_armed();
+}
+
+fn sealPromptNow(_: ?*anyopaque) u64 {
+    return timer.cntpct();
+}
+
+fn sealPromptNonce(_: ?*anyopaque, out: *[12]u8) void {
+    csprng.random_bytes(out);
+}
+
+fn sealPromptReady(_: ?*anyopaque) bool {
+    return csprng.seeded();
+}
+
 fn blk_boot_probe(capacity: u64) void {
     if (capacity == 0) {
         uart_puts("vlfs-probe: refused no_capacity\n");
@@ -1646,7 +1687,8 @@ fn blk_probe_lba(capacity: u64) u64 {
         const valid = blk: {
             virtio_blk.read_sector(slot * @as(u64, vlfs.sectors_per_block), &sector) catch break :blk false;
             if (vlfs.rd32(&sector, sb_magic) != vlfs.magic_super) break :blk false;
-            if (vlfs.rd32(&sector, sb_version) != vlfs.format_version) break :blk false;
+            const v = vlfs.rd32(&sector, sb_version);
+            if (v != vlfs.format_version and v != vlfs.format_version_2) break :blk false;
             if (vlfs.rd32(&sector, sb_cksum) != vlfs.fnv32(sector[0..sb_cksum])) break :blk false;
             break :blk true;
         };

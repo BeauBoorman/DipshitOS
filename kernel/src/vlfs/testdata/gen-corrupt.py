@@ -164,9 +164,9 @@ def cases(empty, populated):
 
     img = bytearray(empty)
     for slot in (0, BLK):
-        struct.pack_into("<I", img, slot + SB_VERSION, 2)
+        struct.pack_into("<I", img, slot + SB_VERSION, 3)
         seal_sb(img, slot // BLK)
-    add("corrupt-unsupported-version.regions", "version 2 superblocks, checksums resealed",
+    add("corrupt-unsupported-version.regions", "version 3 superblocks, checksums resealed",
         "unsupported_version", img)
 
     img = bytearray(empty)

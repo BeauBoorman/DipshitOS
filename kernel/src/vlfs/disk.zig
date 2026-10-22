@@ -27,6 +27,7 @@ const vlfs_write = @import("write.zig");
 const metadata = @import("../fs_metadata.zig");
 const virtio_blk = @import("../virtio_blk.zig");
 const timer = @import("../timer.zig");
+const seal = @import("../seal.zig");
 
 const Mount = struct {
     src: vlfs.SectorSource,
@@ -104,6 +105,7 @@ pub fn attach(src: vlfs.SectorSource) bool {
 /// Drop the mount (tests; a device detach in a later milestone).
 pub fn detach() void {
     active = null;
+    seal_ctx.wipe();
     for (&contained_files) |*f| f.* = .{};
     last_replayed = 0;
 }
@@ -284,14 +286,40 @@ pub fn blkSource() ?vlfs.SectorSource {
     };
 }
 
+/// The one live seal context (M172d, ADR 0061) — armed by the boot
+/// prompt's unwrap, wiped on detach and on a failed sealed mount. The
+/// DEK lives in kernel RAM only for the life of the mount.
+var seal_ctx: seal.Seal = undefined;
+
 /// Boot-path mount: attach the data disk the runner attached with
 /// `--data-disk`. A refusal latches `last_refusal`; no device → `no_disk`.
-pub fn attachBlk() bool {
-    const src = blkSource() orelse {
+/// A v2 superblock with the SLFS mark routes through the unseal prompt
+/// first (ADR 0061): the console reads the passphrase echo-free under a
+/// five-attempt budget and a 120 s idle timeout, and lockout or timeout
+/// refuses the mount — the boot continues share-only either way.
+pub fn attachBlk(ops: *const seal.PromptOps) bool {
+    const raw = blkSource() orelse {
         last_refusal = "no_disk";
         return false;
     };
-    return attach(src);
+    const sb = vlfs.selectSuperblock(raw) catch |err| {
+        last_refusal = vlfs.refusalName(err);
+        return false;
+    };
+    if (sb.seal) |info| {
+        switch (seal.unseal(&seal_ctx, raw, sb, info, ops)) {
+            .unsealed => {
+                if (attach(seal.source(&seal_ctx))) return true;
+                seal_ctx.wipe();
+                return false;
+            },
+            else => {
+                last_refusal = "sealed";
+                return false;
+            },
+        }
+    }
+    return attach(raw);
 }
 
 // --- fs_metadata slot-79 backend (ADR D6: real ContainedOps) ---------------
