@@ -78,4 +78,61 @@ public enum DataDisk {
         }
         return Prepared(url: url, sectors: createBytes / 512, created: true)
     }
+
+    public enum AttachError: Error, Equatable {
+        /// `diskutil image attach` exited nonzero — stderr carried.
+        case attachFailed(String)
+        /// Attach exited 0 but no `/dev/diskN` node was in its output.
+        case noDeviceNode(String)
+    }
+
+    /// Issue #3112: attach `url` as a kernel block device
+    /// (`/dev/diskN`) via `diskutil image attach --noMount`, returning
+    /// the device node. Guest I/O then flows through the kernel's
+    /// disk-image driver — synchronous and FIFO — rather than VZ's
+    /// asynchronous image pipeline, so a request the guest completed is
+    /// in the image file (or its page cache) before the power drops,
+    /// and a VZDiskBlockDeviceStorageDeviceAttachment exposes a real
+    /// flush barrier to the guest.
+    public static func attachBlockDevice(url: URL) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        p.arguments = ["image", "attach", "--noMount", url.path]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        try p.run()
+        p.waitUntilExit()
+        let stdout = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        guard p.terminationStatus == 0 else {
+            let e = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            throw AttachError.attachFailed(e.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        guard let dev = stdout.split(separator: "\n").map(String.init)
+                .first(where: { $0.hasPrefix("/dev/disk") }) else {
+            throw AttachError.noDeviceNode(stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return dev
+    }
+
+    /// "/dev/diskN" -> "/dev/rdiskN" — the raw node for file-handle I/O.
+    public static func rawDevice(_ dev: String) -> String {
+        dev.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")
+    }
+
+    /// Best-effort eject of a node from `attachBlockDevice`. The eject
+    /// refuses while the device still has openers — VZ retains the
+    /// attachment's file handle until process exit, so this is hygiene
+    /// for the early-failure paths, not a contract. A node left behind
+    /// is self-healing anyway: the next attach of the same image
+    /// returns it.
+    public static func detachBlockDevice(_ dev: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+        p.arguments = ["eject", dev]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
 }

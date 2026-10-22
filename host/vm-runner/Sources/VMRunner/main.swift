@@ -21,8 +21,11 @@
 //          needs --timeout in (0,600]. See docs/hardware-contract.md.)
 //         [--data-disk <img>] (M100b, #2307, ADR 0050: a second virtio-blk
 //          function — the guest's VLFS data disk; raw RW image created if
-//          absent, blockDeviceIdentifier "virelai-vlfs", sync .full.
-//          Coexists with --overlay-base, which covers the boot disk only.)
+//          absent, blockDeviceIdentifier "virelai-vlfs", served through a
+//          kernel block device + VZDiskBlockDeviceStorageDeviceAttachment
+//          (issue #3112: the file must be the guest-coherent view even
+//          across a hard vm.stop). Coexists with --overlay-base, which
+//          covers the boot disk only.)
 //          [--vz-restore-save <dir>] [--vz-restore-load <dir>] (M70g G3, #1459:
 //          restore beyond same-process — one process boots, stores the marker,
 //          saves state + the ASIF overlay + the marker into <dir> and exits;
@@ -555,14 +558,22 @@ var noEntropy = false
 // XHCI device (bulk EP1 OUT/IN pair) and `usb bulk` reads the engine state.
 var usbMsdPath: String? = nil
 // M100b (issue #2307, ADR 0050 D1/D2): `--data-disk <img>` attaches a SECOND
-// virtio-blk function as the guest's VLFS data disk — a plain read-write
-// VZDiskImageStorageDeviceAttachment (never stacked; the throwaway overlay
-// covers the boot disk only) named "virelai-vlfs" via blockDeviceIdentifier,
-// synchronizationMode .full so a guest VIRTIO_BLK_T_FLUSH is a host-side
-// full sync. A missing file is created as a zero-filled 64 MiB raw image —
-// formatting is mkfs.vlfs's job, never the runner's. Off by default: without
-// the flag config.storageDevices keeps its single boot element.
+// virtio-blk function as the guest's VLFS data disk — the raw image is
+// attached as a kernel block device and handed to
+// VZDiskBlockDeviceStorageDeviceAttachment (never stacked; the throwaway
+// overlay covers the boot disk only) named "virelai-vlfs" via
+// blockDeviceIdentifier, synchronizationMode .full so a guest
+// VIRTIO_BLK_T_FLUSH is a host-side full sync. A missing file is created
+// as a zero-filled 64 MiB raw image — formatting is mkfs.vlfs's job,
+// never the runner's. Off by default: without the flag
+// config.storageDevices keeps its single boot element.
 var dataDiskPath: String? = nil
+/// Issue #3112: the kernel block device (`/dev/diskN`) the data-disk
+/// image is attached through, and our open handle on its raw node —
+/// held for the VM's lifetime so VZ's block-device attachment always
+/// has a live device to write.
+var dataDiskBlockDev: String? = nil
+var dataDiskBlockFH: FileHandle? = nil
 // M115c (issue #2462): `--profile <path>` boots a persistent machine from a
 // `.virelaivm` bundle instead of the flag-by-flag throwaway pieces. The
 // bundle's manifest members fill --vars/--overlay-base/--data-disk/
@@ -2973,20 +2984,41 @@ do {
 // VZVirtioBlockDeviceConfiguration in every attach mode (plain and
 // --overlay-base — the overlay covers the boot disk only; the data disk
 // itself is never stacked). It is named "virelai-vlfs" so the guest's
-// VIRTIO_BLK_T_GET_ID can tell it from the boot image, and its attachment
-// runs synchronizationMode .full so a guest FLUSH is a host-side full
-// sync. A missing file becomes a zero-filled raw image (default 64 MiB);
-// the guest then refuses mount with not_vlfs until mkfs.vlfs (M100c)
+// VIRTIO_BLK_T_GET_ID can tell it from the boot image.
+// Issue #3112: the image reaches the guest through a kernel block
+// device + VZDiskBlockDeviceStorageDeviceAttachment rather than a
+// file-backed attachment — see the attach site below.
+// A missing file becomes a zero-filled raw image (default 64 MiB); the
+// guest then refuses mount with not_vlfs until mkfs.vlfs (M100c)
 // formats it — never the runner's or kernel's job.
 if let dataDiskPath {
     do {
         let prepared = try DataDisk.prepare(path: dataDiskPath)
         try VZVirtioBlockDeviceConfiguration.validateBlockDeviceIdentifier(DataDisk.vlfsIdentifier)
-        let attachment = try VZDiskImageStorageDeviceAttachment(
-            url: prepared.url,
-            readOnly: false,
-            cachingMode: .automatic,
-            synchronizationMode: .full)
+        // Issue #3112: the image is attached as a kernel block device
+        // (/dev/diskN via `diskutil image attach`) and handed to VZ's
+        // block-device attachment — VZ's file-backed attachment persists
+        // guest writes on an asynchronous pipeline, and a hard vm.stop
+        // stranded requests the guest had already completed (and read
+        // back byte-exact), leaving the image behind the guest-coherent
+        // view at sector granularity (live-vlfs-crash sealed legs 06/07
+        // flagged bad_block_auth on those homes). Through the kernel
+        // driver a completed guest write is in the file — ordered —
+        // before the power drops, and the guest gets a real flush
+        // barrier (the NBD attachment was ruled out: VZ's NBD client
+        // never advertises VIRTIO_BLK_F_FLUSH, so vlfs's commit point
+        // can never complete — verified against qemu-nbd).
+        let dev = try DataDisk.attachBlockDevice(url: prepared.url)
+        dataDiskBlockDev = dev
+        // NOTE: deliberately no atexit eject — the disk-image driver's
+        // own pipeline drains asynchronously past vm.stop, and ejecting
+        // while a descriptor is still open (or racing the drain) drops
+        // completed writes. A stale node is self-healing: the next
+        // attach of the same image returns it.
+        let fh = try FileHandle(forUpdating: URL(fileURLWithPath: DataDisk.rawDevice(dev)))
+        dataDiskBlockFH = fh
+        let attachment = try VZDiskBlockDeviceStorageDeviceAttachment(
+            fileHandle: fh, readOnly: false, synchronizationMode: .full)
         let dataDisk = VZVirtioBlockDeviceConfiguration(attachment: attachment)
         dataDisk.blockDeviceIdentifier = DataDisk.vlfsIdentifier
         config.storageDevices.append(dataDisk)
@@ -4424,7 +4456,7 @@ if let usbMsdPath {
     print("  usb-msd: ENABLED (M43 card U6, issue #1037) — USB mass storage attached on an explicit VZXHCIControllerConfiguration (\(usbMsdPath)); the guest enumerates it as a bulk device behind the XHCI controller (the U1 bulk probe consumes it)")
 }
 if let dataDiskPath {
-    print("  data-disk: ENABLED (M100b, issue #2307, ADR 0050) — second virtio-blk function id 'virelai-vlfs', raw read-write, sync .full (\(dataDiskPath)); the guest's GET_ID probe names it")
+    print("  data-disk: ENABLED (M100b, issue #2307, ADR 0050) — second virtio-blk function id 'virelai-vlfs', raw read-write via kernel block device, sync .full (\(dataDiskPath)); the guest's GET_ID probe names it")
 }
 if let kc = inputKeyCode {
     if viaVirtioEnabled {
@@ -5046,9 +5078,25 @@ func screenCaptureKitScreenshot() -> CGImage? {
 // Issue #1788: stop the device, then run the post-stop evidence reads and
 // exit. Split out of finish() so the teardown drain can gate the stop
 // itself without duplicating this body.
+/// Issue #3112: after vm.stop, give the disk-image driver's queue a
+/// beat to land — it drains asynchronously past the power drop, and a
+/// post-kill fsck reading the file a beat too early would see the
+/// mid-drain state. fsync on our raw-device handle pushes our side; the
+/// short settle covers the driver's own queue.
+func drainDataDiskDevice() {
+    if let fh = dataDiskBlockFH { fsync(fh.fileDescriptor) }
+    if let dev = dataDiskBlockDev {
+        if let f = try? FileHandle(forUpdating: URL(fileURLWithPath: dev)) {
+            fsync(f.fileDescriptor); try? f.close()
+        }
+        usleep(500_000)
+    }
+}
+
 func stopDeviceAndExit(success: Bool, wantDump: Bool, wantNvram: Bool) {
     runner.queue.async {
         runner.vm.stop { _ in
+            drainDataDiskDevice()
             // Claim 2188: the VM is stopped, so every guest byte VZ will
             // deliver is already in the pipe — let the tee flush it into the
             // log before the NVRAM reads and exit() below (which would
@@ -8606,6 +8654,7 @@ var consoleExitStarted = false
 func stopAndDrainForExit(_ context: String) {
     runner.queue.async {
         runner.vm.stop { _ in
+            drainDataDiskDevice()
             drainTeeBeforeExit(context)
             exitWithTerminalRestore(consoleExitCode)
         }
