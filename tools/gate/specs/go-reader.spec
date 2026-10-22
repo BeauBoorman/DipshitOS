@@ -1,5 +1,5 @@
 # go-reader.spec -- M143a (issue #2792) + M143b (issue #2793) + M153c
-# (issue #2923) class-B gate:
+# (issue #2923) + M153d (issue #2924) class-B gate:
 # GOREADER.ELF, the Document mime's registered handler, opens a corpus-
 # authored PDF on VZ, and the three open chains that route documents to it
 # and images to GOVIEW all land end to end.
@@ -51,8 +51,34 @@
 # GOFILES-B execs, so GOFILES-B's window takes focus and the typed Enter
 # hits its listing, not the reader.
 #
+# Run 05 (M153d) closes the M153 loop: the file the OS writes is a file
+# the OS and the host both read. One boot on a RUN-SCOPED share
+# (--cvc-file: run 04 deletes the armed share's GOREADER.POS every
+# iteration, so this leg cannot live there):
+#   phase 1: GOEDIT opens the staged ACCSEED.TXT, the M153b picker lands
+#     a .pdf name -> `edit: export pdf /host/EXPORT.PDF pages=3`, then
+#     `dui close 2` ends the author side.
+#   phase 2: GOREADER opens EXPORT.PDF. The run's single --input-chords
+#     burst belongs to the picker (only it can spell ctrl-shift-s), so
+#     page 2 is reached through the app's own position memory: the share
+#     seeds a GOREADER.POS row keyed to the export's (path,size,sha8) —
+#     computed host-side through the same virelai/pdfwrite, whose only
+#     nondeterminism is the tail CreationDate, outside the 4096-byte
+#     head the row hashes. `pos page=2` is the landing; 'b'+'q' over
+#     --input-string are the bookmark and the pos-writing close; the
+#     `bookmark on page=2` anchors the scanout probe — post-repaint,
+#     the window idles until 'q' lands, so the composite is settled.
+#   phase 3: the reopen — `pos page=2 z=100 bm=2` proves the page and
+#     the bookmark both survived the close.
+# Host side, the built cgrender (ADR 0040 outside reference) renders
+# EXPORT.PDF page 2 at 96 dpi and the python block compares it with the
+# scanout crop inside the live-web-57 tolerance, verifies the PDF's
+# structure, then restores the seeded row so the next iteration
+# replays identically.
+#
 # HOST PREREQUISITES (fail the gate honestly when missing):
 #   bash tools/go/build-goreader.sh             ->  .build/go/GOREADER.ELF
+#   bash tools/go/build-goedit.sh               ->  .build/go/GOEDIT.ELF
 #   bash tools/go/build-files.sh                ->  .build/go/GOFILES.ELF
 #   bash tools/go/build-goview.sh               ->  .build/go/GOVIEW.ELF
 #   bash tools/go/build-web.sh browser WEB --gate -> .build/go/WEB-GATE.ELF
@@ -549,4 +575,403 @@ os.unlink(pos)
 os.unlink(copy)
 print("goreader v2: copy sha256=%s identical; pos row page=2 bm=2; "
       "share reset for next iteration" % hsrc[:16])
+PY
+
+# --- run 05 (M153d #2924): author -> export -> read -> host verify ----------
+# Script files: one exec per phase. script2's `dui close 2` releases
+# GOEDIT's window (first user window on a bare boot) before GOREADER#1
+# execs — the seat envelope never sees more than two user Go runtimes.
+vgate_file script-05.txt <<'EOF'
+exec GOEDIT.ELF /host/ACCSEED.TXT
+EOF
+
+vgate_file script2-05.txt <<'EOF'
+dui close 2
+exec GOREADER.ELF /host/EXPORT.PDF
+EOF
+
+vgate_file script3-05.txt <<'EOF'
+exec GOREADER.ELF /host/EXPORT.PDF
+EOF
+
+# The run-scoped share and the seeded position row. ACCSEED.TXT is
+# 161 short ASCII lines: the export's 80-row grid paginates that
+# into three pages with one text row on page 1, two on page 2, and
+# a footer row on every page — the shown-glyph total stays inside
+# both pdfwrite's normalized-command budget and the reader engine's
+# per-page edge bound (a third short line on page 2 trips
+# SegmentLimit); the CreationDate sits past byte 4096 so the pos
+# row's head hash keys cleanly.
+vgate_setup_python <<'PY'
+import hashlib, os, shutil, subprocess, sys, tempfile
+
+rd = os.environ["RUN_DIR"]
+acc = os.path.join(rd, "accept-share")
+os.makedirs(acc, exist_ok=True)
+
+for name, build in (("GOEDIT.ELF", "bash tools/go/build-goedit.sh"),
+                    ("GOREADER.ELF", "bash tools/go/build-goreader.sh")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit(name + " missing (expected " + src + ") - build it first: " + build)
+    shutil.copy(src, os.path.join(acc, name))
+
+lines = ["M153D ACCEPTANCE ROW"] + [""] * 79 + [
+    "PAGE TWO ROW ONE", "PAGE TWO ROW TWO",
+] + [""] * 79
+assert len(lines) == 161
+assert all(len(l) <= 90 for l in lines)
+seed = ("\n".join(lines) + "\n").encode("ascii")
+with open(os.path.join(acc, "ACCSEED.TXT"), "wb") as fh:
+    fh.write(seed)
+
+# The seeded row needs the export's (path,size,sha8-of-head) key.
+# pdfwrite's only nondeterminism is CreationDate, which lives in the
+# tail Info object — outside the 4096-byte head the row hashes — so the
+# shipped library run host-side on the same rows and layout yields the
+# exact key. The helper mirrors user/go/edit/export.go's wrap/footer
+# constants under this seed's contract (tab-free ASCII, <=90 columns).
+KEYGEN = r'''
+package main
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"virelai/pdfwrite"
+)
+
+const (
+	exportCols      = 90
+	exportPageRows  = 80
+	exportLeft      = 48
+	exportTop       = 48
+	exportLead      = 12
+	exportFooterRow = 81
+)
+
+func exportFooter(page, pages int) string {
+	s := strconv.Itoa(page) + " / " + strconv.Itoa(pages)
+	pad := (exportCols - len(s)) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	return strings.Repeat(" ", pad) + s
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: m153dkey SEED.txt > out.pdf")
+		os.Exit(2)
+	}
+	data, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	// exportWrapAll, under the gate's seed contract: tab-free ASCII
+	// lines inside the column bound wrap 1:1 into rows; the buffer's
+	// trailing newline still emits its blank row.
+	var rows []string
+	for off := 0; ; {
+		end := off
+		for end < len(data) && data[end] != '\n' {
+			end++
+		}
+		line := string(data[off:end])
+		if len(line) > exportCols {
+			fmt.Fprintln(os.Stderr, "seed line exceeds the export column bound")
+			os.Exit(1)
+		}
+		for i := 0; i < len(line); i++ {
+			if line[i] < 0x20 || line[i] > 0x7e {
+				fmt.Fprintln(os.Stderr, "seed byte outside the ASCII draw domain")
+				os.Exit(1)
+			}
+		}
+		rows = append(rows, line)
+		if end == len(data) {
+			break
+		}
+		off = end + 1
+	}
+	pages := (len(rows) + exportPageRows - 1) / exportPageRows
+	d := pdfwrite.New(pdfwrite.Meta{Title: "EXPORT.PDF", Producer: "GOEDIT.ELF",
+		Now: func() time.Time { return time.Unix(1700000000, 0).UTC() }})
+	for p := 0; p < pages; p++ {
+		body := rows[p*exportPageRows:]
+		if len(body) > exportPageRows {
+			body = body[:exportPageRows]
+		}
+		lines := make([]string, 0, exportFooterRow+1)
+		lines = append(lines, body...)
+		for len(lines) < exportFooterRow {
+			lines = append(lines, "")
+		}
+		lines = append(lines, exportFooter(p+1, pages))
+		if _, err := d.AddTextPage(lines, pdfwrite.TextOptions{
+			Scale: 1, Left: exportLeft, Top: exportTop, LineAdvance: exportLead,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	out, err := d.Bytes()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Stdout.Write(out)
+}
+'''
+
+fork = os.environ.get("GO_FORK_DIR") or os.path.join(
+    os.path.dirname(os.getcwd()), "go-virelai")
+gobin = os.path.join(fork, "bin", "go")
+if not os.path.exists(gobin):
+    sys.exit("go toolchain missing at " + gobin +
+             " - provision it: bash tools/go/apply.sh && just go-toolchain")
+gp = tempfile.mkdtemp(prefix="m153d-keygen.")
+os.makedirs(os.path.join(gp, "src", "m153dkey"))
+os.symlink(os.path.join(os.getcwd(), "user", "go"),
+           os.path.join(gp, "src", "virelai"))
+with open(os.path.join(gp, "src", "m153dkey", "main.go"), "w") as fh:
+    fh.write(KEYGEN)
+env = dict(os.environ)
+env.update(GOROOT=fork,
+           PATH=os.path.join(fork, "bin") + os.pathsep + env["PATH"],
+           GOTOOLCHAIN="local", GO111MODULE="off", GOFLAGS="",
+           GOPATH=gp, CGO_ENABLED="0")
+r = subprocess.run([gobin, "run", "m153dkey",
+                    os.path.join(acc, "ACCSEED.TXT")],
+                   env=env, capture_output=True)
+if r.returncode != 0:
+    sys.exit("keygen failed: " + r.stderr.decode("utf-8", "replace")[:400])
+pdf = r.stdout
+if len(pdf) <= 4400:
+    sys.exit("keygen export is %d bytes; the row's head hash needs the "
+             "CreationDate past byte 4096 (want > 4400)" % len(pdf))
+sha8 = hashlib.sha256(pdf[:4096]).hexdigest()[:16]
+hexpath = "/host/EXPORT.PDF".encode().hex()
+with open(os.path.join(acc, "GOREADER.POS"), "w") as fh:
+    fh.write("# virelai-goreader-pos v1 (size<TAB>sha8<TAB>page<TAB>zoom"
+             "<TAB>fit<TAB>bookmarks<TAB>hex(path); most-recent first)\n")
+    fh.write("%d\t%s\t1\t100\t0\t\t%s\n" % (len(pdf), sha8, hexpath))
+print("accept-share staged: GOEDIT.ELF + GOREADER.ELF, ACCSEED.TXT "
+      "(%d rows), pos row keyed size=%d sha8=%s (export %dB)"
+      % (len(lines) + 1, len(pdf), sha8, len(pdf)))
+PY
+
+# The single --input-chords burst drives the picker (ctrl-shift-s is
+# unreachable any other way); GOREADER#1's landing is the seeded pos
+# row, its bookmark + quit are --input-string's 'b'/'q', and the
+# snapshot anchors on `bookmark on page=2` — the post-repaint marker
+# leaves the window up while the probe composites. script3's exec is the reopen: `pos page=2 z=100 bm=2`
+# is both the proof and the terminal marker (the 1.5 s tail still
+# catches the second lifetime's present/ready/pos-saved lines).
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-05' \
+    --cvc-file '$RUN_DIR/accept-share' \
+    --script '$RUN_DIR/script-05.txt' \
+    --input-chords 'ctrl-shift-s,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,backspace,E,X,P,O,R,T,.,P,D,F,return' \
+    --input-chords-after 'goedit: present' \
+    --script2 '$RUN_DIR/script2-05.txt' \
+    --script2-after 'edit: export pdf /host/EXPORT.PDF' \
+    --snapshot-after 'goreader: bookmark on page=2 n=1' \
+    --input-string 'bq' --input-string-after 'goreader: ready' \
+    --script3 '$RUN_DIR/script3-05.txt' \
+    --script3-after 'goreader: quit' \
+    --script-expect 'goreader: pos page=2 z=100 bm=2' --timeout 300
+
+# The author side.
+vgate_assert 05 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 05 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 05 serial-contains 'goedit: open id=2'
+vgate_assert 05 serial-contains 'goedit: read /host/ACCSEED.TXT n='
+vgate_assert 05 serial-contains 'goedit: present'
+vgate_assert 05 serial-contains 'goedit: pick save /host/EXPORT.PDF'
+vgate_assert 05 serial-contains 'edit: export pdf /host/EXPORT.PDF pages=3 bytes='
+vgate_assert 05 serial-contains 'goedit: close'
+vgate_assert 05 serial-contains 'goedit OK'
+# The export moved neither the session path nor the dirty flag: the
+# picker name is never a saved document.
+vgate_assert 05 serial-absent 'goedit: saved /host/EXPORT.PDF'
+vgate_assert 05 serial-absent 'edit: export refused'
+
+# The read side: open, seeded landing, bookmark, pos-writing close.
+vgate_assert 05 serial-contains 'exec: loaded GOREADER.ELF'
+vgate_assert 05 serial-contains 'goreader: open id='
+vgate_assert 05 serial-contains 'goreader: not-tab-aware'
+vgate_assert 05 serial-contains 'goreader: loaded EXPORT.PDF pages=3 816x1056 bytes='
+vgate_assert 05 serial-contains 'goreader: pos page=2 z=100 bm=-'
+vgate_assert 05 serial-contains 'goreader: page 2/3'
+vgate_assert 05 serial-contains 'goreader: bookmark on page=2 n=1'
+vgate_assert 05 serial-contains 'goreader: quit'
+vgate_assert 05 serial-contains 'goreader: pos saved n=1'
+# The reopen: the row's page and bookmark come back — the OS reads the
+# position memory the OS wrote, on the file the OS exported.
+vgate_assert 05 serial-contains 'goreader: pos page=2 z=100 bm=2'
+vgate_assert 05 serial-count 'goreader: page 2/3' 2
+vgate_assert 05 serial-count 'goreader: ready' 2
+vgate_assert 05 serial-absent 'goreader: refuse'
+vgate_assert 05 serial-absent 'goreader: pos rc='
+vgate_assert 05 serial-absent 'goreader: read err'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'exited status=139'
+
+# The scanout probe: page 2's top-left 760x531 sits 1:1 at scanout
+# (40,40) — the page is 816x1056 at the restored 100% inside the 760x531
+# viewport, so the crop carries white page fill plus the three text
+# rows' glyph ink.
+vgate_assert 05 snapshot 'snap-05-*.raw' <<'PY'
+import sys
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+assert len(raw) == W * H * 4, "scanout size %d" % len(raw)
+def px(x, y):
+    k = (y * W + x) * 4
+    return raw[k + 2], raw[k + 1], raw[k]
+white = ink = 0
+for y in range(40, 571):
+    for x in range(40, 800):
+        r, g, b = px(x, y)
+        if r > 235 and g > 235 and b > 235:
+            white += 1
+        elif r < 60 and g < 60 and b < 60:
+            ink += 1
+assert white > 300000, "page-2 fill did not reach the scanout (%d px)" % white
+assert ink > 500, "no glyph ink on page 2 (%d px)" % ink
+print("go-reader 05: page-2 crop on the scanout (white=%d ink=%d)" % (white, ink))
+PY
+
+# The file the OS wrote is a file the host reads: structure, the pos
+# row it earned, and the cgrender pixel compare against the scanout
+# crop — then the seeded row is restored for the next iteration.
+vgate_assert 05 python <<'PY'
+import glob, hashlib, os, re, struct, subprocess, sys
+rd = os.environ["RUN_DIR"]
+acc = os.path.join(rd, "accept-share")
+path = os.path.join(acc, "EXPORT.PDF")
+if not os.path.exists(path):
+    sys.exit("EXPORT.PDF never landed on the run share")
+data = open(path, "rb").read()
+if not data.startswith(b"%PDF-1."):
+    sys.exit("bad header: %r" % data[:16])
+m = re.search(rb"startxref\s*(\d+)\s*%%EOF", data)
+if not m:
+    sys.exit("no startxref")
+xref = int(m[1])
+if data[xref:xref + 4] != b"xref":
+    sys.exit("startxref does not land on xref (%d)" % xref)
+sec = data[xref:].split(b"\n", 2)
+n = int(sec[1].split()[1])
+lines = sec[2].split(b"\n")[:n]
+for i, line in enumerate(lines):
+    off, gen, flag = line.split()
+    if flag == b"f":
+        continue
+    off = int(off)
+    want = ("%d 0 obj" % i).encode()
+    if data[off:off + len(want)] != want:
+        sys.exit("xref offset %d -> %r, want %r" % (i, data[off:off + 16], want))
+m = re.search(rb"/Type /Pages[^>]*?/Count (\d+)", data)
+if not m or int(m[1]) != 3:
+    sys.exit("page count %r" % (m[1] if m else None))
+if b"/Producer (GOEDIT.ELF)" not in data:
+    sys.exit("Info producer missing")
+
+# The position row after close+reopen names the same document, page 2
+# (0-based 1) and the bookmark — then the seeded shape goes back so
+# iteration n+1 replays identically.
+pos = os.path.join(acc, "GOREADER.POS")
+rows = [l for l in open(pos, errors="replace").read().splitlines()
+        if l and not l.startswith("#")]
+if not rows:
+    sys.exit("GOREADER.POS has no rows")
+hexpath = "/host/EXPORT.PDF".encode().hex()
+match = [r for r in rows if r.endswith("\t" + hexpath)]
+if not match:
+    sys.exit("no GOREADER.POS row for EXPORT.PDF")
+f = match[0].split("\t")
+if len(f) != 7:
+    sys.exit("row shape %r" % match[0])
+sha8 = hashlib.sha256(data[:4096]).hexdigest()[:16]
+if f[0] != str(len(data)):
+    sys.exit("size key %r want %d" % (f[0], len(data)))
+if f[1] != sha8:
+    sys.exit("sha8 key %r want %s" % (f[1], sha8))
+if f[2] != "1":
+    sys.exit("stored page %r (want 0-based 1)" % f[2])
+if "1" not in f[5].split(","):
+    sys.exit("bookmark missing from %r" % f[5])
+schema = open(pos, errors="replace").read().splitlines()[0]
+with open(pos, "w") as fh:
+    fh.write(schema + "\n")
+    fh.write("%d\t%s\t1\t100\t0\t\t%s\n" % (len(data), sha8, hexpath))
+
+# Iteration n's boot also persists the WND server's window table:
+# WINDOWS.SAV left on the share restores a phantom window that takes id 2
+# before GOEDIT execs (its `open id=3` then ducks the scripted `dui
+# close 2`), so the reset removes it along with the pos row restore.
+wmsav = os.path.join(acc, "WINDOWS.SAV")
+if os.path.exists(wmsav):
+    os.unlink(wmsav)
+
+# The outside reference: CoreGraphics at 96 dpi renders EXPORT.PDF
+# page 2; the guest's frame is its top-left 760x531 at 1:1 on the
+# scanout at (40,40). Type3 glyph rects land on integer device pixels
+# in both renderers — edge AA is the only slack, so the live-web-57
+# bounds hold (per-channel TOL + mismatch fraction + mean).
+binary = ".build/pdf-proof/cgrender"
+if not os.path.exists(binary):
+    os.makedirs(".build/pdf-proof", exist_ok=True)
+    subprocess.check_call(["/usr/bin/swiftc", "-O", "-module-cache-path",
+        ".build/pdf-proof/module-cache", "tools/pdf-proof/cgrender.swift",
+        "-o", binary])
+out = os.path.join(rd, "export-p2.bgra")
+env = {k: v for k, v in os.environ.items() if not k.startswith("DYLD_")}
+env["CG_PDF_VERBOSE"] = "1"
+r = subprocess.run([os.path.abspath(binary), path, out, "2"], env=env,
+                   capture_output=True, text=True, timeout=60)
+assert r.returncode == 0, "cgrender failed: " + r.stderr[:400]
+open(os.path.join(rd, "export-p2.cglog"), "w").write(r.stderr)
+assert "caught exception" not in r.stderr, "oracle diagnostics: " + r.stderr[:400]
+cg = open(out, "rb").read()
+w, h, stride = struct.unpack_from("<III", cg, 4)
+assert (w, h, stride) == (816, 1056, 816), "cgrender geometry %dx%d" % (w, h)
+pix = cg[16:]
+snaps = sorted(glob.glob(os.path.join(rd, "snap-05-*.raw")))
+assert snaps, "no scanout capture"
+raw = open(max(snaps, key=os.path.getmtime), "rb").read()
+assert len(raw) == 1280 * 720 * 4, "scanout size %d" % len(raw)
+def scan(x, y):
+    k = (y * 1280 + x) * 4
+    return raw[k + 2], raw[k + 1], raw[k]
+def ref(x, y):
+    k = (y * stride + x) * 4
+    return pix[k + 2], pix[k + 1], pix[k]
+mism = total = 0
+sumdiff = 0
+TOL = 48
+for cy in range(531):
+    for cx in range(760):
+        a = scan(40 + cx, 40 + cy)
+        b = ref(cx, cy)
+        d = max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
+        sumdiff += abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
+        total += 1
+        if d > TOL:
+            mism += 1
+frac = mism / total
+mean = sumdiff / (3 * total)
+assert frac <= 0.08 and mean <= 24, \
+    "cgrender vs scanout: mism=%.4f mean=%.2f" % (frac, mean)
+print("go-reader 05: EXPORT.PDF structure ok (%d bytes, %d xref objs, "
+      "pages=3); pos row page=1 bm=1 restored to seed; cgrender page 2 "
+      "vs scanout crop (mismatch %.4f%%, mean %.2f/255, tol %d)"
+      % (len(data), n, frac * 100, mean, TOL))
 PY
