@@ -45,11 +45,26 @@
 # the idle-queue interactive path fans immediately, so the bound being
 # contracted remains the burst-absorption shape the leg measures.
 #
+# card #3042 (same host, 2026-10-22): hf-read re-pinned after card #3035
+# raised the EL0 file-io cap 2048 B -> 32 KiB. The new baseline is the
+# best observed sample at the new cap: 80,932 KiB/s from this card's K=3
+# run (38,190 / 66,373 / 80,932; #3035's PR #3096 had recorded
+# 36,834..67,815). The -75% margin is kept -- the pre-raise spread that
+# earned it was ~3x intra-host, and both K=3 spreads at the new cap sit
+# inside it.
+# app-launch-cold / go-rss are new legs from this card (see corpus.tsv):
+# the launch row is a 1 Hz floor-resolution bound like boot-shell's
+# (observed 3 ticks incl. the runner's marker-forward settle), and go-rss
+# is the resident-footprint contract the capacity table cites (GOCALC
+# observed 5,984,260 B idled, post-#3032 demand-zero BSS).
+#
 id	cmp	budget	baseline	margin	ref
 boot-shell	<=	4	1	x4	#2485
 gosh-cmd-ls	<=	0.05	0.01	+400%	#2485
 gosh-cmd-echo	<=	0.05	0.01	+400%	#2485
-hf-read	>=	2110	8442	-75%	#2485; spread re-measured on #2486
+hf-read	>=	20233	80932	-75%	#3042; re-pinned post-#3035 32 KiB cap (best observed 80,932)
+app-launch-cold	<=	12	3	x4	#3042; new leg, 1 Hz floor-resolution bound
+go-rss	<=	11968520	5984260	x2	#3042; new leg, resident mem_bytes via sys_procs v2
 pcm-drain	<=	8192	4096	x2	#2485
 wm-present-cadence	<=	2554	1277	x2	#2485
 wm-present-latency	<=	4004596	2002298	x2	#2490; re-pinned post-#2729 per-report input fan

@@ -163,6 +163,7 @@ def measure(row_id, ser):
         "smp-scale-c2": r"goscale: ticks=(\d+)",
         "smp-scale-c4": r"goscale: ticks=(\d+)",
         "seat-mbox-burst": r"mburst: accepted=(\d+) of \d+ refused=\d+",
+        "go-rss": r"top: row pid=\d+ name=GOCALC\.ELF .* mem=(\d+)",
     }
     found = re.findall(patterns[row_id], ser)
     if not found:
@@ -268,6 +269,8 @@ need = {
     "GOTABWM.ELF": "bash tools/go/build-gotabwm.sh",
     "GOSOUND.ELF": "bash tools/go/build-gosound.sh",
     "GOMBURST.ELF": "bash tools/go/build-go.sh tools/go/mburst.go",
+    "GOCALC.ELF": "bash tools/go/build-gocalc.sh",
+    "GOTOP.ELF": "bash tools/go/build-gotop.sh",
 }
 missing = [n for n in need if not os.path.exists(os.path.join(".build", "go", n))]
 if missing:
@@ -747,6 +750,70 @@ vgate_file script-mburst-post.txt <<'EOF'
 set GOMAXPROCS=1
 exec GOMBURST.ELF
 EOF
+
+# --- run 08: app-launch (card #3042: app-launch-cold + go-rss) ---------------
+# One windowed boot carries both new rows. `sysinfo` runs immediately before
+# `exec GOCALC.ELF` (uptime T0); a second `sysinfo` rides script2, forwarded
+# the moment the app's own first window marker `gocalc: open id=` lands in
+# the serial log (uptime T1). T1-T0 in 1 Hz ticks is the launch measure,
+# honestly carrying the runner's ~0.5 s marker poll + forward settle — a
+# floor-resolution bound like boot-shell's, not a stopwatch. ~4 s after
+# `gocalc: present` script3 execs GOTOP.ELF; its startup listing prints the
+# sys_procs v2 snapshot row for the idled app (`top: row ... mem=<bytes>`).
+vgate_file script-launch.txt <<'EOF'
+sysinfo
+exec GOCALC.ELF
+EOF
+vgate_file script-launch-t1.txt <<'EOF'
+sysinfo
+EOF
+vgate_file script-launch-rss.txt <<'EOF'
+exec GOTOP.ELF
+EOF
+
+vgate_run launch -- --screen '$RUN_DIR/launch-screen' --via-virtio \
+    --script '$RUN_DIR/script-launch.txt' \
+    --script2 '$RUN_DIR/script-launch-t1.txt' \
+    --script2-after 'gocalc: open id=' --script2-delay 0 \
+    --script3 '$RUN_DIR/script-launch-rss.txt' \
+    --script3-after 'gocalc: present' --script3-delay 4 \
+    --script-expect 'top: ready' --timeout 240
+
+vgate_assert launch serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert launch serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert launch serial-contains 'gocalc: open id='
+vgate_assert launch serial-contains 'gocalc: present'
+vgate_assert launch serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert launch serial-contains 'top: ready'
+vgate_assert launch serial-absent '[EXC]'
+vgate_assert launch python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+ticks = re.findall(r"uptime:\s+ticks=(\d+)", ser)
+if len(ticks) < 2:
+    sys.exit("bench: expected the two scripted `sysinfo` reads "
+             "(pre-exec and post-`gocalc: open id=`), found %d" % len(ticks))
+# The marker-forwarded sysinfo must actually land after the app's open
+# marker, else the delta measures nothing — order-checked, not assumed.
+if ser.find("gocalc: open id=") == -1 or \
+   ser.rfind("uptime:") < ser.find("gocalc: open id="):
+    sys.exit("bench: the second `sysinfo` did not land after `gocalc: open id=`")
+v = float(int(ticks[-1]) - int(ticks[0]))
+benchlib.check("app-launch-cold", v)
+PY
+vgate_assert launch python <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("go-rss", ser)
+if v is None:
+    sys.exit("bench: no `top: row ... name=GOCALC.ELF ... mem=` line — "
+             "GOTOP's startup listing never reported the app's resident set")
+benchlib.check("go-rss", v)
+PY
 
 vgate_run mburst -- --sound --screen '$RUN_DIR/mburst-screen' --via-virtio \
     --script '$RUN_DIR/script-mburst-seat.txt' \

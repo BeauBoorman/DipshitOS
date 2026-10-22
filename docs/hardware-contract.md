@@ -581,15 +581,17 @@ Non-PCI platform facts:
   DSK1/DSK3/contiguous-ELF/PT_INTERP images, which are still refused past
   it. The image-independent ceiling is the physical allocator: 512 MiB of
   guest RAM, against a 32 MiB acceptance bound on the file.
-- **A guest read of the host share costs one round trip per 2 KiB, and runs
-  at ~30 MB/s.** [observed] `go-hello` run 04 has the guest read a 9,502,880 B
-  image out of the share end to end: 4,641 `sys_file_read` calls (exactly
-  `ceil(bytes/2048)`), 298,379 µs, ~31,100 KiB/s, 64,292 ns per call measured
-  from EL0 with CNTPCT_EL0. The 2048-byte per-call cap is the EL0 surface's
-  (`kernel/src/syscall.zig`), not the wire's — `virtio_file.reply_cap` is
-  32 KiB — so a payload is served in ~15× more round trips than the wire
-  would need. Writes are capped the same way (2048 B). `mmap` story:
-  ADR 0035.
+- **A guest read of the host share costs at most two round trips per 32 KiB
+  call, and runs at ~66 MB/s.** [observed] `go-hello` run 04 has the guest
+  read a 9,502,880 B image out of the share end to end: 291 `sys_file_read`
+  calls (exactly `ceil(bytes/32768)`), ~67,815 KiB/s best observed measured
+  from EL0 with CNTPCT_EL0 (card #3035 evidence: 36,834–67,815 KiB/s across
+  three same-shape boots). The 32 KiB per-call cap is the EL0 surface's
+  (`kernel/src/syscall.zig` `file_io_max` = `virtio_file.reply_cap`, raised
+  from the old 2048-byte stack stage by card #3035), not the wire's — a
+  READ reply carries ≤32,765 data bytes, so one EL0 call is one wire round
+  trip (occasionally two at the cap edge). Writes are capped the same way
+  (32 KiB). `mmap` story: ADR 0035.
 - The project targets Apple silicon / Virtualization.framework only; there
   is no QEMU path.
 
@@ -640,13 +642,13 @@ ENOSPC.
 | TCP window / segment | fixed advertised window 4096; payload ≤1460 B per segment (our MSS 1460); fixed src port 8000 on the legacy monitor client | oversized payload truncated honestly; peer RST kills the connection (`connection refused`) | `tcp.zig` `window`/`payload_max`/`our_mss`; **[observed]** `live-net-tcp-syscall` asserts the refusal packet `window=4096` |
 | Terminals | 4 | `terminal.create` → null → `-5` ENOSPC on the `/dev/tty` open | `terminal.max_terminals` (`kernel/src/terminal.zig`), minted lazily in `file_table.zig` |
 | Tabs (GOTABWM seat) | 16 | `full()` declines a new tab; persisted `.tabs` v2 state is ≤1110 B | `tabwm.max_tabs` (`user/src/tabwm.zig`), `gotabwm.MaxTabs` (ADR 0033 cap), `tools/go/tabcodec` |
-| EL0 share I/O rate | 2048 B per `sys_file_read`/`sys_file_write` call — the EL0 surface, not the wire (reply cap is 32 KiB) | a larger write is refused ENOSPC; a larger read truncates to 2048 — a payload costs ~15× more round trips than the wire needs; measured ~30 MB/s | `syscall.zig` cap; **[observed]** `go-hello` run 04: a 9,502,880 B read in 4,641 calls / 298,379 µs / 64,292 ns per call (CNTPCT_EL0) |
+| EL0 share I/O rate | 32 KiB per `sys_file_read`/`sys_file_write` call (`file_io_max` = `virtio_file.reply_cap`; raised from 2048 B by card #3035) — the EL0 surface; one wire READ reply carries ≤32,765 data bytes | a larger write is refused ENOSPC; a larger read truncates to 32 KiB; measured ~66 MB/s | `syscall.zig` `file_io_max`; **[observed]** `go-hello` run 04: a 9,502,880 B read in 291 calls at the 32 KiB cap (CNTPCT_EL0); card #3035 re-measure 36,834–67,815 KiB/s |
 | Host-file-channel wire caps | LIST ≤128 rows; READ ≤32,765 B/reply; WRITE ≤32,763 B/round trip; path ≤255 B; reply ≤32,768 B | status `3` (truncated) / `5` (exists) / `6` (handle error) | `virtio_file.reply_cap`/`write_chunk_max`, `VFWire`; byte-pinned by `tests/vf-*.bin` (`tools/verify-vf-class-a.sh`) |
 | vsock transport | 8 descriptors per queue; rx pool 4×2048 B; event pool 2×64 B; default host-listen port 1208 | unlistened port → `OP_RST` (`vsock: refused port=`) | `kernel/src/virtio_vsock.zig`; **[observed]** `live-vsock-restore` / M115a #2460 — connect accepted on 1208, RST on 9 |
 | Exec wait budget | `execWaitNs` = 15 s per spawned-child wait (the default `vi.Wait` budget is 120 s) | deadline → `vi.ErrWaitGone` ("wait: target not waitable") | `user/go/store/install.go`, `user/go/vi/proc.go`; **[observed]** M109f #2402 — a fresh-share FLINT clone lands `clone ok` ~21 s, past the bound: `live-agent-loop` run 06 fails 0/5 on a quiet host; margin card #2522 |
 | Host recorder | `hardCap` = 60 s at `fps` = 15 (≤ ~900 frames per take) | the cap timer ends the take honestly; receipt `recording=off frames=N bytes=B` | `HostRecorder.swift` (M114e #2458); **[observed]** `live-host-ui` run 05 drives record-start/record-stop; `HostRecorderTests` pin the cap |
 | Guest RAM (compiled default) | 512 MiB (`config.memorySize`; `--memory-mib <n>` overrides, bounded 64…2048). VZ anchors guest RAM at phys 0x7000_0000 growing upward (**[observed]** 256 MiB → [0x7000_0000, 0x8000_0000), 512 MiB → [0x7000_0000, 0x9000_0000)); the allocator bitmap + COW refcounts + identity map span a fixed 4 GiB from that base, and the user-stack VA band opens at 4 GiB, so RAM must stay below it — 2304 MiB is the hard geometry ceiling, 2048 the flag bound | physical allocator exhausted → `out_of_memory` → **ENOMEM** (`out of physical pages (text/stack/exception stack)` at the monitor; card #2755 split the fold — capacity tables stay ENOSPC, memory is -10); a guest whose RAM reached the fixed user `stack_va` used to fail `build_identity_map` at M2_TABLE (zero serial) — M129a (#2610) moved the boot stack VA to 0x1_8000_0000 | `main.swift` `config.memorySize`; **[observed]** `sysinfo`/`pages` on the 512 MiB boot: `usable=0x1febf000`, `total=0x1febf free=0x1eeb8 excluded=0x1007`. M129a (#2610) moved the compiled default 256 → 512 MiB; M129b (#2611) then raised the pool 16 → 64 — the table carve-out above is now exec's first concurrency binder |
-| Per-app RAM / exec image | file ≤32 MiB (`exec_image_max` → `image_too_large`); initialized bytes ≤32 MiB (`elf.load_max` → `segment_too_large`); mapped bytes ≤64 MiB (`elf.map_max` → `map_too_large`); one Go app costs ~45 MiB (32 MiB FIPS `.noptrbss` + eager BSS) | the named loader refusals, then `out_of_memory` → **ENOMEM** (card #2755) past ~4-5 concurrent heavy apps | `kernel/src/exec.zig`/`elf.zig`, M72a #1579; per-app figure **[inferred]** from the index #2557 investigation — the M129a leg re-measures free pages at 512 |
+| Per-app RAM / exec image | file ≤32 MiB (`exec_image_max` → `image_too_large`); initialized bytes ≤32 MiB (`elf.load_max` → `segment_too_large`); mapped bytes ≤64 MiB (`elf.map_max` → `map_too_large`, VIRTUAL — the zero-fill tail is demand-zero since card #3032); an idled GOCALC holds 5,984,260 B resident (~5.7 MiB) | the named loader refusals, then `out_of_memory` → **ENOMEM** (card #2755); the pre-#3032 "~4-5 concurrent heavy apps" wall is retired — at ~5.7 MiB per app the task pool's ~15–20-runtime bound (row above) refuses first | `kernel/src/exec.zig`/`elf.zig`, M72a #1579; per-app figure **[observed]** card #3042 `live-bench` `go-rss` leg (`sys_procs` v2 `mem_bytes` on the idled app; card #3032's PR #3088 measured a 48 MiB-virtual image resident at exec = 2,057 pages ≈ 8.4 MiB) |
 | Application timer | 1 countdown per process | second `sys_timer_set` re-arms the single slot (no queue) | `kernel/src/app_timers.zig`; **[observed]** `live-m16-resources` `timers=1` |
 
 ## Instruction set

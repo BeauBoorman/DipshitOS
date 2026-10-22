@@ -2,8 +2,9 @@
 # runs on VirelaiOS. Runs 01-03 (M70c-K, #1504): svc #0 console + sbrk heap +
 # GC; a >9 MiB image STREAMED into its mapped pages; the two refusals by name.
 # Run 04 (M70c, #1455): the guest reads that same 9.5 MiB from the share
-# end to end at the ABI's 2048-byte read cap — bytes, call count and FNV hash
-# asserted against the file on macOS, the rate reported (ADR 0035 measures it).
+# end to end at the ABI's 32 KiB read cap (2048 B before card #3035) —
+# bytes, call count and FNV hash asserted against the file on macOS, the
+# rate reported (ADR 0035 measures it).
 # Run 05 (M70c-S1L, #1540): the std fixture — a Go program whose file I/O goes
 # through `os`/`fmt` (the #1525 port) instead of the guest SDK — RUNS. Its own
 # output is held to the file on macOS: the whole 9.5 MiB image read through
@@ -43,7 +44,7 @@
 # from the guest's own bytes. The guest never sees a compiler - both runs
 # assert the host's own receipt line absent from their serial.
 # Run 13 (#2354): GOBIGREAD.ELF reads GOBIG.ELF through os.ReadFile — the
-# growing-buffer shape that lands a 2048-byte read chunk ACROSS the armed
+# growing-buffer shape that lands a read chunk ACROSS the armed
 # region boundary where the Go runtime's sbrk chain grows the heap
 # (observed live: `read /host/GPKG_runtime.a: bad address` ~4.4 MiB into a
 # 12 MiB archive on the pure cv channel, live-godiff-loop run 06). Every
@@ -85,7 +86,8 @@ EOF
 
 # M70c (#1455) run 04: GOREAD.ELF reads GOBIG.ELF back out of the share, end
 # to end, at the guest SDK's own chunk size (vsys.MaxFileIOBytes = the kernel's
-# 2048-byte per-call read cap). It hashes every byte as it arrives and prints
+# 32 KiB per-call read cap since card #3035, 2048 B before). It hashes every
+# byte as it arrives and prints
 # what that cost; the host recomputes the hash and the call arithmetic over the
 # file it staged. Nothing here is timing-dependent — the rate is reported, not
 # asserted.
@@ -268,8 +270,8 @@ PY
 # share with nothing staged in between.
 #
 # The assert is the guest's own byte stream, held to the file on macOS: the
-# exact byte count, the call count the kernel's 2048-byte per-call read cap
-# implies (ceil(bytes/2048) — reachable only if a call really moves 2048 B),
+# exact byte count, the call count the kernel's 32 KiB per-call read cap
+# implies (ceil(bytes/32768) — reachable only if a call really moves 32 KiB),
 # and the FNV-1a hash of the bytes READ. A short read, a dropped chunk, a
 # read from the wrong offset or a page of zeros all produce a different hash,
 # and none of them can be printed into place. The rate is extracted and
@@ -290,7 +292,7 @@ src = os.path.join(share, "GOBIG.ELF")
 if not os.path.exists(src):
     sys.exit("FAIL: the fixture run 04 reads is missing: " + src)
 n = os.path.getsize(src)
-calls = (n + 2047) // 2048  # one kernel read call moves at most 2048 bytes
+calls = (n + 32767) // 32768  # one kernel read call moves at most 32 KiB (card #3035)
 h = 0xcbf29ce484222325
 with open(src, "rb") as fh:
     while True:
@@ -300,10 +302,10 @@ with open(src, "rb") as fh:
         for byte in b:
             h = ((h ^ byte) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
 ser = open(os.environ["VG_SER"], errors="replace").read()
-want = "goread: file /host/GOBIG.ELF bytes %d calls %d max 2048" % (n, calls)
+want = "goread: file /host/GOBIG.ELF bytes %d calls %d max 32768" % (n, calls)
 if want not in ser:
     sys.exit("FAIL: the guest's exact read line is absent.\n  want: %r\n"
-             "  (a shorter call count means the kernel moved more than 2048 B per "
+             "  (a shorter call count means the kernel moved more than 32 KiB per "
              "read, or the file the guest read is not the file on macOS)" % want)
 if ("goread: fnv 0x%016x" % h) not in ser:
     sys.exit("FAIL: the guest hashed different bytes than the file on macOS "
@@ -314,7 +316,7 @@ if not m:
 us, kib, ns = (int(x) for x in m.groups())
 if us <= 0 or kib <= 0 or ns <= 0:
     sys.exit("FAIL: the rate line is zero: " + m.group(0))
-print("read %d B from the share in %d calls at the 2048-byte cap: %d us -> %d KiB/s (%d ns/call)"
+print("read %d B from the share in %d calls at the 32 KiB cap: %d us -> %d KiB/s (%d ns/call)"
       % (n, calls, us, kib, ns))
 print("fnv 0x%016x matches the file on macOS" % h)
 PY
@@ -937,9 +939,10 @@ PY
 
 # #2354 run 13: the large-read straddle regression leg, on the pure cv
 # channel (the spec's `seed` share). GOREAD/GOSYSCALL hash their file
-# through a fixed 2-4 KiB buffer that lands inside ONE armed region every
-# call; os.ReadFile's destination grows across the whole file, so its
-# 2048-byte chunks eventually straddle the boundary between two of the Go
+# through a fixed cap-sized buffer (2048 B, then 32 KiB since card #3035)
+# that lands inside ONE armed region every call; os.ReadFile's destination
+# grows across the whole file, so its chunks eventually straddle the
+# boundary between two of the Go
 # heap's adjacent sbrk regions — the exact copy_out range that used to
 # EFAULT. The assert holds the guest's own byte count + FNV-1a-64 to the
 # file on macOS, and the ReadAt pair proves the port's post-read shadow
