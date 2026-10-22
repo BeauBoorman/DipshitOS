@@ -49,6 +49,13 @@ type doc struct {
 	// rest of the doc state and never enters the session blob (the card's
 	// out-of-scope list).
 	folds []fold
+	// heatSpans is the M166c (#2991) gutter map — the --prof= profile's
+	// matched function spans with their heat bucket. heatDone marks it
+	// current for the buffer's bytes; load() and every splice clear it
+	// so the next paint remaps against the real offsets. It parks with
+	// the buffer like folds and never enters the session blob.
+	heatSpans []heatSpan
+	heatDone  bool
 }
 
 // bufMax bounds the ring. Four buffers cover a compile-fix loop without a

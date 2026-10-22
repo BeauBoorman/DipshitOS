@@ -122,6 +122,13 @@ fold = "\n".join([
 ]) + "\n"
 with open(os.path.join(ed, "FOLD.GO"), "wb") as f:
     f.write(fold.encode())
+# M166c (#2991): the run-13 heat leg's capture — the committed,
+# hand-written .folded fixture, staged beside FOLD.GO so --prof= reads
+# it off the share. Its counts pin the marker below: main.f 60+20=80
+# (the closure leaf folds), main.g 8, main.late 4 (named but absent
+# from the buffer), an unresolved 0x leaf 8 — fns=3 mapped=2
+# samples=100 top=main.f pct=80.
+shutil.copy("user/go/edit/heat-gate.folded", os.path.join(ed, "HEAT.FOLDED"))
 print("staged GOEDIT.ELF into share (%d bytes) and %s (%d bytes)" %
       (os.path.getsize(os.path.join(share, "GOEDIT.ELF")),
        seed, os.path.getsize(seed)))
@@ -916,8 +923,11 @@ vgate_assert 12 serial-absent 'exited status=139'
 # document's pixels would never reach gpu_fb. Under the bare shim the
 # kernel composites every window itself, so the teal cell is really there
 # to stream.
+# M166c: --prof= arms the heat gutter from the staged capture. The boot
+# buffer is BKT.TXT — not .go — so its mapping reports mapped=0; the
+# FOLD.GO leg below maps f and g.
 vgate_file script-13.txt <<'EOF'
-exec GOEDIT.ELF /host/EDIT/BKT.TXT
+exec GOEDIT.ELF /host/EDIT/BKT.TXT --prof=/host/EDIT/HEAT.FOLDED
 EOF
 
 # The echo IS the snapshot trigger and the run's expect — no close verb:
@@ -968,6 +978,11 @@ vgate_assert 13 serial-count 'goedit: fold on line=5 hidden=4' 2
 vgate_assert 13 serial-contains 'goedit: fold off line=5 reason=goto'
 vgate_assert 13 serial-contains 'goedit: status line=5/15 col=10 fold=1'
 vgate_assert 13 serial-contains 'goedit: buffer switch i=1/1 path=/host/EDIT/BKT.TXT'
+# M166c: the heat receipts — the boot buffer's empty mapping first
+# (BKT.TXT is not .go), then FOLD.GO's: 3 profile functions, f and g
+# mapped, 100 samples, main.f hottest at 80%.
+vgate_assert 13 serial-contains 'goedit: heat fns=3 mapped=0 samples=100 top=main.f pct=80'
+vgate_assert 13 serial-contains 'goedit: heat fns=3 mapped=2 samples=100 top=main.f pct=80'
 vgate_assert 13 serial-contains 'rx-goedit-match-ok'
 vgate_assert 13 serial-absent '[EXC] parking:'
 vgate_assert 13 serial-absent 'exited status=139'
@@ -1082,8 +1097,24 @@ for y in range(band_y0, band_y0 + 8):
         if close(raw[base + x * 4: base + x * 4 + 3], AMBER, 24):
             amber += 1
 assert amber >= 8, "no caret on the fold's open row (%d px)" % amber
-print("goedit fold leg: fold row=%d muted px=%d, close-row ink x=%d..%d, caret px=%d"
-      % (fold_row, len(muted), u0, u1, amber))
+
+# M166c: the heat gutter — the hottest bucket's strip (0xe01e1e) on the
+# fold's own row: `func f() {` is main.f, 80% of the capture. The strip
+# is 4 px at the frame's left edge, guest x in [35,39): the kernel's
+# left chrome (border + focus accent) occludes the window's first 3 px,
+# so the app paints it past them. The wider hunt band keeps the assert
+# chrome-width agnostic.
+hot = 0
+gy0 = 60 + fold_row * 10
+for y in range(gy0, gy0 + 8):
+    base = y * W * 4
+    for x in range(32, 44):
+        if close(raw[base + x * 4: base + x * 4 + 3], (0xe0, 0x1e, 0x1e), 24):
+            hot += 1
+assert hot >= 16, \
+    "no heat strip on the hottest function's first line (%d px)" % hot
+print("goedit fold leg: fold row=%d muted px=%d, close-row ink x=%d..%d, caret px=%d, heat px=%d"
+      % (fold_row, len(muted), u0, u1, amber, hot))
 PY
 
 # --- M149c (#2808) run 14: the -minimap column — pixels + press-to-jump ---

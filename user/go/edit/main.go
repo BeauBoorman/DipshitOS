@@ -267,6 +267,13 @@ const (
 	// n=` is Ctrl-U's unfold-all, `fold none` the no-block refusal.
 	markerFold = "goedit: fold "
 
+	// M166c (#2991): the --prof= heat gutter's receipts. `heat fns= mapped=
+	// samples= top= pct=` prints on each fresh buffer mapping (the receipt
+	// dedupes — a recompute that changes nothing does not re-announce);
+	// `heat too-large`, `heat bad line=` and `heat rc=` are the open-time
+	// read's named refusals.
+	markerHeat = "goedit: heat "
+
 	// M123d (#2578): the shared in-app error banner. `banner` is the raise
 	// — the failure text the strip shows — printed only after the frame
 	// that carries it is presented; `banner act` is the resolution (`copy`,
@@ -572,6 +579,12 @@ type editor struct {
 	// M149c (#2808): the -minimap flag — the document's right-edge column
 	// of one pixel row per buffer line, and the press-to-jump arm.
 	minimap bool
+
+	// M166c (#2991): the --prof= profile — the parsed .folded capture,
+	// session-wide. Each doc's heatSpans/heatDone maps it per buffer;
+	// heatLast dedupes the mapping receipt across recomputes.
+	heat     *heatData
+	heatLast string
 }
 
 // leaseFixture stamps a FOREIGN lease record on the edited path before the
@@ -628,6 +641,7 @@ func main() {
 	args := vi.Args()
 	path := defaultPath
 	diagPath := ""
+	profPath := ""
 	minimap := false
 	if len(args) > 1 && len(args[1]) > 0 {
 		path = args[1]
@@ -645,6 +659,9 @@ func main() {
 			}
 			if strings.HasPrefix(a, "--diags=") {
 				diagPath = strings.TrimPrefix(a, "--diags=")
+			}
+			if strings.HasPrefix(a, "--prof=") {
+				profPath = strings.TrimPrefix(a, "--prof=")
 			}
 		}
 	}
@@ -721,6 +738,12 @@ func main() {
 	// The blob applies to the loaded buffer — staleness, ring replay and
 	// caret/selection all land here, before the layout/lease/draw pass.
 	e.applyRestored()
+	// M166c (#2991): the .folded capture reads once at open — the named
+	// refusals print here; the fns/mapped receipt lands with the first
+	// buffer mapping, inside the first draw.
+	if profPath != "" {
+		e.loadHeat(profPath)
+	}
 	// The layout is read once, at open: it decides which physical keys are
 	// dead. A change made in GOSET while this editor is open applies to the
 	// next one; until then an unmapped dead key is ignored, as it always was.
@@ -841,6 +864,9 @@ var bufWrite = func(p string, b []byte) int64 {
 func (e *editor) load() {
 	b, rc := bufRead(e.path, maxBuffer)
 	e.folds = nil // M166b: folds index the buffer; new bytes retire them
+	// M166c: so does the gutter map — the next paint remaps the profile
+	// against the bytes just read.
+	e.heatDone = false
 	if rc < 0 {
 		e.buf = nil
 		e.cur = 0
@@ -1650,6 +1676,7 @@ func (e *editor) toggleMark() bool {
 func (e *editor) applyOp(o editOp, cur int) {
 	e.buf = applySplices(e.buf, o.sp, false)
 	e.shiftFolds(o.sp, false)
+	e.heatDone = false // M166c: splices move declarations; remap on next paint
 	e.cur = cur
 	e.hist.push(o)
 	e.selSet, e.markOn = false, false
@@ -1667,6 +1694,7 @@ func (e *editor) undo() {
 	}
 	e.buf = applySplices(e.buf, o.sp, true)
 	e.shiftFolds(o.sp, true)
+	e.heatDone = false
 	e.cur = o.sp[0].pos + len(o.sp[0].old)
 	e.selSet, e.markOn = false, false
 	e.markDirty()
@@ -1684,6 +1712,7 @@ func (e *editor) redo() {
 	}
 	e.buf = applySplices(e.buf, o.sp, false)
 	e.shiftFolds(o.sp, false)
+	e.heatDone = false
 	// Caret after the last splice's inserted text — in APPLIED-buffer
 	// coordinates, so shift the original pos by the earlier splices' delta.
 	shift := 0
@@ -2202,6 +2231,10 @@ func (e *editor) draw() {
 	// while the caret sits on a bracket (matchCell refuses otherwise).
 	mOff, mOK := e.matchCell()
 	y := chromeH + 4
+	// M166c: the profile gutter — one 4-px strip per painted line that
+	// falls inside a matched function's span. The lazy getter computes
+	// (and reports) the map once per buffer state.
+	heatSpans := e.gutter()
 	// M166b: line is the painted (visible) row; hidden fold lines are
 	// skipped without consuming a row, so a folded block reads as its
 	// opening line plus a `{...}` tail and the close line follows it.
@@ -2217,6 +2250,9 @@ func (e *editor) draw() {
 		}
 		if line >= maxLines {
 			break
+		}
+		if b := heatAt(heatSpans, start); b >= 0 {
+			e.fill(heatX, y, heatW, 8, colHeat[b])
 		}
 		// The selection paints UNDER this row's text: the cells of the
 		// [start,i) byte range the [slo,shi) selection covers, plus one cell

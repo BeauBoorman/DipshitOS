@@ -1,0 +1,5 @@
+main.main;0x100042f8c 8
+main.main;main.f 60
+main.main;main.f.func1 20
+main.main;main.g 8
+main.main;main.late 4

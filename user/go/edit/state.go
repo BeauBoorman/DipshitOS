@@ -522,6 +522,7 @@ func applyRecord(d *doc, st *editState) string {
 		}
 		d.buf = buf
 		d.dirty = true
+		d.heatDone = false // M166c: replayed bytes need a fresh gutter map
 	}
 	d.cur = st.cur
 	if d.cur < 0 {

@@ -24,14 +24,22 @@ type fold struct {
 }
 
 // bracePairs enumerates every matched {} pair in buf, ordered by open
-// offset. The pairing is matchBracket's own rule — same-kind depth —
-// expressed as a stack walk, and the classifyGo span filter applies exactly
-// where matchBracket applies it: non-code bytes are skipped outright.
+// offset — the classifyGo span filter applied exactly where matchBracket
+// applies it, or the raw rule (nil cls) on non-Go buffers. M166c reuses
+// the walk through bracePairsCls so the heat mapper pays for classifyGo
+// once, not once per consumer.
 func bracePairs(buf []byte, goFile bool) []fold {
 	var cls []byte
 	if goFile {
 		cls = classifyGo(buf)
 	}
+	return bracePairsCls(buf, cls)
+}
+
+// bracePairsCls is the stack walk itself over a caller-built class map:
+// same-kind depth pairing, non-code bytes skipped outright, open order
+// out. A nil cls classifies every byte as code (the raw rule).
+func bracePairsCls(buf, cls []byte) []fold {
 	var stack []int
 	var out []fold
 	for i := 0; i < len(buf); i++ {
