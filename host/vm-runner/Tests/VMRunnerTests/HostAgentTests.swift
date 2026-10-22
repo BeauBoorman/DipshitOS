@@ -30,7 +30,7 @@ final class HostAgentTests: XCTestCase {
     // MARK: - fixtures
 
     /// A share staged exactly like the go-agentd spec's: #v1
-    /// SECRETS.TXT with the agent-hmac row (uid 1000, app-bound), and
+    /// SECRETS.TXT with the agent-hmac row (uid 2000, app-bound), and
     /// the AGENT/AUDIT lane.
     private func makeShare(secrets: String? = nil) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
@@ -38,7 +38,7 @@ final class HostAgentTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: dir.appendingPathComponent("AGENT/AUDIT", isDirectory: true),
             withIntermediateDirectories: true)
-        let rows = secrets ?? "#v1\nagent-hmac\t1000\t\(key)\tAGENTD.ELF,GOTOP.ELF\n"
+        let rows = secrets ?? "#v1\nagent-hmac\t2000\t\(key)\tAGENTD.ELF,GOTOP.ELF\n"
         try rows.write(to: dir.appendingPathComponent("SECRETS.TXT"),
                        atomically: true, encoding: .utf8)
         dirs.append(dir)
@@ -335,14 +335,14 @@ final class HostAgentTests: XCTestCase {
         XCTAssertFalse(HostAgentCompanion.isReceiptName("rcpt-0000000a-00000001"))
     }
 
-    /// The key row must carry uid 1000 — the row agentd and the seat
-    /// read — and live under a #v1 header.
+    /// The key row must carry uid 2000 — the uid_agent row agentd
+    /// reads — and live under a #v1 header.
     func testKeyRowGrammar() throws {
         let share = try makeShare()
         XCTAssertEqual(HostAgentCompanion.loadKey(shareDir: share), Data(key.utf8))
         let wrongUID = try makeShare(secrets: "#v1\nagent-hmac\t0\t\(key)\n")
         XCTAssertNil(HostAgentCompanion.loadKey(shareDir: wrongUID))
-        let noScheme = try makeShare(secrets: "agent-hmac\t1000\t\(key)\n")
+        let noScheme = try makeShare(secrets: "agent-hmac\t2000\t\(key)\n")
         XCTAssertNil(HostAgentCompanion.loadKey(shareDir: noScheme))
     }
 }

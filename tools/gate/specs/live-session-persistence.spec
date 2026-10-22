@@ -52,18 +52,22 @@ rows = {}
 for line in open(os.path.join(prof, "share", "SECRETS.TXT")):
     f = line.rstrip("\n").split("\t")
     if f[0] and not f[0].startswith("#"):
-        rows[f[0]] = f
-want = {"vsock-ctl": ("0", None), "os-update": ("1000", "GOUPD.ELF"),
-        "agent-hmac": ("1000", "AGENTD.ELF,GOTOP.ELF"),
-        "host-int": ("1000", "GOTABWM.ELF")}
-for name, (uid, bind) in want.items():
-    assert name in rows, "missing %s row" % name
-    assert rows[name][1] == uid, "%s uid=%s" % (name, rows[name][1])
-    if bind is None:
-        assert len(rows[name]) == 3, "%s should be unbound" % name
-    else:
-        assert len(rows[name]) == 4 and rows[name][3] == bind, \
-            "%s binding=%s" % (name, rows[name][3:])
+        rows.setdefault(f[0], []).append(f)
+# M173d (#3161): agent-hmac is ONE credential across two principals —
+# uid_agent for the daemon, uid_user for GOTOP's verification tab —
+# so the pin names the (uid, binding) SET, not a single row.
+want = {"vsock-ctl": [("0", None)],
+        "os-update": [("1000", "GOUPD.ELF")],
+        "agent-hmac": [("2000", "AGENTD.ELF"), ("1000", "GOTOP.ELF")],
+        "host-int": [("1000", "GOTABWM.ELF")]}
+for name, expected in want.items():
+    got = sorted((r[1], r[3] if len(r) == 4 else None)
+                 for r in rows.get(name, []))
+    assert got == sorted(expected), "%s rows=%s" % (name, got)
+    for r in rows.get(name, []):
+        assert len(r) in (3, 4), "%s row arity=%d" % (name, len(r))
+keys = {r[2] for r in rows["agent-hmac"]}
+assert len(keys) == 1, "the agent-hmac rows must carry one credential"
 owners = {l.split("\t")[0]
           for l in open(os.path.join(prof, "share", "OWNERS.TXT"))
           if not l.startswith("#")}
@@ -72,7 +76,7 @@ for app in ("GOTABWM.ELF", "GOUPD.ELF", "GOTOP.ELF", "AGENTD.ELF"):
 
 sys.path.insert(0, "tools/agentctl")
 import agentctl
-pub = agentctl.ed_public_key(bytes.fromhex(rows["os-update"][2])).hex()
+pub = agentctl.ed_public_key(bytes.fromhex(rows["os-update"][0][2])).hex()
 assert cfg.get("updatePubkey") == pub, "updatePubkey does not match the os-update row"
 
 mkfs = os.path.join(".build", "go", "mkfs.vlfs")
@@ -81,7 +85,7 @@ r = subprocess.run([mkfs, "--check", os.path.join(prof, "vlfs.img")],
                    capture_output=True, text=True)
 if r.returncode != 0:
     sys.exit("vlfs.img not formatted: " + r.stdout + r.stderr)
-print("setup: session.sh provisioned profile + 4 credential rows + owners "
+print("setup: session.sh provisioned profile + 5 credential rows + owners "
       "+ updatePubkey pin; vlfs.img formatted")
 PY
 

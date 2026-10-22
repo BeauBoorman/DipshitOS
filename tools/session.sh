@@ -516,17 +516,20 @@ clock_secs=$(( 10#$(date +%H) * 3600 + 10#$(date +%M) * 60 + 10#$(date +%S) ))
 printf '%s\n' "$clock_secs" > "$SHARE/.clock"
 
 # --- 3c. the session credentials (M114c #2456, M120a #2558) -------------
-# Four SECRETS.TXT rows, all idempotent: an existing row is KEPT (the
-# credential persists across sessions, matching the share's persistence),
-# an existing file keeps every other row, and no value is ever logged.
+# Four credentials as SECRETS.TXT rows, all idempotent: an existing row
+# is KEPT (the credential persists across sessions, matching the share's
+# persistence), an existing file keeps every other row, and no value is
+# ever logged.
 #   vsock-ctl   uid_system, app-unbound — the ctl channel's HMAC key; the
 #               host reads the share's file directly so the row serves on
 #               EITHER share transport (ADR 0056 D2).
 #   os-update   the Ed25519 seed GOUPD.ELF signs staged updates with
 #               (app-bound; the profile's config.updatePubkey pins the
 #               public half — derived below, never minted twice).
-#   agent-hmac  bound to AGENTD.ELF,GOTOP.ELF — the agent channel key
-#               (ADR 0052 D4).
+#   agent-hmac  the agent channel key (ADR 0052 D4) — TWO same-key rows
+#               since M173d (#3159): uid_agent for AGENTD.ELF, uid_user
+#               for GOTOP.ELF's receipt verification (the sys_secret_get
+#               uid scope, the live-hostint.spec split).
 #   host-int    the M108 lanes' VHI1 HMAC key, bound to GOTABWM.ELF
 #               (M114c, ADR 0051) — provisioned only under --host-int.
 # Every bound row also needs its app named uid_system-owned in OWNERS.TXT
@@ -570,6 +573,22 @@ ensure_secret() {
     fi
 }
 
+# ensure_secret_uid <name> <uid> <binding> — a second-principal row for a
+# credential another uid already carries: the (name,uid) pair is minted by
+# REUSING the existing row's key (one credential, several readers — the
+# M173d agent-hmac split) and kept verbatim once present. A no-op when the
+# name is absent entirely; ensure_secret owns the first mint.
+ensure_secret_uid() {
+    local name="$1" uid="$2" bind="$3"
+    [ "$secrets_v1" = "1" ] || return 0
+    grep -q "^${name}"$'\t'"${uid}"$'\t' "$SECRETS_FILE" 2>/dev/null && return 0
+    local key
+    key="$(awk -F'\t' -v n="$name" '$1 == n { print $3; exit }' "$SECRETS_FILE" 2>/dev/null)"
+    [ -n "$key" ] || return 0
+    printf '%s\t%s\t%s\t%s\n' "$name" "$uid" "$key" "$bind" >> "$SECRETS_FILE"
+    echo "session: provisioned the ${name} uid-${uid} row in $SECRETS_FILE under the existing credential (app-bound to $bind)"
+}
+
 # ensure_owner <app> — the uid_system OWNERS.TXT row a bound credential
 # needs to be served to that app (same keep-and-warn contract).
 ensure_owner() {
@@ -585,7 +604,13 @@ ensure_owner() {
 
 ensure_secret vsock-ctl 0
 ensure_secret os-update 1000 GOUPD.ELF
-ensure_secret agent-hmac 1000 AGENTD.ELF,GOTOP.ELF
+# The uid_agent clone runs FIRST: on a pre-M173d share the kept uid_user
+# row's key is re-scoped to the daemon's principal (the credential survives
+# the migration — receipts stay verifiable on every reader); on a fresh
+# share the clone is a no-op and ensure_secret mints the row instead.
+ensure_secret_uid agent-hmac 2000 AGENTD.ELF
+ensure_secret agent-hmac 2000 AGENTD.ELF
+ensure_secret_uid agent-hmac 1000 GOTOP.ELF
 ensure_owner GOUPD.ELF
 ensure_owner GOTOP.ELF
 ensure_owner AGENTD.ELF

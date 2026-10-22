@@ -68,7 +68,7 @@ public final class HostAgentCompanion {
     public static let seenMax = 256
 
     static let secretName = "agent-hmac"
-    static let secretUID = "1000" // uid_user — the seat's principal
+    static let secretUID = "2000" // uid_agent — the daemon's principal (M173d)
 
     // MARK: Seams — every external input is injectable.
 

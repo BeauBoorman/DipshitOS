@@ -312,7 +312,7 @@ class SessionAppsTest(unittest.TestCase):
         for line in (self.share / "SECRETS.TXT").read_text().splitlines():
             fields = line.split("\t")
             if line and not line.startswith("#"):
-                rows[fields[0]] = fields
+                rows.setdefault(fields[0], []).append(fields)
         return rows
 
     def owner_rows(self):
@@ -324,14 +324,20 @@ class SessionAppsTest(unittest.TestCase):
         output = self.run_session(["--provision-only"])
         self.assertIn("session: provisioning complete", output)
         rows = self.secret_rows()
-        self.assertEqual(len(rows["vsock-ctl"]), 3)          # uid_system, unbound
-        self.assertEqual(rows["vsock-ctl"][1], "0")
-        self.assertEqual(rows["os-update"][1], "1000")
-        self.assertEqual(rows["os-update"][3], "GOUPD.ELF")
-        self.assertEqual(rows["agent-hmac"][1], "1000")
-        self.assertEqual(rows["agent-hmac"][3], "AGENTD.ELF,GOTOP.ELF")
-        self.assertEqual(rows["host-int"][1], "1000")
-        self.assertEqual(rows["host-int"][3], "GOTABWM.ELF")
+        self.assertEqual(len(rows["vsock-ctl"][0]), 3)       # uid_system, unbound
+        self.assertEqual(rows["vsock-ctl"][0][1], "0")
+        self.assertEqual(rows["os-update"][0][1], "1000")
+        self.assertEqual(rows["os-update"][0][3], "GOUPD.ELF")
+        # M173d (#3161): agent-hmac is ONE credential across two
+        # principals — the daemon's uid_agent row plus GOTOP's uid_user
+        # row, both carrying the same key.
+        agent = {r[1]: r for r in rows["agent-hmac"]}
+        self.assertEqual(sorted(agent), ["1000", "2000"])
+        self.assertEqual(agent["2000"][3], "AGENTD.ELF")
+        self.assertEqual(agent["1000"][3], "GOTOP.ELF")
+        self.assertEqual(agent["2000"][2], agent["1000"][2])
+        self.assertEqual(rows["host-int"][0][1], "1000")
+        self.assertEqual(rows["host-int"][0][3], "GOTABWM.ELF")
         self.assertIn("GOUPD.ELF", self.owner_rows())
         self.assertIn("GOTOP.ELF", self.owner_rows())
         self.assertIn("AGENTD.ELF", self.owner_rows())
@@ -339,7 +345,7 @@ class SessionAppsTest(unittest.TestCase):
         # The update pin is the os-update row's own public half.
         sys.path.insert(0, str(self.root / "tools/agentctl"))
         import agentctl
-        pub = agentctl.ed_public_key(bytes.fromhex(rows["os-update"][2])).hex()
+        pub = agentctl.ed_public_key(bytes.fromhex(rows["os-update"][0][2])).hex()
         cfg = json.loads((self.profile / "config.json").read_text())
         self.assertEqual(cfg["updatePubkey"], pub)
         # First mint formats vlfs.img; the persistence tools are staged.
@@ -360,6 +366,25 @@ class SessionAppsTest(unittest.TestCase):
         calls = (self.share / "mkfs-calls.txt").read_text().splitlines()
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].endswith("vlfs.img"))
+
+    def test_pre_m173d_agent_hmac_row_gains_the_uid_agent_row(self):
+        # A share provisioned before the M173d split keeps its uid_user
+        # row verbatim; provisioning re-scopes the SAME credential to the
+        # daemon's principal instead of minting a second key or only
+        # warning.
+        self.share.mkdir()
+        key = "bb" * 32
+        legacy = "agent-hmac\t1000\t" + key + "\tAGENTD.ELF,GOTOP.ELF"
+        (self.share / "SECRETS.TXT").write_text("#v1\n" + legacy + "\n")
+        output = self.run_session(["--provision-only"])
+        agent = {r[1]: r for r in self.secret_rows()["agent-hmac"]}
+        self.assertEqual(sorted(agent), ["1000", "2000"])
+        self.assertEqual(agent["1000"], legacy.split("\t"))
+        self.assertEqual(agent["2000"], ["agent-hmac", "2000", key, "AGENTD.ELF"])
+        # Idempotent: a second run adds nothing and warns about nothing.
+        self.run_session(["--provision-only"])
+        self.assertEqual(len(self.secret_rows()["agent-hmac"]), 2)
+        self.assertNotIn("agent-hmac row", output)
 
     def test_corrupt_vlfs_is_warned_not_reformatted(self):
         self.run_session(["--provision-only"])   # mint the bundle + format
