@@ -89,6 +89,21 @@ means one principal, but the principal is explicit and enforceable, and a
 second uid can be added later without an ABI change. `uid_system` is not
 assigned by any user-reachable path (D5).
 
+**card #3029 amendment (2026-10-22, card #3029 — a third principal).**
+`uid_agent = 2000` joins the pair: the kernel assigns it at exec to
+processes whose recorded image name is `AGENTD.ELF` (the name binding
+ADR 0054 grants already use), and children of a `uid_agent` process
+inherit it — still spawn-time only, still no syscall setter and no EL0
+naming path, so D5's "the only way to gain privilege is for the kernel
+itself to create the process" now reads: the kernel *assigns* the agent
+principal at exec; it is never requested. On `/host` the agent reads
+user files through the *other* triplet — `0600` and the secret class
+stay closed — and owns only its `AGENT/` sandbox and audit roots
+through kernel-minted rows. The D5/D10 kill posture gains one
+asymmetry: `uid_user` may signal `uid_agent`, never the reverse;
+`CAP_PROC_ADMIN` is unchanged. The decision is the card #3029 amendment to
+ADR 0052; per-agent uids, VLFS ownership and multi-user stay deferred.
+
 ### D2. Identity lives on the `Process` record; it is never persisted
 `Process` gains `uid: u32` and `caps: u32` (kernel BSS, module-private like
 every other field). The kernel assigns them at `process.create`; `exec`

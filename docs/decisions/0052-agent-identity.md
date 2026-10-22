@@ -1,9 +1,13 @@
 # ADR 0052: Agent identity — per-agent credentials, declared caps, revocation, audit contract
 
 - Date: 2026-10-16
-- Status: **Proposed** — awaiting owner review. No code lands here;
-  this ADR is the card (#2397) and, if approved, the D7 Touches are the
-  arc's binding file splits.
+- Status: **Accepted** — the D1–D5 + D7 decision set shipped with M109
+  (all six cards landed; the row's caveat — reference-host K=5 and
+  owner sign-off on #2402 — is gate debt, not design debt). No code
+  lands here; the D7 Touches were the arc's binding file splits.
+  **Amended 2026-10-22 (card #3029, card #3029):** the D6 bullet that kept
+  agent identity channel-level is superseded — the agent is the kernel
+  principal `uid_agent`; see the amendment below.
 - Card: **#2397** (M109, index #2382) — card 1 of 6; gates M109b–f.
 - Related: ADR 0024 (D1 principals, D5 caps, D8 secrets — the trust
   baseline this builds on), ADR 0044 (the channel this identity rides;
@@ -230,6 +234,9 @@ remains the escape hatch it always was (ADR 0044 D2): a cap bounds
 the *channel* surface, and a spawned GOSH still runs `uid_user`
 unconfined — caps never widen the kernel ceiling (no elevation,
 ADR 0024 D5), and they do not confine what a `gosh.run` child does.
+(card #3029 amendment: a `uid_agent` parent's children now inherit
+`uid_agent`, so the spawned GOSH is confined by the agent's file and
+signal rules — see the amendment below.)
 
 **A missing cap is a named refusal**: `cap_required:<cap>` — the
 D4 `code:detail` split already carries it — non-fatal, the session
@@ -351,11 +358,15 @@ singleton, and M99g retired the premise.
 
 ## D6. What does not change
 
-- The authority ceiling: the daemon and everything it spawns run
+- ~~The authority ceiling: the daemon and everything it spawns run
   `uid_user`, caps 0. Agent identity is channel-level; the kernel
   knows processes, not agents. Per-agent *kernel* principals (a uid
   per agent) need a principal-assignment path EL0 cannot reach — that
-  is trust-depth work, M113's territory.
+  is trust-depth work, M113's territory.~~ **Superseded by the card #3029
+  amendment below (2026-10-22, card #3029):** a single agent
+  principal `uid_agent`, assigned by the kernel at exec on the
+  `AGENTD.ELF` image name — the EL0-unreachable assignment path this
+  bullet said was missing. Caps stay 0; per-agent uids stay deferred.
 - One client at a time on 4747; the plaintext-session posture (E6 of
   ADR 0044 still owns transport hardening); the never-logged contract
   for secrets, MACs and payload bytes (receipt args are metadata —
@@ -460,3 +471,61 @@ This card's own Touches: `docs/decisions/0052-agent-identity.md`,
   section already prices the swap: `AGENTS.TXT` keeps caps/status, the
   credential half moves to `SECRETS.TXT`, and the agent count becomes
   "as many as the 8-entry store can spare" — stated, not papered over.
+
+## Amendment (2026-10-22, card #3029 / card #3029): the agent principal
+
+D6's first bullet is superseded. Its premise — that a kernel principal
+needed "a principal-assignment path EL0 cannot reach" and none existed —
+was retired by the grant table (ADR 0054 D7): exec already records the
+image name, and grants already key on it. the agent-principal arc (index #3025, owner
+decisions D12/D13/D15/D16) spends that binding on a principal: **the
+agent is `uid_agent = 2000`.** The channel identity this ADR built —
+*which* agent signed in — is unchanged and stays the receipt label; the
+kernel principal answers *whether* a process is the agent's.
+
+- **Who gets it.** Any process whose exec records the image name
+  `AGENTD.ELF` — the same recorded name grant rows and the M97g label
+  binding already key on (`kernel/src/grant.zig:6-8`). The binding is
+  name-only and the M97g caveat applies honestly: any EL0 process can
+  stage or exec an image under that name and thereby *become* the
+  agent. That is acceptable here because `uid_agent` only ever
+  narrows — the squatter loses `uid_user`'s write reach, gains write
+  only inside the agent-owned roots, signals nothing outside
+  `uid_agent`, and receipts thereafter say `uid=2000`: becoming the
+  agent is exactly the act the principal exists to see.
+- **How it is assigned.** By the kernel at exec — never by an EL0
+  request (`sys_exec` still takes no principal argument, ADR 0024
+  D5/D10) and not by the monitor's `exec -u<uid>`, which stays the
+  admin surface it was. Children of a `uid_agent` process inherit
+  `uid_agent`, so a `gosh.run` child can no longer escape into
+  `uid_user`; caps stay 0 on both. The daemon's startup posture (D1
+  check 1) flips to match: `uid_agent` + no caps, else
+  `agentd: refuse privileged`.
+- **What it can touch** (index D16). On user files the agent is never
+  the owner, so `trust.check` reads the *other* triplet
+  (`kernel/src/trust.zig:239-269`): on the default `0644` it reads and
+  cannot write; `0600` files and the secret class are closed outright.
+  The two roots the daemon must write — `/host/AGENT` (the D1 sandbox)
+  and `/host/AGENT/AUDIT` (the D4 receipt directory) — get kernel-minted
+  `uid_agent`-owned rows, the `ensure_meta_file` default-row pattern, so
+  the agent writes there as owner while `uid_user` keeps read through
+  the other triplet. `GOVAULT`'s `VAULT.BIN` becomes `0600`: the vault
+  stays sealed either way — `0600` removes the ciphertext itself from
+  the agent's read set.
+- **Who can stop it** (index D12). The D10 kill posture gains one
+  asymmetry: `uid_user` may signal `uid_agent` — the human can always
+  stop the agent — while a `uid_agent` caller may signal only
+  `uid_agent` targets. `CAP_PROC_ADMIN` is unchanged, and the principal
+  check still runs before the target-state checks.
+- **What the audit says.** Kernel receipts gain `uid=` (the RCPT line,
+  `kernel/src/measure.zig`): `name=` records what ran, `uid=` records
+  as whom. The audit split inverts cleanly — `AUDIT/` is agent-owned,
+  so the agent's own `gosh.run` child can still rewrite the *userland*
+  trail (D4 residual (a) re-based on `uid_agent`, tamper-evident by MAC
+  as before), while the kernel receipts — serial plus `RCPT.TXT`,
+  published below the file ABI — are the trail no `uid_agent` process
+  can edit.
+- **Deferred** (per index #3025): per-agent uids — one agent principal
+  this wave, `AGENTS.TXT` ids stay channel-level labels — VLFS
+  ownership (index D13; the inode reservation is card #3028's ADR), and
+  multi-user.
