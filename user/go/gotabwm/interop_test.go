@@ -21,6 +21,7 @@ func TestInteropMarkerShapes(t *testing.T) {
 		{MarkerSettingsSubscribe, "gotabwm: settings subscribe pid="},
 		{MarkerSettingsBroadcast, "gotabwm: settings broadcast key="},
 		{MarkerRpcOther, "gotabwm: rpc other kind="},
+		{MarkerRpcShort, "gotabwm: rpc short n="},
 		{MarkerHostFocus, "gotabwm: host focus id="},
 		{MarkerHostView, "gotabwm: host view id="},
 		{MarkerHostClose, "gotabwm: host close id="},
@@ -489,5 +490,59 @@ func TestClosingTheSenderDropsItsToasts(t *testing.T) {
 	}
 	if notifyCount() != 1 || notifyQueue[0].tabID != 5 {
 		t.Fatalf("after closing tab 4 the strip holds %d entries, want tab 5's only", notifyCount())
+	}
+}
+
+// #3053: a sub-38-byte post is one malformed frame, not end-of-queue. The
+// pre-fix seat returned on the first short frame, so a [short, valid…]
+// mailbox served one request per pass — 1 Hz when the tick is 1 s. Now the
+// pass drains past it and the per-pass count lands on the console once.
+func TestServiceRPCShortFrameDoesNotEndPass(t *testing.T) {
+	savedTabs := tabs
+	t.Cleanup(func() { tabs = savedTabs })
+	tabs = TabStrip{}
+	if !tabs.OpenTab(4, "x") {
+		t.Fatal("OpenTab")
+	}
+	stubAuthSeams(t, func(uint8) (string, bool) { return "", false })
+
+	req := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: 4, Seq: 1, ReplyTo: 3}
+	req.SetTitle("pwned")
+	frames := [][]byte{
+		{1, 2, 3, 4, 5}, // short: under the wire size, must not end the pass
+		req.Encode(),    // valid request — still answered in the same pass
+		{9, 9},          // a second short
+	}
+	var ackBytes [][]byte
+	next := 0
+	prev := vi.SetSyscallHookForTest(func(num, a0, a1, a2, a3 uintptr) int64 {
+		switch num {
+		case vi.SlotIPCRecv:
+			if next >= len(frames) {
+				return 0
+			}
+			frame := frames[next]
+			next++
+			copy(hookBuf(a0, a1), frame)
+			return int64(len(frame))
+		case vi.SlotIPCSend:
+			ack := make([]byte, a2)
+			copy(ack, hookBuf(a1, a2))
+			ackBytes = append(ackBytes, ack)
+			return int64(a2)
+		}
+		return -vi.ErrENOSYS
+	})
+	t.Cleanup(func() { vi.SetSyscallHookForTest(prev) })
+
+	served := serviceRPC()
+	if served != 1 {
+		t.Fatalf("served = %d want 1 (short frames must not end the pass)", served)
+	}
+	if len(ackBytes) != 1 {
+		t.Fatalf("acks = %d want 1", len(ackBytes))
+	}
+	if next != len(frames) {
+		t.Fatalf("drained %d of %d queued frames", next, len(frames))
 	}
 }

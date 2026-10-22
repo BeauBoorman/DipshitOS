@@ -232,6 +232,27 @@ func main() {
 	vi.ConsoleLine("wmrpcprobe: forged-echo refused id=" + vi.Itoa64(int64(id)))
 	vi.ConsoleLine("wmrpcprobe: rebind ok")
 
+	// #3053: sub-38-byte posts are malformed frames, not end-of-queue. Burst
+	// three ahead of a bound request — under the vulnerable seat each one
+	// ended the service pass, so the request behind them waited a tick per
+	// short frame. The bound reply proves the pass drained past them.
+	for i := 0; i < 3; i++ {
+		if vi.IpcSend(peers.WM, []byte{0xde, 0xad, byte(i)}) < 0 {
+			fail("short post")
+		}
+	}
+	shortGuard := vi.WmRpc{Kind: vi.WmRpcKindSetTitle, ID: uint8(id),
+		Seq: 7, ReplyTo: uint8(peers.Self), Pad: vi.WmRpcPadBound}
+	shortGuard.SetTitle("wmrpcprobe")
+	vi.SetWmAuth(&shortGuard, vi.WmAuth(rep))
+	if vi.IpcSend(peers.WM, shortGuard.Encode()) < 0 {
+		fail("short-guard send")
+	}
+	if rep, ok = recvAckFor(buf, shortGuard.Seq); !ok || rep.Applied != 1 {
+		fail("request behind short frames went unserved")
+	}
+	vi.ConsoleLine("wmrpcprobe: short-frame drain ok")
+
 	vi.ConsoleLine("wmrpcprobe: auth probe ok")
 	vi.Exit(0)
 }

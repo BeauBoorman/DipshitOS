@@ -1971,6 +1971,10 @@ vgate_assert 11 serial-contains 'wmrpcprobe: agent-input refused'
 # genuine owner-made proof title stands, and the honest echo still binds.
 vgate_assert 11 serial-contains 'wmrpcprobe: forged-echo refused id='
 vgate_assert 11 serial-contains 'wmrpcprobe: rebind ok'
+# #3053: the probe's three sub-38-byte posts are counted and skipped, not
+# treated as end-of-queue — the bound request behind them is still served.
+vgate_assert 11 serial-contains 'gotabwm: rpc short n='
+vgate_assert 11 serial-contains 'wmrpcprobe: short-frame drain ok'
 vgate_assert 11 serial-contains 'wmrpcprobe: auth probe ok'
 vgate_assert 11 serial-contains 'gotabwm: rpc refuse id='
 vgate_assert 11 serial-absent 'wmrpcprobe: FAIL'
@@ -2201,9 +2205,11 @@ if ent[0] != 0 or ent[1] != 1:
     sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
 ln = int.from_bytes(ent[4:8], "little")
 blob = b[off+14:off+14+ln]
-if len(blob) != ln or ln == 0 or blob[0] != 1:
+# M166a moved the outer blob to stateFmtVer2 (multi-record ring); v1 still
+# decodes as a legacy single record, but a live save is v2.
+if len(blob) != ln or ln == 0 or blob[0] != 2:
     sys.exit("blob len=%d fmtver=%d" % (len(blob), blob[0] if ln else -1))
-print("SESSION.TABS app_state: idx=0 appver=1 len=%d (goedit fmt v1)" % ln)
+print("SESSION.TABS app_state: idx=0 appver=1 len=%d (goedit fmt v2)" % ln)
 PY
 vgate_assert 14 serial-contains 'rx-goedit-state-save-ok'
 vgate_assert 14 serial-absent '[EXC] parking:'

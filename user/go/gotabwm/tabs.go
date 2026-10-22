@@ -354,8 +354,34 @@ func guessBin(title string) string {
 		// go-dogfood boot 09).
 		return "GOSET.ELF"
 	default:
-		return title
+		return binToken(title)
 	}
+}
+
+// binToken maps an app-controlled string (a declared title, a session
+// record's bin field) to the single token the gate-parsed `bin=` field
+// carries: the gate reads bin=\S+, so a space, '=' or newline would inject
+// extra key=value fields into the LAYOUT.txt / serial dump line. The
+// filename set [A-Za-z0-9._-] survives verbatim; every other byte becomes
+// '_'. Empty stays empty (layoutLine prints '-').
+func binToken(s string) string {
+	for i := 0; i < len(s); i++ {
+		if !binByteOK(s[i]) {
+			b := []byte(s)
+			for ; i < len(b); i++ {
+				if !binByteOK(b[i]) {
+					b[i] = '_'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
+func binByteOK(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-'
 }
 
 func railIdleRGB() uint32   { return theme.Current.BtnIdle }
@@ -1251,8 +1277,11 @@ func uabs(a, b uint32) uint32 {
 
 // layoutLine is one ADR 0033 LAYOUT.txt surface line (no trailing LF).
 // bin is a single token: a space or newline would break bin=\S+ and the
-// one-line-per-tab dump. Gate titles are app-controlled (GOCALC.ELF etc.).
+// one-line-per-tab dump. Gate titles are app-controlled (GOCALC.ELF etc.),
+// so the token is re-sanitized here — a restored .tabs record or a title
+// fallback reaches this line without passing through guessBin.
 func layoutLine(id uint32, bin string, r Rect, focus bool, kind SplitKind) string {
+	bin = binToken(bin)
 	if bin == "" {
 		bin = "-"
 	}

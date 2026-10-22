@@ -70,6 +70,48 @@ func TestGuessBinShippingTitles(t *testing.T) {
 	}
 }
 
+// #3053: the title is app-controlled text but lands in the gate-parsed
+// `bin=` token — a space, '=' or newline would inject extra key=value
+// fields into the LAYOUT.txt / serial dump line.
+func TestBinTokenSanitizesTitle(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"GOCALC.ELF", "GOCALC.ELF"}, // filename set passes through
+		{"evil focus=1", "evil_focus_1"},
+		{"x=1 y=2", "x_1_y_2"},
+		{"a\nb", "a_b"},
+		{"héllo", "h__llo"}, // é is two UTF-8 bytes
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := binToken(c.in); got != c.want {
+			t.Fatalf("binToken(%q) = %q want %q", c.in, got, c.want)
+		}
+	}
+
+	var s TabStrip
+	if !s.OpenTab(3, "evil focus=1") {
+		t.Fatal("OpenTab")
+	}
+	if s.At(0).Bin != "evil_focus_1" {
+		t.Fatalf("stored bin = %q", s.At(0).Bin)
+	}
+	body := layoutFileBody(&s, 1280, 720)
+	want := "tab=3 bin=evil_focus_1 x=0 y=0 w=1280 h=720 focus=1 split=none\n"
+	if string(body) != want {
+		t.Fatalf("LAYOUT body = %q want %q", body, want)
+	}
+}
+
+// The emit surface re-sanitizes: a bin planted by a crafted .tabs record
+// never reaches the gate line raw.
+func TestLayoutLineSanitizesBin(t *testing.T) {
+	line := layoutLine(5, "evil focus=1", Rect{640, 0, 640, 720}, true, SplitVert)
+	want := "tab=5 bin=evil_focus_1 x=640 y=0 w=640 h=720 focus=1 split=v"
+	if line != want {
+		t.Fatalf("layoutLine = %q want %q", line, want)
+	}
+}
+
 func TestSetTitlePreservesBinAndSession(t *testing.T) {
 	var live TabStrip
 	if !live.OpenTab(4, "Notepad") {

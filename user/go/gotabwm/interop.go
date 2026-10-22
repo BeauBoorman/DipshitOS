@@ -51,6 +51,7 @@ const (
 	MarkerRpcOther   = "gotabwm: rpc other kind="
 	MarkerRpcBind    = "gotabwm: rpc bind id="
 	MarkerRpcRefuse  = "gotabwm: rpc refuse id="
+	MarkerRpcShort   = "gotabwm: rpc short n="
 	MarkerHostFocus  = "gotabwm: host focus id="
 	MarkerHostView   = "gotabwm: host view id="
 	MarkerHostClose  = "gotabwm: host close id="
@@ -345,10 +346,19 @@ func serviceRPC() int {
 	// stops refusing posts; the per-pass bound stays the client-side
 	// constant — a deeper backlog clears over multiple iterations,
 	// not one pass.
+	short := 0
 	for i := 0; i < vi.MailboxMaxMessages; i++ {
 		n, r := vi.IpcRecv(buf[:])
-		if r < 0 || n < 38 {
-			return served
+		if r < 0 || n == 0 {
+			break
+		}
+		if n < 38 {
+			// #3053: a short post is one malformed frame, not the end of
+			// the queue — aborting the pass on it let a [short, valid…]
+			// mailbox cap the seat at one served request per tick. Count
+			// it and keep draining.
+			short++
+			continue
 		}
 		req, ok := vi.DecodeWmRpc(buf[:n])
 		if !ok {
@@ -428,6 +438,9 @@ func serviceRPC() int {
 		}
 		replyRPC(req, applied, pad, auth)
 		served++
+	}
+	if short > 0 {
+		vi.ConsoleLine(MarkerRpcShort + vi.Itoa64(int64(short)))
 	}
 	return served
 }
